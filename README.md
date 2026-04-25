@@ -1,135 +1,154 @@
 # tobyOS
 
-A modern, from-scratch operating system focused on low-level control, performance, and a futuristic cyberpunk-inspired user experience.
+**tobyOS** is a from-scratch, hobby operating system focused on learning, experimentation, and building a modern desktop OS from the ground up.
+
+The project explores the full stack of operating system development—from low-level kernel architecture to a graphical desktop environment—with a long-term goal of creating a usable, extensible, and self-hosting OS.
 
 ---
 
-## 🚀 Overview
+## 🚀 Current Status
 
-**tobyOS** is a custom-built x86_64 operating system designed to explore systems programming from the ground up — from bootloader to kernel to eventual userland and UI.
+tobyOS has progressed significantly and now includes:
 
-The long-term vision is to create a **modern OS with a visually rich interface**, blending:
+### Core OS
 
-* The usability of Windows
-* The polish of macOS
-* A cyberpunk-inspired aesthetic
+* Custom kernel with:
 
----
+  * memory management
+  * interrupts and scheduling
+  * process model and syscalls
+* Virtual filesystem (VFS) with persistent storage
+* User accounts and permissions
+* Basic security model with sandboxing
 
-## ✨ Current Features
+### Hardware & System Support
 
-### Boot & Core
+* Driver model with device discovery
+* Storage support (partitions, filesystems)
+* Networking stack (DHCP, DNS, TCP, HTTP)
+* Expanded hardware compatibility (QEMU-focused)
 
-* Custom boot process using Limine
-* 64-bit kernel (x86_64)
+### Desktop Environment
 
-### CPU & Interrupts
+* Window manager and GUI system
+* Taskbar, launcher, and desktop shell
+* Notification system
+* Cyberpunk-inspired UI direction (in progress)
 
-* Global Descriptor Table (GDT)
-* Interrupt Descriptor Table (IDT)
-* Exception handling
-* PIC (interrupt controller)
-* PIT (hardware timer)
+### Application Ecosystem
 
-### Memory Management
+* Built-in apps:
 
-* Physical Memory Manager (PMM)
-* Kernel heap (`kmalloc` / `kfree`)
+  * file manager
+  * terminal
+  * text editor
+  * settings app
+* Package manager (CLI + GUI “App Store”)
+* App manifest system
+* Install/remove apps dynamically
 
-### Hardware Input
+### Developer Platform
 
-* PS/2 keyboard driver
+* SDK for building apps
+* In-OS build workflow
+* Minimal compiler/toolchain integration
+* Partial self-hosting:
 
-### Graphics & Output
+  * build and run programs inside tobyOS
 
-* Framebuffer rendering
-* Custom console with cursor
+### System Quality
 
-### System Layer
-
-* Basic shell environment
-
----
-
-## 🛣️ Roadmap
-
-### Kernel Evolution
-
-* [ ] Virtual memory (paging)
-* [ ] Process & thread scheduler
-* [ ] User mode support
-* [ ] System call interface
-
-### Storage
-
-* [ ] Disk drivers (AHCI / NVMe)
-* [ ] FAT32 filesystem support
-* [ ] Custom filesystem (`tobyfs`)
-
-### Networking
-
-* [ ] TCP/IP stack
-* [ ] DHCP / DNS
-* [ ] Basic HTTP support
-
-### Userland
-
-* [ ] ELF executable loader
-* [ ] libc implementation
-* [ ] Core utilities (shell tools, editor)
-
-### Graphics & UI
-
-* [ ] Windowing system
-* [ ] Hardware acceleration (GPU support)
-* [ ] UI framework (Slint / LVGL)
-* [ ] Cyberpunk-themed desktop environment
+* Logging and diagnostics framework
+* Crash handling and panic reporting
+* Safe-mode boot options
+* Service supervision and restart
+* Hardware compatibility reporting
 
 ---
 
-## 🧰 Tech Stack
+## 🎯 Project Goals
 
-* **Languages:** C, Assembly
-* **Bootloader:** Limine
-* **Emulator:** QEMU
-* **Architecture:** x86_64
+* Learn and explore OS development end-to-end
+* Build a modern desktop OS with a clean architecture
+* Support a growing ecosystem of applications
+* Achieve partial → full self-hosting over time
+* Create a visually modern UI inspired by:
+
+  * Windows 10 usability
+  * Cyberpunk/technical aesthetic
 
 ---
 
-## 🖥️ Build & Run
+## 🧠 Design Philosophy
+
+* **From scratch**: no reliance on existing OS kernels
+* **Incremental milestones**: each system built step-by-step
+* **Clarity over complexity**: simple, understandable implementations
+* **Modularity**: clean separation between subsystems
+* **Stability-first**: features must not break the system
+
+---
+
+## 🛠️ Development Approach
+
+tobyOS is built using structured milestones, including:
+
+* Kernel & core systems
+* Filesystems & storage
+* Networking
+* GUI & desktop environment
+* Package management
+* Security & sandboxing
+* Self-hosting toolchain
+* Hardware compatibility
+
+Development and testing are primarily done using QEMU, with plans for real hardware validation.
+
+---
+
+## 🧪 Running tobyOS
+
+tobyOS currently runs in a virtual machine environment (QEMU).
+
+Example (may vary based on build setup):
 
 ```bash
-make
-make run
+qemu-system-x86_64 -m 2048 -cdrom tobyOS.iso -boot d
 ```
-
----
-
-## 🧪 Testing
-
-* QEMU-based validation
-* Incremental milestone testing
-
-Planned:
-
-* Unit testing for kernel subsystems
-* Benchmarking (Phoronix Test Suite)
-* Real hardware validation
 
 ---
 
 ## ⚠️ Disclaimer
 
-This project is experimental and not production-ready.
+tobyOS is an experimental hobby project:
+
+* Not production-ready
+* Limited hardware support
+* Features are still evolving
+* Expect bugs and incomplete functionality
 
 ---
 
-## 👤 Author
+## 🔮 Roadmap (High-Level)
 
-Toby Buckmaster
+* Expand hardware compatibility
+* Improve desktop polish and UX
+* Increase POSIX compatibility
+* Advance toward full self-hosting
+* Real hardware testing and release candidate
 
 ---
 
-## 🌌 Vision
+## 🤝 Contributing
 
-tobyOS aims to bridge low-level systems engineering with modern UI/UX design — creating an OS that is both technically deep and visually distinct.
+This project is currently experimental and evolving quickly, but contributions, ideas, and feedback are welcome.
+
+---
+
+## 📌 Summary
+
+tobyOS is a deep dive into operating system engineering—from bootloader to desktop apps—with the ambition of becoming a fully self-sustaining, modern OS.
+
+---
+
+**Status:** Actively in development 🚧
