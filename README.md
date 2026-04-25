@@ -1,108 +1,105 @@
 # tobyOS
 
-A modern, from-scratch operating system built with performance, control, and a cyberpunk-inspired user experience in mind.
+A modern, from-scratch operating system focused on low-level control, performance, and a futuristic cyberpunk-inspired user experience.
 
 ---
 
 ## 🚀 Overview
 
-**tobyOS** is a hobbyist operating system developed from the ground up to explore low-level systems design, hardware interaction, and OS architecture.
+**tobyOS** is a custom-built x86_64 operating system designed to explore systems programming from the ground up — from bootloader to kernel to eventual userland and UI.
 
-The long-term vision is to create a **modern, visually rich OS** combining:
+The long-term vision is to create a **modern OS with a visually rich interface**, blending:
 
-* The usability of Windows 10
+* The usability of Windows
 * The polish of macOS
-* A **cyberpunk-inspired UI aesthetic**
+* A cyberpunk-inspired aesthetic
 
 ---
 
-## ✨ Features (Current)
+## ✨ Current Features
 
-* ✅ Custom boot process using Limine
-* ✅ 64-bit kernel (x86_64)
-* ✅ Framebuffer graphics output
-* ✅ Basic terminal / console
-* ✅ Memory management:
+### Boot & Core
 
-  * Physical Memory Manager (PMM)
-  * Kernel heap (`kmalloc` / `kfree`)
-* ✅ Interrupt handling:
+* Custom boot process using Limine
+* 64-bit kernel (x86_64)
 
-  * GDT (Global Descriptor Table)
-  * IDT (Interrupt Descriptor Table)
-  * Exception handling
-* ✅ Hardware timers (PIT)
-* ✅ Keyboard input (PS/2)
-* ✅ Basic shell
+### CPU & Interrupts
+
+* Global Descriptor Table (GDT)
+* Interrupt Descriptor Table (IDT)
+* Exception handling
+* PIC (interrupt controller)
+* PIT (hardware timer)
+
+### Memory Management
+
+* Physical Memory Manager (PMM)
+* Kernel heap (`kmalloc` / `kfree`)
+
+### Hardware Input
+
+* PS/2 keyboard driver
+
+### Graphics & Output
+
+* Framebuffer rendering
+* Custom console with cursor
+
+### System Layer
+
+* Basic shell environment
 
 ---
 
 ## 🛣️ Roadmap
 
-Planned milestones include:
+### Kernel Evolution
 
-### Core Systems
-
-* [ ] Virtual Memory (Paging)
-* [ ] Process & Thread Scheduler
-* [ ] User Mode Support
-* [ ] System Call Interface
+* [ ] Virtual memory (paging)
+* [ ] Process & thread scheduler
+* [ ] User mode support
+* [ ] System call interface
 
 ### Storage
 
-* [ ] GPT partition support
-* [ ] FAT32 read/write
+* [ ] Disk drivers (AHCI / NVMe)
+* [ ] FAT32 filesystem support
 * [ ] Custom filesystem (`tobyfs`)
 
 ### Networking
 
 * [ ] TCP/IP stack
-* [ ] DHCP & DNS
-* [ ] Basic HTTP client
+* [ ] DHCP / DNS
+* [ ] Basic HTTP support
 
 ### Userland
 
-* [ ] Dynamic linker
+* [ ] ELF executable loader
 * [ ] libc implementation
-* [ ] Ported utilities (shell, text editor)
+* [ ] Core utilities (shell tools, editor)
 
-### UI / Graphics
+### Graphics & UI
 
 * [ ] Windowing system
-* [ ] Hardware acceleration (virtio-gpu / GPU drivers)
-* [ ] Modern UI framework (Slint / LVGL)
+* [ ] Hardware acceleration (GPU support)
+* [ ] UI framework (Slint / LVGL)
 * [ ] Cyberpunk-themed desktop environment
 
 ---
 
 ## 🧰 Tech Stack
 
-* **Languages:** C (primary), Assembly (boot/low-level)
+* **Languages:** C, Assembly
 * **Bootloader:** Limine
-* **Emulation:** QEMU
-* **Build Tools:** GCC / Clang, Make
-* **Target Architecture:** x86_64
+* **Emulator:** QEMU
+* **Architecture:** x86_64
 
 ---
 
-## 🖥️ Building & Running
-
-### Requirements
-
-* GCC or Clang (cross-compiler recommended)
-* QEMU
-* Make
-* NASM
-
-### Build
+## 🖥️ Build & Run
 
 ```bash
 make
-```
-
-### Run in QEMU
-
-```bash
 make run
 ```
 
@@ -110,63 +107,29 @@ make run
 
 ## 🧪 Testing
 
-Current testing is done via:
-
-* QEMU-based boot validation
-* Incremental milestone verification
+* QEMU-based validation
+* Incremental milestone testing
 
 Planned:
 
-* Unit tests for kernel subsystems
-* Integration tests for drivers
-* Benchmarking with tools like Phoronix Test Suite
-* Real hardware validation across multiple platforms
-
----
-
-## 📸 Screenshots
-
-*(Coming soon)*
-
----
-
-## 🤝 Contributing
-
-This project is currently in active development and primarily maintained by a single developer.
-
-If you’re interested in contributing:
-
-* Open an issue to discuss ideas or bugs
-* Fork the repo and submit a PR
+* Unit testing for kernel subsystems
+* Benchmarking (Phoronix Test Suite)
+* Real hardware validation
 
 ---
 
 ## ⚠️ Disclaimer
 
-tobyOS is an experimental project and is **not production-ready**. Expect bugs, crashes, and incomplete features.
-
----
-
-## 📜 License
-
-*(Add your license here — MIT, GPL, etc.)*
+This project is experimental and not production-ready.
 
 ---
 
 ## 👤 Author
 
-Developed by Toby Buckmaster
+Toby Buckmaster
 
 ---
 
 ## 🌌 Vision
 
-tobyOS aims to push beyond traditional hobby OS projects by combining:
-
-* Low-level systems engineering
-* Modern UI/UX design
-* A cohesive aesthetic inspired by futuristic computing environments
-
-This is not just an OS — it’s a platform for experimentation, performance, and design.
-
----
+tobyOS aims to bridge low-level systems engineering with modern UI/UX design — creating an OS that is both technically deep and visually distinct.
