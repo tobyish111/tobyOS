@@ -1,0 +1,3 @@
+﻿# Root repo: keep large generated logs out of git
+tobyOS/qemu*.log
+tobyOS/**/qemu*.log
