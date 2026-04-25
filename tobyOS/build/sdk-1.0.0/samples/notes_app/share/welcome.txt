@@ -1,0 +1,6 @@
+Welcome to notes_app -- the tobyOS SDK 1.0 sample notepad.
+
+Click "Notes" in the [Apps] menu to open a single-line sticky note.
+Save persists to /data/apps/notes_app/note.txt; Load reads it back.
+
+Saving also fires a desktop notification toast via toby_notify_post().

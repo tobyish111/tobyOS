@@ -1,0 +1,55 @@
+rm -f src/installer.o src/kernel.o tobyos.bin tobyOS.iso build/base.iso build/install.img
+/usr/bin/make all CFLAGS="--target=x86_64-elf -Iinclude -ffreestanding -fno-stack-protector -fno-pie -fno-pic -fno-unwind-tables -fno-asynchronous-unwind-tables -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel -nostdlib -O2 -Wall -Wextra -std=c11 -DINSTALL_M20_SELFTEST"
+make[1]: Entering directory '/c/CustomOS/tobyOS'
+clang --target=x86_64-elf -Iinclude -ffreestanding -fno-stack-protector -fno-pie -fno-pic -fno-unwind-tables -fno-asynchronous-unwind-tables -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel -nostdlib -O2 -Wall -Wextra -std=c11 -DINSTALL_M20_SELFTEST -c src/kernel.c -o src/kernel.o
+clang --target=x86_64-elf -Iinclude -ffreestanding -fno-stack-protector -fno-pie -fno-pic -fno-unwind-tables -fno-asynchronous-unwind-tables -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel -nostdlib -O2 -Wall -Wextra -std=c11 -DINSTALL_M20_SELFTEST -c src/installer.c -o src/installer.o
+ld.lld -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 -T linker.ld -o tobyos.bin src/kernel.o src/klibc.o src/serial.o src/font8x8.o src/console.o src/printk.o src/panic.o src/gdt.o src/idt.o src/isr.o src/pic.o src/ioapic.o src/irq.o src/pit.o src/keyboard.o src/pmm.o src/vmm.o src/heap.o src/shell.o src/elf.o src/tss.o src/syscall.o src/acpi.o src/apic.o src/smp.o src/vfs.o src/ramfs.o src/initrd.o src/proc.o src/sched.o src/blk.o src/blk_ata.o src/blk_ahci.o src/blk_nvme.o src/blk_offset.o src/tobyfs.o src/file.o src/pipe.o src/signal.o src/pci.o src/e1000.o src/e1000e.o src/virtio_net.o src/rtl8169.o src/xhci.o src/usb_hid.o src/virtio_gpu.o src/net.o src/eth.o src/arp.o src/ip.o src/udp.o src/socket.o src/gfx.o src/mouse.o src/gui.o src/term.o src/settings.o src/service.o src/session.o src/users.o src/pkg.o src/cap.o src/perf.o src/installer.o src/isr_stubs.o src/syscall_entry.o src/ap_trampoline.o src/proc_switch.o
+rm -rf build/iso_base
+mkdir -p build/iso_base/boot/limine
+mkdir -p build/iso_base/EFI/BOOT
+cp tobyos.bin                           build/iso_base/boot/
+cp limine_base.conf                    build/iso_base/boot/limine/limine.conf
+cp limine/limine-bios.sys       build/iso_base/boot/limine/
+cp limine/limine-bios-cd.bin    build/iso_base/boot/limine/
+cp limine/limine-uefi-cd.bin    build/iso_base/boot/limine/
+cp limine/BOOTX64.EFI           build/iso_base/EFI/BOOT/
+cp build/initrd.tar                       build/iso_base/boot/initrd.tar
+xorriso -as mkisofs -R -r -J \
+	-b boot/limine/limine-bios-cd.bin \
+	-no-emul-boot \
+	-boot-load-size 4 \
+	-boot-info-table \
+	--efi-boot boot/limine/limine-uefi-cd.bin \
+	-efi-boot-part --efi-boot-image \
+	--protective-msdos-label \
+	build/iso_base -o build/base.iso
+[base.iso] zeroing protective-ISO MBR slot before limine bios-install
+dd if=/dev/zero of=build/base.iso bs=1 count=16 seek=446 conv=notrunc status=none
+limine/limine bios-install build/base.iso
+cp build/base.iso build/install.img
+truncate -s 4194304 build/install.img
+rm -rf iso
+mkdir -p iso/boot/limine
+mkdir -p iso/EFI/BOOT
+cp tobyos.bin                           iso/boot/
+cp limine.conf                         iso/boot/limine/
+cp limine/limine-bios.sys       iso/boot/limine/
+cp limine/limine-bios-cd.bin    iso/boot/limine/
+cp limine/limine-uefi-cd.bin    iso/boot/limine/
+cp limine/BOOTX64.EFI           iso/EFI/BOOT/
+cp build/initrd.tar                       iso/boot/initrd.tar
+cp build/install.img                      iso/boot/install.img
+xorriso -as mkisofs -R -r -J \
+	-b boot/limine/limine-bios-cd.bin \
+	-no-emul-boot \
+	-boot-load-size 4 \
+	-boot-info-table \
+	--efi-boot boot/limine/limine-uefi-cd.bin \
+	-efi-boot-part --efi-boot-image \
+	--protective-msdos-label \
+	iso -o tobyOS.iso
+[tobyOS.iso] zeroing protective-ISO MBR slot before limine bios-install
+dd if=/dev/zero of=tobyOS.iso bs=1 count=16 seek=446 conv=notrunc status=none
+limine/limine bios-install tobyOS.iso
+[mkfs] disk.img already exists -- preserving (run 'make wipe-disk' to recreate)
+make[1]: Leaving directory '/c/CustomOS/tobyOS'

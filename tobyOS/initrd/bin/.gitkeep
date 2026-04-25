@@ -1,0 +1,3 @@
+# Placeholder so the bin/ directory exists in source control.
+# /bin/hello is copied here at build time by the Makefile from
+# programs/user_hello/user_hello.elf -- do not commit the ELF.

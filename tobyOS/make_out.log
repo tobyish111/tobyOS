@@ -1,0 +1,731 @@
+rm -f serial.log debug.log qemu.log net.pcap
+"/c/Program Files/qemu/qemu-system-x86_64.exe" -cdrom tobyOS.iso \
+        -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
+        -boot d \
+        -smp 4 \
+        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
+        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
+        -serial file:serial.log \
+        -debugcon file:debug.log \
+        -d int,cpu_reset,guest_errors -D qemu.log \
+        -no-reboot -no-shutdown; \
+echo ""; echo "=== debugcon (port 0xE9) ==="; \
+cat debug.log 2>/dev/null || echo "(empty)"; \
+echo ""; echo "=== serial (COM1) ==="; \
+cat serial.log 2>/dev/null || echo "(empty)"; \
+echo ""; echo "=== qemu.log -- non-timer entries ==="; \
+grep -v "INT=0x08" qemu.log | head -n 200 2>/dev/null || echo "(empty)"
+
+=== debugcon (port 0xE9) ===
+[boot] serial up
+[boot] framebuffer: 1280x800 pitch=5120 bpp=32 addr=0xffff8000fd000000
+[boot] console up
+[gdt] loaded: base=0xffffffff8003d4a0 limit=55 entries=7
+[gdt] CS=0x08 DS=0x10 (expected CS=0x08 DS=0x10)
+[gdt] user CS=0x23 DS=0x1b  TSS sel=0x28 (TSS slot empty until tss_init)
+[idt] loaded: base=0xffffffff8003d4f0 limit=4095 (48 gates wired)
+[boot] firing int3 to exercise IDT round-trip...
+[isr] breakpoint hit at rip=0xffffffff8000107b (rflags=0x82)
+[boot] int3 returned cleanly, IDT round-trip OK
+[pit] channel 0 -> 100 Hz (divisor=11931)
+[kbd] PS/2 driver up (IRQ1 unmasked)
+[boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard)
+[perf] TSC calibrated: 6636 MHz (331819733 cycles in 50000000 ns)
+[boot] HHDM offset = 0xffff800000000000
+[pmm] Limine memmap (19 entries):
+  0x0000000000001000..0x0000000000061000       384 KiB  bootloader
+  0x0000000000061000..0x000000000009f000       248 KiB  usable
+  0x000000000009fc00..0x00000000000a0000         1 KiB  reserved
+  0x00000000000f0000..0x0000000000100000        64 KiB  reserved
+  0x0000000000100000..0x0000000007a53000    124236 KiB  usable
+  0x0000000007a53000..0x0000000007e53000      4096 KiB  kernel
+  0x0000000007e53000..0x0000000007e54000         4 KiB  bootloader
+  0x0000000007e54000..0x0000000007e89000       212 KiB  kernel
+  0x0000000007e89000..0x0000000007e8a000         4 KiB  bootloader
+  0x0000000007e8a000..0x0000000007e8d000        12 KiB  usable
+  0x0000000007e8d000..0x0000000007e93000        24 KiB  bootloader
+  0x0000000007e93000..0x0000000007ee5000       328 KiB  kernel
+  0x0000000007ee5000..0x0000000007f30000       300 KiB  bootloader
+  0x0000000007f30000..0x0000000007f4b000       108 KiB  usable
+  0x0000000007f4b000..0x0000000007fe0000       596 KiB  bootloader
+  0x0000000007fe0000..0x0000000008000000       128 KiB  reserved
+  0x00000000fd000000..0x00000000fd3e8000      4000 KiB  framebuffer
+  0x00000000fffc0000..0x0000000100000000       256 KiB  reserved
+  0x000000fd00000000..0x0000010000000000  12582912 KiB  reserved
+[pmm] managed:  32587 pages (127 MiB) up to 0x0000000007f4b000
+[pmm] usable:   124604 KiB across 19 regions
+[pmm] bitmap:   4074 bytes at phys 0x0000000000061000 (virt 0xffff800000061000), 1 pages
+[pmm] free:     31150 pages (121 MiB) -- used: 1437 pages
+[pmm] test: allocated 0x0000000000062000 0x0000000000063000 0x0000000000064000 0x0000000000065000 (free now=31146)
+[pmm] test: read-back a=0xdeadbeefcafebabe d=0x1122334455667788
+[pmm] test: alloc/free balanced (free=31150 before & after)
+[boot] reserved AP trampoline page at phys 0x0000000000070000
+[vmm] kernel image: virt 0xffffffff80000000..0xffffffff80052000 -> phys 0x0000000007e93000 (328 KiB)
+[vmm] hhdm mirror:  132 MiB across memmap, top phys 0x00000000fd400000, 2M pages
+[vmm] new PML4 at phys 0x0000000000062000, switching CR3...
+[vmm] CR3 switched. Running on tobyOS page tables.
+[vmm] test: __text_start 0xffffffff80001000 -> phys 0x0000000007e94000
+[vmm] test: __data_start 0xffffffff8003d000 -> phys 0x0000000007ed0000
+[vmm] test: HHDM r/w through new PML4 at phys 0x0000000000069000 OK
+[vmm] test: new mapping at 0xffffc00000000000 <-> phys 0x0000000000069000 verified
+[vmm] test: unmap clears translation, scratch page freed
+[vmm] test: ok
+[heap] up: initial arena 17 pages (67 KiB)
+[heap] start: arenas=1 total=69600 used=0 free=69600  brk=0xffffd00000011000 (region 0xffffd00000000000..0xffffd10000000000)
+[heap] after 8 allocs: arenas=2 used=85616 free=65872 allocs=8
+[heap] after 8 frees: arenas=2 used=0 free=151488 frees=8
+[heap] test: ok (region OK, fragmented 80 KiB alloc OK, round-trip balanced, kcalloc zero-verified)
+[heap] brk now 0xffffd00000025000 (148 KiB virt consumed)
+[tss] installed: tss=0xffffffff800430e0 rsp0=0xffffffff800430e0 (irq stack 16 KiB)
+[sys] EFER.SCE on, STAR=0x0010000800000000, LSTAR=0xffffffff8002d9a0, FMASK=0x700
+[sys] kernel syscall rsp = 0xffffffff800430e0
+[sys] available syscalls: 0=exit  1=write  2=read  3=pipe  4=close  5=yield
+[sys]                     6=socket 7=bind 8=sendto 9=recvfrom
+[sys]                     10=gui_create 11=gui_fill 12=gui_text 13=gui_flip 14=gui_poll_event
+[sys]                     15=term_open 16=term_write 17=term_read 18=fs_readdir 19=fs_readfile 20=exec
+[sys]                     21=setting_get 22=setting_set 23=login 24=logout 25=session_info
+[sys]                     26=getuid 27=getgid 28=username 29=chmod 30=chown
+[pci] enumerating bus 0...
+[pci] 6 device(s):
+[pci] 00:00.0  8086:1237  bridge.host       
+[pci] 00:01.0  8086:7000  bridge.isa        
+[pci] 00:01.1  8086:7010  storage.ide         BAR4 io 16
+[pci] 00:01.3  8086:7113  bridge              IRQ 9
+[pci] 00:02.0  1234:1111  display.vga         BAR0 mem 16384K  BAR2 mem 4K
+[pci] 00:03.0  8086:100e  network.ethernet    IRQ 11  BAR0 mem 128K  BAR1 io 64
+[ata] primary master: 32768 sectors (16384 KiB) -- PIO LBA28 (PCI 00:01.1)
+[blk] registered 'ide0:master' (32768 sectors, 16384 KiB)
+[pci] driver blk_ata  bound to 00:01.1  (8086:7010)
+[e1000] probing 00:03.0  (vid:did 8086:100e)
+[e1000] MMIO BAR0 phys=0x00000000febc0000 virt=0xffff8000febc0000 (128 KiB UC)
+[net] +nic e1000:00:03.0 mac=52:54:00:12:34:56 (slot 0)
+[pci] driver e1000    bound to 00:03.0  (8086:100e)
+[pci] bind complete -- 2 of 6 device(s) bound  (2 newly this pass)
+[blk] 1 device(s):
+  [0] ide0:master       32768 sectors (16384 KiB)
+[net] 1 nic(s) registered:
+  [0] e1000:00:03.0 mac=52:54:00:12:34:56
+[boot] Limine modules (2):
+  [0] /boot/initrd.tar  size=215040  addr=0xffff800007e54000
+  [1] /boot/install.img  size=4194304  addr=0xffff800007a53000
+[initrd] using '/boot/initrd.tar' (size=215040, addr=0xffff800007e54000)
+[ramfs] mounted: 19 entries from 215040-byte tar at 0xffff800007e54000
+  - bin/hello                         8848 B
+  - bin/bad                           8800 B
+  - bin/echo                          8744 B
+  - bin/cat                           4768 B
+  - bin/long_task                     5024 B
+  - bin/netecho                       13336 B
+  - bin/gui_demo                      12944 B
+  - bin/gui_clock                     8816 B
+  - bin/gui_widgets                   13472 B
+  - bin/gui_about                     13432 B
+  - bin/gui_term                      13032 B
+  - bin/gui_files                     13480 B
+  - bin/gui_viewer                    13104 B
+  - bin/login                         13456 B
+  - bin/gui_settings                  13560 B
+  - repo/helloapp.tpkg                13777 B
+  - repo/helloapp_v2.tpkg             13834 B
+  - etc/motd                          297 B
+  - readme.txt                        922 B
+[tobyfs] bad magic 0x4e494d494c903ceb (expected 0x546f627946535331) -- run mkfs?
+[boot] /data at LBA 0 not a tobyfs (invalid argument); trying installed layout at LBA 8192...
+[tobyfs] mounted '/data' on data: 8/255 inodes, 5/1013 data blocks (4032 KiB free)
+[boot] mounted installed /data at LBA 8192
+[installer] live install image registered: 4194304 bytes @ 0xffff800007a53000
+[vfs] mount table (2 entries):
+  /            -> ops=0xffffffff8003a6f8 mnt=0xffffffff80043a80
+  /data        -> ops=0xffffffff8003a820 mnt=0xffffd00000011be0
+[proc] table initialised (16 slots), pid 0 = 'kernel_main' RUNNING
+[sched] cooperative round-robin scheduler ready
+[signal] subsystem up (SIGINT=2, SIGTERM=15)
+[boot] spawning first userspace process from /bin/hello...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x34 filesz=0x34 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x45 filesz=0x45 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] load OK (user): 2 segment(s), entry=0x0000000000400000
+[proc] created pid=1 'hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffefe0 cr3=0x139000 kstack=0xffffd00000017dd0 argc=0
+hello from user mode
+user_hello: about to SYS_EXIT(0x55)
+[sys_exit] user requested exit, code=85 (0x55)
+[proc] pid=1 'hello-boot' exit code=85 (0x55) cpu=0 ms syscalls=3
+[proc] reaped pid=1, slot recycled
+[boot] /bin/hello (pid=1) finished, exit code=85 (0x55)
+[acpi] using RSDT @ 0x0000000007fe244c (entries=4)
+[acpi] MADT: lapic_phys (32-bit field) = 0x00000000fee00000, legacy_pic=yes
+[acpi]   CPU0: acpi_id=0 apic_id=0 flags=0x1 enabled 
+[acpi]   CPU1: acpi_id=1 apic_id=1 flags=0x1 enabled 
+[acpi]   CPU2: acpi_id=2 apic_id=2 flags=0x1 enabled 
+[acpi]   CPU3: acpi_id=3 apic_id=3 flags=0x1 enabled 
+[acpi]   IOAPIC entry (ignored, no IO-APIC routing this milestone)
+[acpi] enumerated 4 CPUs (SMP)
+[apic] BSP local APIC: phys=0x00000000fee00000 virt=0xffffd20000000000 id=0 ver=0x14
+[apic] SVR=0x1ff  spurious_vec=0xff  timer_vec=0x40 (masked)
+[apic] timer calibrated: ~9396600 ticks/10ms (~939660 kHz)
+[smp] 4 CPU(s) total: BSP apic_id=0
+[smp]   cpu0: apic_id=0 (BSP)
+[smp]   cpu1: apic_id=1
+[smp]   cpu2: apic_id=2
+[smp]   cpu3: apic_id=3
+CPU 0 online
+  apic_id=0 (BSP)  stack=bootloader-provided
+[smp] trampoline installed: phys=0x0000000000070000 virt=0xffff800000070000 len=1024 bytes
+[smp] cpu1: INIT-SIPI-SIPI to apic_id=1 (tramp_vector=0x70, stack=0xffffd00000017c80)
+CPU 1 online
+  apic_id=1 (acpi said 1)  stack_top=0xffffd00000017c80
+[smp] cpu2: INIT-SIPI-SIPI to apic_id=2 (tramp_vector=0x70, stack=0xffffd0000001bc90)
+CPU 2 online
+  apic_id=2 (acpi said 2)  stack_top=0xffffd0000001bc90
+[smp] cpu3: INIT-SIPI-SIPI to apic_id=3 (tramp_vector=0x70, stack=0xffffd0000001fca0)
+CPU 3 online
+  apic_id=3 (acpi said 3)  stack_top=0xffffd0000001fca0
+[smp] 3/3 APs online (total 4 CPUs)
+[net] up: nic=e1000:00:03.0 ip=10.0.2.15 gw=10.0.2.2 mac=52:54:00:12:34:56
+[net] gateway 10.0.2.2 -> 52:55:0a:00:02:02 (cached)
+[gfx] back buffer 1280x800 (4000 KiB) ready, fb_pitch=1280 px, backend=limine-fb
+[mouse] PS/2 driver up (IRQ12 unmasked, cascade IRQ2 open)
+[gui] window manager ready (max 8 windows, 18-px title bar)
+[term] session pool ready (4 sessions, 4096-byte rings)
+Welcome to tobyOS
+milestone 14: services + settings + login. Boot drops into the GUI desktop with /bin/login.
+
+[settings] loading /data/settings.conf (209 bytes)
+[settings] cache:
+  desktop.bg=0x00204060
+  desktop.title=tobyOS
+  desktop.greeting=Welcome to tobyOS
+  user.last=toby
+  user.greeting=Hello, friend!
+  session.autostart=
+[users] loading /data/users (86 bytes)
+[users] cache (3 entries):
+  root             uid=0 gid=0
+  toby             uid=1000 gid=1000
+  guest            uid=1001 gid=1001
+[svc] service manager up (max 8 services)
+[svc] registered builtin 'input'
+[svc] registered builtin 'network'
+[svc] registered builtin 'desktop'
+[svc] registered builtin 'session'
+[trace] level 0 -> 1
+[gui] auto-enabled trace (level=1) for desktop session
+[trace t=87 pid=0] gui_set_desktop_mode: off -> on
+[gui] entering graphical mode
+[session] init: last user='toby' (will be pre-filled at login)
+[svc] registered program 'login' -> /bin/login (autorestart=1)
+[trace t=88 pid=0] launch_enqueue '/bin/login' sandbox='' (head=1 tail=0)
+[svc] 'login' enqueued (restart #1)
+[svc] 5 services registered
+  name         kind    state   auto pid rcnt  path
+  input        builtin running 0    0   0     (builtin)
+  network      builtin running 0    0   0     (builtin)
+  desktop      builtin running 0    0   0     (builtin)
+  session      builtin running 0    0   0     (builtin)
+  login        program running 1    0   1     /bin/login
+[pkg] package manager ready (apps=/data/apps db=/data/packages repo=/data/repo,/repo)
+type 'help' to list commands.
+tobyOS> [trace t=90 pid=0] drain_launch_queue: spawning '/bin/login' sandbox='default'
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xde1 filesz=0xde1 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x194 filesz=0x194 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x18 filesz=0x0 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): 3 segment(s), entry=0x0000000000400000
+[proc] created pid=1 'login' entry=0x0000000000400000 rsp=0x00007fffffffefe0 cr3=0x553000 kstack=0xffffd00000412180 argc=0
+[cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=90 pid=0] track_pid pid=1 slot=0
+[gui] launched /bin/login as pid 1 (session=0)
+[trace t=90 pid=0] drain_launch_queue: spawned '/bin/login' as pid=1 session=0
+[svc] 'login' pid=1 (backfilled)
+[trace t=90 pid=1] window_create wid=1 owner_pid=1 size=380x220 pos=(60,40) title='tobyOS login'
+[trace t=100 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=200 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=300 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=400 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=501 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=601 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=701 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=801 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=901 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1001 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1101 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+
+=== serial (COM1) ===
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+[2J[H
+[2;27H[36mLimine 11.4.0 (x86-64, BIOS)[0m
+
+
+
+[13;1H                                   [7m tobyOS [27m
+[4;1H    [32mARROWS[0m Select    [32mENTER[0m Boot    [32mE[0m Edit[4;64H[32mB[0m Blank Entry[14;1H
+
+[24;1H[2K[32mBooting automatically in [92m3[32m, press any key to stop the countdown...[0m[24;1H[2K[32mBooting automatically in [92m2[32m, press any key to stop the countdown...[0m[24;1H[2K[32mBooting automatically in [92m1[32m, press any key to stop the countdown...[0m[2J[Hlimine: Loading executable `boot():/boot/tobyos.bin`...
+limine: Physical base:   0x7e93000
+limine: Virtual base:    0xffffffff80000000
+limine: Slide:           0x0
+limine: ELF entry point: 0xffffffff80001000
+limine: Base revision:   3
+limine: Requests count:  6
+limine: Top of HHDM:     0x40000000
+acpi: Found RSDP at 0xf52e0
+limine: Loading module `boot():/boot/initrd.tar`...
+limine: Loading module `boot():/boot/install.img`...
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Mode was already set, perfect!
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+paging: 1GiB pages are not supported!
+acpi: Found RSDP at 0xf52e0
+acpi: "DMAR" not found
+acpi: Found RSDP at 0xf52e0
+acpi: "IVRS" not found
+[boot] serial up
+[boot] framebuffer: 1280x800 pitch=5120 bpp=32 addr=0xffff8000fd000000
+[boot] console up
+[gdt] loaded: base=0xffffffff8003d4a0 limit=55 entries=7
+[gdt] CS=0x08 DS=0x10 (expected CS=0x08 DS=0x10)
+[gdt] user CS=0x23 DS=0x1b  TSS sel=0x28 (TSS slot empty until tss_init)
+[idt] loaded: base=0xffffffff8003d4f0 limit=4095 (48 gates wired)
+[boot] firing int3 to exercise IDT round-trip...
+[isr] breakpoint hit at rip=0xffffffff8000107b (rflags=0x82)
+[boot] int3 returned cleanly, IDT round-trip OK
+[pit] channel 0 -> 100 Hz (divisor=11931)
+[kbd] PS/2 driver up (IRQ1 unmasked)
+[boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard)
+[perf] TSC calibrated: 6636 MHz (331819733 cycles in 50000000 ns)
+[boot] HHDM offset = 0xffff800000000000
+[pmm] Limine memmap (19 entries):
+  0x0000000000001000..0x0000000000061000       384 KiB  bootloader
+  0x0000000000061000..0x000000000009f000       248 KiB  usable
+  0x000000000009fc00..0x00000000000a0000         1 KiB  reserved
+  0x00000000000f0000..0x0000000000100000        64 KiB  reserved
+  0x0000000000100000..0x0000000007a53000    124236 KiB  usable
+  0x0000000007a53000..0x0000000007e53000      4096 KiB  kernel
+  0x0000000007e53000..0x0000000007e54000         4 KiB  bootloader
+  0x0000000007e54000..0x0000000007e89000       212 KiB  kernel
+  0x0000000007e89000..0x0000000007e8a000         4 KiB  bootloader
+  0x0000000007e8a000..0x0000000007e8d000        12 KiB  usable
+  0x0000000007e8d000..0x0000000007e93000        24 KiB  bootloader
+  0x0000000007e93000..0x0000000007ee5000       328 KiB  kernel
+  0x0000000007ee5000..0x0000000007f30000       300 KiB  bootloader
+  0x0000000007f30000..0x0000000007f4b000       108 KiB  usable
+  0x0000000007f4b000..0x0000000007fe0000       596 KiB  bootloader
+  0x0000000007fe0000..0x0000000008000000       128 KiB  reserved
+  0x00000000fd000000..0x00000000fd3e8000      4000 KiB  framebuffer
+  0x00000000fffc0000..0x0000000100000000       256 KiB  reserved
+  0x000000fd00000000..0x0000010000000000  12582912 KiB  reserved
+[pmm] managed:  32587 pages (127 MiB) up to 0x0000000007f4b000
+[pmm] usable:   124604 KiB across 19 regions
+[pmm] bitmap:   4074 bytes at phys 0x0000000000061000 (virt 0xffff800000061000), 1 pages
+[pmm] free:     31150 pages (121 MiB) -- used: 1437 pages
+[pmm] test: allocated 0x0000000000062000 0x0000000000063000 0x0000000000064000 0x0000000000065000 (free now=31146)
+[pmm] test: read-back a=0xdeadbeefcafebabe d=0x1122334455667788
+[pmm] test: alloc/free balanced (free=31150 before & after)
+[boot] reserved AP trampoline page at phys 0x0000000000070000
+[vmm] kernel image: virt 0xffffffff80000000..0xffffffff80052000 -> phys 0x0000000007e93000 (328 KiB)
+[vmm] hhdm mirror:  132 MiB across memmap, top phys 0x00000000fd400000, 2M pages
+[vmm] new PML4 at phys 0x0000000000062000, switching CR3...
+[vmm] CR3 switched. Running on tobyOS page tables.
+[vmm] test: __text_start 0xffffffff80001000 -> phys 0x0000000007e94000
+[vmm] test: __data_start 0xffffffff8003d000 -> phys 0x0000000007ed0000
+[vmm] test: HHDM r/w through new PML4 at phys 0x0000000000069000 OK
+[vmm] test: new mapping at 0xffffc00000000000 <-> phys 0x0000000000069000 verified
+[vmm] test: unmap clears translation, scratch page freed
+[vmm] test: ok
+[heap] up: initial arena 17 pages (67 KiB)
+[heap] start: arenas=1 total=69600 used=0 free=69600  brk=0xffffd00000011000 (region 0xffffd00000000000..0xffffd10000000000)
+[heap] after 8 allocs: arenas=2 used=85616 free=65872 allocs=8
+[heap] after 8 frees: arenas=2 used=0 free=151488 frees=8
+[heap] test: ok (region OK, fragmented 80 KiB alloc OK, round-trip balanced, kcalloc zero-verified)
+[heap] brk now 0xffffd00000025000 (148 KiB virt consumed)
+[tss] installed: tss=0xffffffff800430e0 rsp0=0xffffffff800430e0 (irq stack 16 KiB)
+[sys] EFER.SCE on, STAR=0x0010000800000000, LSTAR=0xffffffff8002d9a0, FMASK=0x700
+[sys] kernel syscall rsp = 0xffffffff800430e0
+[sys] available syscalls: 0=exit  1=write  2=read  3=pipe  4=close  5=yield
+[sys]                     6=socket 7=bind 8=sendto 9=recvfrom
+[sys]                     10=gui_create 11=gui_fill 12=gui_text 13=gui_flip 14=gui_poll_event
+[sys]                     15=term_open 16=term_write 17=term_read 18=fs_readdir 19=fs_readfile 20=exec
+[sys]                     21=setting_get 22=setting_set 23=login 24=logout 25=session_info
+[sys]                     26=getuid 27=getgid 28=username 29=chmod 30=chown
+[pci] enumerating bus 0...
+[pci] 6 device(s):
+[pci] 00:00.0  8086:1237  bridge.host       
+[pci] 00:01.0  8086:7000  bridge.isa        
+[pci] 00:01.1  8086:7010  storage.ide         BAR4 io 16
+[pci] 00:01.3  8086:7113  bridge              IRQ 9
+[pci] 00:02.0  1234:1111  display.vga         BAR0 mem 16384K  BAR2 mem 4K
+[pci] 00:03.0  8086:100e  network.ethernet    IRQ 11  BAR0 mem 128K  BAR1 io 64
+[ata] primary master: 32768 sectors (16384 KiB) -- PIO LBA28 (PCI 00:01.1)
+[blk] registered 'ide0:master' (32768 sectors, 16384 KiB)
+[pci] driver blk_ata  bound to 00:01.1  (8086:7010)
+[e1000] probing 00:03.0  (vid:did 8086:100e)
+[e1000] MMIO BAR0 phys=0x00000000febc0000 virt=0xffff8000febc0000 (128 KiB UC)
+[net] +nic e1000:00:03.0 mac=52:54:00:12:34:56 (slot 0)
+[pci] driver e1000    bound to 00:03.0  (8086:100e)
+[pci] bind complete -- 2 of 6 device(s) bound  (2 newly this pass)
+[blk] 1 device(s):
+  [0] ide0:master       32768 sectors (16384 KiB)
+[net] 1 nic(s) registered:
+  [0] e1000:00:03.0 mac=52:54:00:12:34:56
+[boot] Limine modules (2):
+  [0] /boot/initrd.tar  size=215040  addr=0xffff800007e54000
+  [1] /boot/install.img  size=4194304  addr=0xffff800007a53000
+[initrd] using '/boot/initrd.tar' (size=215040, addr=0xffff800007e54000)
+[ramfs] mounted: 19 entries from 215040-byte tar at 0xffff800007e54000
+  - bin/hello                         8848 B
+  - bin/bad                           8800 B
+  - bin/echo                          8744 B
+  - bin/cat                           4768 B
+  - bin/long_task                     5024 B
+  - bin/netecho                       13336 B
+  - bin/gui_demo                      12944 B
+  - bin/gui_clock                     8816 B
+  - bin/gui_widgets                   13472 B
+  - bin/gui_about                     13432 B
+  - bin/gui_term                      13032 B
+  - bin/gui_files                     13480 B
+  - bin/gui_viewer                    13104 B
+  - bin/login                         13456 B
+  - bin/gui_settings                  13560 B
+  - repo/helloapp.tpkg                13777 B
+  - repo/helloapp_v2.tpkg             13834 B
+  - etc/motd                          297 B
+  - readme.txt                        922 B
+[tobyfs] bad magic 0x4e494d494c903ceb (expected 0x546f627946535331) -- run mkfs?
+[boot] /data at LBA 0 not a tobyfs (invalid argument); trying installed layout at LBA 8192...
+[tobyfs] mounted '/data' on data: 8/255 inodes, 5/1013 data blocks (4032 KiB free)
+[boot] mounted installed /data at LBA 8192
+[installer] live install image registered: 4194304 bytes @ 0xffff800007a53000
+[vfs] mount table (2 entries):
+  /            -> ops=0xffffffff8003a6f8 mnt=0xffffffff80043a80
+  /data        -> ops=0xffffffff8003a820 mnt=0xffffd00000011be0
+[proc] table initialised (16 slots), pid 0 = 'kernel_main' RUNNING
+[sched] cooperative round-robin scheduler ready
+[signal] subsystem up (SIGINT=2, SIGTERM=15)
+[boot] spawning first userspace process from /bin/hello...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x34 filesz=0x34 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x45 filesz=0x45 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] load OK (user): 2 segment(s), entry=0x0000000000400000
+[proc] created pid=1 'hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffefe0 cr3=0x139000 kstack=0xffffd00000017dd0 argc=0
+hello from user mode
+user_hello: about to SYS_EXIT(0x55)
+[sys_exit] user requested exit, code=85 (0x55)
+[proc] pid=1 'hello-boot' exit code=85 (0x55) cpu=0 ms syscalls=3
+[proc] reaped pid=1, slot recycled
+[boot] /bin/hello (pid=1) finished, exit code=85 (0x55)
+[acpi] using RSDT @ 0x0000000007fe244c (entries=4)
+[acpi] MADT: lapic_phys (32-bit field) = 0x00000000fee00000, legacy_pic=yes
+[acpi]   CPU0: acpi_id=0 apic_id=0 flags=0x1 enabled 
+[acpi]   CPU1: acpi_id=1 apic_id=1 flags=0x1 enabled 
+[acpi]   CPU2: acpi_id=2 apic_id=2 flags=0x1 enabled 
+[acpi]   CPU3: acpi_id=3 apic_id=3 flags=0x1 enabled 
+[acpi]   IOAPIC entry (ignored, no IO-APIC routing this milestone)
+[acpi] enumerated 4 CPUs (SMP)
+[apic] BSP local APIC: phys=0x00000000fee00000 virt=0xffffd20000000000 id=0 ver=0x14
+[apic] SVR=0x1ff  spurious_vec=0xff  timer_vec=0x40 (masked)
+[apic] timer calibrated: ~9396600 ticks/10ms (~939660 kHz)
+[smp] 4 CPU(s) total: BSP apic_id=0
+[smp]   cpu0: apic_id=0 (BSP)
+[smp]   cpu1: apic_id=1
+[smp]   cpu2: apic_id=2
+[smp]   cpu3: apic_id=3
+CPU 0 online
+  apic_id=0 (BSP)  stack=bootloader-provided
+[smp] trampoline installed: phys=0x0000000000070000 virt=0xffff800000070000 len=1024 bytes
+[smp] cpu1: INIT-SIPI-SIPI to apic_id=1 (tramp_vector=0x70, stack=0xffffd00000017c80)
+CPU 1 online
+  apic_id=1 (acpi said 1)  stack_top=0xffffd00000017c80
+[smp] cpu2: INIT-SIPI-SIPI to apic_id=2 (tramp_vector=0x70, stack=0xffffd0000001bc90)
+CPU 2 online
+  apic_id=2 (acpi said 2)  stack_top=0xffffd0000001bc90
+[smp] cpu3: INIT-SIPI-SIPI to apic_id=3 (tramp_vector=0x70, stack=0xffffd0000001fca0)
+CPU 3 online
+  apic_id=3 (acpi said 3)  stack_top=0xffffd0000001fca0
+[smp] 3/3 APs online (total 4 CPUs)
+[net] up: nic=e1000:00:03.0 ip=10.0.2.15 gw=10.0.2.2 mac=52:54:00:12:34:56
+[net] gateway 10.0.2.2 -> 52:55:0a:00:02:02 (cached)
+[gfx] back buffer 1280x800 (4000 KiB) ready, fb_pitch=1280 px, backend=limine-fb
+[mouse] PS/2 driver up (IRQ12 unmasked, cascade IRQ2 open)
+[gui] window manager ready (max 8 windows, 18-px title bar)
+[term] session pool ready (4 sessions, 4096-byte rings)
+Welcome to tobyOS
+milestone 14: services + settings + login. Boot drops into the GUI desktop with /bin/login.
+
+[settings] loading /data/settings.conf (209 bytes)
+[settings] cache:
+  desktop.bg=0x00204060
+  desktop.title=tobyOS
+  desktop.greeting=Welcome to tobyOS
+  user.last=toby
+  user.greeting=Hello, friend!
+  session.autostart=
+[users] loading /data/users (86 bytes)
+[users] cache (3 entries):
+  root             uid=0 gid=0
+  toby             uid=1000 gid=1000
+  guest            uid=1001 gid=1001
+[svc] service manager up (max 8 services)
+[svc] registered builtin 'input'
+[svc] registered builtin 'network'
+[svc] registered builtin 'desktop'
+[svc] registered builtin 'session'
+[trace] level 0 -> 1
+[gui] auto-enabled trace (level=1) for desktop session
+[trace t=87 pid=0] gui_set_desktop_mode: off -> on
+[gui] entering graphical mode
+[session] init: last user='toby' (will be pre-filled at login)
+[svc] registered program 'login' -> /bin/login (autorestart=1)
+[trace t=88 pid=0] launch_enqueue '/bin/login' sandbox='' (head=1 tail=0)
+[svc] 'login' enqueued (restart #1)
+[svc] 5 services registered
+  name         kind    state   auto pid rcnt  path
+  input        builtin running 0    0   0     (builtin)
+  network      builtin running 0    0   0     (builtin)
+  desktop      builtin running 0    0   0     (builtin)
+  session      builtin running 0    0   0     (builtin)
+  login        program running 1    0   1     /bin/login
+[pkg] package manager ready (apps=/data/apps db=/data/packages repo=/data/repo,/repo)
+type 'help' to list commands.
+tobyOS> [trace t=90 pid=0] drain_launch_queue: spawning '/bin/login' sandbox='default'
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xde1 filesz=0xde1 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x194 filesz=0x194 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x18 filesz=0x0 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): 3 segment(s), entry=0x0000000000400000
+[proc] created pid=1 'login' entry=0x0000000000400000 rsp=0x00007fffffffefe0 cr3=0x553000 kstack=0xffffd00000412180 argc=0
+[cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=90 pid=0] track_pid pid=1 slot=0
+[gui] launched /bin/login as pid 1 (session=0)
+[trace t=90 pid=0] drain_launch_queue: spawned '/bin/login' as pid=1 session=0
+[svc] 'login' pid=1 (backfilled)
+[trace t=90 pid=1] window_create wid=1 owner_pid=1 size=380x220 pos=(60,40) title='tobyOS login'
+[trace t=100 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=200 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=300 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=400 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=501 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=601 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=701 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=801 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=901 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1001 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1101 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+
+=== qemu.log -- non-timer entries ===
+CPU Reset (CPU 0)
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00060fb1
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=0000fff0 EFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 00000000 0000ffff 00009300
+CS =f000 ffff0000 0000ffff 00009b00
+SS =0000 00000000 0000ffff 00009300
+DS =0000 00000000 0000ffff 00009300
+FS =0000 00000000 0000ffff 00009300
+GS =0000 00000000 0000ffff 00009300
+LDT=0000 00000000 0000ffff 00008200
+TR =0000 00000000 0000ffff 00008b00
+GDT=     00000000 0000ffff
+IDT=     00000000 0000ffff
+CR0=60000010 CR2=00000000 CR3=00000000 CR4=00000000
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+CCS=00000000 CCD=00000000 CCO=EFLAGS
+EFER=0000000000000000
+FCW=037f FSW=0000 [ST=0] FTW=00 MXCSR=00001f80
+FPR0=0000000000000000 0000 FPR1=0000000000000000 0000
+FPR2=0000000000000000 0000 FPR3=0000000000000000 0000
+FPR4=0000000000000000 0000 FPR5=0000000000000000 0000
+FPR6=0000000000000000 0000 FPR7=0000000000000000 0000
+XMM00=0000000000000000 0000000000000000 XMM01=0000000000000000 0000000000000000
+XMM02=0000000000000000 0000000000000000 XMM03=0000000000000000 0000000000000000
+XMM04=0000000000000000 0000000000000000 XMM05=0000000000000000 0000000000000000
+XMM06=0000000000000000 0000000000000000 XMM07=0000000000000000 0000000000000000
+CPU Reset (CPU 1)
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00060fb1
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=0000fff0 EFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=1
+ES =0000 00000000 0000ffff 00009300
+CS =f000 ffff0000 0000ffff 00009b00
+SS =0000 00000000 0000ffff 00009300
+DS =0000 00000000 0000ffff 00009300
+FS =0000 00000000 0000ffff 00009300
+GS =0000 00000000 0000ffff 00009300
+LDT=0000 00000000 0000ffff 00008200
+TR =0000 00000000 0000ffff 00008b00
+GDT=     00000000 0000ffff
+IDT=     00000000 0000ffff
+CR0=60000010 CR2=00000000 CR3=00000000 CR4=00000000
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+CCS=00000000 CCD=00000000 CCO=EFLAGS
+EFER=0000000000000000
+FCW=037f FSW=0000 [ST=0] FTW=00 MXCSR=00001f80
+FPR0=0000000000000000 0000 FPR1=0000000000000000 0000
+FPR2=0000000000000000 0000 FPR3=0000000000000000 0000
+FPR4=0000000000000000 0000 FPR5=0000000000000000 0000
+FPR6=0000000000000000 0000 FPR7=0000000000000000 0000
+XMM00=0000000000000000 0000000000000000 XMM01=0000000000000000 0000000000000000
+XMM02=0000000000000000 0000000000000000 XMM03=0000000000000000 0000000000000000
+XMM04=0000000000000000 0000000000000000 XMM05=0000000000000000 0000000000000000
+XMM06=0000000000000000 0000000000000000 XMM07=0000000000000000 0000000000000000
+CPU Reset (CPU 2)
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00060fb1
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=0000fff0 EFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=1
+ES =0000 00000000 0000ffff 00009300
+CS =f000 ffff0000 0000ffff 00009b00
+SS =0000 00000000 0000ffff 00009300
+DS =0000 00000000 0000ffff 00009300
+FS =0000 00000000 0000ffff 00009300
+GS =0000 00000000 0000ffff 00009300
+LDT=0000 00000000 0000ffff 00008200
+TR =0000 00000000 0000ffff 00008b00
+GDT=     00000000 0000ffff
+IDT=     00000000 0000ffff
+CR0=60000010 CR2=00000000 CR3=00000000 CR4=00000000
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+CCS=00000000 CCD=00000000 CCO=EFLAGS
+EFER=0000000000000000
+FCW=037f FSW=0000 [ST=0] FTW=00 MXCSR=00001f80
+FPR0=0000000000000000 0000 FPR1=0000000000000000 0000
+FPR2=0000000000000000 0000 FPR3=0000000000000000 0000
+FPR4=0000000000000000 0000 FPR5=0000000000000000 0000
+FPR6=0000000000000000 0000 FPR7=0000000000000000 0000
+XMM00=0000000000000000 0000000000000000 XMM01=0000000000000000 0000000000000000
+XMM02=0000000000000000 0000000000000000 XMM03=0000000000000000 0000000000000000
+XMM04=0000000000000000 0000000000000000 XMM05=0000000000000000 0000000000000000
+XMM06=0000000000000000 0000000000000000 XMM07=0000000000000000 0000000000000000
+CPU Reset (CPU 3)
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00060fb1
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=0000fff0 EFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=1
+ES =0000 00000000 0000ffff 00009300
+CS =f000 ffff0000 0000ffff 00009b00
+SS =0000 00000000 0000ffff 00009300
+DS =0000 00000000 0000ffff 00009300
+FS =0000 00000000 0000ffff 00009300
+GS =0000 00000000 0000ffff 00009300
+LDT=0000 00000000 0000ffff 00008200
+TR =0000 00000000 0000ffff 00008b00
+GDT=     00000000 0000ffff
+IDT=     00000000 0000ffff
+CR0=60000010 CR2=00000000 CR3=00000000 CR4=00000000
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+CCS=00000000 CCD=00000000 CCO=EFLAGS
+EFER=0000000000000000
+FCW=037f FSW=0000 [ST=0] FTW=00 MXCSR=00001f80
+FPR0=0000000000000000 0000 FPR1=0000000000000000 0000
+FPR2=0000000000000000 0000 FPR3=0000000000000000 0000
+FPR4=0000000000000000 0000 FPR5=0000000000000000 0000
+FPR6=0000000000000000 0000 FPR7=0000000000000000 0000
+XMM00=0000000000000000 0000000000000000 XMM01=0000000000000000 0000000000000000
+XMM02=0000000000000000 0000000000000000 XMM03=0000000000000000 0000000000000000
+XMM04=0000000000000000 0000000000000000 XMM05=0000000000000000 0000000000000000
+XMM06=0000000000000000 0000000000000000 XMM07=0000000000000000 0000000000000000
+CPU Reset (CPU 0)
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00060fb1
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=0000fff0 EFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 00000000 0000ffff 00009300
+CS =f000 ffff0000 0000ffff 00009b00
+SS =0000 00000000 0000ffff 00009300
+DS =0000 00000000 0000ffff 00009300
+FS =0000 00000000 0000ffff 00009300
+GS =0000 00000000 0000ffff 00009300
+LDT=0000 00000000 0000ffff 00008200
+TR =0000 00000000 0000ffff 00008b00
+GDT=     00000000 0000ffff
+IDT=     00000000 0000ffff
+CR0=60000010 CR2=00000000 CR3=00000000 CR4=00000000
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+CCS=00000000 CCD=00000000 CCO=EFLAGS
+EFER=0000000000000000
+FCW=037f FSW=0000 [ST=0] FTW=00 MXCSR=00001f80
+FPR0=0000000000000000 0000 FPR1=0000000000000000 0000
+FPR2=0000000000000000 0000 FPR3=0000000000000000 0000
+FPR4=0000000000000000 0000 FPR5=0000000000000000 0000
+FPR6=0000000000000000 0000 FPR7=0000000000000000 0000
+XMM00=0000000000000000 0000000000000000 XMM01=0000000000000000 0000000000000000
+XMM02=0000000000000000 0000000000000000 XMM03=0000000000000000 0000000000000000
+XMM04=0000000000000000 0000000000000000 XMM05=0000000000000000 0000000000000000
+XMM06=0000000000000000 0000000000000000 XMM07=0000000000000000 0000000000000000
+CPU Reset (CPU 1)
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00060fb1
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=0000fff0 EFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=1
+ES =0000 00000000 0000ffff 00009300
+CS =f000 ffff0000 0000ffff 00009b00
+SS =0000 00000000 0000ffff 00009300
+DS =0000 00000000 0000ffff 00009300
+FS =0000 00000000 0000ffff 00009300
+GS =0000 00000000 0000ffff 00009300
+LDT=0000 00000000 0000ffff 00008200
+TR =0000 00000000 0000ffff 00008b00
+GDT=     00000000 0000ffff
+IDT=     00000000 0000ffff
+CR0=60000010 CR2=00000000 CR3=00000000 CR4=00000000
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+CCS=00000000 CCD=00000000 CCO=EFLAGS
+EFER=0000000000000000
+FCW=037f FSW=0000 [ST=0] FTW=00 MXCSR=00001f80
+FPR0=0000000000000000 0000 FPR1=0000000000000000 0000
+FPR2=0000000000000000 0000 FPR3=0000000000000000 0000
+FPR4=0000000000000000 0000 FPR5=0000000000000000 0000
+FPR6=0000000000000000 0000 FPR7=0000000000000000 0000
+XMM00=0000000000000000 0000000000000000 XMM01=0000000000000000 0000000000000000
+XMM02=0000000000000000 0000000000000000 XMM03=0000000000000000 0000000000000000
+XMM04=0000000000000000 0000000000000000 XMM05=0000000000000000 0000000000000000
+XMM06=0000000000000000 0000000000000000 XMM07=0000000000000000 0000000000000000
+CPU Reset (CPU 2)
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00060fb1
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=0000fff0 EFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=1
+ES =0000 00000000 0000ffff 00009300
+CS =f000 ffff0000 0000ffff 00009b00
+SS =0000 00000000 0000ffff 00009300
+DS =0000 00000000 0000ffff 00009300
+FS =0000 00000000 0000ffff 00009300
+GS =0000 00000000 0000ffff 00009300
+LDT=0000 00000000 0000ffff 00008200
+TR =0000 00000000 0000ffff 00008b00
+GDT=     00000000 0000ffff
+IDT=     00000000 0000ffff
+CR0=60000010 CR2=00000000 CR3=00000000 CR4=00000000
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+CCS=00000000 CCD=00000000 CCO=EFLAGS
+EFER=0000000000000000
+FCW=037f FSW=0000 [ST=0] FTW=00 MXCSR=00001f80
+FPR0=0000000000000000 0000 FPR1=0000000000000000 0000
+FPR2=0000000000000000 0000 FPR3=0000000000000000 0000
+FPR4=0000000000000000 0000 FPR5=0000000000000000 0000
+FPR6=0000000000000000 0000 FPR7=0000000000000000 0000
+XMM00=0000000000000000 0000000000000000 XMM01=0000000000000000 0000000000000000
+XMM02=0000000000000000 0000000000000000 XMM03=0000000000000000 0000000000000000
+XMM04=0000000000000000 0000000000000000 XMM05=0000000000000000 0000000000000000
+XMM06=0000000000000000 0000000000000000 XMM07=0000000000000000 0000000000000000
+CPU Reset (CPU 3)
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00060fb1
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=0000fff0 EFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=1

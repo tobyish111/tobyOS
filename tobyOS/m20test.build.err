@@ -1,0 +1,56 @@
+GNU xorriso 1.5.6 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:build/base.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 2877g free
+Added to ISO image: directory '/'='/c/CustomOS/tobyOS/build/iso_base'
+xorriso : UPDATE :      11 files added in 1 seconds
+xorriso : UPDATE :      11 files added in 1 seconds
+ISO image produced: 2192 sectors
+Written to medium : 2192 sectors at LBA 0
+Writing to 'stdio:build/base.iso' completed successfully.
+
+Physical block size of 512 bytes.
+Installing to GPT. Logical block size of 512 bytes.
+Secondary header at LBA 0x223f.
+Secondary header valid.
+Detected ISOHYBRID with a GUID partition table (GPT).
+Converting to MBR for improved compatibility...
+Conversion successful.
+No active partition found, some systems may not boot.
+Setting partition 1 as active to work around the issue...
+Installing to MBR.
+Stage 2 to be located at byte offset 0x200.
+Reminder: Remember to copy the limine-bios.sys file in either
+          the root, /boot, /limine, or /boot/limine directories of
+          one of the partitions on the device, or boot will fail!
+Limine BIOS stages installed successfully.
+GNU xorriso 1.5.6 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:tobyOS.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 2877g free
+Added to ISO image: directory '/'='/c/CustomOS/tobyOS/iso'
+xorriso : UPDATE :      12 files added in 1 seconds
+xorriso : UPDATE :      12 files added in 1 seconds
+ISO image produced: 4240 sectors
+Written to medium : 4240 sectors at LBA 0
+Writing to 'stdio:tobyOS.iso' completed successfully.
+
+Physical block size of 512 bytes.
+Installing to GPT. Logical block size of 512 bytes.
+Secondary header at LBA 0x423f.
+Secondary header valid.
+Detected ISOHYBRID with a GUID partition table (GPT).
+Converting to MBR for improved compatibility...
+Conversion successful.
+No active partition found, some systems may not boot.
+Setting partition 1 as active to work around the issue...
+Installing to MBR.
+Stage 2 to be located at byte offset 0x200.
+Reminder: Remember to copy the limine-bios.sys file in either
+          the root, /boot, /limine, or /boot/limine directories of
+          one of the partitions on the device, or boot will fail!
+Limine BIOS stages installed successfully.

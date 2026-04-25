@@ -1,0 +1,1986 @@
+[boot] serial up
+[0] INFO  slog    : slog ready (depth=256, persist=/data/system.log)
+[0] INFO  boot    : tobyOS boot sequence started
+[boot] framebuffer: 1280x800 pitch=5120 bpp=32 addr=0xffff8000fd000000
+[boot] console up
+[gdt] loaded: base=0xffffffff80087650 limit=55 entries=7
+[gdt] CS=0x08 DS=0x10 (expected CS=0x08 DS=0x10)
+[gdt] user CS=0x23 DS=0x1b  TSS sel=0x28 (TSS slot empty until tss_init)
+[idt] loaded: base=0xffffffff800876a0 limit=4095 (256 gates wired)
+[boot] firing int3 to exercise IDT round-trip...
+[isr] breakpoint hit at rip=0xffffffff8000109a (rflags=0x86)
+[boot] int3 returned cleanly, IDT round-trip OK
+[0] INFO  wdog    : watchdog ready (timeout=10000 ms)
+[pit] channel 0 -> 100 Hz (divisor=11931)
+[kbd] PS/2 driver up (IRQ1 unmasked)
+[boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard, via legacy PIC for early boot)
+[perf] TSC calibrated: 4392 MHz (219630227 cycles in 50000000 ns)
+[boot] HHDM offset = 0xffff800000000000
+[pmm] Limine memmap (19 entries):
+  0x0000000000001000..0x0000000000061000       384 KiB  bootloader
+  0x0000000000061000..0x000000000009f000       248 KiB  usable
+  0x000000000009fc00..0x00000000000a0000         1 KiB  reserved
+  0x00000000000f0000..0x0000000000100000        64 KiB  reserved
+  0x0000000000100000..0x000000000777b000    121324 KiB  usable
+  0x000000000777b000..0x0000000007b7b000      4096 KiB  kernel
+  0x0000000007b7b000..0x0000000007b7c000         4 KiB  bootloader
+  0x0000000007b7c000..0x0000000007d3e000      1800 KiB  kernel
+  0x0000000007d3e000..0x0000000007d3f000         4 KiB  bootloader
+  0x0000000007d3f000..0x0000000007d42000        12 KiB  usable
+  0x0000000007d42000..0x0000000007d48000        24 KiB  bootloader
+  0x0000000007d48000..0x0000000007eae000      1432 KiB  kernel
+  0x0000000007eae000..0x0000000007f4b000       628 KiB  bootloader
+  0x0000000007f4b000..0x0000000007f66000       108 KiB  usable
+  0x0000000007f66000..0x0000000007fe0000       488 KiB  bootloader
+  0x0000000007fe0000..0x0000000008000000       128 KiB  reserved
+  0x00000000fd000000..0x00000000fd3e8000      4000 KiB  framebuffer
+  0x00000000fffc0000..0x0000000100000000       256 KiB  reserved
+  0x000000fd00000000..0x0000010000000000  12582912 KiB  reserved
+[pmm] managed:  32614 pages (127 MiB) up to 0x0000000007f66000
+[pmm] usable:   121692 KiB across 19 regions
+[pmm] bitmap:   4077 bytes at phys 0x0000000000061000 (virt 0xffff800000061000), 1 pages
+[pmm] free:     30422 pages (118 MiB) -- used: 2192 pages
+[pmm] test: allocated 0x0000000000062000 0x0000000000063000 0x0000000000064000 0x0000000000065000 (free now=30418)
+[pmm] test: read-back a=0xdeadbeefcafebabe d=0x1122334455667788
+[pmm] test: alloc/free balanced (free=30422 before & after)
+[boot] reserved AP trampoline page at phys 0x0000000000070000
+[vmm] kernel image: virt 0xffffffff80000000..0xffffffff80166000 -> phys 0x0000000007d48000 (1432 KiB)
+[vmm] hhdm mirror:  132 MiB across memmap, top phys 0x00000000fd400000, 2M pages
+[vmm] new PML4 at phys 0x0000000000062000, switching CR3...
+[vmm] CR3 switched. Running on tobyOS page tables.
+[vmm] test: __text_start 0xffffffff80001000 -> phys 0x0000000007d49000
+[vmm] test: __data_start 0xffffffff80086000 -> phys 0x0000000007dce000
+[vmm] test: HHDM r/w through new PML4 at phys 0x0000000000069000 OK
+[vmm] test: new mapping at 0xffffc00000000000 <-> phys 0x0000000000069000 verified
+[vmm] test: unmap clears translation, scratch page freed
+[vmm] test: ok
+[heap] up: initial arena 17 pages (67 KiB)
+[heap] start: arenas=1 total=69600 used=0 free=69600  brk=0xffffd00000011000 (region 0xffffd00000000000..0xffffd10000000000)
+[heap] after 8 allocs: arenas=2 used=85616 free=65872 allocs=8
+[heap] after 8 frees: arenas=2 used=0 free=151488 frees=8
+[heap] test: ok (region OK, fragmented 80 KiB alloc OK, round-trip balanced, kcalloc zero-verified)
+[heap] brk now 0xffffd00000025000 (148 KiB virt consumed)
+[tss] installed: tss=0xffffffff8009e460 rsp0=0xffffffff8009e460 (irq stack 16 KiB)
+[sys] EFER.SCE on, STAR=0x0010000800000000, LSTAR=0xffffffff800653f0, FMASK=0x700
+[sys] kernel syscall rsp = 0xffffffff8009e460
+[sys] available syscalls: 0=exit  1=write  2=read  3=pipe  4=close  5=yield
+[sys]                     6=socket 7=bind 8=sendto 9=recvfrom
+[sys]                     10=gui_create 11=gui_fill 12=gui_text 13=gui_flip 14=gui_poll_event
+[sys]                     15=term_open 16=term_write 17=term_read 18=fs_readdir 19=fs_readfile 20=exec
+[sys]                     21=setting_get 22=setting_set 23=login 24=logout 25=session_info
+[sys]                     26=getuid 27=getgid 28=username 29=chmod 30=chown
+[sys]   M25A: 31=getpid 32=getppid 33=spawn 34=waitpid 35=open 36=lseek 37=stat 38=fstat
+[sys]         39=dup 40=dup2 41=unlink 42=mkdir 43=brk 44=getcwd 45=chdir 46=getenv
+[sys]         47=nanosleep 48=clock_ms 49=abi_version (ABI v1)
+[acpi] using RSDT @ 0x0000000007fe244c (entries=4)
+[acpi] MADT: lapic_phys (32-bit field) = 0x00000000fee00000, legacy_pic=yes
+[acpi]   CPU0: acpi_id=0 apic_id=0 flags=0x1 enabled 
+[acpi]   CPU1: acpi_id=1 apic_id=1 flags=0x1 enabled 
+[acpi]   CPU2: acpi_id=2 apic_id=2 flags=0x1 enabled 
+[acpi]   CPU3: acpi_id=3 apic_id=3 flags=0x1 enabled 
+[acpi]   IOAPIC 0: mmio=0x00000000fec00000 gsi_base=0
+[acpi]   ISO: ISA IRQ0 -> GSI 2 (flags=0x0)
+[acpi]   ISO: ISA IRQ5 -> GSI 5 (flags=0xd)
+[acpi]   ISO: ISA IRQ9 -> GSI 9 (flags=0xd)
+[acpi]   ISO: ISA IRQ10 -> GSI 10 (flags=0xd)
+[acpi]   ISO: ISA IRQ11 -> GSI 11 (flags=0xd)
+[acpi]   LAPIC NMI: acpi_proc=255 lint=1 flags=0x0
+[acpi] enumerated 4 CPU(s) (SMP), 1 IO APIC(s), 5 override(s), 1 NMI source(s)
+[acpi] FADT: pm1a_cnt=0x604 pm1b_cnt=0x0 smi_cmd=0xb2 acpi_enable=0xf1 sci_int=9
+[acpi] FADT: reset_reg not supported (flags=0x80a5)
+[acpi] DSDT _S5_: SLP_TYPa=0 SLP_TYPb=0 (DSDT 8872 bytes)
+[acpi] AML inventory: dsdt=8836 bytes, 0 SSDT(s)
+[apic] BSP local APIC: phys=0x00000000fee00000 virt=0xffffd20000000000 id=0 ver=0x14
+[apic] SVR=0x1ff  spurious_vec=0xff  timer_vec=0x40 (masked)
+[apic] timer calibrated: ~2301500 ticks/10ms (~230150 kHz, ~230150000 Hz/sec)
+[ioapic] chip 0: phys=0x00000000fec00000 virt=0xffffd20000010000 gsi=[0..23] ver=0x20 entries=24
+[irq]   re-route ISA IRQ 0 -> GSI 2 vec=0x20 edge/ahigh
+[irq]   re-route ISA IRQ 1 (identity, edge/ahigh) -> vec=0x21
+[irq] facade: switched to IO APIC mode (2 IRQs re-routed)
+[pci] enumerating bus 0...
+[pci] 6 device(s):
+[pci] 00:00.0  8086:1237  bridge.host       
+[pci] 00:01.0  8086:7000  bridge.isa        
+[pci] 00:01.1  8086:7010  storage.ide         BAR4 io 16
+[pci] 00:01.3  8086:7113  bridge              IRQ 9
+[pci] 00:02.0  1234:1111  display.vga         BAR0 mem 16384K  BAR2 mem 4K
+[pci] 00:03.0  8086:100e  network.ethernet    IRQ 11  BAR0 mem 128K  BAR1 io 64
+[ata] primary master: 32768 sectors (16384 KiB) -- PIO LBA28 (PCI 00:01.1)
+[blk] registered 'ide0:master' [disk] (32768 sectors, 16384 KiB)
+[pci] driver blk_ata  bound to 00:01.1  (8086:7010) strat=generic
+[e1000] probing 00:03.0  (vid:did 8086:100e)
+[e1000] MMIO BAR0 phys=0x00000000febc0000 virt=0xffff8000febc0000 (128 KiB UC)
+[e1000] no MSI cap -- staying polled (vec 0x50 is now idle)
+[net] +nic e1000:00:03.0 mac=52:54:00:12:34:56 (slot 0)
+[pci] driver e1000    bound to 00:03.0  (8086:100e) strat=exact
+[pci] bind complete -- 2 of 6 device(s) bound  (2 newly this pass)
+[blk] 1 device(s) registered:
+  [0] ide0:master          disk    32768 sectors ( 16384 KiB)
+[net] 1 nic(s) registered:
+  [0] e1000:00:03.0 mac=52:54:00:12:34:56
+[boot] Limine modules (2):
+  [0] /boot/initrd.tar  size=1843200  addr=0xffff800007b7c000
+  [1] /boot/install.img  size=4194304  addr=0xffff80000777b000
+[initrd] using '/boot/initrd.tar' (size=1843200, addr=0xffff800007b7c000)
+[ramfs] mounted: 77 entries from 1843200-byte tar at 0xffff800007b7c000
+  - bin/hello                         8848 B  data@0xffff800007b7c200
+  - bin/bad                           8800 B  data@0xffff800007b7e800
+  - bin/echo                          13032 B  data@0xffff800007b80e00
+  - bin/cat                           8864 B  data@0xffff800007b84400
+  - bin/long_task                     8864 B  data@0xffff800007b86a00
+  - bin/netecho                       17232 B  data@0xffff800007b89000
+  - bin/gui_demo                      13080 B  data@0xffff800007b8d600
+  - bin/gui_clock                     13032 B  data@0xffff800007b90c00
+  - bin/gui_widgets                   13672 B  data@0xffff800007b94200
+  - bin/gui_about                     13632 B  data@0xffff800007b97a00
+  - bin/gui_term                      13232 B  data@0xffff800007b9b200
+  - bin/gui_files                     13624 B  data@0xffff800007b9e800
+  - bin/gui_viewer                    13304 B  data@0xffff800007ba2000
+  - bin/login                         13664 B  data@0xffff800007ba5600
+  - bin/gui_settings                  13760 B  data@0xffff800007ba8e00
+  - bin/abi_test                      13064 B  data@0xffff800007bac600
+  - bin/c_hello                       29648 B  data@0xffff800007bafc00
+  - bin/c_args                        29648 B  data@0xffff800007bb7200
+  - bin/c_filedemo                    33744 B  data@0xffff800007bbe800
+  - bin/c_alloctest                   33744 B  data@0xffff800007bc6e00
+  - bin/c_envtest                     34104 B  data@0xffff800007bcf400
+  - bin/c_dynhello                    3328 B  data@0xffff800007bd7c00
+  - bin/devlist                       34328 B  data@0xffff800007bd8c00
+  - bin/drvtest                       34328 B  data@0xffff800007be1600
+  - bin/usbtest                       38808 B  data@0xffff800007bea000
+  - bin/audiotest                     34328 B  data@0xffff800007bf3a00
+  - bin/batterytest                   34328 B  data@0xffff800007bfc400
+  - bin/displayinfo                   34328 B  data@0xffff800007c04e00
+  - bin/drawtest                      34472 B  data@0xffff800007c0d800
+  - bin/rendertest                    42984 B  data@0xffff800007c16200
+  - bin/fonttest                      33808 B  data@0xffff800007c20c00
+  - bin/logview                       34168 B  data@0xffff800007c29400
+  - bin/crashinfo                     33776 B  data@0xffff800007c31c00
+  - bin/wdogtest                      33864 B  data@0xffff800007c3a200
+  - bin/safesh                        34256 B  data@0xffff800007c42a00
+  - bin/fscheck                       33864 B  data@0xffff800007c4b200
+  - bin/services                      33936 B  data@0xffff800007c53a00
+  - bin/svc_crasher                   29648 B  data@0xffff800007c5c200
+  - bin/stabilitytest                 33992 B  data@0xffff800007c63800
+  - bin/hwinfo                        34320 B  data@0xffff800007c6c000
+  - bin/drvmatch                      43168 B  data@0xffff800007c74a00
+  - bin/hwcompat                      34360 B  data@0xffff800007c7f600
+  - bin/hwreport                      38520 B  data@0xffff800007c88000
+  - bin/compattest                    51912 B  data@0xffff800007c91a00
+  - bin/tobycc                        33888 B  data@0xffff800007c9e800
+  - bin/tobybuild                     34008 B  data@0xffff800007ca7000
+  - bin/selfhosttest                  34008 B  data@0xffff800007caf800
+  - bin/p_echo                        34112 B  data@0xffff800007cb8000
+  - bin/p_cat                         34112 B  data@0xffff800007cc0800
+  - bin/p_wc                          34472 B  data@0xffff800007cc9000
+  - bin/p_head                        34456 B  data@0xffff800007cd1a00
+  - bin/p_ls                          34704 B  data@0xffff800007cda400
+  - bin/p_grep                        34600 B  data@0xffff800007ce2e00
+  - lib/ld-toby.so                    5672 B  data@0xffff800007ceb800
+  - lib/libtoby.so                    47752 B  data@0xffff800007ced200
+  - repo/helloapp.tpkg                14262 B  data@0xffff800007cf9000
+  - repo/helloapp_v2.tpkg             14319 B  data@0xffff800007cfca00
+  - repo/helloapp_corrupt.tpkg        14261 B  data@0xffff800007d00400
+  - repo/helloapp_badhash.tpkg        14262 B  data@0xffff800007d03e00
+  - repo/helloapp_nohash.tpkg         14005 B  data@0xffff800007d07800
+  - repo/helloapp_badfhash.tpkg       14263 B  data@0xffff800007d0b200
+  - repo/helloapp_v2_corrupt.tpkg     14318 B  data@0xffff800007d0ec00
+  - repo/helloapp_signed.tpkg         14339 B  data@0xffff800007d12600
+  - repo/helloapp_signed_unknown.tpkg  14336 B  data@0xffff800007d16200
+  - repo/helloapp_signed_tampered.tpkg  14084 B  data@0xffff800007d19c00
+  - repo/helloapp_caps_ro.tpkg        14271 B  data@0xffff800007d1d600
+  - system/keys/trust.db              196 B  data@0xffff800007d21000
+  - repo/hello_cli.tpkg               29863 B  data@0xffff800007d21400
+  - repo/hello_gui.tpkg               34662 B  data@0xffff800007d28c00
+  - repo/notes_app.tpkg               39611 B  data@0xffff800007d31600
+  - etc/motd                          297 B  data@0xffff800007d3b400
+  - etc/drvmatch.conf                 1306 B  data@0xffff800007d3b800
+  - etc/drvmatch.conf.test            456 B  data@0xffff800007d3c000
+  - m36/m36_part2.c                   222 B  data@0xffff800007d3c400
+  - m36/m36_sample.c                  100 B  data@0xffff800007d3c800
+  - m36/Tobyfile                      152 B  data@0xffff800007d3cc00
+  - readme.txt                        922 B  data@0xffff800007d3d000
+[safe] no safemode flag -- normal boot
+[800] INFO  safe    : boot mode = normal (level=0)
+[safe] policy: mode=normal level=0 boot_mode=0
+[safe] policy: usb_full=keep usb_extra=keep net=keep audio=keep gui=keep services=keep virtio_gpu=keep
+[820] INFO  hw      : hwinfo: cpu='QEMU Virtual CPU version 2.5+' family=15 model=107 step=1 feat=0xf6000271
+[drvmatch] init: total=6 bound=2 unbound=4 forced_off=0
+[830] INFO  hw      : drvmatch init: total=6 bound=2 unbound=4 forced=0
+[drvconf] loaded /etc/drvmatch.conf: blacklist=0 force=0 errors=0
+[850] INFO  hw      : drvconf load: blacklist=0 force=0 errors=0
+[drvconf] === active overrides ===
+[drvconf] (none)
+[tobyfs] mount of '/data' clean: inodes=15/256 blocks=23/1013
+[900] INFO  fs      : mount /data clean (i=15/256 b=23/1013)
+[tobyfs] mounted '/data' on ide0:master: 15/255 inodes, 23/1013 data blocks (3960 KiB free)
+[boot] mounted /data on whole disk 'ide0:master' (legacy LBA-0 layout)
+[boot] no FAT32 partition discovered -- /fat unmounted
+[boot] no FAT32-on-USB discovered -- /usb unmounted
+[boot] no ext4 partition discovered -- /ext unmounted
+[installer] live install image registered: 4194304 bytes @ 0xffff80000777b000
+[vfs] mount table (2 entries):
+  /            -> ops=0xffffffff80082450 mnt=0xffffffff800b2f70
+  /data        -> ops=0xffffffff80082a00 mnt=0xffffd00000013e00
+[proc] table initialised (16 slots), pid 0 = 'kernel_main' RUNNING
+[sched] per-CPU round-robin scheduler ready (BSP cur=pid 0)
+[1000] ERROR wdog     pid=0: event #1 kind=sched_stall pid=-1 reason='scheduler heartbeat stalled'
+[wdog] BITE event=1 kind=sched_stall pid=-1 reason='scheduler heartbeat stalled'
+[signal] subsystem up (SIGINT=2, SIGTERM=15)
+[boot] spawning first userspace process from /bin/hello...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x34 filesz=0x34 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x45 filesz=0x45 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] load OK (user): type=ET_EXEC, 2 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (2 entries)
+[proc] created pid=1 ppid=0 'hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13c000 kstack=0xffffd0000001e020 argc=0 envc=0 cwd='/'
+hello from user mode
+user_hello: about to SYS_EXIT(0x55)
+[sys_exit] user requested exit, code=85 (0x55)
+[proc] pid=1 'hello-boot' exit code=85 (0x55) cpu=0 ms syscalls=3
+[proc] reaped pid=1, slot recycled
+[boot] /bin/hello (pid=1) finished, exit code=85 (0x55)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xd22 filesz=0xd22 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x374 filesz=0x374 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x18 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'abi-test-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13c000 kstack=0xffffd0000001e020 argc=0 envc=0 cwd='/'
+[abi-test] starting Milestone 25A ABI surface check
+[abi-test] argc = 0
+[abi-test] abi_version = 1
+[abi-test] pid = 1
+[abi-test] ppid = 0
+[abi-test] clock_ms_delta = 1
+[abi-test] cwd_len = 1
+[abi-test] cwd = /
+[abi-test] brk_initial = 268435456
+[abi-test] brk_after_grow = 268451840
+[abi-test] heap pages writable + zero-initialised OK
+[abi-test] open_fd = 3
+[abi-test] write_bytes = 10
+[abi-test] lseek_set = 0
+[abi-test] read_bytes = 10
+[abi-test] fstat_rc = 0
+[abi-test] fstat_size = 10
+[abi-test] fstat_mode = 33188
+[abi-test] stat_rc = 0
+[abi-test] stat_size = 10
+[abi-test] dup_fd = 4
+[abi-test] dup2_fd = 9
+[abi-test] unlink_rc = 0
+[abi-test] chdir_rc = 0
+[abi-test] new cwd = /data/abi_test_dir
+[abi-test] getenv_PATH_rc = 0
+[abi-test] ALL OK
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'abi-test-boot' exit code=0 (0x0) cpu=0 ms syscalls=152
+[proc] reaped pid=1, slot recycled
+[boot] M25A: /bin/abi_test (pid=1) finished, exit code=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3ed6 filesz=0x3ed6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x7d0 filesz=0x7d0 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13c000 kstack=0xffffd0000001e020 argc=0 envc=0 cwd='/'
+[c_hello] hello from libtoby (argc=0)
+[c_hello] ALL OK
+[_exit] code=0 caller=0x0000000000400124
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_hello-boot' exit code=0 (0x0) cpu=0 ms syscalls=6
+[proc] reaped pid=1, slot recycled
+[boot] M25B: /bin/c_hello (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3fe6 filesz=0x3fe6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x860 filesz=0x860 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_args-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13c000 kstack=0xffffd0000001e020 argc=0 envc=0 cwd='/'
+[c_args] argc=0
+[c_args] envc=0
+[c_args] getenv("HOME") = (unset)
+[c_args] __toby_argc=0 __toby_argv=0x7fffffffff58 __toby_envp=0x7fffffffff60
+[c_args] ALL OK
+[_exit] code=0 caller=0x0000000000400234
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_args-boot' exit code=0 (0x0) cpu=0 ms syscalls=21
+[proc] reaped pid=1, slot recycled
+[boot] M25B: /bin/c_args (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x41a6 filesz=0x41a6 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xa30 filesz=0xa30 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_filedemo-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13c000 kstack=0xffffd0000001e020 argc=0 envc=0 cwd='/'
+[c_filedemo] file size = 45 bytes (expected 45)
+[c_filedemo] readback first 45 chars: hello from c_filedemo
+second lin...
+[c_filedemo] ALL OK
+[_exit] code=0 caller=0x0000000000400b64
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_filedemo-boot' exit code=0 (0x0) cpu=0 ms syscalls=31
+[proc] reaped pid=1, slot recycled
+[boot] M25B: /bin/c_filedemo (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x43f6 filesz=0x43f6 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0x910 filesz=0x910 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_alloctest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13c000 kstack=0xffffd0000001e020 argc=0 envc=0 cwd='/'
+[c_alloctest] ALL OK
+[_exit] code=0 caller=0x0000000000400db4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_alloctest-boot' exit code=0 (0x0) cpu=0 ms syscalls=9
+[proc] reaped pid=1, slot recycled
+[boot] M25B: /bin/c_alloctest (pid=1) exit=0 (PASS)
+[boot] M25B: libtoby demos 4/4 PASS
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3fe6 filesz=0x3fe6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x860 filesz=0x860 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_args-spec' entry=0x0000000000400000 rsp=0x00007ffffffffee0 cr3=0x13c000 kstack=0xffffd0000001e020 argc=4 envc=3 cwd='/'
+[c_args] argc=4
+[c_args]   argv[0] = "c_args"
+[c_args]   argv[1] = "alpha"
+[c_args]   argv[2] = "beta"
+[c_args]   argv[3] = "gamma"
+[c_args] envc=3
+[c_args]   envp[0] = "PATH=/bin"
+[c_args]   envp[1] = "TEST_PHASE=25C"
+[c_args]   envp[2] = "BUILD=ok"
+[c_args] getenv("HOME") = (unset)
+[c_args] __toby_argc=4 __toby_argv=0x7ffffffffee8 __toby_envp=0x7fffffffff10
+[c_args] ALL OK
+[_exit] code=0 caller=0x0000000000400234
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_args-spec' exit code=0 (0x0) cpu=0 ms syscalls=56
+[proc] reaped pid=1, slot recycled
+[boot] M25C: /bin/c_args (pid=1, argc=4 envc=3) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4ae6 filesz=0x4ae6 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xde0 filesz=0xde0 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1f8 filesz=0xa0 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_envtest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff00 cr3=0x13c000 kstack=0xffffd0000001e020 argc=1 envc=3 cwd='/'
+[c_envtest][build] M25C-debug-rev3 alive
+[c_envtest] argc=1 argv[0]='c_envtest'
+[c_envtest] environ has 3 initial entries
+[c_envtest] getenv(PATH) = /bin
+[c_envtest][diag] BEFORE system
+[c_envtest] system("c_hello") starting...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3ed6 filesz=0x3ed6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x7d0 filesz=0x7d0 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=2 ppid=1 'c_hello' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x153000 kstack=0xffffd00000008030 argc=1 envc=1 cwd='/'
+[c_hello] hello from libtoby (argc=1)
+[c_hello] ALL OK
+[_exit] code=0 caller=0x0000000000400124
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=2 'c_hello' exit code=0 (0x0) cpu=0 ms syscalls=6
+[proc] reaped pid=2, slot recycled
+[c_envtest][diag] AFTER system, sr=0
+[c_envtest] system("c_hello") raw status=0x0
+[c_envtest][diag] AFTER printf raw status
+[c_envtest][diag] AFTER system EXPECTs
+[c_envtest] recursive execvp test starting...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4ae6 filesz=0x4ae6 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xde0 filesz=0xde0 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1f8 filesz=0xa0 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=2 ppid=1 'c_envtest' entry=0x0000000000400000 rsp=0x00007fffffffff00 cr3=0x153000 kstack=0xffffd00000008030 argc=3 envc=1 cwd='/'
+[c_envtest][build] M25C-debug-rev3 alive
+[c_envtest] (child) execvp -> 'c_hello'
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3ed6 filesz=0x3ed6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x7d0 filesz=0x7d0 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=3 ppid=2 'c_hello' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x165000 kstack=0xffffd00000010040 argc=1 envc=1 cwd='/'
+[c_hello] hello from libtoby (argc=1)
+[c_hello] ALL OK
+[_exit] code=0 caller=0x0000000000400124
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=3 'c_hello' exit code=0 (0x0) cpu=0 ms syscalls=6
+[proc] reaped pid=3, slot recycled
+[_exit] code=0 caller=0x0000000000402e0b
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=2 'c_envtest' exit code=0 (0x0) cpu=79 ms syscalls=9
+[proc] reaped pid=2, slot recycled
+[c_envtest] recursive child pid=2 status=0x0
+[c_envtest] ALL OK
+[_exit] code=0 caller=0x0000000000400f44
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_envtest-boot' exit code=0 (0x0) cpu=207 ms syscalls=38
+[proc] reaped pid=1, slot recycled
+[boot] M25C: /bin/c_envtest (pid=1) exit=0 (PASS)
+[elf] phdr[2] LOAD vaddr=0x0000000000500000 memsz=0x3a8 filesz=0x3a8 flags=R-- U -> pages [0x0000000000500000..0x0000000000501000)
+[elf] phdr[3] LOAD vaddr=0x00000000005013b0 memsz=0xd0 filesz=0xd0 flags=R-X U -> pages [0x0000000000501000..0x0000000000502000)
+[elf] phdr[4] LOAD vaddr=0x0000000000502480 memsz=0xb80 filesz=0x120 flags=RW- U -> pages [0x0000000000502000..0x0000000000503000)
+[elf] phdr[5] LOAD vaddr=0x00000000005035a0 memsz=0x18 filesz=0x18 flags=RW- U -> pages [0x0000000000503000..0x0000000000504000)
+[elf] load OK (user): type=ET_DYN, 4 segment(s), base=0x0000000000500000, entry=0x00000000005013b0, phdr=0x0000000000500040 (9 entries), PT_INTERP
+[elf] phdr[1] LOAD vaddr=0x0000000040000000 memsz=0x499 filesz=0x499 flags=R-- U -> pages [0x0000000040000000..0x0000000040001000)
+[elf] phdr[2] LOAD vaddr=0x00000000400014a0 memsz=0x9ba filesz=0x9ba flags=R-X U -> pages [0x0000000040001000..0x0000000040002000)
+[elf] phdr[3] LOAD vaddr=0x0000000040002e60 memsz=0x1a0 filesz=0xa0 flags=RW- U -> pages [0x0000000040002000..0x0000000040003000)
+[elf] phdr[4] LOAD vaddr=0x0000000040003f00 memsz=0x390 filesz=0x0 flags=RW- U -> pages [0x0000000040003000..0x0000000040005000)
+[elf] load OK (user): type=ET_DYN, 4 segment(s), base=0x0000000040000000, entry=0x00000000400014a0, phdr=0x0000000040000040 (8 entries)
+[proc] loaded interpreter '/lib/ld-toby.so' base=0x0000000040000000 entry=0x00000000400014a0
+[proc] created pid=1 ppid=0 'c_dynhello-boot' entry=0x00000000400014a0 rsp=0x00007fffffffff30 cr3=0x13c000 kstack=0xffffd0000001e020 argc=1 envc=1 cwd='/'
+[elf] phdr[1] LOAD vaddr=0x0000000060000000 memsz=0x3188 filesz=0x3188 flags=R-- U -> pages [0x0000000060000000..0x0000000060004000)
+[elf] phdr[2] LOAD vaddr=0x0000000060004190 memsz=0x6321 filesz=0x6321 flags=R-X U -> pages [0x0000000060004000..0x000000006000b000)
+[elf] phdr[3] LOAD vaddr=0x000000006000b4c0 memsz=0xb40 filesz=0x278 flags=RW- U -> pages [0x000000006000b000..0x000000006000c000)
+[elf] phdr[4] LOAD vaddr=0x000000006000c738 memsz=0x1f0 filesz=0x7c flags=RW- U -> pages [0x000000006000c000..0x000000006000d000)
+[elf] load OK (user): type=ET_DYN, 4 segment(s), base=0x0000000060000000, entry=0x0000000060000000, phdr=0x0000000060000040 (8 entries)
+[c_dynhello] hello from DYNAMIC libtoby (argc=1)
+[c_dynhello] ALL OK
+[_exit] code=0 caller=0x0000000060004ab4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_dynhello-boot' exit code=0 (0x0) cpu=0 ms syscalls=7
+[proc] reaped pid=1, slot recycled
+[boot] M25D: /bin/c_dynhello (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4246 filesz=0x4246 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0x7e0 filesz=0x7e0 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1e8 filesz=0x88 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'p_echo-boot' entry=0x0000000000400000 rsp=0x00007fffffffff10 cr3=0x13c000 kstack=0xffffd0000001e020 argc=3 envc=1 cwd='/'
+hello from-port-echo
+[_exit] code=0 caller=0x0000000000400c04
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'p_echo-boot' exit code=0 (0x0) cpu=0 ms syscalls=6
+[proc] reaped pid=1, slot recycled
+[boot] M25E: /bin/p_echo (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4276 filesz=0x4276 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0x7d0 filesz=0x7d0 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1e8 filesz=0x88 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'p_cat-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x13c000 kstack=0xffffd0000001e020 argc=2 envc=1 cwd='/'
+==============================================
+  Welcome to tobyOS -- milestone 4
+==============================================
+
+The kernel mounted this file from /etc/motd
+on a read-only ramfs backed by a USTAR initrd.
+
+Try:
+    ls
+    ls /bin
+    cat /readme.txt
+    run /bin/hello
+[_exit] code=0 caller=0x0000000000400c34
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'p_cat-boot' exit code=0 (0x0) cpu=0 ms syscalls=7
+[proc] reaped pid=1, slot recycled
+[boot] M25E: /bin/p_cat (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4aca filesz=0x4aca flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0x840 filesz=0x840 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x208 filesz=0x94 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'p_wc-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x13c000 kstack=0xffffd0000001e020 argc=2 envc=1 cwd='/'
+      12      32     297 /etc/motd
+[_exit] code=0 caller=0x00000000004011f4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'p_wc-boot' exit code=0 (0x0) cpu=0 ms syscalls=29
+[proc] reaped pid=1, slot recycled
+[boot] M25E: /bin/p_wc (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x46ba filesz=0x46ba flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0x840 filesz=0x840 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x208 filesz=0x9c flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'p_head-boot' entry=0x0000000000400000 rsp=0x00007fffffffff10 cr3=0x13c000 kstack=0xffffd0000001e020 argc=4 envc=1 cwd='/'
+==============================================
+  Welcome to tobyOS -- milestone 4
+[_exit] code=0 caller=0x0000000000400de4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'p_head-boot' exit code=0 (0x0) cpu=0 ms syscalls=7
+[proc] reaped pid=1, slot recycled
+[boot] M25E: /bin/p_head (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4d5a filesz=0x4d5a flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0x850 filesz=0x850 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x208 filesz=0x94 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'p_ls-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x13c000 kstack=0xffffd0000001e020 argc=2 envc=1 cwd='/'
+abi_test
+audiotest
+bad
+batterytest
+c_alloctest
+c_args
+c_dynhello
+c_envtest
+c_filedemo
+c_hello
+cat
+compattest
+crashinfo
+devlist
+displayinfo
+drawtest
+drvmatch
+drvtest
+echo
+fonttest
+fscheck
+gui_about
+gui_clock
+gui_demo
+gui_files
+gui_settings
+gui_term
+gui_viewer
+gui_widgets
+hello
+hwcompat
+hwinfo
+hwreport
+login
+logview
+long_task
+netecho
+p_cat
+p_echo
+p_grep
+p_head
+p_ls
+p_wc
+rendertest
+safesh
+selfhosttest
+services
+stabilitytest
+svc_crasher
+tobybuild
+tobycc
+usbtest
+wdogtest
+[_exit] code=0 caller=0x0000000000401194
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'p_ls-boot' exit code=0 (0x0) cpu=0 ms syscalls=169
+[proc] reaped pid=1, slot recycled
+[boot] M25E: /bin/p_ls (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x480a filesz=0x480a flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0x8e0 filesz=0x8e0 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x228 filesz=0x94 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'p_grep-boot' entry=0x0000000000400000 rsp=0x00007fffffffff10 cr3=0x13c000 kstack=0xffffd0000001e020 argc=3 envc=1 cwd='/'
+  Welcome to tobyOS -- milestone 4
+[_exit] code=0 caller=0x0000000000400f34
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'p_grep-boot' exit code=0 (0x0) cpu=0 ms syscalls=305
+[proc] reaped pid=1, slot recycled
+[boot] M25E: /bin/p_grep (pid=1) exit=0 (PASS)
+[boot] M25E: ports 6/6 PASS
+[boot] BSP LAPIC timer @ 100 Hz live (vec=0x40)
+[smp] 4 CPU(s) total: BSP apic_id=0
+[smp]   cpu0: apic_id=0 (BSP)
+[smp]   cpu1: apic_id=1
+[smp]   cpu2: apic_id=2
+[smp]   cpu3: apic_id=3
+CPU 0 online
+  apic_id=0 (BSP)  stack=bootloader-provided
+[smp] trampoline installed: phys=0x0000000000070000 virt=0xffff800000070000 len=1024 bytes
+[smp] cpu1: INIT-SIPI-SIPI to apic_id=1 (tramp_vector=0x70, stack=0xffffd00000019ea0)
+CPU 1 online
+  apic_id=1 (acpi said 1)  stack_top=0xffffd00000019ea0
+  cpu1: LAPIC timer @ 100 Hz live (vec=0x40)
+[smp] cpu2: INIT-SIPI-SIPI to apic_id=2 (tramp_vector=0x70, stack=0xffffd0000001deb0)
+CPU 2 online
+  apic_id=2 (acpi said 2)  stack_top=0xffffd0000001deb0
+[smp] cpu3: INIT-SIPI-SIPI to apic_id=3 (tramp_vector=0x70, stack=0xffffd00000022710)
+  cpu2: LAPIC timer @ 100 Hz live (vec=0x40)
+CPU 3 online
+  apic_id=3 (acpi said 3)  stack_top=0xffffd00000022710
+  cpu3: LAPIC timer @ 100 Hz live (vec=0x40)
+[smp] 3/3 APs online (total 4 CPUs)
+[net] nic=e1000:00:03.0 mac=52:54:00:12:34:56 -- starting up
+[dhcp] DISCOVER xid=0x68985522
+[dhcp] OFFER  yiaddr=10.0.2.15 server=10.0.2.2
+[dhcp] REQUEST requested=10.0.2.15
+[dhcp] ACK    bound: ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3 lease=86400s (server=10.0.2.2)
+[net] DHCP lease applied: ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3
+[net] up: nic=e1000:00:03.0 ip=10.0.2.15 gw=10.0.2.2 mac=52:54:00:12:34:56
+[net] gateway 10.0.2.2 -> 52:55:0a:00:02:02 (cached)
+[net] dns     10.0.2.3 -> 52:55:0a:00:02:03 (cached)
+[dns-test] >>> resolving example.com (boot smoke test)
+[dns] query  id=0x7003 example.com @ 10.0.2.3 (qbytes=29)
+[dns] reply  id=0x7003 example.com -> 104.20.23.154 (ttl=178s)
+[dns-test]     example.com -> 104.20.23.154 (ttl=178s)
+[dns-test] >>> resolving tobyos.invalid (NXDOMAIN probe)
+[dns] query  id=0x927f tobyos.invalid @ 10.0.2.3 (qbytes=32)
+[dns] reply id=0x927f rcode=3 (NXDOMAIN)
+[dns] 'tobyos.invalid' failed: rcode=3 (NXDOMAIN)
+[dns-test]     tobyos.invalid: failed as expected
+[dns-test] <<< done
+[tcp-test] >>> opening TCP connection to example.com:80
+[dns] query  id=0xb326 example.com @ 10.0.2.3 (qbytes=29)
+[dns] reply  id=0xb326 example.com -> 104.20.23.154 (ttl=178s)
+[tcp] connect 104.20.23.154:80  lp=49152 isn=0xdd7fd0ad
+[tcp] ESTABLISHED  lp=49152 rp=80
+[tcp-test]     handshake OK -- sending HTTP/1.0 probe
+[tcp-test]     tcp_send returned 80
+[tcp-test]     first bytes: "HTTP/1.1 200 OK 
+Date: Sat, 25 Apr 2026 06:15:03 GMT 
+Content-Type: text/html 
+C"
+[tcp-test]     server FIN; total bytes=797
+[tcp] CLOSED       lp=49152 rp=80  (final state=CLOSED)
+[tcp-test]     teardown OK.
+[tcp-test] <<< done
+[http-test] >>> GET http://example.com/
+[dns] query  id=0x61c9 example.com @ 10.0.2.3 (qbytes=29)
+[dns] reply  id=0x61c9 example.com -> 172.66.147.243 (ttl=178s)
+[http] example.com -> 172.66.147.243:80/
+[tcp] connect 172.66.147.243:80  lp=49153 isn=0xe8c566f9
+[tcp] ESTABLISHED  lp=49153 rp=80
+[tcp] CLOSED       lp=49153 rp=80  (final state=CLOSED)
+[http] 200 OK; body=528 bytes; type="text/html"
+[http-test]     status=200 reason="OK" type="text/html" body=528 bytes
+[http-test]     body[0..80]: "<!doctype html><html lang="en"><head><title>Example Domain</title><meta name="vi"
+[http-test] <<< done
+[gfx] back buffer 1280x800 (4000 KiB) ready, fb_pitch=1280 px, backend=limine-fb
+[mouse] PS/2 driver up (IRQ12 routed via IO APIC)
+[gui] window manager ready (max 8 windows, 18-px title bar)
+[term] session pool ready (4 sessions, 4096-byte rings)
+Welcome to tobyOS
+milestone 14: services + settings + login. Boot drops into the GUI desktop with /bin/login.
+
+[settings] loading /data/settings.conf (209 bytes)
+[settings] cache:
+  desktop.bg=0x00204060
+  desktop.title=tobyOS
+  desktop.greeting=Welcome to tobyOS
+  user.last=toby
+  user.greeting=Hello, friend!
+  session.autostart=
+[users] loading /data/users (86 bytes)
+[users] cache (3 entries):
+  root             uid=0 gid=0
+  toby             uid=1000 gid=1000
+  guest            uid=1001 gid=1001
+[theme] active='cyber' (settings ui.theme='cyber')
+[svc] registered builtin 'notify'
+[5010] INFO  svc      pid=0: registered builtin 'notify'
+[notify] daemon ready (ring depth 32)
+[svc] service manager up (max 8 services)
+[5030] INFO  svc      pid=0: manager up max=8 backoff_base=100ms cap=6400ms disable_at=5
+[svc] registered builtin 'input'
+[5040] INFO  svc      pid=0: registered builtin 'input'
+[svc] registered builtin 'network'
+[5060] INFO  svc      pid=0: registered builtin 'network'
+[svc] registered builtin 'desktop'
+[5070] INFO  svc      pid=0: registered builtin 'desktop'
+[svc] registered builtin 'session'
+[5080] INFO  svc      pid=0: registered builtin 'session'
+[trace] level 0 -> 1
+[gui] auto-enabled trace (level=1) for desktop session
+[trace t=510 pid=0] gui_set_desktop_mode: off -> on
+[gui] entering graphical mode
+[session] init: last user='toby' (will be pre-filled at login)
+[svc] registered program 'login' -> /bin/login (autorestart=1)
+[5110] INFO  svc      pid=0: registered program 'login' path='/bin/login' autorestart=1
+[trace t=511 pid=0] launch_enqueue '/bin/login' sandbox='' caps='' (head=1 tail=0)
+[svc] 'login' enqueued (restart #1, crashes=0)
+[5110] INFO  svc      pid=0: 'login' enqueued restart=1 crashes=0
+[svc] 5 services registered
+  name         kind    state    auto pid rcnt  ccnt  ccon  path
+  input        builtin running  0    0   0     0     0     (builtin)
+  network      builtin running  0    0   0     0     0     (builtin)
+  desktop      builtin running  0    0   0     0     0     (builtin)
+  session      builtin running  0    0   0     0     0     (builtin)
+  login        program running  1    0   1     0     0     /bin/login
+[notify #1 urg=0 kind=1] kernel: Desktop ready -- Welcome to tobyOS. Click [Apps] to launch a program, or click the bell to open the notification
+[notify #2 urg=0 kind=1] session: Login service started -- /bin/login is running. Type 'root' to log in.
+[sec] M34 crypto self-test PASS (SHA-256, HMAC-SHA-256, hex/ct)
+[sec] trust store loaded: 1 key(s) from /system/keys/trust.db
+[sysprot] init: 5 protected prefix(es)
+[sysprot]   /system          system
+[sysprot]   /system/keys     trust-store
+[sysprot]   /boot            boot
+[sysprot]   /data/packages   package-db
+[sysprot]   /data/users      user-db
+[trace t=516 pid=0] launcher_register 'Hello CLI' -> /data/apps/hello_cli/bin/hello_cli.elf sandbox='' caps='' (slot=0)
+[pkg] registered launcher entry: 'Hello CLI' -> /data/apps/hello_cli/bin/hello_cli.elf
+[pkg] package manager ready (apps=/data/apps db=/data/packages repo=/data/repo,/repo)
+[fw_cfg] QEMU fw_cfg interface present at 0x510/0x511
+[battery] no ACPI battery detected (no fw_cfg mock, no PNP0C0A in AML)
+[display] registered fb0 1280x800 backend=limine-fb
+[boot] M26A: peripheral inventory + self-tests
+[devtest] === 10 devices ===
+[INFO] pci: 00:00.0 drv=- status=0x01 8086:1237 cls=06.00.00 irq=0
+[INFO] pci: 00:01.0 drv=- status=0x01 8086:7000 cls=06.01.00 irq=0
+[INFO] pci: 00:01.1 drv=blk_ata status=0x03 8086:7010 cls=01.01.80 irq=0
+[INFO] pci: 00:01.3 drv=- status=0x01 8086:7113 cls=06.80.00 irq=9
+[INFO] pci: 00:02.0 drv=- status=0x01 1234:1111 cls=03.00.00 irq=0
+[INFO] pci: 00:03.0 drv=e1000 status=0x03 8086:100e cls=02.00.00 irq=11
+[INFO] blk: ide0:master drv=disk status=0x03 sectors=32768 (16384 KiB) class=1
+[INFO] in: kbd0 drv=ps2_kbd status=0x03 PS/2 IRQ1 chars=0 irqs=0 caps=0
+[INFO] in: mouse0 drv=ps2_mouse status=0x03 PS/2 IRQ12 events=0 clicks=0 btn=0x00
+[INFO] fb: fb0 drv=limine-fb status=0x03 1280x800 pitch=5120 bpp=32 fmt=1 flips=0
+[PASS] devtest: devtest registry alive
+[PASS] pci: 6 PCI device(s), 2 driver-bound
+[PASS] blk: 1 blk dev(s): disks=1 partitions=0 wrappers=0
+[SKIP] xhci: no xHCI controller present (run with -device qemu-xhci)
+[SKIP] usb: no xHCI controller, no USB devices
+[SKIP] usb_hub: no USB hub enumerated (try -device usb-hub)
+[SKIP] audio: no HDA controller present (run with -device intel-hda)
+[SKIP] audio_tone: no HDA controller -- run QEMU with -device intel-hda
+[SKIP] battery: no ACPI battery detected (desktop or QEMU default)
+[notify #3 urg=0 kind=2] hotplug: Device attached: selftest-attach -- bus=255 slot=43521 hub.depth=0 hub.port=1
+[notify #4 urg=1 kind=2] hotplug: Device removed: selftest-detach -- bus=255 slot=43521 hub.depth=0 hub.port=1
+[PASS] hotplug: ring=64 capacity=64 posted=2 drained=2 dropped=0
+[PASS] input: ps2 kbd chars=0 irqs=0 (caps=0) | ps2 mouse events=0 clicks=0 | usb_hid devs=0 (kbd=0 mouse=0) frames=0
+[SKIP] usb_hid: no USB HID devices (run with -device usb-kbd / usb-mouse)
+[SKIP] usb_msc: no USB MSC slots (run with -device usb-storage)
+[PASS] display: 1 output(s); primary fb0 1280x800 pitch=5120 bpp=32 backend=limine-fb
+[PASS] display_draw: back buffer reachable 1280x800; clip-paths OK
+[PASS] display_render: backend=limine-fb flip=ok present_rect=yes describe=yes bpp=4 frames=0 flips=0 fb_pitch_px=1280 back_kib=4000
+[PASS] display_alpha: src-over OK: a0=keep, a255=overwrite, a128=blend (got a02020)
+[PASS] display_dirty: tracker OK: rect-inject -> 10,20 100x50, full -> 1280x800 (stats: 3 flips, 1 full, 1 partial, 1 empty)
+[PASS] display_font: scaled bounds OK: 1x=24x8 2x=48x16 3x=72x24 multi=48x32
+[PASS] display_multi: multi OK: 3 outputs registered, layout spans 3104x800 (auto-h-layout + override + cleanup)
+[boot] M26A: 20 test(s) -- pass=12 fail=0 skip=8
+type 'help' to list commands.
+tobyOS> [boot] M25C: driving shell with synthetic command lines
+[shell-test] $ env
+PATH=/bin
+HOME=/
+USER=admin
+PWD=/
+SHELL=tobysh
+[shell-test] $ setenv M25C_FROM_SHELL yes
+[shell-test] $ env
+PATH=/bin
+HOME=/
+USER=admin
+PWD=/
+SHELL=tobysh
+M25C_FROM_SHELL=yes
+[shell-test] $ c_args from-shell PATH-resolved
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3fe6 filesz=0x3fe6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x860 filesz=0x860 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_args' entry=0x0000000000400000 rsp=0x00007ffffffffea0 cr3=0x553000 kstack=0xffffd000004162d0 argc=3 envc=6 cwd='/'
+[c_args] argc=3
+[c_args]   argv[0] = "c_args"
+[c_args]   argv[1] = "from-shell"
+[c_args]   argv[2] = "PATH-resolved"
+[c_args] envc=6
+[c_args]   envp[0] = "PATH=/bin"
+[c_args]   envp[1] = "HOME=/"
+[c_args]   envp[2] = "USER=admin"
+[c_args]   envp[3] = "PWD=/"
+[c_args] getenv("HOME") = /
+[c_args] __toby_argc=3 __toby_argv=0x7ffffffffea8 __toby_envp=0x7ffffffffec8
+[c_args] ALL OK
+[_exit] code=0 caller=0x0000000000400234
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_args' exit code=0 (0x0) cpu=0 ms syscalls=56
+[proc] reaped pid=1, slot recycled
+'c_args' (pid=1) returned 0 (0x0)
+[shell-test] $ unsetenv M25C_FROM_SHELL
+[boot] M25C: shell smoketest done
+[boot] M26A: driving shell builtins (devlist + drvtest)
+[shell-test] $ echo --- M26A shell builtins ---
+--- M26A shell builtins ---
+[shell-test] $ devlist
+[devtest] === 10 devices ===
+[INFO] pci: 00:00.0 drv=- status=0x01 8086:1237 cls=06.00.00 irq=0
+[INFO] pci: 00:01.0 drv=- status=0x01 8086:7000 cls=06.01.00 irq=0
+[INFO] pci: 00:01.1 drv=blk_ata status=0x03 8086:7010 cls=01.01.80 irq=0
+[INFO] pci: 00:01.3 drv=- status=0x01 8086:7113 cls=06.80.00 irq=9
+[INFO] pci: 00:02.0 drv=- status=0x01 1234:1111 cls=03.00.00 irq=0
+[INFO] pci: 00:03.0 drv=e1000 status=0x03 8086:100e cls=02.00.00 irq=11
+[INFO] blk: ide0:master drv=disk status=0x03 sectors=32768 (16384 KiB) class=1
+[INFO] in: kbd0 drv=ps2_kbd status=0x03 PS/2 IRQ1 chars=0 irqs=0 caps=0
+[INFO] in: mouse0 drv=ps2_mouse status=0x03 PS/2 IRQ12 events=0 clicks=0 btn=0x00
+[INFO] fb: fb0 drv=limine-fb status=0x07 1280x800 pitch=5120 bpp=32 fmt=1 flips=3
+[shell-test] $ devlist usb
+[devtest] === 0 devices ===
+[shell-test] $ devlist pci
+[devtest] === 6 devices ===
+[INFO] pci: 00:00.0 drv=- status=0x01 8086:1237 cls=06.00.00 irq=0
+[INFO] pci: 00:01.0 drv=- status=0x01 8086:7000 cls=06.01.00 irq=0
+[INFO] pci: 00:01.1 drv=blk_ata status=0x03 8086:7010 cls=01.01.80 irq=0
+[INFO] pci: 00:01.3 drv=- status=0x01 8086:7113 cls=06.80.00 irq=9
+[INFO] pci: 00:02.0 drv=- status=0x01 1234:1111 cls=03.00.00 irq=0
+[INFO] pci: 00:03.0 drv=e1000 status=0x03 8086:100e cls=02.00.00 irq=11
+[shell-test] $ drvtest
+[PASS] devtest: devtest registry alive
+[PASS] pci: 6 PCI device(s), 2 driver-bound
+[PASS] blk: 1 blk dev(s): disks=1 partitions=0 wrappers=0
+[SKIP] xhci: no xHCI controller present (run with -device qemu-xhci)
+[SKIP] usb: no xHCI controller, no USB devices
+[SKIP] usb_hub: no USB hub enumerated (try -device usb-hub)
+[SKIP] audio: no HDA controller present (run with -device intel-hda)
+[SKIP] audio_tone: no HDA controller -- run QEMU with -device intel-hda
+[SKIP] battery: no ACPI battery detected (desktop or QEMU default)
+[notify #5 urg=0 kind=2] hotplug: Device attached: selftest-attach -- bus=255 slot=43521 hub.depth=0 hub.port=1
+[notify #6 urg=1 kind=2] hotplug: Device removed: selftest-detach -- bus=255 slot=43521 hub.depth=0 hub.port=1
+[PASS] hotplug: ring=64 capacity=64 posted=2 drained=2 dropped=0
+[PASS] input: ps2 kbd chars=0 irqs=0 (caps=0) | ps2 mouse events=0 clicks=0 | usb_hid devs=0 (kbd=0 mouse=0) frames=0
+[SKIP] usb_hid: no USB HID devices (run with -device usb-kbd / usb-mouse)
+[SKIP] usb_msc: no USB MSC slots (run with -device usb-storage)
+[PASS] display: 1 output(s); primary fb0 1280x800 pitch=5120 bpp=32 backend=limine-fb
+[PASS] display_draw: back buffer reachable 1280x800; clip-paths OK
+[PASS] display_render: backend=limine-fb flip=ok present_rect=yes describe=yes bpp=4 frames=0 flips=3 fb_pitch_px=1280 back_kib=4000
+[PASS] display_alpha: src-over OK: a0=keep, a255=overwrite, a128=blend (got a02020)
+[PASS] display_dirty: tracker OK: rect-inject -> 10,20 100x50, full -> 1280x800 (stats: 6 flips, 2 full, 2 partial, 2 empty)
+[PASS] display_font: scaled bounds OK: 1x=24x8 2x=48x16 3x=72x24 multi=48x32
+[PASS] display_multi: multi OK: 3 outputs registered, layout spans 3104x800 (auto-h-layout + override + cleanup)
+drvtest: 20 test(s) -- pass=12 fail=0 skip=8
+[shell-test] $ drvtest pci
+[PASS] pci: 6 PCI device(s), 2 driver-bound
+drvtest: 1 test(s) -- pass=1 fail=0 skip=0
+[shell-test] $ drvtest xhci
+[SKIP] xhci: no xHCI controller present (run with -device qemu-xhci)
+drvtest: 1 test(s) -- pass=0 fail=0 skip=1
+[shell-test] $ echo --- M26B shell builtins ---
+--- M26B shell builtins ---
+[shell-test] $ devlist hub
+[devtest] === 0 devices ===
+[shell-test] $ drvtest usb_hub
+[SKIP] usb_hub: no USB hub enumerated (try -device usb-hub)
+drvtest: 1 test(s) -- pass=0 fail=0 skip=1
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4675 filesz=0x4675 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xa78 filesz=0xa78 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x21d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000409000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'devlist-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+BUS     NAME             DRIVER       STAT   INFO
+---     ----             ------       ----   ----
+pci     00:00.0          -            P----  8086:1237 cls=06.00.00 irq=0
+pci     00:01.0          -            P----  8086:7000 cls=06.01.00 irq=0
+pci     00:01.1          blk_ata      PB---  8086:7010 cls=01.01.80 irq=0
+pci     00:01.3          -            P----  8086:7113 cls=06.80.00 irq=9
+pci     00:02.0          -            P----  1234:1111 cls=03.00.00 irq=0
+pci     00:03.0          e1000        PB---  8086:100e cls=02.00.00 irq=11
+blk     ide0:master      disk         PB---  sectors=32768 (16384 KiB) class=1
+input   kbd0             ps2_kbd      PB---  PS/2 IRQ1 chars=0 irqs=0 caps=0
+input   mouse0           ps2_mouse    PB---  PS/2 IRQ12 events=0 clicks=0 btn=0x00
+display fb0              limine-fb    PBA--  1280x800 pitch=5120 bpp=32 fmt=1 flips=6
+PASS: devlist: 10 device(s)
+[_exit] code=0 caller=0x0000000000400a54
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'devlist-boot' exit code=0 (0x0) cpu=0 ms syscalls=385
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/devlist (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4675 filesz=0x4675 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xa78 filesz=0xa78 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x21d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000409000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'devlist-usb-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+BUS     NAME             DRIVER       STAT   INFO
+---     ----             ------       ----   ----
+INFO: devlist: 0 devices
+[_exit] code=0 caller=0x0000000000400a54
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'devlist-usb-boot' exit code=0 (0x0) cpu=0 ms syscalls=72
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/devlist (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4675 filesz=0x4675 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xa78 filesz=0xa78 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x21d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000409000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'devlist-hub-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+BUS     NAME             DRIVER       STAT   INFO
+---     ----             ------       ----   ----
+INFO: devlist: 0 devices
+[_exit] code=0 caller=0x0000000000400a54
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'devlist-hub-boot' exit code=0 (0x0) cpu=0 ms syscalls=72
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/devlist (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x46a5 filesz=0x46a5 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xa58 filesz=0xa58 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'drvtest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x553000 kstack=0xffffd00000416270 argc=1 envc=1 cwd='/'
+[PASS] devtest: devtest registry alive
+[PASS] pci: 6 PCI device(s), 2 driver-bound
+[PASS] blk: 1 blk dev(s): disks=1 partitions=0 wrappers=0
+[SKIP] xhci: no xHCI controller present (run with -device qemu-xhci)
+[SKIP] usb: no xHCI controller, no USB devices
+[SKIP] usb_hub: no USB hub enumerated (try -device usb-hub)
+[SKIP] audio: no HDA controller present (run with -device intel-hda)
+[SKIP] battery: no ACPI battery detected (desktop or QEMU default)
+PASS: drvtest: pass=3 skip=5 fail=0 (total=8)
+[_exit] code=0 caller=0x0000000000400314
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'drvtest-boot' exit code=0 (0x0) cpu=0 ms syscalls=60
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/drvtest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x46a5 filesz=0x46a5 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xa58 filesz=0xa58 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'drvtest-named' entry=0x0000000000400000 rsp=0x00007fffffffff10 cr3=0x553000 kstack=0xffffd00000416270 argc=4 envc=1 cwd='/'
+[PASS] pci: 6 PCI device(s), 2 driver-bound
+[SKIP] xhci: no xHCI controller present (run with -device qemu-xhci)
+[SKIP] usb: no xHCI controller, no USB devices
+PASS: drvtest: pass=1 skip=2 fail=0 (total=3)
+[_exit] code=0 caller=0x0000000000400314
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'drvtest-named' exit code=0 (0x0) cpu=0 ms syscalls=30
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/drvtest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x51d5 filesz=0x51d5 flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xf98 filesz=0xf98 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0xb3d8 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000413000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'usbtest-list' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+INFO: usbtest list: no USB devices
+[_exit] code=0 caller=0x00000000004015b4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'usbtest-list' exit code=0 (0x0) cpu=0 ms syscalls=4
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/usbtest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x51d5 filesz=0x51d5 flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xf98 filesz=0xf98 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0xb3d8 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000413000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'usbtest-ctrl' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+SKIP: usbtest controller: no xHCI controller present (run with -device qemu-xhci)
+[_exit] code=0 caller=0x00000000004015b4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'usbtest-ctrl' exit code=0 (0x0) cpu=0 ms syscalls=9
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/usbtest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x51d5 filesz=0x51d5 flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xf98 filesz=0xf98 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0xb3d8 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000413000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'usbtest-devs' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+SKIP: usbtest devices: no xHCI controller, no USB devices
+[_exit] code=0 caller=0x00000000004015b4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'usbtest-devs' exit code=0 (0x0) cpu=0 ms syscalls=9
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/usbtest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x51d5 filesz=0x51d5 flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xf98 filesz=0xf98 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0xb3d8 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000413000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'usbtest-hub' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+INFO: usbtest hub: no USB hub registered
+INFO: usbtest hub: 0 USB dev(s) total: 0 root, 0 behind hub
+SKIP: usbtest hub: no USB hub enumerated (try -device usb-hub)
+[_exit] code=0 caller=0x00000000004015b4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'usbtest-hub' exit code=0 (0x0) cpu=0 ms syscalls=17
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/usbtest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x51d5 filesz=0x51d5 flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xf98 filesz=0xf98 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0xb3d8 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000413000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'usbtest-hotplug' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+[notify #7 urg=0 kind=2] hotplug: Device attached: selftest-attach -- bus=255 slot=43521 hub.depth=0 hub.port=1
+[notify #8 urg=1 kind=2] hotplug: Device removed: selftest-detach -- bus=255 slot=43521 hub.depth=0 hub.port=1
+PASS: usbtest hotplug ring: ring=64 capacity=64 posted=2 drained=2 dropped=0
+INFO: usbtest hotplug drain: no live events queued
+[_exit] code=0 caller=0x00000000004015b4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'usbtest-hotplug' exit code=0 (0x0) cpu=0 ms syscalls=9
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/usbtest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x51d5 filesz=0x51d5 flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xf98 filesz=0xf98 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0xb3d8 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000413000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'usbtest-hid' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+INFO: usbtest hid: 2 INPUT dev(s): 2 ps2 + 0 usb_hid
+BUS     NAME             DRIVER       STAT   INFO
+---     ----             ------       ----   ----
+input   kbd0             ps2_kbd      PB---  PS/2 IRQ1 chars=0 irqs=0 caps=0
+input   mouse0           ps2_mouse    PB---  PS/2 IRQ12 events=0 clicks=0 btn=0x00
+PASS: usbtest hid input: ps2 kbd chars=0 irqs=0 (caps=0) | ps2 mouse events=0 clicks=0 | usb_hid devs=0 (kbd=0 mouse=0) frames=0
+SKIP: usbtest hid usb_hid: no USB HID devices (run with -device usb-kbd / usb-mouse)
+[_exit] code=0 caller=0x00000000004015b4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'usbtest-hid' exit code=0 (0x0) cpu=0 ms syscalls=144
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/usbtest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x51d5 filesz=0x51d5 flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xf98 filesz=0xf98 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0xb3d8 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000413000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'usbtest-storage' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+INFO: usbtest storage: 1 BLK dev(s): 1 disk + 0 part, 0 gone, 0 mounted
+BUS     NAME             DRIVER       STAT   INFO
+---     ----             ------       ----   ----
+blk     ide0:master      disk         PB---  sectors=32768 (16384 KiB) class=1
+SKIP: usbtest storage: no USB MSC slots (run with -device usb-storage)
+INFO: usbtest storage: no live USB mount -- skipping FAT32 roundtrip
+[_exit] code=0 caller=0x00000000004015b4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'usbtest-storage' exit code=0 (0x0) cpu=0 ms syscalls=116
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/usbtest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4615 filesz=0x4615 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xb18 filesz=0xb18 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x21d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000409000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'audiotest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x553000 kstack=0xffffd00000416270 argc=1 envc=1 cwd='/'
+INFO: audiotest: no AUDIO bus devices reported by kernel
+SKIP: audiotest controller: no HDA controller present (run with -device intel-hda)
+SKIP: audiotest tone: no HDA controller -- run QEMU with -device intel-hda
+INFO: audiotest: tone path skipped -- attach a codec via `-device hda-output` to exercise stream descriptors
+[_exit] code=0 caller=0x0000000000400284
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'audiotest-boot' exit code=0 (0x0) cpu=0 ms syscalls=15
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/audiotest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x45e5 filesz=0x45e5 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xc78 filesz=0xc78 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x21d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000409000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'batterytest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x553000 kstack=0xffffd00000416270 argc=1 envc=1 cwd='/'
+INFO: batterytest: no battery devices reported by kernel
+INFO: batterytest: this is expected on desktops and on QEMU x86 without -fw_cfg name=opt/tobyos/battery_mock,...
+SKIP: batterytest: no ACPI battery detected (desktop or QEMU default)
+INFO: batterytest: kernel reports no battery; harness treats this as success
+INFO: batterytest: to inject a mock battery in QEMU, add: -fw_cfg name=opt/tobyos/battery_mock,string=state=charging,percent=75,design=50000,remaining=37500,rate=1500
+[_exit] code=0 caller=0x0000000000400254
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'batterytest-boot' exit code=0 (0x0) cpu=0 ms syscalls=12
+[proc] reaped pid=1, slot recycled
+[boot] M26A: /bin/batterytest (pid=1) exit=0 (PASS)
+[boot] M26A: userland 14 PASS / 0 FAIL / 0 missing of 14
+[boot] M27A: driving display test harness (displayinfo + drawtest + rendertest)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x48f5 filesz=0x48f5 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xc38 filesz=0xc38 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x358 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'displayinfo-boot' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x553000 kstack=0xffffd00000416270 argc=1 envc=1 cwd='/'
+IDX NAME       BACKEND      RES        BPP   PITCH     FORMAT    ORIGIN       FLAGS
+--- ----       -------      ---        ---   -----     ------    ------       -----
+0   fb0        limine-fb    1280x800   32    5120      XRGB8888  (0,0)        P*A flips=6
+PASS: displayinfo: 1 output(s); primary fb0 1280x800 backend=limine-fb layout=1280x800
+[_exit] code=0 caller=0x0000000000400cd4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'displayinfo-boot' exit code=0 (0x0) cpu=0 ms syscalls=170
+[proc] reaped pid=1, slot recycled
+[boot] M27A: /bin/displayinfo (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x48f5 filesz=0x48f5 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xc38 filesz=0xc38 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x358 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'displayinfo-json' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd00000416270 argc=2 envc=1 cwd='/'
+{"idx":0,"name":"fb0","backend":"limine-fb","backend_id":1,"width":1280,"height":800,"bpp":32,"pitch_bytes":5120,"pixel_format":1,"origin_x":0,"origin_y":0,"flags":"P*A","flips":6}
+{"layout":{"x":0,"y":0,"w":1280,"h":800,"count":1}}
+PASS: displayinfo: 1 output(s) layout=1280x800
+[_exit] code=0 caller=0x0000000000400cd4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'displayinfo-json' exit code=0 (0x0) cpu=0 ms syscalls=48
+[proc] reaped pid=1, slot recycled
+[boot] M27A: /bin/displayinfo (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4bb5 filesz=0x4bb5 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xcb8 filesz=0xcb8 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x4e8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'drawtest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x553000 kstack=0xffffd00000416270 argc=1 envc=1 cwd='/'
+[trace t=571 pid=1] window_create wid=1 owner_pid=1 size=320x240 pos=(60,40) title='drawtest'
+PASS: drawtest: 49 primitive(s) ran cleanly; 320x240 window flipped
+[_exit] code=0 caller=0x0000000000400f94
+[sys_exit] user requested exit, code=0 (0x0)
+[trace t=571 pid=1] window_close wid=1 owner_pid=1 title='drawtest'
+[proc] pid=1 'drawtest-boot' exit code=0 (0x0) cpu=0 ms syscalls=61
+[proc] reaped pid=1, slot recycled
+[boot] M27A: /bin/drawtest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x54c5 filesz=0x54c5 flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0x11a8 filesz=0x11a8 flags=R-- U -> pages [0x0000000000406000..0x0000000000408000)
+[elf] phdr[2] LOAD vaddr=0x0000000000408000 memsz=0x35c filesz=0x80 flags=RW- U -> pages [0x0000000000408000..0x0000000000409000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'rendertest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x553000 kstack=0xffffd0000043f1b0 argc=1 envc=1 cwd='/'
+[PASS] rendertest basic      -- fb0 1280x800 backend=limine-fb flips=6
+[PASS] rendertest geometry   -- bpp=32 pitch=5120 (>=min 5120)
+[trace t=573 pid=1] window_create wid=1 owner_pid=1 size=160x100 pos=(88,68) title='rt-prim'
+[trace t=573 pid=1] window_close wid=1 owner_pid=1 title='rt-prim'
+[PASS] rendertest primitives -- 5 primitives + flip + close OK
+[trace t=574 pid=1] window_create wid=1 owner_pid=1 size=120x80 pos=(116,96) title='rt-back'
+[trace t=574 pid=1] window_create wid=2 owner_pid=1 size=120x80 pos=(144,124) title='rt-front'
+[trace t=574 pid=1] window_close wid=2 owner_pid=1 title='rt-front'
+[trace t=574 pid=1] window_close wid=1 owner_pid=1 title='rt-back'
+[PASS] rendertest overlap    -- two stacked 120x80 windows flipped + closed
+[SKIP] rendertest cursor     -- compositor has not produced any frames yet (boot harness, cmp=0) -- skipping cursor advance check
+[PASS] rendertest backend    -- backend=limine-fb id=1 (mapped=limine-fb) bpp=32 pitch=5120
+[trace t=574 pid=1] window_create wid=1 owner_pid=1 size=320x220 pos=(172,152) title='rt-alpha'
+[trace t=575 pid=1] window_close wid=1 owner_pid=1 title='rt-alpha'
+[PASS] rendertest alpha      -- 6 ARGB overlays committed (3 translucent + 3 edge cases)
+[SKIP] rendertest font       -- anti-aliased / large fonts arrive in M27D
+[trace t=575 pid=1] window_create wid=1 owner_pid=1 size=160x100 pos=(200,180) title='rt-dirty'
+[trace t=575 pid=1] window_close wid=1 owner_pid=1 title='rt-dirty'
+[PASS] rendertest dirty      -- flips +0 (full+0 partial+0); compositor frames +0 (baseline: total=6 partial=2)
+PASS: rendertest: pass=7 skip=2 fail=0 (total=9)
+[_exit] code=0 caller=0x00000000004018a4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'rendertest-boot' exit code=0 (0x0) cpu=0 ms syscalls=152
+[proc] reaped pid=1, slot recycled
+[boot] M27A: /bin/rendertest (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4416 filesz=0x4416 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0x920 filesz=0x920 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1dc filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'fonttest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x553000 kstack=0xffffd0000048b1b0 argc=1 envc=1 cwd='/'
+[trace t=578 pid=1] window_create wid=1 owner_pid=1 size=320x200 pos=(228,208) title='ft-bitmap'
+[trace t=578 pid=1] window_close wid=1 owner_pid=1 title='ft-bitmap'
+[PASS] fonttest bitmap     -- 8x8 legacy path
+[trace t=578 pid=1] window_create wid=1 owner_pid=1 size=320x200 pos=(256,236) title='ft-s2'
+[trace t=578 pid=1] window_close wid=1 owner_pid=1 title='ft-s2'
+[PASS] fonttest scale2     -- 16x16 cell
+[trace t=578 pid=1] window_create wid=1 owner_pid=1 size=320x200 pos=(284,264) title='ft-s4'
+[trace t=579 pid=1] window_close wid=1 owner_pid=1 title='ft-s4'
+[PASS] fonttest scale4     -- 32x32 cell
+[trace t=579 pid=1] window_create wid=1 owner_pid=1 size=320x200 pos=(312,292) title='ft-sm'
+[trace t=579 pid=1] window_close wid=1 owner_pid=1 title='ft-sm'
+[PASS] fonttest smooth     -- 32x32 + corner smoothing
+[trace t=579 pid=1] window_create wid=1 owner_pid=1 size=320x200 pos=(340,320) title='ft-mixed'
+[trace t=579 pid=1] window_close wid=1 owner_pid=1 title='ft-mixed'
+[PASS] fonttest mixed      -- letters/numbers/symbols + multiline
+[trace t=579 pid=1] window_create wid=1 owner_pid=1 size=320x200 pos=(368,348) title='ft-clamp'
+[trace t=579 pid=1] window_close wid=1 owner_pid=1 title='ft-clamp'
+[PASS] fonttest clamp      -- scale=0 -> 1, scale=99 -> 32
+[fonttest] 6/6 PASS (0 FAIL)
+[_exit] code=0 caller=0x0000000000400664
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'fonttest-boot' exit code=0 (0x0) cpu=0 ms syscalls=114
+[proc] reaped pid=1, slot recycled
+[boot] M27A: /bin/fonttest (pid=1) exit=0 (PASS)
+[boot] M27A: display 5 PASS / 0 FAIL / 0 missing of 5
+[display] 1 output(s) registered (primary idx=0) layout=1280x800@(0,0)
+[INFO] display: fb0 (primary) 1280x800@(0,0) pitch=5120 bpp=32 fmt=1 backend=limine-fb flips=6
+[boot] M28A: driving logging harness (slog ring + logview)
+[5800] INFO  kernel   pid=0: M28A_TAG kernel info trace
+[5800] WARN  fs       pid=0: M28A_TAG fs warn trace
+[5800] ERROR net      pid=0: M28A_TAG net error trace
+[5800] INFO  gui      pid=0: M28A_TAG gui info trace
+[5800] INFO  driver   pid=0: M28A_TAG driver info trace
+[5800] INFO  display  pid=0: M28A_TAG display info trace
+[5800] INFO  audio    pid=0: M28A_TAG audio info trace
+[5800] WARN  svc      pid=0: M28A_TAG svc warn trace
+[5800] ERROR panic    pid=0: M28A_TAG panic-test (synthetic, no halt)
+[boot] M28A: slog persist PASS path=/data/system.log
+[boot] M28A: slog stats emitted=27 dropped=0 in_use=27 depth=256 err=3 warn=2 info=21 debug=1
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4bff filesz=0x4bff flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xc70 filesz=0xc70 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x101d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000417000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'logview-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd0000048b1b0 argc=2 envc=1 cwd='/'
+M28A_LOGVIEW: ring=27 tags=10 kernel=1 fs=1 net=1 gui=1 emitted=27 dropped=0 in_use=27 depth=256
+SEQ     TIME(ms)   LEVEL SUB        PID   MESSAGE
+-----   --------   ----- ---        ---   -------
+18      5800       INFO  kernel     0     M28A_TAG kernel info trace
+19      5800       WARN  fs         0     M28A_TAG fs warn trace
+20      5800       ERROR net        0     M28A_TAG net error trace
+21      5800       INFO  gui        0     M28A_TAG gui info trace
+22      5800       INFO  driver     0     M28A_TAG driver info trace
+23      5800       DEBUG proc       0     M28A_TAG proc debug trace (gated)
+24      5800       INFO  display    0     M28A_TAG display info trace
+25      5800       INFO  audio      0     M28A_TAG audio info trace
+26      5800       WARN  svc        0     M28A_TAG svc warn trace
+27      5800       ERROR panic      0     M28A_TAG panic-test (synthetic, no halt)
+[5860] INFO  user     pid=1: M28A_TAG logview boot write
+M28A_LOGVIEW: PASS
+[_exit] code=0 caller=0x00000000004011d4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'logview-boot' exit code=0 (0x0) cpu=0 ms syscalls=412
+[proc] reaped pid=1, slot recycled
+[boot] M28A: /bin/logview (pid=1) exit=0 (PASS)
+[boot] M28A: logging harness complete
+[boot] M29A: driving hwinfo harness (snapshot + persist + /bin/hwinfo --boot)
+[hwinfo] === hardware inventory ===
+[hwinfo] cpu='QEMU Virtual CPU version 2.5+' family=15 model=107 step=1 count=1
+[hwinfo] feat=fpu tsc msr pae apic sse sse2 ht lm hyper nx
+[hwinfo] mem: total=32614 pg used=3505 pg free=29109 pg
+[hwinfo] bus: pci=6 usb=0 blk=1 input=2 audio=0 battery=0 hub=0 display=1
+[hwinfo] mode=normal profile=vm abi=1 epoch=1
+[boot] M29A: prior snapshot READABLE (size=1953 bytes, from previous boot)
+[5900] INFO  hw       pid=0: hwinfo: persisted 1194 bytes -> /data/hwinfo.snap
+[boot] M29A: hwinfo persist PASS bytes=1194 path=/data/hwinfo.snap
+[boot] M29A: snapshot epoch=3 cpu_count=1 mem_total_pg=32614 pci=6 usb=0 blk=1 disp=1 input=2 audio=0 battery=0 hub=0 profile=vm
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4a19 filesz=0x4a19 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xf78 filesz=0xf78 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'hwinfo-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd0000048b1b0 argc=2 envc=1 cwd='/'
+M29A_HW: abi=1 profile=vm safe=0
+M29A_HW: cpu_count=1 family=15 model=107 step=1 feat=0xf6000271 vendor=AuthenticAMD
+M29A_HW: mem_total_pg=32614 mem_used_pg=3523 mem_free_pg=29091
+M29A_HW: bus pci=6 usb=0 blk=1 input=2 audio=0 battery=0 hub=0 display=1
+M29A_HW: PASS
+[_exit] code=0 caller=0x0000000000400dd4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'hwinfo-boot' exit code=0 (0x0) cpu=0 ms syscalls=48
+[proc] reaped pid=1, slot recycled
+[boot] M29A: /bin/hwinfo (pid=1) exit=0 (PASS)
+[boot] M29A: hwinfo harness complete
+[boot] M29B: driving drvmatch harness (query + fallback + /bin/drvmatch --boot)
+[drvmatch] === driver match table ===
+[drvmatch] total=6 bound=2 unbound=4 forced_off=0
+[drvmatch] PCI 00:00.0 8086:1237 cls=06.00 drv=(none) strat=NONE
+[drvmatch] PCI 00:01.0 8086:7000 cls=06.01 drv=(none) strat=NONE
+[drvmatch] PCI 00:01.1 8086:7010 cls=01.01 drv=blk_ata strat=GENERIC
+[drvmatch] PCI 00:01.3 8086:7113 cls=06.80 drv=(none) strat=NONE
+[drvmatch] PCI 00:02.0 1234:1111 cls=03.00 drv=(none) strat=NONE
+[drvmatch] PCI 00:03.0 8086:100e cls=02.00 drv=e1000 strat=EXACT
+[boot] M29B: drvmatch total=6 bound=2 unbound=4 forced_off=0
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x5319 filesz=0x5319 flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0x1258 filesz=0x1258 flags=R-- U -> pages [0x0000000000406000..0x0000000000408000)
+[elf] phdr[2] LOAD vaddr=0x0000000000408000 memsz=0x1d8 filesz=0x80 flags=RW- U -> pages [0x0000000000408000..0x0000000000409000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'drvmatch-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd0000048b1b0 argc=2 envc=1 cwd='/'
+M29B_DRV: bogus probe pci dead:beef rc=-1 errno=2 strat=NONE -> PASS
+M29B_DRV: bogus probe usb dead:beef rc=-1 errno=2 strat=NONE -> PASS
+M29B_DRV: bogus probe bad-bus rc=-1 errno=22 -> PASS
+M29B_DRV: pci total=6 bound=2 none=4 exact=1 class=0 generic=1
+M29B_DRV: usb total=0 bound=0 none=0
+M29B_DRV: malformed=0
+M29B_DRV: PASS
+[_exit] code=0 caller=0x00000000004010f4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'drvmatch-boot' exit code=0 (0x0) cpu=0 ms syscalls=64
+[proc] reaped pid=1, slot recycled
+[boot] M29B: /bin/drvmatch (pid=1) exit=0 (PASS)
+[boot] M29B: forced-disable test SKIPPED (no /etc/drvtest_now)
+[boot] M29B: drvmatch harness complete
+[boot] M35F: driving hwreport harness (/bin/hwreport --boot)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4fb9 filesz=0x4fb9 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0x1418 filesz=0x1418 flags=R-- U -> pages [0x0000000000405000..0x0000000000407000)
+[elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0x1d8 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000408000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'hwreport-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd0000048b1b0 argc=2 envc=1 cwd='/'
+M35F_HWR: boot_mode=normal profile=vm
+M35F_HWR: total=6 pci=6 usb=0 supported=2 partial=3 unsupported=1 unknown=0
+M35F_HWR: bound pci=2 usb=0 probe_failed=0 forced_off=0
+M35F_HWR: verdict=YELLOW
+M35F_HWR: PASS
+[_exit] code=0 caller=0x0000000000401374
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'hwreport-boot' exit code=0 (0x0) cpu=0 ms syscalls=37
+[proc] reaped pid=1, slot recycled
+[boot] M35F: /bin/hwreport (pid=1) exit=0 (PASS)
+[boot] M35F: hwreport harness complete
+[boot] M35G: driving compattest harness (/bin/compattest --boot)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x61d9 filesz=0x61d9 flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0x2188 filesz=0x2188 flags=R-- U -> pages [0x0000000000407000..0x000000000040a000)
+[elf] phdr[2] LOAD vaddr=0x000000000040a000 memsz=0x5b48 filesz=0x80 flags=RW- U -> pages [0x000000000040a000..0x0000000000410000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'compattest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd0000048b1b0 argc=2 envc=1 cwd='/'
+[6000] INFO  compat   pid=1: M35G_CMP: no_crashes round-trip sentinel
+M35G_CMP: SYSTEM_BOOT: PASS reason="abi=1 cpu='AuthenticAMD' mem=32614 pg epoch=6"
+M35G_CMP: DRIVER_MATCH: PASS reason="pci_bound=2/6 with_driver=2"
+M35G_CMP: FALLBACK_PATHS: PASS reason="bogus probe ENOENT ok; class/generic seen=yes"
+M35G_CMP: NETWORK: PASS reason="net_bound=1/1 driver=e1000"
+M35G_CMP: STORAGE: PASS reason="blk_devs=1 hwinfo_blk_count=1 first='ide0:master'"
+M35G_CMP: USB_INPUT: SKIPPED_REAL_HARDWARE_REQUIRED reason="no USB stack online (no devices in compat)"
+M35G_CMP: LOG_CAPTURE: PASS reason="total_emitted=29 read=16 loud=16"
+M35G_CMP: NO_CRASHES: PASS reason="slog round-trip ok; bogus drvmatch ENOENT ok"
+M35G_CMP: VERDICT: PASS pass=7 fail=0 skipped=1
+[_exit] code=0 caller=0x0000000000401bd4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'compattest-boot' exit code=0 (0x0) cpu=0 ms syscalls=78
+[proc] reaped pid=1, slot recycled
+[boot] M35G: /bin/compattest (pid=1) exit=0 (PASS)
+[boot] M35G: compattest harness complete
+[boot] M28B: no crash dump on disk -- skipping crashinfo
+[boot] M28E: /data mounted -- spawning /bin/fscheck --boot
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x44f9 filesz=0x44f9 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xb80 filesz=0xb80 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'fscheck-boot' entry=0x0000000000400000 rsp=0x00007fffffffff10 cr3=0x553000 kstack=0xffffd0000048b1b0 argc=3 envc=1 cwd='/'
+M28E_FSCHECK: path=/data fs_type=tobyfs status=OK errors_found=0 errors_repaired=0 total_bytes=4194304 free_bytes=4055040
+M28E_FSCHECK: detail=""
+M28E_FSCHECK: PASS
+[_exit] code=0 caller=0x0000000000400e34
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'fscheck-boot' exit code=0 (0x0) cpu=0 ms syscalls=21
+[proc] reaped pid=1, slot recycled
+[boot] M28E: /bin/fscheck (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x45b2 filesz=0x45b2 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xd38 filesz=0xd38 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'services-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd0000048b1b0 argc=2 envc=1 cwd='/'
+M28F_SERVICES: name=input state=running kind=builtin pid=0 rcnt=0 ccnt=0 last_exit=0 backoff_until_ms=0
+M28F_SERVICES: name=network state=running kind=builtin pid=0 rcnt=0 ccnt=0 last_exit=0 backoff_until_ms=0
+M28F_SERVICES: name=desktop state=running kind=builtin pid=0 rcnt=0 ccnt=0 last_exit=0 backoff_until_ms=0
+M28F_SERVICES: name=session state=running kind=builtin pid=0 rcnt=0 ccnt=0 last_exit=0 backoff_until_ms=0
+M28F_SERVICES: name=login state=running kind=program pid=0 rcnt=1 ccnt=0 last_exit=0 backoff_until_ms=0
+M28F_SERVICES: PASS (registry has 5 records, no crash test)
+[_exit] code=0 caller=0x0000000000400ed4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'services-boot' exit code=0 (0x0) cpu=0 ms syscalls=91
+[proc] reaped pid=1, slot recycled
+[boot] M28F: /bin/services (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4987 filesz=0x4987 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xdf0 filesz=0xdf0 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'stabilitytest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x553000 kstack=0xffffd0000048b1b0 argc=2 envc=1 cwd='/'
+M28G_STAB: probe=boot verdict=PASS
+M28G_STAB: probe=log verdict=PASS
+M28G_STAB: probe=panic verdict=FAIL
+M28G_STAB: probe=watchdog verdict=PASS
+M28G_STAB: probe=filesystem verdict=PASS
+M28G_STAB: probe=services verdict=PASS
+M28G_STAB: probe=gui verdict=PASS
+M28G_STAB: probe=terminal verdict=PASS
+M28G_STAB: probe=network verdict=PASS
+M28G_STAB: probe=input verdict=PASS
+M28G_STAB: probe=safe_mode verdict=PASS
+M28G_STAB: probe=display verdict=PASS
+M28G_STAB: detail=boot:normal log:emit=30 drop=0 panic:noinit wdog:age=0/to=10000 fs:ok i=15/256 b=23/1013 svc:n=5 bad=0 gui:active term:ok net:up input:up safe:ready disp:1 
+M28G_STAB: stress=skipped safe_mode=0 boot_ms=6302
+M28G_STAB: FAIL pass=11 fail=1 stress_fails=0
+[_exit] code=1 caller=0x00000000004011d4
+[sys_exit] user requested exit, code=1 (0x1)
+[proc] pid=1 'stabilitytest-boot' exit code=1 (0x1) cpu=0 ms syscalls=80
+[proc] reaped pid=1, slot recycled
+[boot] M28G: /bin/stabilitytest --boot pid=1 exit=1 (FAIL)
+[6130] WARN  kernel   pid=0: M28G stability self-test FAIL (pid=1 rc=1)
+[trace t=614 pid=0] drain_launch_queue: spawning '/bin/login' sandbox='default' caps=''
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xe11 filesz=0xe11 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x194 filesz=0x194 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x30 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'login' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x553000 kstack=0xffffd0000048b1b0 argc=0 envc=0 cwd='/'
+[cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=615 pid=0] track_pid pid=1 slot=0
+[gui] launched /bin/login as pid 1 (session=0)
+[trace t=615 pid=0] drain_launch_queue: spawned '/bin/login' as pid=1 session=0
+[svc] 'login' pid=1 (backfilled)
+[trace t=616 pid=0] heartbeat windows=0 apps_alive=1 cursor=(640,400) btn=0x00 dirty=1 menu=0 desktop=1
+[trace t=616 pid=0] toast new id=8 urg=1 app='hotplug' title='Device removed: selftest-detach'
+[trace t=619 pid=1] window_create wid=1 owner_pid=1 size=380x220 pos=(396,376) title='tobyOS login'
+[trace t=716 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=816 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=916 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1016 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1016 pid=0] toast id=8 expired
+[trace t=1016 pid=0] toast new id=7 urg=0 app='hotplug' title='Device attached: selftest-attach'
+[trace t=1116 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1216 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1316 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1416 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1416 pid=0] toast id=7 expired
+[trace t=1416 pid=0] toast new id=6 urg=1 app='hotplug' title='Device removed: selftest-detach'
+[trace t=1516 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1616 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1716 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1816 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1816 pid=0] toast id=6 expired
+[trace t=1816 pid=0] toast new id=5 urg=0 app='hotplug' title='Device attached: selftest-attach'
+[trace t=1916 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2016 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2116 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2216 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2216 pid=0] toast id=5 expired
+[trace t=2216 pid=0] toast new id=4 urg=1 app='hotplug' title='Device removed: selftest-detach'
+[trace t=2316 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2416 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2516 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2616 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2616 pid=0] toast id=4 expired
+[trace t=2616 pid=0] toast new id=3 urg=0 app='hotplug' title='Device attached: selftest-attach'
+[trace t=2716 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2816 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2916 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3016 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3016 pid=0] toast id=3 expired
+[trace t=3016 pid=0] toast new id=2 urg=0 app='session' title='Login service started'
+[trace t=3116 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3216 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3316 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3416 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3416 pid=0] toast id=2 expired
+[trace t=3416 pid=0] toast new id=1 urg=0 app='kernel' title='Desktop ready'
+[input] mouse_inject events=16 clicks=0 btn=0x00 last_dx=-8 last_dy=6 sumdx=27 sumdy=14
+[trace t=3516 pid=0] heartbeat windows=1 apps_alive=1 cursor=(589,431) btn=0x00 dirty=1 menu=0 desktop=1
+[input] mouse_inject events=32 clicks=0 btn=0x00 last_dx=0 last_dy=0 sumdx=101 sumdy=62
+[trace t=3616 pid=0] heartbeat windows=1 apps_alive=1 cursor=(471,504) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=48 clicks=0 btn=0x00 last_dx=-1 last_dy=1 sumdx=172 sumdy=106
+[input] mouse_inject events=64 clicks=0 btn=0x00 last_dx=32 last_dy=-1 sumdx=523 sumdy=180
+[trace t=3716 pid=0] heartbeat windows=1 apps_alive=1 cursor=(451,498) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=80 clicks=0 btn=0x00 last_dx=0 last_dy=0 sumdx=599 sumdy=200
+[input] mouse_inject events=88 clicks=1 btn=0x01 last_dx=0 last_dy=0 sumdx=600 sumdy=210
+[trace t=3764 pid=1] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (454,510)
+[trace t=3764 pid=1] mouse down=(454,510) hit=client wid=1 owner_pid=1 cx=57 cy=116
+[trace t=3786 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (454,510)
+[trace t=3816 pid=0] heartbeat windows=1 apps_alive=1 cursor=(454,510) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3816 pid=0] toast id=1 expired
+[trace t=3916 pid=0] heartbeat windows=1 apps_alive=1 cursor=(454,510) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4016 pid=0] heartbeat windows=1 apps_alive=1 cursor=(454,510) btn=0x00 dirty=0 menu=0 desktop=1
+[input] kbd_dispatch chars=1 irqs=1 shift=0 ctrl=0 caps=0 last_sc=0x0e last_ch=0x08
+[trace t=4116 pid=0] heartbeat windows=1 apps_alive=1 cursor=(454,510) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4216 pid=0] heartbeat windows=1 apps_alive=1 cursor=(452,509) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=96 clicks=1 btn=0x00 last_dx=0 last_dy=1 sumdx=602 sumdy=214
+[trace t=4316 pid=0] heartbeat windows=1 apps_alive=1 cursor=(445,558) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=112 clicks=1 btn=0x00 last_dx=0 last_dy=-1 sumdx=609 sumdy=264
+[input] mouse_inject events=123 clicks=2 btn=0x01 last_dx=0 last_dy=0 sumdx=611 sumdy=279
+[trace t=4398 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (443,539)
+[trace t=4398 pid=0] mouse down=(443,539) hit=client wid=1 owner_pid=1 cx=46 cy=145
+[trace t=4412 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (443,539)
+[session] login refused: unknown user 'tob'
+[44120] WARN  audit    pid=1: login REJECT user='tob' reason=unknown-user
+[trace t=4416 pid=0] heartbeat windows=1 apps_alive=1 cursor=(443,539) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4516 pid=0] heartbeat windows=1 apps_alive=1 cursor=(443,539) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=128 clicks=2 btn=0x00 last_dx=0 last_dy=-5 sumdx=613 sumdy=285
+[trace t=4616 pid=0] heartbeat windows=1 apps_alive=1 cursor=(465,500) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=142 clicks=3 btn=0x01 last_dx=0 last_dy=0 sumdx=641 sumdy=321
+[trace t=4657 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (467,499)
+[trace t=4657 pid=0] mouse down=(467,499) hit=client wid=1 owner_pid=1 cx=70 cy=105
+[trace t=4685 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (467,499)
+[trace t=4716 pid=0] heartbeat windows=1 apps_alive=1 cursor=(467,499) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4816 pid=0] heartbeat windows=1 apps_alive=1 cursor=(467,499) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4916 pid=0] heartbeat windows=1 apps_alive=1 cursor=(467,499) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5016 pid=0] heartbeat windows=1 apps_alive=1 cursor=(467,499) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=144 clicks=3 btn=0x00 last_dx=-1 last_dy=0 sumdx=642 sumdy=321
+[trace t=5116 pid=0] heartbeat windows=1 apps_alive=1 cursor=(455,510) btn=0x00 dirty=1 menu=0 desktop=1
+[input] mouse_inject events=160 clicks=3 btn=0x00 last_dx=0 last_dy=0 sumdx=661 sumdy=356
+[trace t=5216 pid=0] heartbeat windows=1 apps_alive=1 cursor=(445,542) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=173 clicks=4 btn=0x01 last_dx=0 last_dy=0 sumdx=665 sumdy=365
+[trace t=5294 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (443,543)
+[trace t=5294 pid=0] mouse down=(443,543) hit=client wid=1 owner_pid=1 cx=46 cy=149
+[input] mouse_inject events=176 clicks=4 btn=0x01 last_dx=-2 last_dy=-1 sumdx=673 sumdy=367
+[trace t=5315 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (434,541)
+[settings] saved 209 entries to /data/settings.conf (209 bytes)
+[session] LOGIN id=1 user='toby' uid=1000 gid=1000
+[53180] INFO  audit    pid=1: login OK id=1 user='toby' uid=1000 gid=1000
+[notify #9 urg=0 kind=4] session: Logged in -- Welcome, toby. Session #1 started.
+[trace t=5319 pid=0] heartbeat windows=1 apps_alive=1 cursor=(434,541) btn=0x00 dirty=1 menu=0 desktop=1
+[trace t=5319 pid=0] toast new id=9 urg=0 app='session' title='Logged in'
+[sys_exit] user requested exit, code=0 (0x0)
+[trace t=5319 pid=1] window_close wid=1 owner_pid=1 title='tobyOS login'
+[proc] pid=1 'login' exit code=0 (0x0) cpu=240 ms syscalls=22228
+[proc] reaped pid=1, slot recycled
+[trace t=5321 pid=0] reap: pid=1 terminated exit=0 (slot=0 cleared)
+[svc] 'login' crashed rc=-1 (consecutive=1, total=1) -> BACKOFF 100 ms
+[53210] WARN  svc      pid=0: 'login' crashed rc=-1 consecutive=1 total=1 backoff=100ms
+[notify #10 urg=1 kind=3] service: Service 'login' crashed -- rc=-1, restarting in 100 ms (#1)
+[trace t=5419 pid=0] heartbeat windows=0 apps_alive=0 cursor=(531,504) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=192 clicks=4 btn=0x00 last_dx=0 last_dy=0 sumdx=805 sumdy=416
+[trace t=5519 pid=0] heartbeat windows=0 apps_alive=0 cursor=(555,499) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=208 clicks=4 btn=0x00 last_dx=0 last_dy=0 sumdx=811 sumdy=426
+[trace t=5619 pid=0] heartbeat windows=0 apps_alive=0 cursor=(553,504) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5719 pid=0] heartbeat windows=0 apps_alive=0 cursor=(559,525) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5719 pid=0] toast id=9 expired
+[trace t=5719 pid=0] toast new id=10 urg=1 app='service' title='Service 'login' crashed'
+[input] mouse_inject events=224 clicks=4 btn=0x00 last_dx=0 last_dy=4 sumdx=818 sumdy=457
+[trace t=5819 pid=0] heartbeat windows=0 apps_alive=0 cursor=(561,564) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=240 clicks=4 btn=0x00 last_dx=1 last_dy=0 sumdx=845 sumdy=492
+[input] mouse_inject events=256 clicks=4 btn=0x00 last_dx=1 last_dy=3 sumdx=879 sumdy=526
+[trace t=5919 pid=0] heartbeat windows=0 apps_alive=0 cursor=(623,588) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6019 pid=0] heartbeat windows=0 apps_alive=0 cursor=(636,606) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=272 clicks=4 btn=0x00 last_dx=1 last_dy=0 sumdx=895 sumdy=550
+[trace t=6119 pid=0] heartbeat windows=0 apps_alive=0 cursor=(641,609) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6119 pid=0] toast id=10 expired
+[input] mouse_inject events=288 clicks=4 btn=0x00 last_dx=10 last_dy=-4 sumdx=1295 sumdy=666
+[trace t=6219 pid=0] heartbeat windows=0 apps_alive=0 cursor=(838,683) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=304 clicks=4 btn=0x00 last_dx=0 last_dy=-4 sumdx=1903 sumdy=872
+[trace t=6319 pid=0] heartbeat windows=0 apps_alive=0 cursor=(536,527) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=320 clicks=4 btn=0x00 last_dx=0 last_dy=-1 sumdx=2088 sumdy=1075
+[input] mouse_inject events=336 clicks=4 btn=0x00 last_dx=-14 last_dy=3 sumdx=2289 sumdy=1161
+[trace t=6419 pid=0] heartbeat windows=0 apps_alive=0 cursor=(380,469) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=352 clicks=4 btn=0x00 last_dx=-9 last_dy=13 sumdx=2416 sumdy=1262
+[input] mouse_inject events=356 clicks=5 btn=0x01 last_dx=0 last_dy=0 sumdx=2425 sumdy=1276
+[trace t=6471 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (281,574)
+[trace t=6471 pid=0] mouse down=(281,574) hit=bare-desktop
+[trace t=6489 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (281,574)
+[trace t=6519 pid=0] heartbeat windows=0 apps_alive=0 cursor=(257,712) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=368 clicks=5 btn=0x00 last_dx=127 last_dy=0 sumdx=2957 sumdy=1424
+[input] mouse_inject events=384 clicks=5 btn=0x00 last_dx=-77 last_dy=0 sumdx=4371 sumdy=1691
+[trace t=6619 pid=0] heartbeat windows=0 apps_alive=0 cursor=(339,487) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=400 clicks=5 btn=0x00 last_dx=-17 last_dy=4 sumdx=4698 sumdy=1910
+[trace t=6719 pid=0] heartbeat windows=0 apps_alive=0 cursor=(92,706) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=416 clicks=5 btn=0x00 last_dx=1 last_dy=-2 sumdx=4779 sumdy=1970
+[input] mouse_inject events=432 clicks=5 btn=0x00 last_dx=-4 last_dy=9 sumdx=4803 sumdy=2057
+[trace t=6819 pid=0] heartbeat windows=0 apps_alive=0 cursor=(80,705) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6919 pid=0] heartbeat windows=0 apps_alive=0 cursor=(80,705) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=448 clicks=5 btn=0x00 last_dx=-84 last_dy=0 sumdx=6404 sumdy=2340
+[input] mouse_inject events=464 clicks=5 btn=0x00 last_dx=-17 last_dy=7 sumdx=6777 sumdy=2445
+[trace t=7019 pid=0] heartbeat windows=0 apps_alive=0 cursor=(453,681) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7119 pid=0] heartbeat windows=0 apps_alive=0 cursor=(335,705) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=480 clicks=5 btn=0x00 last_dx=-1 last_dy=-1 sumdx=7123 sumdy=2594
+[trace t=7219 pid=0] heartbeat windows=0 apps_alive=0 cursor=(69,593) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=496 clicks=5 btn=0x00 last_dx=-12 last_dy=4 sumdx=7283 sumdy=2640
+[trace t=7319 pid=0] heartbeat windows=0 apps_alive=0 cursor=(13,615) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=512 clicks=5 btn=0x00 last_dx=-51 last_dy=0 sumdx=7823 sumdy=2764
+[trace t=7419 pid=0] heartbeat windows=0 apps_alive=0 cursor=(104,676) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=528 clicks=5 btn=0x00 last_dx=-6 last_dy=4 sumdx=7859 sumdy=2776
+[trace t=7519 pid=0] heartbeat windows=0 apps_alive=0 cursor=(65,705) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7619 pid=0] heartbeat windows=0 apps_alive=0 cursor=(65,705) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7719 pid=0] heartbeat windows=0 apps_alive=0 cursor=(65,705) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7820 pid=0] heartbeat windows=0 apps_alive=0 cursor=(215,15) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=544 clicks=5 btn=0x00 last_dx=-12 last_dy=62 sumdx=8043 sumdy=3774
+[input] mouse_inject events=560 clicks=5 btn=0x00 last_dx=-2 last_dy=6 sumdx=8214 sumdy=4324
+[input] mouse_inject events=576 clicks=5 btn=0x00 last_dx=1 last_dy=1 sumdx=8229 sumdy=4378
+[trace t=7920 pid=0] heartbeat windows=0 apps_alive=0 cursor=(35,728) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=592 clicks=5 btn=0x00 last_dx=0 last_dy=1 sumdx=8247 sumdy=4424
+[trace t=8020 pid=0] heartbeat windows=0 apps_alive=0 cursor=(37,783) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=605 clicks=6 btn=0x01 last_dx=0 last_dy=0 sumdx=8259 sumdy=4434
+[trace t=8033 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (37,783)
+[trace t=8033 pid=0] mouse down=(37,783) hit=start-button menu_open=1
+[trace t=8059 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (37,783)
+[trace t=8120 pid=0] heartbeat windows=0 apps_alive=0 cursor=(37,783) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=608 clicks=6 btn=0x00 last_dx=0 last_dy=-5 sumdx=8259 sumdy=4440
+[input] mouse_inject events=624 clicks=6 btn=0x00 last_dx=0 last_dy=0 sumdx=8267 sumdy=4462
+[trace t=8220 pid=0] heartbeat windows=0 apps_alive=0 cursor=(45,752) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=8320 pid=0] heartbeat windows=0 apps_alive=0 cursor=(54,740) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=640 clicks=6 btn=0x00 last_dx=0 last_dy=0 sumdx=8277 sumdy=4478
+[input] mouse_inject events=644 clicks=7 btn=0x01 last_dx=0 last_dy=0 sumdx=8281 sumdy=4483
+[trace t=8409 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (59,734)
+[trace t=8409 pid=0] mouse down=(59,734) hit=launcher item=6 label='Hello CLI'
+[trace t=8409 pid=0] launch_enqueue '/data/apps/hello_cli/bin/hello_cli.elf' sandbox='' caps='' (head=2 tail=1)
+[trace t=8410 pid=0] drain_launch_queue: spawning '/data/apps/hello_cli/bin/hello_cli.elf' sandbox='default' caps=''
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3f26 filesz=0x3f26 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x7e0 filesz=0x7e0 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'hello_cli.elf' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x553000 kstack=0xffffd000004d01b0 argc=0 envc=0 cwd='/'
+[cap] pid=1 'hello_cli.elf' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=8416 pid=0] track_pid pid=1 slot=0
+[gui] launched /data/apps/hello_cli/bin/hello_cli.elf as pid 1 (session=1)
+[trace t=8416 pid=0] drain_launch_queue: spawned '/data/apps/hello_cli/bin/hello_cli.elf' as pid=1 session=1
+[hello_cli] Hello from a tobyOS SDK 1.0 app!
+[hello_cli] argc=0
+[_exit] code=0 caller=0x0000000000400174
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'hello_cli.elf' exit code=0 (0x0) cpu=0 ms syscalls=6
+[proc] reaped pid=1, slot recycled
+[trace t=8418 pid=0] reap: pid=1 terminated exit=0 (slot=0 cleared)
+[trace t=8420 pid=0] heartbeat windows=0 apps_alive=0 cursor=(59,734) btn=0x01 dirty=0 menu=0 desktop=1
+[trace t=8427 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (59,734)
+[trace t=8520 pid=0] heartbeat windows=0 apps_alive=0 cursor=(59,734) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=656 clicks=7 btn=0x00 last_dx=9 last_dy=-21 sumdx=8373 sumdy=4673
+[trace t=8620 pid=0] heartbeat windows=0 apps_alive=0 cursor=(169,479) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=672 clicks=7 btn=0x00 last_dx=19 last_dy=-15 sumdx=8481 sumdy=4800
+[trace t=8720 pid=0] heartbeat windows=0 apps_alive=0 cursor=(273,409) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=681 clicks=8 btn=0x01 last_dx=0 last_dy=0 sumdx=8515 sumdy=4820
+[trace t=8756 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (293,397)
+[trace t=8756 pid=0] mouse down=(293,397) hit=bare-desktop
+[trace t=8781 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (293,397)
+[input] mouse_inject events=688 clicks=8 btn=0x00 last_dx=33 last_dy=-7 sumdx=8607 sumdy=4843
+[trace t=8820 pid=0] heartbeat windows=0 apps_alive=0 cursor=(455,367) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=693 clicks=9 btn=0x02 last_dx=0 last_dy=0 sumdx=8677 sumdy=4850
+[trace t=8831 pid=0] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (455,367)
+[trace t=8831 pid=0] mouse down=(455,367) hit=bare-desktop
+[trace t=8856 pid=0] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (455,367)
+[input] mouse_inject events=704 clicks=9 btn=0x00 last_dx=-44 last_dy=53 sumdx=8903 sumdy=5139
+[trace t=8920 pid=0] heartbeat windows=0 apps_alive=0 cursor=(121,768) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=720 clicks=9 btn=0x00 last_dx=-1 last_dy=0 sumdx=9057 sumdy=5280
+[input] mouse_inject events=735 clicks=10 btn=0x01 last_dx=0 last_dy=0 sumdx=9105 sumdy=5292
+[trace t=9014 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (29,785)
+[trace t=9014 pid=0] mouse down=(29,785) hit=start-button menu_open=1
+[trace t=9020 pid=0] heartbeat windows=0 apps_alive=0 cursor=(29,785) btn=0x01 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=736 clicks=10 btn=0x00 last_dx=0 last_dy=0 sumdx=9105 sumdy=5292
+[trace t=9034 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (29,785)
+[trace t=9120 pid=0] heartbeat windows=0 apps_alive=0 cursor=(73,617) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=752 clicks=10 btn=0x00 last_dx=-1 last_dy=1 sumdx=9151 sumdy=5464
+[trace t=9220 pid=0] heartbeat windows=0 apps_alive=0 cursor=(53,651) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=9320 pid=0] heartbeat windows=0 apps_alive=0 cursor=(53,651) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=762 clicks=11 btn=0x01 last_dx=0 last_dy=0 sumdx=9169 sumdy=5494
+[trace t=9345 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (53,651)
+[trace t=9345 pid=0] mouse down=(53,651) hit=launcher item=2 label='Files'
+[trace t=9345 pid=0] launch_enqueue '/bin/gui_files' sandbox='' caps='' (head=3 tail=2)
+[trace t=9345 pid=0] drain_launch_queue: spawning '/bin/gui_files' sandbox='default' caps=''
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xca4 filesz=0xca4 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x8c filesz=0x8c flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x1380 filesz=0x130 flags=RW- U -> pages [0x0000000000402000..0x0000000000404000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'gui_files' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x553000 kstack=0xffffd000004d01b0 argc=0 envc=0 cwd='/'
+[cap] pid=1 'gui_files' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=9347 pid=0] track_pid pid=1 slot=0
+[gui] launched /bin/gui_files as pid 1 (session=1)
+[trace t=9347 pid=0] drain_launch_queue: spawned '/bin/gui_files' as pid=1 session=1
+[trace t=9348 pid=1] window_create wid=1 owner_pid=1 size=480x360 pos=(424,404) title='Files'
+[trace t=9363 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (53,651)
+[trace t=9420 pid=0] heartbeat windows=1 apps_alive=1 cursor=(53,651) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=768 clicks=11 btn=0x00 last_dx=12 last_dy=-18 sumdx=9183 sumdy=5519
+[input] mouse_inject events=784 clicks=11 btn=0x00 last_dx=1 last_dy=0 sumdx=9417 sumdy=5726
+[trace t=9520 pid=0] heartbeat windows=1 apps_alive=1 cursor=(339,409) btn=0x00 dirty=1 menu=0 desktop=1
+[input] mouse_inject events=800 clicks=11 btn=0x00 last_dx=1 last_dy=0 sumdx=9603 sumdy=5753
+[input] mouse_inject events=816 clicks=11 btn=0x00 last_dx=-5 last_dy=3 sumdx=9990 sumdy=6102
+[trace t=9620 pid=0] heartbeat windows=1 apps_alive=1 cursor=(83,779) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=832 clicks=11 btn=0x00 last_dx=-3 last_dy=0 sumdx=10072 sumdy=6120
+[input] mouse_inject events=835 clicks=12 btn=0x01 last_dx=0 last_dy=0 sumdx=10075 sumdy=6120
+[trace t=9685 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (15,793)
+[trace t=9685 pid=0] mouse down=(15,793) hit=start-button menu_open=1
+[trace t=9700 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (15,793)
+[trace t=9720 pid=0] heartbeat windows=1 apps_alive=1 cursor=(15,793) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=848 clicks=12 btn=0x00 last_dx=0 last_dy=-1 sumdx=10103 sumdy=6193
+[trace t=9820 pid=0] heartbeat windows=1 apps_alive=1 cursor=(47,698) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=9920 pid=0] heartbeat windows=1 apps_alive=1 cursor=(47,698) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=861 clicks=13 btn=0x01 last_dx=0 last_dy=0 sumdx=10107 sumdy=6215
+[trace t=9943 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (47,698)
+[trace t=9943 pid=0] mouse down=(47,698) hit=launcher item=4 label='Widgets demo'
+[trace t=9943 pid=0] launch_enqueue '/bin/gui_widgets' sandbox='' caps='' (head=0 tail=3)
+[trace t=9943 pid=0] drain_launch_queue: spawning '/bin/gui_widgets' sandbox='default' caps=''
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xe27 filesz=0xe27 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x121 filesz=0x121 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x28 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=2 ppid=0 'gui_widgets' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x6ee000 kstack=0xffffd000004d81c0 argc=0 envc=0 cwd='/'
+[cap] pid=2 'gui_widgets' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=9944 pid=0] track_pid pid=2 slot=1
+[gui] launched /bin/gui_widgets as pid 2 (session=1)
+[trace t=9944 pid=0] drain_launch_queue: spawned '/bin/gui_widgets' as pid=2 session=1
+[trace t=9947 pid=2] window_create wid=2 owner_pid=2 size=360x220 pos=(452,30) title='widgets demo'
+[trace t=9963 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (47,698)
+[trace t=10020 pid=0] heartbeat windows=2 apps_alive=2 cursor=(47,698) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=864 clicks=13 btn=0x00 last_dx=1 last_dy=0 sumdx=10108 sumdy=6216
+[input] mouse_inject events=880 clicks=13 btn=0x00 last_dx=-1 last_dy=1 sumdx=10468 sumdy=6593
+[trace t=10120 pid=0] heartbeat windows=2 apps_alive=2 cursor=(111,799) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=896 clicks=13 btn=0x00 last_dx=0 last_dy=-1 sumdx=10763 sumdy=7091
+[input] mouse_inject events=912 clicks=13 btn=0x00 last_dx=0 last_dy=0 sumdx=10835 sumdy=7109
+[trace t=10220 pid=0] heartbeat windows=2 apps_alive=2 cursor=(35,780) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=917 clicks=14 btn=0x01 last_dx=0 last_dy=0 sumdx=10839 sumdy=7109
+[trace t=10227 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (35,780)
+[trace t=10227 pid=0] mouse down=(35,780) hit=start-button menu_open=1
+[trace t=10244 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (35,780)
+[input] mouse_inject events=928 clicks=14 btn=0x00 last_dx=4 last_dy=-14 sumdx=10854 sumdy=7176
+[input] mouse_inject events=944 clicks=14 btn=0x00 last_dx=0 last_dy=-5 sumdx=10863 sumdy=7248
+[trace t=10320 pid=0] heartbeat windows=2 apps_alive=2 cursor=(57,641) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=10420 pid=0] heartbeat windows=2 apps_alive=2 cursor=(57,620) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=960 clicks=14 btn=0x00 last_dx=-5 last_dy=0 sumdx=10873 sumdy=7272
+[input] mouse_inject events=965 clicks=15 btn=0x01 last_dx=0 last_dy=0 sumdx=10876 sumdy=7272
+[trace t=10498 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (44,623)
+[trace t=10498 pid=0] mouse down=(44,623) hit=launcher item=1 label='Terminal'
+[trace t=10498 pid=0] launch_enqueue '/bin/gui_term' sandbox='' caps='' (head=1 tail=0)
+[trace t=10499 pid=0] drain_launch_queue: spawning '/bin/gui_term' sandbox='default' caps=''
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x5f0 filesz=0x5f0 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x87 filesz=0x87 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x538 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=3 ppid=0 'gui_term' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x74b000 kstack=0xffffd000004e01d0 argc=0 envc=0 cwd='/'
+[cap] pid=3 'gui_term' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=10499 pid=0] track_pid pid=3 slot=2
+[gui] launched /bin/gui_term as pid 3 (session=1)
+[trace t=10499 pid=0] drain_launch_queue: spawned '/bin/gui_term' as pid=3 session=1
+[trace t=10503 pid=3] window_create wid=3 owner_pid=3 size=520x248 pos=(480,58) title='Terminal'
+[trace t=10511 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (44,623)
+[trace t=10520 pid=0] heartbeat windows=3 apps_alive=3 cursor=(44,623) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=976 clicks=15 btn=0x00 last_dx=0 last_dy=1 sumdx=10895 sumdy=7329
+[input] mouse_inject events=992 clicks=15 btn=0x00 last_dx=-2 last_dy=4 sumdx=10907 sumdy=7414
+[trace t=10620 pid=0] heartbeat windows=3 apps_alive=3 cursor=(57,777) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1008 clicks=15 btn=0x00 last_dx=0 last_dy=1 sumdx=10935 sumdy=7459
+[input] mouse_inject events=1024 clicks=15 btn=0x00 last_dx=0 last_dy=-1 sumdx=10935 sumdy=7471
+[trace t=10720 pid=0] heartbeat windows=3 apps_alive=3 cursor=(31,785) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1038 clicks=16 btn=0x01 last_dx=0 last_dy=0 sumdx=10943 sumdy=7485
+[trace t=10756 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (27,782)
+[trace t=10756 pid=0] mouse down=(27,782) hit=start-button menu_open=1
+[trace t=10773 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (27,782)
+[input] mouse_inject events=1040 clicks=16 btn=0x00 last_dx=0 last_dy=-1 sumdx=10943 sumdy=7486
+[trace t=10820 pid=0] heartbeat windows=3 apps_alive=3 cursor=(27,777) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=10920 pid=0] heartbeat windows=3 apps_alive=3 cursor=(49,717) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=1056 clicks=16 btn=0x00 last_dx=0 last_dy=1 sumdx=10965 sumdy=7552
+[trace t=11020 pid=0] heartbeat windows=3 apps_alive=3 cursor=(45,734) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=1072 clicks=16 btn=0x00 last_dx=0 last_dy=-8 sumdx=10970 sumdy=7578
+[trace t=11120 pid=0] heartbeat windows=3 apps_alive=3 cursor=(44,718) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=1080 clicks=17 btn=0x01 last_dx=0 last_dy=0 sumdx=10970 sumdy=7585
+[trace t=11151 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (44,718)
+[trace t=11151 pid=0] mouse down=(44,718) hit=launcher item=5 label='Hello clock'
+[trace t=11151 pid=0] launch_enqueue '/bin/gui_clock' sandbox='' caps='' (head=2 tail=1)
+[trace t=11151 pid=0] drain_launch_queue: spawning '/bin/gui_clock' sandbox='default' caps=''
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x2b2 filesz=0x2b2 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x49 filesz=0x49 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x18 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=4 ppid=0 'gui_clock' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x7d7000 kstack=0xffffd000004e81e0 argc=0 envc=0 cwd='/'
+[cap] pid=4 'gui_clock' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=11152 pid=0] track_pid pid=4 slot=3
+[gui] launched /bin/gui_clock as pid 4 (session=1)
+[trace t=11152 pid=0] drain_launch_queue: spawned '/bin/gui_clock' as pid=4 session=1
+[trace t=11156 pid=4] window_create wid=4 owner_pid=4 size=200x80 pos=(508,86) title='hello window'
+[trace t=11168 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (44,718)
+[trace t=11220 pid=0] heartbeat windows=4 apps_alive=4 cursor=(44,718) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1088 clicks=17 btn=0x00 last_dx=0 last_dy=1 sumdx=10975 sumdy=7614
+[trace t=11320 pid=0] heartbeat windows=4 apps_alive=4 cursor=(45,771) btn=0x00 dirty=1 menu=0 desktop=1
+[input] mouse_inject events=1104 clicks=17 btn=0x00 last_dx=0 last_dy=1 sumdx=10986 sumdy=7652
+[input] mouse_inject events=1105 clicks=18 btn=0x01 last_dx=0 last_dy=0 sumdx=10986 sumdy=7652
+[trace t=11387 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (38,785)
+[trace t=11387 pid=0] mouse down=(38,785) hit=start-button menu_open=1
+[trace t=11409 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (38,785)
+[trace t=11420 pid=0] heartbeat windows=4 apps_alive=4 cursor=(38,785) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=1120 clicks=18 btn=0x00 last_dx=1 last_dy=-4 sumdx=10991 sumdy=7690
+[trace t=11520 pid=0] heartbeat windows=4 apps_alive=4 cursor=(44,735) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=1132 clicks=19 btn=0x01 last_dx=0 last_dy=0 sumdx=10994 sumdy=7702
+[trace t=11608 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (44,735)
+[trace t=11608 pid=0] mouse down=(44,735) hit=launcher item=6 label='Hello CLI'
+[trace t=11608 pid=0] launch_enqueue '/data/apps/hello_cli/bin/hello_cli.elf' sandbox='' caps='' (head=3 tail=2)
+[trace t=11609 pid=0] drain_launch_queue: spawning '/data/apps/hello_cli/bin/hello_cli.elf' sandbox='default' caps=''
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3f26 filesz=0x3f26 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x7e0 filesz=0x7e0 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=5 ppid=0 'hello_cli.elf' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x7e5000 kstack=0xffffd000004ffc00 argc=0 envc=0 cwd='/'
+[cap] pid=5 'hello_cli.elf' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=11614 pid=0] track_pid pid=5 slot=4
+[gui] launched /data/apps/hello_cli/bin/hello_cli.elf as pid 5 (session=1)
+[trace t=11614 pid=0] drain_launch_queue: spawned '/data/apps/hello_cli/bin/hello_cli.elf' as pid=5 session=1
+[hello_cli] Hello from a tobyOS SDK 1.0 app!
+[hello_cli] argc=0
+[_exit] code=0 caller=0x0000000000400174
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=5 'hello_cli.elf' exit code=0 (0x0) cpu=0 ms syscalls=6
+[proc] reaped pid=5, slot recycled
+[trace t=11618 pid=0] reap: pid=5 terminated exit=0 (slot=4 cleared)
+[trace t=11620 pid=0] heartbeat windows=4 apps_alive=4 cursor=(44,735) btn=0x01 dirty=0 menu=0 desktop=1
+[trace t=11629 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (44,735)
+[trace t=11720 pid=0] heartbeat windows=4 apps_alive=4 cursor=(44,735) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1136 clicks=19 btn=0x00 last_dx=0 last_dy=4 sumdx=10997 sumdy=7713
+[trace t=11820 pid=0] heartbeat windows=4 apps_alive=4 cursor=(47,747) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1151 clicks=20 btn=0x01 last_dx=0 last_dy=0 sumdx=11071 sumdy=7826
+[trace t=11860 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (121,635)
+[trace t=11860 pid=0] mouse down=(121,635) hit=bare-desktop
+[input] mouse_inject events=1152 clicks=20 btn=0x00 last_dx=0 last_dy=0 sumdx=11071 sumdy=7826
+[trace t=11876 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (121,635)
+[input] mouse_inject events=1153 clicks=21 btn=0x01 last_dx=0 last_dy=0 sumdx=11071 sumdy=7826
+[trace t=11897 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (121,635)
+[trace t=11897 pid=0] mouse down=(121,635) hit=bare-desktop
+[trace t=11913 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (121,635)
+[trace t=11920 pid=0] heartbeat windows=4 apps_alive=4 cursor=(121,635) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1168 clicks=21 btn=0x00 last_dx=47 last_dy=5 sumdx=11474 sumdy=7939
+[trace t=12020 pid=0] heartbeat windows=4 apps_alive=4 cursor=(604,493) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1184 clicks=21 btn=0x00 last_dx=-39 last_dy=14 sumdx=11648 sumdy=8046
+[input] mouse_inject events=1200 clicks=21 btn=0x00 last_dx=0 last_dy=0 sumdx=11706 sumdy=8122
+[trace t=12120 pid=0] heartbeat windows=4 apps_alive=4 cursor=(458,559) btn=0x00 dirty=1 menu=0 desktop=1
+[input] mouse_inject events=1204 clicks=22 btn=0x01 last_dx=0 last_dy=0 sumdx=11707 sumdy=8128
+[trace t=12126 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (459,553)
+[trace t=12126 pid=0] mouse down=(459,553) hit=client wid=1 owner_pid=1 cx=34 cy=131
+[trace t=12141 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (459,553)
+[input] mouse_inject events=1206 clicks=23 btn=0x01 last_dx=0 last_dy=0 sumdx=11707 sumdy=8128
+[trace t=12164 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (459,553)
+[trace t=12164 pid=0] mouse down=(459,553) hit=client wid=1 owner_pid=1 cx=34 cy=131
+[trace t=12168 pid=1] launch_enqueue '/bin/gui_viewer' arg=/ sandbox='' caps='' (head=0 tail=3)
+[trace t=12168 pid=0] drain_launch_queue: spawning '/bin/gui_viewer' arg='/' sandbox='default' caps=''
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x465 filesz=0x465 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x1ae filesz=0x1ae flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x10040 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000413000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=5 ppid=0 'gui_viewer' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x7e5000 kstack=0xffffd000004ffc00 argc=2 envc=0 cwd='/'
+[cap] pid=5 'gui_viewer' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=12169 pid=0] track_pid pid=5 slot=4
+[gui] launched /bin/gui_viewer as pid 5 (session=1)
+[trace t=12169 pid=0] drain_launch_queue: spawned '/bin/gui_viewer' as pid=5 session=1
+[trace t=12171 pid=5] window_create wid=5 owner_pid=5 size=560x400 pos=(536,114) title='Viewer'
+[trace t=12183 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (459,553)
+[trace t=12220 pid=0] heartbeat windows=5 apps_alive=5 cursor=(459,553) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1216 clicks=23 btn=0x00 last_dx=0 last_dy=0 sumdx=11708 sumdy=8144
+[trace t=12320 pid=0] heartbeat windows=5 apps_alive=5 cursor=(217,391) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1232 clicks=23 btn=0x00 last_dx=-31 last_dy=-19 sumdx=12046 sumdy=8336
+[input] mouse_inject events=1248 clicks=23 btn=0x00 last_dx=10 last_dy=-10 sumdx=12121 sumdy=8446
+[input] mouse_inject events=1252 clicks=24 btn=0x01 last_dx=0 last_dy=0 sumdx=12132 sumdy=8455
+[trace t=12365 pid=3] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (154,226)
+[trace t=12365 pid=3] mouse down=(154,226) hit=bare-desktop
+[trace t=12389 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (154,226)
+[input] mouse_inject events=1264 clicks=24 btn=0x00 last_dx=16 last_dy=7 sumdx=12197 sumdy=8494
+[trace t=12420 pid=0] heartbeat windows=5 apps_alive=5 cursor=(230,273) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1280 clicks=24 btn=0x00 last_dx=8 last_dy=9 sumdx=12302 sumdy=8588
+[input] mouse_inject events=1296 clicks=24 btn=0x00 last_dx=-2 last_dy=0 sumdx=12375 sumdy=8664
+[trace t=12520 pid=0] heartbeat windows=5 apps_alive=5 cursor=(267,438) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1312 clicks=24 btn=0x00 last_dx=2 last_dy=0 sumdx=12432 sumdy=8698
+[input] mouse_inject events=1328 clicks=24 btn=0x00 last_dx=1 last_dy=-1 sumdx=12484 sumdy=8712
+[trace t=12620 pid=0] heartbeat windows=5 apps_alive=5 cursor=(381,451) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=12720 pid=0] heartbeat windows=5 apps_alive=5 cursor=(381,451) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1344 clicks=24 btn=0x00 last_dx=-1 last_dy=1 sumdx=12495 sumdy=8724
+[trace t=12820 pid=0] heartbeat windows=5 apps_alive=5 cursor=(369,455) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=12920 pid=0] heartbeat windows=5 apps_alive=5 cursor=(363,456) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=13020 pid=0] heartbeat windows=5 apps_alive=5 cursor=(363,456) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1360 clicks=24 btn=0x00 last_dx=0 last_dy=1 sumdx=12509 sumdy=8732
+[trace t=13120 pid=0] heartbeat windows=5 apps_alive=5 cursor=(363,470) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1376 clicks=24 btn=0x00 last_dx=1 last_dy=1 sumdx=12521 sumdy=8744
+[input] mouse_inject events=1392 clicks=24 btn=0x00 last_dx=-9 last_dy=22 sumdx=12558 sumdy=8924
+[trace t=13220 pid=0] heartbeat windows=5 apps_alive=5 cursor=(360,649) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1408 clicks=24 btn=0x00 last_dx=-30 last_dy=2 sumdx=12799 sumdy=9043
+[input] mouse_inject events=1424 clicks=24 btn=0x00 last_dx=0 last_dy=0 sumdx=12877 sumdy=9064
+[trace t=13320 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=0 desktop=1
+[input] mouse_inject events=1430 clicks=25 btn=0x01 last_dx=0 last_dy=0 sumdx=12905 sumdy=9070
+[trace t=13344 pid=0] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (13,795)
+[trace t=13344 pid=0] mouse down=(13,795) hit=start-button menu_open=1
+[trace t=13344 pid=0] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (13,795)
+[trace t=13420 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=13520 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=13620 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=13720 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=13820 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=13920 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=14020 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=14120 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=14220 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=14320 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=14420 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=14520 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=14620 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=14720 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=14820 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=14920 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=15020 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=15120 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=15220 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=15320 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=15420 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=15520 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=15620 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=15720 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=15820 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=15920 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=16020 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=16120 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=16220 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=16320 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=16420 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=16520 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=16620 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=16721 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=16821 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=16921 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=17021 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=17121 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=17221 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=17321 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=17421 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=17521 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=17621 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=17722 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=17822 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=17922 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=18022 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=18122 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=18222 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=18322 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=18422 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=18522 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=18622 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=18722 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=18822 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=18923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=19023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=19123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=19223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=19323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=19423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=19523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=19623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=19723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=19823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=19923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=20023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=20123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=20223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=20323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=20423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=20523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=20623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=20723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=20823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=20923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=21023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=21123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=21223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=21323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=21423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=21523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=21623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=21723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=21823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=21923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=22023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=22123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=22223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=22323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=22423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=22523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=22623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=22723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=22823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=22923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=23023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=23123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=23223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=23323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=23423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=23523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=23623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=23723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=23823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=23923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=24023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=24123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=24223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=24323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=24423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=24523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=24623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=24723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=24823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=24923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=25023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=25123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=25223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=25323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=25423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=25523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=25623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=25723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=25823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=25923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=26023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=26123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=26223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=26323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=26423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=26523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=26623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=26723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=26823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=26923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=27023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=27123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=27223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=27323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=27423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=27523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=27623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=27723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=27823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=27923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=28023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=28123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=28223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=28323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=28423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=28523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=28623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=28723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=28823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=28923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=29023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=29123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=29223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=29323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=29423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=29523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=29623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=29723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=29823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=29923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=30023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=30123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=30223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=30323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=30423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=30523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=30623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=30723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=30823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=30923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=31023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=31123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=31223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=31323 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=31423 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=31523 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=31623 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=31723 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=31823 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=31923 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=32023 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=32123 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=32223 pid=0] heartbeat windows=5 apps_alive=5 cursor=(13,795) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=1440 clicks=25 btn=0x00 last_dx=127 last_dy=0 sumdx=14048 sumdy=9161
+[trace t=32324 pid=0] heartbeat windows=5 apps_alive=5 cursor=(1041,389) btn=0x00 dirty=0 menu=1 desktop=1
+[input] mouse_inject events=1456 clicks=25 btn=0x00 last_dx=5 last_dy=-14 sumdx=14410 sumdy=9548
+[trace t=32424 pid=0] heartbeat windows=5 apps_alive=5 cursor=(1279,85) btn=0x00 dirty=0 menu=1 desktop=1
+[trace t=32524 pid=0] heartbeat windows=5 apps_alive=5 cursor=(1279,85) btn=0x00 dirty=0 menu=1 desktop=1

@@ -1,0 +1,135 @@
+[boot] serial up
+[boot] framebuffer: 1280x800 pitch=5120 bpp=32 addr=0xffff8000fd000000
+[boot] console up
+[gdt] loaded: base=0xffffffff800150a0 limit=55 entries=7
+[gdt] CS=0x08 DS=0x10 (expected CS=0x08 DS=0x10)
+[gdt] user CS=0x23 DS=0x1b  TSS sel=0x28 (TSS slot empty until tss_init)
+[idt] loaded: base=0xffffffff800150f0 limit=4095 (48 gates wired)
+[boot] firing int3 to exercise IDT round-trip...
+[isr] breakpoint hit at rip=0xffffffff8000107b (rflags=0x82)
+[boot] int3 returned cleanly, IDT round-trip OK
+[pit] channel 0 -> 100 Hz (divisor=11931)
+[kbd] PS/2 driver up (IRQ1 unmasked)
+[boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard)
+[boot] HHDM offset = 0xffff800000000000
+[pmm] Limine memmap (17 entries):
+  0x0000000000001000..0x0000000000061000       384 KiB  bootloader
+  0x0000000000061000..0x000000000009f000       248 KiB  usable
+  0x000000000009fc00..0x00000000000a0000         1 KiB  reserved
+  0x00000000000f0000..0x0000000000100000        64 KiB  reserved
+  0x0000000000100000..0x0000000007f11000    129092 KiB  usable
+  0x0000000007f11000..0x0000000007f19000        32 KiB  kernel
+  0x0000000007f19000..0x0000000007f1a000         4 KiB  bootloader
+  0x0000000007f1a000..0x0000000007f1d000        12 KiB  usable
+  0x0000000007f1d000..0x0000000007f23000        24 KiB  bootloader
+  0x0000000007f23000..0x0000000007f3f000       112 KiB  kernel
+  0x0000000007f3f000..0x0000000007f5d000       120 KiB  bootloader
+  0x0000000007f5d000..0x0000000007f78000       108 KiB  usable
+  0x0000000007f78000..0x0000000007fe0000       416 KiB  bootloader
+  0x0000000007fe0000..0x0000000008000000       128 KiB  reserved
+  0x00000000fd000000..0x00000000fd3e8000      4000 KiB  framebuffer
+  0x00000000fffc0000..0x0000000100000000       256 KiB  reserved
+  0x000000fd00000000..0x0000010000000000  12582912 KiB  reserved
+[pmm] managed:  32632 pages (127 MiB) up to 0x0000000007f78000
+[pmm] usable:   129460 KiB across 17 regions
+[pmm] bitmap:   4079 bytes at phys 0x0000000000061000 (virt 0xffff800000061000), 1 pages
+[pmm] free:     32364 pages (126 MiB) -- used: 268 pages
+[pmm] test: allocated 0x0000000000062000 0x0000000000063000 0x0000000000064000 0x0000000000065000 (free now=32360)
+[pmm] test: read-back a=0xdeadbeefcafebabe d=0x1122334455667788
+[pmm] test: alloc/free balanced (free=32364 before & after)
+[boot] reserved AP trampoline page at phys 0x0000000000070000
+[vmm] kernel image: virt 0xffffffff80000000..0xffffffff8001c000 -> phys 0x0000000007f23000 (112 KiB)
+[vmm] hhdm mirror:  132 MiB across memmap, top phys 0x00000000fd400000, 2M pages
+[vmm] new PML4 at phys 0x0000000000062000, switching CR3...
+[vmm] CR3 switched. Running on tobyOS page tables.
+[vmm] test: __text_start 0xffffffff80001000 -> phys 0x0000000007f24000
+[vmm] test: __data_start 0xffffffff80015000 -> phys 0x0000000007f38000
+[vmm] test: HHDM r/w through new PML4 at phys 0x0000000000069000 OK
+[vmm] test: new mapping at 0xffffc00000000000 <-> phys 0x0000000000069000 verified
+[vmm] test: unmap clears translation, scratch page freed
+[vmm] test: ok
+[heap] up: initial arena 17 pages (67 KiB)
+[heap] start: arenas=1 total=69600 used=0 free=69600  brk=0xffffd00000011000 (region 0xffffd00000000000..0xffffd10000000000)
+[heap] after 8 allocs: arenas=2 used=85616 free=65872 allocs=8
+[heap] after 8 frees: arenas=2 used=0 free=151488 frees=8
+[heap] test: ok (region OK, fragmented 80 KiB alloc OK, round-trip balanced, kcalloc zero-verified)
+[heap] brk now 0xffffd00000025000 (148 KiB virt consumed)
+[tss] installed: tss=0xffffffff8001aba0 rsp0=0xffffffff8001aba0 (irq stack 16 KiB)
+[sys] EFER.SCE on, STAR=0x0010000800000000, LSTAR=0xffffffff8000df8c, FMASK=0x700
+[sys] kernel syscall rsp = 0xffffffff8001aba0
+[sys] available syscalls: 0=exit  1=write
+[boot] Limine modules (1):
+  [0] /boot/initrd.tar  size=30720  addr=0xffff800007f11000
+[initrd] using '/boot/initrd.tar' (size=30720, addr=0xffff800007f11000)
+[ramfs] mounted: 4 entries from 30720-byte tar at 0xffff800007f11000
+  - bin/hello                         8848 B
+  - bin/bad                           8800 B
+  - etc/motd                          297 B
+  - readme.txt                        922 B
+[ata] primary master: 8192 sectors (4096 KiB) -- PIO LBA28
+[tobyfs] mounted '/data' on ide0:master: 4/255 inodes, 4/1013 data blocks (4036 KiB free)
+[vfs] mount table (2 entries):
+  /            -> ops=0xffffffff80013600 mnt=0xffffffff8001b540
+  /data        -> ops=0xffffffff800136b0 mnt=0xffffd000000112a0
+[proc] table initialised (16 slots), pid 0 = 'kernel_main' RUNNING
+[sched] cooperative round-robin scheduler ready
+[boot] spawning first userspace process from /bin/hello...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x2f filesz=0x2f flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x45 filesz=0x45 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] load OK (user): 2 segment(s), entry=0x0000000000400000
+[proc] created pid=1 'hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffeff0 cr3=0x95000 kstack=0xffffd00000017340
+hello from user mode
+user_hello: about to SYS_EXIT(0x55)
+[sys_exit] user requested exit, code=85 (0x55)
+[proc] pid=1 'hello-boot' exit code=85 (0x55)
+[proc] reaped pid=1, slot recycled
+[boot] /bin/hello (pid=1) finished, exit code=85 (0x55)
+[acpi] using RSDT @ 0x0000000007fe244c (entries=4)
+[acpi] MADT: lapic_phys (32-bit field) = 0x00000000fee00000, legacy_pic=yes
+[acpi]   CPU0: acpi_id=0 apic_id=0 flags=0x1 enabled 
+[acpi]   CPU1: acpi_id=1 apic_id=1 flags=0x1 enabled 
+[acpi]   CPU2: acpi_id=2 apic_id=2 flags=0x1 enabled 
+[acpi]   CPU3: acpi_id=3 apic_id=3 flags=0x1 enabled 
+[acpi]   IOAPIC entry (ignored, no IO-APIC routing this milestone)
+[acpi] enumerated 4 CPUs (SMP)
+[apic] BSP local APIC: phys=0x00000000fee00000 virt=0xffffd20000000000 id=0 ver=0x14
+[apic] SVR=0x1ff  spurious_vec=0xff  timer_vec=0x40 (masked)
+[apic] timer calibrated: ~6549900 ticks/10ms (~654990 kHz)
+[smp] 4 CPU(s) total: BSP apic_id=0
+[smp]   cpu0: apic_id=0 (BSP)
+[smp]   cpu1: apic_id=1
+[smp]   cpu2: apic_id=2
+[smp]   cpu3: apic_id=3
+CPU 0 online
+  apic_id=0 (BSP)  stack=bootloader-provided
+[smp] trampoline installed: phys=0x0000000000070000 virt=0xffff800000070000 len=1024 bytes
+[smp] cpu1: INIT-SIPI-SIPI to apic_id=1 (tramp_vector=0x70, stack=0xffffd00000017340)
+CPU 1 online
+  apic_id=1 (acpi said 1)  stack_top=0xffffd00000017340
+[smp] cpu2: INIT-SIPI-SIPI to apic_id=2 (tramp_vector=0x70, stack=0xffffd0000001b350)
+CPU 2 online
+  apic_id=2 (acpi said 2)  stack_top=0xffffd0000001b350
+[smp] cpu3: INIT-SIPI-SIPI to apic_id=3 (tramp_vector=0x70, stack=0xffffd0000001f360)
+CPU 3 online
+  apic_id=3 (acpi said 3)  stack_top=0xffffd0000001f360
+[smp] 3/3 APs online (total 4 CPUs)
+Welcome to tobyOS
+milestone 6: writable on-disk filesystem + persistence
+
+type 'help' to list commands.
+tobyOS> mounts
+[vfs] mount table (2 entries):
+  /            -> ops=0xffffffff80013600 mnt=0xffffffff8001b540
+  /data        -> ops=0xffffffff800136b0 mnt=0xffffd000000112a0
+tobyOS> ls /data
+  docs                      <DIR>
+  note.txt                  11 B
+tobyOS> ls /data/docs
+  hello.txt                 23 B
+tobyOS> cat /data/docs/hello.txt
+persisted across reboot
+tobyOS> cat /data/note.txt
+second file
+tobyOS> echo pass2 success if both cats printed pass1 contents
+pass2 success if both cats printed pass1 contents
+tobyOS> 

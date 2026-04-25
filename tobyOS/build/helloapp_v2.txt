@@ -1,0 +1,4 @@
+tobyOS helloapp v1.1.0 -- upgraded via `pkg upgrade helloapp`.
+Launcher entry: 'Hello Pkg' -> /data/apps/helloapp.elf
+Roll back to v1.0.0 with: pkg rollback helloapp
+Remove with: pkg remove helloapp

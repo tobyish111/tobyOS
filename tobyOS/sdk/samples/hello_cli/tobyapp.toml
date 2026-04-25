@@ -1,0 +1,25 @@
+# hello_cli/tobyapp.toml -- minimal CLI sample manifest.
+#
+# Tells `pkgbuild` what to drop into a .tpkg and how the in-kernel
+# pkg installer should register the result.
+
+[app]
+name        = "hello_cli"
+version     = "1.0.0"
+kind        = "cli"
+description = "Minimal SDK 1.0 CLI sample"
+author      = "tobyOS SDK"
+license     = "MIT"
+
+[install]
+prefix      = "/data/apps/hello_cli"
+
+[files]
+"bin/hello_cli.elf" = "build/hello_cli.elf"
+
+# CLI samples normally don't appear in the start menu, but registering
+# a launcher entry lets a curious user click it from [Apps] -- the
+# program runs once and prints to the shell window.
+[launcher]
+label = "Hello CLI"
+exec  = "bin/hello_cli.elf"

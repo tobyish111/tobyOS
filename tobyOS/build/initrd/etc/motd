@@ -1,0 +1,12 @@
+==============================================
+  Welcome to tobyOS -- milestone 4
+==============================================
+
+The kernel mounted this file from /etc/motd
+on a read-only ramfs backed by a USTAR initrd.
+
+Try:
+    ls
+    ls /bin
+    cat /readme.txt
+    run /bin/hello

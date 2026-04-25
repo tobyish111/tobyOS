@@ -1,0 +1,160 @@
+rm -rf build/initrd
+mkdir -p build/initrd/bin build/initrd/etc build/initrd/repo build/initrd/lib
+cp initrd/etc/motd                       build/initrd/etc/motd
+cp initrd/readme.txt                     build/initrd/readme.txt
+cp programs/user_hello/user_hello.elf    build/initrd/bin/hello
+cp programs/user_bad/user_bad.elf        build/initrd/bin/bad
+cp programs/user_echo/user_echo.elf      build/initrd/bin/echo
+cp programs/user_cat/user_cat.elf        build/initrd/bin/cat
+cp programs/user_long/user_long.elf      build/initrd/bin/long_task
+cp programs/user_netecho/user_netecho.elf build/initrd/bin/netecho
+cp programs/user_gui_demo/user_gui_demo.elf   build/initrd/bin/gui_demo
+cp programs/user_gui_clock/user_gui_clock.elf build/initrd/bin/gui_clock
+cp programs/user_gui_widgets/user_gui_widgets.elf build/initrd/bin/gui_widgets
+cp programs/user_gui_about/user_gui_about.elf     build/initrd/bin/gui_about
+cp programs/user_gui_term/user_gui_term.elf       build/initrd/bin/gui_term
+cp programs/user_gui_files/user_gui_files.elf     build/initrd/bin/gui_files
+cp programs/user_gui_viewer/user_gui_viewer.elf   build/initrd/bin/gui_viewer
+cp programs/user_login/user_login.elf             build/initrd/bin/login
+cp programs/user_gui_settings/user_gui_settings.elf build/initrd/bin/gui_settings
+cp programs/user_abi_test/user_abi_test.elf       build/initrd/bin/abi_test
+cp programs/c_hello/c_hello.elf                   build/initrd/bin/c_hello
+cp programs/c_args/c_args.elf                     build/initrd/bin/c_args
+cp programs/c_filedemo/c_filedemo.elf             build/initrd/bin/c_filedemo
+cp programs/c_alloctest/c_alloctest.elf           build/initrd/bin/c_alloctest
+cp programs/c_envtest/c_envtest.elf               build/initrd/bin/c_envtest
+cp programs/c_dynhello/c_dynhello.elf             build/initrd/bin/c_dynhello
+cp programs/devlist/devlist.elf                   build/initrd/bin/devlist
+cp programs/drvtest/drvtest.elf                   build/initrd/bin/drvtest
+cp programs/usbtest/usbtest.elf                   build/initrd/bin/usbtest
+cp programs/audiotest/audiotest.elf               build/initrd/bin/audiotest
+cp programs/batterytest/batterytest.elf           build/initrd/bin/batterytest
+cp programs/displayinfo/displayinfo.elf           build/initrd/bin/displayinfo
+cp programs/drawtest/drawtest.elf                 build/initrd/bin/drawtest
+cp programs/rendertest/rendertest.elf             build/initrd/bin/rendertest
+cp programs/fonttest/fonttest.elf                 build/initrd/bin/fonttest
+cp programs/logview/logview.elf                   build/initrd/bin/logview
+cp programs/crashinfo/crashinfo.elf               build/initrd/bin/crashinfo
+cp programs/wdogtest/wdogtest.elf                 build/initrd/bin/wdogtest
+cp programs/safesh/safesh.elf                     build/initrd/bin/safesh
+cp programs/fscheck/fscheck.elf                   build/initrd/bin/fscheck
+cp programs/services/services.elf                 build/initrd/bin/services
+cp programs/svc_crasher/svc_crasher.elf           build/initrd/bin/svc_crasher
+cp programs/stabilitytest/stabilitytest.elf       build/initrd/bin/stabilitytest
+cp programs/hwinfo/hwinfo.elf                     build/initrd/bin/hwinfo
+cp programs/drvmatch/drvmatch.elf                 build/initrd/bin/drvmatch
+cp ports/sbase/echo.elf                    build/initrd/bin/p_echo
+cp ports/sbase/cat.elf                     build/initrd/bin/p_cat
+cp ports/sbase/wc.elf                      build/initrd/bin/p_wc
+cp ports/sbase/head.elf                    build/initrd/bin/p_head
+cp ports/sbase/ls.elf                      build/initrd/bin/p_ls
+cp ports/sbase/grep.elf                    build/initrd/bin/p_grep
+cp ld/ld-toby.so                                   build/initrd/lib/ld-toby.so
+cp libtoby/libtoby.so                                  build/initrd/lib/libtoby.so
+cp build/helloapp.tpkg                               build/initrd/repo/helloapp.tpkg
+cp build/helloapp_v2.tpkg                            build/initrd/repo/helloapp_v2.tpkg
+[initrd] M29B: DRVTEST_FLAG set --  /etc/drvtest_now baked into initrd
+rm -rf build/iso_base
+mkdir -p build/iso_base/boot/limine
+mkdir -p build/iso_base/EFI/BOOT
+cp tobyos.bin                           build/iso_base/boot/
+cp limine_base.conf                    build/iso_base/boot/limine/limine.conf
+cp limine/limine-bios.sys       build/iso_base/boot/limine/
+cp limine/limine-bios-cd.bin    build/iso_base/boot/limine/
+cp limine/limine-uefi-cd.bin    build/iso_base/boot/limine/
+cp limine/BOOTX64.EFI           build/iso_base/EFI/BOOT/
+cp build/initrd.tar                       build/iso_base/boot/initrd.tar
+xorriso -as mkisofs -R -r -J \
+	-b boot/limine/limine-bios-cd.bin \
+	-no-emul-boot \
+	-boot-load-size 4 \
+	-boot-info-table \
+	--efi-boot boot/limine/limine-uefi-cd.bin \
+	-efi-boot-part --efi-boot-image \
+	--protective-msdos-label \
+	build/iso_base -o build/base.iso
+[base.iso] zeroing protective-ISO MBR slot before limine bios-install
+dd if=/dev/zero of=build/base.iso bs=1 count=16 seek=446 conv=notrunc status=none
+limine/limine bios-install build/base.iso
+cp build/base.iso build/install.img
+truncate -s 4194304 build/install.img
+rm -rf iso
+mkdir -p iso/boot/limine
+mkdir -p iso/EFI/BOOT
+cp tobyos.bin                           iso/boot/
+cp limine.conf                         iso/boot/limine/
+cp limine/limine-bios.sys       iso/boot/limine/
+cp limine/limine-bios-cd.bin    iso/boot/limine/
+cp limine/limine-uefi-cd.bin    iso/boot/limine/
+cp limine/BOOTX64.EFI           iso/EFI/BOOT/
+cp build/initrd.tar                       iso/boot/initrd.tar
+cp build/install.img                      iso/boot/install.img
+xorriso -as mkisofs -R -r -J \
+	-b boot/limine/limine-bios-cd.bin \
+	-no-emul-boot \
+	-boot-load-size 4 \
+	-boot-info-table \
+	--efi-boot boot/limine/limine-uefi-cd.bin \
+	-efi-boot-part --efi-boot-image \
+	--protective-msdos-label \
+	iso -o tobyOS.iso
+[tobyOS.iso] zeroing protective-ISO MBR slot before limine bios-install
+dd if=/dev/zero of=tobyOS.iso bs=1 count=16 seek=446 conv=notrunc status=none
+limine/limine bios-install tobyOS.iso
+GNU xorriso 1.5.6 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:build/base.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 2876g free
+Added to ISO image: directory '/'='/c/CustomOS/tobyOS/build/iso_base'
+xorriso : UPDATE :      11 files added in 1 seconds
+xorriso : UPDATE :      11 files added in 1 seconds
+ISO image produced: 2869 sectors
+Written to medium : 2869 sectors at LBA 0
+Writing to 'stdio:build/base.iso' completed successfully.
+
+Physical block size of 512 bytes.
+Installing to GPT. Logical block size of 512 bytes.
+Secondary header at LBA 0x2cd3.
+Secondary header valid.
+Detected ISOHYBRID with a GUID partition table (GPT).
+Converting to MBR for improved compatibility...
+Conversion successful.
+No active partition found, some systems may not boot.
+Setting partition 1 as active to work around the issue...
+Installing to MBR.
+Stage 2 to be located at byte offset 0x200.
+Reminder: Remember to copy the limine-bios.sys file in either
+          the root, /boot, /limine, or /boot/limine directories of
+          one of the partitions on the device, or boot will fail!
+Limine BIOS stages installed successfully.
+GNU xorriso 1.5.6 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:tobyOS.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 2876g free
+Added to ISO image: directory '/'='/c/CustomOS/tobyOS/iso'
+xorriso : UPDATE :      12 files added in 1 seconds
+xorriso : UPDATE :      12 files added in 1 seconds
+ISO image produced: 4917 sectors
+Written to medium : 4917 sectors at LBA 0
+Writing to 'stdio:tobyOS.iso' completed successfully.
+
+Physical block size of 512 bytes.
+Installing to GPT. Logical block size of 512 bytes.
+Secondary header at LBA 0x4cd3.
+Secondary header valid.
+Detected ISOHYBRID with a GUID partition table (GPT).
+Converting to MBR for improved compatibility...
+Conversion successful.
+No active partition found, some systems may not boot.
+Setting partition 1 as active to work around the issue...
+Installing to MBR.
+Stage 2 to be located at byte offset 0x200.
+Reminder: Remember to copy the limine-bios.sys file in either
+          the root, /boot, /limine, or /boot/limine directories of
+          one of the partitions on the device, or boot will fail!
+Limine BIOS stages installed successfully.
+

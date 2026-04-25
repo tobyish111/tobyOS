@@ -1,0 +1,4 @@
+rm -f disk.img
+build/mkfs_tobyfs disk.img
+mkfs.tobyfs: 'disk.img' formatted -- 1024 blocks of 4096 bytes (4096 KiB), 255 inodes, 1013 user data blocks
+truncate -s 16777216 disk.img

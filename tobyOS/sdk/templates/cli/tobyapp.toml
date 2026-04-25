@@ -1,0 +1,19 @@
+# CLI app template manifest -- rename and edit.
+
+[app]
+name        = "myapp"
+version     = "0.1.0"
+kind        = "cli"
+description = "Replace me"
+author      = "Your Name"
+license     = "MIT"
+
+[install]
+prefix      = "/data/apps/myapp"
+
+[files]
+"bin/myapp.elf" = "build/myapp.elf"
+
+[launcher]
+label = "My App"
+exec  = "bin/myapp.elf"

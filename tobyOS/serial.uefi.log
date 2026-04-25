@@ -1,0 +1,322 @@
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU DVD-ROM QM00003 " from PciRoot(0x0)/Pci(0x1,0x1)/Ata(Secondary,Master,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00003 " from PciRoot(0x0)/Pci(0x1,0x1)/Ata(Secondary,Master,0x0)
+[01;01H[01;01H[01;01H[2J[01;01H[01;01H[01;01H[01;01H[02;01H[02;27H[0m[36m[40mL[02;28Hi[02;29Hm[02;30Hi[02;31Hn[02;32He[02;33H [02;34H1[02;35H1[02;36H.[02;37H4[02;38H.[02;39H0[02;40H [02;41H([02;42Hx[02;43H8[02;44H6[02;45H-[02;46H6[02;47H4[02;48H,[02;49H [02;50HU[02;51HE[02;52HF[02;53HI[02;54H)[02;55H[0m[37m[40m[02;01H[03;01H[03;01H[04;01H[04;01H[05;01H[05;01H[06;01H[13;01H [13;02H [13;03H [13;04H [13;05H [13;06H [13;07H [13;08H [13;09H [13;10H [13;11H [13;12H [13;13H [13;14H [13;15H [13;16H [13;17H [13;18H [13;19H [13;20H [13;21H [13;22H [13;23H [13;24H [13;25H [13;26H [13;27H [13;28H [13;29H [13;30H [13;31H [13;32H [13;33H [13;34H [13;35H [13;36H[0m[30m[47m [13;37Ht[13;38Ho[13;39Hb[13;40Hy[13;41HO[13;42HS[13;43H [13;44H[0m[37m[40m[13;01H[14;01H[04;01H [04;02H [04;03H [04;04H [04;05H[0m[32m[40mA[04;06HR[04;07HR[04;08HO[04;09HW[04;10HS[04;11H[0m[37m[40m [04;12HS[04;13He[04;14Hl[04;15He[04;16Hc[04;17Ht[04;18H [04;19H [04;20H [04;21H [04;22H[0m[32m[40mE[04;23HN[04;24HT[04;25HE[04;26HR[04;27H[0m[37m[40m [04;28HB[04;29Ho[04;30Ho[04;31Ht[04;32H [04;33H [04;34H [04;35H [04;36H[0m[32m[40mE[04;37H[0m[37m[40m [04;38HE[04;39Hd[04;40Hi[04;41Ht[04;42H[04;44H[0m[32m[40mS[04;45H[0m[37m[40m [04;46HF[04;47Hi[04;48Hr[04;49Hm[04;50Hw[04;51Ha[04;52Hr[04;53He[04;54H [04;55HS[04;56He[04;57Ht[04;58Hu[04;59Hp[04;60H[04;64H[0m[32m[40mB[04;65H[0m[37m[40m [04;66HB[04;67Hl[04;68Ha[04;69Hn[04;70Hk[04;71H [04;72HE[04;73Hn[04;74Ht[04;75Hr[04;76Hy[04;77H[14;01H[14;01H[15;01H[15;01H[16;01H[24;01H[24;01H [24;02H [24;03H [24;04H [24;05H [24;06H [24;07H [24;08H [24;09H [24;10H [24;11H [24;12H [24;13H [24;14H [24;15H [24;16H [24;17H [24;18H [24;19H [24;20H [24;21H [24;22H [24;23H [24;24H [24;25H [24;26H [24;27H [24;28H [24;29H [24;30H [24;31H [24;32H [24;33H [24;34H [24;35H [24;36H [24;37H [24;38H [24;39H [24;40H [24;41H [24;42H [24;43H [24;44H [24;45H [24;46H [24;47H [24;48H [24;49H [24;50H [24;51H [24;52H [24;53H [24;54H [24;55H [24;56H [24;57H [24;58H [24;59H [24;60H [24;61H [24;62H [24;63H [24;64H [24;65H [24;66H [24;67H [24;68H [24;69H [24;70H [24;71H [24;72H [24;73H [24;74H [24;75H [24;76H [24;77H [24;78H [24;79H [24;80H[24;01H[0m[32m[40mB[24;02Ho[24;03Ho[24;04Ht[24;05Hi[24;06Hn[24;07Hg[24;08H [24;09Ha[24;10Hu[24;11Ht[24;12Ho[24;13Hm[24;14Ha[24;15Ht[24;16Hi[24;17Hc[24;18Ha[24;19Hl[24;20Hl[24;21Hy[24;22H [24;23Hi[24;24Hn[24;25H [24;26H[1m[32m[40m3[24;27H[0m[32m[40m,[24;28H [24;29Hp[24;30Hr[24;31He[24;32Hs[24;33Hs[24;34H [24;35Ha[24;36Hn[24;37Hy[24;38H [24;39Hk[24;40He[24;41Hy[24;42H [24;43Ht[24;44Ho[24;45H [24;46Hs[24;47Ht[24;48Ho[24;49Hp[24;50H [24;51Ht[24;52Hh[24;53He[24;54H [24;55Hc[24;56Ho[24;57Hu[24;58Hn[24;59Ht[24;60Hd[24;61Ho[24;62Hw[24;63Hn[24;64H.[24;65H.[24;66H.[24;67H[0m[37m[40m[24;01H[24;01H [24;02H [24;03H [24;04H [24;05H [24;06H [24;07H [24;08H [24;09H [24;10H [24;11H [24;12H [24;13H [24;14H [24;15H [24;16H [24;17H [24;18H [24;19H [24;20H [24;21H [24;22H [24;23H [24;24H [24;25H [24;26H [24;27H [24;28H [24;29H [24;30H [24;31H [24;32H [24;33H [24;34H [24;35H [24;36H [24;37H [24;38H [24;39H [24;40H [24;41H [24;42H [24;43H [24;44H [24;45H [24;46H [24;47H [24;48H [24;49H [24;50H [24;51H [24;52H [24;53H [24;54H [24;55H [24;56H [24;57H [24;58H [24;59H [24;60H [24;61H [24;62H [24;63H [24;64H [24;65H [24;66H [24;67H [24;68H [24;69H [24;70H [24;71H [24;72H [24;73H [24;74H [24;75H [24;76H [24;77H [24;78H [24;79H [24;80H[24;01H[0m[32m[40mB[24;02Ho[24;03Ho[24;04Ht[24;05Hi[24;06Hn[24;07Hg[24;08H [24;09Ha[24;10Hu[24;11Ht[24;12Ho[24;13Hm[24;14Ha[24;15Ht[24;16Hi[24;17Hc[24;18Ha[24;19Hl[24;20Hl[24;21Hy[24;22H [24;23Hi[24;24Hn[24;25H [24;26H[1m[32m[40m2[24;27H[0m[32m[40m,[24;28H [24;29Hp[24;30Hr[24;31He[24;32Hs[24;33Hs[24;34H [24;35Ha[24;36Hn[24;37Hy[24;38H [24;39Hk[24;40He[24;41Hy[24;42H [24;43Ht[24;44Ho[24;45H [24;46Hs[24;47Ht[24;48Ho[24;49Hp[24;50H [24;51Ht[24;52Hh[24;53He[24;54H [24;55Hc[24;56Ho[24;57Hu[24;58Hn[24;59Ht[24;60Hd[24;61Ho[24;62Hw[24;63Hn[24;64H.[24;65H.[24;66H.[24;67H[0m[37m[40m[24;01H[24;01H [24;02H [24;03H [24;04H [24;05H [24;06H [24;07H [24;08H [24;09H [24;10H [24;11H [24;12H [24;13H [24;14H [24;15H [24;16H [24;17H [24;18H [24;19H [24;20H [24;21H [24;22H [24;23H [24;24H [24;25H [24;26H [24;27H [24;28H [24;29H [24;30H [24;31H [24;32H [24;33H [24;34H [24;35H [24;36H [24;37H [24;38H [24;39H [24;40H [24;41H [24;42H [24;43H [24;44H [24;45H [24;46H [24;47H [24;48H [24;49H [24;50H [24;51H [24;52H [24;53H [24;54H [24;55H [24;56H [24;57H [24;58H [24;59H [24;60H [24;61H [24;62H [24;63H [24;64H [24;65H [24;66H [24;67H [24;68H [24;69H [24;70H [24;71H [24;72H [24;73H [24;74H [24;75H [24;76H [24;77H [24;78H [24;79H [24;80H[24;01H[0m[32m[40mB[24;02Ho[24;03Ho[24;04Ht[24;05Hi[24;06Hn[24;07Hg[24;08H [24;09Ha[24;10Hu[24;11Ht[24;12Ho[24;13Hm[24;14Ha[24;15Ht[24;16Hi[24;17Hc[24;18Ha[24;19Hl[24;20Hl[24;21Hy[24;22H [24;23Hi[24;24Hn[24;25H [24;26H[1m[32m[40m1[24;27H[0m[32m[40m,[24;28H [24;29Hp[24;30Hr[24;31He[24;32Hs[24;33Hs[24;34H [24;35Ha[24;36Hn[24;37Hy[24;38H [24;39Hk[24;40He[24;41Hy[24;42H [24;43Ht[24;44Ho[24;45H [24;46Hs[24;47Ht[24;48Ho[24;49Hp[24;50H [24;51Ht[24;52Hh[24;53He[24;54H [24;55Hc[24;56Ho[24;57Hu[24;58Hn[24;59Ht[24;60Hd[24;61Ho[24;62Hw[24;63Hn[24;64H.[24;65H.[24;66H.[24;67H[0m[37m[40m[01;01Hl[01;02Hi[01;03Hm[01;04Hi[01;05Hn[01;06He[01;07H:[01;08H [01;09HL[01;10Ho[01;11Ha[01;12Hd[01;13Hi[01;14Hn[01;15Hg[01;16H [01;17He[01;18Hx[01;19He[01;20Hc[01;21Hu[01;22Ht[01;23Ha[01;24Hb[01;25Hl[01;26He[01;27H [01;28H`[01;29Hb[01;30Ho[01;31Ho[01;32Ht[01;33H([01;34H)[01;35H:[01;36H/[01;37Hb[01;38Ho[01;39Ho[01;40Ht[01;41H/[01;42Ht[01;43Ho[01;44Hb[01;45Hy[01;46Ho[01;47Hs[01;48H.[01;49Hb[01;50Hi[01;51Hn[01;52H`[01;53H.[01;54H.[01;55H.[01;56H[01;01H[02;01Hl[02;02Hi[02;03Hm[02;04Hi[02;05Hn[02;06He[02;07H:[02;08H [02;09HP[02;10Hh[02;11Hy[02;12Hs[02;13Hi[02;14Hc[02;15Ha[02;16Hl[02;17H [02;18Hb[02;19Ha[02;20Hs[02;21He[02;22H:[02;23H [02;24H [02;25H [02;26H0[02;27Hx[02;28H1[02;29Hf[02;30H7[02;31H3[02;32H0[02;33H0[02;34H0[02;35H[02;01H[03;01Hl[03;02Hi[03;03Hm[03;04Hi[03;05Hn[03;06He[03;07H:[03;08H [03;09HV[03;10Hi[03;11Hr[03;12Ht[03;13Hu[03;14Ha[03;15Hl[03;16H [03;17Hb[03;18Ha[03;19Hs[03;20He[03;21H:[03;22H [03;23H [03;24H [03;25H [03;26H0[03;27Hx[03;28Hf[03;29Hf[03;30Hf[03;31Hf[03;32Hf[03;33Hf[03;34Hf[03;35Hf[03;36H8[03;37H0[03;38H0[03;39H0[03;40H0[03;41H0[03;42H0[03;43H0[03;44H[03;01H[04;01Hl[04;02Hi[04;03Hm[04;04Hi[04;05Hn[04;06He[04;07H:[04;08H [04;09HS[04;10Hl[04;11Hi[04;12Hd[04;13He[04;14H:[04;15H [04;16H [04;17H [04;18H [04;19H [04;20H [04;21H [04;22H [04;23H [04;24H [04;25H [04;26H0[04;27Hx[04;28H0[04;29H[04;01H[05;01Hl[05;02Hi[05;03Hm[05;04Hi[05;05Hn[05;06He[05;07H:[05;08H [05;09HE[05;10HL[05;11HF[05;12H [05;13He[05;14Hn[05;15Ht[05;16Hr[05;17Hy[05;18H [05;19Hp[05;20Ho[05;21Hi[05;22Hn[05;23Ht[05;24H:[05;25H [05;26H0[05;27Hx[05;28Hf[05;29Hf[05;30Hf[05;31Hf[05;32Hf[05;33Hf[05;34Hf[05;35Hf[05;36H8[05;37H0[05;38H0[05;39H0[05;40H1[05;41H0[05;42H0[05;43H0[05;44H[05;01H[06;01Hl[06;02Hi[06;03Hm[06;04Hi[06;05Hn[06;06He[06;07H:[06;08H [06;09HB[06;10Ha[06;11Hs[06;12He[06;13H [06;14Hr[06;15He[06;16Hv[06;17Hi[06;18Hs[06;19Hi[06;20Ho[06;21Hn[06;22H:[06;23H [06;24H [06;25H [06;26H3[06;27H[06;01H[07;01Hl[07;02Hi[07;03Hm[07;04Hi[07;05Hn[07;06He[07;07H:[07;08H [07;09HR[07;10He[07;11Hq[07;12Hu[07;13He[07;14Hs[07;15Ht[07;16Hs[07;17H [07;18Hc[07;19Ho[07;20Hu[07;21Hn[07;22Ht[07;23H:[07;24H [07;25H [07;26H6[07;27H[07;01H[08;01Hl[08;02Hi[08;03Hm[08;04Hi[08;05Hn[08;06He[08;07H:[08;08H [08;09HT[08;10Ho[08;11Hp[08;12H [08;13Ho[08;14Hf[08;15H [08;16HH[08;17HH[08;18HD[08;19HM[08;20H:[08;21H [08;22H [08;23H [08;24H [08;25H [08;26H0[08;27Hx[08;28H4[08;29H0[08;30H0[08;31H0[08;32H0[08;33H0[08;34H0[08;35H0[08;36H[08;01H[09;01Ha[09;02Hc[09;03Hp[09;04Hi[09;05H:[09;06H [09;07HF[09;08Ho[09;09Hu[09;10Hn[09;11Hd[09;12H [09;13HR[09;14HS[09;15HD[09;16HP[09;17H [09;18Ha[09;19Ht[09;20H [09;21H0[09;22Hx[09;23H7[09;24H7[09;25H7[09;26He[09;27H0[09;28H0[09;29H0[09;30H[09;01H[10;01Ha[10;02Hc[10;03Hp[10;04Hi[10;05H:[10;06H [10;07HF[10;08Ho[10;09Hu[10;10Hn[10;11Hd[10;12H [10;13HX[10;14HS[10;15HD[10;16HP[10;17H [10;18Ha[10;19Ht[10;20H [10;21H0[10;22Hx[10;23H7[10;24H7[10;25H7[10;26He[10;27H0[10;28H1[10;29H4[10;30H[10;01H[11;01Hl[11;02Hi[11;03Hm[11;04Hi[11;05Hn[11;06He[11;07H:[11;08H [11;09HL[11;10Ho[11;11Ha[11;12Hd[11;13Hi[11;14Hn[11;15Hg[11;16H [11;17Hm[11;18Ho[11;19Hd[11;20Hu[11;21Hl[11;22He[11;23H [11;24H`[11;25Hb[11;26Ho[11;27Ho[11;28Ht[11;29H([11;30H)[11;31H:[11;32H/[11;33Hb[11;34Ho[11;35Ho[11;36Ht[11;37H/[11;38Hi[11;39Hn[11;40Hi[11;41Ht[11;42Hr[11;43Hd[11;44H.[11;45Ht[11;46Ha[11;47Hr[11;48H`[11;49H.[11;50H.[11;51H.[11;52H[11;01H[12;01Hl[12;02Hi[12;03Hm[12;04Hi[12;05Hn[12;06He[12;07H:[12;08H [12;09HL[12;10Ho[12;11Ha[12;12Hd[12;13Hi[12;14Hn[12;15Hg[12;16H [12;17Hm[12;18Ho[12;19Hd[12;20Hu[12;21Hl[12;22He[12;23H [12;24H`[12;25Hb[12;26Ho[12;27Ho[12;28Ht[12;29H([12;30H)[12;31H:[12;32H/[12;33Hb[12;34Ho[12;35Ho[12;36Ht[12;37H/[12;38Hi[12;39Hn[12;40Hs[12;41Ht[12;42Ha[12;43Hl[12;44Hl[12;45H.[12;46Hi[12;47Hm[12;48Hg[12;49H`[12;50H.[12;51H.[12;52H.[12;53H[12;01H[13;01H[boot] serial up
+[boot] framebuffer: 1280x800 pitch=5120 bpp=32 addr=0xffff800080000000
+[boot] console up
+[gdt] loaded: base=0xffffffff80036350 limit=55 entries=7
+[gdt] CS=0x08 DS=0x10 (expected CS=0x08 DS=0x10)
+[gdt] user CS=0x23 DS=0x1b  TSS sel=0x28 (TSS slot empty until tss_init)
+[idt] loaded: base=0xffffffff800363a0 limit=4095 (48 gates wired)
+[boot] firing int3 to exercise IDT round-trip...
+[isr] breakpoint hit at rip=0xffffffff8000107b (rflags=0x82)
+[boot] int3 returned cleanly, IDT round-trip OK
+[pit] channel 0 -> 100 Hz (divisor=11931)
+[kbd] PS/2 driver up (IRQ1 unmasked)
+[boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard)
+[perf] TSC calibrated: 6644 MHz (332240704 cycles in 50000000 ns)
+[boot] HHDM offset = 0xffff800000000000
+[pmm] Limine memmap (35 entries):
+  0x0000000000000000..0x0000000000087000       540 KiB  usable
+  0x0000000000087000..0x0000000000088000         4 KiB  bootloader
+  0x0000000000088000..0x00000000000a0000        96 KiB  usable
+  0x0000000000100000..0x0000000000800000      7168 KiB  usable
+  0x0000000000800000..0x0000000000808000        32 KiB  acpi-nvs
+  0x0000000000808000..0x000000000080b000        12 KiB  usable
+  0x000000000080b000..0x000000000080c000         4 KiB  acpi-nvs
+  0x000000000080c000..0x0000000000811000        20 KiB  usable
+  0x0000000000811000..0x0000000000900000       956 KiB  acpi-nvs
+  0x0000000000900000..0x0000000001780000     14848 KiB  bootloader
+  0x0000000001780000..0x0000000001b18000      3680 KiB  usable
+  0x0000000001b18000..0x0000000001b3e000       152 KiB  bootloader
+  0x0000000001b3e000..0x0000000001f3e000      4096 KiB  kernel
+  0x0000000001f3e000..0x0000000001f73000       212 KiB  kernel
+  0x0000000001f73000..0x0000000001fbd000       296 KiB  kernel
+  0x0000000001fbd000..0x000000000203c000       508 KiB  bootloader
+  0x000000000203c000..0x0000000003b3c000     27648 KiB  usable
+  0x0000000003b3c000..0x0000000003bb4000       480 KiB  bootloader
+  0x0000000003bb4000..0x00000000060a7000     37836 KiB  usable
+  0x00000000060a7000..0x0000000006a2e000      9756 KiB  bootloader
+  0x0000000006a2e000..0x0000000006aef000       772 KiB  reserved
+  0x0000000006aef000..0x00000000074ed000     10232 KiB  bootloader
+  0x00000000074ed000..0x00000000075ed000      1024 KiB  reserved
+  0x00000000075ed000..0x00000000076ed000      1024 KiB  reserved
+  0x00000000076ed000..0x000000000776d000       512 KiB  reserved
+  0x000000000776d000..0x000000000777f000        72 KiB  acpi-reclaim
+  0x000000000777f000..0x00000000077ff000       512 KiB  acpi-nvs
+  0x00000000077ff000..0x0000000007e80000      6660 KiB  bootloader
+  0x0000000007e80000..0x0000000007e84000        16 KiB  reserved
+  0x0000000007e84000..0x0000000007e86000         8 KiB  acpi-nvs
+  0x0000000007e86000..0x0000000007edc000       344 KiB  bootloader
+  0x0000000007edc000..0x0000000007f60000       528 KiB  reserved
+  0x0000000007f60000..0x0000000008000000       640 KiB  acpi-nvs
+  0x0000000080000000..0x00000000803e8000      4000 KiB  framebuffer
+  0x000000fd00000000..0x0000010000000000  12582912 KiB  reserved
+[pmm] managed:  24743 pages (96 MiB) up to 0x00000000060a7000
+[pmm] usable:   77000 KiB across 35 regions
+[pmm] bitmap:   3093 bytes at phys 0x0000000000000000 (virt 0xffff800000000000), 1 pages
+[pmm] free:     19249 pages (75 MiB) -- used: 5494 pages
+[pmm] test: allocated 0x0000000000001000 0x0000000000002000 0x0000000000003000 0x0000000000004000 (free now=19245)
+[pmm] test: read-back a=0xdeadbeefcafebabe d=0x1122334455667788
+[pmm] test: alloc/free balanced (free=19249 before & after)
+[boot] reserved AP trampoline page at phys 0x0000000000070000
+[vmm] kernel image: virt 0xffffffff80000000..0xffffffff8004a000 -> phys 0x0000000001f73000 (296 KiB)
+[vmm] hhdm mirror:  132 MiB across memmap, top phys 0x0000000080400000, 2M pages
+[vmm] new PML4 at phys 0x0000000000001000, switching CR3...
+[vmm] CR3 switched. Running on tobyOS page tables.
+[vmm] test: __text_start 0xffffffff80001000 -> phys 0x0000000001f74000
+[vmm] test: __data_start 0xffffffff80036000 -> phys 0x0000000001fa9000
+[vmm] test: HHDM r/w through new PML4 at phys 0x0000000000008000 OK
+[vmm] test: new mapping at 0xffffc00000000000 <-> phys 0x0000000000008000 verified
+[vmm] test: unmap clears translation, scratch page freed
+[vmm] test: ok
+[heap] up: initial arena 17 pages (67 KiB)
+[heap] start: arenas=1 total=69600 used=0 free=69600  brk=0xffffd00000011000 (region 0xffffd00000000000..0xffffd10000000000)
+[heap] after 8 allocs: arenas=2 used=85616 free=65872 allocs=8
+[heap] after 8 frees: arenas=2 used=0 free=151488 frees=8
+[heap] test: ok (region OK, fragmented 80 KiB alloc OK, round-trip balanced, kcalloc zero-verified)
+[heap] brk now 0xffffd00000025000 (148 KiB virt consumed)
+[tss] installed: tss=0xffffffff8003bf90 rsp0=0xffffffff8003bf90 (irq stack 16 KiB)
+[sys] EFER.SCE on, STAR=0x0010000800000000, LSTAR=0xffffffff800286f0, FMASK=0x700
+[sys] kernel syscall rsp = 0xffffffff8003bf90
+[sys] available syscalls: 0=exit  1=write  2=read  3=pipe  4=close  5=yield
+[sys]                     6=socket 7=bind 8=sendto 9=recvfrom
+[sys]                     10=gui_create 11=gui_fill 12=gui_text 13=gui_flip 14=gui_poll_event
+[sys]                     15=term_open 16=term_write 17=term_read 18=fs_readdir 19=fs_readfile 20=exec
+[sys]                     21=setting_get 22=setting_set 23=login 24=logout 25=session_info
+[sys]                     26=getuid 27=getgid 28=username 29=chmod 30=chown
+[pci] enumerating bus 0...
+[pci] 6 device(s):
+[pci] 00:00.0  8086:1237  bridge.host       
+[pci] 00:01.0  8086:7000  bridge.isa        
+[pci] 00:01.1  8086:7010  storage.ide         BAR4 io 16
+[pci] 00:01.3  8086:7113  bridge              IRQ 10
+[pci] 00:02.0  1234:1111  display.vga         BAR0 mem 16384K  BAR2 mem 4K
+[pci] 00:03.0  8086:100e  network.ethernet    IRQ 11  BAR0 mem 128K  BAR1 io 64
+[ata] primary master: 32768 sectors (16384 KiB) -- PIO LBA28 (PCI 00:01.1)
+[blk] registered 'ide0:master' (32768 sectors, 16384 KiB)
+[pci] driver blk_ata  bound to 00:01.1  (8086:7010)
+[e1000] probing 00:03.0  (vid:did 8086:100e)
+[e1000] MMIO BAR0 phys=0x0000000081040000 virt=0xffff800081040000 (128 KiB UC)
+[net] +nic e1000:00:03.0 mac=52:54:00:12:34:56 (slot 0)
+[pci] driver e1000    bound to 00:03.0  (8086:100e)
+[pci] bind complete -- 2 of 6 device(s) bound  (2 newly this pass)
+[blk] 1 device(s):
+  [0] ide0:master       32768 sectors (16384 KiB)
+[net] 1 nic(s) registered:
+  [0] e1000:00:03.0 mac=52:54:00:12:34:56
+[boot] Limine modules (2):
+  [0] /boot/initrd.tar  size=215040  addr=0xffff800001f3e000
+  [1] /boot/install.img  size=4194304  addr=0xffff800001b3e000
+[initrd] using '/boot/initrd.tar' (size=215040, addr=0xffff800001f3e000)
+[ramfs] mounted: 19 entries from 215040-byte tar at 0xffff800001f3e000
+  - bin/hello                         8848 B
+  - bin/bad                           8800 B
+  - bin/echo                          8744 B
+  - bin/cat                           4768 B
+  - bin/long_task                     5024 B
+  - bin/netecho                       13336 B
+  - bin/gui_demo                      12944 B
+  - bin/gui_clock                     8816 B
+  - bin/gui_widgets                   13472 B
+  - bin/gui_about                     13432 B
+  - bin/gui_term                      13032 B
+  - bin/gui_files                     13480 B
+  - bin/gui_viewer                    13104 B
+  - bin/login                         13456 B
+  - bin/gui_settings                  13560 B
+  - repo/helloapp.tpkg                13777 B
+  - repo/helloapp_v2.tpkg             13834 B
+  - etc/motd                          297 B
+  - readme.txt                        922 B
+[tobyfs] bad magic 0x4e494d494c903ceb (expected 0x546f627946535331) -- run mkfs?
+[boot] /data at LBA 0 not a tobyfs (invalid argument); trying installed layout at LBA 8192...
+[tobyfs] mounted '/data' on data: 8/255 inodes, 5/1013 data blocks (4032 KiB free)
+[boot] mounted installed /data at LBA 8192
+[installer] live install image registered: 4194304 bytes @ 0xffff800001b3e000
+[vfs] mount table (2 entries):
+  /            -> ops=0xffffffff80033a18 mnt=0xffffffff8003c930
+  /data        -> ops=0xffffffff80033b20 mnt=0xffffd00000011be0
+[proc] table initialised (16 slots), pid 0 = 'kernel_main' RUNNING
+[sched] cooperative round-robin scheduler ready
+[signal] subsystem up (SIGINT=2, SIGTERM=15)
+[boot] spawning first userspace process from /bin/hello...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x34 filesz=0x34 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x45 filesz=0x45 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] load OK (user): 2 segment(s), entry=0x0000000000400000
+[proc] created pid=1 'hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffefe0 cr3=0x77000 kstack=0xffffd00000017dd0 argc=0
+hello from user mode
+user_hello: about to SYS_EXIT(0x55)
+[sys_exit] user requested exit, code=85 (0x55)
+[proc] pid=1 'hello-boot' exit code=85 (0x55) cpu=0 ms syscalls=3
+[proc] reaped pid=1, slot recycled
+[boot] /bin/hello (pid=1) finished, exit code=85 (0x55)
+[acpi] using XSDT @ 0x000000000777d0e8 (entries=5)
+[acpi] MADT: lapic_phys (32-bit field) = 0x00000000fee00000, legacy_pic=yes
+[acpi]   CPU0: acpi_id=0 apic_id=0 flags=0x1 enabled 
+[acpi]   CPU1: acpi_id=1 apic_id=1 flags=0x1 enabled 
+[acpi]   CPU2: acpi_id=2 apic_id=2 flags=0x1 enabled 
+[acpi]   CPU3: acpi_id=3 apic_id=3 flags=0x1 enabled 
+[acpi]   IOAPIC entry (ignored, no IO-APIC routing this milestone)
+[acpi] enumerated 4 CPUs (SMP)
+[apic] BSP local APIC: phys=0x00000000fee00000 virt=0xffffd20000000000 id=0 ver=0x14
+[apic] SVR=0x1ff  spurious_vec=0xff  timer_vec=0x40 (masked)
+[apic] timer calibrated: ~7420600 ticks/10ms (~742060 kHz)
+[smp] 4 CPU(s) total: BSP apic_id=0
+[smp]   cpu0: apic_id=0 (BSP)
+[smp]   cpu1: apic_id=1
+[smp]   cpu2: apic_id=2
+[smp]   cpu3: apic_id=3
+CPU 0 online
+  apic_id=0 (BSP)  stack=bootloader-provided
+[smp] trampoline installed: phys=0x0000000000070000 virt=0xffff800000070000 len=1024 bytes
+[smp] cpu1: INIT-SIPI-SIPI to apic_id=1 (tramp_vector=0x70, stack=0xffffd00000017c80)
+CPU 1 online
+  apic_id=1 (acpi said 1)  stack_top=0xffffd00000017c80
+[smp] cpu2: INIT-SIPI-SIPI to apic_id=2 (tramp_vector=0x70, stack=0xffffd0000001bc90)
+CPU 2 online
+  apic_id=2 (acpi said 2)  stack_top=0xffffd0000001bc90
+[smp] cpu3: INIT-SIPI-SIPI to apic_id=3 (tramp_vector=0x70, stack=0xffffd0000001fca0)
+CPU 3 online
+  apic_id=3 (acpi said 3)  stack_top=0xffffd0000001fca0
+[smp] 3/3 APs online (total 4 CPUs)
+[net] up: nic=e1000:00:03.0 ip=10.0.2.15 gw=10.0.2.2 mac=52:54:00:12:34:56
+[net] gateway 10.0.2.2 -> 52:55:0a:00:02:02 (cached)
+[gfx] back buffer 1280x800 (4000 KiB) ready, fb_pitch=1280 px
+[mouse] PS/2 driver up (IRQ12 unmasked, cascade IRQ2 open)
+[gui] window manager ready (max 8 windows, 18-px title bar)
+[term] session pool ready (4 sessions, 4096-byte rings)
+Welcome to tobyOS
+milestone 14: services + settings + login. Boot drops into the GUI desktop with /bin/login.
+
+[settings] loading /data/settings.conf (209 bytes)
+[settings] cache:
+  desktop.bg=0x00204060
+  desktop.title=tobyOS
+  desktop.greeting=Welcome to tobyOS
+  user.last=toby
+  user.greeting=Hello, friend!
+  session.autostart=
+[users] loading /data/users (86 bytes)
+[users] cache (3 entries):
+  root             uid=0 gid=0
+  toby             uid=1000 gid=1000
+  guest            uid=1001 gid=1001
+[svc] service manager up (max 8 services)
+[svc] registered builtin 'input'
+[svc] registered builtin 'network'
+[svc] registered builtin 'desktop'
+[svc] registered builtin 'session'
+[trace] level 0 -> 1
+[gui] auto-enabled trace (level=1) for desktop session
+[trace t=88 pid=0] gui_set_desktop_mode: off -> on
+[gui] entering graphical mode
+[session] init: last user='toby' (will be pre-filled at login)
+[svc] registered program 'login' -> /bin/login (autorestart=1)
+[trace t=88 pid=0] launch_enqueue '/bin/login' sandbox='' (head=1 tail=0)
+[svc] 'login' enqueued (restart #1)
+[svc] 5 services registered
+  name         kind    state   auto pid rcnt  path
+  input        builtin running 0    0   0     (builtin)
+  network      builtin running 0    0   0     (builtin)
+  desktop      builtin running 0    0   0     (builtin)
+  session      builtin running 0    0   0     (builtin)
+  login        program running 1    0   1     /bin/login
+[pkg] package manager ready (apps=/data/apps db=/data/packages repo=/data/repo,/repo)
+type 'help' to list commands.
+tobyOS> [trace t=91 pid=0] drain_launch_queue: spawning '/bin/login' sandbox='default'
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xde1 filesz=0xde1 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x194 filesz=0x194 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x18 filesz=0x0 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): 3 segment(s), entry=0x0000000000400000
+[proc] created pid=1 'login' entry=0x0000000000400000 rsp=0x00007fffffffefe0 cr3=0x4f2000 kstack=0xffffd00000412180 argc=0
+[cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=91 pid=0] track_pid pid=1 slot=0
+[gui] launched /bin/login as pid 1 (session=0)
+[trace t=91 pid=0] drain_launch_queue: spawned '/bin/login' as pid=1 session=0
+[svc] 'login' pid=1 (backfilled)
+[trace t=91 pid=1] window_create wid=1 owner_pid=1 size=380x220 pos=(60,40) title='tobyOS login'
+[trace t=100 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=200 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=300 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=400 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=500 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=600 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=700 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=800 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=900 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1000 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1100 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1200 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1300 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1400 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1500 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1600 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1700 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1800 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1900 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2000 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2100 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2200 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2301 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2401 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2501 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2601 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2701 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2801 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2901 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3002 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3102 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3202 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3302 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3402 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3502 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3602 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3702 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3802 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=3902 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4002 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4102 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4202 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4302 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4403 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4503 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4603 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4703 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4803 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=4903 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5003 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5103 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5203 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5303 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5403 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5503 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5603 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5703 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5803 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=5903 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6003 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6103 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6203 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6303 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6403 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6503 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6603 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6703 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6803 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=6903 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7003 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7103 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7203 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7303 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7403 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7503 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7603 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7703 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7803 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=7903 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=8003 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=8103 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=8203 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=8303 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=8403 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=8503 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1

@@ -1,0 +1,554 @@
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+[2J[H
+[2;27H[36mLimine 11.4.0 (x86-64, BIOS)[0m
+
+
+
+[13;1H                                   [7m tobyOS [27m
+[4;1H    [32mARROWS[0m Select    [32mENTER[0m Boot    [32mE[0m Edit[4;64H[32mB[0m Blank Entry[14;1H
+
+[24;1H[2K[32mBooting automatically in [92m3[32m, press any key to stop the countdown...[0m[24;1H[2K[32mBooting automatically in [92m2[32m, press any key to stop the countdown...[0m[24;1H[2K[32mBooting automatically in [92m1[32m, press any key to stop the countdown...[0m[2J[Hlimine: Loading executable `boot():/boot/tobyos.bin`...
+limine: Physical base:   0xfe68000
+limine: Virtual base:    0xffffffff80000000
+limine: Slide:           0x0
+limine: ELF entry point: 0xffffffff80001000
+limine: Base revision:   3
+limine: Requests count:  6
+limine: Top of HHDM:     0x40000000
+acpi: Found RSDP at 0xf52e0
+limine: Loading module `boot():/boot/initrd.tar`...
+limine: Loading module `boot():/boot/install.img`...
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Mode was already set, perfect!
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+paging: 1GiB pages are not supported!
+acpi: Found RSDP at 0xf52e0
+acpi: "DMAR" not found
+acpi: Found RSDP at 0xf52e0
+acpi: "IVRS" not found
+[boot] serial up
+[boot] framebuffer: 1280x800 pitch=5120 bpp=32 addr=0xffff8000fd000000
+[boot] console up
+[gdt] loaded: base=0xffffffff80056500 limit=55 entries=7
+[gdt] CS=0x08 DS=0x10 (expected CS=0x08 DS=0x10)
+[gdt] user CS=0x23 DS=0x1b  TSS sel=0x28 (TSS slot empty until tss_init)
+[idt] loaded: base=0xffffffff80056550 limit=4095 (256 gates wired)
+[boot] firing int3 to exercise IDT round-trip...
+[isr] breakpoint hit at rip=0xffffffff8000107b (rflags=0x82)
+[boot] int3 returned cleanly, IDT round-trip OK
+[pit] channel 0 -> 100 Hz (divisor=11931)
+[kbd] PS/2 driver up (IRQ1 unmasked)
+[boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard, via legacy PIC for early boot)
+[perf] TSC calibrated: 4388 MHz (219418765 cycles in 50000000 ns)
+[boot] HHDM offset = 0xffff800000000000
+[pmm] Limine memmap (19 entries):
+  0x0000000000001000..0x0000000000061000       384 KiB  bootloader
+  0x0000000000061000..0x000000000009f000       248 KiB  usable
+  0x000000000009fc00..0x00000000000a0000         1 KiB  reserved
+  0x00000000000f0000..0x0000000000100000        64 KiB  reserved
+  0x0000000000100000..0x000000000f9ec000    254896 KiB  usable
+  0x000000000f9ec000..0x000000000fdec000      4096 KiB  kernel
+  0x000000000fdec000..0x000000000fded000         4 KiB  bootloader
+  0x000000000fded000..0x000000000fe5e000       452 KiB  kernel
+  0x000000000fe5e000..0x000000000fe5f000         4 KiB  bootloader
+  0x000000000fe5f000..0x000000000fe62000        12 KiB  usable
+  0x000000000fe62000..0x000000000fe68000        24 KiB  bootloader
+  0x000000000fe68000..0x000000000feec000       528 KiB  kernel
+  0x000000000feec000..0x000000000ff54000       416 KiB  bootloader
+  0x000000000ff54000..0x000000000ff6f000       108 KiB  usable
+  0x000000000ff6f000..0x000000000ffe0000       452 KiB  bootloader
+  0x000000000ffe0000..0x0000000010000000       128 KiB  reserved
+  0x00000000fd000000..0x00000000fd3e8000      4000 KiB  framebuffer
+  0x00000000fffc0000..0x0000000100000000       256 KiB  reserved
+  0x000000fd00000000..0x0000010000000000  12582912 KiB  reserved
+[pmm] managed:  65391 pages (255 MiB) up to 0x000000000ff6f000
+[pmm] usable:   255264 KiB across 19 regions
+[pmm] bitmap:   8174 bytes at phys 0x0000000000061000 (virt 0xffff800000061000), 2 pages
+[pmm] free:     63814 pages (249 MiB) -- used: 1577 pages
+[pmm] test: allocated 0x0000000000063000 0x0000000000064000 0x0000000000065000 0x0000000000066000 (free now=63810)
+[pmm] test: read-back a=0xdeadbeefcafebabe d=0x1122334455667788
+[pmm] test: alloc/free balanced (free=63814 before & after)
+[boot] reserved AP trampoline page at phys 0x0000000000070000
+[vmm] kernel image: virt 0xffffffff80000000..0xffffffff80084000 -> phys 0x000000000fe68000 (528 KiB)
+[vmm] hhdm mirror:  260 MiB across memmap, top phys 0x00000000fd400000, 2M pages
+[vmm] new PML4 at phys 0x0000000000063000, switching CR3...
+[vmm] CR3 switched. Running on tobyOS page tables.
+[vmm] test: __text_start 0xffffffff80001000 -> phys 0x000000000fe69000
+[vmm] test: __data_start 0xffffffff80056000 -> phys 0x000000000febe000
+[vmm] test: HHDM r/w through new PML4 at phys 0x000000000006a000 OK
+[vmm] test: new mapping at 0xffffc00000000000 <-> phys 0x000000000006a000 verified
+[vmm] test: unmap clears translation, scratch page freed
+[vmm] test: ok
+[heap] up: initial arena 17 pages (67 KiB)
+[heap] start: arenas=1 total=69600 used=0 free=69600  brk=0xffffd00000011000 (region 0xffffd00000000000..0xffffd10000000000)
+[heap] after 8 allocs: arenas=2 used=85616 free=65872 allocs=8
+[heap] after 8 frees: arenas=2 used=0 free=151488 frees=8
+[heap] test: ok (region OK, fragmented 80 KiB alloc OK, round-trip balanced, kcalloc zero-verified)
+[heap] brk now 0xffffd00000025000 (148 KiB virt consumed)
+[tss] installed: tss=0xffffffff8005d300 rsp0=0xffffffff8005d300 (irq stack 16 KiB)
+[sys] EFER.SCE on, STAR=0x0010000800000000, LSTAR=0xffffffff8003ffe0, FMASK=0x700
+[sys] kernel syscall rsp = 0xffffffff8005d300
+[sys] available syscalls: 0=exit  1=write  2=read  3=pipe  4=close  5=yield
+[sys]                     6=socket 7=bind 8=sendto 9=recvfrom
+[sys]                     10=gui_create 11=gui_fill 12=gui_text 13=gui_flip 14=gui_poll_event
+[sys]                     15=term_open 16=term_write 17=term_read 18=fs_readdir 19=fs_readfile 20=exec
+[sys]                     21=setting_get 22=setting_set 23=login 24=logout 25=session_info
+[sys]                     26=getuid 27=getgid 28=username 29=chmod 30=chown
+[sys]   M25A: 31=getpid 32=getppid 33=spawn 34=waitpid 35=open 36=lseek 37=stat 38=fstat
+[sys]         39=dup 40=dup2 41=unlink 42=mkdir 43=brk 44=getcwd 45=chdir 46=getenv
+[sys]         47=nanosleep 48=clock_ms 49=abi_version (ABI v1)
+[acpi] using RSDT @ 0x000000000ffe2335 (entries=4)
+[acpi] MADT: lapic_phys (32-bit field) = 0x00000000fee00000, legacy_pic=yes
+[acpi]   CPU0: acpi_id=0 apic_id=0 flags=0x1 enabled 
+[acpi]   IOAPIC 0: mmio=0x00000000fec00000 gsi_base=0
+[acpi]   ISO: ISA IRQ0 -> GSI 2 (flags=0x0)
+[acpi]   ISO: ISA IRQ5 -> GSI 5 (flags=0xd)
+[acpi]   ISO: ISA IRQ9 -> GSI 9 (flags=0xd)
+[acpi]   ISO: ISA IRQ10 -> GSI 10 (flags=0xd)
+[acpi]   ISO: ISA IRQ11 -> GSI 11 (flags=0xd)
+[acpi]   LAPIC NMI: acpi_proc=255 lint=1 flags=0x0
+[acpi] enumerated 1 CPU(s) (uniprocessor), 1 IO APIC(s), 5 override(s), 1 NMI source(s)
+[acpi] FADT: pm1a_cnt=0x604 pm1b_cnt=0x0 smi_cmd=0xb2 acpi_enable=0xf1 sci_int=9
+[acpi] FADT: reset_reg not supported (flags=0x80a5)
+[acpi] DSDT _S5_: SLP_TYPa=0 SLP_TYPb=0 (DSDT 8617 bytes)
+[apic] BSP local APIC: phys=0x00000000fee00000 virt=0xffffd20000000000 id=0 ver=0x14
+[apic] SVR=0x1ff  spurious_vec=0xff  timer_vec=0x40 (masked)
+[apic] timer calibrated: ~3012900 ticks/10ms (~301290 kHz, ~301290000 Hz/sec)
+[ioapic] chip 0: phys=0x00000000fec00000 virt=0xffffd20000010000 gsi=[0..23] ver=0x20 entries=24
+[irq]   re-route ISA IRQ 0 -> GSI 2 vec=0x20 edge/ahigh
+[irq]   re-route ISA IRQ 1 (identity, edge/ahigh) -> vec=0x21
+[irq] facade: switched to IO APIC mode (2 IRQs re-routed)
+[pci] enumerating bus 0...
+[pci] 6 device(s):
+[pci] 00:00.0  8086:1237  bridge.host       
+[pci] 00:01.0  8086:7000  bridge.isa        
+[pci] 00:01.1  8086:7010  storage.ide         BAR4 io 16
+[pci] 00:01.3  8086:7113  bridge              IRQ 9
+[pci] 00:02.0  1234:1111  display.vga         BAR0 mem 16384K  BAR2 mem 4K
+[pci] 00:03.0  8086:100e  network.ethernet    IRQ 11  BAR0 mem 128K  BAR1 io 64
+[ata] 00:01.1: no primary-master IDE drive (identify rc=-2)
+[pci] driver blk_ata  declined 00:01.1  (probe rc=-2)
+[e1000] probing 00:03.0  (vid:did 8086:100e)
+[e1000] MMIO BAR0 phys=0x00000000febc0000 virt=0xffff8000febc0000 (128 KiB UC)
+[e1000] no MSI cap -- staying polled (vec 0x50 is now idle)
+[net] +nic e1000:00:03.0 mac=52:54:00:12:34:56 (slot 0)
+[pci] driver e1000    bound to 00:03.0  (8086:100e)
+[pci] bind complete -- 1 of 6 device(s) bound  (1 newly this pass)
+[blk] no block devices registered
+[net] 1 nic(s) registered:
+  [0] e1000:00:03.0 mac=52:54:00:12:34:56
+[boot] Limine modules (2):
+  [0] /boot/initrd.tar  size=460800  addr=0xffff80000fded000
+  [1] /boot/install.img  size=4194304  addr=0xffff80000f9ec000
+[initrd] using '/boot/initrd.tar' (size=460800, addr=0xffff80000fded000)
+[ramfs] mounted: 28 entries from 460800-byte tar at 0xffff80000fded000
+  - bin/hello                         8848 B  data@0xffff80000fded200
+  - bin/bad                           8800 B  data@0xffff80000fdef800
+  - bin/echo                          13032 B  data@0xffff80000fdf1e00
+  - bin/cat                           8864 B  data@0xffff80000fdf5400
+  - bin/long_task                     8864 B  data@0xffff80000fdf7a00
+  - bin/netecho                       17232 B  data@0xffff80000fdfa000
+  - bin/gui_demo                      13080 B  data@0xffff80000fdfe600
+  - bin/gui_clock                     13032 B  data@0xffff80000fe01c00
+  - bin/gui_widgets                   13672 B  data@0xffff80000fe05200
+  - bin/gui_about                     13632 B  data@0xffff80000fe08a00
+  - bin/gui_term                      13232 B  data@0xffff80000fe0c200
+  - bin/gui_files                     13624 B  data@0xffff80000fe0f800
+  - bin/gui_viewer                    13304 B  data@0xffff80000fe13000
+  - bin/login                         13664 B  data@0xffff80000fe16600
+  - bin/gui_settings                  13760 B  data@0xffff80000fe19e00
+  - bin/abi_test                      13064 B  data@0xffff80000fe1d600
+  - bin/c_hello                       29648 B  data@0xffff80000fe20c00
+  - bin/c_args                        29648 B  data@0xffff80000fe28200
+  - bin/c_filedemo                    33744 B  data@0xffff80000fe2f800
+  - bin/c_alloctest                   33744 B  data@0xffff80000fe37e00
+  - bin/c_envtest                     34104 B  data@0xffff80000fe40400
+  - bin/c_dynhello                    3328 B  data@0xffff80000fe48c00
+  - lib/ld-toby.so                    5672 B  data@0xffff80000fe49c00
+  - lib/libtoby.so                    31776 B  data@0xffff80000fe4b600
+  - repo/helloapp.tpkg                13977 B  data@0xffff80000fe53600
+  - repo/helloapp_v2.tpkg             14034 B  data@0xffff80000fe57000
+  - etc/motd                          297 B  data@0xffff80000fe5aa00
+  - readme.txt                        922 B  data@0xffff80000fe5ae00
+[boot] no disk -- /data unavailable this boot
+[boot] no FAT32 partition discovered -- /fat unmounted
+[boot] no FAT32-on-USB discovered -- /usb unmounted
+[boot] no ext4 partition discovered -- /ext unmounted
+[installer] live install image registered: 4194304 bytes @ 0xffff80000f9ec000
+[vfs] mount table (1 entries):
+  /            -> ops=0xffffffff80052878 mnt=0xffffffff8005e8e0
+[proc] table initialised (16 slots), pid 0 = 'kernel_main' RUNNING
+[sched] per-CPU round-robin scheduler ready (BSP cur=pid 0)
+[signal] subsystem up (SIGINT=2, SIGTERM=15)
+[boot] spawning first userspace process from /bin/hello...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x34 filesz=0x34 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x45 filesz=0x45 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] load OK (user): type=ET_EXEC, 2 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (2 entries)
+[proc] created pid=1 ppid=0 'hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13d000 kstack=0xffffd00000016260 argc=0 envc=0 cwd='/'
+hello from user mode
+user_hello: about to SYS_EXIT(0x55)
+[sys_exit] user requested exit, code=85 (0x55)
+[proc] pid=1 'hello-boot' exit code=85 (0x55) cpu=0 ms syscalls=3
+[proc] reaped pid=1, slot recycled
+[boot] /bin/hello (pid=1) finished, exit code=85 (0x55)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xd22 filesz=0xd22 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x374 filesz=0x374 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x18 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'abi-test-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13d000 kstack=0xffffd00000016260 argc=0 envc=0 cwd='/'
+[abi-test] starting Milestone 25A ABI surface check
+[abi-test] argc = 0
+[abi-test] abi_version = 1
+[abi-test] pid = 1
+[abi-test] ppid = 0
+[abi-test] clock_ms_delta = 1
+[abi-test] cwd_len = 1
+[abi-test] cwd = /
+[abi-test] brk_initial = 268435456
+[abi-test] brk_after_grow = 268451840
+[abi-test] heap pages writable + zero-initialised OK
+[abi-test] open_fd = -13
+[abi-test] FAIL: open(/data/abi_test.tmp, O_RDWR|O_CREAT) failed
+[sys_exit] user requested exit, code=1 (0x1)
+[proc] pid=1 'abi-test-boot' exit code=1 (0x1) cpu=0 ms syscalls=69
+[proc] reaped pid=1, slot recycled
+[boot] M25A: /bin/abi_test (pid=1) finished, exit code=1 (FAIL)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3ed6 filesz=0x3ed6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x7d0 filesz=0x7d0 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13d000 kstack=0xffffd00000016260 argc=0 envc=0 cwd='/'
+[c_hello] hello from libtoby (argc=0)
+[c_hello] ALL OK
+[_exit] code=0 caller=0x0000000000400124
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_hello-boot' exit code=0 (0x0) cpu=0 ms syscalls=6
+[proc] reaped pid=1, slot recycled
+[boot] M25B: /bin/c_hello (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3fe6 filesz=0x3fe6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x860 filesz=0x860 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_args-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13d000 kstack=0xffffd00000016260 argc=0 envc=0 cwd='/'
+[c_args] argc=0
+[c_args] envc=0
+[c_args] getenv("HOME") = (unset)
+[c_args] __toby_argc=0 __toby_argv=0x7fffffffff58 __toby_envp=0x7fffffffff60
+[c_args] ALL OK
+[_exit] code=0 caller=0x0000000000400234
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_args-boot' exit code=0 (0x0) cpu=0 ms syscalls=21
+[proc] reaped pid=1, slot recycled
+[boot] M25B: /bin/c_args (pid=1) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x41a6 filesz=0x41a6 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xa30 filesz=0xa30 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1d8 filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_filedemo-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13d000 kstack=0xffffd00000016260 argc=0 envc=0 cwd='/'
+[c_filedemo] fopen(w): Permission denied
+[_exit] code=1 caller=0x0000000000400b64
+[sys_exit] user requested exit, code=1 (0x1)
+[proc] pid=1 'c_filedemo-boot' exit code=1 (0x1) cpu=0 ms syscalls=7
+[proc] reaped pid=1, slot recycled
+[boot] M25B: /bin/c_filedemo (pid=1) exit=1 (FAIL)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x43f6 filesz=0x43f6 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0x910 filesz=0x910 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_alloctest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x13d000 kstack=0xffffd00000016260 argc=0 envc=0 cwd='/'
+[c_alloctest] ALL OK
+[_exit] code=0 caller=0x0000000000400db4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_alloctest-boot' exit code=0 (0x0) cpu=0 ms syscalls=9
+[proc] reaped pid=1, slot recycled
+[boot] M25B: /bin/c_alloctest (pid=1) exit=0 (PASS)
+[boot] M25B: libtoby demos 3/4 PASS
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3fe6 filesz=0x3fe6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x860 filesz=0x860 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_args-spec' entry=0x0000000000400000 rsp=0x00007ffffffffee0 cr3=0x13d000 kstack=0xffffd00000016260 argc=4 envc=3 cwd='/'
+[c_args] argc=4
+[c_args]   argv[0] = "c_args"
+[c_args]   argv[1] = "alpha"
+[c_args]   argv[2] = "beta"
+[c_args]   argv[3] = "gamma"
+[c_args] envc=3
+[c_args]   envp[0] = "PATH=/bin"
+[c_args]   envp[1] = "TEST_PHASE=25C"
+[c_args]   envp[2] = "BUILD=ok"
+[c_args] getenv("HOME") = (unset)
+[c_args] __toby_argc=4 __toby_argv=0x7ffffffffee8 __toby_envp=0x7fffffffff10
+[c_args] ALL OK
+[_exit] code=0 caller=0x0000000000400234
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_args-spec' exit code=0 (0x0) cpu=0 ms syscalls=56
+[proc] reaped pid=1, slot recycled
+[boot] M25C: /bin/c_args (pid=1, argc=4 envc=3) exit=0 (PASS)
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4ae6 filesz=0x4ae6 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xde0 filesz=0xde0 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1f8 filesz=0xa0 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_envtest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff00 cr3=0x13d000 kstack=0xffffd00000016260 argc=1 envc=3 cwd='/'
+[c_envtest][build] M25C-debug-rev3 alive
+[c_envtest] argc=1 argv[0]='c_envtest'
+[c_envtest] environ has 3 initial entries
+[c_envtest] getenv(PATH) = /bin
+[c_envtest][diag] BEFORE system
+[c_envtest] system("c_hello") starting...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3ed6 filesz=0x3ed6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x7d0 filesz=0x7d0 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=2 ppid=1 'c_hello' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x154000 kstack=0xffffd0000001a5f0 argc=1 envc=1 cwd='/'
+[c_hello] hello from libtoby (argc=1)
+[c_hello] ALL OK
+[_exit] code=0 caller=0x0000000000400124
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=2 'c_hello' exit code=0 (0x0) cpu=0 ms syscalls=6
+[proc] reaped pid=2, slot recycled
+[c_envtest][diag] AFTER system, sr=0
+[c_envtest] system("c_hello") raw status=0x0
+[c_envtest][diag] AFTER printf raw status
+[c_envtest][diag] AFTER system EXPECTs
+[c_envtest] recursive execvp test starting...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x4ae6 filesz=0x4ae6 flags=R-X U -> pages [0x0000000000400000..0x0000000000405000)
+[elf] phdr[1] LOAD vaddr=0x0000000000405000 memsz=0xde0 filesz=0xde0 flags=R-- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] phdr[2] LOAD vaddr=0x0000000000406000 memsz=0x1f8 filesz=0xa0 flags=RW- U -> pages [0x0000000000406000..0x0000000000407000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=2 ppid=1 'c_envtest' entry=0x0000000000400000 rsp=0x00007fffffffff00 cr3=0x154000 kstack=0xffffd0000001a7d0 argc=3 envc=1 cwd='/'
+[c_envtest][build] M25C-debug-rev3 alive
+[c_envtest] (child) execvp -> 'c_hello'
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3ed6 filesz=0x3ed6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x7d0 filesz=0x7d0 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=3 ppid=2 'c_hello' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x166000 kstack=0xffffd0000001eae0 argc=1 envc=1 cwd='/'
+[c_hello] hello from libtoby (argc=1)
+[c_hello] ALL OK
+[_exit] code=0 caller=0x0000000000400124
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=3 'c_hello' exit code=0 (0x0) cpu=0 ms syscalls=6
+[proc] reaped pid=3, slot recycled
+[_exit] code=0 caller=0x0000000000402e0b
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=2 'c_envtest' exit code=0 (0x0) cpu=24 ms syscalls=9
+[proc] reaped pid=2, slot recycled
+[c_envtest] recursive child pid=2 status=0x0
+[c_envtest] ALL OK
+[_exit] code=0 caller=0x0000000000400f44
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_envtest-boot' exit code=0 (0x0) cpu=77 ms syscalls=38
+[proc] reaped pid=1, slot recycled
+[boot] M25C: /bin/c_envtest (pid=1) exit=0 (PASS)
+[elf] phdr[2] LOAD vaddr=0x0000000000500000 memsz=0x3a8 filesz=0x3a8 flags=R-- U -> pages [0x0000000000500000..0x0000000000501000)
+[elf] phdr[3] LOAD vaddr=0x00000000005013b0 memsz=0xd0 filesz=0xd0 flags=R-X U -> pages [0x0000000000501000..0x0000000000502000)
+[elf] phdr[4] LOAD vaddr=0x0000000000502480 memsz=0xb80 filesz=0x120 flags=RW- U -> pages [0x0000000000502000..0x0000000000503000)
+[elf] phdr[5] LOAD vaddr=0x00000000005035a0 memsz=0x18 filesz=0x18 flags=RW- U -> pages [0x0000000000503000..0x0000000000504000)
+[elf] load OK (user): type=ET_DYN, 4 segment(s), base=0x0000000000500000, entry=0x00000000005013b0, phdr=0x0000000000500040 (9 entries), PT_INTERP
+[elf] phdr[1] LOAD vaddr=0x0000000040000000 memsz=0x499 filesz=0x499 flags=R-- U -> pages [0x0000000040000000..0x0000000040001000)
+[elf] phdr[2] LOAD vaddr=0x00000000400014a0 memsz=0x9ba filesz=0x9ba flags=R-X U -> pages [0x0000000040001000..0x0000000040002000)
+[elf] phdr[3] LOAD vaddr=0x0000000040002e60 memsz=0x1a0 filesz=0xa0 flags=RW- U -> pages [0x0000000040002000..0x0000000040003000)
+[elf] phdr[4] LOAD vaddr=0x0000000040003f00 memsz=0x390 filesz=0x0 flags=RW- U -> pages [0x0000000040003000..0x0000000040005000)
+[elf] load OK (user): type=ET_DYN, 4 segment(s), base=0x0000000040000000, entry=0x00000000400014a0, phdr=0x0000000040000040 (8 entries)
+[proc] loaded interpreter '/lib/ld-toby.so' base=0x0000000040000000 entry=0x00000000400014a0
+[proc] created pid=1 ppid=0 'c_dynhello-boot' entry=0x00000000400014a0 rsp=0x00007fffffffff30 cr3=0x13d000 kstack=0xffffd00000016260 argc=1 envc=1 cwd='/'
+[elf] phdr[1] LOAD vaddr=0x0000000060000000 memsz=0x1c98 filesz=0x1c98 flags=R-- U -> pages [0x0000000060000000..0x0000000060002000)
+[elf] phdr[2] LOAD vaddr=0x0000000060002ca0 memsz=0x4606 filesz=0x4606 flags=R-X U -> pages [0x0000000060002000..0x0000000060008000)
+[elf] phdr[3] LOAD vaddr=0x00000000600082a8 memsz=0xd58 filesz=0xe0 flags=RW- U -> pages [0x0000000060008000..0x0000000060009000)
+[elf] phdr[4] LOAD vaddr=0x0000000060009388 memsz=0x1d0 filesz=0x70 flags=RW- U -> pages [0x0000000060009000..0x000000006000a000)
+[elf] load OK (user): type=ET_DYN, 4 segment(s), base=0x0000000060000000, entry=0x0000000060000000, phdr=0x0000000060000040 (8 entries)
+[c_dynhello] hello from DYNAMIC libtoby (argc=1)
+[c_dynhello] ALL OK
+[_exit] code=0 caller=0x00000000600035c4
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_dynhello-boot' exit code=0 (0x0) cpu=0 ms syscalls=7
+[proc] reaped pid=1, slot recycled
+[boot] M25D: /bin/c_dynhello (pid=1) exit=0 (PASS)
+[boot] BSP LAPIC timer @ 100 Hz live (vec=0x40)
+[smp] 1 CPU(s) total: BSP apic_id=0
+[smp]   cpu0: apic_id=0 (BSP)
+CPU 0 online
+  apic_id=0 (BSP)  stack=bootloader-provided
+[smp] uniprocessor -- nothing to wake
+[net] nic=e1000:00:03.0 mac=52:54:00:12:34:56 -- starting up
+[dhcp] DISCOVER xid=0x4e868e15
+[dhcp] OFFER  yiaddr=10.0.2.15 server=10.0.2.2
+[dhcp] REQUEST requested=10.0.2.15
+[dhcp] ACK    bound: ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3 lease=86400s (server=10.0.2.2)
+[net] DHCP lease applied: ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3
+[net] up: nic=e1000:00:03.0 ip=10.0.2.15 gw=10.0.2.2 mac=52:54:00:12:34:56
+[net] gateway 10.0.2.2 -> 52:55:0a:00:02:02 (cached)
+[net] dns     10.0.2.3 -> 52:55:0a:00:02:03 (cached)
+[dns-test] >>> resolving example.com (boot smoke test)
+[dns] query  id=0xa0f3 example.com @ 10.0.2.3 (qbytes=29)
+[dns] reply  id=0xa0f3 example.com -> 172.66.147.243 (ttl=37s)
+[dns-test]     example.com -> 172.66.147.243 (ttl=37s)
+[dns-test] >>> resolving tobyos.invalid (NXDOMAIN probe)
+[dns] query  id=0x9c8e tobyos.invalid @ 10.0.2.3 (qbytes=32)
+[dns] reply id=0x9c8e rcode=3 (NXDOMAIN)
+[dns] 'tobyos.invalid' failed: rcode=3 (NXDOMAIN)
+[dns-test]     tobyos.invalid: failed as expected
+[dns-test] <<< done
+[tcp-test] >>> opening TCP connection to example.com:80
+[dns] query  id=0xe8a6 example.com @ 10.0.2.3 (qbytes=29)
+[dns] reply  id=0xe8a6 example.com -> 104.20.23.154 (ttl=37s)
+[tcp] connect 104.20.23.154:80  lp=49152 isn=0xc4b21cea
+[tcp] ESTABLISHED  lp=49152 rp=80
+[tcp-test]     handshake OK -- sending HTTP/1.0 probe
+[tcp-test]     tcp_send returned 80
+[tcp-test]     first bytes: "HTTP/1.1 200 OK 
+Date: Fri, 24 Apr 2026 02:00:24 GMT 
+Content-Type: text/html 
+C"
+[tcp-test]     server FIN; total bytes=797
+[tcp] CLOSED       lp=49152 rp=80  (final state=CLOSED)
+[tcp-test]     teardown OK.
+[tcp-test] <<< done
+[http-test] >>> GET http://example.com/
+[dns] query  id=0x4b5b example.com @ 10.0.2.3 (qbytes=29)
+[dns] reply  id=0x4b5b example.com -> 172.66.147.243 (ttl=37s)
+[http] example.com -> 172.66.147.243:80/
+[tcp] connect 172.66.147.243:80  lp=49153 isn=0x1c65967b
+[tcp] ESTABLISHED  lp=49153 rp=80
+[tcp] CLOSED       lp=49153 rp=80  (final state=CLOSED)
+[http] 200 OK; body=528 bytes; type="text/html"
+[http-test]     status=200 reason="OK" type="text/html" body=528 bytes
+[http-test]     body[0..80]: "<!doctype html><html lang="en"><head><title>Example Domain</title><meta name="vi"
+[http-test] <<< done
+[gfx] back buffer 1280x800 (4000 KiB) ready, fb_pitch=1280 px, backend=limine-fb
+[mouse] PS/2 driver up (IRQ12 routed via IO APIC)
+[gui] window manager ready (max 8 windows, 18-px title bar)
+[term] session pool ready (4 sessions, 4096-byte rings)
+Welcome to tobyOS
+milestone 14: services + settings + login. Boot drops into the GUI desktop with /bin/login.
+
+[settings] /data/settings.conf not found (no such file or directory) -- writing defaults
+[settings] save failed: read-only filesystem
+[settings] cache:
+  desktop.bg=0x00204060
+  desktop.title=tobyOS
+  desktop.greeting=Welcome to tobyOS
+  user.last=toby
+  user.greeting=Hello, friend!
+  session.autostart=
+[users] /data/users not found (no such file or directory) -- writing defaults
+[users] save failed: read-only filesystem
+[users] cache (3 entries):
+  root             uid=0 gid=0
+  toby             uid=1000 gid=1000
+  guest            uid=1001 gid=1001
+[svc] service manager up (max 8 services)
+[svc] registered builtin 'input'
+[svc] registered builtin 'network'
+[svc] registered builtin 'desktop'
+[svc] registered builtin 'session'
+[trace] level 0 -> 1
+[gui] auto-enabled trace (level=1) for desktop session
+[trace t=291 pid=0] gui_set_desktop_mode: off -> on
+[gui] entering graphical mode
+[session] init: last user='toby' (will be pre-filled at login)
+[svc] registered program 'login' -> /bin/login (autorestart=1)
+[trace t=292 pid=0] launch_enqueue '/bin/login' sandbox='' (head=1 tail=0)
+[svc] 'login' enqueued (restart #1)
+[svc] 5 services registered
+  name         kind    state   auto pid rcnt  path
+  input        builtin running 0    0   0     (builtin)
+  network      builtin running 0    0   0     (builtin)
+  desktop      builtin running 0    0   0     (builtin)
+  session      builtin running 0    0   0     (builtin)
+  login        program running 1    0   1     /bin/login
+[pkg] mkdir('/data/apps') failed: read-only filesystem
+[pkg] mkdir('/data/packages') failed: read-only filesystem
+[pkg] mkdir('/data/repo') failed: read-only filesystem
+[pkg] package manager ready (apps=/data/apps db=/data/packages repo=/data/repo,/repo)
+type 'help' to list commands.
+tobyOS> [boot] M25C: driving shell with synthetic command lines
+[shell-test] $ env
+PATH=/bin
+HOME=/
+USER=admin
+PWD=/
+SHELL=tobysh
+[shell-test] $ setenv M25C_FROM_SHELL yes
+[shell-test] $ env
+PATH=/bin
+HOME=/
+USER=admin
+PWD=/
+SHELL=tobysh
+M25C_FROM_SHELL=yes
+[shell-test] $ c_args from-shell PATH-resolved
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x3fe6 filesz=0x3fe6 flags=R-X U -> pages [0x0000000000400000..0x0000000000404000)
+[elf] phdr[1] LOAD vaddr=0x0000000000404000 memsz=0x860 filesz=0x860 flags=R-- U -> pages [0x0000000000404000..0x0000000000405000)
+[elf] phdr[2] LOAD vaddr=0x0000000000405000 memsz=0x1cc filesz=0x80 flags=RW- U -> pages [0x0000000000405000..0x0000000000406000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'c_args' entry=0x0000000000400000 rsp=0x00007ffffffffea0 cr3=0x528000 kstack=0xffffd000000160e0 argc=3 envc=6 cwd='/'
+[c_args] argc=3
+[c_args]   argv[0] = "c_args"
+[c_args]   argv[1] = "from-shell"
+[c_args]   argv[2] = "PATH-resolved"
+[c_args] envc=6
+[c_args]   envp[0] = "PATH=/bin"
+[c_args]   envp[1] = "HOME=/"
+[c_args]   envp[2] = "USER=admin"
+[c_args]   envp[3] = "PWD=/"
+[c_args] getenv("HOME") = /
+[c_args] __toby_argc=3 __toby_argv=0x7ffffffffea8 __toby_envp=0x7ffffffffec8
+[c_args] ALL OK
+[_exit] code=0 caller=0x0000000000400234
+[sys_exit] user requested exit, code=0 (0x0)
+[proc] pid=1 'c_args' exit code=0 (0x0) cpu=0 ms syscalls=56
+[proc] reaped pid=1, slot recycled
+'c_args' (pid=1) returned 0 (0x0)
+[shell-test] $ unsetenv M25C_FROM_SHELL
+[boot] M25C: shell smoketest done
+[trace t=294 pid=0] drain_launch_queue: spawning '/bin/login' sandbox='default'
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xe11 filesz=0xe11 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x194 filesz=0x194 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x30 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[proc] created pid=1 ppid=0 'login' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x528000 kstack=0xffffd000000160e0 argc=0 envc=0 cwd='/'
+[cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=295 pid=0] track_pid pid=1 slot=0
+[gui] launched /bin/login as pid 1 (session=0)
+[trace t=295 pid=0] drain_launch_queue: spawned '/bin/login' as pid=1 session=0
+[svc] 'login' pid=1 (backfilled)
+[trace t=295 pid=0] heartbeat windows=0 apps_alive=1 cursor=(640,400) btn=0x00 dirty=1 menu=0 desktop=1
+[trace t=296 pid=1] window_create wid=1 owner_pid=1 size=380x220 pos=(60,40) title='tobyOS login'
+[trace t=395 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=495 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=595 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=695 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=795 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=895 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=995 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1095 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1195 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1295 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1395 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1495 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1595 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1695 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1795 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1895 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1995 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1

@@ -1,0 +1,9 @@
+# Test fixture for the M35A selftest. Exercises both rule types:
+#   - blacklist rtl8169 (driver registered, no device on QEMU default)
+#   - force 1AF4:1000 virtio-net (pin the virtio-net legacy ID)
+#
+# This file is renamed to /etc/drvmatch.conf inside the initrd ONLY
+# when M35_FIXTURE_FLAG=1 is passed to `make all`; the production
+# initrd ships the empty (commented-out) drvmatch.conf above.
+blacklist rtl8169
+force     1AF4:1000 virtio-net

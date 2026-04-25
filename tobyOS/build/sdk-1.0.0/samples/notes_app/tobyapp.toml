@@ -1,0 +1,23 @@
+# notes_app/tobyapp.toml -- "real" SDK 1.0 sample: GUI + file I/O.
+#
+# Persists notes to /data/apps/notes_app/note.txt; pkg remove will
+# wipe both the binary and the install directory.
+
+[app]
+name        = "notes_app"
+version     = "1.0.0"
+kind        = "gui"
+description = "A simple sticky note for tobyOS (SDK 1.0 sample)"
+author      = "tobyOS SDK"
+license     = "MIT"
+
+[install]
+prefix      = "/data/apps/notes_app"
+
+[files]
+"bin/notes_app.elf" = "build/notes_app.elf"
+"share/welcome.txt" = "share/welcome.txt"
+
+[launcher]
+label = "Notes"
+exec  = "bin/notes_app.elf"

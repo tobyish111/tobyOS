@@ -1,0 +1,23 @@
+# Service app template manifest -- rename and edit.
+
+[app]
+name        = "myservice"
+version     = "0.1.0"
+kind        = "service"
+description = "Replace me"
+author      = "Your Name"
+license     = "MIT"
+
+[install]
+prefix      = "/data/apps/myservice"
+
+[files]
+"bin/myservice.elf" = "build/myservice.elf"
+
+# Service apps usually don't appear in the launcher, but you can add
+# a [launcher] block here if you want a menu entry that re-launches
+# (or restarts) the service manually.
+
+[service]
+restart   = "on-failure"   # always | on-failure | never
+autostart = true

@@ -1,0 +1,4 @@
+# m36: sample in-OS build
+out = /data/self.elf
+# Space-separated: concatenated in order (see /bin/tobycc).
+src = /m36/m36_part2.c /m36/m36_sample.c

@@ -1,0 +1,19 @@
+# hello_gui/tobyapp.toml -- minimal GUI sample manifest.
+
+[app]
+name        = "hello_gui"
+version     = "1.0.0"
+kind        = "gui"
+description = "Minimal SDK 1.0 GUI sample (window + Quit button + toast)"
+author      = "tobyOS SDK"
+license     = "MIT"
+
+[install]
+prefix      = "/data/apps/hello_gui"
+
+[files]
+"bin/hello_gui.elf" = "build/hello_gui.elf"
+
+[launcher]
+label = "Hello GUI"
+exec  = "bin/hello_gui.elf"

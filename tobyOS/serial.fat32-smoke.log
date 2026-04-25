@@ -1,0 +1,333 @@
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+[2J[H
+[2;27H[36mLimine 11.4.0 (x86-64, BIOS)[0m
+
+
+
+[13;1H                                   [7m tobyOS [27m
+[4;1H    [32mARROWS[0m Select    [32mENTER[0m Boot    [32mE[0m Edit[4;64H[32mB[0m Blank Entry[14;1H
+
+[24;1H[2K[32mBooting automatically in [92m3[32m, press any key to stop the countdown...[0m[24;1H[2K[32mBooting automatically in [92m2[32m, press any key to stop the countdown...[0m[24;1H[2K[32mBooting automatically in [92m1[32m, press any key to stop the countdown...[0m[2J[Hlimine: Loading executable `boot():/boot/tobyos.bin`...
+limine: Physical base:   0x7e78000
+limine: Virtual base:    0xffffffff80000000
+limine: Slide:           0x0
+limine: ELF entry point: 0xffffffff80001000
+limine: Base revision:   3
+limine: Requests count:  6
+limine: Top of HHDM:     0x40000000
+acpi: Found RSDP at 0xf52e0
+limine: Loading module `boot():/boot/initrd.tar`...
+limine: Loading module `boot():/boot/install.img`...
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Mode was already set, perfect!
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+paging: 1GiB pages are not supported!
+acpi: Found RSDP at 0xf52e0
+acpi: "DMAR" not found
+acpi: Found RSDP at 0xf52e0
+acpi: "IVRS" not found
+[boot] serial up
+[boot] framebuffer: 1280x800 pitch=5120 bpp=32 addr=0xffff8000fd000000
+[boot] console up
+[gdt] loaded: base=0xffffffff80047500 limit=55 entries=7
+[gdt] CS=0x08 DS=0x10 (expected CS=0x08 DS=0x10)
+[gdt] user CS=0x23 DS=0x1b  TSS sel=0x28 (TSS slot empty until tss_init)
+[idt] loaded: base=0xffffffff80047550 limit=4095 (256 gates wired)
+[boot] firing int3 to exercise IDT round-trip...
+[isr] breakpoint hit at rip=0xffffffff8000107b (rflags=0x82)
+[boot] int3 returned cleanly, IDT round-trip OK
+[pit] channel 0 -> 100 Hz (divisor=11931)
+[kbd] PS/2 driver up (IRQ1 unmasked)
+[boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard, via legacy PIC for early boot)
+[perf] TSC calibrated: 4214 MHz (210715523 cycles in 50000000 ns)
+[boot] HHDM offset = 0xffff800000000000
+[pmm] Limine memmap (19 entries):
+  0x0000000000001000..0x0000000000061000       384 KiB  bootloader
+  0x0000000000061000..0x000000000009f000       248 KiB  usable
+  0x000000000009fc00..0x00000000000a0000         1 KiB  reserved
+  0x00000000000f0000..0x0000000000100000        64 KiB  reserved
+  0x0000000000100000..0x0000000007a38000    124128 KiB  usable
+  0x0000000007a38000..0x0000000007e38000      4096 KiB  kernel
+  0x0000000007e38000..0x0000000007e39000         4 KiB  bootloader
+  0x0000000007e39000..0x0000000007e6e000       212 KiB  kernel
+  0x0000000007e6e000..0x0000000007e6f000         4 KiB  bootloader
+  0x0000000007e6f000..0x0000000007e72000        12 KiB  usable
+  0x0000000007e72000..0x0000000007e78000        24 KiB  bootloader
+  0x0000000007e78000..0x0000000007ed7000       380 KiB  kernel
+  0x0000000007ed7000..0x0000000007f2f000       352 KiB  bootloader
+  0x0000000007f2f000..0x0000000007f4a000       108 KiB  usable
+  0x0000000007f4a000..0x0000000007fe0000       600 KiB  bootloader
+  0x0000000007fe0000..0x0000000008000000       128 KiB  reserved
+  0x00000000fd000000..0x00000000fd3e8000      4000 KiB  framebuffer
+  0x00000000fffc0000..0x0000000100000000       256 KiB  reserved
+  0x000000fd00000000..0x0000010000000000  12582912 KiB  reserved
+[pmm] managed:  32586 pages (127 MiB) up to 0x0000000007f4a000
+[pmm] usable:   124496 KiB across 19 regions
+[pmm] bitmap:   4074 bytes at phys 0x0000000000061000 (virt 0xffff800000061000), 1 pages
+[pmm] free:     31123 pages (121 MiB) -- used: 1463 pages
+[pmm] test: allocated 0x0000000000062000 0x0000000000063000 0x0000000000064000 0x0000000000065000 (free now=31119)
+[pmm] test: read-back a=0xdeadbeefcafebabe d=0x1122334455667788
+[pmm] test: alloc/free balanced (free=31123 before & after)
+[boot] reserved AP trampoline page at phys 0x0000000000070000
+[vmm] kernel image: virt 0xffffffff80000000..0xffffffff8005f000 -> phys 0x0000000007e78000 (380 KiB)
+[vmm] hhdm mirror:  132 MiB across memmap, top phys 0x00000000fd400000, 2M pages
+[vmm] new PML4 at phys 0x0000000000062000, switching CR3...
+[vmm] CR3 switched. Running on tobyOS page tables.
+[vmm] test: __text_start 0xffffffff80001000 -> phys 0x0000000007e79000
+[vmm] test: __data_start 0xffffffff80047000 -> phys 0x0000000007ebf000
+[vmm] test: HHDM r/w through new PML4 at phys 0x0000000000069000 OK
+[vmm] test: new mapping at 0xffffc00000000000 <-> phys 0x0000000000069000 verified
+[vmm] test: unmap clears translation, scratch page freed
+[vmm] test: ok
+[heap] up: initial arena 17 pages (67 KiB)
+[heap] start: arenas=1 total=69600 used=0 free=69600  brk=0xffffd00000011000 (region 0xffffd00000000000..0xffffd10000000000)
+[heap] after 8 allocs: arenas=2 used=85616 free=65872 allocs=8
+[heap] after 8 frees: arenas=2 used=0 free=151488 frees=8
+[heap] test: ok (region OK, fragmented 80 KiB alloc OK, round-trip balanced, kcalloc zero-verified)
+[heap] brk now 0xffffd00000025000 (148 KiB virt consumed)
+[tss] installed: tss=0xffffffff8004e1e0 rsp0=0xffffffff8004e1e0 (irq stack 16 KiB)
+[sys] EFER.SCE on, STAR=0x0010000800000000, LSTAR=0xffffffff80034df0, FMASK=0x700
+[sys] kernel syscall rsp = 0xffffffff8004e1e0
+[sys] available syscalls: 0=exit  1=write  2=read  3=pipe  4=close  5=yield
+[sys]                     6=socket 7=bind 8=sendto 9=recvfrom
+[sys]                     10=gui_create 11=gui_fill 12=gui_text 13=gui_flip 14=gui_poll_event
+[sys]                     15=term_open 16=term_write 17=term_read 18=fs_readdir 19=fs_readfile 20=exec
+[sys]                     21=setting_get 22=setting_set 23=login 24=logout 25=session_info
+[sys]                     26=getuid 27=getgid 28=username 29=chmod 30=chown
+[acpi] using RSDT @ 0x0000000007fe244c (entries=4)
+[acpi] MADT: lapic_phys (32-bit field) = 0x00000000fee00000, legacy_pic=yes
+[acpi]   CPU0: acpi_id=0 apic_id=0 flags=0x1 enabled 
+[acpi]   CPU1: acpi_id=1 apic_id=1 flags=0x1 enabled 
+[acpi]   CPU2: acpi_id=2 apic_id=2 flags=0x1 enabled 
+[acpi]   CPU3: acpi_id=3 apic_id=3 flags=0x1 enabled 
+[acpi]   IOAPIC 0: mmio=0x00000000fec00000 gsi_base=0
+[acpi]   ISO: ISA IRQ0 -> GSI 2 (flags=0x0)
+[acpi]   ISO: ISA IRQ5 -> GSI 5 (flags=0xd)
+[acpi]   ISO: ISA IRQ9 -> GSI 9 (flags=0xd)
+[acpi]   ISO: ISA IRQ10 -> GSI 10 (flags=0xd)
+[acpi]   ISO: ISA IRQ11 -> GSI 11 (flags=0xd)
+[acpi]   LAPIC NMI: acpi_proc=255 lint=1 flags=0x0
+[acpi] enumerated 4 CPU(s) (SMP), 1 IO APIC(s), 5 override(s), 1 NMI source(s)
+[acpi] FADT: pm1a_cnt=0x604 pm1b_cnt=0x0 smi_cmd=0xb2 acpi_enable=0xf1 sci_int=9
+[acpi] FADT: reset_reg not supported (flags=0x80a5)
+[acpi] DSDT _S5_: SLP_TYPa=0 SLP_TYPb=0 (DSDT 8872 bytes)
+[apic] BSP local APIC: phys=0x00000000fee00000 virt=0xffffd20000000000 id=0 ver=0x14
+[apic] SVR=0x1ff  spurious_vec=0xff  timer_vec=0x40 (masked)
+[apic] timer calibrated: ~3139900 ticks/10ms (~313990 kHz, ~313990000 Hz/sec)
+[ioapic] chip 0: phys=0x00000000fec00000 virt=0xffffd20000010000 gsi=[0..23] ver=0x20 entries=24
+[irq]   re-route ISA IRQ 0 -> GSI 2 vec=0x20 edge/ahigh
+[irq]   re-route ISA IRQ 1 (identity, edge/ahigh) -> vec=0x21
+[irq] facade: switched to IO APIC mode (2 IRQs re-routed)
+[pci] enumerating bus 0...
+[pci] 6 device(s):
+[pci] 00:00.0  8086:1237  bridge.host       
+[pci] 00:01.0  8086:7000  bridge.isa        
+[pci] 00:01.1  8086:7010  storage.ide         BAR4 io 16
+[pci] 00:01.3  8086:7113  bridge              IRQ 9
+[pci] 00:02.0  1234:1111  display.vga         BAR0 mem 16384K  BAR2 mem 4K
+[pci] 00:03.0  8086:100e  network.ethernet    IRQ 11  BAR0 mem 128K  BAR1 io 64
+[ata] primary master: 98304 sectors (49152 KiB) -- PIO LBA28 (PCI 00:01.1)
+[blk] registered 'ide0:master' [disk] (98304 sectors, 49152 KiB)
+[pci] driver blk_ata  bound to 00:01.1  (8086:7010)
+[e1000] probing 00:03.0  (vid:did 8086:100e)
+[e1000] MMIO BAR0 phys=0x00000000febc0000 virt=0xffff8000febc0000 (128 KiB UC)
+[e1000] no MSI cap -- staying polled (vec 0x50 is now idle)
+[net] +nic e1000:00:03.0 mac=52:54:00:12:34:56 (slot 0)
+[pci] driver e1000    bound to 00:03.0  (8086:100e)
+[pci] bind complete -- 2 of 6 device(s) bound  (2 newly this pass)
+[part] ide0:master: GPT detected -- entries=128 (size=128), usable LBA 34..98270
+[blk] registered 'ide0:master.p1' [part] (2014 sectors, 1007 KiB)
+[part] ide0:master: slot 1 -> ide0:master.p1, LBA 34..2047 (2014 sectors), label='BIOS-boot'
+[blk] registered 'ide0:master.p2' [part] (8192 sectors, 4096 KiB)
+[part] ide0:master: slot 2 -> ide0:master.p2, LBA 2048..10239 (8192 sectors), label='tobyOS-data'
+[blk] registered 'ide0:master.p3' [part] (88031 sectors, 44015 KiB)
+[part] ide0:master: slot 3 -> ide0:master.p3, LBA 10240..98270 (88031 sectors), label='FAT32-data'
+[part] ide0:master: registered 3 partition(s)
+[boot] partition scan: 3 partition(s) registered
+[blk] 4 device(s) registered:
+  [0] ide0:master          disk    98304 sectors ( 49152 KiB)
+  [1] ide0:master.p1       part     2014 sectors (  1007 KiB) type=21686148 label='BIOS-boot'
+  [2] ide0:master.p2       part     8192 sectors (  4096 KiB) type=54796279 label='tobyOS-data'
+  [3] ide0:master.p3       part    88031 sectors ( 44015 KiB) type=ebd0a0a2 label='FAT32-data'
+[net] 1 nic(s) registered:
+  [0] e1000:00:03.0 mac=52:54:00:12:34:56
+[boot] Limine modules (2):
+  [0] /boot/initrd.tar  size=215040  addr=0xffff800007e39000
+  [1] /boot/install.img  size=4194304  addr=0xffff800007a38000
+[initrd] using '/boot/initrd.tar' (size=215040, addr=0xffff800007e39000)
+[ramfs] mounted: 19 entries from 215040-byte tar at 0xffff800007e39000
+  - bin/hello                         8848 B
+  - bin/bad                           8800 B
+  - bin/echo                          8744 B
+  - bin/cat                           4768 B
+  - bin/long_task                     5024 B
+  - bin/netecho                       13336 B
+  - bin/gui_demo                      12944 B
+  - bin/gui_clock                     8816 B
+  - bin/gui_widgets                   13472 B
+  - bin/gui_about                     13432 B
+  - bin/gui_term                      13032 B
+  - bin/gui_files                     13480 B
+  - bin/gui_viewer                    13104 B
+  - bin/login                         13456 B
+  - bin/gui_settings                  13560 B
+  - repo/helloapp.tpkg                13777 B
+  - repo/helloapp_v2.tpkg             13834 B
+  - etc/motd                          297 B
+  - readme.txt                        922 B
+[tobyfs] mounted '/data' on ide0:master.p2: 6/255 inodes, 3/1013 data blocks (4040 KiB free)
+[boot] mounted /data via GPT partition 'ide0:master.p2' (slot 2, parent 'ide0:master', LBA 2048, 8192 sectors)
+[fat32] mounted '/fat' on ide0:master.p3: 86643 clusters x 512 B (43321 KiB total, 2 FATs x 678 sec, root@cluster 2)
+[boot] mounted /fat via FAT32 partition 'ide0:master.p3' (slot 3, parent 'ide0:master', LBA 10240, 88031 sectors)
+[fat32-test] >>> begin smoke test on /fat
+[fat32-test]   /fat[0] HELLO.TXT  type=1 size=147
+[fat32-test]   /fat[1] BIN  type=2 size=0
+[fat32-test]   readdir /fat -> 2 entries
+[fat32-test]   read /fat/HELLO.TXT -> 147 bytes
+[fat32-test]   first line: Hello from FAT32 on tobyOS!
+[fat32-test]   /fat/BIN[0] README.MD  type=1 size=93
+[fat32-test]   readdir /fat/BIN -> 1 entries
+[fat32-test]   read /fat/BIN/README.MD -> 93 bytes
+[fat32-test]   wrote 28 bytes to /fat/SELFTEST.LOG
+[fat32-test]   read-back 28 bytes (match)
+[fat32-test]   unlinked /fat/SELFTEST.LOG
+[fat32-test]   stat /fat/SELFTEST.LOG post-unlink -> NOENT (good)
+[fat32-test] <<< end smoke test on /fat
+[installer] live install image registered: 4194304 bytes @ 0xffff800007a38000
+[vfs] mount table (3 entries):
+  /            -> ops=0xffffffff800439c8 mnt=0xffffffff8004f360
+  /data        -> ops=0xffffffff80043f70 mnt=0xffffd00000011b90
+  /fat         -> ops=0xffffffff80044060 mnt=0xffffd00000013c30
+[proc] table initialised (16 slots), pid 0 = 'kernel_main' RUNNING
+[sched] per-CPU round-robin scheduler ready (BSP cur=pid 0)
+[signal] subsystem up (SIGINT=2, SIGTERM=15)
+[boot] spawning first userspace process from /bin/hello...
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x34 filesz=0x34 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x45 filesz=0x45 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] load OK (user): 2 segment(s), entry=0x0000000000400000
+[proc] created pid=1 'hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffefe0 cr3=0x165000 kstack=0xffffd00000029180 argc=0
+hello from user mode
+user_hello: about to SYS_EXIT(0x55)
+[sys_exit] user requested exit, code=85 (0x55)
+[proc] pid=1 'hello-boot' exit code=85 (0x55) cpu=0 ms syscalls=3
+[proc] reaped pid=1, slot recycled
+[boot] /bin/hello (pid=1) finished, exit code=85 (0x55)
+[boot] BSP LAPIC timer @ 100 Hz live (vec=0x40)
+[smp] 4 CPU(s) total: BSP apic_id=0
+[smp]   cpu0: apic_id=0 (BSP)
+[smp]   cpu1: apic_id=1
+[smp]   cpu2: apic_id=2
+[smp]   cpu3: apic_id=3
+CPU 0 online
+  apic_id=0 (BSP)  stack=bootloader-provided
+[smp] trampoline installed: phys=0x0000000000070000 virt=0xffff800000070000 len=1024 bytes
+[smp] cpu1: INIT-SIPI-SIPI to apic_id=1 (tramp_vector=0x70, stack=0xffffd00000029030)
+CPU 1 online
+  apic_id=1 (acpi said 1)  stack_top=0xffffd00000029030
+[smp] cpu2: INIT-SIPI-SIPI to apic_id=2 (tramp_vector=0x70, stack=0xffffd0000002d040)
+  cpu1: LAPIC timer @ 100 Hz live (vec=0x40)
+CPU 2 online
+  apic_id=2 (acpi said 2)  stack_top=0xffffd0000002d040
+  cpu2: LAPIC timer @ 100 Hz live (vec=0x40)
+[smp] cpu3: INIT-SIPI-SIPI to apic_id=3 (tramp_vector=0x70, stack=0xffffd00000031050)
+CPU 3 online
+  apic_id=3 (acpi said 3)  stack_top=0xffffd00000031050
+  cpu3: LAPIC timer @ 100 Hz live (vec=0x40)
+[smp] 3/3 APs online (total 4 CPUs)
+[net] up: nic=e1000:00:03.0 ip=10.0.2.15 gw=10.0.2.2 mac=52:54:00:12:34:56
+[net] WARN: gateway 10.0.2.2 did not respond to ARP within 500ms
+[gfx] back buffer 1280x800 (4000 KiB) ready, fb_pitch=1280 px, backend=limine-fb
+[mouse] PS/2 driver up (IRQ12 routed via IO APIC)
+[gui] window manager ready (max 8 windows, 18-px title bar)
+[term] session pool ready (4 sessions, 4096-byte rings)
+Welcome to tobyOS
+milestone 14: services + settings + login. Boot drops into the GUI desktop with /bin/login.
+
+[settings] loading /data/settings.conf (209 bytes)
+[settings] cache:
+  desktop.bg=0x00204060
+  desktop.title=tobyOS
+  desktop.greeting=Welcome to tobyOS
+  user.last=toby
+  user.greeting=Hello, friend!
+  session.autostart=
+[users] loading /data/users (86 bytes)
+[users] cache (3 entries):
+  root             uid=0 gid=0
+  toby             uid=1000 gid=1000
+  guest            uid=1001 gid=1001
+[svc] service manager up (max 8 services)
+[svc] registered builtin 'input'
+[svc] registered builtin 'network'
+[svc] registered builtin 'desktop'
+[svc] registered builtin 'session'
+[trace] level 0 -> 1
+[gui] auto-enabled trace (level=1) for desktop session
+[trace t=166 pid=0] gui_set_desktop_mode: off -> on
+[gui] entering graphical mode
+[session] init: last user='toby' (will be pre-filled at login)
+[svc] registered program 'login' -> /bin/login (autorestart=1)
+[trace t=167 pid=0] launch_enqueue '/bin/login' sandbox='' (head=1 tail=0)
+[svc] 'login' enqueued (restart #1)
+[svc] 5 services registered
+  name         kind    state   auto pid rcnt  path
+  input        builtin running 0    0   0     (builtin)
+  network      builtin running 0    0   0     (builtin)
+  desktop      builtin running 0    0   0     (builtin)
+  session      builtin running 0    0   0     (builtin)
+  login        program running 1    0   1     /bin/login
+[pkg] package manager ready (apps=/data/apps db=/data/packages repo=/data/repo,/repo)
+type 'help' to list commands.
+tobyOS> [trace t=169 pid=0] drain_launch_queue: spawning '/bin/login' sandbox='default'
+[elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xde1 filesz=0xde1 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x194 filesz=0x194 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x18 filesz=0x0 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[elf] load OK (user): 3 segment(s), entry=0x0000000000400000
+[proc] created pid=1 'login' entry=0x0000000000400000 rsp=0x00007fffffffefe0 cr3=0x57c000 kstack=0xffffd0000043b180 argc=0
+[cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[trace t=170 pid=0] track_pid pid=1 slot=0
+[gui] launched /bin/login as pid 1 (session=0)
+[trace t=170 pid=0] drain_launch_queue: spawned '/bin/login' as pid=1 session=0
+[svc] 'login' pid=1 (backfilled)
+[trace t=170 pid=0] heartbeat windows=0 apps_alive=1 cursor=(640,400) btn=0x00 dirty=1 menu=0 desktop=1
+[trace t=171 pid=1] window_create wid=1 owner_pid=1 size=380x220 pos=(60,40) title='tobyOS login'
+[trace t=270 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=370 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=470 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=570 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=670 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=770 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=870 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=970 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1070 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1170 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1270 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1370 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1470 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1570 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1670 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1770 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1870 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=1970 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2070 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2170 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1
+[trace t=2270 pid=0] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1

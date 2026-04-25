@@ -1,0 +1,5 @@
+rm: cannot remove 'serial.log': Device or resource busy
+rm: cannot remove 'debug.log': Device or resource busy
+rm: cannot remove 'qemu.log': Device or resource busy
+rm: cannot remove 'net.pcap': Device or resource busy
+make: *** [Makefile:803: run-ahci] Error 1
