@@ -6,6 +6,7 @@
  *
  * Limits / non-goals (Milestone 24A):
  *   - one network interface (whatever net_default() returns)
+ *   - DISCOVER is retransmitted during the offer-phase window (see dhcp.c)
  *   - no lease renewal (we just log T1/T2 and lease seconds)
  *   - no INFORM / RELEASE / DECLINE
  *   - no per-vendor identifiers
@@ -80,11 +81,12 @@ struct __attribute__((packed)) dhcp_pkt {
 #define DHCP_OPT_HOSTNAME      12
 #define DHCP_OPT_REQUESTED_IP  50
 #define DHCP_OPT_LEASE_TIME    51
+#define DHCP_OPT_OVERLOAD      52 /* RFC 2132 §9.4: opts spill to file/sname */
 #define DHCP_OPT_MSG_TYPE      53
 #define DHCP_OPT_SERVER_ID     54
 #define DHCP_OPT_PARAM_REQ     55
 #define DHCP_OPT_CLIENT_ID     61
-#define DHCP_OPT_END          255
+#define DHCP_OPT_END           255
 
 /* Result of a successful DHCP handshake.
  *   All IPs are in network byte order.

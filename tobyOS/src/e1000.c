@@ -289,12 +289,14 @@ static bool e1000_tx_op(struct net_dev *dev, const void *frame, size_t len) {
     g_tx_ring[i].status = 0;
 
     g_tx_tail = (uint16_t)((i + 1) % TX_DESC_COUNT);
+    __asm__ volatile ("" ::: "memory");
     mmio_write32(E1000_TDT, g_tx_tail);
     return true;
 }
 
 static void e1000_rx_drain_op(struct net_dev *dev) {
     (void)dev;
+    uint64_t irqf = cpu_irqsave();
     /* Walk forward from tail+1 (which is the first descriptor the NIC
      * is allowed to write next). For each descriptor that has DD set,
      * dispatch it, clear the status, advance tail, and bump RDT. */
@@ -309,6 +311,7 @@ static void e1000_rx_drain_op(struct net_dev *dev) {
         g_rx_tail = i;
         mmio_write32(E1000_RDT, g_rx_tail);
     }
+    cpu_irqrestore(irqf);
 }
 
 /* MSI handler. Reading ICR clears every cause bit it returns, so a

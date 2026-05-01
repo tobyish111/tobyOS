@@ -20,6 +20,7 @@
 #include <tobyos/serial.h>
 #include <tobyos/console.h>
 #include <tobyos/printk.h>
+#include <tobyos/bootlog.h>
 #include <tobyos/panic.h>
 #include <tobyos/gdt.h>
 #include <tobyos/idt.h>
@@ -182,6 +183,7 @@ static volatile uint64_t requests_end[] = {
 
 static void early_init(void) {
     serial_init();
+    bootlog_init();
     kprintf("[boot] serial up\n");
     /* Milestone 28A: bring the structured-log ring up as early as
      * possible so every subsequent subsystem can SLOG_INFO/etc. into
@@ -2355,29 +2357,54 @@ void _start(void) {
             } else {
                 kprintf("[usb-msc-test]   unmounted /usb cleanly\n");
 
-                /* Find the same disk we mounted from (the iteration
-                 * mirrors the logic above) and remount. */
+                /* Remount must mirror the *initial* /usb bring-up: GPT sticks
+                 * expose FAT32 on a PARTITION first; raw layout uses the
+                 * whole DISK. M26E previously only scanned DISK, so after
+                 * unmount a partitioned stick never remounted — /usb stayed
+                 * dead and bootlog_flush_all() could not write BOOTLOG.TXT. */
                 bool remount_ok = false;
-                size_t it = 0;
-                struct blk_dev *d;
-                while ((d = blk_iter_next(&it, BLK_CLASS_DISK)) != NULL) {
-                    if (!d || d->gone) continue;
-                    /* Only USB-named disks have priv == NULL? Actually
-                     * usb-msc names them "usbN"; cheap & robust check. */
-                    if (!d->name || d->name[0] != 'u' ||
-                        d->name[1] != 's' || d->name[2] != 'b') continue;
-                    if (!fat32_probe(d)) continue;
-                    int rrc = fat32_mount("/usb", d);
-                    if (rrc == VFS_OK) {
-                        kprintf("[usb-msc-test]   remounted /usb via '%s'\n",
-                                d->name);
-                        remount_ok = true;
-                        break;
+                {
+                    size_t itp = 0;
+                    struct blk_dev *p;
+                    while (!remount_ok &&
+                           (p = blk_iter_next(&itp, BLK_CLASS_PARTITION)) !=
+                               NULL) {
+                        if (!p->parent || !p->parent->name) continue;
+                        const char *pn = p->parent->name;
+                        if (pn[0] != 'u' || pn[1] != 's' || pn[2] != 'b')
+                            continue;
+                        if (!fat32_probe(p)) continue;
+                        int rrc = fat32_mount("/usb", p);
+                        if (rrc == VFS_OK) {
+                            kprintf("[usb-msc-test]   remounted /usb via "
+                                    "partition '%s'\n",
+                                    p->name);
+                            remount_ok = true;
+                        }
+                    }
+                }
+                if (!remount_ok) {
+                    size_t itd = 0;
+                    struct blk_dev *d;
+                    while (!remount_ok &&
+                           (d = blk_iter_next(&itd, BLK_CLASS_DISK)) != NULL) {
+                        if (!d || d->gone) continue;
+                        if (!d->name || d->name[0] != 'u' ||
+                            d->name[1] != 's' || d->name[2] != 'b')
+                            continue;
+                        if (!fat32_probe(d)) continue;
+                        int rrc = fat32_mount("/usb", d);
+                        if (rrc == VFS_OK) {
+                            kprintf("[usb-msc-test]   remounted /usb via "
+                                    "disk '%s'\n",
+                                    d->name);
+                            remount_ok = true;
+                        }
                     }
                 }
                 if (!remount_ok) {
                     kprintf("[usb-msc-test]   remount /usb FAILED -- "
-                            "no FAT32 USB disk found\n");
+                            "no FAT32 USB partition or disk found\n");
                 } else {
                     /* Round-trip a small file again to prove the FS
                      * came back fully wired. */
@@ -2553,6 +2580,12 @@ void _start(void) {
         (void)net_init();
     }
 
+    /* Milestone 24B–24D self-test: DNS + TCP + full HTTP GET to
+     * example.com. Wall-clock cost is noticeable on every boot
+     * (especially offline: DNS 1.5s ×2, TCP connect/recv, HTTP 3s) on
+     * top of net_init()'s DHCP budget.  Default `make` sets -DFAST_BOOT
+     * (Makefile EXTRA_CFLAGS); use `make fullboot` for this smoke block. */
+#if !defined(FAST_BOOT)
     /* Milestone 24B self-test: exercise the resolver end-to-end
      * against the DNS server DHCP just gave us. Two cases:
      *   (a) example.com  -- canonical "internet still exists" probe.
@@ -2670,6 +2703,11 @@ void _start(void) {
         }
         kprintf("[http-test] <<< done\n");
     }
+#else
+    if (!safemode_skip_net() && net_is_up()) {
+        kprintf("[boot] FAST_BOOT: skipping dns/tcp/http example.com smoke\n");
+    }
+#endif
     /* GUI subsystem (milestone 10): graphics back buffer + PS/2 mouse +
      * window manager. Each layer is independently no-op-on-failure --
      * if any of them refuses we still drop into the text shell.
@@ -2758,7 +2796,7 @@ void _start(void) {
         /* Milestone 24D: optional boot self-test for HTTP-based package
          * install. Only does anything when built with `make m24dtest`;
          * default builds leave this as a no-op stub. The test driver is
-         * tools/test_m24d.ps1 which sets up the host HTTP server first. */
+         * tests/test_m24d.ps1 which sets up the host HTTP server first. */
         http_m24d_selftest();
         /* M22 step 4: arm the ACPI shutdown self-test if the kernel was
          * built with -DACPI_M22_SELFTEST. Default builds turn this into
@@ -2982,5 +3020,12 @@ void _start(void) {
         }
         kprintf("[boot] M28D: safe-mode harness complete\n");
     }
+    /* Persist kprintf capture to /data and/or FAT32 install USB. */
+    bootlog_flush_all();
+    /* UDP boot log: GUI path sends after ~300 ms in gui_tick(); if we
+     * never brought the desktop up, push once here so safesh still
+     * ships logs to the LAN collector. */
+    if (safemode_skip_gui())
+        bootlog_net_upload();
     idle_loop();
 }

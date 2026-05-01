@@ -11,6 +11,9 @@ LD   := ld.lld
 AR   := ar
 QEMU := "/c/Program Files/qemu/qemu-system-x86_64.exe"
 
+# QEMU serial / debugcon / trace logs (see `make run*` targets).
+LOGDIR := logs
+
 # OVMF firmware blob shipped with the QEMU-for-Windows installer.
 # Used by `make run-uefi` / `run-installed-uefi` to boot the same
 # image under a real UEFI implementation. The CODE.fd is read-only;
@@ -35,6 +38,11 @@ CFLAGS := --target=x86_64-elf \
           -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
           -mcmodel=kernel \
           -nostdlib -O2 -Wall -Wextra -std=c11
+
+# Faster default boot: shorter DHCP budget, quicker ARP pre-warm, and
+# no inline example.com DNS+TCP+HTTP smoke in kmain (that alone can add
+# many seconds when offline).  For the old behaviour: `make fullboot`.
+EXTRA_CFLAGS ?= -DFAST_BOOT
 
 LDFLAGS := -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 -T linker.ld
 
@@ -65,6 +73,7 @@ C_SRCS := src/kernel.c \
           src/font8x8.c \
           src/console.c \
           src/printk.c \
+          src/bootlog.c \
           src/panic.c \
           src/gdt.c \
           src/idt.c \
@@ -115,6 +124,7 @@ C_SRCS := src/kernel.c \
           src/eth.c \
           src/arp.c \
           src/ip.c \
+          src/icmp.c \
           src/udp.c \
           src/dhcp.c \
           src/dns.c \
@@ -1772,6 +1782,19 @@ sdk-pack: sdk sdk-samples
 	cd build && tar -czf $(notdir $(SDK_TARBALL)) sdk-$(SDK_VERSION)
 	@echo "[sdk] packed $(SDK_TARBALL)"
 
+# Same as default `make all` today (EXTRA_CFLAGS defaults to -DFAST_BOOT).
+.PHONY: fastboot
+fastboot:
+	rm -f src/kernel.o src/net.o
+	$(MAKE) all
+
+# Full boot-time network smoke (example.com DNS+TCP+HTTP) and 3 s DHCP
+# budget — use for CI / regression, not daily dev on real hardware.
+.PHONY: fullboot
+fullboot:
+	rm -f src/kernel.o src/net.o
+	$(MAKE) all EXTRA_CFLAGS=
+
 # Milestone-17 self-test build. Wipes intermediate artifacts and
 # rebuilds the kernel with -DPKG_M17_SELFTEST defined so the boot
 # sequence runs the install/update/upgrade/rollback demo and writes
@@ -1865,7 +1888,7 @@ sectest:
 #  -> pkg info helloapp
 #  -> pkg remove helloapp
 # cycle against an HTTP server expected at 10.0.2.2:8000. Use the
-# tools/test_m24d.ps1 driver which stages the test directory, starts
+# tests/test_m24d.ps1 driver which stages the test directory, starts
 # `py -m http.server 8000` in the background, runs `make run`, and
 # greps serial.log for "[m24d-selftest] SUCCESS".
 m24dtest:
@@ -1875,24 +1898,24 @@ m24dtest:
 # ---------- Run ----------
 
 run: $(ISO) $(DISK_IMG)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== qemu.log -- non-timer entries ==="; \
-	grep -v "INT=0x08" qemu.log | head -n 200 2>/dev/null || echo "(empty)"
+	grep -v "INT=0x08" $(LOGDIR)/qemu.log | head -n 200 2>/dev/null || echo "(empty)"
 
 # ---------- Milestone 20: boot the INSTALLED disk ----------
 #
@@ -1918,21 +1941,21 @@ run-installed:
 	    echo "  5. make run-installed            # boot from installed disk"; \
 	    exit 1; \
 	fi
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
 	        -boot c \
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- Milestone 21 step 1: AHCI smoke targets ----------
 #
@@ -1951,7 +1974,7 @@ run-installed:
 # Useful for catching driver bugs that only surface on real hardware
 # without breaking the existing make run / test_install.ps1 flow.
 run-ahci: $(ISO) $(DISK_IMG)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -machine q35 \
 	        -cdrom $(ISO) \
 	        -device ahci,id=ahci0 \
@@ -1961,18 +1984,18 @@ run-ahci: $(ISO) $(DISK_IMG)
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-ahci-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -machine q35 \
 	        -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
@@ -1983,13 +2006,13 @@ run-ahci-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (UEFI/q35/AHCI) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- Milestone 21 step 2: NVMe smoke targets ----------
 #
@@ -2011,7 +2034,7 @@ run-ahci-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 # Useful for catching driver bugs without breaking the existing make
 # run / run-ahci / test_install.ps1 flows.
 run-nvme: $(ISO) $(DISK_IMG)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=none,id=hd0 \
 	        -device nvme,drive=hd0,serial=tobyOSnvme0 \
@@ -2019,18 +2042,18 @@ run-nvme: $(ISO) $(DISK_IMG)
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-nvme-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -cdrom $(ISO) \
@@ -2039,13 +2062,13 @@ run-nvme-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (UEFI/NVMe) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- virtio-net (modern transport) ----------
 #
@@ -2071,22 +2094,22 @@ run-nvme-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 # run:  echo hello | nc -u 127.0.0.1 5555
 # (or use the user_netecho program from inside the OS).
 run-virtio-net: $(ISO) $(DISK_IMG)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device virtio-net-pci,netdev=net0,disable-legacy=on,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1, virtio-net) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- M35B: virtio-blk smoke target ----------
 #
@@ -2107,20 +2130,20 @@ build/vblk_test.img:
 	fi
 
 run-virtio-blk: $(ISO) $(DISK_IMG) build/vblk_test.img
-	rm -f serial.log debug.log qemu.log
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -drive file=build/vblk_test.img,format=raw,if=none,id=vblk0 \
 	        -device virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off \
 	        -boot d \
 	        -smp 4 \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d cpu_reset,guest_errors -D qemu.log \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot -no-shutdown -display none
 
 run-virtio-net-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -cdrom $(ISO) \
@@ -2128,13 +2151,13 @@ run-virtio-net-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device virtio-net-pci,netdev=net0,disable-legacy=on,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (UEFI/virtio-net) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- e1000e (Intel 82574L) ----------
 #
@@ -2154,25 +2177,25 @@ run-virtio-net-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 #   - net_init() picks up e1000e as net_default(), ARPs the SLIRP
 #     gateway, UDP echo socket binds on :5555.
 run-e1000e: $(ISO) $(DISK_IMG)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1, e1000e) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-e1000e-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -cdrom $(ISO) \
@@ -2180,13 +2203,13 @@ run-e1000e-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (UEFI/e1000e) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- rtl8139 (sanity check that rtl8169 driver IGNORES it) ----------
 #
@@ -2212,7 +2235,7 @@ run-e1000e-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 # distinguishes sibling Realtek chips. Real-hardware verification of
 # the gigabit path itself happens out-of-band on physical 8168 silicon.
 run-rtl8139: $(ISO) $(DISK_IMG)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
@@ -2221,18 +2244,18 @@ run-rtl8139: $(ISO) $(DISK_IMG)
 	        -device rtl8139,netdev=net0,mac=52:54:00:12:34:78 \
 	        -netdev user,id=net1 \
 	        -device e1000,netdev=net1,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1, rtl8139+e1000) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-rtl8139-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -cdrom $(ISO) \
@@ -2242,13 +2265,13 @@ run-rtl8139-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -device rtl8139,netdev=net0,mac=52:54:00:12:34:78 \
 	        -netdev user,id=net1 \
 	        -device e1000,netdev=net1,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (UEFI/rtl8139+e1000) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- xHCI (USB-HID keyboard + mouse) ----------
 #
@@ -2272,7 +2295,7 @@ run-rtl8139-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 # they coexist with USB HID, and the rest of the milestone-21
 # regression suite still sees identical input behaviour.
 run-xhci: $(ISO) $(DISK_IMG)
-	rm -f serial.log debug.log qemu.log
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
@@ -2282,17 +2305,17 @@ run-xhci: $(ISO) $(DISK_IMG)
 	        -device qemu-xhci,id=usb0 \
 	        -device usb-kbd,bus=usb0.0 \
 	        -device usb-mouse,bus=usb0.0 \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1, xhci+usb-kbd+usb-mouse) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-xhci-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
-	rm -f serial.log debug.log qemu.log
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log
 	$(QEMU) -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -cdrom $(ISO) \
@@ -2303,12 +2326,12 @@ run-xhci-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -device qemu-xhci,id=usb0 \
 	        -device usb-kbd,bus=usb0.0 \
 	        -device usb-mouse,bus=usb0.0 \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (UEFI/xhci+usb-kbd+usb-mouse) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- Milestone 23C: xHCI + USB Mass Storage ----------
 #
@@ -2337,7 +2360,7 @@ $(USB_STICK_IMG): $(MKDISK_GPT_BIN)
 	@$(MKDISK_GPT_BIN) --fat32-only $@ $(USB_STICK_BYTES)
 
 run-xhci-usb: $(ISO) $(DISK_IMG) $(USB_STICK_IMG)
-	rm -f serial.log debug.log qemu.log
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -drive if=none,id=usbstick,format=raw,file=$(USB_STICK_IMG) \
@@ -2349,14 +2372,14 @@ run-xhci-usb: $(ISO) $(DISK_IMG) $(USB_STICK_IMG)
 	        -device usb-kbd,bus=usb0.0 \
 	        -device usb-mouse,bus=usb0.0 \
 	        -device usb-storage,bus=usb0.0,drive=usbstick \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1, xhci+usb-storage) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- M26B: USB hub-aware boot ----------
 #
@@ -2377,7 +2400,7 @@ run-xhci-usb: $(ISO) $(DISK_IMG) $(USB_STICK_IMG)
 #   `devlist usb`  shows usb1-1.K records (depth>0) for each leaf
 #   `usbtest hub`  exits 0 with "PASS" line
 run-xhci-hub: $(ISO) $(DISK_IMG) $(USB_STICK_IMG)
-	rm -f serial.log debug.log qemu.log
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -drive if=none,id=usbstick,format=raw,file=$(USB_STICK_IMG) \
@@ -2390,21 +2413,21 @@ run-xhci-hub: $(ISO) $(DISK_IMG) $(USB_STICK_IMG)
 	        -device usb-kbd,bus=usb0.0,port=1.1 \
 	        -device usb-mouse,bus=usb0.0,port=1.2 \
 	        -device usb-storage,bus=usb0.0,port=1.3,drive=usbstick \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1, xhci+hub+kbd+mouse+storage) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # M23D: combined boot exercising EVERY storage path at once --
 #   - GPT-partitioned IDE disk (-> /data + /fat + /ext)
 #   - raw FAT32 USB stick      (-> /usb)
 # Useful as a single end-to-end "all four mounts coexist" smoke test.
 run-gpt-usb: $(ISO) $(GPT_DISK_IMG) $(USB_STICK_IMG)
-	rm -f serial.log debug.log qemu.log
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(GPT_DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -drive if=none,id=usbstick,format=raw,file=$(USB_STICK_IMG) \
@@ -2416,15 +2439,15 @@ run-gpt-usb: $(ISO) $(GPT_DISK_IMG) $(USB_STICK_IMG)
 	        -device usb-kbd,bus=usb0.0 \
 	        -device usb-mouse,bus=usb0.0 \
 	        -device usb-storage,bus=usb0.0,drive=usbstick \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (GPT+USB combined) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-xhci-usb-uefi: $(ISO) $(DISK_IMG) $(USB_STICK_IMG) $(OVMF_CODE) $(OVMF_VARS)
-	rm -f serial.log debug.log qemu.log
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log
 	$(QEMU) -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -cdrom $(ISO) \
@@ -2437,12 +2460,12 @@ run-xhci-usb-uefi: $(ISO) $(DISK_IMG) $(USB_STICK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -device usb-kbd,bus=usb0.0 \
 	        -device usb-mouse,bus=usb0.0 \
 	        -device usb-storage,bus=usb0.0,drive=usbstick \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (UEFI/xhci+usb-storage) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- Milestone 21 step 7: virtio-gpu smoke targets ----------
 #
@@ -2468,7 +2491,7 @@ run-xhci-usb-uefi: $(ISO) $(DISK_IMG) $(USB_STICK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 # We KEEP the i440fx default PS/2 keyboard + mouse for input; only the
 # DISPLAY changes vs. `make run`. `-vga none` removes the default Cirrus.
 run-virtio-gpu: $(ISO) $(DISK_IMG)
-	rm -f serial.log debug.log qemu.log
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
@@ -2477,17 +2500,17 @@ run-virtio-gpu: $(ISO) $(DISK_IMG)
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -vga none \
 	        -device virtio-gpu-pci \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== debugcon (port 0xE9) ==="; \
-	cat debug.log 2>/dev/null || echo "(empty)"; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1, virtio-gpu) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-virtio-gpu-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
-	rm -f serial.log debug.log qemu.log
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log
 	$(QEMU) -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -cdrom $(ISO) \
@@ -2497,12 +2520,12 @@ run-virtio-gpu-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -vga none \
 	        -device virtio-gpu-pci \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (UEFI/virtio-gpu) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- Real-hardware boot helpers (UEFI + USB-image) ----------
 #
@@ -2546,7 +2569,7 @@ $(OVMF_VARS):
 	dd if=/dev/zero of=$(OVMF_VARS) bs=1 count=$(OVMF_VARS_SZ) status=none
 
 run-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -cdrom $(ISO) \
@@ -2554,32 +2577,32 @@ run-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (UEFI) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-installed-uefi: $(OVMF_CODE) $(OVMF_VARS)
 	@if [ ! -f $(DISK) ]; then \
 	    echo "error: $(DISK) does not exist (run 'make run' + 'install --yes' first)"; \
 	    exit 1; \
 	fi
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (installed, UEFI) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- M23A: GPT-disk smoke targets ----------
 #
@@ -2600,23 +2623,23 @@ run-installed-uefi: $(OVMF_CODE) $(OVMF_VARS)
 #   [part] ide0:master: slot 2 -> ide0:master.p2, LBA 2048..10239 ...
 #   [boot] mounted /data via GPT partition 'ide0:master.p2' ...
 run-gpt: $(ISO) $(GPT_DISK_IMG)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(GPT_DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (GPT/IDE) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-gpt-uefi: $(ISO) $(GPT_DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -drive if=pflash,unit=0,format=raw,readonly=on,file=$(OVMF_CODE) \
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -cdrom $(ISO) \
@@ -2624,16 +2647,16 @@ run-gpt-uefi: $(ISO) $(GPT_DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (GPT/UEFI/IDE) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-gpt-nvme: $(ISO) $(GPT_DISK_IMG)
-	rm -f serial.log debug.log qemu.log net.pcap
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
 	$(QEMU) -cdrom $(ISO) \
 	        -drive file=$(GPT_DISK_IMG),format=raw,if=none,id=hd0 \
 	        -device nvme,drive=hd0,serial=tobyOSnvme0 \
@@ -2641,13 +2664,13 @@ run-gpt-nvme: $(ISO) $(GPT_DISK_IMG)
 	        -smp 4 \
 	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-	        -object filter-dump,id=fd0,netdev=net0,file=net.pcap \
-	        -serial file:serial.log \
-	        -debugcon file:debug.log \
-	        -d int,cpu_reset,guest_errors -D qemu.log \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d int,cpu_reset,guest_errors -D $(LOGDIR)/qemu.log \
 	        -no-reboot; \
 	echo ""; echo "=== serial (GPT/NVMe) ==="; \
-	cat serial.log 2>/dev/null || echo "(empty)"
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # Convenience copy for "I want to flash this with Rufus / dd". Just
 # tobyOS.iso renamed -- we already produce a hybrid image. Use the
@@ -2740,5 +2763,5 @@ clean:
 	       $(PORTS_SBASE_OBJS) $(PORTS_SBASE_ELFS) $(PORTS_SBASE_UTIL_O) \
 	       libtoby/libtoby.a libtoby/crt0.o $(LIBTOBY_OBJS) \
 	       libtoby/libtoby.so libtoby/Scrt0.o $(LDTOBY_OBJS) $(LDTOBY_SO) \
-	       programs/common/start.o programs/common/toby_gui.o net.pcap
+	       programs/common/start.o programs/common/toby_gui.o $(LOGDIR)/net.pcap
 	@echo "(disk.img preserved -- 'make wipe-disk' to reformat the persistent FS)"

@@ -34,6 +34,20 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 
+/* First DHCP_OFFER_PHASE_NUM/DEN of the caller's `timeout_ms` is the
+ * DISCOVER/OFFER window; the remainder is for REQUEST/ACK. Within the
+ * offer window we retransmit DISCOVER every DHCP_DISCOVER_GAP_MS (wired
+ * LANs / slow relays / single lost frames). */
+#ifndef DHCP_OFFER_PHASE_NUM
+#define DHCP_OFFER_PHASE_NUM 65u
+#endif
+#ifndef DHCP_OFFER_PHASE_DEN
+#define DHCP_OFFER_PHASE_DEN 100u
+#endif
+#ifndef DHCP_DISCOVER_GAP_MS
+#define DHCP_DISCOVER_GAP_MS 300u
+#endif
+
 /* ---- transient transaction state -------------------------------- *
  *
  * Lives only across one dhcp_acquire() invocation. After the call
@@ -94,6 +108,50 @@ static const uint8_t *opt_find(const uint8_t *opts, size_t opts_len,
         i += len;
     }
     return NULL;
+}
+
+/* RFC 2132 option 52: when the fixed `options` field is full, DHCP options
+ * continue in the BOOTP `file` (bit0) and/or `sname` (bit1) fields. Many
+ * home gateways (Deco, ISP CPEs) rely on this; without it we never see
+ * option 53 and DHCP appears "broken". */
+static const uint8_t *dhcp_opt_find(const struct dhcp_pkt *p, size_t opt_avail,
+                                    uint8_t want_code, uint8_t *out_len) {
+    const uint8_t *v = opt_find(p->options, opt_avail, want_code, out_len);
+    if (v) return v;
+
+    uint8_t  ollen = 0;
+    const uint8_t *ol =
+        opt_find(p->options, opt_avail, DHCP_OPT_OVERLOAD, &ollen);
+    if (!ol || ollen < 1) return NULL;
+
+    uint8_t flags = ol[0];
+    /* 1=file only, 2=sname only, 3=file then sname (RFC 2132). */
+    if (flags & 1u) {
+        v = opt_find(p->file, sizeof p->file, want_code, out_len);
+        if (v) return v;
+    }
+    if (flags & 2u) {
+        v = opt_find(p->sname, sizeof p->sname, want_code, out_len);
+        if (v) return v;
+    }
+    return NULL;
+}
+
+static bool dhcp_chaddr_ok(const struct dhcp_pkt *p) {
+    if (memcmp(p->chaddr, g_my_mac, ETH_ADDR_LEN) == 0) return true;
+    /* Some servers zero or omit echoing the client hw addr; xid+magic
+     * already scoped this datagram to our transaction.
+     *
+     * Only require the Ethernet portion (first hlen octets, up to 6) to
+     * be zero. Many home gateways pad chaddr[6..15] with 0xff or other
+     * junk; treating that as "wrong client" caused us to ignore valid
+     * OFFERs (Wireshark showed OFFER + matching xid, no REQUEST). */
+    unsigned n = p->hlen;
+    if (n == 0 || n > ETH_ADDR_LEN) n = ETH_ADDR_LEN;
+    for (unsigned i = 0; i < n; i++) {
+        if (p->chaddr[i]) return false;
+    }
+    return true;
 }
 
 /* Read a 32-bit big-endian word out of an options blob (DHCP carries
@@ -199,7 +257,6 @@ static bool dhcp_send_request(uint32_t xid_be,
 /* ---- RX hook ---------------------------------------------------- */
 
 void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
-    (void)src_ip_be;
     if (!g_xact.in_flight) return;
     if (len < 8 + 240) return;                       /* UDP hdr + BOOTP fixed */
 
@@ -215,8 +272,7 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
     if (p->magic != DHCP_MAGIC_BE) return;
     if (p->xid   != g_xact.xid) return;              /* not for us */
 
-    /* MAC mirror check: server should echo our MAC in chaddr. */
-    if (memcmp(p->chaddr, g_my_mac, ETH_ADDR_LEN) != 0) return;
+    if (!dhcp_chaddr_ok(p)) return;
 
     /* Parse the options blob. opts_len is up to whatever followed the
      * 240-byte fixed header in this datagram (capped at our struct). */
@@ -224,19 +280,29 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
     if (opt_avail > DHCP_OPTIONS_LEN) opt_avail = DHCP_OPTIONS_LEN;
 
     uint8_t mt_len = 0;
-    const uint8_t *mt = opt_find(p->options, opt_avail,
-                                 DHCP_OPT_MSG_TYPE, &mt_len);
-    if (!mt || mt_len != 1) return;
+    const uint8_t *mt =
+        dhcp_opt_find(p, opt_avail, DHCP_OPT_MSG_TYPE, &mt_len);
+    if (!mt || mt_len < 1) return;
 
-    if (*mt == DHCP_MSG_OFFER) {
+    if (mt[0] == DHCP_MSG_OFFER) {
         /* Capture yiaddr + server-id + the lease parameters now (so a
          * later ACK only needs to confirm). */
         uint8_t l;
-        const uint8_t *sid = opt_find(p->options, opt_avail,
-                                      DHCP_OPT_SERVER_ID, &l);
-        if (!sid || l != 4) return;
+        const uint8_t *sid =
+            dhcp_opt_find(p, opt_avail, DHCP_OPT_SERVER_ID, &l);
+        uint32_t server_be = 0;
+        if (sid && l >= 4) {
+            server_be = opt_u32_be(sid);
+        } else if (src_ip_be != 0) {
+            /* RFC 2131 expects option 54; some CPEs omit it on broadcast
+             * OFFERs. The UDP source address is the same server in the
+             * common no-relay case. */
+            server_be = src_ip_be;
+        } else {
+            return;
+        }
         g_xact.offered_ip_be = p->yiaddr;
-        g_xact.server_id_be  = opt_u32_be(sid);
+        g_xact.server_id_be  = server_be;
         g_xact.saw_offer     = true;
 
         char yb[16], sb[16];
@@ -272,13 +338,13 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
 
         uint8_t l;
         const uint8_t *v;
-        if ((v = opt_find(p->options, opt_avail, DHCP_OPT_SUBNET, &l)) && l == 4)
+        if ((v = dhcp_opt_find(p, opt_avail, DHCP_OPT_SUBNET, &l)) && l == 4)
             L->netmask_be = opt_u32_be(v);
-        if ((v = opt_find(p->options, opt_avail, DHCP_OPT_ROUTER, &l)) && l >= 4)
+        if ((v = dhcp_opt_find(p, opt_avail, DHCP_OPT_ROUTER, &l)) && l >= 4)
             L->gateway_be = opt_u32_be(v);
-        if ((v = opt_find(p->options, opt_avail, DHCP_OPT_DNS, &l)) && l >= 4)
+        if ((v = dhcp_opt_find(p, opt_avail, DHCP_OPT_DNS, &l)) && l >= 4)
             L->dns_be = opt_u32_be(v);   /* keep first DNS server */
-        if ((v = opt_find(p->options, opt_avail, DHCP_OPT_LEASE_TIME, &l)) && l == 4)
+        if ((v = dhcp_opt_find(p, opt_avail, DHCP_OPT_LEASE_TIME, &l)) && l == 4)
             L->lease_secs = opt_u32_host(v);
 
         char ib[16], mb[16], gb[16], db[16], sb[16];
@@ -342,23 +408,39 @@ bool dhcp_acquire(uint32_t timeout_ms, struct dhcp_lease *out) {
     g_xact.in_flight = true;
 
     uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
-    uint64_t end_total = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
+    uint64_t t0        = pit_ticks();
+    uint64_t end_total = t0 + ((uint64_t)hz * (uint64_t)timeout_ms) / 1000u;
 
-    /* ---- step 1: DISCOVER ---- */
-    if (!dhcp_send_discover(g_xact.xid)) {
-        kprintf("[dhcp] DISCOVER send failed (NIC tx error)\n");
-        g_xact.in_flight = false;
-        return false;
+    /* ---- steps 1–2: DISCOVER (possibly repeated) + wait for OFFER/NAK ---- */
+    uint64_t total_ticks       = end_total - t0;
+    uint64_t offer_phase_ticks = total_ticks * DHCP_OFFER_PHASE_NUM /
+                                 DHCP_OFFER_PHASE_DEN;
+    if (offer_phase_ticks == 0) offer_phase_ticks = 1;
+    uint64_t mid_deadline = t0 + offer_phase_ticks;
+
+    unsigned n_discover = 0;
+    while (pit_ticks() < mid_deadline && !g_xact.saw_offer && !g_xact.saw_nak) {
+        n_discover++;
+        if (!dhcp_send_discover(g_xact.xid)) {
+            kprintf("[dhcp] DISCOVER send failed (NIC tx error)\n");
+            g_xact.in_flight = false;
+            return false;
+        }
+
+        uint64_t chunk_end =
+            pit_ticks() + ((uint64_t)hz * (uint64_t)DHCP_DISCOVER_GAP_MS) / 1000u;
+        if (chunk_end > mid_deadline) chunk_end = mid_deadline;
+        if (chunk_end <= pit_ticks()) chunk_end = pit_ticks() + 1;
+
+        (void)dhcp_wait(chunk_end, &g_xact.saw_offer, &g_xact.saw_nak);
     }
 
-    /* ---- step 2: wait for OFFER (or NAK) ---- *
-     *
-     * Half the budget for the OFFER, the rest for the ACK. SLIRP and
-     * dnsmasq both reply within a few ms; this is generous. */
-    uint64_t mid_deadline = pit_ticks() + (end_total - pit_ticks()) / 2;
-    if (!dhcp_wait(mid_deadline, &g_xact.saw_offer, &g_xact.saw_nak)) {
-        kprintf("[dhcp] timeout waiting for OFFER (after %u ms)\n",
-                (unsigned)timeout_ms / 2);
+    if (!g_xact.saw_offer && !g_xact.saw_nak) {
+        uint32_t offer_ms =
+            (uint32_t)((uint64_t)timeout_ms * DHCP_OFFER_PHASE_NUM /
+                       DHCP_OFFER_PHASE_DEN);
+        kprintf("[dhcp] timeout waiting for OFFER (%u DISCOVER, %u ms offer phase)\n",
+                n_discover, (unsigned)offer_ms);
         g_xact.in_flight = false;
         return false;
     }

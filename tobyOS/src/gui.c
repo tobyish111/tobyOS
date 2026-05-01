@@ -58,6 +58,7 @@
 #include <tobyos/notify.h>
 #include <tobyos/net.h>
 #include <tobyos/audio_hda.h>
+#include <tobyos/bootlog.h>
 #include <stdarg.h>
 
 /* ---- internal window struct ---------------------------------------- */
@@ -1927,6 +1928,26 @@ void gui_tick(void) {
     /* Process-spawn / reap operations need pid 0's address space. */
     struct proc *cur = current_proc();
     bool on_pid0 = (cur && cur->pid == 0);
+
+    /* Deferred BOOTLOG.TXT + UDP boot log: MSC on the live USB may
+     * enumerate only after the idle loop has polled USB for a few
+     * frames; the flush at end-of-kmain can miss. Wait ~30 ticks
+     * (~300 ms at 100 Hz) after desktop_mode so xHCI/MSC settles and
+     * ARP to the log collector (192.168.68.74) is reliable. */
+    if (on_pid0 && g.desktop_mode) {
+        static uint8_t s_bootlog_usb_retry_wait;
+        static bool s_bootlog_usb_retry_done;
+        if (!s_bootlog_usb_retry_done) {
+            if (s_bootlog_usb_retry_wait < 30) {
+                s_bootlog_usb_retry_wait++;
+            } else {
+                s_bootlog_usb_retry_done = true;
+                bootlog_net_upload();
+                bootlog_flush_usb_retry();
+            }
+        }
+    }
+
     if (on_pid0) {
         if (g.launch_tail != g.launch_head) drain_launch_queue();
         reap_tracked();

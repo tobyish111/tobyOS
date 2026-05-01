@@ -12,6 +12,7 @@
 
 #include <tobyos/udp.h>
 #include <tobyos/ip.h>
+#include <tobyos/heap.h>
 #include <tobyos/socket.h>
 #include <tobyos/dhcp.h>
 #include <tobyos/dns.h>
@@ -20,26 +21,33 @@
 
 bool udp_send(uint16_t src_port_be, uint32_t dst_ip_be, uint16_t dst_port_be,
               const void *payload, size_t payload_len) {
-    if (payload_len + UDP_HDR_LEN + IP_HDR_LEN > ETH_MTU) return false;
+    if (payload_len > 65535u - UDP_HDR_LEN - IP_HDR_LEN) return false;
 
-    uint8_t buf[ETH_MTU];
+    size_t   udp_len = UDP_HDR_LEN + payload_len;
+    uint8_t  sbuf[ETH_MTU];
+    uint8_t *buf     = sbuf;
+    bool      heap   = false;
+
+    if (udp_len > ETH_MTU) {
+        buf = kmalloc(udp_len);
+        if (!buf) return false;
+        heap = true;
+    }
+
     struct udp_hdr *h = (struct udp_hdr *)buf;
     h->src_port = src_port_be;
     h->dst_port = dst_port_be;
-    h->length   = htons((uint16_t)(UDP_HDR_LEN + payload_len));
+    h->length   = htons((uint16_t)udp_len);
     h->checksum = 0;
 
     if (payload_len) memcpy(buf + UDP_HDR_LEN, payload, payload_len);
 
-    h->checksum = net_udp_checksum(g_my_ip, dst_ip_be,
-                                   buf, UDP_HDR_LEN + payload_len);
-    /* RFC 768: a wire checksum of 0 means "no checksum"; the
-     * one's-complement representation 0xFFFF stands in for "actual
-     * checksum was 0". Verification doesn't (and mustn't) apply this
-     * rewrite -- see comment in net_udp_checksum(). */
+    h->checksum = net_udp_checksum(g_my_ip, dst_ip_be, buf, udp_len);
     if (h->checksum == 0) h->checksum = htons(0xFFFF);
 
-    return ip_send(dst_ip_be, IP_PROTO_UDP, buf, UDP_HDR_LEN + payload_len);
+    bool ok = ip_send(dst_ip_be, IP_PROTO_UDP, buf, udp_len);
+    if (heap) kfree(buf);
+    return ok;
 }
 
 void udp_recv(uint32_t src_ip_be, const void *udp_packet, size_t len) {

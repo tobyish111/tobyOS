@@ -1,8 +1,10 @@
 /* usb_hid.c -- USB HID Boot Protocol class driver.
  *
  * Sits behind xhci.c. Handles two device kinds at the per-interface
- * level: bInterfaceClass=3 (HID), bInterfaceSubClass=1 (Boot), with
- * bInterfaceProtocol = 1 (keyboard) or 2 (mouse). Translated key
+ * level: bInterfaceClass=3 (HID), bInterfaceSubClass=1 (Boot) or
+ * 0 (No Subclass — common on real PCs), with bInterfaceProtocol = 1
+ * (keyboard) or 2 (mouse), or protocol 0 with a boot-sized interrupt
+ * MPS guess (see usb_hid_probe). Translated key
  * presses + mouse deltas land in the same dispatch sinks as the
  * PS/2 path so the GUI / shell / SIGINT routing has exactly one
  * implementation regardless of input source.
@@ -18,6 +20,12 @@
  *     interrupt-IN endpoint.
  *   - mouse Z (wheel) byte parsed for completeness but not forwarded
  *     (mouse.h has no wheel concept yet).
+ *
+ *   - Many real USB mice send a leading Report ID byte before the
+ *     boot-style [Buttons][X][Y] fields (especially when SET_PROTOCOL
+ *     stays in report mode or the device always prefixes). Without
+ *     handling that, byte0 is mis-read as "buttons" and horizontal
+ *     motion lands in dy — we auto-learn RID vs no-RID from traffic.
  */
 
 #include <tobyos/usb_hid.h>
@@ -64,7 +72,13 @@ struct hid_dev_state {
     int8_t    last_dx;                /* mouse: last raw dx (signed) */
     int8_t    last_dy;                /* mouse: last raw dy (signed) */
     uint64_t  last_seen_ms;           /* perf_now_ns()/1e6 at last frame */
+    /* Mouse only: interrupt report layout (0 = unknown, learn on wire). */
+    uint8_t   mouse_parse;          /* HID_MOUSE_PARSE_* */
 };
+
+#define HID_MOUSE_PARSE_UNKNOWN 0u
+#define HID_MOUSE_PARSE_NORID   1u /* [Buttons][X][Y]([wheel]...) */
+#define HID_MOUSE_PARSE_RID     2u /* [ReportID][Buttons][X][Y]... */
 
 static struct hid_dev_state g_hid[USB_HID_MAX_DEVICES];
 
@@ -264,7 +278,7 @@ static void hid_kbd_handle(struct hid_dev_state *st,
 /* Boot mouse report                                               */
 /* ============================================================== */
 
-/* USB HID Boot Mouse:
+/* USB HID Boot Mouse (no leading Report ID):
  *   byte 0: buttons (bit 0=L, 1=R, 2=M) -- exact same bit layout
  *           as MOUSE_BTN_* used by mouse.c, so we can pass through.
  *   byte 1: int8_t  signed X delta (positive = right)
@@ -273,13 +287,61 @@ static void hid_kbd_handle(struct hid_dev_state *st,
  *                                                       no extra negation
  *                                                       needed.
  *   byte 3: int8_t  signed wheel delta (optional)
+ *
+ * With a leading Report ID (common on PCH xHCI + OEM mice):
+ *   byte 0: report ID, byte 1: buttons, byte 2: X, byte 3: Y, ...
  */
+static void hid_mouse_learn_layout(struct hid_dev_state *st,
+                                   const uint8_t *report, uint32_t len) {
+    if (st->mouse_parse != HID_MOUSE_PARSE_UNKNOWN || len < 4) return;
+
+    /* Leading byte zero => first field is the button byte (QEMU and
+     * many 3- and 4-byte boot reports without report ID). */
+    if (report[0] == 0u) {
+        st->mouse_parse = HID_MOUSE_PARSE_NORID;
+        return;
+    }
+
+    /* High bits set on byte0 => cannot be a 3-button bitmap alone. */
+    if ((report[0] & 0xF8u) != 0u) {
+        st->mouse_parse = HID_MOUSE_PARSE_RID;
+        kprintf("[usb-hid] mouse slot=%u: using Report-ID prefix "
+                "(lead=0x%02x)\n",
+                (unsigned)st->slot_id, (unsigned)report[0]);
+        return;
+    }
+
+    /* Heuristic: [RID][0][X][Y] with motion in bytes 2/3 and a plausible
+     * "buttons only" byte1 — classic parse would stuff X into dy. */
+    if ((report[0] & 0xF8u) == 0u && (report[1] & 0xF8u) == 0u &&
+        report[1] == 0u &&
+        (report[2] != 0u || report[3] != 0u)) {
+        st->mouse_parse = HID_MOUSE_PARSE_RID;
+        kprintf("[usb-hid] mouse slot=%u: detected Report-ID-style layout "
+                "(rid=0x%02x)\n",
+                (unsigned)st->slot_id, (unsigned)report[0]);
+    }
+}
+
 static void hid_mouse_handle(struct hid_dev_state *st,
                              const uint8_t *report, uint32_t len) {
     if (len < 3) return;
-    uint8_t buttons = report[0] & 0x07u;
-    int dx = (int8_t)report[1];
-    int dy = (int8_t)report[2];
+
+    hid_mouse_learn_layout(st, report, len);
+
+    uint8_t buttons;
+    int     dx, dy;
+
+    if (st->mouse_parse == HID_MOUSE_PARSE_RID && len >= 4) {
+        buttons = report[1] & 0x07u;
+        dx        = (int8_t)report[2];
+        dy        = (int8_t)report[3];
+    } else {
+        /* UNKNOWN, NORID, or short report: classic boot layout. */
+        buttons = report[0] & 0x07u;
+        dx        = (int8_t)report[1];
+        dy        = (int8_t)report[2];
+    }
 
     /* Count low-to-high transitions on any of the 3 buttons. */
     uint8_t newly = (uint8_t)(buttons & ~st->last_buttons);
@@ -288,8 +350,8 @@ static void hid_mouse_handle(struct hid_dev_state *st,
     if (newly & MOUSE_BTN_MIDDLE) st->mouse_btn_press_total++;
 
     st->last_buttons = buttons;
-    st->last_dx      = (int8_t)report[1];
-    st->last_dy      = (int8_t)report[2];
+    st->last_dx      = (int8_t)dx;
+    st->last_dy      = (int8_t)dy;
     /* Saturate at 1<<32 -- never going to overflow within a session,
      * but the cast back to uint64_t happily wraps so we accumulate as
      * unsigned and just cast on read. */
@@ -365,13 +427,40 @@ static void hid_on_report(struct usb_device *dev,
 bool usb_hid_probe(struct usb_device *dev,
                    const struct usb_iface_desc *iface,
                    const struct usb_endpoint_desc *ep) {
-    /* Boot subclass only (subclass 0 = "no subclass"; not Boot). */
-    if (iface->bInterfaceClass    != USB_CLASS_HID)        return false;
-    if (iface->bInterfaceSubClass != 1)                     return false;
-    if (iface->bInterfaceProtocol != USB_HID_PROTO_KEYBOARD &&
-        iface->bInterfaceProtocol != USB_HID_PROTO_MOUSE)  return false;
+    if (iface->bInterfaceClass != USB_CLASS_HID) return false;
+    /* Boot (1) or No Subclass (0). Subclass 0 is the common "BIOS HID"
+     * shape on laptops and many USB hubs; we still drive them through
+     * SET_PROTOCOL(BOOT) + the same parsers when the device agrees. */
+    if (iface->bInterfaceSubClass != 0 && iface->bInterfaceSubClass != 1) {
+        return false;
+    }
     if (USB_EP_TYPE(ep->bmAttributes) != USB_EP_INTERRUPT) return false;
     if (!USB_EP_DIR_IN(ep->bEndpointAddress))              return false;
+
+    uint16_t ep_mps = ep->wMaxPacketSize & 0x07FFu;
+    if (ep_mps == 0 || ep_mps > HID_REPORT_BUF) return false;
+
+    bool     is_keyboard;
+    uint8_t  proto = iface->bInterfaceProtocol;
+
+    if (proto == USB_HID_PROTO_KEYBOARD) {
+        is_keyboard = true;
+    } else if (proto == USB_HID_PROTO_MOUSE) {
+        is_keyboard = false;
+    } else if (iface->bInterfaceSubClass == 0 && proto == 0) {
+        /* No protocol bits: infer basic boot-sized interrupt IN.
+         * 8 B is the boot keyboard report; 3–7 B covers typical mice
+         * (some advertise 8 B too — those usually declare proto=mouse). */
+        if (ep_mps == 8u) {
+            is_keyboard = true;
+        } else if (ep_mps >= 3u && ep_mps <= 7u) {
+            is_keyboard = false;
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    }
 
     /* Find a free per-device slot in our small pool. */
     struct hid_dev_state *st = 0;
@@ -386,7 +475,7 @@ bool usb_hid_probe(struct usb_device *dev,
 
     memset(st, 0, sizeof(*st));
     st->in_use      = true;
-    st->is_keyboard = (iface->bInterfaceProtocol == USB_HID_PROTO_KEYBOARD);
+    st->is_keyboard = is_keyboard;
     st->iface_num   = iface->bInterfaceNumber;
     st->ep_addr     = ep->bEndpointAddress;
     st->slot_id     = dev->slot_id;
@@ -398,10 +487,9 @@ bool usb_hid_probe(struct usb_device *dev,
      * change (matches PS/2 IRQ semantics: every event is meaningful). */
     if (!hid_set_protocol(dev, iface->bInterfaceNumber, USB_HID_PROTO_BOOT)) {
         /* Some device firmwares (Logitech Unifying receivers in
-         * particular) silently STALL SET_PROTOCOL because they only
-         * support Boot. Treat a STALL as "already in Boot" -- we
-         * proceed; a malformed report would show up later anyway
-         * and we'd just log it. */
+         * particular) STALL SET_PROTOCOL when they stay in report mode
+         * or do not implement the request. Treat a STALL as "keep going"
+         * -- we proceed; a malformed report shows up later anyway. */
         kprintf("[usb-hid] WARN: SET_PROTOCOL(BOOT) refused on iface %u "
                 "-- proceeding under assumption device is already Boot\n",
                 iface->bInterfaceNumber);
@@ -429,10 +517,14 @@ bool usb_hid_probe(struct usb_device *dev,
     dev->hid_state     = st;
     dev->int_armed     = false;
 
-    kprintf("[usb-hid] %s on slot %u iface %u ep 0x%02x mps %u  (port %u)\n",
+    kprintf("[usb-hid] %s on slot %u iface %u ep 0x%02x mps %u  (port %u)"
+            "%s%s\n",
             st->is_keyboard ? "boot keyboard" : "boot mouse",
             dev->slot_id, iface->bInterfaceNumber,
-            ep->bEndpointAddress, st->mps, dev->port_id);
+            ep->bEndpointAddress, st->mps, dev->port_id,
+            iface->bInterfaceSubClass == 0 ? " sub=0" : "",
+            (iface->bInterfaceSubClass == 0 && proto == 0)
+                ? " (proto0 MPS guess)" : "");
     return true;
 }
 

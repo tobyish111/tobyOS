@@ -10,10 +10,13 @@
  *     handful of 82577/82579/I217/I218/I219 device IDs that share
  *     the same legacy descriptor + register layout for basic
  *     polled-mode RX/TX -- they are the most common e1000e variants
- *     soldered onto Intel motherboards from ~2009 onwards. The list
- *     is conservative: any chip that requires non-trivial PHY
- *     handshakes for link-up (most I219 revisions) we deliberately
- *     leave out until tested on real silicon.
+ *     soldered onto Intel motherboards from ~2009 onwards.
+ *
+ *     Skylake / 100-series PCH laptops and desktops typically expose
+ *     I219-LM (156F) or I219-V (1570); Kaby / 200-series often use
+ *     15B7/15B8. Compact OEM systems (e.g. HP 260 G2 mini) may instead
+ *     ship a Realtek 8168/8161 NIC — that path is rtl8169.c, not here.
+ *     Same BAR + ring model as earlier PCH parts for the Intel IDs below.
  *
  *   - 82574L re-arms interrupts via IAM (interrupt auto-mask) in
  *     addition to IMS/IMC. We poll, so we explicitly clear IAM
@@ -286,12 +289,14 @@ static bool e1000e_tx_op(struct net_dev *dev, const void *frame, size_t len) {
     g_tx_ring[i].status = 0;
 
     g_tx_tail = (uint16_t)((i + 1) % TX_DESC_COUNT);
+    __asm__ volatile ("" ::: "memory");
     mmio_write32(E1000E_TDT, g_tx_tail);
     return true;
 }
 
 static void e1000e_rx_drain_op(struct net_dev *dev) {
     (void)dev;
+    uint64_t irqf = cpu_irqsave();
     for (;;) {
         uint16_t i = (uint16_t)((g_rx_tail + 1) % RX_DESC_COUNT);
         if (!(g_rx_ring[i].status & RXD_STAT_DD)) break;
@@ -303,6 +308,7 @@ static void e1000e_rx_drain_op(struct net_dev *dev) {
         g_rx_tail = i;
         mmio_write32(E1000E_RDT, g_rx_tail);
     }
+    cpu_irqrestore(irqf);
 }
 
 /* MSI / MSI-X handler. ICR is read-to-clear on the 82574L (same as
@@ -452,6 +458,87 @@ static const struct pci_match g_e1000e_matches[] = {
      * 8254x init recipe for basic operation. */
     { 0x8086, 0x153A, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
     { 0x8086, 0x153B, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+
+    /* I218-V / I218-LM (Wildcat Point / 9-series PCH, ~2014). */
+    { 0x8086, 0x1559, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x155A, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+
+    /* I219-LM / I219-V (Sunrise Point / 100-series Skylake PCH). */
+    { 0x8086, 0x156F, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x1570, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+
+    /* I219-LM / I219-V (Union Point / 200-series Kaby Lake PCH). */
+    { 0x8086, 0x15B7, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15B8, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    /* Lewisburg / Xeon PCH onboard (same MAC core as SPT I219). */
+    { 0x8086, 0x15B9, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+
+    /* I218-LM / I218-V second and third generations (Haswell refresh
+     * through Skylake client PCH). Linux e1000e uses the same driver. */
+    { 0x8086, 0x15A0, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15A1, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15A2, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15A3, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+
+    /* I219 fourth/fifth gen (300-series / Cannon Lake PCH). */
+    { 0x8086, 0x15D7, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15D8, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15E3, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15D6, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+
+    /* 400-series / Comet Lake PCH (CNP + ICP). */
+    { 0x8086, 0x15BD, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15BE, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15BB, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15BC, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15DF, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15E0, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15E1, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15E2, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+
+    /* Tiger Lake / Rocket Lake / Alder Lake / Raptor Lake PCH (TGP/ADP/RPL). */
+    { 0x8086, 0x15FB, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15FC, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15F9, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15FA, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15F4, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x15F5, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x1A1E, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x1A1F, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x1A1C, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x1A1D, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x0DC5, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x0DC6, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x0DC7, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x0DC8, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+
+    /* Mobile / low-power PCH (CMP through NVL) — IDs from Linux e1000e/hw.h. */
+    { 0x8086, 0x0D4E, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x0D4F, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x0D4C, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x0D4D, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x0D53, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x0D55, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x550A, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x550B, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x550C, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x550D, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x550E, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x550F, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x5510, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x5511, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x57A0, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x57A1, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x57B3, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x57B4, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x57B7, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x57B8, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x57B9, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x57BA, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+
+    /* Extra PCIe gigabit parts Linux binds to e1000e (82574 variant). */
+    { 0x8086, 0x10F6, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+    { 0x8086, 0x150C, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
 
     PCI_MATCH_END,
 };

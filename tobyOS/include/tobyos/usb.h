@@ -138,7 +138,10 @@ _Static_assert(sizeof(struct usb_endpoint_desc) == 7, "endpoint desc must be 7 B
 #define USB_CLASS_HUB            0x09     /* M26B: USB hub class */
 #define USB_CLASS_MASS_STORAGE   0x08
 
-/* HID interface protocols (when bInterfaceSubClass == 1, "boot"). */
+/* HID interface protocols (USB IF: boot subclass uses 1=kbd / 2=mouse;
+ * many real devices use bInterfaceSubClass==0 with the same protocol
+ * codes, or protocol==0 with no separate declaration — usb_hid.c has
+ * a small MPS-based fallback for the latter.) */
 #define USB_HID_PROTO_KEYBOARD   0x01
 #define USB_HID_PROTO_MOUSE      0x02
 

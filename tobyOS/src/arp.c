@@ -77,6 +77,23 @@ void arp_request(uint32_t ip_be) {
     eth_send(g_eth_broadcast, ETH_TYPE_ARP, &p, sizeof(p));
 }
 
+void arp_gratuitous(void) {
+    if (g_my_ip == 0) return;
+    /* ARP REQUEST with spa = tpa = our IP — standard gratuitous probe;
+     * peers cache (sender_mac, sender_ip) from the frame. */
+    struct arp_pkt p;
+    p.hw_type    = htons(ARP_HW_ETHERNET);
+    p.proto_type = htons(ETH_TYPE_IPV4);
+    p.hw_len     = ETH_ADDR_LEN;
+    p.proto_len  = 4;
+    p.opcode     = htons(ARP_OP_REQUEST);
+    memcpy(p.sender_mac, g_my_mac, ETH_ADDR_LEN);
+    p.sender_ip  = g_my_ip;
+    memset(p.target_mac, 0, ETH_ADDR_LEN);
+    p.target_ip  = g_my_ip;
+    eth_send(g_eth_broadcast, ETH_TYPE_ARP, &p, sizeof(p));
+}
+
 static void arp_send_reply(const uint8_t dst_mac[ETH_ADDR_LEN],
                            uint32_t      dst_ip_be) {
     struct arp_pkt p;

@@ -1,10 +1,10 @@
 /* net.h -- shared types + helpers for the milestone-9 network stack.
  *
- * Static configuration:
- *   guest IP   = 10.0.2.15
- *   netmask    = 255.255.255.0
- *   gateway    = 10.0.2.2     (QEMU SLIRP host)
- *   guest MAC  = read from the e1000 (QEMU defaults to 52:54:00:12:34:56)
+ * After DHCP failure, net_init() applies a static fallback (see net.c):
+ *   default: 192.168.68.10 / 255.255.252.0, gateway + DNS 192.168.68.1
+ *   with -DTOBY_NET_FALLBACK_SLIRP: QEMU user-net 10.0.2.15 / 10.0.2.2 / 10.0.2.3
+ *
+ * guest MAC is read from the NIC at net_init().
  *
  * Byte order: the wire is big-endian. We keep IP addresses and ports
  * in network byte order in every kernel struct that mirrors the wire,
@@ -33,9 +33,8 @@
  * Initial values (Milestone 24A onward):
  *   - At net_init() entry, all four are zero.
  *   - DHCP populates them from the lease.
- *   - If DHCP fails, net_init() falls back to QEMU SLIRP defaults
- *     (10.0.2.15 / 255.255.255.0 / 10.0.2.2 / 10.0.2.3) so the kernel
- *     still boots offline. */
+ *   - If DHCP fails, net_init() falls back to static 192.168.68.10/22
+ *     (gw/dns .68.1), or SLIRP defaults when built with TOBY_NET_FALLBACK_SLIRP. */
 extern uint8_t  g_my_mac[ETH_ADDR_LEN];   /* learned from the NIC at init */
 extern uint32_t g_my_ip;
 extern uint32_t g_my_netmask;
@@ -152,5 +151,9 @@ void net_poll(void);
 /* Did net_init() succeed? Kept so syscall stubs can reject cleanly
  * with -ENONET on systems where the e1000 wasn't present. */
 bool net_is_up(void);
+
+/* True if net_init()'s DHCP handshake succeeded (IPv4 from lease, not the
+ * static fallback). Unchanged by later net_dhcp_renew(); for bootlog only. */
+bool net_boot_used_dhcp(void);
 
 #endif /* TOBYOS_NET_H */

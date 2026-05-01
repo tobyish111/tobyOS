@@ -50,6 +50,11 @@ void arp_request(uint32_t ip_be);
  * cache, and replies if the request targets our own IP. */
 void arp_recv(const void *payload, size_t len);
 
+/* Broadcast one gratuitous ARP (RFC 5227 style) so peers learn our
+ * (MAC, IP) without waiting for their own ARP request. Call after
+ * g_my_ip is set (DHCP or static). */
+void arp_gratuitous(void);
+
 /* Diagnostic dump for the `arp` shell builtin. */
 void arp_dump(void);
 

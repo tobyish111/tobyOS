@@ -12,9 +12,9 @@
  *   3. net_init() picks net_default() and copies its MAC into
  *      g_my_mac, then brings up ARP + sockets.
  *
- * The eth/arp/ip/udp stack only ever talks to net_default(); it has
- * no idea whether it's an Intel 82540EM, an 82574L, an RTL8169, or a
- * virtio-net device underneath.
+ * Link layer is IEEE 802.3 Ethernet only (wired NICs).  The
+ * eth/arp/ip/udp/tcp stack only talks to net_default(); the L2
+ * driver may be e1000, e1000e, rtl8169, virtio-net, etc.
  *
  * Helpers:
  *   - net_checksum  : 16-bit one's-complement Internet checksum.
@@ -47,7 +47,13 @@ const uint8_t g_eth_zero[ETH_ADDR_LEN] = { 0 };
 
 static bool g_net_up;
 
+/* Set once in net_init(): true iff the running IPv4 config came from DHCP
+ * (not static fallback). Used by bootlog UDP upload targeting. */
+static bool g_net_boot_via_dhcp;
+
 bool net_is_up(void) { return g_net_up; }
+
+bool net_boot_used_dhcp(void) { return g_net_boot_via_dhcp; }
 
 /* ---- net_dev registry ------------------------------------------- */
 
@@ -91,17 +97,24 @@ void net_dump(void) {
 
 /* ---- init ------------------------------------------------------- */
 
-/* Pre-warm one ARP entry by firing a request and draining RX for
- * ~500 ms while watching the cache. Used for the gateway AND for the
- * DNS server (which on QEMU SLIRP is on our local subnet, so the first
- * UDP query would otherwise hit an ARP-miss on send and silently drop
- * the packet). */
+/* Pre-warm one ARP entry by firing a request and draining RX for a short
+ * window while watching the cache. Used for the gateway AND for the DNS
+ * server when it differs from the gateway (SLIRP: same subnet, first UDP
+ * would otherwise ARP-miss and drop). */
+#ifndef FAST_BOOT
+#define NET_ARP_WARM_MS 220u
+#else
+#define NET_ARP_WARM_MS 120u
+#endif
+
 static void net_warm_arp(struct net_dev *nd, uint32_t ip_be, const char *what) {
     if (!ip_be) return;
     arp_request(ip_be);
     uint32_t hz = pit_hz();
     if (hz == 0) hz = 100;
-    uint64_t deadline = pit_ticks() + (hz / 2);
+    uint64_t warm_ticks = ((uint64_t)hz * (uint64_t)NET_ARP_WARM_MS) / 1000u;
+    if (warm_ticks < 1) warm_ticks = 1;
+    uint64_t deadline = pit_ticks() + warm_ticks;
     uint8_t scratch[ETH_ADDR_LEN];
     while (pit_ticks() < deadline) {
         if (nd && nd->rx_drain) nd->rx_drain(nd);
@@ -116,19 +129,30 @@ static void net_warm_arp(struct net_dev *nd, uint32_t ip_be, const char *what) {
         net_format_mac(mb, scratch);
         kprintf("[net] %s %s -> %s (cached)\n", what, ipbuf, mb);
     } else {
-        kprintf("[net] WARN: %s %s did not respond to ARP within 500ms\n",
-                what, ipbuf);
+        kprintf("[net] WARN: %s %s did not respond to ARP within %ums\n",
+                what, ipbuf, (unsigned)NET_ARP_WARM_MS);
     }
 }
 
 static void net_warm_gateway_arp(struct net_dev *nd) {
     net_warm_arp(nd, g_gateway_ip, "gateway");
-    /* DNS server is usually on the LAN (e.g. SLIRP's 10.0.2.3) so the
-     * first outbound query needs an ARP entry to avoid losing the
-     * datagram. Cheap to do here -- the gateway warm already paid the
-     * 500 ms timer worst case. */
+    /* Skip when DNS is the same host as the gateway (typical home router). */
     if (g_my_dns_be && g_my_dns_be != g_gateway_ip) {
         net_warm_arp(nd, g_my_dns_be, "dns    ");
+    }
+}
+
+/* Brief pause + RX drain between DHCP attempts (home routers / PHY
+ * sometimes miss the first DISCOVER or answer late). */
+static void net_dhcp_retry_gap(struct net_dev *nd, unsigned ms) {
+    uint32_t hz = pit_hz();
+    if (hz == 0) hz = 100;
+    uint64_t end = pit_ticks() + ((uint64_t)hz * (uint64_t)ms) / 1000u;
+    if (end <= pit_ticks()) end = pit_ticks() + 1;
+    while (pit_ticks() < end) {
+        if (nd && nd->rx_drain) nd->rx_drain(nd);
+        sti();
+        hlt();
     }
 }
 
@@ -149,17 +173,28 @@ static void net_apply_lease(const struct dhcp_lease *L, const char *src) {
             src, ipbuf, mskbuf, gwbuf, dnsbuf);
 }
 
-/* Static fallback used when DHCP times out. Matches QEMU SLIRP default
- * networking so the kernel still works in `-net none` after DHCP fails
- * (e.g. an isolated CI with a fake NIC) -- the gateway ARP just won't
- * resolve and packets will silently drop, which is the correct
- * behaviour rather than a panic. */
+/* Static fallback when DHCP times out.
+ *
+ * Default: 192.168.68.10 / 255.255.252.0 (/22) with gateway + DNS
+ * 192.168.68.1 — matches a typical Deco-style LAN (e.g. desktop at
+ * 192.168.68.74/22, gateway .68.1).
+ *
+ * For QEMU `-netdev user` / SLIRP where you rely on this path, build with
+ *   -DTOBY_NET_FALLBACK_SLIRP
+ * to restore 10.0.2.15 / 10.0.2.2 / 10.0.2.3. */
 static void net_apply_static_fallback(void) {
     struct dhcp_lease s;
+#ifdef TOBY_NET_FALLBACK_SLIRP
     s.ip_be      = ip4(10, 0, 2, 15);
     s.netmask_be = ip4(255, 255, 255, 0);
     s.gateway_be = ip4(10, 0, 2, 2);
     s.dns_be     = ip4(10, 0, 2, 3);
+#else
+    s.ip_be      = ip4(192, 168, 68, 10);
+    s.netmask_be = ip4(255, 255, 252, 0);
+    s.gateway_be = ip4(192, 168, 68, 1);
+    s.dns_be     = ip4(192, 168, 68, 1);
+#endif
     s.server_be  = 0;
     s.lease_secs = 0;
     net_apply_lease(&s, "static-fallback");
@@ -194,13 +229,32 @@ bool net_init(void) {
     g_my_dns_be  = 0;
     g_net_up     = true;          /* mark up so udp_send / arp_send work */
 
-    /* Try DHCP. ~3-second budget is plenty for QEMU's in-process server
-     * (replies in <1 ms) without making boot feel sluggish on metal. */
+    /* Try DHCP. Budget is several seconds; dhcp.c spends ~65% on
+     * DISCOVER/OFFER (retransmit every 300 ms) then REQUEST/ACK to the
+     * same deadline. */
+#ifdef FAST_BOOT
+    /* Some home routers answer DHCP slowly on cold boot. */
+    enum { dhcp_boot_budget_ms = 5000 };
+#else
+    enum { dhcp_boot_budget_ms = 6000 };
+#endif
     struct dhcp_lease lease;
-    if (dhcp_acquire(3000, &lease)) {
+    bool dhcp_ok = dhcp_acquire(dhcp_boot_budget_ms, &lease);
+    if (!dhcp_ok) {
+        kprintf("[net] DHCP attempt 1 failed — retrying after short gap\n");
+        net_dhcp_retry_gap(nd, 250);
+        dhcp_ok = dhcp_acquire(dhcp_boot_budget_ms, &lease);
+    }
+    if (dhcp_ok) {
+        g_net_boot_via_dhcp = true;
         net_apply_lease(&lease, "DHCP");
     } else {
-        kprintf("[net] DHCP failed -- using static QEMU SLIRP defaults\n");
+        g_net_boot_via_dhcp = false;
+#ifdef TOBY_NET_FALLBACK_SLIRP
+        kprintf("[net] DHCP failed (2 attempts) -- using static SLIRP fallback (10.0.2.15/24)\n");
+#else
+        kprintf("[net] DHCP failed (2 attempts) -- using static fallback 192.168.68.10/22 (gw/dns .68.1)\n");
+#endif
         net_apply_static_fallback();
     }
 
@@ -209,6 +263,10 @@ bool net_init(void) {
     net_format_ip(gwbuf, g_gateway_ip);
     kprintf("[net] up: nic=%s ip=%s gw=%s mac=%s\n",
             nd->name ? nd->name : "?", ipbuf, gwbuf, macbuf);
+
+    /* Help LAN peers (and our own ARP path) learn this MAC for our IP
+     * before they must ARP-request us — improves first ping / first UDP. */
+    arp_gratuitous();
 
     net_warm_gateway_arp(nd);
     return true;
@@ -228,7 +286,7 @@ bool net_dhcp_renew(void) {
     g_my_ip = 0; g_my_netmask = 0; g_gateway_ip = 0; g_my_dns_be = 0;
 
     struct dhcp_lease lease;
-    if (!dhcp_acquire(3000, &lease)) {
+    if (!dhcp_acquire(5000, &lease)) {
         kprintf("[net] dhcp renew: failed -- restoring previous lease\n");
         g_my_ip = prev_ip; g_my_netmask = prev_msk;
         g_gateway_ip = prev_gw; g_my_dns_be = prev_dns;

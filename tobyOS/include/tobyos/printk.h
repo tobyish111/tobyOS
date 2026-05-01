@@ -19,6 +19,11 @@
  *
  * Width + zero-padding is supported between '%' and the conversion, e.g.
  *   "%08x" -> hex padded to 8 cols with leading zeros.
+ *
+ * Every kprintf()/kvprintf() and kputs() line is prefixed with
+ *   [NNNNNN ms]   monotonic milliseconds since the PIT IRQ (pit_init).
+ * Before pit_init(), the prefix is   [------]   (timer not running yet).
+ * kputc() is not prefixed (would flood on character-at-a-time output).
  */
 
 #ifndef TOBYOS_PRINTK_H

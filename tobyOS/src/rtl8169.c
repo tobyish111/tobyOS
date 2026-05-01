@@ -27,7 +27,8 @@
  *     fresh boot, which is good enough to get an IP).
  *   - Hardware checksum / TSO / LRO offload (CPCR bits cleared).
  *   - 8125 (2.5 GbE) and 8136 (100M-only RTL8101) -- different MAC
- *     layers, separate drivers.
+ *     layers, separate drivers.  RTL8139 (QEMU -device rtl8139) is
+ *     also a different MAC -- use e1000/virtio-net in QEMU instead.
  *
  * Memory layout: same as e1000 -- one page per descriptor ring (we
  * use 32 entries × 16 bytes = 512 B, fits trivially in a page) and
@@ -315,6 +316,7 @@ static bool rtl_tx_op(struct net_dev *dev, const void *frame, size_t len) {
                    ((uint32_t)len & DESC_LENGTH_MASK);
     if (i == TX_DESC_COUNT - 1) cmd |= DESC_EOR;
     g_tx_ring[i].cmd = cmd;
+    __asm__ volatile ("" ::: "memory"); /* desc + payload visible before doorbell */
 
     g_tx_idx = (uint16_t)((i + 1u) % TX_DESC_COUNT);
 
@@ -326,6 +328,10 @@ static bool rtl_tx_op(struct net_dev *dev, const void *frame, size_t len) {
 
 static void rtl_rx_drain_op(struct net_dev *dev) {
     (void)dev;
+    /* Serialize with rtl_irq_handler(): both walk g_rx_ring / g_rx_idx.
+     * dhcp_wait() and net_poll() call us with IF=1; MSI runs nested
+     * otherwise and corrupts the ring (lost DHCP OFFER/ACK). */
+    uint64_t irqf = cpu_irqsave();
     /* Walk descriptors starting from where the NIC will write next.
      * For each one whose OWN bit is clear (NIC has filled it) take
      * the frame out, hand it to eth_recv, then re-arm the descriptor
@@ -351,6 +357,7 @@ static void rtl_rx_drain_op(struct net_dev *dev) {
 
         g_rx_idx = (uint16_t)((g_rx_idx + 1u) % RX_DESC_COUNT);
     }
+    cpu_irqrestore(irqf);
 }
 
 /* MSI handler. ISR is W1C; we read the latched bits, write them
@@ -444,7 +451,10 @@ static int rtl8169_probe(struct pci_dev *dev) {
 
     /* 6. Configure RX. Accept broadcast, multicast, our own unicast;
      * DMA burst unlimited; no early-receive threshold. */
-    mmio_w32(RTL_RCR, RCR_AB | RCR_AM | RCR_APM | RCR_DMA_UNLIMITED);
+    /* RCR_RXFTH_NONE: do not defer small frames — helps DHCP/ARP on
+     * some 8168 revisions when the FIFO threshold default drops bursts. */
+    mmio_w32(RTL_RCR,
+             RCR_AB | RCR_AM | RCR_APM | RCR_DMA_UNLIMITED | RCR_RXFTH_NONE);
 
     /* 7. RX max packet size. RTL spec § 9.4.20 says values in
      * [64..16383]; we pick a generous 1536 to cover any VLAN-tagged
@@ -548,6 +558,9 @@ static const struct pci_match g_rtl_matches[] = {
      * a strap-pin-based ID switch on certain board layouts. Same
      * silicon, same register map -- we treat them identically. */
     { 0x10EC, 0x8161, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
+
+    /* RTL8167 / 8110SC family — same r8169 programming model as 8168. */
+    { 0x10EC, 0x8167, PCI_ANY_CLASS, PCI_ANY_CLASS, PCI_ANY_CLASS },
 
     PCI_MATCH_END,
 };

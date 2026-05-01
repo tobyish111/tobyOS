@@ -472,6 +472,7 @@ static void vnet_rx_drain_op(struct net_dev *dev) {
     struct vnet_dev   *d = &g_vnet;
     struct vnet_queue *q = &d->rx;
 
+    uint64_t irqf = cpu_irqsave();
     bool reposted = false;
     while (q->used_idx != *q->used_idx_ptr) {
         struct virtq_used_elem elem = q->used_ring[q->used_idx % q->qsize];
@@ -497,6 +498,7 @@ static void vnet_rx_drain_op(struct net_dev *dev) {
         *q->avail_idx_ptr = q->avail_idx;
         *q->notify = q->qid;
     }
+    cpu_irqrestore(irqf);
 }
 
 /* ---- capability walk ------------------------------------------ */

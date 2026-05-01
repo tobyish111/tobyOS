@@ -13,8 +13,10 @@
 #include <tobyos/printk.h>
 #include <tobyos/serial.h>
 #include <tobyos/console.h>
+#include <tobyos/bootlog.h>
 #include <tobyos/klibc.h>
 #include <tobyos/spinlock.h>
+#include <tobyos/pit.h>
 
 /* Optional "mirror" sink: when set, every emitted byte is also handed
  * off to cb(ctx, c). See printk.h for the semantics + caveats. */
@@ -45,6 +47,7 @@ static void emit_char(char c) {
     serial_putc(c);
     if (console_ready()) console_putc(c);
     if (g_sink_cb) g_sink_cb(g_sink_ctx, c);
+    bootlog_char(c);
 }
 
 static void emit_str(const char *s) {
@@ -79,6 +82,20 @@ static void emit_uint(uint64_t v, unsigned base, bool upper,
     if (pad > 0 && !left_align) emit_pad(zero_pad ? '0' : ' ', pad);
     while (n-- > 0) emit_char(buf[n]);
     if (pad > 0 && left_align) emit_pad(' ', pad);  /* left-align: never zero-pad */
+}
+
+/* Monotonic ms since PIT started (IRQ0 ticks); before pit_init(), hz is 0. */
+static void emit_ts_prefix(void) {
+    emit_char('[');
+    uint32_t hz = pit_hz();
+    if (hz == 0) {
+        emit_str("------");
+        emit_str("] ");
+        return;
+    }
+    uint64_t ms = (pit_ticks() * 1000ull) / (uint64_t)hz;
+    emit_uint(ms, 10, false, 0, false, false);
+    emit_str(" ms] ");
 }
 
 static void emit_int(int64_t v, int width, bool zero_pad, bool left_align) {
@@ -179,6 +196,7 @@ static void kvprintf_unlocked(const char *fmt, va_list ap) {
 
 void kvprintf(const char *fmt, va_list ap) {
     uint64_t flags = spin_lock_irqsave(&g_printk_lock);
+    emit_ts_prefix();
     kvprintf_unlocked(fmt, ap);
     spin_unlock_irqrestore(&g_printk_lock, flags);
 }
@@ -192,6 +210,7 @@ void kprintf(const char *fmt, ...) {
 
 void kputs(const char *s) {
     uint64_t flags = spin_lock_irqsave(&g_printk_lock);
+    emit_ts_prefix();
     emit_str(s);
     emit_char('\n');
     spin_unlock_irqrestore(&g_printk_lock, flags);

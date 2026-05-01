@@ -39,6 +39,18 @@ static inline void cli(void) { __asm__ volatile ("cli" ::: "memory"); }
 static inline void sti(void) { __asm__ volatile ("sti" ::: "memory"); }
 static inline void hlt(void) { __asm__ volatile ("hlt" ::: "memory"); }
 
+/* Save RFLAGS (including IF), then cli. Paired with cpu_irqrestore()
+ * so paths that may run with IF=1 (idle poll, DHCP wait) and the NIC
+ * ISR cannot interleave on the same RX ring. */
+static inline uint64_t cpu_irqsave(void) {
+    uint64_t f;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void cpu_irqrestore(uint64_t f) {
+    __asm__ volatile ("push %0; popfq" :: "r"(f) : "memory", "cc");
+}
+
 /* Control-register reads -- needed by the page-fault handler (cr2 = the
  * faulting address; cr3 = current page-table root). */
 
