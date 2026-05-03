@@ -1,5 +1,9 @@
 /* dhcp.h -- DHCPv4 client (RFC 2131 / 2132).
  *
+ * Stack path (Ethernet-only): NIC rx_drain → eth_recv (EtherType IPv4) →
+ * ip_recv (dst filter; see ip.c) → udp_recv (port 68) → dhcp_recv_hook.
+ * DISCOVER/REQUEST use src 0.0.0.0 until net_apply_lease sets g_my_ip.
+ *
  * Tiny one-shot client: at boot we run DISCOVER -> OFFER -> REQUEST -> ACK
  * once and commit the resulting lease into the existing net globals
  * (g_my_ip / g_my_netmask / g_gateway_ip / g_my_dns_be).
@@ -56,6 +60,9 @@ struct __attribute__((packed)) dhcp_pkt {
 
 #define DHCP_PKT_LEN     sizeof(struct dhcp_pkt)
 #define DHCP_OPTIONS_LEN 312u
+
+/* BOOTP fixed header through DHCP magic (236 + 4); must match udp_recv clamp. */
+#define DHCP_BOOTP_MIN_BYTES 240u
 
 #define DHCP_OP_REQUEST  1
 #define DHCP_OP_REPLY    2

@@ -343,10 +343,13 @@ static void rtl_rx_drain_op(struct net_dev *dev) {
 
         uint32_t len = cmd & DESC_LENGTH_MASK;
         if (len > 4 && len <= BUF_SIZE) {
-            /* RTL writes the FCS into the buffer and includes it in
-             * `length`. Strip the trailing 4 bytes before handing
-             * the frame to the stack. */
-            eth_recv(g_rx_bufs[g_rx_idx], len - 4u);
+            /* Descriptor `len` is chip-dependent: many 8168/8111 parts report the
+             * Ethernet frame **without** trailing FCS. Subtracting 4 unconditionally
+             * truncates valid DHCP OFFER/ACK so ip_recv sees total_len > buffer and
+             * drops every reply (DISCOVER loops, Wireshark still looks fine).
+             * IPv4 uses header total_len; trailing FCS bytes in the buffer are
+             * harmless if len is slightly larger than the IP datagram. */
+            eth_recv(g_rx_bufs[g_rx_idx], len);
         }
 
         /* Re-arm: OWN back to NIC, length reset, EOR preserved on

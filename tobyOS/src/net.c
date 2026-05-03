@@ -143,7 +143,8 @@ static void net_warm_gateway_arp(struct net_dev *nd) {
 }
 
 /* Brief pause + RX drain between DHCP attempts (home routers / PHY
- * sometimes miss the first DISCOVER or answer late). */
+ * sometimes miss the first DISCOVER or answer late). Kept short for
+ * boot time — second acquire runs quickly like dhcpcd retry. */
 static void net_dhcp_retry_gap(struct net_dev *nd, unsigned ms) {
     uint32_t hz = pit_hz();
     if (hz == 0) hz = 100;
@@ -213,6 +214,13 @@ bool net_init(void) {
     net_format_mac(macbuf, g_my_mac);
     kprintf("[net] nic=%s mac=%s -- starting up\n",
             nd->name ? nd->name : "?", macbuf);
+    {
+        unsigned z = 0;
+        for (int i = 0; i < ETH_ADDR_LEN; i++) z |= g_my_mac[i];
+        if (z == 0)
+            kprintf("[net] WARN: NIC MAC is all-zero — Ethernet src will not "
+                    "match your real adapter; fix driver / Wireshark filter\n");
+    }
 
     arp_init();
     sock_init();
@@ -220,29 +228,34 @@ bool net_init(void) {
 
     /* g_my_ip stays 0 across the DHCP handshake: ip_send and udp_send
      * stamp the source IP from g_my_ip, which is exactly what BOOTP
-     * wants (src = 0.0.0.0 until step 4). Receiving DHCP frames is
-     * also fine -- ip_recv accepts datagrams addressed to the
-     * 255.255.255.255 broadcast regardless of g_my_ip. */
+     * wants (src = 0.0.0.0 until step 4). ip_recv accepts any IPv4
+     * destination while g_my_ip==0 so yiaddr-unicast OFFER/ACK still
+     * demux; once configured, unicast + 255.255.255.255 + subnet
+     * directed broadcast are accepted (see ip_dst_is_for_us). */
     g_my_ip      = 0;
     g_my_netmask = 0;
     g_gateway_ip = 0;
     g_my_dns_be  = 0;
     g_net_up     = true;          /* mark up so udp_send / arp_send work */
 
-    /* Try DHCP. Budget is several seconds; dhcp.c spends ~65% on
-     * DISCOVER/OFFER (retransmit every 300 ms) then REQUEST/ACK to the
-     * same deadline. */
+    /* Try DHCP: DISCOVER → OFFER → REQUEST → ACK; dhcp.c uses ~70% of the
+     * budget waiting for OFFER (with DISCOVER retries) and the rest for ACK. */
 #ifdef FAST_BOOT
     /* Some home routers answer DHCP slowly on cold boot. */
     enum { dhcp_boot_budget_ms = 5000 };
 #else
     enum { dhcp_boot_budget_ms = 6000 };
 #endif
+#ifdef FAST_BOOT
+    enum { dhcp_retry_gap_ms = 90u };
+#else
+    enum { dhcp_retry_gap_ms = 120u };
+#endif
     struct dhcp_lease lease;
     bool dhcp_ok = dhcp_acquire(dhcp_boot_budget_ms, &lease);
     if (!dhcp_ok) {
         kprintf("[net] DHCP attempt 1 failed — retrying after short gap\n");
-        net_dhcp_retry_gap(nd, 250);
+        net_dhcp_retry_gap(nd, dhcp_retry_gap_ms);
         dhcp_ok = dhcp_acquire(dhcp_boot_budget_ms, &lease);
     }
     if (dhcp_ok) {

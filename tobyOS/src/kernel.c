@@ -2817,8 +2817,11 @@ void _start(void) {
          * the recorded backend name is current. Safe even on a true-
          * headless boot (registry stays empty, tests SKIP cleanly). */
         display_init();
+#ifndef QUICK_BOOT
         devtest_boot_run();
+#endif
         shell_init();
+#ifndef QUICK_BOOT
         /* Milestone 25C: drive the shell over a few synthetic command
          * lines BEFORE the idle loop starts polling the keyboard. This
          * exercises shell_run_test_line -> execute_line -> resolve_program
@@ -2833,7 +2836,12 @@ void _start(void) {
          * /bin/drawtest, /bin/rendertest. Each emits `[boot] M27A: ...
          * PASS` lines that test_m27a.ps1 greps for. */
         m27a_run_userland_tools();
+#else
+        kprintf("[boot] QUICK_BOOT: skipping devtest_boot_run + shell "
+                "smoketest + M26A/M27A spawns\n");
+#endif
     }
+#ifndef QUICK_BOOT
     /* Milestone 28A: structured logging harness. Exercises the slog
      * ring from multiple subsystems / levels, persists to disk, and
      * spawns /bin/logview to verify the SLOG_READ syscall path. Each
@@ -2867,6 +2875,10 @@ void _start(void) {
      * sentinels. Tests that require real hardware return
      * SKIPPED_REAL_HARDWARE_REQUIRED instead of failing. */
     m35g_run_compattest_harness();
+#else
+    kprintf("[boot] QUICK_BOOT: skipping M28A–M35G boot harness spawns "
+            "(CI: `make fullboot` / omit -DQUICK_BOOT)\n");
+#endif
 
 #ifdef M36_SELFTEST
     /* Milestone 36E: in-OS compile + run self-test (TobyC stage-1). */
@@ -2893,6 +2905,7 @@ void _start(void) {
     }
 #endif
 
+#ifndef QUICK_BOOT
     /* Milestone 28B (post-boot inspector): on every clean boot, if a
      * crash dump from a previous panic survived in /data/crash/last.dump
      * we spawn /bin/crashinfo --boot to decode it. Test scripts grep
@@ -2919,6 +2932,7 @@ void _start(void) {
      * (/etc/stabtest_now present) it ALSO runs --stress for an
      * end-to-end heap+disk+syscall workload. */
     m28g_run_stability_harness();
+#endif
 
     /* Milestone 28C: watchdog harness. Runs only when /etc/wdogtest_now
      * exists in the read-only initrd (built with WDOGTEST_FLAG=1). Drops

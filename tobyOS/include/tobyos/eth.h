@@ -28,8 +28,9 @@ bool eth_send(const uint8_t dst_mac[ETH_ADDR_LEN],
               const void   *payload,
               size_t        payload_len);
 
-/* Called by e1000_rx_drain for each received frame. Inspects the
- * ethertype and dispatches to the matching protocol handler. */
+/* Called by e1000_rx_drain for each received frame. Strips 802.1Q / 802.1ad
+ * VLAN tags when present, then inspects the final EtherType and dispatches
+ * to the matching protocol handler. */
 void eth_recv(const void *frame, size_t len);
 
 #endif /* TOBYOS_ETH_H */

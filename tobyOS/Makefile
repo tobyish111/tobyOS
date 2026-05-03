@@ -42,6 +42,9 @@ CFLAGS := --target=x86_64-elf \
 # Faster default boot: shorter DHCP budget, quicker ARP pre-warm, and
 # no inline example.com DNS+TCP+HTTP smoke in kmain (that alone can add
 # many seconds when offline).  For the old behaviour: `make fullboot`.
+#
+# For USB dev iteration, `make quickiso` adds -DQUICK_BOOT so kmain skips
+# always-on harness spawns (devtest_boot_run, M26A/M27A, M28–M35 circles).
 EXTRA_CFLAGS ?= -DFAST_BOOT
 
 LDFLAGS := -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 -T linker.ld
@@ -1794,6 +1797,12 @@ fastboot:
 fullboot:
 	rm -f src/kernel.o src/net.o
 	$(MAKE) all EXTRA_CFLAGS=
+
+# Live ISO rebuild with minimal kmain harness work (faster USB boots).
+.PHONY: quickiso
+quickiso:
+	rm -f src/kernel.o
+	$(MAKE) $(ISO) EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT"
 
 # Milestone-17 self-test build. Wipes intermediate artifacts and
 # rebuilds the kernel with -DPKG_M17_SELFTEST defined so the boot

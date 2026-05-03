@@ -23,6 +23,8 @@
 
 #define ETH_TYPE_IPV4    0x0800
 #define ETH_TYPE_ARP     0x0806
+#define ETH_TYPE_VLAN    0x8100    /* 802.1Q customer VLAN tag before EtherType */
+#define ETH_TYPE_VLAN_S  0x88A8    /* 802.1ad service VLAN (outer); inner may be 8100 */
 
 #define IP_PROTO_ICMP    1
 #define IP_PROTO_TCP     6

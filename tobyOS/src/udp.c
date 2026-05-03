@@ -55,7 +55,19 @@ void udp_recv(uint32_t src_ip_be, const void *udp_packet, size_t len) {
     const struct udp_hdr *h = (const struct udp_hdr *)udp_packet;
 
     uint16_t udp_len = ntohs(h->length);
-    if (udp_len < UDP_HDR_LEN || udp_len > len) return;
+    if (udp_len < UDP_HDR_LEN) return;
+
+    size_t udp_n = (size_t)udp_len;
+    /* For BOOTP/DHCP only: if UDP length > IP-delivered payload but we have
+     * the full 240 B BOOTP header, parse what we have (some paths disagree by
+     * a few octets; Wireshark still shows a valid OFFER). */
+    if (udp_n > len) {
+        if (h->dst_port == htons(68) &&
+            len >= UDP_HDR_LEN + DHCP_BOOTP_MIN_BYTES)
+            udp_n = len;
+        else
+            return;
+    }
 
     /* Optional checksum verification: if non-zero, must validate.
      * RFC 768 lets the sender opt out (cs=0) so a zero is not an
@@ -65,8 +77,16 @@ void udp_recv(uint32_t src_ip_be, const void *udp_packet, size_t len) {
      * == 0): the pseudo-header would use 0.0.0.0 as the destination
      * and never validate against the wire bytes. The DHCP path is the
      * canonical example -- replies arrive while we're still acquiring
-     * a lease. */
-    if (h->checksum != 0 && g_my_ip != 0) {
+     * a lease.
+     *
+     * Skip for UDP dst port 68 always: BOOTP/DHCP replies are often
+     * IPv4-broadcast; the pseudo-header uses g_my_ip, which does not
+     * match the packet's IP destination until after the lease applies.
+     *
+     * Skip when we clamped DHCP length: checksum covers declared udp_len,
+     * not the truncated buffer. */
+    if (h->checksum != 0 && udp_n == (size_t)udp_len &&
+        h->dst_port != htons(68) && g_my_ip != 0) {
         if (net_udp_checksum(src_ip_be, g_my_ip, udp_packet, udp_len) != 0)
             return;
     }
@@ -81,11 +101,11 @@ void udp_recv(uint32_t src_ip_be, const void *udp_packet, size_t len) {
      *   port 53999 = kernel resolver    -> dns.c  (24B)
      */
     if (h->dst_port == htons(68)) {
-        dhcp_recv_hook(src_ip_be, udp_packet, udp_len);
+        dhcp_recv_hook(src_ip_be, udp_packet, udp_n);
         return;
     }
     if (h->dst_port == htons(53999)) {
-        dns_recv_hook(src_ip_be, udp_packet, udp_len);
+        dns_recv_hook(src_ip_be, udp_packet, udp_n);
         return;
     }
 
@@ -93,7 +113,7 @@ void udp_recv(uint32_t src_ip_be, const void *udp_packet, size_t len) {
     if (!s) return;                       /* no listener: silent drop */
 
     const uint8_t *payload = (const uint8_t *)udp_packet + UDP_HDR_LEN;
-    size_t         pln     = udp_len - UDP_HDR_LEN;
+    size_t         pln     = udp_n - UDP_HDR_LEN;
 
     /* Hand off to socket.c via a tiny inline structure -- avoids
      * pulling sock internals into udp.c. socket.c walks the dgram

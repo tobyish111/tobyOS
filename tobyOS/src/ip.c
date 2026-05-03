@@ -7,6 +7,13 @@
  * Receive: validates header, reassembles fragments up to IP_REASS_MAX
  * bytes, demuxes UDP/TCP on complete datagrams.  Unfragmented path is
  * unchanged from the original milestone-21 code.
+ *
+ * DHCP bootstrap: many PCIe NICs verify IPv4 checksum in hardware but do
+ * not normalize the header checksum field in the RX buffer. Wireshark
+ * decodes OFFERs correctly while software verification here fails and every
+ * OFFER is dropped (DISCOVER loops, same xid, duplicate OFFERs on wire).
+ * While g_my_ip==0, UDP destined to port 68 may proceed if the IPv4 HCS
+ * alone fails (narrow exception; see ip_recv).
  */
 
 #include <tobyos/ip.h>
@@ -153,6 +160,11 @@ static bool ip_recv_maybe_reassemble(const struct ip_hdr *h,
 
     struct ip_reass_slot *s = reass_find(h->id, h->src_ip, h->dst_ip, h->proto);
     if (!s) {
+        /* First fragment of a datagram must start at offset 0 (RFC 791). If we
+         * have no slot yet and frag_off != 0, this is an orphan tail/middle or
+         * corrupted flags — do NOT allocate a slot (would never complete and
+         * DHCP-sized UDP can look like a bogus "fragment"). */
+        if (frag_off != 0) return true;
         s = reass_alloc();
         s->id_be   = h->id;
         s->src_ip  = h->src_ip;
@@ -276,6 +288,45 @@ bool ip_send(uint32_t dst_ip_be, uint8_t proto,
     return true;
 }
 
+/* True if this IPv4 datagram is addressed to us (or should be demuxed during
+ * DHCP when we have no address yet).
+ *
+ * While g_my_ip == 0 (SELECTING / REQUESTING), accept any destination IPv4 so
+ * OFFER/ACK unicasted to yiaddr still reach udp_recv — the stack has no other
+ * address to match yet. Some servers ignore the BOOTP broadcast flag and
+ * send unicast to the offered IP; the NIC still delivers by Ethernet DA.
+ *
+ * After configuration: accept our unicast, 255.255.255.255, and the subnet's
+ * directed broadcast (e.g. 192.168.1.255) — some DHCP implementations use
+ * the latter for OFFER/ACK instead of global broadcast. */
+static bool ip_dst_is_for_us(uint32_t dst_ip_be) {
+    if (dst_ip_be == g_my_ip) return true;
+    if (dst_ip_be == IP_BROADCAST_BE) return true;
+    if (g_my_ip == 0) return true;
+    if (g_my_netmask) {
+        uint32_t bcast = (g_my_ip & g_my_netmask) | ~g_my_netmask;
+        if (dst_ip_be == bcast) return true;
+    }
+    return false;
+}
+
+/* True if we should accept a datagram whose IPv4 header checksum failed
+ * software verification anyway. Real NICs often offload RX checksum: the
+ * frame is valid on the wire but the IP checksum field left in RAM does
+ * not match RFC 791 verification — without this, valid DHCP OFFER/ACK never
+ * reach udp_recv. Restrict to SELECTING: g_my_ip==0, UDP, dst port 68. */
+static bool ip_rx_allow_bad_ipv4_csum(const struct ip_hdr *h,
+                                      const void *payload, size_t len,
+                                      uint16_t total) {
+    if (g_my_ip != 0) return false;
+    if (h->proto != IP_PROTO_UDP) return false;
+    if (total < IP_HDR_LEN + UDP_HDR_LEN || len < IP_HDR_LEN + UDP_HDR_LEN)
+        return false;
+    const uint8_t *udp = (const uint8_t *)payload + IP_HDR_LEN;
+    /* UDP destination port 68 (BOOTP/DHCP client), wire byte order. */
+    return udp[2] == 0 && udp[3] == 68;
+}
+
 void ip_recv(const void *payload, size_t len) {
     if (len < IP_HDR_LEN) return;
     const struct ip_hdr *h = (const struct ip_hdr *)payload;
@@ -284,15 +335,28 @@ void ip_recv(const void *payload, size_t len) {
     if ((h->ver_ihl & 0x0F) != 5) return;
 
     uint16_t total = ntohs(h->total_len);
-    if (total > len) return;
-
-    if (net_checksum(h, IP_HDR_LEN) != 0) return;
-
-    if (h->dst_ip != g_my_ip &&
-        h->dst_ip != IP_BROADCAST_BE &&
-        g_my_ip   != 0) {
+    if (total > len) {
+        /* Truncated IPv4 — common if RX length disagrees with IP total_len. */
+        if (g_my_ip == 0 && len >= IP_HDR_LEN + 8) {
+            const uint8_t *b = (const uint8_t *)payload;
+            if (b[9] == IP_PROTO_UDP && len >= IP_HDR_LEN + 4) {
+                const uint8_t *u = b + IP_HDR_LEN;
+                if (u[2] == 0 && u[3] == 68) {
+                    static unsigned trunc_dhcp;
+                    if (trunc_dhcp++ < 3u)
+                        kprintf("[ip] DHCP drop: ip total_len=%u buf=%zu (truncated)\n",
+                                (unsigned)total, len);
+                }
+            }
+        }
         return;
     }
+
+    if (net_checksum(h, IP_HDR_LEN) != 0) {
+        if (!ip_rx_allow_bad_ipv4_csum(h, payload, len, total)) return;
+    }
+
+    if (!ip_dst_is_for_us(h->dst_ip)) return;
 
     const uint8_t *frame = (const uint8_t *)payload;
 
