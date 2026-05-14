@@ -27,6 +27,8 @@
 #include <tobyos/socket.h>
 #include <tobyos/dhcp.h>
 #include <tobyos/tcp.h>
+#include <tobyos/tcp_echo.h>
+#include <tobyos/tcp_shell.h>
 #include <tobyos/pit.h>
 #include <tobyos/printk.h>
 #include <tobyos/cpu.h>
@@ -282,6 +284,10 @@ bool net_init(void) {
     arp_gratuitous();
 
     net_warm_gateway_arp(nd);
+
+    tcp_echo_init();
+    tcp_shell_init();
+
     return true;
 }
 
@@ -319,6 +325,8 @@ void net_poll(void) {
         struct net_dev *nd = g_net_devs[i];
         if (nd && nd->rx_drain) nd->rx_drain(nd);
     }
+    tcp_echo_poll();
+    tcp_shell_poll();
 }
 
 /* ---- checksum --------------------------------------------------- */

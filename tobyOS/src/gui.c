@@ -852,8 +852,34 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
 
     int W = (int)gfx_width(), H = (int)gfx_height();
     int old_x = g.cur_x, old_y = g.cur_y;
-    int nx = g.cur_x + dx;
-    int ny = g.cur_y + dy;
+
+    /*
+     * Pointer speed / acceleration.
+     *
+     * Raw USB HID mouse deltas feel slow compared to Windows because
+     * Windows applies pointer speed and acceleration. This does not fix
+     * USB report burstiness, but it makes each received report move the
+     * cursor farther.
+     */
+    int ax = dx < 0 ? -dx : dx;
+    int ay = dy < 0 ? -dy : dy;
+    int maxa = ax > ay ? ax : ay;
+
+    int mult = 3;
+
+    if (maxa >= 4)
+        mult = 4;
+    if (maxa >= 8)
+        mult = 5;
+    if (maxa >= 16)
+        mult = 6;
+
+    int sdx = dx * mult;
+    int sdy = dy * mult;
+
+    int nx = g.cur_x + sdx;
+    int ny = g.cur_y + sdy;
+
     if (nx < 0)      nx = 0;
     if (ny < 0)      ny = 0;
     if (nx >= W)     nx = W - 1;

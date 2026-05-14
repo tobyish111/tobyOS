@@ -767,6 +767,50 @@ bool xhci_control_class(struct usb_device *dev,
     return true;
 }
 
+static uint8_t xhci_encode_interrupt_interval(uint8_t speed, uint8_t bInterval) {
+    if (bInterval == 0) {
+        bInterval = 1;
+    }
+
+    /*
+     * xHCI endpoint context Interval field is encoded in 125us
+     * microframes as a power-of-two exponent.
+     *
+     * For high-speed/super-speed interrupt endpoints, USB descriptors
+     * already encode bInterval as an exponent-ish value, so bInterval-1
+     * is the usual xHCI encoding.
+     *
+     * For low/full-speed interrupt endpoints, bInterval is in 1ms frames.
+     * Convert ms -> microframes, then encode as log2-ish microframes.
+     */
+    if (speed == USB_SPEED_HIGH || speed == USB_SPEED_SUPER) {
+        if (bInterval > 16) {
+            bInterval = 16;
+        }
+        return (uint8_t)(bInterval - 1);
+    }
+
+    /* Low/full-speed: bInterval is milliseconds. 1 ms = 8 microframes. */
+    uint32_t microframes = (uint32_t)bInterval * 8u;
+
+    /*
+     * Floor log2. This intentionally prefers polling a little faster
+     * rather than much slower. For a common 10ms mouse interval:
+     *   10ms = 80 microframes -> enc=6 -> 64 microframes = 8ms.
+     */
+    uint8_t enc = 0;
+    while (enc < 15 && ((1u << (enc + 1)) <= microframes)) {
+        enc++;
+    }
+
+    /* xHCI minimum practical interrupt interval is 1ms for FS/LS here. */
+    if (enc < 3) {
+        enc = 3;
+    }
+
+    return enc;
+}
+
 /* ============================================================== */
 /* Configure Endpoint (for the HID interrupt-IN endpoint)          */
 /* ============================================================== */
@@ -814,8 +858,9 @@ static bool xhci_configure_int_in(struct xhci_dev_state *st,
      * endpoints the spec wants log2(interval-in-microframes). The
      * descriptor's bInterval is in frames (1ms each) for FS/LS, in
      * 125us microframes for HS. We just clamp to a useful range. */
-    uint8_t enc_interval = interval ? interval - 1 : 3;
-    if (enc_interval > 15) enc_interval = 15;
+     uint8_t enc_interval =
+     xhci_encode_interrupt_interval(st->usb.speed, interval);
+ 
     ep->dw0 = ((uint32_t)enc_interval << 16);   /* Interval[31:16 in xhci 1.1; spec actual is 23:16 -- both work for the values we use */
     ep->dw1 = ((uint32_t)mps << 16) | (7u << 3) | (3u << 1); /* EPType=Int IN, CErr=3 */
     ep->deq_lo = (uint32_t)(int_phys & 0xFFFFFFFFu) | 1u;     /* DCS=1 */
@@ -2438,6 +2483,13 @@ int xhci_irq_count(void) {
      * (a long-running session would only ever lose count if irq_count
      * exceeds INT_MAX, which won't happen in any realistic boot). */
     return (int)(g_xhci.irq_count & 0x7FFFFFFFu);
+}
+bool xhci_irq_is_enabled(void) {
+    return g_xhci.bound && g_xhci.irq_enabled;
+}
+
+bool xhci_needs_polling(void) {
+    return g_xhci.bound && !g_xhci.irq_enabled;
 }
 
 int xhci_selftest(char *msg, size_t cap) {

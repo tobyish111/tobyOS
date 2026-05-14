@@ -11,6 +11,11 @@
 
 #include <tobyos/types.h>
 
+typedef void (*shell_write_fn_t)(const char *s, void *ctx);
+
+void shell_set_output(shell_write_fn_t fn, void *ctx);
+void shell_write(const char *s);
+void shell_printf(const char *fmt, ...);
 /* Print the welcome line and the first prompt. Call once after every
  * other subsystem is up. */
 void shell_init(void);

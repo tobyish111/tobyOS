@@ -47,6 +47,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/cpu.h>
+#include <tobyos/spinlock.h>
 #include <tobyos/irq.h>
 #include <tobyos/apic.h>
 
@@ -160,6 +161,8 @@ static uint16_t                 g_tx_tail;
 static char                     g_e1000e_name[32];
 static uint8_t                  g_irq_vector;     /* 0 if MSI/MSI-X off */
 static volatile uint64_t        g_irq_count;
+
+static spinlock_t g_e1000e_rx_lock = SPINLOCK_INIT;
 
 /* ----- MMIO helpers ---------------------------------------------- */
 
@@ -296,7 +299,7 @@ static bool e1000e_tx_op(struct net_dev *dev, const void *frame, size_t len) {
 
 static void e1000e_rx_drain_op(struct net_dev *dev) {
     (void)dev;
-    uint64_t irqf = cpu_irqsave();
+    uint64_t irqf = spin_lock_irqsave(&g_e1000e_rx_lock);
     for (;;) {
         uint16_t i = (uint16_t)((g_rx_tail + 1) % RX_DESC_COUNT);
         if (!(g_rx_ring[i].status & RXD_STAT_DD)) break;
@@ -308,7 +311,7 @@ static void e1000e_rx_drain_op(struct net_dev *dev) {
         g_rx_tail = i;
         mmio_write32(E1000E_RDT, g_rx_tail);
     }
-    cpu_irqrestore(irqf);
+    spin_unlock_irqrestore(&g_e1000e_rx_lock, irqf);
 }
 
 /* MSI / MSI-X handler. ICR is read-to-clear on the 82574L (same as

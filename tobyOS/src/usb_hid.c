@@ -409,15 +409,15 @@ static void hid_on_report(struct usb_device *dev,
     if (st->is_keyboard) hid_kbd_handle(st, buf, len);
     else                 hid_mouse_handle(st, buf, len);
 
-    /* Periodic snapshot (every 8 frames). Force one immediately on
-     * meaningful transitions so a test harness or a developer watching
-     * the log doesn't have to wait for the next 8-frame tick to see a
-     * fresh modifier or click land. */
-    bool tick   = (st->frames_total & 7u) == 0u;
-    bool change = st->is_keyboard
-                  ? (st->last_modmask != prev_mod)
-                  : (st->mouse_btn_press_total != prev_clicks);
-    if (tick || change) hid_log_snapshot(st);
+    /*
+ * Do not log from the HID hot path.
+ *
+ * Mouse reports can arrive at 125 Hz, 500 Hz, or 1000 Hz depending on
+ * the device. Serial/framebuffer logging here destroys responsiveness.
+ * Keep counters updated for diagnostics, but only print them from an
+ * explicit shell command or low-rate debug timer.
+ */
+
 }
 
 /* ============================================================== */

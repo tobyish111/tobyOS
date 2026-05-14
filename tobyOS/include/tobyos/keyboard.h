@@ -1,18 +1,4 @@
-/* keyboard.h -- PS/2 keyboard driver (IRQ1, scancode set 1).
- *
- * After kbd_init():
- *   - the IRQ1 handler is registered and IRQ1 is unmasked
- *   - keystrokes accumulate in a ring buffer
- *   - kbd_trygetc() returns the next ASCII char or -1 if empty
- *   - kbd_getc()    blocks (sti+hlt) until a char is available
- *
- * Limitations of this initial cut:
- *   - US layout only
- *   - extended (E0-prefixed) keys are silently dropped (no arrows yet)
- *   - no key-up events are surfaced (other than for shift tracking)
- *   - no autorepeat reprogramming -- we just consume what the controller
- *     gives us
- */
+/* keyboard.h -- PS/2 keyboard driver (IRQ1, scancode set 1). */
 
 #ifndef TOBYOS_KEYBOARD_H
 #define TOBYOS_KEYBOARD_H
@@ -24,28 +10,18 @@ void kbd_init(void);
 /* Returns the next ASCII char (0..255) or -1 if the buffer is empty. */
 int  kbd_trygetc(void);
 
-/* Blocks until a char is available, then returns it. Requires
- * interrupts to be enabled. */
+/* Blocks until a char is available. Requires interrupts enabled. */
 int  kbd_getc(void);
 
-/* ---- shared input sink (milestone 21: USB-HID re-uses this) ----
- *
- * Push a single resolved ASCII char into wherever it needs to go --
- * that's the GUI focused window when the desktop is up, the text-mode
- * shell ring otherwise, or a SIGINT to the foreground process for
- * Ctrl+C. The PS/2 IRQ calls this after its scancode-to-ASCII map +
- * Caps/Ctrl resolution. USB-HID does the same after decoding boot-
- * protocol reports + applying its own modifier state. Anything that
- * lands here looks identical to downstream consumers.
- *
- * Safe to call from IRQ context AND from the kernel idle loop. */
+/* Shared input sink used by PS/2 and USB-HID. */
 void kbd_dispatch_char(char c);
 
-/* ---- M26D telemetry accessors --------------------------------- *
- *
- * Read-only views over PS/2 driver state. Counters saturate (no
- * rollover guard); modifier queries return the live latch. Used by
- * the input self-test + by usbtest hid for diagnostics. */
+/* PS/2 byte-level entry point.
+ * Exported so the mouse IRQ can drain shared 8042 output bytes and
+ * route keyboard bytes correctly instead of leaving them stuck. */
+void kbd_ps2_handle_scancode(uint8_t sc);
+
+/* M26D telemetry accessors. */
 uint64_t kbd_chars_dispatched(void);
 uint64_t kbd_irqs_total(void);
 bool     kbd_caps_state(void);

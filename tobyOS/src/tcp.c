@@ -337,7 +337,17 @@ static bool tcp_tick_one(struct tcp_conn *c) {
 
 static void tcp_tick_all(void) {
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
-        if (g_conns[i].in_use) (void)tcp_tick_one(&g_conns[i]);
+        struct tcp_conn *c = &g_conns[i];
+        if (!c->in_use) continue;
+
+        if (!tcp_tick_one(c)) {
+            kprintf("[tcp] closing tcp[%d] lp=%u after retransmit failure\n",
+                    i, (unsigned)ntohs(c->local_port_be));
+
+            c->remote_rst_seen = true;
+            c->state = TCP_CLOSED;
+            pend_clear(c);
+        }
     }
 }
 
@@ -349,10 +359,21 @@ static void listen_enqueue(struct tcp_conn *lsn, int child_idx) {
 }
 
 static void passive_syn(struct tcp_conn *lsn, uint32_t src_ip,
-                        uint16_t src_port, uint16_t dst_port, uint32_t seq) {
-    int lidx = conn_index(lsn);
-    if (syn_recv_count(lidx) >= lsn->backlog_cap) return;
-    if (conn_lookup(src_ip, src_port, dst_port)) return;
+    uint16_t src_port, uint16_t dst_port, uint32_t seq) {
+int lidx = conn_index(lsn);
+
+if (syn_recv_count(lidx) >= lsn->backlog_cap) {
+kprintf("[tcp] listen backlog full lp=%u\n",
+(unsigned)ntohs(dst_port));
+return;
+}
+
+if (conn_lookup(src_ip, src_port, dst_port)) {
+kprintf("[tcp] duplicate SYN ignored lp=%u rp=%u\n",
+(unsigned)ntohs(dst_port),
+(unsigned)ntohs(src_port));
+return;
+}
 
     struct tcp_conn *ch = conn_alloc();
     if (!ch) return;
@@ -368,10 +389,23 @@ static void passive_syn(struct tcp_conn *lsn, uint32_t src_ip,
     ch->snd_nxt = ch->snd_una = (uint32_t)(mix ^ (mix >> 32));
 
     ch->state = TCP_SYN_RECEIVED;
+
+    kprintf("[tcp] SYN rx tcp[%d] lp=%u rp=%u seq=%u -> SYN_RECEIVED\n",
+            conn_index(ch),
+            (unsigned)ntohs(dst_port),
+            (unsigned)ntohs(src_port),
+            (unsigned)seq);
+    
     if (!tcp_send_data_segment(ch, TCP_FLAG_SYN, NULL, 0)) {
+        kprintf("[tcp] SYN/ACK send failed tcp[%d]\n", conn_index(ch));
         conn_free(ch);
         return;
     }
+    
+    kprintf("[tcp] SYN/ACK tx tcp[%d] iss=%u ack=%u\n",
+            conn_index(ch),
+            (unsigned)ch->snd_una,
+            (unsigned)ch->rcv_nxt);
 }
 
 void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
@@ -407,6 +441,12 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
     c->snd_wnd = ntohs(h->window);
 
     if (fl & TCP_FLAG_RST) {
+        kprintf("[tcp] RST rx tcp[%d] lp=%u rp=%u state=%s\n",
+                conn_index(c),
+                (unsigned)ntohs(c->local_port_be),
+                (unsigned)ntohs(c->remote_port_be),
+                tcp_state_name(c->state));
+    
         c->remote_rst_seen = true;
         tcp_state_t was = c->state;
         c->state = TCP_CLOSED;
@@ -434,12 +474,27 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
             ack == c->snd_nxt && seq == c->rcv_nxt) {
             pend_ack(c, ack);
             c->state = TCP_ESTABLISHED;
+    
+            kprintf("[tcp] ESTABLISHED passive tcp[%d] lp=%u rp=%u\n",
+                    conn_index(c),
+                    (unsigned)ntohs(c->local_port_be),
+                    (unsigned)ntohs(c->remote_port_be));
+    
             if (c->parent_lsn >= 0 && c->parent_lsn < TCP_MAX_CONNS) {
                 struct tcp_conn *lsn = &g_conns[c->parent_lsn];
                 if (lsn->in_use && lsn->state == TCP_LISTEN)
                     listen_enqueue(lsn, conn_index(c));
             }
+    
             tcp_send_ack(c);
+        } else {
+            kprintf("[tcp] SYN_RECEIVED ignored tcp[%d] fl=0x%02x seq=%u ack=%u expected seq=%u ack=%u\n",
+                    conn_index(c),
+                    (unsigned)fl,
+                    (unsigned)seq,
+                    (unsigned)ack,
+                    (unsigned)c->rcv_nxt,
+                    (unsigned)c->snd_nxt);
         }
         return;
     }
@@ -458,10 +513,25 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
             rx_push(c, payload, plen);
             c->rcv_nxt += (uint32_t)plen;
             need_ack = true;
+    
+            kprintf("[tcp] payload rx tcp[%d] len=%u seq=%u new_rcv_nxt=%u\n",
+                    conn_index(c),
+                    (unsigned)plen,
+                    (unsigned)seq,
+                    (unsigned)c->rcv_nxt);
         } else {
+            kprintf("[tcp] RX buffer full tcp[%d] plen=%u free=%u\n",
+                    conn_index(c),
+                    (unsigned)plen,
+                    (unsigned)free_space);
             need_ack = true;
         }
     } else if (plen > 0 && seq != c->rcv_nxt) {
+        kprintf("[tcp] out-of-order payload tcp[%d] len=%u seq=%u expected=%u\n",
+                conn_index(c),
+                (unsigned)plen,
+                (unsigned)seq,
+                (unsigned)c->rcv_nxt);
         need_ack = true;
     }
 
@@ -470,44 +540,73 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
             c->rcv_nxt += 1u;
             c->remote_fin_seen = true;
             need_ack = true;
+            kprintf("[tcp] FIN rx tcp[%d] state=%s seq=%u\n",
+                conn_index(c),
+                tcp_state_name(c->state),
+                (unsigned)seq);
             switch (c->state) {
-            case TCP_ESTABLISHED:
-                c->state = TCP_CLOSE_WAIT;
-                break;
-            case TCP_FIN_WAIT_1:
-                c->state = TCP_CLOSE_WAIT;
-                break;
-            case TCP_FIN_WAIT_2:
-                c->state = TCP_TIME_WAIT;
-                {
-                    uint32_t hz = pit_hz();
-                    if (hz == 0) hz = 100;
-                    c->tw_deadline_tick =
-                        pit_ticks() +
-                        ((uint64_t)hz * TCP_TW_MSL_MS) / 1000u;
+                case TCP_ESTABLISHED:
+                    /*
+                     * Peer initiated close. We ACK their FIN and wait for local user
+                     * to call tcp_close(), which will send our FIN.
+                     */
+                    c->state = TCP_CLOSE_WAIT;
+                    break;
+                
+                case TCP_FIN_WAIT_1:
+                    /*
+                     * Simultaneous close-ish case: we already sent FIN and now peer
+                     * sent FIN too. We do not have TCP_CLOSING, so use TIME_WAIT as
+                     * the simple hobby-OS fallback.
+                     */
+                    c->state = TCP_TIME_WAIT;
+                    {
+                        uint32_t hz = pit_hz();
+                        if (hz == 0) hz = 100;
+                        c->tw_deadline_tick =
+                            pit_ticks() +
+                            ((uint64_t)hz * TCP_TW_MSL_MS) / 1000u;
+                    }
+                    break;
+                
+                case TCP_FIN_WAIT_2:
+                    /*
+                     * Normal active close: our FIN was ACKed, then peer sent FIN.
+                     */
+                    c->state = TCP_TIME_WAIT;
+                    {
+                        uint32_t hz = pit_hz();
+                        if (hz == 0) hz = 100;
+                        c->tw_deadline_tick =
+                            pit_ticks() +
+                            ((uint64_t)hz * TCP_TW_MSL_MS) / 1000u;
+                    }
+                    break;
+                
+                default:
+                    break;
                 }
-                break;
-            default:
-                break;
-            }
         }
     }
 
     if (c->peer_acked_our_fin) {
         switch (c->state) {
         case TCP_FIN_WAIT_1:
+            /*
+             * Our FIN was ACKed, but we have not seen peer FIN yet.
+             */
             c->state = TCP_FIN_WAIT_2;
             break;
+    
         case TCP_LAST_ACK:
-            c->state = TCP_TIME_WAIT;
-            {
-                uint32_t hz = pit_hz();
-                if (hz == 0) hz = 100;
-                c->tw_deadline_tick =
-                    pit_ticks() +
-                    ((uint64_t)hz * TCP_TW_MSL_MS) / 1000u;
-            }
+            /*
+             * Passive close complete:
+             * peer sent FIN -> we entered CLOSE_WAIT -> we sent FIN ->
+             * peer ACKed our FIN. Done.
+             */
+            c->state = TCP_CLOSED;
             break;
+    
         default:
             break;
         }
@@ -616,6 +715,12 @@ struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog) {
     c->backlog_cap   = (uint8_t)(backlog <= 0 ? 1 : backlog);
     if (c->backlog_cap > TCP_LISTEN_BACKLOG)
         c->backlog_cap = TCP_LISTEN_BACKLOG;
+    
+    kprintf("[tcp] LISTEN tcp[%d] lp=%u backlog=%u\n",
+            conn_index(c),
+            (unsigned)ntohs(local_port_be),
+            (unsigned)c->backlog_cap);
+
     return c;
 }
 

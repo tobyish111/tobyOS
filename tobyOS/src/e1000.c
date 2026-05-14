@@ -43,6 +43,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/cpu.h>
+#include <tobyos/spinlock.h>
 #include <tobyos/irq.h>
 #include <tobyos/apic.h>
 
@@ -70,6 +71,9 @@
 #define E1000_MTA_BASE   0x5200          /* 128 dwords */
 #define E1000_RAL0       0x5400
 #define E1000_RAH0       0x5404
+
+#define RCTL_UPE          (1u << 3)   /* unicast promiscuous; debug only */
+#define RAH_AV            (1u << 31)
 
 /* CTRL bits. */
 #define CTRL_RST         (1u << 26)
@@ -125,6 +129,8 @@
 
 /* Hardware descriptor layouts (Intel 82540EM datasheet § 3.2.3 / 3.3.3). */
 
+//helper 
+
 struct __attribute__((packed)) e1000_rx_desc {
     uint64_t addr;
     uint16_t length;
@@ -161,6 +167,8 @@ static char                    g_e1000_name[32];
 static uint8_t                 g_irq_vector;    /* 0 if MSI not active */
 static volatile uint64_t       g_irq_count;     /* diag: ISR invocations */
 
+static spinlock_t g_e1000_rx_lock = SPINLOCK_INIT;
+
 /* ----- MMIO helpers ---------------------------------------------- */
 
 static inline void mmio_write32(uint32_t off, uint32_t val) {
@@ -170,6 +178,21 @@ static inline uint32_t mmio_read32(uint32_t off) {
     return *(volatile uint32_t *)(g_mmio + off);
 }
 
+static void e1000_program_rar0(const uint8_t mac[ETH_ADDR_LEN]) {
+    uint32_t ral =
+        ((uint32_t)mac[0]) |
+        ((uint32_t)mac[1] << 8) |
+        ((uint32_t)mac[2] << 16) |
+        ((uint32_t)mac[3] << 24);
+
+    uint32_t rah =
+        ((uint32_t)mac[4]) |
+        ((uint32_t)mac[5] << 8) |
+        RAH_AV;
+
+    mmio_write32(E1000_RAL0, ral);
+    mmio_write32(E1000_RAH0, rah);
+}
 /* ----- helpers --------------------------------------------------- */
 
 static bool alloc_buf(uint8_t **out_virt, uint64_t *out_phys) {
@@ -209,8 +232,21 @@ static bool e1000_setup_rx(void) {
     mmio_write32(E1000_RDT,   RX_DESC_COUNT - 1);
     g_rx_tail = RX_DESC_COUNT - 1;
 
-    mmio_write32(E1000_RCTL,
-                 RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2048);
+    uint32_t rctl =
+        RCTL_EN |
+        RCTL_BAM |
+        RCTL_UPE |        /* temporary debug: accept all unicast frames */
+        RCTL_SECRC |
+        RCTL_BSIZE_2048;
+
+    mmio_write32(E1000_RCTL, rctl);
+
+    kprintf("[e1000] RX live RDBAL=0x%08x RDLEN=%u RDT=%u RCTL=0x%08x\n",
+            (uint32_t)(g_rx_ring_phys & 0xFFFFFFFF),
+            RX_DESC_COUNT * (uint32_t)sizeof(struct e1000_rx_desc),
+            (unsigned)g_rx_tail,
+            rctl);
+
     return true;
 }
 
@@ -296,7 +332,7 @@ static bool e1000_tx_op(struct net_dev *dev, const void *frame, size_t len) {
 
 static void e1000_rx_drain_op(struct net_dev *dev) {
     (void)dev;
-    uint64_t irqf = cpu_irqsave();
+    uint64_t irqf = spin_lock_irqsave(&g_e1000_rx_lock);
     /* Walk forward from tail+1 (which is the first descriptor the NIC
      * is allowed to write next). For each descriptor that has DD set,
      * dispatch it, clear the status, advance tail, and bump RDT. */
@@ -305,13 +341,44 @@ static void e1000_rx_drain_op(struct net_dev *dev) {
         if (!(g_rx_ring[i].status & RXD_STAT_DD)) break;
         uint16_t len = g_rx_ring[i].length;
         if (len > 0 && len <= BUF_SIZE) {
+            const uint8_t *f = g_rx_bufs[i];
+        
+            if (len >= 14) {
+                uint16_t et =
+                    ((uint16_t)f[12] << 8) |
+                    ((uint16_t)f[13]);
+        
+                if (et == 0x0800 && len >= 42) {
+                    const uint8_t *ip = f + 14;
+                    uint8_t proto = ip[9];
+        
+                    if (proto == 17) {
+                        uint8_t ihl = (uint8_t)((ip[0] & 0x0F) * 4);
+                        if (ihl >= 20 && len >= 14 + ihl + 8) {
+                            const uint8_t *udp = ip + ihl;
+                            uint16_t sport = ((uint16_t)udp[0] << 8) | udp[1];
+                            uint16_t dport = ((uint16_t)udp[2] << 8) | udp[3];
+        
+                            if ((sport == 67 && dport == 68) ||
+                                (sport == 68 && dport == 67)) {
+                                kprintf("[e1000] RX DHCP frame len=%u udp %u -> %u dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                                        (unsigned)len,
+                                        (unsigned)sport,
+                                        (unsigned)dport,
+                                        f[0], f[1], f[2], f[3], f[4], f[5]);
+                            }
+                        }
+                    }
+                }
+            }
+        
             eth_recv(g_rx_bufs[i], len);
         }
         g_rx_ring[i].status = 0;
         g_rx_tail = i;
         mmio_write32(E1000_RDT, g_rx_tail);
     }
-    cpu_irqrestore(irqf);
+    spin_unlock_irqrestore(&g_e1000_rx_lock, irqf);
 }
 
 /* MSI handler. Reading ICR clears every cause bit it returns, so a
@@ -355,42 +422,63 @@ static int e1000_probe(struct pci_dev *dev) {
         kprintf("[e1000] BAR0 map failed (phys=%p)\n", (void *)dev->bar[0]);
         return -2;
     }
+
     g_mmio = (volatile uint8_t *)bar0_virt;
     kprintf("[e1000] MMIO BAR0 phys=%p virt=%p (%lu KiB UC)\n",
             (void *)dev->bar[0], (void *)g_mmio,
             (unsigned long)(E1000_MMIO_BYTES / 1024u));
 
-    /* Soft reset and wait for it to clear. */
+    /*
+     * Soft reset.
+     * After this, many device registers return to defaults, so anything
+     * important must be programmed after reset, not before it.
+     */
     mmio_write32(E1000_CTRL, mmio_read32(E1000_CTRL) | CTRL_RST);
     for (int i = 0; i < 1000000; i++) {
-        if ((mmio_read32(E1000_CTRL) & CTRL_RST) == 0) break;
+        if ((mmio_read32(E1000_CTRL) & CTRL_RST) == 0) {
+            break;
+        }
     }
 
-    /* Force link up + auto-speed detection. */
+    /*
+     * Force link up + auto-speed detection.
+     */
     mmio_write32(E1000_CTRL,
                  mmio_read32(E1000_CTRL) | CTRL_SLU | CTRL_ASDE);
 
-    /* Mask everything during ring setup. We'll re-arm IMS only after
-     * the rings are live AND MSI is wired -- otherwise an early IRQ
-     * could fire with g_rx_tail/g_tx_tail pointing nowhere. */
+    /*
+     * Mask interrupts during ring setup.
+     */
     mmio_write32(E1000_IMC, 0xFFFFFFFF);
     (void)mmio_read32(E1000_ICR);
 
-    /* Clear the multicast filter table. */
+    /*
+     * Clear multicast filter table.
+     */
     for (int i = 0; i < 128; i++) {
         mmio_write32(E1000_MTA_BASE + i * 4, 0);
     }
 
+    /*
+     * Read MAC and explicitly program receive address slot 0.
+     * This is important for unicast DHCP OFFER/ACK reception.
+     */
     e1000_read_mac(g_e1000_dev.mac);
+    e1000_program_rar0(g_e1000_dev.mac);
 
-    if (!e1000_setup_rx() || !e1000_setup_tx()) return -3;
+    kprintf("[e1000] MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+            g_e1000_dev.mac[0], g_e1000_dev.mac[1],
+            g_e1000_dev.mac[2], g_e1000_dev.mac[3],
+            g_e1000_dev.mac[4], g_e1000_dev.mac[5]);
 
-    /* Try MSI. The 82540EM supports MSI but NOT MSI-X (no x-cap in
-     * its config space). pci_msi_enable() routes a single vector at
-     * the BSP LAPIC; if that fails we leave the chip on its legacy
-     * INT_PIN -- which on the IO APIC path would still arrive via
-     * GSI matching INT_LINE, but we don't wire that today. Polling
-     * via net_poll() in the idle loop remains the reliable fallback. */
+    /*
+     * Now set up rings. RX setup should enable RCTL after RDBAL/RDBAH/RDLEN
+     * and RDH/RDT are programmed.
+     */
+    if (!e1000_setup_rx() || !e1000_setup_tx()) {
+        return -3;
+    }
+
     uint8_t vec = irq_alloc_vector(e1000_irq_handler, 0);
     if (vec == 0) {
         kprintf("[e1000] no IDT vectors free -- staying polled\n");
@@ -399,17 +487,12 @@ static int e1000_probe(struct pci_dev *dev) {
                 "(vec 0x%02x is now idle)\n", (unsigned)vec);
     } else {
         g_irq_vector = vec;
-        /* Clear ICR (any stale bits from BIOS), then unmask the
-         * subset we care about. The chip will MSI on the next RX
-         * frame or TX completion. */
         (void)mmio_read32(E1000_ICR);
         mmio_write32(E1000_IMS, IMS_BITS);
         kprintf("[e1000] IRQ live on vec 0x%02x  IMS=0x%02x  RX/TX irq-driven\n",
                 (unsigned)vec, IMS_BITS);
     }
 
-    /* Build the registry name "e1000:bb:ss.f". snprintf-equivalent
-     * minimal hex formatter so we don't pull printf into this driver. */
     static const char hex[] = "0123456789abcdef";
     char *n = g_e1000_name;
     *n++ = 'e'; *n++ = '1'; *n++ = '0'; *n++ = '0'; *n++ = '0'; *n++ = ':';
@@ -420,6 +503,7 @@ static int e1000_probe(struct pci_dev *dev) {
 
     net_register(&g_e1000_dev);
     dev->driver_data = &g_e1000_dev;
+
     return 0;
 }
 

@@ -41,9 +41,28 @@
 #ifndef DHCP_OFFER_MS_DEN
 #define DHCP_OFFER_MS_DEN 100u
 #endif
-/* Between DISCOVER retransmits while still waiting for an OFFER. */
-#ifndef DHCP_DISCOVER_GAP_MS
-#define DHCP_DISCOVER_GAP_MS 400u
+/* After the *first* DISCOVER: listen this long before sending another.
+ * Short gaps (e.g. 400 ms) spam DISCOVER while the server is still sending
+ * OFFER(s) and can confuse capture / some CPEs; RFC 2131 implies backoff. */
+#ifndef DHCP_DISCOVER_INITIAL_WAIT_MS
+#define DHCP_DISCOVER_INITIAL_WAIT_MS 2500u
+#endif
+/* Gap between 2nd, 3rd, … DISCOVER while waiting for OFFER. */
+#ifndef DHCP_DISCOVER_RETRY_GAP_MS
+#define DHCP_DISCOVER_RETRY_GAP_MS 1200u
+#endif
+/* Legacy override: if set in Makefile, use as retry gap (initial stays default). */
+#ifdef DHCP_DISCOVER_GAP_MS
+#undef DHCP_DISCOVER_RETRY_GAP_MS
+#define DHCP_DISCOVER_RETRY_GAP_MS DHCP_DISCOVER_GAP_MS
+#endif
+
+/* Each dhcp_wait loop runs this many full drain passes before sti+hlt.
+ * Noisy LANs can deliver many frames between sleep wakeups; RTL8169 keeps a
+ * 32-descriptor RX ring — without burst drains we can drop valid OFFER/ACK
+ * while a port mirror still shows the packets. */
+#ifndef DHCP_RX_DRAIN_BURST
+#define DHCP_RX_DRAIN_BURST 48u
 #endif
 
 /* ---- transient transaction state -------------------------------- *
@@ -116,6 +135,7 @@ static const uint8_t *opt_find(const uint8_t *opts, size_t opts_len,
     }
     return NULL;
 }
+
 
 /* RFC 2132 option 52: when the fixed `options` field is full, DHCP options
  * continue in the BOOTP `file` (bit0) and/or `sname` (bit1) fields. Many
@@ -280,8 +300,21 @@ static bool dhcp_send_request(uint32_t xid_be,
 
 /* ---- RX hook ---------------------------------------------------- */
 
+/* Rate-limited: explains why a BOOTP/DHCP reply was not applied (bootlog). */
+static void dhcp_rx_drop(unsigned *ctr, unsigned max, const char *why) {
+    if (*ctr >= max) return;
+    (*ctr)++;
+    kprintf("[dhcp] rx drop (%u/%u): %s\n", *ctr, max, why);
+}
+
 void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
-    if (len < 8u + DHCP_BOOTP_MIN_BYTES) return;   /* UDP hdr + BOOTP + cookie */
+    if (len < 8u + DHCP_BOOTP_MIN_BYTES) {
+        static unsigned n_len;
+        if (g_xact.in_flight && n_len++ < 4u)
+            kprintf("[dhcp] rx drop: len=%u need>=%u\n", (unsigned)len,
+                    (unsigned)(8u + DHCP_BOOTP_MIN_BYTES));
+        return;
+    }
 
     /* Skip the 8-byte UDP header (udp_recv passes us the UDP packet
      * starting at the UDP header). Parse BOOTP from raw offsets so we
@@ -290,8 +323,20 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
     const uint8_t *bp = u + 8;
     size_t         pl = len - 8;
 
-    if (pl < DHCP_BOOTP_MIN_BYTES) return;
-    if (bp[0] != DHCP_OP_REPLY) return;
+    if (pl < DHCP_BOOTP_MIN_BYTES) {
+        static unsigned n_pl;
+        if (g_xact.in_flight && n_pl++ < 4u)
+            kprintf("[dhcp] rx drop: bootp pl=%u need>=%u\n", (unsigned)pl,
+                    (unsigned)DHCP_BOOTP_MIN_BYTES);
+        return;
+    }
+    if (bp[0] != DHCP_OP_REPLY) {
+        static unsigned n_op;
+        if (g_xact.in_flight && n_op++ < 4u)
+            kprintf("[dhcp] rx drop: BOOTP op=%u not REPLY(2)\n",
+                    (unsigned)bp[0]);
+        return;
+    }
     /* Match xid before in_flight: avoids dropping unrelated BOOTP noise,
      * and pairs with a release fence after xid is written in dhcp_acquire(). */
     {
@@ -309,8 +354,11 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
     /* DHCP magic at BOOTP offset 236..239; need full DHCP_BOOTP_MIN_BYTES. */
     if (memcmp(bp + 236, dhcp_magic_cookie, 4) != 0) {
         static unsigned badmagic;
-        if (g_xact.in_flight && badmagic++ < 3u)
-            kprintf("[dhcp] rx bad DHCP magic (xid ok)\n");
+        if (g_xact.in_flight && badmagic++ < 8u) {
+            kprintf("[dhcp] rx drop: bad DHCP magic @236 (got %02x %02x %02x %02x)\n",
+                    (unsigned)bp[236], (unsigned)bp[237],
+                    (unsigned)bp[238], (unsigned)bp[239]);
+        }
         return;
     }
 
@@ -344,6 +392,15 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
             mt         = &inferred;
             mt_len     = 1;
         } else {
+            static unsigned n_infer;
+            if (g_xact.in_flight && n_infer++ < 10u) {
+                char yb[16];
+                net_format_ip(yb, yi);
+                kprintf("[dhcp] rx drop: no-opt53 infer yi=%s saw_off=%d rq=%d\n",
+                        yb, (int)g_xact.saw_offer,
+                        (int)__atomic_load_n(&g_xact.request_sent,
+                                             __ATOMIC_ACQUIRE));
+            }
             return;
         }
     }
@@ -364,12 +421,24 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
     }
 
     if (mt[0] == DHCP_MSG_OFFER) {
-        if (__atomic_load_n(&g_xact.request_sent, __ATOMIC_ACQUIRE)) return;
-        if (g_xact.saw_offer) return;
+        if (__atomic_load_n(&g_xact.request_sent, __ATOMIC_ACQUIRE)) {
+            static unsigned n_off_rs;
+            dhcp_rx_drop(&n_off_rs, 6u, "OFFER after REQUEST already sent");
+            return;
+        }
+        if (g_xact.saw_offer) {
+            static unsigned n_off_dup;
+            dhcp_rx_drop(&n_off_dup, 6u, "OFFER duplicate (already selected one)");
+            return;
+        }
 
         /* Capture yiaddr (or option 50) + server-id + lease hints now. */
         uint32_t yi = bootp_offered_ip_be(bp, pl);
-        if (yi == 0) return;
+        if (yi == 0) {
+            static unsigned n_off_yi;
+            dhcp_rx_drop(&n_off_yi, 8u, "OFFER yiaddr and opt50 both empty");
+            return;
+        }
 
         uint8_t l;
         const uint8_t *sid =
@@ -462,6 +531,12 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
         return;
     }
 
+    {
+        static unsigned n_unk;
+        if (g_xact.in_flight && n_unk++ < 10u)
+            kprintf("[dhcp] rx drop: unhandled opt53 msg=%u\n", (unsigned)mt[0]);
+    }
+
     /* DECLINE / RELEASE / INFORM are not for clients to receive. */
 }
 
@@ -496,15 +571,19 @@ static bool dhcp_wait(uint64_t deadline, const volatile bool *flag,
                       const volatile bool *flag_alt) {
     /* Poll every registered NIC — DHCP broadcasts may be received on a
      * non-default device depending on PCI probe order vs cabling. */
-    for (unsigned spin = 0; spin < 12u && pit_ticks() < deadline; spin++) {
-        dhcp_rx_drain_all();
-        if (*flag) return true;
-        if (flag_alt && *flag_alt) return true;
+    for (unsigned spin = 0; spin < 24u && pit_ticks() < deadline; spin++) {
+        for (unsigned b = 0; b < DHCP_RX_DRAIN_BURST; b++) {
+            dhcp_rx_drain_all();
+            if (*flag) return true;
+            if (flag_alt && *flag_alt) return true;
+        }
     }
     while (pit_ticks() < deadline) {
-        dhcp_rx_drain_all();
-        if (*flag) return true;
-        if (flag_alt && *flag_alt) return true;
+        for (unsigned b = 0; b < DHCP_RX_DRAIN_BURST; b++) {
+            dhcp_rx_drain_all();
+            if (*flag) return true;
+            if (flag_alt && *flag_alt) return true;
+        }
         sti();
         hlt();
         /* Ordering vs NIC MSI path that mutates saw_* while we sleep. */
@@ -540,6 +619,9 @@ bool dhcp_acquire(uint32_t timeout_ms, struct dhcp_lease *out) {
     if (offer_until <= t0) offer_until = t0 + 1;
 
     unsigned n_discover = 0;
+    /* Drop stale BOOTP noise before we fix the session xid. */
+    dhcp_rx_drain_all();
+
     while (pit_ticks() < offer_until && !g_xact.saw_offer && !g_xact.saw_nak) {
         n_discover++;
         if (!dhcp_send_discover(g_xact.xid)) {
@@ -548,8 +630,16 @@ bool dhcp_acquire(uint32_t timeout_ms, struct dhcp_lease *out) {
             return false;
         }
 
+        /* OFFER can land immediately; drain hard before we sleep the window. */
+        for (unsigned spin = 0; spin < DHCP_RX_DRAIN_BURST * 2u; spin++)
+            dhcp_rx_drain_all();
+        if (g_xact.saw_offer || g_xact.saw_nak)
+            break;
+
+        uint32_t gap_ms = (n_discover == 1u) ? DHCP_DISCOVER_INITIAL_WAIT_MS
+                                             : DHCP_DISCOVER_RETRY_GAP_MS;
         uint64_t chunk_end =
-            pit_ticks() + ((uint64_t)hz * (uint64_t)DHCP_DISCOVER_GAP_MS) / 1000u;
+            pit_ticks() + ((uint64_t)hz * (uint64_t)gap_ms) / 1000u;
         if (chunk_end > offer_until) chunk_end = offer_until;
         if (chunk_end <= pit_ticks()) chunk_end = pit_ticks() + 1;
 

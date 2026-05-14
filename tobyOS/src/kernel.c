@@ -56,9 +56,12 @@
 #include <tobyos/net.h>
 #include <tobyos/dns.h>
 #include <tobyos/tcp.h>
+#include <tobyos/tcp_echo.h>
+#include <tobyos/tcp_shell.h>
 #include <tobyos/http.h>
 #include <tobyos/xhci.h>
 #include <tobyos/usb_hub.h>
+#include <tobyos/usb_hid.h>
 #include <tobyos/virtio_gpu.h>
 #include <tobyos/gfx.h>
 #include <tobyos/mouse.h>
@@ -417,45 +420,69 @@ static void smp_init_bsp(void) {
 }
 
 static __attribute__((noreturn)) void idle_loop(void) {
-    /* Drive shell + cursor blink between IRQs. hlt() puts the CPU in
-     * C1 until the next interrupt -- both PIT (every 10 ms) and the
-     * keyboard wake us, so input feels instant and the cursor blinks
-     * smoothly without us spinning. */
     uint32_t hz = pit_hz();
     if (hz == 0) hz = 1;
+
     for (;;) {
-        hlt();
-        /* net_poll() stays for NICs without MSI (notably QEMU's e1000,
-         * which never advertises an MSI cap). MSI/MSI-X-driven NICs
-         * (virtio-net, e1000e, rtl8169) make this a fast no-op because
-         * the IRQ handler has already drained their rx_drain queue. */
+        /* Poll network devices that do not have working MSI/MSI-X. */
         net_poll();
-        /* xhci_poll() removed: M22 step 3e wires xHCI to MSI-X (or MSI),
-         * and the IRQ handler invokes the same poll body atomically.
-         * If MSI bring-up failed, xhci_pci_probe logs "staying polled"
-         * and USB stays dark -- a deliberate, visible failure rather
-         * than a silent fallback that masks broken interrupt routing. */
-        /* M26C: deferred hot-plug processing. The IRQ handler only
-         * RW1Cs the change bits + flips a bitmap; we do the actual
-         * Enable/Disable Slot work here so xhci_cmd's spin doesn't
-         * deadlock against the same-context MSI it's waiting for.
-         * usb_hub_poll() is rate-limited internally to ~5 Hz so the
-         * CPU cost stays bounded even with 4 hubs * 8 ports. Both
-         * functions are no-ops when no controller / no hubs exist. */
+
+        /* TCP services must be polled continuously after net_init(). */
+        tcp_echo_poll();
+        tcp_shell_poll();
+
+        /*
+         * Always drain xHCI once per loop.
+         *
+         * If xHCI IRQs work, this is usually a cheap no-op.
+         * If xHCI IRQs do not work on real hardware, this is the only
+         * thing keeping USB HID input responsive.
+         */
+        xhci_poll();
+
         xhci_service_port_changes();
         usb_hub_poll();
-        gui_tick();           /* recomposite if mouse moved or a window flipped */
+
+        /* GUI/window manager tick. */
+        gui_tick();
+
+        /* Optional low-rate USB diagnostic. This is okay temporarily,
+         * but remove it once you have the numbers because serial logging
+         * can still affect responsiveness.
+         */
+        static uint64_t last_usb_diag;
+        uint64_t now = pit_ticks();
+
+        if (now - last_usb_diag >= hz) {
+            last_usb_diag = now;
+
+            kprintf("[usbdiag] xhci_irq=%d hid=%d kbd=%d mouse=%d frames=%llu\n",
+                    xhci_irq_count(),
+                    usb_hid_count(),
+                    usb_hid_kbd_count(),
+                    usb_hid_mouse_count(),
+                    (unsigned long long)usb_hid_total_frames());
+        }
+
+        /* Local shell input. */
         shell_poll();
-        /* The blinking text-mode cursor would scribble over the GUI's
-         * compositor pass, so we skip the tick while a window is up. */
-        if (!gui_active()) console_tick(pit_ticks(), hz);
-        /* M22 boot self-test: only fires when built with
-         * -DACPI_M22_SELFTEST. In default builds this is a no-op
-         * inline expansion, so there's no per-tick cost. */
+
+        /* Text cursor only when GUI is inactive. */
+        if (!gui_active())
+            console_tick(pit_ticks(), hz);
+
         acpi_m22_selftest_tick();
+
+        /*
+         * Critical:
+         *
+         * If xHCI interrupts are enabled, hlt is good.
+         * If xHCI is polling-only, hlt makes USB HID PIT-limited and
+         * mouse movement becomes chunky.
+         */
+         __asm__ __volatile__("pause");
     }
 }
-
 /* Smoke-test handler for vector 3 (#BP). Demonstrates that the IDT
  * dispatch reaches C and that we can iretq cleanly back to the caller.
  * Without this, the default exception handler would panic on int3. */
@@ -2573,12 +2600,7 @@ void _start(void) {
      * historically a "won't boot" trigger.
      * M35E: COMPATIBILITY mode keeps networking up, so we now gate on
      * the more precise safemode_skip_net() predicate. */
-    if (safemode_skip_net()) {
-        kprintf("[safe] skipping net_init (NIC + DHCP + DNS) -- mode=%s\n",
-                safemode_tag());
-    } else {
-        (void)net_init();
-    }
+   
 
     /* Milestone 24B–24D self-test: DNS + TCP + full HTTP GET to
      * example.com. Wall-clock cost is noticeable on every boot
@@ -2726,29 +2748,64 @@ void _start(void) {
      * M35E: GUI + COMPATIBILITY both bring the compositor up, but
      * COMPATIBILITY skips the virtio-gpu fast path so we stick with
      * the firmware-provided framebuffer (most-tested code path). */
-    if (safemode_skip_gui()) {
+     if (safemode_skip_gui()) {
         kprintf("[safe] skipping gfx/mouse/gui/term/m14_init -- mode=%s\n",
                 safemode_tag());
         banner();
     } else {
         gfx_layer_init();
+
         if (safemode_skip_virtio_gpu()) {
             kprintf("[safe] mode=%s -- keeping Limine framebuffer "
                     "(skip virtio-gpu fast path)\n", safemode_tag());
         } else {
             virtio_gpu_install_backend();
         }
+
         mouse_init();
         gui_init();
         term_init();
         banner();
+
         /* Milestone 14: bring up settings + services + session BEFORE
          * shell_init so the desktop+login is already on screen by the
          * time the shell starts polling. The shell stays available for
-         * debugging (type at the prompt to use it once you've Exited
-         * Desktop or pressed F2). */
+         * debugging.
+         */
         m14_init();
+
+        /*
+         * Force one compositor pass before slow physical-hardware work
+         * such as NIC/DHCP starts.
+         */
+        kprintf("[boot] first gui_tick before net_init\n");
+        gui_tick();
     }
+
+    /*
+     * Bring networking up after the GUI. This lets real hardware show
+     * the desktop even if NIC probing or DHCP is slow/flaky.
+     */
+    if (safemode_skip_net()) {
+        kprintf("[safe] skipping net_init (NIC + DHCP + DNS) -- mode=%s\n",
+                safemode_tag());
+    } else {
+        kprintf("[boot] before net_init\n");
+
+        bool net_ok = net_init();
+
+        kprintf("[boot] after net_init ok=%d net_up=%d\n",
+                (int)net_ok, (int)net_is_up());
+
+        if (net_ok) {
+            kprintf("[boot] net_init OK; starting TCP services\n");
+            tcp_echo_init();
+            tcp_shell_init();
+        } else {
+            kprintf("[boot] net_init failed; TCP services not started\n");
+        }
+    }
+
     if (safemode_skip_services()) {
         kprintf("[safe] skipping pkg_init + selftests + devtest harnesses "
                 "(non-essential)\n");

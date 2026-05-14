@@ -42,6 +42,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/cpu.h>
+#include <tobyos/spinlock.h>
 #include <tobyos/irq.h>
 #include <tobyos/apic.h>
 
@@ -137,7 +138,7 @@
 
 /* ----- ring sizing ------------------------------------------------ */
 
-#define RX_DESC_COUNT     32u
+#define RX_DESC_COUNT     64u
 #define TX_DESC_COUNT     32u
 #define BUF_SIZE          2048u      /* per-descriptor data buffer */
 /* RX max packet size we tell the NIC -- slightly larger than the
@@ -177,6 +178,11 @@ static char              g_rtl_name[32];
 
 static uint8_t           g_irq_vector;
 static volatile uint64_t g_irq_count;
+
+/* Serialize RX ring + g_rx_idx between MSI and dhcp_rx_drain_all() on
+ * any CPU; cpu_irqsave alone is per-CPU and does not stop an AP from
+ * racing the same global ring (lost DHCP OFFER/ACK, DISCOVER loops). */
+static spinlock_t g_rtl_rx_lock = SPINLOCK_INIT;
 
 /* ----- MMIO helpers ---------------------------------------------- */
 
@@ -328,10 +334,8 @@ static bool rtl_tx_op(struct net_dev *dev, const void *frame, size_t len) {
 
 static void rtl_rx_drain_op(struct net_dev *dev) {
     (void)dev;
-    /* Serialize with rtl_irq_handler(): both walk g_rx_ring / g_rx_idx.
-     * dhcp_wait() and net_poll() call us with IF=1; MSI runs nested
-     * otherwise and corrupts the ring (lost DHCP OFFER/ACK). */
-    uint64_t irqf = cpu_irqsave();
+    /* spin_lock_irqsave: one owner across BSP/AP + MSI (see g_rtl_rx_lock). */
+    uint64_t irqf = spin_lock_irqsave(&g_rtl_rx_lock);
     /* Walk descriptors starting from where the NIC will write next.
      * For each one whose OWN bit is clear (NIC has filled it) take
      * the frame out, hand it to eth_recv, then re-arm the descriptor
@@ -360,7 +364,7 @@ static void rtl_rx_drain_op(struct net_dev *dev) {
 
         g_rx_idx = (uint16_t)((g_rx_idx + 1u) % RX_DESC_COUNT);
     }
-    cpu_irqrestore(irqf);
+    spin_unlock_irqrestore(&g_rtl_rx_lock, irqf);
 }
 
 /* MSI handler. ISR is W1C; we read the latched bits, write them

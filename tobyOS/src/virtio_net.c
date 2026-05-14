@@ -98,6 +98,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/cpu.h>
+#include <tobyos/spinlock.h>
 #include <tobyos/irq.h>
 #include <tobyos/apic.h>
 
@@ -263,6 +264,7 @@ struct vnet_dev {
  * declined here (mirrors what e1000.c does). */
 static struct vnet_dev g_vnet;
 static bool            g_vnet_bound;
+static spinlock_t      g_vnet_rx_lock = SPINLOCK_INIT;
 
 /* ---- MMIO helpers --------------------------------------------- */
 
@@ -472,7 +474,7 @@ static void vnet_rx_drain_op(struct net_dev *dev) {
     struct vnet_dev   *d = &g_vnet;
     struct vnet_queue *q = &d->rx;
 
-    uint64_t irqf = cpu_irqsave();
+    uint64_t irqf = spin_lock_irqsave(&g_vnet_rx_lock);
     bool reposted = false;
     while (q->used_idx != *q->used_idx_ptr) {
         struct virtq_used_elem elem = q->used_ring[q->used_idx % q->qsize];
@@ -498,7 +500,7 @@ static void vnet_rx_drain_op(struct net_dev *dev) {
         *q->avail_idx_ptr = q->avail_idx;
         *q->notify = q->qid;
     }
-    cpu_irqrestore(irqf);
+    spin_unlock_irqrestore(&g_vnet_rx_lock, irqf);
 }
 
 /* ---- capability walk ------------------------------------------ */

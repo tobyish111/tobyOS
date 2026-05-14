@@ -10,7 +10,7 @@
  *
  * Limits / non-goals (Milestone 24A):
  *   - one network interface (whatever net_default() returns)
- *   - DISCOVER is retransmitted during the offer-phase window (see dhcp.c)
+ *   - DISCOVER: long listen after the first send, then slower retries (dhcp.c)
  *   - no lease renewal (we just log T1/T2 and lease seconds)
  *   - no INFORM / RELEASE / DECLINE
  *   - no per-vendor identifiers

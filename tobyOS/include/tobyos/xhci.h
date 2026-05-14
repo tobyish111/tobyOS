@@ -138,4 +138,7 @@ uint8_t xhci_iter_root_port_with_device(int *ix);
  * even if xHCI was never bound. */
 void xhci_service_port_changes(void);
 
+bool xhci_irq_is_enabled(void);
+bool xhci_needs_polling(void);
+
 #endif /* TOBYOS_XHCI_H */

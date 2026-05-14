@@ -132,6 +132,8 @@ C_SRCS := src/kernel.c \
           src/dhcp.c \
           src/dns.c \
           src/tcp.c \
+          src/tcp_echo.c \
+          src/tcp_shell.c \
           src/http.c \
           src/socket.c \
           src/gfx.c \
@@ -1801,8 +1803,8 @@ fullboot:
 # Live ISO rebuild with minimal kmain harness work (faster USB boots).
 .PHONY: quickiso
 quickiso:
-	rm -f src/kernel.o
-	$(MAKE) $(ISO) EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT"
+	$(MAKE) clean
+	$(MAKE) EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT"
 
 # Milestone-17 self-test build. Wipes intermediate artifacts and
 # rebuilds the kernel with -DPKG_M17_SELFTEST defined so the boot

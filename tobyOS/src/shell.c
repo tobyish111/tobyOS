@@ -54,15 +54,48 @@
 #include <tobyos/drvmatch.h>
 #include <tobyos/slog.h>
 #include <tobyos/sectest.h>
+#include <tobyos/spinlock.h>
 
 extern volatile struct limine_module_request module_req;
 
 #define LINE_MAX 256
 #define ARG_MAX  16
 
+/* Serialises execute_line() between keyboard shell_poll and remote
+ * tcp_shell (both use the shared `line` buffer). */
+static spinlock_t g_shell_line_lock = SPINLOCK_INIT;
+
 static char line[LINE_MAX];
 static size_t line_len;
 
+static shell_write_fn_t g_shell_out;
+static void *g_shell_out_ctx;
+
+void shell_set_output(shell_write_fn_t fn, void *ctx) {
+    g_shell_out = fn;
+    g_shell_out_ctx = ctx;
+}
+
+void shell_write(const char *s) {
+    if (!s) return;
+
+    if (g_shell_out) {
+        g_shell_out(s, g_shell_out_ctx);
+    } else {
+        kprintf("%s", s);
+    }
+}
+
+void shell_printf(const char *fmt, ...) {
+    char buf[512];
+
+    va_list ap;
+    va_start(ap, fmt);
+    kvsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    shell_write(buf);
+}
 /* ---- job table (milestone 8) ----------------------------------- *
  *
  * Tiny fixed-size table tracking shell-launched background processes.
@@ -343,9 +376,9 @@ static void cmd_unsetenv(int argc, char **argv) {
 
 static void cmd_help(int argc, char **argv) {
     (void)argc; (void)argv;
-    kprintf("commands:\n");
+    shell_write("commands:\n");
     for (const struct cmd *c = cmds; c->name; c++) {
-        kprintf("  %-8s  %s\n", c->name, c->help);
+        shell_printf("  %-8s  %s\n", c->name, c->help);
     }
 }
 
@@ -356,11 +389,10 @@ static void cmd_clear(int argc, char **argv) {
 
 static void cmd_echo(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
-        kprintf("%s%s", argv[i], i + 1 < argc ? " " : "");
+        shell_printf("%s%s", argv[i], i + 1 < argc ? " " : "");
     }
-    kprintf("\n");
+    shell_write("\n");
 }
-
 static void cmd_mem(int argc, char **argv) {
     (void)argc; (void)argv;
     size_t total = pmm_total_pages();
@@ -2565,6 +2597,7 @@ void shell_init(void) {
  * (with a kprintf so the caller notices) instead of stomping memory. */
 void shell_run_test_line(const char *in) {
     if (!in) return;
+    uint64_t irqf = spin_lock_irqsave(&g_shell_line_lock);
     size_t n = 0;
     while (in[n] && n + 1 < LINE_MAX) {
         line[n] = in[n];
@@ -2583,6 +2616,7 @@ void shell_run_test_line(const char *in) {
     execute_line();
     line_len = 0;
     line[0]  = '\0';
+    spin_unlock_irqrestore(&g_shell_line_lock, irqf);
 }
 
 void shell_poll(void) {
@@ -2598,9 +2632,13 @@ void shell_poll(void) {
         if (ch == '\n') {
             line[line_len] = '\0';
             kputc('\n');
-            execute_line();
-            line_len = 0;
-            line[0]  = '\0';
+            {
+                uint64_t irqf = spin_lock_irqsave(&g_shell_line_lock);
+                execute_line();
+                line_len = 0;
+                line[0]  = '\0';
+                spin_unlock_irqrestore(&g_shell_line_lock, irqf);
+            }
             prompt();
             continue;
         }
