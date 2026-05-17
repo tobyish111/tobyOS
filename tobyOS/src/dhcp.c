@@ -506,6 +506,21 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
         net_format_ip(yb, g_xact.offered_ip_be);
         net_format_ip(sb, g_xact.server_id_be);
         kprintf("[dhcp] OFFER  yiaddr=%s server=%s\n", yb, sb);
+
+        /* HP Realtek guardrail: once an OFFER is accepted, emit REQUEST
+         * immediately. The failing bare-metal pattern was
+         * DISCOVER/OFFER/OFFER/retry with no REQUEST on the wire, which
+         * means the state transition was getting lost before the outer
+         * wait loop sent step 3. */
+        if (g_xact.server_id_be != 0 &&
+            !__atomic_exchange_n(&g_xact.request_sent, 1u, __ATOMIC_ACQ_REL)) {
+            if (!dhcp_send_request(g_xact.xid,
+                                   g_xact.offered_ip_be,
+                                   g_xact.server_id_be)) {
+                kprintf("[dhcp] REQUEST send failed from OFFER fast path\n");
+                __atomic_store_n(&g_xact.request_sent, 0u, __ATOMIC_RELEASE);
+            }
+        }
         return;
     }
 
@@ -692,11 +707,13 @@ bool dhcp_acquire(uint32_t timeout_ms, struct dhcp_lease *out) {
         g_xact.in_flight = false;
         return false;
     }
-    __atomic_store_n(&g_xact.request_sent, 1u, __ATOMIC_RELEASE);
-    if (!dhcp_send_request(g_xact.xid, g_xact.offered_ip_be, g_xact.server_id_be)) {
-        kprintf("[dhcp] REQUEST send failed (NIC tx error)\n");
-        g_xact.in_flight = false;
-        return false;
+    if (!__atomic_load_n(&g_xact.request_sent, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_xact.request_sent, 1u, __ATOMIC_RELEASE);
+        if (!dhcp_send_request(g_xact.xid, g_xact.offered_ip_be, g_xact.server_id_be)) {
+            kprintf("[dhcp] REQUEST send failed (NIC tx error)\n");
+            g_xact.in_flight = false;
+            return false;
+        }
     }
 
     /* Step 4: wait ACK (or NAK). Step 5: caller copies lease → net_apply_lease. */

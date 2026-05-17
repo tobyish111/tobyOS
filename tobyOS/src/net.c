@@ -194,43 +194,6 @@ static void net_dhcp_retry_gap(struct net_dev *nd, unsigned ms) {
     }
 }
 
-static bool net_wait_link(struct net_dev *nd) {
-    if (!nd || !nd->link_up) return true;
-    if (nd->link_up(nd)) {
-        kprintf("[net] link is up on %s\n", nd->name ? nd->name : "?");
-        return true;
-    }
-
-#ifdef FAST_BOOT
-    enum { link_wait_ms = 5000u };
-#else
-    enum { link_wait_ms = 8000u };
-#endif
-    kprintf("[net] waiting up to %ums for link on %s before DHCP\n",
-            (unsigned)link_wait_ms, nd->name ? nd->name : "?");
-
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-    uint64_t deadline =
-        pit_ticks() + ((uint64_t)hz * (uint64_t)link_wait_ms) / 1000u;
-    if (deadline <= pit_ticks()) deadline = pit_ticks() + 1;
-
-    while (pit_ticks() < deadline) {
-        if (nd->link_up(nd)) {
-            kprintf("[net] link became ready on %s\n",
-                    nd->name ? nd->name : "?");
-            return true;
-        }
-        if (nd->rx_drain) nd->rx_drain(nd);
-        sti();
-        hlt();
-    }
-
-    kprintf("[net] WARN: link still down on %s; trying DHCP anyway\n",
-            nd->name ? nd->name : "?");
-    return false;
-}
-
 /* Apply a successful DHCP lease into the kernel globals. Logged with
  * a single human-readable line so post-mortem analysis is one grep. */
 static void net_apply_lease(const struct dhcp_lease *L, const char *src) {
@@ -300,13 +263,6 @@ bool net_init(void) {
     arp_init();
     sock_init();
     tcp_init();
-    bool link_ready = net_wait_link(nd);
-    if (link_ready) {
-        /* Carrier can become visible before small broadcast RX is fully
-         * reliable on bare metal. Let the PHY/switch settle briefly so
-         * DHCP does not lose the first OFFER/ACK burst. */
-        net_dhcp_retry_gap(nd, 250u);
-    }
 
     /* g_my_ip stays 0 across the DHCP handshake: ip_send and udp_send
      * stamp the source IP from g_my_ip, which is exactly what BOOTP
@@ -320,6 +276,10 @@ bool net_init(void) {
     g_my_dns_be  = 0;
     g_net_up     = true;          /* mark up so udp_send / arp_send work */
     g_net_status = NET_STATUS_DHCP_WAIT;
+
+    /* HP Realtek guardrail: send the first DISCOVER immediately after
+     * stack init. Do not add a driver-specific pre-DHCP link wait here;
+     * that previously produced boots with no DHCP packets on the wire. */
 
     /* Try DHCP: DISCOVER → OFFER → REQUEST → ACK; dhcp.c uses ~70% of the
      * budget waiting for OFFER (with DISCOVER retries) and the rest for ACK. */

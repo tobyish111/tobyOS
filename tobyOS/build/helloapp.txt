@@ -1,3 +1,0 @@
-tobyOS helloapp -- installed via `pkg install helloapp`.
-Launcher entry: 'Hello Pkg' -> /data/apps/helloapp.elf
-Remove with: pkg remove helloapp

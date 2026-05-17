@@ -1976,11 +1976,15 @@ void gui_tick(void) {
     struct proc *cur = current_proc();
     bool on_pid0 = (cur && cur->pid == 0);
 
-    if (on_pid0 && g.input_boost_pid > 0) {
+    if (g.input_boost_pid > 0) {
         int pid = g.input_boost_pid;
         g.input_boost_pid = 0;
-        sched_boost_pid(pid);
-        sched_yield();
+        if (cur && cur->pid != pid) {
+            sched_boost_pid(pid);
+            sched_yield();
+            cur = current_proc();
+            on_pid0 = (cur && cur->pid == 0);
+        }
     }
 
     /* Deferred BOOTLOG.TXT + UDP boot log: MSC on the live USB may
@@ -2594,7 +2598,7 @@ int gui_window_flip(struct window *w) {
     return 0;
 }
 
-/* ---- keyboard delivery (called from kbd_irq) ---------------------- *
+/* ---- keyboard delivery (called from keyboard IRQ / USB HID poll) --- *
  *
  * Milestone 11: when the GUI is active, the keyboard IRQ no longer
  * pushes characters into the shell's text-mode ring (kbd buf_push).
@@ -2603,9 +2607,11 @@ int gui_window_flip(struct window *w) {
  * window-manager layer. The user-space toolkit then routes the event
  * to the focused widget inside that window.
  *
- * No spinlock needed: the window list is only mutated from syscall
- * context, and the IRQ that this is called from already runs with
- * IF=0 (kbd_irq -> isr stub clears IF). */
+ * Linux's input shape is producer -> event queue -> consumer wakeup.
+ * Match that here: posting a key prioritises the owning process, but
+ * does not mark the compositor dirty. The app will dirty/flip its
+ * window after it consumes the event, avoiding a stale repaint before
+ * the keystroke is visible. */
 void gui_post_key(uint8_t c) {
     if (!g.ready || !g.active) return;
     struct window *w = g.z_top;
@@ -2618,7 +2624,6 @@ void gui_post_key(uint8_t c) {
     }
     enqueue_event(w, GUI_EV_KEY, 0, 0, 0, c);
     g.input_boost_pid = w->owner_pid;
-    g.dirty = true;   /* allow the compositor to repaint if anything visual changed */
 }
 
 int gui_window_poll_event(struct window *w, struct gui_event *out) {

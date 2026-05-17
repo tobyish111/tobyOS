@@ -2600,31 +2600,11 @@ void _start(void) {
                 (unsigned)0x40);
     }
     smp_start_aps();         /* INIT-SIPI-SIPI (BSP/IO APIC already up) */
-    /* Networking comes up AFTER SMP so the boot log reads top-to-bottom
-     * in subsystem order. Failure is non-fatal -- the rest of the OS
-     * still boots and the shell will say "no NIC" if you call ifconfig.
-     * M28D: safe mode skips the NIC entirely -- a flaky e1000 was
-     * historically a "won't boot" trigger.
-     * M35E: COMPATIBILITY mode keeps networking up, so we now gate on
-     * the more precise safemode_skip_net() predicate. */
-    bool net_ok = false;
-    if (safemode_skip_net()) {
-        kprintf("[safe] skipping net_init (NIC + DHCP + DNS) -- mode=%s\n",
-                safemode_tag());
-    } else {
-        kprintf("[boot] before net_init\n");
-        net_ok = net_init();
-        kprintf("[boot] after net_init ok=%d net_up=%d\n",
-                (int)net_ok, (int)net_is_up());
-        if (net_ok) {
-            kprintf("[boot] net_init OK; starting TCP services\n");
-            tcp_echo_init();
-            tcp_shell_init();
-            ssh_init();
-        } else {
-            kprintf("[boot] net_init failed; TCP services not started\n");
-        }
-    }
+    /* Networking intentionally starts after the GUI/input layer setup
+     * below, but before desktop/login services are launched. On the HP
+     * Realtek 8168 machine, moving NIC/DHCP before GUI setup regressed
+     * into "no DHCP packets observed on the wire"; moving it after
+     * login startup let userspace scheduling prevent DHCP from starting. */
 
     /* Milestone 24B–24D self-test: DNS + TCP + full HTTP GET to
      * example.com. Wall-clock cost is noticeable on every boot
@@ -2790,7 +2770,36 @@ void _start(void) {
         gui_init();
         term_init();
         banner();
+    }
 
+    /*
+     * Bring networking up after the GUI/input layers are initialised, but
+     * before m14_init launches login and gui_tick can yield into userspace.
+     * This preserves the HP Realtek timing guardrail without letting the
+     * desktop scheduler prevent DHCP from ever starting.
+     */
+    if (safemode_skip_net()) {
+        kprintf("[safe] skipping net_init (NIC + DHCP + DNS) -- mode=%s\n",
+                safemode_tag());
+    } else {
+        kprintf("[boot] before net_init\n");
+
+        bool net_ok = net_init();
+
+        kprintf("[boot] after net_init ok=%d net_up=%d\n",
+                (int)net_ok, (int)net_is_up());
+
+        if (net_ok) {
+            kprintf("[boot] net_init OK; starting TCP services\n");
+            tcp_echo_init();
+            tcp_shell_init();
+            ssh_init();
+        } else {
+            kprintf("[boot] net_init failed; TCP services not started\n");
+        }
+    }
+
+    if (!safemode_skip_gui()) {
         /* Milestone 14: bring up settings + services + session BEFORE
          * shell_init so the desktop+login is already on screen by the
          * time the shell starts polling. The shell stays available for
