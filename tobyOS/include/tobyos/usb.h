@@ -138,6 +138,11 @@ _Static_assert(sizeof(struct usb_endpoint_desc) == 7, "endpoint desc must be 7 B
 #define USB_CLASS_HUB            0x09     /* M26B: USB hub class */
 #define USB_CLASS_MASS_STORAGE   0x08
 
+#define USB_SPEED_FULL           1
+#define USB_SPEED_LOW            2
+#define USB_SPEED_HIGH           3
+#define USB_SPEED_SUPER          4
+
 /* HID interface protocols (USB IF: boot subclass uses 1=kbd / 2=mouse;
  * many real devices use bInterfaceSubClass==0 with the same protocol
  * codes, or protocol==0 with no separate declaration — usb_hid.c has
@@ -295,6 +300,18 @@ struct usb_device {
     void    *hid_state;
     void   (*int_complete)(struct usb_device *dev,
                            const uint8_t *buf, uint32_t len);
+
+    /* Host-controller-neutral hooks. xHCI fills these with wrappers
+     * around its TRB rings; UHCI/OHCI/EHCI schedulers can fill the
+     * same hooks so class drivers do not care which HCI is underneath.
+     */
+    bool   (*control_xfer)(struct usb_device *dev,
+                           uint8_t bm_request_type, uint8_t b_request,
+                           uint16_t w_value, uint16_t w_index,
+                           void *buf, uint16_t w_length);
+    void   (*submit_int_in)(struct usb_device *dev);
+    void    *hci_priv;
+    void    *hci_dev_priv;
 
     /* ---- Optional bulk-IN/bulk-OUT pair (USB Mass Storage / BBB) ----
      *

@@ -28,6 +28,8 @@ static const struct drvdb_pci_entry pci_table[] = {
     { 0x1AF4, 0x1041, "virtio-net (modern)",  "virtio-net", DRVDB_SUPPORTED },
     { 0x1AF4, 0x1001, "virtio-blk (legacy)",  "virtio-blk", DRVDB_SUPPORTED },
     { 0x1AF4, 0x1042, "virtio-blk (modern)",  "virtio-blk", DRVDB_SUPPORTED },
+    { 0x1AF4, 0x1005, "virtio-rng (legacy)",  "virtio-rng", DRVDB_SUPPORTED },
+    { 0x1AF4, 0x1044, "virtio-rng (modern)",  "virtio-rng", DRVDB_SUPPORTED },
     { 0x1AF4, 0x1004, "virtio-scsi (legacy)", NULL,          DRVDB_UNSUPPORTED },
     { 0x1AF4, 0x1048, "virtio-scsi (modern)", NULL,          DRVDB_UNSUPPORTED },
     { 0x1AF4, 0x1050, "virtio-gpu",           "virtio-gpu", DRVDB_PARTIAL   },
@@ -83,6 +85,7 @@ static const struct drvdb_pci_entry pci_table[] = {
     /* Wireless PCI devices (not on the Ethernet stack — informational). */
     { 0x8086, 0x2723, "Intel Wi-Fi 6 AX200",     NULL,      DRVDB_UNSUPPORTED },
     { 0x8086, 0x2725, "Intel Wi-Fi 6E AX210",    NULL,      DRVDB_UNSUPPORTED },
+    { 0x10EC, 0xB723, "Realtek RTL8723BE Wi-Fi", NULL,      DRVDB_UNSUPPORTED },
     { 0x10EC, 0x8852, "Realtek RTL8852BE Wi-Fi", NULL,      DRVDB_UNSUPPORTED },
     { 0x10EC, 0xC852, "Realtek RTL8822CE Wi-Fi", NULL,      DRVDB_UNSUPPORTED },
 
@@ -94,7 +97,21 @@ static const struct drvdb_pci_entry pci_table[] = {
     { 0x8086, 0x29C0, "Intel Q35 host bridge",     NULL,      DRVDB_PARTIAL },
     { 0x8086, 0x2918, "Intel ICH9 LPC",            NULL,      DRVDB_PARTIAL },
     { 0x8086, 0x2922, "Intel ICH9 AHCI",           "blk_ahci", DRVDB_SUPPORTED },
-    { 0x8086, 0x2934, "Intel ICH9 USB UHCI",       NULL,      DRVDB_UNSUPPORTED },
+    { 0x8086, 0x2934, "Intel ICH9 USB UHCI",       "usb_legacy", DRVDB_PARTIAL },
+
+    /* HP Skylake-era laptop chipset observed on the Realtek RTL8168 test box. */
+    { 0x8086, 0x1904, "Intel Skylake host bridge",       NULL,        DRVDB_PARTIAL },
+    { 0x8086, 0x1911, "Intel Skylake Gaussian Mixture Model", NULL,   DRVDB_PARTIAL },
+    { 0x8086, 0x1916, "Intel HD Graphics 520",           NULL,        DRVDB_PARTIAL },
+    { 0x8086, 0x9D03, "Intel 100 Series-LP SATA AHCI",   "blk_ahci", DRVDB_SUPPORTED },
+    { 0x8086, 0x9D12, "Intel 100 Series-LP PCIe Root Port #3", NULL,  DRVDB_PARTIAL },
+    { 0x8086, 0x9D13, "Intel 100 Series-LP PCIe Root Port #4", NULL,  DRVDB_PARTIAL },
+    { 0x8086, 0x9D21, "Intel 100 Series-LP thermal subsystem", NULL,  DRVDB_UNSUPPORTED },
+    { 0x8086, 0x9D23, "Intel 100 Series-LP SMBus",       NULL,        DRVDB_UNSUPPORTED },
+    { 0x8086, 0x9D2F, "Intel 100 Series-LP USB 3.0 xHCI", "xhci",     DRVDB_SUPPORTED },
+    { 0x8086, 0x9D3A, "Intel 100 Series-LP Management Engine", NULL,  DRVDB_UNSUPPORTED },
+    { 0x8086, 0x9D48, "Intel 100 Series-LP LPC/eSPI",    NULL,        DRVDB_PARTIAL },
+    { 0x8086, 0x9D70, "Intel 100 Series-LP HD Audio",    "audio_hda", DRVDB_PARTIAL },
 
     /* QEMU bespoke PCI IDs. */
     { 0x1B36, 0x000D, "QEMU XHCI controller",      "xhci",    DRVDB_SUPPORTED },

@@ -33,6 +33,8 @@ OVMF_VARS_SZ  := 540672
 
 CFLAGS := --target=x86_64-elf \
           -Iinclude \
+          -Ithird_party/monocypher-4.0.2/src \
+          -Ithird_party/monocypher-4.0.2/src/optional \
           -ffreestanding -fno-stack-protector -fno-pie -fno-pic \
           -fno-unwind-tables -fno-asynchronous-unwind-tables \
           -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
@@ -43,9 +45,9 @@ CFLAGS := --target=x86_64-elf \
 # no inline example.com DNS+TCP+HTTP smoke in kmain (that alone can add
 # many seconds when offline).  For the old behaviour: `make fullboot`.
 #
-# For USB dev iteration, `make quickiso` adds -DQUICK_BOOT so kmain skips
+# Default builds also add -DQUICK_BOOT so kmain skips
 # always-on harness spawns (devtest_boot_run, M26A/M27A, M28–M35 circles).
-EXTRA_CFLAGS ?= -DFAST_BOOT
+EXTRA_CFLAGS ?= -DFAST_BOOT -DQUICK_BOOT
 
 LDFLAGS := -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 -T linker.ld
 
@@ -56,6 +58,11 @@ INSTALL_IMG := build/install.img
 LIMINE_DIR  := limine
 LIMINE_REPO := https://github.com/limine-bootloader/limine.git
 LIMINE_TAG  := v11.x-binary
+LIMINE_FILES := $(LIMINE_DIR)/limine \
+                $(LIMINE_DIR)/limine-bios.sys \
+                $(LIMINE_DIR)/limine-bios-cd.bin \
+                $(LIMINE_DIR)/limine-uefi-cd.bin \
+                $(LIMINE_DIR)/BOOTX64.EFI
 
 # Milestone 20: reserved boot region on an installed disk, in bytes.
 # MUST match INSTALLER_BOOT_BYTES in include/tobyos/installer.h. The
@@ -118,7 +125,9 @@ C_SRCS := src/kernel.c \
           src/e1000.c \
           src/e1000e.c \
           src/virtio_net.c \
+          src/virtio_rng.c \
           src/rtl8169.c \
+          src/usb_legacy.c \
           src/xhci.c \
           src/usb_hid.c \
           src/usb_hub.c \
@@ -134,6 +143,8 @@ C_SRCS := src/kernel.c \
           src/tcp.c \
           src/tcp_echo.c \
           src/tcp_shell.c \
+          src/ssh.c \
+          src/ssh_crypto.c \
           src/http.c \
           src/socket.c \
           src/gfx.c \
@@ -161,6 +172,7 @@ C_SRCS := src/kernel.c \
           src/drvmatch.c \
           src/theme.c \
           src/notify.c \
+          src/rng.c \
           src/sec.c \
           src/sysprot.c \
           src/sectest.c \
@@ -169,7 +181,9 @@ C_SRCS := src/kernel.c \
           src/virtio_blk.c \
           src/usbreg.c \
           src/hwdb.c \
-          src/m35selftest.c
+          src/m35selftest.c \
+          third_party/monocypher-4.0.2/src/monocypher.c \
+          third_party/monocypher-4.0.2/src/optional/monocypher-ed25519.c
 
 S_SRCS := src/isr_stubs.S \
           src/syscall_entry.S \
@@ -343,7 +357,9 @@ PKGBUILD_BIN        := build/pkgbuild
 SDK_SAMPLES         := hello_cli hello_gui notes_app
 SDK_SAMPLE_TPKGS    := $(addprefix build/samples/,$(addsuffix .tpkg,$(SDK_SAMPLES)))
 
-.PHONY: all run run-uefi run-ahci run-ahci-uefi run-nvme run-nvme-uefi \
+.DEFAULT_GOAL := all
+
+.PHONY: help all build iso rebuild qemu run run-ssh run-uefi run-ahci run-ahci-uefi run-nvme run-nvme-uefi \
         run-virtio-net run-virtio-net-uefi run-e1000e run-e1000e-uefi \
         run-rtl8139 run-rtl8139-uefi \
         run-xhci run-xhci-uefi \
@@ -358,7 +374,50 @@ SDK_SAMPLE_TPKGS    := $(addprefix build/samples/,$(addsuffix .tpkg,$(SDK_SAMPLE
         install-target usb-image \
         mkdisk-gpt gpt-disk run-gpt run-gpt-uefi run-gpt-nvme
 
+help:
+	@echo "tobyOS make commands"
+	@echo ""
+	@echo "Build:"
+	@echo "  make              Build the ISO and persistent disk image"
+	@echo "  make build        Same as make"
+	@echo "  make iso          Build only tobyOS.iso"
+	@echo "  make quickiso     Clean rebuild with FAST_BOOT + QUICK_BOOT"
+	@echo "  make fullboot     Rebuild without FAST_BOOT"
+	@echo "  make rebuild      Clean, then build"
+	@echo ""
+	@echo "Run:"
+	@echo "  make run          Boot ISO in QEMU with IDE disk"
+	@echo "  make qemu         Same as make run"
+	@echo "  make run-ssh      Boot QEMU with SSH on localhost:2222 + virtio-rng"
+	@echo "  make run-uefi     Boot ISO in QEMU with UEFI firmware"
+	@echo "  make run-installed       Boot the installed disk image"
+	@echo "  make run-installed-uefi  Boot installed disk image with UEFI"
+	@echo ""
+	@echo "Images and tools:"
+	@echo "  make clean        Remove build outputs; preserves disk.img"
+	@echo "  make wipe-disk    Reformat disk.img"
+	@echo "  make usb-image    Copy hybrid ISO to tobyOS-usb.img"
+	@echo "  make inspect      Show kernel ELF headers"
+	@echo "  make sdk-pack     Build the SDK tarball"
+	@echo ""
+	@echo "Tests:"
+	@echo "  make m17test m20test m22shutdowntest m24dtest m34test m35test m36test sectest"
+	@echo ""
+	@echo "Hardware variants:"
+	@echo "  make run-ahci run-nvme run-gpt run-xhci run-virtio-gpu run-virtio-net"
+	@echo "  make run-ahci-uefi run-nvme-uefi run-gpt-uefi run-xhci-uefi"
+
 all: $(ISO) $(DISK_IMG)
+
+build: all
+
+iso: $(ISO)
+
+rebuild:
+	$(MAKE) clean
+	$(MAKE) all
+
+qemu: run
 
 programs: $(PROGRAMS)
 
@@ -369,10 +428,16 @@ install-img: $(INSTALL_IMG)
 
 # ---------- Compile ----------
 
-src/%.o: src/%.c $(HEADERS)
+src/%.o: src/%.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 
-src/%.o: src/%.S $(HEADERS)
+src/%.o: src/%.S $(HEADERS) Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+
+third_party/monocypher-4.0.2/src/%.o: third_party/monocypher-4.0.2/src/%.c Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+
+third_party/monocypher-4.0.2/src/optional/%.o: third_party/monocypher-4.0.2/src/optional/%.c Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 
 # ---------- Link ----------
@@ -382,7 +447,8 @@ $(KERNEL): $(OBJS) linker.ld
 
 # ---------- Clone Limine binary release ----------
 
-$(LIMINE_DIR):
+$(LIMINE_FILES):
+	rm -rf $(LIMINE_DIR)
 	git clone $(LIMINE_REPO) --branch=$(LIMINE_TAG) --depth=1 $(LIMINE_DIR)
 
 # ---------- Kernel-mode programs (loaded via Limine modules) ----------
@@ -1253,7 +1319,7 @@ $(INITRD_TAR): $(PROGRAMS) initrd/etc/motd initrd/readme.txt \
 # zero is enough to satisfy the safety check, and we want to know
 # loudly if a future xorriso change breaks the assumption.
 
-$(BASE_ISO): $(KERNEL) limine_base.conf $(LIMINE_DIR) $(INITRD_TAR)
+$(BASE_ISO): $(KERNEL) limine_base.conf $(LIMINE_FILES) $(INITRD_TAR)
 	rm -rf build/iso_base
 	mkdir -p build/iso_base/boot/limine
 	mkdir -p build/iso_base/EFI/BOOT
@@ -1290,7 +1356,7 @@ $(INSTALL_IMG): $(BASE_ISO)
 	cp $(BASE_ISO) $(INSTALL_IMG)
 	truncate -s $(INSTALL_BOOT_BYTES) $(INSTALL_IMG)
 
-$(ISO): $(KERNEL) limine.conf $(LIMINE_DIR) $(INITRD_TAR) $(INSTALL_IMG)
+$(ISO): $(KERNEL) limine.conf $(LIMINE_FILES) $(INITRD_TAR) $(INSTALL_IMG)
 	rm -rf iso
 	mkdir -p iso/boot/limine
 	mkdir -p iso/EFI/BOOT
@@ -1787,7 +1853,7 @@ sdk-pack: sdk sdk-samples
 	cd build && tar -czf $(notdir $(SDK_TARBALL)) sdk-$(SDK_VERSION)
 	@echo "[sdk] packed $(SDK_TARBALL)"
 
-# Same as default `make all` today (EXTRA_CFLAGS defaults to -DFAST_BOOT).
+# Same as default `make all` today.
 .PHONY: fastboot
 fastboot:
 	rm -f src/kernel.o src/net.o
@@ -1927,6 +1993,27 @@ run: $(ISO) $(DISK_IMG)
 	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== qemu.log -- non-timer entries ==="; \
 	grep -v "INT=0x08" $(LOGDIR)/qemu.log | head -n 200 2>/dev/null || echo "(empty)"
+
+run-ssh: $(ISO) $(DISK_IMG)
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log $(LOGDIR)/net.pcap
+	@echo "SSH will be available at localhost:2222 once the guest finishes booting."
+	$(QEMU) -cdrom $(ISO) \
+	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
+	        -boot d \
+	        -smp 4 \
+	        -object rng-builtin,id=rng0 \
+	        -device virtio-rng-pci,rng=rng0,disable-legacy=on \
+	        -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=udp::5555-:5555 \
+	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
+	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -debugcon file:$(LOGDIR)/debug.log \
+	        -d guest_errors -D $(LOGDIR)/qemu.log \
+	        -no-reboot; \
+	echo ""; echo "=== debugcon (port 0xE9) ==="; \
+	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
+	echo ""; echo "=== serial (COM1, SSH) ==="; \
+	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 # ---------- Milestone 20: boot the INSTALLED disk ----------
 #

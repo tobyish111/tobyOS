@@ -593,6 +593,14 @@ static const char g_cursor[CUR_H][CUR_W + 1] = {
     "       ###  ",
 };
 
+static struct {
+    bool visible;
+    int x;
+    int y;
+    uint32_t saved[CUR_W * CUR_H];
+    uint8_t valid[CUR_W * CUR_H];
+} g_cursor_overlay;
+
 void gfx_draw_cursor(int x, int y) {
     if (!g.ready) return;
     for (int dy = 0; dy < CUR_H; dy++) {
@@ -613,6 +621,72 @@ void gfx_draw_cursor(int x, int y) {
      * almost always already in the dirty union from window paints
      * earlier in the pass; the union with itself is cheap. */
     gfx_mark_dirty_rect(x, y, CUR_W, CUR_H);
+}
+
+static bool cursor_overlay_supported(void) {
+    return g.ready && g.fb && ((g.backend ? g.backend : &g_backend_limine) == &g_backend_limine);
+}
+
+static inline uint32_t *fb_pixel_ptr(int x, int y) {
+    return &g.fb[(uint32_t)y * g.fb_pitch_px + (uint32_t)x];
+}
+
+void gfx_cursor_overlay_hide(void) {
+    if (!cursor_overlay_supported() || !g_cursor_overlay.visible) {
+        g_cursor_overlay.visible = false;
+        return;
+    }
+
+    for (int dy = 0; dy < CUR_H; dy++) {
+        int py = g_cursor_overlay.y + dy;
+        if (py < 0 || py >= (int)g.height) continue;
+        for (int dx = 0; dx < CUR_W; dx++) {
+            int px = g_cursor_overlay.x + dx;
+            int idx = dy * CUR_W + dx;
+            if (px < 0 || px >= (int)g.width || !g_cursor_overlay.valid[idx]) continue;
+            *fb_pixel_ptr(px, py) = g_cursor_overlay.saved[idx];
+        }
+    }
+
+    g_cursor_overlay.visible = false;
+}
+
+void gfx_cursor_overlay_show(int x, int y) {
+    if (!cursor_overlay_supported()) return;
+
+    g_cursor_overlay.x = x;
+    g_cursor_overlay.y = y;
+    for (int i = 0; i < CUR_W * CUR_H; i++) {
+        g_cursor_overlay.saved[i] = 0;
+        g_cursor_overlay.valid[i] = 0;
+    }
+
+    for (int dy = 0; dy < CUR_H; dy++) {
+        int py = y + dy;
+        if (py < 0 || py >= (int)g.height) continue;
+        const char *row = g_cursor[dy];
+        for (int dx = 0; dx < CUR_W && row[dx]; dx++) {
+            int px = x + dx;
+            int idx = dy * CUR_W + dx;
+            if (px < 0 || px >= (int)g.width) continue;
+
+            uint32_t *p = fb_pixel_ptr(px, py);
+            g_cursor_overlay.saved[idx] = *p;
+            g_cursor_overlay.valid[idx] = 1;
+
+            char c = row[dx];
+            if      (c == '#') *p = 0x00000000u;
+            else if (c == '.') *p = 0x00FFFFFFu;
+        }
+    }
+
+    g_cursor_overlay.visible = true;
+}
+
+void gfx_cursor_overlay_move(int x, int y) {
+    if (!cursor_overlay_supported()) return;
+    gfx_cursor_overlay_hide();
+    gfx_cursor_overlay_show(x, y);
 }
 
 /* ---- push to display ----------------------------------------- */
@@ -665,6 +739,8 @@ static int limine_describe(char *extra, int cap) {
 
 void gfx_flip(void) {
     if (!g.ready) return;
+    gfx_cursor_overlay_hide();
+
     const struct gfx_backend *b = g.backend ? g.backend : &g_backend_limine;
     int dx, dy, dw, dh;
     bool have_dirty = gfx_dirty_get(&dx, &dy, &dw, &dh);
@@ -673,6 +749,7 @@ void gfx_flip(void) {
                    || (dx == 0 && dy == 0
                        && dw == (int)g.width && dh == (int)g.height);
     g.stats.total_flips++;
+
     if (!have_dirty) {
         /* Empty flip: nothing was marked dirty since the last present.
          * We still call flip() defensively (caller wants a present),

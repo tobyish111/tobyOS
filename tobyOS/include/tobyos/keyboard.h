@@ -15,6 +15,7 @@ int  kbd_getc(void);
 
 /* Shared input sink used by PS/2 and USB-HID. */
 void kbd_dispatch_char(char c);
+void kbd_flush_pending(void);
 
 /* PS/2 byte-level entry point.
  * Exported so the mouse IRQ can drain shared 8042 output bytes and

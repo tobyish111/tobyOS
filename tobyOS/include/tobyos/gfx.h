@@ -123,6 +123,14 @@ uint32_t gfx_blend_pixel_argb(uint32_t dst_xrgb, uint32_t src_argb);
  * over any background. The compositor calls this last in each frame. */
 void gfx_draw_cursor(int x, int y);
 
+/* Fast software cursor overlay for the direct Limine framebuffer path.
+ * These draw directly to scanout after saving/restoring the pixels under
+ * the cursor, so pointer movement does not require a full compositor pass.
+ * Backends that do not expose direct scanout simply no-op. */
+void gfx_cursor_overlay_hide(void);
+void gfx_cursor_overlay_show(int x, int y);
+void gfx_cursor_overlay_move(int x, int y);
+
 /* Push the back buffer to the framebuffer in one pass. Cheap (~3 ms for
  * 1024x768 in QEMU). The compositor calls this once per dirty frame.
  *

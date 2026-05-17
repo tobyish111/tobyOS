@@ -38,6 +38,11 @@ void sched_init(void);
  * already on a queue, this is a no-op. */
 void sched_enqueue(struct proc *p);
 
+/* Move a READY process to the front of the BSP ready queue. Used for
+ * latency-sensitive GUI input so the focused app consumes key events
+ * before unrelated desktop apps get more round-robin turns. */
+void sched_boost_pid(int pid);
+
 /* Pick the next runnable proc on the CURRENT CPU and context-switch
  * to it. If the current proc is PROC_RUNNING and this CPU's ready
  * queue is empty, this returns immediately (current keeps the CPU).

@@ -134,12 +134,6 @@
                                 PORTSC_OCC | PORTSC_PRC | PORTSC_PLC | \
                                 PORTSC_CEC)
 
-/* Speed codes returned in PORTSC[13:10]. */
-#define USB_SPEED_FULL    1
-#define USB_SPEED_LOW     2
-#define USB_SPEED_HIGH    3
-#define USB_SPEED_SUPER   4
-
 /* ============================================================== */
 /* TRB (Transfer Request Block) -- the universal xHCI ring entry. */
 /* ============================================================== */
@@ -767,6 +761,17 @@ bool xhci_control_class(struct usb_device *dev,
     return true;
 }
 
+static bool xhci_control_xfer_hook(struct usb_device *dev,
+                                   uint8_t bm_request_type,
+                                   uint8_t b_request,
+                                   uint16_t w_value,
+                                   uint16_t w_index,
+                                   void *buf,
+                                   uint16_t w_length) {
+    return xhci_control_class(dev, bm_request_type, b_request,
+                              w_value, w_index, buf, w_length);
+}
+
 static uint8_t xhci_encode_interrupt_interval(uint8_t speed, uint8_t bInterval) {
     if (bInterval == 0) {
         bInterval = 1;
@@ -1216,6 +1221,10 @@ static void xhci_submit_int_in(struct usb_device *dev) {
     dev->int_armed = true;
 }
 
+static void xhci_submit_int_in_hook(struct usb_device *dev) {
+    xhci_submit_int_in(dev);
+}
+
 /* ============================================================== */
 /* Per-device probe + descriptor walk                              */
 /* ============================================================== */
@@ -1308,6 +1317,8 @@ static void enumerate_port(uint8_t port_idx) {
     st->usb.port_id = port_idx + 1u;     /* 1-based */
     st->usb.speed   = speed;
     st->usb.mps0    = default_mps0(speed);
+    st->usb.control_xfer = xhci_control_xfer_hook;
+    st->usb.submit_int_in = xhci_submit_int_in_hook;
 
     /* Allocate the EP0 ring + input context + device context. */
     st->ep0_ring = make_ring(&st->usb.ep0_ring_phys);
@@ -1738,6 +1749,8 @@ struct usb_device *xhci_attach_via_hub(struct usb_device *parent,
     st->usb.route_string    = child_route;
     st->usb.hub_depth       = child_depth;
     st->usb.hub_port        = hub_port;
+    st->usb.control_xfer    = xhci_control_xfer_hook;
+    st->usb.submit_int_in   = xhci_submit_int_in_hook;
 
     st->ep0_ring = make_ring(&st->usb.ep0_ring_phys);
     if (!st->ep0_ring) goto fail;
@@ -2195,6 +2208,11 @@ static bool xhci_controller_init(void) {
     rt_w32(XHCI_RT_IR0 + XHCI_IR_ERDP_HI, (uint32_t)(g_xhci.evt_ring_phys >> 32));
     rt_w32(XHCI_RT_IR0 + XHCI_IR_ERSTBA_LO, (uint32_t)(g_xhci.erst_phys & 0xFFFFFFFFu));
     rt_w32(XHCI_RT_IR0 + XHCI_IR_ERSTBA_HI, (uint32_t)(g_xhci.erst_phys >> 32));
+    /* Keep HID input latency low. Some controllers/firmware leave a
+     * conservative moderation interval here, batching interrupt events
+     * in a way that feels like mouse/keyboard lag. 0 means deliver
+     * events as soon as the primary interrupter sees them. */
+    rt_w32(XHCI_RT_IR0 + XHCI_IR_IMOD, 0);
     /* Mask the primary interrupter (IE=0). We poll. */
     rt_w32(XHCI_RT_IR0 + XHCI_IR_IMAN, 0);
 

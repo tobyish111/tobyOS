@@ -72,6 +72,9 @@
 #define RTL_RDSAR         0xE4       /* RX desc base (64-bit) */
 #define RTL_ETTHR         0xEC       /* Early TX threshold (8-bit) */
 
+/* PHY_STATUS (0x6C). Realtek reports physical carrier in bit 1. */
+#define PHY_STATUS_LINK   (1u << 1)
+
 /* CR (0x37) bits. */
 #define CR_TE             (1u << 2)  /* TX enable */
 #define CR_RE             (1u << 3)  /* RX enable */
@@ -367,6 +370,11 @@ static void rtl_rx_drain_op(struct net_dev *dev) {
     spin_unlock_irqrestore(&g_rtl_rx_lock, irqf);
 }
 
+static bool rtl_link_up_op(struct net_dev *dev) {
+    (void)dev;
+    return g_mmio && (mmio_r8(RTL_PHY_STATUS) & PHY_STATUS_LINK) != 0;
+}
+
 /* MSI handler. ISR is W1C; we read the latched bits, write them
  * straight back to ack, then drain RX. TX completions are handled
  * lazily inside rtl_tx_op (it spins on DESC_OWN), so TOK doesn't need
@@ -389,6 +397,7 @@ static struct net_dev g_rtl_dev = {
     .priv     = 0,
     .tx       = rtl_tx_op,
     .rx_drain = rtl_rx_drain_op,
+    .link_up  = rtl_link_up_op,
 };
 
 /* ----- PCI probe ------------------------------------------------- */
@@ -498,6 +507,9 @@ static int rtl8169_probe(struct pci_dev *dev) {
      * RX before driver code can transmit, otherwise an immediately-
      * arriving packet is dropped on the floor. */
     mmio_w8(RTL_CR, CR_RE | CR_TE);
+    kprintf("[rtl8169] PHY status=0x%02x link=%s\n",
+            (unsigned)mmio_r8(RTL_PHY_STATUS),
+            rtl_link_up_op(&g_rtl_dev) ? "up" : "down");
 
     /* 11. Try to enable MSI (the 8168 family supports MSI; the older
      * PCI 8169 does NOT). MSI-X first for the few revisions that

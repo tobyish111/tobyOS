@@ -46,7 +46,7 @@
  #define CFG_IRQ12_ENABLE   (1u << 1)
  #define CFG_KBD_DISABLE    (1u << 4)
  #define CFG_MOUSE_DISABLE  (1u << 5)
- 
+
  /* Packet state. */
  static volatile uint8_t g_pkt[3];
  static volatile uint8_t g_pkt_pos = 0;
@@ -69,6 +69,22 @@
  }
  
  static mouse_event_fn g_cb = noop_cb;
+
+ /* Mouse event queue. IRQ/HID paths preserve individual reports here
+  * instead of collapsing them into one large delta. Collapsing made
+  * missed flush windows feel terrible because GUI acceleration was
+  * applied to the combined movement, producing visible bursts. */
+ #define MOUSE_Q_SIZE 64u
+ struct mouse_q_event {
+     int dx;
+     int dy;
+     uint8_t buttons;
+     bool edge;
+ };
+ static volatile struct mouse_q_event g_q[MOUSE_Q_SIZE];
+ static volatile uint8_t g_q_head;
+ static volatile uint8_t g_q_tail;
+ static volatile uint8_t g_current_buttons;
  
  /* ---- 8042 helpers ------------------------------------------------ */
  
@@ -192,13 +208,12 @@
  }
  
  void mouse_inject_event(int dx, int dy, uint8_t buttons) {
-     uint8_t newly = (uint8_t)(buttons & ~g_buttons);
+     uint8_t newly = (uint8_t)(buttons & ~g_last_buttons);
  
      if (newly & MOUSE_BTN_LEFT)   g_btn_press_total++;
      if (newly & MOUSE_BTN_RIGHT)  g_btn_press_total++;
      if (newly & MOUSE_BTN_MIDDLE) g_btn_press_total++;
  
-     g_buttons      = buttons;
      g_last_buttons = buttons;
      g_last_dx      = (int8_t)((dx < -128) ? -128 : (dx > 127 ? 127 : dx));
      g_last_dy      = (int8_t)((dy < -128) ? -128 : (dy > 127 ? 127 : dy));
@@ -207,7 +222,53 @@
      g_dx_abs_total += (uint64_t)(dx < 0 ? -dx : dx);
      g_dy_abs_total += (uint64_t)(dy < 0 ? -dy : dy);
  
-     g_cb(dx, dy, buttons);
+     uint8_t next = (uint8_t)((g_q_head + 1u) & (MOUSE_Q_SIZE - 1u));
+     bool edge = (buttons != g_current_buttons);
+     g_current_buttons = buttons;
+
+     if (next == g_q_tail) {
+         /* Queue full: merge into the most recent queued report so we
+          * preserve forward progress without reverting to a giant
+          * queue-wide burst. */
+         uint8_t prev = (uint8_t)((g_q_head - 1u) & (MOUSE_Q_SIZE - 1u));
+         g_q[prev].dx += dx;
+         g_q[prev].dy += dy;
+         g_q[prev].buttons = buttons;
+         g_q[prev].edge = g_q[prev].edge || edge;
+         return;
+     }
+
+     g_q[g_q_head].dx = dx;
+     g_q[g_q_head].dy = dy;
+     g_q[g_q_head].buttons = buttons;
+     g_q[g_q_head].edge = edge;
+     g_q_head = next;
+ }
+
+ void mouse_flush_pending(void) {
+     for (int n = 0; n < (int)MOUSE_Q_SIZE; n++) {
+         uint64_t flags;
+         __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+
+         if (g_q_tail == g_q_head) {
+             if (flags & (1ULL << 9)) sti();
+             break;
+         }
+
+         struct mouse_q_event ev;
+         ev.dx = g_q[g_q_tail].dx;
+         ev.dy = g_q[g_q_tail].dy;
+         ev.buttons = g_q[g_q_tail].buttons;
+         ev.edge = g_q[g_q_tail].edge;
+         g_q_tail = (uint8_t)((g_q_tail + 1u) & (MOUSE_Q_SIZE - 1u));
+         g_buttons = ev.buttons;
+
+         if (flags & (1ULL << 9)) sti();
+
+         if (ev.dx || ev.dy || ev.edge) {
+             g_cb(ev.dx, ev.dy, ev.buttons);
+         }
+     }
  }
  
  void mouse_init(void) {

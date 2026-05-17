@@ -14,6 +14,7 @@ typedef void (*mouse_event_fn)(int dx, int dy, uint8_t buttons);
 void mouse_init(void);
 void mouse_set_callback(mouse_event_fn cb);
 uint8_t mouse_buttons(void);
+void mouse_flush_pending(void);
 
 /* Shared input sink used by PS/2 and USB-HID. */
 void mouse_inject_event(int dx, int dy, uint8_t buttons);

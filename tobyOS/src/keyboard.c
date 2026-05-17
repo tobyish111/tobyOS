@@ -33,16 +33,22 @@
  #define CMD_READ_CONFIG    0x20
  #define CMD_WRITE_CONFIG   0x60
  #define CMD_ENABLE_KBD     0xAE
+
+ #define KBD_DEV_SET_SCANCODE     0xF0
+ #define KBD_DEV_ENABLE_SCANNING  0xF4
+ #define KBD_DEV_ACK              0xFA
+ #define KBD_DEV_RESEND           0xFE
  
  /* 8042 config bits. */
  #define CFG_IRQ1_ENABLE    (1u << 0)
  #define CFG_KBD_DISABLE    (1u << 4)
+ #define CFG_TRANSLATE_SET1 (1u << 6)
  
  /* Ring buffer. head = producer, tail = consumer. */
  static volatile uint8_t g_buf[KBD_BUF_SIZE];
  static volatile uint8_t g_head = 0;
  static volatile uint8_t g_tail = 0;
- 
+
  /* Modifier state. */
  static volatile bool g_shift  = false;
  static volatile bool g_ctrl   = false;
@@ -86,7 +92,7 @@
      g_buf[g_head] = (uint8_t)c;
      g_head = next;
  }
- 
+
  int kbd_trygetc(void) {
      if (g_head == g_tail) return -1;
      char c = (char)g_buf[g_tail];
@@ -131,6 +137,27 @@
      if (!kbd_wait_out_full()) return -1;
      return inb(KBD_DATA);
  }
+
+ static int kbd_wait_kbd_data(void) {
+     for (int i = 0; i < 200000; i++) {
+         uint8_t st = inb(KBD_STATUS);
+         if ((st & KBD_STATUS_OUT_FULL) == 0) continue;
+         uint8_t b = inb(KBD_DATA);
+         if ((st & KBD_STATUS_AUX_DATA) == 0) return b;
+         mouse_ps2_handle_byte(b);
+     }
+     return -1;
+ }
+
+ static bool kbd_send_dev_cmd(uint8_t cmd) {
+     for (int tries = 0; tries < 3; tries++) {
+         kbd_ctl_write_data(cmd);
+         int r = kbd_wait_kbd_data();
+         if (r == KBD_DEV_ACK) return true;
+         if (r != KBD_DEV_RESEND) return false;
+     }
+     return false;
+ }
  
  static void kbd_drain_input(void) {
      for (int i = 0; i < 64; i++) {
@@ -149,10 +176,20 @@
          return;
      }
  
-     cfg = (cfg | CFG_IRQ1_ENABLE) & ~CFG_KBD_DISABLE;
- 
+     cfg = (cfg | CFG_IRQ1_ENABLE | CFG_TRANSLATE_SET1) & ~CFG_KBD_DISABLE;
+
      kbd_ctl_write(CMD_WRITE_CONFIG);
      kbd_ctl_write_data((uint8_t)cfg);
+ }
+
+ static void kbd_device_enable_scanning(void) {
+     /* Some BIOSes leave the keyboard in a half-initialised state after
+      * handing off USB-legacy or PS/2 emulation. Translation above makes
+      * the controller deliver set-1 bytes to our parser; this command
+      * makes sure the keyboard is actually producing make/break codes. */
+     if (!kbd_send_dev_cmd(KBD_DEV_ENABLE_SCANNING)) {
+         kprintf("[kbd] WARN: keyboard enable-scanning command failed\n");
+     }
  }
  
  /* ---- byte-level scancode handling ------------------------------- */
@@ -167,6 +204,10 @@
  
      if (sc == 0xE0) {
          g_ext_e0 = true;
+         return;
+     }
+
+     if (sc == KBD_DEV_ACK || sc == KBD_DEV_RESEND) {
          return;
      }
  
@@ -256,10 +297,10 @@
  }
  
  /* ---- shared dispatch sink --------------------------------------- */
- 
+
  void kbd_dispatch_char(char c) {
      if (c == 0) return;
- 
+
      g_chars_dispatched++;
      g_last_char = c;
  
@@ -276,12 +317,20 @@
  
      buf_push(c);
  }
+
+ void kbd_flush_pending(void) {
+     /* Keyboard is delivered immediately from the PS/2/USB HID input
+      * path. Mouse keeps a deferred queue because cursor motion is a
+      * rendering hot path; keypresses must be visible to GUI apps at
+      * once, otherwise typing feels like it arrives in delayed batches. */
+ }
  
  void kbd_init(void) {
      cli();
  
      kbd_drain_input();
      kbd_controller_enable_irq1();
+     kbd_device_enable_scanning();
      kbd_drain_input();
  
      irq_install_isa(1, kbd_irq);

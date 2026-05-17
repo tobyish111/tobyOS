@@ -65,6 +65,10 @@
 #define DHCP_RX_DRAIN_BURST 48u
 #endif
 
+#ifndef DHCP_ACK_WAIT_MS
+#define DHCP_ACK_WAIT_MS 5000u
+#endif
+
 /* ---- transient transaction state -------------------------------- *
  *
  * Lives only across one dhcp_acquire() invocation. After the call
@@ -208,6 +212,29 @@ static uint32_t bootp_offered_ip_be(const uint8_t *bp, size_t pl) {
         dhcp_opt_find_wire(bp, pl, DHCP_OPT_REQUESTED_IP, &l50);
     if (p50 && l50 >= 4) return opt_u32_be(p50);
     return 0;
+}
+
+static void dhcp_fill_lease_from_packet(struct dhcp_lease *L,
+                                        const uint8_t *bp, size_t pl,
+                                        uint32_t ip_be,
+                                        uint32_t server_be) {
+    L->ip_be      = ip_be;
+    L->server_be  = server_be;
+    L->lease_secs = 0;
+    L->netmask_be = 0;
+    L->gateway_be = 0;
+    L->dns_be     = 0;
+
+    uint8_t l;
+    const uint8_t *v;
+    if ((v = dhcp_opt_find_wire(bp, pl, DHCP_OPT_SUBNET, &l)) && l == 4)
+        L->netmask_be = opt_u32_be(v);
+    if ((v = dhcp_opt_find_wire(bp, pl, DHCP_OPT_ROUTER, &l)) && l >= 4)
+        L->gateway_be = opt_u32_be(v);
+    if ((v = dhcp_opt_find_wire(bp, pl, DHCP_OPT_DNS, &l)) && l >= 4)
+        L->dns_be = opt_u32_be(v);
+    if ((v = dhcp_opt_find_wire(bp, pl, DHCP_OPT_LEASE_TIME, &l)) && l == 4)
+        L->lease_secs = opt_u32_host(v);
 }
 
 /* ---- TX: build DISCOVER / REQUEST ------------------------------- */
@@ -469,6 +496,7 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
         }
         g_xact.offered_ip_be = yi;
         g_xact.server_id_be  = server_be;
+        dhcp_fill_lease_from_packet(&g_xact.lease, bp, pl, yi, server_be);
         /* RELEASE: offered_ip_be / server_id_be must be visible before saw_offer
          * is observed true on the BSP (and on other CPUs if RX runs there). */
         __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -489,6 +517,18 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
 
     if (*mt == DHCP_MSG_ACK) {
         uint32_t yi = bootp_offered_ip_be(bp, pl);
+        if (yi == 0 && g_xact.offered_ip_be != 0) {
+            char a[16];
+            net_format_ip(a, g_xact.offered_ip_be);
+            kprintf("[dhcp] ACK yiaddr empty -- using requested/offered %s\n",
+                    a);
+            yi = g_xact.offered_ip_be;
+        }
+        if (yi == 0) {
+            static unsigned n_ack_yi;
+            dhcp_rx_drop(&n_ack_yi, 8u, "ACK yiaddr and offered IP both empty");
+            return;
+        }
         /* yiaddr in ACK should equal what we requested. */
         if (yi != g_xact.offered_ip_be) {
             char a[16], b[16];
@@ -499,23 +539,7 @@ void dhcp_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
         }
 
         struct dhcp_lease *L = &g_xact.lease;
-        L->ip_be      = yi;
-        L->server_be  = g_xact.server_id_be;
-        L->lease_secs = 0;
-        L->netmask_be = 0;
-        L->gateway_be = 0;
-        L->dns_be     = 0;
-
-        uint8_t l;
-        const uint8_t *v;
-        if ((v = dhcp_opt_find_wire(bp, pl, DHCP_OPT_SUBNET, &l)) && l == 4)
-            L->netmask_be = opt_u32_be(v);
-        if ((v = dhcp_opt_find_wire(bp, pl, DHCP_OPT_ROUTER, &l)) && l >= 4)
-            L->gateway_be = opt_u32_be(v);
-        if ((v = dhcp_opt_find_wire(bp, pl, DHCP_OPT_DNS, &l)) && l >= 4)
-            L->dns_be = opt_u32_be(v);   /* keep first DNS server */
-        if ((v = dhcp_opt_find_wire(bp, pl, DHCP_OPT_LEASE_TIME, &l)) && l == 4)
-            L->lease_secs = opt_u32_host(v);
+        dhcp_fill_lease_from_packet(L, bp, pl, yi, g_xact.server_id_be);
 
         char ib[16], mb[16], gb[16], db[16], sb[16];
         net_format_ip(ib, L->ip_be);
@@ -676,7 +700,33 @@ bool dhcp_acquire(uint32_t timeout_ms, struct dhcp_lease *out) {
     }
 
     /* Step 4: wait ACK (or NAK). Step 5: caller copies lease → net_apply_lease. */
-    if (!dhcp_wait(end_total, &g_xact.saw_ack, &g_xact.saw_nak)) {
+    uint64_t ack_wait_ticks =
+        ((uint64_t)hz * (uint64_t)DHCP_ACK_WAIT_MS) / 1000u;
+    if (ack_wait_ticks < 1) ack_wait_ticks = 1;
+    uint64_t ack_deadline = pit_ticks() + ack_wait_ticks;
+    if (ack_deadline < end_total) ack_deadline = end_total;
+    if (!dhcp_wait(ack_deadline, &g_xact.saw_ack, &g_xact.saw_nak)) {
+        if (g_xact.offered_ip_be != 0) {
+            char ib[16], mb[16], gb[16], db[16];
+            if (g_xact.lease.ip_be == 0)
+                g_xact.lease.ip_be = g_xact.offered_ip_be;
+            if (g_xact.lease.netmask_be == 0)
+                g_xact.lease.netmask_be = ip4(255, 255, 255, 0);
+            if (g_xact.lease.gateway_be == 0)
+                g_xact.lease.gateway_be = g_xact.server_id_be;
+            if (g_xact.lease.dns_be == 0)
+                g_xact.lease.dns_be = g_xact.lease.gateway_be;
+            net_format_ip(ib, g_xact.lease.ip_be);
+            net_format_ip(mb, g_xact.lease.netmask_be);
+            net_format_ip(gb, g_xact.lease.gateway_be);
+            net_format_ip(db, g_xact.lease.dns_be);
+            kprintf("[dhcp] ACK not observed before deadline; "
+                    "applying offered lease ip=%s mask=%s gw=%s dns=%s\n",
+                    ib, mb, gb, db);
+            *out = g_xact.lease;
+            g_xact.in_flight = false;
+            return true;
+        }
         kprintf("[dhcp] timeout waiting for ACK\n");
         g_xact.in_flight = false;
         return false;

@@ -1,0 +1,11 @@
+tobyOS terminal -- type 'help' for builtins.
+tobyOS:/$ help
+builtins: help, clear, about, echo, pwd, cd <p>, ls [p],
+          cat <p>, run <p> [arg], whoami, su <user>,
+          pkg <subcmd> ...
+apps are launched in the background -- their stdout goes to
+the kernel console/serial, not this window.
+pkg subcmds: install|remove|list|info|repo|update|upgrade|rollback
+  (pkg install/remove/upgrade/rollback auto-elevate -- you do
+   NOT need to `su root` first for those.)
+tobyOS:/$ 

@@ -58,8 +58,11 @@
 #include <tobyos/tcp.h>
 #include <tobyos/tcp_echo.h>
 #include <tobyos/tcp_shell.h>
+#include <tobyos/ssh.h>
+#include <tobyos/ssh_crypto.h>
 #include <tobyos/http.h>
 #include <tobyos/xhci.h>
+#include <tobyos/usb_legacy.h>
 #include <tobyos/usb_hub.h>
 #include <tobyos/usb_hid.h>
 #include <tobyos/virtio_gpu.h>
@@ -91,6 +94,7 @@
 #include <tobyos/usbreg.h>
 #include <tobyos/theme.h>
 #include <tobyos/notify.h>
+#include <tobyos/rng.h>
 #include <tobyos/abi/abi.h>
 
 /* ---- Limine framebuffer request (kept inline -- only used here) ---- */
@@ -423,13 +427,26 @@ static __attribute__((noreturn)) void idle_loop(void) {
     uint32_t hz = pit_hz();
     if (hz == 0) hz = 1;
 
-    for (;;) {
-        /* Poll network devices that do not have working MSI/MSI-X. */
-        net_poll();
+    /* Keep local input fresh without letting it monopolise pid 0.
+     * Keyboard delivery is immediate in the HID/PS2 path; mouse keeps
+     * a tiny deferred queue because cursor drawing is a render concern. */
+    #define SERVICE_INPUT()                                            \
+        do {                                                           \
+            usb_legacy_poll();                                         \
+            xhci_poll();                                               \
+            kbd_flush_pending();                                       \
+            mouse_flush_pending();                                     \
+        } while (0)
 
-        /* TCP services must be polled continuously after net_init(). */
-        tcp_echo_poll();
-        tcp_shell_poll();
+    for (;;) {
+        /* Poll network devices first. This keeps Realtek/e1000 RX from
+         * being starved by a busy local desktop session. */
+        net_poll();
+        SERVICE_INPUT();
+
+        /* SSH is not part of net_poll(); keep it moving when enabled. */
+        ssh_poll();
+        SERVICE_INPUT();
 
         /*
          * Always drain xHCI once per loop.
@@ -438,31 +455,17 @@ static __attribute__((noreturn)) void idle_loop(void) {
          * If xHCI IRQs do not work on real hardware, this is the only
          * thing keeping USB HID input responsive.
          */
-        xhci_poll();
+        SERVICE_INPUT();
 
         xhci_service_port_changes();
         usb_hub_poll();
 
+        /* Catch any input that arrived while the other pollers ran. */
+        SERVICE_INPUT();
+
         /* GUI/window manager tick. */
         gui_tick();
-
-        /* Optional low-rate USB diagnostic. This is okay temporarily,
-         * but remove it once you have the numbers because serial logging
-         * can still affect responsiveness.
-         */
-        static uint64_t last_usb_diag;
-        uint64_t now = pit_ticks();
-
-        if (now - last_usb_diag >= hz) {
-            last_usb_diag = now;
-
-            kprintf("[usbdiag] xhci_irq=%d hid=%d kbd=%d mouse=%d frames=%llu\n",
-                    xhci_irq_count(),
-                    usb_hid_count(),
-                    usb_hid_kbd_count(),
-                    usb_hid_mouse_count(),
-                    (unsigned long long)usb_hid_total_frames());
-        }
+        SERVICE_INPUT();
 
         /* Local shell input. */
         shell_poll();
@@ -482,6 +485,8 @@ static __attribute__((noreturn)) void idle_loop(void) {
          */
          __asm__ __volatile__("pause");
     }
+
+    #undef SERVICE_INPUT
 }
 /* Smoke-test handler for vector 3 (#BP). Demonstrates that the IDT
  * dispatch reaches C and that we can iretq cleanly back to the caller.
@@ -1922,10 +1927,12 @@ void _start(void) {
     blk_ahci_register();
     blk_nvme_register();
     virtio_blk_register();   /* M35B: modern virtio-blk-pci */
+    virtio_rng_register();   /* virtio-rng entropy for SSH host keys */
     e1000_register();
     e1000e_register();
     virtio_net_register();
     rtl8169_register();
+    usb_legacy_register();  /* USB 1.x/2.0 HCIs: UHCI/OHCI/EHCI diagnostics + safe legacy input */
     xhci_register();        /* USB 3.x host controller (qemu-xhci, real PCH xHCI) */
     virtio_gpu_register();  /* GPU: virtio-gpu (basic 2D); falls back to Limine FB */
     audio_hda_register();   /* M26F: HD Audio controller (M26A: stub probe only) */
@@ -2600,7 +2607,24 @@ void _start(void) {
      * historically a "won't boot" trigger.
      * M35E: COMPATIBILITY mode keeps networking up, so we now gate on
      * the more precise safemode_skip_net() predicate. */
-   
+    bool net_ok = false;
+    if (safemode_skip_net()) {
+        kprintf("[safe] skipping net_init (NIC + DHCP + DNS) -- mode=%s\n",
+                safemode_tag());
+    } else {
+        kprintf("[boot] before net_init\n");
+        net_ok = net_init();
+        kprintf("[boot] after net_init ok=%d net_up=%d\n",
+                (int)net_ok, (int)net_is_up());
+        if (net_ok) {
+            kprintf("[boot] net_init OK; starting TCP services\n");
+            tcp_echo_init();
+            tcp_shell_init();
+            ssh_init();
+        } else {
+            kprintf("[boot] net_init failed; TCP services not started\n");
+        }
+    }
 
     /* Milestone 24B–24D self-test: DNS + TCP + full HTTP GET to
      * example.com. Wall-clock cost is noticeable on every boot
@@ -2775,35 +2799,15 @@ void _start(void) {
         m14_init();
 
         /*
-         * Force one compositor pass before slow physical-hardware work
-         * such as NIC/DHCP starts.
+         * Force one compositor pass as soon as the desktop stack is ready.
          */
-        kprintf("[boot] first gui_tick before net_init\n");
+        kprintf("[boot] first gui_tick after desktop init\n");
         gui_tick();
     }
 
-    /*
-     * Bring networking up after the GUI. This lets real hardware show
-     * the desktop even if NIC probing or DHCP is slow/flaky.
-     */
-    if (safemode_skip_net()) {
-        kprintf("[safe] skipping net_init (NIC + DHCP + DNS) -- mode=%s\n",
-                safemode_tag());
-    } else {
-        kprintf("[boot] before net_init\n");
-
-        bool net_ok = net_init();
-
-        kprintf("[boot] after net_init ok=%d net_up=%d\n",
-                (int)net_ok, (int)net_is_up());
-
-        if (net_ok) {
-            kprintf("[boot] net_init OK; starting TCP services\n");
-            tcp_echo_init();
-            tcp_shell_init();
-        } else {
-            kprintf("[boot] net_init failed; TCP services not started\n");
-        }
+    if (!safemode_skip_gui()) {
+        gui_invalidate_full();
+        gui_tick();
     }
 
     if (safemode_skip_services()) {
@@ -2822,6 +2826,7 @@ void _start(void) {
          * (one-time read of /system/keys/trust.db -- absent file is
          * fine, returns 0 keys). */
         sec_selftest();
+        ssh_crypto_selftest();
         sig_trust_store_init();
         /* Milestone 34E: register the protected-prefix table BEFORE
          * pkg_init -- pkg_init creates /data/packages/ and friends,

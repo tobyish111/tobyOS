@@ -57,9 +57,20 @@
 #include <tobyos/drvmatch.h>
 #include <tobyos/hwdb.h>
 #include <tobyos/notify.h>
+#include <tobyos/mouse.h>
+#include <tobyos/keyboard.h>
+#include <tobyos/usb_legacy.h>
+#include <tobyos/xhci.h>
 
 extern uint64_t g_kernel_syscall_rsp;
 extern void syscall_entry(void);
+
+static void syscall_service_input(void) {
+    usb_legacy_poll();
+    xhci_poll();
+    kbd_flush_pending();
+    mouse_flush_pending();
+}
 
 /* MSR numbers. */
 #define IA32_EFER       0xC0000080u
@@ -2227,6 +2238,14 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
     perf_syscall_exit((int)num, t_sys);
     perf_zone_end(PERF_Z_SYSCALL, t_sys);
 
+    /* User GUI apps can make long bursts of draw/read/event syscalls.
+     * Service local input before the compositor tick so USB HID reports
+     * delivered by xHCI IRQs do not sit in the mouse queue until pid 0
+     * eventually reaches the idle loop again. */
+    if (gui_active()) {
+        syscall_service_input();
+    }
+
     /* Drive the GUI compositor from the syscall return path.
      *
      * Milestone 19 optimization: skip gui_tick() entirely when the GUI
@@ -2242,6 +2261,7 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * on_pid0 AND g.active internally). */
     if (gui_active()) {
         gui_tick();
+        syscall_service_input();
     }
 
     /* Safe point #1: every syscall return runs through here. If the

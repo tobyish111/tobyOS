@@ -116,6 +116,7 @@ struct net_dev {
     void       *priv;                       /* driver-private */
     bool      (*tx)      (struct net_dev *dev, const void *frame, size_t len);
     void      (*rx_drain)(struct net_dev *dev);
+    bool      (*link_up) (struct net_dev *dev); /* optional physical-link check */
 };
 
 void           net_register(struct net_dev *dev);
@@ -123,6 +124,20 @@ struct net_dev *net_default(void);          /* first registered or NULL */
 size_t         net_dev_count(void);
 struct net_dev *net_dev_get(size_t idx);
 void           net_dump(void);
+
+enum net_status {
+    NET_STATUS_DOWN = 0,
+    NET_STATUS_NO_NIC,
+    NET_STATUS_DHCP_WAIT,
+    NET_STATUS_DHCP_OK,
+    NET_STATUS_DHCP_EMPTY,
+    NET_STATUS_STATIC_FALLBACK,
+};
+
+enum net_status net_status(void);
+const char *net_status_name(void);
+void net_status_summary(char *dst, size_t cap);
+void net_debug_dump(void);
 
 /* Driver registration entry points called from kernel.c during boot.
  * Each one inserts a struct pci_driver into the bus registry. */

@@ -79,6 +79,13 @@ static void queue_push_locked(struct percpu *cpu, struct proc *p) {
     }
 }
 
+static void queue_push_front_locked(struct percpu *cpu, struct proc *p) {
+    if (!p) return;
+    p->next_ready = cpu->ready_head;
+    cpu->ready_head = p;
+    if (!cpu->ready_tail) cpu->ready_tail = p;
+}
+
 static struct proc *queue_pop_locked(struct percpu *cpu) {
     struct proc *p = cpu->ready_head;
     if (!p) return 0;
@@ -86,6 +93,27 @@ static struct proc *queue_pop_locked(struct percpu *cpu) {
     if (!cpu->ready_head) cpu->ready_tail = 0;
     p->next_ready = 0;
     return p;
+}
+
+static bool queue_remove_locked(struct percpu *cpu, struct proc *p) {
+    if (!cpu || !p || !cpu->ready_head) return false;
+    if (cpu->ready_head == p) {
+        cpu->ready_head = p->next_ready;
+        if (cpu->ready_tail == p) cpu->ready_tail = 0;
+        p->next_ready = 0;
+        return true;
+    }
+
+    struct proc *prev = cpu->ready_head;
+    while (prev->next_ready && prev->next_ready != p) {
+        prev = prev->next_ready;
+    }
+    if (prev->next_ready != p) return false;
+
+    prev->next_ready = p->next_ready;
+    if (cpu->ready_tail == p) cpu->ready_tail = prev;
+    p->next_ready = 0;
+    return true;
 }
 
 /* Return the cpu_idx that should receive a freshly-enqueued proc.
@@ -104,6 +132,20 @@ void sched_enqueue(struct proc *p) {
     if (!cpu) cpu = smp_cpu_mut(0);             /* should never happen */
     uint64_t flags = spin_lock_irqsave(&cpu->ready_lock);
     queue_push_locked(cpu, p);
+    spin_unlock_irqrestore(&cpu->ready_lock, flags);
+}
+
+void sched_boost_pid(int pid) {
+    if (pid <= 0) return;
+    struct proc *p = proc_lookup(pid);
+    if (!p || p->state != PROC_READY) return;
+
+    struct percpu *cpu = smp_cpu_mut(0);
+    if (!cpu) return;
+
+    uint64_t flags = spin_lock_irqsave(&cpu->ready_lock);
+    (void)queue_remove_locked(cpu, p);
+    queue_push_front_locked(cpu, p);
     spin_unlock_irqrestore(&cpu->ready_lock, flags);
 }
 

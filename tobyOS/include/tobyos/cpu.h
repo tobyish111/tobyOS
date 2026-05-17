@@ -29,6 +29,16 @@ static inline uint16_t inw(uint16_t port) {
     return val;
 }
 
+static inline void outl(uint16_t port, uint32_t val) {
+    __asm__ volatile ("outl %0, %1" : : "a"(val), "Nd"(port) : "memory");
+}
+
+static inline uint32_t inl(uint16_t port) {
+    uint32_t val;
+    __asm__ volatile ("inl %1, %0" : "=a"(val) : "Nd"(port) : "memory");
+    return val;
+}
+
 /* Tiny stall after a port write -- writes a dummy byte to an unused port
  * (0x80 is traditionally used by BIOS POST and is safe to scribble on). */
 static inline void io_wait(void) {

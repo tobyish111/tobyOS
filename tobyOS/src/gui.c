@@ -304,6 +304,8 @@ static struct {
     uint64_t      cmp_full_frames;     /* used b->flip()              */
     uint64_t      cmp_partial_frames;  /* used b->present_rect()      */
 
+    volatile int  input_boost_pid;     /* focused app with fresh key input */
+
     /* ---- M31 desktop notifications + system tray ---------------- */
 
     /* Currently-displayed toast. id == 0 means "no toast active";
@@ -475,6 +477,14 @@ static bool point_in_menu(int px, int py) {
     if (!g.menu_open) return false;
     int mx, my, mw, mh; launcher_rect(&mx, &my, &mw, &mh);
     return px >= mx && py >= my && px < mx + mw && py < my + mh;
+}
+
+static void gui_post_net_details(void) {
+    char body[180];
+    net_status_summary(body, sizeof(body));
+    net_debug_dump();
+    notify_post(ABI_NOTIFY_KIND_NET, g_my_ip ? NOTIFY_URG_INFO : NOTIFY_URG_ERR,
+                "network", net_status_name(), body);
 }
 
 /* ---- M31 system-tray geometry ------------------------------------
@@ -865,14 +875,14 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
     int ay = dy < 0 ? -dy : dy;
     int maxa = ax > ay ? ax : ay;
 
-    int mult = 3;
+    int mult = 2;
 
     if (maxa >= 4)
+        mult = 3;
+    if (maxa >= 10)
         mult = 4;
-    if (maxa >= 8)
+    if (maxa >= 24)
         mult = 5;
-    if (maxa >= 16)
-        mult = 6;
 
     int sdx = dx * mult;
     int sdy = dy * mult;
@@ -894,6 +904,9 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
     if (moved) {
         gui_invalidate_rect(old_x, old_y, 12, 19);
         gui_invalidate_rect(nx,    ny,    12, 19);
+        if (g.active) {
+            gfx_cursor_overlay_move(nx, ny);
+        }
     }
 
     /* Detect button transitions: compare THIS packet's buttons against
@@ -915,9 +928,6 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
                        (unsigned)prev, (unsigned)buttons,
                        (int)went_down, (int)went_up, nx, ny);
     }
-
-    /* Cursor moved; we always want a redraw if the GUI is on screen. */
-    if (g.active && moved) g.dirty = true;
 
     /* If the GUI isn't even displayed (no windows AND no desktop), do
      * nothing -- input goes to console_tick / shell instead. */
@@ -1027,6 +1037,10 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
                 g.center_open = !g.center_open;
                 gui_trace_logf("mouse down=(%d,%d) hit=tray-bell center_open=%d",
                                nx, ny, (int)g.center_open);
+            } else if (pill == TRAY_PILL_NET) {
+                gui_post_net_details();
+                gui_trace_logf("mouse down=(%d,%d) hit=tray-net status=%s",
+                               nx, ny, net_status_name());
             } else {
                 gui_trace_logf("mouse down=(%d,%d) hit=tray-pill idx=%d",
                                nx, ny, pill);
@@ -1304,8 +1318,8 @@ static void pill_text(const struct tray_rect *r, const char *s, uint32_t fg) {
     gfx_draw_text(tx, ty, s, fg, GFX_TRANSPARENT);
 }
 
-/* Network pill: "NET 10.0.2.15" if the stack is up + has an IP, else
- * "NET NO LINK". Driven by g_my_ip / net_is_up(). */
+/* Network pill: show the IP once configured; otherwise make the failure
+ * class visible so bare-metal boots are debuggable without serial. */
 static void paint_tray_net(const struct tray_rect *r, bool hot) {
     const struct theme_palette *t = theme_active();
     char text[24];
@@ -1318,7 +1332,14 @@ static void paint_tray_net(const struct tray_rect *r, bool hot) {
         ksnprintf(text, sizeof(text), "NET %s", ip);
         pill_text(r, text, t->tray_text);
     } else {
-        pill_text(r, "NET NO LINK", t->tray_text_dim);
+        const char *label = "NET NO LINK";
+        switch (net_status()) {
+        case NET_STATUS_NO_NIC:     label = "NET NO NIC"; break;
+        case NET_STATUS_DHCP_WAIT:  label = "NET DHCP..."; break;
+        case NET_STATUS_DHCP_EMPTY: label = "NET EMPTY IP"; break;
+        default:                    break;
+        }
+        pill_text(r, label, t->tray_text_dim);
     }
 }
 
@@ -1710,7 +1731,6 @@ static void compositor_pass(void) {
         paint_toast();
     }
 
-    gfx_draw_cursor(g.cur_x, g.cur_y);
     perf_zone_end(PERF_Z_GUI_COMPOSITE, t_comp);
 
     /* M27E: The full compositor pass above always marks the entire
@@ -1747,6 +1767,7 @@ static void compositor_pass(void) {
 
     uint64_t t_flip = perf_rdtsc();
     gfx_flip();
+    gfx_cursor_overlay_show(g.cur_x, g.cur_y);
     perf_zone_end(PERF_Z_GUI_FLIP, t_flip);
 
     if (used_partial) g.cmp_partial_frames++;
@@ -1954,6 +1975,13 @@ void gui_tick(void) {
     /* Process-spawn / reap operations need pid 0's address space. */
     struct proc *cur = current_proc();
     bool on_pid0 = (cur && cur->pid == 0);
+
+    if (on_pid0 && g.input_boost_pid > 0) {
+        int pid = g.input_boost_pid;
+        g.input_boost_pid = 0;
+        sched_boost_pid(pid);
+        sched_yield();
+    }
 
     /* Deferred BOOTLOG.TXT + UDP boot log: MSC on the live USB may
      * enumerate only after the idle loop has polled USB for a few
@@ -2589,6 +2617,7 @@ void gui_post_key(uint8_t c) {
                        w->wid, w->owner_pid);
     }
     enqueue_event(w, GUI_EV_KEY, 0, 0, 0, c);
+    g.input_boost_pid = w->owner_pid;
     g.dirty = true;   /* allow the compositor to repaint if anything visual changed */
 }
 

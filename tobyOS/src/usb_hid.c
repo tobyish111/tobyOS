@@ -86,23 +86,20 @@ static struct hid_dev_state g_hid[USB_HID_MAX_DEVICES];
 /* Class request helpers (built on the HCI's control transfer)     */
 /* ============================================================== */
 
-/* Forward decl: sits in xhci.c (file-local "static" there for now);
- * we keep one tiny extern wrapper here that mirrors the same
- * synchronous semantics. To avoid adding it to a header-visible API
- * (the only consumer is this file, today), we re-declare it locally
- * with the matching signature. If a second HCI ever appears the
- * cleanest move is to formalise this as a function pointer on
- * struct usb_device. */
-bool xhci_control_class(struct usb_device *dev,
-                        uint8_t bm_request_type, uint8_t b_request,
-                        uint16_t w_value, uint16_t w_index,
-                        void *buf, uint16_t w_length);
+static bool usb_control_xfer(struct usb_device *dev,
+                             uint8_t bm_request_type, uint8_t b_request,
+                             uint16_t w_value, uint16_t w_index,
+                             void *buf, uint16_t w_length) {
+    if (!dev || !dev->control_xfer) return false;
+    return dev->control_xfer(dev, bm_request_type, b_request,
+                             w_value, w_index, buf, w_length);
+}
 
 /* Issue SET_PROTOCOL(BOOT). bmRequestType = host-to-device, class,
  * recipient interface = 0x21. */
 static bool hid_set_protocol(struct usb_device *dev,
                              uint8_t iface, uint8_t protocol) {
-    return xhci_control_class(
+    return usb_control_xfer(
         dev,
         USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
         USB_HID_REQ_SET_PROTOCOL,
@@ -113,7 +110,7 @@ static bool hid_set_protocol(struct usb_device *dev,
  * periodically. Reduces interrupt-IN traffic to "real" events. */
 static bool hid_set_idle(struct usb_device *dev,
                          uint8_t iface, uint8_t duration) {
-    return xhci_control_class(
+    return usb_control_xfer(
         dev,
         USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
         USB_HID_REQ_SET_IDLE,

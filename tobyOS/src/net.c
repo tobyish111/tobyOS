@@ -48,6 +48,9 @@ const uint8_t g_eth_broadcast[ETH_ADDR_LEN] = {
 const uint8_t g_eth_zero[ETH_ADDR_LEN] = { 0 };
 
 static bool g_net_up;
+static enum net_status g_net_status = NET_STATUS_DOWN;
+static struct net_dev *g_net_devs[NET_MAX_DEVICES];
+static size_t          g_net_dev_count;
 
 /* Set once in net_init(): true iff the running IPv4 config came from DHCP
  * (not static fallback). Used by bootlog UDP upload targeting. */
@@ -57,10 +60,42 @@ bool net_is_up(void) { return g_net_up; }
 
 bool net_boot_used_dhcp(void) { return g_net_boot_via_dhcp; }
 
-/* ---- net_dev registry ------------------------------------------- */
+enum net_status net_status(void) { return g_net_status; }
 
-static struct net_dev *g_net_devs[NET_MAX_DEVICES];
-static size_t          g_net_dev_count;
+const char *net_status_name(void) {
+    switch (g_net_status) {
+    case NET_STATUS_DOWN:            return "down";
+    case NET_STATUS_NO_NIC:          return "no-nic";
+    case NET_STATUS_DHCP_WAIT:       return "dhcp-wait";
+    case NET_STATUS_DHCP_OK:         return "dhcp-ok";
+    case NET_STATUS_DHCP_EMPTY:      return "dhcp-empty";
+    case NET_STATUS_STATIC_FALLBACK: return "static-fallback";
+    default:                         return "unknown";
+    }
+}
+
+void net_status_summary(char *dst, size_t cap) {
+    if (!dst || cap == 0) return;
+    char ip[16], gw[16], dns[16], mac[18];
+    net_format_ip(ip, g_my_ip);
+    net_format_ip(gw, g_gateway_ip);
+    net_format_ip(dns, g_my_dns_be);
+    net_format_mac(mac, g_my_mac);
+    struct net_dev *nd = net_default();
+    ksnprintf(dst, cap, "status=%s nics=%u nic=%s ip=%s gw=%s dns=%s mac=%s",
+              net_status_name(), (unsigned)g_net_dev_count,
+              nd && nd->name ? nd->name : "?",
+              ip, gw, dns, mac);
+}
+
+void net_debug_dump(void) {
+    char summary[160];
+    net_status_summary(summary, sizeof(summary));
+    kprintf("[net-diag] %s\n", summary);
+    net_dump();
+}
+
+/* ---- net_dev registry ------------------------------------------- */
 
 void net_register(struct net_dev *dev) {
     if (!dev) return;
@@ -159,6 +194,43 @@ static void net_dhcp_retry_gap(struct net_dev *nd, unsigned ms) {
     }
 }
 
+static bool net_wait_link(struct net_dev *nd) {
+    if (!nd || !nd->link_up) return true;
+    if (nd->link_up(nd)) {
+        kprintf("[net] link is up on %s\n", nd->name ? nd->name : "?");
+        return true;
+    }
+
+#ifdef FAST_BOOT
+    enum { link_wait_ms = 5000u };
+#else
+    enum { link_wait_ms = 8000u };
+#endif
+    kprintf("[net] waiting up to %ums for link on %s before DHCP\n",
+            (unsigned)link_wait_ms, nd->name ? nd->name : "?");
+
+    uint32_t hz = pit_hz();
+    if (hz == 0) hz = 100;
+    uint64_t deadline =
+        pit_ticks() + ((uint64_t)hz * (uint64_t)link_wait_ms) / 1000u;
+    if (deadline <= pit_ticks()) deadline = pit_ticks() + 1;
+
+    while (pit_ticks() < deadline) {
+        if (nd->link_up(nd)) {
+            kprintf("[net] link became ready on %s\n",
+                    nd->name ? nd->name : "?");
+            return true;
+        }
+        if (nd->rx_drain) nd->rx_drain(nd);
+        sti();
+        hlt();
+    }
+
+    kprintf("[net] WARN: link still down on %s; trying DHCP anyway\n",
+            nd->name ? nd->name : "?");
+    return false;
+}
+
 /* Apply a successful DHCP lease into the kernel globals. Logged with
  * a single human-readable line so post-mortem analysis is one grep. */
 static void net_apply_lease(const struct dhcp_lease *L, const char *src) {
@@ -206,6 +278,7 @@ static void net_apply_static_fallback(void) {
 bool net_init(void) {
     struct net_dev *nd = net_default();
     if (!nd) {
+        g_net_status = NET_STATUS_NO_NIC;
         kprintf("[net] no NIC registered -- networking disabled\n");
         return false;
     }
@@ -227,6 +300,13 @@ bool net_init(void) {
     arp_init();
     sock_init();
     tcp_init();
+    bool link_ready = net_wait_link(nd);
+    if (link_ready) {
+        /* Carrier can become visible before small broadcast RX is fully
+         * reliable on bare metal. Let the PHY/switch settle briefly so
+         * DHCP does not lose the first OFFER/ACK burst. */
+        net_dhcp_retry_gap(nd, 250u);
+    }
 
     /* g_my_ip stays 0 across the DHCP handshake: ip_send and udp_send
      * stamp the source IP from g_my_ip, which is exactly what BOOTP
@@ -239,12 +319,13 @@ bool net_init(void) {
     g_gateway_ip = 0;
     g_my_dns_be  = 0;
     g_net_up     = true;          /* mark up so udp_send / arp_send work */
+    g_net_status = NET_STATUS_DHCP_WAIT;
 
     /* Try DHCP: DISCOVER → OFFER → REQUEST → ACK; dhcp.c uses ~70% of the
      * budget waiting for OFFER (with DISCOVER retries) and the rest for ACK. */
 #ifdef FAST_BOOT
     /* Some home routers answer DHCP slowly on cold boot. */
-    enum { dhcp_boot_budget_ms = 5000 };
+    enum { dhcp_boot_budget_ms = 7000 };
 #else
     enum { dhcp_boot_budget_ms = 6000 };
 #endif
@@ -254,23 +335,34 @@ bool net_init(void) {
     enum { dhcp_retry_gap_ms = 120u };
 #endif
     struct dhcp_lease lease;
-    bool dhcp_ok = dhcp_acquire(dhcp_boot_budget_ms, &lease);
-    if (!dhcp_ok) {
-        kprintf("[net] DHCP attempt 1 failed — retrying after short gap\n");
-        net_dhcp_retry_gap(nd, dhcp_retry_gap_ms);
+    bool dhcp_ok = false;
+    for (unsigned attempt = 1; attempt <= 3u; attempt++) {
         dhcp_ok = dhcp_acquire(dhcp_boot_budget_ms, &lease);
+        if (dhcp_ok) break;
+        if (attempt < 3u) {
+            kprintf("[net] DHCP attempt %u failed -- retrying after short gap\n",
+                    attempt);
+            net_dhcp_retry_gap(nd, dhcp_retry_gap_ms);
+        }
+    }
+    if (dhcp_ok && lease.ip_be == 0) {
+        kprintf("[net] DHCP returned an empty IP lease -- ignoring\n");
+        g_net_status = NET_STATUS_DHCP_EMPTY;
+        dhcp_ok = false;
     }
     if (dhcp_ok) {
         g_net_boot_via_dhcp = true;
         net_apply_lease(&lease, "DHCP");
+        g_net_status = NET_STATUS_DHCP_OK;
     } else {
         g_net_boot_via_dhcp = false;
 #ifdef TOBY_NET_FALLBACK_SLIRP
-        kprintf("[net] DHCP failed (2 attempts) -- using static SLIRP fallback (10.0.2.15/24)\n");
+        kprintf("[net] DHCP failed (3 attempts) -- using static SLIRP fallback (10.0.2.15/24)\n");
 #else
-        kprintf("[net] DHCP failed (2 attempts) -- using static fallback 192.168.68.10/22 (gw/dns .68.1)\n");
+        kprintf("[net] DHCP failed (3 attempts) -- using static fallback 192.168.68.10/22 (gw/dns .68.1)\n");
 #endif
         net_apply_static_fallback();
+        g_net_status = NET_STATUS_STATIC_FALLBACK;
     }
 
     char ipbuf[16], gwbuf[16];
@@ -311,7 +403,14 @@ bool net_dhcp_renew(void) {
         g_gateway_ip = prev_gw; g_my_dns_be = prev_dns;
         return false;
     }
+    if (lease.ip_be == 0) {
+        kprintf("[net] dhcp renew: empty IP lease -- restoring previous lease\n");
+        g_my_ip = prev_ip; g_my_netmask = prev_msk;
+        g_gateway_ip = prev_gw; g_my_dns_be = prev_dns;
+        return false;
+    }
     net_apply_lease(&lease, "DHCP-renew");
+    g_net_status = NET_STATUS_DHCP_OK;
     arp_init();                       /* gateway might have changed */
     net_warm_gateway_arp(nd);
     return true;

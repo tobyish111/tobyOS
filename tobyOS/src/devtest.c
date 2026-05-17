@@ -29,6 +29,7 @@
 #include <tobyos/blk.h>
 #include <tobyos/xhci.h>
 #include <tobyos/usb.h>
+#include <tobyos/usb_legacy.h>
 #include <tobyos/usb_hub.h>
 #include <tobyos/usb_hid.h>
 #include <tobyos/usb_msc.h>
@@ -554,6 +555,7 @@ void devtest_init(void) {
     /* Subsystem tests -- each subsystem owns its own callback so this
      * file does not need to know how the test is implemented. */
     devtest_register("xhci",     xhci_selftest);
+    devtest_register("usb_legacy", usb_legacy_selftest);
     devtest_register("usb",      xhci_devices_selftest);
     devtest_register("usb_hub",  usb_hub_selftest);
     devtest_register("audio",    audio_hda_selftest);

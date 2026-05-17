@@ -131,6 +131,9 @@
 #define PCI_SUBCLASS_USB         0x03    /* under SERIAL_BUS   */
 #define PCI_SUBCLASS_BRIDGE_PCI  0x04    /* PCI-to-PCI bridge  */
 
+#define PCI_PROGIF_UHCI          0x00    /* under SERIAL_BUS / USB */
+#define PCI_PROGIF_OHCI          0x10    /* under SERIAL_BUS / USB */
+#define PCI_PROGIF_EHCI          0x20    /* under SERIAL_BUS / USB */
 #define PCI_PROGIF_XHCI          0x30    /* under SERIAL_BUS / USB */
 
 /* Wildcards in match tables. 0xFFFF for the 16-bit fields and 0xFF
