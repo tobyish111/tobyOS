@@ -155,6 +155,12 @@ void rtl8169_register(void);      /* Realtek RTL8169/8168/8111 gigabit family */
  * the IP came from DHCP or the fallback). */
 bool net_init(void);
 
+/* Request one boot-time network bring-up. This records intent only:
+ * net_service_tick() performs the actual net_init() from the cooperative
+ * network lane so the desktop can continue booting even if DHCP is slow
+ * or the NIC is absent. */
+void net_boot_request(void);
+
 /* Re-run DHCP at runtime. Same effect as net_init's DHCP branch:
  * acquires a fresh lease and updates the globals. Returns true on
  * success. Used by the `dhcp` shell builtin. */
@@ -164,6 +170,13 @@ bool net_dhcp_renew(void);
  * from the kernel idle loop alongside shell_poll(). Cheap when nothing
  * is pending. Must NOT be called from IRQ context. */
 void net_poll(void);
+
+/* Guarded network maintenance lane. This wraps net_poll() plus protocol
+ * services that sit beside the packet stack (currently SSH). It is safe
+ * to call from cooperative kernel/service contexts before GUI work; a
+ * non-reentrant guard drops nested calls instead of letting GUI/input
+ * paths overlap network maintenance. Must NOT be called from IRQ context. */
+void net_service_tick(void);
 
 /* Did net_init() succeed? Kept so syscall stubs can reject cleanly
  * with -ENONET on systems where the e1000 wasn't present. */

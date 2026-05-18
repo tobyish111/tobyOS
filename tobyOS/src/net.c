@@ -26,6 +26,7 @@
 #include <tobyos/arp.h>
 #include <tobyos/socket.h>
 #include <tobyos/dhcp.h>
+#include <tobyos/ssh.h>
 #include <tobyos/tcp.h>
 #include <tobyos/tcp_echo.h>
 #include <tobyos/tcp_shell.h>
@@ -51,6 +52,9 @@ static bool g_net_up;
 static enum net_status g_net_status = NET_STATUS_DOWN;
 static struct net_dev *g_net_devs[NET_MAX_DEVICES];
 static size_t          g_net_dev_count;
+static volatile int    g_net_service_busy;
+static volatile bool   g_net_boot_requested;
+static volatile bool   g_net_boot_done;
 
 /* Set once in net_init(): true iff the running IPv4 config came from DHCP
  * (not static fallback). Used by bootlog UDP upload targeting. */
@@ -59,6 +63,11 @@ static bool g_net_boot_via_dhcp;
 bool net_is_up(void) { return g_net_up; }
 
 bool net_boot_used_dhcp(void) { return g_net_boot_via_dhcp; }
+
+void net_boot_request(void) {
+    if (g_net_boot_done || g_net_up) return;
+    g_net_boot_requested = true;
+}
 
 enum net_status net_status(void) { return g_net_status; }
 
@@ -386,6 +395,26 @@ void net_poll(void) {
     }
     tcp_echo_poll();
     tcp_shell_poll();
+}
+
+void net_service_tick(void) {
+    if (__atomic_exchange_n(&g_net_service_busy, 1, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+
+    if (g_net_boot_requested && !g_net_boot_done && !g_net_up) {
+        g_net_boot_requested = false;
+        kprintf("[net] deferred boot bring-up starting\n");
+        bool ok = net_init();
+        g_net_boot_done = true;
+        kprintf("[net] deferred boot bring-up %s\n", ok ? "complete" : "failed");
+        if (ok) ssh_init();
+    }
+
+    net_poll();
+    ssh_poll();
+
+    __atomic_store_n(&g_net_service_busy, 0, __ATOMIC_RELEASE);
 }
 
 /* ---- checksum --------------------------------------------------- */

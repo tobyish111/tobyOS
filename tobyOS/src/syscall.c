@@ -2239,10 +2239,13 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
     perf_zone_end(PERF_Z_SYSCALL, t_sys);
 
     /* User GUI apps can make long bursts of draw/read/event syscalls.
-     * Service local input before the compositor tick so USB HID reports
-     * delivered by xHCI IRQs do not sit in the mouse queue until pid 0
-     * eventually reaches the idle loop again. */
+     * Service networking before GUI work so compositor/input changes
+     * cannot starve NIC RX, DHCP follow-up traffic, or SSH. Then service
+     * local input before the compositor tick so USB HID reports delivered
+     * by xHCI IRQs do not sit in the mouse queue until pid 0 eventually
+     * reaches the idle loop again. */
     if (gui_active()) {
+        net_service_tick();
         syscall_service_input();
     }
 
@@ -2261,6 +2264,7 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * on_pid0 AND g.active internally). */
     if (gui_active()) {
         gui_tick();
+        net_service_tick();
         syscall_service_input();
     }
 

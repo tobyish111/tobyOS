@@ -56,9 +56,6 @@
 #include <tobyos/net.h>
 #include <tobyos/dns.h>
 #include <tobyos/tcp.h>
-#include <tobyos/tcp_echo.h>
-#include <tobyos/tcp_shell.h>
-#include <tobyos/ssh.h>
 #include <tobyos/ssh_crypto.h>
 #include <tobyos/http.h>
 #include <tobyos/xhci.h>
@@ -439,13 +436,9 @@ static __attribute__((noreturn)) void idle_loop(void) {
         } while (0)
 
     for (;;) {
-        /* Poll network devices first. This keeps Realtek/e1000 RX from
-         * being starved by a busy local desktop session. */
-        net_poll();
-        SERVICE_INPUT();
-
-        /* SSH is not part of net_poll(); keep it moving when enabled. */
-        ssh_poll();
+        /* Network service lane first: drain NIC RX and protocol daemons
+         * before GUI/input work can consume pid 0's turn. */
+        net_service_tick();
         SERVICE_INPUT();
 
         /*
@@ -465,6 +458,10 @@ static __attribute__((noreturn)) void idle_loop(void) {
 
         /* GUI/window manager tick. */
         gui_tick();
+
+        /* If GUI work yielded back after a repaint burst, give the
+         * network lane another cheap chance before local input/shell. */
+        net_service_tick();
         SERVICE_INPUT();
 
         /* Local shell input. */
@@ -2779,24 +2776,28 @@ void _start(void) {
      * desktop scheduler prevent DHCP from ever starting.
      */
     if (safemode_skip_net()) {
-        kprintf("[safe] skipping net_init (NIC + DHCP + DNS) -- mode=%s\n",
+        kprintf("[safe] skipping network boot request (NIC + DHCP + DNS) -- mode=%s\n",
                 safemode_tag());
     } else {
-        kprintf("[boot] before net_init\n");
+        kprintf("[boot] requesting deferred network bring-up\n");
+        net_boot_request();
 
-        bool net_ok = net_init();
-
-        kprintf("[boot] after net_init ok=%d net_up=%d\n",
-                (int)net_ok, (int)net_is_up());
-
-        if (net_ok) {
-            kprintf("[boot] net_init OK; starting TCP services\n");
-            tcp_echo_init();
-            tcp_shell_init();
-            ssh_init();
-        } else {
-            kprintf("[boot] net_init failed; TCP services not started\n");
+        /* Let the just-initialised GUI/input/USB side settle briefly,
+         * then service the network request before m14_init/gui_tick can
+         * spawn desktop/login work or yield into userspace. This keeps
+         * networking non-fatal but guarantees the boot path actually
+         * gives NIC/DHCP a turn. */
+        kprintf("[boot] settling input before network bring-up\n");
+        for (unsigned i = 0; i < 30; i++) {
+            usb_legacy_poll();
+            xhci_poll();
+            kbd_flush_pending();
+            mouse_flush_pending();
+            pit_sleep_ms(1);
         }
+
+        kprintf("[boot] servicing deferred network bring-up\n");
+        net_service_tick();
     }
 
     if (!safemode_skip_gui()) {
