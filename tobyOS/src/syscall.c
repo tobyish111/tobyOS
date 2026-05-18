@@ -384,6 +384,10 @@ static long sys_gui_poll_event(int fd, struct gui_event *out) {
     if (!user_buf_ok((uint64_t)(uintptr_t)out, sizeof(*out))) return -1;
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+    /* Drain local input before deciding the GUI event queue is empty.
+     * USB keyboard reports are completed by xhci_poll(); doing that only
+     * after this syscall returns can add an extra app yield per keystroke. */
+    syscall_service_input();
     /* Poll into a kernel-side struct first so a partial write to user
      * memory can't leave the queue in a half-consumed state. */
     struct gui_event ev;
