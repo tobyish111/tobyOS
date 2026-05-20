@@ -44,7 +44,7 @@ static const struct {
     const char *key;
     const char *val;
 } g_defaults[] = {
-    { "desktop.bg",      "0x00204060" },   /* same blue the compositor used to hard-code */
+    { "desktop.bg",      "theme"      },   /* "theme" means use active palette default */
     { "desktop.title",   "tobyOS"     },
     { "desktop.greeting", "Welcome to tobyOS" },
     { "user.last",       "toby"       },

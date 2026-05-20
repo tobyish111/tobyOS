@@ -4,7 +4,7 @@
  * Lets the user view and modify a small set of system settings backed
  * by /data/settings.conf:
  *
- *   desktop.bg       0xAARRGGBB wallpaper colour. Live: the next time
+ *   desktop.bg       "theme" or 0xRRGGBB wallpaper colour. Live: the next time
  *                    the compositor repaints the desktop (every
  *                    gui_tick), it pulls this through settings_get_u32.
  *   desktop.title    short string painted by the compositor.
@@ -23,7 +23,7 @@
  *   |  System Settings                         |
  *   |  (changes are saved to /data/settings.conf)
  *   |                                          |
- *   |  desktop.bg (0xAARRGGBB):                |
+ *   |  desktop.bg (theme or 0xRRGGBB):         |
  *   |  [ 0x00204060                          ] |
  *   |                                          |
  *   |  desktop.title:                          |
@@ -75,7 +75,7 @@ static inline long sys_logout(void) {
 
 /* ---- baked-in defaults (mirror src/settings.c) ------------------ */
 
-#define DEF_BG       "0x00204060"
+#define DEF_BG       "theme"
 #define DEF_TITLE    "tobyOS"
 #define DEF_GREETING "Hello, friend!"
 
@@ -153,7 +153,7 @@ int main(int argc, char **argv) {
              "Changes are persisted to /data/settings.conf.");
 
     /* desktop.bg */
-    tg_label(&app, 12,  56, 200, 14, "desktop.bg (0xAARRGGBB):");
+    tg_label(&app, 12,  56, 240, 14, "desktop.bg (theme or 0xRRGGBB):");
     g_in_bg = tg_textinput(&app, 12, 74, 416, 22);
 
     /* desktop.title */

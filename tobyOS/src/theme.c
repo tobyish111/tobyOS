@@ -37,48 +37,55 @@ static const struct theme_palette g_theme_cyber = {
     .name            = "cyber",
 
     /* Wallpaper */
-    .bg              = 0x000A0F18u,   /* near-black with a hint of blue */
-    .bg_band         = 0x00050913u,
-    .bg_grid         = 0x00121B2Cu,
+    .bg              = 0x00060912u,   /* deep graphite, not dead black */
+    .bg_band         = 0x000A1224u,
+    .bg_vignette     = 0x00101828u,
+    .bg_grid         = 0x00141F34u,
     .bg_grid_step    = 32,
     .scanline        = 1,
 
     /* Window chrome */
-    .win_bg          = 0x00121826u,
-    .win_border      = 0x00263042u,
+    .win_bg          = 0x000E1622u,
+    .win_border      = 0x00324762u,
     .win_glow        = 0x0000E6FFu,   /* cyan accent under title bar */
-    .title_focus     = 0x00161E30u,
-    .title_unfocus   = 0x00101522u,
-    .title_text      = 0x00DCEEFFu,
+    .win_shadow      = 0x50000000u,
+    .win_shadow_deep = 0x8A000000u,
+    .title_focus     = 0x00141D34u,
+    .title_focus_hi  = 0x00203458u,
+    .title_unfocus   = 0x000E1420u,
+    .title_unfocus_hi = 0x00152030u,
+    .title_text      = 0x00EAF8FFu,
+    .title_text_dim  = 0x007B93ADu,
 
-    .close_bg        = 0x00301823u,
-    .close_bg_hot    = 0x00FF3060u,
+    .close_bg        = 0x0017222Eu,
+    .close_bg_hot    = 0x00FF2F66u,
     .close_fg        = 0x00FFC8D8u,
 
     /* Taskbar */
-    .taskbar         = 0x000A1020u,
+    .taskbar         = 0x00080D18u,
+    .taskbar_glass   = 0x90080D18u,
     .taskbar_top     = 0x0000E6FFu,   /* cyan accent line, top edge */
     .taskbar_text    = 0x006A87A8u,   /* dim brand text */
 
     /* Start button */
-    .start_bg        = 0x00141E36u,
-    .start_bg_hot    = 0x001A2D55u,
+    .start_bg        = 0x00111B32u,
+    .start_bg_hot    = 0x001E355Fu,
     .start_fg        = 0x00DCEEFFu,
 
     /* Tabs */
-    .tab_bg          = 0x000F1828u,
-    .tab_bg_focus    = 0x00182944u,
+    .tab_bg          = 0x000D1523u,
+    .tab_bg_focus    = 0x00182C4Fu,
     .tab_fg          = 0x00C8DDF2u,
     .tab_border      = 0x00263042u,
 
     /* Launcher */
-    .menu_bg         = 0x00101728u,
+    .menu_bg         = 0x000C1322u,
     .menu_border     = 0x0000E6FFu,
     .menu_hot        = 0x001E2C48u,
     .menu_text       = 0x00DCEEFFu,
 
     /* Tray pills */
-    .tray_bg         = 0x00101728u,
+    .tray_bg         = 0x000C1322u,
     .tray_bg_hot     = 0x00182944u,
     .tray_text       = 0x00C8DDF2u,
     .tray_text_dim   = 0x005A6A82u,
@@ -114,6 +121,7 @@ static const struct theme_palette g_theme_basic = {
 
     .bg              = 0x00204060u,
     .bg_band         = 0x00102540u,
+    .bg_vignette     = 0x00204060u,
     .bg_grid         = 0x00000000u,
     .bg_grid_step    = 0,
     .scanline        = 0,
@@ -121,15 +129,21 @@ static const struct theme_palette g_theme_basic = {
     .win_bg          = 0x00181818u,
     .win_border      = 0x00101010u,
     .win_glow        = 0x00101010u,   /* no glow accent in basic */
+    .win_shadow      = 0x00000000u,
+    .win_shadow_deep = 0x00000000u,
     .title_focus     = 0x00224488u,
+    .title_focus_hi  = 0x00224488u,
     .title_unfocus   = 0x00606060u,
+    .title_unfocus_hi = 0x00606060u,
     .title_text      = 0x00FFFFFFu,
+    .title_text_dim  = 0x00C0C0C0u,
 
     .close_bg        = 0x00C04040u,
     .close_bg_hot    = 0x00FF6060u,
     .close_fg        = 0x00FFFFFFu,
 
     .taskbar         = 0x00181C24u,
+    .taskbar_glass   = 0xFF181C24u,
     .taskbar_top     = 0x00404858u,
     .taskbar_text    = 0x00B0B8C8u,
 

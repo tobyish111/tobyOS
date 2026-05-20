@@ -120,16 +120,20 @@ static void tg_strcpy_capped(char *dst, const char *src, tg_size_t cap) {
 
 /* ---- colours (single global "theme") ------------------------------ */
 
-#define TG_COL_BG          0x00202830u  /* window background */
-#define TG_COL_LABEL_FG    0x00E0E0E0u
-#define TG_COL_BTN_FACE    0x00404858u
-#define TG_COL_BTN_FACE_H  0x00505868u  /* hovered/pressed lighter */
-#define TG_COL_BTN_BORDER  0x00808890u
-#define TG_COL_BTN_TEXT    0x00FFFFFFu
-#define TG_COL_INPUT_BG    0x00101418u
-#define TG_COL_INPUT_FG    0x00E8F0F8u
-#define TG_COL_INPUT_BORDER 0x00606870u
-#define TG_COL_FOCUS_RING  0x00FFD060u  /* yellow-ish focus highlight */
+#define TG_COL_BG           0x000E1622u
+#define TG_COL_PANEL        0x00141F30u
+#define TG_COL_PANEL_HI     0x0020334Eu
+#define TG_COL_LABEL_FG     0x00DDEEFFu
+#define TG_COL_LABEL_DIM    0x007B93ADu
+#define TG_COL_BTN_FACE     0x00142134u
+#define TG_COL_BTN_FACE_H   0x001F365Cu
+#define TG_COL_BTN_BORDER   0x00324762u
+#define TG_COL_BTN_TEXT     0x00EAF8FFu
+#define TG_COL_INPUT_BG     0x00081018u
+#define TG_COL_INPUT_FG     0x00E8F7FFu
+#define TG_COL_INPUT_BORDER 0x00324762u
+#define TG_COL_FOCUS_RING   0x0000E6FFu
+#define TG_COL_ACCENT_2     0x00FF36C8u
 
 /* ---- forward decls ------------------------------------------------ */
 
@@ -224,6 +228,17 @@ static void draw_rect_border(struct tg_app *app, int x, int y, int w, int h,
     sys_gui_fill(app->fd, x + w - 1, y,         1, h, color);
 }
 
+static void draw_surface(struct tg_app *app, int x, int y, int w, int h,
+                         tg_uint32_t fill, tg_uint32_t border,
+                         tg_uint32_t accent) {
+    sys_gui_fill(app->fd, x, y, w, h, fill);
+    if (h > 2 && w > 2) {
+        sys_gui_fill(app->fd, x + 1, y + 1, w - 2, 1, TG_COL_PANEL_HI);
+    }
+    draw_rect_border(app, x, y, w, h, border);
+    if (w > 2) sys_gui_fill(app->fd, x + 1, y, w - 2, 1, accent);
+}
+
 /* Vertical-centre baseline for an 8-px font inside an h-pixel widget. */
 static int text_baseline_y(int widget_y, int widget_h) {
     int by = widget_y + (widget_h - 8) / 2;
@@ -250,8 +265,8 @@ static void draw_label(struct tg_app *app, struct tg_widget *w) {
 
 static void draw_button(struct tg_app *app, struct tg_widget *w, int focused) {
     tg_uint32_t face = w->pressed ? TG_COL_BTN_FACE_H : TG_COL_BTN_FACE;
-    sys_gui_fill(app->fd, w->x, w->y, w->w, w->h, face);
-    draw_rect_border(app, w->x, w->y, w->w, w->h, TG_COL_BTN_BORDER);
+    draw_surface(app, w->x, w->y, w->w, w->h, face, TG_COL_BTN_BORDER,
+                 focused ? TG_COL_FOCUS_RING : TG_COL_ACCENT_2);
     if (focused) {
         /* Inset 2 px so the focus ring is visible against the border. */
         draw_rect_border(app, w->x + 2, w->y + 2, w->w - 4, w->h - 4,
@@ -264,9 +279,9 @@ static void draw_button(struct tg_app *app, struct tg_widget *w, int focused) {
 }
 
 static void draw_textinput(struct tg_app *app, struct tg_widget *w, int focused) {
-    sys_gui_fill(app->fd, w->x, w->y, w->w, w->h, TG_COL_INPUT_BG);
-    draw_rect_border(app, w->x, w->y, w->w, w->h,
-                     focused ? TG_COL_FOCUS_RING : TG_COL_INPUT_BORDER);
+    draw_surface(app, w->x, w->y, w->w, w->h, TG_COL_INPUT_BG,
+                 focused ? TG_COL_FOCUS_RING : TG_COL_INPUT_BORDER,
+                 focused ? TG_COL_ACCENT_2 : TG_COL_INPUT_BORDER);
     /* 4-px text padding from the left edge. */
     int tx = w->x + 4;
     int ty = text_baseline_y(w->y, w->h);
@@ -300,6 +315,8 @@ static void draw_widget(struct tg_app *app, int idx) {
 
 static void redraw_all(struct tg_app *app) {
     sys_gui_fill(app->fd, 0, 0, app->win_w, app->win_h, app->bg_color);
+    sys_gui_fill(app->fd, 0, 0, app->win_w, 1, TG_COL_FOCUS_RING);
+    sys_gui_fill(app->fd, 0, 1, app->win_w, 1, TG_COL_PANEL_HI);
     for (int i = 0; i < app->n_widgets; i++) draw_widget(app, i);
     sys_gui_flip(app->fd);
     app->want_redraw = 0;

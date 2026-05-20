@@ -18,7 +18,7 @@
  * Frame layout per window (drawn by the compositor, not by the user):
  *
  *   +---------------------------------------+  <- (x, y) outer top-left
- *   |          18-px title bar              |
+ *   |          24-px title bar              |
  *   +---------------------------------------+
  *   |                                       |
  *   |          client area  (w x h)         |  <- pixels at (x+1, y+19)..
@@ -45,19 +45,18 @@
 
 /* Visual constants -- exposed so GUI apps can position widgets relative
  * to their own client area without surprises. */
-#define GUI_TITLE_BAR_H      18
+#define GUI_TITLE_BAR_H      24
 #define GUI_BORDER           1
 
 /* Taskbar height reserved at the bottom of the screen in desktop mode.
  * Compositor draws the taskbar last, so it always paints over windows;
  * the WM also clamps window y so the title bar can never disappear
  * underneath the taskbar. */
-#define GUI_TASKBAR_H        24
+#define GUI_TASKBAR_H        32
 
-/* Title-bar close button (top-right "X"). 14x14 px gives the user a
- * comfortable click target on the 18-px title bar. */
-#define GUI_CLOSE_BTN_SIZE   14
-#define GUI_CLOSE_BTN_PAD    2
+/* Title-bar close button (top-right "X"). */
+#define GUI_CLOSE_BTN_SIZE   16
+#define GUI_CLOSE_BTN_PAD    4
 
 /* ---- event types --------------------------------------------------- */
 

@@ -54,6 +54,7 @@ struct theme_palette {
     /* Wallpaper / desktop background */
     uint32_t bg;            /* solid fill behind everything */
     uint32_t bg_band;       /* darker band along the very top */
+    uint32_t bg_vignette;   /* lower desktop fade / horizon */
     uint32_t bg_grid;       /* faint grid line colour, used in cyber */
     int      bg_grid_step;  /* 0 = no grid, else px between lines */
     int      scanline;      /* 0 = no scanline overlay, 1 = subtle band */
@@ -62,9 +63,14 @@ struct theme_palette {
     uint32_t win_bg;        /* default client-area fill */
     uint32_t win_border;    /* outer 1-px frame */
     uint32_t win_glow;      /* M31: 1-px accent line under title bar */
+    uint32_t win_shadow;    /* ARGB shadow overlay behind windows */
+    uint32_t win_shadow_deep; /* ARGB deeper drop shadow */
     uint32_t title_focus;   /* focused window title bar */
+    uint32_t title_focus_hi;/* focused title highlight band */
     uint32_t title_unfocus; /* background window title bar */
+    uint32_t title_unfocus_hi; /* background title highlight band */
     uint32_t title_text;    /* title-bar text */
+    uint32_t title_text_dim;/* inactive title / small helper text */
 
     /* Close button (top-right "X") */
     uint32_t close_bg;
@@ -73,6 +79,7 @@ struct theme_palette {
 
     /* Taskbar */
     uint32_t taskbar;       /* taskbar fill */
+    uint32_t taskbar_glass; /* ARGB glass overlay after windows */
     uint32_t taskbar_top;   /* 1-px accent line at the top edge */
     uint32_t taskbar_text;  /* dim brand text on the right */
 

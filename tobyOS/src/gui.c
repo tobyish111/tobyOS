@@ -90,12 +90,12 @@ struct window {
  * go?". A debug build can `theme_set(THEME_BASIC)` from a serial
  * command to A/B against the M12 colours. */
 
-#define TASKBAR_BRAND        "tobyOS // M31"
+#define TASKBAR_BRAND        "tobyOS // neon"
 
-#define START_BTN_W       72
-#define START_BTN_LABEL   "Apps"
-#define TAB_W             132
-#define TAB_PAD           4
+#define START_BTN_W       92
+#define START_BTN_LABEL   "Start"
+#define TAB_W             148
+#define TAB_PAD           6
 #define TAB_TEXT_MAX      14
 
 /* ---- M31 system tray geometry ----------------------------------- *
@@ -121,7 +121,7 @@ struct window {
  *   NET    - "NET a.b.c.d / NO LINK"  176 px (widest -- IPv4 string) */
 
 #define TRAY_PAD          8
-#define TRAY_PILL_H       (GUI_TASKBAR_H - 8)
+#define TRAY_PILL_H       (GUI_TASKBAR_H - 10)
 #define TRAY_GAP          4
 
 #define TRAY_W_CLOCK      88
@@ -153,9 +153,10 @@ struct window {
  * enough to hold all three plus headroom. */
 #define LAUNCHER_SYS_MAX  7
 #define LAUNCHER_MAX      (LAUNCHER_SYS_MAX + GUI_LAUNCHER_USER_MAX + 1)
-#define LAUNCHER_W        180
-#define LAUNCHER_ITEM_H   22
-#define LAUNCHER_PAD      4
+#define LAUNCHER_W        260
+#define LAUNCHER_HEAD_H    44
+#define LAUNCHER_ITEM_H    30
+#define LAUNCHER_PAD        8
 
 #define LAUNCH_QUEUE_MAX   4
 #define TRACKED_PIDS_MAX   8
@@ -374,6 +375,80 @@ void gui_trace_logf(const char *fmt, ...) {
 
 /* ---- helpers ------------------------------------------------------ */
 
+static uint32_t color_mix(uint32_t a, uint32_t b, int num, int den) {
+    if (den <= 0) return a;
+    if (num < 0) num = 0;
+    if (num > den) num = den;
+    int ia = den - num;
+    uint32_t ar = (a >> 16) & 0xFFu, ag = (a >> 8) & 0xFFu, ab = a & 0xFFu;
+    uint32_t br = (b >> 16) & 0xFFu, bg = (b >> 8) & 0xFFu, bb = b & 0xFFu;
+    uint32_t r = (ar * (uint32_t)ia + br * (uint32_t)num) / (uint32_t)den;
+    uint32_t gch = (ag * (uint32_t)ia + bg * (uint32_t)num) / (uint32_t)den;
+    uint32_t bl = (ab * (uint32_t)ia + bb * (uint32_t)num) / (uint32_t)den;
+    return (r << 16) | (gch << 8) | bl;
+}
+
+static uint32_t argb(uint8_t a, uint32_t xrgb) {
+    return ((uint32_t)a << 24) | (xrgb & 0x00FFFFFFu);
+}
+
+static void fill_vgradient(int x, int y, int w, int h,
+                           uint32_t top, uint32_t bottom, int bands) {
+    if (w <= 0 || h <= 0) return;
+    if (bands < 1) bands = 1;
+    if (bands > h) bands = h;
+    for (int i = 0; i < bands; i++) {
+        int y0 = y + (i * h) / bands;
+        int y1 = y + ((i + 1) * h) / bands;
+        gfx_fill_rect(x, y0, w, y1 - y0, color_mix(top, bottom, i, bands - 1));
+    }
+}
+
+static void draw_line(int x0, int y0, int x1, int y1, uint32_t color) {
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = y1 > y0 ? y0 - y1 : y1 - y0;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        gfx_set_pixel(x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = err * 2;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static int str_px(const char *s) {
+    int n = 0;
+    if (s) while (s[n]) n++;
+    return n * 8;
+}
+
+static void draw_text_centered(int x, int y, int w, int h,
+                               const char *s, uint32_t fg) {
+    int tx = x + (w - str_px(s)) / 2;
+    if (tx < x + 4) tx = x + 4;
+    int ty = y + (h - 8) / 2;
+    if (ty < y) ty = y;
+    gfx_draw_text(tx, ty, s, fg, GFX_TRANSPARENT);
+}
+
+static void paint_glass_rect(int x, int y, int w, int h,
+                             uint32_t fill, uint32_t glass,
+                             uint32_t border, uint32_t accent) {
+    if (w <= 0 || h <= 0) return;
+    gfx_fill_rect(x, y, w, h, fill);
+    if ((glass >> 24) != 0) {
+        gfx_fill_rect_blend(x, y, w, h, glass);
+    }
+    gfx_draw_rect(x, y, w, h, border);
+    if (w > 2) {
+        gfx_fill_rect(x + 1, y, w - 2, 1, accent);
+        gfx_fill_rect_blend(x + 1, y + 1, w - 2, 1, 0x28FFFFFFu);
+    }
+}
+
 static int outer_w(const struct window *w) {
     return w->client_w + 2 * GUI_BORDER;
 }
@@ -456,7 +531,7 @@ static struct window *taskbar_tab_at(int px, int py) {
 static void launcher_rect(int *mx, int *my, int *mw, int *mh) {
     int items = launcher_count();
     *mw = LAUNCHER_W;
-    *mh = items * LAUNCHER_ITEM_H + LAUNCHER_PAD * 2;
+    *mh = LAUNCHER_HEAD_H + items * LAUNCHER_ITEM_H + LAUNCHER_PAD * 2;
     *mx = 2;
     *my = taskbar_top() - *mh;
     if (*my < 4) *my = 4;
@@ -467,8 +542,9 @@ static int launcher_item_at(int px, int py) {
     if (!g.menu_open) return -1;
     int mx, my, mw, mh; launcher_rect(&mx, &my, &mw, &mh);
     if (px < mx || px >= mx + mw) return -1;
-    if (py < my + LAUNCHER_PAD || py >= my + mh - LAUNCHER_PAD) return -1;
-    int local = py - (my + LAUNCHER_PAD);
+    int list_y = my + LAUNCHER_PAD + LAUNCHER_HEAD_H;
+    if (py < list_y || py >= my + mh - LAUNCHER_PAD) return -1;
+    int local = py - list_y;
     int idx = local / LAUNCHER_ITEM_H;
     if (idx < 0 || idx >= launcher_count()) return -1;
     return idx;
@@ -1172,7 +1248,10 @@ static void paint_close_button(const struct window *w) {
     bool hot = (g.cur_x >= bx && g.cur_x < bx + bw &&
                 g.cur_y >= by && g.cur_y < by + bh);
     gfx_fill_rect(bx, by, bw, bh, hot ? t->close_bg_hot : t->close_bg);
-    gfx_draw_rect(bx, by, bw, bh, t->win_border);
+    gfx_draw_rect(bx, by, bw, bh, hot ? t->close_fg : t->win_border);
+    if (!hot && bw > 4) {
+        gfx_fill_rect(bx + 2, by, bw - 4, 1, t->accent_magenta);
+    }
     /* Two diagonals. */
     int pad = 3;
     for (int i = 0; i < bw - 2 * pad; i++) {
@@ -1181,30 +1260,61 @@ static void paint_close_button(const struct window *w) {
     }
 }
 
+static void paint_window_shadow(const struct window *w, bool focused) {
+    const struct theme_palette *t = theme_active();
+    int ow = outer_w(w);
+    int oh = outer_h(w);
+    if ((t->win_shadow_deep >> 24) != 0) {
+        gfx_fill_rect_blend(w->x + 8, w->y + 10, ow, oh, t->win_shadow_deep);
+    }
+    if ((t->win_shadow >> 24) != 0) {
+        gfx_fill_rect_blend(w->x + 3, w->y + 4, ow + 6, oh + 6, t->win_shadow);
+    }
+    if (focused) {
+        gfx_fill_rect_blend(w->x - 1, w->y - 1, ow + 2, 1,
+                            argb(0x80, t->accent_cyan));
+        gfx_fill_rect_blend(w->x - 1, w->y, 1, oh,
+                            argb(0x30, t->accent_cyan));
+        gfx_fill_rect_blend(w->x + ow, w->y, 1, oh,
+                            argb(0x30, t->accent_magenta));
+    }
+}
+
+static void paint_window_glyph(int x, int y, uint32_t a, uint32_t b) {
+    gfx_fill_rect(x,     y,     4, 4, a);
+    gfx_fill_rect(x + 6, y,     4, 4, b);
+    gfx_fill_rect(x,     y + 6, 4, 4, b);
+    gfx_fill_rect(x + 6, y + 6, 4, 4, a);
+}
+
 static void compositor_paint_one(struct window *w, bool focused) {
     const struct theme_palette *t = theme_active();
     int ow = outer_w(w);
     int oh = outer_h(w);
 
-    /* M31: focused windows get a 1-px neon accent line just under
-     * the title bar; reads as a "glass panel" highlight at framebuffer
-     * resolution and identifies the focused window at a glance. */
-    gfx_fill_rect(w->x, w->y, ow, GUI_TITLE_BAR_H,
-                  focused ? t->title_focus : t->title_unfocus);
-    if (focused) {
-        gfx_fill_rect(w->x, w->y + GUI_TITLE_BAR_H - 1, ow, 1,
-                      t->win_glow);
-    }
+    paint_window_shadow(w, focused);
+
+    fill_vgradient(w->x, w->y, ow, GUI_TITLE_BAR_H,
+                   focused ? t->title_focus_hi : t->title_unfocus_hi,
+                   focused ? t->title_focus    : t->title_unfocus,
+                   5);
+    gfx_fill_rect_blend(w->x + 1, w->y + 1, ow - 2, 1, 0x30FFFFFFu);
+    gfx_fill_rect(w->x, w->y + GUI_TITLE_BAR_H - 1, ow, 1,
+                  focused ? t->win_glow : t->win_border);
+    paint_window_glyph(w->x + 8, w->y + (GUI_TITLE_BAR_H - 10) / 2,
+                       focused ? t->accent_cyan : t->title_text_dim,
+                       focused ? t->accent_magenta : t->win_border);
     if (w->title[0]) {
-        gfx_draw_text(w->x + 8, w->y + 5, w->title,
-                      t->title_text, GFX_TRANSPARENT);
+        gfx_draw_text(w->x + 24, w->y + (GUI_TITLE_BAR_H - 8) / 2, w->title,
+                      focused ? t->title_text : t->title_text_dim,
+                      GFX_TRANSPARENT);
     }
-    gfx_draw_rect(w->x, w->y, ow, oh, t->win_border);
 
     gfx_blit(w->x + GUI_BORDER, w->y + GUI_TITLE_BAR_H,
              w->client_w, w->client_h,
              w->backbuf, w->client_w);
 
+    gfx_draw_rect(w->x, w->y, ow, oh, t->win_border);
     paint_close_button(w);
 }
 
@@ -1215,6 +1325,8 @@ static void compositor_paint_one(struct window *w, bool focused) {
 static void paint_wallpaper(void) {
     const struct theme_palette *t = theme_active();
     int W = (int)gfx_width(), H = (int)gfx_height();
+    int desk_h = H - GUI_TASKBAR_H;
+    if (desk_h < 1) desk_h = H;
 
     /* Milestone 14: per-key overrides via /data/settings.conf so the
      * Settings GUI app can tweak the desktop colour live (and across
@@ -1222,47 +1334,67 @@ static void paint_wallpaper(void) {
      * settings still win. */
     uint32_t bg   = settings_get_u32("desktop.bg",      t->bg);
     uint32_t band = settings_get_u32("desktop.bg_band", t->bg_band);
-    gfx_clear(bg);
+    if (t->id == THEME_CYBER && bg == 0x00204060u) {
+        bg = t->bg;   /* migrate the old baked-in blue to the theme look */
+    }
+    fill_vgradient(0, 0, W, desk_h, bg, t->bg_vignette, 24);
+    if (desk_h < H) {
+        gfx_fill_rect(0, desk_h, W, H - desk_h, t->taskbar);
+    }
 
     /* M31 cyber: faint grid overlay. Step==0 means "no grid"
      * (basic theme). We draw 1-px lines spaced t->bg_grid_step
      * apart -- cheap to fill_rect on a framebuffer of any size. */
     if (t->bg_grid_step > 0) {
-        for (int x = 0; x < W; x += t->bg_grid_step) {
-            gfx_fill_rect(x, 0, 1, H - GUI_TASKBAR_H, t->bg_grid);
+        int step = t->bg_grid_step;
+        for (int x = 0; x < W; x += step) {
+            gfx_fill_rect_blend(x, 0, 1, desk_h, argb(0x55, t->bg_grid));
         }
-        for (int y = 0; y < H - GUI_TASKBAR_H; y += t->bg_grid_step) {
-            gfx_fill_rect(0, y, W, 1, t->bg_grid);
+        for (int y = 0; y < desk_h; y += step) {
+            gfx_fill_rect_blend(0, y, W, 1, argb(0x55, t->bg_grid));
         }
     }
 
-    /* Top band -- looks like a lower-third HUD strip in the cyber
-     * theme, sits just at the top in basic. */
-    gfx_fill_rect(0, 0, W, 28, band);
-    /* M31: 1-px accent line along the top band's bottom edge. */
-    gfx_fill_rect(0, 28, W, 1, t->accent_cyan);
+    /* Horizon + diagonal rails: cheap geometric accents that make the
+     * empty desktop feel intentional without needing bitmap assets. */
+    if (t->id == THEME_CYBER) {
+        int hy = desk_h * 58 / 100;
+        gfx_fill_rect_blend(0, hy - 1, W, 2, argb(0x70, t->accent_magenta));
+        gfx_fill_rect_blend(0, hy + 4, W, 1, argb(0x65, t->accent_cyan));
+        draw_line(0, desk_h - 1, W / 3, hy, t->bg_grid);
+        draw_line(W - 1, desk_h - 1, W * 2 / 3, hy, t->bg_grid);
+        draw_line(W / 7, desk_h - 1, W / 2, hy + 24, t->bg_grid);
+        draw_line(W * 6 / 7, desk_h - 1, W / 2, hy + 24, t->bg_grid);
+    }
+
+    /* Top command band. */
+    paint_glass_rect(0, 0, W, 34, band, argb(0x50, band),
+                     t->win_border, t->accent_cyan);
 
     gfx_draw_text(10, 8,
-                  "tobyOS desktop  //  click [Apps] to open programs",
+                  "tobyOS desktop  //  neon shell",
                   t->title_text, GFX_TRANSPARENT);
 
-    /* Centred big brand. Crude centring using 8-px font width. */
+    /* Centred brand. */
     const char *brand = "tobyOS";
-    int bx = (W - 6 * 8) / 2;
-    int by = (H - GUI_TASKBAR_H) / 2 - 16;
-    gfx_draw_text(bx, by, brand, t->title_text, GFX_TRANSPARENT);
-    gfx_draw_text(bx - 4 * 8, by + 16,
-                  "//  M31 desktop",
+    int bx = (W - 6 * 8 * 3) / 2;
+    int by = desk_h / 2 - 34;
+    gfx_draw_text_smooth(bx, by, brand, t->title_text, GFX_TRANSPARENT, 3);
+    gfx_draw_text(bx + 4, by + 32,
+                  "M32 neon desktop",
                   t->accent_cyan, GFX_TRANSPARENT);
+    gfx_draw_text(bx + 4, by + 46,
+                  "local-first OS lab",
+                  t->title_text_dim, GFX_TRANSPARENT);
 
     /* M31 cyber: a subtle scanline band, 8 px tall, alpha-blended
      * across the wallpaper one-third of the way down. We use the
      * blend variant so the grid still shows underneath. */
     if (t->scanline) {
-        int sy = (H - GUI_TASKBAR_H) / 3;
+        int sy = desk_h / 3;
         /* 0xRRGGBB into 0xAARRGGBB; A=0x14 (~8%) reads as a
          * just-perceptible HUD band. */
-        gfx_fill_rect_blend(0, sy, W, 8, 0x14000000u | (t->accent_cyan & 0x00FFFFFFu));
+        gfx_fill_rect_blend(0, sy, W, 8, argb(0x14, t->accent_cyan));
     }
 
     /* Always-visible emergency-hotkey hint above the taskbar.
@@ -1274,8 +1406,8 @@ static void paint_wallpaper(void) {
     int hlen = 0; while (hint[hlen]) hlen++;
     int hx = W - hlen * 8 - 8;
     if (hx < 8) hx = 8;
-    int hy = H - GUI_TASKBAR_H - 12;
-    gfx_draw_text(hx, hy, hint, t->title_text, GFX_TRANSPARENT);
+    int hy = desk_h - 14;
+    gfx_draw_text(hx, hy, hint, t->title_text_dim, GFX_TRANSPARENT);
 }
 
 /* Truncating copy: copies up to dst_max-1 chars from src to dst,
@@ -1302,10 +1434,10 @@ static void copy_clip(char *dst, int dst_max, const char *src) {
 static void paint_pill(const struct tray_rect *r, bool hot, uint32_t accent) {
     if (!r->present) return;
     const struct theme_palette *t = theme_active();
-    gfx_fill_rect(r->x, r->y, r->w, r->h, hot ? t->tray_bg_hot : t->tray_bg);
-    gfx_draw_rect(r->x, r->y, r->w, r->h, t->tray_border);
-    /* Accent stripe: 1 px on top edge inside the border. */
-    gfx_fill_rect(r->x + 1, r->y, r->w - 2, 1, accent);
+    paint_glass_rect(r->x, r->y, r->w, r->h,
+                     hot ? t->tray_bg_hot : t->tray_bg,
+                     argb(hot ? 0x60 : 0x38, t->tray_bg),
+                     t->tray_border, accent);
 }
 
 /* Centred text inside a pill. Text is monospace 8x16, so column
@@ -1423,20 +1555,25 @@ static void paint_taskbar(void) {
     int W  = (int)gfx_width();
     int yt = taskbar_top();
 
-    /* Bar fill + 1-px neon accent line at the very top edge. */
+    /* Glass taskbar layered over windows. */
     gfx_fill_rect(0, yt, W, GUI_TASKBAR_H, t->taskbar);
+    if ((t->taskbar_glass >> 24) != 0) {
+        gfx_fill_rect_blend(0, yt, W, GUI_TASKBAR_H, t->taskbar_glass);
+    }
     gfx_fill_rect(0, yt, W, 1, t->taskbar_top);
+    gfx_fill_rect_blend(0, yt + 1, W, 1, 0x26FFFFFFu);
+    gfx_fill_rect_blend(0, yt - 6, W, 6, 0x30000000u);
 
     /* Start button. */
     bool start_hot = (g.cur_x >= 0 && g.cur_x < START_BTN_W &&
                       g.cur_y >= yt && g.cur_y < yt + GUI_TASKBAR_H);
-    gfx_fill_rect(2, yt + 2, START_BTN_W - 4, GUI_TASKBAR_H - 4,
-                  (start_hot || g.menu_open) ? t->start_bg_hot : t->start_bg);
-    gfx_draw_rect(2, yt + 2, START_BTN_W - 4, GUI_TASKBAR_H - 4, t->win_border);
-    /* M31: 1-px magenta marker on the start button top edge to make
-     * it visually anchor the row of tray pills on the right. */
-    gfx_fill_rect(3, yt + 2, START_BTN_W - 6, 1, t->accent_magenta);
-    gfx_draw_text(12, yt + 8, START_BTN_LABEL,
+    paint_glass_rect(4, yt + 4, START_BTN_W - 8, GUI_TASKBAR_H - 8,
+                     (start_hot || g.menu_open) ? t->start_bg_hot : t->start_bg,
+                     argb(0x40, t->start_bg),
+                     t->win_border, t->accent_magenta);
+    paint_window_glyph(14, yt + (GUI_TASKBAR_H - 10) / 2,
+                       t->accent_cyan, t->accent_magenta);
+    gfx_draw_text(32, yt + (GUI_TASKBAR_H - 8) / 2, START_BTN_LABEL,
                   t->start_fg, GFX_TRANSPARENT);
 
     /* Window tabs (left -> right, oldest first). The right-edge limit
@@ -1462,16 +1599,15 @@ static void paint_taskbar(void) {
         bool focused = (w == g.z_top);
         int tx = x, tw = TAB_W - TAB_PAD;
         if (tx + tw > tabs_x_max) break;
-        gfx_fill_rect(tx, yt + 2, tw, GUI_TASKBAR_H - 4,
-                      focused ? t->tab_bg_focus : t->tab_bg);
-        gfx_draw_rect(tx, yt + 2, tw, GUI_TASKBAR_H - 4, t->tab_border);
-        if (focused) {
-            /* Focused-tab highlight bar, sits flush at the top edge. */
-            gfx_fill_rect(tx + 1, yt + 2, tw - 2, 1, t->accent_cyan);
-        }
+        paint_glass_rect(tx, yt + 4, tw, GUI_TASKBAR_H - 8,
+                         focused ? t->tab_bg_focus : t->tab_bg,
+                         argb(focused ? 0x58 : 0x30, t->tab_bg),
+                         t->tab_border,
+                         focused ? t->accent_cyan : t->win_border);
         char clip[TAB_TEXT_MAX + 1];
         copy_clip(clip, sizeof(clip), w->title[0] ? w->title : "(no title)");
-        gfx_draw_text(tx + 6, yt + 8, clip, t->tab_fg, GFX_TRANSPARENT);
+        gfx_draw_text(tx + 10, yt + (GUI_TASKBAR_H - 8) / 2,
+                      clip, t->tab_fg, GFX_TRANSPARENT);
         x += TAB_W;
     }
 
@@ -1487,7 +1623,7 @@ static void paint_taskbar(void) {
     int bx = START_BTN_W + 6;
     /* Only show the brand if no tabs would overlap it. */
     if (n == 0) {
-        gfx_draw_text(bx, yt + 8, TASKBAR_BRAND,
+        gfx_draw_text(bx, yt + (GUI_TASKBAR_H - 8) / 2, TASKBAR_BRAND,
                       t->taskbar_text, GFX_TRANSPARENT);
     }
 }
@@ -1496,25 +1632,36 @@ static void paint_launcher(void) {
     if (!g.menu_open) return;
     const struct theme_palette *t = theme_active();
     int mx, my, mw, mh; launcher_rect(&mx, &my, &mw, &mh);
-    gfx_fill_rect(mx, my, mw, mh, t->menu_bg);
-    gfx_draw_rect(mx, my, mw, mh, t->menu_border);
-    /* M31: 1-px neon accent line on the menu's top edge -- mirrors
-     * the taskbar accent so the menu looks like an extension of the
-     * panel rather than a floating popup. */
-    gfx_fill_rect(mx, my, mw, 1, t->accent_cyan);
+    gfx_fill_rect_blend(mx + 8, my + 10, mw, mh, 0x70000000u);
+    paint_glass_rect(mx, my, mw, mh, t->menu_bg, argb(0x76, t->menu_bg),
+                     t->menu_border, t->accent_cyan);
+
+    gfx_draw_text(mx + 14, my + 12, "tobyOS", t->title_text, GFX_TRANSPARENT);
+    gfx_draw_text(mx + 14, my + 26, "pinned apps", t->title_text_dim,
+                  GFX_TRANSPARENT);
+    gfx_fill_rect(mx + 12, my + LAUNCHER_HEAD_H - 2, mw - 24, 1,
+                  t->win_border);
 
     int n = launcher_count();
     for (int i = 0; i < n; i++) {
-        int iy = my + LAUNCHER_PAD + i * LAUNCHER_ITEM_H;
+        int iy = my + LAUNCHER_PAD + LAUNCHER_HEAD_H + i * LAUNCHER_ITEM_H;
         bool hot = (g.cur_x >= mx && g.cur_x < mx + mw &&
                     g.cur_y >= iy && g.cur_y < iy + LAUNCHER_ITEM_H);
-        if (hot) {
-            gfx_fill_rect(mx + 2, iy, mw - 4, LAUNCHER_ITEM_H, t->menu_hot);
-        }
         struct launcher_item li;
-        if (launcher_resolve(i, &li) && li.label) {
-            gfx_draw_text(mx + 10, iy + (LAUNCHER_ITEM_H - 8) / 2,
-                          li.label, t->menu_text, GFX_TRANSPARENT);
+        bool ok = launcher_resolve(i, &li) && li.label;
+        if (hot) {
+            gfx_fill_rect_blend(mx + 8, iy + 2, mw - 16, LAUNCHER_ITEM_H - 4,
+                                argb(0xDC, t->menu_hot));
+            gfx_fill_rect(mx + 8, iy + 2, 3, LAUNCHER_ITEM_H - 4,
+                          ok && li.path ? t->accent_cyan : t->status_warn);
+        }
+        if (ok) {
+            uint32_t accent = li.path ? t->accent_cyan : t->status_warn;
+            gfx_fill_rect(mx + 18, iy + (LAUNCHER_ITEM_H - 8) / 2, 7, 7,
+                          hot ? accent : t->win_border);
+            gfx_draw_text(mx + 34, iy + (LAUNCHER_ITEM_H - 8) / 2,
+                          li.label, li.path ? t->menu_text : t->accent_amber,
+                          GFX_TRANSPARENT);
         }
     }
 }
@@ -1571,13 +1718,12 @@ static void paint_toast(void) {
     int x, y, w, h; toast_rect(&x, &y, &w, &h);
     uint32_t accent = urg_accent(t, g.toast_urgency);
 
-    /* Body: dark fill, 1-px outer border, 4-px accent stripe on the
-     * left edge that signals urgency at a glance. */
-    gfx_fill_rect(x, y, w, h, t->toast_bg);
-    gfx_draw_rect(x, y, w, h, t->toast_border);
+    /* Body: dark glass fill, 1-px outer border, 4-px accent stripe on
+     * the left edge that signals urgency at a glance. */
+    gfx_fill_rect_blend(x + 6, y + 8, w, h, 0x65000000u);
+    paint_glass_rect(x, y, w, h, t->toast_bg, argb(0x70, t->toast_bg),
+                     t->toast_border, accent);
     gfx_fill_rect(x, y, 4, h, accent);
-    /* Top accent line for the cyber HUD vibe. */
-    gfx_fill_rect(x + 4, y, w - 4, 1, accent);
 
     /* Header: APP — URG */
     char header[ABI_NOTIFY_APP_MAX + 8];
@@ -1623,10 +1769,9 @@ static void paint_center(void) {
                         0x40000000u);
 
     /* Panel body. */
-    gfx_fill_rect(x, y, w, h, t->center_bg);
-    gfx_draw_rect(x, y, w, h, t->center_border);
-    /* Top accent line. */
-    gfx_fill_rect(x, y, w, 1, t->accent_cyan);
+    gfx_fill_rect_blend(x + 8, y + 10, w, h, 0x70000000u);
+    paint_glass_rect(x, y, w, h, t->center_bg, argb(0x76, t->center_bg),
+                     t->center_border, t->accent_cyan);
 
     /* Header: title + unread count */
     char header[48];
@@ -1643,8 +1788,11 @@ static void paint_center(void) {
         struct abi_notification *r = &recs[i];
         bool hot = (g.cur_x >= x + 4 && g.cur_x < x + w - 4 &&
                     g.cur_y >= iy && g.cur_y < iy + CENTER_ITEM_H);
-        gfx_fill_rect(x + 4, iy + 2, w - 8, CENTER_ITEM_H - 4,
-                      hot ? t->center_item_hot : t->center_item_bg);
+        gfx_fill_rect_blend(x + 4, iy + 2, w - 8, CENTER_ITEM_H - 4,
+                            argb(hot ? 0xE8 : 0xD0,
+                                 hot ? t->center_item_hot : t->center_item_bg));
+        gfx_draw_rect(x + 4, iy + 2, w - 8, CENTER_ITEM_H - 4,
+                      hot ? t->accent_cyan : t->win_border);
         /* Urgency stripe on the left edge of the item. */
         gfx_fill_rect(x + 4, iy + 2, 3, CENTER_ITEM_H - 4,
                       urg_accent(t, r->urgency));
@@ -1683,10 +1831,11 @@ static void paint_center(void) {
     center_clear_btn_rect(&bx, &by, &bw, &bh);
     bool clr_hot = (g.cur_x >= bx && g.cur_x < bx + bw &&
                     g.cur_y >= by && g.cur_y < by + bh);
-    gfx_fill_rect(bx, by, bw, bh, clr_hot ? t->center_item_hot : t->center_item_bg);
-    gfx_draw_rect(bx, by, bw, bh, t->center_border);
-    gfx_draw_text(bx + 10, by + (bh - 8) / 2, "Clear all",
-                  t->center_header, GFX_TRANSPARENT);
+    paint_glass_rect(bx, by, bw, bh,
+                     clr_hot ? t->center_item_hot : t->center_item_bg,
+                     argb(0x40, t->center_item_bg),
+                     t->center_border, t->accent_magenta);
+    draw_text_centered(bx, by, bw, bh, "Clear all", t->center_header);
 
     /* Close hint. */
     gfx_draw_text(x + 12, y + h - 18, "(click bell to close)",

@@ -2731,6 +2731,7 @@ void _start(void) {
         kprintf("[boot] FAST_BOOT: skipping dns/tcp/http example.com smoke\n");
     }
 #endif
+
     /* GUI subsystem (milestone 10): graphics back buffer + PS/2 mouse +
      * window manager. Each layer is independently no-op-on-failure --
      * if any of them refuses we still drop into the text shell.
@@ -2770,10 +2771,9 @@ void _start(void) {
     }
 
     /*
-     * Bring networking up after the GUI/input layers are initialised, but
-     * before m14_init launches login and gui_tick can yield into userspace.
-     * This preserves the HP Realtek timing guardrail without letting the
-     * desktop scheduler prevent DHCP from ever starting.
+     * Protected network lane: after input/GUI setup has put the HP's
+     * platform devices into their stable state, but before m14_init can
+     * spawn login or the compositor can start yielding to user apps.
      */
     if (safemode_skip_net()) {
         kprintf("[safe] skipping network boot request (NIC + DHCP + DNS) -- mode=%s\n",
@@ -2782,11 +2782,6 @@ void _start(void) {
         kprintf("[boot] requesting deferred network bring-up\n");
         net_boot_request();
 
-        /* Let the just-initialised GUI/input/USB side settle briefly,
-         * then service the network request before m14_init/gui_tick can
-         * spawn desktop/login work or yield into userspace. This keeps
-         * networking non-fatal but guarantees the boot path actually
-         * gives NIC/DHCP a turn. */
         kprintf("[boot] settling input before network bring-up\n");
         for (unsigned i = 0; i < 30; i++) {
             usb_legacy_poll();
