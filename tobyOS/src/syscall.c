@@ -57,6 +57,8 @@
 #include <tobyos/drvmatch.h>
 #include <tobyos/hwdb.h>
 #include <tobyos/notify.h>
+#include <tobyos/theme.h>
+#include <tobyos/sysmon.h>
 #include <tobyos/mouse.h>
 #include <tobyos/keyboard.h>
 #include <tobyos/usb_legacy.h>
@@ -600,6 +602,10 @@ static long sys_setting_set(const char *key, const char *val) {
     memcpy(kkey, key, (size_t)klen); kkey[klen] = '\0';
     memcpy(kval, val, (size_t)vlen); kval[vlen] = '\0';
     if (settings_set_str(kkey, kval) != 0) return -1;
+    if (strcmp(kkey, "ui.theme") == 0) {
+        theme_set(strcmp(kval, "basic") == 0 ? THEME_BASIC : THEME_CYBER);
+    }
+    gui_settings_changed(kkey, kval);
     /* Persist immediately so the new value survives a reboot even if
      * the calling app crashes before it gets a chance to save. */
     (void)settings_save();
@@ -1470,6 +1476,17 @@ static long sys_slog_stats(struct abi_slog_stats *out) {
     return 0;
 }
 
+/* ---- Milestone 36B: live system monitor snapshot ---------------- */
+
+static long sys_system_metrics(struct abi_system_metrics *out) {
+    if (!user_buf_ok((uint64_t)(uintptr_t)out, sizeof(*out)))
+        return -ABI_EFAULT;
+    struct abi_system_metrics staging;
+    sysmon_sample(&staging);
+    memcpy(out, &staging, sizeof(staging));
+    return 0;
+}
+
 /* ---- Milestone 28C: watchdog status ------------------------- */
 
 static long sys_wdog_status(struct abi_wdog_status *out) {
@@ -2169,6 +2186,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_notify_list((struct abi_notification *)a1, (uint32_t)a2);
     case ABI_SYS_NOTIFY_DISMISS:
         return sys_notify_dismiss((uint32_t)a1);
+
+    /* ---- Milestone 36B: desktop/system monitor ------------------ */
+    case ABI_SYS_SYSTEM_METRICS:
+        return sys_system_metrics((struct abi_system_metrics *)a1);
 
     default:
         kprintf("[syscall] unknown number %ld -- returning -ENOSYS\n", num);

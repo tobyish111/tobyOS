@@ -106,6 +106,10 @@ void gui_tick(void);
  * keep working as before. */
 bool gui_active(void);
 
+/* Called by settings syscalls after a desktop-related key changes so
+ * compositor-owned shell chrome can reflect it immediately. */
+void gui_settings_changed(const char *key, const char *val);
+
 /* ---- desktop mode (milestone 12) ---------------------------------- */
 
 /* Enter or leave desktop mode. In desktop mode the compositor stays

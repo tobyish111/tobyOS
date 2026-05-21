@@ -176,35 +176,53 @@ static const char *find_ext(const char *name) {
 
 /* ---- layout constants ----------------------------------------- */
 
-#define WIN_W            480
-#define WIN_H            360
+#define WIN_W            640
+#define WIN_H            420
 
-#define PATH_BAR_Y       4
-#define PATH_BAR_H       20
+#define BTN_Y            10
+#define BTN_H            24
+#define BTN_BACK_X       10
+#define BTN_BACK_W       34
+#define BTN_UP_X         50
+#define BTN_UP_W         34
+#define BTN_OPEN_X       90
+#define BTN_OPEN_W       58
 
-#define BTN_Y            28
-#define BTN_H            20
-#define BTN_UP_X         4
-#define BTN_UP_W         48
-#define BTN_OPEN_X       56
-#define BTN_OPEN_W       60
+#define PATH_BAR_Y       42
+#define PATH_BAR_H       26
+#define PATH_BAR_X       164
+#define PATH_BAR_W       322
+#define SEARCH_X         494
+#define SEARCH_W         136
 
-#define LIST_X           4
-#define LIST_Y           56
-#define LIST_W           (WIN_W - 8)
-#define LIST_ROW_H       18
-#define LIST_ROWS_MAX    16
+#define NAV_X            0
+#define NAV_Y            76
+#define NAV_W            152
+#define NAV_H            (WIN_H - NAV_Y)
 
-#define COL_BG           0x00181C24u
-#define COL_PATH_BG      0x00282C34u
-#define COL_PATH_FG      0x00E0F0FFu
-#define COL_BTN_FACE     0x00404858u
-#define COL_BTN_BORDER   0x00808890u
-#define COL_BTN_TEXT     0x00FFFFFFu
-#define COL_ROW_FG       0x00E0E0E0u
-#define COL_ROW_BG       0x00181C24u
-#define COL_ROW_SEL_BG   0x00405070u
-#define COL_STATUS_FG    0x00FFD060u
+#define LIST_X           164
+#define LIST_Y           98
+#define LIST_W           (WIN_W - LIST_X - 12)
+#define LIST_ROW_H       22
+#define LIST_ROWS_MAX    12
+
+#define COL_BG           0x000A101Du
+#define COL_PANEL        0x00070C16u
+#define COL_PANEL_2      0x000B1424u
+#define COL_PATH_BG      0x00070C16u
+#define COL_PATH_FG      0x00EAF8FFu
+#define COL_BTN_FACE     0x00142134u
+#define COL_BTN_HOT      0x001F365Cu
+#define COL_BTN_BORDER   0x00324762u
+#define COL_BTN_TEXT     0x00EAF8FFu
+#define COL_CYAN         0x0000E6FFu
+#define COL_ORANGE       0x00FFB347u
+#define COL_MAGENTA      0x00FF36C8u
+#define COL_ROW_FG       0x00EAF8FFu
+#define COL_ROW_DIM      0x0088A2BAu
+#define COL_ROW_BG       0x000A101Du
+#define COL_ROW_SEL_BG   0x001F365Cu
+#define COL_STATUS_FG    0x00FFB347u
 
 #define ENTRIES_MAX      64
 
@@ -280,6 +298,7 @@ static void draw_button(int fd, int x, int y, int w, int h,
                         const char *label) {
     sys_gui_fill(fd, x, y, w, h, COL_BTN_FACE);
     draw_border(fd, x, y, w, h, COL_BTN_BORDER);
+    if (w > 2) sys_gui_fill(fd, x + 1, y, w - 2, 1, COL_ORANGE);
     int tx = x + (w - (int)my_strlen(label) * 8) / 2;
     if (tx < x + 2) tx = x + 2;
     int ty = y + (h - 8) / 2;
@@ -289,16 +308,20 @@ static void draw_button(int fd, int x, int y, int w, int h,
 static void draw_row(int fd, int row_idx, int y, int is_sel) {
     uint32_t bg = is_sel ? COL_ROW_SEL_BG : COL_ROW_BG;
     sys_gui_fill(fd, LIST_X, y, LIST_W, LIST_ROW_H, bg);
+    if (is_sel) {
+        sys_gui_fill(fd, LIST_X, y, 3, LIST_ROW_H, COL_ORANGE);
+        draw_border(fd, LIST_X, y, LIST_W, LIST_ROW_H, COL_CYAN);
+    }
 
     if (row_idx < 0) {
-        sys_gui_text(fd, LIST_X + 4, y + 5, "[..]  parent directory",
-                     COL_ROW_FG, bg);
+        sys_gui_text(fd, LIST_X + 10, y + 7, "[..]  parent directory",
+                     COL_ROW_DIM, bg);
         return;
     }
     if (row_idx >= g_entry_count) return;
 
     const struct vfs_dirent_user *e = &g_entries[row_idx];
-    const char *tag = (e->type == SYS_FS_TYPE_DIR) ? "[D] " : "[F] ";
+    const char *tag = (e->type == SYS_FS_TYPE_DIR) ? "[DIR]  " : "[FILE] ";
     /* Compose "[T] name" in one line. Cap the displayed name to fit
      * the row width so truncation is silent-but-visible. */
     char line[80];
@@ -308,28 +331,60 @@ static void draw_row(int fd, int row_idx, int y, int is_sel) {
         line[off++] = e->name[i];
     }
     line[off] = '\0';
-    sys_gui_text(fd, LIST_X + 4, y + 5, line, COL_ROW_FG, bg);
+    sys_gui_text(fd, LIST_X + 10, y + 7, line,
+                 e->type == SYS_FS_TYPE_DIR ? COL_ORANGE : COL_ROW_FG, bg);
 }
 
 static void redraw(int fd) {
     sys_gui_fill(fd, 0, 0, WIN_W, WIN_H, COL_BG);
 
-    /* Path bar. */
-    sys_gui_fill(fd, 4, PATH_BAR_Y, WIN_W - 8, PATH_BAR_H, COL_PATH_BG);
-    draw_border(fd, 4, PATH_BAR_Y, WIN_W - 8, PATH_BAR_H, COL_BTN_BORDER);
-    sys_gui_text(fd, 8, PATH_BAR_Y + 6, g_path, COL_PATH_FG, COL_PATH_BG);
+    /* Top toolbar. */
+    sys_gui_fill(fd, 0, 0, WIN_W, 34, 0x000D1523u);
+    sys_gui_fill(fd, 0, 34, WIN_W, 1, COL_CYAN);
+    sys_gui_text(fd, 164, 14, "This PC", COL_PATH_FG, 0x000D1523u);
 
     /* Buttons. */
+    draw_button(fd, BTN_BACK_X, BTN_Y, BTN_BACK_W, BTN_H, "<");
     draw_button(fd, BTN_UP_X,   BTN_Y, BTN_UP_W,   BTN_H, "Up");
     draw_button(fd, BTN_OPEN_X, BTN_Y, BTN_OPEN_W, BTN_H, "Open");
+
+    /* Address + search bars. */
+    sys_gui_fill(fd, PATH_BAR_X, PATH_BAR_Y, PATH_BAR_W, PATH_BAR_H, COL_PATH_BG);
+    draw_border(fd, PATH_BAR_X, PATH_BAR_Y, PATH_BAR_W, PATH_BAR_H, COL_BTN_BORDER);
+    sys_gui_fill(fd, PATH_BAR_X + 1, PATH_BAR_Y, PATH_BAR_W - 2, 1, COL_CYAN);
+    sys_gui_text(fd, PATH_BAR_X + 10, PATH_BAR_Y + 9, g_path, COL_PATH_FG, COL_PATH_BG);
+
+    sys_gui_fill(fd, SEARCH_X, PATH_BAR_Y, SEARCH_W, PATH_BAR_H, COL_PATH_BG);
+    draw_border(fd, SEARCH_X, PATH_BAR_Y, SEARCH_W, PATH_BAR_H, COL_BTN_BORDER);
+    sys_gui_text(fd, SEARCH_X + 10, PATH_BAR_Y + 9, "Search This PC",
+                 COL_ROW_DIM, COL_PATH_BG);
 
     /* Status (right of the buttons) -- shows "<read error>", "launched
      * /bin/hello", etc. Short-lived; overwritten on next action. */
     if (g_status[0]) {
-        sys_gui_text(fd, BTN_OPEN_X + BTN_OPEN_W + 8,
+        sys_gui_text(fd, BTN_OPEN_X + BTN_OPEN_W + 12,
                      BTN_Y + (BTN_H - 8) / 2, g_status,
-                     COL_STATUS_FG, COL_BG);
+                     COL_STATUS_FG, 0x000D1523u);
     }
+
+    /* Navigation sidebar. */
+    sys_gui_fill(fd, NAV_X, NAV_Y, NAV_W, NAV_H, COL_PANEL);
+    sys_gui_fill(fd, NAV_W, NAV_Y, 1, NAV_H, COL_BTN_BORDER);
+    const char *nav[] = {
+        "Quick access", "Desktop", "Downloads", "Documents",
+        "Pictures", "Music", "This PC", "Network"
+    };
+    for (int i = 0; i < 8; i++) {
+        int ny = NAV_Y + 12 + i * 22;
+        if (i == 6) {
+            sys_gui_fill(fd, 8, ny - 5, NAV_W - 16, 18, COL_ROW_SEL_BG);
+            sys_gui_fill(fd, 8, ny - 5, 3, 18, COL_ORANGE);
+        }
+        sys_gui_text(fd, 18, ny, nav[i], i == 6 ? COL_PATH_FG : COL_ROW_DIM,
+                     i == 6 ? COL_ROW_SEL_BG : COL_PANEL);
+    }
+
+    sys_gui_text(fd, LIST_X, 82, "Folders and files", COL_PATH_FG, COL_BG);
 
     /* List. Row -1 is the synthetic parent pseudo-row; rows 0..n-1
      * are real directory entries. */
@@ -410,7 +465,7 @@ int main(int argc, char **argv);
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
-    int fd = sys_gui_create(WIN_W, WIN_H, "Files");
+    int fd = sys_gui_create(WIN_W, WIN_H, "This PC");
     if (fd < 0) {
         putstr_console("gui_files: sys_gui_create failed\n");
         return 1;
@@ -425,6 +480,14 @@ int main(int argc, char **argv) {
         if (got == 0) { sys_yield(); continue; }
 
         if (ev.type == GUI_EV_MOUSE_DOWN && ev.button) {
+            /* Back button: first-pass explorer treats it like Up until
+             * we keep a navigation history stack. */
+            if (hit_in(ev.x, ev.y, BTN_BACK_X, BTN_Y, BTN_BACK_W, BTN_H)) {
+                path_pop();
+                refresh_listing();
+                redraw(fd);
+                continue;
+            }
             /* Up button: pop path + reload. */
             if (hit_in(ev.x, ev.y, BTN_UP_X, BTN_Y, BTN_UP_W, BTN_H)) {
                 path_pop();

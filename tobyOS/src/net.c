@@ -55,6 +55,8 @@ static size_t          g_net_dev_count;
 static volatile int    g_net_service_busy;
 static volatile bool   g_net_boot_requested;
 static volatile bool   g_net_boot_done;
+static volatile unsigned g_net_boot_attempts;
+static uint64_t        g_net_boot_next_tick;
 
 /* Set once in net_init(): true iff the running IPv4 config came from DHCP
  * (not static fallback). Used by bootlog UDP upload targeting. */
@@ -65,8 +67,31 @@ bool net_is_up(void) { return g_net_up; }
 bool net_boot_used_dhcp(void) { return g_net_boot_via_dhcp; }
 
 void net_boot_request(void) {
-    if (g_net_boot_done || g_net_up) return;
+    if (g_net_boot_done) return;
     g_net_boot_requested = true;
+    g_net_boot_next_tick = 0;
+}
+
+/* Real hardware can miss the first deferred service slot while PCI/IRQ
+ * setup is still settling. Keep retrying from the idle service lane instead
+ * of permanently declaring boot networking done after one early miss. */
+static uint64_t net_delay_ticks(unsigned ms) {
+    uint32_t hz = pit_hz();
+    if (hz == 0) hz = 100;
+    uint64_t ticks = ((uint64_t)hz * (uint64_t)ms + 999u) / 1000u;
+    return ticks ? ticks : 1;
+}
+
+static unsigned net_boot_retry_delay_ms(unsigned attempt) {
+    if (attempt <= 2u) return 250u;
+    if (attempt <= 4u) return 500u;
+    if (attempt <= 8u) return 1000u;
+    return 3000u;
+}
+
+static bool net_boot_has_dhcp_lease(void) {
+    return g_net_up && g_net_boot_via_dhcp &&
+           g_net_status == NET_STATUS_DHCP_OK && g_my_ip != 0;
 }
 
 enum net_status net_status(void) { return g_net_status; }
@@ -363,21 +388,29 @@ bool net_dhcp_renew(void) {
      * below depending on the outcome. */
     uint32_t prev_ip = g_my_ip, prev_msk = g_my_netmask;
     uint32_t prev_gw = g_gateway_ip, prev_dns = g_my_dns_be;
+    enum net_status prev_status = g_net_status;
+    bool prev_boot_via_dhcp = g_net_boot_via_dhcp;
     g_my_ip = 0; g_my_netmask = 0; g_gateway_ip = 0; g_my_dns_be = 0;
+    g_net_status = NET_STATUS_DHCP_WAIT;
 
     struct dhcp_lease lease;
     if (!dhcp_acquire(5000, &lease)) {
         kprintf("[net] dhcp renew: failed -- restoring previous lease\n");
         g_my_ip = prev_ip; g_my_netmask = prev_msk;
         g_gateway_ip = prev_gw; g_my_dns_be = prev_dns;
+        g_net_status = prev_status;
+        g_net_boot_via_dhcp = prev_boot_via_dhcp;
         return false;
     }
     if (lease.ip_be == 0) {
         kprintf("[net] dhcp renew: empty IP lease -- restoring previous lease\n");
         g_my_ip = prev_ip; g_my_netmask = prev_msk;
         g_gateway_ip = prev_gw; g_my_dns_be = prev_dns;
+        g_net_status = prev_status;
+        g_net_boot_via_dhcp = prev_boot_via_dhcp;
         return false;
     }
+    g_net_boot_via_dhcp = true;
     net_apply_lease(&lease, "DHCP-renew");
     g_net_status = NET_STATUS_DHCP_OK;
     arp_init();                       /* gateway might have changed */
@@ -402,15 +435,45 @@ void net_service_tick(void) {
         return;
     }
 
-    if (g_net_boot_requested && !g_net_boot_done && !g_net_up) {
+    if (g_net_boot_requested && !g_net_boot_done) {
+        uint64_t now = pit_ticks();
+        if (g_net_boot_next_tick && now < g_net_boot_next_tick) {
+            goto poll_and_release;
+        }
+
         g_net_boot_requested = false;
-        kprintf("[net] deferred boot bring-up starting\n");
-        bool ok = net_init();
-        g_net_boot_done = true;
-        kprintf("[net] deferred boot bring-up %s\n", ok ? "complete" : "failed");
-        if (ok) ssh_init();
+        g_net_boot_attempts++;
+        bool ok;
+        if (g_net_up && g_my_ip != 0 && !net_boot_has_dhcp_lease()) {
+            kprintf("[net] deferred DHCP retry starting (attempt %u)\n",
+                    g_net_boot_attempts);
+            ok = net_dhcp_renew();
+        } else {
+            kprintf("[net] deferred boot bring-up starting (attempt %u)\n",
+                    g_net_boot_attempts);
+            ok = net_init();
+        }
+
+        if (ok && net_boot_has_dhcp_lease()) {
+            g_net_boot_done = true;
+            kprintf("[net] deferred boot bring-up complete\n");
+            ssh_init();
+        } else {
+            unsigned delay_ms = net_boot_retry_delay_ms(g_net_boot_attempts);
+            g_net_boot_requested = true;
+            g_net_boot_next_tick = pit_ticks() + net_delay_ticks(delay_ms);
+            if (g_net_up && g_my_ip != 0) {
+                ssh_init();
+                kprintf("[net] DHCP lease not established yet; retrying in %u ms\n",
+                        delay_ms);
+            } else {
+                kprintf("[net] deferred boot bring-up failed; retrying in %u ms\n",
+                        delay_ms);
+            }
+        }
     }
 
+poll_and_release:
     net_poll();
     ssh_poll();
 

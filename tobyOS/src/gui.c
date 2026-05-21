@@ -40,6 +40,7 @@
 #include <tobyos/gfx.h>
 #include <tobyos/mouse.h>
 #include <tobyos/heap.h>
+#include <tobyos/pmm.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/console.h>
@@ -56,6 +57,7 @@
 #include <tobyos/perf.h>
 #include <tobyos/theme.h>
 #include <tobyos/notify.h>
+#include <tobyos/sysmon.h>
 #include <tobyos/net.h>
 #include <tobyos/audio_hda.h>
 #include <tobyos/bootlog.h>
@@ -90,10 +92,13 @@ struct window {
  * go?". A debug build can `theme_set(THEME_BASIC)` from a serial
  * command to A/B against the M12 colours. */
 
-#define TASKBAR_BRAND        "tobyOS // neon"
+#define TASKBAR_BRAND        "TOBYOS"
 
-#define START_BTN_W       92
-#define START_BTN_LABEL   "Start"
+#define START_BTN_W       58
+#define START_BTN_LABEL   "TO"
+#define TASKBAR_SEARCH_W  150
+#define TASKBAR_PIN_COUNT 7
+#define TASKBAR_PIN_W      42
 #define TAB_W             148
 #define TAB_PAD           6
 #define TAB_TEXT_MAX      14
@@ -124,7 +129,7 @@ struct window {
 #define TRAY_PILL_H       (GUI_TASKBAR_H - 10)
 #define TRAY_GAP          4
 
-#define TRAY_W_CLOCK      88
+#define TRAY_W_CLOCK      96
 #define TRAY_W_BELL       56
 #define TRAY_W_WIN        72
 #define TRAY_W_AUD        72
@@ -151,17 +156,22 @@ struct window {
  * by the package manager, plus one pinned "Logout" entry at the
  * bottom. LAUNCHER_MAX sizes the internal cursor math; keep it big
  * enough to hold all three plus headroom. */
-#define LAUNCHER_SYS_MAX  7
+#define LAUNCHER_SYS_MAX  8
 #define LAUNCHER_MAX      (LAUNCHER_SYS_MAX + GUI_LAUNCHER_USER_MAX + 1)
-#define LAUNCHER_W        260
-#define LAUNCHER_HEAD_H    44
-#define LAUNCHER_ITEM_H    30
-#define LAUNCHER_PAD        8
+#define LAUNCHER_W        420
+#define LAUNCHER_HEAD_H    84
+#define LAUNCHER_ITEM_H    25
+#define LAUNCHER_PAD       10
+#define LAUNCHER_PROFILE_W 116
+#define LAUNCHER_LIST_W   172
+#define LAUNCHER_TILE_W    58
+#define LAUNCHER_TILE_H    50
 
 #define LAUNCH_QUEUE_MAX   4
 #define TRACKED_PIDS_MAX   8
 #define LAUNCH_PATH_MAX    96
 #define LAUNCH_ARG_MAX     128
+#define SYSMON_HISTORY     32
 
 struct launcher_item {
     const char *label;
@@ -171,12 +181,13 @@ struct launcher_item {
 /* System entries at the top of the menu. NEVER mutated after boot;
  * declared const so the linker keeps them in .rodata. */
 static const struct launcher_item g_launcher_sys[LAUNCHER_SYS_MAX] = {
+    { "File Explorer", "/bin/gui_files"    },
     { "Settings",      "/bin/gui_settings" },
-    { "Terminal",      "/bin/gui_term"     },
-    { "Files",         "/bin/gui_files"    },
-    { "About system",  "/bin/gui_about"    },
-    { "Widgets demo",  "/bin/gui_widgets"  },
-    { "Hello clock",   "/bin/gui_clock"    },
+    { "Nex Terminal",  "/bin/gui_term"     },
+    { "Toby Widgets",  "/bin/gui_widgets"  },
+    { "Photos",        "/bin/gui_viewer"   },
+    { "Clock",         "/bin/gui_clock"    },
+    { "About TobyOS",  "/bin/gui_about"    },
     { 0, 0 },
 };
 
@@ -325,6 +336,27 @@ static struct {
      * tray bell is clicked). Pure overlay -- not a real window, so
      * it never steals focus and has no Z-order. */
     bool     center_open;
+
+    /* M36 shell panels. These are compositor-owned shell UI, not fake
+     * app windows. Clicking the widgets/taskbar pin toggles them, and
+     * quick-setting tiles update local shell state or post real kernel
+     * status notifications. */
+    bool     widgets_open;
+    bool     quick_wifi;
+    bool     quick_bt;
+    bool     quick_night;
+    bool     quick_nixie;
+    bool     quick_airplane;
+    bool     quick_focus;
+
+    struct abi_system_metrics mon;
+    uint64_t mon_last_sample_ms;
+    uint8_t  mon_cpu_hist [SYSMON_HISTORY];
+    uint8_t  mon_ram_hist [SYSMON_HISTORY];
+    uint8_t  mon_gui_hist [SYSMON_HISTORY];
+    uint8_t  mon_disk_hist[SYSMON_HISTORY];
+    uint8_t  mon_hist_pos;
+    bool     mon_hist_ready;
 
     /* Last drawn clock minute -- used by gui_tick to mark the
      * compositor dirty exactly once per minute even when nothing
@@ -493,6 +525,16 @@ static bool point_in_close(const struct window *w, int px, int py) {
 
 static int taskbar_top(void) { return (int)gfx_height() - GUI_TASKBAR_H; }
 
+static int taskbar_tabs_x0(void) {
+    int W = (int)gfx_width();
+    int x = START_BTN_W + TASKBAR_SEARCH_W + 12 +
+            TASKBAR_PIN_COUNT * TASKBAR_PIN_W + 10;
+    if (x > W / 2) {
+        x = START_BTN_W + TASKBAR_SEARCH_W + 12;
+    }
+    return x;
+}
+
 static bool point_in_taskbar(int px, int py) {
     (void)px;
     return g.desktop_mode && py >= taskbar_top();
@@ -510,7 +552,7 @@ static struct window *taskbar_tab_at(int px, int py) {
     if (!g.desktop_mode) return 0;
     int yt = taskbar_top();
     if (py < yt || py >= yt + GUI_TASKBAR_H) return 0;
-    int x0 = START_BTN_W + 4;
+    int x0 = taskbar_tabs_x0();
     /* The order in the z-list is top-first; we want tabs left=oldest
      * so newer windows appear on the right. Collect into a stack
      * first to reverse. */
@@ -526,15 +568,52 @@ static struct window *taskbar_tab_at(int px, int py) {
     return 0;
 }
 
+static int taskbar_pin_at(int px, int py) {
+    if (!g.desktop_mode) return -1;
+    int yt = taskbar_top();
+    if (py < yt || py >= yt + GUI_TASKBAR_H) return -1;
+    int sx = START_BTN_W + 4;
+    int x0 = sx + TASKBAR_SEARCH_W + 8;
+    for (int i = 0; i < TASKBAR_PIN_COUNT; i++) {
+        int ix = x0 + i * TASKBAR_PIN_W;
+        if (px >= ix && px < ix + TASKBAR_PIN_W - 6) return i;
+    }
+    return -1;
+}
+
+static bool point_in_taskbar_search(int px, int py) {
+    if (!g.desktop_mode) return false;
+    int yt = taskbar_top();
+    int sx = START_BTN_W + 4;
+    return px >= sx && px < sx + TASKBAR_SEARCH_W &&
+           py >= yt + 5 && py < yt + GUI_TASKBAR_H - 5;
+}
+
+static int desktop_icon_at(int px, int py) {
+    if (!g.desktop_mode) return -1;
+    int x = 16;
+    int y = 58;
+    for (int i = 0; i < 4; i++) {
+        int iy = y + i * 74;
+        if (px >= x && px < x + 76 &&
+            py >= iy && py < iy + 68) return i;
+    }
+    return -1;
+}
+
 /* Launcher menu rect: rises from just above the start button. Width
  * is fixed; height grows with the item count. */
 static void launcher_rect(int *mx, int *my, int *mw, int *mh) {
-    int items = launcher_count();
+    int W = (int)gfx_width();
+    int available_h = taskbar_top() - 12;
     *mw = LAUNCHER_W;
-    *mh = LAUNCHER_HEAD_H + items * LAUNCHER_ITEM_H + LAUNCHER_PAD * 2;
-    *mx = 2;
-    *my = taskbar_top() - *mh;
-    if (*my < 4) *my = 4;
+    if (*mw > W - 16) *mw = W - 16;
+    *mh = 416;
+    if (*mh > available_h) *mh = available_h;
+    if (*mh < 292) *mh = 292;
+    *mx = 8;
+    *my = taskbar_top() - *mh - 8;
+    if (*my < 6) *my = 6;
 }
 /* Returns item index 0..N-1 if the cursor is over a launcher entry,
  * -1 otherwise. */
@@ -542,12 +621,40 @@ static int launcher_item_at(int px, int py) {
     if (!g.menu_open) return -1;
     int mx, my, mw, mh; launcher_rect(&mx, &my, &mw, &mh);
     if (px < mx || px >= mx + mw) return -1;
-    int list_y = my + LAUNCHER_PAD + LAUNCHER_HEAD_H;
-    if (py < list_y || py >= my + mh - LAUNCHER_PAD) return -1;
-    int local = py - list_y;
-    int idx = local / LAUNCHER_ITEM_H;
-    if (idx < 0 || idx >= launcher_count()) return -1;
-    return idx;
+
+    int n = launcher_count();
+    int list_x = mx + LAUNCHER_PAD;
+    int list_y = my + LAUNCHER_HEAD_H + 20;
+    int list_w = LAUNCHER_LIST_W;
+    int visible = n - 1;
+    if (visible > 6) visible = 6;
+    if (px >= list_x && px < list_x + list_w &&
+        py >= list_y && py < list_y + visible * LAUNCHER_ITEM_H) {
+        int idx = (py - list_y) / LAUNCHER_ITEM_H;
+        if (idx >= 0 && idx < visible) return idx;
+    }
+
+    int grid_x = mx + 190;
+    int grid_y = my + LAUNCHER_HEAD_H + 18;
+    int grid_cols = 3;
+    for (int i = 0; i < 9; i++) {
+        int col = i % grid_cols;
+        int row = i / grid_cols;
+        int tx = grid_x + col * (LAUNCHER_TILE_W + 12);
+        int ty = grid_y + row * (LAUNCHER_TILE_H + 12);
+        if (px >= tx && px < tx + LAUNCHER_TILE_W &&
+            py >= ty && py < ty + LAUNCHER_TILE_H) {
+            if (i < n - 1) return i;
+        }
+    }
+
+    int power_x = mx + LAUNCHER_PAD;
+    int power_y = my + mh - 64;
+    if (px >= power_x && px < power_x + LAUNCHER_PROFILE_W - 16 &&
+        py >= power_y && py < power_y + 28) {
+        return n - 1;
+    }
+    return -1;
 }
 static bool point_in_menu(int px, int py) {
     if (!g.menu_open) return false;
@@ -789,15 +896,107 @@ int gui_launch_enqueue_arg(const char *path, const char *arg) {
     return gui_launch_enqueue_arg_profile_caps(path, arg, 0, 0);
 }
 
-static void launch_enqueue_with_profile(const char *path, const char *profile) {
-    (void)gui_launch_enqueue_arg_profile_caps(path, 0, profile, 0);
-}
-
 /* M34D variant: enqueue with both profile and declared caps. */
 static void launch_enqueue_with_profile_caps(const char *path,
                                              const char *profile,
                                              const char *caps) {
     (void)gui_launch_enqueue_arg_profile_caps(path, 0, profile, caps);
+}
+
+static void shell_launch_path(const char *path) {
+    if (!path || !path[0]) return;
+    launch_enqueue_with_profile_caps(path,
+                                     gui_launcher_sandbox_for_path(path),
+                                     gui_launcher_caps_for_path(path));
+}
+
+static void shell_launch_desktop_icon(int icon) {
+    switch (icon) {
+    case 0: shell_launch_path("/bin/gui_files");    break; /* This PC */
+    case 1: shell_launch_path("/bin/gui_about");    break; /* TobyOS */
+    case 2:
+        notify_post(ABI_NOTIFY_KIND_USER, NOTIFY_URG_INFO,
+                    "shell", "Recycle Bin",
+                    "Recycle Bin is now a real shell target; file deletion plumbing is next.");
+        break;
+    case 3: shell_launch_path("/bin/gui_settings"); break; /* Control Panel */
+    default: break;
+    }
+}
+
+static void shell_launch_pin(int pin) {
+    switch (pin) {
+    case 0: shell_launch_path("/bin/gui_files");    break;
+    case 1:
+        notify_post(ABI_NOTIFY_KIND_USER, NOTIFY_URG_INFO,
+                    "shell", "Toby Browser",
+                    "Browser shell tile is wired; TCP/HTTP UI app is a future layer.");
+        break;
+    case 2: shell_launch_path("/bin/gui_term");     break;
+    case 3: shell_launch_path("/bin/gui_widgets");  break;
+    case 4: shell_launch_path("/bin/gui_settings"); break;
+    case 5:
+        g.widgets_open = !g.widgets_open;
+        notify_post(ABI_NOTIFY_KIND_USER, NOTIFY_URG_INFO,
+                    "shell", g.widgets_open ? "Widgets open" : "Widgets hidden",
+                    "Quick Settings and System Monitor are compositor shell panels.");
+        break;
+    case 6:
+        notify_post(ABI_NOTIFY_KIND_USER, NOTIFY_URG_INFO,
+                    "mail", "Mail",
+                    "Mail tile is reserved for the first networked user app.");
+        break;
+    default: break;
+    }
+}
+
+static int shell_widgets_quick_at(int px, int py) {
+    if (!g.widgets_open) return -1;
+    int W = (int)gfx_width();
+    int desk_h = (int)gfx_height() - GUI_TASKBAR_H;
+    if (W < 900 || desk_h < 520) return -1;
+    int rw = W >= 1120 ? 282 : 238;
+    int x = W - rw - 14;
+    int y = 58 + 142;
+    int tw = (rw - 34) / 3;
+    for (int i = 0; i < 6; i++) {
+        int col = i % 3;
+        int row = i / 3;
+        int tx = x + 10 + col * (tw + 8);
+        int ty = y + 36 + row * 48;
+        if (px >= tx && px < tx + tw && py >= ty && py < ty + 42) return i;
+    }
+    return -1;
+}
+
+static bool point_in_shell_widgets(int px, int py) {
+    if (!g.widgets_open) return false;
+    int W = (int)gfx_width();
+    int desk_h = (int)gfx_height() - GUI_TASKBAR_H;
+    if (W < 900 || desk_h < 520) return false;
+    int rw = W >= 1120 ? 282 : 238;
+    int x = W - rw - 14;
+    int y = 58;
+    int h = 128 + 14 + 154 + 16 + 200;
+    return px >= x && px < x + rw && py >= y && py < y + h;
+}
+
+static void shell_toggle_quick(int tile) {
+    const char *title = "Quick Settings";
+    const char *body = "Shell toggle updated.";
+    switch (tile) {
+    case 0:
+        gui_post_net_details();
+        return;
+    case 1: g.quick_bt = !g.quick_bt; title = "Bluetooth"; break;
+    case 2: g.quick_night = !g.quick_night; title = "Night Light"; break;
+    case 3: g.quick_nixie = !g.quick_nixie; title = "Nixie Glow"; break;
+    case 4: g.quick_airplane = !g.quick_airplane; title = "Airplane mode"; break;
+    case 5: g.quick_focus = !g.quick_focus; title = "Focus assist"; break;
+    default: break;
+    }
+    notify_post(ABI_NOTIFY_KIND_USER, NOTIFY_URG_INFO,
+                "settings", title, body);
 }
 
 /* ---- dynamic launcher registry (milestone 16) --------------------- */
@@ -1157,6 +1356,28 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
             }
         }
 
+        /* M36: right-side shell widgets. Quick Settings tiles update
+         * shell state or post real kernel status. Other clicks inside
+         * the stack are swallowed because the widgets are compositor
+         * chrome layered above app windows. */
+        if (g.widgets_open) {
+            int quick = shell_widgets_quick_at(nx, ny);
+            if (quick >= 0) {
+                shell_toggle_quick(quick);
+                gui_trace_logf("mouse down=(%d,%d) hit=quick-settings tile=%d",
+                               nx, ny, quick);
+                g.menu_open = false;
+                g.dirty = true;
+                return;
+            }
+            if (point_in_shell_widgets(nx, ny)) {
+                gui_trace_logf("mouse down=(%d,%d) hit=shell-widgets", nx, ny);
+                g.menu_open = false;
+                g.dirty = true;
+                return;
+            }
+        }
+
         /* M31: clicking a toast dismisses it (and the underlying
          * notification). Toast lives entirely in compositor space,
          * so we hit-test by recomputing its rect. */
@@ -1175,6 +1396,23 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
 
         /* Taskbar tab raises the corresponding window. */
         if (point_in_taskbar(nx, ny)) {
+            if (point_in_taskbar_search(nx, ny)) {
+                notify_post(ABI_NOTIFY_KIND_USER, NOTIFY_URG_INFO,
+                            "search", "Search",
+                            "Search UI is wired as a shell target; indexing comes next.");
+                g.menu_open = false;
+                g.dirty = true;
+                return;
+            }
+            int pin = taskbar_pin_at(nx, ny);
+            if (pin >= 0) {
+                shell_launch_pin(pin);
+                gui_trace_logf("mouse down=(%d,%d) hit=taskbar-pin idx=%d",
+                               nx, ny, pin);
+                g.menu_open = false;
+                g.dirty = true;
+                return;
+            }
             struct window *t = taskbar_tab_at(nx, ny);
             gui_trace_logf("mouse down=(%d,%d) hit=taskbar tab_wid=%d tab_pid=%d",
                            nx, ny, t ? t->wid : 0, t ? t->owner_pid : -1);
@@ -1222,6 +1460,15 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
             }
             g.dirty = true;
         } else if (g.desktop_mode) {
+            int icon = desktop_icon_at(nx, ny);
+            if (icon >= 0) {
+                shell_launch_desktop_icon(icon);
+                gui_trace_logf("mouse down=(%d,%d) hit=desktop-icon idx=%d",
+                               nx, ny, icon);
+                g.menu_open = false;
+                g.dirty = true;
+                return;
+            }
             gui_trace_logf("mouse down=(%d,%d) hit=bare-desktop", nx, ny);
         }
         /* Click on bare desktop just dismisses any open menu. */
@@ -1285,6 +1532,578 @@ static void paint_window_glyph(int x, int y, uint32_t a, uint32_t b) {
     gfx_fill_rect(x + 6, y,     4, 4, b);
     gfx_fill_rect(x,     y + 6, 4, 4, b);
     gfx_fill_rect(x + 6, y + 6, 4, 4, a);
+}
+
+/* ---- M36 shell prototype primitives -------------------------------
+ *
+ * These helpers deliberately stay compositor-local for the first pass:
+ * they draw the "Windows 10 inspired, TobyOS-branded cyberpunk shell"
+ * as cheap framebuffer primitives without creating extra processes or
+ * changing the real window-manager contract. Future work can graduate
+ * each mock panel into real shell surfaces once the compositor has a
+ * retained scene graph and richer hit-testing. */
+
+static void paint_soft_panel(int x, int y, int w, int h,
+                             uint32_t fill, uint32_t glass,
+                             uint32_t border, uint32_t accent) {
+    if (w <= 0 || h <= 0) return;
+    gfx_fill_rect_blend(x + 7, y + 9, w, h, 0x56000000u);
+    paint_glass_rect(x, y, w, h, fill, glass, border, accent);
+    if (w > 6 && h > 6) {
+        gfx_fill_rect_blend(x + 2, y + 2, w - 4, 1, 0x20FFFFFFu);
+        gfx_fill_rect_blend(x + 2, y + h - 3, w - 4, 1, argb(0x20, accent));
+    }
+}
+
+static void paint_toby_hex_logo(int x, int y, int s,
+                                uint32_t hot, uint32_t dim) {
+    if (s < 12) s = 12;
+    int cx = x + s / 2;
+    int p0x = cx,          p0y = y;
+    int p1x = x + s - 1,   p1y = y + s / 4;
+    int p2x = x + s - 1,   p2y = y + (s * 3) / 4;
+    int p3x = cx,          p3y = y + s - 1;
+    int p4x = x,           p4y = y + (s * 3) / 4;
+    int p5x = x,           p5y = y + s / 4;
+
+    draw_line(p0x, p0y, p1x, p1y, hot);
+    draw_line(p1x, p1y, p2x, p2y, hot);
+    draw_line(p2x, p2y, p3x, p3y, hot);
+    draw_line(p3x, p3y, p4x, p4y, hot);
+    draw_line(p4x, p4y, p5x, p5y, hot);
+    draw_line(p5x, p5y, p0x, p0y, hot);
+
+    int my = y + s / 2;
+    draw_line(cx, my, p0x, p0y, dim);
+    draw_line(cx, my, p2x, p2y, dim);
+    draw_line(cx, my, p4x, p4y, dim);
+    draw_line(cx, my, cx, p3y, dim);
+    gfx_fill_rect(cx - 1, my - 1, 3, 3, hot);
+}
+
+static void paint_icon_symbol(int x, int y, int kind,
+                              uint32_t fg, uint32_t dim) {
+    switch (kind) {
+    case 0: /* monitor */
+        gfx_draw_rect(x + 2, y + 3, 24, 16, fg);
+        gfx_fill_rect(x + 5, y + 6, 18, 1, dim);
+        gfx_fill_rect(x + 12, y + 20, 4, 4, fg);
+        gfx_fill_rect(x + 7, y + 24, 14, 2, fg);
+        break;
+    case 1: /* folder */
+        gfx_draw_rect(x + 1, y + 8, 26, 17, fg);
+        gfx_fill_rect(x + 3, y + 5, 10, 4, fg);
+        gfx_fill_rect(x + 4, y + 12, 20, 1, dim);
+        break;
+    case 2: /* bin */
+        gfx_draw_rect(x + 6, y + 8, 16, 19, fg);
+        gfx_fill_rect(x + 4, y + 5, 20, 2, fg);
+        gfx_fill_rect(x + 10, y + 12, 1, 10, dim);
+        gfx_fill_rect(x + 17, y + 12, 1, 10, dim);
+        break;
+    default: /* gear-ish control panel */
+        gfx_draw_rect(x + 7, y + 7, 14, 14, fg);
+        gfx_draw_rect(x + 11, y + 11, 6, 6, dim);
+        gfx_fill_rect(x + 13, y + 2, 2, 6, fg);
+        gfx_fill_rect(x + 13, y + 20, 2, 6, fg);
+        gfx_fill_rect(x + 2, y + 13, 6, 2, fg);
+        gfx_fill_rect(x + 20, y + 13, 6, 2, fg);
+        break;
+    }
+}
+
+static void paint_desktop_icon(int x, int y, const char *label, int kind) {
+    const struct theme_palette *t = theme_active();
+    bool hot = (g.cur_x >= x && g.cur_x < x + 64 &&
+                g.cur_y >= y && g.cur_y < y + 66);
+    paint_soft_panel(x + 5, y, 48, 42,
+                     hot ? t->center_item_hot : t->panel,
+                     argb(hot ? 0x64 : 0x30, t->panel),
+                     hot ? t->border_cyan : t->tray_border,
+                     kind == 2 ? t->glow_orange : t->glow_cyan);
+    paint_icon_symbol(x + 15, y + 7, kind, t->glow_orange, t->glow_cyan);
+    int tx = x + (58 - str_px(label)) / 2;
+    if (tx < x) tx = x;
+    gfx_draw_text(tx, y + 48, label, t->text_primary, GFX_TRANSPARENT);
+}
+
+static void paint_desktop_icons(int top_y) {
+    int x = 16;
+    int y = top_y;
+    paint_desktop_icon(x, y,       "This PC",       0);
+    paint_desktop_icon(x, y + 74,  "TobyOS",        1);
+    paint_desktop_icon(x, y + 148, "Recycle Bin",   2);
+    paint_desktop_icon(x, y + 222, "Control Panel", 3);
+}
+
+static void paint_city_wallpaper(int W, int desk_h,
+                                 const struct theme_palette *t) {
+    if (desk_h < 180) return;
+    int horizon = desk_h * 60 / 100;
+    int base = desk_h - 54;
+    if (base < horizon + 30) base = horizon + 30;
+
+    static const int widths[18] =
+        { 42, 26, 58, 34, 48, 70, 30, 54, 40, 64, 28, 52, 36, 68, 44, 32, 56, 38 };
+    for (int i = 0; i < 18; i++) {
+        int bw = widths[i];
+        int x = (i * 83 + 24) % (W + 80) - 40;
+        int bh = 78 + ((i * 47) % (desk_h / 3 + 60));
+        int y = base - bh;
+        if (y < 46) y = 46;
+        uint32_t fill = color_mix(t->bg, 0x00050A16u, i & 1, 3);
+        gfx_fill_rect_blend(x, y, bw, base - y, argb(0xD0, fill));
+        gfx_draw_rect(x, y, bw, base - y, (i & 1) ? t->border_cyan : t->win_border);
+        for (int wy = y + 12; wy < base - 8; wy += 14) {
+            for (int wx = x + 6; wx < x + bw - 8; wx += 12) {
+                if (((wx + wy + i) & 3) == 0) continue;
+                uint32_t c = ((wx + i) & 1) ? t->glow_cyan : t->accent_magenta;
+                gfx_fill_rect_blend(wx, wy, 4, 2, argb(0x80, c));
+            }
+        }
+        if (i == 5 && bw > 56) {
+            gfx_draw_text(x + 7, y + 34, "TOBYOS", t->glow_cyan, GFX_TRANSPARENT);
+        }
+    }
+
+    gfx_fill_rect_blend(0, horizon - 2, W, 2, argb(0x90, t->accent_magenta));
+    gfx_fill_rect_blend(0, horizon + 5, W, 1, argb(0x80, t->glow_cyan));
+    for (int r = 0; r < 8; r++) {
+        int yy = base + r * 7;
+        if (yy >= desk_h) break;
+        gfx_fill_rect_blend(0, yy, W, 1,
+                            argb((uint8_t)(0x54 - r * 4),
+                                 (r & 1) ? t->glow_orange : t->glow_cyan));
+    }
+    draw_line(W / 2 - 70, horizon + 10, W / 2 - 210, desk_h - 1, t->bg_grid);
+    draw_line(W / 2 + 70, horizon + 10, W / 2 + 210, desk_h - 1, t->bg_grid);
+}
+
+static void paint_top_hud(int W) {
+    const struct theme_palette *t = theme_active();
+    int h = 42;
+    paint_glass_rect(0, 0, W, h, t->panel, t->panel_glass,
+                     t->win_border, t->border_cyan);
+    paint_toby_hex_logo(18, 8, 26, t->glow_orange, t->border_orange);
+    gfx_draw_text_smooth(54, 9, "TOBYOS", t->glow_orange,
+                         GFX_TRANSPARENT, 2);
+    gfx_draw_text(56, 29, "NIXIE DESKTOP", t->text_secondary,
+                  GFX_TRANSPARENT);
+
+    int mid = W / 3;
+    gfx_fill_rect_blend(mid - 26, 8, 1, 26, argb(0x50, t->win_border));
+    gfx_draw_text(mid, 10, "MAY 2026", t->text_primary, GFX_TRANSPARENT);
+    gfx_draw_text(mid, 25, "BUILD PREVIEW", t->text_secondary,
+                  GFX_TRANSPARENT);
+
+    int eqx = W / 2 - 60;
+    for (int i = 0; i < 30; i++) {
+        int bh = 3 + ((i * 7 + i / 3) % 18);
+        uint32_t c = (i & 3) ? t->glow_cyan : t->glow_orange;
+        gfx_fill_rect_blend(eqx + i * 5, 31 - bh, 2, bh, argb(0xC0, c));
+    }
+
+    int hx = W * 62 / 100;
+    if (hx + 160 < W) {
+        gfx_fill_rect_blend(hx - 22, 8, 1, 26, argb(0x50, t->win_border));
+        gfx_draw_text(hx, 10, "SYS HEALTH", t->text_secondary,
+                      GFX_TRANSPARENT);
+        gfx_draw_text(hx, 25, net_is_up() ? "Good" : "Booting",
+                      net_is_up() ? t->success : t->glow_orange,
+                      GFX_TRANSPARENT);
+    }
+
+    const char *icons[] = { "Q", "GRID", "BELL", "VOL", "NET", "USR", "PWR" };
+    int ix = W - 320;
+    if (ix < hx + 118) ix = hx + 118;
+    for (unsigned i = 0; i < sizeof(icons) / sizeof(icons[0]); i++) {
+        int cw = (i == 1 || i == 2) ? 42 : 34;
+        if (ix + cw >= W - 8) break;
+        gfx_fill_rect_blend(ix, 8, 1, 26, argb(0x38, t->win_border));
+        gfx_draw_text(ix + 9, 17, icons[i], t->text_primary,
+                      GFX_TRANSPARENT);
+        ix += cw;
+    }
+}
+
+/* Retired M36 prototype artwork. The shell now launches real GUI apps
+ * for File Explorer and Settings; keep this disabled reference nearby
+ * only while the real apps catch up visually. */
+#if 0
+static void paint_mock_window_frame(int x, int y, int w, int h,
+                                    const char *title, uint32_t accent) {
+    const struct theme_palette *t = theme_active();
+    paint_soft_panel(x, y, w, h, t->panel, t->panel_glass,
+                     t->win_border, accent);
+    fill_vgradient(x + 1, y + 1, w - 2, 28,
+                   t->title_focus_hi, t->title_focus, 4);
+    gfx_fill_rect(x + 1, y + 28, w - 2, 1, accent);
+    paint_window_glyph(x + 12, y + 9, accent, t->glow_orange);
+    gfx_draw_text(x + 30, y + 10, title, t->text_primary, GFX_TRANSPARENT);
+
+    int cx = x + w - 78;
+    gfx_draw_text(cx,      y + 10, "-", t->text_secondary, GFX_TRANSPARENT);
+    gfx_draw_text(cx + 28, y + 10, "[]", t->text_secondary, GFX_TRANSPARENT);
+    gfx_draw_text(cx + 60, y + 10, "X", t->danger, GFX_TRANSPARENT);
+}
+
+static void paint_mock_folder(int x, int y, const char *label,
+                              uint32_t accent) {
+    const struct theme_palette *t = theme_active();
+    paint_soft_panel(x, y, 74, 54, 0x000B1424u, argb(0x24, t->panel),
+                     t->tray_border, accent);
+    paint_icon_symbol(x + 21, y + 7, 1, accent, t->glow_cyan);
+    gfx_draw_text(x + 7, y + 39, label, t->text_primary, GFX_TRANSPARENT);
+}
+
+static void paint_mock_drive(int x, int y, const char *name,
+                             const char *detail, int pct,
+                             uint32_t accent) {
+    const struct theme_palette *t = theme_active();
+    gfx_draw_text(x, y, name, t->text_primary, GFX_TRANSPARENT);
+    gfx_draw_rect(x, y + 14, 126, 8, t->tray_border);
+    int fill = (126 - 2) * pct / 100;
+    if (fill < 0) fill = 0;
+    if (fill > 124) fill = 124;
+    gfx_fill_rect(x + 1, y + 15, fill, 6, accent);
+    gfx_draw_text(x, y + 27, detail, t->text_secondary, GFX_TRANSPARENT);
+}
+
+static void paint_file_explorer_mock(int W, int desk_h) {
+    const struct theme_palette *t = theme_active();
+    int rail = W >= 1120 ? 300 : 248;
+    int x = W >= 1120 ? W * 32 / 100 : 112;
+    int y = 64;
+    int w = W - rail - x - 26;
+    if (w > 590) w = 590;
+    if (w < 390) return;
+    int h = desk_h * 44 / 100;
+    if (h > 280) h = 280;
+    if (h < 220) h = 220;
+
+    paint_mock_window_frame(x, y, w, h, "This PC", t->border_cyan);
+
+    int toolbar_y = y + 38;
+    gfx_draw_text(x + 14, toolbar_y + 8, "<  >  ^", t->text_primary,
+                  GFX_TRANSPARENT);
+    paint_soft_panel(x + 92, toolbar_y, w - 226, 24, 0x00070C16u,
+                     argb(0x28, t->panel), t->tray_border, t->border_cyan);
+    gfx_draw_text(x + 106, toolbar_y + 8, "This PC", t->text_primary,
+                  GFX_TRANSPARENT);
+    paint_soft_panel(x + w - 122, toolbar_y, 108, 24, 0x00070C16u,
+                     argb(0x20, t->panel), t->tray_border, t->border_orange);
+    gfx_draw_text(x + w - 108, toolbar_y + 8, "Search", t->text_secondary,
+                  GFX_TRANSPARENT);
+
+    int side_w = 128;
+    int body_y = y + 72;
+    gfx_fill_rect_blend(x + 1, body_y, side_w, h - 74, argb(0x70, 0x00081218u));
+    const char *nav[] = { "Quick access", "Desktop", "Downloads", "Documents",
+                          "Pictures", "Music", "This PC", "Network" };
+    for (unsigned i = 0; i < sizeof(nav) / sizeof(nav[0]); i++) {
+        int iy = body_y + 10 + (int)i * 18;
+        bool sel = (i == 6);
+        if (sel) {
+            gfx_fill_rect_blend(x + 5, iy - 3, side_w - 10, 16,
+                                argb(0xC0, t->center_item_hot));
+            gfx_fill_rect(x + 5, iy - 3, 3, 16, t->border_orange);
+        }
+        gfx_draw_text(x + 14, iy, nav[i], sel ? t->text_primary : t->text_secondary,
+                      GFX_TRANSPARENT);
+    }
+    gfx_fill_rect(x + side_w + 1, body_y, 1, h - 74, t->win_border);
+
+    int main_x = x + side_w + 18;
+    gfx_draw_text(main_x, body_y + 10, "Folders (6)", t->text_primary,
+                  GFX_TRANSPARENT);
+    const char *folders[] = { "Desktop", "Documents", "Downloads",
+                              "Pictures", "Music", "Videos" };
+    for (int i = 0; i < 6; i++) {
+        int col = i % 3;
+        int row = i / 3;
+        int fx = main_x + col * 94;
+        int fy = body_y + 30 + row * 66;
+        if (fx + 74 < x + w - 10) {
+            paint_mock_folder(fx, fy, folders[i],
+                              (i & 1) ? t->glow_orange : t->glow_cyan);
+        }
+    }
+
+    int drives_y = y + h - 68;
+    gfx_draw_text(main_x, drives_y - 18, "Devices and drives (3)",
+                  t->text_primary, GFX_TRANSPARENT);
+    paint_mock_drive(main_x, drives_y, "System (C:)", "78.6 GB free", 46,
+                     t->glow_cyan);
+    if (main_x + 154 + 126 < x + w - 8) {
+        paint_mock_drive(main_x + 154, drives_y, "Data (D:)", "512 GB free", 56,
+                         t->accent_magenta);
+    }
+    if (main_x + 308 + 126 < x + w - 8) {
+        paint_mock_drive(main_x + 308, drives_y, "Backup (E:)", "1.12 TB free", 63,
+                         t->glow_orange);
+    }
+}
+
+static void paint_color_dot(int x, int y, uint32_t c, bool selected) {
+    const struct theme_palette *t = theme_active();
+    gfx_fill_rect(x, y, 14, 14, c);
+    gfx_draw_rect(x - 2, y - 2, 18, 18, selected ? t->text_primary : t->tray_border);
+    if (selected) {
+        gfx_draw_text(x + 3, y + 3, "*", 0x00000000u, GFX_TRANSPARENT);
+    }
+}
+
+static void paint_settings_mock(int W, int desk_h) {
+    const struct theme_palette *t = theme_active();
+    int rail = W >= 1120 ? 300 : 248;
+    int x = W >= 1120 ? W * 32 / 100 : 112;
+    int y = 64 + (desk_h * 44 / 100);
+    if (y < 350) y = 350;
+    int w = W - rail - x - 26;
+    if (w > 590) w = 590;
+    if (w < 390) return;
+    int h = desk_h - y - 18;
+    if (h > 250) h = 250;
+    if (h < 172) return;
+
+    paint_mock_window_frame(x, y, w, h, "Settings", t->border_orange);
+    int body_y = y + 36;
+    int side_w = 136;
+    gfx_fill_rect_blend(x + 1, body_y, side_w, h - 38, argb(0x72, 0x00081218u));
+    const char *nav[] = { "Home", "System", "Devices", "Network",
+                          "Personalization", "Apps", "Accounts", "About" };
+    for (unsigned i = 0; i < sizeof(nav) / sizeof(nav[0]); i++) {
+        int iy = body_y + 12 + (int)i * 18;
+        bool sel = (i == 4);
+        if (sel) {
+            gfx_fill_rect_blend(x + 6, iy - 3, side_w - 12, 16,
+                                argb(0xC0, t->center_item_hot));
+            gfx_fill_rect(x + 6, iy - 3, 3, 16, t->border_orange);
+        }
+        gfx_draw_text(x + 18, iy, nav[i], sel ? t->text_primary : t->text_secondary,
+                      GFX_TRANSPARENT);
+    }
+    gfx_fill_rect(x + side_w + 1, body_y, 1, h - 38, t->win_border);
+
+    int cx = x + side_w + 22;
+    gfx_draw_text(cx, body_y + 12, "Personalization  >  Colors",
+                  t->text_primary, GFX_TRANSPARENT);
+    paint_soft_panel(cx, body_y + 34, 164, 74, 0x00070C16u,
+                     argb(0x22, t->panel), t->tray_border, t->border_cyan);
+    fill_vgradient(cx + 2, body_y + 36, 160, 70, t->bg, t->bg_vignette, 8);
+    for (int i = 0; i < 7; i++) {
+        int bx = cx + 8 + i * 22;
+        int bh = 22 + ((i * 13) % 34);
+        int by = body_y + 104 - bh;
+        gfx_fill_rect_blend(bx, by, 16, bh, argb(0xC8, 0x00071118u));
+        gfx_fill_rect_blend(bx + 4, by + 8, 8, 1,
+                            argb(0x9A, (i & 1) ? t->glow_cyan : t->accent_magenta));
+    }
+    gfx_fill_rect_blend(cx + 2, body_y + 92, 160, 1, argb(0x80, t->glow_cyan));
+    paint_soft_panel(cx + 178, body_y + 34, w - side_w - 216, 74,
+                     0x00070C16u, argb(0x20, t->panel),
+                     t->tray_border, t->border_orange);
+    gfx_draw_text(cx + 190, body_y + 44, "Choose your accent color",
+                  t->text_primary, GFX_TRANSPARENT);
+    uint32_t dots[] = {
+        0x0000A8FFu, 0x003D7CFFu, 0x006E5CFFu, 0x00A947FFu,
+        0x00E447B8u, 0x00FF6E4Au, 0x00FF394Cu, 0x00FF8E2Eu,
+        0x00FFC04Au, 0x0000D6B6u, 0x0030C060u, 0x00404860u
+    };
+    for (unsigned i = 0; i < sizeof(dots) / sizeof(dots[0]); i++) {
+        paint_color_dot(cx + 190 + (int)(i % 6) * 24,
+                        body_y + 62 + (int)(i / 6) * 24,
+                        dots[i], i == 7 || i == 9);
+    }
+
+    int row_y = body_y + 122;
+    paint_soft_panel(cx, row_y, w - side_w - 36, 28, 0x00070C16u,
+                     argb(0x24, t->panel), t->tray_border, t->border_cyan);
+    gfx_draw_text(cx + 12, row_y + 10, "Transparency effects",
+                  t->text_primary, GFX_TRANSPARENT);
+    gfx_draw_text(x + w - 84, row_y + 10, "On", t->text_primary,
+                  GFX_TRANSPARENT);
+    gfx_draw_rect(x + w - 42, row_y + 7, 28, 14, t->border_orange);
+    gfx_fill_rect(x + w - 25, row_y + 9, 11, 10, t->glow_orange);
+
+    row_y += 36;
+    paint_soft_panel(cx, row_y, w - side_w - 36, 28, 0x00070C16u,
+                     argb(0x24, t->panel), t->tray_border, t->border_orange);
+    gfx_draw_text(cx + 12, row_y + 10, "Nixie Glow", t->text_primary,
+                  GFX_TRANSPARENT);
+    gfx_fill_rect(x + w - 158, row_y + 14, 96, 2, t->tray_border);
+    gfx_fill_rect(x + w - 158, row_y + 14, 68, 2, t->glow_orange);
+    gfx_fill_rect(x + w - 92, row_y + 10, 8, 10, t->glow_orange);
+    gfx_draw_text(x + w - 54, row_y + 10, "75%", t->text_primary,
+                  GFX_TRANSPARENT);
+}
+#endif
+
+static void paint_quick_tile(int x, int y, int w, const char *a,
+                             const char *b, bool on) {
+    const struct theme_palette *t = theme_active();
+    paint_soft_panel(x, y, w, 42,
+                     on ? t->center_item_hot : 0x00070C16u,
+                     argb(on ? 0x44 : 0x22, t->panel),
+                     t->tray_border, on ? t->border_cyan : t->border_orange);
+    gfx_draw_text(x + 10, y + 9, a, on ? t->glow_cyan : t->text_primary,
+                  GFX_TRANSPARENT);
+    gfx_draw_text(x + 10, y + 24, b, on ? t->glow_cyan : t->text_secondary,
+                  GFX_TRANSPARENT);
+}
+
+static uint8_t mon_pct(uint32_t pct) {
+    if (pct > 100u) pct = 100u;
+    return (uint8_t)pct;
+}
+
+static void monitor_update_if_due(void) {
+    uint64_t now = now_uptime_ms();
+    if (g.mon_last_sample_ms != 0 &&
+        now - g.mon_last_sample_ms < 750ull) {
+        return;
+    }
+
+    sysmon_sample(&g.mon);
+    g.mon_last_sample_ms = now;
+
+    uint8_t pos = g.mon_hist_pos;
+    g.mon_cpu_hist [pos] = mon_pct(g.mon.cpu_pct);
+    g.mon_ram_hist [pos] = mon_pct(g.mon.ram_pct);
+    g.mon_gui_hist [pos] = mon_pct(g.mon.gui_pct);
+    g.mon_disk_hist[pos] = mon_pct(g.mon.disk_pct);
+    g.mon_hist_pos = (uint8_t)((pos + 1u) % SYSMON_HISTORY);
+    if (g.mon_hist_pos == 0) g.mon_hist_ready = true;
+}
+
+static void format_pages_mib(char *out, size_t cap,
+                             uint64_t used_pages, uint64_t total_pages) {
+    uint64_t used_mib  = (used_pages  * (uint64_t)PAGE_SIZE) >> 20;
+    uint64_t total_mib = (total_pages * (uint64_t)PAGE_SIZE) >> 20;
+    ksnprintf(out, cap, "%lu / %lu MiB",
+              (unsigned long)used_mib, (unsigned long)total_mib);
+}
+
+static void paint_mini_graph(int x, int y, int w, int h,
+                             const uint8_t hist[SYSMON_HISTORY],
+                             uint32_t color) {
+    const struct theme_palette *t = theme_active();
+    gfx_draw_rect(x, y, w, h, t->tray_border);
+    int bars = (w - 4) / 3;
+    if (bars > SYSMON_HISTORY) bars = SYSMON_HISTORY;
+    int first = (int)g.mon_hist_pos - bars;
+    if (first < 0) first += SYSMON_HISTORY;
+    for (int i = 0; i < bars; i++) {
+        int idx = (first + i) % SYSMON_HISTORY;
+        uint32_t v = hist[idx];
+        int bh = (int)((v * (uint32_t)(h - 5)) / 100u);
+        if (v && bh < 2) bh = 2;
+        gfx_fill_rect_blend(x + 2 + i * 3, y + h - 2 - bh, 2, bh,
+                            argb(0xB0, color));
+    }
+}
+
+static void paint_monitor_row(int x, int y, const char *name,
+                              const char *detail, int pct,
+                              uint32_t accent,
+                              const uint8_t hist[SYSMON_HISTORY]) {
+    const struct theme_palette *t = theme_active();
+    char pctbuf[8];
+    ksnprintf(pctbuf, sizeof(pctbuf), "%d%%", pct);
+    gfx_draw_rect(x, y, 38, 38, accent);
+    gfx_draw_text(x + 7, y + 15, pctbuf, t->text_primary, GFX_TRANSPARENT);
+    gfx_draw_text(x + 52, y + 4, name, t->text_primary, GFX_TRANSPARENT);
+    gfx_draw_text(x + 52, y + 20, detail, t->text_secondary, GFX_TRANSPARENT);
+    paint_mini_graph(x + 132, y + 4, 88, 30, hist, accent);
+}
+
+static void paint_right_widgets(int W, int desk_h) {
+    if (!g.widgets_open || W < 900 || desk_h < 520) return;
+    monitor_update_if_due();
+    const struct theme_palette *t = theme_active();
+    int rw = W >= 1120 ? 282 : 238;
+    int x = W - rw - 14;
+    int y = 58;
+
+    paint_soft_panel(x, y, rw, 128, t->panel, t->panel_glass,
+                     t->border_cyan, t->border_cyan);
+    gfx_draw_text(x + 12, y + 12, "NOTIFICATIONS", t->text_primary,
+                  GFX_TRANSPARENT);
+    struct abi_notification recs[3];
+    uint32_t rn = notify_get_records(recs, 3);
+    if (rn == 0) {
+        gfx_draw_text(x + 44, y + 58, "No notifications",
+                      t->text_secondary, GFX_TRANSPARENT);
+    }
+    for (uint32_t i = 0; i < rn; i++) {
+        int iy = y + 36 + i * 28;
+        uint32_t accent = recs[i].urgency == ABI_NOTIFY_URG_ERR
+                        ? t->danger
+                        : (recs[i].urgency == ABI_NOTIFY_URG_WARN
+                           ? t->border_orange : t->border_cyan);
+        gfx_draw_rect(x + 12, iy, 20, 18, accent);
+        gfx_draw_text(x + 44, iy, recs[i].title[0] ? recs[i].title : "Notification",
+                      t->text_primary, GFX_TRANSPARENT);
+        gfx_draw_text(x + 44, iy + 12, recs[i].body[0] ? recs[i].body : recs[i].app,
+                      t->text_secondary,
+                      GFX_TRANSPARENT);
+    }
+    gfx_draw_text(x + rw - 72, y + 108, "Clear all", t->text_secondary,
+                  GFX_TRANSPARENT);
+
+    y += 142;
+    paint_soft_panel(x, y, rw, 154, t->panel, t->panel_glass,
+                     t->border_cyan, t->border_orange);
+    gfx_draw_text(x + 12, y + 12, "QUICK SETTINGS", t->text_primary,
+                  GFX_TRANSPARENT);
+    int tw = (rw - 34) / 3;
+    bool wifi_up = net_is_up();
+    paint_quick_tile(x + 10, y + 36, tw, "Wi-Fi",
+                     wifi_up ? "On" : "No link", wifi_up);
+    paint_quick_tile(x + 18 + tw, y + 36, tw, "BT",
+                     g.quick_bt ? "On" : "Off", g.quick_bt);
+    paint_quick_tile(x + 26 + tw * 2, y + 36, tw, "Night",
+                     g.quick_night ? "On" : "Off", g.quick_night);
+    paint_quick_tile(x + 10, y + 84, tw, "Nixie",
+                     g.quick_nixie ? "On" : "Off", g.quick_nixie);
+    paint_quick_tile(x + 18 + tw, y + 84, tw, "Air",
+                     g.quick_airplane ? "On" : "Off", g.quick_airplane);
+    paint_quick_tile(x + 26 + tw * 2, y + 84, tw, "Focus",
+                     g.quick_focus ? "On" : "Off", g.quick_focus);
+    gfx_fill_rect(x + 22, y + 136, rw - 52, 2, t->tray_border);
+    gfx_fill_rect(x + 22, y + 136, (rw - 52) * 72 / 100, 2, t->glow_cyan);
+    gfx_fill_rect(x + 22 + (rw - 52) * 72 / 100, y + 132, 8, 10, t->glow_cyan);
+
+    y += 170;
+    paint_soft_panel(x, y, rw, 200, t->panel, t->panel_glass,
+                     t->border_cyan, t->border_cyan);
+    gfx_draw_text(x + 12, y + 12, "SYSTEM MONITOR", t->text_primary,
+                  GFX_TRANSPARENT);
+    char cpu_detail[32], ram_detail[32], gui_detail[32], disk_detail[32];
+    ksnprintf(cpu_detail, sizeof(cpu_detail), "%u MHz  %u sys/s",
+              (unsigned)g.mon.tsc_mhz, (unsigned)g.mon.syscalls_per_s);
+    format_pages_mib(ram_detail, sizeof(ram_detail),
+                     g.mon.used_pages, g.mon.total_pages);
+    ksnprintf(gui_detail, sizeof(gui_detail), "%u fps  %lu frames",
+              (unsigned)g.mon.gui_fps, (unsigned long)g.mon.gui_frames);
+    ksnprintf(disk_detail, sizeof(disk_detail), "VFS %u ops/s",
+              (unsigned)g.mon.vfs_ops_per_s);
+    paint_monitor_row(x + 12, y + 36,  "CPU",  cpu_detail,
+                      (int)g.mon.cpu_pct, t->glow_cyan, g.mon_cpu_hist);
+    paint_monitor_row(x + 12, y + 74,  "RAM",  ram_detail,
+                      (int)g.mon.ram_pct, t->accent_magenta, g.mon_ram_hist);
+    paint_monitor_row(x + 12, y + 112, "GUI",  gui_detail,
+                      (int)g.mon.gui_pct, t->success, g.mon_gui_hist);
+    paint_monitor_row(x + 12, y + 150, "Disk", disk_detail,
+                      (int)g.mon.disk_pct, t->glow_orange, g.mon_disk_hist);
+}
+
+static void paint_shell_widgets(int W, int desk_h) {
+    /* M36: the old static File Explorer / Settings poster windows were
+     * removed. Those surfaces now launch as real user-space GUI apps.
+     * The remaining right-hand stack is compositor-owned shell chrome:
+     * notification center, quick settings, and system monitor. */
+    paint_right_widgets(W, desk_h);
 }
 
 static void compositor_paint_one(struct window *w, bool focused) {
@@ -1355,37 +2174,11 @@ static void paint_wallpaper(void) {
         }
     }
 
-    /* Horizon + diagonal rails: cheap geometric accents that make the
+    /* City skyline placeholder: cheap geometric accents that make the
      * empty desktop feel intentional without needing bitmap assets. */
     if (t->id == THEME_CYBER) {
-        int hy = desk_h * 58 / 100;
-        gfx_fill_rect_blend(0, hy - 1, W, 2, argb(0x70, t->accent_magenta));
-        gfx_fill_rect_blend(0, hy + 4, W, 1, argb(0x65, t->accent_cyan));
-        draw_line(0, desk_h - 1, W / 3, hy, t->bg_grid);
-        draw_line(W - 1, desk_h - 1, W * 2 / 3, hy, t->bg_grid);
-        draw_line(W / 7, desk_h - 1, W / 2, hy + 24, t->bg_grid);
-        draw_line(W * 6 / 7, desk_h - 1, W / 2, hy + 24, t->bg_grid);
+        paint_city_wallpaper(W, desk_h, t);
     }
-
-    /* Top command band. */
-    paint_glass_rect(0, 0, W, 34, band, argb(0x50, band),
-                     t->win_border, t->accent_cyan);
-
-    gfx_draw_text(10, 8,
-                  "tobyOS desktop  //  neon shell",
-                  t->title_text, GFX_TRANSPARENT);
-
-    /* Centred brand. */
-    const char *brand = "tobyOS";
-    int bx = (W - 6 * 8 * 3) / 2;
-    int by = desk_h / 2 - 34;
-    gfx_draw_text_smooth(bx, by, brand, t->title_text, GFX_TRANSPARENT, 3);
-    gfx_draw_text(bx + 4, by + 32,
-                  "M32 neon desktop",
-                  t->accent_cyan, GFX_TRANSPARENT);
-    gfx_draw_text(bx + 4, by + 46,
-                  "local-first OS lab",
-                  t->title_text_dim, GFX_TRANSPARENT);
 
     /* M31 cyber: a subtle scanline band, 8 px tall, alpha-blended
      * across the wallpaper one-third of the way down. We use the
@@ -1396,6 +2189,11 @@ static void paint_wallpaper(void) {
          * just-perceptible HUD band. */
         gfx_fill_rect_blend(0, sy, W, 8, argb(0x14, t->accent_cyan));
     }
+
+    (void)band;
+    paint_top_hud(W);
+    paint_desktop_icons(58);
+    paint_shell_widgets(W, desk_h);
 
     /* Always-visible emergency-hotkey hint above the taskbar.
      * Critical because the user can't see the serial-only hotkey
@@ -1475,12 +2273,13 @@ static void paint_tray_net(const struct tray_rect *r, bool hot) {
     }
 }
 
-/* Disk pill: simple "DISK OK" -- we don't have a free-space API yet,
- * but the pill being present at all signals that tobyfs mounted. */
+/* Power pill: early shell mock shows AC/power status here. Battery
+ * telemetry can replace this once ACPI battery reporting is promoted
+ * into the tray API. */
 static void paint_tray_disk(const struct tray_rect *r, bool hot) {
     const struct theme_palette *t = theme_active();
     paint_pill(r, hot, t->status_ok);
-    pill_text(r, "DISK OK", t->tray_text);
+    pill_text(r, "PWR AC", t->tray_text);
 }
 
 /* Audio pill: "AUD ON" if HDA controller probed, "AUD --" otherwise. */
@@ -1528,7 +2327,9 @@ static void paint_tray_clock(const struct tray_rect *r) {
     paint_pill(r, false, t->accent_cyan);
     char clk[16];
     format_uptime(clk, sizeof(clk));
-    pill_text(r, clk, t->tray_text);
+    gfx_draw_text(r->x + 10, r->y + 4, clk, t->tray_text, GFX_TRANSPARENT);
+    gfx_draw_text(r->x + 10, r->y + 15, "MAY 2026", t->tray_text_dim,
+                  GFX_TRANSPARENT);
 }
 
 static void paint_tray(void) {
@@ -1564,17 +2365,42 @@ static void paint_taskbar(void) {
     gfx_fill_rect_blend(0, yt + 1, W, 1, 0x26FFFFFFu);
     gfx_fill_rect_blend(0, yt - 6, W, 6, 0x30000000u);
 
-    /* Start button. */
+    /* TobyOS launcher button. */
     bool start_hot = (g.cur_x >= 0 && g.cur_x < START_BTN_W &&
                       g.cur_y >= yt && g.cur_y < yt + GUI_TASKBAR_H);
-    paint_glass_rect(4, yt + 4, START_BTN_W - 8, GUI_TASKBAR_H - 8,
+    paint_glass_rect(4, yt + 3, START_BTN_W - 8, GUI_TASKBAR_H - 6,
                      (start_hot || g.menu_open) ? t->start_bg_hot : t->start_bg,
-                     argb(0x40, t->start_bg),
-                     t->win_border, t->accent_magenta);
-    paint_window_glyph(14, yt + (GUI_TASKBAR_H - 10) / 2,
-                       t->accent_cyan, t->accent_magenta);
-    gfx_draw_text(32, yt + (GUI_TASKBAR_H - 8) / 2, START_BTN_LABEL,
-                  t->start_fg, GFX_TRANSPARENT);
+                     argb(0x54, t->start_bg),
+                     t->win_border, t->glow_orange);
+    paint_toby_hex_logo(17, yt + 7, 22, t->glow_orange, t->border_orange);
+
+    /* Search area, intentionally visual-only for now. */
+    int sx = START_BTN_W + 4;
+    int sy = yt + 5;
+    int sh = GUI_TASKBAR_H - 10;
+    paint_glass_rect(sx, sy, TASKBAR_SEARCH_W, sh, 0x00070C16u,
+                     argb(0x34, t->panel), t->tray_border, t->border_cyan);
+    gfx_draw_rect(sx + 10, sy + 7, 10, 10, t->text_primary);
+    draw_line(sx + 18, sy + 15, sx + 24, sy + 21, t->text_primary);
+    gfx_draw_text(sx + 34, sy + (sh - 8) / 2, "Search TobyOS",
+                  t->text_secondary, GFX_TRANSPARENT);
+
+    const char *pins[TASKBAR_PIN_COUNT] = { "F", "G", ">_", "</>", "S", "W", "M" };
+    int px = sx + TASKBAR_SEARCH_W + 8;
+    for (int i = 0; i < TASKBAR_PIN_COUNT; i++) {
+        int ix = px + i * TASKBAR_PIN_W;
+        bool hot = (g.cur_x >= ix && g.cur_x < ix + TASKBAR_PIN_W - 4 &&
+                    g.cur_y >= yt && g.cur_y < yt + GUI_TASKBAR_H);
+        paint_glass_rect(ix, yt + 5, TASKBAR_PIN_W - 6, sh,
+                         hot ? t->center_item_hot : 0x00070C16u,
+                         argb(hot ? 0x58 : 0x28, t->panel),
+                         hot ? t->border_orange : t->tray_border,
+                         t->glow_orange);
+        draw_text_centered(ix, yt + 5, TASKBAR_PIN_W - 6, sh,
+                           pins[i], t->glow_orange);
+        gfx_fill_rect(ix + 10, yt + GUI_TASKBAR_H - 4,
+                      TASKBAR_PIN_W - 26, 2, t->glow_orange);
+    }
 
     /* Window tabs (left -> right, oldest first). The right-edge limit
      * accounts for the tray width so tabs never overdraw the clock. */
@@ -1593,7 +2419,7 @@ static void paint_taskbar(void) {
         }
         tabs_x_max -= TRAY_PAD;
     }
-    int x = START_BTN_W + 4;
+    int x = taskbar_tabs_x0();
     for (int i = n - 1; i >= 0; i--) {
         struct window *w = stack[i];
         bool focused = (w == g.z_top);
@@ -1619,8 +2445,7 @@ static void paint_taskbar(void) {
 
     /* Subtle dim brand text just to the left of the start button --
      * far enough to never overlap a tab. */
-    int blen = 0; while (TASKBAR_BRAND[blen]) blen++;
-    int bx = START_BTN_W + 6;
+    int bx = taskbar_tabs_x0();
     /* Only show the brand if no tabs would overlap it. */
     if (n == 0) {
         gfx_draw_text(bx, yt + (GUI_TASKBAR_H - 8) / 2, TASKBAR_BRAND,
@@ -1632,38 +2457,102 @@ static void paint_launcher(void) {
     if (!g.menu_open) return;
     const struct theme_palette *t = theme_active();
     int mx, my, mw, mh; launcher_rect(&mx, &my, &mw, &mh);
-    gfx_fill_rect_blend(mx + 8, my + 10, mw, mh, 0x70000000u);
-    paint_glass_rect(mx, my, mw, mh, t->menu_bg, argb(0x76, t->menu_bg),
-                     t->menu_border, t->accent_cyan);
+    paint_soft_panel(mx, my, mw, mh, t->menu_bg, argb(0x86, t->menu_bg),
+                     t->menu_border, t->border_orange);
 
-    gfx_draw_text(mx + 14, my + 12, "tobyOS", t->title_text, GFX_TRANSPARENT);
-    gfx_draw_text(mx + 14, my + 26, "pinned apps", t->title_text_dim,
+    paint_toby_hex_logo(mx + 16, my + 14, 32, t->glow_orange,
+                        t->border_orange);
+    gfx_draw_text(mx + 58, my + 14, "Toby", t->text_primary,
                   GFX_TRANSPARENT);
-    gfx_fill_rect(mx + 12, my + LAUNCHER_HEAD_H - 2, mw - 24, 1,
-                  t->win_border);
+    gfx_draw_text(mx + 58, my + 28, "Administrator", t->text_secondary,
+                  GFX_TRANSPARENT);
+    gfx_draw_text(mx + 14, my + 56, "Most used", t->text_primary,
+                  GFX_TRANSPARENT);
+    gfx_draw_text(mx + 190, my + 24, "Pinned", t->text_primary,
+                  GFX_TRANSPARENT);
+    gfx_draw_text(mx + mw - 24, my + 24, "X", t->text_secondary,
+                  GFX_TRANSPARENT);
 
     int n = launcher_count();
-    for (int i = 0; i < n; i++) {
-        int iy = my + LAUNCHER_PAD + LAUNCHER_HEAD_H + i * LAUNCHER_ITEM_H;
-        bool hot = (g.cur_x >= mx && g.cur_x < mx + mw &&
+    int visible = n - 1;
+    if (visible > 6) visible = 6;
+    int list_x = mx + LAUNCHER_PAD;
+    int list_y = my + LAUNCHER_HEAD_H + 20;
+    for (int i = 0; i < visible; i++) {
+        int iy = list_y + i * LAUNCHER_ITEM_H;
+        bool hot = (g.cur_x >= list_x && g.cur_x < list_x + LAUNCHER_LIST_W &&
                     g.cur_y >= iy && g.cur_y < iy + LAUNCHER_ITEM_H);
         struct launcher_item li;
         bool ok = launcher_resolve(i, &li) && li.label;
+        if (!ok) continue;
         if (hot) {
-            gfx_fill_rect_blend(mx + 8, iy + 2, mw - 16, LAUNCHER_ITEM_H - 4,
-                                argb(0xDC, t->menu_hot));
-            gfx_fill_rect(mx + 8, iy + 2, 3, LAUNCHER_ITEM_H - 4,
-                          ok && li.path ? t->accent_cyan : t->status_warn);
+            gfx_fill_rect_blend(list_x, iy - 2, LAUNCHER_LIST_W,
+                                LAUNCHER_ITEM_H - 1, argb(0xD8, t->menu_hot));
+            gfx_fill_rect(list_x, iy - 2, 3, LAUNCHER_ITEM_H - 1,
+                          t->border_orange);
         }
-        if (ok) {
-            uint32_t accent = li.path ? t->accent_cyan : t->status_warn;
-            gfx_fill_rect(mx + 18, iy + (LAUNCHER_ITEM_H - 8) / 2, 7, 7,
-                          hot ? accent : t->win_border);
-            gfx_draw_text(mx + 34, iy + (LAUNCHER_ITEM_H - 8) / 2,
-                          li.label, li.path ? t->menu_text : t->accent_amber,
-                          GFX_TRANSPARENT);
-        }
+        char letter[2] = { li.label[0], 0 };
+        gfx_draw_text(list_x + 12, iy + 6, letter, t->glow_orange,
+                      GFX_TRANSPARENT);
+        gfx_draw_text(list_x + 32, iy + 6, li.label, t->menu_text,
+                      GFX_TRANSPARENT);
     }
+
+    gfx_draw_text(list_x, my + mh - 92, "All apps  >", t->text_primary,
+                  GFX_TRANSPARENT);
+    int power_y = my + mh - 64;
+    bool power_hot = (g.cur_x >= list_x && g.cur_x < list_x + LAUNCHER_PROFILE_W - 16 &&
+                      g.cur_y >= power_y && g.cur_y < power_y + 28);
+    paint_glass_rect(list_x, power_y, LAUNCHER_PROFILE_W - 16, 28,
+                     power_hot ? t->center_item_hot : 0x00070C16u,
+                     argb(0x28, t->panel), t->tray_border, t->border_orange);
+    gfx_draw_text(list_x + 12, power_y + 10, "Power", t->glow_orange,
+                  GFX_TRANSPARENT);
+
+    int grid_x = mx + 190;
+    int grid_y = my + LAUNCHER_HEAD_H + 18;
+    for (int i = 0; i < 9; i++) {
+        int col = i % 3;
+        int row = i / 3;
+        int tx = grid_x + col * (LAUNCHER_TILE_W + 12);
+        int ty = grid_y + row * (LAUNCHER_TILE_H + 12);
+        struct launcher_item li;
+        bool ok = launcher_resolve(i, &li) && li.label && li.path;
+        const char *label = ok ? li.label : "App";
+        bool hot = (g.cur_x >= tx && g.cur_x < tx + LAUNCHER_TILE_W &&
+                    g.cur_y >= ty && g.cur_y < ty + LAUNCHER_TILE_H);
+        paint_soft_panel(tx, ty, LAUNCHER_TILE_W, LAUNCHER_TILE_H,
+                         hot ? t->center_item_hot : 0x00070C16u,
+                         argb(hot ? 0x58 : 0x30, t->panel),
+                         hot ? t->border_cyan : t->tray_border,
+                         (i & 1) ? t->glow_cyan : t->glow_orange);
+        char letter[2] = { label[0], 0 };
+        draw_text_centered(tx, ty + 8, LAUNCHER_TILE_W, 12,
+                           letter, (i & 1) ? t->glow_cyan : t->glow_orange);
+        char clipped[10];
+        copy_clip(clipped, sizeof(clipped), label);
+        draw_text_centered(tx, ty + 31, LAUNCHER_TILE_W, 12,
+                           clipped, t->text_primary);
+    }
+
+    int recent_y = grid_y + 3 * (LAUNCHER_TILE_H + 12) + 8;
+    if (recent_y + 64 < my + mh - 42) {
+        gfx_draw_text(grid_x, recent_y, "Recently opened", t->text_primary,
+                      GFX_TRANSPARENT);
+        gfx_draw_text(grid_x, recent_y + 20, "project_alpha.sk",
+                      t->text_secondary, GFX_TRANSPARENT);
+        gfx_draw_text(grid_x + 132, recent_y + 20, "system_diagram.png",
+                      t->text_secondary, GFX_TRANSPARENT);
+        gfx_draw_text(grid_x, recent_y + 38, "tobyos_update.log",
+                      t->text_secondary, GFX_TRANSPARENT);
+        gfx_draw_text(grid_x + 132, recent_y + 38, "notes.txt",
+                      t->text_secondary, GFX_TRANSPARENT);
+    }
+
+    paint_glass_rect(mx + 12, my + mh - 34, mw - 24, 24, 0x00070C16u,
+                     argb(0x28, t->panel), t->tray_border, t->border_cyan);
+    gfx_draw_text(mx + 28, my + mh - 26, "Search programs and files...",
+                  t->text_secondary, GFX_TRANSPARENT);
 }
 
 /* ---- M31 desktop notifications: toast + center ------------------- *
@@ -2286,6 +3175,21 @@ void gui_tick(void) {
 
 bool gui_active(void) { return g.active; }
 
+void gui_settings_changed(const char *key, const char *val) {
+    if (!key) return;
+    bool on = !(val && strcmp(val, "off") == 0);
+    if (strcmp(key, "ui.widgets") == 0) {
+        g.widgets_open = on;
+    } else if (strcmp(key, "ui.night_light") == 0) {
+        g.quick_night = on;
+    } else if (strcmp(key, "device.bluetooth") == 0) {
+        g.quick_bt = on;
+    } else {
+        return;
+    }
+    g.dirty = true;
+}
+
 void gui_set_desktop_mode(bool on) {
     if (!g.ready) return;
     if (g.desktop_mode == on) return;
@@ -2429,6 +3333,14 @@ void gui_init(void) {
     g.cur_y = (int)gfx_height() / 2;
     g.spawn_x = 60;
     g.spawn_y = 40;
+    char sbuf[16];
+    settings_get_str("ui.widgets", sbuf, sizeof(sbuf), "on");
+    g.widgets_open = strcmp(sbuf, "off") != 0;
+    g.quick_wifi = true;
+    g.quick_bt = true;
+    g.quick_night = true;
+    g.quick_nixie = true;
+    g.quick_focus = true;
     mouse_set_callback(on_mouse_event);
     kprintf("[gui] window manager ready (max %d windows, %d-px title bar)\n",
             GUI_WINDOW_MAX, GUI_TITLE_BAR_H);

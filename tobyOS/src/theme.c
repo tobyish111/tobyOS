@@ -111,6 +111,19 @@ static const struct theme_palette g_theme_cyber = {
     .center_header   = 0x00FF36C8u,
     .center_item_bg  = 0x00121826u,
     .center_item_hot = 0x001E2C48u,
+
+    .panel           = 0x000A101Du,
+    .panel_glass     = 0x8C0A101Du,
+    .border_cyan     = 0x0000E6FFu,
+    .border_orange   = 0x00FF9F2Eu,
+    .glow_orange     = 0x00FFB347u,
+    .glow_cyan       = 0x0000E6FFu,
+    .text_primary    = 0x00F3FBFFu,
+    .text_secondary  = 0x0088A2BAu,
+    .danger          = 0x00FF4060u,
+    .success         = 0x0040D060u,
+    .corner_radius   = 7,
+    .spacing         = 8,
 };
 
 /* ---- M12 basic palette (fallback / debug) ------------------------ */
@@ -184,6 +197,19 @@ static const struct theme_palette g_theme_basic = {
     .center_header   = 0x00FFFFFFu,
     .center_item_bg  = 0x001E242Cu,
     .center_item_hot = 0x00405678u,
+
+    .panel           = 0x002A323Eu,
+    .panel_glass     = 0xFF2A323Eu,
+    .border_cyan     = 0x0080C0FFu,
+    .border_orange   = 0x00FFC080u,
+    .glow_orange     = 0x00FFC080u,
+    .glow_cyan       = 0x0080C0FFu,
+    .text_primary    = 0x00FFFFFFu,
+    .text_secondary  = 0x00C0C8D0u,
+    .danger          = 0x00FF8080u,
+    .success         = 0x0080FF80u,
+    .corner_radius   = 2,
+    .spacing         = 8,
 };
 
 /* Active selection. Pre-init we still want a valid pointer so

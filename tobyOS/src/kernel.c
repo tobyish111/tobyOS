@@ -56,6 +56,9 @@
 #include <tobyos/net.h>
 #include <tobyos/dns.h>
 #include <tobyos/tcp.h>
+#include <tobyos/tcp_echo.h>
+#include <tobyos/tcp_shell.h>
+#include <tobyos/ssh.h>
 #include <tobyos/ssh_crypto.h>
 #include <tobyos/http.h>
 #include <tobyos/xhci.h>
@@ -2771,17 +2774,14 @@ void _start(void) {
     }
 
     /*
-     * Protected network lane: after input/GUI setup has put the HP's
-     * platform devices into their stable state, but before m14_init can
-     * spawn login or the compositor can start yielding to user apps.
+     * Bring networking up directly in the protected boot window. This is
+     * intentionally synchronous: the HP Realtek path has proven sensitive to
+     * losing this early turn once userspace/compositor work starts running.
      */
     if (safemode_skip_net()) {
-        kprintf("[safe] skipping network boot request (NIC + DHCP + DNS) -- mode=%s\n",
+        kprintf("[safe] skipping net_init (NIC + DHCP + DNS) -- mode=%s\n",
                 safemode_tag());
     } else {
-        kprintf("[boot] requesting deferred network bring-up\n");
-        net_boot_request();
-
         kprintf("[boot] settling input before network bring-up\n");
         for (unsigned i = 0; i < 30; i++) {
             usb_legacy_poll();
@@ -2791,8 +2791,26 @@ void _start(void) {
             pit_sleep_ms(1);
         }
 
-        kprintf("[boot] servicing deferred network bring-up\n");
-        net_service_tick();
+        kprintf("[boot] before net_init\n");
+        bool net_ok = net_init();
+        kprintf("[boot] after net_init ok=%d net_up=%d\n",
+                (int)net_ok, (int)net_is_up());
+
+        if (net_ok) {
+            kprintf("[boot] net_init OK; starting TCP services\n");
+            tcp_echo_init();
+            tcp_shell_init();
+            ssh_init();
+
+            /* Static fallback is useful for a local shell, but keep DHCP
+             * retrying from the idle service lane until a real lease lands. */
+            if (!net_boot_used_dhcp()) {
+                net_boot_request();
+            }
+        } else {
+            kprintf("[boot] net_init failed; networking will retry in idle\n");
+            net_boot_request();
+        }
     }
 
     if (!safemode_skip_gui()) {

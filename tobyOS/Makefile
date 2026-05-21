@@ -158,6 +158,7 @@ C_SRCS := src/kernel.c \
           src/pkg.c \
           src/cap.c \
           src/perf.c \
+          src/sysmon.c \
           src/installer.c \
           src/audio_hda.c \
           src/fw_cfg.c \

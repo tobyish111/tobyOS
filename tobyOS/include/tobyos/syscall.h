@@ -262,6 +262,9 @@
 #define SYS_NOTIFY_LIST     ABI_SYS_NOTIFY_LIST
 #define SYS_NOTIFY_DISMISS  ABI_SYS_NOTIFY_DISMISS
 
+/* Live system monitor snapshot for GUI Settings/widgets. */
+#define SYS_SYSTEM_METRICS  ABI_SYS_SYSTEM_METRICS
+
 /* Used by SYS_RECVFROM to return the source address. Network byte
  * order, mirrored verbatim into userspace. */
 struct sockaddr_in_be {

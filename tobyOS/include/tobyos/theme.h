@@ -125,6 +125,23 @@ struct theme_palette {
     uint32_t center_header;
     uint32_t center_item_bg;
     uint32_t center_item_hot;
+
+    /* M36 shell prototype tokens. These duplicate a few older semantic
+     * colours with 2026-desktop naming so future compositor code can move
+     * toward ui/theme-style primitives without rewriting the old palette
+     * users all at once. */
+    uint32_t panel;
+    uint32_t panel_glass;
+    uint32_t border_cyan;
+    uint32_t border_orange;
+    uint32_t glow_orange;
+    uint32_t glow_cyan;
+    uint32_t text_primary;
+    uint32_t text_secondary;
+    uint32_t danger;
+    uint32_t success;
+    int      corner_radius;
+    int      spacing;
 };
 
 /* ---- lifecycle ----------------------------------------------------- */

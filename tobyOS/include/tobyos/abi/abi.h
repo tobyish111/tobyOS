@@ -482,6 +482,15 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
                                     *  id == 0 means "dismiss all"
                                     * -> 0 or -ABI_E*                  */
 
+/* M36B SYS_SYSTEM_METRICS: live read-only system monitor snapshot.
+ *
+ *   args:  (struct abi_system_metrics *out)
+ *   ret:   0 on success, -ABI_EFAULT on bad pointer.
+ *
+ * Percentages/rates are sampled by the kernel over the previous
+ * sysmon interval; absolute counters are cumulative since boot. */
+#define ABI_SYS_SYSTEM_METRICS 74
+
 /* M35D SYS_HWCOMPAT_LIST: enumerate the runtime hardware-compatibility
  * database (PCI + USB devices joined with the static drvdb tier table
  * and live drvmatch outcomes).
@@ -500,7 +509,7 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
 #define ABI_SYS_HWCOMPAT_LIST  73
 
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          74
+#define ABI_SYS_NR_MAX          75
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
@@ -1262,6 +1271,48 @@ _Static_assert(sizeof(struct abi_notification) ==
                4*4 + 8 + ABI_NOTIFY_APP_MAX + ABI_NOTIFY_TITLE_MAX +
                ABI_NOTIFY_BODY_MAX + 16,
                "abi_notification layout is FROZEN at 200 bytes");
+
+/* Live system-monitor snapshot returned by ABI_SYS_SYSTEM_METRICS.
+ * CPU percent is non-idle user/app CPU over the last sample interval
+ * (pid 0's idle/kernel time is still exposed in cpu_total_ns). Disk
+ * percent/rate is current VFS read/write activity, not capacity. */
+struct abi_system_metrics {
+    uint64_t uptime_ms;
+    uint64_t total_pages;
+    uint64_t used_pages;
+    uint64_t free_pages;
+    uint64_t cpu_user_ns;
+    uint64_t cpu_total_ns;
+    uint64_t total_syscalls;
+    uint64_t context_switches;
+    uint64_t gui_frames;
+    uint64_t proc_spawns;
+    uint64_t proc_exits;
+    uint64_t vfs_ops;
+    uint64_t vfs_ns;
+    uint64_t gui_ns;
+    uint64_t net_packets;
+    uint64_t net_ns;
+
+    uint32_t process_count;
+    uint32_t ready_count;
+    uint32_t blocked_count;
+    uint32_t cpu_pct;
+    uint32_t ram_pct;
+    uint32_t gui_pct;
+    uint32_t disk_pct;
+    uint32_t net_pct;
+    uint32_t syscalls_per_s;
+    uint32_t gui_fps;
+    uint32_t vfs_ops_per_s;
+    uint32_t net_packets_per_s;
+    uint32_t net_up;
+    uint32_t net_ip_be;
+    uint32_t tsc_mhz;
+    uint32_t _reserved[9];
+};
+_Static_assert(sizeof(struct abi_system_metrics) == 224,
+               "abi_system_metrics layout is FROZEN at 224 bytes");
 
 /* ============================================================
  *  M35D: hardware compatibility database

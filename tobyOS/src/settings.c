@@ -45,8 +45,17 @@ static const struct {
     const char *val;
 } g_defaults[] = {
     { "desktop.bg",      "theme"      },   /* "theme" means use active palette default */
+    { "desktop.accent",  "orange"     },
     { "desktop.title",   "tobyOS"     },
     { "desktop.greeting", "Welcome to tobyOS" },
+    { "ui.theme",        "cyber"      },
+    { "ui.transparency", "on"         },
+    { "ui.nixie_glow",   "75"         },
+    { "ui.night_light",  "off"        },
+    { "ui.widgets",      "on"         },
+    { "ui.animations",   "on"         },
+    { "device.bluetooth", "off"       },
+    { "network.autostart", "on"       },
     { "user.last",       "toby"       },
     { "user.greeting",   "Hello, friend!" },
     { "session.autostart", ""         },   /* reserved -- comma-separated apps */
