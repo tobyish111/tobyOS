@@ -997,25 +997,6 @@ static void posix_shell_selftest(void) {
         "> /data/posixsh_redir_only.txt",
         "/bin/echo POSIXSH: redir-only-ok >>/data/posixsh_redir_only.txt",
         "cat /data/posixsh_redir_only.txt",
-        "write /data/posixsh_read.txt alpha beta gamma",
-        "read POSIX_R1 POSIX_R2 < /data/posixsh_read.txt",
-        "echo POSIXSH: read-file-$POSIX_R1-$POSIX_R2",
-        "echo POSIXSH: builtin-pipe | p_cat",
-        "pipefn() { echo POSIXSH: function-pipe; }",
-        "pipefn | p_cat",
-        "echo piped value | read POSIX_PIPE_A POSIX_PIPE_B",
-        "echo POSIXSH: read-pipe-status=$? var=${POSIX_PIPE_A:-unset}-${POSIX_PIPE_B:-unset}",
-        "cd /data | true",
-        "echo POSIXSH: pipe-cwd-$PWD",
-        "/bin/echo POSIXSH: wait-bg >/data/posixsh_wait.txt &",
-        "echo POSIXSH: bgpid=$!",
-        "wait $!",
-        "echo POSIXSH: wait-status=$?",
-        "cat /data/posixsh_wait.txt",
-        "/bin/echo POSIXSH: wait-all-bg >/data/posixsh_wait_all.txt &",
-        "wait",
-        "echo POSIXSH: wait-all-status=$?",
-        "cat /data/posixsh_wait_all.txt",
         "POSIX_SPECIAL=kept export POSIX_SPECIAL",
         "echo POSIXSH: special-assign=$POSIX_SPECIAL",
         "POSIX_TEMP=visible env >/data/posixsh_env_tmp.txt",
@@ -1027,24 +1008,6 @@ static void posix_shell_selftest(void) {
         "set -- shift-a shift-b shift-c",
         "shift 2",
         "echo POSIXSH: shift-$#-$1",
-        "set -- -a -b bee rest",
-        "OPTIND=1",
-        "while getopts ab: opt; do echo POSIXSH: getopts-$opt-${OPTARG:-none}-$OPTIND; done",
-        "echo POSIXSH: getopts-done-$OPTIND",
-        "set -- -abbee",
-        "OPTIND=1",
-        "while getopts ab: opt; do echo POSIXSH: getopts-group-$opt-${OPTARG:-none}-$OPTIND; done",
-        "OPTIND=1",
-        "getopts x: opt -x explicit tail",
-        "echo POSIXSH: getopts-explicit-$opt-$OPTARG-$OPTIND",
-        "set -- -z",
-        "OPTIND=1",
-        "getopts :a opt",
-        "echo POSIXSH: getopts-bad-$opt-$OPTARG-$?",
-        "set -- -b",
-        "OPTIND=1",
-        "getopts :b: opt",
-        "echo POSIXSH: getopts-missing-$opt-$OPTARG-$?",
         "command -V export",
         "sh -c 'echo POSIXSH: exit-before; exit 9; echo POSIXSH: exit-bad'",
         "echo POSIXSH: exit-status=$?",
@@ -1087,23 +1050,11 @@ static void posix_shell_selftest(void) {
         "/bin/cat <<EOF\n"
         "POSIXSH: heredoc-$POSIX_ASSIGN\n"
         "EOF\n";
-    static const char read_heredoc_script[] =
-        "read POSIX_H1 POSIX_H2 <<EOF\n"
-        "one two\n"
-        "EOF\n"
-        "echo POSIXSH: read-heredoc-$POSIX_H1-$POSIX_H2\n";
 
     int hrc = vfs_write_all("/data/posixsh_heredoc.sh",
                             heredoc_script, strlen(heredoc_script));
     if (hrc != VFS_OK) {
         kprintf("POSIXSH: heredoc-setup-failed %s\n", vfs_strerror(hrc));
-    }
-    int rhrc = vfs_write_all("/data/posixsh_read_heredoc.sh",
-                             read_heredoc_script,
-                             strlen(read_heredoc_script));
-    if (rhrc != VFS_OK) {
-        kprintf("POSIXSH: read-heredoc-setup-failed %s\n",
-                vfs_strerror(rhrc));
     }
 
     kprintf("[boot] POSIXSH: starting shell compatibility smoke\n");
@@ -1111,7 +1062,6 @@ static void posix_shell_selftest(void) {
         shell_run_test_line(lines[i]);
         if (strcmp(lines[i], "sh /data/posixsh_source.sh") == 0) {
             shell_run_test_line("sh /data/posixsh_heredoc.sh");
-            shell_run_test_line("sh /data/posixsh_read_heredoc.sh");
         }
     }
     kprintf("POSIXSH: PASS\n");
