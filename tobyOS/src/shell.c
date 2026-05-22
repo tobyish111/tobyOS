@@ -4,10 +4,11 @@
  * ASCII appends to the buffer and echoes; backspace erases and rewinds;
  * Enter NUL-terminates, calls execute_line(), and prints the next prompt.
  *
- * Tokenisation is in-place: whitespace runs become NULs and we collect
- * pointers to each non-empty token in argv[]. That means once we've
- * dispatched, the buffer is shredded -- callers must not retain pointers
- * across shell_poll() calls.
+ * Command parsing is intentionally small but shell-shaped: quoting,
+ * environment expansion, command lists, conditionals, pipelines,
+ * background jobs, and simple redirection are parsed before dispatch.
+ * This is not a complete Bash clone, but it gives tobyOS the POSIX-like
+ * grammar expected from an everyday command shell.
  */
 
 #include <tobyos/shell.h>
@@ -58,8 +59,12 @@
 
 extern volatile struct limine_module_request module_req;
 
-#define LINE_MAX 256
-#define ARG_MAX  16
+#define LINE_MAX 512
+#define ARG_MAX  32
+#define SHELL_ALIAS_MAX 32
+#define SHELL_FUNC_MAX 32
+#define SHELL_HEREDOC_MAX 4
+#define SHELL_HEREDOC_BODY_MAX PIPE_BUF_SZ
 
 /* Serialises execute_line() between keyboard shell_poll and remote
  * tcp_shell (both use the shared `line` buffer). */
@@ -70,6 +75,71 @@ static size_t line_len;
 
 static shell_write_fn_t g_shell_out;
 static void *g_shell_out_ctx;
+static struct file *g_shell_in;
+static int g_last_status;
+static int g_last_bg_pid;
+static int g_getopts_last_optind;
+static int g_getopts_char_index;
+static bool g_getopts_internal_optind_write;
+static struct file *g_shell_fd[3];
+
+static char *g_param0;
+static char *g_positional[ARG_MAX];
+static int g_positional_count;
+
+enum shell_flow {
+    SHELL_FLOW_NONE = 0,
+    SHELL_FLOW_BREAK,
+    SHELL_FLOW_CONTINUE,
+    SHELL_FLOW_RETURN,
+    SHELL_FLOW_EXIT,
+};
+
+static enum shell_flow g_shell_flow;
+static int g_shell_flow_status;
+static int g_shell_loop_depth;
+static int g_script_depth;
+static int g_subshell_depth;
+
+struct shell_alias {
+    char *name;
+    char *value;
+};
+
+struct shell_function {
+    char *name;
+    char *body;
+};
+
+struct shell_heredoc {
+    char body[SHELL_HEREDOC_BODY_MAX];
+    size_t len;
+};
+
+static struct shell_alias g_aliases[SHELL_ALIAS_MAX];
+static struct shell_function g_functions[SHELL_FUNC_MAX];
+static struct shell_heredoc g_heredocs[SHELL_HEREDOC_MAX];
+static int g_heredoc_count;
+static char *g_traps[SIG_MAX];
+static bool g_trap_running;
+
+static void prompt(void);
+static void execute_line_text(const char *src);
+static bool shell_name_is_valid(const char *s, size_t n);
+static bool shell_special_builtin_name(const char *name);
+static int shell_expand_param_word(const char *word, char *out, size_t cap);
+static const char *shell_skip_blanks(const char *s);
+static int parse_int(const char *s, int *out);
+static int shell_run_exit_trap(int status);
+struct shell_simple;
+struct shell_io_frame;
+static int shell_enter_io_frame(struct shell_simple *cmd, const char *label,
+                                struct shell_io_frame *frame);
+static void shell_restore_io_frame(struct shell_io_frame *frame);
+
+static void shell_set_status(int status) {
+    g_last_status = status;
+}
 
 void shell_set_output(shell_write_fn_t fn, void *ctx) {
     g_shell_out = fn;
@@ -82,8 +152,14 @@ void shell_write(const char *s) {
     if (g_shell_out) {
         g_shell_out(s, g_shell_out_ctx);
     } else {
-        kprintf("%s", s);
+        while (*s) kputc(*s++);
     }
+}
+
+static void shell_putc(char c) {
+    char s[2] = { c, '\0' };
+    if (g_shell_out) g_shell_out(s, g_shell_out_ctx);
+    else kputc(c);
 }
 
 void shell_printf(const char *fmt, ...) {
@@ -146,6 +222,13 @@ static struct job *jobs_find(int id) {
     return 0;
 }
 
+static struct job *jobs_find_pid(int pid) {
+    for (int i = 0; i < JOB_MAX; i++) {
+        if (g_jobs[i].id != 0 && g_jobs[i].pid == pid) return &g_jobs[i];
+    }
+    return 0;
+}
+
 static void jobs_remove(struct job *j) {
     if (!j) return;
     j->id  = 0;
@@ -179,10 +262,8 @@ static void jobs_reap_finished(void) {
                     jid, pid, g_jobs[i].name, rc, (unsigned)rc);
             jobs_remove(&g_jobs[i]);
             /* Reprint the prompt so the user gets a clean line back. */
-            console_set_color(0x0066FF66);
-            kprintf("tobyOS> ");
-            console_set_color(0x00CCCCCC);
-            for (size_t k = 0; k < line_len; k++) kputc(line[k]);
+            prompt();
+            for (size_t k = 0; k < line_len; k++) shell_putc(line[k]);
         }
     }
 }
@@ -210,9 +291,11 @@ static void jobs_reap_finished(void) {
  */
 
 #define ENV_MAX 32
+#define SHELL_READONLY_MAX 16
 
 static char *g_env[ENV_MAX + 1];     /* +1 reserved for NULL terminator */
 static int   g_envc = 0;
+static char *g_readonly[SHELL_READONLY_MAX];
 
 /* Length of "KEY" up to (but not including) the '='. Returns the
  * byte count, 0 if `kv` doesn't start with at least one non-'=' char. */
@@ -233,6 +316,60 @@ static int env_find(const char *key, size_t klen) {
         if (elen == klen && memcmp(e, key, klen) == 0) return i;
     }
     return -1;
+}
+
+static int shell_readonly_find(const char *key, size_t klen) {
+    if (!key || klen == 0) return -1;
+    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+        if (!g_readonly[i]) continue;
+        if (strlen(g_readonly[i]) == klen &&
+            memcmp(g_readonly[i], key, klen) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void shell_readonly_print_error(const char *key, size_t klen,
+                                       const char *label) {
+    char name[64];
+    size_t n = klen;
+    if (n >= sizeof(name)) n = sizeof(name) - 1;
+    if (key && n > 0) memcpy(name, key, n);
+    name[n] = '\0';
+    kprintf("%s: %s: readonly variable\n", label ? label : "shell", name);
+}
+
+static bool shell_readonly_key(const char *key, size_t klen) {
+    return shell_readonly_find(key, klen) >= 0;
+}
+
+static int shell_readonly_mark(const char *key, size_t klen) {
+    if (!key || klen == 0) return -1;
+    if (shell_readonly_key(key, klen)) return 0;
+    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+        if (g_readonly[i]) continue;
+        char *copy = (char *)kmalloc(klen + 1);
+        if (!copy) return -1;
+        memcpy(copy, key, klen);
+        copy[klen] = '\0';
+        g_readonly[i] = copy;
+        return 0;
+    }
+    kprintf("readonly: table full (max %d)\n", SHELL_READONLY_MAX);
+    return -1;
+}
+
+static bool shell_key_eq(const char *key, size_t klen, const char *lit) {
+    return key && lit && strlen(lit) == klen && memcmp(key, lit, klen) == 0;
+}
+
+static void shell_getopts_note_external_optind_write(const char *key,
+                                                     size_t klen) {
+    if (g_getopts_internal_optind_write) return;
+    if (!shell_key_eq(key, klen, "OPTIND")) return;
+    g_getopts_last_optind = 0;
+    g_getopts_char_index = 1;
 }
 
 /* Walk the table looking for `key` (NUL-terminated) and return its
@@ -262,6 +399,10 @@ static int env_set_kv(const char *kv_in) {
     if (!kv_in) return -1;
     size_t klen = env_key_len(kv_in);
     if (klen == 0) return -1;             /* "=value" or "" -- reject */
+    if (shell_readonly_key(kv_in, klen)) {
+        shell_readonly_print_error(kv_in, klen, "shell");
+        return -1;
+    }
 
     size_t total = strlen(kv_in);
     char *blob = (char *)kmalloc(total + 1);
@@ -272,6 +413,7 @@ static int env_set_kv(const char *kv_in) {
     if (idx >= 0) {
         kfree(g_env[idx]);
         g_env[idx] = blob;
+        shell_getopts_note_external_optind_write(kv_in, klen);
         return 0;
     }
     if (g_envc >= ENV_MAX) {
@@ -281,6 +423,7 @@ static int env_set_kv(const char *kv_in) {
     }
     g_env[g_envc++] = blob;
     g_env[g_envc]   = 0;
+    shell_getopts_note_external_optind_write(kv_in, klen);
     return 0;
 }
 
@@ -301,11 +444,17 @@ static int env_set(const char *key, const char *val) {
     return rc;
 }
 
-static void env_unset(const char *key) {
-    if (!key) return;
+static int env_unset(const char *key) {
+    if (!key) return -1;
     size_t klen = strlen(key);
+    if (shell_readonly_key(key, klen)) {
+        shell_readonly_print_error(key, klen, "unset");
+        return -1;
+    }
     int idx = env_find(key, klen);
     if (idx >= 0) env_remove_at(idx);
+    shell_getopts_note_external_optind_write(key, klen);
+    return 0;
 }
 
 /* Stamp the boot-time defaults. Called once from shell_init. Failures
@@ -313,11 +462,473 @@ static void env_unset(const char *key) {
 static void env_init_defaults(void) {
     g_envc = 0;
     g_env[0] = 0;
+    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+        if (g_readonly[i]) kfree(g_readonly[i]);
+        g_readonly[i] = 0;
+    }
     if (env_set("PATH",  "/bin")    < 0) kprintf("env: default PATH set failed\n");
     if (env_set("HOME",  "/")       < 0) kprintf("env: default HOME set failed\n");
     if (env_set("USER",  "admin")   < 0) kprintf("env: default USER set failed\n");
     if (env_set("PWD",   "/")       < 0) kprintf("env: default PWD set failed\n");
     if (env_set("SHELL", "tobysh")  < 0) kprintf("env: default SHELL set failed\n");
+    if (env_set("OPTIND", "1")      < 0) kprintf("env: default OPTIND set failed\n");
+}
+
+/* ---- POSIX positional parameters ---------------------------------- */
+
+struct shell_param_frame {
+    char *param0;
+    char *positional[ARG_MAX];
+    int positional_count;
+};
+
+static char *shell_strdup(const char *s) {
+    if (!s) s = "";
+    size_t n = strlen(s);
+    char *out = (char *)kmalloc(n + 1);
+    if (!out) return 0;
+    memcpy(out, s, n + 1);
+    return out;
+}
+
+static void shell_free_current_params(void) {
+    if (g_param0) {
+        kfree(g_param0);
+        g_param0 = 0;
+    }
+    for (int i = 0; i < g_positional_count; i++) {
+        if (g_positional[i]) kfree(g_positional[i]);
+        g_positional[i] = 0;
+    }
+    g_positional_count = 0;
+}
+
+static void shell_move_params_to_frame(struct shell_param_frame *f) {
+    memset(f, 0, sizeof(*f));
+    f->param0 = g_param0;
+    f->positional_count = g_positional_count;
+    for (int i = 0; i < g_positional_count; i++) {
+        f->positional[i] = g_positional[i];
+        g_positional[i] = 0;
+    }
+    g_param0 = 0;
+    g_positional_count = 0;
+}
+
+static void shell_restore_params_from_frame(struct shell_param_frame *f) {
+    shell_free_current_params();
+    g_param0 = f->param0;
+    g_positional_count = f->positional_count;
+    for (int i = 0; i < g_positional_count; i++) {
+        g_positional[i] = f->positional[i];
+        f->positional[i] = 0;
+    }
+    f->param0 = 0;
+    f->positional_count = 0;
+}
+
+static int shell_set_param0(const char *name) {
+    char *copy = shell_strdup(name && *name ? name : "tobysh");
+    if (!copy) return -1;
+    if (g_param0) kfree(g_param0);
+    g_param0 = copy;
+    return 0;
+}
+
+static int shell_set_positional_params(int argc, char **argv) {
+    if (argc < 0 || argc > ARG_MAX) return -1;
+
+    char *tmp[ARG_MAX];
+    memset(tmp, 0, sizeof(tmp));
+    for (int i = 0; i < argc; i++) {
+        tmp[i] = shell_strdup(argv[i]);
+        if (!tmp[i]) {
+            for (int j = 0; j < i; j++) kfree(tmp[j]);
+            return -1;
+        }
+    }
+
+    for (int i = 0; i < g_positional_count; i++) {
+        if (g_positional[i]) kfree(g_positional[i]);
+        g_positional[i] = 0;
+    }
+    g_positional_count = argc;
+    for (int i = 0; i < argc; i++) g_positional[i] = tmp[i];
+    return 0;
+}
+
+static int shell_enter_script_params(struct shell_param_frame *frame,
+                                     const char *param0,
+                                     int argc, char **argv) {
+    shell_move_params_to_frame(frame);
+    if (shell_set_param0(param0) < 0 ||
+        shell_set_positional_params(argc, argv) < 0) {
+        shell_restore_params_from_frame(frame);
+        return -1;
+    }
+    return 0;
+}
+
+static int shell_enter_dot_params(struct shell_param_frame *frame,
+                                  int argc, char **argv) {
+    shell_move_params_to_frame(frame);
+    const char *old0 = frame->param0 ? frame->param0 : "tobysh";
+    if (shell_set_param0(old0) < 0 ||
+        shell_set_positional_params(argc, argv) < 0) {
+        shell_restore_params_from_frame(frame);
+        return -1;
+    }
+    return 0;
+}
+
+/* ---- aliases, functions, and here-doc state ------------------------ */
+
+static int shell_alias_find(const char *name) {
+    if (!name || !*name) return -1;
+    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+        if (g_aliases[i].name && strcmp(g_aliases[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static const char *shell_alias_value(const char *name) {
+    int idx = shell_alias_find(name);
+    return idx >= 0 ? g_aliases[idx].value : 0;
+}
+
+static int shell_alias_set(const char *name, const char *value) {
+    if (!name || !value || !shell_name_is_valid(name, strlen(name))) return -1;
+
+    char *ncopy = shell_strdup(name);
+    char *vcopy = shell_strdup(value);
+    if (!ncopy || !vcopy) {
+        kfree(ncopy);
+        kfree(vcopy);
+        return -1;
+    }
+
+    int idx = shell_alias_find(name);
+    if (idx < 0) {
+        for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+            if (!g_aliases[i].name) {
+                idx = i;
+                break;
+            }
+        }
+    }
+    if (idx < 0) {
+        kfree(ncopy);
+        kfree(vcopy);
+        return -1;
+    }
+
+    kfree(g_aliases[idx].name);
+    kfree(g_aliases[idx].value);
+    g_aliases[idx].name = ncopy;
+    g_aliases[idx].value = vcopy;
+    return 0;
+}
+
+static void shell_alias_unset(const char *name) {
+    int idx = shell_alias_find(name);
+    if (idx < 0) return;
+    kfree(g_aliases[idx].name);
+    kfree(g_aliases[idx].value);
+    g_aliases[idx].name = 0;
+    g_aliases[idx].value = 0;
+}
+
+static void shell_alias_clear_all(void) {
+    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+        shell_alias_unset(g_aliases[i].name);
+    }
+}
+
+static int shell_function_find(const char *name) {
+    if (!name || !*name) return -1;
+    for (int i = 0; i < SHELL_FUNC_MAX; i++) {
+        if (g_functions[i].name && strcmp(g_functions[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static struct shell_function *shell_function_lookup(const char *name) {
+    int idx = shell_function_find(name);
+    return idx >= 0 ? &g_functions[idx] : 0;
+}
+
+static int shell_function_set(const char *name, const char *body) {
+    if (!name || !body || !shell_name_is_valid(name, strlen(name))) return -1;
+    if (shell_special_builtin_name(name)) {
+        kprintf("%s: cannot define a function with a special builtin name\n",
+                name);
+        return -1;
+    }
+
+    char *ncopy = shell_strdup(name);
+    char *bcopy = shell_strdup(body);
+    if (!ncopy || !bcopy) {
+        kfree(ncopy);
+        kfree(bcopy);
+        return -1;
+    }
+
+    int idx = shell_function_find(name);
+    if (idx < 0) {
+        for (int i = 0; i < SHELL_FUNC_MAX; i++) {
+            if (!g_functions[i].name) {
+                idx = i;
+                break;
+            }
+        }
+    }
+    if (idx < 0) {
+        kfree(ncopy);
+        kfree(bcopy);
+        return -1;
+    }
+
+    kfree(g_functions[idx].name);
+    kfree(g_functions[idx].body);
+    g_functions[idx].name = ncopy;
+    g_functions[idx].body = bcopy;
+    return 0;
+}
+
+static void shell_function_unset(const char *name) {
+    int idx = shell_function_find(name);
+    if (idx < 0) return;
+    kfree(g_functions[idx].name);
+    kfree(g_functions[idx].body);
+    g_functions[idx].name = 0;
+    g_functions[idx].body = 0;
+}
+
+static const char *shell_trap_name(int sig) {
+    if (sig == 0) return "EXIT";
+    if (sig == SIGINT) return "INT";
+    if (sig == SIGTERM) return "TERM";
+    return 0;
+}
+
+static void shell_trap_unset(int sig) {
+    if (sig < 0 || sig >= SIG_MAX) return;
+    if (g_traps[sig]) {
+        kfree(g_traps[sig]);
+        g_traps[sig] = 0;
+    }
+}
+
+static void shell_trap_clear_all(void) {
+    for (int i = 0; i < SIG_MAX; i++) shell_trap_unset(i);
+}
+
+struct shell_trap_frame {
+    char *trap[SIG_MAX];
+};
+
+static int shell_trap_enter_child(struct shell_trap_frame *frame) {
+    if (!frame) return -1;
+    memset(frame, 0, sizeof(*frame));
+    for (int i = 0; i < SIG_MAX; i++) {
+        if (!g_traps[i]) continue;
+        frame->trap[i] = shell_strdup(g_traps[i]);
+        if (!frame->trap[i]) {
+            for (int j = 0; j < i; j++) {
+                if (frame->trap[j]) kfree(frame->trap[j]);
+                frame->trap[j] = 0;
+            }
+            return -1;
+        }
+    }
+    shell_trap_clear_all();
+    return 0;
+}
+
+static void shell_trap_restore(struct shell_trap_frame *frame) {
+    if (!frame) return;
+    shell_trap_clear_all();
+    for (int i = 0; i < SIG_MAX; i++) {
+        g_traps[i] = frame->trap[i];
+        frame->trap[i] = 0;
+    }
+}
+
+static int shell_run_exit_trap(int status) {
+    if (g_trap_running || !g_traps[0] || !*g_traps[0]) return status;
+
+    char *action = shell_strdup(g_traps[0]);
+    if (!action) return status;
+
+    enum shell_flow saved_flow = g_shell_flow;
+    int saved_flow_status = g_shell_flow_status;
+    g_trap_running = true;
+    g_shell_flow = SHELL_FLOW_NONE;
+    g_shell_flow_status = 0;
+    shell_set_status(status);
+
+    execute_line_text(action);
+
+    int final_status = status;
+    if (g_shell_flow == SHELL_FLOW_EXIT) {
+        final_status = g_shell_flow_status;
+    }
+    g_shell_flow = saved_flow;
+    g_shell_flow_status = (saved_flow == SHELL_FLOW_EXIT)
+                              ? final_status
+                              : saved_flow_status;
+    shell_set_status(final_status);
+    g_trap_running = false;
+    kfree(action);
+    return final_status;
+}
+
+static void shell_heredoc_reset(void) {
+    g_heredoc_count = 0;
+    for (int i = 0; i < SHELL_HEREDOC_MAX; i++) {
+        g_heredocs[i].len = 0;
+        g_heredocs[i].body[0] = '\0';
+    }
+}
+
+static int shell_heredoc_push(const char *body, size_t len) {
+    if (g_heredoc_count >= SHELL_HEREDOC_MAX ||
+        len + 1 > SHELL_HEREDOC_BODY_MAX) {
+        return -1;
+    }
+    struct shell_heredoc *h = &g_heredocs[g_heredoc_count++];
+    memcpy(h->body, body, len);
+    h->body[len] = '\0';
+    h->len = len;
+    return 0;
+}
+
+static const struct shell_heredoc *shell_heredoc_pop(void) {
+    if (g_heredoc_count <= 0) return 0;
+    const struct shell_heredoc *h = &g_heredocs[0];
+    for (int i = 1; i < g_heredoc_count; i++) {
+        g_heredocs[i - 1] = g_heredocs[i];
+    }
+    g_heredoc_count--;
+    return h;
+}
+
+/* ---- cwd/path helpers ------------------------------------------- *
+ *
+ * The VFS takes canonical absolute paths. User programs get cwd-aware
+ * syscalls already; these helpers give kernel-side builtins the same
+ * shell ergonomics for relative paths, ".", "..", and "~".
+ */
+
+static const char *shell_cwd(void) {
+    struct proc *p = current_proc();
+    if (p && p->cwd[0]) return p->cwd;
+    const char *pwd = env_get("PWD");
+    return (pwd && *pwd) ? pwd : "/";
+}
+
+static int shell_copy_path(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0 || !src) return -1;
+    size_t n = strlen(src);
+    if (n + 1 > cap) return -1;
+    memcpy(dst, src, n + 1);
+    return 0;
+}
+
+static int shell_canonicalize_path(const char *in, char *out, size_t cap) {
+    if (!out || cap == 0) return -1;
+    const char *src = (in && *in) ? in : ".";
+    char tmp[VFS_PATH_MAX];
+
+    if (src[0] == '~' && (src[1] == '\0' || src[1] == '/')) {
+        const char *home = env_get("HOME");
+        if (!home || !*home) home = "/";
+        size_t hlen = strlen(home);
+        size_t slen = strlen(src + 1);
+        if (hlen + slen + 1 > sizeof(tmp)) return -1;
+        memcpy(tmp, home, hlen);
+        memcpy(tmp + hlen, src + 1, slen + 1);
+    } else if (src[0] == '/') {
+        if (shell_copy_path(tmp, sizeof(tmp), src) < 0) return -1;
+    } else {
+        const char *cwd = shell_cwd();
+        size_t clen = strlen(cwd);
+        size_t slen = strlen(src);
+        bool need_slash = (clen == 0 || cwd[clen - 1] != '/');
+        if (clen + (need_slash ? 1 : 0) + slen + 1 > sizeof(tmp)) return -1;
+        memcpy(tmp, cwd, clen);
+        size_t pos = clen;
+        if (need_slash) tmp[pos++] = '/';
+        memcpy(tmp + pos, src, slen + 1);
+    }
+
+    char *parts[48];
+    int count = 0;
+    char *p = tmp;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        char *start = p;
+        while (*p && *p != '/') p++;
+        if (*p) *p++ = '\0';
+
+        if (strcmp(start, ".") == 0) continue;
+        if (strcmp(start, "..") == 0) {
+            if (count > 0) count--;
+            continue;
+        }
+        if (count >= (int)(sizeof(parts) / sizeof(parts[0]))) return -1;
+        parts[count++] = start;
+    }
+
+    if (count == 0) {
+        if (cap < 2) return -1;
+        out[0] = '/';
+        out[1] = '\0';
+        return 0;
+    }
+
+    size_t pos = 0;
+    out[pos++] = '/';
+    for (int i = 0; i < count; i++) {
+        size_t n = strlen(parts[i]);
+        if (pos + n + (i + 1 < count ? 1 : 0) + 1 > cap) return -1;
+        memcpy(out + pos, parts[i], n);
+        pos += n;
+        if (i + 1 < count) out[pos++] = '/';
+    }
+    out[pos] = '\0';
+    return 0;
+}
+
+static int shell_set_cwd(const char *path) {
+    if (!path || !*path) return -1;
+    struct proc *p = current_proc();
+    if (p) {
+        size_t n = strlen(path);
+        if (n + 1 > sizeof(p->cwd)) return -1;
+        memcpy(p->cwd, path, n + 1);
+    }
+    return env_set("PWD", path);
+}
+
+static void shell_restore_cwd_only(const char *path) {
+    if (!path || !*path) return;
+    struct proc *p = current_proc();
+    if (!p) return;
+    size_t n = strlen(path);
+    if (n + 1 > sizeof(p->cwd)) return;
+    memcpy(p->cwd, path, n + 1);
+}
+
+static int shell_resolve_path_arg(const char *arg, char *out, size_t cap,
+                                  const char *label) {
+    if (shell_canonicalize_path(arg, out, cap) < 0) {
+        kprintf("%s: path too long: '%s'\n", label, arg ? arg : "");
+        shell_set_status(1);
+        return -1;
+    }
+    return 0;
 }
 
 /* ---- builtins ---- */
@@ -332,11 +943,33 @@ struct cmd {
 
 static const struct cmd cmds[];   /* forward */
 
+static const struct cmd *shell_cmd_lookup(const char *name) {
+    if (!name) return 0;
+    for (const struct cmd *c = cmds; c->name; c++) {
+        if (strcmp(c->name, name) == 0) return c;
+    }
+    return 0;
+}
+
+static bool shell_special_builtin_name(const char *name) {
+    static const char *const special[] = {
+        ":", ".", "break", "continue", "eval", "exec", "exit",
+        "export", "readonly", "return", "set", "shift", "times",
+        "trap", "unset", 0
+    };
+    if (!name) return false;
+    for (int i = 0; special[i]; i++) {
+        if (strcmp(name, special[i]) == 0) return true;
+    }
+    return false;
+}
+
 /* `env`         -- print KEY=VALUE for every entry
  * `env K=V`     -- shortcut for `setenv K V`
  * `setenv K V`  -- create/replace
  * `unsetenv K`  -- remove */
 static void cmd_env(int argc, char **argv) {
+    shell_set_status(0);
     if (argc <= 1) {
         for (int i = 0; i < g_envc; i++) kprintf("%s\n", g_env[i]);
         return;
@@ -348,30 +981,585 @@ static void cmd_env(int argc, char **argv) {
         const char *eq = (klen > 0) ? (argv[i] + klen) : 0;
         if (!eq || *eq != '=') {
             kprintf("env: '%s' is not KEY=VALUE\n", argv[i]);
+            shell_set_status(1);
             continue;
         }
         if (env_set_kv(argv[i]) < 0) {
             kprintf("env: set '%s' failed\n", argv[i]);
+            shell_set_status(1);
         }
     }
 }
 
 static void cmd_setenv(int argc, char **argv) {
+    shell_set_status(0);
     if (argc < 3) {
         kprintf("usage: setenv KEY VALUE\n");
+        shell_set_status(1);
         return;
     }
     if (env_set(argv[1], argv[2]) < 0) {
         kprintf("setenv: failed to set '%s'\n", argv[1]);
+        shell_set_status(1);
     }
 }
 
 static void cmd_unsetenv(int argc, char **argv) {
+    shell_set_status(0);
     if (argc < 2) {
         kprintf("usage: unsetenv KEY\n");
+        shell_set_status(1);
         return;
     }
-    env_unset(argv[1]);
+    if (env_unset(argv[1]) < 0) shell_set_status(1);
+}
+
+static bool shell_name_is_valid(const char *s, size_t n) {
+    if (!s || n == 0) return false;
+    char c = s[0];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_')) {
+        return false;
+    }
+    for (size_t i = 1; i < n; i++) {
+        c = s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void cmd_export(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) {
+        for (int i = 0; i < g_envc; i++) kprintf("export %s\n", g_env[i]);
+        return;
+    }
+    for (int i = 1; i < argc; i++) {
+        size_t klen = env_key_len(argv[i]);
+        if (!shell_name_is_valid(argv[i], klen)) {
+            kprintf("export: bad name '%s'\n", argv[i]);
+            shell_set_status(1);
+            continue;
+        }
+        if (argv[i][klen] == '=') {
+            if (env_set_kv(argv[i]) < 0) {
+                kprintf("export: failed to set '%s'\n", argv[i]);
+                shell_set_status(1);
+            }
+        } else if (!env_get(argv[i])) {
+            if (env_set(argv[i], "") < 0) {
+                kprintf("export: failed to create '%s'\n", argv[i]);
+                shell_set_status(1);
+            }
+        }
+    }
+}
+
+static void cmd_readonly(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1 || (argc == 2 && strcmp(argv[1], "-p") == 0)) {
+        for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+            if (!g_readonly[i]) continue;
+            const char *v = env_get(g_readonly[i]);
+            shell_printf("readonly %s", g_readonly[i]);
+            if (v) shell_printf("=%s", v);
+            shell_printf("\n");
+        }
+        return;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        size_t klen = env_key_len(argv[i]);
+        if (!shell_name_is_valid(argv[i], klen)) {
+            kprintf("readonly: bad name '%s'\n", argv[i]);
+            shell_set_status(1);
+            continue;
+        }
+
+        if (argv[i][klen] == '=') {
+            if (env_set_kv(argv[i]) < 0) {
+                shell_set_status(1);
+                continue;
+            }
+        } else if (!env_get(argv[i])) {
+            if (env_set(argv[i], "") < 0) {
+                kprintf("readonly: failed to create '%s'\n", argv[i]);
+                shell_set_status(1);
+                continue;
+            }
+        }
+
+        if (shell_readonly_mark(argv[i], klen) < 0) shell_set_status(1);
+    }
+}
+
+static void cmd_unset(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) {
+        kprintf("usage: unset [-f|-v] NAME [NAME...]\n");
+        shell_set_status(1);
+        return;
+    }
+
+    bool functions = false;
+    int first = 1;
+    if (strcmp(argv[1], "-f") == 0) {
+        functions = true;
+        first = 2;
+    } else if (strcmp(argv[1], "-v") == 0) {
+        first = 2;
+    }
+    if (first >= argc) {
+        kprintf("unset: missing name\n");
+        shell_set_status(1);
+        return;
+    }
+    for (int i = first; i < argc; i++) {
+        if (functions) shell_function_unset(argv[i]);
+        else if (env_unset(argv[i]) < 0) shell_set_status(1);
+    }
+}
+
+static void cmd_set(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) {
+        for (int i = 0; i < g_envc; i++) kprintf("%s\n", g_env[i]);
+        return;
+    }
+
+    int first = 1;
+    if (strcmp(argv[1], "--") == 0) first = 2;
+
+    bool all_assignments = (first < argc);
+    for (int i = first; i < argc; i++) {
+        size_t klen = env_key_len(argv[i]);
+        if (klen == 0 || argv[i][klen] != '=') {
+            all_assignments = false;
+            break;
+        }
+    }
+
+    if (!all_assignments || strcmp(argv[1], "--") == 0) {
+        if (shell_set_positional_params(argc - first, &argv[first]) < 0) {
+            kprintf("set: positional parameter table full\n");
+            shell_set_status(1);
+        }
+        return;
+    }
+
+    for (int i = first; i < argc; i++) {
+        size_t klen = env_key_len(argv[i]);
+        if (!shell_name_is_valid(argv[i], klen) || env_set_kv(argv[i]) < 0) {
+            kprintf("set: failed to set '%s'\n", argv[i]);
+            shell_set_status(1);
+        }
+    }
+}
+
+static void cmd_shift(int argc, char **argv) {
+    int n = 1;
+    shell_set_status(0);
+    if (argc > 2) {
+        kprintf("shift: too many arguments\n");
+        shell_set_status(2);
+        return;
+    }
+    if (argc == 2 && parse_int(argv[1], &n) < 0) {
+        kprintf("shift: numeric argument required\n");
+        shell_set_status(2);
+        return;
+    }
+    if (n < 0 || n > g_positional_count) {
+        kprintf("shift: can't shift %d positional parameters\n", n);
+        shell_set_status(1);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        if (g_positional[i]) kfree(g_positional[i]);
+    }
+    for (int i = n; i < g_positional_count; i++) {
+        g_positional[i - n] = g_positional[i];
+        g_positional[i] = 0;
+    }
+    g_positional_count -= n;
+}
+
+static const char *shell_getopts_find(const char *optstring, char opt) {
+    if (!optstring) return 0;
+    const char *p = optstring;
+    if (*p == ':') p++;
+    for (; *p; p++) {
+        if (*p == ':') continue;
+        if (*p == opt) return p;
+    }
+    return 0;
+}
+
+static int shell_getopts_set_int(const char *key, int value) {
+    char buf[16];
+    ksnprintf(buf, sizeof(buf), "%d", value);
+    bool old_internal = g_getopts_internal_optind_write;
+    if (shell_key_eq(key, strlen(key), "OPTIND")) {
+        g_getopts_internal_optind_write = true;
+    }
+    int rc = env_set(key, buf);
+    g_getopts_internal_optind_write = old_internal;
+    return rc;
+}
+
+static int shell_getopts_set_char(const char *key, char value) {
+    char buf[2] = { value, '\0' };
+    return env_set(key, buf);
+}
+
+static int shell_getopts_set_name(const char *name, char value) {
+    char buf[2] = { value, '\0' };
+    return env_set(name, buf);
+}
+
+static void shell_getopts_finish_end(const char *name, int optind) {
+    (void)shell_getopts_set_name(name, '?');
+    (void)env_unset("OPTARG");
+    (void)shell_getopts_set_int("OPTIND", optind);
+    g_getopts_last_optind = optind;
+    g_getopts_char_index = 1;
+    shell_set_status(1);
+}
+
+static void cmd_getopts(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc < 3) {
+        kprintf("usage: getopts optstring NAME [ARG...]\n");
+        shell_set_status(2);
+        return;
+    }
+
+    const char *optstring = argv[1] ? argv[1] : "";
+    const char *name = argv[2] ? argv[2] : "";
+    if (!shell_name_is_valid(name, strlen(name))) {
+        kprintf("getopts: invalid variable name '%s'\n", name);
+        shell_set_status(2);
+        return;
+    }
+
+    bool silent = optstring[0] == ':';
+    int arg_count = (argc > 3) ? (argc - 3) : g_positional_count;
+    char **args = (argc > 3) ? &argv[3] : g_positional;
+
+    int optind = 1;
+    const char *optind_env = env_get("OPTIND");
+    if (optind_env && parse_int(optind_env, &optind) < 0) optind = 1;
+    if (optind < 1) optind = 1;
+    if (optind != g_getopts_last_optind) {
+        g_getopts_char_index = 1;
+    }
+    if (g_getopts_char_index < 1) g_getopts_char_index = 1;
+
+    const char *arg = 0;
+    for (;;) {
+        if (optind > arg_count) {
+            shell_getopts_finish_end(name, optind);
+            return;
+        }
+        arg = args[optind - 1] ? args[optind - 1] : "";
+        if (strcmp(arg, "--") == 0) {
+            optind++;
+            shell_getopts_finish_end(name, optind);
+            return;
+        }
+        if (arg[0] != '-' || arg[1] == '\0') {
+            shell_getopts_finish_end(name, optind);
+            return;
+        }
+        if (arg[g_getopts_char_index] != '\0') break;
+        optind++;
+        g_getopts_char_index = 1;
+    }
+
+    char opt = arg[g_getopts_char_index++];
+    const char *spec = shell_getopts_find(optstring, opt);
+    int rc = 0;
+
+    if (!spec) {
+        if (arg[g_getopts_char_index] == '\0') {
+            optind++;
+            g_getopts_char_index = 1;
+        }
+        if (shell_getopts_set_name(name, '?') < 0) rc = 1;
+        if (silent) {
+            if (shell_getopts_set_char("OPTARG", opt) < 0) rc = 1;
+        } else {
+            kprintf("getopts: illegal option -- %c\n", opt);
+            if (env_unset("OPTARG") < 0) rc = 1;
+        }
+        if (shell_getopts_set_int("OPTIND", optind) < 0) rc = 1;
+        g_getopts_last_optind = optind;
+        shell_set_status(rc ? 1 : 0);
+        return;
+    }
+
+    if (spec[1] == ':') {
+        if (arg[g_getopts_char_index] != '\0') {
+            if (shell_getopts_set_char(name, opt) < 0) rc = 1;
+            if (env_set("OPTARG", &arg[g_getopts_char_index]) < 0) rc = 1;
+            optind++;
+            g_getopts_char_index = 1;
+        } else if (optind < arg_count) {
+            if (shell_getopts_set_char(name, opt) < 0) rc = 1;
+            if (env_set("OPTARG", args[optind] ? args[optind] : "") < 0) {
+                rc = 1;
+            }
+            optind += 2;
+            g_getopts_char_index = 1;
+        } else {
+            optind++;
+            g_getopts_char_index = 1;
+            if (silent) {
+                if (shell_getopts_set_name(name, ':') < 0) rc = 1;
+                if (shell_getopts_set_char("OPTARG", opt) < 0) rc = 1;
+            } else {
+                kprintf("getopts: option requires an argument -- %c\n", opt);
+                if (shell_getopts_set_name(name, '?') < 0) rc = 1;
+                if (env_unset("OPTARG") < 0) rc = 1;
+            }
+        }
+        if (shell_getopts_set_int("OPTIND", optind) < 0) rc = 1;
+        g_getopts_last_optind = optind;
+        shell_set_status(rc ? 1 : 0);
+        return;
+    }
+
+    if (arg[g_getopts_char_index] == '\0') {
+        optind++;
+        g_getopts_char_index = 1;
+    }
+    if (shell_getopts_set_char(name, opt) < 0) rc = 1;
+    if (env_unset("OPTARG") < 0) rc = 1;
+    if (shell_getopts_set_int("OPTIND", optind) < 0) rc = 1;
+    g_getopts_last_optind = optind;
+    shell_set_status(rc ? 1 : 0);
+}
+
+static bool shell_ifs_has(const char *ifs, char c) {
+    if (!ifs) ifs = " \t\n";
+    for (const char *p = ifs; *p; p++) {
+        if (*p == c) return true;
+    }
+    return false;
+}
+
+static int shell_read_line_from_file(struct file *in, bool raw,
+                                     char *out, size_t cap,
+                                     bool *got_any) {
+    if (!in || !out || cap == 0 || !got_any) return -1;
+    size_t pos = 0;
+    bool escaped = false;
+    *got_any = false;
+
+    for (;;) {
+        char c = 0;
+        long n = file_read(in, &c, 1);
+        if (n < 0) return -1;
+        if (n == 0) break;
+        *got_any = true;
+
+        if (!raw && escaped) {
+            escaped = false;
+            if (c == '\n') continue;
+            if (pos + 1 >= cap) return -2;
+            out[pos++] = c;
+            continue;
+        }
+        if (!raw && c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '\n') break;
+        if (pos + 1 >= cap) return -2;
+        out[pos++] = c;
+    }
+
+    if (!raw && escaped) {
+        if (pos + 1 >= cap) return -2;
+        out[pos++] = '\\';
+    }
+    out[pos] = '\0';
+    return 0;
+}
+
+static int shell_read_assign_empty(int argc, char **argv, int first) {
+    int rc = 0;
+    for (int i = first; i < argc; i++) {
+        if (!shell_name_is_valid(argv[i], strlen(argv[i])) ||
+            env_set(argv[i], "") < 0) {
+            kprintf("read: failed to set '%s'\n", argv[i]);
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+static int shell_read_assign_fields(int argc, char **argv, int first,
+                                    char *line) {
+    const char *ifs = env_get("IFS");
+    if (!ifs) ifs = " \t\n";
+
+    if (ifs[0] == '\0') {
+        if (!shell_name_is_valid(argv[first], strlen(argv[first])) ||
+            env_set(argv[first], line) < 0) {
+            kprintf("read: failed to set '%s'\n", argv[first]);
+            return 1;
+        }
+        return shell_read_assign_empty(argc, argv, first + 1);
+    }
+
+    char *p = line;
+    while (*p && shell_ifs_has(ifs, *p)) p++;
+
+    int rc = 0;
+    for (int i = first; i < argc; i++) {
+        char *val = p;
+        if (i + 1 == argc) {
+            char *end = p + strlen(p);
+            while (end > p && shell_ifs_has(ifs, end[-1])) end--;
+            *end = '\0';
+            p = end;
+        } else {
+            while (*p && !shell_ifs_has(ifs, *p)) p++;
+            if (*p) *p++ = '\0';
+            while (*p && shell_ifs_has(ifs, *p)) p++;
+        }
+
+        if (!shell_name_is_valid(argv[i], strlen(argv[i])) ||
+            env_set(argv[i], val) < 0) {
+            kprintf("read: failed to set '%s'\n", argv[i]);
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+static void cmd_read(int argc, char **argv) {
+    bool raw = false;
+    int first = 1;
+    shell_set_status(0);
+
+    while (first < argc && argv[first][0] == '-' && argv[first][1]) {
+        if (strcmp(argv[first], "--") == 0) {
+            first++;
+            break;
+        }
+        for (const char *p = argv[first] + 1; *p; p++) {
+            if (*p == 'r') {
+                raw = true;
+            } else {
+                kprintf("read: bad option '-%c'\n", *p);
+                shell_set_status(2);
+                return;
+            }
+        }
+        first++;
+    }
+    if (first >= argc) {
+        kprintf("usage: read [-r] NAME [NAME...]\n");
+        shell_set_status(2);
+        return;
+    }
+
+    struct file *tmp_console = 0;
+    struct file *in = g_shell_in ? g_shell_in : g_shell_fd[0];
+    if (!in) {
+        tmp_console = console_file_make();
+        in = tmp_console;
+    }
+    if (!in) {
+        kprintf("read: failed to open stdin\n");
+        shell_set_status(1);
+        return;
+    }
+
+    char linebuf[LINE_MAX];
+    bool got_any = false;
+    int rr = shell_read_line_from_file(in, raw, linebuf, sizeof(linebuf),
+                                       &got_any);
+    if (tmp_console) file_close(tmp_console);
+    if (rr < 0) {
+        kprintf(rr == -2 ? "read: line too long\n"
+                         : "read: input error\n");
+        shell_set_status(1);
+        return;
+    }
+    if (!got_any) {
+        (void)shell_read_assign_empty(argc, argv, first);
+        shell_set_status(1);
+        return;
+    }
+
+    int rc = shell_read_assign_fields(argc, argv, first, linebuf);
+    shell_set_status(rc);
+}
+
+static void cmd_pwd(int argc, char **argv) {
+    (void)argc; (void)argv;
+    kprintf("%s\n", shell_cwd());
+    shell_set_status(0);
+}
+
+static void cmd_cd(int argc, char **argv) {
+    shell_set_status(0);
+    const char *target = 0;
+    bool print_new = false;
+    if (argc <= 1) {
+        target = env_get("HOME");
+        if (!target || !*target) target = "/";
+    } else if (strcmp(argv[1], "-") == 0) {
+        target = env_get("OLDPWD");
+        if (!target || !*target) {
+            kprintf("cd: OLDPWD not set\n");
+            shell_set_status(1);
+            return;
+        }
+        print_new = true;
+    } else {
+        target = argv[1];
+    }
+
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(target, path, sizeof(path), "cd") < 0) return;
+
+    struct vfs_stat st;
+    int rc = vfs_stat(path, &st);
+    if (rc != VFS_OK) {
+        kprintf("cd: '%s': %s\n", target, vfs_strerror(rc));
+        shell_set_status(1);
+        return;
+    }
+    if (st.type != VFS_TYPE_DIR) {
+        kprintf("cd: '%s': not a directory\n", target);
+        shell_set_status(1);
+        return;
+    }
+
+    const char *old = shell_cwd();
+    (void)env_set("OLDPWD", old);
+    if (shell_set_cwd(path) < 0) {
+        kprintf("cd: failed to enter '%s'\n", path);
+        shell_set_status(1);
+        return;
+    }
+    if (print_new) kprintf("%s\n", path);
+}
+
+static void cmd_true(int argc, char **argv) {
+    (void)argc; (void)argv;
+    shell_set_status(0);
+}
+
+static void cmd_false(int argc, char **argv) {
+    (void)argc; (void)argv;
+    shell_set_status(1);
 }
 
 static void cmd_help(int argc, char **argv) {
@@ -515,12 +1703,14 @@ static void        shell_spawn_program_profile(const char *path, int argc,
                                                const char *profile);
 static const char *resolve_program(const char *name, char *out_buf,
                                    size_t out_sz);
+static bool        path_is_file(const char *path);
 
 static void cmd_run(int argc, char **argv) {
     if (argc < 2) {
         kprintf("usage: run [--sandbox <profile>] <path> [args...]\n");
         kprintf("       (try 'run /bin/hello' or just 'hello')\n");
         kprintf("       'caps' lists available sandbox profiles\n");
+        shell_set_status(1);
         return;
     }
 
@@ -536,6 +1726,7 @@ static void cmd_run(int argc, char **argv) {
     }
     if (argc - shift < 1) {
         kprintf("run: missing <path>\n");
+        shell_set_status(1);
         return;
     }
 
@@ -575,16 +1766,19 @@ static int parse_int(const char *s, int *out) {
 static void cmd_fg(int argc, char **argv) {
     if (argc < 2) {
         kprintf("usage: fg <job_id>     (see 'jobs')\n");
+        shell_set_status(1);
         return;
     }
     int jid;
     if (parse_int(argv[1], &jid) < 0 || jid <= 0) {
         kprintf("fg: bad job id '%s'\n", argv[1]);
+        shell_set_status(1);
         return;
     }
     struct job *j = jobs_find(jid);
     if (!j) {
         kprintf("fg: no such job [%d]\n", jid);
+        shell_set_status(1);
         return;
     }
     int pid = j->pid;
@@ -610,6 +1804,69 @@ static void cmd_fg(int argc, char **argv) {
 
     kprintf("fg: '%s' (pid=%d) returned %d (0x%x)\n",
             saved_name, pid, rc, (unsigned)rc);
+    shell_set_status(rc);
+}
+
+static int shell_wait_job(struct job *j) {
+    if (!j || j->id == 0) return 127;
+    int pid = j->pid;
+    signal_set_foreground(pid);
+    int rc = proc_wait(pid);
+    signal_set_foreground(0);
+    if (rc < 0) {
+        kprintf("wait: pid %d: not a child\n", pid);
+        jobs_remove(j);
+        return 127;
+    }
+    jobs_remove(j);
+    return rc;
+}
+
+static struct job *shell_wait_lookup(const char *arg) {
+    if (!arg || !*arg) return 0;
+    int n = 0;
+    if (arg[0] == '%') {
+        if (parse_int(arg + 1, &n) < 0 || n <= 0) return 0;
+        return jobs_find(n);
+    }
+    if (parse_int(arg, &n) < 0 || n <= 0) return 0;
+
+    struct job *j = jobs_find_pid(n);
+    if (j) return j;
+    return jobs_find(n);
+}
+
+static void cmd_wait(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) {
+        int rc = 0;
+        for (;;) {
+            struct job *j = 0;
+            for (int i = 0; i < JOB_MAX; i++) {
+                if (g_jobs[i].id != 0) {
+                    j = &g_jobs[i];
+                    break;
+                }
+            }
+            if (!j) break;
+            rc = shell_wait_job(j);
+        }
+        shell_set_status(rc == 127 ? 127 : 0);
+        return;
+    }
+
+    int rc = 0;
+    for (int i = 1; i < argc; i++) {
+        struct job *j = shell_wait_lookup(argv[i]);
+        if (!j) {
+            kprintf("wait: %s: unknown pid or job\n", argv[i]);
+            rc = 127;
+            continue;
+        }
+        int wrc = shell_wait_job(j);
+        rc = wrc;
+    }
+    shell_set_status(rc);
 }
 
 static void cmd_ps(int argc, char **argv) {
@@ -866,11 +2123,14 @@ static void cmd_ls(int argc, char **argv) {
     if (argi < argc && strcmp(argv[argi], "-l") == 0) {
         long_form = true; argi++;
     }
-    const char *path = (argi < argc) ? argv[argi] : "/";
+    const char *path_arg = (argi < argc) ? argv[argi] : ".";
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(path_arg, path, sizeof(path), "ls") < 0) return;
     struct vfs_dir d;
     int rc = vfs_opendir(path, &d);
     if (rc != VFS_OK) {
-        kprintf("ls: '%s': %s\n", path, vfs_strerror(rc));
+        kprintf("ls: '%s': %s\n", path_arg, vfs_strerror(rc));
+        shell_set_status(1);
         return;
     }
     struct vfs_dirent ent;
@@ -903,6 +2163,7 @@ static void cmd_ls(int argc, char **argv) {
     }
     vfs_closedir(&d);
     if (shown == 0) kprintf("  (empty)\n");
+    shell_set_status(0);
 }
 
 /* ---- milestone 15 user/perm builtins ----------------------------- */
@@ -926,23 +2187,26 @@ static void cmd_users(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "add") == 0) {
         if (argc != 5) {
             kprintf("usage: users add <name> <uid> <gid>\n");
+            shell_set_status(1);
             return;
         }
         int uid = 0, gid = 0;
         for (const char *p = argv[3]; *p; p++) {
-            if (*p < '0' || *p > '9') { kprintf("users: bad uid\n"); return; }
+            if (*p < '0' || *p > '9') { kprintf("users: bad uid\n"); shell_set_status(1); return; }
             uid = uid * 10 + (*p - '0');
         }
         for (const char *p = argv[4]; *p; p++) {
-            if (*p < '0' || *p > '9') { kprintf("users: bad gid\n"); return; }
+            if (*p < '0' || *p > '9') { kprintf("users: bad gid\n"); shell_set_status(1); return; }
             gid = gid * 10 + (*p - '0');
         }
         if (current_proc() && current_proc()->uid != 0) {
             kprintf("users: only root may add users\n");
+            shell_set_status(1);
             return;
         }
         if (users_add(argv[2], uid, gid) != 0) {
             kprintf("users: add failed\n");
+            shell_set_status(1);
             return;
         }
         if (users_save() != 0) {
@@ -950,10 +2214,12 @@ static void cmd_users(int argc, char **argv) {
         } else {
             kprintf("users: added '%s' uid=%d gid=%d\n", argv[2], uid, gid);
         }
+        shell_set_status(0);
         return;
     }
     kprintf("registered users:\n");
     users_visit(users_print_one, 0);
+    shell_set_status(0);
 }
 
 /* Parse an octal string like "755". Returns -1 on bad input. */
@@ -970,37 +2236,49 @@ static int parse_octal_str(const char *s) {
 static void cmd_chmod(int argc, char **argv) {
     if (argc != 3) {
         kprintf("usage: chmod <octal> <path>     e.g. chmod 644 /data/notes\n");
+        shell_set_status(1);
         return;
     }
     int mode = parse_octal_str(argv[1]);
     if (mode < 0 || mode > 0777) {
         kprintf("chmod: bad mode '%s' -- must be 3 octal digits\n", argv[1]);
+        shell_set_status(1);
         return;
     }
-    int rc = vfs_chmod(argv[2], (uint32_t)mode);
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(argv[2], path, sizeof(path), "chmod") < 0) return;
+    int rc = vfs_chmod(path, (uint32_t)mode);
     if (rc != VFS_OK) {
         kprintf("chmod: '%s': %s\n", argv[2], vfs_strerror(rc));
+        shell_set_status(1);
     } else {
         kprintf("chmod: '%s' -> 0%o\n", argv[2], (unsigned)mode);
+        shell_set_status(0);
     }
 }
 
 static void cmd_chown(int argc, char **argv) {
     if (argc != 3) {
         kprintf("usage: chown <user> <path>      (root only)\n");
+        shell_set_status(1);
         return;
     }
     const struct user *u = users_lookup_by_name(argv[1]);
     if (!u) {
         kprintf("chown: unknown user '%s'\n", argv[1]);
+        shell_set_status(1);
         return;
     }
-    int rc = vfs_chown(argv[2], (uint32_t)u->uid, (uint32_t)u->gid);
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(argv[2], path, sizeof(path), "chown") < 0) return;
+    int rc = vfs_chown(path, (uint32_t)u->uid, (uint32_t)u->gid);
     if (rc != VFS_OK) {
         kprintf("chown: '%s': %s\n", argv[2], vfs_strerror(rc));
+        shell_set_status(1);
     } else {
         kprintf("chown: '%s' -> %s (uid=%d gid=%d)\n",
                 argv[2], u->name, u->uid, u->gid);
+        shell_set_status(0);
     }
 }
 
@@ -1011,30 +2289,36 @@ static void cmd_chown(int argc, char **argv) {
 static void cmd_su(int argc, char **argv) {
     if (argc < 2) {
         kprintf("usage: su <user>                (changes the SHELL's uid/gid)\n");
+        shell_set_status(1);
         return;
     }
     const struct user *u = users_lookup_by_name(argv[1]);
     if (!u) {
         kprintf("su: unknown user '%s'\n", argv[1]);
+        shell_set_status(1);
         return;
     }
     struct proc *p = current_proc();
-    if (!p) { kprintf("su: no current proc\n"); return; }
+    if (!p) { kprintf("su: no current proc\n"); shell_set_status(1); return; }
     /* Debug aid -- the kernel shell always runs on pid 0 (boot
      * thread), so we let it freely flip identity for demo purposes. */
     p->uid = u->uid;
     p->gid = u->gid;
+    (void)env_set("USER", u->name);
     kprintf("su: now running as %s (uid=%d gid=%d). "
             "Type `su root` to restore.\n",
             u->name, u->uid, u->gid);
+    shell_set_status(0);
 }
 
 static void cmd_cat(int argc, char **argv) {
     if (argc < 2) {
         kprintf("usage: cat <path>\n");
+        shell_set_status(1);
         return;
     }
-    const char *path = argv[1];
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(argv[1], path, sizeof(path), "cat") < 0) return;
 
     /* Stream in 256-byte chunks instead of slurping the whole file --
      * keeps stack usage tiny and works for arbitrarily-large text
@@ -1042,23 +2326,27 @@ static void cmd_cat(int argc, char **argv) {
     struct vfs_file f;
     int rc = vfs_open(path, &f);
     if (rc != VFS_OK) {
-        kprintf("cat: '%s': %s\n", path, vfs_strerror(rc));
+        kprintf("cat: '%s': %s\n", argv[1], vfs_strerror(rc));
+        shell_set_status(1);
         return;
     }
     char buf[256];
+    bool ok = true;
     for (;;) {
         long n = vfs_read(&f, buf, sizeof(buf));
         if (n < 0) {
             kprintf("\ncat: read error: %s\n", vfs_strerror((int)n));
+            ok = false;
             break;
         }
         if (n == 0) break;
-        for (long i = 0; i < n; i++) kputc(buf[i]);
+        for (long i = 0; i < n; i++) shell_putc(buf[i]);
     }
     vfs_close(&f);
     /* Many text files lack a trailing newline -- add one so the next
      * shell prompt doesn't visually collide with the last line. */
-    kputc('\n');
+    shell_putc('\n');
+    shell_set_status(ok ? 0 : 1);
 }
 
 /* ---- writable-FS builtins (milestone 6) ---- */
@@ -1066,39 +2354,58 @@ static void cmd_cat(int argc, char **argv) {
 static void cmd_touch(int argc, char **argv) {
     if (argc < 2) {
         kprintf("usage: touch <path>      (creates empty file; '/data' is writable)\n");
+        shell_set_status(1);
         return;
     }
-    int rc = vfs_create(argv[1]);
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(argv[1], path, sizeof(path), "touch") < 0) return;
+    int rc = vfs_create(path);
     if (rc == VFS_ERR_EXIST) {
         /* `touch` of an existing file is a no-op success in classic
          * shells; surface that politely. */
         kprintf("touch: '%s' already exists\n", argv[1]);
+        shell_set_status(0);
         return;
     }
     if (rc != VFS_OK) {
         kprintf("touch: '%s': %s\n", argv[1], vfs_strerror(rc));
+        shell_set_status(1);
+    } else {
+        shell_set_status(0);
     }
 }
 
 static void cmd_mkdir(int argc, char **argv) {
     if (argc < 2) {
         kprintf("usage: mkdir <path>\n");
+        shell_set_status(1);
         return;
     }
-    int rc = vfs_mkdir(argv[1]);
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(argv[1], path, sizeof(path), "mkdir") < 0) return;
+    int rc = vfs_mkdir(path);
     if (rc != VFS_OK) {
         kprintf("mkdir: '%s': %s\n", argv[1], vfs_strerror(rc));
+        shell_set_status(1);
+    } else {
+        shell_set_status(0);
     }
 }
 
 static void cmd_rm(int argc, char **argv) {
     if (argc < 2) {
         kprintf("usage: rm <path>      (file or empty directory)\n");
+        shell_set_status(1);
         return;
     }
-    int rc = vfs_unlink(argv[1]);
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(argv[1], path, sizeof(path), "rm") < 0) return;
+    int rc = vfs_unlink(path);
     if (rc != VFS_OK) {
         kprintf("rm: '%s': %s\n", argv[1], vfs_strerror(rc));
+        shell_set_status(1);
+    } else {
+        shell_set_status(0);
     }
 }
 
@@ -1109,6 +2416,7 @@ static void cmd_write(int argc, char **argv) {
     if (argc < 3) {
         kprintf("usage: write <path> <text>\n");
         kprintf("       e.g. write /data/notes/todo buy groceries\n");
+        shell_set_status(1);
         return;
     }
     /* Join argv[2..argc-1] into a single buffer with ' ' separators. */
@@ -1119,6 +2427,7 @@ static void cmd_write(int argc, char **argv) {
         if (pos + alen + 1 >= sizeof(body)) {
             kprintf("write: input too long (max %lu bytes)\n",
                     (unsigned long)(sizeof(body) - 1));
+            shell_set_status(1);
             return;
         }
         if (i > 2) body[pos++] = ' ';
@@ -1127,13 +2436,17 @@ static void cmd_write(int argc, char **argv) {
     }
     body[pos] = 0;
 
-    int rc = vfs_write_all(argv[1], body, pos);
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(argv[1], path, sizeof(path), "write") < 0) return;
+    int rc = vfs_write_all(path, body, pos);
     if (rc != VFS_OK) {
         kprintf("write: '%s': %s\n", argv[1], vfs_strerror(rc));
+        shell_set_status(1);
         return;
     }
     kprintf("write: '%s' <- %lu byte%s\n", argv[1],
             (unsigned long)pos, pos == 1 ? "" : "s");
+    shell_set_status(0);
 }
 
 static void cmd_mounts(int argc, char **argv) {
@@ -2203,13 +3516,739 @@ static void cmd_sandbox(int argc, char **argv) {
                                 /*background=*/false, argv[1]);
 }
 
+static bool shell_heredoc_delim_char(char c) {
+    return c && c != ' ' && c != '\t' && c != ';' && c != '&' &&
+           c != '|' && c != '<' && c != '>';
+}
+
+static bool shell_line_find_heredoc(const char *line, char *delim, size_t cap,
+                                    bool *strip_tabs, bool *quoted) {
+    bool in_single = false;
+    bool in_double = false;
+    *strip_tabs = false;
+    *quoted = false;
+    delim[0] = '\0';
+
+    for (const char *p = line; *p; p++) {
+        if (in_single) {
+            if (*p == '\'') in_single = false;
+            continue;
+        }
+        if (in_double) {
+            if (*p == '\\' && p[1]) {
+                p++;
+                continue;
+            }
+            if (*p == '"') in_double = false;
+            continue;
+        }
+        if (*p == '\'') {
+            in_single = true;
+            continue;
+        }
+        if (*p == '"') {
+            in_double = true;
+            continue;
+        }
+        if (p[0] != '<' || p[1] != '<') continue;
+
+        p += 2;
+        if (*p == '-') {
+            *strip_tabs = true;
+            p++;
+        }
+        while (*p == ' ' || *p == '\t') p++;
+
+        size_t pos = 0;
+        while (shell_heredoc_delim_char(*p)) {
+            if (*p == '\'' || *p == '"') {
+                char q = *p++;
+                *quoted = true;
+                while (*p && *p != q) {
+                    if (pos + 1 >= cap) return false;
+                    delim[pos++] = *p++;
+                }
+                if (*p == q) p++;
+                continue;
+            }
+            if (pos + 1 >= cap) return false;
+            delim[pos++] = *p++;
+        }
+        delim[pos] = '\0';
+        return delim[0] != '\0';
+    }
+    return false;
+}
+
+static bool shell_heredoc_line_matches(const char *line, const char *delim,
+                                       bool strip_tabs) {
+    if (strip_tabs) {
+        while (*line == '\t') line++;
+    }
+    return strcmp(line, delim) == 0;
+}
+
+static int shell_collect_heredoc(char **pp, const char *delim,
+                                 bool strip_tabs, bool quoted) {
+    char body[SHELL_HEREDOC_BODY_MAX];
+    size_t bpos = 0;
+    char *p = *pp;
+
+    while (*p) {
+        char *line_start = p;
+        while (*p && *p != '\n' && *p != '\r') p++;
+        char saved = *p;
+        if (*p) *p++ = '\0';
+        if (saved == '\r' && *p == '\n') p++;
+
+        const char *match_line = line_start;
+        if (shell_heredoc_line_matches(match_line, delim, strip_tabs)) {
+            *pp = p;
+            return shell_heredoc_push(body, bpos);
+        }
+
+        const char *emit = line_start;
+        char expanded[LINE_MAX * 2];
+        if (!quoted) {
+            if (shell_expand_param_word(line_start, expanded,
+                                        sizeof(expanded)) < 0) {
+                return -1;
+            }
+            emit = expanded;
+        }
+        size_t n = strlen(emit);
+        if (bpos + n + 2 > sizeof(body)) return -1;
+        memcpy(body + bpos, emit, n);
+        bpos += n;
+        body[bpos++] = '\n';
+        body[bpos] = '\0';
+    }
+
+    kprintf("sh: here-document delimited by EOF (wanted '%s')\n", delim);
+    return -1;
+}
+
+static int shell_run_script_text(char *text, bool run_exit_trap) {
+    if (!text) return 1;
+    if (g_script_depth >= 8) {
+        kprintf("sh: script nesting too deep\n");
+        return 2;
+    }
+
+    g_script_depth++;
+    int last = 0;
+    char *p = text;
+    bool first_line = true;
+    while (*p) {
+        char *line_start = p;
+        while (*p && *p != '\n' && *p != '\r') p++;
+        char saved = *p;
+        if (*p) *p++ = '\0';
+        if (saved == '\r' && *p == '\n') p++;
+
+        char *line = line_start;
+        while (*line == ' ' || *line == '\t') line++;
+        if (first_line && line[0] == '#' && line[1] == '!') {
+            first_line = false;
+            continue;
+        }
+        first_line = false;
+        if (*line == '\0' || *line == '#') continue;
+
+        char delim[64];
+        bool strip_tabs = false;
+        bool quoted = false;
+        shell_heredoc_reset();
+        if (shell_line_find_heredoc(line, delim, sizeof(delim),
+                                    &strip_tabs, &quoted)) {
+            if (shell_collect_heredoc(&p, delim, strip_tabs, quoted) < 0) {
+                last = 2;
+                shell_set_status(2);
+                break;
+            }
+        }
+        execute_line_text(line);
+        last = g_last_status;
+        shell_heredoc_reset();
+        if (g_shell_flow == SHELL_FLOW_EXIT) {
+            last = g_shell_flow_status;
+            break;
+        }
+        if (g_shell_flow == SHELL_FLOW_RETURN) {
+            last = g_shell_flow_status;
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+            break;
+        }
+        if (g_shell_flow != SHELL_FLOW_NONE) break;
+    }
+    if (run_exit_trap) last = shell_run_exit_trap(last);
+    g_script_depth--;
+    return last;
+}
+
+static int shell_run_script_path(const char *path_arg, bool run_exit_trap) {
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(path_arg, path, sizeof(path), "sh") < 0) return 1;
+    void *buf = 0;
+    size_t sz = 0;
+    int rc = vfs_read_all(path, &buf, &sz);
+    (void)sz;
+    if (rc != VFS_OK) {
+        kprintf("sh: '%s': %s\n", path_arg, vfs_strerror(rc));
+        return 1;
+    }
+    int st = shell_run_script_text((char *)buf, run_exit_trap);
+    kfree(buf);
+    return st;
+}
+
+static void cmd_sh(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc < 2) {
+        kprintf("usage: sh [-c command] [script]\n");
+        shell_set_status(1);
+        return;
+    }
+    if (strcmp(argv[1], "-c") == 0) {
+        if (argc < 3) {
+            kprintf("sh: -c requires a command string\n");
+            shell_set_status(2);
+            return;
+        }
+        struct shell_param_frame frame;
+        const char *param0 = (argc >= 4) ? argv[3] : "sh";
+        int pargc = (argc >= 5) ? argc - 4 : 0;
+        char **pargv = (argc >= 5) ? &argv[4] : &argv[argc];
+        if (shell_enter_script_params(&frame, param0, pargc, pargv) < 0) {
+            kprintf("sh: failed to set positional parameters\n");
+            shell_set_status(1);
+            return;
+        }
+        struct shell_trap_frame trap_frame;
+        if (shell_trap_enter_child(&trap_frame) < 0) {
+            shell_restore_params_from_frame(&frame);
+            shell_set_status(1);
+            return;
+        }
+        char *copy = shell_strdup(argv[2]);
+        if (!copy) {
+            shell_trap_restore(&trap_frame);
+            shell_restore_params_from_frame(&frame);
+            shell_set_status(1);
+            return;
+        }
+        int st = shell_run_script_text(copy, true);
+        kfree(copy);
+        shell_trap_restore(&trap_frame);
+        if (g_shell_flow == SHELL_FLOW_EXIT) {
+            st = g_shell_flow_status;
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+        }
+        shell_restore_params_from_frame(&frame);
+        shell_set_status(st);
+        return;
+    }
+    struct shell_param_frame frame;
+    int pargc = argc - 2;
+    char **pargv = (argc >= 3) ? &argv[2] : &argv[argc];
+    if (shell_enter_script_params(&frame, argv[1], pargc, pargv) < 0) {
+        kprintf("sh: failed to set positional parameters\n");
+        shell_set_status(1);
+        return;
+    }
+    struct shell_trap_frame trap_frame;
+    if (shell_trap_enter_child(&trap_frame) < 0) {
+        shell_restore_params_from_frame(&frame);
+        shell_set_status(1);
+        return;
+    }
+    int st = shell_run_script_path(argv[1], true);
+    shell_trap_restore(&trap_frame);
+    if (g_shell_flow == SHELL_FLOW_EXIT) {
+        st = g_shell_flow_status;
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+    }
+    shell_restore_params_from_frame(&frame);
+    shell_set_status(st);
+}
+
+static void cmd_dot(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc < 2) {
+        kprintf("usage: . script\n");
+        shell_set_status(2);
+        return;
+    }
+    if (argc <= 2) {
+        shell_set_status(shell_run_script_path(argv[1], false));
+        return;
+    }
+
+    struct shell_param_frame frame;
+    if (shell_enter_dot_params(&frame, argc - 2, &argv[2]) < 0) {
+        kprintf(".: failed to set positional parameters\n");
+        shell_set_status(1);
+        return;
+    }
+    int st = shell_run_script_path(argv[1], false);
+    shell_restore_params_from_frame(&frame);
+    shell_set_status(st);
+}
+
+static void cmd_colon(int argc, char **argv) {
+    (void)argc; (void)argv;
+    shell_set_status(0);
+}
+
+static void shell_print_alias(const struct shell_alias *a) {
+    if (!a || !a->name || !a->value) return;
+    shell_printf("alias %s='", a->name);
+    for (const char *p = a->value; *p; p++) {
+        if (*p == '\'') shell_printf("'\\''");
+        else shell_putc(*p);
+    }
+    shell_printf("'\n");
+}
+
+static void cmd_alias(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) {
+        for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+            if (g_aliases[i].name) shell_print_alias(&g_aliases[i]);
+        }
+        return;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        const char *eq = argv[i];
+        while (*eq && *eq != '=') eq++;
+        if (*eq == '=') {
+            size_t nlen = (size_t)(eq - argv[i]);
+            char name[64];
+            if (nlen == 0 || nlen + 1 > sizeof(name)) {
+                kprintf("alias: bad name '%s'\n", argv[i]);
+                shell_set_status(1);
+                continue;
+            }
+            memcpy(name, argv[i], nlen);
+            name[nlen] = '\0';
+            if (shell_alias_set(name, eq + 1) < 0) {
+                kprintf("alias: failed to set '%s'\n", name);
+                shell_set_status(1);
+            }
+            continue;
+        }
+
+        int idx = shell_alias_find(argv[i]);
+        if (idx < 0) {
+            kprintf("alias: %s not found\n", argv[i]);
+            shell_set_status(1);
+        } else {
+            shell_print_alias(&g_aliases[idx]);
+        }
+    }
+}
+
+static void cmd_unalias(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) {
+        kprintf("usage: unalias [-a] NAME [NAME...]\n");
+        shell_set_status(1);
+        return;
+    }
+    if (strcmp(argv[1], "-a") == 0) {
+        shell_alias_clear_all();
+        return;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (shell_alias_find(argv[i]) < 0) {
+            kprintf("unalias: %s not found\n", argv[i]);
+            shell_set_status(1);
+        } else {
+            shell_alias_unset(argv[i]);
+        }
+    }
+}
+
+static int shell_status_arg(int argc, char **argv, int def, const char *label,
+                            bool *ok) {
+    *ok = true;
+    if (argc <= 1) return def;
+    int v = 0;
+    if (parse_int(argv[1], &v) < 0 || v < 0 || v > 255) {
+        kprintf("%s: numeric argument required\n", label);
+        *ok = false;
+        return 2;
+    }
+    return v;
+}
+
+static void cmd_break(int argc, char **argv) {
+    (void)argv;
+    if (argc > 2) {
+        kprintf("break: too many arguments\n");
+        shell_set_status(2);
+        return;
+    }
+    if (g_shell_loop_depth <= 0) {
+        kprintf("break: not in a loop\n");
+        shell_set_status(1);
+        return;
+    }
+    g_shell_flow = SHELL_FLOW_BREAK;
+    g_shell_flow_status = 0;
+    shell_set_status(0);
+}
+
+static void cmd_continue(int argc, char **argv) {
+    (void)argv;
+    if (argc > 2) {
+        kprintf("continue: too many arguments\n");
+        shell_set_status(2);
+        return;
+    }
+    if (g_shell_loop_depth <= 0) {
+        kprintf("continue: not in a loop\n");
+        shell_set_status(1);
+        return;
+    }
+    g_shell_flow = SHELL_FLOW_CONTINUE;
+    g_shell_flow_status = 0;
+    shell_set_status(0);
+}
+
+static void cmd_return(int argc, char **argv) {
+    if (argc > 2) {
+        kprintf("return: too many arguments\n");
+        shell_set_status(2);
+        return;
+    }
+    if (g_script_depth <= 0) {
+        kprintf("return: not in a script or function\n");
+        shell_set_status(1);
+        return;
+    }
+    bool ok = true;
+    int st = shell_status_arg(argc, argv, g_last_status, "return", &ok);
+    if (!ok) {
+        shell_set_status(st);
+        return;
+    }
+    g_shell_flow = SHELL_FLOW_RETURN;
+    g_shell_flow_status = st;
+    shell_set_status(st);
+}
+
+static void cmd_exit(int argc, char **argv) {
+    if (argc > 2) {
+        kprintf("exit: too many arguments\n");
+        shell_set_status(2);
+        return;
+    }
+    bool ok = true;
+    int st = shell_status_arg(argc, argv, g_last_status, "exit", &ok);
+    if (!ok) {
+        shell_set_status(st);
+        return;
+    }
+    shell_set_status(st);
+    if (g_script_depth > 0 || g_subshell_depth > 0) {
+        g_shell_flow = SHELL_FLOW_EXIT;
+        g_shell_flow_status = st;
+    }
+}
+
+static void cmd_times(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) {
+        kprintf("times: too many arguments\n");
+        shell_set_status(2);
+        return;
+    }
+    uint32_t hz = pit_hz();
+    if (hz == 0) hz = 1;
+    uint64_t t = pit_ticks();
+    uint64_t cs = t * 100 / hz;
+    shell_printf("0m0.00s 0m%lu.%02lus\n",
+                 (unsigned long)(cs / 100),
+                 (unsigned long)(cs % 100));
+    shell_printf("0m0.00s 0m0.00s\n");
+    shell_set_status(0);
+}
+
+static int shell_trap_parse_condition(const char *s, int *out_sig) {
+    if (!s || !*s || !out_sig) return -1;
+    if (strcmp(s, "0") == 0 || strcmp(s, "EXIT") == 0) {
+        *out_sig = 0;
+        return 0;
+    }
+    if (strcmp(s, "INT") == 0 || strcmp(s, "SIGINT") == 0) {
+        *out_sig = SIGINT;
+        return 0;
+    }
+    if (strcmp(s, "TERM") == 0 || strcmp(s, "SIGTERM") == 0) {
+        *out_sig = SIGTERM;
+        return 0;
+    }
+    int v = 0;
+    if (parse_int(s, &v) == 0 && v >= 0 && v < SIG_MAX) {
+        *out_sig = v;
+        return 0;
+    }
+    return -1;
+}
+
+static void shell_print_quoted_trap_action(const char *action) {
+    shell_putc('\'');
+    for (const char *p = action ? action : ""; *p; p++) {
+        if (*p == '\'') shell_printf("'\\''");
+        else shell_putc(*p);
+    }
+    shell_putc('\'');
+}
+
+static void cmd_trap(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) {
+        for (int i = 0; i < SIG_MAX; i++) {
+            if (!g_traps[i]) continue;
+            const char *name = shell_trap_name(i);
+            if (!name) continue;
+            shell_printf("trap -- ");
+            shell_print_quoted_trap_action(g_traps[i]);
+            shell_printf(" %s\n", name);
+        }
+        return;
+    }
+
+    const char *action = argv[1];
+    bool reset = (strcmp(action, "-") == 0);
+    bool ignore = (action[0] == '\0');
+    for (int i = 2; i < argc; i++) {
+        int sig = -1;
+        if (shell_trap_parse_condition(argv[i], &sig) < 0) {
+            kprintf("trap: bad condition '%s'\n", argv[i]);
+            shell_set_status(1);
+            continue;
+        }
+        shell_trap_unset(sig);
+        if (reset || ignore) continue;
+        g_traps[sig] = shell_strdup(action);
+        if (!g_traps[sig]) {
+            shell_set_status(1);
+            return;
+        }
+    }
+}
+
+static void cmd_eval(int argc, char **argv) {
+    if (argc <= 1) {
+        shell_set_status(0);
+        return;
+    }
+    char cmd[LINE_MAX];
+    size_t pos = 0;
+    for (int i = 1; i < argc; i++) {
+        size_t n = strlen(argv[i]);
+        if (pos + n + (i + 1 < argc ? 1 : 0) + 1 > sizeof(cmd)) {
+            kprintf("eval: command too long\n");
+            shell_set_status(2);
+            return;
+        }
+        memcpy(cmd + pos, argv[i], n);
+        pos += n;
+        if (i + 1 < argc) cmd[pos++] = ' ';
+    }
+    cmd[pos] = '\0';
+    execute_line_text(cmd);
+}
+
+static void cmd_exec(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) return;
+    shell_spawn_program(argv[1], argc - 1, &argv[1], /*background=*/false);
+    if (g_last_status == 0 && g_script_depth > 0) {
+        g_shell_flow = SHELL_FLOW_EXIT;
+        g_shell_flow_status = 0;
+    }
+}
+
+static void cmd_command(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc < 2) return;
+
+    bool verbose = false;
+    bool locate = false;
+    int i = 1;
+    if (strcmp(argv[i], "-v") == 0) {
+        locate = true;
+        i++;
+    } else if (strcmp(argv[i], "-V") == 0) {
+        verbose = true;
+        i++;
+    }
+    if (i >= argc) {
+        shell_set_status(0);
+        return;
+    }
+
+    if (locate || verbose) {
+        int rc = 0;
+        for (; i < argc; i++) {
+            bool found = false;
+            int aidx = shell_alias_find(argv[i]);
+            if (aidx >= 0) {
+                if (verbose) {
+                    shell_printf("%s is an alias for '%s'\n",
+                                 argv[i], g_aliases[aidx].value);
+                } else {
+                    shell_print_alias(&g_aliases[aidx]);
+                }
+                found = true;
+            }
+            if (found) continue;
+            struct shell_function *fn = shell_function_lookup(argv[i]);
+            if (fn) {
+                shell_printf(verbose ? "%s is a shell function\n" : "%s\n",
+                             argv[i]);
+                found = true;
+            }
+            if (found) continue;
+            for (const struct cmd *c = cmds; c->name; c++) {
+                if (strcmp(argv[i], c->name) == 0) {
+                    if (verbose && shell_special_builtin_name(c->name)) {
+                        shell_printf("%s is a special shell builtin\n",
+                                     argv[i]);
+                    } else {
+                        shell_printf(verbose ? "%s is a shell builtin\n"
+                                             : "%s\n",
+                                     argv[i]);
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if (found) continue;
+            char path_buf[64];
+            const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
+            if (path_is_file(path)) {
+                shell_printf(verbose ? "%s is %s\n" : "%s\n", argv[i], path);
+            } else {
+                rc = 1;
+            }
+        }
+        shell_set_status(rc);
+        return;
+    }
+
+    shell_spawn_program_profile(argv[i], argc - i, &argv[i],
+                                /*background=*/false, /*profile=*/0);
+}
+
+static void cmd_type(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc < 2) {
+        shell_printf("usage: type NAME [NAME...]\n");
+        shell_set_status(1);
+        return;
+    }
+    for (int i = 1; i < argc; i++) {
+        bool found = false;
+        int aidx = shell_alias_find(argv[i]);
+        if (aidx >= 0) {
+            shell_printf("%s is an alias for '%s'\n",
+                         argv[i], g_aliases[aidx].value);
+            found = true;
+        }
+        if (found) continue;
+
+        struct shell_function *fn = shell_function_lookup(argv[i]);
+        if (fn) {
+            shell_printf("%s is a shell function\n", argv[i]);
+            found = true;
+        }
+        if (found) continue;
+
+        for (const struct cmd *c = cmds; c->name; c++) {
+            if (strcmp(argv[i], c->name) == 0) {
+                if (shell_special_builtin_name(c->name)) {
+                    shell_printf("%s is a special shell builtin\n", argv[i]);
+                } else {
+                    shell_printf("%s is a shell builtin\n", argv[i]);
+                }
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+
+        char path_buf[64];
+        const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
+        if (path_is_file(path)) {
+            shell_printf("%s is %s\n", argv[i], path);
+        } else {
+            shell_printf("%s: not found\n", argv[i]);
+            shell_set_status(1);
+        }
+    }
+}
+
+static void cmd_which(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc < 2) {
+        shell_printf("usage: which NAME [NAME...]\n");
+        shell_set_status(1);
+        return;
+    }
+    for (int i = 1; i < argc; i++) {
+        char path_buf[64];
+        const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
+        if (path_is_file(path)) {
+            shell_printf("%s\n", path);
+        } else {
+            shell_printf("%s not found\n", argv[i]);
+            shell_set_status(1);
+        }
+    }
+}
+
 static const struct cmd cmds[] = {
     { "help",   "list available commands",      cmd_help   },
     { "clear",  "clear the screen",             cmd_clear  },
     { "echo",   "print arguments",              cmd_echo   },
+    { ":",      ": null command",                cmd_colon  },
+    { "alias",  "alias [NAME=VALUE...]: define or list aliases", cmd_alias },
+    { "unalias","unalias [-a] NAME...: remove aliases", cmd_unalias },
+    { "break",  "break: leave the innermost loop", cmd_break },
+    { "continue","continue: start next loop iteration", cmd_continue },
+    { "return", "return [n]: return from script/function", cmd_return },
+    { "exit",   "exit [n]: leave the current script", cmd_exit },
+    { "eval",   "eval ARG...: execute concatenated arguments", cmd_eval },
+    { "exec",   "exec [cmd args...]: execute command from shell", cmd_exec },
+    { "command","command [-v|-V] NAME...: command lookup/run", cmd_command },
+    { "sh",     "sh [-c cmd]|script: run shell text", cmd_sh },
+    { ".",      ". script: run script in this shell", cmd_dot },
+    { "type",   "type NAME...: describe command resolution", cmd_type },
+    { "which",  "which NAME...: print resolved program path", cmd_which },
+    { "pwd",    "print current directory",       cmd_pwd    },
+    { "cd",     "cd [dir|-]: change current directory", cmd_cd },
     { "env",      "env [K=V ...]: print or set environment vars (M25C)", cmd_env      },
+    { "export",   "export [NAME[=VALUE]...]: set shell environment",     cmd_export   },
+    { "readonly", "readonly [NAME[=VALUE]...]: mark variables readonly", cmd_readonly },
+    { "unset",    "unset NAME [NAME...]: remove shell variables",         cmd_unset    },
+    { "set",      "set [NAME=VALUE...]: print or set shell variables",    cmd_set      },
+    { "shift",    "shift [n]: shift positional parameters",              cmd_shift    },
+    { "getopts",  "getopts optstring NAME [ARG...]: parse option args",   cmd_getopts  },
+    { "read",     "read [-r] NAME...: read a line from standard input",   cmd_read     },
+    { "times",    "times: print shell timing summary",                   cmd_times    },
+    { "trap",     "trap [action condition...]: set shell traps",          cmd_trap     },
     { "setenv",   "setenv KEY VALUE: set an environment var (M25C)",     cmd_setenv   },
     { "unsetenv", "unsetenv KEY: remove an environment var (M25C)",      cmd_unsetenv },
+    { "true",   "return successful status",      cmd_true   },
+    { "false",  "return failing status",         cmd_false  },
     { "mem",    "show pmm + heap stats",        cmd_mem    },
     { "uptime", "show seconds since boot",      cmd_uptime },
     { "about",  "kernel info",                  cmd_about  },
@@ -2226,6 +4265,7 @@ static const struct cmd cmds[] = {
     { "run",    "run <path> [args]: spawn ring-3 process (fg)", cmd_run},
     { "jobs",   "list active background jobs",   cmd_jobs   },
     { "fg",     "fg <job_id>: bring bg job to foreground",  cmd_fg },
+    { "wait",   "wait [pid|%job...]: wait for background jobs", cmd_wait },
     { "ps",     "list processes with cpu/syscalls/pages", cmd_ps },
     { "top",    "top [-n iters] [-d ms]: live process stats",  cmd_top  },
     { "time",   "time <cmd> [args]: measure wall + cpu + syscalls", cmd_time },
@@ -2269,31 +4309,86 @@ static const struct cmd cmds[] = {
 /* ---- line editing + dispatch ---- */
 
 static inline bool is_space(char c) {
-    return c == ' ' || c == '\t';
-}
-
-static int tokenize(char *s, char **argv, int argv_max) {
-    int argc = 0;
-    while (*s) {
-        while (is_space(*s)) s++;
-        if (!*s) break;
-        if (argc >= argv_max) break;       /* drop overflow tokens */
-        argv[argc++] = s;
-        while (*s && !is_space(*s)) s++;
-        if (*s) *s++ = '\0';
-    }
-    return argc;
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
 static void prompt(void) {
     console_set_color(0x0066FF66);   /* greenish */
-    kprintf("tobyOS> ");
+    const char *user = env_get("USER");
+    if (!user || !*user) user = "toby";
+    const char *cwd = shell_cwd();
+    struct proc *p = current_proc();
+    char sigil = (p && p->uid == 0) ? '#' : '$';
+    shell_printf("%s@tobyOS:%s%c ", user, cwd, sigil);
     console_set_color(0x00CCCCCC);
 }
 
-/* ---- pipeline support (milestone 7) ---- */
+/* ---- POSIX-ish command execution -------------------------------- */
 
 #define PIPE_BIN_PREFIX "/bin/"
+#define SHELL_TOKEN_MAX 96
+#define SHELL_STAGE_MAX 8
+#define SHELL_PARSE_BUF_MAX (LINE_MAX * 2)
+#define SHELL_REDIR_MAX 8
+
+enum shell_tok_type {
+    SH_TOK_WORD = 1,
+    SH_TOK_SEMI,
+    SH_TOK_BG,
+    SH_TOK_PIPE,
+    SH_TOK_AND_IF,
+    SH_TOK_OR_IF,
+    SH_TOK_REDIR_IN,
+    SH_TOK_HEREDOC,
+    SH_TOK_HEREDOC_TABS,
+    SH_TOK_REDIR_OUT,
+    SH_TOK_REDIR_APPEND,
+    SH_TOK_DUP_IN,
+    SH_TOK_DUP_OUT,
+};
+
+enum shell_redir_op {
+    SH_RD_OPEN_IN = 1,
+    SH_RD_HEREDOC,
+    SH_RD_OPEN_OUT,
+    SH_RD_OPEN_APPEND,
+    SH_RD_DUP_IN,
+    SH_RD_DUP_OUT,
+    SH_RD_CLOSE,
+};
+
+struct shell_token {
+    enum shell_tok_type type;
+    char *text;
+    bool quoted;
+    int fd;
+};
+
+struct shell_redir {
+    enum shell_redir_op op;
+    int fd;
+    int target_fd;
+    const char *path;
+    const char *text;
+};
+
+struct shell_simple {
+    int argc;
+    char *argv[ARG_MAX];
+    const char *stdin_path;
+    const char *stdin_text;
+    const char *stdout_path;
+    bool stdout_append;
+    int redir_count;
+    struct shell_redir redir[SHELL_REDIR_MAX];
+};
+
+struct shell_pipeline {
+    int count;
+    struct shell_simple stage[SHELL_STAGE_MAX];
+    char expand_buf[SHELL_PARSE_BUF_MAX];
+    size_t expand_pos;
+};
 
 /* Build "<prefix>/<name>" into out_buf and return a pointer to it,
  * skipping a redundant slash if `prefix` already ends in one. Returns
@@ -2365,140 +4460,35 @@ static const char *resolve_program(const char *name, char *out_buf,
     return name;
 }
 
-/* Execute a 2-stage pipeline: stage_a's stdout connected to stage_b's
- * stdin via a fresh kernel pipe.
- *
- * Both stages are spawned as user-mode ELFs (auto-prefixed with /bin/
- * if they don't already contain a slash). Builtins are NOT supported on
- * the LHS or RHS of a pipe in milestone 7 -- you write a pipeline as
- *   echo hello | cat
- * and we execute /bin/echo and /bin/cat as real ring-3 processes. */
-static void run_pipeline(int argc_a, char **argv_a,
-                         int argc_b, char **argv_b) {
-    if (argc_a == 0 || argc_b == 0) {
-        kprintf("pipeline: empty stage\n");
-        return;
-    }
-
-    char path_a_buf[64], path_b_buf[64];
-    const char *path_a = resolve_program(argv_a[0], path_a_buf, sizeof(path_a_buf));
-    const char *path_b = resolve_program(argv_b[0], path_b_buf, sizeof(path_b_buf));
-
-    /* Create the connecting pipe -- both ends are owned by the shell
-     * for now; we bump their counts via file_clone() when handing them
-     * to the spawned procs. */
-    struct file *r = 0, *w = 0;
-    if (pipe_create(&r, &w) != 0) {
-        kprintf("pipeline: pipe_create failed (OOM?)\n");
-        return;
-    }
-
-    /* Stage A: stdin = console default, stdout = pipe write end. */
-    struct proc_spec spec_a = {
-        .path = path_a, .name = argv_a[0],
-        .fd0  = 0,   /* default: console */
-        .fd1  = w,   /* clone bumps writers */
-        .fd2  = 0,
-        .argc = argc_a, .argv = argv_a,
-        .envc = g_envc, .envp = g_env,    /* M25C */
-    };
-    int pid_a = proc_spawn(&spec_a);
-    if (pid_a < 0) {
-        kprintf("pipeline: failed to spawn '%s'\n", path_a);
-        file_close(r); file_close(w);
-        return;
-    }
-
-    /* Stage B: stdin = pipe read end, stdout = console default. */
-    struct proc_spec spec_b = {
-        .path = path_b, .name = argv_b[0],
-        .fd0  = r,
-        .fd1  = 0,
-        .fd2  = 0,
-        .argc = argc_b, .argv = argv_b,
-        .envc = g_envc, .envp = g_env,    /* M25C */
-    };
-    int pid_b = proc_spawn(&spec_b);
-    if (pid_b < 0) {
-        kprintf("pipeline: failed to spawn '%s'\n", path_b);
-        file_close(r); file_close(w);
-        /* Stage A is already running; the easiest correct cleanup is
-         * to close the shell's pipe ends (so A sees EPIPE on its next
-         * write and exits) and then wait for it. */
-        (void)proc_wait(pid_a);
-        return;
-    }
-
-    /* Drop the shell's own refs to the pipe so the child processes are
-     * the only ones holding it. This is critical: if we kept r alive,
-     * /bin/cat would never see EOF (writers >= 1 -- us). */
-    file_close(r);
-    file_close(w);
-
-    /* Wait for both. Order doesn't matter; the writer (pid_a) will
-     * usually finish first, and its proc_exit closes its inherited
-     * write end -- waking pid_b's blocked read with EOF. */
-    int rc_a = proc_wait(pid_a);
-    int rc_b = proc_wait(pid_b);
-    kprintf("pipeline: '%s' (pid=%d, rc=%d) | '%s' (pid=%d, rc=%d)\n",
-            argv_a[0], pid_a, rc_a, argv_b[0], pid_b, rc_b);
-}
-
-/* Returns true if any token in argv[0..argc-1] is the literal "|". */
-static int find_pipe_token(int argc, char **argv) {
-    for (int i = 0; i < argc; i++) {
-        if (argv[i][0] == '|' && argv[i][1] == '\0') return i;
-    }
-    return -1;
-}
-
-/* Shared spawn-a-user-program helper used by both `cmd_run` and the
- * implicit-ELF dispatch in execute_line. Resolves a name via /bin/
- * if it doesn't already contain a slash, spawns it with the given
- * argv, and either:
- *   - fg: registers as foreground (so Ctrl+C lands on it),
- *         proc_wait()s, clears foreground, prints the exit code.
- *   - bg: registers in the job table and returns immediately. The
- *         child runs concurrently with the shell prompt; reaping
- *         happens lazily in shell_poll() via jobs_reap_finished. */
-static void shell_spawn_program(const char *path_arg, int argc, char **argv,
-                                bool background) {
-    shell_spawn_program_profile(path_arg, argc, argv, background,
-                                /*profile=*/0);
-}
-
-/* Same as shell_spawn_program, but narrows the child's capabilities /
- * sandbox root via `profile`. NULL or empty profile = inherit from the
- * shell (which is pid 0's child and so usually has admin -- fine for
- * an interactive shell). Unknown profile name is an error, reported
- * by cap_profile_apply() inside proc_spawn. */
-static void shell_spawn_program_profile(const char *path_arg, int argc,
-                                        char **argv, bool background,
-                                        const char *profile) {
+static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
+                                           char **argv, bool background,
+                                           const char *profile,
+                                           struct file *fd0,
+                                           struct file *fd1,
+                                           struct file *fd2,
+                                           int envc, char **envp) {
     char path_buf[64];
     const char *path = resolve_program(path_arg, path_buf, sizeof(path_buf));
 
-    /* Pass argv straight through: argv[0] is the user-typed name (no
-     * /bin/ prefix), which is what /bin/echo etc. expect to see. */
     struct proc_spec spec = {
         .path = path,
         .name = argv[0],
-        .fd0  = 0, .fd1 = 0, .fd2 = 0,    /* console defaults */
+        .fd0  = fd0, .fd1 = fd1, .fd2 = fd2,
         .argc = argc,
         .argv = argv,
-        /* Milestone 25C: pipe the shell environment to every child so
-         * libtoby getenv()/environ pick up PATH, HOME, etc. immediately. */
-        .envc = g_envc,
-        .envp = g_env,
+        .envc = envc,
+        .envp = envp,
         .sandbox_profile = profile,
+        .cwd = shell_cwd(),
     };
     int pid = proc_spawn(&spec);
     if (pid < 0) {
         kprintf("spawn: failed to launch '%s'\n", path);
-        return;
+        return 127;
     }
 
     if (background) {
+        g_last_bg_pid = pid;
         int jid = jobs_add(pid, argv[0]);
         if (jid < 0) {
             /* Out of job slots -- still leave the proc running, but warn
@@ -2510,74 +4500,3245 @@ static void shell_spawn_program_profile(const char *path_arg, int argc,
         } else {
             kprintf("[%d] %d  '%s' &\n", jid, pid, argv[0]);
         }
-        return;
+        return 0;
     }
 
-    /* Foreground: own Ctrl+C until the child exits. */
     signal_set_foreground(pid);
     int rc = proc_wait(pid);
     signal_set_foreground(0);
-    kprintf("'%s' (pid=%d) returned %d (0x%x)\n",
-            argv[0], pid, rc, (unsigned)rc);
+    return rc;
 }
 
-static void execute_line(void) {
-    char *argv[ARG_MAX];
-    int argc = tokenize(line, argv, ARG_MAX);
-    if (argc == 0) return;             /* blank line */
+static void shell_spawn_program(const char *path_arg, int argc, char **argv,
+                                bool background) {
+    int rc = shell_spawn_program_profile_fds(path_arg, argc, argv, background,
+                                             /*profile=*/0,
+                                             g_shell_fd[0], g_shell_fd[1],
+                                             g_shell_fd[2],
+                                             g_envc, g_env);
+    shell_set_status(rc);
+}
 
-    /* Trailing `&` strips off and turns this into a background launch.
-     * Only meaningful for user-program dispatch -- builtins reject `&`
-     * (they run synchronously inside the shell), and pipelines + `&`
-     * are intentionally out of scope for milestone 8. */
-    bool background = false;
-    if (argv[argc - 1][0] == '&' && argv[argc - 1][1] == '\0') {
-        argc--;
-        background = true;
-        if (argc == 0) {
-            kprintf("'&' must follow a command\n");
-            return;
+static void shell_spawn_program_profile(const char *path_arg, int argc,
+                                        char **argv, bool background,
+                                        const char *profile) {
+    int rc = shell_spawn_program_profile_fds(path_arg, argc, argv, background,
+                                             profile,
+                                             g_shell_fd[0], g_shell_fd[1],
+                                             g_shell_fd[2],
+                                             g_envc, g_env);
+    shell_set_status(rc);
+}
+
+static int shell_append_char(char *buf, size_t *pos, size_t cap, char c) {
+    if (*pos + 1 >= cap) return -1;
+    buf[(*pos)++] = c;
+    return 0;
+}
+
+static int shell_append_str(char *buf, size_t *pos, size_t cap,
+                            const char *s) {
+    if (!s) return 0;
+    while (*s) {
+        if (shell_append_char(buf, pos, cap, *s++) < 0) return -1;
+    }
+    return 0;
+}
+
+static int shell_append_uint(char *buf, size_t *pos, size_t cap,
+                             unsigned long v) {
+    char tmp[32];
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v && n < (int)sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (v % 10UL));
+        v /= 10UL;
+    }
+    while (n > 0) {
+        if (shell_append_char(buf, pos, cap, tmp[--n]) < 0) return -1;
+    }
+    return 0;
+}
+
+struct shell_capture {
+    char *buf;
+    size_t cap;
+    size_t pos;
+    bool overflow;
+};
+
+static void shell_capture_char(struct shell_capture *cap, char c) {
+    if (!cap || !cap->buf || cap->cap == 0) return;
+    if (cap->pos + 1 >= cap->cap) {
+        cap->overflow = true;
+        return;
+    }
+    cap->buf[cap->pos++] = c;
+    cap->buf[cap->pos] = '\0';
+}
+
+static void shell_capture_write(const char *s, void *ctx) {
+    struct shell_capture *cap = (struct shell_capture *)ctx;
+    if (!s) return;
+    while (*s) shell_capture_char(cap, *s++);
+}
+
+static void shell_capture_kputc(void *ctx, char c) {
+    shell_capture_char((struct shell_capture *)ctx, c);
+}
+
+static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
+    if (!cmd || !out || out_cap == 0) return -1;
+
+    struct shell_capture cap = { .buf = out, .cap = out_cap, .pos = 0 };
+    out[0] = '\0';
+
+    shell_write_fn_t old_out = g_shell_out;
+    void *old_out_ctx = g_shell_out_ctx;
+    void (*old_sink)(void *ctx, char c) = 0;
+    void *old_sink_ctx = 0;
+    bool old_sink_suppress = false;
+
+    printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
+    shell_set_output(shell_capture_write, &cap);
+    printk_set_sink_mode(shell_capture_kputc, &cap, true);
+
+    execute_line_text(cmd);
+
+    printk_set_sink_mode(old_sink, old_sink_ctx, old_sink_suppress);
+    shell_set_output(old_out, old_out_ctx);
+
+    while (cap.pos > 0 &&
+           (cap.buf[cap.pos - 1] == '\n' || cap.buf[cap.pos - 1] == '\r')) {
+        cap.buf[--cap.pos] = '\0';
+    }
+    if (cap.overflow) {
+        kprintf("shell: command substitution output truncated\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int shell_parse_command_subst(const char **pp, char *cmd,
+                                     size_t cmd_cap) {
+    const char *p = *pp;
+    if (p[0] != '$' || p[1] != '(') return -1;
+    p += 2;
+
+    size_t pos = 0;
+    int depth = 1;
+    while (*p) {
+        if (*p == '\'') {
+            if (pos + 1 >= cmd_cap) return -1;
+            cmd[pos++] = *p++;
+            while (*p && *p != '\'') {
+                if (pos + 1 >= cmd_cap) return -1;
+                cmd[pos++] = *p++;
+            }
+            if (*p == '\'') {
+                if (pos + 1 >= cmd_cap) return -1;
+                cmd[pos++] = *p++;
+            }
+            continue;
+        }
+        if (*p == '"') {
+            if (pos + 1 >= cmd_cap) return -1;
+            cmd[pos++] = *p++;
+            while (*p && *p != '"') {
+                if (p[0] == '$' && p[1] == '(') depth++;
+                if (*p == ')' && depth > 1) depth--;
+                if (pos + 1 >= cmd_cap) return -1;
+                cmd[pos++] = *p++;
+            }
+            if (*p == '"') {
+                if (pos + 1 >= cmd_cap) return -1;
+                cmd[pos++] = *p++;
+            }
+            continue;
+        }
+        if (p[0] == '$' && p[1] == '(') {
+            depth++;
+            if (pos + 2 >= cmd_cap) return -1;
+            cmd[pos++] = *p++;
+            cmd[pos++] = *p++;
+            continue;
+        }
+        if (*p == ')') {
+            depth--;
+            if (depth == 0) {
+                p++;
+                cmd[pos] = '\0';
+                *pp = p;
+                return 0;
+            }
+        }
+        if (pos + 1 >= cmd_cap) return -1;
+        cmd[pos++] = *p++;
+    }
+    return -1;
+}
+
+static int shell_expand_command_subst(const char **pp, char *buf,
+                                      size_t *pos, size_t cap) {
+    char cmd[LINE_MAX];
+    char out[SHELL_PARSE_BUF_MAX];
+    if (shell_parse_command_subst(pp, cmd, sizeof(cmd)) < 0) {
+        kprintf("shell: bad command substitution\n");
+        return -1;
+    }
+    if (shell_capture_command(cmd, out, sizeof(out)) < 0) return -1;
+    return shell_append_str(buf, pos, cap, out);
+}
+
+static int shell_expand_backtick(const char **pp, char *buf,
+                                 size_t *pos, size_t cap) {
+    const char *p = *pp;
+    if (*p != '`') return -1;
+    p++;
+
+    char cmd[LINE_MAX];
+    size_t cpos = 0;
+    while (*p && *p != '`') {
+        if (*p == '\\' && p[1]) p++;
+        if (cpos + 1 >= sizeof(cmd)) {
+            kprintf("shell: command substitution too long\n");
+            return -1;
+        }
+        cmd[cpos++] = *p++;
+    }
+    if (*p != '`') {
+        kprintf("shell: unmatched backquote\n");
+        return -1;
+    }
+    p++;
+    cmd[cpos] = '\0';
+    *pp = p;
+
+    char out[SHELL_PARSE_BUF_MAX];
+    if (shell_capture_command(cmd, out, sizeof(out)) < 0) return -1;
+    return shell_append_str(buf, pos, cap, out);
+}
+
+static int shell_expand_var(const char **pp, char *buf, size_t *pos,
+                            size_t cap);
+
+static bool shell_var_start(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+static bool shell_var_char(char c) {
+    return shell_var_start(c) || (c >= '0' && c <= '9');
+}
+
+static int shell_append_positional_join(char *buf, size_t *pos, size_t cap) {
+    for (int i = 0; i < g_positional_count; i++) {
+        if (i > 0 && shell_append_char(buf, pos, cap, ' ') < 0) return -1;
+        if (shell_append_str(buf, pos, cap, g_positional[i]) < 0) return -1;
+    }
+    return 0;
+}
+
+static int shell_parameter_value(const char *name, char *out, size_t cap,
+                                 bool *is_set) {
+    size_t pos = 0;
+    if (!name || !out || cap == 0 || !is_set) return -1;
+    out[0] = '\0';
+    *is_set = true;
+
+    if (strcmp(name, "?") == 0) {
+        return shell_append_uint(out, &pos, cap, (unsigned long)g_last_status);
+    }
+    if (strcmp(name, "!") == 0) {
+        return shell_append_uint(out, &pos, cap, (unsigned long)g_last_bg_pid);
+    }
+    if (strcmp(name, "$") == 0) {
+        struct proc *cur = current_proc();
+        return shell_append_uint(out, &pos, cap,
+                                 (unsigned long)(cur ? cur->pid : 0));
+    }
+    if (strcmp(name, "#") == 0) {
+        return shell_append_uint(out, &pos, cap,
+                                 (unsigned long)g_positional_count);
+    }
+    if (strcmp(name, "@") == 0 || strcmp(name, "*") == 0) {
+        return shell_append_positional_join(out, &pos, cap);
+    }
+    if (name[0] >= '0' && name[0] <= '9' && name[1] == '\0') {
+        int idx = name[0] - '0';
+        if (idx == 0) {
+            const char *p0 = g_param0 ? g_param0 : "tobysh";
+            return shell_append_str(out, &pos, cap, p0);
+        }
+        if (idx <= g_positional_count) {
+            return shell_append_str(out, &pos, cap, g_positional[idx - 1]);
+        }
+        *is_set = false;
+        return 0;
+    }
+
+    const char *v = env_get(name);
+    if (!v) {
+        *is_set = false;
+        return 0;
+    }
+    return shell_append_str(out, &pos, cap, v);
+}
+
+static int shell_expand_param_word(const char *word, char *out, size_t cap) {
+    const char *p = word ? word : "";
+    size_t pos = 0;
+    if (!out || cap == 0) return -1;
+    out[0] = '\0';
+
+    while (*p) {
+        if (*p == '$') {
+            if (shell_expand_var(&p, out, &pos, cap) < 0) return -1;
+            continue;
+        }
+        if (*p == '`') {
+            if (shell_expand_backtick(&p, out, &pos, cap) < 0) return -1;
+            continue;
+        }
+        if (*p == '\\' && p[1]) p++;
+        if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+    }
+    out[pos] = '\0';
+    return 0;
+}
+
+static int shell_parse_braced_name(const char *expr, size_t *name_len) {
+    if (!expr || !*expr || !name_len) return -1;
+    if (expr[0] == '?' || expr[0] == '$' || expr[0] == '#' ||
+        expr[0] == '@' || expr[0] == '*') {
+        *name_len = 1;
+        return 0;
+    }
+    if (expr[0] >= '0' && expr[0] <= '9') {
+        *name_len = 1;
+        return 0;
+    }
+    if (!shell_var_start(expr[0])) return -1;
+    size_t n = 1;
+    while (shell_var_char(expr[n])) n++;
+    *name_len = n;
+    return 0;
+}
+
+static int shell_expand_braced_parameter(const char *expr, char *buf,
+                                         size_t *pos, size_t cap) {
+    if (!expr) return -1;
+
+    bool length_mode = false;
+    if (expr[0] == '#' && expr[1] != '\0' && expr[1] != '-' &&
+        expr[1] != '=' && expr[1] != '?' && expr[1] != '+') {
+        length_mode = true;
+        expr++;
+    }
+
+    size_t name_len = 0;
+    if (shell_parse_braced_name(expr, &name_len) < 0) {
+        kprintf("shell: bad substitution\n");
+        return -1;
+    }
+
+    char name[64];
+    if (name_len + 1 > sizeof(name)) {
+        kprintf("shell: parameter name too long\n");
+        return -1;
+    }
+    memcpy(name, expr, name_len);
+    name[name_len] = '\0';
+
+    const char *op = expr + name_len;
+    bool colon = false;
+    char opch = '\0';
+    const char *word = "";
+    if (*op) {
+        if (*op == ':') {
+            colon = true;
+            op++;
+        }
+        if (*op == '-' || *op == '=' || *op == '?' || *op == '+') {
+            opch = *op++;
+            word = op;
+        } else {
+            kprintf("shell: bad substitution\n");
+            return -1;
         }
     }
 
-    /* Pipeline path: "<cmd_a args...> | <cmd_b args...>". */
-    int pipe_at = find_pipe_token(argc, argv);
-    if (pipe_at >= 0) {
-        if (background) {
-            kprintf("pipeline: '&' on pipelines not supported in this milestone\n");
-            return;
+    char value[SHELL_PARSE_BUF_MAX];
+    bool is_set = false;
+    if (shell_parameter_value(name, value, sizeof(value), &is_set) < 0) {
+        kprintf("shell: parameter expansion too long\n");
+        return -1;
+    }
+    bool is_null = (value[0] == '\0');
+
+    if (length_mode) {
+        return shell_append_uint(buf, pos, cap, (unsigned long)strlen(value));
+    }
+
+    if (opch == '\0') {
+        return shell_append_str(buf, pos, cap, value);
+    }
+
+    bool missing = !is_set || (colon && is_null);
+    char expanded_word[SHELL_PARSE_BUF_MAX];
+    expanded_word[0] = '\0';
+
+    switch (opch) {
+    case '-':
+        if (!missing) return shell_append_str(buf, pos, cap, value);
+        if (shell_expand_param_word(word, expanded_word,
+                                    sizeof(expanded_word)) < 0) return -1;
+        return shell_append_str(buf, pos, cap, expanded_word);
+    case '=':
+        if (!missing) return shell_append_str(buf, pos, cap, value);
+        if (!shell_var_start(name[0])) {
+            kprintf("shell: cannot assign to special parameter\n");
+            return -1;
         }
-        if (pipe_at == 0 || pipe_at == argc - 1) {
-            kprintf("pipeline: '|' needs a command on both sides\n");
-            return;
+        if (shell_expand_param_word(word, expanded_word,
+                                    sizeof(expanded_word)) < 0) return -1;
+        if (env_set(name, expanded_word) < 0) {
+            kprintf("shell: failed to assign '%s'\n", name);
+            return -1;
         }
-        if (find_pipe_token(argc - pipe_at - 1, argv + pipe_at + 1) >= 0) {
-            kprintf("pipeline: only one '|' supported (got >=2)\n");
-            return;
+        return shell_append_str(buf, pos, cap, expanded_word);
+    case '?':
+        if (!missing) return shell_append_str(buf, pos, cap, value);
+        if (shell_expand_param_word(word, expanded_word,
+                                    sizeof(expanded_word)) < 0) return -1;
+        kprintf("shell: %s: %s\n", name,
+                expanded_word[0] ? expanded_word : "parameter null or not set");
+        return -1;
+    case '+':
+        if (missing) return 0;
+        if (shell_expand_param_word(word, expanded_word,
+                                    sizeof(expanded_word)) < 0) return -1;
+        return shell_append_str(buf, pos, cap, expanded_word);
+    default:
+        return -1;
+    }
+}
+
+struct shell_arith {
+    const char *p;
+    bool ok;
+};
+
+static void shell_arith_skip(struct shell_arith *a) {
+    while (*a->p == ' ' || *a->p == '\t') a->p++;
+}
+
+static long shell_arith_expr(struct shell_arith *a);
+
+static long shell_parse_long_value(const char *s, bool *ok) {
+    long v = 0;
+    bool neg = false;
+    *ok = false;
+    if (!s) return 0;
+    if (*s == '-') {
+        neg = true;
+        s++;
+    }
+    if (*s < '0' || *s > '9') return 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (*s - '0');
+        s++;
+    }
+    if (*s) return 0;
+    *ok = true;
+    return neg ? -v : v;
+}
+
+static long shell_arith_factor(struct shell_arith *a) {
+    shell_arith_skip(a);
+    if (*a->p == '+') {
+        a->p++;
+        return shell_arith_factor(a);
+    }
+    if (*a->p == '-') {
+        a->p++;
+        return -shell_arith_factor(a);
+    }
+    if (*a->p == '(') {
+        a->p++;
+        long v = shell_arith_expr(a);
+        shell_arith_skip(a);
+        if (*a->p != ')') {
+            a->ok = false;
+            return 0;
         }
-        argv[pipe_at] = 0;
-        run_pipeline(pipe_at,            argv,
-                     argc - pipe_at - 1, argv + pipe_at + 1);
+        a->p++;
+        return v;
+    }
+    if (*a->p >= '0' && *a->p <= '9') {
+        long v = 0;
+        while (*a->p >= '0' && *a->p <= '9') {
+            v = v * 10 + (*a->p - '0');
+            a->p++;
+        }
+        return v;
+    }
+    if (shell_var_start(*a->p)) {
+        char name[64];
+        size_t n = 0;
+        while (shell_var_char(*a->p) && n + 1 < sizeof(name)) {
+            name[n++] = *a->p++;
+        }
+        name[n] = '\0';
+        const char *vstr = env_get(name);
+        bool ok = false;
+        long v = shell_parse_long_value(vstr ? vstr : "0", &ok);
+        if (!ok) v = 0;
+        return v;
+    }
+    a->ok = false;
+    return 0;
+}
+
+static long shell_arith_term(struct shell_arith *a) {
+    long v = shell_arith_factor(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        char op = *a->p;
+        if (op != '*' && op != '/' && op != '%') break;
+        a->p++;
+        long rhs = shell_arith_factor(a);
+        if (!a->ok) return 0;
+        if ((op == '/' || op == '%') && rhs == 0) {
+            a->ok = false;
+            return 0;
+        }
+        if (op == '*') v *= rhs;
+        else if (op == '/') v /= rhs;
+        else v %= rhs;
+    }
+    return v;
+}
+
+static long shell_arith_expr(struct shell_arith *a) {
+    long v = shell_arith_term(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        char op = *a->p;
+        if (op != '+' && op != '-') break;
+        a->p++;
+        long rhs = shell_arith_term(a);
+        if (!a->ok) return 0;
+        if (op == '+') v += rhs;
+        else v -= rhs;
+    }
+    return v;
+}
+
+static int shell_append_long(char *buf, size_t *pos, size_t cap, long v) {
+    if (v < 0) {
+        if (shell_append_char(buf, pos, cap, '-') < 0) return -1;
+        return shell_append_uint(buf, pos, cap, (unsigned long)(-v));
+    }
+    return shell_append_uint(buf, pos, cap, (unsigned long)v);
+}
+
+static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
+                              size_t cap) {
+    const char *p = *pp;
+    if (p[0] != '$' || p[1] != '(' || p[2] != '(') return -1;
+    p += 3;
+
+    char expr[128];
+    size_t epos = 0;
+    int paren_depth = 0;
+    while (*p) {
+        if (*p == '(') {
+            paren_depth++;
+        } else if (*p == ')') {
+            if (paren_depth == 0 && p[1] == ')') {
+                p += 2;
+                expr[epos] = '\0';
+                *pp = p;
+                struct shell_arith a = { .p = expr, .ok = true };
+                long v = shell_arith_expr(&a);
+                shell_arith_skip(&a);
+                if (!a.ok || *a.p != '\0') {
+                    kprintf("shell: bad arithmetic expansion\n");
+                    return -1;
+                }
+                return shell_append_long(buf, pos, cap, v);
+            }
+            if (paren_depth > 0) paren_depth--;
+        }
+        if (epos + 1 >= sizeof(expr)) {
+            kprintf("shell: arithmetic expression too long\n");
+            return -1;
+        }
+        expr[epos++] = *p++;
+    }
+    kprintf("shell: unterminated arithmetic expansion\n");
+    return -1;
+}
+
+static bool shell_operator_char(char c) {
+    return c == ';' || c == '&' || c == '|' || c == '<' || c == '>';
+}
+
+static int shell_expand_var(const char **pp, char *buf, size_t *pos,
+                            size_t cap) {
+    const char *p = *pp;
+    if (*p != '$') return shell_append_char(buf, pos, cap, *p++);
+    p++;
+
+    if (*p == '(' && p[1] == '(') {
+        p--;
+        *pp = p;
+        return shell_expand_arith(pp, buf, pos, cap);
+    }
+    if (*p == '(') {
+        p--;
+        *pp = p;
+        return shell_expand_command_subst(pp, buf, pos, cap);
+    }
+    if (*p == '?') {
+        p++;
+        *pp = p;
+        return shell_append_uint(buf, pos, cap, (unsigned long)g_last_status);
+    }
+    if (*p == '!') {
+        p++;
+        *pp = p;
+        return shell_append_uint(buf, pos, cap, (unsigned long)g_last_bg_pid);
+    }
+    if (*p == '$') {
+        p++;
+        *pp = p;
+        struct proc *cur = current_proc();
+        return shell_append_uint(buf, pos, cap,
+                                 (unsigned long)(cur ? cur->pid : 0));
+    }
+    if (*p == '#') {
+        p++;
+        *pp = p;
+        return shell_append_uint(buf, pos, cap,
+                                 (unsigned long)g_positional_count);
+    }
+    if (*p == '@' || *p == '*') {
+        p++;
+        *pp = p;
+        return shell_append_positional_join(buf, pos, cap);
+    }
+    if (*p >= '0' && *p <= '9') {
+        int idx = *p++ - '0';
+        *pp = p;
+        if (idx == 0) {
+            return shell_append_str(buf, pos, cap,
+                                    g_param0 ? g_param0 : "tobysh");
+        }
+        if (idx <= g_positional_count) {
+            return shell_append_str(buf, pos, cap, g_positional[idx - 1]);
+        }
+        return 0;
+    }
+
+    char name[64];
+    size_t n = 0;
+    if (*p == '{') {
+        p++;
+        char expr[128];
+        while (*p && *p != '}' && n + 1 < sizeof(expr)) expr[n++] = *p++;
+        if (*p != '}') {
+            kprintf("shell: unterminated ${...}\n");
+            return -1;
+        }
+        p++;
+        expr[n] = '\0';
+        *pp = p;
+        return shell_expand_braced_parameter(expr, buf, pos, cap);
+    } else if (shell_var_start(*p)) {
+        while (shell_var_char(*p) && n + 1 < sizeof(name)) name[n++] = *p++;
+    } else {
+        if (shell_append_char(buf, pos, cap, '$') < 0) return -1;
+        *pp = p;
+        return 0;
+    }
+    name[n] = '\0';
+    *pp = p;
+    return shell_append_str(buf, pos, cap, env_get(name));
+}
+
+static int shell_emit_token_fd(struct shell_token *tok, int *ntok,
+                               enum shell_tok_type type, char *text,
+                               bool quoted, int fd) {
+    if (*ntok >= SHELL_TOKEN_MAX) {
+        kprintf("shell: too many tokens\n");
+        return -1;
+    }
+    tok[*ntok].type = type;
+    tok[*ntok].text = text;
+    tok[*ntok].quoted = quoted;
+    tok[*ntok].fd = fd;
+    (*ntok)++;
+    return 0;
+}
+
+static int shell_emit_token(struct shell_token *tok, int *ntok,
+                            enum shell_tok_type type, char *text,
+                            bool quoted) {
+    return shell_emit_token_fd(tok, ntok, type, text, quoted, -1);
+}
+
+static bool shell_is_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+static int shell_tokenize(const char *src, struct shell_token *tok,
+                          int *out_ntok, char *words, size_t word_cap) {
+    int ntok = 0;
+    size_t wpos = 0;
+    const char *p = src;
+
+    while (*p) {
+        while (is_space(*p)) p++;
+        if (!*p) break;
+        if (*p == '#') break;
+
+        int explicit_fd = -1;
+        const char *redir_p = p;
+        if (shell_is_digit(*redir_p)) {
+            int n = 0;
+            const char *d = redir_p;
+            while (shell_is_digit(*d)) {
+                n = n * 10 + (*d - '0');
+                d++;
+            }
+            if (*d == '<' || *d == '>') {
+                explicit_fd = n;
+                p = d;
+            }
+        }
+
+        if (*p == ';') {
+            if (shell_emit_token(tok, &ntok, SH_TOK_SEMI, 0, false) < 0) return -1;
+            p++;
+            continue;
+        }
+        if (*p == '&') {
+            enum shell_tok_type t = SH_TOK_BG;
+            if (p[1] == '&') { t = SH_TOK_AND_IF; p++; }
+            if (shell_emit_token(tok, &ntok, t, 0, false) < 0) return -1;
+            p++;
+            continue;
+        }
+        if (*p == '|') {
+            enum shell_tok_type t = SH_TOK_PIPE;
+            if (p[1] == '|') { t = SH_TOK_OR_IF; p++; }
+            if (shell_emit_token(tok, &ntok, t, 0, false) < 0) return -1;
+            p++;
+            continue;
+        }
+        if (*p == '<') {
+            enum shell_tok_type t = SH_TOK_REDIR_IN;
+            if (p[1] == '<') {
+                t = SH_TOK_HEREDOC;
+                p++;
+                if (p[1] == '-') {
+                    t = SH_TOK_HEREDOC_TABS;
+                    p++;
+                }
+            } else if (p[1] == '&') {
+                t = SH_TOK_DUP_IN;
+                p++;
+            }
+            if (shell_emit_token_fd(tok, &ntok, t, 0, false, explicit_fd) < 0) return -1;
+            p++;
+            continue;
+        }
+        if (*p == '>') {
+            enum shell_tok_type t = SH_TOK_REDIR_OUT;
+            if (p[1] == '>') { t = SH_TOK_REDIR_APPEND; p++; }
+            else if (p[1] == '&') { t = SH_TOK_DUP_OUT; p++; }
+            if (shell_emit_token_fd(tok, &ntok, t, 0, false, explicit_fd) < 0) return -1;
+            p++;
+            continue;
+        }
+
+        char *start = words + wpos;
+        bool got = false;
+        bool word_quoted = false;
+        while (*p && !is_space(*p) && !shell_operator_char(*p)) {
+            got = true;
+            if (*p == '\'') {
+                word_quoted = true;
+                p++;
+                while (*p && *p != '\'') {
+                    if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                        kprintf("shell: word too long\n");
+                        return -1;
+                    }
+                }
+                if (*p != '\'') {
+                    kprintf("shell: unmatched single quote\n");
+                    return -1;
+                }
+                p++;
+                continue;
+            }
+            if (*p == '"') {
+                word_quoted = true;
+                p++;
+                while (*p && *p != '"') {
+                    if (*p == '\\' && p[1]) {
+                        p++;
+                        if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                            kprintf("shell: word too long\n");
+                            return -1;
+                        }
+                    } else if (*p == '$') {
+                        if (shell_expand_var(&p, words, &wpos, word_cap) < 0) return -1;
+                    } else if (*p == '`') {
+                        if (shell_expand_backtick(&p, words, &wpos, word_cap) < 0) return -1;
+                    } else {
+                        if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                            kprintf("shell: word too long\n");
+                            return -1;
+                        }
+                    }
+                }
+                if (*p != '"') {
+                    kprintf("shell: unmatched double quote\n");
+                    return -1;
+                }
+                p++;
+                continue;
+            }
+            if (*p == '\\') {
+                word_quoted = true;
+                p++;
+                if (!*p) {
+                    kprintf("shell: trailing escape\n");
+                    return -1;
+                }
+                if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                    kprintf("shell: word too long\n");
+                    return -1;
+                }
+                continue;
+            }
+            if (*p == '`') {
+                if (shell_expand_backtick(&p, words, &wpos, word_cap) < 0) return -1;
+                continue;
+            }
+            if (*p == '$') {
+                if (shell_expand_var(&p, words, &wpos, word_cap) < 0) return -1;
+                continue;
+            }
+            if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                kprintf("shell: word too long\n");
+                return -1;
+            }
+        }
+
+        if (got) {
+            if (shell_append_char(words, &wpos, word_cap, '\0') < 0) {
+                kprintf("shell: parse buffer full\n");
+                return -1;
+            }
+            if (shell_emit_token(tok, &ntok, SH_TOK_WORD, start, word_quoted) < 0) return -1;
+        }
+    }
+
+    *out_ntok = ntok;
+    return 0;
+}
+
+static bool shell_alias_name_char(char c) {
+    return c && !is_space(c) && !shell_operator_char(c) &&
+           c != '(' && c != ')' && c != '\'' && c != '"' && c != '\\';
+}
+
+static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
+                                     bool *changed) {
+    const char *p = src ? src : "";
+    size_t pos = 0;
+    bool at_cmd = true;
+    *changed = false;
+
+    while (*p) {
+        if (*p == '#') {
+            if (shell_append_str(out, &pos, cap, p) < 0) return -1;
+            break;
+        }
+
+        if (is_space(*p)) {
+            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            continue;
+        }
+
+        if (*p == ';') {
+            at_cmd = true;
+            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            continue;
+        }
+        if (*p == '&') {
+            at_cmd = true;
+            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (*p == '&') {
+                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            }
+            continue;
+        }
+        if (*p == '|') {
+            at_cmd = true;
+            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (*p == '|') {
+                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            }
+            continue;
+        }
+
+        if (at_cmd && shell_alias_name_char(*p)) {
+            const char *start = p;
+            while (shell_alias_name_char(*p)) p++;
+            size_t n = (size_t)(p - start);
+            char name[64];
+            if (n + 1 <= sizeof(name)) {
+                memcpy(name, start, n);
+                name[n] = '\0';
+                const char *q = shell_skip_blanks(p);
+                const char *av = (*q == '(') ? 0 : shell_alias_value(name);
+                if (av) {
+                    if (shell_append_str(out, &pos, cap, av) < 0) return -1;
+                    *changed = true;
+                    at_cmd = false;
+                    continue;
+                }
+            }
+            if (pos + n + 1 > cap) return -1;
+            memcpy(out + pos, start, n);
+            pos += n;
+            out[pos] = '\0';
+            at_cmd = false;
+            continue;
+        }
+
+        if (*p == '\'' || *p == '"') {
+            char quote = *p;
+            at_cmd = false;
+            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            while (*p && *p != quote) {
+                if (*p == '\\' && quote == '"' && p[1]) {
+                    if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                }
+                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            }
+            if (*p && shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            continue;
+        }
+
+        at_cmd = false;
+        if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+    }
+
+    out[pos] = '\0';
+    return 0;
+}
+
+static const char *shell_expand_aliases(const char *src, char *buf,
+                                        size_t cap) {
+    char tmp[SHELL_PARSE_BUF_MAX];
+    const char *cur = src ? src : "";
+    bool changed = false;
+
+    for (int pass = 0; pass < 8; pass++) {
+        char *dst = (pass & 1) ? tmp : buf;
+        if (shell_expand_aliases_once(cur, dst,
+                                      (pass & 1) ? sizeof(tmp) : cap,
+                                      &changed) < 0) {
+            kprintf("alias: expansion too long\n");
+            return 0;
+        }
+        cur = dst;
+        if (!changed) return cur;
+    }
+    kprintf("alias: recursive expansion limit reached\n");
+    return 0;
+}
+
+static bool shell_is_list_sep(enum shell_tok_type t) {
+    return t == SH_TOK_SEMI || t == SH_TOK_BG ||
+           t == SH_TOK_AND_IF || t == SH_TOK_OR_IF;
+}
+
+static void shell_simple_init(struct shell_simple *s) {
+    memset(s, 0, sizeof(*s));
+}
+
+static int shell_pipeline_save_word(struct shell_pipeline *pl,
+                                    const char *s, char **out) {
+    if (!pl || !s || !out) return -1;
+    size_t n = strlen(s);
+    if (pl->expand_pos + n + 1 > sizeof(pl->expand_buf)) {
+        kprintf("shell: expansion buffer full\n");
+        return -1;
+    }
+    char *dst = pl->expand_buf + pl->expand_pos;
+    memcpy(dst, s, n + 1);
+    pl->expand_pos += n + 1;
+    *out = dst;
+    return 0;
+}
+
+static bool shell_has_glob(const char *s) {
+    if (!s) return false;
+    for (; *s; s++) {
+        if (*s == '*' || *s == '?' || *s == '[') return true;
+    }
+    return false;
+}
+
+static bool shell_glob_bracket(const char **pp, char c) {
+    const char *p = *pp + 1;   /* skip '[' */
+    bool negate = false;
+    bool matched = false;
+
+    if (*p == '!' || *p == '^') {
+        negate = true;
+        p++;
+    }
+    if (*p == ']') {
+        if (c == ']') matched = true;
+        p++;
+    }
+
+    bool closed = false;
+    while (*p) {
+        if (*p == ']') {
+            closed = true;
+            p++;
+            break;
+        }
+        if (p[1] == '-' && p[2] && p[2] != ']') {
+            char lo = p[0];
+            char hi = p[2];
+            if (lo <= c && c <= hi) matched = true;
+            p += 3;
+            continue;
+        }
+        if (*p == c) matched = true;
+        p++;
+    }
+
+    if (!closed) {
+        /* Malformed bracket expressions behave like a literal '['. */
+        *pp = *pp + 1;
+        return c == '[';
+    }
+    *pp = p;
+    return negate ? !matched : matched;
+}
+
+static bool shell_glob_match(const char *pat, const char *name) {
+    while (*pat) {
+        if (*pat == '*') {
+            while (*pat == '*') pat++;
+            if (!*pat) return true;
+            for (const char *n = name; ; n++) {
+                if (shell_glob_match(pat, n)) return true;
+                if (!*n) return false;
+            }
+        }
+        if (!*name) return false;
+        if (*pat == '?') {
+            pat++;
+            name++;
+            continue;
+        }
+        if (*pat == '[') {
+            const char *after = pat;
+            if (!shell_glob_bracket(&after, *name)) return false;
+            pat = after;
+            name++;
+            continue;
+        }
+        if (*pat != *name) return false;
+        pat++;
+        name++;
+    }
+    return *name == '\0';
+}
+
+static int shell_expand_tilde_word(struct shell_pipeline *pl,
+                                   const char *word, char **out) {
+    if (!word || word[0] != '~' || (word[1] && word[1] != '/')) return 0;
+    const char *home = env_get("HOME");
+    if (!home || !*home) home = "/";
+
+    char tmp[VFS_PATH_MAX];
+    size_t hlen = strlen(home);
+    size_t rest = strlen(word + 1);
+    bool drop_slash = (hlen > 1 && home[hlen - 1] == '/' && word[1] == '/');
+    if (hlen + rest + 1 > sizeof(tmp)) return -1;
+    memcpy(tmp, home, hlen);
+    size_t pos = hlen;
+    const char *tail = word + 1;
+    if (drop_slash) tail++;
+    while (*tail && pos + 1 < sizeof(tmp)) tmp[pos++] = *tail++;
+    if (*tail) return -1;
+    tmp[pos] = '\0';
+    return shell_pipeline_save_word(pl, tmp, out) < 0 ? -1 : 1;
+}
+
+static int shell_expand_glob_word(struct shell_pipeline *pl,
+                                  struct shell_simple *cur,
+                                  const char *word) {
+    const char *last_slash = 0;
+    for (const char *p = word; *p; p++) {
+        if (*p == '/') last_slash = p;
+    }
+
+    char dir_arg[VFS_PATH_MAX];
+    char display_prefix[VFS_PATH_MAX];
+    const char *pattern = word;
+
+    if (!last_slash) {
+        memcpy(dir_arg, ".", 2);
+        display_prefix[0] = '\0';
+    } else {
+        size_t dlen = (size_t)(last_slash - word);
+        size_t plen = (size_t)(last_slash - word + 1);
+        if (dlen == 0) {
+            memcpy(dir_arg, "/", 2);
+        } else {
+            if (dlen + 1 > sizeof(dir_arg)) return -1;
+            memcpy(dir_arg, word, dlen);
+            dir_arg[dlen] = '\0';
+        }
+        if (plen + 1 > sizeof(display_prefix)) return -1;
+        memcpy(display_prefix, word, plen);
+        display_prefix[plen] = '\0';
+        pattern = last_slash + 1;
+    }
+
+    if (!pattern[0]) return 0;
+
+    char dir_path[VFS_PATH_MAX];
+    if (shell_canonicalize_path(dir_arg, dir_path, sizeof(dir_path)) < 0) {
+        return -1;
+    }
+    if (word[0] == '~') {
+        size_t dlen = strlen(dir_path);
+        if (dlen + 2 > sizeof(display_prefix)) return -1;
+        memcpy(display_prefix, dir_path, dlen);
+        if (dlen == 0 || dir_path[dlen - 1] != '/') display_prefix[dlen++] = '/';
+        display_prefix[dlen] = '\0';
+    }
+
+    struct vfs_dir d;
+    int rc = vfs_opendir(dir_path, &d);
+    if (rc != VFS_OK) return 0;
+
+    int matches = 0;
+    struct vfs_dirent ent;
+    while ((rc = vfs_readdir(&d, &ent)) == VFS_OK) {
+        if (ent.name[0] == '.' && pattern[0] != '.') continue;
+        if (!shell_glob_match(pattern, ent.name)) continue;
+        if (cur->argc >= ARG_MAX) {
+            vfs_closedir(&d);
+            kprintf("shell: too many arguments after expansion (max %d)\n", ARG_MAX);
+            return -1;
+        }
+        char tmp[VFS_PATH_MAX];
+        size_t pre = strlen(display_prefix);
+        size_t nam = strlen(ent.name);
+        if (pre + nam + 1 > sizeof(tmp)) {
+            vfs_closedir(&d);
+            return -1;
+        }
+        memcpy(tmp, display_prefix, pre);
+        memcpy(tmp + pre, ent.name, nam + 1);
+        if (shell_pipeline_save_word(pl, tmp, &cur->argv[cur->argc]) < 0) {
+            vfs_closedir(&d);
+            return -1;
+        }
+        cur->argc++;
+        matches++;
+    }
+    vfs_closedir(&d);
+    return matches;
+}
+
+static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur,
+                             const char *word, bool quoted) {
+    if (cur->argc >= ARG_MAX) {
+        kprintf("shell: too many arguments (max %d)\n", ARG_MAX);
+        return -1;
+    }
+
+    if (!quoted) {
+        if (shell_has_glob(word)) {
+            int n = shell_expand_glob_word(pl, cur, word);
+            if (n < 0) return -1;
+            if (n > 0) return 0;
+        }
+
+        char *expanded = 0;
+        int trc = shell_expand_tilde_word(pl, word, &expanded);
+        if (trc < 0) {
+            kprintf("shell: expansion too long\n");
+            return -1;
+        }
+        if (trc > 0) {
+            cur->argv[cur->argc++] = expanded;
+            return 0;
+        }
+    }
+
+    cur->argv[cur->argc++] = (char *)word;
+    return 0;
+}
+
+static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
+                         const char *word, bool quoted) {
+    if (quoted) return shell_add_one_arg(pl, cur, word, true);
+
+    size_t klen = env_key_len(word);
+    if (cur->argc == 0 && word[klen] == '=' && shell_name_is_valid(word, klen)) {
+        return shell_add_one_arg(pl, cur, word, false);
+    }
+
+    const char *p = word;
+    bool added = false;
+    while (*p) {
+        while (is_space(*p)) p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && !is_space(*p)) p++;
+        size_t n = (size_t)(p - start);
+        char tmp[SHELL_PARSE_BUF_MAX];
+        if (n + 1 > sizeof(tmp)) {
+            kprintf("shell: field too long\n");
+            return -1;
+        }
+        memcpy(tmp, start, n);
+        tmp[n] = '\0';
+        char *saved = 0;
+        if (shell_pipeline_save_word(pl, tmp, &saved) < 0) return -1;
+        if (shell_add_one_arg(pl, cur, saved, false) < 0) return -1;
+        added = true;
+    }
+
+    if (!added && word[0] == '\0') {
+        return shell_add_one_arg(pl, cur, word, false);
+    }
+    return 0;
+}
+
+static int shell_default_redir_fd(enum shell_tok_type t, int explicit_fd) {
+    if (explicit_fd >= 0) return explicit_fd;
+    if (t == SH_TOK_REDIR_IN || t == SH_TOK_HEREDOC ||
+        t == SH_TOK_HEREDOC_TABS || t == SH_TOK_DUP_IN) {
+        return 0;
+    }
+    return 1;
+}
+
+static int shell_parse_fd_word(const char *word, int *out_fd) {
+    if (!word || !*word || !out_fd) return -1;
+    int v = 0;
+    for (const char *p = word; *p; p++) {
+        if (!shell_is_digit(*p)) return -1;
+        v = v * 10 + (*p - '0');
+        if (v > 2) return -1;
+    }
+    *out_fd = v;
+    return 0;
+}
+
+static int shell_add_redir(struct shell_simple *cur, enum shell_redir_op op,
+                           int fd, const char *path, const char *text,
+                           int target_fd) {
+    if (fd < 0 || fd > 2) {
+        kprintf("shell: only file descriptors 0, 1, and 2 are supported\n");
+        return -1;
+    }
+    if (cur->redir_count >= SHELL_REDIR_MAX) {
+        kprintf("shell: too many redirections\n");
+        return -1;
+    }
+    struct shell_redir *r = &cur->redir[cur->redir_count++];
+    memset(r, 0, sizeof(*r));
+    r->op = op;
+    r->fd = fd;
+    r->target_fd = target_fd;
+    r->path = path;
+    r->text = text;
+    return 0;
+}
+
+static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
+                                struct shell_pipeline *pl) {
+    memset(pl, 0, sizeof(*pl));
+    if (*io >= ntok || shell_is_list_sep(tok[*io].type)) return 0;
+
+    shell_simple_init(&pl->stage[0]);
+    pl->count = 1;
+
+    while (*io < ntok && !shell_is_list_sep(tok[*io].type)) {
+        enum shell_tok_type t = tok[*io].type;
+        struct shell_simple *cur = &pl->stage[pl->count - 1];
+
+        if (t == SH_TOK_PIPE) {
+            if (cur->argc == 0) {
+                kprintf("shell: empty command before '|'\n");
+                return -1;
+            }
+            (*io)++;
+            if (pl->count >= SHELL_STAGE_MAX) {
+                kprintf("shell: too many pipeline stages\n");
+                return -1;
+            }
+            shell_simple_init(&pl->stage[pl->count++]);
+            continue;
+        }
+
+        if (t == SH_TOK_REDIR_IN || t == SH_TOK_HEREDOC ||
+            t == SH_TOK_HEREDOC_TABS || t == SH_TOK_REDIR_OUT ||
+            t == SH_TOK_REDIR_APPEND || t == SH_TOK_DUP_IN ||
+            t == SH_TOK_DUP_OUT) {
+            int fd = shell_default_redir_fd(t, tok[*io].fd);
+            (*io)++;
+            if (*io >= ntok || tok[*io].type != SH_TOK_WORD) {
+                kprintf("shell: redirection needs a path\n");
+                return -1;
+            }
+            if (t == SH_TOK_REDIR_IN) {
+                cur->stdin_path = tok[*io].text;
+                if (shell_add_redir(cur, SH_RD_OPEN_IN, fd, tok[*io].text,
+                                    0, -1) < 0) return -1;
+            } else if (t == SH_TOK_HEREDOC || t == SH_TOK_HEREDOC_TABS) {
+                const struct shell_heredoc *h = shell_heredoc_pop();
+                if (!h) {
+                    kprintf("shell: here-document body missing\n");
+                    return -1;
+                }
+                cur->stdin_text = h->body;
+                if (shell_add_redir(cur, SH_RD_HEREDOC, fd, 0, h->body,
+                                    -1) < 0) return -1;
+            } else if (t == SH_TOK_DUP_IN || t == SH_TOK_DUP_OUT) {
+                int target = -1;
+                if (strcmp(tok[*io].text, "-") == 0) {
+                    if (shell_add_redir(cur, SH_RD_CLOSE, fd, 0, 0,
+                                        -1) < 0) return -1;
+                } else if (shell_parse_fd_word(tok[*io].text, &target) < 0) {
+                    kprintf("shell: bad file descriptor '%s'\n", tok[*io].text);
+                    return -1;
+                } else {
+                    if (shell_add_redir(cur,
+                                        t == SH_TOK_DUP_IN ? SH_RD_DUP_IN
+                                                           : SH_RD_DUP_OUT,
+                                        fd, 0, 0, target) < 0) return -1;
+                }
+            } else {
+                cur->stdout_path = tok[*io].text;
+                cur->stdout_append = (t == SH_TOK_REDIR_APPEND);
+                if (shell_add_redir(cur,
+                                    t == SH_TOK_REDIR_APPEND ? SH_RD_OPEN_APPEND
+                                                            : SH_RD_OPEN_OUT,
+                                    fd, tok[*io].text, 0, -1) < 0) return -1;
+            }
+            (*io)++;
+            continue;
+        }
+
+        if (t != SH_TOK_WORD) {
+            kprintf("shell: unexpected token\n");
+            return -1;
+        }
+        if (shell_add_arg(pl, cur, tok[*io].text, tok[*io].quoted) < 0) {
+            return -1;
+        }
+        (*io)++;
+    }
+
+    for (int i = 0; i < pl->count; i++) {
+        if (pl->stage[i].argc == 0) {
+            if (pl->count == 1 && pl->stage[i].redir_count > 0) continue;
+            kprintf("shell: empty command in pipeline\n");
+            return -1;
+        }
+    }
+    return pl->count;
+}
+
+static bool shell_is_assignment_word(const char *s) {
+    if (!s) return false;
+    size_t klen = env_key_len(s);
+    return s[klen] == '=' && shell_name_is_valid(s, klen);
+}
+
+static bool shell_assignment_overrides(const char *kv, char **assignv,
+                                       int assignc) {
+    size_t klen = env_key_len(kv);
+    for (int i = 0; i < assignc; i++) {
+        size_t alen = env_key_len(assignv[i]);
+        if (alen == klen && memcmp(kv, assignv[i], klen) == 0) return true;
+    }
+    return false;
+}
+
+static int shell_build_env_overlay(char **assignv, int assignc,
+                                   char **out_env, int *out_envc) {
+    int n = 0;
+    for (int i = 0; i < g_envc; i++) {
+        if (!shell_assignment_overrides(g_env[i], assignv, assignc)) {
+            if (n >= ENV_MAX + ARG_MAX) return -1;
+            out_env[n++] = g_env[i];
+        }
+    }
+    for (int i = 0; i < assignc; i++) {
+        if (n >= ENV_MAX + ARG_MAX) return -1;
+        out_env[n++] = assignv[i];
+    }
+    out_env[n] = 0;
+    *out_envc = n;
+    return 0;
+}
+
+struct shell_env_frame {
+    char *env[ENV_MAX + 1];
+    int envc;
+    int getopts_last_optind;
+    int getopts_char_index;
+};
+
+static void shell_env_frame_clear(struct shell_env_frame *frame) {
+    if (!frame) return;
+    for (int i = 0; i < frame->envc; i++) {
+        if (frame->env[i]) kfree(frame->env[i]);
+        frame->env[i] = 0;
+    }
+    frame->envc = 0;
+}
+
+static int shell_env_frame_capture(struct shell_env_frame *frame) {
+    if (!frame) return -1;
+    memset(frame, 0, sizeof(*frame));
+    for (int i = 0; i < g_envc; i++) {
+        frame->env[i] = shell_strdup(g_env[i]);
+        if (!frame->env[i]) {
+            frame->envc = i;
+            shell_env_frame_clear(frame);
+            return -1;
+        }
+    }
+    frame->envc = g_envc;
+    frame->env[g_envc] = 0;
+    frame->getopts_last_optind = g_getopts_last_optind;
+    frame->getopts_char_index = g_getopts_char_index;
+    return 0;
+}
+
+static void shell_env_frame_restore(struct shell_env_frame *frame) {
+    if (!frame) return;
+    for (int i = 0; i < g_envc; i++) {
+        if (g_env[i]) kfree(g_env[i]);
+        g_env[i] = 0;
+    }
+    g_envc = frame->envc;
+    for (int i = 0; i < frame->envc; i++) {
+        g_env[i] = frame->env[i];
+        frame->env[i] = 0;
+    }
+    g_env[g_envc] = 0;
+    g_getopts_last_optind = frame->getopts_last_optind;
+    g_getopts_char_index = frame->getopts_char_index;
+    frame->envc = 0;
+}
+
+static int shell_apply_assignments(char **assignv, int assignc,
+                                   const char *label) {
+    int rc = 0;
+    for (int i = 0; i < assignc; i++) {
+        if (env_set_kv(assignv[i]) < 0) {
+            kprintf("%s: failed to set '%s'\n",
+                    label ? label : "shell", assignv[i]);
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+static struct file *shell_open_vfs_file(const char *path_arg, bool write,
+                                        bool append, const char *label) {
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(path_arg, path, sizeof(path), label) < 0) return 0;
+
+    if (write) {
+        struct vfs_stat st;
+        int sr = vfs_stat(path, &st);
+        if (sr == VFS_OK && st.type == VFS_TYPE_DIR) {
+            kprintf("%s: '%s': is a directory\n", label, path_arg);
+            return 0;
+        }
+        if (append) {
+            if (sr == VFS_ERR_NOENT) {
+                int cr = vfs_create(path);
+                if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
+                    kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(cr));
+                    return 0;
+                }
+            } else if (sr != VFS_OK) {
+                kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(sr));
+                return 0;
+            }
+        } else {
+            if (sr == VFS_OK) {
+                int ur = vfs_unlink(path);
+                if (ur != VFS_OK) {
+                    kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(ur));
+                    return 0;
+                }
+            } else if (sr != VFS_ERR_NOENT) {
+                kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(sr));
+                return 0;
+            }
+            int cr = vfs_create(path);
+            if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
+                kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(cr));
+                return 0;
+            }
+        }
+    }
+
+    struct file *f = (struct file *)kmalloc(sizeof(*f));
+    if (!f) return 0;
+    memset(f, 0, sizeof(*f));
+    f->kind = FILE_KIND_VFS;
+    f->vfs_refs = (int *)kmalloc(sizeof(int));
+    if (!f->vfs_refs) {
+        kfree(f);
+        return 0;
+    }
+    *f->vfs_refs = 1;
+
+    int rc = vfs_open(path, &f->vfs);
+    if (rc != VFS_OK) {
+        kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(rc));
+        kfree(f->vfs_refs);
+        kfree(f);
+        return 0;
+    }
+    if (write && append) f->vfs.pos = f->vfs.size;
+    return f;
+}
+
+static struct file *shell_open_text_pipe(const char *text, const char *label) {
+    struct file *r = 0;
+    struct file *w = 0;
+    if (pipe_create(&r, &w) != 0) {
+        kprintf("%s: failed to create here-document pipe\n", label);
+        return 0;
+    }
+
+    size_t len = text ? strlen(text) : 0;
+    if (len > 0) {
+        long n = file_write(w, text, len);
+        if (n < 0 || (size_t)n != len) {
+            kprintf("%s: failed to write here-document\n", label);
+            file_close(r);
+            file_close(w);
+            return 0;
+        }
+    }
+    file_close(w);
+    return r;
+}
+
+struct shell_fd_state {
+    struct file *fd[3];
+    bool owned[3];
+};
+
+struct shell_io_frame {
+    struct file *old_fd[3];
+    bool owned[3];
+};
+
+static void shell_fd_state_close_owned(struct shell_fd_state *st) {
+    if (!st) return;
+    for (int i = 0; i < 3; i++) {
+        if (st->owned[i]) file_close(st->fd[i]);
+        st->fd[i] = 0;
+        st->owned[i] = false;
+    }
+}
+
+static struct file *shell_closed_file_make(void) {
+    struct file *f = (struct file *)kmalloc(sizeof(*f));
+    if (!f) return 0;
+    memset(f, 0, sizeof(*f));
+    f->kind = FILE_KIND_NULL;
+    return f;
+}
+
+static int shell_fd_state_replace(struct shell_fd_state *st, int fd,
+                                  struct file *f, bool owned) {
+    if (!st || fd < 0 || fd > 2) return -1;
+    if (st->owned[fd]) file_close(st->fd[fd]);
+    st->fd[fd] = f;
+    st->owned[fd] = owned;
+    return 0;
+}
+
+static void shell_fd_state_init_from_defaults(struct shell_fd_state *st) {
+    memset(st, 0, sizeof(*st));
+    for (int i = 0; i < 3; i++) {
+        st->fd[i] = g_shell_fd[i];
+        st->owned[i] = false;
+    }
+}
+
+static int shell_apply_redirs(struct shell_simple *cmd,
+                              struct shell_fd_state *st,
+                              const char *label) {
+    if (!cmd || !st) return -1;
+    for (int i = 0; i < cmd->redir_count; i++) {
+        struct shell_redir *r = &cmd->redir[i];
+        if (r->fd < 0 || r->fd > 2) {
+            kprintf("%s: bad file descriptor %d\n", label, r->fd);
+            return -1;
+        }
+
+        if (r->op == SH_RD_OPEN_IN) {
+            struct file *f = shell_open_vfs_file(r->path, false, false, label);
+            if (!f) return -1;
+            if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
+                file_close(f);
+                return -1;
+            }
+            continue;
+        }
+        if (r->op == SH_RD_HEREDOC) {
+            struct file *f = shell_open_text_pipe(r->text, label);
+            if (!f) return -1;
+            if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
+                file_close(f);
+                return -1;
+            }
+            continue;
+        }
+        if (r->op == SH_RD_OPEN_OUT || r->op == SH_RD_OPEN_APPEND) {
+            struct file *f = shell_open_vfs_file(r->path, true,
+                                                 r->op == SH_RD_OPEN_APPEND,
+                                                 label);
+            if (!f) return -1;
+            if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
+                file_close(f);
+                return -1;
+            }
+            continue;
+        }
+        if (r->op == SH_RD_CLOSE) {
+            struct file *f = shell_closed_file_make();
+            if (!f) return -1;
+            if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
+                file_close(f);
+                return -1;
+            }
+            continue;
+        }
+        if (r->op == SH_RD_DUP_IN || r->op == SH_RD_DUP_OUT) {
+            if (r->target_fd < 0 || r->target_fd > 2) {
+                kprintf("%s: bad file descriptor %d\n", label, r->target_fd);
+                return -1;
+            }
+            struct file *clone = 0;
+            bool owned = false;
+            if (st->fd[r->target_fd]) {
+                clone = file_clone(st->fd[r->target_fd]);
+                if (!clone) {
+                    kprintf("%s: failed to duplicate fd %d\n",
+                            label, r->target_fd);
+                    return -1;
+                }
+                owned = true;
+            }
+            if (shell_fd_state_replace(st, r->fd, clone, owned) < 0) {
+                file_close(clone);
+                return -1;
+            }
+            continue;
+        }
+    }
+    return 0;
+}
+
+static int shell_enter_io_frame(struct shell_simple *cmd, const char *label,
+                                struct shell_io_frame *frame) {
+    if (!cmd || !frame) return -1;
+    memset(frame, 0, sizeof(*frame));
+
+    struct shell_fd_state fds;
+    shell_fd_state_init_from_defaults(&fds);
+    if (shell_apply_redirs(cmd, &fds, label) < 0) {
+        shell_fd_state_close_owned(&fds);
+        return -1;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        frame->old_fd[i] = g_shell_fd[i];
+        frame->owned[i] = fds.owned[i];
+        g_shell_fd[i] = fds.fd[i];
+        fds.owned[i] = false;
+    }
+    return 0;
+}
+
+static void shell_restore_io_frame(struct shell_io_frame *frame) {
+    if (!frame) return;
+    for (int i = 0; i < 3; i++) {
+        if (frame->owned[i]) file_close(g_shell_fd[i]);
+        g_shell_fd[i] = frame->old_fd[i];
+        frame->old_fd[i] = 0;
+        frame->owned[i] = false;
+    }
+}
+
+static void shell_file_output(const char *s, void *ctx) {
+    struct file *f = (struct file *)ctx;
+    if (s && f) (void)file_write(f, s, strlen(s));
+}
+
+static void shell_file_kputc(void *ctx, char c) {
+    struct file *f = (struct file *)ctx;
+    if (f) (void)file_write(f, &c, 1);
+}
+
+struct shell_printk_bridge {
+    shell_write_fn_t fn;
+    void *ctx;
+};
+
+static void shell_printk_bridge_char(void *ctx, char c) {
+    struct shell_printk_bridge *b = (struct shell_printk_bridge *)ctx;
+    if (!b || !b->fn) return;
+    char s[2] = { c, '\0' };
+    b->fn(s, b->ctx);
+}
+
+static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
+                             char **assignv, int assignc,
+                             bool persist_assignments) {
+    if (!c) c = shell_cmd_lookup(cmd->argv[0]);
+    if (!c) return -1;
+
+    struct shell_fd_state fds;
+    memset(&fds, 0, sizeof(fds));
+    shell_write_fn_t old_fn = g_shell_out;
+    void *old_ctx = g_shell_out_ctx;
+    struct file *old_in = g_shell_in;
+    void (*old_sink)(void *ctx, char c) = 0;
+    void *old_sink_ctx = 0;
+    bool old_sink_suppress = false;
+    bool sink_active = false;
+    struct shell_printk_bridge bridge;
+    struct shell_env_frame env_frame;
+    bool restore_env = false;
+
+    shell_fd_state_init_from_defaults(&fds);
+    if (shell_apply_redirs(cmd, &fds, cmd->argv[0]) < 0) {
+        shell_fd_state_close_owned(&fds);
+        return 1;
+    }
+    if (assignc > 0 && !persist_assignments) {
+        if (shell_env_frame_capture(&env_frame) < 0) {
+            kprintf("%s: failed to save shell environment\n", cmd->argv[0]);
+            shell_fd_state_close_owned(&fds);
+            return 1;
+        }
+        restore_env = true;
+    }
+    if (assignc > 0 &&
+        shell_apply_assignments(assignv, assignc, cmd->argv[0]) != 0) {
+        if (restore_env) shell_env_frame_restore(&env_frame);
+        shell_fd_state_close_owned(&fds);
+        return 1;
+    }
+    if (fds.fd[1]) {
+        shell_set_output(shell_file_output, fds.fd[1]);
+        printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
+        printk_set_sink_mode(shell_file_kputc, fds.fd[1], true);
+        sink_active = true;
+    } else if (g_shell_out) {
+        bridge.fn = g_shell_out;
+        bridge.ctx = g_shell_out_ctx;
+        printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
+        printk_set_sink_mode(shell_printk_bridge_char, &bridge,
+            old_sink_suppress);
+        sink_active = true;
+    }
+    g_shell_in = fds.fd[0];
+    shell_set_status(0);
+    c->fn(cmd->argc, cmd->argv);
+    int rc = g_last_status;
+    g_shell_in = old_in;
+    if (restore_env) {
+        shell_env_frame_restore(&env_frame);
+        shell_set_status(rc);
+    }
+    if (sink_active) {
+        printk_set_sink_mode(old_sink, old_sink_ctx, old_sink_suppress);
+    }
+    if (fds.fd[1]) {
+        shell_set_output(old_fn, old_ctx);
+    }
+    shell_fd_state_close_owned(&fds);
+    return rc;
+}
+
+static int shell_run_function(struct shell_simple *cmd) {
+    struct shell_function *fn = shell_function_lookup(cmd->argv[0]);
+    if (!fn) return -1;
+    if (g_script_depth >= 8) {
+        kprintf("%s: function nesting too deep\n", cmd->argv[0]);
+        return 2;
+    }
+
+    struct shell_io_frame io_frame;
+    bool io_active = false;
+    if (cmd->redir_count > 0) {
+        if (shell_enter_io_frame(cmd, cmd->argv[0], &io_frame) < 0) {
+            return 1;
+        }
+        io_active = true;
+    }
+
+    struct shell_param_frame frame;
+    if (shell_enter_script_params(&frame, cmd->argv[0],
+                                  cmd->argc - 1, &cmd->argv[1]) < 0) {
+        kprintf("%s: failed to set function parameters\n", cmd->argv[0]);
+        if (io_active) shell_restore_io_frame(&io_frame);
+        return 1;
+    }
+
+    g_script_depth++;
+    execute_line_text(fn->body);
+    int rc = g_last_status;
+    if (g_shell_flow == SHELL_FLOW_RETURN) {
+        rc = g_shell_flow_status;
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+    }
+    g_script_depth--;
+    shell_restore_params_from_frame(&frame);
+    if (io_active) shell_restore_io_frame(&io_frame);
+    return rc;
+}
+
+static int shell_run_single(struct shell_simple *cmd, bool background) {
+    int assignc = 0;
+    while (assignc < cmd->argc && shell_is_assignment_word(cmd->argv[assignc])) {
+        assignc++;
+    }
+
+    if (assignc == cmd->argc) {
+        struct shell_fd_state fds;
+        shell_fd_state_init_from_defaults(&fds);
+        if (shell_apply_redirs(cmd, &fds, "shell") < 0) {
+            shell_fd_state_close_owned(&fds);
+            return 1;
+        }
+        shell_fd_state_close_owned(&fds);
+        int rc = shell_apply_assignments(cmd->argv, assignc, "shell");
+        return rc;
+    }
+
+    struct shell_simple exec_cmd = *cmd;
+    exec_cmd.argc = cmd->argc - assignc;
+    for (int i = 0; i < exec_cmd.argc; i++) {
+        exec_cmd.argv[i] = cmd->argv[i + assignc];
+    }
+
+    if (!background) {
+        const struct cmd *special = shell_cmd_lookup(exec_cmd.argv[0]);
+        if (special && shell_special_builtin_name(special->name)) {
+            return shell_run_builtin(&exec_cmd, special, cmd->argv, assignc,
+                                     true);
+        }
+        int frc = shell_run_function(&exec_cmd);
+        if (frc >= 0) return frc;
+        const struct cmd *builtin = shell_cmd_lookup(exec_cmd.argv[0]);
+        int brc = shell_run_builtin(&exec_cmd, builtin, cmd->argv, assignc,
+                                    false);
+        if (brc >= 0) return brc;
+    } else {
+        if (shell_function_lookup(exec_cmd.argv[0])) {
+            kprintf("'%s': shell functions can't be backgrounded with '&'\n",
+                    exec_cmd.argv[0]);
+            return 1;
+        }
+        if (shell_cmd_lookup(exec_cmd.argv[0])) {
+            kprintf("'%s': builtins can't be backgrounded with '&'\n",
+                    exec_cmd.argv[0]);
+            return 1;
+        }
+    }
+
+    char *env_overlay[ENV_MAX + ARG_MAX + 1];
+    char **envp = g_env;
+    int envc = g_envc;
+    if (assignc > 0) {
+        if (shell_build_env_overlay(cmd->argv, assignc,
+                                    env_overlay, &envc) < 0) {
+            kprintf("shell: environment too large\n");
+            return 1;
+        }
+        envp = env_overlay;
+    }
+
+    struct shell_fd_state fds;
+    shell_fd_state_init_from_defaults(&fds);
+    if (shell_apply_redirs(&exec_cmd, &fds, exec_cmd.argv[0]) < 0) {
+        shell_fd_state_close_owned(&fds);
+        return 1;
+    }
+
+    int rc = shell_spawn_program_profile_fds(exec_cmd.argv[0], exec_cmd.argc,
+                                             exec_cmd.argv, background,
+                                             /*profile=*/0,
+                                             fds.fd[0], fds.fd[1], fds.fd[2],
+                                             envc, envp);
+    shell_fd_state_close_owned(&fds);
+    return rc;
+}
+
+static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
+                                          struct file *pipe_in,
+                                          struct file *pipe_out) {
+    int assignc = 0;
+    while (assignc < cmd->argc && shell_is_assignment_word(cmd->argv[assignc])) {
+        assignc++;
+    }
+    if (assignc == cmd->argc) return -1;
+
+    struct shell_simple exec_cmd = *cmd;
+    exec_cmd.argc = cmd->argc - assignc;
+    for (int i = 0; i < exec_cmd.argc; i++) {
+        exec_cmd.argv[i] = cmd->argv[i + assignc];
+    }
+
+    const struct cmd *builtin = shell_cmd_lookup(exec_cmd.argv[0]);
+    struct shell_function *fn = shell_function_lookup(exec_cmd.argv[0]);
+    if (!builtin && !fn) return -1;
+
+    struct shell_env_frame env_frame;
+    if (shell_env_frame_capture(&env_frame) < 0) {
+        kprintf("pipeline: failed to save shell environment\n");
+        return 1;
+    }
+
+    char saved_cwd[VFS_PATH_MAX];
+    const char *cwd = shell_cwd();
+    if (!cwd || strlen(cwd) + 1 > sizeof(saved_cwd)) {
+        shell_env_frame_restore(&env_frame);
+        return 1;
+    }
+    memcpy(saved_cwd, cwd, strlen(cwd) + 1);
+
+    enum shell_flow saved_flow = g_shell_flow;
+    int saved_flow_status = g_shell_flow_status;
+    int saved_loop_depth = g_shell_loop_depth;
+
+    struct shell_fd_state fds;
+    shell_fd_state_init_from_defaults(&fds);
+    if (pipe_in && shell_fd_state_replace(&fds, 0, pipe_in, false) < 0) {
+        shell_fd_state_close_owned(&fds);
+        shell_env_frame_restore(&env_frame);
+        return 1;
+    }
+    if (pipe_out && shell_fd_state_replace(&fds, 1, pipe_out, false) < 0) {
+        shell_fd_state_close_owned(&fds);
+        shell_env_frame_restore(&env_frame);
+        return 1;
+    }
+    if (shell_apply_redirs(&exec_cmd, &fds, exec_cmd.argv[0]) < 0) {
+        shell_fd_state_close_owned(&fds);
+        shell_env_frame_restore(&env_frame);
+        return 1;
+    }
+
+    struct shell_io_frame io_frame;
+    memset(&io_frame, 0, sizeof(io_frame));
+    for (int i = 0; i < 3; i++) {
+        io_frame.old_fd[i] = g_shell_fd[i];
+        io_frame.owned[i] = fds.owned[i];
+        g_shell_fd[i] = fds.fd[i];
+        fds.owned[i] = false;
+    }
+
+    exec_cmd.redir_count = 0;
+    exec_cmd.stdin_path = 0;
+    exec_cmd.stdin_text = 0;
+    exec_cmd.stdout_path = 0;
+    exec_cmd.stdout_append = false;
+
+    g_subshell_depth++;
+    g_shell_flow = SHELL_FLOW_NONE;
+    g_shell_flow_status = 0;
+    g_shell_loop_depth = 0;
+
+    int rc = 1;
+    if (fn) {
+        rc = shell_run_function(&exec_cmd);
+    } else {
+        rc = shell_run_builtin(&exec_cmd, builtin, cmd->argv, assignc, false);
+    }
+    if (g_shell_flow == SHELL_FLOW_EXIT) {
+        rc = g_shell_flow_status;
+    }
+
+    g_subshell_depth--;
+    shell_restore_io_frame(&io_frame);
+    shell_env_frame_restore(&env_frame);
+    shell_restore_cwd_only(saved_cwd);
+    g_shell_flow = saved_flow;
+    g_shell_flow_status = saved_flow_status;
+    g_shell_loop_depth = saved_loop_depth;
+    shell_set_status(rc);
+    return rc;
+}
+
+static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
+                                      struct file *pipe_in,
+                                      struct file *pipe_out,
+                                      int *out_pid) {
+    char *env_overlay[ENV_MAX + ARG_MAX + 1];
+    char **envp = g_env;
+    int envc = g_envc;
+
+    int assignc = 0;
+    while (assignc < cmd->argc && shell_is_assignment_word(cmd->argv[assignc])) {
+        assignc++;
+    }
+    if (assignc == cmd->argc) {
+        kprintf("pipeline: assignment-only stage has no command\n");
+        return 1;
+    }
+    if (assignc > 0) {
+        if (shell_build_env_overlay(cmd->argv, assignc,
+                                    env_overlay, &envc) < 0) {
+            kprintf("pipeline: environment too large\n");
+            return 1;
+        }
+        envp = env_overlay;
+    }
+
+    char *argv[ARG_MAX];
+    int argc = cmd->argc - assignc;
+    for (int i = 0; i < argc; i++) argv[i] = cmd->argv[i + assignc];
+
+    struct shell_fd_state fds;
+    shell_fd_state_init_from_defaults(&fds);
+    if (pipe_in && shell_fd_state_replace(&fds, 0, pipe_in, false) < 0) {
+        shell_fd_state_close_owned(&fds);
+        return 1;
+    }
+    if (pipe_out && shell_fd_state_replace(&fds, 1, pipe_out, false) < 0) {
+        shell_fd_state_close_owned(&fds);
+        return 1;
+    }
+    if (shell_apply_redirs(cmd, &fds, argv[0]) < 0) {
+        shell_fd_state_close_owned(&fds);
+        return 1;
+    }
+
+    char path_buf[64];
+    const char *path = resolve_program(argv[0], path_buf, sizeof(path_buf));
+    struct proc_spec spec = {
+        .path = path, .name = argv[0],
+        .fd0 = fds.fd[0], .fd1 = fds.fd[1], .fd2 = fds.fd[2],
+        .argc = argc, .argv = argv,
+        .envc = envc, .envp = envp,
+        .cwd = shell_cwd(),
+    };
+    int pid = proc_spawn(&spec);
+    shell_fd_state_close_owned(&fds);
+    if (pid < 0) {
+        kprintf("pipeline: failed to spawn '%s'\n", path);
+        return 1;
+    }
+    *out_pid = pid;
+    return 0;
+}
+
+static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
+    if (pl->count == 1) return shell_run_single(&pl->stage[0], background);
+
+    if (background) {
+        kprintf("pipeline: background pipelines are not implemented yet\n");
+        return 1;
+    }
+
+    struct file *pipes_r[SHELL_STAGE_MAX - 1];
+    struct file *pipes_w[SHELL_STAGE_MAX - 1];
+    int pids[SHELL_STAGE_MAX];
+    bool has_pid[SHELL_STAGE_MAX];
+    int stage_status[SHELL_STAGE_MAX];
+    memset(pipes_r, 0, sizeof(pipes_r));
+    memset(pipes_w, 0, sizeof(pipes_w));
+    memset(pids, 0, sizeof(pids));
+    memset(has_pid, 0, sizeof(has_pid));
+    memset(stage_status, 0, sizeof(stage_status));
+
+    for (int i = 0; i < pl->count - 1; i++) {
+        if (pipe_create(&pipes_r[i], &pipes_w[i]) != 0) {
+            kprintf("pipeline: pipe_create failed\n");
+            for (int j = 0; j < i; j++) {
+                file_close(pipes_r[j]);
+                file_close(pipes_w[j]);
+            }
+            return 1;
+        }
+    }
+
+    for (int i = 0; i < pl->count; i++) {
+        struct file *in = (i == 0) ? 0 : pipes_r[i - 1];
+        struct file *out = (i + 1 == pl->count) ? 0 : pipes_w[i];
+
+        int shell_rc = shell_run_pipeline_shell_stage(&pl->stage[i], in, out);
+        if (shell_rc >= 0) {
+            stage_status[i] = shell_rc;
+        } else if (shell_spawn_pipeline_stage(&pl->stage[i], in, out,
+                                              &pids[i]) == 0) {
+            has_pid[i] = true;
+        } else {
+            for (int j = 0; j < pl->count - 1; j++) {
+                if (pipes_r[j]) file_close(pipes_r[j]);
+                if (pipes_w[j]) file_close(pipes_w[j]);
+            }
+            for (int j = 0; j < i; j++) {
+                if (has_pid[j]) (void)proc_wait(pids[j]);
+            }
+            return 1;
+        }
+
+        if (in) {
+            file_close(in);
+            pipes_r[i - 1] = 0;
+        }
+        if (out) {
+            file_close(out);
+            pipes_w[i] = 0;
+        }
+    }
+
+    int rc = 0;
+    for (int i = 0; i < pl->count; i++) {
+        int stage_rc = stage_status[i];
+        if (has_pid[i]) {
+            signal_set_foreground(pids[i]);
+            stage_rc = proc_wait(pids[i]);
+        }
+        if (i + 1 == pl->count) rc = stage_rc;
+    }
+    signal_set_foreground(0);
+    return rc;
+}
+
+static enum shell_tok_type shell_consume_separator(struct shell_token *tok,
+                                                   int ntok, int *io) {
+    if (*io >= ntok) return SH_TOK_SEMI;
+    enum shell_tok_type t = tok[*io].type;
+    if (shell_is_list_sep(t)) {
+        (*io)++;
+        return t;
+    }
+    return SH_TOK_SEMI;
+}
+
+static const char *shell_skip_blanks(const char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
+}
+
+static bool shell_starts_with_word(const char *s, const char *word) {
+    size_t n = strlen(word);
+    return strncmp(s, word, n) == 0 &&
+           (s[n] == '\0' || s[n] == ' ' || s[n] == '\t' ||
+            s[n] == ';' || s[n] == '\n' || s[n] == '\r');
+}
+
+static const char *shell_find_text(const char *s, const char *needle) {
+    size_t n = strlen(needle);
+    if (n == 0) return s;
+    for (; *s; s++) {
+        if (strncmp(s, needle, n) == 0) return s;
+    }
+    return 0;
+}
+
+static int shell_copy_segment(char *dst, size_t cap,
+                              const char *start, const char *end) {
+    if (!dst || cap == 0 || !start || !end || end < start) return -1;
+    while (start < end && (*start == ' ' || *start == '\t' || *start == ';')) {
+        start++;
+    }
+    while (end > start &&
+           (end[-1] == ' ' || end[-1] == '\t' || end[-1] == ';')) {
+        end--;
+    }
+    size_t n = (size_t)(end - start);
+    if (n + 1 > cap) return -1;
+    memcpy(dst, start, n);
+    dst[n] = '\0';
+    return 0;
+}
+
+static const char *shell_find_marker2(const char *s, const char *a,
+                                      const char *b, const char **found) {
+    const char *pa = shell_find_text(s, a);
+    const char *pb = shell_find_text(s, b);
+    if (pa && (!pb || pa < pb)) {
+        if (found) *found = a;
+        return pa;
+    }
+    if (pb) {
+        if (found) *found = b;
+        return pb;
+    }
+    return 0;
+}
+
+static bool shell_try_if_command(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (!shell_starts_with_word(s, "if")) return false;
+    s = shell_skip_blanks(s + 2);
+
+    const char *then_marker = 0;
+    const char *then_at = shell_find_marker2(s, "; then", ";then", &then_marker);
+    if (!then_at) {
+        kprintf("if: expected '; then'\n");
+        shell_set_status(2);
+        return true;
+    }
+    const char *after_then = then_at + strlen(then_marker);
+
+    const char *fi_marker = 0;
+    const char *fi_at = shell_find_marker2(after_then, "; fi", ";fi", &fi_marker);
+    if (!fi_at) {
+        kprintf("if: expected '; fi'\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    const char *else_marker = 0;
+    const char *else_at = shell_find_marker2(after_then, "; else", ";else",
+                                             &else_marker);
+    if (else_at && else_at > fi_at) else_at = 0;
+
+    char cond[LINE_MAX];
+    char yes[LINE_MAX];
+    char no[LINE_MAX];
+    if (shell_copy_segment(cond, sizeof(cond), s, then_at) < 0 ||
+        shell_copy_segment(yes, sizeof(yes), after_then,
+                           else_at ? else_at : fi_at) < 0 ||
+        shell_copy_segment(no, sizeof(no),
+                           else_at ? else_at + strlen(else_marker) : fi_at,
+                           fi_at) < 0) {
+        kprintf("if: command too long\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    execute_line_text(cond);
+    if (g_last_status == 0) {
+        execute_line_text(yes);
+    } else if (else_at) {
+        execute_line_text(no);
+    } else {
+        shell_set_status(0);
+    }
+    return true;
+}
+
+static bool shell_try_for_command(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (!shell_starts_with_word(s, "for")) return false;
+    s = shell_skip_blanks(s + 3);
+
+    const char *name_start = s;
+    if (!shell_var_start(*s)) {
+        kprintf("for: bad variable name\n");
+        shell_set_status(2);
+        return true;
+    }
+    while (shell_var_char(*s)) s++;
+    size_t name_len = (size_t)(s - name_start);
+    char name[64];
+    if (name_len + 1 > sizeof(name)) {
+        kprintf("for: variable name too long\n");
+        shell_set_status(2);
+        return true;
+    }
+    memcpy(name, name_start, name_len);
+    name[name_len] = '\0';
+
+    s = shell_skip_blanks(s);
+    if (!shell_starts_with_word(s, "in")) {
+        kprintf("for: expected 'in'\n");
+        shell_set_status(2);
+        return true;
+    }
+    s = shell_skip_blanks(s + 2);
+
+    const char *do_marker = 0;
+    const char *do_at = shell_find_marker2(s, "; do", ";do", &do_marker);
+    if (!do_at) {
+        kprintf("for: expected '; do'\n");
+        shell_set_status(2);
+        return true;
+    }
+    const char *done_marker = 0;
+    const char *done_at = shell_find_marker2(do_at + strlen(do_marker),
+                                             "; done", ";done", &done_marker);
+    if (!done_at) {
+        kprintf("for: expected '; done'\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    char list[LINE_MAX];
+    char body[LINE_MAX];
+    if (shell_copy_segment(list, sizeof(list), s, do_at) < 0 ||
+        shell_copy_segment(body, sizeof(body), do_at + strlen(do_marker),
+                           done_at) < 0) {
+        kprintf("for: command too long\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    struct shell_token tok[SHELL_TOKEN_MAX];
+    char words[SHELL_PARSE_BUF_MAX];
+    int ntok = 0;
+    if (shell_tokenize(list, tok, &ntok, words, sizeof(words)) < 0) {
+        shell_set_status(2);
+        return true;
+    }
+
+    int last = 0;
+    g_shell_loop_depth++;
+    for (int i = 0; i < ntok; i++) {
+        if (tok[i].type != SH_TOK_WORD) continue;
+        if (env_set(name, tok[i].text) < 0) {
+            kprintf("for: failed to set '%s'\n", name);
+            g_shell_loop_depth--;
+            shell_set_status(1);
+            return true;
+        }
+        execute_line_text(body);
+        last = g_last_status;
+        if (g_shell_flow == SHELL_FLOW_RETURN ||
+            g_shell_flow == SHELL_FLOW_EXIT) {
+            g_shell_loop_depth--;
+            return true;
+        }
+        if (g_shell_flow == SHELL_FLOW_BREAK) {
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+            g_shell_loop_depth--;
+            shell_set_status(last);
+            return true;
+        }
+        if (g_shell_flow == SHELL_FLOW_CONTINUE) {
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+            continue;
+        }
+    }
+    g_shell_loop_depth--;
+    shell_set_status(last);
+    return true;
+}
+
+static bool shell_try_while_command(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (!shell_starts_with_word(s, "while")) return false;
+    s = shell_skip_blanks(s + 5);
+
+    const char *do_marker = 0;
+    const char *do_at = shell_find_marker2(s, "; do", ";do", &do_marker);
+    if (!do_at) {
+        kprintf("while: expected '; do'\n");
+        shell_set_status(2);
+        return true;
+    }
+    const char *done_marker = 0;
+    const char *done_at = shell_find_marker2(do_at + strlen(do_marker),
+                                             "; done", ";done", &done_marker);
+    if (!done_at) {
+        kprintf("while: expected '; done'\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    char cond[LINE_MAX];
+    char body[LINE_MAX];
+    if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
+        shell_copy_segment(body, sizeof(body), do_at + strlen(do_marker),
+                           done_at) < 0) {
+        kprintf("while: command too long\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    int last = 0;
+    g_shell_loop_depth++;
+    for (int iter = 0; iter < 1024; iter++) {
+        execute_line_text(cond);
+        if (g_last_status != 0) {
+            g_shell_loop_depth--;
+            shell_set_status(last);
+            return true;
+        }
+        execute_line_text(body);
+        last = g_last_status;
+        if (g_shell_flow == SHELL_FLOW_RETURN ||
+            g_shell_flow == SHELL_FLOW_EXIT) {
+            g_shell_loop_depth--;
+            return true;
+        }
+        if (g_shell_flow == SHELL_FLOW_BREAK) {
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+            g_shell_loop_depth--;
+            shell_set_status(last);
+            return true;
+        }
+        if (g_shell_flow == SHELL_FLOW_CONTINUE) {
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+            continue;
+        }
+    }
+    g_shell_loop_depth--;
+    kprintf("while: iteration limit reached\n");
+    shell_set_status(2);
+    return true;
+}
+
+static bool shell_try_until_command(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (!shell_starts_with_word(s, "until")) return false;
+    s = shell_skip_blanks(s + 5);
+
+    const char *do_marker = 0;
+    const char *do_at = shell_find_marker2(s, "; do", ";do", &do_marker);
+    if (!do_at) {
+        kprintf("until: expected '; do'\n");
+        shell_set_status(2);
+        return true;
+    }
+    const char *done_marker = 0;
+    const char *done_at = shell_find_marker2(do_at + strlen(do_marker),
+                                             "; done", ";done", &done_marker);
+    if (!done_at) {
+        kprintf("until: expected '; done'\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    char cond[LINE_MAX];
+    char body[LINE_MAX];
+    if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
+        shell_copy_segment(body, sizeof(body), do_at + strlen(do_marker),
+                           done_at) < 0) {
+        kprintf("until: command too long\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    int last = 0;
+    g_shell_loop_depth++;
+    for (int iter = 0; iter < 1024; iter++) {
+        execute_line_text(cond);
+        if (g_last_status == 0) {
+            g_shell_loop_depth--;
+            shell_set_status(last);
+            return true;
+        }
+        execute_line_text(body);
+        last = g_last_status;
+        if (g_shell_flow == SHELL_FLOW_RETURN ||
+            g_shell_flow == SHELL_FLOW_EXIT) {
+            g_shell_loop_depth--;
+            return true;
+        }
+        if (g_shell_flow == SHELL_FLOW_BREAK) {
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+            g_shell_loop_depth--;
+            shell_set_status(last);
+            return true;
+        }
+        if (g_shell_flow == SHELL_FLOW_CONTINUE) {
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+            continue;
+        }
+    }
+    g_shell_loop_depth--;
+    kprintf("until: iteration limit reached\n");
+    shell_set_status(2);
+    return true;
+}
+
+static bool shell_word_boundary_before(const char *start, const char *p) {
+    return p == start || is_space(p[-1]) || p[-1] == ';';
+}
+
+static bool shell_word_boundary_after(const char *p) {
+    return *p == '\0' || is_space(*p) || *p == ';' || *p == ')';
+}
+
+static const char *shell_find_word_marker(const char *start,
+                                          const char *word) {
+    size_t n = strlen(word);
+    for (const char *p = start; *p; p++) {
+        if (strncmp(p, word, n) == 0 &&
+            shell_word_boundary_before(start, p) &&
+            shell_word_boundary_after(p + n)) {
+            return p;
+        }
+    }
+    return 0;
+}
+
+static int shell_expand_case_word(const char *src, char *out, size_t cap) {
+    struct shell_token tok[SHELL_TOKEN_MAX];
+    char words[SHELL_PARSE_BUF_MAX];
+    int ntok = 0;
+    if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) return -1;
+    for (int i = 0; i < ntok; i++) {
+        if (tok[i].type != SH_TOK_WORD) continue;
+        size_t n = strlen(tok[i].text);
+        if (n + 1 > cap) return -1;
+        memcpy(out, tok[i].text, n + 1);
+        return 0;
+    }
+    out[0] = '\0';
+    return 0;
+}
+
+static bool shell_case_pattern_match(const char *patterns, const char *word) {
+    const char *p = patterns;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '(') p++;
+        const char *start = p;
+        while (*p && *p != '|') p++;
+        const char *end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+
+        char pat[128];
+        if (shell_copy_segment(pat, sizeof(pat), start, end) == 0 &&
+            pat[0] && shell_glob_match(pat, word)) {
+            return true;
+        }
+        if (*p == '|') p++;
+    }
+    return false;
+}
+
+static bool shell_try_case_command(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (!shell_starts_with_word(s, "case")) return false;
+    s = shell_skip_blanks(s + 4);
+
+    const char *in_at = shell_find_word_marker(s, "in");
+    if (!in_at) {
+        kprintf("case: expected 'in'\n");
+        shell_set_status(2);
+        return true;
+    }
+    const char *esac_at = shell_find_word_marker(in_at + 2, "esac");
+    if (!esac_at) {
+        kprintf("case: expected 'esac'\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    char word_src[LINE_MAX];
+    char word[SHELL_PARSE_BUF_MAX];
+    if (shell_copy_segment(word_src, sizeof(word_src), s, in_at) < 0 ||
+        shell_expand_case_word(word_src, word, sizeof(word)) < 0) {
+        kprintf("case: word too long\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    const char *p = shell_skip_blanks(in_at + 2);
+    if (*p == ';') p++;
+    int last = 0;
+    bool matched = false;
+
+    while (p < esac_at) {
+        while (p < esac_at && (is_space(*p) || *p == ';')) p++;
+        if (p >= esac_at) break;
+
+        const char *close = p;
+        while (close < esac_at && *close != ')') close++;
+        if (close >= esac_at) {
+            kprintf("case: expected ')'\n");
+            shell_set_status(2);
+            return true;
+        }
+
+        const char *body = close + 1;
+        const char *sep = shell_find_text(body, ";;");
+        if (!sep || sep > esac_at) sep = esac_at;
+
+        char pats[128];
+        char body_text[LINE_MAX];
+        if (shell_copy_segment(pats, sizeof(pats), p, close) < 0 ||
+            shell_copy_segment(body_text, sizeof(body_text), body, sep) < 0) {
+            kprintf("case: clause too long\n");
+            shell_set_status(2);
+            return true;
+        }
+
+        if (!matched && shell_case_pattern_match(pats, word)) {
+            matched = true;
+            execute_line_text(body_text);
+            last = g_last_status;
+            shell_set_status(last);
+            return true;
+        }
+
+        p = (sep < esac_at) ? sep + 2 : esac_at;
+    }
+
+    shell_set_status(0);
+    return true;
+}
+
+static bool shell_try_function_definition(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (!shell_var_start(*s)) return false;
+
+    const char *name_start = s;
+    while (shell_var_char(*s)) s++;
+    size_t name_len = (size_t)(s - name_start);
+    const char *after_name = shell_skip_blanks(s);
+    if (after_name[0] != '(' || after_name[1] != ')') return false;
+
+    s = shell_skip_blanks(after_name + 2);
+    if (*s != '{') {
+        kprintf("function: expected '{'\n");
+        shell_set_status(2);
+        return true;
+    }
+    const char *body_start = s + 1;
+    const char *body_end = 0;
+    int depth = 1;
+    bool in_single = false;
+    bool in_double = false;
+    for (const char *p = body_start; *p; p++) {
+        if (in_single) {
+            if (*p == '\'') in_single = false;
+            continue;
+        }
+        if (in_double) {
+            if (*p == '\\' && p[1]) {
+                p++;
+                continue;
+            }
+            if (*p == '"') in_double = false;
+            continue;
+        }
+        if (*p == '\'') {
+            in_single = true;
+            continue;
+        }
+        if (*p == '"') {
+            in_double = true;
+            continue;
+        }
+        if (*p == '{') depth++;
+        else if (*p == '}') {
+            depth--;
+            if (depth == 0) {
+                body_end = p;
+                break;
+            }
+        }
+    }
+    if (!body_end) {
+        kprintf("function: expected '}'\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    char name[64];
+    char body[LINE_MAX];
+    if (name_len == 0 || name_len + 1 > sizeof(name) ||
+        shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
+        kprintf("function: definition too long\n");
+        shell_set_status(2);
+        return true;
+    }
+    memcpy(name, name_start, name_len);
+    name[name_len] = '\0';
+    if (shell_function_set(name, body) < 0) {
+        kprintf("function: failed to define '%s'\n", name);
+        shell_set_status(1);
+        return true;
+    }
+    shell_set_status(0);
+    return true;
+}
+
+struct shell_param_snapshot {
+    char *param0;
+    char *positional[ARG_MAX];
+    int positional_count;
+};
+
+static void shell_param_snapshot_clear(struct shell_param_snapshot *frame) {
+    if (!frame) return;
+    if (frame->param0) {
+        kfree(frame->param0);
+        frame->param0 = 0;
+    }
+    for (int i = 0; i < frame->positional_count; i++) {
+        if (frame->positional[i]) kfree(frame->positional[i]);
+        frame->positional[i] = 0;
+    }
+    frame->positional_count = 0;
+}
+
+static int shell_param_snapshot_capture(struct shell_param_snapshot *frame) {
+    if (!frame) return -1;
+    memset(frame, 0, sizeof(*frame));
+    if (g_param0) {
+        frame->param0 = shell_strdup(g_param0);
+        if (!frame->param0) return -1;
+    }
+    frame->positional_count = g_positional_count;
+    for (int i = 0; i < g_positional_count; i++) {
+        frame->positional[i] = shell_strdup(g_positional[i]);
+        if (!frame->positional[i]) {
+            shell_param_snapshot_clear(frame);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void shell_param_snapshot_restore(struct shell_param_snapshot *frame) {
+    if (!frame) return;
+    shell_free_current_params();
+    g_param0 = frame->param0;
+    frame->param0 = 0;
+    g_positional_count = frame->positional_count;
+    for (int i = 0; i < g_positional_count; i++) {
+        g_positional[i] = frame->positional[i];
+        frame->positional[i] = 0;
+    }
+    frame->positional_count = 0;
+}
+
+struct shell_alias_frame {
+    char *name[SHELL_ALIAS_MAX];
+    char *value[SHELL_ALIAS_MAX];
+};
+
+static void shell_alias_frame_clear(struct shell_alias_frame *frame) {
+    if (!frame) return;
+    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+        if (frame->name[i]) kfree(frame->name[i]);
+        if (frame->value[i]) kfree(frame->value[i]);
+        frame->name[i] = 0;
+        frame->value[i] = 0;
+    }
+}
+
+static int shell_alias_frame_capture(struct shell_alias_frame *frame) {
+    if (!frame) return -1;
+    memset(frame, 0, sizeof(*frame));
+    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+        if (!g_aliases[i].name) continue;
+        frame->name[i] = shell_strdup(g_aliases[i].name);
+        frame->value[i] = shell_strdup(g_aliases[i].value);
+        if (!frame->name[i] || !frame->value[i]) {
+            shell_alias_frame_clear(frame);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void shell_alias_frame_restore(struct shell_alias_frame *frame) {
+    if (!frame) return;
+    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+        if (g_aliases[i].name) kfree(g_aliases[i].name);
+        if (g_aliases[i].value) kfree(g_aliases[i].value);
+        g_aliases[i].name = frame->name[i];
+        g_aliases[i].value = frame->value[i];
+        frame->name[i] = 0;
+        frame->value[i] = 0;
+    }
+}
+
+struct shell_function_frame {
+    char *name[SHELL_FUNC_MAX];
+    char *body[SHELL_FUNC_MAX];
+};
+
+static void shell_function_frame_clear(struct shell_function_frame *frame) {
+    if (!frame) return;
+    for (int i = 0; i < SHELL_FUNC_MAX; i++) {
+        if (frame->name[i]) kfree(frame->name[i]);
+        if (frame->body[i]) kfree(frame->body[i]);
+        frame->name[i] = 0;
+        frame->body[i] = 0;
+    }
+}
+
+static int shell_function_frame_capture(struct shell_function_frame *frame) {
+    if (!frame) return -1;
+    memset(frame, 0, sizeof(*frame));
+    for (int i = 0; i < SHELL_FUNC_MAX; i++) {
+        if (!g_functions[i].name) continue;
+        frame->name[i] = shell_strdup(g_functions[i].name);
+        frame->body[i] = shell_strdup(g_functions[i].body);
+        if (!frame->name[i] || !frame->body[i]) {
+            shell_function_frame_clear(frame);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void shell_function_frame_restore(struct shell_function_frame *frame) {
+    if (!frame) return;
+    for (int i = 0; i < SHELL_FUNC_MAX; i++) {
+        if (g_functions[i].name) kfree(g_functions[i].name);
+        if (g_functions[i].body) kfree(g_functions[i].body);
+        g_functions[i].name = frame->name[i];
+        g_functions[i].body = frame->body[i];
+        frame->name[i] = 0;
+        frame->body[i] = 0;
+    }
+}
+
+struct shell_readonly_frame {
+    char *name[SHELL_READONLY_MAX];
+};
+
+static void shell_readonly_frame_clear(struct shell_readonly_frame *frame) {
+    if (!frame) return;
+    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+        if (frame->name[i]) kfree(frame->name[i]);
+        frame->name[i] = 0;
+    }
+}
+
+static int shell_readonly_frame_capture(struct shell_readonly_frame *frame) {
+    if (!frame) return -1;
+    memset(frame, 0, sizeof(*frame));
+    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+        if (!g_readonly[i]) continue;
+        frame->name[i] = shell_strdup(g_readonly[i]);
+        if (!frame->name[i]) {
+            shell_readonly_frame_clear(frame);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void shell_readonly_frame_restore(struct shell_readonly_frame *frame) {
+    if (!frame) return;
+    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+        if (g_readonly[i]) kfree(g_readonly[i]);
+        g_readonly[i] = frame->name[i];
+        frame->name[i] = 0;
+    }
+}
+
+struct shell_subshell_frame {
+    struct shell_env_frame env;
+    struct shell_param_snapshot params;
+    struct shell_alias_frame aliases;
+    struct shell_function_frame functions;
+    struct shell_readonly_frame readonly;
+    struct shell_trap_frame traps;
+    char cwd[VFS_PATH_MAX];
+    enum shell_flow flow;
+    int flow_status;
+    int loop_depth;
+};
+
+static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
+    if (!frame) return;
+    shell_env_frame_clear(&frame->env);
+    shell_param_snapshot_clear(&frame->params);
+    shell_alias_frame_clear(&frame->aliases);
+    shell_function_frame_clear(&frame->functions);
+    shell_readonly_frame_clear(&frame->readonly);
+    for (int i = 0; i < SIG_MAX; i++) {
+        if (frame->traps.trap[i]) kfree(frame->traps.trap[i]);
+        frame->traps.trap[i] = 0;
+    }
+}
+
+static int shell_subshell_frame_capture(struct shell_subshell_frame *frame) {
+    if (!frame) return -1;
+    memset(frame, 0, sizeof(*frame));
+    const char *cwd = shell_cwd();
+    if (!cwd || strlen(cwd) + 1 > sizeof(frame->cwd)) return -1;
+    memcpy(frame->cwd, cwd, strlen(cwd) + 1);
+    frame->flow = g_shell_flow;
+    frame->flow_status = g_shell_flow_status;
+    frame->loop_depth = g_shell_loop_depth;
+
+    if (shell_env_frame_capture(&frame->env) < 0 ||
+        shell_param_snapshot_capture(&frame->params) < 0 ||
+        shell_alias_frame_capture(&frame->aliases) < 0 ||
+        shell_function_frame_capture(&frame->functions) < 0 ||
+        shell_readonly_frame_capture(&frame->readonly) < 0 ||
+        shell_trap_enter_child(&frame->traps) < 0) {
+        shell_subshell_frame_clear(frame);
+        return -1;
+    }
+    return 0;
+}
+
+static void shell_subshell_frame_restore(struct shell_subshell_frame *frame) {
+    if (!frame) return;
+    shell_env_frame_restore(&frame->env);
+    shell_param_snapshot_restore(&frame->params);
+    shell_alias_frame_restore(&frame->aliases);
+    shell_function_frame_restore(&frame->functions);
+    shell_readonly_frame_restore(&frame->readonly);
+    shell_trap_restore(&frame->traps);
+    shell_restore_cwd_only(frame->cwd);
+    g_shell_flow = frame->flow;
+    g_shell_flow_status = frame->flow_status;
+    g_shell_loop_depth = frame->loop_depth;
+}
+
+static bool shell_subshell_tail_can_follow(const char *tail) {
+    tail = shell_skip_blanks(tail);
+    if (!*tail) return true;
+    if (*tail == ';') {
+        tail = shell_skip_blanks(tail + 1);
+        return *tail == '\0';
+    }
+    if (*tail == '<' || *tail == '>') return true;
+    if (shell_is_digit(*tail)) {
+        while (shell_is_digit(*tail)) tail++;
+        return *tail == '<' || *tail == '>';
+    }
+    return false;
+}
+
+static bool shell_try_subshell_command(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (*s != '(') return false;
+
+    const char *body_start = s + 1;
+    const char *body_end = 0;
+    int depth = 1;
+    bool in_single = false;
+    bool in_double = false;
+    for (const char *p = body_start; *p; p++) {
+        if (in_single) {
+            if (*p == '\'') in_single = false;
+            continue;
+        }
+        if (in_double) {
+            if (*p == '\\' && p[1]) {
+                p++;
+                continue;
+            }
+            if (*p == '"') in_double = false;
+            continue;
+        }
+        if (*p == '\\' && p[1]) {
+            p++;
+            continue;
+        }
+        if (*p == '\'') {
+            in_single = true;
+            continue;
+        }
+        if (*p == '"') {
+            in_double = true;
+            continue;
+        }
+        if (*p == '(') {
+            depth++;
+            continue;
+        }
+        if (*p == ')') {
+            if (depth > 1) {
+                depth--;
+                continue;
+            }
+            if (shell_subshell_tail_can_follow(p + 1)) {
+                body_end = p;
+                break;
+            }
+        }
+    }
+    if (!body_end) {
+        kprintf("subshell: expected ')'\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    char body[LINE_MAX];
+    if (shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
+        kprintf("subshell: body too long\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    struct shell_simple redirs;
+    shell_simple_init(&redirs);
+    const char *tail = shell_skip_blanks(body_end + 1);
+    if (*tail) {
+        struct shell_token tok[SHELL_TOKEN_MAX];
+        char words[SHELL_PARSE_BUF_MAX];
+        int ntok = 0;
+        if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
+            shell_set_status(2);
+            return true;
+        }
+        int i = 0;
+        struct shell_pipeline pl;
+        int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
+        if (parsed < 0 || parsed == 0 || pl.count != 1 ||
+            pl.stage[0].argc != 0) {
+            kprintf("subshell: expected only redirections after ')'\n");
+            shell_set_status(2);
+            return true;
+        }
+        enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
+        if (sep != SH_TOK_SEMI || i < ntok) {
+            kprintf("subshell: unexpected text after redirection\n");
+            shell_set_status(2);
+            return true;
+        }
+        redirs = pl.stage[0];
+    }
+
+    struct shell_subshell_frame state;
+    if (shell_subshell_frame_capture(&state) < 0) {
+        kprintf("subshell: failed to save shell state\n");
+        shell_set_status(1);
+        return true;
+    }
+
+    struct shell_io_frame io_frame;
+    bool io_active = false;
+    if (redirs.redir_count > 0) {
+        if (shell_enter_io_frame(&redirs, "subshell", &io_frame) < 0) {
+            shell_subshell_frame_restore(&state);
+            shell_set_status(1);
+            return true;
+        }
+        io_active = true;
+    }
+
+    g_subshell_depth++;
+    g_shell_flow = SHELL_FLOW_NONE;
+    g_shell_flow_status = 0;
+    g_shell_loop_depth = 0;
+
+    execute_line_text(body);
+    int rc = g_last_status;
+    if (g_shell_flow == SHELL_FLOW_EXIT) {
+        rc = g_shell_flow_status;
+    }
+    rc = shell_run_exit_trap(rc);
+
+    g_subshell_depth--;
+    if (io_active) shell_restore_io_frame(&io_frame);
+    shell_subshell_frame_restore(&state);
+    shell_set_status(rc);
+    return true;
+}
+
+static bool shell_try_group_command(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (*s != '{') return false;
+
+    const char *body_start = s + 1;
+    const char *body_end = 0;
+    int depth = 1;
+    bool in_single = false;
+    bool in_double = false;
+    for (const char *p = body_start; *p; p++) {
+        if (in_single) {
+            if (*p == '\'') in_single = false;
+            continue;
+        }
+        if (in_double) {
+            if (*p == '\\' && p[1]) {
+                p++;
+                continue;
+            }
+            if (*p == '"') in_double = false;
+            continue;
+        }
+        if (*p == '\'') {
+            in_single = true;
+            continue;
+        }
+        if (*p == '"') {
+            in_double = true;
+            continue;
+        }
+        if (*p == '{') {
+            depth++;
+            continue;
+        }
+        if (*p == '}') {
+            depth--;
+            if (depth == 0) {
+                body_end = p;
+                break;
+            }
+        }
+    }
+    if (!body_end) {
+        kprintf("group: expected '}'\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    char body[LINE_MAX];
+    if (shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
+        kprintf("group: body too long\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    struct shell_simple redirs;
+    shell_simple_init(&redirs);
+    const char *tail = shell_skip_blanks(body_end + 1);
+    if (*tail) {
+        struct shell_token tok[SHELL_TOKEN_MAX];
+        char words[SHELL_PARSE_BUF_MAX];
+        int ntok = 0;
+        if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
+            shell_set_status(2);
+            return true;
+        }
+        int i = 0;
+        struct shell_pipeline pl;
+        int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
+        if (parsed < 0 || parsed == 0 || pl.count != 1 ||
+            pl.stage[0].argc != 0) {
+            kprintf("group: expected only redirections after '}'\n");
+            shell_set_status(2);
+            return true;
+        }
+        enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
+        if (sep != SH_TOK_SEMI || i < ntok) {
+            kprintf("group: unexpected text after redirection\n");
+            shell_set_status(2);
+            return true;
+        }
+        redirs = pl.stage[0];
+    }
+
+    struct shell_io_frame io_frame;
+    bool io_active = false;
+    if (redirs.redir_count > 0) {
+        if (shell_enter_io_frame(&redirs, "group", &io_frame) < 0) {
+            shell_set_status(1);
+            return true;
+        }
+        io_active = true;
+    }
+
+    execute_line_text(body);
+    int rc = g_last_status;
+    if (io_active) shell_restore_io_frame(&io_frame);
+    shell_set_status(rc);
+    return true;
+}
+
+static void execute_line_text(const char *src) {
+    struct shell_token tok[SHELL_TOKEN_MAX];
+    char words[SHELL_PARSE_BUF_MAX];
+    char alias_buf[SHELL_PARSE_BUF_MAX];
+    int ntok = 0;
+
+    src = src ? src : "";
+    if (g_shell_flow != SHELL_FLOW_NONE) return;
+    if (shell_try_function_definition(src)) return;
+    src = shell_expand_aliases(src, alias_buf, sizeof(alias_buf));
+    if (!src) {
+        shell_set_status(2);
+        return;
+    }
+    if (shell_try_if_command(src) ||
+        shell_try_for_command(src) ||
+        shell_try_while_command(src) ||
+        shell_try_until_command(src) ||
+        shell_try_case_command(src) ||
+        shell_try_group_command(src) ||
+        shell_try_subshell_command(src)) {
         return;
     }
 
-    /* Builtin path: synchronous, runs inside the shell. */
-    for (const struct cmd *c = cmds; c->name; c++) {
-        if (strcmp(argv[0], c->name) == 0) {
-            if (background) {
-                kprintf("'%s': builtins can't be backgrounded with '&'\n",
-                        argv[0]);
-                return;
-            }
-            c->fn(argc, argv);
+    if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) {
+        shell_set_status(2);
+        return;
+    }
+    if (ntok == 0) return;
+
+    int i = 0;
+    enum shell_tok_type prev_link = SH_TOK_SEMI;
+    int last = g_last_status;
+
+    while (i < ntok) {
+        while (i < ntok && tok[i].type == SH_TOK_SEMI) i++;
+        if (i >= ntok) break;
+
+        bool should_run = (prev_link == SH_TOK_SEMI || prev_link == SH_TOK_BG) ||
+                          (prev_link == SH_TOK_AND_IF && last == 0) ||
+                          (prev_link == SH_TOK_OR_IF && last != 0);
+
+        struct shell_pipeline pl;
+        int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
+        if (parsed < 0) {
+            shell_set_status(2);
             return;
         }
-    }
+        if (parsed == 0) {
+            kprintf("shell: expected command\n");
+            shell_set_status(2);
+            return;
+        }
 
-    /* Implicit-ELF dispatch: not a builtin -> assume the user typed a
-     * program name (e.g. `long_task &`, `echo hi`). Resolve via /bin/
-     * if no slash, spawn either fg or bg per the `&` flag. */
-    shell_spawn_program(argv[0], argc, argv, background);
+        enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
+        bool background = (sep == SH_TOK_BG);
+        if (should_run) {
+            last = shell_run_pipeline(&pl, background);
+            shell_set_status(last);
+            if (g_shell_flow != SHELL_FLOW_NONE) return;
+        }
+        prev_link = sep;
+    }
+}
+
+static void execute_line(void) {
+    execute_line_text(line);
 }
 
 void shell_init(void) {
@@ -2586,7 +7747,13 @@ void shell_init(void) {
     /* Milestone 25C: stamp boot-time PATH/HOME/USER/PWD/SHELL so any
      * implicit-ELF dispatch immediately has a search path and so any
      * libtoby-linked child sees a meaningful environ at exec. */
+    for (int i = 0; i < 3; i++) g_shell_fd[i] = 0;
     env_init_defaults();
+    g_getopts_last_optind = 1;
+    g_getopts_char_index = 1;
+    shell_trap_clear_all();
+    if (shell_set_param0("tobysh") < 0) kprintf("shell: failed to set $0\n");
+    (void)shell_set_positional_params(0, 0);
     kprintf("type 'help' to list commands.\n");
     prompt();
 }

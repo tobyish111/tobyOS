@@ -53,4 +53,13 @@ void kvprintf(const char *fmt, va_list ap);
  * -- that is acceptable for the usage pattern (interactive commands). */
 void printk_set_sink(void (*cb)(void *ctx, char c), void *ctx);
 
+/* Same sink hook with optional diversion. When suppress_normal_output is
+ * true, bytes are delivered only to the sink and are not mirrored to
+ * serial, the framebuffer console, or the boot log. Save/restore helpers
+ * let temporary users compose without trampling an existing sink. */
+void printk_set_sink_mode(void (*cb)(void *ctx, char c), void *ctx,
+                          bool suppress_normal_output);
+void printk_get_sink(void (**cb)(void *ctx, char c), void **ctx,
+                     bool *suppress_normal_output);
+
 #endif /* TOBYOS_PRINTK_H */

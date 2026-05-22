@@ -22,6 +22,7 @@
  * off to cb(ctx, c). See printk.h for the semantics + caveats. */
 static void (*g_sink_cb)(void *ctx, char c) = 0;
 static void *g_sink_ctx = 0;
+static bool g_sink_suppress = false;
 
 /* Milestone 22 step 5: serialise the entire kvprintf body so two
  * CPUs printing concurrently never interleave individual characters
@@ -39,15 +40,30 @@ static void *g_sink_ctx = 0;
 static spinlock_t g_printk_lock = SPINLOCK_INIT;
 
 void printk_set_sink(void (*cb)(void *ctx, char c), void *ctx) {
-    g_sink_cb  = cb;
-    g_sink_ctx = ctx;
+    printk_set_sink_mode(cb, ctx, false);
+}
+
+void printk_set_sink_mode(void (*cb)(void *ctx, char c), void *ctx,
+                          bool suppress_normal_output) {
+    g_sink_cb       = cb;
+    g_sink_ctx      = ctx;
+    g_sink_suppress = cb ? suppress_normal_output : false;
+}
+
+void printk_get_sink(void (**cb)(void *ctx, char c), void **ctx,
+                     bool *suppress_normal_output) {
+    if (cb) *cb = g_sink_cb;
+    if (ctx) *ctx = g_sink_ctx;
+    if (suppress_normal_output) *suppress_normal_output = g_sink_suppress;
 }
 
 static void emit_char(char c) {
-    serial_putc(c);
-    if (console_ready()) console_putc(c);
+    if (!g_sink_suppress) {
+        serial_putc(c);
+        if (console_ready()) console_putc(c);
+    }
     if (g_sink_cb) g_sink_cb(g_sink_ctx, c);
-    bootlog_char(c);
+    if (!g_sink_suppress) bootlog_char(c);
 }
 
 static void emit_str(const char *s) {
@@ -86,6 +102,7 @@ static void emit_uint(uint64_t v, unsigned base, bool upper,
 
 /* Monotonic ms since PIT started (IRQ0 ticks); before pit_init(), hz is 0. */
 static void emit_ts_prefix(void) {
+    if (g_sink_suppress) return;
     emit_char('[');
     uint32_t hz = pit_hz();
     if (hz == 0) {

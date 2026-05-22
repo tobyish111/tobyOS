@@ -1958,6 +1958,12 @@ sectest:
 	rm -f src/sectest.o src/kernel.o src/shell.o $(KERNEL) $(ISO)
 	$(MAKE) all EXTRA_CFLAGS="-DSECTEST_AUTORUN"
 
+# POSIX shell compatibility smoke build. Keeps QUICK_BOOT so the boot
+# log is dominated by the shell-language sentinels the driver checks.
+posixshtest:
+	rm -f src/kernel.o src/shell.o src/printk.o $(KERNEL) $(ISO)
+	$(MAKE) all EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DPOSIX_SHELL_SELFTEST"
+
 # Milestone-24D HTTP-pkg self-test build. Wipes intermediate
 # artifacts and rebuilds with -DHTTP_M24D_SELFTEST so kmain's
 # http_m24d_selftest() drives the full

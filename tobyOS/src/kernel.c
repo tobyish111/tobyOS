@@ -950,6 +950,173 @@ static void user_shell_smoketest(void) {
     kprintf("[boot] M25C: shell smoketest done\n");
 }
 
+/* POSIX shell compatibility track: boot-driven smoke harness for the
+ * command language features that tobysh is growing toward. This stays
+ * deliberately sentinel-oriented so the PowerShell driver can validate
+ * behaviour from serial.log without trying to interact with the shell. */
+static void posix_shell_selftest(void) {
+    static const char *lines[] = {
+        "echo POSIXSH: start",
+        "echo POSIXSH: subst=$(echo ok)",
+        "echo POSIXSH: backtick=`echo ok2`",
+        "false || echo POSIXSH: or-ok",
+        "true && echo POSIXSH: and-ok",
+        "if false; then echo POSIXSH: if-bad; else echo POSIXSH: if-ok; fi",
+        "for x in alpha beta; do echo POSIXSH: for-$x; done",
+        "set -- one two three",
+        "echo POSIXSH: params count=$# first=$1 all=$*",
+        "echo POSIXSH: default=${POSIX_MISSING:-fallback}",
+        "echo POSIXSH: assign=${POSIX_ASSIGN:=setnow} again=$POSIX_ASSIGN",
+        "echo POSIXSH: alt=${POSIX_ASSIGN:+alt}",
+        "echo POSIXSH: len=${#POSIX_ASSIGN}",
+        "echo POSIXSH: arith=$((1+2*3))",
+        "alias px='echo POSIXSH: alias-ok'",
+        "px",
+        "unalias px",
+        "greet() { echo POSIXSH: func-$1-$#; return 0; }",
+        "greet one two",
+        "case beta in alpha) echo POSIXSH: case-bad ;; beta) echo POSIXSH: case-ok ;; *) echo POSIXSH: case-wild ;; esac",
+        "for x in keep skip stop later; do case $x in skip) continue ;; stop) break ;; *) echo POSIXSH: loop-$x ;; esac; done",
+        "until false; do echo POSIXSH: until-once; break; done",
+        "write /data/posixsh_source.sh echo POSIXSH: script-ok",
+        "sh /data/posixsh_source.sh",
+        "write /data/posixsh_return.sh 'echo POSIXSH: return-before; return 7; echo POSIXSH: return-bad'",
+        "sh /data/posixsh_return.sh",
+        "echo POSIXSH: return-status=$?",
+        "sh -c 'echo POSIXSH: shc-$0-$1-$#' label arg1",
+        "/bin/echo POSIXSH: fd1-file >/data/posixsh_fd1.txt",
+        "cat /data/posixsh_fd1.txt",
+        "p_cat /data/posixsh_no_fd2 2>/data/posixsh_fd2.txt",
+        "cat /data/posixsh_fd2.txt",
+        "p_cat /data/posixsh_no_merge >/data/posixsh_merge.txt 2>&1",
+        "cat /data/posixsh_merge.txt",
+        "p_cat /data/posixsh_order 2>&1 >/data/posixsh_order.txt",
+        "echo POSIXSH: dup-order-status=$?",
+        "p_cat /data/posixsh_closed 2>&-",
+        "echo POSIXSH: close-fd-status=$?",
+        "> /data/posixsh_redir_only.txt",
+        "/bin/echo POSIXSH: redir-only-ok >>/data/posixsh_redir_only.txt",
+        "cat /data/posixsh_redir_only.txt",
+        "write /data/posixsh_read.txt alpha beta gamma",
+        "read POSIX_R1 POSIX_R2 < /data/posixsh_read.txt",
+        "echo POSIXSH: read-file-$POSIX_R1-$POSIX_R2",
+        "echo POSIXSH: builtin-pipe | p_cat",
+        "pipefn() { echo POSIXSH: function-pipe; }",
+        "pipefn | p_cat",
+        "echo piped value | read POSIX_PIPE_A POSIX_PIPE_B",
+        "echo POSIXSH: read-pipe-status=$? var=${POSIX_PIPE_A:-unset}-${POSIX_PIPE_B:-unset}",
+        "cd /data | true",
+        "echo POSIXSH: pipe-cwd-$PWD",
+        "/bin/echo POSIXSH: wait-bg >/data/posixsh_wait.txt &",
+        "echo POSIXSH: bgpid=$!",
+        "wait $!",
+        "echo POSIXSH: wait-status=$?",
+        "cat /data/posixsh_wait.txt",
+        "/bin/echo POSIXSH: wait-all-bg >/data/posixsh_wait_all.txt &",
+        "wait",
+        "echo POSIXSH: wait-all-status=$?",
+        "cat /data/posixsh_wait_all.txt",
+        "POSIX_SPECIAL=kept export POSIX_SPECIAL",
+        "echo POSIXSH: special-assign=$POSIX_SPECIAL",
+        "POSIX_TEMP=visible env >/data/posixsh_env_tmp.txt",
+        "cat /data/posixsh_env_tmp.txt",
+        "echo POSIXSH: temp-after=${POSIX_TEMP:-unset}",
+        "readonly POSIX_RO=locked",
+        "POSIX_RO=changed",
+        "echo POSIXSH: readonly-status=$? value=$POSIX_RO",
+        "set -- shift-a shift-b shift-c",
+        "shift 2",
+        "echo POSIXSH: shift-$#-$1",
+        "set -- -a -b bee rest",
+        "OPTIND=1",
+        "while getopts ab: opt; do echo POSIXSH: getopts-$opt-${OPTARG:-none}-$OPTIND; done",
+        "echo POSIXSH: getopts-done-$OPTIND",
+        "set -- -abbee",
+        "OPTIND=1",
+        "while getopts ab: opt; do echo POSIXSH: getopts-group-$opt-${OPTARG:-none}-$OPTIND; done",
+        "OPTIND=1",
+        "getopts x: opt -x explicit tail",
+        "echo POSIXSH: getopts-explicit-$opt-$OPTARG-$OPTIND",
+        "set -- -z",
+        "OPTIND=1",
+        "getopts :a opt",
+        "echo POSIXSH: getopts-bad-$opt-$OPTARG-$?",
+        "set -- -b",
+        "OPTIND=1",
+        "getopts :b: opt",
+        "echo POSIXSH: getopts-missing-$opt-$OPTARG-$?",
+        "command -V export",
+        "sh -c 'echo POSIXSH: exit-before; exit 9; echo POSIXSH: exit-bad'",
+        "echo POSIXSH: exit-status=$?",
+        "sh -c 'trap \"echo POSIXSH: trap-exit\" EXIT; echo POSIXSH: trap-body'",
+        "echo POSIXSH: trap-status=$?",
+        "sh -c 'trap \"echo POSIXSH: trap-reset-bad\" EXIT; trap - EXIT; echo POSIXSH: trap-reset-ok'",
+        "command -V trap",
+        "fredir() { echo POSIXSH: func-redir-one; echo POSIXSH: func-redir-two; }",
+        "fredir >/data/posixsh_func_redir.txt",
+        "cat /data/posixsh_func_redir.txt",
+        "fxredir() { /bin/echo POSIXSH: func-ext-redir; }",
+        "fxredir >/data/posixsh_func_ext.txt",
+        "cat /data/posixsh_func_ext.txt",
+        "{ echo POSIXSH: group-redir-one; echo POSIXSH: group-redir-two; } >/data/posixsh_group_redir.txt",
+        "cat /data/posixsh_group_redir.txt",
+        "( cd /data; POSIX_SUB=inside; readonly POSIX_SUB_RO=locked; sh -c 'echo POSIXSH: subshell-pwd-$PWD var-$POSIX_SUB'; trap \"echo POSIXSH: subshell-trap\" EXIT ) >/data/posixsh_subshell.txt",
+        "cat /data/posixsh_subshell.txt",
+        "echo POSIXSH: subshell-outer-pwd=$PWD var=${POSIX_SUB:-unset}",
+        "( alias subalias='echo POSIXSH: subshell-alias-bad' )",
+        "alias subalias || echo POSIXSH: subshell-alias-isolated",
+        "( subfn() { echo POSIXSH: subshell-function-bad; } )",
+        "command -v subfn || echo POSIXSH: subshell-function-isolated",
+        "POSIX_SUB_RO=changed",
+        "echo POSIXSH: subshell-readonly-status=$?",
+        "( echo POSIXSH: subshell-exit-before; exit 6; echo POSIXSH: subshell-exit-bad )",
+        "echo POSIXSH: subshell-exit-status=$?",
+        "( echo POSIXSH: subshell-redir-one; echo POSIXSH: subshell-redir-two ) >/data/posixsh_subshell_redir.txt",
+        "cat /data/posixsh_subshell_redir.txt",
+        "eval echo POSIXSH: eval-ok",
+        "touch /data/posixsh_a.txt",
+        "touch /data/posixsh_b.txt",
+        "echo POSIXSH: glob /data/posixsh_?.txt",
+        "echo POSIXSH: colon-before; :; echo POSIXSH: colon-after",
+        "command -v echo",
+        "which echo",
+        "echo POSIXSH: done",
+        0
+    };
+    static const char heredoc_script[] =
+        "/bin/cat <<EOF\n"
+        "POSIXSH: heredoc-$POSIX_ASSIGN\n"
+        "EOF\n";
+    static const char read_heredoc_script[] =
+        "read POSIX_H1 POSIX_H2 <<EOF\n"
+        "one two\n"
+        "EOF\n"
+        "echo POSIXSH: read-heredoc-$POSIX_H1-$POSIX_H2\n";
+
+    int hrc = vfs_write_all("/data/posixsh_heredoc.sh",
+                            heredoc_script, strlen(heredoc_script));
+    if (hrc != VFS_OK) {
+        kprintf("POSIXSH: heredoc-setup-failed %s\n", vfs_strerror(hrc));
+    }
+    int rhrc = vfs_write_all("/data/posixsh_read_heredoc.sh",
+                             read_heredoc_script,
+                             strlen(read_heredoc_script));
+    if (rhrc != VFS_OK) {
+        kprintf("POSIXSH: read-heredoc-setup-failed %s\n",
+                vfs_strerror(rhrc));
+    }
+
+    kprintf("[boot] POSIXSH: starting shell compatibility smoke\n");
+    for (int i = 0; lines[i]; i++) {
+        shell_run_test_line(lines[i]);
+        if (strcmp(lines[i], "sh /data/posixsh_source.sh") == 0) {
+            shell_run_test_line("sh /data/posixsh_heredoc.sh");
+            shell_run_test_line("sh /data/posixsh_read_heredoc.sh");
+        }
+    }
+    kprintf("POSIXSH: PASS\n");
+}
+
 /* Milestone 26A: post-shell_init validation for the new shell builtins
  * + userland test programs. Runs `devlist` and `drvtest` via the shell
  * (kernel-side path), then spawns each /bin/<tool> with representative
@@ -2906,6 +3073,9 @@ void _start(void) {
         devtest_boot_run();
 #endif
         shell_init();
+#ifdef POSIX_SHELL_SELFTEST
+        posix_shell_selftest();
+#endif
 #ifndef QUICK_BOOT
         /* Milestone 25C: drive the shell over a few synthetic command
          * lines BEFORE the idle loop starts polling the keyboard. This
