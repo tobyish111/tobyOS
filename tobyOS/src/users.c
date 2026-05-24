@@ -80,6 +80,7 @@ static void install_defaults(void) {
         copy_capped(g_users[g_count].name, g_defaults[i].name, USER_NAME_MAX);
         g_users[g_count].uid = g_defaults[i].uid;
         g_users[g_count].gid = g_defaults[i].gid;
+        g_users[g_count].password_hash[0] = '\0';
         g_count++;
     }
 }
@@ -109,22 +110,28 @@ static void parse_buffer(const char *text, size_t n) {
         bool blank   = (a == j);
 
         if (!comment && !blank) {
-            /* Find two ':' separators. */
+            /* Find colon separators: name:uid:gid[:password_hash] */
             size_t c1 = a;
             while (c1 < j && text[c1] != ':') c1++;
             size_t c2 = (c1 < j) ? c1 + 1 : j;
             while (c2 < j && text[c2] != ':') c2++;
 
+            /* Optional 3rd colon for password hash */
+            size_t c3 = (c2 < j) ? c2 + 1 : j;
+            while (c3 < j && text[c3] != ':') c3++;
+
             if (c1 == j || c2 == j) {
                 kprintf("[users] line %d: malformed -- ignored\n", line_no);
             } else {
                 size_t nlen = c1 - a;
+                /* gid ends at c3 (next colon) or j (end of line) */
+                size_t gid_end = c3;
                 int uid, gid;
                 if (nlen == 0 || nlen >= USER_NAME_MAX) {
                     kprintf("[users] line %d: bad name length -- ignored\n",
                             line_no);
                 } else if (!parse_int(&text[c1 + 1], c2 - (c1 + 1), &uid) ||
-                           !parse_int(&text[c2 + 1], j  - (c2 + 1), &gid)) {
+                           !parse_int(&text[c2 + 1], gid_end - (c2 + 1), &gid)) {
                     kprintf("[users] line %d: bad uid/gid -- ignored\n",
                             line_no);
                 } else if (g_count >= USER_MAX) {
@@ -149,6 +156,17 @@ static void parse_buffer(const char *text, size_t n) {
                         u->name[nlen] = '\0';
                         u->uid = uid;
                         u->gid = gid;
+                        /* Parse optional password_hash (4th field after 3rd colon) */
+                        u->password_hash[0] = '\0';
+                        if (c3 < j) {
+                            size_t hstart = c3 + 1;
+                            size_t hlen = j - hstart;
+                            if (hlen > 64) hlen = 64;
+                            if (hlen > 0) {
+                                memcpy(u->password_hash, &text[hstart], hlen);
+                                u->password_hash[hlen] = '\0';
+                            }
+                        }
                     }
                 }
             }
@@ -197,6 +215,7 @@ int users_add(const char *name, int uid, int gid) {
     copy_capped(u->name, name, USER_NAME_MAX);
     u->uid = uid;
     u->gid = gid;
+    u->password_hash[0] = '\0';
     return 0;
 }
 
@@ -206,8 +225,8 @@ void users_visit(users_visit_fn cb, void *ctx) {
 }
 
 int users_save(void) {
-    /* Worst case: header + USER_MAX * (name + 2x":" + 2x10-digit + "\n"). */
-    size_t cap = 128 + (size_t)USER_MAX * (USER_NAME_MAX + 32);
+    /* Worst case: header + USER_MAX * (name + 3x":" + 2x10-digit + hash + "\n"). */
+    size_t cap = 128 + (size_t)USER_MAX * (USER_NAME_MAX + 32 + 65);
     char *buf = (char *)kmalloc(cap);
     if (!buf) return -1;
 
@@ -219,12 +238,18 @@ int users_save(void) {
 
     for (int i = 0; i < g_count; i++) {
         size_t nl = strlen(g_users[i].name);
-        if (n + nl + 32 >= cap) break;
+        if (n + nl + 32 + 65 >= cap) break;
         memcpy(&buf[n], g_users[i].name, nl); n += nl;
         buf[n++] = ':';
         append_int(buf, &n, cap, g_users[i].uid);
         buf[n++] = ':';
         append_int(buf, &n, cap, g_users[i].gid);
+        if (g_users[i].password_hash[0]) {
+            buf[n++] = ':';
+            size_t hl = strlen(g_users[i].password_hash);
+            memcpy(&buf[n], g_users[i].password_hash, hl);
+            n += hl;
+        }
         buf[n++] = '\n';
     }
 
@@ -237,6 +262,47 @@ int users_save(void) {
     kprintf("[users] saved %d entries to %s (%lu bytes)\n",
             g_count, USERS_PATH, (unsigned long)n);
     return 0;
+}
+
+bool users_check_password(const char *username, const char *password) {
+    const struct user *u = users_lookup_by_name(username);
+    if (!u) return false;
+    if (u->password_hash[0] == '\0') return true;
+    uint64_t hash = 5381;
+    const char *p = password ? password : "";
+    for (; *p; p++)
+        hash = ((hash << 5) + hash) + (unsigned char)*p;
+    char hex[17];
+    static const char hextab[] = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--) {
+        hex[i] = hextab[hash & 0xF];
+        hash >>= 4;
+    }
+    hex[16] = '\0';
+    return strcmp(u->password_hash, hex) == 0;
+}
+
+int users_set_password(const char *username, const char *password) {
+    for (int i = 0; i < g_count; i++) {
+        if (strcmp(g_users[i].name, username) == 0) {
+            if (!password || !password[0]) {
+                g_users[i].password_hash[0] = '\0';
+                return 0;
+            }
+            uint64_t hash = 5381;
+            for (const char *p = password; *p; p++)
+                hash = ((hash << 5) + hash) + (unsigned char)*p;
+            static const char hextab[] = "0123456789abcdef";
+            for (int j = 15; j >= 0; j--) {
+                g_users[i].password_hash[j] = hextab[hash & 0xF];
+                hash >>= 4;
+            }
+            g_users[i].password_hash[16] = '\0';
+            users_save();
+            return 0;
+        }
+    }
+    return -1;
 }
 
 void users_dump(void) {

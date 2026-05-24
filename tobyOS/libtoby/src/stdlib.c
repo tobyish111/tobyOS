@@ -39,6 +39,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include "libtoby_internal.h"
 
@@ -556,3 +557,170 @@ fallback:
         return q;
     }
 }
+
+/* ============================================================
+ *  qsort -- shell sort (simple, no recursion needed)
+ * ============================================================ */
+
+void qsort(void *base, size_t nmemb, size_t size,
+           int (*compar)(const void *, const void *)) {
+    if (nmemb < 2 || !base || !size) return;
+    char *arr = (char *)base;
+    char *tmp = (char *)__builtin_alloca(size);
+
+    for (size_t gap = nmemb / 2; gap > 0; gap /= 2) {
+        for (size_t i = gap; i < nmemb; i++) {
+            memcpy(tmp, arr + i * size, size);
+            size_t j = i;
+            while (j >= gap && compar(arr + (j - gap) * size, tmp) > 0) {
+                memcpy(arr + j * size, arr + (j - gap) * size, size);
+                j -= gap;
+            }
+            memcpy(arr + j * size, tmp, size);
+        }
+    }
+}
+
+/* ============================================================
+ *  strtod / atof -- string to double
+ * ============================================================ */
+
+double strtod(const char *s, char **endp) {
+    if (!s) { if (endp) *endp = (char *)s; return 0.0; }
+
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+
+    int sign = 1;
+    if (*s == '-') { sign = -1; s++; }
+    else if (*s == '+') { s++; }
+
+    double val = 0.0;
+    int got_digit = 0;
+
+    while (*s >= '0' && *s <= '9') {
+        val = val * 10.0 + (*s - '0');
+        s++;
+        got_digit = 1;
+    }
+
+    if (*s == '.') {
+        s++;
+        double frac = 0.1;
+        while (*s >= '0' && *s <= '9') {
+            val += (*s - '0') * frac;
+            frac *= 0.1;
+            s++;
+            got_digit = 1;
+        }
+    }
+
+    if (got_digit && (*s == 'e' || *s == 'E')) {
+        s++;
+        int exp_sign = 1;
+        if (*s == '-') { exp_sign = -1; s++; }
+        else if (*s == '+') { s++; }
+        int exp_val = 0;
+        while (*s >= '0' && *s <= '9') {
+            exp_val = exp_val * 10 + (*s - '0');
+            s++;
+        }
+        double mult = 1.0;
+        for (int i = 0; i < exp_val; i++) {
+            if (exp_sign > 0) mult *= 10.0;
+            else mult *= 0.1;
+        }
+        val *= mult;
+    }
+
+    if (endp) *endp = (char *)s;
+    return sign * val;
+}
+
+double atof(const char *s) { return strtod(s, 0); }
+
+/* ============================================================
+ *  bsearch
+ * ============================================================ */
+
+void *bsearch(const void *key, const void *base, size_t nmemb,
+              size_t size, int (*compar)(const void *, const void *)) {
+    const char *arr = (const char *)base;
+    size_t lo = 0, hi = nmemb;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = compar(key, arr + mid * size);
+        if (cmp < 0) hi = mid;
+        else if (cmp > 0) lo = mid + 1;
+        else return (void *)(arr + mid * size);
+    }
+    return 0;
+}
+
+/* ============================================================
+ *  mkstemp -- create a temporary file from template
+ * ============================================================ */
+
+int mkstemp(char *tmpl) {
+    if (!tmpl) { errno = EINVAL; return -1; }
+    size_t len = strlen(tmpl);
+    if (len < 6) { errno = EINVAL; return -1; }
+    char *suffix = tmpl + len - 6;
+    for (int i = 0; i < 6; i++) {
+        if (suffix[i] != 'X') { errno = EINVAL; return -1; }
+    }
+
+    static unsigned long counter = 0;
+    unsigned long val = (unsigned long)toby_sc0(ABI_SYS_CLOCK_MS) ^ (++counter * 6364136223846793005ULL);
+
+    for (int attempt = 0; attempt < 100; attempt++) {
+        static const char chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+        unsigned long v = val + (unsigned long)attempt;
+        for (int i = 0; i < 6; i++) {
+            suffix[i] = chars[v % 36];
+            v /= 36;
+        }
+        int fd = open(tmpl, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd >= 0) return fd;
+    }
+    errno = EEXIST;
+    return -1;
+}
+
+/* ============================================================
+ *  realpath -- resolve to absolute path (simplified)
+ * ============================================================ */
+
+char *realpath(const char *path, char *resolved) {
+    if (!path || !*path) { errno = EINVAL; return 0; }
+
+    char *buf = resolved;
+    if (!buf) {
+        buf = (char *)malloc(256);
+        if (!buf) { errno = ENOMEM; return 0; }
+    }
+
+    if (path[0] == '/') {
+        size_t len = strlen(path);
+        if (len >= 256) { if (!resolved) free(buf); errno = ENAMETOOLONG; return 0; }
+        memcpy(buf, path, len + 1);
+    } else {
+        if (!getcwd(buf, 256)) { if (!resolved) free(buf); return 0; }
+        size_t cwdlen = strlen(buf);
+        size_t pathlen = strlen(path);
+        if (cwdlen + 1 + pathlen >= 256) {
+            if (!resolved) free(buf);
+            errno = ENAMETOOLONG;
+            return 0;
+        }
+        buf[cwdlen] = '/';
+        memcpy(buf + cwdlen + 1, path, pathlen + 1);
+    }
+    return buf;
+}
+
+/* ============================================================
+ *  abs / labs
+ * ============================================================ */
+
+int abs(int n) { return n < 0 ? -n : n; }
+long labs(long n) { return n < 0 ? -n : n; }

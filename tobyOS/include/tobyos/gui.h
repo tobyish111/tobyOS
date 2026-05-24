@@ -38,25 +38,41 @@
 
 #include <tobyos/types.h>
 
+/* ---- Phase 2 M2.5: GPU-Accelerated Compositor ---- */
+
+/* Compositor rendering backend mode. */
+enum compositor_mode {
+    COMPOSITOR_SOFTWARE  = 0,  /* CPU-only scanout (default) */
+    COMPOSITOR_GPU_ACCEL = 1,  /* VirGL-accelerated compositing path */
+};
+
 /* Hard limits sized for an 8-process / 1024x768 demo. */
-#define GUI_WINDOW_MAX       8
+#define GUI_WINDOW_MAX       32
 #define GUI_TITLE_MAX        32
 #define GUI_EVENT_RING       16
 
 /* Visual constants -- exposed so GUI apps can position widgets relative
- * to their own client area without surprises. */
-#define GUI_TITLE_BAR_H      24
+ * to their own client area without surprises.
+ * M37: title bar height increased from 24 to 30 for KDE Breeze-style
+ * window chrome with room for minimize/maximize/close buttons. */
+#define GUI_TITLE_BAR_H      30
 #define GUI_BORDER           1
 
 /* Taskbar height reserved at the bottom of the screen in desktop mode.
  * Compositor draws the taskbar last, so it always paints over windows;
  * the WM also clamps window y so the title bar can never disappear
- * underneath the taskbar. */
-#define GUI_TASKBAR_H        32
+ * underneath the taskbar.
+ * M37: increased to 44 for floating KDE Plasma panel aesthetic. */
+#define GUI_TASKBAR_H        44
 
 /* Title-bar close button (top-right "X"). */
-#define GUI_CLOSE_BTN_SIZE   16
+#define GUI_CLOSE_BTN_SIZE   18
 #define GUI_CLOSE_BTN_PAD    4
+
+/* M37: KDE Breeze-style minimize and maximize buttons. */
+#define GUI_MIN_BTN_SIZE     18
+#define GUI_MAX_BTN_SIZE     18
+#define GUI_BTN_GAP          2
 
 /* ---- event types --------------------------------------------------- */
 
@@ -66,6 +82,12 @@
 #define GUI_EV_MOUSE_UP      3
 #define GUI_EV_KEY           4
 #define GUI_EV_CLOSE         5
+#define GUI_EV_RESIZE        6
+
+/* Window states for minimize/maximize/restore */
+#define GUI_WIN_NORMAL       0
+#define GUI_WIN_MINIMIZED    1
+#define GUI_WIN_MAXIMIZED    2
 
 /* Special "key" codes carried in gui_event.key. Regular printable
  * characters use their ASCII value; everything below 0x20 carries one
@@ -208,6 +230,13 @@ struct window *gui_window_create(int client_w, int client_h, const char *title);
  * release the slot. NULL-safe; multiple calls are tolerated. */
 void gui_window_close(struct window *w);
 
+/* Set window state (GUI_WIN_NORMAL/MINIMIZED/MAXIMIZED). Returns 0
+ * on success, -1 on bad args or OOM during backbuf realloc. */
+int gui_window_set_state(struct window *w, int state);
+
+/* Set window title. Copies up to GUI_TITLE_MAX-1 chars. */
+int gui_window_set_title(struct window *w, const char *title);
+
 /* Drawing operations -- all (x, y, w, h) are in CLIENT coordinates and
  * clipped to the client area. Each one only writes the per-window
  * back buffer; the compositor will pick up the change on the next
@@ -266,6 +295,9 @@ int gui_window_poll_event(struct window *w, struct gui_event *out);
  * No-op if no window is up. */
 void gui_post_key(uint8_t c);
 
+/* Close the focused (topmost) window by posting GUI_EV_CLOSE. */
+void gui_close_focused(void);
+
 /* ---- desktop activity tracing ------------------------------------- *
  *
  * Lightweight kprintf-based event trace. Every event line goes to
@@ -323,5 +355,38 @@ void gui_trace_logf(const char *fmt, ...);
  *     already off and no apps are tracked. */
 void gui_dump_status(const char *reason);
 void gui_emergency_exit(const char *reason);
+
+/* Alt+Tab window cycling: raises the next non-minimized window in
+ * z-order. Called from keyboard IRQ when Alt+Tab is detected. */
+void gui_alt_tab_cycle(void);
+
+/* Clipboard */
+int gui_clip_copy(const char *data, uint32_t len);
+int gui_clip_paste(char *buf, uint32_t max);
+
+/* ---- Advanced drawing operations (Phase 1) ----------------------- */
+int gui_window_line(struct window *w, int x0, int y0, int x1, int y1, uint32_t color);
+int gui_window_line_blend(struct window *w, int x0, int y0, int x1, int y1, uint32_t argb);
+int gui_window_rect(struct window *w, int x, int y, int rw, int rh, uint32_t color);
+int gui_window_rounded_rect(struct window *w, int x, int y, int rw, int rh, int radius, uint32_t color);
+int gui_window_rounded_rect_blend(struct window *w, int x, int y, int rw, int rh, int radius, uint32_t argb);
+int gui_window_circle(struct window *w, int cx, int cy, int r, uint32_t color);
+int gui_window_circle_outline(struct window *w, int cx, int cy, int r, uint32_t color);
+int gui_window_blit(struct window *w, int x, int y, int rw, int rh, const uint32_t *pixels);
+int gui_window_blit_blend(struct window *w, int x, int y, int rw, int rh, const uint32_t *pixels);
+int gui_window_getpixels(struct window *w, int x, int y, int rw, int rh, uint32_t *dst);
+int gui_window_gradient(struct window *w, int x, int y, int rw, int rh, uint32_t top, uint32_t bot);
+
+/* Set window opacity (0=invisible, 255=fully opaque). Default is 255. */
+int gui_window_set_opacity(struct window *w, uint8_t alpha);
+
+/* ---- Phase 2 M2.5: GPU-Accelerated Compositor API ----------------- */
+
+/* Get/set the compositor rendering mode. */
+enum compositor_mode gui_compositor_mode(void);
+void gui_set_compositor_mode(enum compositor_mode mode);
+
+/* Triple-buffer state query for diagnostics. */
+int gui_triple_buffer_pending(void);
 
 #endif /* TOBYOS_GUI_H */

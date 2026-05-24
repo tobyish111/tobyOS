@@ -52,6 +52,7 @@
  /* Modifier state. */
  static volatile bool g_shift  = false;
  static volatile bool g_ctrl   = false;
+ static volatile bool g_alt    = false;
  static volatile bool g_caps   = false;
  static volatile bool g_ext_e0 = false;
  
@@ -232,6 +233,9 @@
      case 0x1D:
          g_ctrl = !released;
          return;
+     case 0x38:
+         g_alt = !released;
+         return;
      case 0x3A:
          if (!released) g_caps = !g_caps;
          return;
@@ -256,7 +260,19 @@
          gui_dump_status("ScrollLock hotkey");
          return;
      }
- 
+
+     /* Alt+Tab: cycle windows */
+     if (g_alt && code == 0x0F /* Tab */) {
+         gui_alt_tab_cycle();
+         return;
+     }
+
+     /* Alt+F4: close the focused window */
+     if (g_alt && code == 0x3E /* F4 */) {
+         gui_close_focused();
+         return;
+     }
+
      char c = g_shift ? g_map_shift[code] : g_map_base[code];
      if (c == 0) return;
  
@@ -345,4 +361,5 @@
  bool     kbd_caps_state(void)       { return g_caps; }
  bool     kbd_shift_state(void)      { return g_shift; }
  bool     kbd_ctrl_state(void)       { return g_ctrl; }
+ bool     kbd_alt_state(void)        { return g_alt; }
  uint8_t  kbd_last_scancode(void)    { return g_last_scancode; }

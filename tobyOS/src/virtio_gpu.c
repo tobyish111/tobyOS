@@ -138,6 +138,7 @@
 /* ---- feature bits we care about -------------------------------- */
 
 #define VIRTIO_F_VERSION_1        32    /* mandatory for modern transport */
+#define VIRTIO_GPU_F_VIRGL         0    /* device supports VirGL 3D */
 
 /* virtio MSI-X "no vector" sentinel; same constant as virtio_net.c. */
 #define VIRTIO_MSI_NO_VECTOR      0xFFFFu
@@ -181,6 +182,13 @@ enum {
     VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING = 0x0106,
     VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING = 0x0107,
 
+    VIRTIO_GPU_CMD_CTX_CREATE              = 0x0200,
+    VIRTIO_GPU_CMD_CTX_DESTROY             = 0x0201,
+    VIRTIO_GPU_CMD_SUBMIT_3D               = 0x0207,
+
+    VIRTIO_GPU_CMD_UPDATE_CURSOR           = 0x0300,
+    VIRTIO_GPU_CMD_MOVE_CURSOR             = 0x0301,
+
     VIRTIO_GPU_RESP_OK_NODATA              = 0x1100,
     VIRTIO_GPU_RESP_OK_DISPLAY_INFO        = 0x1101,
 };
@@ -189,6 +197,7 @@ enum {
  * little-endian x86 is the same byte order Limine hands us (BGRX), so
  * the back buffer can be memcpy'd verbatim with no swizzle. */
 #define VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM   2
+#define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM   1
 
 struct __attribute__((packed)) virtio_gpu_ctrl_hdr {
     uint32_t type;
@@ -262,9 +271,63 @@ struct __attribute__((packed)) virtio_gpu_resource_flush {
     uint32_t                   padding;
 };
 
+struct __attribute__((packed)) virtio_gpu_resource_unref {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+};
+
+struct __attribute__((packed)) virtio_gpu_resource_detach_backing {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+};
+
+/* VirGL 3D command structures (Phase 3 foundation) */
+
+struct __attribute__((packed)) virtio_gpu_ctx_create {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t nlen;
+    uint32_t context_init;
+    char     debug_name[64];
+};
+
+struct __attribute__((packed)) virtio_gpu_ctx_destroy {
+    struct virtio_gpu_ctrl_hdr hdr;
+};
+
+struct __attribute__((packed)) virtio_gpu_cmd_submit {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t size;
+    uint32_t pad;
+};
+
+/* Cursor command (spec §5.7.6.8). Used for both UPDATE_CURSOR and
+ * MOVE_CURSOR; the only difference is hdr.type. Submitted on VQ 1
+ * as a single device-readable descriptor (no response descriptor). */
+struct __attribute__((packed)) virtio_gpu_cursor_pos {
+    uint32_t scanout_id;
+    uint32_t x;
+    uint32_t y;
+    uint32_t padding;
+};
+
+struct __attribute__((packed)) virtio_gpu_update_cursor {
+    struct virtio_gpu_ctrl_hdr      hdr;
+    struct virtio_gpu_cursor_pos    pos;
+    uint32_t                        resource_id;
+    uint32_t                        hot_x;
+    uint32_t                        hot_y;
+    uint32_t                        padding;
+};
+
 /* ---- driver state --------------------------------------------- */
 
-#define VG_RESOURCE_ID  1   /* arbitrary; we only ever create one */
+#define VG_RESOURCE_ID         1   /* scanout resource */
+#define VG_CURSOR_RESOURCE_ID  2
+#define VG_WINDOW_RES_BASE    10   /* per-window resources start here */
+#define VG_CURSOR_W            64
+#define VG_CURSOR_H            64
 
 struct vgpu_dev {
     /* Pointers into BAR-mapped MMIO. */
@@ -315,6 +378,12 @@ struct vgpu_dev {
     uint8_t            pci_slot;
     uint8_t            pci_fn;
 
+    /* VirGL 3D state (Phase 3 foundation). */
+    bool            virgl_supported;
+    bool            virgl_enabled;
+    uint64_t        cmd3d_phys;     /* 2-page DMA buffer for SUBMIT_3D */
+    uint8_t        *cmd3d_virt;
+
     /* M27F: per-region transfer counters. Surfaced via describe() so
      * displayinfo --json can prove the dirty-rect path is exercising
      * the partial TRANSFER_TO_HOST_2D + RESOURCE_FLUSH commands and
@@ -334,6 +403,27 @@ struct vgpu_dev {
     uint32_t           enabled_scanouts;        /* count of pmodes[i].enabled    */
     struct virtio_gpu_display_one
                        scanouts[VIRTIO_GPU_MAX_SCANOUTS];
+
+    /* Cursor queue (VQ 1) -- hardware cursor plane. */
+    uint16_t           cq_qsize;
+    uint16_t           cq_avail_idx;
+    uint16_t           cq_used_idx;
+    uint64_t           cq_ring_phys;
+    uint8_t           *cq_ring;
+    struct virtq_desc *cq_desc;
+    volatile uint16_t *cq_avail_idx_ptr;
+    volatile uint16_t *cq_avail_ring;
+    volatile uint16_t *cq_used_idx_ptr;
+    struct virtq_used_elem *cq_used_ring;
+    volatile uint16_t *cq_notify;
+
+    /* Cursor state */
+    bool               hw_cursor_active;
+    uint32_t           cursor_resource_id;
+    uint32_t          *cursor_pixels;     /* 64x64 ARGB backing */
+    uint64_t           cursor_phys;       /* physical address of backing */
+    uint64_t           cursor_cmd_phys;   /* phys addr of cursor command page */
+    uint8_t           *cursor_cmd_virt;   /* virt addr of cursor command page */
 };
 
 /* Single-display scope: first probe wins. Mirrors what virtio_net.c
@@ -341,6 +431,7 @@ struct vgpu_dev {
 static struct vgpu_dev g_vgpu;
 static bool            g_vgpu_bound;     /* PCI driver bound, device set up */
 static bool            g_vgpu_active;    /* gfx backend installed */
+static uint32_t        g_next_window_res = VG_WINDOW_RES_BASE;
 
 #define SCRATCH_REQ_OFF    0u
 #define SCRATCH_RESP_OFF   2048u    /* keeps req+resp in disjoint cache lines */
@@ -449,6 +540,55 @@ static bool vgpu_setup_controlq(struct vgpu_dev *d, uint16_t msix_vec) {
     return true;
 }
 
+/* Set up the cursor virtqueue (VQ 1). Same pattern as controlq but
+ * for cursor commands which are single-descriptor, fire-and-forget. */
+static bool vgpu_setup_cursorq(struct vgpu_dev *d) {
+    d->cq_qsize     = VG_QSIZE;
+    d->cq_avail_idx = 0;
+    d->cq_used_idx  = 0;
+
+    cfg_w16(d, VIRTIO_PCI_QUEUE_SELECT, 1);
+    uint16_t max_qs = cfg_r16(d, VIRTIO_PCI_QUEUE_SIZE);
+    if (max_qs == 0) {
+        kprintf("[virtio-gpu] cursorq missing (queue_size_max=0)\n");
+        return false;
+    }
+    if (max_qs < VG_QSIZE) {
+        kprintf("[virtio-gpu] cursorq max_size=%u < %u (unsupported)\n",
+                max_qs, VG_QSIZE);
+        return false;
+    }
+    cfg_w16(d, VIRTIO_PCI_QUEUE_SIZE, VG_QSIZE);
+
+    d->cq_ring_phys = pmm_alloc_page();
+    if (!d->cq_ring_phys) {
+        kprintf("[virtio-gpu] OOM allocating cursorq ring page\n");
+        return false;
+    }
+    d->cq_ring = (uint8_t *)pmm_phys_to_virt(d->cq_ring_phys);
+    memset(d->cq_ring, 0, PAGE_SIZE);
+
+    d->cq_desc = (struct virtq_desc *)(d->cq_ring + VQ_DESC_OFF);
+    uint8_t *avail = d->cq_ring + VQ_AVAIL_OFF;
+    d->cq_avail_idx_ptr = (volatile uint16_t *)(avail + 2);
+    d->cq_avail_ring    = (volatile uint16_t *)(avail + 4);
+    uint8_t *used = d->cq_ring + VQ_USED_OFF;
+    d->cq_used_idx_ptr = (volatile uint16_t *)(used + 2);
+    d->cq_used_ring    = (struct virtq_used_elem *)(used + 4);
+
+    cfg_w64(d, VIRTIO_PCI_QUEUE_DESC,   d->cq_ring_phys + VQ_DESC_OFF);
+    cfg_w64(d, VIRTIO_PCI_QUEUE_DRIVER, d->cq_ring_phys + VQ_AVAIL_OFF);
+    cfg_w64(d, VIRTIO_PCI_QUEUE_DEVICE, d->cq_ring_phys + VQ_USED_OFF);
+
+    uint16_t qoff = cfg_r16(d, VIRTIO_PCI_QUEUE_NOTIFY_OFF);
+    d->cq_notify = (volatile uint16_t *)
+                   (d->notify_base + (uint32_t)qoff * d->notify_mult);
+
+    cfg_w16(d, VIRTIO_PCI_QUEUE_MSIX_VECTOR, VIRTIO_MSI_NO_VECTOR);
+    cfg_w16(d, VIRTIO_PCI_QUEUE_ENABLE, 1);
+    return true;
+}
+
 /* ---- synchronous request/response ----------------------------- */
 
 /* Submit one request (device-readable) + matching response buffer
@@ -512,6 +652,33 @@ static bool issue_cmd(struct vgpu_dev *d,
     kprintf("[virtio-gpu] issue_cmd timed out (req_type=0x%x)\n",
             ((const struct virtio_gpu_ctrl_hdr *)req_buf)->type);
     return false;
+}
+
+/* Submit a cursor command on VQ 1. Single device-readable descriptor;
+ * no response descriptor needed. We briefly poll the used ring but
+ * don't treat timeout as fatal (cursor is cosmetic). */
+static void issue_cursor_cmd(struct vgpu_dev *d) {
+    if (!d->cursor_cmd_virt) return;
+    uint64_t cmd_phys = d->cursor_cmd_phys;
+
+    d->cq_desc[0].addr  = cmd_phys;
+    d->cq_desc[0].len   = (uint32_t)sizeof(struct virtio_gpu_update_cursor);
+    d->cq_desc[0].flags = 0;
+    d->cq_desc[0].next  = 0;
+
+    d->cq_avail_ring[d->cq_avail_idx % d->cq_qsize] = 0;
+    d->cq_avail_idx++;
+    *d->cq_avail_idx_ptr = d->cq_avail_idx;
+
+    *d->cq_notify = 0;
+
+    for (uint32_t spins = 0; spins < 100000u; spins++) {
+        if (*d->cq_used_idx_ptr != d->cq_used_idx) {
+            d->cq_used_idx++;
+            return;
+        }
+        __asm__ volatile ("pause" ::: "memory");
+    }
 }
 
 /* ---- high-level commands ------------------------------------- */
@@ -597,6 +764,30 @@ static bool cmd_resource_create_2d(struct vgpu_dev *d,
     if (resp->type != VIRTIO_GPU_RESP_OK_NODATA) {
         kprintf("[virtio-gpu] RESOURCE_CREATE_2D bad response type=0x%x\n",
                 resp->type);
+        return false;
+    }
+    return true;
+}
+
+static bool cmd_resource_create_2d_fmt(struct vgpu_dev *d,
+                                       uint32_t resource_id,
+                                       uint32_t width, uint32_t height,
+                                       uint32_t format) {
+    struct virtio_gpu_resource_create_2d *req  = (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr           *resp = (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req,  0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    req->resource_id = resource_id;
+    req->format      = format;
+    req->width       = width;
+    req->height      = height;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return false;
+    if (resp->type != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("[virtio-gpu] RESOURCE_CREATE_2D (fmt=%u) bad response type=0x%x\n",
+                format, resp->type);
         return false;
     }
     return true;
@@ -743,6 +934,49 @@ static bool cmd_resource_flush(struct vgpu_dev *d,
                                uint32_t resource_id,
                                uint32_t width, uint32_t height) {
     return cmd_resource_flush_rect(d, resource_id, 0, 0, width, height);
+}
+
+/* ---- resource lifecycle (per-window GPU resources) ----------- */
+
+static bool cmd_resource_detach_backing(struct vgpu_dev *d,
+                                        uint32_t resource_id) {
+    struct virtio_gpu_resource_detach_backing *req
+        = (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp
+        = (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req,  0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+    req->resource_id = resource_id;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return false;
+    if (resp->type != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("[virtio-gpu] RESOURCE_DETACH_BACKING(%u) bad response 0x%x\n",
+                resource_id, resp->type);
+        return false;
+    }
+    return true;
+}
+
+static bool cmd_resource_unref(struct vgpu_dev *d, uint32_t resource_id) {
+    struct virtio_gpu_resource_unref *req
+        = (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp
+        = (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req,  0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    req->resource_id = resource_id;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return false;
+    if (resp->type != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("[virtio-gpu] RESOURCE_UNREF(%u) bad response 0x%x\n",
+                resource_id, resp->type);
+        return false;
+    }
+    return true;
 }
 
 /* ---- backend (called from gfx_flip) ------------------------- */
@@ -893,6 +1127,175 @@ static const struct gfx_backend g_vgpu_backend = {
     .bytes_per_pixel = 4,
 };
 
+/* ---- hardware cursor ----------------------------------------- */
+
+/* 12x19 NW arrow (same bitmap as gfx.c g_cursor). '#' = black outline,
+ * '.' = white fill, ' ' = transparent. */
+#define HW_CUR_SRC_W  12
+#define HW_CUR_SRC_H  19
+static const char hw_cursor_src[HW_CUR_SRC_H][HW_CUR_SRC_W + 1] = {
+    "#           ",
+    "##          ",
+    "#.#         ",
+    "#..#        ",
+    "#...#       ",
+    "#....#      ",
+    "#.....#     ",
+    "#......#    ",
+    "#.......#   ",
+    "#........#  ",
+    "#.........# ",
+    "#......#####",
+    "#...##.#    ",
+    "#..# #.#    ",
+    "#.#  #.#    ",
+    "##    #.#   ",
+    "      #.#   ",
+    "       #.#  ",
+    "       ###  ",
+};
+
+static void render_cursor_bitmap(uint32_t *pixels) {
+    memset(pixels, 0, VG_CURSOR_W * VG_CURSOR_H * 4u);
+    for (int y = 0; y < HW_CUR_SRC_H; y++) {
+        for (int x = 0; x < HW_CUR_SRC_W; x++) {
+            char c = hw_cursor_src[y][x];
+            uint32_t color = 0x00000000u;
+            if      (c == '#') color = 0xFF000000u;
+            else if (c == '.') color = 0xFFFFFFFFu;
+            if (color) pixels[y * VG_CURSOR_W + x] = color;
+        }
+    }
+}
+
+static bool vgpu_cursor_init(struct vgpu_dev *d) {
+    /* Allocate cursor pixel backing (64*64*4 = 16384 bytes = 4 pages) */
+    size_t cursor_bytes = (size_t)VG_CURSOR_W * VG_CURSOR_H * 4u;
+    size_t cursor_pages = (cursor_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    d->cursor_phys = pmm_alloc_pages(cursor_pages);
+    if (!d->cursor_phys) {
+        kprintf("[virtio-gpu] OOM allocating cursor backing\n");
+        return false;
+    }
+    d->cursor_pixels = (uint32_t *)pmm_phys_to_virt(d->cursor_phys);
+    render_cursor_bitmap(d->cursor_pixels);
+
+    /* Allocate a scratch page for cursor commands */
+    d->cursor_cmd_phys = pmm_alloc_page();
+    if (!d->cursor_cmd_phys) {
+        kprintf("[virtio-gpu] OOM allocating cursor cmd page\n");
+        return false;
+    }
+    d->cursor_cmd_virt = (uint8_t *)pmm_phys_to_virt(d->cursor_cmd_phys);
+    memset(d->cursor_cmd_virt, 0, PAGE_SIZE);
+
+    /* Create 2D resource for the cursor (ARGB, with alpha) */
+    if (!cmd_resource_create_2d_fmt(d, VG_CURSOR_RESOURCE_ID,
+                                    VG_CURSOR_W, VG_CURSOR_H,
+                                    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM))
+        return false;
+
+    /* Attach the pixel backing to the cursor resource */
+    if (!cmd_resource_attach_backing(d, VG_CURSOR_RESOURCE_ID,
+                                     d->cursor_phys,
+                                     (uint32_t)cursor_bytes))
+        return false;
+
+    /* Transfer cursor pixels to host resource */
+    if (!cmd_transfer_to_host_2d_rect(d, VG_CURSOR_RESOURCE_ID,
+                                      0, 0, VG_CURSOR_W, VG_CURSOR_H))
+        return false;
+
+    d->cursor_resource_id = VG_CURSOR_RESOURCE_ID;
+    d->hw_cursor_active   = false;
+    kprintf("[virtio-gpu] cursor resource %u ready (%dx%d ARGB)\n",
+            VG_CURSOR_RESOURCE_ID, VG_CURSOR_W, VG_CURSOR_H);
+    return true;
+}
+
+/* Send UPDATE_CURSOR: sets the cursor image + position. */
+static void vgpu_send_update_cursor(struct vgpu_dev *d, int x, int y) {
+    struct virtio_gpu_update_cursor *cmd =
+        (struct virtio_gpu_update_cursor *)d->cursor_cmd_virt;
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->hdr.type       = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+    cmd->pos.scanout_id = 0;
+    cmd->pos.x          = (uint32_t)x;
+    cmd->pos.y          = (uint32_t)y;
+    cmd->resource_id    = d->cursor_resource_id;
+    cmd->hot_x          = 0;
+    cmd->hot_y          = 0;
+    issue_cursor_cmd(d);
+}
+
+/* Send MOVE_CURSOR: repositions without re-uploading the image. */
+static void vgpu_send_move_cursor(struct vgpu_dev *d, int x, int y) {
+    struct virtio_gpu_update_cursor *cmd =
+        (struct virtio_gpu_update_cursor *)d->cursor_cmd_virt;
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->hdr.type       = VIRTIO_GPU_CMD_MOVE_CURSOR;
+    cmd->pos.scanout_id = 0;
+    cmd->pos.x          = (uint32_t)x;
+    cmd->pos.y          = (uint32_t)y;
+    cmd->resource_id    = d->cursor_resource_id;
+    cmd->hot_x          = 0;
+    cmd->hot_y          = 0;
+    issue_cursor_cmd(d);
+}
+
+/* ---- public hardware cursor API ------------------------------ */
+
+bool virtio_gpu_hw_cursor_available(void) {
+    return g_vgpu_bound && g_vgpu.hw_cursor_active;
+}
+
+void virtio_gpu_hw_cursor_update(const uint32_t *pixels_64x64,
+                                 int hot_x, int hot_y) {
+    struct vgpu_dev *d = &g_vgpu;
+    if (!g_vgpu_bound || !d->cursor_cmd_virt) return;
+
+    if (pixels_64x64) {
+        memcpy(d->cursor_pixels, pixels_64x64,
+               VG_CURSOR_W * VG_CURSOR_H * 4u);
+    }
+    /* Re-transfer pixels to host */
+    cmd_transfer_to_host_2d_rect(d, VG_CURSOR_RESOURCE_ID,
+                                 0, 0, VG_CURSOR_W, VG_CURSOR_H);
+
+    struct virtio_gpu_update_cursor *cmd =
+        (struct virtio_gpu_update_cursor *)d->cursor_cmd_virt;
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->hdr.type       = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+    cmd->pos.scanout_id = 0;
+    cmd->pos.x          = 0;
+    cmd->pos.y          = 0;
+    cmd->resource_id    = d->cursor_resource_id;
+    cmd->hot_x          = (uint32_t)hot_x;
+    cmd->hot_y          = (uint32_t)hot_y;
+    issue_cursor_cmd(d);
+    d->hw_cursor_active = true;
+}
+
+void virtio_gpu_hw_cursor_move(int x, int y) {
+    struct vgpu_dev *d = &g_vgpu;
+    if (!g_vgpu_bound || !d->hw_cursor_active) return;
+    vgpu_send_move_cursor(d, x, y);
+}
+
+void virtio_gpu_hw_cursor_hide(void) {
+    struct vgpu_dev *d = &g_vgpu;
+    if (!g_vgpu_bound || !d->hw_cursor_active) return;
+
+    struct virtio_gpu_update_cursor *cmd =
+        (struct virtio_gpu_update_cursor *)d->cursor_cmd_virt;
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->hdr.type       = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+    cmd->pos.scanout_id = 0;
+    cmd->resource_id    = 0;
+    issue_cursor_cmd(d);
+    d->hw_cursor_active = false;
+}
+
 /* ---- capability walk (mirrors virtio_net.c) ----------------- */
 
 struct vgpu_cap {
@@ -1009,9 +1412,11 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
     cfg_w8(d, VIRTIO_PCI_DEVICE_STATUS,
            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
-    /* Negotiate features. We only need VIRTIO_F_VERSION_1. The
-     * GPU-specific feature bits (VIRGL, EDID, RESOURCE_BLOB,
-     * CONTEXT_INIT) are all advanced/3D features we don't use. */
+    /* Negotiate features. VIRTIO_F_VERSION_1 is mandatory. We also
+     * probe for VIRTIO_GPU_F_VIRGL (bit 0) -- if the device advertises
+     * it we include it in our feature set so 3D context management is
+     * available.  Most default QEMU configs do NOT advertise VirGL;
+     * the check is graceful and the driver falls back to 2D-only. */
     cfg_w32(d, VIRTIO_PCI_DEVICE_FEATURE_SELECT, 1);
     uint32_t devf_hi = cfg_r32(d, VIRTIO_PCI_DEVICE_FEATURE);
     cfg_w32(d, VIRTIO_PCI_DEVICE_FEATURE_SELECT, 0);
@@ -1023,8 +1428,15 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
         cfg_w8(d, VIRTIO_PCI_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
         return -5;
     }
+
+    d->virgl_supported = !!(devf_lo & (1u << VIRTIO_GPU_F_VIRGL));
+
+    uint32_t drv_lo = 0;
+    if (d->virgl_supported)
+        drv_lo |= (1u << VIRTIO_GPU_F_VIRGL);
+
     cfg_w32(d, VIRTIO_PCI_DRIVER_FEATURE_SELECT, 0);
-    cfg_w32(d, VIRTIO_PCI_DRIVER_FEATURE,        0);
+    cfg_w32(d, VIRTIO_PCI_DRIVER_FEATURE,        drv_lo);
     cfg_w32(d, VIRTIO_PCI_DRIVER_FEATURE_SELECT, 1);
     cfg_w32(d, VIRTIO_PCI_DRIVER_FEATURE,        1u << (VIRTIO_F_VERSION_1 - 32));
 
@@ -1036,9 +1448,14 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
         cfg_w8(d, VIRTIO_PCI_DEVICE_STATUS, VIRTIO_STATUS_FAILED);
         return -6;
     }
-    kprintf("[virtio-gpu] features: device=0x%08x_%08x driver=0x%08x_%08x\n",
+
+    d->virgl_enabled = d->virgl_supported;
+
+    kprintf("[virtio-gpu] features: device=0x%08x_%08x driver=0x%08x_%08x "
+            "virgl=%s\n",
             devf_hi, devf_lo,
-            1u << (VIRTIO_F_VERSION_1 - 32), 0u);
+            1u << (VIRTIO_F_VERSION_1 - 32), drv_lo,
+            d->virgl_enabled ? "yes" : "no");
 
     /* Try MSI-X for the controlq. Fall back to no IRQ if the device
      * has no MSI-X cap (rare on modern virtio, but the legacy path
@@ -1058,10 +1475,13 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
         cfg_w16(d, VIRTIO_PCI_MSIX_CONFIG, VIRTIO_MSI_NO_VECTOR);
     }
 
-    /* Bring up the controlq (vq 0). The cursor queue (vq 1) is
-     * intentionally skipped -- we draw the cursor in software via
-     * gfx_draw_cursor(). */
+    /* Bring up the controlq (vq 0). */
     if (!vgpu_setup_controlq(d, cq_vec)) return -7;
+
+    /* Bring up the cursorq (vq 1) for hardware cursor support. */
+    if (!vgpu_setup_cursorq(d)) {
+        kprintf("[virtio-gpu] cursorq setup failed -- HW cursor disabled\n");
+    }
 
     if (d->irq_enabled) {
         kprintf("[virtio-gpu] IRQ live on vec 0x%02x  controlq=msix0\n",
@@ -1116,6 +1536,14 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
     if (!cmd_set_scanout(d, 0, VG_RESOURCE_ID, d->width, d->height))
         return -13;
     kprintf("[virtio-gpu] SET_SCANOUT 0 -> resource %u ok\n", VG_RESOURCE_ID);
+
+    /* Set up the hardware cursor resource on VQ 1. Non-fatal if it
+     * fails -- we fall back to software cursor drawing. */
+    if (d->cq_ring) {
+        if (!vgpu_cursor_init(d)) {
+            kprintf("[virtio-gpu] cursor init failed -- SW cursor only\n");
+        }
+    }
 
     g_vgpu_bound     = true;
     dev->driver_data = d;
@@ -1202,4 +1630,231 @@ void virtio_gpu_install_backend(void) {
     gfx_set_backend(&g_vgpu_backend);
     kprintf("[virtio-gpu] backend installed -- gfx_flip now uses "
             "TRANSFER+FLUSH on scanout 0 (%ux%u)\n", d->width, d->height);
+
+    /* Activate HW cursor if the cursor resource was set up at probe. */
+    if (d->cursor_resource_id && d->cursor_cmd_virt) {
+        vgpu_send_update_cursor(d, 0, 0);
+        d->hw_cursor_active = true;
+        kprintf("[virtio-gpu] HW cursor active (resource %u)\n",
+                d->cursor_resource_id);
+    }
+}
+
+/* ---- VirGL 3D foundation (Phase 3) ----------------------------- */
+
+bool virtio_gpu_virgl_available(void) {
+    return g_vgpu_active && g_vgpu.virgl_enabled;
+}
+
+int virtio_gpu_ctx_create(uint32_t ctx_id, const char *debug_name) {
+    if (!g_vgpu_active || !g_vgpu.virgl_enabled) return -1;
+
+    struct vgpu_dev *d = &g_vgpu;
+    struct virtio_gpu_ctx_create *req =
+        (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp =
+        (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req, 0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type   = VIRTIO_GPU_CMD_CTX_CREATE;
+    req->hdr.ctx_id = ctx_id;
+
+    if (debug_name) {
+        size_t len = 0;
+        while (debug_name[len] && len < sizeof(req->debug_name) - 1) len++;
+        memcpy(req->debug_name, debug_name, len);
+        req->nlen = (uint32_t)len;
+    }
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return -1;
+    if (resp->type != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("[virtio-gpu] CTX_CREATE(%u) bad response type=0x%x\n",
+                ctx_id, resp->type);
+        return -1;
+    }
+    return 0;
+}
+
+void virtio_gpu_ctx_destroy(uint32_t ctx_id) {
+    if (!g_vgpu_active || !g_vgpu.virgl_enabled) return;
+
+    struct vgpu_dev *d = &g_vgpu;
+    struct virtio_gpu_ctx_destroy *req =
+        (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp =
+        (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req, 0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type   = VIRTIO_GPU_CMD_CTX_DESTROY;
+    req->hdr.ctx_id = ctx_id;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return;
+    if (resp->type != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("[virtio-gpu] CTX_DESTROY(%u) bad response type=0x%x\n",
+                ctx_id, resp->type);
+    }
+}
+
+int virtio_gpu_submit_3d(uint32_t ctx_id,
+                         const void *cmd_buf, uint32_t cmd_size) {
+    if (!g_vgpu_active || !g_vgpu.virgl_enabled) return -1;
+    if (!cmd_buf || cmd_size == 0 || cmd_size > 4096) return -1;
+
+    struct vgpu_dev *d = &g_vgpu;
+
+    /* Lazy-allocate a 2-page (8 KiB) DMA buffer for submit commands.
+     * The submit request is the header followed by the 3D command
+     * buffer -- up to sizeof(virtio_gpu_cmd_submit) + 4096 bytes,
+     * which exceeds a single page; two contiguous pages are plenty. */
+    if (!d->cmd3d_virt) {
+        d->cmd3d_phys = pmm_alloc_pages(2);
+        if (!d->cmd3d_phys) {
+            kprintf("[virtio-gpu] OOM allocating SUBMIT_3D DMA buffer\n");
+            return -1;
+        }
+        d->cmd3d_virt = (uint8_t *)pmm_phys_to_virt(d->cmd3d_phys);
+    }
+
+    struct virtio_gpu_cmd_submit *hdr =
+        (struct virtio_gpu_cmd_submit *)d->cmd3d_virt;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
+    hdr->hdr.ctx_id = ctx_id;
+    hdr->size        = cmd_size;
+
+    memcpy(d->cmd3d_virt + sizeof(*hdr), cmd_buf, cmd_size);
+
+    /* Response goes in the scratch page at SCRATCH_RESP_OFF. */
+    struct virtio_gpu_ctrl_hdr *resp =
+        (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+    memset(resp, 0, sizeof(*resp));
+
+    uint64_t req_phys  = d->cmd3d_phys;
+    uint32_t req_len   = (uint32_t)(sizeof(*hdr) + cmd_size);
+    uint64_t resp_phys = d->scratch_phys + SCRATCH_RESP_OFF;
+
+    /* Build a 2-descriptor chain directly (the request lives outside
+     * the scratch page, so we bypass issue_cmd's bounds check). */
+    d->desc[0].addr  = req_phys;
+    d->desc[0].len   = req_len;
+    d->desc[0].flags = VQ_DESC_F_NEXT;
+    d->desc[0].next  = 1;
+
+    d->desc[1].addr  = resp_phys;
+    d->desc[1].len   = (uint32_t)sizeof(*resp);
+    d->desc[1].flags = VQ_DESC_F_WRITE;
+    d->desc[1].next  = 0;
+
+    d->avail_ring[d->avail_idx % d->qsize] = 0;
+    d->avail_idx++;
+    *d->avail_idx_ptr = d->avail_idx;
+    *d->notify = 0;
+
+    for (uint32_t spins = 0; spins < 50000000u; spins++) {
+        if (*d->used_idx_ptr != d->used_idx) {
+            d->used_idx++;
+            if (resp->type == VIRTIO_GPU_RESP_OK_NODATA) return 0;
+            kprintf("[virtio-gpu] SUBMIT_3D(%u) bad response type=0x%x\n",
+                    ctx_id, resp->type);
+            return -1;
+        }
+        __asm__ volatile ("pause" ::: "memory");
+    }
+    kprintf("[virtio-gpu] SUBMIT_3D(%u) timed out\n", ctx_id);
+    return -1;
+}
+
+/* ---- Per-window GPU resource management ------------------------- */
+
+uint32_t virtio_gpu_create_window_resource(uint32_t width, uint32_t height,
+                                           void **backing_out,
+                                           uint64_t *phys_out) {
+    if (!g_vgpu_active || width == 0 || height == 0) return 0;
+    if (!backing_out || !phys_out) return 0;
+
+    struct vgpu_dev *d = &g_vgpu;
+    uint32_t rid = g_next_window_res++;
+
+    size_t bytes = (size_t)width * height * 4u;
+    size_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t phys = pmm_alloc_pages(pages);
+    if (!phys) {
+        kprintf("[virtio-gpu] OOM allocating %lu-page window resource %u\n",
+                (unsigned long)pages, rid);
+        return 0;
+    }
+    void *virt = (void *)pmm_phys_to_virt(phys);
+    memset(virt, 0, bytes);
+
+    if (!cmd_resource_create_2d(d, rid, width, height)) {
+        pmm_free_pages_range(phys, pages);
+        kprintf("[virtio-gpu] CREATE_2D failed for window resource %u\n", rid);
+        return 0;
+    }
+    if (!cmd_resource_attach_backing(d, rid, phys, (uint32_t)bytes)) {
+        cmd_resource_unref(d, rid);
+        pmm_free_pages_range(phys, pages);
+        kprintf("[virtio-gpu] ATTACH_BACKING failed for window resource %u\n", rid);
+        return 0;
+    }
+
+    *backing_out = virt;
+    *phys_out    = phys;
+    kprintf("[virtio-gpu] window resource %u created (%ux%u, %lu KiB)\n",
+            rid, width, height, (unsigned long)(bytes / 1024));
+    return rid;
+}
+
+void virtio_gpu_destroy_window_resource(uint32_t resource_id,
+                                        uint64_t backing_phys,
+                                        size_t   backing_bytes) {
+    if (!g_vgpu_active || resource_id == 0) return;
+
+    struct vgpu_dev *d = &g_vgpu;
+
+    cmd_resource_detach_backing(d, resource_id);
+    cmd_resource_unref(d, resource_id);
+
+    if (backing_phys) {
+        size_t pages = (backing_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        pmm_free_pages_range(backing_phys, pages);
+    }
+    kprintf("[virtio-gpu] window resource %u destroyed\n", resource_id);
+}
+
+void virtio_gpu_transfer_window(uint32_t resource_id,
+                                uint32_t width, uint32_t height) {
+    if (!g_vgpu_active || resource_id == 0) return;
+    struct vgpu_dev *d = &g_vgpu;
+
+    /* Transfer the full window surface to the host. The offset math
+     * in cmd_transfer_to_host_2d_rect uses d->width as the stride,
+     * but for a per-window resource the stride IS the window width.
+     * We save/restore d->width around the call. */
+    uint32_t saved_w = d->width;
+    d->width = width;
+    cmd_transfer_to_host_2d_rect(d, resource_id, 0, 0, width, height);
+    d->width = saved_w;
+}
+
+void virtio_gpu_flush_window(uint32_t resource_id,
+                             uint32_t width, uint32_t height) {
+    if (!g_vgpu_active || resource_id == 0) return;
+    struct vgpu_dev *d = &g_vgpu;
+    cmd_resource_flush_rect(d, resource_id, 0, 0, width, height);
+}
+
+bool virtio_gpu_set_scanout_resource(uint32_t resource_id,
+                                     uint32_t width, uint32_t height) {
+    if (!g_vgpu_active || resource_id == 0) return false;
+    struct vgpu_dev *d = &g_vgpu;
+    return cmd_set_scanout(d, 0, resource_id, width, height);
+}
+
+void virtio_gpu_restore_scanout(void) {
+    if (!g_vgpu_active) return;
+    struct vgpu_dev *d = &g_vgpu;
+    cmd_set_scanout(d, 0, VG_RESOURCE_ID, d->width, d->height);
 }

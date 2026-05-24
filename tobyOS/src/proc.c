@@ -65,6 +65,9 @@
 /* Asm helpers from proc_switch.S. */
 extern __attribute__((noreturn)) void proc_enter_user_asm(uint64_t rip,
                                                           uint64_t rsp);
+extern __attribute__((noreturn)) void proc_enter_user_thread_asm(uint64_t rip,
+                                                                  uint64_t rsp,
+                                                                  uint64_t arg);
 
 /* User stack layout, post-Milestone-25A.
  *
@@ -85,7 +88,7 @@ extern __attribute__((noreturn)) void proc_enter_user_asm(uint64_t rip,
  * Initial RSP : USER_STACK_TOP_VA - 16, OR -- if argv is supplied --
  *               just below the argc/argv/envp/string pool we packed at
  *               the top of the stack (see pack_argv_envp_on_user_stack). */
-#define USER_STACK_PAGES     4
+#define USER_STACK_PAGES     8
 #define USER_STACK_BYTES     (USER_STACK_PAGES * PAGE_SIZE)
 #define USER_STACK_TOP_VA    0x0000800000000000ULL
 #define USER_STACK_TOP_PAGE  (USER_STACK_TOP_VA - USER_STACK_BYTES)
@@ -103,7 +106,7 @@ extern __attribute__((noreturn)) void proc_enter_user_asm(uint64_t rip,
 #define USER_HEAP_BASE       0x0000000010000000ULL
 #define USER_HEAP_MAX_BYTES  (256ull * 1024ull * 1024ull)
 
-static struct proc g_proc[PROC_MAX];
+struct proc g_proc[PROC_MAX];
 struct proc       *g_current_proc;
 
 /* Tiny strncpy substitute -- copies up to max-1 chars and always
@@ -192,6 +195,17 @@ void proc_init(void) {
      * but rdtsc itself is valid from reset -- the conversion to ns
      * is a no-op until calibration completes. */
     k->last_switch_tsc = perf_rdtsc();
+
+    /* Phase 1 M1.1: pid 0 is its own thread-group leader. */
+    k->tgid        = 0;
+    k->is_thread   = false;
+    k->detached    = false;
+    k->tls_base    = 0;
+    k->join_waiters = 0;
+    k->user_arg    = 0;
+
+    /* Phase 1 M1.3: init signal state for pid 0 */
+    signal_init_proc(&k->sigstate);
 
     g_current_proc = k;
 
@@ -504,6 +518,15 @@ static int spawn_internal(const char *path, const char *name,
     p->syscall_count   = 0;
     p->user_pages      = 0;
     p->last_switch_tsc = 0;
+    /* Phase 1 M1.1: new process = its own thread group leader */
+    p->tgid         = p->pid;
+    p->is_thread    = false;
+    p->detached     = false;
+    p->tls_base     = 0;
+    p->join_waiters = 0;
+    p->user_arg     = 0;
+    /* Phase 1 M1.3: init signal state for new process */
+    signal_init_proc(&p->sigstate);
     /* Inherit session tag + user identity from the parent
      * (current_proc()). pid 0 has session_id == 0 / uid == 0 unless
      * the desktop launcher temporarily flipped them to the active
@@ -824,6 +847,12 @@ int proc_spawn(const struct proc_spec *spec) {
  * point at our kstack_top. Drop to ring 3. */
 __attribute__((noreturn)) void proc_first_user_entry(void) {
     struct proc *p = current_proc();
+    /* For threads, pass the thread arg in RDI and load TLS base */
+    if (p->is_thread) {
+        if (p->tls_base)
+            wrmsr(0xC0000100, p->tls_base);  /* MSR_FS_BASE */
+        proc_enter_user_thread_asm(p->user_entry, p->user_rsp, p->user_arg);
+    }
     proc_enter_user_asm(p->user_entry, p->user_rsp);
 }
 
@@ -841,33 +870,57 @@ static void wakeup_waiters(int pid) {
 }
 
 __attribute__((noreturn)) void proc_exit(int code) {
-    /* Disable IRQs while we tweak shared state. The exiting context
-     * has its own kstack, but if a timer IRQ fired between marking
-     * TERMINATED and yielding, the IRQ handler running on this same
-     * stack would still find a coherent snapshot -- belt-and-braces. */
     cli();
 
     struct proc *p = current_proc();
     p->exit_code   = code;
 
-    /* If we WERE the foreground process, the shell's perception of who
-     * owns Ctrl+C must be cleared right now -- otherwise the next
-     * Ctrl+C between our exit and the shell reaping us would target a
-     * TERMINATED PCB (signal_send no-ops on that, but we still want
-     * the foreground slot reset cleanly). */
     if (signal_get_foreground() == p->pid) {
         signal_set_foreground(0);
     }
 
-    /* Close all fds BEFORE flipping to TERMINATED. This lets pipe ends
-     * decrement their reader/writer counts immediately -- so a sibling
-     * process blocked on read() sees EOF the instant we exit, regardless
-     * of whether/when our parent gets around to reaping us.
-     *
-     * Safe to do at this point: we won't run any more user code, and we
-     * still own the kernel stack we're standing on. The PML4 + kstack
-     * stay valid for the eventual proc_reap. */
-    close_all_fds(p);
+    /* Phase 1 M1.1: thread-group exit logic.
+     * If we are the leader, terminate all threads in our group first.
+     * If we are a non-leader thread, don't close shared fds. */
+    if (!p->is_thread) {
+        /* Leader exiting -- kill all threads in this group */
+        for (int i = 0; i < PROC_MAX; i++) {
+            struct proc *q = &g_proc[i];
+            if (q == p || q->state == PROC_UNUSED) continue;
+            if (q->tgid == p->pid && q->is_thread) {
+                /* Force-terminate the thread */
+                q->exit_code = code;
+                q->state = PROC_TERMINATED;
+                /* Wake any joiners */
+                struct proc *w = q->join_waiters;
+                while (w) {
+                    struct proc *nxt = w->next_wait;
+                    w->state = PROC_READY;
+                    w->next_wait = 0;
+                    sched_enqueue(w);
+                    w = nxt;
+                }
+                q->join_waiters = 0;
+                /* Free the thread's kernel stack */
+                if (q->kstack_base) kfree(q->kstack_base);
+                q->kstack_base = 0;
+                q->kstack_top  = 0;
+                q->state = PROC_UNUSED;
+            }
+        }
+        close_all_fds(p);
+    } else {
+        /* Non-leader thread: don't close shared fds, just wake joiners */
+        struct proc *w = p->join_waiters;
+        while (w) {
+            struct proc *nxt = w->next_wait;
+            w->state = PROC_READY;
+            w->next_wait = 0;
+            sched_enqueue(w);
+            w = nxt;
+        }
+        p->join_waiters = 0;
+    }
 
     p->state       = PROC_TERMINATED;
 
@@ -895,10 +948,8 @@ __attribute__((noreturn)) void proc_exit(int code) {
 static void proc_reap(struct proc *p) {
     if (!p || p->state != PROC_TERMINATED) return;
 
-    if (p->owns_pml4 && p->cr3) {
-        /* Safe because the caller (the parent) is running on the
-         * kernel PML4 -- we are NOT pulling the rug out from under
-         * the active CR3. */
+    /* Only the leader owns the PML4; threads share it */
+    if (p->owns_pml4 && p->cr3 && !p->is_thread) {
         vmm_destroy_user_pml4(p->cr3);
     }
     if (p->kstack_base) {

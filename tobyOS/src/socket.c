@@ -1,20 +1,15 @@
-/* socket.c -- UDP socket pool + recv-queue + sendto/recvfrom.
+/* socket.c -- unified socket pool (UDP + TCP) + BSD-like syscall API.
  *
- * Sockets live in a fixed-size pool (SOCK_MAX). The state machine is
- * deliberately minimal: in_use {true,false}, with bound = local_port
- * != 0. Receive queue is a bounded ring of struct sock_dgram; when
- * full we drop the oldest dgram (head++) so a slow consumer doesn't
- * permanently lose every new packet. udp_recv reaches in via
- * sock_deliver() (a private extern) to enqueue.
+ * Sockets live in a fixed-size pool (SOCK_MAX). UDP sockets carry a
+ * datagram ring; TCP sockets wrap the kernel's struct tcp_conn.
  *
- * Wait queue: sock_recvfrom uses the same wq_add / wq_wake_all
- * pattern pipes use, so it cooperates with milestone-8 signal
- * delivery -- a SIGINT cleanly unblocks a hung recvfrom and the
- * syscall path then exits the process.
+ * Wait queue: sock_recvfrom / sys_recv use the same wq_add / wq_wake_all
+ * pattern pipes use, so SIGINT cleanly unblocks a hung recv.
  */
 
 #include <tobyos/socket.h>
 #include <tobyos/udp.h>
+#include <tobyos/tcp.h>
 #include <tobyos/proc.h>
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
@@ -24,7 +19,7 @@
 #include <tobyos/cap.h>
 
 static struct sock g_socks[SOCK_MAX];
-static uint16_t    g_next_ephemeral = 33000;     /* network byte order */
+static uint16_t    g_next_ephemeral = 33000;
 
 /* ---- wait-queue helpers (mirrors pipe.c) ----------------------- */
 
@@ -55,13 +50,26 @@ void sock_init(void) {
     memset(g_socks, 0, sizeof(g_socks));
 }
 
+static int sock_index(const struct sock *s) {
+    if (!s) return -1;
+    return (int)(s - g_socks);
+}
+
+static struct sock *sock_by_fd(int fd) {
+    if (fd < 0 || fd >= SOCK_MAX) return NULL;
+    struct sock *s = &g_socks[fd];
+    return s->in_use ? s : NULL;
+}
+
 struct sock *sock_alloc(int kind) {
-    if (kind != SOCK_KIND_UDP) return 0;
+    if (kind != SOCK_KIND_UDP && kind != SOCK_KIND_TCP) return 0;
     for (int i = 0; i < SOCK_MAX; i++) {
         if (!g_socks[i].in_use) {
             memset(&g_socks[i], 0, sizeof(g_socks[i]));
             g_socks[i].in_use = true;
-            g_socks[i].kind   = SOCK_KIND_UDP;
+            g_socks[i].kind   = kind;
+            g_socks[i].recv_timeout_ms = 30000;
+            g_socks[i].send_timeout_ms = 30000;
             return &g_socks[i];
         }
     }
@@ -70,10 +78,14 @@ struct sock *sock_alloc(int kind) {
 
 void sock_close(struct sock *s) {
     if (!s) return;
-    /* Wake every blocked recvfrom so they return -EINTR-ish. We mark
-     * the socket free first so the wakers don't try to re-bind. */
     s->in_use = false;
     wq_wake_all(&s->wq_recv);
+
+    if (s->kind == SOCK_KIND_TCP && s->tcp) {
+        tcp_close(s->tcp);
+        s->tcp = NULL;
+    }
+
     for (int i = 0; i < SOCK_RX_DGRAMS; i++) {
         if (s->dgrams[i].payload) {
             kfree(s->dgrams[i].payload);
@@ -83,7 +95,6 @@ void sock_close(struct sock *s) {
     memset(s, 0, sizeof(*s));
 }
 
-/* Find a socket by bound local port. Returns NULL if none matches. */
 struct sock *sock_lookup_by_port(uint16_t dst_port_be) {
     if (dst_port_be == 0) return 0;
     for (int i = 0; i < SOCK_MAX; i++) {
@@ -123,8 +134,6 @@ void sock_deliver(struct sock *s,
     if (len > ETH_MTU) len = ETH_MTU;
 
     if (s->count == SOCK_RX_DGRAMS) {
-        /* Queue full -- drop the oldest to make room. Counts the
-         * lifetime drops for `netstat`-style diagnostics. */
         struct sock_dgram *old = &s->dgrams[s->tail];
         if (old->payload) { kfree(old->payload); old->payload = 0; }
         s->tail = (uint8_t)((s->tail + 1) % SOCK_RX_DGRAMS);
@@ -147,20 +156,15 @@ void sock_deliver(struct sock *s,
     wq_wake_all(&s->wq_recv);
 }
 
-/* ---- syscall surface ------------------------------------------- */
+/* ---- UDP syscall surface --------------------------------------- */
 
 long sock_sendto(struct sock *s, const void *buf, size_t len,
                  uint32_t dst_ip_be, uint16_t dst_port_be) {
-    /* Defence-in-depth (milestone 18): the syscall layer already gates
-     * on CAP_NET, but a socket fd could in principle reach a less-
-     * privileged child via a future fd-passing mechanism. Re-check
-     * here so the wire never sees a packet from a proc lacking the
-     * capability. The kernel itself (NULL current_proc) always passes. */
     if (!cap_check(current_proc(), CAP_NET, "sock_sendto")) return -1;
     if (!s || !s->in_use)  return -1;
     if (!buf && len)       return -1;
     if (dst_port_be == 0)  return -1;
-    if (len > ETH_MTU - 28 /* IP+UDP */) return -1;
+    if (len > ETH_MTU - 28) return -1;
 
     if (s->local_port == 0) {
         if (sock_bind_ephemeral(s) != 0) return -1;
@@ -187,7 +191,7 @@ long sock_recvfrom(struct sock *s, void *buf, size_t n,
         self->state = PROC_BLOCKED;
         sched_yield();
         if (self->pending_signals) return EINTR_RET;
-        if (!s->in_use)            return -1;   /* closed under us */
+        if (!s->in_use)            return -1;
     }
 
     struct sock_dgram *d = &s->dgrams[s->tail];
@@ -204,6 +208,133 @@ long sock_recvfrom(struct sock *s, void *buf, size_t n,
     return (long)copy;
 }
 
+/* ---- Unified BSD-like kernel socket API (ksock_*) --------------- */
+
+int ksock_socket(int domain, int type, int protocol) {
+    (void)protocol;
+    if (domain != AF_INET) return -1;
+
+    int kind;
+    if (type == SOCK_STREAM)     kind = SOCK_KIND_TCP;
+    else if (type == SOCK_DGRAM) kind = SOCK_KIND_UDP;
+    else return -1;
+
+    struct sock *s = sock_alloc(kind);
+    if (!s) return -1;
+    return sock_index(s);
+}
+
+int ksock_bind(int sockfd, const struct sockaddr_in *addr) {
+    struct sock *s = sock_by_fd(sockfd);
+    if (!s || !addr) return -1;
+    if (addr->sin_family != AF_INET) return -1;
+    return sock_bind(s, addr->sin_port);
+}
+
+int ksock_connect(int sockfd, const struct sockaddr_in *addr) {
+    struct sock *s = sock_by_fd(sockfd);
+    if (!s || !addr) return -1;
+    if (addr->sin_family != AF_INET) return -1;
+
+    if (s->kind == SOCK_KIND_TCP) {
+        struct tcp_conn *tc = tcp_connect(addr->sin_addr, addr->sin_port,
+                                          s->send_timeout_ms);
+        if (!tc) return -1;
+        s->tcp = tc;
+        return 0;
+    }
+    return -1;
+}
+
+int ksock_listen(int sockfd, int backlog) {
+    struct sock *s = sock_by_fd(sockfd);
+    if (!s) return -1;
+    if (s->kind != SOCK_KIND_TCP) return -1;
+    if (s->local_port == 0) return -1;
+
+    struct tcp_conn *lsn = tcp_listen(s->local_port, backlog);
+    if (!lsn) return -1;
+    s->tcp = lsn;
+    s->tcp_listening = true;
+    return 0;
+}
+
+int ksock_accept(int sockfd, struct sockaddr_in *addr) {
+    struct sock *s = sock_by_fd(sockfd);
+    if (!s) return -1;
+    if (s->kind != SOCK_KIND_TCP || !s->tcp_listening || !s->tcp) return -1;
+
+    struct tcp_conn *child = tcp_accept(s->tcp, s->recv_timeout_ms);
+    if (!child) return -1;
+
+    struct sock *ns = sock_alloc(SOCK_KIND_TCP);
+    if (!ns) {
+        tcp_close(child);
+        return -1;
+    }
+    ns->tcp = child;
+    ns->local_port = s->local_port;
+
+    if (addr) {
+        memset(addr, 0, sizeof(*addr));
+        addr->sin_family = AF_INET;
+    }
+
+    return sock_index(ns);
+}
+
+long ksock_send(int sockfd, const void *buf, size_t len, int flags) {
+    (void)flags;
+    struct sock *s = sock_by_fd(sockfd);
+    if (!s) return -1;
+
+    if (s->kind == SOCK_KIND_TCP) {
+        if (!s->tcp) return -1;
+        return tcp_send(s->tcp, buf, len);
+    }
+    return -1;
+}
+
+long ksock_recv(int sockfd, void *buf, size_t len, int flags) {
+    (void)flags;
+    struct sock *s = sock_by_fd(sockfd);
+    if (!s) return -1;
+
+    if (s->kind == SOCK_KIND_TCP) {
+        if (!s->tcp) return -1;
+        return tcp_recv(s->tcp, buf, len, s->recv_timeout_ms);
+    }
+    return -1;
+}
+
+int ksock_close(int sockfd) {
+    struct sock *s = sock_by_fd(sockfd);
+    if (!s) return -1;
+    sock_close(s);
+    return 0;
+}
+
+int ksock_setsockopt(int sockfd, int level, int optname,
+                     const void *optval, size_t optlen) {
+    struct sock *s = sock_by_fd(sockfd);
+    if (!s) return -1;
+
+    if (level == SOL_SOCKET) {
+        if (optname == SO_RCVTIMEO && optval && optlen >= sizeof(uint32_t)) {
+            s->recv_timeout_ms = *(const uint32_t *)optval;
+            return 0;
+        }
+        if (optname == SO_SNDTIMEO && optval && optlen >= sizeof(uint32_t)) {
+            s->send_timeout_ms = *(const uint32_t *)optval;
+            return 0;
+        }
+        if (optname == SO_REUSEADDR) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* ---- diagnostics ----------------------------------------------- */
 
 void sock_dump(void) {
@@ -211,8 +342,10 @@ void sock_dump(void) {
     int n = 0;
     for (int i = 0; i < SOCK_MAX; i++) {
         if (!g_socks[i].in_use) continue;
-        kprintf("  [%d]  port=%u  queued=%u  dropped=%u\n",
-                i, (unsigned)ntohs(g_socks[i].local_port),
+        const char *kind_str = g_socks[i].kind == SOCK_KIND_TCP ? "TCP" : "UDP";
+        kprintf("  [%d]  %s  port=%u  queued=%u  dropped=%u\n",
+                i, kind_str,
+                (unsigned)ntohs(g_socks[i].local_port),
                 (unsigned)g_socks[i].count,
                 (unsigned)g_socks[i].dropped);
         n++;

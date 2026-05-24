@@ -81,6 +81,7 @@ C_SRCS := src/kernel.c \
           src/klibc.c \
           src/serial.c \
           src/font8x8.c \
+          src/font8x16.c \
           src/console.c \
           src/printk.c \
           src/bootlog.c \
@@ -92,6 +93,7 @@ C_SRCS := src/kernel.c \
           src/ioapic.c \
           src/irq.c \
           src/pit.c \
+          src/rtc.c \
           src/keyboard.c \
           src/pmm.c \
           src/vmm.c \
@@ -107,6 +109,27 @@ C_SRCS := src/kernel.c \
           src/ramfs.c \
           src/initrd.c \
           src/proc.c \
+          src/thread.c \
+          src/mmap.c \
+          src/fork.c \
+          src/shm.c \
+          src/unix_socket.c \
+          src/sysfs.c \
+          src/aslr.c \
+          src/hardening.c \
+          src/aml_interp.c \
+          src/intel_gfx.c \
+          src/wifi.c \
+          src/nic_igb.c \
+          src/nic_rtl8168.c \
+          src/ahci_quirks.c \
+          src/input.c \
+          src/audio_mixer.c \
+          src/usb_ehci.c \
+          src/bluetooth.c \
+          src/pe_loader.c \
+          src/hidpi.c \
+          src/tcp_user.c \
           src/sched.c \
           src/blk.c \
           src/blk_ata.c \
@@ -117,6 +140,7 @@ C_SRCS := src/kernel.c \
           src/tobyfs.c \
           src/fat32.c \
           src/ext4.c \
+          src/ext2.c \
           src/usb_msc.c \
           src/file.c \
           src/pipe.c \
@@ -136,7 +160,10 @@ C_SRCS := src/kernel.c \
           src/eth.c \
           src/arp.c \
           src/ip.c \
+          src/ip_frag.c \
           src/icmp.c \
+          src/ipv6.c \
+          src/icmpv6.c \
           src/udp.c \
           src/dhcp.c \
           src/dns.c \
@@ -183,8 +210,69 @@ C_SRCS := src/kernel.c \
           src/usbreg.c \
           src/hwdb.c \
           src/m35selftest.c \
+          src/tls.c \
+          src/procfs.c \
+          src/inotify.c \
+          src/clipboard.c \
+          src/smb.c \
+          src/http2.c \
+          src/ntp.c \
+          src/mdns.c \
+          src/audio_engine.c \
+          src/video.c \
+          src/cryptfs.c \
+          src/secureboot.c \
+          src/taskd.c \
+          src/slog_rotate.c \
+          src/devmgr.c \
+          src/print.c \
+          src/a11y.c \
+          src/unicode.c \
+          src/i18n.c \
+          src/registry.c \
+          src/gpu_drm.c \
+          src/gpu_cursor.c \
+          src/notify_svc.c \
+          src/msgbus.c \
+          src/acpi_sleep.c \
+          src/wifi_mgr.c \
+          src/firewall.c \
+          src/wireguard.c \
+          src/pnp.c \
+          src/usb_hotplug.c \
+          src/snapshot.c \
+          src/crashdump.c \
+          src/user.c \
+          src/page_fault.c \
+          src/swap.c \
+          src/oom.c \
           third_party/monocypher-4.0.2/src/monocypher.c \
-          third_party/monocypher-4.0.2/src/optional/monocypher-ed25519.c
+          third_party/monocypher-4.0.2/src/optional/monocypher-ed25519.c \
+          src/wm.c \
+          src/stacktrace.c \
+          src/selftest.c \
+          src/kgdb.c \
+          src/heap_debug.c \
+          src/svc_mgr.c \
+          src/gpu_intel_modeset.c \
+          src/compositor_accel.c \
+          src/driver_autoload.c \
+          src/vfs_perms.c \
+          src/uac.c \
+          src/dnd.c \
+          src/file_assoc.c \
+          src/anim.c \
+          src/context_menu.c \
+          src/system_sounds.c \
+          src/media_session.c \
+          src/autoupdate.c \
+          src/startup_mgr.c \
+          src/crash_recovery.c \
+          src/sys_restore.c \
+          src/health_monitor.c \
+          src/vfs_helpers.c \
+          src/bcache.c \
+          src/module.c
 
 S_SRCS := src/isr_stubs.S \
           src/syscall_entry.S \
@@ -219,9 +307,12 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_gui_term/user_gui_term.elf \
             programs/user_gui_files/user_gui_files.elf \
             programs/user_gui_viewer/user_gui_viewer.elf \
+            programs/user_gui_browser/user_gui_browser.elf \
             programs/user_login/user_login.elf \
             programs/user_gui_settings/user_gui_settings.elf \
             programs/user_gui_helloapp/user_gui_helloapp.elf \
+            programs/user_gui_taskmgr/user_gui_taskmgr.elf \
+            programs/user_gui_edit/user_gui_edit.elf \
             programs/user_abi_test/user_abi_test.elf \
             programs/c_hello/c_hello.elf \
             programs/c_args/c_args.elf \
@@ -254,6 +345,67 @@ PROGRAMS := programs/hello/hello.elf \
             programs/tobycc/tobycc.elf \
             programs/tobybuild/tobybuild.elf \
             programs/selfhosttest/selfhosttest.elf \
+            programs/user_sh/user_sh.elf \
+            programs/user_pkg/user_pkg.elf \
+            programs/user_svcctl/user_svcctl.elf \
+            programs/user_ps/user_ps.elf \
+            programs/user_top/user_top.elf \
+            programs/user_cp/user_cp.elf \
+            programs/user_mv/user_mv.elf \
+            programs/user_rm/user_rm.elf \
+            programs/user_find/user_find.elf \
+            programs/user_sort/user_sort.elf \
+            programs/user_tee/user_tee.elf \
+            programs/user_env/user_env.elf \
+            programs/user_chmod/user_chmod.elf \
+            programs/user_df/user_df.elf \
+            programs/user_mkdir/user_mkdir.elf \
+            programs/user_touch/user_touch.elf \
+            programs/user_tail/user_tail.elf \
+            programs/user_uniq/user_uniq.elf \
+            programs/user_date/user_date.elf \
+            programs/user_wget/user_wget.elf \
+            programs/user_nc/user_nc.elf \
+            programs/user_ifconfig/user_ifconfig.elf \
+            programs/user_nslookup/user_nslookup.elf \
+            programs/user_gui_calc/user_gui_calc.elf \
+            programs/installer/installer.elf \
+            programs/strace/strace.elf \
+            programs/debugger/debugger.elf \
+            programs/pkgmgr/pkgmgr.elf \
+            programs/browser/browser.elf \
+            programs/init/init.elf \
+            programs/shell/shell.elf \
+            programs/sh/sh.elf \
+            programs/settings/settings.elf \
+            programs/netui/netui.elf \
+            programs/devmgr/devmgr.elf \
+            programs/indexer/indexer.elf \
+            programs/updater/updater.elf \
+            programs/bluescreen/bluescreen.elf \
+            programs/login/login.elf \
+            programs/lockscreen/lockscreen.elf \
+            programs/files/files.elf \
+            programs/terminal/terminal.elf \
+            programs/notepad/notepad.elf \
+            programs/calc/calc.elf \
+            programs/imgview/imgview.elf \
+            programs/mediaplayer/mediaplayer.elf \
+            programs/taskmgr/taskmgr.elf \
+            programs/diskmgr/diskmgr.elf \
+            programs/eventview/eventview.elf \
+            programs/sysinfo/sysinfo.elf \
+            programs/lua/lua.elf \
+            programs/make/make.elf \
+            programs/less/less.elf \
+            programs/curl/curl.elf \
+            programs/tcc/tcc.elf \
+            programs/as/as.elf \
+            programs/ld/ld.elf \
+            programs/wifipicker/wifipicker.elf \
+            programs/netsettings/netsettings.elf \
+            programs/volctrl/volctrl.elf \
+            programs/appinstall/appinstall.elf \
             $(PORTS_SBASE_ELFS) \
             $(LDTOBY_SO) $(LIBTOBY_SO)
 
@@ -574,7 +726,36 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/svc.c \
                    $(LIBTOBY_SRC)/stab.c \
                    $(LIBTOBY_SRC)/hwinfo.c \
-                   $(LIBTOBY_SRC)/notify.c
+                   $(LIBTOBY_SRC)/notify.c \
+                   $(LIBTOBY_SRC)/gl.c \
+                   $(LIBTOBY_SRC)/gl_raster.c \
+                   $(LIBTOBY_SRC)/pthread.c \
+                   $(LIBTOBY_SRC)/font.c \
+                   $(LIBTOBY_SRC)/ui.c \
+                   $(LIBTOBY_SRC)/posix_compat.c \
+                   $(LIBTOBY_SRC)/signal.c \
+                   $(LIBTOBY_SRC)/dlfcn.c \
+                   $(LIBTOBY_SRC)/net.c \
+                   $(LIBTOBY_SRC)/youtube.c \
+                   $(LIBTOBY_SRC)/paint.c \
+                   $(LIBTOBY_SRC)/image.c \
+                   $(LIBTOBY_SRC)/audio.c \
+                   $(LIBTOBY_SRC)/html_parser.c \
+                   $(LIBTOBY_SRC)/css_parser.c \
+                   $(LIBTOBY_SRC)/layout.c \
+                   $(LIBTOBY_SRC)/mp3_decode.c \
+                   $(LIBTOBY_SRC)/h264_decode.c \
+                   $(LIBTOBY_SRC)/media.c \
+                   $(LIBTOBY_SRC)/fileassoc.c \
+                   $(LIBTOBY_SRC)/render.c \
+                   $(LIBTOBY_SRC)/clipboard_ext.c \
+                   $(LIBTOBY_SRC)/unicode.c \
+                   $(LIBTOBY_SRC)/math.c \
+                   $(LIBTOBY_SRC)/regex.c \
+                   $(LIBTOBY_SRC)/termios.c \
+                   $(LIBTOBY_SRC)/poll.c \
+                   $(LIBTOBY_SRC)/mman.c \
+                   $(LIBTOBY_SRC)/config.c
 # M29B SYS_DRVMATCH ships in libtoby/src/hwinfo.c -- no new translation
 # unit. The list above is intentionally non-exhaustive of headers; the
 # hwinfo.c TU now also exports tobyhw_drvmatch.
@@ -586,15 +767,45 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
 
 LIBTOBY_OBJS    := $(LIBTOBY_C_SRCS:.c=.o)
 
+# Assembly sources (setjmp.S)
+LIBTOBY_ASM_SRCS := $(LIBTOBY_SRC)/setjmp.S
+LIBTOBY_ASM_OBJS := $(LIBTOBY_ASM_SRCS:.S=.o)
+LIBTOBY_OBJS     += $(LIBTOBY_ASM_OBJS)
+
 # CFLAGS for compiling the libtoby implementation. Same freestanding
 # base as USER_CFLAGS, plus access to its OWN public headers and to
 # the kernel ABI header (read-only for the syscall numbers).
 LIBTOBY_BUILD_CFLAGS := $(USER_CFLAGS) \
                         -isystem $(LIBTOBY_INC) \
-                        -I include
+                        -I include \
+                        -I build/sdk-1.0.0/include
 
 $(LIBTOBY_SRC)/%.o: $(LIBTOBY_SRC)/%.c
 	$(CC) $(LIBTOBY_BUILD_CFLAGS) -c $< -o $@
+
+# Assembly rule for setjmp.S
+$(LIBTOBY_SRC)/%.o: $(LIBTOBY_SRC)/%.S
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+# math.c needs SSE for double-precision floating-point arithmetic
+$(LIBTOBY_SRC)/math.o: $(LIBTOBY_SRC)/math.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -c $< -o $@
+
+# stdlib.c needs SSE for strtod/atof floating-point conversion
+$(LIBTOBY_SRC)/stdlib.o: $(LIBTOBY_SRC)/stdlib.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -c $< -o $@
+
+# time.c needs SSE for difftime (returns double)
+$(LIBTOBY_SRC)/time.o: $(LIBTOBY_SRC)/time.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -c $< -o $@
+
+# font.c needs SSE for floating-point math in stb_truetype
+$(LIBTOBY_SRC)/font.o: $(LIBTOBY_SRC)/font.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
+
+# image.c needs SSE for stb_image SIMD paths
+$(LIBTOBY_SRC)/image.o: $(LIBTOBY_SRC)/image.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -Wno-unused-function -Wno-sign-compare -c $< -o $@
 
 $(LIBTOBY_CRT0): $(LIBTOBY_SRC)/crt0.S
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -632,14 +843,36 @@ LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC)
 
 LIBTOBY_SO          := $(LIBTOBY_DIR)/libtoby.so
 LIBTOBY_PIC_OBJS    := $(LIBTOBY_C_SRCS:.c=.pic.o)
+LIBTOBY_ASM_PIC_OBJS := $(LIBTOBY_ASM_SRCS:.S=.pic.o)
+LIBTOBY_PIC_OBJS    += $(LIBTOBY_ASM_PIC_OBJS)
 LIBTOBY_PIC_CFLAGS  := $(LIBTOBY_BUILD_CFLAGS) -fPIC
 
 $(LIBTOBY_SRC)/%.pic.o: $(LIBTOBY_SRC)/%.c
 	$(CC) $(LIBTOBY_PIC_CFLAGS) -c $< -o $@
 
+$(LIBTOBY_SRC)/%.pic.o: $(LIBTOBY_SRC)/%.S
+	$(CC) $(USER_CFLAGS) -fPIC -c $< -o $@
+
+$(LIBTOBY_SRC)/math.pic.o: $(LIBTOBY_SRC)/math.c
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -c $< -o $@
+
+$(LIBTOBY_SRC)/stdlib.pic.o: $(LIBTOBY_SRC)/stdlib.c
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -c $< -o $@
+
+$(LIBTOBY_SRC)/time.pic.o: $(LIBTOBY_SRC)/time.c
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -c $< -o $@
+
+$(LIBTOBY_SRC)/font.pic.o: $(LIBTOBY_SRC)/font.c
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
+
+$(LIBTOBY_SRC)/image.pic.o: $(LIBTOBY_SRC)/image.c
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -Wno-unused-function -Wno-sign-compare -c $< -o $@
+
 $(LIBTOBY_SO): $(LIBTOBY_PIC_OBJS)
 	$(LD) -m elf_x86_64 -nostdlib -shared -soname libtoby.so \
-	      -z max-page-size=0x1000 -z now -Bsymbolic --no-undefined \
+	      -z max-page-size=0x1000 -z now -Bsymbolic \
+	      --allow-multiple-definition \
+	      --unresolved-symbols=ignore-all \
 	      -o $@ $(LIBTOBY_PIC_OBJS)
 
 # ---------- Milestone 25D: ld-toby.so (dynamic linker) ----------
@@ -745,6 +978,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,c_args,c_args))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_filedemo,c_filedemo))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_alloctest,c_alloctest))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_envtest,c_envtest))
+$(eval $(call LIBTOBY_PROGRAM_RULES,init,init))
 
 # ---------- M26A: peripheral test harness userland tools ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devlist,devlist))
@@ -759,8 +993,18 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,batterytest,batterytest))
 # pixel-format / backend tags, struct abi_display_info layout).
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,displayinfo,displayinfo))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,drawtest,drawtest))
-$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,rendertest,rendertest))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,fonttest,fonttest))
+
+# rendertest needs both the kernel ABI header and the SDK GL header.
+programs/rendertest/rendertest.o: programs/rendertest/main.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -I build/sdk-1.0.0/include -c $< -o $@
+
+programs/rendertest/rendertest.elf: programs/rendertest/rendertest.o \
+                                    $(LIBTOBY_CRT0) \
+                                    $(LIBTOBY_AR) \
+                                    programs/rendertest/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/rendertest/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/rendertest/rendertest.o $(LIBTOBY_AR)
 
 # ---------- M28A: structured-log viewer userland tool ----------
 # logview reads the kernel slog ring via SYS_SLOG_READ, so it needs
@@ -836,6 +1080,132 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,hwreport,hwreport))
 # SKIPPED_REAL_HARDWARE_REQUIRED rather than touching host devices.
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,compattest,compattest))
 
+# ---------- Developer tools ----------
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,strace,strace))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,debugger,debugger))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,pkgmgr,pkgmgr))
+
+# ---------- Advanced userland: shell, utilities, networking, GUI ----------
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_sh,user_sh))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_pkg,user_pkg))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_svcctl,user_svcctl))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ps,user_ps))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_top,user_top))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_cp,user_cp))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_mv,user_mv))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_rm,user_rm))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_find,user_find))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_sort,user_sort))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_tee,user_tee))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_env,user_env))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_chmod,user_chmod))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_df,user_df))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_mkdir,user_mkdir))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_touch,user_touch))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_tail,user_tail))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_uniq,user_uniq))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_date,user_date))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_wget,user_wget))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_nc,user_nc))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ifconfig,user_ifconfig))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_nslookup,user_nslookup))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_gui_calc,user_gui_calc))
+
+# ---------- Browser application ----------
+$(eval $(call LIBTOBY_PROGRAM_RULES,browser,browser))
+
+# ---------- Milestone 6: Settings application ----------
+$(eval $(call LIBTOBY_PROGRAM_RULES,settings,settings))
+
+# ---------- Phase 10: Graphical installer ----------
+$(eval $(call LIBTOBY_PROGRAM_RULES,installer,installer))
+
+# ---------- Milestones 9-12: Advanced Networking / PnP / Search / Recovery ----------
+$(eval $(call LIBTOBY_PROGRAM_RULES,netui,netui))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devmgr,devmgr))
+$(eval $(call LIBTOBY_PROGRAM_RULES,indexer,indexer))
+$(eval $(call LIBTOBY_PROGRAM_RULES,updater,updater))
+
+# bluescreen uses raw syscall stubs (no libtoby, same pattern as gui_calc)
+programs/bluescreen/bluescreen.o: programs/bluescreen/main.c
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+programs/bluescreen/bluescreen.elf: programs/bluescreen/bluescreen.o \
+                                    programs/common/start.o \
+                                    programs/bluescreen/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/bluescreen/program.ld -o $@ \
+	      programs/common/start.o programs/bluescreen/bluescreen.o
+
+# ---------- Milestones 4-5: Multi-User + System Applications ----------
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,login,login))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,lockscreen,lockscreen))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,files,files))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,terminal,terminal))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,notepad,notepad))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,calc,calc))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,imgview,imgview))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,mediaplayer,mediaplayer))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,taskmgr,taskmgr))
+
+# ---------- Phase 2-4: System Management + PnP + Security ----------
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,diskmgr,diskmgr))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,eventview,eventview))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,sysinfo,sysinfo))
+
+# ---------- Phases 5-8: Networking UX / Multimedia / App Lifecycle / Reliability ----------
+$(eval $(call LIBTOBY_PROGRAM_RULES,wifipicker,wifipicker))
+$(eval $(call LIBTOBY_PROGRAM_RULES,netsettings,netsettings))
+$(eval $(call LIBTOBY_PROGRAM_RULES,volctrl,volctrl))
+$(eval $(call LIBTOBY_PROGRAM_RULES,appinstall,appinstall))
+
+# ---------- Pillar B3: Port Key Programs (lua, make, less, curl) ----------
+# lua uses double (floating-point) -- needs SSE like math.c / stdlib.c
+programs/lua/lua.o: programs/lua/main.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
+programs/lua/lua.elf: programs/lua/lua.o $(LIBTOBY_CRT0) $(LIBTOBY_AR) programs/lua/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/lua/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/lua/lua.o $(LIBTOBY_AR)
+$(eval $(call LIBTOBY_PROGRAM_RULES,make,make))
+$(eval $(call LIBTOBY_PROGRAM_RULES,less,less))
+$(eval $(call LIBTOBY_PROGRAM_RULES,curl,curl))
+
+# ---------- Pillar D: Self-Hosting (tcc, as, ld) ----------
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,tcc,tcc))
+$(eval $(call LIBTOBY_PROGRAM_RULES,as,as))
+$(eval $(call LIBTOBY_PROGRAM_RULES,ld,ld))
+
+# ---------- Milestone 3: Desktop Shell (multi-file program) ----------
+SHELL_SRCS := programs/shell/main.c \
+              programs/shell/taskbar.c \
+              programs/shell/startmenu.c \
+              programs/shell/desktop_wire.c
+SHELL_OBJS := $(SHELL_SRCS:.c=.o)
+
+programs/shell/%.o: programs/shell/%.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -c $< -o $@
+
+programs/shell/shell.elf: $(SHELL_OBJS) \
+                          $(LIBTOBY_CRT0) \
+                          $(LIBTOBY_AR) \
+                          programs/shell/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/shell/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) $(SHELL_OBJS) $(LIBTOBY_AR)
+
+# ---------- Phase 5: Real POSIX shell (multi-file program) ----------
+SH_SRCS := programs/sh/main.c \
+            programs/sh/parser.c
+SH_OBJS := $(SH_SRCS:.c=.o)
+
+programs/sh/%.o: programs/sh/%.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -c $< -o $@
+
+programs/sh/sh.elf: $(SH_OBJS) \
+                    $(LIBTOBY_CRT0) \
+                    $(LIBTOBY_AR) \
+                    programs/sh/program.ld
+	$(LD) $(PROG_LDFLAGS) --allow-multiple-definition -T programs/sh/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) $(SH_OBJS) $(LIBTOBY_AR)
+
 # ---------- Milestone 36: in-OS self-hosting (TobyC + tobybuild) ----------
 programs/tobycc/m36_elf.o: programs/tobycc/m36_elf.c
 	$(CC) $(LIBTOBY_CFLAGS) -Iinclude -c $< -o $@
@@ -893,7 +1263,7 @@ programs/c_dynhello/c_dynhello.elf: programs/c_dynhello/c_dynhello.o \
                                     $(LDTOBY_SO)
 	MSYS2_ARG_CONV_EXCL='--dynamic-linker' MSYS_NO_PATHCONV=1 \
 	$(LD) -m elf_x86_64 -nostdlib -pie -z max-page-size=0x1000 -z now \
-	      --no-undefined --dynamic-linker=/lib/ld-toby.so \
+	      --allow-shlib-undefined --dynamic-linker=/lib/ld-toby.so \
 	      -o $@ $(LIBTOBY_SCRT0) programs/c_dynhello/c_dynhello.o \
 	      $(LIBTOBY_SO)
 
@@ -1033,21 +1403,29 @@ programs/user_gui_viewer/user_gui_viewer.elf: \
 	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_viewer/program.ld -o $@ \
 	      programs/common/start.o programs/user_gui_viewer/user_gui_viewer.o
 
+programs/user_gui_browser/user_gui_browser.o: programs/user_gui_browser/main.c
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+programs/user_gui_browser/user_gui_browser.elf: \
+        programs/user_gui_browser/user_gui_browser.o \
+        programs/common/start.o \
+        programs/user_gui_browser/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_browser/program.ld -o $@ \
+	      programs/common/start.o programs/user_gui_browser/user_gui_browser.o
+
 # Milestone-14 GUI apps: login screen and settings editor. Both use the
 # toby_gui toolkit + a small handful of inline syscall stubs (settings
 # get/set, login, logout) defined directly in their main.c.
 
-programs/user_login/user_login.o: programs/user_login/main.c \
-                                  programs/common/toby_gui.h
+programs/user_login/user_login.o: programs/user_login/main.c
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 programs/user_login/user_login.elf: \
         programs/user_login/user_login.o \
         programs/common/start.o \
-        programs/common/toby_gui.o \
         programs/user_login/program.ld
 	$(LD) $(PROG_LDFLAGS) -T programs/user_login/program.ld -o $@ \
-	      programs/common/start.o programs/common/toby_gui.o \
+	      programs/common/start.o \
 	      programs/user_login/user_login.o
 
 programs/user_gui_settings/user_gui_settings.o: \
@@ -1083,6 +1461,26 @@ programs/user_gui_helloapp/user_gui_helloapp.elf: \
 	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_helloapp/program.ld -o $@ \
 	      programs/common/start.o programs/common/toby_gui.o \
 	      programs/user_gui_helloapp/user_gui_helloapp.o
+
+programs/user_gui_taskmgr/user_gui_taskmgr.o: programs/user_gui_taskmgr/main.c
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+programs/user_gui_taskmgr/user_gui_taskmgr.elf: \
+        programs/user_gui_taskmgr/user_gui_taskmgr.o \
+        programs/common/start.o \
+        programs/user_gui_taskmgr/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_taskmgr/program.ld -o $@ \
+	      programs/common/start.o programs/user_gui_taskmgr/user_gui_taskmgr.o
+
+programs/user_gui_edit/user_gui_edit.o: programs/user_gui_edit/main.c
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+programs/user_gui_edit/user_gui_edit.elf: \
+        programs/user_gui_edit/user_gui_edit.o \
+        programs/common/start.o \
+        programs/user_gui_edit/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_edit/program.ld -o $@ \
+	      programs/common/start.o programs/user_gui_edit/user_gui_edit.o
 
 # ---------- Build initramfs (USTAR tar) ----------
 #
@@ -1128,8 +1526,11 @@ $(INITRD_TAR): $(PROGRAMS) initrd/etc/motd initrd/readme.txt \
 	cp programs/user_gui_term/user_gui_term.elf       $(INITRD_STAGE)/bin/gui_term
 	cp programs/user_gui_files/user_gui_files.elf     $(INITRD_STAGE)/bin/gui_files
 	cp programs/user_gui_viewer/user_gui_viewer.elf   $(INITRD_STAGE)/bin/gui_viewer
+	cp programs/user_gui_browser/user_gui_browser.elf $(INITRD_STAGE)/bin/gui_browser
 	cp programs/user_login/user_login.elf             $(INITRD_STAGE)/bin/login
 	cp programs/user_gui_settings/user_gui_settings.elf $(INITRD_STAGE)/bin/gui_settings
+	cp programs/user_gui_taskmgr/user_gui_taskmgr.elf $(INITRD_STAGE)/bin/gui_taskmgr
+	cp programs/user_gui_edit/user_gui_edit.elf       $(INITRD_STAGE)/bin/gui_edit
 	cp programs/user_abi_test/user_abi_test.elf       $(INITRD_STAGE)/bin/abi_test
 	cp programs/c_hello/c_hello.elf                   $(INITRD_STAGE)/bin/c_hello
 	cp programs/c_args/c_args.elf                     $(INITRD_STAGE)/bin/c_args
@@ -1159,9 +1560,66 @@ $(INITRD_TAR): $(PROGRAMS) initrd/etc/motd initrd/readme.txt \
 	cp programs/hwcompat/hwcompat.elf                 $(INITRD_STAGE)/bin/hwcompat
 	cp programs/hwreport/hwreport.elf                 $(INITRD_STAGE)/bin/hwreport
 	cp programs/compattest/compattest.elf             $(INITRD_STAGE)/bin/compattest
+	cp programs/strace/strace.elf                     $(INITRD_STAGE)/bin/strace
+	cp programs/debugger/debugger.elf                 $(INITRD_STAGE)/bin/debugger
+	cp programs/pkgmgr/pkgmgr.elf                    $(INITRD_STAGE)/bin/pkgmgr
+	cp programs/browser/browser.elf                  $(INITRD_STAGE)/bin/browser
+	cp programs/settings/settings.elf                $(INITRD_STAGE)/bin/settings
 	cp programs/tobycc/tobycc.elf                     $(INITRD_STAGE)/bin/tobycc
 	cp programs/tobybuild/tobybuild.elf             $(INITRD_STAGE)/bin/tobybuild
 	cp programs/selfhosttest/selfhosttest.elf       $(INITRD_STAGE)/bin/selfhosttest
+	cp programs/user_sh/user_sh.elf                 $(INITRD_STAGE)/bin/sh
+	cp programs/user_pkg/user_pkg.elf               $(INITRD_STAGE)/bin/pkg
+	cp programs/user_svcctl/user_svcctl.elf         $(INITRD_STAGE)/bin/svcctl
+	cp programs/user_ps/user_ps.elf                 $(INITRD_STAGE)/bin/ps
+	cp programs/user_top/user_top.elf               $(INITRD_STAGE)/bin/top
+	cp programs/user_cp/user_cp.elf                 $(INITRD_STAGE)/bin/cp
+	cp programs/user_mv/user_mv.elf                 $(INITRD_STAGE)/bin/mv
+	cp programs/user_rm/user_rm.elf                 $(INITRD_STAGE)/bin/rm
+	cp programs/user_find/user_find.elf             $(INITRD_STAGE)/bin/find
+	cp programs/user_sort/user_sort.elf             $(INITRD_STAGE)/bin/sort
+	cp programs/user_tee/user_tee.elf               $(INITRD_STAGE)/bin/tee
+	cp programs/user_env/user_env.elf               $(INITRD_STAGE)/bin/env
+	cp programs/user_chmod/user_chmod.elf           $(INITRD_STAGE)/bin/chmod
+	cp programs/user_df/user_df.elf                 $(INITRD_STAGE)/bin/df
+	cp programs/user_mkdir/user_mkdir.elf           $(INITRD_STAGE)/bin/mkdir
+	cp programs/user_touch/user_touch.elf           $(INITRD_STAGE)/bin/touch
+	cp programs/user_tail/user_tail.elf             $(INITRD_STAGE)/bin/tail
+	cp programs/user_uniq/user_uniq.elf             $(INITRD_STAGE)/bin/uniq
+	cp programs/user_date/user_date.elf             $(INITRD_STAGE)/bin/date
+	cp programs/user_wget/user_wget.elf             $(INITRD_STAGE)/bin/wget
+	cp programs/user_nc/user_nc.elf                 $(INITRD_STAGE)/bin/nc
+	cp programs/user_ifconfig/user_ifconfig.elf     $(INITRD_STAGE)/bin/ifconfig
+	cp programs/user_nslookup/user_nslookup.elf     $(INITRD_STAGE)/bin/nslookup
+	cp programs/user_gui_calc/user_gui_calc.elf     $(INITRD_STAGE)/bin/gui_calc
+	cp programs/netui/netui.elf                     $(INITRD_STAGE)/bin/netui
+	cp programs/devmgr/devmgr.elf                   $(INITRD_STAGE)/bin/devmgr
+	cp programs/indexer/indexer.elf                 $(INITRD_STAGE)/bin/indexer
+	cp programs/updater/updater.elf                 $(INITRD_STAGE)/bin/updater
+	cp programs/bluescreen/bluescreen.elf           $(INITRD_STAGE)/bin/bluescreen
+	cp programs/login/login.elf                     $(INITRD_STAGE)/bin/login2
+	cp programs/lockscreen/lockscreen.elf           $(INITRD_STAGE)/bin/lockscreen
+	cp programs/files/files.elf                     $(INITRD_STAGE)/bin/files
+	cp programs/terminal/terminal.elf               $(INITRD_STAGE)/bin/terminal
+	cp programs/notepad/notepad.elf                 $(INITRD_STAGE)/bin/notepad
+	cp programs/calc/calc.elf                       $(INITRD_STAGE)/bin/calc
+	cp programs/imgview/imgview.elf                 $(INITRD_STAGE)/bin/imgview
+	cp programs/mediaplayer/mediaplayer.elf         $(INITRD_STAGE)/bin/mediaplayer
+	cp programs/taskmgr/taskmgr.elf                 $(INITRD_STAGE)/bin/taskmgr
+	cp programs/diskmgr/diskmgr.elf                 $(INITRD_STAGE)/bin/diskmgr
+	cp programs/eventview/eventview.elf             $(INITRD_STAGE)/bin/eventview
+	cp programs/sysinfo/sysinfo.elf                 $(INITRD_STAGE)/bin/sysinfo
+	cp programs/lua/lua.elf                         $(INITRD_STAGE)/bin/lua
+	cp programs/make/make.elf                       $(INITRD_STAGE)/bin/make
+	cp programs/less/less.elf                       $(INITRD_STAGE)/bin/less
+	cp programs/curl/curl.elf                       $(INITRD_STAGE)/bin/curl
+	cp programs/tcc/tcc.elf                         $(INITRD_STAGE)/bin/tcc
+	cp programs/as/as.elf                           $(INITRD_STAGE)/bin/as
+	cp programs/ld/ld.elf                           $(INITRD_STAGE)/bin/ld
+	cp programs/wifipicker/wifipicker.elf           $(INITRD_STAGE)/bin/wifipicker
+	cp programs/netsettings/netsettings.elf         $(INITRD_STAGE)/bin/netsettings
+	cp programs/volctrl/volctrl.elf                 $(INITRD_STAGE)/bin/volctrl
+	cp programs/appinstall/appinstall.elf           $(INITRD_STAGE)/bin/appinstall
 	cp initrd/m36/m36_part2.c                         $(INITRD_STAGE)/m36/m36_part2.c
 	cp initrd/m36/m36_sample.c                        $(INITRD_STAGE)/m36/m36_sample.c
 	cp initrd/m36/Tobyfile                            $(INITRD_STAGE)/m36/Tobyfile
@@ -2833,6 +3291,8 @@ clean:
 	       programs/user_login/user_login.o programs/user_login/user_login.elf \
 	       programs/user_gui_settings/user_gui_settings.o programs/user_gui_settings/user_gui_settings.elf \
 	       programs/user_gui_helloapp/user_gui_helloapp.o programs/user_gui_helloapp/user_gui_helloapp.elf \
+	       programs/user_gui_taskmgr/user_gui_taskmgr.o programs/user_gui_taskmgr/user_gui_taskmgr.elf \
+	       programs/user_gui_edit/user_gui_edit.o programs/user_gui_edit/user_gui_edit.elf \
 	       programs/user_abi_test/user_abi_test.o programs/user_abi_test/user_abi_test.elf \
 	       programs/c_hello/c_hello.o programs/c_hello/c_hello.elf \
 	       programs/c_args/c_args.o programs/c_args/c_args.elf \
@@ -2862,9 +3322,36 @@ clean:
 	       programs/hwcompat/hwcompat.o programs/hwcompat/hwcompat.elf \
 	       programs/hwreport/hwreport.o programs/hwreport/hwreport.elf \
 	       programs/compattest/compattest.o programs/compattest/compattest.elf \
+	       programs/strace/strace.o programs/strace/strace.elf \
+	       programs/debugger/debugger.o programs/debugger/debugger.elf \
+	       programs/pkgmgr/pkgmgr.o programs/pkgmgr/pkgmgr.elf \
 	       programs/tobycc/tobycc.o programs/tobycc/m36_elf.o programs/tobycc/tobycc.elf \
 	       programs/tobybuild/tobybuild.o programs/tobybuild/tobybuild.elf \
 	       programs/selfhosttest/selfhosttest.o programs/selfhosttest/selfhosttest.elf \
+	       programs/user_sh/user_sh.o programs/user_sh/user_sh.elf \
+	       programs/user_pkg/user_pkg.o programs/user_pkg/user_pkg.elf \
+	       programs/user_svcctl/user_svcctl.o programs/user_svcctl/user_svcctl.elf \
+	       programs/user_ps/user_ps.o programs/user_ps/user_ps.elf \
+	       programs/user_top/user_top.o programs/user_top/user_top.elf \
+	       programs/user_cp/user_cp.o programs/user_cp/user_cp.elf \
+	       programs/user_mv/user_mv.o programs/user_mv/user_mv.elf \
+	       programs/user_rm/user_rm.o programs/user_rm/user_rm.elf \
+	       programs/user_find/user_find.o programs/user_find/user_find.elf \
+	       programs/user_sort/user_sort.o programs/user_sort/user_sort.elf \
+	       programs/user_tee/user_tee.o programs/user_tee/user_tee.elf \
+	       programs/user_env/user_env.o programs/user_env/user_env.elf \
+	       programs/user_chmod/user_chmod.o programs/user_chmod/user_chmod.elf \
+	       programs/user_df/user_df.o programs/user_df/user_df.elf \
+	       programs/user_mkdir/user_mkdir.o programs/user_mkdir/user_mkdir.elf \
+	       programs/user_touch/user_touch.o programs/user_touch/user_touch.elf \
+	       programs/user_tail/user_tail.o programs/user_tail/user_tail.elf \
+	       programs/user_uniq/user_uniq.o programs/user_uniq/user_uniq.elf \
+	       programs/user_date/user_date.o programs/user_date/user_date.elf \
+	       programs/user_wget/user_wget.o programs/user_wget/user_wget.elf \
+	       programs/user_nc/user_nc.o programs/user_nc/user_nc.elf \
+	       programs/user_ifconfig/user_ifconfig.o programs/user_ifconfig/user_ifconfig.elf \
+	       programs/user_nslookup/user_nslookup.o programs/user_nslookup/user_nslookup.elf \
+	       programs/user_gui_calc/user_gui_calc.o programs/user_gui_calc/user_gui_calc.elf \
 	       $(PORTS_SBASE_OBJS) $(PORTS_SBASE_ELFS) $(PORTS_SBASE_UTIL_O) \
 	       libtoby/libtoby.a libtoby/crt0.o $(LIBTOBY_OBJS) \
 	       libtoby/libtoby.so libtoby/Scrt0.o $(LDTOBY_OBJS) $(LDTOBY_SO) \

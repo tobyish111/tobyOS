@@ -584,6 +584,312 @@ static int case_dirty(char *msg, size_t cap) {
     return 0;
 }
 
+/* ---- VirGL 3D rendering case ------------------------------------ */
+
+#include <toby/gl.h>
+
+static const char *g_vs_tgsi =
+    "VERT\n"
+    "DCL IN[0]\n"
+    "DCL IN[1]\n"
+    "DCL OUT[0], POSITION\n"
+    "DCL OUT[1], COLOR\n"
+    "  0: MOV OUT[0], IN[0]\n"
+    "  1: MOV OUT[1], IN[1]\n"
+    "  2: END\n";
+
+static const char *g_fs_tgsi =
+    "FRAG\n"
+    "DCL IN[0], COLOR, LINEAR\n"
+    "DCL OUT[0], COLOR\n"
+    "  0: MOV OUT[0], IN[0]\n"
+    "  1: END\n";
+
+static int case_virgl(char *msg, size_t cap) {
+    int fd = sys_gui_create(320, 240, "rt-virgl");
+    if (fd < 0) {
+        snprintf(msg, cap, "gui_create failed (%d)", fd);
+        return -1;
+    }
+
+    toby_gl_ctx *gl = toby_gl_init(fd);
+    if (!gl) {
+        snprintf(msg, cap, "VirGL not available (ctx create failed)");
+        sys_close(fd);
+        return ABI_DEVT_SKIP;
+    }
+
+    toby_gl_viewport(gl, 0, 0, 320, 240);
+    toby_gl_clear(gl, 0.1f, 0.0f, 0.2f, 1.0f);
+
+    int vs = toby_gl_create_shader(gl, VIRGL_SHADER_VERTEX, g_vs_tgsi);
+    int fs = toby_gl_create_shader(gl, VIRGL_SHADER_FRAGMENT, g_fs_tgsi);
+
+    if (vs < 0 || fs < 0) {
+        snprintf(msg, cap, "shader creation failed vs=%d fs=%d", vs, fs);
+        toby_gl_destroy(gl);
+        sys_close(fd);
+        return -1;
+    }
+
+    toby_gl_bind_shader(gl, vs, VIRGL_SHADER_VERTEX);
+    toby_gl_bind_shader(gl, fs, VIRGL_SHADER_FRAGMENT);
+
+    int blend = toby_gl_create_blend(gl, 0, 0, 0);
+    if (blend >= 0) toby_gl_bind_blend(gl, blend);
+
+    int rast = toby_gl_create_rasterizer(gl, TOBY_GL_FILL_SOLID,
+                                         TOBY_GL_CULL_NONE);
+    if (rast >= 0) toby_gl_bind_rasterizer(gl, rast);
+
+    int dsa = toby_gl_create_dsa(gl, 0, 0);
+    if (dsa >= 0) toby_gl_bind_dsa(gl, dsa);
+
+    /* Triangle: position (x,y,z,w) + color (r,g,b,a) per vertex */
+    static const float tri_verts[] = {
+         0.0f,  0.5f, 0.0f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f,
+        -0.5f, -0.5f, 0.0f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f,
+         0.5f, -0.5f, 0.0f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f,
+    };
+
+    int vbo = toby_gl_create_vertex_buffer(gl, tri_verts, sizeof(tri_verts));
+    if (vbo < 0) {
+        snprintf(msg, cap, "VBO creation failed");
+        toby_gl_destroy(gl);
+        sys_close(fd);
+        return -1;
+    }
+
+    toby_gl_set_vertex_buffer(gl, vbo, 8 * sizeof(float), 0);
+
+    struct toby_gl_vertex_element elems[2];
+    elems[0].src_offset = 0;
+    elems[0].src_format = TOBY_GL_FORMAT_R32G32B32A32_FLOAT;
+    elems[0].vertex_buffer_index = 0;
+    elems[1].src_offset = 4 * sizeof(float);
+    elems[1].src_format = TOBY_GL_FORMAT_R32G32B32A32_FLOAT;
+    elems[1].vertex_buffer_index = 0;
+
+    int ve = toby_gl_create_vertex_elements(gl, 2, elems);
+    if (ve >= 0) toby_gl_bind_vertex_elements(gl, ve);
+
+    toby_gl_draw_arrays(gl, TOBY_GL_TRIANGLES, 0, 3);
+    toby_gl_swap_buffers(gl);
+
+    toby_gl_destroy(gl);
+    sys_close(fd);
+
+    snprintf(msg, cap, "VirGL triangle submitted (vs=%d fs=%d vbo=%d)", vs, fs, vbo);
+    return 0;
+}
+
+/* ---- VirGL indexed drawing test -------------------------------- */
+
+static int case_virgl_indexed(char *msg, size_t cap) {
+    int fd = sys_gui_create(320, 240, "rt-idx");
+    if (fd < 0) {
+        snprintf(msg, cap, "gui_create failed (%d)", fd);
+        return -1;
+    }
+
+    toby_gl_ctx *gl = toby_gl_init(fd);
+    if (!gl) {
+        snprintf(msg, cap, "VirGL not available");
+        sys_close(fd);
+        return ABI_DEVT_SKIP;
+    }
+
+    toby_gl_viewport(gl, 0, 0, 320, 240);
+    toby_gl_clear(gl, 0.0f, 0.1f, 0.15f, 1.0f);
+
+    int vs = toby_gl_create_shader(gl, VIRGL_SHADER_VERTEX, g_vs_tgsi);
+    int fs = toby_gl_create_shader(gl, VIRGL_SHADER_FRAGMENT, g_fs_tgsi);
+    if (vs < 0 || fs < 0) {
+        snprintf(msg, cap, "shader fail");
+        toby_gl_destroy(gl);
+        sys_close(fd);
+        return -1;
+    }
+    toby_gl_bind_shader(gl, vs, VIRGL_SHADER_VERTEX);
+    toby_gl_bind_shader(gl, fs, VIRGL_SHADER_FRAGMENT);
+
+    /* Quad as 4 vertices + 6 indices */
+    static const float quad_verts[] = {
+        -0.5f,  0.5f, 0.0f, 1.0f,   1.0f, 1.0f, 0.0f, 1.0f,
+         0.5f,  0.5f, 0.0f, 1.0f,   0.0f, 1.0f, 1.0f, 1.0f,
+         0.5f, -0.5f, 0.0f, 1.0f,   1.0f, 0.0f, 1.0f, 1.0f,
+        -0.5f, -0.5f, 0.0f, 1.0f,   0.5f, 0.5f, 1.0f, 1.0f,
+    };
+    static const uint16_t quad_indices[] = { 0, 1, 2, 0, 2, 3 };
+
+    int vbo = toby_gl_create_vertex_buffer(gl, quad_verts, sizeof(quad_verts));
+    int ibo = toby_gl_create_index_buffer(gl, quad_indices,
+                                          sizeof(quad_indices), 2);
+    if (vbo < 0 || ibo < 0) {
+        snprintf(msg, cap, "buffer creation failed vbo=%d ibo=%d", vbo, ibo);
+        toby_gl_destroy(gl);
+        sys_close(fd);
+        return -1;
+    }
+
+    toby_gl_set_vertex_buffer(gl, vbo, 8 * sizeof(float), 0);
+    toby_gl_set_index_buffer(gl, ibo, 2, 0);
+
+    struct toby_gl_vertex_element elems[2];
+    elems[0].src_offset = 0;
+    elems[0].src_format = TOBY_GL_FORMAT_R32G32B32A32_FLOAT;
+    elems[0].vertex_buffer_index = 0;
+    elems[1].src_offset = 4 * sizeof(float);
+    elems[1].src_format = TOBY_GL_FORMAT_R32G32B32A32_FLOAT;
+    elems[1].vertex_buffer_index = 0;
+
+    int ve = toby_gl_create_vertex_elements(gl, 2, elems);
+    if (ve >= 0) toby_gl_bind_vertex_elements(gl, ve);
+
+    toby_gl_draw_elements(gl, TOBY_GL_TRIANGLES, 6, ibo, 2);
+    toby_gl_swap_buffers(gl);
+
+    toby_gl_destroy(gl);
+    sys_close(fd);
+
+    snprintf(msg, cap, "indexed quad drawn (ibo=%d)", ibo);
+    return 0;
+}
+
+/* ---- VirGL uniform buffer test --------------------------------- */
+
+static int case_virgl_uniform(char *msg, size_t cap) {
+    int fd = sys_gui_create(320, 240, "rt-ubo");
+    if (fd < 0) {
+        snprintf(msg, cap, "gui_create failed (%d)", fd);
+        return -1;
+    }
+
+    toby_gl_ctx *gl = toby_gl_init(fd);
+    if (!gl) {
+        snprintf(msg, cap, "VirGL not available");
+        sys_close(fd);
+        return ABI_DEVT_SKIP;
+    }
+
+    /* Upload a 4x4 identity matrix as a uniform */
+    static const float identity_mat[16] = {
+        1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
+    };
+
+    toby_gl_set_constant_buffer_inline(gl, VIRGL_SHADER_VERTEX, 0,
+                                       identity_mat, sizeof(identity_mat));
+
+    toby_gl_flush(gl);
+    toby_gl_destroy(gl);
+    sys_close(fd);
+
+    snprintf(msg, cap, "inline UBO (64 bytes) submitted");
+    return 0;
+}
+
+/* ---- VirGL texture test ---------------------------------------- */
+
+static int case_virgl_texture(char *msg, size_t cap) {
+    int fd = sys_gui_create(320, 240, "rt-tex");
+    if (fd < 0) {
+        snprintf(msg, cap, "gui_create failed (%d)", fd);
+        return -1;
+    }
+
+    toby_gl_ctx *gl = toby_gl_init(fd);
+    if (!gl) {
+        snprintf(msg, cap, "VirGL not available");
+        sys_close(fd);
+        return ABI_DEVT_SKIP;
+    }
+
+    /* Create a tiny 4x4 checkerboard texture */
+    uint32_t texdata[16];
+    for (int i = 0; i < 16; i++)
+        texdata[i] = ((i / 4 + i % 4) & 1) ? 0xFFFFFFFF : 0xFF000000;
+
+    int tex = toby_gl_create_texture_2d(gl, 4, 4, TOBY_GL_FORMAT_R8G8B8A8_UNORM);
+    if (tex < 0) {
+        snprintf(msg, cap, "texture create failed");
+        toby_gl_destroy(gl);
+        sys_close(fd);
+        return -1;
+    }
+
+    toby_gl_upload_texture(gl, tex, 4, 4, TOBY_GL_FORMAT_R8G8B8A8_UNORM,
+                           texdata, sizeof(texdata));
+
+    int sampler = toby_gl_create_sampler(gl,
+        TOBY_GL_FILTER_NEAREST, TOBY_GL_FILTER_NEAREST,
+        TOBY_GL_MIPFILTER_NONE,
+        TOBY_GL_WRAP_CLAMP_TO_EDGE, TOBY_GL_WRAP_CLAMP_TO_EDGE);
+
+    int view = toby_gl_create_sampler_view(gl, tex,
+        TOBY_GL_FORMAT_R8G8B8A8_UNORM, TOBY_GL_TARGET_TEXTURE_2D);
+
+    if (sampler >= 0)
+        toby_gl_bind_sampler(gl, VIRGL_SHADER_FRAGMENT, 0, sampler);
+    if (view >= 0)
+        toby_gl_set_sampler_view(gl, VIRGL_SHADER_FRAGMENT, 0, view);
+
+    toby_gl_flush(gl);
+    toby_gl_destroy(gl);
+    sys_close(fd);
+
+    snprintf(msg, cap, "texture created & bound (tex=%d sampler=%d view=%d)",
+             tex, sampler, view);
+    return 0;
+}
+
+/* ---- VirGL framebuffer (render-to-texture) test ---------------- */
+
+static int case_virgl_fbo(char *msg, size_t cap) {
+    int fd = sys_gui_create(320, 240, "rt-fbo");
+    if (fd < 0) {
+        snprintf(msg, cap, "gui_create failed (%d)", fd);
+        return -1;
+    }
+
+    toby_gl_ctx *gl = toby_gl_init(fd);
+    if (!gl) {
+        snprintf(msg, cap, "VirGL not available");
+        sys_close(fd);
+        return ABI_DEVT_SKIP;
+    }
+
+    /* Create a render target texture and attach as FBO */
+    int rt_tex = toby_gl_create_texture_2d(gl, 128, 128,
+                                            TOBY_GL_FORMAT_R8G8B8A8_UNORM);
+    if (rt_tex < 0) {
+        snprintf(msg, cap, "RT texture create failed");
+        toby_gl_destroy(gl);
+        sys_close(fd);
+        return -1;
+    }
+
+    int surf = toby_gl_create_surface(gl, rt_tex,
+                                       TOBY_GL_FORMAT_R8G8B8A8_UNORM, 0);
+    if (surf < 0) {
+        snprintf(msg, cap, "surface create failed");
+        toby_gl_destroy(gl);
+        sys_close(fd);
+        return -1;
+    }
+
+    int surfaces[1] = { surf };
+    toby_gl_set_framebuffer(gl, -1, 1, surfaces, 128, 128);
+    toby_gl_viewport(gl, 0, 0, 128, 128);
+    toby_gl_clear(gl, 0.2f, 0.8f, 0.3f, 1.0f);
+
+    toby_gl_flush(gl);
+    toby_gl_destroy(gl);
+    sys_close(fd);
+
+    snprintf(msg, cap, "FBO render pass (rt=%d surf=%d)", rt_tex, surf);
+    return 0;
+}
+
 /* ---- driver ---------------------------------------------------- */
 
 static const struct rcase g_cases[] = {
@@ -596,6 +902,11 @@ static const struct rcase g_cases[] = {
     { "alpha",      case_alpha      },
     { "font",       case_font       },
     { "dirty",      case_dirty      },
+    { "virgl",      case_virgl      },
+    { "virgl_idx",  case_virgl_indexed },
+    { "virgl_ubo",  case_virgl_uniform },
+    { "virgl_tex",  case_virgl_texture },
+    { "virgl_fbo",  case_virgl_fbo },
 };
 #define N_CASES ((int)(sizeof(g_cases) / sizeof(g_cases[0])))
 

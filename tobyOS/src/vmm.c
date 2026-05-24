@@ -716,3 +716,7 @@ void vmm_init_and_test(struct limine_memmap_response *memmap) {
     kprintf("[vmm] test: unmap clears translation, scratch page freed\n");
     kprintf("[vmm] test: ok\n");
 }
+
+uint64_t vmm_hhdm_offset(void) {
+    return g_hhdm;
+}

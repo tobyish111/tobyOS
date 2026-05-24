@@ -47,6 +47,7 @@ struct user {
     char name[USER_NAME_MAX];
     int  uid;
     int  gid;
+    char password_hash[65];  /* djb2 hex digest (16 chars), or empty for no password */
 };
 
 /* Boot-time entry. Must be called AFTER /data is mounted (otherwise we
@@ -72,6 +73,13 @@ int  users_save(void);
 
 /* Diagnostics. */
 void users_dump(void);
+
+/* Check a password against the stored hash for username.
+ * Returns true if the password matches (or no hash is set). */
+bool users_check_password(const char *username, const char *password);
+
+/* Set (or clear) the password for username. Returns 0 on success. */
+int users_set_password(const char *username, const char *password);
 
 /* Iterate the cache. cb is called once per registered user; return
  * value of cb is ignored. Used by the shell `users` command. */

@@ -11,6 +11,8 @@
 #include <tobyos/panic.h>
 #include <tobyos/cpu.h>
 #include <tobyos/proc.h>
+#include <tobyos/vmm.h>
+#include <tobyos/page_fault.h>
 
 static const char *exc_name(uint64_t v) {
     static const char *names[32] = {
@@ -73,6 +75,18 @@ static void dump_regs(struct regs *r) {
 
 static void default_exception(struct regs *r) {
     bool from_user = (r->cs & 3) == 3;
+
+    /* Phase 1 M1.2: demand paging for page faults (vector 14).
+     * Try to handle the fault via the VMA/mmap system before killing. */
+    if (r->vector == 14 && from_user) {
+        uint64_t fault_addr = read_cr2();
+        if (page_fault_handler(fault_addr, r->error_code, current_proc())) {
+            return; /* fault resolved via COW / demand-zero / swap-in */
+        }
+        if (mmap_handle_page_fault(fault_addr, r->error_code)) {
+            return; /* fault resolved via mmap demand paging */
+        }
+    }
 
     kprintf("\n*** EXCEPTION %lu: %s%s ***\n",
             r->vector, exc_name(r->vector),

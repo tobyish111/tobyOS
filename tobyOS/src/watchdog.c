@@ -176,12 +176,11 @@ void wdog_check(void) {
     g_last_check_ms = now;
 
     /* Sched-stall test: the scheduler should be making progress at
-     * least once per timeout window. If the BSP is idle, sched_yield
-     * is still called from the PIT signal-deliver path (which kicks
-     * us via the syscall path on next entry) and from the cooperative
-     * yield in idle_loop -- so under healthy load this counter advances
-     * many times per second. */
-    if (g_sched_hb == 0 || (now - g_last_sched_kick_ms) > g_timeout_ms) {
+     * least once per timeout window. Skip the check entirely until
+     * the scheduler has actually started (g_sched_hb > 0) — during
+     * early boot, the LAPIC timer and scheduler aren't running yet
+     * and that's expected, not a stall. */
+    if (g_sched_hb > 0 && (now - g_last_sched_kick_ms) > g_timeout_ms) {
         wdog_record_event(ABI_WDOG_KIND_SCHED_STALL, -1,
                           "scheduler heartbeat stalled");
     }

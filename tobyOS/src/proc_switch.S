@@ -117,4 +117,47 @@ proc_enter_user_asm:
 
     iretq                       /* drop to CPL 3 */
 
+/* ============================================================== */
+/* proc_enter_user_thread_asm -- iretq into ring 3 with arg in RDI */
+/* ============================================================== */
+.global proc_enter_user_thread_asm
+.type   proc_enter_user_thread_asm, @function
+/* void proc_enter_user_thread_asm(
+ *     uint64_t user_rip,   // rdi
+ *     uint64_t user_rsp,   // rsi
+ *     uint64_t arg);       // rdx -> becomes RDI in ring 3
+ */
+proc_enter_user_thread_asm:
+    /* Save the thread arg before we clobber registers */
+    mov rcx, rdx
+
+    /* Build IRETQ frame */
+    mov rax, 0x1B               /* USER_DS | RPL 3 */
+    push rax                    /* SS */
+    push rsi                    /* RSP */
+    mov rax, 0x202
+    push rax                    /* RFLAGS */
+    mov rax, 0x23               /* USER_CS | RPL 3 */
+    push rax                    /* CS */
+    push rdi                    /* RIP */
+
+    /* Set data segments */
+    mov ax, 0x1B
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    /* Set RDI = arg for the thread function */
+    mov rdi, rcx
+    xor rsi, rsi
+    xor rdx, rdx
+    xor rcx, rcx
+    xor r8, r8
+    xor r9, r9
+    xor r10, r10
+    xor r11, r11
+
+    iretq
+
 .section .note.GNU-stack, "", @progbits

@@ -42,7 +42,12 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/wait.h>
 #include "libtoby_internal.h"
+
+/* Forward decl -- defined in process.c */
+pid_t toby_spawn(const char *path, char *const argv[], char *const envp[],
+                 int fd0, int fd1, int fd2);
 
 /* ============================================================
  *  Raw write helper (used by abort path, printf, etc.)
@@ -565,4 +570,215 @@ void perror(const char *prefix) {
     }
     fputs(strerror(errno), stderr);
     fputc('\n', stderr);
+}
+
+/* ============================================================
+ *  ungetc
+ * ============================================================ */
+
+int ungetc(int c, FILE *f) {
+    if (!f || c == EOF) return EOF;
+    f->pushback = c;
+    f->eof = 0;
+    return c;
+}
+
+/* ============================================================
+ *  setvbuf / setbuf -- buffering control (no-op today)
+ * ============================================================ */
+
+int setvbuf(FILE *f, char *buf, int mode, size_t size) {
+    (void)f; (void)buf; (void)mode; (void)size;
+    return 0;
+}
+
+void setbuf(FILE *f, char *buf) {
+    (void)f; (void)buf;
+}
+
+/* ============================================================
+ *  tmpfile -- open anonymous temporary file
+ * ============================================================ */
+
+FILE *tmpfile(void) {
+    static int counter = 0;
+    char name[64];
+    snprintf(name, sizeof(name), "/tmp/_tmpfile_%d_%d", (int)toby_sc0(ABI_SYS_GETPID), counter++);
+    FILE *f = fopen(name, "w+");
+    if (f) unlink(name);
+    return f;
+}
+
+/* ============================================================
+ *  popen / pclose -- pipe to/from a command
+ * ============================================================ */
+
+struct popen_entry {
+    FILE *fp;
+    pid_t pid;
+};
+
+#define POPEN_MAX 8
+static struct popen_entry g_popens[POPEN_MAX];
+
+FILE *popen(const char *command, const char *type) {
+    if (!command || !type) { errno = EINVAL; return 0; }
+    int reading = (type[0] == 'r');
+
+    int fds[2];
+    if (pipe(fds) < 0) return 0;
+
+    char *argv[4];
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = (char *)command;
+    argv[3] = 0;
+
+    pid_t pid;
+    if (reading) {
+        pid = toby_spawn("/bin/sh", argv, environ, 0, fds[1], 2);
+    } else {
+        pid = toby_spawn("/bin/sh", argv, environ, fds[0], 1, 2);
+    }
+
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return 0;
+    }
+
+    int our_fd, their_fd;
+    if (reading) { our_fd = fds[0]; their_fd = fds[1]; }
+    else         { our_fd = fds[1]; their_fd = fds[0]; }
+    close(their_fd);
+
+    FILE *fp = (FILE *)malloc(sizeof(*fp));
+    if (!fp) { close(our_fd); return 0; }
+    fp->fd = our_fd;
+    fp->pushback = -1;
+    fp->eof = 0;
+    fp->err = 0;
+    fp->is_static = 0;
+
+    for (int i = 0; i < POPEN_MAX; i++) {
+        if (!g_popens[i].fp) {
+            g_popens[i].fp = fp;
+            g_popens[i].pid = pid;
+            break;
+        }
+    }
+    return fp;
+}
+
+int pclose(FILE *fp) {
+    if (!fp) return -1;
+    pid_t pid = -1;
+    for (int i = 0; i < POPEN_MAX; i++) {
+        if (g_popens[i].fp == fp) {
+            pid = g_popens[i].pid;
+            g_popens[i].fp = 0;
+            break;
+        }
+    }
+    fclose(fp);
+    if (pid < 0) { errno = ECHILD; return -1; }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return status;
+}
+
+/* ============================================================
+ *  sscanf -- minimal scanf for common patterns
+ * ============================================================ */
+
+int sscanf(const char *str, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int count = 0;
+    const char *s = str;
+
+    while (*fmt && *s) {
+        if (*fmt == ' ') {
+            while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+            fmt++;
+            continue;
+        }
+        if (*fmt != '%') {
+            if (*s != *fmt) break;
+            s++; fmt++;
+            continue;
+        }
+        fmt++; /* skip % */
+        if (*fmt == '%') { if (*s != '%') break; s++; fmt++; continue; }
+
+        int width = 0;
+        while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+
+        int lng = 0;
+        if (*fmt == 'l') { lng = 1; fmt++; }
+
+        switch (*fmt) {
+        case 'd': case 'i': {
+            char *end;
+            long v = strtol(s, &end, 10);
+            if (end == s) goto done;
+            if (lng) { long *p = va_arg(ap, long *); *p = v; }
+            else     { int  *p = va_arg(ap, int *);  *p = (int)v; }
+            s = end;
+            count++;
+            break;
+        }
+        case 'u': {
+            char *end;
+            unsigned long v = strtoul(s, &end, 10);
+            if (end == s) goto done;
+            if (lng) { unsigned long *p = va_arg(ap, unsigned long *); *p = v; }
+            else     { unsigned int  *p = va_arg(ap, unsigned int *);  *p = (unsigned int)v; }
+            s = end;
+            count++;
+            break;
+        }
+        case 'x': case 'X': {
+            char *end;
+            unsigned long v = strtoul(s, &end, 16);
+            if (end == s) goto done;
+            if (lng) { unsigned long *p = va_arg(ap, unsigned long *); *p = v; }
+            else     { unsigned int  *p = va_arg(ap, unsigned int *);  *p = (unsigned int)v; }
+            s = end;
+            count++;
+            break;
+        }
+        case 's': {
+            char *p = va_arg(ap, char *);
+            while (*s == ' ' || *s == '\t') s++;
+            int w = 0;
+            while (*s && *s != ' ' && *s != '\t' && *s != '\n') {
+                if (width > 0 && w >= width) break;
+                *p++ = *s++;
+                w++;
+            }
+            *p = '\0';
+            count++;
+            break;
+        }
+        case 'c': {
+            char *p = va_arg(ap, char *);
+            *p = *s++;
+            count++;
+            break;
+        }
+        case 'n': {
+            int *p = va_arg(ap, int *);
+            *p = (int)(s - str);
+            break;
+        }
+        default:
+            goto done;
+        }
+        fmt++;
+    }
+done:
+    va_end(ap);
+    return count;
 }

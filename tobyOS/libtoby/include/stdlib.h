@@ -47,6 +47,26 @@ int    system  (const char *cmd);
 int    rand  (void);
 void   srand (unsigned seed);
 
+/* Standard qsort and bsearch. */
+void   qsort (void *base, size_t nmemb, size_t size,
+              int (*compar)(const void *, const void *));
+void  *bsearch(const void *key, const void *base, size_t nmemb,
+               size_t size, int (*compar)(const void *, const void *));
+
+/* String to floating-point. */
+double strtod(const char *s, char **endp);
+double atof  (const char *s);
+
+/* Temporary files. */
+int    mkstemp(char *tmpl);
+
+/* Path resolution. If resolved is NULL, malloc's the result. */
+char  *realpath(const char *path, char *resolved);
+
+/* Absolute value. */
+int    abs (int n);
+long   labs(long n);
+
 #ifdef __cplusplus
 }
 #endif

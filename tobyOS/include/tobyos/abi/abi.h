@@ -508,8 +508,133 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
  * tables); safe to call from any userland process. */
 #define ABI_SYS_HWCOMPAT_LIST  73
 
+/* M38: window management syscalls. */
+#define ABI_SYS_GUI_SET_STATE   75  /* (int fd, int state) -> 0 or -ABI_E* */
+#define ABI_SYS_GUI_SET_TITLE   76  /* (int fd, const char *title) -> 0 or -ABI_E* */
+
+/* Clipboard. */
+#define ABI_SYS_CLIP_COPY      77   /* (const char *data, uint32_t len) */
+#define ABI_SYS_CLIP_PASTE     78   /* (char *buf, uint32_t max) -> bytes copied */
+
+/* Network: kernel HTTP GET exposed to userspace. */
+#define ABI_SYS_HTTP_GET       79   /* (const char *url, void *buf, uint32_t buf_sz) -> bytes or <0 */
+
+/* ---- Advanced GUI drawing (Phase 1) ------------------------------ */
+#define ABI_SYS_GUI_LINE              80
+#define ABI_SYS_GUI_RECT              81
+#define ABI_SYS_GUI_ROUNDED_RECT      82
+#define ABI_SYS_GUI_ROUNDED_RECT_BLEND 83
+#define ABI_SYS_GUI_CIRCLE            84
+#define ABI_SYS_GUI_CIRCLE_OUTLINE    85
+#define ABI_SYS_GUI_BLIT              86
+#define ABI_SYS_GUI_BLIT_BLEND        87
+#define ABI_SYS_GUI_GETPIXELS         88
+#define ABI_SYS_GUI_GRADIENT          89
+#define ABI_SYS_GUI_LINE_BLEND        90
+
+/* ---- Advanced compositor (Phase 2) ------------------------------- */
+#define ABI_SYS_GUI_SET_OPACITY       91
+#define ABI_SYS_GUI_WAIT_VSYNC        92
+#define ABI_SYS_GUI_BATCH_FILL        93  /* (int fd, const struct abi_batch_fill *cmds, int count) */
+
+/* ---- 3D Graphics / VirGL (Phase 3) ------------------------------- */
+#define ABI_SYS_GL_CREATE_CTX         100
+#define ABI_SYS_GL_DESTROY_CTX        101
+#define ABI_SYS_GL_CREATE_BUFFER      102
+#define ABI_SYS_GL_SUBMIT             103
+#define ABI_SYS_GL_SWAP_BUFFERS       104
+
+/* ---- Phase 1 M1.1: Threading syscalls ---- */
+#define ABI_SYS_THREAD_CREATE         107
+#define ABI_SYS_THREAD_EXIT           108
+#define ABI_SYS_THREAD_JOIN           109
+#define ABI_SYS_FUTEX                 110
+#define ABI_SYS_SET_TLS               111
+#define ABI_SYS_THREAD_DETACH         112
+#define ABI_SYS_GETTID                113
+
+/* ---- Phase 1 M1.2: Advanced VMM syscalls ---- */
+#define ABI_SYS_MMAP                  114
+#define ABI_SYS_MUNMAP                115
+#define ABI_SYS_MPROTECT              116
+
+/* ---- Phase 1 M1.3: Signal syscalls ---- */
+#define ABI_SYS_SIGACTION             117
+#define ABI_SYS_SIGPROCMASK           118
+#define ABI_SYS_SIGRETURN             119
+#define ABI_SYS_KILL                  120
+
+/* ---- Phase 1 M1.4: IPC syscalls ---- */
+#define ABI_SYS_SHM_OPEN             121
+#define ABI_SYS_SHM_MAP              122
+#define ABI_SYS_SHM_UNLINK           123
+#define ABI_SYS_UNIX_SOCKET          124
+#define ABI_SYS_UNIX_BIND            125
+#define ABI_SYS_UNIX_LISTEN          126
+#define ABI_SYS_UNIX_CONNECT         127
+#define ABI_SYS_UNIX_ACCEPT          128
+#define ABI_SYS_UNIX_SEND            129
+#define ABI_SYS_UNIX_RECV            130
+#define ABI_SYS_UNIX_CLOSE           131
+
+/* ---- Phase 1 M1.5: Enhanced VFS syscalls ---- */
+#define ABI_SYS_SYMLINK              132
+#define ABI_SYS_READLINK             133
+#define ABI_SYS_INOTIFY_INIT        134
+#define ABI_SYS_INOTIFY_ADD_WATCH   135
+#define ABI_SYS_INOTIFY_RM_WATCH    136
+
+/* ---- Phase 2 M2.4: Fluent Design Theme Engine ---- */
+#define ABI_SYS_THEME_SET            137  /* (uint32_t theme_id) -> 0 or -ABI_E* */
+
+/* ---- Phase 2 M2.7: Clipboard System ---- */
+#define ABI_SYS_CLIP_SET             138  /* (const char *data, uint32_t len, uint32_t format) */
+#define ABI_SYS_CLIP_GET             139  /* (char *buf, uint32_t buf_sz, uint32_t format) -> bytes */
+#define ABI_SYS_CLIP_CLEAR           140  /* () -> 0 */
+
+/* ---- Phase 3 M3.2: POSIX fork/exec/waitpid ---- */
+#define ABI_SYS_FORK                 141  /* () -> pid to parent, 0 to child */
+#define ABI_SYS_EXECVE               142  /* (path, argv, envp) -> no return on success */
+
+/* ---- Audio Engine syscalls ---- */
+#define ABI_SYS_AUDIO_OPEN           143  /* (sample_rate, channels, format) -> stream_id */
+#define ABI_SYS_AUDIO_WRITE          144  /* (stream_id, samples, count) -> bytes written */
+#define ABI_SYS_AUDIO_CLOSE          145  /* (stream_id) -> 0 or -ABI_E* */
+#define ABI_SYS_AUDIO_VOLUME         146  /* (stream_id, volume_0_100) -> 0 or -ABI_E* */
+
+/* ---- Video Framework syscalls ---- */
+#define ABI_SYS_VIDEO_OPEN           147  /* (path) -> session_id or -ABI_E* */
+#define ABI_SYS_VIDEO_READ_FRAME     148  /* (session_id, buf, buf_sz) -> bytes or -ABI_E* */
+
+/* ---- Developer tools: ptrace ---- */
+#define ABI_SYS_PTRACE               149  /* (request, pid, addr, data) -> varies */
+
+/* ---- Userland TCP/TLS networking (Phase A) ---- */
+#define ABI_SYS_TCP_CONNECT          150  /* (ip_be, port_be, timeout_ms) -> conn_id or -E */
+#define ABI_SYS_TCP_SEND             151  /* (conn_id, buf, len) -> bytes_sent or -E */
+#define ABI_SYS_TCP_RECV             152  /* (conn_id, buf, len) -> bytes_read or -E */
+#define ABI_SYS_TCP_CLOSE            153  /* (conn_id) -> 0 or -E */
+#define ABI_SYS_TCP_LISTEN           154  /* (port_be, backlog) -> listen_id or -E */
+#define ABI_SYS_TCP_ACCEPT           155  /* (listen_id) -> conn_id or -E */
+#define ABI_SYS_TLS_CONNECT          156  /* (ip_be, port_be, hostname_ptr) -> tls_id or -E */
+#define ABI_SYS_TLS_SEND             157  /* (tls_id, buf, len) -> bytes_sent or -E */
+#define ABI_SYS_TLS_RECV             158  /* (tls_id, buf, len) -> bytes_read or -E */
+#define ABI_SYS_TLS_CLOSE            159  /* (tls_id) -> 0 or -E */
+
+/* ---- Milestone 7: Notification service + message bus ---- */
+#define ABI_SYS_NOTIFY_SVC_SEND    160  /* (title, body, icon) -> id or -E */
+#define ABI_SYS_NOTIFY_SVC_GET     161  /* (out, max_count) -> count */
+#define ABI_SYS_NOTIFY_SVC_DISMISS 162  /* (id; 0=all) -> 0 or -E */
+
+/* ---- Kernel module management ---------------------------------------- */
+#define ABI_SYS_MODULE         163  /* (uint64_t op, uint64_t arg1, uint64_t arg2)
+                                       op=0: load module from path (arg1)
+                                       op=1: unload module by name (arg1)
+                                       op=2: list loaded modules
+                                       -> 0 or -ABI_E* */
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          75
+#define ABI_SYS_NR_MAX          164
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
@@ -947,6 +1072,9 @@ _Static_assert(sizeof(struct abi_display_info) ==
 #define ABI_S_IFMT      0xF000
 #define ABI_S_IFREG     0x8000
 #define ABI_S_IFDIR     0x4000
+#define ABI_S_IFLNK     0xA000
+
+#define ABI_S_ISLNK(m)  (((m) & ABI_S_IFMT) == ABI_S_IFLNK)
 
 /* Permission bits (low 9 bits of mode). */
 #define ABI_S_IRUSR     0400
@@ -1383,6 +1511,35 @@ _Static_assert(sizeof(struct abi_hwcompat_entry) ==
                16 + ABI_HWCOMPAT_FRIENDLY_MAX +
                ABI_HWCOMPAT_DRIVER_MAX + ABI_HWCOMPAT_REASON_MAX,
                "abi_hwcompat_entry layout is FROZEN at 144 bytes");
+
+/* ============================================================
+ *  Clipboard formats (Phase 2 M2.7)
+ * ============================================================ */
+
+#define ABI_CLIP_FMT_TEXT     0u   /* plain UTF-8 text */
+#define ABI_CLIP_FMT_RICH    1u   /* rich text (reserved for future) */
+#define ABI_CLIP_FMT_IMAGE   2u   /* image data (reserved for future) */
+#define ABI_CLIP_MAX_SIZE    65536u  /* 64KB max clipboard payload */
+
+/* ============================================================
+ *  inotify events (Phase 1 M1.5)
+ * ============================================================ */
+
+#define ABI_IN_CREATE      0x100u
+#define ABI_IN_DELETE      0x200u
+#define ABI_IN_MODIFY      0x002u
+#define ABI_IN_MOVED_FROM  0x040u
+#define ABI_IN_MOVED_TO    0x080u
+#define ABI_IN_ALL_EVENTS  (ABI_IN_CREATE | ABI_IN_DELETE | ABI_IN_MODIFY | \
+                            ABI_IN_MOVED_FROM | ABI_IN_MOVED_TO)
+
+struct abi_inotify_event {
+    int32_t  wd;        /* watch descriptor */
+    uint32_t mask;      /* event mask (ABI_IN_*) */
+    uint32_t cookie;    /* association for rename pairs */
+    uint32_t len;       /* length of name field (0 if no name) */
+    char     name[64];  /* optional filename */
+};
 
 #ifdef __cplusplus
 }

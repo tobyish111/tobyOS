@@ -31,6 +31,7 @@
 #include <tobyos/display.h>
 
 extern const uint8_t font8x8_basic[128][8];
+extern const uint8_t font8x16_data[128][16];
 
 /* Forward decls: default backend lives at the bottom of this file. */
 static void limine_flip(void);
@@ -52,7 +53,9 @@ static const struct gfx_backend g_backend_limine = {
 
 static struct {
     uint32_t *fb;          /* hardware framebuffer, in HHDM (Limine path) */
-    uint32_t *back;        /* our back buffer (kmalloc'd) */
+    uint32_t *back;        /* our back buffer (kmalloc'd) -- currently active */
+    uint32_t *back2;       /* second back buffer for double-buffering */
+    int       active_buf;  /* 0 = back is active, 1 = back2 is active */
     uint32_t  width;       /* horizontal pixel count */
     uint32_t  height;      /* vertical pixel count   */
     uint32_t  fb_pitch_px; /* hardware pitch in pixels (>= width) */
@@ -74,6 +77,9 @@ static struct {
      * each frame. Wraps at 2^64 frames -- about 5 billion years at
      * 100 Hz. */
     struct gfx_present_stats stats;
+
+    /* VSync frame counter: incremented on every successful gfx_flip(). */
+    volatile uint64_t frame_count;
 } g = {
     .backend = &g_backend_limine,
 };
@@ -166,9 +172,6 @@ bool gfx_init(void *fb, uint64_t pitch, uint32_t width, uint32_t height) {
     if (!fb || width == 0 || height == 0 || pitch < (uint64_t)width * 4) {
         return false;
     }
-    /* The back buffer can be large (3 MiB at 1024x768). The heap grows
-     * arenas via vmm_map so this just means several extra pages get
-     * stitched into the heap region -- fine. */
     size_t bytes = (size_t)width * height * 4u;
     uint32_t *back = (uint32_t *)kmalloc(bytes);
     if (!back) {
@@ -178,19 +181,27 @@ bool gfx_init(void *fb, uint64_t pitch, uint32_t width, uint32_t height) {
     }
     memset(back, 0, bytes);
 
+    uint32_t *back2 = (uint32_t *)kmalloc(bytes);
+    if (!back2) {
+        kprintf("[gfx] OOM allocating second back buffer -- single-buffer mode\n");
+    } else {
+        memset(back2, 0, bytes);
+    }
+
     g.fb          = (uint32_t *)fb;
     g.back        = back;
+    g.back2       = back2;
+    g.active_buf  = 0;
     g.width       = width;
     g.height      = height;
     g.fb_pitch_px = (uint32_t)(pitch / 4);
     g.ready       = true;
-    /* Don't reset g.backend here: a driver might have set its preferred
-     * backend before gfx_init() (in practice the order is the other way
-     * round, but being defensive is cheap). */
     if (!g.backend) g.backend = &g_backend_limine;
-    kprintf("[gfx] back buffer %ux%u (%lu KiB) ready, fb_pitch=%u px, "
+    kprintf("[gfx] back buffer %ux%u (%lu KiB) ready%s, fb_pitch=%u px, "
             "backend=%s\n",
-            width, height, (unsigned long)(bytes / 1024), g.fb_pitch_px,
+            width, height, (unsigned long)(bytes / 1024),
+            back2 ? " [double-buffered]" : "",
+            g.fb_pitch_px,
             g.backend->name);
     return true;
 }
@@ -220,8 +231,13 @@ static bool clip_rect(int *x, int *y, int *w, int *h) {
 void gfx_clear(uint32_t color) {
     if (!g.ready) return;
     size_t n = (size_t)g.width * g.height;
-    for (size_t i = 0; i < n; i++) g.back[i] = color;
-    g.dirty_full = true;          /* gfx_clear touches every pixel */
+    uint64_t pair = ((uint64_t)color << 32) | (uint64_t)color;
+    size_t qwords = n / 2;
+    uint64_t *dst = (uint64_t *)g.back;
+    __asm__ volatile("rep stosq"
+        : "+D"(dst), "+c"(qwords) : "a"(pair) : "memory");
+    if (n & 1) g.back[n - 1] = color;
+    g.dirty_full = true;
 }
 
 void gfx_set_pixel(int x, int y, uint32_t color) {
@@ -234,20 +250,24 @@ void gfx_set_pixel(int x, int y, uint32_t color) {
 void gfx_fill_rect(int x, int y, int w, int h, uint32_t color) {
     if (!g.ready) return;
     if (!clip_rect(&x, &y, &w, &h)) return;
-    /* M27B: explicit bounds-check assertion. clip_rect() already
-     * narrows to the back buffer; if either coord falls outside the
-     * surface here it means the back buffer was reallocated mid-call
-     * (a serious kernel bug). Belt-and-braces: bail out instead of
-     * writing past the kmalloc region. */
     if (x < 0 || y < 0 || x + w > (int)g.width || y + h > (int)g.height) {
         kprintf("[gfx] fill_rect bounds violation %d,%d %dx%d in %ux%u "
                 "-- skipping (kernel bug?)\n",
                 x, y, w, h, g.width, g.height);
         return;
     }
+    /* Fast path: use 64-bit stores for wide fills. Pack two pixels
+     * into one qword so the inner loop does half the store ops. */
+    uint64_t pair = ((uint64_t)color << 32) | (uint64_t)color;
     for (int dy = 0; dy < h; dy++) {
         uint32_t *row = &g.back[(uint32_t)(y + dy) * g.width + (uint32_t)x];
-        for (int dx = 0; dx < w; dx++) row[dx] = color;
+        int dx = 0;
+        int w8 = w & ~1;  /* even count for qword pairs */
+        uint64_t *row64 = (uint64_t *)row;
+        for (; dx < w8; dx += 2) {
+            row64[dx >> 1] = pair;
+        }
+        if (dx < w) row[dx] = color;
     }
     dirty_union(x, y, w, h);
 }
@@ -260,6 +280,109 @@ void gfx_draw_rect(int x, int y, int w, int h, uint32_t color) {
     /* Left + right edges (avoid double-painting corners). */
     gfx_fill_rect(x,           y + 1, 1, h - 2, color);
     gfx_fill_rect(x + w - 1,   y + 1, 1, h - 2, color);
+}
+
+/* ---- lines & rounded rectangles -------------------------------- */
+
+void gfx_hline(int x, int y, int w, uint32_t color) {
+    if (!g.ready || w <= 0) return;
+    int h = 1;
+    if (!clip_rect(&x, &y, &w, &h)) return;
+    uint32_t *row = &g.back[(uint32_t)y * g.width + (uint32_t)x];
+    for (int i = 0; i < w; i++) row[i] = color;
+    dirty_union(x, y, w, 1);
+}
+
+void gfx_vline(int x, int y, int h, uint32_t color) {
+    if (!g.ready || h <= 0) return;
+    int w = 1;
+    if (!clip_rect(&x, &y, &w, &h)) return;
+    uint32_t *col = &g.back[(uint32_t)y * g.width + (uint32_t)x];
+    for (int i = 0; i < h; i++) { *col = color; col += g.width; }
+    dirty_union(x, y, 1, h);
+}
+
+void gfx_draw_line(int x0, int y0, int x1, int y1, uint32_t color) {
+    if (!g.ready) return;
+    int dx = x1 - x0, dy = y1 - y0;
+    int sx = (dx > 0) ? 1 : -1;
+    int sy = (dy > 0) ? 1 : -1;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    int err = dx - dy;
+    int minx = x0, maxx = x0, miny = y0, maxy = y0;
+    for (;;) {
+        gfx_set_pixel(x0, y0, color);
+        if (x0 < minx) minx = x0; if (x0 > maxx) maxx = x0;
+        if (y0 < miny) miny = y0; if (y0 > maxy) maxy = y0;
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+    gfx_mark_dirty_rect(minx, miny, maxx - minx + 1, maxy - miny + 1);
+}
+
+void gfx_fill_rounded_rect(int x, int y, int w, int h, int radius, uint32_t color) {
+    if (!g.ready || w <= 0 || h <= 0) return;
+    if (radius < 0) radius = 0;
+    int max_r = (w < h ? w : h) / 2;
+    if (radius > max_r) radius = max_r;
+    if (radius == 0) { gfx_fill_rect(x, y, w, h, color); return; }
+
+    for (int row = 0; row < h; row++) {
+        int inset = 0;
+        if (row < radius) {
+            int dy = radius - row - 1;
+            int r2 = radius * radius, dy2 = dy * dy;
+            int sx;
+            for (sx = 0; sx < radius; sx++) {
+                if ((radius - sx) * (radius - sx) + dy2 <= r2) break;
+            }
+            inset = sx;
+        } else if (row >= h - radius) {
+            int dy = row - (h - radius);
+            int r2 = radius * radius, dy2 = dy * dy;
+            int sx;
+            for (sx = 0; sx < radius; sx++) {
+                if ((radius - sx) * (radius - sx) + dy2 <= r2) break;
+            }
+            inset = sx;
+        }
+        int rw = w - 2 * inset;
+        if (rw > 0) gfx_fill_rect(x + inset, y + row, rw, 1, color);
+    }
+}
+
+void gfx_fill_rounded_rect_blend(int x, int y, int w, int h, int radius, uint32_t argb) {
+    if (!g.ready || w <= 0 || h <= 0) return;
+    if (radius < 0) radius = 0;
+    int max_r = (w < h ? w : h) / 2;
+    if (radius > max_r) radius = max_r;
+    if (radius == 0) { gfx_fill_rect_blend(x, y, w, h, argb); return; }
+
+    for (int row = 0; row < h; row++) {
+        int inset = 0;
+        if (row < radius) {
+            int dy = radius - row - 1;
+            int r2 = radius * radius, dy2 = dy * dy;
+            int sx;
+            for (sx = 0; sx < radius; sx++) {
+                if ((radius - sx) * (radius - sx) + dy2 <= r2) break;
+            }
+            inset = sx;
+        } else if (row >= h - radius) {
+            int dy = row - (h - radius);
+            int r2 = radius * radius, dy2 = dy * dy;
+            int sx;
+            for (sx = 0; sx < radius; sx++) {
+                if ((radius - sx) * (radius - sx) + dy2 <= r2) break;
+            }
+            inset = sx;
+        }
+        int rw = w - 2 * inset;
+        if (rw > 0) gfx_fill_rect_blend(x + inset, y + row, rw, 1, argb);
+    }
 }
 
 static void draw_glyph(int x, int y, char c, uint32_t fg, uint32_t bg) {
@@ -300,6 +423,48 @@ void gfx_draw_text(int x, int y, const char *s, uint32_t fg, uint32_t bg) {
      * one rect per glyph -- many fewer accumulator updates for long
      * lines. */
     if (any) gfx_mark_dirty_rect(min_x, min_y, max_x - min_x, max_y - min_y);
+}
+
+/* ---- 8x16 VGA bitmap text ------------------------------------- */
+
+void gfx_draw_text16(int x, int y, const char *s, uint32_t fg, uint32_t bg) {
+    if (!g.ready || !s) return;
+    bool transparent_bg = (bg == GFX_TRANSPARENT);
+    int ox = x;
+    int min_x = x, min_y = y, max_x = x, max_y = y + 16;
+    bool any = false;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c >= 128) c = '?';
+        const uint8_t *glyph = font8x16_data[c];
+        for (int row = 0; row < 16; row++) {
+            int py = y + row;
+            if (py < 0 || py >= (int)g.height) continue;
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < 8; col++) {
+                int px = ox + col;
+                if (px < 0 || px >= (int)g.width) continue;
+                bool on = (bits >> (7 - col)) & 1;
+                if (on)
+                    put_back(px, py, fg);
+                else if (!transparent_bg)
+                    put_back(px, py, bg);
+            }
+        }
+        any = true;
+        if (ox        < min_x) min_x = ox;
+        if (ox + 8    > max_x) max_x = ox + 8;
+        if (y + 16    > max_y) max_y = y + 16;
+        ox += 8;
+    }
+    if (any) gfx_mark_dirty_rect(min_x, min_y, max_x - min_x, max_y - min_y);
+}
+
+void gfx_text16_bounds(const char *s, int *out_w, int *out_h) {
+    int len = 0;
+    if (s) { for (const char *p = s; *p; p++) len++; }
+    if (out_w) *out_w = len * 8;
+    if (out_h) *out_h = 16;
 }
 
 /* ---- M27D: scaled/smoothed bitmap text ------------------------- */
@@ -492,27 +657,24 @@ void gfx_blit(int dst_x, int dst_y, int w, int h,
 
 /* ---- M27C: alpha blending ------------------------------------- */
 
-/* Source-over for one ARGB src over one XRGB dst:
- *   out = src.RGB * a + dst.RGB * (255 - a)
- * Result is XRGB (alpha is consumed).
- * Math is per-channel with rounded division by 255 via the
- * (x * a + 127) * 257 / 65536 trick -> equivalent to dividing by 255
- * but emits no DIV on x86_64 (compiler folds to a mul + shift). */
+/* Source-over blend using the SIMD-friendly "parallel channel" trick:
+ * Process R+B in one 32-bit word, G in another, avoiding per-channel
+ * extract/insert. Uses (x * a + 128) >> 8 ≈ x * a / 255. */
 static inline uint32_t blend_src_over(uint32_t dst_xrgb, uint32_t src_argb) {
-    uint32_t a = (src_argb >> 24) & 0xFFu;
-    if (a == 0)   return dst_xrgb;
-    if (a == 255) return src_argb & 0x00FFFFFFu;
-    uint32_t inv  = 255u - a;
-    uint32_t sR = (src_argb >> 16) & 0xFFu;
-    uint32_t sG = (src_argb >> 8 ) & 0xFFu;
-    uint32_t sB = (src_argb      ) & 0xFFu;
-    uint32_t dR = (dst_xrgb >> 16) & 0xFFu;
-    uint32_t dG = (dst_xrgb >> 8 ) & 0xFFu;
-    uint32_t dB = (dst_xrgb      ) & 0xFFu;
-    uint32_t oR = (sR * a + dR * inv + 127u) / 255u;
-    uint32_t oG = (sG * a + dG * inv + 127u) / 255u;
-    uint32_t oB = (sB * a + dB * inv + 127u) / 255u;
-    return (oR << 16) | (oG << 8) | oB;
+    uint32_t a = src_argb >> 24;
+    if (__builtin_expect(a == 0, 0))   return dst_xrgb;
+    if (__builtin_expect(a == 255, 0)) return src_argb & 0x00FFFFFFu;
+    uint32_t inv = 255u - a;
+    /* RB channels packed: mask out G, multiply both R and B in parallel */
+    uint32_t src_rb = src_argb & 0x00FF00FFu;
+    uint32_t dst_rb = dst_xrgb & 0x00FF00FFu;
+    uint32_t out_rb = (src_rb * a + dst_rb * inv + 0x00800080u) >> 8;
+    out_rb &= 0x00FF00FFu;
+    /* G channel */
+    uint32_t src_g = (src_argb >> 8) & 0xFFu;
+    uint32_t dst_g = (dst_xrgb >> 8) & 0xFFu;
+    uint32_t out_g = ((src_g * a + dst_g * inv + 128u) >> 8) & 0xFFu;
+    return out_rb | (out_g << 8);
 }
 
 uint32_t gfx_blend_pixel_argb(uint32_t dst_xrgb, uint32_t src_argb) {
@@ -603,6 +765,23 @@ static struct {
 
 void gfx_draw_cursor(int x, int y) {
     if (!g.ready) return;
+    /* Semi-transparent shadow offset by (2,2) for depth. */
+    for (int dy = 0; dy < CUR_H; dy++) {
+        int py = y + dy + 2;
+        if (py < 0 || py >= (int)g.height) continue;
+        const char *row = g_cursor[dy];
+        for (int dx = 0; dx < CUR_W && row[dx]; dx++) {
+            int px = x + dx + 2;
+            if (px < 0 || px >= (int)g.width) continue;
+            char c = row[dx];
+            if (c == '#' || c == '.') {
+                uint32_t dst = g.back[(uint32_t)py * g.width + (uint32_t)px];
+                uint32_t blended = blend_src_over(dst, 0x40000000u);
+                put_back(px, py, blended);
+            }
+        }
+    }
+    /* Main cursor sprite */
     for (int dy = 0; dy < CUR_H; dy++) {
         int py = y + dy;
         if (py < 0 || py >= (int)g.height) continue;
@@ -611,16 +790,11 @@ void gfx_draw_cursor(int x, int y) {
             int px = x + dx;
             if (px < 0 || px >= (int)g.width) continue;
             char c = row[dx];
-            if      (c == '#') put_back(px, py, 0x00000000u);  /* outline */
-            else if (c == '.') put_back(px, py, 0x00FFFFFFu);  /* fill    */
-            /* anything else: transparent */
+            if      (c == '#') put_back(px, py, 0x00000000u);
+            else if (c == '.') put_back(px, py, 0x00FFFFFFu);
         }
     }
-    /* M27B: cursor sprite bounding box (whole 12x19 block). The
-     * compositor draws the cursor LAST every frame so this rect is
-     * almost always already in the dirty union from window paints
-     * earlier in the pass; the union with itself is cheap. */
-    gfx_mark_dirty_rect(x, y, CUR_W, CUR_H);
+    gfx_mark_dirty_rect(x, y, CUR_W + 2, CUR_H + 2);
 }
 
 static bool cursor_overlay_supported(void) {
@@ -751,12 +925,6 @@ void gfx_flip(void) {
     g.stats.total_flips++;
 
     if (!have_dirty) {
-        /* Empty flip: nothing was marked dirty since the last present.
-         * We still call flip() defensively (caller wants a present),
-         * but bucket it into `empty_flips` only -- NOT also into
-         * full_flips -- so the invariant
-         *     total_flips == full_flips + partial_flips + empty_flips
-         * stays clean for downstream test code. */
         g.stats.empty_flips++;
         b->flip();
     } else if (!covers_all && b->present_rect) {
@@ -770,6 +938,25 @@ void gfx_flip(void) {
     }
     dirty_reset();
     display_record_flip();
+    g.frame_count++;
+
+    /* Double-buffer swap: after presenting, switch the active drawing
+     * buffer so the compositor draws into the other one while scanout
+     * is still referencing the just-presented content. Copy the current
+     * frame into the new buffer so incremental drawing works correctly. */
+    if (g.back2) {
+        uint32_t *presented = g.back;
+        uint32_t *next = g.back2;
+        if (g.active_buf == 0) {
+            next = g.back2;
+            g.active_buf = 1;
+        } else {
+            next = g.back;
+            g.active_buf = 0;
+        }
+        memcpy(next, presented, (size_t)g.width * g.height * 4u);
+        g.back = next;
+    }
 }
 
 void gfx_set_backend(const struct gfx_backend *backend) {
@@ -784,4 +971,447 @@ void gfx_set_backend(const struct gfx_backend *backend) {
 
 const struct gfx_backend *gfx_get_backend(void) {
     return g.backend;
+}
+
+uint64_t gfx_frame_count(void) {
+    return g.frame_count;
+}
+
+/* ==== Surface-targeted primitives (Phase 1: Advanced GPU/GUI Stack) ==== */
+
+static inline void surface_put(struct gfx_surface *s, int x, int y, uint32_t c) {
+    s->pixels[y * s->width + x] = c;
+}
+
+static inline uint32_t surface_get(const struct gfx_surface *s, int x, int y) {
+    return s->pixels[y * s->width + x];
+}
+
+static bool surface_clip(const struct gfx_surface *s, int *x, int *y, int *w, int *h) {
+    if (*w <= 0 || *h <= 0) return false;
+    int x0 = *x, y0 = *y, x1 = *x + *w, y1 = *y + *h;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > s->width) x1 = s->width;
+    if (y1 > s->height) y1 = s->height;
+    if (x1 <= x0 || y1 <= y0) return false;
+    *x = x0; *y = y0; *w = x1 - x0; *h = y1 - y0;
+    return true;
+}
+
+/* ---- Box blur (Phase 2) ----------------------------------------- */
+
+static void blur_pass_surface(uint32_t *pixels, int stride, int x, int y, int w, int h) {
+    if (w < 3 || h < 3) return;
+    /* Horizontal pass */
+    for (int row = y; row < y + h; row++) {
+        uint32_t *r = &pixels[row * stride];
+        uint32_t prev = r[x];
+        for (int col = x + 1; col < x + w - 1; col++) {
+            uint32_t l = prev;
+            uint32_t c = r[col];
+            uint32_t n = r[col + 1];
+            prev = c;
+            uint32_t rr = (((l >> 16) & 0xFF) + ((c >> 16) & 0xFF) + ((n >> 16) & 0xFF)) / 3;
+            uint32_t gg = (((l >>  8) & 0xFF) + ((c >>  8) & 0xFF) + ((n >>  8) & 0xFF)) / 3;
+            uint32_t bb = ((l & 0xFF) + (c & 0xFF) + (n & 0xFF)) / 3;
+            r[col] = (rr << 16) | (gg << 8) | bb;
+        }
+    }
+    /* Vertical pass */
+    for (int col = x; col < x + w; col++) {
+        uint32_t prev = pixels[y * stride + col];
+        for (int row = y + 1; row < y + h - 1; row++) {
+            uint32_t t = prev;
+            uint32_t c = pixels[row * stride + col];
+            uint32_t b = pixels[(row + 1) * stride + col];
+            prev = c;
+            uint32_t rr = (((t >> 16) & 0xFF) + ((c >> 16) & 0xFF) + ((b >> 16) & 0xFF)) / 3;
+            uint32_t gg = (((t >>  8) & 0xFF) + ((c >>  8) & 0xFF) + ((b >>  8) & 0xFF)) / 3;
+            uint32_t bb = ((t & 0xFF) + (c & 0xFF) + (b & 0xFF)) / 3;
+            pixels[row * stride + col] = (rr << 16) | (gg << 8) | bb;
+        }
+    }
+}
+
+void gfx_box_blur_region(int x, int y, int w, int h, int passes) {
+    if (!g.ready) return;
+    if (!clip_rect(&x, &y, &w, &h)) return;
+    if (passes < 1) passes = 1;
+    if (passes > 3) passes = 3;
+    for (int p = 0; p < passes; p++) {
+        blur_pass_surface(g.back, (int)g.width, x, y, w, h);
+    }
+    dirty_union(x, y, w, h);
+}
+
+void gfx_surface_box_blur(struct gfx_surface *s, int x, int y, int w, int h, int passes) {
+    if (!s || !s->pixels) return;
+    if (!surface_clip(s, &x, &y, &w, &h)) return;
+    if (passes < 1) passes = 1;
+    if (passes > 3) passes = 3;
+    for (int p = 0; p < passes; p++) {
+        blur_pass_surface(s->pixels, s->width, x, y, w, h);
+    }
+}
+
+void gfx_surface_from_backbuf(struct gfx_surface *out) {
+    if (!out) return;
+    out->pixels = g.ready ? g.back : 0;
+    out->width  = (int)g.width;
+    out->height = (int)g.height;
+}
+
+void gfx_surface_fill_rect(struct gfx_surface *s, int x, int y, int w, int h, uint32_t color) {
+    if (!s || !s->pixels) return;
+    if (!surface_clip(s, &x, &y, &w, &h)) return;
+    for (int dy = 0; dy < h; dy++) {
+        uint32_t *row = &s->pixels[(y + dy) * s->width + x];
+        for (int dx = 0; dx < w; dx++) row[dx] = color;
+    }
+}
+
+void gfx_surface_draw_rect(struct gfx_surface *s, int x, int y, int w, int h, uint32_t color) {
+    if (!s || !s->pixels) return;
+    if (w <= 0 || h <= 0) return;
+    /* Top edge */
+    for (int i = 0; i < w; i++) {
+        int px = x + i, py = y;
+        if (px >= 0 && px < s->width && py >= 0 && py < s->height)
+            surface_put(s, px, py, color);
+    }
+    /* Bottom edge */
+    for (int i = 0; i < w; i++) {
+        int px = x + i, py = y + h - 1;
+        if (px >= 0 && px < s->width && py >= 0 && py < s->height)
+            surface_put(s, px, py, color);
+    }
+    /* Left edge */
+    for (int i = 1; i < h - 1; i++) {
+        int px = x, py = y + i;
+        if (px >= 0 && px < s->width && py >= 0 && py < s->height)
+            surface_put(s, px, py, color);
+    }
+    /* Right edge */
+    for (int i = 1; i < h - 1; i++) {
+        int px = x + w - 1, py = y + i;
+        if (px >= 0 && px < s->width && py >= 0 && py < s->height)
+            surface_put(s, px, py, color);
+    }
+}
+
+void gfx_surface_draw_line(struct gfx_surface *s, int x0, int y0, int x1, int y1, uint32_t color) {
+    if (!s || !s->pixels) return;
+    int dx = x1 - x0, dy = y1 - y0;
+    int sx = dx > 0 ? 1 : -1;
+    int sy = dy > 0 ? 1 : -1;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    int err = dx - dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < s->width && y0 >= 0 && y0 < s->height)
+            surface_put(s, x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+}
+
+void gfx_surface_fill_rounded_rect(struct gfx_surface *s, int x, int y, int w, int h, int radius, uint32_t color) {
+    if (!s || !s->pixels) return;
+    if (w <= 0 || h <= 0) return;
+    int max_r = (w < h ? w : h) / 2;
+    if (radius > max_r) radius = max_r;
+    if (radius < 0) radius = 0;
+
+    for (int dy = 0; dy < h; dy++) {
+        int py = y + dy;
+        if (py < 0 || py >= s->height) continue;
+        int x_start = x, x_end = x + w;
+        /* Top-left / top-right corners */
+        if (dy < radius) {
+            int ry = radius - dy - 1;
+            int r2 = radius * radius;
+            int rx;
+            for (rx = radius; rx >= 0; rx--) {
+                if (rx * rx + ry * ry <= r2) break;
+            }
+            int inset = radius - rx - 1;
+            x_start += inset;
+            x_end   -= inset;
+        }
+        /* Bottom-left / bottom-right corners */
+        else if (dy >= h - radius) {
+            int ry = dy - (h - radius);
+            int r2 = radius * radius;
+            int rx;
+            for (rx = radius; rx >= 0; rx--) {
+                if (rx * rx + ry * ry <= r2) break;
+            }
+            int inset = radius - rx - 1;
+            x_start += inset;
+            x_end   -= inset;
+        }
+        if (x_start < 0) x_start = 0;
+        if (x_end > s->width) x_end = s->width;
+        for (int px = x_start; px < x_end; px++) {
+            if (px >= 0) surface_put(s, px, py, color);
+        }
+    }
+}
+
+void gfx_surface_fill_rounded_rect_blend(struct gfx_surface *s, int x, int y, int w, int h, int radius, uint32_t argb) {
+    if (!s || !s->pixels) return;
+    uint32_t a = (argb >> 24) & 0xFF;
+    if (a == 0) return;
+    if (a == 255) { gfx_surface_fill_rounded_rect(s, x, y, w, h, radius, argb & 0x00FFFFFFu); return; }
+    if (w <= 0 || h <= 0) return;
+    int max_r = (w < h ? w : h) / 2;
+    if (radius > max_r) radius = max_r;
+    if (radius < 0) radius = 0;
+
+    for (int dy = 0; dy < h; dy++) {
+        int py = y + dy;
+        if (py < 0 || py >= s->height) continue;
+        int x_start = x, x_end = x + w;
+        if (dy < radius) {
+            int ry = radius - dy - 1;
+            int r2 = radius * radius;
+            int rx;
+            for (rx = radius; rx >= 0; rx--) {
+                if (rx * rx + ry * ry <= r2) break;
+            }
+            int inset = radius - rx - 1;
+            x_start += inset;
+            x_end   -= inset;
+        } else if (dy >= h - radius) {
+            int ry = dy - (h - radius);
+            int r2 = radius * radius;
+            int rx;
+            for (rx = radius; rx >= 0; rx--) {
+                if (rx * rx + ry * ry <= r2) break;
+            }
+            int inset = radius - rx - 1;
+            x_start += inset;
+            x_end   -= inset;
+        }
+        if (x_start < 0) x_start = 0;
+        if (x_end > s->width) x_end = s->width;
+        for (int px = x_start; px < x_end; px++) {
+            if (px >= 0) {
+                uint32_t dst = surface_get(s, px, py);
+                surface_put(s, px, py, blend_src_over(dst, argb));
+            }
+        }
+    }
+}
+
+void gfx_surface_fill_rect_blend(struct gfx_surface *s, int x, int y, int w, int h, uint32_t argb) {
+    if (!s || !s->pixels) return;
+    uint32_t a = (argb >> 24) & 0xFF;
+    if (a == 0) return;
+    if (a == 255) { gfx_surface_fill_rect(s, x, y, w, h, argb & 0x00FFFFFFu); return; }
+    if (!surface_clip(s, &x, &y, &w, &h)) return;
+    for (int dy = 0; dy < h; dy++) {
+        for (int dx = 0; dx < w; dx++) {
+            int px = x + dx, py = y + dy;
+            uint32_t dst = surface_get(s, px, py);
+            surface_put(s, px, py, blend_src_over(dst, argb));
+        }
+    }
+}
+
+void gfx_surface_draw_text(struct gfx_surface *s, int x, int y, const char *str, uint32_t fg, uint32_t bg) {
+    if (!s || !s->pixels || !str) return;
+    bool transparent_bg = (bg == GFX_TRANSPARENT);
+    int ox = x;
+    for (; *str; str++) {
+        unsigned char c = (unsigned char)*str;
+        if (c >= 128) c = '?';
+        const uint8_t *glyph = font8x8_basic[c];
+        for (int row = 0; row < 8; row++) {
+            int py = y + row;
+            if (py < 0 || py >= s->height) continue;
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < 8; col++) {
+                int px = ox + col;
+                if (px < 0 || px >= s->width) continue;
+                if ((bits >> col) & 1)
+                    surface_put(s, px, py, fg);
+                else if (!transparent_bg)
+                    surface_put(s, px, py, bg);
+            }
+        }
+        ox += 8;
+    }
+}
+
+void gfx_surface_draw_text_scaled(struct gfx_surface *s, int x, int y, const char *str, uint32_t fg, uint32_t bg, int scale) {
+    if (!s || !s->pixels || !str) return;
+    if (scale <= 0) scale = 1;
+    bool transparent_bg = (bg == GFX_TRANSPARENT);
+    int ox = x;
+    for (; *str; str++) {
+        unsigned char c = (unsigned char)*str;
+        if (c >= 128) c = '?';
+        const uint8_t *glyph = font8x8_basic[c];
+        for (int row = 0; row < 8; row++) {
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < 8; col++) {
+                uint32_t clr = ((bits >> col) & 1) ? fg : (transparent_bg ? 0 : bg);
+                bool draw = ((bits >> col) & 1) || !transparent_bg;
+                if (!draw) continue;
+                for (int sy = 0; sy < scale; sy++) {
+                    int py = y + row * scale + sy;
+                    if (py < 0 || py >= s->height) continue;
+                    for (int sx = 0; sx < scale; sx++) {
+                        int px = ox + col * scale + sx;
+                        if (px < 0 || px >= s->width) continue;
+                        surface_put(s, px, py, clr);
+                    }
+                }
+            }
+        }
+        ox += 8 * scale;
+    }
+}
+
+void gfx_surface_blit(struct gfx_surface *s, int dst_x, int dst_y, int w, int h, const uint32_t *src, int src_pitch) {
+    if (!s || !s->pixels || !src) return;
+    int sx = 0, sy = 0;
+    if (dst_x < 0) { sx = -dst_x; w += dst_x; dst_x = 0; }
+    if (dst_y < 0) { sy = -dst_y; h += dst_y; dst_y = 0; }
+    if (dst_x + w > s->width) w = s->width - dst_x;
+    if (dst_y + h > s->height) h = s->height - dst_y;
+    if (w <= 0 || h <= 0) return;
+    for (int dy = 0; dy < h; dy++) {
+        const uint32_t *src_row = &src[(sy + dy) * src_pitch + sx];
+        uint32_t *dst_row = &s->pixels[(dst_y + dy) * s->width + dst_x];
+        memcpy(dst_row, src_row, (size_t)w * 4u);
+    }
+}
+
+void gfx_surface_blit_blend(struct gfx_surface *s, int dst_x, int dst_y, int w, int h, const uint32_t *src, int src_pitch) {
+    if (!s || !s->pixels || !src) return;
+    int sx = 0, sy = 0;
+    if (dst_x < 0) { sx = -dst_x; w += dst_x; dst_x = 0; }
+    if (dst_y < 0) { sy = -dst_y; h += dst_y; dst_y = 0; }
+    if (dst_x + w > s->width) w = s->width - dst_x;
+    if (dst_y + h > s->height) h = s->height - dst_y;
+    if (w <= 0 || h <= 0) return;
+    for (int dy = 0; dy < h; dy++) {
+        for (int dx = 0; dx < w; dx++) {
+            uint32_t sp = src[(sy + dy) * src_pitch + sx + dx];
+            if ((sp >> 24) == 0) continue;
+            int px = dst_x + dx, py = dst_y + dy;
+            uint32_t dst = surface_get(s, px, py);
+            surface_put(s, px, py, blend_src_over(dst, sp));
+        }
+    }
+}
+
+void gfx_surface_fill_circle(struct gfx_surface *s, int cx, int cy, int r, uint32_t color) {
+    if (!s || !s->pixels || r <= 0) return;
+    for (int dy = -r; dy <= r; dy++) {
+        int py = cy + dy;
+        if (py < 0 || py >= s->height) continue;
+        int r2 = r * r, dy2 = dy * dy;
+        int half_w = 0;
+        for (half_w = r; half_w >= 0; half_w--) {
+            if (half_w * half_w + dy2 <= r2) break;
+        }
+        int x0 = cx - half_w, x1 = cx + half_w;
+        if (x0 < 0) x0 = 0;
+        if (x1 >= s->width) x1 = s->width - 1;
+        for (int px = x0; px <= x1; px++) {
+            surface_put(s, px, py, color);
+        }
+    }
+}
+
+void gfx_surface_draw_circle(struct gfx_surface *s, int cx, int cy, int r, uint32_t color) {
+    if (!s || !s->pixels || r <= 0) return;
+    int x = 0, y = r, d = 1 - r;
+    while (x <= y) {
+        int pts[][2] = {
+            {cx + x, cy + y}, {cx - x, cy + y},
+            {cx + x, cy - y}, {cx - x, cy - y},
+            {cx + y, cy + x}, {cx - y, cy + x},
+            {cx + y, cy - x}, {cx - y, cy - x},
+        };
+        for (int i = 0; i < 8; i++) {
+            int px = pts[i][0], py = pts[i][1];
+            if (px >= 0 && px < s->width && py >= 0 && py < s->height)
+                surface_put(s, px, py, color);
+        }
+        if (d < 0) {
+            d += 2 * x + 3;
+        } else {
+            d += 2 * (x - y) + 5;
+            y--;
+        }
+        x++;
+    }
+}
+
+void gfx_surface_gradient_v(struct gfx_surface *s, int x, int y, int w, int h, uint32_t top, uint32_t bot) {
+    if (!s || !s->pixels) return;
+    if (!surface_clip(s, &x, &y, &w, &h)) return;
+    if (h == 1) {
+        uint32_t *row = &s->pixels[y * s->width + x];
+        for (int dx = 0; dx < w; dx++) row[dx] = top;
+        return;
+    }
+    for (int dy = 0; dy < h; dy++) {
+        uint32_t r = ((top >> 16) & 0xFF) * (h - 1 - dy) / (h - 1) + ((bot >> 16) & 0xFF) * dy / (h - 1);
+        uint32_t gr = ((top >> 8) & 0xFF) * (h - 1 - dy) / (h - 1) + ((bot >> 8) & 0xFF) * dy / (h - 1);
+        uint32_t b = (top & 0xFF) * (h - 1 - dy) / (h - 1) + (bot & 0xFF) * dy / (h - 1);
+        uint32_t c = (r << 16) | (gr << 8) | b;
+        uint32_t *row = &s->pixels[(y + dy) * s->width + x];
+        for (int dx = 0; dx < w; dx++) row[dx] = c;
+    }
+}
+
+void gfx_surface_draw_line_blend(struct gfx_surface *s, int x0, int y0, int x1, int y1, uint32_t argb) {
+    if (!s || !s->pixels) return;
+    uint32_t a = (argb >> 24) & 0xFF;
+    if (a == 0) return;
+    if (a == 255) { gfx_surface_draw_line(s, x0, y0, x1, y1, argb & 0x00FFFFFFu); return; }
+    int dx = x1 - x0, dy = y1 - y0;
+    int sx = dx > 0 ? 1 : -1;
+    int sy = dy > 0 ? 1 : -1;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    int err = dx - dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < s->width && y0 >= 0 && y0 < s->height) {
+            uint32_t dst = surface_get(s, x0, y0);
+            surface_put(s, x0, y0, blend_src_over(dst, argb));
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+}
+
+int gfx_surface_get_pixels(const struct gfx_surface *s, int x, int y, int w, int h, uint32_t *dst) {
+    if (!s || !s->pixels || !dst) return 0;
+    int cx = x, cy = y, cw = w, ch = h;
+    if (cw <= 0 || ch <= 0) return 0;
+    int x0 = cx, y0 = cy, x1 = cx + cw, y1 = cy + ch;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > s->width) x1 = s->width;
+    if (y1 > s->height) y1 = s->height;
+    if (x1 <= x0 || y1 <= y0) return 0;
+    int copied = 0;
+    for (int row = y0; row < y1; row++) {
+        const uint32_t *src_row = &s->pixels[row * s->width + x0];
+        int count = x1 - x0;
+        memcpy(dst + copied, src_row, (size_t)count * 4u);
+        copied += count;
+    }
+    return copied;
 }

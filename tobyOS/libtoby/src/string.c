@@ -170,3 +170,122 @@ const char *strerror(int err) {
     default: return "Unknown error";
     }
 }
+
+/* ---- strtok ----------------------------------------------------- */
+
+char *strtok_r(char *s, const char *delim, char **saveptr);
+
+static char *g_strtok_save = 0;
+
+char *strtok(char *s, const char *delim) {
+    return strtok_r(s, delim, &g_strtok_save);
+}
+
+char *strtok_r(char *s, const char *delim, char **saveptr) {
+    if (!s) s = *saveptr;
+    if (!s) return 0;
+
+    /* Skip leading delimiters */
+    while (*s) {
+        int is_delim = 0;
+        for (const char *d = delim; *d; d++) {
+            if (*s == *d) { is_delim = 1; break; }
+        }
+        if (!is_delim) break;
+        s++;
+    }
+    if (!*s) { *saveptr = 0; return 0; }
+
+    char *tok = s;
+    while (*s) {
+        for (const char *d = delim; *d; d++) {
+            if (*s == *d) {
+                *s = '\0';
+                *saveptr = s + 1;
+                return tok;
+            }
+        }
+        s++;
+    }
+    *saveptr = 0;
+    return tok;
+}
+
+/* ---- strcoll (no locale, same as strcmp) ------------------------- */
+
+int strcoll(const char *a, const char *b) {
+    return strcmp(a, b);
+}
+
+/* ---- case-insensitive comparisons ------------------------------- */
+
+int strcasecmp(const char *a, const char *b) {
+    while (*a && *b) {
+        int ca = (unsigned char)*a;
+        int cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return ca - cb;
+        a++; b++;
+    }
+    int ca = (unsigned char)*a;
+    int cb = (unsigned char)*b;
+    if (ca >= 'A' && ca <= 'Z') ca += 32;
+    if (cb >= 'A' && cb <= 'Z') cb += 32;
+    return ca - cb;
+}
+
+int strncasecmp(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        int ca = (unsigned char)a[i];
+        int cb = (unsigned char)b[i];
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return ca - cb;
+        if (ca == 0) return 0;
+    }
+    return 0;
+}
+
+/* ---- strspn / strcspn / strpbrk --------------------------------- */
+
+size_t strspn(const char *s, const char *accept) {
+    size_t n = 0;
+    while (s[n]) {
+        int found = 0;
+        for (const char *a = accept; *a; a++) {
+            if (s[n] == *a) { found = 1; break; }
+        }
+        if (!found) break;
+        n++;
+    }
+    return n;
+}
+
+size_t strcspn(const char *s, const char *reject) {
+    size_t n = 0;
+    while (s[n]) {
+        for (const char *r = reject; *r; r++) {
+            if (s[n] == *r) return n;
+        }
+        n++;
+    }
+    return n;
+}
+
+char *strpbrk(const char *s, const char *accept) {
+    while (*s) {
+        for (const char *a = accept; *a; a++) {
+            if (*s == *a) return (char *)s;
+        }
+        s++;
+    }
+    return 0;
+}
+
+/* ---- stpcpy ----------------------------------------------------- */
+
+char *stpcpy(char *dst, const char *src) {
+    while ((*dst = *src)) { dst++; src++; }
+    return dst;
+}

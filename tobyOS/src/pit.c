@@ -17,6 +17,9 @@
 #include <tobyos/signal.h>
 #include <tobyos/printk.h>
 #include <tobyos/watchdog.h>
+#include <tobyos/sched.h>
+#include <tobyos/proc.h>
+#include <tobyos/xhci.h>
 
 #define PIT_CH0_DATA  0x40
 #define PIT_CMD       0x43
@@ -37,6 +40,12 @@ static void pit_irq(struct regs *r) {
     wdog_kick_kernel();
     wdog_check();
 
+    /* Poll USB HID every PIT tick. On real hardware where xHCI MSI/MSI-X
+     * may not fire, this guarantees USB keyboards and mice get sampled at
+     * the PIT rate regardless of what's running. xhci_poll() is a fast
+     * no-op when nothing is pending (just reads the event ring dequeue). */
+    xhci_poll();
+
     /* Asynchronous-signal preemption point.
      *
      * If the timer interrupted ring 3 (CPL=3) and the current process
@@ -50,6 +59,21 @@ static void pit_irq(struct regs *r) {
      * future PIT IRQs can fire on the new running proc. */
     if ((r->cs & 3) == 3) {
         signal_deliver_if_pending();
+
+        /* Timer preemption: if we interrupted a user-mode process that
+         * is NOT pid 0, force a yield so the kernel idle loop (pid 0)
+         * can run the compositor and service input. This bounds worst-
+         * case input-to-pixel latency to one PIT period (4ms @ 250Hz).
+         *
+         * Safety: the user trap frame is already saved on this kstack.
+         * sched_yield() → proc_context_switch() saves the ISR call
+         * chain; when we're rescheduled later, we resume here and
+         * return through iretq normally. Same mechanism used by
+         * signal_deliver_if_pending → proc_exit → sched_yield above. */
+        struct proc *cur = current_proc();
+        if (cur && cur->pid != 0) {
+            sched_yield();
+        }
     }
 }
 

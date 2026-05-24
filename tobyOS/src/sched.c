@@ -25,11 +25,12 @@
  *      proc_context_switch.
  *
  * sched_idle() is the AP-side counterpart: an infinite loop that
- *   - cli + checks if THIS CPU's queue has anything (it won't in v1)
  *   - sti + hlt -- block until the next interrupt
- *   - on wake, drop back to the top of the loop
- * APs never enter ring 3 in v1, so there's no syscall stack /
- * TSS RSP0 to maintain.
+ *   - on wake, drain THIS CPU's ready queue and migrate every proc
+ *     back to the BSP's queue (APs lack per-CPU TSS so can't enter
+ *     ring 3 yet)
+ *   - drop back to the top of the loop
+ * Once per-CPU TSS is wired up, APs will pop-and-switch directly.
  */
 
 #include <tobyos/sched.h>
@@ -117,12 +118,14 @@ static bool queue_remove_locked(struct percpu *cpu, struct proc *p) {
 }
 
 /* Return the cpu_idx that should receive a freshly-enqueued proc.
- * v1 policy: always BSP, because APs lack the TSS/syscall plumbing
- * to safely run user procs. Once that's built (a future milestone),
- * flip this to a real round-robin counter. */
+ * v1 policy: always BSP (cpu 0). APs lack per-CPU TSS so they can't
+ * context-switch into user processes. The AP idle loop migrates any
+ * stray work back to the BSP, but enqueuing directly to BSP avoids
+ * the migration latency entirely. Once per-CPU TSS is wired up,
+ * switch to round-robin across all online CPUs. */
 static uint32_t enq_target_for(struct proc *p) {
     (void)p;
-    return 0;   /* BSP */
+    return 0;
 }
 
 void sched_enqueue(struct proc *p) {
@@ -191,6 +194,20 @@ void sched_yield(void) {
         spin_unlock_irqrestore(&me->ready_lock, f);
     }
 
+    /* Work-stealing: if our queue is empty, try to steal from other CPUs */
+    if (!next) {
+        uint32_t ncpus = smp_online_count();
+        uint32_t my_idx = me->cpu_idx;
+        for (uint32_t i = 1; i < ncpus && !next; i++) {
+            uint32_t victim = (my_idx + i) % ncpus;
+            struct percpu *other = smp_cpu_mut(victim);
+            if (!other || !other->ready_head) continue;
+            uint64_t f = spin_lock_irqsave(&other->ready_lock);
+            next = queue_pop_locked(other);
+            spin_unlock_irqrestore(&other->ready_lock, f);
+        }
+    }
+
     /* No one is ready. If the current proc can resume, just do that
      * (caller's intent was just "let someone else run if possible"). */
     if (!next) {
@@ -249,6 +266,11 @@ void sched_yield(void) {
     tss_set_rsp0((uint64_t)next->kstack_top);
     g_kernel_syscall_rsp   = (uint64_t)next->kstack_top;
 
+    /* Load per-thread TLS base (FS segment) so userland __thread vars
+     * resolve correctly for the incoming thread. */
+    if (next->tls_base)
+        wrmsr(0xC0000100, next->tls_base);  /* MSR_FS_BASE */
+
     if (log_enabled(LOG_CAT_SCHED)) {
         klog(LOG_CAT_SCHED, "yield: %d -> %d (cr3=0x%lx)",
              cur ? cur->pid : -1, next->pid, (unsigned long)next->cr3);
@@ -275,20 +297,31 @@ void sched_yield(void) {
 /* ---------- AP idle loop ---------- */
 
 void sched_idle(void) {
-    /* APs in v1 never run user procs (no per-CPU TSS / syscall stack),
-     * so we cannot context-switch INTO anything. We just sit on hlt
-     * and let interrupts route at this CPU drive any work. The
-     * per-CPU LAPIC timer fires at 100 Hz and bumps me->timer_ticks
-     * via sched_tick(); MSI/MSI-X handlers routed to this CPU's
-     * APIC ID would also wake us. Either way, the loop just goes
-     * back to hlt afterwards.
-     *
-     * Should we ever flip enq_target_for() to spread procs across
-     * CPUs, this loop will need to grow a real "pop from my queue,
-     * switch to it" path -- but that requires per-CPU TSS first. */
+    struct percpu *me  = smp_this_cpu();
+    struct percpu *bsp = smp_cpu_mut(0);
     for (;;) {
         sti();
         hlt();
+
+        if (!me || me->cpu_idx == 0) continue;
+
+        /* APs don't have per-CPU TSS yet, so they can't context-switch
+         * into user processes directly. Migrate any work that landed on
+         * our queue back to the BSP where it can run. This ensures
+         * round-robin enqueue doesn't strand procs on APs.
+         *
+         * TODO: once per-CPU TSS is wired up, replace this migration
+         * with a real pop-and-switch path (like sched_yield on the BSP). */
+        for (;;) {
+            uint64_t f = spin_lock_irqsave(&me->ready_lock);
+            struct proc *p = queue_pop_locked(me);
+            spin_unlock_irqrestore(&me->ready_lock, f);
+            if (!p) break;
+
+            uint64_t f2 = spin_lock_irqsave(&bsp->ready_lock);
+            queue_push_locked(bsp, p);
+            spin_unlock_irqrestore(&bsp->ready_lock, f2);
+        }
     }
 }
 

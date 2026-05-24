@@ -82,6 +82,14 @@ $required = @(
     'POSIXSH: alt=alt',
     'POSIXSH: len=6',
     'POSIXSH: arith=7',
+    'POSIXSH: arith-cmp=1-0-1-1',
+    'POSIXSH: arith-logic=0-1-1',
+    'POSIXSH: strip-prefix=world.txt',
+    'POSIXSH: strip-prefix-greedy=txt',
+    'POSIXSH: strip-suffix=hello.world',
+    'POSIXSH: strip-suffix-greedy=hello',
+    'POSIXSH: elif-ok',
+    'POSIXSH: negate=0',
     'POSIXSH: alias-ok',
     'POSIXSH: func-one-2',
     'POSIXSH: case-ok',
@@ -119,7 +127,7 @@ $required = @(
     'POSIXSH: getopts-b-bee-4',
     'POSIXSH: getopts-done-4',
     'POSIXSH: getopts-group-a-none-1',
-    'POSIXSH: getopts-group-b-bee-2',
+    'POSIXSH: getopts-group-b-bee-3',
     'POSIXSH: getopts-explicit-x-explicit-3',
     'POSIXSH: getopts-bad-?-z-0',
     'POSIXSH: getopts-missing-:-b-0',
@@ -149,6 +157,40 @@ $required = @(
     'POSIXSH: eval-ok',
     'POSIXSH: colon-before',
     'POSIXSH: colon-after',
+    'POSIXSH: echo-n-ok',
+    'POSIXSH: echo-e-tab',
+    'POSIXSH: pos10=j-pos11=k',
+    'POSIXSH: break2=1a',
+    'POSIXSH: cont2=1a2a',
+    'POSIXSH: xtrace-on',
+    'POSIXSH: errexit-status=1',
+    'POSIXSH: nounset-status=',
+    'POSIXSH: dollar-dash=ex',
+    'POSIXSH: tilde-user=/home/root',
+    'POSIXSH: ifs-split=3-a-b-c',
+    'export POSIXSH_EP="hello"',
+    'POSIXSH: setdash-count=0',
+    "trap -- '' INT",
+    'POSIXSH: test-t-ok',
+    'POSIXSH: test-L-ok',
+    'POSIXSH: ansic=hello',
+    'POSIXSH: star-ifs=a,b,c',
+    'POSIXSH: cmd-p-ok',
+    'POSIXSH: arith-var=30',
+    'POSIXSH: arith-tern=42',
+    'POSIXSH: arith-asgn=8-8',
+    'POSIXSH: noglob=*.txt',
+    'POSIXSH: case-or-ok',
+    'POSIXSH: unset-f-ok',
+    'POSIXSH: arith-hex=255',
+    'POSIXSH: arith-oct=8',
+    'POSIXSH: arith-comma=3',
+    'POSIXSH: arith-preinc=6-6',
+    'POSIXSH: arith-postinc=6-7',
+    'POSIXSH: forimpl-hello',
+    'POSIXSH: forimpl-world',
+    'POSIXSH: printf-b=tab',
+    'POSIXSH: noglob2=*',
     'POSIXSH: done',
     'POSIXSH: PASS'
 )
@@ -158,6 +200,7 @@ foreach ($pat in $required) {
     if ($txt -notmatch [regex]::Escape($pat)) { $missing += $pat }
 }
 if ($txt -match '(?m)^POSIXSH: if-bad') { $missing += 'unexpected POSIXSH: if-bad' }
+if ($txt -match '(?m)^POSIXSH: elif-bad') { $missing += 'unexpected POSIXSH: elif-bad' }
 if ($txt -match '(?m)^POSIXSH: case-bad') { $missing += 'unexpected POSIXSH: case-bad' }
 if ($txt -match '(?m)^POSIXSH: exit-bad') { $missing += 'unexpected POSIXSH: exit-bad' }
 if ($txt -match '(?m)^POSIXSH: trap-reset-bad') { $missing += 'unexpected POSIXSH: trap-reset-bad' }
@@ -167,6 +210,7 @@ if ($txt -match '(?m)^POSIXSH: return-bad') { $missing += 'unexpected POSIXSH: r
 if ($txt -match '(?m)^POSIXSH: subshell-alias-bad') { $missing += 'unexpected POSIXSH: subshell-alias-bad' }
 if ($txt -match '(?m)^POSIXSH: subshell-function-bad') { $missing += 'unexpected POSIXSH: subshell-function-bad' }
 if ($txt -match '(?m)^POSIXSH: subshell-exit-bad') { $missing += 'unexpected POSIXSH: subshell-exit-bad' }
+if ($txt -match '(?m)^POSIXSH: errexit-bad') { $missing += 'unexpected POSIXSH: errexit-bad' }
 if ($txt -notmatch 'posixsh_a\.txt' -or $txt -notmatch 'posixsh_b\.txt') {
     $missing += 'glob expansion did not show both posixsh files'
 }

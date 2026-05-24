@@ -69,7 +69,7 @@ void ld_die(const char *s) {
 
 /* ---- Module table ------------------------------------------- */
 
-#define LD_MAX_MODULES 8
+#define LD_MAX_MODULES 16
 
 struct module {
     const char  *name;          /* "<program>" or DT_NEEDED string */
@@ -183,6 +183,17 @@ static void apply_one(struct module *m, Elf64_Rela *r) {
         int found = 0;
         uint64_t v = resolve_global(name, &found);
         if (!found) {
+            uint8_t bind = ELF64_ST_BIND(m->symtab[sym].st_info);
+            if (bind == STB_WEAK) {
+                *slot = 0;
+                return;
+            }
+            /* __tls_get_addr is an optional TLS runtime helper;
+             * stub it to zero if not provided. */
+            if (ld_strcmp(name, "__tls_get_addr") == 0) {
+                *slot = 0;
+                return;
+            }
             ld_puts("[ld-toby] unresolved symbol: ");
             ld_puts(name);
             ld_die("");
@@ -193,6 +204,14 @@ static void apply_one(struct module *m, Elf64_Rela *r) {
             *slot = v;            /* GLOB_DAT and JUMP_SLOT ignore addend */
         return;
     }
+
+    case R_X86_64_DTPMOD64:
+    case R_X86_64_DTPOFF64:
+    case R_X86_64_TPOFF64:
+        /* TLS relocations are not supported yet; zero the slot so
+         * the program doesn't see stale data and warn at load time. */
+        *slot = 0;
+        return;
 
     default:
         ld_die("unsupported relocation type");
@@ -210,31 +229,120 @@ static void apply_module_relocs(struct module *m) {
     }
 }
 
+/* ---- LD_LIBRARY_PATH support -------------------------------- */
+
+#define LD_PATH_MAX_ENTRIES 8
+#define LD_PATH_BUF_SIZE   512
+
+static char g_ld_path_buf[LD_PATH_BUF_SIZE];
+static const char *g_ld_paths[LD_PATH_MAX_ENTRIES];
+static int g_ld_path_count;
+
+static void parse_ld_library_path(uint64_t *sp) {
+    /* Walk envp to find LD_LIBRARY_PATH */
+    uint64_t argc = sp[0];
+    uint64_t *p = &sp[1];
+    p += argc + 1;      /* skip argv + NULL terminator */
+
+    while (*p) {
+        const char *env = (const char *)(uintptr_t)*p;
+        if (env[0] == 'L' && env[1] == 'D' && env[2] == '_' &&
+            env[3] == 'L' && env[4] == 'I' && env[5] == 'B' &&
+            env[6] == 'R' && env[7] == 'A' && env[8] == 'R' &&
+            env[9] == 'Y' && env[10] == '_' && env[11] == 'P' &&
+            env[12] == 'A' && env[13] == 'T' && env[14] == 'H' &&
+            env[15] == '=') {
+            const char *val = env + 16;
+            size_t vlen = ld_strlen(val);
+            if (vlen >= LD_PATH_BUF_SIZE) vlen = LD_PATH_BUF_SIZE - 1;
+            ld_memcpy(g_ld_path_buf, val, vlen);
+            g_ld_path_buf[vlen] = '\0';
+
+            /* Split on ':' */
+            char *s = g_ld_path_buf;
+            g_ld_paths[g_ld_path_count++] = s;
+            while (*s && g_ld_path_count < LD_PATH_MAX_ENTRIES) {
+                if (*s == ':') {
+                    *s = '\0';
+                    g_ld_paths[g_ld_path_count++] = s + 1;
+                }
+                s++;
+            }
+            return;
+        }
+        p++;
+    }
+}
+
 /* ---- Library loading ---------------------------------------- */
 
 static char g_path_buf[256];
 
-static const char *build_lib_path(const char *name) {
-    static const char prefix[] = "/lib/";
-    size_t plen = sizeof(prefix) - 1;
-    size_t nlen = ld_strlen(name);
-    if (plen + nlen + 1 > sizeof(g_path_buf)) ld_die("library name too long");
-    ld_memcpy(g_path_buf, prefix, plen);
-    ld_memcpy(g_path_buf + plen, name, nlen + 1);
-    return g_path_buf;
+static int try_load_at(const char *path, uint64_t base,
+                       struct abi_dlmap_info *info) {
+    long rc = ld_syscall3(ABI_SYS_DLOAD, (long)(uintptr_t)path,
+                          (long)base, (long)(uintptr_t)info);
+    return (rc >= 0) ? 1 : 0;
 }
+
+static const char *resolve_lib_path(const char *name, uint64_t base,
+                                    struct abi_dlmap_info *info) {
+    size_t nlen = ld_strlen(name);
+
+    /* If absolute path, use directly */
+    if (name[0] == '/') {
+        if (try_load_at(name, base, info)) return name;
+        return 0;
+    }
+
+    /* Search LD_LIBRARY_PATH first */
+    for (int i = 0; i < g_ld_path_count; i++) {
+        size_t dlen = ld_strlen(g_ld_paths[i]);
+        if (dlen + 1 + nlen + 1 > sizeof(g_path_buf)) continue;
+        ld_memcpy(g_path_buf, g_ld_paths[i], dlen);
+        g_path_buf[dlen] = '/';
+        ld_memcpy(g_path_buf + dlen + 1, name, nlen + 1);
+        if (try_load_at(g_path_buf, base, info)) return g_path_buf;
+    }
+
+    /* Default: /lib/<name> */
+    if (5 + nlen + 1 > sizeof(g_path_buf)) {
+        ld_die("library name too long");
+    }
+    ld_memcpy(g_path_buf, "/lib/", 5);
+    ld_memcpy(g_path_buf + 5, name, nlen + 1);
+    if (try_load_at(g_path_buf, base, info)) return g_path_buf;
+
+    return 0;
+}
+
+static int is_already_loaded(const char *name) {
+    for (int i = 0; i < g_nmodules; i++) {
+        if (ld_strcmp(g_modules[i].name, name) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Forward declaration for recursive dependency loading */
+static uint64_t g_next_alloc_base;
+static const uint64_t g_per_lib_slot = 0x0000000004000000ULL; /* 64 MiB */
+
+static void load_transitive_deps(struct module *m);
 
 static void load_dependency(struct module *prog, const char *name,
                             uint64_t next_base) {
     if (g_nmodules >= LD_MAX_MODULES) ld_die("too many modules");
+    if (is_already_loaded(name)) return;
 
-    const char *path = build_lib_path(name);
-    struct abi_dlmap_info info = {0};
-    long rc = ld_syscall3(ABI_SYS_DLOAD, (long)(uintptr_t)path,
-                          (long)next_base, (long)(uintptr_t)&info);
-    if (rc < 0) {
+    struct abi_dlmap_info info;
+    ld_memcpy(&info, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+              "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+              "\0\0\0\0\0\0\0\0", sizeof(info));
+
+    const char *path = resolve_lib_path(name, next_base, &info);
+    if (!path) {
         ld_puts("[ld-toby] dload failed for ");
-        ld_puts(path);
+        ld_puts(name);
         ld_die("");
     }
 
@@ -243,7 +351,23 @@ static void load_dependency(struct module *prog, const char *name,
     m->base    = info.base;
     m->dynamic = (Elf64_Dyn *)(uintptr_t)info.dynamic;
     parse_dynamic(m);
+
+    /* Advance the allocation base for subsequent loads */
+    g_next_alloc_base = next_base + g_per_lib_slot;
+
+    /* Recursively load this library's DT_NEEDED dependencies */
+    load_transitive_deps(m);
     (void)prog;
+}
+
+static void load_transitive_deps(struct module *m) {
+    if (!m->dynamic || !m->strtab) return;
+    for (Elf64_Dyn *d = m->dynamic; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag != DT_NEEDED) continue;
+        const char *dep_name = m->strtab + d->d_un;
+        if (is_already_loaded(dep_name)) continue;
+        load_dependency(m, dep_name, g_next_alloc_base);
+    }
 }
 
 /* ---- Program PHDR walk -------------------------------------- */
@@ -326,6 +450,9 @@ static void walk_auxv(uint64_t *sp, struct auxv_unpacked *out) {
 uint64_t ld_main(uint64_t *user_stack_top, uintptr_t self_base) {
     (void)self_base;
 
+    /* Parse LD_LIBRARY_PATH from the environment before loading */
+    parse_ld_library_path(user_stack_top);
+
     struct auxv_unpacked av = {0};
     walk_auxv(user_stack_top, &av);
 
@@ -343,7 +470,8 @@ uint64_t ld_main(uint64_t *user_stack_top, uintptr_t self_base) {
     if (!prog->dynamic) ld_die("program has no PT_DYNAMIC");
     parse_dynamic(prog);
 
-    /* Walk DT_NEEDED entries and dload each one.
+    /* Walk DT_NEEDED entries and dload each one (including transitive
+     * dependencies).
      *
      * Each library is mapped at a fresh VA chosen here by us. We
      * pick a simple bump allocator starting at 0x60000000, with
@@ -351,14 +479,12 @@ uint64_t ld_main(uint64_t *user_stack_top, uintptr_t self_base) {
      * each other. The kernel's elf_load_user_at() validates that
      * the chosen base + segment vaddrs stay below the user split.
      */
-    uint64_t next_base = 0x0000000060000000ULL;
-    const uint64_t per_lib_slot = 0x0000000004000000ULL;   /* 64 MiB */
+    g_next_alloc_base = 0x0000000060000000ULL;
 
     for (Elf64_Dyn *d = prog->dynamic; d->d_tag != DT_NULL; d++) {
         if (d->d_tag != DT_NEEDED) continue;
         const char *name = prog->strtab + d->d_un;
-        load_dependency(prog, name, next_base);
-        next_base += per_lib_slot;
+        load_dependency(prog, name, g_next_alloc_base);
     }
 
     /* Apply each library's own relocations first (so program-side

@@ -20,7 +20,7 @@
 #define TCP_MIN_RTO_MS      200u
 #define TCP_MAX_RTO_MS      12000u
 #define TCP_INIT_CWND_BYTES (TCP_DEFAULT_MSS * 2u)
-#define TCP_MAX_CWND_BYTES  (TCP_DEFAULT_MSS * 8u)
+#define TCP_MAX_CWND_BYTES  (TCP_DEFAULT_MSS * 64u)
 
 struct tx_pend {
     bool     used;
@@ -40,7 +40,7 @@ struct tcp_conn {
     uint16_t     local_port_be;
     uint32_t     snd_una;
     uint32_t     snd_nxt;
-    uint16_t     snd_wnd;
+    uint32_t     snd_wnd;
     uint32_t     rcv_nxt;
     uint8_t      rx_buf[TCP_RX_BUF_BYTES];
     size_t       rx_head, rx_tail, rx_count;
@@ -48,10 +48,36 @@ struct tcp_conn {
     bool         remote_fin_seen;
     bool         remote_rst_seen;
     bool         peer_acked_our_fin;
+
+    /* Retransmission -- Jacobson/Karels (RFC 6298). */
+    uint32_t     srtt_us;
+    uint32_t     rttvar_us;
+    uint32_t     rto_ms;
+    uint32_t     retransmit_count;
+    uint64_t     last_send_tsc;
+
+    /* Legacy millisecond accessors kept for compatibility. */
     uint32_t     srtt_ms;
     uint32_t     rttvar_ms;
-    uint32_t     rto_ms;
+
+    /* Congestion control -- CUBIC (RFC 8312). */
     uint32_t     cwnd_bytes;
+    uint32_t     ssthresh;
+    uint32_t     bytes_in_flight;
+    int          in_slow_start;
+    uint32_t     dup_ack_count;
+
+    /* CUBIC state */
+    uint32_t     w_max;           /* cwnd before last loss (in bytes) */
+    uint64_t     epoch_start;     /* pit_ticks() at last loss event */
+    uint32_t     origin_point;    /* W_max for CUBIC calculation */
+    uint32_t     tcp_friendliness_cwnd; /* TCP-friendly cwnd estimate */
+
+    /* Window scaling (RFC 7323) */
+    uint8_t      snd_wnd_shift;   /* peer's window scale factor */
+    uint8_t      rcv_wnd_shift;   /* our window scale factor (advertised) */
+    bool         wscale_ok;       /* both sides support window scaling */
+
     uint8_t      acc_head, acc_tail, acc_count, backlog_cap;
     int8_t       acc_q[TCP_LISTEN_BACKLOG];
     int8_t       parent_lsn;
@@ -76,12 +102,21 @@ static struct tcp_conn *conn_alloc(void) {
         struct tcp_conn *c = &g_conns[i];
         if (!c->in_use) {
             memset(c, 0, sizeof(*c));
-            c->in_use     = true;
-            c->state      = TCP_CLOSED;
-            c->snd_wnd    = 65535;
-            c->parent_lsn = -1;
-            c->rto_ms     = 1000;
-            c->cwnd_bytes = TCP_INIT_CWND_BYTES;
+            c->in_use        = true;
+            c->state         = TCP_CLOSED;
+            c->snd_wnd       = 65535u;
+            c->parent_lsn    = -1;
+            c->rto_ms        = 1000;
+            c->cwnd_bytes    = TCP_INIT_CWND_BYTES;
+            c->ssthresh      = TCP_MAX_CWND_BYTES;
+            c->in_slow_start = 1;
+            c->w_max         = 0;
+            c->epoch_start   = 0;
+            c->origin_point  = 0;
+            c->tcp_friendliness_cwnd = 0;
+            c->snd_wnd_shift = 0;
+            c->rcv_wnd_shift = 4;  /* advertise shift=4 => up to 1 MiB */
+            c->wscale_ok     = false;
             return c;
         }
     }
@@ -190,26 +225,40 @@ static size_t pend_flight_bytes(const struct tcp_conn *c) {
     return sum;
 }
 
-static void rto_update_on_ack(struct tcp_conn *c, uint32_t age_ms) {
-    if (age_ms == 0) age_ms = 1;
-    if (c->srtt_ms == 0) {
-        c->srtt_ms   = age_ms;
-        c->rttvar_ms = age_ms / 2u;
+/* Jacobson/Karels RTT estimator (RFC 6298) -- microsecond precision. */
+void tcp_rtt_update(struct tcp_conn *c, uint32_t measured_rtt_ms) {
+    uint32_t rtt_us = measured_rtt_ms * 1000u;
+    if (rtt_us == 0) rtt_us = 1000;
+
+    if (c->srtt_us == 0) {
+        c->srtt_us   = rtt_us;
+        c->rttvar_us = rtt_us / 2u;
     } else {
-        int32_t delta = (int32_t)age_ms - (int32_t)c->srtt_ms;
-        if (delta < 0) delta = -delta;
-        c->rttvar_ms = (3u * c->rttvar_ms + (uint32_t)delta) / 4u;
-        c->srtt_ms   = (7u * c->srtt_ms + age_ms) / 8u;
+        int32_t delta = (int32_t)rtt_us - (int32_t)c->srtt_us;
+        uint32_t abs_delta = delta < 0 ? (uint32_t)(-delta) : (uint32_t)delta;
+        c->rttvar_us = (3u * c->rttvar_us + abs_delta) / 4u;
+        c->srtt_us   = (7u * c->srtt_us + rtt_us) / 8u;
     }
-    uint32_t r = c->srtt_ms + 4u * c->rttvar_ms;
+
+    c->srtt_ms   = c->srtt_us / 1000u;
+    c->rttvar_ms = c->rttvar_us / 1000u;
+
+    uint32_t rto_us = c->srtt_us + 4u * c->rttvar_us;
+    uint32_t r = rto_us / 1000u;
     if (r < TCP_MIN_RTO_MS) r = TCP_MIN_RTO_MS;
     if (r > TCP_MAX_RTO_MS) r = TCP_MAX_RTO_MS;
     c->rto_ms = r;
 }
 
+/* Legacy alias so old callers keep working. */
+static void rto_update_on_ack(struct tcp_conn *c, uint32_t age_ms) {
+    tcp_rtt_update(c, age_ms);
+}
+
 /* Drop TX slots fully covered by `ack` (host order). Sample RTT from oldest. */
 static void pend_ack(struct tcp_conn *c, uint32_t ack) {
     bool sampled = false;
+    uint32_t bytes_acked = 0;
     for (int i = 0; i < TCP_MAX_TX_PENDING; i++) {
         struct tx_pend *p = &c->pend[i];
         if (!p->used) continue;
@@ -226,35 +275,60 @@ static void pend_ack(struct tcp_conn *c, uint32_t ack) {
                 rto_update_on_ack(c, (uint32_t)age_ms);
                 sampled = true;
             }
+            bytes_acked += (uint32_t)p->len + extra;
             if (p->xflags & TCP_FLAG_FIN) c->peer_acked_our_fin = true;
             memset(p, 0, sizeof(*p));
         }
     }
-    if (seq_delta(ack, c->snd_una) > 0) c->snd_una = ack;
-    if (c->cwnd_bytes < TCP_MAX_CWND_BYTES)
-        c->cwnd_bytes += TCP_DEFAULT_MSS / 2u;
+    if (seq_delta(ack, c->snd_una) > 0) {
+        c->snd_una = ack;
+        c->dup_ack_count = 0;
+        c->retransmit_count = 0;
+    }
+    if (bytes_acked > 0)
+        tcp_congestion_on_ack(c, bytes_acked);
 }
 
 static bool tcp_emit(struct tcp_conn *c, uint8_t flags,
                       const void *payload, size_t plen) {
-    uint8_t buf[TCP_HDR_LEN + TCP_DEFAULT_MSS];
+    uint8_t buf[TCP_HDR_LEN + 4 + TCP_DEFAULT_MSS]; /* +4 for options */
     if (plen > TCP_DEFAULT_MSS) return false;
 
+    /* Include window scale option on SYN segments */
+    unsigned opt_len = 0;
+    if (flags & TCP_FLAG_SYN) opt_len = 4; /* Kind=3, Len=3, Shift, Pad=NOP */
+
+    unsigned hdr_len = TCP_HDR_LEN + opt_len;
+
     struct tcp_hdr *h = (struct tcp_hdr *)buf;
-    memset(h, 0, TCP_HDR_LEN);
+    memset(h, 0, hdr_len);
     h->src_port = c->local_port_be;
     h->dst_port = c->remote_port_be;
     h->seq      = htonl(c->snd_nxt);
     h->ack      = htonl(c->rcv_nxt);
-    h->data_off = (uint8_t)(5u << 4);
+    h->data_off = (uint8_t)((hdr_len / 4u) << 4);
     h->flags    = flags;
-    h->window   = htons((uint16_t)(TCP_RX_BUF_BYTES - c->rx_count));
+
+    /* Advertise receive window (shifted if wscale negotiated) */
+    uint16_t adv_wnd = (uint16_t)(TCP_RX_BUF_BYTES - c->rx_count);
+    if (c->wscale_ok && !(flags & TCP_FLAG_SYN))
+        adv_wnd = (uint16_t)((TCP_RX_BUF_BYTES - c->rx_count) >> c->rcv_wnd_shift);
+    h->window   = htons(adv_wnd);
     h->urgent   = 0;
     h->checksum = 0;
-    if (plen) memcpy(buf + TCP_HDR_LEN, payload, plen);
+
+    if (opt_len > 0) {
+        uint8_t *opts = buf + TCP_HDR_LEN;
+        opts[0] = 1;               /* NOP (padding) */
+        opts[1] = 3;               /* Kind = Window Scale */
+        opts[2] = 3;               /* Length = 3 */
+        opts[3] = c->rcv_wnd_shift; /* Shift count */
+    }
+
+    if (plen) memcpy(buf + hdr_len, payload, plen);
     h->checksum = net_l4_checksum(IP_PROTO_TCP, g_my_ip, c->remote_ip_be,
-                                   buf, TCP_HDR_LEN + plen);
-    return ip_send(c->remote_ip_be, IP_PROTO_TCP, buf, TCP_HDR_LEN + plen);
+                                   buf, hdr_len + plen);
+    return ip_send(c->remote_ip_be, IP_PROTO_TCP, buf, hdr_len + plen);
 }
 
 static void tcp_send_ack(struct tcp_conn *c) {
@@ -286,6 +360,8 @@ static bool tcp_send_data_segment(struct tcp_conn *c, uint8_t xf,
     if (xf & TCP_FLAG_SYN) consumed++;
     if (xf & TCP_FLAG_FIN) consumed++;
     c->snd_nxt += consumed;
+    c->bytes_in_flight += consumed;
+    c->last_send_tsc = pit_ticks();
     return true;
 }
 
@@ -304,12 +380,13 @@ static bool tcp_retransmit_slot(struct tcp_conn *c, int pi) {
     if (ok) {
         p->sent_at = pit_ticks();
         p->retries++;
+        c->retransmit_count++;
+        /* Exponential backoff on the RTO. */
         if (c->rto_ms < TCP_MAX_RTO_MS / 2u)
             c->rto_ms *= 2u;
         else
             c->rto_ms = TCP_MAX_RTO_MS;
-        if (c->cwnd_bytes > TCP_DEFAULT_MSS * 2u)
-            c->cwnd_bytes = TCP_DEFAULT_MSS * 2u;
+        tcp_congestion_on_loss(c);
     }
     return ok;
 }
@@ -359,7 +436,8 @@ static void listen_enqueue(struct tcp_conn *lsn, int child_idx) {
 }
 
 static void passive_syn(struct tcp_conn *lsn, uint32_t src_ip,
-    uint16_t src_port, uint16_t dst_port, uint32_t seq) {
+    uint16_t src_port, uint16_t dst_port, uint32_t seq,
+    const void *tcp_packet, unsigned hlen) {
 int lidx = conn_index(lsn);
 
 if (syn_recv_count(lidx) >= lsn->backlog_cap) {
@@ -389,6 +467,26 @@ return;
     ch->snd_nxt = ch->snd_una = (uint32_t)(mix ^ (mix >> 32));
 
     ch->state = TCP_SYN_RECEIVED;
+
+    /* Parse TCP options from the incoming SYN for window scale */
+    if (hlen > TCP_HDR_LEN && tcp_packet) {
+        const uint8_t *opts = (const uint8_t *)tcp_packet + TCP_HDR_LEN;
+        unsigned opts_len = hlen - TCP_HDR_LEN;
+        for (unsigned oi = 0; oi < opts_len; ) {
+            uint8_t kind = opts[oi];
+            if (kind == 0) break;
+            if (kind == 1) { oi++; continue; }
+            if (oi + 1 >= opts_len) break;
+            uint8_t olen = opts[oi + 1];
+            if (olen < 2 || oi + olen > opts_len) break;
+            if (kind == 3 && olen == 3) {
+                ch->snd_wnd_shift = opts[oi + 2];
+                if (ch->snd_wnd_shift > 14) ch->snd_wnd_shift = 14;
+                ch->wscale_ok = true;
+            }
+            oi += olen;
+        }
+    }
 
     kprintf("[tcp] SYN rx tcp[%d] lp=%u rp=%u seq=%u -> SYN_RECEIVED\n",
             conn_index(ch),
@@ -428,7 +526,8 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
         struct tcp_conn *lsn = listen_lookup(dstp);
         if (lsn && (h->flags & TCP_FLAG_SYN) &&
             !(h->flags & TCP_FLAG_ACK)) {
-            passive_syn(lsn, src_ip_be, srcp, dstp, ntohl(h->seq));
+            passive_syn(lsn, src_ip_be, srcp, dstp, ntohl(h->seq),
+                        tcp_packet, hlen);
         }
         return;
     }
@@ -438,7 +537,7 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
     uint8_t  fl  = h->flags;
     const uint8_t *payload = (const uint8_t *)tcp_packet + hlen;
     size_t        plen     = len - hlen;
-    c->snd_wnd = ntohs(h->window);
+    c->snd_wnd = (uint32_t)ntohs(h->window) << c->snd_wnd_shift;
 
     if (fl & TCP_FLAG_RST) {
         kprintf("[tcp] RST rx tcp[%d] lp=%u rp=%u state=%s\n",
@@ -461,6 +560,25 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
         if ((fl & (TCP_FLAG_SYN | TCP_FLAG_ACK)) ==
                 (TCP_FLAG_SYN | TCP_FLAG_ACK) &&
             ack == c->snd_nxt) {
+            /* Parse TCP options for window scale */
+            if (hlen > TCP_HDR_LEN) {
+                const uint8_t *opts = (const uint8_t *)tcp_packet + TCP_HDR_LEN;
+                unsigned opts_len = hlen - TCP_HDR_LEN;
+                for (unsigned oi = 0; oi < opts_len; ) {
+                    uint8_t kind = opts[oi];
+                    if (kind == 0) break;        /* End of options */
+                    if (kind == 1) { oi++; continue; } /* NOP */
+                    if (oi + 1 >= opts_len) break;
+                    uint8_t olen = opts[oi + 1];
+                    if (olen < 2 || oi + olen > opts_len) break;
+                    if (kind == 3 && olen == 3) {
+                        c->snd_wnd_shift = opts[oi + 2];
+                        if (c->snd_wnd_shift > 14) c->snd_wnd_shift = 14;
+                        c->wscale_ok = true;
+                    }
+                    oi += olen;
+                }
+            }
             pend_ack(c, ack);
             c->rcv_nxt = seq + 1u;
             c->state   = TCP_ESTABLISHED;
@@ -503,6 +621,12 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
         if (seq_delta(ack, c->snd_una) > 0 &&
             seq_delta(ack, c->snd_nxt) <= 0) {
             pend_ack(c, ack);
+        } else if (ack == c->snd_una && plen == 0 &&
+                   c->state == TCP_ESTABLISHED) {
+            /* Duplicate ACK detection (RFC 5681 sec 2). */
+            c->dup_ack_count++;
+            if (c->dup_ack_count == 3)
+                tcp_fast_retransmit(c);
         }
     }
 
@@ -865,6 +989,122 @@ void tcp_close(struct tcp_conn *c) {
         }
     }
     if (c->in_use) conn_free(c);
+}
+
+/* ---- Congestion control -- CUBIC (RFC 8312) --------------------- */
+
+static uint32_t icbrt(uint32_t n) {
+    if (n == 0) return 0;
+    uint32_t x = 1;
+    for (int i = 0; i < 20; i++) {
+        uint32_t x2 = x * x;
+        if (x2 == 0) break;
+        uint32_t x3 = (2 * x + n / x2) / 3;
+        if (x3 >= x) break;
+        x = x3;
+    }
+    return x;
+}
+
+void tcp_congestion_on_ack(struct tcp_conn *c, uint32_t bytes_acked) {
+    if (!c || !bytes_acked) return;
+
+    if (c->bytes_in_flight >= bytes_acked)
+        c->bytes_in_flight -= bytes_acked;
+    else
+        c->bytes_in_flight = 0;
+
+    if (c->in_slow_start) {
+        c->cwnd_bytes += bytes_acked;
+        if (c->cwnd_bytes >= c->ssthresh) {
+            c->in_slow_start = 0;
+            c->epoch_start = pit_ticks();
+        }
+        return;
+    }
+
+    /* CUBIC congestion avoidance */
+    uint64_t now = pit_ticks();
+    if (c->epoch_start == 0) c->epoch_start = now;
+
+    /* Time since epoch in milliseconds (PIT at ~1000 Hz) */
+    uint64_t elapsed_ticks = now - c->epoch_start;
+    uint32_t elapsed_ms = (uint32_t)(elapsed_ticks);
+
+    /* K = cubic_root(w_max * 0.3 / 0.4) in segments, converted to ms */
+    uint32_t w_max_segs = c->w_max / TCP_DEFAULT_MSS;
+    if (w_max_segs == 0) w_max_segs = 1;
+
+    uint32_t k_input = (w_max_segs * 3) / 4; /* w_max * beta_cubic / C */
+    uint32_t k_ms = icbrt(k_input) * 100;
+
+    /* W_cubic(t) = C * (t - K)^3 + W_max */
+    int32_t diff = (int32_t)elapsed_ms - (int32_t)k_ms;
+    int64_t cubic_term = (int64_t)diff * diff * diff;
+    /* C = 0.4, in fixed point: multiply by 4, divide by 10 */
+    int64_t w_cubic_segs = (int64_t)w_max_segs + (cubic_term * 4 / (10 * 1000 * 1000));
+    if (w_cubic_segs < 1) w_cubic_segs = 1;
+
+    uint32_t w_cubic = (uint32_t)w_cubic_segs * TCP_DEFAULT_MSS;
+
+    /* TCP-friendly mode: standard Reno increase */
+    uint32_t w_reno = c->cwnd_bytes + (TCP_DEFAULT_MSS * bytes_acked) / c->cwnd_bytes;
+
+    /* Use the larger of CUBIC and Reno */
+    uint32_t target = (w_cubic > w_reno) ? w_cubic : w_reno;
+
+    /* Cap growth at 1 MSS increase per RTT */
+    if (target > c->cwnd_bytes + TCP_DEFAULT_MSS)
+        target = c->cwnd_bytes + TCP_DEFAULT_MSS;
+
+    c->cwnd_bytes = target;
+
+    uint32_t max_cwnd = TCP_DEFAULT_MSS * 64;
+    if (c->cwnd_bytes > max_cwnd) c->cwnd_bytes = max_cwnd;
+}
+
+void tcp_congestion_on_loss(struct tcp_conn *c) {
+    if (!c) return;
+    c->w_max = c->cwnd_bytes;
+    /* CUBIC beta = 0.7 */
+    c->cwnd_bytes = (c->cwnd_bytes * 7) / 10;
+    if (c->cwnd_bytes < TCP_DEFAULT_MSS) c->cwnd_bytes = TCP_DEFAULT_MSS;
+    c->ssthresh = c->cwnd_bytes;
+    c->in_slow_start = 0;
+    c->epoch_start = pit_ticks();
+}
+
+void tcp_retransmit_check(struct tcp_conn *c) {
+    if (!c || !c->in_use) return;
+    (void)tcp_tick_one(c);
+}
+
+void tcp_fast_retransmit(struct tcp_conn *c) {
+    if (!c || !c->in_use) return;
+    /* Find the oldest unACKed segment and retransmit it. */
+    int oldest = -1;
+    uint32_t oldest_seq = 0;
+    for (int i = 0; i < TCP_MAX_TX_PENDING; i++) {
+        struct tx_pend *p = &c->pend[i];
+        if (!p->used) continue;
+        if (oldest < 0 || seq_delta(p->seq, oldest_seq) < 0) {
+            oldest = i;
+            oldest_seq = p->seq;
+        }
+    }
+    if (oldest >= 0) {
+        kprintf("[tcp] fast retransmit tcp[%d] seq=%u dup_acks=%u\n",
+                conn_index(c), oldest_seq, c->dup_ack_count);
+        /* CUBIC fast retransmit: beta = 0.7 */
+        c->w_max = c->cwnd_bytes;
+        c->cwnd_bytes = (c->cwnd_bytes * 7) / 10;
+        if (c->cwnd_bytes < TCP_DEFAULT_MSS) c->cwnd_bytes = TCP_DEFAULT_MSS;
+        c->ssthresh   = c->cwnd_bytes;
+        c->in_slow_start = 0;
+        c->epoch_start = pit_ticks();
+
+        tcp_retransmit_slot(c, oldest);
+    }
 }
 
 void tcp_dump(void) {

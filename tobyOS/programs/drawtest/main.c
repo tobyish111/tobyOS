@@ -56,6 +56,7 @@ struct gui_event {
     unsigned char _pad[2];
 };
 #define GUI_EV_NONE  0
+#define GUI_EV_CLOSE 5
 
 static inline void sys_yield(void) {
     /* rax is in/out -- if we don't tie it back, the compiler caches
@@ -195,6 +196,60 @@ static void draw_clipping_test(int fd) {
     check_call(sys_gui_fill(fd, WIN_W + 100, 200, 32, 32, 0x00FFFFFFu), "clip off");
 }
 
+/* ---- Phase 1 advanced primitives -------------------------------- */
+
+#define SYS_GUI_LINE           80
+#define SYS_GUI_CIRCLE         84
+#define SYS_GUI_CIRCLE_OUTLINE 85
+#define SYS_GUI_GRADIENT       89
+#define SYS_GUI_LINE_BLEND     90
+
+static inline long syscall6(long n, long a1, long a2, long a3, long a4, long a5) {
+    long ret;
+    register long r10 __asm__("r10") = a4;
+    register long r8  __asm__("r8")  = a5;
+    __asm__ volatile("syscall"
+        : "=a"(ret)
+        : "0"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+static void draw_lines(int fd) {
+    /* Diagonal lines across the window to exercise line drawing. */
+    long xy0 = (long)(((unsigned)50 << 16) | (unsigned)10);
+    long xy1 = (long)(((unsigned)180 << 16) | (unsigned)300);
+    check_call((int)syscall6(SYS_GUI_LINE, fd, xy0, xy1, 0x00FF8800u, 0), "line diag1");
+
+    xy0 = (long)(((unsigned)50 << 16) | (unsigned)300);
+    xy1 = (long)(((unsigned)180 << 16) | (unsigned)10);
+    check_call((int)syscall6(SYS_GUI_LINE, fd, xy0, xy1, 0x0000FF88u, 0), "line diag2");
+
+    xy0 = (long)(((unsigned)100 << 16) | (unsigned)0);
+    xy1 = (long)(((unsigned)100 << 16) | (unsigned)319);
+    check_call((int)syscall6(SYS_GUI_LINE, fd, xy0, xy1, 0x008888FFu, 0), "line horiz");
+}
+
+static void draw_circles(int fd) {
+    long cxy = (long)(((unsigned)120 << 16) | (unsigned)160);
+    check_call((int)syscall6(SYS_GUI_CIRCLE, fd, cxy, 30, 0x00FF4040u, 0), "circle filled");
+
+    cxy = (long)(((unsigned)120 << 16) | (unsigned)220);
+    check_call((int)syscall6(SYS_GUI_CIRCLE_OUTLINE, fd, cxy, 25, 0x0040FF40u, 0), "circle outline");
+}
+
+static void draw_gradients(int fd) {
+    long xy = (long)(((unsigned)190 << 16) | (unsigned)240);
+    long wh = (long)(((unsigned)40 << 16) | (unsigned)60);
+    check_call((int)syscall6(SYS_GUI_GRADIENT, fd, xy, wh, 0x00FF0000u, 0x000000FFu), "gradient");
+}
+
+static void draw_blended_lines(int fd) {
+    long xy0 = (long)(((unsigned)20 << 16) | (unsigned)20);
+    long xy1 = (long)(((unsigned)220 << 16) | (unsigned)300);
+    check_call((int)syscall6(SYS_GUI_LINE_BLEND, fd, xy0, xy1, 0x80FFFF00u, 0), "line blend");
+}
+
 /* ---- one full pass -------------------------------------------- */
 
 static int pre_state_ok(struct abi_display_info *snap) {
@@ -267,6 +322,10 @@ int main(int argc, char **argv) {
     draw_color_ramp    (fd);
     draw_clipping_test (fd);
     draw_labels        (fd);
+    draw_lines         (fd);
+    draw_circles       (fd);
+    draw_gradients     (fd);
+    draw_blended_lines (fd);
 
     int flip_rc = sys_gui_flip(fd);
     check_call(flip_rc, "flip");
@@ -280,6 +339,7 @@ int main(int argc, char **argv) {
             int got = sys_gui_poll_event(fd, &ev);
             if (got == 0) { sys_yield(); continue; }
             if (got < 0)  break;
+            if (ev.type == GUI_EV_CLOSE) break;
         }
     }
 

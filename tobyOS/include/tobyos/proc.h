@@ -46,12 +46,23 @@
 
 #include <tobyos/types.h>
 #include <tobyos/abi/abi.h>
+#include <tobyos/signal.h>
 
-#define PROC_MAX        16
+#define PROC_MAX        64
 #define PROC_NAME_MAX   32
 #define PROC_KSTACK_SZ  (32 * 1024)   /* per-process kernel stack: 32 KiB */
 #define PROC_NFDS       16            /* per-proc file descriptor table size */
 #define PROC_SANDBOX_MAX 128          /* max length of sandbox path prefix */
+
+/* Thread-group fields. A "thread" is a lightweight proc sharing
+ * the same address space (CR3, brk, fds) as its leader.
+ * - tgid: the PID of the thread-group leader (== pid for leaders).
+ * - is_thread: if true, this proc shares its leader's CR3/fds/brk
+ *   and does NOT own the PML4 (owns_pml4 = false).
+ * - tls_base: userland thread-local storage base (FS.base for this thread).
+ * The maximum threads per process (including the leader) is bounded
+ * only by PROC_MAX -- no per-process thread table. */
+#define THREAD_MAX_PER_PROC  32
 
 struct file;                          /* see <tobyos/file.h> */
 
@@ -114,6 +125,9 @@ struct proc {
      * the first time this process is scheduled in. */
     uint64_t        user_entry;
     uint64_t        user_rsp;
+    /* Thread argument: passed in RDI to the thread entry function.
+     * Only meaningful for threads (is_thread == true) on first entry. */
+    uint64_t        user_arg;
 
     /* Wait-for-child book-keeping. */
     int             wait_pid;       /* pid we're blocked on, or -1 */
@@ -139,6 +153,9 @@ struct proc {
      * return, in the PIT IRQ if it interrupted ring 3, and inside
      * blocking primitives that return -EINTR. See signal.h. */
     uint32_t        pending_signals;
+
+    /* Phase 1 M1.3: full POSIX signal state (handlers, mask, restorer) */
+    struct signal_state sigstate;
 
     /* Per-process file descriptor table. Slot indices that fit in a
      * struct file pointer are owning -- close-on-exit drops them. */
@@ -184,6 +201,32 @@ struct proc {
      * never serialised across exec / spawn -- a child starts at 0
      * even if its parent is mid-scope. */
     uint32_t        sysprot_priv;
+
+    /* ---- Threading (Phase 1 milestone M1.1) -------------------------
+     *
+     * tgid: thread-group ID (== pid of the leader). For the leader
+     *       itself, tgid == pid. For spawned threads, tgid == leader's
+     *       pid. Checked by waitpid/kill to operate on the whole group.
+     *
+     * is_thread: if true this proc is a non-leader thread sharing its
+     *       leader's address space. On exit it does NOT free the PML4
+     *       or the fd table -- only the leader does that.
+     *
+     * tls_base: user-visible FS segment base for this thread's TLS area.
+     *       Written by SYS_SET_TLS, loaded into MSR_FS_BASE on context
+     *       switch so each thread sees its own __thread variables.
+     *
+     * join_waiters: linked list of procs blocked on SYS_THREAD_JOIN
+     *       for this specific thread. Woken by thread_exit().
+     *
+     * detached: if true, nobody will join this thread -- reap immediately
+     *       on exit.
+     */
+    int             tgid;
+    bool            is_thread;
+    bool            detached;
+    uint64_t        tls_base;
+    struct proc    *join_waiters;
 
     /* ---- Milestone 19: performance metrics ---------------------
      *
@@ -315,5 +358,42 @@ void        proc_dump_table(void);
  * switch via the fake initial frame proc_create installed. Reads
  * current's user_entry/user_rsp and iretqs to ring 3. */
 __attribute__((noreturn)) void proc_first_user_entry(void);
+
+/* ---- Thread API (Phase 1 M1.1) ------------------------------------ */
+
+/* Create a new thread in the calling process's thread group. The new
+ * thread shares the leader's address space, fds, brk, caps, and cwd.
+ * It gets its own kernel stack, user stack (at `user_stack_top`), and
+ * starts execution at `entry(arg)`. Returns the new thread's TID (== pid)
+ * on success, or -1 on failure. */
+int thread_create(uint64_t entry, uint64_t arg,
+                  uint64_t user_stack_top, uint64_t tls_base);
+
+/* Exit the calling thread. If the caller is the last thread in the
+ * group, the entire process exits with `code`. Otherwise only this
+ * thread is terminated and its resources freed. */
+__attribute__((noreturn)) void thread_exit(int code);
+
+/* Block until thread `tid` exits. Stores its exit code in *out_code
+ * (if non-NULL). Returns 0 on success, -1 if tid not found or not
+ * in the same thread group as the caller. */
+int thread_join(int tid, int *out_code);
+
+/* Detach thread `tid` so it auto-reaps on exit. */
+int thread_detach(int tid);
+
+/* Futex: atomic wait/wake on a userland address.
+ *   op=0 (FUTEX_WAIT): if *uaddr == expected, block until woken.
+ *   op=1 (FUTEX_WAKE): wake up to `val` waiters on uaddr.
+ * Returns number of waiters woken (WAKE) or 0/-EAGAIN (WAIT). */
+#define FUTEX_WAIT  0
+#define FUTEX_WAKE  1
+long futex(uint32_t *uaddr, int op, uint32_t val);
+
+/* Initialize the futex hash table. Call once during boot. */
+void futex_init(void);
+
+/* Set the calling thread's TLS base (loaded into FS.base). */
+void thread_set_tls(uint64_t base);
 
 #endif /* TOBYOS_PROC_H */

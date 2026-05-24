@@ -11,7 +11,8 @@
  *   block 1       inode bitmap   (256 inodes; bits 0..10 = "metadata", bit 1 = root)
  *   block 2       data  bitmap   (1024 bits; bits 0..10 reserved for metadata)
  *   blocks 3..10  inode table    (256 inodes * 128 bytes = 32 KiB = 8 blocks)
- *   blocks 11..1023 data         (1013 blocks)
+ *   blocks 11..991  data         (981 blocks)
+ *   blocks 992..1023 journal     (32 blocks, write-ahead log)
  *
  * After formatting:
  *   - inode 1 is the root directory (TYPE_DIR, size=0, no data blocks).
@@ -42,6 +43,9 @@
 #define TFS_DATA_BITMAP_BLK   2u
 #define TFS_INODE_TABLE_BLK   3u
 #define TFS_DATA_BLK_START    (TFS_INODE_TABLE_BLK + TFS_INODE_BLOCKS)
+
+#define TFS_JOURNAL_BLOCKS    32u
+#define TFS_JOURNAL_START     (TFS_TOTAL_BLOCKS - TFS_JOURNAL_BLOCKS)
 
 #define TFS_TYPE_FREE 0u
 #define TFS_TYPE_FILE 1u
@@ -130,6 +134,8 @@ int main(int argc, char **argv) {
         .data_blk_start   = TFS_DATA_BLK_START,
         .root_ino         = TFS_ROOT_INO,
     };
+    sb.reserved[0] = TFS_JOURNAL_START;
+    sb.reserved[1] = TFS_JOURNAL_BLOCKS;
     memcpy(blk, &sb, sizeof(sb));
     if (write_block(fp, 0, blk) != 0) { perror("write sb"); fclose(fp); return 1; }
 
@@ -142,9 +148,10 @@ int main(int argc, char **argv) {
     }
 
     /* Block 2: data bitmap. Mark blocks 0..(TFS_DATA_BLK_START - 1) as
-     * "used" -- they're metadata, not free for user data. */
+     * "used" (metadata) and journal blocks as reserved. */
     memset(blk, 0, sizeof(blk));
     for (uint32_t b = 0; b < TFS_DATA_BLK_START; b++) bit_set(blk, b);
+    for (uint32_t b = TFS_JOURNAL_START; b < TFS_TOTAL_BLOCKS; b++) bit_set(blk, b);
     if (write_block(fp, TFS_DATA_BITMAP_BLK, blk) != 0) {
         perror("write dbitmap"); fclose(fp); return 1;
     }
@@ -182,11 +189,12 @@ int main(int argc, char **argv) {
     fclose(fp);
 
     printf("mkfs.tobyfs: '%s' formatted -- %u blocks of %u bytes (%u KiB), "
-           "%u inodes, %u user data blocks\n",
+           "%u inodes, %u user data blocks, %u journal blocks\n",
            path,
            TFS_TOTAL_BLOCKS, TFS_BLOCK_SIZE,
            (TFS_TOTAL_BLOCKS * TFS_BLOCK_SIZE) / 1024,
            TFS_INODE_COUNT - 1,
-           TFS_TOTAL_BLOCKS - TFS_DATA_BLK_START);
+           TFS_JOURNAL_START - TFS_DATA_BLK_START,
+           TFS_JOURNAL_BLOCKS);
     return 0;
 }

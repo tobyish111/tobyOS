@@ -29,6 +29,7 @@
 #include <tobyos/ioapic.h>
 #include <tobyos/irq.h>
 #include <tobyos/pit.h>
+#include <tobyos/rtc.h>
 #include <tobyos/perf.h>
 #include <tobyos/keyboard.h>
 #include <tobyos/limine.h>
@@ -54,6 +55,8 @@
 #include <tobyos/ext4.h>
 #include <tobyos/pci.h>
 #include <tobyos/net.h>
+#include <tobyos/ipv6.h>
+#include <tobyos/icmpv6.h>
 #include <tobyos/dns.h>
 #include <tobyos/tcp.h>
 #include <tobyos/tcp_echo.h>
@@ -77,6 +80,8 @@
 #include <tobyos/pkg.h>
 #include <tobyos/sec.h>
 #include <tobyos/sysprot.h>
+#include <tobyos/procfs.h>
+#include <tobyos/inotify.h>
 #include <tobyos/sectest.h>
 #include <tobyos/installer.h>
 #include <tobyos/audio_hda.h>
@@ -95,7 +100,38 @@
 #include <tobyos/theme.h>
 #include <tobyos/notify.h>
 #include <tobyos/rng.h>
+#include <tobyos/module.h>
+#include <tobyos/clipboard.h>
 #include <tobyos/abi/abi.h>
+#include <tobyos/swap.h>
+#include <tobyos/page_fault.h>
+#include <tobyos/bcache.h>
+
+/* New subsystem headers */
+extern void devmgr_init(void);
+extern void devmgr_enumerate(void);
+extern void taskd_init(void);
+extern void taskd_tick(void);
+
+/* Phase 1 M1.4: IPC subsystem init declarations */
+extern void shm_init(void);
+extern void unix_socket_init(void);
+
+/* Phase 1 M1.5: sysfs */
+extern void sysfs_init(void);
+
+/* Phase 7: ASLR + hardening */
+extern void aslr_init(void);
+extern void hardening_init(void);
+
+/* Phase 4: AML interpreter */
+extern void aml_interp_init(void);
+
+/* Phase 2: HiDPI display scaling */
+extern void hidpi_init(void);
+
+/* Phase B: Audio engine */
+extern void audio_engine_init(void);
 
 /* ---- Limine framebuffer request (kept inline -- only used here) ---- */
 
@@ -970,6 +1006,16 @@ static void posix_shell_selftest(void) {
         "echo POSIXSH: alt=${POSIX_ASSIGN:+alt}",
         "echo POSIXSH: len=${#POSIX_ASSIGN}",
         "echo POSIXSH: arith=$((1+2*3))",
+        "echo POSIXSH: arith-cmp=$((3>2))-$((3<2))-$((3==3))-$((3!=2))",
+        "echo POSIXSH: arith-logic=$((1&&0))-$((1||0))-$((!0))",
+        "POSIX_STRIP=hello.world.txt",
+        "echo POSIXSH: strip-prefix=${POSIX_STRIP#*.}",
+        "echo POSIXSH: strip-prefix-greedy=${POSIX_STRIP##*.}",
+        "echo POSIXSH: strip-suffix=${POSIX_STRIP%.*}",
+        "echo POSIXSH: strip-suffix-greedy=${POSIX_STRIP%%.*}",
+        "if false; then echo POSIXSH: elif-bad; elif true; then echo POSIXSH: elif-ok; else echo POSIXSH: elif-bad2; fi",
+        "! false",
+        "echo POSIXSH: negate=$?",
         "alias px='echo POSIXSH: alias-ok'",
         "px",
         "unalias px",
@@ -997,6 +1043,29 @@ static void posix_shell_selftest(void) {
         "> /data/posixsh_redir_only.txt",
         "/bin/echo POSIXSH: redir-only-ok >>/data/posixsh_redir_only.txt",
         "cat /data/posixsh_redir_only.txt",
+
+        "write /data/posixsh_read_input.txt alpha beta gamma",
+        "read X Y </data/posixsh_read_input.txt",
+        "echo POSIXSH: read-file-$X-$Y",
+        "sh /data/posixsh_read_heredoc.sh",
+
+        "echo hello | echo POSIXSH: builtin-pipe",
+        "pipefn() { echo POSIXSH: function-pipe; }",
+        "echo hello | pipefn",
+        "unset X Y",
+        "echo hello | read X Y",
+        "echo POSIXSH: read-pipe-status=$? var=${X:-unset}-${Y:-unset}",
+        "echo hello | cd /",
+        "echo POSIXSH: pipe-cwd-$PWD",
+
+        "/bin/echo POSIXSH: wait-bg &",
+        "echo POSIXSH: bgpid=$!",
+        "wait $!",
+        "echo POSIXSH: wait-status=$?",
+        "/bin/echo POSIXSH: wait-all-bg &",
+        "wait",
+        "echo POSIXSH: wait-all-status=$?",
+
         "POSIX_SPECIAL=kept export POSIX_SPECIAL",
         "echo POSIXSH: special-assign=$POSIX_SPECIAL",
         "POSIX_TEMP=visible env >/data/posixsh_env_tmp.txt",
@@ -1008,6 +1077,33 @@ static void posix_shell_selftest(void) {
         "set -- shift-a shift-b shift-c",
         "shift 2",
         "echo POSIXSH: shift-$#-$1",
+
+        "OPTIND=1",
+        "getopts ab: OPT -a -b bee extra",
+        "echo POSIXSH: getopts-$OPT-${OPTARG:-none}-$OPTIND",
+        "getopts ab: OPT -a -b bee extra",
+        "echo POSIXSH: getopts-$OPT-${OPTARG:-none}-$OPTIND",
+        "getopts ab: OPT -a -b bee extra",
+        "echo POSIXSH: getopts-done-$OPTIND",
+
+        "OPTIND=1",
+        "getopts ab: OPT -ab bee",
+        "echo POSIXSH: getopts-group-$OPT-${OPTARG:-none}-$OPTIND",
+        "getopts ab: OPT -ab bee",
+        "echo POSIXSH: getopts-group-$OPT-${OPTARG:-none}-$OPTIND",
+
+        "OPTIND=1",
+        "getopts :ab: OPT -z",
+        "echo POSIXSH: getopts-bad-$OPT-${OPTARG:-none}-$?",
+
+        "OPTIND=1",
+        "getopts :ab: OPT -b",
+        "echo POSIXSH: getopts-missing-$OPT-${OPTARG:-none}-$?",
+
+        "OPTIND=1",
+        "getopts x: OPT -x explicit",
+        "echo POSIXSH: getopts-explicit-$OPT-${OPTARG:-none}-$OPTIND",
+
         "command -V export",
         "sh -c 'echo POSIXSH: exit-before; exit 9; echo POSIXSH: exit-bad'",
         "echo POSIXSH: exit-status=$?",
@@ -1043,6 +1139,132 @@ static void posix_shell_selftest(void) {
         "echo POSIXSH: colon-before; :; echo POSIXSH: colon-after",
         "command -v echo",
         "which echo",
+
+        /* --- new POSIX features --- */
+
+        /* echo -n: suppress trailing newline */
+        "echo -n POSIXSH:; echo ' echo-n-ok'",
+
+        /* echo -e: escape interpretation */
+        "echo -e 'POSIXSH: echo-e-tab\\tok'",
+
+        /* ${10}+ positional params via set -- */
+        "set -- a b c d e f g h i j k",
+        "echo POSIXSH: pos10=${10}-pos11=${11}",
+
+        /* break n / continue n: test via script for nested loops */
+        "sh /data/posixsh_break_n.sh",
+        "sh /data/posixsh_cont_n.sh",
+
+        /* set -x: xtrace prints commands with + prefix */
+        "set -x",
+        "echo POSIXSH: xtrace-on",
+        "set +x",
+
+        /* set -e: errexit causes exit on error (tested in subshell) */
+        "sh -c 'set -e; false; echo POSIXSH: errexit-bad'",
+        "echo POSIXSH: errexit-status=$?",
+
+        /* set -u: nounset causes error on unset var */
+        "unset NOVAR_POSIX",
+        "sh -c 'set -u; echo $NOVAR_POSIX 2>/dev/null'",
+        "echo POSIXSH: nounset-status=$?",
+
+        /* $- shows current shell flags */
+        "sh /data/posixsh_dollar_dash.sh",
+
+        /* ~user expansion */
+        "echo POSIXSH: tilde-user=$(echo ~root)",
+
+        /* IFS word splitting */
+        "export IFS=:",
+        "V=a:b:c",
+        "set -- $V",
+        "unset IFS",
+        "echo POSIXSH: ifs-split=$#-$1-$2-$3",
+
+        /* export -p produces re-importable output */
+        "export POSIXSH_EP=hello",
+        "sh /data/posixsh_exportp.sh",
+
+        /* set -- (no args) clears positional params */
+        "set -- a b c",
+        "set --",
+        "echo POSIXSH: setdash-count=$#",
+
+        /* trap '' SIG ignores (verify it sets the trap) */
+        "sh -c 'trap \"\" INT; trap'",
+        "trap - INT",
+
+        /* test -t checks fd is a terminal */
+        "test -t 0 && echo POSIXSH: test-t-ok",
+
+        /* test -L (symlink, should fail in our simple VFS) */
+        "test -L /bin/cat || echo POSIXSH: test-L-ok",
+
+        /* $'...' ANSI-C quoting */
+        "echo POSIXSH: ansic=$'hello\\tworld'",
+
+        /* $* joins with first char of IFS */
+        "set -- a b c",
+        "export IFS=,",
+        "echo POSIXSH: star-ifs=\"$*\"",
+        "unset IFS",
+
+        /* command -p runs command */
+        "command -p echo POSIXSH: cmd-p-ok",
+
+        /* arithmetic with bare variable names */
+        "X=10",
+        "Y=20",
+        "echo POSIXSH: arith-var=$((X+Y))",
+
+        /* arithmetic ternary */
+        "echo POSIXSH: arith-tern=$((1 ? 42 : 99))",
+
+        /* arithmetic assignment */
+        "Z=5",
+        "echo POSIXSH: arith-asgn=$((Z += 3))-$Z",
+
+        /* set -f disables globbing */
+        "set -f",
+        "echo POSIXSH: noglob=*.txt",
+        "set +f",
+
+        /* case with | pattern */
+        "case banana in apple|banana) echo POSIXSH: case-or-ok ;; *) echo POSIXSH: case-or-bad ;; esac",
+
+        /* unset -f removes functions */
+        "tempfn() { echo bad; }",
+        "unset -f tempfn",
+        "command -v tempfn || echo POSIXSH: unset-f-ok",
+
+        /* arithmetic hex/octal */
+        "echo POSIXSH: arith-hex=$((0xFF))",
+        "echo POSIXSH: arith-oct=$((010))",
+
+        /* arithmetic comma */
+        "echo POSIXSH: arith-comma=$((1, 2, 3))",
+
+        /* arithmetic pre-increment */
+        "Q=5",
+        "echo POSIXSH: arith-preinc=$((++Q))-$Q",
+
+        /* arithmetic post-increment */
+        "echo POSIXSH: arith-postinc=$((Q++))-$Q",
+
+        /* for x; do (implicit $@) */
+        "set -- p q r",
+        "sh -c 'for x; do echo POSIXSH: forimpl-$x; done' arg0 hello world",
+
+        /* printf %b */
+        "printf 'POSIXSH: printf-b=%b\\n' 'tab\\there'",
+
+        /* set -f noglob */
+        "set -f",
+        "echo POSIXSH: noglob2=*",
+        "set +f",
+
         "echo POSIXSH: done",
         0
     };
@@ -1056,6 +1278,50 @@ static void posix_shell_selftest(void) {
     if (hrc != VFS_OK) {
         kprintf("POSIXSH: heredoc-setup-failed %s\n", vfs_strerror(hrc));
     }
+
+    static const char read_heredoc_script[] =
+        "read A B <<DELIM\n"
+        "one two\n"
+        "DELIM\n"
+        "echo POSIXSH: read-heredoc-$A-$B\n";
+    hrc = vfs_write_all("/data/posixsh_read_heredoc.sh",
+                        read_heredoc_script, strlen(read_heredoc_script));
+    if (hrc != VFS_OK) {
+        kprintf("POSIXSH: read-heredoc-setup-failed %s\n", vfs_strerror(hrc));
+    }
+
+    static const char ifs_script[] =
+        "IFS=:\n"
+        "V=a:b:c\n"
+        "set -- $V\n"
+        "echo POSIXSH: ifs-split=$#-$1-$2-$3\n";
+    hrc = vfs_write_all("/data/posixsh_ifs.sh",
+                        ifs_script, strlen(ifs_script));
+
+    static const char dollar_dash_script[] =
+        "set -ex\n"
+        "echo POSIXSH: dollar-dash=$-\n";
+    hrc = vfs_write_all("/data/posixsh_dollar_dash.sh",
+                        dollar_dash_script, strlen(dollar_dash_script));
+
+    static const char exportp_script[] =
+        "export -p\n";
+    hrc = vfs_write_all("/data/posixsh_exportp.sh",
+                        exportp_script, strlen(exportp_script));
+
+    static const char break_n_script[] =
+        "R=\n"
+        "for i in 1 2; do for j in a b; do R=$R$i$j; break 2; done; done\n"
+        "echo POSIXSH: break2=$R\n";
+    hrc = vfs_write_all("/data/posixsh_break_n.sh",
+                        break_n_script, strlen(break_n_script));
+
+    static const char cont_n_script[] =
+        "R=\n"
+        "for i in 1 2; do for j in a b; do R=$R$i$j; continue 2; done; done\n"
+        "echo POSIXSH: cont2=$R\n";
+    hrc = vfs_write_all("/data/posixsh_cont_n.sh",
+                        cont_n_script, strlen(cont_n_script));
 
     kprintf("[boot] POSIXSH: starting shell compatibility smoke\n");
     for (int i = 0; lines[i]; i++) {
@@ -1993,7 +2259,8 @@ void _start(void) {
     /* Milestone 28C: arm the watchdog BEFORE pit_init so the very
      * first PIT tick can already feed it without crashing on g_ready=false. */
     wdog_init(WDOG_DEFAULT_TIMEOUT_MS);
-    pit_init(100);          /* via irq_install_isa(0, pit_irq) */
+    pit_init(1000);         /* 1000 Hz — 1ms tick for instant input response */
+    rtc_init();             /* read CMOS wall-clock time */
     kbd_init();             /* via irq_install_isa(1, kbd_irq) */
     sti();                  /* IF=1 -- IRQs can now reach the CPU */
     kprintf("[boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard, "
@@ -2054,6 +2321,9 @@ void _start(void) {
     virtio_gpu_register();  /* GPU: virtio-gpu (basic 2D); falls back to Limine FB */
     audio_hda_register();   /* M26F: HD Audio controller (M26A: stub probe only) */
     pci_bind_drivers();
+    devmgr_init();
+    devmgr_enumerate();
+    taskd_init();
     /* M23A: scan every disk we just discovered for a GPT. Each
      * non-empty entry becomes a BLK_CLASS_PARTITION device in the
      * registry, named "<disk>.pN" and tagged with its type GUID +
@@ -2072,11 +2342,13 @@ void _start(void) {
      * to read files. After this, vfs_open / vfs_opendir / vfs_read_all
      * all work, and user_load_and_run() can be passed VFS paths. */
     initrd_init();
+    procfs_init();   /* Phase 1 M1.5: mount /proc virtual filesystem */
     /* Milestone 28D: latch safe-mode state right after the initrd is
      * mounted (so /etc/safemode_now is readable) but BEFORE any
      * optional subsystem inits. From here on, safemode_active() is
      * the canonical "skip non-essential drivers" gate. */
     safemode_init();
+    module_init();
 
     /* Milestone 29A: hardware-discovery init. Caches CPUID-derived
      * fields (vendor / brand / family / features / cpu_count) into
@@ -2118,6 +2390,8 @@ void _start(void) {
     m35e_selftest();
     m35f_selftest();
 #endif
+
+    bcache_init();
 
     /* Probe the IDE primary master and mount its tobyfs at /data. Two
      * layouts are supported (milestone 20):
@@ -2698,13 +2972,45 @@ void _start(void) {
 
         installer_scan_modules();
         vfs_dump_mounts();
+
+        if (data_mounted) {
+            swap_init(TFS_TOTAL_BLOCKS * TFS_SECTORS_PER_BLOCK,
+                      SWAP_SLOT_COUNT * SWAP_SECTORS_PER_PAGE);
+        }
     }
+
+    /* Loadable kernel modules: scan /lib/modules/ for .ko files and
+     * load them. This runs after all filesystems are mounted so both
+     * initrd and /data paths are accessible. After loading, re-run
+     * pci_bind_drivers() so any newly registered PCI drivers from
+     * modules get a chance to probe unclaimed devices. */
+    {
+        int mod_count = module_load_all();
+        if (mod_count > 0) {
+            kprintf("[boot] re-running PCI bind pass for %d new module(s)\n",
+                    mod_count);
+            pci_bind_drivers();
+        }
+    }
+
     /* Process model + scheduler MUST come up before any proc_create
      * call. proc_init synthesizes pid 0 from this very boot context;
      * everything below is "running as pid 0". */
     proc_init();
     sched_init();
     signal_init();           /* milestone 8: SIGINT/SIGTERM + foreground tracking */
+    futex_init();            /* Phase 1 M1.1: futex wait/wake hash table */
+    shm_init();              /* Phase 1 M1.4: shared memory */
+    unix_socket_init();      /* Phase 1 M1.4: Unix domain sockets */
+    sysfs_init();            /* Phase 1 M1.5: sysfs virtual filesystem */
+    aslr_init();             /* Phase 7 M7.1: address space layout randomization */
+    hardening_init();        /* Phase 7 M7.2: SMEP/SMAP/NX enforcement */
+    page_fault_init();       /* Phase 1: COW + demand paging refcounts + vm_spaces */
+    aml_interp_init();       /* Phase 4: AML namespace + interpreter */
+    clipboard_init();        /* Phase 2 M2.7: system clipboard */
+    hidpi_init();            /* Phase 2 M2.6: HiDPI display scaling */
+    audio_engine_init();     /* Phase B: audio mixing + userland playback */
+    inotify_init_subsystem(); /* Phase 1 M1.5: file watching */
     user_first_run();        /* spawn /bin/hello as pid 1, wait, reap */
     /* M22 step 5: kick the BSP's LAPIC timer at 100 Hz BEFORE waking
      * the APs. The ISR (see apic_timer_isr in apic.c) just bumps
@@ -2886,6 +3192,15 @@ void _start(void) {
 
         mouse_init();
         gui_init();
+
+        /* Auto-enable GPU-accelerated compositor if VirtIO-GPU is active.
+         * This activates per-window dirty tracking, direct scanout for
+         * fullscreen windows, and triple buffering.  Falls back
+         * transparently if no GPU is present. */
+        if (virtio_gpu_present()) {
+            gui_set_compositor_mode(COMPOSITOR_GPU_ACCEL);
+        }
+
         term_init();
         banner();
     }
@@ -2915,6 +3230,8 @@ void _start(void) {
 
         if (net_ok) {
             kprintf("[boot] net_init OK; starting TCP services\n");
+            ipv6_init();
+            icmpv6_init();
             tcp_echo_init();
             tcp_shell_init();
             ssh_init();

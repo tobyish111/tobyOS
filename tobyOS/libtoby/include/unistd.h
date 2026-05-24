@@ -38,6 +38,34 @@ pid_t   getppid(void);
 int     chdir  (const char *path);
 char   *getcwd (char *buf, size_t cap);
 int     unlink (const char *path);
+int     pipe   (int fds[2]);
+int     rmdir  (const char *path);
+int     access (const char *path, int mode);
+int     truncate(const char *path, off_t length);
+int     ftruncate(int fd, off_t length);
+int     chmod  (const char *path, mode_t mode);
+int     chown  (const char *path, uid_t owner, gid_t group);
+int     rename (const char *oldpath, const char *newpath);
+int     link   (const char *oldpath, const char *newpath);
+int     symlink(const char *target, const char *linkpath);
+ssize_t readlink(const char *path, char *buf, size_t bufsiz);
+
+uid_t   getuid (void);
+uid_t   geteuid(void);
+gid_t   getgid (void);
+gid_t   getegid(void);
+
+/* Socket API (UDP only). */
+int     socket  (int domain, int type, int protocol);
+int     bind    (int sockfd, unsigned short port_be);
+ssize_t sendto  (int sockfd, const void *buf, size_t len,
+                 unsigned int dst_ip_be, unsigned short dst_port_be);
+ssize_t recvfrom(int sockfd, void *buf, size_t len, void *src_out);
+
+#define F_OK 0
+#define R_OK 4
+#define W_OK 2
+#define X_OK 1
 
 void   *sbrk   (long inc);
 int     brk    (void *addr);
@@ -47,24 +75,16 @@ int          usleep(unsigned int usecs);
 
 void    _exit  (int code) __attribute__((noreturn));
 
+pid_t   fork   (void);
+
 int     isatty (int fd);
 
 /* ---- exec family (Milestone 25C) ---------------------------------- *
  *
- * tobyOS does NOT have fork(), so the classic POSIX exec model
- * (replace this process's image) is approximated as
- *      pid = sys_spawn(...);
- *      sys_waitpid(pid, &status, 0);
- *      _exit(status);
- *
- * That is: the calling process spawns a child, waits for it, and
- * exits with the child's status. From the parent of *this* process
- * the result is indistinguishable from a real exec. The cost is one
- * extra PID slot during the lifetime of the child.
- *
- * On any failure (spawn returned -1, malloc failed building the
- * argv/envp arrays, ...) execv-family functions return -1 with errno
- * set; on success they DO NOT return. */
+ * The exec family replaces the current process image. Internally
+ * this is modelled as "spawn-then-wait-then-exit" for compatibility
+ * with programs that use the fork+exec pattern. From the parent's
+ * view, the calling process "becomes" the child. */
 int     execv  (const char *path, char *const argv[]);
 int     execvp (const char *file, char *const argv[]);
 int     execve (const char *path, char *const argv[], char *const envp[]);

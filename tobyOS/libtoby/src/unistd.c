@@ -235,3 +235,144 @@ int mkdir(const char *path, mode_t mode) {
     return (int)__toby_check(
         toby_sc2(ABI_SYS_MKDIR, (long)(uintptr_t)path, (long)mode));
 }
+
+/* ---- pipe ------------------------------------------------------- *
+ *
+ * The kernel's SYS_PIPE takes a pointer to an int[2] and fills it
+ * with [read_fd, write_fd]. Returns 0 on success, -1 on failure. */
+
+int pipe(int fds[2]) {
+    long rv = toby_sc1(ABI_SYS_PIPE, (long)(uintptr_t)fds);
+    return (int)__toby_check(rv);
+}
+
+/* ---- truncate / ftruncate --------------------------------------- *
+ *
+ * The kernel doesn't expose these yet -- stub with ENOSYS so linkers
+ * resolve the symbol and callers get a clean error. */
+
+int truncate(const char *path, off_t length) {
+    (void)path; (void)length;
+    errno = ENOSYS;
+    return -1;
+}
+
+int ftruncate(int fd, off_t length) {
+    (void)fd; (void)length;
+    errno = ENOSYS;
+    return -1;
+}
+
+/* ---- rmdir ------------------------------------------------------ *
+ *
+ * Maps to unlink for now (tobyfs doesn't distinguish dir removal). */
+
+int rmdir(const char *path) {
+    return (int)__toby_check(toby_sc1(ABI_SYS_UNLINK, (long)(uintptr_t)path));
+}
+
+/* ---- access ----------------------------------------------------- *
+ *
+ * Check file accessibility using stat() and permission bits. */
+
+int access(const char *pathname, int mode) {
+    struct stat st;
+    if (stat(pathname, &st) < 0) return -1;
+    if (mode == F_OK) return 0;
+    if ((mode & R_OK) && !(st.st_mode & 0444)) { errno = EACCES; return -1; }
+    if ((mode & W_OK) && !(st.st_mode & 0222)) { errno = EACCES; return -1; }
+    if ((mode & X_OK) && !(st.st_mode & 0111)) { errno = EACCES; return -1; }
+    return 0;
+}
+
+/* ---- chmod / chown ---------------------------------------------- */
+
+int chmod(const char *path, mode_t mode) {
+    return (int)__toby_check(
+        toby_sc2(ABI_SYS_CHMOD, (long)(uintptr_t)path, (long)mode));
+}
+
+int chown(const char *path, uid_t owner, gid_t group) {
+    return (int)__toby_check(
+        toby_sc3(ABI_SYS_CHOWN, (long)(uintptr_t)path, (long)owner, (long)group));
+}
+
+/* ---- rename ----------------------------------------------------- *
+ *
+ * No kernel rename syscall. Emulate with read-copy-write-unlink.
+ * Only works for regular files that fit in memory (64KB limit). */
+
+int rename(const char *oldpath, const char *newpath) {
+    struct stat st;
+    if (stat(oldpath, &st) < 0) return -1;
+    if ((st.st_mode & S_IFMT) == S_IFDIR) { errno = EISDIR; return -1; }
+
+    int src = open(oldpath, O_RDONLY);
+    if (src < 0) return -1;
+
+    int dst = open(newpath, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
+    if (dst < 0) { close(src); return -1; }
+
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(src, buf, sizeof(buf))) > 0) {
+        ssize_t w = write(dst, buf, (size_t)n);
+        if (w != n) { close(src); close(dst); return -1; }
+    }
+    close(src);
+    close(dst);
+    if (n < 0) return -1;
+    return unlink(oldpath);
+}
+
+/* ---- link / symlink / readlink ---------------------------------- *
+ *
+ * link() still stubs (hard links not implemented in tobyfs).
+ * symlink/readlink use the kernel's SYS_SYMLINK/SYS_READLINK. */
+
+int link(const char *oldpath, const char *newpath) {
+    (void)oldpath; (void)newpath;
+    errno = ENOSYS;
+    return -1;
+}
+
+int symlink(const char *target, const char *linkpath) {
+    return (int)__toby_check(
+        toby_sc2(ABI_SYS_SYMLINK, (long)(uintptr_t)target, (long)(uintptr_t)linkpath));
+}
+
+ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
+    return (ssize_t)__toby_check(
+        toby_sc3(ABI_SYS_READLINK, (long)(uintptr_t)path, (long)(uintptr_t)buf, (long)bufsiz));
+}
+
+/* ---- getuid / geteuid / getgid / getegid ------------------------ */
+
+uid_t getuid(void)  { return (uid_t)toby_sc0(ABI_SYS_GETUID); }
+uid_t geteuid(void) { return (uid_t)toby_sc0(ABI_SYS_GETUID); }
+gid_t getgid(void)  { return (gid_t)toby_sc0(ABI_SYS_GETGID); }
+gid_t getegid(void) { return (gid_t)toby_sc0(ABI_SYS_GETGID); }
+
+/* ---- socket API ------------------------------------------------- */
+
+int socket(int domain, int type, int protocol) {
+    (void)protocol;
+    return (int)__toby_check(toby_sc2(ABI_SYS_SOCKET, domain, type));
+}
+
+int bind(int sockfd, uint16_t port_be) {
+    return (int)__toby_check(toby_sc2(ABI_SYS_BIND, sockfd, port_be));
+}
+
+ssize_t sendto(int sockfd, const void *buf, size_t len,
+               uint32_t dst_ip_be, uint16_t dst_port_be) {
+    return (ssize_t)__toby_check(
+        toby_sc5(ABI_SYS_SENDTO, sockfd, (long)(uintptr_t)buf,
+                 (long)len, (long)dst_ip_be, (long)dst_port_be));
+}
+
+ssize_t recvfrom(int sockfd, void *buf, size_t len, void *src_out) {
+    return (ssize_t)__toby_check(
+        toby_sc4(ABI_SYS_RECVFROM, sockfd, (long)(uintptr_t)buf,
+                 (long)len, (long)(uintptr_t)src_out));
+}

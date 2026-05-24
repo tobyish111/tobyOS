@@ -34,4 +34,8 @@ void shell_poll(void);
  * Lines longer than the shell's editor buffer are rejected. */
 void shell_run_test_line(const char *line);
 
+/* Deliver an asynchronous signal to the shell (called from interrupt context
+ * or the signal subsystem). The trap handler will run at the next safe point. */
+void shell_deliver_signal(int sig);
+
 #endif /* TOBYOS_SHELL_H */

@@ -25,6 +25,7 @@ extern "C" {
 #define WTERMSIG(s)     (0)
 
 pid_t waitpid(pid_t pid, int *status_out, int flags);
+pid_t wait(int *wstatus);
 
 #ifdef __cplusplus
 }

@@ -44,6 +44,7 @@
 enum theme_id {
     THEME_CYBER = 0,
     THEME_BASIC = 1,
+    THEME_PLASMA = 2,   /* M37: KDE Plasma Breeze-dark inspired palette */
 };
 
 struct theme_palette {
@@ -143,6 +144,40 @@ struct theme_palette {
     int      corner_radius;
     int      spacing;
 };
+
+/* ---- Phase 2 M2.4: Fluent Design Theme State ----------------------- */
+
+/* Semantic colour roles for Fluent-style widgets. The theme_state
+ * structure maps each role to a concrete 0x00RRGGBB value and is
+ * switchable at runtime via SYS_THEME_SET. */
+struct theme_state {
+    uint32_t background;
+    uint32_t foreground;
+    uint32_t accent;
+    uint32_t border;
+    uint32_t button;
+    uint32_t input;
+    uint32_t hover;
+    uint32_t active;
+};
+
+/* Built-in presets. */
+#define THEME_MODE_DARK   0
+#define THEME_MODE_LIGHT  1
+
+/* Returns the current Fluent theme state (never NULL). */
+const struct theme_state *theme_fluent_active(void);
+
+/* Switch Fluent theme mode. Returns 0 on success, -1 on bad mode. */
+int theme_fluent_set(uint32_t mode);
+
+/* ---- Animation easing functions ------------------------------------ *
+ *
+ * Input/output in fixed-point [0.0, 1.0] mapped to [0, 256].
+ * t = linear progress 0..256, returns eased value 0..256. */
+int theme_ease_in(int t);
+int theme_ease_out(int t);
+int theme_ease_in_out(int t);
 
 /* ---- lifecycle ----------------------------------------------------- */
 

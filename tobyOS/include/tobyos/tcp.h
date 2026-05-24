@@ -4,9 +4,11 @@
  *   - Active open (client) and passive open (listen + accept).
  *   - 3-way handshake both directions; graceful FIN close; RST abort.
  *   - Cumulative ACKs, up to TCP_MAX_TX_PENDING data segments in flight
- *     (pipelined send), slow-start style cwnd cap.
- *   - Per-connection RTO with exponential backoff; RTT sampling on ACK
- *     (RFC 6298–style smoothing, simplified integers).
+ *     (pipelined send).
+ *   - Per-connection RTO with Jacobson/Karels RTT estimator (RFC 6298,
+ *     microsecond-precision internally, millisecond user API).
+ *   - Slow start + congestion avoidance (AIMD); fast retransmit on 3
+ *     duplicate ACKs (RFC 5681).
  *   - TIME_WAIT (~2 s) before freeing a closed connection slot.
  *   - IPv4 path MTU via ip.c fragmentation (MSS-sized TCP segments).
  *
@@ -14,9 +16,6 @@
  *   - No SACK, window scaling, or timestamps (20-byte TCP headers only).
  *   - Out-of-order data beyond one segment is not reassembled (peer
  *     retransmits after duplicate ACK).
- *   - No slow-start / congestion avoidance beyond a fixed cwnd ceiling.
- *   - listen() does not integrate with the UDP socket syscall layer yet;
- *     use tcp_listen/tcp_accept from kernel or shell test code.
  */
 
 #ifndef TOBYOS_TCP_H
@@ -85,5 +84,20 @@ void tcp_dump(void);
 
 tcp_state_t tcp_state(const struct tcp_conn *c);
 const char *tcp_state_name(tcp_state_t s);
+
+/* Jacobson/Karels RTT estimator (RFC 6298). */
+void tcp_rtt_update(struct tcp_conn *c, uint32_t measured_rtt_ms);
+
+/* Congestion-window increase on successful ACK (slow start or AIMD). */
+void tcp_congestion_on_ack(struct tcp_conn *c, uint32_t bytes_acked);
+
+/* Loss event: halve cwnd, set ssthresh (multiplicative decrease). */
+void tcp_congestion_on_loss(struct tcp_conn *c);
+
+/* Timer-driven retransmission check for all pending segments. */
+void tcp_retransmit_check(struct tcp_conn *c);
+
+/* Fast retransmit: triggered after 3 duplicate ACKs. */
+void tcp_fast_retransmit(struct tcp_conn *c);
 
 #endif /* TOBYOS_TCP_H */

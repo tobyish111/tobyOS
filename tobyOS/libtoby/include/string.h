@@ -40,6 +40,17 @@ char   *strstr (const char *hay, const char *needle);
 char   *strdup (const char *s);
 char   *strndup(const char *s, size_t n);
 
+char   *strtok (char *s, const char *delim);
+char   *strtok_r(char *s, const char *delim, char **saveptr);
+int     strcoll(const char *a, const char *b);
+int     strcasecmp (const char *a, const char *b);
+int     strncasecmp(const char *a, const char *b, size_t n);
+
+size_t  strspn (const char *s, const char *accept);
+size_t  strcspn(const char *s, const char *reject);
+char   *strpbrk(const char *s, const char *accept);
+char   *stpcpy (char *dst, const char *src);
+
 #ifdef __cplusplus
 }
 #endif

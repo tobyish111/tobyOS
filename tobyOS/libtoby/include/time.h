@@ -25,10 +25,30 @@ struct timespec {
     long   tv_nsec;
 };
 
-clock_t clock(void);
-time_t  time(time_t *t);
-int     nanosleep(const struct timespec *req, struct timespec *rem);
-int     clock_gettime(int clk, struct timespec *ts);
+struct tm {
+    int tm_sec;
+    int tm_min;
+    int tm_hour;
+    int tm_mday;
+    int tm_mon;
+    int tm_year;
+    int tm_wday;
+    int tm_yday;
+    int tm_isdst;
+};
+
+clock_t    clock(void);
+time_t     time(time_t *t);
+int        nanosleep(const struct timespec *req, struct timespec *rem);
+int        clock_gettime(int clk, struct timespec *ts);
+double     difftime(time_t end, time_t start);
+struct tm *gmtime(const time_t *tp);
+struct tm *gmtime_r(const time_t *tp, struct tm *result);
+struct tm *localtime(const time_t *tp);
+struct tm *localtime_r(const time_t *tp, struct tm *result);
+time_t     mktime(struct tm *tm);
+size_t     strftime(char *s, size_t maxsize, const char *fmt,
+                    const struct tm *tm);
 
 #ifdef __cplusplus
 }

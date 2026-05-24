@@ -245,7 +245,11 @@ void *kcalloc(size_t count, size_t size) {
     size_t total = count * size;
     if (size != 0 && total / size != count) return 0;
     void *p = kmalloc(total);
-    if (p) memset(p, 0, total);
+    if (p) {
+        block_hdr_t *hdr = (block_hdr_t *)((uint8_t *)p - sizeof(block_hdr_t));
+        size_t payload = (hdr->size & SIZE_MASK) - sizeof(block_hdr_t);
+        memset(p, 0, payload);
+    }
     return p;
 }
 

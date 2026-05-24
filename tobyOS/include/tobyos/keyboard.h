@@ -28,6 +28,7 @@ uint64_t kbd_irqs_total(void);
 bool     kbd_caps_state(void);
 bool     kbd_shift_state(void);
 bool     kbd_ctrl_state(void);
+bool     kbd_alt_state(void);
 uint8_t  kbd_last_scancode(void);
 
 #endif /* TOBYOS_KEYBOARD_H */

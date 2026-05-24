@@ -57,4 +57,77 @@ void virtio_gpu_install_backend(void);
  * the regression-table-friendly "[virtio-gpu] backend active" line. */
 bool virtio_gpu_present(void);
 
+/* VirGL 3D support (Phase 3 foundation) */
+bool virtio_gpu_virgl_available(void);
+int  virtio_gpu_ctx_create(uint32_t ctx_id, const char *debug_name);
+void virtio_gpu_ctx_destroy(uint32_t ctx_id);
+int  virtio_gpu_submit_3d(uint32_t ctx_id, const void *cmd_buf, uint32_t cmd_size);
+
+/* ---- Per-window GPU resource API --------------------------------
+ *
+ * Each GUI window can own a VirtIO-GPU 2D resource backed by physically
+ * contiguous PMM pages.  The compositor uses these for:
+ *
+ *   - Per-window dirty tracking: only transfer changed window regions.
+ *   - Direct-to-scanout: a fullscreen top window's resource can replace
+ *     the compositor scanout, skipping the CPU blit entirely.
+ *
+ * Resource IDs are bump-allocated starting above the scanout + cursor
+ * IDs so there is no collision.  All functions are no-ops when no
+ * VirtIO-GPU is bound (safe on Limine-only machines).
+ */
+
+/* Allocate a 2D resource (BGRX) + PMM backing for a window.  Returns
+ * the resource ID (>0) on success, 0 on failure.  *backing_out receives
+ * the HHDM virtual pointer, *phys_out the physical address. */
+uint32_t virtio_gpu_create_window_resource(uint32_t width, uint32_t height,
+                                           void **backing_out,
+                                           uint64_t *phys_out);
+
+/* Destroy a window resource: detach backing, unref the resource, free
+ * the PMM pages.  Safe to call with resource_id == 0 (no-op). */
+void virtio_gpu_destroy_window_resource(uint32_t resource_id,
+                                        uint64_t backing_phys,
+                                        size_t   backing_bytes);
+
+/* Transfer a window's backing to the host resource (TRANSFER_TO_HOST_2D
+ * over the full surface).  Caller has already copied fresh pixels into
+ * the backing. */
+void virtio_gpu_transfer_window(uint32_t resource_id,
+                                uint32_t width, uint32_t height);
+
+/* Direct-scanout: point scanout 0 at `resource_id` instead of the
+ * compositor's global resource.  Returns true on success. */
+bool virtio_gpu_set_scanout_resource(uint32_t resource_id,
+                                     uint32_t width, uint32_t height);
+
+/* Restore scanout 0 to the compositor's global resource. */
+void virtio_gpu_restore_scanout(void);
+
+/* Flush a window resource to the display (RESOURCE_FLUSH). */
+void virtio_gpu_flush_window(uint32_t resource_id,
+                             uint32_t width, uint32_t height);
+
+/* ---- Hardware cursor API ----------------------------------------
+ *
+ * The virtio-gpu cursor plane (VQ 1) provides tear-free, zero-copy
+ * cursor movement on the host display. When available, the compositor
+ * should prefer this over software-rendered cursors.
+ */
+
+/* Returns true if a hardware cursor is available and currently active. */
+bool virtio_gpu_hw_cursor_available(void);
+
+/* Upload a new cursor image (64x64 ARGB pixels, row-major) and set
+ * the hotspot. Pass NULL for pixels_64x64 to re-upload the current
+ * backing (e.g. after modifying it in place). */
+void virtio_gpu_hw_cursor_update(const uint32_t *pixels_64x64,
+                                 int hot_x, int hot_y);
+
+/* Move the hardware cursor to screen coordinates (x, y). */
+void virtio_gpu_hw_cursor_move(int x, int y);
+
+/* Hide the hardware cursor (disable the cursor plane). */
+void virtio_gpu_hw_cursor_hide(void);
+
 #endif /* TOBYOS_VIRTIO_GPU_H */

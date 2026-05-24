@@ -28,10 +28,39 @@
 #include <tobyos/http.h>
 #include <tobyos/dns.h>
 #include <tobyos/tcp.h>
+#include <tobyos/tls.h>
 #include <tobyos/net.h>
 #include <tobyos/heap.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+
+/* Transport abstraction: either raw TCP or TLS-wrapped TCP. */
+struct http_transport {
+    struct tcp_conn *tcp;      /* non-NULL for plain HTTP */
+    struct tls_conn *tls;      /* non-NULL for HTTPS */
+    uint32_t timeout_ms;
+};
+
+static long transport_send(struct http_transport *t, const void *buf, size_t len) {
+    if (t->tls) return tls_send(t->tls, buf, len);
+    return tcp_send(t->tcp, buf, len);
+}
+
+static long transport_recv(struct http_transport *t, void *buf, size_t cap) {
+    if (t->tls) {
+        long r = tls_recv(t->tls, buf, cap, t->timeout_ms);
+        if (r == 0 || r == TLS_ERR_CLOSED) return -1;  /* map to EOF */
+        if (r == TLS_ERR_RECV) return 0;                /* map to timeout */
+        if (r < 0) return -2;                           /* map to reset */
+        return r;
+    }
+    return tcp_recv(t->tcp, buf, cap, t->timeout_ms);
+}
+
+static void transport_close(struct http_transport *t) {
+    if (t->tls) { tls_close(t->tls); t->tls = NULL; }
+    else if (t->tcp) { tcp_close(t->tcp); t->tcp = NULL; }
+}
 
 /* ---- tiny ASCII helpers (kept local; klibc.h is intentionally small) - */
 
@@ -111,8 +140,16 @@ int http_parse_url(const char *url, struct http_url *out) {
     if (!url || !out) return HTTP_ERR_URL;
     memset(out, 0, sizeof(*out));
 
-    if (!ascii_starts_with_ci(url, "http://")) return HTTP_ERR_URL;
-    const char *p = url + 7;                /* skip scheme */
+    const char *p;
+    if (ascii_starts_with_ci(url, "https://")) {
+        out->tls = 1;
+        p = url + 8;
+    } else if (ascii_starts_with_ci(url, "http://")) {
+        out->tls = 0;
+        p = url + 7;
+    } else {
+        return HTTP_ERR_URL;
+    }
 
     /* Reject userinfo (we don't implement it). */
     for (const char *q = p; *q && *q != '/' && *q != '#'; q++) {
@@ -131,7 +168,7 @@ int http_parse_url(const char *url, struct http_url *out) {
     p = host_end;
 
     /* Optional :port */
-    out->port = 80;
+    out->port = out->tls ? 443 : 80;
     if (*p == ':') {
         p++;
         size_t consumed = 0;
@@ -289,6 +326,7 @@ static int parse_headers(const char *base, size_t len,
     *out_content_len = -1;
     *out_chunked     = false;
     out->content_type[0] = 0;
+    out->location[0] = 0;
 
     while (len > 0) {
         size_t line_len = 0;
@@ -328,6 +366,11 @@ static int parse_headers(const char *base, size_t len,
             if (cl >= sizeof(out->content_type)) cl = sizeof(out->content_type) - 1;
             memcpy(out->content_type, base + v_off, cl);
             out->content_type[cl] = 0;
+        } else if (colon == 8 && ascii_strncasecmp(base, "Location", 8) == 0) {
+            size_t cl = v_len;
+            if (cl >= sizeof(out->location)) cl = sizeof(out->location) - 1;
+            memcpy(out->location, base + v_off, cl);
+            out->location[cl] = 0;
         }
 
         size_t advance = (size_t)((eol + 2) - base);
@@ -380,6 +423,7 @@ void http_free(struct http_response *r) {
     r->status = 0;
     r->reason[0] = 0;
     r->content_type[0] = 0;
+    r->location[0] = 0;
 }
 
 int http_get(const char *url,
@@ -417,31 +461,43 @@ int http_get(const char *url,
                 u.host, ip[0], ip[1], ip[2], ip[3], u.port, u.path);
     }
 
-    /* 3. TCP connect. */
-    struct tcp_conn *c = tcp_connect(ip_be, htons(u.port), 3000);
-    if (!c) {
-        kprintf("[http] tcp_connect to %s:%u failed\n", u.host, u.port);
-        return HTTP_ERR_CONNECT;
+    /* 3. Connect (plain TCP or TLS). */
+    struct http_transport tr = { .tcp = NULL, .tls = NULL, .timeout_ms = timeout_ms };
+
+    if (u.tls) {
+        int tls_err;
+        tr.tls = tls_connect(ip_be, htons(u.port), u.host, timeout_ms, &tls_err);
+        if (!tr.tls) {
+            kprintf("[http] TLS connect to %s:%u failed: %s\n",
+                    u.host, u.port, tls_strerror(tls_err));
+            return HTTP_ERR_CONNECT;
+        }
+    } else {
+        tr.tcp = tcp_connect(ip_be, htons(u.port), 3000);
+        if (!tr.tcp) {
+            kprintf("[http] tcp_connect to %s:%u failed\n", u.host, u.port);
+            return HTTP_ERR_CONNECT;
+        }
     }
 
     /* 4. Build + send request. */
     char  reqbuf[768];
     long  reqlen = build_request(&u, reqbuf, sizeof(reqbuf));
     if (reqlen <= 0) {
-        tcp_close(c);
+        transport_close(&tr);
         return HTTP_ERR_URL;
     }
-    long sent = tcp_send(c, reqbuf, (size_t)reqlen);
+    long sent = transport_send(&tr, reqbuf, (size_t)reqlen);
     if (sent != reqlen) {
-        kprintf("[http] tcp_send returned %ld (wanted %ld)\n", sent, reqlen);
-        tcp_close(c);
+        kprintf("[http] send returned %ld (wanted %ld)\n", sent, reqlen);
+        transport_close(&tr);
         return HTTP_ERR_RESET;
     }
 
     /* 5. Read into a growing buffer until we see \r\n\r\n. */
     size_t   hdr_cap   = 1024;
     uint8_t *buf       = (uint8_t *)kmalloc(hdr_cap);
-    if (!buf) { tcp_close(c); return HTTP_ERR_NOMEM; }
+    if (!buf) { transport_close(&tr); return HTTP_ERR_NOMEM; }
     size_t   buf_used  = 0;
     size_t   header_end = 0;
     bool     peer_fin  = false;
@@ -452,14 +508,14 @@ int http_get(const char *url,
             if (new_cap > HTTP_MAX_HEADER_BYTES) new_cap = HTTP_MAX_HEADER_BYTES;
             if (new_cap == hdr_cap) {
                 /* Already at the cap and still no \r\n\r\n -- fail. */
-                kfree(buf); tcp_close(c);
+                kfree(buf); transport_close(&tr);
                 return HTTP_ERR_PROTOCOL;
             }
             uint8_t *nb = grow_buf(buf, buf_used, new_cap);
-            if (!nb) { kfree(buf); tcp_close(c); return HTTP_ERR_NOMEM; }
+            if (!nb) { kfree(buf); transport_close(&tr); return HTTP_ERR_NOMEM; }
             buf = nb; hdr_cap = new_cap;
         }
-        long n = tcp_recv(c, buf + buf_used, hdr_cap - buf_used, timeout_ms);
+        long n = transport_recv(&tr, buf + buf_used, hdr_cap - buf_used);
         if (n > 0) {
             buf_used += (size_t)n;
             header_end = find_header_end(buf, buf_used);
@@ -467,22 +523,22 @@ int http_get(const char *url,
             continue;
         }
         if (n == -1) { peer_fin = true; break; }   /* clean EOF */
-        if (n == -2) { kfree(buf); tcp_close(c); return HTTP_ERR_RESET; }
-        if (n == 0)  { kfree(buf); tcp_close(c); return HTTP_ERR_TIMEOUT; }
-        kfree(buf); tcp_close(c); return HTTP_ERR_PROTOCOL;
+        if (n == -2) { kfree(buf); transport_close(&tr); return HTTP_ERR_RESET; }
+        if (n == 0)  { kfree(buf); transport_close(&tr); return HTTP_ERR_TIMEOUT; }
+        kfree(buf); transport_close(&tr); return HTTP_ERR_PROTOCOL;
     }
     if (header_end == 0) {
-        kfree(buf); tcp_close(c);
+        kfree(buf); transport_close(&tr);
         return HTTP_ERR_PROTOCOL;             /* peer closed before headers */
     }
 
     /* 6. Parse status line + headers. */
     size_t status_line_len = 0;
     const char *eol = find_line((const char *)buf, header_end, &status_line_len);
-    if (!eol) { kfree(buf); tcp_close(c); return HTTP_ERR_PROTOCOL; }
+    if (!eol) { kfree(buf); transport_close(&tr); return HTTP_ERR_PROTOCOL; }
 
     int rc = parse_status_line((const char *)buf, status_line_len, out);
-    if (rc != 0) { kfree(buf); tcp_close(c); return rc; }
+    if (rc != 0) { kfree(buf); transport_close(&tr); return rc; }
 
     const char *headers_base = (const char *)buf + status_line_len + 2;
     /* `header_end - 2` because the trailing \r\n\r\n: parse_headers
@@ -492,10 +548,10 @@ int http_get(const char *url,
     long content_len = -1;
     bool chunked     = false;
     rc = parse_headers(headers_base, headers_len, &content_len, &chunked, out);
-    if (rc != 0) { kfree(buf); tcp_close(c); return rc; }
+    if (rc != 0) { kfree(buf); transport_close(&tr); return rc; }
     if (chunked) {
         kprintf("[http] response uses chunked encoding (unsupported)\n");
-        kfree(buf); tcp_close(c);
+        kfree(buf); transport_close(&tr);
         return HTTP_ERR_CHUNKED;
     }
 
@@ -516,12 +572,12 @@ int http_get(const char *url,
         if ((size_t)content_len > max_body_bytes) {
             kprintf("[http] Content-Length %ld > max %lu\n",
                     content_len, (unsigned long)max_body_bytes);
-            kfree(buf); tcp_close(c);
+            kfree(buf); transport_close(&tr);
             return HTTP_ERR_TOOBIG;
         }
         body_cap = (size_t)content_len;
         body = (uint8_t *)kmalloc(body_cap > 0 ? body_cap : 1);
-        if (!body) { kfree(buf); tcp_close(c); return HTTP_ERR_NOMEM; }
+        if (!body) { kfree(buf); transport_close(&tr); return HTTP_ERR_NOMEM; }
         if (already > body_cap) already = body_cap;       /* guard */
         if (already > 0) memcpy(body, buf + header_end, already);
         body_len = already;
@@ -529,12 +585,12 @@ int http_get(const char *url,
         /* If we haven't already received the whole body and the peer
          * hasn't closed, keep pulling until full or error. */
         while (body_len < body_cap && !peer_fin) {
-            long n = tcp_recv(c, body + body_len, body_cap - body_len, timeout_ms);
+            long n = transport_recv(&tr, body + body_len, body_cap - body_len);
             if (n > 0) { body_len += (size_t)n; continue; }
             if (n == -1) { peer_fin = true; break; }
-            if (n == -2) { kfree(body); kfree(buf); tcp_close(c); return HTTP_ERR_RESET; }
-            if (n == 0)  { kfree(body); kfree(buf); tcp_close(c); return HTTP_ERR_TIMEOUT; }
-            kfree(body); kfree(buf); tcp_close(c); return HTTP_ERR_PROTOCOL;
+            if (n == -2) { kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_RESET; }
+            if (n == 0)  { kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_TIMEOUT; }
+            kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_PROTOCOL;
         }
         if (body_len < body_cap) {
             kprintf("[http] short body: got %lu of %lu (peer FIN early)\n",
@@ -543,7 +599,7 @@ int http_get(const char *url,
     } else {
         body_cap = (already > 0 ? already : 1024);
         body = (uint8_t *)kmalloc(body_cap);
-        if (!body) { kfree(buf); tcp_close(c); return HTTP_ERR_NOMEM; }
+        if (!body) { kfree(buf); transport_close(&tr); return HTTP_ERR_NOMEM; }
         if (already > 0) memcpy(body, buf + header_end, already);
         body_len = already;
 
@@ -554,25 +610,25 @@ int http_get(const char *url,
                 if (new_cap == body_cap) {
                     kprintf("[http] body exceeds max %lu bytes\n",
                             (unsigned long)max_body_bytes);
-                    kfree(body); kfree(buf); tcp_close(c);
+                    kfree(body); kfree(buf); transport_close(&tr);
                     return HTTP_ERR_TOOBIG;
                 }
                 uint8_t *nb = grow_buf(body, body_len, new_cap);
-                if (!nb) { kfree(body); kfree(buf); tcp_close(c); return HTTP_ERR_NOMEM; }
+                if (!nb) { kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_NOMEM; }
                 body = nb; body_cap = new_cap;
             }
-            long n = tcp_recv(c, body + body_len, body_cap - body_len, timeout_ms);
+            long n = transport_recv(&tr, body + body_len, body_cap - body_len);
             if (n > 0) { body_len += (size_t)n; continue; }
             if (n == -1) { peer_fin = true; break; }
-            if (n == -2) { kfree(body); kfree(buf); tcp_close(c); return HTTP_ERR_RESET; }
-            if (n == 0)  { kfree(body); kfree(buf); tcp_close(c); return HTTP_ERR_TIMEOUT; }
-            kfree(body); kfree(buf); tcp_close(c); return HTTP_ERR_PROTOCOL;
+            if (n == -2) { kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_RESET; }
+            if (n == 0)  { kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_TIMEOUT; }
+            kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_PROTOCOL;
         }
     }
 
     /* 8. Wrap up. */
     kfree(buf);
-    tcp_close(c);
+    transport_close(&tr);
 
     out->body     = body;
     out->body_len = body_len;

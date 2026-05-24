@@ -71,9 +71,13 @@
 #define VFS_MODE_VALID   0x10000u
 
 enum vfs_type {
-    VFS_TYPE_FILE = 1,
-    VFS_TYPE_DIR  = 2
+    VFS_TYPE_FILE    = 1,
+    VFS_TYPE_DIR     = 2,
+    VFS_TYPE_SYMLINK = 3
 };
+
+#define VFS_SYMLINK_MAX   8   /* max symlink hops before ELOOP */
+#define VFS_ERR_LOOP      -13 /* too many symlink hops */
 
 struct vfs_stat {
     enum vfs_type type;
@@ -228,6 +232,12 @@ int  vfs_read_all(const char *path, void **out_buf, size_t *out_size);
 
 /* Convenience: open(create-if-missing), write `n` bytes, close. */
 int  vfs_write_all(const char *path, const void *buf, size_t n);
+
+/* ---- symlink support (M1.5) ---- */
+
+int  vfs_symlink (const char *path, const char *target);
+int  vfs_readlink(const char *path, char *buf, size_t bufsz);
+int  vfs_resolve_path(const char *path, char *resolved, size_t resolved_sz);
 
 /* Pretty name for an error code (for diagnostics). */
 const char *vfs_strerror(int err);

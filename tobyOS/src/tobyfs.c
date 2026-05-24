@@ -3,15 +3,18 @@
  * Layout (matches include/tobyos/tobyfs.h verbatim and is shared with
  * tools/mkfs_tobyfs.c):
  *
- *   block 0       superblock
- *   block 1       inode bitmap   (1 bit / inode)
- *   block 2       data  bitmap   (1 bit / data block, includes meta blocks)
- *   blocks 3..10  inode table
- *   blocks 11..N  data blocks
+ *   block 0         superblock
+ *   block 1         inode bitmap   (1 bit / inode)
+ *   block 2         data  bitmap   (1 bit / data block, includes meta blocks)
+ *   blocks 3..10    inode table
+ *   blocks 11..991  data blocks
+ *   blocks 992..1023 write-ahead journal (32 blocks)
  *
- * Every metadata mutation is written back to disk synchronously --
- * there's no cache, no journal, no batching. It's slow but easy to
- * reason about: if a call returns success, the bytes are durable.
+ * Metadata-mutating operations (create, mkdir, unlink, write) are
+ * wrapped in write-ahead journal transactions so a crash mid-write
+ * can be recovered on the next mount. The journal lives in the last
+ * 32 blocks of the image and holds at most one active transaction
+ * (up to 16 unique blocks per txn).
  *
  * Path resolution is iterative: split on '/', look up each component
  * in the parent's data blocks (each containing TFS_DIRENTS_PER_BLOCK
@@ -21,6 +24,7 @@
 
 #include <tobyos/tobyfs.h>
 #include <tobyos/blk.h>
+#include <tobyos/bcache.h>
 #include <tobyos/vfs.h>
 #include <tobyos/heap.h>
 #include <tobyos/printk.h>
@@ -44,18 +48,194 @@ struct tobyfs {
      * after a mutation -- correctness over cleverness. */
     uint8_t                ibitmap[TFS_BLOCK_SIZE];
     uint8_t                dbitmap[TFS_BLOCK_SIZE];
+
+    /* Write-ahead journal state.  journal_start == 0 means the
+     * image was formatted without a journal (pre-journal disk). */
+    uint32_t               journal_start;
+    uint32_t               journal_size;
+    uint32_t               next_txn_id;
+    bool                   in_transaction;
+    int                    txn_count;
+    uint32_t               txn_blocks[TFS_TXN_MAX_BLOCKS];
+    uint8_t                txn_data[TFS_TXN_MAX_BLOCKS][TFS_BLOCK_SIZE];
 };
 
 /* -------- block I/O helpers (block N <-> sectors N*8 .. N*8+7) -------- */
 
 static int read_block(struct tobyfs *fs, uint32_t blk, void *buf) {
-    return blk_read(fs->dev, (uint64_t)blk * TFS_SECTORS_PER_BLOCK,
-                    TFS_SECTORS_PER_BLOCK, buf);
+    uint64_t lba = (uint64_t)blk * TFS_SECTORS_PER_BLOCK;
+    void *cached = bcache_get(fs->dev, lba);
+    if (!cached) return VFS_ERR_IO;
+    memcpy(buf, cached, TFS_BLOCK_SIZE);
+    bcache_release(fs->dev, lba);
+    return 0;
+}
+
+static int write_block_raw(struct tobyfs *fs, uint32_t blk, const void *buf) {
+    uint64_t lba = (uint64_t)blk * TFS_SECTORS_PER_BLOCK;
+    void *cached = bcache_get(fs->dev, lba);
+    if (!cached) return VFS_ERR_IO;
+    memcpy(cached, buf, TFS_BLOCK_SIZE);
+    bcache_mark_dirty(fs->dev, lba);
+    bcache_release(fs->dev, lba);
+    return 0;
+}
+
+/* Buffer a block write into the active transaction.  Deduplicates
+ * repeated writes to the same block (e.g. the data bitmap during a
+ * multi-block free) so a single txn slot is consumed. */
+static int journal_write(struct tobyfs *fs, uint32_t blk, const void *data) {
+    for (int i = 0; i < fs->txn_count; i++) {
+        if (fs->txn_blocks[i] == blk) {
+            memcpy(fs->txn_data[i], data, TFS_BLOCK_SIZE);
+            return 0;
+        }
+    }
+    if (fs->txn_count >= (int)TFS_TXN_MAX_BLOCKS)
+        return VFS_ERR_NOSPC;
+    fs->txn_blocks[fs->txn_count] = blk;
+    memcpy(fs->txn_data[fs->txn_count], data, TFS_BLOCK_SIZE);
+    fs->txn_count++;
+    return 0;
 }
 
 static int write_block(struct tobyfs *fs, uint32_t blk, const void *buf) {
-    return blk_write(fs->dev, (uint64_t)blk * TFS_SECTORS_PER_BLOCK,
-                     TFS_SECTORS_PER_BLOCK, buf);
+    if (fs->in_transaction)
+        return journal_write(fs, blk, buf);
+    return write_block_raw(fs, blk, buf);
+}
+
+/* -------- write-ahead journal -------- */
+
+static void journal_begin(struct tobyfs *fs) {
+    if (fs->journal_start == 0) return;
+    fs->in_transaction = true;
+    fs->txn_count = 0;
+    fs->next_txn_id++;
+}
+
+static void journal_abort(struct tobyfs *fs) {
+    fs->in_transaction = false;
+    fs->txn_count = 0;
+}
+
+/* Write the buffered transaction to the journal area, then checkpoint
+ * (replay) all blocks to their real destinations.  Uses blk_write()
+ * for journal I/O so the log is synchronous / durable before the
+ * checkpoint begins. */
+static int journal_commit(struct tobyfs *fs) {
+    if (!fs->in_transaction) return VFS_OK;
+    int count = fs->txn_count;
+    if (count == 0) { fs->in_transaction = false; return VFS_OK; }
+
+    uint8_t buf[TFS_BLOCK_SIZE];
+    uint32_t jbase = fs->journal_start + 1;  /* block after journal super */
+
+    /* 1. Write transaction header. */
+    memset(buf, 0, sizeof(buf));
+    struct tfs_txn_header *hdr = (struct tfs_txn_header *)buf;
+    hdr->magic       = TFS_TXN_BEGIN_MAGIC;
+    hdr->txn_id      = fs->next_txn_id;
+    hdr->block_count = (uint32_t)count;
+    for (int i = 0; i < count; i++)
+        hdr->dest_blocks[i] = fs->txn_blocks[i];
+
+    if (blk_write(fs->dev, (uint64_t)jbase * TFS_SECTORS_PER_BLOCK,
+                  TFS_SECTORS_PER_BLOCK, buf) != 0) {
+        journal_abort(fs);
+        return VFS_ERR_IO;
+    }
+
+    /* 2. Write data blocks into the journal. */
+    for (int i = 0; i < count; i++) {
+        uint64_t lba = (uint64_t)(jbase + 1 + (uint32_t)i) * TFS_SECTORS_PER_BLOCK;
+        if (blk_write(fs->dev, lba, TFS_SECTORS_PER_BLOCK,
+                      fs->txn_data[i]) != 0)
+            goto fail_clear;
+    }
+
+    /* 3. Write commit marker. */
+    memset(buf, 0, sizeof(buf));
+    struct tfs_txn_commit *cmt = (struct tfs_txn_commit *)buf;
+    cmt->magic  = TFS_TXN_COMMIT_MAGIC;
+    cmt->txn_id = fs->next_txn_id;
+    {
+        uint64_t lba = (uint64_t)(jbase + 1 + (uint32_t)count) * TFS_SECTORS_PER_BLOCK;
+        if (blk_write(fs->dev, lba, TFS_SECTORS_PER_BLOCK, buf) != 0)
+            goto fail_clear;
+    }
+
+    /* 4. Checkpoint: write every buffered block to its real location. */
+    for (int i = 0; i < count; i++)
+        (void)write_block_raw(fs, fs->txn_blocks[i], fs->txn_data[i]);
+
+    /* 5. Clear the journal header (marks txn as fully checkpointed). */
+    memset(buf, 0, sizeof(buf));
+    (void)blk_write(fs->dev, (uint64_t)jbase * TFS_SECTORS_PER_BLOCK,
+                    TFS_SECTORS_PER_BLOCK, buf);
+
+    fs->in_transaction = false;
+    fs->txn_count = 0;
+    return VFS_OK;
+
+fail_clear:
+    memset(buf, 0, sizeof(buf));
+    (void)blk_write(fs->dev, (uint64_t)jbase * TFS_SECTORS_PER_BLOCK,
+                    TFS_SECTORS_PER_BLOCK, buf);
+    journal_abort(fs);
+    return VFS_ERR_IO;
+}
+
+/* Scan the journal at mount time. If a committed-but-uncheckpointed
+ * transaction is found, replay it to the real destinations. */
+static void journal_recover(struct tobyfs *fs) {
+    if (fs->journal_start == 0) return;
+
+    uint8_t buf[TFS_BLOCK_SIZE];
+    uint32_t jbase = fs->journal_start + 1;
+
+    if (read_block(fs, jbase, buf) != 0) return;
+
+    struct tfs_txn_header *hdr = (struct tfs_txn_header *)buf;
+    if (hdr->magic != TFS_TXN_BEGIN_MAGIC) return;
+    if (hdr->block_count == 0 || hdr->block_count > TFS_TXN_MAX_BLOCKS)
+        goto clear;
+
+    /* Check for a matching commit marker. */
+    {
+        uint32_t cblk = jbase + 1 + hdr->block_count;
+        if (cblk >= fs->journal_start + fs->journal_size) goto clear;
+
+        uint8_t cbuf[TFS_BLOCK_SIZE];
+        if (read_block(fs, cblk, cbuf) != 0) goto clear;
+
+        struct tfs_txn_commit *cmt = (struct tfs_txn_commit *)cbuf;
+        if (cmt->magic != TFS_TXN_COMMIT_MAGIC ||
+            cmt->txn_id != hdr->txn_id)
+            goto clear;
+    }
+
+    kprintf("[tobyfs] journal: replaying txn %u (%u blocks)\n",
+            hdr->txn_id, hdr->block_count);
+    fs->next_txn_id = hdr->txn_id;
+
+    for (uint32_t i = 0; i < hdr->block_count; i++) {
+        uint8_t data[TFS_BLOCK_SIZE];
+        if (read_block(fs, jbase + 1 + i, data) != 0) {
+            kprintf("[tobyfs] journal: read failed at journal blk %u\n",
+                    jbase + 1 + i);
+            break;
+        }
+        if (write_block_raw(fs, hdr->dest_blocks[i], data) != 0) {
+            kprintf("[tobyfs] journal: replay write failed at blk %u\n",
+                    hdr->dest_blocks[i]);
+            break;
+        }
+    }
+
+clear:
+    memset(buf, 0, sizeof(buf));
+    (void)write_block_raw(fs, jbase, buf);
 }
 
 /* -------- bitmap helpers (operate on the in-memory copy + flush) -------- */
@@ -92,7 +272,8 @@ static int free_inode(struct tobyfs *fs, uint32_t ino) {
 }
 
 static int alloc_data_block(struct tobyfs *fs, uint32_t *out_blk) {
-    for (uint32_t b = fs->sb.data_blk_start; b < fs->sb.total_blocks; b++) {
+    uint32_t limit = fs->journal_start ? fs->journal_start : fs->sb.total_blocks;
+    for (uint32_t b = fs->sb.data_blk_start; b < limit; b++) {
         if (!bit_get(fs->dbitmap, b)) {
             bit_set(fs->dbitmap, b);
             int rc = write_block(fs, fs->sb.data_bitmap_blk, fs->dbitmap);
@@ -115,7 +296,8 @@ static int alloc_data_block(struct tobyfs *fs, uint32_t *out_blk) {
 }
 
 static int free_data_block(struct tobyfs *fs, uint32_t blk) {
-    if (blk < fs->sb.data_blk_start || blk >= fs->sb.total_blocks) {
+    uint32_t limit = fs->journal_start ? fs->journal_start : fs->sb.total_blocks;
+    if (blk < fs->sb.data_blk_start || blk >= limit) {
         return VFS_ERR_INVAL;
     }
     bit_clear(fs->dbitmap, blk);
@@ -387,6 +569,47 @@ static int tobyfs_close(struct vfs_file *f) {
     return VFS_OK;
 }
 
+/* -------- indirect-block helpers -------- */
+
+static uint32_t get_block_for_index(struct tobyfs *fs, struct tfs_inode_disk *node,
+                                     uint32_t didx) {
+    if (didx < TFS_NDIRECT) {
+        return node->direct[didx];
+    }
+    if (node->indirect == 0) return 0;
+    uint32_t ioff = didx - TFS_NDIRECT;
+    if (ioff >= TFS_INDIRECT_ENTRIES) return 0;
+
+    uint8_t ibuf[TFS_BLOCK_SIZE];
+    if (read_block(fs, node->indirect, ibuf) != 0) return 0;
+    uint32_t *entries = (uint32_t *)ibuf;
+    return entries[ioff];
+}
+
+static int set_block_for_index(struct tobyfs *fs, struct tfs_inode_disk *node,
+                                uint32_t didx, uint32_t blk_num) {
+    if (didx < TFS_NDIRECT) {
+        node->direct[didx] = blk_num;
+        return 0;
+    }
+    uint32_t ioff = didx - TFS_NDIRECT;
+    if (ioff >= TFS_INDIRECT_ENTRIES) return -1;
+
+    if (node->indirect == 0) {
+        uint32_t iblk;
+        int rc = alloc_data_block(fs, &iblk);
+        if (rc != VFS_OK) return rc;
+        node->indirect = iblk;
+    }
+
+    uint8_t ibuf[TFS_BLOCK_SIZE];
+    if (read_block(fs, node->indirect, ibuf) != 0) return VFS_ERR_IO;
+    uint32_t *entries = (uint32_t *)ibuf;
+    entries[ioff] = blk_num;
+    if (write_block(fs, node->indirect, ibuf) != 0) return VFS_ERR_IO;
+    return 0;
+}
+
 static long tobyfs_read(struct vfs_file *f, void *buf, size_t n) {
     struct tobyfs *fs = (struct tobyfs *)f->mnt;
     struct tobyfs_handle *h = (struct tobyfs_handle *)f->priv;
@@ -402,8 +625,7 @@ static long tobyfs_read(struct vfs_file *f, void *buf, size_t n) {
         size_t off    = f->pos + copied;
         uint32_t didx = (uint32_t)(off / TFS_BLOCK_SIZE);
         uint32_t bofs = (uint32_t)(off % TFS_BLOCK_SIZE);
-        if (didx >= TFS_NDIRECT) break;
-        uint32_t blk = h->node.direct[didx];
+        uint32_t blk = get_block_for_index(fs, &h->node, didx);
         if (blk == 0) {
             /* Sparse hole -- shouldn't happen on regular writes, but
              * be defensive: zero-fill. */
@@ -428,6 +650,8 @@ static long tobyfs_write(struct vfs_file *f, const void *buf, size_t n) {
     struct tobyfs_handle *h = (struct tobyfs_handle *)f->priv;
     if (!h) return VFS_ERR_INVAL;
 
+    journal_begin(fs);
+
     const uint8_t *in = (const uint8_t *)buf;
     size_t written = 0;
     uint8_t blkbuf[TFS_BLOCK_SIZE];
@@ -436,20 +660,23 @@ static long tobyfs_write(struct vfs_file *f, const void *buf, size_t n) {
         size_t off    = f->pos + written;
         uint32_t didx = (uint32_t)(off / TFS_BLOCK_SIZE);
         uint32_t bofs = (uint32_t)(off % TFS_BLOCK_SIZE);
-        if (didx >= TFS_NDIRECT) {
-            /* File would exceed 16 * 4 KiB = 64 KiB. Stop short and
-             * report what we did manage. */
-            break;
-        }
-        uint32_t blk = h->node.direct[didx];
+        uint32_t max_blocks = TFS_NDIRECT + TFS_INDIRECT_ENTRIES;
+        if (didx >= max_blocks) break;
+        uint32_t blk = get_block_for_index(fs, &h->node, didx);
         if (blk == 0) {
             int rc = alloc_data_block(fs, &blk);
             if (rc != VFS_OK) {
-                /* Persist whatever we wrote so far before bailing. */
                 if (written > 0) goto flush;
+                journal_abort(fs);
                 return rc;
             }
-            h->node.direct[didx] = blk;
+            rc = set_block_for_index(fs, &h->node, didx, blk);
+            if (rc != 0) {
+                (void)free_data_block(fs, blk);
+                if (written > 0) goto flush;
+                journal_abort(fs);
+                return VFS_ERR_IO;
+            }
         }
         size_t chunk = TFS_BLOCK_SIZE - bofs;
         if (chunk > n - written) chunk = n - written;
@@ -457,10 +684,18 @@ static long tobyfs_write(struct vfs_file *f, const void *buf, size_t n) {
             /* Whole-block overwrite: skip the read. */
             memcpy(blkbuf, in + written, TFS_BLOCK_SIZE);
         } else {
-            if (read_block(fs, blk, blkbuf) != 0) return VFS_ERR_IO;
+            if (read_block(fs, blk, blkbuf) != 0) {
+                if (written > 0) goto flush;
+                journal_abort(fs);
+                return VFS_ERR_IO;
+            }
             memcpy(blkbuf + bofs, in + written, chunk);
         }
-        if (write_block(fs, blk, blkbuf) != 0) return VFS_ERR_IO;
+        if (write_block(fs, blk, blkbuf) != 0) {
+            if (written > 0) goto flush;
+            journal_abort(fs);
+            return VFS_ERR_IO;
+        }
         written += chunk;
     }
 
@@ -470,6 +705,8 @@ flush:
         if (newend > h->node.size) h->node.size = (uint32_t)newend;
         h->node.mtime = (uint32_t)pit_ticks();
         int rc = write_inode(fs, h->ino, &h->node);
+        if (rc != VFS_OK) { journal_abort(fs); return rc; }
+        rc = journal_commit(fs);
         if (rc != VFS_OK) return rc;
         f->pos += written;
         f->size = h->node.size;
@@ -477,13 +714,25 @@ flush:
     }
 }
 
-/* Helper: free every direct block of an inode and zero them in-memory. */
 static void inode_free_blocks(struct tobyfs *fs, struct tfs_inode_disk *node) {
     for (uint32_t i = 0; i < TFS_NDIRECT; i++) {
         if (node->direct[i] != 0) {
             (void)free_data_block(fs, node->direct[i]);
             node->direct[i] = 0;
         }
+    }
+    if (node->indirect != 0) {
+        uint8_t ibuf[TFS_BLOCK_SIZE];
+        if (read_block(fs, node->indirect, ibuf) == 0) {
+            uint32_t *entries = (uint32_t *)ibuf;
+            for (uint32_t i = 0; i < TFS_INDIRECT_ENTRIES; i++) {
+                if (entries[i] != 0) {
+                    (void)free_data_block(fs, entries[i]);
+                }
+            }
+        }
+        (void)free_data_block(fs, node->indirect);
+        node->indirect = 0;
     }
 }
 
@@ -515,9 +764,11 @@ static int tobyfs_create(void *mnt, const char *path,
     }
     if (rc != VFS_ERR_NOENT) return rc;
 
+    journal_begin(fs);
+
     uint32_t ino;
     rc = alloc_inode(fs, &ino);
-    if (rc != VFS_OK) return rc;
+    if (rc != VFS_OK) { journal_abort(fs); return rc; }
 
     struct tfs_inode_disk node = {0};
     node.type  = TFS_TYPE_FILE;
@@ -528,14 +779,15 @@ static int tobyfs_create(void *mnt, const char *path,
     node.uid   = uid;
     node.gid   = gid;
     rc = write_inode(fs, ino, &node);
-    if (rc != VFS_OK) { (void)free_inode(fs, ino); return rc; }
+    if (rc != VFS_OK) { (void)free_inode(fs, ino); journal_abort(fs); return rc; }
 
     rc = dir_insert(fs, pino, &pnode, ino, leaf);
     if (rc != VFS_OK) {
         (void)free_inode(fs, ino);
+        journal_abort(fs);
         return rc;
     }
-    return VFS_OK;
+    return journal_commit(fs);
 }
 
 static int tobyfs_mkdir(void *mnt, const char *path,
@@ -556,9 +808,11 @@ static int tobyfs_mkdir(void *mnt, const char *path,
     if (rc == VFS_OK) return VFS_ERR_EXIST;
     if (rc != VFS_ERR_NOENT) return rc;
 
+    journal_begin(fs);
+
     uint32_t ino;
     rc = alloc_inode(fs, &ino);
-    if (rc != VFS_OK) return rc;
+    if (rc != VFS_OK) { journal_abort(fs); return rc; }
 
     struct tfs_inode_disk node = {0};
     node.type  = TFS_TYPE_DIR;
@@ -570,14 +824,15 @@ static int tobyfs_mkdir(void *mnt, const char *path,
     node.gid   = gid;
     /* Empty dir -- no data blocks until something's inserted. */
     rc = write_inode(fs, ino, &node);
-    if (rc != VFS_OK) { (void)free_inode(fs, ino); return rc; }
+    if (rc != VFS_OK) { (void)free_inode(fs, ino); journal_abort(fs); return rc; }
 
     rc = dir_insert(fs, pino, &pnode, ino, leaf);
     if (rc != VFS_OK) {
         (void)free_inode(fs, ino);
+        journal_abort(fs);
         return rc;
     }
-    return VFS_OK;
+    return journal_commit(fs);
 }
 
 static int tobyfs_chmod(void *mnt, const char *path, uint32_t mode) {
@@ -638,12 +893,16 @@ static int tobyfs_unlink(void *mnt, const char *path) {
         return VFS_ERR_INVAL;
     }
 
+    journal_begin(fs);
+
     inode_free_blocks(fs, &cnode);
     cnode.type = TFS_TYPE_FREE;
     cnode.size = 0;
     (void)write_inode(fs, cino, &cnode);
     (void)free_inode(fs, cino);
-    return dir_remove(fs, pino, &pnode, leaf);
+    rc = dir_remove(fs, pino, &pnode, leaf);
+    if (rc != VFS_OK) { journal_abort(fs); return rc; }
+    return journal_commit(fs);
 }
 
 /* -------- directory iteration --------
@@ -782,7 +1041,23 @@ int tobyfs_mount(const char *mount_point, struct blk_dev *dev) {
         kfree(fs);
         return VFS_ERR_INVAL;
     }
-    /* Cache both bitmaps in RAM for fast scan. */
+
+    /* Detect write-ahead journal from superblock reserved fields.
+     * Pre-journal images have reserved[0]==0 so journaling is silently
+     * disabled -- full backward compatibility. */
+    if (fs->sb.reserved[0] == TFS_JOURNAL_START &&
+        fs->sb.reserved[1] == TFS_JOURNAL_BLOCKS) {
+        fs->journal_start = TFS_JOURNAL_START;
+        fs->journal_size  = TFS_JOURNAL_BLOCKS;
+        journal_recover(fs);
+        kprintf("[tobyfs] journal enabled (blocks %u..%u)\n",
+                fs->journal_start,
+                fs->journal_start + fs->journal_size - 1);
+    }
+
+    /* Cache both bitmaps in RAM for fast scan.  This must happen AFTER
+     * journal recovery, which may have replayed writes to the bitmap
+     * blocks. */
     if (read_block(fs, fs->sb.inode_bitmap_blk, fs->ibitmap) != 0 ||
         read_block(fs, fs->sb.data_bitmap_blk,  fs->dbitmap) != 0) {
         kprintf("[tobyfs] bitmap read failed\n");
@@ -859,19 +1134,21 @@ int tobyfs_mount(const char *mount_point, struct blk_dev *dev) {
     }
 
     /* Quick stats print so the boot log shows the FS came up. */
+    uint32_t data_end = fs->journal_start ? fs->journal_start
+                                          : fs->sb.total_blocks;
     uint32_t used_inodes = 0, used_blocks = 0;
     for (uint32_t i = 1; i < fs->sb.inode_count; i++) {
         if (bit_get(fs->ibitmap, i)) used_inodes++;
     }
-    for (uint32_t b = fs->sb.data_blk_start; b < fs->sb.total_blocks; b++) {
+    for (uint32_t b = fs->sb.data_blk_start; b < data_end; b++) {
         if (bit_get(fs->dbitmap, b)) used_blocks++;
     }
     kprintf("[tobyfs] mounted '%s' on %s: %u/%u inodes, %u/%u data blocks "
             "(%u KiB free)\n",
             mount_point, dev->name,
             used_inodes, fs->sb.inode_count - 1,
-            used_blocks, fs->sb.total_blocks - fs->sb.data_blk_start,
-            (fs->sb.total_blocks - fs->sb.data_blk_start - used_blocks) * 4);
+            used_blocks, data_end - fs->sb.data_blk_start,
+            (data_end - fs->sb.data_blk_start - used_blocks) * 4);
     return VFS_OK;
 }
 
@@ -905,6 +1182,8 @@ int tobyfs_format(struct blk_dev *dev) {
         .data_blk_start   = TFS_DATA_BLK_START,
         .root_ino         = TFS_ROOT_INO,
     };
+    sb.reserved[0] = TFS_JOURNAL_START;
+    sb.reserved[1] = TFS_JOURNAL_BLOCKS;
     memcpy(blk, &sb, sizeof(sb));
     if (blk_write(dev, 0, TFS_SECTORS_PER_BLOCK, blk) != 0) return VFS_ERR_IO;
 
@@ -916,9 +1195,13 @@ int tobyfs_format(struct blk_dev *dev) {
                   TFS_SECTORS_PER_BLOCK, blk) != 0) return VFS_ERR_IO;
 
     /* Block 2: data bitmap. Metadata blocks 0..TFS_DATA_BLK_START-1
+     * and journal blocks TFS_JOURNAL_START..TFS_TOTAL_BLOCKS-1 are
      * marked as "used" so the allocator skips them. */
     memset(blk, 0, sizeof(blk));
     for (uint32_t b = 0; b < TFS_DATA_BLK_START; b++) {
+        blk[b >> 3] |= (uint8_t)(1u << (b & 7));
+    }
+    for (uint32_t b = TFS_JOURNAL_START; b < TFS_TOTAL_BLOCKS; b++) {
         blk[b >> 3] |= (uint8_t)(1u << (b & 7));
     }
     if (blk_write(dev,
@@ -949,9 +1232,13 @@ int tobyfs_format(struct blk_dev *dev) {
                       TFS_SECTORS_PER_BLOCK, blk) != 0) return VFS_ERR_IO;
     }
 
-    /* The data region is already zero-initialised on QEMU raw images
-     * (or was wiped when the installer wrote the bootable image into
-     * the preceding region -- neither touches this range). */
+    /* Zero the journal area so recovery never finds stale data. */
+    memset(blk, 0, sizeof(blk));
+    for (uint32_t b = TFS_JOURNAL_START; b < TFS_TOTAL_BLOCKS; b++) {
+        if (blk_write(dev, (uint64_t)b * TFS_SECTORS_PER_BLOCK,
+                      TFS_SECTORS_PER_BLOCK, blk) != 0) return VFS_ERR_IO;
+    }
+
     return VFS_OK;
 }
 
@@ -1133,6 +1420,41 @@ static int check_core(struct tobyfs *fs, struct tobyfs_check *out) {
                 check_record(out, TFS_CHECK_WARN,
                              "ino=%u direct[%u]=%u not set in dbitmap",
                              ino, i, db);
+            }
+        }
+
+        if (node.indirect != 0) {
+            if (node.indirect < fs->sb.data_blk_start ||
+                node.indirect >= fs->sb.total_blocks) {
+                check_record(out, TFS_CHECK_FATAL,
+                             "ino=%u indirect=%u OUT OF RANGE",
+                             ino, node.indirect);
+            } else {
+                if (!(dbm[node.indirect >> 3] &
+                      (uint8_t)(1u << (node.indirect & 7)))) {
+                    check_record(out, TFS_CHECK_WARN,
+                                 "ino=%u indirect=%u not set in dbitmap",
+                                 ino, node.indirect);
+                }
+                uint8_t indirect_buf[TFS_BLOCK_SIZE];
+                if (read_block(fs, node.indirect, indirect_buf) == 0) {
+                    uint32_t *ientries = (uint32_t *)indirect_buf;
+                    for (uint32_t ii = 0; ii < TFS_INDIRECT_ENTRIES; ii++) {
+                        uint32_t ib = ientries[ii];
+                        if (ib == 0) continue;
+                        if (ib < fs->sb.data_blk_start ||
+                            ib >= fs->sb.total_blocks) {
+                            check_record(out, TFS_CHECK_FATAL,
+                                         "ino=%u indirect[%u]=%u OUT OF RANGE",
+                                         ino, ii, ib);
+                        } else if (!(dbm[ib >> 3] &
+                                     (uint8_t)(1u << (ib & 7)))) {
+                            check_record(out, TFS_CHECK_WARN,
+                                         "ino=%u indirect[%u]=%u not set in dbitmap",
+                                         ino, ii, ib);
+                        }
+                    }
+                }
             }
         }
 

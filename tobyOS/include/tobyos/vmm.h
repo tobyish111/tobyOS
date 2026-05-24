@@ -111,4 +111,36 @@ void     vmm_destroy_user_pml4(uint64_t pml4_phys);
 uint64_t vmm_set_active_root(uint64_t pml4_phys);
 uint64_t vmm_set_editor_root(uint64_t pml4_phys);
 
+/* Return the HHDM base offset. */
+uint64_t vmm_hhdm_offset(void);
+
+/* ---- Phase 1 M1.2: mmap/munmap/mprotect ---- */
+
+/* VMA protection flags (matches Linux PROT_*) */
+#define MMAP_PROT_NONE   0x00
+#define MMAP_PROT_READ   0x01
+#define MMAP_PROT_WRITE  0x02
+#define MMAP_PROT_EXEC   0x04
+
+/* mmap flags */
+#define MMAP_FLAG_ANON    0x01
+#define MMAP_FLAG_SHARED  0x02
+#define MMAP_FLAG_PRIVATE 0x04
+#define MMAP_FLAG_FIXED   0x08
+
+/* Syscall implementations */
+long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
+              uint32_t flags, int fd, uint64_t offset);
+long sys_munmap(uint64_t addr, uint64_t len);
+long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot);
+
+/* Initialize VMA table for a new process */
+void mmap_init_proc(int pid);
+/* Clean up VMAs on process exit */
+void mmap_cleanup_proc(int pid);
+/* Handle page fault (demand paging / COW). Returns true if handled. */
+bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code);
+/* Clone VMAs for COW fork */
+int mmap_cow_clone(int parent_pid, int child_pid);
+
 #endif /* TOBYOS_VMM_H */

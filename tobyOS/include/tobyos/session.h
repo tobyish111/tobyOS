@@ -61,10 +61,11 @@ void session_init(void);
 
 /* Promote the system to "logged in as username". Bumps the session id,
  * persists the username via settings, and lets the login service stay
- * stopped until the next logout. Returns 0 on success, -1 on bad args.
- * Safe to call when already active -- treated as a re-login (id bumps,
- * existing session-tagged procs are NOT torn down). Used by SYS_LOGIN. */
-int session_login(const char *username);
+ * stopped until the next logout. Returns 0 on success, -1 on bad args
+ * or failed password check. Safe to call when already active -- treated
+ * as a re-login (id bumps, existing session-tagged procs are NOT torn
+ * down). Used by SYS_LOGIN. If password is NULL, treated as empty. */
+int session_login(const char *username, const char *password);
 
 /* Tear the active session down: SIGTERMs every PCB whose session_id
  * matches the current id (excluding pid 0), marks the session

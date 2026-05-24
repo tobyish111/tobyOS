@@ -87,6 +87,9 @@ typedef struct {
 #define R_X86_64_GLOB_DAT   6
 #define R_X86_64_JUMP_SLOT  7
 #define R_X86_64_RELATIVE   8
+#define R_X86_64_DTPMOD64  16
+#define R_X86_64_DTPOFF64  17
+#define R_X86_64_TPOFF64   18
 
 #define ELF64_R_TYPE(i)  ((uint32_t)((i) & 0xffffffff))
 #define ELF64_R_SYM(i)   ((uint32_t)((i) >> 32))

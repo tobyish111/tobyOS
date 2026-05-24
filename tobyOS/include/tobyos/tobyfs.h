@@ -5,12 +5,13 @@
  *   block  1       inode bitmap   (1 bit / inode, 256 inodes)
  *   block  2       data  bitmap   (1 bit / data block)
  *   blocks 3..10   inode table    (32 inodes / block * 8 = 256 inodes)
- *   blocks 11..1023 data blocks   (1013 user blocks)
+ *   blocks 11..991  data blocks   (981 user blocks)
+ *   blocks 992..1023 journal      (32 blocks, write-ahead log)
  *
  * Inode 0 is reserved (means "invalid"); inode 1 is always the root.
- * Files use direct block pointers only -- 16 of them, max file size
- * 64 KiB. No indirect blocks, no symlinks, no permissions. The
- * format is shared verbatim with tools/mkfs_tobyfs.c.
+ * Files use 16 direct block pointers (64 KiB) plus one single-indirect
+ * block pointer (~4 MiB max file size). No double-indirect, no
+ * symlinks. The format is shared verbatim with tools/mkfs_tobyfs.c.
  */
 
 #ifndef TOBYOS_TOBYFS_H
@@ -26,7 +27,9 @@
 #define TFS_INODE_SIZE     128u                   /* sizeof(tfs_inode_disk) */
 #define TFS_INODES_PER_BLOCK (TFS_BLOCK_SIZE / TFS_INODE_SIZE)
 #define TFS_INODE_BLOCKS   (TFS_INODE_COUNT / TFS_INODES_PER_BLOCK)
-#define TFS_NDIRECT        16u                    /* 16 * 4 KiB = 64 KiB max file */
+#define TFS_NDIRECT        16u                    /* 16 * 4 KiB = 64 KiB direct */
+#define TFS_INDIRECT_ENTRIES (TFS_BLOCK_SIZE / sizeof(uint32_t))  /* 1024 entries */
+#define TFS_MAX_FILE_SIZE    ((TFS_NDIRECT + TFS_INDIRECT_ENTRIES) * TFS_BLOCK_SIZE)
 #define TFS_NAME_MAX       55u                    /* fits in 56-byte slot incl. NUL */
 #define TFS_DIRENT_SIZE    64u
 #define TFS_DIRENTS_PER_BLOCK (TFS_BLOCK_SIZE / TFS_DIRENT_SIZE)
@@ -36,6 +39,15 @@
 #define TFS_DATA_BITMAP_BLK   2u
 #define TFS_INODE_TABLE_BLK   3u
 #define TFS_DATA_BLK_START    (TFS_INODE_TABLE_BLK + TFS_INODE_BLOCKS)  /* 11 */
+
+/* Write-ahead journal (last 32 blocks of the image). */
+#define TFS_JOURNAL_BLOCKS    32u
+#define TFS_JOURNAL_START     (TFS_TOTAL_BLOCKS - TFS_JOURNAL_BLOCKS)  /* 992 */
+#define TFS_USABLE_BLOCKS     TFS_JOURNAL_START                        /* 992 */
+
+#define TFS_TXN_BEGIN_MAGIC   0x4A4F5552U  /* "JOUR" */
+#define TFS_TXN_COMMIT_MAGIC  0x434F4D54U  /* "COMT" */
+#define TFS_TXN_MAX_BLOCKS    16u
 
 #define TFS_TYPE_FREE 0
 #define TFS_TYPE_FILE 1
@@ -94,13 +106,28 @@ struct tfs_inode_disk {
     uint32_t uid;                   /* owner user id */
     uint32_t gid;                   /* owner group id */
     uint32_t direct[TFS_NDIRECT];   /* 64 bytes */
-    uint8_t  pad[40];
+    uint32_t indirect;               /* single-indirect block pointer */
+    uint8_t  pad[36];
 };
 
 struct tfs_dirent_disk {
     uint32_t ino;        /* 0 == empty slot */
     uint32_t reserved;
     char     name[56];   /* NUL-terminated, max 55 chars + NUL */
+};
+
+/* On-disk journal header (first block of a transaction in the journal). */
+struct tfs_txn_header {
+    uint32_t magic;                          /* TFS_TXN_BEGIN_MAGIC */
+    uint32_t txn_id;
+    uint32_t block_count;
+    uint32_t dest_blocks[TFS_TXN_MAX_BLOCKS];
+};
+
+/* On-disk journal commit marker (follows the data blocks). */
+struct tfs_txn_commit {
+    uint32_t magic;                          /* TFS_TXN_COMMIT_MAGIC */
+    uint32_t txn_id;
 };
 
 struct blk_dev;
@@ -162,7 +189,7 @@ struct tobyfs_check {
 
 /* Run a structural check over a tobyfs image without mounting it.
  * Reads the superblock, both bitmaps, the inode table, and walks the
- * direct-block pointers of every allocated inode. Allocates ~12 KiB
+ * block pointers (direct + indirect) of every allocated inode. Allocates ~12 KiB
  * of scratch on the kernel heap for the duration of the call.
  *
  * Returns 0 on success (regardless of severity -- inspect result.severity).

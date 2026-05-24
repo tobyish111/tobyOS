@@ -24,6 +24,14 @@ pid_t waitpid(pid_t pid, int *status_out, int flags) {
     return (pid_t)__toby_check(rv);
 }
 
+pid_t wait(int *wstatus) {
+    return waitpid(-1, wstatus, 0);
+}
+
+pid_t fork(void) {
+    return (pid_t)__toby_check(toby_sc0(ABI_SYS_FORK));
+}
+
 /* Bonus: a tiny posix_spawn-flavoured helper. Not exported via a
  * header in M25B (M25C will add a proper <spawn.h>); samples and
  * future ports include the prototype themselves if they need it. */
@@ -143,6 +151,34 @@ int execvp(const char *file, char *const argv[]) {
 
 int system(const char *cmd) {
     if (!cmd) return 1;
+
+    /* If the command contains shell metacharacters, delegate to /bin/sh. */
+    int need_shell = 0;
+    for (const char *c = cmd; *c; c++) {
+        if (*c == '|' || *c == '>' || *c == '<' || *c == '&' ||
+            *c == ';' || *c == '(' || *c == ')' || *c == '$' ||
+            *c == '`' || *c == '*' || *c == '?') {
+            need_shell = 1;
+            break;
+        }
+    }
+    if (need_shell) {
+        char *sh_argv[4];
+        sh_argv[0] = "/bin/sh";
+        sh_argv[1] = "-c";
+        sh_argv[2] = (char *)cmd;
+        sh_argv[3] = 0;
+        pid_t pid = toby_spawn("/bin/sh", sh_argv, environ, 0, 0, 0);
+        if (pid < 0) {
+            /* Fallback: try without shell */
+            need_shell = 0;
+        } else {
+            int status = 0;
+            pid_t rc = waitpid(pid, &status, 0);
+            if (rc < 0) return -1;
+            return status;
+        }
+    }
 
     /* Duplicate cmd so we can tokenise in-place. */
     size_t clen = strlen(cmd);

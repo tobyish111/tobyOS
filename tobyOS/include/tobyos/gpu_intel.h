@@ -1,0 +1,152 @@
+/* gpu_intel.h -- Intel HD Graphics Gen 6+ modesetting for tobyOS.
+ *
+ * Supports Sandy Bridge (Gen 6), Ivy Bridge (Gen 7), Haswell (Gen 7.5)
+ * and later Intel integrated GPUs for native display output.
+ */
+
+#ifndef TOBYOS_GPU_INTEL_H
+#define TOBYOS_GPU_INTEL_H
+
+#include <tobyos/types.h>
+
+/* PCI device IDs we support */
+#define INTEL_HD2000  0x0102
+#define INTEL_HD3000  0x0116
+#define INTEL_HD4000  0x0162
+#define INTEL_HD4600  0x0412
+#define INTEL_HD530   0x1912
+#define INTEL_UHD620  0x3EA0
+#define INTEL_UHD630  0x3E92
+
+/* Register offsets (from MMIO base) */
+#define PIPE_A_CONF    0x70008
+#define PIPE_B_CONF    0x71008
+#define DPLL_A         0x06014
+#define DPLL_B         0x06018
+#define DPLL_A_MD      0x0601C
+#define DPLL_B_MD      0x06020
+#define FPA0           0x06040
+#define FPA1           0x06044
+#define FPB0           0x06048
+#define FPB1           0x0604C
+#define PLANE_A_CTRL   0x70180
+#define PLANE_A_ADDR   0x7019C
+#define PLANE_A_STRIDE 0x70188
+#define PLANE_A_SIZE   0x70190
+#define PLANE_A_SURF   0x7019C
+#define PLANE_A_OFFSET 0x701A4
+#define PLANE_B_CTRL   0x71180
+#define PLANE_B_ADDR   0x7119C
+#define PLANE_B_STRIDE 0x71188
+#define PLANE_B_SIZE   0x71190
+#define HTOTAL_A       0x60000
+#define HBLANK_A       0x60004
+#define HSYNC_A        0x60008
+#define VTOTAL_A       0x6000C
+#define VBLANK_A       0x60010
+#define VSYNC_A        0x60014
+#define PIPESRC_A      0x6001C
+#define HTOTAL_B       0x61000
+#define HBLANK_B       0x61004
+#define HSYNC_B        0x61008
+#define VTOTAL_B       0x6100C
+#define VBLANK_B       0x61010
+#define VSYNC_B        0x61014
+#define PIPESRC_B      0x6101C
+#define VGACNTRL       0x71400
+#define ADPA           0x61100
+#define HDMI_B         0x61140
+#define HDMI_C         0x61160
+#define DP_B           0x64100
+#define DP_C           0x64200
+#define DP_D           0x64300
+
+/* Pipe configuration bits */
+#define PIPE_CONF_ENABLE        (1u << 31)
+#define PIPE_CONF_STATE_ACTIVE  (1u << 30)
+#define PIPE_CONF_8BPC          (0u << 5)
+#define PIPE_CONF_10BPC         (1u << 5)
+#define PIPE_CONF_PROGRESSIVE   0
+
+/* DPLL bits */
+#define DPLL_VCO_ENABLE         (1u << 31)
+#define DPLL_REF_CLK_100MHZ     (0u << 13)
+#define DPLL_SDVO_HIGH_SPEED    (1u << 30)
+#define DPLL_MODE_LVDS          (2u << 26)
+#define DPLL_MODE_DAC_SERIAL    (1u << 26)
+
+/* Plane control bits */
+#define PLANE_ENABLE            (1u << 31)
+#define PLANE_FORMAT_XRGB8888   (6u << 26)
+#define PLANE_FORMAT_XBGR8888   (14u << 26)
+#define PLANE_TILING_NONE       0
+#define PLANE_TILING_X          (1u << 10)
+
+/* VGA control */
+#define VGA_DISABLE             (1u << 31)
+
+/* Cursor plane registers */
+#define CUR_A_CTL      0x70080
+#define CUR_A_BASE     0x70084
+#define CUR_A_POS      0x70088
+#define CUR_B_CTL      0x700C0
+#define CUR_B_BASE     0x700C4
+#define CUR_B_POS      0x700C8
+
+#define CUR_ENABLE             (1u << 5)
+#define CUR_FORMAT_ARGB        (1u << 5)  /* 64x64 ARGB cursor */
+#define CUR_MODE_64_ARGB       0x27
+
+/* GTT (Graphics Translation Table) */
+#define GTT_BASE               0x200000
+#define GTT_ENTRY_VALID        (1u << 0)
+#define GTT_ENTRY_LOCAL_MEM    0
+
+/* Interrupt registers */
+#define DEIMR          0x44004
+#define DEIER          0x4400C
+#define DEIIR          0x44008
+#define DEISR          0x44000
+#define DE_PIPE_A_VBLANK       (1u << 0)
+#define DE_PIPE_B_VBLANK       (1u << 5)
+
+/* Standard timing modes */
+struct intel_mode {
+    int width, height, hz;
+    uint32_t pixel_clock;   /* kHz */
+    int h_display, h_sync_start, h_sync_end, h_total;
+    int v_display, v_sync_start, v_sync_end, v_total;
+};
+
+struct intel_gpu {
+    volatile uint32_t *mmio;
+    uint64_t mmio_phys;
+    size_t mmio_size;
+    uint32_t *framebuffer;
+    uint64_t fb_phys;
+    size_t fb_size;
+    int width, height, stride;
+    int pipe;
+    int ready;
+    uint16_t device_id;
+    int gen;
+    int has_pch;
+    uint32_t *back_buffer;
+    uint64_t back_phys;
+};
+
+void     intel_gpu_modeset_init(void);
+int      intel_gpu_set_mode(int width, int height, int hz);
+int      intel_gpu_page_flip(uint64_t fb_phys_addr);
+void     intel_gpu_wait_vblank(void);
+uint32_t *intel_gpu_get_framebuffer(void);
+int      intel_gpu_detected(void);
+int      intel_gpu_get_width(void);
+int      intel_gpu_get_height(void);
+
+/* Hardware cursor support */
+void     intel_gpu_set_cursor(const uint32_t *image, int w, int h);
+void     intel_gpu_move_cursor(int x, int y);
+void     intel_gpu_hide_cursor(void);
+
+#endif /* TOBYOS_GPU_INTEL_H */

@@ -24,6 +24,7 @@
 #include <tobyos/net.h>
 #include <tobyos/arp.h>
 #include <tobyos/ip.h>
+#include <tobyos/ipv6.h>
 #include <tobyos/klibc.h>
 
 bool eth_send(const uint8_t dst_mac[ETH_ADDR_LEN],
@@ -75,8 +76,10 @@ void eth_recv(const void *frame, size_t len) {
     case ETH_TYPE_IPV4:
         ip_recv(pl, pln);
         break;
+    case ETH_TYPE_IPV6:
+        ipv6_recv(pl, pln);
+        break;
     default:
-        /* Drop quietly -- IPv6 multicast, LLDP, STP, etc. */
         break;
     }
 }

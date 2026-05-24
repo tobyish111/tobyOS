@@ -43,8 +43,9 @@ static inline tg_ssize_t sys_write(int fd, const void *buf, tg_size_t len) {
     return r;
 }
 static inline void sys_yield(void) {
+    long _dummy;
     __asm__ volatile ("syscall"
-        : : "a"((long)SYS_YIELD)
+        : "=a"(_dummy) : "0"((long)SYS_YIELD)
         : "rcx", "r11", "memory");
 }
 static inline int sys_gui_create(tg_uint32_t w, tg_uint32_t h, const char *title) {
@@ -134,6 +135,16 @@ static void tg_strcpy_capped(char *dst, const char *src, tg_size_t cap) {
 #define TG_COL_INPUT_BORDER 0x00324762u
 #define TG_COL_FOCUS_RING   0x0000E6FFu
 #define TG_COL_ACCENT_2     0x00FF36C8u
+#define TG_COL_CHECK_MARK   0x0000E6FFu
+#define TG_COL_PROGRESS_FG  0x0000B8CCu
+#define TG_COL_PROGRESS_BG  0x00081018u
+#define TG_COL_SEP          0x00324762u
+#define TG_COL_LIST_BG      0x00081018u
+#define TG_COL_LIST_SEL     0x001A3A56u
+#define TG_COL_LIST_FG      0x00DDEEFFu
+#define TG_COL_SCROLLBAR    0x00506878u
+
+#define TG_LIST_ITEM_H      16
 
 /* ---- forward decls ------------------------------------------------ */
 
@@ -147,7 +158,6 @@ static void dispatch_event(struct tg_app *app, const struct tg_event *ev);
 static struct tg_widget *alloc_widget(struct tg_app *app) {
     if (app->n_widgets >= TG_MAX_WIDGETS) return 0;
     struct tg_widget *w = &app->widgets[app->n_widgets++];
-    /* zero-init */
     char *p = (char *)w;
     for (tg_size_t i = 0; i < sizeof(*w); i++) p[i] = 0;
     return w;
@@ -189,6 +199,60 @@ struct tg_widget *tg_textinput(struct tg_app *app, int x, int y, int w, int h) {
     return wd;
 }
 
+int tg_checkbox(struct tg_app *app, int x, int y, int w, int h,
+                const char *label, int initial) {
+    struct tg_widget *wd = alloc_widget(app);
+    if (!wd) return -1;
+    int idx = app->n_widgets - 1;
+    wd->kind = TG_WIDGET_CHECKBOX;
+    wd->x = x; wd->y = y; wd->w = w; wd->h = h;
+    wd->focusable = 1;
+    wd->checked = initial ? 1 : 0;
+    tg_strcpy_capped(wd->text, label, TG_TEXT_MAX);
+    app->want_redraw = 1;
+    return idx;
+}
+
+int tg_progress(struct tg_app *app, int x, int y, int w, int h,
+                tg_uint8_t value) {
+    struct tg_widget *wd = alloc_widget(app);
+    if (!wd) return -1;
+    int idx = app->n_widgets - 1;
+    wd->kind = TG_WIDGET_PROGRESS;
+    wd->x = x; wd->y = y; wd->w = w; wd->h = h;
+    wd->focusable = 0;
+    wd->progress = value > 100 ? 100 : value;
+    app->want_redraw = 1;
+    return idx;
+}
+
+int tg_separator(struct tg_app *app, int x, int y, int w) {
+    struct tg_widget *wd = alloc_widget(app);
+    if (!wd) return -1;
+    int idx = app->n_widgets - 1;
+    wd->kind = TG_WIDGET_SEPARATOR;
+    wd->x = x; wd->y = y; wd->w = w; wd->h = 1;
+    wd->focusable = 0;
+    app->want_redraw = 1;
+    return idx;
+}
+
+int tg_listview(struct tg_app *app, int x, int y, int w, int h,
+                const char **items, int count) {
+    struct tg_widget *wd = alloc_widget(app);
+    if (!wd) return -1;
+    int idx = app->n_widgets - 1;
+    wd->kind = TG_WIDGET_LISTVIEW;
+    wd->x = x; wd->y = y; wd->w = w; wd->h = h;
+    wd->focusable = 1;
+    wd->list_items = items;
+    wd->list_count = count;
+    wd->list_selected = 0;
+    wd->list_scroll = 0;
+    app->want_redraw = 1;
+    return idx;
+}
+
 void tg_set_text(struct tg_app *app, struct tg_widget *w, const char *text) {
     if (!w) return;
     tg_strcpy_capped(w->text, text, TG_TEXT_MAX);
@@ -201,6 +265,49 @@ const char *tg_get_text(struct tg_widget *w) {
 void tg_request_redraw(struct tg_app *app) { app->want_redraw = 1; }
 void tg_app_quit(struct tg_app *app)       { app->want_quit   = 1; }
 
+/* ---- accessor functions ------------------------------------------ */
+
+void tg_checkbox_set(struct tg_app *app, int idx, int checked) {
+    if (idx < 0 || idx >= app->n_widgets) return;
+    struct tg_widget *w = &app->widgets[idx];
+    if (w->kind != TG_WIDGET_CHECKBOX) return;
+    w->checked = checked ? 1 : 0;
+    app->want_redraw = 1;
+}
+
+int tg_checkbox_get(struct tg_app *app, int idx) {
+    if (idx < 0 || idx >= app->n_widgets) return 0;
+    struct tg_widget *w = &app->widgets[idx];
+    if (w->kind != TG_WIDGET_CHECKBOX) return 0;
+    return w->checked;
+}
+
+void tg_progress_set(struct tg_app *app, int idx, tg_uint8_t value) {
+    if (idx < 0 || idx >= app->n_widgets) return;
+    struct tg_widget *w = &app->widgets[idx];
+    if (w->kind != TG_WIDGET_PROGRESS) return;
+    w->progress = value > 100 ? 100 : value;
+    app->want_redraw = 1;
+}
+
+void tg_listview_set_selected(struct tg_app *app, int idx, int sel) {
+    if (idx < 0 || idx >= app->n_widgets) return;
+    struct tg_widget *w = &app->widgets[idx];
+    if (w->kind != TG_WIDGET_LISTVIEW) return;
+    if (sel < 0) sel = 0;
+    if (sel >= w->list_count) sel = w->list_count - 1;
+    if (sel < 0) sel = 0;
+    w->list_selected = sel;
+    app->want_redraw = 1;
+}
+
+int tg_listview_get_selected(struct tg_app *app, int idx) {
+    if (idx < 0 || idx >= app->n_widgets) return -1;
+    struct tg_widget *w = &app->widgets[idx];
+    if (w->kind != TG_WIDGET_LISTVIEW) return -1;
+    return w->list_selected;
+}
+
 /* ---- hit-testing ------------------------------------------------- */
 
 static int point_in(struct tg_widget *w, int x, int y) {
@@ -209,8 +316,6 @@ static int point_in(struct tg_widget *w, int x, int y) {
 }
 
 static int hit_test(struct tg_app *app, int x, int y) {
-    /* Topmost = last-added wins -- mirrors how DOM-ish trees usually
-     * work. (No widget overlap in our demo, so this barely matters.) */
     for (int i = app->n_widgets - 1; i >= 0; i--) {
         if (point_in(&app->widgets[i], x, y)) return i;
     }
@@ -221,7 +326,6 @@ static int hit_test(struct tg_app *app, int x, int y) {
 
 static void draw_rect_border(struct tg_app *app, int x, int y, int w, int h,
                              tg_uint32_t color) {
-    /* 1-px border drawn as 4 thin fills. */
     sys_gui_fill(app->fd, x,         y,         w, 1, color);
     sys_gui_fill(app->fd, x,         y + h - 1, w, 1, color);
     sys_gui_fill(app->fd, x,         y,         1, h, color);
@@ -239,14 +343,12 @@ static void draw_surface(struct tg_app *app, int x, int y, int w, int h,
     if (w > 2) sys_gui_fill(app->fd, x + 1, y, w - 2, 1, accent);
 }
 
-/* Vertical-centre baseline for an 8-px font inside an h-pixel widget. */
 static int text_baseline_y(int widget_y, int widget_h) {
     int by = widget_y + (widget_h - 8) / 2;
     if (by < widget_y) by = widget_y;
     return by;
 }
 
-/* Horizontally centre an `n`-char string (each char = 8 px wide). */
 static int text_centred_x(int widget_x, int widget_w, int n_chars) {
     int tw = n_chars * 8;
     int bx = widget_x + (widget_w - tw) / 2;
@@ -255,9 +357,6 @@ static int text_centred_x(int widget_x, int widget_w, int n_chars) {
 }
 
 static void draw_label(struct tg_app *app, struct tg_widget *w) {
-    /* Labels paint their text with the window bg behind them so they
-     * don't leave stale pixels on text changes (sys_gui_text uses a
-     * solid bg per-glyph when `bg != GFX_TRANSPARENT`). */
     sys_gui_fill(app->fd, w->x, w->y, w->w, w->h, TG_COL_BG);
     int by = text_baseline_y(w->y, w->h);
     sys_gui_text(app->fd, w->x, by, w->text, TG_COL_LABEL_FG, TG_COL_BG);
@@ -268,7 +367,6 @@ static void draw_button(struct tg_app *app, struct tg_widget *w, int focused) {
     draw_surface(app, w->x, w->y, w->w, w->h, face, TG_COL_BTN_BORDER,
                  focused ? TG_COL_FOCUS_RING : TG_COL_ACCENT_2);
     if (focused) {
-        /* Inset 2 px so the focus ring is visible against the border. */
         draw_rect_border(app, w->x + 2, w->y + 2, w->w - 4, w->h - 4,
                          TG_COL_FOCUS_RING);
     }
@@ -282,11 +380,8 @@ static void draw_textinput(struct tg_app *app, struct tg_widget *w, int focused)
     draw_surface(app, w->x, w->y, w->w, w->h, TG_COL_INPUT_BG,
                  focused ? TG_COL_FOCUS_RING : TG_COL_INPUT_BORDER,
                  focused ? TG_COL_ACCENT_2 : TG_COL_INPUT_BORDER);
-    /* 4-px text padding from the left edge. */
     int tx = w->x + 4;
     int ty = text_baseline_y(w->y, w->h);
-    /* Crude horizontal "scroll": if the text is wider than the box,
-     * show the rightmost slice that fits so the caret stays visible. */
     int max_chars = (w->w - 8) / 8;
     if (max_chars < 0) max_chars = 0;
     int n = (int)tg_strlen(w->text);
@@ -294,11 +389,114 @@ static void draw_textinput(struct tg_app *app, struct tg_widget *w, int focused)
     sys_gui_text(app->fd, tx, ty, w->text + start,
                  TG_COL_INPUT_FG, TG_COL_INPUT_BG);
     if (focused) {
-        /* Caret = thin vertical bar after the last visible char. */
         int caret_x = tx + (n - start) * 8;
         if (caret_x > w->x + w->w - 2) caret_x = w->x + w->w - 2;
         sys_gui_fill(app->fd, caret_x, w->y + 3, 1, w->h - 6,
                      TG_COL_FOCUS_RING);
+    }
+}
+
+static void draw_checkbox(struct tg_app *app, struct tg_widget *w, int focused) {
+    int box_size = 12;
+    int bx = w->x + 2;
+    int by = w->y + (w->h - box_size) / 2;
+    if (by < w->y) by = w->y;
+
+    sys_gui_fill(app->fd, w->x, w->y, w->w, w->h, TG_COL_BG);
+
+    /* Draw the checkbox square */
+    sys_gui_fill(app->fd, bx, by, box_size, box_size, TG_COL_INPUT_BG);
+    draw_rect_border(app, bx, by, box_size, box_size,
+                     focused ? TG_COL_FOCUS_RING : TG_COL_INPUT_BORDER);
+
+    /* Draw check mark (filled inner square) if checked */
+    if (w->checked) {
+        sys_gui_fill(app->fd, bx + 3, by + 3, box_size - 6, box_size - 6,
+                     TG_COL_CHECK_MARK);
+    }
+
+    /* Label text to the right of the box */
+    int tx = bx + box_size + 6;
+    int ty = text_baseline_y(w->y, w->h);
+    if (w->text[0]) {
+        sys_gui_text(app->fd, tx, ty, w->text, TG_COL_LABEL_FG, TG_COL_BG);
+    }
+}
+
+static void draw_progress(struct tg_app *app, struct tg_widget *w) {
+    /* Border */
+    sys_gui_fill(app->fd, w->x, w->y, w->w, w->h, TG_COL_PROGRESS_BG);
+    draw_rect_border(app, w->x, w->y, w->w, w->h, TG_COL_INPUT_BORDER);
+
+    /* Filled portion */
+    int inner_w = w->w - 2;
+    int inner_h = w->h - 2;
+    if (inner_w > 0 && inner_h > 0) {
+        int fill_w = (inner_w * (int)w->progress) / 100;
+        if (fill_w > 0) {
+            sys_gui_fill(app->fd, w->x + 1, w->y + 1, fill_w, inner_h,
+                         TG_COL_PROGRESS_FG);
+        }
+    }
+}
+
+static void draw_separator(struct tg_app *app, struct tg_widget *w) {
+    sys_gui_fill(app->fd, w->x, w->y, w->w, 1, TG_COL_SEP);
+}
+
+static void draw_listview(struct tg_app *app, struct tg_widget *w, int focused) {
+    /* Background */
+    sys_gui_fill(app->fd, w->x, w->y, w->w, w->h, TG_COL_LIST_BG);
+    draw_rect_border(app, w->x, w->y, w->w, w->h,
+                     focused ? TG_COL_FOCUS_RING : TG_COL_INPUT_BORDER);
+
+    if (!w->list_items || w->list_count <= 0) return;
+
+    int visible_count = (w->h - 2) / TG_LIST_ITEM_H;
+    if (visible_count <= 0) visible_count = 1;
+
+    /* Clamp scroll so selected item is visible */
+    if (w->list_scroll > w->list_selected)
+        w->list_scroll = w->list_selected;
+    if (w->list_scroll + visible_count <= w->list_selected)
+        w->list_scroll = w->list_selected - visible_count + 1;
+    if (w->list_scroll < 0) w->list_scroll = 0;
+
+    /* Draw visible items */
+    for (int i = 0; i < visible_count; i++) {
+        int item_idx = w->list_scroll + i;
+        if (item_idx >= w->list_count) break;
+
+        int iy = w->y + 1 + i * TG_LIST_ITEM_H;
+        int iw = w->w - 2;
+
+        /* Highlight selected item */
+        if (item_idx == w->list_selected) {
+            sys_gui_fill(app->fd, w->x + 1, iy, iw, TG_LIST_ITEM_H,
+                         TG_COL_LIST_SEL);
+        }
+
+        /* Draw item text */
+        const char *item_text = w->list_items[item_idx];
+        if (item_text) {
+            int ty = iy + (TG_LIST_ITEM_H - 8) / 2;
+            tg_uint32_t bg = (item_idx == w->list_selected)
+                             ? TG_COL_LIST_SEL : TG_COL_LIST_BG;
+            sys_gui_text(app->fd, w->x + 4, ty, item_text,
+                         TG_COL_LIST_FG, bg);
+        }
+    }
+
+    /* Scrollbar indicator (right side) if items overflow */
+    if (w->list_count > visible_count) {
+        int sb_x = w->x + w->w - 4;
+        int track_h = w->h - 2;
+        int thumb_h = track_h * visible_count / w->list_count;
+        if (thumb_h < 4) thumb_h = 4;
+        int thumb_y = w->y + 1 +
+                      (track_h - thumb_h) * w->list_scroll /
+                      (w->list_count - visible_count);
+        sys_gui_fill(app->fd, sb_x, thumb_y, 3, thumb_h, TG_COL_SCROLLBAR);
     }
 }
 
@@ -309,6 +507,10 @@ static void draw_widget(struct tg_app *app, int idx) {
     case TG_WIDGET_LABEL:     draw_label(app, w);              break;
     case TG_WIDGET_BUTTON:    draw_button(app, w, focused);    break;
     case TG_WIDGET_TEXTINPUT: draw_textinput(app, w, focused); break;
+    case TG_WIDGET_CHECKBOX:  draw_checkbox(app, w, focused);  break;
+    case TG_WIDGET_PROGRESS:  draw_progress(app, w);           break;
+    case TG_WIDGET_SEPARATOR: draw_separator(app, w);          break;
+    case TG_WIDGET_LISTVIEW:  draw_listview(app, w, focused);  break;
     default: break;
     }
 }
@@ -324,8 +526,6 @@ static void redraw_all(struct tg_app *app) {
 
 /* ---- per-widget event handling ----------------------------------- */
 
-/* Append a printable ASCII char to a textinput's buffer, or apply
- * backspace. Returns 1 if the buffer changed (caller should redraw). */
 static int textinput_consume_key(struct tg_widget *w, tg_uint8_t k) {
     if (k == TG_KEY_BACKSPACE) {
         tg_size_t n = tg_strlen(w->text);
@@ -333,7 +533,6 @@ static int textinput_consume_key(struct tg_widget *w, tg_uint8_t k) {
         w->text[n - 1] = '\0';
         return 1;
     }
-    /* Printable ASCII only -- ignore everything else (Enter, Tab, ...). */
     if (k < 0x20 || k > 0x7E) return 0;
     tg_size_t n = tg_strlen(w->text);
     if (n + 1 >= TG_TEXT_MAX) return 0;
@@ -342,11 +541,22 @@ static int textinput_consume_key(struct tg_widget *w, tg_uint8_t k) {
     return 1;
 }
 
+static void listview_ensure_visible(struct tg_widget *w) {
+    int visible_count = (w->h - 2) / TG_LIST_ITEM_H;
+    if (visible_count <= 0) visible_count = 1;
+    if (w->list_selected < w->list_scroll)
+        w->list_scroll = w->list_selected;
+    if (w->list_selected >= w->list_scroll + visible_count)
+        w->list_scroll = w->list_selected - visible_count + 1;
+}
+
 static void dispatch_event(struct tg_app *app, const struct tg_event *ev) {
+    if (ev->type == TG_EV_CLOSE) {
+        app->want_quit = 1;
+        return;
+    }
     if (ev->type == TG_EV_MOUSE_DOWN) {
         int hit = hit_test(app, ev->x, ev->y);
-        /* Update focus on every click -- focusable widgets gain it,
-         * a click on a label or empty area drops it. */
         if (hit >= 0 && app->widgets[hit].focusable) {
             if (app->focused != hit) app->want_redraw = 1;
             app->focused = hit;
@@ -359,6 +569,23 @@ static void dispatch_event(struct tg_app *app, const struct tg_event *ev) {
             app->captured = hit;
             app->want_redraw = 1;
         }
+        /* Checkbox: toggle on click */
+        if (hit >= 0 && app->widgets[hit].kind == TG_WIDGET_CHECKBOX) {
+            app->widgets[hit].checked = !app->widgets[hit].checked;
+            app->want_redraw = 1;
+        }
+        /* List view: select item based on click y position */
+        if (hit >= 0 && app->widgets[hit].kind == TG_WIDGET_LISTVIEW) {
+            struct tg_widget *w = &app->widgets[hit];
+            int rel_y = ev->y - (w->y + 1);
+            if (rel_y >= 0) {
+                int clicked_item = w->list_scroll + rel_y / TG_LIST_ITEM_H;
+                if (clicked_item < w->list_count) {
+                    w->list_selected = clicked_item;
+                    app->want_redraw = 1;
+                }
+            }
+        }
         return;
     }
 
@@ -369,8 +596,6 @@ static void dispatch_event(struct tg_app *app, const struct tg_event *ev) {
             int was_pressed = app->widgets[cap].pressed;
             app->widgets[cap].pressed = 0;
             app->want_redraw = 1;
-            /* Only fire the callback if the release happened inside
-             * the button (classic UX -- drag-out cancels the click). */
             if (was_pressed && point_in(&app->widgets[cap], ev->x, ev->y)) {
                 tg_button_cb cb = app->widgets[cap].on_click;
                 if (cb) cb(&app->widgets[cap], app);
@@ -380,8 +605,6 @@ static void dispatch_event(struct tg_app *app, const struct tg_event *ev) {
     }
 
     if (ev->type == TG_EV_MOUSE_MOVE) {
-        /* Re-evaluate "still pressed" while dragging the mouse. If the
-         * user drags off the button, it visually depresses. */
         int cap = app->captured;
         if (cap >= 0 && app->widgets[cap].kind == TG_WIDGET_BUTTON) {
             int now = point_in(&app->widgets[cap], ev->x, ev->y);
@@ -398,15 +621,47 @@ static void dispatch_event(struct tg_app *app, const struct tg_event *ev) {
         if (f < 0) return;
         struct tg_widget *w = &app->widgets[f];
         if (w->kind == TG_WIDGET_TEXTINPUT) {
+            if (ev->key == TG_KEY_ENTER) {
+                for (int i = 0; i < app->n_widgets; i++) {
+                    if (app->widgets[i].kind == TG_WIDGET_BUTTON &&
+                        app->widgets[i].on_click) {
+                        app->widgets[i].on_click(&app->widgets[i], app);
+                        app->want_redraw = 1;
+                        break;
+                    }
+                }
+                return;
+            }
             if (textinput_consume_key(w, ev->key)) app->want_redraw = 1;
             return;
         }
         if (w->kind == TG_WIDGET_BUTTON) {
-            /* Enter / Space activates a focused button, mirroring
-             * standard desktop UX. */
             if (ev->key == TG_KEY_ENTER || ev->key == ' ') {
                 if (w->on_click) w->on_click(w, app);
                 app->want_redraw = 1;
+            }
+            return;
+        }
+        if (w->kind == TG_WIDGET_CHECKBOX) {
+            if (ev->key == TG_KEY_ENTER || ev->key == ' ') {
+                w->checked = !w->checked;
+                app->want_redraw = 1;
+            }
+            return;
+        }
+        if (w->kind == TG_WIDGET_LISTVIEW) {
+            if (ev->key == TG_KEY_DOWN) {
+                if (w->list_selected < w->list_count - 1) {
+                    w->list_selected++;
+                    listview_ensure_visible(w);
+                    app->want_redraw = 1;
+                }
+            } else if (ev->key == TG_KEY_UP) {
+                if (w->list_selected > 0) {
+                    w->list_selected--;
+                    listview_ensure_visible(w);
+                    app->want_redraw = 1;
+                }
             }
             return;
         }
@@ -416,7 +671,6 @@ static void dispatch_event(struct tg_app *app, const struct tg_event *ev) {
 /* ---- public lifecycle -------------------------------------------- */
 
 int tg_app_init(struct tg_app *app, int win_w, int win_h, const char *title) {
-    /* Zero-init the whole struct. */
     char *p = (char *)app;
     for (tg_size_t i = 0; i < sizeof(*app); i++) p[i] = 0;
 
@@ -434,8 +688,6 @@ int tg_app_init(struct tg_app *app, int win_w, int win_h, const char *title) {
 }
 
 int tg_run(struct tg_app *app) {
-    /* Initial paint so the user sees the window even if no event ever
-     * arrives. */
     redraw_all(app);
 
     for (;;) {
@@ -454,10 +706,6 @@ int tg_run(struct tg_app *app) {
     }
 }
 
-/* Convenience: write a NUL-terminated string to stdout. Useful for
- * apps that want to log diagnostics from inside callbacks. Exposed via
- * a non-namespaced symbol because user programs already have their own
- * "puts"/"putstr" conventions. */
 void tg_puts(const char *s) {
     sys_write(1, s, tg_strlen(s));
 }

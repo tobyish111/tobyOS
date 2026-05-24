@@ -28,6 +28,7 @@ typedef unsigned char      uint8_t;
 #define SYS_SYSTEM_METRICS  74
 
 #define GUI_EV_MOUSE_DOWN    2
+#define GUI_EV_CLOSE         5
 
 struct gui_event {
     int     type;
@@ -82,7 +83,8 @@ static inline ssize_t sys_write(int fd, const void *buf, size_t len) {
     return r;
 }
 static inline void sys_yield(void) {
-    __asm__ volatile ("syscall" : : "a"((long)SYS_YIELD)
+    long _dummy;
+    __asm__ volatile ("syscall" : "=a"(_dummy) : "0"((long)SYS_YIELD)
                       : "rcx", "r11", "memory");
 }
 static inline int sys_gui_create(uint32_t w, uint32_t h, const char *title) {
@@ -266,7 +268,7 @@ static void fmt_ip(char *out, size_t cap, uint32_t ip) {
 }
 
 #define WIN_W        680
-#define WIN_H        420
+#define WIN_H        480
 #define SIDE_W       166
 
 #define COL_BG       0x000A101Du
@@ -285,6 +287,10 @@ static void fmt_ip(char *out, size_t cap, uint32_t ip) {
 enum page_id {
     PAGE_HOME = 0,
     PAGE_SYSTEM,
+    PAGE_DISPLAY,
+    PAGE_SOUND,
+    PAGE_STORAGE,
+    PAGE_POWER,
     PAGE_DEVICES,
     PAGE_NETWORK,
     PAGE_PERSONAL,
@@ -295,8 +301,8 @@ enum page_id {
 };
 
 static const char *g_nav[PAGE_COUNT] = {
-    "Home", "System", "Devices", "Network",
-    "Personalization", "Apps", "Accounts", "About TobyOS"
+    "Home", "System", "Display", "Sound", "Storage", "Power",
+    "Devices", "Network", "Personalization", "Apps", "Accounts", "About TobyOS"
 };
 
 struct accent {
@@ -329,6 +335,13 @@ static int  g_night = 0;
 static int  g_widgets = 1;
 static int  g_animations = 1;
 static int  g_bluetooth = 0;
+static int  g_hw_cursor = 0;
+static int  g_vsync = 1;
+static int  g_sys_sounds = 1;
+static int  g_notify_sounds = 1;
+static int  g_volume = 80;
+static int  g_power_plan = 0;
+static int  g_sleep_idle = 1;
 static char g_user[32] = "toby";
 static char g_status[96] = "status: ready.";
 
@@ -428,6 +441,19 @@ static void load_settings(void) {
     g_widgets = read_bool("ui.widgets", 1);
     g_animations = read_bool("ui.animations", 1);
     g_bluetooth = read_bool("device.bluetooth", 0);
+    g_hw_cursor = read_bool("display.hw_cursor", 0);
+    g_vsync = read_bool("display.vsync", 1);
+    g_sys_sounds = read_bool("audio.system_sounds", 1);
+    g_notify_sounds = read_bool("audio.notify_sounds", 1);
+    g_sleep_idle = read_bool("power.sleep_idle", 1);
+    if (sys_setting_get("audio.volume", b, sizeof(b)) > 0) {
+        int v = parse_int(b, g_volume);
+        if (v >= 0 && v <= 100) g_volume = v;
+    }
+    if (sys_setting_get("power.plan", b, sizeof(b)) > 0) {
+        if (streq(b, "performance")) g_power_plan = 1;
+        else g_power_plan = 0;
+    }
     if (sys_setting_get("ui.theme", b, sizeof(b)) > 0 && streq(b, "basic")) {
         g_mode = 1;
     }
@@ -452,6 +478,17 @@ static void apply_all(void) {
     write_bool("ui.widgets", g_widgets);
     write_bool("ui.animations", g_animations);
     write_bool("device.bluetooth", g_bluetooth);
+    write_bool("display.hw_cursor", g_hw_cursor);
+    write_bool("display.vsync", g_vsync);
+    write_bool("audio.system_sounds", g_sys_sounds);
+    write_bool("audio.notify_sounds", g_notify_sounds);
+    write_bool("power.sleep_idle", g_sleep_idle);
+    {
+        char vb[8];
+        u64_dec(vb, sizeof(vb), (uint64_t)g_volume);
+        sys_setting_set("audio.volume", vb);
+    }
+    sys_setting_set("power.plan", g_power_plan ? "performance" : "balanced");
     char nb[8];
     u64_dec(nb, sizeof(nb), (uint64_t)g_nixie);
     sys_setting_set("ui.nixie_glow", nb);
@@ -463,7 +500,7 @@ static void draw_nav(int fd) {
     sys_gui_fill(fd, 0, 35, SIDE_W, WIN_H - 35, COL_PANEL);
     sys_gui_fill(fd, SIDE_W, 35, 1, WIN_H - 35, COL_LINE);
     for (int i = 0; i < PAGE_COUNT; i++) {
-        int y = 54 + i * 25;
+        int y = 54 + i * 30;
         uint32_t bg = (i == g_page) ? COL_HOT : COL_PANEL;
         if (i == g_page) {
             sys_gui_fill(fd, 8, y - 5, SIDE_W - 16, 19, bg);
@@ -508,6 +545,84 @@ static void page_system(int fd, int x) {
                      g_widgets);
     draw_setting_row(fd, x, 272, "Animations", "Use shell transition effects when available",
                      g_animations);
+}
+
+static void page_display(int fd, int x) {
+    char b[48];
+    sys_gui_text(fd, x, 54, "Display", COL_TEXT, COL_BG);
+    draw_panel(fd, x, 82, WIN_W - x - 18, 92, COL_PANEL2, COL_CYAN);
+    sys_gui_text(fd, x + 14, 98, "Resolution", COL_DIM, COL_PANEL2);
+    sys_gui_text(fd, x + 150, 98, "1024 x 768", COL_TEXT, COL_PANEL2);
+    sys_gui_text(fd, x + 14, 118, "Color depth", COL_DIM, COL_PANEL2);
+    sys_gui_text(fd, x + 150, 118, "32-bit XRGB", COL_TEXT, COL_PANEL2);
+    sys_gui_text(fd, x + 14, 138, "Refresh rate", COL_DIM, COL_PANEL2);
+    b[0] = 0; append(b, sizeof(b), "~");
+    append_u64(b, sizeof(b), g_metrics.gui_fps);
+    append(b, sizeof(b), " Hz");
+    sys_gui_text(fd, x + 150, 138, b, COL_TEXT, COL_PANEL2);
+    draw_setting_row(fd, x, 190, "Hardware cursor",
+                     "Use GPU-accelerated mouse pointer", g_hw_cursor);
+    draw_setting_row(fd, x, 242, "VSync",
+                     "Synchronize frame updates with display", g_vsync);
+}
+
+static void page_sound(int fd, int x) {
+    char b[48];
+    sys_gui_text(fd, x, 54, "Sound", COL_TEXT, COL_BG);
+    draw_panel(fd, x, 82, WIN_W - x - 18, 42, COL_PANEL2, COL_ORANGE);
+    sys_gui_text(fd, x + 12, 94, "Volume", COL_TEXT, COL_PANEL2);
+    sys_gui_fill(fd, WIN_W - 204, 102, 128, 3, COL_LINE);
+    sys_gui_fill(fd, WIN_W - 204, 102, 128 * g_volume / 100, 3, COL_ORANGE);
+    sys_gui_fill(fd, WIN_W - 204 + 128 * g_volume / 100 - 3, 97, 8, 12,
+                 COL_ORANGE);
+    fmt_percent(b, sizeof(b), (uint32_t)g_volume);
+    sys_gui_text(fd, WIN_W - 64, 94, b, COL_TEXT, COL_PANEL2);
+    draw_setting_row(fd, x, 140, "System sounds",
+                     "Play sounds for system events", g_sys_sounds);
+    draw_setting_row(fd, x, 192, "Notification sounds",
+                     "Play audio for app notifications", g_notify_sounds);
+    draw_panel(fd, x, 260, WIN_W - x - 18, 46, COL_PANEL2, COL_CYAN);
+    sys_gui_text(fd, x + 14, 274, "Audio: PCM 48kHz stereo (virtio-sound)",
+                 COL_DIM, COL_PANEL2);
+}
+
+static void page_storage(int fd, int x) {
+    char b[64];
+    sys_gui_text(fd, x, 54, "Storage", COL_TEXT, COL_BG);
+    draw_panel(fd, x, 82, WIN_W - x - 18, 80, COL_PANEL2, COL_MAGENTA);
+    sys_gui_text(fd, x + 14, 98, "Disk usage", COL_TEXT, COL_PANEL2);
+    fmt_percent(b, sizeof(b), g_metrics.disk_pct);
+    sys_gui_text(fd, x + 150, 98, b, COL_TEXT, COL_PANEL2);
+    draw_bar(fd, x + 14, 122, WIN_W - x - 46, g_metrics.disk_pct, COL_MAGENTA);
+    sys_gui_text(fd, x + 14, 136, "TobyFS persistent volume",
+                 COL_DIM, COL_PANEL2);
+    draw_panel(fd, x, 178, WIN_W - x - 18, 68, COL_PANEL2, COL_ORANGE);
+    b[0] = 0; append_u64(b, sizeof(b), g_metrics.vfs_ops_per_s);
+    append(b, sizeof(b), " ops/s");
+    sys_gui_text(fd, x + 14, 194, "VFS operations", COL_DIM, COL_PANEL2);
+    sys_gui_text(fd, x + 150, 194, b, COL_TEXT, COL_PANEL2);
+    sys_gui_text(fd, x + 14, 218, "Mount: /data (read-write)",
+                 COL_DIM, COL_PANEL2);
+}
+
+static void page_power(int fd, int x) {
+    char b[64];
+    sys_gui_text(fd, x, 54, "Power", COL_TEXT, COL_BG);
+    draw_panel(fd, x, 82, WIN_W - x - 18, 52, COL_PANEL2, COL_CYAN);
+    sys_gui_text(fd, x + 14, 96, "Power plan", COL_TEXT, COL_PANEL2);
+    draw_button(fd, x + 150, 92, 100, 26, "Balanced", g_power_plan == 0);
+    draw_button(fd, x + 260, 92, 100, 26, "Performance", g_power_plan == 1);
+    draw_setting_row(fd, x, 150, "Sleep on idle",
+                     "Suspend after inactivity timeout", g_sleep_idle);
+    draw_panel(fd, x, 218, WIN_W - x - 18, 80, COL_PANEL2, COL_ORANGE);
+    b[0] = 0; append_u64(b, sizeof(b), g_metrics.uptime_ms / 1000ull);
+    append(b, sizeof(b), " seconds");
+    sys_gui_text(fd, x + 14, 234, "Uptime", COL_DIM, COL_PANEL2);
+    sys_gui_text(fd, x + 150, 234, b, COL_TEXT, COL_PANEL2);
+    b[0] = 0; append_u64(b, sizeof(b), g_metrics.tsc_mhz);
+    append(b, sizeof(b), " MHz");
+    sys_gui_text(fd, x + 14, 258, "TSC frequency", COL_DIM, COL_PANEL2);
+    sys_gui_text(fd, x + 150, 258, b, COL_TEXT, COL_PANEL2);
 }
 
 static void page_devices(int fd, int x) {
@@ -642,6 +757,10 @@ static void redraw(int fd) {
     switch (g_page) {
     case PAGE_HOME:     page_home(fd, x); break;
     case PAGE_SYSTEM:   page_system(fd, x); break;
+    case PAGE_DISPLAY:  page_display(fd, x); break;
+    case PAGE_SOUND:    page_sound(fd, x); break;
+    case PAGE_STORAGE:  page_storage(fd, x); break;
+    case PAGE_POWER:    page_power(fd, x); break;
     case PAGE_DEVICES:  page_devices(fd, x); break;
     case PAGE_NETWORK:  page_network(fd, x); break;
     case PAGE_PERSONAL: page_personal(fd, x); break;
@@ -666,6 +785,13 @@ static void reset_defaults(void) {
     g_widgets = 1;
     g_animations = 1;
     g_bluetooth = 0;
+    g_hw_cursor = 0;
+    g_vsync = 1;
+    g_sys_sounds = 1;
+    g_notify_sounds = 1;
+    g_volume = 80;
+    g_power_plan = 0;
+    g_sleep_idle = 1;
     copy(g_user, "toby", sizeof(g_user));
     apply_all();
     copy(g_status, "status: defaults restored.", sizeof(g_status));
@@ -682,7 +808,7 @@ static void cycle_user(void) {
 static int handle_nav_click(int x, int y) {
     if (x >= SIDE_W) return 0;
     for (int i = 0; i < PAGE_COUNT; i++) {
-        int ry = 54 + i * 25 - 5;
+        int ry = 54 + i * 30 - 5;
         if (hit(x, y, 8, ry, SIDE_W - 16, 20)) {
             g_page = i;
             return 1;
@@ -709,6 +835,52 @@ static void handle_click(int fd, int px, int py) {
         if (hit(px, py, x, 244, 132, 28)) g_page = PAGE_SYSTEM;
         else if (hit(px, py, x + 146, 244, 132, 28)) g_page = PAGE_NETWORK;
         else if (hit(px, py, x + 292, 244, 132, 28)) g_page = PAGE_PERSONAL;
+        redraw(fd); return;
+    }
+
+    if (g_page == PAGE_DISPLAY) {
+        if (hit(px, py, WIN_W - 70, 202, 52, 24)) {
+            g_hw_cursor = !g_hw_cursor; write_bool("display.hw_cursor", g_hw_cursor);
+            copy(g_status, "status: hw cursor saved.", sizeof(g_status));
+        } else if (hit(px, py, WIN_W - 70, 254, 52, 24)) {
+            g_vsync = !g_vsync; write_bool("display.vsync", g_vsync);
+            copy(g_status, "status: vsync saved.", sizeof(g_status));
+        }
+        redraw(fd); return;
+    }
+
+    if (g_page == PAGE_SOUND) {
+        if (hit(px, py, WIN_W - 210, 88, 148, 30)) {
+            int v = (px - (WIN_W - 204)) * 100 / 128;
+            if (v < 0) v = 0;
+            if (v > 100) v = 100;
+            g_volume = v;
+            char vb[8]; u64_dec(vb, sizeof(vb), (uint64_t)g_volume);
+            sys_setting_set("audio.volume", vb);
+            copy(g_status, "status: volume saved.", sizeof(g_status));
+        } else if (hit(px, py, WIN_W - 70, 152, 52, 24)) {
+            g_sys_sounds = !g_sys_sounds; write_bool("audio.system_sounds", g_sys_sounds);
+            copy(g_status, "status: system sounds saved.", sizeof(g_status));
+        } else if (hit(px, py, WIN_W - 70, 204, 52, 24)) {
+            g_notify_sounds = !g_notify_sounds; write_bool("audio.notify_sounds", g_notify_sounds);
+            copy(g_status, "status: notify sounds saved.", sizeof(g_status));
+        }
+        redraw(fd); return;
+    }
+
+    if (g_page == PAGE_POWER) {
+        if (hit(px, py, x + 150, 92, 100, 26)) {
+            g_power_plan = 0;
+            sys_setting_set("power.plan", "balanced");
+            copy(g_status, "status: power plan saved.", sizeof(g_status));
+        } else if (hit(px, py, x + 260, 92, 100, 26)) {
+            g_power_plan = 1;
+            sys_setting_set("power.plan", "performance");
+            copy(g_status, "status: power plan saved.", sizeof(g_status));
+        } else if (hit(px, py, WIN_W - 70, 162, 52, 24)) {
+            g_sleep_idle = !g_sleep_idle; write_bool("power.sleep_idle", g_sleep_idle);
+            copy(g_status, "status: sleep setting saved.", sizeof(g_status));
+        }
         redraw(fd); return;
     }
 
@@ -815,13 +987,16 @@ int main(int argc, char **argv) {
             long now = sys_clock_ms();
             if (now - last_live >= 1000 &&
                 (g_page == PAGE_HOME || g_page == PAGE_SYSTEM ||
-                 g_page == PAGE_NETWORK || g_page == PAGE_ABOUT)) {
+                 g_page == PAGE_DISPLAY || g_page == PAGE_STORAGE ||
+                 g_page == PAGE_POWER || g_page == PAGE_NETWORK ||
+                 g_page == PAGE_ABOUT)) {
                 last_live = now;
                 redraw(fd);
             }
             sys_yield();
             continue;
         }
+        if (ev.type == GUI_EV_CLOSE) return 0;
         if (ev.type == GUI_EV_MOUSE_DOWN && ev.button) {
             handle_click(fd, ev.x, ev.y);
         }

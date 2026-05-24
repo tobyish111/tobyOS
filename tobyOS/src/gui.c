@@ -58,9 +58,11 @@
 #include <tobyos/theme.h>
 #include <tobyos/notify.h>
 #include <tobyos/sysmon.h>
+#include <tobyos/virtio_gpu.h>
 #include <tobyos/net.h>
 #include <tobyos/audio_hda.h>
 #include <tobyos/bootlog.h>
+#include <tobyos/virtio_gpu.h>
 #include <stdarg.h>
 
 /* ---- internal window struct ---------------------------------------- */
@@ -78,6 +80,20 @@ struct window {
     uint8_t          ev_head;       /* producer: IRQ */
     uint8_t          ev_tail;       /* consumer: poll syscall */
 
+    int        state;               /* GUI_WIN_NORMAL/MINIMIZED/MAXIMIZED */
+    int        restore_x, restore_y;   /* saved pos before maximize */
+    int        restore_w, restore_h;   /* saved size before maximize */
+    uint64_t   close_request_tick;  /* tick when GUI_EV_CLOSE was sent (0=none) */
+
+    uint8_t    opacity;             /* 0=invisible, 255=fully opaque */
+
+    /* Per-window VirtIO-GPU 2D resource (GPU_ACCEL mode). */
+    uint32_t   gpu_resource_id;    /* 0 = no resource allocated */
+    void      *gpu_backing;        /* PMM-backed HHDM virt ptr */
+    uint64_t   gpu_backing_phys;   /* physical address of backing */
+    size_t     gpu_backing_bytes;  /* backing allocation size */
+    bool       gpu_dirty;          /* needs transfer before compose */
+
     struct window *z_prev, *z_next; /* doubly linked, head = top */
 };
 
@@ -92,16 +108,70 @@ struct window {
  * go?". A debug build can `theme_set(THEME_BASIC)` from a serial
  * command to A/B against the M12 colours. */
 
+/* Animation framework */
+#define ANIM_MAX         8
+#define ANIM_NONE        0
+#define ANIM_FADE_IN     1   /* window appearing: opacity 0→255 */
+#define ANIM_FADE_OUT    2   /* window closing: opacity 255→0 */
+#define ANIM_MINIMIZE    3   /* shrinking toward taskbar */
+#define ANIM_RESTORE     4   /* expanding from taskbar */
+#define ANIM_SLIDE_UP    5   /* menu sliding up */
+#define ANIM_SLIDE_DOWN  6   /* menu sliding down */
+
+struct gui_anim {
+    int         type;           /* ANIM_* */
+    uint64_t    start_ms;       /* start time (uptime ms) */
+    uint16_t    duration_ms;    /* total duration */
+    int         target_x, target_y, target_w, target_h; /* end geometry */
+    int         start_x, start_y, start_w, start_h;     /* start geometry */
+    struct window *win;         /* associated window (or NULL for shell anims) */
+    uint8_t     progress;       /* 0-255 interpolated progress */
+    bool        active;
+};
+
+#define RESIZE_BORDER    5   /* invisible hit zone around window edges */
+#define WIN_MIN_W      120
+#define WIN_MIN_H       80
+
+/* ---- context menu geometry + IDs -------------------------------- */
+
+#define CTX_MENU_MAX_ITEMS  10
+#define CTX_MENU_ITEM_H     24
+#define CTX_MENU_PAD        4
+#define CTX_MENU_W         180
+#define CTX_MENU_SEPARATOR   0xFF
+
+struct ctx_menu_item {
+    const char *label;
+    uint8_t     id;          /* action id, 0xFF = separator */
+};
+
+#define CTX_ID_CLOSE       1
+#define CTX_ID_MINIMIZE    2
+#define CTX_ID_MAXIMIZE    3
+#define CTX_ID_RESTORE     4
+#define CTX_ID_REFRESH     5
+#define CTX_ID_ABOUT       6
+#define CTX_ID_SETTINGS    7
+
 #define TASKBAR_BRAND        "TOBYOS"
 
-#define START_BTN_W       58
+#define START_BTN_W       62
 #define START_BTN_LABEL   "TO"
-#define TASKBAR_SEARCH_W  150
+#define TASKBAR_SEARCH_W  160
 #define TASKBAR_PIN_COUNT 7
-#define TASKBAR_PIN_W      42
-#define TAB_W             148
+#define TASKBAR_PIN_W      44
+#define TAB_W             152
 #define TAB_PAD           6
 #define TAB_TEXT_MAX      14
+
+/* M37: floating taskbar margins (KDE Plasma 6 style). The logical
+ * taskbar region is still GUI_TASKBAR_H tall and spans the screen, but
+ * the visible panel is drawn inset by these margins, with rounded
+ * corners and a subtle shadow underneath. */
+#define TASKBAR_FLOAT_MX    8   /* left+right margin */
+#define TASKBAR_FLOAT_MY    6   /* bottom margin */
+#define TASKBAR_FLOAT_RADIUS 10 /* corner radius */
 
 /* ---- M31 system tray geometry ----------------------------------- *
  *
@@ -129,12 +199,12 @@ struct window {
 #define TRAY_PILL_H       (GUI_TASKBAR_H - 10)
 #define TRAY_GAP          4
 
-#define TRAY_W_CLOCK      96
-#define TRAY_W_BELL       56
-#define TRAY_W_WIN        72
-#define TRAY_W_AUD        72
-#define TRAY_W_DISK       80
-#define TRAY_W_NET       176
+#define TRAY_W_CLOCK      80
+#define TRAY_W_BELL       48
+#define TRAY_W_WIN        56
+#define TRAY_W_AUD        60
+#define TRAY_W_DISK       56
+#define TRAY_W_NET       120
 
 /* ---- M31 toast geometry ----------------------------------------- */
 
@@ -145,18 +215,18 @@ struct window {
 
 /* ---- M31 notification center geometry --------------------------- */
 
-#define CENTER_W         360
-#define CENTER_HEAD_H     40
+#define CENTER_W         340
+#define CENTER_HEAD_H     36
 #define CENTER_FOOT_H     30
-#define CENTER_ITEM_H     56
-#define CENTER_ITEM_PAD    8
-#define CENTER_VISIBLE_MAX 6     /* items rendered without scrolling */
+#define CENTER_ITEM_H     52
+#define CENTER_ITEM_PAD    6
+#define CENTER_VISIBLE_MAX 8     /* items rendered without scrolling */
 
 /* System slice (compiled-in), plus a user slice filled in at runtime
  * by the package manager, plus one pinned "Logout" entry at the
  * bottom. LAUNCHER_MAX sizes the internal cursor math; keep it big
  * enough to hold all three plus headroom. */
-#define LAUNCHER_SYS_MAX  8
+#define LAUNCHER_SYS_MAX  10
 #define LAUNCHER_MAX      (LAUNCHER_SYS_MAX + GUI_LAUNCHER_USER_MAX + 1)
 #define LAUNCHER_W        420
 #define LAUNCHER_HEAD_H    84
@@ -168,7 +238,7 @@ struct window {
 #define LAUNCHER_TILE_H    50
 
 #define LAUNCH_QUEUE_MAX   4
-#define TRACKED_PIDS_MAX   8
+#define TRACKED_PIDS_MAX   32
 #define LAUNCH_PATH_MAX    96
 #define LAUNCH_ARG_MAX     128
 #define SYSMON_HISTORY     32
@@ -182,9 +252,10 @@ struct launcher_item {
  * declared const so the linker keeps them in .rodata. */
 static const struct launcher_item g_launcher_sys[LAUNCHER_SYS_MAX] = {
     { "File Explorer", "/bin/gui_files"    },
+    { "Web Browser",   "/bin/gui_browser"  },
     { "Settings",      "/bin/gui_settings" },
     { "Nex Terminal",  "/bin/gui_term"     },
-    { "Toby Widgets",  "/bin/gui_widgets"  },
+    { "Notes",         "/bin/gui_widgets"  },
     { "Photos",        "/bin/gui_viewer"   },
     { "Clock",         "/bin/gui_clock"    },
     { "About TobyOS",  "/bin/gui_about"    },
@@ -273,6 +344,16 @@ static struct {
     /* Drag state (set/cleared by IRQ). */
     struct window *drag_win;
     int            drag_dx, drag_dy;
+
+    /* Resize drag state */
+    struct window *resize_win;
+    int            resize_edge;    /* bitmask: 1=left, 2=right, 4=top, 8=bottom */
+    int            resize_start_mx, resize_start_my;
+    int            resize_start_x, resize_start_y;
+    int            resize_start_w, resize_start_h;
+
+    /* Snap zone state (during title-bar drag) */
+    int            snap_zone;      /* 0=none, 1=left, 2=right, 3=maximize */
 
     struct window *z_top;        /* head of z-order list */
     int            spawn_x, spawn_y;  /* tiled placement cursor */
@@ -363,6 +444,58 @@ static struct {
      * else changed (otherwise the desktop would freeze the clock
      * on a static frame). */
     uint32_t last_clock_min;
+
+    /* Context menu */
+    bool          ctx_open;
+    int           ctx_x, ctx_y;
+    int           ctx_count;
+    int           ctx_hover;
+    struct ctx_menu_item ctx_items[CTX_MENU_MAX_ITEMS];
+    struct window *ctx_target_win;
+
+    /* Animation state */
+    struct gui_anim anims[ANIM_MAX];
+
+    /* Clipboard */
+    char          clip_buf[4096];
+    uint32_t      clip_len;
+
+    /* Desktop icon selection (click-to-select, double-click to launch) */
+    int           selected_icon;
+    uint64_t      last_icon_click_ms;
+    int           last_icon_clicked;
+
+    /* Start menu search */
+    char          menu_search_buf[32];
+    int           menu_search_len;
+
+    /* Wallpaper cache: rendered once, then blitted on each frame.
+     * Invalidated on theme change or resolution change. */
+    uint32_t     *wp_cache;
+    uint32_t      wp_cache_w;
+    uint32_t      wp_cache_h;
+    uint32_t      wp_cache_theme_id;
+
+    /* Phase 2 M2.5: GPU-accelerated compositor state */
+    enum compositor_mode comp_mode;
+
+    /* Triple-buffer indices: front (displayed), back (compositor
+     * renders into), and in-progress (GPU async scanout target). */
+    int           tb_front;
+    int           tb_back;
+    int           tb_pending;       /* -1 = no pending flip */
+
+    /* VSync-aware frame timing: deadline for the next flip in ns. */
+    uint64_t      vsync_deadline_ns;
+    uint64_t      vsync_interval_ns;  /* ~16.6ms for 60Hz */
+    uint64_t      frame_count;
+
+    /* GPU_ACCEL: direct-scanout bypass state.  When a maximized top
+     * window covers the entire screen and has a GPU resource, its
+     * resource replaces the compositor's scanout -- no CPU blit needed.
+     * direct_scanout_wid tracks which window (if any) currently owns
+     * the scanout.  0 = compositor owns scanout. */
+    int           direct_scanout_wid;
 } g;
 
 /* ---- desktop activity trace --------------------------------------- *
@@ -466,6 +599,15 @@ static void draw_text_centered(int x, int y, int w, int h,
     gfx_draw_text(tx, ty, s, fg, GFX_TRANSPARENT);
 }
 
+static void draw_text16_centered(int x, int y, int w, int h,
+                                 const char *s, uint32_t fg) {
+    int tx = x + (w - str_px(s)) / 2;
+    if (tx < x + 4) tx = x + 4;
+    int ty = y + (h - 16) / 2;
+    if (ty < y) ty = y;
+    gfx_draw_text_smooth(tx, ty, s, fg, GFX_TRANSPARENT, 2);
+}
+
 static void paint_glass_rect(int x, int y, int w, int h,
                              uint32_t fill, uint32_t glass,
                              uint32_t border, uint32_t accent) {
@@ -506,6 +648,27 @@ static bool point_in_client(const struct window *w, int px, int py) {
            py <  cy + w->client_h;
 }
 
+/* Resize edge detection: returns a bitmask (1=left,2=right,4=top,8=bottom)
+ * if the point is within RESIZE_BORDER pixels of an edge but outside the
+ * window's solid interior. Returns 0 if not on a resize edge. */
+static int resize_edge_at(const struct window *w, int px, int py) {
+    if (w->state != GUI_WIN_NORMAL) return 0;
+    int ow = outer_w(w), oh = outer_h(w);
+    int x0 = w->x - RESIZE_BORDER, y0 = w->y - RESIZE_BORDER;
+    int x1 = w->x + ow + RESIZE_BORDER, y1 = w->y + oh + RESIZE_BORDER;
+    if (px < x0 || px >= x1 || py < y0 || py >= y1) return 0;
+    if (point_in_outer(w, px, py)) {
+        /* Inside the window body -- only count as resize if within
+         * RESIZE_BORDER of an edge. */
+    }
+    int edge = 0;
+    if (px < w->x + RESIZE_BORDER)       edge |= 1; /* left */
+    if (px >= w->x + ow - RESIZE_BORDER) edge |= 2; /* right */
+    if (py < w->y + RESIZE_BORDER)        edge |= 4; /* top */
+    if (py >= w->y + oh - RESIZE_BORDER)  edge |= 8; /* bottom */
+    return edge;
+}
+
 /* Close button rect (within the title bar, top-right). Computed
  * fresh from the window's current x/y/w so dragging keeps it in
  * the right place. */
@@ -516,8 +679,35 @@ static void close_btn_rect(const struct window *w,
     *bx = w->x + outer_w(w) - GUI_CLOSE_BTN_SIZE - GUI_CLOSE_BTN_PAD;
     *by = w->y + (GUI_TITLE_BAR_H - GUI_CLOSE_BTN_SIZE) / 2;
 }
+/* M37: maximize button rect -- just left of close. */
+static void max_btn_rect(const struct window *w,
+                         int *bx, int *by, int *bw, int *bh) {
+    *bw = GUI_MAX_BTN_SIZE;
+    *bh = GUI_MAX_BTN_SIZE;
+    *bx = w->x + outer_w(w) - GUI_CLOSE_BTN_SIZE - GUI_CLOSE_BTN_PAD
+           - GUI_BTN_GAP - GUI_MAX_BTN_SIZE;
+    *by = w->y + (GUI_TITLE_BAR_H - GUI_MAX_BTN_SIZE) / 2;
+}
+/* M37: minimize button rect -- just left of maximize. */
+static void min_btn_rect(const struct window *w,
+                         int *bx, int *by, int *bw, int *bh) {
+    *bw = GUI_MIN_BTN_SIZE;
+    *bh = GUI_MIN_BTN_SIZE;
+    *bx = w->x + outer_w(w) - GUI_CLOSE_BTN_SIZE - GUI_CLOSE_BTN_PAD
+           - GUI_BTN_GAP - GUI_MAX_BTN_SIZE
+           - GUI_BTN_GAP - GUI_MIN_BTN_SIZE;
+    *by = w->y + (GUI_TITLE_BAR_H - GUI_MIN_BTN_SIZE) / 2;
+}
 static bool point_in_close(const struct window *w, int px, int py) {
     int bx, by, bw, bh; close_btn_rect(w, &bx, &by, &bw, &bh);
+    return px >= bx && py >= by && px < bx + bw && py < by + bh;
+}
+static bool point_in_max(const struct window *w, int px, int py) {
+    int bx, by, bw, bh; max_btn_rect(w, &bx, &by, &bw, &bh);
+    return px >= bx && py >= by && px < bx + bw && py < by + bh;
+}
+static bool point_in_min(const struct window *w, int px, int py) {
+    int bx, by, bw, bh; min_btn_rect(w, &bx, &by, &bw, &bh);
     return px >= bx && py >= by && px < bx + bw && py < by + bh;
 }
 
@@ -615,36 +805,59 @@ static void launcher_rect(int *mx, int *my, int *mw, int *mh) {
     *my = taskbar_top() - *mh - 8;
     if (*my < 6) *my = 6;
 }
+/* Forward declaration -- defined near paint_launcher. */
+static bool menu_search_matches(const char *label);
+
 /* Returns item index 0..N-1 if the cursor is over a launcher entry,
- * -1 otherwise. */
+ * -1 otherwise. When a search filter is active, the list items are
+ * filtered, so visual slot → real index mapping is recalculated. */
 static int launcher_item_at(int px, int py) {
     if (!g.menu_open) return -1;
     int mx, my, mw, mh; launcher_rect(&mx, &my, &mw, &mh);
     if (px < mx || px >= mx + mw) return -1;
 
     int n = launcher_count();
+    bool searching = (g.menu_search_len > 0);
     int list_x = mx + LAUNCHER_PAD;
     int list_y = my + LAUNCHER_HEAD_H + 20;
     int list_w = LAUNCHER_LIST_W;
-    int visible = n - 1;
-    if (visible > 6) visible = 6;
-    if (px >= list_x && px < list_x + list_w &&
-        py >= list_y && py < list_y + visible * LAUNCHER_ITEM_H) {
-        int idx = (py - list_y) / LAUNCHER_ITEM_H;
-        if (idx >= 0 && idx < visible) return idx;
-    }
 
-    int grid_x = mx + 190;
-    int grid_y = my + LAUNCHER_HEAD_H + 18;
-    int grid_cols = 3;
-    for (int i = 0; i < 9; i++) {
-        int col = i % grid_cols;
-        int row = i / grid_cols;
-        int tx = grid_x + col * (LAUNCHER_TILE_W + 12);
-        int ty = grid_y + row * (LAUNCHER_TILE_H + 12);
-        if (px >= tx && px < tx + LAUNCHER_TILE_W &&
-            py >= ty && py < ty + LAUNCHER_TILE_H) {
-            if (i < n - 1) return i;
+    if (searching) {
+        /* When filtering, map visual row to the real item index. */
+        if (px >= list_x && px < list_x + list_w) {
+            int slot = (py - list_y) / LAUNCHER_ITEM_H;
+            if (slot >= 0 && slot < 6) {
+                int drawn = 0;
+                for (int i = 0; i < n - 1; i++) {
+                    struct launcher_item li;
+                    if (!launcher_resolve(i, &li) || !li.label) continue;
+                    if (!menu_search_matches(li.label)) continue;
+                    if (drawn == slot) return i;
+                    drawn++;
+                }
+            }
+        }
+    } else {
+        int visible = n - 1;
+        if (visible > 6) visible = 6;
+        if (px >= list_x && px < list_x + list_w &&
+            py >= list_y && py < list_y + visible * LAUNCHER_ITEM_H) {
+            int idx = (py - list_y) / LAUNCHER_ITEM_H;
+            if (idx >= 0 && idx < visible) return idx;
+        }
+
+        int grid_x = mx + 190;
+        int grid_y = my + LAUNCHER_HEAD_H + 18;
+        int grid_cols = 3;
+        for (int i = 0; i < 9; i++) {
+            int col = i % grid_cols;
+            int row = i / grid_cols;
+            int tx = grid_x + col * (LAUNCHER_TILE_W + 12);
+            int ty = grid_y + row * (LAUNCHER_TILE_H + 12);
+            if (px >= tx && px < tx + LAUNCHER_TILE_W &&
+                py >= ty && py < ty + LAUNCHER_TILE_H) {
+                if (i < n - 1) return i;
+            }
         }
     }
 
@@ -838,6 +1051,132 @@ static void format_uptime(char *out, size_t cap) {
               (unsigned)h, (unsigned)m, (unsigned)s);
 }
 
+/* ---- animation helpers ------------------------------------------- */
+
+__attribute__((unused))
+static struct gui_anim *anim_alloc(void) {
+    for (int i = 0; i < ANIM_MAX; i++) {
+        if (!g.anims[i].active) return &g.anims[i];
+    }
+    return NULL;
+}
+
+static void anim_start_fade_in(struct window *w) {
+    if (!w) { g.dirty = true; return; }
+    struct gui_anim *a = anim_alloc();
+    if (!a) { g.dirty = true; return; }
+    a->type = ANIM_FADE_IN;
+    a->win = w;
+    a->start_ms = now_uptime_ms();
+    a->duration_ms = 200;
+    a->progress = 0;
+    a->active = true;
+    w->opacity = 0;
+    g.dirty = true;
+}
+
+__attribute__((unused))
+static void anim_start_fade_out(struct window *w) {
+    if (!w) { g.dirty = true; return; }
+    struct gui_anim *a = anim_alloc();
+    if (!a) { w->state = GUI_WIN_MINIMIZED; g.dirty = true; return; }
+    a->type = ANIM_FADE_OUT;
+    a->win = w;
+    a->start_ms = now_uptime_ms();
+    a->duration_ms = 150;
+    a->progress = 0;
+    a->active = true;
+    g.dirty = true;
+}
+
+static void anim_start_minimize(struct window *w) {
+    if (!w) { g.dirty = true; return; }
+    struct gui_anim *a = anim_alloc();
+    if (!a) { w->state = GUI_WIN_MINIMIZED; g.dirty = true; return; }
+    a->type = ANIM_MINIMIZE;
+    a->win = w;
+    a->start_ms = now_uptime_ms();
+    a->duration_ms = 150;
+    a->start_x = w->x;
+    a->start_y = w->y;
+    a->start_w = w->client_w;
+    a->start_h = w->client_h;
+    a->target_x = (int)gfx_width() / 2;
+    a->target_y = (int)gfx_height() - GUI_TASKBAR_H;
+    a->target_w = 0;
+    a->target_h = 0;
+    a->progress = 0;
+    a->active = true;
+    g.dirty = true;
+}
+
+static uint8_t ease_out(uint8_t t) {
+    uint32_t x = t;
+    return (uint8_t)(255 - ((255 - x) * (255 - x) / 255));
+}
+
+static void anim_tick(void) {
+    uint64_t now = now_uptime_ms();
+    bool any_active = false;
+    for (int i = 0; i < ANIM_MAX; i++) {
+        struct gui_anim *a = &g.anims[i];
+        if (!a->active) continue;
+        any_active = true;
+        uint64_t elapsed = now - a->start_ms;
+        if (elapsed >= a->duration_ms) {
+            a->progress = 255;
+            a->active = false;
+            if (a->type == ANIM_FADE_OUT && a->win) {
+                a->win->state = GUI_WIN_MINIMIZED;
+                a->win->opacity = 255;
+            } else if (a->type == ANIM_FADE_IN && a->win) {
+                a->win->opacity = 255;
+            } else if (a->type == ANIM_MINIMIZE && a->win) {
+                a->win->state = GUI_WIN_MINIMIZED;
+                a->win->opacity = 255;
+                a->win->x = a->start_x;
+                a->win->y = a->start_y;
+            }
+        } else {
+            uint8_t raw = (uint8_t)(elapsed * 255 / a->duration_ms);
+            a->progress = ease_out(raw);
+            if (a->type == ANIM_FADE_IN && a->win) {
+                a->win->opacity = a->progress;
+            } else if (a->type == ANIM_FADE_OUT && a->win) {
+                a->win->opacity = (uint8_t)(255 - a->progress);
+            } else if (a->type == ANIM_MINIMIZE && a->win) {
+                uint8_t p = a->progress;
+                a->win->opacity = (uint8_t)(255 - p);
+                int dx = (a->target_x - a->start_x) * (int)p / 255;
+                int dy = (a->target_y - a->start_y) * (int)p / 255;
+                a->win->x = a->start_x + dx;
+                a->win->y = a->start_y + dy;
+            }
+        }
+    }
+    if (any_active) g.dirty = true;
+}
+
+/* ---- clipboard --------------------------------------------------- */
+
+int gui_clip_copy(const char *data, uint32_t len) {
+    if (!data || len == 0) return 0;
+    if (len > sizeof(g.clip_buf) - 1) len = sizeof(g.clip_buf) - 1;
+    for (uint32_t i = 0; i < len; i++) g.clip_buf[i] = data[i];
+    g.clip_buf[len] = '\0';
+    g.clip_len = len;
+    return (int)len;
+}
+
+int gui_clip_paste(char *buf, uint32_t max) {
+    if (!buf || max == 0) return 0;
+    uint32_t copy = g.clip_len;
+    if (copy >= max) copy = max - 1;
+    for (uint32_t i = 0; i < copy; i++) buf[i] = g.clip_buf[i];
+    buf[copy] = '\0';
+    return (int)copy;
+}
+
 /* ---- deferred app launch queue ----------------------------------- *
  *
  * Mouse-IRQ context can't safely call proc_create_from_elf -- it would
@@ -927,25 +1266,12 @@ static void shell_launch_desktop_icon(int icon) {
 static void shell_launch_pin(int pin) {
     switch (pin) {
     case 0: shell_launch_path("/bin/gui_files");    break;
-    case 1:
-        notify_post(ABI_NOTIFY_KIND_USER, NOTIFY_URG_INFO,
-                    "shell", "Toby Browser",
-                    "Browser shell tile is wired; TCP/HTTP UI app is a future layer.");
-        break;
+    case 1: shell_launch_path("/bin/gui_browser");  break;
     case 2: shell_launch_path("/bin/gui_term");     break;
-    case 3: shell_launch_path("/bin/gui_widgets");  break;
+    case 3: shell_launch_path("/bin/gui_widgets");  break; /* Notes */
     case 4: shell_launch_path("/bin/gui_settings"); break;
-    case 5:
-        g.widgets_open = !g.widgets_open;
-        notify_post(ABI_NOTIFY_KIND_USER, NOTIFY_URG_INFO,
-                    "shell", g.widgets_open ? "Widgets open" : "Widgets hidden",
-                    "Quick Settings and System Monitor are compositor shell panels.");
-        break;
-    case 6:
-        notify_post(ABI_NOTIFY_KIND_USER, NOTIFY_URG_INFO,
-                    "mail", "Mail",
-                    "Mail tile is reserved for the first networked user app.");
-        break;
+    case 5: shell_launch_path("/bin/gui_calc");     break;
+    case 6: shell_launch_path("/bin/gui_about");    break;
     default: break;
     }
 }
@@ -1094,11 +1420,195 @@ static void z_raise(struct window *w) {
     gui_invalidate_full();
 }
 
+static void enqueue_event(struct window *w, int type, int x, int y,
+                          uint8_t button, uint8_t key);
+
+/* Reallocate a window's backbuf to a new client size, zero-filling
+ * with the theme background. Returns true on success. */
+static bool window_realloc_backbuf(struct window *w, int new_cw, int new_ch) {
+    size_t bytes = (size_t)new_cw * new_ch * 4u;
+    uint32_t *nb = (uint32_t *)kmalloc(bytes);
+    if (!nb) return false;
+    const struct theme_palette *t = theme_active();
+    uint32_t fill = t->win_bg;
+    for (size_t i = 0; i < (size_t)new_cw * new_ch; i++) nb[i] = fill;
+    if (w->backbuf) kfree(w->backbuf);
+    w->backbuf  = nb;
+    w->client_w = new_cw;
+    w->client_h = new_ch;
+
+    /* GPU_ACCEL: recreate the per-window GPU resource at the new size. */
+    if (w->gpu_resource_id) {
+        virtio_gpu_destroy_window_resource(w->gpu_resource_id,
+                                           w->gpu_backing_phys,
+                                           w->gpu_backing_bytes);
+        w->gpu_resource_id   = 0;
+        w->gpu_backing       = NULL;
+        w->gpu_backing_phys  = 0;
+        w->gpu_backing_bytes = 0;
+    }
+    if (g.comp_mode == COMPOSITOR_GPU_ACCEL && virtio_gpu_present()) {
+        void     *backing = NULL;
+        uint64_t  phys    = 0;
+        uint32_t rid = virtio_gpu_create_window_resource(
+                            (uint32_t)new_cw, (uint32_t)new_ch,
+                            &backing, &phys);
+        if (rid) {
+            w->gpu_resource_id   = rid;
+            w->gpu_backing       = backing;
+            w->gpu_backing_phys  = phys;
+            w->gpu_backing_bytes = bytes;
+            w->gpu_dirty         = true;
+        }
+    }
+
+    return true;
+}
+
+static void window_do_minimize(struct window *w) {
+    if (w->state == GUI_WIN_MINIMIZED) return;
+    if (w->state == GUI_WIN_NORMAL) {
+        w->restore_x = w->x;
+        w->restore_y = w->y;
+        w->restore_w = w->client_w;
+        w->restore_h = w->client_h;
+    }
+    anim_start_minimize(w);
+    g.dirty = true;
+    gui_invalidate_full();
+}
+
+static void window_do_maximize(struct window *w) {
+    int sw = (int)gfx_width();
+    int sh = (int)gfx_height();
+    int new_cw, new_ch;
+
+    if (!session_active()) {
+        /* Pre-login: fill entire screen (no taskbar, no chrome) */
+        new_cw = sw;
+        new_ch = sh;
+    } else {
+        new_cw = sw - 2 * GUI_BORDER;
+        new_ch = sh - GUI_TASKBAR_H - GUI_TITLE_BAR_H - GUI_BORDER;
+    }
+    if (new_cw < 40) new_cw = 40;
+    if (new_ch < 20) new_ch = 20;
+
+    if (w->state == GUI_WIN_NORMAL) {
+        w->restore_x = w->x;
+        w->restore_y = w->y;
+        w->restore_w = w->client_w;
+        w->restore_h = w->client_h;
+    }
+    if (!window_realloc_backbuf(w, new_cw, new_ch)) return;
+    w->x = 0;
+    w->y = 0;
+    w->state = GUI_WIN_MAXIMIZED;
+    enqueue_event(w, GUI_EV_RESIZE, new_cw, new_ch, 0, 0);
+    g.dirty = true;
+    gui_invalidate_full();
+}
+
+static void window_do_restore(struct window *w) {
+    int rw = w->restore_w > 0 ? w->restore_w : w->client_w;
+    int rh = w->restore_h > 0 ? w->restore_h : w->client_h;
+    if (!window_realloc_backbuf(w, rw, rh)) return;
+    w->x = w->restore_x;
+    w->y = w->restore_y;
+    w->state = GUI_WIN_NORMAL;
+    enqueue_event(w, GUI_EV_RESIZE, rw, rh, 0, 0);
+    g.dirty = true;
+    gui_invalidate_full();
+}
+
+/* ---- context menu helpers ----------------------------------------- */
+
+static void ctx_menu_open(int sx, int sy,
+                          const struct ctx_menu_item *items, int count,
+                          struct window *target) {
+    g.ctx_open = true;
+    g.ctx_x = sx;
+    g.ctx_y = sy;
+    g.ctx_count = count > CTX_MENU_MAX_ITEMS ? CTX_MENU_MAX_ITEMS : count;
+    g.ctx_hover = -1;
+    g.ctx_target_win = target;
+    for (int i = 0; i < g.ctx_count; i++) g.ctx_items[i] = items[i];
+    int menu_h = g.ctx_count * CTX_MENU_ITEM_H + 2 * CTX_MENU_PAD;
+    if (g.ctx_y + menu_h > (int)gfx_height() - GUI_TASKBAR_H)
+        g.ctx_y = (int)gfx_height() - GUI_TASKBAR_H - menu_h;
+    if (g.ctx_x + CTX_MENU_W > (int)gfx_width())
+        g.ctx_x = (int)gfx_width() - CTX_MENU_W;
+    if (g.ctx_x < 0) g.ctx_x = 0;
+    if (g.ctx_y < 0) g.ctx_y = 0;
+    g.dirty = true;
+    gui_invalidate_full();
+}
+
+static void ctx_menu_close(void) {
+    if (!g.ctx_open) return;
+    g.ctx_open = false;
+    g.ctx_target_win = NULL;
+    g.dirty = true;
+    gui_invalidate_full();
+}
+
+static void ctx_menu_execute(int id) {
+    struct window *w = g.ctx_target_win;
+    switch (id) {
+    case CTX_ID_CLOSE:
+        if (w) {
+            enqueue_event(w, GUI_EV_CLOSE, 0, 0, 0, 0);
+            w->close_request_tick = pit_ticks();
+            g.dirty = true;
+        }
+        break;
+    case CTX_ID_MINIMIZE:
+        if (w) window_do_minimize(w);
+        break;
+    case CTX_ID_MAXIMIZE:
+        if (w) window_do_maximize(w);
+        break;
+    case CTX_ID_RESTORE:
+        if (w) window_do_restore(w);
+        break;
+    case CTX_ID_REFRESH:
+        g.dirty = true;
+        gui_invalidate_full();
+        break;
+    case CTX_ID_ABOUT:
+        gui_launch_enqueue_arg("/bin/gui_about", NULL);
+        break;
+    case CTX_ID_SETTINGS:
+        gui_launch_enqueue_arg("/bin/gui_settings", NULL);
+        break;
+    }
+    ctx_menu_close();
+}
+
+static const struct ctx_menu_item ctx_titlebar_menu[] = {
+    { "Restore",   CTX_ID_RESTORE  },
+    { "Minimize",  CTX_ID_MINIMIZE },
+    { "Maximize",  CTX_ID_MAXIMIZE },
+    { NULL,        CTX_MENU_SEPARATOR },
+    { "Close",     CTX_ID_CLOSE    },
+};
+#define CTX_TITLEBAR_COUNT 5
+
+static const struct ctx_menu_item ctx_desktop_menu[] = {
+    { "Refresh",   CTX_ID_REFRESH  },
+    { NULL,        CTX_MENU_SEPARATOR },
+    { "Settings",  CTX_ID_SETTINGS },
+    { "About",     CTX_ID_ABOUT    },
+};
+#define CTX_DESKTOP_COUNT 4
+
 /* Find the topmost window that contains the screen point. NULL if no
- * window does. */
+ * window does. Also matches the resize border zone around each window. */
 static struct window *window_at(int px, int py) {
     for (struct window *w = g.z_top; w; w = w->z_next) {
+        if (w->state == GUI_WIN_MINIMIZED) continue;
         if (point_in_outer(w, px, py)) return w;
+        if (resize_edge_at(w, px, py)) return w;
     }
     return 0;
 }
@@ -1177,10 +1687,14 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
      * cursor size from gfx.c. The hint lives until the next compositor
      * pass consumes it. */
     if (moved) {
-        gui_invalidate_rect(old_x, old_y, 12, 19);
-        gui_invalidate_rect(nx,    ny,    12, 19);
-        if (g.active) {
-            gfx_cursor_overlay_move(nx, ny);
+        if (virtio_gpu_hw_cursor_available()) {
+            virtio_gpu_hw_cursor_move(nx, ny);
+        } else {
+            gui_invalidate_rect(old_x, old_y, 12, 19);
+            gui_invalidate_rect(nx,    ny,    12, 19);
+            if (g.active) {
+                gfx_cursor_overlay_move(nx, ny);
+            }
         }
     }
 
@@ -1208,11 +1722,63 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
      * nothing -- input goes to console_tick / shell instead. */
     if (!g.active) return;
 
+    /* Resize drag in progress -- adjust window geometry. */
+    if (g.resize_win) {
+        if (moved) {
+            struct window *rw = g.resize_win;
+            int new_x = rw->x, new_y = rw->y;
+            int new_w = g.resize_start_w, new_h = g.resize_start_h;
+
+            if (g.resize_edge & 1) { /* left */
+                int delta = g.resize_start_mx - nx;
+                new_w = g.resize_start_w + delta;
+                new_x = g.resize_start_x - delta;
+            }
+            if (g.resize_edge & 2) { /* right */
+                new_w = g.resize_start_w + (nx - g.resize_start_mx);
+            }
+            if (g.resize_edge & 4) { /* top */
+                int delta = g.resize_start_my - ny;
+                new_h = g.resize_start_h + delta;
+                new_y = g.resize_start_y - delta;
+            }
+            if (g.resize_edge & 8) { /* bottom */
+                new_h = g.resize_start_h + (ny - g.resize_start_my);
+            }
+
+            if (new_w < WIN_MIN_W) {
+                if (g.resize_edge & 1) new_x = rw->x + (rw->client_w - WIN_MIN_W);
+                new_w = WIN_MIN_W;
+            }
+            if (new_h < WIN_MIN_H) {
+                if (g.resize_edge & 4) new_y = rw->y + (rw->client_h - WIN_MIN_H);
+                new_h = WIN_MIN_H;
+            }
+
+            if (new_w != rw->client_w || new_h != rw->client_h) {
+                if (window_realloc_backbuf(rw, new_w, new_h)) {
+                    rw->x = new_x;
+                    rw->y = new_y;
+                    enqueue_event(rw, GUI_EV_RESIZE, new_w, new_h, 0, 0);
+                    g.dirty = true;
+                    gui_invalidate_full();
+                }
+            } else {
+                rw->x = new_x;
+                rw->y = new_y;
+                g.dirty = true;
+                gui_invalidate_full();
+            }
+        }
+        if (!buttons) {
+            g.resize_win = 0;
+        }
+        return;
+    }
+
     /* Drag in progress -- just slide the window. */
     if (g.drag_win) {
         if (moved) {
-            int prev_x = g.drag_win->x;
-            int prev_y = g.drag_win->y;
             g.drag_win->x = nx - g.drag_dx;
             g.drag_win->y = ny - g.drag_dy;
             /* Clamp so the title bar can never disappear under the
@@ -1221,21 +1787,90 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
             if (g.drag_win->y < 0)     g.drag_win->y = 0;
             if (g.drag_win->y > max_y) g.drag_win->y = max_y;
             g.dirty = true;
-            /* M27E: hint both the OLD and NEW window positions so the
-             * region the window USED to occupy gets the wallpaper +
-             * overlapped windows behind it presented correctly. */
-            int ow = outer_w(g.drag_win), oh = outer_h(g.drag_win);
-            gui_invalidate_rect(prev_x,        prev_y,        ow, oh);
-            gui_invalidate_rect(g.drag_win->x, g.drag_win->y, ow, oh);
+            gui_invalidate_full();
+
+            /* Snap zone detection: edges/top of screen */
+            if (nx <= 0)
+                g.snap_zone = 1; /* left half */
+            else if (nx >= W - 1)
+                g.snap_zone = 2; /* right half */
+            else if (ny <= 0)
+                g.snap_zone = 3; /* maximize */
+            else
+                g.snap_zone = 0;
         }
         if (!buttons) {
             struct window *w = g.drag_win;
+            /* Apply snap if active */
+            if (g.snap_zone != 0) {
+                int sw = (int)gfx_width();
+                int sh = (int)gfx_height();
+                w->restore_x = w->x;
+                w->restore_y = w->y;
+                w->restore_w = w->client_w;
+                w->restore_h = w->client_h;
+
+                if (g.snap_zone == 3) {
+                    g.drag_win = 0;
+                    g.snap_zone = 0;
+                    window_do_maximize(w);
+                    return;
+                }
+
+                int snap_cw, snap_ch;
+                if (g.snap_zone == 1) { /* left half */
+                    w->x = 0;
+                    w->y = 0;
+                    snap_cw = sw / 2 - 2 * GUI_BORDER;
+                } else { /* right half */
+                    w->x = sw / 2;
+                    w->y = 0;
+                    snap_cw = sw / 2 - 2 * GUI_BORDER;
+                }
+                snap_ch = sh - GUI_TASKBAR_H - GUI_TITLE_BAR_H - GUI_BORDER;
+                if (snap_cw < WIN_MIN_W) snap_cw = WIN_MIN_W;
+                if (snap_ch < WIN_MIN_H) snap_ch = WIN_MIN_H;
+                window_realloc_backbuf(w, snap_cw, snap_ch);
+                w->state = GUI_WIN_NORMAL;
+                enqueue_event(w, GUI_EV_RESIZE, snap_cw, snap_ch, 0, 0);
+                gui_invalidate_full();
+                g.snap_zone = 0;
+                g.drag_win = 0;
+                g.dirty = true;
+                return;
+            }
             int cx = nx - (w->x + GUI_BORDER);
             int cy = ny - (w->y + GUI_TITLE_BAR_H);
             enqueue_event(w, GUI_EV_MOUSE_UP, cx, cy, prev, 0);
             g.drag_win = 0;
+            g.snap_zone = 0;
         }
         return;
+    }
+
+    /* ---- context menu interaction ---------------------------------- *
+     *
+     * The context menu floats above everything (except the cursor), so
+     * it intercepts left-clicks before any other hit test. A right-
+     * click while a menu is open closes the old one before opening a
+     * new one (handled further below in the per-window / desktop right-
+     * click path). */
+    if (g.ctx_open && went_down && (buttons & 1)) {
+        int mh = g.ctx_count * CTX_MENU_ITEM_H + 2 * CTX_MENU_PAD;
+        if (nx >= g.ctx_x && nx < g.ctx_x + CTX_MENU_W &&
+            ny >= g.ctx_y && ny < g.ctx_y + mh) {
+            int rel = ny - g.ctx_y - CTX_MENU_PAD;
+            int idx = rel / CTX_MENU_ITEM_H;
+            if (idx >= 0 && idx < g.ctx_count &&
+                g.ctx_items[idx].id != CTX_MENU_SEPARATOR) {
+                gui_trace_logf("ctx-menu click item=%d id=%d",
+                               idx, (int)g.ctx_items[idx].id);
+                ctx_menu_execute(g.ctx_items[idx].id);
+            }
+            return;
+        }
+        ctx_menu_close();
+        /* Fall through so the click can raise/focus a window. */
     }
 
     /* ---- desktop-chrome hit testing (taskbar / menu / close-X) ----
@@ -1297,6 +1932,7 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
         /* Start button toggles the menu. */
         if (point_in_start_btn(nx, ny)) {
             g.menu_open = !g.menu_open;
+            g.menu_search_len = 0;
             gui_trace_logf("mouse down=(%d,%d) hit=start-button menu_open=%d",
                            nx, ny, (int)g.menu_open);
             g.dirty = true;
@@ -1397,10 +2033,8 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
         /* Taskbar tab raises the corresponding window. */
         if (point_in_taskbar(nx, ny)) {
             if (point_in_taskbar_search(nx, ny)) {
-                notify_post(ABI_NOTIFY_KIND_USER, NOTIFY_URG_INFO,
-                            "search", "Search",
-                            "Search UI is wired as a shell target; indexing comes next.");
-                g.menu_open = false;
+                g.menu_open = true;
+                g.menu_search_len = 0;
                 g.dirty = true;
                 return;
             }
@@ -1414,9 +2048,19 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
                 return;
             }
             struct window *t = taskbar_tab_at(nx, ny);
-            gui_trace_logf("mouse down=(%d,%d) hit=taskbar tab_wid=%d tab_pid=%d",
-                           nx, ny, t ? t->wid : 0, t ? t->owner_pid : -1);
-            if (t) z_raise(t);
+            gui_trace_logf("mouse down=(%d,%d) hit=taskbar tab_wid=%d tab_pid=%d btn=0x%02x",
+                           nx, ny, t ? t->wid : 0, t ? t->owner_pid : -1,
+                           (unsigned)buttons);
+            if (t) {
+                if ((buttons & 2) && !(prev & 2)) {
+                    enqueue_event(t, GUI_EV_CLOSE, 0, 0, 0, 0);
+                    t->close_request_tick = pit_ticks();
+                } else {
+                    if (t->state == GUI_WIN_MINIMIZED)
+                        window_do_restore(t);
+                    z_raise(t);
+                }
+            }
             g.menu_open = false;
             g.dirty = true;
             return;
@@ -1426,30 +2070,82 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
     /* Window-level click handling. */
     struct window *under = window_at(nx, ny);
 
+    /* Right-click opens a context menu. */
+    if (went_down && (buttons & 2) && !(prev & 2)) {
+        ctx_menu_close();
+        if (under && point_in_title(under, nx, ny)) {
+            gui_trace_logf("right-click title wid=%d pid=%d -> ctx menu",
+                           under->wid, under->owner_pid);
+            z_raise(under);
+            ctx_menu_open(nx, ny, ctx_titlebar_menu,
+                          CTX_TITLEBAR_COUNT, under);
+            return;
+        }
+        if (!under && g.desktop_mode) {
+            gui_trace_logf("right-click desktop (%d,%d) -> ctx menu",
+                           nx, ny);
+            ctx_menu_open(nx, ny, ctx_desktop_menu,
+                          CTX_DESKTOP_COUNT, NULL);
+            return;
+        }
+    }
+
     if (went_down) {
         if (under) {
             z_raise(under);
-            /* Close button "X" -- ask the kernel to terminate the
-             * owning process; the proc's fd cleanup will then close
-             * this window. We don't tear the window down inline because
-             * the proc may still be holding the window fd. */
+            /* Minimize button "--" */
+            if (point_in_min(under, nx, ny)) {
+                gui_trace_logf("mouse down=(%d,%d) hit=minimize wid=%d "
+                               "owner_pid=%d",
+                               nx, ny, under->wid, under->owner_pid);
+                window_do_minimize(under);
+                return;
+            }
+            /* Maximize / restore button "[]" */
+            if (point_in_max(under, nx, ny)) {
+                gui_trace_logf("mouse down=(%d,%d) hit=maximize wid=%d "
+                               "owner_pid=%d state=%d",
+                               nx, ny, under->wid, under->owner_pid,
+                               under->state);
+                if (under->state == GUI_WIN_MAXIMIZED)
+                    window_do_restore(under);
+                else
+                    window_do_maximize(under);
+                return;
+            }
+            /* Close button "X" -- enqueue GUI_EV_CLOSE so the app can
+             * save state and exit cleanly. SIGINT is sent as a fallback
+             * if the app doesn't close within ~3 seconds. */
             if (point_in_close(under, nx, ny)) {
                 gui_trace_logf("mouse down=(%d,%d) hit=close-X wid=%d "
-                               "owner_pid=%d -> SIGINT",
+                               "owner_pid=%d -> GUI_EV_CLOSE",
                                nx, ny, under->wid, under->owner_pid);
-                if (under->owner_pid > 0) {
-                    signal_send_to_pid(under->owner_pid, SIGINT);
-                }
+                enqueue_event(under, GUI_EV_CLOSE, 0, 0, 0, 0);
+                under->close_request_tick = pit_ticks();
                 g.dirty = true;
                 return;
             }
             if (point_in_title(under, nx, ny)) {
-                gui_trace_logf("mouse down=(%d,%d) hit=title wid=%d "
-                               "owner_pid=%d (drag start)",
-                               nx, ny, under->wid, under->owner_pid);
-                g.drag_win = under;
-                g.drag_dx  = nx - under->x;
-                g.drag_dy  = ny - under->y;
+                /* Check for resize edge first -- corners of title bar
+                 * should start a resize, not a drag. */
+                int edge = resize_edge_at(under, nx, ny);
+                if (edge) {
+                    g.resize_win = under;
+                    g.resize_edge = edge;
+                    g.resize_start_mx = nx;
+                    g.resize_start_my = ny;
+                    g.resize_start_x  = under->x;
+                    g.resize_start_y  = under->y;
+                    g.resize_start_w  = under->client_w;
+                    g.resize_start_h  = under->client_h;
+                } else {
+                    gui_trace_logf("mouse down=(%d,%d) hit=title wid=%d "
+                                   "owner_pid=%d (drag start)",
+                                   nx, ny, under->wid, under->owner_pid);
+                    g.drag_win = under;
+                    g.drag_dx  = nx - under->x;
+                    g.drag_dy  = ny - under->y;
+                }
             } else if (point_in_client(under, nx, ny)) {
                 int cx = nx - (under->x + GUI_BORDER);
                 int cy = ny - (under->y + GUI_TITLE_BAR_H);
@@ -1457,18 +2153,44 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
                                "owner_pid=%d cx=%d cy=%d",
                                nx, ny, under->wid, under->owner_pid, cx, cy);
                 enqueue_event(under, GUI_EV_MOUSE_DOWN, cx, cy, buttons, 0);
+            } else {
+                /* Not in title or client -- check resize edges */
+                int edge = resize_edge_at(under, nx, ny);
+                if (edge) {
+                    g.resize_win = under;
+                    g.resize_edge = edge;
+                    g.resize_start_mx = nx;
+                    g.resize_start_my = ny;
+                    g.resize_start_x  = under->x;
+                    g.resize_start_y  = under->y;
+                    g.resize_start_w  = under->client_w;
+                    g.resize_start_h  = under->client_h;
+                }
             }
             g.dirty = true;
         } else if (g.desktop_mode) {
             int icon = desktop_icon_at(nx, ny);
             if (icon >= 0) {
-                shell_launch_desktop_icon(icon);
-                gui_trace_logf("mouse down=(%d,%d) hit=desktop-icon idx=%d",
-                               nx, ny, icon);
+                uint64_t now = now_uptime_ms();
+                if (icon == g.last_icon_clicked &&
+                    now - g.last_icon_click_ms < 400) {
+                    shell_launch_desktop_icon(icon);
+                    g.selected_icon = -1;
+                    g.last_icon_clicked = -1;
+                    gui_trace_logf("mouse dblclick=(%d,%d) desktop-icon idx=%d launch",
+                                   nx, ny, icon);
+                } else {
+                    g.selected_icon = icon;
+                    gui_trace_logf("mouse down=(%d,%d) hit=desktop-icon idx=%d select",
+                                   nx, ny, icon);
+                }
+                g.last_icon_clicked = icon;
+                g.last_icon_click_ms = now;
                 g.menu_open = false;
                 g.dirty = true;
                 return;
             }
+            g.selected_icon = -1;
             gui_trace_logf("mouse down=(%d,%d) hit=bare-desktop", nx, ny);
         }
         /* Click on bare desktop just dismisses any open menu. */
@@ -1481,49 +2203,92 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
         int cy = ny - (under->y + GUI_TITLE_BAR_H);
         enqueue_event(under, GUI_EV_MOUSE_MOVE, cx, cy, buttons, 0);
     }
+
+    /* Context menu hover tracking. */
+    if (g.ctx_open && moved) {
+        int mh = g.ctx_count * CTX_MENU_ITEM_H + 2 * CTX_MENU_PAD;
+        int old_hover = g.ctx_hover;
+        if (nx >= g.ctx_x && nx < g.ctx_x + CTX_MENU_W &&
+            ny >= g.ctx_y && ny < g.ctx_y + mh) {
+            int rel = ny - g.ctx_y - CTX_MENU_PAD;
+            int idx = rel / CTX_MENU_ITEM_H;
+            if (idx >= 0 && idx < g.ctx_count &&
+                g.ctx_items[idx].id != CTX_MENU_SEPARATOR)
+                g.ctx_hover = idx;
+            else
+                g.ctx_hover = -1;
+        } else {
+            g.ctx_hover = -1;
+        }
+        if (g.ctx_hover != old_hover) g.dirty = true;
+    }
 }
 
 /* ---- compositor (idle context) ------------------------------------ */
 
-/* Draw the title-bar close button. The "X" is two diagonal strokes
- * built out of single-pixel rects -- avoids depending on a glyph and
- * looks crisp at 14 px. */
-static void paint_close_button(const struct window *w) {
+/* M37: paint all three KDE Breeze-style window control buttons:
+ * minimize (line), maximize (rect), close (X). Each occupies
+ * GUI_*_BTN_SIZE px and has hover highlighting. */
+static void paint_window_buttons(const struct window *w) {
     const struct theme_palette *t = theme_active();
-    int bx, by, bw, bh; close_btn_rect(w, &bx, &by, &bw, &bh);
-    /* Hot if the cursor is over it. */
-    bool hot = (g.cur_x >= bx && g.cur_x < bx + bw &&
-                g.cur_y >= by && g.cur_y < by + bh);
-    gfx_fill_rect(bx, by, bw, bh, hot ? t->close_bg_hot : t->close_bg);
-    gfx_draw_rect(bx, by, bw, bh, hot ? t->close_fg : t->win_border);
-    if (!hot && bw > 4) {
+    int bx, by, bw, bh;
+
+    /* ---- Close button (rightmost, red-on-hover) ---- */
+    close_btn_rect(w, &bx, &by, &bw, &bh);
+    bool hot_close = (g.cur_x >= bx && g.cur_x < bx + bw &&
+                      g.cur_y >= by && g.cur_y < by + bh);
+    gfx_fill_rect(bx, by, bw, bh, hot_close ? t->close_bg_hot : t->close_bg);
+    gfx_draw_rect(bx, by, bw, bh, hot_close ? t->close_fg : t->win_border);
+    if (!hot_close && bw > 4) {
         gfx_fill_rect(bx + 2, by, bw - 4, 1, t->accent_magenta);
     }
-    /* Two diagonals. */
-    int pad = 3;
+    int pad = 4;
     for (int i = 0; i < bw - 2 * pad; i++) {
-        gfx_set_pixel(bx + pad + i, by + pad + i,             t->close_fg);
-        gfx_set_pixel(bx + bw - pad - 1 - i, by + pad + i,    t->close_fg);
+        gfx_set_pixel(bx + pad + i, by + pad + i,           t->close_fg);
+        gfx_set_pixel(bx + bw - pad - 1 - i, by + pad + i, t->close_fg);
     }
+
+    /* ---- Maximize button (outlined rectangle) ---- */
+    max_btn_rect(w, &bx, &by, &bw, &bh);
+    bool hot_max = (g.cur_x >= bx && g.cur_x < bx + bw &&
+                    g.cur_y >= by && g.cur_y < by + bh);
+    gfx_fill_rect(bx, by, bw, bh, hot_max ? t->tray_bg_hot : t->close_bg);
+    gfx_draw_rect(bx, by, bw, bh, hot_max ? t->accent_cyan : t->win_border);
+    gfx_draw_rect(bx + 4, by + 4, bw - 8, bh - 8,
+                  hot_max ? t->text_primary : t->title_text_dim);
+
+    /* ---- Minimize button (horizontal line) ---- */
+    min_btn_rect(w, &bx, &by, &bw, &bh);
+    bool hot_min = (g.cur_x >= bx && g.cur_x < bx + bw &&
+                    g.cur_y >= by && g.cur_y < by + bh);
+    gfx_fill_rect(bx, by, bw, bh, hot_min ? t->tray_bg_hot : t->close_bg);
+    gfx_draw_rect(bx, by, bw, bh, hot_min ? t->accent_cyan : t->win_border);
+    gfx_fill_rect(bx + 4, by + bh / 2, bw - 8, 2,
+                  hot_min ? t->text_primary : t->title_text_dim);
 }
 
 static void paint_window_shadow(const struct window *w, bool focused) {
     const struct theme_palette *t = theme_active();
     int ow = outer_w(w);
     int oh = outer_h(w);
-    if ((t->win_shadow_deep >> 24) != 0) {
-        gfx_fill_rect_blend(w->x + 8, w->y + 10, ow, oh, t->win_shadow_deep);
-    }
+
+    /* Multi-pass graduated shadow: 5 concentric rings with decreasing
+     * alpha simulate a gaussian blur without actual convolution. */
     if ((t->win_shadow >> 24) != 0) {
-        gfx_fill_rect_blend(w->x + 3, w->y + 4, ow + 6, oh + 6, t->win_shadow);
+        for (int i = 5; i >= 1; i--) {
+            uint32_t a = (uint32_t)(10 + i * 9);
+            gfx_fill_rounded_rect_blend(w->x - i + 3, w->y - i + 4,
+                                        ow + i * 2, oh + i * 2,
+                                        3 + i, a << 24);
+        }
     }
+
     if (focused) {
-        gfx_fill_rect_blend(w->x - 1, w->y - 1, ow + 2, 1,
-                            argb(0x80, t->accent_cyan));
-        gfx_fill_rect_blend(w->x - 1, w->y, 1, oh,
-                            argb(0x30, t->accent_cyan));
-        gfx_fill_rect_blend(w->x + ow, w->y, 1, oh,
-                            argb(0x30, t->accent_magenta));
+        uint32_t glow = argb(0x40, t->accent_cyan);
+        gfx_fill_rect_blend(w->x - 2, w->y - 2, ow + 4, 2, glow);
+        gfx_fill_rect_blend(w->x - 2, w->y + oh, ow + 4, 2, glow);
+        gfx_fill_rect_blend(w->x - 2, w->y, 2, oh, glow);
+        gfx_fill_rect_blend(w->x + ow, w->y, 2, oh, glow);
     }
 }
 
@@ -1547,11 +2312,21 @@ static void paint_soft_panel(int x, int y, int w, int h,
                              uint32_t fill, uint32_t glass,
                              uint32_t border, uint32_t accent) {
     if (w <= 0 || h <= 0) return;
-    gfx_fill_rect_blend(x + 7, y + 9, w, h, 0x56000000u);
+    /* Acrylic blur: frosted-glass effect behind the panel */
+    gfx_box_blur_region(x, y, w, h, 2);
+    /* Multi-layer shadow for depth */
+    gfx_fill_rect_blend(x + 8, y + 10, w, h, 0x40000000u);
+    gfx_fill_rect_blend(x + 5, y + 7, w, h, 0x28000000u);
     paint_glass_rect(x, y, w, h, fill, glass, border, accent);
     if (w > 6 && h > 6) {
-        gfx_fill_rect_blend(x + 2, y + 2, w - 4, 1, 0x20FFFFFFu);
-        gfx_fill_rect_blend(x + 2, y + h - 3, w - 4, 1, argb(0x20, accent));
+        /* Top inner glow */
+        gfx_fill_rect_blend(x + 3, y + 2, w - 6, 1, 0x28FFFFFFu);
+        gfx_fill_rect_blend(x + 4, y + 3, w - 8, 1, 0x10FFFFFFu);
+        /* Bottom accent edge */
+        gfx_fill_rect_blend(x + 2, y + h - 3, w - 4, 1, argb(0x24, accent));
+        /* Side inner glow */
+        gfx_fill_rect_blend(x + 1, y + 4, 1, h - 8, 0x0CFFFFFFu);
+        gfx_fill_rect_blend(x + w - 2, y + 4, 1, h - 8, 0x08000000u);
     }
 }
 
@@ -1585,55 +2360,75 @@ static void paint_icon_symbol(int x, int y, int kind,
                               uint32_t fg, uint32_t dim) {
     switch (kind) {
     case 0: /* monitor */
-        gfx_draw_rect(x + 2, y + 3, 24, 16, fg);
-        gfx_fill_rect(x + 5, y + 6, 18, 1, dim);
-        gfx_fill_rect(x + 12, y + 20, 4, 4, fg);
-        gfx_fill_rect(x + 7, y + 24, 14, 2, fg);
+        gfx_fill_rounded_rect_blend(x + 2, y + 3, 24, 16, 3, argb(0x40, fg));
+        gfx_fill_rounded_rect(x + 3, y + 4, 22, 14, 2, 0x00101828u);
+        gfx_draw_rect(x + 3, y + 4, 22, 14, fg);
+        gfx_fill_rect_blend(x + 5, y + 6, 18, 10, argb(0x20, dim));
+        gfx_fill_rect(x + 12, y + 19, 4, 4, fg);
+        gfx_fill_rounded_rect(x + 8, y + 23, 12, 3, 1, fg);
         break;
     case 1: /* folder */
-        gfx_draw_rect(x + 1, y + 8, 26, 17, fg);
-        gfx_fill_rect(x + 3, y + 5, 10, 4, fg);
-        gfx_fill_rect(x + 4, y + 12, 20, 1, dim);
+        gfx_fill_rounded_rect_blend(x + 1, y + 8, 26, 17, 3, argb(0x30, fg));
+        gfx_fill_rounded_rect(x + 2, y + 9, 24, 15, 2, 0x00162030u);
+        gfx_draw_rect(x + 2, y + 9, 24, 15, fg);
+        gfx_fill_rounded_rect(x + 3, y + 5, 10, 5, 2, fg);
+        gfx_fill_rect_blend(x + 4, y + 13, 20, 1, argb(0x40, dim));
         break;
     case 2: /* bin */
-        gfx_draw_rect(x + 6, y + 8, 16, 19, fg);
-        gfx_fill_rect(x + 4, y + 5, 20, 2, fg);
+        gfx_fill_rounded_rect_blend(x + 6, y + 8, 16, 19, 2, argb(0x30, fg));
+        gfx_fill_rounded_rect(x + 7, y + 9, 14, 17, 2, 0x00101828u);
+        gfx_draw_rect(x + 7, y + 9, 14, 17, fg);
+        gfx_fill_rounded_rect(x + 5, y + 5, 18, 3, 1, fg);
         gfx_fill_rect(x + 10, y + 12, 1, 10, dim);
         gfx_fill_rect(x + 17, y + 12, 1, 10, dim);
         break;
     default: /* gear-ish control panel */
-        gfx_draw_rect(x + 7, y + 7, 14, 14, fg);
-        gfx_draw_rect(x + 11, y + 11, 6, 6, dim);
-        gfx_fill_rect(x + 13, y + 2, 2, 6, fg);
-        gfx_fill_rect(x + 13, y + 20, 2, 6, fg);
-        gfx_fill_rect(x + 2, y + 13, 6, 2, fg);
-        gfx_fill_rect(x + 20, y + 13, 6, 2, fg);
+        gfx_fill_rounded_rect_blend(x + 5, y + 5, 18, 18, 9, argb(0x30, fg));
+        gfx_fill_rounded_rect(x + 8, y + 8, 12, 12, 6, 0x00101828u);
+        gfx_draw_rect(x + 9, y + 9, 10, 10, dim);
+        gfx_fill_rect(x + 13, y + 2, 2, 5, fg);
+        gfx_fill_rect(x + 13, y + 21, 2, 5, fg);
+        gfx_fill_rect(x + 2, y + 13, 5, 2, fg);
+        gfx_fill_rect(x + 21, y + 13, 5, 2, fg);
+        gfx_fill_rect(x + 5, y + 5, 3, 2, fg);
+        gfx_fill_rect(x + 20, y + 5, 3, 2, fg);
+        gfx_fill_rect(x + 5, y + 21, 3, 2, fg);
+        gfx_fill_rect(x + 20, y + 21, 3, 2, fg);
         break;
     }
 }
 
-static void paint_desktop_icon(int x, int y, const char *label, int kind) {
+static void paint_desktop_icon(int x, int y, const char *label,
+                               int kind, bool selected) {
     const struct theme_palette *t = theme_active();
     bool hot = (g.cur_x >= x && g.cur_x < x + 64 &&
                 g.cur_y >= y && g.cur_y < y + 66);
+    if (selected) {
+        gfx_fill_rounded_rect_blend(x + 1, y - 4, 64, 74, 5, argb(0x28, t->accent_cyan));
+        gfx_fill_rounded_rect_blend(x + 3, y - 2, 60, 70, 4, argb(0x18, t->accent_cyan));
+    } else if (hot) {
+        gfx_fill_rounded_rect_blend(x + 2, y - 3, 62, 72, 4, argb(0x14, t->accent_cyan));
+    }
     paint_soft_panel(x + 5, y, 48, 42,
-                     hot ? t->center_item_hot : t->panel,
-                     argb(hot ? 0x64 : 0x30, t->panel),
-                     hot ? t->border_cyan : t->tray_border,
+                     (selected || hot) ? t->center_item_hot : t->panel,
+                     argb((selected || hot) ? 0x64 : 0x30, t->panel),
+                     selected ? t->accent_cyan :
+                                (hot ? t->border_cyan : t->tray_border),
                      kind == 2 ? t->glow_orange : t->glow_cyan);
     paint_icon_symbol(x + 15, y + 7, kind, t->glow_orange, t->glow_cyan);
-    int tx = x + (58 - str_px(label)) / 2;
+    int llen = 0; while (label[llen]) llen++;
+    int tx = x + (58 - llen * 8) / 2;
     if (tx < x) tx = x;
-    gfx_draw_text(tx, y + 48, label, t->text_primary, GFX_TRANSPARENT);
+    gfx_draw_text_smooth(tx, y + 46, label, t->text_primary, GFX_TRANSPARENT, 2);
 }
 
 static void paint_desktop_icons(int top_y) {
     int x = 16;
     int y = top_y;
-    paint_desktop_icon(x, y,       "This PC",       0);
-    paint_desktop_icon(x, y + 74,  "TobyOS",        1);
-    paint_desktop_icon(x, y + 148, "Recycle Bin",   2);
-    paint_desktop_icon(x, y + 222, "Control Panel", 3);
+    paint_desktop_icon(x, y,       "This PC",       0, g.selected_icon == 0);
+    paint_desktop_icon(x, y + 74,  "TobyOS",        1, g.selected_icon == 1);
+    paint_desktop_icon(x, y + 148, "Recycle Bin",   2, g.selected_icon == 2);
+    paint_desktop_icon(x, y + 222, "Control Panel", 3, g.selected_icon == 3);
 }
 
 static void paint_city_wallpaper(int W, int desk_h,
@@ -1643,6 +2438,32 @@ static void paint_city_wallpaper(int W, int desk_h,
     int base = desk_h - 54;
     if (base < horizon + 30) base = horizon + 30;
 
+    /* Multi-band sky gradient: dark top -> deep purple at horizon */
+    int sky_bands = 6;
+    int band_h = horizon / sky_bands;
+    if (band_h < 1) band_h = 1;
+    for (int b = 0; b < sky_bands; b++) {
+        int by = b * band_h;
+        int bh = (b == sky_bands - 1) ? (horizon - by) : band_h;
+        uint32_t alpha = (uint32_t)(4 + b * 5);
+        uint32_t col = (b < 3) ? t->accent_magenta : t->glow_cyan;
+        gfx_fill_rect_blend(0, by, W, bh, argb((uint8_t)alpha, col));
+    }
+
+    /* Faint radial glow at center horizon */
+    int glow_w = W / 3;
+    int glow_cx = W / 2;
+    for (int gi = 4; gi >= 1; gi--) {
+        int gx = glow_cx - glow_w / 2 - gi * 20;
+        int gw = glow_w + gi * 40;
+        int gy = horizon - 30 - gi * 8;
+        int gh = 40 + gi * 8;
+        uint32_t ga = (uint32_t)(6 + gi * 3);
+        gfx_fill_rect_blend(gx < 0 ? 0 : gx, gy, gw > W ? W : gw, gh,
+                            argb((uint8_t)ga, t->accent_magenta));
+    }
+
+    /* City buildings */
     static const int widths[18] =
         { 42, 26, 58, 34, 48, 70, 30, 54, 40, 64, 28, 52, 36, 68, 44, 32, 56, 38 };
     for (int i = 0; i < 18; i++) {
@@ -1653,6 +2474,8 @@ static void paint_city_wallpaper(int W, int desk_h,
         if (y < 46) y = 46;
         uint32_t fill = color_mix(t->bg, 0x00050A16u, i & 1, 3);
         gfx_fill_rect_blend(x, y, bw, base - y, argb(0xD0, fill));
+        /* Top edge highlight on buildings */
+        gfx_fill_rect_blend(x + 1, y, bw - 2, 1, argb(0x40, t->glow_cyan));
         gfx_draw_rect(x, y, bw, base - y, (i & 1) ? t->border_cyan : t->win_border);
         for (int wy = y + 12; wy < base - 8; wy += 14) {
             for (int wx = x + 6; wx < x + bw - 8; wx += 12) {
@@ -1666,15 +2489,30 @@ static void paint_city_wallpaper(int W, int desk_h,
         }
     }
 
+    /* Horizon accent lines */
     gfx_fill_rect_blend(0, horizon - 2, W, 2, argb(0x90, t->accent_magenta));
+    gfx_fill_rect_blend(0, horizon, W, 1, argb(0x60, t->glow_cyan));
     gfx_fill_rect_blend(0, horizon + 5, W, 1, argb(0x80, t->glow_cyan));
-    for (int r = 0; r < 8; r++) {
-        int yy = base + r * 7;
+
+    /* Water reflection lines below city */
+    for (int r = 0; r < 12; r++) {
+        int yy = base + r * 5;
         if (yy >= desk_h) break;
-        gfx_fill_rect_blend(0, yy, W, 1,
-                            argb((uint8_t)(0x54 - r * 4),
-                                 (r & 1) ? t->glow_orange : t->glow_cyan));
+        uint32_t ra = (uint32_t)(0x44 - r * 4);
+        if (ra < 8) ra = 8;
+        uint32_t col = (r & 1) ? t->glow_orange : t->glow_cyan;
+        gfx_fill_rect_blend(0, yy, W, 1, argb((uint8_t)ra, col));
+        /* Faint building reflection (mirrored, faded) */
+        if (r < 6) {
+            int rx = (r * 127 + 50) % (W - 60);
+            int rw = widths[r % 18] - 4;
+            if (rw > 4) {
+                gfx_fill_rect_blend(rx, yy, rw, 1,
+                                    argb((uint8_t)(0x18 - r * 2), t->accent_cyan));
+            }
+        }
     }
+    /* Perspective lines */
     draw_line(W / 2 - 70, horizon + 10, W / 2 - 210, desk_h - 1, t->bg_grid);
     draw_line(W / 2 + 70, horizon + 10, W / 2 + 210, desk_h - 1, t->bg_grid);
 }
@@ -1692,8 +2530,8 @@ static void paint_top_hud(int W) {
 
     int mid = W / 3;
     gfx_fill_rect_blend(mid - 26, 8, 1, 26, argb(0x50, t->win_border));
-    gfx_draw_text(mid, 10, "MAY 2026", t->text_primary, GFX_TRANSPARENT);
-    gfx_draw_text(mid, 25, "BUILD PREVIEW", t->text_secondary,
+    gfx_draw_text16(mid, 8, "MAY 2026", t->text_primary, GFX_TRANSPARENT);
+    gfx_draw_text(mid, 26, "BUILD PREVIEW", t->text_secondary,
                   GFX_TRANSPARENT);
 
     int eqx = W / 2 - 60;
@@ -1726,25 +2564,31 @@ static void paint_top_hud(int W) {
     }
 }
 
-/* Retired M36 prototype artwork. The shell now launches real GUI apps
- * for File Explorer and Settings; keep this disabled reference nearby
- * only while the real apps catch up visually. */
+/* Mock window artwork retained for future use (e.g. screenshots,
+ * demo mode). Not drawn during normal operation -- the desktop shows
+ * a clean wallpaper when no windows are open (Windows 10 behaviour). */
 #if 0
 static void paint_mock_window_frame(int x, int y, int w, int h,
                                     const char *title, uint32_t accent) {
     const struct theme_palette *t = theme_active();
     paint_soft_panel(x, y, w, h, t->panel, t->panel_glass,
                      t->win_border, accent);
-    fill_vgradient(x + 1, y + 1, w - 2, 28,
-                   t->title_focus_hi, t->title_focus, 4);
-    gfx_fill_rect(x + 1, y + 28, w - 2, 1, accent);
-    paint_window_glyph(x + 12, y + 9, accent, t->glow_orange);
-    gfx_draw_text(x + 30, y + 10, title, t->text_primary, GFX_TRANSPARENT);
+    /* M37: match the taller GUI_TITLE_BAR_H for mock windows. */
+    int tb = GUI_TITLE_BAR_H;
+    fill_vgradient(x + 1, y + 1, w - 2, tb - 2,
+                   t->title_focus_hi, t->title_focus, 5);
+    gfx_fill_rect_blend(x + 1, y + 1, w - 2, 1, 0x28FFFFFFu);
+    gfx_fill_rect(x + 1, y + tb - 1, w - 2, 1, accent);
+    paint_window_glyph(x + 12, y + (tb - 10) / 2, accent, t->glow_orange);
+    gfx_draw_text(x + 30, y + (tb - 8) / 2, title, t->text_primary,
+                  GFX_TRANSPARENT);
 
-    int cx = x + w - 78;
-    gfx_draw_text(cx,      y + 10, "-", t->text_secondary, GFX_TRANSPARENT);
-    gfx_draw_text(cx + 28, y + 10, "[]", t->text_secondary, GFX_TRANSPARENT);
-    gfx_draw_text(cx + 60, y + 10, "X", t->danger, GFX_TRANSPARENT);
+    /* KDE Breeze-style min/max/close buttons. */
+    int bx = x + w - 80;
+    int by = y + (tb - 14) / 2;
+    gfx_draw_text(bx,      by, "-",  t->text_secondary, GFX_TRANSPARENT);
+    gfx_draw_rect(bx + 26, by, 12, 12, t->text_secondary);
+    gfx_draw_text(bx + 56, by, "X",  t->danger, GFX_TRANSPARENT);
 }
 
 static void paint_mock_folder(int x, int y, const char *label,
@@ -1783,7 +2627,7 @@ static void paint_file_explorer_mock(int W, int desk_h) {
 
     paint_mock_window_frame(x, y, w, h, "This PC", t->border_cyan);
 
-    int toolbar_y = y + 38;
+    int toolbar_y = y + GUI_TITLE_BAR_H + 8;
     gfx_draw_text(x + 14, toolbar_y + 8, "<  >  ^", t->text_primary,
                   GFX_TRANSPARENT);
     paint_soft_panel(x + 92, toolbar_y, w - 226, 24, 0x00070C16u,
@@ -1796,7 +2640,7 @@ static void paint_file_explorer_mock(int W, int desk_h) {
                   GFX_TRANSPARENT);
 
     int side_w = 128;
-    int body_y = y + 72;
+    int body_y = y + GUI_TITLE_BAR_H + 42;
     gfx_fill_rect_blend(x + 1, body_y, side_w, h - 74, argb(0x70, 0x00081218u));
     const char *nav[] = { "Quick access", "Desktop", "Downloads", "Documents",
                           "Pictures", "Music", "This PC", "Network" };
@@ -1867,7 +2711,7 @@ static void paint_settings_mock(int W, int desk_h) {
     if (h < 172) return;
 
     paint_mock_window_frame(x, y, w, h, "Settings", t->border_orange);
-    int body_y = y + 36;
+    int body_y = y + GUI_TITLE_BAR_H + 6;
     int side_w = 136;
     gfx_fill_rect_blend(x + 1, body_y, side_w, h - 38, argb(0x72, 0x00081218u));
     const char *nav[] = { "Home", "System", "Devices", "Network",
@@ -1937,7 +2781,7 @@ static void paint_settings_mock(int W, int desk_h) {
     gfx_draw_text(x + w - 54, row_y + 10, "75%", t->text_primary,
                   GFX_TRANSPARENT);
 }
-#endif
+#endif /* mock window artwork */
 
 static void paint_quick_tile(int x, int y, int w, const char *a,
                              const char *b, bool on) {
@@ -2099,10 +2943,9 @@ static void paint_right_widgets(int W, int desk_h) {
 }
 
 static void paint_shell_widgets(int W, int desk_h) {
-    /* M36: the old static File Explorer / Settings poster windows were
-     * removed. Those surfaces now launch as real user-space GUI apps.
-     * The remaining right-hand stack is compositor-owned shell chrome:
-     * notification center, quick settings, and system monitor. */
+    /* M37: right-side widget stack (notifications, quick settings,
+     * system monitor). When no windows are open the desktop is just
+     * the wallpaper + taskbar + icons -- Windows 10 style. */
     paint_right_widgets(W, desk_h);
 }
 
@@ -2111,101 +2954,232 @@ static void compositor_paint_one(struct window *w, bool focused) {
     int ow = outer_w(w);
     int oh = outer_h(w);
 
-    paint_window_shadow(w, focused);
-
-    fill_vgradient(w->x, w->y, ow, GUI_TITLE_BAR_H,
-                   focused ? t->title_focus_hi : t->title_unfocus_hi,
-                   focused ? t->title_focus    : t->title_unfocus,
-                   5);
-    gfx_fill_rect_blend(w->x + 1, w->y + 1, ow - 2, 1, 0x30FFFFFFu);
-    gfx_fill_rect(w->x, w->y + GUI_TITLE_BAR_H - 1, ow, 1,
-                  focused ? t->win_glow : t->win_border);
-    paint_window_glyph(w->x + 8, w->y + (GUI_TITLE_BAR_H - 10) / 2,
-                       focused ? t->accent_cyan : t->title_text_dim,
-                       focused ? t->accent_magenta : t->win_border);
-    if (w->title[0]) {
-        gfx_draw_text(w->x + 24, w->y + (GUI_TITLE_BAR_H - 8) / 2, w->title,
-                      focused ? t->title_text : t->title_text_dim,
-                      GFX_TRANSPARENT);
+    /* During login (session not yet active) or during the login window's
+     * fade-out (opacity < 255 on a maximized window), skip chrome so the
+     * login window appears borderless/fullscreen. */
+    if (!session_active() ||
+        (w->state == GUI_WIN_MAXIMIZED && w->opacity < 255 && w->opacity > 0)) {
+        if (w->backbuf) {
+            if (w->opacity >= 255) {
+                gfx_blit(w->x, w->y,
+                         w->client_w, w->client_h,
+                         w->backbuf, w->client_w);
+            } else {
+                /* Fade: blend with per-pixel alpha at (x, y) without chrome offset */
+                uint8_t alpha = w->opacity;
+                int cw = w->client_w, ch = w->client_h;
+                int dx = w->x, dy = w->y;
+                uint32_t *bb = gfx_backbuf();
+                int scr_w = (int)gfx_width();
+                int scr_h = (int)gfx_height();
+                for (int row = 0; row < ch; row++) {
+                    int desty = dy + row;
+                    if (desty < 0 || desty >= scr_h) continue;
+                    uint32_t *src_row = &w->backbuf[row * cw];
+                    uint32_t *dst_row = &bb[desty * scr_w + dx];
+                    for (int col = 0; col < cw; col++) {
+                        int destx = dx + col;
+                        if (destx < 0 || destx >= scr_w) continue;
+                        uint32_t sp = src_row[col];
+                        uint32_t dp = dst_row[col];
+                        uint32_t sr = (sp >> 16) & 0xFF;
+                        uint32_t sg = (sp >>  8) & 0xFF;
+                        uint32_t sb =  sp        & 0xFF;
+                        uint32_t dr = (dp >> 16) & 0xFF;
+                        uint32_t dg = (dp >>  8) & 0xFF;
+                        uint32_t db =  dp        & 0xFF;
+                        uint32_t or_ = (sr * alpha + dr * (255 - alpha)) / 255;
+                        uint32_t og  = (sg * alpha + dg * (255 - alpha)) / 255;
+                        uint32_t ob  = (sb * alpha + db * (255 - alpha)) / 255;
+                        dst_row[col] = 0xFF000000u | (or_ << 16) | (og << 8) | ob;
+                    }
+                }
+            }
+        }
+        return;
     }
 
-    gfx_blit(w->x + GUI_BORDER, w->y + GUI_TITLE_BAR_H,
-             w->client_w, w->client_h,
-             w->backbuf, w->client_w);
+    paint_window_shadow(w, focused);
 
+    /* Title bar: 4-band gradient with rounded top corners for depth. */
+    uint32_t tb_top = focused ? t->title_focus_hi : t->title_unfocus_hi;
+    uint32_t tb_bot = focused ? t->title_focus    : t->title_unfocus;
+    int band = GUI_TITLE_BAR_H / 4;
+    int rem = GUI_TITLE_BAR_H - band * 4;
+
+    /* Top band with rounded corners */
+    gfx_fill_rounded_rect(w->x, w->y, ow, band + 2, 5, tb_top);
+    /* Upper-mid band: interpolate */
+    uint32_t mid1 = argb(0x10, 0x00FFFFFFu);
+    gfx_fill_rect(w->x, w->y + band, ow, band, tb_top);
+    gfx_fill_rect_blend(w->x, w->y + band, ow, band, mid1);
+    /* Lower-mid band */
+    gfx_fill_rect(w->x, w->y + band * 2, ow, band, tb_bot);
+    /* Bottom band */
+    gfx_fill_rect(w->x, w->y + band * 3, ow, band + rem, tb_bot);
+    gfx_fill_rect_blend(w->x, w->y + band * 3, ow, band + rem, 0x08000000u);
+    /* Subtle highlight on top edge */
+    gfx_fill_rect_blend(w->x + 5, w->y + 1, ow - 10, 1, 0x30FFFFFFu);
+    /* Second highlight for glossy effect */
+    gfx_fill_rect_blend(w->x + 3, w->y + 2, ow - 6, 1, 0x18FFFFFFu);
+    /* Accent line at bottom */
+    gfx_fill_rect(w->x, w->y + GUI_TITLE_BAR_H - 1, ow, 1,
+                  focused ? t->win_glow : t->win_border);
+
+    /* Window icon glyph. */
+    paint_window_glyph(w->x + 10, w->y + (GUI_TITLE_BAR_H - 10) / 2,
+                       focused ? t->accent_cyan : t->title_text_dim,
+                       focused ? t->accent_magenta : t->win_border);
+    /* Title text: smoothed 2x scale for anti-aliased rendering. */
+    if (w->title[0]) {
+        gfx_draw_text_smooth(w->x + 28, w->y + (GUI_TITLE_BAR_H - 16) / 2,
+                        w->title,
+                        focused ? t->title_text : t->title_text_dim,
+                        GFX_TRANSPARENT, 2);
+    }
+
+    /* Client area blit. */
+    if (w->opacity < 255) {
+        /* Per-pixel alpha blit: stamp each pixel with the window's
+         * opacity so gfx_blit_blend composites correctly. We write
+         * a temporary alpha row-by-row to avoid a full copy. */
+        uint8_t alpha = w->opacity;
+        int cw = w->client_w, ch = w->client_h;
+        int dx = w->x + GUI_BORDER, dy = w->y + GUI_TITLE_BAR_H;
+        uint32_t *bb = gfx_backbuf();
+        int sw = (int)gfx_width();
+        for (int row = 0; row < ch; row++) {
+            int desty = dy + row;
+            if (desty < 0 || desty >= (int)gfx_height()) continue;
+            uint32_t *src_row = &w->backbuf[row * cw];
+            uint32_t *dst_row = &bb[desty * sw + dx];
+            for (int col = 0; col < cw; col++) {
+                int destx = dx + col;
+                if (destx < 0 || destx >= sw) continue;
+                uint32_t src_px = src_row[col];
+                uint32_t dst_px = dst_row[col];
+                uint32_t sr = (src_px >> 16) & 0xFF;
+                uint32_t sg = (src_px >>  8) & 0xFF;
+                uint32_t sb =  src_px        & 0xFF;
+                uint32_t dr = (dst_px >> 16) & 0xFF;
+                uint32_t dg = (dst_px >>  8) & 0xFF;
+                uint32_t db =  dst_px        & 0xFF;
+                uint32_t a = (uint32_t)alpha;
+                uint32_t or_ = (sr * a + dr * (255 - a) + 127) / 255;
+                uint32_t og  = (sg * a + dg * (255 - a) + 127) / 255;
+                uint32_t ob  = (sb * a + db * (255 - a) + 127) / 255;
+                dst_row[col] = (or_ << 16) | (og << 8) | ob;
+            }
+        }
+    } else {
+        gfx_blit(w->x + GUI_BORDER, w->y + GUI_TITLE_BAR_H,
+                 w->client_w, w->client_h,
+                 w->backbuf, w->client_w);
+    }
+
+    /* Outer border. */
     gfx_draw_rect(w->x, w->y, ow, oh, t->win_border);
-    paint_close_button(w);
+    paint_window_buttons(w);
 }
 
-/* Wallpaper: theme-driven bg + optional grid + darker top band +
- * brand text in the middle. Cheap to paint, gives the empty desktop
- * a sense of place. M31 adds the cyber palette's optional grid
- * lines and a thin scanline band. */
+/* Render the static wallpaper background into the cache buffer.
+ * Called once at startup and again on theme/resolution change. */
+static void render_wallpaper_to_cache(void) {
+    const struct theme_palette *t = theme_active();
+    int W = (int)gfx_width(), H = (int)gfx_height();
+    int desk_h = H - GUI_TASKBAR_H;
+    if (desk_h < 1) desk_h = H;
+
+    uint32_t bg   = settings_get_u32("desktop.bg",      t->bg);
+    uint32_t band = settings_get_u32("desktop.bg_band", t->bg_band);
+    (void)band;
+    if (t->id == THEME_CYBER && bg == 0x00204060u) {
+        bg = t->bg;
+    }
+
+    /* Render gradient + grid + city into the backbuffer, then snapshot. */
+    fill_vgradient(0, 0, W, desk_h, bg, t->bg_vignette, 24);
+    if (desk_h < H) {
+        gfx_fill_rect(0, desk_h, W, H - desk_h, t->taskbar);
+    }
+    if (t->bg_grid_step > 0) {
+        int step = t->bg_grid_step;
+        for (int x = 0; x < W; x += step)
+            gfx_fill_rect_blend(x, 0, 1, desk_h, argb(0x55, t->bg_grid));
+        for (int y = 0; y < desk_h; y += step)
+            gfx_fill_rect_blend(0, y, W, 1, argb(0x55, t->bg_grid));
+    }
+    if (t->id == THEME_CYBER) {
+        paint_city_wallpaper(W, desk_h, t);
+    }
+    if (t->scanline) {
+        int sy = desk_h / 3;
+        gfx_fill_rect_blend(0, sy, W, 8, argb(0x14, t->accent_cyan));
+    }
+
+    /* Copy the rendered wallpaper from backbuf into the cache. */
+    size_t pixels = (size_t)W * (size_t)H;
+    memcpy(g.wp_cache, gfx_backbuf(), pixels * 4);
+    g.wp_cache_w = (uint32_t)W;
+    g.wp_cache_h = (uint32_t)H;
+    g.wp_cache_theme_id = t->id;
+}
+
+/* Paint wallpaper: blit from cache (fast memcpy) then draw dynamic
+ * overlays (icons, HUD, widgets). The cache avoids re-computing the
+ * expensive gradient + grid + city + scanline every single frame. */
 static void paint_wallpaper(void) {
     const struct theme_palette *t = theme_active();
     int W = (int)gfx_width(), H = (int)gfx_height();
     int desk_h = H - GUI_TASKBAR_H;
     if (desk_h < 1) desk_h = H;
 
-    /* Milestone 14: per-key overrides via /data/settings.conf so the
-     * Settings GUI app can tweak the desktop colour live (and across
-     * reboots). The theme palette is the FALLBACK -- explicit
-     * settings still win. */
-    uint32_t bg   = settings_get_u32("desktop.bg",      t->bg);
-    uint32_t band = settings_get_u32("desktop.bg_band", t->bg_band);
-    if (t->id == THEME_CYBER && bg == 0x00204060u) {
-        bg = t->bg;   /* migrate the old baked-in blue to the theme look */
+    /* Allocate or invalidate cache on first use / size change / theme swap */
+    bool need_render = false;
+    if (!g.wp_cache || g.wp_cache_w != (uint32_t)W ||
+        g.wp_cache_h != (uint32_t)H || g.wp_cache_theme_id != (uint32_t)t->id) {
+        if (g.wp_cache) kfree(g.wp_cache);
+        size_t bytes = (size_t)W * (size_t)H * 4;
+        g.wp_cache = (uint32_t *)kmalloc(bytes);
+        need_render = true;
     }
-    fill_vgradient(0, 0, W, desk_h, bg, t->bg_vignette, 24);
-    if (desk_h < H) {
-        gfx_fill_rect(0, desk_h, W, H - desk_h, t->taskbar);
+    if (need_render && g.wp_cache) {
+        render_wallpaper_to_cache();
     }
 
-    /* M31 cyber: faint grid overlay. Step==0 means "no grid"
-     * (basic theme). We draw 1-px lines spaced t->bg_grid_step
-     * apart -- cheap to fill_rect on a framebuffer of any size. */
-    if (t->bg_grid_step > 0) {
-        int step = t->bg_grid_step;
-        for (int x = 0; x < W; x += step) {
-            gfx_fill_rect_blend(x, 0, 1, desk_h, argb(0x55, t->bg_grid));
+    /* Fast blit from cache -> backbuffer */
+    if (g.wp_cache) {
+        memcpy(gfx_backbuf(), g.wp_cache, (size_t)W * (size_t)H * 4);
+    } else {
+        gfx_clear(t->bg);
+    }
+
+    /* Dynamic overlays painted on top of cached wallpaper */
+    if (session_active()) {
+        /* Suppress overlays if a fullscreen window at full opacity covers all */
+        bool covered = false;
+        for (struct window *fw = g.z_top; fw; fw = fw->z_next) {
+            if (fw->state == GUI_WIN_MAXIMIZED && fw->opacity >= 255 &&
+                fw->client_w >= W && fw->client_h >= H) {
+                covered = true;
+                break;
+            }
         }
-        for (int y = 0; y < desk_h; y += step) {
-            gfx_fill_rect_blend(0, y, W, 1, argb(0x55, t->bg_grid));
+        if (!covered) {
+            paint_top_hud(W);
+            paint_desktop_icons(58);
+            paint_shell_widgets(W, desk_h);
+
+            const char *hint =
+                "F1=dump  F2=force-exit desktop  (F11/F12 also work; "
+                "Pause = panic exit)";
+            int hlen = 0; while (hint[hlen]) hlen++;
+            int hx = W - hlen * 8 - 8;
+            if (hx < 8) hx = 8;
+            int hy = desk_h - 14;
+            gfx_draw_text(hx, hy, hint, t->title_text_dim, GFX_TRANSPARENT);
         }
     }
-
-    /* City skyline placeholder: cheap geometric accents that make the
-     * empty desktop feel intentional without needing bitmap assets. */
-    if (t->id == THEME_CYBER) {
-        paint_city_wallpaper(W, desk_h, t);
-    }
-
-    /* M31 cyber: a subtle scanline band, 8 px tall, alpha-blended
-     * across the wallpaper one-third of the way down. We use the
-     * blend variant so the grid still shows underneath. */
-    if (t->scanline) {
-        int sy = desk_h / 3;
-        /* 0xRRGGBB into 0xAARRGGBB; A=0x14 (~8%) reads as a
-         * just-perceptible HUD band. */
-        gfx_fill_rect_blend(0, sy, W, 8, argb(0x14, t->accent_cyan));
-    }
-
-    (void)band;
-    paint_top_hud(W);
-    paint_desktop_icons(58);
-    paint_shell_widgets(W, desk_h);
-
-    /* Always-visible emergency-hotkey hint above the taskbar.
-     * Critical because the user can't see the serial-only hotkey
-     * reminder once the screen has switched away from text mode. */
-    const char *hint =
-        "F1=dump  F2=force-exit desktop  (F11/F12 also work; "
-        "Pause = panic exit)";
-    int hlen = 0; while (hint[hlen]) hlen++;
-    int hx = W - hlen * 8 - 8;
-    if (hx < 8) hx = 8;
-    int hy = desk_h - 14;
-    gfx_draw_text(hx, hy, hint, t->title_text_dim, GFX_TRANSPARENT);
 }
 
 /* Truncating copy: copies up to dst_max-1 chars from src to dst,
@@ -2225,117 +3199,171 @@ static void copy_clip(char *dst, int dst_max, const char *src) {
  * proc spawn for a clock) and avoids the focus / Z-order / input
  * routing complexity that real tray plugins would bring. */
 
-/* Paint a single pill: dark fill + 1-px accent border on top edge.
- * The "accent" colour is applied to the top-edge stripe ONLY, not
- * the whole border, so the row of pills reads as a HUD strip rather
- * than as outlined buttons. The hover state brightens the fill. */
+/* Paint a single pill with rounded corners and subtle hover glow.
+ * Windows-style tray items: rounded background, no harsh borders. */
 static void paint_pill(const struct tray_rect *r, bool hot, uint32_t accent) {
     if (!r->present) return;
     const struct theme_palette *t = theme_active();
-    paint_glass_rect(r->x, r->y, r->w, r->h,
-                     hot ? t->tray_bg_hot : t->tray_bg,
-                     argb(hot ? 0x60 : 0x38, t->tray_bg),
-                     t->tray_border, accent);
+    uint32_t bg = hot ? t->tray_bg_hot : t->tray_bg;
+    gfx_fill_rounded_rect_blend(r->x, r->y, r->w, r->h, 4,
+                                argb(hot ? 0xC0 : 0x80, bg));
+    if (hot) {
+        gfx_fill_rounded_rect_blend(r->x, r->y, r->w, 1, 0,
+                                    argb(0x40, accent));
+    }
+    (void)t;
 }
 
-/* Centred text inside a pill. Text is monospace 8x16, so column
- * count is len * 8 -- we pad on the left to centre. */
+/* Centred text inside a pill using the larger 8x16 font for clarity. */
 static void pill_text(const struct tray_rect *r, const char *s, uint32_t fg) {
     int len = 0; while (s[len]) len++;
     int tx = r->x + (r->w - len * 8) / 2;
     if (tx < r->x + 4) tx = r->x + 4;
-    int ty = r->y + (r->h - 8) / 2;
-    gfx_draw_text(tx, ty, s, fg, GFX_TRANSPARENT);
+    int ty = r->y + (r->h - 16) / 2;
+    if (ty < r->y + 1) ty = r->y + 1;
+    gfx_draw_text16(tx, ty, s, fg, GFX_TRANSPARENT);
 }
+
 
 /* Network pill: show the IP once configured; otherwise make the failure
  * class visible so bare-metal boots are debuggable without serial. */
 static void paint_tray_net(const struct tray_rect *r, bool hot) {
     const struct theme_palette *t = theme_active();
-    char text[24];
     bool up = net_is_up() && g_my_ip != 0;
     uint32_t accent = up ? t->status_ok : t->status_err;
     paint_pill(r, hot, accent);
     if (up) {
         char ip[16];
         net_format_ip(ip, g_my_ip);
-        ksnprintf(text, sizeof(text), "NET %s", ip);
-        pill_text(r, text, t->tray_text);
+        /* Two-line: "NET" on top, IP below */
+        int tx = r->x + (r->w - 3 * 8) / 2;
+        gfx_draw_text16(tx, r->y + 2, "NET", accent, GFX_TRANSPARENT);
+        int iplen = 0; while (ip[iplen]) iplen++;
+        int ix = r->x + (r->w - iplen * 8) / 2;
+        if (ix < r->x + 2) ix = r->x + 2;
+        gfx_draw_text(ix, r->y + 20, ip, t->tray_text_dim, GFX_TRANSPARENT);
     } else {
-        const char *label = "NET NO LINK";
+        const char *label = "NO LINK";
         switch (net_status()) {
-        case NET_STATUS_NO_NIC:     label = "NET NO NIC"; break;
-        case NET_STATUS_DHCP_WAIT:  label = "NET DHCP..."; break;
-        case NET_STATUS_DHCP_EMPTY: label = "NET EMPTY IP"; break;
+        case NET_STATUS_NO_NIC:     label = "NO NIC"; break;
+        case NET_STATUS_DHCP_WAIT:  label = "DHCP.."; break;
+        case NET_STATUS_DHCP_EMPTY: label = "NO IP"; break;
         default:                    break;
         }
         pill_text(r, label, t->tray_text_dim);
     }
 }
 
-/* Power pill: early shell mock shows AC/power status here. Battery
- * telemetry can replace this once ACPI battery reporting is promoted
- * into the tray API. */
+/* Power/battery pill: shows AC status with a small battery icon. */
 static void paint_tray_disk(const struct tray_rect *r, bool hot) {
     const struct theme_palette *t = theme_active();
     paint_pill(r, hot, t->status_ok);
-    pill_text(r, "PWR AC", t->tray_text);
+    /* Battery icon outline */
+    int bx = r->x + 8;
+    int by = r->y + (r->h - 10) / 2;
+    gfx_draw_rect(bx, by, 16, 10, t->tray_text);
+    gfx_fill_rect(bx + 16, by + 3, 2, 4, t->tray_text);
+    /* Filled to ~100% (AC connected) */
+    gfx_fill_rect(bx + 2, by + 2, 12, 6, t->status_ok);
+    /* "AC" text to the right */
+    gfx_draw_text16(bx + 22, r->y + (r->h - 16) / 2, "AC",
+                    t->tray_text, GFX_TRANSPARENT);
 }
 
-/* Audio pill: "AUD ON" if HDA controller probed, "AUD --" otherwise. */
+/* Audio pill: volume icon with level bar when HDA is present. */
 static void paint_tray_aud(const struct tray_rect *r, bool hot) {
     const struct theme_palette *t = theme_active();
     bool present = audio_hda_present();
     uint32_t accent = present ? t->status_ok : t->status_warn;
     paint_pill(r, hot, accent);
     if (present) {
-        pill_text(r, "AUD ON", t->tray_text);
+        pill_text(r, "VOL", t->tray_text);
+        /* Mini volume bar below text */
+        int bx = r->x + 8;
+        int bw = r->w - 16;
+        int by = r->y + r->h - 7;
+        gfx_fill_rect(bx, by, bw, 3, t->tray_border);
+        gfx_fill_rect(bx, by, (bw * 75) / 100, 3, accent);
     } else {
-        pill_text(r, "AUD --", t->tray_text_dim);
+        pill_text(r, "MUTE", t->tray_text_dim);
     }
 }
 
-/* Window-count pill: "WIN N" where N is the number of open windows.
- * Helps the operator see at a glance how many apps are running. */
+/* Window-count pill: shows number of open windows with a small
+ * cascade icon representation. */
 static void paint_tray_win(const struct tray_rect *r, bool hot) {
     const struct theme_palette *t = theme_active();
     int n = 0;
-    for (struct window *w = g.z_top; w; w = w->z_next) n++;
+    for (struct window *w = g.z_top; w; w = w->z_next) {
+        if (w->state != GUI_WIN_MINIMIZED) n++;
+    }
     paint_pill(r, hot, t->accent_magenta);
-    char text[16];
-    ksnprintf(text, sizeof(text), "WIN %d", n);
-    pill_text(r, text, t->tray_text);
+    /* Small stacked-window icon */
+    int ix = r->x + 8;
+    int iy = r->y + (r->h - 12) / 2;
+    gfx_draw_rect(ix, iy, 10, 8, t->tray_text_dim);
+    gfx_draw_rect(ix + 3, iy + 3, 10, 8, t->tray_text);
+    /* Count to the right of icon */
+    char text[4];
+    ksnprintf(text, sizeof(text), "%d", n);
+    gfx_draw_text16(ix + 18, r->y + (r->h - 16) / 2, text,
+                    t->tray_text, GFX_TRANSPARENT);
 }
 
-/* Bell pill: shows the unread notification count. Click toggles the
- * notification center panel. The bell uses a "B" letter glyph since
- * the framebuffer font has no proper bell symbol. */
+/* Bell pill: notification indicator with badge count. */
 static void paint_tray_bell(const struct tray_rect *r, bool hot) {
     const struct theme_palette *t = theme_active();
     uint32_t unread = notify_unread_count();
     uint32_t accent = unread ? t->accent_amber : t->accent_cyan;
     paint_pill(r, hot || g.center_open, accent);
-    char text[8];
-    ksnprintf(text, sizeof(text), "B %u", (unsigned)unread);
-    pill_text(r, text, unread ? t->tray_text : t->tray_text_dim);
+    /* Draw a simple bell shape using lines */
+    int cx = r->x + r->w / 2;
+    int cy = r->y + r->h / 2 - 2;
+    gfx_fill_rect(cx - 5, cy - 3, 10, 8, accent);
+    gfx_fill_rect(cx - 7, cy + 5, 14, 2, accent);
+    gfx_fill_rect(cx - 1, cy + 7, 2, 2, accent);
+    gfx_fill_rect(cx - 1, cy - 5, 2, 2, accent);
+    /* Badge count */
+    if (unread) {
+        char badge[4];
+        ksnprintf(badge, sizeof(badge), "%u", (unsigned)unread);
+        gfx_draw_text(cx + 4, r->y + 2, badge, t->accent_amber, GFX_TRANSPARENT);
+    }
 }
 
-/* Clock pill: HH:MM:SS uptime (no RTC subsystem yet). Always
- * present; never dropped by tray_layout. */
+/* Clock pill: HH:MM on top (8x16), date below (8x8).
+ * Uses uptime since no RTC subsystem yet. */
 static void paint_tray_clock(const struct tray_rect *r) {
     const struct theme_palette *t = theme_active();
     paint_pill(r, false, t->accent_cyan);
     char clk[16];
     format_uptime(clk, sizeof(clk));
-    gfx_draw_text(r->x + 10, r->y + 4, clk, t->tray_text, GFX_TRANSPARENT);
-    gfx_draw_text(r->x + 10, r->y + 15, "MAY 2026", t->tray_text_dim,
-                  GFX_TRANSPARENT);
+    clk[5] = '\0';  /* trim seconds: show HH:MM only */
+    int tw = 5 * 8;
+    int tx = r->x + (r->w - tw) / 2;
+    int ty = r->y + 2;
+    gfx_draw_text16(tx, ty, clk, t->tray_text, GFX_TRANSPARENT);
+    /* Date sub-line */
+    gfx_draw_text(r->x + (r->w - 7 * 8) / 2, r->y + 19,
+                  "5/22/26", t->tray_text_dim, GFX_TRANSPARENT);
 }
 
 static void paint_tray(void) {
     struct tray_rect rects[TRAY_PILL_COUNT];
     tray_layout(rects);
     int hover_idx = point_in_tray_pill(g.cur_x, g.cur_y);
+
+    /* Vertical separator between tabs area and system tray */
+    int sep_x = -1;
+    for (int i = TRAY_PILL_COUNT - 1; i >= 0; i--) {
+        if (rects[i].present) { sep_x = rects[i].x - 6; break; }
+    }
+    if (sep_x > 0) {
+        const struct theme_palette *t = theme_active();
+        int yt = taskbar_top();
+        gfx_fill_rect_blend(sep_x, yt + 8, 1, GUI_TASKBAR_H - 16,
+                            argb(0x60, t->tray_border));
+    }
 
     if (rects[TRAY_PILL_NET].present)
         paint_tray_net(&rects[TRAY_PILL_NET], hover_idx == TRAY_PILL_NET);
@@ -2351,55 +3379,207 @@ static void paint_tray(void) {
         paint_tray_clock(&rects[TRAY_PILL_CLOCK]);
 }
 
+/* Pixel-art icons for the 7 taskbar pins.
+ * Drawn centered at (cx, cy) in a ~20x20 bounding box.
+ * Pin 0=Files, 1=Browser, 2=Terminal, 3=Notes, 4=Settings, 5=Calculator, 6=About */
+static void paint_taskbar_pin_icon(int cx, int cy, int pin,
+                                   uint32_t fg, uint32_t fg2) {
+    int x = cx - 10, y = cy - 10;
+    switch (pin) {
+    case 0: /* Files -- folder icon */
+        gfx_fill_rect(x + 2, y + 5, 8, 3, fg);
+        gfx_fill_rect(x + 1, y + 7, 18, 12, fg2);
+        gfx_draw_rect(x + 1, y + 7, 18, 12, fg);
+        gfx_fill_rect(x + 3, y + 10, 14, 1, fg);
+        break;
+    case 1: /* Browser -- globe icon */
+        gfx_draw_rect(x + 3, y + 3, 14, 14, fg);
+        gfx_fill_rect(x + 9, y + 3, 2, 14, fg);
+        gfx_fill_rect(x + 3, y + 9, 14, 2, fg);
+        gfx_fill_rect(x + 5, y + 5, 2, 2, fg2);
+        gfx_fill_rect(x + 13, y + 5, 2, 2, fg2);
+        gfx_fill_rect(x + 5, y + 13, 2, 2, fg2);
+        gfx_fill_rect(x + 13, y + 13, 2, 2, fg2);
+        draw_line(x + 3, y + 3, x + 17, y + 17, fg2);
+        draw_line(x + 17, y + 3, x + 3, y + 17, fg2);
+        break;
+    case 2: /* Terminal -- command prompt */
+        gfx_draw_rect(x + 1, y + 3, 18, 14, fg);
+        gfx_fill_rect(x + 2, y + 4, 16, 1, fg);
+        draw_line(x + 4, y + 8, x + 8, y + 11, fg);
+        draw_line(x + 4, y + 14, x + 8, y + 11, fg);
+        gfx_fill_rect(x + 10, y + 14, 6, 1, fg2);
+        break;
+    case 3: /* Notes -- notepad */
+        gfx_fill_rect(x + 4, y + 2, 12, 16, 0x00182030u);
+        gfx_draw_rect(x + 4, y + 2, 12, 16, fg);
+        gfx_fill_rect(x + 6, y + 5, 8, 1, fg2);
+        gfx_fill_rect(x + 6, y + 8, 8, 1, fg2);
+        gfx_fill_rect(x + 6, y + 11, 6, 1, fg2);
+        gfx_fill_rect(x + 6, y + 14, 4, 1, fg2);
+        gfx_fill_rect(x + 3, y + 4, 1, 12, fg);
+        break;
+    case 4: /* Settings -- gear */
+        gfx_fill_rect(x + 9, y + 2, 2, 3, fg);
+        gfx_fill_rect(x + 9, y + 15, 2, 3, fg);
+        gfx_fill_rect(x + 2, y + 9, 3, 2, fg);
+        gfx_fill_rect(x + 15, y + 9, 3, 2, fg);
+        gfx_fill_rect(x + 4, y + 4, 2, 2, fg);
+        gfx_fill_rect(x + 14, y + 4, 2, 2, fg);
+        gfx_fill_rect(x + 4, y + 14, 2, 2, fg);
+        gfx_fill_rect(x + 14, y + 14, 2, 2, fg);
+        gfx_draw_rect(x + 6, y + 6, 8, 8, fg);
+        gfx_fill_rect(x + 8, y + 8, 4, 4, fg2);
+        break;
+    case 5: /* Calculator -- number pad */
+        gfx_draw_rect(x + 3, y + 2, 14, 16, fg);
+        gfx_fill_rect(x + 5, y + 4, 10, 3, fg2);
+        gfx_fill_rect(x + 5, y + 9, 3, 2, fg);
+        gfx_fill_rect(x + 9, y + 9, 3, 2, fg);
+        gfx_fill_rect(x + 13, y + 9, 3, 2, fg);
+        gfx_fill_rect(x + 5, y + 13, 3, 2, fg);
+        gfx_fill_rect(x + 9, y + 13, 3, 2, fg);
+        gfx_fill_rect(x + 13, y + 13, 3, 2, fg2);
+        break;
+    case 6: /* About -- info circle */
+        gfx_draw_rect(x + 4, y + 4, 12, 12, fg);
+        gfx_fill_rect(x + 6, y + 6, 8, 8, 0x00101828u);
+        gfx_fill_rect(x + 9, y + 7, 2, 2, fg2);
+        gfx_fill_rect(x + 9, y + 10, 2, 4, fg);
+        break;
+    default:
+        gfx_fill_rect(x + 5, y + 5, 10, 10, fg);
+        break;
+    }
+}
+
 static void paint_taskbar(void) {
     const struct theme_palette *t = theme_active();
     int W  = (int)gfx_width();
     int yt = taskbar_top();
 
-    /* Glass taskbar layered over windows. */
-    gfx_fill_rect(0, yt, W, GUI_TASKBAR_H, t->taskbar);
-    if ((t->taskbar_glass >> 24) != 0) {
-        gfx_fill_rect_blend(0, yt, W, GUI_TASKBAR_H, t->taskbar_glass);
+    /* M37: KDE Plasma 6 floating panel. The hit-test region is the
+     * full GUI_TASKBAR_H strip, but visually we draw the panel body
+     * inset by TASKBAR_FLOAT_MX horizontally and TASKBAR_FLOAT_MY
+     * from the bottom. The result is a "floating island" panel with
+     * a subtle shadow and rounded corners. */
+    int fx = TASKBAR_FLOAT_MX;
+    int fw = W - 2 * TASKBAR_FLOAT_MX;
+    int fh = GUI_TASKBAR_H - TASKBAR_FLOAT_MY - 2;
+    int fy = yt + 2;
+
+    /* Shadow beneath the floating panel. */
+    gfx_fill_rect_blend(fx + 4, fy + 4, fw, fh, 0x50000000u);
+    gfx_fill_rect_blend(fx + 2, fy + 2, fw, fh, 0x30000000u);
+
+    /* Acrylic blur behind the taskbar panel.
+     * Optimization: only re-blur every 4th frame since the wallpaper
+     * beneath rarely changes. When a window overlaps the taskbar area
+     * or the user is dragging, blur every frame. */
+    {
+        static int blur_skip_counter;
+        bool force_blur = (g.drag_win != NULL || g.resize_win != NULL);
+        if (force_blur || blur_skip_counter <= 0) {
+            gfx_box_blur_region(fx, fy, fw, fh, 2);
+            blur_skip_counter = 4;
+        } else {
+            blur_skip_counter--;
+        }
     }
-    gfx_fill_rect(0, yt, W, 1, t->taskbar_top);
-    gfx_fill_rect_blend(0, yt + 1, W, 1, 0x26FFFFFFu);
-    gfx_fill_rect_blend(0, yt - 6, W, 6, 0x30000000u);
+
+    /* Main panel fill. */
+    gfx_fill_rect(fx, fy, fw, fh, t->taskbar);
+    if ((t->taskbar_glass >> 24) != 0) {
+        gfx_fill_rect_blend(fx, fy, fw, fh, t->taskbar_glass);
+    }
+
+    /* Accent border: top edge, bottom accent, left/right borders. */
+    gfx_fill_rect(fx, fy, fw, 1, t->taskbar_top);
+    gfx_fill_rect_blend(fx, fy + 1, fw, 1, 0x26FFFFFFu);
+    gfx_draw_rect(fx, fy, fw, fh, t->win_border);
+
+    /* Inner glow: subtle white edge at top, dark fade at bottom. */
+    gfx_fill_rect_blend(fx + 2, fy + 2, fw - 4, 1, 0x14FFFFFFu);
+    gfx_fill_rect_blend(fx + 1, fy + fh - 3, fw - 2, 1, 0x10000000u);
+    gfx_fill_rect_blend(fx + 1, fy + fh - 2, fw - 2, 1, 0x18000000u);
+
+    /* Rounded corner simulation: overdraw the corners with bg. */
+    int r = TASKBAR_FLOAT_RADIUS;
+    for (int i = 0; i < r; i++) {
+        int cutw = r - i;
+        if (cutw <= 0) break;
+        gfx_fill_rect(fx, fy + i, cutw, 1, t->bg_vignette);
+        gfx_fill_rect(fx + fw - cutw, fy + i, cutw, 1, t->bg_vignette);
+        gfx_fill_rect(fx, fy + fh - 1 - i, cutw, 1, t->bg_vignette);
+        gfx_fill_rect(fx + fw - cutw, fy + fh - 1 - i, cutw, 1, t->bg_vignette);
+    }
+
+    /* M37: taskbar content draws inside the floating panel body. */
+    int cy = fy + 3;       /* content y-start inside floating panel */
+    int ch = fh - 6;       /* content height */
 
     /* TobyOS launcher button. */
     bool start_hot = (g.cur_x >= 0 && g.cur_x < START_BTN_W &&
                       g.cur_y >= yt && g.cur_y < yt + GUI_TASKBAR_H);
-    paint_glass_rect(4, yt + 3, START_BTN_W - 8, GUI_TASKBAR_H - 6,
+    paint_glass_rect(fx + 4, cy, START_BTN_W - 8, ch,
                      (start_hot || g.menu_open) ? t->start_bg_hot : t->start_bg,
                      argb(0x54, t->start_bg),
                      t->win_border, t->glow_orange);
-    paint_toby_hex_logo(17, yt + 7, 22, t->glow_orange, t->border_orange);
+    paint_toby_hex_logo(fx + 16, cy + (ch - 22) / 2, 22,
+                        t->glow_orange, t->border_orange);
 
-    /* Search area, intentionally visual-only for now. */
-    int sx = START_BTN_W + 4;
-    int sy = yt + 5;
-    int sh = GUI_TASKBAR_H - 10;
-    paint_glass_rect(sx, sy, TASKBAR_SEARCH_W, sh, 0x00070C16u,
-                     argb(0x34, t->panel), t->tray_border, t->border_cyan);
-    gfx_draw_rect(sx + 10, sy + 7, 10, 10, t->text_primary);
-    draw_line(sx + 18, sy + 15, sx + 24, sy + 21, t->text_primary);
-    gfx_draw_text(sx + 34, sy + (sh - 8) / 2, "Search TobyOS",
-                  t->text_secondary, GFX_TRANSPARENT);
+    /* Search area -- opens launcher with search focus. */
+    int sx = fx + START_BTN_W + 4;
+    int sy = cy + 2;
+    int sh = ch - 4;
+    bool search_hot = point_in_taskbar_search(g.cur_x, g.cur_y);
+    paint_glass_rect(sx, sy, TASKBAR_SEARCH_W, sh,
+                     search_hot ? 0x000D1520u : 0x00070C16u,
+                     argb(search_hot ? 0x44 : 0x34, t->panel),
+                     search_hot ? t->border_cyan : t->tray_border,
+                     t->border_cyan);
+    gfx_draw_rect(sx + 10, sy + (sh - 10) / 2, 10, 10, t->text_primary);
+    draw_line(sx + 18, sy + (sh - 10) / 2 + 8,
+              sx + 24, sy + (sh - 10) / 2 + 14, t->text_primary);
+    gfx_draw_text_smooth(sx + 34, sy + (sh - 16) / 2, "Search TobyOS",
+                    t->text_secondary, GFX_TRANSPARENT, 2);
 
-    const char *pins[TASKBAR_PIN_COUNT] = { "F", "G", ">_", "</>", "S", "W", "M" };
     int px = sx + TASKBAR_SEARCH_W + 8;
+    int hovered_pin = -1;
     for (int i = 0; i < TASKBAR_PIN_COUNT; i++) {
         int ix = px + i * TASKBAR_PIN_W;
         bool hot = (g.cur_x >= ix && g.cur_x < ix + TASKBAR_PIN_W - 4 &&
                     g.cur_y >= yt && g.cur_y < yt + GUI_TASKBAR_H);
-        paint_glass_rect(ix, yt + 5, TASKBAR_PIN_W - 6, sh,
+        if (hot) hovered_pin = i;
+        paint_glass_rect(ix, cy + 2, TASKBAR_PIN_W - 6, ch - 4,
                          hot ? t->center_item_hot : 0x00070C16u,
                          argb(hot ? 0x58 : 0x28, t->panel),
                          hot ? t->border_orange : t->tray_border,
                          t->glow_orange);
-        draw_text_centered(ix, yt + 5, TASKBAR_PIN_W - 6, sh,
-                           pins[i], t->glow_orange);
-        gfx_fill_rect(ix + 10, yt + GUI_TASKBAR_H - 4,
+        int icx = ix + (TASKBAR_PIN_W - 6) / 2;
+        int icy = cy + 2 + (ch - 4) / 2;
+        paint_taskbar_pin_icon(icx, icy, i, t->glow_orange, t->glow_cyan);
+        gfx_fill_rect(ix + 10, fy + fh - 5,
                       TASKBAR_PIN_W - 26, 2, t->glow_orange);
+    }
+
+    /* Tooltip for hovered pin */
+    if (hovered_pin >= 0) {
+        static const char *pin_names[TASKBAR_PIN_COUNT] = {
+            "Files", "Browser", "Terminal", "Notes",
+            "Settings", "Calculator", "About"
+        };
+        const char *tip = pin_names[hovered_pin];
+        int tip_len = 0;
+        while (tip[tip_len]) tip_len++;
+        int tip_w = tip_len * 8 + 12;
+        int tip_x = px + hovered_pin * TASKBAR_PIN_W +
+                    (TASKBAR_PIN_W - 6) / 2 - tip_w / 2;
+        int tip_y = fy - 22;
+        if (tip_x < 0) tip_x = 0;
+        gfx_fill_rect(tip_x, tip_y, tip_w, 18, 0x00101828u);
+        gfx_draw_rect(tip_x, tip_y, tip_w, 18, t->tray_border);
+        gfx_draw_text(tip_x + 6, tip_y + 5, tip, t->text_primary, 0x00101828u);
     }
 
     /* Window tabs (left -> right, oldest first). The right-edge limit
@@ -2419,21 +3599,36 @@ static void paint_taskbar(void) {
         }
         tabs_x_max -= TRAY_PAD;
     }
+    /* Find the topmost non-minimized window (the "active" one). */
+    struct window *active_win = NULL;
+    for (struct window *aw = g.z_top; aw; aw = aw->z_next) {
+        if (aw->state != GUI_WIN_MINIMIZED) { active_win = aw; break; }
+    }
+
     int x = taskbar_tabs_x0();
     for (int i = n - 1; i >= 0; i--) {
         struct window *w = stack[i];
-        bool focused = (w == g.z_top);
+        bool minimized = (w->state == GUI_WIN_MINIMIZED);
+        bool active    = (w == active_win);
         int tx = x, tw = TAB_W - TAB_PAD;
         if (tx + tw > tabs_x_max) break;
-        paint_glass_rect(tx, yt + 4, tw, GUI_TASKBAR_H - 8,
-                         focused ? t->tab_bg_focus : t->tab_bg,
-                         argb(focused ? 0x58 : 0x30, t->tab_bg),
-                         t->tab_border,
-                         focused ? t->accent_cyan : t->win_border);
+
+        uint32_t bg    = active ? t->tab_bg_focus : t->tab_bg;
+        uint32_t glass = argb(active ? 0x58 : (minimized ? 0x18 : 0x30), t->tab_bg);
+        uint32_t glow  = active ? t->accent_cyan :
+                         minimized ? t->win_border : t->win_border;
+        paint_glass_rect(tx, cy + 1, tw, ch - 2, bg, glass,
+                         t->tab_border, glow);
+
+        /* Active window: bright accent underline at bottom of tab. */
+        if (active)
+            gfx_fill_rect(tx + 6, cy + ch - 4, tw - 12, 2, t->accent_cyan);
+
         char clip[TAB_TEXT_MAX + 1];
         copy_clip(clip, sizeof(clip), w->title[0] ? w->title : "(no title)");
-        gfx_draw_text(tx + 10, yt + (GUI_TASKBAR_H - 8) / 2,
-                      clip, t->tab_fg, GFX_TRANSPARENT);
+        uint32_t fg = minimized ? t->text_secondary : t->tab_fg;
+        gfx_draw_text_smooth(tx + 10, cy + (ch - 16) / 2,
+                        clip, fg, GFX_TRANSPARENT, 2);
         x += TAB_W;
     }
 
@@ -2446,11 +3641,25 @@ static void paint_taskbar(void) {
     /* Subtle dim brand text just to the left of the start button --
      * far enough to never overlap a tab. */
     int bx = taskbar_tabs_x0();
-    /* Only show the brand if no tabs would overlap it. */
     if (n == 0) {
-        gfx_draw_text(bx, yt + (GUI_TASKBAR_H - 8) / 2, TASKBAR_BRAND,
-                      t->taskbar_text, GFX_TRANSPARENT);
+        gfx_draw_text_smooth(bx, cy + (ch - 16) / 2, TASKBAR_BRAND,
+                        t->taskbar_text, GFX_TRANSPARENT, 2);
     }
+}
+
+static bool menu_search_matches(const char *label) {
+    if (g.menu_search_len == 0) return true;
+    for (const char *s = label; *s; s++) {
+        bool eq = true;
+        for (int k = 0; k < g.menu_search_len && eq; k++) {
+            char a = s[k], b = g.menu_search_buf[k];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (!a || a != b) eq = false;
+        }
+        if (eq) return true;
+    }
+    return false;
 }
 
 static void paint_launcher(void) {
@@ -2462,29 +3671,31 @@ static void paint_launcher(void) {
 
     paint_toby_hex_logo(mx + 16, my + 14, 32, t->glow_orange,
                         t->border_orange);
-    gfx_draw_text(mx + 58, my + 14, "Toby", t->text_primary,
+    gfx_draw_text_smooth(mx + 58, my + 12, "Toby", t->text_primary,
+                    GFX_TRANSPARENT, 2);
+    gfx_draw_text(mx + 58, my + 30, "Administrator", t->text_secondary,
                   GFX_TRANSPARENT);
-    gfx_draw_text(mx + 58, my + 28, "Administrator", t->text_secondary,
-                  GFX_TRANSPARENT);
-    gfx_draw_text(mx + 14, my + 56, "Most used", t->text_primary,
-                  GFX_TRANSPARENT);
-    gfx_draw_text(mx + 190, my + 24, "Pinned", t->text_primary,
-                  GFX_TRANSPARENT);
-    gfx_draw_text(mx + mw - 24, my + 24, "X", t->text_secondary,
-                  GFX_TRANSPARENT);
+    gfx_draw_text_smooth(mx + 14, my + 54, "Most used", t->text_primary,
+                    GFX_TRANSPARENT, 2);
+    gfx_draw_text_smooth(mx + 190, my + 22, "Pinned", t->text_primary,
+                    GFX_TRANSPARENT, 2);
+    gfx_draw_text_smooth(mx + mw - 24, my + 22, "X", t->text_secondary,
+                    GFX_TRANSPARENT, 2);
+
+    bool searching = (g.menu_search_len > 0);
 
     int n = launcher_count();
-    int visible = n - 1;
-    if (visible > 6) visible = 6;
     int list_x = mx + LAUNCHER_PAD;
     int list_y = my + LAUNCHER_HEAD_H + 20;
-    for (int i = 0; i < visible; i++) {
-        int iy = list_y + i * LAUNCHER_ITEM_H;
-        bool hot = (g.cur_x >= list_x && g.cur_x < list_x + LAUNCHER_LIST_W &&
-                    g.cur_y >= iy && g.cur_y < iy + LAUNCHER_ITEM_H);
+    int drawn = 0;
+    for (int i = 0; i < n - 1 && drawn < 6; i++) {
         struct launcher_item li;
         bool ok = launcher_resolve(i, &li) && li.label;
         if (!ok) continue;
+        if (!menu_search_matches(li.label)) continue;
+        int iy = list_y + drawn * LAUNCHER_ITEM_H;
+        bool hot = (g.cur_x >= list_x && g.cur_x < list_x + LAUNCHER_LIST_W &&
+                    g.cur_y >= iy && g.cur_y < iy + LAUNCHER_ITEM_H);
         if (hot) {
             gfx_fill_rect_blend(list_x, iy - 2, LAUNCHER_LIST_W,
                                 LAUNCHER_ITEM_H - 1, argb(0xD8, t->menu_hot));
@@ -2492,67 +3703,91 @@ static void paint_launcher(void) {
                           t->border_orange);
         }
         char letter[2] = { li.label[0], 0 };
-        gfx_draw_text(list_x + 12, iy + 6, letter, t->glow_orange,
-                      GFX_TRANSPARENT);
-        gfx_draw_text(list_x + 32, iy + 6, li.label, t->menu_text,
-                      GFX_TRANSPARENT);
+        gfx_draw_text_smooth(list_x + 12, iy + 4, letter, t->glow_orange,
+                        GFX_TRANSPARENT, 2);
+        gfx_draw_text_smooth(list_x + 32, iy + 4, li.label, t->menu_text,
+                        GFX_TRANSPARENT, 2);
+        drawn++;
     }
 
-    gfx_draw_text(list_x, my + mh - 92, "All apps  >", t->text_primary,
-                  GFX_TRANSPARENT);
+    if (!searching) {
+        gfx_draw_text_smooth(list_x, my + mh - 92, "All apps  >", t->text_primary,
+                        GFX_TRANSPARENT, 2);
+    }
     int power_y = my + mh - 64;
     bool power_hot = (g.cur_x >= list_x && g.cur_x < list_x + LAUNCHER_PROFILE_W - 16 &&
                       g.cur_y >= power_y && g.cur_y < power_y + 28);
     paint_glass_rect(list_x, power_y, LAUNCHER_PROFILE_W - 16, 28,
                      power_hot ? t->center_item_hot : 0x00070C16u,
                      argb(0x28, t->panel), t->tray_border, t->border_orange);
-    gfx_draw_text(list_x + 12, power_y + 10, "Power", t->glow_orange,
-                  GFX_TRANSPARENT);
+    gfx_draw_text_smooth(list_x + 12, power_y + 6, "Power", t->glow_orange,
+                    GFX_TRANSPARENT, 2);
 
     int grid_x = mx + 190;
     int grid_y = my + LAUNCHER_HEAD_H + 18;
-    for (int i = 0; i < 9; i++) {
-        int col = i % 3;
-        int row = i / 3;
-        int tx = grid_x + col * (LAUNCHER_TILE_W + 12);
-        int ty = grid_y + row * (LAUNCHER_TILE_H + 12);
-        struct launcher_item li;
-        bool ok = launcher_resolve(i, &li) && li.label && li.path;
-        const char *label = ok ? li.label : "App";
-        bool hot = (g.cur_x >= tx && g.cur_x < tx + LAUNCHER_TILE_W &&
-                    g.cur_y >= ty && g.cur_y < ty + LAUNCHER_TILE_H);
-        paint_soft_panel(tx, ty, LAUNCHER_TILE_W, LAUNCHER_TILE_H,
-                         hot ? t->center_item_hot : 0x00070C16u,
-                         argb(hot ? 0x58 : 0x30, t->panel),
-                         hot ? t->border_cyan : t->tray_border,
-                         (i & 1) ? t->glow_cyan : t->glow_orange);
-        char letter[2] = { label[0], 0 };
-        draw_text_centered(tx, ty + 8, LAUNCHER_TILE_W, 12,
-                           letter, (i & 1) ? t->glow_cyan : t->glow_orange);
-        char clipped[10];
-        copy_clip(clipped, sizeof(clipped), label);
-        draw_text_centered(tx, ty + 31, LAUNCHER_TILE_W, 12,
-                           clipped, t->text_primary);
+    if (!searching) {
+        for (int i = 0; i < 9; i++) {
+            int col = i % 3;
+            int row = i / 3;
+            int tx = grid_x + col * (LAUNCHER_TILE_W + 12);
+            int ty = grid_y + row * (LAUNCHER_TILE_H + 12);
+            struct launcher_item li;
+            bool ok = launcher_resolve(i, &li) && li.label && li.path;
+            const char *label = ok ? li.label : "App";
+            bool hot = (g.cur_x >= tx && g.cur_x < tx + LAUNCHER_TILE_W &&
+                        g.cur_y >= ty && g.cur_y < ty + LAUNCHER_TILE_H);
+            paint_soft_panel(tx, ty, LAUNCHER_TILE_W, LAUNCHER_TILE_H,
+                             hot ? t->center_item_hot : 0x00070C16u,
+                             argb(hot ? 0x58 : 0x30, t->panel),
+                             hot ? t->border_cyan : t->tray_border,
+                             (i & 1) ? t->glow_cyan : t->glow_orange);
+            char letter[2] = { label[0], 0 };
+            draw_text16_centered(tx, ty + 4, LAUNCHER_TILE_W, 20,
+                                 letter, (i & 1) ? t->glow_cyan : t->glow_orange);
+            char clipped[10];
+            copy_clip(clipped, sizeof(clipped), label);
+            draw_text_centered(tx, ty + 32, LAUNCHER_TILE_W, 12,
+                               clipped, t->text_primary);
+        }
+
+        int recent_y = grid_y + 3 * (LAUNCHER_TILE_H + 12) + 8;
+        if (recent_y + 64 < my + mh - 42) {
+            gfx_draw_text_smooth(grid_x, recent_y, "Recently opened", t->text_primary,
+                            GFX_TRANSPARENT, 2);
+            gfx_draw_text(grid_x, recent_y + 20, "project_alpha.sk",
+                          t->text_secondary, GFX_TRANSPARENT);
+            gfx_draw_text(grid_x + 132, recent_y + 20, "system_diagram.png",
+                          t->text_secondary, GFX_TRANSPARENT);
+            gfx_draw_text(grid_x, recent_y + 38, "tobyos_update.log",
+                          t->text_secondary, GFX_TRANSPARENT);
+            gfx_draw_text(grid_x + 132, recent_y + 38, "notes.txt",
+                          t->text_secondary, GFX_TRANSPARENT);
+        }
+    } else {
+        if (drawn == 0) {
+            gfx_draw_text(grid_x, grid_y + 10, "No results found",
+                          t->text_secondary, GFX_TRANSPARENT);
+        }
     }
 
-    int recent_y = grid_y + 3 * (LAUNCHER_TILE_H + 12) + 8;
-    if (recent_y + 64 < my + mh - 42) {
-        gfx_draw_text(grid_x, recent_y, "Recently opened", t->text_primary,
-                      GFX_TRANSPARENT);
-        gfx_draw_text(grid_x, recent_y + 20, "project_alpha.sk",
-                      t->text_secondary, GFX_TRANSPARENT);
-        gfx_draw_text(grid_x + 132, recent_y + 20, "system_diagram.png",
-                      t->text_secondary, GFX_TRANSPARENT);
-        gfx_draw_text(grid_x, recent_y + 38, "tobyos_update.log",
-                      t->text_secondary, GFX_TRANSPARENT);
-        gfx_draw_text(grid_x + 132, recent_y + 38, "notes.txt",
-                      t->text_secondary, GFX_TRANSPARENT);
-    }
-
+    /* Bottom search bar: shows typed text or placeholder. */
     paint_glass_rect(mx + 12, my + mh - 34, mw - 24, 24, 0x00070C16u,
-                     argb(0x28, t->panel), t->tray_border, t->border_cyan);
-    gfx_draw_text(mx + 28, my + mh - 26, "Search programs and files...",
-                  t->text_secondary, GFX_TRANSPARENT);
+                     argb(searching ? 0x40 : 0x28, t->panel),
+                     searching ? t->border_cyan : t->tray_border,
+                     t->border_cyan);
+    if (searching) {
+        char disp[34];
+        int len = g.menu_search_len;
+        if (len > 30) len = 30;
+        for (int ci = 0; ci < len; ci++) disp[ci] = g.menu_search_buf[ci];
+        disp[len] = '_';
+        disp[len + 1] = '\0';
+        gfx_draw_text_smooth(mx + 28, my + mh - 30, disp,
+                        t->text_primary, GFX_TRANSPARENT, 2);
+    } else {
+        gfx_draw_text_smooth(mx + 28, my + mh - 30, "Search programs and files...",
+                        t->text_secondary, GFX_TRANSPARENT, 2);
+    }
 }
 
 /* ---- M31 desktop notifications: toast + center ------------------- *
@@ -2622,13 +3857,12 @@ static void paint_toast(void) {
     gfx_draw_text(x + 12, y + 6, header,
                   t->tray_text_dim, GFX_TRANSPARENT);
 
-    /* Title: bold-ish via the brighter colour. */
+    /* Title: bold-ish via the brighter colour, 8x16 font. */
     char title[ABI_NOTIFY_TITLE_MAX];
     copy_clip(title, sizeof(title), g.toast_title);
-    /* Toast width 340, left pad 12, char width 8 -> ~40 visible. */
     trim_to_fit(title, (TOAST_W - 16) / 8);
-    gfx_draw_text(x + 12, y + 18, title,
-                  t->toast_title, GFX_TRANSPARENT);
+    gfx_draw_text_smooth(x + 12, y + 16, title,
+                    t->toast_title, GFX_TRANSPARENT, 2);
 
     /* Body, only if the taller variant is in play. */
     if (h == TOAST_H_FULL && g.toast_body[0]) {
@@ -2667,7 +3901,7 @@ static void paint_center(void) {
     ksnprintf(header, sizeof(header),
               "Notifications  (%u unread)",
               (unsigned)notify_unread_count());
-    gfx_draw_text(x + 12, y + 14, header, t->center_header, GFX_TRANSPARENT);
+    gfx_draw_text(x + 12, y + 12, header, t->center_header, GFX_TRANSPARENT);
 
     /* List items, newest first. */
     struct abi_notification recs[CENTER_VISIBLE_MAX];
@@ -2686,9 +3920,9 @@ static void paint_center(void) {
         gfx_fill_rect(x + 4, iy + 2, 3, CENTER_ITEM_H - 4,
                       urg_accent(t, r->urgency));
 
-        /* Header: APP -- URG  (greyed out so the title pops) */
+        /* Header: APP -- URG  (small, dimmed) */
         char head_buf[ABI_NOTIFY_APP_MAX + 8];
-        ksnprintf(head_buf, sizeof(head_buf), "%s -- %s",
+        ksnprintf(head_buf, sizeof(head_buf), "%s - %s",
                   r->app[0] ? r->app : "?", urg_label(r->urgency));
         gfx_draw_text(x + 14, iy + 6, head_buf,
                       t->tray_text_dim, GFX_TRANSPARENT);
@@ -2703,7 +3937,7 @@ static void paint_center(void) {
             char body[ABI_NOTIFY_BODY_MAX];
             copy_clip(body, sizeof(body), r->body);
             trim_to_fit(body, (CENTER_W - 28) / 8);
-            gfx_draw_text(x + 14, iy + 36, body,
+            gfx_draw_text(x + 14, iy + 30, body,
                           t->toast_body, GFX_TRANSPARENT);
         }
         iy += CENTER_ITEM_H;
@@ -2731,12 +3965,139 @@ static void paint_center(void) {
                   t->tray_text_dim, GFX_TRANSPARENT);
 }
 
+/* ---- context menu paint ------------------------------------------ */
+
+static void paint_ctx_menu(void) {
+    if (!g.ctx_open) return;
+    const struct theme_palette *t = theme_active();
+
+    int mx = g.ctx_x, my = g.ctx_y;
+    int mh = g.ctx_count * CTX_MENU_ITEM_H + 2 * CTX_MENU_PAD;
+
+    /* Shadow */
+    gfx_fill_rect_blend(mx + 3, my + 3, CTX_MENU_W, mh, 0x40000000u);
+
+    /* Background */
+    gfx_fill_rounded_rect(mx, my, CTX_MENU_W, mh, 6, t->menu_bg);
+
+    /* Border */
+    gfx_draw_rect(mx, my, CTX_MENU_W, mh, t->menu_border);
+
+    for (int i = 0; i < g.ctx_count; i++) {
+        int iy = my + CTX_MENU_PAD + i * CTX_MENU_ITEM_H;
+
+        if (g.ctx_items[i].id == CTX_MENU_SEPARATOR) {
+            /* Thin horizontal line */
+            int lx = mx + 8;
+            int lw = CTX_MENU_W - 16;
+            int ly = iy + CTX_MENU_ITEM_H / 2;
+            gfx_fill_rect(lx, ly, lw, 1, t->menu_border);
+            continue;
+        }
+
+        /* Hover highlight */
+        if (i == g.ctx_hover) {
+            gfx_fill_rect(mx + 2, iy, CTX_MENU_W - 4, CTX_MENU_ITEM_H,
+                          t->menu_hot);
+        }
+
+        if (g.ctx_items[i].label) {
+            gfx_draw_text_smooth(mx + 12, iy + (CTX_MENU_ITEM_H - 16) / 2,
+                            g.ctx_items[i].label,
+                            t->menu_text, GFX_TRANSPARENT, 2);
+        }
+    }
+}
+
+/* GPU_ACCEL: transfer dirty windows' backbufs to their GPU resources.
+ * Returns the union of dirty window screen rects (for the invalidation
+ * hint).  Clears gpu_dirty on each processed window. */
+static void gpu_accel_transfer_dirty(void) {
+    for (struct window *w = g.z_top; w; w = w->z_next) {
+        if (!w->gpu_dirty || !w->gpu_resource_id || !w->gpu_backing)
+            continue;
+        if (w->state == GUI_WIN_MINIMIZED) {
+            w->gpu_dirty = false;
+            continue;
+        }
+        size_t bytes = (size_t)w->client_w * w->client_h * 4u;
+        memcpy(w->gpu_backing, w->backbuf, bytes);
+        virtio_gpu_transfer_window(w->gpu_resource_id,
+                                   (uint32_t)w->client_w,
+                                   (uint32_t)w->client_h);
+        w->gpu_dirty = false;
+    }
+}
+
+/* GPU_ACCEL: check if a single fullscreen window can bypass the
+ * compositor entirely via direct scanout.  Returns the window if
+ * eligible, NULL otherwise. */
+static struct window *gpu_accel_direct_scanout_candidate(void) {
+    if (!virtio_gpu_present()) return NULL;
+    struct window *top = g.z_top;
+    if (!top || top->state != GUI_WIN_MAXIMIZED) return NULL;
+    if (top->opacity < 255) return NULL;
+    if (!top->gpu_resource_id || !top->gpu_backing) return NULL;
+    if (top->client_w != (int)gfx_width() ||
+        top->client_h != (int)gfx_height())
+        return NULL;
+    if (!session_active()) return NULL;
+    return top;
+}
+
 static void compositor_pass(void) {
     /* Milestone 19: split the compositor cost into the paint phase
      * (everything in user-facing pixel time) and the flip phase
      * (memcpy to VRAM). Seeing them separately tells you whether a
      * "laggy" frame is the GPU-ish step or the copy step. */
     uint64_t t_comp = perf_rdtsc();
+
+    /* GPU_ACCEL: direct-scanout bypass.  If the topmost maximized
+     * window covers the entire screen at full opacity AND owns a GPU
+     * resource, we skip the full CPU compositor pass and drive the
+     * scanout straight from the window's resource.  The desktop chrome
+     * (taskbar, etc.) is invisible behind a fullscreen window anyway. */
+    if (g.comp_mode == COMPOSITOR_GPU_ACCEL) {
+        struct window *ds = gpu_accel_direct_scanout_candidate();
+        if (ds) {
+            if (g.direct_scanout_wid != ds->wid) {
+                /* First time entering direct scanout for this window:
+                 * must transfer the full surface regardless of dirty. */
+                ds->gpu_dirty = true;
+            }
+            if (ds->gpu_dirty) {
+                size_t bytes = (size_t)ds->client_w * ds->client_h * 4u;
+                memcpy(ds->gpu_backing, ds->backbuf, bytes);
+                virtio_gpu_transfer_window(ds->gpu_resource_id,
+                                           (uint32_t)ds->client_w,
+                                           (uint32_t)ds->client_h);
+                ds->gpu_dirty = false;
+            }
+            if (g.direct_scanout_wid != ds->wid) {
+                virtio_gpu_set_scanout_resource(ds->gpu_resource_id,
+                                                (uint32_t)ds->client_w,
+                                                (uint32_t)ds->client_h);
+                g.direct_scanout_wid = ds->wid;
+            }
+            virtio_gpu_flush_window(ds->gpu_resource_id,
+                                    (uint32_t)ds->client_w,
+                                    (uint32_t)ds->client_h);
+
+            perf_zone_end(PERF_Z_GUI_COMPOSITE, t_comp);
+            perf_count_gui_frame();
+            g.cmp_partial_frames++;
+            g.inv_x = g.inv_y = g.inv_w = g.inv_h = 0;
+            g.inv_full = false;
+            return;
+        }
+    }
+
+    /* If we were in direct-scanout mode but the candidate is no longer
+     * eligible, restore the compositor's scanout resource. */
+    if (g.direct_scanout_wid != 0) {
+        virtio_gpu_restore_scanout();
+        g.direct_scanout_wid = 0;
+    }
 
     const struct theme_palette *theme = theme_active();
     if (g.desktop_mode) {
@@ -2755,19 +4116,61 @@ static void compositor_pass(void) {
     for (struct window *w = g.z_top; w && n < GUI_WINDOW_MAX; w = w->z_next) {
         stack[n++] = w;
     }
+    int top_visible = -1;
+    for (int i = 0; i < n; i++) {
+        if (stack[i]->state != GUI_WIN_MINIMIZED) { top_visible = i; break; }
+    }
     for (int i = n - 1; i >= 0; i--) {
-        compositor_paint_one(stack[i], i == 0);
+        if (stack[i]->state == GUI_WIN_MINIMIZED) continue;
+        compositor_paint_one(stack[i], i == top_visible);
     }
 
-    if (g.desktop_mode) {
-        paint_taskbar();
-        paint_launcher();
-        /* M31: notification center first (acts as a modal-ish panel
-         * over the wallpaper + windows), THEN the toast above it so
-         * a freshly-arrived toast is always on top of the panel. */
-        paint_center();
-        paint_toast();
+    /* Snap preview overlay: semi-transparent accent rectangle showing
+     * where the window will land if released now. */
+    if (g.snap_zone != 0 && g.drag_win) {
+        int sw = (int)gfx_width(), sh = (int)gfx_height();
+        int desk_h = sh - GUI_TASKBAR_H;
+        const struct theme_palette *st = theme_active();
+        uint32_t preview_color = argb(0x40, st->accent_cyan);
+        int sx = 0, sy = 0, ssw = 0, ssh = 0;
+        if (g.snap_zone == 1) { sx = 0; sy = 0; ssw = sw / 2; ssh = desk_h; }
+        else if (g.snap_zone == 2) { sx = sw / 2; sy = 0; ssw = sw / 2; ssh = desk_h; }
+        else if (g.snap_zone == 3) { sx = 0; sy = 0; ssw = sw; ssh = desk_h; }
+        if (ssw > 0 && ssh > 0)
+            gfx_fill_rect_blend(sx, sy, ssw, ssh, preview_color);
     }
+
+    if (g.desktop_mode && session_active()) {
+        /* Don't paint taskbar/overlays if a fullscreen-maximized window
+         * covers the entire screen at full opacity (e.g. login fading). */
+        bool fullscreen_cover = false;
+        for (struct window *fw = g.z_top; fw; fw = fw->z_next) {
+            if (fw->state == GUI_WIN_MAXIMIZED && fw->opacity >= 255 &&
+                fw->client_w >= (int)gfx_width() &&
+                fw->client_h >= (int)gfx_height()) {
+                fullscreen_cover = true;
+                break;
+            }
+        }
+        if (!fullscreen_cover) {
+            paint_taskbar();
+            paint_launcher();
+            /* M31: notification center first (acts as a modal-ish panel
+             * over the wallpaper + windows), THEN the toast above it so
+             * a freshly-arrived toast is always on top of the panel. */
+            paint_center();
+            paint_toast();
+        }
+    }
+
+    paint_ctx_menu();
+
+    /* GPU_ACCEL: transfer dirty windows' backbufs to their per-window
+     * GPU resources.  This keeps host-side resources warm for future
+     * VirGL compositing; for 2D mode the real present still goes
+     * through the scanout resource via gfx_flip(). */
+    if (g.comp_mode == COMPOSITOR_GPU_ACCEL)
+        gpu_accel_transfer_dirty();
 
     perf_zone_end(PERF_Z_GUI_COMPOSITE, t_comp);
 
@@ -2805,8 +4208,24 @@ static void compositor_pass(void) {
 
     uint64_t t_flip = perf_rdtsc();
     gfx_flip();
-    gfx_cursor_overlay_show(g.cur_x, g.cur_y);
+    if (!virtio_gpu_hw_cursor_available()) {
+        gfx_cursor_overlay_show(g.cur_x, g.cur_y);
+    }
     perf_zone_end(PERF_Z_GUI_FLIP, t_flip);
+
+    /* Triple-buffer state rotation (GPU_ACCEL mode with back2 available).
+     * After gfx_flip(), the just-presented buffer is "front" and the
+     * compositor should start drawing the next frame into the alternate
+     * buffer.  gfx_flip() already handles the low-level buffer swap in
+     * gfx.c; here we track the logical triple-buffer indices so
+     * diagnostics (gui_triple_buffer_pending) report correctly. */
+    if (g.comp_mode == COMPOSITOR_GPU_ACCEL) {
+        g.tb_pending = g.tb_back;
+        g.tb_back    = g.tb_front;
+        g.tb_front   = g.tb_pending;
+        g.tb_pending = -1;
+        g.frame_count++;
+    }
 
     if (used_partial) g.cmp_partial_frames++;
     else              g.cmp_full_frames++;
@@ -3045,6 +4464,7 @@ void gui_tick(void) {
     }
 
     if (on_pid0) {
+        anim_tick();
         if (g.launch_tail != g.launch_head) drain_launch_queue();
         reap_tracked();
         /* Service manager pump: monitor PROGRAM services, restart
@@ -3124,6 +4544,24 @@ void gui_tick(void) {
         }
     }
 
+    /* Close-request timeout: if a window received GUI_EV_CLOSE but the
+     * app hasn't closed it within ~3 s, force SIGINT as a fallback. */
+    if (on_pid0 && g.active) {
+        uint64_t ticks = pit_ticks();
+        uint32_t hz = pit_hz();
+        uint64_t timeout_ticks = (uint64_t)hz * 3;
+        for (struct window *w = g.z_top; w; w = w->z_next) {
+            if (w->close_request_tick &&
+                ticks - w->close_request_tick > timeout_ticks) {
+                gui_trace_logf("close timeout wid=%d owner_pid=%d -> SIGINT",
+                               w->wid, w->owner_pid);
+                if (w->owner_pid > 0)
+                    signal_send_to_pid(w->owner_pid, SIGINT);
+                w->close_request_tick = 0;
+            }
+        }
+    }
+
     /* Compositor passes ONLY run on pid 0.
      *
      * Why: compositor_pass() copies the full framebuffer (1280*800*4 ~=
@@ -3142,11 +4580,19 @@ void gui_tick(void) {
      * scheduled (basically every PIT tick = 100 Hz), instead of by how
      * fast the foreground app can dirty the back buffer. */
     if (on_pid0 && g.active && g.dirty) {
-        if (g_trace >= GUI_TRACE_VERBOSE) {
-            gui_trace_logf("compositor_pass: dirty -> repaint+flip");
+        /* Rate-limit compositing to ~60 fps UNLESS the user is actively
+         * dragging or resizing a window — in that case, repaint
+         * immediately for instant visual feedback (no ghosting). */
+        static uint64_t last_comp_tick;
+        uint64_t now_tick = pit_ticks();
+        bool interactive = (g.drag_win != NULL || g.resize_win != NULL);
+        uint32_t min_interval = interactive ? 0 : (pit_hz() / 60);
+        if (min_interval < 1) min_interval = 1;
+        if (interactive || (now_tick - last_comp_tick >= min_interval)) {
+            last_comp_tick = now_tick;
+            g.dirty = false;
+            compositor_pass();
         }
-        g.dirty = false;
-        compositor_pass();
     }
 
     /* Cooperative scheduling.
@@ -3154,10 +4600,11 @@ void gui_tick(void) {
      * pid 0 path: hand the CPU to any tracked desktop app that still
      *             wants to run. Done AFTER compositor_pass so the app
      *             sees a freshly-painted screen and a clean event queue.
-     * app path:   if the syscall we just serviced dirtied the
-     *             compositor, immediately yield to pid 0 so the user
-     *             sees the new pixels promptly (and so pid 0's
-     *             heartbeat keeps firing). */
+     * app path:   yield to pid 0 when either:
+     *             (a) this syscall dirtied the compositor (app flipped)
+     *             (b) there's pending input that pid 0 needs to boost
+     *             Either way, getting pid 0 on CPU fast keeps the
+     *             compositor responsive and input latency minimal. */
     if (on_pid0) {
         if (any_tracked_alive()) {
             if (g_trace >= GUI_TRACE_VERBOSE) {
@@ -3165,9 +4612,10 @@ void gui_tick(void) {
             }
             sched_yield();
         }
-    } else if (g.dirty) {
+    } else if (g.dirty || g.input_boost_pid > 0) {
         if (g_trace >= GUI_TRACE_VERBOSE) {
-            gui_trace_logf("gui_tick: app yielding to pid0 for repaint");
+            gui_trace_logf("gui_tick: app yielding to pid0 (dirty=%d boost=%d)",
+                           (int)g.dirty, g.input_boost_pid);
         }
         sched_yield();
     }
@@ -3335,12 +4783,24 @@ void gui_init(void) {
     g.spawn_y = 40;
     char sbuf[16];
     settings_get_str("ui.widgets", sbuf, sizeof(sbuf), "on");
-    g.widgets_open = strcmp(sbuf, "off") != 0;
+    g.widgets_open = (strcmp(sbuf, "off") != 0);
     g.quick_wifi = true;
     g.quick_bt = true;
     g.quick_night = true;
     g.quick_nixie = true;
     g.quick_focus = true;
+    g.selected_icon = -1;
+    g.last_icon_clicked = -1;
+
+    /* Phase 2 M2.5: triple-buffer + vsync init */
+    g.comp_mode          = COMPOSITOR_SOFTWARE;
+    g.tb_front           = 0;
+    g.tb_back            = 1;
+    g.tb_pending         = -1;
+    g.vsync_interval_ns  = 16666667;  /* ~60Hz */
+    g.vsync_deadline_ns  = 0;
+    g.frame_count        = 0;
+
     mouse_set_callback(on_mouse_event);
     kprintf("[gui] window manager ready (max %d windows, %d-px title bar)\n",
             GUI_WINDOW_MAX, GUI_TITLE_BAR_H);
@@ -3363,6 +4823,15 @@ static struct window *alloc_slot(void) {
 
 static void free_slot(struct window *w) {
     if (!w) return;
+    if (w->gpu_resource_id) {
+        virtio_gpu_destroy_window_resource(w->gpu_resource_id,
+                                           w->gpu_backing_phys,
+                                           w->gpu_backing_bytes);
+        w->gpu_resource_id   = 0;
+        w->gpu_backing       = NULL;
+        w->gpu_backing_phys  = 0;
+        w->gpu_backing_bytes = 0;
+    }
     if (w->backbuf) { kfree(w->backbuf); w->backbuf = 0; }
     w->in_use = false;
     w->wid    = 0;
@@ -3407,9 +4876,12 @@ struct window *gui_window_create(int client_w, int client_h, const char *title) 
     {
         const struct theme_palette *t = theme_active();
         uint32_t fill = t->win_bg;
-        for (size_t i = 0; i < (size_t)client_w * client_h; i++) {
-            w->backbuf[i] = fill;
-        }
+        size_t n = (size_t)client_w * client_h;
+        uint64_t pair = ((uint64_t)fill << 32) | (uint64_t)fill;
+        uint64_t *dst = (uint64_t *)w->backbuf;
+        size_t qwords = n / 2;
+        for (size_t i = 0; i < qwords; i++) dst[i] = pair;
+        if (n & 1) w->backbuf[n - 1] = fill;
     }
 
     w->client_w = client_w;
@@ -3429,6 +4901,25 @@ struct window *gui_window_create(int client_w, int client_h, const char *title) 
         w->title[i] = '\0';
     }
 
+    w->opacity = 255;
+
+    /* GPU_ACCEL: allocate a per-window VirtIO-GPU 2D resource so the
+     * compositor can do per-window dirty tracking and direct scanout. */
+    if (g.comp_mode == COMPOSITOR_GPU_ACCEL && virtio_gpu_present()) {
+        void     *backing = NULL;
+        uint64_t  phys    = 0;
+        uint32_t rid = virtio_gpu_create_window_resource(
+                            (uint32_t)client_w, (uint32_t)client_h,
+                            &backing, &phys);
+        if (rid) {
+            w->gpu_resource_id  = rid;
+            w->gpu_backing      = backing;
+            w->gpu_backing_phys = phys;
+            w->gpu_backing_bytes = (size_t)client_w * client_h * 4u;
+            w->gpu_dirty        = true;
+        }
+    }
+
     struct proc *p = current_proc();
     w->owner_pid = p ? p->pid : -1;
 
@@ -3437,10 +4928,11 @@ struct window *gui_window_create(int client_w, int client_h, const char *title) 
     g.dirty = true;
     /* M27E: new window can land anywhere -- safest is a full present. */
     gui_invalidate_full();
+    anim_start_fade_in(w);
     gui_trace_logf("window_create wid=%d owner_pid=%d size=%dx%d "
-                   "pos=(%d,%d) title='%s'",
+                   "pos=(%d,%d) title='%s' gpu_res=%u",
                    w->wid, w->owner_pid, w->client_w, w->client_h,
-                   w->x, w->y, w->title);
+                   w->x, w->y, w->title, (unsigned)w->gpu_resource_id);
     return w;
 }
 
@@ -3459,6 +4951,34 @@ void gui_window_close(struct window *w) {
     /* M27E: closing a window re-exposes whatever was beneath it --
      * full present is the only safe path. */
     gui_invalidate_full();
+}
+
+int gui_window_set_state(struct window *w, int state) {
+    if (!w || !w->in_use) return -1;
+    switch (state) {
+    case GUI_WIN_NORMAL:
+        if (w->state == GUI_WIN_MINIMIZED || w->state == GUI_WIN_MAXIMIZED)
+            window_do_restore(w);
+        return 0;
+    case GUI_WIN_MINIMIZED:
+        window_do_minimize(w);
+        return 0;
+    case GUI_WIN_MAXIMIZED:
+        if (w->state != GUI_WIN_MAXIMIZED)
+            window_do_maximize(w);
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+int gui_window_set_title(struct window *w, const char *title) {
+    if (!w || !w->in_use || !title) return -1;
+    size_t i = 0;
+    for (; i < GUI_TITLE_MAX - 1 && title[i]; i++) w->title[i] = title[i];
+    w->title[i] = '\0';
+    g.dirty = true;
+    return 0;
 }
 
 /* ---- drawing operations (kernel-side, drive backbuf) -------------- */
@@ -3510,6 +5030,103 @@ int gui_window_fill_argb(struct window *w, int x, int y, int rw, int rh,
             row[dx] = gfx_blend_pixel_argb(row[dx], argb);
         }
     }
+    return 0;
+}
+
+/* ---- Advanced drawing operations (Phase 1) ----------------------- */
+
+static struct gfx_surface window_surface(struct window *w) {
+    struct gfx_surface s;
+    s.pixels = w->backbuf;
+    s.width  = w->client_w;
+    s.height = w->client_h;
+    return s;
+}
+
+int gui_window_line(struct window *w, int x0, int y0, int x1, int y1, uint32_t color) {
+    if (!w || !w->in_use || !w->backbuf) return -1;
+    struct gfx_surface s = window_surface(w);
+    gfx_surface_draw_line(&s, x0, y0, x1, y1, color);
+    return 0;
+}
+
+int gui_window_line_blend(struct window *w, int x0, int y0, int x1, int y1, uint32_t argb) {
+    if (!w || !w->in_use || !w->backbuf) return -1;
+    struct gfx_surface s = window_surface(w);
+    gfx_surface_draw_line_blend(&s, x0, y0, x1, y1, argb);
+    return 0;
+}
+
+int gui_window_rect(struct window *w, int x, int y, int rw, int rh, uint32_t color) {
+    if (!w || !w->in_use || !w->backbuf) return -1;
+    struct gfx_surface s = window_surface(w);
+    gfx_surface_draw_rect(&s, x, y, rw, rh, color);
+    return 0;
+}
+
+int gui_window_rounded_rect(struct window *w, int x, int y, int rw, int rh, int radius, uint32_t color) {
+    if (!w || !w->in_use || !w->backbuf) return -1;
+    struct gfx_surface s = window_surface(w);
+    gfx_surface_fill_rounded_rect(&s, x, y, rw, rh, radius, color);
+    return 0;
+}
+
+int gui_window_rounded_rect_blend(struct window *w, int x, int y, int rw, int rh, int radius, uint32_t argb) {
+    if (!w || !w->in_use || !w->backbuf) return -1;
+    struct gfx_surface s = window_surface(w);
+    gfx_surface_fill_rounded_rect_blend(&s, x, y, rw, rh, radius, argb);
+    return 0;
+}
+
+int gui_window_circle(struct window *w, int cx, int cy, int r, uint32_t color) {
+    if (!w || !w->in_use || !w->backbuf) return -1;
+    struct gfx_surface s = window_surface(w);
+    gfx_surface_fill_circle(&s, cx, cy, r, color);
+    return 0;
+}
+
+int gui_window_circle_outline(struct window *w, int cx, int cy, int r, uint32_t color) {
+    if (!w || !w->in_use || !w->backbuf) return -1;
+    struct gfx_surface s = window_surface(w);
+    gfx_surface_draw_circle(&s, cx, cy, r, color);
+    return 0;
+}
+
+int gui_window_blit(struct window *w, int x, int y, int rw, int rh, const uint32_t *pixels) {
+    if (!w || !w->in_use || !w->backbuf || !pixels) return -1;
+    if (rw <= 0 || rh <= 0) return 0;
+    if (rw > w->client_w || rh > w->client_h) return -1;
+    struct gfx_surface s = window_surface(w);
+    gfx_surface_blit(&s, x, y, rw, rh, pixels, rw);
+    return 0;
+}
+
+int gui_window_blit_blend(struct window *w, int x, int y, int rw, int rh, const uint32_t *pixels) {
+    if (!w || !w->in_use || !w->backbuf || !pixels) return -1;
+    if (rw <= 0 || rh <= 0) return 0;
+    if (rw > w->client_w || rh > w->client_h) return -1;
+    struct gfx_surface s = window_surface(w);
+    gfx_surface_blit_blend(&s, x, y, rw, rh, pixels, rw);
+    return 0;
+}
+
+int gui_window_getpixels(struct window *w, int x, int y, int rw, int rh, uint32_t *dst) {
+    if (!w || !w->in_use || !w->backbuf || !dst) return -1;
+    if (rw <= 0 || rh <= 0) return 0;
+    struct gfx_surface s = window_surface(w);
+    return gfx_surface_get_pixels(&s, x, y, rw, rh, dst);
+}
+
+int gui_window_gradient(struct window *w, int x, int y, int rw, int rh, uint32_t top, uint32_t bot) {
+    if (!w || !w->in_use || !w->backbuf) return -1;
+    struct gfx_surface s = window_surface(w);
+    gfx_surface_gradient_v(&s, x, y, rw, rh, top, bot);
+    return 0;
+}
+
+int gui_window_set_opacity(struct window *w, uint8_t alpha) {
+    if (!w || !w->in_use) return -1;
+    w->opacity = alpha;
     return 0;
 }
 
@@ -3651,6 +5268,7 @@ int gui_window_text_scaled(struct window *w, int x, int y, const char *s,
 
 int gui_window_flip(struct window *w) {
     if (!w || !w->in_use) return -1;
+    w->gpu_dirty = true;
     g.dirty = true;
     /* M27E: hint just the window's outer rect. The compositor still
      * does a correct full repaint into the back buffer, but only this
@@ -3675,6 +5293,48 @@ int gui_window_flip(struct window *w) {
  * the keystroke is visible. */
 void gui_post_key(uint8_t c) {
     if (!g.ready || !g.active) return;
+
+    /* When the start menu is open, route keystrokes to the search
+     * buffer instead of the focused window. */
+    if (g.menu_open) {
+        if (c == 0x1B) {
+            g.menu_open = false;
+            g.menu_search_len = 0;
+        } else if (c == '\b' || c == 0x7F) {
+            if (g.menu_search_len > 0)
+                g.menu_search_len--;
+        } else if (c == '\n' || c == '\r') {
+            int n = launcher_count();
+            for (int i = 0; i < n - 1; i++) {
+                struct launcher_item li;
+                if (!launcher_resolve(i, &li) || !li.label) continue;
+                if (g.menu_search_len > 0) {
+                    bool match = false;
+                    for (const char *s = li.label; *s; s++) {
+                        bool eq = true;
+                        for (int k = 0; k < g.menu_search_len && eq; k++) {
+                            char a = s[k], b = g.menu_search_buf[k];
+                            if (a >= 'A' && a <= 'Z') a += 32;
+                            if (b >= 'A' && b <= 'Z') b += 32;
+                            if (!a || a != b) eq = false;
+                        }
+                        if (eq) { match = true; break; }
+                    }
+                    if (!match) continue;
+                }
+                if (li.path) shell_launch_path(li.path);
+                g.menu_open = false;
+                g.menu_search_len = 0;
+                break;
+            }
+        } else if (c >= 0x20 && c < 0x7F) {
+            if (g.menu_search_len < (int)sizeof(g.menu_search_buf) - 1)
+                g.menu_search_buf[g.menu_search_len++] = (char)c;
+        }
+        g.dirty = true;
+        return;
+    }
+
     struct window *w = g.z_top;
     if (!w) return;
     if (g_trace >= GUI_TRACE_VERBOSE) {
@@ -3685,6 +5345,33 @@ void gui_post_key(uint8_t c) {
     }
     enqueue_event(w, GUI_EV_KEY, 0, 0, 0, c);
     g.input_boost_pid = w->owner_pid;
+}
+
+void gui_close_focused(void) {
+    if (!g.ready || !g.active || !g.z_top) return;
+    struct window *w = g.z_top;
+    if (w->state == GUI_WIN_MINIMIZED) return;
+    enqueue_event(w, GUI_EV_CLOSE, 0, 0, 0, 0);
+    w->close_request_tick = pit_ticks();
+    g.dirty = true;
+}
+
+void gui_alt_tab_cycle(void) {
+    if (!g.ready || !g.active) return;
+    struct window *next = NULL;
+    for (struct window *w = g.z_top ? g.z_top->z_next : NULL; w; w = w->z_next) {
+        if (w->state != GUI_WIN_MINIMIZED) { next = w; break; }
+    }
+    if (!next) {
+        /* Wrap: find the bottommost non-minimized window */
+        for (struct window *w = g.z_top; w; w = w->z_next) {
+            if (w->state != GUI_WIN_MINIMIZED) next = w;
+        }
+    }
+    if (next && next != g.z_top) {
+        z_raise(next);
+        g.dirty = true;
+    }
 }
 
 int gui_window_poll_event(struct window *w, struct gui_event *out) {
@@ -3703,4 +5390,69 @@ int gui_window_poll_event(struct window *w, struct gui_event *out) {
     }
     if (flags & (1ULL << 9)) sti();
     return got;
+}
+
+/* ---- Phase 2 M2.5: GPU-Accelerated Compositor -------------------- */
+
+enum compositor_mode gui_compositor_mode(void) {
+    return g.comp_mode;
+}
+
+void gui_set_compositor_mode(enum compositor_mode mode) {
+    if (mode == g.comp_mode) return;
+
+    /* Leaving GPU_ACCEL: restore the compositor scanout if we were in
+     * direct-scanout mode, and destroy per-window GPU resources. */
+    if (g.comp_mode == COMPOSITOR_GPU_ACCEL) {
+        if (g.direct_scanout_wid != 0) {
+            virtio_gpu_restore_scanout();
+            g.direct_scanout_wid = 0;
+        }
+        for (int i = 0; i < GUI_WINDOW_MAX; i++) {
+            struct window *w = &g_pool[i];
+            if (!w->in_use || !w->gpu_resource_id) continue;
+            virtio_gpu_destroy_window_resource(w->gpu_resource_id,
+                                               w->gpu_backing_phys,
+                                               w->gpu_backing_bytes);
+            w->gpu_resource_id   = 0;
+            w->gpu_backing       = NULL;
+            w->gpu_backing_phys  = 0;
+            w->gpu_backing_bytes = 0;
+        }
+    }
+
+    g.comp_mode = mode;
+    /* Reset triple-buffer state on mode switch */
+    g.tb_front   = 0;
+    g.tb_back    = 1;
+    g.tb_pending = -1;
+    g.dirty      = true;
+
+    /* Entering GPU_ACCEL: create GPU resources for existing windows. */
+    if (mode == COMPOSITOR_GPU_ACCEL && virtio_gpu_present()) {
+        for (int i = 0; i < GUI_WINDOW_MAX; i++) {
+            struct window *w = &g_pool[i];
+            if (!w->in_use || w->gpu_resource_id) continue;
+            void     *backing = NULL;
+            uint64_t  phys    = 0;
+            uint32_t rid = virtio_gpu_create_window_resource(
+                                (uint32_t)w->client_w,
+                                (uint32_t)w->client_h,
+                                &backing, &phys);
+            if (rid) {
+                w->gpu_resource_id   = rid;
+                w->gpu_backing       = backing;
+                w->gpu_backing_phys  = phys;
+                w->gpu_backing_bytes = (size_t)w->client_w * w->client_h * 4u;
+                w->gpu_dirty         = true;
+            }
+        }
+    }
+
+    kprintf("[gui] compositor mode -> %s\n",
+            mode == COMPOSITOR_GPU_ACCEL ? "GPU_ACCEL" : "SOFTWARE");
+}
+
+int gui_triple_buffer_pending(void) {
+    return g.tb_pending >= 0 ? 1 : 0;
 }

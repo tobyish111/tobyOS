@@ -101,6 +101,16 @@ static int g_shell_loop_depth;
 static int g_script_depth;
 static int g_subshell_depth;
 
+static bool g_opt_errexit;   /* set -e */
+static bool g_opt_nounset;   /* set -u */
+static bool g_opt_xtrace;    /* set -x */
+static bool g_opt_noglob;    /* set -f */
+static bool g_opt_verbose;   /* set -v */
+static bool g_opt_noclobber; /* set -C */
+static bool g_opt_notify;    /* set -b */
+static bool g_opt_noexec;    /* set -n */
+static bool g_opt_allexport; /* set -a */
+
 struct shell_alias {
     char *name;
     char *value;
@@ -123,6 +133,8 @@ static int g_heredoc_count;
 static char *g_traps[SIG_MAX];
 static bool g_trap_running;
 
+static bool g_heredoc_collecting;
+static bool g_continuation_active;
 static void prompt(void);
 static void execute_line_text(const char *src);
 static bool shell_name_is_valid(const char *s, size_t n);
@@ -405,7 +417,7 @@ static int env_set_kv(const char *kv_in) {
     }
 
     size_t total = strlen(kv_in);
-    char *blob = (char *)kmalloc(total + 1);
+    char *blob = (char *)kcalloc(1, total + 1);
     if (!blob) return -1;
     memcpy(blob, kv_in, total + 1);
 
@@ -434,14 +446,13 @@ static int env_set(const char *key, const char *val) {
     size_t klen = strlen(key);
     size_t vlen = strlen(val);
     if (klen == 0) return -1;
-    char *tmp = (char *)kmalloc(klen + 1 + vlen + 1);
-    if (!tmp) return -1;
+    size_t need = klen + 1 + vlen + 1;
+    if (need > 256) return -1;
+    char tmp[256];
     memcpy(tmp, key, klen);
     tmp[klen] = '=';
     memcpy(tmp + klen + 1, val, vlen + 1);
-    int rc = env_set_kv(tmp);
-    kfree(tmp);
-    return rc;
+    return env_set_kv(tmp);
 }
 
 static int env_unset(const char *key) {
@@ -754,6 +765,45 @@ static void shell_trap_restore(struct shell_trap_frame *frame) {
     }
 }
 
+static volatile int g_pending_signals[SIG_MAX];
+
+static void shell_run_trap(int sig) {
+    if (g_trap_running) return;
+    if (sig < 0 || sig >= SIG_MAX) return;
+    if (!g_traps[sig] || !*g_traps[sig]) return;
+
+    char *action = shell_strdup(g_traps[sig]);
+    if (!action) return;
+
+    enum shell_flow saved_flow = g_shell_flow;
+    int saved_flow_status = g_shell_flow_status;
+    g_trap_running = true;
+    g_shell_flow = SHELL_FLOW_NONE;
+    g_shell_flow_status = 0;
+
+    execute_line_text(action);
+
+    if (g_shell_flow != SHELL_FLOW_EXIT) {
+        g_shell_flow = saved_flow;
+        g_shell_flow_status = saved_flow_status;
+    }
+    g_trap_running = false;
+    kfree(action);
+}
+
+void shell_deliver_signal(int sig) {
+    if (sig > 0 && sig < SIG_MAX) g_pending_signals[sig] = 1;
+}
+
+static void shell_check_pending_signals(void) {
+    for (int i = 1; i < SIG_MAX; i++) {
+        if (g_pending_signals[i]) {
+            g_pending_signals[i] = 0;
+            shell_run_trap(i);
+        }
+    }
+}
+
 static int shell_run_exit_trap(int status) {
     if (g_trap_running || !g_traps[0] || !*g_traps[0]) return status;
 
@@ -1030,13 +1080,28 @@ static bool shell_name_is_valid(const char *s, size_t n) {
     return true;
 }
 
+static void shell_print_export_entry(const char *entry) {
+    size_t klen = env_key_len(entry);
+    if (entry[klen] == '=') {
+        char name[64];
+        if (klen + 1 > sizeof(name)) return;
+        memcpy(name, entry, klen);
+        name[klen] = '\0';
+        shell_printf("export %s=\"%s\"\n", name, entry + klen + 1);
+    } else {
+        shell_printf("export %s\n", entry);
+    }
+}
+
 static void cmd_export(int argc, char **argv) {
     shell_set_status(0);
-    if (argc <= 1) {
-        for (int i = 0; i < g_envc; i++) kprintf("export %s\n", g_env[i]);
+    if (argc <= 1 || (argc == 2 && strcmp(argv[1], "-p") == 0)) {
+        for (int i = 0; i < g_envc; i++) shell_print_export_entry(g_env[i]);
         return;
     }
-    for (int i = 1; i < argc; i++) {
+    int start = 1;
+    if (strcmp(argv[1], "-p") == 0) start = 2;
+    for (int i = start; i < argc; i++) {
         size_t klen = env_key_len(argv[i]);
         if (!shell_name_is_valid(argv[i], klen)) {
             kprintf("export: bad name '%s'\n", argv[i]);
@@ -1064,7 +1129,7 @@ static void cmd_readonly(int argc, char **argv) {
             if (!g_readonly[i]) continue;
             const char *v = env_get(g_readonly[i]);
             shell_printf("readonly %s", g_readonly[i]);
-            if (v) shell_printf("=%s", v);
+            if (v) shell_printf("=\"%s\"", v);
             shell_printf("\n");
         }
         return;
@@ -1122,6 +1187,46 @@ static void cmd_unset(int argc, char **argv) {
     }
 }
 
+static bool shell_set_opt(char c, bool on) {
+    switch (c) {
+    case 'e': g_opt_errexit = on; return true;
+    case 'u': g_opt_nounset = on; return true;
+    case 'x': g_opt_xtrace = on; return true;
+    case 'f': g_opt_noglob = on; return true;
+    case 'v': g_opt_verbose = on; return true;
+    case 'C': g_opt_noclobber = on; return true;
+    case 'b': g_opt_notify = on; return true;
+    case 'n': g_opt_noexec = on; return true;
+    case 'a': g_opt_allexport = on; return true;
+    default: return false;
+    }
+}
+
+static void shell_print_options(void) {
+    kprintf("allexport %s\n", g_opt_allexport ? "on" : "off");
+    kprintf("errexit   %s\n", g_opt_errexit ? "on" : "off");
+    kprintf("noclobber %s\n", g_opt_noclobber ? "on" : "off");
+    kprintf("noexec    %s\n", g_opt_noexec ? "on" : "off");
+    kprintf("noglob    %s\n", g_opt_noglob ? "on" : "off");
+    kprintf("notify    %s\n", g_opt_notify ? "on" : "off");
+    kprintf("nounset   %s\n", g_opt_nounset ? "on" : "off");
+    kprintf("verbose   %s\n", g_opt_verbose ? "on" : "off");
+    kprintf("xtrace    %s\n", g_opt_xtrace  ? "on" : "off");
+}
+
+static bool shell_set_opt_by_name(const char *name, bool on) {
+    struct { const char *name; char flag; } map[] = {
+        {"errexit", 'e'}, {"nounset", 'u'}, {"xtrace", 'x'},
+        {"noglob", 'f'}, {"verbose", 'v'}, {"noclobber", 'C'},
+        {"notify", 'b'}, {"noexec", 'n'}, {"allexport", 'a'},
+    };
+    for (size_t i = 0; i < sizeof(map)/sizeof(map[0]); i++) {
+        if (strcmp(name, map[i].name) == 0)
+            return shell_set_opt(map[i].flag, on);
+    }
+    return false;
+}
+
 static void cmd_set(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1) {
@@ -1130,9 +1235,66 @@ static void cmd_set(int argc, char **argv) {
     }
 
     int first = 1;
-    if (strcmp(argv[1], "--") == 0) first = 2;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--") == 0) { first = i + 1; break; }
+        if (argv[i][0] == '-' && argv[i][1] == 'o' && argv[i][2] == '\0') {
+            if (i + 1 < argc) {
+                i++;
+                if (!shell_set_opt_by_name(argv[i], true)) {
+                    kprintf("set: unknown option '%s'\n", argv[i]); shell_set_status(1); return;
+                }
+            } else {
+                shell_print_options();
+            }
+            first = i + 1;
+            continue;
+        }
+        if (argv[i][0] == '+' && argv[i][1] == 'o' && argv[i][2] == '\0') {
+            if (i + 1 < argc) {
+                i++;
+                if (!shell_set_opt_by_name(argv[i], false)) {
+                    kprintf("set: unknown option '%s'\n", argv[i]); shell_set_status(1); return;
+                }
+            }
+            first = i + 1;
+            continue;
+        }
+        if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            for (const char *f = argv[i] + 1; *f; f++) {
+                if (!shell_set_opt(*f, true)) {
+                    kprintf("set: unknown flag '-%c'\n", *f);
+                    shell_set_status(2);
+                    return;
+                }
+            }
+            first = i + 1;
+            continue;
+        }
+        if (argv[i][0] == '+' && argv[i][1] != '\0') {
+            for (const char *f = argv[i] + 1; *f; f++) {
+                if (!shell_set_opt(*f, false)) {
+                    kprintf("set: unknown flag '+%c'\n", *f);
+                    shell_set_status(2);
+                    return;
+                }
+            }
+            first = i + 1;
+            continue;
+        }
+        break;
+    }
 
-    bool all_assignments = (first < argc);
+    if (first > 1 && strcmp(argv[first - 1], "--") == 0) {
+        if (shell_set_positional_params(argc - first, &argv[first]) < 0) {
+            kprintf("set: positional parameter table full\n");
+            shell_set_status(1);
+        }
+        return;
+    }
+
+    if (first >= argc) return;
+
+    bool all_assignments = true;
     for (int i = first; i < argc; i++) {
         size_t klen = env_key_len(argv[i]);
         if (klen == 0 || argv[i][klen] != '=') {
@@ -1141,7 +1303,7 @@ static void cmd_set(int argc, char **argv) {
         }
     }
 
-    if (!all_assignments || strcmp(argv[1], "--") == 0) {
+    if (!all_assignments) {
         if (shell_set_positional_params(argc - first, &argv[first]) < 0) {
             kprintf("set: positional parameter table full\n");
             shell_set_status(1);
@@ -1575,11 +1737,61 @@ static void cmd_clear(int argc, char **argv) {
     console_clear();
 }
 
-static void cmd_echo(int argc, char **argv) {
-    for (int i = 1; i < argc; i++) {
-        shell_printf("%s%s", argv[i], i + 1 < argc ? " " : "");
+static void shell_echo_escape(const char *s) {
+    for (; *s; s++) {
+        if (*s == '\\' && s[1]) {
+            switch (s[1]) {
+            case 'n':  shell_write("\n"); s++; break;
+            case 't':  shell_write("\t"); s++; break;
+            case 'r':  shell_write("\r"); s++; break;
+            case '\\': shell_write("\\"); s++; break;
+            case 'a':  shell_write("\a"); s++; break;
+            case 'b':  shell_write("\b"); s++; break;
+            case 'f':  shell_write("\f"); s++; break;
+            case 'v':  shell_write("\v"); s++; break;
+            case '0': {
+                unsigned val = 0;
+                s++;
+                for (int k = 0; k < 3 && s[1] >= '0' && s[1] <= '7'; k++)
+                    val = val * 8 + (*(++s) - '0');
+                char c = (char)val;
+                if (c) { char tmp[2] = {c, 0}; shell_write(tmp); }
+                break;
+            }
+            case 'c': return;
+            default: { char tmp[2] = {'\\', 0}; shell_write(tmp); } break;
+            }
+        } else {
+            char tmp[2] = {*s, 0};
+            shell_write(tmp);
+        }
     }
-    shell_write("\n");
+}
+
+static void cmd_echo(int argc, char **argv) {
+    bool newline = true;
+    bool escapes = false;
+    int i = 1;
+    while (i < argc) {
+        if (argv[i][0] != '-') break;
+        bool valid = true;
+        for (const char *f = argv[i] + 1; *f; f++) {
+            if (*f == 'n') newline = false;
+            else if (*f == 'e') escapes = true;
+            else if (*f == 'E') escapes = false;
+            else { valid = false; break; }
+        }
+        if (!valid) break;
+        i++;
+    }
+    for (; i < argc; i++) {
+        if (escapes)
+            shell_echo_escape(argv[i]);
+        else
+            shell_write(argv[i]);
+        if (i + 1 < argc) shell_write(" ");
+    }
+    if (newline) shell_write("\n");
 }
 static void cmd_mem(int argc, char **argv) {
     (void)argc; (void)argv;
@@ -1805,6 +2017,28 @@ static void cmd_fg(int argc, char **argv) {
     kprintf("fg: '%s' (pid=%d) returned %d (0x%x)\n",
             saved_name, pid, rc, (unsigned)rc);
     shell_set_status(rc);
+}
+
+static void cmd_bg(int argc, char **argv) {
+    if (argc < 2) {
+        kprintf("usage: bg <job_id>     (see 'jobs')\n");
+        shell_set_status(1);
+        return;
+    }
+    int jid;
+    if (parse_int(argv[1], &jid) < 0 || jid <= 0) {
+        kprintf("bg: bad job id '%s'\n", argv[1]);
+        shell_set_status(1);
+        return;
+    }
+    struct job *j = jobs_find(jid);
+    if (!j) {
+        kprintf("bg: no such job [%d]\n", jid);
+        shell_set_status(1);
+        return;
+    }
+    kprintf("[%d] %s &\n", j->id, j->name);
+    shell_set_status(0);
 }
 
 static int shell_wait_job(struct job *j) {
@@ -3703,6 +3937,40 @@ static int shell_run_script_path(const char *path_arg, bool run_exit_trap) {
     return st;
 }
 
+struct shell_opt_frame {
+    bool errexit, nounset, xtrace, noglob, verbose, noclobber, notify, noexec, allexport;
+};
+
+static void shell_save_opts(struct shell_opt_frame *f) {
+    f->errexit   = g_opt_errexit;
+    f->nounset   = g_opt_nounset;
+    f->xtrace    = g_opt_xtrace;
+    f->noglob    = g_opt_noglob;
+    f->verbose   = g_opt_verbose;
+    f->noclobber = g_opt_noclobber;
+    f->notify    = g_opt_notify;
+    f->noexec    = g_opt_noexec;
+    f->allexport = g_opt_allexport;
+}
+
+static void shell_restore_opts(const struct shell_opt_frame *f) {
+    g_opt_errexit   = f->errexit;
+    g_opt_nounset   = f->nounset;
+    g_opt_xtrace    = f->xtrace;
+    g_opt_noglob    = f->noglob;
+    g_opt_verbose   = f->verbose;
+    g_opt_noclobber = f->noclobber;
+    g_opt_notify    = f->notify;
+    g_opt_noexec    = f->noexec;
+    g_opt_allexport = f->allexport;
+}
+
+static void shell_reset_opts(void) {
+    g_opt_errexit = g_opt_nounset = g_opt_xtrace = false;
+    g_opt_noglob = g_opt_verbose = g_opt_noclobber = false;
+    g_opt_notify = g_opt_noexec = g_opt_allexport = false;
+}
+
 static void cmd_sh(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 2) {
@@ -3731,8 +3999,12 @@ static void cmd_sh(int argc, char **argv) {
             shell_set_status(1);
             return;
         }
+        struct shell_opt_frame opt_frame;
+        shell_save_opts(&opt_frame);
+        shell_reset_opts();
         char *copy = shell_strdup(argv[2]);
         if (!copy) {
+            shell_restore_opts(&opt_frame);
             shell_trap_restore(&trap_frame);
             shell_restore_params_from_frame(&frame);
             shell_set_status(1);
@@ -3740,6 +4012,7 @@ static void cmd_sh(int argc, char **argv) {
         }
         int st = shell_run_script_text(copy, true);
         kfree(copy);
+        shell_restore_opts(&opt_frame);
         shell_trap_restore(&trap_frame);
         if (g_shell_flow == SHELL_FLOW_EXIT) {
             st = g_shell_flow_status;
@@ -3764,7 +4037,11 @@ static void cmd_sh(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    struct shell_opt_frame opt_frame;
+    shell_save_opts(&opt_frame);
+    shell_reset_opts();
     int st = shell_run_script_path(argv[1], true);
+    shell_restore_opts(&opt_frame);
     shell_trap_restore(&trap_frame);
     if (g_shell_flow == SHELL_FLOW_EXIT) {
         st = g_shell_flow_status;
@@ -3775,6 +4052,40 @@ static void cmd_sh(int argc, char **argv) {
     shell_set_status(st);
 }
 
+static int shell_find_dot_script(const char *arg, char *out, size_t cap) {
+    bool has_slash = false;
+    for (const char *p = arg; *p; p++) {
+        if (*p == '/') { has_slash = true; break; }
+    }
+    if (has_slash)
+        return shell_resolve_path_arg(arg, out, cap, ".");
+
+    if (shell_canonicalize_path(arg, out, cap) >= 0) {
+        struct vfs_stat st;
+        if (vfs_stat(out, &st) == VFS_OK) return 0;
+    }
+    const char *path_env = env_get("PATH");
+    if (!path_env) path_env = "/bin:/usr/bin";
+    const char *p = path_env;
+    while (*p) {
+        const char *end = p;
+        while (*end && *end != ':') end++;
+        size_t dlen = (size_t)(end - p);
+        size_t alen = strlen(arg);
+        if (dlen == 0) { p = *end ? end + 1 : end; continue; }
+        if (dlen + 1 + alen + 1 > cap) { p = *end ? end + 1 : end; continue; }
+        memcpy(out, p, dlen);
+        out[dlen] = '/';
+        memcpy(out + dlen + 1, arg, alen + 1);
+        struct vfs_stat st;
+        if (vfs_stat(out, &st) == VFS_OK) return 0;
+        p = *end ? end + 1 : end;
+    }
+    kprintf(".: %s: not found\n", arg);
+    shell_set_status(1);
+    return -1;
+}
+
 static void cmd_dot(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 2) {
@@ -3782,6 +4093,9 @@ static void cmd_dot(int argc, char **argv) {
         shell_set_status(2);
         return;
     }
+    char resolved[VFS_PATH_MAX];
+    if (shell_find_dot_script(argv[1], resolved, sizeof(resolved)) < 0) return;
+    argv[1] = resolved;
     if (argc <= 2) {
         shell_set_status(shell_run_script_path(argv[1], false));
         return;
@@ -3886,8 +4200,9 @@ static int shell_status_arg(int argc, char **argv, int def, const char *label,
     return v;
 }
 
+static int g_shell_break_depth;
+
 static void cmd_break(int argc, char **argv) {
-    (void)argv;
     if (argc > 2) {
         kprintf("break: too many arguments\n");
         shell_set_status(2);
@@ -3898,13 +4213,20 @@ static void cmd_break(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    int n = 1;
+    if (argc == 2 && (parse_int(argv[1], &n) < 0 || n <= 0)) {
+        kprintf("break: %s: numeric argument required\n", argv[1]);
+        shell_set_status(2);
+        return;
+    }
+    if (n > g_shell_loop_depth) n = g_shell_loop_depth;
+    g_shell_break_depth = n;
     g_shell_flow = SHELL_FLOW_BREAK;
     g_shell_flow_status = 0;
     shell_set_status(0);
 }
 
 static void cmd_continue(int argc, char **argv) {
-    (void)argv;
     if (argc > 2) {
         kprintf("continue: too many arguments\n");
         shell_set_status(2);
@@ -3915,6 +4237,14 @@ static void cmd_continue(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    int n = 1;
+    if (argc == 2 && (parse_int(argv[1], &n) < 0 || n <= 0)) {
+        kprintf("continue: %s: numeric argument required\n", argv[1]);
+        shell_set_status(2);
+        return;
+    }
+    if (n > g_shell_loop_depth) n = g_shell_loop_depth;
+    g_shell_break_depth = n;
     g_shell_flow = SHELL_FLOW_CONTINUE;
     g_shell_flow_status = 0;
     shell_set_status(0);
@@ -4026,7 +4356,6 @@ static void cmd_trap(int argc, char **argv) {
 
     const char *action = argv[1];
     bool reset = (strcmp(action, "-") == 0);
-    bool ignore = (action[0] == '\0');
     for (int i = 2; i < argc; i++) {
         int sig = -1;
         if (shell_trap_parse_condition(argv[i], &sig) < 0) {
@@ -4035,7 +4364,7 @@ static void cmd_trap(int argc, char **argv) {
             continue;
         }
         shell_trap_unset(sig);
-        if (reset || ignore) continue;
+        if (reset) continue;
         g_traps[sig] = shell_strdup(action);
         if (!g_traps[sig]) {
             shell_set_status(1);
@@ -4082,14 +4411,15 @@ static void cmd_command(int argc, char **argv) {
 
     bool verbose = false;
     bool locate = false;
+    bool use_default_path = false;
     int i = 1;
-    if (strcmp(argv[i], "-v") == 0) {
-        locate = true;
-        i++;
-    } else if (strcmp(argv[i], "-V") == 0) {
-        verbose = true;
-        i++;
+    while (i < argc && argv[i][0] == '-' && argv[i][1]) {
+        if (strcmp(argv[i], "-v") == 0) { locate = true; i++; }
+        else if (strcmp(argv[i], "-V") == 0) { verbose = true; i++; }
+        else if (strcmp(argv[i], "-p") == 0) { use_default_path = true; i++; }
+        else break;
     }
+    (void)use_default_path;
     if (i >= argc) {
         shell_set_status(0);
         return;
@@ -4215,6 +4545,459 @@ static void cmd_which(int argc, char **argv) {
     }
 }
 
+/* ---- POSIX `test` / `[` builtin --------------------------------- */
+
+static bool test_is_int(const char *s, long *out) {
+    if (!s || !*s) return false;
+    long v = 0;
+    bool neg = false;
+    const char *p = s;
+    if (*p == '-') { neg = true; p++; }
+    else if (*p == '+') p++;
+    if (!*p) return false;
+    while (*p) {
+        if (*p < '0' || *p > '9') return false;
+        v = v * 10 + (*p - '0');
+        p++;
+    }
+    if (out) *out = neg ? -v : v;
+    return true;
+}
+
+static int test_eval(int argc, char **argv);
+
+static int test_primary(int argc, char **argv, int *pos) {
+    if (*pos >= argc) return 1;
+    const char *a = argv[*pos];
+
+    if (strcmp(a, "!") == 0) {
+        (*pos)++;
+        return test_primary(argc, argv, pos) == 0 ? 1 : 0;
+    }
+    if (strcmp(a, "(") == 0) {
+        (*pos)++;
+        int r = 1;
+        int depth = 1;
+        int start = *pos;
+        while (*pos < argc) {
+            if (strcmp(argv[*pos], "(") == 0) depth++;
+            else if (strcmp(argv[*pos], ")") == 0) {
+                depth--;
+                if (depth == 0) break;
+            }
+            (*pos)++;
+        }
+        int sub_argc = *pos - start;
+        if (*pos < argc) (*pos)++;
+        if (sub_argc > 0) {
+            char **sub_argv = &argv[start];
+            r = test_eval(sub_argc, sub_argv);
+        }
+        return r;
+    }
+
+    if (strcmp(a, "-n") == 0) {
+        (*pos)++;
+        if (*pos >= argc) return 0;
+        int r = argv[*pos][0] != '\0' ? 0 : 1;
+        (*pos)++;
+        return r;
+    }
+    if (strcmp(a, "-z") == 0) {
+        (*pos)++;
+        if (*pos >= argc) return 0;
+        int r = argv[*pos][0] == '\0' ? 0 : 1;
+        (*pos)++;
+        return r;
+    }
+
+    if (strcmp(a, "-e") == 0 || strcmp(a, "-f") == 0 ||
+        strcmp(a, "-d") == 0 || strcmp(a, "-r") == 0 ||
+        strcmp(a, "-w") == 0 || strcmp(a, "-x") == 0 ||
+        strcmp(a, "-s") == 0 || strcmp(a, "-L") == 0 ||
+        strcmp(a, "-h") == 0 || strcmp(a, "-p") == 0 ||
+        strcmp(a, "-c") == 0 || strcmp(a, "-b") == 0 ||
+        strcmp(a, "-g") == 0 || strcmp(a, "-u") == 0 ||
+        strcmp(a, "-k") == 0 || strcmp(a, "-S") == 0 ||
+        strcmp(a, "-G") == 0 || strcmp(a, "-O") == 0 ||
+        strcmp(a, "-t") == 0) {
+        char op = a[1];
+        (*pos)++;
+        if (*pos >= argc) return 1;
+        const char *operand = argv[*pos];
+        (*pos)++;
+        if (op == 't') {
+            long fd = 0;
+            if (!test_is_int(operand, &fd)) return 1;
+            return (fd >= 0 && fd <= 2) ? 0 : 1;
+        }
+        char resolved[VFS_PATH_MAX];
+        if (shell_canonicalize_path(operand, resolved, sizeof(resolved)) < 0)
+            return 1;
+        struct vfs_stat st;
+        int rc = vfs_stat(resolved, &st);
+        if (rc != VFS_OK) return 1;
+        if (op == 'f') return st.type == VFS_TYPE_FILE ? 0 : 1;
+        if (op == 'd') return st.type == VFS_TYPE_DIR ? 0 : 1;
+        if (op == 's') return st.size > 0 ? 0 : 1;
+        if (op == 'L' || op == 'h') return 1;
+        if (op == 'p' || op == 'c' || op == 'b' || op == 'S') return 1;
+        if (op == 'g' || op == 'u' || op == 'k') return 1;
+        if (op == 'G' || op == 'O') return 0;
+        return 0;
+    }
+
+    if (*pos + 2 < argc) {
+        const char *op = argv[*pos + 1];
+        const char *b = argv[*pos + 2];
+        bool is_str_op = strcmp(op, "=") == 0 || strcmp(op, "==") == 0 ||
+                         strcmp(op, "!=") == 0;
+        bool is_int_op = strcmp(op, "-eq") == 0 || strcmp(op, "-ne") == 0 ||
+                         strcmp(op, "-lt") == 0 || strcmp(op, "-le") == 0 ||
+                         strcmp(op, "-gt") == 0 || strcmp(op, "-ge") == 0;
+
+        if (is_str_op) {
+            *pos += 3;
+            if (strcmp(op, "!=") == 0)
+                return strcmp(a, b) != 0 ? 0 : 1;
+            return strcmp(a, b) == 0 ? 0 : 1;
+        }
+        if (is_int_op) {
+            *pos += 3;
+            long va = 0, vb = 0;
+            if (!test_is_int(a, &va) || !test_is_int(b, &vb)) return 2;
+            if (strcmp(op, "-eq") == 0) return va == vb ? 0 : 1;
+            if (strcmp(op, "-ne") == 0) return va != vb ? 0 : 1;
+            if (strcmp(op, "-lt") == 0) return va < vb ? 0 : 1;
+            if (strcmp(op, "-le") == 0) return va <= vb ? 0 : 1;
+            if (strcmp(op, "-gt") == 0) return va > vb ? 0 : 1;
+            if (strcmp(op, "-ge") == 0) return va >= vb ? 0 : 1;
+        }
+    }
+
+    (*pos)++;
+    return a[0] != '\0' ? 0 : 1;
+}
+
+static int test_and(int argc, char **argv, int *pos) {
+    int r = test_primary(argc, argv, pos);
+    while (*pos < argc && strcmp(argv[*pos], "-a") == 0) {
+        (*pos)++;
+        int r2 = test_primary(argc, argv, pos);
+        if (r == 0) r = r2;
+    }
+    return r;
+}
+
+static int test_eval(int argc, char **argv) {
+    int pos = 0;
+    int r = test_and(argc, argv, &pos);
+    while (pos < argc && strcmp(argv[pos], "-o") == 0) {
+        pos++;
+        int r2 = test_and(argc, argv, &pos);
+        if (r != 0) r = r2;
+    }
+    return r;
+}
+
+static void cmd_test(int argc, char **argv) {
+    bool bracket = (argc > 0 && strcmp(argv[0], "[") == 0);
+    int end = argc;
+    if (bracket) {
+        if (argc < 2 || strcmp(argv[argc - 1], "]") != 0) {
+            kprintf("[: missing ']'\n");
+            shell_set_status(2);
+            return;
+        }
+        end = argc - 1;
+    }
+    if (end <= 1) {
+        shell_set_status(1);
+        return;
+    }
+    int result = test_eval(end - 1, &argv[1]);
+    shell_set_status(result);
+}
+
+/* ---- POSIX `printf` builtin ------------------------------------- */
+
+static int printf_parse_escape(const char **pp) {
+    const char *p = *pp;
+    if (*p != '\\') return -1;
+    p++;
+    char c = *p;
+    if (!c) { *pp = p; return '\\'; }
+    p++;
+    *pp = p;
+    switch (c) {
+    case 'a':  return '\a';
+    case 'b':  return '\b';
+    case 'f':  return '\f';
+    case 'n':  return '\n';
+    case 'r':  return '\r';
+    case 't':  return '\t';
+    case 'v':  return '\v';
+    case '\\': return '\\';
+    case '\'': return '\'';
+    case '"':  return '"';
+    case '0': {
+        int v = 0;
+        for (int i = 0; i < 3 && *p >= '0' && *p <= '7'; i++, p++)
+            v = v * 8 + (*p - '0');
+        *pp = p;
+        return v & 0xFF;
+    }
+    default: return c;
+    }
+}
+
+static long printf_arg_int(int argc, char **argv, int *argi) {
+    if (*argi >= argc) return 0;
+    const char *s = argv[(*argi)++];
+    long v = 0;
+    bool neg = false;
+    if (*s == '-') { neg = true; s++; }
+    else if (*s == '+') s++;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (*s - '0');
+        s++;
+    }
+    return neg ? -v : v;
+}
+
+static const char *printf_arg_str(int argc, char **argv, int *argi) {
+    if (*argi >= argc) return "";
+    return argv[(*argi)++];
+}
+
+static void cmd_printf(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc < 2) {
+        kprintf("usage: printf FORMAT [ARG...]\n");
+        shell_set_status(1);
+        return;
+    }
+    const char *fmt = argv[1];
+    int argi = 2;
+
+    do {
+        const char *p = fmt;
+        while (*p) {
+            if (*p == '\\') {
+                int c = printf_parse_escape(&p);
+                if (c >= 0) shell_putc((char)c);
+                continue;
+            }
+            if (*p != '%') {
+                shell_putc(*p++);
+                continue;
+            }
+            p++;
+            if (*p == '%') {
+                shell_putc('%');
+                p++;
+                continue;
+            }
+
+            bool left = false;
+            bool zero_pad = false;
+            if (*p == '-') { left = true; p++; }
+            if (*p == '0') { zero_pad = true; p++; }
+
+            int width = 0;
+            while (*p >= '0' && *p <= '9') {
+                width = width * 10 + (*p - '0');
+                p++;
+            }
+
+            int prec = -1;
+            if (*p == '.') {
+                p++;
+                prec = 0;
+                while (*p >= '0' && *p <= '9') {
+                    prec = prec * 10 + (*p - '0');
+                    p++;
+                }
+            }
+
+            char spec = *p;
+            if (spec) p++;
+
+            if (spec == 's') {
+                const char *s = printf_arg_str(argc, argv, &argi);
+                int slen = (int)strlen(s);
+                if (prec >= 0 && slen > prec) slen = prec;
+                int pad = width > slen ? width - slen : 0;
+                if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                for (int i = 0; i < slen; i++) shell_putc(s[i]);
+                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+            } else if (spec == 'd' || spec == 'i') {
+                long v = printf_arg_int(argc, argv, &argi);
+                char buf[32];
+                int blen = 0;
+                bool neg = v < 0;
+                unsigned long uv = neg ? (unsigned long)(-v) : (unsigned long)v;
+                if (uv == 0) buf[blen++] = '0';
+                while (uv > 0 && blen < (int)sizeof(buf) - 1) {
+                    buf[blen++] = (char)('0' + (uv % 10));
+                    uv /= 10;
+                }
+                int numlen = blen + (neg ? 1 : 0);
+                int pad = width > numlen ? width - numlen : 0;
+                if (!left && !zero_pad) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (neg) shell_putc('-');
+                if (!left && zero_pad) for (int i = 0; i < pad; i++) shell_putc('0');
+                while (blen > 0) shell_putc(buf[--blen]);
+                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+            } else if (spec == 'b') {
+                const char *s = printf_arg_str(argc, argv, &argi);
+                const char *bp = s;
+                while (*bp) {
+                    if (*bp == '\\') {
+                        int c = printf_parse_escape(&bp);
+                        if (c >= 0) shell_putc((char)c);
+                    } else {
+                        shell_putc(*bp++);
+                    }
+                }
+            } else if (spec == 'c') {
+                const char *s = printf_arg_str(argc, argv, &argi);
+                shell_putc(s[0] ? s[0] : '\0');
+            } else if (spec == 'o') {
+                long v = printf_arg_int(argc, argv, &argi);
+                unsigned long uv = (unsigned long)v;
+                char buf[32];
+                int blen = 0;
+                if (uv == 0) buf[blen++] = '0';
+                while (uv > 0 && blen < (int)sizeof(buf) - 1) {
+                    buf[blen++] = (char)('0' + (uv & 7));
+                    uv >>= 3;
+                }
+                int pad = width > blen ? width - blen : 0;
+                if (!left) for (int i = 0; i < pad; i++) shell_putc(zero_pad ? '0' : ' ');
+                while (blen > 0) shell_putc(buf[--blen]);
+                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+            } else if (spec == 'x' || spec == 'X') {
+                long v = printf_arg_int(argc, argv, &argi);
+                unsigned long uv = (unsigned long)v;
+                const char *hex = (spec == 'X') ? "0123456789ABCDEF"
+                                                : "0123456789abcdef";
+                char buf[32];
+                int blen = 0;
+                if (uv == 0) buf[blen++] = '0';
+                while (uv > 0 && blen < (int)sizeof(buf) - 1) {
+                    buf[blen++] = hex[uv & 0xF];
+                    uv >>= 4;
+                }
+                int pad = width > blen ? width - blen : 0;
+                if (!left) for (int i = 0; i < pad; i++) shell_putc(zero_pad ? '0' : ' ');
+                while (blen > 0) shell_putc(buf[--blen]);
+                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+            } else {
+                shell_putc('%');
+                if (spec) shell_putc(spec);
+            }
+        }
+    } while (argi < argc);
+}
+
+static int g_shell_umask = 022;
+
+static void cmd_umask(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) {
+        kprintf("%04o\n", (unsigned)g_shell_umask);
+        return;
+    }
+    int val = 0;
+    const char *s = argv[1];
+    while (*s >= '0' && *s <= '7') {
+        val = val * 8 + (*s - '0');
+        s++;
+    }
+    if (*s || val > 0777) {
+        kprintf("umask: '%s': invalid octal mask\n", argv[1]);
+        shell_set_status(1);
+        return;
+    }
+    g_shell_umask = val;
+}
+
+static void cmd_hash(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc >= 2 && strcmp(argv[1], "-r") == 0) {
+        kprintf("hash: table cleared\n");
+        return;
+    }
+    if (argc <= 1) {
+        kprintf("hash: table is empty\n");
+        return;
+    }
+    for (int i = 1; i < argc; i++) {
+        char path_buf[64];
+        const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
+        if (path_is_file(path)) {
+            kprintf("%s=%s\n", argv[i], path);
+        } else {
+            kprintf("hash: %s: not found\n", argv[i]);
+            shell_set_status(1);
+        }
+    }
+}
+
+static void cmd_kill(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc < 2) {
+        kprintf("usage: kill [-SIGNAL] PID...\n");
+        shell_set_status(2);
+        return;
+    }
+    int sig = SIGTERM;
+    int first = 1;
+    if (argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
+        int v = 0;
+        for (const char *p = argv[1] + 1; *p; p++) {
+            if (*p < '0' || *p > '9') {
+                kprintf("kill: bad signal '%s'\n", argv[1] + 1);
+                shell_set_status(2);
+                return;
+            }
+            v = v * 10 + (*p - '0');
+        }
+        sig = v;
+        first = 2;
+    } else if (argv[1][0] == '-') {
+        const char *name = argv[1] + 1;
+        if (strcmp(name, "INT") == 0 || strcmp(name, "SIGINT") == 0)
+            sig = SIGINT;
+        else if (strcmp(name, "TERM") == 0 || strcmp(name, "SIGTERM") == 0)
+            sig = SIGTERM;
+        else {
+            kprintf("kill: unknown signal '%s'\n", name);
+            shell_set_status(1);
+            return;
+        }
+        first = 2;
+    }
+    for (int i = first; i < argc; i++) {
+        int pid = 0;
+        const char *p = argv[i];
+        bool neg = false;
+        if (*p == '-') { neg = true; p++; }
+        while (*p >= '0' && *p <= '9') {
+            pid = pid * 10 + (*p - '0');
+            p++;
+        }
+        if (*p) {
+            kprintf("kill: invalid pid '%s'\n", argv[i]);
+            shell_set_status(1);
+            continue;
+        }
+        if (neg) pid = -pid;
+        signal_send_to_pid(pid, sig);
+    }
+}
+
 static const struct cmd cmds[] = {
     { "help",   "list available commands",      cmd_help   },
     { "clear",  "clear the screen",             cmd_clear  },
@@ -4247,6 +5030,9 @@ static const struct cmd cmds[] = {
     { "trap",     "trap [action condition...]: set shell traps",          cmd_trap     },
     { "setenv",   "setenv KEY VALUE: set an environment var (M25C)",     cmd_setenv   },
     { "unsetenv", "unsetenv KEY: remove an environment var (M25C)",      cmd_unsetenv },
+    { "test",     "test EXPR: evaluate conditional expression",         cmd_test     },
+    { "[",        "[ EXPR ]: evaluate conditional expression",          cmd_test     },
+    { "printf",   "printf FORMAT [ARG...]: formatted output",          cmd_printf   },
     { "true",   "return successful status",      cmd_true   },
     { "false",  "return failing status",         cmd_false  },
     { "mem",    "show pmm + heap stats",        cmd_mem    },
@@ -4265,7 +5051,12 @@ static const struct cmd cmds[] = {
     { "run",    "run <path> [args]: spawn ring-3 process (fg)", cmd_run},
     { "jobs",   "list active background jobs",   cmd_jobs   },
     { "fg",     "fg <job_id>: bring bg job to foreground",  cmd_fg },
+    { "bg",     "bg <job_id>: continue job in background", cmd_bg },
     { "wait",   "wait [pid|%job...]: wait for background jobs", cmd_wait },
+    { "kill",   "kill [-SIGNAL] PID...: send signal to process", cmd_kill },
+    { "umask",  "umask [MODE]: display or set file creation mask", cmd_umask },
+    { "hash",   "hash [-r]: display or reset command hash table", cmd_hash },
+    { "source", "source script: run script in current shell",     cmd_dot  },
     { "ps",     "list processes with cpu/syscalls/pages", cmd_ps },
     { "top",    "top [-n iters] [-d ms]: live process stats",  cmd_top  },
     { "time",   "time <cmd> [args]: measure wall + cpu + syscalls", cmd_time },
@@ -4313,6 +5104,12 @@ static inline bool is_space(char c) {
 }
 
 static void prompt(void) {
+    if (g_heredoc_collecting || g_continuation_active) {
+        console_set_color(0x0066FF66);
+        shell_printf("> ");
+        console_set_color(0x00CCCCCC);
+        return;
+    }
     console_set_color(0x0066FF66);   /* greenish */
     const char *user = env_get("USER");
     if (!user || !*user) user = "toby";
@@ -4343,6 +5140,7 @@ enum shell_tok_type {
     SH_TOK_HEREDOC_TABS,
     SH_TOK_REDIR_OUT,
     SH_TOK_REDIR_APPEND,
+    SH_TOK_REDIR_CLOBBER,
     SH_TOK_DUP_IN,
     SH_TOK_DUP_OUT,
 };
@@ -4352,6 +5150,7 @@ enum shell_redir_op {
     SH_RD_HEREDOC,
     SH_RD_OPEN_OUT,
     SH_RD_OPEN_APPEND,
+    SH_RD_OPEN_EXCL,
     SH_RD_DUP_IN,
     SH_RD_DUP_OUT,
     SH_RD_CLOSE,
@@ -4545,6 +5344,15 @@ static int shell_append_str(char *buf, size_t *pos, size_t cap,
     return 0;
 }
 
+static int shell_append_n(char *buf, size_t *pos, size_t cap,
+                          const char *s, size_t n) {
+    if (!s) return 0;
+    for (size_t i = 0; i < n && s[i]; i++) {
+        if (shell_append_char(buf, pos, cap, s[i]) < 0) return -1;
+    }
+    return 0;
+}
+
 static int shell_append_uint(char *buf, size_t *pos, size_t cap,
                              unsigned long v) {
     char tmp[32];
@@ -4730,9 +5538,17 @@ static bool shell_var_char(char c) {
     return shell_var_start(c) || (c >= '0' && c <= '9');
 }
 
-static int shell_append_positional_join(char *buf, size_t *pos, size_t cap) {
+static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
+                                        bool use_ifs) {
+    char sep = ' ';
+    if (use_ifs) {
+        const char *ifs = env_get("IFS");
+        if (ifs && *ifs) sep = ifs[0];
+        else if (!ifs) sep = ' ';
+        else sep = '\0';
+    }
     for (int i = 0; i < g_positional_count; i++) {
-        if (i > 0 && shell_append_char(buf, pos, cap, ' ') < 0) return -1;
+        if (i > 0 && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
         if (shell_append_str(buf, pos, cap, g_positional[i]) < 0) return -1;
     }
     return 0;
@@ -4745,43 +5561,59 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
     out[0] = '\0';
     *is_set = true;
 
+    int rc = -1;
     if (strcmp(name, "?") == 0) {
-        return shell_append_uint(out, &pos, cap, (unsigned long)g_last_status);
-    }
-    if (strcmp(name, "!") == 0) {
-        return shell_append_uint(out, &pos, cap, (unsigned long)g_last_bg_pid);
-    }
-    if (strcmp(name, "$") == 0) {
+        rc = shell_append_uint(out, &pos, cap, (unsigned long)g_last_status);
+    } else if (strcmp(name, "!") == 0) {
+        rc = shell_append_uint(out, &pos, cap, (unsigned long)g_last_bg_pid);
+    } else if (strcmp(name, "$") == 0) {
         struct proc *cur = current_proc();
-        return shell_append_uint(out, &pos, cap,
-                                 (unsigned long)(cur ? cur->pid : 0));
-    }
-    if (strcmp(name, "#") == 0) {
-        return shell_append_uint(out, &pos, cap,
-                                 (unsigned long)g_positional_count);
-    }
-    if (strcmp(name, "@") == 0 || strcmp(name, "*") == 0) {
-        return shell_append_positional_join(out, &pos, cap);
-    }
-    if (name[0] >= '0' && name[0] <= '9' && name[1] == '\0') {
-        int idx = name[0] - '0';
+        rc = shell_append_uint(out, &pos, cap,
+                               (unsigned long)(cur ? cur->pid : 0));
+    } else if (strcmp(name, "#") == 0) {
+        rc = shell_append_uint(out, &pos, cap,
+                               (unsigned long)g_positional_count);
+    } else if (strcmp(name, "-") == 0) {
+        char opts[16];
+        int oi = 0;
+        if (g_opt_allexport) opts[oi++] = 'a';
+        if (g_opt_notify)    opts[oi++] = 'b';
+        if (g_opt_errexit)   opts[oi++] = 'e';
+        if (g_opt_noglob)    opts[oi++] = 'f';
+        if (g_opt_noexec)    opts[oi++] = 'n';
+        if (g_opt_nounset)   opts[oi++] = 'u';
+        if (g_opt_verbose)   opts[oi++] = 'v';
+        if (g_opt_xtrace)    opts[oi++] = 'x';
+        if (g_opt_noclobber) opts[oi++] = 'C';
+        opts[oi] = '\0';
+        rc = shell_append_str(out, &pos, cap, opts);
+    } else if (strcmp(name, "*") == 0) {
+        rc = shell_append_positional_join(out, &pos, cap, true);
+    } else if (strcmp(name, "@") == 0) {
+        rc = shell_append_positional_join(out, &pos, cap, false);
+    } else if (name[0] >= '0' && name[0] <= '9') {
+        int idx = 0;
+        for (const char *d = name; *d >= '0' && *d <= '9'; d++)
+            idx = idx * 10 + (*d - '0');
         if (idx == 0) {
             const char *p0 = g_param0 ? g_param0 : "tobysh";
-            return shell_append_str(out, &pos, cap, p0);
+            rc = shell_append_str(out, &pos, cap, p0);
+        } else if (idx <= g_positional_count) {
+            rc = shell_append_str(out, &pos, cap, g_positional[idx - 1]);
+        } else {
+            *is_set = false;
+            return 0;
         }
-        if (idx <= g_positional_count) {
-            return shell_append_str(out, &pos, cap, g_positional[idx - 1]);
+    } else {
+        const char *v = env_get(name);
+        if (!v) {
+            *is_set = false;
+            return 0;
         }
-        *is_set = false;
-        return 0;
+        rc = shell_append_str(out, &pos, cap, v);
     }
-
-    const char *v = env_get(name);
-    if (!v) {
-        *is_set = false;
-        return 0;
-    }
-    return shell_append_str(out, &pos, cap, v);
+    if (rc >= 0 && pos < cap) out[pos] = '\0';
+    return rc;
 }
 
 static int shell_expand_param_word(const char *word, char *out, size_t cap) {
@@ -4809,12 +5641,14 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap) {
 static int shell_parse_braced_name(const char *expr, size_t *name_len) {
     if (!expr || !*expr || !name_len) return -1;
     if (expr[0] == '?' || expr[0] == '$' || expr[0] == '#' ||
-        expr[0] == '@' || expr[0] == '*') {
+        expr[0] == '@' || expr[0] == '*' || expr[0] == '-') {
         *name_len = 1;
         return 0;
     }
     if (expr[0] >= '0' && expr[0] <= '9') {
-        *name_len = 1;
+        size_t n = 1;
+        while (expr[n] >= '0' && expr[n] <= '9') n++;
+        *name_len = n;
         return 0;
     }
     if (!shell_var_start(expr[0])) return -1;
@@ -4823,6 +5657,8 @@ static int shell_parse_braced_name(const char *expr, size_t *name_len) {
     *name_len = n;
     return 0;
 }
+
+static bool shell_glob_match(const char *pat, const char *name);
 
 static int shell_expand_braced_parameter(const char *expr, char *buf,
                                          size_t *pos, size_t cap) {
@@ -4854,6 +5690,58 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
     char opch = '\0';
     const char *word = "";
     if (*op) {
+        if (*op == '#' || *op == '%') {
+            char strip_op = *op++;
+            bool greedy = (*op == strip_op);
+            if (greedy) op++;
+            const char *pattern = op;
+
+            char value[SHELL_PARSE_BUF_MAX];
+            bool is_set = false;
+            if (shell_parameter_value(name, value, sizeof(value),
+                                      &is_set) < 0) {
+                kprintf("shell: parameter expansion too long\n");
+                return -1;
+            }
+            if (length_mode)
+                return shell_append_uint(buf, pos, cap,
+                                         (unsigned long)strlen(value));
+
+            size_t vlen = strlen(value);
+            char tmp[SHELL_PARSE_BUF_MAX];
+            if (strip_op == '#') {
+                if (greedy) {
+                    for (size_t i = vlen; i > 0; i--) {
+                        memcpy(tmp, value, i);
+                        tmp[i] = '\0';
+                        if (shell_glob_match(pattern, tmp))
+                            return shell_append_str(buf, pos, cap, value + i);
+                    }
+                } else {
+                    for (size_t i = 0; i <= vlen; i++) {
+                        memcpy(tmp, value, i);
+                        tmp[i] = '\0';
+                        if (shell_glob_match(pattern, tmp))
+                            return shell_append_str(buf, pos, cap, value + i);
+                    }
+                }
+            } else {
+                if (greedy) {
+                    for (size_t i = 0; i <= vlen; i++) {
+                        if (shell_glob_match(pattern, value + i))
+                            return shell_append_n(buf, pos, cap, value, i);
+                    }
+                } else {
+                    for (size_t i = vlen; i > 0; i--) {
+                        if (shell_glob_match(pattern, value + i))
+                            return shell_append_n(buf, pos, cap, value, i);
+                    }
+                    if (shell_glob_match(pattern, value))
+                        return shell_append_n(buf, pos, cap, value, 0);
+                }
+            }
+            return shell_append_str(buf, pos, cap, value);
+        }
         if (*op == ':') {
             colon = true;
             op++;
@@ -4880,6 +5768,10 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
     }
 
     if (opch == '\0') {
+        if (!is_set && g_opt_nounset) {
+            kprintf("%s: unbound variable\n", name);
+            return -1;
+        }
         return shell_append_str(buf, pos, cap, value);
     }
 
@@ -4932,7 +5824,9 @@ static void shell_arith_skip(struct shell_arith *a) {
     while (*a->p == ' ' || *a->p == '\t') a->p++;
 }
 
-static long shell_arith_expr(struct shell_arith *a);
+static long shell_arith_or(struct shell_arith *a);
+static long shell_arith_ternary(struct shell_arith *a);
+static int shell_append_long(char *buf, size_t *pos, size_t cap, long v);
 
 static long shell_parse_long_value(const char *s, bool *ok) {
     long v = 0;
@@ -4955,6 +5849,44 @@ static long shell_parse_long_value(const char *s, bool *ok) {
 
 static long shell_arith_factor(struct shell_arith *a) {
     shell_arith_skip(a);
+    if (*a->p == '!') {
+        a->p++;
+        return !shell_arith_factor(a);
+    }
+    if (*a->p == '~') {
+        a->p++;
+        return ~shell_arith_factor(a);
+    }
+    if (a->p[0] == '+' && a->p[1] == '+' && shell_var_start(a->p[2])) {
+        a->p += 2;
+        char name[64]; size_t n = 0;
+        while (shell_var_char(*a->p) && n + 1 < sizeof(name)) name[n++] = *a->p++;
+        name[n] = '\0';
+        const char *vstr = env_get(name);
+        bool ok = false;
+        long v = shell_parse_long_value(vstr ? vstr : "0", &ok);
+        if (!ok) v = 0;
+        v++;
+        char tmp[32]; size_t tpos = 0;
+        shell_append_long(tmp, &tpos, sizeof(tmp), v);
+        env_set(name, tmp);
+        return v;
+    }
+    if (a->p[0] == '-' && a->p[1] == '-' && shell_var_start(a->p[2])) {
+        a->p += 2;
+        char name[64]; size_t n = 0;
+        while (shell_var_char(*a->p) && n + 1 < sizeof(name)) name[n++] = *a->p++;
+        name[n] = '\0';
+        const char *vstr = env_get(name);
+        bool ok = false;
+        long v = shell_parse_long_value(vstr ? vstr : "0", &ok);
+        if (!ok) v = 0;
+        v--;
+        char tmp[32]; size_t tpos = 0;
+        shell_append_long(tmp, &tpos, sizeof(tmp), v);
+        env_set(name, tmp);
+        return v;
+    }
     if (*a->p == '+') {
         a->p++;
         return shell_arith_factor(a);
@@ -4965,7 +5897,7 @@ static long shell_arith_factor(struct shell_arith *a) {
     }
     if (*a->p == '(') {
         a->p++;
-        long v = shell_arith_expr(a);
+        long v = shell_arith_ternary(a);
         shell_arith_skip(a);
         if (*a->p != ')') {
             a->ok = false;
@@ -4976,30 +5908,97 @@ static long shell_arith_factor(struct shell_arith *a) {
     }
     if (*a->p >= '0' && *a->p <= '9') {
         long v = 0;
-        while (*a->p >= '0' && *a->p <= '9') {
-            v = v * 10 + (*a->p - '0');
-            a->p++;
+        if (*a->p == '0' && (a->p[1] == 'x' || a->p[1] == 'X')) {
+            a->p += 2;
+            while (1) {
+                int d = -1;
+                if (*a->p >= '0' && *a->p <= '9') d = *a->p - '0';
+                else if (*a->p >= 'a' && *a->p <= 'f') d = *a->p - 'a' + 10;
+                else if (*a->p >= 'A' && *a->p <= 'F') d = *a->p - 'A' + 10;
+                if (d < 0) break;
+                v = v * 16 + d;
+                a->p++;
+            }
+        } else if (*a->p == '0' && a->p[1] >= '0' && a->p[1] <= '7') {
+            while (*a->p >= '0' && *a->p <= '7') {
+                v = v * 8 + (*a->p - '0');
+                a->p++;
+            }
+        } else {
+            while (*a->p >= '0' && *a->p <= '9') {
+                v = v * 10 + (*a->p - '0');
+                a->p++;
+            }
         }
         return v;
     }
     if (shell_var_start(*a->p)) {
         char name[64];
         size_t n = 0;
+        const char *name_start = a->p;
         while (shell_var_char(*a->p) && n + 1 < sizeof(name)) {
             name[n++] = *a->p++;
         }
         name[n] = '\0';
+        shell_arith_skip(a);
+        if (*a->p == '=' && a->p[1] != '=') {
+            a->p++;
+            long rhs = shell_arith_ternary(a);
+            if (!a->ok) return 0;
+            char tmp[32];
+            size_t tpos = 0;
+            shell_append_long(tmp, &tpos, sizeof(tmp), rhs);
+            env_set(name, tmp);
+            return rhs;
+        }
+        char assign_op = 0;
+        if (a->p[1] == '=' &&
+            (*a->p == '+' || *a->p == '-' || *a->p == '*' ||
+             *a->p == '/' || *a->p == '%')) {
+            assign_op = *a->p;
+            a->p += 2;
+        }
         const char *vstr = env_get(name);
         bool ok = false;
         long v = shell_parse_long_value(vstr ? vstr : "0", &ok);
         if (!ok) v = 0;
+        if (assign_op) {
+            long rhs = shell_arith_ternary(a);
+            if (!a->ok) return 0;
+            if (assign_op == '+') v += rhs;
+            else if (assign_op == '-') v -= rhs;
+            else if (assign_op == '*') v *= rhs;
+            else if (assign_op == '/') { if (rhs == 0) { a->ok = false; return 0; } v /= rhs; }
+            else if (assign_op == '%') { if (rhs == 0) { a->ok = false; return 0; } v %= rhs; }
+            char tmp[32];
+            size_t tpos = 0;
+            shell_append_long(tmp, &tpos, sizeof(tmp), v);
+            env_set(name, tmp);
+        }
+        shell_arith_skip(a);
+        if (a->p[0] == '+' && a->p[1] == '+') {
+            a->p += 2;
+            long ret = v;
+            char tmp[32]; size_t tpos = 0;
+            shell_append_long(tmp, &tpos, sizeof(tmp), v + 1);
+            env_set(name, tmp);
+            return ret;
+        }
+        if (a->p[0] == '-' && a->p[1] == '-') {
+            a->p += 2;
+            long ret = v;
+            char tmp[32]; size_t tpos = 0;
+            shell_append_long(tmp, &tpos, sizeof(tmp), v - 1);
+            env_set(name, tmp);
+            return ret;
+        }
         return v;
     }
     a->ok = false;
     return 0;
 }
 
-static long shell_arith_term(struct shell_arith *a) {
+static long shell_arith_mul(struct shell_arith *a) {
     long v = shell_arith_factor(a);
     while (a->ok) {
         shell_arith_skip(a);
@@ -5019,20 +6018,186 @@ static long shell_arith_term(struct shell_arith *a) {
     return v;
 }
 
-static long shell_arith_expr(struct shell_arith *a) {
-    long v = shell_arith_term(a);
+static long shell_arith_add(struct shell_arith *a) {
+    long v = shell_arith_mul(a);
     while (a->ok) {
         shell_arith_skip(a);
         char op = *a->p;
         if (op != '+' && op != '-') break;
         a->p++;
-        long rhs = shell_arith_term(a);
+        long rhs = shell_arith_mul(a);
         if (!a->ok) return 0;
         if (op == '+') v += rhs;
         else v -= rhs;
     }
     return v;
 }
+
+static long shell_arith_shift(struct shell_arith *a) {
+    long v = shell_arith_add(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        if (a->p[0] == '<' && a->p[1] == '<') {
+            a->p += 2;
+            long rhs = shell_arith_add(a);
+            if (!a->ok) return 0;
+            v <<= rhs;
+        } else if (a->p[0] == '>' && a->p[1] == '>') {
+            a->p += 2;
+            long rhs = shell_arith_add(a);
+            if (!a->ok) return 0;
+            v >>= rhs;
+        } else break;
+    }
+    return v;
+}
+
+static long shell_arith_rel(struct shell_arith *a) {
+    long v = shell_arith_shift(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        if (a->p[0] == '<' && a->p[1] == '=') {
+            a->p += 2;
+            long rhs = shell_arith_shift(a);
+            if (!a->ok) return 0;
+            v = (v <= rhs) ? 1 : 0;
+        } else if (a->p[0] == '>' && a->p[1] == '=') {
+            a->p += 2;
+            long rhs = shell_arith_shift(a);
+            if (!a->ok) return 0;
+            v = (v >= rhs) ? 1 : 0;
+        } else if (a->p[0] == '<' && a->p[1] != '<') {
+            a->p++;
+            long rhs = shell_arith_shift(a);
+            if (!a->ok) return 0;
+            v = (v < rhs) ? 1 : 0;
+        } else if (a->p[0] == '>' && a->p[1] != '>') {
+            a->p++;
+            long rhs = shell_arith_shift(a);
+            if (!a->ok) return 0;
+            v = (v > rhs) ? 1 : 0;
+        } else break;
+    }
+    return v;
+}
+
+static long shell_arith_eq(struct shell_arith *a) {
+    long v = shell_arith_rel(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        if (a->p[0] == '=' && a->p[1] == '=') {
+            a->p += 2;
+            long rhs = shell_arith_rel(a);
+            if (!a->ok) return 0;
+            v = (v == rhs) ? 1 : 0;
+        } else if (a->p[0] == '!' && a->p[1] == '=') {
+            a->p += 2;
+            long rhs = shell_arith_rel(a);
+            if (!a->ok) return 0;
+            v = (v != rhs) ? 1 : 0;
+        } else break;
+    }
+    return v;
+}
+
+static long shell_arith_bitand(struct shell_arith *a) {
+    long v = shell_arith_eq(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        if (a->p[0] == '&' && a->p[1] != '&') {
+            a->p++;
+            long rhs = shell_arith_eq(a);
+            if (!a->ok) return 0;
+            v &= rhs;
+        } else break;
+    }
+    return v;
+}
+
+static long shell_arith_bitxor(struct shell_arith *a) {
+    long v = shell_arith_bitand(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        if (a->p[0] == '^') {
+            a->p++;
+            long rhs = shell_arith_bitand(a);
+            if (!a->ok) return 0;
+            v ^= rhs;
+        } else break;
+    }
+    return v;
+}
+
+static long shell_arith_bitor(struct shell_arith *a) {
+    long v = shell_arith_bitxor(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        if (a->p[0] == '|' && a->p[1] != '|') {
+            a->p++;
+            long rhs = shell_arith_bitxor(a);
+            if (!a->ok) return 0;
+            v |= rhs;
+        } else break;
+    }
+    return v;
+}
+
+static long shell_arith_and(struct shell_arith *a) {
+    long v = shell_arith_bitor(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        if (a->p[0] == '&' && a->p[1] == '&') {
+            a->p += 2;
+            long rhs = shell_arith_bitor(a);
+            if (!a->ok) return 0;
+            v = (v && rhs) ? 1 : 0;
+        } else break;
+    }
+    return v;
+}
+
+static long shell_arith_or(struct shell_arith *a) {
+    long v = shell_arith_and(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        if (a->p[0] == '|' && a->p[1] == '|') {
+            a->p += 2;
+            long rhs = shell_arith_and(a);
+            if (!a->ok) return 0;
+            v = (v || rhs) ? 1 : 0;
+        } else break;
+    }
+    return v;
+}
+
+static long shell_arith_ternary(struct shell_arith *a) {
+    long v = shell_arith_or(a);
+    shell_arith_skip(a);
+    if (*a->p == '?') {
+        a->p++;
+        long if_true = shell_arith_ternary(a);
+        shell_arith_skip(a);
+        if (*a->p != ':') { a->ok = false; return 0; }
+        a->p++;
+        long if_false = shell_arith_ternary(a);
+        if (!a->ok) return 0;
+        return v ? if_true : if_false;
+    }
+    return v;
+}
+
+static long shell_arith_comma(struct shell_arith *a) {
+    long v = shell_arith_ternary(a);
+    while (a->ok) {
+        shell_arith_skip(a);
+        if (*a->p != ',') break;
+        a->p++;
+        v = shell_arith_ternary(a);
+    }
+    return v;
+}
+
+#define shell_arith_expr shell_arith_comma
 
 static int shell_append_long(char *buf, size_t *pos, size_t cap, long v) {
     if (v < 0) {
@@ -5123,10 +6288,32 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
         return shell_append_uint(buf, pos, cap,
                                  (unsigned long)g_positional_count);
     }
-    if (*p == '@' || *p == '*') {
+    if (*p == '-') {
         p++;
         *pp = p;
-        return shell_append_positional_join(buf, pos, cap);
+        char opts[16];
+        int oi = 0;
+        if (g_opt_allexport) opts[oi++] = 'a';
+        if (g_opt_notify)    opts[oi++] = 'b';
+        if (g_opt_errexit)   opts[oi++] = 'e';
+        if (g_opt_noglob)    opts[oi++] = 'f';
+        if (g_opt_noexec)    opts[oi++] = 'n';
+        if (g_opt_nounset)   opts[oi++] = 'u';
+        if (g_opt_verbose)   opts[oi++] = 'v';
+        if (g_opt_xtrace)    opts[oi++] = 'x';
+        if (g_opt_noclobber) opts[oi++] = 'C';
+        opts[oi] = '\0';
+        return shell_append_str(buf, pos, cap, opts);
+    }
+    if (*p == '*') {
+        p++;
+        *pp = p;
+        return shell_append_positional_join(buf, pos, cap, true);
+    }
+    if (*p == '@') {
+        p++;
+        *pp = p;
+        return shell_append_positional_join(buf, pos, cap, false);
     }
     if (*p >= '0' && *p <= '9') {
         int idx = *p++ - '0';
@@ -5164,7 +6351,12 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
     }
     name[n] = '\0';
     *pp = p;
-    return shell_append_str(buf, pos, cap, env_get(name));
+    const char *val = env_get(name);
+    if (!val && g_opt_nounset) {
+        kprintf("%s: unbound variable\n", name);
+        return -1;
+    }
+    return shell_append_str(buf, pos, cap, val);
 }
 
 static int shell_emit_token_fd(struct shell_token *tok, int *ntok,
@@ -5257,6 +6449,7 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
         if (*p == '>') {
             enum shell_tok_type t = SH_TOK_REDIR_OUT;
             if (p[1] == '>') { t = SH_TOK_REDIR_APPEND; p++; }
+            else if (p[1] == '|') { t = SH_TOK_REDIR_CLOBBER; p++; }
             else if (p[1] == '&') { t = SH_TOK_DUP_OUT; p++; }
             if (shell_emit_token_fd(tok, &ntok, t, 0, false, explicit_fd) < 0) return -1;
             p++;
@@ -5268,6 +6461,58 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
         bool word_quoted = false;
         while (*p && !is_space(*p) && !shell_operator_char(*p)) {
             got = true;
+            if (*p == '$' && p[1] == '\'') {
+                word_quoted = true;
+                p += 2;
+                while (*p && *p != '\'') {
+                    if (*p == '\\' && p[1]) {
+                        p++;
+                        char c = 0;
+                        switch (*p) {
+                        case 'a': c = '\a'; p++; break;
+                        case 'b': c = '\b'; p++; break;
+                        case 'e': c = 0x1B; p++; break;
+                        case 'f': c = '\f'; p++; break;
+                        case 'n': c = '\n'; p++; break;
+                        case 'r': c = '\r'; p++; break;
+                        case 't': c = '\t'; p++; break;
+                        case 'v': c = '\v'; p++; break;
+                        case '\\': c = '\\'; p++; break;
+                        case '\'': c = '\''; p++; break;
+                        case '"': c = '"'; p++; break;
+                        case '0': {
+                            p++;
+                            int v = 0, cnt = 0;
+                            while (cnt < 3 && *p >= '0' && *p <= '7') {
+                                v = v * 8 + (*p++ - '0'); cnt++;
+                            }
+                            c = (char)v;
+                            break;
+                        }
+                        case 'x': {
+                            p++;
+                            int v = 0, cnt = 0;
+                            while (cnt < 2) {
+                                int d = -1;
+                                if (*p >= '0' && *p <= '9') d = *p - '0';
+                                else if (*p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+                                else if (*p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+                                if (d < 0) break;
+                                v = v * 16 + d; p++; cnt++;
+                            }
+                            c = (char)v;
+                            break;
+                        }
+                        default: c = *p++; break;
+                        }
+                        if (c && shell_append_char(words, &wpos, word_cap, c) < 0) return -1;
+                    } else {
+                        if (shell_append_char(words, &wpos, word_cap, *p++) < 0) return -1;
+                    }
+                }
+                if (*p == '\'') p++;
+                continue;
+            }
             if (*p == '\'') {
                 word_quoted = true;
                 p++;
@@ -5570,18 +6815,40 @@ static bool shell_glob_match(const char *pat, const char *name) {
 
 static int shell_expand_tilde_word(struct shell_pipeline *pl,
                                    const char *word, char **out) {
-    if (!word || word[0] != '~' || (word[1] && word[1] != '/')) return 0;
-    const char *home = env_get("HOME");
-    if (!home || !*home) home = "/";
+    if (!word || word[0] != '~') return 0;
+
+    const char *slash = word + 1;
+    while (*slash && *slash != '/') slash++;
+
+    const char *home = 0;
+    if (slash == word + 1) {
+        home = env_get("HOME");
+        if (!home || !*home) home = "/";
+    } else {
+        char uname[64];
+        size_t ulen = (size_t)(slash - (word + 1));
+        if (ulen + 1 > sizeof(uname)) return 0;
+        memcpy(uname, word + 1, ulen);
+        uname[ulen] = '\0';
+        /* In this kernel, all users live under /home/<user> */
+        static char ubuf[VFS_PATH_MAX];
+        size_t n = 0;
+        const char *pfx = "/home/";
+        while (*pfx && n + 1 < sizeof(ubuf)) ubuf[n++] = *pfx++;
+        for (size_t i = 0; i < ulen && n + 1 < sizeof(ubuf); i++)
+            ubuf[n++] = uname[i];
+        ubuf[n] = '\0';
+        home = ubuf;
+    }
 
     char tmp[VFS_PATH_MAX];
     size_t hlen = strlen(home);
-    size_t rest = strlen(word + 1);
-    bool drop_slash = (hlen > 1 && home[hlen - 1] == '/' && word[1] == '/');
+    size_t rest = strlen(slash);
+    bool drop_slash = (hlen > 1 && home[hlen - 1] == '/' && *slash == '/');
     if (hlen + rest + 1 > sizeof(tmp)) return -1;
     memcpy(tmp, home, hlen);
     size_t pos = hlen;
-    const char *tail = word + 1;
+    const char *tail = slash;
     if (drop_slash) tail++;
     while (*tail && pos + 1 < sizeof(tmp)) tmp[pos++] = *tail++;
     if (*tail) return -1;
@@ -5676,7 +6943,7 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
     }
 
     if (!quoted) {
-        if (shell_has_glob(word)) {
+        if (!g_opt_noglob && shell_has_glob(word)) {
             int n = shell_expand_glob_word(pl, cur, word);
             if (n < 0) return -1;
             if (n > 0) return 0;
@@ -5698,6 +6965,15 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
     return 0;
 }
 
+static bool shell_is_ifs_char(char c) {
+    const char *ifs = env_get("IFS");
+    if (!ifs) ifs = " \t\n";
+    for (; *ifs; ifs++) {
+        if (*ifs == c) return true;
+    }
+    return false;
+}
+
 static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
                          const char *word, bool quoted) {
     if (quoted) return shell_add_one_arg(pl, cur, word, true);
@@ -5710,10 +6986,10 @@ static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
     const char *p = word;
     bool added = false;
     while (*p) {
-        while (is_space(*p)) p++;
+        while (shell_is_ifs_char(*p)) p++;
         if (!*p) break;
         const char *start = p;
-        while (*p && !is_space(*p)) p++;
+        while (*p && !shell_is_ifs_char(*p)) p++;
         size_t n = (size_t)(p - start);
         char tmp[SHELL_PARSE_BUF_MAX];
         if (n + 1 > sizeof(tmp)) {
@@ -5804,8 +7080,8 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
 
         if (t == SH_TOK_REDIR_IN || t == SH_TOK_HEREDOC ||
             t == SH_TOK_HEREDOC_TABS || t == SH_TOK_REDIR_OUT ||
-            t == SH_TOK_REDIR_APPEND || t == SH_TOK_DUP_IN ||
-            t == SH_TOK_DUP_OUT) {
+            t == SH_TOK_REDIR_APPEND || t == SH_TOK_REDIR_CLOBBER ||
+            t == SH_TOK_DUP_IN || t == SH_TOK_DUP_OUT) {
             int fd = shell_default_redir_fd(t, tok[*io].fd);
             (*io)++;
             if (*io >= ntok || tok[*io].type != SH_TOK_WORD) {
@@ -5842,10 +7118,14 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             } else {
                 cur->stdout_path = tok[*io].text;
                 cur->stdout_append = (t == SH_TOK_REDIR_APPEND);
-                if (shell_add_redir(cur,
-                                    t == SH_TOK_REDIR_APPEND ? SH_RD_OPEN_APPEND
-                                                            : SH_RD_OPEN_OUT,
-                                    fd, tok[*io].text, 0, -1) < 0) return -1;
+                enum shell_redir_op rk;
+                if (t == SH_TOK_REDIR_APPEND) rk = SH_RD_OPEN_APPEND;
+                else if (t == SH_TOK_REDIR_CLOBBER) rk = SH_RD_OPEN_OUT;
+                else rk = SH_RD_OPEN_OUT;
+                if (t == SH_TOK_REDIR_OUT && g_opt_noclobber) {
+                    rk = SH_RD_OPEN_EXCL;
+                }
+                if (shell_add_redir(cur, rk, fd, tok[*io].text, 0, -1) < 0) return -1;
             }
             (*io)++;
             continue;
@@ -6128,7 +7408,20 @@ static int shell_apply_redirs(struct shell_simple *cmd,
             }
             continue;
         }
-        if (r->op == SH_RD_OPEN_OUT || r->op == SH_RD_OPEN_APPEND) {
+        if (r->op == SH_RD_OPEN_OUT || r->op == SH_RD_OPEN_APPEND ||
+            r->op == SH_RD_OPEN_EXCL) {
+            if (r->op == SH_RD_OPEN_EXCL) {
+                char resolved[VFS_PATH_MAX];
+                if (shell_canonicalize_path(r->path, resolved,
+                                            sizeof(resolved)) >= 0) {
+                    struct vfs_stat st2;
+                    if (vfs_stat(resolved, &st2) == VFS_OK) {
+                        kprintf("%s: cannot overwrite existing file\n", r->path);
+                        shell_set_status(1);
+                        return -1;
+                    }
+                }
+            }
             struct file *f = shell_open_vfs_file(r->path, true,
                                                  r->op == SH_RD_OPEN_APPEND,
                                                  label);
@@ -6575,11 +7868,6 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
 static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     if (pl->count == 1) return shell_run_single(&pl->stage[0], background);
 
-    if (background) {
-        kprintf("pipeline: background pipelines are not implemented yet\n");
-        return 1;
-    }
-
     struct file *pipes_r[SHELL_STAGE_MAX - 1];
     struct file *pipes_w[SHELL_STAGE_MAX - 1];
     int pids[SHELL_STAGE_MAX];
@@ -6631,6 +7919,19 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
             file_close(out);
             pipes_w[i] = 0;
         }
+    }
+
+    if (background) {
+        int last_pid = 0;
+        for (int i = pl->count - 1; i >= 0; i--) {
+            if (has_pid[i]) { last_pid = pids[i]; break; }
+        }
+        if (last_pid) {
+            g_last_bg_pid = last_pid;
+            int jid = jobs_add(last_pid, pl->stage[0].argv[0]);
+            if (jid > 0) kprintf("[%d] %d\n", jid, last_pid);
+        }
+        return 0;
     }
 
     int rc = 0;
@@ -6710,55 +8011,210 @@ static const char *shell_find_marker2(const char *s, const char *a,
     return 0;
 }
 
+static bool shell_word_boundary_before(const char *start, const char *p);
+
+static bool shell_is_word_end(char c) {
+    return c == '\0' || c == ' ' || c == '\t' || c == ';' ||
+           c == '|' || c == '&' || c == ')' || c == '>' || c == '<';
+}
+
+static const char *shell_find_matching_done(const char *start,
+                                            const char **found_marker) {
+    int depth = 1;
+    bool in_sq = false, in_dq = false;
+    for (const char *p = start; *p; p++) {
+        if (in_sq) {
+            if (*p == '\'') in_sq = false;
+            continue;
+        }
+        if (in_dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_dq = false;
+            continue;
+        }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'') { in_sq = true; continue; }
+        if (*p == '"') { in_dq = true; continue; }
+
+        /* Check for "; done" / ";done" FIRST (before "; do") to avoid
+         * false positive where "; done" starts with "; do". */
+        if (strncmp(p, "; done", 6) == 0 && shell_is_word_end(p[6])) {
+            depth--;
+            if (depth <= 0) {
+                if (found_marker) *found_marker = "; done";
+                return p;
+            }
+            p += 5;
+            continue;
+        }
+        if (strncmp(p, ";done", 5) == 0 && shell_is_word_end(p[5])) {
+            depth--;
+            if (depth <= 0) {
+                if (found_marker) *found_marker = ";done";
+                return p;
+            }
+            p += 4;
+            continue;
+        }
+        /* Now check "; do" / ";do" */
+        if (strncmp(p, "; do", 4) == 0 && shell_is_word_end(p[4])) {
+            depth++;
+            p += 3;
+            continue;
+        }
+        if (strncmp(p, ";do", 3) == 0 && shell_is_word_end(p[3])) {
+            depth++;
+            p += 2;
+            continue;
+        }
+    }
+    return 0;
+}
+
+static const char *shell_find_if_fi(const char *start) {
+    int depth = 1;
+    bool in_sq = false, in_dq = false;
+    for (const char *p = start; *p; p++) {
+        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_dq = false;
+            continue;
+        }
+        if (*p == '\'') { in_sq = true; continue; }
+        if (*p == '"')  { in_dq = true; continue; }
+        if (shell_starts_with_word(p, "if") &&
+            shell_word_boundary_before(start, p)) depth++;
+        if ((strncmp(p, "; fi", 4) == 0 || strncmp(p, ";fi", 3) == 0) &&
+            shell_word_boundary_before(start, p)) {
+            depth--;
+            if (depth == 0) return p;
+        }
+    }
+    return 0;
+}
+
+static const char *shell_find_elif_else(const char *start, const char *fi_at,
+                                        const char **found_marker) {
+    int depth = 0;
+    bool in_sq = false, in_dq = false;
+    *found_marker = 0;
+    for (const char *p = start; p < fi_at && *p; p++) {
+        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_dq = false;
+            continue;
+        }
+        if (*p == '\'') { in_sq = true; continue; }
+        if (*p == '"')  { in_dq = true; continue; }
+        if (shell_starts_with_word(p, "if") &&
+            shell_word_boundary_before(start, p)) { depth++; continue; }
+        if (depth > 0 &&
+            (strncmp(p, "; fi", 4) == 0 || strncmp(p, ";fi", 3) == 0)) {
+            depth--;
+            continue;
+        }
+        if (depth > 0) continue;
+        if (strncmp(p, "; elif", 6) == 0) {
+            *found_marker = "; elif";
+            return p;
+        }
+        if (strncmp(p, ";elif", 5) == 0) {
+            *found_marker = ";elif";
+            return p;
+        }
+        if (strncmp(p, "; else", 6) == 0) {
+            *found_marker = "; else";
+            return p;
+        }
+        if (strncmp(p, ";else", 5) == 0) {
+            *found_marker = ";else";
+            return p;
+        }
+    }
+    return 0;
+}
+
 static bool shell_try_if_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (!shell_starts_with_word(s, "if")) return false;
     s = shell_skip_blanks(s + 2);
 
-    const char *then_marker = 0;
-    const char *then_at = shell_find_marker2(s, "; then", ";then", &then_marker);
-    if (!then_at) {
-        kprintf("if: expected '; then'\n");
-        shell_set_status(2);
-        return true;
-    }
-    const char *after_then = then_at + strlen(then_marker);
-
-    const char *fi_marker = 0;
-    const char *fi_at = shell_find_marker2(after_then, "; fi", ";fi", &fi_marker);
+    const char *fi_at = shell_find_if_fi(s);
     if (!fi_at) {
         kprintf("if: expected '; fi'\n");
         shell_set_status(2);
         return true;
     }
+    const char *fi_skip = (strncmp(fi_at, "; fi", 4) == 0) ? fi_at + 4
+                                                            : fi_at + 3;
+    (void)fi_skip;
 
-    const char *else_marker = 0;
-    const char *else_at = shell_find_marker2(after_then, "; else", ";else",
-                                             &else_marker);
-    if (else_at && else_at > fi_at) else_at = 0;
+    const char *cond_start = s;
+    bool done = false;
+    while (!done) {
+        const char *then_marker = 0;
+        const char *then_at = shell_find_marker2(cond_start, "; then",
+                                                 ";then", &then_marker);
+        if (!then_at || then_at > fi_at) {
+            kprintf("if: expected '; then'\n");
+            shell_set_status(2);
+            return true;
+        }
+        const char *after_then = then_at + strlen(then_marker);
 
-    char cond[LINE_MAX];
-    char yes[LINE_MAX];
-    char no[LINE_MAX];
-    if (shell_copy_segment(cond, sizeof(cond), s, then_at) < 0 ||
-        shell_copy_segment(yes, sizeof(yes), after_then,
-                           else_at ? else_at : fi_at) < 0 ||
-        shell_copy_segment(no, sizeof(no),
-                           else_at ? else_at + strlen(else_marker) : fi_at,
-                           fi_at) < 0) {
-        kprintf("if: command too long\n");
-        shell_set_status(2);
-        return true;
+        const char *branch_marker = 0;
+        const char *branch_at = shell_find_elif_else(after_then, fi_at,
+                                                     &branch_marker);
+
+        char cond[LINE_MAX];
+        if (shell_copy_segment(cond, sizeof(cond), cond_start, then_at) < 0) {
+            kprintf("if: condition too long\n");
+            shell_set_status(2);
+            return true;
+        }
+
+        execute_line_text(cond);
+        if (g_shell_flow != SHELL_FLOW_NONE) return true;
+
+        if (g_last_status == 0) {
+            char yes[LINE_MAX];
+            const char *body_end = branch_at ? branch_at : fi_at;
+            if (shell_copy_segment(yes, sizeof(yes), after_then, body_end) < 0) {
+                kprintf("if: body too long\n");
+                shell_set_status(2);
+                return true;
+            }
+            execute_line_text(yes);
+            return true;
+        }
+
+        if (!branch_at) {
+            shell_set_status(0);
+            return true;
+        }
+
+        bool is_elif = (strncmp(branch_marker, "; elif", 6) == 0 ||
+                        strncmp(branch_marker, ";elif", 5) == 0);
+        bool is_else = !is_elif;
+
+        if (is_else) {
+            char no[LINE_MAX];
+            const char *else_body = branch_at + strlen(branch_marker);
+            if (shell_copy_segment(no, sizeof(no), else_body, fi_at) < 0) {
+                kprintf("if: else body too long\n");
+                shell_set_status(2);
+                return true;
+            }
+            execute_line_text(no);
+            return true;
+        }
+
+        cond_start = shell_skip_blanks(branch_at + strlen(branch_marker));
     }
 
-    execute_line_text(cond);
-    if (g_last_status == 0) {
-        execute_line_text(yes);
-    } else if (else_at) {
-        execute_line_text(no);
-    } else {
-        shell_set_status(0);
-    }
+    shell_set_status(0);
     return true;
 }
 
@@ -6785,12 +8241,16 @@ static bool shell_try_for_command(const char *src) {
     name[name_len] = '\0';
 
     s = shell_skip_blanks(s);
-    if (!shell_starts_with_word(s, "in")) {
+    bool implicit_at = false;
+    if (shell_starts_with_word(s, "in")) {
+        s = shell_skip_blanks(s + 2);
+    } else if (*s == ';' || shell_starts_with_word(s, "do")) {
+        implicit_at = true;
+    } else {
         kprintf("for: expected 'in'\n");
         shell_set_status(2);
         return true;
     }
-    s = shell_skip_blanks(s + 2);
 
     const char *do_marker = 0;
     const char *do_at = shell_find_marker2(s, "; do", ";do", &do_marker);
@@ -6800,8 +8260,8 @@ static bool shell_try_for_command(const char *src) {
         return true;
     }
     const char *done_marker = 0;
-    const char *done_at = shell_find_marker2(do_at + strlen(do_marker),
-                                             "; done", ";done", &done_marker);
+    const char *done_at = shell_find_matching_done(do_at + strlen(do_marker),
+                                                    &done_marker);
     if (!done_at) {
         kprintf("for: expected '; done'\n");
         shell_set_status(2);
@@ -6810,8 +8270,25 @@ static bool shell_try_for_command(const char *src) {
 
     char list[LINE_MAX];
     char body[LINE_MAX];
-    if (shell_copy_segment(list, sizeof(list), s, do_at) < 0 ||
-        shell_copy_segment(body, sizeof(body), do_at + strlen(do_marker),
+    if (implicit_at) {
+        size_t lpos = 0;
+        for (int i = 0; i < g_positional_count; i++) {
+            if (i > 0 && shell_append_char(list, &lpos, sizeof(list), ' ') < 0) {
+                kprintf("for: list too long\n"); shell_set_status(2); return true;
+            }
+            if (shell_append_str(list, &lpos, sizeof(list), g_positional[i]) < 0) {
+                kprintf("for: list too long\n"); shell_set_status(2); return true;
+            }
+        }
+        list[lpos] = '\0';
+    } else {
+        if (shell_copy_segment(list, sizeof(list), s, do_at) < 0) {
+            kprintf("for: command too long\n");
+            shell_set_status(2);
+            return true;
+        }
+    }
+    if (shell_copy_segment(body, sizeof(body), do_at + strlen(do_marker),
                            done_at) < 0) {
         kprintf("for: command too long\n");
         shell_set_status(2);
@@ -6844,15 +8321,22 @@ static bool shell_try_for_command(const char *src) {
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_BREAK) {
-            g_shell_flow = SHELL_FLOW_NONE;
-            g_shell_flow_status = 0;
+            if (--g_shell_break_depth <= 0) {
+                g_shell_flow = SHELL_FLOW_NONE;
+                g_shell_flow_status = 0;
+            }
             g_shell_loop_depth--;
             shell_set_status(last);
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_CONTINUE) {
-            g_shell_flow = SHELL_FLOW_NONE;
-            g_shell_flow_status = 0;
+            if (--g_shell_break_depth <= 0) {
+                g_shell_flow = SHELL_FLOW_NONE;
+                g_shell_flow_status = 0;
+            } else {
+                g_shell_loop_depth--;
+                return true;
+            }
             continue;
         }
     }
@@ -6874,8 +8358,8 @@ static bool shell_try_while_command(const char *src) {
         return true;
     }
     const char *done_marker = 0;
-    const char *done_at = shell_find_marker2(do_at + strlen(do_marker),
-                                             "; done", ";done", &done_marker);
+    const char *done_at = shell_find_matching_done(do_at + strlen(do_marker),
+                                                    &done_marker);
     if (!done_at) {
         kprintf("while: expected '; done'\n");
         shell_set_status(2);
@@ -6909,15 +8393,22 @@ static bool shell_try_while_command(const char *src) {
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_BREAK) {
-            g_shell_flow = SHELL_FLOW_NONE;
-            g_shell_flow_status = 0;
+            if (--g_shell_break_depth <= 0) {
+                g_shell_flow = SHELL_FLOW_NONE;
+                g_shell_flow_status = 0;
+            }
             g_shell_loop_depth--;
             shell_set_status(last);
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_CONTINUE) {
-            g_shell_flow = SHELL_FLOW_NONE;
-            g_shell_flow_status = 0;
+            if (--g_shell_break_depth <= 0) {
+                g_shell_flow = SHELL_FLOW_NONE;
+                g_shell_flow_status = 0;
+            } else {
+                g_shell_loop_depth--;
+                return true;
+            }
             continue;
         }
     }
@@ -6940,8 +8431,8 @@ static bool shell_try_until_command(const char *src) {
         return true;
     }
     const char *done_marker = 0;
-    const char *done_at = shell_find_marker2(do_at + strlen(do_marker),
-                                             "; done", ";done", &done_marker);
+    const char *done_at = shell_find_matching_done(do_at + strlen(do_marker),
+                                                    &done_marker);
     if (!done_at) {
         kprintf("until: expected '; done'\n");
         shell_set_status(2);
@@ -6975,15 +8466,22 @@ static bool shell_try_until_command(const char *src) {
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_BREAK) {
-            g_shell_flow = SHELL_FLOW_NONE;
-            g_shell_flow_status = 0;
+            if (--g_shell_break_depth <= 0) {
+                g_shell_flow = SHELL_FLOW_NONE;
+                g_shell_flow_status = 0;
+            }
             g_shell_loop_depth--;
             shell_set_status(last);
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_CONTINUE) {
-            g_shell_flow = SHELL_FLOW_NONE;
-            g_shell_flow_status = 0;
+            if (--g_shell_break_depth <= 0) {
+                g_shell_flow = SHELL_FLOW_NONE;
+                g_shell_flow_status = 0;
+            } else {
+                g_shell_loop_depth--;
+                return true;
+            }
             continue;
         }
     }
@@ -7373,6 +8871,7 @@ struct shell_subshell_frame {
     struct shell_function_frame functions;
     struct shell_readonly_frame readonly;
     struct shell_trap_frame traps;
+    struct shell_opt_frame opts;
     char cwd[VFS_PATH_MAX];
     enum shell_flow flow;
     int flow_status;
@@ -7402,6 +8901,7 @@ static int shell_subshell_frame_capture(struct shell_subshell_frame *frame) {
     frame->flow_status = g_shell_flow_status;
     frame->loop_depth = g_shell_loop_depth;
 
+    shell_save_opts(&frame->opts);
     if (shell_env_frame_capture(&frame->env) < 0 ||
         shell_param_snapshot_capture(&frame->params) < 0 ||
         shell_alias_frame_capture(&frame->aliases) < 0 ||
@@ -7422,6 +8922,7 @@ static void shell_subshell_frame_restore(struct shell_subshell_frame *frame) {
     shell_function_frame_restore(&frame->functions);
     shell_readonly_frame_restore(&frame->readonly);
     shell_trap_restore(&frame->traps);
+    shell_restore_opts(&frame->opts);
     shell_restore_cwd_only(frame->cwd);
     g_shell_flow = frame->flow;
     g_shell_flow_status = frame->flow_status;
@@ -7680,6 +9181,9 @@ static void execute_line_text(const char *src) {
 
     src = src ? src : "";
     if (g_shell_flow != SHELL_FLOW_NONE) return;
+    if (g_opt_verbose) kprintf("%s\n", src);
+    shell_check_pending_signals();
+    if (g_shell_flow != SHELL_FLOW_NONE) return;
     if (shell_try_function_definition(src)) return;
     src = shell_expand_aliases(src, alias_buf, sizeof(alias_buf));
     if (!src) {
@@ -7714,6 +9218,22 @@ static void execute_line_text(const char *src) {
                           (prev_link == SH_TOK_AND_IF && last == 0) ||
                           (prev_link == SH_TOK_OR_IF && last != 0);
 
+        bool negate = false;
+        while (i < ntok && tok[i].type == SH_TOK_WORD &&
+               strcmp(tok[i].text, "!") == 0) {
+            negate = !negate;
+            i++;
+        }
+        if (i >= ntok || shell_is_list_sep(tok[i].type)) {
+            if (negate) {
+                last = g_last_status == 0 ? 1 : 0;
+                shell_set_status(last);
+            }
+            enum shell_tok_type sep2 = shell_consume_separator(tok, ntok, &i);
+            prev_link = sep2;
+            continue;
+        }
+
         struct shell_pipeline pl;
         int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
         if (parsed < 0) {
@@ -7729,15 +9249,176 @@ static void execute_line_text(const char *src) {
         enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
         bool background = (sep == SH_TOK_BG);
         if (should_run) {
+            if (g_opt_xtrace) {
+                kprintf("+ ");
+                for (int s = 0; s < pl.count; s++) {
+                    if (s > 0) kprintf("| ");
+                    for (int a = 0; a < pl.stage[s].argc; a++)
+                        kprintf("%s%s", pl.stage[s].argv[a],
+                                a + 1 < pl.stage[s].argc ? " " : "");
+                }
+                kprintf("\n");
+            }
             last = shell_run_pipeline(&pl, background);
+            if (negate) last = last == 0 ? 1 : 0;
             shell_set_status(last);
             if (g_shell_flow != SHELL_FLOW_NONE) return;
+            if (g_opt_errexit && last != 0 && !negate &&
+                prev_link != SH_TOK_AND_IF && prev_link != SH_TOK_OR_IF &&
+                g_shell_loop_depth == 0) {
+                g_shell_flow = SHELL_FLOW_EXIT;
+                g_shell_flow_status = last;
+                return;
+            }
         }
         prev_link = sep;
     }
 }
 
+static char g_heredoc_cmd[LINE_MAX];
+static char g_heredoc_delim[64];
+static bool g_heredoc_strip_tabs;
+static bool g_heredoc_quoted;
+static char g_heredoc_body[SHELL_HEREDOC_BODY_MAX];
+static size_t g_heredoc_body_len;
+
+static char g_continuation_buf[LINE_MAX * 4];
+static size_t g_continuation_len;
+
+static bool shell_line_needs_continuation(const char *s) {
+    int if_depth = 0, do_depth = 0, case_depth = 0;
+    int brace_depth = 0, paren_depth = 0;
+    bool in_sq = false, in_dq = false;
+    bool last_was_pipe = false, last_was_and = false, last_was_or = false;
+    bool last_was_backslash = false;
+
+    for (const char *p = s; *p; p++) {
+        if (in_sq) {
+            if (*p == '\'') in_sq = false;
+            continue;
+        }
+        if (in_dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_dq = false;
+            continue;
+        }
+        if (*p == '\\' && !p[1]) { last_was_backslash = true; continue; }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'') { in_sq = true; continue; }
+        if (*p == '"') { in_dq = true; continue; }
+        if (*p == '{') brace_depth++;
+        if (*p == '}') brace_depth--;
+        if (*p == '(') paren_depth++;
+        if (*p == ')') paren_depth--;
+
+        last_was_pipe = false;
+        last_was_and = false;
+        last_was_or = false;
+
+        if (shell_starts_with_word(p, "if") && (p == s || is_space(p[-1]) || p[-1] == ';'))
+            if_depth++;
+        if (shell_starts_with_word(p, "then") && (p == s || is_space(p[-1]) || p[-1] == ';'))
+            {} /* then is part of if, no depth change */
+        if (shell_starts_with_word(p, "fi") && (p == s || is_space(p[-1]) || p[-1] == ';'))
+            if_depth--;
+        if ((shell_starts_with_word(p, "do") && (p == s || is_space(p[-1]) || p[-1] == ';')))
+            do_depth++;
+        if (shell_starts_with_word(p, "done") && (p == s || is_space(p[-1]) || p[-1] == ';'))
+            do_depth--;
+        if (shell_starts_with_word(p, "case") && (p == s || is_space(p[-1]) || p[-1] == ';'))
+            case_depth++;
+        if (shell_starts_with_word(p, "esac") && (p == s || is_space(p[-1]) || p[-1] == ';'))
+            case_depth--;
+    }
+
+    /* Trailing pipe or logical operator means continuation */
+    const char *end = s + strlen(s);
+    while (end > s && is_space(end[-1])) end--;
+    if (end > s && end[-1] == '|' && !(end - 1 > s && end[-2] == '|'))
+        last_was_pipe = true;
+    if (end - s >= 2 && end[-1] == '&' && end[-2] == '&')
+        last_was_and = true;
+    if (end - s >= 2 && end[-1] == '|' && end[-2] == '|')
+        last_was_or = true;
+
+    if (in_sq || in_dq) return true;
+    if (last_was_backslash) return true;
+    if (if_depth > 0 || do_depth > 0 || case_depth > 0) return true;
+    if (brace_depth > 0 || paren_depth > 0) return true;
+    if (last_was_pipe || last_was_and || last_was_or) return true;
+    return false;
+}
+
 static void execute_line(void) {
+    if (g_heredoc_collecting) {
+        const char *check = line;
+        if (g_heredoc_strip_tabs)
+            while (*check == '\t') check++;
+        if (strcmp(check, g_heredoc_delim) == 0) {
+            g_heredoc_collecting = false;
+            shell_heredoc_reset();
+            shell_heredoc_push(g_heredoc_body, g_heredoc_body_len);
+            execute_line_text(g_heredoc_cmd);
+            shell_heredoc_reset();
+        } else {
+            const char *emit = line;
+            char expanded[LINE_MAX * 2];
+            if (!g_heredoc_quoted) {
+                if (shell_expand_param_word(line, expanded,
+                                            sizeof(expanded)) >= 0)
+                    emit = expanded;
+            }
+            size_t n = strlen(emit);
+            if (g_heredoc_body_len + n + 2 <= sizeof(g_heredoc_body)) {
+                memcpy(g_heredoc_body + g_heredoc_body_len, emit, n);
+                g_heredoc_body_len += n;
+                g_heredoc_body[g_heredoc_body_len++] = '\n';
+                g_heredoc_body[g_heredoc_body_len] = '\0';
+            }
+        }
+        return;
+    }
+
+    char delim[64];
+    bool strip_tabs = false, quoted = false;
+    if (shell_line_find_heredoc(line, delim, sizeof(delim),
+                                &strip_tabs, &quoted)) {
+        size_t ll = strlen(line);
+        if (ll + 1 <= sizeof(g_heredoc_cmd)) {
+            memcpy(g_heredoc_cmd, line, ll + 1);
+            memcpy(g_heredoc_delim, delim, strlen(delim) + 1);
+            g_heredoc_strip_tabs = strip_tabs;
+            g_heredoc_quoted = quoted;
+            g_heredoc_body_len = 0;
+            g_heredoc_body[0] = '\0';
+            g_heredoc_collecting = true;
+            return;
+        }
+    }
+    if (g_continuation_active) {
+        size_t ll = strlen(line);
+        if (g_continuation_len + 1 + ll + 1 <= sizeof(g_continuation_buf)) {
+            g_continuation_buf[g_continuation_len++] = '\n';
+            memcpy(g_continuation_buf + g_continuation_len, line, ll);
+            g_continuation_len += ll;
+            g_continuation_buf[g_continuation_len] = '\0';
+        }
+        if (shell_line_needs_continuation(g_continuation_buf)) return;
+        g_continuation_active = false;
+        execute_line_text(g_continuation_buf);
+        return;
+    }
+
+    if (shell_line_needs_continuation(line)) {
+        size_t ll = strlen(line);
+        if (ll + 1 <= sizeof(g_continuation_buf)) {
+            memcpy(g_continuation_buf, line, ll + 1);
+            g_continuation_len = ll;
+            g_continuation_active = true;
+        }
+        return;
+    }
+
     execute_line_text(line);
 }
 

@@ -39,6 +39,9 @@ extern int errno;
 #define ERANGE          34
 #define ENAMETOOLONG    36
 #define ENOSYS          38
+#define EAGAIN          11
+#define ESRCH            3
+#define EDEADLK         35
 
 /* GNU-flavoured strerror_r returns the message pointer. */
 const char *strerror(int err);

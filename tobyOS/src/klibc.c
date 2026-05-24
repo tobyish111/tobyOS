@@ -11,6 +11,22 @@
 void *memcpy(void *dst, const void *src, size_t n) {
     uint8_t       *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
+    /* Use rep movsq for bulk (8-byte aligned, >=64 bytes) */
+    if (n >= 64 && ((uintptr_t)d & 7) == 0 && ((uintptr_t)s & 7) == 0) {
+        size_t qwords = n / 8;
+        size_t tail   = n & 7;
+        __asm__ volatile("rep movsq"
+            : "+D"(d), "+S"(s), "+c"(qwords) : : "memory");
+        for (size_t i = 0; i < tail; i++) d[i] = s[i];
+        return dst;
+    }
+    /* rep movsb (fast-string on modern CPUs, still ~4x vs byte loop) */
+    if (n >= 16) {
+        size_t cnt = n;
+        __asm__ volatile("rep movsb"
+            : "+D"(d), "+S"(s), "+c"(cnt) : : "memory");
+        return dst;
+    }
     for (size_t i = 0; i < n; i++) d[i] = s[i];
     return dst;
 }
@@ -20,9 +36,25 @@ void *memmove(void *dst, const void *src, size_t n) {
     const uint8_t *s = (const uint8_t *)src;
     if (d == s || n == 0) return dst;
     if (d < s) {
-        for (size_t i = 0; i < n; i++) d[i] = s[i];
+        /* Forward: use rep movsb (ERMS fast on modern x86_64) */
+        if (n >= 16) {
+            size_t cnt = n;
+            __asm__ volatile("rep movsb"
+                : "+D"(d), "+S"(s), "+c"(cnt) : : "memory");
+        } else {
+            for (size_t i = 0; i < n; i++) d[i] = s[i];
+        }
     } else {
-        for (size_t i = n; i != 0; i--) d[i - 1] = s[i - 1];
+        /* Backward: use std + rep movsb + cld */
+        if (n >= 16) {
+            uint8_t *de = d + n - 1;
+            const uint8_t *se = s + n - 1;
+            size_t cnt = n;
+            __asm__ volatile("std; rep movsb; cld"
+                : "+D"(de), "+S"(se), "+c"(cnt) : : "memory");
+        } else {
+            for (size_t i = n; i != 0; i--) d[i - 1] = s[i - 1];
+        }
     }
     return dst;
 }
@@ -30,6 +62,23 @@ void *memmove(void *dst, const void *src, size_t n) {
 void *memset(void *dst, int c, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     uint8_t  v = (uint8_t)c;
+    /* rep stosq for large aligned fills */
+    if (n >= 64 && ((uintptr_t)d & 7) == 0) {
+        uint64_t pattern = (uint64_t)v * 0x0101010101010101ULL;
+        size_t qwords = n / 8;
+        size_t tail   = n & 7;
+        __asm__ volatile("rep stosq"
+            : "+D"(d), "+c"(qwords) : "a"(pattern) : "memory");
+        for (size_t i = 0; i < tail; i++) d[i] = v;
+        return dst;
+    }
+    /* rep stosb for moderate sizes */
+    if (n >= 16) {
+        size_t cnt = n;
+        __asm__ volatile("rep stosb"
+            : "+D"(d), "+c"(cnt) : "a"(v) : "memory");
+        return dst;
+    }
     for (size_t i = 0; i < n; i++) d[i] = v;
     return dst;
 }

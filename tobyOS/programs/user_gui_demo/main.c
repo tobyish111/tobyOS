@@ -31,6 +31,7 @@ typedef unsigned char      uint8_t;
 #define GUI_EV_MOUSE_MOVE  1
 #define GUI_EV_MOUSE_DOWN  2
 #define GUI_EV_MOUSE_UP    3
+#define GUI_EV_CLOSE       5
 
 struct gui_event {
     int     type;
@@ -55,8 +56,9 @@ static inline ssize_t sys_write(int fd, const void *buf, size_t len) {
  * with main's return value, so a return is enough to terminate. */
 
 static inline void sys_yield(void) {
+    long _dummy;
     __asm__ volatile ("syscall"
-        : : "a"((long)SYS_YIELD)
+        : "=a"(_dummy) : "0"((long)SYS_YIELD)
         : "rcx", "r11", "memory");
 }
 static inline int sys_gui_create(uint32_t w, uint32_t h, const char *title) {
@@ -175,6 +177,7 @@ int main(int argc, char **argv) {
             sys_yield();
             continue;
         }
+        if (ev.type == GUI_EV_CLOSE) return 0;
 
         int redraw = 0;
         if (ev.type == GUI_EV_MOUSE_DOWN) {

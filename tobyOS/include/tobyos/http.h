@@ -55,7 +55,8 @@
 struct http_url {
     char     host[HTTP_MAX_HOST_LEN];
     char     path[HTTP_MAX_PATH_LEN];
-    uint16_t port;            /* host order; default 80 if absent */
+    uint16_t port;            /* host order; default 80/443 if absent */
+    uint8_t  tls;             /* 1 if https://, 0 if http:// */
 };
 
 /* Result of a successful (or partially successful) HTTP fetch. body
@@ -65,6 +66,7 @@ struct http_response {
     int        status;                  /* e.g. 200, 404, 500            */
     char       reason[64];              /* status-line reason phrase     */
     char       content_type[64];        /* "Content-Type:" if present    */
+    char       location[256];           /* "Location:" for 3xx redirects */
     size_t     body_len;                /* bytes actually downloaded     */
     uint8_t   *body;                    /* kmalloc'd; may be NULL on err */
 };

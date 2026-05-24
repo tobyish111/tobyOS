@@ -73,6 +73,27 @@ int    ferror  (FILE *f);
 void   clearerr(FILE *f);
 int    fileno  (FILE *f);
 
+/* ---- pushback ----------------------------------------------------- */
+int    ungetc  (int c, FILE *f);
+
+/* ---- buffering (no-ops in current unbuffered impl) ---------------- */
+#define _IOFBF 0
+#define _IOLBF 1
+#define _IONBF 2
+
+int    setvbuf (FILE *f, char *buf, int mode, size_t size);
+void   setbuf  (FILE *f, char *buf);
+
+/* ---- temporary files ---------------------------------------------- */
+FILE  *tmpfile (void);
+
+/* ---- pipe to/from a command --------------------------------------- */
+FILE  *popen   (const char *command, const char *type);
+int    pclose  (FILE *fp);
+
+/* ---- scanf family ------------------------------------------------- */
+int    sscanf  (const char *str, const char *fmt, ...);
+
 /* ---- diagnostics -------------------------------------------------- */
 void   perror  (const char *prefix);
 

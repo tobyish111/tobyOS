@@ -101,6 +101,80 @@ typedef struct {
     Elf64_Xword p_align;
 } Elf64_Phdr;
 
+/* ---- ELF64 section header (needed by the kernel module loader) ---- */
+
+typedef int64_t  Elf64_Sxword;
+
+typedef struct {
+    Elf64_Word  sh_name;
+    Elf64_Word  sh_type;
+    Elf64_Xword sh_flags;
+    Elf64_Addr  sh_addr;
+    Elf64_Off   sh_offset;
+    Elf64_Xword sh_size;
+    Elf64_Word  sh_link;
+    Elf64_Word  sh_info;
+    Elf64_Xword sh_addralign;
+    Elf64_Xword sh_entsize;
+} Elf64_Shdr;
+
+/* Section types. */
+#define SHT_NULL        0
+#define SHT_PROGBITS    1
+#define SHT_SYMTAB      2
+#define SHT_STRTAB      3
+#define SHT_RELA        4
+#define SHT_NOBITS      8
+
+/* Section flags. */
+#define SHF_WRITE       0x1
+#define SHF_ALLOC       0x2
+#define SHF_EXECINSTR   0x4
+
+/* ---- ELF64 symbol table entry ---- */
+
+typedef struct {
+    Elf64_Word    st_name;
+    uint8_t       st_info;
+    uint8_t       st_other;
+    Elf64_Half    st_shndx;
+    Elf64_Addr    st_value;
+    Elf64_Xword   st_size;
+} Elf64_Sym;
+
+#define ELF64_ST_BIND(i)   ((i) >> 4)
+#define ELF64_ST_TYPE(i)   ((i) & 0xf)
+#define ELF64_ST_INFO(b,t) (((b) << 4) + ((t) & 0xf))
+
+#define STB_LOCAL   0
+#define STB_GLOBAL  1
+
+#define STT_NOTYPE  0
+#define STT_OBJECT  1
+#define STT_FUNC    2
+#define STT_SECTION 3
+
+#define SHN_UNDEF   0
+#define SHN_ABS     0xFFF1
+
+/* ---- ELF64 relocation with addend ---- */
+
+typedef struct {
+    Elf64_Addr    r_offset;
+    Elf64_Xword   r_info;
+    Elf64_Sxword  r_addend;
+} Elf64_Rela;
+
+#define ELF64_R_SYM(i)    ((i) >> 32)
+#define ELF64_R_TYPE(i)   ((i) & 0xFFFFFFFF)
+
+/* x86_64 relocation types used by kernel modules. */
+#define R_X86_64_NONE    0
+#define R_X86_64_64      1
+#define R_X86_64_PC32    2
+#define R_X86_64_PLT32   4
+#define R_X86_64_32S     11
+
 /* ---- loader API ---- */
 
 /* Calling convention for loaded programs: zero-arg, returns int (in

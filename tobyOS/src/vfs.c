@@ -592,6 +592,114 @@ const char *vfs_strerror(int err) {
     case VFS_ERR_NOSPC:         return "no space left on device";
     case VFS_ERR_NAMETOOLONG:   return "name too long";
     case VFS_ERR_PERM:          return "permission denied";
+    case VFS_ERR_LOOP:          return "too many levels of symbolic links";
     default:                    return "unknown error";
     }
+}
+
+/* -------- symlink layer (M1.5) --------
+ *
+ * In-kernel symlink table: a simple array of (path, target) pairs.
+ * Real filesystems would store symlinks as inodes; this lightweight
+ * table covers the VFS layer so procfs /proc/self and user-created
+ * symlinks work without modifying every on-disk format. */
+
+#define VFS_MAX_SYMLINKS 128
+
+struct vfs_symlink_entry {
+    char path[VFS_PATH_MAX];
+    char target[VFS_PATH_MAX];
+    bool used;
+};
+
+static struct vfs_symlink_entry g_symlinks[VFS_MAX_SYMLINKS];
+
+static struct vfs_symlink_entry *symlink_find(const char *path) {
+    for (size_t i = 0; i < VFS_MAX_SYMLINKS; i++) {
+        if (g_symlinks[i].used && strcmp(g_symlinks[i].path, path) == 0)
+            return &g_symlinks[i];
+    }
+    return 0;
+}
+
+int vfs_symlink(const char *path, const char *target) {
+    if (!path || !target) return VFS_ERR_INVAL;
+    if (path[0] != '/') return VFS_ERR_INVAL;
+    if (strlen(path) >= VFS_PATH_MAX || strlen(target) >= VFS_PATH_MAX)
+        return VFS_ERR_NAMETOOLONG;
+    if (symlink_find(path)) return VFS_ERR_EXIST;
+
+    for (size_t i = 0; i < VFS_MAX_SYMLINKS; i++) {
+        if (!g_symlinks[i].used) {
+            size_t plen = strlen(path);
+            size_t tlen = strlen(target);
+            memcpy(g_symlinks[i].path, path, plen + 1);
+            memcpy(g_symlinks[i].target, target, tlen + 1);
+            g_symlinks[i].used = true;
+            return VFS_OK;
+        }
+    }
+    return VFS_ERR_NOSPC;
+}
+
+int vfs_readlink(const char *path, char *buf, size_t bufsz) {
+    if (!path || !buf || bufsz == 0) return VFS_ERR_INVAL;
+    struct vfs_symlink_entry *e = symlink_find(path);
+    if (!e) return VFS_ERR_NOENT;
+    size_t tlen = strlen(e->target);
+    if (tlen >= bufsz) tlen = bufsz - 1;
+    memcpy(buf, e->target, tlen);
+    buf[tlen] = '\0';
+    return VFS_OK;
+}
+
+int vfs_resolve_path(const char *path, char *resolved, size_t resolved_sz) {
+    if (!path || !resolved || resolved_sz < 2) return VFS_ERR_INVAL;
+
+    char buf_a[VFS_PATH_MAX], buf_b[VFS_PATH_MAX];
+    size_t plen = strlen(path);
+    if (plen >= VFS_PATH_MAX) return VFS_ERR_NAMETOOLONG;
+    memcpy(buf_a, path, plen + 1);
+
+    for (int hops = 0; hops < VFS_SYMLINK_MAX; hops++) {
+        struct vfs_symlink_entry *e = symlink_find(buf_a);
+        if (!e) {
+            /* Check prefix-based symlinks: if any symlink path is a
+             * prefix of buf_a, substitute it. E.g. /proc/self/status
+             * resolves /proc/self -> /proc/<pid>, yielding
+             * /proc/<pid>/status. */
+            size_t best_len = 0;
+            struct vfs_symlink_entry *best = 0;
+            for (size_t i = 0; i < VFS_MAX_SYMLINKS; i++) {
+                if (!g_symlinks[i].used) continue;
+                size_t sp = strlen(g_symlinks[i].path);
+                if (sp > strlen(buf_a)) continue;
+                if (strncmp(buf_a, g_symlinks[i].path, sp) != 0) continue;
+                char next = buf_a[sp];
+                if (next != '\0' && next != '/') continue;
+                if (sp > best_len) { best_len = sp; best = &g_symlinks[i]; }
+            }
+            if (!best) {
+                /* No more symlinks to resolve. */
+                plen = strlen(buf_a);
+                if (plen >= resolved_sz) return VFS_ERR_NAMETOOLONG;
+                memcpy(resolved, buf_a, plen + 1);
+                return VFS_OK;
+            }
+            /* Substitute the prefix. */
+            const char *tail = buf_a + best_len;
+            size_t tlen = strlen(best->target);
+            size_t tail_len = strlen(tail);
+            if (tlen + tail_len >= VFS_PATH_MAX) return VFS_ERR_NAMETOOLONG;
+            memcpy(buf_b, best->target, tlen);
+            memcpy(buf_b + tlen, tail, tail_len + 1);
+            memcpy(buf_a, buf_b, tlen + tail_len + 1);
+            continue;
+        }
+        /* Exact match: replace with target. */
+        plen = strlen(e->target);
+        if (plen >= VFS_PATH_MAX) return VFS_ERR_NAMETOOLONG;
+        memcpy(buf_a, e->target, plen + 1);
+    }
+    return VFS_ERR_LOOP;
 }

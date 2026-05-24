@@ -40,12 +40,32 @@ void gfx_set_pixel(int x, int y, uint32_t color);
 void gfx_fill_rect(int x, int y, int w, int h, uint32_t color);
 void gfx_draw_rect(int x, int y, int w, int h, uint32_t color);
 
+/* Filled rounded rectangle. Corners use midpoint circle algorithm.
+ * radius is clamped to min(w,h)/2. */
+void gfx_fill_rounded_rect(int x, int y, int w, int h, int radius, uint32_t color);
+
+/* Alpha-blended filled rounded rectangle. */
+void gfx_fill_rounded_rect_blend(int x, int y, int w, int h, int radius, uint32_t argb);
+
+/* Bresenham line from (x0,y0) to (x1,y1). */
+void gfx_draw_line(int x0, int y0, int x1, int y1, uint32_t color);
+
+/* Horizontal and vertical lines (optimized, no Bresenham overhead). */
+void gfx_hline(int x, int y, int w, uint32_t color);
+void gfx_vline(int x, int y, int h, uint32_t color);
+
 /* 8x8 bitmap text using the existing font8x8_basic table. Each character
  * is drawn at (x + i*8, y) in foreground colour fg over background bg.
  * Use bg = 0xFF000000 (alpha-only sentinel) to skip background fill --
  * useful for drawing labels over arbitrary surfaces. */
 #define GFX_TRANSPARENT 0xFF000000u
 void gfx_draw_text(int x, int y, const char *s, uint32_t fg, uint32_t bg);
+
+/* 8x16 VGA bitmap text. Same interface as gfx_draw_text but uses the
+ * larger font for better readability in UI chrome (title bars, menus,
+ * dialog text). Each character is 8px wide, 16px tall. */
+void gfx_draw_text16(int x, int y, const char *s, uint32_t fg, uint32_t bg);
+void gfx_text16_bounds(const char *s, int *out_w, int *out_h);
 
 /* ---- M27D: scaled / smoothed bitmap text -------------------------
  *
@@ -236,5 +256,67 @@ struct gfx_present_stats {
     uint64_t full_pixels;        /* sum of full-frame rect areas      */
 };
 void gfx_present_stats(struct gfx_present_stats *out);
+
+/* ---- Box blur (Phase 2: acrylic/glass effect) ---------------------
+ *
+ * In-place 3x3 box blur on a rectangular region of the global back
+ * buffer. Used by the compositor to apply a frosted-glass effect
+ * behind translucent panels (taskbar, launcher, notifications)
+ * before painting them. The region is clipped to back-buffer bounds.
+ *
+ * `passes` controls quality: 1 = single 3x3 (cheap, blocky),
+ * 2 = two passes (approximates 5x5 gaussian), 3 = three passes
+ * (smooth, ~7x7 gaussian approximation). Values > 3 are clamped. */
+void gfx_box_blur_region(int x, int y, int w, int h, int passes);
+
+/* VSync: returns a monotonically increasing frame counter that ticks
+ * on every gfx_flip(). Userland can snapshot this, yield, and poll
+ * until it changes to implement a simple vsync-wait. */
+uint64_t gfx_frame_count(void);
+
+/* ---- Surface abstraction for off-screen / per-window rendering ----
+ *
+ * A gfx_surface is a simple pixel buffer that drawing primitives can
+ * target instead of the global compositor back buffer. Window backbufs,
+ * off-screen scratch buffers, and image decode targets all become
+ * surfaces. The global back buffer is itself a surface internally. */
+struct gfx_surface {
+    uint32_t *pixels;
+    int       width;
+    int       height;
+};
+
+/* Get the global back buffer as a surface (convenience). */
+void gfx_surface_from_backbuf(struct gfx_surface *out);
+
+/* Surface-targeted primitives. These do NOT touch the global backbuf
+ * or dirty-rect tracking -- they write only to the provided surface.
+ * All clip to [0..surface.width) x [0..surface.height). */
+void gfx_surface_fill_rect(struct gfx_surface *s, int x, int y, int w, int h, uint32_t color);
+void gfx_surface_draw_rect(struct gfx_surface *s, int x, int y, int w, int h, uint32_t color);
+void gfx_surface_draw_line(struct gfx_surface *s, int x0, int y0, int x1, int y1, uint32_t color);
+void gfx_surface_fill_rounded_rect(struct gfx_surface *s, int x, int y, int w, int h, int radius, uint32_t color);
+void gfx_surface_fill_rounded_rect_blend(struct gfx_surface *s, int x, int y, int w, int h, int radius, uint32_t argb);
+void gfx_surface_fill_rect_blend(struct gfx_surface *s, int x, int y, int w, int h, uint32_t argb);
+void gfx_surface_draw_text(struct gfx_surface *s, int x, int y, const char *str, uint32_t fg, uint32_t bg);
+void gfx_surface_draw_text_scaled(struct gfx_surface *s, int x, int y, const char *str, uint32_t fg, uint32_t bg, int scale);
+void gfx_surface_blit(struct gfx_surface *s, int dst_x, int dst_y, int w, int h, const uint32_t *src, int src_pitch);
+void gfx_surface_blit_blend(struct gfx_surface *s, int dst_x, int dst_y, int w, int h, const uint32_t *src, int src_pitch);
+
+/* Circle primitives (work on surfaces). */
+void gfx_surface_fill_circle(struct gfx_surface *s, int cx, int cy, int r, uint32_t color);
+void gfx_surface_draw_circle(struct gfx_surface *s, int cx, int cy, int r, uint32_t color);
+
+/* Vertical gradient fill. */
+void gfx_surface_gradient_v(struct gfx_surface *s, int x, int y, int w, int h, uint32_t color_top, uint32_t color_bot);
+
+/* Alpha-blended line. */
+void gfx_surface_draw_line_blend(struct gfx_surface *s, int x0, int y0, int x1, int y1, uint32_t argb);
+
+/* Read pixels from a surface into a user buffer. Returns number of pixels copied. */
+int gfx_surface_get_pixels(const struct gfx_surface *s, int x, int y, int w, int h, uint32_t *dst);
+
+/* Surface-targeted box blur (does not touch global state). */
+void gfx_surface_box_blur(struct gfx_surface *s, int x, int y, int w, int h, int passes);
 
 #endif /* TOBYOS_GFX_H */

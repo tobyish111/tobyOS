@@ -74,7 +74,7 @@ bool session_should_restart_login(struct service *s) {
     return !g.active;
 }
 
-int session_login(const char *username) {
+int session_login(const char *username, const char *password) {
     if (!username || !username[0]) {
         kprintf("[session] login refused: empty username\n");
         SLOG_WARN(SLOG_SUB_AUDIT,
@@ -89,6 +89,13 @@ int session_login(const char *username) {
         kprintf("[session] login refused: unknown user '%s'\n", username);
         SLOG_WARN(SLOG_SUB_AUDIT,
                   "login REJECT user='%s' reason=unknown-user", username);
+        return -1;
+    }
+
+    if (!users_check_password(username, password ? password : "")) {
+        kprintf("[session] login refused: bad password for '%s'\n", username);
+        SLOG_WARN(SLOG_SUB_AUDIT,
+                  "login REJECT user='%s' reason=bad-password", username);
         return -1;
     }
 

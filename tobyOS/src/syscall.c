@@ -28,6 +28,7 @@
 #include <tobyos/socket.h>
 #include <tobyos/gui.h>
 #include <tobyos/gfx.h>
+#include <tobyos/virtio_gpu.h>
 #include <tobyos/term.h>
 #include <tobyos/vfs.h>
 #include <tobyos/heap.h>
@@ -57,15 +58,57 @@
 #include <tobyos/drvmatch.h>
 #include <tobyos/hwdb.h>
 #include <tobyos/notify.h>
+#include <tobyos/notify_svc.h>
 #include <tobyos/theme.h>
 #include <tobyos/sysmon.h>
 #include <tobyos/mouse.h>
 #include <tobyos/keyboard.h>
 #include <tobyos/usb_legacy.h>
 #include <tobyos/xhci.h>
+#include <tobyos/http.h>
+#include <tobyos/inotify.h>
+#include <tobyos/clipboard.h>
 
 extern uint64_t g_kernel_syscall_rsp;
 extern void syscall_entry(void);
+
+/* Phase 3 M3.2: fork/exec forward declarations */
+extern long sys_fork(void);
+extern long sys_execve(const char *path, char *const argv[], char *const envp[]);
+
+/* TCP/TLS userland networking */
+extern long sys_tcp_user_connect(uint32_t ip_be, uint16_t port_be, uint32_t timeout_ms);
+
+/* Audio engine */
+extern int sys_audio_open(uint32_t sample_rate, uint8_t channels, uint8_t format);
+extern long sys_audio_write(int stream_id, const void *samples, size_t count);
+extern int sys_audio_close(int stream_id);
+extern int sys_audio_volume(int stream_id, uint8_t volume);
+extern long sys_tcp_user_send(int conn_id, const void *buf, uint32_t len);
+extern long sys_tcp_user_recv(int conn_id, void *buf, uint32_t len);
+extern long sys_tcp_user_close(int conn_id);
+extern long sys_tcp_user_listen(uint16_t port_be, int backlog);
+extern long sys_tcp_user_accept(int listen_id);
+extern long sys_tls_user_connect(uint32_t ip_be, uint16_t port_be, const char *hostname);
+extern long sys_tls_user_send(int tls_id, const void *buf, uint32_t len);
+extern long sys_tls_user_recv(int tls_id, void *buf, uint32_t len);
+extern long sys_tls_user_close(int tls_id);
+
+/* Kernel module management */
+extern long sys_module(uint64_t op, uint64_t arg1, uint64_t arg2);
+
+/* Phase 1 M1.4: IPC forward declarations */
+extern long sys_shm_open(const char *name, int flags, size_t size);
+extern long sys_shm_map(int shm_id, uint64_t hint_addr);
+extern long sys_shm_unlink(const char *name);
+extern long sys_unix_socket(void);
+extern long sys_unix_bind(int sockfd, const char *path);
+extern long sys_unix_listen(int sockfd, int backlog);
+extern long sys_unix_connect(int sockfd, const char *path);
+extern long sys_unix_accept(int sockfd);
+extern long sys_unix_send(int sockfd, const void *buf, size_t len);
+extern long sys_unix_recv(int sockfd, void *buf, size_t len);
+extern long sys_unix_close(int sockfd);
 
 static void syscall_service_input(void) {
     usb_legacy_poll();
@@ -404,6 +447,88 @@ static long sys_gui_poll_event(int fd, struct gui_event *out) {
     return got;
 }
 
+/* ---- window state / title syscalls (milestone 38) --------------- */
+
+static long sys_gui_set_state(int fd, int state) {
+    struct file *f = fd_lookup(fd);
+    if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -ABI_EBADF;
+    if (state < GUI_WIN_NORMAL || state > GUI_WIN_MAXIMIZED) return -ABI_EINVAL;
+    return gui_window_set_state(f->win, state) == 0 ? 0 : -ABI_ENOMEM;
+}
+
+static long sys_gui_set_title(int fd, const char *title) {
+    struct file *f = fd_lookup(fd);
+    if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -ABI_EBADF;
+    char tbuf[GUI_TITLE_MAX];
+    long n = user_str_ok(title, sizeof(tbuf));
+    if (n < 0) return -ABI_EFAULT;
+    memcpy(tbuf, title, (size_t)n);
+    tbuf[n] = '\0';
+    return gui_window_set_title(f->win, tbuf) == 0 ? 0 : -ABI_EINVAL;
+}
+
+static long sys_clip_copy(const char *data, uint32_t len) {
+    if (!data) return -ABI_EFAULT;
+    uint64_t addr = (uint64_t)(uintptr_t)data;
+    if (addr == 0 || addr >= 0x0000800000000000ULL) return -ABI_EFAULT;
+    if (len > 4095) len = 4095;
+    return gui_clip_copy(data, len);
+}
+
+static long sys_clip_paste(char *buf, uint32_t max) {
+    if (!buf || max == 0) return -ABI_EINVAL;
+    uint64_t addr = (uint64_t)(uintptr_t)buf;
+    if (addr == 0 || addr >= 0x0000800000000000ULL) return -ABI_EFAULT;
+    return gui_clip_paste(buf, max);
+}
+
+/* ---- HTTP GET syscall ------------------------------------------ */
+#define HTTP_SYSCALL_MAX_BODY  65536u  /* 64KB cap for userspace fetches */
+#define HTTP_MAX_REDIRECTS     5
+
+static long sys_http_get(const char *url, void *buf, uint32_t buf_sz) {
+    if (!cap_check(current_proc(), CAP_NET, "sys_http_get")) return -ABI_EPERM;
+    if (!url || !buf || buf_sz == 0) return -ABI_EINVAL;
+
+    uint64_t url_addr = (uint64_t)(uintptr_t)url;
+    uint64_t buf_addr = (uint64_t)(uintptr_t)buf;
+    if (url_addr >= 0x0000800000000000ULL) return -ABI_EFAULT;
+    if (buf_addr >= 0x0000800000000000ULL) return -ABI_EFAULT;
+
+    uint32_t cap = buf_sz < HTTP_SYSCALL_MAX_BODY ? buf_sz : HTTP_SYSCALL_MAX_BODY;
+
+    /* Copy URL to kernel buffer so we can follow redirects */
+    char cur_url[512];
+    size_t ulen = 0;
+    while (url[ulen] && ulen < sizeof(cur_url) - 1) { cur_url[ulen] = url[ulen]; ulen++; }
+    cur_url[ulen] = '\0';
+
+    for (int redir = 0; redir <= HTTP_MAX_REDIRECTS; redir++) {
+        struct http_response resp;
+        int rc = http_get(cur_url, (size_t)cap, HTTP_DEFAULT_TIMEOUT_MS, &resp);
+        if (rc < 0) return (long)rc;
+
+        /* Follow 301/302/303/307/308 redirects */
+        if ((resp.status == 301 || resp.status == 302 || resp.status == 303 ||
+             resp.status == 307 || resp.status == 308) && resp.location[0]) {
+            size_t loc_len = 0;
+            while (resp.location[loc_len]) loc_len++;
+            if (loc_len < sizeof(cur_url)) {
+                memcpy(cur_url, resp.location, loc_len + 1);
+                http_free(&resp);
+                continue;
+            }
+        }
+
+        size_t copy = resp.body_len < (size_t)cap ? resp.body_len : (size_t)cap;
+        memcpy(buf, resp.body, copy);
+        http_free(&resp);
+        return (long)copy;
+    }
+
+    return HTTP_ERR_PROTOCOL;
+}
+
 /* ---- terminal session syscalls (milestone 13) ------------------ */
 
 static long sys_term_open(void) {
@@ -612,14 +737,23 @@ static long sys_setting_set(const char *key, const char *val) {
     return 0;
 }
 
-static long sys_login(const char *username) {
+static long sys_login(const char *username, const char *password) {
     if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_login")) return -1;
     long n = user_str_ok(username, SESSION_USER_MAX);
     if (n < 0) return -1;
     char kname[SESSION_USER_MAX];
     memcpy(kname, username, (size_t)n);
     kname[n] = '\0';
-    return session_login(kname) == 0 ? 0 : -1;
+    char kpass[65];
+    kpass[0] = '\0';
+    if (password) {
+        long pn = user_str_ok(password, 64);
+        if (pn > 0) {
+            memcpy(kpass, password, (size_t)pn);
+            kpass[pn] = '\0';
+        }
+    }
+    return session_login(kname, kpass) == 0 ? 0 : -1;
 }
 
 static long sys_logout(void) {
@@ -2066,7 +2200,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     case SYS_SETTING_SET:
         return sys_setting_set((const char *)a1, (const char *)a2);
     case SYS_LOGIN:
-        return sys_login((const char *)a1);
+        return sys_login((const char *)a1, (const char *)a2);
     case SYS_LOGOUT:
         return sys_logout();
     case SYS_SESSION_INFO:
@@ -2190,6 +2324,355 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Milestone 36B: desktop/system monitor ------------------ */
     case ABI_SYS_SYSTEM_METRICS:
         return sys_system_metrics((struct abi_system_metrics *)a1);
+
+    /* ---- Milestone 38: window management ------------------------ */
+    case ABI_SYS_GUI_SET_STATE:
+        return sys_gui_set_state((int)a1, (int)a2);
+    case ABI_SYS_GUI_SET_TITLE:
+        return sys_gui_set_title((int)a1, (const char *)a2);
+
+    /* ---- Clipboard ------------------------------------------------- */
+    case ABI_SYS_CLIP_COPY:  return sys_clip_copy((const char *)a1, (uint32_t)a2);
+    case ABI_SYS_CLIP_PASTE: return sys_clip_paste((char *)a1, (uint32_t)a2);
+
+    /* ---- Network: HTTP GET ------------------------------------------ */
+    case ABI_SYS_HTTP_GET:
+        return sys_http_get((const char *)a1, (void *)a2, (uint32_t)a3);
+
+    /* ---- Advanced GUI drawing (Phase 1) ----------------------------- */
+    case ABI_SYS_GUI_LINE: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int x0 = (int)(int16_t)(a2 & 0xFFFF), y0 = (int)(int16_t)(a2 >> 16);
+        int x1 = (int)(int16_t)(a3 & 0xFFFF), y1 = (int)(int16_t)(a3 >> 16);
+        return gui_window_line(f->win, x0, y0, x1, y1, (uint32_t)a4);
+    }
+    case ABI_SYS_GUI_RECT: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int w = (int)(int16_t)(a4 & 0xFFFF), h = (int)(int16_t)(a4 >> 16);
+        return gui_window_rect(f->win, (int)a2, (int)a3, w, h, (uint32_t)a5);
+    }
+    case ABI_SYS_GUI_ROUNDED_RECT: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int w = (int)(int16_t)(a3 & 0xFFFF), h = (int)(int16_t)(a3 >> 16);
+        int radius = (int)(a5 >> 24);
+        uint32_t color = a5 & 0x00FFFFFFu;
+        return gui_window_rounded_rect(f->win, (int)a2, (int)(a2 >> 32), w, h, radius, color);
+    }
+    case ABI_SYS_GUI_ROUNDED_RECT_BLEND: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int w = (int)(int16_t)(a3 & 0xFFFF), h = (int)(int16_t)(a3 >> 16);
+        return gui_window_rounded_rect_blend(f->win, (int)a2, (int)(a3 >> 32), w, h, (int)a4, (uint32_t)a5);
+    }
+    case ABI_SYS_GUI_CIRCLE: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int cx = (int)(int16_t)(a2 & 0xFFFF), cy = (int)(int16_t)(a2 >> 16);
+        return gui_window_circle(f->win, cx, cy, (int)a3, (uint32_t)a4);
+    }
+    case ABI_SYS_GUI_CIRCLE_OUTLINE: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int cx = (int)(int16_t)(a2 & 0xFFFF), cy = (int)(int16_t)(a2 >> 16);
+        return gui_window_circle_outline(f->win, cx, cy, (int)a3, (uint32_t)a4);
+    }
+    case ABI_SYS_GUI_BLIT: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int dx = (int)(int16_t)(a2 & 0xFFFF), dy = (int)(int16_t)(a2 >> 16);
+        int w = (int)(int16_t)(a4 & 0xFFFF), h = (int)(int16_t)(a4 >> 16);
+        return gui_window_blit(f->win, dx, dy, w, h, (const uint32_t *)a3);
+    }
+    case ABI_SYS_GUI_BLIT_BLEND: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int dx = (int)(int16_t)(a2 & 0xFFFF), dy = (int)(int16_t)(a2 >> 16);
+        int w = (int)(int16_t)(a4 & 0xFFFF), h = (int)(int16_t)(a4 >> 16);
+        return gui_window_blit_blend(f->win, dx, dy, w, h, (const uint32_t *)a3);
+    }
+    case ABI_SYS_GUI_GETPIXELS: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int sx = (int)(int16_t)(a2 & 0xFFFF), sy = (int)(int16_t)(a2 >> 16);
+        int w = (int)(int16_t)(a4 & 0xFFFF), h = (int)(int16_t)(a4 >> 16);
+        return gui_window_getpixels(f->win, sx, sy, w, h, (uint32_t *)a3);
+    }
+    case ABI_SYS_GUI_GRADIENT: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int w = (int)(int16_t)(a3 & 0xFFFF), h = (int)(int16_t)(a3 >> 16);
+        return gui_window_gradient(f->win, (int)a2, (int)(a2 >> 32), w, h, (uint32_t)a4, (uint32_t)a5);
+    }
+    case ABI_SYS_GUI_LINE_BLEND: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int x0 = (int)(int16_t)(a2 & 0xFFFF), y0 = (int)(int16_t)(a2 >> 16);
+        int x1 = (int)(int16_t)(a3 & 0xFFFF), y1 = (int)(int16_t)(a3 >> 16);
+        return gui_window_line_blend(f->win, x0, y0, x1, y1, (uint32_t)a4);
+    }
+
+    /* ---- Advanced compositor (Phase 2) ------------------------------ */
+    case ABI_SYS_GUI_SET_OPACITY: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        return gui_window_set_opacity(f->win, (uint8_t)(a2 & 0xFF));
+    }
+    case ABI_SYS_GUI_WAIT_VSYNC: {
+        uint64_t start_frame = gfx_frame_count();
+        uint64_t deadline = perf_now_ns() + 20000000ull; /* 20ms timeout (~50Hz min) */
+        while (gfx_frame_count() == start_frame && perf_now_ns() < deadline) {
+            sched_yield();
+        }
+        return (long)(gfx_frame_count() - start_frame);
+    }
+    case ABI_SYS_GUI_BATCH_FILL: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        int count = (int)a3;
+        if (count <= 0 || count > 256) return -ABI_EINVAL;
+        const uint32_t *cmds = (const uint32_t *)a2;
+        if (!user_buf_ok((uint64_t)(uintptr_t)cmds, (uint64_t)count * 16))
+            return -ABI_EFAULT;
+        for (int i = 0; i < count; i++) {
+            int16_t bx = (int16_t)(cmds[i * 4 + 0] & 0xFFFF);
+            int16_t by = (int16_t)((cmds[i * 4 + 0] >> 16) & 0xFFFF);
+            uint16_t bw = (uint16_t)(cmds[i * 4 + 1] & 0xFFFF);
+            uint16_t bh = (uint16_t)((cmds[i * 4 + 1] >> 16) & 0xFFFF);
+            uint32_t color = cmds[i * 4 + 2];
+            gui_window_fill(f->win, bx, by, bw, bh, color);
+        }
+        return count;
+    }
+
+    /* ---- 3D Graphics / VirGL (Phase 3) ------------------------------ */
+    case ABI_SYS_GL_CREATE_CTX: {
+        static uint32_t next_ctx = 1;
+        uint32_t id = next_ctx++;
+        int rc = virtio_gpu_ctx_create(id, "userland");
+        return rc == 0 ? (long)id : -1;
+    }
+    case ABI_SYS_GL_DESTROY_CTX:
+        virtio_gpu_ctx_destroy((uint32_t)a1);
+        return 0;
+    case ABI_SYS_GL_CREATE_BUFFER:
+        /* Buffer creation is a subset of context resource management.
+         * For now, return -1 (not yet implemented beyond context). */
+        (void)a1; (void)a2;
+        return -1;
+    case ABI_SYS_GL_SUBMIT:
+        return (long)virtio_gpu_submit_3d((uint32_t)a1, (const void *)a2, (uint32_t)a3);
+    case ABI_SYS_GL_SWAP_BUFFERS: {
+        struct file *f = fd_lookup((int)a2);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+        gui_window_flip(f->win);
+        return 0;
+    }
+
+    /* ---- Phase 1 M1.1: Threading syscalls ---- */
+
+    case ABI_SYS_THREAD_CREATE:
+        return thread_create((uint64_t)a1, (uint64_t)a2,
+                             (uint64_t)a3, (uint64_t)a4);
+
+    case ABI_SYS_THREAD_EXIT:
+        thread_exit((int)a1);
+        return 0; /* unreachable */
+
+    case ABI_SYS_THREAD_JOIN:
+        return thread_join((int)a1, (int *)a2);
+
+    case ABI_SYS_THREAD_DETACH:
+        return thread_detach((int)a1);
+
+    case ABI_SYS_FUTEX:
+        return futex((uint32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3);
+
+    case ABI_SYS_SET_TLS:
+        thread_set_tls((uint64_t)a1);
+        return 0;
+
+    case ABI_SYS_GETTID:
+        return current_proc() ? current_proc()->pid : -1;
+
+    /* ---- Phase 1 M1.2: Advanced VMM syscalls ---- */
+
+    case ABI_SYS_MMAP:
+        return sys_mmap((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
+                        (uint32_t)a4, (int)a5, 0);
+
+    case ABI_SYS_MUNMAP:
+        return sys_munmap((uint64_t)a1, (uint64_t)a2);
+
+    case ABI_SYS_MPROTECT:
+        return sys_mprotect((uint64_t)a1, (uint64_t)a2, (uint32_t)a3);
+
+    /* ---- Phase 1 M1.3: Signal syscalls ---- */
+
+    case ABI_SYS_SIGACTION:
+        return sys_sigaction((int)a1, (const struct sigaction *)(uintptr_t)a2,
+                            (struct sigaction *)(uintptr_t)a3);
+
+    case ABI_SYS_SIGPROCMASK:
+        return sys_sigprocmask((int)a1, (const sigset_t *)(uintptr_t)a2,
+                              (sigset_t *)(uintptr_t)a3);
+
+    case ABI_SYS_SIGRETURN:
+        sys_sigreturn();
+        return 0;
+
+    case ABI_SYS_KILL:
+        return sys_kill((int)a1, (int)a2);
+
+    /* ---- Phase 1 M1.4: IPC syscalls ---- */
+
+    case ABI_SYS_SHM_OPEN:
+        return sys_shm_open((const char *)(uintptr_t)a1, (int)a2, (size_t)a3);
+
+    case ABI_SYS_SHM_MAP:
+        return sys_shm_map((int)a1, (uint64_t)a2);
+
+    case ABI_SYS_SHM_UNLINK:
+        return sys_shm_unlink((const char *)(uintptr_t)a1);
+
+    case ABI_SYS_UNIX_SOCKET:
+        return sys_unix_socket();
+
+    case ABI_SYS_UNIX_BIND:
+        return sys_unix_bind((int)a1, (const char *)(uintptr_t)a2);
+
+    case ABI_SYS_UNIX_LISTEN:
+        return sys_unix_listen((int)a1, (int)a2);
+
+    case ABI_SYS_UNIX_CONNECT:
+        return sys_unix_connect((int)a1, (const char *)(uintptr_t)a2);
+
+    case ABI_SYS_UNIX_ACCEPT:
+        return sys_unix_accept((int)a1);
+
+    case ABI_SYS_UNIX_SEND:
+        return sys_unix_send((int)a1, (const void *)(uintptr_t)a2, (size_t)a3);
+
+    case ABI_SYS_UNIX_RECV:
+        return sys_unix_recv((int)a1, (void *)(uintptr_t)a2, (size_t)a3);
+
+    case ABI_SYS_UNIX_CLOSE:
+        return sys_unix_close((int)a1);
+
+    /* ---- Phase 1 M1.5: Enhanced VFS ---- */
+
+    case ABI_SYS_SYMLINK: {
+        const char *path   = (const char *)(uintptr_t)a1;
+        const char *target = (const char *)(uintptr_t)a2;
+        if (!path || (uintptr_t)path >= USER_HALF_MAX) return -ABI_EFAULT;
+        if (!target || (uintptr_t)target >= USER_HALF_MAX) return -ABI_EFAULT;
+        int rc = vfs_symlink(path, target);
+        if (rc == VFS_OK) return 0;
+        if (rc == VFS_ERR_EXIST) return -ABI_EEXIST;
+        if (rc == VFS_ERR_NOSPC) return -ABI_ENOSPC;
+        return -ABI_EINVAL;
+    }
+
+    case ABI_SYS_READLINK: {
+        const char *path = (const char *)(uintptr_t)a1;
+        char *buf        = (char *)(uintptr_t)a2;
+        size_t bufsz     = (size_t)a3;
+        if (!path || (uintptr_t)path >= USER_HALF_MAX) return -ABI_EFAULT;
+        if (!buf  || (uintptr_t)buf  >= USER_HALF_MAX) return -ABI_EFAULT;
+        int rc = vfs_readlink(path, buf, bufsz);
+        if (rc == VFS_OK) return (long)strlen(buf);
+        if (rc == VFS_ERR_NOENT) return -ABI_ENOENT;
+        return -ABI_EINVAL;
+    }
+
+    case ABI_SYS_INOTIFY_INIT:
+        return sys_inotify_init();
+
+    case ABI_SYS_INOTIFY_ADD_WATCH: {
+        const char *path = (const char *)(uintptr_t)a2;
+        if (!path || (uintptr_t)path >= USER_HALF_MAX) return -ABI_EFAULT;
+        return sys_inotify_add_watch((int)a1, path, (uint32_t)a3);
+    }
+
+    case ABI_SYS_INOTIFY_RM_WATCH:
+        return sys_inotify_rm_watch((int)a1, (int)a2);
+
+    /* ---- Phase 2 M2.4: Fluent Design Theme Engine ------------------- */
+    case ABI_SYS_THEME_SET:
+        return theme_fluent_set((uint32_t)a1) == 0 ? 0 : -ABI_EINVAL;
+
+    /* ---- Phase 2 M2.7: Clipboard System ----------------------------- */
+    case ABI_SYS_CLIP_SET: {
+        const char *data = (const char *)(uintptr_t)a1;
+        uint32_t len = (uint32_t)a2;
+        uint32_t fmt = (uint32_t)a3;
+        if (!data || (uintptr_t)data >= USER_HALF_MAX) return -ABI_EFAULT;
+        return clipboard_set(data, len, fmt);
+    }
+    case ABI_SYS_CLIP_GET: {
+        char *buf = (char *)(uintptr_t)a1;
+        uint32_t buf_sz = (uint32_t)a2;
+        uint32_t fmt = (uint32_t)a3;
+        if (!buf || (uintptr_t)buf >= USER_HALF_MAX) return -ABI_EFAULT;
+        return clipboard_get(buf, buf_sz, fmt);
+    }
+    case ABI_SYS_CLIP_CLEAR:
+        return clipboard_clear();
+
+    /* ---- Phase 3 M3.2: Fork/Exec ----------------------------------- */
+    case ABI_SYS_FORK:
+        return sys_fork();
+
+    case ABI_SYS_EXECVE:
+        return sys_execve((const char *)(uintptr_t)a1,
+                          (char *const *)(uintptr_t)a2,
+                          (char *const *)(uintptr_t)a3);
+
+    /* ---- Audio Engine ---- */
+    case ABI_SYS_AUDIO_OPEN:
+        return sys_audio_open((uint32_t)a1, (uint8_t)a2, (uint8_t)a3);
+    case ABI_SYS_AUDIO_WRITE:
+        return sys_audio_write((int)a1, (const void *)a2, (size_t)a3);
+    case ABI_SYS_AUDIO_CLOSE:
+        return sys_audio_close((int)a1);
+    case ABI_SYS_AUDIO_VOLUME:
+        return sys_audio_volume((int)a1, (uint8_t)a2);
+
+    /* ---- Userland TCP/TLS networking ---- */
+    case ABI_SYS_TCP_CONNECT:
+        return sys_tcp_user_connect((uint32_t)a1, (uint16_t)a2, (uint32_t)a3);
+    case ABI_SYS_TCP_SEND:
+        return sys_tcp_user_send((int)a1, (const void *)a2, (uint32_t)a3);
+    case ABI_SYS_TCP_RECV:
+        return sys_tcp_user_recv((int)a1, (void *)a2, (uint32_t)a3);
+    case ABI_SYS_TCP_CLOSE:
+        return sys_tcp_user_close((int)a1);
+    case ABI_SYS_TCP_LISTEN:
+        return sys_tcp_user_listen((uint16_t)a1, (int)a2);
+    case ABI_SYS_TCP_ACCEPT:
+        return sys_tcp_user_accept((int)a1);
+    case ABI_SYS_TLS_CONNECT:
+        return sys_tls_user_connect((uint32_t)a1, (uint16_t)a2, (const char *)a3);
+    case ABI_SYS_TLS_SEND:
+        return sys_tls_user_send((int)a1, (const void *)a2, (uint32_t)a3);
+    case ABI_SYS_TLS_RECV:
+        return sys_tls_user_recv((int)a1, (void *)a2, (uint32_t)a3);
+    case ABI_SYS_TLS_CLOSE:
+        return sys_tls_user_close((int)a1);
+
+    /* ---- Kernel module management --------------------------------------- */
+    case ABI_SYS_MODULE:
+        return sys_module(a1, a2, a3);
+
+    /* ---- Milestone 7: notification service / IPC -------------------- */
+    case ABI_SYS_NOTIFY_SVC_SEND:
+        return sys_notify_svc_send((const char *)a1, (const char *)a2, (const char *)a3);
+    case ABI_SYS_NOTIFY_SVC_GET:
+        return sys_notify_svc_get((struct notification *)a1, (int)a2);
+    case ABI_SYS_NOTIFY_SVC_DISMISS:
+        return sys_notify_svc_dismiss((int)a1);
 
     default:
         kprintf("[syscall] unknown number %ld -- returning -ENOSYS\n", num);
