@@ -31,6 +31,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/pmm.h>
+#include <tobyos/vmm.h>
 #include <tobyos/cpu.h>
 #include <tobyos/pit.h>
 
@@ -239,11 +240,23 @@ static bool sig_eq(const char *sig, const char *want, size_t n) {
     return true;
 }
 
-/* Convert a phys address (from an ACPI table entry) into a kernel-virt
- * pointer via HHDM. All ACPI tables live in ACPI_RECLAIMABLE memory
- * which we mirror in the HHDM during vmm_init, so this is a free deref. */
-static const void *phys_to_kv(uint64_t phys) {
-    return pmm_phys_to_virt(phys);
+/* Ensure [phys, phys+len) is mapped in HHDM. Real UEFI firmware may
+ * place ACPI tables in RESERVED regions or HHDM gaps that vmm_init
+ * skipped; map on demand before dereferencing. */
+static bool acpi_ensure_mapped(uint64_t phys, size_t len) {
+    return vmm_hhdm_ensure_mapped(phys, len, VMM_PRESENT | VMM_WRITE | VMM_NX);
+}
+
+/* Map an ACPI table (header + body) and return a kernel-virt pointer. */
+static const void *phys_to_kv_table(uint64_t phys) {
+    if (!acpi_ensure_mapped(phys, sizeof(struct acpi_sdt_header)))
+        return 0;
+
+    const struct acpi_sdt_header *h = pmm_phys_to_virt(phys);
+    if (!acpi_ensure_mapped(phys, h->length))
+        return 0;
+
+    return h;
 }
 
 /* ---- MADT walk ---- */
@@ -538,8 +551,8 @@ static void parse_fadt(const struct acpi_fadt *f) {
         return;
     }
 
-    const struct acpi_sdt_header *dh = phys_to_kv(dsdt_phys);
-    if (!sig_eq(dh->signature, "DSDT", 4)) {
+    const struct acpi_sdt_header *dh = phys_to_kv_table(dsdt_phys);
+    if (!dh || !sig_eq(dh->signature, "DSDT", 4)) {
         kprintf("[acpi] DSDT @ %p has bad signature -- shutdown unavailable\n",
                 (void *)dsdt_phys);
         return;
@@ -576,8 +589,8 @@ static void parse_fadt(const struct acpi_fadt *f) {
 static void collect_ssdts_xsdt(const struct acpi_xsdt *xsdt) {
     uint32_t n = (xsdt->h.length - sizeof(struct acpi_sdt_header)) / 8u;
     for (uint32_t i = 0; i < n; i++) {
-        const struct acpi_sdt_header *h = phys_to_kv(xsdt->entries[i]);
-        if (!sig_eq(h->signature, "SSDT", 4)) continue;
+        const struct acpi_sdt_header *h = phys_to_kv_table(xsdt->entries[i]);
+        if (!h || !sig_eq(h->signature, "SSDT", 4)) continue;
         if (g_info.ssdt_count >= ACPI_MAX_SSDTS) {
             kprintf("[acpi] more than %u SSDTs -- dropping rest\n",
                     (unsigned)ACPI_MAX_SSDTS);
@@ -595,8 +608,8 @@ static void collect_ssdts_xsdt(const struct acpi_xsdt *xsdt) {
 static void collect_ssdts_rsdt(const struct acpi_rsdt *rsdt) {
     uint32_t n = (rsdt->h.length - sizeof(struct acpi_sdt_header)) / 4u;
     for (uint32_t i = 0; i < n; i++) {
-        const struct acpi_sdt_header *h = phys_to_kv((uint64_t)rsdt->entries[i]);
-        if (!sig_eq(h->signature, "SSDT", 4)) continue;
+        const struct acpi_sdt_header *h = phys_to_kv_table((uint64_t)rsdt->entries[i]);
+        if (!h || !sig_eq(h->signature, "SSDT", 4)) continue;
         if (g_info.ssdt_count >= ACPI_MAX_SSDTS) {
             kprintf("[acpi] more than %u SSDTs -- dropping rest\n",
                     (unsigned)ACPI_MAX_SSDTS);
@@ -618,8 +631,9 @@ static const struct acpi_sdt_header *find_table_xsdt(const struct acpi_xsdt *xsd
                                                      const char *sig) {
     uint32_t n = (xsdt->h.length - sizeof(struct acpi_sdt_header)) / 8u;
     for (uint32_t i = 0; i < n; i++) {
-        const struct acpi_sdt_header *h = phys_to_kv(xsdt->entries[i]);
-        if (sig_eq(h->signature, sig, 4)) return h;
+        const struct acpi_sdt_header *h = phys_to_kv_table(xsdt->entries[i]);
+        if (!h || !sig_eq(h->signature, sig, 4)) continue;
+        return h;
     }
     return 0;
 }
@@ -628,8 +642,9 @@ static const struct acpi_sdt_header *find_table_rsdt(const struct acpi_rsdt *rsd
                                                      const char *sig) {
     uint32_t n = (rsdt->h.length - sizeof(struct acpi_sdt_header)) / 4u;
     for (uint32_t i = 0; i < n; i++) {
-        const struct acpi_sdt_header *h = phys_to_kv((uint64_t)rsdt->entries[i]);
-        if (sig_eq(h->signature, sig, 4)) return h;
+        const struct acpi_sdt_header *h = phys_to_kv_table((uint64_t)rsdt->entries[i]);
+        if (!h || !sig_eq(h->signature, sig, 4)) continue;
+        return h;
     }
     return 0;
 }
@@ -657,8 +672,8 @@ const struct acpi_info *acpi_init(void *limine_rsdp_address) {
     const struct acpi_rsdt *rsdt = 0;
     if (rsdp1->revision >= 2) {
         const struct acpi_rsdp_v2 *rsdp2 = limine_rsdp_address;
-        xsdt = phys_to_kv(rsdp2->xsdt_phys);
-        if (!sig_eq(xsdt->h.signature, "XSDT", 4)) {
+        xsdt = phys_to_kv_table(rsdp2->xsdt_phys);
+        if (!xsdt || !sig_eq(xsdt->h.signature, "XSDT", 4)) {
             kprintf("[acpi] bad XSDT signature\n");
             return &g_info;
         }
@@ -672,8 +687,8 @@ const struct acpi_info *acpi_init(void *limine_rsdp_address) {
         madt_hdr = find_table_xsdt(xsdt, "APIC");
         fadt_hdr = find_table_xsdt(xsdt, "FACP");
     } else {
-        rsdt = phys_to_kv((uint64_t)rsdp1->rsdt_phys);
-        if (!sig_eq(rsdt->h.signature, "RSDT", 4)) {
+        rsdt = phys_to_kv_table((uint64_t)rsdp1->rsdt_phys);
+        if (!rsdt || !sig_eq(rsdt->h.signature, "RSDT", 4)) {
             kprintf("[acpi] bad RSDT signature\n");
             return &g_info;
         }

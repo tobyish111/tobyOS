@@ -17,6 +17,8 @@
 #include <tobyos/limine.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+#include <tobyos/vmm.h>
+#include <tobyos/pmm.h>
 
 extern volatile struct limine_module_request module_req;
 
@@ -53,6 +55,17 @@ bool initrd_init(void) {
 
     kprintf("[initrd] using '%s' (size=%lu, addr=%p)\n",
             found->path, (unsigned long)found->size, found->address);
+
+    uint64_t hhdm = pmm_hhdm_offset();
+    uint64_t virt = (uint64_t)(uintptr_t)found->address;
+    uint64_t phys = (virt >= hhdm) ? (virt - hhdm) : virt;
+    if (!vmm_hhdm_ensure_mapped(phys, (size_t)found->size,
+                                VMM_PRESENT | VMM_WRITE | VMM_NX)) {
+        kprintf("[initrd] failed to map module at phys %p\n", (void *)phys);
+        return false;
+    }
+    if (virt != hhdm + phys)
+        found->address = (void *)(uintptr_t)(hhdm + phys);
 
     int rc = ramfs_mount(found->address, found->size);
     if (rc != VFS_OK) {

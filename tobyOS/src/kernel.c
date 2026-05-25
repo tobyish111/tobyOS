@@ -236,10 +236,22 @@ static void early_init(void) {
     SLOG_INFO(SLOG_SUB_BOOT, "tobyOS boot sequence started");
 }
 
+static void limine_fb_canonical(struct limine_framebuffer *fb) {
+    if (!fb || !fb->address) return;
+
+    uint64_t hhdm = hhdm_req.response ? hhdm_req.response->offset : 0;
+    if (hhdm == 0)
+        hhdm = pmm_hhdm_offset();
+    if (hhdm == 0)
+        return;
+
+    uint64_t virt = (uint64_t)(uintptr_t)fb->address;
+    uint64_t phys = (virt >= hhdm) ? (virt - hhdm) : virt;
+    fb->address   = (void *)(uintptr_t)(hhdm + phys);
+}
+
 static void framebuffer_init(void) {
     if (fb_req.response == 0 || fb_req.response->framebuffer_count == 0) {
-        /* Serial-only path: report and continue without a console. The
-         * panic path still works; it just won't be visible on screen. */
         kprintf("[boot] WARNING: no framebuffer response from Limine\n");
         return;
     }
@@ -255,16 +267,76 @@ static void framebuffer_init(void) {
         return;
     }
 
+    /* Do not console_init here -- HHDM is not latched until pmm_init().
+     * Early boot output goes to serial only. */
+}
+
+/* Bring the text console up once HHDM is known. */
+static void framebuffer_console_init(void) {
+    if (!fb_req.response || fb_req.response->framebuffer_count == 0)
+        return;
+
+    struct limine_framebuffer *fb = fb_req.response->framebuffers[0];
+    if (!fb || fb->bpp != 32)
+        return;
+
+    limine_fb_canonical(fb);
+    kprintf("[boot] framebuffer canonical virt=%p\n", fb->address);
+
     if (!console_init(fb->address, fb->pitch, fb->width, fb->height)) {
         kprintf("[boot] WARNING: console_init rejected the framebuffer\n");
         return;
     }
     kprintf("[boot] console up\n");
+}
 
-    /* Hand the same framebuffer to the gfx layer. The back buffer is
-     * a heap allocation, so this DEFERS until heap_init() runs. We
-     * stash the pointer/dims on the stack here and call gfx_init from
-     * the post-heap path inside _start. */
+/* Map the GOP framebuffer into our HHDM and refresh console/gfx pointers.
+ * Safe to call multiple times (post-CR3 hook, before gfx, before desktop). */
+static void framebuffer_sync_mapping(void) {
+    if (!fb_req.response || fb_req.response->framebuffer_count == 0)
+        return;
+
+    struct limine_framebuffer *fb = fb_req.response->framebuffers[0];
+    if (!fb || !fb->address || fb->bpp != 32)
+        return;
+
+    limine_fb_canonical(fb);
+
+    uint64_t hhdm = pmm_hhdm_offset();
+    uint64_t virt = (uint64_t)(uintptr_t)fb->address;
+    uint64_t phys = (virt >= hhdm) ? (virt - hhdm) : virt;
+
+    uint64_t size = fb->pitch * fb->height;
+    if (size == 0) size = PAGE_SIZE;
+    if (!vmm_hhdm_ensure_mapped(phys, (size_t)size,
+                                VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_NOCACHE)) {
+        kprintf("[boot] WARNING: framebuffer remap failed at phys %p\n",
+                (void *)phys);
+        return;
+    }
+
+    (void)console_init(fb->address, fb->pitch, fb->width, fb->height);
+    gfx_sync_framebuffer(fb->address, fb->pitch,
+                         (uint32_t)fb->width, (uint32_t)fb->height);
+}
+
+/* After vmm_init switches CR3, Limine's HHDM framebuffer mapping may
+ * be gone if UEFI/GOP tagged the region RESERVED instead of
+ * FRAMEBUFFER. Re-map on demand so console/gfx keep working. */
+static void framebuffer_validate_mapping(void) {
+    framebuffer_sync_mapping();
+    if (fb_req.response && fb_req.response->framebuffer_count > 0) {
+        struct limine_framebuffer *fb = fb_req.response->framebuffers[0];
+        if (fb && fb->address)
+            kprintf("[boot] framebuffer mapped for kernel page tables "
+                    "(%p)\n", fb->address);
+    }
+}
+
+/* Called from vmm_init immediately after CR3 switch, before any
+ * post-switch kprintf that might write through the framebuffer. */
+void vmm_post_cr3_hook(void) {
+    framebuffer_validate_mapping();
 }
 
 /* gfx layer needs the heap, so it gets initialised after heap_init.
@@ -412,15 +484,13 @@ static void *normalise_rsdp_pointer(void *raw) {
     uint64_t hhdm = hhdm_req.response ? hhdm_req.response->offset : 0;
 
     if (addr < hhdm) {
-        /* Looks like a raw phys -- map the page (and the next, in case
-         * the RSDP straddles a page boundary -- it's only 36 bytes but
-         * the alignment can be awkward) and convert. */
         uint64_t page = addr & ~((uint64_t)PAGE_SIZE - 1);
-        if (vmm_translate(hhdm + page) == 0) {
-            (void)vmm_map(hhdm + page, page, PAGE_SIZE * 2,
-                          VMM_PRESENT | VMM_NX);
-        }
+        (void)vmm_hhdm_ensure_mapped(page, PAGE_SIZE * 2, VMM_PRESENT | VMM_NX);
         addr += hhdm;
+    } else if (hhdm && vmm_translate(addr) == 0) {
+        uint64_t phys = addr - hhdm;
+        uint64_t page = phys & ~((uint64_t)PAGE_SIZE - 1);
+        (void)vmm_hhdm_ensure_mapped(page, PAGE_SIZE * 2, VMM_PRESENT | VMM_NX);
     }
     return (void *)addr;
 }
@@ -551,6 +621,8 @@ static void pmm_init_and_test(void) {
 
     pmm_init((struct limine_memmap_response *)memmap_req.response,
              hhdm_req.response->offset);
+
+    framebuffer_console_init();
 
     /* Round-trip smoke test: alloc 4 pages, prove they're distinct, free
      * them, prove the free count returns to baseline. */
@@ -3181,6 +3253,7 @@ void _start(void) {
                 safemode_tag());
         banner();
     } else {
+        framebuffer_sync_mapping();
         gfx_layer_init();
 
         if (safemode_skip_virtio_gpu()) {
@@ -3253,6 +3326,7 @@ void _start(void) {
          * time the shell starts polling. The shell stays available for
          * debugging.
          */
+        framebuffer_sync_mapping();
         m14_init();
 
         /*

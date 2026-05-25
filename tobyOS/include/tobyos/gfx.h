@@ -29,6 +29,12 @@ bool     gfx_ready (void);
 uint32_t gfx_width (void);
 uint32_t gfx_height(void);
 
+/* Re-point the hardware framebuffer pointer after Limine/GOP address
+ * normalisation or a post-vmm remap (UEFI GOP often reports phys
+ * 0x400000; console/gfx must use HHDM+phys). No-op if gfx_init has
+ * not run yet. */
+void gfx_sync_framebuffer(void *fb, uint64_t pitch, uint32_t width, uint32_t height);
+
 /* Direct back-buffer access -- exposed so the compositor can blit
  * window contents row-by-row without going through fill_rect. Returns 0
  * if the surface isn't initialised. */

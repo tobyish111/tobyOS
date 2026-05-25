@@ -21,6 +21,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/pci.h>
 #include <tobyos/pmm.h>
+#include <tobyos/vmm.h>
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/gfx.h>
@@ -175,7 +176,18 @@ static int igfx_probe(struct pci_dev *dev) {
     g_igfx.mmio_phys = dev->bar[0];
     g_igfx.mmio_size = dev->bar_size[0] ? dev->bar_size[0] : (2 * 1024 * 1024);
 
-    g_igfx.mmio = (volatile uint32_t *)pmm_phys_to_virt(g_igfx.mmio_phys);
+    {
+        uint64_t virt = g_igfx.mmio_phys + pmm_hhdm_offset();
+        if (vmm_translate(virt) == 0) {
+            if (!vmm_map(virt, g_igfx.mmio_phys, g_igfx.mmio_size,
+                         VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_NOCACHE)) {
+                kprintf("[igfx] Failed to map MMIO at phys %p\n",
+                        (void *)g_igfx.mmio_phys);
+                return -1;
+            }
+        }
+        g_igfx.mmio = (volatile uint32_t *)virt;
+    }
     if (!g_igfx.mmio) {
         kprintf("[igfx] Failed to map MMIO\n");
         return -1;

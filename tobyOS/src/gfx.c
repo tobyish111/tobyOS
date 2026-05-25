@@ -29,6 +29,8 @@
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/display.h>
+#include <tobyos/vmm.h>
+#include <tobyos/pmm.h>
 
 extern const uint8_t font8x8_basic[128][8];
 extern const uint8_t font8x16_data[128][16];
@@ -168,10 +170,32 @@ uint32_t gfx_width (void) { return g.width;  }
 uint32_t gfx_height(void) { return g.height; }
 uint32_t *gfx_backbuf(void) { return g.ready ? g.back : 0; }
 
+static uint32_t *gfx_hw_fb_ptr(void) {
+    if (!g.fb) return 0;
+    uint64_t addr = (uint64_t)(uintptr_t)g.fb;
+    uint64_t hhdm = pmm_hhdm_offset();
+    if (hhdm && addr < hhdm)
+        addr += hhdm;
+    return (uint32_t *)(uintptr_t)addr;
+}
+
+static bool gfx_hw_fb_writable(void) {
+    uint32_t *fb = gfx_hw_fb_ptr();
+    if (!fb) return false;
+    uint64_t hhdm = pmm_hhdm_offset();
+    if (hhdm == 0) return true;
+    return vmm_translate((uint64_t)(uintptr_t)fb) != 0;
+}
+
 bool gfx_init(void *fb, uint64_t pitch, uint32_t width, uint32_t height) {
     if (!fb || width == 0 || height == 0 || pitch < (uint64_t)width * 4) {
         return false;
     }
+
+    uint64_t addr = (uint64_t)(uintptr_t)fb;
+    uint64_t hhdm = pmm_hhdm_offset();
+    if (hhdm && addr < hhdm)
+        addr += hhdm;
     size_t bytes = (size_t)width * height * 4u;
     uint32_t *back = (uint32_t *)kmalloc(bytes);
     if (!back) {
@@ -188,7 +212,7 @@ bool gfx_init(void *fb, uint64_t pitch, uint32_t width, uint32_t height) {
         memset(back2, 0, bytes);
     }
 
-    g.fb          = (uint32_t *)fb;
+    g.fb          = (uint32_t *)(uintptr_t)addr;
     g.back        = back;
     g.back2       = back2;
     g.active_buf  = 0;
@@ -204,6 +228,19 @@ bool gfx_init(void *fb, uint64_t pitch, uint32_t width, uint32_t height) {
             g.fb_pitch_px,
             g.backend->name);
     return true;
+}
+
+void gfx_sync_framebuffer(void *fb, uint64_t pitch, uint32_t width, uint32_t height) {
+    if (!g.ready || !fb || width == 0 || height == 0 || pitch < (uint64_t)width * 4)
+        return;
+    uint64_t addr = (uint64_t)(uintptr_t)fb;
+    uint64_t hhdm = pmm_hhdm_offset();
+    if (hhdm && addr < hhdm)
+        addr += hhdm;
+    g.fb          = (uint32_t *)(uintptr_t)addr;
+    g.fb_pitch_px = (uint32_t)(pitch / 4);
+    g.width       = width;
+    g.height      = height;
 }
 
 /* ---- helpers --------------------------------------------------- */
@@ -869,7 +906,8 @@ void gfx_cursor_overlay_move(int x, int y) {
  * Used everywhere unless a higher-fidelity backend (virtio-gpu, etc.)
  * has called gfx_set_backend(). */
 static void limine_flip(void) {
-    if (!g.fb) return;
+    uint32_t *fb = gfx_hw_fb_ptr();
+    if (!fb || !gfx_hw_fb_writable()) return;
     /* When the hardware pitch matches our width (the common QEMU case)
      * one big memcpy beats H separate ones. Otherwise walk row by row. */
     if (g.fb_pitch_px == g.width) {
@@ -889,7 +927,8 @@ static void limine_flip(void) {
  * after present_rect either way is fine -- worst case we double-push
  * a few pixels, never crash). */
 static void limine_present_rect(int x, int y, int w, int h) {
-    if (!g.fb || w <= 0 || h <= 0) return;
+    uint32_t *fb = gfx_hw_fb_ptr();
+    if (!fb || !gfx_hw_fb_writable() || w <= 0 || h <= 0) return;
     if (x < 0 || y < 0) return;
     if (x + w > (int)g.width)  w = (int)g.width  - x;
     if (y + h > (int)g.height) h = (int)g.height - y;

@@ -528,6 +528,9 @@ void vmm_destroy_user_pml4(uint64_t pml4_phys) {
 
 /* ---- init ---- */
 
+void vmm_post_cr3_hook(void) __attribute__((weak));
+void vmm_post_cr3_hook(void) { }
+
 #define IA32_EFER         0xC0000080u
 #define IA32_EFER_NXE     (1ULL << 11)
 
@@ -640,6 +643,10 @@ void vmm_init(struct limine_memmap_response *memmap) {
 
     write_cr3(g_pml4_phys);
 
+    /* Console may already be live from Limine's tables; the first
+     * kprintf after CR3 would fault if UEFI tagged the FB RESERVED. */
+    vmm_post_cr3_hook();
+
     kprintf("[vmm] CR3 switched. Running on tobyOS page tables.\n");
 }
 
@@ -715,6 +722,25 @@ void vmm_init_and_test(struct limine_memmap_response *memmap) {
     pmm_free_page(scratch_phys);
     kprintf("[vmm] test: unmap clears translation, scratch page freed\n");
     kprintf("[vmm] test: ok\n");
+}
+
+bool vmm_hhdm_ensure_mapped(uint64_t phys, size_t len, uint32_t flags) {
+    if (len == 0) len = PAGE_SIZE;
+    if (!flags)
+        flags = VMM_PRESENT | VMM_WRITE | VMM_NX;
+
+    uint64_t hhdm = g_hhdm;
+    uint64_t lo   = phys & ~((uint64_t)PAGE_SIZE - 1);
+    uint64_t hi   = phys + len;
+    uint64_t hi_pg = (hi + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+
+    for (uint64_t pg = lo; pg < hi_pg; pg += PAGE_SIZE) {
+        uint64_t virt = hhdm + pg;
+        if (vmm_translate(virt) != 0) continue;
+        if (!vmm_map(virt, pg, PAGE_SIZE, flags))
+            return false;
+    }
+    return true;
 }
 
 uint64_t vmm_hhdm_offset(void) {

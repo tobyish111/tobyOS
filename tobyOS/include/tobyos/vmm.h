@@ -114,9 +114,12 @@ uint64_t vmm_set_editor_root(uint64_t pml4_phys);
 /* Return the HHDM base offset. */
 uint64_t vmm_hhdm_offset(void);
 
-/* ---- Phase 1 M1.2: mmap/munmap/mprotect ---- */
+/* Map [phys, phys+len) into HHDM on demand if vmm_init skipped the
+ * region (common on UEFI firmware: framebuffer/ACPI/modules tagged
+ * RESERVED or falling in memmap gaps). Returns false on map failure. */
+bool vmm_hhdm_ensure_mapped(uint64_t phys, size_t len, uint32_t flags);
 
-/* VMA protection flags (matches Linux PROT_*) */
+/* ---- Phase 1 M1.2: mmap/munmap/mprotect ---- */
 #define MMAP_PROT_NONE   0x00
 #define MMAP_PROT_READ   0x01
 #define MMAP_PROT_WRITE  0x02
