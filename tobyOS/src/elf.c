@@ -38,6 +38,7 @@
 #include <tobyos/vmm.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+#include <tobyos/uaccess.h>
 
 #define KERNEL_HALF_MIN 0xFFFF800000000000ULL
 #define USER_HALF_MAX   0x0000800000000000ULL
@@ -292,6 +293,13 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
 
         if (!ensure_writable_pages(virt_lo, virt_hi, user_mode)) return false;
 
+        /* These writes target the (just-mapped) destination address space.
+         * For a user ELF that is user memory, so under SMAP they need a
+         * uaccess window. The loader runs both inside execve (window already
+         * open) and from kernel-context spawn (closed); uaccess_begin/end
+         * save+restore AC so either nests correctly. Harmless for kernel
+         * ELFs (AC doesn't affect kernel-page access). */
+        unsigned long uflags = uaccess_begin();
         if (ph->p_filesz) {
             memcpy((void *)seg_vaddr, bytes + ph->p_offset, ph->p_filesz);
         }
@@ -299,6 +307,7 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
             memset((void *)(seg_vaddr + ph->p_filesz), 0,
                    ph->p_memsz - ph->p_filesz);
         }
+        uaccess_end(uflags);
         loaded++;
     }
 

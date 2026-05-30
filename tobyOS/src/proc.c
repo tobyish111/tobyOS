@@ -58,6 +58,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/panic.h>
 #include <tobyos/klibc.h>
+#include <tobyos/uaccess.h>
 #include <tobyos/file.h>
 #include <tobyos/cap.h>
 #include <tobyos/perf.h>
@@ -368,6 +369,12 @@ static bool pack_user_stack(const struct user_stack_pack *L,
     struct abi_auxv  *auxv_ptr  = (struct abi_auxv *)auxv_va;
     size_t            off       = 0;
 
+    /* All the destinations below are user-half VAs in the new process's
+     * address space; under SMAP they need a uaccess window. Spawn runs in
+     * kernel context (window closed) while execve runs inside the syscall
+     * window (open) -- uaccess_begin/end save+restore AC so both nest. */
+    unsigned long uflags = uaccess_begin();
+
     for (int i = 0; i < L->argc; i++) {
         size_t l = strlen(L->argv[i]) + 1;
         memcpy(pool_ptr + off, L->argv[i], l);
@@ -394,6 +401,8 @@ static bool pack_user_stack(const struct user_stack_pack *L,
 
     /* Write argc. */
     *(uint64_t *)argc_va = (uint64_t)(uint32_t)L->argc;
+
+    uaccess_end(uflags);
 
     *out_rsp = argc_va;
     return true;

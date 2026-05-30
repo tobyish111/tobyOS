@@ -17,7 +17,9 @@ survives clones and any agent can read/update it.
 
 ## Bottom line
 
-**~22% overall Win10 feature parity** (canvas baseline was ~16%).
+**~23% overall Win10 feature parity** (canvas baseline was ~16%; +1 since the initial
+repo version after the 2026-05-30 security-depth work — Argon2id auth, login lockout,
+real signal delivery, and SMAP re-enabled behind a uaccess window).
 
 The percentage understates the real milestone: tobyOS now **boots to the desktop and gets
 on the network on real hardware** (HP EliteDesk 800, Intel CPU). The canvas scored a thing
@@ -41,7 +43,7 @@ honest number.
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
 | Device Drivers | ~12% | ~14% | **Loadable `ET_REL` kernel module loader** (foundational). 6 NIC drivers, AHCI/NVMe/IDE/virtio-blk, xHCI/EHCI/HID/MSC, HDA. No real GPU driver; no signed third-party ecosystem. |
 | GUI / Desktop | ~10% | ~12% | GPU-accelerated compositor path exists **but only active with VirtIO-GPU**; on real Intel iGPU it falls back to the CPU/Limine compositor. Now **usable on hardware** (login no longer flaps; mouse/keyboard work). |
-| Security | ~8% | ~13% | Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** now works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP still disabled** (no stac/clac uaccess wrappers yet). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
+| Security | ~8% | ~15% | Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP re-enabled** behind a syscall-wide stac/clac uaccess window + wrapped loader/argv; validated under QEMU `+smap` (full desktop + sigtest, no #PF). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
 | Power / ACPI | ~6% | ~9% | **RTC driver** → real wall-clock time. ACPI shutdown + partial S3/S4 framework. No full AML power management. |
 | Audio / Media | ~15% | ~15% | Intel HDA + software mixer + decode helpers. Unchanged this round. |
 | App Compatibility | ~2% | ~3% | POSIX libc filled in (`signal.h`, `fork`, `symlink`/`readlink`, real `getuid/gid`, `wait`, `access`) → easier to **port Unix software**. Still own-ELF-only; **zero** Win32/.NET/UWP. |
@@ -58,9 +60,13 @@ dual-stack (link-local); TobyFS journaling; GPU compositor (VirtIO only); loadab
 driver model; POSIX libc surface.
 
 **Real-hardware bring-up (this is what made it actually run):**
-- **SMAP disabled** in `hardening.c` — it was enabled with no `stac`/`clac` uaccess
-  wrappers, so the first kernel access to user memory (`CR2=0x400000`, the ELF load base)
-  #PF'd on real Skylake while QEMU (no SMAP) booted fine. See `memory/realhw-smap-divergence`.
+- **SMAP** — was disabled because it was enabled with no `stac`/`clac` uaccess wrappers,
+  so the first kernel access to user memory (`CR2=0x400000`, the ELF load base) #PF'd on
+  real Skylake while QEMU (no SMAP) booted fine (see `memory/realhw-smap-divergence`).
+  **Now re-enabled** (2026-05-30): the SYSCALL trampoline brackets the whole syscall body
+  in stac/clac, and the out-of-syscall user writers (ELF loader, argv/envp packer) use
+  `uaccess_begin/end`; both gated on `g_smap_on` so non-SMAP CPUs are unaffected. Verified
+  by booting the full desktop and `/bin/sigtest` under `qemu64,+smep,+smap`.
 - **GUI event-type ABI fix** — kernel `GUI_EV_MOUSE_MOVE=1` collided with a stale
   `EV_CLOSE=1` in `user_login` + 8 other apps, so moving the mouse "closed" the window;
   the login service then flapped login↔desktop until disabled. `/bin/login` is built from
@@ -79,9 +85,10 @@ driver model; POSIX libc surface.
    cores idle. (`sched.c` header documents this explicitly.)
 4. **GPU-accelerated desktop on real hardware** — compositor accel only exists for VirtIO,
    not the Intel iGPU path used on the EliteDesk.
-5. **Security depth** — ~~salted/KDF auth~~ (done: Argon2id), ~~login rate-limiting~~
-   (done: lockout), ~~signal *delivery*~~ (done: real frame push + sigreturn). Remaining:
-   re-enabling SMAP behind proper `stac`/`clac` uaccess wrappers; SA_RESTART; job control.
+5. **Security depth** — ~~salted/KDF auth~~ (Argon2id), ~~login rate-limiting~~ (lockout),
+   ~~signal *delivery*~~ (frame push + sigreturn), ~~re-enable SMAP~~ (syscall-wide uaccess
+   window). This bundle is now largely done. Remaining: per-copy uaccess accessors (the
+   window is coarser than Linux's per-`copy_*_user`), SA_RESTART, job control/stop-cont.
 
 ---
 
@@ -91,6 +98,8 @@ driver model; POSIX libc surface.
 - Passwords: now salted Argon2id (was djb2). Still no account lockout / rate-limiting,
   no password policy, and no PAM-style pluggable auth.
 - GPU accel: VirtIO-only; real-HW desktop is CPU-composited.
+- SMAP: enabled, but via a coarse syscall-wide stac/clac window rather than per-copy
+  accessors, so a stray user-pointer deref *inside* a syscall isn't caught (only outside).
 - Signals: user-handler delivery now works (frame push + sigreturn, mask/pending
   honored). Still missing: SA_RESTART syscall restart, job-control stop/cont,
   SA_SIGINFO/siginfo_t, and handler delivery to a pure-CPU-bound process is
@@ -120,3 +129,13 @@ driver model; POSIX libc surface.
   the wrong offset); `fork` now inherits dispositions + clears pending (POSIX). Verified by
   `/bin/sigtest` (build `EXTRA_CFLAGS+=-DSIGTEST_BOOT`): handler runs, context preserved,
   blocked-signal pending/unblock all PASS, no #PF. Security ~11% → ~13%.
+- **2026-05-30** — **SMAP re-enabled** (`include/tobyos/uaccess.h`, `hardening.c`,
+  `syscall_entry.S`, `elf.c`, `proc.c`). The SYSCALL trampoline opens a stac/clac uaccess
+  window around the whole syscall body (survives blocking — proc_switch preserves RFLAGS);
+  the ELF loader and argv/envp packer use `uaccess_begin/end` (save+restore AC, so they
+  nest inside execve's window); the COW copier already uses HHDM (kernel) addresses so
+  needs none. All stac/clac gated on `g_smap_on`, set only after CR4.SMAP goes live, so
+  non-SMAP CPUs (default QEMU) run the identical old path — confirmed booting clean with
+  `[hardening] SMAP not available`. Under `qemu64,+smep,+smap` the full GUI desktop runs
+  19 s with no #PF and `/bin/sigtest` passes. Security ~13% → ~15%. This is the fix the
+  real-Skylake `CR2=0x400000` #PF was waiting on.

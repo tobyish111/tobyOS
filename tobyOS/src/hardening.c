@@ -28,6 +28,11 @@ static int g_smep_available;
 static int g_smap_available;
 static int g_nx_available;
 
+/* 1 once CR4.SMAP is actually live. Read by the uaccess helpers
+ * (include/tobyos/uaccess.h) and syscall_entry.S to gate stac/clac, which
+ * #UD on CPUs without SMAP. Plain byte so the .S side can `cmpb` it. */
+volatile uint8_t g_smap_on = 0;
+
 static inline void cpuid_query(uint32_t leaf, uint32_t sub,
                                uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d) {
     __asm__ volatile("cpuid"
@@ -56,35 +61,33 @@ void hardening_init(void) {
         kprintf("[hardening] SMEP not available\n");
     }
 
-    /* SMAP is detected but deliberately NOT enabled.
+    /* SMAP (#PF on any supervisor-mode access to a user page unless the AC
+     * flag is set) is now ENABLED behind a uaccess window.
      *
-     * SMAP (#PF on any supervisor-mode access to a user page unless the
-     * AC flag is set via stac/clac) requires every kernel path that
-     * touches user memory -- the ELF loader writing a program image,
-     * sys_write/sys_read copying syscall buffers, argv/envp setup, the
-     * GUI syscalls reading user-supplied strings, etc. -- to bracket
-     * those accesses with stac/clac. tobyOS does none of that today:
-     * it dereferences user pointers directly throughout the syscall and
-     * loader paths.
+     * The kernel touches user memory in two contexts:
+     *   - inside a syscall: the SYSCALL trampoline (syscall_entry.S) brackets
+     *     the whole syscall body in stac/clac, so handlers keep dereferencing
+     *     user pointers directly. The window survives blocking switches
+     *     (proc_context_switch saves/restores RFLAGS).
+     *   - outside a syscall: the ELF loader, argv/envp stack setup, and the
+     *     COW page copier use uaccess_begin()/uaccess_end() (see uaccess.h).
      *
-     * On QEMU's default CPU SMAP is unsupported, so enabling it was a
-     * silent no-op and the bug was invisible. On real SMAP-capable
-     * hardware (e.g. Skylake) the very first user-memory access -- the
-     * ELF loader writing /bin/init to 0x400000 -- faults with CR2 in
-     * the user half, which manifested as the boot-time #PF (vector 14)
-     * on real machines while QEMU booted fine.
-     *
-     * Until proper stac/clac uaccess wrappers exist, leave SMAP off.
-     * SMEP and NX below stay on -- the kernel never executes user pages,
-     * so they cost nothing and keep that mitigation in place. */
+     * stac/clac #UD on CPUs without SMAP, so they are all gated on g_smap_on,
+     * which we only set after CR4.SMAP is confirmed live below. On QEMU's
+     * default (no-SMAP) CPU this stays 0 and every stac/clac is skipped, so
+     * the default boot path is byte-for-byte unchanged. */
     if (g_smap_available) {
-        kprintf("[hardening] SMAP available but left disabled "
-                "(no stac/clac uaccess wrappers yet)\n");
+        cr4 |= CR4_SMAP;
+        kprintf("[hardening] SMAP enabled (uaccess window active)\n");
     } else {
         kprintf("[hardening] SMAP not available\n");
     }
 
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+
+    /* Only now that CR4.SMAP is actually set is it safe to let stac/clac
+     * execute. Order matters: the mov-to-cr4 above must complete first. */
+    if (g_smap_available) g_smap_on = 1;
 
     if (g_nx_available) {
         uint64_t efer = rdmsr(MSR_IA32_EFER);
