@@ -56,9 +56,30 @@ void hardening_init(void) {
         kprintf("[hardening] SMEP not available\n");
     }
 
+    /* SMAP is detected but deliberately NOT enabled.
+     *
+     * SMAP (#PF on any supervisor-mode access to a user page unless the
+     * AC flag is set via stac/clac) requires every kernel path that
+     * touches user memory -- the ELF loader writing a program image,
+     * sys_write/sys_read copying syscall buffers, argv/envp setup, the
+     * GUI syscalls reading user-supplied strings, etc. -- to bracket
+     * those accesses with stac/clac. tobyOS does none of that today:
+     * it dereferences user pointers directly throughout the syscall and
+     * loader paths.
+     *
+     * On QEMU's default CPU SMAP is unsupported, so enabling it was a
+     * silent no-op and the bug was invisible. On real SMAP-capable
+     * hardware (e.g. Skylake) the very first user-memory access -- the
+     * ELF loader writing /bin/init to 0x400000 -- faults with CR2 in
+     * the user half, which manifested as the boot-time #PF (vector 14)
+     * on real machines while QEMU booted fine.
+     *
+     * Until proper stac/clac uaccess wrappers exist, leave SMAP off.
+     * SMEP and NX below stay on -- the kernel never executes user pages,
+     * so they cost nothing and keep that mitigation in place. */
     if (g_smap_available) {
-        cr4 |= CR4_SMAP;
-        kprintf("[hardening] SMAP enabled\n");
+        kprintf("[hardening] SMAP available but left disabled "
+                "(no stac/clac uaccess wrappers yet)\n");
     } else {
         kprintf("[hardening] SMAP not available\n");
     }

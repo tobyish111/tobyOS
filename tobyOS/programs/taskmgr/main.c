@@ -28,7 +28,7 @@ static long sys_kill(int pid,int sig){return sc2(ABI_SYS_KILL,pid,sig);}
 static long sys_system_metrics(void*out){return sc1(ABI_SYS_SYSTEM_METRICS,(long)out);}
 
 struct gui_event { int type,x,y; unsigned char button,key,_pad[2]; };
-#define EV_CLOSE 1
+#define EV_CLOSE 5  /* match kernel GUI_EV_CLOSE; type 1 is MOUSE_MOVE */
 #define EV_MOUSE_DOWN 2
 #define EV_KEY 4
 

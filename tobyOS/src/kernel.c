@@ -226,8 +226,9 @@ static volatile uint64_t requests_end[] = {
 
 static void early_init(void) {
     serial_init();
+    serial_puts("\n[boot] tobyOS kernel entry\n");
     bootlog_init();
-    kprintf("[boot] serial up\n");
+    kprintf("[boot] serial up (COM1 + debugcon)\n");
     /* Milestone 28A: bring the structured-log ring up as early as
      * possible so every subsequent subsystem can SLOG_INFO/etc. into
      * a real ring and not just the early fallback. The ring is BSS-
@@ -271,25 +272,6 @@ static void framebuffer_init(void) {
      * Early boot output goes to serial only. */
 }
 
-/* Bring the text console up once HHDM is known. */
-static void framebuffer_console_init(void) {
-    if (!fb_req.response || fb_req.response->framebuffer_count == 0)
-        return;
-
-    struct limine_framebuffer *fb = fb_req.response->framebuffers[0];
-    if (!fb || fb->bpp != 32)
-        return;
-
-    limine_fb_canonical(fb);
-    kprintf("[boot] framebuffer canonical virt=%p\n", fb->address);
-
-    if (!console_init(fb->address, fb->pitch, fb->width, fb->height)) {
-        kprintf("[boot] WARNING: console_init rejected the framebuffer\n");
-        return;
-    }
-    kprintf("[boot] console up\n");
-}
-
 /* Map the GOP framebuffer into our HHDM and refresh console/gfx pointers.
  * Safe to call multiple times (post-CR3 hook, before gfx, before desktop). */
 static void framebuffer_sync_mapping(void) {
@@ -312,10 +294,24 @@ static void framebuffer_sync_mapping(void) {
                                 VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_NOCACHE)) {
         kprintf("[boot] WARNING: framebuffer remap failed at phys %p\n",
                 (void *)phys);
+        console_notify_cr3_switch();
         return;
     }
 
-    (void)console_init(fb->address, fb->pitch, fb->width, fb->height);
+    {
+        bool had_console = console_ready();
+        if (console_init(fb->address, fb->pitch, fb->width, fb->height)) {
+            if (!had_console) {
+                kprintf("[boot] console up (%lux%lu text cells)\n",
+                        (unsigned long)(fb->width / 8),
+                        (unsigned long)(fb->height / 8));
+            }
+        } else if (!had_console) {
+            kprintf("[boot] WARNING: console_init failed on framebuffer\n");
+        }
+    }
+    kprintf("[boot] framebuffer sync: phys=%p virt=%p size=%lu\n",
+            (void *)phys, fb->address, (unsigned long)size);
     gfx_sync_framebuffer(fb->address, fb->pitch,
                          (uint32_t)fb->width, (uint32_t)fb->height);
 }
@@ -336,6 +332,7 @@ static void framebuffer_validate_mapping(void) {
 /* Called from vmm_init immediately after CR3 switch, before any
  * post-switch kprintf that might write through the framebuffer. */
 void vmm_post_cr3_hook(void) {
+    console_notify_cr3_switch();
     framebuffer_validate_mapping();
 }
 
@@ -622,7 +619,14 @@ static void pmm_init_and_test(void) {
     pmm_init((struct limine_memmap_response *)memmap_req.response,
              hhdm_req.response->offset);
 
-    framebuffer_console_init();
+    /* IMPORTANT: do NOT bring the framebuffer console up here. On real
+     * hardware UEFI, Limine does not always identity-map the lower
+     * half, so any code path that walks the page tables before
+     * vmm_init builds them (e.g. console_fb_writable -> vmm_translate)
+     * will dereference NULL or read garbage and #PF. The post-CR3
+     * hook (framebuffer_validate_mapping) brings the console up
+     * once tobyOS's own PML4 is live, with the FB explicitly mapped
+     * into HHDM. */
 
     /* Round-trip smoke test: alloc 4 pages, prove they're distinct, free
      * them, prove the free count returns to baseline. */

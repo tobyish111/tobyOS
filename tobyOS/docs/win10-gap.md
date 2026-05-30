@@ -1,0 +1,99 @@
+# tobyOS vs Windows 10 — Living Gap Analysis
+
+**Purpose:** a repo-tracked, updatable assessment of how far tobyOS is from Windows 10
+functionality. Originally a Cursor "canvas" (outside the git tree); moved here so it
+survives clones and any agent can read/update it.
+
+**How to use / update this file**
+- Numbers are *feature-coverage* parity estimates (not benchmarks), per subsystem, vs Win10.
+- "Wired" means the feature initializes at boot and is reachable — verified against
+  `src/kernel.c` call sites and boot logs — **not** that it is Windows-10-robust under load.
+- When you change a subsystem, update its row, bump the date, and add a line to the Changelog.
+- Be honest: "code present" ≠ "wired" ≠ "robust". Distinguish them.
+
+**Last updated:** 2026-05-30
+
+---
+
+## Bottom line
+
+**~22% overall Win10 feature parity** (canvas baseline was ~16%).
+
+The percentage understates the real milestone: tobyOS now **boots to the desktop and gets
+on the network on real hardware** (HP EliteDesk 800, Intel CPU). The canvas scored a thing
+that only ran in QEMU. It is now a real, bootable, networked OS — a qualitative jump even
+though the parity bar barely moves.
+
+A prior estimate of "30–35%" was optimistic: it counted code that is present but either
+doesn't help real hardware (GPU compositing), is shallow (djb2 passwords, link-local-only
+IPv6), or adds no capability (SMP that still won't run apps on other cores). ~22% is the
+honest number.
+
+---
+
+## Parity by subsystem
+
+| Subsystem | Canvas | Now | Notes |
+|---|---|---|---|
+| Scheduler / SMP | ~12% | ~13% | APs migrate work back to the BSP instead of stranding it, but still **do not run user code** (no per-CPU TSS). Apps are effectively single-core. Preemptive via PIT 1 kHz. No priority classes/MLFQ. |
+| Memory | ~18% | ~24% | `swap_init` wired; **real CoW fork** (`vmm_cow_fork` + `mmap_cow_clone`, no longer eager-copy); demand paging live; ASLR/NX/SMEP. Still bitmap PMM, first-fit heap, no memory compression / large pages. |
+| Filesystem / Storage | ~20% | ~27% | TobyFS: **journaling** (replay on mount), **indirect blocks** (max file 64 KiB → ~4 MiB), **256-entry write-back buffer cache**. VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. Still no NTFS-class streams/ACLs; 4 MiB ≪ 16 TB. |
+| Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
+| Device Drivers | ~12% | ~14% | **Loadable `ET_REL` kernel module loader** (foundational). 6 NIC drivers, AHCI/NVMe/IDE/virtio-blk, xHCI/EHCI/HID/MSC, HDA. No real GPU driver; no signed third-party ecosystem. |
+| GUI / Desktop | ~10% | ~12% | GPU-accelerated compositor path exists **but only active with VirtIO-GPU**; on real Intel iGPU it falls back to the CPU/Limine compositor. Now **usable on hardware** (login no longer flaps; mouse/keyboard work). |
+| Security | ~8% | ~9% | Password auth added but **djb2, unsalted** (not credible). **SMAP currently disabled** (required to boot — no stac/clac uaccess wrappers yet). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
+| Power / ACPI | ~6% | ~9% | **RTC driver** → real wall-clock time. ACPI shutdown + partial S3/S4 framework. No full AML power management. |
+| Audio / Media | ~15% | ~15% | Intel HDA + software mixer + decode helpers. Unchanged this round. |
+| App Compatibility | ~2% | ~3% | POSIX libc filled in (`signal.h`, `fork`, `symlink`/`readlink`, real `getuid/gid`, `wait`, `access`) → easier to **port Unix software**. Still own-ELF-only; **zero** Win32/.NET/UWP. |
+
+---
+
+## What's been done
+
+**Tier 1 (wired & verified live):** swap init; CoW fork; SMP AP work-migration; TobyFS
+indirect blocks; password auth; RTC driver.
+
+**Tier 2 (wired & verified live):** block buffer cache; CUBIC + window scaling; IPv6
+dual-stack (link-local); TobyFS journaling; GPU compositor (VirtIO only); loadable kernel
+driver model; POSIX libc surface.
+
+**Real-hardware bring-up (this is what made it actually run):**
+- **SMAP disabled** in `hardening.c` — it was enabled with no `stac`/`clac` uaccess
+  wrappers, so the first kernel access to user memory (`CR2=0x400000`, the ELF load base)
+  #PF'd on real Skylake while QEMU (no SMAP) booted fine. See `memory/realhw-smap-divergence`.
+- **GUI event-type ABI fix** — kernel `GUI_EV_MOUSE_MOVE=1` collided with a stale
+  `EV_CLOSE=1` in `user_login` + 8 other apps, so moving the mouse "closed" the window;
+  the login service then flapped login↔desktop until disabled. `/bin/login` is built from
+  `programs/user_login/`, not `programs/login/`.
+- **VLAN networking** — the router answers DHCP on 802.1Q VID 591; `eth_recv` de-tags
+  correctly and DHCP now completes on the real LAN.
+
+---
+
+## Remaining gap to Win10 (impact order)
+
+1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
+   and the hardest. Loadable-module infra exists but no driver ecosystem.
+2. **App compatibility (~3%)** — no Win32/POSIX-compat runtime → no software ecosystem.
+3. **Real multi-core execution** — APs need per-CPU TSS to run user threads; today extra
+   cores idle. (`sched.c` header documents this explicitly.)
+4. **GPU-accelerated desktop on real hardware** — compositor accel only exists for VirtIO,
+   not the Intel iGPU path used on the EliteDesk.
+5. **Security depth** — salted/KDF auth, working signal *delivery* (kernel side is partial),
+   and re-enabling SMAP behind proper `stac`/`clac` uaccess wrappers.
+
+---
+
+## Known shallow / "present but not robust" items
+- SMP: cores boot but never run user code.
+- IPv6: link-local only — no SLAAC/DHCPv6/global addressing.
+- Passwords: djb2, unsalted.
+- GPU accel: VirtIO-only; real-HW desktop is CPU-composited.
+- Signals: syscalls exist; user-handler delivery is partial.
+- TobyFS journaling/swap/CoW: wired but not stress-tested under crash/pressure/load.
+
+---
+
+## Changelog
+- **2026-05-30** — Initial repo-tracked version. Re-scored after Tier 1/2 wiring + real-HW
+  bring-up (SMAP, GUI event ABI, VLAN DHCP). Overall ~16% → ~22%.

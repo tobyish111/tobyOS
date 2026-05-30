@@ -1,7 +1,9 @@
 /* serial.h -- early debug output over COM1 + QEMU's 0xE9 debugcon.
  *
- * Both sinks are written from a single function so debug.log and
- * serial.log always stay in sync.
+ * Both sinks are written from serial_putc(). COM1 is initialised on the
+ * first write (and serial_init() is idempotent) so the entire boot path
+ * from _start onward lands on the host serial backend when QEMU is
+ * started with -serial.
  */
 
 #ifndef TOBYOS_SERIAL_H

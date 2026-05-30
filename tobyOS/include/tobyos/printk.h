@@ -2,7 +2,7 @@
  *
  * Output is fanned out to:
  *   - QEMU debugcon (0xE9)  -- always
- *   - COM1 serial            -- after serial_init()
+ *   - COM1 serial            -- from first serial_putc (lazy init)
  *   - framebuffer console    -- after console_init() succeeds
  *
  * Supported conversions:

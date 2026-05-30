@@ -40,12 +40,17 @@ static struct {
     uint32_t  fg;
     uint32_t  bg;
     bool      ready;
+    bool      fb_mapped;          /* cached: FB writable under live page tables */
     bool      cursor_visible;
     bool      cursor_drawn;
     uint64_t  last_blink_tick;
 } g;
 
 bool console_ready(void) { return g.ready; }
+
+void console_notify_cr3_switch(void) {
+    g.fb_mapped = false;
+}
 
 /* Resolve the stored pointer to a kernel-virtual address. Before pmm_init
  * g_hhdm is zero and Limine's own map makes the raw pointer work; after
@@ -60,19 +65,24 @@ static uint32_t *console_fb_ptr(void) {
     return (uint32_t *)(uintptr_t)addr;
 }
 
-static bool console_fb_writable(void) {
+/* Re-evaluate whether the FB is reachable under the current page
+ * tables. Called once at console_init and again after vmm_post_cr3_hook
+ * remaps the FB. The hot path (put_pixel) reads g.fb_mapped only -- we
+ * must never walk page tables per pixel. */
+static void console_refresh_mapping(void) {
     uint32_t *fb = console_fb_ptr();
-    if (!fb) return false;
+    if (!fb) { g.fb_mapped = false; return; }
 
-    uint64_t hhdm = pmm_hhdm_offset();
-    if (hhdm == 0)
-        return true;   /* still on Limine page tables */
+    /* Before vmm_init builds a PML4, we're still on Limine's tables.
+     * Trust those and write the FB directly. vmm_translate is unsafe
+     * here -- g_pml4 is NULL until vmm_init. */
+    if (vmm_kernel_pml4_phys() == 0) { g.fb_mapped = true; return; }
 
-    return vmm_translate((uint64_t)(uintptr_t)fb) != 0;
+    g.fb_mapped = vmm_translate((uint64_t)(uintptr_t)fb) != 0;
 }
 
 static inline void put_pixel(uint32_t x, uint32_t y, uint32_t color) {
-    if (!console_fb_writable()) return;
+    if (!g.fb_mapped) return;
     uint32_t *fb = console_fb_ptr();
     fb[y * g.pitch_px + x] = color;
 }
@@ -103,7 +113,7 @@ static void draw_glyph(uint32_t col, uint32_t row, char c) {
 }
 
 static void cursor_xor_toggle(void) {
-    if (!console_fb_writable()) return;
+    if (!g.fb_mapped) return;
     if (g.cur_col >= g.cols || g.cur_row >= g.rows) return;
 
     uint32_t *fb = console_fb_ptr();
@@ -122,7 +132,7 @@ static void cursor_undraw(void) {
 }
 
 static void scroll_up_one_row(void) {
-    if (!console_fb_writable()) return;
+    if (!g.fb_mapped) return;
 
     uint32_t *fb = console_fb_ptr();
     uint32_t pitch_bytes = g.pitch_px * 4u;
@@ -171,6 +181,7 @@ bool console_init(void *fb, uint64_t pitch, uint64_t width, uint64_t height) {
     g.cursor_drawn    = false;
     g.last_blink_tick = 0;
     g.ready           = true;
+    console_refresh_mapping();
     console_clear();
     return true;
 }

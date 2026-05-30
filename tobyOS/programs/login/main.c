@@ -97,10 +97,16 @@ struct gui_event {
     unsigned char key;
     unsigned char _pad[2];
 };
-#define EV_CLOSE      1
+/* GUI event types -- MUST match <tobyos/gui.h> GUI_EV_*. A mouse-move
+ * event is type 1; older code defined EV_CLOSE=1, which made the login
+ * window exit (and the login service flap between login/desktop the
+ * moment the pointer moved). Keep these in lockstep with the kernel. */
+#define EV_MOUSE_MOVE 1
 #define EV_MOUSE_DOWN 2
+#define EV_MOUSE_UP   3
 #define EV_KEY        4
-#define EV_RESIZE     5
+#define EV_CLOSE      5
+#define EV_RESIZE     6
 
 #define WIN_MAXIMIZED 2
 
@@ -254,7 +260,12 @@ int main(void)
     struct gui_event ev;
     for (;;) {
         if (gui_poll(fd, &ev) > 0) {
-            if (ev.type == EV_CLOSE) break;
+            /* The login screen is the session gateway -- it must not be
+             * dismissable. Ignore EV_CLOSE (Alt+F4, stray close events)
+             * so the only way out is a successful sign-in (do_login execs
+             * the shell and exits). This also stops the login service
+             * from flapping between login and the bare desktop. */
+            if (ev.type == EV_CLOSE) continue;
 
             if (ev.type == EV_MOUSE_DOWN) {
                 int fx = px + (PANEL_W - FIELD_W) / 2;

@@ -44,4 +44,8 @@ void console_backspace(void);
  * is fine -- we only diff and threshold it). Cheap when nothing changes. */
 void console_tick(uint64_t ticks, uint32_t hz);
 
+/* Called immediately after CR3 switches to tobyOS page tables. Clears
+ * the cached "FB is mapped" flag until framebuffer_sync remaps it. */
+void console_notify_cr3_switch(void);
+
 #endif /* TOBYOS_CONSOLE_H */

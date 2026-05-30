@@ -159,19 +159,27 @@ static void print_regs(const struct panic_regs *r) {
  * giant "KERNEL PANIC" banner. Good enough as a "the box is dead"
  * indicator a person standing nearby will recognise. */
 static void paint_panic_screen(void) {
+    /* Fan the panic banner through kputc so it always hits COM1/serial,
+     * not only the framebuffer console. */
+    for (int row = 0; row < 3; row++) {
+        for (int col = 0; col < 80; col++) kputc('#');
+        kputc('\n');
+    }
+    kputc('\n');
+    const char *title = "                 KERNEL PANIC -- tobyOS halted";
+    for (const char *p = title; *p; p++) kputc(*p);
+    kputc('\n');
+    kputc('\n');
+
     if (!console_ready()) return;
-    /* Clear so we get a visually-distinct full-screen banner. */
     console_clear();
-    console_set_color(0x00FFFFFFu);  /* bright white */
-    /* Big banner. Eight rows of '#' for emphasis. */
+    console_set_color(0x00FFFFFFu);
     for (int row = 0; row < 3; row++) {
         for (int col = 0; col < 80; col++) console_putc('#');
         console_putc('\n');
     }
     console_putc('\n');
-    console_set_color(0x00FF6060u);  /* hot red, used by the body */
-    /* Centred-ish title. */
-    const char *title = "                 KERNEL PANIC -- tobyOS halted";
+    console_set_color(0x00FF6060u);
     for (const char *p = title; *p; p++) console_putc(*p);
     console_putc('\n');
     console_putc('\n');

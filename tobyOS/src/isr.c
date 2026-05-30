@@ -13,6 +13,47 @@
 #include <tobyos/proc.h>
 #include <tobyos/vmm.h>
 #include <tobyos/page_fault.h>
+#include <tobyos/pmm.h>
+
+/* During pid-0 bring-up, demand-map HHDM mirror gaps (UEFI memmap
+ * holes, GOP framebuffer tagged RESERVED, freshly PMM'd pages). */
+static bool kernel_boot_demand_map(uint64_t fault_addr) {
+    struct proc *p = current_proc();
+    if (!p || p->pid != 0)
+        return false;
+    if (vmm_kernel_pml4_phys() == 0)
+        return false;
+
+    uint64_t hhdm = vmm_hhdm_offset();
+    if (hhdm == 0)
+        return false;
+
+    uint64_t page = fault_addr & ~((uint64_t)PAGE_SIZE - 1);
+    uint64_t phys;
+    uint32_t flags = VMM_PRESENT | VMM_WRITE | VMM_NX;
+
+    if (fault_addr >= hhdm) {
+        phys = page - hhdm;
+    } else if (fault_addr < 0x100000000ULL) {
+        /* Code still dereferencing a raw physical GOP address. Map the
+         * page into HHDM and alias it at the low virt the caller used. */
+        phys = page;
+        flags |= VMM_NOCACHE;
+        if (vmm_translate(hhdm + phys) == 0) {
+            if (!vmm_hhdm_ensure_mapped(phys, PAGE_SIZE, flags))
+                return false;
+        }
+        if (vmm_translate(page) == 0) {
+            if (!vmm_map(page, phys, PAGE_SIZE, flags))
+                return false;
+        }
+        return true;
+    } else {
+        return false;
+    }
+
+    return vmm_hhdm_ensure_mapped(phys, PAGE_SIZE, flags);
+}
 
 static const char *exc_name(uint64_t v) {
     static const char *names[32] = {
@@ -78,13 +119,17 @@ static void default_exception(struct regs *r) {
 
     /* Phase 1 M1.2: demand paging for page faults (vector 14).
      * Try to handle the fault via the VMA/mmap system before killing. */
-    if (r->vector == 14 && from_user) {
+    if (r->vector == 14) {
         uint64_t fault_addr = read_cr2();
-        if (page_fault_handler(fault_addr, r->error_code, current_proc())) {
-            return; /* fault resolved via COW / demand-zero / swap-in */
-        }
-        if (mmap_handle_page_fault(fault_addr, r->error_code)) {
-            return; /* fault resolved via mmap demand paging */
+        if (from_user) {
+            if (page_fault_handler(fault_addr, r->error_code, current_proc())) {
+                return; /* fault resolved via COW / demand-zero / swap-in */
+            }
+            if (mmap_handle_page_fault(fault_addr, r->error_code)) {
+                return; /* fault resolved via mmap demand paging */
+            }
+        } else if (kernel_boot_demand_map(fault_addr)) {
+            return;
         }
     }
 

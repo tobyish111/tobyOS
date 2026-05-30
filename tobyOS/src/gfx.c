@@ -184,6 +184,8 @@ static bool gfx_hw_fb_writable(void) {
     if (!fb) return false;
     uint64_t hhdm = pmm_hhdm_offset();
     if (hhdm == 0) return true;
+    /* vmm_init has not built a PML4 yet -- still on Limine tables. */
+    if (vmm_kernel_pml4_phys() == 0) return true;
     return vmm_translate((uint64_t)(uintptr_t)fb) != 0;
 }
 
@@ -839,7 +841,9 @@ static bool cursor_overlay_supported(void) {
 }
 
 static inline uint32_t *fb_pixel_ptr(int x, int y) {
-    return &g.fb[(uint32_t)y * g.fb_pitch_px + (uint32_t)x];
+    uint32_t *fb = gfx_hw_fb_ptr();
+    if (!fb) return g.fb;
+    return &fb[(uint32_t)y * g.fb_pitch_px + (uint32_t)x];
 }
 
 void gfx_cursor_overlay_hide(void) {
@@ -911,11 +915,11 @@ static void limine_flip(void) {
     /* When the hardware pitch matches our width (the common QEMU case)
      * one big memcpy beats H separate ones. Otherwise walk row by row. */
     if (g.fb_pitch_px == g.width) {
-        memcpy(g.fb, g.back, (size_t)g.width * g.height * 4u);
+        memcpy(fb, g.back, (size_t)g.width * g.height * 4u);
         return;
     }
     for (uint32_t row = 0; row < g.height; row++) {
-        memcpy(&g.fb[row * g.fb_pitch_px],
+        memcpy(&fb[row * g.fb_pitch_px],
                &g.back[row * g.width],
                (size_t)g.width * 4u);
     }
@@ -934,7 +938,7 @@ static void limine_present_rect(int x, int y, int w, int h) {
     if (y + h > (int)g.height) h = (int)g.height - y;
     if (w <= 0 || h <= 0) return;
     for (int row = 0; row < h; row++) {
-        memcpy(&g.fb [(uint32_t)(y + row) * g.fb_pitch_px + (uint32_t)x],
+        memcpy(&fb[(uint32_t)(y + row) * g.fb_pitch_px + (uint32_t)x],
                &g.back[(uint32_t)(y + row) * g.width      + (uint32_t)x],
                (size_t)w * 4u);
     }

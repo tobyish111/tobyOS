@@ -1,120 +1,1088 @@
-[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU DVD-ROM QM00003 " from PciRoot(0x0)/Pci(0x1,0x1)/Ata(Secondary,Master,0x0)
-BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00003 " from PciRoot(0x0)/Pci(0x1,0x1)/Ata(Secondary,Master,0x0)
-[01;01H[01;01H[01;01H[2J[01;01H[01;01H[01;01H[01;01H[02;01H[02;27H[0m[36m[40mL[02;28Hi[02;29Hm[02;30Hi[02;31Hn[02;32He[02;33H [02;34H1[02;35H1[02;36H.[02;37H4[02;38H.[02;39H0[02;40H [02;41H([02;42Hx[02;43H8[02;44H6[02;45H-[02;46H6[02;47H4[02;48H,[02;49H [02;50HU[02;51HE[02;52HF[02;53HI[02;54H)[02;55H[0m[37m[40m[02;01H[03;01H[03;01H[04;01H[04;01H[05;01H[05;01H[06;01H[13;01H [13;02H [13;03H [13;04H [13;05H [13;06H [13;07H [13;08H [13;09H [13;10H [13;11H [13;12H [13;13H [13;14H [13;15H [13;16H [13;17H [13;18H [13;19H [13;20H [13;21H [13;22H [13;23H [13;24H [13;25H [13;26H [13;27H [13;28H [13;29H [13;30H [13;31H [13;32H [13;33H [13;34H [13;35H [13;36H[0m[30m[47m [13;37Ht[13;38Ho[13;39Hb[13;40Hy[13;41HO[13;42HS[13;43H [13;44H[0m[37m[40m[13;01H[14;01H[04;01H [04;02H [04;03H [04;04H [04;05H[0m[32m[40mA[04;06HR[04;07HR[04;08HO[04;09HW[04;10HS[04;11H[0m[37m[40m [04;12HS[04;13He[04;14Hl[04;15He[04;16Hc[04;17Ht[04;18H [04;19H [04;20H [04;21H [04;22H[0m[32m[40mE[04;23HN[04;24HT[04;25HE[04;26HR[04;27H[0m[37m[40m [04;28HB[04;29Ho[04;30Ho[04;31Ht[04;32H [04;33H [04;34H [04;35H [04;36H[0m[32m[40mE[04;37H[0m[37m[40m [04;38HE[04;39Hd[04;40Hi[04;41Ht[04;42H[04;44H[0m[32m[40mS[04;45H[0m[37m[40m [04;46HF[04;47Hi[04;48Hr[04;49Hm[04;50Hw[04;51Ha[04;52Hr[04;53He[04;54H [04;55HS[04;56He[04;57Ht[04;58Hu[04;59Hp[04;60H[04;64H[0m[32m[40mB[04;65H[0m[37m[40m [04;66HB[04;67Hl[04;68Ha[04;69Hn[04;70Hk[04;71H [04;72HE[04;73Hn[04;74Ht[04;75Hr[04;76Hy[04;77H[14;01H[14;01H[15;01H[15;01H[16;01H[24;01H[24;01H [24;02H [24;03H [24;04H [24;05H [24;06H [24;07H [24;08H [24;09H [24;10H [24;11H [24;12H [24;13H [24;14H [24;15H [24;16H [24;17H [24;18H [24;19H [24;20H [24;21H [24;22H [24;23H [24;24H [24;25H [24;26H [24;27H [24;28H [24;29H [24;30H [24;31H [24;32H [24;33H [24;34H [24;35H [24;36H [24;37H [24;38H [24;39H [24;40H [24;41H [24;42H [24;43H [24;44H [24;45H [24;46H [24;47H [24;48H [24;49H [24;50H [24;51H [24;52H [24;53H [24;54H [24;55H [24;56H [24;57H [24;58H [24;59H [24;60H [24;61H [24;62H [24;63H [24;64H [24;65H [24;66H [24;67H [24;68H [24;69H [24;70H [24;71H [24;72H [24;73H [24;74H [24;75H [24;76H [24;77H [24;78H [24;79H [24;80H[24;01H[0m[32m[40mB[24;02Ho[24;03Ho[24;04Ht[24;05Hi[24;06Hn[24;07Hg[24;08H [24;09Ha[24;10Hu[24;11Ht[24;12Ho[24;13Hm[24;14Ha[24;15Ht[24;16Hi[24;17Hc[24;18Ha[24;19Hl[24;20Hl[24;21Hy[24;22H [24;23Hi[24;24Hn[24;25H [24;26H[1m[32m[40m3[24;27H[0m[32m[40m,[24;28H [24;29Hp[24;30Hr[24;31He[24;32Hs[24;33Hs[24;34H [24;35Ha[24;36Hn[24;37Hy[24;38H [24;39Hk[24;40He[24;41Hy[24;42H [24;43Ht[24;44Ho[24;45H [24;46Hs[24;47Ht[24;48Ho[24;49Hp[24;50H [24;51Ht[24;52Hh[24;53He[24;54H [24;55Hc[24;56Ho[24;57Hu[24;58Hn[24;59Ht[24;60Hd[24;61Ho[24;62Hw[24;63Hn[24;64H.[24;65H.[24;66H.[24;67H[0m[37m[40m[24;01H[24;01H [24;02H [24;03H [24;04H [24;05H [24;06H [24;07H [24;08H [24;09H [24;10H [24;11H [24;12H [24;13H [24;14H [24;15H [24;16H [24;17H [24;18H [24;19H [24;20H [24;21H [24;22H [24;23H [24;24H [24;25H [24;26H [24;27H [24;28H [24;29H [24;30H [24;31H [24;32H [24;33H [24;34H [24;35H [24;36H [24;37H [24;38H [24;39H [24;40H [24;41H [24;42H [24;43H [24;44H [24;45H [24;46H [24;47H [24;48H [24;49H [24;50H [24;51H [24;52H [24;53H [24;54H [24;55H [24;56H [24;57H [24;58H [24;59H [24;60H [24;61H [24;62H [24;63H [24;64H [24;65H [24;66H [24;67H [24;68H [24;69H [24;70H [24;71H [24;72H [24;73H [24;74H [24;75H [24;76H [24;77H [24;78H [24;79H [24;80H[24;01H[0m[32m[40mB[24;02Ho[24;03Ho[24;04Ht[24;05Hi[24;06Hn[24;07Hg[24;08H [24;09Ha[24;10Hu[24;11Ht[24;12Ho[24;13Hm[24;14Ha[24;15Ht[24;16Hi[24;17Hc[24;18Ha[24;19Hl[24;20Hl[24;21Hy[24;22H [24;23Hi[24;24Hn[24;25H [24;26H[1m[32m[40m2[24;27H[0m[32m[40m,[24;28H [24;29Hp[24;30Hr[24;31He[24;32Hs[24;33Hs[24;34H [24;35Ha[24;36Hn[24;37Hy[24;38H [24;39Hk[24;40He[24;41Hy[24;42H [24;43Ht[24;44Ho[24;45H [24;46Hs[24;47Ht[24;48Ho[24;49Hp[24;50H [24;51Ht[24;52Hh[24;53He[24;54H [24;55Hc[24;56Ho[24;57Hu[24;58Hn[24;59Ht[24;60Hd[24;61Ho[24;62Hw[24;63Hn[24;64H.[24;65H.[24;66H.[24;67H[0m[37m[40m[24;01H[24;01H [24;02H [24;03H [24;04H [24;05H [24;06H [24;07H [24;08H [24;09H [24;10H [24;11H [24;12H [24;13H [24;14H [24;15H [24;16H [24;17H [24;18H [24;19H [24;20H [24;21H [24;22H [24;23H [24;24H [24;25H [24;26H [24;27H [24;28H [24;29H [24;30H [24;31H [24;32H [24;33H [24;34H [24;35H [24;36H [24;37H [24;38H [24;39H [24;40H [24;41H [24;42H [24;43H [24;44H [24;45H [24;46H [24;47H [24;48H [24;49H [24;50H [24;51H [24;52H [24;53H [24;54H [24;55H [24;56H [24;57H [24;58H [24;59H [24;60H [24;61H [24;62H [24;63H [24;64H [24;65H [24;66H [24;67H [24;68H [24;69H [24;70H [24;71H [24;72H [24;73H [24;74H [24;75H [24;76H [24;77H [24;78H [24;79H [24;80H[24;01H[0m[32m[40mB[24;02Ho[24;03Ho[24;04Ht[24;05Hi[24;06Hn[24;07Hg[24;08H [24;09Ha[24;10Hu[24;11Ht[24;12Ho[24;13Hm[24;14Ha[24;15Ht[24;16Hi[24;17Hc[24;18Ha[24;19Hl[24;20Hl[24;21Hy[24;22H [24;23Hi[24;24Hn[24;25H [24;26H[1m[32m[40m1[24;27H[0m[32m[40m,[24;28H [24;29Hp[24;30Hr[24;31He[24;32Hs[24;33Hs[24;34H [24;35Ha[24;36Hn[24;37Hy[24;38H [24;39Hk[24;40He[24;41Hy[24;42H [24;43Ht[24;44Ho[24;45H [24;46Hs[24;47Ht[24;48Ho[24;49Hp[24;50H [24;51Ht[24;52Hh[24;53He[24;54H [24;55Hc[24;56Ho[24;57Hu[24;58Hn[24;59Ht[24;60Hd[24;61Ho[24;62Hw[24;63Hn[24;64H.[24;65H.[24;66H.[24;67H[0m[37m[40m[01;01Hl[01;02Hi[01;03Hm[01;04Hi[01;05Hn[01;06He[01;07H:[01;08H [01;09HL[01;10Ho[01;11Ha[01;12Hd[01;13Hi[01;14Hn[01;15Hg[01;16H [01;17He[01;18Hx[01;19He[01;20Hc[01;21Hu[01;22Ht[01;23Ha[01;24Hb[01;25Hl[01;26He[01;27H [01;28H`[01;29Hb[01;30Ho[01;31Ho[01;32Ht[01;33H([01;34H)[01;35H:[01;36H/[01;37Hb[01;38Ho[01;39Ho[01;40Ht[01;41H/[01;42Ht[01;43Ho[01;44Hb[01;45Hy[01;46Ho[01;47Hs[01;48H.[01;49Hb[01;50Hi[01;51Hn[01;52H`[01;53H.[01;54H.[01;55H.[01;56H[01;01H[02;01Hl[02;02Hi[02;03Hm[02;04Hi[02;05Hn[02;06He[02;07H:[02;08H [02;09HP[02;10Hh[02;11Hy[02;12Hs[02;13Hi[02;14Hc[02;15Ha[02;16Hl[02;17H [02;18Hb[02;19Ha[02;20Hs[02;21He[02;22H:[02;23H [02;24H [02;25H [02;26H0[02;27Hx[02;28H1[02;29H7[02;30H9[02;31H2[02;32He[02;33H0[02;34H0[02;35H0[02;36H[02;01H[03;01Hl[03;02Hi[03;03Hm[03;04Hi[03;05Hn[03;06He[03;07H:[03;08H [03;09HV[03;10Hi[03;11Hr[03;12Ht[03;13Hu[03;14Ha[03;15Hl[03;16H [03;17Hb[03;18Ha[03;19Hs[03;20He[03;21H:[03;22H [03;23H [03;24H [03;25H [03;26H0[03;27Hx[03;28Hf[03;29Hf[03;30Hf[03;31Hf[03;32Hf[03;33Hf[03;34Hf[03;35Hf[03;36H8[03;37H0[03;38H0[03;39H0[03;40H0[03;41H0[03;42H0[03;43H0[03;44H[03;01H[04;01Hl[04;02Hi[04;03Hm[04;04Hi[04;05Hn[04;06He[04;07H:[04;08H [04;09HS[04;10Hl[04;11Hi[04;12Hd[04;13He[04;14H:[04;15H [04;16H [04;17H [04;18H [04;19H [04;20H [04;21H [04;22H [04;23H [04;24H [04;25H [04;26H0[04;27Hx[04;28H0[04;29H[04;01H[05;01Hl[05;02Hi[05;03Hm[05;04Hi[05;05Hn[05;06He[05;07H:[05;08H [05;09HE[05;10HL[05;11HF[05;12H [05;13He[05;14Hn[05;15Ht[05;16Hr[05;17Hy[05;18H [05;19Hp[05;20Ho[05;21Hi[05;22Hn[05;23Ht[05;24H:[05;25H [05;26H0[05;27Hx[05;28Hf[05;29Hf[05;30Hf[05;31Hf[05;32Hf[05;33Hf[05;34Hf[05;35Hf[05;36H8[05;37H0[05;38H0[05;39H0[05;40H1[05;41H0[05;42H0[05;43H0[05;44H[05;01H[06;01Hl[06;02Hi[06;03Hm[06;04Hi[06;05Hn[06;06He[06;07H:[06;08H [06;09HB[06;10Ha[06;11Hs[06;12He[06;13H [06;14Hr[06;15He[06;16Hv[06;17Hi[06;18Hs[06;19Hi[06;20Ho[06;21Hn[06;22H:[06;23H [06;24H [06;25H [06;26H3[06;27H[06;01H[07;01Hl[07;02Hi[07;03Hm[07;04Hi[07;05Hn[07;06He[07;07H:[07;08H [07;09HR[07;10He[07;11Hq[07;12Hu[07;13He[07;14Hs[07;15Ht[07;16Hs[07;17H [07;18Hc[07;19Ho[07;20Hu[07;21Hn[07;22Ht[07;23H:[07;24H [07;25H [07;26H6[07;27H[07;01H[08;01Hl[08;02Hi[08;03Hm[08;04Hi[08;05Hn[08;06He[08;07H:[08;08H [08;09HT[08;10Ho[08;11Hp[08;12H [08;13Ho[08;14Hf[08;15H [08;16HH[08;17HH[08;18HD[08;19HM[08;20H:[08;21H [08;22H [08;23H [08;24H [08;25H [08;26H0[08;27Hx[08;28H4[08;29H0[08;30H0[08;31H0[08;32H0[08;33H0[08;34H0[08;35H0[08;36H[08;01H[09;01Ha[09;02Hc[09;03Hp[09;04Hi[09;05H:[09;06H [09;07HF[09;08Ho[09;09Hu[09;10Hn[09;11Hd[09;12H [09;13HR[09;14HS[09;15HD[09;16HP[09;17H [09;18Ha[09;19Ht[09;20H [09;21H0[09;22Hx[09;23H1[09;24Hf[09;25H7[09;26H7[09;27He[09;28H0[09;29H0[09;30H0[09;31H[09;01H[10;01Ha[10;02Hc[10;03Hp[10;04Hi[10;05H:[10;06H [10;07HF[10;08Ho[10;09Hu[10;10Hn[10;11Hd[10;12H [10;13HX[10;14HS[10;15HD[10;16HP[10;17H [10;18Ha[10;19Ht[10;20H [10;21H0[10;22Hx[10;23H1[10;24Hf[10;25H7[10;26H7[10;27He[10;28H0[10;29H1[10;30H4[10;31H[10;01H[11;01Hl[11;02Hi[11;03Hm[11;04Hi[11;05Hn[11;06He[11;07H:[11;08H [11;09HL[11;10Ho[11;11Ha[11;12Hd[11;13Hi[11;14Hn[11;15Hg[11;16H [11;17Hm[11;18Ho[11;19Hd[11;20Hu[11;21Hl[11;22He[11;23H [11;24H`[11;25Hb[11;26Ho[11;27Ho[11;28Ht[11;29H([11;30H)[11;31H:[11;32H/[11;33Hb[11;34Ho[11;35Ho[11;36Ht[11;37H/[11;38Hi[11;39Hn[11;40Hi[11;41Ht[11;42Hr[11;43Hd[11;44H.[11;45Ht[11;46Ha[11;47Hr[11;48H`[11;49H.[11;50H.[11;51H.[11;52H[11;01H[12;01Hl[12;02Hi[12;03Hm[12;04Hi[12;05Hn[12;06He[12;07H:[12;08H [12;09HL[12;10Ho[12;11Ha[12;12Hd[12;13Hi[12;14Hn[12;15Hg[12;16H [12;17Hm[12;18Ho[12;19Hd[12;20Hu[12;21Hl[12;22He[12;23H [12;24H`[12;25Hb[12;26Ho[12;27Ho[12;28Ht[12;29H([12;30H)[12;31H:[12;32H/[12;33Hb[12;34Ho[12;35Ho[12;36Ht[12;37H/[12;38Hi[12;39Hn[12;40Hs[12;41Ht[12;42Ha[12;43Hl[12;44Hl[12;45H.[12;46Hi[12;47Hm[12;48Hg[12;49H`[12;50H.[12;51H.[12;52H.[12;53H[12;01H[13;01H[------] [boot] serial up
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+[2J[H
+[2;27H[36mLimine 11.4.0 (x86-64, BIOS)[0m
+
+
+
+[13;1H                                   [7m tobyOS [27m
+[4;1H    [32mARROWS[0m Select    [32mENTER[0m Boot    [32mE[0m Edit[4;64H[32mB[0m Blank Entry[14;1H
+
+[24;1H[2K[32mBooting automatically in [92m3[32m, press any key to stop the countdown...[0m[24;1H[2K[32mBooting automatically in [92m2[32m, press any key to stop the countdown...[0m[24;1H[2K[32mBooting automatically in [92m1[32m, press any key to stop the countdown...[0m[2J[Hlimine: Loading executable `boot():/boot/tobyos.bin`...
+limine: Physical base:   0x57a2000
+limine: Virtual base:    0xffffffff80000000
+limine: Slide:           0x0
+limine: ELF entry point: 0xffffffff80001050
+limine: Base revision:   3
+limine: Requests count:  6
+limine: Top of HHDM:     0x40000000
+acpi: Found RSDP at 0xf52e0
+limine: Loading module `boot():/boot/initrd.tar`...
+limine: Loading module `boot():/boot/install.img`...
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Mode was already set, perfect!
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+paging: 1GiB pages are not supported!
+acpi: Found RSDP at 0xf52e0
+acpi: "DMAR" not found
+acpi: Found RSDP at 0xf52e0
+acpi: "IVRS" not found
+[------] [boot] serial up
 [------] [0] INFO  slog    : slog ready (depth=256, persist=/data/system.log)
 [------] [0] INFO  boot    : tobyOS boot sequence started
-[------] [boot] framebuffer: 1280x800 pitch=5120 bpp=32 addr=0xffff800080000000
-[------] [boot] console up
+[------] [boot] framebuffer: 1280x800 pitch=5120 bpp=32 addr=0xffff8000fd000000
 [------] [gdt] loaded: base=0xffffffff801510a0 limit=55 entries=7
 [------] [gdt] CS=0x08 DS=0x10 (expected CS=0x08 DS=0x10)
 [------] [gdt] user CS=0x23 DS=0x1b  TSS sel=0x28 (TSS slot empty until tss_init)
 [------] [idt] loaded: base=0xffffffff801510f0 limit=4095 (256 gates wired)
 [------] [boot] firing int3 to exercise IDT round-trip...
-[------] [isr] breakpoint hit at rip=0xffffffff8000109f (rflags=0x82)
+[------] [isr] breakpoint hit at rip=0xffffffff800010ef (rflags=0x86)
 [------] [boot] int3 returned cleanly, IDT round-trip OK
 [------] [0] INFO  wdog    : watchdog ready (timeout=10000 ms)
 [0 ms] [pit] channel 0 -> 1000 Hz (divisor=1193)
-[0 ms] [rtc] 2026-05-24 17:31:01 (CMOS clock)
+[0 ms] [rtc] 2026-05-25 20:51:10 (CMOS clock)
 [0 ms] [kbd] PS/2 driver up (IRQ1 enabled + unmasked)
-[1 ms] [boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard, via legacy PIC for early boot)
-[7 ms] [perf] TSC calibrated: 6077 MHz (30388014 cycles in 5000000 ns)
-[7 ms] [boot] HHDM offset = 0xffff800000000000
-[7 ms] [pmm] Limine memmap (37 entries):
-[7 ms]   0x0000000000000000..0x0000000000087000       540 KiB  usable
-[7 ms]   0x0000000000087000..0x0000000000088000         4 KiB  bootloader
-[7 ms]   0x0000000000088000..0x00000000000a0000        96 KiB  usable
-[7 ms]   0x0000000000100000..0x0000000000800000      7168 KiB  usable
-[7 ms]   0x0000000000800000..0x0000000000808000        32 KiB  acpi-nvs
-[7 ms]   0x0000000000808000..0x000000000080b000        12 KiB  usable
-[7 ms]   0x000000000080b000..0x000000000080c000         4 KiB  acpi-nvs
-[7 ms]   0x000000000080c000..0x0000000000811000        20 KiB  usable
-[7 ms]   0x0000000000811000..0x0000000000900000       956 KiB  acpi-nvs
-[8 ms]   0x0000000000900000..0x0000000001780000     14848 KiB  bootloader
-[8 ms]   0x0000000001780000..0x000000001723e000    355064 KiB  usable
-[8 ms]   0x000000001723e000..0x0000000017282000       272 KiB  bootloader
-[8 ms]   0x0000000017282000..0x0000000017682000      4096 KiB  kernel
-[9 ms]   0x0000000017682000..0x0000000017683000         4 KiB  bootloader
-[9 ms]   0x0000000017683000..0x0000000017924000      2692 KiB  kernel
-[9 ms]   0x0000000017924000..0x000000001792e000        40 KiB  bootloader
-[9 ms]   0x000000001792e000..0x0000000019fa3000     39380 KiB  kernel
-[9 ms]   0x0000000019fa3000..0x000000001a13c000      1636 KiB  bootloader
-[9 ms]   0x000000001a13c000..0x000000001bb3c000     26624 KiB  usable
-[9 ms]   0x000000001bb3c000..0x000000001bb5c000       128 KiB  bootloader
-[9 ms]   0x000000001bb5c000..0x000000001e14f000     38860 KiB  usable
-[9 ms]   0x000000001e14f000..0x000000001ea2e000      9084 KiB  bootloader
-[9 ms]   0x000000001ea2e000..0x000000001eaef000       772 KiB  reserved
-[9 ms]   0x000000001eaef000..0x000000001f4ed000     10232 KiB  bootloader
-[9 ms]   0x000000001f4ed000..0x000000001f5ed000      1024 KiB  reserved
-[9 ms]   0x000000001f5ed000..0x000000001f6ed000      1024 KiB  reserved
-[9 ms]   0x000000001f6ed000..0x000000001f76d000       512 KiB  reserved
-[9 ms]   0x000000001f76d000..0x000000001f77f000        72 KiB  acpi-reclaim
-[10 ms]   0x000000001f77f000..0x000000001f7ff000       512 KiB  acpi-nvs
-[10 ms]   0x000000001f7ff000..0x000000001fe80000      6660 KiB  bootloader
-[10 ms]   0x000000001fe80000..0x000000001fe84000        16 KiB  reserved
-[10 ms]   0x000000001fe84000..0x000000001fe86000         8 KiB  acpi-nvs
-[10 ms]   0x000000001fe86000..0x000000001fedc000       344 KiB  bootloader
-[10 ms]   0x000000001fedc000..0x000000001ff60000       528 KiB  reserved
-[10 ms]   0x000000001ff60000..0x0000000020000000       640 KiB  acpi-nvs
-[10 ms]   0x0000000080000000..0x00000000803e8000      4000 KiB  framebuffer
-[10 ms]   0x000000fd00000000..0x0000010000000000  12582912 KiB  reserved
-[11 ms] [pmm] managed:  123215 pages (481 MiB) up to 0x000000001e14f000
-[11 ms] [pmm] usable:   428384 KiB across 37 regions
-[11 ms] [pmm] bitmap:   15402 bytes at phys 0x0000000000000000 (virt 0xffff800000000000), 4 pages
-[11 ms] [pmm] free:     107092 pages (418 MiB) -- used: 16123 pages
-[11 ms] [pmm] test: allocated 0x0000000000004000 0x0000000000005000 0x0000000000006000 0x0000000000007000 (free now=107088)
+[2 ms] [boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard, via legacy PIC for early boot)
+[8 ms] [perf] TSC calibrated: 6007 MHz (30035285 cycles in 5000000 ns)
+[8 ms] [boot] HHDM offset = 0xffff800000000000
+[8 ms] [pmm] Limine memmap (19 entries):
+[8 ms]   0x0000000000001000..0x0000000000061000       384 KiB  bootloader
+[8 ms]   0x0000000000061000..0x000000000009f000       248 KiB  usable
+[9 ms]   0x000000000009fc00..0x00000000000a0000         1 KiB  reserved
+[9 ms]   0x00000000000f0000..0x0000000000100000        64 KiB  reserved
+[9 ms]   0x0000000000100000..0x00000000050f6000     81880 KiB  usable
+[9 ms]   0x00000000050f6000..0x00000000054f6000      4096 KiB  kernel
+[9 ms]   0x00000000054f6000..0x00000000054f7000         4 KiB  bootloader
+[9 ms]   0x00000000054f7000..0x0000000005798000      2692 KiB  kernel
+[9 ms]   0x0000000005798000..0x0000000005799000         4 KiB  bootloader
+[9 ms]   0x0000000005799000..0x000000000579c000        12 KiB  usable
+[9 ms]   0x000000000579c000..0x00000000057a2000        24 KiB  bootloader
+[9 ms]   0x00000000057a2000..0x0000000007e17000     39380 KiB  kernel
+[9 ms]   0x0000000007e17000..0x0000000007f4f000      1248 KiB  bootloader
+[9 ms]   0x0000000007f4f000..0x0000000007f57000        32 KiB  usable
+[9 ms]   0x0000000007f57000..0x0000000007fe0000       548 KiB  bootloader
+[9 ms]   0x0000000007fe0000..0x0000000008000000       128 KiB  reserved
+[9 ms]   0x00000000fd000000..0x00000000fd3e8000      4000 KiB  framebuffer
+[9 ms]   0x00000000fffc0000..0x0000000100000000       256 KiB  reserved
+[9 ms]   0x000000fd00000000..0x0000010000000000  12582912 KiB  reserved
+[10 ms] [pmm] managed:  32599 pages (127 MiB) up to 0x0000000007f57000
+[10 ms] [pmm] usable:   82172 KiB across 19 regions
+[10 ms] [pmm] bitmap:   4075 bytes at phys 0x0000000000061000 (virt 0xffff800000061000), 1 pages
+[10 ms] [pmm] free:     20542 pages (80 MiB) -- used: 12057 pages
+[10 ms] [pmm] test: allocated 0x0000000000062000 0x0000000000063000 0x0000000000064000 0x0000000000065000 (free now=20538)
 [11 ms] [pmm] test: read-back a=0xdeadbeefcafebabe d=0x1122334455667788
-[12 ms] [pmm] test: alloc/free balanced (free=107092 before & after)
-[12 ms] [boot] reserved AP trampoline page at phys 0x0000000000070000
-[13 ms] [vmm] kernel image: virt 0xffffffff80000000..0xffffffff82675000 -> phys 0x000000001792e000 (39380 KiB)
-[13 ms] [vmm] hhdm mirror:  516 MiB across memmap, top phys 0x0000000080400000, 2M pages
-[13 ms] [vmm] new PML4 at phys 0x0000000000004000, switching CR3...
-[13 ms] [vmm] CR3 switched. Running on tobyOS page tables.
-[13 ms] [vmm] test: __text_start 0xffffffff80001000 -> phys 0x000000001792f000
-[14 ms] [vmm] test: __data_start 0xffffffff8010f000 -> phys 0x0000000017a3d000
-[14 ms] [vmm] test: HHDM r/w through new PML4 at phys 0x000000000001e000 OK
-[14 ms] [vmm] test: new mapping at 0xffffc00000000000 <-> phys 0x000000000001e000 verified
-[14 ms] [vmm] test: unmap clears translation, scratch page freed
-[14 ms] [vmm] test: ok
-[14 ms] [heap] up: initial arena 17 pages (67 KiB)
-[14 ms] [heap] start: arenas=1 total=69600 used=0 free=69600  brk=0xffffd00000011000 (region 0xffffd00000000000..0xffffd10000000000)
-[15 ms] [heap] after 8 allocs: arenas=2 used=85616 free=65872 allocs=8
-[15 ms] [heap] after 8 frees: arenas=2 used=0 free=151488 frees=8
-[16 ms] [heap] test: ok (region OK, fragmented 80 KiB alloc OK, round-trip balanced, kcalloc zero-verified)
-[16 ms] [heap] brk now 0xffffd00000025000 (148 KiB virt consumed)
-[16 ms] [tss] installed: tss=0xffffffff8016e300 rsp0=0xffffffff8016e300 (irq stack 16 KiB)
-[16 ms] [sys] EFER.SCE on, STAR=0x0010000800000000, LSTAR=0xffffffff800de064, FMASK=0x700
-[16 ms] [sys] kernel syscall rsp = 0xffffffff8016e300
-[16 ms] [sys] available syscalls: 0=exit  1=write  2=read  3=pipe  4=close  5=yield
-[16 ms] [sys]                     6=socket 7=bind 8=sendto 9=recvfrom
-[16 ms] [sys]                     10=gui_create 11=gui_fill 12=gui_text 13=gui_flip 14=gui_poll_event
-[16 ms] [sys]                     15=term_open 16=term_write 17=term_read 18=fs_readdir 19=fs_readfile 20=exec
-[17 ms] [sys]                     21=setting_get 22=setting_set 23=login 24=logout 25=session_info
-[17 ms] [sys]                     26=getuid 27=getgid 28=username 29=chmod 30=chown
-[17 ms] [sys]   M25A: 31=getpid 32=getppid 33=spawn 34=waitpid 35=open 36=lseek 37=stat 38=fstat
-[18 ms] [sys]         39=dup 40=dup2 41=unlink 42=mkdir 43=brk 44=getcwd 45=chdir 46=getenv
-[18 ms] [sys]         47=nanosleep 48=clock_ms 49=abi_version (ABI v1)
-[18 ms] [acpi] using XSDT @ 0x000000001f77d0e8 (entries=5)
-[19 ms] [acpi] MADT: lapic_phys (32-bit field) = 0x00000000fee00000, legacy_pic=yes
-[19 ms] [acpi]   CPU0: acpi_id=0 apic_id=0 flags=0x1 enabled 
-[19 ms] [acpi]   CPU1: acpi_id=1 apic_id=1 flags=0x1 enabled 
-[19 ms] [acpi]   CPU2: acpi_id=2 apic_id=2 flags=0x1 enabled 
-[19 ms] [acpi]   CPU3: acpi_id=3 apic_id=3 flags=0x1 enabled 
-[19 ms] [acpi]   IOAPIC 0: mmio=0x00000000fec00000 gsi_base=0
-[19 ms] [acpi]   ISO: ISA IRQ0 -> GSI 2 (flags=0x0)
-[19 ms] [acpi]   ISO: ISA IRQ5 -> GSI 5 (flags=0xd)
-[19 ms] [acpi]   ISO: ISA IRQ9 -> GSI 9 (flags=0xd)
-[19 ms] [acpi]   ISO: ISA IRQ10 -> GSI 10 (flags=0xd)
-[20 ms] [acpi]   ISO: ISA IRQ11 -> GSI 11 (flags=0xd)
-[21 ms] [acpi]   LAPIC NMI: acpi_proc=255 lint=1 flags=0x0
-[22 ms] [acpi] enumerated 4 CPU(s) (SMP), 1 IO APIC(s), 5 override(s), 1 NMI source(s)
-[23 ms] [acpi] FADT: pm1a_cnt=0xb004 pm1b_cnt=0x0 smi_cmd=0xb2 acpi_enable=0xf1 sci_int=9
-[24 ms] [acpi] FADT: reset_reg not supported (flags=0x80a5)
-[25 ms] [acpi] DSDT _S5_: SLP_TYPa=0 SLP_TYPb=0 (DSDT 8872 bytes)
-[26 ms] [acpi] AML inventory: dsdt=8836 bytes, 0 SSDT(s)
-[27 ms] [apic] BSP local APIC: phys=0x00000000fee00000 virt=0xffffd20000000000 id=0 ver=0x14
-[28 ms] [apic] SVR=0x1ff  spurious_vec=0xff  timer_vec=0x40 (masked)
-[39 ms] [apic] timer calibrated: ~13517600 ticks/10ms (~1351760 kHz, ~1351760000 Hz/sec)
-[40 ms] [ioapic] chip 0: phys=0x00000000fec00000 virt=0xffffd20000010000 gsi=[0..23] ver=0x20 entries=24
-[41 ms] [irq]   re-route ISA IRQ 0 -> GSI 2 vec=0x20 edge/ahigh
-[42 ms] [irq]   re-route ISA IRQ 1 (identity, edge/ahigh) -> vec=0x21
-[43 ms] [irq] facade: switched to IO APIC mode (2 IRQs re-routed)
+[11 ms] [pmm] test: alloc/free balanced (free=20542 before & after)
+[11 ms] [boot] reserved AP trampoline page at phys 0x0000000000070000
+[13 ms] [vmm] kernel image: virt 0xffffffff80000000..0xffffffff82675000 -> phys 0x00000000057a2000 (39380 KiB)
+[13 ms] [vmm] hhdm mirror:  132 MiB across memmap, top phys 0x00000000fd400000, 2M pages
+[14 ms] [vmm] new PML4 at phys 0x0000000000062000, switching CR3...
+[29 ms] [boot] framebuffer mapped for kernel page tables (0xffff8000fd000000)
+[29 ms] [vmm] CR3 switched. Running on tobyOS page tables.
+[29 ms] [vmm] test: __text_start 0xffffffff80001000 -> phys 0x00000000057a3000
+[30 ms] [vmm] test: __data_start 0xffffffff8010f000 -> phys 0x00000000058b1000
+[30 ms] [vmm] test: HHDM r/w through new PML4 at phys 0x000000000007d000 OK
+[30 ms] [vmm] test: new mapping at 0xffffc00000000000 <-> phys 0x000000000007d000 verified
+[31 ms] [vmm] test: unmap clears translation, scratch page freed
+[31 ms] [vmm] test: ok
+[31 ms] [heap] up: initial arena 17 pages (67 KiB)
+[31 ms] [heap] start: arenas=1 total=69600 used=0 free=69600  brk=0xffffd00000011000 (region 0xffffd00000000000..0xffffd10000000000)
+[32 ms] [heap] after 8 allocs: arenas=2 used=85616 free=65872 allocs=8
+[32 ms] [heap] after 8 frees: arenas=2 used=0 free=151488 frees=8
+[33 ms] [heap] test: ok (region OK, fragmented 80 KiB alloc OK, round-trip balanced, kcalloc zero-verified)
+[34 ms] [heap] brk now 0xffffd00000025000 (148 KiB virt consumed)
+[34 ms] [tss] installed: tss=0xffffffff8016e300 rsp0=0xffffffff8016e300 (irq stack 16 KiB)
+[34 ms] [sys] EFER.SCE on, STAR=0x0010000800000000, LSTAR=0xffffffff800de254, FMASK=0x700
+[34 ms] [sys] kernel syscall rsp = 0xffffffff8016e300
+[35 ms] [sys] available syscalls: 0=exit  1=write  2=read  3=pipe  4=close  5=yield
+[35 ms] [sys]                     6=socket 7=bind 8=sendto 9=recvfrom
+[36 ms] [sys]                     10=gui_create 11=gui_fill 12=gui_text 13=gui_flip 14=gui_poll_event
+[36 ms] [sys]                     15=term_open 16=term_write 17=term_read 18=fs_readdir 19=fs_readfile 20=exec
+[36 ms] [sys]                     21=setting_get 22=setting_set 23=login 24=logout 25=session_info
+[37 ms] [sys]                     26=getuid 27=getgid 28=username 29=chmod 30=chown
+[37 ms] [sys]   M25A: 31=getpid 32=getppid 33=spawn 34=waitpid 35=open 36=lseek 37=stat 38=fstat
+[39 ms] [sys]         39=dup 40=dup2 41=unlink 42=mkdir 43=brk 44=getcwd 45=chdir 46=getenv
+[39 ms] [sys]         47=nanosleep 48=clock_ms 49=abi_version (ABI v1)
+[39 ms] [acpi] using RSDT @ 0x0000000007fe244c (entries=4)
+[39 ms] [acpi] MADT: lapic_phys (32-bit field) = 0x00000000fee00000, legacy_pic=yes
+[40 ms] [acpi]   CPU0: acpi_id=0 apic_id=0 flags=0x1 enabled 
+[40 ms] [acpi]   CPU1: acpi_id=1 apic_id=1 flags=0x1 enabled 
+[40 ms] [acpi]   CPU2: acpi_id=2 apic_id=2 flags=0x1 enabled 
+[41 ms] [acpi]   CPU3: acpi_id=3 apic_id=3 flags=0x1 enabled 
+[41 ms] [acpi]   IOAPIC 0: mmio=0x00000000fec00000 gsi_base=0
+[42 ms] [acpi]   ISO: ISA IRQ0 -> GSI 2 (flags=0x0)
+[42 ms] [acpi]   ISO: ISA IRQ5 -> GSI 5 (flags=0xd)
+[42 ms] [acpi]   ISO: ISA IRQ9 -> GSI 9 (flags=0xd)
+[42 ms] [acpi]   ISO: ISA IRQ10 -> GSI 10 (flags=0xd)
+[42 ms] [acpi]   ISO: ISA IRQ11 -> GSI 11 (flags=0xd)
+[42 ms] [acpi]   LAPIC NMI: acpi_proc=255 lint=1 flags=0x0
+[43 ms] [acpi] enumerated 4 CPU(s) (SMP), 1 IO APIC(s), 5 override(s), 1 NMI source(s)
+[43 ms] [acpi] FADT: pm1a_cnt=0x604 pm1b_cnt=0x0 smi_cmd=0xb2 acpi_enable=0xf1 sci_int=9
+[44 ms] [acpi] FADT: reset_reg not supported (flags=0x80a5)
+[45 ms] [acpi] DSDT _S5_: SLP_TYPa=0 SLP_TYPb=0 (DSDT 8872 bytes)
+[45 ms] [acpi] AML inventory: dsdt=8836 bytes, 0 SSDT(s)
+[46 ms] [apic] BSP local APIC: phys=0x00000000fee00000 virt=0xffffd20000000000 id=0 ver=0x14
+[46 ms] [apic] SVR=0x1ff  spurious_vec=0xff  timer_vec=0x40 (masked)
+[56 ms] [apic] timer calibrated: ~16791400 ticks/10ms (~1679140 kHz, ~1679140000 Hz/sec)
+[57 ms] [ioapic] chip 0: phys=0x00000000fec00000 virt=0xffffd20000010000 gsi=[0..23] ver=0x20 entries=24
+[57 ms] [irq]   re-route ISA IRQ 0 -> GSI 2 vec=0x20 edge/ahigh
+[57 ms] [irq]   re-route ISA IRQ 1 (identity, edge/ahigh) -> vec=0x21
+[58 ms] [irq] facade: switched to IO APIC mode (2 IRQs re-routed)
+[58 ms] [pci] enumerating bus 0...
+[60 ms] [pci] 6 device(s):
+[60 ms] [pci] 00:00.0  8086:1237  bridge.host       [60 ms] 
+[60 ms] [pci] 00:01.0  8086:7000  bridge.isa        [61 ms] 
+[61 ms] [pci] 00:01.1  8086:7010  storage.ide       [61 ms]   BAR4 io 16[61 ms] 
+[61 ms] [pci] 00:01.3  8086:7113  bridge            [61 ms]   IRQ 9[61 ms] 
+[61 ms] [pci] 00:02.0  1234:1111  display.vga       [62 ms]   BAR0 mem 16384K[62 ms]   BAR2 mem 4K[62 ms] 
+[62 ms] [pci] 00:03.0  8086:100e  network.ethernet  [62 ms]   IRQ 11[62 ms]   BAR0 mem 128K[62 ms]   BAR1 io 64[62 ms] 
+[62 ms] [ata] primary master: 32768 sectors (16384 KiB) -- PIO LBA28 (PCI 00:01.1)
+[64 ms] [blk] registered 'ide0:master' [disk] (32768 sectors, 16384 KiB)
+[64 ms] [pci] driver blk_ata  bound to 00:01.1  (8086:7010) strat=generic
+[64 ms] [e1000] probing 00:03.0  (vid:did 8086:100e)
+[66 ms] [e1000] MMIO BAR0 phys=0x00000000febc0000 virt=0xffff8000febc0000 (128 KiB UC)
+[68 ms] [e1000] MAC 52:54:00:12:34:56
+[68 ms] [e1000] RX live RDBAL=0x0010d000 RDLEN=512 RDT=31 RCTL=0x0400800a
+[68 ms] [e1000] no MSI cap -- staying polled (vec 0x50 is now idle)
+[69 ms] [net] +nic e1000:00:03.0 mac=52:54:00:12:34:56 (slot 0)
+[69 ms] [pci] driver e1000    bound to 00:03.0  (8086:100e) strat=exact
+[69 ms] [pci] bind complete -- 2 of 6 device(s) bound  (2 newly this pass)
+[69 ms] [devmgr] device manager initialized
+[70 ms] [70] INFO  devmgr  : device manager ready (max=128 nodes)
+[70 ms] [devmgr] enumerated 8 device nodes
+[70 ms] [70] INFO  devmgr  : PCI enumeration complete: 8 nodes
+[71 ms] [taskd] added task 0: '/bin/logrotate' every 3600 sec
+[71 ms] [taskd] added task 1: '/bin/healthcheck' every 300 sec
+[71 ms] [taskd] scheduler initialized (32 slots)
+[72 ms] [72] INFO  taskd   : task scheduler ready (max=32)
+[73 ms] [blk] 1 device(s) registered:
+[73 ms]   [0] ide0:master          disk    32768 sectors ( 16384 KiB)
+[73 ms] [net] 1 nic(s) registered:
+[73 ms]   [0] e1000:00:03.0 mac=52:54:00:12:34:56
+[73 ms] [boot] Limine modules (2):
+[73 ms]   [0] /boot/initrd.tar  size=2754560  addr=0xffff8000054f7000
+[74 ms]   [1] /boot/install.img  size=4194304  addr=0xffff8000050f6000
+[75 ms] [initrd] using '/boot/initrd.tar' (size=2754560, addr=0xffff8000054f7000)
+[76 ms] [ramfs] mounted: 77 entries from 2754560-byte tar at 0xffff8000054f7000
+[76 ms]   - bin/hello                         8848 B  data@0xffff8000054f7200
+[76 ms]   - bin/bad                           8800 B  data@0xffff8000054f9800
+[77 ms]   - bin/echo                          13032 B  data@0xffff8000054fbe00
+[77 ms]   - bin/cat                           13064 B  data@0xffff8000054ff400
+[77 ms]   - bin/long_task                     8864 B  data@0xffff800005502a00
+[77 ms]   - bin/netecho                       17232 B  data@0xffff800005505000
+[77 ms]   - bin/gui_demo                      13080 B  data@0xffff800005509600
+[78 ms]   - bin/gui_clock                     17192 B  data@0xffff80000550cc00
+[79 ms]   - bin/gui_widgets                   31064 B  data@0xffff800005511200
+[79 ms]   - bin/gui_about                     22152 B  data@0xffff800005518e00
+[79 ms]   - bin/gui_term                      17880 B  data@0xffff80000551e800
+[79 ms]   - bin/gui_files                     22328 B  data@0xffff800005523000
+[79 ms]   - bin/gui_viewer                    17624 B  data@0xffff800005528a00
+[80 ms]   - bin/login                         13400 B  data@0xffff80000552d200
+[81 ms]   - bin/gui_settings                  43816 B  data@0xffff800005530a00
+[82 ms]   - bin/abi_test                      13064 B  data@0xffff80000553b800
+[83 ms]   - bin/c_hello                       39696 B  data@0xffff80000553ee00
+[84 ms]   - bin/c_args                        39696 B  data@0xffff800005548c00
+[85 ms]   - bin/c_filedemo                    43792 B  data@0xffff800005552a00
+[86 ms]   - bin/c_alloctest                   43792 B  data@0xffff80000555d800
+[88 ms]   - bin/c_envtest                     47984 B  data@0xffff800005568600
+[89 ms]   - bin/c_dynhello                    3328 B  data@0xffff800005574400
+[90 ms]   - bin/devlist                       44376 B  data@0xffff800005575400
+[91 ms]   - bin/drvtest                       44376 B  data@0xffff800005580400
+[92 ms]   - bin/usbtest                       52952 B  data@0xffff80000558b400
+[93 ms]   - bin/audiotest                     44376 B  data@0xffff800005598600
+[94 ms]   - bin/batterytest                   48472 B  data@0xffff8000055a3600
+[95 ms]   - bin/displayinfo                   48472 B  data@0xffff8000055af600
+[96 ms]   - bin/drawtest                      48616 B  data@0xffff8000055bb600
+[97 ms]   - bin/rendertest                    71712 B  data@0xffff8000055c7600
+[98 ms]   - bin/fonttest                      43856 B  data@0xffff8000055d9200
+[99 ms]   - bin/logview                       48312 B  data@0xffff8000055e4000
+[100 ms]   - bin/crashinfo                     43824 B  data@0xffff8000055f0000
+[101 ms]   - bin/wdogtest                      48000 B  data@0xffff8000055fae00
+[102 ms]   - bin/safesh                        53624 B  data@0xffff800005606c00
+[103 ms]   - bin/fscheck                       43912 B  data@0xffff800005614000
+[104 ms]   - bin/services                      48072 B  data@0xffff80000561ee00
+[105 ms]   - bin/svc_crasher                   39696 B  data@0xffff80000562ac00
+[106 ms]   - bin/stabilitytest                 48136 B  data@0xffff800005634a00
+[107 ms]   - bin/hwinfo                        48464 B  data@0xffff800005640a00
+[108 ms]   - bin/drvmatch                      53216 B  data@0xffff80000564ca00
+[109 ms]   - bin/hwcompat                      48496 B  data@0xffff800005659c00
+[110 ms]   - bin/hwreport                      48568 B  data@0xffff800005665c00
+[111 ms]   - bin/compattest                    61960 B  data@0xffff800005671c00
+[112 ms]   - bin/tobycc                        43936 B  data@0xffff800005681200
+[113 ms]   - bin/tobybuild                     43792 B  data@0xffff80000568c000
+[114 ms]   - bin/selfhosttest                  39696 B  data@0xffff800005696e00
+[115 ms]   - bin/p_echo                        44160 B  data@0xffff8000056a0c00
+[116 ms]   - bin/p_cat                         44160 B  data@0xffff8000056abc00
+[117 ms]   - bin/p_wc                          44520 B  data@0xffff8000056b6c00
+[118 ms]   - bin/p_head                        44504 B  data@0xffff8000056c1c00
+[119 ms]   - bin/p_ls                          44752 B  data@0xffff8000056ccc00
+[120 ms]   - bin/p_grep                        44648 B  data@0xffff8000056d7e00
+[121 ms]   - lib/ld-toby.so                    7416 B  data@0xffff8000056e3000
+[122 ms]   - lib/libtoby.so                    358120 B  data@0xffff8000056e5000
+[123 ms]   - repo/helloapp.tpkg                18758 B  data@0xffff80000573ca00
+[125 ms]   - repo/helloapp_v2.tpkg             18815 B  data@0xffff800005741600
+[126 ms]   - repo/helloapp_corrupt.tpkg        18757 B  data@0xffff800005746200
+[127 ms]   - repo/helloapp_badhash.tpkg        18758 B  data@0xffff80000574ae00
+[128 ms]   - repo/helloapp_nohash.tpkg         18501 B  data@0xffff80000574fa00
+[129 ms]   - repo/helloapp_badfhash.tpkg       18759 B  data@0xffff800005754600
+[130 ms]   - repo/helloapp_v2_corrupt.tpkg     18814 B  data@0xffff800005759200
+[131 ms]   - repo/helloapp_signed.tpkg         18835 B  data@0xffff80000575de00
+[132 ms]   - repo/helloapp_signed_unknown.tpkg  18832 B  data@0xffff800005762a00
+[133 ms]   - repo/helloapp_signed_tampered.tpkg  18580 B  data@0xffff800005767600
+[134 ms]   - repo/helloapp_caps_ro.tpkg        18767 B  data@0xffff80000576c200
+[135 ms]   - system/keys/trust.db              196 B  data@0xffff800005770e00
+[136 ms]   - repo/hello_cli.tpkg               39911 B  data@0xffff800005771200
+[137 ms]   - repo/hello_gui.tpkg               49198 B  data@0xffff80000577b000
+[138 ms]   - repo/notes_app.tpkg               54141 B  data@0xffff800005787400
+[139 ms]   - etc/motd                          285 B  data@0xffff800005794a00
+[140 ms]   - etc/drvmatch.conf                 1278 B  data@0xffff800005794e00
+[141 ms]   - etc/drvmatch.conf.test            447 B  data@0xffff800005795600
+[142 ms]   - m36/m36_part2.c                   218 B  data@0xffff800005795a00
+[143 ms]   - m36/m36_sample.c                  96 B  data@0xffff800005795e00
+[144 ms]   - m36/Tobyfile                      148 B  data@0xffff800005796200
+[145 ms]   - readme.txt                        899 B  data@0xffff800005796600
+[146 ms] [procfs] mounted at /proc
+[148 ms] [safe] no safemode flag -- normal boot
+[149 ms] [149] INFO  safe    : boot mode = normal (level=0)
+[150 ms] [safe] policy: mode=normal level=0 boot_mode=0
+[151 ms] [safe] policy: usb_full=keep usb_extra=keep net=keep audio=keep gui=keep services=keep virtio_gpu=keep
+[152 ms] [module] kernel module subsystem initialized (32 slots)
+[154 ms] [154] INFO  hw      : hwinfo: cpu='QEMU Virtual CPU version 2.5+' family=15 model=107 step=1 feat=0xf6000271
+[155 ms] [drvmatch] init: total=6 bound=2 unbound=4 forced_off=0
+[156 ms] [156] INFO  hw      : drvmatch init: total=6 bound=2 unbound=4 forced=0
+[157 ms] [drvconf] loaded /etc/drvmatch.conf: blacklist=0 force=0 errors=0
+[158 ms] [158] INFO  hw      : drvconf load: blacklist=0 force=0 errors=0
+[159 ms] [drvconf] === active overrides ===
+[160 ms] [drvconf] (none)
+[161 ms] [bcache] initialised: 256 entries, 1024 KiB pool
+[176 ms] [tobyfs] mount of '/data' WARNING: 1 issue(s): ino=16 allocated but type=FREE (orphan slot) (mounting anyway)
+[177 ms] [177] WARN  fs      : mount /data warn: ino=16 allocated but type=FREE (orphan slot)
+[178 ms] [tobyfs] mounted '/data' on ide0:master: 53/255 inodes, 102/1013 data blocks (3644 KiB free)
+[179 ms] [boot] mounted /data on whole disk 'ide0:master' (legacy LBA-0 layout)
+[180 ms] [boot] no FAT32 partition discovered -- /fat unmounted
+[181 ms] [boot] no FAT32-on-USB discovered -- /usb unmounted
+[182 ms] [boot] no ext4 partition discovered -- /ext unmounted
+[183 ms] [installer] live install image registered: 4194304 bytes @ 0xffff8000050f6000
+[185 ms] [vfs] mount table (3 entries):
+[186 ms]   /            -> ops=0xffffffff80107448 mnt=0xffffffff80192e90
+[187 ms]   /proc        -> ops=0xffffffff8010b0c0 mnt=0x0000000000000000
+[188 ms]   /data        -> ops=0xffffffff80108080 mnt=0xffffd00000025030
+[189 ms] swap: initialized 4096 slots (16 MB) on ide0:master at LBA 8192
+[190 ms] [module] /lib/modules not found -- no modules to load
+[191 ms] [proc] table initialised (64 slots), pid 0 = 'kernel_main' RUNNING
+[192 ms] [sched] per-CPU round-robin scheduler ready (BSP cur=pid 0)
+[193 ms] [signal] POSIX signal subsystem ready (32 signals)
+[194 ms] [shm] shared memory subsystem ready (32 slots)
+[195 ms] [unix_sock] Unix domain socket subsystem ready
+[197 ms] [sysfs] mounted at /sys (9 nodes)
+[198 ms] [aslr] ASLR enabled (stack=16 bits, mmap=20 bits, exe=12 bits)
+[199 ms] [hardening] SMEP not available
+[200 ms] [hardening] SMAP not available
+[201 ms] [hardening] NX/DEP enabled (IA32_EFER.NXE)
+[202 ms] page_fault: initialized (COW + demand paging ready)
+[203 ms] [aml] Parsing DSDT (8836 bytes)...
+[205 ms] [aml] Namespace: 62 objects registered
+[206 ms] [clipboard] init: 65536 bytes available
+[207 ms] [hidpi] Display scaling subsystem initialized
+[208 ms] [audio_engine] initialized: 48000 Hz stereo 16-bit output
+[210 ms] [inotify] subsystem initialized
+[211 ms] [boot] spawning first userspace process from /bin/hello...
+[212 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x34 filesz=0x34 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[213 ms] [elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x45 filesz=0x45 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[214 ms] [elf] load OK (user): type=ET_EXEC, 2 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (2 entries)
+[215 ms] [proc] created pid=1 ppid=0 'hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x162000 kstack=0xffffd00000008030 argc=0 envc=0 cwd='/'
+hello from user mode
+user_hello: about to SYS_EXIT(0x55)
+[220 ms] [sys_exit] user requested exit, code=85 (0x55)
+[221 ms] [proc] pid=1 'hello-boot' exit code=85 (0x55) cpu=0 ms syscalls=3
+[222 ms] [proc] reaped pid=1, slot recycled
+[223 ms] [boot] /bin/hello (pid=1) finished, exit code=85 (0x55)
+[224 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0xd22 filesz=0xd22 flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[225 ms] [elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x374 filesz=0x374 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[226 ms] [elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0x18 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[227 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[228 ms] [proc] created pid=1 ppid=0 'abi-test-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x162000 kstack=0xffffd00000008030 argc=0 envc=0 cwd='/'
+[abi-test] starting Milestone 25A ABI surface check
+[abi-test] argc = 0
+[abi-test] abi_version = 1
+[abi-test] pid = 1
+[abi-test] ppid = 0
+[abi-test] clock_ms_delta = 1
+[abi-test] cwd_len = 1
+[abi-test] cwd = /
+[abi-test] brk_initial = 268435456
+[abi-test] brk_after_grow = 268451840
+[abi-test] heap pages writable + zero-initialised OK
+[abi-test] open_fd = 3
+[abi-test] write_bytes = 10
+[abi-test] lseek_set = 0
+[abi-test] read_bytes = 10
+[abi-test] fstat_rc = 0
+[abi-test] fstat_size = 10
+[abi-test] fstat_mode = 33188
+[abi-test] stat_rc = 0
+[abi-test] stat_size = 10
+[abi-test] dup_fd = 4
+[abi-test] dup2_fd = 9
+[abi-test] unlink_rc = 0
+[abi-test] chdir_rc = 0
+[abi-test] new cwd = /data/abi_test_dir
+[abi-test] getenv_PATH_rc = 0
+[abi-test] ALL OK
+[273 ms] [sys_exit] user requested exit, code=0 (0x0)
+[274 ms] [proc] pid=1 'abi-test-boot' exit code=0 (0x0) cpu=0 ms syscalls=152
+[275 ms] [proc] reaped pid=1, slot recycled
+[276 ms] [boot] M25A: /bin/abi_test (pid=1) finished, exit code=0 (PASS)
+[277 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x5e0e filesz=0x5e0e flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[278 ms] [elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xc28 filesz=0xc28 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[279 ms] [elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0x270 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000408000)
+[281 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[282 ms] [proc] created pid=1 ppid=0 'c_hello-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x162000 kstack=0xffffd00000008030 argc=0 envc=0 cwd='/'
+[c_hello] hello from libtoby (argc=0)
+[c_hello] ALL OK
+[_exit] code=0 caller=0x0000000000400124
+[288 ms] [sys_exit] user requested exit, code=0 (0x0)
+[289 ms] [proc] pid=1 'c_hello-boot' exit code=0 (0x0) cpu=0 ms syscalls=6
+[290 ms] [proc] reaped pid=1, slot recycled
+[291 ms] [boot] M25B: /bin/c_hello (pid=1) exit=0 (PASS)
+[292 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x5f1e filesz=0x5f1e flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[293 ms] [elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xcb8 filesz=0xcb8 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[294 ms] [elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0x270 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000408000)
+[295 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[296 ms] [proc] created pid=1 ppid=0 'c_args-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x162000 kstack=0xffffd00000008030 argc=0 envc=0 cwd='/'
+[c_args] argc=0
+[c_args] envc=0
+[c_args] getenv("HOME") = (unset)
+[c_args] __toby_argc=0 __toby_argv=0x7fffffffff58 __toby_envp=0x7fffffffff60
+[c_args] ALL OK
+[_exit] code=0 caller=0x0000000000400234
+[304 ms] [sys_exit] user requested exit, code=0 (0x0)
+[305 ms] [proc] pid=1 'c_args-boot' exit code=0 (0x0) cpu=0 ms syscalls=21
+[306 ms] [proc] reaped pid=1, slot recycled
+[307 ms] [boot] M25B: /bin/c_args (pid=1) exit=0 (PASS)
+[309 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x60de filesz=0x60de flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[310 ms] [elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0xe90 filesz=0xe90 flags=R-- U -> pages [0x0000000000407000..0x0000000000408000)
+[311 ms] [elf] phdr[2] LOAD vaddr=0x0000000000408000 memsz=0x270 filesz=0x80 flags=RW- U -> pages [0x0000000000408000..0x0000000000409000)
+[312 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[313 ms] [proc] created pid=1 ppid=0 'c_filedemo-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x162000 kstack=0xffffd00000008030 argc=0 envc=0 cwd='/'
+[c_filedemo] file size = 45 bytes (expected 45)
+[c_filedemo] readback first 45 chars: hello from c_filedemo
+second lin...
+[c_filedemo] ALL OK
+[_exit] code=0 caller=0x0000000000400f94
+[319 ms] [sys_exit] user requested exit, code=0 (0x0)
+[320 ms] [proc] pid=1 'c_filedemo-boot' exit code=0 (0x0) cpu=0 ms syscalls=31
+[321 ms] [proc] reaped pid=1, slot recycled
+[322 ms] [boot] M25B: /bin/c_filedemo (pid=1) exit=0 (PASS)
+[323 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x632e filesz=0x632e flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[324 ms] [elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0xd60 filesz=0xd60 flags=R-- U -> pages [0x0000000000407000..0x0000000000408000)
+[325 ms] [elf] phdr[2] LOAD vaddr=0x0000000000408000 memsz=0x280 filesz=0x80 flags=RW- U -> pages [0x0000000000408000..0x0000000000409000)
+[326 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[327 ms] [proc] created pid=1 ppid=0 'c_alloctest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x162000 kstack=0xffffd00000008030 argc=0 envc=0 cwd='/'
+[c_alloctest] ALL OK
+[_exit] code=0 caller=0x00000000004011e4
+[334 ms] [sys_exit] user requested exit, code=0 (0x0)
+[335 ms] [proc] pid=1 'c_alloctest-boot' exit code=0 (0x0) cpu=0 ms syscalls=9
+[336 ms] [proc] reaped pid=1, slot recycled
+[337 ms] [boot] M25B: /bin/c_alloctest (pid=1) exit=0 (PASS)
+[338 ms] [boot] M25B: libtoby demos 4/4 PASS
+[339 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x5f1e filesz=0x5f1e flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[340 ms] [elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xcb8 filesz=0xcb8 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[341 ms] [elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0x270 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000408000)
+[342 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[343 ms] [proc] created pid=1 ppid=0 'c_args-spec' entry=0x0000000000400000 rsp=0x00007ffffffffee0 cr3=0x162000 kstack=0xffffd00000008030 argc=4 envc=3 cwd='/'
+[c_args] argc=4
+[c_args]   argv[0] = "c_args"
+[c_args]   argv[1] = "alpha"
+[c_args]   argv[2] = "beta"
+[c_args]   argv[3] = "gamma"
+[c_args] envc=3
+[c_args]   envp[0] = "PATH=/bin"
+[c_args]   envp[1] = "TEST_PHASE=25C"
+[c_args]   envp[2] = "BUILD=ok"
+[c_args] getenv("HOME") = (unset)
+[c_args] __toby_argc=4 __toby_argv=0x7ffffffffee8 __toby_envp=0x7fffffffff10
+[c_args] ALL OK
+[_exit] code=0 caller=0x0000000000400234
+[359 ms] [sys_exit] user requested exit, code=0 (0x0)
+[360 ms] [proc] pid=1 'c_args-spec' exit code=0 (0x0) cpu=0 ms syscalls=56
+[361 ms] [proc] reaped pid=1, slot recycled
+[362 ms] [boot] M25C: /bin/c_args (pid=1, argc=4 envc=3) exit=0 (PASS)
+[363 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x64b6 filesz=0x64b6 flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[364 ms] [elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0x1230 filesz=0x1230 flags=R-- U -> pages [0x0000000000407000..0x0000000000409000)
+[365 ms] [elf] phdr[2] LOAD vaddr=0x0000000000409000 memsz=0x290 filesz=0xa0 flags=RW- U -> pages [0x0000000000409000..0x000000000040a000)
+[366 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[367 ms] [proc] created pid=1 ppid=0 'c_envtest-boot' entry=0x0000000000400000 rsp=0x00007fffffffff00 cr3=0x162000 kstack=0xffffd00000008030 argc=1 envc=3 cwd='/'
+[c_envtest][build] M25C-debug-rev3 alive
+[c_envtest] argc=1 argv[0]='c_envtest'
+[c_envtest] environ has 3 initial entries
+[c_envtest] getenv(PATH) = /bin
+[c_envtest][diag] BEFORE system
+[c_envtest] system("c_hello") starting...
+[378 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x5e0e filesz=0x5e0e flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[379 ms] [elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xc28 filesz=0xc28 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[380 ms] [elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0x270 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000408000)
+[381 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[382 ms] [proc] created pid=2 ppid=1 'c_hello' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x190000 kstack=0xffffd00000040030 argc=1 envc=1 cwd='/'
+[c_hello] hello from libtoby (argc=1)
+[c_hello] ALL OK
+[_exit] code=0 caller=0x0000000000400124
+[387 ms] [sys_exit] user requested exit, code=0 (0x0)
+[388 ms] [proc] pid=2 'c_hello' exit code=0 (0x0) cpu=0 ms syscalls=6
+[389 ms] [proc] reaped pid=2, slot recycled
+[c_envtest][diag] AFTER system, sr=0
+[c_envtest] system("c_hello") raw status=0x0
+[c_envtest][diag] AFTER printf raw status
+[c_envtest][diag] AFTER system EXPECTs
+[c_envtest] recursive execvp test starting...
+[396 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x64b6 filesz=0x64b6 flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[398 ms] [elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0x1230 filesz=0x1230 flags=R-- U -> pages [0x0000000000407000..0x0000000000409000)
+[399 ms] [elf] phdr[2] LOAD vaddr=0x0000000000409000 memsz=0x290 filesz=0xa0 flags=RW- U -> pages [0x0000000000409000..0x000000000040a000)
+[400 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[401 ms] [proc] created pid=2 ppid=1 'c_envtest' entry=0x0000000000400000 rsp=0x00007fffffffff00 cr3=0x190000 kstack=0xffffd00000040400 argc=3 envc=1 cwd='/'
+[c_envtest][build] M25C-debug-rev3 alive
+[c_envtest] (child) execvp -> 'c_hello'
+[404 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x5e0e filesz=0x5e0e flags=R-X U -> pages [0x0000000000400000..0x0000000000406000)
+[405 ms] [elf] phdr[1] LOAD vaddr=0x0000000000406000 memsz=0xc28 filesz=0xc28 flags=R-- U -> pages [0x0000000000406000..0x0000000000407000)
+[406 ms] [elf] phdr[2] LOAD vaddr=0x0000000000407000 memsz=0x270 filesz=0x80 flags=RW- U -> pages [0x0000000000407000..0x0000000000408000)
+[407 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[408 ms] [proc] created pid=3 ppid=2 'c_hello' entry=0x0000000000400000 rsp=0x00007fffffffff30 cr3=0x1b9000 kstack=0xffffd00000050030 argc=1 envc=1 cwd='/'
+[c_hello] hello from libtoby (argc=1)
+[c_hello] ALL OK
+[_exit] code=0 caller=0x0000000000400124
+[414 ms] [sys_exit] user requested exit, code=0 (0x0)
+[415 ms] [proc] pid=3 'c_hello' exit code=0 (0x0) cpu=0 ms syscalls=6
+[416 ms] [proc] reaped pid=3, slot recycled
+[_exit] code=0 caller=0x000000000040401b
+[419 ms] [sys_exit] user requested exit, code=0 (0x0)
+[420 ms] [proc] pid=2 'c_envtest' exit code=0 (0x0) cpu=32 ms syscalls=9
+[421 ms] [proc] reaped pid=2, slot recycled
+[c_envtest] recursive child pid=2 status=0x0
+[c_envtest] ALL OK
+[_exit] code=0 caller=0x0000000000401374
+[425 ms] [sys_exit] user requested exit, code=0 (0x0)
+[426 ms] [proc] pid=1 'c_envtest-boot' exit code=0 (0x0) cpu=100 ms syscalls=38
+[427 ms] [proc] reaped pid=1, slot recycled
+[428 ms] [boot] M25C: /bin/c_envtest (pid=1) exit=0 (PASS)
+[429 ms] [elf] phdr[2] LOAD vaddr=0x0000000000500000 memsz=0x3a8 filesz=0x3a8 flags=R-- U -> pages [0x0000000000500000..0x0000000000501000)
+[430 ms] [elf] phdr[3] LOAD vaddr=0x00000000005013b0 memsz=0xd0 filesz=0xd0 flags=R-X U -> pages [0x0000000000501000..0x0000000000502000)
+[431 ms] [elf] phdr[4] LOAD vaddr=0x0000000000502480 memsz=0xb80 filesz=0x120 flags=RW- U -> pages [0x0000000000502000..0x0000000000503000)
+[432 ms] [elf] phdr[5] LOAD vaddr=0x00000000005035a0 memsz=0x18 filesz=0x18 flags=RW- U -> pages [0x0000000000503000..0x0000000000504000)
+[434 ms] [elf] load OK (user): type=ET_DYN, 4 segment(s), base=0x0000000000500000, entry=0x00000000005013b0, phdr=0x0000000000500040 (9 entries), PT_INTERP
+[435 ms] [elf] phdr[1] LOAD vaddr=0x0000000040000000 memsz=0x4d0 filesz=0x4d0 flags=R-- U -> pages [0x0000000040000000..0x0000000040001000)
+[436 ms] [elf] phdr[2] LOAD vaddr=0x00000000400014d0 memsz=0xf9b filesz=0xf9b flags=R-X U -> pages [0x0000000040001000..0x0000000040003000)
+[437 ms] [elf] phdr[3] LOAD vaddr=0x0000000040003470 memsz=0xb90 filesz=0xa0 flags=RW- U -> pages [0x0000000040003000..0x0000000040004000)
+[438 ms] [elf] phdr[4] LOAD vaddr=0x0000000040004510 memsz=0x870 filesz=0x0 flags=RW- U -> pages [0x0000000040004000..0x0000000040005000)
+[439 ms] [elf] load OK (user): type=ET_DYN, 4 segment(s), base=0x0000000040000000, entry=0x00000000400014d0, phdr=0x0000000040000040 (8 entries)
+[440 ms] [proc] loaded interpreter '/lib/ld-toby.so' base=0x0000000040000000 entry=0x00000000400014d0
+[442 ms] [proc] created pid=1 ppid=0 'c_dynhello-boot' entry=0x00000000400014d0 rsp=0x00007fffffffff30 cr3=0x162000 kstack=0xffffd000000501b0 argc=1 envc=1 cwd='/'
+[445 ms] [elf] phdr[1] LOAD vaddr=0x0000000060000000 memsz=0xc26c filesz=0xc26c flags=R-- U -> pages [0x0000000060000000..0x000000006000d000)
+[446 ms] [elf] phdr[2] LOAD vaddr=0x000000006000d270 memsz=0x42a70 filesz=0x42a70 flags=R-X U -> pages [0x000000006000d000..0x0000000060050000)
+[448 ms] [elf] phdr[3] LOAD vaddr=0x0000000060050ce0 memsz=0x1320 filesz=0xb30 flags=RW- U -> pages [0x0000000060050000..0x0000000060052000)
+[449 ms] [elf] phdr[4] LOAD vaddr=0x0000000060052810 memsz=0xc34100 filesz=0x99 flags=RW- U -> pages [0x0000000060052000..0x0000000060c87000)
+[461 ms] [elf] load OK (user): type=ET_DYN, 4 segment(s), base=0x0000000060000000, entry=0x0000000060000000, phdr=0x0000000060000040 (8 entries)
+[c_dynhello] hello from DYNAMIC libtoby (argc=1)
+[c_dynhello] ALL OK
+[_exit] code=0 caller=0x000000006000dfc4
+[467 ms] [sys_exit] user requested exit, code=0 (0x0)
+[468 ms] [proc] pid=1 'c_dynhello-boot' exit code=0 (0x0) cpu=0 ms syscalls=7
+[469 ms] [proc] reaped pid=1, slot recycled
+[470 ms] [boot] M25D: /bin/c_dynhello (pid=1) exit=0 (PASS)
+[471 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x617e filesz=0x617e flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[472 ms] [elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0xc40 filesz=0xc40 flags=R-- U -> pages [0x0000000000407000..0x0000000000408000)
+[473 ms] [elf] phdr[2] LOAD vaddr=0x0000000000408000 memsz=0x280 filesz=0x88 flags=RW- U -> pages [0x0000000000408000..0x0000000000409000)
+[474 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[475 ms] [proc] created pid=1 ppid=0 'p_echo-boot' entry=0x0000000000400000 rsp=0x00007fffffffff10 cr3=0x162000 kstack=0xffffd000000601b0 argc=3 envc=1 cwd='/'
+hello from-port-echo
+[_exit] code=0 caller=0x0000000000401034
+[478 ms] [sys_exit] user requested exit, code=0 (0x0)
+[479 ms] [proc] pid=1 'p_echo-boot' exit code=0 (0x0) cpu=0 ms syscalls=6
+[480 ms] [proc] reaped pid=1, slot recycled
+[481 ms] [boot] M25E: /bin/p_echo (pid=1) exit=0 (PASS)
+[483 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x61ae filesz=0x61ae flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[485 ms] [elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0xc30 filesz=0xc30 flags=R-- U -> pages [0x0000000000407000..0x0000000000408000)
+[486 ms] [elf] phdr[2] LOAD vaddr=0x0000000000408000 memsz=0x280 filesz=0x88 flags=RW- U -> pages [0x0000000000408000..0x0000000000409000)
+[488 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[489 ms] [proc] created pid=1 ppid=0 'p_cat-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x162000 kstack=0xffffd000000601b0 argc=2 envc=1 cwd='/'
+==============================================
+  Welcome to tobyOS -- milestone 4
+==============================================
+
+The kernel mounted this file from /etc/motd
+on a read-only ramfs backed by a USTAR initrd.
+
+Try:
+    ls
+    ls /bin
+    cat /readme.txt
+    run /bin/hello
+[_exit] code=0 caller=0x0000000000401064
+[506 ms] [sys_exit] user requested exit, code=0 (0x0)
+[507 ms] [proc] pid=1 'p_cat-boot' exit code=0 (0x0) cpu=0 ms syscalls=7
+[508 ms] [proc] reaped pid=1, slot recycled
+[509 ms] [boot] M25E: /bin/p_cat (pid=1) exit=0 (PASS)
+[510 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x69fa filesz=0x69fa flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[512 ms] [elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0xca0 filesz=0xca0 flags=R-- U -> pages [0x0000000000407000..0x0000000000408000)
+[513 ms] [elf] phdr[2] LOAD vaddr=0x0000000000408000 memsz=0x2b0 filesz=0x94 flags=RW- U -> pages [0x0000000000408000..0x0000000000409000)
+[514 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[515 ms] [proc] created pid=1 ppid=0 'p_wc-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x162000 kstack=0xffffd000000601b0 argc=2 envc=1 cwd='/'
+      12      32     285 /etc/motd
+[_exit] code=0 caller=0x0000000000401624
+[520 ms] [sys_exit] user requested exit, code=0 (0x0)
+[521 ms] [proc] pid=1 'p_wc-boot' exit code=0 (0x0) cpu=0 ms syscalls=29
+[522 ms] [proc] reaped pid=1, slot recycled
+[523 ms] [boot] M25E: /bin/p_wc (pid=1) exit=0 (PASS)
+[524 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x65ea filesz=0x65ea flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[525 ms] [elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0xca0 filesz=0xca0 flags=R-- U -> pages [0x0000000000407000..0x0000000000408000)
+[526 ms] [elf] phdr[2] LOAD vaddr=0x0000000000408000 memsz=0x2a0 filesz=0x9c flags=RW- U -> pages [0x0000000000408000..0x0000000000409000)
+[527 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[528 ms] [proc] created pid=1 ppid=0 'p_head-boot' entry=0x0000000000400000 rsp=0x00007fffffffff10 cr3=0x162000 kstack=0xffffd000000601b0 argc=4 envc=1 cwd='/'
+==============================================
+  Welcome to tobyOS -- milestone 4
+[_exit] code=0 caller=0x0000000000401214
+[533 ms] [sys_exit] user requested exit, code=0 (0x0)
+[534 ms] [proc] pid=1 'p_head-boot' exit code=0 (0x0) cpu=0 ms syscalls=7
+[535 ms] [proc] reaped pid=1, slot recycled
+[536 ms] [boot] M25E: /bin/p_head (pid=1) exit=0 (PASS)
+[537 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x6c8a filesz=0x6c8a flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[538 ms] [elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0xcb0 filesz=0xcb0 flags=R-- U -> pages [0x0000000000407000..0x0000000000408000)
+[539 ms] [elf] phdr[2] LOAD vaddr=0x0000000000408000 memsz=0x2b0 filesz=0x94 flags=RW- U -> pages [0x0000000000408000..0x0000000000409000)
+[540 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[541 ms] [proc] created pid=1 ppid=0 'p_ls-boot' entry=0x0000000000400000 rsp=0x00007fffffffff20 cr3=0x162000 kstack=0xffffd000000601b0 argc=2 envc=1 cwd='/'
+abi_test
+audiotest
+bad
+batterytest
+c_alloctest
+c_args
+c_dynhello
+c_envtest
+c_filedemo
+c_hello
+cat
+compattest
+crashinfo
+devlist
+displayinfo
+drawtest
+drvmatch
+drvtest
+echo
+fonttest
+fscheck
+gui_about
+gui_clock
+gui_demo
+gui_files
+gui_settings
+gui_term
+gui_viewer
+gui_widgets
+hello
+hwcompat
+hwinfo
+hwreport
+login
+logview
+long_task
+netecho
+p_cat
+p_echo
+p_grep
+p_head
+p_ls
+p_wc
+rendertest
+safesh
+selfhosttest
+services
+stabilitytest
+svc_crasher
+tobybuild
+tobycc
+usbtest
+wdogtest
+[_exit] code=0 caller=0x00000000004015c4
+[601 ms] [sys_exit] user requested exit, code=0 (0x0)
+[602 ms] [proc] pid=1 'p_ls-boot' exit code=0 (0x0) cpu=0 ms syscalls=169
+[603 ms] [proc] reaped pid=1, slot recycled
+[604 ms] [boot] M25E: /bin/p_ls (pid=1) exit=0 (PASS)
+[605 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x673a filesz=0x673a flags=R-X U -> pages [0x0000000000400000..0x0000000000407000)
+[606 ms] [elf] phdr[1] LOAD vaddr=0x0000000000407000 memsz=0xd40 filesz=0xd40 flags=R-- U -> pages [0x0000000000407000..0x0000000000408000)
+[607 ms] [elf] phdr[2] LOAD vaddr=0x0000000000408000 memsz=0x2c0 filesz=0x94 flags=RW- U -> pages [0x0000000000408000..0x0000000000409000)
+[609 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[610 ms] [proc] created pid=1 ppid=0 'p_grep-boot' entry=0x0000000000400000 rsp=0x00007fffffffff10 cr3=0x162000 kstack=0xffffd000000601b0 argc=3 envc=1 cwd='/'
+  Welcome to tobyOS -- milestone 4
+[_exit] code=0 caller=0x0000000000401364
+[615 ms] [sys_exit] user requested exit, code=0 (0x0)
+[616 ms] [proc] pid=1 'p_grep-boot' exit code=0 (0x0) cpu=0 ms syscalls=293
+[617 ms] [proc] reaped pid=1, slot recycled
+[618 ms] [boot] M25E: /bin/p_grep (pid=1) exit=0 (PASS)
+[619 ms] [boot] M25E: ports 6/6 PASS
+[621 ms] [boot] BSP LAPIC timer @ 100 Hz live (vec=0x40)
+[622 ms] [smp] 4 CPU(s) total: BSP apic_id=0
+[623 ms] [smp]   cpu0: apic_id=0 (BSP)
+[625 ms] [smp]   cpu1: apic_id=1
+[626 ms] [smp]   cpu2: apic_id=2
+[627 ms] [smp]   cpu3: apic_id=3
+[628 ms] CPU 0 online
+[629 ms]   apic_id=0 (BSP)  stack=bootloader-provided
+[630 ms] [smp] trampoline installed: phys=0x0000000000070000 virt=0xffff800000070000 len=1024 bytes
+[631 ms] [smp] cpu1: INIT-SIPI-SIPI to apic_id=1 (tramp_vector=0x70, stack=0xffffd0000005c030)
+[642 ms] CPU 1 online
+[644 ms]   apic_id=1 (acpi said 1)  stack_top=0xffffd0000005c030
+[648 ms]   cpu1: LAPIC timer @ 100 Hz live (vec=0x40)
+[648 ms] [smp] cpu2: INIT-SIPI-SIPI to apic_id=2 (tramp_vector=0x70, stack=0xffffd00000060040)
+[659 ms] CPU 2 online
+[662 ms]   apic_id=2 (acpi said 2)  stack_top=0xffffd00000060040
+[665 ms]   cpu2: LAPIC timer @ 100 Hz live (vec=0x40)
+[665 ms] [smp] cpu3: INIT-SIPI-SIPI to apic_id=3 (tramp_vector=0x70, stack=0xffffd00000064050)
+[676 ms] CPU 3 online
+[678 ms]   apic_id=3 (acpi said 3)  stack_top=0xffffd00000064050
+[683 ms]   cpu3: LAPIC timer @ 100 Hz live (vec=0x40)
+[683 ms] [smp] 3/3 APs online (total 4 CPUs)
+[701 ms] [gfx] back buffer 1280x800 (4000 KiB) ready [double-buffered], fb_pitch=1280 px, backend=limine-fb
+[702 ms] [mouse] PS/2 driver up (IRQ12 routed via IO APIC, sample=200Hz)
+[703 ms] [gui] window manager ready (max 32 windows, 30-px title bar)
+[704 ms] [term] session pool ready (4 sessions, 4096-byte rings)
+[704 ms] Welcome to tobyOS
+[704 ms] milestone 14: services + settings + login. Boot drops into the GUI desktop with /bin/login.
+[704 ms] 
+[704 ms] [boot] settling input before network bring-up
+[735 ms] [boot] before net_init
+[735 ms] [net] nic=e1000:00:03.0 mac=52:54:00:12:34:56 -- starting up
+[736 ms] [dhcp] DISCOVER xid=0x259c39b9
+[739 ms] [e1000] RX DHCP frame len=590 udp 67 -> 68 dst=ff:ff:ff:ff:ff:ff
+[739 ms] [dhcp] OFFER  yiaddr=10.0.2.15 server=10.0.2.2
+[739 ms] [dhcp] REQUEST requested=10.0.2.15
+[739 ms] [e1000] RX DHCP frame len=590 udp 67 -> 68 dst=ff:ff:ff:ff:ff:ff
+[739 ms] [dhcp] ACK    bound: ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3 lease=86400s (server=10.0.2.2)
+[741 ms] [net] DHCP lease applied: ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3
+[741 ms] [net] up: nic=e1000:00:03.0 ip=10.0.2.15 gw=10.0.2.2 mac=52:54:00:12:34:56
+[743 ms] [net] gateway 10.0.2.2 -> 52:55:0a:00:02:02 (cached)
+[744 ms] [net] dns     10.0.2.3 -> 52:55:0a:00:02:03 (cached)
+[744 ms] [tcp] LISTEN tcp[0] lp=1234 backlog=4
+[744 ms] [tcp-echo] listening on TCP port 1234
+[745 ms] [tcp] LISTEN tcp[1] lp=7777 backlog=4
+[745 ms] [tcp-shell] listening on TCP port 7777
+[745 ms] [boot] after net_init ok=1 net_up=1
+[745 ms] [boot] net_init OK; starting TCP services
+[745 ms] [ipv6] link-local fe80::5054:ff:fe12:3456
+[746 ms] [icmpv6] initialized
+[747 ms] [rng] CSPRNG ready (rdrand=0 words=0)
+[754 ms] [ssh-crypto] loaded Ed25519 host key from /data/ssh/ssh_host_ed25519_seed
+[755 ms] [tcp] LISTEN tcp[2] lp=22 backlog=2
+[755 ms] [ssh] listening on TCP port 22 (transport scaffold)
+[774 ms] [settings] loading /data/settings.conf (374 bytes)
+[774 ms] [settings] cache:
+[774 ms]   desktop.bg=0x00204060
+[774 ms]   desktop.accent=orange
+[774 ms]   desktop.title=tobyOS
+[775 ms]   desktop.greeting=Welcome to tobyOS
+[775 ms]   ui.theme=cyber
+[775 ms]   ui.transparency=on
+[775 ms]   ui.nixie_glow=75
+[776 ms]   ui.night_light=off
+[776 ms]   ui.widgets=on
+[776 ms]   ui.animations=on
+[776 ms]   device.bluetooth=off
+[776 ms]   network.autostart=on
+[776 ms]   user.last=toby
+[776 ms]   user.greeting=Hello, friend!
+[776 ms]   session.autostart=
+[779 ms] [users] loading /data/users (86 bytes)
+[779 ms] [users] cache (3 entries):
+[779 ms]   root             uid=0 gid=0
+[780 ms]   toby             uid=1000 gid=1000
+[780 ms]   guest            uid=1001 gid=1001
+[781 ms] [theme] active='cyber' (settings ui.theme='cyber')
+[781 ms] [svc] registered builtin 'notify'
+[781 ms] [781] INFO  svc      pid=0: registered builtin 'notify'
+[781 ms] [notify] daemon ready (ring depth 32)
+[781 ms] [svc] service manager up (max 8 services)
+[781 ms] [781] INFO  svc      pid=0: manager up max=8 backoff_base=100ms cap=6400ms disable_at=5
+[782 ms] [svc] registered builtin 'input'
+[783 ms] [783] INFO  svc      pid=0: registered builtin 'input'
+[783 ms] [svc] registered builtin 'network'
+[783 ms] [783] INFO  svc      pid=0: registered builtin 'network'
+[783 ms] [svc] registered builtin 'desktop'
+[783 ms] [783] INFO  svc      pid=0: registered builtin 'desktop'
+[784 ms] [svc] registered builtin 'session'
+[784 ms] [784] INFO  svc      pid=0: registered builtin 'session'
+[784 ms] [trace] level 0 -> 1
+[785 ms] [gui] auto-enabled trace (level=1) for desktop session
+[785 ms] [trace t=785 pid=0] [785 ms] gui_set_desktop_mode: off -> on[785 ms] 
+[785 ms] [gui] entering graphical mode
+[785 ms] [session] init: last user='toby' (will be pre-filled at login)
+[785 ms] [svc] registered program 'login' -> /bin/login (autorestart=1)
+[786 ms] [786] INFO  svc      pid=0: registered program 'login' path='/bin/login' autorestart=1
+[787 ms] [trace t=787 pid=0] [787 ms] launch_enqueue '/bin/login' sandbox='' caps='' (head=1 tail=0)[787 ms] 
+[787 ms] [svc] 'login' enqueued (restart #1, crashes=0)
+[787 ms] [787] INFO  svc      pid=0: 'login' enqueued restart=1 crashes=0
+[787 ms] [svc] 5 services registered
+[787 ms]   name         kind    state    auto pid rcnt  ccnt  ccon  path
+[788 ms]   input        builtin running  0    0   0     0     0     (builtin)
+[788 ms]   network      builtin running  0    0   0     0     0     (builtin)
+[788 ms]   desktop      builtin running  0    0   0     0     0     (builtin)
+[788 ms]   session      builtin running  0    0   0     0     0     (builtin)
+[788 ms]   login        program running  1    0   1     0     0     /bin/login
+[789 ms] [notify #1 urg=0 kind=1] kernel: Desktop ready -- Welcome to tobyOS. Click [Apps] to launch a program, or click the bell to open the notification
+[790 ms] [notify #2 urg=0 kind=1] session: Login service started -- /bin/login is running. Type 'root' to log in.
+[790 ms] [boot] first gui_tick after desktop init
+[790 ms] [trace t=790 pid=0] [790 ms] drain_launch_queue: spawning '/bin/login' sandbox='default' caps=''[790 ms] 
+[790 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x96b filesz=0x96b flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[790 ms] [elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x83 filesz=0x83 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[792 ms] [elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0xa4 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[792 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[793 ms] [proc] created pid=1 ppid=0 'login' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x9b3000 kstack=0xffffd0000006c060 argc=0 envc=0 cwd='/'
+[794 ms] [cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[794 ms] [trace t=794 pid=0] [794 ms] track_pid pid=1 slot=0[794 ms] 
+[794 ms] [gui] launched /bin/login as pid 1 (session=0)
+[794 ms] [trace t=794 pid=0] [794 ms] drain_launch_queue: spawned '/bin/login' as pid=1 session=0[794 ms] 
+[795 ms] [svc] 'login' pid=1 (backfilled)
+[795 ms] [trace t=795 pid=0] [795 ms] heartbeat windows=0 apps_alive=1 cursor=(640,400) btn=0x00 dirty=1 menu=0 desktop=1[795 ms] 
+[796 ms] [trace t=796 pid=0] [796 ms] toast new id=2 urg=0 app='session' title='Login service started'[796 ms] 
+[803 ms] [trace t=803 pid=1] [803 ms] window_create wid=1 owner_pid=1 size=1024x724 pos=(60,40) title='' gpu_res=0[803 ms] 
+[806 ms] [sec] M34 crypto self-test PASS (SHA-256, HMAC-SHA-256, hex/ct)
+[810 ms] [ssh-crypto] Monocypher self-test PASS (X25519, Ed25519, XChaCha20-Poly1305)
+[811 ms] [sec] trust store loaded: 1 key(s) from /system/keys/trust.db
+[811 ms] [sysprot] init: 5 protected prefix(es)
+[811 ms] [sysprot]   /system          system
+[811 ms] [sysprot]   /system/keys     trust-store
+[811 ms] [sysprot]   /boot            boot
+[811 ms] [sysprot]   /data/packages   package-db
+[811 ms] [sysprot]   /data/users      user-db
+[816 ms] [trace t=816 pid=0] [816 ms] launcher_register 'Hello CLI' -> /data/apps/hello_cli/bin/hello_cli.elf sandbox='' caps='' (slot=0)[816 ms] 
+[816 ms] [pkg] registered launcher entry: 'Hello CLI' -> /data/apps/hello_cli/bin/hello_cli.elf
+[817 ms] [pkg] package manager ready (apps=/data/apps db=/data/packages repo=/data/repo,/repo)
+[818 ms] [fw_cfg] QEMU fw_cfg interface present at 0x510/0x511
+[818 ms] [battery] no ACPI battery detected (no fw_cfg mock, no PNP0C0A in AML)
+[819 ms] [display] registered fb0 1280x800 backend=limine-fb
+[819 ms] type 'help' to list commands.
+admin@tobyOS:/# [819 ms] [boot] QUICK_BOOT: skipping devtest_boot_run + shell smoketest + M26A/M27A spawns
+[820 ms] [boot] QUICK_BOOT: skipping M28A–M35G boot harness spawns (CI: `make fullboot` / omit -DQUICK_BOOT)
+[834 ms] [bootlog] wrote /data/boot.log (50292 bytes payload + 71 header)
+[834 ms] [bootlog] no FAT32 USB at /usb — skipping BOOTLOG.TXT
+[834 ms] [bootlog] flush complete (ram cap=262144 overflow=0)
+[847 ms] [bootlog] net upload: sent 50382 bytes to 192.168.68.74:40123/udp
+[847 ms] [bootlog] (deferred) no FAT32 USB at /usb — skipping BOOTLOG.TXT
+[847 ms] [bootlog] deferred USB flush done (ram cap=262144 overflow=0)
+[895 ms] [trace t=895 pid=0] [895 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=1 menu=0 desktop=1[895 ms] 
+[998 ms] [trace t=998 pid=0] [998 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=1 menu=0 desktop=1[998 ms] 
+[1098 ms] [trace t=1098 pid=0] [1098 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[1098 ms] 
+[1198 ms] [trace t=1198 pid=0] [1198 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[1198 ms] 
+[1298 ms] [trace t=1298 pid=0] [1298 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[1298 ms] 
+[1398 ms] [trace t=1398 pid=0] [1398 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[1398 ms] 
+[1498 ms] [trace t=1498 pid=0] [1498 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[1498 ms] 
+[1598 ms] [trace t=1598 pid=0] [1598 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[1598 ms] 
+[1698 ms] [trace t=1698 pid=0] [1698 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[1698 ms] 
+[1798 ms] [trace t=1798 pid=0] [1798 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[1799 ms] 
+[1898 ms] [trace t=1898 pid=0] [1898 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[1898 ms] 
+[1998 ms] [trace t=1998 pid=0] [1998 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[1998 ms] 
+[2098 ms] [trace t=2098 pid=0] [2098 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[2098 ms] 
+[2198 ms] [trace t=2198 pid=0] [2198 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[2198 ms] 
+[2298 ms] [trace t=2298 pid=0] [2298 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[2298 ms] 
+[2398 ms] [trace t=2398 pid=0] [2398 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[2398 ms] 
+[2498 ms] [trace t=2498 pid=0] [2498 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[2498 ms] 
+[2598 ms] [trace t=2598 pid=0] [2598 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[2598 ms] 
+[2698 ms] [trace t=2698 pid=0] [2698 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[2698 ms] 
+[2798 ms] [trace t=2798 pid=0] [2798 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[2798 ms] 
+[2898 ms] [trace t=2898 pid=0] [2898 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[2898 ms] 
+[2998 ms] [trace t=2998 pid=0] [2998 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[2998 ms] 
+[3098 ms] [trace t=3098 pid=0] [3098 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[3098 ms] 
+[3198 ms] [trace t=3198 pid=0] [3198 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[3199 ms] 
+[3298 ms] [trace t=3298 pid=0] [3298 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[3298 ms] 
+[3398 ms] [trace t=3398 pid=0] [3398 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[3398 ms] 
+[3498 ms] [trace t=3498 pid=0] [3498 ms] heartbeat windows=1 apps_alive=1 cursor=(640,400) btn=0x00 dirty=0 menu=0 desktop=1[3498 ms] 
+[3567 ms] [sys_exit] user requested exit, code=0 (0x0)
+[3567 ms] [trace t=3567 pid=1] [3567 ms] window_close wid=1 owner_pid=1 title=''[3567 ms] 
+[3567 ms] [proc] pid=1 'login' exit code=0 (0x0) cpu=1218 ms syscalls=170056
+[3568 ms] [proc] reaped pid=1, slot recycled
+[3568 ms] [trace t=3568 pid=0] [3568 ms] reap: pid=1 terminated exit=0 (slot=0 cleared)[3568 ms] 
+[3570 ms] [svc] 'login' crashed rc=-1 (consecutive=1, total=1) -> BACKOFF 100 ms
+[3571 ms] [3571] WARN  svc      pid=0: 'login' crashed rc=-1 consecutive=1 total=1 backoff=100ms
+[3571 ms] [notify #3 urg=1 kind=3] service: Service 'login' crashed -- rc=-1, restarting in 100 ms (#1)
+[3598 ms] [trace t=3598 pid=0] [3598 ms] heartbeat windows=0 apps_alive=0 cursor=(607,378) btn=0x00 dirty=0 menu=0 desktop=1[3599 ms] 
+[3697 ms] [svc] 'login' backoff elapsed (consecutive=1) -> retry
+[3697 ms] [3697] INFO  svc      pid=0: 'login' backoff elapsed -> retry
+[3697 ms] [trace t=3697 pid=0] [3697 ms] launch_enqueue '/bin/login' sandbox='' caps='' (head=2 tail=1)[3697 ms] 
+[3697 ms] [svc] 'login' enqueued (restart #2, crashes=1)
+[3698 ms] [3698] INFO  svc      pid=0: 'login' enqueued restart=2 crashes=1
+[3698 ms] [trace t=3698 pid=0] [3698 ms] heartbeat windows=0 apps_alive=0 cursor=(277,157) btn=0x00 dirty=0 menu=0 desktop=1[3699 ms] 
+[3699 ms] [trace t=3699 pid=0] [3699 ms] drain_launch_queue: spawning '/bin/login' sandbox='default' caps=''[3700 ms] 
+[3700 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x96b filesz=0x96b flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[3701 ms] [elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x83 filesz=0x83 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[3701 ms] [elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0xa4 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[3702 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[3703 ms] [proc] created pid=1 ppid=0 'login' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x9b3000 kstack=0xffffd00000f481b0 argc=0 envc=0 cwd='/'
+[3703 ms] [cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[3704 ms] [trace t=3704 pid=0] [3704 ms] track_pid pid=1 slot=0[3704 ms] 
+[3704 ms] [gui] launched /bin/login as pid 1 (session=0)
+[3704 ms] [trace t=3704 pid=0] [3704 ms] drain_launch_queue: spawned '/bin/login' as pid=1 session=0[3704 ms] 
+[3704 ms] [svc] 'login' pid=1 (backfilled)
+[3706 ms] [trace t=3706 pid=1] [3706 ms] window_create wid=1 owner_pid=1 size=1024x724 pos=(88,30) title='' gpu_res=0[3706 ms] 
+[3732 ms] [sys_exit] user requested exit, code=0 (0x0)
+[3732 ms] [trace t=3732 pid=1] [3732 ms] window_close wid=1 owner_pid=1 title=''[3732 ms] 
+[3732 ms] [proc] pid=1 'login' exit code=0 (0x0) cpu=5 ms syscalls=269
+[3732 ms] [proc] reaped pid=1, slot recycled
+[3732 ms] [trace t=3732 pid=0] [3732 ms] reap: pid=1 terminated exit=0 (slot=0 cleared)[3732 ms] 
+[3732 ms] [svc] 'login' crashed rc=-1 (consecutive=2, total=2) -> BACKOFF 200 ms
+[3732 ms] [3732] WARN  svc      pid=0: 'login' crashed rc=-1 consecutive=2 total=2 backoff=200ms
+[3732 ms] [notify #4 urg=1 kind=3] service: Service 'login' crashed -- rc=-1, restarting in 200 ms (#2)
+[3798 ms] [trace t=3798 pid=0] [3798 ms] heartbeat windows=0 apps_alive=0 cursor=(177,81) btn=0x00 dirty=1 menu=0 desktop=1[3799 ms] 
+[3898 ms] [trace t=3898 pid=0] [3899 ms] heartbeat windows=0 apps_alive=0 cursor=(153,94) btn=0x00 dirty=1 menu=0 desktop=1[3899 ms] 
+[3951 ms] [svc] 'login' backoff elapsed (consecutive=2) -> retry
+[3951 ms] [3951] INFO  svc      pid=0: 'login' backoff elapsed -> retry
+[3952 ms] [trace t=3952 pid=0] [3953 ms] launch_enqueue '/bin/login' sandbox='' caps='' (head=3 tail=2)[3953 ms] 
+[3953 ms] [svc] 'login' enqueued (restart #3, crashes=2)
+[3953 ms] [3953] INFO  svc      pid=0: 'login' enqueued restart=3 crashes=2
+[3953 ms] [trace t=3953 pid=0] [3953 ms] drain_launch_queue: spawning '/bin/login' sandbox='default' caps=''[3953 ms] 
+[3954 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x96b filesz=0x96b flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[3956 ms] [elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x83 filesz=0x83 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[3957 ms] [elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0xa4 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[3958 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[3958 ms] [proc] created pid=1 ppid=0 'login' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x9b3000 kstack=0xffffd000013311b0 argc=0 envc=0 cwd='/'
+[3958 ms] [cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[3958 ms] [trace t=3958 pid=0] [3958 ms] track_pid pid=1 slot=0[3958 ms] 
+[3958 ms] [gui] launched /bin/login as pid 1 (session=0)
+[3958 ms] [trace t=3958 pid=0] [3958 ms] drain_launch_queue: spawned '/bin/login' as pid=1 session=0[3958 ms] 
+[3958 ms] [svc] 'login' pid=1 (backfilled)
+[3960 ms] [trace t=3960 pid=1] [3960 ms] window_create wid=1 owner_pid=1 size=1024x724 pos=(116,30) title='' gpu_res=0[3960 ms] 
+[3987 ms] [sys_exit] user requested exit, code=0 (0x0)
+[3988 ms] [trace t=3988 pid=1] [3988 ms] window_close wid=1 owner_pid=1 title=''[3988 ms] 
+[3988 ms] [proc] pid=1 'login' exit code=0 (0x0) cpu=4 ms syscalls=270
+[3989 ms] [proc] reaped pid=1, slot recycled
+[3989 ms] [trace t=3989 pid=0] [3989 ms] reap: pid=1 terminated exit=0 (slot=0 cleared)[3989 ms] 
+[3989 ms] [svc] 'login' crashed rc=-1 (consecutive=3, total=3) -> BACKOFF 400 ms
+[3990 ms] [3990] WARN  svc      pid=0: 'login' crashed rc=-1 consecutive=3 total=3 backoff=400ms
+[3990 ms] [notify #5 urg=1 kind=3] service: Service 'login' crashed -- rc=-1, restarting in 400 ms (#3)
+[3998 ms] [trace t=3998 pid=0] [3998 ms] heartbeat windows=0 apps_alive=0 cursor=(178,647) btn=0x00 dirty=1 menu=0 desktop=1[3998 ms] 
+[4098 ms] [trace t=4098 pid=0] [4098 ms] heartbeat windows=0 apps_alive=0 cursor=(709,716) btn=0x00 dirty=1 menu=0 desktop=1[4098 ms] 
+[4198 ms] [trace t=4198 pid=0] [4198 ms] heartbeat windows=0 apps_alive=0 cursor=(1259,450) btn=0x00 dirty=0 menu=0 desktop=1[4199 ms] 
+[4298 ms] [trace t=4298 pid=0] [4298 ms] heartbeat windows=0 apps_alive=0 cursor=(993,167) btn=0x00 dirty=0 menu=0 desktop=1[4298 ms] 
+[4398 ms] [trace t=4398 pid=0] [4398 ms] heartbeat windows=0 apps_alive=0 cursor=(985,167) btn=0x00 dirty=0 menu=0 desktop=1[4398 ms] 
+[4489 ms] [svc] 'login' backoff elapsed (consecutive=3) -> retry
+[4489 ms] [4489] INFO  svc      pid=0: 'login' backoff elapsed -> retry
+[4489 ms] [trace t=4489 pid=0] [4489 ms] launch_enqueue '/bin/login' sandbox='' caps='' (head=0 tail=3)[4490 ms] 
+[4490 ms] [svc] 'login' enqueued (restart #4, crashes=3)
+[4490 ms] [4490] INFO  svc      pid=0: 'login' enqueued restart=4 crashes=3
+[4490 ms] [trace t=4490 pid=0] [4490 ms] drain_launch_queue: spawning '/bin/login' sandbox='default' caps=''[4490 ms] 
+[4490 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x96b filesz=0x96b flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[4491 ms] [elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x83 filesz=0x83 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[4491 ms] [elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0xa4 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[4492 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[4493 ms] [proc] created pid=1 ppid=0 'login' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x9b3000 kstack=0xffffd000013311b0 argc=0 envc=0 cwd='/'
+[4493 ms] [cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[4493 ms] [trace t=4493 pid=0] [4493 ms] track_pid pid=1 slot=0[4493 ms] 
+[4493 ms] [gui] launched /bin/login as pid 1 (session=0)
+[4493 ms] [trace t=4493 pid=0] [4493 ms] drain_launch_queue: spawned '/bin/login' as pid=1 session=0[4493 ms] 
+[4493 ms] [svc] 'login' pid=1 (backfilled)
+[4494 ms] [trace t=4494 pid=1] [4495 ms] window_create wid=1 owner_pid=1 size=1024x724 pos=(144,30) title='' gpu_res=0[4495 ms] 
+[4502 ms] [trace t=4502 pid=0] [4502 ms] heartbeat windows=1 apps_alive=1 cursor=(683,323) btn=0x00 dirty=1 menu=0 desktop=1[4502 ms] 
+[4522 ms] [sys_exit] user requested exit, code=0 (0x0)
+[4522 ms] [trace t=4522 pid=1] [4522 ms] window_close wid=1 owner_pid=1 title=''[4522 ms] 
+[4522 ms] [proc] pid=1 'login' exit code=0 (0x0) cpu=6 ms syscalls=269
+[4523 ms] [proc] reaped pid=1, slot recycled
+[4523 ms] [trace t=4523 pid=0] [4523 ms] reap: pid=1 terminated exit=0 (slot=0 cleared)[4523 ms] 
+[4523 ms] [svc] 'login' crashed rc=-1 (consecutive=4, total=4) -> BACKOFF 800 ms
+[4524 ms] [4524] WARN  svc      pid=0: 'login' crashed rc=-1 consecutive=4 total=4 backoff=800ms
+[4524 ms] [notify #6 urg=1 kind=3] service: Service 'login' crashed -- rc=-1, restarting in 800 ms (#4)
+[4602 ms] [trace t=4602 pid=0] [4602 ms] heartbeat windows=0 apps_alive=0 cursor=(438,378) btn=0x00 dirty=1 menu=0 desktop=1[4602 ms] 
+[4695 ms] [trace t=4695 pid=0] [4695 ms] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (350,378)[4695 ms] 
+[4695 ms] [trace t=4695 pid=0] [4695 ms] mouse down=(350,378) hit=bare-desktop[4695 ms] 
+[4702 ms] [trace t=4702 pid=0] [4702 ms] heartbeat windows=0 apps_alive=0 cursor=(350,378) btn=0x01 dirty=1 menu=0 desktop=1[4702 ms] 
+[4774 ms] [trace t=4774 pid=0] [4775 ms] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (350,378)[4776 ms] 
+[4795 ms] [trace t=4795 pid=0] [4795 ms] toast id=2 expired[4795 ms] 
+[4795 ms] [trace t=4795 pid=0] [4795 ms] toast new id=6 urg=1 app='service' title='Service 'login' crashed'[4795 ms] 
+[4802 ms] [trace t=4802 pid=0] [4802 ms] heartbeat windows=0 apps_alive=0 cursor=(350,378) btn=0x00 dirty=0 menu=0 desktop=1[4802 ms] 
+[4902 ms] [trace t=4902 pid=0] [4902 ms] heartbeat windows=0 apps_alive=0 cursor=(344,386) btn=0x00 dirty=0 menu=0 desktop=1[4902 ms] 
+[5002 ms] [trace t=5002 pid=0] [5002 ms] heartbeat windows=0 apps_alive=0 cursor=(346,447) btn=0x00 dirty=0 menu=0 desktop=1[5003 ms] 
+[5102 ms] [trace t=5102 pid=0] [5102 ms] heartbeat windows=0 apps_alive=0 cursor=(386,400) btn=0x00 dirty=0 menu=0 desktop=1[5102 ms] 
+[5120 ms] [trace t=5120 pid=0] [5121 ms] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (386,400)[5121 ms] 
+[5121 ms] [trace t=5121 pid=0] [5121 ms] mouse down=(386,400) hit=bare-desktop[5121 ms] 
+[5200 ms] [trace t=5200 pid=0] [5200 ms] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (388,400)[5200 ms] 
+[5202 ms] [trace t=5202 pid=0] [5202 ms] heartbeat windows=0 apps_alive=0 cursor=(388,400) btn=0x00 dirty=0 menu=0 desktop=1[5202 ms] 
+[5302 ms] [trace t=5302 pid=0] [5303 ms] heartbeat windows=0 apps_alive=0 cursor=(698,263) btn=0x00 dirty=0 menu=0 desktop=1[5304 ms] 
+[5375 ms] [trace t=5375 pid=0] [5375 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (716,252)[5375 ms] 
+[5375 ms] [trace t=5375 pid=0] [5375 ms] right-click desktop (716,252) -> ctx menu[5376 ms] 
+[5402 ms] [trace t=5402 pid=0] [5402 ms] heartbeat windows=0 apps_alive=0 cursor=(716,252) btn=0x02 dirty=0 menu=0 desktop=1[5402 ms] 
+[5420 ms] [svc] 'login' backoff elapsed (consecutive=4) -> retry
+[5420 ms] [5420] INFO  svc      pid=0: 'login' backoff elapsed -> retry
+[5420 ms] [trace t=5420 pid=0] [5420 ms] launch_enqueue '/bin/login' sandbox='' caps='' (head=1 tail=0)[5420 ms] 
+[5420 ms] [svc] 'login' enqueued (restart #5, crashes=4)
+[5420 ms] [5420] INFO  svc      pid=0: 'login' enqueued restart=5 crashes=4
+[5420 ms] [trace t=5420 pid=0] [5420 ms] drain_launch_queue: spawning '/bin/login' sandbox='default' caps=''[5420 ms] 
+[5421 ms] [elf] phdr[0] LOAD vaddr=0x0000000000400000 memsz=0x96b filesz=0x96b flags=R-X U -> pages [0x0000000000400000..0x0000000000401000)
+[5422 ms] [elf] phdr[1] LOAD vaddr=0x0000000000401000 memsz=0x83 filesz=0x83 flags=R-- U -> pages [0x0000000000401000..0x0000000000402000)
+[5422 ms] [elf] phdr[2] LOAD vaddr=0x0000000000402000 memsz=0xa4 filesz=0x18 flags=RW- U -> pages [0x0000000000402000..0x0000000000403000)
+[5422 ms] [elf] load OK (user): type=ET_EXEC, 3 segment(s), base=0x0000000000000000, entry=0x0000000000400000, phdr=0x0000000000000000 (3 entries)
+[5423 ms] [proc] created pid=1 ppid=0 'login' entry=0x0000000000400000 rsp=0x00007fffffffff50 cr3=0x9b3000 kstack=0xffffd000013311b0 argc=0 envc=0 cwd='/'
+[5424 ms] [cap] pid=1 'login' sandbox='default' caps=FILE_READ,FILE_WRITE,EXEC,NET,GUI,TERM,SETTINGS_WRITE root=(none)
+[5424 ms] [trace t=5424 pid=0] [5424 ms] track_pid pid=1 slot=0[5424 ms] 
+[5424 ms] [gui] launched /bin/login as pid 1 (session=0)
+[5424 ms] [trace t=5424 pid=0] [5424 ms] drain_launch_queue: spawned '/bin/login' as pid=1 session=0[5424 ms] 
+[5424 ms] [svc] 'login' pid=1 (backfilled)
+[5426 ms] [trace t=5426 pid=1] [5426 ms] window_create wid=1 owner_pid=1 size=1024x724 pos=(172,30) title='' gpu_res=0[5426 ms] 
+[5434 ms] [trace t=5434 pid=0] [5434 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (716,252)[5434 ms] 
+[5502 ms] [trace t=5502 pid=0] [5502 ms] heartbeat windows=1 apps_alive=1 cursor=(716,252) btn=0x00 dirty=1 menu=0 desktop=1[5502 ms] 
+[5535 ms] [sys_exit] user requested exit, code=0 (0x0)
+[5535 ms] [trace t=5535 pid=1] [5535 ms] window_close wid=1 owner_pid=1 title=''[5535 ms] 
+[5535 ms] [proc] pid=1 'login' exit code=0 (0x0) cpu=25 ms syscalls=1657
+[5535 ms] [proc] reaped pid=1, slot recycled
+[5535 ms] [trace t=5535 pid=0] [5535 ms] reap: pid=1 terminated exit=0 (slot=0 cleared)[5536 ms] 
+[5536 ms] [svc] 'login' DISABLED after 5 consecutive crashes (rc=-1, total=5)
+[5536 ms] [5536] ERROR svc      pid=0: 'login' DISABLED consecutive=5 rc=-1 total=5
+[5536 ms] [notify #7 urg=2 kind=3] service: Service 'login' disabled -- rc=-1 after 5 consecutive crashes -- auto-restart disabled.
+[5602 ms] [trace t=5602 pid=0] [5602 ms] heartbeat windows=0 apps_alive=0 cursor=(649,274) btn=0x00 dirty=1 menu=0 desktop=1[5603 ms] 
+[5702 ms] [trace t=5702 pid=0] [5703 ms] heartbeat windows=0 apps_alive=0 cursor=(571,277) btn=0x00 dirty=0 menu=0 desktop=1[5703 ms] 
+[5802 ms] [trace t=5802 pid=0] [5802 ms] heartbeat windows=0 apps_alive=0 cursor=(460,269) btn=0x00 dirty=0 menu=0 desktop=1[5802 ms] 
+[5902 ms] [trace t=5902 pid=0] [5902 ms] heartbeat windows=0 apps_alive=0 cursor=(460,269) btn=0x00 dirty=0 menu=0 desktop=1[5902 ms] 
+[5905 ms] [trace t=5905 pid=0] [5905 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (460,269)[5905 ms] 
+[5906 ms] [trace t=5906 pid=0] [5906 ms] right-click desktop (460,269) -> ctx menu[5906 ms] 
+[5975 ms] [trace t=5975 pid=0] [5975 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (460,269)[5975 ms] 
+[6002 ms] [trace t=6002 pid=0] [6002 ms] heartbeat windows=0 apps_alive=0 cursor=(460,269) btn=0x00 dirty=0 menu=0 desktop=1[6002 ms] 
+[6102 ms] [trace t=6102 pid=0] [6102 ms] heartbeat windows=0 apps_alive=0 cursor=(456,269) btn=0x00 dirty=0 menu=0 desktop=1[6102 ms] 
+[6202 ms] [trace t=6202 pid=0] [6202 ms] heartbeat windows=0 apps_alive=0 cursor=(240,341) btn=0x00 dirty=0 menu=0 desktop=1[6202 ms] 
+[6302 ms] [trace t=6302 pid=0] [6302 ms] heartbeat windows=0 apps_alive=0 cursor=(178,349) btn=0x00 dirty=0 menu=0 desktop=1[6302 ms] 
+[6328 ms] [trace t=6328 pid=0] [6328 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (178,349)[6328 ms] 
+[6328 ms] [trace t=6328 pid=0] [6328 ms] right-click desktop (178,349) -> ctx menu[6328 ms] 
+[6402 ms] [trace t=6402 pid=0] [6402 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (172,357)[6402 ms] 
+[6402 ms] [trace t=6402 pid=0] [6402 ms] heartbeat windows=0 apps_alive=0 cursor=(172,357) btn=0x00 dirty=0 menu=0 desktop=1[6402 ms] 
+[6502 ms] [trace t=6502 pid=0] [6502 ms] heartbeat windows=0 apps_alive=0 cursor=(172,357) btn=0x00 dirty=0 menu=0 desktop=1[6502 ms] 
+[6602 ms] [trace t=6602 pid=0] [6602 ms] heartbeat windows=0 apps_alive=0 cursor=(171,338) btn=0x00 dirty=0 menu=0 desktop=1[6603 ms] 
+[6669 ms] [trace t=6669 pid=0] [6669 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (221,288)[6669 ms] 
+[6669 ms] [trace t=6669 pid=0] [6669 ms] right-click desktop (221,288) -> ctx menu[6669 ms] 
+[6702 ms] [trace t=6702 pid=0] [6702 ms] heartbeat windows=0 apps_alive=0 cursor=(221,288) btn=0x02 dirty=0 menu=0 desktop=1[6702 ms] 
+[6722 ms] [trace t=6722 pid=0] [6722 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (221,288)[6722 ms] 
+[6802 ms] [trace t=6802 pid=0] [6802 ms] heartbeat windows=0 apps_alive=0 cursor=(570,266) btn=0x00 dirty=0 menu=0 desktop=1[6802 ms] 
+[6902 ms] [trace t=6902 pid=0] [6902 ms] heartbeat windows=0 apps_alive=0 cursor=(788,175) btn=0x00 dirty=0 menu=0 desktop=1[6902 ms] 
+[6991 ms] [trace t=6991 pid=0] [6991 ms] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (995,91)[6991 ms] 
+[6992 ms] [trace t=6992 pid=0] [6992 ms] mouse down=(995,91) hit=shell-widgets[6992 ms] 
+[7002 ms] [trace t=7002 pid=0] [7002 ms] heartbeat windows=0 apps_alive=0 cursor=(995,91) btn=0x01 dirty=1 menu=0 desktop=1[7002 ms] 
+[7047 ms] [trace t=7047 pid=0] [7047 ms] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (995,91)[7047 ms] 
+[7102 ms] [trace t=7102 pid=0] [7102 ms] heartbeat windows=0 apps_alive=0 cursor=(995,91) btn=0x00 dirty=0 menu=0 desktop=1[7102 ms] 
+[7202 ms] [trace t=7202 pid=0] [7203 ms] heartbeat windows=0 apps_alive=0 cursor=(991,97) btn=0x00 dirty=0 menu=0 desktop=1[7203 ms] 
+[7302 ms] [trace t=7302 pid=0] [7302 ms] heartbeat windows=0 apps_alive=0 cursor=(769,280) btn=0x00 dirty=0 menu=0 desktop=1[7302 ms] 
+[7402 ms] [trace t=7402 pid=0] [7402 ms] heartbeat windows=0 apps_alive=0 cursor=(703,325) btn=0x00 dirty=0 menu=0 desktop=1[7402 ms] 
+[7489 ms] [trace t=7489 pid=0] [7489 ms] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (663,354)[7489 ms] 
+[7489 ms] [trace t=7489 pid=0] [7489 ms] mouse down=(663,354) hit=bare-desktop[7489 ms] 
+[7502 ms] [trace t=7502 pid=0] [7502 ms] heartbeat windows=0 apps_alive=0 cursor=(663,354) btn=0x01 dirty=0 menu=0 desktop=1[7502 ms] 
+[7551 ms] [trace t=7551 pid=0] [7551 ms] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (663,354)[7551 ms] 
+[7602 ms] [trace t=7602 pid=0] [7602 ms] heartbeat windows=0 apps_alive=0 cursor=(663,354) btn=0x00 dirty=0 menu=0 desktop=1[7602 ms] 
+[7637 ms] [trace t=7637 pid=0] [7637 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (663,354)[7637 ms] 
+[7637 ms] [trace t=7637 pid=0] [7637 ms] right-click desktop (663,354) -> ctx menu[7637 ms] 
+[7702 ms] [trace t=7702 pid=0] [7702 ms] heartbeat windows=0 apps_alive=0 cursor=(663,354) btn=0x02 dirty=0 menu=0 desktop=1[7702 ms] 
+[7708 ms] [trace t=7708 pid=0] [7708 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (663,354)[7708 ms] 
+[7802 ms] [trace t=7802 pid=0] [7802 ms] heartbeat windows=0 apps_alive=0 cursor=(613,274) btn=0x00 dirty=0 menu=0 desktop=1[7802 ms] 
+[7881 ms] [trace t=7881 pid=0] [7881 ms] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (602,254)[7881 ms] 
+[7881 ms] [trace t=7881 pid=0] [7881 ms] mouse down=(602,254) hit=bare-desktop[7881 ms] 
+[7902 ms] [trace t=7902 pid=0] [7902 ms] heartbeat windows=0 apps_alive=0 cursor=(602,254) btn=0x01 dirty=0 menu=0 desktop=1[7902 ms] 
+[7932 ms] [trace t=7932 pid=0] [7932 ms] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (602,254)[7932 ms] 
+[8002 ms] [trace t=8002 pid=0] [8003 ms] heartbeat windows=0 apps_alive=0 cursor=(602,254) btn=0x00 dirty=0 menu=0 desktop=1[8003 ms] 
+[8098 ms] [trace t=8098 pid=0] [8099 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (528,254)[8099 ms] 
+[8099 ms] [trace t=8099 pid=0] [8099 ms] right-click desktop (528,254) -> ctx menu[8099 ms] 
+[8102 ms] [trace t=8102 pid=0] [8102 ms] heartbeat windows=0 apps_alive=0 cursor=(528,254) btn=0x02 dirty=0 menu=0 desktop=1[8102 ms] 
+[8166 ms] [trace t=8166 pid=0] [8166 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (528,254)[8166 ms] 
+[8202 ms] [trace t=8202 pid=0] [8202 ms] heartbeat windows=0 apps_alive=0 cursor=(524,254) btn=0x00 dirty=0 menu=0 desktop=1[8202 ms] 
+[8302 ms] [trace t=8302 pid=0] [8302 ms] heartbeat windows=0 apps_alive=0 cursor=(231,314) btn=0x00 dirty=0 menu=0 desktop=1[8302 ms] 
+[8402 ms] [trace t=8402 pid=0] [8402 ms] heartbeat windows=0 apps_alive=0 cursor=(0,368) btn=0x00 dirty=0 menu=0 desktop=1[8403 ms] 
+[8426 ms] [trace t=8426 pid=0] [8426 ms] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (0,368)[8426 ms] 
+[8427 ms] [trace t=8427 pid=0] [8427 ms] mouse down=(0,368) hit=bare-desktop[8427 ms] 
+[8471 ms] [trace t=8471 pid=0] [8471 ms] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (0,368)[8471 ms] 
+[8502 ms] [trace t=8502 pid=0] [8502 ms] heartbeat windows=0 apps_alive=0 cursor=(2,370) btn=0x00 dirty=0 menu=0 desktop=1[8503 ms] 
+[8602 ms] [trace t=8602 pid=0] [8603 ms] heartbeat windows=0 apps_alive=0 cursor=(832,225) btn=0x00 dirty=0 menu=0 desktop=1[8603 ms] 
+[8702 ms] [trace t=8702 pid=0] [8702 ms] heartbeat windows=0 apps_alive=0 cursor=(994,201) btn=0x00 dirty=0 menu=0 desktop=1[8702 ms] 
+[8735 ms] [trace t=8735 pid=0] [8735 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (994,201)[8735 ms] 
+[8735 ms] [trace t=8735 pid=0] [8735 ms] mouse down=(994,201) hit=shell-widgets[8735 ms] 
+[8795 ms] [trace t=8795 pid=0] [8795 ms] toast id=6 expired[8795 ms] 
+[8795 ms] [trace t=8795 pid=0] [8795 ms] toast new id=7 urg=2 app='service' title='Service 'login' disabled'[8795 ms] 
+[8801 ms] [trace t=8801 pid=0] [8801 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (994,201)[8801 ms] 
+[8802 ms] [trace t=8802 pid=0] [8802 ms] heartbeat windows=0 apps_alive=0 cursor=(994,201) btn=0x00 dirty=0 menu=0 desktop=1[8802 ms] 
+[8902 ms] [trace t=8902 pid=0] [8903 ms] heartbeat windows=0 apps_alive=0 cursor=(916,237) btn=0x00 dirty=0 menu=0 desktop=1[8904 ms] 
+[9000 ms] [trace t=9000 pid=0] [9000 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (635,283)[9000 ms] 
+[9000 ms] [trace t=9000 pid=0] [9000 ms] right-click desktop (635,283) -> ctx menu[9000 ms] 
+[9002 ms] [trace t=9002 pid=0] [9002 ms] heartbeat windows=0 apps_alive=0 cursor=(635,283) btn=0x02 dirty=0 menu=0 desktop=1[9002 ms] 
+[9070 ms] [trace t=9070 pid=0] [9070 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (635,283)[9070 ms] 
+[9102 ms] [trace t=9102 pid=0] [9102 ms] heartbeat windows=0 apps_alive=0 cursor=(631,287) btn=0x00 dirty=0 menu=0 desktop=1[9102 ms] 
+[9202 ms] [trace t=9202 pid=0] [9202 ms] heartbeat windows=0 apps_alive=0 cursor=(568,332) btn=0x00 dirty=0 menu=0 desktop=1[9203 ms] 
+[9214 ms] [trace t=9214 pid=0] [9215 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (553,344)[9215 ms] 
+[9215 ms] [trace t=9215 pid=0] [9216 ms] right-click desktop (553,344) -> ctx menu[9216 ms] 
+[9302 ms] [trace t=9302 pid=0] [9302 ms] heartbeat windows=0 apps_alive=0 cursor=(487,378) btn=0x02 dirty=0 menu=0 desktop=1[9303 ms] 
+[9320 ms] [trace t=9320 pid=0] [9320 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (481,380)[9320 ms] 
+[9403 ms] [trace t=9403 pid=0] [9403 ms] heartbeat windows=0 apps_alive=0 cursor=(469,384) btn=0x00 dirty=0 menu=0 desktop=1[9403 ms] 
+[9488 ms] [trace t=9488 pid=0] [9488 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (467,386)[9488 ms] 
+[9488 ms] [trace t=9488 pid=0] [9488 ms] right-click desktop (467,386) -> ctx menu[9488 ms] 
+[9503 ms] [trace t=9503 pid=0] [9503 ms] heartbeat windows=0 apps_alive=0 cursor=(463,388) btn=0x02 dirty=0 menu=0 desktop=1[9503 ms] 
+[9572 ms] [trace t=9572 pid=0] [9572 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (412,417)[9572 ms] 
+[9603 ms] [trace t=9603 pid=0] [9603 ms] heartbeat windows=0 apps_alive=0 cursor=(376,432) btn=0x00 dirty=0 menu=0 desktop=1[9603 ms] 
+[9703 ms] [trace t=9703 pid=0] [9703 ms] heartbeat windows=0 apps_alive=0 cursor=(190,456) btn=0x00 dirty=0 menu=0 desktop=1[9703 ms] 
+[9794 ms] [trace t=9794 pid=0] [9794 ms] mouse edge: prev=0x00 -> cur=0x02 (down=1 up=0) at (50,456)[9794 ms] 
+[9794 ms] [trace t=9794 pid=0] [9794 ms] right-click desktop (50,456) -> ctx menu[9794 ms] 
+[9803 ms] [trace t=9803 pid=0] [9803 ms] heartbeat windows=0 apps_alive=0 cursor=(50,456) btn=0x02 dirty=0 menu=0 desktop=1[9803 ms] 
+[9846 ms] [trace t=9846 pid=0] [9846 ms] mouse edge: prev=0x02 -> cur=0x00 (down=0 up=1) at (50,456)[9846 ms] 
+[9903 ms] [trace t=9903 pid=0] [9903 ms] heartbeat windows=0 apps_alive=0 cursor=(60,384) btn=0x00 dirty=0 menu=0 desktop=1[9903 ms] 
+[10003 ms] [trace t=10003 pid=0] [10003 ms] heartbeat windows=0 apps_alive=0 cursor=(184,136) btn=0x00 dirty=0 menu=0 desktop=1[10003 ms] 
+[10103 ms] [trace t=10103 pid=0] [10103 ms] heartbeat windows=0 apps_alive=0 cursor=(302,22) btn=0x00 dirty=0 menu=0 desktop=1[10103 ms] 
+[10106 ms] [trace t=10106 pid=0] [10106 ms] mouse edge: prev=0x00 -> cur=0x01 (down=1 up=0) at (350,2)[10107 ms] 
+[10107 ms] [trace t=10107 pid=0] [10107 ms] mouse down=(350,2) hit=bare-desktop[10107 ms] 
+[10171 ms] [trace t=10171 pid=0] [10171 ms] mouse edge: prev=0x01 -> cur=0x00 (down=0 up=1) at (350,2)[10171 ms] 
+[10203 ms] [trace t=10203 pid=0] [10203 ms] heartbeat windows=0 apps_alive=0 cursor=(352,2) btn=0x00 dirty=0 menu=0 desktop=1[10203 ms] 
+[10303 ms] [trace t=10303 pid=0] [10304 ms] heartbeat windows=0 apps_alive=0 cursor=(716,0) btn=0x00 dirty=0 menu=0 desktop=1[10304 ms] 
+[10403 ms] [trace t=10403 pid=0] [10403 ms] heartbeat windows=0 apps_alive=0 cursor=(1032,0) btn=0x00 dirty=0 menu=0 desktop=1[10404 ms] 
+[10503 ms] [trace t=10503 pid=0] [10504 ms] heartbeat windows=0 apps_alive=0 cursor=(1279,0) btn=0x00 dirty=0 menu=0 desktop=1[10504 ms] 
+[10603 ms] [trace t=10603 pid=0] [10603 ms] heartbeat windows=0 apps_alive=0 cursor=(1279,0) btn=0x00 dirty=0 menu=0 desktop=1[10603 ms] 
+[10703 ms] [trace t=10703 pid=0] [10703 ms] heartbeat windows=0 apps_alive=0 cursor=(1279,0) btn=0x00 dirty=0 menu=0 desktop=1[10703 ms] 
+[10803 ms] [trace t=10803 pid=0] [10803 ms] heartbeat windows=0 apps_alive=0 cursor=(1277,0) btn=0x00 dirty=0 menu=0 desktop=1[10803 ms] 
+[10903 ms] [trace t=10903 pid=0] [10903 ms] heartbeat windows=0 apps_alive=0 cursor=(1129,87) btn=0x00 dirty=0 menu=0 desktop=1[10903 ms] 
+[11003 ms] [trace t=11003 pid=0] [11003 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[11003 ms] 
+[11103 ms] [trace t=11103 pid=0] [11103 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[11103 ms] 
+[11203 ms] [trace t=11203 pid=0] [11203 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[11203 ms] 
+[11303 ms] [trace t=11303 pid=0] [11303 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[11303 ms] 
+[11403 ms] [trace t=11403 pid=0] [11403 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[11403 ms] 
+[11503 ms] [trace t=11503 pid=0] [11503 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[11503 ms] 
+[11603 ms] [trace t=11603 pid=0] [11603 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[11603 ms] 
+[11703 ms] [trace t=11703 pid=0] [11703 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[11703 ms] 
+[11803 ms] [trace t=11803 pid=0] [11803 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[11803 ms] 
+[11903 ms] [trace t=11903 pid=0] [11903 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[11903 ms] 
+[12003 ms] [trace t=12003 pid=0] [12003 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[12003 ms] 
+[12103 ms] [trace t=12103 pid=0] [12103 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[12103 ms] 
+[12203 ms] [trace t=12203 pid=0] [12203 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[12203 ms] 
+[12303 ms] [trace t=12303 pid=0] [12303 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[12303 ms] 
+[12403 ms] [trace t=12403 pid=0] [12403 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[12403 ms] 
+[12503 ms] [trace t=12503 pid=0] [12503 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[12503 ms] 
+[12603 ms] [trace t=12603 pid=0] [12604 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[12605 ms] 
+[12703 ms] [trace t=12703 pid=0] [12704 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[12705 ms] 
+[12795 ms] [trace t=12795 pid=0] [12795 ms] toast id=7 expired[12795 ms] 
+[12795 ms] [trace t=12795 pid=0] [12795 ms] toast new id=5 urg=1 app='service' title='Service 'login' crashed'[12795 ms] 
+[12803 ms] [trace t=12803 pid=0] [12804 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[12804 ms] 
+[12903 ms] [trace t=12903 pid=0] [12903 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[12903 ms] 
+[13003 ms] [trace t=13003 pid=0] [13003 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[13003 ms] 
+[13103 ms] [trace t=13103 pid=0] [13103 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[13103 ms] 
+[13203 ms] [trace t=13203 pid=0] [13203 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[13203 ms] 
+[13303 ms] [trace t=13303 pid=0] [13303 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[13303 ms] 
+[13403 ms] [trace t=13403 pid=0] [13404 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[13405 ms] 
+[13503 ms] [trace t=13503 pid=0] [13503 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[13503 ms] 
+[13603 ms] [trace t=13603 pid=0] [13603 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[13603 ms] 
+[13703 ms] [trace t=13703 pid=0] [13703 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[13703 ms] 
+[13803 ms] [trace t=13803 pid=0] [13803 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[13803 ms] 
+[13903 ms] [trace t=13903 pid=0] [13903 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[13903 ms] 
+[14003 ms] [trace t=14003 pid=0] [14003 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[14003 ms] 
+[14103 ms] [trace t=14103 pid=0] [14103 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[14103 ms] 
+[14203 ms] [trace t=14203 pid=0] [14203 ms] heartbeat windows=0 apps_alive=0 cursor=(1101,129) btn=0x00 dirty=0 menu=0 desktop=1[14204 ms] 

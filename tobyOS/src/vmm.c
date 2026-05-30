@@ -323,6 +323,11 @@ bool vmm_protect(uint64_t virt, size_t bytes, uint32_t flags) {
 /* ---- translate / dump ---- */
 
 uint64_t vmm_translate(uint64_t virt) {
+    /* Defensive: vmm_init has not yet built a PML4. Callers that run
+     * between pmm_init and vmm_init (console/gfx framebuffer probes
+     * on real-hw UEFI) would otherwise deref NULL and page-fault on
+     * boards where Limine did not identity-map the low half. */
+    if (!g_pml4) return 0;
     pte_t *pdpt = next_table(g_pml4, pml4_idx(virt), 0, false);
     if (!pdpt) return 0;
     pte_t *pd   = next_table(pdpt,  pdpt_idx(virt), 0, false);

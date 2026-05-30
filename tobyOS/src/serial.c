@@ -1,8 +1,8 @@
 /* serial.c -- COM1 driver + QEMU debugcon mux.
  *
- * Every byte goes to BOTH 0xE9 (debugcon, no init required, captured by
- * `-debugcon file:debug.log`) and COM1 once initialised. That way even
- * a one-character write before serial_init() shows up in debug.log.
+ * Every byte goes to BOTH 0xE9 (debugcon, no init required) and COM1.
+ * COM1 is brought up lazily on the first serial_putc(); serial_init()
+ * is idempotent. Capture with QEMU `-serial` and `-debugcon`.
  */
 
 #include <tobyos/serial.h>
@@ -27,6 +27,7 @@ static inline void dbgcon_putc(char c) {
 }
 
 void serial_init(void) {
+    if (s_serial_ready) return;
     outb(COM1_INT_EN,     0x00);  /* mask all UART interrupts */
     outb(COM1_LINE_CTRL,  0x80);  /* DLAB on -> baud divisor */
     outb(COM1_DATA,       0x03);  /* divisor low  (38400 baud) */
@@ -41,7 +42,9 @@ void serial_putc(char c) {
     /* debugcon always on -- never blocks, never fails */
     dbgcon_putc(c);
 
-    if (!s_serial_ready) return;
+    /* Lazily bring COM1 up so even a write before serial_init() lands
+     * on the QEMU/host serial backend (-serial), not only debugcon. */
+    if (!s_serial_ready) serial_init();
     while (!(inb(COM1_LINE_STAT) & LINE_STAT_THR_EMPTY)) { /* spin */ }
     outb(COM1_DATA, (uint8_t)c);
 }

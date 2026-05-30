@@ -40,10 +40,16 @@ struct gui_event {
     uint8_t key;
     uint8_t _pad[2];
 };
-#define GUI_EV_CLOSE      1
+/* MUST match <tobyos/gui.h> GUI_EV_*. Type 1 is MOUSE_MOVE; an older
+ * stale enum defined GUI_EV_CLOSE=1, so every mouse-move over the login
+ * window was read as a close -> login exited and the login service
+ * flapped between the login screen and the bare desktop. */
+#define GUI_EV_MOUSE_MOVE 1
 #define GUI_EV_MOUSE_DOWN 2
+#define GUI_EV_MOUSE_UP   3
 #define GUI_EV_KEY        4
-#define GUI_EV_RESIZE     5
+#define GUI_EV_CLOSE      5
+#define GUI_EV_RESIZE     6
 #define GUI_WIN_MAXIMIZED 2
 
 /* ---- inline syscall helpers -------------------------------------- */
@@ -371,8 +377,11 @@ int main(int argc, char **argv) {
         int got = sys_gui_poll_event(g_win, &ev);
 
         if (got > 0) {
+            /* The login screen is the session gateway and must not be
+             * dismissable -- ignore CLOSE (Alt+F4 / stray close events).
+             * The only exit is a successful sign-in. */
             if (ev.type == GUI_EV_CLOSE)
-                return 0;
+                continue;
 
             if (ev.type == GUI_EV_RESIZE) {
                 g_actual_w = ev.x;
