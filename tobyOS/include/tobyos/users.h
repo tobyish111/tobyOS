@@ -43,11 +43,22 @@
 /* On-disk path. Lives on tobyfs so it survives reboots. */
 #define USERS_PATH     "/data/users"
 
+/* Encoded password credential. Format is one of:
+ *   ""                          -- no password set (login allowed)
+ *   "$argon2id$m=<kib>,t=<n>$<salt_hex>$<hash_hex>"
+ *                               -- salted Argon2id (current scheme)
+ *   16 lowercase hex chars      -- legacy unsalted djb2 (pre-2026-05),
+ *                                  still verified for backward compat and
+ *                                  transparently upgraded on next login.
+ * 128 bytes holds the encoded Argon2id form (16-byte salt -> 32 hex,
+ * 32-byte hash -> 64 hex, plus the parameter prefix) with margin. */
+#define USER_PWHASH_MAX 128
+
 struct user {
     char name[USER_NAME_MAX];
     int  uid;
     int  gid;
-    char password_hash[65];  /* djb2 hex digest (16 chars), or empty for no password */
+    char password_hash[USER_PWHASH_MAX];
 };
 
 /* Boot-time entry. Must be called AFTER /data is mounted (otherwise we
