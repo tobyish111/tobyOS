@@ -3480,6 +3480,35 @@ void _start(void) {
             "(CI: `make fullboot` / omit -DQUICK_BOOT)\n");
 #endif
 
+#ifdef SIGTEST_BOOT
+    /* Opt-in signal-delivery regression harness (build with
+     * EXTRA_CFLAGS+=-DSIGTEST_BOOT). Runs regardless of QUICK_BOOT so the
+     * real kernel signal frame/sigreturn path can be validated on a fast
+     * headless boot. Spawns /bin/sigtest and asserts a clean exit. */
+    {
+        kprintf("[boot] SIGTEST: spawning /bin/sigtest\n");
+        char *argv[] = { (char *)"sigtest", (char *)"--boot", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/sigtest",
+            .name = "sigtest-boot",
+            .argc = 2,
+            .argv = argv,
+            .envc = 1,
+            .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] SIGTEST: /bin/sigtest not spawned (rc=%d) MISSING\n",
+                    pid);
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] SIGTEST: /bin/sigtest (pid=%d) exit=%d (%s)\n",
+                    pid, rc, rc == 0 ? "PASS" : "FAIL");
+        }
+    }
+#endif
+
 #ifdef M36_SELFTEST
     /* Milestone 36E: in-OS compile + run self-test (TobyC stage-1). */
     {

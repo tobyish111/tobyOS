@@ -2,7 +2,38 @@
 #include <unistd.h>
 #include "libtoby_internal.h"
 
+/* sigreturn trampoline.
+ *
+ * When the kernel delivers a caught signal it pushes the address of this
+ * stub as the handler's return address. The handler `ret`s here; we then
+ * issue SYS_SIGRETURN, which the kernel handles by restoring the interrupted
+ * context (so it never returns to us). The `ud2` is a guard: if SIGRETURN
+ * ever does return, fault loudly instead of running off into the stack. */
+__asm__(
+    ".text\n"
+    ".globl __toby_sigreturn\n"
+    ".type __toby_sigreturn, @function\n"
+    "__toby_sigreturn:\n"
+    "    movl $119, %eax\n"          /* ABI_SYS_SIGRETURN */
+    "    syscall\n"
+    "    ud2\n"
+    ".size __toby_sigreturn, .-__toby_sigreturn\n"
+);
+extern void __toby_sigreturn(void);
+
+/* Register the trampoline with the kernel exactly once per process image.
+ * Re-armed automatically after execve (fresh image -> g_restorer_armed==0)
+ * and inherited as already-armed across fork (same address space). */
+static int g_restorer_armed;
+
+static void arm_restorer(void) {
+    if (g_restorer_armed) return;
+    toby_sc1(ABI_SYS_SIGRESTORER, (long)(uintptr_t)__toby_sigreturn);
+    g_restorer_armed = 1;
+}
+
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
+    arm_restorer();
     return (int)__toby_check(
         toby_sc3(ABI_SYS_SIGACTION, (long)signum, (long)(uintptr_t)act, (long)(uintptr_t)oldact));
 }

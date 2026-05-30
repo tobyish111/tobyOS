@@ -41,7 +41,7 @@ honest number.
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
 | Device Drivers | ~12% | ~14% | **Loadable `ET_REL` kernel module loader** (foundational). 6 NIC drivers, AHCI/NVMe/IDE/virtio-blk, xHCI/EHCI/HID/MSC, HDA. No real GPU driver; no signed third-party ecosystem. |
 | GUI / Desktop | ~10% | ~12% | GPU-accelerated compositor path exists **but only active with VirtIO-GPU**; on real Intel iGPU it falls back to the CPU/Limine compositor. Now **usable on hardware** (login no longer flaps; mouse/keyboard work). |
-| Security | ~8% | ~11% | Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes still verify and are **transparently upgraded** on next login. **SMAP still disabled** (required to boot — no stac/clac uaccess wrappers yet). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
+| Security | ~8% | ~13% | Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** now works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP still disabled** (no stac/clac uaccess wrappers yet). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
 | Power / ACPI | ~6% | ~9% | **RTC driver** → real wall-clock time. ACPI shutdown + partial S3/S4 framework. No full AML power management. |
 | Audio / Media | ~15% | ~15% | Intel HDA + software mixer + decode helpers. Unchanged this round. |
 | App Compatibility | ~2% | ~3% | POSIX libc filled in (`signal.h`, `fork`, `symlink`/`readlink`, real `getuid/gid`, `wait`, `access`) → easier to **port Unix software**. Still own-ELF-only; **zero** Win32/.NET/UWP. |
@@ -79,9 +79,9 @@ driver model; POSIX libc surface.
    cores idle. (`sched.c` header documents this explicitly.)
 4. **GPU-accelerated desktop on real hardware** — compositor accel only exists for VirtIO,
    not the Intel iGPU path used on the EliteDesk.
-5. **Security depth** — ~~salted/KDF auth~~ (done: Argon2id), working signal *delivery*
-   (kernel side is partial), and re-enabling SMAP behind proper `stac`/`clac` uaccess
-   wrappers. Remaining auth hardening: account lockout / login rate-limiting.
+5. **Security depth** — ~~salted/KDF auth~~ (done: Argon2id), ~~login rate-limiting~~
+   (done: lockout), ~~signal *delivery*~~ (done: real frame push + sigreturn). Remaining:
+   re-enabling SMAP behind proper `stac`/`clac` uaccess wrappers; SA_RESTART; job control.
 
 ---
 
@@ -91,7 +91,10 @@ driver model; POSIX libc surface.
 - Passwords: now salted Argon2id (was djb2). Still no account lockout / rate-limiting,
   no password policy, and no PAM-style pluggable auth.
 - GPU accel: VirtIO-only; real-HW desktop is CPU-composited.
-- Signals: syscalls exist; user-handler delivery is partial.
+- Signals: user-handler delivery now works (frame push + sigreturn, mask/pending
+  honored). Still missing: SA_RESTART syscall restart, job-control stop/cont,
+  SA_SIGINFO/siginfo_t, and handler delivery to a pure-CPU-bound process is
+  deferred to its next syscall (timer-IRQ path doesn't push frames).
 - TobyFS journaling/swap/CoW: wired but not stress-tested under crash/pressure/load.
 
 ---
@@ -105,3 +108,15 @@ driver model; POSIX libc surface.
   next login. On-disk credential format is now
   `$argon2id$m=<kib>,t=<passes>$<salt_hex>$<hash_hex>`; `struct user.password_hash`
   widened 65→128. Builds + boots clean (login still reached, no #PF). Security ~9% → ~11%.
+- **2026-05-30** — **Login lockout** (`src/session.c`): per-username failed-attempt
+  throttle, 5 fails → 30 s lockout, unknown users counted too (blunts enumeration),
+  monotonic PIT clock, LRU-evicted fixed table.
+- **2026-05-30** — **Real signal delivery** (`src/signal.c` + `syscall_entry.S` layout
+  mirror): on the syscall-return path the kernel now pushes a signal frame onto the user
+  stack (saving the full GP context + mask), redirects the SYSRETQ into the handler with
+  RDI=signum, and `sys_sigreturn` restores the context. Added `SYS_SIGRESTORER` (164) so
+  libc registers a sigreturn trampoline; fixed the sigaction/sigprocmask ABI marshalling
+  (libtoby's 64-bit `sigset_t` vs the kernel's 32-bit struct meant sa_flags was read from
+  the wrong offset); `fork` now inherits dispositions + clears pending (POSIX). Verified by
+  `/bin/sigtest` (build `EXTRA_CFLAGS+=-DSIGTEST_BOOT`): handler runs, context preserved,
+  blocked-signal pending/unblock all PASS, no #PF. Security ~11% → ~13%.

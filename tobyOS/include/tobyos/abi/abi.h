@@ -633,8 +633,14 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
                                        op=2: list loaded modules
                                        -> 0 or -ABI_E* */
 
+/* ---- Signal trampoline registration ---------------------------------- */
+#define ABI_SYS_SIGRESTORER    164  /* (uint64_t trampoline_addr) -> 0
+                                       libc registers its sigreturn stub once
+                                       so the kernel can use it as the handler
+                                       return address. See sys_sigrestorer. */
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          164
+#define ABI_SYS_NR_MAX          165
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

@@ -342,6 +342,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/hwcompat/hwcompat.elf \
             programs/hwreport/hwreport.elf \
             programs/compattest/compattest.elf \
+            programs/sigtest/sigtest.elf \
             programs/tobycc/tobycc.elf \
             programs/tobybuild/tobybuild.elf \
             programs/selfhosttest/selfhosttest.elf \
@@ -1079,6 +1080,7 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,hwreport,hwreport))
 # pattern-matches against. Tests requiring real hardware return
 # SKIPPED_REAL_HARDWARE_REQUIRED rather than touching host devices.
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,compattest,compattest))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,sigtest,sigtest))
 
 # ---------- Developer tools ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,strace,strace))
@@ -1560,6 +1562,7 @@ $(INITRD_TAR): $(PROGRAMS) initrd/etc/motd initrd/readme.txt \
 	cp programs/hwcompat/hwcompat.elf                 $(INITRD_STAGE)/bin/hwcompat
 	cp programs/hwreport/hwreport.elf                 $(INITRD_STAGE)/bin/hwreport
 	cp programs/compattest/compattest.elf             $(INITRD_STAGE)/bin/compattest
+	cp programs/sigtest/sigtest.elf                   $(INITRD_STAGE)/bin/sigtest
 	cp programs/strace/strace.elf                     $(INITRD_STAGE)/bin/strace
 	cp programs/debugger/debugger.elf                 $(INITRD_STAGE)/bin/debugger
 	cp programs/pkgmgr/pkgmgr.elf                    $(INITRD_STAGE)/bin/pkgmgr
@@ -1709,7 +1712,7 @@ $(INITRD_TAR): $(PROGRAMS) initrd/etc/motd initrd/readme.txt \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
 	    bin/services bin/svc_crasher bin/stabilitytest                    \
 	    bin/hwinfo bin/drvmatch bin/hwcompat bin/hwreport bin/compattest  \
-	    bin/tobycc bin/tobybuild bin/selfhosttest \
+	    bin/sigtest bin/tobycc bin/tobybuild bin/selfhosttest \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    repo/helloapp.tpkg repo/helloapp_v2.tpkg                          \

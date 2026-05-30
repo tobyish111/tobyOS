@@ -33,6 +33,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/notify.h>
 #include <tobyos/slog.h>
+#include <tobyos/pit.h>
 #include <tobyos/abi/abi.h>
 
 #define LOGIN_SERVICE_NAME "login"
@@ -53,6 +54,104 @@ static void copy_capped(char *dst, const char *src, size_t cap) {
         for (; i + 1 < cap && src[i]; i++) dst[i] = src[i];
     }
     dst[i] = '\0';
+}
+
+/* ---- login rate-limiting / account lockout ----
+ *
+ * Per-username failed-attempt throttle. After LOGIN_MAX_FAILS consecutive
+ * bad attempts the account is locked for LOGIN_LOCKOUT_MS; further attempts
+ * are rejected without even running the (deliberately expensive) Argon2
+ * verify, which both rate-limits online brute force and avoids burning CPU.
+ *
+ * Failures are keyed on the *typed* username, so unknown users are throttled
+ * too -- this bounds username-enumeration probing and keeps the table from
+ * being a free oracle. The counter resets if the previous failure was longer
+ * than LOGIN_FAIL_WINDOW_MS ago (so an occasional typo doesn't accumulate
+ * toward a lockout), and is cleared entirely on a successful login.
+ *
+ * The table is fixed-size; when full we evict the least-recently-touched
+ * slot. Time comes from the monotonic PIT tick (unaffected by RTC/wall-clock
+ * changes). */
+
+#define LOGIN_MAX_FAILS       5
+#define LOGIN_LOCKOUT_MS      30000ULL   /* lock for 30 s after MAX_FAILS */
+#define LOGIN_FAIL_WINDOW_MS  30000ULL   /* forget stale failures after 30 s */
+#define LOGIN_THROTTLE_SLOTS  (USER_MAX + 4)
+
+static struct login_throttle {
+    char     name[SESSION_USER_MAX];
+    int      fails;
+    uint64_t last_touch_ms;     /* last attempt (for LRU eviction)      */
+    uint64_t lockout_until_ms;  /* 0 == not locked                      */
+} g_throttle[LOGIN_THROTTLE_SLOTS];
+
+static uint64_t login_now_ms(void) {
+    uint32_t hz = pit_hz();
+    if (!hz) return 0;
+    return pit_ticks() * 1000ULL / hz;
+}
+
+static struct login_throttle *throttle_find(const char *name) {
+    for (int i = 0; i < LOGIN_THROTTLE_SLOTS; i++) {
+        if (g_throttle[i].name[0] && strcmp(g_throttle[i].name, name) == 0)
+            return &g_throttle[i];
+    }
+    return 0;
+}
+
+/* Find the slot for `name`, allocating one (empty slot, else LRU eviction)
+ * if it does not already exist. */
+static struct login_throttle *throttle_get(const char *name, uint64_t now) {
+    struct login_throttle *t = throttle_find(name);
+    if (t) return t;
+
+    struct login_throttle *victim = &g_throttle[0];
+    for (int i = 0; i < LOGIN_THROTTLE_SLOTS; i++) {
+        if (!g_throttle[i].name[0]) { victim = &g_throttle[i]; break; }
+        if (g_throttle[i].last_touch_ms < victim->last_touch_ms)
+            victim = &g_throttle[i];
+    }
+    memset(victim, 0, sizeof(*victim));
+    copy_capped(victim->name, name, SESSION_USER_MAX);
+    victim->last_touch_ms = now;
+    return victim;
+}
+
+/* If `name` is currently locked out, return the remaining seconds (>=1);
+ * otherwise return 0. Expired lockouts are cleared as a side effect. */
+static unsigned throttle_locked_secs(const char *name, uint64_t now) {
+    struct login_throttle *t = throttle_find(name);
+    if (!t || t->lockout_until_ms == 0) return 0;
+    if (now < t->lockout_until_ms) {
+        uint64_t rem = t->lockout_until_ms - now;
+        return (unsigned)((rem + 999) / 1000);
+    }
+    /* Lockout window has elapsed -- start the user fresh. */
+    t->lockout_until_ms = 0;
+    t->fails = 0;
+    return 0;
+}
+
+static void throttle_record_fail(const char *name, uint64_t now) {
+    struct login_throttle *t = throttle_get(name, now);
+    if (!t) return;
+    if (t->last_touch_ms && now - t->last_touch_ms > LOGIN_FAIL_WINDOW_MS)
+        t->fails = 0;   /* stale: forget the old streak */
+    t->fails++;
+    t->last_touch_ms = now;
+    if (t->fails >= LOGIN_MAX_FAILS && t->lockout_until_ms == 0) {
+        t->lockout_until_ms = now + LOGIN_LOCKOUT_MS;
+        kprintf("[session] '%s' locked out for %llus after %d failed attempts\n",
+                name, (unsigned long long)(LOGIN_LOCKOUT_MS / 1000), t->fails);
+        SLOG_WARN(SLOG_SUB_AUDIT,
+                  "login LOCKOUT user='%s' fails=%d lock_ms=%llu",
+                  name, t->fails, (unsigned long long)LOGIN_LOCKOUT_MS);
+    }
+}
+
+static void throttle_clear(const char *name) {
+    struct login_throttle *t = throttle_find(name);
+    if (t) memset(t, 0, sizeof(*t));
 }
 
 int session_current_id(void) { return g.active ? g.id : 0; }
@@ -81,14 +180,28 @@ int session_login(const char *username, const char *password) {
                   "login REJECT reason=empty-username");
         return -1;
     }
+
+    /* Rate-limit before doing any (expensive) credential work. */
+    uint64_t now = login_now_ms();
+    unsigned locked = throttle_locked_secs(username, now);
+    if (locked) {
+        kprintf("[session] login refused: '%s' locked out (%us remaining)\n",
+                username, locked);
+        SLOG_WARN(SLOG_SUB_AUDIT,
+                  "login REJECT user='%s' reason=locked-out remaining_s=%u",
+                  username, locked);
+        return -1;
+    }
+
     /* Validate against the on-disk users database. Reject unknown names
-     * outright -- this is the entirety of "authentication" in milestone
-     * 15. The on-disk file has no password column. */
+     * outright. Unknown-user rejections still count toward the lockout so
+     * the throttle also blunts username-enumeration probing. */
     const struct user *u = users_lookup_by_name(username);
     if (!u) {
         kprintf("[session] login refused: unknown user '%s'\n", username);
         SLOG_WARN(SLOG_SUB_AUDIT,
                   "login REJECT user='%s' reason=unknown-user", username);
+        throttle_record_fail(username, now);
         return -1;
     }
 
@@ -96,8 +209,12 @@ int session_login(const char *username, const char *password) {
         kprintf("[session] login refused: bad password for '%s'\n", username);
         SLOG_WARN(SLOG_SUB_AUDIT,
                   "login REJECT user='%s' reason=bad-password", username);
+        throttle_record_fail(username, now);
         return -1;
     }
+
+    /* Success -- forget any accumulated failures for this user. */
+    throttle_clear(username);
 
     /* Bump the id even on a re-login so any orphaned tagged procs are
      * automatically de-tagged from the new session. */

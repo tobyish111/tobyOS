@@ -205,7 +205,13 @@ long sys_fork(void) {
     child->syscall_count  = 0;
     child->last_switch_tsc = 0;
     child->sysprot_priv   = 0;
-    signal_init_proc(&child->sigstate);
+    /* POSIX fork: the child inherits the parent's signal dispositions, mask,
+     * and sigreturn trampoline (already copied by the memcpy above), but
+     * starts with NO pending signals. (Previously this reset all handlers,
+     * which both lost the inherited restorer and wrongly kept the parent's
+     * copied pending bits.) */
+    child->pending_signals  = 0;
+    child->sigstate.pending = 0;
 
     /* Allocate a new PML4 with the kernel half mirrored. */
     uint64_t new_pml4 = vmm_create_user_pml4();

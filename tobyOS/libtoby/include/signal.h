@@ -31,6 +31,11 @@
 #define SA_SIGINFO   0x00000004
 #define SA_NOCLDSTOP 0x00000001
 
+/* sigprocmask `how` values */
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+
 typedef unsigned long sigset_t;
 
 struct sigaction {

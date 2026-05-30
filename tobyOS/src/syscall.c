@@ -2512,15 +2512,18 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Phase 1 M1.3: Signal syscalls ---- */
 
     case ABI_SYS_SIGACTION:
-        return sys_sigaction((int)a1, (const struct sigaction *)(uintptr_t)a2,
-                            (struct sigaction *)(uintptr_t)a3);
+        return sys_sigaction((int)a1, (const void *)(uintptr_t)a2,
+                            (void *)(uintptr_t)a3);
 
     case ABI_SYS_SIGPROCMASK:
-        return sys_sigprocmask((int)a1, (const sigset_t *)(uintptr_t)a2,
-                              (sigset_t *)(uintptr_t)a3);
+        return sys_sigprocmask((int)a1, (const void *)(uintptr_t)a2,
+                              (void *)(uintptr_t)a3);
 
     case ABI_SYS_SIGRETURN:
-        sys_sigreturn();
+        return sys_sigreturn();
+
+    case ABI_SYS_SIGRESTORER:
+        sys_sigrestorer((uint64_t)a1);
         return 0;
 
     case ABI_SYS_KILL:
@@ -2778,9 +2781,11 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
 
     /* Safe point #1: every syscall return runs through here. If the
      * kernel (or another proc, or the keyboard IRQ) sent us a signal
-     * during the body, deliver it now -- proc_exit never returns. The
-     * value already in `rv` is irrelevant in that case. */
-    signal_deliver_if_pending();
+     * during the body, deliver it now -- for a caught signal this pushes a
+     * handler frame and rewrites our trapframe so the SYSRETQ below lands in
+     * the handler; for a fatal default it proc_exit()s and never returns.
+     * `rv` is preserved as the to-be-restored RAX for the handler case. */
+    signal_deliver_syscall(rv);
 
     /* Re-mask interrupts before we return into the .S unwind. The
      * trampoline pops 14 registers and then does `mov rsp, [rsp]` to

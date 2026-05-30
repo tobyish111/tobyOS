@@ -15,6 +15,53 @@
 
 static int g_foreground_pid = 0;
 
+/* Marker stamped into the on-user-stack signal frame; sys_sigreturn refuses
+ * to restore a frame without it (a corrupt/forged frame -> SIGSEGV). */
+#define SIG_FRAME_MAGIC  0x5347465254423031ULL  /* "SGFRTB01" */
+
+/* Mirror of the register block syscall_entry.S leaves on the per-process
+ * kernel syscall stack. Listed in ASCENDING address order, which is the
+ * REVERSE of the push order. The base address of this block is
+ * `current_proc()->kstack_top - sizeof(struct syscall_regs)` because the
+ * scheduler keeps g_kernel_syscall_rsp == current kstack_top (sched.c) and
+ * syscall_entry pushes downward from there.
+ *
+ * THIS MUST STAY IN SYNC WITH THE PUSH SEQUENCE IN syscall_entry.S. */
+struct syscall_regs {
+    uint64_t r15, r14, r13, r12, rbp, rbx;   /* callee-saved          */
+    uint64_t r9, r8, r10, rdx, rsi, rdi;     /* user syscall arg regs */
+    uint64_t r11;        /* user RFLAGS (SYSRETQ reloads from here)   */
+    uint64_t rcx;        /* user RIP    (SYSRETQ reloads from here)   */
+    uint64_t pad;        /* 16-byte alignment pad                     */
+    uint64_t user_rsp;   /* saved user RSP                            */
+};
+
+/* Saved user context pushed onto the user stack for a caught signal and read
+ * back by sys_sigreturn. It sits ABOVE the 8-byte handler return address so
+ * the handler's own stack growth (downward) never clobbers it. rcx/r11 are
+ * intentionally absent: the `syscall` instruction clobbers them by ABI, so
+ * the interrupted user code already treats them as dead. */
+struct sig_context {
+    uint64_t rax;        /* syscall return value at the interruption point */
+    uint64_t rdi, rsi, rdx, r10, r8, r9;
+    uint64_t rbx, rbp, r12, r13, r14, r15;
+    uint64_t rip;        /* resume RIP    */
+    uint64_t rsp;        /* resume RSP    */
+    uint64_t rflags;     /* resume RFLAGS */
+    uint64_t saved_mask; /* signal mask to restore */
+    uint64_t magic;
+};
+
+/* Locate the current process's saved syscall register block. Only valid on
+ * the SYSCALL return path (where the block was just pushed by the asm
+ * trampoline); returns NULL for pid 0 / kernel threads. */
+static struct syscall_regs *current_syscall_regs(void) {
+    struct proc *p = current_proc();
+    if (!p || p->pid == 0 || !p->kstack_top) return 0;
+    return (struct syscall_regs *)((uint8_t *)p->kstack_top
+                                   - sizeof(struct syscall_regs));
+}
+
 void signal_init(void) {
     g_foreground_pid = 0;
     kprintf("[signal] POSIX signal subsystem ready (%d signals)\n", SIG_MAX);
@@ -110,7 +157,80 @@ static int signal_default_action(int sig) {
     }
 }
 
-void signal_deliver_if_pending(void) {
+/* Apply the default disposition (terminate / ignore / stop) for `sig`.
+ * Never returns when the action is "terminate". */
+static void signal_apply_default(struct proc *p, int sig) {
+    int action = signal_default_action(sig);
+    if (action == 0) return;          /* ignore */
+    if (action == 1) {                /* terminate */
+        if (g_foreground_pid == p->pid) g_foreground_pid = 0;
+        kprintf("[signal] pid=%d '%s' killed by signal %d\n",
+                p->pid, p->name, sig);
+        proc_exit(128 + sig);
+    }
+    /* action == 2 (stop): job control not implemented -- treat as ignore. */
+}
+
+/* Build a signal frame on the user stack and redirect the saved syscall
+ * trapframe so the SYSRETQ at the end of the syscall path lands in the
+ * handler instead of the interrupted instruction. Returns false if no frame
+ * could be built (no restorer registered) -- caller then falls back to the
+ * default disposition. Requires a valid `regs` (syscall return path). */
+static bool signal_setup_user_frame(struct proc *p, int sig,
+                                     struct sigaction *sa,
+                                     struct syscall_regs *regs, long rv) {
+    if (!regs) return false;
+    if (p->sigstate.restorer == 0) {
+        kprintf("[signal] pid=%d sig %d: no sigreturn trampoline registered; "
+                "applying default action\n", p->pid, sig);
+        return false;
+    }
+
+    /* Carve the frame out of the user stack, below the SysV red zone. */
+    uint64_t sp = regs->user_rsp;
+    sp -= 128;                                /* skip the 128-byte red zone */
+    sp -= sizeof(struct sig_context);
+    sp &= ~(uint64_t)0xF;                     /* 16-align the context base  */
+    struct sig_context *ctx = (struct sig_context *)sp;
+
+    ctx->rax = (uint64_t)rv;
+    ctx->rdi = regs->rdi; ctx->rsi = regs->rsi; ctx->rdx = regs->rdx;
+    ctx->r10 = regs->r10; ctx->r8  = regs->r8;  ctx->r9 = regs->r9;
+    ctx->rbx = regs->rbx; ctx->rbp = regs->rbp;
+    ctx->r12 = regs->r12; ctx->r13 = regs->r13;
+    ctx->r14 = regs->r14; ctx->r15 = regs->r15;
+    ctx->rip       = regs->rcx;        /* original user RIP    */
+    ctx->rsp       = regs->user_rsp;   /* original user RSP    */
+    ctx->rflags    = regs->r11;        /* original user RFLAGS */
+    ctx->saved_mask = p->sigstate.mask;
+    ctx->magic     = SIG_FRAME_MAGIC;
+
+    /* Push the handler's return address (the restorer trampoline) one slot
+     * below the context. Handler entry RSP must be %16==8 per SysV; since
+     * the context base is 16-aligned, frame = ctx-8 satisfies that. */
+    uint64_t frame = (uint64_t)sp - 8;
+    *(uint64_t *)frame = p->sigstate.restorer;
+
+    /* Block the signal (and sa_mask) for the duration of the handler unless
+     * SA_NODEFER. SIGKILL/SIGSTOP can never be blocked. */
+    sigset_t newmask = p->sigstate.mask | sa->sa_mask;
+    if (!(sa->sa_flags & SA_NODEFER)) newmask |= SIGMASK(sig);
+    newmask &= ~(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
+    p->sigstate.mask = newmask;
+
+    if (sa->sa_flags & SA_RESETHAND) sa->sa_handler = SIG_DFL;
+
+    /* Redirect the return-to-user: RIP -> handler, RSP -> frame, RDI -> sig. */
+    regs->rcx      = (uint64_t)(uintptr_t)sa->sa_handler;
+    regs->user_rsp = frame;
+    regs->rdi      = (uint64_t)sig;
+    return true;
+}
+
+/* Core delivery. `regs` is the saved syscall trapframe on the SYSCALL return
+ * path, or NULL when called from an IRQ (PIT) where no such frame exists.
+ * `rv` is the syscall return value (only meaningful when regs != NULL). */
+static void signal_deliver(struct syscall_regs *regs, long rv) {
     struct proc *p = current_proc();
     if (!p || p->pending_signals == 0) return;
     if (p->pid == 0) {
@@ -119,10 +239,10 @@ void signal_deliver_if_pending(void) {
         return;
     }
 
-    /* Find lowest deliverable signal (unblocked or SIGKILL/SIGSTOP) */
+    /* Lowest-numbered deliverable signal (unblocked, plus the two that can
+     * never be blocked). */
     uint32_t deliverable = p->pending_signals & ~p->sigstate.mask;
     deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
-
     if (deliverable == 0) return;
 
     int sig = 0;
@@ -131,117 +251,152 @@ void signal_deliver_if_pending(void) {
     }
     if (sig == 0) return;
 
-    /* Clear from pending */
-    p->pending_signals &= ~SIGMASK(sig);
+    struct sigaction *sa = &p->sigstate.actions[sig];
+
+    /* A caught (user-handler) signal can only be delivered when we have a
+     * trapframe to rewrite. On the IRQ path we leave it pending so the next
+     * syscall return delivers it -- do NOT consume it here. */
+    bool caught = (sig != SIGKILL &&
+                   sa->sa_handler != SIG_DFL && sa->sa_handler != SIG_IGN);
+    if (caught && !regs) return;
+
+    /* Committed to acting on this signal -- consume it. */
+    p->pending_signals  &= ~SIGMASK(sig);
     p->sigstate.pending &= ~SIGMASK(sig);
 
-    /* SIGKILL is always fatal, cannot be caught */
+    /* SIGKILL is always fatal and can never be caught. */
     if (sig == SIGKILL) {
         if (g_foreground_pid == p->pid) g_foreground_pid = 0;
         kprintf("[signal] pid=%d killed by SIGKILL\n", p->pid);
         proc_exit(128 + sig);
     }
 
-    struct sigaction *sa = &p->sigstate.actions[sig];
-
-    /* If handler is SIG_IGN, do nothing */
     if (sa->sa_handler == SIG_IGN) return;
 
-    /* If handler is SIG_DFL, apply default action */
     if (sa->sa_handler == SIG_DFL) {
-        int action = signal_default_action(sig);
-        if (action == 0) return; /* ignore */
-        if (action == 1) {
-            /* terminate */
-            if (g_foreground_pid == p->pid) g_foreground_pid = 0;
-            kprintf("[signal] pid=%d '%s' killed by signal %d\n",
-                    p->pid, p->name, sig);
-            proc_exit(128 + sig);
-        }
-        /* action == 2: stop (not yet implemented, just ignore) */
+        signal_apply_default(p, sig);
         return;
     }
 
-    /* User handler: we would normally set up a signal frame on the user
-     * stack and redirect execution to the handler. For now, we invoke
-     * the handler "synchronously" by saving the signal number and
-     * letting the user trampoline call it.
-     *
-     * Full signal frame setup requires modifying the iret/sysret frame
-     * that's about to return to userland. Since signal_deliver_if_pending
-     * is called from the syscall return path, we need access to the
-     * saved user context. For the initial implementation, we use a
-     * simplified approach:
-     *   - Store that a signal needs delivery
-     *   - The user-mode trampoline checks and calls the handler
-     *
-     * TODO: Full kernel-side signal frame push (Phase 2 refinement)
-     * For now, just execute the default action for handled signals
-     * since the user handler mechanism requires more infrastructure. */
+    /* User handler: set up the frame; fall back to default if we can't. */
+    if (!signal_setup_user_frame(p, sig, sa, regs, rv))
+        signal_apply_default(p, sig);
+}
 
-    /* Reset handler if SA_RESETHAND */
-    if (sa->sa_flags & SA_RESETHAND) {
-        sa->sa_handler = SIG_DFL;
-    }
+/* IRQ-context entry (PIT). Handles fatal/default dispositions; caught
+ * handlers are deferred to the next syscall return. */
+void signal_deliver_if_pending(void) {
+    signal_deliver(0, 0);
+}
 
-    /* For now, treat user handlers as "caught but default action" */
-    kprintf("[signal] pid=%d signal %d caught (handler at %p)\n",
-            p->pid, sig, (void *)sa->sa_handler);
-    /* Don't kill - the signal was caught */
-    return;
+/* SYSCALL-return entry. Has access to the saved trapframe, so it can deliver
+ * caught handlers by pushing a signal frame and redirecting the return. */
+void signal_deliver_syscall(long rv) {
+    signal_deliver(current_syscall_regs(), rv);
 }
 
 /* ---- Syscall implementations ---- */
 
-int sys_sigaction(int sig, const struct sigaction *act,
-                  struct sigaction *oldact) {
+/* On-user-stack layout of `struct sigaction`, matching libtoby's
+ * <signal.h>. NOTE: libtoby's sigset_t is 64-bit (`unsigned long`) while the
+ * kernel keeps a 32-bit internal mask, so the user struct is 24 bytes, not
+ * 16. We MUST marshal field-by-field through this view -- a wholesale
+ * `*kern = *user` struct copy would misread sa_flags from the wrong offset
+ * (the old code did exactly that, which is why sa_flags was always garbage
+ * before handler delivery existed). */
+struct abi_sigaction {
+    uint64_t sa_handler;
+    uint64_t sa_mask;     /* user sigset_t is 64-bit */
+    uint32_t sa_flags;
+    uint32_t _pad;
+};
+
+int sys_sigaction(int sig, const void *uact, void *uoldact) {
     struct proc *p = current_proc();
     if (!p) return -1;
     if (sig <= 0 || sig >= SIG_MAX) return -22; /* EINVAL */
     if (sig == SIGKILL || sig == SIGSTOP) return -22; /* can't change */
 
-    if (oldact) {
-        *oldact = p->sigstate.actions[sig];
+    struct sigaction *cur = &p->sigstate.actions[sig];
+
+    if (uoldact) {
+        struct abi_sigaction *old = (struct abi_sigaction *)uoldact;
+        old->sa_handler = (uint64_t)(uintptr_t)cur->sa_handler;
+        old->sa_mask    = (uint64_t)cur->sa_mask;
+        old->sa_flags   = (uint32_t)cur->sa_flags;
+        old->_pad       = 0;
     }
-    if (act) {
-        p->sigstate.actions[sig] = *act;
+    if (uact) {
+        const struct abi_sigaction *a = (const struct abi_sigaction *)uact;
+        cur->sa_handler = (void (*)(int))(uintptr_t)a->sa_handler;
+        cur->sa_mask    = (sigset_t)a->sa_mask;
+        cur->sa_flags   = (int)a->sa_flags;
     }
     return 0;
 }
 
-int sys_sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
+int sys_sigprocmask(int how, const void *uset, void *uoldset) {
     struct proc *p = current_proc();
     if (!p) return -1;
 
-    if (oldset) *oldset = p->sigstate.mask;
+    /* User sigset_t is 64-bit; read/write the full 8 bytes even though only
+     * the low SIG_MAX bits are meaningful here. */
+    if (uoldset) *(uint64_t *)uoldset = (uint64_t)p->sigstate.mask;
 
-    if (set) {
-        sigset_t s = *set;
-        /* Cannot block SIGKILL or SIGSTOP */
-        s &= ~(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
+    if (uset) {
+        uint64_t s = *(const uint64_t *)uset;
+        s &= ~(uint64_t)(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
 
         switch (how) {
-        case SIG_BLOCK:
-            p->sigstate.mask |= s;
-            break;
-        case SIG_UNBLOCK:
-            p->sigstate.mask &= ~s;
-            break;
-        case SIG_SETMASK:
-            p->sigstate.mask = s;
-            break;
-        default:
-            return -22; /* EINVAL */
+        case SIG_BLOCK:   p->sigstate.mask |= (sigset_t)s;  break;
+        case SIG_UNBLOCK: p->sigstate.mask &= ~(sigset_t)s; break;
+        case SIG_SETMASK: p->sigstate.mask  = (sigset_t)s;  break;
+        default:          return -22; /* EINVAL */
         }
     }
     return 0;
 }
 
-void sys_sigreturn(void) {
-    /* Placeholder for full signal frame restoration.
-     * When we implement full signal frames, this syscall restores
-     * the saved register context from the signal frame on the user
-     * stack. For now, it's a no-op. */
+/* Register the user-space sigreturn trampoline. Called once by libc startup
+ * (lazily, on the first sigaction). The kernel pushes this address as the
+ * handler's return address so that when the handler returns it traps back
+ * into sys_sigreturn. */
+void sys_sigrestorer(uint64_t addr) {
+    struct proc *p = current_proc();
+    if (p) p->sigstate.restorer = addr;
+}
+
+/* Restore the interrupted context saved by signal_setup_user_frame. The
+ * handler has returned to the restorer trampoline, which issued SYS_SIGRETURN
+ * with RSP pointing at the saved sig_context. We copy that context back into
+ * the syscall trapframe so the SYSRETQ at the end of this very syscall
+ * resumes the originally-interrupted instruction. Returns the value to leave
+ * in the user's RAX. */
+long sys_sigreturn(void) {
+    struct proc *p = current_proc();
+    struct syscall_regs *regs = current_syscall_regs();
+    if (!p || !regs) return -1;
+
+    struct sig_context *ctx = (struct sig_context *)regs->user_rsp;
+    if (ctx->magic != SIG_FRAME_MAGIC) {
+        kprintf("[signal] pid=%d sigreturn: bad frame magic 0x%llx -- "
+                "killing\n", p->pid, (unsigned long long)ctx->magic);
+        if (g_foreground_pid == p->pid) g_foreground_pid = 0;
+        proc_exit(128 + SIGSEGV);
+    }
+
+    regs->rdi = ctx->rdi; regs->rsi = ctx->rsi; regs->rdx = ctx->rdx;
+    regs->r10 = ctx->r10; regs->r8  = ctx->r8;  regs->r9 = ctx->r9;
+    regs->rbx = ctx->rbx; regs->rbp = ctx->rbp;
+    regs->r12 = ctx->r12; regs->r13 = ctx->r13;
+    regs->r14 = ctx->r14; regs->r15 = ctx->r15;
+    regs->rcx      = ctx->rip;      /* resume RIP    */
+    regs->r11      = ctx->rflags;   /* resume RFLAGS */
+    regs->user_rsp = ctx->rsp;      /* resume RSP    */
+
+    p->sigstate.mask = (sigset_t)ctx->saved_mask;
+
+    return (long)ctx->rax;          /* becomes user RAX after SYSRETQ */
 }
 
 int sys_kill(int pid, int sig) {

@@ -99,25 +99,37 @@ void signal_send(struct proc *p, int sig);
 void signal_send_to_pid(int pid, int sig);
 void signal_send_to_foreground(int sig);
 
-/* Check and deliver pending signals. For signals with user handlers,
- * this sets up a signal frame on the user stack and modifies the
- * return-to-user RIP/RSP. */
+/* Check and deliver pending signals from an IRQ (PIT) context, where no
+ * saved syscall trapframe exists. Handles fatal/default dispositions;
+ * caught (user-handler) signals are left pending for the next syscall
+ * return to deliver. */
 void signal_deliver_if_pending(void);
+
+/* Check and deliver pending signals from the SYSCALL return path. `rv` is
+ * the syscall's return value. For a signal with a user handler this pushes a
+ * signal frame onto the user stack and rewrites the saved trapframe so the
+ * SYSRETQ lands in the handler; sys_sigreturn later restores the context. */
+void signal_deliver_syscall(long rv);
 
 /* Quick non-destructive query */
 bool signal_pending_self(void);
 
 /* ---- Syscall implementations ---- */
 
-/* sigaction: install/query signal handler */
-int sys_sigaction(int sig, const struct sigaction *act,
-                  struct sigaction *oldact);
+/* sigaction: install/query signal handler. act/oldact point at the user
+ * `struct sigaction` (libtoby ABI: 64-bit sa_mask), marshalled internally. */
+int sys_sigaction(int sig, const void *act, void *oldact);
 
-/* sigprocmask: modify signal mask */
-int sys_sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+/* sigprocmask: modify signal mask. set/oldset point at a user 64-bit
+ * sigset_t. */
+int sys_sigprocmask(int how, const void *set, void *oldset);
 
-/* sigreturn: restore context after signal handler returns */
-void sys_sigreturn(void);
+/* sigreturn: restore the context saved when a handler was entered. Returns
+ * the value to leave in the user's RAX (the interrupted syscall's result). */
+long sys_sigreturn(void);
+
+/* sigrestorer: register the user-space sigreturn trampoline address. */
+void sys_sigrestorer(uint64_t addr);
 
 /* kill: send signal to process */
 int sys_kill(int pid, int sig);
