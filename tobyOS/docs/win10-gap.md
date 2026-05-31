@@ -85,13 +85,19 @@ driver model; POSIX libc surface.
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
 2. **App compatibility (~3%)** — no Win32/POSIX-compat runtime → no software ecosystem.
-3. **Real multi-core execution** — the per-CPU *foundation* is now built (per-CPU TSS,
-   GS-base SYSCALL stack, per-CPU current_proc, AP hardening parity). Remaining to actually
-   run user code on APs: a syscall-path big-kernel-lock (serialize kernel entry so user
-   code parallelizes without a full SMP-safety audit) OR per-subsystem locks for
-   VFS/GUI/proc-table; per-CPU idle contexts; AP pop-and-switch; then flip `enq_target_for`
-   to round-robin. Deferred from the 2026-05-30 push as it needs careful, real-HW-validated
-   testing (deadlock/race failure modes don't surface in short headless boots).
+3. **Real multi-core execution** — the per-CPU *foundation* is built and committed
+   (per-CPU TSS, GS-base SYSCALL stack, per-CPU current_proc, AP hardening parity).
+   A full flip (syscall-path BKL + per-CPU idle procs + AP pop-and-switch + work-steal)
+   was **prototyped and proved 2.62x on 4 CPU-bound workers** — APs genuinely run user
+   code in parallel — but it was **reverted** because it **deadlocks the desktop**: the
+   GUI relies on the cooperative model where pid 0 continuously runs `gui_tick`, and the
+   new scheduling parks the BSP on a blocked login proc so input/compositor events never
+   get generated (pid 0 ↔ login deadlock). It also exposed a non-deterministic
+   `current_proc()` inconsistency for the pid-0 kernel thread (proc_spawn/proc_wait racing
+   the scheduler → `ppid` wrong → proc_wait hangs). To land it: give pid 0 a proper
+   per-CPU idle separate from the GUI driver (or drive `gui_tick` from a dedicated kernel
+   thread/IRQ), and make kernel-thread proc management hold the BKL. Needs real-HW-validated
+   testing — deadlock/race modes don't surface reliably in short headless boots.
 4. **GPU-accelerated desktop on real hardware** — compositor accel only exists for VirtIO,
    not the Intel iGPU path used on the EliteDesk.
 5. **Security depth** — ~~salted/KDF auth~~ (Argon2id), ~~login rate-limiting~~ (lockout),
