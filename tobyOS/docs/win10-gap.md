@@ -17,11 +17,13 @@ survives clones and any agent can read/update it.
 
 ## Bottom line
 
-**~24% overall Win10 feature parity** (canvas baseline was ~16%). The 2026-05-30 work
+**~25% overall Win10 feature parity** (canvas baseline was ~16%). The 2026-05-30 work
 added the security-depth bundle (Argon2id auth, login lockout, real signal delivery, SMAP
-re-enabled behind a uaccess window) and an app-compatibility bump (SSE/FP enabled with
+re-enabled behind a uaccess window), an app-compatibility bump (SSE/FP enabled with
 FXSAVE context switching, `%f`/`%e`/`%g` printf, a 256 KiB user stack, and the marquee
-ports — including a working Lua interpreter — actually shipping in the initrd).
+ports — including a working Lua interpreter — actually shipping in the initrd), and the
+per-CPU multi-core foundation (per-CPU TSS / GS-base SYSCALL stack / current_proc; the
+round-robin flip is deferred).
 
 The percentage understates the real milestone: tobyOS now **boots to the desktop and gets
 on the network on real hardware** (HP EliteDesk 800, Intel CPU). The canvas scored a thing
@@ -39,7 +41,7 @@ honest number.
 
 | Subsystem | Canvas | Now | Notes |
 |---|---|---|---|
-| Scheduler / SMP | ~12% | ~13% | APs migrate work back to the BSP instead of stranding it, but still **do not run user code** (no per-CPU TSS). Apps are effectively single-core. Preemptive via PIT 1 kHz. No priority classes/MLFQ. |
+| Scheduler / SMP | ~12% | ~15% | **Per-CPU multi-core foundation now built & tested**: per-CPU TSS, per-CPU SYSCALL stack via GS base (no swapgs), per-CPU `current_proc`, AP CR0/CR4/EFER (SSE/SMEP/SMAP/NX) parity. APs still idle — the round-robin "flip" is deliberately deferred: it needs a syscall-path big-kernel-lock (or full per-subsystem locking) + per-CPU idle contexts + AP pop-and-switch, which can't be safely validated headlessly. heap+PMM+sched-queues are already spinlocked; VFS/GUI/proc-table are not. Preemptive via PIT 1 kHz. No priority classes/MLFQ. |
 | Memory | ~18% | ~24% | `swap_init` wired; **real CoW fork** (`vmm_cow_fork` + `mmap_cow_clone`, no longer eager-copy); demand paging live; ASLR/NX/SMEP. Still bitmap PMM, first-fit heap, no memory compression / large pages. |
 | Filesystem / Storage | ~20% | ~27% | TobyFS: **journaling** (replay on mount), **indirect blocks** (max file 64 KiB → ~4 MiB), **256-entry write-back buffer cache**. VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. Still no NTFS-class streams/ACLs; 4 MiB ≪ 16 TB. |
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
@@ -83,8 +85,13 @@ driver model; POSIX libc surface.
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
 2. **App compatibility (~3%)** — no Win32/POSIX-compat runtime → no software ecosystem.
-3. **Real multi-core execution** — APs need per-CPU TSS to run user threads; today extra
-   cores idle. (`sched.c` header documents this explicitly.)
+3. **Real multi-core execution** — the per-CPU *foundation* is now built (per-CPU TSS,
+   GS-base SYSCALL stack, per-CPU current_proc, AP hardening parity). Remaining to actually
+   run user code on APs: a syscall-path big-kernel-lock (serialize kernel entry so user
+   code parallelizes without a full SMP-safety audit) OR per-subsystem locks for
+   VFS/GUI/proc-table; per-CPU idle contexts; AP pop-and-switch; then flip `enq_target_for`
+   to round-robin. Deferred from the 2026-05-30 push as it needs careful, real-HW-validated
+   testing (deadlock/race failure modes don't surface in short headless boots).
 4. **GPU-accelerated desktop on real hardware** — compositor accel only exists for VirtIO,
    not the Intel iGPU path used on the EliteDesk.
 5. **Security depth** — ~~salted/KDF auth~~ (Argon2id), ~~login rate-limiting~~ (lockout),
@@ -95,7 +102,9 @@ driver model; POSIX libc surface.
 ---
 
 ## Known shallow / "present but not robust" items
-- SMP: cores boot but never run user code.
+- SMP: cores boot, run the kernel idle loop + take LAPIC timer IRQs, and now have the full
+  per-CPU plumbing to run user code — but the enqueue is still BSP-pinned, so user code
+  does not yet run on APs (the concurrency flip is deferred; see gap item #3).
 - IPv6: link-local only — no SLAAC/DHCPv6/global addressing.
 - Passwords: now salted Argon2id (was djb2). Still no account lockout / rate-limiting,
   no password policy, and no PAM-style pluggable auth.
@@ -141,6 +150,14 @@ driver model; POSIX libc surface.
   `[hardening] SMAP not available`. Under `qemu64,+smep,+smap` the full GUI desktop runs
   19 s with no #PF and `/bin/sigtest` passes. Security ~13% → ~15%. This is the fix the
   real-Skylake `CR2=0x400000` #PF was waiting on.
+- **2026-05-30** — **Multi-core foundation** (`smp`/`tss`/`sched`/`proc`/`syscall_entry.S`):
+  per-CPU TSS (one TSS/CPU, GDT slot reused at LTR), per-CPU SYSCALL stack via GS base
+  (gs:[0]/gs:[8], no swapgs — proc_switch no longer reloads the GS selector), per-CPU
+  `current_proc()`, and AP CR0/CR4/EFER parity (SSE+SMEP+SMAP+NX) in `hardening_init_ap`.
+  Enqueue still BSP-pinned, so behaviour is unchanged (APs idle) — verified: -smp 4 boots
+  clean, 4 CPUs online, per-CPU TSS installed, desktop runs, no faults. The round-robin
+  flip (needs a syscall BKL + per-CPU idle contexts + AP pop-switch) is deferred for
+  dedicated, real-HW-validated work. Scheduler/SMP ~13% → ~15%.
 - **2026-05-30** — App-compat: **SSE/floating-point enabled** (`hardening.c` sets CR0.EM=0/
   MP, CR4.OSFXSR|OSXMMEXCPT) with per-process **FXSAVE/FXRSTOR** context switching
   (`cpu.h`, `proc` `fpu_state[512]`, `sched.c`, first-entry restores in proc.c/fork.c/
