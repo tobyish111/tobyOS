@@ -89,7 +89,10 @@ extern __attribute__((noreturn)) void proc_enter_user_thread_asm(uint64_t rip,
  * Initial RSP : USER_STACK_TOP_VA - 16, OR -- if argv is supplied --
  *               just below the argc/argv/envp/string pool we packed at
  *               the top of the stack (see pack_argv_envp_on_user_stack). */
-#define USER_STACK_PAGES     8
+/* 64 pages = 256 KiB. The old 8-page (32 KiB) stack was too small for
+ * non-trivial ported programs (e.g. interpreters with sizable frames);
+ * 256 KiB is a sane default while still tiny next to a Linux 8 MiB stack. */
+#define USER_STACK_PAGES     64
 #define USER_STACK_BYTES     (USER_STACK_PAGES * PAGE_SIZE)
 #define USER_STACK_TOP_VA    0x0000800000000000ULL
 #define USER_STACK_TOP_PAGE  (USER_STACK_TOP_VA - USER_STACK_BYTES)
@@ -179,6 +182,9 @@ void proc_init(void) {
     k->kstack_base = 0;            /* uses the boot stack -- never freed */
     k->kstack_top  = 0;
     k->wait_pid    = -1;
+    /* pid 0 goes through sched_yield's fpu_save/restore like any proc, so
+     * its FXSAVE area must be a valid clean state from the start. */
+    fpu_init_default(k->fpu_state);
     /* Milestone 25A: pid 0 has no per-proc heap and starts at "/". */
     k->brk_base = k->brk_cur = k->brk_max = 0;
     k->cwd[0] = '/'; k->cwd[1] = '\0';
@@ -446,6 +452,10 @@ static bool build_kstack(struct proc *p) {
     memset(base, 0, PROC_KSTACK_SZ);
     p->kstack_base = base;
     p->kstack_top  = (uint8_t *)base + PROC_KSTACK_SZ;
+
+    /* Clean default FPU/SSE state for this new process, restored on its
+     * first entry by proc_first_user_entry (see cpu.h fpu_init_default). */
+    fpu_init_default(p->fpu_state);
 
     /* Build the fake initial frame (memory from high -> low, top -> bot):
      *   [padding]               -- 8 B for SysV 16-B alignment after ret
@@ -856,6 +866,10 @@ int proc_spawn(const struct proc_spec *spec) {
  * point at our kstack_top. Drop to ring 3. */
 __attribute__((noreturn)) void proc_first_user_entry(void) {
     struct proc *p = current_proc();
+    /* Load this process's initial FPU/SSE state (we arrived via a context
+     * switch that saved the PREVIOUS proc's state but couldn't restore ours
+     * -- first-run procs never parked in sched_yield's restore). */
+    fpu_restore(p->fpu_state);
     /* For threads, pass the thread arg in RDI and load TLS base */
     if (p->is_thread) {
         if (p->tls_base)

@@ -98,6 +98,11 @@ struct proc {
     /* Saved kernel SP across cooperative context switches. */
     uint64_t        saved_rsp;
 
+    /* x87/SSE FPU state (FXSAVE image), saved/restored across context
+     * switches now that SSE is enabled and user code (incl. printf %f) uses
+     * XMM. 16-byte aligned as fxsave/fxrstor require. */
+    uint8_t         fpu_state[512] __attribute__((aligned(16)));
+
     /* User stack (NULL/0 for kernel_main). */
     uint64_t        user_stack_base;
     size_t          user_stack_pages;

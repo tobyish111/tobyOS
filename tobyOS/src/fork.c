@@ -141,6 +141,9 @@ static __attribute__((noreturn)) void fork_child_entry(void);
 
 static __attribute__((noreturn)) void fork_child_entry(void) {
     struct proc *p = current_proc();
+    /* Load the child's FPU/SSE state (copied from the parent at fork time)
+     * -- the switch that landed us here restored the previous proc's state. */
+    fpu_restore(p->fpu_state);
     proc_enter_user_asm(p->user_entry, p->user_rsp);
 }
 

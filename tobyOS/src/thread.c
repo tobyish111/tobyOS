@@ -179,6 +179,8 @@ int thread_create(uint64_t entry, uint64_t arg,
      *
      * proc_context_switch does: popfq, pop r15..r12, pop rbx, pop rbp, ret
      */
+    /* Clean default FPU/SSE state -- proc_first_user_entry fxrstor's it. */
+    fpu_init_default(t->fpu_state);
     {
         uint64_t *sp = (uint64_t *)t->kstack_top;
         sp -= 1;  /* alignment padding */

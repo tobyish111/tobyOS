@@ -87,6 +87,28 @@ static inline void write_cr3(uint64_t v) {
     __asm__ volatile ("mov %0, %%cr3" : : "r"(v) : "memory");
 }
 
+/* ---- x87/SSE FPU state (FXSAVE area, 512 bytes, 16-byte aligned) ----
+ *
+ * Since SSE is enabled (hardening.c) and user code -- including libtoby's
+ * printf %f path -- now uses XMM, each process's FPU/SSE state must be
+ * saved and restored across context switches. fxsave/fxrstor are valid in
+ * the -mno-sse kernel (they only move state, no SSE arithmetic). */
+static inline void fpu_save(void *area) {
+    __asm__ volatile ("fxsave (%0)" :: "r"(area) : "memory");
+}
+static inline void fpu_restore(const void *area) {
+    __asm__ volatile ("fxrstor (%0)" :: "r"(area) : "memory");
+}
+/* Initialise an FXSAVE area to a clean default: x87 control word 0x037F
+ * (round-to-nearest, all exceptions masked) and MXCSR 0x1F80 (all SSE
+ * exceptions masked). Everything else zero. */
+static inline void fpu_init_default(void *area) {
+    uint8_t *p = (uint8_t *)area;
+    for (int i = 0; i < 512; i++) p[i] = 0;
+    p[0] = 0x7F; p[1] = 0x03;          /* FCW  @ offset 0  */
+    p[24] = 0x80; p[25] = 0x1F;        /* MXCSR @ offset 24 */
+}
+
 /* MSR access -- needed to flip EFER.NXE on so NX bits in PTEs are
  * honoured. rdmsr returns lo|hi in edx:eax; we splice them in C. */
 static inline uint64_t rdmsr(uint32_t msr) {

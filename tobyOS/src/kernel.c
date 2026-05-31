@@ -3509,6 +3509,33 @@ void _start(void) {
     }
 #endif
 
+#ifdef LUATEST_BOOT
+    /* Opt-in Lua app-compat harness (build EXTRA_CFLAGS+=-DLUATEST_BOOT).
+     * Runs /bin/lua on /etc/lua_selftest.lua, which prints "LUATEST: ALL OK"
+     * when the interpreter (incl. string.format/rep/upper/lower, math.*) is
+     * working. Demonstrates real Lua scripts executing on tobyOS. */
+    {
+        kprintf("[boot] LUATEST: spawning /bin/lua /etc/lua_selftest.lua\n");
+        char *argv[] = { (char *)"lua", (char *)"/etc/lua_selftest.lua", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/lua",
+            .name = "luatest-boot",
+            .argc = 2,
+            .argv = argv,
+            .envc = 1,
+            .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LUATEST: /bin/lua not spawned (rc=%d) MISSING\n", pid);
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] LUATEST: /bin/lua (pid=%d) exit=%d\n", pid, rc);
+        }
+    }
+#endif
+
 #ifdef M36_SELFTEST
     /* Milestone 36E: in-OS compile + run self-test (TobyC stage-1). */
     {

@@ -11,13 +11,17 @@
  *   printf()    -> fd sink that calls write(1, ...)
  *   fprintf()   -> FILE * sink that ultimately calls write(fileno, ...)
  *
- * Supported conversions: %c %s %d %i %u %x %X %o %p %ld %li %lu %lx %zu %%
+ * Supported conversions: %c %s %d %i %u %x %X %o %p %ld %li %lu %lx %zu
+ *                         %f %F %e %E %g %G %%
  * Flags:    -  +  (space)  #  0
  * Width:    nnn or *
- * Precision: .nnn or .*  (max chars for %s; min digits for %d/%u/%x/...)
+ * Precision: .nnn or .*  (max chars for %s; min digits for %d/%u/%x/...;
+ *                         fractional/significant digits for floats)
  *
- * No floating-point conversions yet -- our sample programs and the
- * planned M25E ports (cat/ls/echo/wc/sh) don't use them.
+ * Floating-point (%f/%e/%g) needs SSE -- both for double arithmetic and to
+ * read the double vararg from the XMM save area on x86-64 -- so stdio.c is
+ * compiled -msse (see the Makefile). It is not shortest-round-trip exact,
+ * but correct for the magnitudes/precisions real apps use.
  *
  * ---- FILE * streams ----------------------------------------------
  *
@@ -209,6 +213,119 @@ static int conv_int(sink_fn sink, void *ctx, int *total,
     return 0;
 }
 
+/* Emit a pre-rendered numeric body (no sign) with the given sign char,
+ * honoring width / '-' (left) / '0' (zero) flags. Shared by conv_float. */
+static int emit_num_padded(sink_fn sink, void *ctx, int *total,
+                           struct fmtflags *f, char sign,
+                           const char *num, int nlen) {
+    int total_len = (sign ? 1 : 0) + nlen;
+    int width_pad = f->width > total_len ? f->width - total_len : 0;
+    bool zero_pad = f->zero && !f->left;
+    if (!f->left && !zero_pad && pad(sink, ctx, total, ' ', width_pad) != 0) return -1;
+    if (sign && emit_ch(sink, ctx, total, sign) != 0) return -1;
+    if (zero_pad && pad(sink, ctx, total, '0', width_pad) != 0) return -1;
+    if (emit(sink, ctx, total, num, (size_t)nlen) != 0) return -1;
+    if (f->left && pad(sink, ctx, total, ' ', width_pad) != 0) return -1;
+    return 0;
+}
+
+/* Floating-point conversions %f/%F %e/%E %g/%G.
+ *
+ * Not a bit-exact, shortest-round-trip implementation (no Grisu/Ryu), but
+ * correct for normal magnitudes and the precision/width/flag combinations
+ * apps actually use. Requires SSE (double math + reading the double vararg),
+ * so stdio.c is built -msse (see the Makefile). NaN/Inf handled; very large
+ * %f magnitudes fall back to %e to avoid 64-bit integer overflow. */
+static int conv_float(sink_fn sink, void *ctx, int *total,
+                      struct fmtflags *f, double val, char conv) {
+    char num[600];
+    int n = 0;
+    int prec = f->has_precision ? f->precision : 6;
+    if (prec < 0) prec = 6;
+    if (prec > 60) prec = 60;          /* bound buffers; doubles can't show more */
+    bool upper = (conv >= 'A' && conv <= 'Z');
+    char lc = (char)(conv | 0x20);     /* 'f' | 'e' | 'g' */
+
+    union { double d; unsigned long long u; } pun;
+    pun.d = val;
+    char sign = 0;
+    if (pun.u >> 63) { sign = '-'; val = -val; }
+    else if (f->plus)  sign = '+';
+    else if (f->space) sign = ' ';
+
+    unsigned long long ab = pun.u & 0x7fffffffffffffffULL;
+    if ((ab >> 52) == 0x7ffULL) {                 /* Inf / NaN */
+        bool nan = (ab & 0xfffffffffffffULL) != 0;
+        const char *t = nan ? (upper ? "NAN" : "nan") : (upper ? "INF" : "inf");
+        while (*t) num[n++] = *t++;
+        return emit_num_padded(sink, ctx, total, f, nan ? 0 : sign, num, n);
+    }
+
+    bool strip = false;                            /* %g strips trailing zeros */
+    if (lc == 'g') {
+        int P = (prec == 0) ? 1 : prec;
+        int X = 0;
+        double t = val;
+        if (t != 0.0) { while (t >= 10.0) { t /= 10.0; X++; }
+                        while (t <  1.0) { t *= 10.0; X--; } }
+        if (X < -4 || X >= P) { lc = 'e'; prec = P - 1; }
+        else                  { lc = 'f'; prec = P - 1 - X; if (prec < 0) prec = 0; }
+        if (!f->hash) strip = true;
+    }
+
+    if (lc == 'f' && val >= 1.8e19) lc = 'e';      /* avoid u64 overflow */
+
+    if (lc == 'e') {
+        int X = 0;
+        double m = val;
+        if (m != 0.0) { while (m >= 10.0) { m /= 10.0; X++; }
+                        while (m <  1.0) { m *= 10.0; X--; } }
+        double scale = 1.0;
+        for (int i = 0; i < prec; i++) scale *= 10.0;
+        unsigned long long one = (unsigned long long)(scale + 0.5);
+        unsigned long long md  = (unsigned long long)(m * scale + 0.5);
+        if (md >= 10ULL * one) { md /= 10; X++; }  /* 9.99..->10.0 carry */
+        char tb[80]; int tn = 0;
+        unsigned long long q = md;
+        for (int i = 0; i <= prec; i++) { tb[tn++] = (char)('0' + q % 10); q /= 10; }
+        num[n++] = tb[tn - 1];
+        if (prec > 0 || f->hash) num[n++] = '.';
+        for (int i = tn - 2; i >= 0; i--) num[n++] = tb[i];
+        if (strip) { while (n > 0 && num[n-1] == '0') n--;
+                     if (n > 0 && num[n-1] == '.') n--; }
+        num[n++] = upper ? 'E' : 'e';
+        num[n++] = (X < 0) ? '-' : '+';
+        int ax = X < 0 ? -X : X;
+        char eb[8]; int en = 0;
+        do { eb[en++] = (char)('0' + ax % 10); ax /= 10; } while (ax);
+        while (en < 2) eb[en++] = '0';
+        for (int i = en - 1; i >= 0; i--) num[n++] = eb[i];
+    } else {                                       /* %f */
+        double scale = 1.0;
+        for (int i = 0; i < prec; i++) scale *= 10.0;
+        unsigned long long ip  = (unsigned long long) val;
+        double frac = val - (double) ip;
+        unsigned long long one = (unsigned long long)(scale + 0.5);
+        unsigned long long fd  = (unsigned long long)(frac * scale + 0.5);
+        if (prec == 0) { if (frac >= 0.5) ip++; }
+        else if (fd >= one) { fd -= one; ip++; }   /* fractional carry */
+        char tb[24]; int tn = 0;
+        unsigned long long q = ip;
+        do { tb[tn++] = (char)('0' + q % 10); q /= 10; } while (q);
+        for (int i = tn - 1; i >= 0; i--) num[n++] = tb[i];
+        if (prec > 0 || f->hash) {
+            num[n++] = '.';
+            char fb[80]; int fn = 0;
+            unsigned long long fq = fd;
+            for (int i = 0; i < prec; i++) { fb[fn++] = (char)('0' + fq % 10); fq /= 10; }
+            for (int i = fn - 1; i >= 0; i--) num[n++] = fb[i];
+            if (strip) { while (n > 0 && num[n-1] == '0') n--;
+                         if (n > 0 && num[n-1] == '.') n--; }
+        }
+    }
+    return emit_num_padded(sink, ctx, total, f, sign, num, n);
+}
+
 static int do_format(sink_fn sink, void *ctx, const char *fmt, va_list ap) {
     int total = 0;
     while (*fmt) {
@@ -294,6 +411,11 @@ static int do_format(sink_fn sink, void *ctx, const char *fmt, va_list ap) {
             unsigned long uv = (unsigned long)(uintptr_t)va_arg(ap, void *);
             f.hash = true;       /* always print 0x */
             if (conv_int(sink, ctx, &total, &f, 0, uv, false, 16, false) != 0) return -1;
+            break;
+        }
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+            double dv = va_arg(ap, double);
+            if (conv_float(sink, ctx, &total, &f, dv, f.conv) != 0) return -1;
             break;
         }
         default:

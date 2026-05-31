@@ -24,6 +24,7 @@
 #define LUA_MAX_LOCALS  64
 #define LUA_MAX_UPVALS  32
 #define LUA_MAX_FUNCS   64
+#define VM_MAX_PROTOS   128   /* VM proto-table capacity (REPL accumulates) */
 #define LUA_MAX_STR     4096
 #define LUA_MAX_TABLE   256
 #define LUA_MAX_GLOBALS 256
@@ -869,6 +870,11 @@ static void parse_stat(compiler *C) {
             else if (prev_op == OP_GETGLOBAL) emit(C, OP_SETGLOBAL, prev_arg);
             else if (prev_op == OP_GETFIELD) {
                 emit(C, OP_SETFIELD, prev_arg);
+            } else if (prev_op == OP_GETTABLE) {
+                /* Indexed assignment t[k] = v. Dropping the GETTABLE leaves
+                 * the object and key on the stack; after the RHS value is
+                 * pushed, SETTABLE pops (val, key, obj). */
+                emit(C, OP_SETTABLE, 0);
             } else compile_error(C, "invalid assignment target");
         } else if (C->lex.cur.type == TOK_COMMA) {
             emit(C, OP_POP, 0);
@@ -1349,6 +1355,145 @@ static lua_value cfn_ipairs_iter(lua_vm *vm, lua_value *args, int nargs) {
     return lua_nil();
 }
 
+/* string.format -- supports the common conversions (%d/%i/%u/%x/%X/%o/%c,
+ * %f/%g/%e/%G/%E, %s, %%) with flags/width/precision, delegating the actual
+ * formatting to libc snprintf (libtoby's supports width/precision/flags). */
+static lua_value cfn_string_format(lua_vm *vm, lua_value *args, int nargs) {
+    (void)vm;
+    if (nargs < 1 || args[0].type != LUA_TSTR) return lua_str("");
+    const char *f = args[0].u.sval;
+    char out[1024];
+    int oi = 0;
+    int argi = 1;
+    for (int i = 0; f[i] && oi < (int)sizeof(out) - 1; i++) {
+        if (f[i] != '%') { out[oi++] = f[i]; continue; }
+        /* Collect the conversion spec: %[flags][width][.prec]conv */
+        char spec[40];
+        int si = 0;
+        spec[si++] = '%';
+        i++;
+        while (f[i] && strchr("-+ #0", f[i]) && si < 32) spec[si++] = f[i++];
+        while (f[i] && isdigit((unsigned char)f[i]) && si < 32) spec[si++] = f[i++];
+        if (f[i] == '.') { spec[si++] = f[i++];
+            while (f[i] && isdigit((unsigned char)f[i]) && si < 32) spec[si++] = f[i++]; }
+        char conv = f[i];
+        char tmp[300];
+        tmp[0] = '\0';
+        lua_value a = (argi < nargs) ? args[argi] : lua_nil();
+        switch (conv) {
+        case '%':
+            tmp[0] = '%'; tmp[1] = '\0';
+            break;
+        case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': case 'c': {
+            /* Inject a 'l' length modifier so we can pass a long safely. */
+            spec[si++] = 'l'; spec[si++] = conv; spec[si] = '\0';
+            long v = (a.type == LUA_TNUM) ? (long)a.u.nval : 0;
+            snprintf(tmp, sizeof(tmp), spec, v);
+            argi++;
+            break;
+        }
+        case 'f': case 'F': case 'g': case 'G': case 'e': case 'E': {
+            spec[si++] = conv; spec[si] = '\0';
+            double v = (a.type == LUA_TNUM) ? a.u.nval : 0.0;
+            snprintf(tmp, sizeof(tmp), spec, v);
+            argi++;
+            break;
+        }
+        case 's': {
+            spec[si++] = 's'; spec[si] = '\0';
+            char sb[512];
+            val_tostring(a, sb, sizeof(sb));
+            snprintf(tmp, sizeof(tmp), spec, sb);
+            argi++;
+            break;
+        }
+        default:
+            /* Unknown conversion: emit it verbatim. */
+            tmp[0] = '%'; tmp[1] = conv; tmp[2] = '\0';
+            break;
+        }
+        for (int k = 0; tmp[k] && oi < (int)sizeof(out) - 1; k++) out[oi++] = tmp[k];
+    }
+    out[oi] = '\0';
+    return lua_str(out);
+}
+
+static lua_value cfn_string_rep(lua_vm *vm, lua_value *args, int nargs) {
+    (void)vm;
+    if (nargs < 2 || args[0].type != LUA_TSTR || args[1].type != LUA_TNUM)
+        return lua_str("");
+    const char *s = args[0].u.sval;
+    int n = (int)args[1].u.nval;
+    int sl = (int)strlen(s);
+    char buf[1024];
+    int oi = 0;
+    for (int i = 0; i < n && oi + sl < (int)sizeof(buf) - 1; i++) {
+        memcpy(buf + oi, s, sl);
+        oi += sl;
+    }
+    buf[oi] = '\0';
+    return lua_str(buf);
+}
+
+static lua_value cfn_string_upper(lua_vm *vm, lua_value *args, int nargs) {
+    (void)vm;
+    if (nargs < 1 || args[0].type != LUA_TSTR) return lua_str("");
+    char buf[512];
+    int i = 0;
+    for (; args[0].u.sval[i] && i < 511; i++)
+        buf[i] = (char)toupper((unsigned char)args[0].u.sval[i]);
+    buf[i] = '\0';
+    return lua_str(buf);
+}
+
+static lua_value cfn_string_lower(lua_vm *vm, lua_value *args, int nargs) {
+    (void)vm;
+    if (nargs < 1 || args[0].type != LUA_TSTR) return lua_str("");
+    char buf[512];
+    int i = 0;
+    for (; args[0].u.sval[i] && i < 511; i++)
+        buf[i] = (char)tolower((unsigned char)args[0].u.sval[i]);
+    buf[i] = '\0';
+    return lua_str(buf);
+}
+
+static lua_value cfn_math_max(lua_vm *vm, lua_value *args, int nargs) {
+    (void)vm;
+    if (nargs < 1 || args[0].type != LUA_TNUM) return lua_nil();
+    double m = args[0].u.nval;
+    for (int i = 1; i < nargs; i++)
+        if (args[i].type == LUA_TNUM && args[i].u.nval > m) m = args[i].u.nval;
+    return lua_num(m);
+}
+
+static lua_value cfn_math_min(lua_vm *vm, lua_value *args, int nargs) {
+    (void)vm;
+    if (nargs < 1 || args[0].type != LUA_TNUM) return lua_nil();
+    double m = args[0].u.nval;
+    for (int i = 1; i < nargs; i++)
+        if (args[i].type == LUA_TNUM && args[i].u.nval < m) m = args[i].u.nval;
+    return lua_num(m);
+}
+
+static lua_value cfn_math_ceil(lua_vm *vm, lua_value *args, int nargs) {
+    (void)vm;
+    if (nargs < 1 || args[0].type != LUA_TNUM) return lua_num(0);
+    double d = args[0].u.nval;
+    long l = (long)d;
+    if (d > (double)l) l++;
+    return lua_num((double)l);
+}
+
+static lua_value cfn_io_write(lua_vm *vm, lua_value *args, int nargs) {
+    (void)vm;
+    for (int i = 0; i < nargs; i++) {
+        char buf[512];
+        val_tostring(args[i], buf, sizeof(buf));
+        fputs(buf, stdout);
+    }
+    return lua_nil();
+}
+
 static void register_cfunc(lua_vm *vm, const char *name,
                            lua_value (*fn)(lua_vm*, lua_value*, int)) {
     int s = vm_global_slot(vm, name);
@@ -1376,6 +1521,14 @@ static void register_stdlib(lua_vm *vm) {
     table_set(str_lib, lua_str("len"), fv);
     fv.u.cfunc = (int(*)(void))(void*)cfn_string_sub;
     table_set(str_lib, lua_str("sub"), fv);
+    fv.u.cfunc = (int(*)(void))(void*)cfn_string_format;
+    table_set(str_lib, lua_str("format"), fv);
+    fv.u.cfunc = (int(*)(void))(void*)cfn_string_rep;
+    table_set(str_lib, lua_str("rep"), fv);
+    fv.u.cfunc = (int(*)(void))(void*)cfn_string_upper;
+    table_set(str_lib, lua_str("upper"), fv);
+    fv.u.cfunc = (int(*)(void))(void*)cfn_string_lower;
+    table_set(str_lib, lua_str("lower"), fv);
 
     /* table library */
     lua_table *tbl_lib = table_new();
@@ -1401,14 +1554,31 @@ static void register_stdlib(lua_vm *vm) {
     table_set(math_lib, lua_str("abs"), fv);
     fv.u.cfunc = (int(*)(void))(void*)cfn_math_floor;
     table_set(math_lib, lua_str("floor"), fv);
+    fv.u.cfunc = (int(*)(void))(void*)cfn_math_ceil;
+    table_set(math_lib, lua_str("ceil"), fv);
+    fv.u.cfunc = (int(*)(void))(void*)cfn_math_max;
+    table_set(math_lib, lua_str("max"), fv);
+    fv.u.cfunc = (int(*)(void))(void*)cfn_math_min;
+    table_set(math_lib, lua_str("min"), fv);
     table_set(math_lib, lua_str("pi"), lua_num(3.14159265358979323846));
     table_set(math_lib, lua_str("huge"), lua_num(1e308));
+
+    /* io library (minimal: io.write) */
+    lua_table *io_lib = table_new();
+    lua_value iv; iv.type = LUA_TTABLE; iv.u.tval = io_lib;
+    s = vm_global_slot(vm, "io");
+    if (s >= 0) vm->globals[s] = iv;
+    fv.u.cfunc = (int(*)(void))(void*)cfn_io_write;
+    table_set(io_lib, lua_str("write"), fv);
 }
 
 /* ---- REPL & file execution ------------------------------------------ */
 
 static int run_source(const char *src, lua_vm *vm) {
-    compiler C;
+    /* `compiler` is ~3 MB (LUA_MAX_FUNCS protos, each with code/consts/locals
+     * arrays), which would blow the modest user stack if placed there. Keep
+     * it in BSS. run_source is never re-entrant (no nested compilation). */
+    static compiler C;
     memset(&C, 0, sizeof(C));
     C.lex.src = src;
     C.lex.pos = 0;
@@ -1424,6 +1594,10 @@ static int run_source(const char *src, lua_vm *vm) {
     emit(&C, OP_NIL, 0);
     emit(&C, OP_RETURN, 0);
 
+    if (vm->nprotos + C.nprotos > VM_MAX_PROTOS) {
+        fprintf(stderr, "lua: too many functions (proto table full)\n");
+        return 1;
+    }
     for (int i = 0; i < C.nprotos; i++)
         vm->protos[vm->nprotos + i] = C.protos[i];
 
@@ -1447,9 +1621,15 @@ static char *read_file(const char *path) {
     return buf;
 }
 
+/* Backing storage for the VM's proto table. vm.protos is otherwise an
+ * unbacked pointer; without this the first run_source() would write through
+ * NULL. Sized for one full file (LUA_MAX_FUNCS) plus REPL headroom. */
+static lua_proto g_vm_protos[VM_MAX_PROTOS];
+
 int main(int argc, char **argv) {
-    lua_vm vm;
+    static lua_vm vm;   /* ~24 KB; keep off the small user stack */
     memset(&vm, 0, sizeof(vm));
+    vm.protos = g_vm_protos;
     register_stdlib(&vm);
 
     if (argc >= 2) {

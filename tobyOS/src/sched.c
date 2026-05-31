@@ -280,7 +280,13 @@ void sched_yield(void) {
                        (void *)cur->saved_rsp, (void *)next->saved_rsp,
                        (unsigned long)next->cr3);
     }
+    /* Save our FPU/SSE state, switch, and restore ours when we're resumed.
+     * The proc we switch TO restores its own state either via its matching
+     * fpu_restore here (if it parked in sched_yield) or via the explicit
+     * restore in proc_first_user_entry/fork_child_entry (if first-run). */
+    fpu_save(cur->fpu_state);
     proc_context_switch(&cur->saved_rsp, next->saved_rsp, next->cr3);
+    fpu_restore(cur->fpu_state);
     if (gui_trace_level() >= GUI_TRACE_VERBOSE) {
         struct proc *now = current_proc();
         gui_trace_logf("sched_yield: resumed as %d", now ? now->pid : -1);

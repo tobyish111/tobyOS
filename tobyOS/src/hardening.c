@@ -19,8 +19,12 @@
 #define CPUID_SMAP_BIT    (1U << 20)  /* EBX from leaf 7, sub 0 */
 #define CPUID_NX_BIT      (1U << 20)  /* EDX from ext leaf 0x80000001 */
 
+#define CR4_OSFXSR        (1UL << 9)    /* enable SSE + fxsave/fxrstor       */
+#define CR4_OSXMMEXCPT    (1UL << 10)   /* unmasked SSE FP exceptions (#XF)  */
 #define CR4_SMEP          (1UL << 20)
 #define CR4_SMAP          (1UL << 21)
+#define CR0_MP            (1UL << 1)    /* monitor coprocessor               */
+#define CR0_EM            (1UL << 2)    /* FPU emulation (must be 0 for SSE) */
 #define MSR_IA32_EFER     0xC0000080UL
 #define EFER_NXE          (1UL << 11)
 
@@ -53,6 +57,20 @@ void hardening_init(void) {
     g_nx_available = !!(d & CPUID_NX_BIT);
 
     uint64_t cr4 = read_cr4();
+
+    /* Enable SSE so floating-point user programs (e.g. /bin/lua) run instead
+     * of #UD'ing on the first SSE instruction. CR0.EM must be 0 (no x87
+     * emulation) with CR0.MP set; CR4.OSFXSR turns on SSE + the fxsave/
+     * fxrstor area, CR4.OSXMMEXCPT routes SSE FP faults to #XF. The kernel
+     * is built -mno-sse so it never touches XMM itself; per-process XMM/MXCSR
+     * state is saved/restored across switches by proc_context_switch. */
+    {
+        uint64_t cr0 = read_cr0();
+        cr0 = (cr0 & ~CR0_EM) | CR0_MP;
+        __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
+        cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
+        kprintf("[hardening] SSE enabled (CR0.EM=0, CR4.OSFXSR|OSXMMEXCPT)\n");
+    }
 
     if (g_smep_available) {
         cr4 |= CR4_SMEP;

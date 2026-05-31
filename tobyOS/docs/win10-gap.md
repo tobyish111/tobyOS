@@ -17,9 +17,11 @@ survives clones and any agent can read/update it.
 
 ## Bottom line
 
-**~23% overall Win10 feature parity** (canvas baseline was ~16%; +1 since the initial
-repo version after the 2026-05-30 security-depth work — Argon2id auth, login lockout,
-real signal delivery, and SMAP re-enabled behind a uaccess window).
+**~24% overall Win10 feature parity** (canvas baseline was ~16%). The 2026-05-30 work
+added the security-depth bundle (Argon2id auth, login lockout, real signal delivery, SMAP
+re-enabled behind a uaccess window) and an app-compatibility bump (SSE/FP enabled with
+FXSAVE context switching, `%f`/`%e`/`%g` printf, a 256 KiB user stack, and the marquee
+ports — including a working Lua interpreter — actually shipping in the initrd).
 
 The percentage understates the real milestone: tobyOS now **boots to the desktop and gets
 on the network on real hardware** (HP EliteDesk 800, Intel CPU). The canvas scored a thing
@@ -46,7 +48,7 @@ honest number.
 | Security | ~8% | ~15% | Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP re-enabled** behind a syscall-wide stac/clac uaccess window + wrapped loader/argv; validated under QEMU `+smap` (full desktop + sigtest, no #PF). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
 | Power / ACPI | ~6% | ~9% | **RTC driver** → real wall-clock time. ACPI shutdown + partial S3/S4 framework. No full AML power management. |
 | Audio / Media | ~15% | ~15% | Intel HDA + software mixer + decode helpers. Unchanged this round. |
-| App Compatibility | ~2% | ~3% | POSIX libc filled in (`signal.h`, `fork`, `symlink`/`readlink`, real `getuid/gid`, `wait`, `access`) → easier to **port Unix software**. Still own-ELF-only; **zero** Win32/.NET/UWP. |
+| App Compatibility | ~2% | ~5% | POSIX libc filled in (`signal.h`, `fork`, `symlink`/`readlink`, real `getuid/gid`, `wait`, `access`). **SSE/FP now enabled** (CR0/CR4 + FXSAVE/FXRSTOR FPU context switch), so floating-point programs run; **libc printf gained `%f`/`%e`/`%g`**; user stack 32 KiB→256 KiB. Marquee ports (lua/make/less/curl/tcc/as) **now actually ship in the initrd** (were built but omitted from the tar). **Lua interpreter runs real scripts** (`/bin/lua`, verified by `/etc/lua_selftest.lua`). Still own-ELF-only; **zero** Win32/.NET/UWP. |
 
 ---
 
@@ -139,3 +141,15 @@ driver model; POSIX libc surface.
   `[hardening] SMAP not available`. Under `qemu64,+smep,+smap` the full GUI desktop runs
   19 s with no #PF and `/bin/sigtest` passes. Security ~13% → ~15%. This is the fix the
   real-Skylake `CR2=0x400000` #PF was waiting on.
+- **2026-05-30** — App-compat: **SSE/floating-point enabled** (`hardening.c` sets CR0.EM=0/
+  MP, CR4.OSFXSR|OSXMMEXCPT) with per-process **FXSAVE/FXRSTOR** context switching
+  (`cpu.h`, `proc` `fpu_state[512]`, `sched.c`, first-entry restores in proc.c/fork.c/
+  thread.c) so FP programs run safely alongside others. **libc printf gained `%f`/`%e`/`%g`**
+  (`libtoby/src/stdio.c`, built `-msse`). Default **user stack 32 KiB→256 KiB** (proc.c).
+  The B3 marquee ports (lua/make/less/curl/tcc/as) were built+staged but **missing from the
+  initrd tar** — now shipped. Fixed three latent bugs in `/bin/lua` (never ran before: it
+  wasn't shipped): a ~3 MB `compiler` stack local (→ static), an unbacked `vm.protos` NULL
+  pointer, and unsupported `t[k]=v` indexed assignment; added `string.format/rep/upper/
+  lower`, `math.max/min/ceil`, `io.write`. Verified by `/etc/lua_selftest.lua` via
+  `/bin/lua` (EXTRA_CFLAGS+=-DLUATEST_BOOT): ALL OK on default and `+smap` CPUs; desktop
+  still boots clean. App Compatibility ~3% → ~5%; overall ~23% → ~24%.

@@ -792,6 +792,10 @@ $(LIBTOBY_SRC)/%.o: $(LIBTOBY_SRC)/%.S
 $(LIBTOBY_SRC)/math.o: $(LIBTOBY_SRC)/math.c
 	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -c $< -o $@
 
+# stdio.c needs SSE for %f/%e/%g (double math + reading the double vararg)
+$(LIBTOBY_SRC)/stdio.o: $(LIBTOBY_SRC)/stdio.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -c $< -o $@
+
 # stdlib.c needs SSE for strtod/atof floating-point conversion
 $(LIBTOBY_SRC)/stdlib.o: $(LIBTOBY_SRC)/stdlib.c
 	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -c $< -o $@
@@ -855,6 +859,9 @@ $(LIBTOBY_SRC)/%.pic.o: $(LIBTOBY_SRC)/%.S
 	$(CC) $(USER_CFLAGS) -fPIC -c $< -o $@
 
 $(LIBTOBY_SRC)/math.pic.o: $(LIBTOBY_SRC)/math.c
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -c $< -o $@
+
+$(LIBTOBY_SRC)/stdio.pic.o: $(LIBTOBY_SRC)/stdio.c
 	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -c $< -o $@
 
 $(LIBTOBY_SRC)/stdlib.pic.o: $(LIBTOBY_SRC)/stdlib.c
@@ -1499,6 +1506,7 @@ programs/user_gui_edit/user_gui_edit.elf: \
 
 $(INITRD_TAR): $(PROGRAMS) initrd/etc/motd initrd/readme.txt \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
+               initrd/etc/lua_selftest.lua \
                $(HELLOAPP_TPKG) $(HELLOAPP_TPKG_V2) $(SDK_SAMPLE_TPKGS) \
                $(HELLOAPP_TPKG_CORRUPT) $(HELLOAPP_TPKG_BADHASH) \
                $(HELLOAPP_TPKG_NOHASH)  $(HELLOAPP_TPKG_BADFHASH) \
@@ -1514,6 +1522,7 @@ $(INITRD_TAR): $(PROGRAMS) initrd/etc/motd initrd/readme.txt \
 	cp initrd/etc/motd                       $(INITRD_STAGE)/etc/motd
 	cp initrd/etc/drvmatch.conf              $(INITRD_STAGE)/etc/drvmatch.conf
 	cp initrd/etc/drvmatch.conf.test         $(INITRD_STAGE)/etc/drvmatch.conf.test
+	cp initrd/etc/lua_selftest.lua           $(INITRD_STAGE)/etc/lua_selftest.lua
 	cp initrd/readme.txt                     $(INITRD_STAGE)/readme.txt
 	cp programs/user_hello/user_hello.elf    $(INITRD_STAGE)/bin/hello
 	cp programs/user_bad/user_bad.elf        $(INITRD_STAGE)/bin/bad
@@ -1713,6 +1722,7 @@ $(INITRD_TAR): $(PROGRAMS) initrd/etc/motd initrd/readme.txt \
 	    bin/services bin/svc_crasher bin/stabilitytest                    \
 	    bin/hwinfo bin/drvmatch bin/hwcompat bin/hwreport bin/compattest  \
 	    bin/sigtest bin/tobycc bin/tobybuild bin/selfhosttest \
+    bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    repo/helloapp.tpkg repo/helloapp_v2.tpkg                          \
@@ -1724,7 +1734,7 @@ $(INITRD_TAR): $(PROGRAMS) initrd/etc/motd initrd/readme.txt \
 	    repo/helloapp_caps_ro.tpkg                                        \
 	    system/keys/trust.db                                              \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
-	    etc/motd etc/drvmatch.conf etc/drvmatch.conf.test \
+	    etc/motd etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    readme.txt $$EXTRA_FILES
 
