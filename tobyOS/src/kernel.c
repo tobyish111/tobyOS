@@ -542,6 +542,14 @@ static __attribute__((noreturn)) void idle_loop(void) {
         } while (0)
 
     for (;;) {
+        /* SMP: pid 0's per-tick work (gui_tick, service ticks, net/USB/shell)
+         * touches shared kernel state that user procs on other cores also
+         * reach via their syscalls. Hold the BKL across the iteration to
+         * serialize against those, and release it at the pause below so the
+         * other cores get the lock. gui_tick's internal sched_yield drops/
+         * reacquires the BKL while a user proc runs on this core. */
+        bkl_enter();
+
         /* Network service lane first: drain NIC RX and protocol daemons
          * before GUI/input work can consume pid 0's turn. */
         net_service_tick();
@@ -586,6 +594,9 @@ static __attribute__((noreturn)) void idle_loop(void) {
          * If xHCI is polling-only, hlt makes USB HID PIT-limited and
          * mouse movement becomes chunky.
          */
+         /* Release the BKL before idling so other cores can enter the kernel
+          * (their syscalls were spinning on it while we held it). */
+         bkl_exit();
          __asm__ __volatile__("pause");
     }
 
@@ -3697,5 +3708,48 @@ void _start(void) {
      * ships logs to the LAN collector. */
     if (safemode_skip_gui())
         bootlog_net_upload();
+
+    /* Boot sequence done. From here pid 0 holds the BKL around its per-tick
+     * shared-state work (idle_loop), so it's now safe to let secondary CPUs
+     * steal + run user procs in parallel. */
+    sched_enable_ap_run();
+
+#ifdef MCTEST_BOOT
+    /* Opt-in multi-core proof (EXTRA_CFLAGS+=-DMCTEST_BOOT). With AP-run now
+     * enabled, time one CPU-bound worker then four spawned together. ~one-
+     * worker time => real parallelism; ~4x => serial. Held under the BKL so
+     * pid-0's proc-table accesses are serialized vs the workers' exits;
+     * proc_wait's sched_yield drops/reacquires it so the workers run in
+     * parallel on the APs. /bin/mctest does no syscalls in its compute loop. */
+    {
+        struct proc_spec spec = {
+            .path = "/bin/mctest", .name = "mctest",
+            .argc = 0, .argv = 0, .envc = 0, .envp = 0,
+        };
+        uint32_t hz = pit_hz();
+#define MC_NOW_MS() (hz ? (pit_ticks() * 1000ULL / hz) : 0ULL)
+        bkl_enter();
+        uint64_t t0 = MC_NOW_MS();
+        int p1 = proc_spawn(&spec);
+        if (p1 > 0) proc_wait(p1);
+        uint64_t one = MC_NOW_MS() - t0;
+
+        uint64_t t2 = MC_NOW_MS();
+        int pids[4];
+        for (int i = 0; i < 4; i++) pids[i] = proc_spawn(&spec);
+        for (int i = 0; i < 4; i++) if (pids[i] > 0) proc_wait(pids[i]);
+        uint64_t four = MC_NOW_MS() - t2;
+        bkl_exit();
+        kprintf("[boot] MCTEST: 1 worker = %llu ms; 4 workers = %llu ms "
+                "(serial ~%llu ms)\n", (unsigned long long)one,
+                (unsigned long long)four, (unsigned long long)(one * 4));
+        if (four > 0)
+            kprintf("[boot] MCTEST: parallelism ~%llu.%02llux\n",
+                    (unsigned long long)((one * 4) / four),
+                    (unsigned long long)(((one * 4 * 100) / four) % 100));
+#undef MC_NOW_MS
+    }
+#endif
+
     idle_loop();
 }

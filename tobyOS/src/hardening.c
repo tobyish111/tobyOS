@@ -123,9 +123,12 @@ void hardening_init(void) {
  * on the BSP. Called from ap_entry(). */
 void hardening_init_ap(void) {
     /* SSE: CR0.EM=0/MP, CR4.OSFXSR|OSXMMEXCPT (always -- the BSP enabled it
-     * unconditionally and user FP code requires it). */
+     * unconditionally and user FP code requires it). Also clear CD/NW: a
+     * just-reset AP comes up with caches disabled and the trampoline leaves
+     * them off -- running user code uncached works but is cripplingly slow. */
     uint64_t cr0 = read_cr0();
     cr0 = (cr0 & ~CR0_EM) | CR0_MP;
+    cr0 &= ~((1UL << 30) | (1UL << 29));   /* clear CD (30) and NW (29) */
     __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
 
     uint64_t cr4 = read_cr4();

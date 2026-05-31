@@ -42,6 +42,7 @@ struct percpu {
     uint32_t apic_id;       /* what the LAPIC reports for this CPU */
     bool     is_bsp;        /* true for cpu_idx 0 (always the BSP) */
     bool     online;        /* set by the CPU itself when init done  */
+    bool     holds_bkl;     /* this CPU currently holds the big kernel lock */
     uint64_t stack_top;     /* per-CPU kernel stack top (NULL for BSP) */
 
     /* ---- Milestone 22 step 5: per-CPU scheduler state -------- */
@@ -50,6 +51,12 @@ struct percpu {
      * on `sti; hlt`). The BSP starts with current = pid 0 once
      * proc_init runs. */
     struct proc    *current;
+
+    /* This CPU's idle process (ap_idle on APs; NULL on the BSP, which idles
+     * as pid 0 driving gui_tick). When a proc on an AP blocks/exits with no
+     * other work, sched_yield switches back to this idle proc, which steals
+     * runnable work off other CPUs. */
+    struct proc    *idle;
 
     /* This CPU's runnable queue. enqueue/dequeue must hold ready_lock.
      * For v1 the round-robin distributor pushes everything to BSP

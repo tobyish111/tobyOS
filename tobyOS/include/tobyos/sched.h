@@ -50,6 +50,19 @@ void sched_boost_pid(int pid);
  * spins doing `sti; hlt` until an IRQ wakes someone up. */
 void sched_yield(void);
 
+/* Big Kernel Lock: serializes kernel-mode execution across CPUs so user code
+ * runs in parallel while not-yet-fine-grained-locked subsystems (VFS, GUI,
+ * proc table) stay safe. bkl_enter at syscall entry / around pid 0's per-tick
+ * shared-state work; bkl_exit at syscall exit / before idling. The scheduler
+ * drops/reacquires it around blocking. bkl_exit is idempotent. */
+void bkl_enter(void);
+void bkl_exit(void);
+
+/* Allow secondary CPUs to start stealing + running user procs. Called once by
+ * the BSP after its boot sequence, right before entering the GUI idle loop --
+ * before this, APs idle so they can't race kernel_main's unlocked boot work. */
+void sched_enable_ap_run(void);
+
 /* AP idle entry. Never returns. Sits on `sti; hlt` and wakes on
  * timer/IRQ; if anything ever lands on this CPU's ready queue, it
  * promotes to RUNNING and context-switches. APs call this from

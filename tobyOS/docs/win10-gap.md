@@ -17,7 +17,7 @@ survives clones and any agent can read/update it.
 
 ## Bottom line
 
-**~25% overall Win10 feature parity** (canvas baseline was ~16%). The 2026-05-30 work
+**~26% overall Win10 feature parity** (canvas baseline was ~16%). The 2026-05-30 work
 added the security-depth bundle (Argon2id auth, login lockout, real signal delivery, SMAP
 re-enabled behind a uaccess window), an app-compatibility bump (SSE/FP enabled with
 FXSAVE context switching, `%f`/`%e`/`%g` printf, a 256 KiB user stack, and the marquee
@@ -41,7 +41,7 @@ honest number.
 
 | Subsystem | Canvas | Now | Notes |
 |---|---|---|---|
-| Scheduler / SMP | ~12% | ~15% | **Per-CPU multi-core foundation now built & tested**: per-CPU TSS, per-CPU SYSCALL stack via GS base (no swapgs), per-CPU `current_proc`, AP CR0/CR4/EFER (SSE/SMEP/SMAP/NX) parity. APs still idle — the round-robin "flip" is deliberately deferred: it needs a syscall-path big-kernel-lock (or full per-subsystem locking) + per-CPU idle contexts + AP pop-and-switch, which can't be safely validated headlessly. heap+PMM+sched-queues are already spinlocked; VFS/GUI/proc-table are not. Preemptive via PIT 1 kHz. No priority classes/MLFQ. |
+| Scheduler / SMP | ~12% | ~18% | **APs now run user code in parallel.** Per-CPU TSS + SYSCALL stack (GS base, no swapgs) + `current_proc` + AP CR0/CR4/EFER parity + per-CPU SYSCALL MSRs; a syscall-path **big-kernel-lock** serializes kernel entry (and pid 0's `gui_tick`/service work) so user code parallelizes while VFS/GUI/proc-table stay race-free; per-CPU **idle procs** + **work-stealing** distribute work; AP-run gated until boot completes. Measured **~2.6-2.7x on 4 CPU-bound workers**; the GUI desktop is stable (default and under `+smap`). **Known issue:** an `argc>=1` first-run proc that lands on an AP **under SMAP** SMEP-faults (`argc=0` is clean) — under investigation, needs real-HW debugging; non-SMAP is unaffected. No priority classes/MLFQ. |
 | Memory | ~18% | ~24% | `swap_init` wired; **real CoW fork** (`vmm_cow_fork` + `mmap_cow_clone`, no longer eager-copy); demand paging live; ASLR/NX/SMEP. Still bitmap PMM, first-fit heap, no memory compression / large pages. |
 | Filesystem / Storage | ~20% | ~27% | TobyFS: **journaling** (replay on mount), **indirect blocks** (max file 64 KiB → ~4 MiB), **256-entry write-back buffer cache**. VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. Still no NTFS-class streams/ACLs; 4 MiB ≪ 16 TB. |
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
@@ -85,19 +85,15 @@ driver model; POSIX libc surface.
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
 2. **App compatibility (~3%)** — no Win32/POSIX-compat runtime → no software ecosystem.
-3. **Real multi-core execution** — the per-CPU *foundation* is built and committed
-   (per-CPU TSS, GS-base SYSCALL stack, per-CPU current_proc, AP hardening parity).
-   A full flip (syscall-path BKL + per-CPU idle procs + AP pop-and-switch + work-steal)
-   was **prototyped and proved 2.62x on 4 CPU-bound workers** — APs genuinely run user
-   code in parallel — but it was **reverted** because it **deadlocks the desktop**: the
-   GUI relies on the cooperative model where pid 0 continuously runs `gui_tick`, and the
-   new scheduling parks the BSP on a blocked login proc so input/compositor events never
-   get generated (pid 0 ↔ login deadlock). It also exposed a non-deterministic
-   `current_proc()` inconsistency for the pid-0 kernel thread (proc_spawn/proc_wait racing
-   the scheduler → `ppid` wrong → proc_wait hangs). To land it: give pid 0 a proper
-   per-CPU idle separate from the GUI driver (or drive `gui_tick` from a dedicated kernel
-   thread/IRQ), and make kernel-thread proc management hold the BKL. Needs real-HW-validated
-   testing — deadlock/race modes don't surface reliably in short headless boots.
+3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
+   code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
+   on top of the per-CPU TSS/GS/current_proc foundation. The earlier deadlock (pid 0 ↔
+   login) was fixed by holding the BKL around pid 0's `gui_tick`/service work in idle_loop
+   and gating AP-run until boot completes. ~2.6-2.7x on 4 CPU-bound workers; desktop stable
+   on default and `+smap`. **Remaining:** an `argc>=1` first-run proc on an AP under SMAP
+   SMEP-faults (kernel-executes-user-page; fault RIP tracks the packed user_rsp); needs a
+   real-HW debug session. Also: no priority classes / fair per-AP timeslicing yet (the AP
+   LAPIC timer doesn't preempt; CPU-bound procs run to completion / block-yield).
 4. **GPU-accelerated desktop on real hardware** — compositor accel only exists for VirtIO,
    not the Intel iGPU path used on the EliteDesk.
 5. **Security depth** — ~~salted/KDF auth~~ (Argon2id), ~~login rate-limiting~~ (lockout),
@@ -108,9 +104,9 @@ driver model; POSIX libc surface.
 ---
 
 ## Known shallow / "present but not robust" items
-- SMP: cores boot, run the kernel idle loop + take LAPIC timer IRQs, and now have the full
-  per-CPU plumbing to run user code — but the enqueue is still BSP-pinned, so user code
-  does not yet run on APs (the concurrency flip is deferred; see gap item #3).
+- SMP: APs run user code in parallel now (BKL-serialized kernel, work-stealing, ~2.6x on 4
+  workers). Caveat: argc>=1 first-run procs on an AP under SMAP SMEP-fault (gap item #3).
+  No fair per-AP timeslicing (AP LAPIC timer doesn't preempt).
 - IPv6: link-local only — no SLAAC/DHCPv6/global addressing.
 - Passwords: now salted Argon2id (was djb2). Still no account lockout / rate-limiting,
   no password policy, and no PAM-style pluggable auth.
@@ -126,6 +122,18 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-05-31** — **Real multi-core landed.** On top of the per-CPU foundation, APs now
+  run user code in parallel: a syscall-path big-kernel-lock (`sched.c` `bkl_enter/exit`,
+  released/reacquired around blocking in `sched_yield`, around pid 0's `gui_tick`/service
+  work in `idle_loop`, and in execve's direct-enter path) serializes kernel entry so user
+  code parallelizes while VFS/GUI/proc-table stay race-free; per-CPU idle procs
+  (`proc_ap_idle`, `is_idle`) + work-stealing (`steal_one`, `queue_steal_locked`) +
+  `do_switch` run+migrate procs on APs; APs get per-CPU SYSCALL MSRs (`syscall_init_ap`)
+  and CD/NW cleared; AP-run is gated until boot finishes (`sched_enable_ap_run`). Measured
+  ~2.6-2.7x on 4 CPU-bound workers; GUI desktop stable on default and `+smap` across many
+  boots. Known issue: `argc>=1` first-run procs on an AP under SMAP SMEP-fault. Earlier
+  prototype that deadlocked the desktop was fixed by the idle_loop BKL wrap + AP-run gate.
+  Scheduler/SMP ~15% → ~18%; overall ~25% → ~26%.
 - **2026-05-30** — Initial repo-tracked version. Re-scored after Tier 1/2 wiring + real-HW
   bring-up (SMAP, GUI event ABI, VLAN DHCP). Overall ~16% → ~22%.
 - **2026-05-30** — Login password auth moved from unsalted djb2 to salted **Argon2id**

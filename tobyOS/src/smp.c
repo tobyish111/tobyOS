@@ -26,6 +26,7 @@
 
 #include <tobyos/smp.h>
 #include <tobyos/tss.h>
+#include <tobyos/proc.h>
 #include <tobyos/acpi.h>
 #include <tobyos/apic.h>
 #include <tobyos/pmm.h>
@@ -143,6 +144,7 @@ static void smp_logf(const char *fmt, ...) {
  *      sched_tick + per-CPU bookkeeping stay live.
  */
 extern void hardening_init_ap(void);   /* hardening.c -- per-CPU CR0/CR4/EFER */
+extern void syscall_init_ap(void);     /* syscall.c  -- per-CPU SYSCALL MSRs  */
 
 static __attribute__((noreturn, used)) void ap_entry(uint32_t cpu_idx) {
     apic_init_local();
@@ -157,9 +159,15 @@ static __attribute__((noreturn, used)) void ap_entry(uint32_t cpu_idx) {
      *   - a sane initial syscall_rsp (overwritten on the first context switch).
      * Order: hardening before anything that might rely on SSE; GS base last. */
     hardening_init_ap();
+    syscall_init_ap();      /* EFER.SCE/STAR/LSTAR/FMASK -- else `syscall` #UDs */
     tss_init_ap(cpu_idx, me->stack_top);
     me->syscall_rsp = me->stack_top;
     wrmsr(0xC0000101u /* IA32_GS_BASE */, (uint64_t)me);
+
+    /* Adopt this CPU's idle process so the scheduler can switch user work in
+     * and out of this core. `idle` is the switch-back target when a proc on
+     * this CPU blocks/exits with nothing else to run. */
+    me->current = me->idle = proc_ap_idle(cpu_idx, me->stack_top);
 
     /* Sanity check: did the LAPIC ID survive the trip? Should equal
      * what ACPI told us. If not we still proceed (the message will

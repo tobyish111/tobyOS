@@ -230,6 +230,9 @@ struct proc {
     int             tgid;
     bool            is_thread;
     bool            detached;
+    /* True for per-CPU idle procs (pid 0 on the BSP, ap_idle on APs). The
+     * scheduler never steals an idle proc onto another CPU. */
+    bool            is_idle;
     uint64_t        tls_base;
     struct proc    *join_waiters;
 
@@ -285,6 +288,11 @@ extern struct proc *g_current_proc;     /* last proc switched-to on any CPU */
  * needn't pull in the SMP/percpu machinery. Falls back to g_current_proc in
  * the brief early-boot window before per-CPU `current` is populated. */
 struct proc *current_proc(void);
+
+/* Build/return a secondary CPU's idle process (kernel address space, runs on
+ * the AP boot stack). Set as that CPU's current+idle so the scheduler can
+ * switch user work in and out on the AP. */
+struct proc *proc_ap_idle(uint32_t cpu, uint64_t kstack_top);
 
 /* Build pid 0 from the live boot context (the caller IS pid 0 after
  * this returns). Must be called once, after the kernel PML4 + heap +

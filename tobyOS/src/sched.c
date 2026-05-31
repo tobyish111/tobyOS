@@ -53,6 +53,40 @@ extern void proc_context_switch(uint64_t *save_old_rsp,
                                 uint64_t  new_rsp,
                                 uint64_t  new_cr3);
 
+/* ---------- Big Kernel Lock (BKL) ----------
+ *
+ * Serializes kernel-mode execution across CPUs so user code runs in parallel
+ * on multiple cores while the kernel's coarse-locked subsystems (VFS, GUI
+ * compositor, proc table, ...) stay race-free. Held across a syscall body
+ * (syscall_dispatch) and around the pid-0 idle_loop's per-tick shared-state
+ * work (gui_tick/services). RELEASED whenever a CPU gives up the core (the
+ * scheduling slow path) and REACQUIRED when the holding proc resumes -- a
+ * blocked proc must not hold it while halted or it wedges every other core.
+ *
+ * Held with IRQs ENABLED (plain spinlock) because syscall bodies must keep
+ * taking device IRQs; IRQ handlers do NOT take the BKL (their shared state --
+ * heap, PMM, per-CPU sched queues -- has its own fine-grained spinlocks). */
+static spinlock_t g_bkl = SPINLOCK_INIT;
+
+/* APs only start stealing + running user procs once the BSP has finished its
+ * boot sequence and entered the GUI idle loop. Until then kernel_main touches
+ * lots of shared state without the BKL, so APs must not run user code that
+ * would race it. The BSP flips this on right before idle_loop(). */
+static volatile bool g_ap_run_enabled = false;
+void sched_enable_ap_run(void) { g_ap_run_enabled = true; }
+
+void bkl_enter(void) {
+    spin_lock(&g_bkl);
+    smp_this_cpu()->holds_bkl = true;
+}
+
+void bkl_exit(void) {
+    struct percpu *me = smp_this_cpu();
+    if (!me->holds_bkl) return;     /* idempotent: never double-unlock */
+    me->holds_bkl = false;
+    spin_unlock(&g_bkl);
+}
+
 void sched_init(void) {
     /* Per-CPU queues live in g_percpu[]; smp.c memset-zeroed them
      * during build_percpu_table, which happens to be the right
@@ -117,6 +151,74 @@ static bool queue_remove_locked(struct percpu *cpu, struct proc *p) {
     return true;
 }
 
+/* Unlink + return the first NON-idle runnable proc from cpu's queue, or NULL.
+ * Idle procs (pid 0, ap_idle) are pinned to their home core and must never be
+ * migrated, so work-stealing skips them. */
+static struct proc *queue_steal_locked(struct percpu *cpu) {
+    struct proc *prev = 0, *p = cpu->ready_head;
+    while (p) {
+        if (!p->is_idle) {
+            if (prev) prev->next_ready = p->next_ready;
+            else      cpu->ready_head  = p->next_ready;
+            if (cpu->ready_tail == p) cpu->ready_tail = prev;
+            p->next_ready = 0;
+            return p;
+        }
+        prev = p;
+        p = p->next_ready;
+    }
+    return 0;
+}
+
+/* Find one runnable non-idle proc to run on `me`: our own queue first, then
+ * steal from other CPUs. NULL if nothing is runnable anywhere. */
+static struct proc *steal_one(struct percpu *me) {
+    uint64_t f = spin_lock_irqsave(&me->ready_lock);
+    struct proc *p = queue_steal_locked(me);
+    spin_unlock_irqrestore(&me->ready_lock, f);
+    if (p) return p;
+
+    uint32_t n = smp_online_count();
+    for (uint32_t i = 1; i < n; i++) {
+        struct percpu *o = smp_cpu_mut((me->cpu_idx + i) % n);
+        if (!o || !o->ready_head) continue;
+        uint64_t f2 = spin_lock_irqsave(&o->ready_lock);
+        p = queue_steal_locked(o);
+        spin_unlock_irqrestore(&o->ready_lock, f2);
+        if (p) return p;
+    }
+    return 0;
+}
+
+/* Context-switch from `from` to `to` on CPU `me`: per-CPU current/TSS RSP0/
+ * SYSCALL stack/TLS/FPU, then the register switch. `reacquire_bkl` re-takes
+ * the BKL when `from` resumes (the caller released it before switching away).
+ * Shared by sched_yield and the AP idle loop. */
+static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
+                      bool reacquire_bkl) {
+    uint64_t t = perf_rdtsc();
+    if (from) perf_proc_account_out(from, t);
+    perf_proc_account_in(to, t);
+    perf_count_ctx_switch();
+    perf_zone_end(PERF_Z_SCHED_SWITCH, t);
+
+    to->state       = PROC_RUNNING;
+    g_current_proc  = to;
+    me->current     = to;
+    tss_set_rsp0((uint64_t)to->kstack_top);
+    me->syscall_rsp = (uint64_t)to->kstack_top;
+    if (to->tls_base) wrmsr(0xC0000100, to->tls_base);   /* MSR_FS_BASE */
+
+    fpu_save(from->fpu_state);
+    proc_context_switch(&from->saved_rsp, to->saved_rsp, to->cr3);
+    /* --- `from` resumes here when some later switch picks it again --- */
+    if (reacquire_bkl) bkl_enter();
+    fpu_restore(from->fpu_state);
+
+    struct proc *r = current_proc();
+    if (r) perf_proc_account_in(r, perf_rdtsc());
+}
+
 /* Return the cpu_idx that should receive a freshly-enqueued proc.
  * v1 policy: always BSP (cpu 0). APs lack per-CPU TSS so they can't
  * context-switch into user processes. The AP idle loop migrates any
@@ -173,8 +275,17 @@ void sched_yield(void) {
      * tick, which is fine. */
     if (cur && cur->state == PROC_RUNNING &&
         __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE) == 0) {
-        return;
+        return;     /* fast path: still running, nothing else here -- keep BKL */
     }
+
+    /* Slow path: we may halt or switch away, so we must not keep the BKL.
+     * Release it now; reacquire on every path where THIS proc keeps running
+     * (YIELD_RETURN) or resumes after a switch (do_switch's reacquire flag).
+     * The scheduling work below only touches per-CPU queues (own ready_lock)
+     * and per-proc fields, so it's safe without the BKL. */
+    bool had_bkl = me->holds_bkl;
+    if (had_bkl) bkl_exit();
+#define YIELD_RETURN() do { if (had_bkl) bkl_enter(); return; } while (0)
 
     /* If we're still RUNNING, demote to READY and rejoin OUR queue
      * so we get a turn again later. (Always our own CPU's queue, NOT
@@ -199,11 +310,10 @@ void sched_yield(void) {
         uint32_t ncpus = smp_online_count();
         uint32_t my_idx = me->cpu_idx;
         for (uint32_t i = 1; i < ncpus && !next; i++) {
-            uint32_t victim = (my_idx + i) % ncpus;
-            struct percpu *other = smp_cpu_mut(victim);
+            struct percpu *other = smp_cpu_mut((my_idx + i) % ncpus);
             if (!other || !other->ready_head) continue;
             uint64_t f = spin_lock_irqsave(&other->ready_lock);
-            next = queue_pop_locked(other);
+            next = queue_steal_locked(other);    /* skip idle procs */
             spin_unlock_irqrestore(&other->ready_lock, f);
         }
     }
@@ -213,21 +323,28 @@ void sched_yield(void) {
     if (!next) {
         if (cur && cur->state == PROC_READY) {
             cur->state = PROC_RUNNING;
-            return;
+            YIELD_RETURN();
         }
-        /* Caller is BLOCKED or TERMINATED and nothing else is ready --
-         * spin sti+hlt until an IRQ unblocks somebody (or until the
-         * caller's wait condition is satisfied by an exit). */
-        for (;;) {
-            sti();
-            hlt();
-            uint64_t f = spin_lock_irqsave(&me->ready_lock);
-            next = queue_pop_locked(me);
-            spin_unlock_irqrestore(&me->ready_lock, f);
-            if (next) break;
-            if (cur && cur->state == PROC_READY) {
-                cur->state = PROC_RUNNING;
-                return;
+        /* cur is BLOCKED/TERMINATED with nothing else runnable. On an AP,
+         * switch back to this CPU's idle proc (it steals work / halts). On
+         * the BSP (no per-CPU idle proc) we halt in place until an IRQ makes
+         * something runnable -- pid 0 drives the GUI and is never blocked, so
+         * this only fires for genuinely-stuck waits. The BKL is already
+         * released, so other cores run freely while we wait. */
+        if (me->idle && cur != me->idle) {
+            next = me->idle;
+        } else {
+            for (;;) {
+                sti();
+                hlt();
+                uint64_t f = spin_lock_irqsave(&me->ready_lock);
+                next = queue_pop_locked(me);
+                spin_unlock_irqrestore(&me->ready_lock, f);
+                if (next) break;
+                if (cur && cur->state == PROC_READY) {
+                    cur->state = PROC_RUNNING;
+                    YIELD_RETURN();
+                }
             }
         }
     }
@@ -235,98 +352,33 @@ void sched_yield(void) {
     /* If we just popped ourselves back off, no actual switch needed. */
     if (next == cur) {
         next->state = PROC_RUNNING;
-        return;
+        YIELD_RETURN();
     }
 
-    /* ---- Milestone 19 per-proc CPU accounting --------------------
-     *
-     * We book-keep on the two sides of the boundary:
-     *   - cur: accumulate (now - last_switch_tsc) into cur->cpu_ns
-     *   - next: stamp last_switch_tsc = now
-     * This way cpu_ns stays correct across arbitrary interleavings,
-     * and pid 0's cpu_ns ends up being "idle time + kernel work",
-     * which we treat as the system-idle bucket in `top`.
-     *
-     * Also account the zone + global context_switch counter so
-     * `perf` shows how often we ping-pong. */
-    uint64_t t_switch = perf_rdtsc();
-    if (cur)  perf_proc_account_out(cur,  t_switch);
-    perf_proc_account_in (next, t_switch);
-    perf_count_ctx_switch();
-    perf_zone_end(PERF_Z_SCHED_SWITCH, t_switch);
-
-    /* Hand the kernel-side stacks over to the new process so any
-     * subsequent IRQ-from-user / syscall lands on its kstack. We
-     * also stamp this CPU's percpu->current so anyone resolving
-     * "what's running on cpu X?" via smp_cpu(X)->current sees the
-     * post-switch picture. */
-    next->state            = PROC_RUNNING;
-    g_current_proc         = next;
-    me->current            = next;
-    tss_set_rsp0((uint64_t)next->kstack_top);
-    me->syscall_rsp        = (uint64_t)next->kstack_top;  /* per-CPU (gs:[0]) */
-
-    /* Load per-thread TLS base (FS segment) so userland __thread vars
-     * resolve correctly for the incoming thread. */
-    if (next->tls_base)
-        wrmsr(0xC0000100, next->tls_base);  /* MSR_FS_BASE */
-
-    if (log_enabled(LOG_CAT_SCHED)) {
-        klog(LOG_CAT_SCHED, "yield: %d -> %d (cr3=0x%lx)",
-             cur ? cur->pid : -1, next->pid, (unsigned long)next->cr3);
-    } else if (gui_trace_level() >= GUI_TRACE_VERBOSE) {
-        gui_trace_logf("sched_yield: %d -> %d (old_rsp=%p new_rsp=%p new_cr3=0x%lx)",
-                       cur ? cur->pid : -1, next->pid,
-                       (void *)cur->saved_rsp, (void *)next->saved_rsp,
-                       (unsigned long)next->cr3);
-    }
-    /* Save our FPU/SSE state, switch, and restore ours when we're resumed.
-     * The proc we switch TO restores its own state either via its matching
-     * fpu_restore here (if it parked in sched_yield) or via the explicit
-     * restore in proc_first_user_entry/fork_child_entry (if first-run). */
-    fpu_save(cur->fpu_state);
-    proc_context_switch(&cur->saved_rsp, next->saved_rsp, next->cr3);
-    fpu_restore(cur->fpu_state);
-    if (gui_trace_level() >= GUI_TRACE_VERBOSE) {
-        struct proc *now = current_proc();
-        gui_trace_logf("sched_yield: resumed as %d", now ? now->pid : -1);
-    }
-    /* When this returns, we're back as `cur` again -- some future
-     * sched_yield switched control to us. Re-stamp our switch-in
-     * time so the NEXT switch-out delta is correct. */
-    {
-        struct proc *resumed = current_proc();
-        if (resumed) perf_proc_account_in(resumed, perf_rdtsc());
-    }
+    do_switch(me, cur, next, had_bkl);   /* releases-already / reacquires BKL */
+#undef YIELD_RETURN
 }
 
 /* ---------- AP idle loop ---------- */
 
 void sched_idle(void) {
-    struct percpu *me  = smp_this_cpu();
-    struct percpu *bsp = smp_cpu_mut(0);
+    /* AP scheduler loop, running as this CPU's idle proc (set by ap_entry).
+     * Find a runnable proc (our queue first, then steal from other cores) and
+     * context-switch into it. When that proc later blocks/exits with nothing
+     * else for this CPU, sched_yield switches back here (me->idle) and we look
+     * again; if there's genuinely no work anywhere, halt until the next IRQ
+     * and retry. The idle proc never holds the BKL (user procs acquire it in
+     * their own syscalls). */
+    struct percpu *me   = smp_this_cpu();
+    struct proc   *idle = me->current;     /* == me->idle */
     for (;;) {
-        sti();
-        hlt();
-
-        if (!me || me->cpu_idx == 0) continue;
-
-        /* APs don't have per-CPU TSS yet, so they can't context-switch
-         * into user processes directly. Migrate any work that landed on
-         * our queue back to the BSP where it can run. This ensures
-         * round-robin enqueue doesn't strand procs on APs.
-         *
-         * TODO: once per-CPU TSS is wired up, replace this migration
-         * with a real pop-and-switch path (like sched_yield on the BSP). */
-        for (;;) {
-            uint64_t f = spin_lock_irqsave(&me->ready_lock);
-            struct proc *p = queue_pop_locked(me);
-            spin_unlock_irqrestore(&me->ready_lock, f);
-            if (!p) break;
-
-            uint64_t f2 = spin_lock_irqsave(&bsp->ready_lock);
-            queue_push_locked(bsp, p);
-            spin_unlock_irqrestore(&bsp->ready_lock, f2);
+        struct proc *p = g_ap_run_enabled ? steal_one(me) : 0;
+        if (p) {
+            do_switch(me, idle, p, false);
+            me->current = idle;            /* p yielded/exited back to us */
+        } else {
+            sti();
+            hlt();
         }
     }
 }

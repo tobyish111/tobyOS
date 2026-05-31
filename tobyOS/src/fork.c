@@ -547,6 +547,11 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     kprintf("[execve] pid=%d now running '%s' entry=%p rsp=%p\n",
             p->pid, p->name, (void *)p->user_entry, (void *)p->user_rsp);
 
+    /* This path enters ring 3 directly and never returns to syscall_dispatch,
+     * so release the BKL here (execve was called from a syscall holding it).
+     * Idempotent if already released. */
+    bkl_exit();
+
     /* Jump to new program -- does not return. */
     proc_enter_user_asm(p->user_entry, p->user_rsp);
 }

@@ -224,10 +224,43 @@ void proc_init(void) {
     /* Phase 1 M1.3: init signal state for pid 0 */
     signal_init_proc(&k->sigstate);
 
+    /* pid 0 is the BSP's idle/kernel thread (drives the GUI) -- mark it so
+     * the scheduler never steals it onto a secondary core. */
+    k->is_idle = true;
+
     g_current_proc = k;
+    /* cpu 0's per-CPU current is pid 0, so current_proc() works on the BSP
+     * from the very start (before sched_init). */
+    smp_cpu_mut(0)->current = k;
 
     kprintf("[proc] table initialised (%d slots), pid 0 = '%s' RUNNING\n",
             PROC_MAX, k->name);
+}
+
+/* Per-AP idle process. Each secondary CPU runs a kernel idle context the
+ * scheduler can switch user work in and out of. It lives on the AP boot stack
+ * and uses the kernel address space. pid 0 so it's treated as a kernel thread
+ * everywhere `pid == 0` is special-cased (signals, faults); is_idle so it's
+ * never stolen onto another CPU. */
+static struct proc g_ap_idle[MAX_CPUS];
+
+struct proc *proc_ap_idle(uint32_t cpu, uint64_t kstack_top) {
+    struct proc *k = &g_ap_idle[cpu];
+    memset(k, 0, sizeof(*k));
+    k->pid         = 0;
+    k->ppid        = 0;
+    k->state       = PROC_RUNNING;
+    k->cr3         = vmm_kernel_pml4_phys();
+    k->owns_pml4   = false;
+    k->kstack_base = 0;                       /* AP boot stack -- never freed */
+    k->kstack_top  = (void *)kstack_top;
+    k->wait_pid    = -1;
+    k->is_idle     = true;
+    k->cwd[0] = '/'; k->cwd[1] = '\0';
+    name_copy(k->name, "ap_idle", PROC_NAME_MAX);
+    signal_init_proc(&k->sigstate);
+    fpu_init_default(k->fpu_state);
+    return k;
 }
 
 /* ---- per-process fd table helpers --------------------------------- */

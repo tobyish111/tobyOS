@@ -2714,6 +2714,13 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * deadlock the box. */
     sti();
 
+    /* Big Kernel Lock: serialize the whole syscall body across CPUs so user
+     * code parallelizes while the kernel's coarse-locked subsystems stay safe.
+     * The scheduler drops/reacquires the BKL around any blocking switch inside
+     * the body, and proc_exit's switch releases it for a dying proc. Held with
+     * IRQs on (we just sti'd); IRQ handlers don't take the BKL. */
+    bkl_enter();
+
     /* ---- Milestone 19: per-syscall perf zone + per-proc counter ---
      *
      * perf_syscall_enter/exit wrap the dispatch body. The overhead is
@@ -2788,6 +2795,11 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * `rv` is preserved as the to-be-restored RAX for the handler case. */
     signal_deliver_syscall(rv);
 
+    /* Leaving the kernel: drop the BKL so another core can enter. (If the
+     * body proc_exit'd or a signal killed us, the scheduler already released
+     * it and we never got here; bkl_exit is idempotent regardless.) */
+    bkl_exit();
+
     /* Re-mask interrupts before we return into the .S unwind. The
      * trampoline pops 14 registers and then does `mov rsp, [rsp]` to
      * jump back onto the user stack -- if an IRQ fired in that window
@@ -2798,7 +2810,11 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
     return rv;
 }
 
-void syscall_init(void) {
+/* Program the SYSCALL-related MSRs on the CURRENT CPU. EFER.SCE/STAR/LSTAR/
+ * FMASK are all per-CPU, so every core that runs ring-3 code must set them or
+ * the `syscall` instruction #UDs. Shared by syscall_init (BSP) and
+ * syscall_init_ap (each AP). */
+static void syscall_program_msrs(void) {
     uint64_t efer = rdmsr(IA32_EFER);
     wrmsr(IA32_EFER, efer | EFER_SCE);
 
@@ -2808,6 +2824,20 @@ void syscall_init(void) {
 
     wrmsr(IA32_LSTAR, (uint64_t)&syscall_entry);
     wrmsr(IA32_FMASK, RFLAGS_IF | RFLAGS_DF | RFLAGS_TF);
+}
+
+/* Per-AP SYSCALL setup: just the MSRs. The AP's GS base + syscall_rsp are set
+ * in ap_entry. Without this, the first `syscall` a user proc runs on an AP
+ * raises #UD. */
+void syscall_init_ap(void) {
+    syscall_program_msrs();
+}
+
+void syscall_init(void) {
+    syscall_program_msrs();
+
+    uint64_t star = ((uint64_t)GDT_KERNEL_CS << 32) |
+                    ((uint64_t)0x10          << 48);
 
     /* Per-CPU SYSCALL stack via GS base. GS base points at this CPU's
      * struct percpu; syscall_entry.S reads gs:[0] (syscall_rsp) / gs:[8]
