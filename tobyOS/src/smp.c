@@ -25,6 +25,7 @@
  */
 
 #include <tobyos/smp.h>
+#include <tobyos/tss.h>
 #include <tobyos/acpi.h>
 #include <tobyos/apic.h>
 #include <tobyos/pmm.h>
@@ -141,10 +142,24 @@ static void smp_logf(const char *fmt, ...) {
  *      pinned to the BSP in v1) but the timer ticks land here so
  *      sched_tick + per-CPU bookkeeping stay live.
  */
+extern void hardening_init_ap(void);   /* hardening.c -- per-CPU CR0/CR4/EFER */
+
 static __attribute__((noreturn, used)) void ap_entry(uint32_t cpu_idx) {
     apic_init_local();
 
     struct percpu *me = &g_percpu[cpu_idx];
+
+    /* Bring this AP up to BSP parity so it can run ring-3 user code:
+     *   - per-CPU CR0/CR4/EFER (SSE + SMEP/SMAP/NX),
+     *   - its own TSS (RSP0 for IRQ-from-ring3; scheduler overrides per switch),
+     *   - GS base -> this CPU's percpu so the SYSCALL trampoline finds its
+     *     per-CPU kernel stack (gs:[0]),
+     *   - a sane initial syscall_rsp (overwritten on the first context switch).
+     * Order: hardening before anything that might rely on SSE; GS base last. */
+    hardening_init_ap();
+    tss_init_ap(cpu_idx, me->stack_top);
+    me->syscall_rsp = me->stack_top;
+    wrmsr(0xC0000101u /* IA32_GS_BASE */, (uint64_t)me);
 
     /* Sanity check: did the LAPIC ID survive the trip? Should equal
      * what ACPI told us. If not we still proceed (the message will

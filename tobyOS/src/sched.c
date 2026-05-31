@@ -45,8 +45,8 @@
 #include <tobyos/spinlock.h>
 #include <tobyos/watchdog.h>
 
-/* From syscall_entry.S: kernel SP loaded by the SYSCALL trampoline. */
-extern uint64_t g_kernel_syscall_rsp;
+/* The SYSCALL trampoline now loads its kernel stack from this CPU's
+ * percpu->syscall_rsp (gs:[0]); the scheduler updates it on every switch. */
 
 /* From proc_switch.S. */
 extern void proc_context_switch(uint64_t *save_old_rsp,
@@ -264,7 +264,7 @@ void sched_yield(void) {
     g_current_proc         = next;
     me->current            = next;
     tss_set_rsp0((uint64_t)next->kstack_top);
-    g_kernel_syscall_rsp   = (uint64_t)next->kstack_top;
+    me->syscall_rsp        = (uint64_t)next->kstack_top;  /* per-CPU (gs:[0]) */
 
     /* Load per-thread TLS base (FS segment) so userland __thread vars
      * resolve correctly for the incoming thread. */

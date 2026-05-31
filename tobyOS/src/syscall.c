@@ -68,8 +68,8 @@
 #include <tobyos/http.h>
 #include <tobyos/inotify.h>
 #include <tobyos/clipboard.h>
+#include <tobyos/smp.h>
 
-extern uint64_t g_kernel_syscall_rsp;
 extern void syscall_entry(void);
 
 /* Phase 3 M3.2: fork/exec forward declarations */
@@ -122,6 +122,7 @@ static void syscall_service_input(void) {
 #define IA32_STAR       0xC0000081u
 #define IA32_LSTAR      0xC0000082u
 #define IA32_FMASK      0xC0000084u
+#define IA32_GS_BASE    0xC0000101u   /* active GS base (per-CPU data ptr) */
 
 #define EFER_SCE        (1ULL << 0)
 
@@ -2808,12 +2809,20 @@ void syscall_init(void) {
     wrmsr(IA32_LSTAR, (uint64_t)&syscall_entry);
     wrmsr(IA32_FMASK, RFLAGS_IF | RFLAGS_DF | RFLAGS_TF);
 
-    g_kernel_syscall_rsp = tss_kernel_rsp_top();
+    /* Per-CPU SYSCALL stack via GS base. GS base points at this CPU's
+     * struct percpu; syscall_entry.S reads gs:[0] (syscall_rsp) / gs:[8]
+     * (scratch). tobyOS user code never uses the GS base, so we leave it
+     * pointed at per-CPU data across ring transitions (no swapgs needed).
+     * APs do the equivalent in ap_entry(). */
+    struct percpu *pc = smp_this_cpu();
+    pc->syscall_rsp = tss_kernel_rsp_top();
+    wrmsr(IA32_GS_BASE, (uint64_t)pc);
 
     kprintf("[sys] EFER.SCE on, STAR=0x%016lx, LSTAR=%p, FMASK=0x%lx\n",
             star, (void *)&syscall_entry,
             (unsigned long)(RFLAGS_IF | RFLAGS_DF | RFLAGS_TF));
-    kprintf("[sys] kernel syscall rsp = %p\n", (void *)g_kernel_syscall_rsp);
+    kprintf("[sys] kernel syscall rsp = %p (gs base=%p)\n",
+            (void *)pc->syscall_rsp, (void *)pc);
     kprintf("[sys] available syscalls: %d=exit  %d=write  %d=read  "
             "%d=pipe  %d=close  %d=yield\n",
             SYS_EXIT, SYS_WRITE, SYS_READ, SYS_PIPE, SYS_CLOSE, SYS_YIELD);

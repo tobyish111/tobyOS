@@ -117,6 +117,30 @@ void hardening_init(void) {
     }
 }
 
+/* Replay the BSP's CR0/CR4/EFER hardening on a secondary CPU. CR0/CR4/EFER
+ * are per-CPU, so each AP must set SSE/SMEP/SMAP/NX itself before it runs
+ * any user code. Uses the feature flags already probed by hardening_init()
+ * on the BSP. Called from ap_entry(). */
+void hardening_init_ap(void) {
+    /* SSE: CR0.EM=0/MP, CR4.OSFXSR|OSXMMEXCPT (always -- the BSP enabled it
+     * unconditionally and user FP code requires it). */
+    uint64_t cr0 = read_cr0();
+    cr0 = (cr0 & ~CR0_EM) | CR0_MP;
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
+
+    uint64_t cr4 = read_cr4();
+    cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
+    if (g_smep_available) cr4 |= CR4_SMEP;
+    if (g_smap_available) cr4 |= CR4_SMAP;
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+
+    if (g_nx_available) {
+        uint64_t efer = rdmsr(MSR_IA32_EFER);
+        efer |= EFER_NXE;
+        wrmsr(MSR_IA32_EFER, efer);
+    }
+}
+
 int hardening_smep_enabled(void) { return g_smep_available; }
 int hardening_smap_enabled(void) { return g_smap_available; }
 int hardening_nx_enabled(void)   { return g_nx_available; }

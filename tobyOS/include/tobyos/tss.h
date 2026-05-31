@@ -31,6 +31,10 @@
 
 void tss_init(void);
 
+/* Per-AP TSS install + LTR, called from ap_entry. cpu_idx selects this
+ * CPU's TSS; rsp0 seeds its RSP0 until the scheduler hands it a process. */
+void tss_init_ap(uint32_t cpu_idx, uint64_t rsp0);
+
 /* Top (highest address) of the kernel interrupt stack. SYSCALL entry
  * loads RSP from this on entry from user mode. Same value lives in
  * TSS.RSP0 for the IRQ path. */

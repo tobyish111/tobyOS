@@ -29,6 +29,15 @@
 struct proc;
 
 struct percpu {
+    /* ---- asm-visible per-CPU fields (MUST stay first, offsets 0 and 8) ----
+     * GS base on each CPU points at that CPU's struct percpu, so the SYSCALL
+     * trampoline (syscall_entry.S) reads gs:[0] / gs:[8] for the kernel stack
+     * and the user-RSP scratch. Two CPUs can be in the SYSCALL prologue at
+     * once, so these MUST be per-CPU (a single global would race). Keep these
+     * two fields at offsets 0/8 -- syscall_entry.S hard-codes them. */
+    uint64_t syscall_rsp;        /* offset 0:  kernel stack top for SYSCALL  */
+    uint64_t user_rsp_scratch;   /* offset 8:  SYSCALL prologue scratch slot */
+
     uint32_t cpu_idx;       /* 0..n-1, our internal numbering */
     uint32_t apic_id;       /* what the LAPIC reports for this CPU */
     bool     is_bsp;        /* true for cpu_idx 0 (always the BSP) */

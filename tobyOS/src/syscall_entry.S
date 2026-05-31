@@ -62,12 +62,6 @@
 .intel_syntax noprefix
 .code64
 
-.section .data
-.global g_kernel_syscall_rsp
-.global g_user_rsp_scratch
-g_kernel_syscall_rsp: .quad 0
-g_user_rsp_scratch:   .quad 0
-
 .section .text
 
 /* ============================================================== */
@@ -100,9 +94,17 @@ syscall_entry:
      * etc. inside printk. We therefore push TWO 8-byte slots here:
      * the live user RSP plus an alignment pad. The exit path skips
      * the pad and reloads RSP from the user-RSP slot. */
-    mov [rip + g_user_rsp_scratch], rsp
-    mov rsp, [rip + g_kernel_syscall_rsp]
-    push qword ptr [rip + g_user_rsp_scratch]   /* user RSP -> kstack */
+    /* Per-CPU via GS base (set to this CPU's `struct percpu`):
+     *   gs:[0] = syscall_rsp       (this CPU's kernel syscall stack top)
+     *   gs:[8] = user_rsp_scratch  (this CPU's prologue scratch)
+     * Per-CPU (not a global) so two CPUs can run the prologue concurrently
+     * without clobbering each other. IF is cleared by FMASK here, so this
+     * window is non-preemptible on THIS CPU. tobyOS user code never uses the
+     * GS base, so we do NOT swapgs -- GS stays pointed at per-CPU data across
+     * the ring transition (see syscall_init / proc_enter_user_asm). */
+    mov gs:[8], rsp                             /* save user RSP -> scratch */
+    mov rsp, gs:[0]                             /* swap to kernel syscall stack */
+    push qword ptr gs:[8]                       /* user RSP -> kstack */
     sub rsp, 8                                  /* 16-B alignment pad */
 
     /* Save the regs we'll touch in the body. We need to preserve

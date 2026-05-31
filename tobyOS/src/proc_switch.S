@@ -108,12 +108,16 @@ proc_enter_user_asm:
     push rdi                    /* RIP */
 
     /* Reload data segments to user selectors -- mostly cosmetic in
-     * long mode, but keeps the descriptor cache tidy. */
+     * long mode, but keeps the descriptor cache tidy. We deliberately do
+     * NOT reload GS: loading a selector rewrites the segment's hidden base
+     * from its GDT descriptor (base 0), which would wipe this CPU's per-CPU
+     * GS base that the SYSCALL trampoline relies on (gs:[0]=syscall_rsp).
+     * tobyOS user code uses FS for TLS, never GS, so leaving GS pointed at
+     * per-CPU kernel data is safe (no swapgs scheme needed). */
     mov ax, 0x1B
     mov ds, ax
     mov es, ax
     mov fs, ax
-    mov gs, ax
 
     iretq                       /* drop to CPL 3 */
 
@@ -141,12 +145,12 @@ proc_enter_user_thread_asm:
     push rax                    /* CS */
     push rdi                    /* RIP */
 
-    /* Set data segments */
+    /* Set data segments. NOT GS -- see proc_enter_user_asm: reloading GS
+     * would clobber this CPU's per-CPU GS base used by the SYSCALL path. */
     mov ax, 0x1B
     mov ds, ax
     mov es, ax
     mov fs, ax
-    mov gs, ax
 
     /* Set RDI = arg for the thread function */
     mov rdi, rcx

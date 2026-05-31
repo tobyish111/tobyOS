@@ -278,9 +278,13 @@ struct proc_exit_info {
 int proc_wait_info(int pid, struct proc_exit_info *out);
 
 /* Globals (defined in proc.c). */
-extern struct proc *g_current_proc;     /* always non-NULL after proc_init */
+extern struct proc *g_current_proc;     /* last proc switched-to on any CPU */
 
-static inline struct proc *current_proc(void) { return g_current_proc; }
+/* The process running on the CALLING CPU. Multi-core: this is per-CPU
+ * (g_percpu[this_cpu].current). Defined out-of-line in proc.c so this header
+ * needn't pull in the SMP/percpu machinery. Falls back to g_current_proc in
+ * the brief early-boot window before per-CPU `current` is populated. */
+struct proc *current_proc(void);
 
 /* Build pid 0 from the live boot context (the caller IS pid 0 after
  * this returns). Must be called once, after the kernel PML4 + heap +

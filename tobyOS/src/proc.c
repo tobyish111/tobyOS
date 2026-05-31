@@ -59,6 +59,7 @@
 #include <tobyos/panic.h>
 #include <tobyos/klibc.h>
 #include <tobyos/uaccess.h>
+#include <tobyos/smp.h>
 #include <tobyos/file.h>
 #include <tobyos/cap.h>
 #include <tobyos/perf.h>
@@ -112,6 +113,15 @@ extern __attribute__((noreturn)) void proc_enter_user_thread_asm(uint64_t rip,
 
 struct proc g_proc[PROC_MAX];
 struct proc       *g_current_proc;
+
+/* The process running on the calling CPU. Per-CPU via g_percpu[].current
+ * (kept current by the scheduler on every switch). Before the scheduler has
+ * populated this CPU's slot (very early boot), fall back to the global
+ * last-switched pointer. smp_this_cpu() safely returns cpu 0 pre-SMP. */
+struct proc *current_proc(void) {
+    struct proc *p = smp_this_cpu()->current;
+    return p ? p : g_current_proc;
+}
 
 /* Tiny strncpy substitute -- copies up to max-1 chars and always
  * NUL-terminates the destination. */
