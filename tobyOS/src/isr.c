@@ -14,6 +14,7 @@
 #include <tobyos/vmm.h>
 #include <tobyos/page_fault.h>
 #include <tobyos/pmm.h>
+#include <tobyos/smp.h>
 
 /* During pid-0 bring-up, demand-map HHDM mirror gaps (UEFI memmap
  * holes, GOP framebuffer tagged RESERVED, freshly PMM'd pages). */
@@ -137,6 +138,39 @@ static void default_exception(struct regs *r) {
             r->vector, exc_name(r->vector),
             from_user ? "  (in user mode)" : "");
     dump_regs(r);
+
+    /* SMEP diagnostic: a supervisor-mode #PF with the instruction-fetch bit
+     * set (err bit 4) on a present user page means the kernel jumped INTO a
+     * user-mapped page. This is the AP-first-run / argc>=1 / SMAP bug. Surface
+     * the entry-path fields so the fault frame is self-explanatory (compare
+     * fault rip/cr2 against user_rsp / user_entry to see what we jumped to). */
+    if (r->vector == 14 && !from_user && (r->error_code & 0x10)) {
+        /* Stop taking IRQs on THIS CPU so the dump below isn't interleaved
+         * on the serial wire with another core's logging / pid-0 heartbeat.
+         * The fault is fatal (we panic at the end) so losing IRQs is fine. */
+        cli();
+        struct proc *cp = current_proc();
+        struct percpu *me = smp_this_cpu();
+        /* Banner markers chosen to be trivially greppable in a captured
+         * serial stream from the EliteDesk (null-modem @ 38400 8N1). */
+        kprintf("\n===SMEP-FAULT-BEGIN===\n");
+        kprintf("  [SMEP] kernel instruction-fetch from a user page!\n");
+        kprintf("  [SMEP] cpu=%u  pid=%d '%s'  is_idle=%d is_thread=%d\n",
+                me ? me->cpu_idx : 0,
+                cp ? cp->pid : -1, cp ? cp->name : "(null)",
+                cp ? cp->is_idle : -1, cp ? cp->is_thread : -1);
+        if (cp) {
+            kprintf("  [SMEP] user_entry=%p user_rsp=%p\n",
+                    (void *)cp->user_entry, (void *)cp->user_rsp);
+            kprintf("  [SMEP] kstack_top=%p saved_rsp=%p proc.cr3=%p\n",
+                    cp->kstack_top, (void *)cp->saved_rsp, (void *)cp->cr3);
+            kprintf("  [SMEP] fault_rip - user_rsp = %ld (0x%lx)\n",
+                    (long)(r->rip - cp->user_rsp), r->rip - cp->user_rsp);
+            kprintf("  [SMEP] fault_rip - user_entry = %ld (0x%lx)\n",
+                    (long)(r->rip - cp->user_entry), r->rip - cp->user_entry);
+        }
+        kprintf("===SMEP-FAULT-END===\n");
+    }
 
     if (from_user) {
         /* User code did something illegal -- bail out of ring 3 cleanly

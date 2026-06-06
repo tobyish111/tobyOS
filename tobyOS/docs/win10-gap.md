@@ -95,7 +95,23 @@ driver model; POSIX libc surface.
    real-HW debug session. Also: no priority classes / fair per-AP timeslicing yet (the AP
    LAPIC timer doesn't preempt; CPU-bound procs run to completion / block-yield).
 4. **GPU-accelerated desktop on real hardware** — compositor accel only exists for VirtIO,
-   not the Intel iGPU path used on the EliteDesk.
+   not the Intel iGPU path used on the EliteDesk. **In progress (i915-lite):** the desktop
+   today renders via Limine's firmware framebuffer (CPU memcpy); the Intel drivers
+   (`gpu_intel_modeset.c`, the now-deleted duplicate `intel_gfx.c`, `compositor_accel.c`)
+   were dead code, never called at boot. Staged bring-up that never re-modesets Limine's
+   working pipe: **Stage 1 DONE** — read-only GT/display recon (`intel_gpu_gt_recon`) logs
+   GT gen, GGTT/stolen config, BCS ring state, active scanout; writes nothing.
+   **Stage 2 DONE + VALIDATED ON REAL HW (2026-06-04)** — `intel_gt_init`: forcewake
+   (render+blitter), gen9 GGTT mapping (8-byte PTEs, top half of the 16 MiB BAR), BCS
+   blitter ring bring-up, and an `MI_STORE_DWORD_IMM` hardware self-test. On the EliteDesk
+   (HD 520, gen9): `self-test PASS -- blitter accel available` (`scratch=0x7ed5c0de`). The
+   blitter executes our command stream end-to-end. Took 3 blind real-HW boots to land
+   (BAR-size 4 MiB clamp → missing MI_USE_GLOBAL_GTT bit → PASS). Touches only GT/GGTT/ring
+   + our own pages, never the display pipe, so it can't blackscreen the box; gated behind
+   `intel_gt_selftest_ok()`. **Stage 3 (next)** — wire `XY_COLOR_BLT`/`XY_SRC_COPY_BLT` as a
+   `gfx_backend` peer of virtio, presenting via Limine memcpy first (a broken blit shows
+   visible garbage, never a black screen). **Stage 4** — vblank-synced `PLANE_SURF` page-flip
+   with watchdog auto-revert. QEMU can't emulate the Intel GT, so 3-4 stay EliteDesk-validated.
 5. **Security depth** — ~~salted/KDF auth~~ (Argon2id), ~~login rate-limiting~~ (lockout),
    ~~signal *delivery*~~ (frame push + sigreturn), ~~re-enable SMAP~~ (syscall-wide uaccess
    window). This bundle is now largely done. Remaining: per-copy uaccess accessors (the
@@ -105,7 +121,13 @@ driver model; POSIX libc surface.
 
 ## Known shallow / "present but not robust" items
 - SMP: APs run user code in parallel now (BKL-serialized kernel, work-stealing, ~2.6x on 4
-  workers). Caveat: argc>=1 first-run procs on an AP under SMAP SMEP-fault (gap item #3).
+  workers). Caveat: argc>=1 first-run procs on an AP under SMAP were reported to SMEP-fault on
+  real HW (gap item #3). **2026-05-31: confirmed NOT reproducible in QEMU** across three
+  escalating configs incl. multi-threaded TCG (`-accel tcg,thread=multi`, `Skylake-Client,
+  +smep,+smap`) — 32/32 argc>=1 workers ran clean on APs, 0 faults. Instrumentation added
+  (`-DMCARGV_BOOT` repro harness + a SMEP fault dump in isr.c) to capture the fault frame on
+  the EliteDesk over the COM1 null-modem cable; see `docs/smep-ap-capture.md`. Root-cause now
+  blocked on a real-HW serial capture, not on QEMU debugging.
   No fair per-AP timeslicing (AP LAPIC timer doesn't preempt).
 - IPv6: link-local only — no SLAAC/DHCPv6/global addressing.
 - Passwords: now salted Argon2id (was djb2). Still no account lockout / rate-limiting,
@@ -122,6 +144,18 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-05-31** — **AP/argc>=1/SMAP SMEP fault: confirmed NOT QEMU-reproducible.** Built an
+  opt-in repro (`-DMCARGV_BOOT` in kernel.c: 8 rounds × 4 `argc=4`/`envc=3` `/bin/mctest`
+  workers spawned together, with `/bin/mctest` now dereferencing `argv[]`) plus a greppable
+  SMEP fault dump in `isr.c default_exception` (on `vector==14 && !from_user && err&0x10`:
+  cli's the CPU, prints cpu/pid/user_entry/user_rsp/kstack_top/saved_rsp + fault-rip deltas,
+  bracketed `===SMEP-FAULT-BEGIN/END===`). Ran `qemu64,+smep,+smap`, the same with argv
+  deref, and `Skylake-Client,+smep,+smap` under `-accel tcg,thread=multi` — all clean (32/32
+  workers, 0 SMEP, 0 #PF, desktop healthy; per-proc cpu times prove genuine parallel AP
+  execution). No KVM on the Windows host, so MTTCG is the strongest local concurrency model.
+  Wrote `docs/smep-ap-capture.md` for capturing the fault frame on the EliteDesk over COM1
+  (38400 8N1 null-modem). The original MCTEST benchmark used `argc=0`, which is why it never
+  exercised this path. No parity-number change; this is diagnosis, not a fix.
 - **2026-05-31** — **Real multi-core landed.** On top of the per-CPU foundation, APs now
   run user code in parallel: a syscall-path big-kernel-lock (`sched.c` `bkl_enter/exit`,
   released/reacquired around blocking in `sched_yield`, around pid 0's `gui_tick`/service

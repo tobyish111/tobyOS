@@ -10,8 +10,15 @@
 #include <stdio.h>
 
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
-    volatile unsigned long x = 0;
+    /* Touch argv so the compiler keeps the packed strings live and we
+     * actually dereference the user-stack argv pointers (the region the
+     * AP-first-run SMEP fault was reported to land in). */
+    volatile unsigned long sink = (unsigned long)argc;
+    for (int a = 0; a < argc; a++) {
+        const char *s = argv[a];
+        while (s && *s) { sink += (unsigned char)*s; s++; }
+    }
+    volatile unsigned long x = sink;
     for (unsigned long i = 0; i < 400000000UL; i++) {
         x += i * 2654435761UL;
         x ^= (x >> 13);
