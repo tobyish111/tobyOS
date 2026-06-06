@@ -51,6 +51,7 @@
 #include <tobyos/pit.h>
 #include <tobyos/irq.h>
 #include <tobyos/apic.h>
+#include <tobyos/spinlock.h>
 
 /* ============================================================== */
 /* Capability + Operational + Runtime + Doorbell register offsets */
@@ -2000,16 +2001,25 @@ void xhci_service_port_changes(void) {
 /* Event ring drain (xhci_poll)                                    */
 /* ============================================================== */
 
+/* Serialises the event-ring drain across CPUs. Pre-SMP, xhci_poll() relied
+ * on a plain cli to be atomic against our own MSI handler -- correct when one
+ * CPU ran everything. Post-SMP (BKL world) xhci_poll() is reached from pid 0's
+ * idle_loop (BSP, under BKL), the PIT IRQ (no BKL), AND user syscalls running
+ * on secondary CPUs (syscall.c) -- so two cores could drain the same ring at
+ * once, double-consuming HID transfer events and wedging mouse/keyboard input.
+ * cli only masks the local CPU, so it can't prevent that; this lock does.
+ * spin_lock_irqsave keeps the local-CPU cli behaviour (atomic vs our own MSI)
+ * AND adds cross-CPU exclusion. */
+static spinlock_t g_xhci_poll_lock = SPINLOCK_INIT;
+
 void xhci_poll(void) {
     if (!g_xhci.bound) return;
 
-    /* Save RFLAGS + cli so the body is atomic w.r.t. our own MSI
-     * handler. Works correctly from both kernel context (IF=1: cli
-     * masks, popfq re-enables) and IRQ context (IF=0: cli no-op,
-     * popfq leaves IF=0). Without this, an MSI arriving while the
-     * idle loop is mid-drain would double-consume an event. */
-    uint64_t flags;
-    __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    /* Cross-CPU + local-IRQ exclusion for the whole drain (see lock comment).
+     * irqsave gives us the same cli/RFLAGS-restore the old hand-rolled
+     * pushfq/cli/popfq did, so behaviour from IRQ context (IF stays 0) and
+     * kernel context (IF restored) is unchanged -- now just SMP-safe. */
+    uint64_t flags = spin_lock_irqsave(&g_xhci_poll_lock);
 
     for (;;) {
         struct trb *e = &g_xhci.evt_ring[g_xhci.evt_idx];
@@ -2092,7 +2102,7 @@ void xhci_poll(void) {
            (uint32_t)((deq_phys & 0xFFFFFFF0u) | (1u << 3)));
     rt_w32(XHCI_RT_IR0 + XHCI_IR_ERDP_HI, (uint32_t)(deq_phys >> 32));
 
-    __asm__ __volatile__("push %0; popfq" :: "r"(flags) : "memory");
+    spin_unlock_irqrestore(&g_xhci_poll_lock, flags);
 }
 
 /* MSI / MSI-X handler. The chip raises IR0.IMAN.IP (bit 0) on every
