@@ -17,6 +17,7 @@
 #include <tobyos/pmm.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+#include <tobyos/pit.h>
 
 #define printk kprintf
 
@@ -163,13 +164,20 @@ static int igpu_probe_pci(void) {
                     mmio_base |= ((uint64_t)bar1) << 32;
                 }
 
-                /* Determine MMIO size (typically 512KB to 2MB) */
+                /* Determine MMIO (GTTMMADR / BAR0) size from the BAR
+                 * sizing dance. On gen8/9 this BAR is 16 MiB: registers in
+                 * the low 8 MiB, the GGTT PTE array in the top 8 MiB. The
+                 * old 4 MiB clamp below was fine for the register-only
+                 * modeset path but truncated the GGTT half, so GT accel
+                 * (intel_gt_init) couldn't reach its page tables. Keep the
+                 * BAR's real size (capped at a sane 16 MiB so a bogus
+                 * read can't make us map something enormous). */
                 pci_cfg_write32(bus, dev, func, 0x10, 0xFFFFFFFF);
                 uint32_t size_mask = pci_cfg_read32(bus, dev, func, 0x10);
                 pci_cfg_write32(bus, dev, func, 0x10, bar0);
                 size_t mmio_size = ~(size_mask & 0xFFFFFFF0u) + 1;
-                if (mmio_size < 0x80000) mmio_size = 0x80000;
-                if (mmio_size > 0x400000) mmio_size = 0x400000;
+                if (mmio_size < 0x80000)   mmio_size = 0x80000;     /* 512 KiB floor */
+                if (mmio_size > 0x1000000) mmio_size = 0x1000000;   /* 16 MiB ceiling */
 
                 /* Enable bus mastering and memory space */
                 uint32_t cmd = pci_cfg_read32(bus, dev, func, 0x04);
@@ -181,6 +189,10 @@ static int igpu_probe_pci(void) {
                 g_igpu.device_id = device;
                 g_igpu.gen = igpu_get_gen(device);
                 g_igpu.has_pch = (g_igpu.gen >= 6);
+                g_igpu.bus = (uint8_t)bus;
+                g_igpu.dev = (uint8_t)dev;
+                g_igpu.func = (uint8_t)func;
+                g_igpu.bdf_valid = 1;
 
                 printk("[intel_gpu] found device %04x at %02x:%02x.%d "
                        "gen=%d mmio=0x%llx size=0x%zx\n",
@@ -482,6 +494,319 @@ static void igpu_enable_vblank_irq(int pipe) {
     uint32_t mask = (pipe == 0) ? DE_PIPE_A_VBLANK : DE_PIPE_B_VBLANK;
     igpu_clear_bits(DEIMR, mask);
     igpu_set_bits(DEIER, mask);
+}
+
+/* ======================================================================
+ * Stage 1: read-only GT + display reconnaissance
+ *
+ * Everything here only READS registers/config space and logs. No writes,
+ * no VGA disable, no modeset -- so it can never disturb the working Limine
+ * display, even on the un-serial-debuggable EliteDesk. The numbers it
+ * prints (GGTT size, stolen base/size, blitter ring head/tail/ctl, and
+ * which pipe+plane Limine left scanning out) are exactly what Stages 2-4
+ * (BLT ring + hardware page-flip) need and what QEMU can't show us.
+ * ====================================================================== */
+
+/* GEN8_BCS_RING_BASE / RING_* now live in gpu_intel.h (shared with the
+ * Stage 2 GT bring-up below). */
+
+/* Gen6+ graphics control regs live in the GPU's PCI CONFIG space. */
+#define INTEL_PCI_MGGC0      0x50u             /* Mirror of GMCH gfx ctrl   */
+#define INTEL_PCI_BDSM       0x5Cu             /* Base of Data Stolen Memory */
+
+/* PIPE_A source size + the primary plane Limine programmed. We read these
+ * to learn the active resolution + scanout surface WITHOUT changing them. */
+
+static uint32_t recon_ring_reg(uint32_t ring_base, uint32_t off) {
+    return igpu_read(ring_base + off);
+}
+
+void intel_gpu_gt_recon(void) {
+    if (!igpu_probe_pci()) {
+        kprintf("[intel_gpu] GT recon: no supported Intel GPU\n");
+        return;
+    }
+    if (igpu_map_mmio() < 0) {
+        kprintf("[intel_gpu] GT recon: MMIO map failed\n");
+        return;
+    }
+
+    kprintf("[intel_gpu] GT recon: device=%04x gen=%d mmio=0x%llx size=0x%zx\n",
+            g_igpu.device_id, g_igpu.gen,
+            (unsigned long long)g_igpu.mmio_phys, g_igpu.mmio_size);
+
+    /* --- Stolen memory + GGTT geometry, from PCI config (read-only). On
+     * Gen8/9 MGGC0[15:8] encodes GGTT size, [7:6]+[15:8] encode stolen
+     * size; BDSM[31:20] is the stolen-memory base. We log raw + decoded
+     * so a wrong decode is still debuggable from the raw value. */
+    if (g_igpu.bdf_valid) {
+        uint32_t mggc0 = pci_cfg_read32(g_igpu.bus, g_igpu.dev, g_igpu.func,
+                                        INTEL_PCI_MGGC0);
+        uint32_t bdsm  = pci_cfg_read32(g_igpu.bus, g_igpu.dev, g_igpu.func,
+                                        INTEL_PCI_BDSM);
+        uint32_t ggms  = (mggc0 >> 6) & 0x3u;          /* GGTT size sel    */
+        uint32_t gms   = (mggc0 >> 8) & 0xFFu;         /* stolen size sel  */
+        uint64_t stolen_base = (uint64_t)(bdsm & 0xFFF00000u);
+        kprintf("[intel_gpu] GT recon: MGGC0=0x%08x (GGMS=%u GMS=%u) "
+                "BDSM=0x%08x stolen_base=0x%llx\n",
+                mggc0, ggms, gms, bdsm,
+                (unsigned long long)stolen_base);
+    }
+
+    /* --- Blitter ring state. On a Limine boot nothing has touched the
+     * BCS, so we expect head==tail and RING_CTL length/enable telling us
+     * whether firmware left a ring configured. This is the register set
+     * Stage 2 will program. */
+    uint32_t bcs_ctl   = recon_ring_reg(GEN8_BCS_RING_BASE, RING_CTL);
+    uint32_t bcs_head  = recon_ring_reg(GEN8_BCS_RING_BASE, RING_HEAD);
+    uint32_t bcs_tail  = recon_ring_reg(GEN8_BCS_RING_BASE, RING_TAIL);
+    uint32_t bcs_start = recon_ring_reg(GEN8_BCS_RING_BASE, RING_START);
+    kprintf("[intel_gpu] GT recon: BCS ring ctl=0x%08x head=0x%08x "
+            "tail=0x%08x start=0x%08x\n",
+            bcs_ctl, bcs_head, bcs_tail, bcs_start);
+
+    /* --- Active display: which pipe/plane is Limine scanning out, and at
+     * what surface address + stride. PIPESRC_A holds (w-1)<<16|(h-1);
+     * PLANE_A_CTRL bit31 = enabled; PLANE_A_SURF = scanout phys; PLANE_A
+     * _STRIDE = bytes/line. We only READ -- this is the surface a future
+     * page-flip would retarget. */
+    uint32_t pipesrc = igpu_read(PIPESRC_A);
+    uint32_t pa_ctrl = igpu_read(PLANE_A_CTRL);
+    uint32_t pa_surf = igpu_read(PLANE_A_SURF);
+    uint32_t pa_strd = igpu_read(PLANE_A_STRIDE);
+    uint32_t aw = ((pipesrc >> 16) & 0xFFFFu) + 1u;
+    uint32_t ah = (pipesrc & 0xFFFFu) + 1u;
+    kprintf("[intel_gpu] GT recon: PIPE_A src=%ux%u PLANE_A ctrl=0x%08x "
+            "(en=%d) surf=0x%08x stride=%u\n",
+            aw, ah, pa_ctrl, (pa_ctrl >> 31) & 1u, pa_surf, pa_strd);
+
+    kprintf("[intel_gpu] GT recon: complete (read-only, display untouched)\n");
+
+    /* Deliberately do NOT set g_igpu.ready -- recon must not make the rest
+     * of the (modeset) driver think it owns the display. Stage 2+ will key
+     * off its own state. Leave the MMIO mapping in place; it's harmless and
+     * the later stages reuse it. */
+}
+
+/* ======================================================================
+ * Stage 2: GT / render-engine bring-up  (forcewake + GGTT + BCS ring)
+ *
+ * SAFETY: touches ONLY forcewake, the GGTT (top half of BAR0), the BCS
+ * ring registers (0x22000), and pages we allocate. It never writes a
+ * pipe/plane/DPLL/VGA register, so the Limine scanout is untouched -- the
+ * worst failure here is "the GT didn't respond", logged, with the self-test
+ * flag left 0 so nothing downstream trusts the GPU. Unverifiable in QEMU
+ * (no Intel GT); the self-test log line is the real-HW go/no-go signal.
+ * ====================================================================== */
+
+/* GT bring-up state, separate from the (unused) modeset state in g_igpu. */
+static struct {
+    int       fw_render;          /* forcewake acquired (render domain)  */
+    int       fw_blitter;         /* forcewake acquired (blitter domain) */
+    uint64_t  ggtt_mmio;          /* virt base of the GGTT PTE array      */
+    uint32_t  ring_pages;         /* BCS ring size in 4 KiB pages         */
+    uint64_t  ring_phys;          /* ring buffer phys                     */
+    uint32_t *ring_virt;          /* ring buffer virt (HHDM)              */
+    uint32_t  ring_ggtt_off;      /* ring's offset within GGTT (== GT VA) */
+    uint64_t  scratch_phys;       /* self-test target page phys           */
+    uint32_t *scratch_virt;       /* self-test target page virt           */
+    uint32_t  scratch_ggtt_off;   /* scratch GT VA                        */
+    int       selftest_ok;        /* GT executed our command stream       */
+} g_gt;
+
+int intel_gt_selftest_ok(void) { return g_gt.selftest_ok; }
+
+/* Acquire a forcewake domain: write (mask<<16 | bit), then poll the ack.
+ * Without this, gen9 render/blitter MMIO reads return 0 and writes drop. */
+static int gt_forcewake_get(uint32_t req_reg, uint32_t ack_reg) {
+    uint32_t set = (1u << (FORCEWAKE_KERNEL_BIT + 16)) |
+                   (1u << FORCEWAKE_KERNEL_BIT);
+    igpu_write(req_reg, set);
+    (void)igpu_read(req_reg);            /* posting read */
+    for (int i = 0; i < 100000; i++) {
+        if (igpu_read(ack_reg) & (1u << FORCEWAKE_KERNEL_BIT))
+            return 1;
+        for (volatile int j = 0; j < 50; j++) {}
+    }
+    return 0;
+}
+
+static void gt_forcewake_put(uint32_t req_reg) {
+    uint32_t clr = (1u << (FORCEWAKE_KERNEL_BIT + 16)) | 0u;  /* mask, val=0 */
+    igpu_write(req_reg, clr);
+    (void)igpu_read(req_reg);
+}
+
+/* Install a 4 KiB page into the GGTT at byte offset `ggtt_off` (which is
+ * also the GPU virtual address the engines will use). Gen8/9 PTEs are 8
+ * bytes and live in the top half of BAR0. */
+static void gt_ggtt_map(uint32_t ggtt_off, uint64_t phys) {
+    uint32_t pte_index = ggtt_off >> 12;
+    volatile uint64_t *ggtt = (volatile uint64_t *)g_gt.ggtt_mmio;
+    ggtt[pte_index] = (phys & ~0xFFFull) | GEN8_GGTT_PTE_PRESENT;
+    (void)ggtt[pte_index];               /* posting read */
+}
+
+/* Bring up the BCS ring: program START/CTL, leave HEAD=TAIL=0 (empty). */
+static int gt_ring_init(void) {
+    /* The ring buffer must be GGTT-mapped; the engine fetches commands
+     * through its GT VA, not the raw phys. We place it at a fixed GGTT
+     * offset well above anything the display uses. */
+    g_gt.ring_pages    = 1;                       /* 4 KiB ring is plenty */
+    g_gt.ring_ggtt_off = 0x40000u;                /* 256 KiB into GGTT    */
+    g_gt.ring_phys = pmm_alloc_pages(g_gt.ring_pages);
+    if (!g_gt.ring_phys) return 0;
+    g_gt.ring_virt = (uint32_t *)pmm_phys_to_virt(g_gt.ring_phys);
+    memset(g_gt.ring_virt, 0, g_gt.ring_pages * 4096u);
+    gt_ggtt_map(g_gt.ring_ggtt_off, g_gt.ring_phys);
+
+    /* Stop the ring first (CTL=0), then point it at our buffer. */
+    igpu_write(GEN8_BCS_RING_BASE + RING_CTL, 0);
+    (void)igpu_read(GEN8_BCS_RING_BASE + RING_CTL);
+    igpu_write(GEN8_BCS_RING_BASE + RING_HEAD, 0);
+    igpu_write(GEN8_BCS_RING_BASE + RING_TAIL, 0);
+    /* RING_START takes the ring's GT virtual address (its GGTT offset). */
+    igpu_write(GEN8_BCS_RING_BASE + RING_START, g_gt.ring_ggtt_off);
+    /* CTL: (npages*4KiB - 4KiB) in bits 12.., length field is (size/4K - 1)
+     * encoded in bits 20:12 ... gen8 uses (num_pages-1)<<12 | ENABLE. */
+    uint32_t ctl = ((g_gt.ring_pages - 1u) << 12) | RING_CTL_ENABLE;
+    igpu_write(GEN8_BCS_RING_BASE + RING_CTL, ctl);
+    (void)igpu_read(GEN8_BCS_RING_BASE + RING_CTL);
+    return 1;
+}
+
+/* Emit MI_STORE_DWORD_IMM(scratch <- magic) + MI_NOOP, advance TAIL, and
+ * wait for HEAD to catch up == the GT executed our stream. Then verify the
+ * scratch page actually holds the magic. This is the whole go/no-go test. */
+#define GT_SELFTEST_MAGIC  0x7ED5C0DEu
+static int gt_run_selftest(void) {
+    g_gt.scratch_phys = pmm_alloc_pages(1);
+    if (!g_gt.scratch_phys) return 0;
+    g_gt.scratch_virt = (uint32_t *)pmm_phys_to_virt(g_gt.scratch_phys);
+    g_gt.scratch_virt[0] = 0;                       /* clear target */
+    g_gt.scratch_ggtt_off = 0x41000u;               /* next GGTT page */
+    gt_ggtt_map(g_gt.scratch_ggtt_off, g_gt.scratch_phys);
+
+    /* Build the command stream at ring head 0. MI_STORE_DWORD_IMM (gen8)
+     * is: dword0=cmd, dword1:2=64-bit GT address, dword3=immediate. */
+    uint32_t *r = g_gt.ring_virt;
+    int n = 0;
+    r[n++] = MI_STORE_DWORD_IMM_GEN8;
+    r[n++] = g_gt.scratch_ggtt_off;                 /* addr lo (GT VA) */
+    r[n++] = 0;                                      /* addr hi         */
+    r[n++] = GT_SELFTEST_MAGIC;                      /* immediate data  */
+    r[n++] = MI_NOOP;
+    /* TAIL is a byte offset into the ring; must be 8-byte (qword) aligned. */
+    uint32_t tail = (uint32_t)(n * 4);
+    tail = (tail + 7u) & ~7u;
+    igpu_write(GEN8_BCS_RING_BASE + RING_TAIL, tail & RING_TAIL_MASK);
+    (void)igpu_read(GEN8_BCS_RING_BASE + RING_TAIL);
+
+    /* Wait for HEAD to reach TAIL (engine drained our commands). */
+    int drained = 0;
+    for (int i = 0; i < 200000; i++) {
+        uint32_t head = igpu_read(GEN8_BCS_RING_BASE + RING_HEAD)
+                        & RING_HEAD_MASK;
+        if (head == (tail & RING_HEAD_MASK)) { drained = 1; break; }
+        for (volatile int j = 0; j < 50; j++) {}
+    }
+
+    /* The store completes ASYNCHRONOUSLY: the ring HEAD advancing (drained)
+     * means the engine PARSED the command, but MI_STORE_DWORD_IMM's write
+     * travels the GPU memory pipeline and may not be visible to the CPU yet.
+     * (This is why an earlier single-shot read was flaky -- one boot caught
+     * the write, the next read 0 before it landed.) So POLL the scratch
+     * value, flushing our write-back cache line each iteration, until the
+     * magic appears or we time out. No new GPU command encoding needed --
+     * just tolerance for write latency. */
+    uint32_t got = 0;
+    int settle = 0;
+    for (int i = 0; i < 100000; i++) {
+        __asm__ __volatile__("clflush (%0)" :: "r"(g_gt.scratch_virt)
+                             : "memory");
+        __asm__ __volatile__("mfence" ::: "memory");
+        got = g_gt.scratch_virt[0];
+        if (got == GT_SELFTEST_MAGIC) { settle = i; break; }
+        for (volatile int j = 0; j < 50; j++) {}
+    }
+    kprintf("[intel_gpu] GT selftest: ring drained=%d scratch=0x%08x "
+            "(want 0x%08x) settle_iters=%d\n",
+            drained, got, GT_SELFTEST_MAGIC, settle);
+    return drained && got == GT_SELFTEST_MAGIC;
+}
+
+void intel_gt_init(void) {
+    memset(&g_gt, 0, sizeof(g_gt));
+
+    /* Reuse the probe + MMIO mapping. (intel_gpu_gt_recon may already have
+     * run and mapped it; re-probing is cheap and idempotent.) */
+    if (!g_igpu.mmio) {
+        if (!igpu_probe_pci()) {
+            kprintf("[intel_gpu] GT init: no supported Intel GPU\n");
+            return;
+        }
+        if (igpu_map_mmio() < 0) {
+            kprintf("[intel_gpu] GT init: MMIO map failed\n");
+            return;
+        }
+    }
+
+    /* Only gen8/gen9 GGTT/forcewake layout is implemented here. */
+    if (g_igpu.gen < 8) {
+        kprintf("[intel_gpu] GT init: gen %d < 8, GT accel unsupported "
+                "(display stays on Limine)\n", g_igpu.gen);
+        return;
+    }
+
+    /* GGTT lives in the top half of the (>=16 MiB) BAR. Guard the size so a
+     * small/odd BAR can't make us write outside the mapping. We touch the
+     * GGTT from GEN8_GGTT_OFFSET (8 MiB) up to the highest PTE we install
+     * (scratch page at GGTT VA 0x41000 -> PTE byte offset 0x41*8); require
+     * the mapping to cover at least the first 64 KiB of PTEs past the GGTT
+     * base. A correct gen9 GTTMMADR is 16 MiB, so this passes once the BAR
+     * sizing isn't clamped (the 4 MiB clamp was the Stage-2 EliteDesk
+     * abort: "BAR0 size 0x400000 too small for GGTT"). */
+    size_t ggtt_need = GEN8_GGTT_OFFSET + (64u << 10);
+    if (g_igpu.mmio_size < ggtt_need) {
+        kprintf("[intel_gpu] GT init: BAR0 size 0x%zx too small for GGTT "
+                "(need >= 0x%zx) -- staying on Limine\n",
+                g_igpu.mmio_size, ggtt_need);
+        return;
+    }
+    g_gt.ggtt_mmio = (uint64_t)g_igpu.mmio + GEN8_GGTT_OFFSET;
+
+    /* Forcewake render + blitter so the ring registers are live. */
+    g_gt.fw_render  = gt_forcewake_get(FORCEWAKE_RENDER_GEN9,
+                                       FORCEWAKE_RENDER_ACK);
+    g_gt.fw_blitter = gt_forcewake_get(FORCEWAKE_BLITTER_GEN9,
+                                       FORCEWAKE_BLITTER_ACK);
+    kprintf("[intel_gpu] GT init: forcewake render=%d blitter=%d\n",
+            g_gt.fw_render, g_gt.fw_blitter);
+    if (!g_gt.fw_blitter) {
+        kprintf("[intel_gpu] GT init: blitter forcewake failed -- "
+                "aborting GT accel (display unaffected)\n");
+        return;
+    }
+
+    if (!gt_ring_init()) {
+        kprintf("[intel_gpu] GT init: BCS ring setup failed\n");
+        gt_forcewake_put(FORCEWAKE_RENDER_GEN9);
+        gt_forcewake_put(FORCEWAKE_BLITTER_GEN9);
+        return;
+    }
+    kprintf("[intel_gpu] GT init: BCS ring up (phys=0x%llx gtt_off=0x%x "
+            "ctl=0x%08x)\n",
+            (unsigned long long)g_gt.ring_phys, g_gt.ring_ggtt_off,
+            igpu_read(GEN8_BCS_RING_BASE + RING_CTL));
+
+    g_gt.selftest_ok = gt_run_selftest();
+    kprintf("[intel_gpu] GT init: self-test %s\n",
+            g_gt.selftest_ok ? "PASS -- blitter accel available"
+                             : "FAIL -- staying on Limine compositor");
+
+    /* Keep forcewake held while the GT is in use (Stage 3 will rely on it).
+     * If the self-test failed we could drop it, but holding it is harmless
+     * and simpler; the GT is otherwise idle. */
 }
 
 /* ======================================================================

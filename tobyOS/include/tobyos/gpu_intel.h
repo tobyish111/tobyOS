@@ -133,7 +133,89 @@ struct intel_gpu {
     int has_pch;
     uint32_t *back_buffer;
     uint64_t back_phys;
+    /* PCI bus/dev/func of the GPU, recorded at probe so the GT recon
+     * pass can read MGGC0 / BDSM (graphics control + stolen-memory
+     * base) out of config space without re-scanning. */
+    uint8_t  bus, dev, func;
+    int      bdf_valid;
 };
+
+/* Stage 1 (i915-lite): read-only GT + display reconnaissance. Probes the
+ * Intel GPU, maps its register MMIO, and logs the GT generation, GGTT /
+ * stolen-memory config, blitter ring register state, and the display
+ * plane/pipe Limine left active. Touches NO display registers and writes
+ * nothing -- safe to call on any machine (silent no-op without an Intel
+ * GPU). Its log output is the data we need to bring up the BLT ring and a
+ * tear-free page-flip on the real EliteDesk, which QEMU cannot emulate. */
+void     intel_gpu_gt_recon(void);
+
+/* ======================================================================
+ * Stage 2 (i915-lite): GT / render-engine bring-up (gen8/gen9, e.g. the
+ * Skylake EliteDesk). Completely independent of the display pipe -- it
+ * only touches forcewake, the GGTT, the blitter (BCS) ring, and buffers
+ * we allocate ourselves. It NEVER programs the pipe/plane/DPLL/VGA, so a
+ * broken blitter can at worst fail to update the screen, never blackscreen
+ * it. QEMU has no Intel GT, so this is real-HW-only; everything is gated on
+ * a hardware self-test (intel_gt_selftest_ok) before any user trusts it.
+ * ====================================================================== */
+
+/* Forcewake (gen9 render/blitter regs are dead without it). */
+#define FORCEWAKE_RENDER_GEN9   0x0A278u   /* multi-threaded forcewake req  */
+#define FORCEWAKE_RENDER_ACK    0x0D84u    /* GTSP1 ack (render)            */
+#define FORCEWAKE_BLITTER_GEN9  0x0A188u
+#define FORCEWAKE_BLITTER_ACK   0x130044u
+#define FORCEWAKE_KERNEL_BIT    0          /* we drive bit 0 (mask<<16|val) */
+
+/* Blitter Command Streamer (BCS) ring registers (gen8+ island base). */
+#define GEN8_BCS_RING_BASE      0x22000u
+#define RING_TAIL               0x30u
+#define RING_HEAD               0x34u
+#define RING_START              0x38u
+#define RING_CTL                0x3Cu
+#define RING_CTL_ENABLE         (1u << 0)
+#define RING_HEAD_MASK          0x1FFFFCu
+#define RING_TAIL_MASK          0x1FFFF8u
+
+/* Gen8/9 GGTT lives in the TOP HALF of the (16 MiB) MMIO BAR; PTEs are
+ * 8 bytes (NOT the gen7 4-byte PTEs at 0x200000 the old modeset code used).
+ * A GGTT PTE is just the page phys addr | present. */
+#define GEN8_GGTT_OFFSET        (8u << 20)     /* 8 MiB into a 16 MiB BAR   */
+#define GEN8_GGTT_PTE_PRESENT   (1ull << 0)
+
+/* Blitter command opcodes (gen8/9). */
+#define MI_NOOP                 0x00000000u
+/* MI_STORE_DWORD_IMM (gen8+): opcode 0x20, DWord Length 2 (4-dword cmd:
+ * header + 64-bit addr + 1 data dword). Bit 22 = "Use Global GTT" -- REQUIRED
+ * when the destination is a GGTT address (ours is); without it the engine
+ * treats the address as a PPGTT VA we never set up, so the store is dropped
+ * even though the command retires (ring head still advances). */
+#define MI_USE_GLOBAL_GTT       (1u << 22)
+#define MI_STORE_DWORD_IMM_GEN8 ((0x20u << 23) | MI_USE_GLOBAL_GTT | 2u)
+#define MI_BATCH_BUFFER_END     (0x0Au << 23)
+#define XY_COLOR_BLT_CMD        ((2u << 29) | (0x50u << 22) | 0x4u) /* + BPP */
+#define XY_SRC_COPY_BLT_CMD     ((2u << 29) | (0x53u << 22) | 0x6u)
+#define BLT_WRITE_ALPHA         (1u << 21)
+#define BLT_WRITE_RGB           (1u << 20)
+#define BLT_DEPTH_32            (3u << 24)     /* in BR13 (color depth)     */
+#define BLT_ROP_SRCCOPY         (0xCCu << 16)
+#define BLT_ROP_PATCOPY         (0xF0u << 16)
+
+/* Stage 2 entry: bring up forcewake + GGTT + BCS ring and run the
+ * store-dword self-test. Logs everything; sets the self-test flag on
+ * success. Safe no-op without a supported Intel GPU. */
+void     intel_gt_init(void);
+int      intel_gt_selftest_ok(void);   /* 1 only if the GT proved itself */
+
+/* ---- Stage 4 (deferred): hardware page-flip via PLANE_SURF ----
+ * The display plane scans through the GGTT, so a tear-free flip would just
+ * repoint PLANE_SURF at a GGTT offset (no timing/DPLL/format change). The
+ * flip self-test was reverted 2026-06-06: it hung the EliteDesk, and no
+ * off-box log channel works on that machine (no serial/net; USB-write also
+ * hung), so it can't be debugged blind. These register defs are kept as
+ * groundwork for when a working feedback channel exists. */
+#define GEN8_DE_PIPE_A_IIR      0x44408u   /* per-pipe interrupt status (RW1C) */
+#define GEN8_PIPE_VBLANK        (1u << 0)
+#define PLANE_A_SURFLIVE        0x701ACu   /* address the plane is CURRENTLY scanning */
 
 void     intel_gpu_modeset_init(void);
 int      intel_gpu_set_mode(int width, int height, int hz);

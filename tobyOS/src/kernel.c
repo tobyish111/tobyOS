@@ -69,6 +69,7 @@
 #include <tobyos/usb_hub.h>
 #include <tobyos/usb_hid.h>
 #include <tobyos/virtio_gpu.h>
+#include <tobyos/gpu_intel.h>
 #include <tobyos/gfx.h>
 #include <tobyos/mouse.h>
 #include <tobyos/gui.h>
@@ -3278,6 +3279,22 @@ void _start(void) {
             virtio_gpu_install_backend();
         }
 
+        /* i915-lite Stage 1: read-only Intel GT/display reconnaissance.
+         * Logs the real GT + scanout config (the data the BLT-ring and
+         * page-flip stages need, which QEMU can't emulate). Writes nothing
+         * and never touches the display, so it can't disturb the working
+         * Limine framebuffer on the EliteDesk. Silent no-op without an
+         * Intel GPU (e.g. QEMU's std/virtio paths). */
+        intel_gpu_gt_recon();
+
+        /* i915-lite Stage 2: bring up the Intel GT render side (forcewake +
+         * GGTT + BCS blitter ring) and run a hardware store-dword self-test.
+         * Touches ONLY GT/GGTT/ring regs + buffers we allocate -- never the
+         * display pipe -- so a broken blitter can't blackscreen the box; it
+         * just leaves intel_gt_selftest_ok()==0 and we stay on Limine. QEMU
+         * has no Intel GT, so this is a no-op there (gen<8 / no GPU). */
+        intel_gt_init();
+
         mouse_init();
         gui_init();
 
@@ -3701,6 +3718,7 @@ void _start(void) {
         }
         kprintf("[boot] M28D: safe-mode harness complete\n");
     }
+
     /* Persist kprintf capture to /data and/or FAT32 install USB. */
     bootlog_flush_all();
     /* UDP boot log: GUI path sends after ~300 ms in gui_tick(); if we
@@ -3748,6 +3766,35 @@ void _start(void) {
                     (unsigned long long)((one * 4) / four),
                     (unsigned long long)(((one * 4 * 100) / four) % 100));
 #undef MC_NOW_MS
+    }
+#endif
+
+#ifdef MCARGV_BOOT
+    /* Repro for the AP-first-run + argc>=1 + SMAP/SMEP fault. Spawn four
+     * argc>=1 workers at once so APs steal+run them; if the bug is live one
+     * of them SMEP-faults at first entry (kernel instruction-fetch from the
+     * user page). Build: EXTRA_CFLAGS="-DMCARGV_BOOT" and boot with
+     * -cpu qemu64,+smep,+smap. /bin/mctest ignores argv so behaviour is
+     * otherwise identical to the argc=0 MCTEST run. */
+    {
+        char *av[] = { "mctest", "argone", "argtwo", "argthree", 0 };
+        char *ev[] = { "PATH=/bin", "HOME=/", "TERM=toby", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/mctest", .name = "mctest",
+            .argc = 4, .argv = av, .envc = 3, .envp = ev,
+        };
+        int rounds = 8;
+        kprintf("[boot] MCARGV: %d rounds x 4 argc>=1 workers (AP/SMAP repro)\n",
+                rounds);
+        for (int round = 0; round < rounds; round++) {
+            bkl_enter();
+            int pids[4];
+            for (int i = 0; i < 4; i++) pids[i] = proc_spawn(&spec);
+            for (int i = 0; i < 4; i++) if (pids[i] > 0) proc_wait(pids[i]);
+            bkl_exit();
+            kprintf("[boot] MCARGV: round %d/%d done\n", round + 1, rounds);
+        }
+        kprintf("[boot] MCARGV: all argc>=1 workers completed (no fault)\n");
     }
 #endif
 

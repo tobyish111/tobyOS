@@ -118,7 +118,6 @@ C_SRCS := src/kernel.c \
           src/aslr.c \
           src/hardening.c \
           src/aml_interp.c \
-          src/intel_gfx.c \
           src/wifi.c \
           src/nic_igb.c \
           src/nic_rtl8168.c \
