@@ -22,28 +22,55 @@
 #define TFS_MAGIC          0x546F627946535331ULL  /* "TobyFSS1" */
 #define TFS_BLOCK_SIZE     4096u
 #define TFS_SECTORS_PER_BLOCK (TFS_BLOCK_SIZE / 512u)
-#define TFS_TOTAL_BLOCKS   1024u                  /* 4 MiB */
-#define TFS_INODE_COUNT    256u
+/* Default geometry for the smallest (legacy 4 MiB) image. Volumes are now
+ * SIZED DYNAMICALLY at format time from the backing device; these are the
+ * minimum/fallback values and the geometry an old 1024-block image carries.
+ * The real geometry always comes from the superblock at mount time. */
+#define TFS_TOTAL_BLOCKS   1024u                  /* 4 MiB minimum */
+#define TFS_INODE_COUNT    256u                   /* minimum inode count */
+#define TFS_BITS_PER_BLOCK (TFS_BLOCK_SIZE * 8u)  /* 32768 bitmap bits/block */
 #define TFS_INODE_SIZE     128u                   /* sizeof(tfs_inode_disk) */
 #define TFS_INODES_PER_BLOCK (TFS_BLOCK_SIZE / TFS_INODE_SIZE)
 #define TFS_INODE_BLOCKS   (TFS_INODE_COUNT / TFS_INODES_PER_BLOCK)
 #define TFS_NDIRECT        16u                    /* 16 * 4 KiB = 64 KiB direct */
 #define TFS_INDIRECT_ENTRIES (TFS_BLOCK_SIZE / sizeof(uint32_t))  /* 1024 entries */
-#define TFS_MAX_FILE_SIZE    ((TFS_NDIRECT + TFS_INDIRECT_ENTRIES) * TFS_BLOCK_SIZE)
+/* Double-indirect: one L1 block of 1024 pointers, each -> an L2 block of 1024
+ * data-block pointers => 1024*1024 blocks = 4 GiB of addressable data. */
+#define TFS_DBL_INDIRECT_ENTRIES (TFS_INDIRECT_ENTRIES * TFS_INDIRECT_ENTRIES)
+/* First file-block index reachable only via the double-indirect tree. */
+#define TFS_DBL_INDIRECT_BASE (TFS_NDIRECT + TFS_INDIRECT_ENTRIES)
+/* Total addressable bytes overflow uint32_t, so compute in 64-bit and clamp
+ * to the on-disk `size` field's range (uint32_t => 4 GiB - 1). */
+#define TFS_ADDRESSABLE_BYTES \
+    (((uint64_t)(TFS_NDIRECT + TFS_INDIRECT_ENTRIES + TFS_DBL_INDIRECT_ENTRIES)) \
+     * (uint64_t)TFS_BLOCK_SIZE)
+#define TFS_MAX_FILE_SIZE    0xFFFFFFFFu           /* capped by uint32_t size */
 #define TFS_NAME_MAX       55u                    /* fits in 56-byte slot incl. NUL */
 #define TFS_DIRENT_SIZE    64u
 #define TFS_DIRENTS_PER_BLOCK (TFS_BLOCK_SIZE / TFS_DIRENT_SIZE)
 
-/* Fixed region offsets (in block units). Match these in mkfs. */
+/* LEGACY region offsets (block units) for the default 4 MiB image. With
+ * dynamic sizing the true offsets are read from the superblock at mount;
+ * each region's span is derived from consecutive start deltas (the regions
+ * are contiguous), so NO on-disk format change is needed and old 1024-block
+ * images still mount with these exact values. format() recomputes them from
+ * the device size. */
 #define TFS_INODE_BITMAP_BLK  1u
 #define TFS_DATA_BITMAP_BLK   2u
 #define TFS_INODE_TABLE_BLK   3u
 #define TFS_DATA_BLK_START    (TFS_INODE_TABLE_BLK + TFS_INODE_BLOCKS)  /* 11 */
 
-/* Write-ahead journal (last 32 blocks of the image). */
+/* Write-ahead journal (last TFS_JOURNAL_BLOCKS of the volume). The journal
+ * size is fixed; its START is dynamic (volume end - size) and is recorded in
+ * the superblock reserved fields, so it scales with the volume. */
 #define TFS_JOURNAL_BLOCKS    32u
 #define TFS_JOURNAL_START     (TFS_TOTAL_BLOCKS - TFS_JOURNAL_BLOCKS)  /* 992 */
 #define TFS_USABLE_BLOCKS     TFS_JOURNAL_START                        /* 992 */
+
+/* Largest volume we'll format/mount, in 4 KiB blocks. Caps RAM used by the
+ * cached bitmaps + bounds the format math. 1 GiB = 262144 blocks => an 8-block
+ * data bitmap. Plenty for /data and big-file testing; raise if ever needed. */
+#define TFS_MAX_TOTAL_BLOCKS  (256u * 1024u)      /* 1 GiB */
 
 #define TFS_TXN_BEGIN_MAGIC   0x4A4F5552U  /* "JOUR" */
 #define TFS_TXN_COMMIT_MAGIC  0x434F4D54U  /* "COMT" */
@@ -107,7 +134,12 @@ struct tfs_inode_disk {
     uint32_t gid;                   /* owner group id */
     uint32_t direct[TFS_NDIRECT];   /* 64 bytes */
     uint32_t indirect;               /* single-indirect block pointer */
-    uint8_t  pad[36];
+    /* Double-indirect block pointer. Carved out of the former pad[] WITHOUT
+     * changing the on-disk inode size (still TFS_INODE_SIZE), so legacy
+     * disks still mount: those bytes were zero, and dbl_indirect==0 means
+     * "no double-indirect blocks" -- identical to a freshly-created inode. */
+    uint32_t dbl_indirect;           /* double-indirect block pointer */
+    uint8_t  pad[32];
 };
 
 struct tfs_dirent_disk {

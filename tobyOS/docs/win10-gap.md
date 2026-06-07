@@ -43,7 +43,7 @@ honest number.
 |---|---|---|---|
 | Scheduler / SMP | ~12% | ~18% | **APs now run user code in parallel.** Per-CPU TSS + SYSCALL stack (GS base, no swapgs) + `current_proc` + AP CR0/CR4/EFER parity + per-CPU SYSCALL MSRs; a syscall-path **big-kernel-lock** serializes kernel entry (and pid 0's `gui_tick`/service work) so user code parallelizes while VFS/GUI/proc-table stay race-free; per-CPU **idle procs** + **work-stealing** distribute work; AP-run gated until boot completes. Measured **~2.6-2.7x on 4 CPU-bound workers**; the GUI desktop is stable (default and under `+smap`). **Known issue:** an `argc>=1` first-run proc that lands on an AP **under SMAP** SMEP-faults (`argc=0` is clean) — under investigation, needs real-HW debugging; non-SMAP is unaffected. No priority classes/MLFQ. |
 | Memory | ~18% | ~24% | `swap_init` wired; **real CoW fork** (`vmm_cow_fork` + `mmap_cow_clone`, no longer eager-copy); demand paging live; ASLR/NX/SMEP. Still bitmap PMM, first-fit heap, no memory compression / large pages. |
-| Filesystem / Storage | ~20% | ~27% | TobyFS: **journaling** (replay on mount), **indirect blocks** (max file 64 KiB → ~4 MiB), **256-entry write-back buffer cache**. VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. Still no NTFS-class streams/ACLs; 4 MiB ≪ 16 TB. |
+| Filesystem / Storage | ~20% | ~29% | TobyFS: **journaling** (replay on mount), **direct + single + double-indirect blocks** (max file now ~4 GiB, was ~4 MiB), **dynamic device-sized volumes** (format scales geometry + multi-block bitmaps to the disk, up to 1 GiB; legacy 4 MiB images still mount), **256-entry write-back buffer cache**. Fixed a latent journal intra-transaction read-after-write bug (was silently corrupting freshly-created inodes sharing a parent's inode-table block). VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. Still no NTFS-class streams/ACLs; AHCI/NVMe single-outstanding-command; NVMe skips non-512 LBA. |
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
 | Device Drivers | ~12% | ~14% | **Loadable `ET_REL` kernel module loader** (foundational). 6 NIC drivers, AHCI/NVMe/IDE/virtio-blk, xHCI/EHCI/HID/MSC, HDA. No real GPU driver; no signed third-party ecosystem. |
 | GUI / Desktop | ~10% | ~12% | GPU-accelerated compositor path exists **but only active with VirtIO-GPU**; on real Intel iGPU it falls back to the CPU/Limine compositor. Now **usable on hardware** (login no longer flaps; mouse/keyboard work). |
@@ -144,6 +144,22 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-07** — **TobyFS: double-indirect blocks + dynamic device-sized volumes.** Max file
+  size raised from ~4 MiB to ~4 GiB by adding a double-indirect block pointer (carved from the
+  inode's pad bytes, on-disk inode size unchanged, legacy disks still mount). The filesystem is
+  no longer hardcoded to a 4 MiB volume: `tobyfs_format` now computes geometry (inode count,
+  multi-block inode/data bitmaps, journal start) from the backing device size (cap 1 GiB), and
+  mount/fsck read the geometry from the superblock and heap-allocate multi-block bitmaps. The
+  bitmap cache flushes only the single block containing a mutated bit. Backward compatible: a
+  legacy 1024-block image derives the exact old layout and mounts clean (verified: real `/data`
+  mounts fine). Also fixed a **latent journal bug**: in-transaction `journal_write` didn't
+  update the block cache, so a read-modify-write of a block already buffered in the same txn
+  (e.g. create updating a child inode then the parent-dir inode in the same inode-table block)
+  re-read stale data and clobbered the earlier change — silently reverting freshly-created
+  inodes to type=FREE. Verified in QEMU via an extended `tobyfs_self_test` that formats a 16 MiB
+  volume, writes/reads/verifies a 5 MiB file through the double-indirect path (PASS), and the
+  corruption-detection check (PASS), with the desktop booting clean and no panic. Storage ~27% →
+  ~29%.
 - **2026-05-31** — **AP/argc>=1/SMAP SMEP fault: confirmed NOT QEMU-reproducible.** Built an
   opt-in repro (`-DMCARGV_BOOT` in kernel.c: 8 rounds × 4 `argc=4`/`envc=3` `/bin/mctest`
   workers spawned together, with `/bin/mctest` now dereferencing `argv[]`) plus a greppable
