@@ -11,7 +11,7 @@ survives clones and any agent can read/update it.
 - When you change a subsystem, update its row, bump the date, and add a line to the Changelog.
 - Be honest: "code present" ≠ "wired" ≠ "robust". Distinguish them.
 
-**Last updated:** 2026-05-30
+**Last updated:** 2026-06-07
 
 ---
 
@@ -43,7 +43,7 @@ honest number.
 |---|---|---|---|
 | Scheduler / SMP | ~12% | ~18% | **APs now run user code in parallel.** Per-CPU TSS + SYSCALL stack (GS base, no swapgs) + `current_proc` + AP CR0/CR4/EFER parity + per-CPU SYSCALL MSRs; a syscall-path **big-kernel-lock** serializes kernel entry (and pid 0's `gui_tick`/service work) so user code parallelizes while VFS/GUI/proc-table stay race-free; per-CPU **idle procs** + **work-stealing** distribute work; AP-run gated until boot completes. Measured **~2.6-2.7x on 4 CPU-bound workers**; the GUI desktop is stable (default and under `+smap`). **Known issue:** an `argc>=1` first-run proc that lands on an AP **under SMAP** SMEP-faults (`argc=0` is clean) — under investigation, needs real-HW debugging; non-SMAP is unaffected. No priority classes/MLFQ. |
 | Memory | ~18% | ~24% | `swap_init` wired; **real CoW fork** (`vmm_cow_fork` + `mmap_cow_clone`, no longer eager-copy); demand paging live; ASLR/NX/SMEP. Still bitmap PMM, first-fit heap, no memory compression / large pages. |
-| Filesystem / Storage | ~20% | ~29% | TobyFS: **journaling** (replay on mount), **direct + single + double-indirect blocks** (max file now ~4 GiB, was ~4 MiB), **dynamic device-sized volumes** (format scales geometry + multi-block bitmaps to the disk, up to 1 GiB; legacy 4 MiB images still mount), **256-entry write-back buffer cache**. Fixed a latent journal intra-transaction read-after-write bug (was silently corrupting freshly-created inodes sharing a parent's inode-table block). VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. Still no NTFS-class streams/ACLs; AHCI/NVMe single-outstanding-command; NVMe skips non-512 LBA. |
+| Filesystem / Storage | ~20% | ~29% | TobyFS: **journaling** (replay on mount), **direct + single + double-indirect blocks** (max file now ~4 GiB, was ~4 MiB), **dynamic device-sized volumes** (format scales geometry + multi-block bitmaps to the disk, up to 1 GiB; legacy 4 MiB images still mount), **256-entry write-back buffer cache**. Fixed a latent journal intra-transaction read-after-write bug (was silently corrupting freshly-created inodes sharing a parent's inode-table block). VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. **NVMe now handles 4K-LBA namespaces** (presents a 512-byte logical view, translates to native 4096-byte sectors with a read-modify-write fallback for sub-sector access). Still no NTFS-class streams/ACLs; AHCI/NVMe single-outstanding-command. |
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
 | Device Drivers | ~12% | ~14% | **Loadable `ET_REL` kernel module loader** (foundational). 6 NIC drivers, AHCI/NVMe/IDE/virtio-blk, xHCI/EHCI/HID/MSC, HDA. No real GPU driver; no signed third-party ecosystem. |
 | GUI / Desktop | ~10% | ~12% | GPU-accelerated compositor path exists **but only active with VirtIO-GPU**; on real Intel iGPU it falls back to the CPU/Limine compositor. Now **usable on hardware** (login no longer flaps; mouse/keyboard work). |
@@ -144,6 +144,21 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-07** — **NVMe 4K-sector (4096-byte LBA) support.** `src/blk_nvme.c` previously
+  skipped any namespace whose native LBA size wasn't 512; real SSDs increasingly format at
+  4096. The rest of the kernel (block registry, bcache, partition layer, filesystems) is fixed
+  at 512-byte logical sectors, so the driver now keeps that invariant and translates: a 4K
+  namespace of N native sectors is registered as 8N logical 512-byte sectors, and the read/write
+  path emits whole-device-sector runs straight through (the FS does 4 KiB-aligned I/O, so this
+  is the common case) while a sub-device-sector fragment (e.g. a single 512-byte GPT/MBR sector)
+  is handled by a read-modify-write through a per-controller bounce page. Formats carrying inline
+  metadata (PI/DIF) or non-power-of-two native sizes are still skipped. 512-byte namespaces take
+  the identity fast path (sec_ratio==1) unchanged. Verified in QEMU with
+  `-device nvme,...,logical_block_size=4096` (and =512) via an opt-in non-destructive self-test
+  (`-DNVME4K_BOOT`, `blk_nvme_selftest`): aligned multi-sector rw, sub-sector write + neighbour
+  preservation, and sub-sector read all PASS on both geometries; boot clean, 0 exceptions/panics.
+  Storage row updated (still ~29%; this is breadth/correctness, not a parity jump). Remaining in
+  storage: AHCI/NVMe single-outstanding-command (queuing).
 - **2026-06-07** — **TobyFS: double-indirect blocks + dynamic device-sized volumes.** Max file
   size raised from ~4 MiB to ~4 GiB by adding a double-indirect block pointer (carved from the
   inode's pad bytes, on-disk inode size unchanged, legacy disks still mount). The filesystem is

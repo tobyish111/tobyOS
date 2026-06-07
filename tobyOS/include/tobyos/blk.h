@@ -148,6 +148,13 @@ void blk_dump(void);
 void blk_ata_register(void);   /* PIIX3 IDE / compatibility-mode IDE */
 void blk_ahci_register(void);  /* AHCI 1.0 SATA (q35 ICH9 / real PCH) */
 void blk_nvme_register(void);  /* NVMe 1.x (PCIe SSDs, QEMU -device nvme) */
+
+/* Opt-in NVMe self-test (called from kernel.c under -DNVME4K_BOOT):
+ * round-trips aligned + sub-device-sector I/O against the first
+ * registered NVMe namespace to validate the 512<->native-LBA
+ * translation. Non-destructive (saves+restores the window it uses);
+ * no-op SKIP if no NVMe namespace is present. */
+void blk_nvme_selftest(void);
 void virtio_blk_register(void); /* M35B: modern virtio-blk-pci         */
 
 /* M35B: lightweight introspection (NULL/0/false if no virtio-blk bound). */

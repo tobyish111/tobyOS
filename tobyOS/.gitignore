@@ -14,6 +14,7 @@ tobyos.bin
 # Bootable images / filesystems produced by the build
 *.iso
 disk.img
+nvme*.img       # scratch NVMe backing images for QEMU storage tests
 *.tar
 build/
 iso/

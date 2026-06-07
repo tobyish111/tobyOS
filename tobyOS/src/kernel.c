@@ -2423,6 +2423,11 @@ void _start(void) {
                 parts_found);
     }
     blk_dump();
+#ifdef NVME4K_BOOT
+    /* Opt-in: exercise the NVMe 512<->native-LBA translation path
+     * (-device nvme,...,logical_block_size=4096). Non-destructive. */
+    blk_nvme_selftest();
+#endif
     net_dump();
 
     modules_log();

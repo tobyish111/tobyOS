@@ -37,9 +37,16 @@
  *   5. For each NSID 1..NN (capped at NVME_MAX_NS_PER_CTRL):
  *      IDENTIFY NAMESPACE (0x06, CNS=0). On success, look up the
  *      current LBA format (FLBAS index into LBAF[0..NLBAF]) and read
- *      its LBADS. Skip namespaces with non-512 LBA size for now --
- *      tobyfs and the installer assume 512-byte sectors and we don't
- *      yet do block-size translation in the hot path.
+ *      its LBADS. The rest of the kernel (block registry, bcache,
+ *      partition layer, filesystems) is fixed at 512-byte logical
+ *      sectors, so a namespace whose native LBA is 4096 (increasingly
+ *      common on real SSDs) is presented as 8x as many 512-byte logical
+ *      sectors and translated in the read/write path: whole-device-
+ *      sector runs go straight through (the FS does 4 KiB-aligned I/O),
+ *      and a sub-device-sector fragment is handled by a read-modify-
+ *      write through a per-controller bounce page. Native sizes that
+ *      aren't a power-of-two multiple of 512 (<= page size), or formats
+ *      carrying inline metadata (PI/DIF), are still skipped.
  *
  *   6. blk_register() with name "nvme<H>:n<N>" (H = HBA index, N =
  *      namespace id). Reads/writes funnel through the I/O queue:
@@ -121,7 +128,6 @@
 #define NVME_QDEPTH             64u
 #define NVME_PRP_LIST_ENTRIES   (PAGE_SIZE / 8u)        /* 512 */
 #define NVME_MAX_BYTES_PER_OP   (256u * 1024u)          /* 256 KiB */
-#define NVME_MAX_SECTORS_PER_OP (NVME_MAX_BYTES_PER_OP / BLK_SECTOR_SIZE)
 #define NVME_MAX_CONTROLLERS    4
 #define NVME_MAX_NS_PER_CTRL    8
 #define NVME_MAX_DRIVES         8
@@ -183,6 +189,17 @@ struct nvme_controller {
     uint64_t           prp_list_phys;
     uint64_t          *prp_list;
 
+    /* Bounce page for read-modify-write of a partial NATIVE sector when
+     * a namespace uses 4 KiB (or other >512) LBAs. The block layer above
+     * us is 512-byte addressed, so a logical request that doesn't cover a
+     * whole device sector (e.g. a single 512-byte GPT/MBR sector on a 4K
+     * SSD) must read the surrounding device sector, splice, and write it
+     * back. One page covers any device LBA size we accept (<= PAGE_SIZE).
+     * Page-aligned, so PRP1 alone describes the whole transfer. Reused per
+     * command -- safe under the single-outstanding-command model. */
+    uint64_t           bounce_phys;
+    void              *bounce;
+
     /* MSI bring-up state. irq_enabled is set if pci_msi_enable() and
      * irq_alloc_vector() both succeeded; we only flip IEN in CREATE
      * I/O CQ when this is true. irq_count is bumped by the ISR -- the
@@ -196,8 +213,9 @@ struct nvme_controller {
 struct nvme_namespace {
     struct nvme_controller *ctrl;
     uint32_t                nsid;
-    uint64_t                nsze;        /* in 512-byte sectors */
-    uint32_t                lba_size;    /* always 512 in this driver */
+    uint64_t                nsze;        /* in NATIVE device LBAs */
+    uint32_t                lba_size;    /* native device LBA size: 512 or 4096 */
+    uint32_t                sec_ratio;   /* lba_size / 512 (1 for a 512-byte device) */
 };
 
 struct nvme_drive {
@@ -357,10 +375,32 @@ static int nvme_submit_sync(struct nvme_controller *c, struct nvme_queue *q,
 
 /* ---- read / write --------------------------------------------- */
 
-static int nvme_io(struct nvme_namespace *ns, uint64_t lba,
-                   uint32_t count, void *buf, bool is_write) {
+/* Submit one I/O command addressed in NATIVE device LBAs. The caller
+ * has already turned a buffer into PRP1/PRP2 (or knows them, as the
+ * bounce path does). NLB is a 0-based count. */
+static int nvme_submit_io(struct nvme_namespace *ns, uint64_t dev_lba,
+                          uint32_t dev_count, uint64_t prp1, uint64_t prp2,
+                          bool is_write) {
     struct nvme_controller *c = ns->ctrl;
-    uint32_t bytes = count * ns->lba_size;
+    struct nvme_sqe sqe;
+    memset(&sqe, 0, sizeof(sqe));
+    sqe.opc   = is_write ? NVME_IO_WRITE : NVME_IO_READ;
+    sqe.nsid  = ns->nsid;
+    sqe.prp1  = prp1;
+    sqe.prp2  = prp2;
+    sqe.cdw10 = (uint32_t)(dev_lba & 0xFFFFFFFFu);
+    sqe.cdw11 = (uint32_t)(dev_lba >> 32);
+    sqe.cdw12 = (uint32_t)((dev_count - 1u) & 0xFFFFu);   /* NLB = count-1 */
+    return nvme_submit_sync(c, &c->io, &sqe);
+}
+
+/* Transfer `dev_count` NATIVE device sectors at native LBA `dev_lba`
+ * to/from a kernel buffer. `dev_count` must already be bounded to the
+ * per-op cap by the caller. */
+static int nvme_io_dev(struct nvme_namespace *ns, uint64_t dev_lba,
+                       uint32_t dev_count, void *buf, bool is_write) {
+    struct nvme_controller *c = ns->ctrl;
+    uint32_t bytes = dev_count * ns->lba_size;
 
     /* Build PRPs into locals first; assigning them into a packed SQE
      * field via &sqe.prp1 trips the compiler's "address of packed
@@ -371,50 +411,87 @@ static int nvme_io(struct nvme_namespace *ns, uint64_t lba,
         kprintf("[nvme] build_prp failed (buf=%p bytes=%u)\n", buf, bytes);
         return -1;
     }
+    return nvme_submit_io(ns, dev_lba, dev_count, prp1, prp2, is_write);
+}
 
-    struct nvme_sqe sqe;
-    memset(&sqe, 0, sizeof(sqe));
-    sqe.opc   = is_write ? NVME_IO_WRITE : NVME_IO_READ;
-    sqe.nsid  = ns->nsid;
-    sqe.prp1  = prp1;
-    sqe.prp2  = prp2;
-    sqe.cdw10 = (uint32_t)(lba & 0xFFFFFFFFu);
-    sqe.cdw11 = (uint32_t)(lba >> 32);
-    sqe.cdw12 = (uint32_t)((count - 1u) & 0xFFFFu);   /* NLB = count-1 */
+/* Read-modify-write one PARTIAL native device sector: the caller wants
+ * `n` 512-byte logical sectors starting `off` 512-byte sectors into
+ * native sector `dev_lba`. Always reads the device sector first (to
+ * preserve the bytes we aren't touching on a write), then either copies
+ * out (read) or splices + writes back (write). Serialised by the
+ * single-outstanding-command model -- the bounce page is shared. */
+static int nvme_rmw_partial(struct nvme_namespace *ns, uint64_t dev_lba,
+                            uint32_t off, uint32_t n, uint8_t *buf,
+                            bool is_write) {
+    struct nvme_controller *c = ns->ctrl;
+    uint8_t *bb = (uint8_t *)c->bounce;
 
-    return nvme_submit_sync(c, &c->io, &sqe);
+    int rc = nvme_submit_io(ns, dev_lba, 1, c->bounce_phys, 0, /*write*/ false);
+    if (rc != 0) return rc;
+
+    if (is_write) {
+        memcpy(bb + (size_t)off * BLK_SECTOR_SIZE, buf,
+               (size_t)n * BLK_SECTOR_SIZE);
+        return nvme_submit_io(ns, dev_lba, 1, c->bounce_phys, 0, /*write*/ true);
+    }
+    memcpy(buf, bb + (size_t)off * BLK_SECTOR_SIZE,
+           (size_t)n * BLK_SECTOR_SIZE);
+    return 0;
+}
+
+/* The block layer addresses us in 512-byte logical sectors; the device
+ * may use 512 or 4096 (sec_ratio = 1 or 8). Walk the request: emit
+ * whole-device-sector runs straight through (the common case -- tobyfs
+ * does 4 KiB-block, 4 KiB-aligned I/O), and fall back to a per-sector
+ * read-modify-write for any leading/trailing fragment that doesn't fill
+ * a device sector. For a 512-byte device sec_ratio==1, so `off` is
+ * always 0 and this collapses to the old straight-through path. */
+static int nvme_rw_logical(struct nvme_namespace *ns, uint64_t lba,
+                           uint32_t count, void *buf, bool is_write) {
+    uint32_t ratio   = ns->sec_ratio;
+    uint32_t dev_max = NVME_MAX_BYTES_PER_OP / ns->lba_size;  /* dev sectors/op */
+    if (dev_max == 0) dev_max = 1;
+    uint8_t *p = (uint8_t *)buf;
+
+    while (count > 0) {
+        uint64_t dev_lba = lba / ratio;
+        uint32_t off     = (uint32_t)(lba % ratio);   /* 512-sectors into dev sec */
+
+        if (off == 0 && count >= ratio) {
+            /* Aligned run of whole device sectors. */
+            uint32_t whole = count / ratio;           /* full dev sectors wanted */
+            if (whole > dev_max) whole = dev_max;
+            int rc = nvme_io_dev(ns, dev_lba, whole, p, is_write);
+            if (rc != 0) return rc;
+            uint32_t did = whole * ratio;             /* 512-sectors consumed */
+            p     += (size_t)did * BLK_SECTOR_SIZE;
+            lba   += did;
+            count -= did;
+        } else {
+            /* Leading/trailing fragment of a single device sector. */
+            uint32_t n = ratio - off;
+            if (n > count) n = count;
+            int rc = nvme_rmw_partial(ns, dev_lba, off, n, p, is_write);
+            if (rc != 0) return rc;
+            p     += (size_t)n * BLK_SECTOR_SIZE;
+            lba   += n;
+            count -= n;
+        }
+    }
+    return 0;
 }
 
 static int nvme_blk_read(struct blk_dev *dev, uint64_t lba,
                          uint32_t count, void *buf) {
     struct nvme_namespace *ns = (struct nvme_namespace *)dev->priv;
-    uint8_t *out = (uint8_t *)buf;
-    while (count > 0) {
-        uint32_t chunk = count > NVME_MAX_SECTORS_PER_OP
-                             ? NVME_MAX_SECTORS_PER_OP : count;
-        int rc = nvme_io(ns, lba, chunk, out, /*write*/ false);
-        if (rc != 0) return rc;
-        out   += chunk * ns->lba_size;
-        lba   += chunk;
-        count -= chunk;
-    }
-    return 0;
+    return nvme_rw_logical(ns, lba, count, buf, /*write*/ false);
 }
 
 static int nvme_blk_write(struct blk_dev *dev, uint64_t lba,
                           uint32_t count, const void *buf) {
     struct nvme_namespace *ns = (struct nvme_namespace *)dev->priv;
-    uint8_t *in = (uint8_t *)buf;        /* HBA never writes through it */
-    while (count > 0) {
-        uint32_t chunk = count > NVME_MAX_SECTORS_PER_OP
-                             ? NVME_MAX_SECTORS_PER_OP : count;
-        int rc = nvme_io(ns, lba, chunk, in, /*write*/ true);
-        if (rc != 0) return rc;
-        in    += chunk * ns->lba_size;
-        lba   += chunk;
-        count -= chunk;
-    }
-    return 0;
+    /* The controller never writes through `buf`; cast away const. */
+    return nvme_rw_logical(ns, lba, count, (void *)buf, /*write*/ true);
 }
 
 static const struct blk_ops g_nvme_ops = {
@@ -519,8 +596,10 @@ static int alloc_queue(struct nvme_controller *c, struct nvme_queue *q,
 
 /* Reset, configure, IDENTIFY, build I/O queue, register namespaces.
  * Returns the number of namespaces that successfully became blk_devs;
- * 0 means "controller is alive but has nothing usable" (e.g. all
- * namespaces report a non-512 LBA size). <0 means hard init failure. */
+ * 0 means "controller is alive but has nothing usable" (e.g. every
+ * namespace is inactive or uses an unsupported format -- inline
+ * metadata, or a native LBA size that isn't a power-of-two multiple of
+ * 512). <0 means hard init failure. */
 static int nvme_init_controller(struct nvme_controller *c) {
     /* CAP gives us the doorbell stride, page-size range, MQES, and the
      * timeout-to-ready hint. */
@@ -568,6 +647,17 @@ static int nvme_init_controller(struct nvme_controller *c) {
     }
     c->prp_list = (uint64_t *)pmm_phys_to_virt(c->prp_list_phys);
     memset(c->prp_list, 0, PAGE_SIZE);
+
+    /* Bounce page for partial-sector RMW on 4K-LBA namespaces (see
+     * struct nvme_controller). Allocated unconditionally -- it's one
+     * page and keeps the 512-byte and 4K paths uniform. */
+    c->bounce_phys = pmm_alloc_page();
+    if (!c->bounce_phys) {
+        kprintf("[nvme] PMM out of memory for bounce page\n");
+        return -12;
+    }
+    c->bounce = pmm_phys_to_virt(c->bounce_phys);
+    memset(c->bounce, 0, PAGE_SIZE);
 
     /* Program the admin queue base addresses + sizes. AQA encodes
      * SQ_size_minus_1 (low 12 bits) and CQ_size_minus_1 (bits 27:16). */
@@ -677,6 +767,7 @@ static int nvme_init_controller(struct nvme_controller *c) {
                (uint8_t *)id_data + 128 + lbaf_idx * 4u,
                sizeof(lbaf_entry));
         uint32_t lbads    = (lbaf_entry >> 16) & 0xFFu;
+        uint32_t ms       = lbaf_entry & 0xFFFFu;          /* metadata bytes */
         uint32_t lba_size = 1u << lbads;
 
         kprintf("[nvme] NS %u: NSZE=%lu lba_size=%u  "
@@ -684,12 +775,26 @@ static int nvme_init_controller(struct nvme_controller *c) {
                 nsid, (unsigned long)nsze, lba_size,
                 lbaf_idx, lbaf_entry, nlbaf + 1u);
 
-        if (lba_size != BLK_SECTOR_SIZE) {
-            kprintf("[nvme] NS %u: lba_size=%u != %u -- skipping (not "
-                    "supported in this milestone)\n",
-                    nsid, lba_size, BLK_SECTOR_SIZE);
+        /* We present a 512-byte logical view and translate to the
+         * native LBA below. Accept any power-of-two native size that is
+         * a whole multiple of 512 and fits the bounce page (<= PAGE_SIZE,
+         * which is also <= MPS since we require MPSMIN==0 / 4K). Reject
+         * formats carrying inline metadata (MS != 0): they make the
+         * sector non-power-of-two on the wire and we don't do PI/DIF. */
+        if (ms != 0) {
+            kprintf("[nvme] NS %u: format has %u metadata bytes/LBA -- "
+                    "skipping (no PI/DIF support)\n", nsid, ms);
             continue;
         }
+        if (lba_size < BLK_SECTOR_SIZE || lba_size > PAGE_SIZE ||
+            (lba_size & (lba_size - 1u)) != 0 ||
+            (lba_size % BLK_SECTOR_SIZE) != 0) {
+            kprintf("[nvme] NS %u: unsupported lba_size=%u -- skipping\n",
+                    nsid, lba_size);
+            continue;
+        }
+        uint32_t sec_ratio = lba_size / BLK_SECTOR_SIZE;   /* 1 or 8 */
+
         if (g_drive_count >= NVME_MAX_DRIVES) {
             kprintf("[nvme] WARN: g_drives full -- ignoring NS %u\n", nsid);
             break;
@@ -697,20 +802,27 @@ static int nvme_init_controller(struct nvme_controller *c) {
 
         struct nvme_drive *d = &g_drives[g_drive_count];
         memset(d, 0, sizeof(*d));
-        d->ns.ctrl     = c;
-        d->ns.nsid     = nsid;
-        d->ns.nsze     = nsze;
-        d->ns.lba_size = lba_size;
+        d->ns.ctrl      = c;
+        d->ns.nsid      = nsid;
+        d->ns.nsze      = nsze;
+        d->ns.lba_size  = lba_size;
+        d->ns.sec_ratio = sec_ratio;
         build_drive_name(d->name, c->idx, nsid);
+
+        /* The registry is 512-byte addressed everywhere above us, so a
+         * 4K device of N native sectors looks like 8N logical sectors. */
+        uint64_t log_sectors = nsze * sec_ratio;
 
         d->blk.name         = d->name;
         d->blk.ops          = &g_nvme_ops;
-        d->blk.sector_count = nsze;
+        d->blk.sector_count = log_sectors;
         d->blk.priv         = &d->ns;
 
-        kprintf("[nvme] NS %u registered as '%s'  (%lu sectors, %lu KiB)\n",
-                nsid, d->name,
-                (unsigned long)nsze, (unsigned long)(nsze / 2u));
+        kprintf("[nvme] NS %u registered as '%s'  (%lu x %u-byte LBAs = "
+                "%lu logical sectors, %lu KiB)\n",
+                nsid, d->name, (unsigned long)nsze, lba_size,
+                (unsigned long)log_sectors,
+                (unsigned long)((uint64_t)nsze * lba_size / 1024u));
         blk_register(&d->blk);
         g_drive_count++;
         registered++;
@@ -813,6 +925,109 @@ static struct pci_driver g_nvme_driver = {
     .probe   = nvme_pci_probe,
     .remove  = 0,
 };
+
+/* ---- 4K-LBA translation self-test ----------------------------- */
+
+/* Exercises nvme_rw_logical against a real registered namespace:
+ *   1. aligned multi-sector write/read round-trips;
+ *   2. a sub-device-sector write (forces a read-modify-write on a 4K
+ *      namespace) round-trips AND leaves its neighbours intact;
+ *   3. a sub-device-sector read returns exactly the slice written.
+ *
+ * Non-destructive: the touched window is read back into `orig` first
+ * and rewritten at the end. The base LBA is 8-aligned and clear of any
+ * MBR/GPT. Safe on a 512-byte device too (sec_ratio==1 collapses the
+ * RMW path to a plain write), where it just confirms the fast path
+ * still round-trips. Buffers are static (.bss), not on the boot stack.
+ */
+#define NVME4K_WIN_SECTORS  16u
+#define NVME4K_BASE_LBA     128u
+
+static void nvme4k_fill(uint8_t *b, size_t n, uint32_t seed) {
+    for (size_t i = 0; i < n; i++)
+        b[i] = (uint8_t)(seed * 131u + i * 17u + (i >> 8) * 7u);
+}
+
+void blk_nvme_selftest(void) {
+    struct blk_dev *dev = NULL;
+    size_t total = blk_count();
+    for (size_t i = 0; i < total; i++) {
+        struct blk_dev *b = blk_get(i);
+        if (b && b->ops == &g_nvme_ops) { dev = b; break; }
+    }
+    if (!dev) {
+        kprintf("[NVME4K] SKIP -- no NVMe namespace registered\n");
+        return;
+    }
+
+    struct nvme_namespace *ns = (struct nvme_namespace *)dev->priv;
+    kprintf("[NVME4K] testing '%s' native_lba=%u sec_ratio=%u "
+            "logical_sectors=%lu\n",
+            dev->name, ns->lba_size, ns->sec_ratio,
+            (unsigned long)dev->sector_count);
+
+    if (dev->sector_count < NVME4K_BASE_LBA + NVME4K_WIN_SECTORS) {
+        kprintf("[NVME4K] SKIP -- device too small\n");
+        return;
+    }
+
+    static uint8_t orig [NVME4K_WIN_SECTORS * BLK_SECTOR_SIZE];
+    static uint8_t work [NVME4K_WIN_SECTORS * BLK_SECTOR_SIZE];
+    static uint8_t check[NVME4K_WIN_SECTORS * BLK_SECTOR_SIZE];
+    static uint8_t one  [BLK_SECTOR_SIZE];
+    static uint8_t rdbuf[BLK_SECTOR_SIZE];
+
+    const uint64_t base = NVME4K_BASE_LBA;
+    const size_t   win  = NVME4K_WIN_SECTORS * BLK_SECTOR_SIZE;
+    int fails = 0;
+
+    /* Save the window so the test is non-destructive. */
+    if (blk_read(dev, base, NVME4K_WIN_SECTORS, orig) != 0) {
+        kprintf("[NVME4K] FAIL -- save read failed\n");
+        return;
+    }
+
+    /* 1. Aligned full-window write + read-back. */
+    nvme4k_fill(work, win, 0xA1);
+    int rc = blk_write(dev, base, NVME4K_WIN_SECTORS, work);
+    rc |= blk_read(dev, base, NVME4K_WIN_SECTORS, check);
+    bool ok1 = (rc == 0) && (memcmp(work, check, win) == 0);
+    if (!ok1) fails++;
+    kprintf("[NVME4K] step1 aligned %u-sector rw: %s\n",
+            NVME4K_WIN_SECTORS, ok1 ? "PASS" : "FAIL");
+
+    /* 2. Sub-sector write at base+9. On a 4K namespace this lands one
+     *    512-slice into the second device sector, forcing an RMW that
+     *    must update ONLY that logical sector and preserve the other
+     *    seven slices written in step 1. */
+    nvme4k_fill(one, BLK_SECTOR_SIZE, 0xB2);
+    rc  = blk_write(dev, base + 9, 1, one);
+    rc |= blk_read(dev, base, NVME4K_WIN_SECTORS, check);
+    bool ok2 = (rc == 0);
+    for (uint32_t s = 0; s < NVME4K_WIN_SECTORS && ok2; s++) {
+        const uint8_t *exp = (s == 9) ? one : work + s * BLK_SECTOR_SIZE;
+        if (memcmp(check + s * BLK_SECTOR_SIZE, exp, BLK_SECTOR_SIZE) != 0)
+            ok2 = false;
+    }
+    if (!ok2) fails++;
+    kprintf("[NVME4K] step2 sub-sector write + neighbour preservation: %s\n",
+            ok2 ? "PASS" : "FAIL");
+
+    /* 3. Sub-sector read at base+9 returns exactly what step 2 wrote
+     *    (RMW read slice). Regenerate the expected pattern into work. */
+    rc = blk_read(dev, base + 9, 1, rdbuf);
+    nvme4k_fill(work, BLK_SECTOR_SIZE, 0xB2);
+    bool ok3 = (rc == 0) && (memcmp(rdbuf, work, BLK_SECTOR_SIZE) == 0);
+    if (!ok3) fails++;
+    kprintf("[NVME4K] step3 sub-sector read: %s\n", ok3 ? "PASS" : "FAIL");
+
+    /* Restore the original window contents. */
+    if (blk_write(dev, base, NVME4K_WIN_SECTORS, orig) != 0)
+        kprintf("[NVME4K] WARN -- restore write failed\n");
+
+    kprintf("[NVME4K] %s (%d failure(s))\n",
+            fails == 0 ? "PASS" : "FAIL", fails);
+}
 
 void blk_nvme_register(void) {
     pci_register_driver(&g_nvme_driver);
