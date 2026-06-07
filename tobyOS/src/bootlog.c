@@ -13,7 +13,7 @@
 
 /* After a successful DHCP lease, upload to this host on the same LAN.
  * UDP so the collector only needs: ncat -u -l -p 40123 > bootlog.txt */
-#define BOOTLOG_NET_DST_DHCP ip4(192, 168, 68, 74)
+#define BOOTLOG_NET_DST_DHCP ip4(192, 168, 68, 66)
 #define BOOTLOG_NET_UDP_PORT htons(40123)
 #define BOOTLOG_NET_SRC_PORT htons(49999)
 #define BOOTLOG_NET_CHUNK    1000u
