@@ -15,6 +15,7 @@ tobyos.bin
 *.iso
 disk.img
 nvme*.img       # scratch NVMe backing images for QEMU storage tests
+sata*.img       # scratch AHCI/SATA backing images for QEMU storage tests
 *.tar
 build/
 iso/

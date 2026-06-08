@@ -67,6 +67,7 @@
 #include <tobyos/pit.h>
 #include <tobyos/irq.h>
 #include <tobyos/apic.h>
+#include <tobyos/spinlock.h>
 
 /* ---- generic host control register offsets (in ABAR) -------------- */
 
@@ -136,9 +137,12 @@
 #define AHCI_PxIS_DSS       (1u << 2)
 #define AHCI_PxIS_DONE_MASK (AHCI_PxIS_DHRS | AHCI_PxIS_PSS | AHCI_PxIS_DSS)
 
-/* Per-port IRQ enable bits we want active. Match the completion +
- * error mask so we hear about both cases. */
-#define AHCI_PxIE_BITS      (AHCI_PxIS_DONE_MASK | AHCI_PxIS_ERR_MASK)
+/* Per-port IRQ enable bits we want active. The DONE_MASK covers the
+ * legacy single-command D2H/PIO/DMA-setup completions; SDBS (Set Device
+ * Bits FIS) is how NCQ commands signal completion; ERR_MASK covers
+ * faults for both paths. */
+#define AHCI_PxIE_BITS      (AHCI_PxIS_DONE_MASK | AHCI_PxIS_SDBS | \
+                             AHCI_PxIS_ERR_MASK)
 
 #define AHCI_DET_PRESENT    3u    /* SSTS.DET = device + PHY up */
 
@@ -146,17 +150,25 @@
 
 /* ---- ATA commands ------------------------------------------------- */
 
-#define ATA_CMD_IDENTIFY        0xEC
-#define ATA_CMD_READ_DMA_EXT    0x25
-#define ATA_CMD_WRITE_DMA_EXT   0x35
+#define ATA_CMD_IDENTIFY            0xEC
+#define ATA_CMD_READ_DMA_EXT        0x25
+#define ATA_CMD_WRITE_DMA_EXT       0x35
+#define ATA_CMD_READ_FPDMA_QUEUED   0x60   /* NCQ read  */
+#define ATA_CMD_WRITE_FPDMA_QUEUED  0x61   /* NCQ write */
+
+/* ---- capability + status bits used for NCQ ----------------------- */
+
+#define AHCI_CAP_SNCQ       (1u << 30)     /* HBA supports native command queuing */
+#define AHCI_PxIS_SDBS      (1u << 3)      /* Set Device Bits FIS (NCQ completion) */
 
 /* ---- driver capacities ------------------------------------------- */
 
-#define AHCI_SLOT               0      /* polled = one slot in use   */
+#define AHCI_SLOT               0      /* legacy/IDENTIFY path: command slot 0 */
 #define AHCI_PRDT_ENTRIES       64
 #define AHCI_BYTES_PER_OP       (AHCI_PRDT_ENTRIES * PAGE_SIZE)
 #define AHCI_SECTORS_PER_OP     (AHCI_BYTES_PER_OP / BLK_SECTOR_SIZE)
 #define AHCI_MAX_DRIVES         8
+#define AHCI_NCQ_SLOTS          32     /* max NCQ command slots (HBA + spec cap) */
 
 /* ---- on-the-wire HBA structures --------------------------------- */
 
@@ -210,11 +222,14 @@ struct ahci_port {
     struct ahci_cmd_header   *cl;            /* 32-entry command list  */
     uint64_t                  fis_phys;
     void                     *fis;           /* 256-byte FIS RX area   */
-    uint64_t                  ct_phys;
-    struct ahci_cmd_table    *ct;            /* command table for slot 0 */
+    /* Per-slot command tables. ct[0] is always allocated (legacy single-
+     * command path + IDENTIFY). When NCQ is enabled, ct[1..nslots-1] are
+     * allocated too so each in-flight NCQ tag has its own table. */
+    uint64_t                  ct_phys[AHCI_NCQ_SLOTS];
+    struct ahci_cmd_table    *ct[AHCI_NCQ_SLOTS];
     uint64_t                  sectors;
     /* Set by the ISR; cleared at the start of every issue. Bit s = 1
-     * means slot s completed (we currently only use slot 0). 'volatile'
+     * means slot s completed (legacy path only uses slot 0). 'volatile'
      * is required because the wait loop reads it without taking any
      * lock -- the ISR is the writer. */
     volatile uint32_t         done_slots;
@@ -224,6 +239,23 @@ struct ahci_port {
      * ISR) is still visible to the failure log. */
     volatile uint32_t         err_is;
     struct ahci_hba          *hba;           /* back-pointer for ISR */
+
+    /* ---- NCQ command queuing ----
+     *
+     * When `ncq` is set, reads/writes go through the FPDMA QUEUED path:
+     * up to `nslots` tagged commands outstanding at once. `free_slots` is
+     * a bitmap of available tags, `inflight_mask` the tags currently
+     * issued, and `inflight[tag]` the blk_io waiting on each. `lock`
+     * serializes submission, the PxSACT-driven completion reap, and the
+     * bitmaps across the submitter(s) + the completion IRQ. */
+    bool                      ncq;
+    int                       nslots;
+    spinlock_t                lock;
+    uint32_t                  free_slots;     /* bit t set => tag t free  */
+    uint32_t                  inflight_mask;  /* tags currently issued     */
+    struct blk_io            *inflight[AHCI_NCQ_SLOTS];
+    volatile uint64_t         inflight_now;
+    volatile uint64_t         max_inflight;
 };
 
 /* Per-disk wrapper. blk_dev.priv -> &ahci_drive::port. */
@@ -241,6 +273,8 @@ struct ahci_hba {
     volatile uint8_t *abar;
     uint8_t           irq_vector;       /* allocated via irq_alloc_vector */
     bool              irq_enabled;      /* MSI succeeded -> IRQs live */
+    bool              ncq_cap;          /* CAP.SNCQ -- HBA supports NCQ */
+    int               ncs;              /* CAP.NCS+1 -- HBA command slots */
     int               drive_first;      /* index in g_drives[] */
     int               drive_count;
     /* IRQ counter for diagnostics. Read by the shell + the regression
@@ -294,10 +328,13 @@ static int wait_until(volatile uint8_t *reg, uint32_t mask,
 
 /* ---- IRQ handler ------------------------------------------------ */
 
+static void ahci_ncq_poll(struct ahci_port *p);   /* fwd: defined below */
+
 /* Called from the irq_alloc_vector trampoline; ctx is the ahci_hba *
  * we registered at probe time. apic_eoi() is sent for us by the
  * trampoline. We only do non-blocking work here: snapshot IS, walk
- * each affected port, capture PxIS bits, and W1C both. */
+ * each affected port, and hand it to the NCQ reaper (which drains
+ * completed tags via PxSACT) or the legacy done_slots path. */
 static void ahci_irq_handler(void *ctx) {
     struct ahci_hba *h = (struct ahci_hba *)ctx;
     if (!h || !h->abar) return;
@@ -316,13 +353,18 @@ static void ahci_irq_handler(void *ctx) {
         struct ahci_port *p = &g_drives[di].port;
         if ((is & (1u << p->idx)) == 0) continue;
 
-        uint32_t pis = prt_r32(p->regs, AHCI_PxIS);
-        prt_w32(p->regs, AHCI_PxIS, pis);                  /* W1C */
-
-        if (pis & AHCI_PxIS_DONE_MASK) p->done_slots |= 1u;
-        if (pis & AHCI_PxIS_ERR_MASK)  {
-            p->err_is    |= pis;
-            p->done_slots |= 1u;       /* errored, but still wakes */
+        if (p->ncq) {
+            /* NCQ port: the reaper reads + W1Cs PxIS and completes tags
+             * whose PxSACT bit cleared. */
+            ahci_ncq_poll(p);
+        } else {
+            uint32_t pis = prt_r32(p->regs, AHCI_PxIS);
+            prt_w32(p->regs, AHCI_PxIS, pis);              /* W1C */
+            if (pis & AHCI_PxIS_DONE_MASK) p->done_slots |= 1u;
+            if (pis & AHCI_PxIS_ERR_MASK)  {
+                p->err_is    |= pis;
+                p->done_slots |= 1u;       /* errored, but still wakes */
+            }
         }
     }
 
@@ -438,8 +480,8 @@ static int ahci_issue(struct ahci_port *p, int prdt_count, bool is_write) {
     p->cl[AHCI_SLOT].flags    = flags;
     p->cl[AHCI_SLOT].prdtl    = (uint16_t)prdt_count;
     p->cl[AHCI_SLOT].prdbc    = 0;
-    p->cl[AHCI_SLOT].ctba_lo  = (uint32_t)(p->ct_phys & 0xFFFFFFFFu);
-    p->cl[AHCI_SLOT].ctba_hi  = (uint32_t)(p->ct_phys >> 32);
+    p->cl[AHCI_SLOT].ctba_lo  = (uint32_t)(p->ct_phys[0] & 0xFFFFFFFFu);
+    p->cl[AHCI_SLOT].ctba_hi  = (uint32_t)(p->ct_phys[0] >> 32);
 
     /* Reset the wait state. We do this BEFORE clearing the hardware
      * status so a leftover IRQ from a prior command can't sneak in
@@ -497,12 +539,12 @@ static int ahci_identify(struct ahci_port *p, uint64_t *out_sectors) {
     uint16_t *id = (uint16_t *)pmm_phys_to_virt(scratch_phys);
     memset(id, 0, BLK_SECTOR_SIZE);
 
-    int n = build_prdt(p->ct, id, BLK_SECTOR_SIZE);
+    int n = build_prdt(p->ct[0], id, BLK_SECTOR_SIZE);
     if (n <= 0) {
         pmm_free_page(scratch_phys);
         return -2;
     }
-    build_h2d_fis(p->ct->cfis, ATA_CMD_IDENTIFY, 0, 1);
+    build_h2d_fis(p->ct[0]->cfis, ATA_CMD_IDENTIFY, 0, 1);
 
     int rc = ahci_issue(p, n, /*is_write*/ false);
     if (rc != 0) {
@@ -523,6 +565,17 @@ static int ahci_identify(struct ahci_port *p, uint64_t *out_sectors) {
     }
     *out_sectors = lba48;
 
+    /* NCQ capability + queue depth from the drive's IDENTIFY data:
+     *   word 76 bit 8  = NCQ supported (Serial ATA capabilities)
+     *   word 75 [4:0]  = max queue depth minus 1
+     * The caller combines drive_ncq with the HBA's CAP.SNCQ and caps the
+     * tag count at the HBA's command-slot count + AHCI_NCQ_SLOTS. */
+    p->ncq    = (id[76] & (1u << 8)) != 0;
+    int qd    = (id[75] & 0x1F) + 1;
+    if (qd < 1) qd = 1;
+    if (qd > AHCI_NCQ_SLOTS) qd = AHCI_NCQ_SLOTS;
+    p->nslots = qd;
+
     pmm_free_page(scratch_phys);
     return 0;
 }
@@ -532,17 +585,169 @@ static int ahci_identify(struct ahci_port *p, uint64_t *out_sectors) {
 static int ahci_one_xfer(struct ahci_port *p, uint64_t lba,
                          uint16_t count, void *buf, bool is_write) {
     if (count == 0) return 0;
-    int n = build_prdt(p->ct, buf, (uint32_t)count * BLK_SECTOR_SIZE);
+    int n = build_prdt(p->ct[0], buf, (uint32_t)count * BLK_SECTOR_SIZE);
     if (n <= 0) return -1;
-    build_h2d_fis(p->ct->cfis,
+    build_h2d_fis(p->ct[0]->cfis,
                   is_write ? ATA_CMD_WRITE_DMA_EXT : ATA_CMD_READ_DMA_EXT,
                   lba, count);
     return ahci_issue(p, n, is_write);
 }
 
+/* ---- NCQ (FPDMA QUEUED) command queuing -------------------------- */
+
+/* Build a Host-to-Device Register FIS for an NCQ FPDMA QUEUED command.
+ * Unlike the legacy LBA48 FIS, the transfer length goes in the FEATURES
+ * register (low byte cfis[3], high byte cfis[11]) and the SECTOR COUNT
+ * register carries the TAG in bits 7:3 (cfis[12]). */
+static void build_ncq_fis(uint8_t *cfis, uint8_t cmd, uint64_t lba,
+                          uint16_t count, int tag) {
+    memset(cfis, 0, 20);
+    cfis[0]  = 0x27;                       /* FIS type: H2D Register     */
+    cfis[1]  = 0x80;                       /* C = command                */
+    cfis[2]  = cmd;                        /* READ/WRITE FPDMA QUEUED    */
+    cfis[3]  = (uint8_t)(count & 0xFF);    /* features[7:0]  = count lo  */
+
+    cfis[4]  = (uint8_t)(lba       & 0xFF);
+    cfis[5]  = (uint8_t)((lba >>  8) & 0xFF);
+    cfis[6]  = (uint8_t)((lba >> 16) & 0xFF);
+    cfis[7]  = 0x40;                        /* device: LBA mode          */
+
+    cfis[8]  = (uint8_t)((lba >> 24) & 0xFF);
+    cfis[9]  = (uint8_t)((lba >> 32) & 0xFF);
+    cfis[10] = (uint8_t)((lba >> 40) & 0xFF);
+    cfis[11] = (uint8_t)((count >> 8) & 0xFF);  /* features[15:8] = count hi */
+
+    cfis[12] = (uint8_t)((tag & 0x1F) << 3);    /* sector count low = TAG<<3 */
+    cfis[13] = 0;                          /* sector count high (PRIO=0) */
+    cfis[14] = 0;
+    cfis[15] = 0;                          /* control                    */
+}
+
+/* Reap NCQ completions on `p`. A tag is done when its PxSACT bit, which
+ * software set at submit, has been cleared by the device. Shared by the
+ * completion IRQ and the busy-poll/yield waiter (p->lock makes them
+ * mutually exclusive). On a task-file error the port halts: we fail
+ * every outstanding tag and restart the command engine (coarse but safe
+ * -- per-tag NCQ error recovery via READ LOG EXT isn't worth it here). */
+static void ahci_ncq_poll(struct ahci_port *p) {
+    uint64_t f = spin_lock_irqsave(&p->lock);
+
+    uint32_t is = prt_r32(p->regs, AHCI_PxIS);
+    if (is & AHCI_PxIS_ERR_MASK) {
+        prt_w32(p->regs, AHCI_PxIS, is);                        /* W1C */
+        prt_w32(p->regs, AHCI_PxSERR, prt_r32(p->regs, AHCI_PxSERR));
+        kprintf("[ahci] port %d: NCQ error IS=0x%08x TFD=0x%08x -- "
+                "failing %d outstanding tag(s)\n",
+                p->idx, is, prt_r32(p->regs, AHCI_PxTFD), p->nslots);
+        for (int t = 0; t < p->nslots; t++) {
+            if (!(p->inflight_mask & (1u << t))) continue;
+            struct blk_io *io = p->inflight[t];
+            p->inflight[t]    = 0;
+            p->inflight_mask &= ~(1u << t);
+            p->free_slots    |= (1u << t);
+            if (p->inflight_now) p->inflight_now--;
+            if (io) blk_io_complete(io, -3);
+        }
+        /* Restart the command engine so future commands run. */
+        uint32_t cmd = prt_r32(p->regs, AHCI_PxCMD);
+        prt_w32(p->regs, AHCI_PxCMD, cmd & ~AHCI_PxCMD_ST);
+        (void)wait_until(p->regs + AHCI_PxCMD, AHCI_PxCMD_CR, 0, 500);
+        prt_w32(p->regs, AHCI_PxCMD,
+                prt_r32(p->regs, AHCI_PxCMD) | AHCI_PxCMD_ST);
+        spin_unlock_irqrestore(&p->lock, f);
+        return;
+    }
+
+    uint32_t sact = prt_r32(p->regs, AHCI_PxSACT);
+    uint32_t done = p->inflight_mask & ~sact;     /* set-then-cleared = done */
+    while (done) {
+        int t = __builtin_ctz(done);
+        done &= ~(1u << t);
+        struct blk_io *io = p->inflight[t];
+        p->inflight[t]    = 0;
+        p->inflight_mask &= ~(1u << t);
+        p->free_slots    |= (1u << t);
+        if (p->inflight_now) p->inflight_now--;
+        if (io) blk_io_complete(io, 0);
+    }
+    if (is) prt_w32(p->regs, AHCI_PxIS, is);                    /* W1C */
+    spin_unlock_irqrestore(&p->lock, f);
+}
+
+static void ahci_ncq_poll_cb(void *ctx) {
+    ahci_ncq_poll((struct ahci_port *)ctx);
+}
+
+/* Submit one NCQ command (<= AHCI_SECTORS_PER_OP sectors). Allocates a
+ * free tag, builds the command table + FIS, then sets the PxSACT bit
+ * (before PxCI, per spec) to issue it. Returns 0 on submit, -1 if no tag
+ * is free, -2 on PRDT build failure. */
+static int ahci_ncq_submit(struct ahci_port *p, struct blk_io *io,
+                           uint64_t lba, uint16_t count, void *buf,
+                           bool is_write) {
+    uint64_t f = spin_lock_irqsave(&p->lock);
+    if (p->free_slots == 0) { spin_unlock_irqrestore(&p->lock, f); return -1; }
+    int tag = __builtin_ctz(p->free_slots);
+
+    int n = build_prdt(p->ct[tag], buf, (uint32_t)count * BLK_SECTOR_SIZE);
+    if (n <= 0) { spin_unlock_irqrestore(&p->lock, f); return -2; }
+    build_ncq_fis(p->ct[tag]->cfis,
+                  is_write ? ATA_CMD_WRITE_FPDMA_QUEUED
+                           : ATA_CMD_READ_FPDMA_QUEUED,
+                  lba, count, tag);
+
+    uint16_t flags = 5u;                        /* CFL = 5 dwords */
+    if (is_write) flags |= (1u << 6);           /* W bit          */
+    p->cl[tag].flags   = flags;
+    p->cl[tag].prdtl   = (uint16_t)n;
+    p->cl[tag].prdbc   = 0;
+    p->cl[tag].ctba_lo = (uint32_t)(p->ct_phys[tag] & 0xFFFFFFFFu);
+    p->cl[tag].ctba_hi = (uint32_t)(p->ct_phys[tag] >> 32);
+
+    p->free_slots    &= ~(1u << tag);
+    p->inflight_mask |=  (1u << tag);
+    p->inflight[tag]  = io;
+    p->inflight_now++;
+    if (p->inflight_now > p->max_inflight) p->max_inflight = p->inflight_now;
+
+    /* NCQ issue: set the SACT bit for this tag, THEN the CI bit (these
+     * registers are write-1-to-set, so other in-flight tags are
+     * unaffected). */
+    prt_w32(p->regs, AHCI_PxSACT, (1u << tag));
+    prt_w32(p->regs, AHCI_PxCI,   (1u << tag));
+
+    spin_unlock_irqrestore(&p->lock, f);
+    return 0;
+}
+
+/* Chunked NCQ transfer: one tagged command per <= 256 KiB chunk, each
+ * waited via blk_io_wait (which yields when safe so other procs keep the
+ * queue full). If all tags are busy we reap + retry. */
+static int ahci_ncq_xfer(struct ahci_port *p, uint64_t lba, uint32_t count,
+                         void *buf, bool is_write) {
+    uint8_t *b = (uint8_t *)buf;
+    while (count > 0) {
+        uint32_t chunk = count > AHCI_SECTORS_PER_OP
+                             ? AHCI_SECTORS_PER_OP : count;
+        struct blk_io io;
+        blk_io_prep(&io, lba, chunk, b, is_write);
+        while (ahci_ncq_submit(p, &io, lba, (uint16_t)chunk, b, is_write) != 0) {
+            ahci_ncq_poll(p);          /* free a tag by reaping */
+            __asm__ volatile ("pause");
+        }
+        int st = blk_io_wait(&io, ahci_ncq_poll_cb, p);
+        if (st != 0) return st;
+        b     += (size_t)chunk * BLK_SECTOR_SIZE;
+        lba   += chunk;
+        count -= chunk;
+    }
+    return 0;
+}
+
 static int ahci_blk_read(struct blk_dev *dev, uint64_t lba,
                          uint32_t count, void *buf) {
     struct ahci_port *p = (struct ahci_port *)dev->priv;
+    if (p->ncq) return ahci_ncq_xfer(p, lba, count, buf, /*write*/ false);
     uint8_t *out = (uint8_t *)buf;
     while (count > 0) {
         uint32_t chunk = count > AHCI_SECTORS_PER_OP
@@ -559,6 +764,7 @@ static int ahci_blk_read(struct blk_dev *dev, uint64_t lba,
 static int ahci_blk_write(struct blk_dev *dev, uint64_t lba,
                           uint32_t count, const void *buf) {
     struct ahci_port *p = (struct ahci_port *)dev->priv;
+    if (p->ncq) return ahci_ncq_xfer(p, lba, count, (void *)buf, /*write*/ true);
     uint8_t *in = (uint8_t *)buf;        /* HBA never writes through it */
     while (count > 0) {
         uint32_t chunk = count > AHCI_SECTORS_PER_OP
@@ -617,11 +823,32 @@ static int port_alloc(struct ahci_port *p) {
     p->fis = pmm_phys_to_virt(p->fis_phys);
     memset(p->fis, 0, PAGE_SIZE);
 
-    p->ct_phys = pmm_alloc_page();
-    if (!p->ct_phys) return -3;
-    p->ct = (struct ahci_cmd_table *)pmm_phys_to_virt(p->ct_phys);
-    memset(p->ct, 0, PAGE_SIZE);
+    p->ct_phys[0] = pmm_alloc_page();
+    if (!p->ct_phys[0]) return -3;
+    p->ct[0] = (struct ahci_cmd_table *)pmm_phys_to_virt(p->ct_phys[0]);
+    memset(p->ct[0], 0, PAGE_SIZE);
     return 0;
+}
+
+/* Allocate the remaining per-tag command tables (1..nslots-1) for NCQ.
+ * Called after IDENTIFY once we know the disk + HBA support NCQ. One
+ * page per table (a command table is ~1.1 KiB; the slack is wasted but
+ * keeps each table page-aligned and the code trivial). On OOM we cap
+ * nslots at whatever we managed to allocate -- NCQ still works with a
+ * shorter queue. */
+static void port_alloc_ncq_tables(struct ahci_port *p) {
+    for (int s = 1; s < p->nslots; s++) {
+        uint64_t pg = pmm_alloc_page();
+        if (!pg) {
+            kprintf("[ahci] port %d: NCQ tables OOM -- capping depth at %d\n",
+                    p->idx, s);
+            p->nslots = s;
+            break;
+        }
+        p->ct_phys[s] = pg;
+        p->ct[s]      = (struct ahci_cmd_table *)pmm_phys_to_virt(pg);
+        memset(p->ct[s], 0, PAGE_SIZE);
+    }
 }
 
 /* Bring up one port. Returns 0 on success (drive present + IDENTIFY
@@ -713,6 +940,27 @@ static int port_init(struct ahci_port *p) {
         return -7;
     }
 
+    /* Finalize NCQ: ahci_identify set p->ncq (drive support) + p->nslots
+     * (drive queue depth). Enable it only if the HBA also advertises NCQ
+     * (CAP.SNCQ) and there's more than one tag to gain from. On enable,
+     * allocate the per-tag command tables and mark every tag free.
+     * Otherwise fall back to the legacy single-command path (ct[0]). */
+    bool hba_ncq   = p->hba && p->hba->ncq_cap;
+    bool drive_ncq = p->ncq;
+    if (p->hba && p->nslots > p->hba->ncs) p->nslots = p->hba->ncs;  /* HBA slot cap */
+    if (hba_ncq && drive_ncq && p->nslots > 1) {
+        port_alloc_ncq_tables(p);          /* may cap nslots on OOM */
+        p->free_slots = (p->nslots >= 32)
+                          ? 0xFFFFFFFFu : ((1u << p->nslots) - 1u);
+        kprintf("[ahci] port %d: NCQ enabled (%d tags)\n", p->idx, p->nslots);
+    } else {
+        p->ncq    = false;
+        p->nslots = 1;
+        kprintf("[ahci] port %d: NCQ off (hba_cap=%d drive=%d) -- "
+                "legacy single-command\n",
+                p->idx, (int)hba_ncq, (int)drive_ncq);
+    }
+
     /* Drive is healthy. Unmask the per-port IRQ sources we care about
      * (DHRS / PSS / DSS for command completion + the four error bits)
      * AFTER clearing any latched bits IDENTIFY may have set. The HBA
@@ -802,9 +1050,12 @@ static int ahci_pci_probe(struct pci_dev *dev) {
     uint32_t cap = hba_r32(abar, AHCI_CAP);
     uint32_t pi  = hba_r32(abar, AHCI_PI);
     uint32_t vs  = hba_r32(abar, AHCI_VS);
-    int np = (int)(cap & 0x1F) + 1;
-    kprintf("[ahci] CAP=0x%08x PI=0x%08x VS=0x%08x  (NP=%d ports)\n",
-            cap, pi, vs, np);
+    int np  = (int)(cap & 0x1F) + 1;
+    int ncs = (int)((cap >> 8) & 0x1F) + 1;       /* command slots */
+    h->ncs     = ncs;
+    h->ncq_cap = (cap & AHCI_CAP_SNCQ) != 0;      /* gates per-port NCQ */
+    kprintf("[ahci] CAP=0x%08x PI=0x%08x VS=0x%08x  (NP=%d NCS=%d SNCQ=%d)\n",
+            cap, pi, vs, np, ncs, (int)h->ncq_cap);
 
     int hba_id = g_hba_index++;
     int found  = 0;
@@ -922,6 +1173,128 @@ static struct pci_driver g_ahci_driver = {
     .probe   = ahci_pci_probe,
     .remove  = 0,
 };
+
+/* ---- NCQ command-queuing self-test --------------------------------
+ *
+ * Exercises the AHCI driver against the first registered AHCI disk:
+ *   1. sequential write/read/verify of K sectors (basic correctness
+ *      through the NCQ path);
+ *   2. batched concurrency -- submit K tagged commands at once (PxIE
+ *      masked across the batch so the peak in-flight count is
+ *      deterministic), reap all, and verify each command's DMA landed in
+ *      its own buffer (write K distinct patterns concurrently, read back
+ *      concurrently, per-buffer verify). Proves multiple tags in flight
+ *      AND correct per-tag completion routing.
+ * Non-destructive (saves + restores the K sectors). Opt-in via
+ * -DAHCIQ_BOOT. Buffers are static (.bss). */
+#define AHCIQ_K     8u
+#define AHCIQ_BASE  2048u    /* clear of any GPT/boot area */
+
+static void ahciq_fill(uint8_t *b, size_t n, uint32_t seed) {
+    for (size_t i = 0; i < n; i++)
+        b[i] = (uint8_t)(seed * 131u + i * 17u + (i >> 8) * 7u);
+}
+
+void blk_ahci_selftest(void) {
+    struct blk_dev *dev = NULL;
+    size_t total = blk_count();
+    for (size_t i = 0; i < total; i++) {
+        struct blk_dev *b = blk_get(i);
+        if (b && b->ops == &g_ahci_ops) { dev = b; break; }
+    }
+    if (!dev) {
+        kprintf("[AHCIQ] SKIP -- no AHCI disk registered\n");
+        return;
+    }
+
+    struct ahci_port *p = (struct ahci_port *)dev->priv;
+    kprintf("[AHCIQ] testing '%s' ncq=%d nslots=%d sectors=%lu\n",
+            dev->name, (int)p->ncq, p->nslots,
+            (unsigned long)dev->sector_count);
+
+    const uint64_t base = AHCIQ_BASE;
+    const uint32_t K    = AHCIQ_K;
+    if (dev->sector_count < base + K) {
+        kprintf("[AHCIQ] SKIP -- disk too small\n");
+        return;
+    }
+
+    static uint8_t save[AHCIQ_K][BLK_SECTOR_SIZE];
+    static uint8_t data[AHCIQ_K][BLK_SECTOR_SIZE];
+    static uint8_t cexp[BLK_SECTOR_SIZE];
+    int fails = 0;
+
+    for (uint32_t k = 0; k < K; k++)
+        if (blk_read(dev, base + k, 1, save[k]) != 0) fails++;
+
+    /* 1. Sequential write/read/verify. */
+    int rc = 0;
+    for (uint32_t k = 0; k < K; k++) ahciq_fill(data[k], BLK_SECTOR_SIZE, 0xA0u + k);
+    for (uint32_t k = 0; k < K; k++) rc |= blk_write(dev, base + k, 1, data[k]);
+    for (uint32_t k = 0; k < K; k++) {
+        memset(data[k], 0, BLK_SECTOR_SIZE);
+        rc |= blk_read(dev, base + k, 1, data[k]);
+    }
+    bool ok1 = (rc == 0);
+    for (uint32_t k = 0; k < K && ok1; k++) {
+        ahciq_fill(cexp, BLK_SECTOR_SIZE, 0xA0u + k);
+        if (memcmp(data[k], cexp, BLK_SECTOR_SIZE) != 0) ok1 = false;
+    }
+    if (!ok1) fails++;
+    kprintf("[AHCIQ] step1 sequential rw: %s\n", ok1 ? "PASS" : "FAIL");
+
+    /* 2. Batched concurrency (only meaningful when NCQ is enabled). */
+    if (p->ncq) {
+        struct blk_io io[AHCIQ_K];
+        bool ok2 = true;
+
+        for (uint32_t k = 0; k < K; k++) ahciq_fill(data[k], BLK_SECTOR_SIZE, 0xC0u + k);
+        prt_w32(p->regs, AHCI_PxIE, 0);                 /* mask completions */
+        p->max_inflight = 0;
+        for (uint32_t k = 0; k < K; k++) {
+            blk_io_prep(&io[k], base + k, 1, data[k], true);
+            while (ahci_ncq_submit(p, &io[k], base + k, 1, data[k], true) != 0) {
+                ahci_ncq_poll(p); __asm__ volatile ("pause");
+            }
+        }
+        prt_w32(p->regs, AHCI_PxIE, AHCI_PxIE_BITS);    /* unmask           */
+        uint64_t peak_w = p->max_inflight;
+        for (uint32_t k = 0; k < K; k++)
+            if (blk_io_wait(&io[k], ahci_ncq_poll_cb, p) != 0) ok2 = false;
+
+        for (uint32_t k = 0; k < K; k++) memset(data[k], 0, BLK_SECTOR_SIZE);
+        prt_w32(p->regs, AHCI_PxIE, 0);
+        p->max_inflight = 0;
+        for (uint32_t k = 0; k < K; k++) {
+            blk_io_prep(&io[k], base + k, 1, data[k], false);
+            while (ahci_ncq_submit(p, &io[k], base + k, 1, data[k], false) != 0) {
+                ahci_ncq_poll(p); __asm__ volatile ("pause");
+            }
+        }
+        prt_w32(p->regs, AHCI_PxIE, AHCI_PxIE_BITS);
+        uint64_t peak_r = p->max_inflight;
+        for (uint32_t k = 0; k < K; k++)
+            if (blk_io_wait(&io[k], ahci_ncq_poll_cb, p) != 0) ok2 = false;
+
+        for (uint32_t k = 0; k < K; k++) {
+            ahciq_fill(cexp, BLK_SECTOR_SIZE, 0xC0u + k);
+            if (memcmp(data[k], cexp, BLK_SECTOR_SIZE) != 0) ok2 = false;
+        }
+        bool depth_ok = (peak_w >= 2) || (peak_r >= 2);
+        if (!ok2 || !depth_ok) fails++;
+        kprintf("[AHCIQ] step2 concurrency: %s "
+                "(peak in-flight write=%lu read=%lu of %u)\n",
+                (ok2 && depth_ok) ? "PASS" : "FAIL",
+                (unsigned long)peak_w, (unsigned long)peak_r, (unsigned)K);
+    } else {
+        kprintf("[AHCIQ] step2 concurrency: SKIP (NCQ not enabled)\n");
+    }
+
+    for (uint32_t k = 0; k < K; k++)
+        if (blk_write(dev, base + k, 1, save[k]) != 0) fails++;
+
+    kprintf("[AHCIQ] %s (%d failure(s))\n", fails == 0 ? "PASS" : "FAIL", fails);
+}
 
 void blk_ahci_register(void) {
     pci_register_driver(&g_ahci_driver);

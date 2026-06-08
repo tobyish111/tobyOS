@@ -155,6 +155,12 @@ void blk_nvme_register(void);  /* NVMe 1.x (PCIe SSDs, QEMU -device nvme) */
  * translation. Non-destructive (saves+restores the window it uses);
  * no-op SKIP if no NVMe namespace is present. */
 void blk_nvme_selftest(void);
+
+/* Opt-in AHCI NCQ self-test (called from kernel.c under -DAHCIQ_BOOT):
+ * sequential rw + batched concurrent rw against the first registered
+ * AHCI disk, proving multiple NCQ tags in flight with correct per-tag
+ * completion. Non-destructive; SKIPs if no AHCI disk is present. */
+void blk_ahci_selftest(void);
 void virtio_blk_register(void); /* M35B: modern virtio-blk-pci         */
 
 /* M35B: lightweight introspection (NULL/0/false if no virtio-blk bound). */

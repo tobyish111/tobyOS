@@ -2428,6 +2428,11 @@ void _start(void) {
      * (-device nvme,...,logical_block_size=4096). Non-destructive. */
     blk_nvme_selftest();
 #endif
+#ifdef AHCIQ_BOOT
+    /* Opt-in: exercise the AHCI NCQ command-queuing path on q35 (an
+     * AHCI/SATA disk). Non-destructive. */
+    blk_ahci_selftest();
+#endif
     net_dump();
 
     modules_log();
