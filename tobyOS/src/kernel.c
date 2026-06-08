@@ -3737,6 +3737,11 @@ void _start(void) {
      * steal + run user procs in parallel. */
     sched_enable_ap_run();
 
+    /* Scheduler + drivers are up: let blk_io_wait cooperatively yield
+     * while block commands are in flight, so concurrent submitters keep
+     * the AHCI/NVMe queues full instead of serializing. */
+    blk_set_yield_ready();
+
 #ifdef MCTEST_BOOT
     /* Opt-in multi-core proof (EXTRA_CFLAGS+=-DMCTEST_BOOT). With AP-run now
      * enabled, time one CPU-bound worker then four spawned together. ~one-

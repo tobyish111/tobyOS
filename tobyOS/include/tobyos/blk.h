@@ -218,4 +218,58 @@ static inline int blk_write(struct blk_dev *d, uint64_t lba, uint32_t n, const v
     return d->ops->write(d, lba, n, b);
 }
 
+/* ---- async block I/O (command queuing) ---------------------------
+ *
+ * Drivers that keep multiple commands in flight (NVMe multi-CID, AHCI
+ * NCQ) split each blk_read/blk_write into one or more `struct blk_io`
+ * hardware operations (each <= the driver's per-op cap), submit them all
+ * to the hardware queue, then wait for each. The public blk_read/write
+ * signatures stay synchronous; the queuing happens underneath.
+ *
+ * Completion is delivered two ways, and the wait tolerates both:
+ *   - the device completion IRQ (MSI) calls blk_io_complete(); or
+ *   - the caller's `poll` reaper drains finished tags (used when MSI is
+ *     unavailable, or when interrupts are masked at the wait point).
+ *
+ * `blk_io_wait` cooperatively yields between polls *when it is safe to*
+ * (scheduler up, interrupts enabled, a current proc exists) so that other
+ * processes -- and their own I/O -- make progress while this op is in
+ * flight; that overlap is what keeps the hardware queue full. When it
+ * cannot yield (early boot, or a spinlock is held, e.g. the bcache flush
+ * paths) it busy-polls the hardware exactly as the old synchronous path
+ * did, so it is never worse than single-outstanding-command. */
+
+#define BLK_IO_PENDING  1     /* status while a blk_io is in flight */
+
+struct blk_io {
+    uint64_t        lba;        /* device/native LBA of this op        */
+    uint32_t        count;      /* sectors in this op                  */
+    void           *buf;        /* kernel buffer                       */
+    bool            is_write;
+    volatile int    status;     /* BLK_IO_PENDING -> 0 (ok) / <0 (err) */
+    volatile bool   done;       /* set by blk_io_complete              */
+    void           *drv;        /* driver-private cookie (tag, ctrl)   */
+    struct blk_io  *next;       /* driver free-list / chaining          */
+};
+
+static inline void blk_io_prep(struct blk_io *io, uint64_t lba, uint32_t count,
+                               void *buf, bool is_write) {
+    io->lba = lba; io->count = count; io->buf = buf; io->is_write = is_write;
+    io->status = BLK_IO_PENDING; io->done = false; io->drv = 0; io->next = 0;
+}
+
+/* Mark `io` finished with `status` (0 ok, <0 error). Safe from IRQ
+ * context: a plain release store, no locks, no scheduler calls. */
+void blk_io_complete(struct blk_io *io, int status);
+
+/* Wait until `io->done`. `poll` (may be NULL) is the driver's completion
+ * reaper, invoked with `poll_ctx` each iteration to harvest finished tags
+ * on the no-IRQ / IRQs-masked path. Returns io->status. */
+int  blk_io_wait(struct blk_io *io, void (*poll)(void *), void *poll_ctx);
+
+/* Called once by the kernel after the scheduler + drivers are fully up,
+ * enabling blk_io_wait's cooperative-yield path. Before this, all waits
+ * busy-poll (early-boot I/O is single-threaded anyway). */
+void blk_set_yield_ready(void);
+
 #endif /* TOBYOS_BLK_H */

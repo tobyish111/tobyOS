@@ -44,25 +44,31 @@
  *      sectors and translated in the read/write path: whole-device-
  *      sector runs go straight through (the FS does 4 KiB-aligned I/O),
  *      and a sub-device-sector fragment is handled by a read-modify-
- *      write through a per-controller bounce page. Native sizes that
- *      aren't a power-of-two multiple of 512 (<= page size), or formats
- *      carrying inline metadata (PI/DIF), are still skipped.
+ *      write through a transient bounce page. Native sizes that aren't a
+ *      power-of-two multiple of 512 (<= page size), or formats carrying
+ *      inline metadata (PI/DIF), are still skipped.
  *
  *   6. blk_register() with name "nvme<H>:n<N>" (H = HBA index, N =
- *      namespace id). Reads/writes funnel through the I/O queue:
+ *      namespace id). Reads/writes funnel through the I/O queue, which
+ *      keeps MULTIPLE commands in flight (command queuing):
  *        - Build a 64-byte SQE for READ (0x02) or WRITE (0x01).
  *        - PRP1/PRP2 from the caller's kernel-virt buffer via
  *          vmm_translate. <= 1 page after PRP1's offset = PRP2 unused;
- *          <= 2 pages = PRP2 is page 2's phys; > 2 pages = PRP2 is the
- *          phys of the controller's PRP-list page (1 page = 512
- *          entries = 2 MiB max), and we cap I/O at 256 KiB / call.
- *        - Submit by writing SQ tail doorbell.
- *        - Poll CQ for matching CID + phase tag flip; advance head;
- *          ring CQ head doorbell.
+ *          <= 2 pages = PRP2 is page 2's phys; > 2 pages = PRP2 is a
+ *          transient PRP-list page (1 page = 512 entries = 2 MiB max),
+ *          and we cap I/O at 256 KiB / call.
+ *        - Allocate a unique CID, write the SQE, ring the SQ-tail
+ *          doorbell, and record the request -- WITHOUT waiting.
+ *        - blk_io_wait cooperatively yields (when safe) until the
+ *          completion arrives, so other processes' I/O overlaps with
+ *          ours and the hardware queue stays full.
  *
- *   7. IRQs are masked at every level (INTMS = ~0). We poll. Same
- *      model as blk_ata, blk_ahci. NVMe IRQ steering / MSI-X comes
- *      with the milestone-21 IRQ overhaul, not this step.
+ *   7. Completion is interrupt-driven (MSI / MSI-X): nvme_irq_handler
+ *      drains the CQ via nvme_io_poll, matching each CQE's CID back to
+ *      its request and marking it done. If MSI is unavailable, or a
+ *      waiter is called with interrupts masked, the same nvme_io_poll
+ *      reaper runs from the busy-poll path -- so the driver degrades to
+ *      the old polled behaviour without a separate code path.
  *
  *   8. 64-bit DMA always. NVMe is PCIe-only, no 32-bit-only legacy.
  */
@@ -77,6 +83,7 @@
 #include <tobyos/pit.h>
 #include <tobyos/irq.h>
 #include <tobyos/apic.h>
+#include <tobyos/spinlock.h>
 
 /* ---- controller register offsets ------------------------------- */
 
@@ -183,22 +190,26 @@ struct nvme_controller {
     int                idx;             /* slot in g_ctrls (= HBA index) */
     volatile uint8_t  *bar;
     uint32_t           dstrd;
-    uint16_t           next_cid;
+    uint16_t           next_cid;        /* admin-queue CID (single outstanding) */
     struct nvme_queue  admin;
     struct nvme_queue  io;
-    uint64_t           prp_list_phys;
-    uint64_t          *prp_list;
 
-    /* Bounce page for read-modify-write of a partial NATIVE sector when
-     * a namespace uses 4 KiB (or other >512) LBAs. The block layer above
-     * us is 512-byte addressed, so a logical request that doesn't cover a
-     * whole device sector (e.g. a single 512-byte GPT/MBR sector on a 4K
-     * SSD) must read the surrounding device sector, splice, and write it
-     * back. One page covers any device LBA size we accept (<= PAGE_SIZE).
-     * Page-aligned, so PRP1 alone describes the whole transfer. Reused per
-     * command -- safe under the single-outstanding-command model. */
-    uint64_t           bounce_phys;
-    void              *bounce;
+    /* ---- I/O queue command queuing (multiple commands in flight) ----
+     *
+     * The I/O queue (qid 1) keeps up to NVME_QDEPTH commands outstanding
+     * at once. Each carries a unique CID in [0, NVME_QDEPTH); `free_cids`
+     * is a bitmap of available CIDs and `inflight[cid]` points at the
+     * blk_io waiting on it. `io_lock` serializes SQ submission, CQ
+     * draining, and the bitmap across the submitter(s) + the completion
+     * IRQ. PRP-list pages for >2-page transfers and the 4K-RMW bounce are
+     * allocated transiently per op (both paths are infrequent), so there
+     * is no per-CID DMA table to size or leak. */
+    spinlock_t         io_lock;
+    uint64_t           free_cids;       /* bit i set => CID i is free */
+    struct blk_io     *inflight[NVME_QDEPTH];
+    volatile uint64_t  inflight_now;    /* current outstanding I/O count   */
+    volatile uint64_t  max_inflight;    /* high-water mark (diagnostic)     */
+    volatile bool      io_ready;        /* I/O queue built -> reap CQ       */
 
     /* MSI bring-up state. irq_enabled is set if pci_msi_enable() and
      * irq_alloc_vector() both succeeded; we only flip IEN in CREATE
@@ -276,11 +287,17 @@ static int wait_until32(volatile uint8_t *reg, uint32_t mask,
 
 /* Convert a kernel virtual buffer + length into PRP1/PRP2. Walks page
  * by page using vmm_translate, so heap-allocated buffers (which can
- * span page boundaries with arbitrary phys layout) Just Work. The
- * controller's prp_list scratch page is reused for every command --
- * safe because we only ever have one outstanding I/O. */
-static int build_prp(struct nvme_controller *c, void *buf, uint32_t bytes,
-                     uint64_t *out_prp1, uint64_t *out_prp2) {
+ * span page boundaries with arbitrary phys layout) Just Work.
+ *
+ * For transfers spanning >2 pages a PRP-list page is needed; since
+ * multiple commands can now be in flight at once, the list page is
+ * allocated transiently here (returned via *out_prp_page) and freed by
+ * the caller once the command completes -- there is no shared scratch
+ * page. *out_prp_page is 0 when no list was needed. */
+static int build_prp(void *buf, uint32_t bytes,
+                     uint64_t *out_prp1, uint64_t *out_prp2,
+                     uint64_t *out_prp_page) {
+    *out_prp_page = 0;
     uint64_t v        = (uint64_t)buf;
     uint64_t page_off = v & (PAGE_SIZE - 1);
     uint32_t in_first = (uint32_t)(PAGE_SIZE - page_off);
@@ -303,29 +320,34 @@ static int build_prp(struct nvme_controller *c, void *buf, uint32_t bytes,
     }
 
     /* > 2 pages -- need a PRP list. The list contains one 8-byte phys
-     * per remaining page. With one 4 KiB list page = 512 entries we
-     * support up to 512 + 1 = 513 pages = ~2 MiB per command, which
-     * comfortably bounds NVME_MAX_BYTES_PER_OP (256 KiB = 64 pages). */
+     * per remaining page. One 4 KiB list page = 512 entries supports up
+     * to 512 + 1 = 513 pages = ~2 MiB per command, comfortably bounding
+     * NVME_MAX_BYTES_PER_OP (256 KiB = 64 pages). */
+    uint64_t pg = pmm_alloc_page();
+    if (!pg) return -3;
+    uint64_t *list = (uint64_t *)pmm_phys_to_virt(pg);
     uint32_t n = 0;
     uint64_t v_iter = v2;
     while (after > 0) {
-        if (n >= NVME_PRP_LIST_ENTRIES) return -3;
+        if (n >= NVME_PRP_LIST_ENTRIES) { pmm_free_page(pg); return -4; }
         uint64_t phys = vmm_translate(v_iter);
-        if (phys == 0) return -4;
-        c->prp_list[n++] = phys;
+        if (phys == 0) { pmm_free_page(pg); return -5; }
+        list[n++] = phys;
         v_iter += PAGE_SIZE;
         after = after > PAGE_SIZE ? after - PAGE_SIZE : 0;
     }
-    *out_prp2 = c->prp_list_phys;
+    *out_prp2      = pg;
+    *out_prp_page  = pg;
     return 0;
 }
 
-/* ---- core submit + poll ---------------------------------------- */
+/* ---- admin submit + poll (single outstanding) ------------------ */
 
-/* Submit `sqe` to `q` and busy-wait for its completion. Returns 0 on
- * success, <0 on timeout / error. The caller fills opc / nsid / CDWs
- * / PRPs; we stamp the CID, ring the SQ tail doorbell, then poll the
- * CQ for a phase-tag flip with our CID. */
+/* Submit `sqe` to `q` (the ADMIN queue) and busy-wait for completion.
+ * Admin commands (IDENTIFY, CREATE I/O SQ/CQ) run once at init, single-
+ * threaded, before IRQs are unmasked, so the simple submit-then-poll
+ * model is fine here. The I/O queue uses the async path below instead.
+ * Returns 0 on success, <0 on timeout / error. */
 static int nvme_submit_sync(struct nvme_controller *c, struct nvme_queue *q,
                             struct nvme_sqe *sqe) {
     uint16_t cid = c->next_cid++;
@@ -373,25 +395,114 @@ static int nvme_submit_sync(struct nvme_controller *c, struct nvme_queue *q,
     }
 }
 
-/* ---- read / write --------------------------------------------- */
+/* ---- I/O queue: async submit + completion reaping -------------- */
 
-/* Submit one I/O command addressed in NATIVE device LBAs. The caller
- * has already turned a buffer into PRP1/PRP2 (or knows them, as the
- * bounce path does). NLB is a 0-based count. */
-static int nvme_submit_io(struct nvme_namespace *ns, uint64_t dev_lba,
-                          uint32_t dev_count, uint64_t prp1, uint64_t prp2,
-                          bool is_write) {
+/* Allocate a free I/O CID (caller holds io_lock). -1 if all busy. We
+ * cap usable CIDs at NVME_QDEPTH-1 (see free_cids init) so the SQ ring
+ * tail can never lap the controller's head. */
+static int nvme_alloc_cid(struct nvme_controller *c) {
+    if (c->free_cids == 0) return -1;
+    int cid = __builtin_ctzll(c->free_cids);
+    c->free_cids &= ~((uint64_t)1 << cid);
+    return cid;
+}
+
+/* Drain the I/O completion queue: for every CQE whose phase tag has
+ * flipped, complete the waiting blk_io, free its CID, and advance the
+ * CQ-head doorbell. Safe to call from the completion IRQ AND from a
+ * busy-poll/yield waiter -- io_lock makes the two mutually exclusive, so
+ * each CQE is consumed exactly once. */
+static void nvme_io_poll(struct nvme_controller *c) {
+    /* The completion IRQ can fire during early init (e.g. on an admin
+     * command) before the I/O queue exists -- c->io.cq is still NULL and
+     * its depth 0. Until the I/O queue is built, there is nothing to reap
+     * here (admin completions are handled by nvme_submit_sync's poll). */
+    if (!c->io_ready) return;
+    struct nvme_queue *q = &c->io;
+    uint64_t f = spin_lock_irqsave(&c->io_lock);
+    for (;;) {
+        struct nvme_cqe *cqe = &q->cq[q->cq_head];
+        uint16_t status = cqe->status;
+        if ((status & 1u) != q->cq_phase) break;     /* no new completion */
+
+        uint16_t cid = cqe->cid;
+        uint16_t sf  = (uint16_t)(status >> 1);
+
+        q->cq_head = (uint16_t)((q->cq_head + 1u) % q->depth);
+        if (q->cq_head == 0) q->cq_phase ^= 1u;
+        *q->cq_dbl = q->cq_head;
+
+        if (cid < NVME_QDEPTH && c->inflight[cid]) {
+            struct blk_io *io = c->inflight[cid];
+            c->inflight[cid]  = 0;
+            c->free_cids     |= ((uint64_t)1 << cid);
+            if (c->inflight_now) c->inflight_now--;
+            if (sf != 0)
+                kprintf("[nvme] I/O cid=%u failed sf=0x%04x\n", cid, sf);
+            blk_io_complete(io, sf != 0 ? -2 : 0);
+        } else {
+            kprintf("[nvme] WARN: completion for stray cid=%u sf=0x%04x\n",
+                    cid, sf);
+            if (cid < NVME_QDEPTH) c->free_cids |= ((uint64_t)1 << cid);
+        }
+    }
+    spin_unlock_irqrestore(&c->io_lock, f);
+}
+
+static void nvme_io_poll_cb(void *ctx) {
+    nvme_io_poll((struct nvme_controller *)ctx);
+}
+
+/* Submit one I/O command (native LBAs, NLB = count-1) asynchronously:
+ * stamp a fresh CID, write the SQE, ring the SQ-tail doorbell, record
+ * `io` against the CID. Returns 0 on submit, -1 if the queue is full. */
+static int nvme_submit_io_async(struct nvme_namespace *ns, struct blk_io *io,
+                                uint64_t dev_lba, uint32_t dev_count,
+                                uint64_t prp1, uint64_t prp2, bool is_write) {
     struct nvme_controller *c = ns->ctrl;
-    struct nvme_sqe sqe;
-    memset(&sqe, 0, sizeof(sqe));
-    sqe.opc   = is_write ? NVME_IO_WRITE : NVME_IO_READ;
-    sqe.nsid  = ns->nsid;
-    sqe.prp1  = prp1;
-    sqe.prp2  = prp2;
-    sqe.cdw10 = (uint32_t)(dev_lba & 0xFFFFFFFFu);
-    sqe.cdw11 = (uint32_t)(dev_lba >> 32);
-    sqe.cdw12 = (uint32_t)((dev_count - 1u) & 0xFFFFu);   /* NLB = count-1 */
-    return nvme_submit_sync(c, &c->io, &sqe);
+    struct nvme_queue      *q = &c->io;
+
+    uint64_t f = spin_lock_irqsave(&c->io_lock);
+    int cid = nvme_alloc_cid(c);
+    if (cid < 0) { spin_unlock_irqrestore(&c->io_lock, f); return -1; }
+
+    struct nvme_sqe *slot = &q->sq[q->sq_tail];
+    memset(slot, 0, sizeof(*slot));
+    slot->opc   = is_write ? NVME_IO_WRITE : NVME_IO_READ;
+    slot->cid   = (uint16_t)cid;
+    slot->nsid  = ns->nsid;
+    slot->prp1  = prp1;
+    slot->prp2  = prp2;
+    slot->cdw10 = (uint32_t)(dev_lba & 0xFFFFFFFFu);
+    slot->cdw11 = (uint32_t)(dev_lba >> 32);
+    slot->cdw12 = (uint32_t)((dev_count - 1u) & 0xFFFFu);
+
+    q->sq_tail = (uint16_t)((q->sq_tail + 1u) % q->depth);
+    *q->sq_dbl = q->sq_tail;
+
+    c->inflight[cid] = io;
+    c->inflight_now++;
+    if (c->inflight_now > c->max_inflight) c->max_inflight = c->inflight_now;
+    spin_unlock_irqrestore(&c->io_lock, f);
+    return 0;
+}
+
+/* Submit one I/O op and wait for it. The wait cooperatively yields when
+ * safe (so other procs keep the queue full) and otherwise busy-polls.
+ * If the queue is momentarily full we reap completions and retry. */
+static int nvme_io_submit_wait(struct nvme_namespace *ns, uint64_t dev_lba,
+                               uint32_t dev_count, uint64_t prp1, uint64_t prp2,
+                               bool is_write) {
+    struct nvme_controller *c = ns->ctrl;
+    struct blk_io io;
+    blk_io_prep(&io, dev_lba, dev_count, 0, is_write);
+
+    while (nvme_submit_io_async(ns, &io, dev_lba, dev_count,
+                                prp1, prp2, is_write) != 0) {
+        nvme_io_poll(c);                 /* free a CID by reaping a CQE */
+        __asm__ volatile ("pause");
+    }
+    return blk_io_wait(&io, nvme_io_poll_cb, c);
 }
 
 /* Transfer `dev_count` NATIVE device sectors at native LBA `dev_lba`
@@ -399,44 +510,44 @@ static int nvme_submit_io(struct nvme_namespace *ns, uint64_t dev_lba,
  * per-op cap by the caller. */
 static int nvme_io_dev(struct nvme_namespace *ns, uint64_t dev_lba,
                        uint32_t dev_count, void *buf, bool is_write) {
-    struct nvme_controller *c = ns->ctrl;
     uint32_t bytes = dev_count * ns->lba_size;
-
-    /* Build PRPs into locals first; assigning them into a packed SQE
-     * field via &sqe.prp1 trips the compiler's "address of packed
-     * member may be unaligned" warning even though our SQEs always
-     * land on 8-byte boundaries (stack alloc + 64 B struct). */
-    uint64_t prp1 = 0, prp2 = 0;
-    if (build_prp(c, buf, bytes, &prp1, &prp2) != 0) {
+    uint64_t prp1 = 0, prp2 = 0, prp_pg = 0;
+    if (build_prp(buf, bytes, &prp1, &prp2, &prp_pg) != 0) {
         kprintf("[nvme] build_prp failed (buf=%p bytes=%u)\n", buf, bytes);
         return -1;
     }
-    return nvme_submit_io(ns, dev_lba, dev_count, prp1, prp2, is_write);
+    int st = nvme_io_submit_wait(ns, dev_lba, dev_count, prp1, prp2, is_write);
+    if (prp_pg) pmm_free_page(prp_pg);    /* list page lived to completion */
+    return st;
 }
 
 /* Read-modify-write one PARTIAL native device sector: the caller wants
  * `n` 512-byte logical sectors starting `off` 512-byte sectors into
- * native sector `dev_lba`. Always reads the device sector first (to
- * preserve the bytes we aren't touching on a write), then either copies
- * out (read) or splices + writes back (write). Serialised by the
- * single-outstanding-command model -- the bounce page is shared. */
+ * native sector `dev_lba`. Reads the surrounding device sector first (to
+ * preserve the bytes we aren't touching on a write), then copies out
+ * (read) or splices + writes back (write). The bounce is a transient
+ * page-aligned page private to this call, so concurrent RMWs don't
+ * collide. PRP1 = bounce phys (one device sector <= PAGE_SIZE). */
 static int nvme_rmw_partial(struct nvme_namespace *ns, uint64_t dev_lba,
                             uint32_t off, uint32_t n, uint8_t *buf,
                             bool is_write) {
-    struct nvme_controller *c = ns->ctrl;
-    uint8_t *bb = (uint8_t *)c->bounce;
+    uint64_t bp = pmm_alloc_page();
+    if (!bp) return -1;
+    uint8_t *bb = (uint8_t *)pmm_phys_to_virt(bp);
 
-    int rc = nvme_submit_io(ns, dev_lba, 1, c->bounce_phys, 0, /*write*/ false);
-    if (rc != 0) return rc;
-
-    if (is_write) {
-        memcpy(bb + (size_t)off * BLK_SECTOR_SIZE, buf,
-               (size_t)n * BLK_SECTOR_SIZE);
-        return nvme_submit_io(ns, dev_lba, 1, c->bounce_phys, 0, /*write*/ true);
+    int rc = nvme_io_submit_wait(ns, dev_lba, 1, bp, 0, /*write*/ false);
+    if (rc == 0) {
+        if (is_write) {
+            memcpy(bb + (size_t)off * BLK_SECTOR_SIZE, buf,
+                   (size_t)n * BLK_SECTOR_SIZE);
+            rc = nvme_io_submit_wait(ns, dev_lba, 1, bp, 0, /*write*/ true);
+        } else {
+            memcpy(buf, bb + (size_t)off * BLK_SECTOR_SIZE,
+                   (size_t)n * BLK_SECTOR_SIZE);
+        }
     }
-    memcpy(buf, bb + (size_t)off * BLK_SECTOR_SIZE,
-           (size_t)n * BLK_SECTOR_SIZE);
-    return 0;
+    pmm_free_page(bp);
+    return rc;
 }
 
 /* The block layer addresses us in 512-byte logical sectors; the device
@@ -535,15 +646,15 @@ static int nvme_identify(struct nvme_controller *c, uint32_t cns,
 }
 
 /* MSI handler. Called from the dyn-vector trampoline (which already
- * sent apic_eoi). We don't drain CQEs here -- nvme_submit_sync still
- * polls the phase tag and rings the head doorbell. We only bump the
- * diagnostic counter so test sweeps can prove the controller actually
- * fired its MSI. (Once the M22 step-5 scheduler arrives, this is
- * where we'd wake any task sleeping on the queue.) */
+ * sent apic_eoi). Drains the I/O completion queue, completing every
+ * finished command (which sets each waiter's blk_io done flag); the
+ * waiters then stop yielding and return. Also bumps a diagnostic counter
+ * so test sweeps can confirm the controller really fired its MSI. */
 static void nvme_irq_handler(void *ctx) {
     struct nvme_controller *c = (struct nvme_controller *)ctx;
     if (!c) return;
     c->irq_count++;
+    nvme_io_poll(c);
 }
 
 /* CREATE I/O CQ (qid 1). PC=1 always; IEN=1 only when MSI is live so
@@ -635,29 +746,19 @@ static int nvme_init_controller(struct nvme_controller *c) {
         }
     }
 
-    /* Allocate admin queues + the shared PRP-list scratch page. */
+    /* Allocate admin queues. PRP-list pages and the 4K-RMW bounce are
+     * now allocated transiently per op (see build_prp / nvme_rmw_partial),
+     * so there is no shared scratch page to set up here. */
     if (alloc_queue(c, &c->admin, 0) != 0) {
         kprintf("[nvme] PMM out of memory for admin queues\n");
         return -4;
     }
-    c->prp_list_phys = pmm_alloc_page();
-    if (!c->prp_list_phys) {
-        kprintf("[nvme] PMM out of memory for PRP list page\n");
-        return -5;
-    }
-    c->prp_list = (uint64_t *)pmm_phys_to_virt(c->prp_list_phys);
-    memset(c->prp_list, 0, PAGE_SIZE);
 
-    /* Bounce page for partial-sector RMW on 4K-LBA namespaces (see
-     * struct nvme_controller). Allocated unconditionally -- it's one
-     * page and keeps the 512-byte and 4K paths uniform. */
-    c->bounce_phys = pmm_alloc_page();
-    if (!c->bounce_phys) {
-        kprintf("[nvme] PMM out of memory for bounce page\n");
-        return -12;
-    }
-    c->bounce = pmm_phys_to_virt(c->bounce_phys);
-    memset(c->bounce, 0, PAGE_SIZE);
+    /* I/O command-queuing state: all CIDs free except the top one (kept
+     * reserved so the SQ ring tail can never lap the controller head),
+     * empty in-flight table. io_lock + inflight[] were already zeroed by
+     * the memset in nvme_pci_probe (SPINLOCK_INIT is {0} = unlocked). */
+    c->free_cids = ((uint64_t)1 << (NVME_QDEPTH - 1)) - 1u;   /* CIDs 0..62 */
 
     /* Program the admin queue base addresses + sizes. AQA encodes
      * SQ_size_minus_1 (low 12 bits) and CQ_size_minus_1 (bits 27:16). */
@@ -733,6 +834,9 @@ static int nvme_init_controller(struct nvme_controller *c) {
         pmm_free_page(id_phys);
         return -11;
     }
+
+    /* I/O queue is live: completions may now be reaped from the CQ. */
+    c->io_ready = true;
 
     /* IDENTIFY each namespace and register the ones we can support. */
     int registered = 0;
@@ -942,6 +1046,7 @@ static struct pci_driver g_nvme_driver = {
  */
 #define NVME4K_WIN_SECTORS  16u
 #define NVME4K_BASE_LBA     128u
+#define NVME_CC_K           8u     /* concurrent commands in the step-4 batch */
 
 static void nvme4k_fill(uint8_t *b, size_t n, uint32_t seed) {
     for (size_t i = 0; i < n; i++)
@@ -1024,6 +1129,95 @@ void blk_nvme_selftest(void) {
     /* Restore the original window contents. */
     if (blk_write(dev, base, NVME4K_WIN_SECTORS, orig) != 0)
         kprintf("[NVME4K] WARN -- restore write failed\n");
+
+    /* 4. Command queuing: submit K commands at once -- without waiting
+     *    between them -- so multiple are in flight, then reap all. Proves
+     *    (a) the hardware queue holds >1 outstanding command, and (b) each
+     *    command's CID routes its DMA to the right buffer (concurrent
+     *    write of K distinct patterns, concurrent read-back, per-buffer
+     *    verify). The completion IRQ is masked across the batch submit so
+     *    the peak in-flight count is deterministic; the waits reap via the
+     *    poll callback. Non-destructive (saves/restores K device sectors).
+     */
+    {
+        struct nvme_controller *c = ns->ctrl;
+        const uint32_t  K    = NVME_CC_K;
+        const uint32_t  dls  = ns->lba_size;                /* device sector */
+        const uint64_t  ndev = dev->sector_count / ns->sec_ratio;
+        const uint64_t  dbase = (base / ns->sec_ratio) + 2; /* clear of 1-3   */
+
+        if (ndev < dbase + K) {
+            kprintf("[NVME4K] step4 concurrency: SKIP (device too small)\n");
+        } else {
+            static uint8_t csave[NVME_CC_K][4096];
+            static uint8_t cdata[NVME_CC_K][4096];
+            static uint8_t cexp [4096];
+            struct blk_io  io  [NVME_CC_K];
+            uint64_t       p1  [NVME_CC_K], p2[NVME_CC_K], pg[NVME_CC_K];
+            bool ok4 = true;
+
+            /* Save the region (sequentially -- correctness baseline). */
+            for (uint32_t k = 0; k < K; k++)
+                if (nvme_io_dev(ns, dbase + k, 1, csave[k], false) != 0) ok4 = false;
+
+            /* Batched concurrent WRITE of K distinct patterns. */
+            for (uint32_t k = 0; k < K; k++) nvme4k_fill(cdata[k], dls, 0xC0u + k);
+            reg_w32(c->bar, NVME_INTMS, 0x1u);              /* mask completions */
+            c->max_inflight = 0;
+            for (uint32_t k = 0; k < K; k++) {
+                pg[k] = 0;
+                if (build_prp(cdata[k], dls, &p1[k], &p2[k], &pg[k]) != 0) ok4 = false;
+                blk_io_prep(&io[k], dbase + k, 1, cdata[k], true);
+                while (nvme_submit_io_async(ns, &io[k], dbase + k, 1,
+                                            p1[k], p2[k], true) != 0) {
+                    nvme_io_poll(c); __asm__ volatile ("pause");
+                }
+            }
+            reg_w32(c->bar, NVME_INTMC, 0x1u);              /* unmask           */
+            uint64_t peak_w = c->max_inflight;
+            for (uint32_t k = 0; k < K; k++) {
+                if (blk_io_wait(&io[k], nvme_io_poll_cb, c) != 0) ok4 = false;
+                if (pg[k]) pmm_free_page(pg[k]);
+            }
+
+            /* Batched concurrent READ-back into zeroed buffers. */
+            for (uint32_t k = 0; k < K; k++) memset(cdata[k], 0, dls);
+            reg_w32(c->bar, NVME_INTMS, 0x1u);
+            c->max_inflight = 0;
+            for (uint32_t k = 0; k < K; k++) {
+                pg[k] = 0;
+                if (build_prp(cdata[k], dls, &p1[k], &p2[k], &pg[k]) != 0) ok4 = false;
+                blk_io_prep(&io[k], dbase + k, 1, cdata[k], false);
+                while (nvme_submit_io_async(ns, &io[k], dbase + k, 1,
+                                            p1[k], p2[k], false) != 0) {
+                    nvme_io_poll(c); __asm__ volatile ("pause");
+                }
+            }
+            reg_w32(c->bar, NVME_INTMC, 0x1u);
+            uint64_t peak_r = c->max_inflight;
+            for (uint32_t k = 0; k < K; k++) {
+                if (blk_io_wait(&io[k], nvme_io_poll_cb, c) != 0) ok4 = false;
+                if (pg[k]) pmm_free_page(pg[k]);
+            }
+
+            /* Each buffer must hold ITS pattern (CID routed DMA correctly). */
+            for (uint32_t k = 0; k < K; k++) {
+                nvme4k_fill(cexp, dls, 0xC0u + k);
+                if (memcmp(cdata[k], cexp, dls) != 0) ok4 = false;
+            }
+
+            /* Restore. */
+            for (uint32_t k = 0; k < K; k++)
+                if (nvme_io_dev(ns, dbase + k, 1, csave[k], true) != 0) ok4 = false;
+
+            bool depth_ok = (peak_w >= 2) || (peak_r >= 2);
+            if (!ok4 || !depth_ok) fails++;
+            kprintf("[NVME4K] step4 concurrency: %s "
+                    "(peak in-flight write=%lu read=%lu of %u)\n",
+                    (ok4 && depth_ok) ? "PASS" : "FAIL",
+                    (unsigned long)peak_w, (unsigned long)peak_r, (unsigned)K);
+        }
+    }
 
     kprintf("[NVME4K] %s (%d failure(s))\n",
             fails == 0 ? "PASS" : "FAIL", fails);

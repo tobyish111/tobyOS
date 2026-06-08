@@ -83,6 +83,13 @@ static inline uint64_t read_rflags(void) {
     return v;
 }
 
+/* RFLAGS.IF (bit 9). False means a spin_lock_irqsave region is active (or
+ * we're otherwise in a non-preemptible context) -- callers that want to
+ * cooperatively yield must NOT do so while interrupts are masked. */
+static inline bool interrupts_enabled(void) {
+    return (read_rflags() & (1u << 9)) != 0;
+}
+
 static inline void write_cr3(uint64_t v) {
     __asm__ volatile ("mov %0, %%cr3" : : "r"(v) : "memory");
 }

@@ -25,9 +25,47 @@
 #include <tobyos/blk.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+#include <tobyos/cpu.h>
+#include <tobyos/proc.h>
+#include <tobyos/sched.h>
 
 static struct blk_dev *g_devs[BLK_MAX_DEVICES];
 static size_t          g_count;
+
+/* ---- async block I/O wait/complete (command queuing) -------------
+ *
+ * See blk.h. blk_io_complete is a release store (callable from the
+ * device completion IRQ); blk_io_wait cooperatively yields between
+ * driver poll passes when it is safe to, otherwise busy-polls. */
+
+static volatile bool g_blk_yield_ready;
+
+void blk_set_yield_ready(void) { g_blk_yield_ready = true; }
+
+void blk_io_complete(struct blk_io *io, int status) {
+    if (!io) return;
+    io->status = status;
+    /* Publish status before done so a waiter that sees done==true also
+     * sees the final status (x86 is TSO, but make the order explicit). */
+    __atomic_store_n(&io->done, true, __ATOMIC_RELEASE);
+}
+
+int blk_io_wait(struct blk_io *io, void (*poll)(void *), void *poll_ctx) {
+    if (!io) return -1;
+    /* Yield only when the scheduler is up, interrupts are enabled (no
+     * spinlock held), and we have a proc to yield from. Otherwise the
+     * completion IRQ can't fire / it isn't safe to switch -- busy-poll
+     * the hardware via the driver's reaper instead. */
+    bool can_yield = g_blk_yield_ready && interrupts_enabled() &&
+                     current_proc() != NULL;
+    while (!__atomic_load_n(&io->done, __ATOMIC_ACQUIRE)) {
+        if (poll) poll(poll_ctx);        /* harvest finished tags now   */
+        if (__atomic_load_n(&io->done, __ATOMIC_ACQUIRE)) break;
+        if (can_yield) sched_yield();    /* let others run + submit I/O */
+        else __asm__ volatile ("pause");
+    }
+    return io->status;
+}
 
 void blk_register(struct blk_dev *dev) {
     if (!dev || !dev->ops || !dev->ops->read) {
