@@ -44,6 +44,8 @@
 #include <tobyos/smp.h>
 #include <tobyos/spinlock.h>
 #include <tobyos/watchdog.h>
+#include <tobyos/pit.h>
+#include <tobyos/isr.h>
 
 /* The SYSCALL trampoline now loads its kernel stack from this CPU's
  * percpu->syscall_rsp (gs:[0]); the scheduler updates it on every switch. */
@@ -104,8 +106,21 @@ void sched_init(void) {
 
 /* ---------- queue helpers (callers must hold per-CPU ready_lock) ---------- */
 
+/* Effective priority = base class priority + an aging boost that grows with
+ * how long the proc has waited READY-but-not-running since `enq_tick`. The
+ * boost guarantees a starved low-priority proc eventually out-ranks a busy
+ * high-priority one (anti-starvation), bounding worst-case wait. `now` is the
+ * global PIT tick. */
+static inline int eff_prio(const struct proc *p, uint64_t now) {
+    uint64_t waited = (now > p->enq_tick) ? (now - p->enq_tick) : 0;
+    int boost = (int)(waited / (uint64_t)SCHED_AGE_STEP_TICKS);
+    if (boost > SCHED_AGE_MAX_BOOST) boost = SCHED_AGE_MAX_BOOST;
+    return p->prio + boost;
+}
+
 static void queue_push_locked(struct percpu *cpu, struct proc *p) {
     p->next_ready = 0;
+    p->enq_tick   = pit_ticks();       /* start the aging clock for this wait */
     if (cpu->ready_tail) {
         cpu->ready_tail->next_ready = p;
         cpu->ready_tail = p;
@@ -116,18 +131,33 @@ static void queue_push_locked(struct percpu *cpu, struct proc *p) {
 
 static void queue_push_front_locked(struct percpu *cpu, struct proc *p) {
     if (!p) return;
+    p->enq_tick   = pit_ticks();
     p->next_ready = cpu->ready_head;
     cpu->ready_head = p;
     if (!cpu->ready_tail) cpu->ready_tail = p;
 }
 
+/* Unlink + return the highest-effective-priority proc on cpu's queue, or NULL.
+ * Ties are broken FIFO (the queue is walked head->tail and a strictly-greater
+ * test keeps the first/oldest contender), so equal-priority procs round-robin
+ * exactly as the old plain-FIFO pop did -- which is why a tree of all-NORMAL
+ * procs behaves identically to before. */
 static struct proc *queue_pop_locked(struct percpu *cpu) {
-    struct proc *p = cpu->ready_head;
-    if (!p) return 0;
-    cpu->ready_head = p->next_ready;
-    if (!cpu->ready_head) cpu->ready_tail = 0;
-    p->next_ready = 0;
-    return p;
+    uint64_t now = pit_ticks();
+    struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
+    int best_eff = 0;
+    while (p) {
+        int eff = eff_prio(p, now);
+        if (!best || eff > best_eff) { best = p; best_prev = prev; best_eff = eff; }
+        prev = p;
+        p = p->next_ready;
+    }
+    if (!best) return 0;
+    if (best_prev) best_prev->next_ready = best->next_ready;
+    else           cpu->ready_head       = best->next_ready;
+    if (cpu->ready_tail == best) cpu->ready_tail = best_prev;
+    best->next_ready = 0;
+    return best;
 }
 
 static bool queue_remove_locked(struct percpu *cpu, struct proc *p) {
@@ -151,23 +181,28 @@ static bool queue_remove_locked(struct percpu *cpu, struct proc *p) {
     return true;
 }
 
-/* Unlink + return the first NON-idle runnable proc from cpu's queue, or NULL.
- * Idle procs (pid 0, ap_idle) are pinned to their home core and must never be
- * migrated, so work-stealing skips them. */
+/* Unlink + return the highest-effective-priority NON-idle runnable proc from
+ * cpu's queue, or NULL. Idle procs (pid 0, ap_idle) are pinned to their home
+ * core and must never be migrated, so work-stealing skips them. Same FIFO-tie
+ * + aging policy as queue_pop_locked. */
 static struct proc *queue_steal_locked(struct percpu *cpu) {
-    struct proc *prev = 0, *p = cpu->ready_head;
+    uint64_t now = pit_ticks();
+    struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
+    int best_eff = 0;
     while (p) {
         if (!p->is_idle) {
-            if (prev) prev->next_ready = p->next_ready;
-            else      cpu->ready_head  = p->next_ready;
-            if (cpu->ready_tail == p) cpu->ready_tail = prev;
-            p->next_ready = 0;
-            return p;
+            int eff = eff_prio(p, now);
+            if (!best || eff > best_eff) { best = p; best_prev = prev; best_eff = eff; }
         }
         prev = p;
         p = p->next_ready;
     }
-    return 0;
+    if (!best) return 0;
+    if (best_prev) best_prev->next_ready = best->next_ready;
+    else           cpu->ready_head       = best->next_ready;
+    if (cpu->ready_tail == best) cpu->ready_tail = best_prev;
+    best->next_ready = 0;
+    return best;
 }
 
 /* Find one runnable non-idle proc to run on `me`: our own queue first, then
@@ -203,6 +238,7 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
     perf_zone_end(PERF_Z_SCHED_SWITCH, t);
 
     to->state       = PROC_RUNNING;
+    to->quantum_left = sched_quantum_for(to->prio);  /* fresh timeslice */
     g_current_proc  = to;
     me->current     = to;
     tss_set_rsp0((uint64_t)to->kstack_top);
@@ -252,6 +288,24 @@ void sched_boost_pid(int pid) {
     (void)queue_remove_locked(cpu, p);
     queue_push_front_locked(cpu, p);
     spin_unlock_irqrestore(&cpu->ready_lock, flags);
+}
+
+int sched_set_prio(int pid, int prio) {
+    struct proc *p = proc_lookup(pid);
+    if (!p) return SCHED_PRIO_NONE;
+    if (prio < PRIO_MIN) prio = PRIO_MIN;
+    if (prio > PRIO_MAX) prio = PRIO_MAX;
+    p->prio = prio;
+    /* Re-base the quantum so a live raise/lower takes effect within a tick
+     * rather than only at the next switch-in. Bounded to the new class slice. */
+    if (p->quantum_left > sched_quantum_for(prio))
+        p->quantum_left = sched_quantum_for(prio);
+    return prio;
+}
+
+int sched_get_prio(int pid) {
+    struct proc *p = proc_lookup(pid);
+    return p ? p->prio : SCHED_PRIO_NONE;
 }
 
 void sched_yield(void) {
@@ -385,18 +439,40 @@ void sched_idle(void) {
 
 /* ---------- LAPIC timer tick ---------- */
 
-void sched_tick(void) {
+void sched_tick(struct regs *r) {
     struct percpu *me = smp_this_cpu();
     if (me) me->timer_ticks++;
     /* M28C: count scheduler-tick events as heartbeats too. */
     wdog_kick_sched();
-    /* Preemption hook: in v1 the BSP still preempts cooperatively
-     * via sched_yield calls scattered through syscalls + proc_exit
-     * + proc_wait, so this ISR doesn't force a switch. A future v2
-     * can call sched_yield() from here on the BSP if the current
-     * proc has consumed its quantum -- but that requires careful
-     * audit of every kprintf path that could be reached from inside
-     * a timer ISR (since sched_yield touches the heap via proc
-     * accounting, and the heap isn't yet locked for SMP). For now
-     * we just count ticks; user-visible preemption is unchanged. */
+
+    /* ---- Fair timeslicing (preemptive) ---------------------------------
+     *
+     * Only ever preempt when the timer interrupted ring-3 USER code. There the
+     * interrupted proc holds no kernel spinlock and not the BKL, so forcing a
+     * sched_yield() from this ISR is exactly as safe as the PIT's long-standing
+     * ring-3 preemption (pit.c). A CPL-0 tick interrupted kernel code that may
+     * hold a lock (heap, ready_lock, a driver lock) -- yielding there could
+     * deadlock, so we just count those.
+     *
+     * This is what gives APs fair timeslicing: only the BSP receives the PIT
+     * IRQ, so before this a CPU-bound proc stolen onto an AP ran until it
+     * blocked or exited, monopolising that core. Now its per-CPU LAPIC timer
+     * burns down its quantum and rotates it for the next runnable proc. The
+     * quantum was sized by class in do_switch (sched_quantum_for), so higher-
+     * priority procs get a proportionally longer slice. */
+    if (!r || (r->cs & 3) != 3) return;
+
+    struct proc *cur = current_proc();
+    if (!cur || cur->is_idle) return;        /* never preempt pid 0 / ap_idle */
+
+    if (cur->quantum_left > 0) cur->quantum_left--;
+    if (cur->quantum_left > 0) return;        /* slice not spent yet */
+
+    /* Slice spent: rotate. sched_yield() demotes cur to READY (re-enqueued on
+     * this CPU, refreshing its aging stamp) and context-switches to the highest
+     * effective-priority runnable proc -- which also lets a higher-priority
+     * proc that became ready mid-slice preempt cur here. do_switch resets the
+     * winner's quantum on the way in. The user trap frame is already saved on
+     * this kstack; we resume here and iretq normally when cur is rescheduled. */
+    sched_yield();
 }

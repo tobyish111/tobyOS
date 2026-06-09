@@ -3819,5 +3819,76 @@ void _start(void) {
     }
 #endif
 
+#ifdef SCHEDPRIO_BOOT
+    /* Opt-in priority-scheduling + fair-timeslicing proof
+     * (EXTRA_CFLAGS+=-DSCHEDPRIO_BOOT). Run under the DEFAULT QEMU CPU (no
+     * +smap): these workers take argv, and argc>=1 first-run on an AP under
+     * SMAP is the separate open real-HW bug -- irrelevant here.
+     *
+     * Spawn 6 identical timed CPU-bound workers (more than the 4 cores, so they
+     * must contend) onto a 4-CPU machine, three at PRIO_HIGH and three at
+     * PRIO_LOW. Each runs the SAME ~1500 ms wall window, so the CPU each one
+     * accumulates (cpu_ns, captured at reap by proc_wait_info) is a direct
+     * measure of the share the scheduler gave it. We assert two things:
+     *   (1) every worker got SOME CPU (cpu_ns > 0) -> nothing starved, which is
+     *       only possible because aging lifts the LOW procs and the per-AP LAPIC
+     *       timer preempts the running ones so queued procs get a turn;
+     *   (2) the HIGH group averaged materially more CPU than the LOW group
+     *       -> priority actually steers the dispatcher. */
+    {
+        char *av[]  = { "mctest", "1500", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/mctest", .name = "mctest",
+            .argc = 2, .argv = av, .envc = 0, .envp = 0,
+        };
+        const int N = 6;
+        int      pids[6];
+        uint64_t cpu_ns[6];
+        int      prio[6] = { PRIO_HIGH, PRIO_HIGH, PRIO_HIGH,
+                             PRIO_LOW,  PRIO_LOW,  PRIO_LOW };
+
+        kprintf("[boot] SCHEDPRIO: 6 timed workers (3 HIGH + 3 LOW) on %u CPUs\n",
+                smp_online_count());
+        bkl_enter();
+        for (int i = 0; i < N; i++) {
+            pids[i] = proc_spawn(&spec);
+            if (pids[i] > 0) sched_set_prio(pids[i], prio[i]);   /* before they run */
+        }
+        /* Reap in spawn order; cpu_ns is captured pre-reap. All exit ~together
+         * (same wall window), so later waits return near-immediately. */
+        for (int i = 0; i < N; i++) {
+            cpu_ns[i] = 0;
+            if (pids[i] > 0) {
+                struct proc_exit_info info;
+                proc_wait_info(pids[i], &info);
+                cpu_ns[i] = info.cpu_ns;
+            }
+        }
+        bkl_exit();
+
+        uint64_t hi = 0, lo = 0;
+        bool all_ran = true;
+        for (int i = 0; i < N; i++) {
+            if (cpu_ns[i] == 0) all_ran = false;
+            if (prio[i] == PRIO_HIGH) hi += cpu_ns[i]; else lo += cpu_ns[i];
+            kprintf("[boot] SCHEDPRIO:   pid %d prio %d cpu=%llu ms\n",
+                    pids[i], prio[i], (unsigned long long)(cpu_ns[i] / 1000000ULL));
+        }
+        uint64_t hi_avg = hi / 3, lo_avg = lo / 3;
+        /* HIGH should average clearly more than LOW. Require >=1.3x and that no
+         * worker starved. (lo_avg==0 would also fail all_ran.) */
+        bool weighted = lo_avg == 0 ? (hi_avg > 0)
+                                    : (hi_avg * 10ULL >= lo_avg * 13ULL);
+        kprintf("[boot] SCHEDPRIO: HIGH avg=%llu ms  LOW avg=%llu ms  "
+                "(ratio x100=%llu)\n",
+                (unsigned long long)(hi_avg / 1000000ULL),
+                (unsigned long long)(lo_avg / 1000000ULL),
+                (unsigned long long)(lo_avg ? (hi_avg * 100ULL / lo_avg) : 0));
+        kprintf("[boot] SCHEDPRIO: %s (no-starvation=%s, weighted=%s)\n",
+                (all_ran && weighted) ? "PASS" : "FAIL",
+                all_ran ? "yes" : "no", weighted ? "yes" : "no");
+    }
+#endif
+
     idle_loop();
 }

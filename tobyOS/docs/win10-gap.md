@@ -11,7 +11,7 @@ survives clones and any agent can read/update it.
 - When you change a subsystem, update its row, bump the date, and add a line to the Changelog.
 - Be honest: "code present" ≠ "wired" ≠ "robust". Distinguish them.
 
-**Last updated:** 2026-06-08
+**Last updated:** 2026-06-08 (priority scheduling + fair per-AP timeslicing)
 
 ---
 
@@ -41,7 +41,7 @@ honest number.
 
 | Subsystem | Canvas | Now | Notes |
 |---|---|---|---|
-| Scheduler / SMP | ~12% | ~18% | **APs now run user code in parallel.** Per-CPU TSS + SYSCALL stack (GS base, no swapgs) + `current_proc` + AP CR0/CR4/EFER parity + per-CPU SYSCALL MSRs; a syscall-path **big-kernel-lock** serializes kernel entry (and pid 0's `gui_tick`/service work) so user code parallelizes while VFS/GUI/proc-table stay race-free; per-CPU **idle procs** + **work-stealing** distribute work; AP-run gated until boot completes. Measured **~2.6-2.7x on 4 CPU-bound workers**; the GUI desktop is stable (default and under `+smap`). **Known issue:** an `argc>=1` first-run proc that lands on an AP **under SMAP** SMEP-faults (`argc=0` is clean) — under investigation, needs real-HW debugging; non-SMAP is unaffected. No priority classes/MLFQ. |
+| Scheduler / SMP | ~12% | ~21% | **APs run user code in parallel AND the dispatcher is now priority-aware + preemptively timesliced.** Per-CPU TSS + SYSCALL stack (GS base, no swapgs) + `current_proc` + AP CR0/CR4/EFER parity + per-CPU SYSCALL MSRs; a syscall-path **big-kernel-lock** serializes kernel entry (and pid 0's `gui_tick`/service work) so user code parallelizes while VFS/GUI/proc-table stay race-free; per-CPU **idle procs** + **work-stealing** distribute work; AP-run gated until boot completes. Measured **~2.6-2.7x on 4 CPU-bound workers**. **Priority classes** (IDLE/LOW/NORMAL/HIGH/RT, `prio` HIGHER-runs-first, 0==NORMAL default; `SYS_SETPRIORITY`/`GETPRIORITY` + `toby_setprio` libc, uid/root policy) drive a highest-effective-priority dequeue with **FIFO-within-level** and **aging anti-starvation**. **Fair per-AP timeslicing:** the per-CPU LAPIC timer now preempts ring-3 user code whose class quantum is spent (only the BSP had the PIT before), so a CPU-bound proc stolen onto an AP no longer monopolises that core. Validated (`-DSCHEDPRIO_BOOT`): 3 HIGH vs 3 LOW workers on 4 cores → HIGH got **~18x** the CPU of LOW yet **every LOW proc still ran** (no starvation). GUI desktop stable (default and `+smap`). **Known issue:** an `argc>=1` first-run proc on an AP **under SMAP** SMEP-faults (`argc=0` clean) — real-HW only, needs HW debugging; non-SMAP unaffected. Still a coarse 5-class scheme, not full MLFQ / load-balancing. |
 | Memory | ~18% | ~24% | `swap_init` wired; **real CoW fork** (`vmm_cow_fork` + `mmap_cow_clone`, no longer eager-copy); demand paging live; ASLR/NX/SMEP. Still bitmap PMM, first-fit heap, no memory compression / large pages. |
 | Filesystem / Storage | ~20% | ~29% | TobyFS: **journaling** (replay on mount), **direct + single + double-indirect blocks** (max file now ~4 GiB, was ~4 MiB), **dynamic device-sized volumes** (format scales geometry + multi-block bitmaps to the disk, up to 1 GiB; legacy 4 MiB images still mount), **256-entry write-back buffer cache**. Fixed a latent journal intra-transaction read-after-write bug (was silently corrupting freshly-created inodes sharing a parent's inode-table block). VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. **NVMe now handles 4K-LBA namespaces** (512-byte logical view + RMW for sub-sector access). **Block I/O is now async with real command queuing** — NVMe keeps multiple SQ commands in flight (CID-tagged) and AHCI uses NCQ (FPDMA QUEUED, up to 32 tags); a cooperative-yield wait lets concurrent submitters keep the hardware queue full. **ext4 is now read-write** (in-place overwrite, file growth via depth-0 extent-tree extension + block allocation, create/unlink/mkdir) on a clean no-journal image; journaled/needs-recovery images still mount read-only. Still no NTFS-class streams/ACLs; no ext4 journaling (writes not crash-atomic). |
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
@@ -90,10 +90,16 @@ driver model; POSIX libc surface.
    on top of the per-CPU TSS/GS/current_proc foundation. The earlier deadlock (pid 0 ↔
    login) was fixed by holding the BKL around pid 0's `gui_tick`/service work in idle_loop
    and gating AP-run until boot completes. ~2.6-2.7x on 4 CPU-bound workers; desktop stable
-   on default and `+smap`. **Remaining:** an `argc>=1` first-run proc on an AP under SMAP
-   SMEP-faults (kernel-executes-user-page; fault RIP tracks the packed user_rsp); needs a
-   real-HW debug session. Also: no priority classes / fair per-AP timeslicing yet (the AP
-   LAPIC timer doesn't preempt; CPU-bound procs run to completion / block-yield).
+   on default and `+smap`. **Priority classes + fair per-AP timeslicing now DONE**
+   (2026-06-08): a HIGHER-runs-first `prio` (IDLE..RT, 0==NORMAL default) feeds a
+   highest-effective-priority dequeue with FIFO-within-level + aging anti-starvation, and the
+   per-CPU LAPIC timer preempts ring-3 user code whose class quantum is spent so CPU-bound
+   procs timeslice on the APs (only the BSP had PIT preemption before). `SYS_SETPRIORITY`/
+   `GETPRIORITY` + `toby_setprio` expose it (uid/root policy). Validated: 3 HIGH vs 3 LOW on
+   4 cores → ~18x CPU split, no starvation. **Remaining:** an `argc>=1` first-run proc on an
+   AP under SMAP SMEP-faults (kernel-executes-user-page; fault RIP tracks the packed
+   user_rsp); needs a real-HW debug session. And the priority scheme is a coarse 5-class
+   static model, not a full MLFQ with per-CPU load balancing.
 4. **GPU-accelerated desktop on real hardware** — compositor accel only exists for VirtIO,
    not the Intel iGPU path used on the EliteDesk. **In progress (i915-lite):** the desktop
    today renders via Limine's firmware framebuffer (CPU memcpy); the Intel drivers
@@ -121,7 +127,10 @@ driver model; POSIX libc surface.
 
 ## Known shallow / "present but not robust" items
 - SMP: APs run user code in parallel now (BKL-serialized kernel, work-stealing, ~2.6x on 4
-  workers). Caveat: argc>=1 first-run procs on an AP under SMAP were reported to SMEP-fault on
+  workers), with priority-aware preemptive timeslicing (5 static classes + aging, per-AP LAPIC
+  preemption). It is a coarse static-priority scheme, not a full MLFQ: no per-CPU load
+  balancing, no interactivity/IO-boost heuristics, and quantum/aging are single global tunables.
+  Caveat: argc>=1 first-run procs on an AP under SMAP were reported to SMEP-fault on
   real HW (gap item #3). **2026-05-31: confirmed NOT reproducible in QEMU** across three
   escalating configs incl. multi-threaded TCG (`-accel tcg,thread=multi`, `Skylake-Client,
   +smep,+smap`) — 32/32 argc>=1 workers ran clean on APs, 0 faults. Instrumentation added
@@ -144,6 +153,26 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-08** — **Priority scheduling + fair per-AP timeslicing.** The scheduler was a pure
+  per-CPU FIFO round-robin with one front-of-queue GUI boost; APs never preempted (only the BSP
+  PIT did), so a CPU-bound proc stolen onto an AP monopolised that core until it blocked/exited.
+  Added (1) a HIGHER-runs-first `prio` on `struct proc` (classes IDLE/-2..RT/+2, **0==NORMAL so a
+  zero-initialised PCB defaults correctly with no per-site code**), feeding a highest-effective-
+  priority dequeue/steal (`src/sched.c`) with **FIFO-within-level** (a tree of all-NORMAL procs
+  behaves byte-identically to the old FIFO) and **aging anti-starvation** (effective priority
+  climbs +1 per ~60 ms a proc waits READY, from a per-enqueue `enq_tick`, capped so a starved
+  IDLE proc can out-rank a running RT proc); (2) **fair per-AP timeslicing** — `sched_tick(regs)`
+  now preempts when the per-CPU LAPIC timer interrupts **ring-3** user code (where the proc holds
+  no kernel lock/BKL, the same safety invariant the PIT preemption relies on) and the proc's
+  class quantum (`sched_quantum_for`, reset on switch-in) is spent; `apic_timer_isr` EOIs before
+  the tick so a preemptive switch never strands the LAPIC un-acked; (3) a userland surface —
+  `SYS_SETPRIORITY`/`SYS_GETPRIORITY` (165/166) + `toby_setprio`/`toby_getprio` libc, with a
+  uid/root policy (renice only your own procs; only root raises above NORMAL). Verified by an
+  opt-in self-test (`-DSCHEDPRIO_BOOT`): 3 HIGH + 3 LOW timed CPU-bound workers on 4 cores →
+  **HIGH ~18x the CPU of LOW (ratio 1792/100) yet every LOW proc still ran (no starvation)**, 0
+  exceptions/panics. Production boot byte-neutral (desktop 292 heartbeats == baseline, all-NORMAL
+  procs schedule exactly as before). Closes the open priority-classes/timeslicing bullet of gap
+  item #3. Scheduler/SMP ~18% → ~21%; overall stays ~26%.
 - **2026-06-08** — **ext4 read-write support.** `src/ext4.c` was read-only (create/write/unlink/
   mkdir returned ROFS). Added real write support on a clean (no-journal-replay) ext4/ext2:
   in-place overwrite, file growth (block-bitmap allocation + **depth-0 extent-tree extension** --

@@ -185,11 +185,17 @@ void apic_timer_calibrate_global(void) {
  * on every CPU; sched_tick consults smp_this_cpu() internally so we
  * don't have to thread cpu_idx through the dispatch path. EOI is to
  * the LAPIC (apic_eoi) -- the LAPIC timer is delivered by the local
- * APIC, never via the PIC or IO APIC. */
+ * APIC, never via the PIC or IO APIC.
+ *
+ * EOI is sent BEFORE sched_tick(): when the timeslice is spent, sched_tick
+ * preempts by switching away and does not return promptly, so the LAPIC must
+ * already be acked or it would never deliver another timer to this core (same
+ * ordering the PIT ISR uses for its preemption). The trap frame `r` is passed
+ * through so sched_tick can check the interrupted privilege level -- it only
+ * preempts when ring 3 was interrupted. */
 static void apic_timer_isr(struct regs *r) {
-    (void)r;
-    sched_tick();
     apic_eoi();
+    sched_tick(r);
 }
 
 bool apic_timer_periodic_init(uint32_t hz) {

@@ -887,6 +887,35 @@ static long sys_getppid(void) {
     return p ? p->ppid : 0;
 }
 
+/* ---- scheduling priority ---------------------------------------- *
+ *
+ * setpriority(pid, prio): pid<=0 targets the caller. Policy: a proc may only
+ * renice itself or another proc owned by the same uid; only root (uid 0) may
+ * RAISE a proc above NORMAL (so an unprivileged task can't grab RT/HIGH and
+ * starve the desktop -- aging bounds the damage even then, but the gate keeps
+ * the contract Windows-like). Returns the applied priority, ABI_PRIO_NONE if
+ * the target doesn't exist, or -ABI_EPERM on a policy violation. */
+static long sys_setpriority(int pid, int prio) {
+    struct proc *me = current_proc();
+    if (pid <= 0) pid = me ? me->pid : 0;
+
+    struct proc *tgt = proc_lookup(pid);
+    if (!tgt) return ABI_PRIO_NONE;
+
+    bool is_root = me && me->uid == 0;
+    if (!is_root) {
+        if (!me || tgt->uid != me->uid) return -ABI_EPERM;   /* not your proc */
+        if (prio > ABI_PRIO_NORMAL)     return -ABI_EPERM;   /* no self-elevation */
+    }
+    return sched_set_prio(pid, prio);
+}
+
+static long sys_getpriority(int pid) {
+    struct proc *me = current_proc();
+    if (pid <= 0) pid = me ? me->pid : 0;
+    return sched_get_prio(pid);
+}
+
 /* Resolve a user-provided path against the calling proc's cwd. The
  * result lives in `out` (caller-owned buffer of size `cap`). Returns
  * 0 on success, -ABI_E* on failure. Absolute paths copy verbatim;
@@ -2220,6 +2249,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Milestone 25A: libc-shape calls ------------------------ */
     case SYS_GETPID:        return sys_getpid();
     case SYS_GETPPID:       return sys_getppid();
+    case ABI_SYS_SETPRIORITY: return sys_setpriority((int)a1, (int)a2);
+    case ABI_SYS_GETPRIORITY: return sys_getpriority((int)a1);
     case SYS_SPAWN:
         return sys_spawn((const struct abi_spawn_req *)a1);
     case SYS_WAITPID:

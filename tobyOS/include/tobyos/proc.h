@@ -236,6 +236,28 @@ struct proc {
     uint64_t        tls_base;
     struct proc    *join_waiters;
 
+    /* ---- Priority scheduling (gap #3: priority classes + timeslicing) ----
+     *
+     * `prio` is the scheduling priority: HIGHER runs first. 0 == NORMAL,
+     * which is exactly what a zero-initialised PCB gets for free, so every
+     * spawn/fork/thread path defaults to NORMAL without extra code. Negative
+     * values are background classes, positive are foreground/elevated; the
+     * setpriority syscall clamps to [PRIO_MIN, PRIO_MAX] (see <tobyos/sched.h>).
+     *
+     * `quantum_left` is the number of LAPIC-timer ticks remaining in this
+     * proc's current timeslice. It's reset to the proc's class quantum on
+     * switch-in and decremented by the per-CPU timer ISR; reaching 0 while the
+     * timer interrupts ring 3 forces a preemptive yield -- this is what gives
+     * CPU-bound procs fair timeslicing on the APs (which have no PIT).
+     *
+     * `enq_tick` is the global tick at which this proc was last made READY and
+     * pushed onto a ready queue. The dispatcher ages a long-waiting proc's
+     * *effective* priority upward from this stamp so a busy high-priority proc
+     * can never starve a low-priority one. */
+    int             prio;
+    int32_t         quantum_left;
+    uint64_t        enq_tick;
+
     /* ---- Milestone 19: performance metrics ---------------------
      *
      * `cpu_ns` accumulates wallclock time this proc has spent

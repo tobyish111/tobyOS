@@ -76,6 +76,14 @@ pid_t getppid(void) {
     return (pid_t)toby_sc0(ABI_SYS_GETPPID);
 }
 
+int toby_setprio(int pid, int prio) {
+    return (int)toby_sc2(ABI_SYS_SETPRIORITY, (long)pid, (long)prio);
+}
+
+int toby_getprio(int pid) {
+    return (int)toby_sc1(ABI_SYS_GETPRIORITY, (long)pid);
+}
+
 int chdir(const char *path) {
     return (int)__toby_check(toby_sc1(ABI_SYS_CHDIR, (long)(uintptr_t)path));
 }

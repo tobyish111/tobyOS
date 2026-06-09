@@ -35,6 +35,13 @@ int     dup2   (int oldfd, int newfd);
 pid_t   getpid (void);
 pid_t   getppid(void);
 
+/* Scheduling priority (tobyOS extension). prio is HIGHER-runs-first, 0 ==
+ * normal; see ABI_PRIO_* in <tobyos/abi/abi.h>. pid<=0 means the caller.
+ * toby_setprio returns the applied priority, or <0 on error (e.g. -EPERM).
+ * toby_getprio returns the priority, or a value <= -1000 if pid not found. */
+int     toby_setprio(int pid, int prio);
+int     toby_getprio(int pid);
+
 int     chdir  (const char *path);
 char   *getcwd (char *buf, size_t cap);
 int     unlink (const char *path);

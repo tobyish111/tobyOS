@@ -639,8 +639,32 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
                                        so the kernel can use it as the handler
                                        return address. See sys_sigrestorer. */
 
+/* ---- Scheduling priority (priority classes + fair timeslicing) ------- */
+#define ABI_SYS_SETPRIORITY    165  /* (int pid, int prio) -> applied prio or
+                                       ABI_PRIO_NONE. pid<=0 means the caller.
+                                       prio is clamped to [ABI_PRIO_MIN,
+                                       ABI_PRIO_MAX]; higher runs first. A proc
+                                       may only renice ITSELF or a proc with the
+                                       same uid, and only root may RAISE above
+                                       ABI_PRIO_NORMAL. */
+#define ABI_SYS_GETPRIORITY    166  /* (int pid) -> prio or ABI_PRIO_NONE.
+                                       pid<=0 means the caller. */
+
+/* Scheduling priority classes (mirror of the kernel's PRIO_* in
+ * <tobyos/sched.h>): HIGHER runs first, 0 == NORMAL (the default). */
+#define ABI_PRIO_IDLE   (-2)
+#define ABI_PRIO_LOW    (-1)
+#define ABI_PRIO_NORMAL   0
+#define ABI_PRIO_HIGH     1
+#define ABI_PRIO_RT       2
+#define ABI_PRIO_MIN    ABI_PRIO_IDLE
+#define ABI_PRIO_MAX    ABI_PRIO_RT
+/* Returned by the priority syscalls when `pid` has no live process. Far
+ * outside the valid range so it can never alias a real priority. */
+#define ABI_PRIO_NONE   (-1000000)
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          165
+#define ABI_SYS_NR_MAX          167
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

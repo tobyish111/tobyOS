@@ -28,6 +28,41 @@
 #include <tobyos/types.h>
 
 struct proc;
+struct regs;
+
+/* ---- Priority classes ------------------------------------------------------
+ * `prio` on struct proc is HIGHER-runs-first, with 0 == NORMAL so a freshly
+ * zero-initialised PCB defaults to NORMAL with no extra code. These class
+ * constants are the values userland sets via SYS_SETPRIORITY; the kernel
+ * clamps to [PRIO_MIN, PRIO_MAX]. (Mirrored to userland in <tobyos/abi/abi.h>
+ * as ABI_PRIO_*.) */
+#define PRIO_IDLE    (-2)   /* only runs when nothing else is runnable */
+#define PRIO_LOW     (-1)   /* background work */
+#define PRIO_NORMAL    0    /* default */
+#define PRIO_HIGH      1    /* foreground / interactive */
+#define PRIO_RT        2    /* latency-critical (still preemptible) */
+#define PRIO_MIN     PRIO_IDLE
+#define PRIO_MAX     PRIO_RT
+
+/* ---- Timeslice + anti-starvation tunables ----------------------------------
+ * Quantum is counted in LAPIC-timer ticks (the per-CPU 100 Hz periodic timer,
+ * 10 ms/tick). Higher-priority classes get a longer slice, but every class is
+ * preemptible so nothing monopolises a core. Aging is counted in PIT ticks
+ * (the global 1000 Hz wall clock, pit_ticks(), 1 ms/tick): a READY proc's
+ * effective priority climbs one level for every SCHED_AGE_STEP_TICKS it has
+ * waited without running, capped at SCHED_AGE_MAX_BOOST -- enough for a starved
+ * IDLE proc to eventually out-rank a running RT proc, which bounds worst-case
+ * wait. (Validated: 3 HIGH vs 3 LOW CPU-bound workers on 4 cores -> HIGH ~18x
+ * the CPU of LOW, yet every LOW proc still made progress: no starvation.) */
+#define SCHED_QUANTUM_BASE     5    /* LAPIC ticks for NORMAL (~50 ms @100Hz)   */
+#define SCHED_AGE_STEP_TICKS  60    /* +1 effective level per ~60 ms waiting     */
+#define SCHED_AGE_MAX_BOOST    5    /* PRIO_MAX-PRIO_MIN+1: can lift IDLE>RT     */
+
+/* Class quantum: foreground classes get a slightly longer slice. */
+static inline int sched_quantum_for(int prio) {
+    int q = SCHED_QUANTUM_BASE + prio;   /* RT=7, HIGH=6, NORMAL=5, LOW=4, IDLE=3 */
+    return q < 1 ? 1 : q;
+}
 
 /* Initialise scheduler state. Must be called once after proc_init. */
 void sched_init(void);
@@ -69,10 +104,26 @@ void sched_enable_ap_run(void);
  * ap_entry() once their LAPIC + LAPIC timer are alive. */
 __attribute__((noreturn)) void sched_idle(void);
 
-/* Called from the LAPIC timer ISR (which runs on every CPU at 100 Hz
- * once apic_timer_periodic_init has fired on that CPU). Increments
- * this CPU's tick counter; on the BSP also drives any cooperative
- * preempt heuristic. Cheap -- safe to call from interrupt context. */
-void sched_tick(void);
+/* Called from the LAPIC timer ISR (which runs on every CPU at 100 Hz once
+ * apic_timer_periodic_init has fired on that CPU). Increments this CPU's tick
+ * counter and, when the timer interrupted ring-3 user code whose timeslice is
+ * spent, forces a preemptive yield (fair per-AP timeslicing). `r` is the
+ * interrupt trap frame so we can test the interrupted privilege level -- we
+ * only ever preempt from ring 3, where the proc holds no kernel lock/BKL, so
+ * the yield is as safe as the proven PIT preemption path. The caller MUST have
+ * already EOI'd the LAPIC before invoking this (we may not return promptly).
+ * Cheap on the no-preempt path -- safe to call from interrupt context. */
+void sched_tick(struct regs *r);
+
+/* Sentinel returned by the prio accessors when `pid` has no live PCB. Well
+ * outside [PRIO_MIN, PRIO_MAX] so it can never collide with a real priority. */
+#define SCHED_PRIO_NONE  (-1000000)
+
+/* Set proc `pid`'s scheduling priority (clamped to [PRIO_MIN, PRIO_MAX]).
+ * Returns the applied value, or SCHED_PRIO_NONE if pid not found. */
+int sched_set_prio(int pid, int prio);
+
+/* Read proc `pid`'s scheduling priority, or SCHED_PRIO_NONE if pid not found. */
+int sched_get_prio(int pid);
 
 #endif /* TOBYOS_SCHED_H */
