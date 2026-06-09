@@ -11,7 +11,7 @@ survives clones and any agent can read/update it.
 - When you change a subsystem, update its row, bump the date, and add a line to the Changelog.
 - Be honest: "code present" ≠ "wired" ≠ "robust". Distinguish them.
 
-**Last updated:** 2026-06-07
+**Last updated:** 2026-06-08
 
 ---
 
@@ -43,7 +43,7 @@ honest number.
 |---|---|---|---|
 | Scheduler / SMP | ~12% | ~18% | **APs now run user code in parallel.** Per-CPU TSS + SYSCALL stack (GS base, no swapgs) + `current_proc` + AP CR0/CR4/EFER parity + per-CPU SYSCALL MSRs; a syscall-path **big-kernel-lock** serializes kernel entry (and pid 0's `gui_tick`/service work) so user code parallelizes while VFS/GUI/proc-table stay race-free; per-CPU **idle procs** + **work-stealing** distribute work; AP-run gated until boot completes. Measured **~2.6-2.7x on 4 CPU-bound workers**; the GUI desktop is stable (default and under `+smap`). **Known issue:** an `argc>=1` first-run proc that lands on an AP **under SMAP** SMEP-faults (`argc=0` is clean) — under investigation, needs real-HW debugging; non-SMAP is unaffected. No priority classes/MLFQ. |
 | Memory | ~18% | ~24% | `swap_init` wired; **real CoW fork** (`vmm_cow_fork` + `mmap_cow_clone`, no longer eager-copy); demand paging live; ASLR/NX/SMEP. Still bitmap PMM, first-fit heap, no memory compression / large pages. |
-| Filesystem / Storage | ~20% | ~29% | TobyFS: **journaling** (replay on mount), **direct + single + double-indirect blocks** (max file now ~4 GiB, was ~4 MiB), **dynamic device-sized volumes** (format scales geometry + multi-block bitmaps to the disk, up to 1 GiB; legacy 4 MiB images still mount), **256-entry write-back buffer cache**. Fixed a latent journal intra-transaction read-after-write bug (was silently corrupting freshly-created inodes sharing a parent's inode-table block). VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. **NVMe now handles 4K-LBA namespaces** (512-byte logical view + RMW for sub-sector access). **Block I/O is now async with real command queuing** — NVMe keeps multiple SQ commands in flight (CID-tagged) and AHCI uses NCQ (FPDMA QUEUED, up to 32 tags); a cooperative-yield wait lets concurrent submitters keep the hardware queue full. Still no NTFS-class streams/ACLs; ext4 read-only. |
+| Filesystem / Storage | ~20% | ~29% | TobyFS: **journaling** (replay on mount), **direct + single + double-indirect blocks** (max file now ~4 GiB, was ~4 MiB), **dynamic device-sized volumes** (format scales geometry + multi-block bitmaps to the disk, up to 1 GiB; legacy 4 MiB images still mount), **256-entry write-back buffer cache**. Fixed a latent journal intra-transaction read-after-write bug (was silently corrupting freshly-created inodes sharing a parent's inode-table block). VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. **NVMe now handles 4K-LBA namespaces** (512-byte logical view + RMW for sub-sector access). **Block I/O is now async with real command queuing** — NVMe keeps multiple SQ commands in flight (CID-tagged) and AHCI uses NCQ (FPDMA QUEUED, up to 32 tags); a cooperative-yield wait lets concurrent submitters keep the hardware queue full. **ext4 is now read-write** (in-place overwrite, file growth via depth-0 extent-tree extension + block allocation, create/unlink/mkdir) on a clean no-journal image; journaled/needs-recovery images still mount read-only. Still no NTFS-class streams/ACLs; no ext4 journaling (writes not crash-atomic). |
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
 | Device Drivers | ~12% | ~14% | **Loadable `ET_REL` kernel module loader** (foundational). 6 NIC drivers, AHCI/NVMe/IDE/virtio-blk, xHCI/EHCI/HID/MSC, HDA. No real GPU driver; no signed third-party ecosystem. |
 | GUI / Desktop | ~10% | ~12% | GPU-accelerated compositor path exists **but only active with VirtIO-GPU**; on real Intel iGPU it falls back to the CPU/Limine compositor. Now **usable on hardware** (login no longer flaps; mouse/keyboard work). |
@@ -144,6 +144,24 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-08** — **ext4 read-write support.** `src/ext4.c` was read-only (create/write/unlink/
+  mkdir returned ROFS). Added real write support on a clean (no-journal-replay) ext4/ext2:
+  in-place overwrite, file growth (block-bitmap allocation + **depth-0 extent-tree extension** --
+  the ext4-specific part: extend the last extent when contiguous so sequential writes stay one
+  extent, else add a leaf up to eh_max=4; legacy-pointer inodes reuse the direct+single-indirect
+  path), and create/unlink/mkdir with directory-entry insert (slot-split or grow-by-block) and
+  remove. Block/inode bitmap + group-descriptor + superblock free-count bookkeeping was adapted
+  from the already-read-write ext2 driver (`src/ext2.c`, shares the same on-disk structs). Mount is
+  now rw; a needs-recovery (dirty journal) image is still refused, and there is **no journaling**
+  (writes aren't crash-atomic) -- the depth-1 extent index tree and >4 fragmented runs return NOSPC
+  (documented limit, not silent corruption). Verified self-contained (no host mke2fs): a new
+  in-kernel `ext4_format` (single block group, 4 KiB blocks, extents, no journal) + `ext4_self_test`
+  (`-DEXT4_SELFTEST`) format a ramdev, mount it via the real driver, and PASS create + multi-block
+  extent-grow write + verify, in-place overwrite, mkdir + nested file, unlink, and remount-
+  persistence; default IDE boot + production build stay clean (0 exceptions/panics). (Root-caused a
+  nondeterministic heap corruption to a 1 KiB stack buffer in the mount path overflowing the ~16 KiB
+  boot stack; moved it to the heap.) Storage stays ~29% (the last storage sub-task; rounds out
+  filesystem write coverage rather than adding a new subsystem).
 - **2026-06-07** — **Async block I/O + command queuing (NVMe multi-command + AHCI NCQ).**
   Both block drivers were single-outstanding-command (one NVMe SQ entry / AHCI slot 0, polled).
   Added an async block-I/O core (`struct blk_io` + `blk_io_complete` callable from the completion
