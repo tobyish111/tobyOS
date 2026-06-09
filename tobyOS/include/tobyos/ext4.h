@@ -257,9 +257,21 @@ struct ext4_dir_entry_2 {
 int ext4_probe(struct blk_dev *dev);
 
 /* Mount the ext4 filesystem on `dev` at `mount_point`. Returns
- * VFS_OK on success; VFS_ERR_* on any failure. The mount is
- * read-only -- attempts to write through the VFS layer return
- * VFS_ERR_ROFS. */
+ * VFS_OK on success; VFS_ERR_* on any failure. The mount is now
+ * READ-WRITE: create / write / unlink / mkdir mutate the filesystem
+ * (no journaling -- writes are not crash-atomic; a needs-recovery
+ * image is still refused at mount). */
 int ext4_mount(const char *mount_point, struct blk_dev *dev);
+
+/* Format `dev` as a minimal single-block-group, 4 KiB-block, extents,
+ * no-journal ext4 (used by the self-test; also a usable mkfs). Returns
+ * VFS_OK / VFS_ERR_*. */
+int ext4_format(struct blk_dev *dev);
+
+/* Self-contained write self-test: formats a ramdev, mounts it, and
+ * exercises create / extent-grow write / overwrite / mkdir / unlink /
+ * remount-persistence. Returns 0 on all-pass. Emits [EXT4ST] markers.
+ * Called from kernel.c under -DEXT4_SELFTEST. */
+int ext4_self_test(void);
 
 #endif /* TOBYOS_EXT4_H */

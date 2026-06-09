@@ -2433,6 +2433,12 @@ void _start(void) {
      * AHCI/SATA disk). Non-destructive. */
     blk_ahci_selftest();
 #endif
+#ifdef EXT4_SELFTEST
+    /* Opt-in: ext4 write self-test -- formats + mounts a ramdev and
+     * exercises create/write/grow/overwrite/mkdir/unlink/remount.
+     * Self-contained (no host mke2fs, no QEMU disk). */
+    { extern int ext4_self_test(void); ext4_self_test(); }
+#endif
     net_dump();
 
     modules_log();
