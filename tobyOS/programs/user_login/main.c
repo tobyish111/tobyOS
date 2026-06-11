@@ -18,6 +18,7 @@ typedef unsigned char      uint8_t;
 #define SYS_EXIT            0
 #define SYS_WRITE           1
 #define SYS_YIELD           5
+#define SYS_NANOSLEEP      47
 #define SYS_GUI_CREATE     10
 #define SYS_GUI_FILL       11
 #define SYS_GUI_TEXT       12
@@ -54,6 +55,7 @@ struct gui_event {
 
 /* ---- inline syscall helpers -------------------------------------- */
 
+static inline long syscall0(long nr) __attribute__((unused));
 static inline long syscall0(long nr) {
     long r;
     __asm__ volatile ("syscall" : "=a"(r)
@@ -93,8 +95,7 @@ static inline long syscall5(long nr, long a1, long a2, long a3,
 
 static void sys_exit(int code) __attribute__((unused));
 static void sys_exit(int code) { syscall1(SYS_EXIT, code); for(;;); }
-static void sys_yield(void)    { syscall0(SYS_YIELD); }
-static long sys_clock_ms(void) { return syscall0(SYS_CLOCK_MS); }
+static void sys_sleep_ms(int ms) { syscall1(SYS_NANOSLEEP, (long)ms * 1000000L); }
 
 static int sys_gui_create(int w, int h, const char *title) {
     return (int)syscall3(SYS_GUI_CREATE, w, h, (long)title);
@@ -430,7 +431,14 @@ int main(int argc, char **argv) {
                 }
             }
         } else {
-            sys_yield();
+            /* No event pending. Sleep instead of busy-yielding: the old
+             * yield loop hammered the kernel with a syscall stream that
+             * (with the whole-iteration BKL hold in pid 0's idle_loop)
+             * livelocked the desktop under SMP, and it burned a full core
+             * at the login screen regardless. ~15 ms keeps typing/mouse
+             * response well under perception threshold; events queue in
+             * the kernel meanwhile. */
+            sys_sleep_ms(15);
         }
     }
 
@@ -444,9 +452,7 @@ int main(int argc, char **argv) {
         sys_gui_set_opacity(g_win, alpha);
         sys_gui_flip(g_win);
         /* ~20ms per frame for 50fps animation */
-        long target = sys_clock_ms() + 20;
-        while (sys_clock_ms() < target)
-            sys_yield();
+        sys_sleep_ms(20);
     }
     sys_gui_set_opacity(g_win, 0);
     sys_gui_flip(g_win);

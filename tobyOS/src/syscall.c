@@ -1231,14 +1231,27 @@ static long sys_getenv(const char *name, char *out, size_t cap) {
 /* ---- time ------------------------------------------------------ */
 
 static long sys_nanosleep(uint64_t ns) {
-    /* Implementation: spin-yield until enough wall time has passed.
-     * Resolution is set by the perf tick (~10 ms on QEMU) -- good
-     * enough for the uses libc has in M25A (sleep, usleep). */
-    uint64_t start = perf_now_ns();
-    uint64_t end   = start + ns;
+    /* Resolution is set by the timer tick (~10 ms on QEMU) -- good enough
+     * for the uses libc has in M25A (sleep, usleep).
+     *
+     * SMP: drop the BKL across the wait. The old spin-yield held it for the
+     * WHOLE sleep whenever this CPU's queue was empty (sched_yield's fast
+     * path returns without releasing), so a sleeping proc on an AP blocked
+     * every other core's syscalls for its full sleep duration. A sleeping
+     * proc touches no shared kernel state, so the lock isn't needed; we
+     * re-take it before returning to the dispatch epilogue. Same pattern as
+     * tcp_poll_until. sched_yield still runs other ready work on this CPU;
+     * with nothing ready we genuinely idle in hlt until the next IRQ. */
+    uint64_t end = perf_now_ns() + ns;
+    bool had_bkl = bkl_held();
+    if (had_bkl) bkl_exit();
     while (perf_now_ns() < end) {
         sched_yield();
+        if (perf_now_ns() >= end) break;
+        sti();
+        hlt();
     }
+    if (had_bkl) bkl_enter();
     return 0;
 }
 
