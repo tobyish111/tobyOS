@@ -99,37 +99,53 @@ static inline void bkl_unlock(void) {
 static volatile bool g_ap_run_enabled = false;
 void sched_enable_ap_run(void) { g_ap_run_enabled = true; }
 
-/* Diagnostic: how many times bkl_enter() was called by a CPU that ALREADY held
- * the BKL. Should be readable via QMP/`cpus`; non-zero means the upstream BKL
- * accounting has an imbalance worth chasing, but the idempotent guard below
- * keeps it from being fatal. */
-volatile uint64_t g_bkl_reenters = 0;
-
-/* ---- BKL accounting instrumentation (diagnosing the freeze) -------------
+#ifdef SMP_DIAG
+/* ---- BKL accounting instrumentation (-DSMP_DIAG) -------------------------
+ * Used to diagnose the SMP desktop-freeze livelock (fixed in the per-phase
+ * idle_loop commit); kept compiled-out for the day it resurfaces, e.g. on the
+ * EliteDesk. Read live via QMP `x/` at a stall (addresses via nm).
+ * g_bkl_reenters: bkl_enter() calls by a CPU that ALREADY held the BKL --
+ *   non-zero means an accounting imbalance upstream (the idempotent guard in
+ *   bkl_enter keeps it non-fatal either way).
  * g_bkl_owner   : cpu_idx that currently owns g_bkl (-1 == free).
  * g_bkl_enter_idmm / g_bkl_exit_idmm : times bkl_enter/bkl_exit saw an
  *   smp_this_cpu() whose cpu_idx disagrees with the recorded owner -- the
  *   signature of per-CPU mis-identification.
  * g_bkl_exit_notheld : bkl_exit() calls that no-op'd because holds_bkl was 0
- *   while g_bkl was actually held by someone (a leaked/lost release). */
+ *   while g_bkl was actually held by someone (a leaked/lost release).
+ *
+ * WARNING: do NOT add per-bkl_enter/exit event LOGGING (ring buffers etc.) --
+ * the extra hot-path stores perturb timing enough to MASK the freeze
+ * (verified: an instrumented build ran clean while the same source froze
+ * 3/3 without it). These counters are single stores and were freeze-safe. */
+volatile uint64_t g_bkl_reenters = 0;
 volatile int      g_bkl_owner       = -1;
 volatile uint64_t g_bkl_enter_idmm  = 0;
 volatile uint64_t g_bkl_exit_idmm   = 0;
 volatile uint64_t g_bkl_exit_notheld = 0;
 volatile int      g_bkl_mm_owner    = -1;   /* owner at the last mismatch */
 volatile int      g_bkl_mm_caller   = -1;   /* mis-id'd cpu at last mismatch */
+#endif
 
 void bkl_enter(void) {
     struct percpu *me = smp_this_cpu();
-    if (me->holds_bkl) { g_bkl_reenters++; return; }   /* idempotent re-entry */
+    if (me->holds_bkl) {                               /* idempotent re-entry */
+#ifdef SMP_DIAG
+        g_bkl_reenters++;
+#endif
+        return;
+    }
     bkl_lock();
     me->holds_bkl = true;
+#ifdef SMP_DIAG
     g_bkl_owner = (int)me->cpu_idx;
+#endif
 }
 
 void bkl_exit(void) {
     struct percpu *me = smp_this_cpu();
     if (!me->holds_bkl) {
+#ifdef SMP_DIAG
         /* This CPU doesn't think it owns the BKL. If g_bkl is nonetheless held
          * by some cpu_idx, releasing was lost -> the lock leaks. Record it. */
         if (g_bkl_owner >= 0) {
@@ -137,8 +153,10 @@ void bkl_exit(void) {
             g_bkl_mm_owner  = g_bkl_owner;
             g_bkl_mm_caller = (int)me->cpu_idx;
         }
+#endif
         return;                          /* idempotent: never double-unlock */
     }
+#ifdef SMP_DIAG
     if (g_bkl_owner != (int)me->cpu_idx) {
         /* We "own" it per holds_bkl, but the recorded acquirer was a different
          * cpu_idx -> the same physical CPU was identified differently at
@@ -147,8 +165,9 @@ void bkl_exit(void) {
         g_bkl_mm_owner  = g_bkl_owner;
         g_bkl_mm_caller = (int)me->cpu_idx;
     }
-    me->holds_bkl = false;
     g_bkl_owner = -1;
+#endif
+    me->holds_bkl = false;
     bkl_unlock();
 }
 

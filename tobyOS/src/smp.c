@@ -88,12 +88,15 @@ uint32_t smp_online_count(void) {
     return n;
 }
 
-/* Diagnostics: times the LAPIC-ID match failed (and we fell back to cpu 0),
- * plus the last offending LAPIC ID. A non-zero count means a running CPU was
- * mis-identified as the BSP -> it would scribble per-CPU state into pid 0's
- * slot. Readable via QMP. */
+#ifdef SMP_DIAG
+/* Diagnostics (-DSMP_DIAG): times the LAPIC-ID match failed (and we fell back
+ * to cpu 0), plus the last offending LAPIC ID. A non-zero count means a
+ * running CPU was mis-identified as the BSP -> it would scribble per-CPU
+ * state into pid 0's slot. Readable via QMP. (Stayed 0 throughout the
+ * desktop-freeze investigation -- mis-ID was ruled out.) */
 volatile uint64_t g_smp_id_nomatch = 0;
 volatile uint32_t g_smp_id_badid   = 0xFFFFFFFFu;
+#endif
 
 uint32_t smp_current_cpu_idx(void) {
     /* Before the percpu table is built, or before the LAPIC is
@@ -106,10 +109,11 @@ uint32_t smp_current_cpu_idx(void) {
     for (uint32_t i = 0; i < g_cpu_count; i++) {
         if (g_percpu[i].apic_id == id) return i;
     }
-    /* No match -- fall back to BSP. Instrumented: this is the suspected source
-     * of the per-CPU corruption freeze. */
+    /* No match -- fall back to BSP. */
+#ifdef SMP_DIAG
     g_smp_id_nomatch++;
     g_smp_id_badid = id;
+#endif
     return 0;
 }
 

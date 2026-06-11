@@ -2765,11 +2765,13 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * IRQs on (we just sti'd); IRQ handlers don't take the BKL. */
     bkl_enter();
 
+#ifdef SMP_DIAG
     /* DIAG: record the syscall this CPU is currently inside (by cpu_idx) so a
      * freeze capture can name the syscall whose body/return path is holding the
      * BKL. Cleared to -1 at the normal return below. */
     extern volatile long g_cpu_syscall[32];
     g_cpu_syscall[smp_current_cpu_idx() & 31] = num;
+#endif
 
     /* ---- Milestone 19: per-syscall perf zone + per-proc counter ---
      *
@@ -2843,7 +2845,9 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * it and we never got here; bkl_exit is idempotent regardless.) */
     bkl_exit();
 
+#ifdef SMP_DIAG
     g_cpu_syscall[smp_current_cpu_idx() & 31] = -1;   /* DIAG: syscall done */
+#endif
 
     /* Re-mask interrupts before we return into the .S unwind. The
      * trampoline pops 14 registers and then does `mov rsp, [rsp]` to
@@ -2855,11 +2859,13 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
     return rv;
 }
 
+#ifdef SMP_DIAG
 /* DIAG: per-cpu_idx current syscall number (-1 == not in a syscall). Read at a
  * freeze to identify which syscall is holding the BKL on the stuck core. */
 volatile long g_cpu_syscall[32] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
+#endif
 
 /* Program the SYSCALL-related MSRs on the CURRENT CPU. EFER.SCE/STAR/LSTAR/
  * FMASK are all per-CPU, so every core that runs ring-3 code must set them or
