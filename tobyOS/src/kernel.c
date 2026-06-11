@@ -544,17 +544,28 @@ static __attribute__((noreturn)) void idle_loop(void) {
 
     for (;;) {
         /* SMP: pid 0's per-tick work (gui_tick, service ticks, net/USB/shell)
-         * touches shared kernel state that user procs on other cores also
-         * reach via their syscalls. Hold the BKL across the iteration to
-         * serialize against those, and release it at the pause below so the
-         * other cores get the lock. gui_tick's internal sched_yield drops/
-         * reacquires the BKL while a user proc runs on this core. */
-        bkl_enter();
+         * touches shared kernel state that user procs on other cores reach via
+         * their syscalls, so each phase runs under the BKL.
+         *
+         * CRITICAL -- per-phase acquire/RELEASE, NOT one hold across the whole
+         * iteration. A user proc busy-polling syscalls on an AP (notably
+         * /bin/login's poll_event/yield main loop) takes the BKL on every call.
+         * Holding the BKL across this entire body made that AP proc and pid 0
+         * livelock on the lock -- both spinning ~100% in bkl_enter, the GUI
+         * driver (pid 0) never completing a gui_tick -- which presented as a hard,
+         * SMP-only desktop freeze (heartbeat just stops, no fault). Dropping the
+         * BKL between phases bounds the hold so the fair ticket lock interleaves
+         * the AP cleanly and pid 0 always makes forward progress. gui_tick's
+         * internal sched_yield still drops/reacquires the BKL while a user proc
+         * runs on this core. The phases are independent ticks -- no shared state
+         * needs to persist held across a phase boundary. */
 
         /* Network service lane first: drain NIC RX and protocol daemons
          * before GUI/input work can consume pid 0's turn. */
+        bkl_enter();
         net_service_tick();
         SERVICE_INPUT();
+        bkl_exit();
 
         /*
          * Always drain xHCI once per loop.
@@ -563,30 +574,31 @@ static __attribute__((noreturn)) void idle_loop(void) {
          * If xHCI IRQs do not work on real hardware, this is the only
          * thing keeping USB HID input responsive.
          */
+        bkl_enter();
         SERVICE_INPUT();
-
         xhci_service_port_changes();
         usb_hub_poll();
-
         /* Catch any input that arrived while the other pollers ran. */
         SERVICE_INPUT();
+        bkl_exit();
 
         /* GUI/window manager tick. */
+        bkl_enter();
         gui_tick();
+        bkl_exit();
 
         /* If GUI work yielded back after a repaint burst, give the
          * network lane another cheap chance before local input/shell. */
+        bkl_enter();
         net_service_tick();
         SERVICE_INPUT();
-
         /* Local shell input. */
         shell_poll();
-
         /* Text cursor only when GUI is inactive. */
         if (!gui_active())
             console_tick(pit_ticks(), hz);
-
         acpi_m22_selftest_tick();
+        bkl_exit();
 
         /*
          * Critical:
@@ -595,9 +607,6 @@ static __attribute__((noreturn)) void idle_loop(void) {
          * If xHCI is polling-only, hlt makes USB HID PIT-limited and
          * mouse movement becomes chunky.
          */
-         /* Release the BKL before idling so other cores can enter the kernel
-          * (their syscalls were spinning on it while we held it). */
-         bkl_exit();
          __asm__ __volatile__("pause");
     }
 
