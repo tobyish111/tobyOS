@@ -41,6 +41,17 @@ struct percpu {
     uint32_t cpu_idx;       /* 0..n-1, our internal numbering */
     uint32_t apic_id;       /* what the LAPIC reports for this CPU */
     bool     is_bsp;        /* true for cpu_idx 0 (always the BSP) */
+    /* AP-bringup handshake (two stages so the BSP's SIPI retry is safe):
+     *   started -- set by the AP as its VERY FIRST action in ap_entry, before
+     *              it touches any lock or shared state. Tells the BSP "this AP
+     *              received a SIPI and is executing", so the BSP must NOT
+     *              re-INIT it (a re-INIT would reset it mid-init and could leak
+     *              the console lock). Only an AP that never set `started` is
+     *              eligible for an INIT-SIPI-SIPI retry.
+     *   online  -- set after the AP finishes per-CPU init and is ready to
+     *              schedule. The BSP waits on this (without retrying) once it
+     *              has seen `started`. */
+    bool     started;       /* AP began executing ap_entry (pre-init) */
     bool     online;        /* set by the CPU itself when init done  */
     bool     holds_bkl;     /* this CPU currently holds the big kernel lock */
     uint64_t stack_top;     /* per-CPU kernel stack top (NULL for BSP) */

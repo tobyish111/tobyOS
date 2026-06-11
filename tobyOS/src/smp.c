@@ -155,9 +155,16 @@ extern void hardening_init_ap(void);   /* hardening.c -- per-CPU CR0/CR4/EFER */
 extern void syscall_init_ap(void);     /* syscall.c  -- per-CPU SYSCALL MSRs  */
 
 static __attribute__((noreturn, used)) void ap_entry(uint32_t cpu_idx) {
-    apic_init_local();
-
     struct percpu *me = &g_percpu[cpu_idx];
+
+    /* Signal "this AP is alive and executing" BEFORE any init or lock-taking
+     * work. The BSP's bringup retry only re-INITs an AP that has NOT set this
+     * flag, so by the time we touch the console lock (in smp_logf below) or any
+     * other shared state, the BSP can no longer reset us. RELEASE pairs with the
+     * BSP's ACQUIRE load. */
+    __atomic_store_n(&me->started, true, __ATOMIC_RELEASE);
+
+    apic_init_local();
 
     /* Bring this AP up to BSP parity so it can run ring-3 user code:
      *   - per-CPU CR0/CR4/EFER (SSE + SMEP/SMAP/NX),
@@ -342,47 +349,84 @@ static bool start_one_ap(uint32_t cpu_idx) {
     kprintf("[smp] cpu%u: INIT-SIPI-SIPI to apic_id=%u (tramp_vector=0x%02x, stack=%p)\n",
             cpu_idx, apic_id, vector, (void *)cpu->stack_top);
 
-    /* Snapshot the global online count BEFORE we kick the AP. On QEMU
-     * the AP can finish printing and bump the counter faster than we
-     * fall through these few instructions, so capturing `before` after
-     * the SIPIs would miss the transition. We watch this CPU's per-CPU
-     * `online` flag too, for robustness against any spurious cross-AP
-     * counter bumps in future code. */
-    uint32_t before = __atomic_load_n(&g_aps_online_count, __ATOMIC_ACQUIRE);
-    cpu->online = false;
+    cpu->started = false;
+    cpu->online  = false;
 
-    /* INIT IPI. Spec wants ~10 ms of dwell after INIT before the first
-     * SIPI; the PIT gives us that easily. */
-    apic_send_init(apic_id);
-    pit_sleep_ms(10);
+    /* ---- Stage 1: get the AP executing, retrying a missed SIPI -------------
+     *
+     * The real-hardware failure ("cpu N: timed out waiting for online flag" on
+     * the Skylake EliteDesk) is an AP that intermittently misses its SIPI and
+     * never starts. A single INIT-SIPI-SIPI then declared it dead. We now retry
+     * the whole sequence up to MAX_ATTEMPTS times.
+     *
+     * The retry is made safe by the per-CPU `started` flag, which the AP sets as
+     * its very first instruction in ap_entry (before touching any lock): we only
+     * ever re-INIT an AP that has NOT signalled `started`. An AP that already
+     * began executing can therefore never be reset by a retry, so a slow-but-
+     * healthy AP is never clobbered mid-init (which would, e.g., leak the console
+     * lock). A short per-attempt window (~100 ms) cleanly distinguishes "missed
+     * the SIPI" (never starts -- microseconds is all a live AP needs) from a
+     * genuine start. */
+    const int MAX_ATTEMPTS = 3;
+    bool started = false;
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS && !started; attempt++) {
+        if (attempt > 1)
+            kprintf("[smp] cpu%u: no SIPI response (attempt %d/%d) -- re-INIT\n",
+                    cpu_idx, attempt - 1, MAX_ATTEMPTS);
 
-    /* First SIPI. Wait ~200us; PIT resolution is 10 ms but a 1-tick
-     * wait is fine and matches Linux/SeaBIOS practice (200us is a
-     * lower bound, not an upper). */
-    apic_send_sipi(apic_id, vector);
-    pit_sleep_ms(1);
+        /* INIT IPI, then ~10 ms dwell (Intel MP spec) before the SIPIs. */
+        apic_send_init(apic_id);
+        pit_sleep_ms(10);
 
-    /* Second SIPI. The spec mandates two; the AP latches whichever
-     * arrives first. */
-    apic_send_sipi(apic_id, vector);
+#ifdef SMP_SIPI_FLAKE
+        /* Opt-in fault injection (EXTRA_CFLAGS+=-DSMP_SIPI_FLAKE): make cpu 1's
+         * first attempt "miss" by withholding both SIPIs, so the retry path must
+         * recover it. Proves the Stage-1 retry actually works under QEMU, where
+         * a real missed-SIPI race can't be reproduced. */
+        bool flake = (cpu_idx == 1 && attempt == 1);
+        if (!flake) {
+            apic_send_sipi(apic_id, vector);
+            pit_sleep_ms(1);
+            apic_send_sipi(apic_id, vector);
+        } else {
+            kprintf("[smp] cpu%u: SMP_SIPI_FLAKE -- withholding SIPI on attempt 1\n",
+                    cpu_idx);
+        }
+#else
+        /* Two SIPIs (~200us apart; the AP latches whichever arrives first). The
+         * 1-tick PIT wait is a lower bound and matches Linux/SeaBIOS practice. */
+        apic_send_sipi(apic_id, vector);
+        pit_sleep_ms(1);
+        apic_send_sipi(apic_id, vector);
+#endif
 
-    /* Wait for the AP to phone home. Cap the wait at ~1 second so a
-     * busted AP doesn't hang boot forever. */
-    uint64_t deadline = pit_ticks() + (uint64_t)pit_hz();   /* ~1s */
+        /* Short window: did the AP begin executing (set `started`)? */
+        uint64_t sdl = pit_ticks() + (uint64_t)(pit_hz() / 10);   /* ~100 ms */
+        while (pit_ticks() < sdl) {
+            if (__atomic_load_n(&cpu->started, __ATOMIC_ACQUIRE)) { started = true; break; }
+            __asm__ volatile ("pause" ::: "memory");
+        }
+    }
+
+    if (!started) {
+        kprintf("[smp] cpu%u: no response to %d INIT-SIPI-SIPI attempts -- giving up\n",
+                cpu_idx, MAX_ATTEMPTS);
+        return false;
+    }
+
+    /* ---- Stage 2: AP is alive -- wait (no retry) for it to publish online ---
+     *
+     * Past this point the AP is executing and may already hold the console lock,
+     * so we must NEVER re-INIT it. Just wait for it to finish per-CPU init and
+     * set `online`, with a generous cap so a healthy-but-slow AP isn't failed. */
+    uint64_t deadline = pit_ticks() + (uint64_t)pit_hz();        /* ~1 s */
     while (pit_ticks() < deadline) {
-        if (__atomic_load_n(&cpu->online, __ATOMIC_ACQUIRE)) {
-            return true;
-        }
-        if (__atomic_load_n(&g_aps_online_count, __ATOMIC_ACQUIRE) != before) {
-            /* Some AP came online (us, almost certainly, since we
-             * serialise startup). Re-check our flag once before
-             * declaring victory. */
-            if (__atomic_load_n(&cpu->online, __ATOMIC_ACQUIRE)) return true;
-        }
+        if (__atomic_load_n(&cpu->online, __ATOMIC_ACQUIRE)) return true;
         __asm__ volatile ("pause" ::: "memory");
     }
 
-    kprintf("[smp] cpu%u: timed out waiting for online flag\n", cpu_idx);
+    kprintf("[smp] cpu%u: started but never reached online (stuck in AP init)\n",
+            cpu_idx);
     return false;
 }
 
