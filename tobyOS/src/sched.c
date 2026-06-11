@@ -68,7 +68,29 @@ extern void proc_context_switch(uint64_t *save_old_rsp,
  * Held with IRQs ENABLED (plain spinlock) because syscall bodies must keep
  * taking device IRQs; IRQ handlers do NOT take the BKL (their shared state --
  * heap, PMM, per-CPU sched queues -- has its own fine-grained spinlocks). */
-static spinlock_t g_bkl = SPINLOCK_INIT;
+/* The BKL is a FAIR ticket lock, NOT the generic unfair test-and-set spinlock.
+ * Fairness is essential here: under SMP, user procs on the APs take the BKL on
+ * every syscall (and again for the syscall-return net_service_tick/gui_tick
+ * work), so an unfair lock let the APs win re-acquisition indefinitely and
+ * STARVE pid 0's idle-loop bkl_enter() -- the BSP never got a turn to run
+ * gui_tick, which looked like a hard full-desktop freeze (random 1-30 s in,
+ * heartbeat just stops). A ticket lock serves waiters FIFO, so the BSP always
+ * gets its turn within one rotation. (The generic spinlock_t stays unfair --
+ * fine for the short IRQ-off critical sections it guards.) */
+typedef struct {
+    volatile uint32_t next;      /* next ticket number to hand out */
+    volatile uint32_t serving;   /* ticket currently allowed to proceed */
+} bkl_ticket_t;
+static bkl_ticket_t g_bkl = { 0, 0 };
+
+static inline void bkl_lock(void) {
+    uint32_t my = __atomic_fetch_add(&g_bkl.next, 1u, __ATOMIC_RELAXED);
+    while (__atomic_load_n(&g_bkl.serving, __ATOMIC_ACQUIRE) != my)
+        __asm__ volatile ("pause" ::: "memory");
+}
+static inline void bkl_unlock(void) {
+    __atomic_store_n(&g_bkl.serving, g_bkl.serving + 1u, __ATOMIC_RELEASE);
+}
 
 /* APs only start stealing + running user procs once the BSP has finished its
  * boot sequence and entered the GUI idle loop. Until then kernel_main touches
@@ -77,16 +99,62 @@ static spinlock_t g_bkl = SPINLOCK_INIT;
 static volatile bool g_ap_run_enabled = false;
 void sched_enable_ap_run(void) { g_ap_run_enabled = true; }
 
+/* Diagnostic: how many times bkl_enter() was called by a CPU that ALREADY held
+ * the BKL. Should be readable via QMP/`cpus`; non-zero means the upstream BKL
+ * accounting has an imbalance worth chasing, but the idempotent guard below
+ * keeps it from being fatal. */
+volatile uint64_t g_bkl_reenters = 0;
+
+/* ---- BKL accounting instrumentation (diagnosing the freeze) -------------
+ * g_bkl_owner   : cpu_idx that currently owns g_bkl (-1 == free).
+ * g_bkl_enter_idmm / g_bkl_exit_idmm : times bkl_enter/bkl_exit saw an
+ *   smp_this_cpu() whose cpu_idx disagrees with the recorded owner -- the
+ *   signature of per-CPU mis-identification.
+ * g_bkl_exit_notheld : bkl_exit() calls that no-op'd because holds_bkl was 0
+ *   while g_bkl was actually held by someone (a leaked/lost release). */
+volatile int      g_bkl_owner       = -1;
+volatile uint64_t g_bkl_enter_idmm  = 0;
+volatile uint64_t g_bkl_exit_idmm   = 0;
+volatile uint64_t g_bkl_exit_notheld = 0;
+volatile int      g_bkl_mm_owner    = -1;   /* owner at the last mismatch */
+volatile int      g_bkl_mm_caller   = -1;   /* mis-id'd cpu at last mismatch */
+
 void bkl_enter(void) {
-    spin_lock(&g_bkl);
-    smp_this_cpu()->holds_bkl = true;
+    struct percpu *me = smp_this_cpu();
+    if (me->holds_bkl) { g_bkl_reenters++; return; }   /* idempotent re-entry */
+    bkl_lock();
+    me->holds_bkl = true;
+    g_bkl_owner = (int)me->cpu_idx;
 }
 
 void bkl_exit(void) {
     struct percpu *me = smp_this_cpu();
-    if (!me->holds_bkl) return;     /* idempotent: never double-unlock */
+    if (!me->holds_bkl) {
+        /* This CPU doesn't think it owns the BKL. If g_bkl is nonetheless held
+         * by some cpu_idx, releasing was lost -> the lock leaks. Record it. */
+        if (g_bkl_owner >= 0) {
+            g_bkl_exit_notheld++;
+            g_bkl_mm_owner  = g_bkl_owner;
+            g_bkl_mm_caller = (int)me->cpu_idx;
+        }
+        return;                          /* idempotent: never double-unlock */
+    }
+    if (g_bkl_owner != (int)me->cpu_idx) {
+        /* We "own" it per holds_bkl, but the recorded acquirer was a different
+         * cpu_idx -> the same physical CPU was identified differently at
+         * enter vs exit (mis-ID), or the BKL crossed CPUs. */
+        g_bkl_exit_idmm++;
+        g_bkl_mm_owner  = g_bkl_owner;
+        g_bkl_mm_caller = (int)me->cpu_idx;
+    }
     me->holds_bkl = false;
-    spin_unlock(&g_bkl);
+    g_bkl_owner = -1;
+    bkl_unlock();
+}
+
+bool bkl_held(void) {
+    struct percpu *me = smp_this_cpu();
+    return me && me->holds_bkl;
 }
 
 void sched_init(void) {

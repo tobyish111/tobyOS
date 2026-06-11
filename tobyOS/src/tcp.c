@@ -7,6 +7,7 @@
 #include <tobyos/pit.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+#include <tobyos/sched.h>   /* bkl_held/bkl_exit/bkl_enter for the wait loop */
 
 #define TCP_MAX_CONNS         12
 #define TCP_RX_BUF_BYTES    8192
@@ -750,8 +751,24 @@ static int tcp_poll_until(struct tcp_conn *c, uint64_t deadline,
         if (p) return p;
         if (!tcp_tick_one(c)) return -1;
         if (pit_ticks() >= deadline) return 0;
+
+        /* Idle until the next interrupt. CRITICAL: drop the big kernel lock
+         * across the wait. This loop backs the blocking TCP syscalls
+         * (connect/accept/send/recv/close). When one runs on a secondary CPU
+         * the syscall holds the BKL, and holding it across this multi-tick
+         * wait starves every other core -- in particular pid 0 on the BSP,
+         * whose idle loop drives the GUI compositor AND pumps the network RX
+         * that would satisfy our predicate. Holding it here was a hard,
+         * intermittent full-desktop freeze (the waiter sits in `hlt` with the
+         * BKL held while pid 0 spins forever in bkl_enter). Releasing it lets
+         * pid 0 run (and advance the network) while we sleep; we re-take it
+         * before touching shared net state on the next iteration. The
+         * net-state work above all runs under the BKL, so nothing races. */
+        bool had_bkl = bkl_held();
+        if (had_bkl) bkl_exit();
         sti();
         hlt();
+        if (had_bkl) bkl_enter();
     }
 }
 

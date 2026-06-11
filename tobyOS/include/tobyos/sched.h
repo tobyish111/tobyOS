@@ -93,6 +93,11 @@ void sched_yield(void);
 void bkl_enter(void);
 void bkl_exit(void);
 
+/* True if the calling CPU currently holds the BKL. Lets a long cooperative
+ * wait (e.g. a blocking network syscall) release the BKL across its idle
+ * period and reacquire it afterwards, so it never starves the other cores. */
+bool bkl_held(void);
+
 /* Allow secondary CPUs to start stealing + running user procs. Called once by
  * the BSP after its boot sequence, right before entering the GUI idle loop --
  * before this, APs idle so they can't race kernel_main's unlocked boot work. */

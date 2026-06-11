@@ -2752,6 +2752,12 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * IRQs on (we just sti'd); IRQ handlers don't take the BKL. */
     bkl_enter();
 
+    /* DIAG: record the syscall this CPU is currently inside (by cpu_idx) so a
+     * freeze capture can name the syscall whose body/return path is holding the
+     * BKL. Cleared to -1 at the normal return below. */
+    extern volatile long g_cpu_syscall[32];
+    g_cpu_syscall[smp_current_cpu_idx() & 31] = num;
+
     /* ---- Milestone 19: per-syscall perf zone + per-proc counter ---
      *
      * perf_syscall_enter/exit wrap the dispatch body. The overhead is
@@ -2788,31 +2794,24 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
     perf_syscall_exit((int)num, t_sys);
     perf_zone_end(PERF_Z_SYSCALL, t_sys);
 
-    /* User GUI apps can make long bursts of draw/read/event syscalls.
-     * Service networking before GUI work so compositor/input changes
-     * cannot starve NIC RX, DHCP follow-up traffic, or SSH. Then service
-     * local input before the compositor tick so USB HID reports delivered
-     * by xHCI IRQs do not sit in the mouse queue until pid 0 eventually
-     * reaches the idle loop again. */
-    if (gui_active()) {
+    /* Drive GUI/net/input housekeeping from the syscall-return path ONLY on a
+     * uniprocessor. On a single CPU this is essential: while a user app runs,
+     * pid 0's idle loop never gets the CPU, so its compositor/network/input
+     * ticks would stall until the app yields -- driving them here keeps the
+     * desktop and NIC RX alive across long syscall bursts.
+     *
+     * Under SMP this is REMOVED. pid 0 runs concurrently on the BSP and drives
+     * all of this from idle_loop, so doing it again on every AP syscall return
+     * is redundant -- and harmful: gui_tick() internally sched_yield()s, so the
+     * syscall (holding the BKL) drops + reacquires the BKL and switches procs
+     * mid-return. That deeply-nested BKL juggling on every syscall, combined
+     * with the heavy work holding the lock, was the source of a rare full-
+     * desktop freeze (the BSP couldn't make progress while APs churned the
+     * lock through this path). Letting pid 0 be the sole driver keeps the BKL
+     * critical sections short and the nesting flat. */
+    if (gui_active() && smp_online_count() <= 1) {
         net_service_tick();
         syscall_service_input();
-    }
-
-    /* Drive the GUI compositor from the syscall return path.
-     *
-     * Milestone 19 optimization: skip gui_tick() entirely when the GUI
-     * subsystem isn't active (serial-only shell path). The function is
-     * already cheap-when-idle (early-out on !g.ready), but the call
-     * itself still touches multiple globals; avoiding it on the hot
-     * text-mode syscall path saves a measurable chunk on fast boxes
-     * where the shell issues thousands of SYS_WRITE in a burst.
-     *
-     * Correctness: when the GUI isn't running, gui_tick has nothing
-     * to do -- compositor state is idle, no launch queue to drain,
-     * no service ticks to run (services tick is also gated behind
-     * on_pid0 AND g.active internally). */
-    if (gui_active()) {
         gui_tick();
         net_service_tick();
         syscall_service_input();
@@ -2831,6 +2830,8 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * it and we never got here; bkl_exit is idempotent regardless.) */
     bkl_exit();
 
+    g_cpu_syscall[smp_current_cpu_idx() & 31] = -1;   /* DIAG: syscall done */
+
     /* Re-mask interrupts before we return into the .S unwind. The
      * trampoline pops 14 registers and then does `mov rsp, [rsp]` to
      * jump back onto the user stack -- if an IRQ fired in that window
@@ -2840,6 +2841,12 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
     cli();
     return rv;
 }
+
+/* DIAG: per-cpu_idx current syscall number (-1 == not in a syscall). Read at a
+ * freeze to identify which syscall is holding the BKL on the stuck core. */
+volatile long g_cpu_syscall[32] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1 };
 
 /* Program the SYSCALL-related MSRs on the CURRENT CPU. EFER.SCE/STAR/LSTAR/
  * FMASK are all per-CPU, so every core that runs ring-3 code must set them or
