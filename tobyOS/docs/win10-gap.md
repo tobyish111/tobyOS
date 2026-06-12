@@ -42,12 +42,12 @@ honest number.
 | Subsystem | Canvas | Now | Notes |
 |---|---|---|---|
 | Scheduler / SMP | ~12% | ~22% | **APs run user code in parallel AND the dispatcher is now priority-aware + preemptively timesliced; the SMP desktop-freeze livelock is root-caused & fixed.** Per-CPU TSS + SYSCALL stack (GS base, no swapgs) + `current_proc` + AP CR0/CR4/EFER parity + per-CPU SYSCALL MSRs; a syscall-path **big-kernel-lock** serializes kernel entry (and pid 0's `gui_tick`/service work) so user code parallelizes while VFS/GUI/proc-table stay race-free; per-CPU **idle procs** + **work-stealing** distribute work; AP-run gated until boot completes. Measured **~2.6-2.7x on 4 CPU-bound workers**. **SMP desktop-freeze livelock fixed (2026-06-11):** the BKL is a fair ticket lock, pid 0's idle_loop holds it per-phase (not across the whole iteration), nanosleep/tcp waits drop it, and login no longer busy-polls; AP bringup retries missed SIPIs (`started`-flag-gated re-INIT). **Priority classes** (IDLE/LOW/NORMAL/HIGH/RT, `prio` HIGHER-runs-first, 0==NORMAL default; `SYS_SETPRIORITY`/`GETPRIORITY` + `toby_setprio` libc, uid/root policy) drive a highest-effective-priority dequeue with **FIFO-within-level** and **aging anti-starvation**. **Fair per-AP timeslicing:** the per-CPU LAPIC timer now preempts ring-3 user code whose class quantum is spent (only the BSP had the PIT before), so a CPU-bound proc stolen onto an AP no longer monopolises that core. Validated (`-DSCHEDPRIO_BOOT`): 3 HIGH vs 3 LOW workers on 4 cores → HIGH got **~18x** the CPU of LOW yet **every LOW proc still ran** (no starvation). GUI desktop stable (default and `+smap`). **Known issue:** an `argc>=1` first-run proc on an AP **under SMAP** SMEP-faults (`argc=0` clean) — real-HW only, needs HW debugging; non-SMAP unaffected. Still a coarse 5-class scheme, not full MLFQ / load-balancing. |
-| Memory | ~18% | ~24% | `swap_init` wired; **real CoW fork** (`vmm_cow_fork` + `mmap_cow_clone`, no longer eager-copy); demand paging live; ASLR/NX/SMEP. Still bitmap PMM, first-fit heap, no memory compression / large pages. |
+| Memory | ~18% | ~24% | `swap_init` wired; **real CoW fork** (`vmm_cow_fork` + `mmap_cow_clone`) — **actually functional as of 2026-06-12** (it had 4 latent bugs: child restarted at _start, no TLB flush after write-protect, refcounts off by one enabling shared writable pages, non-ref-aware teardown freeing live pages; see changelog); demand paging live; ASLR/NX/SMEP. Still bitmap PMM, first-fit heap, no memory compression / large pages. |
 | Filesystem / Storage | ~20% | ~29% | TobyFS: **journaling** (replay on mount), **direct + single + double-indirect blocks** (max file now ~4 GiB, was ~4 MiB), **dynamic device-sized volumes** (format scales geometry + multi-block bitmaps to the disk, up to 1 GiB; legacy 4 MiB images still mount), **256-entry write-back buffer cache**. Fixed a latent journal intra-transaction read-after-write bug (was silently corrupting freshly-created inodes sharing a parent's inode-table block). VFS over ramfs/TobyFS/FAT32/ext2(rw)/ext4(ro)/proc/sys/cryptfs. **NVMe now handles 4K-LBA namespaces** (512-byte logical view + RMW for sub-sector access). **Block I/O is now async with real command queuing** — NVMe keeps multiple SQ commands in flight (CID-tagged) and AHCI uses NCQ (FPDMA QUEUED, up to 32 tags); a cooperative-yield wait lets concurrent submitters keep the hardware queue full. **ext4 is now read-write** (in-place overwrite, file growth via depth-0 extent-tree extension + block allocation, create/unlink/mkdir) on a clean no-journal image; journaled/needs-recovery images still mount read-only. Still no NTFS-class streams/ACLs; no ext4 journaling (writes not crash-atomic). |
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
 | Device Drivers | ~12% | ~14% | **Loadable `ET_REL` kernel module loader** (foundational). 6 NIC drivers, AHCI/NVMe/IDE/virtio-blk, xHCI/EHCI/HID/MSC, HDA. No real GPU driver; no signed third-party ecosystem. |
 | GUI / Desktop | ~10% | ~12% | GPU-accelerated compositor path exists **but only active with VirtIO-GPU**; on real Intel iGPU it falls back to the CPU/Limine compositor. Now **usable on hardware** (login no longer flaps; mouse/keyboard work). |
-| Security | ~8% | ~15% | Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP re-enabled** behind a syscall-wide stac/clac uaccess window + wrapped loader/argv; validated under QEMU `+smap` (full desktop + sigtest, no #PF). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
+| Security | ~8% | ~17% | **SA_RESTART + job control (SIGSTOP/SIGCONT, PROC_STOPPED) now work**, signals reach CPU-bound procs on APs (LAPIC-tick delivery), and the SA_* flag ABI is Linux-aligned. Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP re-enabled** behind a syscall-wide stac/clac uaccess window + wrapped loader/argv; validated under QEMU `+smap` (full desktop + sigtest, no #PF). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
 | Power / ACPI | ~6% | ~9% | **RTC driver** → real wall-clock time. ACPI shutdown + partial S3/S4 framework. No full AML power management. |
 | Audio / Media | ~15% | ~15% | Intel HDA + software mixer + decode helpers. Unchanged this round. |
 | App Compatibility | ~2% | ~5% | POSIX libc filled in (`signal.h`, `fork`, `symlink`/`readlink`, real `getuid/gid`, `wait`, `access`). **SSE/FP now enabled** (CR0/CR4 + FXSAVE/FXRSTOR FPU context switch), so floating-point programs run; **libc printf gained `%f`/`%e`/`%g`**; user stack 32 KiB→256 KiB. Marquee ports (lua/make/less/curl/tcc/as) **now actually ship in the initrd** (were built but omitted from the tar). **Lua interpreter runs real scripts** (`/bin/lua`, verified by `/etc/lua_selftest.lua`). Still own-ELF-only; **zero** Win32/.NET/UWP. |
@@ -122,8 +122,10 @@ driver model; POSIX libc surface.
    with watchdog auto-revert. QEMU can't emulate the Intel GT, so 3-4 stay EliteDesk-validated.
 5. **Security depth** — ~~salted/KDF auth~~ (Argon2id), ~~login rate-limiting~~ (lockout),
    ~~signal *delivery*~~ (frame push + sigreturn), ~~re-enable SMAP~~ (syscall-wide uaccess
-   window). This bundle is now largely done. Remaining: per-copy uaccess accessors (the
-   window is coarser than Linux's per-`copy_*_user`), SA_RESTART, job control/stop-cont.
+   window), ~~SA_RESTART~~, ~~job control stop/cont~~ (both 2026-06-12). Remaining: per-copy
+   uaccess accessors (the window is coarser than Linux's per-`copy_*_user`; converting is a
+   large cross-cutting audit -- every syscall body and the VFS/GUI/net paths deref user
+   pointers directly today), SA_SIGINFO, terminal job-control wiring.
 
 ---
 
@@ -148,15 +150,46 @@ driver model; POSIX libc surface.
 - GPU accel: VirtIO-only; real-HW desktop is CPU-composited.
 - SMAP: enabled, but via a coarse syscall-wide stac/clac window rather than per-copy
   accessors, so a stray user-pointer deref *inside* a syscall isn't caught (only outside).
-- Signals: user-handler delivery now works (frame push + sigreturn, mask/pending
-  honored). Still missing: SA_RESTART syscall restart, job-control stop/cont,
-  SA_SIGINFO/siginfo_t, and handler delivery to a pure-CPU-bound process is
-  deferred to its next syscall (timer-IRQ path doesn't push frames).
+- Signals: user-handler delivery works (frame push + sigreturn, mask/pending
+  honored), SA_RESTART restarts interrupted syscalls, and SIGSTOP/SIGCONT job
+  control works (PROC_STOPPED; stops delivered even to CPU-bound procs on APs via
+  the LAPIC tick). Still missing: SA_SIGINFO/siginfo_t, SIGCHLD-on-stop/WUNTRACED,
+  terminal-driven SIGTSTP/TTIN/TTOU, and *caught-handler* delivery to a pure-CPU-
+  bound process is deferred to its next syscall (tick paths only run default
+  dispositions; they don't push handler frames).
 - TobyFS journaling/swap/CoW: wired but not stress-tested under crash/pressure/load.
 
 ---
 
 ## Changelog
+- **2026-06-12** — **SA_RESTART + job control; fork/CoW was never actually functional — 4
+  latent bugs fixed.** Security-depth bundle: (1) **SA_RESTART** — an EINTR'd blocking syscall
+  whose caught handler has SA_RESTART is transparently re-executed (delivery rewinds the saved
+  user RIP onto the `syscall` insn with RAX = the syscall number; args still live in the saved
+  trapframe). (2) **Job control** — new `PROC_STOPPED` state; SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU
+  park the proc, SIGCONT resumes at *send* time per POSIX (stops ↔ CONT cancel each other's
+  pending bits), SIGKILL wakes a stopped proc to die. (3) The per-CPU LAPIC tick now delivers
+  signals when it interrupts ring 3 — before, only the BSP's PIT path delivered, so a CPU-bound
+  proc on an AP dodged fatal/stop signals indefinitely. (4) **ABI fix**: kernel SA_* flag values
+  collided with libtoby's Linux-style values (user `SA_NOCLDSTOP`=0x1 read as kernel
+  `SA_RESTART`) — kernel now uses Linux values; libtoby gains SA_NODEFER/SA_RESETHAND/
+  SIGTTIN/SIGTTOU, errno.h gains EINTR. **The new fork-based sigtest cases then exposed that
+  fork/CoW had never worked** (nothing in-tree forked and checked semantics; the terminal's
+  fork+exec path was silently broken): (a) fork resumed the child at the spawn-time ELF entry —
+  children re-ran `_start` over a CoW image; now the parent's saved syscall register block is
+  copied onto the child kstack and the child descends through the normal syscall unwind with
+  rax=0, all registers restored. (b) `vmm_cow_fork` write-protected the parent's PTEs but never
+  flushed the TLB — the parent wrote through stale writable entries, silently corrupting shared
+  pages. (c) CoW refcounts started at 1 (spawn-time pages predate the refcount system), so the
+  sole-owner fast path made the *shared* page writable for both procs — shared writable stacks.
+  (d) proc teardown freed leaf frames unconditionally, handing a parent's still-shared pages
+  back to the PMM when a fork child exited. Plus: kernel-mode #PF on user-half addresses
+  (kernel writing user memory under the SMAP window — syscall out-params, signal frames) now
+  routes through the CoW/demand handler instead of dying. Verified via extended `/bin/sigtest`
+  (`-DSIGTEST_BOOT`): 9/9 checks incl. SA_RESTART restart, EINTR without it, and
+  SIGSTOP-park (LAPIC path, CPU-spinning child)/SIGCONT/SIGKILL observed via /proc; two full
+  fork/wait cycles per run; 3×60 s default boots clean. Security ~15% → ~17%; Memory: CoW fork
+  *actually* works now.
 - **2026-06-11** — **SMP desktop-freeze root-caused & fixed (BKL livelock) + bringup/idle
   hardening.** The long-standing SMP-only hard desktop freeze (gui_tick heartbeat just stops,
   no fault; needed `-smp >= 2`) was root-caused via non-invasive QMP captures as a **BKL
