@@ -2837,8 +2837,9 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * during the body, deliver it now -- for a caught signal this pushes a
      * handler frame and rewrites our trapframe so the SYSRETQ below lands in
      * the handler; for a fatal default it proc_exit()s and never returns.
-     * `rv` is preserved as the to-be-restored RAX for the handler case. */
-    signal_deliver_syscall(rv);
+     * `rv` is preserved as the to-be-restored RAX for the handler case
+     * (or swapped for a syscall restart when the action has SA_RESTART). */
+    signal_deliver_syscall(rv, num);
 
     /* Leaving the kernel: drop the BKL so another core can enter. (If the
      * body proc_exit'd or a signal killed us, the scheduler already released

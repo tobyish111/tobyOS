@@ -320,11 +320,43 @@ int vmm_cow_fork(uint64_t parent_cr3, uint64_t child_cr3) {
                         child_pt[i1] = pte_val;
                     }
 
-                    /* Increment reference count on shared physical page */
-                    page_ref_inc(phys);
+                    /* Account BOTH owners of the now-shared page. Pages
+                     * allocated at spawn/exec time predate the refcount
+                     * system and sit untracked at 0, so the original
+                     * single inc here produced refs == 1 -- the COW fault
+                     * handler's sole-owner shortcut then made the SHARED
+                     * page writable in place for parent and child alike
+                     * (shared writable stacks: the post-fork procs
+                     * scribbled over each other and jumped through
+                     * corrupted return addresses). Bring an untracked
+                     * page to 1 (the parent's own reference) before
+                     * adding the child's. */
+                    if (page_ref_get(phys) == 0)
+                        page_ref_inc(phys);     /* parent's untracked ref */
+                    page_ref_inc(phys);         /* child's new ref        */
                 }
             }
         }
+    }
+
+    /* CRITICAL: flush the TLB. We just stripped PTE_WRITABLE from every
+     * writable user PTE of the RUNNING parent, whose translations -- its
+     * own stack above all -- are hot in this CPU's TLB with the old write
+     * permission cached. Without a flush the parent keeps writing straight
+     * through stale TLB entries after fork() returns: no #PF, no CoW copy,
+     * and its writes land on the physical pages now shared with the child
+     * (observed as the fork child "resuming" with the parent's later stack
+     * frames -- its return addresses were overwritten under it). Reloading
+     * CR3 flushes all non-global entries; user pages are non-global. Other
+     * CPUs are safe without an IPI shootdown: the parent runs on exactly
+     * one CPU (this one), and any future migration switches CR3 anyway
+     * (proc_context_switch), which flushes that CPU's stale entries before
+     * the parent can run there. (Inline asm rather than cpu.h's helpers --
+     * this file defines its own invlpg, which collides with cpu.h's.) */
+    {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
     }
 
     return 0;

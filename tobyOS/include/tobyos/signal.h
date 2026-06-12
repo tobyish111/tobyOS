@@ -48,13 +48,20 @@
 #define SIG_MAX  32
 #define SIGMASK(s) ((uint32_t)1u << (s))
 
-/* ---- Signal action flags ---- */
+/* ---- Signal action flags ----
+ *
+ * VALUES ARE ABI: userland passes these through sys_sigaction's raw
+ * sa_flags, so the kernel constants MUST match libtoby's <signal.h> (which
+ * uses the Linux values, easing ports). The original kernel-private values
+ * (0x01..0x10) silently collided -- e.g. libtoby's SA_NOCLDSTOP (0x1) was
+ * the kernel's SA_RESTART -- the same class of footgun as the GUI_EV_*
+ * event-type mismatch. Keep both headers in lockstep. */
 
-#define SA_RESTART   0x01   /* restart interrupted syscall */
-#define SA_NOCLDSTOP 0x02   /* don't notify on child stop */
-#define SA_SIGINFO   0x04   /* use sa_sigaction instead of sa_handler */
-#define SA_RESETHAND 0x08   /* reset to SIG_DFL after delivery */
-#define SA_NODEFER   0x10   /* don't block signal during handler */
+#define SA_NOCLDSTOP 0x00000001  /* don't notify on child stop */
+#define SA_SIGINFO   0x00000004  /* use sa_sigaction instead of sa_handler */
+#define SA_RESTART   0x10000000  /* restart interrupted syscall */
+#define SA_NODEFER   0x40000000  /* don't block signal during handler */
+#define SA_RESETHAND 0x80000000  /* reset to SIG_DFL after delivery */
 
 /* Special handler values */
 #define SIG_DFL  ((void (*)(int))0)
@@ -82,6 +89,24 @@ struct signal_state {
 /* errno-ish return value for interrupted blocking primitives */
 #define EINTR_RET ((long)-4)
 
+/* Mirror of the register block syscall_entry.S leaves on the per-process
+ * kernel syscall stack. Listed in ASCENDING address order, which is the
+ * REVERSE of the push order. The base address of this block is
+ * `proc->kstack_top - sizeof(struct syscall_regs)` because the scheduler
+ * keeps the per-CPU syscall_rsp == current kstack_top and syscall_entry
+ * pushes downward from there. Shared by signal delivery (frame rewrite)
+ * and fork (the child's resume frame is a copy of the parent's).
+ *
+ * THIS MUST STAY IN SYNC WITH THE PUSH SEQUENCE IN syscall_entry.S. */
+struct syscall_regs {
+    uint64_t r15, r14, r13, r12, rbp, rbx;   /* callee-saved          */
+    uint64_t r9, r8, r10, rdx, rsi, rdi;     /* user syscall arg regs */
+    uint64_t r11;        /* user RFLAGS (SYSRETQ reloads from here)   */
+    uint64_t rcx;        /* user RIP    (SYSRETQ reloads from here)   */
+    uint64_t pad;        /* 16-byte alignment pad                     */
+    uint64_t user_rsp;   /* saved user RSP                            */
+};
+
 struct proc;
 
 /* Initialise signal state. */
@@ -106,10 +131,13 @@ void signal_send_to_foreground(int sig);
 void signal_deliver_if_pending(void);
 
 /* Check and deliver pending signals from the SYSCALL return path. `rv` is
- * the syscall's return value. For a signal with a user handler this pushes a
- * signal frame onto the user stack and rewrites the saved trapframe so the
- * SYSRETQ lands in the handler; sys_sigreturn later restores the context. */
-void signal_deliver_syscall(long rv);
+ * the syscall's return value and `num` its number (for SA_RESTART: an
+ * EINTR'd syscall whose handler asks for restart is re-executed by rewinding
+ * the saved user RIP to the `syscall` instruction with RAX = num). For a
+ * signal with a user handler this pushes a signal frame onto the user stack
+ * and rewrites the saved trapframe so the SYSRETQ lands in the handler;
+ * sys_sigreturn later restores the context. */
+void signal_deliver_syscall(long rv, long num);
 
 /* Quick non-destructive query */
 bool signal_pending_self(void);

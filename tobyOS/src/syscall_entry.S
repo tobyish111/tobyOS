@@ -177,7 +177,12 @@ syscall_entry:
     clac
 2:
 
-    /* Unwind in reverse push order. */
+    /* Unwind in reverse push order. Also the entry point for a fork child's
+     * first return to user mode: fork copies the parent's whole register
+     * block onto the child kstack and jumps here via fork_child_return_asm
+     * with rsp at the block base and rax = 0 (the child's fork() return). */
+.global syscall_return_unwind
+syscall_return_unwind:
     pop r15
     pop r14
     pop r13
@@ -209,5 +214,25 @@ syscall_entry:
     mov rsp, [rsp]          /* user RSP <- saved slot */
 
     sysretq                 /* CPL3, RIP <- rcx, RFLAGS <- r11 */
+
+/* ============================================================== */
+/* fork_child_return_asm -- a fork child's first descent to ring 3 */
+/* ============================================================== */
+.global fork_child_return_asm
+.type   fork_child_return_asm, @function
+/* void fork_child_return_asm(uint64_t frame_rsp);   // rdi
+ *
+ * `frame_rsp` is the base of the syscall register block fork copied from
+ * the parent onto THIS child's kstack. Replay the normal syscall unwind on
+ * it so the child resumes at the parent's post-`syscall` instruction with
+ * every user register restored and rax = 0 (fork's child return value).
+ * cli first for the same reason syscall_dispatch does before returning:
+ * the `mov rsp, [rsp]` window in the unwind must not take an IRQ on a
+ * half-switched stack. sysretq reloads user RFLAGS (IF=1) from r11. */
+fork_child_return_asm:
+    cli
+    mov rsp, rdi
+    xor eax, eax
+    jmp syscall_return_unwind
 
 .section .note.GNU-stack, "", @progbits

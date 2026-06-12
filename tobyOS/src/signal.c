@@ -19,22 +19,8 @@ static int g_foreground_pid = 0;
  * to restore a frame without it (a corrupt/forged frame -> SIGSEGV). */
 #define SIG_FRAME_MAGIC  0x5347465254423031ULL  /* "SGFRTB01" */
 
-/* Mirror of the register block syscall_entry.S leaves on the per-process
- * kernel syscall stack. Listed in ASCENDING address order, which is the
- * REVERSE of the push order. The base address of this block is
- * `current_proc()->kstack_top - sizeof(struct syscall_regs)` because the
- * scheduler keeps g_kernel_syscall_rsp == current kstack_top (sched.c) and
- * syscall_entry pushes downward from there.
- *
- * THIS MUST STAY IN SYNC WITH THE PUSH SEQUENCE IN syscall_entry.S. */
-struct syscall_regs {
-    uint64_t r15, r14, r13, r12, rbp, rbx;   /* callee-saved          */
-    uint64_t r9, r8, r10, rdx, rsi, rdi;     /* user syscall arg regs */
-    uint64_t r11;        /* user RFLAGS (SYSRETQ reloads from here)   */
-    uint64_t rcx;        /* user RIP    (SYSRETQ reloads from here)   */
-    uint64_t pad;        /* 16-byte alignment pad                     */
-    uint64_t user_rsp;   /* saved user RSP                            */
-};
+/* struct syscall_regs (the saved syscall trapframe layout) lives in
+ * <tobyos/signal.h> now -- fork.c shares it for the child resume frame. */
 
 /* Saved user context pushed onto the user stack for a caught signal and read
  * back by sys_sigreturn. It sits ABOVE the 8-byte handler return address so
@@ -96,11 +82,30 @@ static void wait_queue_unlink(struct proc *p) {
     p->wait_head = 0;
 }
 
+#define SIGMASK_STOPS (SIGMASK(SIGSTOP) | SIGMASK(SIGTSTP) | \
+                       SIGMASK(SIGTTIN) | SIGMASK(SIGTTOU))
+
 void signal_send(struct proc *p, int sig) {
     if (!p) return;
     if (sig <= 0 || sig >= SIG_MAX) return;
     if (p->pid == 0) return;
     if (p->state == PROC_UNUSED || p->state == PROC_TERMINATED) return;
+
+    /* Job control (POSIX): SIGCONT resumes a stopped proc even when SIGCONT
+     * itself is ignored or blocked -- the resume happens at SEND time, not
+     * delivery. Generating SIGCONT also discards pending stop signals, and
+     * generating a stop signal discards a pending SIGCONT (they cancel). */
+    if (sig == SIGCONT) {
+        p->pending_signals  &= ~SIGMASK_STOPS;
+        p->sigstate.pending &= ~SIGMASK_STOPS;
+        if (p->state == PROC_STOPPED) {
+            p->state = PROC_READY;
+            sched_enqueue(p);
+        }
+    } else if (SIGMASK(sig) & SIGMASK_STOPS) {
+        p->pending_signals  &= ~SIGMASK(SIGCONT);
+        p->sigstate.pending &= ~SIGMASK(SIGCONT);
+    }
 
     /* Check if signal is ignored (SIG_IGN) and not SIGKILL/SIGSTOP */
     if (sig != SIGKILL && sig != SIGSTOP) {
@@ -114,6 +119,13 @@ void signal_send(struct proc *p, int sig) {
     /* Unblock if asleep */
     if (p->state == PROC_BLOCKED) {
         wait_queue_unlink(p);
+        p->state = PROC_READY;
+        sched_enqueue(p);
+    }
+
+    /* A stopped proc stays stopped for ordinary signals (they stay pending
+     * until SIGCONT) -- but SIGKILL must wake it so it can die. */
+    if (sig == SIGKILL && p->state == PROC_STOPPED) {
         p->state = PROC_READY;
         sched_enqueue(p);
     }
@@ -168,7 +180,18 @@ static void signal_apply_default(struct proc *p, int sig) {
                 p->pid, p->name, sig);
         proc_exit(128 + sig);
     }
-    /* action == 2 (stop): job control not implemented -- treat as ignore. */
+
+    /* action == 2: job-control stop. We are running as `p` (delivery happens
+     * on the target's own syscall-return / tick path), so park ourselves:
+     * leave RUNNING without re-enqueueing -- sched_yield only requeues a
+     * PROC_RUNNING proc, so a STOPPED one just gets switched away from,
+     * exactly like a BLOCKED proc. signal_send's SIGCONT (or SIGKILL) path
+     * later flips us READY + enqueues, and execution resumes right here. */
+    kprintf("[signal] pid=%d '%s' stopped by signal %d\n",
+            p->pid, p->name, sig);
+    p->state = PROC_STOPPED;
+    sched_yield();
+    /* SIGCONT arrived: we're RUNNING again; resume the interrupted flow. */
 }
 
 /* Build a signal frame on the user stack and redirect the saved syscall
@@ -178,7 +201,8 @@ static void signal_apply_default(struct proc *p, int sig) {
  * default disposition. Requires a valid `regs` (syscall return path). */
 static bool signal_setup_user_frame(struct proc *p, int sig,
                                      struct sigaction *sa,
-                                     struct syscall_regs *regs, long rv) {
+                                     struct syscall_regs *regs, long rv,
+                                     long num) {
     if (!regs) return false;
     if (p->sigstate.restorer == 0) {
         kprintf("[signal] pid=%d sig %d: no sigreturn trampoline registered; "
@@ -193,13 +217,25 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     sp &= ~(uint64_t)0xF;                     /* 16-align the context base  */
     struct sig_context *ctx = (struct sig_context *)sp;
 
-    ctx->rax = (uint64_t)rv;
+    /* SA_RESTART: if this handler interrupted a blocking syscall (it bailed
+     * with EINTR) and the action asks for restart, resume at the `syscall`
+     * instruction itself (2 bytes, 0F 05, so saved-RIP minus 2) with RAX
+     * reloaded with the syscall number -- the arg registers below are the
+     * originals from the entry trapframe, so after the handler returns via
+     * sigreturn the kernel re-executes the interrupted call transparently.
+     * Otherwise the handler returns into code that sees rax == -EINTR. */
+    if (rv == EINTR_RET && num >= 0 && (sa->sa_flags & SA_RESTART)) {
+        ctx->rax = (uint64_t)num;
+        ctx->rip = regs->rcx - 2;
+    } else {
+        ctx->rax = (uint64_t)rv;
+        ctx->rip = regs->rcx;          /* original user RIP    */
+    }
     ctx->rdi = regs->rdi; ctx->rsi = regs->rsi; ctx->rdx = regs->rdx;
     ctx->r10 = regs->r10; ctx->r8  = regs->r8;  ctx->r9 = regs->r9;
     ctx->rbx = regs->rbx; ctx->rbp = regs->rbp;
     ctx->r12 = regs->r12; ctx->r13 = regs->r13;
     ctx->r14 = regs->r14; ctx->r15 = regs->r15;
-    ctx->rip       = regs->rcx;        /* original user RIP    */
     ctx->rsp       = regs->user_rsp;   /* original user RSP    */
     ctx->rflags    = regs->r11;        /* original user RFLAGS */
     ctx->saved_mask = p->sigstate.mask;
@@ -229,8 +265,9 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
 
 /* Core delivery. `regs` is the saved syscall trapframe on the SYSCALL return
  * path, or NULL when called from an IRQ (PIT) where no such frame exists.
- * `rv` is the syscall return value (only meaningful when regs != NULL). */
-static void signal_deliver(struct syscall_regs *regs, long rv) {
+ * `rv` is the syscall return value and `num` the syscall number (only
+ * meaningful when regs != NULL; pass num = -1 on the IRQ path). */
+static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
     struct proc *p = current_proc();
     if (!p || p->pending_signals == 0) return;
     if (p->pid == 0) {
@@ -279,20 +316,20 @@ static void signal_deliver(struct syscall_regs *regs, long rv) {
     }
 
     /* User handler: set up the frame; fall back to default if we can't. */
-    if (!signal_setup_user_frame(p, sig, sa, regs, rv))
+    if (!signal_setup_user_frame(p, sig, sa, regs, rv, num))
         signal_apply_default(p, sig);
 }
 
 /* IRQ-context entry (PIT). Handles fatal/default dispositions; caught
  * handlers are deferred to the next syscall return. */
 void signal_deliver_if_pending(void) {
-    signal_deliver(0, 0);
+    signal_deliver(0, 0, -1);
 }
 
 /* SYSCALL-return entry. Has access to the saved trapframe, so it can deliver
  * caught handlers by pushing a signal frame and redirecting the return. */
-void signal_deliver_syscall(long rv) {
-    signal_deliver(current_syscall_regs(), rv);
+void signal_deliver_syscall(long rv, long num) {
+    signal_deliver(current_syscall_regs(), rv, num);
 }
 
 /* ---- Syscall implementations ---- */

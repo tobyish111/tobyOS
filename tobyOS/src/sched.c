@@ -46,6 +46,7 @@
 #include <tobyos/watchdog.h>
 #include <tobyos/pit.h>
 #include <tobyos/isr.h>
+#include <tobyos/signal.h>
 
 /* The SYSCALL trampoline now loads its kernel stack from this CPU's
  * percpu->syscall_rsp (gs:[0]); the scheduler updates it on every switch. */
@@ -551,6 +552,16 @@ void sched_tick(struct regs *r) {
 
     struct proc *cur = current_proc();
     if (!cur || cur->is_idle) return;        /* never preempt pid 0 / ap_idle */
+
+    /* Asynchronous-signal point for CPU-bound user code on THIS cpu. The
+     * PIT only fires on the BSP, so before this a spinning proc running on
+     * an AP could dodge a fatal/stop signal indefinitely (it never makes a
+     * syscall, and the BSP's pit.c delivery never sees it). Same safety
+     * argument as pit.c and the preemption below: we interrupted ring 3, so
+     * the proc holds no kernel lock; default dispositions may proc_exit()
+     * or stop (both sched_yield away), caught handlers stay pending for the
+     * next syscall return. */
+    signal_deliver_if_pending();
 
     if (cur->quantum_left > 0) cur->quantum_left--;
     if (cur->quantum_left > 0) return;        /* slice not spent yet */

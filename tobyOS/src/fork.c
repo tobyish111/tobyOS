@@ -125,26 +125,33 @@ static bool copy_user_pages(uint64_t parent_pml4_phys,
 /* ---- Kernel-stack layout for the child ----------------------------
  *
  * We build the same fake frame that build_kstack() in proc.c does so
- * the first context_switch into the child lands at fork_child_return,
- * which sets rax=0 and jumps back to userspace. */
+ * the first context_switch into the child lands at fork_child_entry,
+ * which descends to ring 3 through the regular syscall unwind. */
 
 extern __attribute__((noreturn)) void proc_enter_user_asm(uint64_t rip,
                                                           uint64_t rsp);
+extern __attribute__((noreturn)) void fork_child_return_asm(uint64_t frame_rsp);
 
-/* The child's first-ever entry after context switch. It returns 0
- * (fork's child return value) by jumping to user mode with rax=0. */
-static __attribute__((noreturn)) void fork_child_entry(void);
-
-/* Implemented below. We need the saved user RIP and RSP from the
- * parent's syscall frame. The syscall entry code saves RCX (user RIP)
- * and R11 (user RFLAGS). We'll stash them in the child proc. */
-
+/* The child's first-ever entry after context switch. The child's kstack
+ * top holds a verbatim copy of the parent's saved syscall register block
+ * (made in sys_fork below), so replaying the syscall unwind on it resumes
+ * the child at the instruction after the parent's `syscall`, with every
+ * user register (incl. callee-saved rbx/rbp/r12-r15, which the compiler
+ * assumes survive the libc fork() call) restored and rax = 0.
+ *
+ * This replaced a long-standing bug: the original implementation jumped to
+ * p->user_entry/user_rsp, which are the SPAWN-TIME ELF entry + initial
+ * stack (never updated after exec) -- so every fork child re-ran the
+ * program from _start over a CoW copy of the parent's memory instead of
+ * resuming at the fork point. Unnoticed because nothing in-tree forked
+ * and checked resume semantics until the SA_RESTART sigtest did. */
 static __attribute__((noreturn)) void fork_child_entry(void) {
     struct proc *p = current_proc();
     /* Load the child's FPU/SSE state (copied from the parent at fork time)
      * -- the switch that landed us here restored the previous proc's state. */
     fpu_restore(p->fpu_state);
-    proc_enter_user_asm(p->user_entry, p->user_rsp);
+    fork_child_return_asm((uint64_t)p->kstack_top
+                          - sizeof(struct syscall_regs));
 }
 
 static bool build_fork_kstack(struct proc *child) {
@@ -154,7 +161,13 @@ static bool build_fork_kstack(struct proc *child) {
     child->kstack_base = base;
     child->kstack_top  = (uint8_t *)base + PROC_KSTACK_SZ;
 
-    uint64_t *sp = (uint64_t *)child->kstack_top;
+    /* The top sizeof(struct syscall_regs) bytes are reserved for the copy
+     * of the parent's saved register block (sys_fork fills it in right
+     * after us); fork_child_entry replays the syscall unwind on it. Build
+     * the context-switch frame BELOW that so the first switch into the
+     * child doesn't clobber the resume frame. */
+    uint64_t *sp = (uint64_t *)((uint8_t *)child->kstack_top
+                                - sizeof(struct syscall_regs));
     *--sp = 0;                                      /* alignment pad */
     *--sp = (uint64_t)fork_child_entry;             /* RIP for ret */
     *--sp = 0;                                      /* r15 */
@@ -244,19 +257,6 @@ long sys_fork(void) {
         }
     }
 
-    /* The child returns to the same user RIP/RSP as the parent.
-     * user_entry and user_rsp are reused by fork_child_entry
-     * to re-enter userspace at the syscall return point.
-     *
-     * The parent's syscall return will have RCX = next user RIP and
-     * the parent's user RSP. We stash the SAME values so the child
-     * continues from the same instruction. The syscall_entry.S code
-     * saves rcx (user RIP) and restores via sysretq. We store the
-     * user-mode return address and stack in user_entry/user_rsp.
-     *
-     * NOTE: These are set from the parent's live values -- the child
-     * will re-enter user mode at the instruction after the syscall. */
-
     /* Build the child's kernel stack. */
     if (!build_fork_kstack(child)) {
         for (int i = 0; i < PROC_NFDS; i++) {
@@ -268,6 +268,16 @@ long sys_fork(void) {
         child->state = PROC_UNUSED;
         return -ABI_ENOMEM;
     }
+
+    /* The child resumes at the parent's post-`syscall` instruction with the
+     * parent's full user register state: copy the live saved register block
+     * off the parent's kstack (we are inside the parent's fork() syscall, so
+     * it sits exactly at kstack_top - sizeof) into the slot build_fork_kstack
+     * reserved at the child's kstack top. fork_child_entry replays the
+     * syscall unwind on this copy with rax = 0. */
+    memcpy((uint8_t *)child->kstack_top  - sizeof(struct syscall_regs),
+           (uint8_t *)parent->kstack_top - sizeof(struct syscall_regs),
+           sizeof(struct syscall_regs));
 
     /* Ready to run. */
     child->state = PROC_READY;

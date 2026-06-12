@@ -72,6 +72,11 @@ enum proc_state {
     PROC_RUNNING,
     PROC_BLOCKED,
     PROC_TERMINATED,
+    /* Job control: stopped by SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU, resumed by
+     * SIGCONT (or killed by SIGKILL). Never on a ready queue; the scheduler
+     * treats it like BLOCKED (won't requeue on yield). Appended after
+     * TERMINATED so existing state ordinals are unchanged. */
+    PROC_STOPPED,
 };
 
 struct proc {

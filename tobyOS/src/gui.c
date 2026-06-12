@@ -4680,6 +4680,7 @@ static const char *proc_state_str_local(int s) {
     case PROC_RUNNING:    return "RUN";
     case PROC_BLOCKED:    return "BLOCK";
     case PROC_TERMINATED: return "TERM";
+    case PROC_STOPPED:    return "STOP";
     default:              return "?";
     }
 }

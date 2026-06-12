@@ -42,6 +42,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/cpu.h>
 #include <tobyos/spinlock.h>
+#include <tobyos/page_fault.h>   /* page_ref_* for CoW-aware teardown */
 
 /* ---- architectural PTE bits ---- */
 
@@ -494,8 +495,21 @@ static void free_subtree(uint64_t table_phys, int level) {
         if (!(e & PTE_P)) continue;
 
         if (level == 1) {
-            /* PT entry -- leaf 4 KiB page, free the data frame. */
-            pmm_free_page(e & PTE_ADDR_MASK);
+            /* PT entry -- leaf 4 KiB page. CoW-aware: after a fork this
+             * frame may be shared with another address space (refcount
+             * > 1); we must only drop OUR reference and let the last
+             * owner's teardown (or its CoW copy-out) free the frame.
+             * Blindly freeing here handed the parent's still-live pages
+             * back to the PMM whenever a fork child exited -- the next
+             * allocation recycled them under the parent. */
+            uint64_t leaf = e & PTE_ADDR_MASK;
+            int refs = page_ref_get(leaf);
+            if (refs > 1) {
+                page_ref_dec(leaf);
+                continue;
+            }
+            if (refs == 1) page_ref_dec(leaf);
+            pmm_free_page(leaf);
             continue;
         }
         if (e & PTE_PS) {

@@ -129,8 +129,24 @@ static void default_exception(struct regs *r) {
             if (mmap_handle_page_fault(fault_addr, r->error_code)) {
                 return; /* fault resolved via mmap demand paging */
             }
-        } else if (kernel_boot_demand_map(fault_addr)) {
-            return;
+        } else {
+            /* Kernel-mode fault on a USER-HALF address: under the syscall-wide
+             * SMAP stac window the kernel legitimately writes user memory
+             * (syscall out-params, the signal frame pushed onto the user
+             * stack), and after a CoW fork those pages are write-protected --
+             * the fault must take the same COW/demand path a ring-3 write
+             * would. Without this, the first kernel write into a post-fork
+             * proc's user memory was fatal. Kernel-half addresses still take
+             * the boot demand-map / fatal path below. */
+            struct proc *cp = current_proc();
+            if (fault_addr < 0x0000800000000000ULL && cp && cp->pid != 0) {
+                if (page_fault_handler(fault_addr, r->error_code, cp))
+                    return;
+                if (mmap_handle_page_fault(fault_addr, r->error_code))
+                    return;
+            }
+            if (kernel_boot_demand_map(fault_addr))
+                return;
         }
     }
 

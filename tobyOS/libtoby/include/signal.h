@@ -27,9 +27,16 @@
 #define SIG_IGN ((void (*)(int))1)
 #define SIG_ERR ((void (*)(int))-1)
 
+/* Linux-compatible values; the kernel's <tobyos/signal.h> mirrors these
+ * exactly (sa_flags crosses the syscall ABI raw -- keep in lockstep). */
 #define SA_RESTART   0x10000000
 #define SA_SIGINFO   0x00000004
 #define SA_NOCLDSTOP 0x00000001
+#define SA_NODEFER   0x40000000
+#define SA_RESETHAND 0x80000000
+
+#define SIGTTIN   21
+#define SIGTTOU   22
 
 /* sigprocmask `how` values */
 #define SIG_BLOCK   0

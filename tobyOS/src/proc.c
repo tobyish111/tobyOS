@@ -141,6 +141,7 @@ const char *proc_state_name(enum proc_state s) {
     case PROC_RUNNING:    return "RUNNING";
     case PROC_BLOCKED:    return "BLOCKED";
     case PROC_TERMINATED: return "TERMINATED";
+    case PROC_STOPPED:    return "STOPPED";
     }
     return "?";
 }
