@@ -2454,6 +2454,12 @@ void _start(void) {
      * recovery is atomic (rollback / replay / heal). */
     { extern int ext4_journal_self_test(void); ext4_journal_self_test(); }
 #endif
+#ifdef MEMCOMP_SELFTEST
+    /* Opt-in: memory-compression self-test -- LZ4 codec round-trip +
+     * ratios, zram pool store/load, and the swap compress/disk-fallback
+     * routing. Runs BEFORE swap_init so it can freely reconfigure swap. */
+    { extern int memcomp_self_test(void); memcomp_self_test(); }
+#endif
     net_dump();
 
     modules_log();

@@ -243,6 +243,8 @@ C_SRCS := src/kernel.c \
           src/crashdump.c \
           src/user.c \
           src/page_fault.c \
+          src/lz4.c \
+          src/zram.c \
           src/swap.c \
           src/oom.c \
           third_party/monocypher-4.0.2/src/monocypher.c \
