@@ -320,12 +320,21 @@
      g_chars_dispatched++;
      g_last_char = c;
  
-     if (c == 0x03) {
+     /* TTY job-control keys -> signals to the foreground process. Checked
+      * before the GUI dispatch so they work from the console shell; when no
+      * console foreground job is set (g_foreground_pid == 0, the usual case
+      * under the GUI) signal_send to pid 0 is a no-op, so GUI apps still see
+      * normal keys. Ctrl-C=SIGINT, Ctrl-\=SIGQUIT, Ctrl-Z=SIGTSTP (the last
+      * stops the job via the PROC_STOPPED machinery; `kill -CONT` resumes). */
+     if (c == 0x03 || c == 0x1c || c == 0x1a) {
          int fg = signal_get_foreground();
-         if (fg > 0) signal_send_to_pid(fg, SIGINT);
+         if (fg > 0) {
+             int sig = (c == 0x03) ? SIGINT : (c == 0x1c) ? SIGQUIT : SIGTSTP;
+             signal_send_to_pid(fg, sig);
+         }
          return;
      }
- 
+
      if (gui_active()) {
          gui_post_key((uint8_t)c);
          return;

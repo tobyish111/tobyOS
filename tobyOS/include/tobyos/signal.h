@@ -77,6 +77,45 @@ struct sigaction {
     int        sa_flags;
 };
 
+/* ---- siginfo_t + ucontext_t (SA_SIGINFO) ----
+ *
+ * tobyOS's own ABI layout (NOT Linux-binary-compatible) -- it MUST match
+ * libtoby's <signal.h>. A 3-arg sa_sigaction handler receives
+ *   void handler(int signo, siginfo_t *info, void *ucontext);
+ * with `info` and `ucontext` pointing at structures the kernel builds on
+ * the user stack alongside the sigreturn frame. */
+
+/* si_code values */
+#define SI_USER    0       /* kill()/raise()/tty-generated */
+#define SI_KERNEL  0x80    /* kernel-synthesized */
+
+typedef struct {
+    int          si_signo;   /* signal number                       */
+    int          si_code;    /* SI_USER / SI_KERNEL                  */
+    int          si_pid;     /* sending pid (0 == kernel/tty)        */
+    unsigned int si_uid;     /* sending uid                          */
+    void        *si_addr;    /* fault address (unused for now, 0)    */
+    int          si_status;  /* exit/signal status (unused for now)  */
+    int          _pad;
+} siginfo_t;
+
+/* Minimal machine context. Register slots are populated from the saved
+ * syscall trapframe; uc_mcontext is enough for a handler to read the
+ * interrupted RIP/RSP/RFLAGS. Layout fixed -- keep libtoby in sync. */
+typedef struct {
+    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rip, rsp, rflags;
+} mcontext_t;
+
+typedef struct ucontext {
+    uint64_t          uc_flags;
+    struct ucontext  *uc_link;
+    sigset_t          uc_sigmask;
+    uint32_t          _pad;
+    mcontext_t        uc_mcontext;
+} ucontext_t;
+
 /* ---- Per-process signal state (stored in proc struct) ---- */
 
 struct signal_state {
@@ -84,6 +123,10 @@ struct signal_state {
     sigset_t         mask;             /* blocked signals */
     sigset_t         pending;          /* pending signals */
     uint64_t         restorer;         /* sigreturn trampoline address */
+    /* SA_SIGINFO: sender identity recorded per pending signal, set at
+     * send time and read at delivery to populate siginfo_t. */
+    int              si_pid[SIG_MAX];
+    uint32_t         si_uid[SIG_MAX];
 };
 
 /* errno-ish return value for interrupted blocking primitives */

@@ -13,6 +13,7 @@
 #include <tobyos/sched.h>
 #include <tobyos/printk.h>
 #include <tobyos/uaccess.h>
+#include <tobyos/klibc.h>
 
 static int g_foreground_pid = 0;
 
@@ -59,6 +60,8 @@ void signal_init_proc(struct signal_state *ss) {
         ss->actions[i].sa_handler = SIG_DFL;
         ss->actions[i].sa_mask    = 0;
         ss->actions[i].sa_flags   = 0;
+        ss->si_pid[i] = 0;
+        ss->si_uid[i] = 0;
     }
     ss->mask     = 0;
     ss->pending  = 0;
@@ -116,6 +119,17 @@ void signal_send(struct proc *p, int sig) {
 
     p->pending_signals |= SIGMASK(sig);
     p->sigstate.pending |= SIGMASK(sig);
+
+    /* Record the sender for SA_SIGINFO's siginfo_t. current_proc() is the
+     * proc that invoked kill()/raise(), or the interrupted proc for a
+     * tty/kernel-generated signal (Ctrl-C from the IRQ path) -- for those
+     * "kernel" sources we stamp pid 0, which reads as SI_USER pid 0. */
+    {
+        struct proc *snd = current_proc();
+        bool from_user = snd && snd != p && snd->pid > 0;
+        p->sigstate.si_pid[sig] = from_user ? snd->pid : 0;
+        p->sigstate.si_uid[sig] = from_user ? snd->uid : 0;
+    }
 
     /* Unblock if asleep */
     if (p->state == PROC_BLOCKED) {
@@ -211,12 +225,25 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
         return false;
     }
 
-    /* Carve the frame out of the user stack, below the SysV red zone.
-     * Build it in a kernel local and copy out (per-copy uaccess). */
-    uint64_t sp = regs->user_rsp;
-    sp -= 128;                                /* skip the 128-byte red zone */
-    sp -= sizeof(struct sig_context);
-    sp &= ~(uint64_t)0xF;                     /* 16-align the context base  */
+    bool siginfo = (sa->sa_flags & SA_SIGINFO) != 0;
+
+    /* Carve the frame out of the user stack, below the SysV red zone. Build
+     * each piece in a kernel local and copy out (per-copy uaccess). Layout,
+     * high address -> low:
+     *     [siginfo_t]      (SA_SIGINFO only)   -- &info passed in RSI
+     *     [ucontext_t]     (SA_SIGINFO only)   -- &uctx passed in RDX
+     *     [sig_context]                        -- sigreturn reads this
+     *     [restorer addr]  == frame            -- handler entry RSP
+     * info/uctx sit ABOVE the context so the handler's own (downward) stack
+     * growth from `frame` never clobbers them. */
+    uint64_t top = regs->user_rsp - 128;      /* skip the 128-byte red zone */
+    uint64_t info_addr = 0, uctx_addr = 0;
+    if (siginfo) {
+        info_addr = (top - sizeof(siginfo_t)) & ~(uint64_t)0xF;
+        uctx_addr = (info_addr - sizeof(ucontext_t)) & ~(uint64_t)0xF;
+        top = uctx_addr;
+    }
+    uint64_t sp = (top - sizeof(struct sig_context)) & ~(uint64_t)0xF;
     struct sig_context kctx;
     struct sig_context *ctx = &kctx;
 
@@ -253,6 +280,40 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
         return false;
     }
 
+    /* SA_SIGINFO: also write the siginfo_t and ucontext_t the 3-arg handler
+     * expects, and pass their addresses in RSI/RDX. */
+    if (siginfo) {
+        siginfo_t info = {
+            .si_signo = sig,
+            .si_code  = SI_USER,
+            .si_pid   = p->sigstate.si_pid[sig],
+            .si_uid   = p->sigstate.si_uid[sig],
+            .si_addr  = 0,
+            .si_status = 0,
+            ._pad     = 0,
+        };
+        ucontext_t uctx;
+        memset(&uctx, 0, sizeof(uctx));
+        uctx.uc_sigmask = p->sigstate.mask;
+        uctx.uc_mcontext.rax = ctx->rax; uctx.uc_mcontext.rbx = ctx->rbx;
+        uctx.uc_mcontext.rcx = regs->rcx; uctx.uc_mcontext.rdx = ctx->rdx;
+        uctx.uc_mcontext.rsi = ctx->rsi; uctx.uc_mcontext.rdi = ctx->rdi;
+        uctx.uc_mcontext.rbp = ctx->rbp;
+        uctx.uc_mcontext.r8  = ctx->r8;  uctx.uc_mcontext.r9  = ctx->r9;
+        uctx.uc_mcontext.r10 = ctx->r10; uctx.uc_mcontext.r11 = regs->r11;
+        uctx.uc_mcontext.r12 = ctx->r12; uctx.uc_mcontext.r13 = ctx->r13;
+        uctx.uc_mcontext.r14 = ctx->r14; uctx.uc_mcontext.r15 = ctx->r15;
+        uctx.uc_mcontext.rip = ctx->rip;
+        uctx.uc_mcontext.rsp = ctx->rsp;
+        uctx.uc_mcontext.rflags = ctx->rflags;
+        if (copy_to_user((void *)info_addr, &info, sizeof(info)) != 0 ||
+            copy_to_user((void *)uctx_addr, &uctx, sizeof(uctx)) != 0) {
+            kprintf("[signal] pid=%d sig %d: cannot write siginfo/ucontext\n",
+                    p->pid, sig);
+            return false;
+        }
+    }
+
     /* Push the handler's return address (the restorer trampoline) one slot
      * below the context. Handler entry RSP must be %16==8 per SysV; since
      * the context base is 16-aligned, frame = ctx-8 satisfies that. */
@@ -272,10 +333,16 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
 
     if (sa->sa_flags & SA_RESETHAND) sa->sa_handler = SIG_DFL;
 
-    /* Redirect the return-to-user: RIP -> handler, RSP -> frame, RDI -> sig. */
+    /* Redirect the return-to-user: RIP -> handler, RSP -> frame, RDI -> sig.
+     * For SA_SIGINFO the handler is void(int, siginfo_t*, void*), so also
+     * pass &info in RSI and &uctx in RDX (SysV arg regs 2 and 3). */
     regs->rcx      = (uint64_t)(uintptr_t)sa->sa_handler;
     regs->user_rsp = frame;
     regs->rdi      = (uint64_t)sig;
+    if (siginfo) {
+        regs->rsi = info_addr;
+        regs->rdx = uctx_addr;
+    }
     return true;
 }
 

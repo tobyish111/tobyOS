@@ -33,9 +33,27 @@ static volatile int g_usr1_count;
 static volatile int g_usr1_signum;
 static volatile int g_usr2_count;
 
+/* SA_SIGINFO test state. */
+static volatile int g_info_count;
+static volatile int g_info_signo;
+static volatile int g_info_pid;
+static volatile int g_info_has_uctx;
+static volatile unsigned long g_info_uc_rsp;
+
 static void on_usr1(int sig) {
     g_usr1_count++;
     g_usr1_signum = sig;
+}
+
+static void on_info(int sig, siginfo_t *info, void *uctx) {
+    g_info_count++;
+    g_info_signo = sig;
+    g_info_pid   = info ? info->si_pid : -1;
+    g_info_has_uctx = (uctx != 0);
+    if (uctx) {
+        ucontext_t *u = (ucontext_t *)uctx;
+        g_info_uc_rsp = u->uc_mcontext.rsp;   /* should be a user-half addr */
+    }
 }
 
 static void on_usr2(int sig) {
@@ -240,6 +258,48 @@ int main(int argc, char **argv) {
                 printf("SIGTEST: SIGKILL reaped the child OK\n");
             } else {
                 printf("SIGTEST: waitpid after SIGKILL FAIL\n");
+                fails++;
+            }
+        }
+    }
+
+    /* ---- Test 7: SA_SIGINFO 3-arg handler gets siginfo + ucontext ----
+     * A child raises SIGUSR1 in the parent via kill(); the parent's
+     * SA_SIGINFO handler must see signo==SIGUSR1, si_pid==child, and a
+     * non-NULL ucontext whose saved RSP is a user-half address. */
+    {
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = on_info;
+        sa.sa_flags     = SA_SIGINFO;
+        sigaction(SIGUSR1, &sa, 0);
+        g_info_count = 0;
+
+        pid_t me  = getpid();
+        pid_t pid = fork();
+        if (pid == 0) {
+            usleep(120 * 1000);
+            kill(me, SIGUSR1);
+            _exit(0);
+        }
+        if (pid < 0) {
+            printf("SIGTEST: fork() for siginfo test FAIL\n");
+            fails++;
+        } else {
+            /* Spin briefly so the signal lands and the handler runs. */
+            for (int i = 0; i < 4 && g_info_count == 0; i++)
+                usleep(80 * 1000);
+            waitpid(pid, 0, 0);
+            if (g_info_count == 1 && g_info_signo == SIGUSR1 &&
+                g_info_pid == (int)pid && g_info_has_uctx &&
+                g_info_uc_rsp != 0 &&
+                g_info_uc_rsp < 0x0000800000000000UL) {
+                printf("SIGTEST: SA_SIGINFO delivered siginfo+ucontext OK "
+                       "(signo=%d si_pid=%d)\n", g_info_signo, g_info_pid);
+            } else {
+                printf("SIGTEST: SA_SIGINFO FAIL (count=%d signo=%d si_pid=%d "
+                       "child=%d uctx=%d rsp=0x%lx)\n",
+                       g_info_count, g_info_signo, g_info_pid, (int)pid,
+                       g_info_has_uctx, g_info_uc_rsp);
                 fails++;
             }
         }

@@ -45,8 +45,40 @@
 
 typedef unsigned long sigset_t;
 
+/* siginfo_t + ucontext_t for SA_SIGINFO 3-arg handlers. MUST match the
+ * kernel's <tobyos/signal.h> layout (tobyOS's own ABI, not Linux-binary). */
+#define SI_USER    0
+#define SI_KERNEL  0x80
+
+typedef struct {
+    int          si_signo;
+    int          si_code;
+    int          si_pid;
+    unsigned int si_uid;
+    void        *si_addr;
+    int          si_status;
+    int          _si_pad;
+} siginfo_t;
+
+typedef struct {
+    unsigned long rax, rbx, rcx, rdx, rsi, rdi, rbp;
+    unsigned long r8, r9, r10, r11, r12, r13, r14, r15;
+    unsigned long rip, rsp, rflags;
+} mcontext_t;
+
+typedef struct ucontext {
+    unsigned long     uc_flags;
+    struct ucontext  *uc_link;
+    sigset_t          uc_sigmask;
+    unsigned int      _uc_pad;
+    mcontext_t        uc_mcontext;
+} ucontext_t;
+
 struct sigaction {
-    void (*sa_handler)(int);
+    union {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, siginfo_t *, void *);
+    };
     sigset_t sa_mask;
     int sa_flags;
 };
