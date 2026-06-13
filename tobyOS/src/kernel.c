@@ -3902,5 +3902,45 @@ void _start(void) {
     }
 #endif
 
+#ifdef SCHEDINT_BOOT
+    /* Opt-in interactivity / io_boost proof (EXTRA_CFLAGS+=-DSCHEDINT_BOOT),
+     * default QEMU CPU. HOGS CPU-bound spinners saturate the cores; one
+     * "pipeint" reader BLOCKS on a pipe fed every ~15 ms by its own (mostly
+     * idle) feeder child, measuring true wake-to-run latency. ALL at
+     * PRIO_NORMAL, so any latency difference is purely the io_boost (granted
+     * when the reader blocks with quantum left): with it the woken reader
+     * out-ranks the hogs at the next scheduling point; without it the reader
+     * waits its FIFO turn behind them. Reader returns avg latency (ms) as its
+     * exit code. Compare boost on/off (toggle SCHED_IO_BOOST) to see the delta;
+     * HOGS == cores so every core is busy when the reader wakes. */
+    {
+        const int HOGS = 6;          /* > cores: even when the feeder frees its
+                                      * core on each write, a hog is queued for
+                                      * it, so the woken reader must out-rank
+                                      * the hog to run promptly -- which is
+                                      * exactly what io_boost decides. */
+        char *hog_av[] = { "mctest", "2500", 0 };
+        char *pi_av[]  = { "mctest", "pipeint", "1800", 0 };
+        struct proc_spec hog = { .path="/bin/mctest", .name="mc-hog",
+                                 .argc=2, .argv=hog_av };
+        struct proc_spec rdr = { .path="/bin/mctest", .name="mc-pipe",
+                                 .argc=3, .argv=pi_av };
+        kprintf("[boot] SCHEDINT: %d CPU hogs + 1 pipe-blocked reader "
+                "(all NORMAL) on %u CPUs\n", HOGS, smp_online_count());
+        bkl_enter();
+        int hpids[8], rpid;
+        for (int i = 0; i < HOGS; i++) hpids[i] = proc_spawn(&hog);
+        rpid = proc_spawn(&rdr);
+        struct proc_exit_info info, rinfo;
+        rinfo.exit_code = -1;
+        if (rpid > 0) proc_wait_info(rpid, &rinfo);  /* exit_code = avg lat ms */
+        for (int i = 0; i < HOGS; i++)
+            if (hpids[i] > 0) proc_wait_info(hpids[i], &info);
+        bkl_exit();
+        kprintf("[boot] SCHEDINT: pipe-reader avg wake latency = %d ms "
+                "(io_boost=%d)\n", rinfo.exit_code, SCHED_IO_BOOST);
+    }
+#endif
+
     idle_loop();
 }

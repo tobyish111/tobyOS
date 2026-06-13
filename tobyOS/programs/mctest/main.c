@@ -19,6 +19,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 int main(int argc, char **argv) {
     /* Touch argv so the compiler keeps the packed strings live and we actually
@@ -28,6 +31,92 @@ int main(int argc, char **argv) {
     for (int a = 0; a < argc; a++) {
         const char *s = argv[a];
         while (s && *s) { sink += (unsigned char)*s; s++; }
+    }
+
+    /* Interactive mode (argv[1]=="int", argv[2]=window ms): the scheduler-
+     * maturity io_boost proof. Repeatedly do a sliver of work then block in
+     * usleep; measure how much longer each wake took than the requested sleep
+     * -- that excess is the wake-to-run scheduling latency. Under CPU-bound
+     * contention an interactive task with the io_boost should preempt the hogs
+     * on wakeup, keeping average latency small; without it the wake would queue
+     * behind a full quantum per competing hog. */
+    if (argc >= 3 && strcmp(argv[1], "int") == 0) {
+        long window = atol(argv[2]);
+        if (window <= 0) window = 1500;
+        const long nap = 5;                  /* requested sleep per cycle (ms) */
+        long start = (long)clock();
+        unsigned long cycles = 0, lat_sum = 0, lat_max = 0;
+        volatile unsigned long x = sink;
+        while (((long)clock() - start) < window) {
+            for (int k = 0; k < 20000; k++) { x += k * 2654435761UL; x ^= x >> 13; }
+            long t0 = (long)clock();
+            usleep((unsigned)(nap * 1000));
+            long elapsed = (long)clock() - t0;
+            long lat = elapsed - nap;         /* scheduling delay beyond the nap */
+            if (lat < 0) lat = 0;
+            lat_sum += (unsigned long)lat;
+            if ((unsigned long)lat > lat_max) lat_max = (unsigned long)lat;
+            cycles++;
+        }
+        unsigned long avg = cycles ? lat_sum / cycles : 0;
+        printf("MCTEST: interactive cycles=%lu avg_lat=%lums max_lat=%lums cksum=%lu\n",
+               cycles, avg, lat_max, (unsigned long)x);
+        /* Return avg wake latency (ms, capped) as the exit code so the boot
+         * harness can read it cleanly via proc_wait_info -- serial printf from
+         * 9 concurrent procs interleaves and can't be parsed reliably. */
+        return (int)(avg > 250 ? 250 : avg);
+    }
+
+    /* Pipe-blocking interactivity proof (argv[1]=="pipeint", argv[2]=window
+     * ms): the real io_boost test. We fork a feeder that mostly sleeps and,
+     * every ~15 ms, writes the current clock into a pipe; the reader BLOCKS in
+     * read() (-> PROC_BLOCKED, genuinely leaving its core, unlike a nanosleep
+     * that hlt-retains the core) and on each wakeup computes how long it took
+     * to run after the byte was sent -- the true wake-to-run latency while CPU
+     * hogs saturate the cores. With io_boost the woken reader out-ranks the
+     * NORMAL hogs at the next scheduling point; without it the reader waits its
+     * FIFO turn behind them. Returns avg latency (ms, capped) as the exit code
+     * so the boot harness reads it cleanly. */
+    if (argc >= 3 && strcmp(argv[1], "pipeint") == 0) {
+        long window = atol(argv[2]);
+        if (window <= 0) window = 1500;
+        int fds[2];
+        if (pipe(fds) != 0) { printf("MCTEST: pipeint pipe FAIL\n"); return 255; }
+        int pid = fork();
+        if (pid == 0) {
+            close(fds[0]);                       /* feeder: write end only */
+            long start = (long)clock();
+            while (((long)clock() - start) < window) {
+                usleep(15000);                   /* pace; feeder ~idle */
+                long t = (long)clock();
+                if (write(fds[1], &t, sizeof(t)) != (long)sizeof(t)) break;
+            }
+            close(fds[1]);
+            _exit(0);
+        }
+        if (pid < 0) { printf("MCTEST: pipeint fork FAIL\n"); return 254; }
+        close(fds[1]);                           /* reader: read end only */
+        unsigned long n = 0, sum = 0, mx = 0;
+        for (;;) {
+            long t; char *p = (char *)&t; size_t got = 0;
+            while (got < sizeof(t)) {            /* read() BLOCKS when empty */
+                long r = read(fds[0], p + got, sizeof(t) - got);
+                if (r <= 0) { got = 0; break; }
+                got += (size_t)r;
+            }
+            if (got != sizeof(t)) break;          /* feeder closed -> done */
+            long lat = (long)clock() - t;
+            if (lat < 0) lat = 0;
+            sum += (unsigned long)lat;
+            if ((unsigned long)lat > mx) mx = (unsigned long)lat;
+            n++;
+        }
+        close(fds[0]);
+        waitpid(pid, 0, 0);
+        unsigned long avg = n ? sum / n : 0;
+        printf("MCTEST: pipeint cycles=%lu avg_lat=%lums max_lat=%lums\n",
+               n, avg, mx);
+        return (int)(avg > 250 ? 250 : avg);
     }
 
     long dur_ms = (argc >= 2) ? atol(argv[1]) : 0;

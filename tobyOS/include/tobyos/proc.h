@@ -263,6 +263,15 @@ struct proc {
     int32_t         quantum_left;
     uint64_t        enq_tick;
 
+    /* `io_boost` is a transient interactivity bonus added to the effective
+     * priority (MLFQ-style). A proc that gives up the CPU by BLOCKING before
+     * its quantum is spent -- the signature of an I/O-bound / interactive
+     * task (waiting on a pipe, socket, key, sleep) -- earns the boost so it
+     * preempts CPU-bound work and stays responsive on wakeup. A proc that
+     * burns a whole quantum (CPU-bound) has the boost cleared. Bounded to one
+     * priority class so it can't starve anything; aging still applies on top. */
+    int             io_boost;
+
     /* ---- Milestone 19: performance metrics ---------------------
      *
      * `cpu_ns` accumulates wallclock time this proc has spent

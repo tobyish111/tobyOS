@@ -203,7 +203,11 @@ static inline int eff_prio(const struct proc *p, uint64_t now) {
     uint64_t waited = (now > p->enq_tick) ? (now - p->enq_tick) : 0;
     int boost = (int)(waited / (uint64_t)SCHED_AGE_STEP_TICKS);
     if (boost > SCHED_AGE_MAX_BOOST) boost = SCHED_AGE_MAX_BOOST;
-    return p->prio + boost;
+    /* Aging boost (anti-starvation) + interactivity boost (responsiveness).
+     * io_boost is granted when a proc blocks before spending its quantum and
+     * cleared when it burns a full one -- so an interactive task out-ranks a
+     * CPU hog without permanently elevating anything. */
+    return p->prio + boost + p->io_boost;
 }
 
 static void queue_push_locked(struct percpu *cpu, struct proc *p) {
@@ -293,8 +297,20 @@ static struct proc *queue_steal_locked(struct percpu *cpu) {
     return best;
 }
 
+/* Count this CPU's stealable (non-idle) ready procs -- a load estimate for
+ * balancing. Caller need not hold the lock; a racy count just picks a
+ * slightly-stale victim, which self-corrects on the next idle pass. */
+static int queue_depth(struct percpu *cpu) {
+    int n = 0;
+    for (struct proc *p = cpu->ready_head; p; p = p->next_ready)
+        if (!p->is_idle) n++;
+    return n;
+}
+
 /* Find one runnable non-idle proc to run on `me`: our own queue first, then
- * steal from other CPUs. NULL if nothing is runnable anywhere. */
+ * steal from the BUSIEST other CPU (load balancing -- migrate work off the
+ * most-loaded core rather than the first non-empty one we happen to scan).
+ * NULL if nothing is runnable anywhere. */
 static struct proc *steal_one(struct percpu *me) {
     uint64_t f = spin_lock_irqsave(&me->ready_lock);
     struct proc *p = queue_steal_locked(me);
@@ -302,6 +318,25 @@ static struct proc *steal_one(struct percpu *me) {
     if (p) return p;
 
     uint32_t n = smp_online_count();
+
+    /* Pick the most-loaded remote CPU as the steal victim. */
+    struct percpu *victim = 0;
+    int best_depth = 0;
+    for (uint32_t i = 1; i < n; i++) {
+        struct percpu *o = smp_cpu_mut((me->cpu_idx + i) % n);
+        if (!o || !o->ready_head) continue;
+        int d = queue_depth(o);
+        if (d > best_depth) { best_depth = d; victim = o; }
+    }
+    if (victim) {
+        uint64_t f2 = spin_lock_irqsave(&victim->ready_lock);
+        p = queue_steal_locked(victim);
+        spin_unlock_irqrestore(&victim->ready_lock, f2);
+        if (p) return p;
+    }
+
+    /* Fallback: the depths raced to zero (victim drained) -- sweep for any
+     * remaining work so we never idle while a runnable proc exists. */
     for (uint32_t i = 1; i < n; i++) {
         struct percpu *o = smp_cpu_mut((me->cpu_idx + i) % n);
         if (!o || !o->ready_head) continue;
@@ -419,6 +454,19 @@ void sched_yield(void) {
         __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE) == 0) {
         return;     /* fast path: still running, nothing else here -- keep BKL */
     }
+
+    /* Interactivity credit (MLFQ "yield-before-slice-end stays high"): a proc
+     * that gives up the CPU with quantum still left -- whether by BLOCKING
+     * (about to sleep on a pipe/socket/key) or by voluntarily yielding
+     * (nanosleep, cooperative SYS_YIELD, a GUI poll loop) -- is interactive /
+     * I/O-bound, so grant it the io_boost that lifts its effective priority on
+     * wakeup. CPU-bound procs only reach sched_yield via the quantum-expiry
+     * tick (quantum_left == 0, after sched_tick already cleared the boost), so
+     * they get no credit. We're past the fast path, so a RUNNING proc here is
+     * genuinely ceding the core to a waiting peer. */
+    if (cur && cur->quantum_left > 0 &&
+        (cur->state == PROC_BLOCKED || cur->state == PROC_RUNNING))
+        cur->io_boost = SCHED_IO_BOOST;
 
     /* Slow path: we may halt or switch away, so we must not keep the BKL.
      * Release it now; reacquire on every path where THIS proc keeps running
@@ -565,6 +613,12 @@ void sched_tick(struct regs *r) {
 
     if (cur->quantum_left > 0) cur->quantum_left--;
     if (cur->quantum_left > 0) return;        /* slice not spent yet */
+
+    /* Full quantum burned without blocking -> this proc is CPU-bound, not
+     * interactive: drop any interactivity boost it had so it competes at its
+     * base class from here on (MLFQ demotion). It re-earns the boost only by
+     * blocking before its next quantum is up. */
+    cur->io_boost = 0;
 
     /* Slice spent: rotate. sched_yield() demotes cur to READY (re-enqueued on
      * this CPU, refreshing its aging stamp) and context-switches to the highest

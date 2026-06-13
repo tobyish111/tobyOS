@@ -57,6 +57,7 @@ struct regs;
 #define SCHED_QUANTUM_BASE     5    /* LAPIC ticks for NORMAL (~50 ms @100Hz)   */
 #define SCHED_AGE_STEP_TICKS  60    /* +1 effective level per ~60 ms waiting     */
 #define SCHED_AGE_MAX_BOOST    5    /* PRIO_MAX-PRIO_MIN+1: can lift IDLE>RT     */
+#define SCHED_IO_BOOST         2    /* interactivity bonus: one priority class   */
 
 /* Class quantum: foreground classes get a slightly longer slice. */
 static inline int sched_quantum_for(int prio) {
