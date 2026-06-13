@@ -47,7 +47,7 @@ honest number.
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
 | Device Drivers | ~12% | ~14% | **Loadable `ET_REL` kernel module loader** (foundational). 6 NIC drivers, AHCI/NVMe/IDE/virtio-blk, xHCI/EHCI/HID/MSC, HDA. No real GPU driver; no signed third-party ecosystem. |
 | GUI / Desktop | ~10% | ~12% | GPU-accelerated compositor path exists **but only active with VirtIO-GPU**; on real Intel iGPU it falls back to the CPU/Limine compositor. Now **usable on hardware** (login no longer flaps; mouse/keyboard work). |
-| Security | ~8% | ~17% | **SA_RESTART + job control (SIGSTOP/SIGCONT, PROC_STOPPED) now work**, signals reach CPU-bound procs on APs (LAPIC-tick delivery), and the SA_* flag ABI is Linux-aligned. Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP re-enabled** behind a syscall-wide stac/clac uaccess window + wrapped loader/argv; validated under QEMU `+smap` (full desktop + sigtest, no #PF). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
+| Security | ~8% | ~18% | **Per-copy uaccess accessors** (Linux-style `copy_*_user`; the whole-syscall SMAP window is gone, so a stray kernel user-deref now faults under SMAP) -- validated end-to-end under hardware `+smap`. **SA_RESTART + job control (SIGSTOP/SIGCONT, PROC_STOPPED) now work**, signals reach CPU-bound procs on APs (LAPIC-tick delivery), and the SA_* flag ABI is Linux-aligned. Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP re-enabled** behind a syscall-wide stac/clac uaccess window + wrapped loader/argv; validated under QEMU `+smap` (full desktop + sigtest, no #PF). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
 | Power / ACPI | ~6% | ~9% | **RTC driver** → real wall-clock time. ACPI shutdown + partial S3/S4 framework. No full AML power management. |
 | Audio / Media | ~15% | ~15% | Intel HDA + software mixer + decode helpers. Unchanged this round. |
 | App Compatibility | ~2% | ~5% | POSIX libc filled in (`signal.h`, `fork`, `symlink`/`readlink`, real `getuid/gid`, `wait`, `access`). **SSE/FP now enabled** (CR0/CR4 + FXSAVE/FXRSTOR FPU context switch), so floating-point programs run; **libc printf gained `%f`/`%e`/`%g`**; user stack 32 KiB→256 KiB. Marquee ports (lua/make/less/curl/tcc/as) **now actually ship in the initrd** (were built but omitted from the tar). **Lua interpreter runs real scripts** (`/bin/lua`, verified by `/etc/lua_selftest.lua`). Still own-ELF-only; **zero** Win32/.NET/UWP. |
@@ -122,10 +122,9 @@ driver model; POSIX libc surface.
    with watchdog auto-revert. QEMU can't emulate the Intel GT, so 3-4 stay EliteDesk-validated.
 5. **Security depth** — ~~salted/KDF auth~~ (Argon2id), ~~login rate-limiting~~ (lockout),
    ~~signal *delivery*~~ (frame push + sigreturn), ~~re-enable SMAP~~ (syscall-wide uaccess
-   window), ~~SA_RESTART~~, ~~job control stop/cont~~ (both 2026-06-12). Remaining: per-copy
-   uaccess accessors (the window is coarser than Linux's per-`copy_*_user`; converting is a
-   large cross-cutting audit -- every syscall body and the VFS/GUI/net paths deref user
-   pointers directly today), SA_SIGINFO, terminal job-control wiring.
+   window), ~~SA_RESTART~~, ~~job control stop/cont~~ (both 2026-06-12). ~~per-copy
+   uaccess accessors~~ (done 2026-06-12: Linux-style `copy_*_user`, whole-syscall window
+   removed, validated under hardware `+smap`). Remaining: SA_SIGINFO, terminal job-control wiring.
 
 ---
 
@@ -148,8 +147,9 @@ driver model; POSIX libc surface.
 - Passwords: now salted Argon2id (was djb2) with login lockout (5 fails → 30 s). Still no
   password policy and no PAM-style pluggable auth.
 - GPU accel: VirtIO-only; real-HW desktop is CPU-composited.
-- SMAP: enabled, but via a coarse syscall-wide stac/clac window rather than per-copy
-  accessors, so a stray user-pointer deref *inside* a syscall isn't caught (only outside).
+- SMAP: enabled with per-copy accessors (Linux `copy_*_user` style, 2026-06-12) -- the
+  whole-syscall stac window is gone, so a stray kernel user-pointer deref inside a syscall
+  now faults instead of silently succeeding. Large I/O bounces through kernel buffers.
 - Signals: user-handler delivery works (frame push + sigreturn, mask/pending
   honored), SA_RESTART restarts interrupted syscalls, and SIGSTOP/SIGCONT job
   control works (PROC_STOPPED; stops delivered even to CPU-bound procs on APs via
@@ -162,6 +162,23 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-12 (later)** — **Per-copy uaccess; the whole-syscall SMAP window is gone.** Replaced the
+  coarse "stac for the entire syscall body" model with Linux-style per-copy accessors
+  (`copy_from_user`/`copy_to_user`/`strncpy_from_user`/`clear_user`/`put_user_*`/`get_user_*` in
+  `uaccess.h`), each range-checking the user pointer and bracketing only the actual copy in a
+  stac/clac window; `syscall_entry.S` no longer opens a blanket window. ~80 syscall handlers
+  converted: large I/O (read/write/send/recv/clip/gl-submit/tcp/tls/unix) **bounces** through a
+  kmalloc'd kernel buffer at the boundary so the VFS/pipe/net stacks never see a user pointer;
+  paths/strings via `strncpy_from_user`; struct out-params + staging arrays via `copy_to_user`;
+  argv/envp pointer arrays slot-by-slot via `get_user_u64`. Also signal.c (sigaction/procmask/
+  sigreturn + the signal frame written to the user stack via `copy_to_user`), fork.c (execve),
+  thread.c (futex pre-touch + `thread_join` status), module.c. A stray kernel deref of a user
+  pointer anywhere outside an accessor now **faults under SMAP** instead of silently succeeding.
+  Validated under `qemu64,+smep,+smap` (hardware SMAP enforcing): desktop+login boot clean,
+  `/bin/sigtest` 9/9 PASS (signal-frame copy-out, fork argv, SA_RESTART, pipe bounce all
+  exercised), interactive login OK (keystrokes via `gui_poll_event` copy-out, username via
+  `strncpy_from_user` -- 'tobyroot' rejected, 'toby' accepted), 0 exceptions; 9 default boots
+  across configs all alive. Closes the last open item of gap #5 (security depth). Security ~17% -> ~18%.
 - **2026-06-12** — **SA_RESTART + job control; fork/CoW was never actually functional — 4
   latent bugs fixed.** Security-depth bundle: (1) **SA_RESTART** — an EINTR'd blocking syscall
   whose caught handler has SA_RESTART is transparently re-executed (delivery rewinds the saved
