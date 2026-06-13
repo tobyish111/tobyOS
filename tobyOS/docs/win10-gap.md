@@ -47,7 +47,7 @@ honest number.
 | Networking | ~22% | ~30% | **CUBIC** + window scaling, IPv6 link-local + ICMPv6/ND, TLS 1.3, HTTP/2 (early). **DHCP/TCP working on real hardware over a VLAN-tagged LAN.** Small conn tables, link-local-only v6, no offloads. Strongest area. |
 | Device Drivers | ~12% | ~14% | **Loadable `ET_REL` kernel module loader** (foundational). 6 NIC drivers, AHCI/NVMe/IDE/virtio-blk, xHCI/EHCI/HID/MSC, HDA. No real GPU driver; no signed third-party ecosystem. |
 | GUI / Desktop | ~10% | ~12% | GPU-accelerated compositor path exists **but only active with VirtIO-GPU**; on real Intel iGPU it falls back to the CPU/Limine compositor. Now **usable on hardware** (login no longer flaps; mouse/keyboard work). |
-| Security | ~8% | ~18% | **Per-copy uaccess accessors** (Linux-style `copy_*_user`; the whole-syscall SMAP window is gone, so a stray kernel user-deref now faults under SMAP) -- validated end-to-end under hardware `+smap`. **SA_RESTART + job control (SIGSTOP/SIGCONT, PROC_STOPPED) now work**, signals reach CPU-bound procs on APs (LAPIC-tick delivery), and the SA_* flag ABI is Linux-aligned. Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP re-enabled** behind a syscall-wide stac/clac uaccess window + wrapped loader/argv; validated under QEMU `+smap` (full desktop + sigtest, no #PF). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
+| Security | ~8% | ~19% | **SA_SIGINFO 3-arg handlers** (siginfo_t + ucontext on the user stack) and **TTY job-control keys** (Ctrl-Z->SIGTSTP / Ctrl-\->SIGQUIT, completing Ctrl-C->SIGINT). **Per-copy uaccess accessors** (Linux-style `copy_*_user`; the whole-syscall SMAP window is gone, so a stray kernel user-deref now faults under SMAP) -- validated end-to-end under hardware `+smap`. **SA_RESTART + job control (SIGSTOP/SIGCONT, PROC_STOPPED) now work**, signals reach CPU-bound procs on APs (LAPIC-tick delivery), and the SA_* flag ABI is Linux-aligned. Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP re-enabled** behind a syscall-wide stac/clac uaccess window + wrapped loader/argv; validated under QEMU `+smap` (full desktop + sigtest, no #PF). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
 | Power / ACPI | ~6% | ~9% | **RTC driver** → real wall-clock time. ACPI shutdown + partial S3/S4 framework. No full AML power management. |
 | Audio / Media | ~15% | ~15% | Intel HDA + software mixer + decode helpers. Unchanged this round. |
 | App Compatibility | ~2% | ~5% | POSIX libc filled in (`signal.h`, `fork`, `symlink`/`readlink`, real `getuid/gid`, `wait`, `access`). **SSE/FP now enabled** (CR0/CR4 + FXSAVE/FXRSTOR FPU context switch), so floating-point programs run; **libc printf gained `%f`/`%e`/`%g`**; user stack 32 KiB→256 KiB. Marquee ports (lua/make/less/curl/tcc/as) **now actually ship in the initrd** (were built but omitted from the tar). **Lua interpreter runs real scripts** (`/bin/lua`, verified by `/etc/lua_selftest.lua`). Still own-ELF-only; **zero** Win32/.NET/UWP. |
@@ -124,7 +124,9 @@ driver model; POSIX libc surface.
    ~~signal *delivery*~~ (frame push + sigreturn), ~~re-enable SMAP~~ (syscall-wide uaccess
    window), ~~SA_RESTART~~, ~~job control stop/cont~~ (both 2026-06-12). ~~per-copy
    uaccess accessors~~ (done 2026-06-12: Linux-style `copy_*_user`, whole-syscall window
-   removed, validated under hardware `+smap`). Remaining: SA_SIGINFO, terminal job-control wiring.
+   removed, validated under hardware `+smap`). ~~SA_SIGINFO~~ and ~~terminal job-control keys~~ (both 2026-06-13). The security-depth
+   bundle is now done; the only job-control gap left is full POSIX process groups + fg/bg/jobs,
+   which is a shell/controlling-tty feature that doesn't fit the kernel-builtin-shell model.
 
 ---
 
@@ -151,17 +153,31 @@ driver model; POSIX libc surface.
   whole-syscall stac window is gone, so a stray kernel user-pointer deref inside a syscall
   now faults instead of silently succeeding. Large I/O bounces through kernel buffers.
 - Signals: user-handler delivery works (frame push + sigreturn, mask/pending
-  honored), SA_RESTART restarts interrupted syscalls, and SIGSTOP/SIGCONT job
-  control works (PROC_STOPPED; stops delivered even to CPU-bound procs on APs via
-  the LAPIC tick). Still missing: SA_SIGINFO/siginfo_t, SIGCHLD-on-stop/WUNTRACED,
-  terminal-driven SIGTSTP/TTIN/TTOU, and *caught-handler* delivery to a pure-CPU-
-  bound process is deferred to its next syscall (tick paths only run default
-  dispositions; they don't push handler frames).
+  honored), SA_RESTART restarts interrupted syscalls, SA_SIGINFO delivers
+  siginfo_t+ucontext to 3-arg handlers, and SIGSTOP/SIGCONT job control works
+  (PROC_STOPPED; stops delivered even to CPU-bound procs on APs via the LAPIC
+  tick; Ctrl-Z/Ctrl-\ wired in the keyboard path). Still missing: full POSIX
+  process groups + fg/bg/jobs, SIGCHLD-on-stop/WUNTRACED, and *caught-handler*
+  delivery to a pure-CPU-bound process is deferred to its next syscall (tick
+  paths only run default dispositions; they don't push handler frames).
 - TobyFS journaling/swap/CoW: wired but not stress-tested under crash/pressure/load.
 
 ---
 
 ## Changelog
+- **2026-06-13** — **SA_SIGINFO + TTY job-control keys (security-depth bundle 100% done).**
+  SA_SIGINFO handlers now get the full `void(int, siginfo_t*, void*)` form: the kernel builds a
+  `siginfo_t` (signo/code=SI_USER/sender pid+uid, recorded per pending signal at send time) and a
+  `ucontext_t` (uc_sigmask + uc_mcontext from the interrupted trapframe) on the user stack above
+  the sigreturn frame and passes them in RSI/RDX; all writes via `copy_to_user`. New
+  siginfo_t/mcontext_t/ucontext_t mirrored in libtoby with sa_handler/sa_sigaction as a
+  layout-compatible union. Keyboard TTY keys: Ctrl-C->SIGINT already existed; added
+  Ctrl-Z->SIGTSTP (stops via PROC_STOPPED; `kill -CONT` resumes) and Ctrl-\->SIGQUIT to the
+  foreground proc (no-op under the GUI where no console fg job is set). `/bin/sigtest` now 10/10
+  incl. SA_SIGINFO (handler sees signo, si_pid=child, user-half ucontext RSP), PASS on default CPU
+  and under `qemu64,+smep,+smap`, 0 exc. NOTE: full fg/bg/jobs + process groups remain out of
+  scope -- they don't fit the kernel-builtin-shell + GUI-launch model (tobyOS has a single global
+  foreground pid, not POSIX process groups). Security ~18% -> ~19%.
 - **2026-06-12 (later)** — **Per-copy uaccess; the whole-syscall SMAP window is gone.** Replaced the
   coarse "stac for the entire syscall body" model with Linux-style per-copy accessors
   (`copy_from_user`/`copy_to_user`/`strncpy_from_user`/`clear_user`/`put_user_*`/`get_user_*` in
