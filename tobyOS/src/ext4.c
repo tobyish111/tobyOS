@@ -45,11 +45,44 @@
  */
 
 #include <tobyos/ext4.h>
+#include <tobyos/jbd2.h>
 #include <tobyos/blk.h>
 #include <tobyos/vfs.h>
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
+
+/* JBD2 stores every multi-byte field big-endian; we run little-endian. */
+static inline uint16_t be16(uint16_t x) { return __builtin_bswap16(x); }
+static inline uint32_t be32(uint32_t x) { return __builtin_bswap32(x); }
+
+/* ---- write-ahead journal (JBD2) transaction staging ---- */
+
+/* One staged block write inside the active transaction: its home block
+ * number plus a full-block snapshot of the bytes to commit there. */
+struct ext4_txn_ent { uint64_t blk; uint8_t *data; };
+
+/* An in-progress atomic operation. Every write_block() during the op is
+ * captured here instead of hitting the disk; on txn_commit() the whole
+ * set is logged to the journal, committed, then checkpointed to the home
+ * locations. The entries array grows on demand. */
+struct ext4_txn {
+    struct ext4_txn_ent *ents;
+    int    n;
+    int    cap;
+    bool   nomem;        /* a staging allocation failed -> abort the op */
+};
+
+/* Crash-injection knob for the journal self-test. 0 == disabled; when
+ * set, txn_commit() stops at the chosen phase WITHOUT clearing on-disk
+ * state, modelling a power loss so the next mount must recover. */
+enum {
+    JBD2_CRASH_NONE = 0,
+    JBD2_CRASH_BEFORE_COMMIT,   /* descriptor+data logged, no commit block */
+    JBD2_CRASH_AFTER_COMMIT,    /* committed, nothing checkpointed */
+    JBD2_CRASH_MID_CHECKPOINT,  /* committed, only half the homes written */
+};
+static int g_jbd_crash_phase = JBD2_CRASH_NONE;
 
 /* ---- in-memory state ---- */
 
@@ -78,6 +111,14 @@ struct ext4 {
     uint8_t *sb_buf;              /* cached 1024-byte superblock (write-back) */
     uint32_t gdt_bytes;
     uint32_t group_count;
+
+    /* ---- JBD2 write-ahead journal ---- */
+    bool     has_journal;         /* journal present AND we can drive it */
+    uint64_t j_phys_first;        /* physical block of journal block 0 (j SB) */
+    uint32_t j_blocks;            /* journal length in fs blocks (s_maxlen) */
+    uint32_t j_first;             /* first usable log block (s_first, usually 1) */
+    uint32_t j_sequence;          /* sequence to stamp on the next transaction */
+    struct ext4_txn *txn;         /* active transaction, or NULL (writes direct) */
 };
 
 /* Per-handle state for an open file. We snapshot the inode at open
@@ -99,8 +140,20 @@ struct ext4_diriter {
 
 /* ---- low-level helpers ---- */
 
+/* Find a block already staged in the active transaction (NULL if none). */
+static struct ext4_txn_ent *txn_find(struct ext4 *fs, uint64_t blk) {
+    if (!fs->txn) return NULL;
+    for (int i = 0; i < fs->txn->n; i++)
+        if (fs->txn->ents[i].blk == blk) return &fs->txn->ents[i];
+    return NULL;
+}
+
 static int read_block(struct ext4 *fs, uint64_t blk, void *buf) {
     if (blk >= fs->total_blocks) return VFS_ERR_INVAL;
+    /* Read-your-writes: a block staged in the open transaction reflects
+     * the not-yet-committed contents. */
+    struct ext4_txn_ent *e = txn_find(fs, blk);
+    if (e) { memcpy(buf, e->data, fs->block_size); return VFS_OK; }
     uint64_t lba = blk * fs->sectors_per_block;
     if (blk_read(fs->dev, lba, fs->sectors_per_block, buf) != 0) {
         return VFS_ERR_IO;
@@ -166,8 +219,34 @@ static int read_inode(struct ext4 *fs, uint32_t ino, struct ext4_inode *out) {
  * ext4-specific part is depth-0 extent-tree growth.
  * ================================================================ */
 
+/* Stage `buf` for home block `blk` into the active transaction, replacing
+ * any earlier staged copy of the same block. */
+static int txn_stage(struct ext4 *fs, uint64_t blk, const void *buf) {
+    struct ext4_txn *t = fs->txn;
+    struct ext4_txn_ent *e = txn_find(fs, blk);
+    if (!e) {
+        if (t->n == t->cap) {
+            int ncap = t->cap ? t->cap * 2 : 16;
+            struct ext4_txn_ent *ne =
+                kmalloc((size_t)ncap * sizeof(*ne));
+            if (!ne) { t->nomem = true; return VFS_ERR_NOMEM; }
+            if (t->n) memcpy(ne, t->ents, (size_t)t->n * sizeof(*ne));
+            if (t->ents) kfree(t->ents);
+            t->ents = ne; t->cap = ncap;
+        }
+        e = &t->ents[t->n];
+        e->blk = blk;
+        e->data = kmalloc(fs->block_size);
+        if (!e->data) { t->nomem = true; return VFS_ERR_NOMEM; }
+        t->n++;
+    }
+    memcpy(e->data, buf, fs->block_size);
+    return VFS_OK;
+}
+
 static int write_block(struct ext4 *fs, uint64_t blk, const void *buf) {
     if (blk >= fs->total_blocks) return VFS_ERR_INVAL;
+    if (fs->txn) return txn_stage(fs, blk, buf);
     uint64_t lba = blk * fs->sectors_per_block;
     if (blk_write(fs->dev, lba, fs->sectors_per_block, buf) != 0)
         return VFS_ERR_IO;
@@ -175,8 +254,34 @@ static int write_block(struct ext4 *fs, uint64_t blk, const void *buf) {
 }
 
 /* Write back the cached 1024-byte superblock (free counts, state). The
- * SB always lives at byte offset 1024 = LBA 2 (512-byte sectors). */
+ * SB always lives at byte offset 1024 = LBA 2 (512-byte sectors).
+ *
+ * Inside a transaction we can't do that sub-block write directly: the SB
+ * shares an fs block with the boot area (and, for 1 KiB blocks, sits at a
+ * block boundary). So we read-modify-write the whole containing block and
+ * stage *that*, keeping the journal at fs-block granularity. */
 static int flush_superblock(struct ext4 *fs) {
+    if (!fs->sb_buf) return VFS_OK;
+    if (fs->txn) {
+        uint64_t sbblk = 1024u / fs->block_size;
+        uint32_t sboff = 1024u % fs->block_size;
+        uint8_t *tmp = kmalloc(fs->block_size);
+        if (!tmp) return VFS_ERR_NOMEM;
+        int rc = read_block(fs, sbblk, tmp);
+        if (rc != VFS_OK) { kfree(tmp); return rc; }
+        memcpy(tmp + sboff, fs->sb_buf, 1024);
+        rc = write_block(fs, sbblk, tmp);
+        kfree(tmp);
+        return rc;
+    }
+    if (blk_write(fs->dev, 2, 2, fs->sb_buf) != 0) return VFS_ERR_IO;
+    return VFS_OK;
+}
+
+/* Write the cached SB straight to disk, bypassing the transaction. Used
+ * by the journal machinery itself (marking the log dirty/clean) where the
+ * SB change must NOT be part of the staged set. */
+static int flush_superblock_direct(struct ext4 *fs) {
     if (!fs->sb_buf) return VFS_OK;
     if (blk_write(fs->dev, 2, 2, fs->sb_buf) != 0) return VFS_ERR_IO;
     return VFS_OK;
@@ -1004,6 +1109,346 @@ static void inode_free_data(struct ext4 *fs, struct ext4_inode *in) {
     in->i_blocks_lo = 0;
 }
 
+/* ================================================================
+ * JBD2 write-ahead journalling.
+ *
+ * Each atomic filesystem operation opens a transaction (txn_begin),
+ * stages every block it touches, then commits (txn_commit):
+ *
+ *   1. mark the on-disk journal dirty (superblock s_start = first log
+ *      block, s_sequence = this txn's id; set ext4 NEEDS_RECOVERY).
+ *   2. write the log: [descriptor][data..][commit].
+ *   3. checkpoint: copy each staged block to its home location.
+ *   4. mark the journal clean (s_start = 0; clear NEEDS_RECOVERY).
+ *
+ * A crash anywhere is healed on the next mount by jbd2_recover():
+ *   - crash before the commit block -> no valid commit -> discard
+ *     (the operation atomically did not happen);
+ *   - crash after the commit block (or mid-checkpoint) -> replay the
+ *     whole logged set to its homes (the operation atomically happened).
+ * Replay is idempotent, so replaying an already-checkpointed txn is a
+ * no-op. The journal is reset to empty after every checkpoint, so at most
+ * one transaction is ever outstanding -- transactions always start at the
+ * first log block, which removes all the circular-buffer bookkeeping.
+ * ================================================================ */
+
+/* Raw journal-block I/O: rel 0 is the journal superblock, rel >= j_first
+ * are log blocks. These bypass transaction staging (they ARE the commit
+ * machinery) and go straight to the device. */
+static int jraw_read(struct ext4 *fs, uint32_t rel, void *buf) {
+    uint64_t lba = (fs->j_phys_first + rel) * fs->sectors_per_block;
+    return blk_read(fs->dev, lba, fs->sectors_per_block, buf) == 0
+               ? VFS_OK : VFS_ERR_IO;
+}
+static int jraw_write(struct ext4 *fs, uint32_t rel, const void *buf) {
+    uint64_t lba = (fs->j_phys_first + rel) * fs->sectors_per_block;
+    return blk_write(fs->dev, lba, fs->sectors_per_block, buf) == 0
+               ? VFS_OK : VFS_ERR_IO;
+}
+
+/* Open a transaction. With no (drivable) journal this is a no-op and
+ * writes fall through to the disk as before -- zero behaviour change on
+ * non-journalled images. If the txn allocation fails we also fall back to
+ * direct writes (safe, just not atomic). */
+static void txn_begin(struct ext4 *fs) {
+    if (!fs->has_journal || fs->txn) return;
+    fs->txn = kcalloc(1, sizeof(struct ext4_txn));
+}
+
+static void txn_free(struct ext4_txn *t) {
+    if (!t) return;
+    for (int i = 0; i < t->n; i++)
+        if (t->ents[i].data) kfree(t->ents[i].data);
+    if (t->ents) kfree(t->ents);
+    kfree(t);
+}
+
+/* Throw away a transaction without touching the disk (operation failed
+ * before commit -> filesystem is exactly as it was). */
+static void txn_abort(struct ext4 *fs) {
+    struct ext4_txn *t = fs->txn;
+    fs->txn = NULL;
+    txn_free(t);
+}
+
+/* Set the on-disk journal state. start_rel == 0 marks the log clean;
+ * start_rel == j_first marks it dirty (a transaction may need recovery).
+ * Also mirror the state into the ext4 NEEDS_RECOVERY incompat bit and
+ * push the superblock straight to disk. */
+static int jbd2_set_state(struct ext4 *fs, uint32_t start_rel,
+                          uint32_t seq, bool recover_bit) {
+    uint8_t *jsb = kmalloc(fs->block_size);
+    if (!jsb) return VFS_ERR_NOMEM;
+    int rc = jraw_read(fs, 0, jsb);
+    if (rc != VFS_OK) { kfree(jsb); return rc; }
+    jbd2_superblock_t *s = (jbd2_superblock_t *)jsb;
+    s->s_start    = be32(start_rel);
+    s->s_sequence = be32(seq);
+    rc = jraw_write(fs, 0, jsb);
+    kfree(jsb);
+    if (rc != VFS_OK) return rc;
+
+    struct ext4_super_block *sb = (struct ext4_super_block *)fs->sb_buf;
+    if (sb) {
+        if (recover_bit) sb->s_feature_incompat |= EXT4_FEATURE_INCOMPAT_RECOVER;
+        else             sb->s_feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
+        fs->feature_incompat = sb->s_feature_incompat;
+        rc = flush_superblock_direct(fs);
+    }
+    return rc;
+}
+
+/* Count the block tags in a descriptor block (mirrors the write layout:
+ * 8-byte tag, plus a 16-byte UUID after any tag without SAME_UUID). */
+static uint32_t jbd2_count_tags(struct ext4 *fs, const uint8_t *desc) {
+    uint32_t off = sizeof(jbd2_header_t), n = 0;
+    while (off + sizeof(jbd2_block_tag_t) <= fs->block_size) {
+        const jbd2_block_tag_t *tag = (const jbd2_block_tag_t *)(desc + off);
+        uint16_t flags = be16(tag->t_flags);
+        off += sizeof(*tag);
+        if (!(flags & JBD2_FLAG_SAME_UUID)) off += 16;
+        n++;
+        if (flags & JBD2_FLAG_LAST_TAG) break;
+    }
+    return n;
+}
+
+/* Write the log records for transaction `t`: one descriptor block listing
+ * every home block, the data blocks themselves, then a commit block. */
+static int jbd2_write_log(struct ext4 *fs, struct ext4_txn *t, uint32_t seq) {
+    uint32_t n = (uint32_t)t->n;
+    if ((uint64_t)fs->j_first + n + 1 >= fs->j_blocks) return VFS_ERR_NOSPC;
+
+    uint8_t *blk = kmalloc(fs->block_size);
+    if (!blk) return VFS_ERR_NOMEM;
+    int rc = VFS_OK;
+
+    /* --- descriptor block at j_first --- */
+    memset(blk, 0, fs->block_size);
+    jbd2_header_t *dh = (jbd2_header_t *)blk;
+    dh->h_magic     = be32(JBD2_MAGIC_NUMBER);
+    dh->h_blocktype = be32(JBD2_DESCRIPTOR_BLOCK);
+    dh->h_sequence  = be32(seq);
+    uint32_t off = sizeof(jbd2_header_t);
+    for (uint32_t i = 0; i < n; i++) {
+        if (off + sizeof(jbd2_block_tag_t) + 16 > fs->block_size) {
+            rc = VFS_ERR_NOSPC; goto out;     /* too many tags for one block */
+        }
+        jbd2_block_tag_t *tag = (jbd2_block_tag_t *)(blk + off);
+        uint16_t flags = 0;
+        if (i + 1 == n) flags |= JBD2_FLAG_LAST_TAG;
+        if (i > 0)      flags |= JBD2_FLAG_SAME_UUID;
+        if (be32(*(const uint32_t *)t->ents[i].data) == JBD2_MAGIC_NUMBER)
+            flags |= JBD2_FLAG_ESCAPE;        /* first word collides with magic */
+        tag->t_blocknr  = be32((uint32_t)t->ents[i].blk);
+        tag->t_checksum = 0;
+        tag->t_flags    = be16(flags);
+        off += sizeof(*tag);
+        if (i == 0) { memset(blk + off, 0, 16); off += 16; }   /* journal UUID */
+    }
+    rc = jraw_write(fs, fs->j_first, blk);
+    if (rc != VFS_OK) goto out;
+
+    /* --- data blocks at j_first+1 .. j_first+n --- */
+    for (uint32_t i = 0; i < n; i++) {
+        memcpy(blk, t->ents[i].data, fs->block_size);
+        if (be32(*(uint32_t *)blk) == JBD2_MAGIC_NUMBER)
+            *(uint32_t *)blk = 0;             /* escape: zero the magic word */
+        rc = jraw_write(fs, fs->j_first + 1 + i, blk);
+        if (rc != VFS_OK) goto out;
+    }
+
+    if (g_jbd_crash_phase == JBD2_CRASH_BEFORE_COMMIT) goto out;  /* no commit */
+
+    /* --- commit block at j_first+n+1 --- */
+    memset(blk, 0, fs->block_size);
+    jbd2_commit_header_t *ch = (jbd2_commit_header_t *)blk;
+    ch->h.h_magic     = be32(JBD2_MAGIC_NUMBER);
+    ch->h.h_blocktype = be32(JBD2_COMMIT_BLOCK);
+    ch->h.h_sequence  = be32(seq);
+    rc = jraw_write(fs, fs->j_first + 1 + n, blk);
+
+out:
+    kfree(blk);
+    return rc;
+}
+
+/* Copy every staged block to its home location. */
+static int jbd2_checkpoint(struct ext4 *fs, struct ext4_txn *t) {
+    int half = (t->n + 1) / 2;
+    for (int i = 0; i < t->n; i++) {
+        if (g_jbd_crash_phase == JBD2_CRASH_MID_CHECKPOINT && i >= half)
+            return VFS_OK;                    /* model a crash partway */
+        uint64_t lba = t->ents[i].blk * fs->sectors_per_block;
+        if (blk_write(fs->dev, lba, fs->sectors_per_block,
+                      t->ents[i].data) != 0)
+            return VFS_ERR_IO;
+    }
+    return VFS_OK;
+}
+
+/* Commit the active transaction (see the section header for ordering). */
+static int txn_commit(struct ext4 *fs) {
+    struct ext4_txn *t = fs->txn;
+    if (!t) return VFS_OK;
+    fs->txn = NULL;                  /* journal + checkpoint writes go direct */
+    int rc;
+
+    if (t->nomem) { rc = VFS_ERR_NOMEM; goto done; }
+    if (t->n == 0) { rc = VFS_OK; goto done; }
+
+    if (!fs->has_journal) {
+        /* No journal: flush staged blocks straight home (legacy, non-
+         * atomic). We never stage without a journal, but stay correct. */
+        rc = VFS_OK;
+        for (int i = 0; i < t->n && rc == VFS_OK; i++) {
+            uint64_t lba = t->ents[i].blk * fs->sectors_per_block;
+            if (blk_write(fs->dev, lba, fs->sectors_per_block,
+                          t->ents[i].data) != 0)
+                rc = VFS_ERR_IO;
+        }
+        goto done;
+    }
+
+    uint32_t seq = fs->j_sequence;
+    rc = jbd2_set_state(fs, fs->j_first, seq, true);     /* mark dirty */
+    if (rc != VFS_OK) goto done;
+    rc = jbd2_write_log(fs, t, seq);
+    if (rc != VFS_OK) goto done;
+    if (g_jbd_crash_phase == JBD2_CRASH_BEFORE_COMMIT ||
+        g_jbd_crash_phase == JBD2_CRASH_AFTER_COMMIT) { rc = VFS_OK; goto done; }
+    rc = jbd2_checkpoint(fs, t);
+    if (rc != VFS_OK) goto done;
+    if (g_jbd_crash_phase == JBD2_CRASH_MID_CHECKPOINT) { rc = VFS_OK; goto done; }
+    rc = jbd2_set_state(fs, 0, seq + 1, false);          /* mark clean */
+    if (rc == VFS_OK) fs->j_sequence = seq + 1;
+
+done:
+    txn_free(t);
+    return rc;
+}
+
+/* Close a transaction opened by txn_begin: commit on success, discard on
+ * failure. If no journal was active, just return the operation's rc. */
+static int txn_finish(struct ext4 *fs, int rc) {
+    if (!fs->txn) return rc;
+    if (rc != VFS_OK) { txn_abort(fs); return rc; }
+    return txn_commit(fs);
+}
+
+/* Scan the log from the journal superblock's s_start and replay every
+ * transaction that has a matching commit block. Idempotent: safe to run
+ * on a partially-checkpointed or already-recovered journal. */
+static int jbd2_recover(struct ext4 *fs) {
+    uint8_t *jsb = kmalloc(fs->block_size);
+    if (!jsb) return VFS_ERR_NOMEM;
+    int rc = jraw_read(fs, 0, jsb);
+    if (rc != VFS_OK) { kfree(jsb); return rc; }
+    jbd2_superblock_t *s = (jbd2_superblock_t *)jsb;
+    uint32_t start = be32(s->s_start);
+    uint32_t seq   = be32(s->s_sequence);
+    kfree(jsb);
+    if (start == 0) { fs->j_sequence = seq; return VFS_OK; }   /* clean */
+
+    uint8_t *blk = kmalloc(fs->block_size);
+    if (!blk) return VFS_ERR_NOMEM;
+
+    /* Pass 1: find the highest sequence whose commit block is present. */
+    uint32_t rel = start, expect = seq, last_committed = seq - 1;
+    while (rel < fs->j_blocks) {
+        if (jraw_read(fs, rel, blk) != VFS_OK) break;
+        jbd2_header_t *h = (jbd2_header_t *)blk;
+        if (be32(h->h_magic) != JBD2_MAGIC_NUMBER) break;
+        if (be32(h->h_blocktype) != JBD2_DESCRIPTOR_BLOCK) break;
+        if (be32(h->h_sequence) != expect) break;
+        uint32_t m = jbd2_count_tags(fs, blk);
+        uint32_t commit_rel = rel + 1 + m;
+        if (commit_rel >= fs->j_blocks) break;
+        if (jraw_read(fs, commit_rel, blk) != VFS_OK) break;
+        jbd2_header_t *c = (jbd2_header_t *)blk;
+        if (be32(c->h_magic) == JBD2_MAGIC_NUMBER &&
+            be32(c->h_blocktype) == JBD2_COMMIT_BLOCK &&
+            be32(c->h_sequence) == expect) {
+            last_committed = expect;
+            rel = commit_rel + 1;
+            expect++;
+        } else {
+            break;                        /* incomplete transaction: stop */
+        }
+    }
+
+    /* Pass 2: replay each committed transaction's data blocks to home.
+     * (No revoke pass: our writer never emits revoke records.) */
+    uint32_t replayed = 0;
+    rel = start; expect = seq;
+    uint8_t *dblk = kmalloc(fs->block_size);
+    if (!dblk) { kfree(blk); return VFS_ERR_NOMEM; }
+    while (expect <= last_committed && rel < fs->j_blocks) {
+        if (jraw_read(fs, rel, blk) != VFS_OK) break;
+        jbd2_header_t *h = (jbd2_header_t *)blk;
+        if (be32(h->h_magic) != JBD2_MAGIC_NUMBER ||
+            be32(h->h_blocktype) != JBD2_DESCRIPTOR_BLOCK ||
+            be32(h->h_sequence) != expect) break;
+        uint32_t off = sizeof(jbd2_header_t), idx = 0;
+        bool last = false;
+        while (!last && off + sizeof(jbd2_block_tag_t) <= fs->block_size) {
+            jbd2_block_tag_t *tag = (jbd2_block_tag_t *)(blk + off);
+            uint16_t flags = be16(tag->t_flags);
+            uint32_t home  = be32(tag->t_blocknr);
+            off += sizeof(*tag);
+            if (!(flags & JBD2_FLAG_SAME_UUID)) off += 16;
+            last = (flags & JBD2_FLAG_LAST_TAG) != 0;
+            if (jraw_read(fs, rel + 1 + idx, dblk) == VFS_OK) {
+                if (flags & JBD2_FLAG_ESCAPE)
+                    *(uint32_t *)dblk = be32(JBD2_MAGIC_NUMBER);
+                uint64_t lba = (uint64_t)home * fs->sectors_per_block;
+                if (blk_write(fs->dev, lba, fs->sectors_per_block, dblk) == 0)
+                    replayed++;
+            }
+            idx++;
+        }
+        rel = rel + 1 + idx + 1;          /* descriptor + data + commit */
+        expect++;
+    }
+    kfree(dblk);
+    kfree(blk);
+
+    /* Recovery may have rewritten the ext4 SB / GDT; refresh our caches
+     * from disk before we clear the recovery flags (which write the SB). */
+    if (blk_read(fs->dev, 2, 2, fs->sb_buf) != 0) return VFS_ERR_IO;
+    uint32_t gdt_blocks = (fs->gdt_bytes + fs->block_size - 1) / fs->block_size;
+    uint32_t gdt_first = fs->first_data_block + 1;
+    for (uint32_t i = 0; i < gdt_blocks; i++)
+        if (read_block(fs, gdt_first + i,
+                       fs->gdt_buf + i * fs->block_size) != VFS_OK)
+            return VFS_ERR_IO;
+
+    fs->j_sequence = last_committed + 1;
+    rc = jbd2_set_state(fs, 0, fs->j_sequence, false);     /* journal clean */
+    kprintf("[ext4] journal recovery: replayed %u block(s), seq %u..%u\n",
+            replayed, (unsigned)seq, (unsigned)last_committed);
+    return rc;
+}
+
+/* Locate the journal inode's (single, contiguous, depth-0) extent so we
+ * can address log blocks physically. Returns false if the journal isn't
+ * laid out the simple way we can drive. */
+static bool journal_locate(struct ext4 *fs, uint32_t jinum) {
+    struct ext4_inode ji;
+    if (read_inode(fs, jinum, &ji) != VFS_OK) return false;
+    if (!(ji.i_flags & EXT4_EXTENTS_FL)) return false;
+    struct ext4_extent_header *eh = (struct ext4_extent_header *)&ji.i_block[0];
+    if (eh->eh_magic != EXT4_EXT_MAGIC || eh->eh_depth != 0 ||
+        eh->eh_entries != 1) return false;
+    struct ext4_extent *e = (struct ext4_extent *)(eh + 1);
+    if (e->ee_block != 0) return false;
+    uint16_t len = e->ee_len;
+    if (len > 32768) len = (uint16_t)(len - 32768);
+    fs->j_phys_first = ((uint64_t)e->ee_start_hi << 32) | e->ee_start_lo;
+    fs->j_blocks     = len;
+    return fs->j_blocks >= 4;     /* superblock + at least desc/data/commit */
+}
+
 /* ---- vfs_ops ---- */
 
 static int ext4_open(void *mnt, const char *path, struct vfs_file *out) {
@@ -1049,6 +1494,11 @@ static long ext4_read(struct vfs_file *f, void *buf, size_t n) {
     return got;
 }
 
+/* Cap on file-data blocks journalled per transaction. A write longer
+ * than this is split into several atomic chunks (the inode is persisted
+ * at each chunk boundary, so every commit leaves a consistent file). */
+#define EXT4_WRITE_CHUNK_BLOCKS 32
+
 static long ext4_write(struct vfs_file *f, const void *buf, size_t n) {
     struct ext4 *fs = (struct ext4 *)f->mnt;
     struct ext4_filepriv *fp = (struct ext4_filepriv *)f->priv;
@@ -1058,51 +1508,59 @@ static long ext4_write(struct vfs_file *f, const void *buf, size_t n) {
     size_t written = 0;
 
     while (n > 0) {
-        uint32_t lblk = (uint32_t)(f->pos / fs->block_size);
-        uint32_t off  = (uint32_t)(f->pos % fs->block_size);
-        uint32_t take = fs->block_size - off;
-        if (take > n) take = (uint32_t)n;
+        txn_begin(fs);                       /* one transaction per chunk */
+        int rc = VFS_OK;
+        int blocks = 0;
+        while (n > 0 && blocks < EXT4_WRITE_CHUNK_BLOCKS) {
+            uint32_t lblk = (uint32_t)(f->pos / fs->block_size);
+            uint32_t off  = (uint32_t)(f->pos % fs->block_size);
+            uint32_t take = fs->block_size - off;
+            if (take > n) take = (uint32_t)n;
 
-        /* Resolve (or allocate) the backing block for this file block. */
-        uint64_t phys = 0;
-        int rc = inode_block_map_alloc(fs, &fp->in, lblk, &phys);
-        if (rc != VFS_OK || phys == 0)
-            return written > 0 ? (long)written : (rc ? rc : VFS_ERR_IO);
+            uint64_t phys = 0;
+            rc = inode_block_map_alloc(fs, &fp->in, lblk, &phys);
+            if (rc != VFS_OK || phys == 0) {
+                if (rc == VFS_OK) rc = VFS_ERR_IO;
+                break;
+            }
+            /* RMW for a partial block; full-block writes skip the read. */
+            uint8_t *tmp = kmalloc(fs->block_size);
+            if (!tmp) { rc = VFS_ERR_NOMEM; break; }
+            if (take < fs->block_size) {
+                rc = read_block(fs, phys, tmp);
+                if (rc != VFS_OK) { kfree(tmp); break; }
+            }
+            memcpy(tmp + off, src, take);
+            rc = write_block(fs, phys, tmp);
+            kfree(tmp);
+            if (rc != VFS_OK) break;
 
-        /* Read-modify-write for a partial block; full-block writes skip
-         * the read. Reuse blk_buf (single-threaded FS access). */
-        uint8_t *tmp = kmalloc(fs->block_size);
-        if (!tmp) return written > 0 ? (long)written : VFS_ERR_NOMEM;
-        if (take < fs->block_size) {
-            rc = read_block(fs, phys, tmp);
-            if (rc != VFS_OK) { kfree(tmp);
-                return written > 0 ? (long)written : rc; }
+            src     += take;
+            f->pos  += take;
+            n       -= take;
+            written += take;
+            blocks++;
         }
-        memcpy(tmp + off, src, take);
-        rc = write_block(fs, phys, tmp);
-        kfree(tmp);
+
+        /* Persist the inode (size + extent growth) INSIDE this txn so the
+         * commit is self-consistent, then commit (or discard on error). */
+        if (rc == VFS_OK) {
+            if (f->pos > fp->file_size) {
+                fp->file_size    = f->pos;
+                fp->in.i_size_lo = (uint32_t)(fp->file_size & 0xFFFFFFFFu);
+                fp->in.i_size_hi = (uint32_t)(fp->file_size >> 32);
+                f->size          = (size_t)fp->file_size;
+            }
+            rc = write_inode(fs, fp->inode_no, &fp->in);
+        }
+        rc = txn_finish(fs, rc);
         if (rc != VFS_OK) return written > 0 ? (long)written : rc;
-
-        src     += take;
-        f->pos  += take;
-        n       -= take;
-        written += take;
     }
-
-    /* Grow the file size if we wrote past the old EOF. */
-    if (f->pos > fp->file_size) {
-        fp->file_size    = f->pos;
-        fp->in.i_size_lo = (uint32_t)(fp->file_size & 0xFFFFFFFFu);
-        fp->in.i_size_hi = (uint32_t)(fp->file_size >> 32);
-        f->size          = (size_t)fp->file_size;
-    }
-    write_inode(fs, fp->inode_no, &fp->in);
     return (long)written;
 }
 
-static int ext4_create(void *mnt, const char *path,
-                       uint32_t uid, uint32_t gid, uint32_t mode) {
-    struct ext4 *fs = (struct ext4 *)mnt;
+static int do_create(struct ext4 *fs, const char *path,
+                     uint32_t uid, uint32_t gid, uint32_t mode) {
     uint32_t parent_ino;
     char leaf[VFS_NAME_MAX];
     int rc = path_parent(fs, path, &parent_ino, leaf, sizeof(leaf));
@@ -1134,8 +1592,14 @@ static int ext4_create(void *mnt, const char *path,
     return VFS_OK;
 }
 
-static int ext4_unlink(void *mnt, const char *path) {
+static int ext4_create(void *mnt, const char *path,
+                       uint32_t uid, uint32_t gid, uint32_t mode) {
     struct ext4 *fs = (struct ext4 *)mnt;
+    txn_begin(fs);
+    return txn_finish(fs, do_create(fs, path, uid, gid, mode));
+}
+
+static int do_unlink(struct ext4 *fs, const char *path) {
     uint32_t parent_ino;
     char leaf[VFS_NAME_MAX];
     int rc = path_parent(fs, path, &parent_ino, leaf, sizeof(leaf));
@@ -1167,9 +1631,14 @@ static int ext4_unlink(void *mnt, const char *path) {
     return VFS_OK;
 }
 
-static int ext4_mkdir(void *mnt, const char *path,
-                      uint32_t uid, uint32_t gid, uint32_t mode) {
+static int ext4_unlink(void *mnt, const char *path) {
     struct ext4 *fs = (struct ext4 *)mnt;
+    txn_begin(fs);
+    return txn_finish(fs, do_unlink(fs, path));
+}
+
+static int do_mkdir(struct ext4 *fs, const char *path,
+                    uint32_t uid, uint32_t gid, uint32_t mode) {
     uint32_t parent_ino;
     char leaf[VFS_NAME_MAX];
     int rc = path_parent(fs, path, &parent_ino, leaf, sizeof(leaf));
@@ -1225,6 +1694,13 @@ static int ext4_mkdir(void *mnt, const char *path,
     adj_used_dirs(fs, (new_ino - 1) / fs->inodes_per_group, +1);
     flush_gdt(fs);
     return VFS_OK;
+}
+
+static int ext4_mkdir(void *mnt, const char *path,
+                      uint32_t uid, uint32_t gid, uint32_t mode) {
+    struct ext4 *fs = (struct ext4 *)mnt;
+    txn_begin(fs);
+    return txn_finish(fs, do_mkdir(fs, path, uid, gid, mode));
 }
 
 /* ---- opendir / readdir / closedir ---- */
@@ -1395,8 +1871,9 @@ int ext4_probe(struct blk_dev *dev) {
     uint32_t bs = 1024u << sb->s_log_block_size;
     if (bs != 1024 && bs != 2048 && bs != 4096) return 0;
 
-    /* Refuse anything we can't safely mount RO. */
-    if (sb->s_feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER) return 0;
+    /* INLINE_DATA we can't read at all; refuse. A NEEDS_RECOVERY image is
+     * now allowed through -- mount() recovers it if the journal is one we
+     * can drive, and otherwise refuses cleanly. */
     if (sb->s_feature_incompat & EXT4_FEATURE_INCOMPAT_INLINE_DATA) return 0;
     return 1;
 }
@@ -1437,11 +1914,9 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
         kfree(sb_raw);
         return NULL;
     }
-    if (sb->s_feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER) {
-        kprintf("[ext4] refuse mount: NEEDS_RECOVERY (journal replay required)\n");
-        kfree(sb_raw);
-        return NULL;
-    }
+    /* NEEDS_RECOVERY is handled below (after we locate the journal): we
+     * replay if the journal is drivable, else refuse. INLINE_DATA we can
+     * never read. */
     if (sb->s_feature_incompat & EXT4_FEATURE_INCOMPAT_INLINE_DATA) {
         kprintf("[ext4] refuse mount: INLINE_DATA not supported\n");
         kfree(sb_raw);
@@ -1511,6 +1986,58 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
         ext4_free(fs);
         return NULL;
     }
+
+    /* ---- JBD2 journal: detect, validate, recover ---- */
+    struct ext4_super_block *sbc = (struct ext4_super_block *)fs->sb_buf;
+    if (sbc->s_feature_compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL) {
+        uint32_t jinum = sbc->s_journal_inum ? sbc->s_journal_inum
+                                             : EXT4_JOURNAL_INODE;
+        uint8_t *jsb = NULL;
+        if (journal_locate(fs, jinum) &&
+            (jsb = kmalloc(fs->block_size)) != NULL &&
+            jraw_read(fs, 0, jsb) == VFS_OK) {
+            jbd2_superblock_t *js = (jbd2_superblock_t *)jsb;
+            uint32_t jmagic    = be32(js->s_header.h_magic);
+            uint32_t jtype     = be32(js->s_header.h_blocktype);
+            uint32_t jincompat = be32(js->s_feature_incompat);
+            uint32_t jbsize    = be32(js->s_blocksize);
+            uint32_t jstart    = be32(js->s_start);
+            bool drivable =
+                jmagic == JBD2_MAGIC_NUMBER &&
+                (jtype == JBD2_SUPERBLOCK_V2 || jtype == JBD2_SUPERBLOCK_V1) &&
+                jbsize == fs->block_size &&
+                (jincompat & ~JBD2_INCOMPAT_SUPPORTED) == 0;
+            if (drivable) {
+                fs->j_first    = be32(js->s_first);
+                if (fs->j_first == 0) fs->j_first = 1;
+                fs->j_sequence = be32(js->s_sequence);
+                fs->has_journal = true;
+                kfree(jsb); jsb = NULL;
+                if (jstart != 0) {
+                    kprintf("[ext4] journal needs recovery (s_start=%u, "
+                            "seq=%u)\n", jstart, fs->j_sequence);
+                    if (jbd2_recover(fs) != VFS_OK) {
+                        kprintf("[ext4] journal recovery FAILED\n");
+                        ext4_free(fs);
+                        return NULL;
+                    }
+                }
+            } else {
+                kprintf("[ext4] journal present but not drivable "
+                        "(magic=0x%x incompat=0x%x bs=%u); in-place writes\n",
+                        jmagic, jincompat, jbsize);
+            }
+        }
+        if (jsb) kfree(jsb);
+    }
+    /* NEEDS_RECOVERY but we couldn't drive its journal -> refuse rather
+     * than corrupt it with in-place writes. */
+    if ((fs->feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER) &&
+        !fs->has_journal) {
+        kprintf("[ext4] refuse mount: NEEDS_RECOVERY, journal not drivable\n");
+        ext4_free(fs);
+        return NULL;
+    }
     return fs;
 }
 
@@ -1528,28 +2055,32 @@ int ext4_mount(const char *mount_point, struct blk_dev *dev) {
     }
 
     kprintf("[ext4] mounted '%s' on %s: %u blocks x %u B "
-            "(%u KiB total, %u groups, inode_size=%u, first_ino=%u, %s, rw)\n",
+            "(%u KiB total, %u groups, inode_size=%u, first_ino=%u, %s, rw%s)\n",
             mount_point, dev->name ? dev->name : "(anon)",
             (unsigned)fs->total_blocks, fs->block_size,
             (unsigned)((fs->total_blocks * fs->block_size) / 1024u),
             fs->group_count, fs->inode_size, fs->first_ino,
             (fs->feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) ?
-                "extents" : "legacy-ptrs");
+                "extents" : "legacy-ptrs",
+            fs->has_journal ? "+jbd2" : "");
     return VFS_OK;
 }
 
 /* ================================================================
  * In-kernel minimal ext4 formatter (for the self-test; no host mke2fs)
  *
- * Produces a single-block-group, 4 KiB-block, extents, NO-journal ext4
- * that the existing read+write paths fully understand. Layout:
+ * Produces a single-block-group, 4 KiB-block, extents ext4 that the
+ * read+write paths fully understand. Layout:
  *   block 0      : boot area + superblock (at byte offset 1024)
  *   block 1      : group descriptor table (one 32-byte descriptor)
  *   block 2      : block bitmap
  *   block 3      : inode bitmap
  *   blocks 4..   : inode table (EXT4FMT_IPG inodes x 256 B)
- *   first data   : root directory block ("." / "..")
- * Reserved inodes 1..10 are marked used; inode 2 is the root dir.
+ *   root dir     : root directory block ("." / "..")
+ *   [journal]    : with_journal -> EXT4FMT_JBLOCKS-block JBD2 journal
+ *                  (inode 8); block 0 of it is the journal superblock.
+ * Reserved inodes 1..10 are marked used; inode 2 is the root dir and
+ * inode 8 (when journalled) is the journal.
  * ================================================================ */
 
 #define EXT4FMT_BS       4096u
@@ -1557,6 +2088,7 @@ int ext4_mount(const char *mount_point, struct blk_dev *dev) {
 #define EXT4FMT_ISIZE    256u
 #define EXT4FMT_IPG      512u                              /* inodes/group */
 #define EXT4FMT_BPG      (EXT4FMT_BS * 8u)                 /* 32768 blocks/group */
+#define EXT4FMT_JBLOCKS  256u                              /* 1 MiB journal */
 
 static int fmt_write_block(struct blk_dev *dev, uint64_t blk, const void *buf) {
     if (blk_write(dev, blk * EXT4FMT_SPB, EXT4FMT_SPB, buf) != 0)
@@ -1564,7 +2096,7 @@ static int fmt_write_block(struct blk_dev *dev, uint64_t blk, const void *buf) {
     return VFS_OK;
 }
 
-int ext4_format(struct blk_dev *dev) {
+int ext4_format_ex(struct blk_dev *dev, int with_journal) {
     if (!dev) return VFS_ERR_INVAL;
     uint64_t total_blocks = dev->sector_count / EXT4FMT_SPB;
     if (total_blocks < 64 || total_blocks > EXT4FMT_BPG) {
@@ -1583,7 +2115,16 @@ int ext4_format(struct blk_dev *dev) {
     const uint32_t itable_block     = 4;
     const uint32_t first_data       = itable_block + itable_blocks;   /* 36 */
     const uint32_t root_dir_block   = first_data;
-    const uint32_t used_blocks      = root_dir_block + 1;             /* 0..root */
+    const uint32_t journal_blocks   = with_journal ? EXT4FMT_JBLOCKS : 0;
+    const uint32_t journal_start    = root_dir_block + 1;
+    const uint32_t used_blocks      = journal_start + journal_blocks;
+
+    if (with_journal && total_blocks < used_blocks + 8) {
+        kprintf("[ext4] format: device too small for a %u-block journal "
+                "(have %lu blocks, need >= %u)\n", journal_blocks,
+                (unsigned long)total_blocks, used_blocks + 8);
+        return VFS_ERR_INVAL;
+    }
 
     uint8_t *blk = kcalloc(1, EXT4FMT_BS);
     if (!blk) return VFS_ERR_NOMEM;
@@ -1610,7 +2151,11 @@ int ext4_format(struct blk_dev *dev) {
     sb->s_inode_size          = EXT4FMT_ISIZE;
     sb->s_feature_incompat    = EXT4_FEATURE_INCOMPAT_FILETYPE |
                                 EXT4_FEATURE_INCOMPAT_EXTENTS;
-    /* No journal (compat=0), no ro_compat checksums, 32-byte descs. */
+    if (with_journal) {
+        sb->s_feature_compat |= EXT4_FEATURE_COMPAT_HAS_JOURNAL;
+        sb->s_journal_inum    = EXT4_JOURNAL_INODE;
+    }
+    /* No ro_compat checksums, 32-byte descs. */
     rc = fmt_write_block(dev, sb_block, blk);
     if (rc != VFS_OK) goto out;
 
@@ -1628,7 +2173,7 @@ int ext4_format(struct blk_dev *dev) {
 
     /* --- block 2: block bitmap (bit N = block N) --- */
     memset(blk, 0, EXT4FMT_BS);
-    for (uint32_t b = 0; b < used_blocks; b++)         /* metadata + root dir */
+    for (uint32_t b = 0; b < used_blocks; b++)         /* metadata + root + journal */
         blk[b / 8] |= (uint8_t)(1u << (b & 7));
     for (uint32_t b = (uint32_t)total_blocks; b < EXT4FMT_BPG; b++) /* nonexistent */
         blk[b / 8] |= (uint8_t)(1u << (b & 7));
@@ -1642,37 +2187,60 @@ int ext4_format(struct blk_dev *dev) {
     rc = fmt_write_block(dev, ibitmap_block, blk);
     if (rc != VFS_OK) goto out;
 
-    /* --- inode table: zero all blocks, then write root inode #2 --- */
+    /* --- inode table: zero all blocks, then write inodes 2 + 8 (both
+     *     land in the first itable block, block 4) --- */
     memset(blk, 0, EXT4FMT_BS);
     for (uint32_t i = 0; i < itable_blocks; i++) {
         rc = fmt_write_block(dev, itable_block + i, blk);
         if (rc != VFS_OK) goto out;
     }
-    /* Inode 2 lives at table byte offset (2-1)*256 = 256 -> block 4, off 256. */
     {
-        uint32_t byte_off = (EXT4_ROOT_INODE - 1) * EXT4FMT_ISIZE;
-        uint32_t iblk = itable_block + byte_off / EXT4FMT_BS;
-        uint32_t ioff = byte_off % EXT4FMT_BS;
-        memset(blk, 0, EXT4FMT_BS);          /* iblk == block 4, only root here */
-        struct ext4_inode *root = (struct ext4_inode *)(blk + ioff);
+        memset(blk, 0, EXT4FMT_BS);          /* block 4 holds inodes 1..16 */
+        /* root inode #2 at byte offset (2-1)*256 = 256 */
+        struct ext4_inode *root =
+            (struct ext4_inode *)(blk + (EXT4_ROOT_INODE - 1) * EXT4FMT_ISIZE);
         root->i_mode        = EXT4_S_IFDIR | 0755u;
         root->i_links_count = 2;             /* "." + parent's entry */
         root->i_size_lo     = EXT4FMT_BS;
         root->i_blocks_lo   = EXT4FMT_BS / 512;
         root->i_flags       = EXT4_EXTENTS_FL;
-        struct ext4_extent_header *eh =
+        struct ext4_extent_header *reh =
             (struct ext4_extent_header *)&root->i_block[0];
-        eh->eh_magic   = EXT4_EXT_MAGIC;
-        eh->eh_entries = 1;
-        eh->eh_max     = (sizeof(root->i_block) - sizeof(*eh)) /
-                         sizeof(struct ext4_extent);
-        eh->eh_depth   = 0;
-        struct ext4_extent *e = (struct ext4_extent *)(eh + 1);
-        e->ee_block    = 0;
-        e->ee_len      = 1;
-        e->ee_start_hi = 0;
-        e->ee_start_lo = root_dir_block;
-        rc = fmt_write_block(dev, iblk, blk);
+        reh->eh_magic   = EXT4_EXT_MAGIC;
+        reh->eh_entries = 1;
+        reh->eh_max     = (sizeof(root->i_block) - sizeof(*reh)) /
+                          sizeof(struct ext4_extent);
+        reh->eh_depth   = 0;
+        struct ext4_extent *re = (struct ext4_extent *)(reh + 1);
+        re->ee_block    = 0;
+        re->ee_len      = 1;
+        re->ee_start_hi = 0;
+        re->ee_start_lo = root_dir_block;
+
+        if (with_journal) {
+            /* journal inode #8 at byte offset (8-1)*256 = 1792, one
+             * contiguous extent covering the whole journal region. */
+            struct ext4_inode *ji =
+                (struct ext4_inode *)(blk + (EXT4_JOURNAL_INODE - 1) * EXT4FMT_ISIZE);
+            ji->i_mode        = EXT4_S_IFREG | 0600u;
+            ji->i_links_count = 1;
+            ji->i_size_lo     = journal_blocks * EXT4FMT_BS;
+            ji->i_blocks_lo   = journal_blocks * (EXT4FMT_BS / 512);
+            ji->i_flags       = EXT4_EXTENTS_FL;
+            struct ext4_extent_header *jeh =
+                (struct ext4_extent_header *)&ji->i_block[0];
+            jeh->eh_magic   = EXT4_EXT_MAGIC;
+            jeh->eh_entries = 1;
+            jeh->eh_max     = (sizeof(ji->i_block) - sizeof(*jeh)) /
+                              sizeof(struct ext4_extent);
+            jeh->eh_depth   = 0;
+            struct ext4_extent *je = (struct ext4_extent *)(jeh + 1);
+            je->ee_block    = 0;
+            je->ee_len      = (uint16_t)journal_blocks;
+            je->ee_start_hi = 0;
+            je->ee_start_lo = journal_start;
+        }
+        rc = fmt_write_block(dev, itable_block, blk);
         if (rc != VFS_OK) goto out;
     }
 
@@ -1686,15 +2254,37 @@ int ext4_format(struct blk_dev *dev) {
         dd->inode = EXT4_ROOT_INODE; dd->rec_len = (uint16_t)(EXT4FMT_BS - 12);
         dd->name_len = 2; dd->file_type = EXT4_FT_DIR; memcpy((char *)dd + 8, "..", 2);
         rc = fmt_write_block(dev, root_dir_block, blk);
+        if (rc != VFS_OK) goto out;
+    }
+
+    /* --- journal superblock (journal block 0), clean (s_start = 0) --- */
+    if (with_journal) {
+        memset(blk, 0, EXT4FMT_BS);
+        jbd2_superblock_t *js = (jbd2_superblock_t *)blk;
+        js->s_header.h_magic     = be32(JBD2_MAGIC_NUMBER);
+        js->s_header.h_blocktype = be32(JBD2_SUPERBLOCK_V2);
+        js->s_blocksize          = be32(EXT4FMT_BS);
+        js->s_maxlen             = be32(journal_blocks);
+        js->s_first              = be32(1);
+        js->s_sequence           = be32(1);     /* first commit id */
+        js->s_start              = be32(0);      /* clean */
+        js->s_nr_users           = be32(1);
+        rc = fmt_write_block(dev, journal_start, blk);
+        if (rc != VFS_OK) goto out;
     }
 
 out:
     kfree(blk);
     if (rc == VFS_OK)
         kprintf("[ext4] format: %lu blocks (4K), %u inodes, itable=%u blk, "
-                "first_data=%u\n", (unsigned long)total_blocks, EXT4FMT_IPG,
-                itable_blocks, first_data);
+                "root=%u%s\n", (unsigned long)total_blocks, EXT4FMT_IPG,
+                itable_blocks, root_dir_block,
+                with_journal ? ", +jbd2 journal (inode 8)" : "");
     return rc;
+}
+
+int ext4_format(struct blk_dev *dev) {
+    return ext4_format_ex(dev, 0);
 }
 
 /* ================================================================
@@ -1870,5 +2460,149 @@ int ext4_self_test(void) {
     kfree(image);
     kfree(scratch);
     kprintf("[EXT4ST] %s (%d failure(s))\n", fails == 0 ? "PASS" : "FAIL", fails);
+    return fails == 0 ? 0 : -1;
+}
+
+/* ================================================================
+ * JBD2 crash-consistency self-test.
+ *
+ * Formats a journalled ramdev, then for each phase of a transaction
+ * (before the commit block / after the commit block / midway through the
+ * checkpoint) injects a "power loss": the in-flight commit stops, the
+ * in-memory fs is thrown away, and the image is remounted -- which runs
+ * jbd2_recover(). We then assert that the operation was atomic:
+ *   - crash before commit  -> the change vanished (rolled back);
+ *   - crash after commit    -> the change is present (replayed);
+ *   - crash mid-checkpoint  -> the half-written homes were healed.
+ * Both metadata (create) and data (overwrite) transactions are tested.
+ * Self-contained -- no host mke2fs, no QEMU disk. [EXT4JT] markers.
+ * ================================================================ */
+
+static bool e4jt_exists(struct ext4 *fs, const char *path) {
+    uint32_t ino; uint8_t ftype;
+    return path_to_inode(fs, path, &ino, &ftype) == VFS_OK;
+}
+
+/* Create `path` with crash `phase` armed, then model a power loss:
+ * discard the in-memory fs and remount (which recovers). */
+static struct ext4 *e4jt_crash_create(struct blk_dev *dev, struct ext4 *fs,
+                                      const char *path, int phase) {
+    g_jbd_crash_phase = phase;
+    (void)ext4_create(fs, path, 0, 0, 0644);    /* commit halts at `phase` */
+    g_jbd_crash_phase = JBD2_CRASH_NONE;
+    ext4_free(fs);
+    return ext4_setup(dev);                      /* remount -> jbd2_recover */
+}
+
+/* Overwrite all of /keep with pattern `seed`, crash at `phase`, remount. */
+static struct ext4 *e4jt_crash_rewrite(struct blk_dev *dev, struct ext4 *fs,
+                                       uint8_t *scratch, size_t n,
+                                       uint32_t seed, int phase) {
+    struct vfs_file f; memset(&f, 0, sizeof(f));
+    if (ext4_open(fs, "/keep", &f) == VFS_OK) {
+        f.mnt = fs; f.pos = 0;
+        e4st_fill(scratch, n, seed);
+        g_jbd_crash_phase = phase;
+        ext4_write(&f, scratch, n);
+        g_jbd_crash_phase = JBD2_CRASH_NONE;
+        ext4_close(&f);
+    }
+    ext4_free(fs);
+    return ext4_setup(dev);
+}
+
+int ext4_journal_self_test(void) {
+    const uint64_t bytes = 4u * 1024u * 1024u;        /* 4 MiB ramdev (1024 blk) */
+    const size_t   ksize = 8192;                      /* /keep: 2 x 4K blocks */
+    int fails = 0;
+
+    uint8_t *image = kmalloc((size_t)bytes);
+    uint8_t *scratch = kmalloc(ksize);
+    if (!image || !scratch) {
+        kprintf("[EXT4JT] SKIP -- kmalloc failed\n");
+        if (image) kfree(image); if (scratch) kfree(scratch);
+        return -1;
+    }
+    memset(image, 0, (size_t)bytes);
+
+    struct ext4_ramdev r = { .buf = image, .bytes = bytes };
+    struct blk_dev dev; memset(&dev, 0, sizeof(dev));
+    dev.name = "ext4-jbd-selftest"; dev.ops = &e4ram_ops;
+    dev.sector_count = bytes / BLK_SECTOR_SIZE; dev.priv = &r;
+    dev.class = BLK_CLASS_DISK;
+
+    /* 0. format WITH journal + mount; confirm the journal is being driven. */
+    int rc = ext4_format_ex(&dev, 1);
+    struct ext4 *fs = (rc == VFS_OK) ? ext4_setup(&dev) : NULL;
+    bool ok0 = fs && fs->has_journal;
+    if (!ok0) fails++;
+    kprintf("[EXT4JT] step0 format+mount (journalled): %s\n",
+            ok0 ? "PASS" : "FAIL");
+    if (!fs) { kfree(image); kfree(scratch); return -1; }
+
+    /* 1. clean journalled create + multi-block write + verify (end-to-end). */
+    rc = e4st_create_write(fs, "/keep", scratch, ksize, 0x5A);
+    bool ok1 = (rc == VFS_OK) &&
+               (e4st_read_verify(fs, "/keep", scratch, ksize, 0x5A) == VFS_OK);
+    if (!ok1) fails++;
+    kprintf("[EXT4JT] step1 clean journalled write+verify: %s\n",
+            ok1 ? "PASS" : "FAIL");
+
+    /* 2. crash BEFORE the commit block -> create atomically rolled back. */
+    fs = e4jt_crash_create(&dev, fs, "/a", JBD2_CRASH_BEFORE_COMMIT);
+    bool ok2 = fs && !e4jt_exists(fs, "/a") && e4jt_exists(fs, "/keep");
+    if (!ok2) fails++;
+    kprintf("[EXT4JT] step2 crash<commit rollback (/a absent): %s\n",
+            ok2 ? "PASS" : "FAIL");
+    if (!fs) { kfree(image); kfree(scratch); return -1; }
+
+    /* 3. crash AFTER the commit block -> create atomically replayed. */
+    fs = e4jt_crash_create(&dev, fs, "/b", JBD2_CRASH_AFTER_COMMIT);
+    bool ok3 = fs && e4jt_exists(fs, "/b") && e4jt_exists(fs, "/keep");
+    if (!ok3) fails++;
+    kprintf("[EXT4JT] step3 crash>commit replay (/b present): %s\n",
+            ok3 ? "PASS" : "FAIL");
+    if (!fs) { kfree(image); kfree(scratch); return -1; }
+
+    /* 4. crash mid-checkpoint -> half-written homes healed by full replay. */
+    fs = e4jt_crash_create(&dev, fs, "/c", JBD2_CRASH_MID_CHECKPOINT);
+    bool ok4 = fs && e4jt_exists(fs, "/c") &&
+               e4jt_exists(fs, "/b") && e4jt_exists(fs, "/keep");
+    if (!ok4) fails++;
+    kprintf("[EXT4JT] step4 crash mid-checkpoint heal (/c present): %s\n",
+            ok4 ? "PASS" : "FAIL");
+    if (!fs) { kfree(image); kfree(scratch); return -1; }
+
+    /* 5. data overwrite, crash BEFORE commit -> original data survives. */
+    fs = e4jt_crash_rewrite(&dev, fs, scratch, ksize, 0x77,
+                            JBD2_CRASH_BEFORE_COMMIT);
+    bool ok5 = fs &&
+               (e4st_read_verify(fs, "/keep", scratch, ksize, 0x5A) == VFS_OK);
+    if (!ok5) fails++;
+    kprintf("[EXT4JT] step5 overwrite crash<commit rollback (0x5A kept): %s\n",
+            ok5 ? "PASS" : "FAIL");
+    if (!fs) { kfree(image); kfree(scratch); return -1; }
+
+    /* 6. data overwrite, crash AFTER commit -> new data replayed. */
+    fs = e4jt_crash_rewrite(&dev, fs, scratch, ksize, 0x77,
+                            JBD2_CRASH_AFTER_COMMIT);
+    bool ok6 = fs &&
+               (e4st_read_verify(fs, "/keep", scratch, ksize, 0x77) == VFS_OK);
+    if (!ok6) fails++;
+    kprintf("[EXT4JT] step6 overwrite crash>commit replay (0x77 applied): %s\n",
+            ok6 ? "PASS" : "FAIL");
+
+    /* 7. filesystem still fully usable after all that recovery. */
+    bool ok7 = fs &&
+               (e4st_create_write(fs, "/after", scratch, ksize, 0x33) == VFS_OK) &&
+               (e4st_read_verify(fs, "/after", scratch, ksize, 0x33) == VFS_OK);
+    if (!ok7) fails++;
+    kprintf("[EXT4JT] step7 fs usable post-recovery: %s\n",
+            ok7 ? "PASS" : "FAIL");
+
+    if (fs) ext4_free(fs);
+    kfree(image);
+    kfree(scratch);
+    kprintf("[EXT4JT] %s (%d failure(s))\n", fails == 0 ? "PASS" : "FAIL", fails);
     return fails == 0 ? 0 : -1;
 }

@@ -50,6 +50,13 @@ struct blk_dev;
 #define EXT4_FEATURE_INCOMPAT_FLEX_BG    0x0200u   /* ok */
 #define EXT4_FEATURE_INCOMPAT_INLINE_DATA 0x8000u  /* refuse */
 
+/* COMPAT bits. HAS_JOURNAL means a JBD2 journal inode is present
+ * (s_journal_inum); we drive it for crash-atomic writes + recovery. */
+#define EXT4_FEATURE_COMPAT_HAS_JOURNAL  0x0004u
+
+/* Conventional inode number of the JBD2 journal (s_journal_inum). */
+#define EXT4_JOURNAL_INODE   8u
+
 /* Inode mode (i_mode) high nibble: file type. */
 #define EXT4_S_IFMT          0xF000u
 #define EXT4_S_IFREG         0x8000u
@@ -263,9 +270,11 @@ int ext4_probe(struct blk_dev *dev);
  * image is still refused at mount). */
 int ext4_mount(const char *mount_point, struct blk_dev *dev);
 
-/* Format `dev` as a minimal single-block-group, 4 KiB-block, extents,
- * no-journal ext4 (used by the self-test; also a usable mkfs). Returns
- * VFS_OK / VFS_ERR_*. */
+/* Format `dev` as a minimal single-block-group, 4 KiB-block, extents
+ * ext4. `with_journal` adds a JBD2 journal (inode 8) so writes become
+ * crash-atomic. ext4_format() is the no-journal shorthand (back-compat
+ * with the original self-test). Returns VFS_OK / VFS_ERR_*. */
+int ext4_format_ex(struct blk_dev *dev, int with_journal);
 int ext4_format(struct blk_dev *dev);
 
 /* Self-contained write self-test: formats a ramdev, mounts it, and
@@ -273,5 +282,13 @@ int ext4_format(struct blk_dev *dev);
  * remount-persistence. Returns 0 on all-pass. Emits [EXT4ST] markers.
  * Called from kernel.c under -DEXT4_SELFTEST. */
 int ext4_self_test(void);
+
+/* Crash-consistency self-test for the JBD2 journal: formats a journalled
+ * ramdev, then injects a power loss at each phase of a transaction
+ * (before commit / after commit / mid-checkpoint) and verifies that
+ * remount+recovery leaves the filesystem atomically all-or-nothing.
+ * Returns 0 on all-pass. Emits [EXT4JT] markers. Called from kernel.c
+ * under -DEXT4_JOURNAL_SELFTEST. */
+int ext4_journal_self_test(void);
 
 #endif /* TOBYOS_EXT4_H */

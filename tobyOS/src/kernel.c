@@ -2448,6 +2448,12 @@ void _start(void) {
      * Self-contained (no host mke2fs, no QEMU disk). */
     { extern int ext4_self_test(void); ext4_self_test(); }
 #endif
+#ifdef EXT4_JOURNAL_SELFTEST
+    /* Opt-in: ext4 JBD2 crash-consistency self-test -- injects a power
+     * loss at each phase of a journalled transaction and proves remount
+     * recovery is atomic (rollback / replay / heal). */
+    { extern int ext4_journal_self_test(void); ext4_journal_self_test(); }
+#endif
     net_dump();
 
     modules_log();
