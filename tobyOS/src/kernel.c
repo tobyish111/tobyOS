@@ -2460,6 +2460,12 @@ void _start(void) {
      * routing. Runs BEFORE swap_init so it can freely reconfigure swap. */
     { extern int memcomp_self_test(void); memcomp_self_test(); }
 #endif
+#ifdef HUGEPAGE_SELFTEST
+    /* Opt-in: 2 MiB large-page self-test -- PMM huge-frame allocator +
+     * VMM huge map/translate/unmap, and a large kmalloc backed by 2 MiB
+     * leaves via the heap's huge-page growth path. */
+    { extern int hugepage_self_test(void); hugepage_self_test(); }
+#endif
     net_dump();
 
     modules_log();

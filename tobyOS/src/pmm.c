@@ -237,6 +237,51 @@ void pmm_free_pages_range(uint64_t phys, size_t n) {
     }
 }
 
+/* 2 MiB huge frame = 512 contiguous pages on a 2 MiB-aligned base. */
+#define PMM_2M_PAGES 512u
+#define PMM_2M_BYTES (PMM_2M_PAGES * PAGE_SIZE)
+
+uint64_t pmm_alloc_2m(void) {
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    uint64_t result = 0;
+    /* Only 2 MiB-aligned bases (page index a multiple of 512) can back a
+     * PD huge leaf. Scan those for a fully-free 512-page block. */
+    for (size_t base = 0; base + PMM_2M_PAGES <= g_total_pages;
+         base += PMM_2M_PAGES) {
+        bool all_free = true;
+        for (size_t k = 0; k < PMM_2M_PAGES; k++) {
+            if (bm_get(base + k)) { all_free = false; break; }
+        }
+        if (!all_free) continue;
+        for (size_t k = 0; k < PMM_2M_PAGES; k++) bm_set(base + k);
+        g_used_pages += PMM_2M_PAGES;
+        result = (uint64_t)base * PAGE_SIZE;     /* 2 MiB-aligned */
+        break;
+    }
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
+    return result;
+}
+
+void pmm_free_2m(uint64_t phys) {
+    if (phys == 0 || (phys & (PMM_2M_BYTES - 1)) != 0) {
+        kprintf("[pmm] WARN: pmm_free_2m(%p): not 2 MiB-aligned\n",
+                (void *)phys);
+        return;
+    }
+    size_t base = phys / PAGE_SIZE;
+    if (base + PMM_2M_PAGES > g_total_pages) {
+        kprintf("[pmm] WARN: pmm_free_2m(%p): out of range\n", (void *)phys);
+        return;
+    }
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    for (size_t k = 0; k < PMM_2M_PAGES; k++) {
+        size_t i = base + k;
+        if (bm_get(i)) { bm_clr(i); g_used_pages--; }
+    }
+    if (base < g_first_free_hint) g_first_free_hint = base;
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
+}
+
 void pmm_free_page(uint64_t phys) {
     if (phys == 0 || (phys & (PAGE_SIZE - 1)) != 0) {
         kprintf("[pmm] WARN: pmm_free_page(%p): not a page-aligned phys\n",

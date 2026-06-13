@@ -111,6 +111,70 @@ static void rollback_pages(uint64_t arena_virt, size_t mapped) {
     }
 }
 
+/* 2 MiB huge page, and a running count of 4 KiB-equivalent pages we've
+ * backed with huge leaves (stat / self-test). */
+#define KHEAP_2M (2ULL * 1024 * 1024)
+static size_t g_huge_arena_pages;
+
+size_t heap_huge_pages(void) { return g_huge_arena_pages; }
+
+/* Undo the first `done_2m` huge mappings of a partially-grown huge arena. */
+static void rollback_huge(uint64_t base, size_t done_2m) {
+    for (size_t j = 0; j < done_2m; j++) {
+        uint64_t v = base + (uint64_t)j * KHEAP_2M;
+        uint64_t p = vmm_translate(v) & ~(KHEAP_2M - 1);
+        vmm_unmap(v, KHEAP_2M);
+        if (p) pmm_free_2m(p);
+    }
+}
+
+/* Grow the heap with 2 MiB huge pages: one PD leaf per 2 MiB instead of
+ * 512 PTEs + a PT page, which cuts page-table memory and TLB pressure for
+ * large allocations. Best-effort -- returns 0 (caller falls back to the
+ * 4 KiB path) if the 2 MiB-aligned physical runs aren't available. The
+ * brk is rounded up to a 2 MiB boundary first (the skipped virtual
+ * address space is free; physical memory is untouched). */
+static arena_t *grow_huge(size_t bytes) {
+    uint64_t base = (g_kheap_brk + KHEAP_2M - 1) & ~(KHEAP_2M - 1);
+    size_t n2m = (bytes + KHEAP_2M - 1) / KHEAP_2M;
+    if (base + (uint64_t)n2m * KHEAP_2M > KHEAP_VIRT_END) return 0;
+
+    for (size_t k = 0; k < n2m; k++) {
+        uint64_t phys = pmm_alloc_2m();
+        if (phys == 0) { rollback_huge(base, k); return 0; }
+        if (!vmm_map(base + (uint64_t)k * KHEAP_2M, phys, KHEAP_2M,
+                     VMM_HUGE_2M | VMM_WRITE | VMM_NX)) {
+            pmm_free_2m(phys);
+            rollback_huge(base, k);
+            return 0;
+        }
+    }
+    g_kheap_brk = base + (uint64_t)n2m * KHEAP_2M;
+
+    arena_t *a    = (arena_t *)base;
+    a->next       = g_arenas;
+    a->pages      = n2m * (KHEAP_2M / PAGE_SIZE);
+    a->total_size = (size_t)n2m * KHEAP_2M - sizeof(arena_t);
+    a->magic      = KHEAP_MAGIC;
+    a->_pad       = 1;                      /* huge marker */
+    g_arenas      = a;
+
+    block_hdr_t *b = first_block(a);
+    b->size  = a->total_size;
+    b->magic = KHEAP_MAGIC;
+
+    g_total_bytes      += a->total_size;
+    g_huge_arena_pages += a->pages;
+
+    static bool announced;
+    if (!announced) {
+        announced = true;
+        kprintf("[heap] first 2 MiB huge arena: %lu x 2 MiB at %p\n",
+                (unsigned long)n2m, (void *)base);
+    }
+    return a;
+}
+
 static arena_t *grow(size_t need_bytes) {
     /* Pages needed to fit one block of `need_bytes` plus the arena
      * header. Round up to KHEAP_GROW_PAGES so we don't churn one page
@@ -118,6 +182,13 @@ static arena_t *grow(size_t need_bytes) {
     size_t bytes = align_up(need_bytes + sizeof(arena_t), PAGE_SIZE);
     size_t pages = bytes / PAGE_SIZE;
     if (pages < KHEAP_GROW_PAGES) pages = KHEAP_GROW_PAGES;
+
+    /* Large arenas get 2 MiB huge-page backing when possible; on
+     * fragmentation we transparently fall back to the 4 KiB path below. */
+    if (bytes >= KHEAP_2M) {
+        arena_t *huge = grow_huge(bytes);
+        if (huge) return huge;
+    }
 
     if (g_kheap_brk + (uint64_t)pages * PAGE_SIZE > KHEAP_VIRT_END) {
         kprintf("[heap] WARN: out of heap virtual address space "
@@ -154,6 +225,7 @@ static arena_t *grow(size_t need_bytes) {
     a->pages     = pages;
     a->total_size = pages * PAGE_SIZE - sizeof(arena_t);
     a->magic     = KHEAP_MAGIC;
+    a->_pad      = 0;                       /* 4 KiB-backed arena */
     g_arenas     = a;
 
     block_hdr_t *b = first_block(a);
@@ -347,4 +419,86 @@ void heap_dump(void) {
             bix++;
         }
     }
+}
+
+/* ================================================================
+ * 2 MiB large-page self-test (-DHUGEPAGE_SELFTEST). Proves the PMM huge-
+ * frame allocator + VMM huge map/translate/unmap, and that a large
+ * kmalloc is transparently backed by 2 MiB leaves. [HUGEPT] markers.
+ * ================================================================ */
+int hugepage_self_test(void) {
+    int fails = 0;
+    kprintf("[HUGEPT] 2 MiB large-page self-test\n");
+
+    /* ---- Test 1: direct PMM 2M alloc + VMM huge map/RW/translate/unmap ---- */
+    {
+        size_t   free0 = pmm_free_pages();
+        uint64_t phys  = pmm_alloc_2m();
+        bool aligned = (phys != 0) && ((phys & (KHEAP_2M - 1)) == 0);
+        bool drop512 = aligned && (pmm_free_pages() == free0 - 512);
+
+        /* An unused, 2 MiB-aligned VA near the top of the heap window. */
+        uint64_t tva = KHEAP_VIRT_END - 4 * KHEAP_2M;
+        bool mapped = aligned &&
+            vmm_map(tva, phys, KHEAP_2M, VMM_HUGE_2M | VMM_WRITE | VMM_NX);
+        bool huge  = mapped && (vmm_leaf_size(tva) == KHEAP_2M);
+        bool xlate = mapped && vmm_translate(tva) == phys &&
+                     vmm_translate(tva + 0x100000) == phys + 0x100000;
+
+        bool rw = mapped;
+        if (mapped) {
+            volatile uint32_t *p = (volatile uint32_t *)tva;
+            for (size_t off = 0; off < KHEAP_2M; off += PAGE_SIZE)
+                p[off / 4] = (uint32_t)(off ^ 0xABCD1234u);
+            for (size_t off = 0; off < KHEAP_2M; off += PAGE_SIZE)
+                if (p[off / 4] != (uint32_t)(off ^ 0xABCD1234u)) { rw = false; break; }
+        }
+
+        bool unmapped = mapped && vmm_unmap(tva, KHEAP_2M) &&
+                        vmm_leaf_size(tva) == 0 && vmm_translate(tva) == 0;
+        /* Isolate the huge-frame return from the VMM intermediate tables
+         * (PDPT/PD) that vmm_map allocated and unmap intentionally keeps:
+         * the free count must rise by exactly 512 across pmm_free_2m. */
+        size_t before_free = pmm_free_pages();
+        if (phys) pmm_free_2m(phys);
+        bool gain512 = (pmm_free_pages() == before_free + 512);
+
+        bool pass = drop512 && huge && xlate && rw && unmapped && gain512;
+        if (!pass) fails++;
+        kprintf("[HUGEPT] t1 direct 2M: %s (aligned=%d -512f=%d huge_leaf=%d "
+                "xlate=%d rw=%d unmap=%d +512f=%d)\n", pass ? "PASS" : "FAIL",
+                aligned, drop512, huge, xlate, rw, unmapped, gain512);
+    }
+
+    /* ---- Test 2: a large kmalloc is huge-page backed ---- */
+    {
+        size_t hp0 = heap_huge_pages();
+        const size_t big = 4u * 1024 * 1024;        /* 4 MiB */
+        uint8_t *p = kmalloc(big);
+        bool ok   = (p != NULL);
+        bool huge = ok && (vmm_leaf_size((uint64_t)p) == KHEAP_2M);
+        bool grew = (heap_huge_pages() > hp0);
+
+        bool rw = ok;
+        if (ok) {
+            for (size_t i = 0; i < big; i += PAGE_SIZE)
+                p[i] = (uint8_t)((i * 2654435761u) >> 24);
+            for (size_t i = 0; i < big; i += PAGE_SIZE)
+                if (p[i] != (uint8_t)((i * 2654435761u) >> 24)) { rw = false; break; }
+        }
+        if (p) kfree(p);
+
+        size_t n2m = (big + KHEAP_2M - 1) / KHEAP_2M;  /* PT pages saved vs 4K */
+        /* A >= 2 MiB allocation always lands in a huge-backed arena (every
+         * 4K arena is < 2 MiB), so huge_leaf is the robust assertion; grew
+         * is informational (it's false if a prior huge arena had room). */
+        bool pass = ok && rw && huge;
+        if (!pass) fails++;
+        kprintf("[HUGEPT] t2 heap kmalloc(4MiB): %s (huge_leaf=%d grew=%d rw=%d "
+                "PT_pages_saved=%lu)\n", pass ? "PASS" : "FAIL",
+                huge, grew, rw, (unsigned long)n2m);
+    }
+
+    kprintf("[HUGEPT] %s (%d failure(s))\n", fails == 0 ? "PASS" : "FAIL", fails);
+    return fails == 0 ? 0 : -1;
 }

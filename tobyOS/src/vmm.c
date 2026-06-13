@@ -237,34 +237,37 @@ bool vmm_map(uint64_t virt, uint64_t phys, size_t bytes, uint32_t flags) {
 
 /* ---- unmap path ---- */
 
-static bool unmap_one(uint64_t virt) {
+/* Unmap the leaf covering `virt`. Returns the number of bytes unmapped
+ * (PAGE_SIZE or PAGE_2M), or 0 if nothing was mapped / the request would
+ * shatter a 2 MiB leaf (sub-leaf unmap of a huge page is refused). */
+static size_t unmap_one(uint64_t virt) {
     pte_t *pdpt = next_table(g_pml4, pml4_idx(virt), 0, false);
-    if (!pdpt) return false;
+    if (!pdpt) return 0;
     pte_t *pd   = next_table(pdpt,  pdpt_idx(virt), 0, false);
-    if (!pd)   return false;
+    if (!pd)   return 0;
 
     pte_t pde = pd[pd_idx(virt)];
-    if (!(pde & PTE_P)) return false;
+    if (!(pde & PTE_P)) return 0;
 
     if (pde & PTE_PS) {
-        /* 2 MiB leaf -- only allow unmap if the request is aligned to
-         * the leaf. Refuse to silently shatter a huge page. */
+        /* 2 MiB leaf: unmap the whole leaf, but only if `virt` is aligned
+         * to it -- we never silently shatter a huge page. */
         if (virt & PAGE_2M_MASK) {
             kprintf("[vmm] WARN: unmap of 4K virt %p inside 2M leaf -- skipped\n",
                     (void *)virt);
-            return false;
+            return 0;
         }
         pd[pd_idx(virt)] = 0;
         invlpg(virt);
-        return true;
+        return PAGE_2M;
     }
 
     pte_t *pt = phys_to_table(pde & PTE_ADDR_MASK);
     size_t i  = pt_idx(virt);
-    if (!(pt[i] & PTE_P)) return false;
+    if (!(pt[i] & PTE_P)) return 0;
     pt[i] = 0;
     invlpg(virt);
-    return true;
+    return PAGE_SIZE;
 }
 
 bool vmm_unmap(uint64_t virt, size_t bytes) {
@@ -276,11 +279,28 @@ bool vmm_unmap(uint64_t virt, size_t bytes) {
     }
     uint64_t saved = spin_lock_irqsave(&g_vmm_lock);
     bool ok = true;
-    for (size_t off = 0; off < bytes; off += PAGE_SIZE) {
-        if (!unmap_one(virt + off)) ok = false;
+    size_t off = 0;
+    while (off < bytes) {
+        size_t step = unmap_one(virt + off);    /* whole leaf: 4K or 2M */
+        if (step == 0) { ok = false; step = PAGE_SIZE; }  /* skip + keep going */
+        off += step;
     }
     spin_unlock_irqrestore(&g_vmm_lock, saved);
     return ok;
+}
+
+/* Size of the leaf mapping `virt`: 0 (unmapped), PAGE_SIZE (4 KiB), or
+ * PAGE_2M (a 2 MiB huge leaf). Lock-free like vmm_translate. */
+size_t vmm_leaf_size(uint64_t virt) {
+    pte_t *pdpt = next_table(g_pml4, pml4_idx(virt), 0, false);
+    if (!pdpt) return 0;
+    pte_t *pd   = next_table(pdpt,  pdpt_idx(virt), 0, false);
+    if (!pd)   return 0;
+    pte_t pde = pd[pd_idx(virt)];
+    if (!(pde & PTE_P)) return 0;
+    if (pde & PTE_PS)   return PAGE_2M;
+    pte_t *pt = phys_to_table(pde & PTE_ADDR_MASK);
+    return (pt[pt_idx(virt)] & PTE_P) ? PAGE_SIZE : 0;
 }
 
 /* ---- protect ---- */

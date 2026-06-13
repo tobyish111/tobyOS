@@ -27,6 +27,15 @@ uint64_t pmm_alloc_page(void);
  * O(N * total_pages) worst case -- fine for our growth path. */
 uint64_t pmm_alloc_pages(size_t n);
 
+/* Allocate one 2 MiB huge frame: 512 physically-contiguous pages whose
+ * base is 2 MiB-aligned (required for an x86_64 2 MiB page-directory
+ * leaf). Returns the 2 MiB-aligned physical address, or 0 if no aligned
+ * free run exists (fragmentation -- caller should fall back to 4 KiB). */
+uint64_t pmm_alloc_2m(void);
+
+/* Free a 2 MiB huge frame previously returned by pmm_alloc_2m(). */
+void pmm_free_2m(uint64_t phys);
+
 /* Free one previously-allocated page. Silently ignores out-of-range or
  * already-free addresses (logs a warning in the latter case). */
 void pmm_free_page(uint64_t phys);

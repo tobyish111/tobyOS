@@ -49,4 +49,14 @@ uint64_t heap_virt_base(void);
 uint64_t heap_virt_brk(void);    /* next free byte after the last arena */
 uint64_t heap_virt_end(void);    /* one-past-the-end of the heap window */
 
+/* Count of 4 KiB-equivalent pages currently backed by 2 MiB huge leaves
+ * (i.e. large arenas that took the huge-page growth path). */
+size_t heap_huge_pages(void);
+
+/* 2 MiB large-page self-test: direct PMM+VMM huge map/translate/unmap,
+ * plus a large kmalloc that exercises the heap's huge-page growth path.
+ * Returns 0 on all-pass. Emits [HUGEPT] markers. Called from kernel.c
+ * under -DHUGEPAGE_SELFTEST. */
+int hugepage_self_test(void);
+
 #endif /* TOBYOS_HEAP_H */

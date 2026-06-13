@@ -68,6 +68,10 @@ bool vmm_protect(uint64_t virt, size_t bytes, uint32_t flags);
  * the CPU would compute on a load). */
 uint64_t vmm_translate(uint64_t virt);
 
+/* Size of the leaf that maps `virt`: 0 (unmapped), 4096 (4 KiB leaf), or
+ * 0x200000 (a 2 MiB huge leaf). Used to confirm huge-page backing. */
+size_t vmm_leaf_size(uint64_t virt);
+
 /* Walk the kernel PML4 for `virt` and print every level: indices, raw
  * entry, present/writable/huge bits, and the resolved physical address.
  * Cheap diagnostic for the `page` shell command. */
