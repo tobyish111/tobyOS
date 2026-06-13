@@ -31,6 +31,7 @@
 #include <tobyos/spinlock.h>
 #include <tobyos/perf.h>
 #include <tobyos/cpu.h>
+#include <tobyos/uaccess.h>
 
 /* ---- Thread creation ------------------------------------------------ */
 
@@ -398,13 +399,23 @@ long futex(uint32_t *uaddr, int op, uint32_t val) {
 
     uint64_t addr = (uint64_t)(uintptr_t)uaddr;
     uint64_t cr3  = caller->cr3;
+    if (!user_range_ok(addr, sizeof(uint32_t))) return -14; /* EFAULT */
+
+    /* Pre-touch the futex word OUTSIDE the spinlock so any CoW/demand #PF
+     * resolves with IRQs on; the locked re-read below then can't fault
+     * (per-copy uaccess: each read opens its own stac window). */
+    uint32_t cur_val;
+    if (copy_from_user(&cur_val, uaddr, sizeof(cur_val)) != 0) return -14;
 
     if (op == FUTEX_WAIT) {
         /* Atomically: if *uaddr == val, block. Otherwise return -EAGAIN. */
         uint64_t flags = spin_lock_irqsave(&g_futex_lock);
 
-        /* Read the user value -- we're in the caller's address space */
-        uint32_t cur_val = *uaddr;
+        /* Re-read the user value under the lock -- we're in the caller's
+         * address space and the page is present (pre-touched above). */
+        unsigned long uw = uaccess_begin();
+        cur_val = *(volatile uint32_t *)uaddr;
+        uaccess_end(uw);
         if (cur_val != val) {
             spin_unlock_irqrestore(&g_futex_lock, flags);
             return -11; /* -EAGAIN */

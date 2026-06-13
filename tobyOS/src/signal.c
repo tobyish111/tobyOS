@@ -12,6 +12,7 @@
 #include <tobyos/proc.h>
 #include <tobyos/sched.h>
 #include <tobyos/printk.h>
+#include <tobyos/uaccess.h>
 
 static int g_foreground_pid = 0;
 
@@ -210,12 +211,14 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
         return false;
     }
 
-    /* Carve the frame out of the user stack, below the SysV red zone. */
+    /* Carve the frame out of the user stack, below the SysV red zone.
+     * Build it in a kernel local and copy out (per-copy uaccess). */
     uint64_t sp = regs->user_rsp;
     sp -= 128;                                /* skip the 128-byte red zone */
     sp -= sizeof(struct sig_context);
     sp &= ~(uint64_t)0xF;                     /* 16-align the context base  */
-    struct sig_context *ctx = (struct sig_context *)sp;
+    struct sig_context kctx;
+    struct sig_context *ctx = &kctx;
 
     /* SA_RESTART: if this handler interrupted a blocking syscall (it bailed
      * with EINTR) and the action asks for restart, resume at the `syscall`
@@ -241,11 +244,24 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     ctx->saved_mask = p->sigstate.mask;
     ctx->magic     = SIG_FRAME_MAGIC;
 
+    /* Write the context onto the user stack through the accessor (this is
+     * a kernel-mode write to user memory; a CoW/demand fault inside the
+     * window resolves through the page-fault path). */
+    if (copy_to_user((void *)sp, &kctx, sizeof(kctx)) != 0) {
+        kprintf("[signal] pid=%d sig %d: cannot write signal frame\n",
+                p->pid, sig);
+        return false;
+    }
+
     /* Push the handler's return address (the restorer trampoline) one slot
      * below the context. Handler entry RSP must be %16==8 per SysV; since
      * the context base is 16-aligned, frame = ctx-8 satisfies that. */
     uint64_t frame = (uint64_t)sp - 8;
-    *(uint64_t *)frame = p->sigstate.restorer;
+    if (put_user_u64((void *)frame, p->sigstate.restorer) != 0) {
+        kprintf("[signal] pid=%d sig %d: cannot write restorer slot\n",
+                p->pid, sig);
+        return false;
+    }
 
     /* Block the signal (and sa_mask) for the duration of the handler unless
      * SA_NODEFER. SIGKILL/SIGSTOP can never be blocked. */
@@ -357,17 +373,20 @@ int sys_sigaction(int sig, const void *uact, void *uoldact) {
     struct sigaction *cur = &p->sigstate.actions[sig];
 
     if (uoldact) {
-        struct abi_sigaction *old = (struct abi_sigaction *)uoldact;
-        old->sa_handler = (uint64_t)(uintptr_t)cur->sa_handler;
-        old->sa_mask    = (uint64_t)cur->sa_mask;
-        old->sa_flags   = (uint32_t)cur->sa_flags;
-        old->_pad       = 0;
+        struct abi_sigaction old = {
+            .sa_handler = (uint64_t)(uintptr_t)cur->sa_handler,
+            .sa_mask    = (uint64_t)cur->sa_mask,
+            .sa_flags   = (uint32_t)cur->sa_flags,
+            ._pad       = 0,
+        };
+        if (copy_to_user(uoldact, &old, sizeof(old)) != 0) return -14;
     }
     if (uact) {
-        const struct abi_sigaction *a = (const struct abi_sigaction *)uact;
-        cur->sa_handler = (void (*)(int))(uintptr_t)a->sa_handler;
-        cur->sa_mask    = (sigset_t)a->sa_mask;
-        cur->sa_flags   = (int)a->sa_flags;
+        struct abi_sigaction a;
+        if (copy_from_user(&a, uact, sizeof(a)) != 0) return -14;
+        cur->sa_handler = (void (*)(int))(uintptr_t)a.sa_handler;
+        cur->sa_mask    = (sigset_t)a.sa_mask;
+        cur->sa_flags   = (int)a.sa_flags;
     }
     return 0;
 }
@@ -378,10 +397,12 @@ int sys_sigprocmask(int how, const void *uset, void *uoldset) {
 
     /* User sigset_t is 64-bit; read/write the full 8 bytes even though only
      * the low SIG_MAX bits are meaningful here. */
-    if (uoldset) *(uint64_t *)uoldset = (uint64_t)p->sigstate.mask;
+    if (uoldset && put_user_u64(uoldset, (uint64_t)p->sigstate.mask) != 0)
+        return -14; /* EFAULT */
 
     if (uset) {
-        uint64_t s = *(const uint64_t *)uset;
+        uint64_t s;
+        if (get_user_u64(&s, uset) != 0) return -14;
         s &= ~(uint64_t)(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
 
         switch (how) {
@@ -414,7 +435,17 @@ long sys_sigreturn(void) {
     struct syscall_regs *regs = current_syscall_regs();
     if (!p || !regs) return -1;
 
-    struct sig_context *ctx = (struct sig_context *)regs->user_rsp;
+    /* Copy the saved context off the user stack through the accessor
+     * (per-copy uaccess) before trusting any field. */
+    struct sig_context kctx;
+    if (copy_from_user(&kctx, (const void *)regs->user_rsp,
+                       sizeof(kctx)) != 0) {
+        kprintf("[signal] pid=%d sigreturn: unreadable frame -- killing\n",
+                p->pid);
+        if (g_foreground_pid == p->pid) g_foreground_pid = 0;
+        proc_exit(128 + SIGSEGV);
+    }
+    struct sig_context *ctx = &kctx;
     if (ctx->magic != SIG_FRAME_MAGIC) {
         kprintf("[signal] pid=%d sigreturn: bad frame magic 0x%llx -- "
                 "killing\n", p->pid, (unsigned long long)ctx->magic);

@@ -25,6 +25,7 @@
 #include <tobyos/signal.h>
 #include <tobyos/abi/abi.h>
 #include <tobyos/page_fault.h>
+#include <tobyos/uaccess.h>
 #include <tobyos/mmap.h>
 
 extern struct proc g_proc[];
@@ -316,35 +317,27 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     struct proc *p = current_proc();
     if (!p || p->pid == 0) return -ABI_EINVAL;
 
-    /* Validate the path pointer. */
-    if (!path || (uintptr_t)path >= 0x0000800000000000ULL)
-        return -ABI_EFAULT;
-
-    /* Copy path into kernel buffer. */
+    /* Copy path into a kernel buffer (per-copy uaccess). */
     char kpath[ABI_PATH_MAX];
-    size_t plen = 0;
-    for (; plen < ABI_PATH_MAX - 1; plen++) {
-        char c = path[plen];
-        kpath[plen] = c;
-        if (c == '\0') break;
-    }
-    kpath[plen] = '\0';
+    long plen = strncpy_from_user(kpath, path, sizeof(kpath));
+    if (plen < 0) return -ABI_EFAULT;
     if (plen == 0) return -ABI_EINVAL;
 
-    /* Copy argv into kernel buffers. */
+    /* Copy argv into kernel buffers. Each user pointer-array slot and
+     * each string is read through an accessor; a bad slot just ends the
+     * vector (matching the old tolerant behaviour). */
     int kargc = 0;
     char *kargv_buf[ABI_ARGV_MAX];
     static char kargv_pool[ABI_ARGV_MAX][ABI_ARG_MAX];
 
-    if (argv && (uintptr_t)argv < 0x0000800000000000ULL) {
+    if (argv) {
         for (int i = 0; i < ABI_ARGV_MAX; i++) {
-            char *arg = argv[i];
-            if (!arg) break;
-            if ((uintptr_t)arg >= 0x0000800000000000ULL) break;
-            size_t l = 0;
-            for (; l < ABI_ARG_MAX - 1 && arg[l]; l++)
-                kargv_pool[kargc][l] = arg[l];
-            kargv_pool[kargc][l] = '\0';
+            uint64_t slot = 0;
+            if (get_user_u64(&slot, argv + i) != 0) break;
+            if (!slot) break;
+            if (strncpy_from_user(kargv_pool[kargc],
+                                  (const void *)(uintptr_t)slot,
+                                  ABI_ARG_MAX) < 0) break;
             kargv_buf[kargc] = kargv_pool[kargc];
             kargc++;
         }
@@ -355,15 +348,14 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     char *kenvp_buf[ABI_ENVP_MAX];
     static char kenvp_pool[ABI_ENVP_MAX][ABI_ARG_MAX];
 
-    if (envp && (uintptr_t)envp < 0x0000800000000000ULL) {
+    if (envp) {
         for (int i = 0; i < ABI_ENVP_MAX; i++) {
-            char *env = envp[i];
-            if (!env) break;
-            if ((uintptr_t)env >= 0x0000800000000000ULL) break;
-            size_t l = 0;
-            for (; l < ABI_ARG_MAX - 1 && env[l]; l++)
-                kenvp_pool[kenvc][l] = env[l];
-            kenvp_pool[kenvc][l] = '\0';
+            uint64_t slot = 0;
+            if (get_user_u64(&slot, envp + i) != 0) break;
+            if (!slot) break;
+            if (strncpy_from_user(kenvp_pool[kenvc],
+                                  (const void *)(uintptr_t)slot,
+                                  ABI_ARG_MAX) < 0) break;
             kenvp_buf[kenvc] = kenvp_pool[kenvc];
             kenvc++;
         }

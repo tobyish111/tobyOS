@@ -8,6 +8,7 @@
 #include <tobyos/module.h>
 #include <tobyos/elf.h>
 #include <tobyos/vfs.h>
+#include <tobyos/uaccess.h>
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
@@ -541,27 +542,15 @@ long sys_module(uint64_t op, uint64_t arg1, uint64_t arg2) {
     (void)arg2;
     switch (op) {
     case 0: {
-        const char *upath = (const char *)(uintptr_t)arg1;
-        if (!upath) return -1;
         char kpath[VFS_PATH_MAX];
-        size_t i;
-        for (i = 0; i < VFS_PATH_MAX - 1; i++) {
-            kpath[i] = upath[i];
-            if (kpath[i] == '\0') break;
-        }
-        kpath[VFS_PATH_MAX - 1] = '\0';
+        if (strncpy_from_user(kpath, (const char *)(uintptr_t)arg1,
+                              sizeof(kpath)) < 0) return -1;
         return module_load(kpath);
     }
     case 1: {
-        const char *uname = (const char *)(uintptr_t)arg1;
-        if (!uname) return -1;
         char kname[MODULE_NAME_MAX];
-        size_t i;
-        for (i = 0; i < MODULE_NAME_MAX - 1; i++) {
-            kname[i] = uname[i];
-            if (kname[i] == '\0') break;
-        }
-        kname[MODULE_NAME_MAX - 1] = '\0';
+        if (strncpy_from_user(kname, (const char *)(uintptr_t)arg1,
+                              sizeof(kname)) < 0) return -1;
         return module_unload(kname);
     }
     case 2:

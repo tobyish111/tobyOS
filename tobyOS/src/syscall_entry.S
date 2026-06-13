@@ -158,24 +158,15 @@ syscall_entry:
 
     cld                     /* SysV: DF must be clear at function entry */
 
-    /* SMAP: open a uaccess window for the whole syscall body so handlers can
-     * dereference user pointers directly. Gated on g_smap_on because stac
-     * #UDs on CPUs without SMAP (and is unnecessary there). The window
-     * survives blocking context switches inside the body -- proc_switch.S
-     * preserves RFLAGS.AC via pushfq/popfq. */
-    cmp byte ptr [rip + g_smap_on], 0
-    je 1f
-    stac
-1:
+    /* SMAP: NO whole-body uaccess window any more. Every kernel access to
+     * user memory inside the syscall body goes through the per-copy
+     * accessors in <tobyos/uaccess.h> (copy_from_user / copy_to_user /
+     * strncpy_from_user), each of which opens a stac window around just
+     * the copy. A stray user-pointer dereference anywhere else in the
+     * kernel now faults under SMAP instead of silently succeeding. */
     call syscall_dispatch
     /* rax now holds the return value -- SysV puts it there, and SYSRETQ
      * leaves it untouched, so the user sees it in rax. */
-
-    /* Close the uaccess window before returning to ring 3. */
-    cmp byte ptr [rip + g_smap_on], 0
-    je 2f
-    clac
-2:
 
     /* Unwind in reverse push order. Also the entry point for a fork child's
      * first return to user mode: fork copies the parent's whole register

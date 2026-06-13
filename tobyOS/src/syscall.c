@@ -41,6 +41,7 @@
 #include <tobyos/session.h>
 #include <tobyos/users.h>
 #include <tobyos/cap.h>
+#include <tobyos/uaccess.h>
 #include <tobyos/perf.h>
 #include <tobyos/elf.h>
 #include <tobyos/vmm.h>
@@ -146,6 +147,34 @@ static bool user_buf_ok(uint64_t addr, size_t len) {
     return true;
 }
 
+/* ---- per-copy uaccess helpers (the SMAP window is per-copy now) --------
+ *
+ * The syscall body no longer runs under a blanket stac window, so every
+ * access to user memory below goes through <tobyos/uaccess.h> accessors.
+ * Two local conveniences:
+ *
+ * user_str_in(): copy a NUL-terminated user string into a kernel buffer.
+ * Rejects NULL, bad ranges, and strings that don't fit (no silent path
+ * truncation -- same contract as the old validate-only user_str_ok).
+ *
+ * bounce_in(): kmalloc a kernel copy of a user buffer (caller kfrees).
+ * sys_read/sys_write-class syscalls bounce through kernel buffers so the
+ * whole VFS/pipe/console/socket stack below never sees a user pointer. */
+static bool user_str_in(char *ks, size_t cap, const char *us) {
+    if (!us) return false;
+    long n = strncpy_from_user(ks, us, cap);
+    if (n < 0) return false;
+    if ((size_t)n >= cap - 1) return false;   /* didn't fit (or exact-fit) */
+    return true;
+}
+
+static void *bounce_in(const void *ubuf, size_t len) {
+    void *k = kmalloc(len ? len : 1);
+    if (!k) return 0;
+    if (copy_from_user(k, ubuf, len) != 0) { kfree(k); return 0; }
+    return k;
+}
+
 static struct file *fd_lookup(int fd) {
     if (fd < 0 || fd >= PROC_NFDS) return 0;
     return current_proc()->fds[fd];
@@ -166,34 +195,31 @@ static int fd_alloc_into(struct proc *p, struct file *f) {
 static long sys_write(int fd, const void *buf, size_t len) {
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
-    if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) {
-        kprintf("[sys_write] reject: buf=%p len=%lu not in user half\n",
-                buf, (unsigned long)len);
-        return -1;
-    }
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
-    return file_write(f, buf, len);
+    void *k = bounce_in(buf, len);
+    if (!k) return -ABI_EFAULT;
+    long rv = file_write(f, k, len);
+    kfree(k);
+    return rv;
 }
 
 static long sys_read(int fd, void *buf, size_t len) {
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
-    if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) {
-        kprintf("[sys_read] reject: buf=%p len=%lu not in user half\n",
-                buf, (unsigned long)len);
-        return -1;
-    }
+    if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
-    return file_read(f, buf, len);
+    void *k = kmalloc(len);
+    if (!k) return -ABI_ENOMEM;
+    long rv = file_read(f, k, len);
+    if (rv > 0 && copy_to_user(buf, k, (size_t)rv) != 0) rv = -ABI_EFAULT;
+    kfree(k);
+    return rv;
 }
 
 /* SYS_PIPE: returns two fds. user_fds_out points at int[2] in userspace. */
 static long sys_pipe(int *user_fds_out) {
-    if (!user_buf_ok((uint64_t)(uintptr_t)user_fds_out, sizeof(int) * 2)) {
-        return -1;
-    }
     struct file *r = 0, *w = 0;
     if (pipe_create(&r, &w) != 0) return -1;
 
@@ -203,8 +229,12 @@ static long sys_pipe(int *user_fds_out) {
     int fd_w = fd_alloc_into(p, w);
     if (fd_w < 0) { p->fds[fd_r] = 0; file_close(r); file_close(w); return -1; }
 
-    user_fds_out[0] = fd_r;
-    user_fds_out[1] = fd_w;
+    int fds[2] = { fd_r, fd_w };
+    if (copy_to_user(user_fds_out, fds, sizeof(fds)) != 0) {
+        p->fds[fd_r] = 0; p->fds[fd_w] = 0;
+        file_close(r); file_close(w);
+        return -ABI_EFAULT;
+    }
     return 0;
 }
 
@@ -262,41 +292,31 @@ static long sys_sendto(int fd, const void *buf, size_t len,
                        uint32_t dst_ip_be, uint16_t dst_port_be) {
     if (!cap_check(current_proc(), CAP_NET, "sys_sendto")) return -1;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
-    if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -1;
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_SOCKET || !f->sock) return -1;
-    return sock_sendto(f->sock, buf, len, dst_ip_be, dst_port_be);
-}
-
-/* Validate a NUL-terminated user string lives entirely in the user
- * half. Cap is per-call so a malicious user can't make us scan
- * forever. Returns the (capped) string length on success, -1 on bad. */
-static long user_str_ok(const char *s, size_t cap) {
-    uint64_t addr = (uint64_t)(uintptr_t)s;
-    if (addr == 0 || addr >= USER_HALF_MAX) return -1;
-    for (size_t i = 0; i < cap; i++) {
-        if (addr + i >= USER_HALF_MAX) return -1;
-        if (s[i] == '\0') return (long)i;
-    }
-    /* Not NUL-terminated within cap -- treat as bad input. */
-    return -1;
+    void *k = bounce_in(buf, len);
+    if (!k) return -ABI_EFAULT;
+    long rv = sock_sendto(f->sock, k, len, dst_ip_be, dst_port_be);
+    kfree(k);
+    return rv;
 }
 
 static long sys_recvfrom(int fd, void *buf, size_t len,
                          struct sockaddr_in_be *src_out) {
     if (!cap_check(current_proc(), CAP_NET, "sys_recvfrom")) return -1;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
-    if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -1;
-    if (src_out && !user_buf_ok((uint64_t)(uintptr_t)src_out,
-                                sizeof(*src_out))) return -1;
+    if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_SOCKET || !f->sock) return -1;
+    void *k = kmalloc(len ? len : 1);
+    if (!k) return -ABI_ENOMEM;
     uint32_t src_ip = 0; uint16_t src_port = 0;
-    long rv = sock_recvfrom(f->sock, buf, len, &src_ip, &src_port);
+    long rv = sock_recvfrom(f->sock, k, len, &src_ip, &src_port);
+    if (rv > 0 && copy_to_user(buf, k, (size_t)rv) != 0) rv = -ABI_EFAULT;
+    kfree(k);
     if (rv >= 0 && src_out) {
-        src_out->ip   = src_ip;
-        src_out->port = src_port;
-        src_out->_pad = 0;
+        struct sockaddr_in_be sa = { .ip = src_ip, .port = src_port, ._pad = 0 };
+        if (copy_to_user(src_out, &sa, sizeof(sa)) != 0) return -ABI_EFAULT;
     }
     return rv;
 }
@@ -308,10 +328,7 @@ static long sys_gui_create(uint32_t w, uint32_t h, const char *title) {
     char tbuf[32];
     tbuf[0] = '\0';
     if (title) {
-        long n = user_str_ok(title, sizeof(tbuf));
-        if (n < 0) return -1;
-        memcpy(tbuf, title, (size_t)n);
-        tbuf[n] = '\0';
+        if (strncpy_from_user(tbuf, title, sizeof(tbuf)) < 0) return -1;
     }
     if (w == 0 || h == 0 || w > 4096 || h > 4096) return -1;
 
@@ -370,7 +387,8 @@ static long sys_gui_text_scaled(int fd, uint32_t xy, const char *s,
                                 uint32_t fg, uint32_t bg_scale_smooth) {
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
-    long n = user_str_ok(s, 256);
+    char buf[256];
+    long n = strncpy_from_user(buf, s, sizeof(buf));
     if (n < 0) return -1;
     int x = (int)(int16_t)(xy & 0xFFFFu);
     int y = (int)(int16_t)((xy >> 16) & 0xFFFFu);
@@ -386,9 +404,6 @@ static long sys_gui_text_scaled(int fd, uint32_t xy, const char *s,
      * 0x00FFFFFE in `bg` (a colour that nobody draws) -- the kernel
      * promotes that to the canonical sentinel. */
     if (bg == 0x00FFFFFEu) bg = GFX_TRANSPARENT;
-    char buf[256];
-    memcpy(buf, s, (size_t)n);
-    buf[n] = '\0';
     if (gui_trace_level() >= GUI_TRACE_VERBOSE) {
         gui_trace_logf("syscall: gui_text_scaled fd=%d xy=(%d,%d) "
                        "len=%ld scale=%d smooth=%d",
@@ -401,15 +416,13 @@ static long sys_gui_text(int fd, uint32_t xy, const char *s,
                          uint32_t fg, uint32_t bg) {
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
-    long n = user_str_ok(s, 256);
-    if (n < 0) return -1;
-    int x = (int)(int16_t)(xy & 0xFFFFu);
-    int y = (int)(int16_t)((xy >> 16) & 0xFFFFu);
     /* Copy into a small kernel buffer so the user can't change the
      * string out from under us mid-draw. */
     char buf[256];
-    memcpy(buf, s, (size_t)n);
-    buf[n] = '\0';
+    long n = strncpy_from_user(buf, s, sizeof(buf));
+    if (n < 0) return -1;
+    int x = (int)(int16_t)(xy & 0xFFFFu);
+    int y = (int)(int16_t)((xy >> 16) & 0xFFFFu);
     if (gui_trace_level() >= GUI_TRACE_VERBOSE) {
         gui_trace_logf("syscall: gui_text fd=%d xy=(%d,%d) len=%ld",
                        fd, x, y, n);
@@ -427,7 +440,6 @@ static long sys_gui_flip(int fd) {
 }
 
 static long sys_gui_poll_event(int fd, struct gui_event *out) {
-    if (!user_buf_ok((uint64_t)(uintptr_t)out, sizeof(*out))) return -1;
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
     /* Drain local input before deciding the GUI event queue is empty.
@@ -438,7 +450,8 @@ static long sys_gui_poll_event(int fd, struct gui_event *out) {
      * memory can't leave the queue in a half-consumed state. */
     struct gui_event ev;
     int got = gui_window_poll_event(f->win, &ev);
-    if (got > 0) memcpy(out, &ev, sizeof(*out));
+    if (got > 0 && copy_to_user(out, &ev, sizeof(*out)) != 0)
+        return -ABI_EFAULT;
     if (got > 0 && gui_trace_level() >= GUI_TRACE_VERBOSE) {
         gui_trace_logf("syscall: gui_poll_event fd=%d -> type=%d "
                        "xy=(%d,%d) btn=0x%02x key=0x%02x",
@@ -461,26 +474,31 @@ static long sys_gui_set_title(int fd, const char *title) {
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -ABI_EBADF;
     char tbuf[GUI_TITLE_MAX];
-    long n = user_str_ok(title, sizeof(tbuf));
-    if (n < 0) return -ABI_EFAULT;
-    memcpy(tbuf, title, (size_t)n);
-    tbuf[n] = '\0';
+    if (strncpy_from_user(tbuf, title, sizeof(tbuf)) < 0) return -ABI_EFAULT;
     return gui_window_set_title(f->win, tbuf) == 0 ? 0 : -ABI_EINVAL;
 }
 
 static long sys_clip_copy(const char *data, uint32_t len) {
     if (!data) return -ABI_EFAULT;
-    uint64_t addr = (uint64_t)(uintptr_t)data;
-    if (addr == 0 || addr >= 0x0000800000000000ULL) return -ABI_EFAULT;
     if (len > 4095) len = 4095;
-    return gui_clip_copy(data, len);
+    void *k = bounce_in(data, len);
+    if (!k) return -ABI_EFAULT;
+    long rv = gui_clip_copy(k, len);
+    kfree(k);
+    return rv;
 }
 
 static long sys_clip_paste(char *buf, uint32_t max) {
     if (!buf || max == 0) return -ABI_EINVAL;
-    uint64_t addr = (uint64_t)(uintptr_t)buf;
-    if (addr == 0 || addr >= 0x0000800000000000ULL) return -ABI_EFAULT;
-    return gui_clip_paste(buf, max);
+    if (max > 4096) max = 4096;
+    char *k = (char *)kmalloc(max);
+    if (!k) return -ABI_ENOMEM;
+    long rv = gui_clip_paste(k, max);
+    /* gui_clip_paste NUL-terminates: rv excludes the NUL, so rv+1 bytes
+     * were written (rv+1 <= max by its own clamping). */
+    if (rv >= 0 && copy_to_user(buf, k, (size_t)rv + 1) != 0) rv = -ABI_EFAULT;
+    kfree(k);
+    return rv;
 }
 
 /* ---- HTTP GET syscall ------------------------------------------ */
@@ -490,19 +508,14 @@ static long sys_clip_paste(char *buf, uint32_t max) {
 static long sys_http_get(const char *url, void *buf, uint32_t buf_sz) {
     if (!cap_check(current_proc(), CAP_NET, "sys_http_get")) return -ABI_EPERM;
     if (!url || !buf || buf_sz == 0) return -ABI_EINVAL;
-
-    uint64_t url_addr = (uint64_t)(uintptr_t)url;
-    uint64_t buf_addr = (uint64_t)(uintptr_t)buf;
-    if (url_addr >= 0x0000800000000000ULL) return -ABI_EFAULT;
-    if (buf_addr >= 0x0000800000000000ULL) return -ABI_EFAULT;
+    if (!user_buf_ok((uint64_t)(uintptr_t)buf, buf_sz)) return -ABI_EFAULT;
 
     uint32_t cap = buf_sz < HTTP_SYSCALL_MAX_BODY ? buf_sz : HTTP_SYSCALL_MAX_BODY;
 
     /* Copy URL to kernel buffer so we can follow redirects */
     char cur_url[512];
-    size_t ulen = 0;
-    while (url[ulen] && ulen < sizeof(cur_url) - 1) { cur_url[ulen] = url[ulen]; ulen++; }
-    cur_url[ulen] = '\0';
+    if (strncpy_from_user(cur_url, url, sizeof(cur_url)) < 0)
+        return -ABI_EFAULT;
 
     for (int redir = 0; redir <= HTTP_MAX_REDIRECTS; redir++) {
         struct http_response resp;
@@ -522,7 +535,10 @@ static long sys_http_get(const char *url, void *buf, uint32_t buf_sz) {
         }
 
         size_t copy = resp.body_len < (size_t)cap ? resp.body_len : (size_t)cap;
-        memcpy(buf, resp.body, copy);
+        if (copy_to_user(buf, resp.body, copy) != 0) {
+            http_free(&resp);
+            return -ABI_EFAULT;
+        }
         http_free(&resp);
         return (long)copy;
     }
@@ -551,7 +567,7 @@ static long sys_term_open(void) {
 static long sys_term_write(int fd, const void *buf, size_t len) {
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
-    if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -1;
+    if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_TERM || !f->term) return -1;
     /* Bounce the input through a small kernel buffer so the user can't
@@ -561,7 +577,8 @@ static long sys_term_write(int fd, const void *buf, size_t len) {
     while (written < len) {
         size_t chunk = len - written;
         if (chunk > sizeof(tmp)) chunk = sizeof(tmp);
-        memcpy(tmp, (const char *)buf + written, chunk);
+        if (copy_from_user(tmp, (const char *)buf + written, chunk) != 0)
+            return -ABI_EFAULT;
         long rv = term_session_write_input(f->term, tmp, chunk);
         if (rv < 0) return rv;
         written += (size_t)rv;
@@ -573,7 +590,7 @@ static long sys_term_write(int fd, const void *buf, size_t len) {
 static long sys_term_read(int fd, void *buf, size_t cap) {
     if (cap == 0) return 0;
     if (cap > SYS_MAX_RW) cap = SYS_MAX_RW;
-    if (!user_buf_ok((uint64_t)(uintptr_t)buf, cap)) return -1;
+    if (!user_buf_ok((uint64_t)(uintptr_t)buf, cap)) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_TERM || !f->term) return -1;
     /* Drain to a kernel buffer first, then copy out -- keeps the ring
@@ -586,7 +603,8 @@ static long sys_term_read(int fd, void *buf, size_t cap) {
         if (chunk > sizeof(tmp)) chunk = sizeof(tmp);
         long n = term_session_read_output(f->term, tmp, chunk);
         if (n <= 0) break;
-        memcpy((char *)buf + total, tmp, (size_t)n);
+        if (copy_to_user((char *)buf + total, tmp, (size_t)n) != 0)
+            return -ABI_EFAULT;
         total += (size_t)n;
         if ((size_t)n < chunk) break;
     }
@@ -599,13 +617,10 @@ static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
                            int cap, int offset) {
     if (cap <= 0) return 0;
     if (offset < 0) offset = 0;
-    long plen = user_str_ok(path, VFS_PATH_MAX);
-    if (plen < 0) return -1;
     if (!user_buf_ok((uint64_t)(uintptr_t)out,
-                     (size_t)cap * sizeof(*out))) return -1;
+                     (size_t)cap * sizeof(*out))) return -ABI_EFAULT;
     char kpath[VFS_PATH_MAX];
-    memcpy(kpath, path, (size_t)plen);
-    kpath[plen] = '\0';
+    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
 
     struct vfs_dir d;
     int rc = vfs_opendir(kpath, &d);
@@ -631,7 +646,10 @@ static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
         u.uid  = ent.uid;
         u.gid  = ent.gid;
         u.mode = ent.mode;
-        memcpy(&out[written], &u, sizeof(u));
+        if (copy_to_user(&out[written], &u, sizeof(u)) != 0) {
+            vfs_closedir(&d);
+            return -ABI_EFAULT;
+        }
         written++;
     }
     vfs_closedir(&d);
@@ -641,12 +659,9 @@ static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
 static long sys_fs_readfile(const char *path, void *out, size_t cap) {
     if (cap == 0) return 0;
     if (cap > SYS_MAX_RW) cap = SYS_MAX_RW;
-    long plen = user_str_ok(path, VFS_PATH_MAX);
-    if (plen < 0) return -1;
-    if (!user_buf_ok((uint64_t)(uintptr_t)out, cap)) return -1;
+    if (!user_buf_ok((uint64_t)(uintptr_t)out, cap)) return -ABI_EFAULT;
     char kpath[VFS_PATH_MAX];
-    memcpy(kpath, path, (size_t)plen);
-    kpath[plen] = '\0';
+    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
 
     struct vfs_file f;
     int rc = vfs_open(kpath, &f);
@@ -662,7 +677,10 @@ static long sys_fs_readfile(const char *path, void *out, size_t cap) {
         if (want > sizeof(tmp)) want = sizeof(tmp);
         long n = vfs_read(&f, tmp, want);
         if (n <= 0) break;
-        memcpy((char *)out + total, tmp, (size_t)n);
+        if (copy_to_user((char *)out + total, tmp, (size_t)n) != 0) {
+            vfs_close(&f);
+            return -ABI_EFAULT;
+        }
         total += (size_t)n;
     }
     vfs_close(&f);
@@ -676,19 +694,13 @@ static long sys_fs_readfile(const char *path, void *out, size_t cap) {
  * the kernel's proc table from an arbitrary syscall context. */
 static long sys_exec(const char *path, const char *arg) {
     if (!cap_check(current_proc(), CAP_EXEC, "sys_exec")) return -1;
-    long plen = user_str_ok(path, VFS_PATH_MAX);
-    if (plen < 0) return -1;
     char kpath[VFS_PATH_MAX];
-    memcpy(kpath, path, (size_t)plen);
-    kpath[plen] = '\0';
+    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
 
     char karg[128];
     const char *karg_ptr = 0;
     if (arg) {
-        long alen = user_str_ok(arg, sizeof(karg));
-        if (alen < 0) return -1;
-        memcpy(karg, arg, (size_t)alen);
-        karg[alen] = '\0';
+        if (!user_str_in(karg, sizeof(karg), arg)) return -ABI_EFAULT;
         karg_ptr = karg;
     }
     return gui_launch_enqueue_arg(kpath, karg_ptr);
@@ -699,34 +711,26 @@ static long sys_exec(const char *path, const char *arg) {
 static long sys_setting_get(const char *key, char *out, size_t cap) {
     if (cap == 0) return 0;
     if (cap > 1024) cap = 1024;
-    long klen = user_str_ok(key, SETTING_KEY_MAX);
-    if (klen < 0) return -1;
-    if (!user_buf_ok((uint64_t)(uintptr_t)out, cap)) return -1;
     char kkey[SETTING_KEY_MAX];
-    memcpy(kkey, key, (size_t)klen);
-    kkey[klen] = '\0';
+    if (!user_str_in(kkey, sizeof(kkey), key)) return -ABI_EFAULT;
 
     /* Stage in a kernel buffer so the user can't observe a half-
      * written value. Then copy out atomically. */
     char tmp[SETTING_VAL_MAX];
     size_t n = settings_get_str(kkey, tmp, sizeof(tmp), "");
     if (n + 1 > cap) n = (cap > 0) ? (cap - 1) : 0;
-    memcpy(out, tmp, n);
-    out[n] = '\0';
+    tmp[n] = '\0';
+    if (copy_to_user(out, tmp, n + 1) != 0) return -ABI_EFAULT;
     return (long)n;
 }
 
 static long sys_setting_set(const char *key, const char *val) {
     if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_setting_set"))
         return -1;
-    long klen = user_str_ok(key, SETTING_KEY_MAX);
-    if (klen < 0) return -1;
-    long vlen = user_str_ok(val, SETTING_VAL_MAX);
-    if (vlen < 0) return -1;
     char kkey[SETTING_KEY_MAX];
     char kval[SETTING_VAL_MAX];
-    memcpy(kkey, key, (size_t)klen); kkey[klen] = '\0';
-    memcpy(kval, val, (size_t)vlen); kval[vlen] = '\0';
+    if (!user_str_in(kkey, sizeof(kkey), key)) return -ABI_EFAULT;
+    if (!user_str_in(kval, sizeof(kval), val)) return -ABI_EFAULT;
     if (settings_set_str(kkey, kval) != 0) return -1;
     if (strcmp(kkey, "ui.theme") == 0) {
         theme_set(strcmp(kval, "basic") == 0 ? THEME_BASIC : THEME_CYBER);
@@ -740,19 +744,13 @@ static long sys_setting_set(const char *key, const char *val) {
 
 static long sys_login(const char *username, const char *password) {
     if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_login")) return -1;
-    long n = user_str_ok(username, SESSION_USER_MAX);
-    if (n < 0) return -1;
     char kname[SESSION_USER_MAX];
-    memcpy(kname, username, (size_t)n);
-    kname[n] = '\0';
+    if (!user_str_in(kname, sizeof(kname), username)) return -ABI_EFAULT;
     char kpass[65];
     kpass[0] = '\0';
     if (password) {
-        long pn = user_str_ok(password, 64);
-        if (pn > 0) {
-            memcpy(kpass, password, (size_t)pn);
-            kpass[pn] = '\0';
-        }
+        if (strncpy_from_user(kpass, password, sizeof(kpass)) < 0)
+            kpass[0] = '\0';     /* bad pointer == empty password (old shape) */
     }
     return session_login(kname, kpass) == 0 ? 0 : -1;
 }
@@ -765,7 +763,6 @@ static long sys_logout(void) {
 static long sys_session_info(char *out, size_t cap) {
     if (cap == 0) return 0;
     if (cap > 1024) cap = 1024;
-    if (!user_buf_ok((uint64_t)(uintptr_t)out, cap)) return -1;
 
     struct session_info info;
     session_get_info(&info);
@@ -797,8 +794,8 @@ static long sys_session_info(char *out, size_t cap) {
     buf[i] = '\0';
 
     if (i + 1 > cap) i = (cap > 0) ? (cap - 1) : 0;
-    memcpy(out, buf, i);
-    out[i] = '\0';
+    buf[i] = '\0';
+    if (copy_to_user(out, buf, i + 1) != 0) return -ABI_EFAULT;
     return (long)i;
 }
 
@@ -825,33 +822,30 @@ static long sys_username(int uid, char *out, size_t cap) {
         target = p ? p->uid : 0;
     }
     const struct user *u = users_lookup_by_uid(target);
-    if (!u) {
-        out[0] = '\0';
-        return 0;
-    }
+    char tmp[64];
     size_t n = 0;
-    while (u->name[n] && n + 1 < cap) { out[n] = u->name[n]; n++; }
-    out[n] = '\0';
+    if (u) {
+        while (u->name[n] && n + 1 < cap && n + 1 < sizeof(tmp)) {
+            tmp[n] = u->name[n];
+            n++;
+        }
+    }
+    tmp[n] = '\0';
+    if (copy_to_user(out, tmp, n + 1) != 0) return -ABI_EFAULT;
     return (long)n;
 }
 
 static long sys_chmod(const char *path, uint32_t mode) {
     if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_chmod")) return -1;
-    long plen = user_str_ok(path, VFS_PATH_MAX);
-    if (plen < 0) return -1;
     char kpath[VFS_PATH_MAX];
-    memcpy(kpath, path, (size_t)plen);
-    kpath[plen] = '\0';
+    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
     return vfs_chmod(kpath, mode);
 }
 
 static long sys_chown(const char *path, uint32_t uid, uint32_t gid) {
     if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_chown")) return -1;
-    long plen = user_str_ok(path, VFS_PATH_MAX);
-    if (plen < 0) return -1;
     char kpath[VFS_PATH_MAX];
-    memcpy(kpath, path, (size_t)plen);
-    kpath[plen] = '\0';
+    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
     return vfs_chown(kpath, uid, gid);
 }
 
@@ -916,17 +910,21 @@ static long sys_getpriority(int pid) {
     return sched_get_prio(pid);
 }
 
-/* Resolve a user-provided path against the calling proc's cwd. The
- * result lives in `out` (caller-owned buffer of size `cap`). Returns
- * 0 on success, -ABI_E* on failure. Absolute paths copy verbatim;
- * relative paths get prefixed with cwd + '/'. */
-static int resolve_user_path(const char *user_path, size_t plen,
-                             char *out, size_t cap) {
+/* Copy a user-provided path into the kernel and resolve it against the
+ * calling proc's cwd. The result lives in `out` (caller-owned buffer of
+ * size `cap`). Returns 0 on success, -ABI_E* on failure. Absolute paths
+ * copy verbatim; relative paths get prefixed with cwd + '/'. The user
+ * pointer is consumed HERE (per-copy uaccess) -- callers never touch it. */
+static int resolve_user_path(const char *user_path, char *out, size_t cap) {
+    char up[ABI_PATH_MAX];
+    long plen = strncpy_from_user(up, user_path, sizeof(up));
+    if (plen < 0) return -ABI_EFAULT;
+    if ((size_t)plen >= sizeof(up) - 1) return -ABI_ENAMETOOLONG;
     if (plen == 0 || cap == 0) return -ABI_EINVAL;
     /* Absolute? */
-    if (user_path[0] == '/') {
-        if (plen + 1 > cap) return -ABI_ENAMETOOLONG;
-        memcpy(out, user_path, plen);
+    if (up[0] == '/') {
+        if ((size_t)plen + 1 > cap) return -ABI_ENAMETOOLONG;
+        memcpy(out, up, (size_t)plen);
         out[plen] = '\0';
         return 0;
     }
@@ -936,11 +934,11 @@ static int resolve_user_path(const char *user_path, size_t plen,
     /* Need cwd + '/' + path + NUL, but skip the slash if cwd already
      * ends with one (e.g. cwd == "/"). */
     bool need_slash = (clen == 0 || cwd[clen - 1] != '/');
-    size_t need = clen + (need_slash ? 1 : 0) + plen + 1;
+    size_t need = clen + (need_slash ? 1 : 0) + (size_t)plen + 1;
     if (need > cap) return -ABI_ENAMETOOLONG;
     memcpy(out, cwd, clen);
     if (need_slash) out[clen++] = '/';
-    memcpy(out + clen, user_path, plen);
+    memcpy(out + clen, up, (size_t)plen);
     out[clen + plen] = '\0';
     return 0;
 }
@@ -949,10 +947,8 @@ static int resolve_user_path(const char *user_path, size_t plen,
 
 static long sys_open(const char *path, int flags, int mode) {
     (void)mode;     /* M25A: permissions on creation not honoured yet */
-    long plen = user_str_ok(path, ABI_PATH_MAX);
-    if (plen < 0) return -ABI_EFAULT;
     char kpath[ABI_PATH_MAX];
-    int rr = resolve_user_path(path, (size_t)plen, kpath, sizeof(kpath));
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
 
     int access = flags & ABI_O_ACCMODE;
@@ -1061,11 +1057,8 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
 }
 
 static long sys_stat(const char *path, struct abi_stat *out) {
-    long plen = user_str_ok(path, ABI_PATH_MAX);
-    if (plen < 0) return -ABI_EFAULT;
-    if (!user_buf_ok((uint64_t)(uintptr_t)out, sizeof(*out))) return -ABI_EFAULT;
     char kpath[ABI_PATH_MAX];
-    int rr = resolve_user_path(path, (size_t)plen, kpath, sizeof(kpath));
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
     struct vfs_stat vs;
     int sr = vfs_stat(kpath, &vs);
@@ -1074,12 +1067,11 @@ static long sys_stat(const char *path, struct abi_stat *out) {
 
     struct abi_stat tmp;
     fill_abi_stat(&vs, &tmp);
-    memcpy(out, &tmp, sizeof(tmp));
+    if (copy_to_user(out, &tmp, sizeof(tmp)) != 0) return -ABI_EFAULT;
     return 0;
 }
 
 static long sys_fstat(int fd, struct abi_stat *out) {
-    if (!user_buf_ok((uint64_t)(uintptr_t)out, sizeof(*out))) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
     if (!f) return -ABI_EBADF;
     struct abi_stat tmp;
@@ -1098,7 +1090,7 @@ static long sys_fstat(int fd, struct abi_stat *out) {
          * the size is simply zero. */
         tmp.mode = ABI_S_IFREG | 0666;
     }
-    memcpy(out, &tmp, sizeof(tmp));
+    if (copy_to_user(out, &tmp, sizeof(tmp)) != 0) return -ABI_EFAULT;
     return 0;
 }
 
@@ -1134,10 +1126,8 @@ static long sys_dup2(int oldfd, int newfd) {
 }
 
 static long sys_unlink(const char *path) {
-    long plen = user_str_ok(path, ABI_PATH_MAX);
-    if (plen < 0) return -ABI_EFAULT;
     char kpath[ABI_PATH_MAX];
-    int rr = resolve_user_path(path, (size_t)plen, kpath, sizeof(kpath));
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
     int rc = vfs_unlink(kpath);
     switch (rc) {
@@ -1151,10 +1141,8 @@ static long sys_unlink(const char *path) {
 
 static long sys_mkdir(const char *path, int mode) {
     (void)mode;     /* M25A: not honoured yet -- new dirs use proc owner */
-    long plen = user_str_ok(path, ABI_PATH_MAX);
-    if (plen < 0) return -ABI_EFAULT;
     char kpath[ABI_PATH_MAX];
-    int rr = resolve_user_path(path, (size_t)plen, kpath, sizeof(kpath));
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
     int rc = vfs_mkdir(kpath);
     switch (rc) {
@@ -1182,21 +1170,17 @@ static long sys_brk(uintptr_t new_brk) {
 static long sys_getcwd(char *out, size_t cap) {
     if (cap == 0) return -ABI_EINVAL;
     if (cap > ABI_PATH_MAX) cap = ABI_PATH_MAX;
-    if (!user_buf_ok((uint64_t)(uintptr_t)out, cap)) return -ABI_EFAULT;
     struct proc *p = current_proc();
     const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
     size_t n = strlen(cwd);
     if (n + 1 > cap) return -ABI_ERANGE;
-    memcpy(out, cwd, n);
-    out[n] = '\0';
+    if (copy_to_user(out, cwd, n + 1) != 0) return -ABI_EFAULT;
     return (long)n;
 }
 
 static long sys_chdir(const char *path) {
-    long plen = user_str_ok(path, ABI_PATH_MAX);
-    if (plen < 0) return -ABI_EFAULT;
     char kpath[ABI_PATH_MAX];
-    int rr = resolve_user_path(path, (size_t)plen, kpath, sizeof(kpath));
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
     struct vfs_stat st;
     int sr = vfs_stat(kpath, &st);
@@ -1220,11 +1204,12 @@ static long sys_chdir(const char *path) {
  * We still validate inputs so a buggy caller gets a clean error
  * rather than silent success. */
 static long sys_getenv(const char *name, char *out, size_t cap) {
-    long nlen = user_str_ok(name, 256);
-    if (nlen < 0) return -ABI_EFAULT;
-    if (cap > 0 && !user_buf_ok((uint64_t)(uintptr_t)out, cap))
-        return -ABI_EFAULT;
-    if (cap > 0) out[0] = '\0';
+    char kname[256];
+    if (strncpy_from_user(kname, name, sizeof(kname)) < 0) return -ABI_EFAULT;
+    if (cap > 0) {
+        char nul = '\0';
+        if (copy_to_user(out, &nul, 1) != 0) return -ABI_EFAULT;
+    }
     return 0;
 }
 
@@ -1275,16 +1260,14 @@ static int copy_kvec_in(char *const *user_arr,
     *out_arr = 0;
     *out_count = 0;
     if (!user_arr) return 0;
-    if (!user_buf_ok((uint64_t)(uintptr_t)user_arr,
-                     sizeof(char *) * 1)) return -ABI_EFAULT;
+    if (max_strlen <= 1 || max_strlen > 4096) return -ABI_EINVAL;
 
-    /* Count first. */
+    /* Count first: read each user pointer slot through the accessor. */
     int n = 0;
     for (;;) {
-        if (!user_buf_ok((uint64_t)(uintptr_t)(user_arr + n),
-                         sizeof(char *))) return -ABI_EFAULT;
-        const char *s = user_arr[n];
-        if (s == 0) break;
+        uint64_t slot = 0;
+        if (get_user_u64(&slot, user_arr + n) != 0) return -ABI_EFAULT;
+        if (slot == 0) break;
         if (n >= max_entries) return -ABI_E2BIG;
         n++;
     }
@@ -1295,13 +1278,13 @@ static int copy_kvec_in(char *const *user_arr,
     memset(arr, 0, sizeof(char *) * (size_t)(n + 1));
 
     for (int i = 0; i < n; i++) {
-        const char *s = user_arr[i];
-        long sl = user_str_ok(s, max_strlen);
-        if (sl < 0) goto fail;
-        char *kc = (char *)kmalloc((size_t)sl + 1);
+        uint64_t slot = 0;
+        if (get_user_u64(&slot, user_arr + i) != 0) goto fail;
+        char *kc = (char *)kmalloc((size_t)max_strlen);
         if (!kc) goto fail;
-        memcpy(kc, s, (size_t)sl);
-        kc[sl] = '\0';
+        long sl = strncpy_from_user(kc, (const void *)(uintptr_t)slot,
+                                    (size_t)max_strlen);
+        if (sl < 0 || sl >= max_strlen - 1) { kfree(kc); goto fail; }
         arr[i] = kc;
     }
     arr[n] = 0;
@@ -1323,19 +1306,15 @@ static void free_kvec(char **arr) {
 
 static long sys_spawn(const struct abi_spawn_req *req) {
     if (!cap_check(current_proc(), CAP_EXEC, "sys_spawn")) return -ABI_EPERM;
-    if (!user_buf_ok((uint64_t)(uintptr_t)req, sizeof(*req))) return -ABI_EFAULT;
 
     /* Snapshot the request into the kernel up front so a concurrent
      * user mutation can't change pointers we already validated. */
     struct abi_spawn_req kreq;
-    memcpy(&kreq, req, sizeof(kreq));
+    if (copy_from_user(&kreq, req, sizeof(kreq)) != 0) return -ABI_EFAULT;
     if (kreq.flags != 0) return -ABI_EINVAL;
 
-    long plen = user_str_ok(kreq.path, ABI_PATH_MAX);
-    if (plen < 0) return -ABI_EFAULT;
     char kpath[ABI_PATH_MAX];
-    memcpy(kpath, kreq.path, (size_t)plen);
-    kpath[plen] = '\0';
+    if (!user_str_in(kpath, sizeof(kpath), kreq.path)) return -ABI_EFAULT;
 
     char **kargv = 0; int kargc = 0;
     char **kenvp = 0; int kenvc = 0;
@@ -1415,17 +1394,13 @@ static long sys_dload(const char *path, uint64_t base,
      * caller without CAP_EXEC has no business doing this. */
     if (!cap_check(current_proc(), CAP_EXEC, "sys_dload")) return -ABI_EPERM;
 
-    long plen = user_str_ok(path, ABI_PATH_MAX);
-    if (plen < 0) return -ABI_EFAULT;
-    if (!user_buf_ok((uint64_t)(uintptr_t)out_user, sizeof(*out_user)))
-        return -ABI_EFAULT;
     if ((base & (PAGE_SIZE - 1)) != 0) return -ABI_EINVAL;
     if (base == 0 || base >= 0x0000800000000000ULL) return -ABI_EINVAL;
 
     /* Resolve under the caller's sandbox (so dload can't be used to
      * pull arbitrary files outside the per-session FS root). */
     char kpath[ABI_PATH_MAX];
-    int rr = resolve_user_path(path, (size_t)plen, kpath, sizeof(kpath));
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
 
     void  *image     = 0;
@@ -1498,7 +1473,7 @@ static long sys_dload(const char *path, uint64_t base,
         .phent   = info.phent,
         ._pad    = 0,
     };
-    memcpy(out_user, &kout, sizeof(kout));
+    if (copy_to_user(out_user, &kout, sizeof(kout)) != 0) return -ABI_EFAULT;
     return 0;
 }
 
@@ -1520,31 +1495,25 @@ static long sys_dev_list(struct abi_dev_info *out, uint32_t cap,
      *       actually filled" without needing to clear the tail. */
     static struct abi_dev_info staging[ABI_DEVT_MAX_DEVICES];
     int n = devtest_enumerate(staging, (int)cap, mask);
-    if (n > 0) memcpy(out, staging, sizeof(*out) * (size_t)n);
+    if (n > 0 && copy_to_user(out, staging, sizeof(*out) * (size_t)n) != 0)
+        return -ABI_EFAULT;
     return n;
 }
 
 static long sys_dev_test(const char *name, char *msg, uint32_t cap) {
-    /* name: short (<= 32B). Bound it explicitly so a malicious or
-     * confused caller can't trick user_str_ok into walking past
-     * a guard page. */
-    long nlen = user_str_ok(name, ABI_DEVT_NAME_MAX);
-    if (nlen < 0) return -ABI_EFAULT;
     if (cap > ABI_DEVT_MSG_MAX) cap = ABI_DEVT_MSG_MAX;
-    if (cap > 0 && !user_buf_ok((uint64_t)(uintptr_t)msg, cap))
-        return -ABI_EFAULT;
 
     /* Copy the name into kernel memory (devtest_run does strcmp). */
     char kname[ABI_DEVT_NAME_MAX];
-    memcpy(kname, name, (size_t)nlen);
-    kname[nlen] = '\0';
+    if (strncpy_from_user(kname, name, sizeof(kname)) < 0) return -ABI_EFAULT;
 
     char kmsg[ABI_DEVT_MSG_MAX];
     int rc = devtest_run(kname, kmsg, sizeof kmsg);
     if (cap > 0 && msg) {
-        size_t n = 0;
-        while (n + 1 < cap && kmsg[n]) { msg[n] = kmsg[n]; n++; }
-        msg[n] = '\0';
+        size_t n = strlen(kmsg);
+        if (n + 1 > cap) n = cap - 1;
+        kmsg[n] = '\0';
+        if (copy_to_user(msg, kmsg, n + 1) != 0) return -ABI_EFAULT;
     }
     return rc;
 }
@@ -1561,7 +1530,8 @@ static long sys_hot_drain(struct abi_hot_event *out, uint32_t cap) {
      * We then memcpy the populated prefix to user memory. */
     static struct abi_hot_event staging[ABI_DEVT_HOT_RING];
     int n = hotplug_drain(staging, (int)cap);
-    if (n > 0) memcpy(out, staging, sizeof(*out) * (size_t)n);
+    if (n > 0 && copy_to_user(out, staging, sizeof(*out) * (size_t)n) != 0)
+        return -ABI_EFAULT;
     return n;
 }
 
@@ -1585,7 +1555,7 @@ static long sys_display_present_stats(struct abi_display_present_stats *out) {
         .cmp_full_frames    = cmp_full,
         .cmp_partial_frames = cmp_partial,
     };
-    memcpy(out, &staging, sizeof(staging));
+    if (copy_to_user(out, &staging, sizeof(staging)) != 0) return -ABI_EFAULT;
     return 0;
 }
 
@@ -1602,7 +1572,8 @@ static long sys_display_info(struct abi_display_info *out, uint32_t cap) {
      * prefix to user space in one shot. */
     static struct abi_display_info staging[ABI_DISPLAY_MAX_OUTPUTS];
     int n = display_enumerate(staging, (int)cap);
-    if (n > 0) memcpy(out, staging, sizeof(*out) * (size_t)n);
+    if (n > 0 && copy_to_user(out, staging, sizeof(*out) * (size_t)n) != 0)
+        return -ABI_EFAULT;
     return n;
 }
 
@@ -1619,23 +1590,21 @@ static long sys_slog_read(struct abi_slog_record *out, uint32_t cap,
      * one shot. */
     static struct abi_slog_record staging[ABI_SLOG_RING_DEPTH];
     uint32_t n = slog_drain(staging, cap, since_seq);
-    if (n > 0) memcpy(out, staging, sizeof(*out) * (size_t)n);
+    if (n > 0 && copy_to_user(out, staging, sizeof(*out) * (size_t)n) != 0)
+        return -ABI_EFAULT;
     return (long)n;
 }
 
 static long sys_slog_write(uint32_t level, const char *sub_user,
                            const char *msg_user) {
-    long sub_len = user_str_ok(sub_user, ABI_SLOG_SUB_MAX);
-    long msg_len = user_str_ok(msg_user, ABI_SLOG_MSG_MAX);
-    if (sub_len < 0 || msg_len < 0) return -ABI_EFAULT;
     if (level >= ABI_SLOG_LEVEL_MAX) return -ABI_EINVAL;
 
     /* Copy strings into kernel memory so the ring writer never
      * dereferences user pointers. */
     char ksub[ABI_SLOG_SUB_MAX];
     char kmsg[ABI_SLOG_MSG_MAX];
-    memcpy(ksub, sub_user, (size_t)sub_len); ksub[sub_len] = '\0';
-    memcpy(kmsg, msg_user, (size_t)msg_len); kmsg[msg_len] = '\0';
+    if (strncpy_from_user(ksub, sub_user, sizeof(ksub)) < 0) return -ABI_EFAULT;
+    if (strncpy_from_user(kmsg, msg_user, sizeof(kmsg)) < 0) return -ABI_EFAULT;
 
     int32_t pid = -1;
     struct proc *p = current_proc();
@@ -1649,7 +1618,7 @@ static long sys_slog_stats(struct abi_slog_stats *out) {
         return -ABI_EFAULT;
     struct abi_slog_stats staging;
     slog_stats(&staging);
-    memcpy(out, &staging, sizeof(staging));
+    if (copy_to_user(out, &staging, sizeof(staging)) != 0) return -ABI_EFAULT;
     return 0;
 }
 
@@ -1660,7 +1629,7 @@ static long sys_system_metrics(struct abi_system_metrics *out) {
         return -ABI_EFAULT;
     struct abi_system_metrics staging;
     sysmon_sample(&staging);
-    memcpy(out, &staging, sizeof(staging));
+    if (copy_to_user(out, &staging, sizeof(staging)) != 0) return -ABI_EFAULT;
     return 0;
 }
 
@@ -1671,7 +1640,7 @@ static long sys_wdog_status(struct abi_wdog_status *out) {
         return -ABI_EFAULT;
     struct abi_wdog_status staging;
     wdog_status(&staging);
-    memcpy(out, &staging, sizeof(staging));
+    if (copy_to_user(out, &staging, sizeof(staging)) != 0) return -ABI_EFAULT;
     return 0;
 }
 
@@ -1710,16 +1679,12 @@ static bool fscheck_lookup_cb(const char *mount_point,
 
 static long sys_fs_check(const char *path,
                          struct abi_fscheck_report *out) {
-    if (!user_buf_ok((uint64_t)(uintptr_t)out, sizeof(*out)))
-        return -ABI_EFAULT;
-    long plen = user_str_ok(path, ABI_FSCHECK_PATH_MAX);
-    if (plen <= 0) return -ABI_EINVAL;
-
     /* Stage path into kernel space so the iteration callback sees a
      * stable, NUL-terminated buffer regardless of user paging. */
     char kpath[ABI_FSCHECK_PATH_MAX];
-    for (long i = 0; i < plen; i++) kpath[i] = path[i];
-    kpath[plen] = '\0';
+    long plen = strncpy_from_user(kpath, path, sizeof(kpath));
+    if (plen < 0) return -ABI_EFAULT;
+    if (plen == 0 || (size_t)plen >= sizeof(kpath) - 1) return -ABI_EINVAL;
 
     struct abi_fscheck_report staging;
     memset(&staging, 0, sizeof(staging));
@@ -1739,7 +1704,7 @@ static long sys_fs_check(const char *path,
         const char *msg = "no filesystem mounted at this path";
         for (uint32_t i = 0; i < sizeof(staging.detail) - 1 && msg[i]; i++)
             staging.detail[i] = msg[i];
-        memcpy(out, &staging, sizeof(staging));
+        (void)copy_to_user(out, &staging, sizeof(staging));
         return -ABI_ENOENT;
     }
 
@@ -1757,7 +1722,7 @@ static long sys_fs_check(const char *path,
                                             : "fscheck failed (I/O?)";
             for (uint32_t i = 0; i < sizeof(staging.detail) - 1 && msg[i]; i++)
                 staging.detail[i] = msg[i];
-            memcpy(out, &staging, sizeof(staging));
+            (void)copy_to_user(out, &staging, sizeof(staging));
             return -ABI_EIO;
         }
         staging.errors_found    = chk.errors;
@@ -1776,7 +1741,8 @@ static long sys_fs_check(const char *path,
                  i < sizeof(staging.detail) - 1 && chk.detail[i]; i++)
                 staging.detail[i] = chk.detail[i];
         }
-        memcpy(out, &staging, sizeof(staging));
+        if (copy_to_user(out, &staging, sizeof(staging)) != 0)
+            return -ABI_EFAULT;
         return 0;
     }
 
@@ -1787,7 +1753,7 @@ static long sys_fs_check(const char *path,
     for (uint32_t i = 0; i < sizeof(staging.detail) - 1 && msg[i]; i++)
         staging.detail[i] = msg[i];
     staging.status = ABI_FSCHECK_OK;
-    memcpy(out, &staging, sizeof(staging));
+    if (copy_to_user(out, &staging, sizeof(staging)) != 0) return -ABI_EFAULT;
     return 0;
 }
 
@@ -1992,7 +1958,7 @@ static long sys_stab_selftest(struct abi_stab_report *out, uint32_t mask) {
         }
     }
 
-    memcpy(out, &r, sizeof(r));
+    if (copy_to_user(out, &r, sizeof(r)) != 0) return -ABI_EFAULT;
     return ((r.result_mask & mask) == mask) ? 0 : -ABI_EIO;
 }
 
@@ -2006,7 +1972,7 @@ static long sys_hwinfo(struct abi_hwinfo_summary *out) {
         return -ABI_EFAULT;
     struct abi_hwinfo_summary snap;
     hwinfo_snapshot(&snap);
-    memcpy(out, &snap, sizeof(snap));
+    if (copy_to_user(out, &snap, sizeof(snap)) != 0) return -ABI_EFAULT;
     return 0;
 }
 
@@ -2024,7 +1990,7 @@ static long sys_drvmatch(uint32_t bus, uint32_t vendor, uint32_t device,
     /* drvmatch_query() always populates rec, even when it returns
      * -ABI_ENOENT (it stamps the record with NONE/UNSUPPORTED so
      * userland can render it). Copy unconditionally. */
-    memcpy(out, &rec, sizeof(rec));
+    if (copy_to_user(out, &rec, sizeof(rec)) != 0) return -ABI_EFAULT;
     return rc;
 }
 
@@ -2055,7 +2021,8 @@ static long sys_hwcompat_list(struct abi_hwcompat_entry *out,
      * lives in one place. */
     struct abi_hwcompat_entry staging[ABI_HWCOMPAT_MAX_ENTRIES];
     size_t n = hwdb_snapshot(staging, cap);
-    if (n > 0) memcpy(out, staging, n * sizeof(staging[0]));
+    if (n > 0 && copy_to_user(out, staging, n * sizeof(staging[0])) != 0)
+        return -ABI_EFAULT;
     return (long)n;
 }
 
@@ -2076,7 +2043,8 @@ static long sys_notify_post(const struct abi_notification *user_rec) {
         return -ABI_EFAULT;
 
     struct abi_notification staging;
-    memcpy(&staging, user_rec, sizeof(staging));
+    if (copy_from_user(&staging, user_rec, sizeof(staging)) != 0)
+        return -ABI_EFAULT;
 
     /* Force NUL terminators on every string field; defends against a
      * caller that forgot. notify_post itself also clamps but doing
@@ -2120,7 +2088,8 @@ static long sys_notify_list(struct abi_notification *out, uint32_t cap) {
      * syscall stack is 32 KiB so this is comfortable. */
     struct abi_notification staging[64];
     uint32_t n = notify_get_records(staging, cap);
-    if (n > 0) memcpy(out, staging, (size_t)n * sizeof(staging[0]));
+    if (n > 0 && copy_to_user(out, staging, (size_t)n * sizeof(staging[0])) != 0)
+        return -ABI_EFAULT;
     return (long)n;
 }
 
@@ -2153,15 +2122,12 @@ static long sys_svc_list(struct abi_service_info *out, uint32_t cap) {
         want = (uint32_t)(sizeof(staging) / sizeof(staging[0]));
     }
     uint32_t n = service_get_records(staging, want);
-    if (n > 0) memcpy(out, staging, n * sizeof(staging[0]));
+    if (n > 0 && copy_to_user(out, staging, n * sizeof(staging[0])) != 0)
+        return -ABI_EFAULT;
     return (long)n;
 }
 
 static long sys_waitpid(int pid, int *status_out, int flags) {
-    if (status_out && !user_buf_ok((uint64_t)(uintptr_t)status_out,
-                                   sizeof(*status_out))) {
-        return -ABI_EFAULT;
-    }
 
     if (flags & ABI_WNOHANG) {
         struct proc *child = proc_lookup(pid);
@@ -2175,7 +2141,8 @@ static long sys_waitpid(int pid, int *status_out, int flags) {
          * "no such pid / waited on self". */
         return -ABI_ENOENT;
     }
-    if (status_out) *status_out = code;
+    if (status_out && put_user_u32(status_out, (uint32_t)code) != 0)
+        return -ABI_EFAULT;
     return pid;
 }
 
@@ -2478,9 +2445,9 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
         int count = (int)a3;
         if (count <= 0 || count > 256) return -ABI_EINVAL;
-        const uint32_t *cmds = (const uint32_t *)a2;
-        if (!user_buf_ok((uint64_t)(uintptr_t)cmds, (uint64_t)count * 16))
-            return -ABI_EFAULT;
+        uint32_t *cmds = (uint32_t *)bounce_in((const void *)a2,
+                                               (size_t)count * 16);
+        if (!cmds) return -ABI_EFAULT;
         for (int i = 0; i < count; i++) {
             int16_t bx = (int16_t)(cmds[i * 4 + 0] & 0xFFFF);
             int16_t by = (int16_t)((cmds[i * 4 + 0] >> 16) & 0xFFFF);
@@ -2489,6 +2456,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
             uint32_t color = cmds[i * 4 + 2];
             gui_window_fill(f->win, bx, by, bw, bh, color);
         }
+        kfree(cmds);
         return count;
     }
 
@@ -2507,8 +2475,15 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
          * For now, return -1 (not yet implemented beyond context). */
         (void)a1; (void)a2;
         return -1;
-    case ABI_SYS_GL_SUBMIT:
-        return (long)virtio_gpu_submit_3d((uint32_t)a1, (const void *)a2, (uint32_t)a3);
+    case ABI_SYS_GL_SUBMIT: {
+        uint32_t len = (uint32_t)a3;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k = bounce_in((const void *)a2, len);
+        if (!k) return -ABI_EFAULT;
+        long rv = (long)virtio_gpu_submit_3d((uint32_t)a1, k, len);
+        kfree(k);
+        return rv;
+    }
     case ABI_SYS_GL_SWAP_BUFFERS: {
         struct file *f = fd_lookup((int)a2);
         if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
@@ -2526,8 +2501,13 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         thread_exit((int)a1);
         return 0; /* unreachable */
 
-    case ABI_SYS_THREAD_JOIN:
-        return thread_join((int)a1, (int *)a2);
+    case ABI_SYS_THREAD_JOIN: {
+        int code = 0;
+        long rv = thread_join((int)a1, a2 ? &code : 0);
+        if (rv == 0 && a2 && put_user_u32((void *)a2, (uint32_t)code) != 0)
+            return -ABI_EFAULT;
+        return rv;
+    }
 
     case ABI_SYS_THREAD_DETACH:
         return thread_detach((int)a1);
@@ -2576,35 +2556,68 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
 
     /* ---- Phase 1 M1.4: IPC syscalls ---- */
 
-    case ABI_SYS_SHM_OPEN:
-        return sys_shm_open((const char *)(uintptr_t)a1, (int)a2, (size_t)a3);
+    case ABI_SYS_SHM_OPEN: {
+        char kname[128];
+        if (!user_str_in(kname, sizeof(kname),
+                         (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
+        return sys_shm_open(kname, (int)a2, (size_t)a3);
+    }
 
     case ABI_SYS_SHM_MAP:
         return sys_shm_map((int)a1, (uint64_t)a2);
 
-    case ABI_SYS_SHM_UNLINK:
-        return sys_shm_unlink((const char *)(uintptr_t)a1);
+    case ABI_SYS_SHM_UNLINK: {
+        char kname[128];
+        if (!user_str_in(kname, sizeof(kname),
+                         (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
+        return sys_shm_unlink(kname);
+    }
 
     case ABI_SYS_UNIX_SOCKET:
         return sys_unix_socket();
 
-    case ABI_SYS_UNIX_BIND:
-        return sys_unix_bind((int)a1, (const char *)(uintptr_t)a2);
+    case ABI_SYS_UNIX_BIND: {
+        char kpath[128];
+        if (!user_str_in(kpath, sizeof(kpath),
+                         (const char *)(uintptr_t)a2)) return -ABI_EFAULT;
+        return sys_unix_bind((int)a1, kpath);
+    }
 
     case ABI_SYS_UNIX_LISTEN:
         return sys_unix_listen((int)a1, (int)a2);
 
-    case ABI_SYS_UNIX_CONNECT:
-        return sys_unix_connect((int)a1, (const char *)(uintptr_t)a2);
+    case ABI_SYS_UNIX_CONNECT: {
+        char kpath[128];
+        if (!user_str_in(kpath, sizeof(kpath),
+                         (const char *)(uintptr_t)a2)) return -ABI_EFAULT;
+        return sys_unix_connect((int)a1, kpath);
+    }
 
     case ABI_SYS_UNIX_ACCEPT:
         return sys_unix_accept((int)a1);
 
-    case ABI_SYS_UNIX_SEND:
-        return sys_unix_send((int)a1, (const void *)(uintptr_t)a2, (size_t)a3);
+    case ABI_SYS_UNIX_SEND: {
+        size_t len = (size_t)a3;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k = bounce_in((const void *)(uintptr_t)a2, len);
+        if (!k) return -ABI_EFAULT;
+        long rv = sys_unix_send((int)a1, k, len);
+        kfree(k);
+        return rv;
+    }
 
-    case ABI_SYS_UNIX_RECV:
-        return sys_unix_recv((int)a1, (void *)(uintptr_t)a2, (size_t)a3);
+    case ABI_SYS_UNIX_RECV: {
+        size_t len = (size_t)a3;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        if (!user_buf_ok((uint64_t)a2, len)) return -ABI_EFAULT;
+        void *k = kmalloc(len ? len : 1);
+        if (!k) return -ABI_ENOMEM;
+        long rv = sys_unix_recv((int)a1, k, len);
+        if (rv > 0 && copy_to_user((void *)(uintptr_t)a2, k, (size_t)rv) != 0)
+            rv = -ABI_EFAULT;
+        kfree(k);
+        return rv;
+    }
 
     case ABI_SYS_UNIX_CLOSE:
         return sys_unix_close((int)a1);
@@ -2612,11 +2625,12 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Phase 1 M1.5: Enhanced VFS ---- */
 
     case ABI_SYS_SYMLINK: {
-        const char *path   = (const char *)(uintptr_t)a1;
-        const char *target = (const char *)(uintptr_t)a2;
-        if (!path || (uintptr_t)path >= USER_HALF_MAX) return -ABI_EFAULT;
-        if (!target || (uintptr_t)target >= USER_HALF_MAX) return -ABI_EFAULT;
-        int rc = vfs_symlink(path, target);
+        char kpath[ABI_PATH_MAX], ktarget[ABI_PATH_MAX];
+        if (!user_str_in(kpath, sizeof(kpath),
+                         (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
+        if (!user_str_in(ktarget, sizeof(ktarget),
+                         (const char *)(uintptr_t)a2)) return -ABI_EFAULT;
+        int rc = vfs_symlink(kpath, ktarget);
         if (rc == VFS_OK) return 0;
         if (rc == VFS_ERR_EXIST) return -ABI_EEXIST;
         if (rc == VFS_ERR_NOSPC) return -ABI_ENOSPC;
@@ -2624,13 +2638,19 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     }
 
     case ABI_SYS_READLINK: {
-        const char *path = (const char *)(uintptr_t)a1;
         char *buf        = (char *)(uintptr_t)a2;
         size_t bufsz     = (size_t)a3;
-        if (!path || (uintptr_t)path >= USER_HALF_MAX) return -ABI_EFAULT;
-        if (!buf  || (uintptr_t)buf  >= USER_HALF_MAX) return -ABI_EFAULT;
-        int rc = vfs_readlink(path, buf, bufsz);
-        if (rc == VFS_OK) return (long)strlen(buf);
+        char kpath[ABI_PATH_MAX], ktmp[ABI_PATH_MAX];
+        if (!user_str_in(kpath, sizeof(kpath),
+                         (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
+        if (!buf || bufsz == 0) return -ABI_EFAULT;
+        if (bufsz > sizeof(ktmp)) bufsz = sizeof(ktmp);
+        int rc = vfs_readlink(kpath, ktmp, bufsz);
+        if (rc == VFS_OK) {
+            size_t n = strlen(ktmp);
+            if (copy_to_user(buf, ktmp, n + 1) != 0) return -ABI_EFAULT;
+            return (long)n;
+        }
         if (rc == VFS_ERR_NOENT) return -ABI_ENOENT;
         return -ABI_EINVAL;
     }
@@ -2639,9 +2659,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_inotify_init();
 
     case ABI_SYS_INOTIFY_ADD_WATCH: {
-        const char *path = (const char *)(uintptr_t)a2;
-        if (!path || (uintptr_t)path >= USER_HALF_MAX) return -ABI_EFAULT;
-        return sys_inotify_add_watch((int)a1, path, (uint32_t)a3);
+        char kpath[ABI_PATH_MAX];
+        if (!user_str_in(kpath, sizeof(kpath),
+                         (const char *)(uintptr_t)a2)) return -ABI_EFAULT;
+        return sys_inotify_add_watch((int)a1, kpath, (uint32_t)a3);
     }
 
     case ABI_SYS_INOTIFY_RM_WATCH:
@@ -2653,18 +2674,29 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
 
     /* ---- Phase 2 M2.7: Clipboard System ----------------------------- */
     case ABI_SYS_CLIP_SET: {
-        const char *data = (const char *)(uintptr_t)a1;
         uint32_t len = (uint32_t)a2;
         uint32_t fmt = (uint32_t)a3;
-        if (!data || (uintptr_t)data >= USER_HALF_MAX) return -ABI_EFAULT;
-        return clipboard_set(data, len, fmt);
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k = bounce_in((const void *)(uintptr_t)a1, len);
+        if (!k) return -ABI_EFAULT;
+        long rv = clipboard_set((const char *)k, len, fmt);
+        kfree(k);
+        return rv;
     }
     case ABI_SYS_CLIP_GET: {
         char *buf = (char *)(uintptr_t)a1;
         uint32_t buf_sz = (uint32_t)a2;
         uint32_t fmt = (uint32_t)a3;
-        if (!buf || (uintptr_t)buf >= USER_HALF_MAX) return -ABI_EFAULT;
-        return clipboard_get(buf, buf_sz, fmt);
+        if (!buf || buf_sz == 0) return -ABI_EFAULT;
+        if (buf_sz > SYS_MAX_RW) buf_sz = SYS_MAX_RW;
+        char *k = (char *)kmalloc(buf_sz);
+        if (!k) return -ABI_ENOMEM;
+        long rv = clipboard_get(k, buf_sz, fmt);
+        if (rv > 0 && copy_to_user(buf, k, (size_t)rv <= (size_t)buf_sz
+                                            ? (size_t)rv : (size_t)buf_sz) != 0)
+            rv = -ABI_EFAULT;
+        kfree(k);
+        return rv;
     }
     case ABI_SYS_CLIP_CLEAR:
         return clipboard_clear();
@@ -2681,8 +2713,17 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Audio Engine ---- */
     case ABI_SYS_AUDIO_OPEN:
         return sys_audio_open((uint32_t)a1, (uint8_t)a2, (uint8_t)a3);
-    case ABI_SYS_AUDIO_WRITE:
-        return sys_audio_write((int)a1, (const void *)a2, (size_t)a3);
+    case ABI_SYS_AUDIO_WRITE: {
+        /* count is in SAMPLES; bound the byte size conservatively (max
+         * 4 bytes/sample) and bounce. */
+        size_t count = (size_t)a3;
+        if (count > SYS_MAX_RW / 4) count = SYS_MAX_RW / 4;
+        void *k = bounce_in((const void *)a2, count * 4);
+        if (!k) return -ABI_EFAULT;
+        long rv = sys_audio_write((int)a1, k, count);
+        kfree(k);
+        return rv;
+    }
     case ABI_SYS_AUDIO_CLOSE:
         return sys_audio_close((int)a1);
     case ABI_SYS_AUDIO_VOLUME:
@@ -2691,22 +2732,62 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Userland TCP/TLS networking ---- */
     case ABI_SYS_TCP_CONNECT:
         return sys_tcp_user_connect((uint32_t)a1, (uint16_t)a2, (uint32_t)a3);
-    case ABI_SYS_TCP_SEND:
-        return sys_tcp_user_send((int)a1, (const void *)a2, (uint32_t)a3);
-    case ABI_SYS_TCP_RECV:
-        return sys_tcp_user_recv((int)a1, (void *)a2, (uint32_t)a3);
+    case ABI_SYS_TCP_SEND: {
+        uint32_t len = (uint32_t)a3;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k = bounce_in((const void *)a2, len);
+        if (!k) return -ABI_EFAULT;
+        long rv = sys_tcp_user_send((int)a1, k, len);
+        kfree(k);
+        return rv;
+    }
+    case ABI_SYS_TCP_RECV: {
+        uint32_t len = (uint32_t)a3;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        if (!user_buf_ok((uint64_t)a2, len)) return -ABI_EFAULT;
+        void *k = kmalloc(len ? len : 1);
+        if (!k) return -ABI_ENOMEM;
+        long rv = sys_tcp_user_recv((int)a1, k, len);
+        if (rv > 0 && copy_to_user((void *)a2, k, (size_t)rv) != 0)
+            rv = -ABI_EFAULT;
+        kfree(k);
+        return rv;
+    }
     case ABI_SYS_TCP_CLOSE:
         return sys_tcp_user_close((int)a1);
     case ABI_SYS_TCP_LISTEN:
         return sys_tcp_user_listen((uint16_t)a1, (int)a2);
     case ABI_SYS_TCP_ACCEPT:
         return sys_tcp_user_accept((int)a1);
-    case ABI_SYS_TLS_CONNECT:
-        return sys_tls_user_connect((uint32_t)a1, (uint16_t)a2, (const char *)a3);
-    case ABI_SYS_TLS_SEND:
-        return sys_tls_user_send((int)a1, (const void *)a2, (uint32_t)a3);
-    case ABI_SYS_TLS_RECV:
-        return sys_tls_user_recv((int)a1, (void *)a2, (uint32_t)a3);
+    case ABI_SYS_TLS_CONNECT: {
+        char khost[256];
+        khost[0] = '\0';
+        if (a3 && strncpy_from_user(khost, (const char *)a3,
+                                    sizeof(khost)) < 0) return -ABI_EFAULT;
+        return sys_tls_user_connect((uint32_t)a1, (uint16_t)a2,
+                                    a3 ? khost : 0);
+    }
+    case ABI_SYS_TLS_SEND: {
+        uint32_t len = (uint32_t)a3;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k = bounce_in((const void *)a2, len);
+        if (!k) return -ABI_EFAULT;
+        long rv = sys_tls_user_send((int)a1, k, len);
+        kfree(k);
+        return rv;
+    }
+    case ABI_SYS_TLS_RECV: {
+        uint32_t len = (uint32_t)a3;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        if (!user_buf_ok((uint64_t)a2, len)) return -ABI_EFAULT;
+        void *k = kmalloc(len ? len : 1);
+        if (!k) return -ABI_ENOMEM;
+        long rv = sys_tls_user_recv((int)a1, k, len);
+        if (rv > 0 && copy_to_user((void *)a2, k, (size_t)rv) != 0)
+            rv = -ABI_EFAULT;
+        kfree(k);
+        return rv;
+    }
     case ABI_SYS_TLS_CLOSE:
         return sys_tls_user_close((int)a1);
 
@@ -2715,10 +2796,28 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_module(a1, a2, a3);
 
     /* ---- Milestone 7: notification service / IPC -------------------- */
-    case ABI_SYS_NOTIFY_SVC_SEND:
-        return sys_notify_svc_send((const char *)a1, (const char *)a2, (const char *)a3);
-    case ABI_SYS_NOTIFY_SVC_GET:
-        return sys_notify_svc_get((struct notification *)a1, (int)a2);
+    case ABI_SYS_NOTIFY_SVC_SEND: {
+        char kt[128], kb[256], ki[64];
+        kt[0] = kb[0] = ki[0] = '\0';
+        if (a1 && strncpy_from_user(kt, (const char *)a1, sizeof(kt)) < 0)
+            return -ABI_EFAULT;
+        if (a2 && strncpy_from_user(kb, (const char *)a2, sizeof(kb)) < 0)
+            return -ABI_EFAULT;
+        if (a3 && strncpy_from_user(ki, (const char *)a3, sizeof(ki)) < 0)
+            return -ABI_EFAULT;
+        return sys_notify_svc_send(a1 ? kt : 0, a2 ? kb : 0, a3 ? ki : 0);
+    }
+    case ABI_SYS_NOTIFY_SVC_GET: {
+        int maxc = (int)a2;
+        if (maxc <= 0) return -ABI_EINVAL;
+        if (maxc > 16) maxc = 16;
+        struct notification kbuf[16];
+        long n = sys_notify_svc_get(kbuf, maxc);
+        if (n > 0 && copy_to_user((void *)a1, kbuf,
+                                  (size_t)n * sizeof(kbuf[0])) != 0)
+            return -ABI_EFAULT;
+        return n;
+    }
     case ABI_SYS_NOTIFY_SVC_DISMISS:
         return sys_notify_svc_dismiss((int)a1);
 
