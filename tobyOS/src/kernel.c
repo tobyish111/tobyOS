@@ -3362,6 +3362,9 @@ void _start(void) {
             kprintf("[boot] net_init OK; starting TCP services\n");
             ipv6_init();
             icmpv6_init();
+#ifdef SLAAC_SELFTEST
+            icmpv6_slaac_selftest();
+#endif
             tcp_echo_init();
             tcp_shell_init();
             ssh_init();

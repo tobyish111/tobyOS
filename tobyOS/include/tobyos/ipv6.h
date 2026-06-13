@@ -53,4 +53,23 @@ int  ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
 const struct ipv6_addr *ipv6_our_linklocal(void);
 bool ipv6_is_up(void);
 
+/* ---- SLAAC (stateless address autoconfiguration) ----
+ *
+ * Filled in by the ICMPv6 Router Advertisement handler: a /64 prefix with
+ * the autonomous flag yields a global address (prefix | our interface id),
+ * and the RA source becomes the default router for off-link traffic. */
+
+/* Install a SLAAC global address formed from `prefix` (top 64 bits) and our
+ * interface id. `router` is the RA source (default router); its MAC is
+ * cached separately by the ND layer. Idempotent for the same prefix. */
+void ipv6_slaac_configure(const struct ipv6_addr *prefix,
+                          const struct ipv6_addr *router);
+
+/* Our autoconfigured global address, or NULL if SLAAC hasn't completed. */
+const struct ipv6_addr *ipv6_our_global(void);
+bool ipv6_have_global(void);
+
+/* The default router (RA source), or NULL if none learned. */
+const struct ipv6_addr *ipv6_default_router(void);
+
 #endif /* TOBYOS_IPV6_H */

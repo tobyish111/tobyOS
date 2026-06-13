@@ -35,6 +35,12 @@ const struct ipv6_addr ipv6_addr_all_routers = {{
 static struct ipv6_addr g_linklocal;
 static bool             g_ipv6_up;
 
+/* SLAAC state (set by the RA handler). */
+static struct ipv6_addr g_global;          /* autoconfigured global address */
+static bool             g_have_global;
+static struct ipv6_addr g_router;          /* default router (RA source)    */
+static bool             g_have_router;
+
 /* ---- address utilities ------------------------------------------ */
 
 bool ipv6_addr_is_zero(const struct ipv6_addr *a) {
@@ -156,6 +162,11 @@ void ipv6_init(void) {
     char buf[40];
     ipv6_format(buf, sizeof(buf), &g_linklocal);
     kprintf("[ipv6] link-local %s\n", buf);
+
+    /* Kick off SLAAC: solicit a Router Advertisement. The reply (handled in
+     * icmpv6.c) installs a global address + default router. Best-effort --
+     * if no router answers we stay link-local-only as before. */
+    icmpv6_send_router_solicit();
 }
 
 const struct ipv6_addr *ipv6_our_linklocal(void) {
@@ -166,6 +177,42 @@ bool ipv6_is_up(void) {
     return g_ipv6_up;
 }
 
+/* ---- SLAAC ------------------------------------------------------- */
+
+void ipv6_slaac_configure(const struct ipv6_addr *prefix,
+                          const struct ipv6_addr *router) {
+    /* Global = prefix top 64 bits | our interface id (the low 64 bits of
+     * the link-local, which we derived from the MAC). RFC 4862 SLAAC. */
+    struct ipv6_addr g;
+    for (int i = 0; i < 8; i++)  g.bytes[i] = prefix->bytes[i];
+    for (int i = 8; i < 16; i++) g.bytes[i] = g_linklocal.bytes[i];
+
+    bool changed = !g_have_global || !ipv6_addr_equal(&g, &g_global);
+    g_global      = g;
+    g_have_global = true;
+
+    if (router) { g_router = *router; g_have_router = true; }
+
+    if (changed) {
+        char buf[40], rbuf[40];
+        ipv6_format(buf, sizeof(buf), &g_global);
+        ipv6_format(rbuf, sizeof(rbuf), &g_router);
+        kprintf("[ipv6] SLAAC global %s via router %s\n", buf, rbuf);
+    }
+}
+
+const struct ipv6_addr *ipv6_our_global(void) {
+    return g_have_global ? &g_global : 0;
+}
+
+bool ipv6_have_global(void) {
+    return g_have_global;
+}
+
+const struct ipv6_addr *ipv6_default_router(void) {
+    return g_have_router ? &g_router : 0;
+}
+
 /* ---- receive ----------------------------------------------------- */
 
 /* True if this datagram is addressed to us. */
@@ -173,11 +220,16 @@ static bool ipv6_dst_is_for_us(const struct ipv6_addr *dst) {
     if (ipv6_addr_equal(dst, &g_linklocal)) return true;
     if (ipv6_addr_equal(dst, &ipv6_addr_all_nodes)) return true;
     if (ipv6_addr_equal(dst, &ipv6_addr_loopback)) return true;
+    if (g_have_global && ipv6_addr_equal(dst, &g_global)) return true;
 
-    /* Solicited-node multicast for our link-local */
+    /* Solicited-node multicast for our link-local (and global, if any) */
     struct ipv6_addr sn;
     ipv6_make_solicited_node(&sn, &g_linklocal);
     if (ipv6_addr_equal(dst, &sn)) return true;
+    if (g_have_global) {
+        ipv6_make_solicited_node(&sn, &g_global);
+        if (ipv6_addr_equal(dst, &sn)) return true;
+    }
 
     return false;
 }
@@ -222,10 +274,23 @@ int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
 
     uint8_t dst_mac[6];
 
+    /* Pick the next hop: on-link destinations (multicast, link-local, or
+     * inside our SLAAC /64) resolve directly; everything else goes to the
+     * default router learned from the Router Advertisement. */
     if (ipv6_addr_is_multicast(dst)) {
         ipv6_multicast_mac(dst_mac, dst);
     } else {
-        if (!icmpv6_resolve(dst, dst_mac))
+        bool on_link = ipv6_addr_is_linklocal(dst);
+        if (!on_link && g_have_global) {
+            /* same /64 as our global prefix? */
+            bool same = true;
+            for (int i = 0; i < 8; i++)
+                if (dst->bytes[i] != g_global.bytes[i]) { same = false; break; }
+            on_link = same;
+        }
+        const struct ipv6_addr *next = dst;
+        if (!on_link && g_have_router) next = &g_router;
+        if (!icmpv6_resolve(next, dst_mac))
             return -1;
     }
 
@@ -239,7 +304,14 @@ int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
     h->payload_len = htons((uint16_t)payload_len);
     h->next_header = next_header;
     h->hop_limit   = 64;
-    h->src         = g_linklocal;
+    /* Source selection: a link-local/multicast destination uses our
+     * link-local; a global destination uses our SLAAC global if we have one
+     * (a global source is required for the reply to be routable back). */
+    if (g_have_global && !ipv6_addr_is_linklocal(dst) &&
+        !ipv6_addr_is_multicast(dst))
+        h->src = g_global;
+    else
+        h->src = g_linklocal;
     h->dst         = *dst;
 
     if (payload_len)
