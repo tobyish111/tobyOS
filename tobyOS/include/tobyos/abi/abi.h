@@ -1253,6 +1253,7 @@ struct abi_dirent {
 #define ABI_AT_BASE     7       /* base address the interpreter was loaded at */
 #define ABI_AT_FLAGS    8       /* flags */
 #define ABI_AT_ENTRY    9       /* entry point of the *program* (not interp) */
+#define ABI_AT_RANDOM   25      /* ptr to 16 random bytes (libc stack canary) */
 
 struct abi_auxv {
     uint64_t a_type;

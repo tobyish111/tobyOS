@@ -3657,6 +3657,64 @@ void _start(void) {
     }
 #endif
 
+#ifdef LINUXBB_BOOT
+    /* Track B milestone B2 -- run a REAL musl-libc binary (busybox). Build
+     * EXTRA_CFLAGS+=-DLINUXBB_BOOT, with an opt-in musl-static busybox staged
+     * at programs/busybox/busybox (see Makefile; not committed -- GPL). This
+     * is the headline B2 proof: an unmodified, real-libc Linux binary (the
+     * busybox multiplexer dispatching its `echo` applet through musl's full
+     * startup: arch_prctl TLS, stdio via writev, malloc, exit). */
+    {
+        /* A battery of busybox applets that each exit 0 on success. They
+         * fan out across the real-libc syscall surface: echo (writev),
+         * uname (uname), pwd (getcwd), cat (open/read/fstat/close), wc
+         * (read loop), stat (stat -> Linux struct stat translation).
+         * (`ls` is deferred to B3 -- it needs getdents64 + a directory-fd
+         * abstraction tobyOS doesn't have yet.) Any [linux] unhandled
+         * syscall is logged with its number so gaps are self-identifying. */
+        static char *bb[][4] = {
+            { (char *)"busybox", (char *)"echo",
+              (char *)"hello from busybox (musl libc) on tobyOS", 0 },
+            { (char *)"busybox", (char *)"true",  0, 0 },
+            { (char *)"busybox", (char *)"uname", (char *)"-a", 0 },
+            { (char *)"busybox", (char *)"pwd",   0, 0 },
+            { (char *)"busybox", (char *)"cat",   (char *)"/etc/motd", 0 },
+            { (char *)"busybox", (char *)"wc",    (char *)"/etc/motd", 0 },
+            { (char *)"busybox", (char *)"stat",  (char *)"/etc/motd", 0 },
+        };
+        int n = (int)(sizeof(bb) / sizeof(bb[0]));
+        int npass = 0, nrun = 0;
+        for (int t = 0; t < n; t++) {
+            char *argv[4]; int ac = 0;
+            for (int i = 0; i < 4 && bb[t][i]; i++) argv[ac++] = bb[t][i];
+            argv[ac] = 0;
+            char *envp[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec spec = {
+                .path = "/bin/busybox", .name = "busybox",
+                .argc = ac, .argv = argv, .envc = 1, .envp = envp,
+            };
+            kprintf("[boot] LXBB: busybox %s%s%s ...\n", bb[t][1],
+                    bb[t][2] ? " " : "", bb[t][2] ? bb[t][2] : "");
+            int pid = proc_spawn(&spec);
+            if (pid < 0) {
+                kprintf("[boot] LXBB: /bin/busybox not present -- SKIPPED "
+                        "(stage programs/busybox/busybox to enable)\n");
+                kprintf("[LXBB] VERDICT: SKIP reason=no-busybox\n");
+                nrun = -1;
+                break;
+            }
+            int rc = proc_wait(pid);
+            nrun++;
+            if (rc == 0) npass++;
+            kprintf("[LXBB] busybox %-8s exit=%d %s\n", bb[t][1], rc,
+                    rc == 0 ? "OK" : "FAIL");
+        }
+        if (nrun >= 0)
+            kprintf("[LXBB] VERDICT: %s pass=%d/%d\n",
+                    (npass == nrun && nrun > 0) ? "PASS" : "FAIL", npass, nrun);
+    }
+#endif
+
 #ifdef M36_SELFTEST
     /* Milestone 36E: in-OS compile + run self-test (TobyC stage-1). */
     {

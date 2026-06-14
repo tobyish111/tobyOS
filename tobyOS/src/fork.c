@@ -441,7 +441,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     }
 
     /* Build auxv + pack argv/envp onto user stack. */
-    struct abi_auxv aux[8];
+    struct abi_auxv aux[10];
     int auxc = 0;
     uint64_t user_rsp = USER_STACK_RSP_INIT;
 
@@ -454,6 +454,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         aux[auxc++] = (struct abi_auxv){ ABI_AT_ENTRY,  prog_info.entry   };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PAGESZ, PAGE_SIZE         };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_FLAGS,  0                 };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
 
         /* Pack using inline logic (we can't call proc.c's static pack_user_stack).
          * We build a minimal layout: argc, argv[], NULL, envp[], NULL,

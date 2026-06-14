@@ -1732,6 +1732,14 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "/etc/drvtest_now baked into initrd";                        \
 	    EXTRA_FILES="$$EXTRA_FILES etc/drvtest_now";                      \
 	fi;                                                                   \
+	if [ -f programs/busybox/busybox ]; then                             \
+	    cp programs/busybox/busybox $(INITRD_STAGE)/bin/busybox;          \
+	    printf '\003' | dd of=$(INITRD_STAGE)/bin/busybox bs=1 seek=7     \
+	         count=1 conv=notrunc 2>/dev/null;                           \
+	    echo "[initrd] Track B: bundling musl-static busybox (brandelf"   \
+	         "EI_OSABI=Linux) -- Linux ABI demo, OPT-IN (not committed)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/busybox";                          \
+	fi;                                                                   \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/gui_clock bin/gui_widgets bin/gui_about          \

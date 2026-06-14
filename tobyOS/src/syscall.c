@@ -2854,17 +2854,18 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
 /* Linux x86-64 syscall numbers (arch/x86/entry/syscalls/syscall_64.tbl). */
 enum {
     LX_read = 0, LX_write = 1, LX_open = 2, LX_close = 3,
-    LX_stat = 4, LX_fstat = 5, LX_lseek = 8, LX_mmap = 9,
+    LX_stat = 4, LX_fstat = 5, LX_lstat = 6, LX_lseek = 8, LX_mmap = 9,
     LX_mprotect = 10, LX_munmap = 11, LX_brk = 12,
     LX_rt_sigaction = 13, LX_rt_sigprocmask = 14, LX_ioctl = 16,
     LX_readv = 19, LX_writev = 20, LX_access = 21, LX_pipe = 22,
-    LX_dup = 32, LX_dup2 = 33, LX_nanosleep = 35, LX_getpid = 39,
-    LX_exit = 60, LX_uname = 63, LX_fcntl = 72, LX_getcwd = 79,
-    LX_chdir = 80, LX_mkdir = 83, LX_unlink = 87,
+    LX_dup = 32, LX_dup2 = 33, LX_nanosleep = 35, LX_sendfile = 40,
+    LX_getpid = 39, LX_exit = 60, LX_uname = 63, LX_fcntl = 72,
+    LX_getcwd = 79, LX_chdir = 80, LX_mkdir = 83, LX_unlink = 87,
     LX_getuid = 102, LX_getgid = 104, LX_geteuid = 107, LX_getegid = 108,
     LX_getppid = 110, LX_arch_prctl = 158, LX_gettid = 186,
     LX_futex = 202, LX_set_tid_address = 218, LX_clock_gettime = 228,
-    LX_exit_group = 231, LX_set_robust_list = 273, LX_getrandom = 318,
+    LX_exit_group = 231, LX_newfstatat = 262, LX_set_robust_list = 273,
+    LX_getrandom = 318,
 };
 
 /* arch_prctl codes. */
@@ -2879,6 +2880,47 @@ enum {
 
 struct lx_iovec   { uint64_t iov_base; uint64_t iov_len; };
 struct lx_timespec{ int64_t  tv_sec;   int64_t  tv_nsec; };
+
+/* Linux x86-64 struct stat (arch/x86/include/uapi/asm/stat.h) -- 144 bytes,
+ * field layout is ABI and must match byte-for-byte. tobyOS's S_IF* type bits
+ * (abi.h) already equal Linux's (S_IFDIR=0x4000 / S_IFREG=0x8000), so the
+ * mode just carries through. */
+struct lx_stat {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint64_t st_nlink;
+    uint32_t st_mode;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t __pad0;
+    uint64_t st_rdev;
+    int64_t  st_size;
+    int64_t  st_blksize;
+    int64_t  st_blocks;
+    int64_t  st_atime;  int64_t st_atime_nsec;
+    int64_t  st_mtime;  int64_t st_mtime_nsec;
+    int64_t  st_ctime;  int64_t st_ctime_nsec;
+    int64_t  __unused3[3];
+};
+
+/* Build a Linux struct stat from a tobyOS vfs_stat and copy it out. */
+static long linux_emit_stat(const struct vfs_stat *vs, void *ubuf) {
+    struct lx_stat st;
+    memset(&st, 0, sizeof st);
+    uint32_t typ  = (vs->type == VFS_TYPE_DIR) ? 0x4000u : 0x8000u; /* S_IFDIR/REG */
+    uint32_t perm = vs->mode & 0xFFFu;
+    if (perm == 0) perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
+    st.st_mode    = typ | perm;
+    st.st_ino     = 1;                 /* synthetic; tobyOS VFS has no stable ino here */
+    st.st_nlink   = 1;
+    st.st_uid     = vs->uid;
+    st.st_gid     = vs->gid;
+    st.st_size    = (int64_t)vs->size;
+    st.st_blksize = 512;
+    st.st_blocks  = (int64_t)((vs->size + 511) / 512);
+    if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
+    return 0;
+}
 
 /* Translate a Linux mmap flags word into the tobyOS VMA flag word that
  * sys_mmap (src/mmap.c) expects. Defaults to a private anonymous mapping
@@ -2912,6 +2954,59 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
     case LX_unlink: return do_syscall(SYS_UNLINK, a1, 0, 0, 0, 0);
+
+    /* ---- stat family: translate tobyOS vfs_stat -> Linux struct stat ---- */
+    case LX_stat:
+    case LX_lstat: {                   /* (path, struct stat*) */
+        char kpath[ABI_PATH_MAX];
+        int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+        if (rr) return rr;
+        struct vfs_stat vs;
+        int sr = vfs_stat(kpath, &vs);
+        if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
+        if (sr != VFS_OK)        return -ABI_EACCES;
+        return linux_emit_stat(&vs, (void *)a2);
+    }
+    case LX_newfstatat: {              /* (dirfd, path, struct stat*, flags) */
+        /* We honour absolute paths and AT_FDCWD; AT_EMPTY_PATH (stat the
+         * dirfd itself) is treated like fstat(dirfd). */
+        const char *upath = (const char *)a2;
+        char probe[2] = {0,0};
+        if (upath) (void)strncpy_from_user(probe, upath, sizeof probe);
+        if (!upath || probe[0] == '\0') {
+            /* AT_EMPTY_PATH-style: fall through to fstat on a1. */
+            struct file *f = fd_lookup((int)a1);
+            if (!f) return -ABI_EBADF;
+            struct vfs_stat vs = { .type = VFS_TYPE_FILE, .size = f->vfs.size,
+                                   .uid = f->vfs.uid, .gid = f->vfs.gid,
+                                   .mode = f->vfs.mode };
+            if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
+            return linux_emit_stat(&vs, (void *)a3);
+        }
+        char kpath[ABI_PATH_MAX];
+        int rr = resolve_user_path(upath, kpath, sizeof kpath);
+        if (rr) return rr;
+        struct vfs_stat vs;
+        int sr = vfs_stat(kpath, &vs);
+        if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
+        if (sr != VFS_OK)        return -ABI_EACCES;
+        return linux_emit_stat(&vs, (void *)a3);
+    }
+    case LX_fstat: {                   /* (fd, struct stat*) */
+        struct file *f = fd_lookup((int)a1);
+        if (!f) return -ABI_EBADF;
+        struct vfs_stat vs;
+        if (f->kind == FILE_KIND_VFS) {
+            vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
+                                    .uid = f->vfs.uid, .gid = f->vfs.gid,
+                                    .mode = f->vfs.mode };
+        } else {
+            /* console/pipe/socket: report a minimal regular-file stat. */
+            vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = 0,
+                                    .mode = 0666 };
+        }
+        return linux_emit_stat(&vs, (void *)a2);
+    }
 
     /* ---- identities ---- */
     case LX_getpid:  return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
@@ -3051,6 +3146,12 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
 
     case LX_access:
         return -ABI_ENOENT;     /* conservative: report "not there" */
+
+    /* Known-optional: libc/busybox probe these and fall back cleanly on
+     * -ENOSYS. Handled explicitly (quietly) so they don't spam the log. */
+    case LX_sendfile:           /* cat/cp fall back to a read/write loop */
+    case LX_fcntl:              /* F_SETFD/CLOEXEC etc -- best-effort no-op */
+        return (n == LX_fcntl) ? 0 : -ABI_ENOSYS;
 
     default:
         kprintf("[linux] unhandled syscall %ld (a1=0x%lx a2=0x%lx) -> -ENOSYS "

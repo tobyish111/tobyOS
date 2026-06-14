@@ -792,7 +792,7 @@ static int spawn_internal(const char *path, const char *name,
      * static programs -- the trailing AT_NULL is harmless to libtoby
      * crt0 (which doesn't read auxv at all today) and makes the stack
      * shape uniform across static and dynamic launches. */
-    struct abi_auxv aux[8];
+    struct abi_auxv aux[10];
     int             auxc = 0;
     if (ok) {
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PHDR,   prog_info.phdr_va  };
@@ -804,6 +804,11 @@ static int spawn_internal(const char *path, const char *name,
         aux[auxc++] = (struct abi_auxv){ ABI_AT_ENTRY,  prog_info.entry    };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PAGESZ, PAGE_SIZE          };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_FLAGS,  0                  };
+        /* AT_RANDOM: 16 bytes a Linux libc reads for its stack canary.
+         * Point at the 16-byte scratch pad pack_user_stack always leaves
+         * at the very top of the (zeroed) user stack -- valid + readable.
+         * glibc requires this; musl falls back gracefully without it. */
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
     }
 
     /* Default RSP if no argv -- pack a canonical
