@@ -130,6 +130,18 @@ static int write_block(struct tobyfs *fs, uint32_t blk, const void *buf) {
 
 /* -------- write-ahead journal -------- */
 
+/* Crash-injection knob for the crash-consistency self-test. When set,
+ * journal_commit() stops at the chosen phase WITHOUT clearing the on-disk
+ * journal header, modelling a power loss so the next mount must recover.
+ * The in-RAM checkpoint lives in the (write-back) block cache, so the test
+ * models the lost cache by bcache_invalidate()'ing before it remounts. */
+enum {
+    TFS_CRASH_NONE = 0,
+    TFS_CRASH_BEFORE_COMMIT,   /* header+data logged, no commit marker */
+    TFS_CRASH_AFTER_COMMIT,    /* committed, nothing checkpointed to disk */
+};
+static int g_tfs_crash_phase = TFS_CRASH_NONE;
+
 static void journal_begin(struct tobyfs *fs) {
     if (fs->journal_start == 0) return;
     fs->in_transaction = true;
@@ -189,6 +201,13 @@ static int journal_commit(struct tobyfs *fs) {
             goto fail_clear;
     }
 
+    /* Crash injection: power loss after the log's data is durable but
+     * before the commit marker. Recovery must find no commit -> discard. */
+    if (g_tfs_crash_phase == TFS_CRASH_BEFORE_COMMIT) {
+        fs->in_transaction = false; fs->txn_count = 0;
+        return VFS_ERR_IO;
+    }
+
     /* 3. Write commit marker. */
     memset(buf, 0, sizeof(buf));
     struct tfs_txn_commit *cmt = (struct tfs_txn_commit *)buf;
@@ -198,6 +217,13 @@ static int journal_commit(struct tobyfs *fs) {
         uint64_t lba = (uint64_t)(jbase + 1 + (uint32_t)count) * TFS_SECTORS_PER_BLOCK;
         if (blk_write(fs->dev, lba, TFS_SECTORS_PER_BLOCK, buf) != 0)
             goto fail_clear;
+    }
+
+    /* Crash injection: power loss after the commit marker is durable but
+     * before any block is checkpointed home. Recovery must replay. */
+    if (g_tfs_crash_phase == TFS_CRASH_AFTER_COMMIT) {
+        fs->in_transaction = false; fs->txn_count = 0;
+        return VFS_ERR_IO;
     }
 
     /* 4. Checkpoint: write every buffered block to its real location. */
@@ -2059,4 +2085,239 @@ int tobyfs_self_test(struct tobyfs_check *clean_out,
 
     kfree(image);
     return 0;
+}
+
+/* ============================================================
+ *  Crash-consistency + stress harness (-DTOBYFS_STRESS_SELFTEST).
+ *
+ *  Part 1 injects a power loss at each journal phase of a single
+ *  operation and proves remount+recovery is atomic (rollback vs
+ *  replay). Part 2 churns the filesystem with hundreds of mixed
+ *  operations (incl. a double-indirect 4.5 MiB file), verifying
+ *  every byte and running the integrity checker throughout.
+ *
+ *  The journal's [header][data][commit] log is written with blk_write
+ *  (direct to device); the checkpoint + live data sit in the write-back
+ *  block cache. So "power loss" = bcache_invalidate() (drop the cache),
+ *  leaving only what reached the device -- exactly what recovery must
+ *  cope with. [TFST] markers.
+ * ============================================================ */
+
+#define TFST_CHUNK (16u * 1024u)    /* 4 blocks/write: under the 16-block txn cap */
+
+/* Write `size` bytes of a seed+offset-derived pattern to `path`. */
+static int tfst_write(const char *path, uint32_t seed, size_t size,
+                      uint8_t *chunk) {
+    if (vfs_create(path) != VFS_OK) return -1;
+    struct vfs_file f;
+    if (vfs_open(path, &f) != VFS_OK) return -1;
+    size_t done = 0;
+    int rc = 0;
+    while (done < size) {
+        size_t this = size - done;
+        if (this > TFST_CHUNK) this = TFST_CHUNK;
+        for (size_t k = 0; k < this; k++)
+            chunk[k] = (uint8_t)(seed * 131u + (done + k) * 17u +
+                                 ((done + k) >> 8) * 7u);
+        if (vfs_write(&f, chunk, this) != (long)this) { rc = -1; break; }
+        done += this;
+    }
+    vfs_close(&f);
+    return rc;
+}
+
+/* Read `path` back and verify the pattern. Returns 0 on a perfect match. */
+static int tfst_verify(const char *path, uint32_t seed, size_t size,
+                       uint8_t *chunk) {
+    struct vfs_file f;
+    if (vfs_open(path, &f) != VFS_OK) return -1;
+    size_t done = 0;
+    int rc = 0;
+    while (done < size) {
+        size_t this = size - done;
+        if (this > TFST_CHUNK) this = TFST_CHUNK;
+        if (vfs_read(&f, chunk, this) != (long)this) { rc = -1; break; }
+        for (size_t k = 0; k < this; k++)
+            if (chunk[k] != (uint8_t)(seed * 131u + (done + k) * 17u +
+                                      ((done + k) >> 8) * 7u)) { rc = -1; break; }
+        if (rc) break;
+        done += this;
+    }
+    vfs_close(&f);
+    return rc;
+}
+
+static void tfst_path(char *buf, int slot) {
+    const char *base = "/tfst/f";
+    int i = 0;
+    while (base[i]) { buf[i] = base[i]; i++; }
+    char num[12]; int j = 0; int n = slot;
+    if (n == 0) num[j++] = '0';
+    while (n > 0) { num[j++] = (char)('0' + n % 10); n /= 10; }
+    while (j > 0) buf[i++] = num[--j];
+    buf[i] = 0;
+}
+
+/* Create `name` under /tfst with a crash injected at `phase`, then model a
+ * power loss (drop the cache) and remount (which recovers). Returns true
+ * if the post-recovery filesystem is non-FATAL consistent. */
+static bool tfst_crash_create(struct blk_dev *dev, const char *mp,
+                              const char *name, int phase) {
+    g_tfs_crash_phase = phase;
+    (void)vfs_create(name);          /* journal_commit halts at `phase` */
+    g_tfs_crash_phase = TFS_CRASH_NONE;
+    bcache_discard(dev);             /* power loss: lose the write-back cache */
+    (void)vfs_unmount(mp);
+    return tobyfs_mount(mp, dev) == VFS_OK;   /* reboot -> journal_recover */
+}
+
+int tobyfs_crash_stress_test(void) {
+    int fails = 0;
+    kprintf("[TFST] tobyfs crash-consistency + stress self-test\n");
+
+    const uint32_t test_blocks = 4096u;             /* 16 MiB */
+    const uint64_t bytes = (uint64_t)test_blocks * TFS_BLOCK_SIZE;
+    uint8_t *image = (uint8_t *)kmalloc((size_t)bytes);
+    uint8_t *chunk = (uint8_t *)kmalloc(TFST_CHUNK);
+    if (!image || !chunk) {
+        kprintf("[TFST] SKIP -- kmalloc failed\n");
+        if (image) kfree(image); if (chunk) kfree(chunk);
+        return -1;
+    }
+    memset(image, 0, (size_t)bytes);
+
+    struct tfs_ramdev r = { .buf = image, .bytes = bytes };
+    struct blk_dev dev; memset(&dev, 0, sizeof(dev));
+    dev.name = "tfs-crashstress"; dev.ops = &ramdev_ops;
+    dev.sector_count = bytes / BLK_SECTOR_SIZE; dev.priv = &r;
+    dev.class = BLK_CLASS_DISK;
+
+    const char *mp = "/tfst";
+    if (tobyfs_format(&dev) != VFS_OK ||
+        tobyfs_mount(mp, &dev) != VFS_OK) {
+        kprintf("[TFST] format/mount FAIL\n");
+        bcache_invalidate(&dev); kfree(image); kfree(chunk);
+        return -1;
+    }
+
+    /* baseline file, made durable on the device before any crash. */
+    if (tfst_write("/tfst/keep", 0x11, 8192, chunk) != 0) fails++;
+    bcache_sync(&dev);
+
+    struct vfs_stat st;
+    struct tobyfs_check chk;
+
+    /* ---- Part 1a: crash before the commit marker -> rolled back. ---- */
+    {
+        bool mounted = tfst_crash_create(&dev, mp, "/tfst/victim",
+                                         TFS_CRASH_BEFORE_COMMIT);
+        bool victim_absent = mounted && vfs_stat("/tfst/victim", &st) != VFS_OK;
+        bool keep_ok = mounted && tfst_verify("/tfst/keep", 0x11, 8192, chunk) == 0;
+        tobyfs_check_dev(&dev, &chk);
+        bool ok = victim_absent && keep_ok && chk.severity != TFS_CHECK_FATAL;
+        if (!ok) fails++;
+        kprintf("[TFST] t1 crash<commit rollback: %s "
+                "(victim_absent=%d keep_ok=%d chk_sev=%d)\n",
+                ok ? "PASS" : "FAIL", victim_absent, keep_ok, chk.severity);
+    }
+
+    /* ---- Part 1b: crash after the commit marker -> replayed. ---- */
+    {
+        bcache_sync(&dev);            /* current consistent state -> device */
+        bool mounted = tfst_crash_create(&dev, mp, "/tfst/survivor",
+                                         TFS_CRASH_AFTER_COMMIT);
+        bool survivor_present = mounted && vfs_stat("/tfst/survivor", &st) == VFS_OK;
+        bool keep_ok = mounted && tfst_verify("/tfst/keep", 0x11, 8192, chunk) == 0;
+        tobyfs_check_dev(&dev, &chk);
+        bool ok = survivor_present && keep_ok && chk.severity != TFS_CHECK_FATAL;
+        if (!ok) fails++;
+        kprintf("[TFST] t2 crash>commit replay: %s "
+                "(survivor_present=%d keep_ok=%d chk_sev=%d)\n",
+                ok ? "PASS" : "FAIL", survivor_present, keep_ok, chk.severity);
+    }
+
+    /* ---- Part 2a: a 4.5 MiB file exercises the double-indirect path. ---- */
+    {
+        const size_t big = 4608u * 1024u;          /* 4.5 MiB > 4.06 MiB */
+        bool ok = tfst_write("/tfst/big", 0xC3, big, chunk) == 0 &&
+                  tfst_verify("/tfst/big", 0xC3, big, chunk) == 0;
+        (void)vfs_unlink("/tfst/big");             /* free the space again */
+        if (!ok) fails++;
+        kprintf("[TFST] t3 double-indirect 4.5 MiB write/verify: %s\n",
+                ok ? "PASS" : "FAIL");
+    }
+
+    /* ---- Part 2b: random churn with content + integrity verification. ---- */
+    {
+        enum { NFILES = 24, ITERS = 80 };
+        struct { int live; uint32_t seed; size_t size; } f[NFILES];
+        for (int i = 0; i < NFILES; i++) f[i].live = 0;
+        size_t live_bytes = 0;
+        const size_t budget = 9u * 1024 * 1024;    /* keep well under volume */
+        uint32_t rng = 0x9e3779b9u;
+        int verified = 0, did = 0, bad = 0;
+
+        for (int it = 0; it < ITERS; it++) {
+            rng = rng * 1664525u + 1013904223u; uint32_t roll = rng % 100;
+            rng = rng * 1664525u + 1013904223u; int slot = (int)(rng % NFILES);
+            char path[40]; tfst_path(path, slot);
+
+            if (!f[slot].live && roll < 60) {
+                rng = rng * 1664525u + 1013904223u;
+                size_t sz = (roll < 45)
+                    ? 4096u + (rng % (60u * 1024))            /* small */
+                    : 64u * 1024 + (rng % (2u * 1024 * 1024));/* indirect */
+                if (live_bytes + sz > budget) continue;
+                if (tfst_write(path, (uint32_t)(slot * 7 + it + 1), sz, chunk) == 0 &&
+                    tfst_verify(path, (uint32_t)(slot * 7 + it + 1), sz, chunk) == 0) {
+                    f[slot].live = 1; f[slot].seed = (uint32_t)(slot * 7 + it + 1);
+                    f[slot].size = sz; live_bytes += sz; verified++;
+                } else bad++;
+                did++;
+            } else if (f[slot].live && roll < 80) {
+                /* rewrite: unlink + recreate at a new size/seed */
+                (void)vfs_unlink(path); live_bytes -= f[slot].size; f[slot].live = 0;
+                rng = rng * 1664525u + 1013904223u;
+                size_t sz = 4096u + (rng % (128u * 1024));
+                if (live_bytes + sz > budget) { did++; continue; }
+                if (tfst_write(path, (uint32_t)(slot * 13 + it + 3), sz, chunk) == 0 &&
+                    tfst_verify(path, (uint32_t)(slot * 13 + it + 3), sz, chunk) == 0) {
+                    f[slot].live = 1; f[slot].seed = (uint32_t)(slot * 13 + it + 3);
+                    f[slot].size = sz; live_bytes += sz; verified++;
+                } else bad++;
+                did++;
+            } else if (f[slot].live) {
+                (void)vfs_unlink(path); live_bytes -= f[slot].size; f[slot].live = 0;
+                did++;
+            }
+
+            if ((it & 15) == 15) {
+                tobyfs_check_dev(&dev, &chk);
+                if (chk.severity == TFS_CHECK_FATAL) { bad++; break; }
+            }
+        }
+
+        /* Re-verify every surviving file end-to-end. */
+        int survivors = 0;
+        for (int i = 0; i < NFILES; i++) {
+            if (!f[i].live) continue;
+            char path[40]; tfst_path(path, i);
+            if (tfst_verify(path, f[i].seed, f[i].size, chunk) != 0) bad++;
+            else survivors++;
+        }
+        tobyfs_check_dev(&dev, &chk);
+        bool ok = (bad == 0) && chk.severity != TFS_CHECK_FATAL;
+        if (!ok) fails++;
+        kprintf("[TFST] t4 churn %d ops (%d writes verified, %d survivors): %s "
+                "(bad=%d final_chk_sev=%d used=%u/%u blocks)\n",
+                did, verified, survivors, ok ? "PASS" : "FAIL", bad, chk.severity,
+                chk.data_blocks_used, chk.data_blocks_total);
+    }
+
+    (void)vfs_unmount(mp);
+    bcache_invalidate(&dev);          /* drop cache keyed to the stack dev */
+    kfree(image);
+    kfree(chunk);
+    kprintf("[TFST] %s (%d failure(s))\n", fails == 0 ? "PASS" : "FAIL", fails);
+    return fails == 0 ? 0 : -1;
 }

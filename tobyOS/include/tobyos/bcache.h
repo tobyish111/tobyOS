@@ -24,8 +24,13 @@ void bcache_release(struct blk_dev *dev, uint64_t block_lba);
 /* Flush all dirty blocks for a device (or all devices if dev is NULL). */
 void bcache_sync(struct blk_dev *dev);
 
-/* Invalidate all cache entries for a device. */
+/* Invalidate all cache entries for a device (flushes dirty blocks first). */
 void bcache_invalidate(struct blk_dev *dev);
+
+/* Drop all cache entries for a device WITHOUT flushing dirty blocks --
+ * i.e. discard not-yet-written-back data. Models a power loss (the
+ * write-back cache is volatile). Used by the FS crash-consistency tests. */
+void bcache_discard(struct blk_dev *dev);
 
 /* Statistics for diagnostics. */
 void bcache_stats(uint64_t *hits, uint64_t *misses, uint64_t *evictions);

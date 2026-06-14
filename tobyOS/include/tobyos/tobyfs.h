@@ -252,4 +252,13 @@ int tobyfs_check_mounted(void *mount_data, struct tobyfs_check *out);
 int tobyfs_self_test(struct tobyfs_check *clean_out,
                      struct tobyfs_check *bad_out);
 
+/* Crash-consistency + stress harness. Injects a power loss at each journal
+ * phase of an operation and proves remount+recovery is atomic (rollback /
+ * replay), then churns the filesystem with hundreds of mixed operations
+ * (incl. a double-indirect 4.5 MiB file) verifying every byte and running
+ * the integrity checker throughout. Returns 0 on all-pass. Emits [TFST]
+ * markers. Self-contained ramdev. Called from kernel.c under
+ * -DTOBYFS_STRESS_SELFTEST. */
+int tobyfs_crash_stress_test(void);
+
 #endif /* TOBYOS_TOBYFS_H */

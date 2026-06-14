@@ -2474,6 +2474,12 @@ void _start(void) {
      * all work, and user_load_and_run() can be passed VFS paths. */
     initrd_init();
     procfs_init();   /* Phase 1 M1.5: mount /proc virtual filesystem */
+#ifdef TOBYFS_STRESS_SELFTEST
+    /* Opt-in: TobyFS crash-consistency + stress harness (needs the VFS
+     * mount table, hence after initrd_init). Journal rollback/replay under
+     * injected power loss, then a churn + integrity stress run. */
+    { extern int tobyfs_crash_stress_test(void); tobyfs_crash_stress_test(); }
+#endif
     /* Milestone 28D: latch safe-mode state right after the initrd is
      * mounted (so /etc/safemode_now is readable) but BEFORE any
      * optional subsystem inits. From here on, safemode_active() is

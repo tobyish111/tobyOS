@@ -173,6 +173,19 @@ void bcache_invalidate(struct blk_dev *dev) {
     spin_unlock_irqrestore(&g_lock, flags);
 }
 
+void bcache_discard(struct blk_dev *dev) {
+    uint64_t flags = spin_lock_irqsave(&g_lock);
+    for (uint32_t i = 0; i < BCACHE_MAX_ENTRIES; i++) {
+        struct bcache_entry *e = &g_cache[i];
+        if (!e->valid) continue;
+        if (dev && e->dev != dev) continue;
+        e->dirty    = false;          /* drop without writing back */
+        e->valid    = false;
+        e->refcount = 0;
+    }
+    spin_unlock_irqrestore(&g_lock, flags);
+}
+
 void bcache_stats(uint64_t *hits, uint64_t *misses, uint64_t *evictions) {
     uint64_t flags = spin_lock_irqsave(&g_lock);
     if (hits)      *hits      = g_hits;
