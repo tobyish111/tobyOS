@@ -29,6 +29,10 @@ struct __attribute__((packed)) icmpv6_hdr {
 #define ND_PREFIX_FLAG_ONLINK 0x80   /* L: prefix is on-link            */
 #define ND_PREFIX_FLAG_AUTO   0x40   /* A: usable for SLAAC autoconfig  */
 
+/* Router Advertisement flag bits (byte 5 of the RA message) */
+#define ND_RA_FLAG_MANAGED    0x80   /* M: use stateful DHCPv6 for addresses */
+#define ND_RA_FLAG_OTHER      0x40   /* O: use DHCPv6 for other config (DNS)  */
+
 void icmpv6_init(void);
 void icmpv6_recv(const struct ipv6_addr *src, const struct ipv6_addr *dst,
                  const void *payload, size_t len);

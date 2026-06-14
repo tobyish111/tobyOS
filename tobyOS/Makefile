@@ -163,6 +163,7 @@ C_SRCS := src/kernel.c \
           src/icmp.c \
           src/ipv6.c \
           src/icmpv6.c \
+          src/dhcpv6.c \
           src/udp.c \
           src/dhcp.c \
           src/dns.c \

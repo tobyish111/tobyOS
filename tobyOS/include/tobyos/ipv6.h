@@ -72,4 +72,15 @@ bool ipv6_have_global(void);
 /* The default router (RA source), or NULL if none learned. */
 const struct ipv6_addr *ipv6_default_router(void);
 
+/* ---- DHCPv6 (stateful) ----
+ *
+ * Install a server-assigned global address from a DHCPv6 REPLY (the
+ * default router still comes from the RA, not DHCPv6). The address is
+ * accepted as "for us" in inbound delivery, alongside the link-local and
+ * any SLAAC global. */
+void ipv6_dhcp6_configure(const struct ipv6_addr *addr);
+const struct ipv6_addr *ipv6_dhcp6_addr(void);
+bool ipv6_have_dhcp6(void);
+void ipv6_dhcp6_reset_for_test(void);   /* self-test only: drop the lease */
+
 #endif /* TOBYOS_IPV6_H */

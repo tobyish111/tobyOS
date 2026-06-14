@@ -9,6 +9,7 @@
 
 #include <tobyos/ipv6.h>
 #include <tobyos/icmpv6.h>
+#include <tobyos/dhcpv6.h>
 #include <tobyos/eth.h>
 #include <tobyos/net.h>
 #include <tobyos/printk.h>
@@ -40,6 +41,10 @@ static struct ipv6_addr g_global;          /* autoconfigured global address */
 static bool             g_have_global;
 static struct ipv6_addr g_router;          /* default router (RA source)    */
 static bool             g_have_router;
+
+/* DHCPv6 state (set by the stateful client when the RA M flag is seen). */
+static struct ipv6_addr g_dhcp6;           /* server-assigned global address */
+static bool             g_have_dhcp6;
 
 /* ---- address utilities ------------------------------------------ */
 
@@ -213,6 +218,30 @@ const struct ipv6_addr *ipv6_default_router(void) {
     return g_have_router ? &g_router : 0;
 }
 
+/* ---- DHCPv6 (stateful) ------------------------------------------- */
+
+void ipv6_dhcp6_configure(const struct ipv6_addr *addr) {
+    bool changed = !g_have_dhcp6 || !ipv6_addr_equal(addr, &g_dhcp6);
+    g_dhcp6      = *addr;
+    g_have_dhcp6 = true;
+    if (changed) {
+        char buf[40];
+        ipv6_format(buf, sizeof(buf), &g_dhcp6);
+        kprintf("[ipv6] DHCPv6 address %s\n", buf);
+    }
+}
+
+const struct ipv6_addr *ipv6_dhcp6_addr(void) {
+    return g_have_dhcp6 ? &g_dhcp6 : 0;
+}
+
+bool ipv6_have_dhcp6(void) { return g_have_dhcp6; }
+
+void ipv6_dhcp6_reset_for_test(void) {
+    g_have_dhcp6 = false;
+    memset(&g_dhcp6, 0, sizeof(g_dhcp6));
+}
+
 /* ---- receive ----------------------------------------------------- */
 
 /* True if this datagram is addressed to us. */
@@ -221,13 +250,18 @@ static bool ipv6_dst_is_for_us(const struct ipv6_addr *dst) {
     if (ipv6_addr_equal(dst, &ipv6_addr_all_nodes)) return true;
     if (ipv6_addr_equal(dst, &ipv6_addr_loopback)) return true;
     if (g_have_global && ipv6_addr_equal(dst, &g_global)) return true;
+    if (g_have_dhcp6 && ipv6_addr_equal(dst, &g_dhcp6)) return true;
 
-    /* Solicited-node multicast for our link-local (and global, if any) */
+    /* Solicited-node multicast for each of our addresses. */
     struct ipv6_addr sn;
     ipv6_make_solicited_node(&sn, &g_linklocal);
     if (ipv6_addr_equal(dst, &sn)) return true;
     if (g_have_global) {
         ipv6_make_solicited_node(&sn, &g_global);
+        if (ipv6_addr_equal(dst, &sn)) return true;
+    }
+    if (g_have_dhcp6) {
+        ipv6_make_solicited_node(&sn, &g_dhcp6);
         if (ipv6_addr_equal(dst, &sn)) return true;
     }
 
@@ -256,9 +290,18 @@ void ipv6_recv(const void *frame, size_t len) {
     case IPV6_NH_ICMPV6:
         icmpv6_recv(&h->src, &h->dst, payload, plen);
         break;
+    case IPV6_NH_UDP: {
+        /* Minimal UDP-over-IPv6 demux: only the DHCPv6 client port (546)
+         * is consumed in-kernel today. Header = src(2) dst(2) len(2) cks(2). */
+        if (plen < 8) break;
+        uint16_t dport = ((uint16_t)payload[2] << 8) | payload[3];
+        uint16_t ulen  = ((uint16_t)payload[4] << 8) | payload[5];
+        if (dport == 546 && ulen >= 8 && (size_t)ulen <= plen)
+            dhcpv6_recv(&h->src, payload + 8, (size_t)ulen - 8);
+        break;
+    }
     case IPV6_NH_TCP:
-    case IPV6_NH_UDP:
-        /* Future: demux to TCP/UDP-over-IPv6 */
+        /* Future: TCP-over-IPv6 */
         break;
     default:
         break;

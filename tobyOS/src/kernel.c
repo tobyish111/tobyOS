@@ -3383,6 +3383,11 @@ void _start(void) {
 #ifdef SLAAC_SELFTEST
             icmpv6_slaac_selftest();
 #endif
+#ifdef DHCPV6_SELFTEST
+            /* Opt-in: stateful DHCPv6 client self-test (QEMU SLIRP has no
+             * DHCPv6 server, so we drive synthetic ADVERTISE/REPLY msgs). */
+            { extern int dhcpv6_self_test(void); dhcpv6_self_test(); }
+#endif
             tcp_echo_init();
             tcp_shell_init();
             ssh_init();

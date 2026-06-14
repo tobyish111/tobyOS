@@ -11,6 +11,7 @@
 
 #include <tobyos/icmpv6.h>
 #include <tobyos/ipv6.h>
+#include <tobyos/dhcpv6.h>
 #include <tobyos/eth.h>
 #include <tobyos/net.h>
 #include <tobyos/printk.h>
@@ -184,6 +185,18 @@ static void handle_router_advert(const struct ipv6_addr *src,
     /* Fixed RA part is 16 bytes (4 hdr + cur_hop + flags + lifetime +
      * reachable + retrans); options follow. */
     if (len < 16) return;
+
+    /* Byte 5 carries the M (Managed) / O (Other) flags. M => obtain the
+     * address from a DHCPv6 server (stateful); O (without M) => addresses
+     * via SLAAC but other config (DNS) via DHCPv6 INFORMATION-REQUEST. We
+     * kick the DHCPv6 client off here; SLAAC below still runs in parallel
+     * (a host may use both). */
+    uint8_t ra_flags = payload[5];
+    if (ra_flags & ND_RA_FLAG_MANAGED) {
+        dhcpv6_start(true);
+    } else if (ra_flags & ND_RA_FLAG_OTHER) {
+        dhcpv6_start(false);
+    }
 
     /* Walk options looking for Prefix Information (and an optional source
      * link-layer address we can cache for the router). */
