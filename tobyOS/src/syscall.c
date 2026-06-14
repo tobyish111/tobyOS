@@ -2863,9 +2863,9 @@ enum {
     LX_getcwd = 79, LX_chdir = 80, LX_mkdir = 83, LX_unlink = 87,
     LX_getuid = 102, LX_getgid = 104, LX_geteuid = 107, LX_getegid = 108,
     LX_getppid = 110, LX_arch_prctl = 158, LX_gettid = 186,
-    LX_futex = 202, LX_set_tid_address = 218, LX_clock_gettime = 228,
-    LX_exit_group = 231, LX_newfstatat = 262, LX_set_robust_list = 273,
-    LX_getrandom = 318,
+    LX_futex = 202, LX_getdents64 = 217, LX_set_tid_address = 218,
+    LX_clock_gettime = 228, LX_exit_group = 231, LX_openat = 257,
+    LX_newfstatat = 262, LX_set_robust_list = 273, LX_getrandom = 318,
 };
 
 /* arch_prctl codes. */
@@ -2934,6 +2934,39 @@ static uint32_t lx_mmap_flags(uint32_t lf) {
     return tf;
 }
 
+/* Linux struct linux_dirent64 (getdents64). The byte layout is ABI; d_name
+ * is oversized so any 8-aligned d_reclen we compute fits in this local copy. */
+struct lx_dirent64 {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[VFS_NAME_MAX + 16];
+} __attribute__((packed));
+#define LX_DT_DIR  4
+#define LX_DT_REG  8
+
+/* Open a directory as a Linux getdents64-capable fd (FILE_KIND_DIR). tobyOS
+ * has no native directory fd, so we just remember the path; getdents64
+ * re-opens via vfs_opendir and resumes after dir_off entries. */
+static long linux_open_dir(const char *kpath) {
+    struct vfs_dir probe;
+    if (vfs_opendir(kpath, &probe) != VFS_OK) return -ABI_ENOENT;
+    vfs_closedir(&probe);
+    struct file *f = (struct file *)kmalloc(sizeof *f);
+    if (!f) return -ABI_ENOMEM;
+    memset(f, 0, sizeof *f);
+    f->kind = FILE_KIND_DIR;
+    size_t n = strlen(kpath) + 1;
+    f->dirpath = (char *)kmalloc(n);
+    if (!f->dirpath) { kfree(f); return -ABI_ENOMEM; }
+    memcpy(f->dirpath, kpath, n);
+    f->dir_off = 0;
+    int fd = fd_alloc_into(current_proc(), f);
+    if (fd < 0) { kfree(f->dirpath); kfree(f); return -ABI_EMFILE; }
+    return fd;
+}
+
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     switch (n) {
     /* ---- exits ---- */
@@ -2947,7 +2980,28 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_write:  return sys_write((int)a1, (const void *)a2, (size_t)a3);
     case LX_close:  return do_syscall(SYS_CLOSE, a1, 0, 0, 0, 0);
     case LX_lseek:  return do_syscall(SYS_LSEEK, a1, a2, a3, 0, 0);
-    case LX_open:   return do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);
+    case LX_open: {                    /* (path, flags, mode) */
+        /* Opening a directory yields a getdents64-capable dir fd; files
+         * fall through to the normal VFS open. */
+        char kpath[ABI_PATH_MAX];
+        if (resolve_user_path((const char *)a1, kpath, sizeof kpath) == 0) {
+            struct vfs_stat vs;
+            if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR)
+                return linux_open_dir(kpath);
+        }
+        return do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);
+    }
+    case LX_openat: {                  /* (dirfd, path, flags, mode) */
+        /* AT_FDCWD / absolute paths only (busybox uses these); a real
+         * dirfd-relative open is out of scope for B3. */
+        char kpath[ABI_PATH_MAX];
+        if (resolve_user_path((const char *)a2, kpath, sizeof kpath) == 0) {
+            struct vfs_stat vs;
+            if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR)
+                return linux_open_dir(kpath);
+        }
+        return do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
+    }
     case LX_dup:    return do_syscall(SYS_DUP, a1, 0, 0, 0, 0);
     case LX_pipe:   return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
     case LX_getcwd: return do_syscall(SYS_GETCWD, a1, a2, 0, 0, 0);
@@ -2996,7 +3050,10 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         struct file *f = fd_lookup((int)a1);
         if (!f) return -ABI_EBADF;
         struct vfs_stat vs;
-        if (f->kind == FILE_KIND_VFS) {
+        if (f->kind == FILE_KIND_DIR && f->dirpath) {
+            if (vfs_stat(f->dirpath, &vs) != VFS_OK)
+                vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
+        } else if (f->kind == FILE_KIND_VFS) {
             vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
                                     .uid = f->vfs.uid, .gid = f->vfs.gid,
                                     .mode = f->vfs.mode };
@@ -3006,6 +3063,48 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
                                     .mode = 0666 };
         }
         return linux_emit_stat(&vs, (void *)a2);
+    }
+    case LX_getdents64: {              /* (fd, void *dirp, count) */
+        struct file *f = fd_lookup((int)a1);
+        if (!f) return -ABI_EBADF;
+        if (f->kind != FILE_KIND_DIR || !f->dirpath) return -ABI_ENOTDIR;
+        uint8_t *ubuf = (uint8_t *)a2;
+        size_t   cap  = (size_t)a3;
+        struct vfs_dir d;
+        if (vfs_opendir(f->dirpath, &d) != VFS_OK) return -ABI_ENOENT;
+        struct vfs_dirent ent;
+        uint32_t idx = 0, emitted = 0;
+        size_t   written = 0;
+        bool     toosmall = false;
+        /* Skip the entries already returned by earlier getdents64 calls. */
+        while (idx < f->dir_off && vfs_readdir(&d, &ent) == VFS_OK) idx++;
+        while (vfs_readdir(&d, &ent) == VFS_OK) {
+            size_t namelen = 0;
+            while (namelen < VFS_NAME_MAX && ent.name[namelen]) namelen++;
+            size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;  /* hdr=19, 8-align */
+            if (written + reclen > cap) {
+                if (written == 0) toosmall = true;   /* buffer can't hold one entry */
+                break;
+            }
+            struct lx_dirent64 de;
+            memset(&de, 0, reclen);
+            de.d_ino    = (uint64_t)(f->dir_off + emitted + 1);
+            de.d_off    = (int64_t)(f->dir_off + emitted + 1);
+            de.d_reclen = (uint16_t)reclen;
+            de.d_type   = (ent.type == VFS_TYPE_DIR) ? LX_DT_DIR : LX_DT_REG;
+            memcpy(de.d_name, ent.name, namelen);
+            de.d_name[namelen] = '\0';
+            if (copy_to_user(ubuf + written, &de, reclen) != 0) {
+                vfs_closedir(&d);
+                return -ABI_EFAULT;
+            }
+            written += reclen;
+            emitted++;
+        }
+        vfs_closedir(&d);
+        f->dir_off += emitted;
+        if (toosmall) return -ABI_EINVAL;
+        return (long)written;          /* 0 => end of directory */
     }
 
     /* ---- identities ---- */

@@ -3668,10 +3668,10 @@ void _start(void) {
         /* A battery of busybox applets that each exit 0 on success. They
          * fan out across the real-libc syscall surface: echo (writev),
          * uname (uname), pwd (getcwd), cat (open/read/fstat/close), wc
-         * (read loop), stat (stat -> Linux struct stat translation).
-         * (`ls` is deferred to B3 -- it needs getdents64 + a directory-fd
-         * abstraction tobyOS doesn't have yet.) Any [linux] unhandled
-         * syscall is logged with its number so gaps are self-identifying. */
+         * (read loop), stat (stat -> Linux struct stat translation), and
+         * ls / ls -la (B3: opendir+getdents64 directory fd + per-entry
+         * lstat). Any [linux] unhandled syscall is logged with its number
+         * so gaps are self-identifying. */
         static char *bb[][4] = {
             { (char *)"busybox", (char *)"echo",
               (char *)"hello from busybox (musl libc) on tobyOS", 0 },
@@ -3681,11 +3681,13 @@ void _start(void) {
             { (char *)"busybox", (char *)"cat",   (char *)"/etc/motd", 0 },
             { (char *)"busybox", (char *)"wc",    (char *)"/etc/motd", 0 },
             { (char *)"busybox", (char *)"stat",  (char *)"/etc/motd", 0 },
+            { (char *)"busybox", (char *)"ls",    (char *)"/bin", 0 },
+            { (char *)"busybox", (char *)"ls",    (char *)"-la", (char *)"/bin" },
         };
         int n = (int)(sizeof(bb) / sizeof(bb[0]));
         int npass = 0, nrun = 0;
         for (int t = 0; t < n; t++) {
-            char *argv[4]; int ac = 0;
+            char *argv[5]; int ac = 0;
             for (int i = 0; i < 4 && bb[t][i]; i++) argv[ac++] = bb[t][i];
             argv[ac] = 0;
             char *envp[] = { (char *)"PATH=/bin", 0 };

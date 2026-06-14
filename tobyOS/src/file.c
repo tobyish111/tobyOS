@@ -126,6 +126,17 @@ struct file *file_clone(struct file *src) {
          * sharing across fork. */
         kfree(f);
         return 0;
+    case FILE_KIND_DIR:
+        /* Deep-copy the directory path so each clone owns its own buffer
+         * (avoids a double-free on close); resume offset carries over. */
+        if (src->dirpath) {
+            size_t n = strlen(src->dirpath) + 1;
+            f->dirpath = (char *)kmalloc(n);
+            if (!f->dirpath) { kfree(f); return 0; }
+            memcpy(f->dirpath, src->dirpath, n);
+        }
+        f->dir_off = src->dir_off;
+        break;
     }
     return f;
 }
@@ -163,6 +174,9 @@ void file_close(struct file *f) {
         break;
     case FILE_KIND_TERM:
         term_session_close(f->term);
+        break;
+    case FILE_KIND_DIR:
+        if (f->dirpath) kfree(f->dirpath);
         break;
     case FILE_KIND_CONSOLE:
     case FILE_KIND_NULL:

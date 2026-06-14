@@ -56,6 +56,11 @@ enum file_kind {
     FILE_KIND_SOCKET  = 5,
     FILE_KIND_WINDOW  = 6,
     FILE_KIND_TERM    = 7,
+    /* Track B/B3: a directory opened by a Linux process for getdents64.
+     * tobyOS has no native directory-fd, so this kind just remembers the
+     * path; getdents64 re-opens it via vfs_opendir and resumes after
+     * dir_off entries (see linux_syscall in syscall.c). */
+    FILE_KIND_DIR     = 8,
 };
 
 struct file {
@@ -76,6 +81,11 @@ struct file {
     struct window  *win;
     /* For TERM (milestone 13). */
     struct term_session *term;
+    /* For FILE_KIND_DIR (Track B/B3 getdents64): kmalloc'd absolute path
+     * of the directory + how many entries have already been returned, so
+     * each getdents64 re-opens and resumes. */
+    char           *dirpath;
+    uint32_t        dir_off;
 };
 
 /* Allocate + initialise the well-known console-backed file. Each call
