@@ -2827,6 +2827,239 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     }
 }
 
+/* ============================================================================
+ * Track B (foreign-binary compat) -- Linux x86-64 personality, milestone B1.
+ *
+ * A process tagged ABI_PERS_LINUX (its ELF was branded ELFOSABI_LINUX) makes
+ * `syscall` instructions using the *Linux* x86-64 ABI: Linux syscall numbers
+ * in RAX, args in RDI/RSI/RDX/R10/R8/R9. The .S trampoline already preserves
+ * that exact register convention (it was modelled on Linux), and the initial
+ * user stack we build (argc/argv/envp/auxv with AT_PHDR/AT_ENTRY/AT_BASE...)
+ * is already Linux-shaped -- so all that's left is to translate the syscall
+ * NUMBERS + a few ABI-specific semantics onto tobyOS's existing primitives.
+ *
+ * This function is that translation layer. 1:1 calls are forwarded to the
+ * native dispatcher with the tobyOS number; Linux-specific ones (arch_prctl,
+ * writev, set_tid_address, exit_group, clock_gettime, uname, ...) are handled
+ * inline. Anything not yet covered returns -ENOSYS with a log line naming the
+ * number, so a real musl/busybox binary that hits a gap tells us exactly what
+ * to implement next (milestone B2+).
+ *
+ * Scope note: this is the FIRST milestone. The set below is enough to run a
+ * static Linux binary through libc-style startup (TLS via arch_prctl, the
+ * stdio write path via writev) to exit. Signals, full mmap-backed malloc
+ * churn, fstat struct translation, openat dir semantics, and the dynamic
+ * loader path are explicitly deferred. */
+
+/* Linux x86-64 syscall numbers (arch/x86/entry/syscalls/syscall_64.tbl). */
+enum {
+    LX_read = 0, LX_write = 1, LX_open = 2, LX_close = 3,
+    LX_stat = 4, LX_fstat = 5, LX_lseek = 8, LX_mmap = 9,
+    LX_mprotect = 10, LX_munmap = 11, LX_brk = 12,
+    LX_rt_sigaction = 13, LX_rt_sigprocmask = 14, LX_ioctl = 16,
+    LX_readv = 19, LX_writev = 20, LX_access = 21, LX_pipe = 22,
+    LX_dup = 32, LX_dup2 = 33, LX_nanosleep = 35, LX_getpid = 39,
+    LX_exit = 60, LX_uname = 63, LX_fcntl = 72, LX_getcwd = 79,
+    LX_chdir = 80, LX_mkdir = 83, LX_unlink = 87,
+    LX_getuid = 102, LX_getgid = 104, LX_geteuid = 107, LX_getegid = 108,
+    LX_getppid = 110, LX_arch_prctl = 158, LX_gettid = 186,
+    LX_futex = 202, LX_set_tid_address = 218, LX_clock_gettime = 228,
+    LX_exit_group = 231, LX_set_robust_list = 273, LX_getrandom = 318,
+};
+
+/* arch_prctl codes. */
+#define LX_ARCH_SET_FS   0x1002
+#define LX_ARCH_GET_FS   0x1003
+
+/* Linux mmap flag bits (differ from tobyOS VMA_FLAG_*). */
+#define LXMAP_SHARED     0x01
+#define LXMAP_PRIVATE    0x02
+#define LXMAP_FIXED      0x10
+#define LXMAP_ANONYMOUS  0x20
+
+struct lx_iovec   { uint64_t iov_base; uint64_t iov_len; };
+struct lx_timespec{ int64_t  tv_sec;   int64_t  tv_nsec; };
+
+/* Translate a Linux mmap flags word into the tobyOS VMA flag word that
+ * sys_mmap (src/mmap.c) expects. Defaults to a private anonymous mapping
+ * (the malloc case) when neither shared nor private is asked for. */
+static uint32_t lx_mmap_flags(uint32_t lf) {
+    uint32_t tf = 0;
+    if (lf & LXMAP_ANONYMOUS) tf |= 0x01;   /* VMA_FLAG_ANON    */
+    if (lf & LXMAP_SHARED)    tf |= 0x02;   /* VMA_FLAG_SHARED  */
+    if (lf & LXMAP_PRIVATE)   tf |= 0x04;   /* VMA_FLAG_PRIVATE */
+    if (lf & LXMAP_FIXED)     tf |= 0x08;   /* VMA_FLAG_FIXED   */
+    return tf;
+}
+
+static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
+    switch (n) {
+    /* ---- exits ---- */
+    case LX_exit:
+    case LX_exit_group:
+        sys_exit((int)a1);          /* noreturn */
+        return 0;
+
+    /* ---- plain byte I/O (tobyOS handlers already take user buffers) ---- */
+    case LX_read:   return sys_read((int)a1, (void *)a2, (size_t)a3);
+    case LX_write:  return sys_write((int)a1, (const void *)a2, (size_t)a3);
+    case LX_close:  return do_syscall(SYS_CLOSE, a1, 0, 0, 0, 0);
+    case LX_lseek:  return do_syscall(SYS_LSEEK, a1, a2, a3, 0, 0);
+    case LX_open:   return do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);
+    case LX_dup:    return do_syscall(SYS_DUP, a1, 0, 0, 0, 0);
+    case LX_pipe:   return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
+    case LX_getcwd: return do_syscall(SYS_GETCWD, a1, a2, 0, 0, 0);
+    case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
+    case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
+    case LX_unlink: return do_syscall(SYS_UNLINK, a1, 0, 0, 0, 0);
+
+    /* ---- identities ---- */
+    case LX_getpid:  return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+    case LX_getppid: return do_syscall(SYS_GETPPID, 0, 0, 0, 0, 0);
+    case LX_gettid:  return do_syscall(ABI_SYS_GETTID, 0, 0, 0, 0, 0);
+    case LX_getuid:
+    case LX_geteuid: return do_syscall(SYS_GETUID, 0, 0, 0, 0, 0);
+    case LX_getgid:
+    case LX_getegid: return do_syscall(SYS_GETGID, 0, 0, 0, 0, 0);
+
+    /* ---- scatter/gather: fan out onto the byte handlers ---- */
+    case LX_writev:
+    case LX_readv: {
+        int             fd  = (int)a1;
+        const void     *uio = (const void *)a2;
+        int             cnt = (int)a3;
+        if (cnt < 0)        return -ABI_EINVAL;
+        if (cnt > 1024)     cnt = 1024;          /* IOV_MAX-ish clamp */
+        long total = 0;
+        for (int i = 0; i < cnt; i++) {
+            struct lx_iovec iov;
+            if (copy_from_user(&iov, (const uint8_t *)uio + (size_t)i * 16,
+                               sizeof iov) != 0)
+                return -ABI_EFAULT;
+            if (iov.iov_len == 0) continue;
+            long r = (n == LX_writev)
+                       ? sys_write(fd, (const void *)iov.iov_base,
+                                   (size_t)iov.iov_len)
+                       : sys_read(fd, (void *)iov.iov_base,
+                                  (size_t)iov.iov_len);
+            if (r < 0) return total ? total : r;
+            total += r;
+            if ((uint64_t)r < iov.iov_len) break;  /* short transfer */
+        }
+        return total;
+    }
+
+    /* ---- TLS setup: Linux libc startup calls arch_prctl(ARCH_SET_FS) ---- */
+    case LX_arch_prctl:
+        if ((unsigned long)a1 == LX_ARCH_SET_FS) {
+            thread_set_tls((uint64_t)a2);
+            return 0;
+        }
+        if ((unsigned long)a1 == LX_ARCH_GET_FS) {
+            struct proc *p = current_proc();
+            if (put_user_u64((void *)a2, p ? p->tls_base : 0) != 0)
+                return -ABI_EFAULT;
+            return 0;
+        }
+        return -ABI_EINVAL;
+
+    /* libc records a thread-exit futex address here; we have nothing to
+     * store for it but must return the tid (libc uses the return value). */
+    case LX_set_tid_address: {
+        struct proc *p = current_proc();
+        return p ? p->pid : 0;
+    }
+    case LX_set_robust_list:
+        return 0;
+
+    /* stdio probes the tty geometry on first write; any error just means
+     * "not a tty" -> fully buffered, which still flushes at exit. */
+    case LX_ioctl:
+        return -ABI_ENOTTY;
+
+    /* ---- memory ---- */
+    case LX_brk: {
+        struct proc *p = current_proc();
+        if (!p) return -ABI_EPERM;
+        if (a1 == 0) return (long)p->brk_cur;        /* query */
+        long r = sys_brk((uintptr_t)a1);
+        return (r < 0) ? (long)p->brk_cur : r;       /* Linux: unchanged on fail */
+    }
+    case LX_mmap:
+        return sys_mmap((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
+                        lx_mmap_flags((uint32_t)a4), (int)a5, 0);
+    case LX_munmap:
+        return do_syscall(ABI_SYS_MUNMAP, a1, a2, 0, 0, 0);
+    case LX_mprotect:
+        return do_syscall(ABI_SYS_MPROTECT, a1, a2, a3, 0, 0);
+
+    /* ---- time ---- */
+    case LX_nanosleep: {
+        struct lx_timespec ts;
+        if (!a1) return -ABI_EINVAL;
+        if (copy_from_user(&ts, (const void *)a1, sizeof ts) != 0)
+            return -ABI_EFAULT;
+        uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        return do_syscall(SYS_NANOSLEEP, (long)ns, 0, 0, 0, 0);
+    }
+    case LX_clock_gettime: {
+        long ms = do_syscall(ABI_SYS_CLOCK_MS, 0, 0, 0, 0, 0);
+        if (ms < 0) ms = 0;
+        struct lx_timespec ts = { ms / 1000, (ms % 1000) * 1000000 };
+        if (a2 && copy_to_user((void *)a2, &ts, sizeof ts) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
+
+    /* ---- misc ---- */
+    case LX_uname: {
+        /* struct utsname: 6 x 65-byte NUL-padded fields. */
+        char u[6 * 65];
+        memset(u, 0, sizeof u);
+        const char *vals[6] = { "Linux", "tobyos", "5.0.0-tobyos",
+                                "#1 tobyOS Linux-ABI", "x86_64", "(none)" };
+        for (int i = 0; i < 6; i++) {
+            size_t l = strlen(vals[i]);
+            memcpy(u + i * 65, vals[i], l);
+        }
+        if (a1 && copy_to_user((void *)a1, u, sizeof u) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
+    case LX_getrandom: {
+        /* Best-effort: zero-fill (deterministic). Real entropy is B2. */
+        size_t len = (size_t)a2;
+        if (len > 256) len = 256;
+        char z[256]; memset(z, 0, len);
+        if (a1 && len && copy_to_user((void *)a1, z, len) != 0)
+            return -ABI_EFAULT;
+        return (long)len;
+    }
+
+    /* Signals: accepted but not yet wired to the native signal layer
+     * (the Linux struct sigaction / sigset layouts differ -- B2). Return
+     * success so libc startup that installs handlers doesn't abort. */
+    case LX_rt_sigaction:
+    case LX_rt_sigprocmask:
+        return 0;
+
+    /* Futex: forward only the FUTEX_WAIT/WAKE low ops; private flag and
+     * timeouts are ignored for now (single-threaded statics don't block
+     * here). */
+    case LX_futex:
+        return futex((uint32_t *)(uintptr_t)a1, (int)(a2 & 0x7f), (uint32_t)a3);
+
+    case LX_access:
+        return -ABI_ENOENT;     /* conservative: report "not there" */
+
+    default:
+        kprintf("[linux] unhandled syscall %ld (a1=0x%lx a2=0x%lx) -> -ENOSYS "
+                "(implement in linux_syscall, milestone B2)\n",
+                n, (unsigned long)a1, (unsigned long)a2);
+        return -ABI_ENOSYS;
+    }
+}
+
 long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Milestone 26E: re-enable interrupts inside the syscall body.
      *
@@ -2903,7 +3136,12 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
              (unsigned long)a1, (unsigned long)a2);
     }
 
-    long rv = do_syscall(num, a1, a2, a3, a4, a5);
+    /* Track B: a process branded ABI_PERS_LINUX speaks the Linux x86-64
+     * syscall ABI -- route its `num` through the translation layer. The
+     * native path (the common case) is completely unchanged. */
+    long rv = (caller && caller->personality == ABI_PERS_LINUX)
+                  ? linux_syscall(num, a1, a2, a3, a4, a5)
+                  : do_syscall(num, a1, a2, a3, a4, a5);
 
     perf_syscall_exit((int)num, t_sys);
     perf_zone_end(PERF_Z_SYSCALL, t_sys);

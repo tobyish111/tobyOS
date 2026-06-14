@@ -89,6 +89,14 @@ struct proc {
     enum proc_state state;
     int             exit_code;
 
+    /* Track B (foreign-binary compat): which syscall ABI this process
+     * speaks. ABI_PERS_TOBY (0, the zero-init default) routes `syscall`
+     * through the native tobyOS dispatcher; ABI_PERS_LINUX routes it
+     * through the Linux x86-64 translation layer. Latched at ELF load
+     * from e_ident[EI_OSABI] and inherited across fork (CoW copies the
+     * whole PCB) -- execve re-latches it from the new image. */
+    int             personality;
+
     /* Address space. For pid 0 (kernel_main) cr3 == kernel PML4 and
      * owns_pml4 is false (we never destroy the kernel PML4). */
     uint64_t        cr3;

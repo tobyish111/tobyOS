@@ -44,6 +44,14 @@ typedef uint64_t Elf64_Xword;
 #define EI_CLASS   4
 #define EI_DATA    5
 #define EI_VERSION 6
+#define EI_OSABI   7        /* target OS/ABI -- selects the process personality */
+
+/* EI_OSABI values we care about. SysV(0) is what our own toolchain emits
+ * for native binaries; LINUX(3) (== GNU) is the FreeBSD-style "brandelf"
+ * tag that opts a binary into the Linux x86-64 syscall ABI. */
+#define ELFOSABI_SYSV   0
+#define ELFOSABI_LINUX  3
+#define ELFOSABI_GNU    3
 
 #define ELFMAG0    0x7f
 #define ELFMAG1    'E'
@@ -230,6 +238,7 @@ struct elf_load_info {
     uint16_t phnum;
     uint16_t phent;
     bool     has_interp;
+    uint8_t  osabi;        /* e_ident[EI_OSABI] -- drives ABI personality */
 };
 
 bool elf_load_user_at(const void *image, size_t size, uint64_t load_base,

@@ -50,7 +50,7 @@ honest number.
 | Security | ~8% | ~19% | **SA_SIGINFO 3-arg handlers** (siginfo_t + ucontext on the user stack) and **TTY job-control keys** (Ctrl-Z->SIGTSTP / Ctrl-\->SIGQUIT, completing Ctrl-C->SIGINT). **Per-copy uaccess accessors** (Linux-style `copy_*_user`; the whole-syscall SMAP window is gone, so a stray kernel user-deref now faults under SMAP) -- validated end-to-end under hardware `+smap`. **SA_RESTART + job control (SIGSTOP/SIGCONT, PROC_STOPPED) now work**, signals reach CPU-bound procs on APs (LAPIC-tick delivery), and the SA_* flag ABI is Linux-aligned. Login auth now **salted Argon2id** (monocypher, 16-byte random salt, m=1 MiB/t=3, constant-time compare); legacy djb2 hashes self-upgrade on next login. **Login lockout** (5 fails → 30 s) blunts brute force/enumeration. **Real user-space signal delivery** works (kernel pushes a signal frame + sigreturn restores context; verified by `/bin/sigtest`). **SMAP re-enabled** behind a syscall-wide stac/clac uaccess window + wrapped loader/argv; validated under QEMU `+smap` (full desktop + sigtest, no #PF). ASLR/NX/SMEP on. Caps + sandbox + HMAC package signing. |
 | Power / ACPI | ~6% | ~9% | **RTC driver** → real wall-clock time. ACPI shutdown + partial S3/S4 framework. No full AML power management. |
 | Audio / Media | ~15% | ~15% | Intel HDA + software mixer + decode helpers. Unchanged this round. |
-| App Compatibility | ~2% | ~5% | POSIX libc filled in (`signal.h`, `fork`, `symlink`/`readlink`, real `getuid/gid`, `wait`, `access`). **SSE/FP now enabled** (CR0/CR4 + FXSAVE/FXRSTOR FPU context switch), so floating-point programs run; **libc printf gained `%f`/`%e`/`%g`**; user stack 32 KiB→256 KiB. Marquee ports (lua/make/less/curl/tcc/as) **now actually ship in the initrd** (were built but omitted from the tar). **Lua interpreter runs real scripts** (`/bin/lua`, verified by `/etc/lua_selftest.lua`). Still own-ELF-only; **zero** Win32/.NET/UWP. |
+| App Compatibility | ~2% | ~7% | POSIX libc filled in (`signal.h`, `fork`, `symlink`/`readlink`, real `getuid/gid`, `wait`, `access`). **SSE/FP now enabled** (CR0/CR4 + FXSAVE/FXRSTOR FPU context switch), so floating-point programs run; **libc printf gained `%f`/`%e`/`%g`**; user stack 32 KiB→256 KiB. Marquee ports (lua/make/less/curl/tcc/as) **now actually ship in the initrd** (were built but omitted from the tar). **Lua interpreter runs real scripts** (`/bin/lua`, verified by `/etc/lua_selftest.lua`). **Foreign-binary compat (Track B, milestone B1, 2026-06-14): tobyOS now runs an UNMODIFIED Linux x86-64 binary.** A per-process ABI **personality** (`struct proc.personality`) is latched at ELF load from `e_ident[EI_OSABI]` — a binary branded `ELFOSABI_LINUX` (the standard FreeBSD-style `brandelf` tag; the binary's code is byte-for-byte untouched) runs under `ABI_PERS_LINUX`, and `syscall_dispatch` routes its `syscall`s through a new **Linux→tobyOS translation layer** (`linux_syscall()` in `src/syscall.c`). This leverages infra that was already Linux-shaped: the SYSCALL entry path already uses the exact Linux register ABI (`rax`=nr, args `rdi/rsi/rdx/r10/r8/r9`), the initial user stack is already Linux-auxv-shaped, and TLS is already via `MSR_FS_BASE`. Proven by `/bin/linux-hello` — a genuine Linux static ELF (raw Linux syscalls, no libc) that the kernel runs through libc-style startup: **`arch_prctl(ARCH_SET_FS)` TLS (verified via `%fs:0`), `write`+`writev` to stdout, `exit_group(42)`** — `[LXABI] VERDICT: PASS` clean under default boot AND hardware `+smep+smap` (0 faults). Translated set covers the common static-binary surface (read/write/writev/readv, open/close/lseek, mmap/munmap/mprotect/brk, arch_prctl, set_tid_address, ioctl→ENOTTY, nanosleep/clock_gettime, uname, getpid/uid/gid…); unimplemented numbers log `[linux] unhandled syscall N` + return `-ENOSYS` so the next gap is self-identifying. Still **B1-scoped**: real musl/glibc + `busybox-static`, signals, AT_RANDOM, fstat struct translation, and the dynamic loader (`ld.so`) are B2. Still **zero** Win32/.NET/UWP. |
 
 ---
 
@@ -84,7 +84,10 @@ driver model; POSIX libc surface.
 
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
-2. **App compatibility (~3%)** — no Win32/POSIX-compat runtime → no software ecosystem.
+2. **App compatibility (~7%)** — still no Win32/.NET/UWP. **Linux x86-64 binary compat started
+   (Track B, B1, 2026-06-14):** a process ABI personality + Linux→tobyOS syscall translation runs
+   an unmodified (brandelf'd) Linux static ELF (`/bin/linux-hello`, `[LXABI] PASS`). Next: real
+   musl/`busybox-static` (B2), then signals + the dynamic loader. Still ecosystem-scale overall.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
    code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
    on top of the per-CPU TSS/GS/current_proc foundation. The pid 0 ↔ login interaction bit
@@ -168,6 +171,29 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-14** — **Foreign-binary compatibility, Track B milestone B1: run an unmodified Linux
+  x86-64 binary.** Gap #2 (app-compat) is ecosystem-scale; after surveying the three tracks
+  (A: broaden POSIX source / port musl; B: Linux ELF binary compat; C: Win32 PE) the user chose
+  **B** (highest demonstrable value; the SYSCALL entry path, the auxv stack, and FS-base TLS were
+  already Linux-shaped, so the headline win was also the most leveraged). Added a per-process **ABI
+  personality** (`struct proc.personality`, `ABI_PERS_TOBY`/`ABI_PERS_LINUX` in `abi.h`) latched at
+  ELF load from `e_ident[EI_OSABI]` (new `EI_OSABI`/`ELFOSABI_LINUX` in `elf.h`; `struct
+  elf_load_info.osabi` populated in `elf.c`; set in `proc.c` spawn + `fork.c` execve). `syscall_dispatch`
+  now branches: a Linux-personality process is routed through **`linux_syscall()`** (new, `src/syscall.c`)
+  which translates Linux x86-64 syscall numbers onto tobyOS primitives — 1:1 calls forward to the
+  native dispatcher, Linux-specifics (`arch_prctl` SET/GET_FS → `thread_set_tls`, `writev`/`readv` →
+  fan-out over `sys_write`/`sys_read`, `set_tid_address`, `exit_group`, `clock_gettime`, `uname`,
+  `nanosleep` timespec→ns, `mmap` Linux→VMA flag xlate, `brk` Linux return convention,
+  `ioctl`→ENOTTY) handled inline; unknown numbers log + `-ENOSYS`. **Proof:** `/bin/linux-hello`
+  (`programs/linux-hello/main.c`) — a genuine Linux x86-64 static ELF built with `clang
+  --target=x86_64-linux-gnu -nostdlib` (raw syscalls, NO libtoby/headers) then `brandelf`'d
+  (`EI_OSABI=3`, code untouched); it runs the libc-style startup (`arch_prctl` TLS verified via
+  `%fs:0`, `write`+`writev`, `exit_group(42)`). `-DLINUXABI_BOOT` harness spawns it → **`[LXABI]
+  VERDICT: PASS exit=42`** with its stdout in the serial log, clean under default boot AND `-cpu
+  qemu64,+smep,+smap` (0 EXCEPTION/PANIC/#PF — the `copy_from_user`/`put_user_*` paths are
+  SMAP-safe), 3×100 s validate ALIVE. Native binaries (OSABI 0) are untouched → zero regression risk.
+  **B2 (next):** real musl/`busybox-static` (needs broader syscalls + AT_RANDOM + fstat struct xlate),
+  Linux signals, and the dynamic loader. App-compat ~5% → ~7%.
 - **2026-06-13 (later 7)** — **TobyFS crash-consistency + stress harness.** The write-ahead journal
   (replay-on-mount) + allocator/indirect-block/bitmap machinery were wired but never tested under
   crash or load. Added `bcache_discard()` (drops a device's cache entries WITHOUT flushing dirty

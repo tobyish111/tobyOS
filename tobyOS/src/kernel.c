@@ -3621,6 +3621,42 @@ void _start(void) {
     }
 #endif
 
+#ifdef LINUXABI_BOOT
+    /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
+     * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a
+     * GENUINE Linux x86-64 static ELF (raw Linux syscalls, branded
+     * ELFOSABI_LINUX) that the kernel runs under the Linux personality:
+     * it sets up TLS via arch_prctl, writes to stdout via write+writev,
+     * and exit_group(42) iff its %fs thread pointer verified. Exit==42
+     * proves the whole Linux-compat chain. Runs regardless of QUICK_BOOT
+     * so it is provable on a fast headless boot. */
+    {
+        kprintf("[boot] LXABI: spawning /bin/linux-hello (Linux x86-64 ELF)\n");
+        char *argv[] = { (char *)"linux-hello", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-hello",
+            .name = "linux-hello",
+            .argc = 1,
+            .argv = argv,
+            .envc = 1,
+            .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LXABI: /bin/linux-hello not spawned (rc=%d) "
+                    "MISSING\n", pid);
+            kprintf("[LXABI] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] LXABI: /bin/linux-hello (pid=%d) exit=%d\n",
+                    pid, rc);
+            kprintf("[LXABI] VERDICT: %s exit=%d (expected 42)\n",
+                    rc == 42 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef M36_SELFTEST
     /* Milestone 36E: in-OS compile + run self-test (TobyC stage-1). */
     {

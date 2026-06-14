@@ -741,6 +741,18 @@ static int spawn_internal(const char *path, const char *name,
     perf_zone_end(PERF_Z_ELF_LOAD, t_elf);
     kfree(image);                  /* segments now live in their own frames */
 
+    /* Track B: latch the ABI personality from the program's EI_OSABI. A
+     * binary branded ELFOSABI_LINUX runs through the Linux syscall
+     * translation layer; everything else keeps the tobyOS default. */
+    if (ok) {
+        p->personality = (prog_info.osabi == ELFOSABI_LINUX)
+                             ? ABI_PERS_LINUX : ABI_PERS_TOBY;
+        if (p->personality == ABI_PERS_LINUX) {
+            kprintf("[proc] pid %d '%s' -> Linux ABI personality "
+                    "(EI_OSABI=%u)\n", p->pid, p->name, prog_info.osabi);
+        }
+    }
+
     /* Milestone 25D: when the program declares PT_INTERP, also load
      * the interpreter (the dynamic linker, /lib/ld-toby.so) into the
      * same address space at a non-overlapping base. The kernel's

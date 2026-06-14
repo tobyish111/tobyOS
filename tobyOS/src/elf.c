@@ -197,9 +197,15 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
     info->phnum      = 0;
     info->phent      = 0;
     info->has_interp = false;
+    info->osabi      = ELFOSABI_SYSV;
 
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
     if (!validate_ehdr(eh, size, user_mode, load_base)) return false;
+
+    /* Latch the ABI brand (e_ident[EI_OSABI]) so the spawn/exec path can
+     * pick the process personality. We don't reject any value here --
+     * an unknown OSABI simply runs under the tobyOS-default personality. */
+    info->osabi = eh->e_ident[EI_OSABI];
 
     const uint8_t *bytes = (const uint8_t *)image;
     const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(bytes + eh->e_phoff);

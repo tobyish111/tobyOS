@@ -113,6 +113,26 @@ extern "C" {
 #define ABI_ERANGE          34   /* result out of range */
 #define ABI_ENAMETOOLONG    36   /* file name too long */
 #define ABI_ENOSYS          38   /* function not implemented */
+#define ABI_ENOTTY          25   /* not a typewriter (ioctl on non-tty) */
+
+/* ============================================================
+ *  Process ABI personality (Track B: foreign-binary compat)
+ * ============================================================
+ *
+ * A process carries a `personality` that selects which syscall-number
+ * namespace + ABI semantics the kernel applies to its `syscall`
+ * instructions. The DEFAULT (0) is tobyOS's own ABI -- every native
+ * program built against libtoby runs here, unchanged. ABI_PERS_LINUX
+ * tags a process whose binary uses the Linux x86-64 syscall ABI; the
+ * dispatcher then routes its syscalls through the Linux translation
+ * layer (see linux_syscall() in src/syscall.c).
+ *
+ * The personality is latched at ELF load time from e_ident[EI_OSABI]:
+ * a binary branded ELFOSABI_LINUX (3) -- the standard FreeBSD-style
+ * "brandelf" mechanism -- is run with ABI_PERS_LINUX. Native binaries
+ * (OSABI 0/SYSV) keep the default, so this can never regress them. */
+#define ABI_PERS_TOBY        0
+#define ABI_PERS_LINUX       1
 
 /* ============================================================
  *  Syscall numbers
