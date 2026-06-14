@@ -18,27 +18,44 @@ personality — the binary's code is byte-for-byte untouched). The
 ## How to obtain it
 
 ```sh
-# A prebuilt musl-static busybox (x86-64). Any static musl/uClibc busybox works.
+# 1) STATIC busybox (B2/B3/B4 demos) -- any static musl/uClibc busybox works.
 curl -L -o programs/busybox/busybox \
     https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
+
+# 2) DYNAMIC busybox + the musl loader (B5 demo). The Alpine minirootfs ships
+#    a PIE busybox (PT_INTERP=/lib/ld-musl-x86_64.so.1, NEEDED libc.musl) plus
+#    the loader (which IS libc in musl):
+curl -L -o /tmp/alpine.tgz \
+    https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-minirootfs-3.19.1-x86_64.tar.gz
+tar xzf /tmp/alpine.tgz -C /tmp ./bin/busybox ./lib/ld-musl-x86_64.so.1
+cp /tmp/bin/busybox            programs/busybox/busybox-dyn
+cp /tmp/lib/ld-musl-x86_64.so.1 programs/busybox/ld-musl-x86_64.so.1
 ```
 
-That's it — the Makefile's initrd rule detects `programs/busybox/busybox`,
-copies it in, and brandelf's it automatically. No manual branding needed.
+That's it — the Makefile's initrd rule detects these files, copies them in
+(the dynamic loader to `/lib/`), and brandelf's the executables automatically.
+No manual branding needed.
 
 ## How to run the demo
 
 ```sh
 # from PowerShell on the build host (see the build-env notes):
-make iso EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DLINUXBB_BOOT"
+make iso EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DLINUXBB_BOOT"   # static busybox battery
+make iso EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DLINUXDYN_BOOT"  # DYNAMIC busybox (B5)
 # then boot headless and grep the serial log for the verdict:
-#   [LXBB] VERDICT: PASS pass=7/7
+#   [LXBB]  VERDICT: PASS pass=10/10
+#   [LXDYN] VERDICT: PASS pass=7/7   (real ld-musl dynamic linking)
 ```
 
 ## Status / scope
 
-- **Works:** echo, true, uname -a, pwd, cat, wc, stat (real file I/O + the
-  Linux `struct stat` translation).
-- **Deferred to B3:** `ls` and friends — they need `getdents64`, which requires
-  a directory-fd abstraction tobyOS doesn't have yet. Dynamic (non-static)
-  Linux binaries also need a Linux `ld.so` + `/lib`, which is a later stage.
+- **Static (B2/B3/B4):** echo, true, uname -a, pwd, cat, wc, stat, ls, ls -la
+  (real file I/O + Linux `struct stat` + getdents64 + signals).
+- **Dynamic (B5):** the same applets run through the **real musl `ld.so`** — the
+  kernel loads the PIE busybox + the `ld-musl` interpreter (which IS libc), and
+  the loader self-relocates + relocates busybox + resolves symbols. Works
+  because busybox's only DSO is the kernel-loaded interpreter.
+- **Deferred to B6:** dynamic programs that load a *separate* shared library
+  (beyond libc) need working **file-backed mmap** (currently a stub in
+  `page_fault.c`) + the 6th syscall arg (mmap offset) plumbed through the
+  dispatch — busybox+musl does not exercise this path.

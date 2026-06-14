@@ -11,10 +11,13 @@
 *.bin
 tobyos.bin
 
-# Track B (Linux compat): the opt-in musl-static busybox is a third-party
-# GPLv2 binary fetched at test time -- never commit it (see
-# programs/busybox/README.md for how to obtain it).
+# Track B (Linux compat): opt-in third-party Linux binaries fetched at test
+# time -- never commit them (GPL busybox + musl loader; see
+# programs/busybox/README.md for how to obtain them).
 programs/busybox/busybox
+programs/busybox/busybox-dyn
+programs/busybox/ld-musl-x86_64.so.1
+programs/busybox/libc.musl-x86_64.so.1
 
 # Bootable images / filesystems produced by the build
 *.iso

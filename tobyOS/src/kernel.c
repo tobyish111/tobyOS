@@ -3740,6 +3740,58 @@ void _start(void) {
     }
 #endif
 
+#ifdef LINUXDYN_BOOT
+    /* Track B/B5: run a DYNAMICALLY-linked Linux binary -- a real musl
+     * busybox (PT_INTERP=/lib/ld-musl-x86_64.so.1, NEEDED libc.musl).
+     * The kernel loads both the PIE program and the ld-musl interpreter
+     * (which IS libc), then jumps to the loader, which self-relocates,
+     * relocates busybox, resolves symbols, and runs the applet. Proves
+     * the Linux dynamic-loader path. Opt-in (stage programs/busybox/
+     * busybox-dyn + ld-musl-x86_64.so.1). */
+    {
+        /* A battery through the DYNAMIC busybox -- every applet exits 0 only
+         * if ld-musl relocated + the shared libc's full runtime works. */
+        static char *bb[][4] = {
+            { (char *)"busybox-dyn", (char *)"echo",
+              (char *)"hello from DYNAMIC busybox via ld-musl", 0 },
+            { (char *)"busybox-dyn", (char *)"uname", (char *)"-a", 0 },
+            { (char *)"busybox-dyn", (char *)"pwd",   0, 0 },
+            { (char *)"busybox-dyn", (char *)"cat",   (char *)"/etc/motd", 0 },
+            { (char *)"busybox-dyn", (char *)"wc",    (char *)"/etc/motd", 0 },
+            { (char *)"busybox-dyn", (char *)"stat",  (char *)"/etc/motd", 0 },
+            { (char *)"busybox-dyn", (char *)"ls",    (char *)"/bin", 0 },
+        };
+        int n = (int)(sizeof(bb) / sizeof(bb[0]));
+        int npass = 0, nrun = 0;
+        for (int t = 0; t < n; t++) {
+            char *argv[5]; int ac = 0;
+            for (int i = 0; i < 4 && bb[t][i]; i++) argv[ac++] = bb[t][i];
+            argv[ac] = 0;
+            char *envp[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec spec = {
+                .path = "/bin/busybox-dyn", .name = "busybox-dyn",
+                .argc = ac, .argv = argv, .envc = 1, .envp = envp,
+            };
+            kprintf("[boot] LXDYN: busybox-dyn %s ...\n", bb[t][1]);
+            int pid = proc_spawn(&spec);
+            if (pid < 0) {
+                kprintf("[boot] LXDYN: /bin/busybox-dyn not present -- SKIPPED\n");
+                kprintf("[LXDYN] VERDICT: SKIP reason=no-dynamic-busybox\n");
+                nrun = -1;
+                break;
+            }
+            int rc = proc_wait(pid);
+            nrun++;
+            if (rc == 0) npass++;
+            kprintf("[LXDYN] busybox-dyn %-6s exit=%d %s\n", bb[t][1], rc,
+                    rc == 0 ? "OK" : "FAIL");
+        }
+        if (nrun >= 0)
+            kprintf("[LXDYN] VERDICT: %s pass=%d/%d (real ld-musl dynamic linking)\n",
+                    (npass == nrun && nrun > 0) ? "PASS" : "FAIL", npass, nrun);
+    }
+#endif
+
 #ifdef M36_SELFTEST
     /* Milestone 36E: in-OS compile + run self-test (TobyC stage-1). */
     {

@@ -1751,6 +1751,20 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "EI_OSABI=Linux) -- Linux ABI demo, OPT-IN (not committed)"; \
 	    EXTRA_FILES="$$EXTRA_FILES bin/busybox";                          \
 	fi;                                                                   \
+	if [ -f programs/busybox/busybox-dyn ] &&                            \
+	   [ -f programs/busybox/ld-musl-x86_64.so.1 ]; then                 \
+	    cp programs/busybox/busybox-dyn $(INITRD_STAGE)/bin/busybox-dyn;  \
+	    printf '\003' | dd of=$(INITRD_STAGE)/bin/busybox-dyn bs=1 seek=7 \
+	         count=1 conv=notrunc 2>/dev/null;                           \
+	    mkdir -p $(INITRD_STAGE)/lib;                                     \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/ld-musl-x86_64.so.1;                    \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/libc.musl-x86_64.so.1;                  \
+	    echo "[initrd] Track B/B5: bundling DYNAMIC musl busybox +"       \
+	         "ld-musl loader -- OPT-IN (not committed)";                 \
+	    EXTRA_FILES="$$EXTRA_FILES bin/busybox-dyn lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
+	fi;                                                                   \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/gui_clock bin/gui_widgets bin/gui_about          \
