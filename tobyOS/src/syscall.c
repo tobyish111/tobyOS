@@ -931,15 +931,30 @@ static int resolve_user_path(const char *user_path, char *out, size_t cap) {
     struct proc *p = current_proc();
     const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
     size_t clen = strlen(cwd);
-    /* Need cwd + '/' + path + NUL, but skip the slash if cwd already
-     * ends with one (e.g. cwd == "/"). */
-    bool need_slash = (clen == 0 || cwd[clen - 1] != '/');
-    size_t need = clen + (need_slash ? 1 : 0) + (size_t)plen + 1;
+
+    /* Strip a leading "." / "./" so a cwd-relative path resolves against
+     * the cwd rather than producing a bogus "/." -- e.g. `busybox ls .`
+     * (no path arg -> opendir(".")). A bare "." becomes the cwd itself.
+     * Only leading dot-components are collapsed (enough for the common
+     * cases); interior "/./" and ".." are left alone. */
+    char  *rel  = up;
+    size_t rlen = (size_t)plen;
+    while (rlen >= 1 && rel[0] == '.' && (rlen == 1 || rel[1] == '/')) {
+        size_t skip = (rlen == 1) ? 1 : 2;
+        rel += skip; rlen -= skip;
+        while (rlen && rel[0] == '/') { rel++; rlen--; }
+    }
+
+    /* Need cwd + '/' + path + NUL, but skip the slash if cwd already ends
+     * with one (e.g. cwd == "/") or there's no trailing component left. */
+    bool need_slash = rlen > 0 && (clen == 0 || cwd[clen - 1] != '/');
+    size_t need = clen + (need_slash ? 1 : 0) + rlen + 1;
     if (need > cap) return -ABI_ENAMETOOLONG;
     memcpy(out, cwd, clen);
-    if (need_slash) out[clen++] = '/';
-    memcpy(out + clen, up, (size_t)plen);
-    out[clen + plen] = '\0';
+    size_t o = clen;
+    if (need_slash) out[o++] = '/';
+    memcpy(out + o, rel, rlen);
+    out[o + rlen] = '\0';
     return 0;
 }
 
@@ -2856,15 +2871,16 @@ enum {
     LX_read = 0, LX_write = 1, LX_open = 2, LX_close = 3,
     LX_stat = 4, LX_fstat = 5, LX_lstat = 6, LX_lseek = 8, LX_mmap = 9,
     LX_mprotect = 10, LX_munmap = 11, LX_brk = 12,
-    LX_rt_sigaction = 13, LX_rt_sigprocmask = 14, LX_ioctl = 16,
-    LX_readv = 19, LX_writev = 20, LX_access = 21, LX_pipe = 22,
-    LX_dup = 32, LX_dup2 = 33, LX_nanosleep = 35, LX_sendfile = 40,
-    LX_getpid = 39, LX_exit = 60, LX_uname = 63, LX_fcntl = 72,
-    LX_getcwd = 79, LX_chdir = 80, LX_mkdir = 83, LX_unlink = 87,
-    LX_getuid = 102, LX_getgid = 104, LX_geteuid = 107, LX_getegid = 108,
-    LX_getppid = 110, LX_arch_prctl = 158, LX_gettid = 186,
-    LX_futex = 202, LX_getdents64 = 217, LX_set_tid_address = 218,
-    LX_clock_gettime = 228, LX_exit_group = 231, LX_openat = 257,
+    LX_rt_sigaction = 13, LX_rt_sigprocmask = 14, LX_rt_sigreturn = 15,
+    LX_ioctl = 16, LX_readv = 19, LX_writev = 20, LX_access = 21,
+    LX_pipe = 22, LX_dup = 32, LX_dup2 = 33, LX_nanosleep = 35,
+    LX_sendfile = 40, LX_getpid = 39, LX_exit = 60, LX_kill = 62,
+    LX_uname = 63, LX_fcntl = 72, LX_getcwd = 79, LX_chdir = 80,
+    LX_mkdir = 83, LX_unlink = 87, LX_getuid = 102, LX_getgid = 104,
+    LX_geteuid = 107, LX_getegid = 108, LX_getppid = 110,
+    LX_arch_prctl = 158, LX_gettid = 186, LX_tkill = 200, LX_futex = 202,
+    LX_getdents64 = 217, LX_set_tid_address = 218, LX_clock_gettime = 228,
+    LX_exit_group = 231, LX_tgkill = 234, LX_openat = 257,
     LX_newfstatat = 262, LX_set_robust_list = 273, LX_getrandom = 318,
 };
 
@@ -2880,6 +2896,19 @@ enum {
 
 struct lx_iovec   { uint64_t iov_base; uint64_t iov_len; };
 struct lx_timespec{ int64_t  tv_sec;   int64_t  tv_nsec; };
+
+/* Linux x86-64 `struct sigaction` as the rt_sigaction(2) syscall sees it:
+ * sa_handler, then sa_flags, then the mandatory sa_restorer, then sa_mask.
+ * This field ORDER differs from tobyOS's struct sigaction (handler, mask,
+ * flags), so it must be translated by hand. The SA_* flag *values* are
+ * already Linux-aligned in tobyOS (signal.h), so flags carry through. */
+struct lx_sigaction {
+    uint64_t sa_handler;
+    uint64_t sa_flags;
+    uint64_t sa_restorer;
+    uint64_t sa_mask;
+};
+#define LX_SA_RESTORER 0x04000000u
 
 /* Linux x86-64 struct stat (arch/x86/include/uapi/asm/stat.h) -- 144 bytes,
  * field layout is ABI and must match byte-for-byte. tobyOS's S_IF* type bits
@@ -3230,12 +3259,52 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         return (long)len;
     }
 
-    /* Signals: accepted but not yet wired to the native signal layer
-     * (the Linux struct sigaction / sigset layouts differ -- B2). Return
-     * success so libc startup that installs handlers doesn't abort. */
-    case LX_rt_sigaction:
-    case LX_rt_sigprocmask:
+    /* ---- signals (B4): translate the Linux signal ABI onto the native
+     * signal layer. musl supplies its own sa_restorer trampoline (which
+     * just issues rt_sigreturn); we record it as the proc's restorer so
+     * delivery has a return path -- a Linux process never calls the
+     * tobyOS SYS_SIGRESTORER. 1-arg handlers are fully supported; an
+     * SA_SIGINFO 3-arg handler would receive tobyOS-layout siginfo/
+     * ucontext (a known gap). ---- */
+    case LX_rt_sigaction: {            /* (sig, act, oldact, sigsetsize) */
+        int sig = (int)a1;
+        if (sig <= 0 || sig >= SIG_MAX) return -ABI_EINVAL;
+        if (sig == SIGKILL || sig == SIGSTOP) return -ABI_EINVAL;
+        struct proc *p = current_proc();
+        if (!p) return -ABI_EPERM;
+        struct sigaction *cur = &p->sigstate.actions[sig];
+        if (a3) {                       /* report old action in Linux layout */
+            struct lx_sigaction old;
+            memset(&old, 0, sizeof old);
+            old.sa_handler  = (uint64_t)(uintptr_t)cur->sa_handler;
+            old.sa_flags    = (uint64_t)(uint32_t)cur->sa_flags;
+            old.sa_restorer = p->sigstate.restorer;
+            old.sa_mask     = (uint64_t)cur->sa_mask;
+            if (copy_to_user((void *)a3, &old, sizeof old) != 0)
+                return -ABI_EFAULT;
+        }
+        if (a2) {                       /* install new action from Linux layout */
+            struct lx_sigaction na;
+            if (copy_from_user(&na, (const void *)a2, sizeof na) != 0)
+                return -ABI_EFAULT;
+            cur->sa_handler = (void (*)(int))(uintptr_t)na.sa_handler;
+            cur->sa_mask    = (sigset_t)na.sa_mask;
+            cur->sa_flags   = (int)na.sa_flags;
+            if ((na.sa_flags & LX_SA_RESTORER) && na.sa_restorer)
+                p->sigstate.restorer = na.sa_restorer;
+        }
         return 0;
+    }
+    case LX_rt_sigprocmask:            /* (how, set, oldset, sigsetsize) */
+        return sys_sigprocmask((int)a1, (const void *)a2, (void *)a3);
+    case LX_rt_sigreturn:
+        return sys_sigreturn();
+    case LX_kill:                      /* (pid, sig) */
+        return sys_kill((int)a1, (int)a2);
+    case LX_tkill:                     /* (tid, sig) */
+        return sys_kill((int)a1, (int)a2);
+    case LX_tgkill:                    /* (tgid, tid, sig) -> signal the tid */
+        return sys_kill((int)a2, (int)a3);
 
     /* Futex: forward only the FUTEX_WAIT/WAKE low ops; private flag and
      * timeouts are ignored for now (single-threaded statics don't block

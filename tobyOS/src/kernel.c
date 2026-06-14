@@ -3654,6 +3654,28 @@ void _start(void) {
             kprintf("[LXABI] VERDICT: %s exit=%d (expected 42)\n",
                     rc == 42 ? "PASS" : "FAIL", rc);
         }
+
+        /* B4: prove the Linux signal path (rt_sigaction + musl-style
+         * restorer + rt_sigreturn) with a second hand-rolled Linux ELF
+         * that installs a SIGUSR1 handler, raises it, and exits 0 iff the
+         * handler actually ran. */
+        kprintf("[boot] LXSIG: spawning /bin/linux-sigtest (Linux signals)\n");
+        char *sargv[] = { (char *)"linux-sigtest", 0 };
+        char *senvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec sspec = {
+            .path = "/bin/linux-sigtest", .name = "linux-sigtest",
+            .argc = 1, .argv = sargv, .envc = 1, .envp = senvp,
+        };
+        int spid = proc_spawn(&sspec);
+        if (spid < 0) {
+            kprintf("[LXSIG] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int src = proc_wait(spid);
+            kprintf("[boot] LXSIG: /bin/linux-sigtest (pid=%d) exit=%d\n",
+                    spid, src);
+            kprintf("[LXSIG] VERDICT: %s exit=%d (expected 0)\n",
+                    src == 0 ? "PASS" : "FAIL", src);
+        }
     }
 #endif
 
@@ -3683,6 +3705,7 @@ void _start(void) {
             { (char *)"busybox", (char *)"stat",  (char *)"/etc/motd", 0 },
             { (char *)"busybox", (char *)"ls",    (char *)"/bin", 0 },
             { (char *)"busybox", (char *)"ls",    (char *)"-la", (char *)"/bin" },
+            { (char *)"busybox", (char *)"ls",    0, 0 },  /* B4: no path -> cwd "." */
         };
         int n = (int)(sizeof(bb) / sizeof(bb[0]));
         int npass = 0, nrun = 0;
