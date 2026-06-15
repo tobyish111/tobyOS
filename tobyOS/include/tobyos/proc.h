@@ -411,6 +411,10 @@ int proc_wait(int pid);
 /* Look up a PCB by PID. Returns NULL if not found or slot is UNUSED. */
 struct proc *proc_lookup(int pid);
 
+/* Find a child of `ppid` (for Linux wait4(-1)); prefers a TERMINATED child.
+ * Returns the child pid, or -1 if there are no children. */
+int proc_any_child(int ppid);
+
 /* For diagnostics. */
 const char *proc_state_name(enum proc_state s);
 void        proc_dump_table(void);

@@ -1046,6 +1046,21 @@ static void proc_reap(struct proc *p) {
     kprintf("[proc] reaped pid=%d, slot recycled\n", pid);
 }
 
+/* Find a child of `ppid` for Linux wait4(-1) ("wait for any child"). Prefers
+ * an already-TERMINATED child (so a ready reap returns immediately); otherwise
+ * returns the first live child so the caller can block on it. Returns the
+ * child pid, or -1 if `ppid` has no children. */
+int proc_any_child(int ppid) {
+    int live = -1;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q->state == PROC_UNUSED || q->ppid != ppid) continue;
+        if (q->state == PROC_TERMINATED) return q->pid;   /* reap-ready */
+        if (live < 0) live = q->pid;
+    }
+    return live;
+}
+
 int proc_wait_info(int pid, struct proc_exit_info *out) {
     struct proc *self = current_proc();
     if (pid == self->pid) return -1;

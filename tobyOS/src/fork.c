@@ -489,6 +489,12 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
             struct abi_auxv *auxv_ptr = (struct abi_auxv *)auxv_va;
             size_t off = 0;
 
+            /* These writes target the new image's user stack. Under SMAP the
+             * kernel may not touch user memory without a stac window -- open
+             * one around the whole pack (same as elf.c's segment copy). Without
+             * this, execve from a CPL-3 caller #PFs on the first argv write
+             * under +smap (exposed by busybox sh's fork+execve). */
+            unsigned long uflags = uaccess_begin();
             for (int i = 0; i < kargc; i++) {
                 size_t l = strlen(kargv_buf[i]) + 1;
                 memcpy(pool_ptr + off, kargv_buf[i], l);
@@ -510,6 +516,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
             auxv_ptr[auxc].a_val  = 0;
 
             *(uint64_t *)argc_va = (uint64_t)(uint32_t)kargc;
+            uaccess_end(uflags);
             user_rsp = argc_va;
         }
     }

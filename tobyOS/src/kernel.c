@@ -3761,6 +3761,37 @@ void _start(void) {
     }
 #endif
 
+#ifdef LINUXSH_BOOT
+    /* Track B/B8: run a real shell -- `busybox sh -c '<external cmd>'`. The
+     * shell forks, execve's /bin/busybox for the external command, and wait4's
+     * for it. Proves fork/execve/wait4 translation end to end. Opt-in: needs
+     * the static busybox staged (programs/busybox/busybox). */
+    {
+        kprintf("[boot] LXSH: spawning busybox sh -c 'busybox echo ...'\n");
+        /* A command LIST so ash can't exec-optimize the first command away:
+         * `echo A` must fork + wait4 (only the trailing `echo B` is exec'd in
+         * place), so this exercises fork AND execve AND wait4. */
+        char *argv[] = { (char *)"sh", (char *)"-c",
+                         (char *)"busybox echo shell-forked-A; "
+                                 "busybox echo shell-exec-B", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/busybox", .name = "sh",
+            .argc = 3, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LXSH: /bin/busybox not present -- SKIPPED\n");
+            kprintf("[LXSH] VERDICT: SKIP reason=no-busybox\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] LXSH: busybox sh (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[LXSH] VERDICT: %s exit=%d (fork+execve+wait4 via a real "
+                    "shell)\n", rc == 0 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef LINUXDYN_BOOT
     /* Track B/B5: run a DYNAMICALLY-linked Linux binary -- a real musl
      * busybox (PT_INTERP=/lib/ld-musl-x86_64.so.1, NEEDED libc.musl).

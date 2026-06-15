@@ -2874,7 +2874,10 @@ enum {
     LX_rt_sigaction = 13, LX_rt_sigprocmask = 14, LX_rt_sigreturn = 15,
     LX_ioctl = 16, LX_readv = 19, LX_writev = 20, LX_access = 21,
     LX_pipe = 22, LX_dup = 32, LX_dup2 = 33, LX_nanosleep = 35,
-    LX_sendfile = 40, LX_getpid = 39, LX_exit = 60, LX_kill = 62,
+    LX_sendfile = 40, LX_getpid = 39, LX_clone = 56, LX_fork = 57,
+    LX_vfork = 58, LX_execve = 59, LX_exit = 60, LX_wait4 = 61,
+    LX_kill = 62, LX_setpgid = 109, LX_getpgrp = 111, LX_setsid = 112,
+    LX_getpgid = 121,
     LX_uname = 63, LX_fcntl = 72, LX_getcwd = 79, LX_chdir = 80,
     LX_mkdir = 83, LX_unlink = 87, LX_getuid = 102, LX_getgid = 104,
     LX_geteuid = 107, LX_getegid = 108, LX_getppid = 110,
@@ -3096,6 +3099,51 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
     case LX_unlink: return do_syscall(SYS_UNLINK, a1, 0, 0, 0, 0);
+
+    /* ---- process control (B8): the shell forks, execs, and waits ---- */
+    case LX_fork:
+    case LX_vfork:
+        return do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+    case LX_clone:
+        /* glibc/musl fork() may route through clone(SIGCHLD,...). Threads
+         * (CLONE_VM, 0x100) are out of scope (B9) -- reject so libc can
+         * fall back / error cleanly; a plain fork-equivalent clone -> fork. */
+        if ((uint64_t)a1 & 0x100u /* CLONE_VM */) return -ABI_ENOSYS;
+        return do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+    case LX_execve:                    /* (path, argv, envp) -- same as Linux */
+        return sys_execve((const char *)a1, (char *const *)a2,
+                          (char *const *)a3);
+    case LX_wait4: {                   /* (pid, *status, options, *rusage) */
+        int   pid     = (int)a1;
+        void *ustatus = (void *)a2;
+        int   options = (int)a3;
+        if (pid <= 0) {                /* "any child" -- sh -c forks exactly one */
+            struct proc *self = current_proc();
+            pid = self ? proc_any_child(self->pid) : -1;
+            if (pid < 0) return -ABI_ECHILD;
+        }
+        if (options & 0x1 /* WNOHANG */) {
+            struct proc *c = proc_lookup(pid);
+            if (!c) return -ABI_ECHILD;
+            if (c->state != PROC_TERMINATED) return 0;
+        }
+        int code = proc_wait(pid);
+        if (code < 0) return -ABI_ECHILD;
+        if (ustatus) {
+            /* Linux wait status: normal exit -> (code & 0xff) << 8, with the
+             * low 7 bits zero so WIFEXITED is true / WEXITSTATUS == code. */
+            uint32_t wstatus = ((uint32_t)code & 0xff) << 8;
+            if (put_user_u32(ustatus, wstatus) != 0) return -ABI_EFAULT;
+        }
+        return pid;
+    }
+    /* Job control: tobyOS has a single global foreground pid, not POSIX
+     * process groups, so accept these as no-ops/identity so the shell's
+     * setup doesn't abort. */
+    case LX_setpgid: return 0;
+    case LX_getpgid:
+    case LX_getpgrp:
+    case LX_setsid:  return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
 
     /* ---- stat family: translate tobyOS vfs_stat -> Linux struct stat ---- */
     case LX_stat:
