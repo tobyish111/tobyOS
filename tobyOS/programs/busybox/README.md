@@ -30,6 +30,18 @@ curl -L -o /tmp/alpine.tgz \
 tar xzf /tmp/alpine.tgz -C /tmp ./bin/busybox ./lib/ld-musl-x86_64.so.1
 cp /tmp/bin/busybox            programs/busybox/busybox-dyn
 cp /tmp/lib/ld-musl-x86_64.so.1 programs/busybox/ld-musl-x86_64.so.1
+
+# 3) MULTI-DSO demo (B7): a real binary that loads a SEPARATE shared library
+#    beyond libc. Alpine `file` -> libmagic.so.1 + libc. Running `file
+#    --version` makes ld-musl file-backed-mmap libmagic.so.1.
+curl -L -o /tmp/file.apk \
+    https://dl-cdn.alpinelinux.org/alpine/v3.19/main/x86_64/file-5.45-r1.apk
+curl -L -o /tmp/libmagic.apk \
+    https://dl-cdn.alpinelinux.org/alpine/v3.19/main/x86_64/libmagic-5.45-r1.apk
+tar xzf /tmp/file.apk     -C /tmp usr/bin/file
+tar xzf /tmp/libmagic.apk -C /tmp usr/lib/libmagic.so.1.0.0
+cp /tmp/usr/bin/file                 programs/busybox/file
+cp /tmp/usr/lib/libmagic.so.1.0.0    programs/busybox/libmagic.so.1
 ```
 
 That's it — the Makefile's initrd rule detects these files, copies them in
@@ -55,7 +67,9 @@ make iso EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DLINUXDYN_BOOT"  # DYNAMIC busy
   kernel loads the PIE busybox + the `ld-musl` interpreter (which IS libc), and
   the loader self-relocates + relocates busybox + resolves symbols. Works
   because busybox's only DSO is the kernel-loaded interpreter.
-- **Deferred to B6:** dynamic programs that load a *separate* shared library
-  (beyond libc) need working **file-backed mmap** (currently a stub in
-  `page_fault.c`) + the 6th syscall arg (mmap offset) plumbed through the
-  dispatch — busybox+musl does not exercise this path.
+- **Multi-DSO (B6 file-backed mmap + B7 end-to-end):** `file --version` is a real
+  binary that depends on a *separate* shared library, `libmagic.so.1`. ld-musl
+  opens it and **file-backed-mmaps** its segments (the loader maps the whole span,
+  then MAP_FIXED-maps each segment at the lib's 16 TiB base + offset), relocates
+  it, and resolves its symbols — `[LXMULTI] VERDICT: PASS`. (Surfaced + fixed a
+  latent kernel bug: `mmap.c`'s `PAGE_MASK` truncated addresses >= 4 GiB.)

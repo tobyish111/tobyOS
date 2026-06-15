@@ -1774,6 +1774,17 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] Track B/B5: bundling DYNAMIC musl busybox +"       \
 	         "ld-musl loader -- OPT-IN (not committed)";                 \
 	    EXTRA_FILES="$$EXTRA_FILES bin/busybox-dyn lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
+	    if [ -f programs/busybox/file ] &&                               \
+	       [ -f programs/busybox/libmagic.so.1 ]; then                   \
+	        cp programs/busybox/file $(INITRD_STAGE)/bin/file;            \
+	        printf '\003' | dd of=$(INITRD_STAGE)/bin/file bs=1 seek=7    \
+	             count=1 conv=notrunc 2>/dev/null;                       \
+	        cp programs/busybox/libmagic.so.1                            \
+	             $(INITRD_STAGE)/lib/libmagic.so.1;                      \
+	        echo "[initrd] Track B/B6: bundling multi-DSO 'file' +"       \
+	             "libmagic.so.1 (file-backed mmap of a separate .so)";   \
+	        EXTRA_FILES="$$EXTRA_FILES bin/file lib/libmagic.so.1";       \
+	    fi;                                                              \
 	fi;                                                                   \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \

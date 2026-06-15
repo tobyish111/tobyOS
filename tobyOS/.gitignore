@@ -18,6 +18,8 @@ programs/busybox/busybox
 programs/busybox/busybox-dyn
 programs/busybox/ld-musl-x86_64.so.1
 programs/busybox/libc.musl-x86_64.so.1
+programs/busybox/file
+programs/busybox/libmagic.so.1
 
 # Bootable images / filesystems produced by the build
 *.iso

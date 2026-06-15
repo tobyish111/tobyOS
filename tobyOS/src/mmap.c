@@ -66,7 +66,13 @@ static struct vma_table g_vma_tables[PROC_MAX];
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096ULL
 #endif
-#define PAGE_MASK (~(PAGE_SIZE - 1))
+/* PAGE_SIZE comes from pmm.h as `4096u` (32-bit unsigned), so the naive
+ * `~(PAGE_SIZE - 1)` is a 32-bit `0xFFFFF000` that zero-extends to
+ * `0x00000000FFFFF000` and TRUNCATES any address >= 4 GiB -- and the mmap
+ * region lives at 16 TiB (MMAP_REGION_BASE). Force the mask 64-bit so
+ * page_align_down/up keep the high bits (a real bug the Linux dynamic
+ * loader's MAP_FIXED segment maps surfaced). */
+#define PAGE_MASK (~((uint64_t)PAGE_SIZE - 1))
 
 static inline uint64_t page_align_up(uint64_t v) {
     return (v + PAGE_SIZE - 1) & PAGE_MASK;

@@ -3270,11 +3270,20 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_mmap: {
         uint32_t lf = (uint32_t)a4;
         int      fd = (int)a5;
+        long ret;
         if ((lf & LXMAP_ANONYMOUS) || fd < 0)        /* anonymous (malloc/TLS) */
-            return sys_mmap((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
-                            lx_mmap_flags(lf), -1, 0);
-        return linux_mmap_file((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
-                               lf, fd, lx_mmap_offset());  /* file-backed */
+            ret = sys_mmap((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
+                           lx_mmap_flags(lf), -1, 0);
+        else
+            ret = linux_mmap_file((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
+                                  lf, fd, lx_mmap_offset());  /* file-backed */
+#ifdef LXMMAP_TRACE
+        kprintf("[mmaptrace] addr=%p len=0x%lx prot=0x%x flags=0x%x fd=%d "
+                "off=0x%lx -> %p\n", (void *)a1, (unsigned long)a2,
+                (unsigned)a3, (unsigned)lf, fd,
+                (unsigned long)lx_mmap_offset(), (void *)ret);
+#endif
+        return ret;
     }
     case LX_munmap:
         return do_syscall(ABI_SYS_MUNMAP, a1, a2, 0, 0, 0);

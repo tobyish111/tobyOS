@@ -3810,6 +3810,32 @@ void _start(void) {
         if (nrun >= 0)
             kprintf("[LXDYN] VERDICT: %s pass=%d/%d (real ld-musl dynamic linking)\n",
                     (npass == nrun && nrun > 0) ? "PASS" : "FAIL", npass, nrun);
+
+        /* B7: the multi-DSO headline -- a REAL musl binary (`file`, from
+         * Alpine) that depends on a SEPARATE shared library, libmagic.so.1
+         * (beyond libc). ld-musl must open + FILE-BACKED mmap
+         * /lib/libmagic.so.1 and resolve its symbols. `file --version`
+         * prints the version and exits 0 without touching the magic DB.
+         * Opt-in: stage programs/busybox/{file,libmagic.so.1}. */
+        kprintf("[boot] LXMULTI: spawning /bin/file --version (separate .so "
+                "via ld-musl)\n");
+        char *fargv[] = { (char *)"file", (char *)"--version", 0 };
+        char *fenvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec fspec = {
+            .path = "/bin/file", .name = "file",
+            .argc = 2, .argv = fargv, .envc = 1, .envp = fenvp,
+        };
+        int fpid = proc_spawn(&fspec);
+        if (fpid < 0) {
+            kprintf("[boot] LXMULTI: /bin/file not present -- SKIPPED\n");
+            kprintf("[LXMULTI] VERDICT: SKIP reason=no-multidso-binary\n");
+        } else {
+            int frc = proc_wait(fpid);
+            kprintf("[boot] LXMULTI: /bin/file --version (pid=%d) exit=%d\n",
+                    fpid, frc);
+            kprintf("[LXMULTI] VERDICT: %s exit=%d (file-backed mmap of "
+                    "libmagic.so.1)\n", frc == 0 ? "PASS" : "FAIL", frc);
+        }
     }
 #endif
 
