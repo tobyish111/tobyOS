@@ -76,6 +76,9 @@ extern void syscall_entry(void);
 /* Phase 3 M3.2: fork/exec forward declarations */
 extern long sys_fork(void);
 extern long sys_execve(const char *path, char *const argv[], char *const envp[]);
+/* Track B/B9: Linux clone(CLONE_VM) thread (shared address space). */
+extern long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
+                             uint64_t ctid, uint64_t tls);
 
 /* TCP/TLS userland networking */
 extern long sys_tcp_user_connect(uint32_t ip_be, uint16_t port_be, uint32_t timeout_ms);
@@ -2873,7 +2876,8 @@ enum {
     LX_mprotect = 10, LX_munmap = 11, LX_brk = 12,
     LX_rt_sigaction = 13, LX_rt_sigprocmask = 14, LX_rt_sigreturn = 15,
     LX_ioctl = 16, LX_readv = 19, LX_writev = 20, LX_access = 21,
-    LX_pipe = 22, LX_dup = 32, LX_dup2 = 33, LX_nanosleep = 35,
+    LX_pipe = 22, LX_sched_yield = 24, LX_dup = 32, LX_dup2 = 33,
+    LX_nanosleep = 35,
     LX_sendfile = 40, LX_getpid = 39, LX_clone = 56, LX_fork = 57,
     LX_vfork = 58, LX_execve = 59, LX_exit = 60, LX_wait4 = 61,
     LX_kill = 62, LX_setpgid = 109, LX_getpgrp = 111, LX_setsid = 112,
@@ -3105,11 +3109,15 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_vfork:
         return do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
     case LX_clone:
-        /* glibc/musl fork() may route through clone(SIGCHLD,...). Threads
-         * (CLONE_VM, 0x100) are out of scope (B9) -- reject so libc can
-         * fall back / error cleanly; a plain fork-equivalent clone -> fork. */
-        if ((uint64_t)a1 & 0x100u /* CLONE_VM */) return -ABI_ENOSYS;
+        /* clone(flags, stack, ptid, ctid, tls). CLONE_VM (0x100) => a thread
+         * that shares the address space (pthread_create); otherwise it's a
+         * fork-equivalent (glibc/musl fork() may route through clone). */
+        if ((uint64_t)a1 & 0x100u /* CLONE_VM */)
+            return sys_clone_thread((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
+                                    (uint64_t)a4, (uint64_t)a5);
         return do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+    case LX_sched_yield:
+        return do_syscall(SYS_YIELD, 0, 0, 0, 0, 0);
     case LX_execve:                    /* (path, argv, envp) -- same as Linux */
         return sys_execve((const char *)a1, (char *const *)a2,
                           (char *const *)a3);

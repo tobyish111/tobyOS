@@ -294,6 +294,102 @@ long sys_fork(void) {
 }
 
 /* ===================================================================
+ * sys_clone_thread -- Linux clone(CLONE_VM,...) : create a thread that
+ * SHARES the caller's address space and, like fork, resumes after the
+ * clone `syscall` (rax = 0) -- but on the caller-provided `stack`, with
+ * `tls` as its FS base. This mirrors sys_fork's resume mechanism
+ * (copy the trapframe, descend through fork_child_entry) but installs
+ * the shared-VM thread fields thread_create uses instead of allocating a
+ * fresh PML4. Returns the new thread's tid to the caller.
+ *
+ * x86-64 clone arg order: clone(flags, stack, parent_tid, child_tid, tls).
+ * =================================================================== */
+long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
+                      uint64_t ctid, uint64_t tls) {
+    struct proc *parent = current_proc();
+    if (!parent || parent->pid == 0) return -ABI_EINVAL;
+    if (!stack) return -ABI_EINVAL;             /* a thread needs its own stack */
+
+    /* The thread joins the caller's thread group (the leader owns the PML4). */
+    struct proc *tg = (parent->is_thread && parent->tgid != parent->pid)
+                          ? proc_lookup(parent->tgid) : parent;
+    if (!tg) return -ABI_EINVAL;
+
+    struct proc *child = NULL;
+    for (int i = 1; i < PROC_MAX; i++) {
+        if (g_proc[i].state == PROC_UNUSED) { child = &g_proc[i]; break; }
+    }
+    if (!child) return -ABI_ENOMEM;
+    int child_pid = (int)(child - g_proc);
+
+    memcpy(child, parent, sizeof(*child));
+    child->pid        = child_pid;
+    child->ppid       = parent->ppid;
+    child->tgid       = tg->pid;                /* same thread group */
+    child->is_thread  = true;
+    child->cr3        = tg->cr3;                /* SHARE the address space */
+    child->owns_pml4  = false;                  /* never free the shared PML4 */
+    child->detached   = true;
+    child->state      = PROC_UNUSED;
+    child->wait_pid   = -1;
+    child->exit_code  = -1;
+    child->next_ready = NULL;
+    child->next_wait  = NULL;
+    child->wait_head  = NULL;
+    child->join_waiters = NULL;
+    child->pending_signals  = 0;
+    child->sigstate.pending = 0;
+    child->created_ns      = perf_now_ns();
+    child->cpu_ns          = 0;
+    child->syscall_count   = 0;
+    child->last_switch_tsc = 0;
+    child->sysprot_priv    = 0;
+
+    size_t nlen = strlen(tg->name);
+    if (nlen > PROC_NAME_MAX - 3) nlen = PROC_NAME_MAX - 3;
+    memcpy(child->name, tg->name, nlen);
+    child->name[nlen] = '+'; child->name[nlen + 1] = 'T'; child->name[nlen + 2] = '\0';
+
+    /* Clone the fd handles (shares the underlying open descriptions). */
+    for (int i = 0; i < PROC_NFDS; i++)
+        child->fds[i] = parent->fds[i] ? file_clone(parent->fds[i]) : NULL;
+
+    if (!build_fork_kstack(child)) {
+        for (int i = 0; i < PROC_NFDS; i++)
+            if (child->fds[i]) file_close(child->fds[i]);
+        memset(child, 0, sizeof(*child));
+        child->state = PROC_UNUSED;
+        return -ABI_ENOMEM;
+    }
+
+    /* Resume at the parent's post-`syscall` RIP with rax=0, but on the new
+     * thread stack. (fork_child_entry applies rax=0 during the unwind.) */
+    struct syscall_regs *cr = (struct syscall_regs *)
+        ((uint8_t *)child->kstack_top - sizeof(struct syscall_regs));
+    memcpy(cr, (uint8_t *)parent->kstack_top - sizeof(struct syscall_regs),
+           sizeof(struct syscall_regs));
+    cr->user_rsp = stack;
+
+    child->tls_base = (flags & 0x00080000u /* CLONE_SETTLS */) ? tls
+                                                              : parent->tls_base;
+
+    /* CLONE_PARENT_SETTID / CLONE_CHILD_SETTID: publish the new tid into the
+     * shared address space (we're already on the shared CR3). */
+    if ((flags & 0x00100000u /* CLONE_PARENT_SETTID */) && ptid)
+        (void)put_user_u32((void *)ptid, (uint32_t)child_pid);
+    if ((flags & 0x01000000u /* CLONE_CHILD_SETTID */) && ctid)
+        (void)put_user_u32((void *)ctid, (uint32_t)child_pid);
+
+    child->state = PROC_READY;
+    sched_enqueue(child);
+    perf_count_proc_spawn();
+
+    kprintf("[clone] thread tid=%d in tgid=%d (shared VM, stack=0x%lx)\n",
+            child_pid, child->tgid, (unsigned long)stack);
+    return child_pid;  /* caller gets the new tid */
+}
+
+/* ===================================================================
  * sys_execve -- Replace the current process image with a new ELF.
  *
  * path  : absolute path to the ELF binary.

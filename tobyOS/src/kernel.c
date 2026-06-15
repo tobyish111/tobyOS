@@ -3697,6 +3697,27 @@ void _start(void) {
             kprintf("[LXMMAP] VERDICT: %s exit=%d (expected 0)\n",
                     mrc == 0 ? "PASS" : "FAIL", mrc);
         }
+
+        /* B9: prove Linux threads -- a hand-rolled ELF spawns a thread with
+         * clone(CLONE_VM), the thread runs in the shared address space, sets
+         * a shared flag, and exits; the program exits 0 iff the thread ran. */
+        kprintf("[boot] LXTHREAD: spawning /bin/linux-thread (clone CLONE_VM)\n");
+        char *targv[] = { (char *)"linux-thread", 0 };
+        char *tenvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec tspec = {
+            .path = "/bin/linux-thread", .name = "linux-thread",
+            .argc = 1, .argv = targv, .envc = 1, .envp = tenvp,
+        };
+        int tpid = proc_spawn(&tspec);
+        if (tpid < 0) {
+            kprintf("[LXTHREAD] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int trc = proc_wait(tpid);
+            kprintf("[boot] LXTHREAD: /bin/linux-thread (pid=%d) exit=%d\n",
+                    tpid, trc);
+            kprintf("[LXTHREAD] VERDICT: %s exit=%d (expected 0)\n",
+                    trc == 0 ? "PASS" : "FAIL", trc);
+        }
     }
 #endif
 
