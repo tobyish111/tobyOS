@@ -3676,6 +3676,27 @@ void _start(void) {
             kprintf("[LXSIG] VERDICT: %s exit=%d (expected 0)\n",
                     src == 0 ? "PASS" : "FAIL", src);
         }
+
+        /* B6: prove file-backed mmap with a third hand-rolled Linux ELF
+         * that mmaps files at offset 0 and a page offset and verifies the
+         * mapped bytes equal read()'s. */
+        kprintf("[boot] LXMMAP: spawning /bin/linux-mmaptest (file-backed mmap)\n");
+        char *margv[] = { (char *)"linux-mmaptest", 0 };
+        char *menvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec mspec = {
+            .path = "/bin/linux-mmaptest", .name = "linux-mmaptest",
+            .argc = 1, .argv = margv, .envc = 1, .envp = menvp,
+        };
+        int mpid = proc_spawn(&mspec);
+        if (mpid < 0) {
+            kprintf("[LXMMAP] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int mrc = proc_wait(mpid);
+            kprintf("[boot] LXMMAP: /bin/linux-mmaptest (pid=%d) exit=%d\n",
+                    mpid, mrc);
+            kprintf("[LXMMAP] VERDICT: %s exit=%d (expected 0)\n",
+                    mrc == 0 ? "PASS" : "FAIL", mrc);
+        }
     }
 #endif
 

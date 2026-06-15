@@ -2963,6 +2963,65 @@ static uint32_t lx_mmap_flags(uint32_t lf) {
     return tf;
 }
 
+/* The mmap offset is Linux mmap's 6th arg (user r9), which the dispatch
+ * doesn't forward to C (only a1..a5). The .S stashed every user register
+ * in the syscall_regs block at the top of this proc's kstack, so read it
+ * back from there. */
+static uint64_t lx_mmap_offset(void) {
+    struct proc *p = current_proc();
+    if (!p || !p->kstack_top) return 0;
+    struct syscall_regs *r =
+        (struct syscall_regs *)((uint8_t *)p->kstack_top - sizeof(*r));
+    return r->r9;   /* user r9 == 6th syscall arg == mmap offset */
+}
+
+/* File-backed mmap (B6). The dynamic loader maps a shared library's
+ * segments with mmap(fd, MAP_PRIVATE, offset). tobyOS's demand-paged
+ * VMA_FILE fault path is a stub, and -- decisively -- musl closes the
+ * library fd the instant mmap returns, so lazy by-fd paging is impossible.
+ * We therefore map EAGERLY: reserve writable anonymous pages, read the
+ * file content in at the requested offset, then tighten to `prot`. A short
+ * read at EOF leaves the tail zeroed, which is exactly the file-hole / .bss
+ * semantics the loader expects. */
+static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
+                            uint32_t lflags, int fd, uint64_t offset) {
+    if (len == 0) return -ABI_EINVAL;
+    struct file *f = fd_lookup(fd);
+    if (!f || f->kind != FILE_KIND_VFS) return -ABI_EBADF;
+
+    /* Reserve + map writable anon pages so we can fill them. */
+    uint32_t tflags = lx_mmap_flags(lflags) | 0x01u /* VMA_FLAG_ANON */;
+    long base = sys_mmap(addr, len, 0x1u | 0x2u /* PROT_READ|WRITE */,
+                         tflags, -1, 0);
+    if (base < 0) return base;
+
+    uint8_t *kbuf = (uint8_t *)kmalloc(4096);
+    if (!kbuf) { sys_munmap((uint64_t)base, len); return -ABI_ENOMEM; }
+
+    size_t save_pos = f->vfs.pos;
+    f->vfs.pos = offset;
+    uint64_t done = 0;
+    while (done < len) {
+        size_t want = (len - done) > 4096 ? 4096 : (size_t)(len - done);
+        long got = file_read(f, kbuf, want);
+        if (got <= 0) break;                  /* EOF -> leave tail zeroed */
+        if (copy_to_user((void *)((uint64_t)base + done), kbuf,
+                         (size_t)got) != 0) {
+            kfree(kbuf); f->vfs.pos = save_pos;
+            sys_munmap((uint64_t)base, len);
+            return -ABI_EFAULT;
+        }
+        done += (uint64_t)got;
+        if ((size_t)got < want) break;        /* short read == EOF */
+    }
+    kfree(kbuf);
+    f->vfs.pos = save_pos;
+
+    /* Tighten to the loader's requested protection (R-X for .text, etc.). */
+    sys_mprotect((uint64_t)base, len, prot);
+    return base;
+}
+
 /* Linux struct linux_dirent64 (getdents64). The byte layout is ABI; d_name
  * is oversized so any 8-aligned d_reclen we compute fits in this local copy. */
 struct lx_dirent64 {
@@ -3208,9 +3267,15 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         long r = sys_brk((uintptr_t)a1);
         return (r < 0) ? (long)p->brk_cur : r;       /* Linux: unchanged on fail */
     }
-    case LX_mmap:
-        return sys_mmap((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
-                        lx_mmap_flags((uint32_t)a4), (int)a5, 0);
+    case LX_mmap: {
+        uint32_t lf = (uint32_t)a4;
+        int      fd = (int)a5;
+        if ((lf & LXMAP_ANONYMOUS) || fd < 0)        /* anonymous (malloc/TLS) */
+            return sys_mmap((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
+                            lx_mmap_flags(lf), -1, 0);
+        return linux_mmap_file((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
+                               lf, fd, lx_mmap_offset());  /* file-backed */
+    }
     case LX_munmap:
         return do_syscall(ABI_SYS_MUNMAP, a1, a2, 0, 0, 0);
     case LX_mprotect:
