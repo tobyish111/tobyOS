@@ -1287,6 +1287,18 @@ programs/win-hello/win-hello.exe: programs/win-hello/hello.c
 	      -fno-stack-protector -O1 -Wl,-e,hello_entry -Wl,--subsystem,console \
 	      -o $@ $< -lkernel32
 
+# Track C/C2: a Windows PE that uses the real C RUNTIME. Unlike win-hello
+# (-nostdlib), this keeps the ucrt libs so `printf`/`puts` link to their real
+# mingw wrappers -> the ucrt stdio primitives (__acrt_iob_func +
+# __stdio_common_vfprintf, whose va_list is a stack arg), which tobyOS shims.
+# -nostartfiles + a custom entry skip the full mainCRTStartup (SEH/_initterm/
+# ~9 import DLLs) so the import surface stays small. -D__USE_MINGW_ANSI_STDIO=0
+# routes printf to the ucrt stdio primitives, not the libmingwex wrapper.
+programs/win-crt/win-crt.exe: programs/win-crt/main.c
+	$(CC) --target=x86_64-w64-mingw32 -nostartfiles -D__USE_MINGW_ANSI_STDIO=0 \
+	      -fno-stack-protector -O1 -Wl,-e,c2_entry -Wl,--subsystem,console \
+	      -o $@ $<
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1569,6 +1581,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-mmaptest/linux-mmaptest.elf \
                programs/linux-thread/linux-thread.elf \
                programs/win-hello/win-hello.exe \
+               programs/win-crt/win-crt.exe \
                initrd/etc/motd initrd/readme.txt \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1619,6 +1632,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-mmaptest/linux-mmaptest.elf     $(INITRD_STAGE)/bin/linux-mmaptest
 	cp programs/linux-thread/linux-thread.elf         $(INITRD_STAGE)/bin/linux-thread
 	cp programs/win-hello/win-hello.exe               $(INITRD_STAGE)/bin/win-hello.exe
+	cp programs/win-crt/win-crt.exe                   $(INITRD_STAGE)/bin/win-crt.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -1821,6 +1835,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/win-hello.exe            \
+	    bin/win-crt.exe                                                  \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \

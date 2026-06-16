@@ -3529,6 +3529,239 @@ static long w32_ExitProcess(uint64_t *args) {
     return 0;       /* unreached */
 }
 
+/* ============================================================
+ * C2: the C-runtime printf path (api-ms-win-crt-stdio-l1-1-0.dll).
+ *
+ * A normal MinGW/ucrt program's printf inlines to a call through
+ * __acrt_iob_func(stream) + __stdio_common_vfprintf(opts, FILE*, fmt, loc,
+ * va_list) -- where va_list is the 5th (stack) argument, which is exactly
+ * why the C2 gate marshals stack args. We shim those two plus puts, and
+ * implement a real printf engine (flags/width/precision/length) below that
+ * reads conversions from the user va_list and writes via file_write. Since
+ * tobyOS has no real CRT DLL, these shims ARE the CRT for a PE.
+ * ============================================================ */
+
+/* Write a kernel buffer straight to a tobyOS fd (bypasses sys_write's
+ * user-buffer bounce since our format buffer is kernel memory). */
+static long win32_fd_write(int fd, const char *buf, size_t len) {
+    if (len == 0) return 0;
+    struct file *f = fd_lookup(fd);
+    if (!f) return -1;
+    return file_write(f, buf, len);
+}
+
+/* Chunked output sink for the formatter: accumulate then flush. */
+struct win32_fmtbuf { int fd; size_t n; long total; char buf[256]; };
+static void fb_flush(struct win32_fmtbuf *fb) {
+    if (fb->n) { win32_fd_write(fb->fd, fb->buf, fb->n); fb->n = 0; }
+}
+static void fb_putc(struct win32_fmtbuf *fb, char c) {
+    if (fb->n == sizeof(fb->buf)) fb_flush(fb);
+    fb->buf[fb->n++] = c;
+    fb->total++;
+}
+static void fb_pad(struct win32_fmtbuf *fb, char c, int count) {
+    for (int i = 0; i < count; i++) fb_putc(fb, c);
+}
+static void fb_write(struct win32_fmtbuf *fb, const char *s, int len) {
+    for (int i = 0; i < len; i++) fb_putc(fb, s[i]);
+}
+
+/* Forward digits of `v` in `base` into out[]; returns digit count (>=1). */
+static int u64_digits(uint64_t v, char *out, int base, bool upper) {
+    const char *d = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    char tmp[24];
+    int n = 0;
+    do { tmp[n++] = d[v % (unsigned)base]; v /= (unsigned)base; } while (v);
+    for (int i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    return n;
+}
+
+/* Read the next 8-byte va_list slot (a Microsoft-x64 vararg) from user. */
+static uint64_t va_next(uint64_t uva, int *idx) {
+    uint64_t v = 0;
+    (void)copy_from_user(&v, (const void *)(uintptr_t)(uva + (size_t)(*idx) * 8), 8);
+    (*idx)++;
+    return v;
+}
+
+/* Emit prefix(sign/0x) + zero/space padding + body per flags/width. */
+static void emit_field(struct win32_fmtbuf *fb, const char *pre, int pl,
+                       const char *body, int bl, int width, bool left, bool zero) {
+    int total = pl + bl;
+    int pad = width > total ? width - total : 0;
+    if (!left && !zero) fb_pad(fb, ' ', pad);
+    fb_write(fb, pre, pl);
+    if (!left && zero) fb_pad(fb, '0', pad);
+    fb_write(fb, body, bl);
+    if (left) fb_pad(fb, ' ', pad);
+}
+
+#define WIN32_FMT_MAX  4096
+
+/* The printf engine. Reads the format string + variadic args from user
+ * memory and writes the rendered output to `fd`. Returns chars written. */
+static long win32_vformat(int fd, uint64_t ufmt, uint64_t uva) {
+    char fmt[1024];
+    long fl = strncpy_from_user(fmt, (const char *)(uintptr_t)ufmt, sizeof(fmt));
+    if (fl < 0) return -1;
+    fmt[sizeof(fmt) - 1] = '\0';
+
+    struct win32_fmtbuf fb = { .fd = fd, .n = 0, .total = 0 };
+    int ai = 0;
+    const char *p = fmt;
+
+    while (*p) {
+        if (*p != '%') { fb_putc(&fb, *p++); continue; }
+        p++;
+        if (*p == '%') { fb_putc(&fb, '%'); p++; continue; }
+
+        bool left = false, zero = false, plus = false, space = false, alt = false;
+        for (;; p++) {
+            if (*p == '-') left = true;
+            else if (*p == '0') zero = true;
+            else if (*p == '+') plus = true;
+            else if (*p == ' ') space = true;
+            else if (*p == '#') alt = true;
+            else break;
+        }
+
+        int width = 0;
+        if (*p == '*') { p++; int w = (int)(int32_t)va_next(uva, &ai);
+                         if (w < 0) { left = true; w = -w; } width = w; }
+        else while (*p >= '0' && *p <= '9') width = width * 10 + (*p++ - '0');
+        if (width > WIN32_FMT_MAX) width = WIN32_FMT_MAX;
+
+        int prec = -1;
+        if (*p == '.') {
+            p++; prec = 0;
+            if (*p == '*') { p++; prec = (int)(int32_t)va_next(uva, &ai); if (prec < 0) prec = -1; }
+            else while (*p >= '0' && *p <= '9') prec = prec * 10 + (*p++ - '0');
+        }
+        if (prec > WIN32_FMT_MAX) prec = WIN32_FMT_MAX;
+
+        /* Length. NOTE: Windows `long` is 32-bit, so a single 'l' stays
+         * 32-bit; only 'll'/'I64'/'z'/'j'/'t' are 64-bit. */
+        bool wide = false;
+        if (*p == 'l') { p++; if (*p == 'l') { wide = true; p++; } }
+        else if (*p == 'h') { p++; if (*p == 'h') p++; }
+        else if (*p == 'z' || *p == 'j' || *p == 't') { wide = true; p++; }
+        else if (*p == 'I') {
+            p++;
+            if (p[0] == '6' && p[1] == '4') { wide = true; p += 2; }
+            else if (p[0] == '3' && p[1] == '2') { p += 2; }
+            else wide = true;                 /* bare 'I' == pointer width */
+        }
+
+        char conv = *p ? *p++ : '\0';
+        char numbody[80];
+        char pre[4]; int pl = 0;
+
+        switch (conv) {
+        case 'd': case 'i': {
+            uint64_t raw = va_next(uva, &ai);
+            int64_t sv = wide ? (int64_t)raw : (int64_t)(int32_t)raw;
+            uint64_t mag;
+            if (sv < 0) { mag = (uint64_t)(-sv); pre[pl++] = '-'; }
+            else { mag = (uint64_t)sv; if (plus) pre[pl++] = '+'; else if (space) pre[pl++] = ' '; }
+            char digs[24]; int dn = u64_digits(mag, digs, 10, false);
+            if (prec == 0 && mag == 0) dn = 0;
+            int zeros = (prec > dn) ? (prec - dn) : 0;
+            int bl = 0;
+            for (int i = 0; i < zeros && bl < (int)sizeof(numbody); i++) numbody[bl++] = '0';
+            for (int i = 0; i < dn && bl < (int)sizeof(numbody); i++) numbody[bl++] = digs[i];
+            emit_field(&fb, pre, pl, numbody, bl, width, left, zero && prec < 0);
+            break;
+        }
+        case 'u': case 'x': case 'X': case 'o': case 'p': {
+            uint64_t raw = va_next(uva, &ai);
+            int base = (conv == 'x' || conv == 'X' || conv == 'p') ? 16 : (conv == 'o' ? 8 : 10);
+            bool upper = (conv == 'X');
+            uint64_t v = (conv == 'p' || wide) ? raw : (uint32_t)raw;
+            if (conv == 'p') { pre[pl++] = '0'; pre[pl++] = 'x'; }
+            else if (alt && v != 0 && (conv == 'x' || conv == 'X')) { pre[pl++] = '0'; pre[pl++] = (char)conv; }
+            char digs[24]; int dn = u64_digits(v, digs, base, upper);
+            if (prec == 0 && v == 0) dn = 0;
+            if (alt && conv == 'o' && (dn == 0 || digs[0] != '0')) { /* leading 0 */ }
+            int zeros = (prec > dn) ? (prec - dn) : 0;
+            int bl = 0;
+            if (alt && conv == 'o') numbody[bl++] = '0';
+            for (int i = 0; i < zeros && bl < (int)sizeof(numbody); i++) numbody[bl++] = '0';
+            for (int i = 0; i < dn && bl < (int)sizeof(numbody); i++) numbody[bl++] = digs[i];
+            emit_field(&fb, pre, pl, numbody, bl, width, left, zero && prec < 0);
+            break;
+        }
+        case 'c': {
+            char ch = (char)va_next(uva, &ai);
+            emit_field(&fb, pre, 0, &ch, 1, width, left, false);
+            break;
+        }
+        case 's': {
+            uint64_t sp = va_next(uva, &ai);
+            char sbuf[1024];
+            int sl = 0;
+            if (sp) {
+                long n = strncpy_from_user(sbuf, (const char *)(uintptr_t)sp, sizeof(sbuf));
+                if (n < 0) { const char *bad = "(badptr)"; fb_write(&fb, bad, 8); break; }
+                sl = (n >= (long)sizeof(sbuf)) ? (int)sizeof(sbuf) - 1 : (int)n;
+            } else {
+                const char *nul = "(null)";
+                emit_field(&fb, pre, 0, nul, 6, width, left, false);
+                break;
+            }
+            if (prec >= 0 && prec < sl) sl = prec;
+            emit_field(&fb, pre, 0, sbuf, sl, width, left, false);
+            break;
+        }
+        case '\0':
+            fb_putc(&fb, '%');
+            break;
+        default:
+            /* Unknown conversion: emit it verbatim so nothing is silently lost. */
+            fb_putc(&fb, '%');
+            fb_putc(&fb, conv);
+            break;
+        }
+    }
+
+    fb_flush(&fb);
+    return fb.total;
+}
+
+/* api-ms-win-crt-stdio-l1-1-0.dll!__acrt_iob_func(unsigned index) -> FILE*.
+ * Returns an opaque token encoding the std fd; __stdio_common_vfprintf (also
+ * a shim) decodes it. index 0/1/2 = stdin/stdout/stderr. */
+#define WIN32_IOB_TAG 0xF11E0000ULL
+static long w32_acrt_iob_func(uint64_t *args) {
+    return (long)(WIN32_IOB_TAG | ((uint32_t)args[0] & 0xFF));
+}
+
+/* api-ms-win-crt-stdio-l1-1-0.dll!__stdio_common_vfprintf(
+ *     UINT64 options, FILE* stream, const char* fmt, _locale_t loc, va_list).
+ * The printf-family target. Decode the fd from the FILE* token, ignore
+ * options + locale, run the formatter. Returns chars written. */
+static long w32_stdio_common_vfprintf(uint64_t *args) {
+    uint64_t stream = args[1];
+    uint64_t ufmt   = args[2];
+    uint64_t uva    = args[4];        /* 5th arg, marshalled off the stack */
+    int fd = 1;
+    if ((stream & 0xFFFFFF00ULL) == WIN32_IOB_TAG) fd = (int)(stream & 0xFF);
+    if (!ufmt || !uva) return -1;
+    return win32_vformat(fd, ufmt, uva);
+}
+
+/* api-ms-win-crt-stdio-l1-1-0.dll!puts(const char* s) -> >=0 / EOF.
+ * Writes s + '\n' to stdout. */
+static long w32_puts(uint64_t *args) {
+    char s[1024];
+    long n = strncpy_from_user(s, (const char *)(uintptr_t)args[0], sizeof(s));
+    if (n < 0) return -1;             /* EOF */
+    if (n >= (long)sizeof(s)) n = sizeof(s) - 1;
+    win32_fd_write(1, s, (size_t)n);
+    win32_fd_write(1, "\n", 1);
+    return n + 1;
+}
+
 typedef long (*win32_shim_fn)(uint64_t *args);
 
 struct win32_shim {
@@ -3544,6 +3777,11 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetStdHandle", w32_GetStdHandle },
     { "kernel32.dll", "WriteFile",    w32_WriteFile },
     { "kernel32.dll", "ExitProcess",  w32_ExitProcess },
+    /* C2: the C-runtime printf path. The DLL name is one of the ucrt API
+     * sets ("api-ms-win-crt-stdio-l1-1-0.dll"); match is case-insensitive. */
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__acrt_iob_func",          w32_acrt_iob_func },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfprintf",  w32_stdio_common_vfprintf },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "puts",                     w32_puts },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

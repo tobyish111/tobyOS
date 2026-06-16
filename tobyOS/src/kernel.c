@@ -3658,6 +3658,41 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE2_BOOT
+    /* Track C -- Win32/PE C-runtime proof, milestone C2. Build
+     * EXTRA_CFLAGS+=-DWINPE2_BOOT. Spawns /bin/win-crt.exe, a Windows PE that
+     * calls the REAL ucrt printf/puts (which inline to __acrt_iob_func +
+     * __stdio_common_vfprintf, whose va_list is a STACK arg). tobyOS shims
+     * those kernel-side with a full printf engine; the rendered lines show in
+     * the serial log and exit==7 proves stack-arg marshalling + the format
+     * engine. Runs regardless of QUICK_BOOT. */
+    {
+        kprintf("[boot] WINPE2: spawning /bin/win-crt.exe (Windows PE + C runtime)\n");
+        char *argv[] = { (char *)"win-crt.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-crt.exe",
+            .name = "win-crt.exe",
+            .argc = 1,
+            .argv = argv,
+            .envc = 1,
+            .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] WINPE2: /bin/win-crt.exe not spawned (rc=%d) "
+                    "MISSING\n", pid);
+            kprintf("[WINPE2] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE2: /bin/win-crt.exe (pid=%d) exit=%d\n",
+                    pid, rc);
+            kprintf("[WINPE2] VERDICT: %s exit=%d (expected 7)\n",
+                    rc == 7 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef LINUXABI_BOOT
     /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
      * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a

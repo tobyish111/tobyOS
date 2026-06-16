@@ -84,8 +84,8 @@ driver model; POSIX libc surface.
 
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
-2. **App compatibility (~24%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
-   has begun running **unmodified Windows x86-64 `.exe`s**. **Track B (2026-06-14), milestones B1–B9 —
+2. **App compatibility (~25%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
+   **unmodified Windows x86-64 `.exe`s** (including ones that use the C runtime). **Track B (2026-06-14), milestones B1–B9 —
    the discrete Linux high-value set is complete:** a per-process ABI personality + a Linux→tobyOS
    syscall-translation layer run static ELFs (B1), **real musl-libc binaries** (B2 busybox), directory
    listing (B3 getdents64), **Linux signals** (B4), **dynamic linking via the real musl `ld.so`** (B5),
@@ -97,9 +97,15 @@ driver model; POSIX libc surface.
    args and issues one `ABI_SYS_WIN32_DISPATCH` syscall — solving the "CPL3 can't call kernel code"
    problem that made the old dead `pe_loader.c` unworkable). A genuine MinGW-built `win-hello.exe`
    (`kernel32!{GetStdHandle,WriteFile,ExitProcess}`) loads, prints to stdout, and exits 42 (`[WINPE]
-   PASS`, clean `+smep+smap`). **Linux: remaining is incremental syscall breadth** (pthread_join,
-   poll/epoll, broader sockets, glibc). **Windows: C1 is a foundation, not breadth** — next is the
-   kernel32 surface (heap, GetCommandLine/GetModuleHandle, more file I/O), then the MSVC/ucrt CRT, then
+   PASS`, clean `+smep+smap`). **C2 (2026-06-16) — the C runtime:** the marshalling gate now marshals
+   **stack arguments** (not just the 4 register args), so variadic Win32 functions work; a new shimmable
+   DLL namespace (`api-ms-win-crt-stdio`) implements `__acrt_iob_func` + `__stdio_common_vfprintf` + `puts`
+   on top of a **full kernel `printf` engine** (flags/width/precision/length, `d/i/u/x/X/o/p/c/s/%`). A
+   real ucrt-linked `win-crt.exe` renders `%s/%d/%x/%c`, width/precision/zero-pad/left-justify, `%lld`,
+   `%p`, and >4 varargs correctly and exits 7 (`[WINPE2] PASS`, clean `+smep+smap`). **Linux: remaining is
+   incremental syscall breadth** (pthread_join, poll/epoll, broader sockets, glibc). **Windows: still
+   foundation-building** — next is the heap (`HeapAlloc`/`GetProcessHeap`), `GetCommandLine`/`GetModuleHandle`,
+   broader file I/O, then the full `mainCRTStartup` path (SEH/`_initterm`/the ~9 ucrt API-set DLLs), then
    the user32/gdi32 → `SYS_GUI_*` bridge. Still no .NET/UWP.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
    code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
@@ -184,6 +190,28 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-16** — **Track C milestone C2: tobyOS runs a Windows `.exe` that uses the C runtime
+  (`printf`).** Two pieces on the C1 foundation. **(1) The marshalling gate now marshals stack
+  arguments.** C1's gate captured only the 4 Microsoft-x64 register args (`rcx/rdx/r8/r9`); C2's reads
+  `a4..a7` off the caller's stack into the arg array (bytes re-assembled offline + verified; the PE's
+  initial RSP already sits at `USER_STACK_TOP_VA-0x400` so the upward reads stay inside the mapped
+  stack). This is what makes variadic Win32 functions work — a real MinGW/ucrt `printf` inlines to
+  `__stdio_common_vfprintf(options, FILE*, fmt, locale, va_list)` where **`va_list` is the 5th, stack-
+  passed argument**. **(2) A new shimmable DLL namespace + a real printf engine.** `api-ms-win-crt-stdio-
+  l1-1-0.dll` (one of the ucrt API sets) joins kernel32 in the shim table with `__acrt_iob_func` (returns
+  an fd-encoding FILE* token), `__stdio_common_vfprintf`, and `puts`. `win32_vformat` (src/syscall.c) is
+  a from-scratch `printf`: flags (`-`,`0`,`+`,space,`#`), width + precision (incl. `*`), length
+  (`l`/`ll`/`h`/`z`/`I64`, respecting Windows' 32-bit `long`), and conversions `d/i/u/x/X/o/p/c/s/%`; it
+  reads each conversion's argument from the user `va_list` (8-byte slots; `%s` is a user `char*` →
+  `strncpy_from_user`) and writes via `file_write`. Since tobyOS has no real CRT DLL, these shims ARE the
+  CRT for a PE — bypassing the full `mainCRTStartup` (SEH/`_initterm`/~9 ucrt API-set DLLs), which stays
+  C3+. Proof: `programs/win-crt/main.c` (first-party; the `.exe` is a build artifact) calls the real
+  ucrt `printf`/`puts` and prints `printf: world #42 hex=0xff char=Z pct=%`, a width/precision/flags line
+  `[   42] [42   ] [00042] [+42] [tru] [0xabcd] [      rt]`, `six ints: 1 2 3 4 5 6` (stack-passed
+  varargs), `%lld`/`%p`, and the exact `printf` return count (40), then exits 7 → `[WINPE2] VERDICT:
+  PASS`. Clean under default boot AND `-cpu qemu64,+smep,+smap` (0 faults — the va_list/format/`%s`
+  `copy_from_user` + stack-arg reads are SMAP-safe), validate 3/3 ALIVE, and C1's `win-hello.exe` still
+  passes under the shared gate v2 (no regression). App-compat ~24% → ~25%.
 - **2026-06-15** — **Track C milestone C1: tobyOS runs an unmodified Windows x86-64 `.exe`.** This is
   the foundation of the Windows half of gap #2 (app-compat), previously ZERO. A Windows PE does NOT
   make raw syscalls — it imports functions from DLLs through its Import Address Table — so C1 is three
