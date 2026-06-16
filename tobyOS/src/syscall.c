@@ -70,6 +70,7 @@
 #include <tobyos/inotify.h>
 #include <tobyos/clipboard.h>
 #include <tobyos/smp.h>
+#include <tobyos/pe.h>
 
 extern void syscall_entry(void);
 
@@ -3459,6 +3460,139 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     }
 }
 
+/* ============================================================
+ * Track C (foreign-binary compat) -- Win32 / PE personality, milestone C1.
+ *
+ * A loaded Windows PE never makes raw syscalls. Its imports were bound by
+ * the PE loader (src/pe_loader.c) to user-mode thunks that funnel into a
+ * shared marshalling gate; that gate captures the Microsoft-x64 argument
+ * registers into an 8-qword array and issues exactly one syscall:
+ *   ABI_SYS_WIN32_DISPATCH(func_index, args_ptr)
+ * We copy the args in and call the indexed shim below. Each shim reads the
+ * MS-x64 arguments out of args[] (args[0]=rcx, [1]=rdx, [2]=r8, [3]=r9,
+ * [4..7]=stack args, zeroed for C1) and returns the Win32 function's
+ * result (which the gate hands back to the PE in RAX).
+ *
+ * The shims deliberately reuse tobyOS primitives (sys_write, proc_exit,
+ * the per-proc fd table) so Win32 console I/O lands on the very same path
+ * as native + Linux output.
+ * ============================================================ */
+
+/* Win32 standard-handle pseudo-values. nStdHandle is a DWORD, and the
+ * compiler passes it via `mov ecx, imm32` which ZERO-extends, so the value
+ * the gate captures is the 32-bit form (e.g. 0x00000000FFFFFFF5), NOT the
+ * 64-bit sign-extended one. Compare at DWORD width. We map each handle
+ * straight onto a tobyOS fd so the returned "HANDLE" feeds back to
+ * WriteFile unchanged. */
+#define WIN32_STD_INPUT_HANDLE   ((uint32_t)-10)   /* 0xFFFFFFF6 */
+#define WIN32_STD_OUTPUT_HANDLE  ((uint32_t)-11)   /* 0xFFFFFFF5 */
+#define WIN32_STD_ERROR_HANDLE   ((uint32_t)-12)   /* 0xFFFFFFF4 */
+#define WIN32_INVALID_HANDLE     ((uint64_t)-1)
+
+/* kernel32!GetStdHandle(DWORD nStdHandle) -> HANDLE. */
+static long w32_GetStdHandle(uint64_t *args) {
+    switch ((uint32_t)args[0]) {
+        case WIN32_STD_INPUT_HANDLE:  return 0;   /* fd 0 */
+        case WIN32_STD_OUTPUT_HANDLE: return 1;   /* fd 1 */
+        case WIN32_STD_ERROR_HANDLE:  return 2;   /* fd 2 */
+        default:                      return (long)WIN32_INVALID_HANDLE;
+    }
+}
+
+/* kernel32!WriteFile(HANDLE hFile, LPCVOID buf, DWORD n,
+ *                    LPDWORD written, LPOVERLAPPED ovl) -> BOOL.
+ * We treat hFile as a tobyOS fd, ignore the (synchronous) overlapped arg,
+ * and write through sys_write (fd lookup + copy_from_user + file_write).
+ * On success the byte count is stored into *written (a user pointer). */
+static long w32_WriteFile(uint64_t *args) {
+    int       fd      = (int)args[0];
+    uint64_t  ubuf    = args[1];
+    uint32_t  n       = (uint32_t)args[2];
+    uint64_t  pwrite  = args[3];   /* LPDWORD, may be NULL */
+
+    long wrote = sys_write(fd, (const void *)(uintptr_t)ubuf, n);
+    if (wrote < 0) {
+        if (pwrite) { uint32_t z = 0; (void)copy_to_user((void *)(uintptr_t)pwrite, &z, 4); }
+        return 0;   /* FALSE */
+    }
+    if (pwrite) {
+        uint32_t w = (uint32_t)wrote;
+        if (copy_to_user((void *)(uintptr_t)pwrite, &w, 4) != 0) return 0;
+    }
+    return 1;       /* TRUE */
+}
+
+/* kernel32!ExitProcess(UINT code) -> (noreturn). */
+static long w32_ExitProcess(uint64_t *args) {
+    kprintf("[win32] ExitProcess(%u)\n", (unsigned)args[0]);
+    proc_exit((int)(uint32_t)args[0]);
+    return 0;       /* unreached */
+}
+
+typedef long (*win32_shim_fn)(uint64_t *args);
+
+struct win32_shim {
+    const char    *dll;     /* lower-case DLL name, no path */
+    const char    *func;    /* exact exported symbol */
+    win32_shim_fn  fn;
+};
+
+/* The kernel32 subset for C1. Index into this table is what the PE loader
+ * bakes into each IAT thunk; keep it append-only so existing thunks stay
+ * valid. */
+static const struct win32_shim g_win32_shims[] = {
+    { "kernel32.dll", "GetStdHandle", w32_GetStdHandle },
+    { "kernel32.dll", "WriteFile",    w32_WriteFile },
+    { "kernel32.dll", "ExitProcess",  w32_ExitProcess },
+};
+#define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
+
+/* Case-insensitive compare of a (possibly mixed-case) DLL name against our
+ * lower-case table entries. */
+static bool win32_dll_eq(const char *a, const char *b) {
+    for (;; a++, b++) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+        if (ca != cb) return false;
+        if (ca == '\0') return true;
+    }
+}
+
+int win32_shim_index(const char *dll, const char *func) {
+    if (!dll || !func) return -1;
+    for (int i = 0; i < WIN32_SHIM_COUNT; i++) {
+        if (win32_dll_eq(dll, g_win32_shims[i].dll) &&
+            strcmp(func, g_win32_shims[i].func) == 0)
+            return i;
+    }
+    return -1;
+}
+
+long win32_dispatch(uint64_t func_index, uint64_t args_ptr) {
+    if ((int)func_index >= WIN32_SHIM_COUNT) {
+        kprintf("[win32] bad shim index %lu\n", (unsigned long)func_index);
+        return -1;
+    }
+    uint64_t args[8];
+    if (copy_from_user(args, (const void *)(uintptr_t)args_ptr, sizeof(args)) != 0) {
+        kprintf("[win32] dispatch: bad args_ptr %p\n", (void *)(uintptr_t)args_ptr);
+        return -1;
+    }
+    return g_win32_shims[func_index].fn(args);
+}
+
+/* Win32 personality translator -- the mirror of linux_syscall(). A PE only
+ * ever issues the marshalling gate's ABI_SYS_WIN32_DISPATCH; anything else
+ * is unexpected and falls through to the native dispatcher (which will
+ * report it). */
+static long win32_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
+    if (n == ABI_SYS_WIN32_DISPATCH)
+        return win32_dispatch((uint64_t)a1, (uint64_t)a2);
+    kprintf("[win32] unexpected raw syscall %ld from a PE process\n", n);
+    return do_syscall(n, a1, a2, a3, a4, a5);
+}
+
 long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Milestone 26E: re-enable interrupts inside the syscall body.
      *
@@ -3535,12 +3669,18 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
              (unsigned long)a1, (unsigned long)a2);
     }
 
-    /* Track B: a process branded ABI_PERS_LINUX speaks the Linux x86-64
-     * syscall ABI -- route its `num` through the translation layer. The
-     * native path (the common case) is completely unchanged. */
-    long rv = (caller && caller->personality == ABI_PERS_LINUX)
-                  ? linux_syscall(num, a1, a2, a3, a4, a5)
-                  : do_syscall(num, a1, a2, a3, a4, a5);
+    /* Track B/C: a process carrying a foreign-binary personality routes its
+     * `num` through the matching translation layer. ABI_PERS_LINUX speaks the
+     * Linux x86-64 syscall ABI; ABI_PERS_WIN32 is a loaded Windows PE whose
+     * only syscall is the Win32 marshalling gate. The native path (the common
+     * case, personality 0) is completely unchanged. */
+    long rv;
+    if (caller && caller->personality == ABI_PERS_LINUX)
+        rv = linux_syscall(num, a1, a2, a3, a4, a5);
+    else if (caller && caller->personality == ABI_PERS_WIN32)
+        rv = win32_syscall(num, a1, a2, a3, a4, a5);
+    else
+        rv = do_syscall(num, a1, a2, a3, a4, a5);
 
     perf_syscall_exit((int)num, t_sys);
     perf_zone_end(PERF_Z_SYSCALL, t_sys);

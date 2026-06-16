@@ -53,6 +53,7 @@
 #include <tobyos/heap.h>
 #include <tobyos/vfs.h>
 #include <tobyos/elf.h>
+#include <tobyos/pe.h>
 #include <tobyos/tss.h>
 #include <tobyos/cpu.h>
 #include <tobyos/printk.h>
@@ -700,12 +701,46 @@ static int spawn_internal(const char *path, const char *name,
     uint64_t old_editor  = vmm_set_editor_root(pml4);
     if (saved_cr3 != pml4) write_cr3(pml4);
 
+    /* Track C: a Windows PE/COFF image is loaded by an entirely separate
+     * path (sections + IAT thunks, no ELF program headers). Detect it by
+     * the 'MZ'/'PE' magic in the kernel-side `image` buffer (CR3-agnostic)
+     * and branch the whole image-load below. */
+    bool is_pe = pe_is_image(image, image_size);
+
+    /* Outputs shared by both arms, consumed after the CR3 window closes. */
+    bool ok;
+    bool has_interp = false;
+    struct elf_load_info prog_info   = {0};
+    struct elf_load_info interp_info = {0};
+    struct pe_load_info  pe_info     = {0};
+    uint64_t user_rsp = USER_STACK_RSP_INIT;
+
+  if (is_pe) {
+    /* ---- Windows PE/COFF image (Track C) ---- */
+    int prc = pe_load_user(image, image_size, &pe_info);
+    kfree(image);
+    ok = (prc == 0);
+    if (ok) {
+        p->personality = ABI_PERS_WIN32;
+        kprintf("[proc] pid %d '%s' -> Win32 PE personality (entry=%p)\n",
+                p->pid, p->name, (void *)pe_info.entry);
+        ok = build_user_stack(p);
+    }
+    if (ok) {
+        /* Windows entry points run on a 16-aligned stack. Leave headroom
+         * above RSP so the marshalling gate's MS-x64 stack-arg reads stay
+         * inside the mapped stack. No argv/auxv frame -- a freestanding PE
+         * gets its command line via GetCommandLine (a later milestone). */
+        user_rsp = (USER_STACK_TOP_VA - 0x400) & ~0xFULL;
+    }
+  } else {
+    /* ---- ELF image (tobyOS-native or Linux personality) ---- */
     /* Milestone 25D: peek for PT_INTERP BEFORE loading. Done outside
      * the CR3 swap window because elf_peek_interp only reads from the
      * kernel-virtual `image` buffer -- no user mappings involved. */
     char interp_path[ABI_PATH_MAX];
-    bool has_interp = elf_peek_interp(image, image_size,
-                                      interp_path, sizeof(interp_path));
+    has_interp = elf_peek_interp(image, image_size,
+                                 interp_path, sizeof(interp_path));
 
     /* Pick load bases:
      *  - ET_EXEC: load_base = 0 (vaddrs are absolute).
@@ -736,8 +771,7 @@ static int spawn_internal(const char *path, const char *name,
      * single most expensive operation during spawn (reads segments,
      * alloc+maps each page, memcpys the bytes in). */
     uint64_t t_elf = perf_rdtsc();
-    struct elf_load_info prog_info = {0};
-    bool ok = elf_load_user_at(image, image_size, prog_load_base, &prog_info);
+    ok = elf_load_user_at(image, image_size, prog_load_base, &prog_info);
     perf_zone_end(PERF_Z_ELF_LOAD, t_elf);
     kfree(image);                  /* segments now live in their own frames */
 
@@ -759,7 +793,6 @@ static int spawn_internal(const char *path, const char *name,
      * single role here is to make both images resident and to give
      * the interpreter the auxv it needs to find the program's PHDRs;
      * actual relocation and symbol resolution happen in user mode. */
-    struct elf_load_info interp_info = {0};
     void  *interp_image      = 0;
     size_t interp_image_size = 0;
     if (ok && has_interp) {
@@ -815,7 +848,6 @@ static int spawn_internal(const char *path, const char *name,
      *   { argc=0, argv=[NULL], envp=[NULL], auxv=[AT_NULL] }
      * frame anyway so the user-side trampoline always finds a valid
      * layout at the top of the stack. */
-    uint64_t user_rsp = USER_STACK_RSP_INIT;
     if (ok) {
         struct user_stack_pack pack = {
             .argc = argc, .argv = argv,
@@ -824,6 +856,7 @@ static int spawn_internal(const char *path, const char *name,
         };
         ok = pack_user_stack(&pack, &user_rsp);
     }
+  } /* end ELF arm */
 
     if (read_cr3() != saved_cr3) write_cr3(saved_cr3);
     vmm_set_editor_root(old_editor);
@@ -836,10 +869,13 @@ static int spawn_internal(const char *path, const char *name,
         return -1;
     }
 
-    /* Initial RIP: hand control to the dynamic linker if present so
-     * it can self-relocate, load DT_NEEDED libraries, and resolve
-     * relocations before jumping to AT_ENTRY. */
-    p->user_entry = has_interp ? interp_info.entry : prog_info.entry;
+    /* Initial RIP: the PE entry point for a Windows image; otherwise the
+     * dynamic linker if present (so it can self-relocate, load DT_NEEDED
+     * libraries, and resolve relocations before jumping to AT_ENTRY) or
+     * the program entry for a static ELF. */
+    p->user_entry = is_pe       ? pe_info.entry
+                  : has_interp  ? interp_info.entry
+                                : prog_info.entry;
     p->user_rsp   = user_rsp;
 
     /* ---- 4. kernel stack with the fake initial frame ---- */

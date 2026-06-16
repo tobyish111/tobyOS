@@ -133,6 +133,13 @@ extern "C" {
  * (OSABI 0/SYSV) keep the default, so this can never regress them. */
 #define ABI_PERS_TOBY        0
 #define ABI_PERS_LINUX       1
+/* Track C: a process whose image is a Windows PE/COFF executable. It is
+ * detected at exec time by the 'MZ' magic (not a brand), its sections +
+ * IAT are mapped by the PE loader, and its syscalls (only ever the
+ * marshalling gate's ABI_SYS_WIN32_DISPATCH) route through win32_syscall().
+ * Native ELF binaries can never become this -- it is set only on the PE
+ * path -- so it carries zero regression risk for tobyOS/Linux binaries. */
+#define ABI_PERS_WIN32       2
 
 /* ============================================================
  *  Syscall numbers
@@ -670,6 +677,23 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
 #define ABI_SYS_GETPRIORITY    166  /* (int pid) -> prio or ABI_PRIO_NONE.
                                        pid<=0 means the caller. */
 
+/* ---- Track C (Win32/PE app compat): Win32 API dispatch gate ----------
+ *
+ * A loaded Windows PE never makes raw syscalls -- it imports functions
+ * (kernel32!WriteFile, ...) through its Import Address Table. The PE
+ * loader binds each IAT slot to a small user-mode trampoline (a "thunk")
+ * that funnels into a shared marshalling gate. That gate captures the
+ * Microsoft-x64 argument registers, then issues exactly ONE syscall --
+ * this one -- to cross into the kernel-side Win32 shim:
+ *   a1 = func_index  (which shim, an index into the kernel's shim table)
+ *   a2 = args_ptr    (user VA of an 8-qword array holding rcx,rdx,r8,r9,...)
+ * The dispatcher copy_from_user's the args and invokes the shim, whose
+ * return value becomes the Win32 function's result (RAX). Only processes
+ * carrying ABI_PERS_WIN32 ever issue this; see win32_syscall() /
+ * win32_dispatch() in src/syscall.c and the loader in src/pe_loader.c. */
+#define ABI_SYS_WIN32_DISPATCH 167  /* (uint64 func_index, uint64 args_ptr)
+                                       -> Win32 function result. */
+
 /* Scheduling priority classes (mirror of the kernel's PRIO_* in
  * <tobyos/sched.h>): HIGHER runs first, 0 == NORMAL (the default). */
 #define ABI_PRIO_IDLE   (-2)
@@ -684,7 +708,7 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
 #define ABI_PRIO_NONE   (-1000000)
 
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          167
+#define ABI_SYS_NR_MAX          168
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

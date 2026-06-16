@@ -1272,6 +1272,21 @@ programs/linux-thread/linux-thread.elf: programs/linux-thread/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# ---------- Track C (Win32/PE app compat): win-hello.exe ----------
+#
+# win-hello.exe is NOT a tobyOS program: it is a GENUINE Windows x86-64
+# console PE, built with the Windows target triple and linked against the
+# real mingw kernel32 import library, so it is byte-for-byte a normal
+# Windows .exe (it would run unmodified on Windows). -nostdlib + a custom
+# entry keep the import surface to the three kernel32 symbols C1 shims:
+# GetStdHandle / WriteFile / ExitProcess. PE is self-identifying by its
+# 'MZ' magic, so -- unlike the brandelf'd Linux ELFs -- it needs NO brand;
+# tobyOS's exec path sniffs the magic and routes it to the PE loader.
+programs/win-hello/win-hello.exe: programs/win-hello/hello.c
+	$(CC) --target=x86_64-w64-mingw32 -nostdlib -ffreestanding -fno-builtin \
+	      -fno-stack-protector -O1 -Wl,-e,hello_entry -Wl,--subsystem,console \
+	      -o $@ $< -lkernel32
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1553,6 +1568,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-sigtest/linux-sigtest.elf \
                programs/linux-mmaptest/linux-mmaptest.elf \
                programs/linux-thread/linux-thread.elf \
+               programs/win-hello/win-hello.exe \
                initrd/etc/motd initrd/readme.txt \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1602,6 +1618,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-sigtest/linux-sigtest.elf       $(INITRD_STAGE)/bin/linux-sigtest
 	cp programs/linux-mmaptest/linux-mmaptest.elf     $(INITRD_STAGE)/bin/linux-mmaptest
 	cp programs/linux-thread/linux-thread.elf         $(INITRD_STAGE)/bin/linux-thread
+	cp programs/win-hello/win-hello.exe               $(INITRD_STAGE)/bin/win-hello.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -1803,7 +1820,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/login bin/gui_settings bin/abi_test                           \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
-	    bin/linux-mmaptest bin/linux-thread                              \
+	    bin/linux-mmaptest bin/linux-thread bin/win-hello.exe            \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \

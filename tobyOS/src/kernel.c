@@ -3621,6 +3621,43 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE_BOOT
+    /* Track C (foreign-binary compat) -- Win32/PE proof, milestone C1.
+     * Build EXTRA_CFLAGS+=-DWINPE_BOOT. Spawns /bin/win-hello.exe, a GENUINE
+     * Windows x86-64 console PE (built with the Windows toolchain, importing
+     * kernel32!{GetStdHandle,WriteFile,ExitProcess}). tobyOS's PE loader maps
+     * the image, binds those imports to its Win32 shims via a user-mode
+     * marshalling gate, and runs it: the program writes a line to stdout
+     * through WriteFile and exits 42. The written line shows up in the serial
+     * log and exit==42 proves the whole PE-load -> IAT -> shim chain. Runs
+     * regardless of QUICK_BOOT so it is provable on a fast headless boot. */
+    {
+        kprintf("[boot] WINPE: spawning /bin/win-hello.exe (Windows x86-64 PE)\n");
+        char *argv[] = { (char *)"win-hello.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-hello.exe",
+            .name = "win-hello.exe",
+            .argc = 1,
+            .argv = argv,
+            .envc = 1,
+            .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] WINPE: /bin/win-hello.exe not spawned (rc=%d) "
+                    "MISSING\n", pid);
+            kprintf("[WINPE] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE: /bin/win-hello.exe (pid=%d) exit=%d\n",
+                    pid, rc);
+            kprintf("[WINPE] VERDICT: %s exit=%d (expected 42)\n",
+                    rc == 42 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef LINUXABI_BOOT
     /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
      * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a

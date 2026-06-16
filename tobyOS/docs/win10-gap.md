@@ -84,16 +84,23 @@ driver model; POSIX libc surface.
 
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
-2. **App compatibility (~23%)** — still no Win32/.NET/UWP, but tobyOS now runs **unmodified Linux
-   x86-64 binaries** broadly. **Track B (2026-06-14), milestones B1–B9 — the discrete high-value set is
-   complete:** a per-process ABI personality + a Linux→tobyOS syscall-translation layer run static ELFs
-   (B1), **real musl-libc binaries** (B2 busybox), directory listing (B3 getdents64), **Linux signals**
-   (B4), **dynamic linking via the real musl `ld.so`** (B5), **file-backed mmap** (B6) → **end-to-end
-   multi-DSO** (B7, Alpine `file`+`libmagic`), **a real shell** (B8 `busybox sh` via fork/execve/wait4),
-   and **threads** (B9 `clone(CLONE_VM)`). Surfaced + fixed **3 latent kernel bugs** (PAGE_MASK >4 GiB
-   truncation; execve user-stack pack missing a SMAP window; …). All proven under `+smep+smap`. **What
-   remains is incremental syscall breadth** (`pthread_join` clear_child_tid+futex, poll/epoll/select,
-   broader sockets, glibc's heavier demands) — diminishing returns, not discrete milestones.
+2. **App compatibility (~24%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
+   has begun running **unmodified Windows x86-64 `.exe`s**. **Track B (2026-06-14), milestones B1–B9 —
+   the discrete Linux high-value set is complete:** a per-process ABI personality + a Linux→tobyOS
+   syscall-translation layer run static ELFs (B1), **real musl-libc binaries** (B2 busybox), directory
+   listing (B3 getdents64), **Linux signals** (B4), **dynamic linking via the real musl `ld.so`** (B5),
+   **file-backed mmap** (B6) → **end-to-end multi-DSO** (B7, Alpine `file`+`libmagic`), **a real shell**
+   (B8 `busybox sh` via fork/execve/wait4), and **threads** (B9 `clone(CLONE_VM)`). Surfaced + fixed
+   **3 latent kernel bugs**. **Track C (2026-06-15), the Windows half, has its foundation — milestone C1:**
+   a real **PE32+ loader** maps sections + applies base relocations, and the **IAT is bound to a kernel
+   Win32 shim** via a user-mode marshalling gate (each import → a thunk that captures the Microsoft-x64
+   args and issues one `ABI_SYS_WIN32_DISPATCH` syscall — solving the "CPL3 can't call kernel code"
+   problem that made the old dead `pe_loader.c` unworkable). A genuine MinGW-built `win-hello.exe`
+   (`kernel32!{GetStdHandle,WriteFile,ExitProcess}`) loads, prints to stdout, and exits 42 (`[WINPE]
+   PASS`, clean `+smep+smap`). **Linux: remaining is incremental syscall breadth** (pthread_join,
+   poll/epoll, broader sockets, glibc). **Windows: C1 is a foundation, not breadth** — next is the
+   kernel32 surface (heap, GetCommandLine/GetModuleHandle, more file I/O), then the MSVC/ucrt CRT, then
+   the user32/gdi32 → `SYS_GUI_*` bridge. Still no .NET/UWP.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
    code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
    on top of the per-CPU TSS/GS/current_proc foundation. The pid 0 ↔ login interaction bit
@@ -177,6 +184,29 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-15** — **Track C milestone C1: tobyOS runs an unmodified Windows x86-64 `.exe`.** This is
+  the foundation of the Windows half of gap #2 (app-compat), previously ZERO. A Windows PE does NOT
+  make raw syscalls — it imports functions from DLLs through its Import Address Table — so C1 is three
+  pieces, none of which the old `pe_loader.c` actually did (it was dead code with no callers, and its
+  IAT-points-at-a-kernel-function design can't work: CPL3 can't call a CPL0 address). **(1) A real
+  PE32+ loader** (`src/pe_loader.c`, rewritten): sniff `MZ`/`PE` in the exec path (`spawn_internal`,
+  `src/proc.c`), map the headers + sections at the preferred ImageBase into user pages, zero BSS tails,
+  apply `DIR64` base relocations (a no-op at the preferred base), all under SMAP uaccess windows.
+  **(2) IAT → kernel-shim binding via a user-mode marshalling gate.** The loader maps one `R-X` user
+  page holding a hand-verified position-independent gate plus a 10-byte thunk per import; each IAT slot
+  is bound to its thunk. At runtime the PE does `call *[iat]` → thunk (`mov eax,<shim-index>; jmp gate`)
+  → gate, which captures the Microsoft-x64 arg registers (`rcx/rdx/r8/r9`, callee-saved `rdi/rsi`
+  preserved) into a user-stack array and issues exactly one new syscall, `ABI_SYS_WIN32_DISPATCH`.
+  **(3) A kernel-side kernel32 subset** (`src/syscall.c`): a new `ABI_PERS_WIN32` personality routes
+  that syscall to `win32_dispatch`, which `copy_from_user`s the args and calls the indexed shim.
+  `GetStdHandle`/`WriteFile`/`ExitProcess` reuse tobyOS primitives (`sys_write`, `proc_exit`), so Win32
+  console output lands on the same stdout path as native + Linux. Proof: a genuine MinGW-built
+  `win-hello.exe` (`programs/win-hello/hello.c`, first-party source; the `.exe` is a build artifact)
+  prints `hello from a Windows PE binary running on tobyOS` and exits 42 → `[WINPE] VERDICT: PASS`,
+  clean under default boot AND `-cpu qemu64,+smep,+smap` (0 faults), validate 3/3 ALIVE. **Bug caught
+  in the act:** `GetStdHandle(STD_OUTPUT_HANDLE)` compiles to `mov ecx,0xfffffff5` which zero-extends,
+  so the shim must compare `nStdHandle` at DWORD width — the 64-bit sign-extended constant silently
+  returned `INVALID_HANDLE` and ate the first WriteFile. App-compat ~23% → ~24%.
 - **2026-06-14 (later 8)** — **Track B milestone B9 (finale): Linux threads — `clone(CLONE_VM)` runs a
   real thread in the shared address space.** Added `sys_clone_thread` (`src/fork.c`): a `clone(56)`
   with `CLONE_VM` set creates a thread that, like fork, resumes after the `clone` syscall with rax=0
