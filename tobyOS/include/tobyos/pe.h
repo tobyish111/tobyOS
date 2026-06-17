@@ -53,9 +53,15 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_CRT_FMODE     0x08   /* int   _fmode          */
 #define WIN32_CRT_ARGV      0x10   /* char**argv  (a value) */
 #define WIN32_CRT_ENVIRON   0x18   /* char**environ (value) */
+#define WIN32_CRT_ERRNO     0x20   /* int   errno (for _errno())   */
 #define WIN32_CRT_ARGV_ARR  0x40   /* char* argv[]  array   */
 #define WIN32_CRT_ENVIRON_ARR 0x100/* char* environ[] array */
 #define WIN32_CRT_STRINGS   0x140  /* argv string bytes     */
+/* C4 (C++ CRT): a minimal "C" locale `struct lconv` + the strings the
+ * shims hand back. Past the argv strings region. */
+#define WIN32_CRT_LCONV     0x300  /* struct lconv (decimal_point first) */
+#define WIN32_CRT_LCONV_DOT 0x3F0  /* "." (lconv.decimal_point target)   */
+#define WIN32_CRT_STRERR    0x3F8  /* strerror() fixed message           */
 
 /* Resolve "dll!func" to the kernel-side Win32 shim index used to bind an
  * IAT thunk (case-insensitive dll match, exact func match). Returns the

@@ -3889,6 +3889,45 @@ static long w32_VirtualQuery(uint64_t *a) {
     return (long)sizeof(mbi);
 }
 
+/* ---- C4: the extra ucrt surface a C++ program pulls in ---- */
+
+/* _errno() / localeconv() / strerror(): return USER pointers into the CRT
+ * data page (errno slot, minimal "C" lconv, a fixed message). */
+static long w32_errno(uint64_t *a)     { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_ERRNO); }
+static long w32_localeconv(uint64_t *a){ (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_LCONV); }
+static long w32_strerror(uint64_t *a)  { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_STRERR); }
+
+/* fputc(c, FILE*) -> write one byte to the fd encoded in the FILE* token. */
+static long w32_fputc(uint64_t *a) {
+    int  c  = (int)(unsigned char)a[0];
+    int  fd = 1;
+    if ((a[1] & 0xFFFFFF00ULL) == WIN32_IOB_TAG) fd = (int)(a[1] & 0xFF);
+    char ch = (char)c;
+    if (win32_fd_write(fd, &ch, 1) < 0) return -1;   /* EOF */
+    return c;
+}
+
+/* strnlen(s, max) over user memory. */
+static long w32_strnlen(uint64_t *a) {
+    uint64_t max = a[1];
+    char buf[1024];
+    long n = strncpy_from_user(buf, (const char *)(uintptr_t)a[0], sizeof(buf));
+    if (n < 0) return 0;
+    if (n >= (long)sizeof(buf)) n = sizeof(buf) - 1;
+    return ((uint64_t)n > max) ? (long)max : n;
+}
+
+/* wcslen(ws): length of a UTF-16 string (count u16 units until 0). */
+static long w32_wcslen(uint64_t *a) {
+    uint64_t p = a[0];
+    for (long n = 0; n < 65536; n++) {
+        uint16_t w = 0;
+        if (copy_from_user(&w, (const void *)(uintptr_t)(p + (uint64_t)n * 2), 2) != 0) return n;
+        if (w == 0) return n;
+    }
+    return 65536;
+}
+
 typedef long (*win32_shim_fn)(uint64_t *args);
 
 struct win32_shim {
@@ -3958,6 +3997,25 @@ static const struct win32_shim g_win32_shims[] = {
     /* ucrt: string */
     { "api-ms-win-crt-string-l1-1-0.dll", "strlen",                  w32_strlen },
     { "api-ms-win-crt-string-l1-1-0.dll", "strncmp",                 w32_strncmp },
+
+    /* ---- C4: the extra ucrt surface a C++ .exe pulls in ---- */
+    /* convert (multibyte/wide -- not on the integer-printf path; minimal) */
+    { "api-ms-win-crt-convert-l1-1-0.dll", "mbrtowc",                w32_one },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "wcrtomb",                w32_one },
+    /* filesystem: stdio FILE locking -- single-threaded, no-op */
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_lock_file",          w32_zero },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_unlock_file",        w32_zero },
+    /* locale */
+    { "api-ms-win-crt-locale-l1-1-0.dll", "localeconv",              w32_localeconv },
+    /* runtime extras */
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_errno",                 w32_errno },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "strerror",              w32_strerror },
+    /* stdio extras */
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fputc",                    w32_fputc },
+    /* string extras */
+    { "api-ms-win-crt-string-l1-1-0.dll", "strnlen",                 w32_strnlen },
+    { "api-ms-win-crt-string-l1-1-0.dll", "wcslen",                  w32_wcslen },
+    { "api-ms-win-crt-string-l1-1-0.dll", "wcsnlen",                 w32_wcslen },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

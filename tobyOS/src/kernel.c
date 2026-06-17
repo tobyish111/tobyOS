@@ -3729,6 +3729,40 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE4_BOOT
+    /* Track C -- a STOCK C++ .exe, milestone C4. Build EXTRA_CFLAGS+=-DWINPE4_BOOT.
+     * Spawns /bin/win-cpp.exe, a plain `clang++ main.cpp -o win-cpp.exe`. Beyond
+     * C3 this runs a C++ GLOBAL CONSTRUCTOR (mingw calls it from static __main ->
+     * __do_global_ctors in CPL3 -- no kernel trampoline) before main, and pulls
+     * in the wider ucrt surface (_errno/localeconv/FILE locking/wide-string
+     * helpers) that tobyOS shims. The ctor's line appears in the serial log and
+     * exit==5 proves the constructor ran. Runs regardless of QUICK_BOOT. */
+    {
+        kprintf("[boot] WINPE4: spawning /bin/win-cpp.exe (STOCK C++ Windows .exe)\n");
+        char *argv[] = { (char *)"win-cpp.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-cpp.exe",
+            .name = "win-cpp.exe",
+            .argc = 1,
+            .argv = argv,
+            .envc = 1,
+            .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] WINPE4: /bin/win-cpp.exe not spawned (rc=%d) "
+                    "MISSING\n", pid);
+            kprintf("[WINPE4] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE4: /bin/win-cpp.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE4] VERDICT: %s exit=%d (expected 5)\n",
+                    rc == 5 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef LINUXABI_BOOT
     /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
      * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a

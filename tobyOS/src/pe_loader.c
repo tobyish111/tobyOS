@@ -399,6 +399,14 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         *(uint64_t *)(base + WIN32_CRT_ARGV)        = argv_arr;
         *(uint64_t *)(base + WIN32_CRT_ENVIRON)     = base + WIN32_CRT_ENVIRON_ARR;
         *(uint64_t *)(base + WIN32_CRT_ENVIRON_ARR) = 0;   /* environ[0] = NULL */
+
+        /* C4: a minimal "C"-locale lconv. Only decimal_point (the first
+         * field) needs to be a valid non-NULL "."; the rest stay zeroed,
+         * which the CRT reads as "no grouping / empty". Plus a strerror msg. */
+        *(char *)(base + WIN32_CRT_LCONV_DOT)     = '.';
+        *(char *)(base + WIN32_CRT_LCONV_DOT + 1) = '\0';
+        *(uint64_t *)(base + WIN32_CRT_LCONV)     = base + WIN32_CRT_LCONV_DOT; /* decimal_point */
+        memcpy((void *)(base + WIN32_CRT_STRERR), "error", 6);
         uaccess_end(uf);
     }
 
