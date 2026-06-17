@@ -732,11 +732,15 @@ static int spawn_internal(const char *path, const char *name,
         ok = build_user_stack(p);
     }
     if (ok) {
-        /* Windows entry points run on a 16-aligned stack. Leave headroom
-         * above RSP so the marshalling gate's MS-x64 stack-arg reads stay
-         * inside the mapped stack. No argv/auxv frame -- a freestanding PE
-         * gets its command line via GetCommandLine (a later milestone). */
-        user_rsp = (USER_STACK_TOP_VA - 0x400) & ~0xFULL;
+        /* Windows entry points are entered with RSP%16==8 -- i.e. as if reached
+         * by a CALL (return address pushed). The mingw mainCRTStartup relies on
+         * this: its `sub rsp,0x28; call __tmainCRTStartup` only keeps the stack
+         * 16-aligned at the call if it starts at %16==8, and the whole CRT chain
+         * (-> main) inherits that. A 16-aligned (%16==0) entry desyncs every
+         * frame by 8 and faults the first `movaps [rbp+x]`. Leave headroom above
+         * RSP for the marshalling gate's MS-x64 stack-arg reads. No argv/auxv
+         * frame -- a PE gets its command line from the CRT-data region / TEB. */
+        user_rsp = ((USER_STACK_TOP_VA - 0x400) & ~0xFULL) - 8;
     }
   } else {
     /* ---- ELF image (tobyOS-native or Linux personality) ---- */

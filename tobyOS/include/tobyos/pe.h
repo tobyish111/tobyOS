@@ -62,6 +62,9 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_CRT_LCONV     0x300  /* struct lconv (decimal_point first) */
 #define WIN32_CRT_LCONV_DOT 0x3F0  /* "." (lconv.decimal_point target)   */
 #define WIN32_CRT_STRERR    0x3F8  /* strerror() fixed message           */
+/* C5 (file I/O): a scratch buffer where CreateFileA writes the translated
+ * (Windows->tobyOS) path so it can hand sys_open a USER pointer. */
+#define WIN32_CRT_PATHBUF   0x800  /* translated path scratch (<=0x200)  */
 
 /* Resolve "dll!func" to the kernel-side Win32 shim index used to bind an
  * IAT thunk (case-insensitive dll match, exact func match). Returns the

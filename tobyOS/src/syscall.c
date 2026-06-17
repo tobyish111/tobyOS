@@ -3855,6 +3855,21 @@ static long w32_strlen(uint64_t *a) {
     if (n < 0) return 0;
     return (n >= (long)sizeof(buf)) ? (long)sizeof(buf) - 1 : n;
 }
+static long w32_memcmp(uint64_t *a) {
+    uint64_t p1 = a[0], p2 = a[1], n = a[2], done = 0;
+    char b1[256], b2[256];
+    while (done < n) {
+        uint64_t chunk = n - done; if (chunk > sizeof(b1)) chunk = sizeof(b1);
+        if (copy_from_user(b1, (const void *)(uintptr_t)(p1 + done), chunk) != 0) return 1;
+        if (copy_from_user(b2, (const void *)(uintptr_t)(p2 + done), chunk) != 0) return 1;
+        for (uint64_t i = 0; i < chunk; i++) {
+            unsigned char c1 = (unsigned char)b1[i], c2 = (unsigned char)b2[i];
+            if (c1 != c2) return (long)c1 - (long)c2;
+        }
+        done += chunk;
+    }
+    return 0;
+}
 static long w32_strncmp(uint64_t *a) {
     char s1[512], s2[512];
     uint64_t n = a[2]; if (n > 511) n = 511;
@@ -3928,6 +3943,85 @@ static long w32_wcslen(uint64_t *a) {
     return 65536;
 }
 
+/* ---- C5: file I/O via real HANDLE<->fd mapping ----
+ * A Win32 HANDLE from CreateFile/GetStdHandle is just a tobyOS fd; the ucrt
+ * FILE* tokens (0xF11E....) used by the stdio shims are a separate space and
+ * never reach these. CreateFileA maps Windows access/disposition flags onto
+ * O_* + sys_open; ReadFile/WriteFile/CloseHandle forward to sys_read/write/
+ * close. */
+
+/* kernel32!CreateFileA(name, access, share, sec, disposition, flags, template)
+ * -> HANDLE (== fd) or INVALID_HANDLE_VALUE. */
+static long w32_CreateFileA(uint64_t *a) {
+    char wpath[ABI_PATH_MAX];
+    long pn = strncpy_from_user(wpath, (const char *)(uintptr_t)a[0], sizeof(wpath));
+    if (pn < 0) return (long)WIN32_INVALID_HANDLE;
+    wpath[sizeof(wpath) - 1] = '\0';
+
+    /* Windows path -> tobyOS path. A drive letter "X:" maps to tobyOS's
+     * writable mount /data (the root ramfs is a read-only initrd), and '\'
+     * becomes '/'. A path with no drive is left relative to the cwd. */
+    char kp[ABI_PATH_MAX];
+    int si = 0, di = 0;
+    if (wpath[0] && wpath[1] == ':') {
+        for (const char *r = "/data"; *r && di < (int)sizeof(kp) - 1; r++) kp[di++] = *r;
+        si = 2;
+        if (wpath[si] != '\\' && wpath[si] != '/' && di < (int)sizeof(kp) - 1) kp[di++] = '/';
+    }
+    for (; wpath[si] && di < (int)sizeof(kp) - 1; si++)
+        kp[di++] = (wpath[si] == '\\') ? '/' : wpath[si];
+    kp[di] = '\0';
+
+    /* Hand sys_open a USER pointer: stage the translated path in the CRT page. */
+    uint64_t ubuf = WIN32_CRT_DATA_BASE + WIN32_CRT_PATHBUF;
+    if (copy_to_user((void *)(uintptr_t)ubuf, kp, (size_t)di + 1) != 0)
+        return (long)WIN32_INVALID_HANDLE;
+
+    uint32_t access = (uint32_t)a[1];
+    uint32_t disp   = (uint32_t)a[4];
+    bool rd = (access & 0x80000000UL) != 0;   /* GENERIC_READ  */
+    bool wr = (access & 0x40000000UL) != 0;   /* GENERIC_WRITE */
+    int flags = (rd && wr) ? ABI_O_RDWR : (wr ? ABI_O_WRONLY : ABI_O_RDONLY);
+    switch (disp) {
+        case 1: flags |= ABI_O_CREAT | ABI_O_EXCL;  break;  /* CREATE_NEW       */
+        case 2: flags |= ABI_O_CREAT | ABI_O_TRUNC; break;  /* CREATE_ALWAYS    */
+        case 3:                                      break;  /* OPEN_EXISTING    */
+        case 4: flags |= ABI_O_CREAT;                break;  /* OPEN_ALWAYS      */
+        case 5: flags |= ABI_O_TRUNC;                break;  /* TRUNCATE_EXISTING */
+        default: break;
+    }
+    long fd = sys_open((const char *)(uintptr_t)ubuf, flags, 0644);
+    return (fd < 0) ? (long)WIN32_INVALID_HANDLE : fd;
+}
+
+/* kernel32!ReadFile(hFile, buf, n, *read, overlapped) -> BOOL. */
+static long w32_ReadFile(uint64_t *a) {
+    int      fd     = (int)a[0];
+    uint64_t ubuf   = a[1];
+    uint32_t n      = (uint32_t)a[2];
+    uint64_t pread  = a[3];
+    long got = sys_read(fd, (void *)(uintptr_t)ubuf, n);
+    if (got < 0) {
+        if (pread) { uint32_t z = 0; (void)copy_to_user((void *)(uintptr_t)pread, &z, 4); }
+        return 0;
+    }
+    if (pread) {
+        uint32_t g = (uint32_t)got;
+        if (copy_to_user((void *)(uintptr_t)pread, &g, 4) != 0) return 0;
+    }
+    return 1;
+}
+
+/* kernel32!CloseHandle(h) -> BOOL. Leaves std handles (0/1/2) and the ucrt
+ * FILE* tokens alone; closes real file fds. */
+static long w32_CloseHandle(uint64_t *a) {
+    uint64_t h = a[0];
+    if ((h & 0xFFFFFF00ULL) == WIN32_IOB_TAG) return 1;   /* a stdio FILE token */
+    int fd = (int)h;
+    if (fd < 3) return 1;                                 /* keep std handles open */
+    return (sys_close(fd) == 0) ? 1 : 0;
+}
+
 typedef long (*win32_shim_fn)(uint64_t *args);
 
 struct win32_shim {
@@ -3973,6 +4067,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-math-l1-1-0.dll", "__setusermatherr",          w32_zero },
     { "api-ms-win-crt-private-l1-1-0.dll", "__C_specific_handler",   w32_zero },
     { "api-ms-win-crt-private-l1-1-0.dll", "memcpy",                 w32_memcpy },
+    { "api-ms-win-crt-private-l1-1-0.dll", "memcmp",                 w32_memcmp },
     /* ucrt: runtime (the startup core) */
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__p___argc",             w32_p_argc },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__p___argv",             w32_p_argv },
@@ -4016,6 +4111,11 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-string-l1-1-0.dll", "strnlen",                 w32_strnlen },
     { "api-ms-win-crt-string-l1-1-0.dll", "wcslen",                  w32_wcslen },
     { "api-ms-win-crt-string-l1-1-0.dll", "wcsnlen",                 w32_wcslen },
+
+    /* ---- C5: file I/O (kernel32) ---- */
+    { "kernel32.dll", "CreateFileA",  w32_CreateFileA },
+    { "kernel32.dll", "ReadFile",     w32_ReadFile },
+    { "kernel32.dll", "CloseHandle",  w32_CloseHandle },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

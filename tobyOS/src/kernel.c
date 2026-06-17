@@ -3763,6 +3763,39 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE5_BOOT
+    /* Track C -- Win32 FILE I/O, milestone C5. Build EXTRA_CFLAGS+=-DWINPE5_BOOT.
+     * Spawns /bin/win-fileio.exe, a STOCK clang-built .exe that round-trips a
+     * file through the Win32 API: CreateFileA(write) -> WriteFile -> CloseHandle
+     * -> CreateFileA(read) -> ReadFile -> CloseHandle, then verifies the bytes.
+     * Proves real HANDLE<->fd mapping + Windows-path translation onto the VFS.
+     * exit==9 means the round-trip matched. Runs regardless of QUICK_BOOT. */
+    {
+        kprintf("[boot] WINPE5: spawning /bin/win-fileio.exe (Win32 file I/O)\n");
+        char *argv[] = { (char *)"win-fileio.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-fileio.exe",
+            .name = "win-fileio.exe",
+            .argc = 1,
+            .argv = argv,
+            .envc = 1,
+            .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] WINPE5: /bin/win-fileio.exe not spawned (rc=%d) "
+                    "MISSING\n", pid);
+            kprintf("[WINPE5] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE5: /bin/win-fileio.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE5] VERDICT: %s exit=%d (expected 9)\n",
+                    rc == 9 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef LINUXABI_BOOT
     /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
      * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a

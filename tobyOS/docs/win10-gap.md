@@ -85,8 +85,9 @@ driver model; POSIX libc surface.
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
 2. **App compatibility (~28%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
-   **stock, off-the-shelf Windows x86-64 `.exe`s — C and C++** (a plain `clang hello.c` / `clang++
-   hello.cpp` runs through its full ucrt CRT startup, including C++ global constructors, → main → exit).
+   **stock, off-the-shelf Windows x86-64 `.exe`s — C and C++, with real file I/O** (a plain `clang
+   hello.c` / `clang++ hello.cpp` runs through its full ucrt CRT startup → main → exit, and the Win32
+   `CreateFile`/`Read`/`Write`/`CloseHandle` API round-trips a file onto the VFS).
    **Track B (2026-06-14), milestones B1–B9 —
    the discrete Linux high-value set is complete:** a per-process ABI personality + a Linux→tobyOS
    syscall-translation layer run static ELFs (B1), **real musl-libc binaries** (B2 busybox), directory
@@ -119,10 +120,16 @@ driver model; POSIX libc surface.
    `__main` → `__do_global_ctors`, all CPL3 user code), so **no kernel trampoline was needed**; C4 was
    just broadening the shim surface for the ~13 extra ucrt imports a C++ binary pulls in (`_errno`,
    `localeconv`, stdio FILE locking, wide/multibyte string helpers). A global ctor prints its line + sets
-   a flag before `main`, which returns 5 (`[WINPE4] PASS`). **Linux: remaining is incremental syscall
-   breadth** (pthread_join, poll/epoll, broader sockets, glibc). **Windows: next** — file I/O
-   (`CreateFile`/`ReadFile`/`CloseHandle`), `GetModuleHandle`/`GetProcAddress`, then user32/gdi32 →
-   `SYS_GUI_*` (GUI). Still no .NET/UWP.
+   a flag before `main`, which returns 5 (`[WINPE4] PASS`). **C5 (2026-06-16) — file I/O:** the Win32
+   `CreateFileA`/`ReadFile`/`WriteFile`/`CloseHandle` API maps onto the VFS (`sys_open`/`read`/`write`/
+   `close`) with a real HANDLE↔fd mapping, Windows access/disposition→`O_*` flag translation, and a path
+   translation where the `C:` drive maps to tobyOS's writable `/data` (`\`→`/`). A stock `.exe`
+   write→close→reopen→read round-trips `C:\wintest.txt` and verifies the bytes, exit 9 (`[WINPE5] PASS`).
+   This also fixed a **latent entry-RSP alignment bug** — the mingw CRT entry needs `RSP%16==8`; I'd set
+   `%16==0`, which C3/C4 survived by luck but C5's `movaps`-based buffer init exposed. **Linux: remaining
+   is incremental syscall breadth** (pthread_join, poll/epoll, broader sockets, glibc). **Windows: next** —
+   `GetModuleHandle`/`GetProcAddress`, `CreateThread` (→ tobyOS threads), then user32/gdi32 → `SYS_GUI_*`
+   (GUI). Still no .NET/UWP.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
    code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
    on top of the per-CPU TSS/GS/current_proc foundation. The pid 0 ↔ login interaction bit
@@ -206,6 +213,24 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-16** — **Track C milestone C5: tobyOS runs a stock Windows `.exe` that does FILE I/O.** A
+  plain `clang main.c -o win-fileio.exe` using the Win32 `CreateFileA`/`WriteFile`/`ReadFile`/`CloseHandle`
+  API now round-trips a file: it opens `C:\wintest.txt` for write, writes a line, closes, re-opens for
+  read, reads it back, and `memcmp`s — exit 9 (`[WINPE5] PASS`), `[c5] wrote 33 bytes, read 33 back: …`.
+  The shims (`src/syscall.c`) map a Win32 **HANDLE directly onto a tobyOS fd** (distinct from the ucrt
+  `FILE*` tokens the stdio shims use): `CreateFileA` translates the access (`GENERIC_READ/WRITE`) +
+  disposition (`CREATE_ALWAYS`/`OPEN_EXISTING`/…) flags onto `O_*` and the path onto the VFS — a `C:`
+  drive letter maps to tobyOS's **writable `/data`** mount (the root ramfs is a read-only initrd) and
+  `\`→`/` — then calls `sys_open` (staging the translated path in a CRT-page scratch buffer so it can
+  pass a user pointer); `ReadFile`→`sys_read`, `WriteFile` (from C1) →`sys_write`, `CloseHandle`→
+  `sys_close` (leaving std handles + FILE* tokens alone). Also added `memcmp`. **Latent bug found + fixed:**
+  the mingw CRT entry is entered with `RSP%16==8` (as if `CALL`-ed); the PE loader was giving it `%16==0`,
+  which desyncs every CRT frame by 8 — C3/C4 survived by luck, but C5's `movaps`-based local-buffer init
+  `#GP`'d on the misaligned `[rbp+x]`. Fixed the PE initial RSP in `proc.c` to `%16==8` (now all of
+  C1–C5 are correctly aligned, not lucky). Proof: `programs/win-fileio/main.c` (first-party; the `.exe` is
+  a build artifact) under `-DWINPE5_BOOT`; all FIVE Win32 milestones (C1=42, C2=7, C3=3, C4=5, C5=9) pass
+  together under `-cpu qemu64,+smep,+smap` with 0 faults; validate 3/3 ALIVE; default desktop boot
+  unaffected. App-compat ~28%.
 - **2026-06-16** — **Track C milestone C4: tobyOS runs a STOCK C++ Windows `.exe` (global constructors
   run).** A plain `clang++ main.cpp -o win-cpp.exe` now runs unmodified: a C++ global constructor executes
   before `main` (prints its line + sets a flag) and `main` returns 5 (`[WINPE4] PASS`). KEY FINDING that
