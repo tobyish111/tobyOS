@@ -84,10 +84,11 @@ driver model; POSIX libc surface.
 
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
-2. **App compatibility (~28%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
-   **stock, off-the-shelf Windows x86-64 `.exe`s — C and C++, with real file I/O** (a plain `clang
-   hello.c` / `clang++ hello.cpp` runs through its full ucrt CRT startup → main → exit, and the Win32
-   `CreateFile`/`Read`/`Write`/`CloseHandle` API round-trips a file onto the VFS).
+2. **App compatibility (~29%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
+   **stock, off-the-shelf Windows x86-64 `.exe`s — C and C++, with real file I/O and multithreading** (a
+   plain `clang`/`clang++` runs through its full ucrt CRT startup → main → exit, the Win32
+   `CreateFile`/`Read`/`Write`/`CloseHandle` API round-trips a file onto the VFS, and `CreateThread` +
+   `WaitForSingleObject` + a real `CRITICAL_SECTION` run concurrent threads with correct mutual exclusion).
    **Track B (2026-06-14), milestones B1–B9 —
    the discrete Linux high-value set is complete:** a per-process ABI personality + a Linux→tobyOS
    syscall-translation layer run static ELFs (B1), **real musl-libc binaries** (B2 busybox), directory
@@ -127,9 +128,15 @@ driver model; POSIX libc surface.
    write→close→reopen→read round-trips `C:\wintest.txt` and verifies the bytes, exit 9 (`[WINPE5] PASS`).
    This also fixed a **latent entry-RSP alignment bug** — the mingw CRT entry needs `RSP%16==8`; I'd set
    `%16==0`, which C3/C4 survived by luck but C5's `movaps`-based buffer init exposed. **Linux: remaining
-   is incremental syscall breadth** (pthread_join, poll/epoll, broader sockets, glibc). **Windows: next** —
-   `GetModuleHandle`/`GetProcAddress`, `CreateThread` (→ tobyOS threads), then user32/gdi32 → `SYS_GUI_*`
-   (GUI). Still no .NET/UWP.
+   is incremental syscall breadth** (pthread_join, poll/epoll, broader sockets, glibc). **C6 (2026-06-16) —
+   multithreading:** `CreateThread` spawns a tobyOS thread that enters a CPL3 wrapper (shim page) which
+   calls the thread function then exits; `WaitForSingleObject` joins it (thread HANDLEs are tagged so they
+   don't collide with file fds); and `EnterCriticalSection`/`LeaveCriticalSection` are **real** mutual
+   exclusion (lock state in the user `CRITICAL_SECTION`, serialised by the BKL, contention handled by
+   yield-retry). A stock `.exe` with 4 threads each incrementing a shared counter under the lock yields
+   exactly `4000` (no lost updates), exit 6 (`[WINPE6] PASS`). **Windows: next** — `GetModuleHandle`/
+   `GetProcAddress`, more file ops (`SetFilePointer`/`GetFileSize`/`DeleteFile`), then user32/gdi32 →
+   `SYS_GUI_*` (windowed apps — the big one). Still no .NET/UWP.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
    code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
    on top of the per-CPU TSS/GS/current_proc foundation. The pid 0 ↔ login interaction bit
@@ -213,6 +220,26 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-16** — **Track C milestone C6: tobyOS runs a stock MULTITHREADED Windows `.exe`.** A plain
+  `clang main.c -o win-thread.exe` using `CreateThread` + `WaitForSingleObject` + a real
+  `CRITICAL_SECTION` now runs: 4 worker threads each increment a shared counter 1000× under the lock, main
+  joins them all, and the total is exactly `4000` (no lost updates) — exit 6 (`[WINPE6] PASS`). Three
+  pieces. **(1) CreateThread → a tobyOS thread.** The loader writes a tiny position-independent **thread
+  wrapper** into the shim page (at a fixed offset; the gate/thunk layout moved to fixed offsets to make
+  room). `CreateThread` allocates a `{func,param}` block + a thread stack from the per-proc heap and calls
+  `thread_create(wrapper, block, stack_top, 0)`; the new thread enters the wrapper in CPL3, which sets the
+  Microsoft-x64 first arg (`param`→`rcx`), calls the thread function, and exits via a raw
+  `ABI_SYS_THREAD_EXIT`. The new thread is given the `ABI_PERS_WIN32` personality + the shared TEB before
+  it can run (the BKL we hold blocks it until then). **(2) WaitForSingleObject → `thread_join`**; thread
+  HANDLEs are tagged (`WIN32_THREAD_TAG|tid`) so `CloseHandle`/`WaitForSingleObject` tell them apart from
+  file fds + ucrt `FILE*` tokens. **(3) Real critical sections.** `EnterCriticalSection`/`Leave` (no-ops
+  since C3) now do real mutual exclusion: the lock state lives in the user `CRITICAL_SECTION` struct
+  (`OwningThread`/`RecursionCount`), the BKL makes the read-modify-write atomic across threads, and
+  contention is handled by `sched_yield`-retry. Proof: `programs/win-thread/main.c` (first-party; the
+  `.exe` is a build artifact) under `-DWINPE6_BOOT`; all SIX Win32 milestones (C1=42, C2=7, C3=3, C4=5,
+  C5=9, C6=6) pass together under `-cpu qemu64,+smep,+smap` with 0 faults; validate 3/3 ALIVE; default
+  desktop boot unaffected (additive shims + shim-page layout only; no kernel-path change). App-compat
+  ~28% → ~29%.
 - **2026-06-16** — **Track C milestone C5: tobyOS runs a stock Windows `.exe` that does FILE I/O.** A
   plain `clang main.c -o win-fileio.exe` using the Win32 `CreateFileA`/`WriteFile`/`ReadFile`/`CloseHandle`
   API now round-trips a file: it opens `C:\wintest.txt` for write, writes a line, closes, re-opens for

@@ -66,6 +66,13 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
  * (Windows->tobyOS) path so it can hand sys_open a USER pointer. */
 #define WIN32_CRT_PATHBUF   0x800  /* translated path scratch (<=0x200)  */
 
+/* C6 (multithreading): the CPL3 thread wrapper lives at this fixed VA in the
+ * shim page (WIN32_SHIM_BASE 0x30000000 + WIN32_WRAPPER_OFF 0x80); CreateThread
+ * starts each tobyOS thread there. And a Win32 thread HANDLE is tagged so it
+ * is distinguishable from a file fd or a ucrt FILE* token. */
+#define WIN32_THREAD_WRAPPER_VA  0x0000000030000080ULL
+#define WIN32_THREAD_TAG         0x7400000000000000ULL  /* handle = TAG | tid */
+
 /* Resolve "dll!func" to the kernel-side Win32 shim index used to bind an
  * IAT thunk (case-insensitive dll match, exact func match). Returns the
  * index, or -1 if the symbol is not provided. Defined alongside the shim

@@ -175,6 +175,33 @@ static const uint8_t g_win32_gate[] = {
 };
 #define WIN32_GATE_SIZE (sizeof(g_win32_gate))
 
+/* Shim-page layout (fixed offsets the loader + the kernel shims agree on):
+ *   0x00  gate (94 bytes)
+ *   0x80  thread wrapper (C6: CreateThread's CPL3 entry trampoline)
+ *   0x100 per-import thunks (10 bytes each)
+ * See WIN32_THREAD_WRAPPER_VA in pe.h for the wrapper's user VA. */
+#define WIN32_WRAPPER_OFF   0x80
+#define WIN32_THUNK_BASE    0x100
+#define WIN32_WRAPPER_IMM_OFF 0x14    /* the thread-exit imm32 in the wrapper */
+
+/* Position-independent thread wrapper (C6). A Win32 thread function is
+ * entered here (via tobyOS thread_create, rdi = &{func, param}); it sets up
+ * the Microsoft-x64 first arg (param -> rcx), calls the thread function,
+ * then exits the thread with its DWORD return via a raw ABI_SYS_THREAD_EXIT
+ * (patched into the imm32 at load). Verified by assembling the equivalent
+ * .intel_syntax + extracting .text.
+ *
+ *   mov rax,[rdi] ; mov rcx,[rdi+8]     ; func, param(->rcx)
+ *   sub rsp,0x20 ; call rax ; add rsp,0x20
+ *   mov edi,eax ; mov eax,<THREAD_EXIT> ; syscall ; ud2
+ */
+static const uint8_t g_win32_thread_wrapper[] = {
+    0x48, 0x8b, 0x07, 0x48, 0x8b, 0x4f, 0x08, 0x48, 0x83, 0xec, 0x20, 0xff,
+    0xd0, 0x48, 0x83, 0xc4, 0x20, 0x89, 0xc7, 0xb8, 0x00, 0x00, 0x00, 0x00,
+    0x0f, 0x05, 0x0f, 0x0b
+};
+#define WIN32_WRAPPER_SIZE (sizeof(g_win32_thread_wrapper))
+
 static inline uint64_t round_up(uint64_t x, uint64_t a) { return (x + a - 1) & ~(a - 1); }
 
 /* ---- MZ/PE sniff -------------------------------------------------------- */
@@ -220,8 +247,16 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
     uint32_t nr = ABI_SYS_WIN32_DISPATCH;
     memcpy(&gate[WIN32_GATE_IMM_OFF], &nr, 4);
 
+    /* Thread wrapper (C6) at its fixed offset, with the thread-exit syscall
+     * number patched in. */
+    uint8_t wrap[WIN32_WRAPPER_SIZE];
+    memcpy(wrap, g_win32_thread_wrapper, WIN32_WRAPPER_SIZE);
+    uint32_t tx = ABI_SYS_THREAD_EXIT;
+    memcpy(&wrap[WIN32_WRAPPER_IMM_OFF], &tx, 4);
+
     unsigned long uf = uaccess_begin();
     memcpy((void *)WIN32_SHIM_BASE, gate, WIN32_GATE_SIZE);
+    memcpy((void *)(WIN32_SHIM_BASE + WIN32_WRAPPER_OFF), wrap, WIN32_WRAPPER_SIZE);
     uaccess_end(uf);
 
     int next_thunk = 0;     /* next free thunk slot in the page */
@@ -263,11 +298,11 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
             }
 
             /* Emit a 10-byte thunk:  mov eax,idx ; jmp gate */
-            uint64_t thunk_va = WIN32_SHIM_BASE + WIN32_GATE_SIZE +
+            uint64_t thunk_va = WIN32_SHIM_BASE + WIN32_THUNK_BASE +
                                 (uint64_t)next_thunk * WIN32_THUNK_SIZE;
             uint8_t t[WIN32_THUNK_SIZE];
             uint32_t imm = (uint32_t)idx;
-            int32_t  rel = -(int32_t)(WIN32_GATE_SIZE +
+            int32_t  rel = -(int32_t)(WIN32_THUNK_BASE +
                                       (uint32_t)next_thunk * WIN32_THUNK_SIZE +
                                       WIN32_THUNK_SIZE);
             t[0] = 0xB8; memcpy(&t[1], &imm, 4);    /* mov eax, idx */

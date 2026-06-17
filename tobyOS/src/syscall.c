@@ -4012,14 +4012,110 @@ static long w32_ReadFile(uint64_t *a) {
     return 1;
 }
 
-/* kernel32!CloseHandle(h) -> BOOL. Leaves std handles (0/1/2) and the ucrt
- * FILE* tokens alone; closes real file fds. */
+/* kernel32!CloseHandle(h) -> BOOL. Leaves std handles (0/1/2), the ucrt
+ * FILE* tokens, and thread handles (reaped by the join) alone; closes real
+ * file fds. */
 static long w32_CloseHandle(uint64_t *a) {
     uint64_t h = a[0];
-    if ((h & 0xFFFFFF00ULL) == WIN32_IOB_TAG) return 1;   /* a stdio FILE token */
+    if ((h & 0xFF00000000000000ULL) == WIN32_THREAD_TAG) return 1; /* thread handle */
+    if ((h & 0xFFFFFF00ULL) == WIN32_IOB_TAG) return 1;           /* stdio FILE token */
     int fd = (int)h;
-    if (fd < 3) return 1;                                 /* keep std handles open */
+    if (fd < 3) return 1;                                         /* keep std handles open */
     return (sys_close(fd) == 0) ? 1 : 0;
+}
+
+/* ---- C6: multithreading + real critical sections ----
+ * CreateThread starts a tobyOS thread at the CPL3 wrapper (shim page) which
+ * calls the thread function and exits; WaitForSingleObject joins it. A thread
+ * HANDLE is WIN32_THREAD_TAG|tid (distinct from file fds / FILE* tokens).
+ * EnterCriticalSection/LeaveCriticalSection are REAL mutual exclusion: the
+ * lock state lives in the user CRITICAL_SECTION struct (OwningThread at +0x10,
+ * RecursionCount at +0x0C), and the BKL makes the read-modify-write atomic
+ * across threads. */
+#define WIN32_THREAD_STACK (256u * 1024u)
+
+static long w32_CreateThread(uint64_t *a) {
+    uint64_t start = a[2];   /* lpStartAddress */
+    uint64_t param = a[3];   /* lpParameter    */
+    uint64_t ptid  = a[5];   /* lpThreadId (optional) */
+
+    /* {func, param} block + a thread stack, both from the per-proc heap. */
+    uint64_t block = win32_heap_alloc(16);
+    if (!block) return 0;
+    uint64_t fp[2] = { start, param };
+    if (copy_to_user((void *)(uintptr_t)block, fp, 16) != 0) return 0;
+
+    uint64_t stack = win32_heap_alloc(WIN32_THREAD_STACK);
+    if (!stack) return 0;
+    uint64_t stack_top = (stack + WIN32_THREAD_STACK) & ~0xFULL;   /* 16-aligned */
+
+    struct proc *leader = current_proc();
+    int tid = thread_create(WIN32_THREAD_WRAPPER_VA, block, stack_top, 0);
+    if (tid < 0) return 0;
+
+    /* The new thread must carry the Win32 personality (so its gate calls route
+     * to the dispatcher) and share the TEB. Safe here: we hold the BKL, so the
+     * new thread can't run until this syscall yields/returns. */
+    struct proc *t = proc_lookup(tid);
+    if (t) { t->personality = ABI_PERS_WIN32; t->gs_base = leader ? leader->gs_base : 0; }
+
+    if (ptid) { uint32_t id = (uint32_t)tid; (void)copy_to_user((void *)(uintptr_t)ptid, &id, 4); }
+    return (long)(WIN32_THREAD_TAG | (uint64_t)(uint32_t)tid);
+}
+
+/* WaitForSingleObject(handle, ms) -> WAIT_OBJECT_0(0) / WAIT_FAILED. For a
+ * thread handle this is a join (timeout ignored == INFINITE). */
+static long w32_WaitForSingleObject(uint64_t *a) {
+    uint64_t h = a[0];
+    if ((h & 0xFF00000000000000ULL) == WIN32_THREAD_TAG) {
+        int tid = (int)(h & 0xFFFFFFFFULL);
+        return (thread_join(tid, 0) == 0) ? 0 : (long)0xFFFFFFFF;
+    }
+    return 0;
+}
+
+#define WIN32_CS_RECURSION 0x0C   /* CRITICAL_SECTION.RecursionCount (LONG) */
+#define WIN32_CS_OWNER     0x10   /* CRITICAL_SECTION.OwningThread (HANDLE)  */
+
+static long w32_InitializeCriticalSection(uint64_t *a) {
+    uint64_t cs = a[0];
+    uint32_t z4 = 0; uint64_t z8 = 0;
+    (void)copy_to_user((void *)(uintptr_t)(cs + WIN32_CS_RECURSION), &z4, 4);
+    (void)copy_to_user((void *)(uintptr_t)(cs + WIN32_CS_OWNER),     &z8, 8);
+    return 0;
+}
+
+static long w32_EnterCriticalSection(uint64_t *a) {
+    uint64_t cs = a[0];
+    struct proc *p = current_proc();
+    uint64_t me = p ? (uint64_t)p->pid : 0;
+    for (;;) {
+        uint64_t owner = 0;
+        if (copy_from_user(&owner, (const void *)(uintptr_t)(cs + WIN32_CS_OWNER), 8) != 0)
+            return 0;
+        if (owner == 0 || owner == me) {
+            uint32_t rec = 0;
+            (void)copy_from_user(&rec, (const void *)(uintptr_t)(cs + WIN32_CS_RECURSION), 4);
+            rec++;
+            (void)copy_to_user((void *)(uintptr_t)(cs + WIN32_CS_OWNER),     &me,  8);
+            (void)copy_to_user((void *)(uintptr_t)(cs + WIN32_CS_RECURSION), &rec, 4);
+            return 0;
+        }
+        /* Held by another thread -- yield (drops/reacquires the BKL so the
+         * owner can run + release) and retry. */
+        sched_yield();
+    }
+}
+
+static long w32_LeaveCriticalSection(uint64_t *a) {
+    uint64_t cs = a[0];
+    uint32_t rec = 0;
+    if (copy_from_user(&rec, (const void *)(uintptr_t)(cs + WIN32_CS_RECURSION), 4) != 0)
+        return 0;
+    if (rec > 0) rec--;
+    (void)copy_to_user((void *)(uintptr_t)(cs + WIN32_CS_RECURSION), &rec, 4);
+    if (rec == 0) { uint64_t z = 0; (void)copy_to_user((void *)(uintptr_t)(cs + WIN32_CS_OWNER), &z, 8); }
+    return 0;
 }
 
 typedef long (*win32_shim_fn)(uint64_t *args);
@@ -4044,11 +4140,12 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-stdio-l1-1-0.dll", "puts",                     w32_puts },
 
     /* ---- C3: the rest of the stock-clang mainCRTStartup surface ---- */
-    /* kernel32 */
-    { "kernel32.dll", "InitializeCriticalSection", w32_zero },
+    /* kernel32. The critical-section funcs are REAL as of C6 (mutual
+     * exclusion); DeleteCriticalSection stays a no-op. */
+    { "kernel32.dll", "InitializeCriticalSection", w32_InitializeCriticalSection },
     { "kernel32.dll", "DeleteCriticalSection",     w32_zero },
-    { "kernel32.dll", "EnterCriticalSection",      w32_zero },
-    { "kernel32.dll", "LeaveCriticalSection",      w32_zero },
+    { "kernel32.dll", "EnterCriticalSection",      w32_EnterCriticalSection },
+    { "kernel32.dll", "LeaveCriticalSection",      w32_LeaveCriticalSection },
     { "kernel32.dll", "GetLastError",              w32_zero },
     { "kernel32.dll", "SetUnhandledExceptionFilter", w32_zero },
     { "kernel32.dll", "Sleep",                     w32_zero },
@@ -4116,6 +4213,10 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "CreateFileA",  w32_CreateFileA },
     { "kernel32.dll", "ReadFile",     w32_ReadFile },
     { "kernel32.dll", "CloseHandle",  w32_CloseHandle },
+
+    /* ---- C6: multithreading (kernel32) ---- */
+    { "kernel32.dll", "CreateThread",        w32_CreateThread },
+    { "kernel32.dll", "WaitForSingleObject", w32_WaitForSingleObject },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
@@ -4161,7 +4262,11 @@ long win32_dispatch(uint64_t func_index, uint64_t args_ptr) {
 static long win32_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     if (n == ABI_SYS_WIN32_DISPATCH)
         return win32_dispatch((uint64_t)a1, (uint64_t)a2);
-    kprintf("[win32] unexpected raw syscall %ld from a PE process\n", n);
+    /* The C6 thread wrapper issues a raw ABI_SYS_THREAD_EXIT when its thread
+     * function returns -- that's expected; forward it (and anything else) to
+     * the native dispatcher, noting only the genuinely-unexpected ones. */
+    if (n != ABI_SYS_THREAD_EXIT)
+        kprintf("[win32] raw syscall %ld from a PE process -> native dispatch\n", n);
     return do_syscall(n, a1, a2, a3, a4, a5);
 }
 

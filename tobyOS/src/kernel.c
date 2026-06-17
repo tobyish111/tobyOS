@@ -3796,6 +3796,39 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE6_BOOT
+    /* Track C -- multithreading, milestone C6. Build EXTRA_CFLAGS+=-DWINPE6_BOOT.
+     * Spawns /bin/win-thread.exe, a STOCK multithreaded .exe: N CreateThread
+     * workers each increment a SHARED counter under a real CRITICAL_SECTION,
+     * main WaitForSingleObject-joins them and checks the total. exit==6 means
+     * the threads ran AND the lock serialised them (no lost updates). Runs
+     * regardless of QUICK_BOOT. */
+    {
+        kprintf("[boot] WINPE6: spawning /bin/win-thread.exe (Win32 threads + lock)\n");
+        char *argv[] = { (char *)"win-thread.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-thread.exe",
+            .name = "win-thread.exe",
+            .argc = 1,
+            .argv = argv,
+            .envc = 1,
+            .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] WINPE6: /bin/win-thread.exe not spawned (rc=%d) "
+                    "MISSING\n", pid);
+            kprintf("[WINPE6] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE6: /bin/win-thread.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE6] VERDICT: %s exit=%d (expected 6)\n",
+                    rc == 6 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef LINUXABI_BOOT
     /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
      * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a
