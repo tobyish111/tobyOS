@@ -3829,6 +3829,41 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE7_BOOT
+    /* Track C -- the user32/gdi32 GUI bridge, milestone C7. Build
+     * EXTRA_CFLAGS+=-DWINPE7_BOOT. Spawns /bin/win-gui.exe, a STOCK Win32 GUI
+     * .exe: RegisterClass + CreateWindowEx + a GetMessage/DispatchMessage loop
+     * whose WndProc draws (BeginPaint -> FillRect + TextOut). tobyOS maps the
+     * window onto a real desktop window and routes DispatchMessage to the
+     * WndProc via a user-mode trampoline. The window stays up ~2s (for a
+     * screenshot) then the app quits, returning 7 iff the WndProc ran. Runs
+     * regardless of QUICK_BOOT. */
+    {
+        kprintf("[boot] WINPE7: spawning /bin/win-gui.exe (Win32 GUI window)\n");
+        char *argv[] = { (char *)"win-gui.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-gui.exe",
+            .name = "win-gui.exe",
+            .argc = 1,
+            .argv = argv,
+            .envc = 1,
+            .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] WINPE7: /bin/win-gui.exe not spawned (rc=%d) "
+                    "MISSING\n", pid);
+            kprintf("[WINPE7] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE7: /bin/win-gui.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE7] VERDICT: %s exit=%d (expected 7)\n",
+                    rc == 7 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef LINUXABI_BOOT
     /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
      * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a

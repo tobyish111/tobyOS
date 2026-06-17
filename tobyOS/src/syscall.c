@@ -4118,6 +4118,179 @@ static long w32_LeaveCriticalSection(uint64_t *a) {
     return 0;
 }
 
+/* ---- C7: the user32/gdi32 GUI bridge ----
+ * A Win32 GUI app's window maps onto a tobyOS window (sys_gui_create -> an fd
+ * that is BOTH the HWND and the HDC); drawing maps onto sys_gui_fill/text;
+ * the message loop is synthesised here (CreateWindow/ShowWindow queue a
+ * WM_PAINT; PostQuitMessage ends the loop). The one genuinely hard bit --
+ * DispatchMessage calling the app's WndProc -- is handled by a user-mode
+ * trampoline (the kernel can't call CPL3 code); see WIN32_DISPATCH_STUB_VA
+ * + win32_user_stub_va in pe_loader.c. For now a single window per process. */
+static struct {
+    int      tgid;        /* owning process (thread group); 0 = none */
+    int      fd;          /* sys_gui_create fd == HWND == HDC          */
+    int      w, h;        /* client size                              */
+    uint64_t wndproc;     /* registered WndProc (also in the CRT slot) */
+    bool     needs_paint; /* a WM_PAINT is queued                      */
+    bool     quit;        /* PostQuitMessage seen                      */
+    int      quitcode;
+} g_win32_gui;
+
+/* Win32 messages we synthesise. */
+#define WM_NULL    0x0000
+#define WM_PAINT   0x000F
+#define WM_QUIT    0x0012
+
+/* RegisterClassA(&WNDCLASSA): stash the WndProc (offset +0x08) both in our
+ * state and in the user CRT slot the DispatchMessage trampoline reads. */
+static long w32_RegisterClassA(uint64_t *a) {
+    uint64_t wc = a[0];
+    uint64_t wndproc = 0;
+    (void)copy_from_user(&wndproc, (const void *)(uintptr_t)(wc + 0x08), 8);
+    g_win32_gui.wndproc = wndproc;
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_WNDPROC),
+                       &wndproc, 8);
+    return 1;   /* a non-zero class atom */
+}
+
+/* CreateWindowExA(exStyle, class, name, style, x, y, W, H, parent, menu,
+ *                 hInst, param) -> HWND (== the tobyOS window fd). W=a6, H=a7,
+ * name=a2 -- all within the gate's 8 marshalled args. */
+static long w32_CreateWindowExA(uint64_t *a) {
+    uint64_t name = a[2];
+    int w = (int)(uint32_t)a[6];
+    int h = (int)(uint32_t)a[7];
+    if (w <= 0 || w > 4096) w = 400;
+    if (h <= 0 || h > 4096) h = 200;
+    long fd = sys_gui_create((uint32_t)w, (uint32_t)h, (const char *)(uintptr_t)name);
+    if (fd < 0) return 0;   /* NULL HWND */
+    struct proc *p = current_proc();
+    g_win32_gui.tgid        = p ? (p->is_thread ? p->tgid : p->pid) : 0;
+    g_win32_gui.fd          = (int)fd;
+    g_win32_gui.w           = w;
+    g_win32_gui.h           = h;
+    g_win32_gui.needs_paint = true;
+    g_win32_gui.quit        = false;
+    return fd;   /* HWND == HDC == fd */
+}
+
+static long w32_ShowWindow(uint64_t *a)   { (void)a; g_win32_gui.needs_paint = true; return 1; }
+static long w32_UpdateWindow(uint64_t *a) { (void)a; g_win32_gui.needs_paint = true; return 1; }
+static long w32_PostQuitMessage(uint64_t *a) {
+    g_win32_gui.quit = true; g_win32_gui.quitcode = (int)a[0]; return 0;
+}
+static long w32_TranslateMessage(uint64_t *a) { (void)a; return 0; }
+static long w32_DefWindowProcA(uint64_t *a)   { (void)a; return 0; }
+
+/* GetMessageA(&MSG, hwnd, min, max) -> >0 normal / 0 on WM_QUIT. We deliver a
+ * queued WM_PAINT, then WM_QUIT once PostQuitMessage fires; otherwise we poll
+ * the window for a close event (and otherwise yield + WM_NULL). */
+static long w32_GetMessageA(uint64_t *a) {
+    uint64_t msg = a[0];
+    struct { uint64_t hwnd; uint32_t message; uint32_t pad;
+             uint64_t wParam, lParam; uint32_t time; int32_t ptx, pty; } m;
+    memset(&m, 0, sizeof(m));
+
+    if (g_win32_gui.quit) {
+        m.message = WM_QUIT; m.wParam = (uint64_t)(uint32_t)g_win32_gui.quitcode;
+        (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+        return 0;
+    }
+    if (g_win32_gui.needs_paint) {
+        g_win32_gui.needs_paint = false;
+        m.hwnd = (uint64_t)g_win32_gui.fd; m.message = WM_PAINT;
+        (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+        return 1;
+    }
+    /* No paint pending and no quit: yield and deliver WM_NULL so a real app's
+     * loop keeps turning without busy-spinning. (Window-close events that
+     * would synthesise WM_QUIT are a later refinement; this test quits via
+     * PostQuitMessage from its WM_PAINT handler.) */
+    sched_yield();
+    m.hwnd = (uint64_t)g_win32_gui.fd; m.message = WM_NULL;
+    (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+    return 1;
+}
+
+/* BeginPaint(hwnd, &PAINTSTRUCT) -> HDC. EndPaint -> present (flip). */
+static long w32_BeginPaint(uint64_t *a) {
+    uint64_t hwnd = a[0];
+    uint64_t ps   = a[1];
+    /* PAINTSTRUCT: hdc@0, fErase@8, rcPaint(l,t,r,b)@0x0C */
+    uint64_t hdc = hwnd;          /* HDC == HWND == fd */
+    uint32_t erase = 1;
+    int32_t  rc[4] = { 0, 0, g_win32_gui.w, g_win32_gui.h };
+    (void)copy_to_user((void *)(uintptr_t)(ps + 0x00), &hdc, 8);
+    (void)copy_to_user((void *)(uintptr_t)(ps + 0x08), &erase, 4);
+    (void)copy_to_user((void *)(uintptr_t)(ps + 0x0C), rc, sizeof(rc));
+    return (long)hdc;
+}
+static long w32_EndPaint(uint64_t *a) {
+    (void)a;
+    if (g_win32_gui.fd >= 0) (void)sys_gui_flip(g_win32_gui.fd);
+    return 1;
+}
+
+/* FillRect(hdc, &RECT, hbrush) -> non-zero. We render every brush as a
+ * distinct fill colour (real brush/colour mapping is a later refinement). */
+static long w32_FillRect(uint64_t *a) {
+    int      fd   = (int)a[0];
+    uint64_t prc  = a[1];
+    int32_t  rc[4] = { 0, 0, 0, 0 };
+    if (copy_from_user(rc, (const void *)(uintptr_t)prc, sizeof(rc)) != 0) return 0;
+    int x = rc[0], y = rc[1], w = rc[2] - rc[0], h = rc[3] - rc[1];
+    if (w < 0) w = 0; if (h < 0) h = 0;
+    uint32_t whlen = ((uint32_t)(w & 0xFFFF)) | ((uint32_t)(h & 0xFFFF) << 16);
+    (void)sys_gui_fill(fd, x, y, whlen, 0x002E5C8A /* a visible blue */);
+    return 1;
+}
+
+/* gdi32!TextOutA(hdc, x, y, str, len) -> non-zero. */
+static long w32_TextOutA(uint64_t *a) {
+    int      fd  = (int)a[0];
+    int      x   = (int)(int32_t)a[1];
+    int      y   = (int)(int32_t)a[2];
+    uint64_t str = a[3];
+    uint32_t xy  = ((uint32_t)(x & 0xFFFF)) | ((uint32_t)(y & 0xFFFF) << 16);
+    (void)sys_gui_text(fd, xy, (const char *)(uintptr_t)str,
+                       0x00FFFFFF /* white */, 0x002E5C8A /* on the blue fill */);
+    return 1;
+}
+
+/* kernel32!GetStartupInfoA(&STARTUPINFOA): a zeroed struct + cb. */
+static long w32_GetStartupInfoA(uint64_t *a) {
+    uint64_t si = a[0];
+    uint8_t  zero[0x68];
+    memset(zero, 0, sizeof(zero));
+    uint32_t cb = sizeof(zero);
+    memcpy(zero, &cb, 4);     /* STARTUPINFOA.cb @ +0 */
+    (void)copy_to_user((void *)(uintptr_t)si, zero, sizeof(zero));
+    return 0;
+}
+
+/* crt!__p__acmdln() -> char** (a pointer into the CRT-data page whose slot
+ * holds the command-line string pointer). */
+static long w32_p_acmdln(uint64_t *a) { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_ACMDLN); }
+
+/* kernel32!Sleep(ms) -> real sleep (drops the BKL while waiting). */
+static long w32_Sleep(uint64_t *a) {
+    sys_nanosleep((uint64_t)(uint32_t)a[0] * 1000000ull);
+    return 0;
+}
+
+/* memset over user memory. */
+static long w32_memset(uint64_t *a) {
+    uint64_t dst = a[0]; int v = (int)a[1]; uint64_t n = a[2], done = 0;
+    char buf[256];
+    memset(buf, (unsigned char)v, sizeof(buf) < n ? sizeof(buf) : n);
+    while (done < n) {
+        uint64_t chunk = n - done; if (chunk > sizeof(buf)) chunk = sizeof(buf);
+        if (copy_to_user((void *)(uintptr_t)(dst + done), buf, chunk) != 0) break;
+        done += chunk;
+    }
+    return (long)dst;
+}
+
 typedef long (*win32_shim_fn)(uint64_t *args);
 
 struct win32_shim {
@@ -4148,7 +4321,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "LeaveCriticalSection",      w32_LeaveCriticalSection },
     { "kernel32.dll", "GetLastError",              w32_zero },
     { "kernel32.dll", "SetUnhandledExceptionFilter", w32_zero },
-    { "kernel32.dll", "Sleep",                     w32_zero },
+    { "kernel32.dll", "Sleep",                     w32_Sleep },
     { "kernel32.dll", "TlsGetValue",               w32_zero },
     { "kernel32.dll", "VirtualProtect",            w32_one },
     { "kernel32.dll", "VirtualQuery",              w32_VirtualQuery },
@@ -4217,6 +4390,28 @@ static const struct win32_shim g_win32_shims[] = {
     /* ---- C6: multithreading (kernel32) ---- */
     { "kernel32.dll", "CreateThread",        w32_CreateThread },
     { "kernel32.dll", "WaitForSingleObject", w32_WaitForSingleObject },
+
+    /* ---- C7: the GUI bridge ---- */
+    /* kernel32 + crt extras the GUI-subsystem CRT startup pulls in */
+    { "kernel32.dll", "GetStartupInfoA", w32_GetStartupInfoA },
+    { "kernel32.dll", "IsDBCSLeadByte",  w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__p__acmdln", w32_p_acmdln },
+    { "api-ms-win-crt-string-l1-1-0.dll",  "memset",      w32_memset },
+    /* user32. NOTE: DispatchMessageA is bound by the loader to a user-mode
+     * trampoline (it calls the app's WndProc), so it's deliberately NOT here. */
+    { "user32.dll", "RegisterClassA",    w32_RegisterClassA },
+    { "user32.dll", "CreateWindowExA",   w32_CreateWindowExA },
+    { "user32.dll", "ShowWindow",        w32_ShowWindow },
+    { "user32.dll", "UpdateWindow",      w32_UpdateWindow },
+    { "user32.dll", "GetMessageA",       w32_GetMessageA },
+    { "user32.dll", "TranslateMessage",  w32_TranslateMessage },
+    { "user32.dll", "DefWindowProcA",    w32_DefWindowProcA },
+    { "user32.dll", "PostQuitMessage",   w32_PostQuitMessage },
+    { "user32.dll", "BeginPaint",        w32_BeginPaint },
+    { "user32.dll", "EndPaint",          w32_EndPaint },
+    { "user32.dll", "FillRect",          w32_FillRect },
+    /* gdi32 */
+    { "gdi32.dll",  "TextOutA",          w32_TextOutA },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

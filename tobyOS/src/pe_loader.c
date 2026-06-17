@@ -202,6 +202,26 @@ static const uint8_t g_win32_thread_wrapper[] = {
 };
 #define WIN32_WRAPPER_SIZE (sizeof(g_win32_thread_wrapper))
 
+/* DispatchMessage trampoline (C7), at WIN32_DISPATCH_OFF. DispatchMessageA's
+ * IAT slot points here. It reads the MSG (rcx), loads the registered WndProc
+ * from the CRT-data slot (abs64 patched at load), and CALLS it in CPL3 with
+ * the Microsoft-x64 args (hwnd, message, wParam, lParam) -- the kernel can't
+ * call a user WndProc itself. Verified by assembling the equivalent asm.
+ *
+ *   sub rsp,0x28 ; mov rax,[rcx] ; mov r8,[rcx+0x10] ; mov r9,[rcx+0x18]
+ *   mov edx,[rcx+8] ; mov rcx,rax ; movabs rax,<&wndproc> ; mov rax,[rax]
+ *   test rax,rax ; jz 1f ; call rax ; 1: add rsp,0x28 ; ret
+ */
+#define WIN32_DISPATCH_OFF     0xC0
+#define WIN32_DISPATCH_IMM_OFF 0x17    /* the &wndproc abs64 in the trampoline */
+static const uint8_t g_win32_dispatch_stub[] = {
+    0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x01, 0x4c, 0x8b, 0x41, 0x10, 0x4c,
+    0x8b, 0x49, 0x18, 0x8b, 0x51, 0x08, 0x48, 0x89, 0xc1, 0x48, 0xb8, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x00, 0x48, 0x85,
+    0xc0, 0x74, 0x02, 0xff, 0xd0, 0x48, 0x83, 0xc4, 0x28, 0xc3
+};
+#define WIN32_DISPATCH_SIZE (sizeof(g_win32_dispatch_stub))
+
 static inline uint64_t round_up(uint64_t x, uint64_t a) { return (x + a - 1) & ~(a - 1); }
 
 /* ---- MZ/PE sniff -------------------------------------------------------- */
@@ -233,6 +253,19 @@ static bool pe_map_user(uint64_t virt_lo, uint64_t virt_hi) {
     return true;
 }
 
+/* Return the shim-page VA of the user-mode stub for an import that must call
+ * back into CPL3 (so it can't be a kernel shim), or 0 for the normal
+ * gate-thunk path. Currently just DispatchMessage{A,W} -> the WndProc
+ * trampoline. (func match is exact; the caller already knows the DLL is a
+ * Win32 one.) */
+static uint64_t win32_user_stub_va(const char *dll, const char *func) {
+    (void)dll;
+    if (strcmp(func, "DispatchMessageA") == 0 ||
+        strcmp(func, "DispatchMessageW") == 0)
+        return WIN32_DISPATCH_STUB_VA;
+    return 0;
+}
+
 /* Build the gate + per-import thunks into the (already mapped, RW) shim
  * page, then bind every imported IAT slot to its thunk. All user-memory
  * access here is under the caller's uaccess window. `udir` points at the
@@ -254,9 +287,17 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
     uint32_t tx = ABI_SYS_THREAD_EXIT;
     memcpy(&wrap[WIN32_WRAPPER_IMM_OFF], &tx, 4);
 
+    /* DispatchMessage trampoline (C7), with the &wndproc CRT-data slot
+     * patched into its abs64 load. */
+    uint8_t disp[WIN32_DISPATCH_SIZE];
+    memcpy(disp, g_win32_dispatch_stub, WIN32_DISPATCH_SIZE);
+    uint64_t wndproc_slot = WIN32_CRT_DATA_BASE + WIN32_CRT_WNDPROC;
+    memcpy(&disp[WIN32_DISPATCH_IMM_OFF], &wndproc_slot, 8);
+
     unsigned long uf = uaccess_begin();
     memcpy((void *)WIN32_SHIM_BASE, gate, WIN32_GATE_SIZE);
     memcpy((void *)(WIN32_SHIM_BASE + WIN32_WRAPPER_OFF), wrap, WIN32_WRAPPER_SIZE);
+    memcpy((void *)(WIN32_SHIM_BASE + WIN32_DISPATCH_OFF), disp, WIN32_DISPATCH_SIZE);
     uaccess_end(uf);
 
     int next_thunk = 0;     /* next free thunk slot in the page */
@@ -287,6 +328,18 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
                 /* hint(2) + name(NUL-terminated) at RVA */
                 fname = (const char *)(load_base + (uint32_t)ent + 2);
                 idx = win32_shim_index(dll, fname);
+            }
+
+            /* Some imports are bound to a USER-MODE stub in the shim page
+             * rather than a kernel gate-thunk, because they must call back
+             * into CPL3 code (e.g. DispatchMessage -> the window's WndProc).
+             * Bind those straight to the stub VA. */
+            uint64_t stub = win32_user_stub_va(dll, fname);
+            if (stub) {
+                iat[k] = stub;
+                kprintf("[pe]   bind %s!%s -> user-stub@%p\n",
+                        dll, fname, (void *)stub);
+                continue;
             }
 
             if (idx < 0) {
@@ -434,6 +487,17 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         *(uint64_t *)(base + WIN32_CRT_ARGV)        = argv_arr;
         *(uint64_t *)(base + WIN32_CRT_ENVIRON)     = base + WIN32_CRT_ENVIRON_ARR;
         *(uint64_t *)(base + WIN32_CRT_ENVIRON_ARR) = 0;   /* environ[0] = NULL */
+
+        /* C7: _acmdln (the raw command line) -> the program name. The GUI CRT
+         * startup reads it via __p__acmdln to build WinMain's lpCmdLine. */
+        {
+            const char *s0 = (n > 0 && argv) ? argv[0] : "";
+            uint64_t cl = base + WIN32_CRT_CMDLINE;
+            uint64_t clp = cl;
+            while (*s0 && clp < base + PAGE_SIZE - 1) *(char *)(clp++) = *s0++;
+            *(char *)clp = '\0';
+            *(uint64_t *)(base + WIN32_CRT_ACMDLN) = cl;   /* char* to the cmdline */
+        }
 
         /* C4: a minimal "C"-locale lconv. Only decimal_point (the first
          * field) needs to be a valid non-NULL "."; the rest stay zeroed,

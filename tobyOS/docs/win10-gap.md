@@ -84,11 +84,11 @@ driver model; POSIX libc surface.
 
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
-2. **App compatibility (~29%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
-   **stock, off-the-shelf Windows x86-64 `.exe`s — C and C++, with real file I/O and multithreading** (a
-   plain `clang`/`clang++` runs through its full ucrt CRT startup → main → exit, the Win32
-   `CreateFile`/`Read`/`Write`/`CloseHandle` API round-trips a file onto the VFS, and `CreateThread` +
-   `WaitForSingleObject` + a real `CRITICAL_SECTION` run concurrent threads with correct mutual exclusion).
+2. **App compatibility (~30%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
+   **stock, off-the-shelf Windows x86-64 `.exe`s — C and C++, console AND GUI** (a plain `clang`/`clang++`
+   runs through its full ucrt CRT startup → main/WinMain → exit; real file I/O, multithreading with a real
+   `CRITICAL_SECTION`, and a `user32`/`gdi32` GUI app that creates a window and draws through its WndProc
+   message loop).
    **Track B (2026-06-14), milestones B1–B9 —
    the discrete Linux high-value set is complete:** a per-process ABI personality + a Linux→tobyOS
    syscall-translation layer run static ELFs (B1), **real musl-libc binaries** (B2 busybox), directory
@@ -134,9 +134,19 @@ driver model; POSIX libc surface.
    don't collide with file fds); and `EnterCriticalSection`/`LeaveCriticalSection` are **real** mutual
    exclusion (lock state in the user `CRITICAL_SECTION`, serialised by the BKL, contention handled by
    yield-retry). A stock `.exe` with 4 threads each incrementing a shared counter under the lock yields
-   exactly `4000` (no lost updates), exit 6 (`[WINPE6] PASS`). **Windows: next** — `GetModuleHandle`/
-   `GetProcAddress`, more file ops (`SetFilePointer`/`GetFileSize`/`DeleteFile`), then user32/gdi32 →
-   `SYS_GUI_*` (windowed apps — the big one). Still no .NET/UWP.
+   exactly `4000` (no lost updates), exit 6 (`[WINPE6] PASS`). **C7 (2026-06-17) — the user32/gdi32 GUI
+   bridge:** a stock Win32 GUI `.exe` (Windows subsystem, `WinMain`) does `RegisterClass` + `CreateWindowEx`
+   (→ a real desktop window via `sys_gui_create`, correct title/size) + a `GetMessage`/`DispatchMessage`
+   loop whose `WndProc` draws (`BeginPaint`→`FillRect`+`TextOut`→`EndPaint` → `sys_gui_fill`/`sys_gui_text`).
+   The hard part — `DispatchMessage` calling the app's `WndProc` (a kernel shim can't call CPL3 code) — is a
+   **user-mode trampoline** in the shim page (same idea as the C6 thread wrapper) that reads the `MSG`,
+   loads the registered `WndProc`, and calls it. Proven by the serial log (window created + WndProc ran →
+   exit 7, since the exit code is only set after the paint completes) + `[WINPE7] PASS`, clean `+smap`.
+   Known limit (honest): the harness runs the app at *boot*, so the window is composited behind the login
+   screen and isn't crisply visible in a boot-time screenshot — a desktop-session launch would show it; the
+   bridge itself is complete (single window; `DispatchMessage`-only callback). **Windows: next** —
+   `GetModuleHandle`/`GetProcAddress`, multi-window + input events (mouse/keyboard → `WM_*`), more GDI, a
+   desktop-session launcher for visible windows. Still no .NET/UWP.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
    code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
    on top of the per-CPU TSS/GS/current_proc foundation. The pid 0 ↔ login interaction bit
@@ -220,6 +230,27 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-17** — **Track C milestone C7: tobyOS runs a stock Win32 GUI `.exe` (user32/gdi32 bridge).**
+  A textbook Win32 GUI program (Windows subsystem, `WinMain`) -- `RegisterClassA` + `CreateWindowExA` +
+  a `GetMessageA`/`DispatchMessageA` loop whose `WndProc` draws on `WM_PAINT` (`BeginPaint` → `FillRect`
+  + `TextOutA` → `EndPaint`) -- now runs. It creates a **real tobyOS desktop window** (`sys_gui_create`,
+  with the right title + 400×200 size) and the drawing maps onto `sys_gui_fill`/`sys_gui_text`. **The hard
+  part** -- `DispatchMessage` calling the app's `WndProc`, which a kernel shim can't do (it can't call CPL3
+  code) -- is solved with a **user-mode trampoline** in the shim page (same mechanism as the C6 thread
+  wrapper): the loader binds `DispatchMessageA`'s IAT slot to a 46-byte stub that reads the `MSG`, loads
+  the registered `WndProc` from a CRT-data slot, and `call`s it in CPL3 with the Microsoft-x64 args. The
+  rest is ~16 shims (the 12 user32 funcs, gdi32 `TextOutA`, and the GUI-subsystem CRT extras
+  `GetStartupInfoA`/`__p__acmdln`/`memset`/`IsDBCSLeadByte`); the message loop is synthesised kernel-side
+  (`CreateWindow`/`ShowWindow` queue a `WM_PAINT`, `PostQuitMessage` ends it); `Sleep` was made real
+  (`sys_nanosleep`) so the window persists. Proof: `programs/win-gui/main.c` (first-party; the `.exe` is a
+  build artifact) under `-DWINPE7_BOOT`; the serial log shows `window_create … title='tobyOS Win32 GUI'`
+  and the app exits **7** -- which is only returned after the WndProc's paint completes, so it proves the
+  whole chain (window + message loop + WndProc trampoline + GDI drawing) ran. All SEVEN Win32 milestones
+  (C1=42, C2=7, C3=3, C4=5, C5=9, C6=6, C7=7) pass together under `-cpu qemu64,+smep,+smap` with 0 faults;
+  validate 3/3 ALIVE; default desktop boot unaffected. **Known limit (honest):** the harness runs the app
+  at boot, so the window is composited *behind* the login screen and isn't crisply visible in a boot-time
+  screenshot (a desktop-session launch would show it); single window; `DispatchMessage`-style callback
+  only. App-compat ~29% → ~30%.
 - **2026-06-16** — **Track C milestone C6: tobyOS runs a stock MULTITHREADED Windows `.exe`.** A plain
   `clang main.c -o win-thread.exe` using `CreateThread` + `WaitForSingleObject` + a real
   `CRITICAL_SECTION` now runs: 4 worker threads each increment a shared counter 1000× under the lock, main

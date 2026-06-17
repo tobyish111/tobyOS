@@ -54,6 +54,9 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_CRT_ARGV      0x10   /* char**argv  (a value) */
 #define WIN32_CRT_ENVIRON   0x18   /* char**environ (value) */
 #define WIN32_CRT_ERRNO     0x20   /* int   errno (for _errno())   */
+#define WIN32_CRT_WNDPROC   0x28   /* WNDPROC of the (single) window -- the C7
+                                    * DispatchMessage trampoline reads [this]  */
+#define WIN32_CRT_ACMDLN    0x30   /* char* to the command line (__p__acmdln)  */
 #define WIN32_CRT_ARGV_ARR  0x40   /* char* argv[]  array   */
 #define WIN32_CRT_ENVIRON_ARR 0x100/* char* environ[] array */
 #define WIN32_CRT_STRINGS   0x140  /* argv string bytes     */
@@ -65,6 +68,7 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 /* C5 (file I/O): a scratch buffer where CreateFileA writes the translated
  * (Windows->tobyOS) path so it can hand sys_open a USER pointer. */
 #define WIN32_CRT_PATHBUF   0x800  /* translated path scratch (<=0x200)  */
+#define WIN32_CRT_CMDLINE   0xA00  /* the command-line string bytes      */
 
 /* C6 (multithreading): the CPL3 thread wrapper lives at this fixed VA in the
  * shim page (WIN32_SHIM_BASE 0x30000000 + WIN32_WRAPPER_OFF 0x80); CreateThread
@@ -72,6 +76,11 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
  * is distinguishable from a file fd or a ucrt FILE* token. */
 #define WIN32_THREAD_WRAPPER_VA  0x0000000030000080ULL
 #define WIN32_THREAD_TAG         0x7400000000000000ULL  /* handle = TAG | tid */
+
+/* C7 (GUI): the DispatchMessage trampoline (calls the user WndProc directly in
+ * CPL3 -- a kernel shim can't). Lives in the shim page at WIN32_DISPATCH_OFF;
+ * its IAT slot is bound to this VA instead of a gate-thunk. */
+#define WIN32_DISPATCH_STUB_VA   0x00000000300000C0ULL
 
 /* Resolve "dll!func" to the kernel-side Win32 shim index used to bind an
  * IAT thunk (case-insensitive dll match, exact func match). Returns the

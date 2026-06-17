@@ -1325,6 +1325,14 @@ programs/win-fileio/win-fileio.exe: programs/win-fileio/main.c
 programs/win-thread/win-thread.exe: programs/win-thread/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
 
+# Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
+# CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
+# BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
+# the user-mode WndProc trampoline.
+programs/win-gui/win-gui.exe: programs/win-gui/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
+	      -o $@ $< -lgdi32 -luser32
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1612,6 +1620,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-cpp/win-cpp.exe \
                programs/win-fileio/win-fileio.exe \
                programs/win-thread/win-thread.exe \
+               programs/win-gui/win-gui.exe \
                initrd/etc/motd initrd/readme.txt \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1667,6 +1676,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-cpp/win-cpp.exe                   $(INITRD_STAGE)/bin/win-cpp.exe
 	cp programs/win-fileio/win-fileio.exe             $(INITRD_STAGE)/bin/win-fileio.exe
 	cp programs/win-thread/win-thread.exe             $(INITRD_STAGE)/bin/win-thread.exe
+	cp programs/win-gui/win-gui.exe                   $(INITRD_STAGE)/bin/win-gui.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -1870,7 +1880,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/win-hello.exe            \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
-	    bin/win-fileio.exe bin/win-thread.exe                          \
+	    bin/win-fileio.exe bin/win-thread.exe bin/win-gui.exe          \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
