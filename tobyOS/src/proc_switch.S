@@ -119,6 +119,11 @@ proc_enter_user_asm:
     mov es, ax
     mov fs, ax
 
+    /* SWAPGS: first descent to CPL3. do_switch put this proc's user GS base
+     * (TEB for a Win32 PE, else &percpu) in the IA32_KERNEL_GS_BASE shadow;
+     * swap it into the active GS base for ring 3. Mirror swaps live in the
+     * syscall + ISR entry paths. */
+    swapgs
     iretq                       /* drop to CPL 3 */
 
 /* ============================================================== */
@@ -162,6 +167,8 @@ proc_enter_user_thread_asm:
     xor r10, r10
     xor r11, r11
 
+    /* SWAPGS: first descent to CPL3 (see proc_enter_user_asm). */
+    swapgs
     iretq
 
 .section .note.GNU-stack, "", @progbits

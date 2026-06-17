@@ -717,13 +717,18 @@ static int spawn_internal(const char *path, const char *name,
 
   if (is_pe) {
     /* ---- Windows PE/COFF image (Track C) ---- */
-    int prc = pe_load_user(image, image_size, &pe_info);
+    int prc = pe_load_user(image, image_size, argc, argv, &pe_info);
     kfree(image);
     ok = (prc == 0);
     if (ok) {
         p->personality = ABI_PERS_WIN32;
-        kprintf("[proc] pid %d '%s' -> Win32 PE personality (entry=%p)\n",
-                p->pid, p->name, (void *)pe_info.entry);
+        /* GS base = the PE's TEB so the CRT's gs:[0x30] (NtCurrentTeb) works.
+         * Loaded into the IA32_KERNEL_GS_BASE shadow on context switch and
+         * SWAPGS'd into the active GS base on the way to CPL3 (do_switch +
+         * syscall_entry.S). */
+        p->gs_base = pe_info.teb;
+        kprintf("[proc] pid %d '%s' -> Win32 PE personality (entry=%p teb=%p)\n",
+                p->pid, p->name, (void *)pe_info.entry, (void *)pe_info.teb);
         ok = build_user_stack(p);
     }
     if (ok) {

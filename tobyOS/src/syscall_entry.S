@@ -102,6 +102,12 @@ syscall_entry:
      * window is non-preemptible on THIS CPU. tobyOS user code never uses the
      * GS base, so we do NOT swapgs -- GS stays pointed at per-CPU data across
      * the ring transition (see syscall_init / proc_enter_user_asm). */
+    /* SWAPGS: on entry the active GS base is the user's (the per-proc TEB for
+     * a Win32 PE, or &percpu for native/Linux -- an identity swap). Swap it
+     * for this CPU's &percpu (held in the IA32_KERNEL_GS_BASE shadow) so the
+     * gs:[0]/gs:[8] accesses below hit per-CPU kernel data. IF is already
+     * clear (FMASK), so this prologue is non-preemptible on this CPU. */
+    swapgs
     mov gs:[8], rsp                             /* save user RSP -> scratch */
     mov rsp, gs:[0]                             /* swap to kernel syscall stack */
     push qword ptr gs:[8]                       /* user RSP -> kstack */
@@ -204,6 +210,11 @@ syscall_return_unwind:
     add rsp, 8              /* discard alignment pad */
     mov rsp, [rsp]          /* user RSP <- saved slot */
 
+    /* SWAPGS back: restore the user GS base (per-proc TEB / &percpu) for CPL3.
+     * Must come AFTER the last gs:-relative access (none remain) and the user
+     * RSP reload above (which reads the kernel stack, not gs:). cli was issued
+     * by syscall_dispatch before returning, so no IRQ lands in this window. */
+    swapgs
     sysretq                 /* CPL3, RIP <- rcx, RFLAGS <- r11 */
 
 /* ============================================================== */

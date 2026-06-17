@@ -234,6 +234,13 @@ struct proc {
      *       Written by SYS_SET_TLS, loaded into MSR_FS_BASE on context
      *       switch so each thread sees its own __thread variables.
      *
+     * gs_base: user-visible GS base for this proc. 0 for native/Linux
+     *       procs (which never use GS); for a Windows PE (ABI_PERS_WIN32)
+     *       it points at the proc's TEB so the CRT's gs:[0x30]
+     *       (NtCurrentTeb) works. Loaded into the IA32_KERNEL_GS_BASE
+     *       shadow on context switch; SWAPGS restores it on the way to
+     *       CPL3. See do_switch() + syscall_entry.S / isr_stubs.S.
+     *
      * join_waiters: linked list of procs blocked on SYS_THREAD_JOIN
      *       for this specific thread. Woken by thread_exit().
      *
@@ -247,6 +254,13 @@ struct proc {
      * scheduler never steals an idle proc onto another CPU. */
     bool            is_idle;
     uint64_t        tls_base;
+    uint64_t        gs_base;     /* Win32 TEB base (0 if not a PE); see above */
+    /* Win32 CRT heap (Track C): a bump allocator over sys_mmap'd anonymous
+     * user memory, backing the kernel32/ucrt malloc/calloc shims. Lazily
+     * created on first malloc; never reclaims (free() is a no-op) -- fine for
+     * a short-lived process. Both 0 until first use. */
+    uint64_t        win_heap_cur;
+    uint64_t        win_heap_end;
     struct proc    *join_waiters;
 
     /* ---- Priority scheduling (gap #3: priority classes + timeslicing) ----

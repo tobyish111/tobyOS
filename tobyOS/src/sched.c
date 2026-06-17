@@ -367,6 +367,13 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
     tss_set_rsp0((uint64_t)to->kstack_top);
     me->syscall_rsp = (uint64_t)to->kstack_top;
     if (to->tls_base) wrmsr(0xC0000100, to->tls_base);   /* MSR_FS_BASE */
+    /* SWAPGS shadow: a Win32 PE runs CPL3 with GS = its TEB (gs->gs_base);
+     * everything else runs CPL3 with GS = &percpu (this CPU), which makes the
+     * SWAPGS at every ring boundary an identity swap -- so native/Linux procs
+     * are behaviourally unchanged. Restored into the active GS base by the
+     * SWAPGS on the way out to CPL3 (syscall_entry.S / isr_stubs.S). */
+    wrmsr(0xC0000102 /* IA32_KERNEL_GS_BASE */,
+          to->gs_base ? to->gs_base : (uint64_t)me);
 
     fpu_save(from->fpu_state);
     proc_context_switch(&from->saved_rsp, to->saved_rsp, to->cr3);

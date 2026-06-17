@@ -121,6 +121,19 @@ struct pe_base_reloc { uint32_t page_rva, block_size; } __attribute__((packed));
 #define WIN32_THUNK_SIZE   10
 #define WIN32_GATE_IMM_OFF 0x51     /* offset of the syscall-number imm32 */
 
+/* The Thread Environment Block. A Windows CRT reads gs:[0x30]
+ * (NtCurrentTeb) during startup, so a PE runs CPL3 with its GS base = this
+ * VA (see the SWAPGS scheme in proc.h/syscall_entry.S). One page, mapped
+ * user-RW; only a few fields are meaningful to a minimal CRT. */
+#define WIN32_TEB_BASE     0x0000000031000000ULL
+#define WIN32_TEB_SELF     0x30    /* NtCurrentTeb: TEB's own linear address */
+#define WIN32_TEB_STACKBASE  0x08
+#define WIN32_TEB_STACKLIMIT 0x10
+#define WIN32_USER_STACK_TOP 0x0000800000000000ULL
+
+/* CRT data page (argc/argv/environ/_commode/_fmode): WIN32_CRT_DATA_BASE +
+ * the layout offsets are in pe.h (shared with the shims in syscall.c). */
+
 /* Position-independent marshalling gate (C2). Verified by assembling the
  * equivalent .intel_syntax and extracting .text (see the commit notes).
  * On entry: rax = shim index, rcx/rdx/r8/r9 = Microsoft-x64 args 0..3, and
@@ -272,7 +285,8 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
     return true;
 }
 
-int pe_load_user(const void *image, size_t size, struct pe_load_info *out) {
+int pe_load_user(const void *image, size_t size, int argc, char **argv,
+                 struct pe_load_info *out) {
     if (!image || !out || !pe_is_image(image, size)) return -1;
     out->entry = 0;
     out->image_base = 0;
@@ -333,6 +347,59 @@ int pe_load_user(const void *image, size_t size, struct pe_load_info *out) {
     if (!pe_map_user(WIN32_SHIM_BASE, WIN32_SHIM_BASE + PAGE_SIZE)) {
         kprintf("[pe] failed mapping shim page\n");
         return -1;
+    }
+    if (!pe_map_user(WIN32_TEB_BASE, WIN32_TEB_BASE + PAGE_SIZE)) {
+        kprintf("[pe] failed mapping TEB page\n");
+        return -1;
+    }
+    if (!pe_map_user(WIN32_CRT_DATA_BASE, WIN32_CRT_DATA_BASE + PAGE_SIZE)) {
+        kprintf("[pe] failed mapping CRT data page\n");
+        return -1;
+    }
+
+    /* ---- minimal TEB ---- the CRT startup reads gs:[0x30] (NtCurrentTeb).
+     * Zero the page, then set the self-pointer + stack bounds. The proc's GS
+     * base is set to WIN32_TEB_BASE by the spawn path, and the SWAPGS scheme
+     * makes gs:[...] resolve here while the PE runs in CPL3. */
+    {
+        unsigned long uf = uaccess_begin();
+        memset((void *)WIN32_TEB_BASE, 0, PAGE_SIZE);
+        *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_SELF)       = WIN32_TEB_BASE;
+        *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_STACKBASE)  = WIN32_USER_STACK_TOP;
+        *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_STACKLIMIT) = WIN32_USER_STACK_TOP - 0x200000ULL;
+        uaccess_end(uf);
+    }
+
+    /* ---- CRT data page: argc / argv[] / environ[] / _commode / _fmode ----
+     * The ucrt startup reads these via __p_* accessor shims. Copy the kernel-
+     * side argv strings into the user page and build the pointer arrays. */
+    {
+        uint64_t base = WIN32_CRT_DATA_BASE;
+        unsigned long uf = uaccess_begin();
+        memset((void *)base, 0, PAGE_SIZE);
+
+        int n = (argc > 0) ? argc : 0;
+        /* cap so the arrays + strings stay on the page */
+        if (n > 16) n = 16;
+        uint64_t argv_arr = base + WIN32_CRT_ARGV_ARR;
+        uint64_t strp     = base + WIN32_CRT_STRINGS;
+        uint64_t strp_end = base + PAGE_SIZE;
+        for (int i = 0; i < n; i++) {
+            const char *s = argv ? argv[i] : 0;
+            if (!s) { ((uint64_t *)argv_arr)[i] = 0; continue; }
+            ((uint64_t *)argv_arr)[i] = strp;
+            while (*s && strp < strp_end - 1) *(char *)(strp++) = *s++;
+            *(char *)(strp++) = '\0';
+        }
+        ((uint64_t *)argv_arr)[n] = 0;                 /* argv[argc] = NULL */
+
+        *(int32_t *)(base + WIN32_CRT_ARGC)    = n;
+        *(int32_t *)(base + WIN32_CRT_COMMODE) = 0;
+        *(int32_t *)(base + WIN32_CRT_FMODE)   = 0;
+        *(uint64_t *)(base + WIN32_CRT_ARGV)        = argv_arr;
+        *(uint64_t *)(base + WIN32_CRT_ENVIRON)     = base + WIN32_CRT_ENVIRON_ARR;
+        *(uint64_t *)(base + WIN32_CRT_ENVIRON_ARR) = 0;   /* environ[0] = NULL */
+        uaccess_end(uf);
     }
 
     /* ---- 2. copy headers + sections into the mapped pages ---- */
@@ -401,10 +468,17 @@ int pe_load_user(const void *image, size_t size, struct pe_load_info *out) {
     }
     /* shim page: executable, read-only (no write, no NX) for the PE at CPL3 */
     (void)vmm_protect(WIN32_SHIM_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER);
+    /* TEB + CRT data pages: data, read-write, never executable */
+    (void)vmm_protect(WIN32_TEB_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
+    (void)vmm_protect(WIN32_CRT_DATA_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
 
     out->image_base = load_base;
     out->entry      = load_base + opt->entry_point_rva;
-    kprintf("[pe] loaded: base=%p entry=%p (gate@%p)\n",
-            (void *)load_base, (void *)out->entry, (void *)WIN32_SHIM_BASE);
+    out->teb        = WIN32_TEB_BASE;
+    out->crt_data   = WIN32_CRT_DATA_BASE;
+    kprintf("[pe] loaded: base=%p entry=%p (gate@%p teb@%p crt@%p)\n",
+            (void *)load_base, (void *)out->entry,
+            (void *)WIN32_SHIM_BASE, (void *)WIN32_TEB_BASE,
+            (void *)WIN32_CRT_DATA_BASE);
     return 0;
 }

@@ -3693,6 +3693,42 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE3_BOOT
+    /* Track C -- the full mainCRTStartup, milestone C3. Build
+     * EXTRA_CFLAGS+=-DWINPE3_BOOT. Spawns /bin/win-hello3.exe, a STOCK
+     * `clang main.c -o win-hello3.exe` (no flags, no custom entry) that runs
+     * the whole ucrt CRT startup before main: it reads the TEB via gs:[0x30]
+     * (the SWAPGS scheme), uses the user-memory heap, gets argc/argv from the
+     * CRT-data region, and printf's through the shimmed ucrt stdio. The lines
+     * appear in the serial log and exit==3 proves the off-the-shelf .exe ran.
+     * Runs regardless of QUICK_BOOT. */
+    {
+        kprintf("[boot] WINPE3: spawning /bin/win-hello3.exe (STOCK Windows .exe)\n");
+        char *argv[] = { (char *)"win-hello3.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-hello3.exe",
+            .name = "win-hello3.exe",
+            .argc = 1,
+            .argv = argv,
+            .envc = 1,
+            .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] WINPE3: /bin/win-hello3.exe not spawned (rc=%d) "
+                    "MISSING\n", pid);
+            kprintf("[WINPE3] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE3: /bin/win-hello3.exe (pid=%d) exit=%d\n",
+                    pid, rc);
+            kprintf("[WINPE3] VERDICT: %s exit=%d (expected 3)\n",
+                    rc == 3 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef LINUXABI_BOOT
     /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
      * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a

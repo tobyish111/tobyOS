@@ -1299,6 +1299,13 @@ programs/win-crt/win-crt.exe: programs/win-crt/main.c
 	      -fno-stack-protector -O1 -Wl,-e,c2_entry -Wl,--subsystem,console \
 	      -o $@ $<
 
+# Track C/C3: a STOCK Windows .exe -- a plain `clang main.c -o win-hello3.exe`
+# with NO special flags and NO custom entry, so it runs the FULL ucrt
+# mainCRTStartup before main(). Proves tobyOS runs unmodified off-the-shelf
+# Windows console programs (TEB via SWAPGS + user heap + argv + ~40 CRT shims).
+programs/win-hello3/win-hello3.exe: programs/win-hello3/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1582,6 +1589,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-thread/linux-thread.elf \
                programs/win-hello/win-hello.exe \
                programs/win-crt/win-crt.exe \
+               programs/win-hello3/win-hello3.exe \
                initrd/etc/motd initrd/readme.txt \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1633,6 +1641,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-thread/linux-thread.elf         $(INITRD_STAGE)/bin/linux-thread
 	cp programs/win-hello/win-hello.exe               $(INITRD_STAGE)/bin/win-hello.exe
 	cp programs/win-crt/win-crt.exe                   $(INITRD_STAGE)/bin/win-crt.exe
+	cp programs/win-hello3/win-hello3.exe             $(INITRD_STAGE)/bin/win-hello3.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -1835,7 +1844,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/win-hello.exe            \
-	    bin/win-crt.exe                                                  \
+	    bin/win-crt.exe bin/win-hello3.exe                              \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \

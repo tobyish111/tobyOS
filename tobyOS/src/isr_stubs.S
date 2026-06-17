@@ -111,7 +111,16 @@ common_isr:
      *   [rsp+40]  rsp       (CPU)
      *   [rsp+48]  ss        (CPU)
      *
-     * We push GP regs in REVERSE order of `struct regs` so that the
+     * SWAPGS: if this interrupt came from CPL3 (CS.RPL==3), the active GS base
+     * is the user's (a Win32 PE's TEB, or &percpu for native -- identity), so
+     * swap in this CPU's &percpu (the IA32_KERNEL_GS_BASE shadow) for the
+     * handler. An interrupt that hit kernel code (CS.RPL==0) already has
+     * GS=&percpu, so it must NOT swap. The mirror swap is before iretq. */
+    test byte ptr [rsp+24], 3
+    jz 1f
+    swapgs
+1:
+    /* We push GP regs in REVERSE order of `struct regs` so that the
      * lowest field (r15) ends up at the lowest address. */
     push rax
     push rbx
@@ -160,8 +169,16 @@ common_isr:
     pop rbx
     pop rax
 
-    /* Drop the vector + error_code we pushed (16 bytes), then return. */
+    /* Drop the vector + error_code we pushed (16 bytes). Stack is now
+     *   [rsp+0] rip, [rsp+8] cs, [rsp+16] rflags, ...
+     * Mirror the entry SWAPGS: if returning to CPL3 (CS.RPL==3), restore the
+     * user GS base. IF is still clear here (we never sti in this trampoline),
+     * so no nested IRQ lands between the swap and iretq. */
     add rsp, 16
+    test byte ptr [rsp+8], 3
+    jz 2f
+    swapgs
+2:
     iretq
 
 /* -------- table of stub addresses, exported to C -------- */

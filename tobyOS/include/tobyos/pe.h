@@ -25,6 +25,8 @@
 struct pe_load_info {
     uint64_t entry;        /* user VA of the PE entry point (AddressOfEntryPoint + base) */
     uint64_t image_base;   /* actual load base (== preferred base for C1) */
+    uint64_t teb;          /* user VA of the Thread Environment Block (gs base) */
+    uint64_t crt_data;     /* user VA of the CRT data page (argc/argv/environ/...) */
 };
 
 /* True if [image,size) looks like a PE/COFF image: 'MZ' DOS magic and a
@@ -37,7 +39,23 @@ bool pe_is_image(const void *image, size_t size);
  * root so vmm_map edits + user writes land in the child. Applies base
  * relocations, installs the Win32 IAT thunks + marshalling gate, and
  * reports the entry point. Returns 0 on success, <0 on failure. */
-int pe_load_user(const void *image, size_t size, struct pe_load_info *out);
+int pe_load_user(const void *image, size_t size, int argc, char **argv,
+                 struct pe_load_info *out);
+
+/* CRT data page layout (Track C). The ucrt startup reaches argc/argv/environ
+ * through __p___argc / __p___argv / __p__environ, and _commode/_fmode through
+ * __p__commode / __p__fmode -- all of which must return USER pointers. The PE
+ * loader fills one user page with this fixed layout; the shims return
+ * crt_data + the matching offset. */
+#define WIN32_CRT_DATA_BASE 0x0000000031001000ULL  /* fixed VA of the page */
+#define WIN32_CRT_ARGC      0x00   /* int   argc            */
+#define WIN32_CRT_COMMODE   0x04   /* int   _commode        */
+#define WIN32_CRT_FMODE     0x08   /* int   _fmode          */
+#define WIN32_CRT_ARGV      0x10   /* char**argv  (a value) */
+#define WIN32_CRT_ENVIRON   0x18   /* char**environ (value) */
+#define WIN32_CRT_ARGV_ARR  0x40   /* char* argv[]  array   */
+#define WIN32_CRT_ENVIRON_ARR 0x100/* char* environ[] array */
+#define WIN32_CRT_STRINGS   0x140  /* argv string bytes     */
 
 /* Resolve "dll!func" to the kernel-side Win32 shim index used to bind an
  * IAT thunk (case-insensitive dll match, exact func match). Returns the

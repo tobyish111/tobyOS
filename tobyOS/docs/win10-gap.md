@@ -84,8 +84,9 @@ driver model; POSIX libc surface.
 
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
-2. **App compatibility (~25%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
-   **unmodified Windows x86-64 `.exe`s** (including ones that use the C runtime). **Track B (2026-06-14), milestones B1–B9 —
+2. **App compatibility (~27%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
+   **stock, off-the-shelf Windows x86-64 `.exe`s** (a plain `clang hello.c -o hello.exe` runs through its
+   full ucrt CRT startup → main → exit). **Track B (2026-06-14), milestones B1–B9 —
    the discrete Linux high-value set is complete:** a per-process ABI personality + a Linux→tobyOS
    syscall-translation layer run static ELFs (B1), **real musl-libc binaries** (B2 busybox), directory
    listing (B3 getdents64), **Linux signals** (B4), **dynamic linking via the real musl `ld.so`** (B5),
@@ -102,11 +103,20 @@ driver model; POSIX libc surface.
    DLL namespace (`api-ms-win-crt-stdio`) implements `__acrt_iob_func` + `__stdio_common_vfprintf` + `puts`
    on top of a **full kernel `printf` engine** (flags/width/precision/length, `d/i/u/x/X/o/p/c/s/%`). A
    real ucrt-linked `win-crt.exe` renders `%s/%d/%x/%c`, width/precision/zero-pad/left-justify, `%lld`,
-   `%p`, and >4 varargs correctly and exits 7 (`[WINPE2] PASS`, clean `+smep+smap`). **Linux: remaining is
-   incremental syscall breadth** (pthread_join, poll/epoll, broader sockets, glibc). **Windows: still
-   foundation-building** — next is the heap (`HeapAlloc`/`GetProcessHeap`), `GetCommandLine`/`GetModuleHandle`,
-   broader file I/O, then the full `mainCRTStartup` path (SEH/`_initterm`/the ~9 ucrt API-set DLLs), then
-   the user32/gdi32 → `SYS_GUI_*` bridge. Still no .NET/UWP.
+   `%p`, and >4 varargs correctly and exits 7 (`[WINPE2] PASS`, clean `+smep+smap`). **C3 (2026-06-16) —
+   the full `mainCRTStartup`:** a STOCK `clang hello.c -o hello.exe` (no flags, no custom entry) now runs
+   unmodified. This required giving a PE a real **TEB** reachable via `gs:[0x30]` — which forced a real
+   **SWAPGS scheme** across the whole syscall + interrupt + context-switch surface (the kernel had used
+   GS for per-CPU data without SWAPGS; PEs get a per-proc GS base = TEB, native/Linux procs get an
+   identity swap so they're behaviourally unchanged) — plus a **user-memory heap** (`malloc`/`calloc` over
+   `sys_mmap`), a **CRT data region** (`argc`/`argv`/`environ`/`_commode`/`_fmode`), and **~40 kernel32 +
+   ucrt shims** (`_initterm`, `__p_*`, `__getmainargs` glue, `memcpy`/`strlen`/`strncmp`, `VirtualQuery`,
+   critical sections, …). The off-the-shelf `.exe` prints `argc=1 argv0=win-hello3.exe` + its message and
+   exits 3 (`[WINPE3] PASS`); C1/C2 still pass under the shared SWAPGS gate; clean `+smep+smap`, validate
+   3/3 ALIVE, normal desktop boot unaffected. **Linux: remaining is incremental syscall breadth**
+   (pthread_join, poll/epoll, broader sockets, glibc). **Windows: next** — C++ programs (`_initterm`
+   global ctors + TLS callbacks need a user-mode trampoline, since a kernel shim can't call CPL3 code),
+   file I/O (`CreateFile`/`ReadFile`), then user32/gdi32 → `SYS_GUI_*` (GUI). Still no .NET/UWP.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
    code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
    on top of the per-CPU TSS/GS/current_proc foundation. The pid 0 ↔ login interaction bit
@@ -190,6 +200,32 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-16** — **Track C milestone C3: tobyOS runs a STOCK, off-the-shelf Windows `.exe`.** A plain
+  `clang main.c -o win-hello3.exe` (no flags, no custom entry) now runs unmodified through the entire ucrt
+  `mainCRTStartup` → `main` → `printf` → `exit`, printing `argc=1 argv0=win-hello3.exe` and exiting 3
+  (`[WINPE3] PASS`). Four pieces. **(1) A real SWAPGS scheme.** The CRT reads `gs:[0x30]` (NtCurrentTeb),
+  so a PE needs a TEB reachable via `gs:` — but the kernel had deliberately used the GS base for per-CPU
+  data *without* SWAPGS. Introduced SWAPGS at every CPL3 boundary (syscall entry+exit in
+  `syscall_entry.S`; ISR entry+exit conditional on `CS.RPL==3` in `isr_stubs.S`; first user-entry in
+  `proc_switch.S`), backed by a per-proc `gs_base` loaded into the `IA32_KERNEL_GS_BASE` shadow in
+  `do_switch`. A Win32 PE runs CPL3 with GS = its TEB; native/Linux procs get `gs_base=0` → shadow =
+  `&percpu`, an *identity* swap that leaves them byte-for-byte unchanged (verified: normal desktop boot,
+  user apps, C1/C2 all unaffected). **(2) A TEB + CRT-data page** mapped per PE (`pe_loader.c`): the TEB
+  self-pointer at `+0x30` and stack bounds; the CRT-data page holds `argc`/`argv`/`environ`/`_commode`/
+  `_fmode` (the ucrt `__p_*` accessors must return *user* pointers). **(3) A user-memory heap** — a
+  per-proc bump allocator over `sys_mmap`'d anonymous memory backing `malloc`/`calloc` (never reclaims;
+  `free` is a no-op — fine for a short-lived process; fresh blocks are zeroed so `calloc == malloc`).
+  **(4) ~40 kernel32 + ucrt shims** (`src/syscall.c`): `_initterm`/`_initterm_e` (walk the init tables —
+  empty for plain C, so nothing is called, which is necessary because a kernel shim can't call back into
+  CPL3), the `__p_*` accessors, `exit`/`_exit`/`abort`, `memcpy`/`strlen`/`strncmp`,
+  `VirtualQuery`/`VirtualProtect`, the critical-section no-ops, and a shared `w32_zero`/`w32_one` for the
+  ~22 trivial ones. Proof: `programs/win-hello3/main.c` (first-party source; the `.exe` is a build
+  artifact) under `-DWINPE3_BOOT`; all three Win32 milestones pass together under
+  `-cpu qemu64,+smep,+smap` with 0 faults; validate 3/3 ALIVE; normal desktop boot unaffected. **Known
+  limits (honest):** no C++ global ctors / TLS callbacks yet (they need a user-mode trampoline to call
+  CPL3 init code); the SWAPGS path uses the standard CPL-conditional swap (the NMI-swapgs race that full
+  kernels handle with IST is a known edge case, benign here since tobyOS ISRs don't read `gs:`).
+  App-compat ~25% → ~27%.
 - **2026-06-16** — **Track C milestone C2: tobyOS runs a Windows `.exe` that uses the C runtime
   (`printf`).** Two pieces on the C1 foundation. **(1) The marshalling gate now marshals stack
   arguments.** C1's gate captured only the 4 Microsoft-x64 register args (`rcx/rdx/r8/r9`); C2's reads

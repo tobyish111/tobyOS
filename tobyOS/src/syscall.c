@@ -127,7 +127,14 @@ static void syscall_service_input(void) {
 #define IA32_STAR       0xC0000081u
 #define IA32_LSTAR      0xC0000082u
 #define IA32_FMASK      0xC0000084u
-#define IA32_GS_BASE    0xC0000101u   /* active GS base (per-CPU data ptr) */
+#define IA32_GS_BASE        0xC0000101u   /* active GS base (per-CPU data ptr) */
+#define IA32_KERNEL_GS_BASE 0xC0000102u   /* SWAPGS shadow: the CPL3 GS base.
+                                           * Holds the current proc's user GS
+                                           * (TEB for a Win32 PE, else &percpu --
+                                           * an identity swap). syscall_entry.S /
+                                           * isr_stubs.S SWAPGS it in/out at every
+                                           * CPL3 boundary; do_switch keeps it in
+                                           * sync with the running proc. */
 
 #define EFER_SCE        (1ULL << 0)
 
@@ -3762,6 +3769,126 @@ static long w32_puts(uint64_t *args) {
     return n + 1;
 }
 
+/* ============================================================
+ * C3: enough kernel32 + ucrt to run a STOCK clang-built .exe through the
+ * full mainCRTStartup. Most shims are trivial (no-op / return-constant /
+ * return-pointer-into-the-CRT-data-page). The substantive ones: the heap
+ * (malloc/calloc over sys_mmap'd user memory), the __p_* accessors, and
+ * _initterm (which walks the C/C++ init tables -- empty for plain C).
+ * ============================================================ */
+
+/* The legion of "no-op / return 0" and "return TRUE" Win32 entry points. */
+static long w32_zero(uint64_t *a) { (void)a; return 0; }
+static long w32_one (uint64_t *a) { (void)a; return 1; }
+
+/* CRT process-termination entry points -> tobyOS proc_exit. */
+static long w32_exit (uint64_t *a) { proc_exit((int)(uint32_t)a[0]); return 0; }
+static long w32_abort(uint64_t *a) { (void)a; proc_exit(3); return 0; }
+
+/* The Win32 process heap: a per-proc bump allocator over anonymous user
+ * memory (sys_mmap). Never reclaims (free() is a no-op), so every block is
+ * fresh + zeroed -- which also makes calloc == malloc. */
+#define WIN32_HEAP_ARENA (4u * 1024u * 1024u)
+static uint64_t win32_heap_alloc(uint64_t n) {
+    struct proc *p = current_proc();
+    if (!p) return 0;
+    n = (n + 15) & ~15ull;                 /* 16-byte align */
+    if (n == 0) n = 16;
+    if (p->win_heap_cur == 0 || p->win_heap_cur + n > p->win_heap_end) {
+        uint64_t want = (n > WIN32_HEAP_ARENA) ? ((n + 0xFFFull) & ~0xFFFull)
+                                               : WIN32_HEAP_ARENA;
+        long base = sys_mmap(0, want, 0x03 /*RW*/, 0x05 /*ANON|PRIVATE*/, -1, 0);
+        if (base < 0) return 0;
+        p->win_heap_cur = (uint64_t)base;
+        p->win_heap_end = (uint64_t)base + want;
+    }
+    uint64_t r = p->win_heap_cur;
+    p->win_heap_cur += n;
+    return r;
+}
+static long w32_malloc(uint64_t *a) { return (long)win32_heap_alloc(a[0]); }
+static long w32_calloc(uint64_t *a) {
+    uint64_t nmemb = a[0], sz = a[1], total = nmemb * sz;
+    if (sz && total / sz != nmemb) return 0;       /* overflow */
+    return (long)win32_heap_alloc(total);          /* mmap memory is zeroed */
+}
+
+/* __p_* accessors -> a USER pointer into the CRT data page (set up by the
+ * PE loader). The ucrt startup reads argc/argv/environ/_commode/_fmode here. */
+static long w32_p_argc(uint64_t *a)    { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_ARGC); }
+static long w32_p_argv(uint64_t *a)    { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_ARGV); }
+static long w32_p_environ(uint64_t *a) { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_ENVIRON); }
+static long w32_p_commode(uint64_t *a) { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_COMMODE); }
+static long w32_p_fmode(uint64_t *a)   { (void)a; return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_FMODE); }
+
+/* _initterm(first,last) / _initterm_e: walk a table of init function
+ * pointers and call each non-NULL one. A plain C program's tables are empty
+ * (all NULL) so nothing is called -- which is necessary, because a kernel
+ * shim cannot call back into CPL3. A non-NULL entry (a C++ global ctor) is
+ * logged + skipped (a later user-mode-trampoline milestone). */
+static long w32_initterm(uint64_t *a) {
+    uint64_t p = a[0], end = a[1];
+    for (; p + 8 <= end; p += 8) {
+        uint64_t fn = 0;
+        if (copy_from_user(&fn, (const void *)(uintptr_t)p, 8) != 0) break;
+        if (fn) kprintf("[win32] _initterm: skipping ctor @%p (no user callback yet)\n",
+                        (void *)(uintptr_t)fn);
+    }
+    return 0;
+}
+
+/* memcpy / strlen / strncmp over user memory (imported by the CRT). */
+static long w32_memcpy(uint64_t *a) {
+    uint64_t dst = a[0], src = a[1], n = a[2], done = 0;
+    char buf[256];
+    while (done < n) {
+        uint64_t chunk = n - done; if (chunk > sizeof(buf)) chunk = sizeof(buf);
+        if (copy_from_user(buf, (const void *)(uintptr_t)(src + done), chunk) != 0) break;
+        if (copy_to_user((void *)(uintptr_t)(dst + done), buf, chunk) != 0) break;
+        done += chunk;
+    }
+    return (long)dst;
+}
+static long w32_strlen(uint64_t *a) {
+    char buf[1024];
+    long n = strncpy_from_user(buf, (const char *)(uintptr_t)a[0], sizeof(buf));
+    if (n < 0) return 0;
+    return (n >= (long)sizeof(buf)) ? (long)sizeof(buf) - 1 : n;
+}
+static long w32_strncmp(uint64_t *a) {
+    char s1[512], s2[512];
+    uint64_t n = a[2]; if (n > 511) n = 511;
+    if (strncpy_from_user(s1, (const char *)(uintptr_t)a[0], sizeof(s1)) < 0) return 0;
+    if (strncpy_from_user(s2, (const char *)(uintptr_t)a[1], sizeof(s2)) < 0) return 0;
+    for (uint64_t i = 0; i < n; i++) {
+        unsigned char c1 = (unsigned char)s1[i], c2 = (unsigned char)s2[i];
+        if (c1 != c2) return (long)c1 - (long)c2;
+        if (c1 == 0) break;
+    }
+    return 0;
+}
+
+/* VirtualQuery(addr, buf, len): fill a minimal MEMORY_BASIC_INFORMATION
+ * (committed, private, read-write). Enough for the CRT's startup probes. */
+static long w32_VirtualQuery(uint64_t *a) {
+    struct {
+        uint64_t BaseAddress, AllocationBase;
+        uint32_t AllocationProtect, _pad0;
+        uint64_t RegionSize;
+        uint32_t State, Protect, Type, _pad1;
+    } mbi;
+    memset(&mbi, 0, sizeof(mbi));
+    mbi.BaseAddress    = a[0] & ~0xFFFull;
+    mbi.AllocationBase = a[0] & ~0xFFFull;
+    mbi.AllocationProtect = 0x04;     /* PAGE_READWRITE */
+    mbi.RegionSize     = 0x100000;    /* 1 MiB */
+    mbi.State          = 0x1000;      /* MEM_COMMIT  */
+    mbi.Protect        = 0x04;        /* PAGE_READWRITE */
+    mbi.Type           = 0x20000;     /* MEM_PRIVATE */
+    if (copy_to_user((void *)(uintptr_t)a[1], &mbi, sizeof(mbi)) != 0) return 0;
+    return (long)sizeof(mbi);
+}
+
 typedef long (*win32_shim_fn)(uint64_t *args);
 
 struct win32_shim {
@@ -3782,6 +3909,55 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__acrt_iob_func",          w32_acrt_iob_func },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfprintf",  w32_stdio_common_vfprintf },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "puts",                     w32_puts },
+
+    /* ---- C3: the rest of the stock-clang mainCRTStartup surface ---- */
+    /* kernel32 */
+    { "kernel32.dll", "InitializeCriticalSection", w32_zero },
+    { "kernel32.dll", "DeleteCriticalSection",     w32_zero },
+    { "kernel32.dll", "EnterCriticalSection",      w32_zero },
+    { "kernel32.dll", "LeaveCriticalSection",      w32_zero },
+    { "kernel32.dll", "GetLastError",              w32_zero },
+    { "kernel32.dll", "SetUnhandledExceptionFilter", w32_zero },
+    { "kernel32.dll", "Sleep",                     w32_zero },
+    { "kernel32.dll", "TlsGetValue",               w32_zero },
+    { "kernel32.dll", "VirtualProtect",            w32_one },
+    { "kernel32.dll", "VirtualQuery",              w32_VirtualQuery },
+    /* ucrt: environment */
+    { "api-ms-win-crt-environment-l1-1-0.dll", "__p__environ",       w32_p_environ },
+    /* ucrt: heap */
+    { "api-ms-win-crt-heap-l1-1-0.dll", "malloc",                    w32_malloc },
+    { "api-ms-win-crt-heap-l1-1-0.dll", "calloc",                    w32_calloc },
+    { "api-ms-win-crt-heap-l1-1-0.dll", "free",                      w32_zero },
+    { "api-ms-win-crt-heap-l1-1-0.dll", "_set_new_mode",             w32_zero },
+    /* ucrt: locale / math / private */
+    { "api-ms-win-crt-locale-l1-1-0.dll", "_configthreadlocale",     w32_zero },
+    { "api-ms-win-crt-math-l1-1-0.dll", "__setusermatherr",          w32_zero },
+    { "api-ms-win-crt-private-l1-1-0.dll", "__C_specific_handler",   w32_zero },
+    { "api-ms-win-crt-private-l1-1-0.dll", "memcpy",                 w32_memcpy },
+    /* ucrt: runtime (the startup core) */
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__p___argc",             w32_p_argc },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "__p___argv",             w32_p_argv },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_configure_narrow_argv", w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_narrow_environment", w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_get_initial_narrow_environment", w32_p_environ },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_app_type",          w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_set_invalid_parameter_handler", w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit",            w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_cexit",                 w32_zero },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_initterm",              w32_initterm },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_initterm_e",            w32_initterm },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "exit",                   w32_exit },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_exit",                  w32_exit },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "abort",                  w32_abort },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "signal",                 w32_zero },
+    /* ucrt: stdio (extras beyond the C2 set) */
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__p__commode",             w32_p_commode },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__p__fmode",               w32_p_fmode },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fflush",                   w32_zero },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "setvbuf",                  w32_zero },
+    /* ucrt: string */
+    { "api-ms-win-crt-string-l1-1-0.dll", "strlen",                  w32_strlen },
+    { "api-ms-win-crt-string-l1-1-0.dll", "strncmp",                 w32_strncmp },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
@@ -4019,6 +4195,10 @@ void syscall_init(void) {
     struct percpu *pc = smp_this_cpu();
     pc->syscall_rsp = tss_kernel_rsp_top();
     wrmsr(IA32_GS_BASE, (uint64_t)pc);
+    /* SWAPGS shadow default = &percpu so the first ring transitions are
+     * identity swaps until a real user proc (with its own user_gs) runs;
+     * do_switch overwrites this per proc. */
+    wrmsr(IA32_KERNEL_GS_BASE, (uint64_t)pc);
 
     kprintf("[sys] EFER.SCE on, STAR=0x%016lx, LSTAR=%p, FMASK=0x%lx\n",
             star, (void *)&syscall_entry,

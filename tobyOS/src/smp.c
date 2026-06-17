@@ -182,6 +182,9 @@ static __attribute__((noreturn, used)) void ap_entry(uint32_t cpu_idx) {
     tss_init_ap(cpu_idx, me->stack_top);
     me->syscall_rsp = me->stack_top;
     wrmsr(0xC0000101u /* IA32_GS_BASE */, (uint64_t)me);
+    /* SWAPGS shadow default = &percpu (identity swap until a user proc runs;
+     * do_switch keeps it in sync per proc). See do_switch + syscall_entry.S. */
+    wrmsr(0xC0000102u /* IA32_KERNEL_GS_BASE */, (uint64_t)me);
 
     /* Adopt this CPU's idle process so the scheduler can switch user work in
      * and out of this core. `idle` is the switch-back target when a proc on
