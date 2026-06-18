@@ -93,4 +93,15 @@ int win32_shim_index(const char *dll, const char *func);
  * function's result. Defined in src/syscall.c. */
 long win32_dispatch(uint64_t func_index, uint64_t args_ptr);
 
+/* C8 boot-harness observers for the single Win32 GUI window (src/syscall.c).
+ * win32_gui_window_fd: live window fd for process `tgid`, or -1 if none yet.
+ * win32_gui_fill_color: the window's current FillRect colour (XRGB) so the
+ * harness can confirm a click recoloured it. */
+int      win32_gui_window_fd(int tgid);
+uint32_t win32_gui_fill_color(void);
+
+/* When on, GetMessage logs each meaningful WM_* it delivers to the WndProc
+ * (proof of input delivery, without GUI_TRACE_VERBOSE's per-frame volume). */
+void     win32_gui_set_log(bool on);
+
 #endif /* TOBYOS_PE_H */

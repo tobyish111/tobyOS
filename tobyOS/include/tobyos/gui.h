@@ -298,6 +298,20 @@ void gui_post_key(uint8_t c);
 /* Close the focused (topmost) window by posting GUI_EV_CLOSE. */
 void gui_close_focused(void);
 
+/* Inject a synthetic mouse event (GUI_EV_MOUSE_MOVE/DOWN/UP, client coords,
+ * button bitmask) into the focused (topmost) window -- same ring the real
+ * mouse path feeds. Used by the C8 Win32-GUI boot harness to drive an app's
+ * WndProc deterministically. No-op if no window is focused. */
+void gui_post_mouse(int type, int x, int y, uint8_t button);
+
+/* Screen-coordinate centre of the focused (topmost) window's client area.
+ * Returns false if no window is focused. Lets the C8 harness aim a REAL mouse
+ * click (via mouse_inject_event) at the Win32 window. */
+bool gui_focused_window_client_center(int *cx, int *cy);
+
+/* Current desktop cursor position (screen coords). */
+void gui_cursor_pos(int *x, int *y);
+
 /* ---- desktop activity tracing ------------------------------------- *
  *
  * Lightweight kprintf-based event trace. Every event line goes to

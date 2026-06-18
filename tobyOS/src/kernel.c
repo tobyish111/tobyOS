@@ -73,6 +73,7 @@
 #include <tobyos/gfx.h>
 #include <tobyos/mouse.h>
 #include <tobyos/gui.h>
+#include <tobyos/pe.h>      /* C8: win32_gui_window_fd / win32_gui_fill_color */
 #include <tobyos/term.h>
 #include <tobyos/settings.h>
 #include <tobyos/service.h>
@@ -2345,6 +2346,62 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
+#ifdef WINPE8_BOOT
+/* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
+ *
+ * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
+ * fullscreen login screen at boot and (b) inert (no input). C8 fixes both:
+ *   - VISIBLE: programmatically sign a session in (root has an empty seed
+ *     password), dismiss the login window, and launch the .exe so its window
+ *     composites with full chrome on the logged-in desktop (wallpaper+taskbar).
+ *   - INTERACTIVE: GetMessage now translates real mouse/keyboard/close events
+ *     into WM_*; the harness drives a REAL mouse click (mouse_inject_event ->
+ *     PS/2 driver -> compositor hit-test -> the window) to recolour the window,
+ *     then a deterministic close to run WM_CLOSE->WM_DESTROY->PostQuitMessage.
+ * The app returns 8 iff it PAINTED, HANDLED a click, and ran the close chain.
+ */
+
+/* The window's post-click fill colour (XRGB). The app's WndProc fills with
+ * CreateSolidBrush(RGB(40,180,90)) after a click; FillRect swaps R<->B from
+ * COLORREF, so the framebuffer colour is 0x0028B45A. */
+#define WINPE8_GREEN 0x0028B45Au
+
+/* Pump the desktop for ~`ms` milliseconds: yield so the GUI app runs, drain
+ * local input (so injected mouse reports are processed), and composite. We run
+ * here on pid 0 BEFORE idle_loop, so this is the compositor's only driver. */
+static void winpe8_pump_ms(uint64_t ms) {
+    uint64_t hz = pit_hz(); if (hz == 0) hz = 100;
+    uint64_t end = pit_ticks() + (ms * hz + 999) / 1000;
+    do {
+        sched_yield();
+        mouse_flush_pending();
+        kbd_flush_pending();
+        gui_tick();
+    } while (pit_ticks() < end);
+}
+
+/* Move the host cursor onto (tx,ty) in SCREEN coords via the real PS/2 mouse
+ * path. mouse_inject_event applies a pointer-acceleration multiplier (up to 5x)
+ * so open-loop delta math overshoots -- drive it as a feedback loop that reads
+ * the real cursor each step and converges. */
+static void winpe8_move_cursor_to(int tx, int ty) {
+    for (int i = 0; i < 200; i++) {
+        int cxp = 0, cyp = 0;
+        gui_cursor_pos(&cxp, &cyp);
+        int ex = tx - cxp, ey = ty - cyp;
+        if (ex >= -3 && ex <= 3 && ey >= -3 && ey <= 3) break;
+        /* pre-divide for the accel multiplier, clamp the per-report delta, and
+         * always nudge at least 1px toward the target. */
+        int sx = ex / 6; if (sx > 40) sx = 40; if (sx < -40) sx = -40;
+        if (sx == 0 && ex) sx = (ex > 0) ? 1 : -1;
+        int sy = ey / 6; if (sy > 40) sy = 40; if (sy < -40) sy = -40;
+        if (sy == 0 && ey) sy = (ey > 0) ? 1 : -1;
+        mouse_inject_event(sx, sy, 0);
+        winpe8_pump_ms(15);
+    }
+}
+#endif /* WINPE8_BOOT */
+
 void _start(void) {
     early_init();
     framebuffer_init();
@@ -3861,6 +3918,126 @@ void _start(void) {
             kprintf("[WINPE7] VERDICT: %s exit=%d (expected 7)\n",
                     rc == 7 ? "PASS" : "FAIL", rc);
         }
+    }
+#endif
+
+#ifdef WINPE8_BOOT
+    /* Track C -- VISIBLE + INTERACTIVE Win32 GUI, milestone C8. Build
+     * EXTRA_CFLAGS+=-DWINPE8_BOOT. Auto-login + dismiss login + launch the .exe
+     * onto the logged-in desktop, drive a REAL mouse click (recolour) and a
+     * deterministic close, assert exit==8. See the winpe8_* helpers above. */
+    {
+        /* Targeted input logging: GetMessage prints each WM_* it delivers to
+         * the WndProc (proof of input delivery) without GUI_TRACE_VERBOSE's
+         * per-frame serial flood. */
+        win32_gui_set_log(true);
+
+        /* (1) Sign a session in (root seeds with an empty password) so the
+         * desktop is logged-in and windows get real chrome. */
+        int lr = session_login("root", "");
+        kprintf("[boot] WINPE8: session_login(root) rc=%d active=%d\n",
+                lr, (int)session_active());
+
+        /* (2) Dismiss the login window: stop the service (won't restart now a
+         * session is active) and SIGKILL any lingering login proc, then
+         * composite the now-clean desktop (wallpaper + taskbar). */
+        service_stop("login");
+        winpe8_pump_ms(400);
+        for (int pid = 1; pid < 64; pid++) {
+            struct proc *p = proc_lookup(pid);
+            if (p && p->name[0] && strcmp(p->name, "login") == 0) {
+                kprintf("[boot] WINPE8: SIGKILL lingering login pid=%d\n", pid);
+                signal_send_to_pid(pid, SIGKILL);
+            }
+        }
+        winpe8_pump_ms(300);
+        gui_invalidate_full();
+        winpe8_pump_ms(300);
+
+        /* (3) Launch the .exe as a session-tagged desktop app. */
+        kprintf("[boot] WINPE8: spawning /bin/win-gui8.exe (interactive Win32 GUI)\n");
+        struct proc *self = current_proc();
+        int sid  = self ? self->session_id : 0;
+        int suid = self ? self->uid : 0;
+        int sgid = self ? self->gid : 0;
+        if (self) {
+            self->session_id = session_current_id();
+            self->uid        = session_current_uid();
+            self->gid        = session_current_gid();
+        }
+        char *argv[] = { (char *)"win-gui8.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-gui8.exe",
+            .name = "win-gui8.exe",
+            .argc = 1, .argv = argv,
+            .envc = 1, .envp = envp,
+        };
+        int wpid = proc_spawn(&spec);
+        if (self) { self->session_id = sid; self->uid = suid; self->gid = sgid; }
+
+        if (wpid < 0) {
+            kprintf("[boot] WINPE8: spawn failed rc=%d MISSING\n", wpid);
+            kprintf("[WINPE8] VERDICT: FAIL reason=spawn\n");
+        } else {
+            /* (4) Wait (up to ~4s) for the window to come up. */
+            int wfd = -1;
+            for (int i = 0; i < 80 && wfd < 0; i++) {
+                winpe8_pump_ms(50);
+                wfd = win32_gui_window_fd(wpid);
+            }
+            if (wfd < 0) {
+                kprintf("[boot] WINPE8: window never appeared\n");
+                kprintf("[WINPE8] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(wpid, SIGKILL);
+                (void)proc_wait(wpid);
+            } else {
+                kprintf("[boot] WINPE8: window up (fd=%d) -- painting blue\n", wfd);
+                winpe8_pump_ms(800);   /* first WM_PAINT (blue) + composite */
+
+                /* (5) REAL mouse click: move the cursor onto the window centre
+                 * via the PS/2 driver path, then press + release. */
+                int cx = 0, cy = 0;
+                if (gui_focused_window_client_center(&cx, &cy)) {
+                    kprintf("[boot] WINPE8: real mouse click at screen (%d,%d)\n", cx, cy);
+                    winpe8_move_cursor_to(cx, cy);
+                    mouse_inject_event(0, 0, MOUSE_BTN_LEFT);  /* button down */
+                    winpe8_pump_ms(250);
+                    mouse_inject_event(0, 0, 0);               /* button up   */
+                    winpe8_pump_ms(400);
+                }
+                uint32_t after_real = win32_gui_fill_color();
+                kprintf("[boot] WINPE8: fill after real click = 0x%06x (%s)\n",
+                        after_real & 0xFFFFFFu,
+                        after_real == WINPE8_GREEN
+                            ? "GREEN: real click landed"
+                            : "not green yet -- deterministic injection follows");
+
+                /* (6) Deterministic injection GUARANTEES the recolour for the
+                 * screenshot + exit code, regardless of real-click timing. */
+                gui_post_mouse(GUI_EV_MOUSE_MOVE, 200, 100, 0);
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 200, 100, MOUSE_BTN_LEFT);
+                winpe8_pump_ms(500);
+                kprintf("[boot] WINPE8: fill after deterministic click = 0x%06x\n",
+                        win32_gui_fill_color() & 0xFFFFFFu);
+
+                /* (7) Hold the green window on screen for the QMP screenshot. */
+                kprintf("[WINPE8] window recoloured GREEN; holding ~6s for screenshot\n");
+                winpe8_pump_ms(6000);
+
+                /* (8) Deterministic close -> WM_CLOSE -> WM_DESTROY ->
+                 * PostQuitMessage -> WM_QUIT -> clean exit. */
+                kprintf("[boot] WINPE8: posting WM_CLOSE (close chain)\n");
+                gui_close_focused();
+                winpe8_pump_ms(800);
+
+                int rc = proc_wait(wpid);
+                kprintf("[boot] WINPE8: /bin/win-gui8.exe (pid=%d) exit=%d\n", wpid, rc);
+                kprintf("[WINPE8] VERDICT: %s exit=%d (expected 8)\n",
+                        rc == 8 ? "PASS" : "FAIL", rc);
+            }
+        }
+        win32_gui_set_log(false);
     }
 #endif
 

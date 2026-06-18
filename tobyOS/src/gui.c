@@ -5357,6 +5357,45 @@ void gui_close_focused(void) {
     g.dirty = true;
 }
 
+/* Inject a synthetic mouse event into the focused (topmost) window's event
+ * ring, in CLIENT coordinates -- the same queue the real mouse path feeds. Used
+ * by the C8 boot harness to drive a Win32 app's WndProc deterministically
+ * (a click, a move) without depending on host cursor positioning. `type` is one
+ * of GUI_EV_MOUSE_MOVE/DOWN/UP; `button` is the LEFT/RIGHT/MIDDLE bitmask. */
+void gui_post_mouse(int type, int x, int y, uint8_t button) {
+    if (!g.ready || !g.active || !g.z_top) return;
+    if (type != GUI_EV_MOUSE_MOVE && type != GUI_EV_MOUSE_DOWN &&
+        type != GUI_EV_MOUSE_UP)
+        return;
+    struct window *w = g.z_top;
+    if (w->state == GUI_WIN_MINIMIZED) return;
+    if (g_trace >= GUI_TRACE_VERBOSE) {
+        gui_trace_logf("post_mouse type=%d xy=(%d,%d) btn=0x%02x -> wid=%d owner_pid=%d",
+                       type, x, y, (unsigned)button, w->wid, w->owner_pid);
+    }
+    enqueue_event(w, type, x, y, button, 0);
+    g.input_boost_pid = w->owner_pid;
+}
+
+/* Current desktop cursor position (screen coords). Lets the C8 harness drive a
+ * REAL mouse to a target via feedback (mouse_inject_event applies a pointer-
+ * acceleration multiplier, so open-loop delta math overshoots). */
+void gui_cursor_pos(int *x, int *y) {
+    if (x) *x = g.cur_x;
+    if (y) *y = g.cur_y;
+}
+
+/* Screen-coordinate centre of the focused (topmost) window's CLIENT area.
+ * Returns false if no window is focused. Used by the C8 harness to aim a REAL
+ * mouse click (driven via mouse_inject_event) at the Win32 window. */
+bool gui_focused_window_client_center(int *cx, int *cy) {
+    if (!g.ready || !g.active || !g.z_top) return false;
+    struct window *w = g.z_top;
+    if (cx) *cx = w->x + GUI_BORDER  + w->client_w / 2;
+    if (cy) *cy = w->y + GUI_TITLE_BAR_H + w->client_h / 2;
+    return true;
+}
+
 void gui_alt_tab_cycle(void) {
     if (!g.ready || !g.active) return;
     struct window *next = NULL;

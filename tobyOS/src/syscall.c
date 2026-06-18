@@ -4132,14 +4132,71 @@ static struct {
     int      w, h;        /* client size                              */
     uint64_t wndproc;     /* registered WndProc (also in the CRT slot) */
     bool     needs_paint; /* a WM_PAINT is queued                      */
+    bool     destroy;     /* DestroyWindow seen -> deliver WM_DESTROY  */
     bool     quit;        /* PostQuitMessage seen                      */
     int      quitcode;
+    uint32_t fill_color;  /* last FillRect colour (TextOut bg tracks it) */
 } g_win32_gui;
 
-/* Win32 messages we synthesise. */
-#define WM_NULL    0x0000
-#define WM_PAINT   0x000F
-#define WM_QUIT    0x0012
+/* Win32 messages. WM_PAINT/WM_QUIT/WM_NULL are synthesised by the loop; the
+ * WM_* in the 0x01xx/0x02xx ranges are translated from struct gui_event by
+ * GetMessage so the WndProc receives real mouse/keyboard/close input (C8). */
+#define WM_NULL         0x0000
+#define WM_DESTROY      0x0002
+#define WM_PAINT        0x000F
+#define WM_CLOSE        0x0010
+#define WM_QUIT         0x0012
+#define WM_KEYDOWN      0x0100
+#define WM_CHAR         0x0102
+#define WM_MOUSEMOVE    0x0200
+#define WM_LBUTTONDOWN  0x0201
+#define WM_LBUTTONUP    0x0202
+#define WM_RBUTTONDOWN  0x0204
+#define WM_RBUTTONUP    0x0205
+
+/* MK_* wParam button-state bits for mouse messages. */
+#define MK_LBUTTON      0x0001
+#define MK_RBUTTON      0x0002
+#define MK_MBUTTON      0x0010
+
+/* A CreateSolidBrush handle is a tagged token carrying its 24-bit COLORREF so
+ * FillRect can honour the colour. The high byte (0x7B) keeps it distinct from
+ * the small-integer system-colour brushes (COLOR_WINDOW+1 etc.) and from the
+ * thread/file/FILE* handle spaces. */
+#define WIN32_BRUSH_TAG   0x7B00000000000000ull
+#define WIN32_BRUSH_MASK  0xFF00000000000000ull
+
+/* The default window fill (C7's blue) used when no solid brush is supplied. */
+#define WIN32_FILL_DEFAULT 0x002E5C8Au
+
+/* The Win32 MSG struct as the loop sees it (and as the DispatchMessage
+ * trampoline reads it: hwnd@0, message@8, wParam@0x10, lParam@0x18). */
+struct win32_msg {
+    uint64_t hwnd;
+    uint32_t message;
+    uint32_t pad;
+    uint64_t wParam;
+    uint64_t lParam;
+    uint32_t time;
+    int32_t  ptx, pty;
+};
+
+/* When set (by the C8 harness via win32_gui_set_log), GetMessage logs each
+ * non-trivial input message it delivers to the WndProc -- crisp proof the
+ * mouse/keyboard/close events reach the app, without the per-frame volume of
+ * GUI_TRACE_VERBOSE (which slowed the run ~13x writing serial). */
+static bool g_win32_log_input;
+void win32_gui_set_log(bool on) { g_win32_log_input = on; }
+
+/* Poll one input event off a Win32 app's window, kernel-side (NO copy_to_user
+ * -- unlike sys_gui_poll_event, the caller here is a shim with a kernel
+ * destination). Drains pending USB/PS2 input first, like the syscall does. */
+static int win32_poll_window_event(int fd, struct gui_event *out) {
+    struct file *f = fd_lookup(fd);
+    if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+    syscall_service_input();
+    return gui_window_poll_event(f->win, out);
+}
 
 /* RegisterClassA(&WNDCLASSA): stash the WndProc (offset +0x08) both in our
  * state and in the user CRT slot the DispatchMessage trampoline reads. */
@@ -4170,7 +4227,9 @@ static long w32_CreateWindowExA(uint64_t *a) {
     g_win32_gui.w           = w;
     g_win32_gui.h           = h;
     g_win32_gui.needs_paint = true;
+    g_win32_gui.destroy     = false;
     g_win32_gui.quit        = false;
+    g_win32_gui.fill_color  = WIN32_FILL_DEFAULT;
     return fd;   /* HWND == HDC == fd */
 }
 
@@ -4180,15 +4239,72 @@ static long w32_PostQuitMessage(uint64_t *a) {
     g_win32_gui.quit = true; g_win32_gui.quitcode = (int)a[0]; return 0;
 }
 static long w32_TranslateMessage(uint64_t *a) { (void)a; return 0; }
-static long w32_DefWindowProcA(uint64_t *a)   { (void)a; return 0; }
 
-/* GetMessageA(&MSG, hwnd, min, max) -> >0 normal / 0 on WM_QUIT. We deliver a
- * queued WM_PAINT, then WM_QUIT once PostQuitMessage fires; otherwise we poll
- * the window for a close event (and otherwise yield + WM_NULL). */
+/* DefWindowProcA(hwnd, message, wParam, lParam). The one default behaviour we
+ * implement is the idiomatic WM_CLOSE -> DestroyWindow: a real app that doesn't
+ * handle WM_CLOSE in its WndProc passes it here, and Windows responds by
+ * destroying the window (which then sends WM_DESTROY). */
+static long w32_DefWindowProcA(uint64_t *a) {
+    if ((uint32_t)a[1] == WM_CLOSE) g_win32_gui.destroy = true;
+    return 0;
+}
+
+/* DestroyWindow(hwnd) -> TRUE. We don't tear the tobyOS window down here (the
+ * process exit / file_close does that); we just arm GetMessage to deliver one
+ * WM_DESTROY so the app's WndProc can PostQuitMessage and unwind cleanly. */
+static long w32_DestroyWindow(uint64_t *a) { (void)a; g_win32_gui.destroy = true; return 1; }
+
+/* InvalidateRect(hwnd, &RECT|NULL, erase) -> TRUE. Marks a repaint pending so
+ * the next GetMessage delivers WM_PAINT (how an app asks to redraw, e.g. after
+ * a click changes its state). */
+static long w32_InvalidateRect(uint64_t *a) { (void)a; g_win32_gui.needs_paint = true; return 1; }
+
+/* Translate one struct gui_event into a Win32 message in *m. Returns true if a
+ * deliverable message was produced (RESIZE/NONE are dropped). */
+static bool win32_event_to_msg(const struct gui_event *ev,
+                               struct win32_msg *m) {
+    m->hwnd = (uint64_t)g_win32_gui.fd;
+    switch (ev->type) {
+    case GUI_EV_MOUSE_MOVE:
+        m->message = WM_MOUSEMOVE;
+        m->wParam  = (ev->button & 1) ? MK_LBUTTON : 0;
+        m->lParam  = ((uint64_t)(uint16_t)ev->x) | ((uint64_t)(uint16_t)ev->y << 16);
+        return true;
+    case GUI_EV_MOUSE_DOWN:
+        m->message = (ev->button & 2) ? WM_RBUTTONDOWN : WM_LBUTTONDOWN;
+        m->wParam  = (ev->button & 2) ? MK_RBUTTON : MK_LBUTTON;
+        m->lParam  = ((uint64_t)(uint16_t)ev->x) | ((uint64_t)(uint16_t)ev->y << 16);
+        return true;
+    case GUI_EV_MOUSE_UP:
+        m->message = (ev->button & 2) ? WM_RBUTTONUP : WM_LBUTTONUP;
+        m->wParam  = 0;
+        m->lParam  = ((uint64_t)(uint16_t)ev->x) | ((uint64_t)(uint16_t)ev->y << 16);
+        return true;
+    case GUI_EV_KEY:
+        /* tobyOS delivers an ASCII byte; surface it as both a virtual-key-ish
+         * WM_KEYDOWN (wParam = the byte) -- enough for an app that switches on
+         * keystrokes. (A separate WM_CHAR would need TranslateMessage state we
+         * don't keep; the byte in wParam is sufficient here.) */
+        m->message = WM_KEYDOWN;
+        m->wParam  = (uint64_t)ev->key;
+        m->lParam  = 1;
+        return true;
+    case GUI_EV_CLOSE:
+        m->message = WM_CLOSE;
+        return true;
+    default:
+        return false;   /* GUI_EV_NONE / GUI_EV_RESIZE -> no message */
+    }
+}
+
+/* GetMessageA(&MSG, hwnd, min, max) -> >0 normal / 0 on WM_QUIT. Order of
+ * delivery: a pending WM_DESTROY (after DestroyWindow), then WM_QUIT (after
+ * PostQuitMessage), then a queued WM_PAINT, then any real input event drained
+ * from the window (mouse/keyboard/close -> WM_*), else yield + WM_NULL so the
+ * loop keeps turning without busy-spinning. */
 static long w32_GetMessageA(uint64_t *a) {
     uint64_t msg = a[0];
-    struct { uint64_t hwnd; uint32_t message; uint32_t pad;
-             uint64_t wParam, lParam; uint32_t time; int32_t ptx, pty; } m;
+    struct win32_msg m;
     memset(&m, 0, sizeof(m));
 
     if (g_win32_gui.quit) {
@@ -4196,16 +4312,35 @@ static long w32_GetMessageA(uint64_t *a) {
         (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
         return 0;
     }
+    if (g_win32_gui.destroy) {
+        g_win32_gui.destroy = false;
+        m.hwnd = (uint64_t)g_win32_gui.fd; m.message = WM_DESTROY;
+        if (g_win32_log_input) kprintf("[winpe8] GetMessage -> WM_DESTROY\n");
+        (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+        return 1;
+    }
     if (g_win32_gui.needs_paint) {
         g_win32_gui.needs_paint = false;
         m.hwnd = (uint64_t)g_win32_gui.fd; m.message = WM_PAINT;
         (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
         return 1;
     }
-    /* No paint pending and no quit: yield and deliver WM_NULL so a real app's
-     * loop keeps turning without busy-spinning. (Window-close events that
-     * would synthesise WM_QUIT are a later refinement; this test quits via
-     * PostQuitMessage from its WM_PAINT handler.) */
+    /* Drain one real input event (mouse/keyboard/close) and translate it. */
+    if (g_win32_gui.fd >= 0) {
+        struct gui_event ev;
+        if (win32_poll_window_event(g_win32_gui.fd, &ev) > 0 &&
+            win32_event_to_msg(&ev, &m)) {
+            /* Log the meaningful ones (skip the WM_MOUSEMOVE flood). */
+            if (g_win32_log_input && m.message != WM_MOUSEMOVE)
+                kprintf("[winpe8] GetMessage -> WM_%04x wParam=0x%lx lParam=0x%lx\n",
+                        (unsigned)m.message, (unsigned long)m.wParam,
+                        (unsigned long)m.lParam);
+            (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+            return 1;
+        }
+    }
+    /* Nothing pending: yield and deliver WM_NULL so the app's loop keeps
+     * turning (and other procs run) without busy-spinning. */
     sched_yield();
     m.hwnd = (uint64_t)g_win32_gui.fd; m.message = WM_NULL;
     (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
@@ -4231,21 +4366,46 @@ static long w32_EndPaint(uint64_t *a) {
     return 1;
 }
 
-/* FillRect(hdc, &RECT, hbrush) -> non-zero. We render every brush as a
- * distinct fill colour (real brush/colour mapping is a later refinement). */
+/* COLORREF is 0x00BBGGRR (red in the low byte); tobyOS framebuffer colours are
+ * XRGB 0x00RRGGBB. Swap R and B. */
+static uint32_t win32_colorref_to_xrgb(uint32_t cr) {
+    uint32_t r = cr & 0xFF, g = (cr >> 8) & 0xFF, b = (cr >> 16) & 0xFF;
+    return (r << 16) | (g << 8) | b;
+}
+
+/* gdi32!CreateSolidBrush(COLORREF) -> HBRUSH. We return a tagged token that
+ * carries the colour so FillRect can honour it (no real GDI object table). */
+static long w32_CreateSolidBrush(uint64_t *a) {
+    return (long)(WIN32_BRUSH_TAG | (uint64_t)((uint32_t)a[0] & 0xFFFFFFu));
+}
+
+/* gdi32!DeleteObject(hgdiobj) -> TRUE. Brush tokens carry no allocation. */
+static long w32_DeleteObject(uint64_t *a) { (void)a; return 1; }
+
+/* FillRect(hdc, &RECT, hbrush) -> non-zero. Honours a CreateSolidBrush colour
+ * (so e.g. a click can repaint the window a new colour); a non-solid/system
+ * brush handle falls back to the default fill. The chosen colour is remembered
+ * so TextOutA draws its text on a matching background. */
 static long w32_FillRect(uint64_t *a) {
     int      fd   = (int)a[0];
     uint64_t prc  = a[1];
+    uint64_t hbr  = a[2];
     int32_t  rc[4] = { 0, 0, 0, 0 };
     if (copy_from_user(rc, (const void *)(uintptr_t)prc, sizeof(rc)) != 0) return 0;
     int x = rc[0], y = rc[1], w = rc[2] - rc[0], h = rc[3] - rc[1];
     if (w < 0) w = 0; if (h < 0) h = 0;
+    uint32_t color = WIN32_FILL_DEFAULT;
+    if ((hbr & WIN32_BRUSH_MASK) == WIN32_BRUSH_TAG)
+        color = win32_colorref_to_xrgb((uint32_t)(hbr & 0xFFFFFFu));
+    g_win32_gui.fill_color = color;
     uint32_t whlen = ((uint32_t)(w & 0xFFFF)) | ((uint32_t)(h & 0xFFFF) << 16);
-    (void)sys_gui_fill(fd, x, y, whlen, 0x002E5C8A /* a visible blue */);
+    (void)sys_gui_fill(fd, x, y, whlen, color);
     return 1;
 }
 
-/* gdi32!TextOutA(hdc, x, y, str, len) -> non-zero. */
+/* gdi32!TextOutA(hdc, x, y, str, len) -> non-zero. Drawn white on the window's
+ * current fill colour (tracked by FillRect) so the label stays legible after a
+ * recolour. */
 static long w32_TextOutA(uint64_t *a) {
     int      fd  = (int)a[0];
     int      x   = (int)(int32_t)a[1];
@@ -4253,7 +4413,7 @@ static long w32_TextOutA(uint64_t *a) {
     uint64_t str = a[3];
     uint32_t xy  = ((uint32_t)(x & 0xFFFF)) | ((uint32_t)(y & 0xFFFF) << 16);
     (void)sys_gui_text(fd, xy, (const char *)(uintptr_t)str,
-                       0x00FFFFFF /* white */, 0x002E5C8A /* on the blue fill */);
+                       0x00FFFFFF /* white */, g_win32_gui.fill_color);
     return 1;
 }
 
@@ -4412,6 +4572,15 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "FillRect",          w32_FillRect },
     /* gdi32 */
     { "gdi32.dll",  "TextOutA",          w32_TextOutA },
+
+    /* ---- C8: interactive single window (input events + close chain) ---- */
+    /* user32: DestroyWindow/InvalidateRect drive the WM_CLOSE->WM_DESTROY and
+     * repaint paths; GetMessageA (above) now translates real input -> WM_*. */
+    { "user32.dll", "DestroyWindow",     w32_DestroyWindow },
+    { "user32.dll", "InvalidateRect",    w32_InvalidateRect },
+    /* gdi32: solid brushes so a click can repaint the window a new colour. */
+    { "gdi32.dll",  "CreateSolidBrush",  w32_CreateSolidBrush },
+    { "gdi32.dll",  "DeleteObject",      w32_DeleteObject },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
@@ -4449,6 +4618,18 @@ long win32_dispatch(uint64_t func_index, uint64_t args_ptr) {
     }
     return g_win32_shims[func_index].fn(args);
 }
+
+/* ---- C8 harness accessors ----
+ * Let the boot harness observe the single Win32 GUI window without reaching
+ * into g_win32_gui directly. win32_gui_window_fd returns the live window fd for
+ * a given process (-1 if that process has no window yet); win32_gui_fill_color
+ * reports the current FillRect colour so the harness can confirm a click
+ * actually recoloured the window (real-mouse vs deterministic injection). */
+int win32_gui_window_fd(int tgid) {
+    if (g_win32_gui.tgid == tgid && g_win32_gui.fd >= 0) return g_win32_gui.fd;
+    return -1;
+}
+uint32_t win32_gui_fill_color(void) { return g_win32_gui.fill_color; }
 
 /* Win32 personality translator -- the mirror of linux_syscall(). A PE only
  * ever issues the marshalling gate's ABI_SYS_WIN32_DISPATCH; anything else
