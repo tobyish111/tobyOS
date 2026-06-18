@@ -82,11 +82,25 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
  * its IAT slot is bound to this VA instead of a gate-thunk. */
 #define WIN32_DISPATCH_STUB_VA   0x00000000300000C0ULL
 
+/* C9 (GetProcAddress): the loader pre-generates a marshalling thunk for EVERY
+ * kernel-side Win32 shim into a fixed region of the shim page, so GetProcAddress
+ * can hand back a real callable CPL3 function pointer for any shim resolved by
+ * name at runtime. Slot i lives at WIN32_PROCADDR_BASE_VA + i*WIN32_PROCADDR_STRIDE
+ * (each slot is the same 10-byte `mov eax,i; jmp gate` thunk an IAT import gets).
+ * 0x800 leaves room below it for ~179 per-import thunks (0x100..0x800) and above
+ * it for ~204 shim thunks before the 4 KiB page ends -- both bounds are checked. */
+#define WIN32_PROCADDR_BASE_VA   0x0000000030000800ULL
+#define WIN32_PROCADDR_STRIDE    10
+
 /* Resolve "dll!func" to the kernel-side Win32 shim index used to bind an
  * IAT thunk (case-insensitive dll match, exact func match). Returns the
  * index, or -1 if the symbol is not provided. Defined alongside the shim
  * table in src/syscall.c. */
 int win32_shim_index(const char *dll, const char *func);
+
+/* Number of entries in the Win32 shim table (src/syscall.c). The loader emits
+ * one procaddr thunk per shim; GetProcAddress bounds its index against this. */
+int win32_shim_count(void);
 
 /* The ABI_SYS_WIN32_DISPATCH target: invoke shim `func_index` with the
  * 8-qword argument array at user VA `args_ptr`. Returns the Win32

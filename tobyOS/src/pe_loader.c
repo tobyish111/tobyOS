@@ -184,6 +184,22 @@ static const uint8_t g_win32_gate[] = {
 #define WIN32_THUNK_BASE    0x100
 #define WIN32_WRAPPER_IMM_OFF 0x14    /* the thread-exit imm32 in the wrapper */
 
+/* C9: per-import thunks grow up from WIN32_THUNK_BASE; the GetProcAddress thunk
+ * table (one slot per shim) sits at this fixed offset above them. Both must stay
+ * within the single 4 KiB shim page. */
+#define WIN32_PROCADDR_OFF  ((uint64_t)(WIN32_PROCADDR_BASE_VA - WIN32_SHIM_BASE))
+
+/* Emit a 10-byte marshalling thunk (`mov eax,idx ; jmp gate`) at `page_off` in
+ * the shim page. The jmp is rel32 to the gate at offset 0. Caller holds the
+ * uaccess window. */
+static void pe_emit_gate_thunk(uint64_t page_off, uint32_t idx) {
+    uint8_t t[WIN32_THUNK_SIZE];
+    int32_t rel = -(int32_t)(page_off + WIN32_THUNK_SIZE);
+    t[0] = 0xB8; memcpy(&t[1], &idx, 4);    /* mov eax, idx */
+    t[5] = 0xE9; memcpy(&t[6], &rel, 4);    /* jmp rel32 (gate) */
+    memcpy((void *)(WIN32_SHIM_BASE + page_off), t, WIN32_THUNK_SIZE);
+}
+
 /* Position-independent thread wrapper (C6). A Win32 thread function is
  * entered here (via tobyOS thread_create, rdi = &{func, param}); it sets up
  * the Microsoft-x64 first arg (param -> rcx), calls the thread function,
@@ -350,25 +366,40 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
                 continue;
             }
 
-            /* Emit a 10-byte thunk:  mov eax,idx ; jmp gate */
-            uint64_t thunk_va = WIN32_SHIM_BASE + WIN32_THUNK_BASE +
-                                (uint64_t)next_thunk * WIN32_THUNK_SIZE;
-            uint8_t t[WIN32_THUNK_SIZE];
-            uint32_t imm = (uint32_t)idx;
-            int32_t  rel = -(int32_t)(WIN32_THUNK_BASE +
-                                      (uint32_t)next_thunk * WIN32_THUNK_SIZE +
-                                      WIN32_THUNK_SIZE);
-            t[0] = 0xB8; memcpy(&t[1], &imm, 4);    /* mov eax, idx */
-            t[5] = 0xE9; memcpy(&t[6], &rel, 4);    /* jmp rel32 (gate) */
-            memcpy((void *)thunk_va, t, WIN32_THUNK_SIZE);
-
-            iat[k] = thunk_va;      /* bind the IAT slot */
+            /* Emit a 10-byte thunk and bind the IAT slot to it. Guard against
+             * the per-import region (0x100..) growing into the procaddr table. */
+            uint64_t thunk_off = WIN32_THUNK_BASE +
+                                 (uint64_t)next_thunk * WIN32_THUNK_SIZE;
+            if (thunk_off + WIN32_THUNK_SIZE > WIN32_PROCADDR_OFF) {
+                kprintf("[pe] too many imports (%d) -- thunk region full\n",
+                        next_thunk);
+                iat[k] = 0;
+                continue;
+            }
+            pe_emit_gate_thunk(thunk_off, (uint32_t)idx);
+            iat[k] = WIN32_SHIM_BASE + thunk_off;   /* bind the IAT slot */
             next_thunk++;
 
             kprintf("[pe]   bind %s!%s -> shim#%d thunk@%p\n",
-                    dll, fname, idx, (void *)thunk_va);
+                    dll, fname, idx, (void *)(WIN32_SHIM_BASE + thunk_off));
         }
     }
+
+    /* C9: pre-generate a thunk for EVERY shim so GetProcAddress can return a
+     * callable pointer for any name-resolved shim index (slot i at
+     * WIN32_PROCADDR_BASE_VA + i*WIN32_THUNK_SIZE). Bounded by the page end. */
+    int nshims = win32_shim_count();
+    uint64_t pa_end = WIN32_PROCADDR_OFF +
+                      (uint64_t)nshims * WIN32_THUNK_SIZE;
+    if (pa_end > PAGE_SIZE) {
+        kprintf("[pe] WARNING: procaddr table (%d shims) overruns shim page\n",
+                nshims);
+        nshims = (int)((PAGE_SIZE - WIN32_PROCADDR_OFF) / WIN32_THUNK_SIZE);
+    }
+    for (int i = 0; i < nshims; i++)
+        pe_emit_gate_thunk(WIN32_PROCADDR_OFF + (uint64_t)i * WIN32_THUNK_SIZE,
+                           (uint32_t)i);
+
     uaccess_end(uf2);
     return true;
 }

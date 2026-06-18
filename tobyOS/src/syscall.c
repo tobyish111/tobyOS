@@ -4451,6 +4451,68 @@ static long w32_memset(uint64_t *a) {
     return (long)dst;
 }
 
+/* ---- C9: runtime API resolution (GetModuleHandle / GetProcAddress / LoadLibrary) ----
+ * Real software resolves APIs at runtime by name, not just via the static IAT.
+ * tobyOS has no real DLLs -- it IS the Win32 implementation -- so a module
+ * HANDLE is a tagged token carrying a shim-table index whose .dll names the
+ * module, and GetProcAddress returns the address of the loader-generated
+ * marshalling thunk for the resolved shim (callable in CPL3 like any import). */
+#define WIN32_HMODULE_TAG   0x7D00000000000000ull  /* distinct from brush 0x7B / thread 0x74 / FILE* 0xF11E */
+#define WIN32_HMODULE_MASK  0xFF00000000000000ull
+#define WIN32_PE_IMAGE_BASE 0x0000000140000000ull  /* all tobyOS PEs load here (delta 0) */
+
+static int         win32_dll_first_index(const char *dll); /* defined after the table */
+static const char *win32_shim_dll(int idx);                /* defined after the table */
+
+/* kernel32!GetCurrentProcessId() -> the caller's pid. Observable, so the C9
+ * test can prove a GetProcAddress'd pointer actually reaches the shim. */
+static long w32_GetCurrentProcessId(uint64_t *a) {
+    (void)a;
+    struct proc *p = current_proc();
+    return p ? (long)(p->is_thread ? p->tgid : p->pid) : 0;
+}
+
+/* kernel32!GetModuleHandleA(name) -> HMODULE. NULL name = this module (the
+ * exe's ImageBase). A named DLL we provide -> a tagged handle carrying a shim
+ * index that maps back to the DLL name; an unknown DLL -> NULL. */
+static long w32_GetModuleHandleA(uint64_t *a) {
+    uint64_t name = a[0];
+    if (name == 0) return (long)WIN32_PE_IMAGE_BASE;
+    char dll[64];
+    if (strncpy_from_user(dll, (const char *)(uintptr_t)name, sizeof(dll)) < 0)
+        return 0;
+    int idx = win32_dll_first_index(dll);
+    if (idx < 0) return 0;                       /* NULL: not a DLL we implement */
+    return (long)(WIN32_HMODULE_TAG | (uint64_t)(uint32_t)idx);
+}
+
+/* kernel32!LoadLibraryA(name) -> HMODULE. Nothing to actually load (tobyOS *is*
+ * the implementation); same resolution as GetModuleHandleA, NULL if unknown. */
+static long w32_LoadLibraryA(uint64_t *a) { return w32_GetModuleHandleA(a); }
+
+/* kernel32!FreeLibrary(hModule) -> TRUE (no real DLL refcount to drop). */
+static long w32_FreeLibrary(uint64_t *a) { (void)a; return 1; }
+
+/* kernel32!GetProcAddress(hModule, lpProcName) -> FARPROC. Resolves the function
+ * by name within the module's DLL and returns the address of its pre-generated
+ * marshalling thunk. Ordinal imports (MAKEINTRESOURCE) and unknown names -> NULL. */
+static long w32_GetProcAddress(uint64_t *a) {
+    uint64_t hmod  = a[0];
+    uint64_t pname = a[1];
+    if ((hmod & WIN32_HMODULE_MASK) != WIN32_HMODULE_TAG)
+        return 0;                                /* exe base / unknown handle */
+    if (pname == 0 || (pname >> 16) == 0)
+        return 0;                                /* NULL or an ordinal */
+    const char *dll = win32_shim_dll((int)(uint32_t)(hmod & 0xFFFFFFFFu));
+    if (!dll) return 0;
+    char fn[96];
+    if (strncpy_from_user(fn, (const char *)(uintptr_t)pname, sizeof(fn)) < 0)
+        return 0;
+    int idx = win32_shim_index(dll, fn);
+    if (idx < 0 || idx >= win32_shim_count()) return 0;
+    return (long)(WIN32_PROCADDR_BASE_VA + (uint64_t)idx * WIN32_PROCADDR_STRIDE);
+}
+
 typedef long (*win32_shim_fn)(uint64_t *args);
 
 struct win32_shim {
@@ -4581,6 +4643,13 @@ static const struct win32_shim g_win32_shims[] = {
     /* gdi32: solid brushes so a click can repaint the window a new colour. */
     { "gdi32.dll",  "CreateSolidBrush",  w32_CreateSolidBrush },
     { "gdi32.dll",  "DeleteObject",      w32_DeleteObject },
+
+    /* ---- C9: runtime API resolution (kernel32) ---- */
+    { "kernel32.dll", "GetModuleHandleA",    w32_GetModuleHandleA },
+    { "kernel32.dll", "GetProcAddress",      w32_GetProcAddress },
+    { "kernel32.dll", "LoadLibraryA",        w32_LoadLibraryA },
+    { "kernel32.dll", "FreeLibrary",         w32_FreeLibrary },
+    { "kernel32.dll", "GetCurrentProcessId", w32_GetCurrentProcessId },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
@@ -4604,6 +4673,24 @@ int win32_shim_index(const char *dll, const char *func) {
             return i;
     }
     return -1;
+}
+
+int win32_shim_count(void) { return WIN32_SHIM_COUNT; }
+
+/* First shim-table index whose DLL matches `dll` (case-insensitive), or -1. The
+ * index doubles as a module token in GetModuleHandleA/GetProcAddress (C9). */
+static int win32_dll_first_index(const char *dll) {
+    if (!dll) return -1;
+    for (int i = 0; i < WIN32_SHIM_COUNT; i++)
+        if (win32_dll_eq(dll, g_win32_shims[i].dll)) return i;
+    return -1;
+}
+
+/* DLL name for a shim-table index (recovers a module's DLL from its handle
+ * token), or NULL if out of range (C9). */
+static const char *win32_shim_dll(int idx) {
+    if (idx < 0 || idx >= WIN32_SHIM_COUNT) return 0;
+    return g_win32_shims[idx].dll;
 }
 
 long win32_dispatch(uint64_t func_index, uint64_t args_ptr) {

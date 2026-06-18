@@ -4041,6 +4041,34 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE9_BOOT
+    /* Track C -- runtime API resolution, milestone C9. Build
+     * EXTRA_CFLAGS+=-DWINPE9_BOOT. Spawns /bin/win-c9.exe, a STOCK clang .exe
+     * that resolves Win32 APIs at runtime via GetModuleHandleA/GetProcAddress/
+     * LoadLibraryA and calls through the resolved pointer. exit 9 iff every step
+     * passed (resolve by name, stable + distinct thunks, unknown->NULL, the call
+     * reaches the shim, cross-DLL LoadLibrary). Runs regardless of QUICK_BOOT. */
+    {
+        kprintf("[boot] WINPE9: spawning /bin/win-c9.exe (GetModuleHandle/GetProcAddress)\n");
+        char *argv[] = { (char *)"win-c9.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-c9.exe", .name = "win-c9.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] WINPE9: /bin/win-c9.exe not spawned (rc=%d) MISSING\n", pid);
+            kprintf("[WINPE9] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE9: /bin/win-c9.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE9] VERDICT: %s exit=%d (expected 9)\n",
+                    rc == 9 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef LINUXABI_BOOT
     /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
      * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a
