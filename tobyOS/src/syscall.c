@@ -71,6 +71,7 @@
 #include <tobyos/clipboard.h>
 #include <tobyos/smp.h>
 #include <tobyos/pe.h>
+#include <tobyos/kfont.h>   /* C14b: kernel TrueType text for the GDI shims */
 
 extern void syscall_entry(void);
 
@@ -4198,6 +4199,7 @@ struct win32_win {
     int      parent_fd;
     /* C13 GDI text state (per window / HDC). */
     int      font_scale;  /* bitmap-font scale from SelectObject(CreateFont) */
+    int      font_px;     /* C14b: TTF pixel height (0 = default 16)         */
     uint32_t text_color;  /* SetTextColor (XRGB); default white */
     int      bk_mode;     /* OPAQUE(2, default) / TRANSPARENT(1) */
     /* C14: a dialog window (from a template). The kernel owns its painting
@@ -4873,17 +4875,34 @@ static long w32_FillRect(uint64_t *a) {
     return 1;
 }
 
-/* gdi32!TextOutA(hdc, x, y, str, len) -> non-zero. Honours the DC's current text
- * colour (SetTextColor) and font scale (SelectObject(CreateFont)); the background
- * is the window's tracked fill colour. */
+/* C14b: the DC's TTF pixel height (0 = the default 16 px). */
+static int win32_win_px(const struct win32_win *w) {
+    int px = w ? w->font_px : 0;
+    return px > 0 ? px : 16;
+}
+
+/* gdi32!TextOutA(hdc, x, y, str, len) -> non-zero. C14b: when the TrueType font
+ * is available, render real glyphs at the DC's pixel height (CreateFont) in the
+ * DC's text colour (SetTextColor) via the kernel rasterizer; else fall back to
+ * the scaled 8x8 bitmap font. */
 static long w32_TextOutA(uint64_t *a) {
     int      fd  = (int)a[0];
     int      x   = (int)(int32_t)a[1];
     int      y   = (int)(int32_t)a[2];
     uint64_t str = a[3];
-    uint32_t xy  = ((uint32_t)(x & 0xFFFF)) | ((uint32_t)(y & 0xFFFF) << 16);
+    int      len = (int)(int32_t)a[4];
     struct win32_win *win = win32_win_find(fd);
-    uint32_t fg    = win ? win->text_color : 0x00FFFFFFu;
+    uint32_t fg = win ? win->text_color : 0x00FFFFFFu;
+    if (kfont_available()) {
+        char s[256];
+        long n = strncpy_from_user(s, (const char *)(uintptr_t)str, sizeof(s));
+        if (n < 0) return 0;
+        if (len >= 0 && len < (int)n) s[len] = 0;
+        struct window *gw = win32_hdc_window(fd);
+        if (gw) (void)kfont_draw_window(gw, x, y, s, -1, fg, win32_win_px(win));
+        return 1;
+    }
+    uint32_t xy    = ((uint32_t)(x & 0xFFFF)) | ((uint32_t)(y & 0xFFFF) << 16);
     uint32_t bg    = (win ? win->fill_color : WIN32_FILL_DEFAULT) & 0x00FFFFFFu;
     int      scale = win ? win->font_scale : 1;
     (void)sys_gui_text_scaled(fd, xy, (const char *)(uintptr_t)str, fg,
@@ -4891,16 +4910,16 @@ static long w32_TextOutA(uint64_t *a) {
     return 1;
 }
 
-/* ---- C13: GDI fonts + text metrics ----
- * tobyOS has one 8x8 bitmap font, scalable by an integer factor; an HFONT is a
- * tagged token carrying that scale = round(|height| / 8). */
+/* ---- C13/C14b: GDI fonts + text metrics ----
+ * C14b: an HFONT token carries the requested PIXEL HEIGHT; the kernel TTF
+ * rasterizer (kfont.c) renders at that size. If no font ships, the DC falls
+ * back to the scaled 8x8 bitmap font (the token's height/8 = the bitmap scale). */
 
-/* gdi32!CreateFontA(height, width, ...) -> HFONT. Only the height (a0) matters
- * for our scalable bitmap font. */
+/* gdi32!CreateFontA(height, width, ...) -> HFONT carrying |height| in pixels. */
 static long w32_CreateFontA(uint64_t *a) {
     int hgt = (int)(int32_t)a[0]; if (hgt < 0) hgt = -hgt;
-    int scale = (hgt + 4) / 8; if (scale < 1) scale = 1; if (scale > 8) scale = 8;
-    return (long)(WIN32_FONT_TAG | (uint64_t)(uint32_t)scale);
+    if (hgt < 1) hgt = 16; if (hgt > 200) hgt = 200;
+    return (long)(WIN32_FONT_TAG | (uint64_t)(uint32_t)hgt);
 }
 /* gdi32!SetTextColor(hdc, COLORREF) -> previous colour (as COLORREF). */
 static long w32_SetTextColor(uint64_t *a) {
@@ -4927,24 +4946,45 @@ static long w32_SetBkMode(uint64_t *a) {
 /* gdi32!GetTextExtentPoint32A(hdc, str, len, &SIZE{cx,cy}) -> TRUE. */
 static long w32_GetTextExtentPoint32A(uint64_t *a) {
     struct win32_win *w = win32_win_find((int)a[0]);
-    int scale = w ? w->font_scale : 1;
     int len = (int)(int32_t)a[2];
     if (len < 0) len = 0;
-    int32_t sz[2] = { len * 8 * scale, 8 * scale };   /* cx, cy */
+    int px = win32_win_px(w);
+    int32_t sz[2];
+    if (kfont_available()) {
+        char s[256];
+        long n = strncpy_from_user(s, (const char *)(uintptr_t)a[1], sizeof(s));
+        if (n < 0) n = 0;
+        if (len > (int)n) len = (int)n;
+        int asc = 0, desc = 0, lh = px;
+        kfont_vmetrics(px, &asc, &desc, &lh);
+        sz[0] = kfont_text_width(s, len, px);
+        sz[1] = lh;
+    } else {
+        int scale = w ? w->font_scale : 1;
+        sz[0] = len * 8 * scale; sz[1] = 8 * scale;
+    }
     (void)copy_to_user((void *)(uintptr_t)a[3], sz, sizeof(sz));
     return 1;
 }
 /* gdi32!GetTextMetricsA(hdc, &TEXTMETRICA) -> TRUE (fills the common fields). */
 static long w32_GetTextMetricsA(uint64_t *a) {
     struct win32_win *w = win32_win_find((int)a[0]);
-    int scale = w ? w->font_scale : 1;
+    int px = win32_win_px(w);
     int32_t tm[8];
     memset(tm, 0, sizeof(tm));
-    tm[0] = 8 * scale;       /* tmHeight        */
-    tm[1] = 7 * scale;       /* tmAscent        */
-    tm[2] = 1 * scale;       /* tmDescent       */
-    tm[5] = 8 * scale;       /* tmAveCharWidth  (@0x14) */
-    tm[6] = 8 * scale;       /* tmMaxCharWidth  (@0x18) */
+    if (kfont_available()) {
+        int asc = 0, desc = 0, lh = px;
+        kfont_vmetrics(px, &asc, &desc, &lh);
+        tm[0] = asc + desc;                       /* tmHeight       */
+        tm[1] = asc;                              /* tmAscent       */
+        tm[2] = desc;                             /* tmDescent      */
+        tm[5] = kfont_text_width("n", -1, px);    /* tmAveCharWidth */
+        tm[6] = kfont_text_width("W", -1, px);    /* tmMaxCharWidth */
+    } else {
+        int scale = w ? w->font_scale : 1;
+        tm[0] = 8 * scale; tm[1] = 7 * scale; tm[2] = 1 * scale;
+        tm[5] = 8 * scale; tm[6] = 8 * scale;
+    }
     (void)copy_to_user((void *)(uintptr_t)a[1], tm, sizeof(tm));
     return 1;
 }
@@ -4954,12 +4994,27 @@ static long w32_DrawTextA(uint64_t *a) {
     int fd = (int)a[0];
     struct win32_win *w = win32_win_find(fd);
     if (!w) return 0;
-    char s[128];
+    char s[256];
     long n = strncpy_from_user(s, (const char *)(uintptr_t)a[1], sizeof(s));
     if (n < 0) return 0;
+    int len = (int)(int32_t)a[2];                 /* -1 = whole string */
+    if (len >= 0 && len < (int)n) s[len] = 0;
     int32_t rc[4] = { 0, 0, 0, 0 };
     if (copy_from_user(rc, (const void *)(uintptr_t)a[3], sizeof(rc)) != 0) return 0;
     uint32_t fmt = (uint32_t)a[4];
+    int px = win32_win_px(w);
+    struct window *gw = win32_hdc_window(fd);
+    if (kfont_available() && gw) {
+        int tw = kfont_text_width(s, -1, px);
+        int asc = 0, desc = 0, lh = px;
+        kfont_vmetrics(px, &asc, &desc, &lh);
+        int th = asc + desc;
+        int x = rc[0], y = rc[1];
+        if (fmt & 0x1u) x = rc[0] + ((rc[2] - rc[0]) - tw) / 2;   /* DT_CENTER  */
+        if (fmt & 0x4u) y = rc[1] + ((rc[3] - rc[1]) - th) / 2;   /* DT_VCENTER */
+        (void)kfont_draw_window(gw, x, y, s, -1, w->text_color, px);
+        return th;
+    }
     int scale = w->font_scale;
     int tw = (int)n * 8 * scale, th = 8 * scale;
     int x = rc[0], y = rc[1];
@@ -5493,6 +5548,13 @@ static long w32_SendDlgItemMessageA(uint64_t *a) {
     uint64_t sub[4] = { WIN32_CTRL_TAG | (uint64_t)(c - g_win32_gui.ctrl), a[2], a[3], a[4] };
     return w32_SendMessageA(sub);
 }
+/* kernel32!lstrlenA(s) -> length (used by GUI apps to size TextOut strings). */
+static long w32_lstrlenA(uint64_t *a) {
+    if (!a[0]) return 0;
+    char s[256];
+    long n = strncpy_from_user(s, (const char *)(uintptr_t)a[0], sizeof(s));
+    return n < 0 ? 0 : (long)strlen(s);
+}
 /* kernel32!lstrcmpA(a, b) -> <0/0/>0 (used by dialog apps to compare text). */
 static long w32_lstrcmpA(uint64_t *a) {
     char s1[128], s2[128];
@@ -5540,10 +5602,13 @@ static long w32_SelectObject(uint64_t *a) {
         w->pen_color = win32_colorref_to_xrgb((uint32_t)(obj & 0xFFFFFFu));
         return (long)old;
     }
-    if (w && (obj & WIN32_TAG_MASK) == WIN32_FONT_TAG) {   /* C13: select a font */
-        uint64_t old = WIN32_FONT_TAG | (uint64_t)(uint32_t)w->font_scale;
-        int s = (int)(obj & 0xFF); if (s < 1) s = 1; if (s > 8) s = 8;
-        w->font_scale = s;
+    if (w && (obj & WIN32_TAG_MASK) == WIN32_FONT_TAG) {   /* C13/C14b: select a font */
+        uint64_t old = WIN32_FONT_TAG | (uint64_t)(uint32_t)(w->font_px ? w->font_px : 16);
+        int px = (int)(obj & 0xFFFF); if (px < 1) px = 16; if (px > 200) px = 200;
+        w->font_px = px;                                  /* C14b: TTF pixel height */
+        w->font_scale = (px + 4) / 8;                     /* bitmap fallback scale  */
+        if (w->font_scale < 1) w->font_scale = 1;
+        if (w->font_scale > 8) w->font_scale = 8;
         return (long)old;
     }
     return (long)obj;
@@ -6713,6 +6778,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "CheckRadioButton",       w32_CheckRadioButton },
     { "user32.dll", "SendDlgItemMessageA",    w32_SendDlgItemMessageA },
     { "kernel32.dll", "lstrcmpA",             w32_lstrcmpA },
+    { "kernel32.dll", "lstrlenA",             w32_lstrlenA },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

@@ -2346,7 +2346,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -4420,6 +4420,38 @@ void _start(void) {
                 int rc = proc_wait(dpid);
                 kprintf("[boot] WINPE14: /bin/win-dlg14.exe (pid=%d) exit=%d\n", dpid, rc);
                 kprintf("[WINPE14D] VERDICT: %s exit=%d (expected 14)\n", rc == 14 ? "PASS" : "FAIL", rc);
+            }
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE14B_BOOT
+    /* Track C -- REAL TrueType fonts, milestone C14b. Build EXTRA_CFLAGS+=
+     * -DWINPE14B_BOOT. A stock Win32 GUI .exe CreateFontA's several pixel sizes
+     * and TextOutA/DrawTextA's real strings; tobyOS rasterizes genuine Lato
+     * (OFL) glyphs in the kernel via stb_truetype. exit 14 iff the text measured
+     * PROPORTIONAL (TTF), not monospace (the 8x8 bitmap fallback). */
+    {
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+        kprintf("[boot] WINPE14B: spawning /bin/win-font14b.exe (TrueType fonts)\n");
+        int fpid = winpe_spawn_session_app("/bin/win-font14b.exe", "win-font14b.exe");
+        if (fpid < 0) {
+            kprintf("[WINPE14B] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 120 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(fpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE14B] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(fpid, SIGKILL); (void)proc_wait(fpid);
+            } else {
+                winpe8_pump_ms(900);   /* WM_PAINT -> glyphs rasterized + drawn */
+                kprintf("[WINPE14B] TrueType text on the window; holding ~5s for screenshot\n");
+                for (int i = 0; i < 200 && win32_gui_window_count(fpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(fpid);
+                kprintf("[boot] WINPE14B: /bin/win-font14b.exe (pid=%d) exit=%d\n", fpid, rc);
+                kprintf("[WINPE14B] VERDICT: %s exit=%d (expected 14)\n", rc == 14 ? "PASS" : "FAIL", rc);
             }
         }
         win32_gui_set_log(false);

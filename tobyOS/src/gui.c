@@ -5034,6 +5034,40 @@ int gui_window_fill_argb(struct window *w, int x, int y, int rw, int rh,
     return 0;
 }
 
+/* C14b: blend an 8-bit coverage glyph bitmap (cov[gh*gw], top-to-bottom),
+ * tinted `xrgb` (0x00RRGGBB), into the window's XRGB client backbuffer at
+ * (x,y). Integer-only source-over per pixel (the kernel TTF rasterizer in
+ * kfont.c produces the coverage; this stays in the -mno-sse gui.c). */
+void gui_window_blend_coverage(struct window *w, int x, int y,
+                               const uint8_t *cov, int gw, int gh, uint32_t xrgb) {
+    if (!w || !w->in_use || !w->backbuf || !cov) return;
+    uint32_t cr = (xrgb >> 16) & 0xFFu, cg = (xrgb >> 8) & 0xFFu, cb = xrgb & 0xFFu;
+    int cw = w->client_w, ch = w->client_h;
+    for (int row = 0; row < gh; row++) {
+        int dy = y + row;
+        if (dy < 0 || dy >= ch) continue;
+        const uint8_t *srow = &cov[row * gw];
+        uint32_t *drow = &w->backbuf[dy * cw];
+        for (int col = 0; col < gw; col++) {
+            int dx = x + col;
+            if (dx < 0 || dx >= cw) continue;
+            uint8_t a = srow[col];
+            if (a == 0) continue;
+            if (a == 255) {
+                drow[dx] = (cr << 16) | (cg << 8) | cb;
+            } else {
+                uint32_t bg = drow[dx];
+                uint32_t br = (bg >> 16) & 0xFFu, bgc = (bg >> 8) & 0xFFu, bb = bg & 0xFFu;
+                uint32_t inv = 255u - a;
+                uint32_t orr = (cr * a + br * inv) / 255u;
+                uint32_t og  = (cg * a + bgc * inv) / 255u;
+                uint32_t ob  = (cb * a + bb * inv) / 255u;
+                drow[dx] = (orr << 16) | (og << 8) | ob;
+            }
+        }
+    }
+}
+
 /* ---- Advanced drawing operations (Phase 1) ----------------------- */
 
 static struct gfx_surface window_surface(struct window *w) {

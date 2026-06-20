@@ -248,6 +248,10 @@ int gui_window_fill(struct window *w, int x, int y, int rw, int rh,
  * the blend. */
 int gui_window_fill_argb(struct window *w, int x, int y, int rw, int rh,
                          uint32_t argb);
+/* C14b: blend an 8-bit coverage glyph (from the kernel TTF rasterizer, kfont.c)
+ * tinted `xrgb` into the window's client backbuffer at (x,y). */
+void gui_window_blend_coverage(struct window *w, int x, int y,
+                               const uint8_t *cov, int gw, int gh, uint32_t xrgb);
 int gui_window_text(struct window *w, int x, int y, const char *s,
                     uint32_t fg, uint32_t bg);
 /* M27D: scaled bitmap text into a window backbuf.

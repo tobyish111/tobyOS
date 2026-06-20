@@ -82,6 +82,7 @@ C_SRCS := src/kernel.c \
           src/serial.c \
           src/font8x8.c \
           src/font8x16.c \
+          src/kfont.c \
           src/console.c \
           src/printk.c \
           src/bootlog.c \
@@ -587,6 +588,14 @@ install-img: $(INSTALL_IMG)
 
 src/%.o: src/%.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+
+# C14b: kfont.c runs stb_truetype's floating-point math, so it must be built
+# with SSE (overriding the kernel's default -mno-sse). The FP usage is bracketed
+# by an FXSAVE/FXRSTOR guard (kfpu_begin/end) so the calling user process's live
+# SSE state is preserved. -Wno-* silence the vendored single-header.
+src/kfont.o: src/kfont.c $(HEADERS) third_party/stb_truetype.h Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -msse -msse2 -Wno-unused-function \
+	      -Wno-sign-compare -Wno-cast-align -c $< -o $@
 
 src/%.o: src/%.S $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
@@ -1406,6 +1415,12 @@ programs/win-dlg14/win-dlg14.exe: programs/win-dlg14/main.c programs/win-dlg14/d
 	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
 	      -o $@ $< programs/win-dlg14/dlg_res.o -lgdi32 -luser32
 
+# Track C/C14b: a STOCK Win32 GUI .exe drawing real TrueType text via the kernel
+# rasterizer -- CreateFontA at several sizes + TextOutA/DrawTextA/GetTextExtent.
+programs/win-font14b/win-font14b.exe: programs/win-font14b/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
+	      -o $@ $< -lgdi32 -luser32
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1705,7 +1720,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-font13/win-font13.exe \
                programs/win-ctrl14/win-ctrl14.exe \
                programs/win-dlg14/win-dlg14.exe \
-               initrd/etc/motd initrd/readme.txt \
+               programs/win-font14b/win-font14b.exe \
+               initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
                $(HELLOAPP_TPKG) $(HELLOAPP_TPKG_V2) $(SDK_SAMPLE_TPKGS) \
@@ -1721,6 +1737,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	mkdir -p $(INITRD_STAGE)/bin $(INITRD_STAGE)/etc $(INITRD_STAGE)/repo $(INITRD_STAGE)/lib \
 	         $(INITRD_STAGE)/system/keys $(INITRD_STAGE)/m36
 	cp initrd/etc/motd                       $(INITRD_STAGE)/etc/motd
+	cp initrd/etc/Lato-Regular.ttf           $(INITRD_STAGE)/etc/Lato-Regular.ttf
 	cp initrd/etc/drvmatch.conf              $(INITRD_STAGE)/etc/drvmatch.conf
 	cp initrd/etc/drvmatch.conf.test         $(INITRD_STAGE)/etc/drvmatch.conf.test
 	cp initrd/etc/lua_selftest.lua           $(INITRD_STAGE)/etc/lua_selftest.lua
@@ -1772,6 +1789,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-font13/win-font13.exe             $(INITRD_STAGE)/bin/win-font13.exe
 	cp programs/win-ctrl14/win-ctrl14.exe             $(INITRD_STAGE)/bin/win-ctrl14.exe
 	cp programs/win-dlg14/win-dlg14.exe               $(INITRD_STAGE)/bin/win-dlg14.exe
+	cp programs/win-font14b/win-font14b.exe           $(INITRD_STAGE)/bin/win-font14b.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -1980,7 +1998,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-c11file.exe bin/win-gui11.exe                          \
 	    bin/win-bmp12.exe bin/win-ctrl12.exe                           \
 	    bin/win-ctrl13.exe bin/win-font13.exe                          \
-	    bin/win-ctrl14.exe bin/win-dlg14.exe                           \
+	    bin/win-ctrl14.exe bin/win-dlg14.exe bin/win-font14b.exe       \
+	    etc/Lato-Regular.ttf                                           \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
