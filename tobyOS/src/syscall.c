@@ -4205,6 +4205,9 @@ struct win32_win {
     /* C14: a dialog window (from a template). The kernel owns its painting
      * (fill bg + draw controls) since the app's DialogProc usually doesn't. */
     bool     is_dialog;
+    /* C15: an attached menu bar (SetMenu); kernel-drawn into the client top. */
+    uint64_t menu;        /* HMENU of the bar (0 = none)                    */
+    int      menu_open;   /* index of the top-level item whose dropdown is open (-1) */
 };
 
 static struct {
@@ -4301,6 +4304,11 @@ static void win32_refresh_controls(int parent_fd);
 static void win32_dlg_paint(int fd);   /* C14: kernel-paint a dialog window */
 static void win32_msg_push(int parent_fd, uint32_t message, uint64_t wParam, uint64_t lParam);
 static bool win32_route_control_input(int parent_fd, const struct gui_event *ev);
+static void win32_draw_menu(int fd);                                   /* C15 menus */
+static bool win32_route_menu_input(int fd, const struct gui_event *ev);/* C15 menus */
+static void win32_reset_menus_timers(void);                            /* C15 fresh-app reset */
+struct win32_msg;
+static bool win32_timer_poll(int only_fd, struct win32_msg *m);        /* C15 timers */
 /* C13: MessageBoxA (font section) draws via these, defined further below. */
 static struct window *win32_hdc_window(int fd);
 extern uint64_t pit_ticks(void);
@@ -4367,10 +4375,17 @@ static void win32_stash_wndproc(const struct win32_win *w) {
 
 /* C12/C13 control + scroll messages and notifications. */
 #define WM_SETTEXT        0x000C
+#define WM_TIMER          0x0113   /* C15: SetTimer -> periodic WM_TIMER       */
 #define WM_INITDIALOG     0x0110   /* C14: first message a DialogProc receives */
 #define WM_VSCROLL        0x0115
 #define WM_COMMAND        0x0111
 #define WM_NOTIFY         0x004E   /* C14: TAB sends TCN_SELCHANGE via this    */
+/* C15: menus. HMENU = WIN32_MENU_TAG | index; MF_* are AppendMenuA flags. */
+#define WIN32_MENU_TAG    0x6600000000000000ull   /* distinct from font 0x65 / ctrl 0x64 */
+#define MF_POPUP          0x0010u
+#define MF_SEPARATOR      0x0800u
+#define WIN32_MENUBAR_H   22
+#define WIN32_MENU_ITEMH  18
 #define BN_CLICKED        0
 #define LBN_SELCHANGE     1
 #define CBN_SELCHANGE     1        /* C14 COMBOBOX select notification (HIWORD) */
@@ -4407,6 +4422,18 @@ static void win32_stash_wndproc(const struct win32_win *w) {
 /* MessageBox / dialog button-id results. */
 #define IDOK              1
 #define IDCANCEL          2
+#define IDABORT           3
+#define IDRETRY           4
+#define IDIGNORE          5
+#define IDYES             6
+#define IDNO              7
+/* MessageBox button-set (uType & 0xF). */
+#define MB_OK               0u
+#define MB_OKCANCEL         1u
+#define MB_ABORTRETRYIGNORE 2u
+#define MB_YESNOCANCEL      3u
+#define MB_YESNO            4u
+#define MB_RETRYCANCEL      5u
 
 /* The default window fill (C7's blue) used when no solid brush is supplied. */
 #define WIN32_FILL_DEFAULT 0x002E5C8Au
@@ -4470,8 +4497,10 @@ static long w32_RegisterClassA(uint64_t *a) {
      * register their class before creating windows; our apps use a single
      * class, so this fires once per app.) */
     win32_prune_dead_windows();
-    if (win32_win_count() == 0)
+    if (win32_win_count() == 0) {
         memset(&g_win32_gui, 0, sizeof(g_win32_gui));
+        win32_reset_menus_timers();   /* C15: HMENU/timer tokens don't survive a process exit */
+    }
 
     uint64_t wc = a[0];
     uint64_t wndproc = 0, cnameptr = 0;
@@ -4612,8 +4641,14 @@ static long w32_CreateWindowExA(uint64_t *a) {
     win->cur_y       = 0;
     win->parent_fd   = parent_fd;
     win->font_scale  = 1;
+    win->font_px     = 0;
     win->text_color  = 0x00FFFFFFu;   /* white */
     win->bk_mode     = 2;             /* OPAQUE */
+    win->is_dialog   = false;
+    /* C15: a top-level window's hMenu arg (a9) is its menu bar (if a menu token,
+     * not a control id). menu_open = -1 = no dropdown showing. */
+    win->menu        = ((a[9] & WIN32_TAG_MASK) == WIN32_MENU_TAG) ? a[9] : 0;
+    win->menu_open   = -1;
     return fd;   /* HWND == HDC == fd */
 }
 
@@ -4782,6 +4817,11 @@ static long w32_GetMessageA(uint64_t *a) {
         if (w->fd <= 0) continue;
         struct gui_event ev;
         if (win32_poll_window_event(w->fd, &ev) <= 0) continue;
+        if (win32_route_menu_input(w->fd, &ev)) {     /* C15: menu bar / dropdown */
+            m.hwnd = (uint64_t)w->fd; m.message = WM_NULL;
+            (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+            return 1;
+        }
         if (win32_route_control_input(w->fd, &ev)) {
             m.hwnd = (uint64_t)w->fd; m.message = WM_NULL;
             (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
@@ -4796,6 +4836,15 @@ static long w32_GetMessageA(uint64_t *a) {
             (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
             return 1;
         }
+    }
+
+    /* C15: a due timer -> WM_TIMER (after input, before idle). */
+    if (win32_timer_poll(-1, &m)) {
+        if (g_win32_log_input)
+            kprintf("[winpe] GetMessage hwnd=%d -> WM_TIMER id=%lu\n",
+                    (int)m.hwnd, (unsigned long)m.wParam);
+        (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+        return 1;
     }
 
     /* Nothing pending: yield and deliver WM_NULL so the loop keeps turning
@@ -4824,6 +4873,7 @@ static long w32_EndPaint(uint64_t *a) {
     int fd = (int)a[0];
     if (win32_win_find(fd)) {
         win32_draw_controls(fd);   /* C12: overlay child controls on the app's paint */
+        win32_draw_menu(fd);       /* C15: menu bar / dropdown on top */
         (void)sys_gui_flip(fd);
     }
     return 1;
@@ -5026,18 +5076,34 @@ static long w32_DrawTextA(uint64_t *a) {
     return th;
 }
 
-/* user32!MessageBoxA(hWnd, lpText, lpCaption, uType) -> IDOK. A REAL MODAL
- * dialog: it creates its own window with the text + an OK button, draws it, and
- * BLOCKS (a kernel poll loop, sched_yield-ing so the rest of the system runs)
- * until OK is clicked / Enter / the box is closed -- then tears the box down and
- * returns. (We model every box as MB_OK -> IDOK.) */
+/* user32!MessageBoxA(hWnd, lpText, lpCaption, uType) -> the clicked button's id.
+ * A REAL MODAL dialog: it creates its own window with the text + the buttons for
+ * the requested set (C15: MB_OK/OKCANCEL/YESNO/YESNOCANCEL/ABORTRETRYIGNORE/
+ * RETRYCANCEL), draws it, and BLOCKS (a kernel poll loop, sched_yield-ing so the
+ * rest of the system runs) until a button is clicked / Enter / the box is closed
+ * -- then tears it down and returns the matching ID. */
 static long w32_MessageBoxA(uint64_t *a) {
     char text[128], cap[40];
     text[0] = cap[0] = 0;
     if (a[1]) (void)strncpy_from_user(text, (const char *)(uintptr_t)a[1], sizeof(text));
     if (a[2]) (void)strncpy_from_user(cap,  (const char *)(uintptr_t)a[2], sizeof(cap));
+    uint32_t kind = (uint32_t)a[3] & 0xFu;
 
-    const int W = 320, H = 140;
+    /* Button set for the requested type. */
+    const char *blabel[3]; int bid[3]; int nb = 0;
+    switch (kind) {
+    case MB_OKCANCEL:         blabel[0]="OK";    bid[0]=IDOK;    blabel[1]="Cancel"; bid[1]=IDCANCEL; nb=2; break;
+    case MB_YESNO:            blabel[0]="Yes";   bid[0]=IDYES;   blabel[1]="No";     bid[1]=IDNO;     nb=2; break;
+    case MB_YESNOCANCEL:      blabel[0]="Yes";   bid[0]=IDYES;   blabel[1]="No";     bid[1]=IDNO;
+                              blabel[2]="Cancel"; bid[2]=IDCANCEL; nb=3; break;
+    case MB_RETRYCANCEL:      blabel[0]="Retry"; bid[0]=IDRETRY; blabel[1]="Cancel"; bid[1]=IDCANCEL; nb=2; break;
+    case MB_ABORTRETRYIGNORE: blabel[0]="Abort"; bid[0]=IDABORT; blabel[1]="Retry";  bid[1]=IDRETRY;
+                              blabel[2]="Ignore"; bid[2]=IDIGNORE; nb=3; break;
+    default:                  blabel[0]="OK";    bid[0]=IDOK;    nb=1; break;
+    }
+    int dflt = bid[0];           /* Enter / close -> the default (first) button */
+
+    const int W = 340, H = 150;
     /* NB: sys_gui_create marshals its title from USER space; ours is a kernel
      * string, so create the window directly with the kernel-side backend. */
     int fd = -1;
@@ -5053,40 +5119,50 @@ static long w32_MessageBoxA(uint64_t *a) {
             } else gui_window_close(bw);
         }
     }
-    if (fd < 0) return IDOK;
+    if (fd < 0) return dflt;
     struct window *win = win32_hdc_window((int)fd);
-    int okx = W / 2 - 40, oky = H - 46, okw = 80, okh = 28;
+    const int bw_ = 80, bh = 28, gap = 12, oky = H - 46;
+    int total = nb * bw_ + (nb - 1) * gap;
+    int bx0 = (W - total) / 2;
     if (win) {
         (void)gui_window_fill(win, 0, 0, W, H, 0x00DCDCDC);
         (void)gui_window_text(win, 16, 26, text, 0x00101010, 0x00DCDCDC);
-        (void)gui_window_fill(win, okx, oky, okw, okh, 0x00C0C0C0);
-        (void)gui_window_rect(win, okx, oky, okw, okh, 0x00303030);
-        (void)gui_window_rect(win, okx + 1, oky + 1, okw - 2, okh - 2, 0x00F0F0F0);
-        (void)gui_window_text(win, okx + okw / 2 - 8, oky + okh / 2 - 4, "OK", 0x00101010, 0x00C0C0C0);
+        for (int i = 0; i < nb; i++) {
+            int bx = bx0 + i * (bw_ + gap);
+            (void)gui_window_fill(win, bx, oky, bw_, bh, 0x00C0C0C0);
+            (void)gui_window_rect(win, bx, oky, bw_, bh, 0x00303030);
+            (void)gui_window_rect(win, bx + 1, oky + 1, bw_ - 2, bh - 2, 0x00F0F0F0);
+            int tw = (int)strlen(blabel[i]) * 8;
+            (void)gui_window_text(win, bx + (bw_ - tw) / 2, oky + bh / 2 - 4,
+                                  blabel[i], 0x00101010, 0x00C0C0C0);
+        }
     }
     (void)sys_gui_flip((int)fd);
-    if (g_win32_log_input) kprintf("[winpe] MessageBox: '%s' (modal) -- waiting for OK\n", text);
+    if (g_win32_log_input) kprintf("[winpe] MessageBox: '%s' (modal, %d buttons) -- waiting\n", text, nb);
 
     /* Modal wait: bounded so a missing click can never hang the process. */
     uint64_t hz = pit_hz(); if (!hz) hz = 100;
     uint64_t deadline = pit_ticks() + 20 * hz;     /* ~20s safety cap */
-    long result = 0;
-    while (pit_ticks() < deadline) {
+    long result = dflt;
+    bool done = false;
+    while (!done && pit_ticks() < deadline) {
         struct gui_event ev;
         if (win32_poll_window_event((int)fd, &ev) > 0) {
-            if (ev.type == GUI_EV_CLOSE) { result = IDOK; break; }
-            if (ev.type == GUI_EV_MOUSE_DOWN &&
-                ev.x >= okx && ev.x < okx + okw && ev.y >= oky && ev.y < oky + okh) {
-                result = IDOK; break;
+            if (ev.type == GUI_EV_CLOSE) { result = (kind == MB_OK) ? IDOK : IDCANCEL; break; }
+            if (ev.type == GUI_EV_MOUSE_DOWN && ev.y >= oky && ev.y < oky + bh) {
+                for (int i = 0; i < nb; i++) {
+                    int bx = bx0 + i * (bw_ + gap);
+                    if (ev.x >= bx && ev.x < bx + bw_) { result = bid[i]; done = true; break; }
+                }
             }
             if (ev.type == GUI_EV_KEY &&
-                (ev.key == '\n' || ev.key == '\r' || ev.key == ' ')) { result = IDOK; break; }
+                (ev.key == '\n' || ev.key == '\r' || ev.key == ' ')) { result = dflt; break; }
         }
         sched_yield();
     }
     (void)sys_close((int)fd);            /* tear the box down */
-    if (g_win32_log_input) kprintf("[winpe] MessageBox: closed -> IDOK\n");
-    return IDOK;
+    if (g_win32_log_input) kprintf("[winpe] MessageBox: closed -> %ld\n", result);
+    return result;
 }
 
 /* ================= C14: dialog templates (DialogBoxParamA) =================
@@ -5272,7 +5348,7 @@ static int win32_dlg_build(int dlg_id, uint64_t dlgproc, bool modeless) {
 
     /* Fresh-app boundary (a dialog-only app never calls RegisterClassA). */
     win32_prune_dead_windows();
-    if (win32_win_count() == 0) memset(&g_win32_gui, 0, sizeof(g_win32_gui));
+    if (win32_win_count() == 0) { memset(&g_win32_gui, 0, sizeof(g_win32_gui)); win32_reset_menus_timers(); }
     g_win32_gui.quit = false;
 
     struct win32_win *wslot = win32_win_alloc();
@@ -6101,6 +6177,7 @@ static void win32_draw_controls(int parent_fd) {
 /* Redraw a parent's controls + present (after a control changes). */
 static void win32_refresh_controls(int parent_fd) {
     win32_draw_controls(parent_fd);
+    win32_draw_menu(parent_fd);   /* C15: menu bar / open dropdown on top */
     (void)sys_gui_flip(parent_fd);
 }
 /* Queue a message (WM_COMMAND/WM_VSCROLL) for a parent window. */
@@ -6112,6 +6189,248 @@ static void win32_msg_push(int parent_fd, uint32_t message, uint64_t wParam, uin
     g_win32_gui.cmd_q[g_win32_gui.cmd_head].wParam  = wParam;
     g_win32_gui.cmd_q[g_win32_gui.cmd_head].lParam  = lParam;
     g_win32_gui.cmd_head = next;
+}
+
+/* ================= C15: menus =================
+ * An HMENU is a tagged token into g_win32_menus[]. A menu bar (CreateMenu) is
+ * attached to a window via SetMenu and kernel-drawn into the top strip of the
+ * window's client backbuffer; a popup (CreatePopupMenu) appended with MF_POPUP
+ * is its dropdown. A menu-item click delivers WM_COMMAND(id) to the window. */
+#define WIN32_MAX_MENUS   8
+#define WIN32_MENU_ITEMS  8
+struct win32_menuitem { int id; bool is_popup; uint64_t submenu; char text[24]; };
+struct win32_menu { bool in_use; bool is_popup; int n; struct win32_menuitem items[WIN32_MENU_ITEMS]; };
+static struct win32_menu g_win32_menus[WIN32_MAX_MENUS];
+
+static struct win32_menu *win32_menu_find(uint64_t h) {
+    if ((h & WIN32_TAG_MASK) != WIN32_MENU_TAG) return NULL;
+    int s = (int)(h & 0xFF);
+    if (s < 0 || s >= WIN32_MAX_MENUS || !g_win32_menus[s].in_use) return NULL;
+    return &g_win32_menus[s];
+}
+static long win32_menu_alloc(bool popup) {
+    for (int i = 0; i < WIN32_MAX_MENUS; i++)
+        if (!g_win32_menus[i].in_use) {
+            memset(&g_win32_menus[i], 0, sizeof(g_win32_menus[i]));
+            g_win32_menus[i].in_use = true; g_win32_menus[i].is_popup = popup;
+            return (long)(WIN32_MENU_TAG | (uint64_t)i);
+        }
+    return 0;
+}
+/* Width of a top-level bar item (label + padding). */
+static int win32_menubar_item_w(const struct win32_menuitem *it) {
+    return (int)strlen(it->text) * 8 + 16;
+}
+/* Left x of bar item `idx`. */
+static int win32_menubar_item_x(const struct win32_menu *bar, int idx) {
+    int x = 4;
+    for (int i = 0; i < idx && i < bar->n; i++) x += win32_menubar_item_w(&bar->items[i]);
+    return x;
+}
+/* Bar item hit by x (in the bar strip), or -1. */
+static int win32_menubar_hit(const struct win32_menu *bar, int x) {
+    int bx = 4;
+    for (int i = 0; i < bar->n; i++) {
+        int w = win32_menubar_item_w(&bar->items[i]);
+        if (x >= bx && x < bx + w) return i;
+        bx += w;
+    }
+    return -1;
+}
+/* Pixel width of a popup (widest item + padding). */
+static int win32_menu_popup_w(const struct win32_menu *pop) {
+    int mw = 60;
+    for (int i = 0; i < pop->n; i++) {
+        int w = (int)strlen(pop->items[i].text) * 8 + 28;
+        if (w > mw) mw = w;
+    }
+    return mw;
+}
+
+/* Draw a window's menu bar (+ open dropdown) into the top of its backbuffer. */
+static void win32_draw_menu(int fd) {
+    struct win32_win *w = win32_win_find(fd);
+    if (!w || !w->menu) return;
+    struct win32_menu *bar = win32_menu_find(w->menu);
+    struct window *win = win32_hdc_window(fd);
+    if (!bar || !win) return;
+    (void)gui_window_fill(win, 0, 0, w->w, WIN32_MENUBAR_H, 0x00ECECEC);
+    (void)gui_window_line(win, 0, WIN32_MENUBAR_H - 1, w->w, WIN32_MENUBAR_H - 1, 0x00A0A0A0);
+    int tx = 4;
+    for (int i = 0; i < bar->n; i++) {
+        int iw = win32_menubar_item_w(&bar->items[i]);
+        bool open = (w->menu_open == i);
+        if (open) (void)gui_window_fill(win, tx, 0, iw, WIN32_MENUBAR_H - 1, 0x002E8AE0);
+        (void)gui_window_text(win, tx + 8, (WIN32_MENUBAR_H - 8) / 2 - 1, bar->items[i].text,
+                              open ? 0x00FFFFFF : 0x00202020, open ? 0x002E8AE0 : 0x00ECECEC);
+        tx += iw;
+    }
+    if (w->menu_open >= 0 && w->menu_open < bar->n) {
+        struct win32_menu *pop = win32_menu_find(bar->items[w->menu_open].submenu);
+        if (pop) {
+            int mx = win32_menubar_item_x(bar, w->menu_open), my = WIN32_MENUBAR_H;
+            int mw = win32_menu_popup_w(pop), mh = pop->n * WIN32_MENU_ITEMH + 4;
+            (void)gui_window_fill(win, mx, my, mw, mh, 0x00F4F4F4);
+            (void)gui_window_rect(win, mx, my, mw, mh, 0x00606060);
+            for (int j = 0; j < pop->n; j++) {
+                int iy = my + 2 + j * WIN32_MENU_ITEMH;
+                if (pop->items[j].text[0] == 0)   /* separator */
+                    (void)gui_window_line(win, mx + 4, iy + WIN32_MENU_ITEMH / 2,
+                                          mx + mw - 4, iy + WIN32_MENU_ITEMH / 2, 0x00B0B0B0);
+                else
+                    (void)gui_window_text(win, mx + 10, iy + (WIN32_MENU_ITEMH - 8) / 2,
+                                          pop->items[j].text, 0x00202020, 0x00F4F4F4);
+            }
+        }
+    }
+}
+/* Repaint a window's menu immediately + arm a full WM_PAINT (so a closing
+ * dropdown's background is erased by the app's paint). */
+static void win32_menu_repaint(int fd) {
+    struct win32_win *w = win32_win_find(fd);
+    if (w) w->needs_paint = true;
+    win32_refresh_controls(fd);
+}
+/* Route a click to the window's menu bar / open dropdown. Returns true if the
+ * menu consumed it (the app should not also see it). */
+static bool win32_route_menu_input(int fd, const struct gui_event *ev) {
+    struct win32_win *w = win32_win_find(fd);
+    if (!w || !w->menu || ev->type != GUI_EV_MOUSE_DOWN) return false;
+    struct win32_menu *bar = win32_menu_find(w->menu);
+    if (!bar) return false;
+    /* An open dropdown captures clicks first. */
+    if (w->menu_open >= 0 && w->menu_open < bar->n) {
+        struct win32_menu *pop = win32_menu_find(bar->items[w->menu_open].submenu);
+        if (pop) {
+            int mx = win32_menubar_item_x(bar, w->menu_open), my = WIN32_MENUBAR_H;
+            int mw = win32_menu_popup_w(pop), mh = pop->n * WIN32_MENU_ITEMH + 4;
+            if (ev->x >= mx && ev->x < mx + mw && ev->y >= my && ev->y < my + mh) {
+                int j = (ev->y - (my + 2)) / WIN32_MENU_ITEMH;
+                if (j >= 0 && j < pop->n && pop->items[j].text[0] && pop->items[j].id) {
+                    int id = pop->items[j].id;
+                    w->menu_open = -1;
+                    win32_menu_repaint(fd);
+                    win32_msg_push(fd, WM_COMMAND, (uint64_t)(uint32_t)id, 0);  /* menu: HIWORD=0 */
+                    if (g_win32_log_input)
+                        kprintf("[winpe] menu: item id=%d -> WM_COMMAND\n", id);
+                }
+                return true;
+            }
+        }
+    }
+    /* A click in the bar toggles that item's dropdown. */
+    if (ev->y >= 0 && ev->y < WIN32_MENUBAR_H) {
+        int idx = win32_menubar_hit(bar, ev->x);
+        w->menu_open = (idx >= 0 && w->menu_open != idx) ? idx : -1;
+        win32_menu_repaint(fd);
+        return true;
+    }
+    /* A click anywhere else closes an open dropdown (and is consumed). */
+    if (w->menu_open >= 0) { w->menu_open = -1; win32_menu_repaint(fd); return true; }
+    return false;
+}
+
+/* ================= C15: timers =================
+ * SetTimer registers a periodic WM_TIMER for a window; GetMessage / the dialog
+ * pump synthesise the message when the interval elapses (PIT-tick based). */
+#define WIN32_MAX_TIMERS 8
+struct win32_timer { bool in_use; int fd; uint64_t id, interval, next, proc; };
+static struct win32_timer g_win32_timers[WIN32_MAX_TIMERS];
+
+static long w32_SetTimer(uint64_t *a) {
+    int fd = (int)a[0]; uint64_t id = a[1], ms = (uint32_t)a[2], proc = a[3];
+    uint64_t hz = pit_hz(); if (!hz) hz = 100;
+    uint64_t ticks = (ms * hz + 999) / 1000; if (ticks < 1) ticks = 1;
+    for (int i = 0; i < WIN32_MAX_TIMERS; i++)        /* update existing */
+        if (g_win32_timers[i].in_use && g_win32_timers[i].fd == fd && g_win32_timers[i].id == id) {
+            g_win32_timers[i].interval = ticks; g_win32_timers[i].next = pit_ticks() + ticks;
+            g_win32_timers[i].proc = proc; return (long)(id ? id : 1);
+        }
+    for (int i = 0; i < WIN32_MAX_TIMERS; i++)        /* allocate */
+        if (!g_win32_timers[i].in_use) {
+            g_win32_timers[i].in_use = true; g_win32_timers[i].fd = fd; g_win32_timers[i].id = id;
+            g_win32_timers[i].interval = ticks; g_win32_timers[i].next = pit_ticks() + ticks;
+            g_win32_timers[i].proc = proc;
+            if (g_win32_log_input) kprintf("[winpe] SetTimer hwnd=%d id=%lu %lums\n", fd, (unsigned long)id, (unsigned long)ms);
+            return (long)(id ? id : 1);
+        }
+    return 0;
+}
+static long w32_KillTimer(uint64_t *a) {
+    int fd = (int)a[0]; uint64_t id = a[1];
+    for (int i = 0; i < WIN32_MAX_TIMERS; i++)
+        if (g_win32_timers[i].in_use && g_win32_timers[i].fd == fd && g_win32_timers[i].id == id)
+            g_win32_timers[i].in_use = false;
+    return 1;
+}
+/* If a timer for window `only_fd` (or any live window when only_fd<=0) is due,
+ * fill *m with WM_TIMER + stash the window's WndProc; returns true. */
+static bool win32_timer_poll(int only_fd, struct win32_msg *m) {
+    uint64_t now = pit_ticks();
+    for (int i = 0; i < WIN32_MAX_TIMERS; i++) {
+        struct win32_timer *t = &g_win32_timers[i];
+        if (!t->in_use) continue;
+        if (only_fd > 0 && t->fd != only_fd) continue;
+        struct win32_win *w = win32_win_find(t->fd);
+        if (!w) { t->in_use = false; continue; }     /* window gone -> drop */
+        if (now >= t->next) {
+            t->next = now + t->interval;
+            memset(m, 0, sizeof(*m));
+            m->hwnd = (uint64_t)t->fd; m->message = WM_TIMER;
+            m->wParam = t->id; m->lParam = t->proc;
+            win32_stash_wndproc(w);
+            return true;
+        }
+    }
+    return false;
+}
+/* Clear process-global menu + timer state on a fresh GUI app (alongside the
+ * g_win32_gui memset; HMENU/timer tokens don't survive a process exit). */
+static void win32_reset_menus_timers(void) {
+    memset(g_win32_menus, 0, sizeof(g_win32_menus));
+    memset(g_win32_timers, 0, sizeof(g_win32_timers));
+}
+
+/* ---- menu shims (user32) ---- */
+static long w32_CreateMenu(uint64_t *a)      { (void)a; return win32_menu_alloc(false); }
+static long w32_CreatePopupMenu(uint64_t *a) { (void)a; return win32_menu_alloc(true); }
+static long w32_DestroyMenu(uint64_t *a) {
+    struct win32_menu *m = win32_menu_find(a[0]);
+    if (m) m->in_use = false;
+    return 1;
+}
+/* AppendMenuA(hMenu, uFlags, uIDNewItem, lpNewItem). MF_POPUP -> uIDNewItem is a
+ * submenu HMENU; MF_SEPARATOR -> a divider; else a command item. */
+static long w32_AppendMenuA(uint64_t *a) {
+    struct win32_menu *m = win32_menu_find(a[0]);
+    if (!m || m->n >= WIN32_MENU_ITEMS) return 0;
+    uint32_t flags = (uint32_t)a[1];
+    struct win32_menuitem *it = &m->items[m->n];
+    memset(it, 0, sizeof(*it));
+    if (flags & MF_SEPARATOR) {
+        it->id = 0; it->text[0] = 0;
+    } else if (flags & MF_POPUP) {
+        it->is_popup = true; it->submenu = a[2];
+        if (a[3]) (void)strncpy_from_user(it->text, (const char *)(uintptr_t)a[3], sizeof(it->text));
+    } else {
+        it->id = (int)a[2];
+        if (a[3]) (void)strncpy_from_user(it->text, (const char *)(uintptr_t)a[3], sizeof(it->text));
+    }
+    m->n++;
+    return 1;
+}
+/* SetMenu(hwnd, hMenu) -> TRUE; attach a bar menu to a window. */
+static long w32_SetMenu(uint64_t *a) {
+    struct win32_win *w = win32_win_find((int)a[0]);
+    if (!w) return 0;
+    w->menu = a[1]; w->menu_open = -1;
+    w->needs_paint = true;
+    win32_refresh_controls((int)a[0]);
+    return 1;
+}
+static long w32_GetMenu(uint64_t *a) {
+    struct win32_win *w = win32_win_find((int)a[0]);
+    return w ? (long)w->menu : 0;
 }
 
 /* C14: a TAB selection change is reported as WM_NOTIFY whose lParam points to an
@@ -6779,6 +7098,16 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "SendDlgItemMessageA",    w32_SendDlgItemMessageA },
     { "kernel32.dll", "lstrcmpA",             w32_lstrcmpA },
     { "kernel32.dll", "lstrlenA",             w32_lstrlenA },
+
+    /* ---- C15: menus + timers + multi-button MessageBox (user32) ---- */
+    { "user32.dll", "CreateMenu",             w32_CreateMenu },
+    { "user32.dll", "CreatePopupMenu",        w32_CreatePopupMenu },
+    { "user32.dll", "AppendMenuA",            w32_AppendMenuA },
+    { "user32.dll", "DestroyMenu",            w32_DestroyMenu },
+    { "user32.dll", "SetMenu",                w32_SetMenu },
+    { "user32.dll", "GetMenu",                w32_GetMenu },
+    { "user32.dll", "SetTimer",               w32_SetTimer },
+    { "user32.dll", "KillTimer",              w32_KillTimer },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

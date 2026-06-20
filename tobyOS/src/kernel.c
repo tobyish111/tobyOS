@@ -2346,7 +2346,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -4452,6 +4452,52 @@ void _start(void) {
                 int rc = proc_wait(fpid);
                 kprintf("[boot] WINPE14B: /bin/win-font14b.exe (pid=%d) exit=%d\n", fpid, rc);
                 kprintf("[WINPE14B] VERDICT: %s exit=%d (expected 14)\n", rc == 14 ? "PASS" : "FAIL", rc);
+            }
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE15_BOOT
+    /* Track C -- menus + timers + multi-button MessageBox, milestone C15. Build
+     * EXTRA_CFLAGS+=-DWINPE15_BOOT. A stock Win32 GUI .exe with a File/Help menu
+     * bar, a 500 ms timer, and an MB_YESNO About box. The harness lets the timer
+     * tick, opens Help -> About (a Yes/No box), clicks Yes, then File -> Exit;
+     * exit 15 iff the timer fired + a menu command arrived + the box gave IDYES. */
+    {
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+        kprintf("[boot] WINPE15: spawning /bin/win-menu15.exe (menus + timers)\n");
+        int mpid = winpe_spawn_session_app("/bin/win-menu15.exe", "win-menu15.exe");
+        if (mpid < 0) {
+            kprintf("[WINPE15] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 120 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(mpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE15] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(mpid, SIGKILL); (void)proc_wait(mpid);
+            } else {
+                winpe8_pump_ms(1600);   /* let the 500ms timer tick a few times */
+                kprintf("[WINPE15] menu bar + timer counter up; holding ~3s for screenshot\n");
+                winpe8_pump_ms(3000);
+                kprintf("[boot] WINPE15: open the Help menu\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 76, 11, MOUSE_BTN_LEFT);   winpe8_pump_ms(500);
+                kprintf("[WINPE15] Help dropdown open; holding ~3s for screenshot\n");
+                winpe8_pump_ms(3000);
+                kprintf("[boot] WINPE15: click About -> Yes/No box\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 76, 31, MOUSE_BTN_LEFT);   winpe8_pump_ms(700);
+                kprintf("[WINPE15] About MessageBox (Yes/No) up; holding ~3s for screenshot\n");
+                winpe8_pump_ms(3000);
+                kprintf("[boot] WINPE15: click Yes\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 124, 118, MOUSE_BTN_LEFT);  winpe8_pump_ms(700);
+                kprintf("[boot] WINPE15: File -> Exit\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 28, 11, MOUSE_BTN_LEFT);    winpe8_pump_ms(400);
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 30, 86, MOUSE_BTN_LEFT);
+                for (int i = 0; i < 160 && win32_gui_window_count(mpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(mpid);
+                kprintf("[boot] WINPE15: /bin/win-menu15.exe (pid=%d) exit=%d\n", mpid, rc);
+                kprintf("[WINPE15] VERDICT: %s exit=%d (expected 15)\n", rc == 15 ? "PASS" : "FAIL", rc);
             }
         }
         win32_gui_set_log(false);
