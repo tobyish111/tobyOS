@@ -26,7 +26,10 @@ static INT_PTR CALLBACK DlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     (void)lp;
     switch (msg) {
     case WM_INITDIALOG:
-        SetDlgItemTextA(h, IDC_EDIT, "edit me");
+        /* Seed the edit with "to"; the test driver then types "byOS" -> "tobyOS".
+         * This proves WM_INITDIALOG ran + SetDlgItemTextA works + the EDIT takes
+         * keyboard input + GetDlgItemTextA reads it back. */
+        SetDlgItemTextA(h, IDC_EDIT, "to");
         CheckRadioButton(h, IDC_RAD_A, IDC_RAD_B, IDC_RAD_A);  /* default Free */
         return TRUE;
     case WM_COMMAND:

@@ -4388,6 +4388,40 @@ void _start(void) {
                 kprintf("[WINPE14] VERDICT: %s exit=%d (expected 14)\n", rc == 14 ? "PASS" : "FAIL", rc);
             }
         }
+
+        /* ---- Part B: a MODAL dialog from a RESOURCE template ---- */
+        kprintf("[boot] WINPE14: spawning /bin/win-dlg14.exe (DialogBoxParamA + .rsrc)\n");
+        int dpid = winpe_spawn_session_app("/bin/win-dlg14.exe", "win-dlg14.exe");
+        if (dpid < 0) {
+            kprintf("[WINPE14D] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 120 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(dpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE14D] VERDICT: FAIL reason=nodialog\n");
+                signal_send_to_pid(dpid, SIGKILL); (void)proc_wait(dpid);
+            } else {
+                winpe8_pump_ms(900);   /* dialog built + WM_INITDIALOG processed (edit='to') */
+                kprintf("[WINPE14D] dialog (modal template) up; holding ~4s for screenshot\n");
+                winpe8_pump_ms(4000);
+                /* Type "byOS" into the auto-focused EDIT (WM_INITDIALOG seeded "to"). */
+                kprintf("[boot] WINPE14: typing 'byOS' into the dialog EDIT\n");
+                const char *typ = "byOS";
+                for (const char *q = typ; *q; q++) { gui_post_key((uint8_t)*q); winpe8_pump_ms(150); }
+                kprintf("[boot] WINPE14: check the CHECKBOX\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 24, 67, MOUSE_BTN_LEFT);   winpe8_pump_ms(300);
+                kprintf("[boot] WINPE14: select RADIO 'Premium'\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 171, 119, MOUSE_BTN_LEFT); winpe8_pump_ms(300);
+                kprintf("[WINPE14D] dialog filled (edit+check+radio); holding ~4s for screenshot\n");
+                winpe8_pump_ms(4000);
+                kprintf("[boot] WINPE14: click OK\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 119, 204, MOUSE_BTN_LEFT);
+                for (int i = 0; i < 160 && win32_gui_window_count(dpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(dpid);
+                kprintf("[boot] WINPE14: /bin/win-dlg14.exe (pid=%d) exit=%d\n", dpid, rc);
+                kprintf("[WINPE14D] VERDICT: %s exit=%d (expected 14)\n", rc == 14 ? "PASS" : "FAIL", rc);
+            }
+        }
         win32_gui_set_log(false);
     }
 #endif

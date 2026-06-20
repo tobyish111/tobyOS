@@ -27,6 +27,8 @@ struct pe_load_info {
     uint64_t image_base;   /* actual load base (== preferred base for C1) */
     uint64_t teb;          /* user VA of the Thread Environment Block (gs base) */
     uint64_t crt_data;     /* user VA of the CRT data page (argc/argv/environ/...) */
+    uint64_t rsrc_rva;     /* C14: .rsrc directory RVA (0 if none) -- dialog templates */
+    uint64_t rsrc_size;    /* C14: .rsrc directory size                             */
 };
 
 /* True if [image,size) looks like a PE/COFF image: 'MZ' DOS magic and a
@@ -84,6 +86,13 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
  * CPL3 -- a kernel shim can't). Lives in the shim page at WIN32_DISPATCH_OFF;
  * its IAT slot is bound to this VA instead of a gate-thunk. */
 #define WIN32_DISPATCH_STUB_VA   0x00000000300000C0ULL
+
+/* C14 (dialog templates): a MODAL DialogBoxParamA runs its message loop in CPL3
+ * (it dispatches to the app's DialogProc), so its IAT slot is bound to a
+ * trampoline at this fixed VA. The trampoline reaches the kernel via the
+ * __toby_dlgsvc gate-thunk (also a fixed VA) so the blob needs no patching. */
+#define WIN32_DLG_TRAMP_VA       0x0000000030000100ULL
+#define WIN32_DLGSVC_THUNK_VA    0x00000000300001F0ULL
 
 /* C9 (GetProcAddress): the loader pre-generates a marshalling thunk for EVERY
  * kernel-side Win32 shim into a fixed region of the shim page, so GetProcAddress

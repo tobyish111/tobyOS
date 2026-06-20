@@ -4200,6 +4200,9 @@ struct win32_win {
     int      font_scale;  /* bitmap-font scale from SelectObject(CreateFont) */
     uint32_t text_color;  /* SetTextColor (XRGB); default white */
     int      bk_mode;     /* OPAQUE(2, default) / TRANSPARENT(1) */
+    /* C14: a dialog window (from a template). The kernel owns its painting
+     * (fill bg + draw controls) since the app's DialogProc usually doesn't. */
+    bool     is_dialog;
 };
 
 static struct {
@@ -4293,6 +4296,8 @@ static struct win32_ctrl *win32_ctrl_find(uint64_t h) {
  * backend they call). */
 static void win32_draw_controls(int parent_fd);
 static void win32_refresh_controls(int parent_fd);
+static void win32_dlg_paint(int fd);   /* C14: kernel-paint a dialog window */
+static void win32_msg_push(int parent_fd, uint32_t message, uint64_t wParam, uint64_t lParam);
 static bool win32_route_control_input(int parent_fd, const struct gui_event *ev);
 /* C13: MessageBoxA (font section) draws via these, defined further below. */
 static struct window *win32_hdc_window(int fd);
@@ -4756,6 +4761,9 @@ static long w32_GetMessageA(uint64_t *a) {
         struct win32_win *w = &g_win32_gui.win[i];
         if (w->fd > 0 && w->needs_paint) {
             w->needs_paint = false;
+            /* C14: a modeless dialog window is painted by the kernel (the app's
+             * DialogProc doesn't), so handle its WM_PAINT here + keep looping. */
+            if (w->is_dialog) { win32_dlg_paint(w->fd); continue; }
             win32_stash_wndproc(w);
             m.hwnd = (uint64_t)w->fd; m.message = WM_PAINT;
             (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
@@ -5024,6 +5032,474 @@ static long w32_MessageBoxA(uint64_t *a) {
     (void)sys_close((int)fd);            /* tear the box down */
     if (g_win32_log_input) kprintf("[winpe] MessageBox: closed -> IDOK\n");
     return IDOK;
+}
+
+/* ================= C14: dialog templates (DialogBoxParamA) =================
+ * The app passes a MAKEINTRESOURCE dialog id; the kernel walks the PE's .rsrc
+ * section for the RT_DIALOG resource, parses the DLGTEMPLATE(EX) + each
+ * DLGITEMTEMPLATE(EX), builds the dialog window + its controls (reusing the
+ * virtual-control system), then -- because a MODAL dialog dispatches to the
+ * app's DialogProc (CPL3) -- a user-mode trampoline (pe_loader.c) runs the
+ * message loop: it asks the kernel (__toby_dlgsvc) for one message at a time
+ * and DispatchMessages each to the DialogProc until EndDialog.
+ */
+#define DS_SETFONT  0x40u
+#define RT_DIALOG   5
+
+static long w32_SendMessageA(uint64_t *a);   /* defined below; used by SendDlgItemMessage */
+
+/* The single active MODAL dialog (DialogBoxParamA). Modeless dialogs
+ * (CreateDialogParamA) are ordinary windows in win[] flagged is_dialog. */
+static struct {
+    int      fd;            /* dialog window fd (0 = none active) */
+    uint64_t dlgproc;       /* the app's DialogProc */
+    bool     init_pending;  /* WM_INITDIALOG not yet delivered */
+    uint64_t init_param;    /* dwInitParam (WM_INITDIALOG lParam) */
+    bool     ended;         /* EndDialog called */
+    long     result;        /* EndDialog result */
+} g_win32_modal;
+
+/* ---- little-endian readers over the copied template buffer (bounds-checked) */
+static uint16_t dlg_rd16(const uint8_t *b, int p, int len) {
+    if (p < 0 || p + 2 > len) return 0;
+    return (uint16_t)(b[p] | ((uint16_t)b[p + 1] << 8));
+}
+static uint32_t dlg_rd32(const uint8_t *b, int p, int len) {
+    if (p < 0 || p + 4 > len) return 0;
+    return (uint32_t)b[p] | ((uint32_t)b[p + 1] << 8) |
+           ((uint32_t)b[p + 2] << 16) | ((uint32_t)b[p + 3] << 24);
+}
+/* Read a UTF-16 string into an ASCII buffer (low byte per WCHAR); -> new pos. */
+static int dlg_read_wsz(const uint8_t *b, int p, int len, char *out, int outsz) {
+    int o = 0;
+    while (p + 2 <= len) {
+        uint16_t c = dlg_rd16(b, p, len); p += 2;
+        if (c == 0) break;
+        if (o < outsz - 1) out[o++] = (char)(c & 0xFF);
+    }
+    if (out && outsz) out[o] = 0;
+    return p;
+}
+/* Skip a sz_Or_Ord (menu/class at the dialog level): 0xFFFF+ord, or a sz. */
+static int dlg_skip_szord(const uint8_t *b, int p, int len) {
+    uint16_t w = dlg_rd16(b, p, len);
+    if (w == 0xFFFF) return p + 4;
+    while (p + 2 <= len) { uint16_t c = dlg_rd16(b, p, len); p += 2; if (c == 0) break; }
+    return p;
+}
+/* An item's windowClass: ordinal (0xFFFF+WORD), empty (0x0000), or a sz name. */
+static int dlg_read_class(const uint8_t *b, int p, int len, int *ord, char *name, int namesz) {
+    *ord = -1; if (name && namesz) name[0] = 0;
+    uint16_t w = dlg_rd16(b, p, len);
+    if (w == 0xFFFF) { *ord = dlg_rd16(b, p + 2, len); return p + 4; }
+    if (w == 0x0000) return p + 2;
+    return dlg_read_wsz(b, p, len, name, namesz);
+}
+/* An item's title: a sz, or 0xFFFF+ord (icon/resource -> empty text). */
+static int dlg_read_title(const uint8_t *b, int p, int len, char *out, int outsz) {
+    uint16_t w = dlg_rd16(b, p, len);
+    if (w == 0xFFFF) { if (out && outsz) out[0] = 0; return p + 4; }
+    return dlg_read_wsz(b, p, len, out, outsz);
+}
+/* Dialog units -> pixels (MS Shell Dlg 8pt baseline ~ 6x13 base units). */
+static int dlg_dlu_x(int v) { return v * 3 / 2; }
+static int dlg_dlu_y(int v) { return v * 13 / 8; }
+/* Map a control class ordinal/name + style to a control kind. */
+static int dlg_class_kind(int ord, const char *name, uint32_t style) {
+    int base = 0;
+    switch (ord) {
+    case 0x80: base = WIN32_CTRL_BUTTON;    break;
+    case 0x81: base = WIN32_CTRL_EDIT;      break;
+    case 0x82: base = WIN32_CTRL_STATIC;    break;
+    case 0x83: base = WIN32_CTRL_LISTBOX;   break;
+    case 0x84: base = WIN32_CTRL_SCROLLBAR; break;
+    case 0x85: base = WIN32_CTRL_COMBOBOX;  break;
+    default:   if (name && name[0]) base = win32_ctrl_class(name); break;
+    }
+    return win32_button_subkind(base, style);
+}
+
+/* ---- .rsrc walk (user memory) ---- small copy_from_user readers ---- */
+static uint32_t win32_uread32(uint64_t uva) {
+    uint32_t v = 0; (void)copy_from_user(&v, (const void *)(uintptr_t)uva, 4); return v;
+}
+static uint16_t win32_uread16(uint64_t uva) {
+    uint16_t v = 0; (void)copy_from_user(&v, (const void *)(uintptr_t)uva, 2); return v;
+}
+/* In a resource directory, find the entry whose id matches; return the target VA
+ * (a subdir or a leaf, rsrc-relative offset added to rsrc_base). */
+static uint64_t win32_rsrc_find_id(uint64_t rsrc_base, uint64_t dir, uint32_t id) {
+    uint16_t nnamed = win32_uread16(dir + 0x0C);
+    uint16_t nid    = win32_uread16(dir + 0x0E);
+    uint64_t e = dir + 0x10 + (uint64_t)nnamed * 8;   /* skip named entries */
+    for (int i = 0; i < nid; i++, e += 8)
+        if (win32_uread32(e + 0) == id)
+            return rsrc_base + (win32_uread32(e + 4) & 0x7FFFFFFFu);
+    return 0;
+}
+/* First entry of a directory (used at the language level). */
+static uint64_t win32_rsrc_first(uint64_t rsrc_base, uint64_t dir) {
+    uint16_t nnamed = win32_uread16(dir + 0x0C);
+    uint16_t nid    = win32_uread16(dir + 0x0E);
+    if (nnamed + nid == 0) return 0;
+    return rsrc_base + (win32_uread32(dir + 0x10 + 4) & 0x7FFFFFFFu);
+}
+/* Resolve RT_DIALOG id -> (user VA of the template, size). 0 if not found. */
+static uint64_t win32_find_dialog_template(struct proc *lead, int dlg_id, uint32_t *out_size) {
+    if (!lead || !lead->win_image_base || !lead->win_rsrc_rva) return 0;
+    uint64_t base = lead->win_image_base;
+    uint64_t rsrc = base + lead->win_rsrc_rva;
+    uint64_t td = win32_rsrc_find_id(rsrc, rsrc, RT_DIALOG);
+    if (!td) return 0;
+    uint64_t idd = win32_rsrc_find_id(rsrc, td, (uint32_t)dlg_id);
+    if (!idd) return 0;
+    uint64_t leaf = win32_rsrc_first(rsrc, idd);   /* language level -> data entry */
+    if (!leaf) return 0;
+    uint32_t rva = win32_uread32(leaf + 0);
+    uint32_t sz  = win32_uread32(leaf + 4);
+    if (out_size) *out_size = sz;
+    return rva ? base + rva : 0;
+}
+
+/* Fill a dialog window's background + draw its controls + present. */
+static void win32_dlg_paint(int fd) {
+    struct window *win = win32_hdc_window(fd);
+    struct win32_win *w = win32_win_find(fd);
+    if (!win || !w) return;
+    (void)gui_window_fill(win, 0, 0, w->w, w->h, w->fill_color & 0x00FFFFFFu);
+    win32_draw_controls(fd);
+    (void)sys_gui_flip(fd);
+}
+
+/* Build the dialog window + its controls from the RT_DIALOG template. Returns
+ * the dialog window fd, or -1. `modeless` flags a CreateDialogParam dialog. */
+static int win32_dlg_build(int dlg_id, uint64_t dlgproc, bool modeless) {
+    struct proc *p = current_proc();
+    struct proc *lead = (p && p->is_thread) ? proc_lookup(p->tgid) : p;
+    if (!lead) lead = p;
+
+    uint32_t tsize = 0;
+    uint64_t tmpl = win32_find_dialog_template(lead, dlg_id, &tsize);
+    if (!tmpl || tsize == 0) {
+        kprintf("[winpe] dialog: RT_DIALOG id=%d not found in .rsrc\n", dlg_id);
+        return -1;
+    }
+    static uint8_t tbuf[2048];
+    int tlen = (tsize > sizeof(tbuf)) ? (int)sizeof(tbuf) : (int)tsize;
+    if (copy_from_user(tbuf, (const void *)(uintptr_t)tmpl, (size_t)tlen) != 0) return -1;
+
+    int pos = 0;
+    bool ex = (dlg_rd16(tbuf, 0, tlen) == 1 && dlg_rd16(tbuf, 2, tlen) == 0xFFFF);
+    uint32_t style; uint16_t cdit;
+    if (ex) {
+        pos = 12;                                   /* dlgVer,sig,helpID,exStyle */
+        style = dlg_rd32(tbuf, pos, tlen); pos += 4;
+        cdit  = dlg_rd16(tbuf, pos, tlen); pos += 2;
+    } else {
+        style = dlg_rd32(tbuf, 0, tlen); pos = 8;   /* style, exStyle */
+        cdit  = dlg_rd16(tbuf, pos, tlen); pos += 2;
+    }
+    int dcx = (int16_t)dlg_rd16(tbuf, pos + 4, tlen);
+    int dcy = (int16_t)dlg_rd16(tbuf, pos + 6, tlen);
+    pos += 8;                                       /* x,y,cx,cy */
+    pos = dlg_skip_szord(tbuf, pos, tlen);          /* menu  */
+    pos = dlg_skip_szord(tbuf, pos, tlen);          /* class */
+    char title[40];
+    pos = dlg_read_wsz(tbuf, pos, tlen, title, sizeof(title));   /* title */
+    if (style & DS_SETFONT) {
+        pos += ex ? 6 : 2;                          /* pointsize(+weight/italic/charset) */
+        char face[40]; pos = dlg_read_wsz(tbuf, pos, tlen, face, sizeof(face));
+    }
+
+    int cw = dlg_dlu_x(dcx), ch = dlg_dlu_y(dcy);
+    if (cw < 80)  cw = 80;  if (cw > 1000) cw = 1000;
+    if (ch < 60)  ch = 60;  if (ch > 800)  ch = 800;
+
+    /* Fresh-app boundary (a dialog-only app never calls RegisterClassA). */
+    win32_prune_dead_windows();
+    if (win32_win_count() == 0) memset(&g_win32_gui, 0, sizeof(g_win32_gui));
+    g_win32_gui.quit = false;
+
+    struct win32_win *wslot = win32_win_alloc();
+    if (!wslot) return -1;
+    int fd = -1;
+    if (cap_check(current_proc(), CAP_GUI, "DialogBox")) {
+        struct window *dw = gui_window_create((uint32_t)cw, (uint32_t)ch,
+                                              title[0] ? title : "Dialog");
+        if (dw) {
+            struct file *df = (struct file *)kmalloc(sizeof(*df));
+            if (df) {
+                memset(df, 0, sizeof(*df));
+                df->kind = FILE_KIND_WINDOW; df->win = dw;
+                fd = fd_alloc_into(current_proc(), df);
+                if (fd < 0) { kfree(df); gui_window_close(dw); }
+            } else gui_window_close(dw);
+        }
+    }
+    if (fd < 0) return -1;
+
+    struct proc *cp = current_proc();
+    g_win32_gui.tgid = cp ? (cp->is_thread ? cp->tgid : cp->pid) : 0;
+    memset(wslot, 0, sizeof(*wslot));
+    wslot->fd = fd; wslot->w = cw; wslot->h = ch;
+    wslot->wndproc = dlgproc;
+    wslot->fill_color = 0x00DCDCDC;     /* dialog face gray */
+    wslot->pen_color  = WIN32_PEN_DEFAULT;
+    wslot->font_scale = 1; wslot->text_color = 0x00101010; wslot->bk_mode = 2;
+    wslot->is_dialog  = true;
+    (void)modeless;
+
+    for (int i = 0; i < cdit && pos < tlen; i++) {
+        pos = (pos + 3) & ~3;                        /* each item is DWORD-aligned */
+        uint32_t istyle, iid;
+        if (ex) { pos += 8; istyle = dlg_rd32(tbuf, pos, tlen); pos += 4; }
+        else    { istyle = dlg_rd32(tbuf, pos, tlen); pos += 8; }
+        int ix  = (int16_t)dlg_rd16(tbuf, pos + 0, tlen);
+        int iy  = (int16_t)dlg_rd16(tbuf, pos + 2, tlen);
+        int icx = (int16_t)dlg_rd16(tbuf, pos + 4, tlen);
+        int icy = (int16_t)dlg_rd16(tbuf, pos + 6, tlen);
+        pos += 8;
+        if (ex) { iid = dlg_rd32(tbuf, pos, tlen); pos += 4; }
+        else    { iid = dlg_rd16(tbuf, pos, tlen); pos += 2; }
+        int cord; char cname[24];
+        pos = dlg_read_class(tbuf, pos, tlen, &cord, cname, sizeof(cname));
+        char itext[40];
+        pos = dlg_read_title(tbuf, pos, tlen, itext, sizeof(itext));
+        uint16_t extra = dlg_rd16(tbuf, pos, tlen); pos += 2 + extra;   /* creation data */
+        int kind = dlg_class_kind(cord, cname, istyle);
+        if (!kind) continue;
+        int slot = win32_ctrl_make(fd, kind, dlg_dlu_x(ix), dlg_dlu_y(iy),
+                                   dlg_dlu_x(icx), dlg_dlu_y(icy),
+                                   (int)iid, itext, istyle);
+        if (g_win32_log_input && slot >= 0)
+            kprintf("[winpe] dialog ctrl: kind=%d id=%d @(%d,%d %dx%d) '%s'\n",
+                    kind, (int)iid, dlg_dlu_x(ix), dlg_dlu_y(iy),
+                    dlg_dlu_x(icx), dlg_dlu_y(icy), itext);
+    }
+    return fd;
+}
+
+/* BEGIN: build the MODAL dialog, arm WM_INITDIALOG, return hDlg. */
+static long win32_dlg_begin(uint64_t hInst, uint64_t lpTemplate, uint64_t parent,
+                            uint64_t dlgproc, uint64_t initParam) {
+    (void)hInst; (void)parent;
+    int dlg_id = (int)(uint32_t)lpTemplate;       /* MAKEINTRESOURCE -> small int */
+    int fd = win32_dlg_build(dlg_id, dlgproc, false);
+    if (fd < 0) return 0;
+    g_win32_modal.fd           = fd;
+    g_win32_modal.dlgproc      = dlgproc;
+    g_win32_modal.init_pending = true;
+    g_win32_modal.init_param   = initParam;
+    g_win32_modal.ended        = false;
+    g_win32_modal.result       = 0;
+    win32_dlg_paint(fd);
+    if (g_win32_log_input)
+        kprintf("[winpe] dialog: id=%d up (modal); waiting for EndDialog\n", dlg_id);
+    return (long)fd;
+}
+
+/* PUMP: produce one message for the modal loop. Returns 1 (dispatch *msgptr to
+ * the DialogProc) or 0 (the dialog ended -- stop the loop). */
+static long win32_dlg_pump(uint64_t msgptr) {
+    struct win32_msg m; memset(&m, 0, sizeof(m));
+    int fd = g_win32_modal.fd;
+    struct win32_win *w = win32_win_find(fd);
+    if (fd <= 0 || !w || g_win32_modal.ended) {
+        (void)copy_to_user((void *)(uintptr_t)msgptr, &m, sizeof(m));
+        return 0;                                   /* ended */
+    }
+    /* WM_INITDIALOG first. */
+    if (g_win32_modal.init_pending) {
+        g_win32_modal.init_pending = false;
+        win32_stash_wndproc(w);
+        m.hwnd = (uint64_t)fd; m.message = WM_INITDIALOG;
+        m.wParam = (uint64_t)fd; m.lParam = g_win32_modal.init_param;
+        (void)copy_to_user((void *)(uintptr_t)msgptr, &m, sizeof(m));
+        return 1;
+    }
+    /* A queued control notification (WM_COMMAND/WM_VSCROLL/WM_NOTIFY) for us. */
+    if (g_win32_gui.cmd_head != g_win32_gui.cmd_tail) {
+        int t = g_win32_gui.cmd_tail;
+        if ((int)g_win32_gui.cmd_q[t].hwnd == fd) {
+            win32_stash_wndproc(w);
+            m.hwnd    = g_win32_gui.cmd_q[t].hwnd;
+            m.message = g_win32_gui.cmd_q[t].message;
+            m.wParam  = g_win32_gui.cmd_q[t].wParam;
+            m.lParam  = g_win32_gui.cmd_q[t].lParam;
+            g_win32_gui.cmd_tail = (t + 1) % WIN32_CMDQ;
+            (void)copy_to_user((void *)(uintptr_t)msgptr, &m, sizeof(m));
+            return 1;
+        }
+    }
+    /* Repaint if needed (kernel owns the dialog's painting). */
+    if (w->needs_paint) { w->needs_paint = false; win32_dlg_paint(fd); }
+    /* One input event -> route to a control, or deliver to the DialogProc. */
+    struct gui_event ev;
+    if (win32_poll_window_event(fd, &ev) > 0) {
+        if (ev.type == GUI_EV_CLOSE) {              /* [X] -> WM_COMMAND IDCANCEL */
+            win32_msg_push(fd, WM_COMMAND, (uint64_t)IDCANCEL, 0);
+        } else if (!win32_route_control_input(fd, &ev)) {
+            if (win32_event_to_msg(fd, &ev, &m)) {
+                win32_stash_wndproc(w);
+                (void)copy_to_user((void *)(uintptr_t)msgptr, &m, sizeof(m));
+                return 1;
+            }
+        }
+    }
+    /* Idle: yield + WM_NULL so the loop keeps turning without busy-spinning. */
+    sched_yield();
+    win32_stash_wndproc(w);
+    m.hwnd = (uint64_t)fd; m.message = WM_NULL;
+    (void)copy_to_user((void *)(uintptr_t)msgptr, &m, sizeof(m));
+    return 1;
+}
+
+/* RESULT: tear the modal dialog down + return the EndDialog code. */
+static long win32_dlg_result(void) {
+    long r  = g_win32_modal.result;
+    int  fd = g_win32_modal.fd;
+    if (fd > 0) {
+        for (int i = 0; i < WIN32_MAX_CTRLS; i++)
+            if (g_win32_gui.ctrl[i].in_use && g_win32_gui.ctrl[i].parent_fd == fd)
+                g_win32_gui.ctrl[i].in_use = false;
+        struct win32_win *w = win32_win_find(fd);
+        if (w) w->fd = 0;                            /* retire the window slot */
+        (void)sys_close(fd);                         /* remove from the desktop */
+    }
+    memset(&g_win32_modal, 0, sizeof(g_win32_modal));
+    g_win32_gui.quit = false;
+    if (g_win32_log_input) kprintf("[winpe] dialog: ended -> result=%ld\n", r);
+    return r;
+}
+
+/* The dialog service the modal trampoline calls (BEGIN/PUMP/RESULT). Hidden
+ * from GetProcAddress consumers -- it's an internal helper, not a real API. */
+static long w32_toby_dlgsvc(uint64_t *a) {
+    switch (a[0]) {
+    case 0: return win32_dlg_begin(a[1], a[2], a[3], a[4], a[5]);
+    case 1: return win32_dlg_pump(a[1]);
+    case 2: return win32_dlg_result();
+    default: return 0;
+    }
+}
+
+/* user32!EndDialog(hDlg, nResult). Modal: signal the pump to stop with this
+ * result. Modeless: destroy the dialog window. */
+static long w32_EndDialog(uint64_t *a) {
+    int fd = (int)a[0];
+    if (g_win32_modal.fd == fd) {
+        g_win32_modal.ended  = true;
+        g_win32_modal.result = (long)a[1];
+        return 1;
+    }
+    struct win32_win *w = win32_win_find(fd);
+    if (w) w->destroy = true;
+    return 1;
+}
+
+/* user32!CreateDialogParamA -> a MODELESS dialog (the app pumps it with its own
+ * GetMessage/DispatchMessage loop). WM_INITDIALOG is queued for that loop. */
+static long w32_CreateDialogParamA(uint64_t *a) {
+    int dlg_id = (int)(uint32_t)a[1];
+    int fd = win32_dlg_build(dlg_id, a[3], true);
+    if (fd < 0) return 0;
+    win32_dlg_paint(fd);
+    win32_msg_push(fd, WM_INITDIALOG, (uint64_t)fd, a[4]);   /* deliver via the app's loop */
+    return (long)fd;
+}
+
+/* user32!DefDlgProcA(hDlg, msg, wParam, lParam): the default dialog behaviour.
+ * WM_CLOSE -> end the dialog (IDCANCEL semantics). */
+static long w32_DefDlgProcA(uint64_t *a) {
+    uint32_t msg = (uint32_t)a[1];
+    int fd = (int)a[0];
+    if (msg == WM_CLOSE) {
+        if (g_win32_modal.fd == fd) { g_win32_modal.ended = true; g_win32_modal.result = 0; }
+        else { struct win32_win *w = win32_win_find(fd); if (w) w->destroy = true; }
+    }
+    return 0;
+}
+
+/* ---- dialog item (control-by-id) helpers ---- */
+/* Find a control by (dialog hwnd, item id). */
+static struct win32_ctrl *win32_dlg_item(int dlg_fd, int id) {
+    for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
+        struct win32_ctrl *c = &g_win32_gui.ctrl[i];
+        if (c->in_use && c->parent_fd == dlg_fd && c->id == id) return c;
+    }
+    return NULL;
+}
+/* user32!GetDlgItem(hDlg, id) -> the control's HWND token (or 0). */
+static long w32_GetDlgItem(uint64_t *a) {
+    struct win32_ctrl *c = win32_dlg_item((int)a[0], (int)a[1]);
+    if (!c) return 0;
+    return (long)(WIN32_CTRL_TAG | (uint64_t)(c - g_win32_gui.ctrl));
+}
+/* user32!GetDlgCtrlID(hCtrl) -> the control's id. */
+static long w32_GetDlgCtrlID(uint64_t *a) {
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    return c ? c->id : 0;
+}
+/* user32!SetDlgItemTextA(hDlg, id, text) -> TRUE. */
+static long w32_SetDlgItemTextA(uint64_t *a) {
+    struct win32_ctrl *c = win32_dlg_item((int)a[0], (int)a[1]);
+    if (!c) return 0;
+    c->text[0] = 0;
+    if (a[2]) (void)strncpy_from_user(c->text, (const char *)(uintptr_t)a[2], sizeof(c->text));
+    win32_dlg_paint((int)a[0]);
+    return 1;
+}
+/* user32!GetDlgItemTextA(hDlg, id, buf, max) -> length copied. */
+static long w32_GetDlgItemTextA(uint64_t *a) {
+    struct win32_ctrl *c = win32_dlg_item((int)a[0], (int)a[1]);
+    int max = (int)(int32_t)a[3];
+    if (max <= 0) return 0;
+    int n = 0;
+    if (c) while (n < (int)sizeof(c->text) - 1 && c->text[n]) n++;
+    if (n > max - 1) n = max - 1;
+    if (c && n) (void)copy_to_user((void *)(uintptr_t)a[2], c->text, n);
+    char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[2] + n), &z, 1);
+    return n;
+}
+/* user32!CheckDlgButton(hDlg, id, check) -> TRUE. */
+static long w32_CheckDlgButton(uint64_t *a) {
+    struct win32_ctrl *c = win32_dlg_item((int)a[0], (int)a[1]);
+    if (!c) return 0;
+    c->checked = (a[2] != 0);
+    win32_dlg_paint((int)a[0]);
+    return 1;
+}
+/* user32!IsDlgButtonChecked(hDlg, id) -> BST_CHECKED(1)/BST_UNCHECKED(0). */
+static long w32_IsDlgButtonChecked(uint64_t *a) {
+    struct win32_ctrl *c = win32_dlg_item((int)a[0], (int)a[1]);
+    return (c && c->checked) ? 1 : 0;
+}
+/* user32!CheckRadioButton(hDlg, first, last, check): set one radio in [first,
+ * last], clear the others in that id range. */
+static long w32_CheckRadioButton(uint64_t *a) {
+    int dlg = (int)a[0], lo = (int)a[1], hi = (int)a[2], sel = (int)a[3];
+    for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
+        struct win32_ctrl *c = &g_win32_gui.ctrl[i];
+        if (c->in_use && c->parent_fd == dlg && c->id >= lo && c->id <= hi)
+            c->checked = (c->id == sel);
+    }
+    win32_dlg_paint(dlg);
+    return 1;
+}
+/* user32!SendDlgItemMessageA(hDlg, id, msg, wParam, lParam) -> result. */
+static long w32_SendDlgItemMessageA(uint64_t *a) {
+    struct win32_ctrl *c = win32_dlg_item((int)a[0], (int)a[1]);
+    if (!c) return 0;
+    uint64_t sub[4] = { WIN32_CTRL_TAG | (uint64_t)(c - g_win32_gui.ctrl), a[2], a[3], a[4] };
+    return w32_SendMessageA(sub);
+}
+/* kernel32!lstrcmpA(a, b) -> <0/0/>0 (used by dialog apps to compare text). */
+static long w32_lstrcmpA(uint64_t *a) {
+    char s1[128], s2[128];
+    s1[0] = s2[0] = 0;
+    if (a[0]) (void)strncpy_from_user(s1, (const char *)(uintptr_t)a[0], sizeof(s1));
+    if (a[1]) (void)strncpy_from_user(s2, (const char *)(uintptr_t)a[1], sizeof(s2));
+    return (long)strcmp(s1, s2);
 }
 
 /* ---- C11: more GDI (pens, lines, shapes) ----
@@ -5420,12 +5896,22 @@ static int win32_sb_thumb_y(const struct win32_ctrl *c) {
     return c->y + ah + (track * p) / span;
 }
 
+/* Pick a label text colour that contrasts with the parent background: dark text
+ * on a light bg (e.g. a dialog's gray face), light text on a dark bg (the C13
+ * app windows). Used for the controls whose label sits directly on the bg. */
+static uint32_t win32_label_fg(uint32_t bg) {
+    uint32_t r = (bg >> 16) & 0xFF, g = (bg >> 8) & 0xFF, b = bg & 0xFF;
+    uint32_t lum = (r * 2 + g * 3 + b) / 6;
+    return (lum > 140) ? 0x00101010u : 0x00E8E8E8u;
+}
+
 /* Draw all of a parent window's controls into its backbuffer (caller flips). */
 static void win32_draw_controls(int parent_fd) {
     struct window *win = win32_hdc_window(parent_fd);
     if (!win) return;
     struct win32_win *pw = win32_win_find(parent_fd);
     uint32_t pbg = pw ? pw->fill_color : WIN32_FILL_DEFAULT;
+    uint32_t lfg = win32_label_fg(pbg);
     for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
         struct win32_ctrl *c = &g_win32_gui.ctrl[i];
         if (!c->in_use || c->parent_fd != parent_fd || c->hidden) continue;
@@ -5443,7 +5929,7 @@ static void win32_draw_controls(int parent_fd) {
             (void)gui_window_text(win, c->x + 5, ty, c->text[0] ? c->text : " ", 0x00000000, 0x00FFFFFF);
             break;
         case WIN32_CTRL_STATIC:
-            (void)gui_window_text(win, c->x, ty, c->text, 0x00E8E8E8, pbg);
+            (void)gui_window_text(win, c->x, ty, c->text, lfg, pbg);
             break;
         case WIN32_CTRL_CHECKBOX: {
             int bs = 13, by = c->y + (c->h - bs) / 2;
@@ -5453,7 +5939,7 @@ static void win32_draw_controls(int parent_fd) {
                 (void)gui_window_line(win, c->x + 2, by + 6, c->x + 5, by + 9, 0x00208020);
                 (void)gui_window_line(win, c->x + 5, by + 9, c->x + 10, by + 2, 0x00208020);
             }
-            (void)gui_window_text(win, c->x + bs + 6, ty, c->text, 0x00E8E8E8, pbg);
+            (void)gui_window_text(win, c->x + bs + 6, ty, c->text, lfg, pbg);
             break;
         }
         case WIN32_CTRL_LISTBOX: {
@@ -5486,7 +5972,7 @@ static void win32_draw_controls(int parent_fd) {
             (void)gui_window_rect(win, c->x, c->y + 4, c->w, c->h - 4, 0x00909090);
             int tw = 0; while (c->text[tw]) tw++;
             (void)gui_window_fill(win, c->x + 8, c->y, tw * 8 + 6, 9, pbg);
-            (void)gui_window_text(win, c->x + 11, c->y, c->text, 0x00E8E8E8, pbg);
+            (void)gui_window_text(win, c->x + 11, c->y, c->text, lfg, pbg);
             break;
         }
         case WIN32_CTRL_RADIO: {        /* C14: a circular, group-exclusive check */
@@ -5494,7 +5980,7 @@ static void win32_draw_controls(int parent_fd) {
             (void)gui_window_circle(win, ccx, ccy, rr, 0x00FFFFFF);
             (void)gui_window_circle_outline(win, ccx, ccy, rr, 0x00404040);
             if (c->checked) (void)gui_window_circle(win, ccx, ccy, 3, 0x00208020);
-            (void)gui_window_text(win, c->x + 2 * rr + 6, ty, c->text, 0x00E8E8E8, pbg);
+            (void)gui_window_text(win, c->x + 2 * rr + 6, ty, c->text, lfg, pbg);
             break;
         }
         case WIN32_CTRL_COMBOBOX: {     /* C14: closed face (selected text + arrow) */
@@ -5612,10 +6098,15 @@ static bool win32_route_control_input(int parent_fd, const struct gui_event *ev)
                                     c->id, row, lb->items[row]);
                     }
                     c->dropped = false;
+                    /* closing shrinks the combo's footprint -> repaint the bg to
+                     * erase the dropdown (the app's WM_PAINT / the kernel dialog
+                     * painter refills the background, then redraws controls). */
+                    { struct win32_win *pw = win32_win_find(parent_fd); if (pw) pw->needs_paint = true; }
                     win32_refresh_controls(parent_fd);
                     return true;
                 }
                 c->dropped = false;                 /* click off the list -> close */
+                { struct win32_win *pw = win32_win_find(parent_fd); if (pw) pw->needs_paint = true; }
                 win32_refresh_controls(parent_fd);
                 if (inField) return true;           /* on the field -> just close */
                 /* else fall through so the click can hit another control */
@@ -6204,6 +6695,24 @@ static const struct win32_shim g_win32_shims[] = {
     { "gdi32.dll",  "SetBkMode",              w32_SetBkMode },
     { "gdi32.dll",  "GetTextExtentPoint32A",  w32_GetTextExtentPoint32A },
     { "gdi32.dll",  "GetTextMetricsA",        w32_GetTextMetricsA },
+
+    /* ---- C14: dialog templates + dialog-item helpers (user32) ----
+     * NOTE: DialogBoxParamA is bound by the loader to a CPL3 trampoline (it runs
+     * the modal loop + dispatches to the app's DialogProc), so it is NOT in this
+     * table; __toby_dlgsvc is the internal service that trampoline calls. */
+    { "user32.dll", "__toby_dlgsvc",          w32_toby_dlgsvc },
+    { "user32.dll", "EndDialog",              w32_EndDialog },
+    { "user32.dll", "CreateDialogParamA",     w32_CreateDialogParamA },
+    { "user32.dll", "DefDlgProcA",            w32_DefDlgProcA },
+    { "user32.dll", "GetDlgItem",             w32_GetDlgItem },
+    { "user32.dll", "GetDlgCtrlID",           w32_GetDlgCtrlID },
+    { "user32.dll", "SetDlgItemTextA",        w32_SetDlgItemTextA },
+    { "user32.dll", "GetDlgItemTextA",        w32_GetDlgItemTextA },
+    { "user32.dll", "CheckDlgButton",         w32_CheckDlgButton },
+    { "user32.dll", "IsDlgButtonChecked",     w32_IsDlgButtonChecked },
+    { "user32.dll", "CheckRadioButton",       w32_CheckRadioButton },
+    { "user32.dll", "SendDlgItemMessageA",    w32_SendDlgItemMessageA },
+    { "kernel32.dll", "lstrcmpA",             w32_lstrcmpA },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

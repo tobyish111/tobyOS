@@ -261,6 +261,11 @@ struct proc {
      * a short-lived process. Both 0 until first use. */
     uint64_t        win_heap_cur;
     uint64_t        win_heap_end;
+    /* C14: PE image base + resource directory (.rsrc), for DialogBoxParamA to
+     * walk RT_DIALOG templates. All 0 for non-PE / no-resource processes. */
+    uint64_t        win_image_base;
+    uint64_t        win_rsrc_rva;
+    uint64_t        win_rsrc_size;
     struct proc    *join_waiters;
 
     /* ---- Priority scheduling (gap #3: priority classes + timeslicing) ----

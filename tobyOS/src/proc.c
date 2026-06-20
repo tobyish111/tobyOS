@@ -727,6 +727,11 @@ static int spawn_internal(const char *path, const char *name,
          * SWAPGS'd into the active GS base on the way to CPL3 (do_switch +
          * syscall_entry.S). */
         p->gs_base = pe_info.teb;
+        /* C14: record the image base + .rsrc dir so DialogBoxParamA can walk
+         * RT_DIALOG resource templates from this process's mapped image. */
+        p->win_image_base = pe_info.image_base;
+        p->win_rsrc_rva   = pe_info.rsrc_rva;
+        p->win_rsrc_size  = pe_info.rsrc_size;
         kprintf("[proc] pid %d '%s' -> Win32 PE personality (entry=%p teb=%p)\n",
                 p->pid, p->name, (void *)pe_info.entry, (void *)pe_info.teb);
         ok = build_user_stack(p);

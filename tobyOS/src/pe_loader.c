@@ -97,6 +97,7 @@ struct pe_import_desc {
 struct pe_base_reloc { uint32_t page_rva, block_size; } __attribute__((packed));
 
 #define PE_DIR_IMPORT      1
+#define PE_DIR_RESOURCE    2   /* C14: .rsrc (RT_DIALOG dialog templates) */
 #define PE_DIR_BASERELOC   5
 
 #define PE_MACHINE_AMD64   0x8664
@@ -180,12 +181,17 @@ static const uint8_t g_win32_gate[] = {
 #define WIN32_GATE_SIZE (sizeof(g_win32_gate))
 
 /* Shim-page layout (fixed offsets the loader + the kernel shims agree on):
- *   0x00  gate (94 bytes)
+ *   0x00  gate (123 bytes, C11: 10-arg)
  *   0x80  thread wrapper (C6: CreateThread's CPL3 entry trampoline)
- *   0x100 per-import thunks (10 bytes each)
- * See WIN32_THREAD_WRAPPER_VA in pe.h for the wrapper's user VA. */
+ *   0xC0  DispatchMessage trampoline (C7)
+ *   0x100 dialog modal-loop trampoline (C14: DialogBoxParamA, 106 bytes)
+ *   0x1F0 dialog-service gate-thunk (C14: __toby_dlgsvc, 10 bytes)
+ *   0x200 per-import thunks (10 bytes each)
+ * See WIN32_THREAD_WRAPPER_VA / WIN32_DLG_TRAMP_VA in pe.h for the user VAs. */
 #define WIN32_WRAPPER_OFF   0x80
-#define WIN32_THUNK_BASE    0x100
+#define WIN32_DLGTRAMP_OFF  0x100     /* C14: DialogBoxParamA trampoline */
+#define WIN32_DLGSVC_THUNK_OFF 0x1F0  /* C14: __toby_dlgsvc gate-thunk (fixed VA) */
+#define WIN32_THUNK_BASE    0x200
 #define WIN32_WRAPPER_IMM_OFF 0x14    /* the thread-exit imm32 in the wrapper */
 
 /* C9: per-import thunks grow up from WIN32_THUNK_BASE; the GetProcAddress thunk
@@ -242,6 +248,34 @@ static const uint8_t g_win32_dispatch_stub[] = {
 };
 #define WIN32_DISPATCH_SIZE (sizeof(g_win32_dispatch_stub))
 
+/* C14: the DialogBoxParamA modal-loop trampoline (at WIN32_DLGTRAMP_OFF).
+ * DialogBoxParamA's IAT slot points here. It creates the dialog (kernel),
+ * then runs a GetMessage/DispatchMessage loop in CPL3 -- PUMP-ing one message
+ * at a time from the kernel and dispatching each to the app's DialogProc via
+ * the C7 DispatchMessage trampoline -- until EndDialog, then returns the
+ * EndDialog result. Reaches the kernel through the __toby_dlgsvc gate-thunk at
+ * the FIXED VA 0x300001F0, and DispatchMessage at the FIXED VA 0x300000C0, so
+ * the blob needs no load-time patching. Assembled offline (.tmp_c14a/dlgtramp.S
+ * -> clang --target=x86_64-elf -> objdump/objcopy) + verified.
+ *
+ *   push rbx ; sub rsp,0x60
+ *   ; BEGIN: dlgsvc(0, hInst, template, parent, dlgProc, initParam)
+ *   ; loop: r = dlgsvc(1, &msg) ; if !r goto done ; DispatchMessage(&msg) ; loop
+ *   ; done: rax = dlgsvc(2) ; add rsp,0x60 ; pop rbx ; ret
+ */
+static const uint8_t g_win32_dlg_tramp[] = {
+    0x53, 0x48, 0x83, 0xec, 0x60, 0x4c, 0x89, 0xc8, 0x4d, 0x89, 0xc1, 0x49,
+    0x89, 0xd0, 0x48, 0x89, 0xca, 0x31, 0xc9, 0x48, 0x89, 0x44, 0x24, 0x20,
+    0x4c, 0x8b, 0x94, 0x24, 0x90, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x54, 0x24,
+    0x28, 0x48, 0xc7, 0xc0, 0xf0, 0x01, 0x00, 0x30, 0xff, 0xd0, 0xb9, 0x01,
+    0x00, 0x00, 0x00, 0x48, 0x8d, 0x54, 0x24, 0x30, 0x48, 0xc7, 0xc0, 0xf0,
+    0x01, 0x00, 0x30, 0xff, 0xd0, 0x48, 0x85, 0xc0, 0x74, 0x10, 0x48, 0x8d,
+    0x4c, 0x24, 0x30, 0x48, 0xc7, 0xc0, 0xc0, 0x00, 0x00, 0x30, 0xff, 0xd0,
+    0xeb, 0xd8, 0xb9, 0x02, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc0, 0xf0, 0x01,
+    0x00, 0x30, 0xff, 0xd0, 0x48, 0x83, 0xc4, 0x60, 0x5b, 0xc3,
+};
+#define WIN32_DLG_TRAMP_SIZE (sizeof(g_win32_dlg_tramp))
+
 static inline uint64_t round_up(uint64_t x, uint64_t a) { return (x + a - 1) & ~(a - 1); }
 
 /* ---- MZ/PE sniff -------------------------------------------------------- */
@@ -283,6 +317,10 @@ static uint64_t win32_user_stub_va(const char *dll, const char *func) {
     if (strcmp(func, "DispatchMessageA") == 0 ||
         strcmp(func, "DispatchMessageW") == 0)
         return WIN32_DISPATCH_STUB_VA;
+    /* C14: a modal dialog runs its message loop in CPL3 (it calls the app's
+     * DialogProc), so DialogBoxParamA is bound to the dialog trampoline. */
+    if (strcmp(func, "DialogBoxParamA") == 0)
+        return WIN32_DLG_TRAMP_VA;
     return 0;
 }
 
@@ -318,6 +356,18 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
     memcpy((void *)WIN32_SHIM_BASE, gate, WIN32_GATE_SIZE);
     memcpy((void *)(WIN32_SHIM_BASE + WIN32_WRAPPER_OFF), wrap, WIN32_WRAPPER_SIZE);
     memcpy((void *)(WIN32_SHIM_BASE + WIN32_DISPATCH_OFF), disp, WIN32_DISPATCH_SIZE);
+    /* C14: the dialog modal-loop trampoline + its dedicated gate-thunk for the
+     * __toby_dlgsvc shim (so the trampoline can reach the kernel at a fixed VA
+     * with no load-time patching of the blob itself). */
+    _Static_assert(WIN32_DLGTRAMP_OFF + sizeof(g_win32_dlg_tramp) <= WIN32_DLGSVC_THUNK_OFF,
+                   "dialog trampoline overruns the dlgsvc thunk slot");
+    _Static_assert(WIN32_DLGSVC_THUNK_OFF + WIN32_THUNK_SIZE <= WIN32_THUNK_BASE,
+                   "dlgsvc thunk overruns the import-thunk region");
+    memcpy((void *)(WIN32_SHIM_BASE + WIN32_DLGTRAMP_OFF), g_win32_dlg_tramp,
+           WIN32_DLG_TRAMP_SIZE);
+    int dlgsvc_idx = win32_shim_index("user32.dll", "__toby_dlgsvc");
+    if (dlgsvc_idx >= 0)
+        pe_emit_gate_thunk(WIN32_DLGSVC_THUNK_OFF, (uint32_t)dlgsvc_idx);
     uaccess_end(uf);
 
     int next_thunk = 0;     /* next free thunk slot in the page */
@@ -618,6 +668,15 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
     out->entry      = load_base + opt->entry_point_rva;
     out->teb        = WIN32_TEB_BASE;
     out->crt_data   = WIN32_CRT_DATA_BASE;
+    /* C14: expose the resource directory (.rsrc) so DialogBoxParamA can walk it
+     * for RT_DIALOG templates. rsrc_rva is a directory offset relative to the
+     * loaded image base; the kernel adds load_base when parsing. */
+    if (opt->num_data_dirs > PE_DIR_RESOURCE && dirs[PE_DIR_RESOURCE].rva) {
+        out->rsrc_rva  = (uint64_t)dirs[PE_DIR_RESOURCE].rva;
+        out->rsrc_size = (uint64_t)dirs[PE_DIR_RESOURCE].size;
+    } else {
+        out->rsrc_rva = out->rsrc_size = 0;
+    }
     kprintf("[pe] loaded: base=%p entry=%p (gate@%p teb@%p crt@%p)\n",
             (void *)load_base, (void *)out->entry,
             (void *)WIN32_SHIM_BASE, (void *)WIN32_TEB_BASE,
