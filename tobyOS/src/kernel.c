@@ -2346,7 +2346,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -4199,6 +4199,71 @@ void _start(void) {
                 kprintf("[boot] WINPE11: /bin/win-gui11.exe (pid=%d) exit=%d\n", wpid, rc);
                 kprintf("[WINPE11] VERDICT: %s exit=%d (expected 11)\n",
                         rc == 11 ? "PASS" : "FAIL", rc);
+            }
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE12_BOOT
+    /* Track C -- bitmaps/BitBlt + real BUTTON/EDIT controls, milestone C12.
+     * Build EXTRA_CFLAGS+=-DWINPE12_BOOT. Two GUI proofs on the logged-in
+     * desktop (reusing C8's auto-login + desktop launch):
+     *   A) /bin/win-bmp12.exe BitBlts an in-memory gradient bitmap -> exit 12.
+     *   B) /bin/win-ctrl12.exe creates an EDIT + a BUTTON; the harness types
+     *      into the edit and clicks the button (button -> WM_COMMAND, the app
+     *      reads the edit text back) -> exit 12. */
+    {
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+
+        /* ---- Part A: bitmaps / BitBlt ---- */
+        kprintf("[boot] WINPE12: spawning /bin/win-bmp12.exe (BitBlt)\n");
+        int bpid = winpe_spawn_session_app("/bin/win-bmp12.exe", "win-bmp12.exe");
+        if (bpid < 0) {
+            kprintf("[WINPE12B] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 100 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(bpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE12B] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(bpid, SIGKILL); (void)proc_wait(bpid);
+            } else {
+                winpe8_pump_ms(800);
+                kprintf("[WINPE12B] BitBlt bitmap on the window; holding ~5s for screenshot\n");
+                for (int i = 0; i < 160 && win32_gui_window_count(bpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(bpid);
+                kprintf("[boot] WINPE12: /bin/win-bmp12.exe (pid=%d) exit=%d\n", bpid, rc);
+                kprintf("[WINPE12B] VERDICT: %s exit=%d (expected 12)\n", rc == 12 ? "PASS" : "FAIL", rc);
+            }
+        }
+
+        /* ---- Part B: BUTTON + EDIT controls ---- */
+        kprintf("[boot] WINPE12: spawning /bin/win-ctrl12.exe (BUTTON/EDIT)\n");
+        int cpid = winpe_spawn_session_app("/bin/win-ctrl12.exe", "win-ctrl12.exe");
+        if (cpid < 0) {
+            kprintf("[WINPE12] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 100 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(cpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE12] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(cpid, SIGKILL); (void)proc_wait(cpid);
+            } else {
+                winpe8_pump_ms(900);   /* first paint -> controls drawn, EDIT focused */
+                /* Type into the auto-focused EDIT. */
+                const char *txt = "tobyOS";
+                kprintf("[boot] WINPE12: typing '%s' into the EDIT control\n", txt);
+                for (const char *p = txt; *p; p++) { gui_post_key((uint8_t)*p); winpe8_pump_ms(120); }
+                /* Click the BUTTON at its client centre (placed at 30,110,120,32). */
+                kprintf("[boot] WINPE12: clicking the BUTTON control\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 90, 126, MOUSE_BTN_LEFT);
+                winpe8_pump_ms(500);
+                kprintf("[WINPE12] EDIT typed + BUTTON clicked; holding ~4s for screenshot\n");
+                for (int i = 0; i < 160 && win32_gui_window_count(cpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(cpid);
+                kprintf("[boot] WINPE12: /bin/win-ctrl12.exe (pid=%d) exit=%d\n", cpid, rc);
+                kprintf("[WINPE12] VERDICT: %s exit=%d (expected 12)\n", rc == 12 ? "PASS" : "FAIL", rc);
             }
         }
         win32_gui_set_log(false);

@@ -4136,6 +4136,33 @@ static long w32_LeaveCriticalSection(uint64_t *a) {
  * (GetMessage and DispatchMessage are called in lock-step per message). */
 #define WIN32_MAX_WINDOWS 8
 #define WIN32_MAX_CLASSES 8
+#define WIN32_MAX_CTRLS   16   /* C12: BUTTON/EDIT child controls */
+#define WIN32_CMDQ        8    /* C12: pending WM_COMMAND ring     */
+#define WIN32_CTRL_TEXT   40
+
+/* C12 handle tags (high byte) -- distinct from brush 0x7B / pen 0x7C / module
+ * 0x7D / find 0x7E / thread 0x74 / FILE* 0xF11E. */
+#define WIN32_BITMAP_TAG  0x6200000000000000ull   /* HBITMAP -> g_win32_bmp slot  */
+#define WIN32_MEMDC_TAG   0x6300000000000000ull   /* memory HDC -> g_win32_memdc  */
+#define WIN32_CTRL_TAG    0x6400000000000000ull   /* control HWND -> g_win32_ctrl */
+#define WIN32_TAG_MASK    0xFF00000000000000ull
+/* C12 control kinds. */
+#define WIN32_CTRL_BUTTON 1
+#define WIN32_CTRL_EDIT   2
+
+/* C12: a control (BUTTON/EDIT) is a VIRTUAL child rendered INTO its parent
+ * window's client area (the compositor is top-level-only -- no nested windows),
+ * with input routed from the parent. The kernel draws it and handles its input;
+ * the app only sees WM_COMMAND notifications. */
+struct win32_ctrl {
+    bool     in_use;
+    int      parent_fd;          /* the owning top-level window (fd) */
+    int      type;               /* WIN32_CTRL_BUTTON / WIN32_CTRL_EDIT */
+    int      x, y, w, h;         /* rect within the parent's client area */
+    int      id;                 /* control id (CreateWindowEx hMenu) */
+    bool     focus;              /* EDIT: has keyboard focus */
+    char     text[WIN32_CTRL_TEXT];
+};
 
 struct win32_win {
     int      fd;          /* sys_gui_create fd == HWND == HDC; 0 = free slot */
@@ -4159,6 +4186,12 @@ static struct {
     struct win32_win win[WIN32_MAX_WINDOWS];
     struct { char name[32]; uint64_t wndproc; } cls[WIN32_MAX_CLASSES];
     int  ncls;
+    /* C12: virtual child controls + a ring of WM_COMMAND notifications pending
+     * delivery to a parent window. Both live here so the per-fresh-app memset
+     * clears them with the rest of the bridge state. */
+    struct win32_ctrl ctrl[WIN32_MAX_CTRLS];
+    struct { uint64_t hwnd; uint32_t message; uint64_t wParam, lParam; } cmd_q[WIN32_CMDQ];
+    int  cmd_head, cmd_tail;
 } g_win32_gui;
 
 /* Window-table entry for an HWND/HDC fd, or NULL. */
@@ -4181,6 +4214,34 @@ static int win32_win_count(void) {
         if (g_win32_gui.win[i].fd > 0) n++;
     return n;
 }
+
+/* C12: case-insensitive string compare (for predefined control class names). */
+static bool win32_streq_ci(const char *a, const char *b) {
+    for (;; a++, b++) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+        if (ca != cb) return false;
+        if (!ca) return true;
+    }
+}
+/* C12: map a window class name to a control kind (0 if not a control class). */
+static int win32_ctrl_class(const char *cn) {
+    if (win32_streq_ci(cn, "BUTTON")) return WIN32_CTRL_BUTTON;
+    if (win32_streq_ci(cn, "EDIT"))   return WIN32_CTRL_EDIT;
+    return 0;
+}
+/* C12: resolve a control HWND token to its slot, or NULL. */
+static struct win32_ctrl *win32_ctrl_find(uint64_t h) {
+    if ((h & WIN32_TAG_MASK) != WIN32_CTRL_TAG) return NULL;
+    int s = (int)(h & 0xFF);
+    if (s < 0 || s >= WIN32_MAX_CTRLS || !g_win32_gui.ctrl[s].in_use) return NULL;
+    return &g_win32_gui.ctrl[s];
+}
+/* C12 control helpers used by GetMessage/EndPaint (defined below, after the GDI
+ * backend they call). */
+static void win32_draw_controls(int parent_fd);
+static bool win32_route_control_input(int parent_fd, const struct gui_event *ev);
 
 /* Retire window-table slots whose fd is no longer a live window in the CURRENT
  * process -- i.e. leftovers from a previous, now-exited GUI process. pids get
@@ -4239,6 +4300,16 @@ static void win32_stash_wndproc(const struct win32_win *w) {
 /* WS_CHILD window style bit (C11): a window created with it (or with a non-NULL
  * hWndParent) is a child/owned window. */
 #define WS_CHILD          0x40000000u
+
+/* C12 messages a control synthesises to its parent. */
+#define WM_SETTEXT        0x000C
+#define WM_COMMAND        0x0111
+#define BN_CLICKED        0
+
+/* The default window fill (C7's blue) used when no solid brush is supplied. */
+#define WIN32_FILL_DEFAULT 0x002E5C8Au
+/* Default pen colour (white) until CreatePen/SelectObject sets one. */
+#define WIN32_PEN_DEFAULT  0x00FFFFFFu
 
 /* The default window fill (C7's blue) used when no solid brush is supplied. */
 #define WIN32_FILL_DEFAULT 0x002E5C8Au
@@ -4347,6 +4418,37 @@ static long w32_CreateWindowExA(uint64_t *a) {
     if (cnameptr)
         (void)strncpy_from_user(cname, (const char *)(uintptr_t)cnameptr, sizeof(cname));
 
+    /* C12: a predefined control class (BUTTON/EDIT) with a parent creates a
+     * VIRTUAL child rendered into the parent's client area, not a top-level
+     * window. Its HWND is a tagged token; its id is hMenu (a9). */
+    int ctype = win32_ctrl_class(cname);
+    if (ctype && parent_fd) {
+        for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
+            if (g_win32_gui.ctrl[i].in_use) continue;
+            struct win32_ctrl *c = &g_win32_gui.ctrl[i];
+            memset(c, 0, sizeof(*c));
+            c->in_use = true;  c->parent_fd = parent_fd;  c->type = ctype;
+            c->x = (int)(int32_t)a[4];  c->y = (int)(int32_t)a[5];
+            c->w = w;  c->h = h;  c->id = (int)a[9];   /* hMenu = control id */
+            if (name)
+                (void)strncpy_from_user(c->text, (const char *)(uintptr_t)name,
+                                        sizeof(c->text));
+            if (ctype == WIN32_CTRL_EDIT) {            /* auto-focus the first EDIT */
+                bool any = false;
+                for (int j = 0; j < WIN32_MAX_CTRLS; j++)
+                    if (g_win32_gui.ctrl[j].in_use &&
+                        g_win32_gui.ctrl[j].parent_fd == parent_fd &&
+                        g_win32_gui.ctrl[j].type == WIN32_CTRL_EDIT &&
+                        g_win32_gui.ctrl[j].focus) any = true;
+                if (!any) c->focus = true;
+            }
+            struct win32_win *pw = win32_win_find(parent_fd);
+            if (pw) pw->needs_paint = true;           /* redraw parent -> draw control */
+            return (long)(WIN32_CTRL_TAG | (uint64_t)i);
+        }
+        return 0;   /* control table full */
+    }
+
     struct win32_win *win = win32_win_alloc();
     if (!win) return 0;                          /* table full -> NULL HWND */
     long fd = sys_gui_create((uint32_t)w, (uint32_t)h, (const char *)(uintptr_t)name);
@@ -4368,8 +4470,14 @@ static long w32_CreateWindowExA(uint64_t *a) {
     return fd;   /* HWND == HDC == fd */
 }
 
-static long w32_ShowWindow(uint64_t *a)   { struct win32_win *w = win32_win_find((int)a[0]); if (w) w->needs_paint = true; return 1; }
-static long w32_UpdateWindow(uint64_t *a) { struct win32_win *w = win32_win_find((int)a[0]); if (w) w->needs_paint = true; return 1; }
+/* ShowWindow/UpdateWindow: a window -> queue its repaint; a control (C12) ->
+ * queue its PARENT's repaint so the control gets drawn into it. */
+static long w32_ShowWindow(uint64_t *a) {
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    if (c) { struct win32_win *pw = win32_win_find(c->parent_fd); if (pw) pw->needs_paint = true; return 1; }
+    struct win32_win *w = win32_win_find((int)a[0]); if (w) w->needs_paint = true; return 1;
+}
+static long w32_UpdateWindow(uint64_t *a) { return w32_ShowWindow(a); }
 static long w32_PostQuitMessage(uint64_t *a) {
     g_win32_gui.quit = true; g_win32_gui.quitcode = (int)a[0]; return 0;
 }
@@ -4480,7 +4588,25 @@ static long w32_GetMessageA(uint64_t *a) {
         }
     }
 
-    /* WM_PAINT for any window that needs one. */
+    /* C12: deliver a pending WM_COMMAND (e.g. a button click) to its parent. */
+    if (g_win32_gui.cmd_head != g_win32_gui.cmd_tail) {
+        int t = g_win32_gui.cmd_tail;
+        struct win32_win *pw = win32_win_find((int)g_win32_gui.cmd_q[t].hwnd);
+        win32_stash_wndproc(pw);
+        m.hwnd    = g_win32_gui.cmd_q[t].hwnd;
+        m.message = g_win32_gui.cmd_q[t].message;
+        m.wParam  = g_win32_gui.cmd_q[t].wParam;
+        m.lParam  = g_win32_gui.cmd_q[t].lParam;
+        g_win32_gui.cmd_tail = (t + 1) % WIN32_CMDQ;
+        if (g_win32_log_input)
+            kprintf("[winpe] GetMessage hwnd=%d -> WM_COMMAND id=%d\n",
+                    (int)m.hwnd, (int)(m.wParam & 0xFFFF));
+        (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+        return 1;
+    }
+
+    /* WM_PAINT for any window that needs one. (Controls are drawn into the
+     * parent's backbuffer by EndPaint, after the app's own client paint.) */
     for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
         struct win32_win *w = &g_win32_gui.win[i];
         if (w->fd > 0 && w->needs_paint) {
@@ -4492,13 +4618,21 @@ static long w32_GetMessageA(uint64_t *a) {
         }
     }
 
-    /* One real input event from any window -> WM_*. */
+    /* One real input event from any window -> WM_*. C12: if the window has child
+     * controls and the event hits one (button click / edit keystroke), the
+     * control consumes it (the app sees only the resulting WM_COMMAND); we
+     * return WM_NULL so the loop keeps turning. */
     for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
         struct win32_win *w = &g_win32_gui.win[i];
         if (w->fd <= 0) continue;
         struct gui_event ev;
-        if (win32_poll_window_event(w->fd, &ev) > 0 &&
-            win32_event_to_msg(w->fd, &ev, &m)) {
+        if (win32_poll_window_event(w->fd, &ev) <= 0) continue;
+        if (win32_route_control_input(w->fd, &ev)) {
+            m.hwnd = (uint64_t)w->fd; m.message = WM_NULL;
+            (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+            return 1;
+        }
+        if (win32_event_to_msg(w->fd, &ev, &m)) {
             win32_stash_wndproc(w);
             if (g_win32_log_input && m.message != WM_MOUSEMOVE)
                 kprintf("[winpe] GetMessage hwnd=%d -> WM_%04x wParam=0x%lx lParam=0x%lx\n",
@@ -4533,7 +4667,10 @@ static long w32_BeginPaint(uint64_t *a) {
 }
 static long w32_EndPaint(uint64_t *a) {
     int fd = (int)a[0];
-    if (win32_win_find(fd)) (void)sys_gui_flip(fd);
+    if (win32_win_find(fd)) {
+        win32_draw_controls(fd);   /* C12: overlay child controls on the app's paint */
+        (void)sys_gui_flip(fd);
+    }
     return 1;
 }
 
@@ -4550,8 +4687,16 @@ static long w32_CreateSolidBrush(uint64_t *a) {
     return (long)(WIN32_BRUSH_TAG | (uint64_t)((uint32_t)a[0] & 0xFFFFFFu));
 }
 
-/* gdi32!DeleteObject(hgdiobj) -> TRUE. Brush tokens carry no allocation. */
-static long w32_DeleteObject(uint64_t *a) { (void)a; return 1; }
+/* C12: free a bitmap's backing store -- forward-declared so DeleteObject can
+ * route to it. Defined with the bitmap shims below. */
+static void win32_bitmap_free(uint64_t hbmp);
+
+/* gdi32!DeleteObject(hgdiobj) -> TRUE. Brush/pen tokens carry no allocation; a
+ * bitmap (C12) frees its pixel buffer. */
+static long w32_DeleteObject(uint64_t *a) {
+    if ((a[0] & WIN32_TAG_MASK) == WIN32_BITMAP_TAG) win32_bitmap_free(a[0]);
+    return 1;
+}
 
 /* FillRect(hdc, &RECT, hbrush) -> non-zero. Honours a CreateSolidBrush colour
  * (so e.g. a click can repaint the window a new colour); a non-solid/system
@@ -4610,14 +4755,20 @@ static long w32_CreatePen(uint64_t *a) {
     return (long)(WIN32_PEN_TAG | (uint64_t)((uint32_t)a[2] & 0xFFFFFFu));
 }
 
-/* gdi32!SelectObject(hdc, hgdiobj) -> the previously-selected object. A pen
- * token sets the DC's current pen colour; the prior pen is returned (so the app
- * can restore it). Non-pen objects (brushes etc.) are passed back unchanged. */
+/* C12: select a bitmap into a memory DC -- forward-declared so SelectObject can
+ * route to it. Defined with the bitmap shims below. */
+static long win32_memdc_select_bitmap(uint64_t hdc, uint64_t hbmp);
+
+/* gdi32!SelectObject(hdc, hgdiobj) -> the previously-selected object. A pen token
+ * sets a window DC's current pen colour; a bitmap selected into a memory DC is
+ * routed to the bitmap path (C12); other objects are passed back unchanged. */
 static long w32_SelectObject(uint64_t *a) {
     int fd = (int)a[0];
     uint64_t obj = a[1];
+    if ((a[0] & WIN32_TAG_MASK) == WIN32_MEMDC_TAG)        /* memory DC + bitmap */
+        return win32_memdc_select_bitmap(a[0], obj);
     struct win32_win *w = win32_win_find(fd);
-    if (w && (obj & WIN32_BRUSH_MASK) == WIN32_PEN_TAG) {
+    if (w && (obj & WIN32_TAG_MASK) == WIN32_PEN_TAG) {
         uint64_t old = WIN32_PEN_TAG |
                        (uint64_t)win32_colorref_to_xrgb(w->pen_color);
         w->pen_color = win32_colorref_to_xrgb((uint32_t)(obj & 0xFFFFFFu));
@@ -4839,6 +4990,240 @@ static long w32_FindClose(uint64_t *a) {
         vfs_closedir(&g_win32_find[slot].dir);
         g_win32_find[slot].in_use = false;
     }
+    return 1;
+}
+
+/* ---- C12: bitmaps + BitBlt ----
+ * A memory DC + bitmap let an app compose an off-screen image and BitBlt it onto
+ * a window. A bitmap is a kmalloc'd 32bpp pixel buffer (DWORDs are 0x00RRGGBB,
+ * which IS the tobyOS framebuffer's XRGB -- no conversion); a memory DC just
+ * references a selected bitmap. BitBlt copies the source bitmap (or a sub-rect)
+ * to the destination window via gui_window_blit. */
+#define WIN32_MAX_BITMAPS 8
+#define WIN32_MAX_MEMDC   4
+static struct { bool in_use; int w, h; uint32_t *pixels; } g_win32_bmp[WIN32_MAX_BITMAPS];
+static struct { bool in_use; int bmp; } g_win32_memdc[WIN32_MAX_MEMDC];
+
+/* gdi32!CreateCompatibleDC(hdc) -> a memory HDC (tagged token), no bitmap yet. */
+static long w32_CreateCompatibleDC(uint64_t *a) {
+    (void)a;
+    for (int i = 0; i < WIN32_MAX_MEMDC; i++)
+        if (!g_win32_memdc[i].in_use) {
+            g_win32_memdc[i].in_use = true; g_win32_memdc[i].bmp = -1;
+            return (long)(WIN32_MEMDC_TAG | (uint64_t)i);
+        }
+    return 0;
+}
+
+/* Allocate a bitmap slot with a w*h pixel buffer; copies `bits` (user 32bpp) if
+ * non-NULL, else zero-fills. Returns the HBITMAP token or 0. */
+static long win32_bitmap_alloc(int w, int h, uint64_t bits_user) {
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return 0;
+    for (int i = 0; i < WIN32_MAX_BITMAPS; i++) {
+        if (g_win32_bmp[i].in_use) continue;
+        uint32_t *px = (uint32_t *)kmalloc((size_t)w * h * 4u);
+        if (!px) return 0;
+        if (bits_user) {
+            if (copy_from_user(px, (const void *)(uintptr_t)bits_user,
+                               (size_t)w * h * 4u) != 0) { kfree(px); return 0; }
+        } else {
+            memset(px, 0, (size_t)w * h * 4u);
+        }
+        g_win32_bmp[i].in_use = true; g_win32_bmp[i].w = w; g_win32_bmp[i].h = h;
+        g_win32_bmp[i].pixels = px;
+        return (long)(WIN32_BITMAP_TAG | (uint64_t)i);
+    }
+    return 0;
+}
+
+/* gdi32!CreateBitmap(w, h, planes, bpp, bits) -> HBITMAP (32bpp DWORD bits). */
+static long w32_CreateBitmap(uint64_t *a) {
+    return win32_bitmap_alloc((int)(int32_t)a[0], (int)(int32_t)a[1], a[4]);
+}
+/* gdi32!CreateCompatibleBitmap(hdc, w, h) -> HBITMAP (zero-filled). */
+static long w32_CreateCompatibleBitmap(uint64_t *a) {
+    return win32_bitmap_alloc((int)(int32_t)a[1], (int)(int32_t)a[2], 0);
+}
+
+/* SelectObject(memdc, bitmap) routing target. Returns the previously-selected
+ * bitmap handle (or 0). */
+static long win32_memdc_select_bitmap(uint64_t hdc, uint64_t hbmp) {
+    int d = (int)(hdc & 0xFF);
+    if (d < 0 || d >= WIN32_MAX_MEMDC || !g_win32_memdc[d].in_use) return 0;
+    int old = g_win32_memdc[d].bmp;
+    if ((hbmp & WIN32_TAG_MASK) == WIN32_BITMAP_TAG)
+        g_win32_memdc[d].bmp = (int)(hbmp & 0xFF);
+    return (old >= 0) ? (long)(WIN32_BITMAP_TAG | (uint64_t)old) : 0;
+}
+
+/* DeleteObject(bitmap) routing target. */
+static void win32_bitmap_free(uint64_t hbmp) {
+    int b = (int)(hbmp & 0xFF);
+    if (b < 0 || b >= WIN32_MAX_BITMAPS || !g_win32_bmp[b].in_use) return;
+    if (g_win32_bmp[b].pixels) kfree(g_win32_bmp[b].pixels);
+    g_win32_bmp[b].pixels = 0; g_win32_bmp[b].in_use = false;
+}
+
+/* gdi32!DeleteDC(memdc) -> TRUE. */
+static long w32_DeleteDC(uint64_t *a) {
+    int d = (int)(a[0] & 0xFF);
+    if ((a[0] & WIN32_TAG_MASK) == WIN32_MEMDC_TAG &&
+        d >= 0 && d < WIN32_MAX_MEMDC)
+        g_win32_memdc[d].in_use = false;
+    return 1;
+}
+
+/* gdi32!BitBlt(hdcDest, x, y, w, h, hdcSrc, sx, sy, rop) -> TRUE. Copies a w*h
+ * sub-rect (origin sx,sy) of the source memory DC's selected bitmap onto the
+ * destination window at (x,y). dwRop is treated as SRCCOPY (a8=rop). */
+static long w32_BitBlt(uint64_t *a) {
+    int destfd = (int)a[0];
+    int x = (int)(int32_t)a[1], y = (int)(int32_t)a[2];
+    int w = (int)(int32_t)a[3], h = (int)(int32_t)a[4];
+    uint64_t hsrc = a[5];
+    int sx = (int)(int32_t)a[6], sy = (int)(int32_t)a[7];
+    struct window *win = win32_hdc_window(destfd);
+    if (!win || (hsrc & WIN32_TAG_MASK) != WIN32_MEMDC_TAG) return 0;
+    int d = (int)(hsrc & 0xFF);
+    if (d < 0 || d >= WIN32_MAX_MEMDC || !g_win32_memdc[d].in_use) return 0;
+    int b = g_win32_memdc[d].bmp;
+    if (b < 0 || b >= WIN32_MAX_BITMAPS || !g_win32_bmp[b].in_use) return 0;
+    if (w <= 0 || h <= 0) return 0;
+    int bw = g_win32_bmp[b].w, bh = g_win32_bmp[b].h;
+    /* Extract the (sx,sy,w,h) sub-rect into a contiguous temp buffer (the
+     * bitmap rows aren't contiguous for a sub-rect) then blit. */
+    uint32_t *tmp = (uint32_t *)kmalloc((size_t)w * h * 4u);
+    if (!tmp) return 0;
+    for (int r = 0; r < h; r++) {
+        for (int c = 0; c < w; c++) {
+            int srcx = sx + c, srcy = sy + r;
+            tmp[r * w + c] = (srcx >= 0 && srcx < bw && srcy >= 0 && srcy < bh)
+                             ? g_win32_bmp[b].pixels[srcy * bw + srcx] : 0;
+        }
+    }
+    (void)gui_window_blit(win, x, y, w, h, tmp);
+    kfree(tmp);
+    return 1;
+}
+
+/* ---- C12: BUTTON / EDIT controls (drawing, input routing, text) ----
+ * Controls are virtual children drawn into the parent's client backbuffer; the
+ * kernel draws + handles them, the app only gets WM_COMMAND notifications. */
+
+/* Draw all of a parent window's controls into its backbuffer (caller flips). */
+static void win32_draw_controls(int parent_fd) {
+    struct window *win = win32_hdc_window(parent_fd);
+    if (!win) return;
+    for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
+        struct win32_ctrl *c = &g_win32_gui.ctrl[i];
+        if (!c->in_use || c->parent_fd != parent_fd) continue;
+        if (c->type == WIN32_CTRL_BUTTON) {
+            (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00C8C8C8);          /* face */
+            (void)gui_window_rect(win, c->x, c->y, c->w, c->h, 0x00303030);          /* border */
+            (void)gui_window_rect(win, c->x + 1, c->y + 1, c->w - 2, c->h - 2, 0x00F4F4F4); /* hilite */
+            (void)gui_window_text(win, c->x + 10, c->y + (c->h - 8) / 2,
+                                  c->text, 0x00101010, 0x00C8C8C8);
+        } else {  /* EDIT: white box, dark/blue border when focused, left text */
+            (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00FFFFFF);
+            (void)gui_window_rect(win, c->x, c->y, c->w, c->h,
+                                  c->focus ? 0x002E8AE0 : 0x00808080);
+            (void)gui_window_text(win, c->x + 5, c->y + (c->h - 8) / 2,
+                                  c->text[0] ? c->text : " ", 0x00000000, 0x00FFFFFF);
+        }
+    }
+}
+/* Redraw a parent's controls + present (after a control changes). */
+static void win32_refresh_controls(int parent_fd) {
+    win32_draw_controls(parent_fd);
+    (void)sys_gui_flip(parent_fd);
+}
+/* Queue a WM_COMMAND for a parent window. */
+static void win32_cmd_push(int parent_fd, uint64_t wParam, uint64_t lParam) {
+    int next = (g_win32_gui.cmd_head + 1) % WIN32_CMDQ;
+    if (next == g_win32_gui.cmd_tail) return;   /* full -> drop */
+    g_win32_gui.cmd_q[g_win32_gui.cmd_head].hwnd    = (uint64_t)(uint32_t)parent_fd;
+    g_win32_gui.cmd_q[g_win32_gui.cmd_head].message = WM_COMMAND;
+    g_win32_gui.cmd_q[g_win32_gui.cmd_head].wParam  = wParam;
+    g_win32_gui.cmd_q[g_win32_gui.cmd_head].lParam  = lParam;
+    g_win32_gui.cmd_head = next;
+}
+
+/* Route a parent window's input event to a control if it targets one. Returns
+ * true if a control consumed it (the app should NOT see it). */
+static bool win32_route_control_input(int parent_fd, const struct gui_event *ev) {
+    bool has = false;
+    for (int i = 0; i < WIN32_MAX_CTRLS; i++)
+        if (g_win32_gui.ctrl[i].in_use && g_win32_gui.ctrl[i].parent_fd == parent_fd) has = true;
+    if (!has) return false;
+
+    if (ev->type == GUI_EV_MOUSE_DOWN) {
+        for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
+            struct win32_ctrl *c = &g_win32_gui.ctrl[i];
+            if (!c->in_use || c->parent_fd != parent_fd) continue;
+            if (ev->x < c->x || ev->x >= c->x + c->w ||
+                ev->y < c->y || ev->y >= c->y + c->h) continue;
+            if (c->type == WIN32_CTRL_BUTTON) {
+                win32_cmd_push(parent_fd,
+                               ((uint64_t)BN_CLICKED << 16) | (uint32_t)c->id,
+                               WIN32_CTRL_TAG | (uint64_t)i);
+                if (g_win32_log_input)
+                    kprintf("[winpe] control: BUTTON id=%d clicked -> WM_COMMAND\n", c->id);
+            } else {  /* focus this edit */
+                for (int j = 0; j < WIN32_MAX_CTRLS; j++)
+                    if (g_win32_gui.ctrl[j].in_use &&
+                        g_win32_gui.ctrl[j].parent_fd == parent_fd &&
+                        g_win32_gui.ctrl[j].type == WIN32_CTRL_EDIT)
+                        g_win32_gui.ctrl[j].focus = false;
+                c->focus = true;
+                win32_refresh_controls(parent_fd);
+            }
+            return true;
+        }
+        return false;   /* click missed all controls -> deliver to app */
+    }
+
+    if (ev->type == GUI_EV_KEY) {
+        for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
+            struct win32_ctrl *c = &g_win32_gui.ctrl[i];
+            if (!c->in_use || c->parent_fd != parent_fd ||
+                c->type != WIN32_CTRL_EDIT || !c->focus) continue;
+            int n = 0;
+            while (n < (int)sizeof(c->text) - 1 && c->text[n]) n++;
+            uint8_t k = ev->key;
+            if (k == '\b' || k == 0x7F) { if (n > 0) c->text[n - 1] = 0; }
+            else if (k >= 0x20 && k < 0x7F && n < (int)sizeof(c->text) - 1) {
+                c->text[n] = (char)k; c->text[n + 1] = 0;
+            } else return false;   /* non-text key -> deliver to app */
+            win32_refresh_controls(parent_fd);
+            if (g_win32_log_input)
+                kprintf("[winpe] control: EDIT id=%d text='%s'\n", c->id, c->text);
+            return true;
+        }
+        return false;   /* no focused edit -> deliver to app */
+    }
+    return false;
+}
+
+/* user32!GetWindowTextA(hwnd, buf, max) -> length copied (a control's text). */
+static long w32_GetWindowTextA(uint64_t *a) {
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    int max = (int)(int32_t)a[2];
+    if (max <= 0) return 0;
+    int n = 0;
+    if (c) { while (n < (int)sizeof(c->text) - 1 && c->text[n]) n++; }
+    if (n > max - 1) n = max - 1;
+    if (c && n) (void)copy_to_user((void *)(uintptr_t)a[1], c->text, n);
+    char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[1] + n), &z, 1);
+    return n;
+}
+/* user32!SetWindowTextA(hwnd, text) -> TRUE. Sets a control's text + redraws. */
+static long w32_SetWindowTextA(uint64_t *a) {
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    if (!c) return 0;
+    c->text[0] = 0;
+    if (a[1])
+        (void)strncpy_from_user(c->text, (const char *)(uintptr_t)a[1], sizeof(c->text));
+    win32_refresh_controls(c->parent_fd);
     return 1;
 }
 
@@ -5094,6 +5479,17 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "FindFirstFileA",      w32_FindFirstFileA },
     { "kernel32.dll", "FindNextFileA",       w32_FindNextFileA },
     { "kernel32.dll", "FindClose",           w32_FindClose },
+
+    /* ---- C12: bitmaps + BitBlt (gdi32) ---- */
+    { "gdi32.dll",  "CreateCompatibleDC",     w32_CreateCompatibleDC },
+    { "gdi32.dll",  "CreateBitmap",           w32_CreateBitmap },
+    { "gdi32.dll",  "CreateCompatibleBitmap", w32_CreateCompatibleBitmap },
+    { "gdi32.dll",  "BitBlt",                 w32_BitBlt },
+    { "gdi32.dll",  "DeleteDC",               w32_DeleteDC },
+
+    /* ---- C12: BUTTON/EDIT controls (user32) ---- */
+    { "user32.dll", "GetWindowTextA",         w32_GetWindowTextA },
+    { "user32.dll", "SetWindowTextA",         w32_SetWindowTextA },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

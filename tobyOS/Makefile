@@ -1368,6 +1368,19 @@ programs/win-gui11/win-gui11.exe: programs/win-gui11/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
 	      -o $@ $< -lgdi32 -luser32
 
+# Track C/C12: a STOCK Win32 GUI .exe that BitBlts an in-memory bitmap onto its
+# window (CreateCompatibleDC + CreateBitmap + SelectObject + BitBlt).
+programs/win-bmp12/win-bmp12.exe: programs/win-bmp12/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
+	      -o $@ $< -lgdi32 -luser32
+
+# Track C/C12: a STOCK Win32 GUI .exe using REAL system controls -- a BUTTON
+# (click -> WM_COMMAND) and an EDIT (typed text, GetWindowText) -- which tobyOS
+# draws + handles; the app never implements them.
+programs/win-ctrl12/win-ctrl12.exe: programs/win-ctrl12/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
+	      -o $@ $< -lgdi32 -luser32
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1661,6 +1674,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-gui10/win-gui10.exe \
                programs/win-c11file/win-c11file.exe \
                programs/win-gui11/win-gui11.exe \
+               programs/win-bmp12/win-bmp12.exe \
+               programs/win-ctrl12/win-ctrl12.exe \
                initrd/etc/motd initrd/readme.txt \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1722,6 +1737,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-gui10/win-gui10.exe               $(INITRD_STAGE)/bin/win-gui10.exe
 	cp programs/win-c11file/win-c11file.exe           $(INITRD_STAGE)/bin/win-c11file.exe
 	cp programs/win-gui11/win-gui11.exe               $(INITRD_STAGE)/bin/win-gui11.exe
+	cp programs/win-bmp12/win-bmp12.exe               $(INITRD_STAGE)/bin/win-bmp12.exe
+	cp programs/win-ctrl12/win-ctrl12.exe             $(INITRD_STAGE)/bin/win-ctrl12.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -1928,6 +1945,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-fileio.exe bin/win-thread.exe bin/win-gui.exe          \
 	    bin/win-gui8.exe bin/win-c9.exe bin/win-gui10.exe              \
 	    bin/win-c11file.exe bin/win-gui11.exe                          \
+	    bin/win-bmp12.exe bin/win-ctrl12.exe                           \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
