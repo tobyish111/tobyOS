@@ -119,7 +119,7 @@ struct pe_base_reloc { uint32_t page_rva, block_size; } __attribute__((packed));
  * usual PE ImageBase (0x140000000), so it can't collide with either. */
 #define WIN32_SHIM_BASE    0x0000000030000000ULL
 #define WIN32_THUNK_SIZE   10
-#define WIN32_GATE_IMM_OFF 0x51     /* offset of the syscall-number imm32 */
+#define WIN32_GATE_IMM_OFF 0x6e     /* offset of the syscall-number imm32 (C11: 10-arg gate) */
 
 /* The Thread Environment Block. A Windows CRT reads gs:[0x30]
  * (NtCurrentTeb) during startup, so a PE runs CPL3 with its GS base = this
@@ -134,44 +134,48 @@ struct pe_base_reloc { uint32_t page_rva, block_size; } __attribute__((packed));
 /* CRT data page (argc/argv/environ/_commode/_fmode): WIN32_CRT_DATA_BASE +
  * the layout offsets are in pe.h (shared with the shims in syscall.c). */
 
-/* Position-independent marshalling gate (C2). Verified by assembling the
- * equivalent .intel_syntax and extracting .text (see the commit notes).
- * On entry: rax = shim index, rcx/rdx/r8/r9 = Microsoft-x64 args 0..3, and
- * stack args 4.. at [rsp+0x28], [rsp+0x30], ... (after the return address +
- * the 32-byte shadow space). We marshal all 8 into a contiguous array so
- * variadic Win32 functions (printf -> __stdio_common_vfprintf, whose
- * va_list is the 5th/stack arg) work.
+/* Position-independent marshalling gate (C2, extended at C11 from 8 to 10 args).
+ * On entry: rax = shim index, rcx/rdx/r8/r9 = Microsoft-x64 args 0..3, and stack
+ * args 4.. at [rsp+0x28], [rsp+0x30], ... (after the return address + the 32-byte
+ * shadow space). We marshal a0..a9 into a contiguous array so variadic Win32
+ * functions (printf's va_list = the 5th/stack arg) AND >8-arg functions
+ * (CreateWindowExA's hWndParent = a8) work.
  *
  *   push rdi ; push rsi            ; preserve MS-x64 non-volatile regs
- *   sub  rsp, 0x40                 ; 8-qword argument array
+ *   sub  rsp, 0x50                 ; 10-qword argument array
  *   mov  [rsp+00], rcx             ; arg0..arg3 from registers
- *   mov  [rsp+08], rdx
- *   mov  [rsp+10], r8
- *   mov  [rsp+18], r9
- *   mov  r10, [rsp+0x78] ; mov [rsp+20], r10   ; arg4 (orig [rsp+0x28]+0x50)
- *   mov  r10, [rsp+0x80] ; mov [rsp+28], r10   ; arg5
- *   mov  r10, [rsp+0x88] ; mov [rsp+30], r10   ; arg6
- *   mov  r10, [rsp+0x90] ; mov [rsp+38], r10   ; arg7
+ *   mov  [rsp+08], rdx ; ...+10, r8 ; ...+18, r9
+ *   mov  r10, [rsp+0x88] ; mov [rsp+20], r10   ; arg4 (orig [rsp+0x28]+0x60)
+ *   ... a5 [rsp+0x90], a6 [rsp+0x98], a7 [rsp+0xA0], a8 [rsp+0xA8], a9 [rsp+0xB0]
  *   mov  rdi, rax                  ; syscall a1 = shim index
- *   mov  rsi, rsp                  ; syscall a2 = &args
- *   mov  eax, <ABI_SYS_WIN32_DISPATCH>
+ *   mov  rsi, rsp                  ; syscall a2 = &args (10 qwords)
+ *   mov  eax, <ABI_SYS_WIN32_DISPATCH>  ; imm32 at WIN32_GATE_IMM_OFF
  *   syscall
- *   add  rsp, 0x40 ; pop rsi ; pop rdi ; ret
+ *   add  rsp, 0x50 ; pop rsi ; pop rdi ; ret
  *
- * The a4..a7 reads come off the caller's stack; the PE's initial RSP is set
- * (in proc.c) to USER_STACK_TOP_VA-0x400 so these reads of up to +0x90 above
+ * The a4..a9 reads come off the caller's stack; the PE's initial RSP is set
+ * (in proc.c) to USER_STACK_TOP_VA-0x400 so these reads of up to +0xB0 above
  * the call site stay inside the mapped stack even for the first call. For a
- * function with <4 stack args the surplus slots read harmless garbage the
+ * function with fewer stack args the surplus slots read harmless garbage the
  * shim ignores. */
+/* C11: extended to marshal 10 args (a0..a9), so CreateWindowExA's hWndParent
+ * (its 9th arg = a8) reaches the shim -- needed for child/owned windows. Frame
+ * is `sub rsp,0x50` (10 qwords); a4..a9 read off the caller stack at
+ * [rsp+0x88..0xB0] (the orig [rsp+0x28..] + 0x60 push/sub shift). 123 bytes,
+ * still under the thread wrapper at 0x80. Assembled offline + verified by
+ * objdump; the syscall-number imm32 sits at WIN32_GATE_IMM_OFF (0x6e). */
 static const uint8_t g_win32_gate[] = {
-    0x57, 0x56, 0x48, 0x83, 0xec, 0x40, 0x48, 0x89, 0x0c, 0x24, 0x48, 0x89,
+    0x57, 0x56, 0x48, 0x83, 0xec, 0x50, 0x48, 0x89, 0x0c, 0x24, 0x48, 0x89,
     0x54, 0x24, 0x08, 0x4c, 0x89, 0x44, 0x24, 0x10, 0x4c, 0x89, 0x4c, 0x24,
-    0x18, 0x4c, 0x8b, 0x54, 0x24, 0x78, 0x4c, 0x89, 0x54, 0x24, 0x20, 0x4c,
-    0x8b, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x54, 0x24, 0x28,
-    0x4c, 0x8b, 0x94, 0x24, 0x88, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x54, 0x24,
-    0x30, 0x4c, 0x8b, 0x94, 0x24, 0x90, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x54,
-    0x24, 0x38, 0x48, 0x89, 0xc7, 0x48, 0x89, 0xe6, 0xb8, 0x00, 0x00, 0x00,
-    0x00, 0x0f, 0x05, 0x48, 0x83, 0xc4, 0x40, 0x5e, 0x5f, 0xc3
+    0x18, 0x4c, 0x8b, 0x94, 0x24, 0x88, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x54,
+    0x24, 0x20, 0x4c, 0x8b, 0x94, 0x24, 0x90, 0x00, 0x00, 0x00, 0x4c, 0x89,
+    0x54, 0x24, 0x28, 0x4c, 0x8b, 0x94, 0x24, 0x98, 0x00, 0x00, 0x00, 0x4c,
+    0x89, 0x54, 0x24, 0x30, 0x4c, 0x8b, 0x94, 0x24, 0xa0, 0x00, 0x00, 0x00,
+    0x4c, 0x89, 0x54, 0x24, 0x38, 0x4c, 0x8b, 0x94, 0x24, 0xa8, 0x00, 0x00,
+    0x00, 0x4c, 0x89, 0x54, 0x24, 0x40, 0x4c, 0x8b, 0x94, 0x24, 0xb0, 0x00,
+    0x00, 0x00, 0x4c, 0x89, 0x54, 0x24, 0x48, 0x48, 0x89, 0xc7, 0x48, 0x89,
+    0xe6, 0xb8, 0xef, 0xbe, 0xad, 0xde, 0x0f, 0x05, 0x48, 0x83, 0xc4, 0x50,
+    0x5e, 0x5f, 0xc3
 };
 #define WIN32_GATE_SIZE (sizeof(g_win32_gate))
 

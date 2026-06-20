@@ -4144,6 +4144,12 @@ struct win32_win {
     bool     needs_paint; /* a WM_PAINT is queued */
     bool     destroy;     /* DestroyWindow seen -> deliver WM_DESTROY then retire */
     uint32_t fill_color;  /* last FillRect colour (TextOut bg tracks it) */
+    /* C11 GDI device-context state (per window / HDC). */
+    int      cur_x, cur_y;/* current position for MoveToEx/LineTo */
+    uint32_t pen_color;   /* currently-selected pen colour (XRGB) */
+    /* C11 child/owned windows: the parent/owner HWND (fd), or 0 if top-level.
+     * Destroying the parent retires its children too. */
+    int      parent_fd;
 };
 
 static struct {
@@ -4225,8 +4231,19 @@ static void win32_stash_wndproc(const struct win32_win *w) {
 #define WIN32_BRUSH_TAG   0x7B00000000000000ull
 #define WIN32_BRUSH_MASK  0xFF00000000000000ull
 
+/* C11: a CreatePen handle is a tagged token carrying its COLORREF (high byte
+ * 0x7C, distinct from the brush 0x7B / thread 0x74 / module 0x7D / FILE* 0xF11E
+ * spaces). SelectObject reads it; LineTo/Rectangle/Ellipse draw with it. */
+#define WIN32_PEN_TAG     0x7C00000000000000ull
+
+/* WS_CHILD window style bit (C11): a window created with it (or with a non-NULL
+ * hWndParent) is a child/owned window. */
+#define WS_CHILD          0x40000000u
+
 /* The default window fill (C7's blue) used when no solid brush is supplied. */
 #define WIN32_FILL_DEFAULT 0x002E5C8Au
+/* Default pen colour (white) until CreatePen/SelectObject sets one. */
+#define WIN32_PEN_DEFAULT  0x00FFFFFFu
 
 /* The Win32 MSG struct as the loop sees it (and as the DispatchMessage
  * trampoline reads it: hwnd@0, message@8, wParam@0x10, lParam@0x18). */
@@ -4307,15 +4324,21 @@ static long w32_RegisterClassA(uint64_t *a) {
 
 /* CreateWindowExA(exStyle, class, name, style, x, y, W, H, parent, menu,
  *                 hInst, param) -> HWND (== the tobyOS window fd). class=a1,
- * name=a2, W=a6, H=a7 -- all within the gate's 8 marshalled args. Allocates a
- * window-table slot bound to its class's WndProc. */
+ * name=a2, style=a3, W=a6, H=a7, hWndParent=a8 (C11: reachable now the gate
+ * marshals 10 args). Allocates a window-table slot bound to its class's WndProc;
+ * a WS_CHILD style or a non-NULL parent records the parent/owner relationship. */
 static long w32_CreateWindowExA(uint64_t *a) {
     uint64_t cnameptr = a[1];
     uint64_t name     = a[2];
+    uint32_t style    = (uint32_t)a[3];
     int w = (int)(uint32_t)a[6];
     int h = (int)(uint32_t)a[7];
+    int parent_fd = (int)a[8];           /* hWndParent (== the parent's fd) */
     if (w <= 0 || w > 4096) w = 400;
     if (h <= 0 || h > 4096) h = 200;
+    /* Keep the parent link only if it references a live window of ours. */
+    if (!win32_win_find(parent_fd)) parent_fd = 0;
+    (void)style;   /* WS_CHILD is implied by a non-NULL parent here */
 
     win32_prune_dead_windows();
     g_win32_gui.quit = false;    /* creating a window -> not in a quit state */
@@ -4338,6 +4361,10 @@ static long w32_CreateWindowExA(uint64_t *a) {
     win->needs_paint = true;
     win->destroy     = false;
     win->fill_color  = WIN32_FILL_DEFAULT;
+    win->pen_color   = WIN32_PEN_DEFAULT;
+    win->cur_x       = 0;
+    win->cur_y       = 0;
+    win->parent_fd   = parent_fd;
     return fd;   /* HWND == HDC == fd */
 }
 
@@ -4433,11 +4460,15 @@ static long w32_GetMessageA(uint64_t *a) {
     }
 
     /* WM_DESTROY: deliver, then retire the window (close its desktop window +
-     * free the slot). */
+     * free the slot). C11: destroying a parent cascades to its children -- mark
+     * each child for destroy so it gets its own WM_DESTROY next. */
     for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
         struct win32_win *w = &g_win32_gui.win[i];
         if (w->fd > 0 && w->destroy) {
             int fd = w->fd;
+            for (int j = 0; j < WIN32_MAX_WINDOWS; j++)
+                if (g_win32_gui.win[j].fd > 0 && g_win32_gui.win[j].parent_fd == fd)
+                    g_win32_gui.win[j].destroy = true;   /* cascade to children */
             win32_stash_wndproc(w);
             m.hwnd = (uint64_t)fd; m.message = WM_DESTROY;
             if (g_win32_log_input)
@@ -4557,6 +4588,257 @@ static long w32_TextOutA(uint64_t *a) {
     uint32_t bg = win ? win->fill_color : WIN32_FILL_DEFAULT;
     (void)sys_gui_text(fd, xy, (const char *)(uintptr_t)str,
                        0x00FFFFFF /* white */, bg);
+    return 1;
+}
+
+/* ---- C11: more GDI (pens, lines, shapes) ----
+ * These map a GDI device context (HDC == HWND == fd) onto the window's drawing
+ * backend (gui_window_line/_rect/_circle_outline). A per-window "current pen"
+ * (set by SelectObject(CreatePen)) and "current position" (MoveToEx) give the
+ * stateful MoveToEx/LineTo pair its expected behaviour. */
+
+/* Resolve an HDC fd to the underlying compositor window (for the gui_window_*
+ * drawing calls), or NULL. */
+static struct window *win32_hdc_window(int fd) {
+    struct file *f = fd_lookup(fd);
+    return (f && f->kind == FILE_KIND_WINDOW) ? f->win : NULL;
+}
+
+/* gdi32!CreatePen(style, width, COLORREF) -> HPEN, a tagged token carrying the
+ * colour (line width is not honoured by the 1px backend). */
+static long w32_CreatePen(uint64_t *a) {
+    return (long)(WIN32_PEN_TAG | (uint64_t)((uint32_t)a[2] & 0xFFFFFFu));
+}
+
+/* gdi32!SelectObject(hdc, hgdiobj) -> the previously-selected object. A pen
+ * token sets the DC's current pen colour; the prior pen is returned (so the app
+ * can restore it). Non-pen objects (brushes etc.) are passed back unchanged. */
+static long w32_SelectObject(uint64_t *a) {
+    int fd = (int)a[0];
+    uint64_t obj = a[1];
+    struct win32_win *w = win32_win_find(fd);
+    if (w && (obj & WIN32_BRUSH_MASK) == WIN32_PEN_TAG) {
+        uint64_t old = WIN32_PEN_TAG |
+                       (uint64_t)win32_colorref_to_xrgb(w->pen_color);
+        w->pen_color = win32_colorref_to_xrgb((uint32_t)(obj & 0xFFFFFFu));
+        return (long)old;
+    }
+    return (long)obj;
+}
+
+/* gdi32!MoveToEx(hdc, x, y, &POINT|NULL) -> TRUE. Sets the current position;
+ * stores the previous point if a POINT is supplied. */
+static long w32_MoveToEx(uint64_t *a) {
+    int fd = (int)a[0];
+    struct win32_win *w = win32_win_find(fd);
+    if (!w) return 0;
+    uint64_t pold = a[3];
+    if (pold) {
+        int32_t op[2] = { w->cur_x, w->cur_y };
+        (void)copy_to_user((void *)(uintptr_t)pold, op, sizeof(op));
+    }
+    w->cur_x = (int)(int32_t)a[1];
+    w->cur_y = (int)(int32_t)a[2];
+    return 1;
+}
+
+/* gdi32!LineTo(hdc, x, y) -> TRUE. Draws from the current position to (x,y) with
+ * the current pen, then moves the current position there. */
+static long w32_LineTo(uint64_t *a) {
+    int fd = (int)a[0];
+    struct win32_win *w   = win32_win_find(fd);
+    struct window    *win = win32_hdc_window(fd);
+    if (!w || !win) return 0;
+    int x = (int)(int32_t)a[1], y = (int)(int32_t)a[2];
+    (void)gui_window_line(win, w->cur_x, w->cur_y, x, y, w->pen_color);
+    w->cur_x = x; w->cur_y = y;
+    return 1;
+}
+
+/* gdi32!Rectangle(hdc, l, t, r, b) -> TRUE. Outlines the rectangle in the
+ * current pen colour. */
+static long w32_Rectangle(uint64_t *a) {
+    int fd = (int)a[0];
+    struct win32_win *w   = win32_win_find(fd);
+    struct window    *win = win32_hdc_window(fd);
+    if (!w || !win) return 0;
+    int l = (int)(int32_t)a[1], t = (int)(int32_t)a[2];
+    int r = (int)(int32_t)a[3], b = (int)(int32_t)a[4];
+    (void)gui_window_rect(win, l, t, r - l, b - t, w->pen_color);
+    return 1;
+}
+
+/* gdi32!Ellipse(hdc, l, t, r, b) -> TRUE. Drawn as a circle inscribed in the
+ * bounding box (the backend draws circles, not true ellipses -- honest
+ * approximation when the box isn't square). */
+static long w32_Ellipse(uint64_t *a) {
+    int fd = (int)a[0];
+    struct win32_win *w   = win32_win_find(fd);
+    struct window    *win = win32_hdc_window(fd);
+    if (!w || !win) return 0;
+    int l = (int)(int32_t)a[1], t = (int)(int32_t)a[2];
+    int r = (int)(int32_t)a[3], b = (int)(int32_t)a[4];
+    int cx = (l + r) / 2, cy = (t + b) / 2;
+    int rad = ((r - l) + (b - t)) / 4;          /* mean of the half-extents */
+    if (rad < 1) rad = 1;
+    (void)gui_window_circle_outline(win, cx, cy, rad, w->pen_color);
+    return 1;
+}
+
+/* gdi32!SetPixel(hdc, x, y, COLORREF) -> the colour set (or -1 on bad hdc). */
+static long w32_SetPixel(uint64_t *a) {
+    int fd = (int)a[0];
+    if (!win32_win_find(fd)) return -1;
+    int x = (int)(int32_t)a[1], y = (int)(int32_t)a[2];
+    uint32_t cr = (uint32_t)a[3];
+    uint32_t whlen = 1u | (1u << 16);           /* 1x1 */
+    (void)sys_gui_fill(fd, x, y, whlen, win32_colorref_to_xrgb(cr & 0xFFFFFFu));
+    return (long)(cr & 0xFFFFFFu);
+}
+
+/* ---- C11: more file ops (seek, size, delete, mkdir, attrs, dir enum) ----
+ * Built on the C5 base (HANDLE == fd, a "X:" drive -> the writable /data mount).
+ * Path-taking ops translate the Windows path; some stage it into the CRT scratch
+ * for the user-pointer syscalls, others call the kernel-side VFS directly. */
+
+/* Translate a Windows path into an absolute tobyOS kernel path: a drive letter
+ * "X:" -> the writable /data mount, '\' -> '/'. Returns the length, or -1. */
+static int win32_translate_path_k(const char *wpath_user, char *kp, int cap) {
+    char wpath[ABI_PATH_MAX];
+    if (strncpy_from_user(wpath, wpath_user, sizeof(wpath)) < 0) return -1;
+    wpath[sizeof(wpath) - 1] = '\0';
+    int si = 0, di = 0;
+    if (wpath[0] && wpath[1] == ':') {
+        for (const char *r = "/data"; *r && di < cap - 1; r++) kp[di++] = *r;
+        si = 2;
+        if (wpath[si] != '\\' && wpath[si] != '/' && di < cap - 1) kp[di++] = '/';
+    }
+    for (; wpath[si] && di < cap - 1; si++)
+        kp[di++] = (wpath[si] == '\\') ? '/' : wpath[si];
+    kp[di] = '\0';
+    return di;
+}
+
+/* Translate + stage a Windows path into the CRT-page scratch; returns a USER
+ * pointer to it (for sys_open/unlink/mkdir, which expect a user path), or 0. */
+static uint64_t win32_stage_path(const char *wpath_user) {
+    char kp[ABI_PATH_MAX];
+    int di = win32_translate_path_k(wpath_user, kp, sizeof(kp));
+    if (di < 0) return 0;
+    uint64_t ubuf = WIN32_CRT_DATA_BASE + WIN32_CRT_PATHBUF;
+    if (copy_to_user((void *)(uintptr_t)ubuf, kp, (size_t)di + 1) != 0) return 0;
+    return ubuf;
+}
+
+/* kernel32!SetFilePointer(hFile, lDist, &lDistHigh|NULL, dwMoveMethod) -> new
+ * low-32 file position (FILE_BEGIN/CURRENT/END = 0/1/2 == SEEK_SET/CUR/END). */
+static long w32_SetFilePointer(uint64_t *a) {
+    int fd = (int)a[0];
+    int64_t  dist   = (int64_t)(int32_t)a[1];     /* low 32, signed */
+    uint32_t method = (uint32_t)a[3];
+    int whence = (method <= 2) ? (int)method : ABI_SEEK_SET;
+    long pos = sys_lseek(fd, dist, whence);
+    if (pos < 0) return (long)0xFFFFFFFFu;         /* INVALID_SET_FILE_POINTER */
+    return (long)(uint32_t)pos;
+}
+
+/* kernel32!GetFileSize(hFile, &lpFileSizeHigh|NULL) -> low-32 size. */
+static long w32_GetFileSize(uint64_t *a) {
+    struct file *f = fd_lookup((int)a[0]);
+    if (!f || f->kind != FILE_KIND_VFS) return (long)0xFFFFFFFFu; /* INVALID_FILE_SIZE */
+    uint64_t sz = f->vfs.size;
+    if (a[1]) { uint32_t hi = (uint32_t)(sz >> 32);
+                (void)copy_to_user((void *)(uintptr_t)a[1], &hi, 4); }
+    return (long)(uint32_t)sz;
+}
+
+/* kernel32!DeleteFileA(path) -> TRUE on success. */
+static long w32_DeleteFileA(uint64_t *a) {
+    uint64_t up = win32_stage_path((const char *)(uintptr_t)a[0]);
+    return (up && sys_unlink((const char *)(uintptr_t)up) == 0) ? 1 : 0;
+}
+
+/* kernel32!CreateDirectoryA(path, &SECURITY_ATTRIBUTES|NULL) -> TRUE. */
+static long w32_CreateDirectoryA(uint64_t *a) {
+    uint64_t up = win32_stage_path((const char *)(uintptr_t)a[0]);
+    return (up && sys_mkdir((const char *)(uintptr_t)up, 0755) == 0) ? 1 : 0;
+}
+
+/* kernel32!GetFileAttributesA(path) -> FILE_ATTRIBUTE_* or INVALID(0xFFFFFFFF).
+ * Uses the kernel-side VFS stat directly (no user marshalling needed). */
+static long w32_GetFileAttributesA(uint64_t *a) {
+    char kp[ABI_PATH_MAX];
+    if (win32_translate_path_k((const char *)(uintptr_t)a[0], kp, sizeof(kp)) < 0)
+        return (long)0xFFFFFFFFu;
+    struct vfs_stat vs;
+    if (vfs_stat(kp, &vs) != VFS_OK) return (long)0xFFFFFFFFu; /* INVALID_FILE_ATTRIBUTES */
+    return (vs.type == VFS_TYPE_DIR) ? 0x10 /* DIRECTORY */ : 0x80 /* NORMAL */;
+}
+
+/* ---- FindFirstFile/FindNextFile/FindClose: directory enumeration ----
+ * A find HANDLE is a tagged token (high byte 0x7E) carrying a slot in a small
+ * table of open VFS directory cursors. */
+#define WIN32_FIND_TAG    0x7E00000000000000ull
+#define WIN32_MAX_FINDS   4
+static struct { bool in_use; struct vfs_dir dir; } g_win32_find[WIN32_MAX_FINDS];
+
+/* Fill a WIN32_FIND_DATAA at user `out` from a VFS directory entry (we set only
+ * the fields apps commonly read: attributes, low size, cFileName@0x2C). */
+static void win32_fill_find_data(uint64_t out, const struct vfs_dirent *e) {
+    uint8_t b[0x140];
+    memset(b, 0, sizeof(b));
+    uint32_t attr = (e->type == VFS_TYPE_DIR) ? 0x10u : 0x80u;
+    memcpy(&b[0x00], &attr, 4);                  /* dwFileAttributes */
+    uint32_t lo = (uint32_t)e->size;
+    memcpy(&b[0x20], &lo, 4);                     /* nFileSizeLow */
+    int n = 0;
+    for (; e->name[n] && n < 259; n++) b[0x2C + n] = (uint8_t)e->name[n];
+    b[0x2C + n] = 0;                              /* cFileName[MAX_PATH] @0x2C */
+    (void)copy_to_user((void *)(uintptr_t)out, b, 0x2C + 260);
+}
+
+/* kernel32!FindFirstFileA(pattern, &WIN32_FIND_DATAA) -> find HANDLE or INVALID.
+ * The trailing wildcard is stripped to yield the directory to enumerate. */
+static long w32_FindFirstFileA(uint64_t *a) {
+    char kp[ABI_PATH_MAX];
+    int di = win32_translate_path_k((const char *)(uintptr_t)a[0], kp, sizeof(kp));
+    if (di < 0) return (long)WIN32_INVALID_HANDLE;
+    int cut = 0;                                 /* strip "/<wildcard>" -> dir */
+    for (int i = di - 1; i >= 0; i--) if (kp[i] == '/') { cut = i; break; }
+    kp[cut ? cut : 1] = '\0';
+    int slot = -1;
+    for (int i = 0; i < WIN32_MAX_FINDS; i++) if (!g_win32_find[i].in_use) { slot = i; break; }
+    if (slot < 0) return (long)WIN32_INVALID_HANDLE;
+    if (vfs_opendir(kp, &g_win32_find[slot].dir) != VFS_OK) return (long)WIN32_INVALID_HANDLE;
+    struct vfs_dirent e;
+    if (vfs_readdir(&g_win32_find[slot].dir, &e) != VFS_OK) {
+        vfs_closedir(&g_win32_find[slot].dir);
+        return (long)WIN32_INVALID_HANDLE;
+    }
+    g_win32_find[slot].in_use = true;
+    win32_fill_find_data(a[1], &e);
+    return (long)(WIN32_FIND_TAG | (uint64_t)slot);
+}
+
+/* kernel32!FindNextFileA(hFind, &WIN32_FIND_DATAA) -> TRUE, FALSE at end. */
+static long w32_FindNextFileA(uint64_t *a) {
+    if ((a[0] & WIN32_BRUSH_MASK) != WIN32_FIND_TAG) return 0;
+    int slot = (int)(a[0] & 0xFF);
+    if (slot < 0 || slot >= WIN32_MAX_FINDS || !g_win32_find[slot].in_use) return 0;
+    struct vfs_dirent e;
+    if (vfs_readdir(&g_win32_find[slot].dir, &e) != VFS_OK) return 0;
+    win32_fill_find_data(a[1], &e);
+    return 1;
+}
+
+/* kernel32!FindClose(hFind) -> TRUE. */
+static long w32_FindClose(uint64_t *a) {
+    if ((a[0] & WIN32_BRUSH_MASK) != WIN32_FIND_TAG) return 0;
+    int slot = (int)(a[0] & 0xFF);
+    if (slot >= 0 && slot < WIN32_MAX_FINDS && g_win32_find[slot].in_use) {
+        vfs_closedir(&g_win32_find[slot].dir);
+        g_win32_find[slot].in_use = false;
+    }
     return 1;
 }
 
@@ -4793,6 +5075,25 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "LoadLibraryA",        w32_LoadLibraryA },
     { "kernel32.dll", "FreeLibrary",         w32_FreeLibrary },
     { "kernel32.dll", "GetCurrentProcessId", w32_GetCurrentProcessId },
+
+    /* ---- C11: more GDI (gdi32) ---- */
+    { "gdi32.dll",  "CreatePen",      w32_CreatePen },
+    { "gdi32.dll",  "SelectObject",   w32_SelectObject },
+    { "gdi32.dll",  "MoveToEx",       w32_MoveToEx },
+    { "gdi32.dll",  "LineTo",         w32_LineTo },
+    { "gdi32.dll",  "Rectangle",      w32_Rectangle },
+    { "gdi32.dll",  "Ellipse",        w32_Ellipse },
+    { "gdi32.dll",  "SetPixel",       w32_SetPixel },
+
+    /* ---- C11: more file ops (kernel32) ---- */
+    { "kernel32.dll", "SetFilePointer",      w32_SetFilePointer },
+    { "kernel32.dll", "GetFileSize",         w32_GetFileSize },
+    { "kernel32.dll", "DeleteFileA",         w32_DeleteFileA },
+    { "kernel32.dll", "CreateDirectoryA",    w32_CreateDirectoryA },
+    { "kernel32.dll", "GetFileAttributesA",  w32_GetFileAttributesA },
+    { "kernel32.dll", "FindFirstFileA",      w32_FindFirstFileA },
+    { "kernel32.dll", "FindNextFileA",       w32_FindNextFileA },
+    { "kernel32.dll", "FindClose",           w32_FindClose },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
@@ -4841,7 +5142,7 @@ long win32_dispatch(uint64_t func_index, uint64_t args_ptr) {
         kprintf("[win32] bad shim index %lu\n", (unsigned long)func_index);
         return -1;
     }
-    uint64_t args[8];
+    uint64_t args[10];   /* C11: gate marshals a0..a9 (hWndParent = a8) */
     if (copy_from_user(args, (const void *)(uintptr_t)args_ptr, sizeof(args)) != 0) {
         kprintf("[win32] dispatch: bad args_ptr %p\n", (void *)(uintptr_t)args_ptr);
         return -1;

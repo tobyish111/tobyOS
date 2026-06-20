@@ -2346,7 +2346,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -4143,6 +4143,65 @@ void _start(void) {
             kprintf("[WINPE9] VERDICT: %s exit=%d (expected 9)\n",
                     rc == 9 ? "PASS" : "FAIL", rc);
         }
+    }
+#endif
+
+#ifdef WINPE11_BOOT
+    /* Track C -- more GDI + more file ops + child/owned windows, milestone C11.
+     * Build EXTRA_CFLAGS+=-DWINPE11_BOOT. Two proofs:
+     *   A) /bin/win-c11file.exe (console): SetFilePointer/GetFileSize/DeleteFile/
+     *      CreateDirectory/GetFileAttributes/FindFirstFile round-trip -> exit 11.
+     *   B) /bin/win-gui11.exe (GUI): a window drawing rich GDI (pen line +
+     *      Rectangle + Ellipse) plus a CHILD window owned by it; the app destroys
+     *      only the main window and tobyOS cascades the destroy to the child ->
+     *      exit 11. (The hWndParent it passes is its 9th arg, reachable now the
+     *      gate marshals 10 args.) Reuses C8's auto-login + desktop launch. */
+    {
+        /* Part A: file ops (console; no desktop needed). */
+        kprintf("[boot] WINPE11: spawning /bin/win-c11file.exe (file ops)\n");
+        int fpid = winpe_spawn_session_app("/bin/win-c11file.exe", "win-c11file.exe");
+        if (fpid < 0) {
+            kprintf("[WINPE11F] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int frc = proc_wait(fpid);
+            kprintf("[boot] WINPE11: /bin/win-c11file.exe (pid=%d) exit=%d\n", fpid, frc);
+            kprintf("[WINPE11F] VERDICT: %s exit=%d (expected 11)\n",
+                    frc == 11 ? "PASS" : "FAIL", frc);
+        }
+
+        /* Part B: GDI + child/owned window (GUI, on the logged-in desktop). */
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+        kprintf("[boot] WINPE11: spawning /bin/win-gui11.exe (GDI + child window)\n");
+        int wpid = winpe_spawn_session_app("/bin/win-gui11.exe", "win-gui11.exe");
+        if (wpid < 0) {
+            kprintf("[boot] WINPE11: spawn failed rc=%d MISSING\n", wpid);
+            kprintf("[WINPE11] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int n = 0;
+            for (int i = 0; i < 100 && n < 2; i++) {
+                winpe8_pump_ms(50);
+                n = win32_gui_window_count(wpid);
+            }
+            if (n < 2) {
+                kprintf("[boot] WINPE11: only %d window(s) appeared\n", n);
+                kprintf("[WINPE11] VERDICT: FAIL reason=nowindows\n");
+                signal_send_to_pid(wpid, SIGKILL);
+                (void)proc_wait(wpid);
+            } else {
+                kprintf("[boot] WINPE11: %d windows up (GDI main + child)\n", n);
+                kprintf("[WINPE11] GDI main + child window up; holding ~5s for screenshot\n");
+                /* Pump while the app holds (Sleep 4s) then self-destructs the
+                 * main window -> cascade to the child -> both exit. */
+                for (int i = 0; i < 160 && win32_gui_window_count(wpid) > 0; i++)
+                    winpe8_pump_ms(50);
+                int rc = proc_wait(wpid);
+                kprintf("[boot] WINPE11: /bin/win-gui11.exe (pid=%d) exit=%d\n", wpid, rc);
+                kprintf("[WINPE11] VERDICT: %s exit=%d (expected 11)\n",
+                        rc == 11 ? "PASS" : "FAIL", rc);
+            }
+        }
+        win32_gui_set_log(false);
     }
 #endif
 

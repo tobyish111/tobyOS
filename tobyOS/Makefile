@@ -1355,6 +1355,19 @@ programs/win-gui10/win-gui10.exe: programs/win-gui10/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
 	      -o $@ $< -lgdi32 -luser32
 
+# Track C/C11: a STOCK console .exe exercising the EXTENDED Win32 file API
+# (SetFilePointer/GetFileSize/DeleteFile/CreateDirectory/GetFileAttributes/
+# FindFirstFile) on the C5 base.
+programs/win-c11file/win-c11file.exe: programs/win-c11file/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
+
+# Track C/C11: a STOCK Win32 GUI .exe drawing richer GDI (pen line + Rectangle +
+# Ellipse) plus a CHILD window owned by the main window. Proves more GDI + the
+# 10-arg gate (hWndParent) + parent->child destroy cascade.
+programs/win-gui11/win-gui11.exe: programs/win-gui11/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
+	      -o $@ $< -lgdi32 -luser32
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1646,6 +1659,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-gui8/win-gui8.exe \
                programs/win-c9/win-c9.exe \
                programs/win-gui10/win-gui10.exe \
+               programs/win-c11file/win-c11file.exe \
+               programs/win-gui11/win-gui11.exe \
                initrd/etc/motd initrd/readme.txt \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1705,6 +1720,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-gui8/win-gui8.exe                 $(INITRD_STAGE)/bin/win-gui8.exe
 	cp programs/win-c9/win-c9.exe                     $(INITRD_STAGE)/bin/win-c9.exe
 	cp programs/win-gui10/win-gui10.exe               $(INITRD_STAGE)/bin/win-gui10.exe
+	cp programs/win-c11file/win-c11file.exe           $(INITRD_STAGE)/bin/win-c11file.exe
+	cp programs/win-gui11/win-gui11.exe               $(INITRD_STAGE)/bin/win-gui11.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -1910,6 +1927,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
 	    bin/win-fileio.exe bin/win-thread.exe bin/win-gui.exe          \
 	    bin/win-gui8.exe bin/win-c9.exe bin/win-gui10.exe              \
+	    bin/win-c11file.exe bin/win-gui11.exe                          \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
