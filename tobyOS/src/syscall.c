@@ -4145,24 +4145,35 @@ static long w32_LeaveCriticalSection(uint64_t *a) {
 #define WIN32_BITMAP_TAG  0x6200000000000000ull   /* HBITMAP -> g_win32_bmp slot  */
 #define WIN32_MEMDC_TAG   0x6300000000000000ull   /* memory HDC -> g_win32_memdc  */
 #define WIN32_CTRL_TAG    0x6400000000000000ull   /* control HWND -> g_win32_ctrl */
+#define WIN32_FONT_TAG    0x6500000000000000ull   /* HFONT, carries a bitmap scale (C13) */
 #define WIN32_TAG_MASK    0xFF00000000000000ull
-/* C12 control kinds. */
-#define WIN32_CTRL_BUTTON 1
-#define WIN32_CTRL_EDIT   2
+/* Control kinds (C12 BUTTON/EDIT; C13 STATIC/CHECKBOX/LISTBOX/SCROLLBAR). */
+#define WIN32_CTRL_BUTTON    1
+#define WIN32_CTRL_EDIT      2
+#define WIN32_CTRL_STATIC    3
+#define WIN32_CTRL_CHECKBOX  4
+#define WIN32_CTRL_LISTBOX   5
+#define WIN32_CTRL_SCROLLBAR 6
+#define WIN32_LB_MAX_ITEMS   8
+#define WIN32_LB_ITEM_LEN    24
 
-/* C12: a control (BUTTON/EDIT) is a VIRTUAL child rendered INTO its parent
- * window's client area (the compositor is top-level-only -- no nested windows),
- * with input routed from the parent. The kernel draws it and handles its input;
- * the app only sees WM_COMMAND notifications. */
+/* A control (BUTTON/EDIT/STATIC/CHECKBOX/LISTBOX/SCROLLBAR) is a VIRTUAL child
+ * rendered INTO its parent window's client area (the compositor is top-level-
+ * only -- no nested windows), with input routed from the parent. The kernel
+ * draws it and handles its input; the app sees only WM_COMMAND/WM_VSCROLL. */
 struct win32_ctrl {
     bool     in_use;
     int      parent_fd;          /* the owning top-level window (fd) */
-    int      type;               /* WIN32_CTRL_BUTTON / WIN32_CTRL_EDIT */
+    int      type;               /* WIN32_CTRL_* */
     int      x, y, w, h;         /* rect within the parent's client area */
     int      id;                 /* control id (CreateWindowEx hMenu) */
     bool     focus;              /* EDIT: has keyboard focus */
+    bool     checked;            /* CHECKBOX state (C13) */
+    int      sb_min, sb_max, sb_pos;  /* SCROLLBAR range/pos (C13) */
     char     text[WIN32_CTRL_TEXT];
 };
+/* C13 LISTBOX item store, indexed by control slot. */
+struct win32_lb { char items[WIN32_LB_MAX_ITEMS][WIN32_LB_ITEM_LEN]; int n, sel; };
 
 struct win32_win {
     int      fd;          /* sys_gui_create fd == HWND == HDC; 0 = free slot */
@@ -4177,6 +4188,10 @@ struct win32_win {
     /* C11 child/owned windows: the parent/owner HWND (fd), or 0 if top-level.
      * Destroying the parent retires its children too. */
     int      parent_fd;
+    /* C13 GDI text state (per window / HDC). */
+    int      font_scale;  /* bitmap-font scale from SelectObject(CreateFont) */
+    uint32_t text_color;  /* SetTextColor (XRGB); default white */
+    int      bk_mode;     /* OPAQUE(2, default) / TRANSPARENT(1) */
 };
 
 static struct {
@@ -4193,6 +4208,11 @@ static struct {
     struct { uint64_t hwnd; uint32_t message; uint64_t wParam, lParam; } cmd_q[WIN32_CMDQ];
     int  cmd_head, cmd_tail;
 } g_win32_gui;
+
+/* C13 LISTBOX item store, indexed by the control's slot. A separate static (not
+ * in g_win32_gui); a listbox clears its slot on creation, so cross-app reuse is
+ * safe. */
+static struct win32_lb g_win32_lb[WIN32_MAX_CTRLS];
 
 /* Window-table entry for an HWND/HDC fd, or NULL. */
 static struct win32_win *win32_win_find(int fd) {
@@ -4225,10 +4245,15 @@ static bool win32_streq_ci(const char *a, const char *b) {
         if (!ca) return true;
     }
 }
-/* C12: map a window class name to a control kind (0 if not a control class). */
+/* Map a window class name to a control kind (0 if not a control class). A
+ * "BUTTON" with a checkbox style is resolved to WIN32_CTRL_CHECKBOX by the
+ * caller (which has the dwStyle). */
 static int win32_ctrl_class(const char *cn) {
-    if (win32_streq_ci(cn, "BUTTON")) return WIN32_CTRL_BUTTON;
-    if (win32_streq_ci(cn, "EDIT"))   return WIN32_CTRL_EDIT;
+    if (win32_streq_ci(cn, "BUTTON"))     return WIN32_CTRL_BUTTON;
+    if (win32_streq_ci(cn, "EDIT"))       return WIN32_CTRL_EDIT;
+    if (win32_streq_ci(cn, "STATIC"))     return WIN32_CTRL_STATIC;
+    if (win32_streq_ci(cn, "LISTBOX"))    return WIN32_CTRL_LISTBOX;
+    if (win32_streq_ci(cn, "SCROLLBAR"))  return WIN32_CTRL_SCROLLBAR;
     return 0;
 }
 /* C12: resolve a control HWND token to its slot, or NULL. */
@@ -4242,6 +4267,10 @@ static struct win32_ctrl *win32_ctrl_find(uint64_t h) {
  * backend they call). */
 static void win32_draw_controls(int parent_fd);
 static bool win32_route_control_input(int parent_fd, const struct gui_event *ev);
+/* C13: MessageBoxA (font section) draws via these, defined further below. */
+static struct window *win32_hdc_window(int fd);
+extern uint64_t pit_ticks(void);
+extern uint32_t pit_hz(void);
 
 /* Retire window-table slots whose fd is no longer a live window in the CURRENT
  * process -- i.e. leftovers from a previous, now-exited GUI process. pids get
@@ -4301,10 +4330,31 @@ static void win32_stash_wndproc(const struct win32_win *w) {
  * hWndParent) is a child/owned window. */
 #define WS_CHILD          0x40000000u
 
-/* C12 messages a control synthesises to its parent. */
+/* C12/C13 control + scroll messages and notifications. */
 #define WM_SETTEXT        0x000C
+#define WM_VSCROLL        0x0115
 #define WM_COMMAND        0x0111
 #define BN_CLICKED        0
+#define LBN_SELCHANGE     1
+/* SendMessage control messages. */
+#define BM_GETCHECK       0x00F0
+#define BM_SETCHECK       0x00F1
+#define LB_ADDSTRING      0x0180
+#define LB_RESETCONTENT   0x0184
+#define LB_SETCURSEL      0x0186
+#define LB_GETCURSEL      0x0188
+#define LB_GETTEXT        0x0189
+#define LB_GETCOUNT       0x018B
+/* Scrollbar notification codes (wParam low word of WM_VSCROLL). */
+#define SB_LINEUP         0
+#define SB_LINEDOWN       1
+#define SB_PAGEUP         2
+#define SB_PAGEDOWN       3
+/* BUTTON styles (low nibble of dwStyle): a checkbox is BS_(AUTO)CHECKBOX. */
+#define BS_CHECKBOX       0x0002u
+#define BS_AUTOCHECKBOX   0x0003u
+/* MessageBox button-id results. */
+#define IDOK              1
 
 /* The default window fill (C7's blue) used when no solid brush is supplied. */
 #define WIN32_FILL_DEFAULT 0x002E5C8Au
@@ -4418,10 +4468,14 @@ static long w32_CreateWindowExA(uint64_t *a) {
     if (cnameptr)
         (void)strncpy_from_user(cname, (const char *)(uintptr_t)cnameptr, sizeof(cname));
 
-    /* C12: a predefined control class (BUTTON/EDIT) with a parent creates a
-     * VIRTUAL child rendered into the parent's client area, not a top-level
-     * window. Its HWND is a tagged token; its id is hMenu (a9). */
+    /* A predefined control class (BUTTON/EDIT/STATIC/CHECKBOX/LISTBOX/SCROLLBAR)
+     * with a parent creates a VIRTUAL child rendered into the parent's client
+     * area, not a top-level window. Its HWND is a tagged token; its id is hMenu
+     * (a9). A "BUTTON" with a checkbox style becomes a CHECKBOX. */
     int ctype = win32_ctrl_class(cname);
+    if (ctype == WIN32_CTRL_BUTTON &&
+        ((style & 0xFu) == BS_CHECKBOX || (style & 0xFu) == BS_AUTOCHECKBOX))
+        ctype = WIN32_CTRL_CHECKBOX;
     if (ctype && parent_fd) {
         for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
             if (g_win32_gui.ctrl[i].in_use) continue;
@@ -4441,6 +4495,11 @@ static long w32_CreateWindowExA(uint64_t *a) {
                         g_win32_gui.ctrl[j].type == WIN32_CTRL_EDIT &&
                         g_win32_gui.ctrl[j].focus) any = true;
                 if (!any) c->focus = true;
+            } else if (ctype == WIN32_CTRL_LISTBOX) {
+                memset(&g_win32_lb[i], 0, sizeof(g_win32_lb[i]));
+                g_win32_lb[i].sel = -1;
+            } else if (ctype == WIN32_CTRL_SCROLLBAR) {
+                c->sb_min = 0; c->sb_max = 100; c->sb_pos = 0;
             }
             struct win32_win *pw = win32_win_find(parent_fd);
             if (pw) pw->needs_paint = true;           /* redraw parent -> draw control */
@@ -4467,6 +4526,9 @@ static long w32_CreateWindowExA(uint64_t *a) {
     win->cur_x       = 0;
     win->cur_y       = 0;
     win->parent_fd   = parent_fd;
+    win->font_scale  = 1;
+    win->text_color  = 0x00FFFFFFu;   /* white */
+    win->bk_mode     = 2;             /* OPAQUE */
     return fd;   /* HWND == HDC == fd */
 }
 
@@ -4720,9 +4782,9 @@ static long w32_FillRect(uint64_t *a) {
     return 1;
 }
 
-/* gdi32!TextOutA(hdc, x, y, str, len) -> non-zero. Drawn white on the window's
- * current fill colour (tracked by FillRect) so the label stays legible after a
- * recolour. */
+/* gdi32!TextOutA(hdc, x, y, str, len) -> non-zero. Honours the DC's current text
+ * colour (SetTextColor) and font scale (SelectObject(CreateFont)); the background
+ * is the window's tracked fill colour. */
 static long w32_TextOutA(uint64_t *a) {
     int      fd  = (int)a[0];
     int      x   = (int)(int32_t)a[1];
@@ -4730,10 +4792,155 @@ static long w32_TextOutA(uint64_t *a) {
     uint64_t str = a[3];
     uint32_t xy  = ((uint32_t)(x & 0xFFFF)) | ((uint32_t)(y & 0xFFFF) << 16);
     struct win32_win *win = win32_win_find(fd);
-    uint32_t bg = win ? win->fill_color : WIN32_FILL_DEFAULT;
-    (void)sys_gui_text(fd, xy, (const char *)(uintptr_t)str,
-                       0x00FFFFFF /* white */, bg);
+    uint32_t fg    = win ? win->text_color : 0x00FFFFFFu;
+    uint32_t bg    = (win ? win->fill_color : WIN32_FILL_DEFAULT) & 0x00FFFFFFu;
+    int      scale = win ? win->font_scale : 1;
+    (void)sys_gui_text_scaled(fd, xy, (const char *)(uintptr_t)str, fg,
+                              bg | ((uint32_t)(scale & 0x7F) << 24));
     return 1;
+}
+
+/* ---- C13: GDI fonts + text metrics ----
+ * tobyOS has one 8x8 bitmap font, scalable by an integer factor; an HFONT is a
+ * tagged token carrying that scale = round(|height| / 8). */
+
+/* gdi32!CreateFontA(height, width, ...) -> HFONT. Only the height (a0) matters
+ * for our scalable bitmap font. */
+static long w32_CreateFontA(uint64_t *a) {
+    int hgt = (int)(int32_t)a[0]; if (hgt < 0) hgt = -hgt;
+    int scale = (hgt + 4) / 8; if (scale < 1) scale = 1; if (scale > 8) scale = 8;
+    return (long)(WIN32_FONT_TAG | (uint64_t)(uint32_t)scale);
+}
+/* gdi32!SetTextColor(hdc, COLORREF) -> previous colour (as COLORREF). */
+static long w32_SetTextColor(uint64_t *a) {
+    struct win32_win *w = win32_win_find((int)a[0]);
+    if (!w) return -1;
+    uint32_t old = w->text_color;
+    w->text_color = win32_colorref_to_xrgb((uint32_t)a[1] & 0xFFFFFFu);
+    return (long)win32_colorref_to_xrgb(old);
+}
+/* gdi32!SetBkColor(hdc, COLORREF) -> previous (the text background). */
+static long w32_SetBkColor(uint64_t *a) {
+    struct win32_win *w = win32_win_find((int)a[0]);
+    if (!w) return -1;
+    uint32_t old = w->fill_color;
+    w->fill_color = win32_colorref_to_xrgb((uint32_t)a[1] & 0xFFFFFFu);
+    return (long)win32_colorref_to_xrgb(old);
+}
+/* gdi32!SetBkMode(hdc, mode) -> previous mode. */
+static long w32_SetBkMode(uint64_t *a) {
+    struct win32_win *w = win32_win_find((int)a[0]);
+    if (!w) return 0;
+    int old = w->bk_mode; w->bk_mode = (int)a[1]; return old;
+}
+/* gdi32!GetTextExtentPoint32A(hdc, str, len, &SIZE{cx,cy}) -> TRUE. */
+static long w32_GetTextExtentPoint32A(uint64_t *a) {
+    struct win32_win *w = win32_win_find((int)a[0]);
+    int scale = w ? w->font_scale : 1;
+    int len = (int)(int32_t)a[2];
+    if (len < 0) len = 0;
+    int32_t sz[2] = { len * 8 * scale, 8 * scale };   /* cx, cy */
+    (void)copy_to_user((void *)(uintptr_t)a[3], sz, sizeof(sz));
+    return 1;
+}
+/* gdi32!GetTextMetricsA(hdc, &TEXTMETRICA) -> TRUE (fills the common fields). */
+static long w32_GetTextMetricsA(uint64_t *a) {
+    struct win32_win *w = win32_win_find((int)a[0]);
+    int scale = w ? w->font_scale : 1;
+    int32_t tm[8];
+    memset(tm, 0, sizeof(tm));
+    tm[0] = 8 * scale;       /* tmHeight        */
+    tm[1] = 7 * scale;       /* tmAscent        */
+    tm[2] = 1 * scale;       /* tmDescent       */
+    tm[5] = 8 * scale;       /* tmAveCharWidth  (@0x14) */
+    tm[6] = 8 * scale;       /* tmMaxCharWidth  (@0x18) */
+    (void)copy_to_user((void *)(uintptr_t)a[1], tm, sizeof(tm));
+    return 1;
+}
+/* user32!DrawTextA(hdc, str, len, &RECT, format) -> text height. Honours
+ * DT_CENTER(0x1)/DT_VCENTER(0x4) within the rect; defaults to top-left. */
+static long w32_DrawTextA(uint64_t *a) {
+    int fd = (int)a[0];
+    struct win32_win *w = win32_win_find(fd);
+    if (!w) return 0;
+    char s[128];
+    long n = strncpy_from_user(s, (const char *)(uintptr_t)a[1], sizeof(s));
+    if (n < 0) return 0;
+    int32_t rc[4] = { 0, 0, 0, 0 };
+    if (copy_from_user(rc, (const void *)(uintptr_t)a[3], sizeof(rc)) != 0) return 0;
+    uint32_t fmt = (uint32_t)a[4];
+    int scale = w->font_scale;
+    int tw = (int)n * 8 * scale, th = 8 * scale;
+    int x = rc[0], y = rc[1];
+    if (fmt & 0x1u) x = rc[0] + ((rc[2] - rc[0]) - tw) / 2;   /* DT_CENTER  */
+    if (fmt & 0x4u) y = rc[1] + ((rc[3] - rc[1]) - th) / 2;   /* DT_VCENTER */
+    uint32_t xy = ((uint32_t)(x & 0xFFFF)) | ((uint32_t)(y & 0xFFFF) << 16);
+    (void)sys_gui_text_scaled(fd, xy, (const char *)(uintptr_t)a[1], w->text_color,
+                              (w->fill_color & 0xFFFFFFu) | ((uint32_t)(scale & 0x7F) << 24));
+    return th;
+}
+
+/* user32!MessageBoxA(hWnd, lpText, lpCaption, uType) -> IDOK. A REAL MODAL
+ * dialog: it creates its own window with the text + an OK button, draws it, and
+ * BLOCKS (a kernel poll loop, sched_yield-ing so the rest of the system runs)
+ * until OK is clicked / Enter / the box is closed -- then tears the box down and
+ * returns. (We model every box as MB_OK -> IDOK.) */
+static long w32_MessageBoxA(uint64_t *a) {
+    char text[128], cap[40];
+    text[0] = cap[0] = 0;
+    if (a[1]) (void)strncpy_from_user(text, (const char *)(uintptr_t)a[1], sizeof(text));
+    if (a[2]) (void)strncpy_from_user(cap,  (const char *)(uintptr_t)a[2], sizeof(cap));
+
+    const int W = 320, H = 140;
+    /* NB: sys_gui_create marshals its title from USER space; ours is a kernel
+     * string, so create the window directly with the kernel-side backend. */
+    int fd = -1;
+    if (cap_check(current_proc(), CAP_GUI, "MessageBox")) {
+        struct window *bw = gui_window_create(W, H, cap[0] ? cap : "Message");
+        if (bw) {
+            struct file *bf = (struct file *)kmalloc(sizeof(*bf));
+            if (bf) {
+                memset(bf, 0, sizeof(*bf));
+                bf->kind = FILE_KIND_WINDOW; bf->win = bw;
+                fd = fd_alloc_into(current_proc(), bf);
+                if (fd < 0) { kfree(bf); gui_window_close(bw); }
+            } else gui_window_close(bw);
+        }
+    }
+    if (fd < 0) return IDOK;
+    struct window *win = win32_hdc_window((int)fd);
+    int okx = W / 2 - 40, oky = H - 46, okw = 80, okh = 28;
+    if (win) {
+        (void)gui_window_fill(win, 0, 0, W, H, 0x00DCDCDC);
+        (void)gui_window_text(win, 16, 26, text, 0x00101010, 0x00DCDCDC);
+        (void)gui_window_fill(win, okx, oky, okw, okh, 0x00C0C0C0);
+        (void)gui_window_rect(win, okx, oky, okw, okh, 0x00303030);
+        (void)gui_window_rect(win, okx + 1, oky + 1, okw - 2, okh - 2, 0x00F0F0F0);
+        (void)gui_window_text(win, okx + okw / 2 - 8, oky + okh / 2 - 4, "OK", 0x00101010, 0x00C0C0C0);
+    }
+    (void)sys_gui_flip((int)fd);
+    if (g_win32_log_input) kprintf("[winpe] MessageBox: '%s' (modal) -- waiting for OK\n", text);
+
+    /* Modal wait: bounded so a missing click can never hang the process. */
+    uint64_t hz = pit_hz(); if (!hz) hz = 100;
+    uint64_t deadline = pit_ticks() + 20 * hz;     /* ~20s safety cap */
+    long result = 0;
+    while (pit_ticks() < deadline) {
+        struct gui_event ev;
+        if (win32_poll_window_event((int)fd, &ev) > 0) {
+            if (ev.type == GUI_EV_CLOSE) { result = IDOK; break; }
+            if (ev.type == GUI_EV_MOUSE_DOWN &&
+                ev.x >= okx && ev.x < okx + okw && ev.y >= oky && ev.y < oky + okh) {
+                result = IDOK; break;
+            }
+            if (ev.type == GUI_EV_KEY &&
+                (ev.key == '\n' || ev.key == '\r' || ev.key == ' ')) { result = IDOK; break; }
+        }
+        sched_yield();
+    }
+    (void)sys_close((int)fd);            /* tear the box down */
+    if (g_win32_log_input) kprintf("[winpe] MessageBox: closed -> IDOK\n");
+    return IDOK;
 }
 
 /* ---- C11: more GDI (pens, lines, shapes) ----
@@ -4772,6 +4979,12 @@ static long w32_SelectObject(uint64_t *a) {
         uint64_t old = WIN32_PEN_TAG |
                        (uint64_t)win32_colorref_to_xrgb(w->pen_color);
         w->pen_color = win32_colorref_to_xrgb((uint32_t)(obj & 0xFFFFFFu));
+        return (long)old;
+    }
+    if (w && (obj & WIN32_TAG_MASK) == WIN32_FONT_TAG) {   /* C13: select a font */
+        uint64_t old = WIN32_FONT_TAG | (uint64_t)(uint32_t)w->font_scale;
+        int s = (int)(obj & 0xFF); if (s < 1) s = 1; if (s > 8) s = 8;
+        w->font_scale = s;
         return (long)old;
     }
     return (long)obj;
@@ -5110,25 +5323,82 @@ static long w32_BitBlt(uint64_t *a) {
  * Controls are virtual children drawn into the parent's client backbuffer; the
  * kernel draws + handles them, the app only gets WM_COMMAND notifications. */
 
+/* Scrollbar geometry: square arrow buttons of side = width, clamped. */
+static int win32_sb_arrow(const struct win32_ctrl *c) {
+    int a = c->w; if (a > 18) a = 18; if (a > c->h / 2) a = c->h / 2; return a;
+}
+/* Thumb y for a vertical scrollbar at the current pos. */
+static int win32_sb_thumb_y(const struct win32_ctrl *c) {
+    int ah = win32_sb_arrow(c);
+    int track = c->h - 2 * ah - 16;           /* 16 = thumb height */
+    if (track < 0) track = 0;
+    int span = c->sb_max - c->sb_min; if (span <= 0) span = 1;
+    int p = c->sb_pos - c->sb_min; if (p < 0) p = 0; if (p > span) p = span;
+    return c->y + ah + (track * p) / span;
+}
+
 /* Draw all of a parent window's controls into its backbuffer (caller flips). */
 static void win32_draw_controls(int parent_fd) {
     struct window *win = win32_hdc_window(parent_fd);
     if (!win) return;
+    struct win32_win *pw = win32_win_find(parent_fd);
+    uint32_t pbg = pw ? pw->fill_color : WIN32_FILL_DEFAULT;
     for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
         struct win32_ctrl *c = &g_win32_gui.ctrl[i];
         if (!c->in_use || c->parent_fd != parent_fd) continue;
-        if (c->type == WIN32_CTRL_BUTTON) {
-            (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00C8C8C8);          /* face */
-            (void)gui_window_rect(win, c->x, c->y, c->w, c->h, 0x00303030);          /* border */
-            (void)gui_window_rect(win, c->x + 1, c->y + 1, c->w - 2, c->h - 2, 0x00F4F4F4); /* hilite */
-            (void)gui_window_text(win, c->x + 10, c->y + (c->h - 8) / 2,
-                                  c->text, 0x00101010, 0x00C8C8C8);
-        } else {  /* EDIT: white box, dark/blue border when focused, left text */
+        int ty = c->y + (c->h - 8) / 2;
+        switch (c->type) {
+        case WIN32_CTRL_BUTTON:
+            (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00C8C8C8);
+            (void)gui_window_rect(win, c->x, c->y, c->w, c->h, 0x00303030);
+            (void)gui_window_rect(win, c->x + 1, c->y + 1, c->w - 2, c->h - 2, 0x00F4F4F4);
+            (void)gui_window_text(win, c->x + 10, ty, c->text, 0x00101010, 0x00C8C8C8);
+            break;
+        case WIN32_CTRL_EDIT:
             (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00FFFFFF);
-            (void)gui_window_rect(win, c->x, c->y, c->w, c->h,
-                                  c->focus ? 0x002E8AE0 : 0x00808080);
-            (void)gui_window_text(win, c->x + 5, c->y + (c->h - 8) / 2,
-                                  c->text[0] ? c->text : " ", 0x00000000, 0x00FFFFFF);
+            (void)gui_window_rect(win, c->x, c->y, c->w, c->h, c->focus ? 0x002E8AE0 : 0x00808080);
+            (void)gui_window_text(win, c->x + 5, ty, c->text[0] ? c->text : " ", 0x00000000, 0x00FFFFFF);
+            break;
+        case WIN32_CTRL_STATIC:
+            (void)gui_window_text(win, c->x, ty, c->text, 0x00E8E8E8, pbg);
+            break;
+        case WIN32_CTRL_CHECKBOX: {
+            int bs = 13, by = c->y + (c->h - bs) / 2;
+            (void)gui_window_fill(win, c->x, by, bs, bs, 0x00FFFFFF);
+            (void)gui_window_rect(win, c->x, by, bs, bs, 0x00404040);
+            if (c->checked) {  /* a check mark (two strokes) */
+                (void)gui_window_line(win, c->x + 2, by + 6, c->x + 5, by + 9, 0x00208020);
+                (void)gui_window_line(win, c->x + 5, by + 9, c->x + 10, by + 2, 0x00208020);
+            }
+            (void)gui_window_text(win, c->x + bs + 6, ty, c->text, 0x00E8E8E8, pbg);
+            break;
+        }
+        case WIN32_CTRL_LISTBOX: {
+            (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00FFFFFF);
+            (void)gui_window_rect(win, c->x, c->y, c->w, c->h, 0x00808080);
+            struct win32_lb *lb = &g_win32_lb[i];
+            for (int r = 0; r < lb->n && r * 14 + 14 <= c->h; r++) {
+                int ry = c->y + 2 + r * 14;
+                uint32_t bg = (r == lb->sel) ? 0x002E8AE0 : 0x00FFFFFF;
+                uint32_t fg = (r == lb->sel) ? 0x00FFFFFF : 0x00101010;
+                (void)gui_window_fill(win, c->x + 1, ry, c->w - 2, 14, bg);
+                (void)gui_window_text(win, c->x + 5, ry + 3, lb->items[r], fg, bg);
+            }
+            break;
+        }
+        case WIN32_CTRL_SCROLLBAR: {
+            int ah = win32_sb_arrow(c);
+            (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00C8C8C8);       /* track */
+            (void)gui_window_rect(win, c->x, c->y, c->w, c->h, 0x00808080);
+            (void)gui_window_fill(win, c->x, c->y, c->w, ah, 0x00B0B0B0);          /* up arrow */
+            (void)gui_window_text(win, c->x + c->w / 2 - 3, c->y + ah / 2 - 4, "^", 0x00202020, 0x00B0B0B0);
+            (void)gui_window_fill(win, c->x, c->y + c->h - ah, c->w, ah, 0x00B0B0B0); /* down arrow */
+            (void)gui_window_text(win, c->x + c->w / 2 - 3, c->y + c->h - ah / 2 - 4, "v", 0x00202020, 0x00B0B0B0);
+            int thy = win32_sb_thumb_y(c);                                          /* thumb */
+            (void)gui_window_fill(win, c->x + 2, thy, c->w - 4, 16, 0x00707070);
+            (void)gui_window_rect(win, c->x + 2, thy, c->w - 4, 16, 0x00404040);
+            break;
+        }
         }
     }
 }
@@ -5137,12 +5407,12 @@ static void win32_refresh_controls(int parent_fd) {
     win32_draw_controls(parent_fd);
     (void)sys_gui_flip(parent_fd);
 }
-/* Queue a WM_COMMAND for a parent window. */
-static void win32_cmd_push(int parent_fd, uint64_t wParam, uint64_t lParam) {
+/* Queue a message (WM_COMMAND/WM_VSCROLL) for a parent window. */
+static void win32_msg_push(int parent_fd, uint32_t message, uint64_t wParam, uint64_t lParam) {
     int next = (g_win32_gui.cmd_head + 1) % WIN32_CMDQ;
     if (next == g_win32_gui.cmd_tail) return;   /* full -> drop */
     g_win32_gui.cmd_q[g_win32_gui.cmd_head].hwnd    = (uint64_t)(uint32_t)parent_fd;
-    g_win32_gui.cmd_q[g_win32_gui.cmd_head].message = WM_COMMAND;
+    g_win32_gui.cmd_q[g_win32_gui.cmd_head].message = message;
     g_win32_gui.cmd_q[g_win32_gui.cmd_head].wParam  = wParam;
     g_win32_gui.cmd_q[g_win32_gui.cmd_head].lParam  = lParam;
     g_win32_gui.cmd_head = next;
@@ -5162,20 +5432,62 @@ static bool win32_route_control_input(int parent_fd, const struct gui_event *ev)
             if (!c->in_use || c->parent_fd != parent_fd) continue;
             if (ev->x < c->x || ev->x >= c->x + c->w ||
                 ev->y < c->y || ev->y >= c->y + c->h) continue;
-            if (c->type == WIN32_CTRL_BUTTON) {
-                win32_cmd_push(parent_fd,
-                               ((uint64_t)BN_CLICKED << 16) | (uint32_t)c->id,
-                               WIN32_CTRL_TAG | (uint64_t)i);
+            uint64_t hctrl = WIN32_CTRL_TAG | (uint64_t)i;
+            switch (c->type) {
+            case WIN32_CTRL_BUTTON:
+                win32_msg_push(parent_fd, WM_COMMAND,
+                               ((uint64_t)BN_CLICKED << 16) | (uint32_t)c->id, hctrl);
                 if (g_win32_log_input)
                     kprintf("[winpe] control: BUTTON id=%d clicked -> WM_COMMAND\n", c->id);
-            } else {  /* focus this edit */
+                break;
+            case WIN32_CTRL_CHECKBOX:
+                c->checked = !c->checked;
+                win32_msg_push(parent_fd, WM_COMMAND,
+                               ((uint64_t)BN_CLICKED << 16) | (uint32_t)c->id, hctrl);
+                win32_refresh_controls(parent_fd);
+                if (g_win32_log_input)
+                    kprintf("[winpe] control: CHECKBOX id=%d -> checked=%d\n", c->id, (int)c->checked);
+                break;
+            case WIN32_CTRL_EDIT:
                 for (int j = 0; j < WIN32_MAX_CTRLS; j++)
-                    if (g_win32_gui.ctrl[j].in_use &&
-                        g_win32_gui.ctrl[j].parent_fd == parent_fd &&
+                    if (g_win32_gui.ctrl[j].in_use && g_win32_gui.ctrl[j].parent_fd == parent_fd &&
                         g_win32_gui.ctrl[j].type == WIN32_CTRL_EDIT)
                         g_win32_gui.ctrl[j].focus = false;
                 c->focus = true;
                 win32_refresh_controls(parent_fd);
+                break;
+            case WIN32_CTRL_LISTBOX: {
+                struct win32_lb *lb = &g_win32_lb[i];
+                int row = (ev->y - (c->y + 2)) / 14;
+                if (row >= 0 && row < lb->n) {
+                    lb->sel = row;
+                    win32_msg_push(parent_fd, WM_COMMAND,
+                                   ((uint64_t)LBN_SELCHANGE << 16) | (uint32_t)c->id, hctrl);
+                    win32_refresh_controls(parent_fd);
+                    if (g_win32_log_input)
+                        kprintf("[winpe] control: LISTBOX id=%d -> sel=%d ('%s')\n",
+                                c->id, row, lb->items[row]);
+                }
+                break;
+            }
+            case WIN32_CTRL_SCROLLBAR: {
+                int ah = win32_sb_arrow(c);
+                int code, delta;
+                if (ev->y < c->y + ah)              { code = SB_LINEUP;   delta = -1; }
+                else if (ev->y >= c->y + c->h - ah) { code = SB_LINEDOWN; delta = +1; }
+                else if (ev->y < win32_sb_thumb_y(c)) { code = SB_PAGEUP;   delta = -5; }
+                else                                { code = SB_PAGEDOWN; delta = +5; }
+                c->sb_pos += delta;
+                if (c->sb_pos < c->sb_min) c->sb_pos = c->sb_min;
+                if (c->sb_pos > c->sb_max) c->sb_pos = c->sb_max;
+                win32_msg_push(parent_fd, WM_VSCROLL,
+                               ((uint64_t)(uint32_t)c->sb_pos << 16) | (uint32_t)code, hctrl);
+                win32_refresh_controls(parent_fd);
+                if (g_win32_log_input)
+                    kprintf("[winpe] control: SCROLLBAR id=%d -> pos=%d -> WM_VSCROLL\n", c->id, c->sb_pos);
+                break;
+            }
+            default: break;
             }
             return true;
         }
@@ -5224,6 +5536,93 @@ static long w32_SetWindowTextA(uint64_t *a) {
     if (a[1])
         (void)strncpy_from_user(c->text, (const char *)(uintptr_t)a[1], sizeof(c->text));
     win32_refresh_controls(c->parent_fd);
+    return 1;
+}
+
+/* C13: a control's slot index (for the parallel listbox store). */
+static int win32_ctrl_slot(const struct win32_ctrl *c) {
+    return (int)(c - g_win32_gui.ctrl);
+}
+
+/* user32!SendMessageA(hwnd, msg, wParam, lParam) -> result. Handles the control
+ * messages used to drive BUTTON(checkbox)/EDIT/LISTBOX controls (the kernel IS
+ * the control's WndProc); non-control targets / unknown messages return 0. */
+static long w32_SendMessageA(uint64_t *a) {
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    if (!c) return 0;
+    uint32_t msg = (uint32_t)a[1];
+    uint64_t wp = a[2], lp = a[3];
+    int slot = win32_ctrl_slot(c);
+    struct win32_lb *lb = &g_win32_lb[slot];
+    switch (msg) {
+    case BM_GETCHECK:   return c->checked ? 1 : 0;
+    case BM_SETCHECK:   c->checked = (wp != 0); win32_refresh_controls(c->parent_fd); return 0;
+    case WM_SETTEXT:
+        c->text[0] = 0;
+        if (lp) (void)strncpy_from_user(c->text, (const char *)(uintptr_t)lp, sizeof(c->text));
+        win32_refresh_controls(c->parent_fd);
+        return 1;
+    case LB_ADDSTRING:
+        if (lb->n >= WIN32_LB_MAX_ITEMS) return -2 /* LB_ERR */;
+        lb->items[lb->n][0] = 0;
+        if (lp) (void)strncpy_from_user(lb->items[lb->n], (const char *)(uintptr_t)lp, WIN32_LB_ITEM_LEN);
+        lb->n++;
+        win32_refresh_controls(c->parent_fd);
+        return lb->n - 1;
+    case LB_RESETCONTENT: lb->n = 0; lb->sel = -1; win32_refresh_controls(c->parent_fd); return 0;
+    case LB_SETCURSEL:    lb->sel = (int)(int32_t)wp; win32_refresh_controls(c->parent_fd); return lb->sel;
+    case LB_GETCURSEL:    return lb->sel;
+    case LB_GETCOUNT:     return lb->n;
+    case LB_GETTEXT: {
+        int idx = (int)(int32_t)wp;
+        if (idx < 0 || idx >= lb->n) return -2;
+        int n = 0; while (n < WIN32_LB_ITEM_LEN - 1 && lb->items[idx][n]) n++;
+        if (lp) {
+            (void)copy_to_user((void *)(uintptr_t)lp, lb->items[idx], n);
+            char z = 0; (void)copy_to_user((void *)(uintptr_t)(lp + n), &z, 1);
+        }
+        return n;
+    }
+    default: return 0;
+    }
+}
+
+/* user32 scrollbar API on a SCROLLBAR control (and tolerated on windows). */
+static long w32_SetScrollRange(uint64_t *a) {       /* (hwnd, bar, min, max, redraw) */
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    if (!c || c->type != WIN32_CTRL_SCROLLBAR) return 0;
+    c->sb_min = (int)(int32_t)a[2]; c->sb_max = (int)(int32_t)a[3];
+    win32_refresh_controls(c->parent_fd); return 1;
+}
+static long w32_SetScrollPos(uint64_t *a) {         /* (hwnd, bar, pos, redraw) -> old */
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    if (!c || c->type != WIN32_CTRL_SCROLLBAR) return 0;
+    int old = c->sb_pos; c->sb_pos = (int)(int32_t)a[2];
+    if (c->sb_pos < c->sb_min) c->sb_pos = c->sb_min;
+    if (c->sb_pos > c->sb_max) c->sb_pos = c->sb_max;
+    win32_refresh_controls(c->parent_fd); return old;
+}
+static long w32_GetScrollPos(uint64_t *a) {         /* (hwnd, bar) -> pos */
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    return (c && c->type == WIN32_CTRL_SCROLLBAR) ? c->sb_pos : 0;
+}
+/* SetScrollInfo(hwnd, bar, &SCROLLINFO{cbSize,fMask,nMin@8,nMax@0xC,nPage@0x10,
+ * nPos@0x14,...}, redraw). */
+static long w32_SetScrollInfo(uint64_t *a) {
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    if (!c || c->type != WIN32_CTRL_SCROLLBAR) return 0;
+    int32_t v[4];   /* nMin, nMax, nPage, nPos at +8..+0x14 */
+    if (copy_from_user(v, (const void *)(uintptr_t)(a[2] + 8), sizeof(v)) == 0) {
+        c->sb_min = v[0]; c->sb_max = v[1]; c->sb_pos = v[3];
+        win32_refresh_controls(c->parent_fd);
+    }
+    return c->sb_max;
+}
+static long w32_GetScrollInfo(uint64_t *a) {
+    struct win32_ctrl *c = win32_ctrl_find(a[0]);
+    if (!c || c->type != WIN32_CTRL_SCROLLBAR) return 0;
+    int32_t v[4] = { c->sb_min, c->sb_max, 1, c->sb_pos };
+    (void)copy_to_user((void *)(uintptr_t)(a[2] + 8), v, sizeof(v));
     return 1;
 }
 
@@ -5490,6 +5889,23 @@ static const struct win32_shim g_win32_shims[] = {
     /* ---- C12: BUTTON/EDIT controls (user32) ---- */
     { "user32.dll", "GetWindowTextA",         w32_GetWindowTextA },
     { "user32.dll", "SetWindowTextA",         w32_SetWindowTextA },
+
+    /* ---- C13: more controls + dialogs (user32) ---- */
+    { "user32.dll", "SendMessageA",           w32_SendMessageA },
+    { "user32.dll", "DrawTextA",              w32_DrawTextA },
+    { "user32.dll", "MessageBoxA",            w32_MessageBoxA },
+    { "user32.dll", "SetScrollRange",         w32_SetScrollRange },
+    { "user32.dll", "SetScrollPos",           w32_SetScrollPos },
+    { "user32.dll", "GetScrollPos",           w32_GetScrollPos },
+    { "user32.dll", "SetScrollInfo",          w32_SetScrollInfo },
+    { "user32.dll", "GetScrollInfo",          w32_GetScrollInfo },
+    /* ---- C13: GDI fonts + text metrics (gdi32) ---- */
+    { "gdi32.dll",  "CreateFontA",            w32_CreateFontA },
+    { "gdi32.dll",  "SetTextColor",           w32_SetTextColor },
+    { "gdi32.dll",  "SetBkColor",             w32_SetBkColor },
+    { "gdi32.dll",  "SetBkMode",              w32_SetBkMode },
+    { "gdi32.dll",  "GetTextExtentPoint32A",  w32_GetTextExtentPoint32A },
+    { "gdi32.dll",  "GetTextMetricsA",        w32_GetTextMetricsA },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

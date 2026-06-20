@@ -2346,7 +2346,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -4264,6 +4264,77 @@ void _start(void) {
                 int rc = proc_wait(cpid);
                 kprintf("[boot] WINPE12: /bin/win-ctrl12.exe (pid=%d) exit=%d\n", cpid, rc);
                 kprintf("[WINPE12] VERDICT: %s exit=%d (expected 12)\n", rc == 12 ? "PASS" : "FAIL", rc);
+            }
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE13_BOOT
+    /* Track C -- STATIC/CHECKBOX/LISTBOX/SCROLLBAR controls + MessageBoxA modal
+     * dialog + GDI fonts/metrics, milestone C13. Build EXTRA_CFLAGS+=-DWINPE13_BOOT.
+     * Two GUI proofs (reusing C8's auto-login + desktop launch):
+     *   A) /bin/win-ctrl13.exe: the harness checks a CHECKBOX, selects a LISTBOX
+     *      item, nudges a SCROLLBAR, then clicks a button that pops a MessageBox
+     *      the harness OKs -> exit 13.
+     *   B) /bin/win-font13.exe: draws multi-size/colour text -> exit 13. */
+    {
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+
+        /* ---- Part A: controls + dialog ---- */
+        kprintf("[boot] WINPE13: spawning /bin/win-ctrl13.exe (controls + dialog)\n");
+        int cpid = winpe_spawn_session_app("/bin/win-ctrl13.exe", "win-ctrl13.exe");
+        if (cpid < 0) {
+            kprintf("[WINPE13] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 100 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(cpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE13] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(cpid, SIGKILL); (void)proc_wait(cpid);
+            } else {
+                winpe8_pump_ms(900);   /* controls drawn */
+                kprintf("[boot] WINPE13: check the CHECKBOX\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 32, 57, MOUSE_BTN_LEFT);   winpe8_pump_ms(300);
+                kprintf("[boot] WINPE13: select LISTBOX row 1 (Banana)\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 60, 103, MOUSE_BTN_LEFT);  winpe8_pump_ms(300);
+                kprintf("[boot] WINPE13: nudge the SCROLLBAR (down arrow x3)\n");
+                for (int i = 0; i < 3; i++) { gui_post_mouse(GUI_EV_MOUSE_DOWN, 209, 161, MOUSE_BTN_LEFT); winpe8_pump_ms(200); }
+                kprintf("[WINPE13] controls set (checkbox+listbox+scrollbar); holding ~4s for screenshot\n");
+                winpe8_pump_ms(4000);
+                /* Pop the modal dialog and screenshot it. */
+                kprintf("[boot] WINPE13: click 'Show dialog' button\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 89, 215, MOUSE_BTN_LEFT);  winpe8_pump_ms(700);
+                kprintf("[WINPE13] dialog (MessageBox) up; holding ~4s for screenshot\n");
+                winpe8_pump_ms(4000);
+                kprintf("[boot] WINPE13: click OK in the MessageBox\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 160, 108, MOUSE_BTN_LEFT);
+                for (int i = 0; i < 160 && win32_gui_window_count(cpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(cpid);
+                kprintf("[boot] WINPE13: /bin/win-ctrl13.exe (pid=%d) exit=%d\n", cpid, rc);
+                kprintf("[WINPE13] VERDICT: %s exit=%d (expected 13)\n", rc == 13 ? "PASS" : "FAIL", rc);
+            }
+        }
+
+        /* ---- Part B: GDI fonts + metrics ---- */
+        kprintf("[boot] WINPE13: spawning /bin/win-font13.exe (GDI fonts)\n");
+        int fpid = winpe_spawn_session_app("/bin/win-font13.exe", "win-font13.exe");
+        if (fpid < 0) {
+            kprintf("[WINPE13F] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 100 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(fpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE13F] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(fpid, SIGKILL); (void)proc_wait(fpid);
+            } else {
+                winpe8_pump_ms(800);
+                kprintf("[WINPE13F] GDI fonts on the window; holding ~5s for screenshot\n");
+                for (int i = 0; i < 160 && win32_gui_window_count(fpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(fpid);
+                kprintf("[boot] WINPE13: /bin/win-font13.exe (pid=%d) exit=%d\n", fpid, rc);
+                kprintf("[WINPE13F] VERDICT: %s exit=%d (expected 13)\n", rc == 13 ? "PASS" : "FAIL", rc);
             }
         }
         win32_gui_set_log(false);
