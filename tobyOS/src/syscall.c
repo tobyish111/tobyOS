@@ -4125,18 +4125,77 @@ static long w32_LeaveCriticalSection(uint64_t *a) {
  * WM_PAINT; PostQuitMessage ends the loop). The one genuinely hard bit --
  * DispatchMessage calling the app's WndProc -- is handled by a user-mode
  * trampoline (the kernel can't call CPL3 code); see WIN32_DISPATCH_STUB_VA
- * + win32_user_stub_va in pe_loader.c. For now a single window per process. */
-static struct {
-    int      tgid;        /* owning process (thread group); 0 = none */
-    int      fd;          /* sys_gui_create fd == HWND == HDC          */
-    int      w, h;        /* client size                              */
-    uint64_t wndproc;     /* registered WndProc (also in the CRT slot) */
-    bool     needs_paint; /* a WM_PAINT is queued                      */
-    bool     destroy;     /* DestroyWindow seen -> deliver WM_DESTROY  */
-    bool     quit;        /* PostQuitMessage seen                      */
-    int      quitcode;
+ * + win32_user_stub_va in pe_loader.c.
+ *
+ * C10: MULTIPLE top-level windows. A per-window table (keyed by HWND == the
+ * tobyOS fd) holds each window's size/WndProc/paint+destroy flags/fill colour;
+ * a class registry maps a class name -> its WndProc; CreateWindow associates a
+ * window with its class's WndProc. GetMessage scans all windows and -- crucially
+ * -- stashes the message's target WndProc into the CRT slot the C7 trampoline
+ * reads, so DispatchMessage calls the RIGHT window's WndProc with no asm change
+ * (GetMessage and DispatchMessage are called in lock-step per message). */
+#define WIN32_MAX_WINDOWS 8
+#define WIN32_MAX_CLASSES 8
+
+struct win32_win {
+    int      fd;          /* sys_gui_create fd == HWND == HDC; 0 = free slot */
+    int      w, h;        /* client size */
+    uint64_t wndproc;     /* this window's WndProc (from its class) */
+    bool     needs_paint; /* a WM_PAINT is queued */
+    bool     destroy;     /* DestroyWindow seen -> deliver WM_DESTROY then retire */
     uint32_t fill_color;  /* last FillRect colour (TextOut bg tracks it) */
+};
+
+static struct {
+    int  tgid;            /* owning process (thread group); 0 = none */
+    bool quit;            /* PostQuitMessage seen (thread-wide) */
+    int  quitcode;
+    struct win32_win win[WIN32_MAX_WINDOWS];
+    struct { char name[32]; uint64_t wndproc; } cls[WIN32_MAX_CLASSES];
+    int  ncls;
 } g_win32_gui;
+
+/* Window-table entry for an HWND/HDC fd, or NULL. */
+static struct win32_win *win32_win_find(int fd) {
+    if (fd <= 0) return NULL;
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
+        if (g_win32_gui.win[i].fd == fd) return &g_win32_gui.win[i];
+    return NULL;
+}
+/* A free window slot, or NULL if the table is full. */
+static struct win32_win *win32_win_alloc(void) {
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
+        if (g_win32_gui.win[i].fd == 0) return &g_win32_gui.win[i];
+    return NULL;
+}
+/* Count of live windows. */
+static int win32_win_count(void) {
+    int n = 0;
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
+        if (g_win32_gui.win[i].fd > 0) n++;
+    return n;
+}
+
+/* Retire window-table slots whose fd is no longer a live window in the CURRENT
+ * process -- i.e. leftovers from a previous, now-exited GUI process. pids get
+ * reused, so we validate against the live fd table (per-process) rather than
+ * keying on tgid: a dead predecessor's fd won't resolve to a window here. */
+static void win32_prune_dead_windows(void) {
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
+        int fd = g_win32_gui.win[i].fd;
+        if (fd <= 0) continue;
+        struct file *f = fd_lookup(fd);
+        if (!f || f->kind != FILE_KIND_WINDOW || !f->win)
+            g_win32_gui.win[i].fd = 0;
+    }
+}
+/* Publish a window's WndProc into the CRT slot the DispatchMessage trampoline
+ * reads, so the next DispatchMessage calls THIS window's WndProc. */
+static void win32_stash_wndproc(const struct win32_win *w) {
+    uint64_t wp = w ? w->wndproc : 0;
+    (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_WNDPROC),
+                       &wp, 8);
+}
 
 /* Win32 messages. WM_PAINT/WM_QUIT/WM_NULL are synthesised by the loop; the
  * WM_* in the 0x01xx/0x02xx ranges are translated from struct gui_event by
@@ -4198,43 +4257,92 @@ static int win32_poll_window_event(int fd, struct gui_event *out) {
     return gui_window_poll_event(f->win, out);
 }
 
-/* RegisterClassA(&WNDCLASSA): stash the WndProc (offset +0x08) both in our
- * state and in the user CRT slot the DispatchMessage trampoline reads. */
+/* Resolve a class name (or NULL) to its registered WndProc. Falls back to the
+ * most-recently registered class so a single-class app is robust even if the
+ * name match is imperfect (and so the very first window before any explicit
+ * lookup still gets a WndProc). 0 if no class has been registered. */
+static uint64_t win32_class_wndproc(const char *name) {
+    if (name && name[0]) {
+        for (int i = 0; i < g_win32_gui.ncls; i++)
+            if (strcmp(g_win32_gui.cls[i].name, name) == 0)
+                return g_win32_gui.cls[i].wndproc;
+    }
+    return g_win32_gui.ncls ? g_win32_gui.cls[g_win32_gui.ncls - 1].wndproc : 0;
+}
+
+/* RegisterClassA(&WNDCLASSA): record the class name (+0x40) -> WndProc (+0x08)
+ * mapping, and default the trampoline's CRT slot to this WndProc (GetMessage
+ * refines it per message for multi-window apps). */
 static long w32_RegisterClassA(uint64_t *a) {
+    /* New-GUI-app boundary: after retiring any windows left by a previous,
+     * now-exited GUI process, if none remain this is a fresh app -- reset the
+     * whole bridge so a leftover quit flag / class table can't leak in. (Apps
+     * register their class before creating windows; our apps use a single
+     * class, so this fires once per app.) */
+    win32_prune_dead_windows();
+    if (win32_win_count() == 0)
+        memset(&g_win32_gui, 0, sizeof(g_win32_gui));
+
     uint64_t wc = a[0];
-    uint64_t wndproc = 0;
-    (void)copy_from_user(&wndproc, (const void *)(uintptr_t)(wc + 0x08), 8);
-    g_win32_gui.wndproc = wndproc;
+    uint64_t wndproc = 0, cnameptr = 0;
+    (void)copy_from_user(&wndproc,  (const void *)(uintptr_t)(wc + 0x08), 8); /* lpfnWndProc */
+    (void)copy_from_user(&cnameptr, (const void *)(uintptr_t)(wc + 0x40), 8); /* lpszClassName */
+    char cname[32]; cname[0] = '\0';
+    if (cnameptr)
+        (void)strncpy_from_user(cname, (const char *)(uintptr_t)cnameptr, sizeof(cname));
+
+    int slot = -1;
+    for (int i = 0; i < g_win32_gui.ncls; i++)
+        if (strcmp(g_win32_gui.cls[i].name, cname) == 0) { slot = i; break; }
+    if (slot < 0 && g_win32_gui.ncls < WIN32_MAX_CLASSES) slot = g_win32_gui.ncls++;
+    if (slot >= 0) {
+        memcpy(g_win32_gui.cls[slot].name, cname, sizeof(g_win32_gui.cls[slot].name));
+        g_win32_gui.cls[slot].name[sizeof(g_win32_gui.cls[slot].name) - 1] = '\0';
+        g_win32_gui.cls[slot].wndproc = wndproc;
+    }
     (void)copy_to_user((void *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_WNDPROC),
                        &wndproc, 8);
     return 1;   /* a non-zero class atom */
 }
 
 /* CreateWindowExA(exStyle, class, name, style, x, y, W, H, parent, menu,
- *                 hInst, param) -> HWND (== the tobyOS window fd). W=a6, H=a7,
- * name=a2 -- all within the gate's 8 marshalled args. */
+ *                 hInst, param) -> HWND (== the tobyOS window fd). class=a1,
+ * name=a2, W=a6, H=a7 -- all within the gate's 8 marshalled args. Allocates a
+ * window-table slot bound to its class's WndProc. */
 static long w32_CreateWindowExA(uint64_t *a) {
-    uint64_t name = a[2];
+    uint64_t cnameptr = a[1];
+    uint64_t name     = a[2];
     int w = (int)(uint32_t)a[6];
     int h = (int)(uint32_t)a[7];
     if (w <= 0 || w > 4096) w = 400;
     if (h <= 0 || h > 4096) h = 200;
+
+    win32_prune_dead_windows();
+    g_win32_gui.quit = false;    /* creating a window -> not in a quit state */
+
+    char cname[32]; cname[0] = '\0';
+    if (cnameptr)
+        (void)strncpy_from_user(cname, (const char *)(uintptr_t)cnameptr, sizeof(cname));
+
+    struct win32_win *win = win32_win_alloc();
+    if (!win) return 0;                          /* table full -> NULL HWND */
     long fd = sys_gui_create((uint32_t)w, (uint32_t)h, (const char *)(uintptr_t)name);
-    if (fd < 0) return 0;   /* NULL HWND */
+    if (fd < 0) return 0;                        /* NULL HWND */
+
     struct proc *p = current_proc();
-    g_win32_gui.tgid        = p ? (p->is_thread ? p->tgid : p->pid) : 0;
-    g_win32_gui.fd          = (int)fd;
-    g_win32_gui.w           = w;
-    g_win32_gui.h           = h;
-    g_win32_gui.needs_paint = true;
-    g_win32_gui.destroy     = false;
-    g_win32_gui.quit        = false;
-    g_win32_gui.fill_color  = WIN32_FILL_DEFAULT;
+    g_win32_gui.tgid   = p ? (p->is_thread ? p->tgid : p->pid) : 0;
+    win->fd          = (int)fd;
+    win->w           = w;
+    win->h           = h;
+    win->wndproc     = win32_class_wndproc(cname);
+    win->needs_paint = true;
+    win->destroy     = false;
+    win->fill_color  = WIN32_FILL_DEFAULT;
     return fd;   /* HWND == HDC == fd */
 }
 
-static long w32_ShowWindow(uint64_t *a)   { (void)a; g_win32_gui.needs_paint = true; return 1; }
-static long w32_UpdateWindow(uint64_t *a) { (void)a; g_win32_gui.needs_paint = true; return 1; }
+static long w32_ShowWindow(uint64_t *a)   { struct win32_win *w = win32_win_find((int)a[0]); if (w) w->needs_paint = true; return 1; }
+static long w32_UpdateWindow(uint64_t *a) { struct win32_win *w = win32_win_find((int)a[0]); if (w) w->needs_paint = true; return 1; }
 static long w32_PostQuitMessage(uint64_t *a) {
     g_win32_gui.quit = true; g_win32_gui.quitcode = (int)a[0]; return 0;
 }
@@ -4245,25 +4353,34 @@ static long w32_TranslateMessage(uint64_t *a) { (void)a; return 0; }
  * handle WM_CLOSE in its WndProc passes it here, and Windows responds by
  * destroying the window (which then sends WM_DESTROY). */
 static long w32_DefWindowProcA(uint64_t *a) {
-    if ((uint32_t)a[1] == WM_CLOSE) g_win32_gui.destroy = true;
+    if ((uint32_t)a[1] == WM_CLOSE) {
+        struct win32_win *w = win32_win_find((int)a[0]);
+        if (w) w->destroy = true;
+    }
     return 0;
 }
 
-/* DestroyWindow(hwnd) -> TRUE. We don't tear the tobyOS window down here (the
- * process exit / file_close does that); we just arm GetMessage to deliver one
- * WM_DESTROY so the app's WndProc can PostQuitMessage and unwind cleanly. */
-static long w32_DestroyWindow(uint64_t *a) { (void)a; g_win32_gui.destroy = true; return 1; }
+/* DestroyWindow(hwnd) -> TRUE. Arms GetMessage to deliver one WM_DESTROY for
+ * THIS window (then retire it); the app's WndProc can PostQuitMessage. */
+static long w32_DestroyWindow(uint64_t *a) {
+    struct win32_win *w = win32_win_find((int)a[0]);
+    if (w) w->destroy = true;
+    return 1;
+}
 
-/* InvalidateRect(hwnd, &RECT|NULL, erase) -> TRUE. Marks a repaint pending so
- * the next GetMessage delivers WM_PAINT (how an app asks to redraw, e.g. after
- * a click changes its state). */
-static long w32_InvalidateRect(uint64_t *a) { (void)a; g_win32_gui.needs_paint = true; return 1; }
+/* InvalidateRect(hwnd, &RECT|NULL, erase) -> TRUE. Marks THIS window for a
+ * repaint so the next GetMessage delivers it a WM_PAINT (e.g. after a click). */
+static long w32_InvalidateRect(uint64_t *a) {
+    struct win32_win *w = win32_win_find((int)a[0]);
+    if (w) w->needs_paint = true;
+    return 1;
+}
 
-/* Translate one struct gui_event into a Win32 message in *m. Returns true if a
- * deliverable message was produced (RESIZE/NONE are dropped). */
-static bool win32_event_to_msg(const struct gui_event *ev,
+/* Translate one struct gui_event (from the window `fd`) into a Win32 message in
+ * *m. Returns true if a deliverable message was produced (RESIZE/NONE dropped). */
+static bool win32_event_to_msg(int fd, const struct gui_event *ev,
                                struct win32_msg *m) {
-    m->hwnd = (uint64_t)g_win32_gui.fd;
+    m->hwnd = (uint64_t)fd;
     switch (ev->type) {
     case GUI_EV_MOUSE_MOVE:
         m->message = WM_MOUSEMOVE;
@@ -4297,11 +4414,13 @@ static bool win32_event_to_msg(const struct gui_event *ev,
     }
 }
 
-/* GetMessageA(&MSG, hwnd, min, max) -> >0 normal / 0 on WM_QUIT. Order of
- * delivery: a pending WM_DESTROY (after DestroyWindow), then WM_QUIT (after
- * PostQuitMessage), then a queued WM_PAINT, then any real input event drained
- * from the window (mouse/keyboard/close -> WM_*), else yield + WM_NULL so the
- * loop keeps turning without busy-spinning. */
+/* GetMessageA(&MSG, hwnd, min, max) -> >0 normal / 0 on WM_QUIT. Scans ALL the
+ * process's windows. Order: WM_QUIT (PostQuitMessage, thread-wide), then per
+ * window a pending WM_DESTROY (after which the window is retired -- desktop
+ * window closed + slot freed), then a queued WM_PAINT, then a drained input
+ * event (mouse/keyboard/close -> WM_*); else yield + WM_NULL. Each delivered
+ * message first stashes its window's WndProc so the following DispatchMessage
+ * routes to the correct one (multi-window). */
 static long w32_GetMessageA(uint64_t *a) {
     uint64_t msg = a[0];
     struct win32_msg m;
@@ -4312,57 +4431,78 @@ static long w32_GetMessageA(uint64_t *a) {
         (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
         return 0;
     }
-    if (g_win32_gui.destroy) {
-        g_win32_gui.destroy = false;
-        m.hwnd = (uint64_t)g_win32_gui.fd; m.message = WM_DESTROY;
-        if (g_win32_log_input) kprintf("[winpe8] GetMessage -> WM_DESTROY\n");
-        (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
-        return 1;
+
+    /* WM_DESTROY: deliver, then retire the window (close its desktop window +
+     * free the slot). */
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
+        struct win32_win *w = &g_win32_gui.win[i];
+        if (w->fd > 0 && w->destroy) {
+            int fd = w->fd;
+            win32_stash_wndproc(w);
+            m.hwnd = (uint64_t)fd; m.message = WM_DESTROY;
+            if (g_win32_log_input)
+                kprintf("[winpe] GetMessage hwnd=%d -> WM_DESTROY\n", fd);
+            w->fd = 0; w->destroy = false; w->needs_paint = false;  /* retire */
+            (void)sys_close(fd);                                    /* remove from desktop */
+            (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+            return 1;
+        }
     }
-    if (g_win32_gui.needs_paint) {
-        g_win32_gui.needs_paint = false;
-        m.hwnd = (uint64_t)g_win32_gui.fd; m.message = WM_PAINT;
-        (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
-        return 1;
+
+    /* WM_PAINT for any window that needs one. */
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
+        struct win32_win *w = &g_win32_gui.win[i];
+        if (w->fd > 0 && w->needs_paint) {
+            w->needs_paint = false;
+            win32_stash_wndproc(w);
+            m.hwnd = (uint64_t)w->fd; m.message = WM_PAINT;
+            (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
+            return 1;
+        }
     }
-    /* Drain one real input event (mouse/keyboard/close) and translate it. */
-    if (g_win32_gui.fd >= 0) {
+
+    /* One real input event from any window -> WM_*. */
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++) {
+        struct win32_win *w = &g_win32_gui.win[i];
+        if (w->fd <= 0) continue;
         struct gui_event ev;
-        if (win32_poll_window_event(g_win32_gui.fd, &ev) > 0 &&
-            win32_event_to_msg(&ev, &m)) {
-            /* Log the meaningful ones (skip the WM_MOUSEMOVE flood). */
+        if (win32_poll_window_event(w->fd, &ev) > 0 &&
+            win32_event_to_msg(w->fd, &ev, &m)) {
+            win32_stash_wndproc(w);
             if (g_win32_log_input && m.message != WM_MOUSEMOVE)
-                kprintf("[winpe8] GetMessage -> WM_%04x wParam=0x%lx lParam=0x%lx\n",
-                        (unsigned)m.message, (unsigned long)m.wParam,
+                kprintf("[winpe] GetMessage hwnd=%d -> WM_%04x wParam=0x%lx lParam=0x%lx\n",
+                        w->fd, (unsigned)m.message, (unsigned long)m.wParam,
                         (unsigned long)m.lParam);
             (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
             return 1;
         }
     }
-    /* Nothing pending: yield and deliver WM_NULL so the app's loop keeps
-     * turning (and other procs run) without busy-spinning. */
+
+    /* Nothing pending: yield and deliver WM_NULL so the loop keeps turning
+     * (and other procs run) without busy-spinning. */
     sched_yield();
-    m.hwnd = (uint64_t)g_win32_gui.fd; m.message = WM_NULL;
+    m.hwnd = 0; m.message = WM_NULL;
     (void)copy_to_user((void *)(uintptr_t)msg, &m, sizeof(m));
     return 1;
 }
 
-/* BeginPaint(hwnd, &PAINTSTRUCT) -> HDC. EndPaint -> present (flip). */
+/* BeginPaint(hwnd, &PAINTSTRUCT) -> HDC. EndPaint -> present (flip) the window. */
 static long w32_BeginPaint(uint64_t *a) {
     uint64_t hwnd = a[0];
     uint64_t ps   = a[1];
+    struct win32_win *w = win32_win_find((int)hwnd);
     /* PAINTSTRUCT: hdc@0, fErase@8, rcPaint(l,t,r,b)@0x0C */
     uint64_t hdc = hwnd;          /* HDC == HWND == fd */
     uint32_t erase = 1;
-    int32_t  rc[4] = { 0, 0, g_win32_gui.w, g_win32_gui.h };
+    int32_t  rc[4] = { 0, 0, w ? w->w : 0, w ? w->h : 0 };
     (void)copy_to_user((void *)(uintptr_t)(ps + 0x00), &hdc, 8);
     (void)copy_to_user((void *)(uintptr_t)(ps + 0x08), &erase, 4);
     (void)copy_to_user((void *)(uintptr_t)(ps + 0x0C), rc, sizeof(rc));
     return (long)hdc;
 }
 static long w32_EndPaint(uint64_t *a) {
-    (void)a;
-    if (g_win32_gui.fd >= 0) (void)sys_gui_flip(g_win32_gui.fd);
+    int fd = (int)a[0];
+    if (win32_win_find(fd)) (void)sys_gui_flip(fd);
     return 1;
 }
 
@@ -4397,7 +4537,8 @@ static long w32_FillRect(uint64_t *a) {
     uint32_t color = WIN32_FILL_DEFAULT;
     if ((hbr & WIN32_BRUSH_MASK) == WIN32_BRUSH_TAG)
         color = win32_colorref_to_xrgb((uint32_t)(hbr & 0xFFFFFFu));
-    g_win32_gui.fill_color = color;
+    struct win32_win *win = win32_win_find(fd);
+    if (win) win->fill_color = color;
     uint32_t whlen = ((uint32_t)(w & 0xFFFF)) | ((uint32_t)(h & 0xFFFF) << 16);
     (void)sys_gui_fill(fd, x, y, whlen, color);
     return 1;
@@ -4412,8 +4553,10 @@ static long w32_TextOutA(uint64_t *a) {
     int      y   = (int)(int32_t)a[2];
     uint64_t str = a[3];
     uint32_t xy  = ((uint32_t)(x & 0xFFFF)) | ((uint32_t)(y & 0xFFFF) << 16);
+    struct win32_win *win = win32_win_find(fd);
+    uint32_t bg = win ? win->fill_color : WIN32_FILL_DEFAULT;
     (void)sys_gui_text(fd, xy, (const char *)(uintptr_t)str,
-                       0x00FFFFFF /* white */, g_win32_gui.fill_color);
+                       0x00FFFFFF /* white */, bg);
     return 1;
 }
 
@@ -4713,10 +4856,25 @@ long win32_dispatch(uint64_t func_index, uint64_t args_ptr) {
  * reports the current FillRect colour so the harness can confirm a click
  * actually recoloured the window (real-mouse vs deterministic injection). */
 int win32_gui_window_fd(int tgid) {
-    if (g_win32_gui.tgid == tgid && g_win32_gui.fd >= 0) return g_win32_gui.fd;
+    if (g_win32_gui.tgid != tgid) return -1;
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
+        if (g_win32_gui.win[i].fd > 0) return g_win32_gui.win[i].fd;   /* first live window */
     return -1;
 }
-uint32_t win32_gui_fill_color(void) { return g_win32_gui.fill_color; }
+uint32_t win32_gui_fill_color(void) {
+    for (int i = 0; i < WIN32_MAX_WINDOWS; i++)
+        if (g_win32_gui.win[i].fd > 0) return g_win32_gui.win[i].fill_color;
+    return WIN32_FILL_DEFAULT;
+}
+/* C10: number of live windows owned by `tgid`, and a specific window's fill. */
+int win32_gui_window_count(int tgid) {
+    if (g_win32_gui.tgid != tgid) return 0;
+    return win32_win_count();
+}
+uint32_t win32_gui_fill_color_fd(int fd) {
+    struct win32_win *w = win32_win_find(fd);
+    return w ? w->fill_color : 0;
+}
 
 /* Win32 personality translator -- the mirror of linux_syscall(). A PE only
  * ever issues the marshalling gate's ABI_SYS_WIN32_DISPATCH; anything else

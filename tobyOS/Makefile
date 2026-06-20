@@ -1348,6 +1348,13 @@ programs/win-gui8/win-gui8.exe: programs/win-gui8/main.c
 programs/win-c9/win-c9.exe: programs/win-c9/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
 
+# Track C/C10: a STOCK Win32 GUI .exe with TWO top-level windows sharing one
+# WndProc that discriminates by HWND. Proves tobyOS routes each window's paint /
+# input / close independently (per-window state table + per-message WndProc).
+programs/win-gui10/win-gui10.exe: programs/win-gui10/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
+	      -o $@ $< -lgdi32 -luser32
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1638,6 +1645,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-gui/win-gui.exe \
                programs/win-gui8/win-gui8.exe \
                programs/win-c9/win-c9.exe \
+               programs/win-gui10/win-gui10.exe \
                initrd/etc/motd initrd/readme.txt \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1696,6 +1704,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-gui/win-gui.exe                   $(INITRD_STAGE)/bin/win-gui.exe
 	cp programs/win-gui8/win-gui8.exe                 $(INITRD_STAGE)/bin/win-gui8.exe
 	cp programs/win-c9/win-c9.exe                     $(INITRD_STAGE)/bin/win-c9.exe
+	cp programs/win-gui10/win-gui10.exe               $(INITRD_STAGE)/bin/win-gui10.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -1900,7 +1909,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-mmaptest bin/linux-thread bin/win-hello.exe            \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
 	    bin/win-fileio.exe bin/win-thread.exe bin/win-gui.exe          \
-	    bin/win-gui8.exe bin/win-c9.exe                                 \
+	    bin/win-gui8.exe bin/win-c9.exe bin/win-gui10.exe              \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \

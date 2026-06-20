@@ -114,6 +114,12 @@ long win32_dispatch(uint64_t func_index, uint64_t args_ptr);
 int      win32_gui_window_fd(int tgid);
 uint32_t win32_gui_fill_color(void);
 
+/* C10 (multi-window): how many live windows process `tgid` owns, and a specific
+ * window's current fill colour (XRGB) so the harness can confirm a click
+ * recoloured exactly one of several windows. */
+int      win32_gui_window_count(int tgid);
+uint32_t win32_gui_fill_color_fd(int fd);
+
 /* When on, GetMessage logs each meaningful WM_* it delivers to the WndProc
  * (proof of input delivery, without GUI_TRACE_VERBOSE's per-frame volume). */
 void     win32_gui_set_log(bool on);

@@ -2346,7 +2346,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#ifdef WINPE8_BOOT
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -2400,7 +2400,51 @@ static void winpe8_move_cursor_to(int tx, int ty) {
         winpe8_pump_ms(15);
     }
 }
-#endif /* WINPE8_BOOT */
+
+/* Sign a session in (root has an empty seed password) and dismiss the login
+ * window, leaving a clean logged-in desktop (wallpaper + taskbar) so a launched
+ * Win32 app's window shows with full chrome on top. */
+static void winpe_autologin_clear(void) {
+    int lr = session_login("root", "");
+    kprintf("[boot] WINPE: session_login(root) rc=%d active=%d\n",
+            lr, (int)session_active());
+    service_stop("login");
+    winpe8_pump_ms(400);
+    for (int pid = 1; pid < 64; pid++) {
+        struct proc *p = proc_lookup(pid);
+        if (p && p->name[0] && strcmp(p->name, "login") == 0) {
+            kprintf("[boot] WINPE: SIGKILL lingering login pid=%d\n", pid);
+            signal_send_to_pid(pid, SIGKILL);
+        }
+    }
+    winpe8_pump_ms(300);
+    gui_invalidate_full();
+    winpe8_pump_ms(300);
+}
+
+/* Spawn a PE as a session-tagged desktop app (tag the boot thread with the
+ * active session around the spawn so the child inherits it). Returns the pid. */
+static int winpe_spawn_session_app(const char *path, const char *name) {
+    struct proc *self = current_proc();
+    int sid  = self ? self->session_id : 0;
+    int suid = self ? self->uid : 0;
+    int sgid = self ? self->gid : 0;
+    if (self) {
+        self->session_id = session_current_id();
+        self->uid        = session_current_uid();
+        self->gid        = session_current_gid();
+    }
+    char *argv[] = { (char *)name, 0 };
+    char *envp[] = { (char *)"PATH=/bin", 0 };
+    struct proc_spec spec = {
+        .path = path, .name = name,
+        .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+    };
+    int pid = proc_spawn(&spec);
+    if (self) { self->session_id = sid; self->uid = suid; self->gid = sgid; }
+    return pid;
+}
+#endif /* WINPE8_BOOT || WINPE10_BOOT */
 
 void _start(void) {
     early_init();
@@ -3932,49 +3976,12 @@ void _start(void) {
          * per-frame serial flood. */
         win32_gui_set_log(true);
 
-        /* (1) Sign a session in (root seeds with an empty password) so the
-         * desktop is logged-in and windows get real chrome. */
-        int lr = session_login("root", "");
-        kprintf("[boot] WINPE8: session_login(root) rc=%d active=%d\n",
-                lr, (int)session_active());
-
-        /* (2) Dismiss the login window: stop the service (won't restart now a
-         * session is active) and SIGKILL any lingering login proc, then
-         * composite the now-clean desktop (wallpaper + taskbar). */
-        service_stop("login");
-        winpe8_pump_ms(400);
-        for (int pid = 1; pid < 64; pid++) {
-            struct proc *p = proc_lookup(pid);
-            if (p && p->name[0] && strcmp(p->name, "login") == 0) {
-                kprintf("[boot] WINPE8: SIGKILL lingering login pid=%d\n", pid);
-                signal_send_to_pid(pid, SIGKILL);
-            }
-        }
-        winpe8_pump_ms(300);
-        gui_invalidate_full();
-        winpe8_pump_ms(300);
+        /* (1+2) Sign in + dismiss the login window -> a clean logged-in desktop. */
+        winpe_autologin_clear();
 
         /* (3) Launch the .exe as a session-tagged desktop app. */
         kprintf("[boot] WINPE8: spawning /bin/win-gui8.exe (interactive Win32 GUI)\n");
-        struct proc *self = current_proc();
-        int sid  = self ? self->session_id : 0;
-        int suid = self ? self->uid : 0;
-        int sgid = self ? self->gid : 0;
-        if (self) {
-            self->session_id = session_current_id();
-            self->uid        = session_current_uid();
-            self->gid        = session_current_gid();
-        }
-        char *argv[] = { (char *)"win-gui8.exe", 0 };
-        char *envp[] = { (char *)"PATH=/bin", 0 };
-        struct proc_spec spec = {
-            .path = "/bin/win-gui8.exe",
-            .name = "win-gui8.exe",
-            .argc = 1, .argv = argv,
-            .envc = 1, .envp = envp,
-        };
-        int wpid = proc_spawn(&spec);
-        if (self) { self->session_id = sid; self->uid = suid; self->gid = sgid; }
+        int wpid = winpe_spawn_session_app("/bin/win-gui8.exe", "win-gui8.exe");
 
         if (wpid < 0) {
             kprintf("[boot] WINPE8: spawn failed rc=%d MISSING\n", wpid);
@@ -4035,6 +4042,76 @@ void _start(void) {
                 kprintf("[boot] WINPE8: /bin/win-gui8.exe (pid=%d) exit=%d\n", wpid, rc);
                 kprintf("[WINPE8] VERDICT: %s exit=%d (expected 8)\n",
                         rc == 8 ? "PASS" : "FAIL", rc);
+            }
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE10_BOOT
+    /* Track C -- MULTI-WINDOW, milestone C10. Build EXTRA_CFLAGS+=-DWINPE10_BOOT.
+     * Reuses C8's visible+interactive infra (auto-login + desktop launch + real
+     * input). A stock .exe opens TWO top-level windows; the harness waits for
+     * both to paint, drives a REAL mouse click into the FOCUSED window (recolours
+     * only that one -> proof of per-window routing), holds for a screenshot, then
+     * closes BOTH windows in turn (independent WM_CLOSE->WM_DESTROY). The app
+     * returns 10 iff both painted, exactly ONE got the click, and both ran their
+     * WM_DESTROY. */
+    {
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+
+        kprintf("[boot] WINPE10: spawning /bin/win-gui10.exe (two Win32 windows)\n");
+        int wpid = winpe_spawn_session_app("/bin/win-gui10.exe", "win-gui10.exe");
+        if (wpid < 0) {
+            kprintf("[boot] WINPE10: spawn failed rc=%d MISSING\n", wpid);
+            kprintf("[WINPE10] VERDICT: FAIL reason=spawn\n");
+        } else {
+            /* (4) Wait (up to ~5s) for BOTH windows to come up. */
+            int n = 0;
+            for (int i = 0; i < 100 && n < 2; i++) {
+                winpe8_pump_ms(50);
+                n = win32_gui_window_count(wpid);
+            }
+            if (n < 2) {
+                kprintf("[boot] WINPE10: only %d window(s) appeared\n", n);
+                kprintf("[WINPE10] VERDICT: FAIL reason=nowindows\n");
+                signal_send_to_pid(wpid, SIGKILL);
+                (void)proc_wait(wpid);
+            } else {
+                kprintf("[boot] WINPE10: %d windows up -- painting blue\n", n);
+                winpe8_pump_ms(900);   /* both WM_PAINT (blue) + composite */
+
+                /* (5) REAL click into the FOCUSED (topmost) window only. */
+                int cx = 0, cy = 0;
+                if (gui_focused_window_client_center(&cx, &cy)) {
+                    kprintf("[boot] WINPE10: real mouse click into focused window at (%d,%d)\n",
+                            cx, cy);
+                    winpe8_move_cursor_to(cx, cy);
+                    mouse_inject_event(0, 0, MOUSE_BTN_LEFT);
+                    winpe8_pump_ms(250);
+                    mouse_inject_event(0, 0, 0);
+                    winpe8_pump_ms(500);
+                }
+
+                kprintf("[WINPE10] one of two windows recoloured GREEN; holding ~6s for screenshot\n");
+                winpe8_pump_ms(6000);
+
+                /* (6) Close BOTH windows in turn (focused first; after it retires,
+                 * the other becomes focused). Each runs WM_CLOSE->WM_DESTROY. */
+                kprintf("[boot] WINPE10: closing focused window #1\n");
+                gui_close_focused();
+                for (int i = 0; i < 30 && win32_gui_window_count(wpid) > 1; i++)
+                    winpe8_pump_ms(50);
+                kprintf("[boot] WINPE10: closing window #2 (count now %d)\n",
+                        win32_gui_window_count(wpid));
+                gui_close_focused();
+                winpe8_pump_ms(800);
+
+                int rc = proc_wait(wpid);
+                kprintf("[boot] WINPE10: /bin/win-gui10.exe (pid=%d) exit=%d\n", wpid, rc);
+                kprintf("[WINPE10] VERDICT: %s exit=%d (expected 10)\n",
+                        rc == 10 ? "PASS" : "FAIL", rc);
             }
         }
         win32_gui_set_log(false);
