@@ -4147,13 +4147,18 @@ static long w32_LeaveCriticalSection(uint64_t *a) {
 #define WIN32_CTRL_TAG    0x6400000000000000ull   /* control HWND -> g_win32_ctrl */
 #define WIN32_FONT_TAG    0x6500000000000000ull   /* HFONT, carries a bitmap scale (C13) */
 #define WIN32_TAG_MASK    0xFF00000000000000ull
-/* Control kinds (C12 BUTTON/EDIT; C13 STATIC/CHECKBOX/LISTBOX/SCROLLBAR). */
+/* Control kinds (C12 BUTTON/EDIT; C13 STATIC/CHECKBOX/LISTBOX/SCROLLBAR;
+ * C14 COMBOBOX/RADIO/GROUPBOX/TAB). */
 #define WIN32_CTRL_BUTTON    1
 #define WIN32_CTRL_EDIT      2
 #define WIN32_CTRL_STATIC    3
 #define WIN32_CTRL_CHECKBOX  4
 #define WIN32_CTRL_LISTBOX   5
 #define WIN32_CTRL_SCROLLBAR 6
+#define WIN32_CTRL_COMBOBOX  7   /* C14: dropdown edit+list             */
+#define WIN32_CTRL_RADIO     8   /* C14: mutually-exclusive radio button */
+#define WIN32_CTRL_GROUPBOX  9   /* C14: a labelled frame (visual only)  */
+#define WIN32_CTRL_TAB       10  /* C14: SysTabControl32 tab strip       */
 #define WIN32_LB_MAX_ITEMS   8
 #define WIN32_LB_ITEM_LEN    24
 
@@ -4168,8 +4173,11 @@ struct win32_ctrl {
     int      x, y, w, h;         /* rect within the parent's client area */
     int      id;                 /* control id (CreateWindowEx hMenu) */
     bool     focus;              /* EDIT: has keyboard focus */
-    bool     checked;            /* CHECKBOX state (C13) */
+    bool     checked;            /* CHECKBOX / RADIO state (C13/C14) */
     int      sb_min, sb_max, sb_pos;  /* SCROLLBAR range/pos (C13) */
+    bool     dropped;            /* C14 COMBOBOX: dropdown list is open */
+    int      group;              /* C14 RADIO: group id (WS_GROUP runs)  */
+    bool     hidden;             /* C14: ShowWindow(SW_HIDE) (TAB pages) */
     char     text[WIN32_CTRL_TEXT];
 };
 /* C13 LISTBOX item store, indexed by control slot. */
@@ -4254,7 +4262,25 @@ static int win32_ctrl_class(const char *cn) {
     if (win32_streq_ci(cn, "STATIC"))     return WIN32_CTRL_STATIC;
     if (win32_streq_ci(cn, "LISTBOX"))    return WIN32_CTRL_LISTBOX;
     if (win32_streq_ci(cn, "SCROLLBAR"))  return WIN32_CTRL_SCROLLBAR;
+    if (win32_streq_ci(cn, "COMBOBOX"))   return WIN32_CTRL_COMBOBOX;
+    if (win32_streq_ci(cn, "SysTabControl32")) return WIN32_CTRL_TAB;
     return 0;
+}
+/* BUTTON styles (low nibble of dwStyle) select the button subtype. */
+#define BS_CHECKBOX        0x0002u
+#define BS_AUTOCHECKBOX    0x0003u
+#define BS_RADIOBUTTON     0x0004u
+#define BS_GROUPBOX        0x0007u
+#define BS_AUTORADIOBUTTON 0x0009u
+/* C14: a BUTTON's low-style-bits subtype. BS_GROUPBOX(7)/BS_(AUTO)RADIOBUTTON
+ * (4/9) reclassify a "BUTTON" the way BS_(AUTO)CHECKBOX(2/3) does. */
+static int win32_button_subkind(int base, uint32_t style) {
+    if (base != WIN32_CTRL_BUTTON) return base;
+    uint32_t low = style & 0xFu;
+    if (low == BS_CHECKBOX || low == BS_AUTOCHECKBOX)       return WIN32_CTRL_CHECKBOX;
+    if (low == BS_RADIOBUTTON || low == BS_AUTORADIOBUTTON) return WIN32_CTRL_RADIO;
+    if (low == BS_GROUPBOX)                                 return WIN32_CTRL_GROUPBOX;
+    return WIN32_CTRL_BUTTON;
 }
 /* C12: resolve a control HWND token to its slot, or NULL. */
 static struct win32_ctrl *win32_ctrl_find(uint64_t h) {
@@ -4266,6 +4292,7 @@ static struct win32_ctrl *win32_ctrl_find(uint64_t h) {
 /* C12 control helpers used by GetMessage/EndPaint (defined below, after the GDI
  * backend they call). */
 static void win32_draw_controls(int parent_fd);
+static void win32_refresh_controls(int parent_fd);
 static bool win32_route_control_input(int parent_fd, const struct gui_event *ev);
 /* C13: MessageBoxA (font section) draws via these, defined further below. */
 static struct window *win32_hdc_window(int fd);
@@ -4327,15 +4354,20 @@ static void win32_stash_wndproc(const struct win32_win *w) {
 #define WIN32_PEN_TAG     0x7C00000000000000ull
 
 /* WS_CHILD window style bit (C11): a window created with it (or with a non-NULL
- * hWndParent) is a child/owned window. */
+ * hWndParent) is a child/owned window. WS_GROUP starts a new radio group (C14). */
 #define WS_CHILD          0x40000000u
+#define WS_GROUP          0x00020000u
 
 /* C12/C13 control + scroll messages and notifications. */
 #define WM_SETTEXT        0x000C
+#define WM_INITDIALOG     0x0110   /* C14: first message a DialogProc receives */
 #define WM_VSCROLL        0x0115
 #define WM_COMMAND        0x0111
+#define WM_NOTIFY         0x004E   /* C14: TAB sends TCN_SELCHANGE via this    */
 #define BN_CLICKED        0
 #define LBN_SELCHANGE     1
+#define CBN_SELCHANGE     1        /* C14 COMBOBOX select notification (HIWORD) */
+#define TCN_SELCHANGE     (0u-551u)/* C14 TAB select notification (NMHDR.code)  */
 /* SendMessage control messages. */
 #define BM_GETCHECK       0x00F0
 #define BM_SETCHECK       0x00F1
@@ -4345,16 +4377,29 @@ static void win32_stash_wndproc(const struct win32_win *w) {
 #define LB_GETCURSEL      0x0188
 #define LB_GETTEXT        0x0189
 #define LB_GETCOUNT       0x018B
+/* C14 COMBOBOX messages (CB_*). */
+#define CB_ADDSTRING      0x0143
+#define CB_RESETCONTENT   0x014B
+#define CB_GETCOUNT       0x0146
+#define CB_SETCURSEL      0x014E
+#define CB_GETCURSEL      0x0147
+#define CB_GETLBTEXT      0x0148
+/* C14 TAB messages (TCM_FIRST 0x1300). lParam of TCM_INSERTITEM = TCITEM whose
+ * pszText (@+0x10) is the tab label. */
+#define TCM_FIRST         0x1300
+#define TCM_GETIMAGELIST  (TCM_FIRST + 2)
+#define TCM_INSERTITEMA   (TCM_FIRST + 7)
+#define TCM_GETITEMCOUNT  (TCM_FIRST + 4)
+#define TCM_GETCURSEL     (TCM_FIRST + 11)
+#define TCM_SETCURSEL     (TCM_FIRST + 12)
 /* Scrollbar notification codes (wParam low word of WM_VSCROLL). */
 #define SB_LINEUP         0
 #define SB_LINEDOWN       1
 #define SB_PAGEUP         2
 #define SB_PAGEDOWN       3
-/* BUTTON styles (low nibble of dwStyle): a checkbox is BS_(AUTO)CHECKBOX. */
-#define BS_CHECKBOX       0x0002u
-#define BS_AUTOCHECKBOX   0x0003u
-/* MessageBox button-id results. */
+/* MessageBox / dialog button-id results. */
 #define IDOK              1
+#define IDCANCEL          2
 
 /* The default window fill (C7's blue) used when no solid brush is supplied. */
 #define WIN32_FILL_DEFAULT 0x002E5C8Au
@@ -4443,6 +4488,62 @@ static long w32_RegisterClassA(uint64_t *a) {
     return 1;   /* a non-zero class atom */
 }
 
+/* Allocate + initialise a virtual child control in the parent's client area.
+ * `ktext` is a KERNEL string (or NULL); `style` drives radio grouping (WS_GROUP).
+ * Returns the control slot index, or -1 if the table is full. Shared by
+ * CreateWindowExA (C12/C13) and the C14 dialog-template builder. */
+static int win32_ctrl_make(int parent_fd, int type, int x, int y, int w, int h,
+                           int id, const char *ktext, uint32_t style) {
+    for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
+        if (g_win32_gui.ctrl[i].in_use) continue;
+        struct win32_ctrl *c = &g_win32_gui.ctrl[i];
+        memset(c, 0, sizeof(*c));
+        c->in_use = true;  c->parent_fd = parent_fd;  c->type = type;
+        c->x = x;  c->y = y;  c->w = w;  c->h = h;  c->id = id;
+        if (ktext) {
+            int n = 0;
+            while (n < (int)sizeof(c->text) - 1 && ktext[n]) { c->text[n] = ktext[n]; n++; }
+            c->text[n] = 0;
+        }
+        /* Radio grouping: a control with WS_GROUP starts a new group; controls
+         * after it share that group number until the next WS_GROUP. */
+        int grp = 0;
+        for (int j = 0; j < WIN32_MAX_CTRLS; j++)
+            if (j != i && g_win32_gui.ctrl[j].in_use &&
+                g_win32_gui.ctrl[j].parent_fd == parent_fd &&
+                g_win32_gui.ctrl[j].group > grp)
+                grp = g_win32_gui.ctrl[j].group;
+        if (style & WS_GROUP) grp++;
+        c->group = grp;
+
+        switch (type) {
+        case WIN32_CTRL_EDIT: {                    /* auto-focus the first EDIT */
+            bool any = false;
+            for (int j = 0; j < WIN32_MAX_CTRLS; j++)
+                if (g_win32_gui.ctrl[j].in_use &&
+                    g_win32_gui.ctrl[j].parent_fd == parent_fd &&
+                    g_win32_gui.ctrl[j].type == WIN32_CTRL_EDIT &&
+                    g_win32_gui.ctrl[j].focus) any = true;
+            if (!any) c->focus = true;
+            break;
+        }
+        case WIN32_CTRL_LISTBOX:
+        case WIN32_CTRL_COMBOBOX:                  /* C14: list/combo/tab share */
+        case WIN32_CTRL_TAB:                       /* the g_win32_lb item store  */
+            memset(&g_win32_lb[i], 0, sizeof(g_win32_lb[i]));
+            g_win32_lb[i].sel = -1;
+            break;
+        case WIN32_CTRL_SCROLLBAR:
+            c->sb_min = 0; c->sb_max = 100; c->sb_pos = 0;
+            break;
+        }
+        struct win32_win *pw = win32_win_find(parent_fd);
+        if (pw) pw->needs_paint = true;            /* redraw parent -> draw control */
+        return i;
+    }
+    return -1;
+}
+
 /* CreateWindowExA(exStyle, class, name, style, x, y, W, H, parent, menu,
  *                 hInst, param) -> HWND (== the tobyOS window fd). class=a1,
  * name=a2, style=a3, W=a6, H=a7, hWndParent=a8 (C11: reachable now the gate
@@ -4468,44 +4569,21 @@ static long w32_CreateWindowExA(uint64_t *a) {
     if (cnameptr)
         (void)strncpy_from_user(cname, (const char *)(uintptr_t)cnameptr, sizeof(cname));
 
-    /* A predefined control class (BUTTON/EDIT/STATIC/CHECKBOX/LISTBOX/SCROLLBAR)
-     * with a parent creates a VIRTUAL child rendered into the parent's client
-     * area, not a top-level window. Its HWND is a tagged token; its id is hMenu
-     * (a9). A "BUTTON" with a checkbox style becomes a CHECKBOX. */
-    int ctype = win32_ctrl_class(cname);
-    if (ctype == WIN32_CTRL_BUTTON &&
-        ((style & 0xFu) == BS_CHECKBOX || (style & 0xFu) == BS_AUTOCHECKBOX))
-        ctype = WIN32_CTRL_CHECKBOX;
+    /* A predefined control class (BUTTON/EDIT/STATIC/CHECKBOX/LISTBOX/SCROLLBAR;
+     * C14: COMBOBOX/RADIO/GROUPBOX/SysTabControl32) with a parent creates a
+     * VIRTUAL child rendered into the parent's client area, not a top-level
+     * window. Its HWND is a tagged token; its id is hMenu (a9). A "BUTTON" with
+     * a checkbox/radio/groupbox style is reclassified accordingly. */
+    int ctype = win32_button_subkind(win32_ctrl_class(cname), style);
     if (ctype && parent_fd) {
-        for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
-            if (g_win32_gui.ctrl[i].in_use) continue;
-            struct win32_ctrl *c = &g_win32_gui.ctrl[i];
-            memset(c, 0, sizeof(*c));
-            c->in_use = true;  c->parent_fd = parent_fd;  c->type = ctype;
-            c->x = (int)(int32_t)a[4];  c->y = (int)(int32_t)a[5];
-            c->w = w;  c->h = h;  c->id = (int)a[9];   /* hMenu = control id */
-            if (name)
-                (void)strncpy_from_user(c->text, (const char *)(uintptr_t)name,
-                                        sizeof(c->text));
-            if (ctype == WIN32_CTRL_EDIT) {            /* auto-focus the first EDIT */
-                bool any = false;
-                for (int j = 0; j < WIN32_MAX_CTRLS; j++)
-                    if (g_win32_gui.ctrl[j].in_use &&
-                        g_win32_gui.ctrl[j].parent_fd == parent_fd &&
-                        g_win32_gui.ctrl[j].type == WIN32_CTRL_EDIT &&
-                        g_win32_gui.ctrl[j].focus) any = true;
-                if (!any) c->focus = true;
-            } else if (ctype == WIN32_CTRL_LISTBOX) {
-                memset(&g_win32_lb[i], 0, sizeof(g_win32_lb[i]));
-                g_win32_lb[i].sel = -1;
-            } else if (ctype == WIN32_CTRL_SCROLLBAR) {
-                c->sb_min = 0; c->sb_max = 100; c->sb_pos = 0;
-            }
-            struct win32_win *pw = win32_win_find(parent_fd);
-            if (pw) pw->needs_paint = true;           /* redraw parent -> draw control */
-            return (long)(WIN32_CTRL_TAG | (uint64_t)i);
-        }
-        return 0;   /* control table full */
+        char ktext[WIN32_CTRL_TEXT]; ktext[0] = '\0';
+        if (name)
+            (void)strncpy_from_user(ktext, (const char *)(uintptr_t)name, sizeof(ktext));
+        int slot = win32_ctrl_make(parent_fd, ctype, (int)(int32_t)a[4],
+                                   (int)(int32_t)a[5], w, h, (int)a[9],
+                                   name ? ktext : NULL, style);
+        if (slot < 0) return 0;                       /* control table full */
+        return (long)(WIN32_CTRL_TAG | (uint64_t)slot);
     }
 
     struct win32_win *win = win32_win_alloc();
@@ -4536,7 +4614,12 @@ static long w32_CreateWindowExA(uint64_t *a) {
  * queue its PARENT's repaint so the control gets drawn into it. */
 static long w32_ShowWindow(uint64_t *a) {
     struct win32_ctrl *c = win32_ctrl_find(a[0]);
-    if (c) { struct win32_win *pw = win32_win_find(c->parent_fd); if (pw) pw->needs_paint = true; return 1; }
+    if (c) {
+        c->hidden = ((int)a[1] == 0 /* SW_HIDE */);   /* C14: TAB page show/hide */
+        struct win32_win *pw = win32_win_find(c->parent_fd);
+        if (pw) { pw->needs_paint = true; win32_refresh_controls(c->parent_fd); }
+        return 1;
+    }
     struct win32_win *w = win32_win_find((int)a[0]); if (w) w->needs_paint = true; return 1;
 }
 static long w32_UpdateWindow(uint64_t *a) { return w32_ShowWindow(a); }
@@ -5345,7 +5428,7 @@ static void win32_draw_controls(int parent_fd) {
     uint32_t pbg = pw ? pw->fill_color : WIN32_FILL_DEFAULT;
     for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
         struct win32_ctrl *c = &g_win32_gui.ctrl[i];
-        if (!c->in_use || c->parent_fd != parent_fd) continue;
+        if (!c->in_use || c->parent_fd != parent_fd || c->hidden) continue;
         int ty = c->y + (c->h - 8) / 2;
         switch (c->type) {
         case WIN32_CTRL_BUTTON:
@@ -5399,6 +5482,68 @@ static void win32_draw_controls(int parent_fd) {
             (void)gui_window_rect(win, c->x + 2, thy, c->w - 4, 16, 0x00404040);
             break;
         }
+        case WIN32_CTRL_GROUPBOX: {     /* C14: a labelled frame (visual only) */
+            (void)gui_window_rect(win, c->x, c->y + 4, c->w, c->h - 4, 0x00909090);
+            int tw = 0; while (c->text[tw]) tw++;
+            (void)gui_window_fill(win, c->x + 8, c->y, tw * 8 + 6, 9, pbg);
+            (void)gui_window_text(win, c->x + 11, c->y, c->text, 0x00E8E8E8, pbg);
+            break;
+        }
+        case WIN32_CTRL_RADIO: {        /* C14: a circular, group-exclusive check */
+            int rr = 6, ccx = c->x + rr, ccy = c->y + c->h / 2;
+            (void)gui_window_circle(win, ccx, ccy, rr, 0x00FFFFFF);
+            (void)gui_window_circle_outline(win, ccx, ccy, rr, 0x00404040);
+            if (c->checked) (void)gui_window_circle(win, ccx, ccy, 3, 0x00208020);
+            (void)gui_window_text(win, c->x + 2 * rr + 6, ty, c->text, 0x00E8E8E8, pbg);
+            break;
+        }
+        case WIN32_CTRL_COMBOBOX: {     /* C14: closed face (selected text + arrow) */
+            struct win32_lb *lb = &g_win32_lb[i];
+            int fh = 18;                 /* the always-visible field height */
+            (void)gui_window_fill(win, c->x, c->y, c->w, fh, 0x00FFFFFF);
+            (void)gui_window_rect(win, c->x, c->y, c->w, fh, c->dropped ? 0x002E8AE0 : 0x00808080);
+            const char *seltxt = (lb->sel >= 0 && lb->sel < lb->n) ? lb->items[lb->sel] : "";
+            (void)gui_window_text(win, c->x + 5, c->y + (fh - 8) / 2, seltxt, 0x00101010, 0x00FFFFFF);
+            int ax = c->x + c->w - 16;   /* drop-arrow button */
+            (void)gui_window_fill(win, ax, c->y + 1, 15, fh - 2, 0x00C8C8C8);
+            (void)gui_window_text(win, ax + 4, c->y + (fh - 8) / 2, "v", 0x00202020, 0x00C8C8C8);
+            break;                       /* the open dropdown is drawn in pass 2 */
+        }
+        case WIN32_CTRL_TAB: {          /* C14: a row of tab buttons + page frame */
+            struct win32_lb *lb = &g_win32_lb[i];
+            (void)gui_window_fill(win, c->x, c->y, c->w, c->h, pbg);
+            int th = 20, tx = c->x;
+            for (int t = 0; t < lb->n; t++) {
+                int tw = 8 * (int)strlen(lb->items[t]) + 16;
+                bool selt = (t == lb->sel);
+                uint32_t tbg = selt ? 0x00D8D8D8 : 0x00B0B0B0;
+                (void)gui_window_fill(win, tx, c->y, tw, th, tbg);
+                (void)gui_window_rect(win, tx, c->y, tw, th, 0x00606060);
+                (void)gui_window_text(win, tx + 8, c->y + 6, lb->items[t], 0x00101010, tbg);
+                tx += tw;
+            }
+            /* page area below the tab row */
+            (void)gui_window_rect(win, c->x, c->y + th, c->w, c->h - th, 0x00606060);
+            (void)gui_window_fill(win, c->x + 1, c->y + th + 1, c->w - 2, c->h - th - 2, 0x00D8D8D8);
+            break;
+        }
+        }
+    }
+    /* Pass 2: open COMBOBOX dropdowns, drawn on top of sibling controls. */
+    for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
+        struct win32_ctrl *c = &g_win32_gui.ctrl[i];
+        if (!c->in_use || c->parent_fd != parent_fd || c->hidden) continue;
+        if (c->type != WIN32_CTRL_COMBOBOX || !c->dropped) continue;
+        struct win32_lb *lb = &g_win32_lb[i];
+        int fh = 18, dy = c->y + fh, dh = lb->n * 14 + 2;
+        (void)gui_window_fill(win, c->x, dy, c->w, dh, 0x00FFFFFF);
+        (void)gui_window_rect(win, c->x, dy, c->w, dh, 0x00404040);
+        for (int r = 0; r < lb->n; r++) {
+            int ry = dy + 1 + r * 14;
+            uint32_t bg = (r == lb->sel) ? 0x002E8AE0 : 0x00FFFFFF;
+            uint32_t fg = (r == lb->sel) ? 0x00FFFFFF : 0x00101010;
+            (void)gui_window_fill(win, c->x + 1, ry, c->w - 2, 14, bg);
+            (void)gui_window_text(win, c->x + 5, ry + 3, lb->items[r], fg, bg);
         }
     }
 }
@@ -5418,6 +5563,20 @@ static void win32_msg_push(int parent_fd, uint32_t message, uint64_t wParam, uin
     g_win32_gui.cmd_head = next;
 }
 
+/* C14: a TAB selection change is reported as WM_NOTIFY whose lParam points to an
+ * NMHDR { hwndFrom, idFrom, code=TCN_SELCHANGE } staged in the CRT data page.
+ * The app handles WM_NOTIFY, checks ->code, then calls TabCtrl_GetCurSel. */
+static void win32_tab_notify(int parent_fd, int ctrl_id, int slot) {
+    uint64_t base = WIN32_CRT_DATA_BASE + WIN32_CRT_NMHDR;
+    uint64_t hwndFrom = WIN32_CTRL_TAG | (uint64_t)slot;
+    uint64_t idFrom   = (uint64_t)(uint32_t)ctrl_id;
+    uint32_t code     = (uint32_t)TCN_SELCHANGE;
+    (void)copy_to_user((void *)(uintptr_t)(base + 0x00), &hwndFrom, 8);
+    (void)copy_to_user((void *)(uintptr_t)(base + 0x08), &idFrom, 8);
+    (void)copy_to_user((void *)(uintptr_t)(base + 0x10), &code, 4);
+    win32_msg_push(parent_fd, WM_NOTIFY, (uint64_t)(uint32_t)ctrl_id, base);
+}
+
 /* Route a parent window's input event to a control if it targets one. Returns
  * true if a control consumed it (the app should NOT see it). */
 static bool win32_route_control_input(int parent_fd, const struct gui_event *ev) {
@@ -5427,9 +5586,80 @@ static bool win32_route_control_input(int parent_fd, const struct gui_event *ev)
     if (!has) return false;
 
     if (ev->type == GUI_EV_MOUSE_DOWN) {
+        /* C14 pre-pass A: an open COMBOBOX dropdown is drawn on top of its
+         * siblings, so it captures clicks first; a closed combo opens on a
+         * field click. */
         for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
             struct win32_ctrl *c = &g_win32_gui.ctrl[i];
-            if (!c->in_use || c->parent_fd != parent_fd) continue;
+            if (!c->in_use || c->parent_fd != parent_fd || c->hidden) continue;
+            if (c->type != WIN32_CTRL_COMBOBOX) continue;
+            struct win32_lb *lb = &g_win32_lb[i];
+            int fh = 18, dy = c->y + fh, dh = lb->n * 14 + 2;
+            bool inField = ev->x >= c->x && ev->x < c->x + c->w &&
+                           ev->y >= c->y && ev->y < c->y + fh;
+            if (c->dropped) {
+                bool inDrop = ev->x >= c->x && ev->x < c->x + c->w &&
+                              ev->y >= dy && ev->y < dy + dh;
+                if (inDrop) {
+                    int row = (ev->y - (dy + 1)) / 14;
+                    if (row >= 0 && row < lb->n) {
+                        lb->sel = row;
+                        win32_msg_push(parent_fd, WM_COMMAND,
+                                       ((uint64_t)CBN_SELCHANGE << 16) | (uint32_t)c->id,
+                                       WIN32_CTRL_TAG | (uint64_t)i);
+                        if (g_win32_log_input)
+                            kprintf("[winpe] control: COMBOBOX id=%d -> sel=%d ('%s')\n",
+                                    c->id, row, lb->items[row]);
+                    }
+                    c->dropped = false;
+                    win32_refresh_controls(parent_fd);
+                    return true;
+                }
+                c->dropped = false;                 /* click off the list -> close */
+                win32_refresh_controls(parent_fd);
+                if (inField) return true;           /* on the field -> just close */
+                /* else fall through so the click can hit another control */
+            } else if (inField) {
+                c->dropped = true;                  /* open the dropdown */
+                win32_refresh_controls(parent_fd);
+                if (g_win32_log_input)
+                    kprintf("[winpe] control: COMBOBOX id=%d opened\n", c->id);
+                return true;
+            }
+        }
+        /* C14 pre-pass B: a TAB strip captures clicks only in its tab ROW; the
+         * page area below stays click-transparent so the page's controls work. */
+        for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
+            struct win32_ctrl *c = &g_win32_gui.ctrl[i];
+            if (!c->in_use || c->parent_fd != parent_fd || c->hidden) continue;
+            if (c->type != WIN32_CTRL_TAB) continue;
+            if (ev->y < c->y || ev->y >= c->y + 20) continue;   /* tab row height = 20 */
+            struct win32_lb *lb = &g_win32_lb[i];
+            int tx = c->x;
+            for (int t = 0; t < lb->n; t++) {
+                int tw = 8 * (int)strlen(lb->items[t]) + 16;
+                if (ev->x >= tx && ev->x < tx + tw) {
+                    if (lb->sel != t) {
+                        lb->sel = t;
+                        win32_tab_notify(parent_fd, c->id, i);   /* WM_NOTIFY TCN_SELCHANGE */
+                        win32_refresh_controls(parent_fd);
+                        if (g_win32_log_input)
+                            kprintf("[winpe] control: TAB id=%d -> sel=%d ('%s')\n",
+                                    c->id, t, lb->items[t]);
+                    }
+                    return true;
+                }
+                tx += tw;
+            }
+            return true;   /* in the tab row but between tabs -> still consume */
+        }
+        for (int i = 0; i < WIN32_MAX_CTRLS; i++) {
+            struct win32_ctrl *c = &g_win32_gui.ctrl[i];
+            if (!c->in_use || c->parent_fd != parent_fd || c->hidden) continue;
+            /* COMBOBOX is handled above; GROUPBOX/TAB page areas are click-
+             * transparent so controls drawn over them still receive clicks. */
+            if (c->type == WIN32_CTRL_COMBOBOX || c->type == WIN32_CTRL_GROUPBOX ||
+                c->type == WIN32_CTRL_TAB) continue;
             if (ev->x < c->x || ev->x >= c->x + c->w ||
                 ev->y < c->y || ev->y >= c->y + c->h) continue;
             uint64_t hctrl = WIN32_CTRL_TAG | (uint64_t)i;
@@ -5447,6 +5677,21 @@ static bool win32_route_control_input(int parent_fd, const struct gui_event *ev)
                 win32_refresh_controls(parent_fd);
                 if (g_win32_log_input)
                     kprintf("[winpe] control: CHECKBOX id=%d -> checked=%d\n", c->id, (int)c->checked);
+                break;
+            case WIN32_CTRL_RADIO:
+                /* mutual exclusion within the same parent + WS_GROUP group */
+                for (int j = 0; j < WIN32_MAX_CTRLS; j++) {
+                    struct win32_ctrl *o = &g_win32_gui.ctrl[j];
+                    if (o->in_use && o->parent_fd == parent_fd &&
+                        o->type == WIN32_CTRL_RADIO && o->group == c->group)
+                        o->checked = false;
+                }
+                c->checked = true;
+                win32_msg_push(parent_fd, WM_COMMAND,
+                               ((uint64_t)BN_CLICKED << 16) | (uint32_t)c->id, hctrl);
+                win32_refresh_controls(parent_fd);
+                if (g_win32_log_input)
+                    kprintf("[winpe] control: RADIO id=%d (group=%d) selected\n", c->id, c->group);
                 break;
             case WIN32_CTRL_EDIT:
                 for (int j = 0; j < WIN32_MAX_CTRLS; j++)
@@ -5582,6 +5827,59 @@ static long w32_SendMessageA(uint64_t *a) {
             char z = 0; (void)copy_to_user((void *)(uintptr_t)(lp + n), &z, 1);
         }
         return n;
+    }
+    /* ---- C14 COMBOBOX (CB_*) ---- reuse the listbox item store ---- */
+    case CB_ADDSTRING:
+        if (lb->n >= WIN32_LB_MAX_ITEMS) return -1 /* CB_ERR */;
+        lb->items[lb->n][0] = 0;
+        if (lp) (void)strncpy_from_user(lb->items[lb->n], (const char *)(uintptr_t)lp, WIN32_LB_ITEM_LEN);
+        lb->n++;
+        win32_refresh_controls(c->parent_fd);
+        return lb->n - 1;
+    case CB_RESETCONTENT: lb->n = 0; lb->sel = -1; win32_refresh_controls(c->parent_fd); return 0;
+    case CB_GETCOUNT:     return lb->n;
+    case CB_SETCURSEL:
+        lb->sel = (int)(int32_t)wp;
+        if (lb->sel < -1) lb->sel = -1;
+        if (lb->sel >= lb->n) lb->sel = lb->n - 1;
+        win32_refresh_controls(c->parent_fd);
+        return lb->sel;
+    case CB_GETCURSEL:    return lb->sel;
+    case CB_GETLBTEXT: {
+        int idx = (int)(int32_t)wp;
+        if (idx < 0 || idx >= lb->n) return -1 /* CB_ERR */;
+        int n = 0; while (n < WIN32_LB_ITEM_LEN - 1 && lb->items[idx][n]) n++;
+        if (lp) {
+            (void)copy_to_user((void *)(uintptr_t)lp, lb->items[idx], n);
+            char z = 0; (void)copy_to_user((void *)(uintptr_t)(lp + n), &z, 1);
+        }
+        return n;
+    }
+    /* ---- C14 TAB (SysTabControl32, TCM_*) ---- tabs in the item store ---- */
+    case TCM_INSERTITEMA: {
+        /* lParam = TCITEM; pszText (char*) at offset 0x10 on x64. */
+        if (lb->n >= WIN32_LB_MAX_ITEMS) return -1;
+        lb->items[lb->n][0] = 0;
+        if (lp) {
+            uint64_t pszText = 0;
+            if (copy_from_user(&pszText, (const void *)(uintptr_t)(lp + 0x10), 8) == 0 && pszText)
+                (void)strncpy_from_user(lb->items[lb->n], (const char *)(uintptr_t)pszText,
+                                        WIN32_LB_ITEM_LEN);
+        }
+        if (lb->sel < 0) lb->sel = 0;       /* first inserted tab is selected */
+        int idx = lb->n++;
+        win32_refresh_controls(c->parent_fd);
+        return idx;
+    }
+    case TCM_GETITEMCOUNT: return lb->n;
+    case TCM_GETCURSEL:    return lb->sel;
+    case TCM_SETCURSEL: {
+        int old = lb->sel;
+        lb->sel = (int)(int32_t)wp;
+        if (lb->sel < 0) lb->sel = 0;
+        if (lb->sel >= lb->n) lb->sel = lb->n - 1;
+        win32_refresh_controls(c->parent_fd);
+        return old;
     }
     default: return 0;
     }

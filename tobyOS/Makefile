@@ -1393,6 +1393,19 @@ programs/win-font13/win-font13.exe: programs/win-font13/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
 	      -o $@ $< -lgdi32 -luser32
 
+# Track C/C14a: a STOCK Win32 GUI .exe exercising the new controls -- a GROUPBOX,
+# two mutually-exclusive RADIO buttons, a COMBOBOX, and a SysTabControl32 TAB.
+programs/win-ctrl14/win-ctrl14.exe: programs/win-ctrl14/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
+	      -o $@ $< -lgdi32 -luser32
+
+# Track C/C14a: a STOCK Win32 GUI .exe driven from a RESOURCE dialog template
+# (DialogBoxParamA + RT_DIALOG in .rsrc + DialogProc + EndDialog).
+programs/win-dlg14/win-dlg14.exe: programs/win-dlg14/main.c programs/win-dlg14/dlg.rc
+	windres -i programs/win-dlg14/dlg.rc -o programs/win-dlg14/dlg_res.o --target=pe-x86-64
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
+	      -o $@ $< programs/win-dlg14/dlg_res.o -lgdi32 -luser32
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1690,6 +1703,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-ctrl12/win-ctrl12.exe \
                programs/win-ctrl13/win-ctrl13.exe \
                programs/win-font13/win-font13.exe \
+               programs/win-ctrl14/win-ctrl14.exe \
+               programs/win-dlg14/win-dlg14.exe \
                initrd/etc/motd initrd/readme.txt \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1755,6 +1770,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-ctrl12/win-ctrl12.exe             $(INITRD_STAGE)/bin/win-ctrl12.exe
 	cp programs/win-ctrl13/win-ctrl13.exe             $(INITRD_STAGE)/bin/win-ctrl13.exe
 	cp programs/win-font13/win-font13.exe             $(INITRD_STAGE)/bin/win-font13.exe
+	cp programs/win-ctrl14/win-ctrl14.exe             $(INITRD_STAGE)/bin/win-ctrl14.exe
+	cp programs/win-dlg14/win-dlg14.exe               $(INITRD_STAGE)/bin/win-dlg14.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -1963,6 +1980,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-c11file.exe bin/win-gui11.exe                          \
 	    bin/win-bmp12.exe bin/win-ctrl12.exe                           \
 	    bin/win-ctrl13.exe bin/win-font13.exe                          \
+	    bin/win-ctrl14.exe bin/win-dlg14.exe                           \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \

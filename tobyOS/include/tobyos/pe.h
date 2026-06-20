@@ -69,6 +69,9 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
  * (Windows->tobyOS) path so it can hand sys_open a USER pointer. */
 #define WIN32_CRT_PATHBUF   0x800  /* translated path scratch (<=0x200)  */
 #define WIN32_CRT_CMDLINE   0xA00  /* the command-line string bytes      */
+/* C14 (TAB control): a staged NMHDR { HWND hwndFrom; UINT_PTR idFrom; UINT code }
+ * whose USER pointer is passed in WM_NOTIFY.lParam (the app reads ->code). */
+#define WIN32_CRT_NMHDR     0xC00  /* struct NMHDR (24 bytes)            */
 
 /* C6 (multithreading): the CPL3 thread wrapper lives at this fixed VA in the
  * shim page (WIN32_SHIM_BASE 0x30000000 + WIN32_WRAPPER_OFF 0x80); CreateThread

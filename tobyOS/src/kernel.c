@@ -2346,7 +2346,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -4335,6 +4335,57 @@ void _start(void) {
                 int rc = proc_wait(fpid);
                 kprintf("[boot] WINPE13: /bin/win-font13.exe (pid=%d) exit=%d\n", fpid, rc);
                 kprintf("[WINPE13F] VERDICT: %s exit=%d (expected 13)\n", rc == 13 ? "PASS" : "FAIL", rc);
+            }
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE14_BOOT
+    /* Track C -- COMBOBOX/RADIO/GROUPBOX/TAB controls + dialog templates,
+     * milestone C14a. Build EXTRA_CFLAGS+=-DWINPE14_BOOT. Two GUI proofs
+     * (reusing C8's auto-login + desktop launch):
+     *   A) /bin/win-ctrl14.exe: the harness selects the 2nd RADIO, opens the
+     *      COMBOBOX + picks "Green", switches to TAB "Two", then clicks Finish
+     *      -> exit 14 iff radio2 + combo=Green + tab=Two all read back.
+     *   B) /bin/win-dlg14.exe: a modal DialogBoxParamA built from an RT_DIALOG
+     *      resource template; the harness types into the EDIT, toggles the
+     *      CHECKBOX, then clicks OK -> exit 14. */
+    {
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+
+        /* ---- Part A: the four new controls ---- */
+        kprintf("[boot] WINPE14: spawning /bin/win-ctrl14.exe (combo/radio/group/tab)\n");
+        int cpid = winpe_spawn_session_app("/bin/win-ctrl14.exe", "win-ctrl14.exe");
+        if (cpid < 0) {
+            kprintf("[WINPE14] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 100 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(cpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE14] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(cpid, SIGKILL); (void)proc_wait(cpid);
+            } else {
+                winpe8_pump_ms(900);   /* controls drawn */
+                kprintf("[boot] WINPE14: select RADIO 'Slow'\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 41, 70, MOUSE_BTN_LEFT);   winpe8_pump_ms(300);
+                kprintf("[boot] WINPE14: open the COMBOBOX\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 320, 43, MOUSE_BTN_LEFT);  winpe8_pump_ms(300);
+                kprintf("[WINPE14] COMBOBOX dropdown open; holding ~4s for screenshot\n");
+                winpe8_pump_ms(4000);
+                kprintf("[boot] WINPE14: pick COMBOBOX item 'Green'\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 320, 75, MOUSE_BTN_LEFT);  winpe8_pump_ms(300);
+                kprintf("[boot] WINPE14: switch to TAB 'Two'\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 80, 120, MOUSE_BTN_LEFT);  winpe8_pump_ms(300);
+                kprintf("[WINPE14] controls set (radio+combo+tab); holding ~4s for screenshot\n");
+                winpe8_pump_ms(4000);
+                kprintf("[boot] WINPE14: click Finish\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 240, 315, MOUSE_BTN_LEFT);
+                for (int i = 0; i < 160 && win32_gui_window_count(cpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(cpid);
+                kprintf("[boot] WINPE14: /bin/win-ctrl14.exe (pid=%d) exit=%d\n", cpid, rc);
+                kprintf("[WINPE14] VERDICT: %s exit=%d (expected 14)\n", rc == 14 ? "PASS" : "FAIL", rc);
             }
         }
         win32_gui_set_log(false);
