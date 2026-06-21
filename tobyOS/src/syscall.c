@@ -7198,6 +7198,216 @@ static long w32_RegEnumValueA(uint64_t *a) {
     return ERROR_SUCCESS;
 }
 
+/* ================= C16b: common file dialogs (comdlg32) =================
+ * GetOpenFileNameA/GetSaveFileNameA as a REAL modal file picker over /data
+ * (== "C:"): it lists the current directory, lets the user pick/navigate, and
+ * writes the chosen "C:\..." path into the OPENFILENAMEA.lpstrFile buffer.
+ * OPENFILENAMEA x64 offsets: lpstrFile@0x30, nMaxFile@0x38, lpstrInitialDir@0x50,
+ * lpstrTitle@0x58, Flags@0x60. */
+#define OFD_MAX_ENTRIES 48
+#define OFD_ROW_H       16
+struct ofd_entry { char name[40]; bool is_dir; };
+
+/* leaf name of a path (after the last '\\' or '/'). */
+static const char *ofd_leaf(const char *p) {
+    const char *s = p;
+    for (const char *q = p; *q; q++) if (*q == '\\' || *q == '/') s = q + 1;
+    return s;
+}
+/* List "/data/<curdir>" into ents[]; returns count. Adds ".." if not at root. */
+static int ofd_list(const char *curdir, struct ofd_entry *ents, int cap) {
+    char dpath[192];
+    int n = 0; const char *base = "/data";
+    while (base[n] && n < (int)sizeof(dpath) - 1) { dpath[n] = base[n]; n++; }
+    if (curdir[0]) { if (n < (int)sizeof(dpath) - 1) dpath[n++] = '/';
+        for (const char *p = curdir; *p && n < (int)sizeof(dpath) - 1; p++) dpath[n++] = *p; }
+    dpath[n] = 0;
+    int cnt = 0;
+    if (curdir[0]) {   /* parent entry */
+        ents[cnt].is_dir = true; ents[cnt].name[0] = '.'; ents[cnt].name[1] = '.'; ents[cnt].name[2] = 0; cnt++;
+    }
+    struct vfs_dir d;
+    if (vfs_opendir(dpath, &d) == VFS_OK) {
+        struct vfs_dirent de;
+        while (cnt < cap && vfs_readdir(&d, &de) == VFS_OK) {
+            if (de.name[0] == '.' && de.name[1] == 0) continue;      /* skip "." */
+            if (de.name[0] == '.' && de.name[1] == '.' && de.name[2] == 0) continue;
+            int k = 0; while (de.name[k] && k < 39) { ents[cnt].name[k] = de.name[k]; k++; }
+            ents[cnt].name[k] = 0;
+            ents[cnt].is_dir = (de.type == VFS_TYPE_DIR);
+            cnt++;
+        }
+        vfs_closedir(&d);
+    }
+    return cnt;
+}
+
+static long win32_file_dialog(uint64_t ofn, bool save) {
+    if (!ofn) return 0;
+    uint64_t lpFile = 0, lpTitle = 0; uint32_t nMax = 0;
+    (void)copy_from_user(&lpFile,  (const void *)(uintptr_t)(ofn + 0x30), 8);
+    (void)copy_from_user(&nMax,    (const void *)(uintptr_t)(ofn + 0x38), 4);
+    (void)copy_from_user(&lpTitle, (const void *)(uintptr_t)(ofn + 0x58), 8);
+    char field[48]; field[0] = 0;
+    if (lpFile) { char tmp[160]; tmp[0] = 0;
+        (void)strncpy_from_user(tmp, (const char *)(uintptr_t)lpFile, sizeof(tmp));
+        const char *lf = ofd_leaf(tmp);
+        int i = 0; while (lf[i] && i < (int)sizeof(field) - 1) { field[i] = lf[i]; i++; } field[i] = 0; }
+    char title[40]; title[0] = 0;
+    if (lpTitle) (void)strncpy_from_user(title, (const char *)(uintptr_t)lpTitle, sizeof(title));
+    const char *deftitle = save ? "Save As" : "Open";
+
+    const int W = 420, H = 344;
+    int fd = -1;
+    if (cap_check(current_proc(), CAP_GUI, "FileDialog")) {
+        struct window *dw = gui_window_create(W, H, title[0] ? title : deftitle);
+        if (dw) {
+            struct file *df = (struct file *)kmalloc(sizeof(*df));
+            if (df) { memset(df, 0, sizeof(*df)); df->kind = FILE_KIND_WINDOW; df->win = dw;
+                      fd = fd_alloc_into(current_proc(), df);
+                      if (fd < 0) { kfree(df); gui_window_close(dw); } }
+            else gui_window_close(dw);
+        }
+    }
+    if (fd < 0) return 0;
+    struct window *win = win32_hdc_window(fd);
+
+    char curdir[128]; curdir[0] = 0;             /* relative to /data */
+    static struct ofd_entry ents[OFD_MAX_ENTRIES];
+    int nents = 0, sel = -1, top = 0;
+    const int listX = 12, listY = 56, listW = W - 24, listH = OFD_ROW_H * 14;
+    const int okx = W - 180, oky = H - 40, okw = 76, okh = 26;
+    const int cax = W - 92,  cay = oky,    caw = 76, cah = okh;
+    bool relist = true, redraw = true;
+    long result = 0;
+
+    uint64_t hz = pit_hz(); if (!hz) hz = 100;
+    uint64_t deadline = pit_ticks() + 40 * hz;
+    while (pit_ticks() < deadline) {
+        if (relist) {
+            nents = ofd_list(curdir, ents, OFD_MAX_ENTRIES);
+            sel = -1;
+            for (int i = 0; i < nents; i++)
+                if (!ents[i].is_dir && win32_streq_ci(ents[i].name, field)) { sel = i; break; }
+            relist = false; redraw = true;
+        }
+        if (redraw && win) {
+            (void)gui_window_fill(win, 0, 0, W, H, 0x00DCDCDC);
+            char look[160]; int li = 0;
+            const char *pfx = "Look in:  C:\\";
+            for (const char *p = pfx; *p && li < 150; p++) look[li++] = *p;
+            for (const char *p = curdir; *p && li < 150; p++) look[li++] = (*p == '/') ? '\\' : *p;
+            look[li] = 0;
+            (void)gui_window_text(win, 12, 14, look, 0x00101010, 0x00DCDCDC);
+            (void)gui_window_fill(win, listX, listY, listW, listH, 0x00FFFFFF);
+            (void)gui_window_rect(win, listX, listY, listW, listH, 0x00808080);
+            for (int r = 0; r < nents && r < listH / OFD_ROW_H; r++) {
+                int i = top + r; if (i >= nents) break;
+                int ry = listY + 2 + r * OFD_ROW_H;
+                uint32_t bg = (i == sel) ? 0x002E8AE0 : 0x00FFFFFF;
+                uint32_t fg = (i == sel) ? 0x00FFFFFF : 0x00101010;
+                if (i == sel) (void)gui_window_fill(win, listX + 1, ry - 1, listW - 2, OFD_ROW_H, bg);
+                char line[48]; int c = 0;
+                if (ents[i].is_dir) { const char *d = "[ ] "; for (int k = 0; d[k]; k++) line[c++] = d[k]; line[1] = '+'; }
+                for (int k = 0; ents[i].name[k] && c < 46; k++) line[c++] = ents[i].name[k];
+                line[c] = 0;
+                (void)gui_window_text(win, listX + 6, ry + 1, line, fg, bg);
+            }
+            /* filename field */
+            int fy = listY + listH + 10;
+            (void)gui_window_text(win, 12, fy + 4, "Name:", 0x00101010, 0x00DCDCDC);
+            (void)gui_window_fill(win, 60, fy, W - 72, 20, 0x00FFFFFF);
+            (void)gui_window_rect(win, 60, fy, W - 72, 20, 0x00808080);
+            (void)gui_window_text(win, 65, fy + 6, field[0] ? field : " ", 0x00000000, 0x00FFFFFF);
+            /* buttons */
+            (void)gui_window_fill(win, okx, oky, okw, okh, 0x00C0C0C0);
+            (void)gui_window_rect(win, okx, oky, okw, okh, 0x00303030);
+            (void)gui_window_text(win, okx + okw / 2 - (save ? 16 : 16), oky + okh / 2 - 4,
+                                  save ? "Save" : "Open", 0x00101010, 0x00C0C0C0);
+            (void)gui_window_fill(win, cax, cay, caw, cah, 0x00C0C0C0);
+            (void)gui_window_rect(win, cax, cay, caw, cah, 0x00303030);
+            (void)gui_window_text(win, cax + caw / 2 - 24, cay + cah / 2 - 4, "Cancel", 0x00101010, 0x00C0C0C0);
+            (void)sys_gui_flip(fd);
+            redraw = false;
+        }
+        struct gui_event ev;
+        if (win32_poll_window_event(fd, &ev) > 0) {
+            if (ev.type == GUI_EV_CLOSE) { result = 0; break; }
+            if (ev.type == GUI_EV_MOUSE_DOWN) {
+                if (ev.x >= listX && ev.x < listX + listW && ev.y >= listY && ev.y < listY + listH) {
+                    int r = (ev.y - (listY + 2)) / OFD_ROW_H, i = top + r;
+                    if (i >= 0 && i < nents) {
+                        sel = i;
+                        if (!ents[i].is_dir) {
+                            int k = 0; while (ents[i].name[k] && k < (int)sizeof(field) - 1) { field[k] = ents[i].name[k]; k++; } field[k] = 0;
+                        }
+                        redraw = true;
+                    }
+                } else if (ev.x >= okx && ev.x < okx + okw && ev.y >= oky && ev.y < oky + okh) {
+                    if (sel >= 0 && ents[sel].is_dir) {     /* navigate into / up */
+                        if (ents[sel].name[0] == '.' && ents[sel].name[1] == '.') {
+                            int e = 0; while (curdir[e]) e++;
+                            while (e > 0 && curdir[e - 1] != '/') e--;
+                            if (e > 0) e--; curdir[e] = 0;
+                        } else {
+                            int e = 0; while (curdir[e]) e++;
+                            if (e && e < (int)sizeof(curdir) - 1) curdir[e++] = '/';
+                            for (int k = 0; ents[sel].name[k] && e < (int)sizeof(curdir) - 1; k++) curdir[e++] = ents[sel].name[k];
+                            curdir[e] = 0;
+                        }
+                        relist = true;
+                    } else if (field[0]) {                  /* pick the file */
+                        char res[200]; int e = 0;
+                        const char *cp = "C:\\"; for (int k = 0; cp[k]; k++) res[e++] = cp[k];
+                        for (const char *p = curdir; *p && e < 190; p++) res[e++] = (*p == '/') ? '\\' : *p;
+                        if (curdir[0] && e < 190) res[e++] = '\\';
+                        for (const char *p = field; *p && e < 198; p++) res[e++] = *p;
+                        res[e] = 0;
+                        if (lpFile) {
+                            int cap = (int)nMax; if (cap <= 0 || cap > (int)sizeof(res)) cap = (int)sizeof(res);
+                            int wl = e; if (wl > cap - 1) wl = cap - 1;
+                            (void)copy_to_user((void *)(uintptr_t)lpFile, res, wl);
+                            char z = 0; (void)copy_to_user((void *)(uintptr_t)(lpFile + wl), &z, 1);
+                        }
+                        if (g_win32_log_input) kprintf("[winpe] %s -> '%s'\n", save ? "GetSaveFileName" : "GetOpenFileName", res);
+                        result = 1; break;
+                    }
+                } else if (ev.x >= cax && ev.x < cax + caw && ev.y >= cay && ev.y < cay + cah) {
+                    result = 0; break;
+                }
+            } else if (ev.type == GUI_EV_KEY) {            /* edit the name field */
+                int n = 0; while (field[n]) n++;
+                uint8_t k = ev.key;
+                if (k == '\b' || k == 0x7F) { if (n > 0) field[n - 1] = 0; redraw = true; }
+                else if (k == '\n' || k == '\r') {          /* Enter == Open */
+                    struct gui_event ok; memset(&ok, 0, sizeof(ok));
+                    ok.type = GUI_EV_MOUSE_DOWN; ok.x = okx + 2; ok.y = oky + 2;
+                    /* fallthrough by faking an Open click next loop is messy; do inline */
+                    if (field[0]) {
+                        char res[200]; int e = 0; const char *cp = "C:\\";
+                        for (int kk = 0; cp[kk]; kk++) res[e++] = cp[kk];
+                        for (const char *p = curdir; *p && e < 190; p++) res[e++] = (*p == '/') ? '\\' : *p;
+                        if (curdir[0] && e < 190) res[e++] = '\\';
+                        for (const char *p = field; *p && e < 198; p++) res[e++] = *p;
+                        res[e] = 0;
+                        if (lpFile) { int cap = (int)nMax; if (cap <= 0 || cap > (int)sizeof(res)) cap = (int)sizeof(res);
+                            int wl = e; if (wl > cap - 1) wl = cap - 1;
+                            (void)copy_to_user((void *)(uintptr_t)lpFile, res, wl);
+                            char z = 0; (void)copy_to_user((void *)(uintptr_t)(lpFile + wl), &z, 1); }
+                        result = 1; break;
+                    }
+                    (void)ok;
+                } else if (k >= 0x20 && k < 0x7F && n < (int)sizeof(field) - 1) { field[n] = (char)k; field[n + 1] = 0; redraw = true; }
+            }
+        }
+        sched_yield();
+    }
+    (void)sys_close(fd);
+    return result;
+}
+static long w32_GetOpenFileNameA(uint64_t *a) { return win32_file_dialog(a[0], false); }
+static long w32_GetSaveFileNameA(uint64_t *a) { return win32_file_dialog(a[0], true); }
+
 struct win32_shim {
     const char    *dll;     /* lower-case DLL name, no path */
     const char    *func;    /* exact exported symbol */
@@ -7420,6 +7630,10 @@ static const struct win32_shim g_win32_shims[] = {
     { "advapi32.dll", "RegDeleteKeyA",        w32_RegDeleteKeyA },
     { "advapi32.dll", "RegEnumKeyExA",        w32_RegEnumKeyExA },
     { "advapi32.dll", "RegEnumValueA",        w32_RegEnumValueA },
+
+    /* ---- C16b: common file dialogs (comdlg32) ---- */
+    { "comdlg32.dll", "GetOpenFileNameA",     w32_GetOpenFileNameA },
+    { "comdlg32.dll", "GetSaveFileNameA",     w32_GetSaveFileNameA },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

@@ -2346,7 +2346,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -4528,6 +4528,44 @@ void _start(void) {
             kprintf("[boot] WINPE16A: /bin/win-reg16.exe (pid=%d) exit=%d\n", pid, rc);
             kprintf("[WINPE16A] VERDICT: %s exit=%d (16=persisted, 17=first-write)\n",
                     (rc == 16 || rc == 17) ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE16B_BOOT
+    /* Track C -- common file dialog (comdlg32), milestone C16b. Build
+     * EXTRA_CFLAGS+=-DWINPE16B_BOOT. A stock Win32 GUI .exe writes a known file
+     * C:\c16test.txt, then a button click calls GetOpenFileNameA; tobyOS shows a
+     * modal file picker over /data; the harness clicks the picker's Open button
+     * (the file is pre-selected by name) and the app opens the returned path +
+     * verifies the contents -> exit 16. */
+    {
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+        kprintf("[boot] WINPE16B: spawning /bin/win-fdlg16.exe (Open file dialog)\n");
+        int mpid = winpe_spawn_session_app("/bin/win-fdlg16.exe", "win-fdlg16.exe");
+        if (mpid < 0) {
+            kprintf("[WINPE16B] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 120 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(mpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE16B] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(mpid, SIGKILL); (void)proc_wait(mpid);
+            } else {
+                winpe8_pump_ms(700);
+                kprintf("[boot] WINPE16B: click 'Open File...'\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 110, 56, MOUSE_BTN_LEFT);  winpe8_pump_ms(900);
+                kprintf("[WINPE16B] file picker up; holding ~3s for screenshot\n");
+                winpe8_pump_ms(3000);
+                kprintf("[boot] WINPE16B: click the picker's Open button\n");
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 278, 317, MOUSE_BTN_LEFT);
+                for (int i = 0; i < 160 && win32_gui_window_count(mpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(mpid);
+                kprintf("[boot] WINPE16B: /bin/win-fdlg16.exe (pid=%d) exit=%d\n", mpid, rc);
+                kprintf("[WINPE16B] VERDICT: %s exit=%d (expected 16)\n", rc == 16 ? "PASS" : "FAIL", rc);
+            }
         }
         win32_gui_set_log(false);
     }
