@@ -1441,6 +1441,10 @@ programs/win-fdlg16/win-fdlg16.exe: programs/win-fdlg16/main.c
 programs/win-env16/win-env16.exe: programs/win-env16/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
 
+# Track C/C16e: a STOCK multithreaded Win32 console .exe proving per-thread TLS.
+programs/win-tls16/win-tls16.exe: programs/win-tls16/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1745,6 +1749,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-reg16/win-reg16.exe \
                programs/win-fdlg16/win-fdlg16.exe \
                programs/win-env16/win-env16.exe \
+               programs/win-tls16/win-tls16.exe \
                initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1818,6 +1823,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-reg16/win-reg16.exe               $(INITRD_STAGE)/bin/win-reg16.exe
 	cp programs/win-fdlg16/win-fdlg16.exe             $(INITRD_STAGE)/bin/win-fdlg16.exe
 	cp programs/win-env16/win-env16.exe               $(INITRD_STAGE)/bin/win-env16.exe
+	cp programs/win-tls16/win-tls16.exe               $(INITRD_STAGE)/bin/win-tls16.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -2028,7 +2034,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-ctrl13.exe bin/win-font13.exe                          \
 	    bin/win-ctrl14.exe bin/win-dlg14.exe bin/win-font14b.exe       \
 	    bin/win-menu15.exe bin/win-reg16.exe bin/win-fdlg16.exe        \
-	    bin/win-env16.exe etc/Lato-Regular.ttf                         \
+	    bin/win-env16.exe bin/win-tls16.exe etc/Lato-Regular.ttf       \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \

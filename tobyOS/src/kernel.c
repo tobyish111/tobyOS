@@ -4597,6 +4597,33 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE16E_BOOT
+    /* Track C -- per-thread TEBs + TLS, milestone C16e. Build EXTRA_CFLAGS+=
+     * -DWINPE16E_BOOT. A stock multithreaded Win32 console .exe: each thread
+     * gets its own TEB, so TlsSetValue/TlsGetValue are per-thread -- three
+     * workers each store a unique value, sleep, and read back their own (and the
+     * main thread's value survives) -> exit 16. */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE16E: spawning /bin/win-tls16.exe (per-thread TLS)\n");
+        char *argv[] = { (char *)"win-tls16.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-tls16.exe", .name = "win-tls16.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE16E] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE16E: /bin/win-tls16.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE16E] VERDICT: %s exit=%d (expected 16)\n", rc == 16 ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery

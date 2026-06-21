@@ -4035,6 +4035,50 @@ static long w32_CloseHandle(uint64_t *a) {
  * across threads. */
 #define WIN32_THREAD_STACK (256u * 1024u)
 
+/* ================= C16e: per-thread TEBs + TLS =================
+ * Each CreateThread thread gets its OWN TEB (so gs:[0x30] / NtCurrentTeb is
+ * per-thread) carrying its own TLS slot array; TlsAlloc/Free/SetValue/GetValue
+ * operate on the calling thread's TEB (current_proc()->gs_base). */
+#define WIN32_TEB_SELF_OFF       0x30
+#define WIN32_TEB_STACKBASE_OFF  0x08
+#define WIN32_TEB_STACKLIMIT_OFF 0x10
+#define WIN32_TEB_TLS_OFF        0x80    /* TLS slot array within our 1-page TEB */
+#define WIN32_TLS_MAX            64
+static uint8_t g_win32_tls_used[WIN32_TLS_MAX];
+
+static void win32_reset_tls(void) { memset(g_win32_tls_used, 0, sizeof(g_win32_tls_used)); }
+
+/* kernel32!TlsAlloc() -> a free index, or TLS_OUT_OF_INDEXES (0xFFFFFFFF). */
+static long w32_TlsAlloc(uint64_t *a) {
+    (void)a;
+    for (int i = 0; i < WIN32_TLS_MAX; i++)
+        if (!g_win32_tls_used[i]) { g_win32_tls_used[i] = 1; return i; }
+    return (long)0xFFFFFFFF;
+}
+static long w32_TlsFree(uint64_t *a) {
+    int i = (int)(uint32_t)a[0];
+    if (i >= 0 && i < WIN32_TLS_MAX) g_win32_tls_used[i] = 0;
+    return 1;
+}
+/* TlsSetValue(idx, val) -> TRUE: write to the calling thread's TEB slot. */
+static long w32_TlsSetValue(uint64_t *a) {
+    uint32_t i = (uint32_t)a[0];
+    struct proc *p = current_proc();
+    if (i >= WIN32_TLS_MAX || !p || !p->gs_base) return 0;
+    uint64_t v = a[1];
+    (void)copy_to_user((void *)(uintptr_t)(p->gs_base + WIN32_TEB_TLS_OFF + (uint64_t)i * 8), &v, 8);
+    return 1;
+}
+/* TlsGetValue(idx) -> the calling thread's TEB slot value (0 if unset). */
+static long w32_TlsGetValue(uint64_t *a) {
+    uint32_t i = (uint32_t)a[0];
+    struct proc *p = current_proc();
+    if (i >= WIN32_TLS_MAX || !p || !p->gs_base) return 0;
+    uint64_t v = 0;
+    (void)copy_from_user(&v, (const void *)(uintptr_t)(p->gs_base + WIN32_TEB_TLS_OFF + (uint64_t)i * 8), 8);
+    return (long)v;
+}
+
 static long w32_CreateThread(uint64_t *a) {
     uint64_t start = a[2];   /* lpStartAddress */
     uint64_t param = a[3];   /* lpParameter    */
@@ -4058,7 +4102,22 @@ static long w32_CreateThread(uint64_t *a) {
      * to the dispatcher) and share the TEB. Safe here: we hold the BKL, so the
      * new thread can't run until this syscall yields/returns. */
     struct proc *t = proc_lookup(tid);
-    if (t) { t->personality = ABI_PERS_WIN32; t->gs_base = leader ? leader->gs_base : 0; }
+    if (t) {
+        t->personality = ABI_PERS_WIN32;
+        /* C16e: give the thread its OWN TEB (per-thread NtCurrentTeb + TLS).
+         * The TEB lives in the shared address space (win32_heap_alloc), so it's
+         * reachable via the thread's gs_base once do_switch loads it. */
+        uint64_t teb = win32_heap_alloc(0x400);
+        if (teb) {
+            uint64_t self = teb, sb = stack_top, sl = stack;
+            (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_SELF_OFF),       &self, 8);
+            (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACKBASE_OFF),  &sb,   8);
+            (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACKLIMIT_OFF), &sl,   8);
+            t->gs_base = teb;
+        } else {
+            t->gs_base = leader ? leader->gs_base : 0;   /* fallback: share */
+        }
+    }
 
     if (ptid) { uint32_t id = (uint32_t)tid; (void)copy_to_user((void *)(uintptr_t)ptid, &id, 4); }
     return (long)(WIN32_THREAD_TAG | (uint64_t)(uint32_t)tid);
@@ -6408,6 +6467,7 @@ static void win32_reset_menus_timers(void) {
     memset(g_win32_menus, 0, sizeof(g_win32_menus));
     memset(g_win32_timers, 0, sizeof(g_win32_timers));
     win32_reset_env();   /* C16c: per-app environment reseeds on next use */
+    win32_reset_tls();   /* C16e: per-app TLS index bitmap */
 }
 
 /* ---- menu shims (user32) ---- */
@@ -7571,7 +7631,10 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetLastError",              w32_zero },
     { "kernel32.dll", "SetUnhandledExceptionFilter", w32_zero },
     { "kernel32.dll", "Sleep",                     w32_Sleep },
-    { "kernel32.dll", "TlsGetValue",               w32_zero },
+    { "kernel32.dll", "TlsAlloc",                  w32_TlsAlloc },
+    { "kernel32.dll", "TlsFree",                   w32_TlsFree },
+    { "kernel32.dll", "TlsGetValue",               w32_TlsGetValue },
+    { "kernel32.dll", "TlsSetValue",               w32_TlsSetValue },
     { "kernel32.dll", "VirtualProtect",            w32_one },
     { "kernel32.dll", "VirtualQuery",              w32_VirtualQuery },
     /* ucrt: environment */
