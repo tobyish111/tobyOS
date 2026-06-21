@@ -1427,6 +1427,11 @@ programs/win-menu15/win-menu15.exe: programs/win-menu15/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
 	      -o $@ $< -lgdi32 -luser32
 
+# Track C/C16a: a STOCK Win32 console .exe exercising the registry (advapi32),
+# persisted across reboot.
+programs/win-reg16/win-reg16.exe: programs/win-reg16/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $< -ladvapi32
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1728,6 +1733,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-dlg14/win-dlg14.exe \
                programs/win-font14b/win-font14b.exe \
                programs/win-menu15/win-menu15.exe \
+               programs/win-reg16/win-reg16.exe \
                initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1798,6 +1804,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-dlg14/win-dlg14.exe               $(INITRD_STAGE)/bin/win-dlg14.exe
 	cp programs/win-font14b/win-font14b.exe           $(INITRD_STAGE)/bin/win-font14b.exe
 	cp programs/win-menu15/win-menu15.exe             $(INITRD_STAGE)/bin/win-menu15.exe
+	cp programs/win-reg16/win-reg16.exe               $(INITRD_STAGE)/bin/win-reg16.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -2007,7 +2014,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-bmp12.exe bin/win-ctrl12.exe                           \
 	    bin/win-ctrl13.exe bin/win-font13.exe                          \
 	    bin/win-ctrl14.exe bin/win-dlg14.exe bin/win-font14b.exe       \
-	    bin/win-menu15.exe etc/Lato-Regular.ttf                        \
+	    bin/win-menu15.exe bin/win-reg16.exe etc/Lato-Regular.ttf      \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \

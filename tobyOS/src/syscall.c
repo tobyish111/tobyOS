@@ -6897,6 +6897,307 @@ static long w32_GetProcAddress(uint64_t *a) {
 
 typedef long (*win32_shim_fn)(uint64_t *args);
 
+/* ================= C16a: registry (advapi32) =================
+ * A small in-kernel registry tree backing the Reg* API. Predefined roots
+ * (HKLM/HKCU/HKCR/HKU) are fixed keys; an opened HKEY is a tagged token into the
+ * key table. Writes are flushed to /data/toby_registry.dat (vfs_write_all) so an
+ * app's settings survive a reboot; the hive is lazy-loaded on first use. */
+#define WIN32_HKEY_TAG    0x6700000000000000ull   /* distinct: menu 0x66 / font 0x65 */
+#define REG_MAX_KEYS      24
+#define REG_MAX_VALS      4
+#define REG_NAME_LEN      40
+#define REG_DATA_LEN      48
+#define REG_PATH          "/data/toby_registry.dat"
+#define REG_MAGIC         0x52475431u   /* 'RGT1' -- hive format v1 */
+
+#define ERROR_SUCCESS         0
+#define ERROR_FILE_NOT_FOUND  2
+#define ERROR_NO_MORE_ITEMS   259
+#define REG_SZ                1
+#define REG_BINARY            3
+#define REG_DWORD             4
+
+/* C16a: flush dirty bcache to the backing disk so registry writes reach /data's
+ * disk image even on an unclean shutdown (a forced kill skips shutdown sync). */
+struct blk_dev;
+extern struct blk_dev *blk_get(size_t idx);
+extern void bcache_sync(struct blk_dev *dev);
+static void reg_sync_disks(void) {
+    int n = 0;
+    for (size_t i = 0; ; i++) {
+        struct blk_dev *d = blk_get(i);
+        if (!d) break;
+        bcache_sync(d); n++;
+    }
+    if (g_win32_log_input) kprintf("[winreg] synced %d block device(s)\n", n);
+}
+
+struct reg_value { char name[REG_NAME_LEN]; uint32_t type, len; uint8_t data[REG_DATA_LEN]; };
+struct reg_key {
+    bool in_use; int parent; char name[REG_NAME_LEN];
+    int nvals; struct reg_value vals[REG_MAX_VALS];
+};
+static struct { uint32_t magic, version, nkeys, reserved; struct reg_key keys[REG_MAX_KEYS]; } g_reg;
+static bool g_reg_loaded;
+
+static void reg_seed_roots(void) {
+    /* roots 0..3 = HKEY_CLASSES_ROOT / HKCU / HKLM / HKEY_USERS */
+    static const char *rn[4] = { "CLASSES_ROOT", "CURRENT_USER", "LOCAL_MACHINE", "USERS" };
+    for (int i = 0; i < 4; i++) {
+        memset(&g_reg.keys[i], 0, sizeof(g_reg.keys[i]));
+        g_reg.keys[i].in_use = true; g_reg.keys[i].parent = -1;
+        int n = 0; while (rn[i][n] && n < REG_NAME_LEN - 1) { g_reg.keys[i].name[n] = rn[i][n]; n++; }
+        g_reg.keys[i].name[n] = 0;
+    }
+}
+static void reg_ensure_loaded(void) {
+    if (g_reg_loaded) return;
+    g_reg_loaded = true;
+    void *buf = 0; size_t sz = 0;
+    if (vfs_read_all(REG_PATH, &buf, &sz) == 0 && buf && sz >= sizeof(g_reg)) {
+        memcpy(&g_reg, buf, sizeof(g_reg));   /* the hive is at offset 0 */
+        kfree(buf);
+        if (g_reg.magic == REG_MAGIC) {
+            kprintf("[winreg] loaded hive %s (%d keys)\n", REG_PATH, (int)g_reg.nkeys);
+            return;
+        }
+    } else if (buf) kfree(buf);
+    memset(&g_reg, 0, sizeof(g_reg));
+    g_reg.magic = REG_MAGIC; g_reg.version = 1;
+    reg_seed_roots();
+    kprintf("[winreg] fresh hive (no %s)\n", REG_PATH);
+}
+static void reg_flush(void) {
+    g_reg.nkeys = 0;
+    for (int i = 0; i < REG_MAX_KEYS; i++) if (g_reg.keys[i].in_use) g_reg.nkeys++;
+    (void)vfs_unlink(REG_PATH);   /* clean slate -- vfs_create doesn't truncate */
+    int cr = vfs_create(REG_PATH);
+    if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
+        if (g_win32_log_input) kprintf("[winreg] flush create failed rc=%d\n", cr);
+        return;
+    }
+    struct vfs_file f;
+    if (vfs_open(REG_PATH, &f) != VFS_OK) return;
+    /* Write in chunks (a single large vfs_write can fail on tobyfs). */
+    const uint8_t *p = (const uint8_t *)&g_reg;
+    size_t total = sizeof(g_reg), off = 0;
+    bool ok = true;
+    while (off < total) {
+        size_t chunk = total - off; if (chunk > 4096) chunk = 4096;
+        long w = vfs_write(&f, p + off, chunk);
+        if (w <= 0) { ok = false; break; }
+        off += (size_t)w;
+    }
+    vfs_close(&f);
+    if (ok) reg_sync_disks();    /* make the write durable on the disk image */
+    if (g_win32_log_input)
+        kprintf("[winreg] flush %s -> %s (%lu bytes, %d keys)\n",
+                REG_PATH, ok ? "ok" : "IO-FAIL", (unsigned long)off, (int)g_reg.nkeys);
+}
+/* Predefined root or tagged HKEY -> key index, or -1. The predefined HKEYs
+ * (HKEY_CURRENT_USER etc.) are (HKEY)(LONG_PTR)0x8000000n, which compilers
+ * SIGN-extend to 0xFFFFFFFF8000000n -- so match them on the low 32 bits, and
+ * check our tagged handle (top byte 0x67) first to disambiguate. */
+static int reg_resolve(uint64_t hkey) {
+    reg_ensure_loaded();
+    if ((hkey & WIN32_TAG_MASK) == WIN32_HKEY_TAG) {
+        int idx = (int)(hkey & 0xFF);
+        if (idx >= 0 && idx < REG_MAX_KEYS && g_reg.keys[idx].in_use) return idx;
+        return -1;
+    }
+    uint32_t lo = (uint32_t)hkey;
+    if (lo >= 0x80000000u && lo <= 0x800000FFu) {
+        int r = (int)(lo - 0x80000000u);
+        return (r >= 0 && r < 4) ? r : 2;   /* unknown predefined -> HKLM */
+    }
+    return -1;
+}
+static bool reg_name_eq(const char *a, const char *b) {   /* case-insensitive */
+    for (;; a++, b++) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+        if (ca != cb) return false;
+        if (!ca) return true;
+    }
+}
+static int reg_find_child(int parent, const char *name) {
+    for (int i = 0; i < REG_MAX_KEYS; i++)
+        if (g_reg.keys[i].in_use && g_reg.keys[i].parent == parent &&
+            reg_name_eq(g_reg.keys[i].name, name)) return i;
+    return -1;
+}
+static int reg_alloc_child(int parent, const char *name) {
+    for (int i = 4; i < REG_MAX_KEYS; i++)
+        if (!g_reg.keys[i].in_use) {
+            memset(&g_reg.keys[i], 0, sizeof(g_reg.keys[i]));
+            g_reg.keys[i].in_use = true; g_reg.keys[i].parent = parent;
+            int n = 0; while (name[n] && n < REG_NAME_LEN - 1) { g_reg.keys[i].name[n] = name[n]; n++; }
+            g_reg.keys[i].name[n] = 0;
+            return i;
+        }
+    return -1;
+}
+/* Walk a "Sub\\Path" relative to root key `idx`; create=true makes missing keys. */
+static int reg_walk(int idx, const char *path, bool create) {
+    char comp[REG_NAME_LEN]; int ci = 0;
+    for (const char *p = path; ; p++) {
+        if (*p == '\\' || *p == '/' || *p == 0) {
+            if (ci > 0) {
+                comp[ci] = 0;
+                int child = reg_find_child(idx, comp);
+                if (child < 0) {
+                    if (!create) return -1;
+                    child = reg_alloc_child(idx, comp);
+                    if (child < 0) return -1;
+                }
+                idx = child; ci = 0;
+            }
+            if (*p == 0) break;
+        } else if (ci < REG_NAME_LEN - 1) comp[ci++] = *p;
+    }
+    return idx;
+}
+static struct reg_value *reg_find_value(int idx, const char *name) {
+    struct reg_key *k = &g_reg.keys[idx];
+    for (int i = 0; i < k->nvals; i++)
+        if (reg_name_eq(k->vals[i].name, name)) return &k->vals[i];
+    return NULL;
+}
+
+/* advapi32!RegCreateKeyExA(hKey, lpSubKey, Res, lpClass, dwOpts, sam, lpSA,
+ * phkResult=a7, lpdwDisposition=a8) -> ERROR_SUCCESS. */
+static long w32_RegCreateKeyExA(uint64_t *a) {
+    int root = reg_resolve(a[0]);
+    if (root < 0) return ERROR_FILE_NOT_FOUND;
+    char sub[160]; sub[0] = 0;
+    if (a[1]) (void)strncpy_from_user(sub, (const char *)(uintptr_t)a[1], sizeof(sub));
+    int idx = sub[0] ? reg_walk(root, sub, true) : root;
+    if (idx < 0) return ERROR_FILE_NOT_FOUND;
+    uint64_t h = WIN32_HKEY_TAG | (uint64_t)idx;
+    if (a[7]) (void)copy_to_user((void *)(uintptr_t)a[7], &h, 8);
+    if (a[8]) { uint32_t disp = 1; (void)copy_to_user((void *)(uintptr_t)a[8], &disp, 4); }
+    reg_flush();
+    if (g_win32_log_input) kprintf("[winreg] CreateKey '%s' -> key#%d\n", sub, idx);
+    return ERROR_SUCCESS;
+}
+/* RegOpenKeyExA(hKey, lpSubKey, ulOptions, sam, phkResult=a4) -> ERROR_SUCCESS / NOT_FOUND. */
+static long w32_RegOpenKeyExA(uint64_t *a) {
+    int root = reg_resolve(a[0]);
+    if (root < 0) return ERROR_FILE_NOT_FOUND;
+    char sub[160]; sub[0] = 0;
+    if (a[1]) (void)strncpy_from_user(sub, (const char *)(uintptr_t)a[1], sizeof(sub));
+    int idx = sub[0] ? reg_walk(root, sub, false) : root;
+    if (idx < 0) return ERROR_FILE_NOT_FOUND;
+    uint64_t h = WIN32_HKEY_TAG | (uint64_t)idx;
+    if (a[4]) (void)copy_to_user((void *)(uintptr_t)a[4], &h, 8);
+    return ERROR_SUCCESS;
+}
+static long w32_RegCloseKey(uint64_t *a) { (void)a; return ERROR_SUCCESS; }
+/* RegSetValueExA(hKey, lpValueName, Res, dwType, lpData, cbData) -> ERROR_SUCCESS. */
+static long w32_RegSetValueExA(uint64_t *a) {
+    int idx = reg_resolve(a[0]);
+    if (idx < 0) return ERROR_FILE_NOT_FOUND;
+    char vn[REG_NAME_LEN]; vn[0] = 0;
+    if (a[1]) (void)strncpy_from_user(vn, (const char *)(uintptr_t)a[1], sizeof(vn));
+    uint32_t type = (uint32_t)a[3], len = (uint32_t)a[5];
+    if (len > REG_DATA_LEN) len = REG_DATA_LEN;
+    struct reg_value *v = reg_find_value(idx, vn);
+    if (!v) {
+        struct reg_key *k = &g_reg.keys[idx];
+        if (k->nvals >= REG_MAX_VALS) return ERROR_FILE_NOT_FOUND;
+        v = &k->vals[k->nvals++];
+        memset(v, 0, sizeof(*v));
+        int n = 0; while (vn[n] && n < REG_NAME_LEN - 1) { v->name[n] = vn[n]; n++; } v->name[n] = 0;
+    }
+    v->type = type; v->len = len;
+    if (len && a[4]) (void)copy_from_user(v->data, (const void *)(uintptr_t)a[4], len);
+    reg_flush();
+    if (g_win32_log_input) kprintf("[winreg] SetValue key#%d '%s' type=%u len=%u\n", idx, vn, type, len);
+    return ERROR_SUCCESS;
+}
+/* RegQueryValueExA(hKey, lpValueName, lpRes, lpType=a3, lpData=a4, lpcbData=a5)
+ * -> ERROR_SUCCESS / NOT_FOUND. */
+static long w32_RegQueryValueExA(uint64_t *a) {
+    int idx = reg_resolve(a[0]);
+    if (idx < 0) return ERROR_FILE_NOT_FOUND;
+    char vn[REG_NAME_LEN]; vn[0] = 0;
+    if (a[1]) (void)strncpy_from_user(vn, (const char *)(uintptr_t)a[1], sizeof(vn));
+    struct reg_value *v = reg_find_value(idx, vn);
+    if (!v) return ERROR_FILE_NOT_FOUND;
+    if (a[3]) (void)copy_to_user((void *)(uintptr_t)a[3], &v->type, 4);
+    uint32_t cap = 0;
+    if (a[5]) (void)copy_from_user(&cap, (const void *)(uintptr_t)a[5], 4);
+    if (a[4] && v->len) {
+        uint32_t n = (a[5] && cap < v->len) ? cap : v->len;
+        (void)copy_to_user((void *)(uintptr_t)a[4], v->data, n);
+    }
+    if (a[5]) (void)copy_to_user((void *)(uintptr_t)a[5], &v->len, 4);
+    return ERROR_SUCCESS;
+}
+static long w32_RegDeleteValueA(uint64_t *a) {
+    int idx = reg_resolve(a[0]);
+    if (idx < 0) return ERROR_FILE_NOT_FOUND;
+    char vn[REG_NAME_LEN]; vn[0] = 0;
+    if (a[1]) (void)strncpy_from_user(vn, (const char *)(uintptr_t)a[1], sizeof(vn));
+    struct reg_key *k = &g_reg.keys[idx];
+    for (int i = 0; i < k->nvals; i++)
+        if (reg_name_eq(k->vals[i].name, vn)) {
+            k->vals[i] = k->vals[--k->nvals];
+            reg_flush();
+            return ERROR_SUCCESS;
+        }
+    return ERROR_FILE_NOT_FOUND;
+}
+static long w32_RegDeleteKeyA(uint64_t *a) {
+    int root = reg_resolve(a[0]);
+    if (root < 0) return ERROR_FILE_NOT_FOUND;
+    char sub[160]; sub[0] = 0;
+    if (a[1]) (void)strncpy_from_user(sub, (const char *)(uintptr_t)a[1], sizeof(sub));
+    int idx = sub[0] ? reg_walk(root, sub, false) : -1;
+    if (idx < 4) return ERROR_FILE_NOT_FOUND;       /* never delete a root */
+    g_reg.keys[idx].in_use = false;                 /* (children left orphaned; ok) */
+    reg_flush();
+    return ERROR_SUCCESS;
+}
+/* RegEnumKeyExA(hKey, dwIndex, lpName=a2, lpcchName=a3, ...) -> ERROR_SUCCESS/NO_MORE_ITEMS. */
+static long w32_RegEnumKeyExA(uint64_t *a) {
+    int parent = reg_resolve(a[0]);
+    if (parent < 0) return ERROR_FILE_NOT_FOUND;
+    int want = (int)(uint32_t)a[1], seen = 0;
+    for (int i = 0; i < REG_MAX_KEYS; i++) {
+        if (!g_reg.keys[i].in_use || g_reg.keys[i].parent != parent) continue;
+        if (seen++ != want) continue;
+        int n = 0; while (g_reg.keys[i].name[n]) n++;
+        uint32_t cap = 0; if (a[3]) (void)copy_from_user(&cap, (const void *)(uintptr_t)a[3], 4);
+        if (cap && (uint32_t)n + 1 > cap) n = (int)cap - 1;
+        if (a[2] && n >= 0) {
+            (void)copy_to_user((void *)(uintptr_t)a[2], g_reg.keys[i].name, n);
+            char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[2] + n), &z, 1);
+        }
+        uint32_t outn = (uint32_t)n; if (a[3]) (void)copy_to_user((void *)(uintptr_t)a[3], &outn, 4);
+        return ERROR_SUCCESS;
+    }
+    return ERROR_NO_MORE_ITEMS;
+}
+/* RegEnumValueA(hKey, dwIndex, lpName=a2, lpcchName=a3, lpRes, lpType=a5, lpData=a6, lpcbData=a7). */
+static long w32_RegEnumValueA(uint64_t *a) {
+    int idx = reg_resolve(a[0]);
+    if (idx < 0) return ERROR_FILE_NOT_FOUND;
+    int want = (int)(uint32_t)a[1];
+    struct reg_key *k = &g_reg.keys[idx];
+    if (want < 0 || want >= k->nvals) return ERROR_NO_MORE_ITEMS;
+    struct reg_value *v = &k->vals[want];
+    int n = 0; while (v->name[n]) n++;
+    if (a[2]) { (void)copy_to_user((void *)(uintptr_t)a[2], v->name, n);
+                char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[2] + n), &z, 1); }
+    uint32_t outn = (uint32_t)n; if (a[3]) (void)copy_to_user((void *)(uintptr_t)a[3], &outn, 4);
+    if (a[5]) (void)copy_to_user((void *)(uintptr_t)a[5], &v->type, 4);
+    if (a[6] && v->len) (void)copy_to_user((void *)(uintptr_t)a[6], v->data, v->len);
+    if (a[7]) (void)copy_to_user((void *)(uintptr_t)a[7], &v->len, 4);
+    return ERROR_SUCCESS;
+}
+
 struct win32_shim {
     const char    *dll;     /* lower-case DLL name, no path */
     const char    *func;    /* exact exported symbol */
@@ -7108,6 +7409,17 @@ static const struct win32_shim g_win32_shims[] = {
     { "user32.dll", "GetMenu",                w32_GetMenu },
     { "user32.dll", "SetTimer",               w32_SetTimer },
     { "user32.dll", "KillTimer",              w32_KillTimer },
+
+    /* ---- C16a: registry (advapi32), persisted to /data ---- */
+    { "advapi32.dll", "RegCreateKeyExA",      w32_RegCreateKeyExA },
+    { "advapi32.dll", "RegOpenKeyExA",        w32_RegOpenKeyExA },
+    { "advapi32.dll", "RegCloseKey",          w32_RegCloseKey },
+    { "advapi32.dll", "RegSetValueExA",       w32_RegSetValueExA },
+    { "advapi32.dll", "RegQueryValueExA",     w32_RegQueryValueExA },
+    { "advapi32.dll", "RegDeleteValueA",      w32_RegDeleteValueA },
+    { "advapi32.dll", "RegDeleteKeyA",        w32_RegDeleteKeyA },
+    { "advapi32.dll", "RegEnumKeyExA",        w32_RegEnumKeyExA },
+    { "advapi32.dll", "RegEnumValueA",        w32_RegEnumValueA },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

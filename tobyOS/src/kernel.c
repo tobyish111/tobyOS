@@ -4504,6 +4504,35 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE16A_BOOT
+    /* Track C -- registry (advapi32), milestone C16a. Build EXTRA_CFLAGS+=
+     * -DWINPE16A_BOOT. A stock Win32 console .exe reads a persisted DWORD counter
+     * under HKCU\Software\tobyOS\C16, increments + writes it back (flushed to
+     * /data/toby_registry.dat), and verifies the round-trip. exit 17 = first
+     * write (no prior counter), exit 16 = a prior counter persisted (proven by
+     * the 2-boot script: boot1 seeds, boot2 reads it back across reboot). */
+    {
+        win32_gui_set_log(true);    /* surface [winreg] activity */
+        kprintf("[boot] WINPE16A: spawning /bin/win-reg16.exe (registry persistence)\n");
+        char *argv[] = { (char *)"win-reg16.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-reg16.exe", .name = "win-reg16.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE16A] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE16A: /bin/win-reg16.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE16A] VERDICT: %s exit=%d (16=persisted, 17=first-write)\n",
+                    (rc == 16 || rc == 17) ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef LINUXABI_BOOT
     /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
      * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a
