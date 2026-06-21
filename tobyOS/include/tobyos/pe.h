@@ -74,6 +74,8 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 /* C14 (TAB control): a staged NMHDR { HWND hwndFrom; UINT_PTR idFrom; UINT code }
  * whose USER pointer is passed in WM_NOTIFY.lParam (the app reads ->code). */
 #define WIN32_CRT_NMHDR     0xC00  /* struct NMHDR (24 bytes)            */
+/* C16c: GetCommandLineW builds a UTF-16 copy of the ANSI command line here. */
+#define WIN32_CRT_CMDLINEW  0xC80  /* wide command line (<=0x300 bytes)  */
 
 /* C6 (multithreading): the CPL3 thread wrapper lives at this fixed VA in the
  * shim page (WIN32_SHIM_BASE 0x30000000 + WIN32_WRAPPER_OFF 0x80); CreateThread

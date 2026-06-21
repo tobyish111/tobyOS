@@ -4307,6 +4307,7 @@ static bool win32_route_control_input(int parent_fd, const struct gui_event *ev)
 static void win32_draw_menu(int fd);                                   /* C15 menus */
 static bool win32_route_menu_input(int fd, const struct gui_event *ev);/* C15 menus */
 static void win32_reset_menus_timers(void);                            /* C15 fresh-app reset */
+static void win32_reset_env(void);                                     /* C16c env reset */
 struct win32_msg;
 static bool win32_timer_poll(int only_fd, struct win32_msg *m);        /* C15 timers */
 /* C13: MessageBoxA (font section) draws via these, defined further below. */
@@ -6389,6 +6390,7 @@ static bool win32_timer_poll(int only_fd, struct win32_msg *m) {
 static void win32_reset_menus_timers(void) {
     memset(g_win32_menus, 0, sizeof(g_win32_menus));
     memset(g_win32_timers, 0, sizeof(g_win32_timers));
+    win32_reset_env();   /* C16c: per-app environment reseeds on next use */
 }
 
 /* ---- menu shims (user32) ---- */
@@ -7408,6 +7410,121 @@ static long win32_file_dialog(uint64_t ofn, bool save) {
 static long w32_GetOpenFileNameA(uint64_t *a) { return win32_file_dialog(a[0], false); }
 static long w32_GetSaveFileNameA(uint64_t *a) { return win32_file_dialog(a[0], true); }
 
+/* ================= C16c: command line + environment =================
+ * GetCommandLineA returns the CRT-page command line (filled by the loader);
+ * GetCommandLineW a UTF-16 copy. A small per-app environment block (seeded with
+ * the usual Windows vars) backs GetEnvironmentVariableA/SetEnvironmentVariableA/
+ * ExpandEnvironmentStringsA. */
+#define WIN32_ENV_MAX  16
+#define ENV_NAME_LEN   32
+#define ENV_VAL_LEN    80
+static struct { bool in_use; char name[ENV_NAME_LEN], val[ENV_VAL_LEN]; } g_win32_env[WIN32_ENV_MAX];
+static bool g_win32_env_seeded;
+
+static int env_find(const char *name) {
+    for (int i = 0; i < WIN32_ENV_MAX; i++)
+        if (g_win32_env[i].in_use && win32_streq_ci(g_win32_env[i].name, name)) return i;
+    return -1;
+}
+static void env_set_k(const char *name, const char *val) {  /* kernel strings */
+    int i = env_find(name);
+    if (i < 0) { for (i = 0; i < WIN32_ENV_MAX; i++) if (!g_win32_env[i].in_use) break; if (i >= WIN32_ENV_MAX) return; }
+    g_win32_env[i].in_use = true;
+    int n = 0; while (name[n] && n < ENV_NAME_LEN - 1) { g_win32_env[i].name[n] = name[n]; n++; } g_win32_env[i].name[n] = 0;
+    n = 0; while (val[n] && n < ENV_VAL_LEN - 1) { g_win32_env[i].val[n] = val[n]; n++; } g_win32_env[i].val[n] = 0;
+}
+static void env_seed(void) {
+    if (g_win32_env_seeded) return;
+    g_win32_env_seeded = true;
+    memset(g_win32_env, 0, sizeof(g_win32_env));
+    env_set_k("OS", "tobyOS");
+    env_set_k("PATH", "C:\\bin");
+    env_set_k("TEMP", "C:\\");
+    env_set_k("TMP", "C:\\");
+    env_set_k("COMPUTERNAME", "TOBYOS");
+    env_set_k("USERNAME", "root");
+    env_set_k("USERPROFILE", "C:\\");
+    env_set_k("SystemRoot", "C:\\Windows");
+    env_set_k("windir", "C:\\Windows");
+    env_set_k("NUMBER_OF_PROCESSORS", "4");
+}
+/* C16: reset the per-app environment (next env call reseeds defaults). */
+static void win32_reset_env(void) { g_win32_env_seeded = false; memset(g_win32_env, 0, sizeof(g_win32_env)); }
+
+/* kernel32!GetCommandLineA() -> the CRT-page command-line string. */
+static long w32_GetCommandLineA(uint64_t *a) {
+    (void)a;
+    return (long)(WIN32_CRT_DATA_BASE + WIN32_CRT_CMDLINE);
+}
+/* kernel32!GetCommandLineW() -> a UTF-16 copy in the CRT page. */
+static long w32_GetCommandLineW(uint64_t *a) {
+    (void)a;
+    uint64_t dst = WIN32_CRT_DATA_BASE + WIN32_CRT_CMDLINEW;
+    char s[200]; s[0] = 0;
+    (void)strncpy_from_user(s, (const char *)(uintptr_t)(WIN32_CRT_DATA_BASE + WIN32_CRT_CMDLINE), sizeof(s));
+    uint16_t w[200]; int i = 0; for (; s[i] && i < 199; i++) w[i] = (uint16_t)(uint8_t)s[i]; w[i] = 0;
+    (void)copy_to_user((void *)(uintptr_t)dst, w, (size_t)(i + 1) * 2);
+    return (long)dst;
+}
+/* kernel32!GetEnvironmentVariableA(name, buf, size) -> chars copied (excl NUL),
+ * or 0 if not found. */
+static long w32_GetEnvironmentVariableA(uint64_t *a) {
+    env_seed();
+    char name[ENV_NAME_LEN]; name[0] = 0;
+    if (a[0]) (void)strncpy_from_user(name, (const char *)(uintptr_t)a[0], sizeof(name));
+    int i = env_find(name);
+    if (i < 0) return 0;
+    const char *v = g_win32_env[i].val;
+    int len = 0; while (v[len]) len++;
+    int cap = (int)(uint32_t)a[2];
+    if (a[1] && cap > 0) {
+        int n = (len < cap - 1) ? len : cap - 1;
+        (void)copy_to_user((void *)(uintptr_t)a[1], v, n);
+        char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[1] + n), &z, 1);
+    }
+    return (long)len;
+}
+/* kernel32!SetEnvironmentVariableA(name, val) -> TRUE. val==NULL deletes. */
+static long w32_SetEnvironmentVariableA(uint64_t *a) {
+    env_seed();
+    char name[ENV_NAME_LEN]; name[0] = 0;
+    if (a[0]) (void)strncpy_from_user(name, (const char *)(uintptr_t)a[0], sizeof(name));
+    if (!name[0]) return 0;
+    if (!a[1]) { int i = env_find(name); if (i >= 0) g_win32_env[i].in_use = false; return 1; }
+    char val[ENV_VAL_LEN]; val[0] = 0;
+    (void)strncpy_from_user(val, (const char *)(uintptr_t)a[1], sizeof(val));
+    env_set_k(name, val);
+    return 1;
+}
+/* kernel32!ExpandEnvironmentStringsA(src, dst, size) -> bytes written (incl NUL).
+ * Expands %VAR% references against the environment block. */
+static long w32_ExpandEnvironmentStringsA(uint64_t *a) {
+    env_seed();
+    char src[200]; src[0] = 0;
+    if (a[0]) (void)strncpy_from_user(src, (const char *)(uintptr_t)a[0], sizeof(src));
+    char out[256]; int o = 0;
+    for (int i = 0; src[i] && o < (int)sizeof(out) - 1; ) {
+        if (src[i] == '%') {
+            int j = i + 1; char vn[ENV_NAME_LEN]; int k = 0;
+            while (src[j] && src[j] != '%' && k < ENV_NAME_LEN - 1) vn[k++] = src[j++];
+            vn[k] = 0;
+            if (src[j] == '%') {                 /* %VAR% -> value */
+                int e = env_find(vn);
+                if (e >= 0) { const char *v = g_win32_env[e].val; for (int m = 0; v[m] && o < (int)sizeof(out) - 1; m++) out[o++] = v[m]; }
+                i = j + 1;
+            } else { out[o++] = src[i++]; }      /* lone % */
+        } else out[o++] = src[i++];
+    }
+    out[o] = 0;
+    int cap = (int)(uint32_t)a[2];
+    if (a[1] && cap > 0) {
+        int n = (o < cap - 1) ? o : cap - 1;
+        (void)copy_to_user((void *)(uintptr_t)a[1], out, n);
+        char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[1] + n), &z, 1);
+    }
+    return (long)(o + 1);
+}
+
 struct win32_shim {
     const char    *dll;     /* lower-case DLL name, no path */
     const char    *func;    /* exact exported symbol */
@@ -7634,6 +7751,13 @@ static const struct win32_shim g_win32_shims[] = {
     /* ---- C16b: common file dialogs (comdlg32) ---- */
     { "comdlg32.dll", "GetOpenFileNameA",     w32_GetOpenFileNameA },
     { "comdlg32.dll", "GetSaveFileNameA",     w32_GetSaveFileNameA },
+
+    /* ---- C16c: command line + environment (kernel32) ---- */
+    { "kernel32.dll", "GetCommandLineA",         w32_GetCommandLineA },
+    { "kernel32.dll", "GetCommandLineW",         w32_GetCommandLineW },
+    { "kernel32.dll", "GetEnvironmentVariableA", w32_GetEnvironmentVariableA },
+    { "kernel32.dll", "SetEnvironmentVariableA", w32_SetEnvironmentVariableA },
+    { "kernel32.dll", "ExpandEnvironmentStringsA", w32_ExpandEnvironmentStringsA },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

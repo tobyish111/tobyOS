@@ -4571,6 +4571,32 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE16C_BOOT
+    /* Track C -- command line + environment, milestone C16c. Build EXTRA_CFLAGS+=
+     * -DWINPE16C_BOOT. A stock Win32 console .exe checks GetCommandLineA, sets +
+     * reads an env var, reads a seeded default (OS=tobyOS), and expands %VAR%
+     * references -> exit 16. */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE16C: spawning /bin/win-env16.exe (cmdline + env)\n");
+        char *argv[] = { (char *)"win-env16.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-env16.exe", .name = "win-env16.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE16C] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE16C: /bin/win-env16.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE16C] VERDICT: %s exit=%d (expected 16)\n", rc == 16 ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef LINUXABI_BOOT
     /* Track B (foreign-binary compat) -- Linux ABI proof, milestone B1.
      * Build EXTRA_CFLAGS+=-DLINUXABI_BOOT. Spawns /bin/linux-hello, a
