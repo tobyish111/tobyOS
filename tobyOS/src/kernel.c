@@ -2346,7 +2346,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT) || defined(WINPE16D_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -4592,6 +4592,44 @@ void _start(void) {
             int rc = proc_wait(pid);
             kprintf("[boot] WINPE16C: /bin/win-env16.exe (pid=%d) exit=%d\n", pid, rc);
             kprintf("[WINPE16C] VERDICT: %s exit=%d (expected 16)\n", rc == 16 ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE16D_BOOT
+    /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
+     * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery
+     * (win-ctrl14: GROUPBOX/RADIO/COMBOBOX/TAB) -- the proof is the SCREENSHOT:
+     * every control label now renders as real TrueType (vs the 8x8 bitmap). The
+     * exit code (14) confirms the controls still work (no behaviour regression). */
+    {
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+        kprintf("[boot] WINPE16D: spawning /bin/win-ctrl14.exe (controls in TTF)\n");
+        int cpid = winpe_spawn_session_app("/bin/win-ctrl14.exe", "win-ctrl14.exe");
+        if (cpid < 0) {
+            kprintf("[WINPE16D] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 100 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(cpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE16D] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(cpid, SIGKILL); (void)proc_wait(cpid);
+            } else {
+                winpe8_pump_ms(900);
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 41, 70, MOUSE_BTN_LEFT);   winpe8_pump_ms(300);
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 320, 43, MOUSE_BTN_LEFT);  winpe8_pump_ms(300);
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 320, 75, MOUSE_BTN_LEFT);  winpe8_pump_ms(300);
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 80, 120, MOUSE_BTN_LEFT);  winpe8_pump_ms(300);
+                kprintf("[WINPE16D] controls in TrueType; holding ~4s for screenshot\n");
+                winpe8_pump_ms(4000);
+                gui_post_mouse(GUI_EV_MOUSE_DOWN, 240, 315, MOUSE_BTN_LEFT);
+                for (int i = 0; i < 160 && win32_gui_window_count(cpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(cpid);
+                kprintf("[boot] WINPE16D: /bin/win-ctrl14.exe (pid=%d) exit=%d\n", cpid, rc);
+                kprintf("[WINPE16D] VERDICT: %s exit=%d (expected 14; labels now TTF)\n", rc == 14 ? "PASS" : "FAIL", rc);
+            }
         }
         win32_gui_set_log(false);
     }

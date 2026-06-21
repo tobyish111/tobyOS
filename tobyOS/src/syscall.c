@@ -439,7 +439,7 @@ static long sys_gui_text(int fd, uint32_t xy, const char *s,
         gui_trace_logf("syscall: gui_text fd=%d xy=(%d,%d) len=%ld",
                        fd, x, y, n);
     }
-    return gui_window_text(f->win, x, y, buf, fg, bg);
+    return gui_window_text(f->win, x, y, buf, fg, bg);   /* native apps: 8x8 bitmap */
 }
 
 static long sys_gui_flip(int fd) {
@@ -4308,6 +4308,23 @@ static void win32_draw_menu(int fd);                                   /* C15 me
 static bool win32_route_menu_input(int fd, const struct gui_event *ev);/* C15 menus */
 static void win32_reset_menus_timers(void);                            /* C15 fresh-app reset */
 static void win32_reset_env(void);                                     /* C16c env reset */
+
+/* C16d: all Win32 UI text (control labels, menus, MessageBox, file dialog) goes
+ * through here so it renders as real TrueType when a font is available, falling
+ * back to the 8x8 bitmap otherwise. Native (non-PE) apps' sys_gui_text stays on
+ * the bitmap font. The y arg is the 8x8-font top; nudge up so the taller glyph
+ * keeps roughly the same vertical centre. */
+#define WIN32_UI_FONT_PX 14
+static void win32_ui_text(struct window *win, int x, int y, const char *s,
+                          uint32_t fg, uint32_t bg) {
+    if (win && s && kfont_available()) {
+        int yy = y - (WIN32_UI_FONT_PX - 8) / 2;
+        (void)kfont_draw_window(win, x, yy, s, -1, fg, WIN32_UI_FONT_PX);
+        (void)bg;
+    } else {
+        (void)gui_window_text(win, x, y, s, fg, bg);
+    }
+}
 struct win32_msg;
 static bool win32_timer_poll(int only_fd, struct win32_msg *m);        /* C15 timers */
 /* C13: MessageBoxA (font section) draws via these, defined further below. */
@@ -5127,14 +5144,14 @@ static long w32_MessageBoxA(uint64_t *a) {
     int bx0 = (W - total) / 2;
     if (win) {
         (void)gui_window_fill(win, 0, 0, W, H, 0x00DCDCDC);
-        (void)gui_window_text(win, 16, 26, text, 0x00101010, 0x00DCDCDC);
+        (void)win32_ui_text(win, 16, 26, text, 0x00101010, 0x00DCDCDC);
         for (int i = 0; i < nb; i++) {
             int bx = bx0 + i * (bw_ + gap);
             (void)gui_window_fill(win, bx, oky, bw_, bh, 0x00C0C0C0);
             (void)gui_window_rect(win, bx, oky, bw_, bh, 0x00303030);
             (void)gui_window_rect(win, bx + 1, oky + 1, bw_ - 2, bh - 2, 0x00F0F0F0);
             int tw = (int)strlen(blabel[i]) * 8;
-            (void)gui_window_text(win, bx + (bw_ - tw) / 2, oky + bh / 2 - 4,
+            (void)win32_ui_text(win, bx + (bw_ - tw) / 2, oky + bh / 2 - 4,
                                   blabel[i], 0x00101010, 0x00C0C0C0);
         }
     }
@@ -6063,15 +6080,15 @@ static void win32_draw_controls(int parent_fd) {
             (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00C8C8C8);
             (void)gui_window_rect(win, c->x, c->y, c->w, c->h, 0x00303030);
             (void)gui_window_rect(win, c->x + 1, c->y + 1, c->w - 2, c->h - 2, 0x00F4F4F4);
-            (void)gui_window_text(win, c->x + 10, ty, c->text, 0x00101010, 0x00C8C8C8);
+            (void)win32_ui_text(win, c->x + 10, ty, c->text, 0x00101010, 0x00C8C8C8);
             break;
         case WIN32_CTRL_EDIT:
             (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00FFFFFF);
             (void)gui_window_rect(win, c->x, c->y, c->w, c->h, c->focus ? 0x002E8AE0 : 0x00808080);
-            (void)gui_window_text(win, c->x + 5, ty, c->text[0] ? c->text : " ", 0x00000000, 0x00FFFFFF);
+            (void)win32_ui_text(win, c->x + 5, ty, c->text[0] ? c->text : " ", 0x00000000, 0x00FFFFFF);
             break;
         case WIN32_CTRL_STATIC:
-            (void)gui_window_text(win, c->x, ty, c->text, lfg, pbg);
+            (void)win32_ui_text(win, c->x, ty, c->text, lfg, pbg);
             break;
         case WIN32_CTRL_CHECKBOX: {
             int bs = 13, by = c->y + (c->h - bs) / 2;
@@ -6081,7 +6098,7 @@ static void win32_draw_controls(int parent_fd) {
                 (void)gui_window_line(win, c->x + 2, by + 6, c->x + 5, by + 9, 0x00208020);
                 (void)gui_window_line(win, c->x + 5, by + 9, c->x + 10, by + 2, 0x00208020);
             }
-            (void)gui_window_text(win, c->x + bs + 6, ty, c->text, lfg, pbg);
+            (void)win32_ui_text(win, c->x + bs + 6, ty, c->text, lfg, pbg);
             break;
         }
         case WIN32_CTRL_LISTBOX: {
@@ -6093,7 +6110,7 @@ static void win32_draw_controls(int parent_fd) {
                 uint32_t bg = (r == lb->sel) ? 0x002E8AE0 : 0x00FFFFFF;
                 uint32_t fg = (r == lb->sel) ? 0x00FFFFFF : 0x00101010;
                 (void)gui_window_fill(win, c->x + 1, ry, c->w - 2, 14, bg);
-                (void)gui_window_text(win, c->x + 5, ry + 3, lb->items[r], fg, bg);
+                (void)win32_ui_text(win, c->x + 5, ry + 3, lb->items[r], fg, bg);
             }
             break;
         }
@@ -6102,9 +6119,9 @@ static void win32_draw_controls(int parent_fd) {
             (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00C8C8C8);       /* track */
             (void)gui_window_rect(win, c->x, c->y, c->w, c->h, 0x00808080);
             (void)gui_window_fill(win, c->x, c->y, c->w, ah, 0x00B0B0B0);          /* up arrow */
-            (void)gui_window_text(win, c->x + c->w / 2 - 3, c->y + ah / 2 - 4, "^", 0x00202020, 0x00B0B0B0);
+            (void)win32_ui_text(win, c->x + c->w / 2 - 3, c->y + ah / 2 - 4, "^", 0x00202020, 0x00B0B0B0);
             (void)gui_window_fill(win, c->x, c->y + c->h - ah, c->w, ah, 0x00B0B0B0); /* down arrow */
-            (void)gui_window_text(win, c->x + c->w / 2 - 3, c->y + c->h - ah / 2 - 4, "v", 0x00202020, 0x00B0B0B0);
+            (void)win32_ui_text(win, c->x + c->w / 2 - 3, c->y + c->h - ah / 2 - 4, "v", 0x00202020, 0x00B0B0B0);
             int thy = win32_sb_thumb_y(c);                                          /* thumb */
             (void)gui_window_fill(win, c->x + 2, thy, c->w - 4, 16, 0x00707070);
             (void)gui_window_rect(win, c->x + 2, thy, c->w - 4, 16, 0x00404040);
@@ -6114,7 +6131,7 @@ static void win32_draw_controls(int parent_fd) {
             (void)gui_window_rect(win, c->x, c->y + 4, c->w, c->h - 4, 0x00909090);
             int tw = 0; while (c->text[tw]) tw++;
             (void)gui_window_fill(win, c->x + 8, c->y, tw * 8 + 6, 9, pbg);
-            (void)gui_window_text(win, c->x + 11, c->y, c->text, lfg, pbg);
+            (void)win32_ui_text(win, c->x + 11, c->y, c->text, lfg, pbg);
             break;
         }
         case WIN32_CTRL_RADIO: {        /* C14: a circular, group-exclusive check */
@@ -6122,7 +6139,7 @@ static void win32_draw_controls(int parent_fd) {
             (void)gui_window_circle(win, ccx, ccy, rr, 0x00FFFFFF);
             (void)gui_window_circle_outline(win, ccx, ccy, rr, 0x00404040);
             if (c->checked) (void)gui_window_circle(win, ccx, ccy, 3, 0x00208020);
-            (void)gui_window_text(win, c->x + 2 * rr + 6, ty, c->text, lfg, pbg);
+            (void)win32_ui_text(win, c->x + 2 * rr + 6, ty, c->text, lfg, pbg);
             break;
         }
         case WIN32_CTRL_COMBOBOX: {     /* C14: closed face (selected text + arrow) */
@@ -6131,10 +6148,10 @@ static void win32_draw_controls(int parent_fd) {
             (void)gui_window_fill(win, c->x, c->y, c->w, fh, 0x00FFFFFF);
             (void)gui_window_rect(win, c->x, c->y, c->w, fh, c->dropped ? 0x002E8AE0 : 0x00808080);
             const char *seltxt = (lb->sel >= 0 && lb->sel < lb->n) ? lb->items[lb->sel] : "";
-            (void)gui_window_text(win, c->x + 5, c->y + (fh - 8) / 2, seltxt, 0x00101010, 0x00FFFFFF);
+            (void)win32_ui_text(win, c->x + 5, c->y + (fh - 8) / 2, seltxt, 0x00101010, 0x00FFFFFF);
             int ax = c->x + c->w - 16;   /* drop-arrow button */
             (void)gui_window_fill(win, ax, c->y + 1, 15, fh - 2, 0x00C8C8C8);
-            (void)gui_window_text(win, ax + 4, c->y + (fh - 8) / 2, "v", 0x00202020, 0x00C8C8C8);
+            (void)win32_ui_text(win, ax + 4, c->y + (fh - 8) / 2, "v", 0x00202020, 0x00C8C8C8);
             break;                       /* the open dropdown is drawn in pass 2 */
         }
         case WIN32_CTRL_TAB: {          /* C14: a row of tab buttons + page frame */
@@ -6147,7 +6164,7 @@ static void win32_draw_controls(int parent_fd) {
                 uint32_t tbg = selt ? 0x00D8D8D8 : 0x00B0B0B0;
                 (void)gui_window_fill(win, tx, c->y, tw, th, tbg);
                 (void)gui_window_rect(win, tx, c->y, tw, th, 0x00606060);
-                (void)gui_window_text(win, tx + 8, c->y + 6, lb->items[t], 0x00101010, tbg);
+                (void)win32_ui_text(win, tx + 8, c->y + 6, lb->items[t], 0x00101010, tbg);
                 tx += tw;
             }
             /* page area below the tab row */
@@ -6171,7 +6188,7 @@ static void win32_draw_controls(int parent_fd) {
             uint32_t bg = (r == lb->sel) ? 0x002E8AE0 : 0x00FFFFFF;
             uint32_t fg = (r == lb->sel) ? 0x00FFFFFF : 0x00101010;
             (void)gui_window_fill(win, c->x + 1, ry, c->w - 2, 14, bg);
-            (void)gui_window_text(win, c->x + 5, ry + 3, lb->items[r], fg, bg);
+            (void)win32_ui_text(win, c->x + 5, ry + 3, lb->items[r], fg, bg);
         }
     }
 }
@@ -6262,7 +6279,7 @@ static void win32_draw_menu(int fd) {
         int iw = win32_menubar_item_w(&bar->items[i]);
         bool open = (w->menu_open == i);
         if (open) (void)gui_window_fill(win, tx, 0, iw, WIN32_MENUBAR_H - 1, 0x002E8AE0);
-        (void)gui_window_text(win, tx + 8, (WIN32_MENUBAR_H - 8) / 2 - 1, bar->items[i].text,
+        (void)win32_ui_text(win, tx + 8, (WIN32_MENUBAR_H - 8) / 2 - 1, bar->items[i].text,
                               open ? 0x00FFFFFF : 0x00202020, open ? 0x002E8AE0 : 0x00ECECEC);
         tx += iw;
     }
@@ -6279,7 +6296,7 @@ static void win32_draw_menu(int fd) {
                     (void)gui_window_line(win, mx + 4, iy + WIN32_MENU_ITEMH / 2,
                                           mx + mw - 4, iy + WIN32_MENU_ITEMH / 2, 0x00B0B0B0);
                 else
-                    (void)gui_window_text(win, mx + 10, iy + (WIN32_MENU_ITEMH - 8) / 2,
+                    (void)win32_ui_text(win, mx + 10, iy + (WIN32_MENU_ITEMH - 8) / 2,
                                           pop->items[j].text, 0x00202020, 0x00F4F4F4);
             }
         }
@@ -7300,7 +7317,7 @@ static long win32_file_dialog(uint64_t ofn, bool save) {
             for (const char *p = pfx; *p && li < 150; p++) look[li++] = *p;
             for (const char *p = curdir; *p && li < 150; p++) look[li++] = (*p == '/') ? '\\' : *p;
             look[li] = 0;
-            (void)gui_window_text(win, 12, 14, look, 0x00101010, 0x00DCDCDC);
+            (void)win32_ui_text(win, 12, 14, look, 0x00101010, 0x00DCDCDC);
             (void)gui_window_fill(win, listX, listY, listW, listH, 0x00FFFFFF);
             (void)gui_window_rect(win, listX, listY, listW, listH, 0x00808080);
             for (int r = 0; r < nents && r < listH / OFD_ROW_H; r++) {
@@ -7313,22 +7330,22 @@ static long win32_file_dialog(uint64_t ofn, bool save) {
                 if (ents[i].is_dir) { const char *d = "[ ] "; for (int k = 0; d[k]; k++) line[c++] = d[k]; line[1] = '+'; }
                 for (int k = 0; ents[i].name[k] && c < 46; k++) line[c++] = ents[i].name[k];
                 line[c] = 0;
-                (void)gui_window_text(win, listX + 6, ry + 1, line, fg, bg);
+                (void)win32_ui_text(win, listX + 6, ry + 1, line, fg, bg);
             }
             /* filename field */
             int fy = listY + listH + 10;
-            (void)gui_window_text(win, 12, fy + 4, "Name:", 0x00101010, 0x00DCDCDC);
+            (void)win32_ui_text(win, 12, fy + 4, "Name:", 0x00101010, 0x00DCDCDC);
             (void)gui_window_fill(win, 60, fy, W - 72, 20, 0x00FFFFFF);
             (void)gui_window_rect(win, 60, fy, W - 72, 20, 0x00808080);
-            (void)gui_window_text(win, 65, fy + 6, field[0] ? field : " ", 0x00000000, 0x00FFFFFF);
+            (void)win32_ui_text(win, 65, fy + 6, field[0] ? field : " ", 0x00000000, 0x00FFFFFF);
             /* buttons */
             (void)gui_window_fill(win, okx, oky, okw, okh, 0x00C0C0C0);
             (void)gui_window_rect(win, okx, oky, okw, okh, 0x00303030);
-            (void)gui_window_text(win, okx + okw / 2 - (save ? 16 : 16), oky + okh / 2 - 4,
+            (void)win32_ui_text(win, okx + okw / 2 - (save ? 16 : 16), oky + okh / 2 - 4,
                                   save ? "Save" : "Open", 0x00101010, 0x00C0C0C0);
             (void)gui_window_fill(win, cax, cay, caw, cah, 0x00C0C0C0);
             (void)gui_window_rect(win, cax, cay, caw, cah, 0x00303030);
-            (void)gui_window_text(win, cax + caw / 2 - 24, cay + cah / 2 - 4, "Cancel", 0x00101010, 0x00C0C0C0);
+            (void)win32_ui_text(win, cax + caw / 2 - 24, cay + cah / 2 - 4, "Cancel", 0x00101010, 0x00C0C0C0);
             (void)sys_gui_flip(fd);
             redraw = false;
         }
