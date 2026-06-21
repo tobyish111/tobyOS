@@ -26,6 +26,7 @@
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/socket.h>
+#include <tobyos/dns.h>
 #include <tobyos/gui.h>
 #include <tobyos/gfx.h>
 #include <tobyos/virtio_gpu.h>
@@ -7602,6 +7603,190 @@ static long w32_ExpandEnvironmentStringsA(uint64_t *a) {
     return (long)(o + 1);
 }
 
+/* ================= C17a: Winsock TCP client (ws2_32) =================
+ * A Win32 SOCKET maps onto the kernel BSD-like socket pool (ksock_* in
+ * socket.c, the same stack the native HTTP/curl path rides). SOCKET handles
+ * carry a distinct tag byte so closesocket/send/recv tell them apart from
+ * file HANDLEs (small fds) and FILE* tokens (0xF11E....). All user buffers go
+ * through copy_from/to_user so the shims stay SMAP-safe. gethostbyname routes
+ * through the kernel DNS resolver and builds a real `struct hostent` in the
+ * app's heap. */
+#define WIN32_SOCKET_TAG  0x6800000000000000ULL  /* distinct: hkey 0x67 / menu 0x66 */
+#define WIN32_TAGBYTE_MASK 0xFF00000000000000ULL
+#define WIN32_INVALID_SOCK ((long)(int64_t)-1)   /* INVALID_SOCKET == SOCKET_ERROR */
+
+/* Winsock error codes (WinError.h subset) used by WSAGetLastError. */
+#define WSAEINTR_         10004
+#define WSAEFAULT_        10014
+#define WSAENOTSOCK_      10038
+#define WSAEAFNOSUPPORT_  10047
+#define WSAECONNRESET_    10054
+#define WSAECONNREFUSED_  10061
+#define WSAETIMEDOUT_     10060
+#define WSAHOST_NOT_FOUND_ 11001
+
+static int g_wsa_lasterror = 0;
+
+/* Decode a tagged SOCKET handle into a kernel ksock fd, or -1 if it isn't one. */
+static int win32_sock_fd(uint64_t h) {
+    if ((h & WIN32_TAGBYTE_MASK) != WIN32_SOCKET_TAG) return -1;
+    return (int)(h & 0xFFFF);
+}
+
+/* ws2_32!WSAStartup(wVersionRequested, lpWSAData) -> 0. Fills WSADATA (zeroed,
+ * version words set); the CRT only checks the return value + version. */
+static long w32_WSAStartup(uint64_t *a) {
+    uint16_t ver = (uint16_t)a[0];
+    if (a[1]) {
+        /* sizeof(WSADATA) on Win64 == 408 bytes. */
+        uint8_t wd[408];
+        memset(wd, 0, sizeof(wd));
+        uint16_t v = ver ? ver : 0x0202;
+        wd[0] = (uint8_t)(v & 0xFF); wd[1] = (uint8_t)(v >> 8);     /* wVersion */
+        wd[2] = 0x02; wd[3] = 0x02;                                  /* wHighVersion 2.2 */
+        (void)copy_to_user((void *)(uintptr_t)a[1], wd, sizeof(wd));
+    }
+    g_wsa_lasterror = 0;
+    return 0;
+}
+static long w32_WSACleanup(uint64_t *a) { (void)a; return 0; }
+static long w32_WSAGetLastError(uint64_t *a) { (void)a; return (long)g_wsa_lasterror; }
+
+/* ws2_32!socket(af, type, protocol) -> a tagged SOCKET, or INVALID_SOCKET. */
+static long w32_socket(uint64_t *a) {
+    int af = (int)(uint32_t)a[0], type = (int)(uint32_t)a[1];
+    if (af != AF_INET) { g_wsa_lasterror = WSAEAFNOSUPPORT_; return WIN32_INVALID_SOCK; }
+    int fd = ksock_socket(AF_INET, type, 0);  /* SOCK_STREAM/DGRAM match Win32 1:1 */
+    if (fd < 0) { g_wsa_lasterror = WSAEINTR_; return WIN32_INVALID_SOCK; }
+    return (long)(WIN32_SOCKET_TAG | (uint64_t)(uint32_t)fd);
+}
+
+/* ws2_32!connect(s, name, namelen) -> 0 / SOCKET_ERROR. */
+static long w32_connect(uint64_t *a) {
+    int fd = win32_sock_fd(a[0]);
+    if (fd < 0) { g_wsa_lasterror = WSAENOTSOCK_; return WIN32_INVALID_SOCK; }
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    if (!a[1] || copy_from_user(&sa, (const void *)(uintptr_t)a[1], sizeof(sa)) != 0) {
+        g_wsa_lasterror = WSAEFAULT_; return WIN32_INVALID_SOCK;
+    }
+    if (ksock_connect(fd, &sa) != 0) { g_wsa_lasterror = WSAECONNREFUSED_; return WIN32_INVALID_SOCK; }
+    return 0;
+}
+
+/* ws2_32!send(s, buf, len, flags) -> bytes sent / SOCKET_ERROR. */
+static long w32_send(uint64_t *a) {
+    int fd = win32_sock_fd(a[0]);
+    if (fd < 0) { g_wsa_lasterror = WSAENOTSOCK_; return WIN32_INVALID_SOCK; }
+    int len = (int)(uint32_t)a[2];
+    if (len <= 0) return 0;
+    int cap = len > 16384 ? 16384 : len;
+    uint8_t *kb = (uint8_t *)kmalloc(cap);
+    if (!kb) { g_wsa_lasterror = WSAEINTR_; return WIN32_INVALID_SOCK; }
+    if (copy_from_user(kb, (const void *)(uintptr_t)a[1], cap) != 0) {
+        kfree(kb); g_wsa_lasterror = WSAEFAULT_; return WIN32_INVALID_SOCK;
+    }
+    long n = ksock_send(fd, kb, cap, 0);
+    kfree(kb);
+    if (n <= 0) { g_wsa_lasterror = WSAECONNRESET_; return WIN32_INVALID_SOCK; }
+    return n;
+}
+
+/* ws2_32!recv(s, buf, len, flags) -> bytes / 0 (closed) / SOCKET_ERROR. */
+static long w32_recv(uint64_t *a) {
+    int fd = win32_sock_fd(a[0]);
+    if (fd < 0) { g_wsa_lasterror = WSAENOTSOCK_; return WIN32_INVALID_SOCK; }
+    int len = (int)(uint32_t)a[2];
+    if (len <= 0) return 0;
+    int cap = len > 16384 ? 16384 : len;
+    uint8_t *kb = (uint8_t *)kmalloc(cap);
+    if (!kb) { g_wsa_lasterror = WSAEINTR_; return WIN32_INVALID_SOCK; }
+    long n = ksock_recv(fd, kb, cap, 0);   /* tcp_recv: >0 data, -1 FIN, -2 RST, 0 timeout */
+    if (n > 0) {
+        if (copy_to_user((void *)(uintptr_t)a[1], kb, (size_t)n) != 0) {
+            kfree(kb); g_wsa_lasterror = WSAEFAULT_; return WIN32_INVALID_SOCK;
+        }
+        kfree(kb);
+        return n;
+    }
+    kfree(kb);
+    if (n == -1 || n == 0) return 0;       /* FIN / timeout -> graceful close */
+    g_wsa_lasterror = WSAECONNRESET_;      /* RST */
+    return WIN32_INVALID_SOCK;
+}
+
+/* ws2_32!closesocket(s) -> 0 / SOCKET_ERROR. */
+static long w32_closesocket(uint64_t *a) {
+    int fd = win32_sock_fd(a[0]);
+    if (fd < 0) { g_wsa_lasterror = WSAENOTSOCK_; return WIN32_INVALID_SOCK; }
+    ksock_close(fd);
+    return 0;
+}
+
+/* ws2_32!gethostbyname(name) -> a `struct hostent *` in the app heap, or NULL.
+ * Resolves via the kernel DNS resolver (the same one DHCP configured). */
+static long w32_gethostbyname(uint64_t *a) {
+    char name[128]; name[0] = 0;
+    if (a[0]) (void)strncpy_from_user(name, (const char *)(uintptr_t)a[0], sizeof(name));
+    if (!name[0]) { g_wsa_lasterror = WSAHOST_NOT_FOUND_; return 0; }
+    if (!net_is_up()) { g_wsa_lasterror = WSAHOST_NOT_FOUND_; return 0; }
+    struct dns_result r;
+    if (!dns_resolve(name, 4000, &r)) { g_wsa_lasterror = WSAHOST_NOT_FOUND_; return 0; }
+
+    int nlen = 0; while (name[nlen]) nlen++;
+    /* Layout (Win64 struct hostent):
+     *  +0x00 h_name      -> base+0x40
+     *  +0x08 h_aliases   -> base+0x20 (one NULL entry)
+     *  +0x10 h_addrtype  = AF_INET (short)
+     *  +0x12 h_length    = 4         (short)
+     *  +0x18 h_addr_list -> base+0x28 { base+0x38, NULL }
+     *  +0x38 the 4-byte IPv4 address (network order)
+     *  +0x40 the name string bytes  */
+    uint64_t total = 0x41 + (uint64_t)nlen;
+    uint64_t base = win32_heap_alloc(total);
+    if (!base) { g_wsa_lasterror = WSAEINTR_; return 0; }
+
+    uint8_t buf[0x41 + 128] __attribute__((aligned(8)));
+    int blen = (int)total; if (blen > (int)sizeof(buf)) blen = (int)sizeof(buf);
+    memset(buf, 0, blen);
+    *(uint64_t *)(buf + 0x00) = base + 0x40;          /* h_name      */
+    *(uint64_t *)(buf + 0x08) = base + 0x20;          /* h_aliases   */
+    *(uint16_t *)(buf + 0x10) = (uint16_t)AF_INET;    /* h_addrtype  */
+    *(uint16_t *)(buf + 0x12) = 4;                    /* h_length    */
+    *(uint64_t *)(buf + 0x18) = base + 0x28;          /* h_addr_list */
+    /* aliases[0] = NULL already zero (buf+0x20) */
+    *(uint64_t *)(buf + 0x28) = base + 0x38;          /* h_addr_list[0] -> ip */
+    /* h_addr_list[1] = NULL already zero (buf+0x30) */
+    *(uint32_t *)(buf + 0x38) = r.ip_be;              /* the IPv4 address */
+    for (int i = 0; i < nlen && (0x40 + i) < blen; i++) buf[0x40 + i] = (uint8_t)name[i];
+    (void)copy_to_user((void *)(uintptr_t)base, buf, blen);
+    g_wsa_lasterror = 0;
+    return (long)base;
+}
+
+/* Byte-order + address helpers (pure computation). */
+static long w32_htons(uint64_t *a) { return (long)htons((uint16_t)a[0]); }
+static long w32_ntohs(uint64_t *a) { return (long)ntohs((uint16_t)a[0]); }
+static long w32_htonl(uint64_t *a) { return (long)(uint32_t)htonl((uint32_t)a[0]); }
+static long w32_ntohl(uint64_t *a) { return (long)(uint32_t)ntohl((uint32_t)a[0]); }
+/* ws2_32!inet_addr("a.b.c.d") -> the address in network byte order, INADDR_NONE on error. */
+static long w32_inet_addr(uint64_t *a) {
+    char s[32]; s[0] = 0;
+    if (a[0]) (void)strncpy_from_user(s, (const char *)(uintptr_t)a[0], sizeof(s));
+    uint32_t parts[4]; int pi = 0, have = 0; uint32_t cur = 0;
+    for (const char *p = s; ; p++) {
+        if (*p >= '0' && *p <= '9') { cur = cur * 10 + (uint32_t)(*p - '0'); have = 1; if (cur > 255) return (long)(uint32_t)0xFFFFFFFF; }
+        else if (*p == '.' || *p == 0) {
+            if (!have || pi >= 4) return (long)(uint32_t)0xFFFFFFFF;
+            parts[pi++] = cur; cur = 0; have = 0;
+            if (*p == 0) break;
+        } else return (long)(uint32_t)0xFFFFFFFF;
+    }
+    if (pi != 4) return (long)(uint32_t)0xFFFFFFFF;
+    uint32_t ip_be = (parts[0]) | (parts[1] << 8) | (parts[2] << 16) | (parts[3] << 24);
+    return (long)(uint32_t)ip_be;
+}
+
 struct win32_shim {
     const char    *dll;     /* lower-case DLL name, no path */
     const char    *func;    /* exact exported symbol */
@@ -7838,6 +8023,22 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetEnvironmentVariableA", w32_GetEnvironmentVariableA },
     { "kernel32.dll", "SetEnvironmentVariableA", w32_SetEnvironmentVariableA },
     { "kernel32.dll", "ExpandEnvironmentStringsA", w32_ExpandEnvironmentStringsA },
+
+    /* ---- C17a: Winsock TCP client (ws2_32) ---- */
+    { "ws2_32.dll", "WSAStartup",      w32_WSAStartup },
+    { "ws2_32.dll", "WSACleanup",      w32_WSACleanup },
+    { "ws2_32.dll", "WSAGetLastError", w32_WSAGetLastError },
+    { "ws2_32.dll", "socket",          w32_socket },
+    { "ws2_32.dll", "connect",         w32_connect },
+    { "ws2_32.dll", "send",            w32_send },
+    { "ws2_32.dll", "recv",            w32_recv },
+    { "ws2_32.dll", "closesocket",     w32_closesocket },
+    { "ws2_32.dll", "gethostbyname",   w32_gethostbyname },
+    { "ws2_32.dll", "htons",           w32_htons },
+    { "ws2_32.dll", "ntohs",           w32_ntohs },
+    { "ws2_32.dll", "htonl",           w32_htonl },
+    { "ws2_32.dll", "ntohl",           w32_ntohl },
+    { "ws2_32.dll", "inet_addr",       w32_inet_addr },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

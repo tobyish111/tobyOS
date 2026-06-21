@@ -84,7 +84,7 @@ driver model; POSIX libc surface.
 
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
-2. **App compatibility (~36%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
+2. **App compatibility (~42%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
    **stock, off-the-shelf Windows x86-64 `.exe`s — C and C++, console AND GUI** (a plain `clang`/`clang++`
    runs through its full ucrt CRT startup → main/WinMain → exit; real file I/O, multithreading with a real
    `CRITICAL_SECTION`, and a `user32`/`gdi32` GUI app that creates a window and draws through its WndProc
@@ -253,7 +253,11 @@ driver model; POSIX libc surface.
    `GetCommandLine`/`GetEnvironmentVariable`/`SetEnvironmentVariable`/`ExpandEnvironmentStrings` over a seeded
    per-app environment; the entire **Win32 UI rendered in TrueType** (control labels, menus, dialogs — native
    apps + desktop stay 8x8); and **per-thread TEBs** giving each `CreateThread` thread its own
-   `NtCurrentTeb`/TLS (`TlsAlloc`/`TlsGetValue`/`TlsSetValue`). **Windows: next** — `__declspec(thread)`
+   `NtCurrentTeb`/TLS (`TlsAlloc`/`TlsGetValue`/`TlsSetValue`). **C17a (2026-06-21) — Winsock (ws2_32),
+   the TCP client:** a stock Windows `.exe` linked against `ws2_32` does a real **HTTP GET over the network** —
+   `WSAStartup`/`gethostbyname`/`socket`/`connect`/`send`/`recv`/`closesocket` mapped onto tobyOS's existing
+   `ksock_*`/DNS/TCP stack (a tagged `SOCKET` handle; `gethostbyname` builds a real `struct hostent`).
+   **Windows: next** — winsock TCP server (`bind`/`listen`/`accept`) + UDP (C17b/c), `__declspec(thread)`
    compiler TLS, bold/italic + desktop-wide TTF, more shell32/ole shims, broader runtime. Still no .NET/UWP.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
    code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
@@ -338,6 +342,22 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-21** — **Track C milestone C17a: Winsock (ws2_32) — the TCP client.** A stock, off-the-shelf
+  Windows `.exe` (built with the in-tree clang, linked against `ws2_32`) does a real **HTTP GET over the
+  network** on tobyOS, with no real `ws2_32.dll`. Ten new shims — `WSAStartup`/`WSACleanup`/`WSAGetLastError`/
+  `socket`/`connect`/`send`/`recv`/`closesocket`/`gethostbyname`/`htons` (+`ntohs`/`htonl`/`ntohl`/`inet_addr`)
+  — map Win32 sockets onto tobyOS's existing kernel `ksock_*` API (`socket.c`, the same TCP stack the native
+  HTTP/curl path uses) and the kernel DNS resolver. A Win32 `SOCKET` is a tagged handle (tag byte `0x68`,
+  distinct from file fds / FILE* tokens) decoding to a `ksock` fd; `gethostbyname` resolves via `dns_resolve`
+  and builds a real `struct hostent` (h_name/h_aliases/h_addrtype/h_length/h_addr_list) in the app's heap;
+  all user buffers go through `copy_from/to_user` (SMAP-safe). The marshalling gate was **not** touched (all
+  winsock fns are <=6 args, well within the 10-arg gate). Proof `win-net17.exe` (first-party, ordinary
+  Winsock 2 code): `WSAStartup` -> `gethostbyname("example.com")` -> `socket`/`connect`(:80) -> `send` a
+  `GET / HTTP/1.0` -> `recv` -> verifies the `HTTP/1` status line -> exit 17 (`[WINPE17A] PASS`, status line
+  `HTTP/1.1 200 OK`, ~828 bytes). Needs networking (QEMU `-netdev user`/SLIRP, internet via host); DHCP binds
+  10.0.2.15 at boot. All Win32 milestones (C1=42 … C16=…, C17A=17) pass together under `-cpu qemu64,+smep,+smap`
+  with 0 faults (26 PASS verdicts); validate 3/3 ALIVE; default desktop boot unaffected and shows 0 PE
+  activity (the winsock shims only run for a PE process). App-compat ~41% -> ~42%.
 - **2026-06-20** — **Track C milestone C16 (a-e): registry, file dialogs, command line/env, TTF UI,
   per-thread TLS.** Five sub-milestones, each its own branch -> proof -> ff-merge. **C16a registry
   (advapi32):** a small in-kernel hive backs `RegCreateKeyExA`/`RegOpenKeyExA`/`RegCloseKey`/`RegSetValueExA`/

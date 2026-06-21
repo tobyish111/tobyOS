@@ -4624,6 +4624,35 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE17A_BOOT
+    /* Track C -- Winsock TCP client, milestone C17a. Build EXTRA_CFLAGS+=
+     * -DWINPE17A_BOOT. A stock Win32 console .exe (linked against ws2_32)
+     * resolves example.com via gethostbyname, opens a TCP socket, sends an
+     * HTTP/1.0 GET, drains the response, and verifies the "HTTP/1" status line
+     * -> exit 17. Requires networking (net_init/DHCP/DNS, up by this point) and
+     * an outbound path to the internet (QEMU -netdev user / SLIRP). */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE17A: net_up=%d -- spawning /bin/win-net17.exe (winsock TCP client)\n",
+                (int)net_is_up());
+        char *argv[] = { (char *)"win-net17.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-net17.exe", .name = "win-net17.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE17A] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE17A: /bin/win-net17.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE17A] VERDICT: %s exit=%d (expected 17)\n", rc == 17 ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery
