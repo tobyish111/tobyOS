@@ -103,6 +103,10 @@ int  ksock_listen(int sockfd, int backlog);
 int  ksock_accept(int sockfd, struct sockaddr_in *addr);
 long ksock_send(int sockfd, const void *buf, size_t len, int flags);
 long ksock_recv(int sockfd, void *buf, size_t len, int flags);
+long ksock_sendto(int sockfd, const void *buf, size_t len,
+                  uint32_t dst_ip_be, uint16_t dst_port_be);
+long ksock_recvfrom(int sockfd, void *buf, size_t len,
+                    uint32_t *src_ip_be, uint16_t *src_port_be);
 int  ksock_close(int sockfd);
 int  ksock_setsockopt(int sockfd, int level, int optname,
                       const void *optval, size_t optlen);

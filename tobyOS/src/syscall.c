@@ -7851,6 +7851,61 @@ static long w32_accept(uint64_t *a) {
     return (long)(WIN32_SOCKET_TAG | (uint64_t)(uint32_t)nfd);
 }
 
+/* ---- C17c: Winsock UDP datagrams (sendto / recvfrom) ----
+ * Map onto sock_sendto/sock_recvfrom (UDP) via ksock_sendto/ksock_recvfrom. */
+
+/* ws2_32!sendto(s, buf, len, flags, to, tolen) -> bytes sent / SOCKET_ERROR. */
+static long w32_sendto(uint64_t *a) {
+    int fd = win32_sock_fd(a[0]);
+    if (fd < 0) { g_wsa_lasterror = WSAENOTSOCK_; return WIN32_INVALID_SOCK; }
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    if (!a[4] || copy_from_user(&to, (const void *)(uintptr_t)a[4], sizeof(to)) != 0) {
+        g_wsa_lasterror = WSAEFAULT_; return WIN32_INVALID_SOCK;
+    }
+    int len = (int)(uint32_t)a[2];
+    if (len <= 0) return 0;
+    int cap = len > 16384 ? 16384 : len;
+    uint8_t *kb = (uint8_t *)kmalloc(cap);
+    if (!kb) { g_wsa_lasterror = WSAEINTR_; return WIN32_INVALID_SOCK; }
+    if (copy_from_user(kb, (const void *)(uintptr_t)a[1], cap) != 0) {
+        kfree(kb); g_wsa_lasterror = WSAEFAULT_; return WIN32_INVALID_SOCK;
+    }
+    long n = ksock_sendto(fd, kb, cap, to.sin_addr, to.sin_port);
+    kfree(kb);
+    if (n < 0) { g_wsa_lasterror = WSAECONNRESET_; return WIN32_INVALID_SOCK; }
+    return n;
+}
+
+/* ws2_32!recvfrom(s, buf, len, flags, from, fromlen) -> bytes / SOCKET_ERROR.
+ * Blocks (sock_recvfrom) until a datagram arrives. Fills the optional `from`. */
+static long w32_recvfrom(uint64_t *a) {
+    int fd = win32_sock_fd(a[0]);
+    if (fd < 0) { g_wsa_lasterror = WSAENOTSOCK_; return WIN32_INVALID_SOCK; }
+    int len = (int)(uint32_t)a[2];
+    if (len <= 0) return 0;
+    int cap = len > 16384 ? 16384 : len;
+    uint8_t *kb = (uint8_t *)kmalloc(cap);
+    if (!kb) { g_wsa_lasterror = WSAEINTR_; return WIN32_INVALID_SOCK; }
+    uint32_t sip = 0; uint16_t sport = 0;
+    long n = ksock_recvfrom(fd, kb, cap, &sip, &sport);
+    if (n < 0) { kfree(kb); g_wsa_lasterror = WSAECONNRESET_; return WIN32_INVALID_SOCK; }
+    if (n > 0 && copy_to_user((void *)(uintptr_t)a[1], kb, (size_t)n) != 0) {
+        kfree(kb); g_wsa_lasterror = WSAEFAULT_; return WIN32_INVALID_SOCK;
+    }
+    kfree(kb);
+    if (a[4]) {                                   /* from sockaddr (optional) */
+        struct sockaddr_in from;
+        memset(&from, 0, sizeof(from));
+        from.sin_family = (uint16_t)AF_INET;
+        from.sin_addr = sip;
+        from.sin_port = sport;
+        (void)copy_to_user((void *)(uintptr_t)a[4], &from, sizeof(from));
+        if (a[5]) { int fl = (int)sizeof(from); (void)copy_to_user((void *)(uintptr_t)a[5], &fl, sizeof(fl)); }
+    }
+    return n;
+}
+
 struct win32_shim {
     const char    *dll;     /* lower-case DLL name, no path */
     const char    *func;    /* exact exported symbol */
@@ -8109,6 +8164,10 @@ static const struct win32_shim g_win32_shims[] = {
     { "ws2_32.dll", "bind",            w32_bind },
     { "ws2_32.dll", "listen",          w32_listen },
     { "ws2_32.dll", "accept",          w32_accept },
+
+    /* ---- C17c: Winsock UDP datagrams (ws2_32) ---- */
+    { "ws2_32.dll", "sendto",          w32_sendto },
+    { "ws2_32.dll", "recvfrom",        w32_recvfrom },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

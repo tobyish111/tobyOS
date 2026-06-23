@@ -84,7 +84,7 @@ driver model; POSIX libc surface.
 
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
-2. **App compatibility (~43%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
+2. **App compatibility (~44%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
    **stock, off-the-shelf Windows x86-64 `.exe`s — C and C++, console AND GUI** (a plain `clang`/`clang++`
    runs through its full ucrt CRT startup → main/WinMain → exit; real file I/O, multithreading with a real
    `CRITICAL_SECTION`, and a `user32`/`gdi32` GUI app that creates a window and draws through its WndProc
@@ -260,7 +260,10 @@ driver model; POSIX libc surface.
    **C17b (2026-06-22) — Winsock TCP server:** a stock Windows `.exe` does `bind`/`listen`/`accept` and a REAL
    external client (the QEMU host, over SLIRP hostfwd) connects to it; the server reads the request and replies
    (caught + fixed a latent kernel bug: `tcp_close`'s TIME_WAIT linger held the BKL across `hlt`, deadlocking
-   pid 0 — only the first *active* TCP closer, a server, hit it). **Windows: next** — winsock UDP (C17c),
+   pid 0 — only the first *active* TCP closer, a server, hit it). **C17c (2026-06-22) — Winsock UDP:** a stock
+   `.exe` does `sendto`/`recvfrom` (datagram echo server); a real host datagram (SLIRP hostfwd) round-trips
+   through tobyOS's UDP stack (caught + fixed a second latent bug: `sock_recvfrom` never drained the NIC while
+   waiting, so inbound UDP couldn't arrive unless another context happened to drain). **Windows: next** —
    `__declspec(thread)` compiler TLS, bold/italic + desktop-wide TTF, more shell32/ole shims, broader runtime.
    Still no .NET/UWP.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
@@ -346,6 +349,22 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-22** — **Track C milestone C17c: Winsock (ws2_32) — UDP datagrams.** A stock, off-the-shelf
+  Windows `.exe` (`-lws2_32`) is a UDP echo server on tobyOS: `socket(SOCK_DGRAM)` -> `bind`(:9090) ->
+  `recvfrom` -> `sendto` (echo). A REAL host datagram (SLIRP `hostfwd=udp::18081-:9090`, sent via bash
+  `/dev/udp`) round-trips through tobyOS's UDP stack; the server checks for a magic token and exits 17 iff
+  `recvfrom` delivered it and the echo `sendto` succeeded. Two new shims — `sendto`/`recvfrom` — wrap new
+  by-fd kernel helpers `ksock_sendto`/`ksock_recvfrom` (socket.c) over `sock_sendto`/`sock_recvfrom`; user
+  buffers go through `copy_from/to_user` and `recvfrom` fills the optional peer `sockaddr`. **Second latent
+  kernel bug caught + fixed:** `sock_recvfrom` parked on a wait-queue (`PROC_BLOCKED`) and relied purely on
+  the e1000 IRQ to wake it, but **never drained the NIC RX ring itself** — so an inbound datagram was never
+  delivered when no other context happened to be draining (e.g. a boot-harness `proc_wait`); UDP recv simply
+  hung. Fixed by making `sock_recvfrom` actively `rx_drain` + `sti;hlt` with the BKL dropped across the wait,
+  mirroring `tcp_poll_until`/`dhcp_wait` (the proven pattern every other blocking receiver already uses).
+  Proof `win-udp17.exe` (first-party): `[WINPE17C] PASS exit=17`, `recvfrom 12 bytes magic=1 from
+  10.0.2.2:...`. All Win32 milestones C1..C17c pass together under `-cpu qemu64,+smep,+smap` with 0 faults
+  (28 PASS verdicts); default desktop boot unaffected (steady heartbeats, max ~197ms gap, desktop ready, 0
+  faults, 0 PE activity). **C17 (winsock) COMPLETE** — TCP client + TCP server + UDP. App-compat ~43% -> ~44%.
 - **2026-06-22** — **Track C milestone C17b: Winsock (ws2_32) — the TCP server.** A stock, off-the-shelf
   Windows `.exe` (`-lws2_32`) acts as a TCP **server** on tobyOS: `socket` -> `bind`(INADDR_ANY:8080) ->
   `listen` -> `accept`, and a REAL external client — the QEMU host over SLIRP `hostfwd` (127.0.0.1:18080 ->

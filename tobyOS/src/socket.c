@@ -10,24 +10,23 @@
 #include <tobyos/socket.h>
 #include <tobyos/udp.h>
 #include <tobyos/tcp.h>
+#include <tobyos/net.h>
 #include <tobyos/proc.h>
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
+#include <tobyos/cpu.h>
 #include <tobyos/cap.h>
 
 static struct sock g_socks[SOCK_MAX];
 static uint16_t    g_next_ephemeral = 33000;
 
-/* ---- wait-queue helpers (mirrors pipe.c) ----------------------- */
-
-static void wq_add(struct proc **head, struct proc *p) {
-    p->next_wait = *head;
-    p->wait_head = head;
-    *head = p;
-}
+/* ---- wait-queue helpers (mirrors pipe.c) -----------------------
+ * sock_recvfrom now actively drains the NIC while waiting (see there) rather
+ * than parking on s->wq_recv, so wq_add is gone; wq_wake_all stays so
+ * sock_close still releases any legacy waiter and is a safe no-op otherwise. */
 
 static void wq_wake_all(struct proc **head) {
     struct proc *p = *head;
@@ -187,11 +186,24 @@ long sock_recvfrom(struct sock *s, void *buf, size_t n,
     while (s->count == 0) {
         struct proc *self = current_proc();
         if (self->pending_signals) return EINTR_RET;
-        wq_add(&s->wq_recv, self);
-        self->state = PROC_BLOCKED;
-        sched_yield();
-        if (self->pending_signals) return EINTR_RET;
         if (!s->in_use)            return -1;
+        /* Actively pull the NIC RX ring so inbound datagrams are delivered
+         * (udp_recv -> sock_deliver) while we wait. The e1000 IRQ-driven wake
+         * alone does not reliably advance a blocked UDP recv -- every other
+         * blocking receiver in the stack (tcp_poll_until, dhcp_wait) drains
+         * explicitly for the same reason. Drop the BKL across the idle hlt so
+         * pid 0 (compositor + net pump) can run; re-take it before touching
+         * shared socket state. (Was: pure wq_add + PROC_BLOCKED + sched_yield,
+         * which never received an inbound datagram when no other context was
+         * draining -- e.g. a boot-harness proc_wait -- a latent UDP-recv hang.) */
+        struct net_dev *nd = net_default();
+        if (nd && nd->rx_drain) nd->rx_drain(nd);
+        if (s->count > 0) break;
+        bool had_bkl = bkl_held();
+        if (had_bkl) bkl_exit();
+        sti();
+        hlt();
+        if (had_bkl) bkl_enter();
     }
 
     struct sock_dgram *d = &s->dgrams[s->tail];
@@ -312,6 +324,22 @@ int ksock_close(int sockfd) {
     if (!s) return -1;
     sock_close(s);
     return 0;
+}
+
+/* UDP datagram send/recv by pool fd (used by the ws2_32 sendto/recvfrom shims;
+ * the BSD wrappers above are TCP-oriented). buf is kernel memory. */
+long ksock_sendto(int sockfd, const void *buf, size_t len,
+                  uint32_t dst_ip_be, uint16_t dst_port_be) {
+    struct sock *s = sock_by_fd(sockfd);
+    if (!s) return -1;
+    return sock_sendto(s, buf, len, dst_ip_be, dst_port_be);
+}
+
+long ksock_recvfrom(int sockfd, void *buf, size_t len,
+                    uint32_t *src_ip_be, uint16_t *src_port_be) {
+    struct sock *s = sock_by_fd(sockfd);
+    if (!s) return -1;
+    return sock_recvfrom(s, buf, len, src_ip_be, src_port_be);
 }
 
 int ksock_setsockopt(int sockfd, int level, int optname,

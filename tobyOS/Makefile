@@ -1453,6 +1453,10 @@ programs/win-net17/win-net17.exe: programs/win-net17/main.c
 programs/win-srv17/win-srv17.exe: programs/win-srv17/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $< -lws2_32
 
+# Track C/C17c: a STOCK Win32 console .exe -- a winsock UDP echo server (sendto/recvfrom).
+programs/win-udp17/win-udp17.exe: programs/win-udp17/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $< -lws2_32
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1760,6 +1764,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-tls16/win-tls16.exe \
                programs/win-net17/win-net17.exe \
                programs/win-srv17/win-srv17.exe \
+               programs/win-udp17/win-udp17.exe \
                initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1836,6 +1841,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-tls16/win-tls16.exe               $(INITRD_STAGE)/bin/win-tls16.exe
 	cp programs/win-net17/win-net17.exe               $(INITRD_STAGE)/bin/win-net17.exe
 	cp programs/win-srv17/win-srv17.exe               $(INITRD_STAGE)/bin/win-srv17.exe
+	cp programs/win-udp17/win-udp17.exe               $(INITRD_STAGE)/bin/win-udp17.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -2047,7 +2053,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-ctrl14.exe bin/win-dlg14.exe bin/win-font14b.exe       \
 	    bin/win-menu15.exe bin/win-reg16.exe bin/win-fdlg16.exe        \
 	    bin/win-env16.exe bin/win-tls16.exe bin/win-net17.exe         \
-	    bin/win-srv17.exe                                             \
+	    bin/win-srv17.exe bin/win-udp17.exe                           \
 	    etc/Lato-Regular.ttf                                          \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \

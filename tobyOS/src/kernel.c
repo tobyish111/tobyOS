@@ -4685,6 +4685,37 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE17C_BOOT
+    /* Track C -- Winsock UDP datagrams, milestone C17c. Build EXTRA_CFLAGS+=
+     * -DWINPE17C_BOOT. A stock Win32 console .exe (ws2_32) binds UDP :9090,
+     * blocks in recvfrom for one datagram, checks for "TOBYUDP", echoes it back,
+     * and exits 17 IFF the token arrived and the echo send succeeded. The sender
+     * is the QEMU host: boot with -netdev user,hostfwd=udp::18081-:9090 and run
+     * logs/c17c.sh, which sends to 127.0.0.1:18081 once "[c17c] udp listening"
+     * shows. recvfrom blocks cooperatively (sock_recvfrom) while the boot thread
+     * proc_waits; the NIC RX IRQ delivers the datagram. */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE17C: net_up=%d -- spawning /bin/win-udp17.exe (winsock UDP echo)\n",
+                (int)net_is_up());
+        char *argv[] = { (char *)"win-udp17.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-udp17.exe", .name = "win-udp17.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE17C] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE17C: /bin/win-udp17.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE17C] VERDICT: %s exit=%d (expected 17)\n", rc == 17 ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery
