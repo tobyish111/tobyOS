@@ -3885,6 +3885,26 @@ static long w32_strncmp(uint64_t *a) {
     return 0;
 }
 
+/* strstr(haystack, needle) -> a USER pointer into haystack at the first match,
+ * or NULL. Searches within the copied prefix (cap 1024); the returned pointer
+ * is haystack + offset so it stays valid for the caller. */
+static long w32_strstr(uint64_t *a) {
+    if (!a[0]) return 0;
+    char hay[1024], nee[128];
+    hay[0] = 0; nee[0] = 0;
+    if (strncpy_from_user(hay, (const char *)(uintptr_t)a[0], sizeof(hay)) < 0) return 0;
+    if (!a[1]) return (long)a[0];
+    (void)strncpy_from_user(nee, (const char *)(uintptr_t)a[1], sizeof(nee));
+    if (!nee[0]) return (long)a[0];                 /* empty needle -> haystack */
+    int nlen = 0; while (nee[nlen]) nlen++;
+    for (int i = 0; hay[i]; i++) {
+        int j = 0;
+        while (j < nlen && hay[i + j] && hay[i + j] == nee[j]) j++;
+        if (j == nlen) return (long)(a[0] + (uint64_t)i);
+    }
+    return 0;
+}
+
 /* VirtualQuery(addr, buf, len): fill a minimal MEMORY_BASIC_INFORMATION
  * (committed, private, read-write). Enough for the CRT's startup probes. */
 static long w32_VirtualQuery(uint64_t *a) {
@@ -7787,6 +7807,50 @@ static long w32_inet_addr(uint64_t *a) {
     return (long)(uint32_t)ip_be;
 }
 
+/* ---- C17b: Winsock TCP server (bind / listen / accept) ----
+ * The kernel already implements the full server-side TCP handshake (tcp_listen
+ * + a per-listener accept queue + tcp_accept; see tcp.c). These wrap ksock_*. */
+#define WSAEADDRINUSE_  10048
+
+/* ws2_32!bind(s, name, namelen) -> 0 / SOCKET_ERROR. */
+static long w32_bind(uint64_t *a) {
+    int fd = win32_sock_fd(a[0]);
+    if (fd < 0) { g_wsa_lasterror = WSAENOTSOCK_; return WIN32_INVALID_SOCK; }
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    if (!a[1] || copy_from_user(&sa, (const void *)(uintptr_t)a[1], sizeof(sa)) != 0) {
+        g_wsa_lasterror = WSAEFAULT_; return WIN32_INVALID_SOCK;
+    }
+    if (ksock_bind(fd, &sa) != 0) { g_wsa_lasterror = WSAEADDRINUSE_; return WIN32_INVALID_SOCK; }
+    return 0;
+}
+
+/* ws2_32!listen(s, backlog) -> 0 / SOCKET_ERROR. */
+static long w32_listen(uint64_t *a) {
+    int fd = win32_sock_fd(a[0]);
+    if (fd < 0) { g_wsa_lasterror = WSAENOTSOCK_; return WIN32_INVALID_SOCK; }
+    if (ksock_listen(fd, (int)(int32_t)(uint32_t)a[1]) != 0) {
+        g_wsa_lasterror = WSAEINTR_; return WIN32_INVALID_SOCK;
+    }
+    return 0;
+}
+
+/* ws2_32!accept(s, addr, addrlen) -> a tagged SOCKET for the new connection,
+ * or INVALID_SOCKET. addr/addrlen are optional (filled with the peer family). */
+static long w32_accept(uint64_t *a) {
+    int fd = win32_sock_fd(a[0]);
+    if (fd < 0) { g_wsa_lasterror = WSAENOTSOCK_; return WIN32_INVALID_SOCK; }
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    int nfd = ksock_accept(fd, &sa);          /* blocks (tcp_accept) up to recv timeout */
+    if (nfd < 0) { g_wsa_lasterror = WSAETIMEDOUT_; return WIN32_INVALID_SOCK; }
+    if (a[1]) {
+        (void)copy_to_user((void *)(uintptr_t)a[1], &sa, sizeof(sa));
+        if (a[2]) { int alen = (int)sizeof(sa); (void)copy_to_user((void *)(uintptr_t)a[2], &alen, sizeof(alen)); }
+    }
+    return (long)(WIN32_SOCKET_TAG | (uint64_t)(uint32_t)nfd);
+}
+
 struct win32_shim {
     const char    *dll;     /* lower-case DLL name, no path */
     const char    *func;    /* exact exported symbol */
@@ -7835,6 +7899,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-private-l1-1-0.dll", "__C_specific_handler",   w32_zero },
     { "api-ms-win-crt-private-l1-1-0.dll", "memcpy",                 w32_memcpy },
     { "api-ms-win-crt-private-l1-1-0.dll", "memcmp",                 w32_memcmp },
+    { "api-ms-win-crt-private-l1-1-0.dll", "strstr",                 w32_strstr },
     /* ucrt: runtime (the startup core) */
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__p___argc",             w32_p_argc },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "__p___argv",             w32_p_argv },
@@ -8039,6 +8104,11 @@ static const struct win32_shim g_win32_shims[] = {
     { "ws2_32.dll", "htonl",           w32_htonl },
     { "ws2_32.dll", "ntohl",           w32_ntohl },
     { "ws2_32.dll", "inet_addr",       w32_inet_addr },
+
+    /* ---- C17b: Winsock TCP server (ws2_32) ---- */
+    { "ws2_32.dll", "bind",            w32_bind },
+    { "ws2_32.dll", "listen",          w32_listen },
+    { "ws2_32.dll", "accept",          w32_accept },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

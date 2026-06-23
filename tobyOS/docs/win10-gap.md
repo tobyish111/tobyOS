@@ -84,7 +84,7 @@ driver model; POSIX libc surface.
 
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
-2. **App compatibility (~42%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
+2. **App compatibility (~43%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
    **stock, off-the-shelf Windows x86-64 `.exe`s — C and C++, console AND GUI** (a plain `clang`/`clang++`
    runs through its full ucrt CRT startup → main/WinMain → exit; real file I/O, multithreading with a real
    `CRITICAL_SECTION`, and a `user32`/`gdi32` GUI app that creates a window and draws through its WndProc
@@ -257,8 +257,12 @@ driver model; POSIX libc surface.
    the TCP client:** a stock Windows `.exe` linked against `ws2_32` does a real **HTTP GET over the network** —
    `WSAStartup`/`gethostbyname`/`socket`/`connect`/`send`/`recv`/`closesocket` mapped onto tobyOS's existing
    `ksock_*`/DNS/TCP stack (a tagged `SOCKET` handle; `gethostbyname` builds a real `struct hostent`).
-   **Windows: next** — winsock TCP server (`bind`/`listen`/`accept`) + UDP (C17b/c), `__declspec(thread)`
-   compiler TLS, bold/italic + desktop-wide TTF, more shell32/ole shims, broader runtime. Still no .NET/UWP.
+   **C17b (2026-06-22) — Winsock TCP server:** a stock Windows `.exe` does `bind`/`listen`/`accept` and a REAL
+   external client (the QEMU host, over SLIRP hostfwd) connects to it; the server reads the request and replies
+   (caught + fixed a latent kernel bug: `tcp_close`'s TIME_WAIT linger held the BKL across `hlt`, deadlocking
+   pid 0 — only the first *active* TCP closer, a server, hit it). **Windows: next** — winsock UDP (C17c),
+   `__declspec(thread)` compiler TLS, bold/italic + desktop-wide TTF, more shell32/ole shims, broader runtime.
+   Still no .NET/UWP.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
    code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
    on top of the per-CPU TSS/GS/current_proc foundation. The pid 0 ↔ login interaction bit
@@ -342,6 +346,23 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-22** — **Track C milestone C17b: Winsock (ws2_32) — the TCP server.** A stock, off-the-shelf
+  Windows `.exe` (`-lws2_32`) acts as a TCP **server** on tobyOS: `socket` -> `bind`(INADDR_ANY:8080) ->
+  `listen` -> `accept`, and a REAL external client — the QEMU host over SLIRP `hostfwd` (127.0.0.1:18080 ->
+  guest:8080) — connects to it. The server `recv`s the request, checks for a magic token, `send`s an HTTP
+  reply, and exits 17 IFF the token arrived (a path only reachable if a genuine inbound connection was
+  delivered through tobyOS's TCP stack). Three new shims — `bind`/`listen`/`accept` — wrap the kernel
+  `ksock_bind`/`ksock_listen`/`ksock_accept` (tcp.c already implements the full passive-open handshake +
+  per-listener accept queue); `accept` returns a freshly-tagged `SOCKET`. Also added a `strstr` shim
+  (`api-ms-win-crt-private`) the server's CRT imported. **Latent kernel bug caught + fixed:** `tcp_close`'s
+  TIME_WAIT linger loop did `sti();hlt()` while **holding the BKL**, deadlocking pid 0 (which spins in
+  `bkl_enter`) — the exact failure `tcp_poll_until` documents and avoids. It stayed latent because only the
+  *active* closer reaches TIME_WAIT, and no prior test (all clients = passive closers) ever did; the C17b
+  server is the first. Fixed by dropping/retaking the BKL across the wait, mirroring `tcp_poll_until`. Proof
+  `win-srv17.exe` (first-party): `[WINPE17B] PASS exit=17`, the host received `HTTP/1.0 200 OK`. All Win32
+  milestones C1..C17b pass together under `-cpu qemu64,+smep,+smap` with 0 faults (27 PASS verdicts); default
+  desktop boot unaffected and shows 0 PE activity (the `tcp_close` fix is inert on a default boot — no TCP
+  connection is opened — and the winsock shims only run for a PE process). App-compat ~42% -> ~43%.
 - **2026-06-21** — **Track C milestone C17a: Winsock (ws2_32) — the TCP client.** A stock, off-the-shelf
   Windows `.exe` (built with the in-tree clang, linked against `ws2_32`) does a real **HTTP GET over the
   network** on tobyOS, with no real `ws2_32.dll`. Ten new shims — `WSAStartup`/`WSACleanup`/`WSAGetLastError`/

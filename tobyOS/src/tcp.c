@@ -1001,8 +1001,18 @@ void tcp_close(struct tcp_conn *c) {
             struct net_dev *nd = net_default();
             if (nd && nd->rx_drain) nd->rx_drain(nd);
             tcp_tick_all();
+            /* Drop the BKL across the idle wait, exactly as tcp_poll_until does:
+             * holding it across `hlt` deadlocks pid 0 (it spins forever in
+             * bkl_enter while we sleep). This linger is reached by the ACTIVE
+             * closer (a TCP server's closesocket -> TIME_WAIT); the passive-
+             * close path (clients) never enters it, which is why it stayed
+             * latent until the C17b winsock server. The net-state work above
+             * runs under the BKL, so nothing races. */
+            bool had_bkl = bkl_held();
+            if (had_bkl) bkl_exit();
             sti();
             hlt();
+            if (had_bkl) bkl_enter();
         }
     }
     if (c->in_use) conn_free(c);

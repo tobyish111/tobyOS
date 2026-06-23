@@ -4653,6 +4653,38 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE17B_BOOT
+    /* Track C -- Winsock TCP server, milestone C17b. Build EXTRA_CFLAGS+=
+     * -DWINPE17B_BOOT. A stock Win32 console .exe (ws2_32) binds :8080, listens,
+     * accepts ONE inbound connection, reads the request, and exits 17 IFF the
+     * magic token "TOBYPING" arrived -- i.e. a REAL external client connected.
+     * The external client is the QEMU host: boot with -netdev user,hostfwd=
+     * tcp::18080-:8080 and run logs/c17b.sh, which connects to 127.0.0.1:18080
+     * once the "[c17b] listening" marker shows. The accept blocks cooperatively
+     * (tcp_accept) while the boot thread proc_waits -- IRQ-driven RX completes
+     * the handshake, same path the C17a client proved. */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE17B: net_up=%d -- spawning /bin/win-srv17.exe (winsock TCP server)\n",
+                (int)net_is_up());
+        char *argv[] = { (char *)"win-srv17.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-srv17.exe", .name = "win-srv17.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE17B] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE17B: /bin/win-srv17.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE17B] VERDICT: %s exit=%d (expected 17)\n", rc == 17 ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery
