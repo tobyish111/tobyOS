@@ -357,6 +357,18 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-25** — **Track C milestone C19a: hardened + shipped C1–C18.** Full-suite regression gate before
+  opening C19. Built the all-flags ISO (every `-DWINPE*_BOOT` through `WINPE18D`) and ran the all-together boot
+  under `-cpu qemu64,+smep,+smap` with `-netdev user` + tcp/udp hostfwd connectors and `cache=writethrough`:
+  **all 32 verdicts PASS, 0 FAIL, 0 faults** — including the live C17 network round-trip (TCP client HTTP GET,
+  TCP echo server with a real host client, UDP datagram echo) and C18a's on-disk SQLite db. Inspected the C18c
+  GUI screenshots: the app window renders four distinct Lato faces (bold visibly heavier — +25% ink — and italic
+  slanted), and the native `gui_about` window's body text is now smooth TrueType (desktop-wide `gui_window_text`
+  → kfont). Default build (no `WINPE` flags) `validate.sh 3 75`: **3/3 ALIVE**, ~450 heartbeats each, `exc/panic=0`.
+  Pushed the three previously-local merges (C18c/C18b/C18d) to `origin/main` (`b4b469d..5ef47d5`). Track C now
+  spans C/C++, file I/O, threads + compiler TLS, runtime API resolution, multi-window, full GDI + multi-face
+  TrueType (incl. the desktop), the full control/dialog/menu/timer set, registry, comdlg32, env, winsock, shell32,
+  and a real off-the-shelf SQLite engine.
 - **2026-06-24** — **Track C milestone C18d: `shell32` (folder paths, ShellExecute, tray, drag-drop).** Five new
   `shell32.dll` shims in `src/syscall.c`: **`SHGetFolderPathA`** and **`SHGetSpecialFolderPathA`** map a `CSIDL`
   folder id to a Windows path under `C:\` (e.g. `CSIDL_APPDATA` → `C:\Users\toby\AppData\Roaming`, `CSIDL_PERSONAL`
