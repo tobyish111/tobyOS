@@ -18,20 +18,34 @@
 
 struct window;   /* opaque (compositor window) */
 
+/* C18c: font faces. CreateFontA's lfWeight (>=700 = bold) and lfItalic pick one;
+ * a missing weight/style transparently falls back to Regular. */
+enum {
+    KFONT_REGULAR    = 0,
+    KFONT_BOLD       = 1,
+    KFONT_ITALIC     = 2,
+    KFONT_BOLDITALIC = 3,
+    KFONT_NFACES     = 4,
+};
+
 /* Lazy-load the bundled TTF (idempotent). Returns true once a font is ready. */
 bool kfont_available(void);
 
 /* Advance width, in pixels, of NUL-terminated `s` rendered at pixel height `px`
  * (`len` >= 0 limits the character count; <0 = whole string). */
 int  kfont_text_width(const char *s, int len, int px);
+int  kfont_text_width_f(const char *s, int len, int px, int face);
 
 /* Vertical metrics at pixel height `px` (any out-pointer may be NULL). */
 void kfont_vmetrics(int px, int *ascent, int *descent, int *line_height);
+void kfont_vmetrics_f(int px, int *ascent, int *descent, int *line_height, int face);
 
 /* Draw `s` (len<0 = whole string) at (x,y) = the top-left of the text box, in
  * colour `xrgb` (0x00RRGGBB), pixel height `px`, alpha-blended into the
  * window's client backbuffer. Returns the advance width drawn. */
 int  kfont_draw_window(struct window *w, int x, int y, const char *s, int len,
                        uint32_t xrgb, int px);
+int  kfont_draw_window_f(struct window *w, int x, int y, const char *s, int len,
+                         uint32_t xrgb, int px, int face);
 
 #endif /* TOBYOS_KFONT_H */

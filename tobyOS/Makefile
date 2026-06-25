@@ -1421,6 +1421,13 @@ programs/win-font14b/win-font14b.exe: programs/win-font14b/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
 	      -o $@ $< -lgdi32 -luser32
 
+# Track C/C18c: a STOCK Win32 GUI .exe proving bold/italic TTF face selection --
+# CreateFontA's lfWeight/lfItalic pick a distinct Lato face (Regular/Bold/Italic/
+# BoldItalic) in the kernel rasterizer.
+programs/win-font18c/win-font18c.exe: programs/win-font18c/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
+	      -o $@ $< -lgdi32 -luser32
+
 # Track C/C15: a STOCK Win32 GUI .exe exercising a menu bar, a timer, and a
 # multi-button (Yes/No) MessageBox.
 programs/win-menu15/win-menu15.exe: programs/win-menu15/main.c
@@ -1775,7 +1782,10 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-srv17/win-srv17.exe \
                programs/win-udp17/win-udp17.exe \
                programs/win-sqlite/win-sqlite.exe \
+               programs/win-font18c/win-font18c.exe \
                initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
+               initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
+               initrd/etc/Lato-BoldItalic.ttf \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
                $(HELLOAPP_TPKG) $(HELLOAPP_TPKG_V2) $(SDK_SAMPLE_TPKGS) \
@@ -1792,6 +1802,9 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         $(INITRD_STAGE)/system/keys $(INITRD_STAGE)/m36
 	cp initrd/etc/motd                       $(INITRD_STAGE)/etc/motd
 	cp initrd/etc/Lato-Regular.ttf           $(INITRD_STAGE)/etc/Lato-Regular.ttf
+	cp initrd/etc/Lato-Bold.ttf              $(INITRD_STAGE)/etc/Lato-Bold.ttf
+	cp initrd/etc/Lato-Italic.ttf            $(INITRD_STAGE)/etc/Lato-Italic.ttf
+	cp initrd/etc/Lato-BoldItalic.ttf        $(INITRD_STAGE)/etc/Lato-BoldItalic.ttf
 	cp initrd/etc/drvmatch.conf              $(INITRD_STAGE)/etc/drvmatch.conf
 	cp initrd/etc/drvmatch.conf.test         $(INITRD_STAGE)/etc/drvmatch.conf.test
 	cp initrd/etc/lua_selftest.lua           $(INITRD_STAGE)/etc/lua_selftest.lua
@@ -1853,6 +1866,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-srv17/win-srv17.exe               $(INITRD_STAGE)/bin/win-srv17.exe
 	cp programs/win-udp17/win-udp17.exe               $(INITRD_STAGE)/bin/win-udp17.exe
 	cp programs/win-sqlite/win-sqlite.exe             $(INITRD_STAGE)/bin/win-sqlite.exe
+	cp programs/win-font18c/win-font18c.exe           $(INITRD_STAGE)/bin/win-font18c.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -2065,7 +2079,9 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-menu15.exe bin/win-reg16.exe bin/win-fdlg16.exe        \
 	    bin/win-env16.exe bin/win-tls16.exe bin/win-net17.exe         \
 	    bin/win-srv17.exe bin/win-udp17.exe bin/win-sqlite.exe        \
-	    etc/Lato-Regular.ttf                                          \
+	    bin/win-font18c.exe                                           \
+	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
+	    etc/Lato-BoldItalic.ttf                                       \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \

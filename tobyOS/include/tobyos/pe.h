@@ -140,4 +140,10 @@ uint32_t win32_gui_fill_color_fd(int fd);
  * (proof of input delivery, without GUI_TRACE_VERBOSE's per-frame volume). */
 void     win32_gui_set_log(bool on);
 
+/* C18c proof: count rendered "ink" pixels in a window region (differing from
+ * `bg`) and report the x-centroid of ink in the region's top vs bottom third so
+ * the harness can machine-verify bold renders heavier and italic slants. */
+int      win32_gui_ink_stats(int fd, int rx, int ry, int rw, int rh, uint32_t bg,
+                             int *top_cx, int *bot_cx);
+
 #endif /* TOBYOS_PE_H */

@@ -4283,7 +4283,9 @@ static long w32_LeaveCriticalSection(uint64_t *a) {
 #define WIN32_BITMAP_TAG  0x6200000000000000ull   /* HBITMAP -> g_win32_bmp slot  */
 #define WIN32_MEMDC_TAG   0x6300000000000000ull   /* memory HDC -> g_win32_memdc  */
 #define WIN32_CTRL_TAG    0x6400000000000000ull   /* control HWND -> g_win32_ctrl */
-#define WIN32_FONT_TAG    0x6500000000000000ull   /* HFONT, carries a bitmap scale (C13) */
+#define WIN32_FONT_TAG    0x6500000000000000ull   /* HFONT: px in bits[0:15], face in bits[16:17] (C18c) */
+#define WIN32_FONT_FACE_SHIFT 16
+#define WIN32_FONT_FACE_MASK  0x3u
 #define WIN32_TAG_MASK    0xFF00000000000000ull
 /* Control kinds (C12 BUTTON/EDIT; C13 STATIC/CHECKBOX/LISTBOX/SCROLLBAR;
  * C14 COMBOBOX/RADIO/GROUPBOX/TAB). */
@@ -4323,6 +4325,7 @@ struct win32_lb { char items[WIN32_LB_MAX_ITEMS][WIN32_LB_ITEM_LEN]; int n, sel;
 
 struct win32_win {
     int      fd;          /* sys_gui_create fd == HWND == HDC; 0 = free slot */
+    struct window *gwin;  /* C18c: the compositor window (for harness pixel readback) */
     int      w, h;        /* client size */
     uint64_t wndproc;     /* this window's WndProc (from its class) */
     bool     needs_paint; /* a WM_PAINT is queued */
@@ -4337,6 +4340,7 @@ struct win32_win {
     /* C13 GDI text state (per window / HDC). */
     int      font_scale;  /* bitmap-font scale from SelectObject(CreateFont) */
     int      font_px;     /* C14b: TTF pixel height (0 = default 16)         */
+    int      font_face;   /* C18c: KFONT_REGULAR/BOLD/ITALIC/BOLDITALIC      */
     uint32_t text_color;  /* SetTextColor (XRGB); default white */
     int      bk_mode;     /* OPAQUE(2, default) / TRANSPARENT(1) */
     /* C14: a dialog window (from a template). The kernel owns its painting
@@ -4785,6 +4789,7 @@ static long w32_CreateWindowExA(uint64_t *a) {
     struct proc *p = current_proc();
     g_win32_gui.tgid   = p ? (p->is_thread ? p->tgid : p->pid) : 0;
     win->fd          = (int)fd;
+    win->gwin        = win32_hdc_window((int)fd);  /* C18c: stash for pixel readback */
     win->w           = w;
     win->h           = h;
     win->wndproc     = win32_class_wndproc(cname);
@@ -4797,6 +4802,7 @@ static long w32_CreateWindowExA(uint64_t *a) {
     win->parent_fd   = parent_fd;
     win->font_scale  = 1;
     win->font_px     = 0;
+    win->font_face   = 0;             /* C18c: KFONT_REGULAR */
     win->text_color  = 0x00FFFFFFu;   /* white */
     win->bk_mode     = 2;             /* OPAQUE */
     win->is_dialog   = false;
@@ -5085,6 +5091,10 @@ static int win32_win_px(const struct win32_win *w) {
     int px = w ? w->font_px : 0;
     return px > 0 ? px : 16;
 }
+/* C18c: the DC's selected font face (KFONT_REGULAR if none). */
+static int win32_win_face(const struct win32_win *w) {
+    return w ? w->font_face : 0;
+}
 
 /* gdi32!TextOutA(hdc, x, y, str, len) -> non-zero. C14b: when the TrueType font
  * is available, render real glyphs at the DC's pixel height (CreateFont) in the
@@ -5104,7 +5114,8 @@ static long w32_TextOutA(uint64_t *a) {
         if (n < 0) return 0;
         if (len >= 0 && len < (int)n) s[len] = 0;
         struct window *gw = win32_hdc_window(fd);
-        if (gw) (void)kfont_draw_window(gw, x, y, s, -1, fg, win32_win_px(win));
+        if (gw) (void)kfont_draw_window_f(gw, x, y, s, -1, fg, win32_win_px(win),
+                                          win32_win_face(win));
         return 1;
     }
     uint32_t xy    = ((uint32_t)(x & 0xFFFF)) | ((uint32_t)(y & 0xFFFF) << 16);
@@ -5120,11 +5131,19 @@ static long w32_TextOutA(uint64_t *a) {
  * rasterizer (kfont.c) renders at that size. If no font ships, the DC falls
  * back to the scaled 8x8 bitmap font (the token's height/8 = the bitmap scale). */
 
-/* gdi32!CreateFontA(height, width, ...) -> HFONT carrying |height| in pixels. */
+/* gdi32!CreateFontA(cHeight, cWidth, cEscapement, cOrientation, cWeight,
+ * bItalic, ...) -> HFONT. C14b: low 16 bits carry |cHeight| in pixels. C18c:
+ * bits 16-17 carry the face selected by cWeight (a[4], >=700 = bold) and
+ * bItalic (a[5]) -- KFONT_REGULAR/BOLD/ITALIC/BOLDITALIC. */
 static long w32_CreateFontA(uint64_t *a) {
     int hgt = (int)(int32_t)a[0]; if (hgt < 0) hgt = -hgt;
     if (hgt < 1) hgt = 16; if (hgt > 200) hgt = 200;
-    return (long)(WIN32_FONT_TAG | (uint64_t)(uint32_t)hgt);
+    int weight = (int)(int32_t)a[4];          /* FW_BOLD == 700 */
+    bool italic = (a[5] & 0xFFu) != 0;
+    int face = (weight >= 700 ? KFONT_BOLD : 0) | (italic ? KFONT_ITALIC : 0);
+    return (long)(WIN32_FONT_TAG |
+                  ((uint64_t)(face & WIN32_FONT_FACE_MASK) << WIN32_FONT_FACE_SHIFT) |
+                  (uint64_t)(uint32_t)hgt);
 }
 /* gdi32!SetTextColor(hdc, COLORREF) -> previous colour (as COLORREF). */
 static long w32_SetTextColor(uint64_t *a) {
@@ -5161,8 +5180,8 @@ static long w32_GetTextExtentPoint32A(uint64_t *a) {
         if (n < 0) n = 0;
         if (len > (int)n) len = (int)n;
         int asc = 0, desc = 0, lh = px;
-        kfont_vmetrics(px, &asc, &desc, &lh);
-        sz[0] = kfont_text_width(s, len, px);
+        kfont_vmetrics_f(px, &asc, &desc, &lh, win32_win_face(w));
+        sz[0] = kfont_text_width_f(s, len, px, win32_win_face(w));
         sz[1] = lh;
     } else {
         int scale = w ? w->font_scale : 1;
@@ -5179,12 +5198,13 @@ static long w32_GetTextMetricsA(uint64_t *a) {
     memset(tm, 0, sizeof(tm));
     if (kfont_available()) {
         int asc = 0, desc = 0, lh = px;
-        kfont_vmetrics(px, &asc, &desc, &lh);
+        int face = win32_win_face(w);
+        kfont_vmetrics_f(px, &asc, &desc, &lh, face);
         tm[0] = asc + desc;                       /* tmHeight       */
         tm[1] = asc;                              /* tmAscent       */
         tm[2] = desc;                             /* tmDescent      */
-        tm[5] = kfont_text_width("n", -1, px);    /* tmAveCharWidth */
-        tm[6] = kfont_text_width("W", -1, px);    /* tmMaxCharWidth */
+        tm[5] = kfont_text_width_f("n", -1, px, face);    /* tmAveCharWidth */
+        tm[6] = kfont_text_width_f("W", -1, px, face);    /* tmMaxCharWidth */
     } else {
         int scale = w ? w->font_scale : 1;
         tm[0] = 8 * scale; tm[1] = 7 * scale; tm[2] = 1 * scale;
@@ -5210,14 +5230,15 @@ static long w32_DrawTextA(uint64_t *a) {
     int px = win32_win_px(w);
     struct window *gw = win32_hdc_window(fd);
     if (kfont_available() && gw) {
-        int tw = kfont_text_width(s, -1, px);
+        int face = win32_win_face(w);
+        int tw = kfont_text_width_f(s, -1, px, face);
         int asc = 0, desc = 0, lh = px;
-        kfont_vmetrics(px, &asc, &desc, &lh);
+        kfont_vmetrics_f(px, &asc, &desc, &lh, face);
         int th = asc + desc;
         int x = rc[0], y = rc[1];
         if (fmt & 0x1u) x = rc[0] + ((rc[2] - rc[0]) - tw) / 2;   /* DT_CENTER  */
         if (fmt & 0x4u) y = rc[1] + ((rc[3] - rc[1]) - th) / 2;   /* DT_VCENTER */
-        (void)kfont_draw_window(gw, x, y, s, -1, w->text_color, px);
+        (void)kfont_draw_window_f(gw, x, y, s, -1, w->text_color, px, face);
         return th;
     }
     int scale = w->font_scale;
@@ -5833,10 +5854,13 @@ static long w32_SelectObject(uint64_t *a) {
         w->pen_color = win32_colorref_to_xrgb((uint32_t)(obj & 0xFFFFFFu));
         return (long)old;
     }
-    if (w && (obj & WIN32_TAG_MASK) == WIN32_FONT_TAG) {   /* C13/C14b: select a font */
-        uint64_t old = WIN32_FONT_TAG | (uint64_t)(uint32_t)(w->font_px ? w->font_px : 16);
+    if (w && (obj & WIN32_TAG_MASK) == WIN32_FONT_TAG) {   /* C13/C14b/C18c: select a font */
+        uint64_t old = WIN32_FONT_TAG |
+            ((uint64_t)(w->font_face & WIN32_FONT_FACE_MASK) << WIN32_FONT_FACE_SHIFT) |
+            (uint64_t)(uint32_t)(w->font_px ? w->font_px : 16);
         int px = (int)(obj & 0xFFFF); if (px < 1) px = 16; if (px > 200) px = 200;
         w->font_px = px;                                  /* C14b: TTF pixel height */
+        w->font_face = (int)((obj >> WIN32_FONT_FACE_SHIFT) & WIN32_FONT_FACE_MASK); /* C18c */
         w->font_scale = (px + 4) / 8;                     /* bitmap fallback scale  */
         if (w->font_scale < 1) w->font_scale = 1;
         if (w->font_scale > 8) w->font_scale = 8;
@@ -9019,6 +9043,47 @@ int win32_gui_window_count(int tgid) {
 uint32_t win32_gui_fill_color_fd(int fd) {
     struct win32_win *w = win32_win_find(fd);
     return w ? w->fill_color : 0;
+}
+
+/* C18c proof: analyze rendered text in a window region so the harness can
+ * machine-verify the new font faces (bold genuinely renders heavier ink; italic
+ * genuinely slants). Reads the window's client backbuffer directly (works from
+ * the boot harness's context, where the app's fd isn't in our fd table) and
+ * returns the count of "ink" pixels (those differing from `bg` past a luma
+ * threshold). *top_cx/*bot_cx receive the x-centroid of ink in the region's top
+ * vs bottom third (-1 if none) -- an italic glyph leans forward, so its top
+ * centroid sits to the RIGHT of its bottom centroid. */
+int win32_gui_ink_stats(int fd, int rx, int ry, int rw, int rh, uint32_t bg,
+                        int *top_cx, int *bot_cx) {
+    if (top_cx) *top_cx = -1;
+    if (bot_cx) *bot_cx = -1;
+    struct win32_win *w = win32_win_find(fd);
+    if (!w || !w->gwin || rw <= 0 || rh <= 0) return 0;
+    static uint32_t row[1024];
+    if (rw > 1024) rw = 1024;
+    uint32_t b = bg & 0xFFFFFFu;
+    int br = (int)((b >> 16) & 0xFF), bg8 = (int)((b >> 8) & 0xFF), bb = (int)(b & 0xFF);
+    int third = rh / 3; if (third < 1) third = 1;
+    long count = 0, top_n = 0, bot_n = 0; long long top_xs = 0, bot_xs = 0;
+    for (int yy = 0; yy < rh; yy++) {
+        int got = gui_window_getpixels(w->gwin, rx, ry + yy, rw, 1, row);
+        if (got < rw) continue;                 /* clipped/short row -> skip */
+        for (int xx = 0; xx < rw; xx++) {
+            uint32_t px = row[xx] & 0xFFFFFFu;
+            int dr = (int)((px >> 16) & 0xFF) - br;
+            int dg = (int)((px >> 8) & 0xFF) - bg8;
+            int db = (int)(px & 0xFF) - bb;
+            int dist = (dr < 0 ? -dr : dr) + (dg < 0 ? -dg : dg) + (db < 0 ? -db : db);
+            if (dist > 60) {                     /* ink */
+                count++;
+                if (yy < third)            { top_xs += xx; top_n++; }
+                else if (yy >= rh - third) { bot_xs += xx; bot_n++; }
+            }
+        }
+    }
+    if (top_cx && top_n) *top_cx = (int)(top_xs / top_n);
+    if (bot_cx && bot_n) *bot_cx = (int)(bot_xs / bot_n);
+    return (int)count;
 }
 
 /* Win32 personality translator -- the mirror of linux_syscall(). A PE only

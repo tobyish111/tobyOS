@@ -85,62 +85,100 @@ static int      g_fpudepth;
 static inline void kfpu_begin(void) { if (g_fpudepth++ == 0) fpu_save(g_fpubuf); }
 static inline void kfpu_end(void)   { if (--g_fpudepth == 0) fpu_restore(g_fpubuf); }
 
-/* ---- font + glyph cache ---- */
-#define KFONT_PATH      "/etc/Lato-Regular.ttf"
-#define KFONT_CACHE     256
+/* ---- font faces + glyph cache (C18c: multiple weights/styles) ----
+ *
+ * Four faces of the Lato family ship in the initrd; CreateFontA's weight/italic
+ * select among them. Each face lazy-loads independently on first use; a missing
+ * bold/italic file transparently falls back to Regular (so the system still
+ * works if only Regular ships). The glyph cache keys on (face,cp,px). */
+#define KFONT_CACHE     384
 #define KFONT_PX_MIN    4
 #define KFONT_PX_MAX    200
 
-static struct {
+static const char *const g_face_path[KFONT_NFACES] = {
+    [KFONT_REGULAR]    = "/etc/Lato-Regular.ttf",
+    [KFONT_BOLD]       = "/etc/Lato-Bold.ttf",
+    [KFONT_ITALIC]     = "/etc/Lato-Italic.ttf",
+    [KFONT_BOLDITALIC] = "/etc/Lato-BoldItalic.ttf",
+};
+
+static struct kface {
     bool            tried, ok;
     unsigned char  *data;
     size_t          size;
     stbtt_fontinfo  info;
-} g_font;
+} g_faces[KFONT_NFACES];
 
 struct gcache {
-    int            cp, px;
+    int            face, cp, px;
     unsigned char *bmp;          /* coverage, w*h, or NULL (e.g. space) */
     int            w, h, xoff, yoff, advance;
 };
 static struct gcache g_cache[KFONT_CACHE];
 static int           g_cache_n;
 
-static void kfont_try_load(void) {
-    if (g_font.tried) return;
-    g_font.tried = true;
+/* Load one face's TTF (idempotent). Does not fall back -- the caller does. */
+static void kface_try_load(int face) {
+    struct kface *f = &g_faces[face];
+    if (f->tried) return;
+    f->tried = true;
     void  *buf = 0; size_t sz = 0;
-    if (vfs_read_all(KFONT_PATH, &buf, &sz) != 0 || !buf || sz < 12) {
-        kprintf("[kfont] no font at %s -- falling back to bitmap font\n", KFONT_PATH);
+    if (vfs_read_all(g_face_path[face], &buf, &sz) != 0 || !buf || sz < 12) {
+        if (face == KFONT_REGULAR)
+            kprintf("[kfont] no font at %s -- falling back to bitmap font\n",
+                    g_face_path[face]);
+        else
+            kprintf("[kfont] no %s -- falling back to Regular\n", g_face_path[face]);
         return;
     }
-    g_font.data = (unsigned char *)buf;
-    g_font.size = sz;
+    f->data = (unsigned char *)buf;
+    f->size = sz;
     kfpu_begin();
-    int ok = stbtt_InitFont(&g_font.info, g_font.data,
-                            stbtt_GetFontOffsetForIndex(g_font.data, 0));
+    int ok = stbtt_InitFont(&f->info, f->data,
+                            stbtt_GetFontOffsetForIndex(f->data, 0));
     kfpu_end();
     if (!ok) {
-        kprintf("[kfont] stbtt_InitFont failed (%lu bytes)\n", (unsigned long)sz);
-        kfree(buf); g_font.data = 0;
+        kprintf("[kfont] stbtt_InitFont failed for %s (%lu bytes)\n",
+                g_face_path[face], (unsigned long)sz);
+        kfree(buf); f->data = 0;
         return;
     }
-    g_font.ok = true;
-    kprintf("[kfont] loaded %s (%lu bytes) -- TrueType text enabled\n",
-            KFONT_PATH, (unsigned long)sz);
+    f->ok = true;
+    kprintf("[kfont] loaded %s (%lu bytes)\n", g_face_path[face], (unsigned long)sz);
+}
+
+/* Resolve a requested face to a loaded stbtt_fontinfo, falling back to Regular
+ * when the requested weight/style isn't shipped. Returns NULL only if even
+ * Regular is unavailable. */
+static stbtt_fontinfo *kface_info(int face) {
+    if (face < 0 || face >= KFONT_NFACES) face = KFONT_REGULAR;
+    kface_try_load(face);
+    if (g_faces[face].ok) return &g_faces[face].info;
+    /* Style-aware fallback: bold-italic -> bold -> regular; italic -> regular. */
+    if (face == KFONT_BOLDITALIC) {
+        kface_try_load(KFONT_BOLD);
+        if (g_faces[KFONT_BOLD].ok) return &g_faces[KFONT_BOLD].info;
+    }
+    if (face != KFONT_REGULAR) {
+        kface_try_load(KFONT_REGULAR);
+        if (g_faces[KFONT_REGULAR].ok) return &g_faces[KFONT_REGULAR].info;
+    }
+    return NULL;
 }
 
 bool kfont_available(void) {
-    kfont_try_load();
-    return g_font.ok;
+    return kface_info(KFONT_REGULAR) != NULL;
 }
 
-/* Find or rasterize the (cp,px) glyph. FP-guarded on a cache miss. */
-static struct gcache *kfont_glyph(int cp, int px) {
+/* Find or rasterize the (face,cp,px) glyph. FP-guarded on a cache miss. */
+static struct gcache *kfont_glyph(int face, int cp, int px) {
     if (px < KFONT_PX_MIN) px = KFONT_PX_MIN;
     if (px > KFONT_PX_MAX) px = KFONT_PX_MAX;
+    stbtt_fontinfo *info = kface_info(face);
+    if (!info) return NULL;
     for (int i = 0; i < g_cache_n; i++)
-        if (g_cache[i].cp == cp && g_cache[i].px == px) return &g_cache[i];
+        if (g_cache[i].face == face && g_cache[i].cp == cp && g_cache[i].px == px)
+            return &g_cache[i];
 
     if (g_cache_n >= KFONT_CACHE) {                 /* evict oldest */
         if (g_cache[0].bmp) kfree(g_cache[0].bmp);
@@ -148,64 +186,77 @@ static struct gcache *kfont_glyph(int cp, int px) {
         g_cache_n = KFONT_CACHE - 1;
     }
     struct gcache *g = &g_cache[g_cache_n++];
-    g->cp = cp; g->px = px;
+    g->face = face; g->cp = cp; g->px = px;
 
     kfpu_begin();
-    float scale = stbtt_ScaleForPixelHeight(&g_font.info, (float)px);
+    float scale = stbtt_ScaleForPixelHeight(info, (float)px);
     int adv = 0, lsb = 0;
-    stbtt_GetCodepointHMetrics(&g_font.info, cp, &adv, &lsb);
+    stbtt_GetCodepointHMetrics(info, cp, &adv, &lsb);
     g->advance = (int)(adv * scale + 0.5f);
-    g->bmp = stbtt_GetCodepointBitmap(&g_font.info, 0, scale, cp,
+    g->bmp = stbtt_GetCodepointBitmap(info, 0, scale, cp,
                                       &g->w, &g->h, &g->xoff, &g->yoff);
     kfpu_end();
     return g;
 }
 
-/* Ascent in pixels at `px` (FP-guarded). */
-static int kfont_ascent_px(int px) {
+/* Ascent in pixels at `px` for a face (FP-guarded). */
+static int kfont_ascent_px(int face, int px) {
+    stbtt_fontinfo *info = kface_info(face);
+    if (!info) return px;
     kfpu_begin();
-    float scale = stbtt_ScaleForPixelHeight(&g_font.info, (float)px);
+    float scale = stbtt_ScaleForPixelHeight(info, (float)px);
     int a = 0, d = 0, lg = 0;
-    stbtt_GetFontVMetrics(&g_font.info, &a, &d, &lg);
+    stbtt_GetFontVMetrics(info, &a, &d, &lg);
     int asc = (int)(a * scale + 0.5f);
     kfpu_end();
     return asc;
 }
 
-void kfont_vmetrics(int px, int *ascent, int *descent, int *line_height) {
-    if (!kfont_available()) { if (ascent) *ascent = px; if (descent) *descent = 0;
-                              if (line_height) *line_height = px; return; }
+void kfont_vmetrics_f(int px, int *ascent, int *descent, int *line_height, int face) {
+    stbtt_fontinfo *info = kface_info(face);
+    if (!info) { if (ascent) *ascent = px; if (descent) *descent = 0;
+                 if (line_height) *line_height = px; return; }
     kfpu_begin();
-    float scale = stbtt_ScaleForPixelHeight(&g_font.info, (float)px);
+    float scale = stbtt_ScaleForPixelHeight(info, (float)px);
     int a = 0, d = 0, lg = 0;
-    stbtt_GetFontVMetrics(&g_font.info, &a, &d, &lg);
+    stbtt_GetFontVMetrics(info, &a, &d, &lg);
     kfpu_end();
     if (ascent)      *ascent      = (int)(a * scale + 0.5f);
     if (descent)     *descent     = (int)(-d * scale + 0.5f);
     if (line_height) *line_height = (int)((a - d + lg) * scale + 0.5f);
 }
+void kfont_vmetrics(int px, int *ascent, int *descent, int *line_height) {
+    kfont_vmetrics_f(px, ascent, descent, line_height, KFONT_REGULAR);
+}
 
-int kfont_text_width(const char *s, int len, int px) {
-    if (!s || !kfont_available()) return 0;
+int kfont_text_width_f(const char *s, int len, int px, int face) {
+    if (!s || !kface_info(face)) return 0;
     int w = 0, n = 0;
     for (const char *p = s; *p && (len < 0 || n < len); p++, n++) {
-        struct gcache *g = kfont_glyph((unsigned char)*p, px);
+        struct gcache *g = kfont_glyph(face, (unsigned char)*p, px);
         w += g ? g->advance : px / 2;
     }
     return w;
 }
+int kfont_text_width(const char *s, int len, int px) {
+    return kfont_text_width_f(s, len, px, KFONT_REGULAR);
+}
 
-int kfont_draw_window(struct window *w, int x, int y, const char *s, int len,
-                      uint32_t xrgb, int px) {
-    if (!w || !s || !kfont_available()) return 0;
-    int baseline = y + kfont_ascent_px(px);
+int kfont_draw_window_f(struct window *w, int x, int y, const char *s, int len,
+                        uint32_t xrgb, int px, int face) {
+    if (!w || !s || !kface_info(face)) return 0;
+    int baseline = y + kfont_ascent_px(face, px);
     int x0 = x, n = 0;
     for (const char *p = s; *p && (len < 0 || n < len); p++, n++) {
-        struct gcache *g = kfont_glyph((unsigned char)*p, px);
+        struct gcache *g = kfont_glyph(face, (unsigned char)*p, px);
         if (g && g->bmp && g->w > 0 && g->h > 0)
             gui_window_blend_coverage(w, x + g->xoff, baseline + g->yoff,
                                       g->bmp, g->w, g->h, xrgb);
         x += g ? g->advance : px / 2;
     }
     return x - x0;
+}
+int kfont_draw_window(struct window *w, int x, int y, const char *s, int len,
+                      uint32_t xrgb, int px) {
+    return kfont_draw_window_f(w, x, y, s, len, xrgb, px, KFONT_REGULAR);
 }

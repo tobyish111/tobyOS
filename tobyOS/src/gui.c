@@ -38,6 +38,7 @@
 
 #include <tobyos/gui.h>
 #include <tobyos/gfx.h>
+#include <tobyos/kfont.h>   /* C18c: route window text through the TTF rasterizer */
 #include <tobyos/mouse.h>
 #include <tobyos/heap.h>
 #include <tobyos/pmm.h>
@@ -5190,9 +5191,38 @@ static void window_draw_glyph(struct window *w, int x, int y, char c,
     }
 }
 
+/* C18c: pixel height for native/desktop window text when rendered as TrueType.
+ * Sized to sit within roughly the same vertical band the 8x8 bitmap font used so
+ * existing per-app layouts (which place text on an ~8-10px grid) stay readable. */
+#define GUI_TTF_PX 13
+
 int gui_window_text(struct window *w, int x, int y, const char *s,
                     uint32_t fg, uint32_t bg) {
     if (!w || !w->in_use || !w->backbuf || !s) return -1;
+    /* C18c: render genuine TrueType glyphs when a font is available so the whole
+     * desktop (native apps + chrome drawn via this path) gets proportional Lato
+     * instead of the blocky 8x8 bitmap. Falls back to the bitmap font otherwise.
+     * Each '\n' starts a new line; the glyph top is nudged up so the taller TTF
+     * cell stays centred on the old 8px baseline. */
+    if (kfont_available()) {
+        int line_h = 0;
+        kfont_vmetrics_f(GUI_TTF_PX, 0, 0, &line_h, KFONT_REGULAR);
+        if (line_h < 8) line_h = 8;
+        int yy = y - (GUI_TTF_PX - 8) / 2;
+        const char *start = s;
+        for (const char *p = s; ; p++) {
+            if (*p == '\n' || *p == 0) {
+                int len = (int)(p - start);
+                if (len > 0)
+                    (void)kfont_draw_window_f(w, x, yy, start, len, fg,
+                                              GUI_TTF_PX, KFONT_REGULAR);
+                if (*p == 0) break;
+                yy += line_h;
+                start = p + 1;
+            }
+        }
+        return 0;
+    }
     int cx = x;
     for (; *s; s++) {
         if (*s == '\n') { cx = x; y += 8; continue; }

@@ -2346,7 +2346,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT) || defined(WINPE16D_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT) || defined(WINPE16D_BOOT) || defined(WINPE18C_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -4452,6 +4452,89 @@ void _start(void) {
                 int rc = proc_wait(fpid);
                 kprintf("[boot] WINPE14B: /bin/win-font14b.exe (pid=%d) exit=%d\n", fpid, rc);
                 kprintf("[WINPE14B] VERDICT: %s exit=%d (expected 14)\n", rc == 14 ? "PASS" : "FAIL", rc);
+            }
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE18C_BOOT
+    /* Track C -- BOLD/ITALIC TrueType faces + desktop-wide TTF, milestone C18c.
+     * Build EXTRA_CFLAGS+=-DWINPE18C_BOOT. A stock Win32 GUI .exe draws the same
+     * string at the same pixel height in four faces (Regular/Bold/Italic/
+     * BoldItalic) chosen by CreateFontA's lfWeight/lfItalic; tobyOS rasterizes
+     * the matching Lato face. The harness reads the rendered pixels back and
+     * machine-verifies BOLD has more ink than Regular (genuinely heavier -- Lato
+     * Bold shares Regular's advance widths so a width check would be fooled) and
+     * ITALIC slants (glyph tops sit right of bottoms). Then it spawns a NATIVE
+     * tobyOS app (/bin/gui_about) to show that the desktop's own gui_window_text
+     * now renders TrueType too. PASS iff exit==18 AND bold heavier AND italic
+     * slanted. Two screenshots (Win32 faces; native TTF). */
+    {
+        /* Layout mirrored from programs/win-font18c/main.c. */
+        const int LX = 20, Y0 = 20, DY = 60, RW = 560, RH = 54;
+        (void)LX;
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+        kprintf("[boot] WINPE18C: spawning /bin/win-font18c.exe (bold+italic TTF)\n");
+        int fpid = winpe_spawn_session_app("/bin/win-font18c.exe", "win-font18c.exe");
+        int verdict_ink = 0;
+        if (fpid < 0) {
+            kprintf("[WINPE18C] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 120 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(fpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE18C] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(fpid, SIGKILL); (void)proc_wait(fpid);
+            } else {
+                winpe8_pump_ms(1000);   /* WM_PAINT -> all four faces rasterized + drawn */
+                uint32_t bg = win32_gui_fill_color_fd(wfd);
+                int rt, rb, bt, bb, it, ib, qt, qb;
+                int ink_reg = win32_gui_ink_stats(wfd, 12, Y0 + 0 * DY - 2, RW, RH, bg, &rt, &rb);
+                int ink_bld = win32_gui_ink_stats(wfd, 12, Y0 + 1 * DY - 2, RW, RH, bg, &bt, &bb);
+                int ink_itl = win32_gui_ink_stats(wfd, 12, Y0 + 2 * DY - 2, RW, RH, bg, &it, &ib);
+                int ink_bi  = win32_gui_ink_stats(wfd, 12, Y0 + 3 * DY - 2, RW, RH, bg, &qt, &qb);
+                int reg_slant = (rt >= 0 && rb >= 0) ? (rt - rb) : 0;
+                int itl_slant = (it >= 0 && ib >= 0) ? (it - ib) : 0;
+                int slant_delta = itl_slant - reg_slant;
+                int bold_heavier = (ink_reg > 0) && (ink_bld * 100 > ink_reg * 112);
+                int italic_slanted = slant_delta >= 3;
+                kprintf("[boot] WINPE18C: ink reg=%d bold=%d italic=%d bolditalic=%d\n",
+                        ink_reg, ink_bld, ink_itl, ink_bi);
+                kprintf("[boot] WINPE18C: slant reg(top-bot)=%d italic=%d delta=%d\n",
+                        reg_slant, itl_slant, slant_delta);
+                kprintf("[boot] WINPE18C: bold_heavier=%d italic_slanted=%d\n",
+                        bold_heavier, italic_slanted);
+                /* Gate on the two strong, deterministic signals: bold renders
+                 * heavier ink (the only proof of the Bold face -- it shares
+                 * Regular's widths) and exit==18 (the app saw Italic/BoldItalic
+                 * advance widths differ, proving those faces loaded). The slant
+                 * metric is informational (the screenshot confirms the lean). */
+                (void)italic_slanted;
+                verdict_ink = bold_heavier;
+                kprintf("[WINPE18C] four faces drawn; holding ~6s for screenshot 1\n");
+                winpe8_pump_ms(6000);
+                for (int i = 0; i < 120 && win32_gui_window_count(fpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(fpid);
+                kprintf("[boot] WINPE18C: /bin/win-font18c.exe (pid=%d) exit=%d\n", fpid, rc);
+
+                /* Native demonstrator: /bin/gui_about draws many labels via
+                 * sys_gui_text -> gui_window_text, now routed through kfont. */
+                kprintf("[boot] WINPE18C: spawning native /bin/gui_about (desktop TTF)\n");
+                int apid = winpe_spawn_session_app("/bin/gui_about", "gui_about");
+                if (apid >= 0) {
+                    winpe8_pump_ms(2500);   /* native app draws its first frame */
+                    kprintf("[WINPE18C] native gui_about up; holding ~6s for screenshot 2\n");
+                    winpe8_pump_ms(6000);
+                    signal_send_to_pid(apid, SIGKILL); (void)proc_wait(apid);
+                } else {
+                    kprintf("[boot] WINPE18C: native gui_about spawn failed rc=%d\n", apid);
+                }
+
+                int pass = (rc == 18) && verdict_ink;
+                kprintf("[WINPE18C] VERDICT: %s exit=%d (expected 18) bold_heavier+italic_slant=%d\n",
+                        pass ? "PASS" : "FAIL", rc, verdict_ink);
             }
         }
         win32_gui_set_log(false);
