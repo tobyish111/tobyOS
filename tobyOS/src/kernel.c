@@ -4982,6 +4982,41 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE19C_BOOT
+    /* Track C -- minimal COM / ole32, TIGHTLY SCOPED, milestone C19c. Build
+     * EXTRA_CFLAGS+=-DWINPE19C_BOOT. /bin/win-com19c.exe is a first-party
+     * COM-ABI proof: it imports the REAL ole32 entry points (CoInitializeEx,
+     * CoCreateInstance, CoTaskMemAlloc/Free, CoUninitialize) and drives the one
+     * coclass tobyOS supports (CLSID_TobyAdder / ITobyAdder : IUnknown). The
+     * point is that QueryInterface/AddRef/Release + the real Add method are all
+     * dispatched THROUGH THE OBJECT'S VTABLE, whose slots are kernel-built gate
+     * thunks. The exit code 19 is reachable only if: CoTaskMem alloc/free round
+     * trips, CoCreateInstance returns a live object, Add(6,7)==42 through the
+     * vtable, AddRef/Release reference counting is exact, and QueryInterface
+     * both succeeds (IUnknown) and returns E_NOINTERFACE for an unknown IID. */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE19C: spawning /bin/win-com19c.exe (COM vtable proof)\n");
+        char *argv[] = { (char *)"win-com19c.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-com19c.exe", .name = "win-com19c.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE19C] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE19C: /bin/win-com19c.exe (pid=%d) exit=%d\n", pid, rc);
+            int pass = (rc == 19);
+            kprintf("[WINPE19C] VERDICT: %s exit=%d (expect 19: vtable Add/QI/AddRef/Release)\n",
+                    pass ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery

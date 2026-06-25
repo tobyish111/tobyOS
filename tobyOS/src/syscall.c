@@ -8783,6 +8783,118 @@ static long w32_SetFileTime(uint64_t *a){(void)a;return 1;}
 static long w32_GetLastError(uint64_t *a){(void)a;return (long)g_win32_lasterr;}
 static long w32_SetLastError(uint64_t *a){g_win32_lasterr=(uint32_t)a[0];return 0;}
 
+/* ================= C19c: minimal COM / ole32 (TIGHTLY SCOPED) =================
+ * A DELIBERATELY NARROW slice -- NOT a real COM runtime. tobyOS supports exactly
+ * ONE coclass (CLSID_TobyAdder) exposing ONE interface (ITobyAdder : IUnknown)
+ * with ONE real method (Add); every other CLSID/IID returns REGDB_E_CLASSNOTREG
+ * / E_NOINTERFACE. It proves the genuine COM ABI: CoInitializeEx/CoUninitialize,
+ * CoTaskMemAlloc/Free (-> the Win32 heap), and CoCreateInstance returning a real
+ * vtable-backed object on which QueryInterface/AddRef/Release + Add are called
+ * THROUGH THE VTABLE. The hard part -- dispatching a kernel-provided object's
+ * methods back into the kernel -- reuses the C9 procaddr gate-thunks: each vtable
+ * slot holds the fixed VA of a `mov eax,idx; jmp gate` thunk, so
+ * obj->lpVtbl->Method(this,...) traps into the matching shim with `this` as
+ * arg0. The object lives in user memory (win32_heap_alloc): [+0 lpVtbl, +8
+ * refcount(i32), +12 magic(u32)]. */
+#define COM_S_OK                 0L
+#define COM_E_NOINTERFACE        ((long)0x80004002L)
+#define COM_E_POINTER            ((long)0x80004003L)
+#define COM_E_FAIL               ((long)0x80004005L)
+#define COM_E_OUTOFMEMORY        ((long)0x8007000EL)
+#define COM_CLASS_E_NOAGGREGATION ((long)0x80040110L)
+#define COM_REGDB_E_CLASSNOTREG  ((long)0x80040154L)
+#define COM_OBJ_MAGIC            0x434F424Au   /* 'COBJ' */
+
+/* GUIDs as raw 16-byte blobs (the app passes pointers to identical bytes). */
+static const uint8_t COM_IID_IUnknown[16]   = {0,0,0,0, 0,0, 0,0, 0xC0,0,0,0,0,0,0,0x46};
+static const uint8_t COM_CLSID_TobyAdder[16]= {0x79,0x62,0x6F,0x74, 0x44,0x41, 0x52,0x44,
+                                               'T','O','B','Y','C','L','S','D'};
+static const uint8_t COM_IID_ITobyAdder[16] = {0x79,0x62,0x6F,0x74, 0x49,0x44, 0x46,0x49,
+                                               'T','O','B','Y','I','F','A','D'};
+
+static int win32_guid_eq_user(uint64_t uptr, const uint8_t *kguid){
+    uint8_t g[16]; if(!uptr||copy_from_user(g,(const void*)(uintptr_t)uptr,16)!=0) return 0;
+    for(int i=0;i<16;i++) if(g[i]!=kguid[i]) return 0; return 1;
+}
+/* The CPL3-callable VA of the procaddr gate-thunk for a named shim (C9). */
+static uint64_t win32_com_thunk(const char *fn){
+    int idx = win32_shim_index("ole32.dll", fn);
+    if(idx<0||idx>=win32_shim_count()) return 0;
+    return WIN32_PROCADDR_BASE_VA + (uint64_t)idx*WIN32_PROCADDR_STRIDE;
+}
+/* Validate that `self` points at one of our live COM objects. */
+static int win32_com_obj_ok(uint64_t self){
+    if(!self) return 0; uint32_t m=0;
+    if(copy_from_user(&m,(const void*)(uintptr_t)(self+12),4)!=0) return 0;
+    return m==COM_OBJ_MAGIC;
+}
+static int win32_com_ref_get(uint64_t self){ int32_t r=0;
+    (void)copy_from_user(&r,(const void*)(uintptr_t)(self+8),4); return r; }
+static void win32_com_ref_set(uint64_t self,int32_t r){
+    (void)copy_to_user((void*)(uintptr_t)(self+8),&r,4); }
+
+static long w32_CoInitializeEx(uint64_t *a){(void)a;return COM_S_OK;}
+static long w32_CoInitialize(uint64_t *a){(void)a;return COM_S_OK;}
+static long w32_CoUninitialize(uint64_t *a){(void)a;return 0;}
+static long w32_CoTaskMemAlloc(uint64_t *a){return (long)win32_malloc_hdr(a[0]);}
+static long w32_CoTaskMemFree(uint64_t *a){(void)a;return 0;}   /* arena heap: no-op */
+
+/* CoCreateInstance(rclsid=a0, pUnkOuter=a1, dwClsCtx=a2, riid=a3, ppv=a4). */
+static long w32_CoCreateInstance(uint64_t *a){
+    uint64_t rclsid=a[0], pUnkOuter=a[1], riid=a[3], ppv=a[4]; (void)a[2];
+    if(!ppv) return COM_E_POINTER;
+    uint64_t zero=0; (void)copy_to_user((void*)(uintptr_t)ppv,&zero,8);
+    if(pUnkOuter) return COM_CLASS_E_NOAGGREGATION;
+    if(!win32_guid_eq_user(rclsid,COM_CLSID_TobyAdder)) return COM_REGDB_E_CLASSNOTREG;
+    if(!win32_guid_eq_user(riid,COM_IID_ITobyAdder) &&
+       !win32_guid_eq_user(riid,COM_IID_IUnknown))     return COM_E_NOINTERFACE;
+    uint64_t vt  = win32_heap_alloc(4*8);
+    uint64_t obj = win32_heap_alloc(16);
+    if(!vt||!obj) return COM_E_OUTOFMEMORY;
+    uint64_t e[4] = { win32_com_thunk("__toby_com_QueryInterface"),
+                      win32_com_thunk("__toby_com_AddRef"),
+                      win32_com_thunk("__toby_com_Release"),
+                      win32_com_thunk("__toby_com_Add") };
+    if(!e[0]||!e[1]||!e[2]||!e[3]) return COM_E_FAIL;
+    if(copy_to_user((void*)(uintptr_t)vt,e,sizeof(e))!=0) return COM_E_FAIL;
+    int32_t one=1; uint32_t magic=COM_OBJ_MAGIC;
+    if(copy_to_user((void*)(uintptr_t)(obj+0),&vt,8)!=0) return COM_E_FAIL;
+    (void)copy_to_user((void*)(uintptr_t)(obj+8),&one,4);
+    (void)copy_to_user((void*)(uintptr_t)(obj+12),&magic,4);
+    (void)copy_to_user((void*)(uintptr_t)ppv,&obj,8);
+    return COM_S_OK;
+}
+/* Vtable methods -- reached only via the object's gate-thunks; `this`==a0. */
+static long w32_com_QueryInterface(uint64_t *a){
+    uint64_t self=a[0], riid=a[1], ppv=a[2];
+    if(!ppv) return COM_E_POINTER;
+    uint64_t zero=0; (void)copy_to_user((void*)(uintptr_t)ppv,&zero,8);
+    if(!win32_com_obj_ok(self)) return COM_E_POINTER;
+    if(win32_guid_eq_user(riid,COM_IID_ITobyAdder)||win32_guid_eq_user(riid,COM_IID_IUnknown)){
+        win32_com_ref_set(self, win32_com_ref_get(self)+1);
+        (void)copy_to_user((void*)(uintptr_t)ppv,&self,8);
+        return COM_S_OK;
+    }
+    return COM_E_NOINTERFACE;
+}
+static long w32_com_AddRef(uint64_t *a){
+    uint64_t self=a[0]; if(!win32_com_obj_ok(self)) return 0;
+    int32_t r=win32_com_ref_get(self)+1; win32_com_ref_set(self,r); return r;
+}
+static long w32_com_Release(uint64_t *a){
+    uint64_t self=a[0]; if(!win32_com_obj_ok(self)) return 0;
+    int32_t r=win32_com_ref_get(self)-1; if(r<0)r=0; win32_com_ref_set(self,r);
+    if(r==0){ uint32_t dead=0; (void)copy_to_user((void*)(uintptr_t)(self+12),&dead,4); }
+    return r;
+}
+/* The one real interface method: Add(this, x, y, *out) -> S_OK, *out = x+y. */
+static long w32_com_Add(uint64_t *a){
+    uint64_t self=a[0]; int32_t x=(int32_t)(uint32_t)a[1], y=(int32_t)(uint32_t)a[2];
+    uint64_t pout=a[3];
+    if(!win32_com_obj_ok(self)||!pout) return COM_E_POINTER;
+    int32_t s=x+y; return (copy_to_user((void*)(uintptr_t)pout,&s,4)==0)?COM_S_OK:COM_E_FAIL;
+}
+
 struct win32_shim {
     const char    *dll;     /* lower-case DLL name, no path */
     const char    *func;    /* exact exported symbol */
@@ -9214,6 +9326,20 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-time-l1-1-0.dll", "_localtime64", w32_localtime64 },
     { "api-ms-win-crt-time-l1-1-0.dll", "_time64",      w32_time64 },
     { "api-ms-win-crt-time-l1-1-0.dll", "clock",        w32_clock },
+    /* C19c: minimal COM / ole32 (tightly scoped -- one coclass/interface). */
+    { "ole32.dll", "CoInitializeEx",   w32_CoInitializeEx },
+    { "ole32.dll", "CoInitialize",     w32_CoInitialize },
+    { "ole32.dll", "CoUninitialize",   w32_CoUninitialize },
+    { "ole32.dll", "CoCreateInstance", w32_CoCreateInstance },
+    { "ole32.dll", "CoTaskMemAlloc",   w32_CoTaskMemAlloc },
+    { "ole32.dll", "CoTaskMemFree",    w32_CoTaskMemFree },
+    /* Internal vtable-method shims: never imported by name -- the kernel hands
+     * back their procaddr-thunk VAs as the COM object's vtable slots, so they're
+     * reached only through obj->lpVtbl->Method(this,...). */
+    { "ole32.dll", "__toby_com_QueryInterface", w32_com_QueryInterface },
+    { "ole32.dll", "__toby_com_AddRef",         w32_com_AddRef },
+    { "ole32.dll", "__toby_com_Release",        w32_com_Release },
+    { "ole32.dll", "__toby_com_Add",            w32_com_Add },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

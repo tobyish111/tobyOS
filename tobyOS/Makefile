@@ -1498,6 +1498,13 @@ programs/win-lua/win-lua.exe: $(LUA_SRCS)
 	@mkdir -p $(dir $@)
 	$(CC) --target=x86_64-w64-mingw32 -O1 -Ithird_party/lua -o $@ $(LUA_SRCS)
 
+# Track C/C19c: a first-party COM-ABI proof -- imports the REAL ole32 entry
+# points (CoInitializeEx/CoCreateInstance/CoTaskMem*) and dispatches a coclass's
+# methods through its vtable. Proves the genuine COM ABI against tobyOS's tightly
+# scoped (one coclass/interface) ole32 shim.
+programs/win-com19c/win-com19c.exe: programs/win-com19c/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $< -lole32
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1811,6 +1818,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-sqlite/win-sqlite.exe \
                programs/win-font18c/win-font18c.exe \
                programs/win-lua/win-lua.exe \
+               programs/win-com19c/win-com19c.exe \
                initrd/etc/c19b.lua \
                initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
@@ -1899,6 +1907,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-sqlite/win-sqlite.exe             $(INITRD_STAGE)/bin/win-sqlite.exe
 	cp programs/win-font18c/win-font18c.exe           $(INITRD_STAGE)/bin/win-font18c.exe
 	cp programs/win-lua/win-lua.exe                   $(INITRD_STAGE)/bin/win-lua.exe
+	cp programs/win-com19c/win-com19c.exe             $(INITRD_STAGE)/bin/win-com19c.exe
 	cp initrd/etc/c19b.lua                            $(INITRD_STAGE)/etc/c19b.lua
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
@@ -2114,7 +2123,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-menu15.exe bin/win-reg16.exe bin/win-fdlg16.exe        \
 	    bin/win-env16.exe bin/win-tls16.exe bin/win-net17.exe         \
 	    bin/win-srv17.exe bin/win-udp17.exe bin/win-sqlite.exe        \
-	    bin/win-font18c.exe bin/win-lua.exe                           \
+	    bin/win-font18c.exe bin/win-lua.exe bin/win-com19c.exe        \
 	    etc/c19b.lua                                                  \
 	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
 	    etc/Lato-BoldItalic.ttf                                       \
