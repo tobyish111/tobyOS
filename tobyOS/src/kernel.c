@@ -4932,6 +4932,56 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE19B_BOOT
+    /* Track C -- run ANOTHER real off-the-shelf third-party binary, milestone
+     * C19b. Build EXTRA_CFLAGS+=-DWINPE19B_BOOT. /bin/win-lua.exe is the
+     * UNMODIFIED upstream Lua 5.4.7 interpreter built as a Windows PE. It runs
+     * /etc/c19b.lua -- a program of integer arithmetic, the string library,
+     * tables and io -- which writes its result to C:\c19b.out (-> /data). Proof
+     * = clean exit AND the kernel re-reads /data/c19b.out and finds the exact
+     * sentinel the script can only produce by genuinely lexing, parsing,
+     * compiling and executing real Lua bytecode through the real VM + stdlib. */
+    {
+        win32_gui_set_log(true);
+        (void)vfs_unlink("/data/c19b.out");
+        kprintf("[boot] WINPE19B: spawning /bin/win-lua.exe /etc/c19b.lua (real Lua 5.4)\n");
+        char *argv[] = { (char *)"win-lua.exe", (char *)"/etc/c19b.lua", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-lua.exe", .name = "win-lua.exe",
+            .argc = 2, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE19B] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE19B: /bin/win-lua.exe (pid=%d) exit=%d\n", pid, rc);
+            void *buf = 0; size_t sz = 0; int found = 0;
+            if (vfs_read_all("/data/c19b.out", &buf, &sz) == 0 && buf) {
+                const char *p = (const char *)buf;
+                /* Exact result of the script: integer sum 385, fib(25)=75025,
+                 * gsub word count 4 -- unreachable unless real Lua executed. */
+                const char *needle = "TOBYLUA=== sum=385 fib25=75025 words=4";
+                size_t nl = 0; while (needle[nl]) nl++;
+                for (size_t i = 0; sz >= nl && i + nl <= sz; i++) {
+                    size_t k = 0; while (k < nl && p[i + k] == needle[k]) k++;
+                    if (k == nl) { found = 1; break; }
+                }
+                kprintf("[boot] WINPE19B: /data/c19b.out = %lu bytes, sentinel %s\n",
+                        (unsigned long)sz, found ? "FOUND" : "MISSING");
+                kfree(buf);
+            } else {
+                kprintf("[boot] WINPE19B: /data/c19b.out not readable\n");
+            }
+            int pass = (rc == 0 && found);
+            kprintf("[WINPE19B] VERDICT: %s exit=%d sentinel=%d (expect exit 0 + Lua result)\n",
+                    pass ? "PASS" : "FAIL", rc, found);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery

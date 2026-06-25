@@ -102,6 +102,15 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_DLG_TRAMP_VA       0x0000000030000100ULL
 #define WIN32_DLGSVC_THUNK_VA    0x00000000300001F0ULL
 
+/* C19b (real Lua / setjmp-using binaries): setjmp/longjmp save+restore the
+ * CALLER's live register context, so they CANNOT be kernel shims (a syscall is
+ * a different context). Their IAT slots are bound to pure-CPL3 leaf stubs in the
+ * shim page that never trap -- a self-consistent {rbx,rbp,rsp,r12-r15,rsi,rdi,
+ * retaddr} save/restore (no SEH unwind; sufficient for Lua's non-local goto).
+ * Placed high in page 0, above the import-thunk region. */
+#define WIN32_SETJMP_STUB_VA     0x0000000030000E00ULL
+#define WIN32_LONGJMP_STUB_VA    0x0000000030000E80ULL
+
 /* C9 (GetProcAddress): the loader pre-generates a marshalling thunk for EVERY
  * kernel-side Win32 shim into a fixed region of the shim page, so GetProcAddress
  * can hand back a real callable CPL3 function pointer for any shim resolved by

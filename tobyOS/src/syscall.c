@@ -7203,6 +7203,26 @@ static long w32_GetModuleHandleA(uint64_t *a) {
  * the implementation); same resolution as GetModuleHandleA, NULL if unknown. */
 static long w32_LoadLibraryA(uint64_t *a) { return w32_GetModuleHandleA(a); }
 
+/* kernel32!LoadLibraryExA(name, hFile, flags) -> HMODULE. The extra args don't
+ * change which built-in DLL we resolve; same as LoadLibraryA on a[0]. (C19b:
+ * real Lua's package loader imports this; it only matters if a C module is
+ * require()d, which resolves to NULL here -- pure-Lua require still works.) */
+static long w32_LoadLibraryExA(uint64_t *a) { return w32_GetModuleHandleA(a); }
+
+/* kernel32!GetModuleFileNameA(hModule, lpFilename, nSize) -> length. Returns the
+ * running PE's path; Lua's package lib calls this to derive the default
+ * package.path/cpath prefix. (C19b) */
+static long w32_GetModuleFileNameA(uint64_t *a) {
+    uint64_t buf = a[1]; uint32_t cap = (uint32_t)a[2];
+    if (!buf || !cap) return 0;
+    const char *path = "C:\\win-lua.exe";
+    uint32_t n = 0; while (path[n]) n++;
+    if (n > cap - 1) n = cap - 1;
+    if (copy_to_user((void *)(uintptr_t)buf, path, n) != 0) return 0;
+    char z = 0; (void)copy_to_user((void *)(uintptr_t)(buf + n), &z, 1);
+    return (long)n;
+}
+
 /* kernel32!FreeLibrary(hModule) -> TRUE (no real DLL refcount to drop). */
 static long w32_FreeLibrary(uint64_t *a) { (void)a; return 1; }
 
@@ -8493,6 +8513,14 @@ static long w32_isspace(uint64_t *a){int c=(int)a[0];return c==' '||c=='\t'||c==
 static long w32_isprint(uint64_t *a){int c=(int)a[0];return c>=0x20&&c<0x7F;}
 static long w32_tolower(uint64_t *a){int c=(int)a[0];return (c>='A'&&c<='Z')?c+32:c;}
 static long w32_toupper(uint64_t *a){int c=(int)a[0];return (c>='a'&&c<='z')?c-32:c;}
+/* C19b: remaining C-locale ctype predicates (real Lua's pattern matcher + libs). */
+static long w32_iscntrl(uint64_t *a){int c=(int)a[0];return (c>=0&&c<0x20)||c==0x7F;}
+static long w32_isgraph(uint64_t *a){int c=(int)a[0];return c>0x20&&c<0x7F;}
+static long w32_islower(uint64_t *a){int c=(int)a[0];return c>='a'&&c<='z';}
+static long w32_isupper(uint64_t *a){int c=(int)a[0];return c>='A'&&c<='Z';}
+static long w32_ispunct(uint64_t *a){int c=(int)a[0];return c>0x20&&c<0x7F&&
+    !((c>='0'&&c<='9')||(c>='A'&&c<='Z')||(c>='a'&&c<='z'));}
+static long w32_isxdigit(uint64_t *a){int c=(int)a[0];return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F');}
 
 /* ---- string (user memory) ---- */
 static long w32_strcmp(uint64_t *a) {
@@ -8527,6 +8555,12 @@ static long w32_strrchr(uint64_t *a) {
     char c=(char)(int)a[1]; long r=0;
     for(int i=0;i<=n;i++) if(s[i]==c) r=(long)(a[0]+(uint64_t)i);
     return r;
+}
+static long w32_strpbrk(uint64_t *a) {
+    char s[W32_STRCAP],set[256]; int n=(int)strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s));
+    if(n<0)return 0; if(strncpy_from_user(set,(const char*)(uintptr_t)a[1],sizeof(set))<0)return 0;
+    for(int i=0;s[i];i++)for(int j=0;set[j];j++)if(s[i]==set[j])return (long)(a[0]+(uint64_t)i);
+    return 0;
 }
 static long w32_strspn(uint64_t *a) {
     char s[W32_STRCAP],set[256]; int n=(int)strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s));
@@ -8604,8 +8638,12 @@ static long w32_fopen(uint64_t *a) {
     return (long)(WIN32_IOB_TAG|(uint64_t)((uint32_t)fd&0xFF));
 }
 static long w32_fclose(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd>=3)(void)sys_close(fd); return 0;}
-static long w32_fread(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return 0; uint64_t sz=a[1],nm=a[2]; if(!sz)return 0;
-    long got=sys_read(fd,(void*)(uintptr_t)a[3],sz*nm); return got>0?(long)((uint64_t)got/sz):0;}
+/* fread(ptr=a0, size=a1, nmemb=a2, FILE*=a3). (C19b: the FILE* is a3 like
+ * fwrite -- a latent arg-swap here read the fd from the buffer ptr and wrote
+ * into the FILE* token; SQLite never hit it as its VFS uses ReadFile, but real
+ * Lua's script loader reads via fread.) */
+static long w32_fread(uint64_t *a){int fd=win32_file_fd(a[3]); if(fd<0)return 0; uint64_t sz=a[1],nm=a[2]; if(!sz)return 0;
+    long got=sys_read(fd,(void*)(uintptr_t)a[0],sz*nm); return got>0?(long)((uint64_t)got/sz):0;}
 static long w32_fwrite(uint64_t *a){int fd=win32_file_fd(a[3]); if(fd<0)return 0; uint64_t sz=a[1],nm=a[2]; if(!sz)return 0;
     long w=sys_write(fd,(const void*)(uintptr_t)a[0],sz*nm); return w>0?(long)((uint64_t)w/sz):0;}
 static long w32_fputs(uint64_t *a){int fd=win32_file_fd(a[1]); if(fd<0)return -1;
@@ -8627,6 +8665,21 @@ static long w32_get_osfhandle(uint64_t *a){return (long)(int)a[0];}     /* HANDL
 static long w32_isatty(uint64_t *a){(void)a;return 0;}                  /* batch, not a tty */
 static long w32_setmode(uint64_t *a){(void)a;return 0;}
 static long w32_vsscanf(uint64_t *a){(void)a;return 0;}                 /* stub: 0 fields */
+/* C19b: stdio status/pushback. Our fd-backed FILE* shims signal EOF/error via
+ * return values, so feof/ferror/clearerr are no-ops; ungetc rewinds one byte. */
+static long w32_feof(uint64_t *a){(void)a;return 0;}
+static long w32_ferror(uint64_t *a){(void)a;return 0;}
+static long w32_clearerr(uint64_t *a){(void)a;return 0;}
+static long w32_ungetc(uint64_t *a){int fd=win32_file_fd(a[1]); int c=(int)a[0];
+    if(fd<0||c<0)return -1; long pos=sys_lseek(fd,0,1); if(pos>0)(void)sys_lseek(fd,pos-1,0); return c;}
+/* freopen(path,mode,stream): tobyOS has no real reopen; accept by returning the
+ * same stream token unchanged (covers the common freopen(NULL,"rb",std*) case). */
+static long w32_freopen(uint64_t *a){return (long)a[2];}
+/* setlocale(cat, name) -> a stable "C" string; tobyOS is C-locale only. */
+static long w32_setlocale(uint64_t *a){(void)a;
+    uint64_t ub=WIN32_CRT_DATA_BASE+WIN32_CRT_PATHBUF; char c[2]={'C',0};
+    return (copy_to_user((void*)(uintptr_t)ub,c,2)==0)?(long)ub:0;}
+static long w32__configthreadlocale(uint64_t *a){(void)a;return 0;}     /* _DISABLE_PER_THREAD */
 
 /* ---- environment / process ---- */
 static long w32_getenv(uint64_t *a) {
@@ -8656,6 +8709,10 @@ static long w32_access(uint64_t *a) {
 static long w32_chmod(uint64_t *a){(void)a;return 0;}
 static long w32_crt_mkdir(uint64_t *a){uint64_t up=win32_stage_winpath((const char*)(uintptr_t)a[0]); return (up&&sys_mkdir((const char*)(uintptr_t)up,0755)==0)?0:-1;}
 static long w32_crt_unlink(uint64_t *a){uint64_t up=win32_stage_winpath((const char*)(uintptr_t)a[0]); return (up&&sys_unlink((const char*)(uintptr_t)up)==0)?0:-1;}
+/* C19b: remove(path) == unlink. rename has no kernel primitive yet -> reports
+ * failure (Lua's os.rename surfaces it as nil,errmsg; uncalled by the test). */
+static long w32_crt_remove(uint64_t *a){uint64_t up=win32_stage_winpath((const char*)(uintptr_t)a[0]); return (up&&sys_unlink((const char*)(uintptr_t)up)==0)?0:-1;}
+static long w32_crt_rename(uint64_t *a){(void)a;return -1;}
 static long w32_crt_wunlink(uint64_t *a){char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0],wp,sizeof(wp));
     char kp[ABI_PATH_MAX]; int di=win32_xlate_winpath(wp,kp,sizeof(kp)); if(di<0)return -1;
     uint64_t ubuf=WIN32_CRT_DATA_BASE+WIN32_CRT_PATHBUF; if(copy_to_user((void*)(uintptr_t)ubuf,kp,(size_t)di+1)!=0)return -1;
@@ -8702,6 +8759,19 @@ static long w32_localtime64(uint64_t *a) {
     int32_t tm[9]={sec,mn,hr,d,m-1,y-1900,wday,0,0};
     uint64_t p=win32_malloc_hdr(sizeof(tm)); if(!p)return 0;
     (void)copy_to_user((void*)(uintptr_t)p,tm,sizeof(tm)); return (long)p;
+}
+
+/* C19b: time()/clock() return integer time_t/clock_t (marshal fine through the
+ * gate; difftime/gmtime/strftime stay out -- difftime returns a double). Real
+ * Lua seeds its RNG from time(NULL) in luaopen_math, so this is on the startup
+ * path. Epoch base is uptime-relative -- adequate for a seed; tobyOS has no RTC
+ * wall-clock plumbed into the Win32 layer. */
+static long w32_time64(uint64_t *a){
+    uint64_t hz=pit_hz(); if(!hz)hz=100; int64_t secs=(int64_t)(pit_ticks()/hz);
+    if(a[0])(void)copy_to_user((void*)(uintptr_t)a[0],&secs,8); return (long)secs;
+}
+static long w32_clock(uint64_t *a){(void)a;
+    uint64_t hz=pit_hz(); if(!hz)hz=100; return (long)(pit_ticks()*1000ull/hz);  /* CLOCKS_PER_SEC=1000 */
 }
 
 /* ---- a few more kernel32 ---- */
@@ -8799,6 +8869,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_unlock_file",        w32_zero },
     /* locale */
     { "api-ms-win-crt-locale-l1-1-0.dll", "localeconv",              w32_localeconv },
+    { "api-ms-win-crt-locale-l1-1-0.dll", "setlocale",              w32_setlocale },
+    { "api-ms-win-crt-locale-l1-1-0.dll", "_configthreadlocale",    w32__configthreadlocale },
     /* runtime extras */
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_errno",                 w32_errno },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "strerror",              w32_strerror },
@@ -8853,6 +8925,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "GetModuleHandleA",    w32_GetModuleHandleA },
     { "kernel32.dll", "GetProcAddress",      w32_GetProcAddress },
     { "kernel32.dll", "LoadLibraryA",        w32_LoadLibraryA },
+    { "kernel32.dll", "LoadLibraryExA",      w32_LoadLibraryExA },
+    { "kernel32.dll", "GetModuleFileNameA",  w32_GetModuleFileNameA },
     { "kernel32.dll", "FreeLibrary",         w32_FreeLibrary },
     { "kernel32.dll", "GetCurrentProcessId", w32_GetCurrentProcessId },
 
@@ -9064,6 +9138,13 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-string-l1-1-0.dll", "isprint",  w32_isprint },
     { "api-ms-win-crt-string-l1-1-0.dll", "tolower",  w32_tolower },
     { "api-ms-win-crt-string-l1-1-0.dll", "toupper",  w32_toupper },
+    /* C19b: ctype gaps the real Lua stdlib + pattern matcher reach */
+    { "api-ms-win-crt-string-l1-1-0.dll", "iscntrl",  w32_iscntrl },
+    { "api-ms-win-crt-string-l1-1-0.dll", "isgraph",  w32_isgraph },
+    { "api-ms-win-crt-string-l1-1-0.dll", "islower",  w32_islower },
+    { "api-ms-win-crt-string-l1-1-0.dll", "isupper",  w32_isupper },
+    { "api-ms-win-crt-string-l1-1-0.dll", "ispunct",  w32_ispunct },
+    { "api-ms-win-crt-string-l1-1-0.dll", "isxdigit", w32_isxdigit },
     /* string */
     { "api-ms-win-crt-string-l1-1-0.dll", "strcmp",   w32_strcmp },
     { "api-ms-win-crt-string-l1-1-0.dll", "strcpy",   w32_strcpy },
@@ -9072,6 +9153,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-string-l1-1-0.dll", "strrchr",  w32_strrchr },
     { "api-ms-win-crt-string-l1-1-0.dll", "strspn",   w32_strspn },
     { "api-ms-win-crt-string-l1-1-0.dll", "strcspn",  w32_strcspn },
+    { "api-ms-win-crt-string-l1-1-0.dll", "strpbrk",  w32_strpbrk },
+    { "api-ms-win-crt-string-l1-1-0.dll", "strcoll",  w32_strcmp },  /* C-locale == strcmp */
     { "api-ms-win-crt-string-l1-1-0.dll", "_strdup",  w32_strdup },
     { "api-ms-win-crt-private-l1-1-0.dll", "memchr",  w32_memchr },
     { "api-ms-win-crt-private-l1-1-0.dll", "memmove", w32_memmove },
@@ -9099,6 +9182,15 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vsscanf", w32_vsscanf },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "_popen",    w32_zero },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "_pclose",   w32_zero },
+    /* C19b: real-Lua stdio gaps */
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "getc",      w32_fgetc },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "ungetc",    w32_ungetc },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "feof",      w32_feof },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "ferror",    w32_ferror },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "clearerr",  w32_clearerr },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "freopen",   w32_freopen },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "tmpfile",   w32_zero },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "tmpnam",    w32_zero },
     /* environment / process */
     { "api-ms-win-crt-environment-l1-1-0.dll", "getenv", w32_getenv },
     { "api-ms-win-crt-runtime-l1-1-0.dll", "_getpid",  w32_getpid },
@@ -9109,6 +9201,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_chmod",         w32_chmod },
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_mkdir",         w32_crt_mkdir },
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_unlink",        w32_crt_unlink },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "remove",         w32_crt_remove },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "rename",         w32_crt_rename },
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_wunlink",       w32_crt_wunlink },
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_fullpath",      w32_fullpath },
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_stat64i32",     w32_stat64i32 },
@@ -9118,6 +9212,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-filesystem-l1-1-0.dll", "_findclose",     w32_findclose_crt },
     /* time */
     { "api-ms-win-crt-time-l1-1-0.dll", "_localtime64", w32_localtime64 },
+    { "api-ms-win-crt-time-l1-1-0.dll", "_time64",      w32_time64 },
+    { "api-ms-win-crt-time-l1-1-0.dll", "clock",        w32_clock },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 

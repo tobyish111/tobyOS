@@ -306,6 +306,46 @@ static const uint8_t g_win32_dlg_tramp[] = {
 };
 #define WIN32_DLG_TRAMP_SIZE (sizeof(g_win32_dlg_tramp))
 
+/* C19b: pure-CPL3 setjmp/longjmp leaf stubs (no syscall). A real binary that
+ * uses setjmp/longjmp (e.g. Lua's protected-call error handling) binds those
+ * IAT slots here. The jmp_buf layout is private + self-consistent between the
+ * two stubs (Windows _JBLEN=256 bytes is plenty): offsets
+ *   +0 rbx  +8 rbp  +0x10 rsp(caller)  +0x18 r12  +0x20 r13  +0x28 r14
+ *   +0x30 r15  +0x38 rsi  +0x40 rdi  +0x48 return-address
+ * No SEH unwinding (sufficient for a plain non-local goto on the same stack).
+ *
+ * setjmp(rcx=buf [, rdx=frame ignored]) -> 0  (mingw __intrinsic_setjmp passes
+ * a frame ptr in rdx; we don't unwind, so it's unused):
+ *   mov [rcx],rbx ; mov [rcx+8],rbp ; lea rax,[rsp+8] ; mov [rcx+0x10],rax
+ *   mov [rcx+0x18],r12 ; ... r15 ; mov [rcx+0x38],rsi ; mov [rcx+0x40],rdi
+ *   mov rax,[rsp] ; mov [rcx+0x48],rax ; xor eax,eax ; ret
+ */
+static const uint8_t g_win32_setjmp_stub[] = {
+    0x48,0x89,0x19, 0x48,0x89,0x69,0x08, 0x48,0x8d,0x44,0x24,0x08,
+    0x48,0x89,0x41,0x10, 0x4c,0x89,0x61,0x18, 0x4c,0x89,0x69,0x20,
+    0x4c,0x89,0x71,0x28, 0x4c,0x89,0x79,0x30, 0x48,0x89,0x71,0x38,
+    0x48,0x89,0x79,0x40, 0x48,0x8b,0x04,0x24, 0x48,0x89,0x41,0x48,
+    0x31,0xc0, 0xc3
+};
+#define WIN32_SETJMP_STUB_SIZE (sizeof(g_win32_setjmp_stub))
+
+/* longjmp(rcx=buf, edx=val) -> never returns to here; resumes at the setjmp
+ * call site with eax = (val ? val : 1):
+ *   mov rbx,[rcx] ; mov rbp,[rcx+8] ; mov r12,[rcx+0x18] ; ... r15
+ *   mov rsi,[rcx+0x38] ; mov rdi,[rcx+0x40] ; mov eax,edx ; test eax,eax
+ *   jnz 1f ; mov eax,1 ; 1: mov rsp,[rcx+0x10] ; jmp [rcx+0x48]
+ */
+static const uint8_t g_win32_longjmp_stub[] = {
+    0x48,0x8b,0x19, 0x48,0x8b,0x69,0x08, 0x4c,0x8b,0x61,0x18,
+    0x4c,0x8b,0x69,0x20, 0x4c,0x8b,0x71,0x28, 0x4c,0x8b,0x79,0x30,
+    0x48,0x8b,0x71,0x38, 0x48,0x8b,0x79,0x40, 0x89,0xd0, 0x85,0xc0,
+    0x75,0x05, 0xb8,0x01,0x00,0x00,0x00, 0x48,0x8b,0x61,0x10,
+    0xff,0x61,0x48
+};
+#define WIN32_LONGJMP_STUB_SIZE (sizeof(g_win32_longjmp_stub))
+#define WIN32_SETJMP_OFF   ((uint64_t)(WIN32_SETJMP_STUB_VA  - WIN32_SHIM_BASE))
+#define WIN32_LONGJMP_OFF  ((uint64_t)(WIN32_LONGJMP_STUB_VA - WIN32_SHIM_BASE))
+
 static inline uint64_t round_up(uint64_t x, uint64_t a) { return (x + a - 1) & ~(a - 1); }
 
 /* ---- MZ/PE sniff -------------------------------------------------------- */
@@ -351,6 +391,13 @@ static uint64_t win32_user_stub_va(const char *dll, const char *func) {
      * DialogProc), so DialogBoxParamA is bound to the dialog trampoline. */
     if (strcmp(func, "DialogBoxParamA") == 0)
         return WIN32_DLG_TRAMP_VA;
+    /* C19b: setjmp/longjmp run entirely in CPL3 (save/restore the caller's
+     * context); mingw emits the setjmp side as __intrinsic_setjmp. */
+    if (strcmp(func, "__intrinsic_setjmp") == 0 ||
+        strcmp(func, "_setjmp") == 0 || strcmp(func, "setjmp") == 0)
+        return WIN32_SETJMP_STUB_VA;
+    if (strcmp(func, "longjmp") == 0)
+        return WIN32_LONGJMP_STUB_VA;
     return 0;
 }
 
@@ -398,6 +445,13 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
     int dlgsvc_idx = win32_shim_index("user32.dll", "__toby_dlgsvc");
     if (dlgsvc_idx >= 0)
         pe_emit_gate_thunk(WIN32_DLGSVC_THUNK_OFF, (uint32_t)dlgsvc_idx);
+    /* C19b: the pure-CPL3 setjmp/longjmp leaf stubs (high in page 0). */
+    _Static_assert(WIN32_SETJMP_OFF  + WIN32_SETJMP_STUB_SIZE  <= WIN32_LONGJMP_OFF,
+                   "setjmp stub overruns longjmp stub");
+    _Static_assert(WIN32_LONGJMP_OFF + WIN32_LONGJMP_STUB_SIZE <= 0x1000,
+                   "longjmp stub overruns shim page 0");
+    memcpy((void *)(WIN32_SHIM_BASE + WIN32_SETJMP_OFF),  g_win32_setjmp_stub,  WIN32_SETJMP_STUB_SIZE);
+    memcpy((void *)(WIN32_SHIM_BASE + WIN32_LONGJMP_OFF), g_win32_longjmp_stub, WIN32_LONGJMP_STUB_SIZE);
     uaccess_end(uf);
 
     int next_thunk = 0;     /* next free thunk slot in the page */
