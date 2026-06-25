@@ -732,6 +732,11 @@ static int spawn_internal(const char *path, const char *name,
         p->win_image_base = pe_info.image_base;
         p->win_rsrc_rva   = pe_info.rsrc_rva;
         p->win_rsrc_size  = pe_info.rsrc_size;
+        /* C18b: remember the .tls template for per-thread TLS in CreateThread. */
+        p->win_tls_raw_va   = pe_info.tls_raw_va;
+        p->win_tls_raw_size = pe_info.tls_raw_size;
+        p->win_tls_total    = pe_info.tls_total;
+        p->win_tls_index    = pe_info.tls_index;
         kprintf("[proc] pid %d '%s' -> Win32 PE personality (entry=%p teb=%p)\n",
                 p->pid, p->name, (void *)pe_info.entry, (void *)pe_info.teb);
         ok = build_user_stack(p);

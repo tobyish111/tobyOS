@@ -1334,6 +1334,14 @@ programs/win-fileio/win-fileio.exe: programs/win-fileio/main.c
 programs/win-thread/win-thread.exe: programs/win-thread/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $<
 
+# Track C/C18b: a STOCK console .exe using compiler thread-local storage
+# (_Thread_local) across 4 threads. -fno-emulated-tls makes clang emit NATIVE
+# Windows TLS (gs:[0x58] + _tls_index via the PE .tls directory) instead of the
+# __emutls_get_address default; proves the loader's TLS template/_tls_index/
+# ThreadLocalStoragePointer setup + per-thread blocks (per-thread isolation).
+programs/win-tls18b/win-tls18b.exe: programs/win-tls18b/main.c
+	$(CC) --target=x86_64-w64-mingw32 -fno-emulated-tls -O1 -o $@ $<
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -1760,6 +1768,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-cpp/win-cpp.exe \
                programs/win-fileio/win-fileio.exe \
                programs/win-thread/win-thread.exe \
+               programs/win-tls18b/win-tls18b.exe \
                programs/win-gui/win-gui.exe \
                programs/win-gui8/win-gui8.exe \
                programs/win-c9/win-c9.exe \
@@ -1844,6 +1853,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-cpp/win-cpp.exe                   $(INITRD_STAGE)/bin/win-cpp.exe
 	cp programs/win-fileio/win-fileio.exe             $(INITRD_STAGE)/bin/win-fileio.exe
 	cp programs/win-thread/win-thread.exe             $(INITRD_STAGE)/bin/win-thread.exe
+	cp programs/win-tls18b/win-tls18b.exe             $(INITRD_STAGE)/bin/win-tls18b.exe
 	cp programs/win-gui/win-gui.exe                   $(INITRD_STAGE)/bin/win-gui.exe
 	cp programs/win-gui8/win-gui8.exe                 $(INITRD_STAGE)/bin/win-gui8.exe
 	cp programs/win-c9/win-c9.exe                     $(INITRD_STAGE)/bin/win-c9.exe
@@ -2070,7 +2080,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/win-hello.exe            \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
-	    bin/win-fileio.exe bin/win-thread.exe bin/win-gui.exe          \
+	    bin/win-fileio.exe bin/win-thread.exe bin/win-tls18b.exe       \
+	    bin/win-gui.exe                                                \
 	    bin/win-gui8.exe bin/win-c9.exe bin/win-gui10.exe              \
 	    bin/win-c11file.exe bin/win-gui11.exe                          \
 	    bin/win-bmp12.exe bin/win-ctrl12.exe                           \

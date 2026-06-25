@@ -3827,6 +3827,18 @@ static uint64_t win32_heap_alloc(uint64_t n) {
     p->win_heap_cur += n;
     return r;
 }
+/* Copy n bytes between two USER addresses in the current address space (bounces
+ * through a small kernel buffer; copy_to/from_user can't go user->user). Used by
+ * C18b per-thread TLS to clone the .tls template into each thread's block. */
+static void win32_user_memcpy(uint64_t dst, uint64_t src, uint64_t n) {
+    uint8_t buf[256];
+    while (n) {
+        uint64_t c = n < sizeof(buf) ? n : sizeof(buf);
+        if (copy_from_user(buf, (const void *)(uintptr_t)src, c) != 0) break;
+        if (copy_to_user((void *)(uintptr_t)dst, buf, c) != 0) break;
+        src += c; dst += c; n -= c;
+    }
+}
 /* Size-tracked allocation over the bump arena: store the byte count in a 16-byte
  * header (keeps the returned pointer 16-aligned) so realloc / HeapSize / _msize
  * can recover it. free() stays a no-op (the arena never reclaims). C18a: SQLite
@@ -4121,6 +4133,8 @@ static long w32_CloseHandle(uint64_t *a) {
 #define WIN32_TEB_STACKBASE_OFF  0x08
 #define WIN32_TEB_STACKLIMIT_OFF 0x10
 #define WIN32_TEB_TLS_OFF        0x80    /* TLS slot array within our 1-page TEB */
+#define WIN32_TEB_TLSPTR_OFF     0x58    /* C18b: x64 ThreadLocalStoragePointer  */
+#define WIN32_TLS_ARR_BYTES      0x80    /* C18b: per-thread TLS pointer array    */
 #define WIN32_TLS_MAX            64
 static uint8_t g_win32_tls_used[WIN32_TLS_MAX];
 
@@ -4173,6 +4187,8 @@ static long w32_CreateThread(uint64_t *a) {
     uint64_t stack_top = (stack + WIN32_THREAD_STACK) & ~0xFULL;   /* 16-aligned */
 
     struct proc *leader = current_proc();
+    /* C18b: the .tls template lives on the thread-group leader (the main proc). */
+    struct proc *lead = (leader && leader->is_thread) ? proc_lookup(leader->tgid) : leader;
     int tid = thread_create(WIN32_THREAD_WRAPPER_VA, block, stack_top, 0);
     if (tid < 0) return 0;
 
@@ -4192,6 +4208,19 @@ static long w32_CreateThread(uint64_t *a) {
             (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACKBASE_OFF),  &sb,   8);
             (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_STACKLIMIT_OFF), &sl,   8);
             t->gs_base = teb;
+            /* C18b: give this thread its OWN static-TLS block + pointer array and
+             * point its TEB's gs:[0x58] at the array, so every _Thread_local is
+             * per-thread (the template's initial values, isolated per thread). */
+            if (lead && lead->win_tls_total) {
+                uint64_t arr = win32_heap_alloc(WIN32_TLS_ARR_BYTES);
+                uint64_t blk = win32_heap_alloc(lead->win_tls_total);
+                if (arr && blk) {
+                    /* heap is fresh ANON (zeroed): only copy the template raw. */
+                    win32_user_memcpy(blk, lead->win_tls_raw_va, lead->win_tls_raw_size);
+                    (void)copy_to_user((void *)(uintptr_t)(arr + lead->win_tls_index * 8), &blk, 8);
+                    (void)copy_to_user((void *)(uintptr_t)(teb + WIN32_TEB_TLSPTR_OFF), &arr, 8);
+                }
+            }
         } else {
             t->gs_base = leader ? leader->gs_base : 0;   /* fallback: share */
         }

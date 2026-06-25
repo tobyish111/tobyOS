@@ -266,6 +266,11 @@ struct proc {
     uint64_t        win_image_base;
     uint64_t        win_rsrc_rva;
     uint64_t        win_rsrc_size;
+    /* C18b: .tls template, so CreateThread can give each thread its own block. */
+    uint64_t        win_tls_raw_va;
+    uint64_t        win_tls_raw_size;
+    uint64_t        win_tls_total;
+    uint64_t        win_tls_index;
     struct proc    *join_waiters;
 
     /* ---- Priority scheduling (gap #3: priority classes + timeslicing) ----

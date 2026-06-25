@@ -99,6 +99,23 @@ struct pe_base_reloc { uint32_t page_rva, block_size; } __attribute__((packed));
 #define PE_DIR_IMPORT      1
 #define PE_DIR_RESOURCE    2   /* C14: .rsrc (RT_DIALOG dialog templates) */
 #define PE_DIR_BASERELOC   5
+#define PE_DIR_TLS         9   /* C18b: .tls (IMAGE_TLS_DIRECTORY64 -- __thread) */
+
+/* C18b: the PE TLS directory (data-dir index 9). All four addresses are
+ * absolute VAs already biased by the preferred ImageBase (subject to base
+ * relocation); for C1 delta==0 so they equal the loaded VA. The compiler emits
+ *   mov eax,[_tls_index]; mov rcx,gs:[0x58]; mov rsi,[rcx+rax*8]
+ * for a _Thread_local/__declspec(thread) access, so the loader must point
+ * gs:[0x58] (ThreadLocalStoragePointer) at a per-thread pointer array whose
+ * [_tls_index] slot holds this module's TLS block (template raw + zero-fill). */
+struct pe_tls_dir64 {
+    uint64_t raw_start;     /* StartAddressOfRawData (VA of the template bytes) */
+    uint64_t raw_end;       /* EndAddressOfRawData                              */
+    uint64_t index_addr;    /* AddressOfIndex (VA where _tls_index is written)  */
+    uint64_t callbacks;     /* AddressOfCallBacks (VA of NULL-terminated array) */
+    uint32_t zero_fill;     /* SizeOfZeroFill (extra zero bytes after raw)      */
+    uint32_t characteristics;
+} __attribute__((packed));
 
 #define PE_MACHINE_AMD64   0x8664
 #define PE_OPT_MAGIC_PE32P 0x020B
@@ -133,7 +150,17 @@ struct pe_base_reloc { uint32_t page_rva, block_size; } __attribute__((packed));
 #define WIN32_TEB_SELF     0x30    /* NtCurrentTeb: TEB's own linear address */
 #define WIN32_TEB_STACKBASE  0x08
 #define WIN32_TEB_STACKLIMIT 0x10
+#define WIN32_TEB_TLSPTR     0x58  /* C18b: x64 ThreadLocalStoragePointer */
 #define WIN32_USER_STACK_TOP 0x0000800000000000ULL
+
+/* C18b: the main thread's TLS region (one or more pages). Layout:
+ *   [ pointer array (WIN32_TLS_BLK_OFF bytes) ][ this module's TLS block ]
+ * gs:[0x58] -> WIN32_TLS_BASE (the array); array[_tls_index] -> the block.
+ * Per-thread CreateThread threads get their own array+block from the Win32
+ * heap (see w32_CreateThread); only the main thread uses this fixed region. */
+#define WIN32_TLS_BASE     0x0000000031002000ULL
+#define WIN32_TLS_BLK_OFF  0x80    /* the pointer array occupies [0..0x80) */
+#define WIN32_TLS_MAX_BLK  (3u * PAGE_SIZE)   /* cap a single module's static TLS */
 
 /* CRT data page (argc/argv/environ/_commode/_fmode): WIN32_CRT_DATA_BASE +
  * the layout offsets are in pe.h (shared with the shims in syscall.c). */
@@ -648,6 +675,74 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         return -1;
     }
 
+    /* ---- 4b. C18b: thread-local storage (.tls / IMAGE_TLS_DIRECTORY) ----
+     * Lay out the main thread's TLS block from the template, write _tls_index,
+     * and point gs:[0x58] (ThreadLocalStoragePointer) at the pointer array so a
+     * _Thread_local access resolves. Runs while the image is still RW (before
+     * the W^X tightening below) since it writes _tls_index into the image. */
+    out->tls_raw_va = out->tls_raw_size = out->tls_total = out->tls_index = 0;
+    if (opt->num_data_dirs > PE_DIR_TLS && dirs[PE_DIR_TLS].rva &&
+        dirs[PE_DIR_TLS].size >= sizeof(struct pe_tls_dir64)) {
+        unsigned long uf = uaccess_begin();
+        const struct pe_tls_dir64 *t =
+            (const struct pe_tls_dir64 *)(load_base + dirs[PE_DIR_TLS].rva);
+        uint64_t raw_start = t->raw_start, raw_end = t->raw_end;
+        uint64_t idx_addr  = t->index_addr, cbs = t->callbacks;
+        uint32_t zfill     = t->zero_fill;
+        uaccess_end(uf);
+
+        uint64_t raw_size = (raw_end > raw_start) ? (raw_end - raw_start) : 0;
+        uint64_t total    = raw_size + (uint64_t)zfill;
+        uint64_t img_end  = load_base + size_of_image;
+        if (raw_start >= load_base && raw_start + raw_size <= img_end &&
+            total > 0 && total <= WIN32_TLS_MAX_BLK) {
+            total = round_up(total, 16);
+            uint64_t blk  = WIN32_TLS_BASE + WIN32_TLS_BLK_OFF;
+            uint64_t need = round_up(WIN32_TLS_BLK_OFF + total, PAGE_SIZE);
+            if (pe_map_user(WIN32_TLS_BASE, WIN32_TLS_BASE + need)) {
+                unsigned long uf2 = uaccess_begin();
+                memset((void *)WIN32_TLS_BASE, 0, WIN32_TLS_BLK_OFF);
+                *(uint64_t *)WIN32_TLS_BASE = blk;            /* array[0] = block */
+                memcpy((void *)blk, (const void *)raw_start, raw_size);
+                if (total > raw_size)
+                    memset((void *)(blk + raw_size), 0, total - raw_size);
+                if (idx_addr >= load_base && idx_addr + 4 <= img_end)
+                    *(uint32_t *)idx_addr = 0;               /* _tls_index = 0 */
+                *(uint64_t *)(WIN32_TEB_BASE + WIN32_TEB_TLSPTR) = WIN32_TLS_BASE;
+                uaccess_end(uf2);
+
+                int ncb = 0;
+                if (cbs >= load_base && cbs + 8 <= img_end) {
+                    unsigned long uf3 = uaccess_begin();
+                    const uint64_t *cb = (const uint64_t *)cbs;
+                    while (ncb < 64 && cb[ncb]) ncb++;
+                    uaccess_end(uf3);
+                }
+                out->tls_raw_va   = raw_start;
+                out->tls_raw_size = raw_size;
+                out->tls_total    = total;
+                out->tls_index    = 0;
+                kprintf("[pe] .tls: raw=%p size=0x%lx zfill=0x%x total=0x%lx "
+                        "idx@%p cbs=%d gs[0x58]=%p blk=%p\n",
+                        (void *)raw_start, (unsigned long)raw_size, zfill,
+                        (unsigned long)total, (void *)idx_addr, ncb,
+                        (void *)WIN32_TLS_BASE, (void *)blk);
+                /* The mingw .tls callbacks (__dyn_tls_init/__dyn_tls_dtor) are
+                 * NOT invoked: they only set _CRT_MT and service *dynamic* TLS;
+                 * every C1..C18a mingw PE ships them yet runs correctly with the
+                 * loader never calling them, so static _Thread_local works from
+                 * the template copy alone. Invoking CPL3 callbacks from the
+                 * kernel loader (process not yet running) is needless and risky. */
+            } else {
+                kprintf("[pe] .tls: map failed (need 0x%lx)\n", (unsigned long)need);
+            }
+        } else {
+            kprintf("[pe] .tls: skipped raw=%p size=0x%lx total=0x%lx (range)\n",
+                    (void *)raw_start, (unsigned long)raw_size,
+                    (unsigned long)total);
+        }
+    }
+
     /* ---- 5. tighten W^X: per-section perms + R/NX headers + R-X shim ---- */
     (void)vmm_protect(load_base, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_NX);
     for (uint16_t i = 0; i < coff->num_sections; i++) {
@@ -666,6 +761,11 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
     /* TEB + CRT data pages: data, read-write, never executable */
     (void)vmm_protect(WIN32_TEB_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
     (void)vmm_protect(WIN32_CRT_DATA_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
+    /* C18b: main thread TLS region (array + block): read-write data, NX */
+    if (out->tls_total) {
+        uint64_t need = round_up(WIN32_TLS_BLK_OFF + out->tls_total, PAGE_SIZE);
+        (void)vmm_protect(WIN32_TLS_BASE, need, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
+    }
 
     out->image_base = load_base;
     out->entry      = load_base + opt->entry_point_rva;

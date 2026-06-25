@@ -29,6 +29,12 @@ struct pe_load_info {
     uint64_t crt_data;     /* user VA of the CRT data page (argc/argv/environ/...) */
     uint64_t rsrc_rva;     /* C14: .rsrc directory RVA (0 if none) -- dialog templates */
     uint64_t rsrc_size;    /* C14: .rsrc directory size                             */
+    /* C18b: .tls (IMAGE_TLS_DIRECTORY) template, so each CreateThread thread can
+     * build its own TLS block. All 0 when the PE has no usable .tls directory. */
+    uint64_t tls_raw_va;   /* VA of the template raw bytes (StartAddressOfRawData) */
+    uint64_t tls_raw_size; /* template raw byte count (End - Start)                */
+    uint64_t tls_total;    /* per-thread block size (raw + zero-fill, 16-aligned)  */
+    uint64_t tls_index;    /* the module's assigned _tls_index (0 = sole module)   */
 };
 
 /* True if [image,size) looks like a PE/COFF image: 'MZ' DOS magic and a

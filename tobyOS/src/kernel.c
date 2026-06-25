@@ -4853,6 +4853,39 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE18B_BOOT
+    /* Track C -- compiler thread-local storage, milestone C18b. Build
+     * EXTRA_CFLAGS+=-DWINPE18B_BOOT. /bin/win-tls18b.exe uses _Thread_local
+     * across 4 worker threads (compiled -fno-emulated-tls => NATIVE Windows TLS:
+     * gs:[0x58] + _tls_index via the PE .tls directory). The loader lays out a
+     * TLS template block, writes _tls_index, and points each thread's TEB+0x58
+     * at a private pointer array; CreateThread gives each thread its OWN block.
+     * Proof = exit 42, reachable ONLY if every thread saw the pristine template
+     * (g_n==1000) and main's private copy (1005) survived untouched -- i.e. real
+     * per-thread isolation. Shared/unset TLS would corrupt the values and fail. */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE18B: spawning /bin/win-tls18b.exe (_Thread_local x4 threads)\n");
+        char *argv[] = { (char *)"win-tls18b.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-tls18b.exe", .name = "win-tls18b.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE18B] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE18B: /bin/win-tls18b.exe (pid=%d) exit=%d\n", pid, rc);
+            int pass = (rc == 42);
+            kprintf("[WINPE18B] VERDICT: %s exit=%d (expected 42; per-thread _Thread_local)\n",
+                    pass ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery
