@@ -1457,6 +1457,15 @@ programs/win-srv17/win-srv17.exe: programs/win-srv17/main.c
 programs/win-udp17/win-udp17.exe: programs/win-udp17/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $< -lws2_32
 
+# Track C/C18a: a REAL off-the-shelf SQLite database engine (third_party/sqlite,
+# unmodified public-domain amalgamation) built as a Windows PE. Standard embed
+# build options; the engine source is verbatim upstream.
+programs/win-sqlite/win-sqlite.exe: third_party/sqlite/sqlite3.c third_party/sqlite/shell.c
+	@mkdir -p $(dir $@)
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Ithird_party/sqlite \
+	      -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_MAX_MMAP_SIZE=0 \
+	      -o $@ third_party/sqlite/shell.c third_party/sqlite/sqlite3.c
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1765,6 +1774,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-net17/win-net17.exe \
                programs/win-srv17/win-srv17.exe \
                programs/win-udp17/win-udp17.exe \
+               programs/win-sqlite/win-sqlite.exe \
                initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua \
@@ -1842,6 +1852,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-net17/win-net17.exe               $(INITRD_STAGE)/bin/win-net17.exe
 	cp programs/win-srv17/win-srv17.exe               $(INITRD_STAGE)/bin/win-srv17.exe
 	cp programs/win-udp17/win-udp17.exe               $(INITRD_STAGE)/bin/win-udp17.exe
+	cp programs/win-sqlite/win-sqlite.exe             $(INITRD_STAGE)/bin/win-sqlite.exe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -2053,7 +2064,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-ctrl14.exe bin/win-dlg14.exe bin/win-font14b.exe       \
 	    bin/win-menu15.exe bin/win-reg16.exe bin/win-fdlg16.exe        \
 	    bin/win-env16.exe bin/win-tls16.exe bin/win-net17.exe         \
-	    bin/win-srv17.exe bin/win-udp17.exe                           \
+	    bin/win-srv17.exe bin/win-udp17.exe bin/win-sqlite.exe        \
 	    etc/Lato-Regular.ttf                                          \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \

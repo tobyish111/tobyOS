@@ -101,9 +101,11 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
  * can hand back a real callable CPL3 function pointer for any shim resolved by
  * name at runtime. Slot i lives at WIN32_PROCADDR_BASE_VA + i*WIN32_PROCADDR_STRIDE
  * (each slot is the same 10-byte `mov eax,i; jmp gate` thunk an IAT import gets).
- * 0x800 leaves room below it for ~179 per-import thunks (0x100..0x800) and above
- * it for ~204 shim thunks before the 4 KiB page ends -- both bounds are checked. */
-#define WIN32_PROCADDR_BASE_VA   0x0000000030000800ULL
+ * C18a: the shim count crossed ~300 (SQLite's CRT breadth), so the shim region is
+ * now 2 pages (0x2000) and the procaddr table starts at the 2nd page (0x1000):
+ * per-import thunks get 0x200..0x1000 (~358) and the procaddr table 0x1000..0x2000
+ * (~409) -- both bounds are checked in pe_loader.c. */
+#define WIN32_PROCADDR_BASE_VA   0x0000000030001000ULL
 #define WIN32_PROCADDR_STRIDE    10
 
 /* Resolve "dll!func" to the kernel-side Win32 shim index used to bind an

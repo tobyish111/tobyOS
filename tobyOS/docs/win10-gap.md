@@ -84,7 +84,7 @@ driver model; POSIX libc surface.
 
 1. **Drivers** — no real GPU/WiFi/BT/print; storage/NIC breadth limited. The bulk of Win10
    and the hardest. Loadable-module infra exists but no driver ecosystem.
-2. **App compatibility (~44%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
+2. **App compatibility (~46%)** — tobyOS now runs **unmodified Linux x86-64 binaries** broadly AND
    **stock, off-the-shelf Windows x86-64 `.exe`s — C and C++, console AND GUI** (a plain `clang`/`clang++`
    runs through its full ucrt CRT startup → main/WinMain → exit; real file I/O, multithreading with a real
    `CRITICAL_SECTION`, and a `user32`/`gdi32` GUI app that creates a window and draws through its WndProc
@@ -263,9 +263,12 @@ driver model; POSIX libc surface.
    pid 0 — only the first *active* TCP closer, a server, hit it). **C17c (2026-06-22) — Winsock UDP:** a stock
    `.exe` does `sendto`/`recvfrom` (datagram echo server); a real host datagram (SLIRP hostfwd) round-trips
    through tobyOS's UDP stack (caught + fixed a second latent bug: `sock_recvfrom` never drained the NIC while
-   waiting, so inbound UDP couldn't arrive unless another context happened to drain). **Windows: next** —
-   `__declspec(thread)` compiler TLS, bold/italic + desktop-wide TTF, more shell32/ole shims, broader runtime.
-   Still no .NET/UWP.
+   waiting, so inbound UDP couldn't arrive unless another context happened to drain). **C18a (2026-06-24) — a
+   REAL third-party binary:** the unmodified public-domain **SQLite** amalgamation, built as a Windows PE,
+   runs on tobyOS and creates/queries a real on-disk database under `/data` (~110 new kernel32/ucrt shims —
+   Win32 heap, the wide-file VFS, a C-runtime layer; +2 latent kernel-bug fixes: `GetLastError` and a POSIX
+   `lseek`-past-EOF size bug). **Windows: next** — `__declspec(thread)` compiler TLS, bold/italic + desktop-wide
+   TTF, shell32 shims, broader runtime. Still no .NET/UWP.
 3. **Real multi-core execution** — **DONE** (with one known SMAP caveat). APs run user
    code in parallel via a syscall-path big-kernel-lock + per-CPU idle procs + work-stealing,
    on top of the per-CPU TSS/GS/current_proc foundation. The pid 0 ↔ login interaction bit
@@ -349,6 +352,32 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-24** — **Track C milestone C18a: tobyOS runs a REAL off-the-shelf third-party database engine
+  (SQLite).** The unmodified public-domain SQLite amalgamation (3.46.0, vendored verbatim at
+  `third_party/sqlite/`) is built as a Windows PE (`win-sqlite.exe`) by the in-tree mingw clang and runs on
+  tobyOS — code neither hand-written nor tobyOS-aware. It opens an **on-disk database** at `C:\c18.db`
+  (→ `/data/c18.db`), runs `CREATE TABLE` / `INSERT` / `SELECT`, prints the rows (`TOBYSQL-OK`, `42`), and
+  leaves a real **8192-byte 2-page SQLite database file on disk**; the harness reads that file back and finds
+  the stored row value, so the proof spans the whole engine (SQL parser → VM → b-tree → the Win32 **wide-file
+  VFS**). This needed ~110 new kernel32/ucrt shims in three groups: the **Win32 process heap** (`HeapAlloc`/
+  `HeapReAlloc`/… over a new size-tracked allocator so `realloc`/`HeapSize`/`_msize` work — the C1–C17 bump
+  allocator couldn't realloc); the **wide (W) file APIs** SQLite's WinNT VFS uses (`CreateFileW`/
+  `GetFileAttributesExW`/`MultiByteToWideChar`/… converting UTF-16↔ASCII and reusing the A-path) plus
+  time/console/locking/`GetFileType`; and a broad **C-runtime layer** (`fopen`/`fread`/`fwrite`/`fseek`,
+  `strcmp`/`strcpy`/`memmove`/`strstr`, `isalnum`/`tolower`, `atoi`/`strtol`, `_stat64i32`/`_access`/`_mkdir`,
+  `getenv`, `_localtime64`). The shim count crossed ~300, so the **PE shim region grew from 1 to 2 pages**
+  (the GetProcAddress thunk table no longer fits one page). **Two latent kernel bugs caught + fixed:**
+  (1) `GetLastError` was a constant-0 stub and the file-attribute shims didn't set `ERROR_FILE_NOT_FOUND`, so
+  SQLite's `winAccess` read a missing rollback journal as a hard `SQLITE_IOERR_ACCESS` — now a real
+  GetLastError/SetLastError + not-found signalling; (2) **`sys_lseek` grew the file when seeking past EOF**, a
+  POSIX violation (size must only change on write) — SQLite's positioned reads of a not-yet-written page grew
+  the empty db so it saw a short garbage header and returned `SQLITE_NOTADB`; now seek never changes size
+  (writes still extend via `file_write`). `ReadFile`/`WriteFile` also honour an `OVERLAPPED` offset
+  (positioned I/O). Build options are standard embed (`SQLITE_THREADSAFE=0`, `OMIT_LOAD_EXTENSION`,
+  `MAX_MMAP_SIZE=0`); the engine source is unchanged. Proof `[WINPE18A] PASS exit=0 sentinel=1`. All C1–C18a
+  pass together under `-cpu qemu64,+smep,+smap` with 0 faults (29 PASS verdicts); default desktop boot
+  unaffected (steady heartbeats, max ~246ms gap, desktop ready, 0 faults, 0 PE activity, Linux-ABI boot tests
+  still pass — the lseek fix is POSIX-correct). App-compat ~44% → ~46%.
 - **2026-06-22** — **Track C milestone C17c: Winsock (ws2_32) — UDP datagrams.** A stock, off-the-shelf
   Windows `.exe` (`-lws2_32`) is a UDP echo server on tobyOS: `socket(SOCK_DGRAM)` -> `bind`(:9090) ->
   `recvfrom` -> `sendto` (echo). A REAL host datagram (SLIRP `hostfwd=udp::18081-:9090`, sent via bash

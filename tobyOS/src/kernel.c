@@ -4716,6 +4716,60 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE18A_BOOT
+    /* Track C -- run a REAL off-the-shelf third-party binary, milestone C18a.
+     * Build EXTRA_CFLAGS+=-DWINPE18A_BOOT. /bin/win-sqlite.exe is the unmodified
+     * public-domain SQLite amalgamation built as a Windows PE. It opens an
+     * on-disk database at C:\c18.db (-> /data/c18.db), runs CREATE/INSERT/SELECT,
+     * and exits 0. Proof = clean exit AND the database file SQLite wrote to /data
+     * contains the row value 'TOBYSQL-OK' -- a path only reachable if the whole
+     * engine (SQL parser -> VM -> b-tree -> the Win32 wide-file VFS shims) ran. */
+    {
+        win32_gui_set_log(true);
+        (void)vfs_unlink("/data/c18.db");   /* fresh DB so CREATE TABLE succeeds */
+        kprintf("[boot] WINPE18A: spawning /bin/win-sqlite.exe (real SQLite engine)\n");
+        char *argv[] = {
+            (char *)"win-sqlite.exe",
+            (char *)"C:\\c18.db",
+            (char *)"CREATE TABLE t(x);INSERT INTO t VALUES('TOBYSQL-OK');"
+                    "INSERT INTO t VALUES(6*7);SELECT x FROM t;",
+            0
+        };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-sqlite.exe", .name = "win-sqlite.exe",
+            .argc = 3, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE18A] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE18A: /bin/win-sqlite.exe (pid=%d) exit=%d\n", pid, rc);
+            /* Read back the on-disk DB SQLite created and search for the row. */
+            void *buf = 0; size_t sz = 0;
+            int found = 0;
+            if (vfs_read_all("/data/c18.db", &buf, &sz) == 0 && buf) {
+                const char *p = (const char *)buf;
+                const char *needle = "TOBYSQL-OK";
+                for (size_t i = 0; sz >= 10 && i + 10 <= sz; i++) {
+                    int k = 0; while (k < 10 && p[i + k] == needle[k]) k++;
+                    if (k == 10) { found = 1; break; }
+                }
+                kprintf("[boot] WINPE18A: /data/c18.db = %lu bytes, sentinel %s\n",
+                        (unsigned long)sz, found ? "FOUND" : "MISSING");
+                kfree(buf);
+            } else {
+                kprintf("[boot] WINPE18A: /data/c18.db not readable\n");
+            }
+            int pass = (rc == 0 && found);
+            kprintf("[WINPE18A] VERDICT: %s exit=%d sentinel=%d (expect exit 0 + db row)\n",
+                    pass ? "PASS" : "FAIL", rc, found);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery

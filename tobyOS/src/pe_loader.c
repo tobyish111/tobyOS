@@ -119,6 +119,9 @@ struct pe_base_reloc { uint32_t page_rva, block_size; } __attribute__((packed));
  * Placed above the user heap (USER_HEAP_BASE+max = 512 MiB) and below the
  * usual PE ImageBase (0x140000000), so it can't collide with either. */
 #define WIN32_SHIM_BASE    0x0000000030000000ULL
+/* C18a: the shim region grew from 1 to 2 pages -- the procaddr table (one 10-byte
+ * thunk per shim) crossed the 4 KiB page once the shim count passed ~300. */
+#define WIN32_SHIM_BYTES   (2u * PAGE_SIZE)
 #define WIN32_THUNK_SIZE   10
 #define WIN32_GATE_IMM_OFF 0x6e     /* offset of the syscall-number imm32 (C11: 10-arg gate) */
 
@@ -445,10 +448,10 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
     int nshims = win32_shim_count();
     uint64_t pa_end = WIN32_PROCADDR_OFF +
                       (uint64_t)nshims * WIN32_THUNK_SIZE;
-    if (pa_end > PAGE_SIZE) {
-        kprintf("[pe] WARNING: procaddr table (%d shims) overruns shim page\n",
+    if (pa_end > WIN32_SHIM_BYTES) {
+        kprintf("[pe] WARNING: procaddr table (%d shims) overruns shim region\n",
                 nshims);
-        nshims = (int)((PAGE_SIZE - WIN32_PROCADDR_OFF) / WIN32_THUNK_SIZE);
+        nshims = (int)((WIN32_SHIM_BYTES - WIN32_PROCADDR_OFF) / WIN32_THUNK_SIZE);
     }
     for (int i = 0; i < nshims; i++)
         pe_emit_gate_thunk(WIN32_PROCADDR_OFF + (uint64_t)i * WIN32_THUNK_SIZE,
@@ -517,7 +520,7 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         kprintf("[pe] failed mapping image pages\n");
         return -1;
     }
-    if (!pe_map_user(WIN32_SHIM_BASE, WIN32_SHIM_BASE + PAGE_SIZE)) {
+    if (!pe_map_user(WIN32_SHIM_BASE, WIN32_SHIM_BASE + WIN32_SHIM_BYTES)) {
         kprintf("[pe] failed mapping shim page\n");
         return -1;
     }
@@ -658,8 +661,8 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         if (!(s->characteristics & PE_SCN_MEM_EXECUTE)) f |= VMM_NX;
         (void)vmm_protect(lo, hi - lo, f);
     }
-    /* shim page: executable, read-only (no write, no NX) for the PE at CPL3 */
-    (void)vmm_protect(WIN32_SHIM_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER);
+    /* shim region (2 pages): executable, read-only (no write, no NX) at CPL3 */
+    (void)vmm_protect(WIN32_SHIM_BASE, WIN32_SHIM_BYTES, VMM_PRESENT | VMM_USER);
     /* TEB + CRT data pages: data, read-write, never executable */
     (void)vmm_protect(WIN32_TEB_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);
     (void)vmm_protect(WIN32_CRT_DATA_BASE, PAGE_SIZE, VMM_PRESENT | VMM_USER | VMM_WRITE | VMM_NX);

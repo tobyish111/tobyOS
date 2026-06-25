@@ -27,6 +27,7 @@
 #include <tobyos/signal.h>
 #include <tobyos/socket.h>
 #include <tobyos/dns.h>
+#include <tobyos/rtc.h>
 #include <tobyos/gui.h>
 #include <tobyos/gfx.h>
 #include <tobyos/virtio_gpu.h>
@@ -1066,7 +1067,12 @@ static long sys_lseek(int fd, int64_t off, int whence) {
     }
     if (newp < 0) return -ABI_EINVAL;
     f->vfs.pos = (size_t)newp;
-    if ((size_t)newp > f->vfs.size) f->vfs.size = (size_t)newp;
+    /* POSIX: seeking past EOF does NOT change the file size -- the file only
+     * grows when bytes are actually written. (Was: bumped vfs.size to the seek
+     * offset, a latent bug. It surfaced via SQLite's positioned reads: seeking
+     * to read a not-yet-written page grew the empty db, so SQLite saw a short
+     * garbage "database" and returned SQLITE_NOTADB. Writes still extend via
+     * file_write.) */
     return newp;
 }
 
@@ -3513,12 +3519,25 @@ static long w32_GetStdHandle(uint64_t *args) {
  * We treat hFile as a tobyOS fd, ignore the (synchronous) overlapped arg,
  * and write through sys_write (fd lookup + copy_from_user + file_write).
  * On success the byte count is stored into *written (a user pointer). */
+/* If lpOverlapped is non-NULL, seek to its 64-bit file offset before the I/O.
+ * SQLite's Win32 VFS does positioned reads/writes by passing an OVERLAPPED with
+ * the offset (Win64 layout: Offset @ +16, OffsetHigh @ +20) on a synchronous
+ * handle -- without honouring it, every db write lands at the wrong place. */
+static void win32_apply_overlapped(int fd, uint64_t lpov) {
+    if (!lpov) return;
+    uint32_t lo = 0, hi = 0;
+    (void)copy_from_user(&lo, (const void *)(uintptr_t)(lpov + 16), 4);
+    (void)copy_from_user(&hi, (const void *)(uintptr_t)(lpov + 20), 4);
+    (void)sys_lseek(fd, (int64_t)(((uint64_t)hi << 32) | lo), 0 /*SEEK_SET*/);
+}
+
 static long w32_WriteFile(uint64_t *args) {
     int       fd      = (int)args[0];
     uint64_t  ubuf    = args[1];
     uint32_t  n       = (uint32_t)args[2];
     uint64_t  pwrite  = args[3];   /* LPDWORD, may be NULL */
 
+    win32_apply_overlapped(fd, args[4]);   /* C18a: positioned I/O (SQLite VFS) */
     long wrote = sys_write(fd, (const void *)(uintptr_t)ubuf, n);
     if (wrote < 0) {
         if (pwrite) { uint32_t z = 0; (void)copy_to_user((void *)(uintptr_t)pwrite, &z, 4); }
@@ -3808,12 +3827,49 @@ static uint64_t win32_heap_alloc(uint64_t n) {
     p->win_heap_cur += n;
     return r;
 }
-static long w32_malloc(uint64_t *a) { return (long)win32_heap_alloc(a[0]); }
+/* Size-tracked allocation over the bump arena: store the byte count in a 16-byte
+ * header (keeps the returned pointer 16-aligned) so realloc / HeapSize / _msize
+ * can recover it. free() stays a no-op (the arena never reclaims). C18a: SQLite
+ * + the ucrt heap need realloc, which the C1-C17 bump allocator could not do. */
+static uint64_t win32_malloc_hdr(uint64_t n) {
+    uint64_t base = win32_heap_alloc(n + 16);
+    if (!base) return 0;
+    uint64_t sz = n;
+    (void)copy_to_user((void *)(uintptr_t)base, &sz, 8);
+    return base + 16;
+}
+static uint64_t win32_msize(uint64_t uptr) {
+    if (!uptr) return 0;
+    uint64_t sz = 0;
+    if (copy_from_user(&sz, (const void *)(uintptr_t)(uptr - 16), 8) != 0) return 0;
+    return sz;
+}
+static long w32_malloc(uint64_t *a) { return (long)win32_malloc_hdr(a[0]); }
 static long w32_calloc(uint64_t *a) {
     uint64_t nmemb = a[0], sz = a[1], total = nmemb * sz;
     if (sz && total / sz != nmemb) return 0;       /* overflow */
-    return (long)win32_heap_alloc(total);          /* mmap memory is zeroed */
+    return (long)win32_malloc_hdr(total);          /* mmap memory is zeroed */
 }
+/* realloc(ptr, n): NULL -> malloc; else fresh block + copy min(old, n). The bump
+ * arena never frees, so the old block just leaks. */
+static long w32_realloc(uint64_t *a) {
+    uint64_t old = a[0], n = a[1];
+    if (!old) return (long)win32_malloc_hdr(n);
+    uint64_t np = win32_malloc_hdr(n);
+    if (!np) return 0;
+    uint64_t oldsz = win32_msize(old);
+    uint64_t cp = oldsz < n ? oldsz : n;
+    /* user->user copy in chunks via a kernel bounce */
+    uint8_t buf[1024];
+    for (uint64_t off = 0; off < cp; ) {
+        uint64_t chunk = cp - off; if (chunk > sizeof(buf)) chunk = sizeof(buf);
+        if (copy_from_user(buf, (const void *)(uintptr_t)(old + off), chunk) != 0) break;
+        if (copy_to_user((void *)(uintptr_t)(np + off), buf, chunk) != 0) break;
+        off += chunk;
+    }
+    return (long)np;
+}
+static long w32_msize(uint64_t *a) { return (long)win32_msize(a[0]); }
 
 /* __p_* accessors -> a USER pointer into the CRT data page (set up by the
  * PE loader). The ucrt startup reads argc/argv/environ/_commode/_fmode here. */
@@ -4022,6 +4078,7 @@ static long w32_ReadFile(uint64_t *a) {
     uint64_t ubuf   = a[1];
     uint32_t n      = (uint32_t)a[2];
     uint64_t pread  = a[3];
+    win32_apply_overlapped(fd, a[4]);   /* C18a: positioned I/O (SQLite VFS) */
     long got = sys_read(fd, (void *)(uintptr_t)ubuf, n);
     if (got < 0) {
         if (pread) { uint32_t z = 0; (void)copy_to_user((void *)(uintptr_t)pread, &z, 4); }
@@ -7646,6 +7703,12 @@ static long w32_ExpandEnvironmentStringsA(uint64_t *a) {
 #define WSAHOST_NOT_FOUND_ 11001
 
 static int g_wsa_lasterror = 0;
+/* C18a: the Win32 thread-last-error (GetLastError/SetLastError). Set by file
+ * shims so SQLite's winAccess can tell ERROR_FILE_NOT_FOUND apart from a real
+ * I/O error. Defined here (early) so the wide-file shims below can set it. */
+static uint32_t g_win32_lasterr = 0;
+#define WIN32_ERR_FILE_NOT_FOUND 2u
+#define WIN32_ERR_ALREADY_EXISTS 183u
 
 /* Decode a tagged SOCKET handle into a kernel ksock fd, or -1 if it isn't one. */
 static int win32_sock_fd(uint64_t h) {
@@ -7906,6 +7969,576 @@ static long w32_recvfrom(uint64_t *a) {
     return n;
 }
 
+/* ================= C18a: run real off-the-shelf SQLite =================
+ * The SQLite shell + amalgamation pull a much wider kernel32 surface than any
+ * first-party test: the Win32 heap, the WIDE (W) file APIs (SQLite's WinNT VFS),
+ * time, console, file locking, and memory-mapped files. Most map onto existing
+ * VFS/heap primitives or are safe stubs (mmap -> fail so SQLite uses normal I/O;
+ * locking -> success since we are single-process). */
+
+/* ---- Win32 process heap (over the size-tracked malloc) ---- */
+#define WIN32_PROCHEAP_TOKEN  0x48454150ull     /* "HEAP"; an opaque non-NULL HANDLE */
+static long w32_GetProcessHeap(uint64_t *a) { (void)a; return (long)WIN32_PROCHEAP_TOKEN; }
+static long w32_HeapCreate (uint64_t *a) { (void)a; return (long)WIN32_PROCHEAP_TOKEN; }
+static long w32_HeapDestroy(uint64_t *a) { (void)a; return 1; }
+static long w32_HeapValidate(uint64_t *a){ (void)a; return 1; }
+static long w32_HeapCompact(uint64_t *a) { (void)a; return 0; }
+/* HeapAlloc(hHeap, dwFlags, n) -> ptr (HEAP_ZERO_MEMORY 0x8 already holds: arena
+ * is fresh-zeroed). */
+static long w32_HeapAlloc(uint64_t *a)   { return (long)win32_malloc_hdr(a[2]); }
+static long w32_HeapFree (uint64_t *a)   { (void)a; return 1; }
+static long w32_HeapSize (uint64_t *a)   { return (long)win32_msize(a[2]); }
+/* HeapReAlloc(hHeap, dwFlags, ptr, n). */
+static long w32_HeapReAlloc(uint64_t *a) { uint64_t b[2] = { a[2], a[3] }; return w32_realloc(b); }
+
+/* ---- wide-char helpers + conversion APIs ---- */
+/* Read a user UTF-16 string into a kernel ASCII buffer (ASCII subset; non-ASCII
+ * code units become '?'). Returns the ASCII length. */
+static int win32_wstr_to_k(uint64_t uwide, char *out, int cap) {
+    int i = 0;
+    for (; i < cap - 1; i++) {
+        uint16_t wc = 0;
+        if (copy_from_user(&wc, (const void *)(uintptr_t)(uwide + (uint64_t)i * 2), 2) != 0) break;
+        if (wc == 0) break;
+        out[i] = (wc < 0x80) ? (char)wc : '?';
+    }
+    out[i] = 0;
+    return i;
+}
+/* Write a kernel ASCII string out to a user UTF-16 buffer (incl. NUL). cap is in
+ * WORDs. Returns code units written incl. NUL. */
+static int win32_k_to_wstr(uint64_t uwide, const char *s, int cap) {
+    int i = 0;
+    for (; s[i] && i < cap - 1; i++) {
+        uint16_t wc = (uint16_t)(uint8_t)s[i];
+        (void)copy_to_user((void *)(uintptr_t)(uwide + (uint64_t)i * 2), &wc, 2);
+    }
+    uint16_t z = 0;
+    (void)copy_to_user((void *)(uintptr_t)(uwide + (uint64_t)i * 2), &z, 2);
+    return i + 1;
+}
+/* MultiByteToWideChar(cp, flags, mbStr, cbMb, wStr, cchWide). cbMb<0 => NUL-term
+ * (count includes the NUL). cchWide==0 => return required count. */
+static long w32_MultiByteToWideChar(uint64_t *a) {
+    int cb = (int)(int32_t)a[3];
+    char src[1024];
+    int n;
+    if (cb < 0) {
+        n = (int)strncpy_from_user(src, (const char *)(uintptr_t)a[2], sizeof(src));
+        if (n < 0) return 0;
+        n = (int)strlen(src) + 1;                /* include NUL */
+    } else {
+        n = cb < (int)sizeof(src) ? cb : (int)sizeof(src);
+        if (n && copy_from_user(src, (const void *)(uintptr_t)a[2], (size_t)n) != 0) return 0;
+    }
+    int cch = (int)(int32_t)a[5];
+    if (cch == 0) return n;                       /* size query */
+    int w = 0;
+    for (; w < n && w < cch; w++) {
+        uint16_t wc = (uint16_t)(uint8_t)src[w];
+        (void)copy_to_user((void *)(uintptr_t)(a[4] + (uint64_t)w * 2), &wc, 2);
+    }
+    return w;
+}
+/* WideCharToMultiByte(cp, flags, wStr, cchWide, mbStr, cbMb, defChar, usedDef). */
+static long w32_WideCharToMultiByte(uint64_t *a) {
+    int cch = (int)(int32_t)a[3];
+    char dst[1024];
+    int n;
+    if (cch < 0) { n = win32_wstr_to_k(a[2], dst, sizeof(dst)); n += 1; }   /* + NUL */
+    else {
+        n = 0;
+        for (; n < cch && n < (int)sizeof(dst) - 1; n++) {
+            uint16_t wc = 0;
+            if (copy_from_user(&wc, (const void *)(uintptr_t)(a[2] + (uint64_t)n * 2), 2) != 0) break;
+            dst[n] = (wc < 0x80) ? (char)wc : '?';
+        }
+        dst[n] = 0;
+    }
+    int cb = (int)(int32_t)a[5];
+    if (cb == 0) return n;                         /* size query */
+    int w = n < cb ? n : cb;
+    if (w && a[4]) (void)copy_to_user((void *)(uintptr_t)a[4], dst, (size_t)w);
+    return w;
+}
+
+/* ---- wide file APIs (SQLite's WinNT VFS) ---- */
+/* Translate a KERNEL Windows path string ("X:\..") into a tobyOS path (drive ->
+ * /data, '\\' -> '/'). Mirrors w32_CreateFileA's inline logic for the W side. */
+static int win32_xlate_winpath(const char *wpath, char *kp, int cap) {
+    int si = 0, di = 0;
+    if (wpath[0] && wpath[1] == ':') {
+        for (const char *r = "/data"; *r && di < cap - 1; r++) kp[di++] = *r;
+        si = 2;
+        if (wpath[si] != '\\' && wpath[si] != '/' && di < cap - 1) kp[di++] = '/';
+    }
+    for (; wpath[si] && di < cap - 1; si++) kp[di++] = (wpath[si] == '\\') ? '/' : wpath[si];
+    kp[di] = '\0';
+    return di;
+}
+/* Open a KERNEL Windows path with the CreateFile access/disposition encoding. */
+static long win32_open_winpath(const char *wpath, uint32_t access, uint32_t disp) {
+    char kp[ABI_PATH_MAX];
+    int di = win32_xlate_winpath(wpath, kp, sizeof(kp));
+    if (di < 0) return (long)WIN32_INVALID_HANDLE;
+    uint64_t ubuf = WIN32_CRT_DATA_BASE + WIN32_CRT_PATHBUF;
+    if (copy_to_user((void *)(uintptr_t)ubuf, kp, (size_t)di + 1) != 0) return (long)WIN32_INVALID_HANDLE;
+    bool rd = (access & 0x80000000UL) != 0, wr = (access & 0x40000000UL) != 0;
+    int flags = (rd && wr) ? ABI_O_RDWR : (wr ? ABI_O_WRONLY : ABI_O_RDONLY);
+    switch (disp) {
+        case 1: flags |= ABI_O_CREAT | ABI_O_EXCL;  break;
+        case 2: flags |= ABI_O_CREAT | ABI_O_TRUNC; break;
+        case 3:                                      break;
+        case 4: flags |= ABI_O_CREAT;                break;
+        case 5: flags |= ABI_O_TRUNC;                break;
+        default: break;
+    }
+    long fd = sys_open((const char *)(uintptr_t)ubuf, flags, 0644);
+    return (fd < 0) ? (long)WIN32_INVALID_HANDLE : fd;
+}
+/* CreateFileW(name, access, share, sa, disp, flags, template). */
+static long w32_CreateFileW(uint64_t *a) {
+    char wp[ABI_PATH_MAX];
+    win32_wstr_to_k(a[0], wp, sizeof(wp));
+    return win32_open_winpath(wp, (uint32_t)a[1], (uint32_t)a[4]);
+}
+static long w32_GetFileAttributesW(uint64_t *a) {
+    char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0], wp, sizeof(wp));
+    char kp[ABI_PATH_MAX]; win32_xlate_winpath(wp, kp, sizeof(kp));
+    struct vfs_stat vs;
+    if (vfs_stat(kp, &vs) != VFS_OK) { g_win32_lasterr = WIN32_ERR_FILE_NOT_FOUND; return (long)0xFFFFFFFFu; }
+    g_win32_lasterr = 0;
+    return (vs.type == VFS_TYPE_DIR) ? 0x10 : 0x80;
+}
+/* GetFileAttributesExW(name, infoLevel, lpFileInformation) ->
+ * WIN32_FILE_ATTRIBUTE_DATA { DWORD attr; FILETIME c/a/w; DWORD szHi/szLo }. */
+static long w32_GetFileAttributesExW(uint64_t *a) {
+    char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0], wp, sizeof(wp));
+    char kp[ABI_PATH_MAX]; win32_xlate_winpath(wp, kp, sizeof(kp));
+    struct vfs_stat vs;
+    if (vfs_stat(kp, &vs) != VFS_OK) { g_win32_lasterr = WIN32_ERR_FILE_NOT_FOUND; return 0; }
+    uint8_t b[36]; memset(b, 0, sizeof(b));
+    uint32_t attr = (vs.type == VFS_TYPE_DIR) ? 0x10u : 0x80u;
+    memcpy(&b[0], &attr, 4);
+    uint32_t szlo = (uint32_t)vs.size, szhi = (uint32_t)(vs.size >> 32);
+    memcpy(&b[28], &szhi, 4); memcpy(&b[32], &szlo, 4);
+    (void)copy_to_user((void *)(uintptr_t)a[2], b, sizeof(b));
+    g_win32_lasterr = 0;
+    return 1;
+}
+static long w32_DeleteFileW(uint64_t *a) {
+    char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0], wp, sizeof(wp));
+    char kp[ABI_PATH_MAX]; int di = win32_xlate_winpath(wp, kp, sizeof(kp));
+    if (di < 0) return 0;
+    uint64_t ubuf = WIN32_CRT_DATA_BASE + WIN32_CRT_PATHBUF;
+    if (copy_to_user((void *)(uintptr_t)ubuf, kp, (size_t)di + 1) != 0) return 0;
+    return (sys_unlink((const char *)(uintptr_t)ubuf) == 0) ? 1 : 0;
+}
+/* GetFullPathNameW(name, nBuf, buf, &filePart): we treat the input as already
+ * absolute and copy it through, pointing filePart at the basename. */
+static long w32_GetFullPathNameW(uint64_t *a) {
+    char wp[ABI_PATH_MAX]; int n = win32_wstr_to_k(a[0], wp, sizeof(wp));
+    int cap = (int)(uint32_t)a[1];
+    if (a[2] && cap > 0) {
+        int w = win32_k_to_wstr(a[2], wp, cap) - 1;   /* code units excl NUL */
+        if (a[3]) {                                    /* lpFilePart */
+            int base = 0; for (int i = 0; i < n; i++) if (wp[i] == '\\' || wp[i] == '/') base = i + 1;
+            uint64_t fp = a[2] + (uint64_t)base * 2;
+            (void)copy_to_user((void *)(uintptr_t)a[3], &fp, 8);
+        }
+        (void)w;
+    }
+    return n;                                          /* required/!written length in chars */
+}
+static long w32_GetFullPathNameA(uint64_t *a) {
+    char wp[ABI_PATH_MAX]; (void)strncpy_from_user(wp, (const char *)(uintptr_t)a[0], sizeof(wp));
+    int n = (int)strlen(wp);
+    int cap = (int)(uint32_t)a[1];
+    if (a[2] && cap > 0) {
+        int w = n < cap - 1 ? n : cap - 1;
+        (void)copy_to_user((void *)(uintptr_t)a[2], wp, (size_t)w);
+        char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[2] + w), &z, 1);
+        if (a[3]) { int base = 0; for (int i = 0; i < n; i++) if (wp[i] == '\\' || wp[i] == '/') base = i + 1;
+                    uint64_t fp = a[2] + (uint64_t)base; (void)copy_to_user((void *)(uintptr_t)a[3], &fp, 8); }
+    }
+    return n;
+}
+/* GetTempPathW/A -> "C:\\" (maps to /data). Returns length in chars. */
+static long w32_GetTempPathW(uint64_t *a) {
+    int cap = (int)(uint32_t)a[0];
+    if (a[1] && cap >= 4) (void)win32_k_to_wstr(a[1], "C:\\", cap);
+    return 3;
+}
+static long w32_GetTempPathA(uint64_t *a) {
+    int cap = (int)(uint32_t)a[0];
+    if (a[1] && cap >= 4) { (void)copy_to_user((void *)(uintptr_t)a[1], "C:\\", 4); }
+    return 3;
+}
+static long w32_SetCurrentDirectoryW(uint64_t *a) { (void)a; return 1; }
+static long w32_FindFirstFileW(uint64_t *a) { (void)a; g_wsa_lasterror = 2; return (long)WIN32_INVALID_HANDLE; }
+/* GetFileType(h): real fds -> DISK(1); std handles -> CHAR(2). */
+static long w32_GetFileType(uint64_t *a) { return ((int)a[0] < 3) ? 2 : 1; }
+static long w32_FlushFileBuffers(uint64_t *a) { (void)a; return 1; }
+static long w32_SetEndOfFile(uint64_t *a) { (void)a; return 1; }   /* no real truncate; grows via writes */
+static long w32_GetDiskFreeSpaceA(uint64_t *a) {
+    uint32_t spc = 8, bps = 512, freec = 0x100000, totc = 0x200000;
+    if (a[1]) (void)copy_to_user((void *)(uintptr_t)a[1], &spc, 4);
+    if (a[2]) (void)copy_to_user((void *)(uintptr_t)a[2], &bps, 4);
+    if (a[3]) (void)copy_to_user((void *)(uintptr_t)a[3], &freec, 4);
+    if (a[4]) (void)copy_to_user((void *)(uintptr_t)a[4], &totc, 4);
+    return 1;
+}
+
+/* ---- time ---- */
+#define WIN32_FT_EPOCH_DIFF 11644473600ull        /* seconds 1601-01-01 .. 1970 */
+static void win32_put_filetime(uint64_t uft, uint64_t unix_secs) {
+    uint64_t ft = (unix_secs + WIN32_FT_EPOCH_DIFF) * 10000000ull;
+    uint32_t lo = (uint32_t)ft, hi = (uint32_t)(ft >> 32);
+    (void)copy_to_user((void *)(uintptr_t)uft, &lo, 4);
+    (void)copy_to_user((void *)(uintptr_t)(uft + 4), &hi, 4);
+}
+static long w32_GetSystemTimeAsFileTime(uint64_t *a) {
+    if (a[0]) win32_put_filetime(a[0], rtc_unix_time());
+    return 0;
+}
+static long w32_GetSystemTime(uint64_t *a) {     /* SYSTEMTIME: 8 WORDs */
+    struct rtc_time t; rtc_read_time(&t);
+    uint16_t st[8] = { t.year, t.month, t.weekday, t.day, t.hour, t.minute, t.second, 0 };
+    if (a[0]) (void)copy_to_user((void *)(uintptr_t)a[0], st, sizeof(st));
+    return 0;
+}
+static int64_t win32_days_from_civil(int y, int m, int d) {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int yoe = (int)(y - era * 400);
+    int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;          /* days since 1970-01-01 */
+}
+static long w32_SystemTimeToFileTime(uint64_t *a) {
+    uint16_t st[8]; memset(st, 0, sizeof(st));
+    if (!a[0] || copy_from_user(st, (const void *)(uintptr_t)a[0], sizeof(st)) != 0) return 0;
+    int64_t days = win32_days_from_civil(st[0], st[1], st[3]);
+    uint64_t secs = (uint64_t)(days * 86400 + st[4] * 3600 + st[5] * 60 + st[6]);
+    if (a[1]) win32_put_filetime(a[1], secs);
+    return 1;
+}
+static long w32_GetTickCount(uint64_t *a) {
+    (void)a; uint64_t hz = pit_hz(); if (!hz) hz = 100;
+    return (long)(uint32_t)(pit_ticks() * 1000ull / hz);
+}
+static long w32_QueryPerformanceCounter(uint64_t *a) {
+    uint64_t v = pit_ticks();
+    if (a[0]) (void)copy_to_user((void *)(uintptr_t)a[0], &v, 8);
+    return 1;
+}
+static long w32_QueryPerformanceFrequency(uint64_t *a) {
+    uint64_t hz = pit_hz(); if (!hz) hz = 100;
+    if (a[0]) (void)copy_to_user((void *)(uintptr_t)a[0], &hz, 8);
+    return 1;
+}
+static long w32_GetSystemInfo(uint64_t *a) {      /* SYSTEM_INFO ~48 bytes */
+    uint8_t b[48]; memset(b, 0, sizeof(b));
+    uint32_t page = 4096, gran = 65536, nproc = 1;
+    memcpy(&b[4], &page, 4);                       /* dwPageSize */
+    memcpy(&b[32], &nproc, 4);                     /* dwNumberOfProcessors */
+    memcpy(&b[40], &gran, 4);                      /* dwAllocationGranularity */
+    if (a[0]) (void)copy_to_user((void *)(uintptr_t)a[0], b, sizeof(b));
+    return 0;
+}
+
+/* ---- file locking (single-process: always succeed) + mmap (fail -> SQLite
+ *      falls back to ordinary read/write I/O) ---- */
+static long w32_LockFileStub(uint64_t *a)   { (void)a; return 1; }
+static long w32_CreateFileMappingW(uint64_t *a) { (void)a; g_wsa_lasterror = 8; return 0; } /* NULL -> no mmap */
+static long w32_MapViewOfFile(uint64_t *a)  { (void)a; return 0; }
+
+/* ---- console (report "not a console" so the shell uses plain file I/O) ---- */
+static long w32_GetConsoleMode(uint64_t *a) {
+    if (a[1]) { uint32_t z = 0; (void)copy_to_user((void *)(uintptr_t)a[1], &z, 4); }
+    return 0;                                      /* FALSE: handle is not a console */
+}
+static long w32_WriteConsoleW(uint64_t *a) {       /* (h, wbuf, nchars, *written, resv) */
+    int nch = (int)(uint32_t)a[2];
+    char buf[512];
+    int w = 0;
+    for (; w < nch && w < (int)sizeof(buf); w++) {
+        uint16_t wc = 0;
+        if (copy_from_user(&wc, (const void *)(uintptr_t)(a[1] + (uint64_t)w * 2), 2) != 0) break;
+        buf[w] = (wc < 0x80) ? (char)wc : '?';
+    }
+    int fd = ((int)a[0] >= 0 && (int)a[0] < 3) ? (int)a[0] : 1;
+    if (w > 0) (void)sys_write(fd, buf, (size_t)w);
+    if (a[3]) { uint32_t cw = (uint32_t)w; (void)copy_to_user((void *)(uintptr_t)a[3], &cw, 4); }
+    return 1;
+}
+
+/* ---- misc ---- */
+static long w32_GetCurrentProcess(uint64_t *a)  { (void)a; return (long)(int64_t)-1; } /* pseudo handle */
+static long w32_GetCurrentThreadId(uint64_t *a) { (void)a; struct proc *p = current_proc(); return p ? (long)(uint32_t)p->pid : 1; }
+static long w32_LocalFree(uint64_t *a)          { (void)a; return 0; }
+static long w32_AreFileApisANSI(uint64_t *a)    { (void)a; return 1; }
+static long w32_CreateMutexW(uint64_t *a)       { (void)a; return (long)0x4D000001ull; } /* opaque non-NULL */
+/* FormatMessageA: write a generic message; honour FORMAT_MESSAGE_ALLOCATE_BUFFER
+ * (0x100) where lpBuffer is a char** to receive a heap copy. */
+static long w32_FormatMessageA(uint64_t *a) {
+    static const char msg[] = "tobyOS Win32 error";
+    int len = (int)sizeof(msg) - 1;
+    uint32_t flags = (uint32_t)a[0];
+    if (flags & 0x100u) {
+        uint64_t p = win32_malloc_hdr((uint64_t)len + 1);
+        if (p) { (void)copy_to_user((void *)(uintptr_t)p, msg, (size_t)len + 1);
+                 (void)copy_to_user((void *)(uintptr_t)a[4], &p, 8); }   /* *(char**)lpBuffer = p */
+        return len;
+    }
+    int cap = (int)(uint32_t)a[5];
+    if (a[4] && cap > 0) { int w = len < cap - 1 ? len : cap - 1;
+        (void)copy_to_user((void *)(uintptr_t)a[4], msg, (size_t)w);
+        char z = 0; (void)copy_to_user((void *)(uintptr_t)(a[4] + w), &z, 1); return w; }
+    return len;
+}
+
+/* ================= C18a: the C-runtime breadth SQLite pulls in =================
+ * Standard libc that the ucrt would normally provide: string/ctype/conversion
+ * (pure compute on user memory), stdio FILE* (a FILE* token == WIN32_IOB_TAG|fd,
+ * extended from the C2 printf path), and the _wstat/_access/_mkdir file layer
+ * (onto the VFS). NOTE: float-returning CRT (strtod) cannot pass a double back
+ * through the integer gate, so it is stubbed -- SQLite only needs it for REAL
+ * literals, which the C18a proof query does not use. */
+#define W32_STRCAP 4096
+static int win32_file_fd(uint64_t tok) {
+    if ((tok & 0xFFFFFF00ULL) == WIN32_IOB_TAG) return (int)(tok & 0xFF);
+    return -1;
+}
+
+/* ---- ctype (operate on the int arg) ---- */
+static long w32_isalnum(uint64_t *a){int c=(int)a[0];return (c>='0'&&c<='9')||(c>='A'&&c<='Z')||(c>='a'&&c<='z');}
+static long w32_isalpha(uint64_t *a){int c=(int)a[0];return (c>='A'&&c<='Z')||(c>='a'&&c<='z');}
+static long w32_isdigit(uint64_t *a){int c=(int)a[0];return c>='0'&&c<='9';}
+static long w32_isspace(uint64_t *a){int c=(int)a[0];return c==' '||c=='\t'||c=='\n'||c=='\r'||c=='\v'||c=='\f';}
+static long w32_isprint(uint64_t *a){int c=(int)a[0];return c>=0x20&&c<0x7F;}
+static long w32_tolower(uint64_t *a){int c=(int)a[0];return (c>='A'&&c<='Z')?c+32:c;}
+static long w32_toupper(uint64_t *a){int c=(int)a[0];return (c>='a'&&c<='z')?c-32:c;}
+
+/* ---- string (user memory) ---- */
+static long w32_strcmp(uint64_t *a) {
+    char s1[W32_STRCAP], s2[W32_STRCAP];
+    if (strncpy_from_user(s1,(const char*)(uintptr_t)a[0],sizeof(s1))<0) return 0;
+    if (strncpy_from_user(s2,(const char*)(uintptr_t)a[1],sizeof(s2))<0) return 0;
+    for (int i=0;;i++){unsigned char c1=(unsigned char)s1[i],c2=(unsigned char)s2[i];
+        if(c1!=c2) return (long)c1-(long)c2; if(!c1) return 0;}
+}
+static long w32_strcpy(uint64_t *a) {
+    char s[W32_STRCAP];
+    int n=(int)strncpy_from_user(s,(const char*)(uintptr_t)a[1],sizeof(s)); if(n<0)return (long)a[0];
+    (void)copy_to_user((void*)(uintptr_t)a[0],s,(size_t)n+1); return (long)a[0];
+}
+static long w32_strcat(uint64_t *a) {
+    char d[W32_STRCAP],s[W32_STRCAP];
+    int dn=(int)strncpy_from_user(d,(const char*)(uintptr_t)a[0],sizeof(d)); if(dn<0)dn=0;
+    int sn=(int)strncpy_from_user(s,(const char*)(uintptr_t)a[1],sizeof(s)); if(sn<0)sn=0;
+    int room=W32_STRCAP-1-dn; if(sn>room)sn=room;
+    (void)copy_to_user((void*)(uintptr_t)(a[0]+dn),s,(size_t)sn);
+    char z=0; (void)copy_to_user((void*)(uintptr_t)(a[0]+dn+sn),&z,1);
+    return (long)a[0];
+}
+static long w32_strchr(uint64_t *a) {
+    char s[W32_STRCAP]; int n=(int)strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s)); if(n<0)return 0;
+    char c=(char)(int)a[1];
+    for(int i=0;i<=n;i++) if(s[i]==c) return (long)(a[0]+(uint64_t)i);
+    return 0;
+}
+static long w32_strrchr(uint64_t *a) {
+    char s[W32_STRCAP]; int n=(int)strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s)); if(n<0)return 0;
+    char c=(char)(int)a[1]; long r=0;
+    for(int i=0;i<=n;i++) if(s[i]==c) r=(long)(a[0]+(uint64_t)i);
+    return r;
+}
+static long w32_strspn(uint64_t *a) {
+    char s[W32_STRCAP],set[256]; int n=(int)strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s));
+    if(n<0)return 0; (void)strncpy_from_user(set,(const char*)(uintptr_t)a[1],sizeof(set));
+    int i=0; for(;s[i];i++){int f=0;for(int j=0;set[j];j++)if(s[i]==set[j]){f=1;break;} if(!f)break;} return i;
+}
+static long w32_strcspn(uint64_t *a) {
+    char s[W32_STRCAP],set[256]; int n=(int)strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s));
+    if(n<0)return 0; (void)strncpy_from_user(set,(const char*)(uintptr_t)a[1],sizeof(set));
+    int i=0; for(;s[i];i++){int f=0;for(int j=0;set[j];j++)if(s[i]==set[j]){f=1;break;} if(f)break;} return i;
+}
+static long w32_strdup(uint64_t *a) {
+    char s[W32_STRCAP]; int n=(int)strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s)); if(n<0)return 0;
+    uint64_t p=win32_malloc_hdr((uint64_t)n+1); if(!p)return 0;
+    (void)copy_to_user((void*)(uintptr_t)p,s,(size_t)n+1); return (long)p;
+}
+static long w32_memchr(uint64_t *a) {
+    uint64_t base=a[0],n=a[2]; int c=(int)(unsigned char)a[1];
+    for(uint64_t i=0;i<n;i++){unsigned char b; if(copy_from_user(&b,(const void*)(uintptr_t)(base+i),1)!=0)break; if(b==(unsigned char)c)return (long)(base+i);}
+    return 0;
+}
+static long w32_memmove(uint64_t *a) {
+    uint64_t d=a[0],s=a[1],n=a[2]; uint8_t buf[2048];
+    /* copy via a kernel bounce -> safe for overlap; go backwards if d>s */
+    if (d>s) { for(uint64_t off=n; off>0; ){uint64_t ch=off> sizeof(buf)?sizeof(buf):off; off-=ch;
+        if(copy_from_user(buf,(const void*)(uintptr_t)(s+off),ch)!=0)break; (void)copy_to_user((void*)(uintptr_t)(d+off),buf,ch);} }
+    else { for(uint64_t off=0; off<n; ){uint64_t ch=n-off> sizeof(buf)?sizeof(buf):n-off;
+        if(copy_from_user(buf,(const void*)(uintptr_t)(s+off),ch)!=0)break; (void)copy_to_user((void*)(uintptr_t)(d+off),buf,ch); off+=ch;} }
+    return (long)d;
+}
+
+/* ---- conversion ---- */
+static long w32_atoi(uint64_t *a) {
+    char s[64]; if(strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s))<0)return 0;
+    int i=0,sign=1; while(s[i]==' '||s[i]=='\t')i++; if(s[i]=='-'){sign=-1;i++;}else if(s[i]=='+')i++;
+    long v=0; for(;s[i]>='0'&&s[i]<='9';i++)v=v*10+(s[i]-'0'); return sign*v;
+}
+static long w32_strtol(uint64_t *a) {
+    char s[64]; if(strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s))<0)return 0;
+    int base=(int)a[2]; int i=0,sign=1; while(s[i]==' '||s[i]=='\t')i++;
+    if(s[i]=='-'){sign=-1;i++;}else if(s[i]=='+')i++;
+    if((base==0||base==16)&&s[i]=='0'&&(s[i+1]=='x'||s[i+1]=='X')){i+=2;base=16;}
+    if(base==0)base=10;
+    long v=0; for(;s[i];i++){int d; char c=s[i];
+        if(c>='0'&&c<='9')d=c-'0'; else if(c>='a'&&c<='z')d=c-'a'+10; else if(c>='A'&&c<='Z')d=c-'A'+10; else break;
+        if(d>=base)break; v=v*base+d;}
+    if(a[1]){uint64_t ep=a[0]+(uint64_t)i; (void)copy_to_user((void*)(uintptr_t)a[1],&ep,8);}
+    return sign*v;
+}
+/* strtod: cannot return a double through the integer gate -> 0.0; advances
+ * endptr past a numeric prefix. SQLite needs it only for REAL literals. */
+static long w32_strtod(uint64_t *a) {
+    char s[64]; if(strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s))<0){if(a[1])(void)copy_to_user((void*)(uintptr_t)a[1],&a[0],8);return 0;}
+    int i=0; while(s[i]==' ')i++; if(s[i]=='-'||s[i]=='+')i++;
+    while((s[i]>='0'&&s[i]<='9')||s[i]=='.')i++;
+    if(a[1]){uint64_t ep=a[0]+(uint64_t)i; (void)copy_to_user((void*)(uintptr_t)a[1],&ep,8);}
+    return 0;
+}
+
+/* ---- stdio FILE* (token == WIN32_IOB_TAG | fd) ---- */
+static long w32_fopen(uint64_t *a) {
+    char path[ABI_PATH_MAX], mode[8];
+    if(strncpy_from_user(path,(const char*)(uintptr_t)a[0],sizeof(path))<0)return 0;
+    mode[0]=0; if(a[1])(void)strncpy_from_user(mode,(const char*)(uintptr_t)a[1],sizeof(mode));
+    char kp[ABI_PATH_MAX]; win32_xlate_winpath(path,kp,sizeof(kp));
+    uint64_t ubuf=WIN32_CRT_DATA_BASE+WIN32_CRT_PATHBUF; int di=0; while(kp[di])di++;
+    if(copy_to_user((void*)(uintptr_t)ubuf,kp,(size_t)di+1)!=0)return 0;
+    int wr=0,rd=0,plus=0; for(int i=0;mode[i];i++){if(mode[i]=='w'||mode[i]=='a')wr=1;if(mode[i]=='r')rd=1;if(mode[i]=='+')plus=1;}
+    int flags;
+    if(plus)flags=ABI_O_RDWR|(wr?(ABI_O_CREAT|ABI_O_TRUNC):0);
+    else if(wr)flags=ABI_O_WRONLY|ABI_O_CREAT|ABI_O_TRUNC;
+    else flags=ABI_O_RDONLY; (void)rd;
+    long fd=sys_open((const char*)(uintptr_t)ubuf,flags,0644);
+    if(fd<0)return 0;
+    return (long)(WIN32_IOB_TAG|(uint64_t)((uint32_t)fd&0xFF));
+}
+static long w32_fclose(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd>=3)(void)sys_close(fd); return 0;}
+static long w32_fread(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return 0; uint64_t sz=a[1],nm=a[2]; if(!sz)return 0;
+    long got=sys_read(fd,(void*)(uintptr_t)a[3],sz*nm); return got>0?(long)((uint64_t)got/sz):0;}
+static long w32_fwrite(uint64_t *a){int fd=win32_file_fd(a[3]); if(fd<0)return 0; uint64_t sz=a[1],nm=a[2]; if(!sz)return 0;
+    long w=sys_write(fd,(const void*)(uintptr_t)a[0],sz*nm); return w>0?(long)((uint64_t)w/sz):0;}
+static long w32_fputs(uint64_t *a){int fd=win32_file_fd(a[1]); if(fd<0)return -1;
+    char s[W32_STRCAP]; int n=(int)strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s)); if(n<0)return -1;
+    return sys_write(fd,(const void*)(uintptr_t)a[0],(size_t)n)>=0?0:-1;}
+static long w32_fgetc(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1;
+    uint64_t ub=WIN32_CRT_DATA_BASE+WIN32_CRT_PATHBUF; long g=sys_read(fd,(void*)(uintptr_t)ub,1);
+    if(g<=0)return -1; unsigned char c; if(copy_from_user(&c,(const void*)(uintptr_t)ub,1)!=0)return -1; return (long)c;}
+static long w32_fgets(uint64_t *a){int fd=win32_file_fd(a[2]); if(fd<0)return 0; int n=(int)(int32_t)a[1]; if(n<=1)return 0;
+    int i=0; for(;i<n-1;i++){long g=sys_read(fd,(void*)(uintptr_t)(a[0]+(uint64_t)i),1); if(g<=0)break;
+        unsigned char c; if(copy_from_user(&c,(const void*)(uintptr_t)(a[0]+(uint64_t)i),1)!=0)break; if(c=='\n'){i++;break;}}
+    if(i==0)return 0; char z=0; (void)copy_to_user((void*)(uintptr_t)(a[0]+(uint64_t)i),&z,1); return (long)a[0];}
+static long w32_fseek(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1;
+    return sys_lseek(fd,(int64_t)(int32_t)a[1],(int)a[2])<0?-1:0;}
+static long w32_ftell(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd<0)return -1; return sys_lseek(fd,0,1);}
+static long w32_rewind(uint64_t *a){int fd=win32_file_fd(a[0]); if(fd>=0)(void)sys_lseek(fd,0,0); return 0;}
+static long w32_fileno(uint64_t *a){return win32_file_fd(a[0]);}
+static long w32_get_osfhandle(uint64_t *a){return (long)(int)a[0];}     /* HANDLE == fd */
+static long w32_isatty(uint64_t *a){(void)a;return 0;}                  /* batch, not a tty */
+static long w32_setmode(uint64_t *a){(void)a;return 0;}
+static long w32_vsscanf(uint64_t *a){(void)a;return 0;}                 /* stub: 0 fields */
+
+/* ---- environment / process ---- */
+static long w32_getenv(uint64_t *a) {
+    env_seed();
+    char name[ENV_NAME_LEN]; if(!a[0]||strncpy_from_user(name,(const char*)(uintptr_t)a[0],sizeof(name))<0)return 0;
+    int i=env_find(name); if(i<0)return 0;
+    const char *v=g_win32_env[i].val; int n=0; while(v[n])n++;
+    uint64_t p=win32_malloc_hdr((uint64_t)n+1); if(!p)return 0;
+    (void)copy_to_user((void*)(uintptr_t)p,v,(size_t)n+1); return (long)p;
+}
+static long w32_getpid(uint64_t *a){(void)a;struct proc*p=current_proc();return p?(long)p->pid:1;}
+static long w32_system(uint64_t *a){(void)a;return -1;}
+static long w32_assert(uint64_t *a){(void)a;kprintf("[win32] _assert failed\n");proc_exit(134);return 0;}
+
+/* ---- file / path CRT (onto the VFS) ---- */
+static uint64_t win32_stage_winpath(const char *winpath_user) {
+    char wp[ABI_PATH_MAX]; if(strncpy_from_user(wp,winpath_user,sizeof(wp))<0)return 0;
+    char kp[ABI_PATH_MAX]; int di=win32_xlate_winpath(wp,kp,sizeof(kp)); if(di<0)return 0;
+    uint64_t ubuf=WIN32_CRT_DATA_BASE+WIN32_CRT_PATHBUF;
+    if(copy_to_user((void*)(uintptr_t)ubuf,kp,(size_t)di+1)!=0)return 0; return ubuf;
+}
+static long w32_access(uint64_t *a) {
+    char wp[ABI_PATH_MAX]; if(strncpy_from_user(wp,(const char*)(uintptr_t)a[0],sizeof(wp))<0)return -1;
+    char kp[ABI_PATH_MAX]; win32_xlate_winpath(wp,kp,sizeof(kp));
+    struct vfs_stat vs; return (vfs_stat(kp,&vs)==VFS_OK)?0:-1;
+}
+static long w32_chmod(uint64_t *a){(void)a;return 0;}
+static long w32_crt_mkdir(uint64_t *a){uint64_t up=win32_stage_winpath((const char*)(uintptr_t)a[0]); return (up&&sys_mkdir((const char*)(uintptr_t)up,0755)==0)?0:-1;}
+static long w32_crt_unlink(uint64_t *a){uint64_t up=win32_stage_winpath((const char*)(uintptr_t)a[0]); return (up&&sys_unlink((const char*)(uintptr_t)up)==0)?0:-1;}
+static long w32_crt_wunlink(uint64_t *a){char wp[ABI_PATH_MAX]; win32_wstr_to_k(a[0],wp,sizeof(wp));
+    char kp[ABI_PATH_MAX]; int di=win32_xlate_winpath(wp,kp,sizeof(kp)); if(di<0)return -1;
+    uint64_t ubuf=WIN32_CRT_DATA_BASE+WIN32_CRT_PATHBUF; if(copy_to_user((void*)(uintptr_t)ubuf,kp,(size_t)di+1)!=0)return -1;
+    return sys_unlink((const char*)(uintptr_t)ubuf)==0?0:-1;}
+static long w32_fullpath(uint64_t *a){    /* _fullpath(absPath, relPath, maxLen) */
+    char rp[ABI_PATH_MAX]; int n=(int)strncpy_from_user(rp,(const char*)(uintptr_t)a[1],sizeof(rp)); if(n<0)return 0;
+    if(!a[0])return (long)a[1]; int cap=(int)(uint32_t)a[2]; int w=n<cap-1?n:cap-1;
+    (void)copy_to_user((void*)(uintptr_t)a[0],rp,(size_t)w); char z=0;(void)copy_to_user((void*)(uintptr_t)(a[0]+w),&z,1);
+    return (long)a[0];
+}
+/* _stat64i32(path, &st): fill st_mode@6 + st_size@20 (48-byte struct). */
+static void win32_fill_stat(uint64_t out, const struct vfs_stat *vs) {
+    uint8_t b[48]; memset(b,0,sizeof(b));
+    uint16_t mode = (vs->type==VFS_TYPE_DIR) ? 0x4000|0x1FF : 0x8000|0x1B6;  /* S_IFDIR / S_IFREG */
+    memcpy(&b[6],&mode,2);
+    int32_t sz=(int32_t)vs->size; memcpy(&b[20],&sz,4);
+    int64_t mt=(int64_t)rtc_unix_time(); memcpy(&b[24],&mt,8); memcpy(&b[32],&mt,8); memcpy(&b[40],&mt,8);
+    (void)copy_to_user((void*)(uintptr_t)out,b,sizeof(b));
+}
+static long w32_stat64i32(uint64_t *a){
+    char wp[ABI_PATH_MAX]; if(strncpy_from_user(wp,(const char*)(uintptr_t)a[0],sizeof(wp))<0)return -1;
+    char kp[ABI_PATH_MAX]; win32_xlate_winpath(wp,kp,sizeof(kp));
+    struct vfs_stat vs; if(vfs_stat(kp,&vs)!=VFS_OK)return -1; win32_fill_stat(a[1],&vs); return 0;
+}
+static long w32_fstat64(uint64_t *a){
+    struct file *f=fd_lookup((int)a[0]); if(!f)return -1;
+    struct vfs_stat vs; memset(&vs,0,sizeof(vs)); vs.type=VFS_TYPE_FILE;
+    if(f->kind==FILE_KIND_VFS)vs.size=f->vfs.size; win32_fill_stat(a[1],&vs); return 0;
+}
+static long w32_findclose_crt(uint64_t *a){(void)a;return 0;}
+static long w32_findfirst_crt(uint64_t *a){(void)a;return -1;}          /* no match */
+
+/* _localtime64(const __time64_t*) -> struct tm* (filled in app heap). */
+static long w32_localtime64(uint64_t *a) {
+    int64_t t=0; if(a[0])(void)copy_from_user(&t,(const void*)(uintptr_t)a[0],8);
+    int64_t days=t/86400, rem=t%86400; if(rem<0){rem+=86400;days--;}
+    int sec=(int)(rem%60), mn=(int)((rem/60)%60), hr=(int)(rem/3600);
+    /* civil from days since 1970 (Howard Hinnant) */
+    int64_t z=days+719468; int64_t era=(z>=0?z:z-146096)/146097; int doe=(int)(z-era*146097);
+    int yoe=(doe-doe/1460+doe/36524-doe/146096)/365; int y=(int)(yoe+era*400);
+    int doy=doe-(365*yoe+yoe/4-yoe/100); int mp=(5*doy+2)/153; int d=doy-(153*mp+2)/5+1;
+    int m=mp+(mp<10?3:-9); y+=(m<=2);
+    int wday=(int)((days%7+4)%7); if(wday<0)wday+=7;
+    int32_t tm[9]={sec,mn,hr,d,m-1,y-1900,wday,0,0};
+    uint64_t p=win32_malloc_hdr(sizeof(tm)); if(!p)return 0;
+    (void)copy_to_user((void*)(uintptr_t)p,tm,sizeof(tm)); return (long)p;
+}
+
+/* ---- a few more kernel32 ---- */
+static long w32_GetDiskFreeSpaceW(uint64_t *a){return w32_GetDiskFreeSpaceA(a);}
+static long w32_SetFileTime(uint64_t *a){(void)a;return 1;}
+/* Real GetLastError/SetLastError (was a 0 stub). SQLite's winOpen/winAccess read
+ * it to distinguish created-vs-existing files and ERROR_FILE_NOT_FOUND from a
+ * real I/O error. (g_win32_lasterr is defined up by g_wsa_lasterror.) */
+static long w32_GetLastError(uint64_t *a){(void)a;return (long)g_win32_lasterr;}
+static long w32_SetLastError(uint64_t *a){g_win32_lasterr=(uint32_t)a[0];return 0;}
+
 struct win32_shim {
     const char    *dll;     /* lower-case DLL name, no path */
     const char    *func;    /* exact exported symbol */
@@ -7932,7 +8565,8 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "DeleteCriticalSection",     w32_zero },
     { "kernel32.dll", "EnterCriticalSection",      w32_EnterCriticalSection },
     { "kernel32.dll", "LeaveCriticalSection",      w32_LeaveCriticalSection },
-    { "kernel32.dll", "GetLastError",              w32_zero },
+    { "kernel32.dll", "GetLastError",              w32_GetLastError },
+    { "kernel32.dll", "SetLastError",              w32_SetLastError },
     { "kernel32.dll", "SetUnhandledExceptionFilter", w32_zero },
     { "kernel32.dll", "Sleep",                     w32_Sleep },
     { "kernel32.dll", "TlsAlloc",                  w32_TlsAlloc },
@@ -7946,6 +8580,8 @@ static const struct win32_shim g_win32_shims[] = {
     /* ucrt: heap */
     { "api-ms-win-crt-heap-l1-1-0.dll", "malloc",                    w32_malloc },
     { "api-ms-win-crt-heap-l1-1-0.dll", "calloc",                    w32_calloc },
+    { "api-ms-win-crt-heap-l1-1-0.dll", "realloc",                   w32_realloc },   /* C18a */
+    { "api-ms-win-crt-heap-l1-1-0.dll", "_msize",                    w32_msize },     /* C18a */
     { "api-ms-win-crt-heap-l1-1-0.dll", "free",                      w32_zero },
     { "api-ms-win-crt-heap-l1-1-0.dll", "_set_new_mode",             w32_zero },
     /* ucrt: locale / math / private */
@@ -8168,6 +8804,140 @@ static const struct win32_shim g_win32_shims[] = {
     /* ---- C17c: Winsock UDP datagrams (ws2_32) ---- */
     { "ws2_32.dll", "sendto",          w32_sendto },
     { "ws2_32.dll", "recvfrom",        w32_recvfrom },
+
+    /* ---- C18a: run real off-the-shelf SQLite (kernel32 breadth) ---- */
+    /* Win32 process heap */
+    { "kernel32.dll", "GetProcessHeap",      w32_GetProcessHeap },
+    { "kernel32.dll", "HeapCreate",          w32_HeapCreate },
+    { "kernel32.dll", "HeapDestroy",         w32_HeapDestroy },
+    { "kernel32.dll", "HeapAlloc",           w32_HeapAlloc },
+    { "kernel32.dll", "HeapReAlloc",         w32_HeapReAlloc },
+    { "kernel32.dll", "HeapFree",            w32_HeapFree },
+    { "kernel32.dll", "HeapSize",            w32_HeapSize },
+    { "kernel32.dll", "HeapValidate",        w32_HeapValidate },
+    { "kernel32.dll", "HeapCompact",         w32_HeapCompact },
+    /* wide-char conversion */
+    { "kernel32.dll", "MultiByteToWideChar", w32_MultiByteToWideChar },
+    { "kernel32.dll", "WideCharToMultiByte", w32_WideCharToMultiByte },
+    /* wide file APIs (SQLite WinNT VFS) */
+    { "kernel32.dll", "CreateFileW",         w32_CreateFileW },
+    { "kernel32.dll", "GetFileAttributesW",  w32_GetFileAttributesW },
+    { "kernel32.dll", "GetFileAttributesExW",w32_GetFileAttributesExW },
+    { "kernel32.dll", "DeleteFileW",         w32_DeleteFileW },
+    { "kernel32.dll", "GetFullPathNameW",    w32_GetFullPathNameW },
+    { "kernel32.dll", "GetFullPathNameA",    w32_GetFullPathNameA },
+    { "kernel32.dll", "GetTempPathW",        w32_GetTempPathW },
+    { "kernel32.dll", "GetTempPathA",        w32_GetTempPathA },
+    { "kernel32.dll", "SetCurrentDirectoryW",w32_SetCurrentDirectoryW },
+    { "kernel32.dll", "FindFirstFileW",      w32_FindFirstFileW },
+    { "kernel32.dll", "GetFileType",         w32_GetFileType },
+    { "kernel32.dll", "FlushFileBuffers",    w32_FlushFileBuffers },
+    { "kernel32.dll", "SetEndOfFile",        w32_SetEndOfFile },
+    { "kernel32.dll", "GetDiskFreeSpaceA",   w32_GetDiskFreeSpaceA },
+    { "kernel32.dll", "AreFileApisANSI",     w32_AreFileApisANSI },
+    /* time */
+    { "kernel32.dll", "GetSystemTimeAsFileTime", w32_GetSystemTimeAsFileTime },
+    { "kernel32.dll", "GetSystemTime",       w32_GetSystemTime },
+    { "kernel32.dll", "SystemTimeToFileTime",w32_SystemTimeToFileTime },
+    { "kernel32.dll", "GetTickCount",        w32_GetTickCount },
+    { "kernel32.dll", "GetTickCount64",      w32_GetTickCount },
+    { "kernel32.dll", "QueryPerformanceCounter",   w32_QueryPerformanceCounter },
+    { "kernel32.dll", "QueryPerformanceFrequency", w32_QueryPerformanceFrequency },
+    { "kernel32.dll", "GetSystemInfo",       w32_GetSystemInfo },
+    /* file locking (single-process -> succeed) + mmap (fail -> normal I/O) */
+    { "kernel32.dll", "LockFile",            w32_LockFileStub },
+    { "kernel32.dll", "LockFileEx",          w32_LockFileStub },
+    { "kernel32.dll", "UnlockFile",          w32_LockFileStub },
+    { "kernel32.dll", "UnlockFileEx",        w32_LockFileStub },
+    { "kernel32.dll", "CreateFileMappingW",  w32_CreateFileMappingW },
+    { "kernel32.dll", "MapViewOfFile",       w32_MapViewOfFile },
+    { "kernel32.dll", "FlushViewOfFile",     w32_LockFileStub },
+    { "kernel32.dll", "UnmapViewOfFile",     w32_LockFileStub },
+    /* console (report not-a-console -> plain file I/O) */
+    { "kernel32.dll", "GetConsoleMode",            w32_GetConsoleMode },
+    { "kernel32.dll", "GetConsoleScreenBufferInfo",w32_zero },
+    { "kernel32.dll", "SetConsoleMode",            w32_one },
+    { "kernel32.dll", "SetConsoleCtrlHandler",     w32_one },
+    { "kernel32.dll", "SetConsoleTextAttribute",   w32_one },
+    { "kernel32.dll", "WriteConsoleW",             w32_WriteConsoleW },
+    { "kernel32.dll", "ReadConsoleW",              w32_zero },
+    /* misc */
+    { "kernel32.dll", "GetCurrentProcess",   w32_GetCurrentProcess },
+    { "kernel32.dll", "GetCurrentThreadId",  w32_GetCurrentThreadId },
+    { "kernel32.dll", "FormatMessageA",      w32_FormatMessageA },
+    { "kernel32.dll", "FormatMessageW",      w32_zero },
+    { "kernel32.dll", "LocalFree",           w32_LocalFree },
+    { "kernel32.dll", "CreateMutexW",        w32_CreateMutexW },
+    { "kernel32.dll", "DebugBreak",          w32_zero },
+    { "kernel32.dll", "OutputDebugStringA",  w32_zero },
+    { "kernel32.dll", "OutputDebugStringW",  w32_zero },
+    { "kernel32.dll", "GetDiskFreeSpaceW",   w32_GetDiskFreeSpaceW },
+    { "kernel32.dll", "SetFileTime",         w32_SetFileTime },
+    { "kernel32.dll", "WaitForSingleObjectEx", w32_WaitForSingleObject },
+
+    /* ---- C18a: the C-runtime breadth SQLite pulls in ---- */
+    /* ctype */
+    { "api-ms-win-crt-string-l1-1-0.dll", "isalnum",  w32_isalnum },
+    { "api-ms-win-crt-string-l1-1-0.dll", "isalpha",  w32_isalpha },
+    { "api-ms-win-crt-string-l1-1-0.dll", "isdigit",  w32_isdigit },
+    { "api-ms-win-crt-string-l1-1-0.dll", "isspace",  w32_isspace },
+    { "api-ms-win-crt-string-l1-1-0.dll", "isprint",  w32_isprint },
+    { "api-ms-win-crt-string-l1-1-0.dll", "tolower",  w32_tolower },
+    { "api-ms-win-crt-string-l1-1-0.dll", "toupper",  w32_toupper },
+    /* string */
+    { "api-ms-win-crt-string-l1-1-0.dll", "strcmp",   w32_strcmp },
+    { "api-ms-win-crt-string-l1-1-0.dll", "strcpy",   w32_strcpy },
+    { "api-ms-win-crt-string-l1-1-0.dll", "strcat",   w32_strcat },
+    { "api-ms-win-crt-string-l1-1-0.dll", "strchr",   w32_strchr },
+    { "api-ms-win-crt-string-l1-1-0.dll", "strrchr",  w32_strrchr },
+    { "api-ms-win-crt-string-l1-1-0.dll", "strspn",   w32_strspn },
+    { "api-ms-win-crt-string-l1-1-0.dll", "strcspn",  w32_strcspn },
+    { "api-ms-win-crt-string-l1-1-0.dll", "_strdup",  w32_strdup },
+    { "api-ms-win-crt-private-l1-1-0.dll", "memchr",  w32_memchr },
+    { "api-ms-win-crt-private-l1-1-0.dll", "memmove", w32_memmove },
+    { "api-ms-win-crt-private-l1-1-0.dll", "strchr",  w32_strchr },
+    { "api-ms-win-crt-private-l1-1-0.dll", "strrchr", w32_strrchr },
+    /* conversion */
+    { "api-ms-win-crt-convert-l1-1-0.dll", "atoi",    w32_atoi },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "strtol",  w32_strtol },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "strtod",  w32_strtod },
+    /* stdio FILE* */
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fopen",     w32_fopen },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fclose",    w32_fclose },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fread",     w32_fread },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fwrite",    w32_fwrite },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fputs",     w32_fputs },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fgetc",     w32_fgetc },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fgets",     w32_fgets },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fseek",     w32_fseek },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "ftell",     w32_ftell },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "rewind",    w32_rewind },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_fileno",   w32_fileno },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_get_osfhandle", w32_get_osfhandle },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_isatty",   w32_isatty },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_setmode",  w32_setmode },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vsscanf", w32_vsscanf },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_popen",    w32_zero },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_pclose",   w32_zero },
+    /* environment / process */
+    { "api-ms-win-crt-environment-l1-1-0.dll", "getenv", w32_getenv },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_getpid",  w32_getpid },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "system",   w32_system },
+    { "api-ms-win-crt-runtime-l1-1-0.dll", "_assert",  w32_assert },
+    /* file / path */
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_access",        w32_access },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_chmod",         w32_chmod },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_mkdir",         w32_crt_mkdir },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_unlink",        w32_crt_unlink },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_wunlink",       w32_crt_wunlink },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_fullpath",      w32_fullpath },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_stat64i32",     w32_stat64i32 },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_fstat64",       w32_fstat64 },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_findfirst64i32",w32_findfirst_crt },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_findnext64i32", w32_findfirst_crt },
+    { "api-ms-win-crt-filesystem-l1-1-0.dll", "_findclose",     w32_findclose_crt },
+    /* time */
+    { "api-ms-win-crt-time-l1-1-0.dll", "_localtime64", w32_localtime64 },
 };
 #define WIN32_SHIM_COUNT (int)(sizeof(g_win32_shims) / sizeof(g_win32_shims[0]))
 
