@@ -6036,6 +6036,127 @@ static long w32_CreateDirectoryA(uint64_t *a) {
     return (up && sys_mkdir((const char *)(uintptr_t)up, 0755) == 0) ? 1 : 0;
 }
 
+/* ================= C18d: shell32 ================= *
+ * Path / launch / tray shims. CSIDL folder ids map to C:\ paths (which the file
+ * shims already route to the writable /data mount), ShellExecuteA enqueues a
+ * desktop launch via the SAFE pid-0 launch queue (a shim must never proc_spawn
+ * directly -- see sys_exec), and Shell_NotifyIcon/DragQueryFile are minimal
+ * (tobyOS has no system tray and delivers no OLE drag-drop). */
+
+/* CSIDL (low byte; CSIDL_FLAG_CREATE 0x8000 etc. live in the high bits) -> a
+ * Windows path under C:\ . Unknown ids fall back to the user profile. */
+static const char *win32_csidl_path(int csidl) {
+    switch (csidl & 0xFF) {
+    case 0x00: case 0x10: return "C:\\Users\\toby\\Desktop";          /* DESKTOP(DIRECTORY) */
+    case 0x02: case 0x0b: return "C:\\Users\\toby\\Start Menu";       /* PROGRAMS / STARTMENU */
+    case 0x05: return "C:\\Users\\toby\\Documents";                   /* PERSONAL          */
+    case 0x06: return "C:\\Users\\toby\\Favorites";                   /* FAVORITES         */
+    case 0x0d: return "C:\\Users\\toby\\Music";                       /* MYMUSIC           */
+    case 0x0e: return "C:\\Users\\toby\\Videos";                      /* MYVIDEO           */
+    case 0x1a: return "C:\\Users\\toby\\AppData\\Roaming";            /* APPDATA           */
+    case 0x1c: return "C:\\Users\\toby\\AppData\\Local";              /* LOCAL_APPDATA     */
+    case 0x23: return "C:\\ProgramData";                              /* COMMON_APPDATA    */
+    case 0x24: return "C:\\Windows";                                  /* WINDOWS           */
+    case 0x25: return "C:\\Windows\\System32";                        /* SYSTEM            */
+    case 0x26: return "C:\\Program Files";                            /* PROGRAM_FILES     */
+    case 0x27: return "C:\\Users\\toby\\Pictures";                    /* MYPICTURES        */
+    case 0x28: return "C:\\Users\\toby";                              /* PROFILE           */
+    case 0x2b: return "C:\\Program Files (x86)";                      /* PROGRAM_FILESX86  */
+    case 0x2e: return "C:\\Users\\Public\\Documents";                /* COMMON_DOCUMENTS  */
+    default:   return "C:\\Users\\toby";
+    }
+}
+
+/* mkdir -p over a translated /data path (creates each '/'-separated level). */
+static void win32_mkdir_p_k(const char *kp) {
+    char tmp[ABI_PATH_MAX];
+    int n = 0;
+    for (; kp[n] && n < (int)sizeof(tmp) - 1; n++) tmp[n] = kp[n];
+    tmp[n] = '\0';
+    for (int i = 1; i < n; i++) {
+        if (tmp[i] == '/') { tmp[i] = '\0'; (void)vfs_mkdir(tmp); tmp[i] = '/'; }
+    }
+    (void)vfs_mkdir(tmp);                  /* ignore EEXIST at every level */
+}
+
+/* Copy a CSIDL's C:\ path to a user buffer, optionally creating the dir tree
+ * (under /data). Returns 1 on success, 0 on a bad buffer. */
+static long win32_shell_folder(uint64_t upath, int csidl, int create) {
+    if (!upath) return 0;
+    const char *p = win32_csidl_path(csidl);
+    size_t n = 0; while (p[n]) n++;
+    if (copy_to_user((void *)(uintptr_t)upath, p, n + 1) != 0) return 0;
+    if (create || (csidl & 0x8000)) {      /* CSIDL_FLAG_CREATE */
+        char kp[ABI_PATH_MAX];
+        int di = 0;
+        for (const char *r = "/data"; *r; r++) kp[di++] = *r;
+        for (size_t i = 2; i < n && di < (int)sizeof(kp) - 1; i++)   /* skip "C:" */
+            kp[di++] = (p[i] == '\\') ? '/' : p[i];
+        kp[di] = '\0';
+        win32_mkdir_p_k(kp);
+    }
+    return 1;
+}
+
+/* shell32!SHGetFolderPathA(hwnd, csidl, hToken, dwFlags, LPSTR pszPath) -> HRESULT. */
+static long w32_SHGetFolderPathA(uint64_t *a) {
+    return win32_shell_folder(a[4], (int)(uint32_t)a[1], 0)
+               ? 0 /* S_OK */ : (long)0x80070057 /* E_INVALIDARG */;
+}
+/* shell32!SHGetSpecialFolderPathA(hwnd, LPSTR pszPath, csidl, BOOL fCreate) -> BOOL. */
+static long w32_SHGetSpecialFolderPathA(uint64_t *a) {
+    return win32_shell_folder(a[1], (int)(uint32_t)a[2], (int)(uint32_t)a[3]);
+}
+
+/* shell32!ShellExecuteA(hwnd, lpOp, lpFile, lpParams, lpDir, nShow) -> HINSTANCE.
+ * Return >32 = success. A *.exe target is launched for real via the safe pid-0
+ * desktop launch queue (/bin/<basename>); other verbs are accepted optimistically
+ * (tobyOS has no file-type associations), matching ShellExecute's fire-and-forget
+ * contract (it returns success before the target has necessarily started). */
+static long w32_ShellExecuteA(uint64_t *a) {
+    char file[ABI_PATH_MAX], params[256];
+    if (strncpy_from_user(file, (const char *)(uintptr_t)a[2], sizeof(file)) < 0)
+        return 2;   /* SE_ERR_FNF (<32 = error) */
+    file[sizeof(file) - 1] = 0;
+    params[0] = 0;
+    if (a[3]) {
+        (void)strncpy_from_user(params, (const char *)(uintptr_t)a[3], sizeof(params));
+        params[sizeof(params) - 1] = 0;
+    }
+    int len = 0; while (file[len]) len++;
+    int bs = 0; for (int i = len - 1; i >= 0; i--) if (file[i]=='\\'||file[i]=='/'){ bs=i+1; break; }
+    const char *base = file + bs; int blen = len - bs;
+    int is_exe = blen > 4 && base[blen-4]=='.' && (base[blen-3]|32)=='e' &&
+                 (base[blen-2]|32)=='x' && (base[blen-1]|32)=='e';
+    if (is_exe) {
+        char path[ABI_PATH_MAX]; int di = 0;
+        for (const char *r = "/bin/"; *r && di < (int)sizeof(path)-1; r++) path[di++] = *r;
+        for (int i = 0; i < blen && di < (int)sizeof(path)-1; i++) path[di++] = base[i];
+        path[di] = 0;
+        int enq = gui_launch_enqueue_arg(path, params[0] ? params : 0);
+        kprintf("[c18d] ShellExecuteA open '%s' -> launch %s (enqueue=%d)\n", file, path, enq);
+    } else {
+        kprintf("[c18d] ShellExecuteA open '%s' (no assoc)\n", file);
+    }
+    return 42;   /* >32 = success */
+}
+
+/* shell32!Shell_NotifyIconA(dwMessage, PNOTIFYICONDATA) -> BOOL. tobyOS has no
+ * system tray; accept add/modify/delete so apps that show a tray icon proceed. */
+static long w32_Shell_NotifyIconA(uint64_t *a) {
+    kprintf("[c18d] Shell_NotifyIconA msg=%u (no tray; accepted)\n", (uint32_t)a[0]);
+    return 1;   /* TRUE */
+}
+
+/* shell32!DragQueryFileA(hDrop, iFile, lpszFile, cch) -> file count / chars.
+ * tobyOS delivers no OLE drag-drop, so any HDROP reports zero files. */
+static long w32_DragQueryFileA(uint64_t *a) {
+    if ((uint32_t)a[1] != 0xFFFFFFFFu && a[2] && (uint32_t)a[3] > 0) {
+        char z = 0; (void)copy_to_user((void *)(uintptr_t)a[2], &z, 1);
+    }
+    return 0;   /* 0 files (query) / 0 chars (copy) */
+}
+
 /* kernel32!GetFileAttributesA(path) -> FILE_ATTRIBUTE_* or INVALID(0xFFFFFFFF).
  * Uses the kernel-side VFS stat directly (no user marshalling needed). */
 static long w32_GetFileAttributesA(uint64_t *a) {
@@ -8750,6 +8871,12 @@ static const struct win32_shim g_win32_shims[] = {
     { "kernel32.dll", "DeleteFileA",         w32_DeleteFileA },
     { "kernel32.dll", "CreateDirectoryA",    w32_CreateDirectoryA },
     { "kernel32.dll", "GetFileAttributesA",  w32_GetFileAttributesA },
+    /* C18d: shell32 -- CSIDL paths, ShellExecute launch, tray/drag stubs. */
+    { "shell32.dll",  "SHGetFolderPathA",        w32_SHGetFolderPathA },
+    { "shell32.dll",  "SHGetSpecialFolderPathA", w32_SHGetSpecialFolderPathA },
+    { "shell32.dll",  "ShellExecuteA",           w32_ShellExecuteA },
+    { "shell32.dll",  "Shell_NotifyIconA",       w32_Shell_NotifyIconA },
+    { "shell32.dll",  "DragQueryFileA",          w32_DragQueryFileA },
     { "kernel32.dll", "FindFirstFileA",      w32_FindFirstFileA },
     { "kernel32.dll", "FindNextFileA",       w32_FindNextFileA },
     { "kernel32.dll", "FindClose",           w32_FindClose },

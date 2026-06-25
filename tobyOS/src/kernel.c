@@ -4886,6 +4886,52 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE18D_BOOT
+    /* Track C -- shell32, milestone C18d. Build EXTRA_CFLAGS+=-DWINPE18D_BOOT.
+     * /bin/win-shell18d.exe uses SHGetFolderPathA/SHGetSpecialFolderPathA (CSIDL
+     * -> C:\ -> /data), ShellExecuteA (desktop launch via the safe pid-0 queue),
+     * Shell_NotifyIcon (tray) and DragQueryFile. Proof = exit 88 (all shim return
+     * values correct) AND the kernel re-reads the sentinel the app wrote under the
+     * SHGetFolderPathA(CSIDL_APPDATA|FLAG_CREATE) path -- only reachable if that
+     * CSIDL path genuinely resolved end-to-end through the C:\ -> /data layer. */
+    {
+        win32_gui_set_log(true);
+        (void)vfs_unlink("/data/Users/toby/AppData/Roaming/c18d.txt");
+        kprintf("[boot] WINPE18D: spawning /bin/win-shell18d.exe (shell32 CSIDL/ShellExecute)\n");
+        char *argv[] = { (char *)"win-shell18d.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-shell18d.exe", .name = "win-shell18d.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE18D] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE18D: /bin/win-shell18d.exe (pid=%d) exit=%d\n", pid, rc);
+            void *buf = 0; size_t sz = 0; int found = 0;
+            if (vfs_read_all("/data/Users/toby/AppData/Roaming/c18d.txt", &buf, &sz) == 0 && buf) {
+                const char *p = (const char *)buf;
+                const char *needle = "C18D-SHELL-OK";
+                for (size_t i = 0; sz >= 13 && i + 13 <= sz; i++) {
+                    int k = 0; while (k < 13 && p[i + k] == needle[k]) k++;
+                    if (k == 13) { found = 1; break; }
+                }
+                kprintf("[boot] WINPE18D: CSIDL appdata sentinel %s (%lu bytes)\n",
+                        found ? "FOUND" : "MISSING", (unsigned long)sz);
+                kfree(buf);
+            } else {
+                kprintf("[boot] WINPE18D: appdata sentinel file not readable\n");
+            }
+            int pass = (rc == 88 && found);
+            kprintf("[WINPE18D] VERDICT: %s exit=%d sentinel=%d (expect exit 88 + CSIDL file)\n",
+                    pass ? "PASS" : "FAIL", rc, found);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery
