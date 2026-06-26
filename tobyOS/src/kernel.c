@@ -5017,6 +5017,87 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE20_BOOT
+    /* Track C -- float-return marshalling through the gate, milestone C20. Build
+     * EXTRA_CFLAGS+=-DWINPE20_BOOT. /bin/win-math20.exe calls the REAL ucrt libm
+     * (sqrt/sin/cos/pow/exp/log/floor/ceil/fmod/fabs/atan2/...), each returning a
+     * double in xmm0 via the new float-return gate (which marshals xmm0..xmm3 and
+     * does movq xmm0,rax on the result) + the -msse kmath libm. It checks every
+     * result against its known value within a tolerance using integer/relational
+     * ops only (no float printing) and exits 20 only if all doubles round-tripped
+     * arg -> xmm -> kernel -> xmm0 correctly (a failing check returns 100+index). */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE20: spawning /bin/win-math20.exe (float-return libm)\n");
+        char *argv[] = { (char *)"win-math20.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-math20.exe", .name = "win-math20.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE20] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE20: /bin/win-math20.exe (pid=%d) exit=%d\n", pid, rc);
+            int pass = (rc == 20);
+            kprintf("[WINPE20] VERDICT: %s exit=%d (expect 20: 15 libm float round-trips; 100+i=fail i)\n",
+                    pass ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE20L_BOOT
+    /* Track C -- the REAL off-the-shelf Lua 5.4 interpreter doing FLOATING-POINT
+     * math through the C20 float-return gate, milestone C20 (capstone). Build
+     * EXTRA_CFLAGS+=-DWINPE20L_BOOT. /bin/win-lua.exe runs /etc/c20.lua, which
+     * calls math.sqrt/sin/exp/log/pi (ucrt libm, all double-returning) and writes
+     * integer-scaled results to C:\c20.out (-> /data). This turns C19b's honest
+     * "floats return garbage" caveat into a proven capability: the kernel re-reads
+     * the file and matches the exact sentinel the script can only produce if real
+     * libm doubles round-tripped through the gate. */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE20L: spawning /bin/win-lua.exe /etc/c20.lua (real Lua float math)\n");
+        char *argv[] = { (char *)"win-lua.exe", (char *)"/etc/c20.lua", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-lua.exe", .name = "win-lua.exe",
+            .argc = 2, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE20L] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE20L: /bin/win-lua.exe (pid=%d) exit=%d\n", pid, rc);
+            void *buf = 0; size_t sz = 0; int found = 0;
+            if (vfs_read_all("/data/c20.out", &buf, &sz) == 0 && buf) {
+                const char *p = (const char *)buf;
+                const char *needle =
+                    "TOBYMATH=== sqrt2=1414214 sin30=500000 e=2718282 lne=1000000 pi=3141593";
+                size_t nl = 0; while (needle[nl]) nl++;
+                for (size_t i = 0; sz >= nl && i + nl <= sz; i++) {
+                    size_t k = 0; while (k < nl && p[i + k] == needle[k]) k++;
+                    if (k == nl) { found = 1; break; }
+                }
+                kprintf("[boot] WINPE20L: /data/c20.out = %lu bytes, sentinel %s\n",
+                        (unsigned long)sz, found ? "FOUND" : "MISSING");
+                (void)p;
+                kfree(buf);
+            } else {
+                kprintf("[boot] WINPE20L: /data/c20.out not readable\n");
+            }
+            int pass = (rc == 0 && found);
+            kprintf("[WINPE20L] VERDICT: %s exit=%d sentinel=%d (expect exit 0 + Lua float math)\n",
+                    pass ? "PASS" : "FAIL", rc, found);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery

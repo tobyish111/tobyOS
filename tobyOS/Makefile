@@ -83,6 +83,7 @@ C_SRCS := src/kernel.c \
           src/font8x8.c \
           src/font8x16.c \
           src/kfont.c \
+          src/kmath.c \
           src/console.c \
           src/printk.c \
           src/bootlog.c \
@@ -596,6 +597,13 @@ src/%.o: src/%.c $(HEADERS) Makefile
 src/kfont.o: src/kfont.c $(HEADERS) third_party/stb_truetype.h Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -msse -msse2 -Wno-unused-function \
 	      -Wno-sign-compare -Wno-cast-align -c $< -o $@
+
+# C20: kmath.c is the kernel-side libm for the Win32 float-return shims; it runs
+# real FP, so (like kfont.c) it is built -msse2 with an FXSAVE/FXRSTOR guard
+# (kmfpu_begin/end) preserving the calling user process's live SSE state.
+src/kmath.o: src/kmath.c $(HEADERS) Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -msse -msse2 -fno-math-errno \
+	      -Wno-unused-function -c $< -o $@
 
 src/%.o: src/%.S $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
@@ -1505,6 +1513,12 @@ programs/win-lua/win-lua.exe: $(LUA_SRCS)
 programs/win-com19c/win-com19c.exe: programs/win-com19c/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $< -lole32
 
+# Track C/C20: float-return proof -- calls the REAL ucrt libm (sqrt/sin/pow/...),
+# each returning a double in xmm0. -fno-builtin forces genuine imported calls
+# (no inlined sqrtsd / constant fold) so the float-return gate is exercised.
+programs/win-math20/win-math20.exe: programs/win-math20/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -fno-builtin -o $@ $<
+
 # ---------- Milestone 25D: dynamic-linked sample (c_dynhello) ----------
 #
 # Same source-shape as the other libtoby samples, but built as a
@@ -1819,7 +1833,9 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-font18c/win-font18c.exe \
                programs/win-lua/win-lua.exe \
                programs/win-com19c/win-com19c.exe \
-               initrd/etc/c19b.lua \
+               programs/win-math20/win-math20.exe \
+                initrd/etc/c19b.lua \
+                initrd/etc/c20.lua \
                initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
                initrd/etc/Lato-BoldItalic.ttf \
@@ -1908,7 +1924,9 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-font18c/win-font18c.exe           $(INITRD_STAGE)/bin/win-font18c.exe
 	cp programs/win-lua/win-lua.exe                   $(INITRD_STAGE)/bin/win-lua.exe
 	cp programs/win-com19c/win-com19c.exe             $(INITRD_STAGE)/bin/win-com19c.exe
+	cp programs/win-math20/win-math20.exe             $(INITRD_STAGE)/bin/win-math20.exe
 	cp initrd/etc/c19b.lua                            $(INITRD_STAGE)/etc/c19b.lua
+	cp initrd/etc/c20.lua                             $(INITRD_STAGE)/etc/c20.lua
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -2124,7 +2142,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-env16.exe bin/win-tls16.exe bin/win-net17.exe         \
 	    bin/win-srv17.exe bin/win-udp17.exe bin/win-sqlite.exe        \
 	    bin/win-font18c.exe bin/win-lua.exe bin/win-com19c.exe        \
-	    etc/c19b.lua                                                  \
+	    bin/win-math20.exe                                            \
+	    etc/c19b.lua etc/c20.lua                                      \
 	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
 	    etc/Lato-BoldItalic.ttf                                       \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \

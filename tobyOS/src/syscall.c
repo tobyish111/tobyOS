@@ -20,6 +20,7 @@
  */
 
 #include <tobyos/syscall.h>
+#include <tobyos/kmath.h>      /* C20: kernel libm for the float-return shims */
 #include <tobyos/proc.h>
 #include <tobyos/file.h>
 #include <tobyos/pipe.h>
@@ -8895,6 +8896,48 @@ static long w32_com_Add(uint64_t *a){
     int32_t s=x+y; return (copy_to_user((void*)(uintptr_t)pout,&s,4)==0)?COM_S_OK:COM_E_FAIL;
 }
 
+/* ================= C20: float-return CRT math (libm) =================
+ * These shims return a `double` in xmm0, so their IAT/procaddr thunks jmp to the
+ * float-return gate (WIN32_FGATE_VA) instead of the integer gate -- the loader
+ * picks the gate via win32_shim_is_double_ret() below. The float gate marshals
+ * the four MS-x64 FP-arg registers as bit patterns into a[4..7] (and the integer
+ * regs into a[0..3]); the actual FP runs in the -msse kmath.c (FXSAVE-guarded),
+ * exchanged as bit patterns since this file is -mno-sse. The gate does
+ * `movq xmm0, rax` on the returned bits. One-arg funcs read xmm0 = a[4]; two-arg
+ * read xmm0,xmm1 = a[4],a[5]; ldexp's int exponent is the 2nd integer arg a[1]. */
+static long w32_sqrt (uint64_t *a){ return (long)kmath_op1(KM_SQRT , a[4]); }
+static long w32_sin  (uint64_t *a){ return (long)kmath_op1(KM_SIN  , a[4]); }
+static long w32_cos  (uint64_t *a){ return (long)kmath_op1(KM_COS  , a[4]); }
+static long w32_tan  (uint64_t *a){ return (long)kmath_op1(KM_TAN  , a[4]); }
+static long w32_exp  (uint64_t *a){ return (long)kmath_op1(KM_EXP  , a[4]); }
+static long w32_exp2 (uint64_t *a){ return (long)kmath_op1(KM_EXP2 , a[4]); }
+static long w32_log  (uint64_t *a){ return (long)kmath_op1(KM_LOG  , a[4]); }
+static long w32_log10(uint64_t *a){ return (long)kmath_op1(KM_LOG10, a[4]); }
+static long w32_log2 (uint64_t *a){ return (long)kmath_op1(KM_LOG2 , a[4]); }
+static long w32_floor(uint64_t *a){ return (long)kmath_op1(KM_FLOOR, a[4]); }
+static long w32_ceil (uint64_t *a){ return (long)kmath_op1(KM_CEIL , a[4]); }
+static long w32_trunc(uint64_t *a){ return (long)kmath_op1(KM_TRUNC, a[4]); }
+static long w32_round(uint64_t *a){ return (long)kmath_op1(KM_ROUND, a[4]); }
+static long w32_fabs (uint64_t *a){ return (long)kmath_op1(KM_FABS , a[4]); }
+static long w32_atan (uint64_t *a){ return (long)kmath_op1(KM_ATAN , a[4]); }
+static long w32_asin (uint64_t *a){ return (long)kmath_op1(KM_ASIN , a[4]); }
+static long w32_acos (uint64_t *a){ return (long)kmath_op1(KM_ACOS , a[4]); }
+static long w32_sinh (uint64_t *a){ return (long)kmath_op1(KM_SINH , a[4]); }
+static long w32_cosh (uint64_t *a){ return (long)kmath_op1(KM_COSH , a[4]); }
+static long w32_tanh (uint64_t *a){ return (long)kmath_op1(KM_TANH , a[4]); }
+static long w32_cbrt (uint64_t *a){ return (long)kmath_op1(KM_CBRT , a[4]); }
+static long w32_pow  (uint64_t *a){ return (long)kmath_op2(KM2_POW  , a[4], a[5]); }
+static long w32_fmod (uint64_t *a){ return (long)kmath_op2(KM2_FMOD , a[4], a[5]); }
+static long w32_atan2(uint64_t *a){ return (long)kmath_op2(KM2_ATAN2, a[4], a[5]); }
+static long w32_hypot(uint64_t *a){ return (long)kmath_op2(KM2_HYPOT, a[4], a[5]); }
+static long w32_ldexp(uint64_t *a){ return (long)kmath_ldexp(a[4], (long)(int)(uint32_t)a[1]); }
+/* frexp(double x, int *e): x = xmm0 = a[4], e = 2nd integer arg = a[1] (rdx). */
+static long w32_frexp(uint64_t *a){
+    int e = 0; uint64_t mb = kmath_frexp(a[4], &e);
+    if (a[1]) copy_to_user((void *)(uintptr_t)a[1], &e, sizeof(e));
+    return (long)mb;
+}
+
 struct win32_shim {
     const char    *dll;     /* lower-case DLL name, no path */
     const char    *func;    /* exact exported symbol */
@@ -8943,6 +8986,34 @@ static const struct win32_shim g_win32_shims[] = {
     /* ucrt: locale / math / private */
     { "api-ms-win-crt-locale-l1-1-0.dll", "_configthreadlocale",     w32_zero },
     { "api-ms-win-crt-math-l1-1-0.dll", "__setusermatherr",          w32_zero },
+    /* C20: float-return libm (double in xmm0 via the float-return gate). */
+    { "api-ms-win-crt-math-l1-1-0.dll", "sqrt",   w32_sqrt },
+    { "api-ms-win-crt-math-l1-1-0.dll", "sin",    w32_sin },
+    { "api-ms-win-crt-math-l1-1-0.dll", "cos",    w32_cos },
+    { "api-ms-win-crt-math-l1-1-0.dll", "tan",    w32_tan },
+    { "api-ms-win-crt-math-l1-1-0.dll", "exp",    w32_exp },
+    { "api-ms-win-crt-math-l1-1-0.dll", "exp2",   w32_exp2 },
+    { "api-ms-win-crt-math-l1-1-0.dll", "log",    w32_log },
+    { "api-ms-win-crt-math-l1-1-0.dll", "log10",  w32_log10 },
+    { "api-ms-win-crt-math-l1-1-0.dll", "log2",   w32_log2 },
+    { "api-ms-win-crt-math-l1-1-0.dll", "floor",  w32_floor },
+    { "api-ms-win-crt-math-l1-1-0.dll", "ceil",   w32_ceil },
+    { "api-ms-win-crt-math-l1-1-0.dll", "trunc",  w32_trunc },
+    { "api-ms-win-crt-math-l1-1-0.dll", "round",  w32_round },
+    { "api-ms-win-crt-math-l1-1-0.dll", "fabs",   w32_fabs },
+    { "api-ms-win-crt-math-l1-1-0.dll", "atan",   w32_atan },
+    { "api-ms-win-crt-math-l1-1-0.dll", "asin",   w32_asin },
+    { "api-ms-win-crt-math-l1-1-0.dll", "acos",   w32_acos },
+    { "api-ms-win-crt-math-l1-1-0.dll", "sinh",   w32_sinh },
+    { "api-ms-win-crt-math-l1-1-0.dll", "cosh",   w32_cosh },
+    { "api-ms-win-crt-math-l1-1-0.dll", "tanh",   w32_tanh },
+    { "api-ms-win-crt-math-l1-1-0.dll", "cbrt",   w32_cbrt },
+    { "api-ms-win-crt-math-l1-1-0.dll", "pow",    w32_pow },
+    { "api-ms-win-crt-math-l1-1-0.dll", "fmod",   w32_fmod },
+    { "api-ms-win-crt-math-l1-1-0.dll", "atan2",  w32_atan2 },
+    { "api-ms-win-crt-math-l1-1-0.dll", "hypot",  w32_hypot },
+    { "api-ms-win-crt-math-l1-1-0.dll", "ldexp",  w32_ldexp },
+    { "api-ms-win-crt-math-l1-1-0.dll", "frexp",  w32_frexp },
     { "api-ms-win-crt-private-l1-1-0.dll", "__C_specific_handler",   w32_zero },
     { "api-ms-win-crt-private-l1-1-0.dll", "memcpy",                 w32_memcpy },
     { "api-ms-win-crt-private-l1-1-0.dll", "memcmp",                 w32_memcmp },
@@ -9366,6 +9437,21 @@ int win32_shim_index(const char *dll, const char *func) {
 }
 
 int win32_shim_count(void) { return WIN32_SHIM_COUNT; }
+
+/* C20: 1 if shim `idx` returns a `double` (so the loader binds its thunk to the
+ * float-return gate). Matched by fn pointer so only the genuine libm shims route
+ * through the FP gate. */
+int win32_shim_is_double_ret(int idx) {
+    if (idx < 0 || idx >= WIN32_SHIM_COUNT) return 0;
+    win32_shim_fn f = g_win32_shims[idx].fn;
+    return f == w32_sqrt || f == w32_sin   || f == w32_cos   || f == w32_tan  ||
+           f == w32_exp  || f == w32_exp2  || f == w32_log   || f == w32_log10 ||
+           f == w32_log2 || f == w32_floor || f == w32_ceil  || f == w32_trunc ||
+           f == w32_round|| f == w32_fabs  || f == w32_atan  || f == w32_asin  ||
+           f == w32_acos || f == w32_sinh  || f == w32_cosh  || f == w32_tanh  ||
+           f == w32_cbrt || f == w32_pow   || f == w32_fmod  || f == w32_atan2 ||
+           f == w32_hypot|| f == w32_ldexp || f == w32_frexp;
+}
 
 /* First shim-table index whose DLL matches `dll` (case-insensitive), or -1. The
  * index doubles as a module token in GetModuleHandleA/GetProcAddress (C9). */

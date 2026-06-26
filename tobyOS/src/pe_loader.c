@@ -232,9 +232,17 @@ static const uint8_t g_win32_gate[] = {
 /* Emit a 10-byte marshalling thunk (`mov eax,idx ; jmp gate`) at `page_off` in
  * the shim page. The jmp is rel32 to the gate at offset 0. Caller holds the
  * uaccess window. */
+/* C20: byte offset of the float-return gate within the shim page (no dependency
+ * on the gate blob, so it can sit ahead of pe_emit_gate_thunk). */
+#define WIN32_FGATE_OFF  ((uint64_t)(WIN32_FGATE_VA - WIN32_SHIM_BASE))
+
 static void pe_emit_gate_thunk(uint64_t page_off, uint32_t idx) {
     uint8_t t[WIN32_THUNK_SIZE];
-    int32_t rel = -(int32_t)(page_off + WIN32_THUNK_SIZE);
+    /* C20: a double-returning shim routes through the float-return gate (which
+     * marshals xmm0..xmm3 and puts the result back in xmm0); everything else
+     * uses the integer gate at offset 0. */
+    uint64_t target_off = win32_shim_is_double_ret((int)idx) ? WIN32_FGATE_OFF : 0;
+    int32_t rel = (int32_t)((int64_t)target_off - (int64_t)(page_off + WIN32_THUNK_SIZE));
     t[0] = 0xB8; memcpy(&t[1], &idx, 4);    /* mov eax, idx */
     t[5] = 0xE9; memcpy(&t[6], &rel, 4);    /* jmp rel32 (gate) */
     memcpy((void *)(WIN32_SHIM_BASE + page_off), t, WIN32_THUNK_SIZE);
@@ -346,6 +354,33 @@ static const uint8_t g_win32_longjmp_stub[] = {
 #define WIN32_SETJMP_OFF   ((uint64_t)(WIN32_SETJMP_STUB_VA  - WIN32_SHIM_BASE))
 #define WIN32_LONGJMP_OFF  ((uint64_t)(WIN32_LONGJMP_STUB_VA - WIN32_SHIM_BASE))
 
+/* C20: the float-return marshalling gate. Like the integer gate, but it also
+ * captures the four MS-x64 FP-arg registers xmm0..xmm3 (as bit patterns) into
+ * the argument array AFTER the four integer regs (so a[0..3]=rcx/rdx/r8/r9 and
+ * a[4..7]=xmm0..xmm3), and after the dispatch syscall returns the result's bit
+ * pattern in rax it does `movq xmm0, rax` so a `double` return lands in xmm0.
+ * A double-returning shim's thunk jmps here (see pe_emit_gate_thunk). Assembled
+ * offline (.tmp_c20/fgate.S -> clang --target=x86_64-elf -> objdump) + verified;
+ * the dispatch imm32 sits at WIN32_FGATE_IMM_OFF.
+ *
+ *   push rdi ; push rsi ; sub rsp,0x40
+ *   mov [rsp+00],rcx ; +08,rdx ; +10,r8 ; +18,r9
+ *   movq [rsp+20],xmm0 ; +28,xmm1 ; +30,xmm2 ; +38,xmm3
+ *   mov rdi,rax ; mov rsi,rsp ; mov eax,<DISPATCH> ; syscall
+ *   movq xmm0,rax ; add rsp,0x40 ; pop rsi ; pop rdi ; ret
+ */
+#define WIN32_FGATE_IMM_OFF 0x38
+static const uint8_t g_win32_fgate[] = {
+    0x57, 0x56, 0x48, 0x83, 0xec, 0x40, 0x48, 0x89, 0x0c, 0x24, 0x48, 0x89,
+    0x54, 0x24, 0x08, 0x4c, 0x89, 0x44, 0x24, 0x10, 0x4c, 0x89, 0x4c, 0x24,
+    0x18, 0x66, 0x0f, 0xd6, 0x44, 0x24, 0x20, 0x66, 0x0f, 0xd6, 0x4c, 0x24,
+    0x28, 0x66, 0x0f, 0xd6, 0x54, 0x24, 0x30, 0x66, 0x0f, 0xd6, 0x5c, 0x24,
+    0x38, 0x48, 0x89, 0xc7, 0x48, 0x89, 0xe6, 0xb8, 0xef, 0xbe, 0xad, 0xde,
+    0x0f, 0x05, 0x66, 0x48, 0x0f, 0x6e, 0xc0, 0x48, 0x83, 0xc4, 0x40, 0x5e,
+    0x5f, 0xc3
+};
+#define WIN32_FGATE_SIZE (sizeof(g_win32_fgate))
+
 static inline uint64_t round_up(uint64_t x, uint64_t a) { return (x + a - 1) & ~(a - 1); }
 
 /* ---- MZ/PE sniff -------------------------------------------------------- */
@@ -415,6 +450,11 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
     uint32_t nr = ABI_SYS_WIN32_DISPATCH;
     memcpy(&gate[WIN32_GATE_IMM_OFF], &nr, 4);
 
+    /* C20: the float-return gate, same dispatch number patched in. */
+    uint8_t fgate[WIN32_FGATE_SIZE];
+    memcpy(fgate, g_win32_fgate, WIN32_FGATE_SIZE);
+    memcpy(&fgate[WIN32_FGATE_IMM_OFF], &nr, 4);
+
     /* Thread wrapper (C6) at its fixed offset, with the thread-exit syscall
      * number patched in. */
     uint8_t wrap[WIN32_WRAPPER_SIZE];
@@ -452,6 +492,13 @@ static bool pe_resolve_imports(uint64_t load_base, const struct pe_data_dir *udi
                    "longjmp stub overruns shim page 0");
     memcpy((void *)(WIN32_SHIM_BASE + WIN32_SETJMP_OFF),  g_win32_setjmp_stub,  WIN32_SETJMP_STUB_SIZE);
     memcpy((void *)(WIN32_SHIM_BASE + WIN32_LONGJMP_OFF), g_win32_longjmp_stub, WIN32_LONGJMP_STUB_SIZE);
+    /* C20: the float-return gate, in the free gap between the dialog trampoline
+     * and the dlgsvc thunk. */
+    _Static_assert(WIN32_DLGTRAMP_OFF + sizeof(g_win32_dlg_tramp) <= WIN32_FGATE_OFF,
+                   "float gate overlaps the dialog trampoline");
+    _Static_assert(WIN32_FGATE_OFF + WIN32_FGATE_SIZE <= WIN32_DLGSVC_THUNK_OFF,
+                   "float gate overruns the dlgsvc thunk slot");
+    memcpy((void *)(WIN32_SHIM_BASE + WIN32_FGATE_OFF), fgate, WIN32_FGATE_SIZE);
     uaccess_end(uf);
 
     int next_thunk = 0;     /* next free thunk slot in the page */

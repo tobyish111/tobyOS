@@ -111,6 +111,18 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
 #define WIN32_SETJMP_STUB_VA     0x0000000030000E00ULL
 #define WIN32_LONGJMP_STUB_VA    0x0000000030000E80ULL
 
+/* C20 (float-return marshalling): the integer gate captures only rcx/rdx/r8/r9 +
+ * stack and returns rax, so a `double`-returning Win32/CRT function (libm sqrt,
+ * sin, pow, ...) gets garbage in xmm0. A SECOND gate captures xmm0..xmm3 (the
+ * MS-x64 FP arg registers) alongside the 4 integer regs into an 8-qword array
+ * (ints a[0..3], doubles-as-bits a[4..7]) and, after the dispatch syscall returns
+ * the result's bit pattern in rax, does `movq xmm0, rax` so the double lands in
+ * xmm0 per the ABI. A double-returning shim's IAT/procaddr thunk jmps here instead
+ * of the integer gate (chosen by win32_shim_is_double_ret). Placed in the free
+ * region between the dialog trampoline (ends ~0x16A) and the dlgsvc thunk (0x1F0);
+ * the 74-byte gate at 0x180 fits with margin. */
+#define WIN32_FGATE_VA           0x0000000030000180ULL
+
 /* C9 (GetProcAddress): the loader pre-generates a marshalling thunk for EVERY
  * kernel-side Win32 shim into a fixed region of the shim page, so GetProcAddress
  * can hand back a real callable CPL3 function pointer for any shim resolved by
@@ -132,6 +144,11 @@ int win32_shim_index(const char *dll, const char *func);
 /* Number of entries in the Win32 shim table (src/syscall.c). The loader emits
  * one procaddr thunk per shim; GetProcAddress bounds its index against this. */
 int win32_shim_count(void);
+
+/* C20: 1 if shim `idx` returns a `double` (in xmm0) and so must be reached
+ * through the float-return gate (WIN32_FGATE_VA) instead of the integer gate.
+ * Defined alongside the shim table in src/syscall.c. */
+int win32_shim_is_double_ret(int idx);
 
 /* The ABI_SYS_WIN32_DISPATCH target: invoke shim `func_index` with the
  * 8-qword argument array at user VA `args_ptr`. Returns the Win32
