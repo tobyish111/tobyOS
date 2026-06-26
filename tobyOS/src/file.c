@@ -41,8 +41,10 @@ static long console_read(void *buf, size_t n) {
 }
 
 static long console_write(const void *buf, size_t n) {
-    const char *cb = (const char *)buf;
-    for (size_t i = 0; i < n; i++) kputc(cb[i]);
+    /* B21/B22: route through the TTY output path so it can answer terminal
+     * queries (ESC[6n cursor-position report) that interactive line editors
+     * issue; every byte still reaches the console + serial. */
+    tty_console_output((const char *)buf, n);
     return (long)n;
 }
 

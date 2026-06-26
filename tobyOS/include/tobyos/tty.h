@@ -106,4 +106,14 @@ long tty_console_read(char *buf, size_t n);
  * Returns 0 on success or a negative ABI errno. Unknown requests -> -ENOTTY. */
 long tty_console_ioctl(unsigned long cmd, unsigned long arg);
 
+/* Console output path: writes every byte to the console + serial, and scans
+ * the output for terminal queries it must answer (ESC[6n cursor-position
+ * report -> pushed into the priority input-reply queue) so interactive line
+ * editors don't block. Backs FILE_KIND_CONSOLE writes. */
+void tty_console_output(const char *buf, size_t n);
+
+/* True if a console read would not block (reply queue / pending cooked line /
+ * keyboard ring non-empty). Used by poll/select on a console fd. */
+bool tty_console_readable(void);
+
 #endif /* TOBYOS_TTY_H */

@@ -357,6 +357,21 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-26** — **Track B milestone B22: a REAL interactive Linux shell — `busybox sh -i` runs a read-eval loop over the B21 TTY.**
+  B21 made the console a controlling TTY; B22 is the payoff: a genuine interactive shell. The blocker turned out to be the
+  **terminal-query handshake** — busybox's line editor writes `ESC[6n` (Device Status Report → cursor position) and *blocks
+  reading the reply*; a raw byte console never answers. Two fixes make it work: (1) `tty_console_output()` (now backing
+  `FILE_KIND_CONSOLE` writes) scans output for `ESC[6n` and pushes a **cursor-position report** (`ESC[<row>;<col>R`, from the
+  console cursor) into a **priority input-reply queue** that reads drain *before* the keyboard ring (served as its own burst so
+  the editor parsing `…R` doesn't also swallow the user's typed line); (2) **poll/select now reports a console fd readable**
+  when input is actually available (reply queue / pending cooked line / keyboard ring — via a new non-destructive `kbd_haschar()`
+  + `tty_console_readable()`), where before a console fd only ever reported `POLLOUT`, so the editor's poll-before-read never woke.
+  **Proof, clean under `+smep,+smap`, 0 faults, 0 unhandled syscalls:** `[LXISH] VERDICT: PASS exit=42` (`logs/b22.sh`) — the
+  harness "types" a two-line session into the keyboard ring (`busybox true` ⏎ then `exit $(busybox echo 42)` ⏎) and spawns
+  `busybox sh -i`; the shell answers the `ESC[6n` query, reads **both** lines from the TTY in its interactive loop, runs the
+  command substitution (fork+exec `busybox echo`, captures `42`) and exits with it — proving an end-to-end interactive
+  read-eval loop over the console, not just `sh -c`. **No regression:** full Linux-track battery green
+  (`LXABI/LXSIG/LXMMAP/LXTHREAD/LXJOIN/LXPOLL/LXAUTO/LXSAUTO`, + `LXPROCFS`/`LXTTY` standalone), busybox file battery `[LXBB] PASS 10/10`.
 - **2026-06-26** — **Track B milestone B21: the console is a real controlling TTY — Linux `termios` + a cooked line discipline.**
   Before B21 the console was a raw byte pipe and `ioctl` always returned `ENOTTY`, so a Linux libc decided stdin/stdout were
   *not* a terminal — `isatty()==0` → fully buffered, no line editing, no way to set raw mode. That blocks interactive Linux

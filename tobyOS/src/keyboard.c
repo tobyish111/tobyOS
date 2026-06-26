@@ -95,12 +95,16 @@
      g_head = next;
  }
 
- int kbd_trygetc(void) {
-     if (g_head == g_tail) return -1;
-     char c = (char)g_buf[g_tail];
-     g_tail = (uint8_t)((g_tail + 1u) & (KBD_BUF_SIZE - 1u));
-     return (uint8_t)c;
- }
+int kbd_trygetc(void) {
+    if (g_head == g_tail) return -1;
+    char c = (char)g_buf[g_tail];
+    g_tail = (uint8_t)((g_tail + 1u) & (KBD_BUF_SIZE - 1u));
+    return (uint8_t)c;
+}
+
+bool kbd_haschar(void) {
+    return g_head != g_tail;
+}
  
  int kbd_getc(void) {
      int c;

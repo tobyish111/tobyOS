@@ -24,6 +24,27 @@ static char   g_line[TTY_LINE_MAX];
 static size_t g_line_len;   /* bytes of a completed line waiting */
 static size_t g_line_pos;   /* delivered so far */
 
+/* Priority input-reply queue. Terminal query responses the TTY generates
+ * itself (e.g. the cursor-position report answering ESC[6n) are pushed here
+ * and consumed by reads BEFORE the keyboard ring, so an interactive line
+ * editor that does "write ESC[6n; read the reply" gets its answer ahead of
+ * any user keystrokes already queued. */
+#define TTY_REPLY_MAX 32
+static char   g_reply[TTY_REPLY_MAX];
+static size_t g_reply_len;
+static size_t g_reply_pos;
+
+/* Output escape-sequence scanner state (persisted across console writes). */
+static int  g_esc_state;            /* 0 normal, 1 saw ESC, 2 inside CSI */
+static char g_csi[16];
+static int  g_csi_len;
+
+/* Next input byte: priority reply queue first, then the keyboard ring. */
+static int tty_input_next(void) {
+    if (g_reply_pos < g_reply_len) return (unsigned char)g_reply[g_reply_pos++];
+    return kbd_trygetc();
+}
+
 void tty_init(void) {
     if (g_inited) return;
     memset(&g_tio, 0, sizeof(g_tio));
@@ -92,12 +113,12 @@ bool tty_handle_isig(char c) {
 /* ---- blocking single-char fetch from the keyboard ring ---------------- */
 /* Returns 0..255, or <0 to mean "interrupted by a signal" (EINTR). */
 static int getc_block(void) {
-    int c = kbd_trygetc();
+    int c = tty_input_next();
     while (c < 0) {
         if (signal_pending_self()) return -1;
         sti();
         hlt();
-        c = kbd_trygetc();
+        c = tty_input_next();
     }
     return c;
 }
@@ -170,8 +191,17 @@ static long raw_read(char *buf, size_t n) {
     if (vmin == 0) vmin = 1;          /* we don't model VTIME timers */
     size_t got = 0;
 
+    /* Serve any priority reply (e.g. a CPR answering ESC[6n) as its OWN read
+     * burst -- don't spill into real keyboard input in the same call, so a
+     * line editor parsing "ESC[...R" doesn't also swallow the user's typed
+     * line. */
+    if (g_reply_pos < g_reply_len) {
+        while (got < n && g_reply_pos < g_reply_len) buf[got++] = g_reply[g_reply_pos++];
+        return (long)got;
+    }
+
     while (got < n) {
-        int c = kbd_trygetc();
+        int c = tty_input_next();
         if (c < 0) {
             if (got >= vmin) break;   /* VMIN satisfied */
             if (signal_pending_self()) return got ? (long)got : EINTR_RET;
@@ -192,10 +222,21 @@ long tty_console_read(char *buf, size_t n) {
     return raw_read(buf, n);
 }
 
+bool tty_console_readable(void) {
+    /* For poll/select on a console fd: input is available if a terminal-query
+     * reply is queued, a cooked line is pending delivery, or the keyboard ring
+     * has bytes. (We report readiness on any byte even in canonical mode --
+     * close enough for interactive use, which runs in raw mode anyway.) */
+    if (g_reply_pos < g_reply_len) return true;
+    if (g_line_pos < g_line_len) return true;
+    return kbd_haschar();
+}
+
 /* ---- ioctl ------------------------------------------------------------ */
 
 static void flush_input(void) {
     g_line_len = g_line_pos = 0;
+    g_reply_len = g_reply_pos = 0;
     while (kbd_trygetc() >= 0) { /* drain the keyboard ring */ }
 }
 
@@ -272,5 +313,64 @@ long tty_console_ioctl(unsigned long cmd, unsigned long arg) {
 
     default:
         return -ABI_ENOTTY;
+    }
+}
+
+/* ---- console output processing (terminal query replies) --------------- */
+
+/* Push the cursor-position report (CPR) answering an ESC[6n query into the
+ * priority reply queue: ESC [ <row> ; <col> R, 1-based, from the console
+ * cursor. An interactive line editor (busybox ash, readline, ...) does
+ * "write ESC[6n; read until 'R'" to locate itself; without this reply it
+ * blocks forever. */
+static void enqueue_cpr(void) {
+    uint32_t col = 0, row = 0;
+    console_get_cursor(&col, &row);
+    unsigned r = row + 1, c = col + 1;
+    char rep[TTY_REPLY_MAX];
+    int n = 0;
+    rep[n++] = 0x1b; rep[n++] = '[';
+    char tmp[8]; int t = 0;
+    if (r == 0) tmp[t++] = '0'; else { unsigned v = r; while (v) { tmp[t++] = (char)('0' + v % 10); v /= 10; } }
+    while (t > 0) rep[n++] = tmp[--t];
+    rep[n++] = ';';
+    t = 0;
+    if (c == 0) tmp[t++] = '0'; else { unsigned v = c; while (v) { tmp[t++] = (char)('0' + v % 10); v /= 10; } }
+    while (t > 0) rep[n++] = tmp[--t];
+    rep[n++] = 'R';
+    /* Overwrite any stale reply (a prior query is always fully consumed
+     * before the next one is issued). */
+    for (int i = 0; i < n; i++) g_reply[i] = rep[i];
+    g_reply_len = (size_t)n;
+    g_reply_pos = 0;
+}
+
+void tty_console_output(const char *buf, size_t n) {
+    ensure_init();
+    for (size_t i = 0; i < n; i++) {
+        char c = buf[i];
+        kputc(c);   /* pass every byte through to the console + serial */
+
+        switch (g_esc_state) {
+        case 0:
+            if (c == 0x1b) g_esc_state = 1;
+            break;
+        case 1:
+            if (c == '[') { g_esc_state = 2; g_csi_len = 0; }
+            else g_esc_state = 0;
+            break;
+        case 2:
+            if (c >= '0' && c <= '9') {
+                if (g_csi_len < (int)sizeof(g_csi)) g_csi[g_csi_len++] = c;
+            } else {
+                /* final byte: answer Device Status Report -> cursor position
+                 * (ESC[6n). ESC[5n (device OK) -> ESC[0n. */
+                if (c == 'n' && g_csi_len == 1 && g_csi[0] == '6') {
+                    enqueue_cpr();
+                }
+                g_esc_state = 0;
+            }
+            break;
+        }
     }
 }

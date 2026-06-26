@@ -10,6 +10,9 @@ void kbd_init(void);
 /* Returns the next ASCII char (0..255) or -1 if the buffer is empty. */
 int  kbd_trygetc(void);
 
+/* Non-destructive: true if the input ring has at least one byte. */
+bool kbd_haschar(void);
+
 /* Blocks until a char is available. Requires interrupts enabled. */
 int  kbd_getc(void);
 

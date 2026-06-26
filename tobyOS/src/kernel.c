@@ -5774,6 +5774,47 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXISH_BOOT
+    /* Track B/B22: a REAL INTERACTIVE Linux shell. Now that B21 made the
+     * console a controlling TTY (isatty(0) is true, termios works, reads are
+     * cooked), busybox `sh -i` runs interactively: it reads command LINES from
+     * the console, runs each, and loops -- exactly what a person at a terminal
+     * does. We "type" a two-line session by injecting it into the keyboard
+     * ring before spawning (kbd_inject_raw bypasses the GUI key gate):
+     *
+     *     busybox true                      <- line 1: an interactive command
+     *     exit $(busybox echo 42)           <- line 2: cmd-substitution -> exit
+     *
+     * If the shell read BOTH lines from the TTY, ran the command substitution
+     * (fork+exec busybox echo, captured "42"), and exited with it, proc_wait
+     * returns 42 -- proving an end-to-end interactive read loop over the new
+     * TTY, not just `sh -c`. Opt-in: needs the static busybox staged. */
+    {
+        const char *session = "busybox true\nexit $(busybox echo 42)\n";
+        for (const char *p = session; *p; p++) kbd_inject_raw(*p);
+
+        char *argv[] = { (char *)"sh", (char *)"-i", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"PS1=$ ", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/busybox", .name = "sh",
+            .argc = 2, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] LXISH: spawning interactive `busybox sh -i` "
+                "(injected a 2-line session)\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LXISH: /bin/busybox not present -- SKIPPED\n");
+            kprintf("[LXISH] VERDICT: SKIP reason=no-busybox\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] LXISH: interactive sh (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[LXISH] VERDICT: %s exit=%d (interactive read loop over the "
+                    "TTY + cmd-substitution; expect 42)\n",
+                    rc == 42 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef XPIPE_BOOT
     /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
      * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux

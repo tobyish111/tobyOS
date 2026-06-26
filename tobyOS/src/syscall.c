@@ -3161,7 +3161,11 @@ static short file_poll_ready(struct file *f) {
             if (f->sock && f->sock->count > 0) r |= LXP_POLLIN;  /* rx queued */
         }
         break;
-    default:                                 /* console/term/window/etc. */
+    case FILE_KIND_CONSOLE:                  /* B22: real TTY input readiness */
+        r |= LXP_POLLOUT;                    /* always writable */
+        if (tty_console_readable()) r |= LXP_POLLIN;
+        break;
+    default:                                 /* term/window/etc. */
         r |= LXP_POLLOUT;                    /* writable; input best-effort */
         break;
     }
