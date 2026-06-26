@@ -5243,6 +5243,38 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE23_BOOT
+    /* Track C -- wide-char / Unicode (UTF-16) W APIs, milestone C23. Build
+     * EXTRA_CFLAGS+=-DWINPE23_BOOT. /bin/win-wide23.exe is a clang/ucrt PE
+     * (built like win-printf21, so the wprintf/swprintf family routes to the
+     * ucrt wide stdio primitives __stdio_common_vfwprintf/vswprintf -> the
+     * kernel win32_wvformat engine). It exercises the wide CRT string family
+     * (wcscpy/cat/cmp/ncmp/chr/rchr/len), swprintf into a wide buffer, wprintf
+     * + the narrow printf %ls path, and fputws/_putws -- exiting 23 ONLY if
+     * every wide-string result matched (else a 9x code pinpoints the step). */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE23: spawning /bin/win-wide23.exe (wide-char W APIs)\n");
+        char *argv[] = { (char *)"win-wide23.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-wide23.exe", .name = "win-wide23.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE23] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE23: /bin/win-wide23.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE23] VERDICT: %s exit=%d (expect 23; wide CRT string + "
+                    "wprintf/swprintf + %%ls + fputws)\n",
+                    rc == 23 ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery

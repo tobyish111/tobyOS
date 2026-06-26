@@ -3857,10 +3857,28 @@ static long win32_fd_write(int fd, const char *buf, size_t len) {
     return file_write(f, buf, len);
 }
 
-/* Chunked output sink for the formatter: accumulate then flush. */
-struct win32_fmtbuf { int fd; size_t n; long total; char buf[256]; };
+/* C23: UTF-16 (user) -> narrow (kernel) string, defined later; the printf
+ * core uses it for %ls/%S. */
+static int win32_wstr_to_k(uint64_t uwide, char *out, int cap);
+
+/* Chunked output sink for the formatter: accumulate then flush. Two modes:
+ *   fd >= 0  -> flush to that file descriptor (printf/fprintf/wprintf).
+ *   fd <  0  -> CAPTURE into cap[0..cap_max) (sprintf/swprintf); `total`
+ *               still counts every char attempted, so the return value is the
+ *               would-be length even when the buffer truncates. */
+struct win32_fmtbuf {
+    int fd; size_t n; long total; char buf[256];
+    char  *cap; size_t cap_n, cap_max;
+};
 static void fb_flush(struct win32_fmtbuf *fb) {
-    if (fb->n) { win32_fd_write(fb->fd, fb->buf, fb->n); fb->n = 0; }
+    if (!fb->n) return;
+    if (fb->fd >= 0) {
+        win32_fd_write(fb->fd, fb->buf, fb->n);
+    } else if (fb->cap) {
+        for (size_t i = 0; i < fb->n && fb->cap_n < fb->cap_max; i++)
+            fb->cap[fb->cap_n++] = fb->buf[i];
+    }
+    fb->n = 0;
 }
 static void fb_putc(struct win32_fmtbuf *fb, char c) {
     if (fb->n == sizeof(fb->buf)) fb_flush(fb);
@@ -3906,15 +3924,14 @@ static void emit_field(struct win32_fmtbuf *fb, const char *pre, int pl,
 
 #define WIN32_FMT_MAX  4096
 
-/* The printf engine. Reads the format string + variadic args from user
- * memory and writes the rendered output to `fd`. Returns chars written. */
-static long win32_vformat(int fd, uint64_t ufmt, uint64_t uva) {
-    char fmt[1024];
-    long fl = strncpy_from_user(fmt, (const char *)(uintptr_t)ufmt, sizeof(fmt));
-    if (fl < 0) return -1;
-    fmt[sizeof(fmt) - 1] = '\0';
-
-    struct win32_fmtbuf fb = { .fd = fd, .n = 0, .total = 0 };
+/* The printf engine core. Renders a KERNEL format string `fmt` + the user
+ * variadic block `uva` into either `fd` (>=0) or a capture buffer `cap`
+ * (cap_max bytes, used when fd<0). Returns chars written (the would-be
+ * length in capture mode, even if `cap` truncates). */
+static long win32_format_core(int fd, char *cap, size_t cap_max,
+                              const char *fmt, uint64_t uva) {
+    struct win32_fmtbuf fb = { .fd = fd, .n = 0, .total = 0,
+                               .cap = cap, .cap_n = 0, .cap_max = cap_max };
     int ai = 0;
     const char *p = fmt;
 
@@ -3949,9 +3966,11 @@ static long win32_vformat(int fd, uint64_t ufmt, uint64_t uva) {
 
         /* Length. NOTE: Windows `long` is 32-bit, so a single 'l' stays
          * 32-bit; only 'll'/'I64'/'z'/'j'/'t' are 64-bit. */
-        bool wide = false;
-        if (*p == 'l') { p++; if (*p == 'l') { wide = true; p++; } }
-        else if (*p == 'h') { p++; if (*p == 'h') p++; }
+        bool wide = false;       /* 64-bit integer conversion */
+        bool lmod = false;       /* 'l' length modifier seen (-> wide str/char) */
+        bool hmod = false;       /* 'h' length modifier seen (-> narrow str/char) */
+        if (*p == 'l') { lmod = true; p++; if (*p == 'l') { wide = true; p++; } }
+        else if (*p == 'h') { hmod = true; p++; if (*p == 'h') p++; }
         else if (*p == 'L') { p++; }            /* long double == double on Windows */
         else if (*p == 'z' || *p == 'j' || *p == 't') { wide = true; p++; }
         else if (*p == 'I') {
@@ -3999,19 +4018,32 @@ static long win32_vformat(int fd, uint64_t ufmt, uint64_t uva) {
             emit_field(&fb, pre, pl, numbody, bl, width, left, zero && prec < 0);
             break;
         }
+        case 'C':                 /* C23: %C == wide char in a narrow printf */
         case 'c': {
-            char ch = (char)va_next(uva, &ai);
+            /* Wide when the conversion is %C, or %lc. The arg occupies one
+             * va slot either way; for a wide char we down-convert U+0000..7F
+             * to ASCII (others -> '?'), matching our UTF-16<->ASCII policy. */
+            bool wch = (conv == 'C') || lmod;
+            uint64_t raw = va_next(uva, &ai);
+            char ch = wch ? ((raw < 0x80) ? (char)raw : '?') : (char)raw;
             emit_field(&fb, pre, 0, &ch, 1, width, left, false);
             break;
         }
+        case 'S':                 /* C23: %S == wide string in a narrow printf */
         case 's': {
+            /* Wide when the conversion is %S, or %ls (and not %hs). */
+            bool wstr = (conv == 'S') || (lmod && !hmod);
             uint64_t sp = va_next(uva, &ai);
             char sbuf[1024];
             int sl = 0;
             if (sp) {
-                long n = strncpy_from_user(sbuf, (const char *)(uintptr_t)sp, sizeof(sbuf));
-                if (n < 0) { const char *bad = "(badptr)"; fb_write(&fb, bad, 8); break; }
-                sl = (n >= (long)sizeof(sbuf)) ? (int)sizeof(sbuf) - 1 : (int)n;
+                if (wstr) {
+                    sl = win32_wstr_to_k(sp, sbuf, sizeof(sbuf));
+                } else {
+                    long n = strncpy_from_user(sbuf, (const char *)(uintptr_t)sp, sizeof(sbuf));
+                    if (n < 0) { const char *bad = "(badptr)"; fb_write(&fb, bad, 8); break; }
+                    sl = (n >= (long)sizeof(sbuf)) ? (int)sizeof(sbuf) - 1 : (int)n;
+                }
             } else {
                 const char *nul = "(null)";
                 emit_field(&fb, pre, 0, nul, 6, width, left, false);
@@ -4050,6 +4082,84 @@ static long win32_vformat(int fd, uint64_t ufmt, uint64_t uva) {
     return fb.total;
 }
 
+/* The classic narrow printf engine: copy the user format string into the
+ * kernel, then run the core writing to `fd`. Returns chars written. */
+static long win32_vformat(int fd, uint64_t ufmt, uint64_t uva) {
+    char fmt[1024];
+    long fl = strncpy_from_user(fmt, (const char *)(uintptr_t)ufmt, sizeof(fmt));
+    if (fl < 0) return -1;
+    fmt[sizeof(fmt) - 1] = '\0';
+    return win32_format_core(fd, 0, 0, fmt, uva);
+}
+
+/* C23: narrow sprintf core -> capture into a kernel buffer (then the caller
+ * copies it out, narrow or wide). cap_max counts bytes incl. the NUL we add. */
+static long win32_sformat(char *cap, size_t cap_max, uint64_t ufmt, uint64_t uva) {
+    char fmt[1024];
+    long fl = strncpy_from_user(fmt, (const char *)(uintptr_t)ufmt, sizeof(fmt));
+    if (fl < 0) return -1;
+    fmt[sizeof(fmt) - 1] = '\0';
+    if (cap_max == 0) return win32_format_core(-1, 0, 0, fmt, uva); /* length probe */
+    long t = win32_format_core(-1, cap, cap_max - 1, fmt, uva);
+    size_t end = (size_t)t < cap_max - 1 ? (size_t)t : cap_max - 1;
+    cap[end] = '\0';
+    return t;
+}
+
+/* C23: wide printf engine. The wide CRT format string is UTF-16; transcode it
+ * to a narrow format string, rewriting the string/char conversions to their
+ * wide form so win32_format_core reads the args correctly:
+ *   %s / %c  (default WIDE in the wide CRT) -> %ls / %lc
+ *   %hs/ %hc (explicit narrow)              -> %s  / %c
+ *   %S / %C  (explicit narrow in wide CRT)  -> %s  / %c
+ * Everything else (flags/width/precision/numeric conversions) is copied
+ * verbatim. The args themselves are unchanged -- only how the core reads %s. */
+static int win32_wfmt_transcode(uint64_t uwfmt, char *out, int cap) {
+    int oi = 0;
+    for (uint64_t wi = 0; oi < cap - 1; wi++) {
+        uint16_t wc = 0;
+        if (copy_from_user(&wc, (const void *)(uintptr_t)(uwfmt + wi * 2), 2) != 0) break;
+        if (wc == 0) break;
+        char c = (wc < 0x80) ? (char)wc : '?';
+        if (c != '%') { out[oi++] = c; continue; }
+        out[oi++] = '%';
+        /* copy the rest of the spec, tracking h/l, until the conversion char */
+        bool hmod = false, lmod = false;
+        for (;;) {
+            uint16_t nw = 0;
+            if (copy_from_user(&nw, (const void *)(uintptr_t)(uwfmt + (++wi) * 2), 2) != 0) { out[oi] = 0; return oi; }
+            if (nw == 0) { out[oi] = 0; return oi; }
+            char nc = (nw < 0x80) ? (char)nw : '?';
+            if (nc == 'h') { hmod = true; if (oi < cap - 1) out[oi++] = nc; continue; }
+            if (nc == 'l' || nc == 'L' || nc == 'w') { lmod = true; if (oi < cap - 1) out[oi++] = nc; continue; }
+            if (nc == 'j' || nc == 'z' || nc == 't' || nc == 'I' ||
+                nc == '0' || (nc >= '1' && nc <= '9') || nc == '.' || nc == '*' ||
+                nc == '-' || nc == '+' || nc == ' ' || nc == '#') {
+                if (oi < cap - 1) out[oi++] = nc; continue;
+            }
+            /* conversion char */
+            if (nc == 's' || nc == 'c') {
+                if (!hmod && !lmod && oi < cap - 1) out[oi++] = 'l';  /* default wide */
+                if (oi < cap - 1) out[oi++] = nc;
+            } else if (nc == 'S' || nc == 'C') {
+                if (oi < cap - 1) out[oi++] = (nc == 'S') ? 's' : 'c';  /* narrow */
+            } else {
+                if (oi < cap - 1) out[oi++] = nc;
+            }
+            break;
+        }
+    }
+    out[oi] = 0;
+    return oi;
+}
+
+/* wprintf/fwprintf family -> fd. */
+static long win32_wvformat(int fd, uint64_t uwfmt, uint64_t uva) {
+    char fmt[1024];
+    win32_wfmt_transcode(uwfmt, fmt, sizeof(fmt));
+    return win32_format_core(fd, 0, 0, fmt, uva);
+}
+
 /* api-ms-win-crt-stdio-l1-1-0.dll!__acrt_iob_func(unsigned index) -> FILE*.
  * Returns an opaque token encoding the std fd; __stdio_common_vfprintf (also
  * a shim) decodes it. index 0/1/2 = stdin/stdout/stderr. */
@@ -4082,6 +4192,84 @@ static long w32_puts(uint64_t *args) {
     win32_fd_write(1, s, (size_t)n);
     win32_fd_write(1, "\n", 1);
     return n + 1;
+}
+
+/* ============================================================
+ * C23: wide (UTF-16) stdio. The wprintf family funnels through ucrt's
+ * __stdio_common_vfwprintf (-> fd) and __stdio_common_vswprintf (-> wide
+ * buffer); fputws/_putws/fputwc/putwchar emit a wide string/char. All
+ * down-convert U+0000..7F to ASCII (others '?'), matching the kernel's
+ * UTF-16<->ASCII policy used everywhere else in the Win32 layer.
+ * ============================================================ */
+
+/* __stdio_common_vfwprintf(opts, FILE* stream, const wchar_t* fmt, loc, va). */
+static long w32_stdio_common_vfwprintf(uint64_t *args) {
+    uint64_t stream = args[1];
+    uint64_t uwfmt  = args[2];
+    uint64_t uva    = args[4];
+    int fd = 1;
+    if ((stream & 0xFFFFFF00ULL) == WIN32_IOB_TAG) fd = (int)(stream & 0xFF);
+    if (!uwfmt) return -1;
+    return win32_wvformat(fd, uwfmt, uva);
+}
+
+/* __stdio_common_vswprintf(opts, wchar_t* buf, size_t count, const wchar_t* fmt,
+ *     loc, va). Renders into a UTF-16 buffer of `count` code units (incl NUL).
+ * Returns code units written excl. NUL, or -1 if it didn't fit (ucrt-ish). */
+static long w32_stdio_common_vswprintf(uint64_t *args) {
+    uint64_t ubuf  = args[1];
+    uint64_t count = args[2];
+    uint64_t uwfmt = args[3];
+    uint64_t uva   = args[5];
+    char fmt[1024];
+    win32_wfmt_transcode(uwfmt, fmt, sizeof(fmt));
+    char tmp[1024];
+    long t = win32_format_core(-1, tmp, sizeof(tmp) - 1, fmt, uva);
+    size_t n = ((size_t)t < sizeof(tmp) - 1) ? (size_t)t : sizeof(tmp) - 1;
+    if (ubuf && count > 0) {
+        size_t maxc = (size_t)count - 1;          /* leave room for NUL */
+        size_t w = n < maxc ? n : maxc;
+        for (size_t i = 0; i < w; i++) {
+            uint16_t wc = (uint16_t)(uint8_t)tmp[i];
+            (void)copy_to_user((void *)(uintptr_t)(ubuf + i * 2), &wc, 2);
+        }
+        uint16_t z = 0;
+        (void)copy_to_user((void *)(uintptr_t)(ubuf + w * 2), &z, 2);
+    }
+    return t;
+}
+
+/* fputws(const wchar_t* ws, FILE* stream) -> >=0 / WEOF. */
+static long w32_fputws(uint64_t *a) {
+    uint64_t stream = a[1];
+    int fd = 1;
+    if ((stream & 0xFFFFFF00ULL) == WIN32_IOB_TAG) fd = (int)(stream & 0xFF);
+    char s[1024];
+    int n = win32_wstr_to_k(a[0], s, sizeof(s));
+    win32_fd_write(fd, s, (size_t)n);
+    return n;
+}
+/* _putws(const wchar_t* ws): fputws to stdout + newline. */
+static long w32_putws(uint64_t *a) {
+    char s[1024];
+    int n = win32_wstr_to_k(a[0], s, sizeof(s));
+    win32_fd_write(1, s, (size_t)n);
+    win32_fd_write(1, "\n", 1);
+    return n + 1;
+}
+/* fputwc(wchar_t c, FILE* stream) / putwchar(wchar_t c). */
+static long w32_fputwc(uint64_t *a) {
+    uint64_t wc = a[0]; uint64_t stream = a[1];
+    int fd = 1;
+    if ((stream & 0xFFFFFF00ULL) == WIN32_IOB_TAG) fd = (int)(stream & 0xFF);
+    char c = (wc < 0x80) ? (char)wc : '?';
+    win32_fd_write(fd, &c, 1);
+    return (long)(uint16_t)wc;
+}
+static long w32_putwchar(uint64_t *a) {
+    char c = (a[0] < 0x80) ? (char)a[0] : '?';
+    win32_fd_write(1, &c, 1);
+    return (long)(uint16_t)a[0];
 }
 
 /* ============================================================
@@ -4325,6 +4513,74 @@ static long w32_wcslen(uint64_t *a) {
         if (w == 0) return n;
     }
     return 65536;
+}
+
+/* ---- C23: wide (UTF-16) string CRT. All operate directly on user UTF-16
+ * buffers via copy_{from,to}_user, comparing/copying 16-bit code units. ---- */
+static inline uint16_t wld(uint64_t p, uint64_t i) {           /* load wchar[i] */
+    uint16_t w = 0; (void)copy_from_user(&w, (const void *)(uintptr_t)(p + i * 2), 2); return w;
+}
+static inline void wst(uint64_t p, uint64_t i, uint16_t w) {   /* store wchar[i] */
+    (void)copy_to_user((void *)(uintptr_t)(p + i * 2), &w, 2);
+}
+/* wcscmp(a,b) / wcsncmp(a,b,n): lexicographic compare of code units. */
+static long w32_wcscmp(uint64_t *a) {
+    for (uint64_t i = 0; i < 65536; i++) {
+        uint16_t x = wld(a[0], i), y = wld(a[1], i);
+        if (x != y) return (x < y) ? -1 : 1;
+        if (x == 0) return 0;
+    }
+    return 0;
+}
+static long w32_wcsncmp(uint64_t *a) {
+    uint64_t n = a[2];
+    for (uint64_t i = 0; i < n; i++) {
+        uint16_t x = wld(a[0], i), y = wld(a[1], i);
+        if (x != y) return (x < y) ? -1 : 1;
+        if (x == 0) return 0;
+    }
+    return 0;
+}
+/* wcscpy(dst,src) -> dst. */
+static long w32_wcscpy(uint64_t *a) {
+    uint64_t i = 0;
+    for (; i < 65536; i++) { uint16_t w = wld(a[1], i); wst(a[0], i, w); if (w == 0) break; }
+    return (long)a[0];
+}
+/* wcsncpy(dst,src,n) -> dst (pads with NULs, no NUL-term if src longer). */
+static long w32_wcsncpy(uint64_t *a) {
+    uint64_t n = a[2]; bool end = false;
+    for (uint64_t i = 0; i < n; i++) {
+        uint16_t w = end ? 0 : wld(a[1], i);
+        if (w == 0) end = true;
+        wst(a[0], i, w);
+    }
+    return (long)a[0];
+}
+/* wcscat(dst,src) -> dst. */
+static long w32_wcscat(uint64_t *a) {
+    uint64_t d = 0; while (d < 65536 && wld(a[0], d) != 0) d++;
+    for (uint64_t i = 0; i < 65536; i++) { uint16_t w = wld(a[1], i); wst(a[0], d + i, w); if (w == 0) break; }
+    return (long)a[0];
+}
+/* wcschr(s,c) / wcsrchr(s,c) -> pointer to match or NULL. */
+static long w32_wcschr(uint64_t *a) {
+    uint16_t c = (uint16_t)a[1];
+    for (uint64_t i = 0; i < 65536; i++) {
+        uint16_t w = wld(a[0], i);
+        if (w == c) return (long)(a[0] + i * 2);
+        if (w == 0) return 0;
+    }
+    return 0;
+}
+static long w32_wcsrchr(uint64_t *a) {
+    uint16_t c = (uint16_t)a[1]; long hit = 0;
+    for (uint64_t i = 0; i < 65536; i++) {
+        uint16_t w = wld(a[0], i);
+        if (w == c) hit = (long)(a[0] + i * 2);
+        if (w == 0) break;
+    }
+    return hit;
 }
 
 /* ---- C5: file I/O via real HANDLE<->fd mapping ----
@@ -9454,6 +9710,14 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__acrt_iob_func",          w32_acrt_iob_func },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfprintf",  w32_stdio_common_vfprintf },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "puts",                     w32_puts },
+    /* C23: wide (UTF-16) stdio. */
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfwprintf", w32_stdio_common_vfwprintf },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vswprintf", w32_stdio_common_vswprintf },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vswprintf_s", w32_stdio_common_vswprintf },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fputws",                   w32_fputws },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "_putws",                   w32_putws },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "fputwc",                   w32_fputwc },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "putwchar",                 w32_putwchar },
 
     /* ---- C3: the rest of the stock-clang mainCRTStartup surface ---- */
     /* kernel32. The critical-section funcs are REAL as of C6 (mutual
@@ -9561,6 +9825,15 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-string-l1-1-0.dll", "strnlen",                 w32_strnlen },
     { "api-ms-win-crt-string-l1-1-0.dll", "wcslen",                  w32_wcslen },
     { "api-ms-win-crt-string-l1-1-0.dll", "wcsnlen",                 w32_wcslen },
+    /* C23: wide (UTF-16) string CRT. */
+    { "api-ms-win-crt-string-l1-1-0.dll", "wcscmp",                  w32_wcscmp },
+    { "api-ms-win-crt-string-l1-1-0.dll", "wcsncmp",                 w32_wcsncmp },
+    { "api-ms-win-crt-string-l1-1-0.dll", "wcscpy",                  w32_wcscpy },
+    { "api-ms-win-crt-string-l1-1-0.dll", "wcscpy_s",                w32_wcscpy },
+    { "api-ms-win-crt-string-l1-1-0.dll", "wcsncpy",                 w32_wcsncpy },
+    { "api-ms-win-crt-string-l1-1-0.dll", "wcscat",                  w32_wcscat },
+    { "api-ms-win-crt-string-l1-1-0.dll", "wcschr",                  w32_wcschr },
+    { "api-ms-win-crt-string-l1-1-0.dll", "wcsrchr",                 w32_wcsrchr },
 
     /* ---- C5: file I/O (kernel32) ---- */
     { "kernel32.dll", "CreateFileA",  w32_CreateFileA },
@@ -9927,12 +10200,33 @@ static bool win32_dll_eq(const char *a, const char *b) {
     }
 }
 
+/* True if `dll` is a ucrt api-set stub ("api-ms-win-crt-..."), case-insensitive. */
+static bool win32_is_apiset_crt(const char *dll) {
+    const char *pfx = "api-ms-win-crt-";
+    for (int i = 0; pfx[i]; i++) {
+        char c = dll[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (c != pfx[i]) return false;
+    }
+    return true;
+}
+
 int win32_shim_index(const char *dll, const char *func) {
     if (!dll || !func) return -1;
     for (int i = 0; i < WIN32_SHIM_COUNT; i++) {
         if (win32_dll_eq(dll, g_win32_shims[i].dll) &&
             strcmp(func, g_win32_shims[i].func) == 0)
             return i;
+    }
+    /* C23: ucrt forwards the same CRT function through several api-ms-win-crt-*
+     * api-set stub DLLs (e.g. wcschr imports from -private-l1 in one build,
+     * -string-l1 in another). If an api-ms-win-crt-* import didn't match by
+     * exact DLL, fall back to a name-only match against any -crt-* shim. */
+    if (win32_is_apiset_crt(dll)) {
+        for (int i = 0; i < WIN32_SHIM_COUNT; i++)
+            if (win32_is_apiset_crt(g_win32_shims[i].dll) &&
+                strcmp(func, g_win32_shims[i].func) == 0)
+                return i;
     }
     return -1;
 }

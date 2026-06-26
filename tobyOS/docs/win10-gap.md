@@ -357,6 +357,28 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-26** — **Track C milestone C23: wide-char / Unicode (UTF-16) — wide CRT strings, the `wprintf` family, and `%ls`.**
+  Real Windows programs lean on `wchar_t`/UTF-16 (`wmain`, `wprintf`, `wcs*`, the `…W` APIs). The `…W` file APIs
+  (`CreateFileW`, `WriteConsoleW`, `MultiByteToWideChar`, …) already worked, but the **wide CRT** was a near-total gap
+  (only `wcslen`). Added, all operating on UTF-16 directly (down-converting U+0000–7F to ASCII, others `?`, matching the
+  layer's existing policy): the **wide string family** `wcscmp`/`wcsncmp`/`wcscpy`/`wcsncpy`/`wcscat`/`wcschr`/`wcsrchr`;
+  **wide stdio** `fputws`/`_putws`/`fputwc`/`putwchar`; and the **wide `printf` family** — `wprintf`/`fwprintf` route to
+  ucrt's `__stdio_common_vfwprintf` and `swprintf`/`_snwprintf` to `__stdio_common_vswprintf`, both shimmed kernel-side.
+  The wide formatter **reuses the narrow engine**: `win32_vformat` was refactored into a `win32_format_core` with a
+  sink that targets either an fd or a capture buffer (so `sprintf`/`swprintf` capture), and the wide path **transcodes**
+  the UTF-16 format string to a narrow one, rewriting the string/char conversions to their wide form (`%s`/`%c` →
+  `%ls`/`%lc`; `%hs`/`%S` → narrow) so the core reads each vararg correctly. The narrow engine itself also gained
+  `%ls`/`%S`/`%lc`/`%C` (wide string/char in a *narrow* `printf`, common in mixed-mode code). Also made shim resolution
+  robust to ucrt **api-set forwarding**: an `api-ms-win-crt-*` import that misses an exact-DLL match now falls back to a
+  name-only match against any `-crt-*` shim (e.g. `wcschr` imports from `-private-l1` in this build, `-string-l1` in
+  another). **Proof, clean under `+smep,+smap`, 0 faults, no unresolved imports:** `[WINPE23] VERDICT: PASS exit=23` —
+  first-party `win-wide23.exe` (built like `win-printf21`, `-D__USE_MINGW_ANSI_STDIO=0` so the wide stdio routes to the
+  ucrt primitives → the kernel engine, confirmed via its import table) builds `L"Hello, wide"` with `wcscpy`/`wcscat`,
+  validates it with `wcscmp`/`wcsncmp`/`wcschr`/`wcsrchr`/`wcslen`, `swprintf`s into a wide buffer and checks the code
+  units, then emits via `wprintf` (`%ls`/`%d`/wide `%c`), narrow `printf("%ls")`, `fputws`, and `_putws` — exiting 23
+  only if every wide-string result matched (else a distinct `9x`). The serial log shows the expected wide lines
+  (`C23W|Hello, wide|len=11|X|`, `C23N|Hello, wide|`, …). The refactor is regression-checked: C21's float-printf proof
+  still `PASS exit=21 match=1`, and `validate.sh 3 75` (default) = 3/3 ALIVE, exc/panic=0.
 - **2026-06-26** — **Track B milestone B13: readiness multiplexing — `poll`/`ppoll`/`select`/`pselect6`/`epoll` work.**
   The event-loop primitive every server / interactive Linux program reaches for, and previously all `-ENOSYS`. Added one
   readiness predicate `file_poll_ready(struct file*)` (regular files always ready; pipes exact — POLLIN on buffered data,

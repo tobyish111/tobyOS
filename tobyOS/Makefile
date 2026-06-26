@@ -1348,6 +1348,16 @@ programs/win-scan22/win-scan22.exe: programs/win-scan22/main.c
 	      -fno-stack-protector -O1 -Wl,-e,c22_entry -Wl,--subsystem,console \
 	      -o $@ $<
 
+# Track C/C23: wide-char (UTF-16) APIs -- wide CRT string family + wide printf
+# (wprintf/swprintf) + wide stdio. Same build as win-printf21/win-scan22
+# (-D__USE_MINGW_ANSI_STDIO=0) so the wprintf family routes to the ucrt wide
+# stdio primitives -> the kernel win32_wvformat engine, not libmingwex.
+programs/win-wide23/win-wide23.exe: programs/win-wide23/main.c
+	@mkdir -p $(dir $@)
+	$(CC) --target=x86_64-w64-mingw32 -nostartfiles -D__USE_MINGW_ANSI_STDIO=0 \
+	      -fno-stack-protector -O1 -Wl,-e,c23_entry -Wl,--subsystem,console \
+	      -o $@ $<
+
 # Track C/C3: a STOCK Windows .exe -- a plain `clang main.c -o win-hello3.exe`
 # with NO special flags and NO custom entry, so it runs the FULL ucrt
 # mainCRTStartup before main(). Proves tobyOS runs unmodified off-the-shelf
@@ -1870,6 +1880,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-math20/win-math20.exe \
                programs/win-printf21/win-printf21.exe \
                programs/win-scan22/win-scan22.exe \
+               programs/win-wide23/win-wide23.exe \
                 initrd/etc/c19b.lua \
                 initrd/etc/c20.lua \
                 initrd/etc/c21.lua \
@@ -1966,6 +1977,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-math20/win-math20.exe             $(INITRD_STAGE)/bin/win-math20.exe
 	cp programs/win-printf21/win-printf21.exe         $(INITRD_STAGE)/bin/win-printf21.exe
 	cp programs/win-scan22/win-scan22.exe             $(INITRD_STAGE)/bin/win-scan22.exe
+	cp programs/win-wide23/win-wide23.exe             $(INITRD_STAGE)/bin/win-wide23.exe
 	cp initrd/etc/c19b.lua                            $(INITRD_STAGE)/etc/c19b.lua
 	cp initrd/etc/c20.lua                             $(INITRD_STAGE)/etc/c20.lua
 	cp initrd/etc/c21.lua                             $(INITRD_STAGE)/etc/c21.lua
@@ -2192,6 +2204,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-srv17.exe bin/win-udp17.exe bin/win-sqlite.exe        \
 	    bin/win-font18c.exe bin/win-lua.exe bin/win-com19c.exe        \
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
+	    bin/win-wide23.exe                                            \
 	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
 	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
 	    etc/Lato-BoldItalic.ttf                                       \
