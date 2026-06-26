@@ -641,6 +641,16 @@ static int spawn_internal(const char *path, const char *name,
         name_copy(p->name, base, PROC_NAME_MAX);
     }
 
+    /* B20 (procfs): record the executable path for /proc/<pid>/exe. */
+    if (path) {
+        size_t pn = strlen(path);
+        if (pn >= ABI_PATH_MAX) pn = ABI_PATH_MAX - 1;
+        memcpy(p->exe_path, path, pn);
+        p->exe_path[pn] = '\0';
+    } else {
+        p->exe_path[0] = '\0';
+    }
+
     /* ---- 0. inherit fds (clone the explicit ones, default the rest) ---- */
     if (!install_initial_fds(p, fd0, fd1, fd2)) {
         kprintf("[proc] '%s': OOM installing initial fds\n", path);

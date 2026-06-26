@@ -357,6 +357,22 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-26** — **Track B milestone B20: a minimal, dynamic `/proc` filesystem — `cpuinfo`, `self`, `[pid]/maps`, `[pid]/stat`, `[pid]/exe`.**
+  Real Linux tooling probes `/proc` constantly (libc/runtime introspection, allocators reading `/proc/self/maps`, tools resolving
+  `/proc/self/exe`); tobyOS had only a skeletal procfs. B20 makes `/proc` generate content from live kernel state. **`/proc/self`
+  is now resolved dynamically** to the calling process's pid (a new `subst_self()` rewrites the path per-open against the current
+  pid) instead of a stale boot-time static symlink. Added synthetic generators: **`/proc/cpuinfo`** (per-CPU stanzas from the SMP
+  table), **`/proc/[pid]/maps`** (synthesized from the proc's image/heap/stack regions in canonical `addr-addr perms off dev ino path`
+  form), and **`/proc/[pid]/stat`** (the space-separated field row). **`/proc/[pid]/exe` and `/proc/self/exe` are real symlinks**
+  resolved on demand: `struct proc` gained an `exe_path[]` (the absolute path, latched at spawn in `proc.c` and at `execve`/`execve_pe`
+  in `fork.c`), `struct vfs_ops` gained a `readlink` driver hook, `vfs_readlink` dispatches to it, and `procfs_readlink` answers
+  `self`→pid and `[pid]/exe`→`exe_path`. Wired the Linux **`readlink(89)`/`readlinkat(267)`** syscalls (previously `-ENOSYS`) onto
+  `vfs_readlink`. `procfs_opendir`/`readdir`/`stat`/`open` all run through `subst_self` and enumerate the new entries. **Proof, clean
+  under `+smep,+smap`, 0 faults:** `[LXPROCFS] VERDICT: PASS exit=15` (`logs/b20.sh`) — `linux-procfs`, a raw-syscall Linux ELF, reads
+  `/proc/cpuinfo`, `/proc/self/status`, `/proc/self/maps` and `readlink`s `/proc/self/exe` (→ `/bin/linux-procfs`); each of the four
+  checks sets a bit, 15 = all four. **No regression:** combined Linux-track battery green
+  (`[LXABI]/[LXSIG]/[LXMMAP]/[LXTHREAD]/[LXJOIN]/[LXPOLL]/[LXAUTO]/[LXSAUTO]/[LXPROCFS]` all PASS), and the real-musl busybox file
+  battery is `[LXBB] PASS pass=10/10`.
 - **2026-06-26** — **Track B milestone B19: static, note-less SYSV Linux binaries now DROP-AND-RUN — auto-detect the Linux ABI from `PT_GNU_STACK`.**
   This closes the last `elf_is_linux_abi` gap left open by B10. A genuine Linux binary that is *static* (no `PT_INTERP`),
   *note-less*, and *unbranded* (`e_ident[EI_OSABI]==0`, i.e. `ELFOSABI_SYSV`) has neither the `brandelf` tag (rule 1) nor a

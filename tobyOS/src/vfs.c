@@ -645,7 +645,16 @@ int vfs_symlink(const char *path, const char *target) {
 int vfs_readlink(const char *path, char *buf, size_t bufsz) {
     if (!path || !buf || bufsz == 0) return VFS_ERR_INVAL;
     struct vfs_symlink_entry *e = symlink_find(path);
-    if (!e) return VFS_ERR_NOENT;
+    if (!e) {
+        /* B20: not in the static table -- give the owning mount a chance
+         * to resolve a dynamically-synthesised symlink (procfs
+         * /proc/self, /proc/<pid>/exe). */
+        const char *rel = 0;
+        struct vfs_mount *m = resolve(path, &rel);
+        if (m && m->ops && m->ops->readlink)
+            return m->ops->readlink(m->data, rel, buf, bufsz);
+        return VFS_ERR_NOENT;
+    }
     size_t tlen = strlen(e->target);
     if (tlen >= bufsz) tlen = bufsz - 1;
     memcpy(buf, e->target, tlen);

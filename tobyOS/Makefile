@@ -1337,6 +1337,15 @@ programs/linux-msgsock/linux-msgsock.elf: programs/linux-msgsock/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# Track B/B20: a genuine Linux x86-64 static ELF proving the extended /proc
+# filesystem -- reads /proc/cpuinfo, /proc/self/status, /proc/self/maps and
+# readlinks /proc/self/exe. Same brandelf'd build shape as the other Linux ELFs.
+programs/linux-procfs/linux-procfs.elf: programs/linux-procfs/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 # Track B/B19: a genuine STATIC, NOTE-LESS, UNBRANDED Linux x86-64 ELF -- the
 # one shape the loader could not previously auto-detect (no OSABI brand, no
 # PT_INTERP). Built exactly like the others EXCEPT there is deliberately NO
@@ -1921,6 +1930,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-httpget/linux-httpget.elf \
                programs/linux-msgsock/linux-msgsock.elf \
                programs/linux-static-auto/linux-static-auto.elf \
+               programs/linux-procfs/linux-procfs.elf \
                programs/win-hello/win-hello.exe \
                programs/win-crt/win-crt.exe \
                programs/win-hello3/win-hello3.exe \
@@ -2027,6 +2037,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-httpget/linux-httpget.elf       $(INITRD_STAGE)/bin/linux-httpget
 	cp programs/linux-msgsock/linux-msgsock.elf       $(INITRD_STAGE)/bin/linux-msgsock
 	cp programs/linux-static-auto/linux-static-auto.elf $(INITRD_STAGE)/bin/linux-static-auto
+	cp programs/linux-procfs/linux-procfs.elf         $(INITRD_STAGE)/bin/linux-procfs
 	cp programs/win-hello/win-hello.exe               $(INITRD_STAGE)/bin/win-hello.exe
 	cp programs/win-crt/win-crt.exe                   $(INITRD_STAGE)/bin/win-crt.exe
 	cp programs/win-hello3/win-hello3.exe             $(INITRD_STAGE)/bin/win-hello3.exe
@@ -2279,7 +2290,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
-	    bin/linux-static-auto \
+	    bin/linux-static-auto bin/linux-procfs \
 	    bin/win-hello.exe \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
 	    bin/win-fileio.exe bin/win-thread.exe bin/win-tls18b.exe       \

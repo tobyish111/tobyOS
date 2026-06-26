@@ -6014,6 +6014,35 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXPROCFS_BOOT
+    /* Track B/B20: the extended /proc filesystem. /bin/linux-procfs is a
+     * genuine Linux ELF that reads /proc/cpuinfo, /proc/self/status,
+     * /proc/self/maps and readlinks /proc/self/exe (the synthetic files real
+     * Linux software consults). Each passing check sets a bit; exit 15 means
+     * all four worked -- proving /proc/self resolves to the live caller, the
+     * new files generate sane content, and the exe symlink resolves. */
+    {
+        const char *path = "/bin/linux-procfs";
+        char *argv[] = { (char *)"linux-procfs", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-procfs",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] LXPROCFS: spawning %s\n", path);
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LXPROCFS: %s not present -- SKIPPED\n", path);
+            kprintf("[LXPROCFS] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[LXPROCFS] VERDICT: %s exit=%d (cpuinfo|self/status|"
+                    "self/maps|self/exe bitmask; 15=all)\n",
+                    rc == 15 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef M36_SELFTEST
     /* Milestone 36E: in-OS compile + run self-test (TobyC stage-1). */
     {

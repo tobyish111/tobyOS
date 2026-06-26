@@ -7,9 +7,17 @@
  *   /proc/uptime         system uptime in seconds
  *   /proc/meminfo        total / free / used memory
  *   /proc/version        kernel version string
- *   /proc/self           symlink -> /proc/<current_pid>
- *   /proc/<pid>/status   name, state, pid, ppid, memory
+ *   /proc/cpuinfo        one block per logical CPU (B20)
+ *   /proc/self           symlink -> /proc/<calling-pid> (resolved live, B20)
+ *   /proc/<pid>/status   name, state, pid, ppid, uid
  *   /proc/<pid>/cmdline  process name
+ *   /proc/<pid>/maps     memory map: exe image + [heap] + [stack] (B20)
+ *   /proc/<pid>/stat     single-line numeric stat (B20)
+ *   /proc/<pid>/exe      symlink -> the process's executable path (B20)
+ *
+ * "self" is handled in every op by subst_self(), which rewrites a leading
+ * "self" component to the CALLING process's pid -- so /proc/self/* always
+ * refers to the live caller, not a boot-time placeholder.
  */
 
 #include <tobyos/procfs.h>
@@ -20,6 +28,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/pit.h>
 #include <tobyos/pmm.h>
+#include <tobyos/smp.h>
 
 extern struct proc g_proc[PROC_MAX];
 
@@ -57,6 +66,47 @@ static int uint_to_str(char *buf, size_t cap, uint64_t v) {
     for (int i = 0; i < len; i++) buf[i] = tmp[len - 1 - i];
     buf[len] = '\0';
     return len;
+}
+
+/* Lowercase hex, no "0x", no leading zeros (Linux /proc/<pid>/maps style). */
+static int hex_to_str(char *buf, size_t cap, uint64_t v) {
+    char tmp[24];
+    int len = 0;
+    if (v == 0) { tmp[len++] = '0'; }
+    else { while (v > 0) { int d = (int)(v & 0xf); tmp[len++] = (char)(d < 10 ? '0'+d : 'a'+d-10); v >>= 4; } }
+    if ((size_t)len >= cap) return -1;
+    for (int i = 0; i < len; i++) buf[i] = tmp[len - 1 - i];
+    buf[len] = '\0';
+    return len;
+}
+
+/* Rewrite a procfs-relative path, replacing a leading "/self" component
+ * with "/<current-pid>" so /proc/self/* works for ANY caller (the static
+ * /proc/self symlink couldn't track the live process). Paths without a
+ * "self" component are copied through unchanged. */
+static void subst_self(const char *rel, char *out, size_t cap) {
+    if (rel && rel[0] == '/' &&
+        rel[1] == 's' && rel[2] == 'e' && rel[3] == 'l' && rel[4] == 'f' &&
+        (rel[5] == '\0' || rel[5] == '/')) {
+        struct proc *p = current_proc();
+        int pid = p ? p->pid : 0;
+        char pidstr[16];
+        int pl = int_to_str(pidstr, sizeof(pidstr), pid);
+        const char *tail = rel + 5;
+        size_t tl = strlen(tail);
+        if ((size_t)(1 + pl) + tl + 1 > cap) { /* truncate-safe fallback */
+            size_t rl = strlen(rel); if (rl >= cap) rl = cap - 1;
+            memcpy(out, rel, rl); out[rl] = '\0'; return;
+        }
+        out[0] = '/';
+        memcpy(out + 1, pidstr, (size_t)pl);
+        memcpy(out + 1 + pl, tail, tl + 1);
+        return;
+    }
+    size_t rl = rel ? strlen(rel) : 0;
+    if (rl >= cap) rl = cap - 1;
+    if (rel) memcpy(out, rel, rl);
+    out[rl] = '\0';
 }
 
 /* ---- content generators ---- */
@@ -147,6 +197,119 @@ static int gen_pid_cmdline(int pid, char *buf, size_t cap) {
     return (int)nl;
 }
 
+static int gen_cpuinfo(char *buf, size_t cap) {
+    int off = 0;
+    char tmp[24];
+    #define APPEND_STR(s) do { \
+        size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; \
+    } while (0)
+    #define APPEND_INT(v) do { \
+        int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); \
+    } while (0)
+
+    uint32_t ncpu = smp_cpu_count();
+    if (ncpu == 0) ncpu = 1;
+    for (uint32_t i = 0; i < ncpu; i++) {
+        APPEND_STR("processor\t: "); APPEND_INT(i); APPEND_STR("\n");
+        APPEND_STR("vendor_id\t: GenuineTobyOS\n");
+        APPEND_STR("cpu family\t: 6\n");
+        APPEND_STR("model\t\t: 1\n");
+        APPEND_STR("model name\t: tobyOS virtual x86-64 CPU\n");
+        APPEND_STR("flags\t\t: fpu tsc msr sse sse2 syscall\n");
+        APPEND_STR("\n");
+    }
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+    #undef APPEND_INT
+}
+
+/* /proc/<pid>/maps -- a best-effort memory map synthesised from the few
+ * regions the kernel tracks explicitly: the executable image (around the
+ * entry point), the brk heap, and the user stack. Real software reads this
+ * to discover its own [heap]/[stack] ranges and exe mapping. */
+static int gen_pid_maps(int pid, char *buf, size_t cap) {
+    struct proc *p = proc_lookup(pid);
+    if (!p) return -1;
+    int off = 0;
+    char tmp[24];
+    #define APPEND_STR(s) do { \
+        size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; \
+    } while (0)
+    #define APPEND_HEX(v) do { hex_to_str(tmp, sizeof(tmp), (uint64_t)(v)); APPEND_STR(tmp); } while (0)
+
+    /* one map line: lo-hi perms 00000000 00:00 0    path */
+    #define MAP_LINE(lo, hi, perms, path) do { \
+        APPEND_HEX(lo); APPEND_STR("-"); APPEND_HEX(hi); \
+        APPEND_STR(" "); APPEND_STR(perms); \
+        APPEND_STR(" 00000000 00:00 0 \t"); APPEND_STR(path); APPEND_STR("\n"); \
+    } while (0)
+
+    /* executable image: round the entry down to a page; present one r-xp
+     * page mapped to the exe path (span is approximate). */
+    if (p->user_entry) {
+        uint64_t lo = p->user_entry & ~0xfffULL;
+        uint64_t hi = lo + 0x1000ULL;
+        MAP_LINE(lo, hi, "r-xp", (p->exe_path[0] ? p->exe_path : p->name));
+    }
+    /* heap */
+    if (p->brk_cur > p->brk_base) {
+        MAP_LINE(p->brk_base, p->brk_cur, "rw-p", "[heap]");
+    }
+    /* stack */
+    if (p->user_stack_base && p->user_stack_pages) {
+        uint64_t slo = p->user_stack_base;
+        uint64_t shi = p->user_stack_base + (uint64_t)p->user_stack_pages * 4096ULL;
+        MAP_LINE(slo, shi, "rw-p", "[stack]");
+    }
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+    #undef APPEND_HEX
+    #undef MAP_LINE
+}
+
+/* /proc/<pid>/stat -- the single-line numeric form. We emit the leading
+ * fields tools actually parse (pid, comm, state, ppid, ...) and pad the
+ * rest with zeros. */
+static int gen_pid_stat(int pid, char *buf, size_t cap) {
+    struct proc *p = proc_lookup(pid);
+    if (!p) return -1;
+    char st = 'R';
+    switch (p->state) {
+        case PROC_RUNNING: case PROC_READY: st = 'R'; break;
+        case PROC_BLOCKED: st = 'S'; break;
+        case PROC_TERMINATED: st = 'Z'; break;
+        default: st = 'R'; break;
+    }
+    int off = 0;
+    char tmp[24];
+    #define APPEND_STR(s) do { \
+        size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; \
+    } while (0)
+    #define APPEND_INT(v) do { int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); } while (0)
+
+    APPEND_INT(p->pid); APPEND_STR(" (");
+    APPEND_STR(p->name); APPEND_STR(") ");
+    { char ss[2] = { st, 0 }; APPEND_STR(ss); }
+    APPEND_STR(" "); APPEND_INT(p->ppid);
+    /* pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt
+     * utime stime cutime cstime priority nice num_threads itrealvalue
+     * starttime -- 18 fields, all zero. */
+    for (int i = 0; i < 18; i++) APPEND_STR(" 0");
+    APPEND_STR("\n");
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+    #undef APPEND_INT
+}
+
 /* ---- VFS driver ---- */
 
 struct procfs_handle {
@@ -158,16 +321,20 @@ struct procfs_handle {
 static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
     (void)mnt;
     if (!path || path[0] != '/') return VFS_ERR_NOENT;
-    const char *rel = path + 1; /* skip leading '/' */
 
-    char buf[1024];
+    char normbuf[ABI_PATH_MAX];
+    subst_self(path, normbuf, sizeof(normbuf));
+    const char *rel = normbuf + 1; /* skip leading '/' */
+
+    char buf[2048];
     int len = -1;
 
     if (strcmp(rel, "uptime") == 0)  { len = gen_uptime(buf, sizeof(buf));  }
     else if (strcmp(rel, "meminfo") == 0) { len = gen_meminfo(buf, sizeof(buf)); }
     else if (strcmp(rel, "version") == 0) { len = gen_version(buf, sizeof(buf)); }
+    else if (strcmp(rel, "cpuinfo") == 0) { len = gen_cpuinfo(buf, sizeof(buf)); }
     else {
-        /* Try /proc/<pid>/status or /proc/<pid>/cmdline */
+        /* Try /proc/<pid>/<file> */
         if (rel[0] >= '0' && rel[0] <= '9') {
             const char *slash = rel;
             while (*slash && *slash != '/') slash++;
@@ -183,6 +350,10 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                     len = gen_pid_status(pid, buf, sizeof(buf));
                 else if (strcmp(sub, "cmdline") == 0)
                     len = gen_pid_cmdline(pid, buf, sizeof(buf));
+                else if (strcmp(sub, "maps") == 0)
+                    len = gen_pid_maps(pid, buf, sizeof(buf));
+                else if (strcmp(sub, "stat") == 0)
+                    len = gen_pid_stat(pid, buf, sizeof(buf));
             }
         }
     }
@@ -224,9 +395,12 @@ static long procfs_read(struct vfs_file *f, void *buf, size_t n) {
 static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     (void)mnt;
     if (!path || path[0] != '/') return VFS_ERR_NOENT;
-    const char *rel = path + 1;
 
-    /* Root /proc directory or a pid directory */
+    char normbuf[ABI_PATH_MAX];
+    subst_self(path, normbuf, sizeof(normbuf));
+    const char *rel = normbuf + 1;
+
+    /* Root /proc directory */
     if (rel[0] == '\0') {
         out->type = VFS_TYPE_DIR;
         out->size = 0;
@@ -234,7 +408,7 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
         return VFS_OK;
     }
 
-    /* Check if it's a pid directory: /proc/<pid> */
+    /* /proc/<pid>  (dir)  and  /proc/<pid>/exe (symlink) */
     if (rel[0] >= '0' && rel[0] <= '9') {
         const char *s = rel;
         while (*s >= '0' && *s <= '9') s++;
@@ -248,12 +422,22 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
             }
             return VFS_ERR_NOENT;
         }
+        if (*s == '/' && strcmp(s + 1, "exe") == 0) {
+            int pid = parse_int(rel);
+            if (proc_lookup(pid)) {
+                out->type = VFS_TYPE_SYMLINK;
+                out->size = 0;
+                out->uid = 0; out->gid = 0; out->mode = 0;
+                return VFS_OK;
+            }
+            return VFS_ERR_NOENT;
+        }
     }
 
     /* Try opening the file to determine its size. */
     struct vfs_file tmp;
     memset(&tmp, 0, sizeof(tmp));
-    int rc = procfs_open(mnt, path, &tmp);
+    int rc = procfs_open(mnt, normbuf, &tmp);
     if (rc != VFS_OK) return rc;
     out->type = VFS_TYPE_FILE;
     out->size = tmp.size;
@@ -279,7 +463,9 @@ static int procfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
     if (strcmp(path, "/") == 0) {
         dh->pid = -1;
     } else {
-        const char *rel = path + 1;
+        char normbuf[ABI_PATH_MAX];
+        subst_self(path, normbuf, sizeof(normbuf));
+        const char *rel = normbuf + 1;
         dh->pid = parse_int(rel);
         if (!proc_lookup(dh->pid)) { kfree(dh); return VFS_ERR_NOENT; }
     }
@@ -299,18 +485,22 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
 
     if (dh->pid == -1) {
         /* Root /proc listing: global files first, then pid dirs */
-        static const char *globals[] = { "uptime", "meminfo", "version", "self" };
-        if (dh->index < 4) {
+        static const char *globals[] = { "uptime", "meminfo", "version",
+                                         "cpuinfo", "self" };
+        const int nglobals = 5;
+        if (dh->index < nglobals) {
             memset(out->name, 0, VFS_NAME_MAX);
             size_t nl = strlen(globals[dh->index]);
             memcpy(out->name, globals[dh->index], nl);
-            out->type = (dh->index == 3) ? VFS_TYPE_SYMLINK : VFS_TYPE_FILE;
+            /* the last entry ("self") is a symlink, the rest are files */
+            out->type = (dh->index == nglobals - 1) ? VFS_TYPE_SYMLINK
+                                                     : VFS_TYPE_FILE;
             out->size = 0;
             out->uid = 0; out->gid = 0; out->mode = 0;
             dh->index++;
             return VFS_OK;
         }
-        int pidx = dh->index - 4;
+        int pidx = dh->index - nglobals;
         for (int i = pidx; i < PROC_MAX; i++) {
             if (g_proc[i].state != PROC_UNUSED) {
                 memset(out->name, 0, VFS_NAME_MAX);
@@ -321,7 +511,7 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
                 out->type = VFS_TYPE_DIR;
                 out->size = 0;
                 out->uid = 0; out->gid = 0; out->mode = 0;
-                dh->index = 4 + i + 1;
+                dh->index = nglobals + i + 1;
                 return VFS_OK;
             }
         }
@@ -329,16 +519,64 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     }
 
     /* Per-pid directory listing */
-    static const char *entries[] = { "status", "cmdline" };
-    if (dh->index >= 2) return VFS_ERR_NOENT;
+    static const char *entries[] = { "status", "cmdline", "maps", "stat", "exe" };
+    const int nentries = 5;
+    if (dh->index >= nentries) return VFS_ERR_NOENT;
     memset(out->name, 0, VFS_NAME_MAX);
     size_t nl = strlen(entries[dh->index]);
     memcpy(out->name, entries[dh->index], nl);
-    out->type = VFS_TYPE_FILE;
+    /* "exe" is a symlink; the rest are files */
+    out->type = (dh->index == nentries - 1) ? VFS_TYPE_SYMLINK : VFS_TYPE_FILE;
     out->size = 0;
     out->uid = 0; out->gid = 0; out->mode = 0;
     dh->index++;
     return VFS_OK;
+}
+
+/* B20: dynamically-resolved /proc symlinks (the static symlink table can't
+ * track the live process). Handles:
+ *   /self            -> /proc/<current-pid>
+ *   /<pid>/exe       -> the process's executable path
+ *   /self/exe        -> current process's executable path (via subst_self) */
+static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz) {
+    (void)mnt;
+    if (!path || path[0] != '/' || !buf || bufsz == 0) return VFS_ERR_INVAL;
+
+    /* Bare /proc/self -> /proc/<pid> */
+    if (strcmp(path, "/self") == 0) {
+        struct proc *p = current_proc();
+        char pidstr[16];
+        int pl = int_to_str(pidstr, sizeof(pidstr), p ? p->pid : 0);
+        int n = 0;
+        const char *pre = "/proc/";
+        size_t prelen = strlen(pre);
+        if (prelen + (size_t)pl + 1 > bufsz) return VFS_ERR_INVAL;
+        memcpy(buf, pre, prelen); n = (int)prelen;
+        memcpy(buf + n, pidstr, (size_t)pl); n += pl;
+        buf[n] = '\0';
+        return VFS_OK;
+    }
+
+    /* /proc/<pid>/exe (or /proc/self/exe after substitution) */
+    char normbuf[ABI_PATH_MAX];
+    subst_self(path, normbuf, sizeof(normbuf));
+    const char *rel = normbuf + 1;
+    if (rel[0] >= '0' && rel[0] <= '9') {
+        const char *s = rel;
+        while (*s >= '0' && *s <= '9') s++;
+        if (*s == '/' && strcmp(s + 1, "exe") == 0) {
+            int pid = parse_int(rel);
+            struct proc *p = proc_lookup(pid);
+            if (!p) return VFS_ERR_NOENT;
+            const char *tgt = p->exe_path[0] ? p->exe_path : p->name;
+            size_t tl = strlen(tgt);
+            if (tl >= bufsz) tl = bufsz - 1;
+            memcpy(buf, tgt, tl);
+            buf[tl] = '\0';
+            return VFS_OK;
+        }
+    }
+    return VFS_ERR_NOENT;
 }
 
 static const struct vfs_ops procfs_ops = {
@@ -355,6 +593,7 @@ static const struct vfs_ops procfs_ops = {
     .stat     = procfs_stat,
     .chmod    = 0,
     .chown    = 0,
+    .readlink = procfs_readlink,
     .umount   = 0,
 };
 
@@ -365,20 +604,11 @@ void procfs_init(void) {
         return;
     }
 
-    /* /proc/self symlink: updated dynamically on readlink, but we
-     * register a symlink entry so VFS path resolution catches it. We
-     * use pid 0 as a placeholder; the actual readlink of /proc/self
-     * will need to resolve to current_proc()->pid. We handle this via
-     * a dynamic update in the open path instead. */
-    struct proc *p = current_proc();
-    char target[32];
-    int n = 0;
-    memcpy(target, "/proc/", 6); n = 6;
-    char pidstr[16];
-    int pl = int_to_str(pidstr, sizeof(pidstr), p ? p->pid : 0);
-    memcpy(target + n, pidstr, (size_t)pl); n += pl;
-    target[n] = '\0';
-    vfs_symlink("/proc/self", target);
-
-    kprintf("[procfs] mounted at /proc\n");
+    /* B20: /proc/self is resolved DYNAMICALLY by procfs_readlink +
+     * subst_self() (every op rewrites a leading "self" component to the
+     * CALLING process's pid). We deliberately do NOT register a static
+     * symlink-table entry -- the old code pinned /proc/self at the boot
+     * pid, so /proc/self/* read the wrong process from every later
+     * caller. */
+    kprintf("[procfs] mounted at /proc (self/exe/maps/stat/cpuinfo)\n");
 }

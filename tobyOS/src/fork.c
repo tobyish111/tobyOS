@@ -517,6 +517,14 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
     memcpy(p->name, base, n);
     p->name[n] = '\0';
 
+    /* B20 (procfs): re-point /proc/<pid>/exe at the new image. */
+    {
+        size_t pn = strlen(kpath);
+        if (pn >= ABI_PATH_MAX) pn = ABI_PATH_MAX - 1;
+        memcpy(p->exe_path, kpath, pn);
+        p->exe_path[pn] = '\0';
+    }
+
     p->user_entry = pe_info.entry;
     /* Win32 ABI: enter with RSP%16==8 (as if reached by a CALL). Headroom
      * above RSP for the marshalling gate's MS-x64 stack-arg reads. */
@@ -798,6 +806,14 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     if (n >= PROC_NAME_MAX) n = PROC_NAME_MAX - 1;
     memcpy(p->name, base, n);
     p->name[n] = '\0';
+
+    /* B20 (procfs): re-point /proc/<pid>/exe at the new image. */
+    {
+        size_t pn = strlen(kpath);
+        if (pn >= ABI_PATH_MAX) pn = ABI_PATH_MAX - 1;
+        memcpy(p->exe_path, kpath, pn);
+        p->exe_path[pn] = '\0';
+    }
 
     /* Set new entry point and stack. */
     p->user_entry = has_interp ? interp_info.entry : prog_info.entry;

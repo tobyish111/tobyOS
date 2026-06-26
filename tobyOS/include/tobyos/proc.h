@@ -86,6 +86,11 @@ struct proc {
      * always has a sensible answer. */
     int             ppid;
     char            name[PROC_NAME_MAX];
+    /* B20 (procfs): absolute path of the executable image this process
+     * runs, set at spawn and re-set on execve. Backs /proc/<pid>/exe and
+     * /proc/self/exe (the symlink real software uses to find its own
+     * binary). Empty for kernel threads. */
+    char            exe_path[ABI_PATH_MAX];
     enum proc_state state;
     int             exit_code;
 

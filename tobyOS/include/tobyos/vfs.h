@@ -128,6 +128,13 @@ struct vfs_ops {
     int  (*chmod)   (void *mnt, const char *path, uint32_t mode);
     int  (*chown)   (void *mnt, const char *path,
                      uint32_t uid, uint32_t gid);
+    /* B20 (optional). Resolve a symlink that the driver synthesises
+     * dynamically (e.g. procfs /proc/self, /proc/<pid>/exe), which the
+     * static in-kernel symlink table can't represent. Gets the path
+     * relative to the mount; writes up to bufsz-1 bytes + NUL into buf
+     * and returns VFS_OK, or VFS_ERR_NOENT/INVAL. NULL => the driver has
+     * no synthetic symlinks. */
+    int  (*readlink)(void *mnt, const char *path, char *buf, size_t bufsz);
     /* M26E (optional). Called by vfs_unmount AFTER the slot is removed
      * from the mount table. Drivers free their per-mount state here
      * (cluster buffers, FS scratch, etc). NULL => the VFS just drops

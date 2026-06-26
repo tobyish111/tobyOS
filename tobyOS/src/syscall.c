@@ -2907,6 +2907,7 @@ enum {
     LX_getdents64 = 217, LX_set_tid_address = 218, LX_clock_gettime = 228,
     LX_exit_group = 231, LX_tgkill = 234, LX_openat = 257,
     LX_newfstatat = 262, LX_set_robust_list = 273, LX_getrandom = 318,
+    LX_readlink = 89, LX_readlinkat = 267,  /* B20: /proc/self/exe etc. */
     LX_dup3 = 292, LX_pipe2 = 293,   /* B12: shell pipelines (dup3/pipe2) */
     /* B13: readiness multiplexing. */
     LX_poll = 7, LX_select = 23, LX_epoll_create = 213, LX_epoll_wait = 232,
@@ -3973,6 +3974,27 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_getpgid:
     case LX_getpgrp:
     case LX_setsid:  return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+
+    /* ---- readlink (B20): backs readlink(/proc/self/exe), realpath, etc. ---- */
+    case LX_readlink:                  /* (path, buf, bufsz) */
+    case LX_readlinkat: {              /* (dirfd, path, buf, bufsz) */
+        int is_at = (n == LX_readlinkat);
+        const char *upath = is_at ? (const char *)a2 : (const char *)a1;
+        char *ubuf        = is_at ? (char *)a3       : (char *)a2;
+        size_t bufsz      = is_at ? (size_t)a4       : (size_t)a3;
+        char kpath[ABI_PATH_MAX], ktmp[ABI_PATH_MAX];
+        int rr = resolve_user_path(upath, kpath, sizeof kpath);
+        if (rr) return rr;
+        if (!ubuf || bufsz == 0) return -ABI_EINVAL;
+        size_t cap = bufsz < sizeof(ktmp) ? bufsz : sizeof(ktmp);
+        int rc = vfs_readlink(kpath, ktmp, cap);
+        if (rc == VFS_ERR_NOENT) return -ABI_ENOENT;
+        if (rc != VFS_OK)        return -ABI_EINVAL;
+        size_t n = strlen(ktmp);
+        if (n > bufsz) n = bufsz;          /* readlink does NOT NUL-terminate */
+        if (copy_to_user(ubuf, ktmp, n) != 0) return -ABI_EFAULT;
+        return (long)n;
+    }
 
     /* ---- stat family: translate tobyOS vfs_stat -> Linux struct stat ---- */
     case LX_stat:
