@@ -61,6 +61,10 @@ enum file_kind {
      * path; getdents64 re-opens it via vfs_opendir and resumes after
      * dir_off entries (see linux_syscall in syscall.c). */
     FILE_KIND_DIR     = 8,
+    /* Track B/B13: a Linux epoll instance (epoll_create1). The fd's backing
+     * is a kmalloc'd struct epoll_inst (an interest list of {fd,events,data}).
+     * See linux_syscall epoll_ctl/epoll_wait in syscall.c. */
+    FILE_KIND_EPOLL   = 9,
 };
 
 struct file {
@@ -86,6 +90,8 @@ struct file {
      * each getdents64 re-opens and resumes. */
     char           *dirpath;
     uint32_t        dir_off;
+    /* For FILE_KIND_EPOLL (Track B/B13): the epoll interest list. */
+    struct epoll_inst *epoll;
 };
 
 /* Allocate + initialise the well-known console-backed file. Each call

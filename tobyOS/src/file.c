@@ -178,6 +178,9 @@ void file_close(struct file *f) {
     case FILE_KIND_DIR:
         if (f->dirpath) kfree(f->dirpath);
         break;
+    case FILE_KIND_EPOLL:
+        if (f->epoll) kfree(f->epoll);
+        break;
     case FILE_KIND_CONSOLE:
     case FILE_KIND_NULL:
         break;

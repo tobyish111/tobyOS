@@ -5401,6 +5401,28 @@ void _start(void) {
                     "contract: CLONE_CHILD_CLEARTID + futex wake)\n",
                     jrc == 0 ? "PASS" : "FAIL", jrc);
         }
+
+        /* B13: prove readiness multiplexing -- a hand-rolled ELF runs a
+         * poll/ppoll/select/epoll battery on a real pipe (empty->timeout,
+         * write->POLLIN, POLLOUT, select, epoll_wait, EOF->POLLHUP); it
+         * exits 0 only if every readiness check matched. */
+        kprintf("[boot] LXPOLL: spawning /bin/linux-poll (poll/select/epoll)\n");
+        char *poargv[] = { (char *)"linux-poll", 0 };
+        char *poenvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec pospec = {
+            .path = "/bin/linux-poll", .name = "linux-poll",
+            .argc = 1, .argv = poargv, .envc = 1, .envp = poenvp,
+        };
+        int popid = proc_spawn(&pospec);
+        if (popid < 0) {
+            kprintf("[LXPOLL] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int porc = proc_wait(popid);
+            kprintf("[boot] LXPOLL: /bin/linux-poll (pid=%d) exit=%d\n",
+                    popid, porc);
+            kprintf("[LXPOLL] VERDICT: %s exit=%d (expected 0; poll/select/"
+                    "epoll on a pipe)\n", porc == 0 ? "PASS" : "FAIL", porc);
+        }
     }
 #endif
 

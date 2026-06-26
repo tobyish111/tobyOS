@@ -2907,6 +2907,10 @@ enum {
     LX_exit_group = 231, LX_tgkill = 234, LX_openat = 257,
     LX_newfstatat = 262, LX_set_robust_list = 273, LX_getrandom = 318,
     LX_dup3 = 292, LX_pipe2 = 293,   /* B12: shell pipelines (dup3/pipe2) */
+    /* B13: readiness multiplexing. */
+    LX_poll = 7, LX_select = 23, LX_epoll_create = 213, LX_epoll_wait = 232,
+    LX_epoll_ctl = 233, LX_pselect6 = 270, LX_ppoll = 271, LX_epoll_pwait = 281,
+    LX_epoll_create1 = 291,
 };
 
 /* arch_prctl codes. */
@@ -3080,6 +3084,224 @@ static long linux_open_dir(const char *kpath) {
     return fd;
 }
 
+/* ===================================================================
+ * Track B/B13: poll / select / epoll -- readiness multiplexing.
+ *
+ * One readiness predicate (file_poll_ready) computes the conditions currently
+ * true for an fd; poll/ppoll/select/pselect6/epoll_wait all loop over their fd
+ * lists calling it and block COOPERATIVELY (sched_yield) until at least one fd
+ * is ready or the timeout elapses. Because the scheduler is cooperative,
+ * yielding lets the other end of a pipe / a peer proc run and make the fd
+ * ready, which we observe on the next pass.
+ *
+ * Scope/honesty: regular files are always ready (POSIX); pipes are exact (data/
+ * space/EOF/EPIPE off the live ring + reader/writer counts); UDP sockets report
+ * POLLIN off the queued-datagram count + always POLLOUT. TCP-socket POLLIN and
+ * tty/console input-readiness are best-effort (reported writable; their input
+ * side isn't peekable here) -- a documented limit, not exercised by the proof.
+ * =================================================================== */
+
+#define LXP_POLLIN   0x001
+#define LXP_POLLPRI  0x002
+#define LXP_POLLOUT  0x004
+#define LXP_POLLERR  0x008
+#define LXP_POLLHUP  0x010
+#define LXP_POLLNVAL 0x020
+#define LX_EINTR     4
+
+static short file_poll_ready(struct file *f) {
+    if (!f) return LXP_POLLNVAL;
+    short r = 0;
+    switch (f->kind) {
+    case FILE_KIND_VFS:
+    case FILE_KIND_DIR:
+        r |= LXP_POLLIN | LXP_POLLOUT;       /* regular files never block */
+        break;
+    case FILE_KIND_PIPE_R:
+        if (f->pipe) {
+            if (f->pipe->count > 0)    r |= LXP_POLLIN;
+            if (f->pipe->writers == 0) r |= LXP_POLLIN | LXP_POLLHUP; /* EOF readable */
+        }
+        break;
+    case FILE_KIND_PIPE_W:
+        if (f->pipe) {
+            if (f->pipe->readers == 0)             r |= LXP_POLLERR;
+            else if (f->pipe->count < PIPE_BUF_SZ) r |= LXP_POLLOUT;
+        }
+        break;
+    case FILE_KIND_SOCKET:
+        r |= LXP_POLLOUT;                    /* assume sendable */
+        if (f->sock && f->sock->count > 0) r |= LXP_POLLIN;  /* UDP rx queued */
+        break;
+    default:                                 /* console/term/window/etc. */
+        r |= LXP_POLLOUT;                    /* writable; input best-effort */
+        break;
+    }
+    return r;
+}
+
+struct lx_pollfd { int fd; short events; short revents; };  /* 8 bytes, Linux ABI */
+#define LX_POLL_MAXFDS 256
+
+/* Core poll loop shared by poll/ppoll. timeout_ms < 0 == infinite. */
+static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
+    if (nfds > LX_POLL_MAXFDS) return -ABI_EINVAL;
+    struct lx_pollfd fds[LX_POLL_MAXFDS];
+    if (nfds && copy_from_user(fds, (const void *)(uintptr_t)ufds,
+                               nfds * sizeof(fds[0])) != 0)
+        return -ABI_EFAULT;
+    struct proc *self = current_proc();
+    bool infinite = (timeout_ms < 0);
+    uint64_t deadline = infinite ? 0
+                                 : perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+    for (;;) {
+        int nready = 0;
+        for (unsigned long i = 0; i < nfds; i++) {
+            fds[i].revents = 0;
+            if (fds[i].fd < 0) continue;           /* negative fd: ignored */
+            short cond = file_poll_ready(fd_lookup(fds[i].fd));
+            short want = fds[i].events | LXP_POLLERR | LXP_POLLHUP | LXP_POLLNVAL;
+            short rev  = cond & want;
+            fds[i].revents = rev;
+            if (rev) nready++;
+        }
+        if (nready > 0 || timeout_ms == 0 ||
+            (!infinite && perf_now_ns() >= deadline)) {
+            if (nfds && copy_to_user((void *)(uintptr_t)ufds, fds,
+                                     nfds * sizeof(fds[0])) != 0)
+                return -ABI_EFAULT;
+            return nready;
+        }
+        if (self && self->pending_signals) return -LX_EINTR;
+        sched_yield();
+    }
+}
+
+/* select(2): three fd_set bitmaps (byte arrays). Caps at PROC_NFDS. */
+static long lx_do_select(int nfds, uint64_t urd, uint64_t uwr, uint64_t uex,
+                         long timeout_ms) {
+    if (nfds < 0) return -ABI_EINVAL;
+    if (nfds > PROC_NFDS) nfds = PROC_NFDS;
+    unsigned nbytes = (unsigned)((nfds + 7) / 8);
+    uint8_t rd[ (PROC_NFDS + 7) / 8 ] = {0};
+    uint8_t wr[ (PROC_NFDS + 7) / 8 ] = {0};
+    uint8_t ex[ (PROC_NFDS + 7) / 8 ] = {0};
+    if (urd && nbytes && copy_from_user(rd, (const void *)(uintptr_t)urd, nbytes)) return -ABI_EFAULT;
+    if (uwr && nbytes && copy_from_user(wr, (const void *)(uintptr_t)uwr, nbytes)) return -ABI_EFAULT;
+    if (uex && nbytes && copy_from_user(ex, (const void *)(uintptr_t)uex, nbytes)) return -ABI_EFAULT;
+
+    struct proc *self = current_proc();
+    bool infinite = (timeout_ms < 0);
+    uint64_t deadline = infinite ? 0
+                                 : perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+    uint8_t ord[(PROC_NFDS + 7) / 8], owr[(PROC_NFDS + 7) / 8], oex[(PROC_NFDS + 7) / 8];
+    for (;;) {
+        memset(ord, 0, sizeof(ord)); memset(owr, 0, sizeof(owr)); memset(oex, 0, sizeof(oex));
+        int nready = 0;
+        for (int fd = 0; fd < nfds; fd++) {
+            int bit = 1 << (fd & 7), by = fd >> 3;
+            bool wr_r = (urd && (rd[by] & bit));
+            bool wr_w = (uwr && (wr[by] & bit));
+            bool wr_e = (uex && (ex[by] & bit));
+            if (!wr_r && !wr_w && !wr_e) continue;
+            short cond = file_poll_ready(fd_lookup(fd));
+            if (wr_r && (cond & (LXP_POLLIN | LXP_POLLHUP | LXP_POLLERR))) { ord[by] |= bit; nready++; }
+            if (wr_w && (cond & (LXP_POLLOUT | LXP_POLLERR)))             { owr[by] |= bit; nready++; }
+            if (wr_e && (cond & LXP_POLLPRI))                            { oex[by] |= bit; nready++; }
+        }
+        if (nready > 0 || timeout_ms == 0 ||
+            (!infinite && perf_now_ns() >= deadline)) {
+            if (urd && nbytes && copy_to_user((void *)(uintptr_t)urd, ord, nbytes)) return -ABI_EFAULT;
+            if (uwr && nbytes && copy_to_user((void *)(uintptr_t)uwr, owr, nbytes)) return -ABI_EFAULT;
+            if (uex && nbytes && copy_to_user((void *)(uintptr_t)uex, oex, nbytes)) return -ABI_EFAULT;
+            return nready;
+        }
+        if (self && self->pending_signals) return -LX_EINTR;
+        sched_yield();
+    }
+}
+
+/* ---- epoll ---- */
+#define EPOLL_MAX 64
+struct epoll_entry { int fd; uint32_t events; uint64_t data; bool used; };
+struct epoll_inst  { struct epoll_entry e[EPOLL_MAX]; };
+struct lx_epoll_event { uint32_t events; uint64_t data; } __attribute__((packed)); /* 12 B */
+#define LX_EPOLL_CTL_ADD 1
+#define LX_EPOLL_CTL_DEL 2
+#define LX_EPOLL_CTL_MOD 3
+
+static long lx_epoll_create(void) {
+    struct file *f = (struct file *)kmalloc(sizeof(*f));
+    if (!f) return -ABI_ENOMEM;
+    memset(f, 0, sizeof(*f));
+    f->kind  = FILE_KIND_EPOLL;
+    f->epoll = (struct epoll_inst *)kmalloc(sizeof(struct epoll_inst));
+    if (!f->epoll) { kfree(f); return -ABI_ENOMEM; }
+    memset(f->epoll, 0, sizeof(struct epoll_inst));
+    int fd = fd_alloc_into(current_proc(), f);
+    if (fd < 0) { kfree(f->epoll); kfree(f); return -ABI_EMFILE; }
+    return fd;
+}
+
+static long lx_epoll_ctl(int epfd, int op, int fd, uint64_t uevent) {
+    struct file *ef = fd_lookup(epfd);
+    if (!ef || ef->kind != FILE_KIND_EPOLL || !ef->epoll) return -ABI_EBADF;
+    if (!fd_lookup(fd)) return -ABI_EBADF;
+    struct epoll_inst *ei = ef->epoll;
+    struct lx_epoll_event ev = {0};
+    if (op == LX_EPOLL_CTL_ADD || op == LX_EPOLL_CTL_MOD) {
+        if (!uevent || copy_from_user(&ev, (const void *)(uintptr_t)uevent, sizeof(ev)))
+            return -ABI_EFAULT;
+    }
+    if (op == LX_EPOLL_CTL_ADD) {
+        int free_slot = -1;
+        for (int i = 0; i < EPOLL_MAX; i++) {
+            if (ei->e[i].used && ei->e[i].fd == fd) return -17 /* EEXIST */;
+            if (!ei->e[i].used && free_slot < 0) free_slot = i;
+        }
+        if (free_slot < 0) return -ABI_ENOMEM;
+        ei->e[free_slot] = (struct epoll_entry){ fd, ev.events, ev.data, true };
+        return 0;
+    }
+    for (int i = 0; i < EPOLL_MAX; i++) {
+        if (!ei->e[i].used || ei->e[i].fd != fd) continue;
+        if (op == LX_EPOLL_CTL_DEL) { ei->e[i].used = false; return 0; }
+        if (op == LX_EPOLL_CTL_MOD) { ei->e[i].events = ev.events; ei->e[i].data = ev.data; return 0; }
+    }
+    return -2 /* ENOENT */;
+}
+
+static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeout_ms) {
+    struct file *ef = fd_lookup(epfd);
+    if (!ef || ef->kind != FILE_KIND_EPOLL || !ef->epoll) return -ABI_EBADF;
+    if (maxevents <= 0) return -ABI_EINVAL;
+    struct epoll_inst *ei = ef->epoll;
+    struct proc *self = current_proc();
+    bool infinite = (timeout_ms < 0);
+    uint64_t deadline = infinite ? 0
+                                 : perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+    for (;;) {
+        int n = 0;
+        for (int i = 0; i < EPOLL_MAX && n < maxevents; i++) {
+            if (!ei->e[i].used) continue;
+            short cond = file_poll_ready(fd_lookup(ei->e[i].fd));
+            uint32_t want = ei->e[i].events | LXP_POLLERR | LXP_POLLHUP;
+            uint32_t rev  = (uint32_t)cond & want;
+            if (!rev) continue;
+            struct lx_epoll_event out = { rev, ei->e[i].data };
+            if (copy_to_user((void *)(uintptr_t)(uevents + (uint64_t)n * sizeof(out)),
+                             &out, sizeof(out)) != 0)
+                return -ABI_EFAULT;
+            n++;
+        }
+        if (n > 0 || timeout_ms == 0 ||
+            (!infinite && perf_now_ns() >= deadline))
+            return n;
+        if (self && self->pending_signals) return -LX_EINTR;
+        sched_yield();
+    }
+}
+
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     switch (n) {
     /* ---- exits ---- */
@@ -3128,6 +3350,48 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         return do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
     case LX_pipe:   return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
     case LX_pipe2:  return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
+
+    /* ---- B13: poll / select / epoll (readiness multiplexing) ---- */
+    case LX_poll:                  /* poll(fds, nfds, timeout_ms) */
+        return lx_do_poll((uint64_t)a1, (unsigned long)a2, (long)(int)a3);
+    case LX_ppoll: {               /* ppoll(fds, nfds, *timespec, *sigmask, sz) */
+        long ms = -1;              /* NULL timespec == infinite */
+        if (a3) {
+            int64_t ts[2];
+            if (copy_from_user(ts, (const void *)a3, sizeof(ts)) != 0)
+                return -ABI_EFAULT;
+            ms = (long)(ts[0] * 1000 + ts[1] / 1000000);
+        }
+        return lx_do_poll((uint64_t)a1, (unsigned long)a2, ms);
+    }
+    case LX_select: {              /* select(nfds, *rd, *wr, *ex, *timeval) */
+        long ms = -1;
+        if (a5) {
+            int64_t tv[2];
+            if (copy_from_user(tv, (const void *)a5, sizeof(tv)) != 0)
+                return -ABI_EFAULT;
+            ms = (long)(tv[0] * 1000 + tv[1] / 1000);
+        }
+        return lx_do_select((int)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4, ms);
+    }
+    case LX_pselect6: {            /* pselect6(nfds, *rd, *wr, *ex, *timespec, *sig) */
+        long ms = -1;
+        if (a5) {
+            int64_t ts[2];
+            if (copy_from_user(ts, (const void *)a5, sizeof(ts)) != 0)
+                return -ABI_EFAULT;
+            ms = (long)(ts[0] * 1000 + ts[1] / 1000000);
+        }
+        return lx_do_select((int)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4, ms);
+    }
+    case LX_epoll_create:          /* epoll_create(size) -- size ignored */
+    case LX_epoll_create1:         /* epoll_create1(flags) -- flags ignored */
+        return lx_epoll_create();
+    case LX_epoll_ctl:             /* epoll_ctl(epfd, op, fd, *event) */
+        return lx_epoll_ctl((int)a1, (int)a2, (int)a3, (uint64_t)a4);
+    case LX_epoll_wait:            /* epoll_wait(epfd, *events, maxevents, timeout) */
+    case LX_epoll_pwait:           /* epoll_pwait(... , *sigmask) -- sigmask ignored */
+        return lx_epoll_wait((int)a1, (uint64_t)a2, (int)a3, (long)(int)a4);
     case LX_getcwd: return do_syscall(SYS_GETCWD, a1, a2, 0, 0, 0);
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
