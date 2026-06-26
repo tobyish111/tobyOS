@@ -5194,6 +5194,55 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE22_BOOT
+    /* Track C -- formatted/number INPUT (scanf family + strtod/atof), milestone
+     * C22. Build EXTRA_CFLAGS+=-DWINPE22_BOOT. /bin/win-scan22.exe is a clang/ucrt
+     * PE (built like win-crt, so sscanf/fscanf/strtod route to the ucrt stdio +
+     * convert primitives -> the kernel win32_vscanf engine + -msse kmath_strtod).
+     * It sscanf's ints/string/double, strtod/atof's with endptr + exponent, %x and
+     * %f, and fscanf's a real file, then exits 22 iff every field parsed right
+     * (else 50+i). The kernel re-reads /data/c22.out and matches the exact text,
+     * so the verdict is PASS only if the scanf engine + real strtod work end to
+     * end -- closing the C20/C21 float story (compute, print, and now READ). */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE22: spawning /bin/win-scan22.exe (scanf/strtod input)\n");
+        char *argv[] = { (char *)"win-scan22.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-scan22.exe", .name = "win-scan22.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE22] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE22: /bin/win-scan22.exe (pid=%d) exit=%d\n", pid, rc);
+            void *buf = 0; size_t sz = 0; int found = 0;
+            if (vfs_read_all("/data/c22.out", &buf, &sz) == 0 && buf) {
+                const char *p = (const char *)buf;
+                const char *needle =
+                    "C22|n=4|a=42|b=-7|w=hello|d=314159|e=271828|g=-1500|u=255|f=50|end=r|m=2|fi=100|fd2=25|";
+                size_t nl = 0; while (needle[nl]) nl++;
+                for (size_t i = 0; sz >= nl && i + nl <= sz; i++) {
+                    size_t k = 0; while (k < nl && p[i + k] == needle[k]) k++;
+                    if (k == nl) { found = 1; break; }
+                }
+                kprintf("[boot] WINPE22: /data/c22.out = %lu bytes, match %s\n",
+                        (unsigned long)sz, found ? "FOUND" : "MISSING");
+                kfree(buf);
+            } else {
+                kprintf("[boot] WINPE22: /data/c22.out not readable\n");
+            }
+            int pass = (rc == 22 && found);
+            kprintf("[WINPE22] VERDICT: %s exit=%d match=%d (expect 22 + exact scanf/strtod output)\n",
+                    pass ? "PASS" : "FAIL", rc, found);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery

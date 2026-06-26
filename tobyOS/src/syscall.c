@@ -8626,14 +8626,44 @@ static long w32_strtol(uint64_t *a) {
     if(a[1]){uint64_t ep=a[0]+(uint64_t)i; (void)copy_to_user((void*)(uintptr_t)a[1],&ep,8);}
     return sign*v;
 }
-/* strtod: cannot return a double through the integer gate -> 0.0; advances
- * endptr past a numeric prefix. SQLite needs it only for REAL literals. */
+/* C22: strtod is now REAL. The actual decimal->double parse runs in the -msse
+ * kmath unit (this file is -mno-sse); the result's bit pattern is returned in
+ * rax and, because strtod is in win32_shim_is_double_ret(), the C20 float gate
+ * does `movq xmm0, rax` so the caller gets the double in xmm0. endptr (a[1]) is
+ * advanced past the consumed bytes (== str on no conversion, per C). */
 static long w32_strtod(uint64_t *a) {
-    char s[64]; if(strncpy_from_user(s,(const char*)(uintptr_t)a[0],sizeof(s))<0){if(a[1])(void)copy_to_user((void*)(uintptr_t)a[1],&a[0],8);return 0;}
-    int i=0; while(s[i]==' ')i++; if(s[i]=='-'||s[i]=='+')i++;
-    while((s[i]>='0'&&s[i]<='9')||s[i]=='.')i++;
-    if(a[1]){uint64_t ep=a[0]+(uint64_t)i; (void)copy_to_user((void*)(uintptr_t)a[1],&ep,8);}
-    return 0;
+    char s[128];
+    if (strncpy_from_user(s, (const char *)(uintptr_t)a[0], sizeof(s)) < 0) {
+        if (a[1]) (void)copy_to_user((void *)(uintptr_t)a[1], &a[0], 8);
+        return 0;
+    }
+    s[sizeof(s) - 1] = '\0';
+    int consumed = 0;
+    uint64_t bits = kmath_strtod(s, &consumed, 0);
+    if (a[1]) { uint64_t ep = a[0] + (uint64_t)consumed; (void)copy_to_user((void *)(uintptr_t)a[1], &ep, 8); }
+    return (long)bits;
+}
+/* atof(str) == strtod(str, NULL); also a real double through the float gate. */
+static long w32_atof(uint64_t *a) {
+    char s[128];
+    if (strncpy_from_user(s, (const char *)(uintptr_t)a[0], sizeof(s)) < 0) return 0;
+    s[sizeof(s) - 1] = '\0';
+    int consumed = 0;
+    return (long)kmath_strtod(s, &consumed, 0);
+}
+/* strtoul(str, endptr, base) -> unsigned long; like w32_strtol without the sign
+ * negation (a leading '-' still wraps per C, but we keep it simple/unsigned). */
+static long w32_strtoul(uint64_t *a) {
+    char s[64]; if (strncpy_from_user(s, (const char *)(uintptr_t)a[0], sizeof(s)) < 0) return 0;
+    int base = (int)a[2]; int i = 0; int neg = 0; while (s[i] == ' ' || s[i] == '\t') i++;
+    if (s[i] == '-') { neg = 1; i++; } else if (s[i] == '+') i++;
+    if ((base == 0 || base == 16) && s[i] == '0' && (s[i+1] == 'x' || s[i+1] == 'X')) { i += 2; base = 16; }
+    if (base == 0) base = 10;
+    unsigned long v = 0; for (; s[i]; i++) { int d; char c = s[i];
+        if (c >= '0' && c <= '9') d = c - '0'; else if (c >= 'a' && c <= 'z') d = c - 'a' + 10; else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10; else break;
+        if (d >= base) break; v = v * (unsigned)base + (unsigned)d; }
+    if (a[1]) { uint64_t ep = a[0] + (uint64_t)i; (void)copy_to_user((void *)(uintptr_t)a[1], &ep, 8); }
+    return (long)(neg ? (unsigned long)(-(long)v) : v);
 }
 
 /* ---- stdio FILE* (token == WIN32_IOB_TAG | fd) ---- */
@@ -8680,7 +8710,182 @@ static long w32_fileno(uint64_t *a){return win32_file_fd(a[0]);}
 static long w32_get_osfhandle(uint64_t *a){return (long)(int)a[0];}     /* HANDLE == fd */
 static long w32_isatty(uint64_t *a){(void)a;return 0;}                  /* batch, not a tty */
 static long w32_setmode(uint64_t *a){(void)a;return 0;}
-static long w32_vsscanf(uint64_t *a){(void)a;return 0;}                 /* stub: 0 fields */
+/* ============================================================
+ * C22: the scanf family. ucrt's sscanf/fscanf/scanf inline to the stdio
+ * primitives __stdio_common_vsscanf (input = a string buffer) and
+ * __stdio_common_vfscanf (input = a FILE*), whose va_list is the last (stack)
+ * arg the C2 gate marshals. The engine below parses a NUL-terminated KERNEL
+ * input buffer per a user format string, reading one user pointer per
+ * conversion from the va_list and copy_to_user-ing the parsed value. Floats use
+ * the -msse kmath_strtod (this file is -mno-sse). Mirrors the native libc
+ * sscanf but adds %f/%e/%g, '*' (assignment suppression), and field width.
+ * ============================================================ */
+static int w32_sc_isspace(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+/* Returns the number of assigned fields; *consumed gets input bytes consumed. */
+static long win32_vscanf(const char *s, size_t slen, uint64_t ufmt, uint64_t uva, int *consumed) {
+    char fmt[512];
+    long fl = strncpy_from_user(fmt, (const char *)(uintptr_t)ufmt, sizeof(fmt));
+    if (fl < 0) { if (consumed) *consumed = 0; return -1; }
+    fmt[sizeof(fmt) - 1] = '\0';
+
+    int count = 0, ai = 0;
+    size_t si = 0;
+    const char *f = fmt;
+
+    while (*f) {
+        if (w32_sc_isspace(*f)) {                 /* whitespace in fmt: skip input ws */
+            while (si < slen && w32_sc_isspace(s[si])) si++;
+            f++;
+            continue;
+        }
+        if (*f != '%') {                          /* literal: must match */
+            if (si >= slen || s[si] != *f) goto done;
+            si++; f++;
+            continue;
+        }
+        f++;                                      /* skip '%' */
+        if (*f == '%') { if (si >= slen || s[si] != '%') goto done; si++; f++; continue; }
+
+        int suppress = 0;
+        if (*f == '*') { suppress = 1; f++; }
+        int width = 0;
+        while (*f >= '0' && *f <= '9') { width = width * 10 + (*f - '0'); f++; }
+        int lng = 0;                              /* 0=int/float, 1=long/double, 2=long long */
+        if (*f == 'l') { lng = 1; f++; if (*f == 'l') { lng = 2; f++; } }
+        else if (*f == 'h') { f++; if (*f == 'h') f++; }
+        else if (*f == 'L' || *f == 'j' || *f == 'z' || *f == 't') { lng = (*f == 'L') ? 1 : 2; f++; }
+        char conv = *f ? *f++ : '\0';
+        if (!conv) break;
+
+        switch (conv) {
+        case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': case 'p': {
+            while (si < slen && w32_sc_isspace(s[si])) si++;     /* skip leading ws */
+            int base = (conv == 'x' || conv == 'X' || conv == 'p') ? 16 : (conv == 'o' ? 8 : 10);
+            int is_signed = (conv == 'd' || conv == 'i');
+            int neg = 0, ndig = 0;
+            size_t start = si;
+            int maxw = width > 0 ? width : 0x7fffffff;
+            int taken = 0;
+            if (si < slen && (s[si] == '-' || s[si] == '+')) { neg = (s[si] == '-'); si++; taken++; }
+            if ((conv == 'i' || conv == 'x' || conv == 'X' || conv == 'p') && taken < maxw &&
+                si + 1 < slen && s[si] == '0' && (s[si+1] == 'x' || s[si+1] == 'X')) {
+                base = 16; si += 2; taken += 2;
+            }
+            unsigned long long v = 0;
+            while (si < slen && taken < maxw) {
+                char c = s[si]; int d;
+                if (c >= '0' && c <= '9') d = c - '0';
+                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                else break;
+                if (d >= base) break;
+                v = v * (unsigned)base + (unsigned)d; si++; taken++; ndig++;
+            }
+            if (ndig == 0) { si = start; goto done; }
+            long long sv = neg ? -(long long)v : (long long)v;
+            if (!suppress) {
+                uint64_t p = va_next(uva, &ai);
+                if (p) {
+                    uint64_t out = is_signed ? (uint64_t)sv : (uint64_t)v;
+                    (void)copy_to_user((void *)(uintptr_t)p, &out, (lng >= 2) ? 8 : 4);
+                }
+                count++;
+            }
+            break;
+        }
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+            while (si < slen && w32_sc_isspace(s[si])) si++;
+            int cons = 0; uint32_t fb = 0;
+            uint64_t db = kmath_strtod(s + si, &cons, &fb);
+            if (width > 0 && cons > width) cons = width;     /* approx width honouring */
+            if (cons == 0) goto done;
+            si += (size_t)cons;
+            if (!suppress) {
+                uint64_t p = va_next(uva, &ai);
+                if (p) {
+                    if (lng >= 1) (void)copy_to_user((void *)(uintptr_t)p, &db, 8);
+                    else          (void)copy_to_user((void *)(uintptr_t)p, &fb, 4);
+                }
+                count++;
+            }
+            break;
+        }
+        case 's': {
+            while (si < slen && w32_sc_isspace(s[si])) si++;
+            if (si >= slen) goto done;
+            char tmp[1024]; int tn = 0;
+            int maxw = width > 0 ? width : (int)sizeof(tmp) - 1;
+            while (si < slen && !w32_sc_isspace(s[si]) && tn < maxw && tn < (int)sizeof(tmp) - 1)
+                tmp[tn++] = s[si++];
+            tmp[tn] = '\0';
+            if (!suppress) {
+                uint64_t p = va_next(uva, &ai);
+                if (p) (void)copy_to_user((void *)(uintptr_t)p, tmp, (size_t)tn + 1);
+                count++;
+            }
+            break;
+        }
+        case 'c': {
+            int w = width > 0 ? width : 1;
+            if (si + (size_t)w > slen) goto done;
+            char tmp[256]; if (w > (int)sizeof(tmp)) w = (int)sizeof(tmp);
+            for (int i = 0; i < w; i++) tmp[i] = s[si++];
+            if (!suppress) {
+                uint64_t p = va_next(uva, &ai);
+                if (p) (void)copy_to_user((void *)(uintptr_t)p, tmp, (size_t)w);
+                count++;
+            }
+            break;
+        }
+        case 'n': {                               /* chars consumed so far; no count++ */
+            uint64_t p = va_next(uva, &ai);
+            int n = (int)si;
+            if (p) (void)copy_to_user((void *)(uintptr_t)p, &n, 4);
+            break;
+        }
+        default:
+            goto done;
+        }
+    }
+done:
+    if (consumed) *consumed = (int)si;
+    return count;
+}
+
+/* __stdio_common_vsscanf(options, const char* buffer, size_t count, const char*
+ * fmt, _locale_t, va_list) -> assigned-field count. */
+static long w32_vsscanf(uint64_t *a) {
+    if (!a[1] || !a[3] || !a[5]) return -1;
+    char in[1024];
+    long n = strncpy_from_user(in, (const char *)(uintptr_t)a[1], sizeof(in));
+    if (n < 0) return -1;
+    size_t slen = (n >= (long)sizeof(in)) ? sizeof(in) - 1 : (size_t)n;
+    in[slen] = '\0';
+    int consumed = 0;
+    return win32_vscanf(in, slen, a[3], a[5], &consumed);
+}
+
+/* __stdio_common_vfscanf(options, FILE* stream, const char* fmt, _locale_t,
+ * va_list) -> assigned-field count. Reads a bounded chunk at the file's current
+ * offset, parses it, then re-seeks the fd to just past the consumed bytes so the
+ * next read continues correctly (a regular file; stdin is read once). */
+static long w32_vfscanf(uint64_t *a) {
+    int fd = win32_file_fd(a[1]);
+    if (fd < 0 || !a[2] || !a[4]) return -1;
+    struct file *f = fd_lookup(fd);
+    if (!f) return -1;
+    int64_t startpos = sys_lseek(fd, 0, 1);       /* SEEK_CUR; <0 if not seekable */
+    char in[1024];
+    long r = file_read(f, in, sizeof(in) - 1);    /* straight into a kernel buffer */
+    if (r <= 0) return -1;
+    size_t slen = (size_t)r; in[slen] = '\0';
+    int consumed = 0;
+    long cnt = win32_vscanf(in, slen, a[2], a[4], &consumed);
+    if (startpos >= 0) (void)sys_lseek(fd, startpos + (int64_t)consumed, 0);  /* SEEK_SET */
+    return cnt;
+}
 /* C19b: stdio status/pushback. Our fd-backed FILE* shims signal EOF/error via
  * return values, so feof/ferror/clearerr are no-ops; ungetc rewinds one byte. */
 static long w32_feof(uint64_t *a){(void)a;return 0;}
@@ -9361,7 +9566,9 @@ static const struct win32_shim g_win32_shims[] = {
     /* conversion */
     { "api-ms-win-crt-convert-l1-1-0.dll", "atoi",    w32_atoi },
     { "api-ms-win-crt-convert-l1-1-0.dll", "strtol",  w32_strtol },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "strtoul", w32_strtoul },
     { "api-ms-win-crt-convert-l1-1-0.dll", "strtod",  w32_strtod },
+    { "api-ms-win-crt-convert-l1-1-0.dll", "atof",    w32_atof },
     /* stdio FILE* */
     { "api-ms-win-crt-stdio-l1-1-0.dll", "fopen",     w32_fopen },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "fclose",    w32_fclose },
@@ -9378,6 +9585,7 @@ static const struct win32_shim g_win32_shims[] = {
     { "api-ms-win-crt-stdio-l1-1-0.dll", "_isatty",   w32_isatty },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "_setmode",  w32_setmode },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vsscanf", w32_vsscanf },
+    { "api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vfscanf", w32_vfscanf },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "_popen",    w32_zero },
     { "api-ms-win-crt-stdio-l1-1-0.dll", "_pclose",   w32_zero },
     /* C19b: real-Lua stdio gaps */
@@ -9465,7 +9673,8 @@ int win32_shim_is_double_ret(int idx) {
            f == w32_round|| f == w32_fabs  || f == w32_atan  || f == w32_asin  ||
            f == w32_acos || f == w32_sinh  || f == w32_cosh  || f == w32_tanh  ||
            f == w32_cbrt || f == w32_pow   || f == w32_fmod  || f == w32_atan2 ||
-           f == w32_hypot|| f == w32_ldexp || f == w32_frexp;
+           f == w32_hypot|| f == w32_ldexp || f == w32_frexp ||
+           f == w32_strtod || f == w32_atof;   /* C22: string->double also returns in xmm0 */
 }
 
 /* First shim-table index whose DLL matches `dll` (case-insensitive), or -1. The

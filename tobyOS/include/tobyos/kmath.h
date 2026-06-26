@@ -43,4 +43,13 @@ uint64_t kmath_frexp(uint64_t xbits, int *e_out);
 int kmath_fmt_double(uint64_t bits, char conv, int prec, unsigned flags,
                      char *out, int outcap, int *sign_out, int *special_out);
 
+/* C22: parse a decimal string to a double (the FP side of strtod/atof + scanf
+ * %f/%e/%g). `s` is a KERNEL buffer (NUL-terminated). *consumed gets the byte
+ * count consumed from s (0 if no valid number, matching C strtod's endptr==s);
+ * *fbits (if non-NULL) gets the value narrowed to a 32-bit float's bit pattern
+ * (for scanf %f into a `float*`). Returns the double's bit pattern. The integer
+ * shim layer can't hold a double, so the result travels back as bits (and a
+ * double-returning shim like strtod relies on the C20 float gate's movq). */
+uint64_t kmath_strtod(const char *s, int *consumed, uint32_t *fbits);
+
 #endif

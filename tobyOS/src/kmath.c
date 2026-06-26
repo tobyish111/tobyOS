@@ -298,6 +298,45 @@ int kmath_fmt_double(uint64_t bits, char conv, int prec, unsigned flags,
     return n;
 }
 
+/* C22: decimal string -> double, the FP side of strtod/atof + scanf %f. Same
+ * accumulate algorithm as the native libc strtod (libtoby/src/stdlib.c) so they
+ * agree. FXSAVE-guarded; the result bits + narrowed float bits + consumed count
+ * are all materialised to memory/integers before kmfpu_end (see kmath_op1). */
+uint64_t kmath_strtod(const char *s, int *consumed, uint32_t *fbits) {
+    kmfpu_begin();
+    const char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f' || *p == '\v') p++;
+    int sign = 1;
+    if (*p == '-') { sign = -1; p++; }
+    else if (*p == '+') p++;
+
+    double val = 0.0; int got = 0;
+    while (*p >= '0' && *p <= '9') { val = val * 10.0 + (*p - '0'); p++; got = 1; }
+    if (*p == '.') {
+        p++;
+        double frac = 0.1;
+        while (*p >= '0' && *p <= '9') { val += (*p - '0') * frac; frac *= 0.1; p++; got = 1; }
+    }
+    if (got && (*p == 'e' || *p == 'E')) {
+        const char *esave = p;
+        p++;
+        int es = 1; if (*p == '-') { es = -1; p++; } else if (*p == '+') p++;
+        int ev = 0, ed = 0;
+        while (*p >= '0' && *p <= '9') { ev = ev * 10 + (*p - '0'); p++; ed = 1; }
+        if (ed) { double m = 1.0; for (int i = 0; i < ev; i++) m *= (es > 0 ? 10.0 : 0.1); val *= m; }
+        else p = esave;                 /* 'e' with no exponent digits: not part of the number */
+    }
+
+    double r = got ? (sign * val) : 0.0;
+    float  fv = (float) r;
+    uint32_t fb; __builtin_memcpy(&fb, &fv, 4);
+    if (consumed) *consumed = got ? (int)(p - s) : 0;
+    if (fbits)    *fbits = fb;
+    volatile uint64_t rb = d2b(r);      /* keep r out of an xmm reg across fxrstor */
+    kmfpu_end();
+    return rb;
+}
+
 uint64_t kmath_frexp(uint64_t xbits, int *e_out) {
     kmfpu_begin();
     double x = b2d(xbits);
