@@ -17,6 +17,11 @@ int  kbd_getc(void);
 void kbd_dispatch_char(char c);
 void kbd_flush_pending(void);
 
+/* Push a byte directly into the console input ring, bypassing the GUI key
+ * dispatch + ISIG handling. For programmatic/test input (the B21 TTY
+ * harness). */
+void kbd_inject_raw(char c);
+
 /* PS/2 byte-level entry point.
  * Exported so the mouse IRQ can drain shared 8042 output bytes and
  * route keyboard bytes correctly instead of leaving them stuck. */

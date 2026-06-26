@@ -68,6 +68,7 @@
 #include <tobyos/sysmon.h>
 #include <tobyos/mouse.h>
 #include <tobyos/keyboard.h>
+#include <tobyos/tty.h>
 #include <tobyos/usb_legacy.h>
 #include <tobyos/xhci.h>
 #include <tobyos/http.h>
@@ -4169,10 +4170,18 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_ftruncate:
         return 0;
 
-    /* stdio probes the tty geometry on first write; any error just means
-     * "not a tty" -> fully buffered, which still flushes at exit. */
-    case LX_ioctl:
+    /* Track B/B21: ioctl on the console is a real TTY now. TCGETS/TCSETS
+     * (termios), TIOCGWINSZ (size), TIOCGPGRP/TIOCSPGRP (foreground group),
+     * TCFLSH/FIONREAD. A working TCGETS is what makes a Linux libc's
+     * isatty() return true (-> line-buffered, interactive). ioctl(fd,cmd,arg)
+     * = (a1,a2,a3). Non-console fds + unknown requests still get ENOTTY. */
+    case LX_ioctl: {
+        struct file *f = fd_lookup((int)a1);
+        if (!f) return -ABI_EBADF;
+        if (f->kind == FILE_KIND_CONSOLE)
+            return tty_console_ioctl((unsigned long)a2, (unsigned long)a3);
         return -ABI_ENOTTY;
+    }
 
     /* ---- memory ---- */
     case LX_brk: {

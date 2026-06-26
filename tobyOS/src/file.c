@@ -25,34 +25,19 @@
 #include <tobyos/printk.h>
 #include <tobyos/keyboard.h>
 #include <tobyos/signal.h>
+#include <tobyos/tty.h>
 #include <tobyos/klibc.h>
 #include <tobyos/cpu.h>
 
 static long console_read(void *buf, size_t n) {
     if (n == 0) return 0;
-    char *cb = (char *)buf;
-    /* Busy-poll for at least one byte so the caller doesn't spin its
-     * own retry loop. We sti+hlt between probes so the CPU isn't pegged
-     * at 100% waiting for a keystroke. The hlt also gives the keyboard
-     * IRQ a chance to fire, including the Ctrl+C handler which may
-     * SIGINT us -- detect that on each wakeup and bail with -EINTR
-     * so the syscall return path can actually deliver the signal. */
-    int c = kbd_trygetc();
-    while (c < 0) {
-        if (signal_pending_self()) return EINTR_RET;
-        sti();
-        hlt();
-        c = kbd_trygetc();
-    }
-    cb[0] = (char)c;
-    /* Drain whatever else is buffered without blocking. */
-    size_t got = 1;
-    while (got < n) {
-        c = kbd_trygetc();
-        if (c < 0) break;
-        cb[got++] = (char)c;
-    }
-    return (long)got;
+    /* Track B/B21: the console is a real controlling TTY now -- reads go
+     * through the cooked line discipline (canonical line editing + ECHO, or
+     * raw/VMIN when an app clears ICANON), which also honours the termios the
+     * program set via TCSETS. tty_console_read writes into this kernel buffer;
+     * sys_read copies it out. Signal interruption surfaces as EINTR_RET so the
+     * syscall return path delivers the pending signal. */
+    return tty_console_read((char *)buf, n);
 }
 
 static long console_write(const void *buf, size_t n) {

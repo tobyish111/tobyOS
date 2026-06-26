@@ -32,6 +32,7 @@
 #include <tobyos/rtc.h>
 #include <tobyos/perf.h>
 #include <tobyos/keyboard.h>
+#include <tobyos/tty.h>
 #include <tobyos/limine.h>
 #include <tobyos/pmm.h>
 #include <tobyos/vmm.h>
@@ -2461,6 +2462,7 @@ void _start(void) {
     pit_init(1000);         /* 1000 Hz — 1ms tick for instant input response */
     rtc_init();             /* read CMOS wall-clock time */
     kbd_init();             /* via irq_install_isa(1, kbd_irq) */
+    tty_init();             /* B21: console termios + cooked line discipline */
     sti();                  /* IF=1 -- IRQs can now reach the CPU */
     kprintf("[boot] interrupts enabled (IRQ0 timer + IRQ1 keyboard, "
             "via legacy PIC for early boot)\n");
@@ -6038,6 +6040,39 @@ void _start(void) {
             int rc = proc_wait(pid);
             kprintf("[LXPROCFS] VERDICT: %s exit=%d (cpuinfo|self/status|"
                     "self/maps|self/exe bitmask; 15=all)\n",
+                    rc == 15 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
+#ifdef LXTTY_BOOT
+    /* Track B/B21: the console TTY + termios. /bin/linux-tty is a genuine
+     * Linux ELF that calls ioctl(TCGETS) (isatty), flips raw mode via TCSETS
+     * and reads it back, queries TIOCGWINSZ, and does a CANONICAL read that
+     * must cook the keyboard input we inject below into one line. Each check
+     * sets a bit; exit 15 = all four. We inject "hello\n" as if typed BEFORE
+     * spawning so the cooked read finds a complete line (the line discipline
+     * pulls it from the same keyboard ring a real keystroke would land in). */
+    {
+        const char *inj = "hello\n";
+        for (const char *p = inj; *p; p++) kbd_inject_raw(*p);
+
+        const char *path = "/bin/linux-tty";
+        char *argv[] = { (char *)"linux-tty", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-tty",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] LXTTY: spawning %s (injected 'hello\\n')\n", path);
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LXTTY: %s not present -- SKIPPED\n", path);
+            kprintf("[LXTTY] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[LXTTY] VERDICT: %s exit=%d (tcgets|tcsetraw|winsize|"
+                    "cookedline bitmask; 15=all)\n",
                     rc == 15 ? "PASS" : "FAIL", rc);
         }
     }

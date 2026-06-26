@@ -13,6 +13,7 @@
  #include <tobyos/irq.h>
  #include <tobyos/cpu.h>
  #include <tobyos/signal.h>
+ #include <tobyos/tty.h>
  #include <tobyos/gui.h>
  #include <tobyos/printk.h>
  #include <tobyos/abi/abi.h>
@@ -320,20 +321,15 @@
      g_chars_dispatched++;
      g_last_char = c;
  
-     /* TTY job-control keys -> signals to the foreground process. Checked
-      * before the GUI dispatch so they work from the console shell; when no
-      * console foreground job is set (g_foreground_pid == 0, the usual case
-      * under the GUI) signal_send to pid 0 is a no-op, so GUI apps still see
-      * normal keys. Ctrl-C=SIGINT, Ctrl-\=SIGQUIT, Ctrl-Z=SIGTSTP (the last
-      * stops the job via the PROC_STOPPED machinery; `kill -CONT` resumes). */
-     if (c == 0x03 || c == 0x1c || c == 0x1a) {
-         int fg = signal_get_foreground();
-         if (fg > 0) {
-             int sig = (c == 0x03) ? SIGINT : (c == 0x1c) ? SIGQUIT : SIGTSTP;
-             signal_send_to_pid(fg, sig);
-         }
-         return;
-     }
+    /* TTY job-control keys -> signals to the foreground process. Checked
+    * before the GUI dispatch so they work from the console shell; when no
+    * console foreground job is set (the usual case under the GUI) the send
+    * is a no-op, so GUI apps still see normal keys. Track B/B21: this is now
+    * driven by the live console termios -- tty_handle_isig() fires SIGINT/
+    * SIGQUIT/SIGTSTP only while ISIG is set and only for the configured
+    * VINTR/VQUIT/VSUSP control chars, so an app in raw mode (ISIG cleared)
+    * receives e.g. Ctrl-C as a literal data byte instead of a signal. */
+    if (tty_handle_isig(c)) return;
 
      if (gui_active()) {
          gui_post_key((uint8_t)c);
@@ -343,7 +339,17 @@
      buf_push(c);
  }
 
- void kbd_flush_pending(void) {
+ void kbd_inject_raw(char c) {
+    /* Push a byte straight into the console input ring, bypassing the GUI
+     * key dispatch + ISIG handling. Used to feed the console TTY
+     * programmatically (e.g. the B21 boot harness injects a line of "typed"
+     * input for a Linux process's canonical read to cook), independent of
+     * whether the GUI desktop happens to be active. */
+    if (c == 0) return;
+    buf_push(c);
+}
+
+void kbd_flush_pending(void) {
      /* Keyboard is delivered immediately from the PS/2/USB HID input
       * path. Mouse keeps a deferred queue because cursor motion is a
       * rendering hot path; keypresses must be visible to GUI apps at

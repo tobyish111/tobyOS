@@ -357,6 +357,25 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-26** — **Track B milestone B21: the console is a real controlling TTY — Linux `termios` + a cooked line discipline.**
+  Before B21 the console was a raw byte pipe and `ioctl` always returned `ENOTTY`, so a Linux libc decided stdin/stdout were
+  *not* a terminal — `isatty()==0` → fully buffered, no line editing, no way to set raw mode. That blocks interactive Linux
+  software (shells, editors, pagers, password prompts). B21 gives the kernel text console a single controlling TTY: (1) a real
+  36-byte Linux `struct termios` (`src/tty.c`/`tty.h`) with sane cooked defaults (`ICANON|ECHO|ISIG`, standard `VINTR=^C`/
+  `VERASE=DEL`/`VKILL=^U`/`VEOF=^D`/`VSUSP=^Z`), read/written by **`TCGETS`/`TCSETS`** — a working `TCGETS` is exactly what makes
+  `isatty()` return true and lets a program flip raw mode; (2) a **cooked line discipline** in `tty_console_read()` (now backing
+  `console_read`): canonical mode buffers a whole line with `VERASE`/`VKILL` editing + `ECHO` and `VEOF` for EOF, raw mode
+  (ICANON cleared) delivers bytes immediately under `VMIN`; (3) **termios-driven signals** — the keyboard ISIG path
+  (`tty_handle_isig`, replacing a hard-coded `^C/^\/^Z` block in `kbd_dispatch_char`) now fires `SIGINT`/`SIGQUIT`/`SIGTSTP`
+  only while `ISIG` is set and only for the configured control chars, so a raw-mode app receives e.g. Ctrl-C as a literal data
+  byte; (4) **`TIOCGWINSZ`** (terminal size from the console grid) + **`TIOCGPGRP`/`TIOCSPGRP`** (foreground group) + `TCFLSH`/
+  `FIONREAD`; (5) wired Linux `ioctl(16)` on a `FILE_KIND_CONSOLE` fd to this TTY (non-console fds + unknown requests still get
+  `ENOTTY`). **Proof, clean under `+smep,+smap`, 0 faults:** `[LXTTY] VERDICT: PASS exit=15` (`logs/b21.sh`) — `linux-tty`, a
+  raw-syscall Linux ELF, calls `ioctl(0,TCGETS)` (isatty), flips raw mode via `TCSETS` and reads it back (verifying `ICANON`/
+  `ECHO` actually cleared), queries `TIOCGWINSZ`, and does a **canonical read** that must cook the `hello\n` the harness injects
+  into the keyboard ring into exactly one 6-byte line (proving the line discipline, not raw bytes). **No regression:** full
+  Linux-track battery green (`LXABI/LXSIG/LXMMAP/LXTHREAD/LXJOIN/LXPOLL/LXAUTO/LXSAUTO/LXPROCFS/LXTTY` all PASS), real-musl
+  busybox file battery `[LXBB] PASS 10/10`.
 - **2026-06-26** — **Track B milestone B20: a minimal, dynamic `/proc` filesystem — `cpuinfo`, `self`, `[pid]/maps`, `[pid]/stat`, `[pid]/exe`.**
   Real Linux tooling probes `/proc` constantly (libc/runtime introspection, allocators reading `/proc/self/maps`, tools resolving
   `/proc/self/exe`); tobyOS had only a skeletal procfs. B20 makes `/proc` generate content from live kernel state. **`/proc/self`
