@@ -2914,7 +2914,8 @@ enum {
     LX_epoll_create1 = 291,
     /* B14: BSD sockets (event-driven TCP servers). */
     LX_socket = 41, LX_connect = 42, LX_accept = 43, LX_sendto = 44,
-    LX_recvfrom = 45, LX_shutdown = 48, LX_bind = 49, LX_listen = 50,
+    LX_recvfrom = 45, LX_sendmsg = 46, LX_recvmsg = 47,
+    LX_shutdown = 48, LX_bind = 49, LX_listen = 50,
     LX_getsockname = 51, LX_getpeername = 52, LX_setsockopt = 54,
     LX_getsockopt = 55, LX_accept4 = 288,
     /* B17: real busybox network clients arm an alarm-timeout (setitimer) around
@@ -3621,6 +3622,197 @@ static long lx_getsockname(int fd, uint64_t uaddr, uint64_t ualen) {
     return 0;
 }
 
+/* B18: a REAL getsockopt(SOL_SOCKET, …). Before this it was an accept-and-ignore
+ * stub that returned 0 and left *optval untouched -- so SO_ERROR/SO_TYPE readers
+ * (the common case: check SO_ERROR after connect(), or SO_TYPE to learn the
+ * socket kind) read uninitialised junk. Fills the int/timeval result and writes
+ * back *optlen, honouring the caller's buffer size. */
+static long lx_getsockopt(int fd, int level, int optname,
+                          uint64_t uval, uint64_t ulen_ptr) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s) return -LXE_ENOTSOCK;
+    if (level != SOL_SOCKET || !uval || !ulen_ptr) return 0;
+
+    uint32_t ulen = 0;
+    if (copy_from_user(&ulen, (const void *)(uintptr_t)ulen_ptr, 4) != 0)
+        return -ABI_EFAULT;
+
+    /* SO_RCVTIMEO/SO_SNDTIMEO answer with a struct timeval {sec, usec}. */
+    if (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) {
+        uint32_t ms = (optname == SO_RCVTIMEO) ? s->recv_timeout_ms
+                                               : s->send_timeout_ms;
+        int64_t tv[2] = { (int64_t)(ms / 1000), (int64_t)(ms % 1000) * 1000 };
+        uint32_t n = ulen < sizeof tv ? ulen : (uint32_t)sizeof tv;
+        if (n && copy_to_user((void *)(uintptr_t)uval, tv, n) != 0)
+            return -ABI_EFAULT;
+        (void)copy_to_user((void *)(uintptr_t)ulen_ptr, &n, 4);
+        return 0;
+    }
+
+    /* Everything else is a 4-byte int. */
+    int32_t v;
+    switch (optname) {
+    case SO_ERROR:      v = 0;                                       break;
+    case SO_TYPE:       v = (s->kind == SOCK_KIND_TCP) ? SOCK_STREAM
+                                                       : SOCK_DGRAM; break;
+    case SO_ACCEPTCONN: v = s->tcp_listening ? 1 : 0;                break;
+    case SO_SNDBUF:
+    case SO_RCVBUF:     v = 65536;                                   break;
+    default:            v = 0;  /* REUSEADDR/KEEPALIVE/BROADCAST/… readback */ break;
+    }
+    uint32_t n = ulen < 4 ? ulen : 4;
+    if (n && copy_to_user((void *)(uintptr_t)uval, &v, n) != 0)
+        return -ABI_EFAULT;
+    (void)copy_to_user((void *)(uintptr_t)ulen_ptr, &n, 4);
+    return 0;
+}
+
+/* B18: sendmsg/recvmsg scatter-gather. struct msghdr (x86-64 Linux):
+ *   0:msg_name 8:msg_namelen(+pad) 16:msg_iov 24:msg_iovlen
+ *   32:msg_control 40:msg_controllen 48:msg_flags(+pad)   (56 bytes)
+ * struct iovec { void *iov_base; size_t iov_len; }        (16 bytes)
+ * We implement the data path (gather/scatter + msg_name for UDP); ancillary
+ * data (msg_control / SCM_RIGHTS) is not supported and is reported cleared. */
+#define LX_MSG_IOV_MAX 16
+
+struct lx_msghdr {
+    uint64_t msg_name;
+    uint32_t msg_namelen;
+    uint32_t _pad0;
+    uint64_t msg_iov;
+    uint64_t msg_iovlen;
+    uint64_t msg_control;
+    uint64_t msg_controllen;
+    int32_t  msg_flags;
+    uint32_t _pad1;
+};
+
+/* Read a msghdr + its (bounded) iovec array from user. Returns the iovec count,
+ * fills *total with the summed length (capped at SYS_MAX_RW), or <0 on fault.
+ * (struct lx_iovec {iov_base, iov_len} is defined above for readv/writev.) */
+static long lx_read_msghdr(uint64_t umsg, struct lx_msghdr *mh,
+                           struct lx_iovec *iov, size_t *total) {
+    if (!umsg || copy_from_user(mh, (const void *)(uintptr_t)umsg, sizeof *mh) != 0)
+        return -ABI_EFAULT;
+    uint64_t n = mh->msg_iovlen;
+    if (n > LX_MSG_IOV_MAX) n = LX_MSG_IOV_MAX;
+    if (n && (!mh->msg_iov ||
+              copy_from_user(iov, (const void *)(uintptr_t)mh->msg_iov,
+                             (size_t)n * sizeof *iov) != 0))
+        return -ABI_EFAULT;
+    size_t t = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        if (iov[i].iov_len > SYS_MAX_RW - t) { t = SYS_MAX_RW; break; }
+        t += (size_t)iov[i].iov_len;
+    }
+    *total = t;
+    return (long)n;
+}
+
+static long lx_sendmsg(int fd, uint64_t umsg, int flags) {
+    (void)flags;
+    struct sock *s = lx_sock_of(fd);
+    if (!s) return -LXE_ENOTSOCK;
+
+    struct lx_msghdr mh;
+    struct lx_iovec  iov[LX_MSG_IOV_MAX];
+    size_t total = 0;
+    long nio = lx_read_msghdr(umsg, &mh, iov, &total);
+    if (nio < 0) return nio;
+
+    void *k = total ? kmalloc(total) : 0;
+    if (total && !k) return -ABI_ENOMEM;
+    size_t off = 0;
+    for (long i = 0; i < nio && off < total; i++) {
+        size_t l = (size_t)iov[i].iov_len;
+        if (l > total - off) l = total - off;
+        if (l && copy_from_user((uint8_t *)k + off,
+                                (const void *)(uintptr_t)iov[i].iov_base, l) != 0) {
+            if (k) kfree(k);
+            return -ABI_EFAULT;
+        }
+        off += l;
+    }
+
+    long rv;
+    if (s->kind == SOCK_KIND_UDP) {
+        uint32_t dip; uint16_t dport;
+        uint64_t naddr = (mh.msg_namelen >= 8) ? mh.msg_name : 0;
+        if (!lx_udp_dest(s, naddr, &dip, &dport)) { if (k) kfree(k); return -ABI_EINVAL; }
+        long n = sock_sendto(s, k, total, dip, dport);
+        rv = (n < 0) ? -LXE_EAGAIN : n;
+    } else if (s->kind == SOCK_KIND_TCP && s->tcp) {
+        long n = total ? tcp_send(s->tcp, k, total) : 0;
+        rv = (n < 0) ? -ABI_EPIPE : n;
+    } else {
+        rv = -LXE_ENOTSOCK;
+    }
+    if (k) kfree(k);
+    return rv;
+}
+
+static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
+    (void)flags;
+    struct sock *s = lx_sock_of(fd);
+    if (!s) return -LXE_ENOTSOCK;
+
+    struct lx_msghdr mh;
+    struct lx_iovec  iov[LX_MSG_IOV_MAX];
+    size_t total = 0;
+    long nio = lx_read_msghdr(umsg, &mh, iov, &total);
+    if (nio < 0) return nio;
+    if (total == 0) return 0;
+
+    void *k = kmalloc(total);
+    if (!k) return -ABI_ENOMEM;
+
+    long n;
+    uint32_t sip = 0; uint16_t sport = 0;
+    if (s->kind == SOCK_KIND_UDP) {
+        uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
+        n = sock_recvfrom_to(s, k, total, &sip, &sport, to);
+        if (n == EINTR_RET)        { kfree(k); return -LXE_EINTR; }
+        if (n < 0)                 { kfree(k); return -LXE_EAGAIN; }
+        if (n == 0 && to)          { kfree(k); return -LXE_EAGAIN; }
+    } else if (s->kind == SOCK_KIND_TCP && s->tcp) {
+        uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
+        n = tcp_recv(s->tcp, k, total, to);
+        if (n == -1)      n = 0;                 /* peer closed -> EOF */
+        else if (n < 0)   { kfree(k); return -LXE_ECONNREFUSED; }
+    } else {
+        kfree(k);
+        return -LXE_ENOTSOCK;
+    }
+
+    /* Scatter the received bytes across the iovecs. */
+    size_t off = 0;
+    for (long i = 0; i < nio && off < (size_t)n; i++) {
+        size_t l = (size_t)iov[i].iov_len;
+        if (l > (size_t)n - off) l = (size_t)n - off;
+        if (l && copy_to_user((void *)(uintptr_t)iov[i].iov_base,
+                              (const uint8_t *)k + off, l) != 0) {
+            kfree(k);
+            return -ABI_EFAULT;
+        }
+        off += l;
+    }
+    kfree(k);
+
+    /* Fill the sender address (UDP) / family (TCP) and clear ancillary. */
+    if (mh.msg_name && mh.msg_namelen >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET; sa.sin_addr = sip; sa.sin_port = sport;
+        (void)copy_to_user((void *)(uintptr_t)mh.msg_name, &sa, sizeof sa);
+    }
+    {   /* msg_namelen, msg_controllen, msg_flags written back into the msghdr */
+        uint32_t nl = (mh.msg_name) ? (uint32_t)sizeof(struct sockaddr_in) : 0;
+        (void)copy_to_user((void *)(uintptr_t)(umsg + 8),  &nl, 4);
+        uint64_t cl = 0; (void)copy_to_user((void *)(uintptr_t)(umsg + 40), &cl, 8);
+        int32_t  fl = 0; (void)copy_to_user((void *)(uintptr_t)(umsg + 48), &fl, 4);
+    }
+    return n;
+}
+
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     switch (n) {
     /* ---- exits ---- */
@@ -3679,8 +3871,10 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_connect:     return lx_connect((int)a1, (uint64_t)a2, (uint32_t)a3);
     case LX_sendto:      return lx_send((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5);
     case LX_recvfrom:    return lx_recv((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5, 0);
+    case LX_sendmsg:     return lx_sendmsg((int)a1, (uint64_t)a2, (int)a3);
+    case LX_recvmsg:     return lx_recvmsg((int)a1, (uint64_t)a2, (int)a3);
     case LX_setsockopt:  return lx_setsockopt((int)a1, (int)a2, (int)a3, (uint64_t)a4, (uint32_t)a5);
-    case LX_getsockopt:  return 0;       /* accept-and-ignore (returns 0/optlen unchanged) */
+    case LX_getsockopt:  return lx_getsockopt((int)a1, (int)a2, (int)a3, (uint64_t)a4, (uint64_t)a5);
     case LX_getsockname: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
     case LX_getpeername: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
     case LX_shutdown:    return 0;       /* half-close not modelled; close() tears down */

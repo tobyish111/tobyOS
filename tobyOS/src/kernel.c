@@ -5558,6 +5558,37 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXMSG_BOOT
+    /* Track B milestone B18 -- socket depth: a REAL getsockopt (SO_TYPE/SO_ERROR)
+     * + scatter-gather sendmsg/recvmsg. A genuine Linux x86-64 ELF (raw syscalls)
+     * re-runs the resolve-then-fetch flow, but each transfer rides sendmsg/recvmsg
+     * with TWO iovecs and it asserts getsockopt answers along the way. Exit 56 is
+     * reachable only if the getsockopt assertions hold AND the DNS+HTTP round-trip
+     * succeeds -- a live internet round-trip over SLIRP. Build
+     * EXTRA_CFLAGS+=-DLXMSG_BOOT and run logs/b18.sh (needs host internet). */
+    {
+        kprintf("[boot] LXMSG: net_up=%d -- spawning /bin/linux-msgsock "
+                "(getsockopt + sendmsg/recvmsg DNS+HTTP)\n", (int)net_is_up());
+        char *margv[] = { (char *)"linux-msgsock", 0 };
+        char *menvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec mspec = {
+            .path = "/bin/linux-msgsock", .name = "linux-msgsock",
+            .argc = 1, .argv = margv, .envc = 1, .envp = menvp,
+        };
+        int mpid = proc_spawn(&mspec);
+        if (mpid < 0) {
+            kprintf("[LXMSG] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int mrc = proc_wait(mpid);
+            kprintf("[boot] LXMSG: /bin/linux-msgsock (pid=%d) exit=%d\n",
+                    mpid, mrc);
+            kprintf("[LXMSG] VERDICT: %s exit=%d (expected 56; getsockopt "
+                    "SO_TYPE/SO_ERROR + scatter-gather sendmsg/recvmsg over "
+                    "SLIRP)\n", mrc == 56 ? "PASS" : "FAIL", mrc);
+        }
+    }
+#endif
+
 #ifdef LXNETBB_BOOT
     /* Track B milestone B17 -- run REAL off-the-shelf busybox network applets
      * over the B16 socket client path: `nslookup` (musl getaddrinfo -> UDP DNS

@@ -26,11 +26,19 @@
 #define SOCK_STREAM            1       /* TCP */
 #define SOCK_DGRAM             2       /* UDP */
 
-/* setsockopt levels + options. */
+/* setsockopt/getsockopt levels + options (Linux x86-64 numeric values). */
 #define SOL_SOCKET             1
+#define SO_REUSEADDR           2
+#define SO_TYPE                3       /* getsockopt: SOCK_STREAM / SOCK_DGRAM */
+#define SO_ERROR               4       /* getsockopt: pending socket error (0) */
+#define SO_DONTROUTE           5
+#define SO_BROADCAST           6
+#define SO_SNDBUF              7
+#define SO_RCVBUF              8
+#define SO_KEEPALIVE           9
 #define SO_RCVTIMEO            20
 #define SO_SNDTIMEO            21
-#define SO_REUSEADDR           2
+#define SO_ACCEPTCONN          30      /* getsockopt: 1 if listen()ing */
 
 struct sockaddr_in {
     uint16_t sin_family;
