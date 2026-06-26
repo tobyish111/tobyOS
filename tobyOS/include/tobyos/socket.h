@@ -22,6 +22,7 @@
 
 /* User-visible "domain"/"type" constants. */
 #define AF_INET                2
+#define AF_INET6               10      /* not implemented; lx_socket -> EAFNOSUPPORT */
 #define SOCK_STREAM            1       /* TCP */
 #define SOCK_DGRAM             2       /* UDP */
 

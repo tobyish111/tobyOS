@@ -2917,6 +2917,9 @@ enum {
     LX_recvfrom = 45, LX_shutdown = 48, LX_bind = 49, LX_listen = 50,
     LX_getsockname = 51, LX_getpeername = 52, LX_setsockopt = 54,
     LX_getsockopt = 55, LX_accept4 = 288,
+    /* B17: real busybox network clients arm an alarm-timeout (setitimer) around
+     * each network op and ftruncate the wget output file. */
+    LX_ftruncate = 77, LX_getitimer = 36, LX_setitimer = 38,
 };
 
 /* arch_prctl codes. */
@@ -3358,6 +3361,7 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
 /* errno values not in abi.h but expected by Linux-personality callers. */
 #define LXE_EINTR          4
 #define LXE_EAGAIN        11
+#define LXE_EAFNOSUPPORT  97
 #define LXE_ENOTSOCK      88
 #define LXE_EADDRINUSE    98
 #define LXE_EOPNOTSUPP    95
@@ -3387,6 +3391,10 @@ static struct sock *lx_sock_of(int fd) {
 
 static long lx_socket(int domain, int type, int proto) {
     (void)proto;
+    /* We only implement IPv4. musl's getaddrinfo opens an AF_INET6 DNS socket
+     * first and falls back to AF_INET *only* on EAFNOSUPPORT -- returning
+     * EINVAL there made the fallback never happen (wget: "bad address"). */
+    if (domain == AF_INET6) return -LXE_EAFNOSUPPORT;
     if (domain != AF_INET) return -ABI_EINVAL;
     int t = type & 0xff;                /* strip SOCK_NONBLOCK/SOCK_CLOEXEC */
     int kind;
@@ -3929,6 +3937,20 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         return p ? p->pid : 0;
     }
     case LX_set_robust_list:
+        return 0;
+
+    /* B17: busybox wraps each network op in an alarm-timeout via setitimer
+     * (arm + disarm). We don't model interval timers, so accept-and-ignore as
+     * success (the watched I/O has its own timeouts); getitimer zero-fills its
+     * out struct. ftruncate sizes wget's output file -- the content is written
+     * by write() regardless, so a no-op success is correct here. */
+    case LX_setitimer:
+        return 0;
+    case LX_getitimer:
+        if (a2) { struct { long it[4]; } z; for (int i=0;i<4;i++) z.it[i]=0;
+                  (void)copy_to_user((void *)(uintptr_t)a2, &z, sizeof z); }
+        return 0;
+    case LX_ftruncate:
         return 0;
 
     /* stdio probes the tty geometry on first write; any error just means

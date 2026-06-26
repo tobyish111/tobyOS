@@ -5558,6 +5558,53 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXNETBB_BOOT
+    /* Track B milestone B17 -- run REAL off-the-shelf busybox network applets
+     * over the B16 socket client path: `nslookup` (musl getaddrinfo -> UDP DNS
+     * via /etc/resolv.conf) and `wget` (getaddrinfo + TCP active-open + HTTP).
+     * This validates B16 with genuine, unmodified musl-libc third-party software
+     * rather than a first-party proof. Build EXTRA_CFLAGS+=-DLXNETBB_BOOT with
+     * the opt-in busybox staged + SLIRP networking (logs/b17.sh; needs host
+     * internet). Any [linux] unhandled syscall is self-identifying. */
+    {
+        static char *bb[][5] = {
+            { (char *)"busybox", (char *)"nslookup", (char *)"example.com", 0, 0 },
+            { (char *)"busybox", (char *)"wget", (char *)"-O", (char *)"/data/bb_wget.out",
+              (char *)"http://example.com/" },
+        };
+        int n = (int)(sizeof(bb) / sizeof(bb[0]));
+        int npass = 0, nrun = 0;
+        for (int t = 0; t < n; t++) {
+            char *argv[6]; int ac = 0;
+            for (int i = 0; i < 5 && bb[t][i]; i++) argv[ac++] = bb[t][i];
+            argv[ac] = 0;
+            char *envp[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec spec = {
+                .path = "/bin/busybox", .name = "busybox",
+                .argc = ac, .argv = argv, .envc = 1, .envp = envp,
+            };
+            kprintf("[boot] LXNETBB: busybox %s %s ...\n", bb[t][1],
+                    bb[t][2] ? bb[t][2] : "");
+            int pid = proc_spawn(&spec);
+            if (pid < 0) {
+                kprintf("[LXNETBB] VERDICT: SKIP reason=no-busybox "
+                        "(stage programs/busybox/busybox)\n");
+                nrun = -1;
+                break;
+            }
+            int rc = proc_wait(pid);
+            nrun++;
+            if (rc == 0) npass++;
+            kprintf("[LXNETBB] busybox %-8s exit=%d %s\n", bb[t][1], rc,
+                    rc == 0 ? "OK" : "FAIL");
+        }
+        if (nrun >= 0)
+            kprintf("[LXNETBB] VERDICT: %s pass=%d/%d (real musl busybox "
+                    "nslookup + wget over SLIRP)\n",
+                    (npass == nrun && nrun > 0) ? "PASS" : "FAIL", npass, nrun);
+    }
+#endif
+
 #ifdef LINUXBB_BOOT
     /* Track B milestone B2 -- run a REAL musl-libc binary (busybox). Build
      * EXTRA_CFLAGS+=-DLINUXBB_BOOT, with an opt-in musl-static busybox staged

@@ -24,6 +24,8 @@
 static struct sock g_socks[SOCK_MAX];
 static uint16_t    g_next_ephemeral = 33000;
 
+static int sock_bind_ephemeral(struct sock *s);   /* defined below */
+
 /* ---- wait-queue helpers (mirrors pipe.c) -----------------------
  * sock_recvfrom now actively drains the NIC while waiting (see there) rather
  * than parking on s->wq_recv, so wq_add is gone; wq_wake_all stays so
@@ -106,7 +108,10 @@ struct sock *sock_lookup_by_port(uint16_t dst_port_be) {
 
 int sock_bind(struct sock *s, uint16_t port_be) {
     if (!s || !s->in_use) return -1;
-    if (port_be == 0)     return -1;
+    /* BSD semantics: port 0 means "assign any free ephemeral port" -- this is
+     * what musl/busybox resolvers do (bind a UDP socket to 0 before sending a
+     * DNS query). Treating it as an error broke `nslookup` (bind EADDRINUSE). */
+    if (port_be == 0) return sock_bind_ephemeral(s);
     if (sock_lookup_by_port(port_be)) return -1;
     s->local_port = port_be;
     return 0;
