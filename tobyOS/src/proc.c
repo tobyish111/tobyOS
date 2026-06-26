@@ -587,6 +587,7 @@ static int spawn_internal(const char *path, const char *name,
     p->is_thread    = false;
     p->detached     = false;
     p->tls_base     = 0;
+    p->clear_child_tid = 0;       /* B11: no pthread_join futex address yet */
     p->join_waiters = 0;
     p->user_arg     = 0;
     /* Phase 1 M1.3: init signal state for new process */
@@ -1012,9 +1013,23 @@ static void wakeup_waiters(int pid) {
 }
 
 __attribute__((noreturn)) void proc_exit(int code) {
+    struct proc *p = current_proc();
+
+    /* B11: Linux pthread_join. If this thread registered a clear_child_tid
+     * (via clone(CLONE_CHILD_CLEARTID) or set_tid_address), write 0 to that
+     * user word and FUTEX_WAKE it -- the joining thread is parked in
+     * futex(FUTEX_WAIT, &tid). Done BEFORE cli() so a demand/CoW fault on the
+     * word resolves with IRQs on, and while we're still in this thread's CR3. */
+    if (p && p->clear_child_tid) {
+        uint32_t zero = 0;
+        (void)copy_to_user((void *)(uintptr_t)p->clear_child_tid,
+                           &zero, sizeof(zero));
+        (void)futex((uint32_t *)(uintptr_t)p->clear_child_tid, FUTEX_WAKE, 1);
+        p->clear_child_tid = 0;
+    }
+
     cli();
 
-    struct proc *p = current_proc();
     p->exit_code   = code;
 
     if (signal_get_foreground() == p->pid) {

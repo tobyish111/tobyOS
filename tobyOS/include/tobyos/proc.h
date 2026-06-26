@@ -254,6 +254,11 @@ struct proc {
      * scheduler never steals an idle proc onto another CPU. */
     bool            is_idle;
     uint64_t        tls_base;
+    /* B11: Linux pthread_join support. A user VA recorded via clone(
+     * CLONE_CHILD_CLEARTID) or set_tid_address(): on this thread's exit the
+     * kernel writes 0 there and FUTEX_WAKEs it, which is exactly what glibc/
+     * musl pthread_join blocks on (futex FUTEX_WAIT on &thread->tid). 0 = unset. */
+    uint64_t        clear_child_tid;
     uint64_t        gs_base;     /* Win32 TEB base (0 if not a PE); see above */
     /* Win32 CRT heap (Track C): a bump allocator over sys_mmap'd anonymous
      * user memory, backing the kernel32/ucrt malloc/calloc shims. Lazily

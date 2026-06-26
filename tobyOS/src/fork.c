@@ -380,6 +380,13 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     if ((flags & 0x01000000u /* CLONE_CHILD_SETTID */) && ctid)
         (void)put_user_u32((void *)ctid, (uint32_t)child_pid);
 
+    /* B11: CLONE_CHILD_CLEARTID -- record the futex address the kernel must
+     * zero + wake when THIS thread exits (the pthread_join rendezvous). The
+     * child was memcpy'd from the parent, so set it explicitly (else it would
+     * inherit the parent's, or a stale value). */
+    child->clear_child_tid =
+        (flags & 0x00200000u /* CLONE_CHILD_CLEARTID */) ? ctid : 0;
+
     child->state = PROC_READY;
     sched_enqueue(child);
     perf_count_proc_spawn();
@@ -642,6 +649,10 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     p->brk_base = USER_HEAP_BASE;
     p->brk_cur  = USER_HEAP_BASE;
     p->brk_max  = USER_HEAP_BASE + USER_HEAP_MAX_BYTES;
+
+    /* B11: the new image hasn't registered a pthread-exit futex yet; drop any
+     * clear_child_tid carried over from the replaced image. */
+    p->clear_child_tid = 0;
 
     /* Update name from the new path. */
     const char *base = kpath;

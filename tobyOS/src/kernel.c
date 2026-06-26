@@ -5378,6 +5378,29 @@ void _start(void) {
             kprintf("[LXTHREAD] VERDICT: %s exit=%d (expected 0)\n",
                     trc == 0 ? "PASS" : "FAIL", trc);
         }
+
+        /* B11: prove pthread_join -- a hand-rolled ELF spawns N joinable
+         * threads with clone(CLONE_CHILD_CLEARTID), then joins each via
+         * futex(FUTEX_WAIT,&tid); it exits 0 only if the kernel zeroed every
+         * tid + woke the futex on each thread's exit (the join rendezvous). */
+        kprintf("[boot] LXJOIN: spawning /bin/linux-join (clone+futex join)\n");
+        char *jargv[] = { (char *)"linux-join", 0 };
+        char *jenvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec jspec = {
+            .path = "/bin/linux-join", .name = "linux-join",
+            .argc = 1, .argv = jargv, .envc = 1, .envp = jenvp,
+        };
+        int jpid = proc_spawn(&jspec);
+        if (jpid < 0) {
+            kprintf("[LXJOIN] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int jrc = proc_wait(jpid);
+            kprintf("[boot] LXJOIN: /bin/linux-join (pid=%d) exit=%d\n",
+                    jpid, jrc);
+            kprintf("[LXJOIN] VERDICT: %s exit=%d (expected 0; pthread_join "
+                    "contract: CLONE_CHILD_CLEARTID + futex wake)\n",
+                    jrc == 0 ? "PASS" : "FAIL", jrc);
+        }
     }
 #endif
 

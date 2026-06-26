@@ -3318,10 +3318,12 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         }
         return -ABI_EINVAL;
 
-    /* libc records a thread-exit futex address here; we have nothing to
-     * store for it but must return the tid (libc uses the return value). */
+    /* B11: libc records its thread-exit futex address here. Store it as the
+     * clear_child_tid so proc_exit zeroes it + FUTEX_WAKEs on exit (the
+     * pthread_join contract). Returns the tid (libc uses the return value). */
     case LX_set_tid_address: {
         struct proc *p = current_proc();
+        if (p) p->clear_child_tid = (uint64_t)a1;
         return p ? p->pid : 0;
     }
     case LX_set_robust_list:
