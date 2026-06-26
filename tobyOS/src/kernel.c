@@ -5740,6 +5740,62 @@ void _start(void) {
     }
 #endif
 
+#ifdef XPIPE_BOOT
+    /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
+     * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux
+     * binaries, exchanging bytes through kernel pipes. Neither Windows nor
+     * Linux can run the other's binaries in a pipeline; tobyOS does both on one
+     * kernel. This relies on execve()->PE (fork.c): a forked `sh` stage can now
+     * execve() a .exe and have it run as a Win32 process, with its
+     * WriteFile/ReadFile bytes flowing through the SAME kernel pipe/dup2
+     * machinery proven by B12. Each pipeline's asserting last stage exits 0 iff
+     * the expected bytes traversed every personality boundary. */
+    {
+        static const char *xpipes[] = {
+            /* Windows -> Linux: a Windows PE's WriteFile(stdout) feeds Linux grep. */
+            "/bin/win-xprod.exe | busybox grep -q XPIPE_TOKEN_OK",
+            /* Linux -> Windows: Linux echo feeds a Windows PE's ReadFile(stdin).
+             * The .exe is the LAST stage, so its exit code is the pipeline's. */
+            "busybox echo XPIPE_TOKEN_OK | /bin/win-xcons.exe",
+            /* Linux -> Windows -> Linux: TWO personality flips in one pipeline.
+             * The Windows filter both reads and writes kernel pipes; the far
+             * Linux grep only matches if the Windows transform actually ran. */
+            "busybox echo XPIPE_TOKEN_OK | /bin/win-xfilter.exe | "
+                "busybox grep -q WIN-SAW:XPIPE_TOKEN_OK",
+        };
+        static const char *xnames[] = {
+            "win->linux", "linux->win", "linux->win->linux"
+        };
+        int xn = (int)(sizeof(xpipes) / sizeof(xpipes[0]));
+        int xpass = 0, xrun = 0;
+        for (int t = 0; t < xn; t++) {
+            char *xargv[] = { (char *)"sh", (char *)"-c", (char *)xpipes[t], 0 };
+            char *xenvp[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec xspec = {
+                .path = "/bin/busybox", .name = "sh",
+                .argc = 3, .argv = xargv, .envc = 1, .envp = xenvp,
+            };
+            kprintf("[boot] XPIPE: [%s] sh -c '%s'\n", xnames[t], xpipes[t]);
+            int xpid = proc_spawn(&xspec);
+            if (xpid < 0) {
+                kprintf("[boot] XPIPE: /bin/busybox not present -- SKIPPED\n");
+                kprintf("[XPIPE] VERDICT: SKIP reason=no-busybox\n");
+                xrun = -1;
+                break;
+            }
+            int xrc = proc_wait(xpid);
+            xrun++;
+            if (xrc == 0) xpass++;
+            kprintf("[XPIPE] stage-test %d (%s) exit=%d %s\n", t, xnames[t], xrc,
+                    xrc == 0 ? "OK" : "FAIL");
+        }
+        if (xrun >= 0)
+            kprintf("[XPIPE] VERDICT: %s pass=%d/%d (cross-personality "
+                    "Windows<->Linux pipelines over kernel pipes)\n",
+                    (xpass == xrun && xrun > 0) ? "PASS" : "FAIL", xpass, xrun);
+    }
+#endif
+
 #ifdef LINUXDYN_BOOT
     /* Track B/B5: run a DYNAMICALLY-linked Linux binary -- a real musl
      * busybox (PT_INTERP=/lib/ld-musl-x86_64.so.1, NEEDED libc.musl).

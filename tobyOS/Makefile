@@ -1343,6 +1343,31 @@ programs/win-hello/win-hello.exe: programs/win-hello/hello.c
 	      -fno-stack-protector -O1 -Wl,-e,hello_entry -Wl,--subsystem,console \
 	      -o $@ $< -lkernel32
 
+# ---------- Track X / X1 (cross-personality pipeline): win-x*.exe ----------
+#
+# Three GENUINE Windows x86-64 console PEs (same -nostdlib / kernel32-only build
+# as win-hello), used as stages of busybox `sh` pipelines that mix Windows and
+# Linux binaries on one kernel. They prove X1's execve()->PE path: a Linux shell
+# stage execve()s a .exe, whose WriteFile/ReadFile bytes flow through kernel
+# pipes to/from Linux stages.
+#   win-xprod   : producer  -- WriteFile(stdout, token)
+#   win-xcons   : consumer  -- ReadFile(stdin), assert token, exit 0/1
+#   win-xfilter : middle    -- ReadFile(stdin) -> WriteFile(stdout, "WIN-SAW:"+in)
+programs/win-xprod/win-xprod.exe: programs/win-xprod/main.c
+	$(CC) --target=x86_64-w64-mingw32 -nostdlib -ffreestanding -fno-builtin \
+	      -fno-stack-protector -O1 -Wl,-e,xprod_entry -Wl,--subsystem,console \
+	      -o $@ $< -lkernel32
+
+programs/win-xcons/win-xcons.exe: programs/win-xcons/main.c
+	$(CC) --target=x86_64-w64-mingw32 -nostdlib -ffreestanding -fno-builtin \
+	      -fno-stack-protector -O1 -Wl,-e,xcons_entry -Wl,--subsystem,console \
+	      -o $@ $< -lkernel32
+
+programs/win-xfilter/win-xfilter.exe: programs/win-xfilter/main.c
+	$(CC) --target=x86_64-w64-mingw32 -nostdlib -ffreestanding -fno-builtin \
+	      -fno-stack-protector -O1 -Wl,-e,xfilter_entry -Wl,--subsystem,console \
+	      -o $@ $< -lkernel32
+
 # Track C/C2: a Windows PE that uses the real C RUNTIME. Unlike win-hello
 # (-nostdlib), this keeps the ucrt libs so `printf`/`puts` link to their real
 # mingw wrappers -> the ucrt stdio primitives (__acrt_iob_func +
@@ -1911,6 +1936,9 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-printf21/win-printf21.exe \
                programs/win-scan22/win-scan22.exe \
                programs/win-wide23/win-wide23.exe \
+               programs/win-xprod/win-xprod.exe \
+               programs/win-xcons/win-xcons.exe \
+               programs/win-xfilter/win-xfilter.exe \
                 initrd/etc/c19b.lua \
                 initrd/etc/c20.lua \
                 initrd/etc/c21.lua \
@@ -2012,6 +2040,9 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-printf21/win-printf21.exe         $(INITRD_STAGE)/bin/win-printf21.exe
 	cp programs/win-scan22/win-scan22.exe             $(INITRD_STAGE)/bin/win-scan22.exe
 	cp programs/win-wide23/win-wide23.exe             $(INITRD_STAGE)/bin/win-wide23.exe
+	cp programs/win-xprod/win-xprod.exe               $(INITRD_STAGE)/bin/win-xprod.exe
+	cp programs/win-xcons/win-xcons.exe               $(INITRD_STAGE)/bin/win-xcons.exe
+	cp programs/win-xfilter/win-xfilter.exe           $(INITRD_STAGE)/bin/win-xfilter.exe
 	cp initrd/etc/c19b.lua                            $(INITRD_STAGE)/etc/c19b.lua
 	cp initrd/etc/c20.lua                             $(INITRD_STAGE)/etc/c20.lua
 	cp initrd/etc/c21.lua                             $(INITRD_STAGE)/etc/c21.lua
@@ -2240,6 +2271,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-font18c.exe bin/win-lua.exe bin/win-com19c.exe        \
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe                                            \
+	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
 	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
 	    etc/Lato-BoldItalic.ttf                                       \

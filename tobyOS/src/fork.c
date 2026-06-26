@@ -15,6 +15,7 @@
 #include <tobyos/heap.h>
 #include <tobyos/vfs.h>
 #include <tobyos/elf.h>
+#include <tobyos/pe.h>
 #include <tobyos/tss.h>
 #include <tobyos/cpu.h>
 #include <tobyos/printk.h>
@@ -416,6 +417,131 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
 #define USER_HEAP_BASE       0x0000000010000000ULL
 #define USER_HEAP_MAX_BYTES  (256ULL * 1024ULL * 1024ULL)
 
+/* SWAPGS shadow MSR -- holds the CPL3 GS base (TEB for a Win32 PE). See
+ * do_switch (sched.c) + proc_switch.S. */
+#define IA32_KERNEL_GS_BASE_MSR 0xC0000102u
+
+/* Windows entry points are entered with a 256 KiB stack, matching proc.c's
+ * build_user_stack (64 pages). The ELF execve path uses USER_STACK_PAGES (8),
+ * but a Win32 CRT wants more headroom, so the PE arm maps its own. */
+#define PE_STACK_PAGES  64
+
+/* ===================================================================
+ * execve_pe -- the Windows-PE arm of sys_execve (Track X / X1).
+ *
+ * sys_execve() has already: copied the path/argv/envp into kernel buffers,
+ * read the image, created `new_pml4`, and switched CR3 to it (so vmm_map here
+ * targets the new address space). This loads the image as a Win32 PE instead
+ * of an ELF, flips the process to ABI_PERS_WIN32, installs the TEB/GS base,
+ * and enters the PE entry point -- so a Linux or native process (e.g. a shell
+ * stage) can execve() a genuine .exe. This is the kernel feature that lets a
+ * single pipeline mix Windows and Linux binaries.
+ *
+ * On success this never returns (drops to ring 3). On failure it restores the
+ * caller's previous address space and returns a negative ABI error; the
+ * caller's image is gone past the point of pe_load_user success, so a late
+ * failure (stack OOM) returns -ABI_ENOMEM with the old image already torn
+ * down -- identical to the ELF path's point-of-no-return semantics.
+ * =================================================================== */
+static long execve_pe(struct proc *p, void *image, size_t image_size,
+                      const char *kpath, int kargc, char **kargv_buf,
+                      uint64_t old_pml4, uint64_t new_pml4,
+                      uint64_t saved_cr3, uint64_t old_editor) {
+    struct pe_load_info pe_info = {0};
+    int prc = pe_load_user(image, image_size, kargc, kargv_buf, &pe_info);
+    kfree(image);
+
+    bool ok = (prc == 0);
+
+    /* Map the Win32 user stack (256 KiB). Top is shared with the ELF layout
+     * (USER_STACK_TOP_VA); the base floats down PE_STACK_PAGES pages. */
+    const uint64_t pe_stack_top_page =
+        USER_STACK_TOP_VA - (uint64_t)PE_STACK_PAGES * PAGE_SIZE;
+    if (ok) {
+        p->user_stack_base  = pe_stack_top_page;
+        p->user_stack_pages = PE_STACK_PAGES;
+        for (size_t i = 0; i < PE_STACK_PAGES; i++) {
+            uint64_t phys = pmm_alloc_page();
+            if (!phys) { ok = false; break; }
+            if (!vmm_map(pe_stack_top_page + i * PAGE_SIZE, phys, PAGE_SIZE,
+                         VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
+                pmm_free_page(phys);
+                ok = false;
+                break;
+            }
+            memset((void *)pmm_phys_to_virt(phys), 0, PAGE_SIZE);
+        }
+    }
+
+    if (!ok) {
+        write_cr3(saved_cr3);
+        vmm_set_editor_root(old_editor);
+        vmm_destroy_user_pml4(new_pml4);
+        return -ABI_ENOMEM;
+    }
+
+    /* Success -- point of no return. Commit the new address space. */
+    write_cr3(new_pml4);
+    vmm_set_editor_root(old_editor);
+    if (old_pml4 != new_pml4 && p->owns_pml4) {
+        vmm_destroy_user_pml4(old_pml4);
+    }
+    p->cr3       = new_pml4;
+    p->owns_pml4 = true;
+
+    /* Reset heap (both tobyOS and Win32 CRT heaps are per-image). */
+    p->brk_base = USER_HEAP_BASE;
+    p->brk_cur  = USER_HEAP_BASE;
+    p->brk_max  = USER_HEAP_BASE + USER_HEAP_MAX_BYTES;
+    p->win_heap_cur = 0;
+    p->win_heap_end = 0;
+    p->clear_child_tid = 0;
+
+    /* Flip to the Win32 personality and install the PE's TEB + resource/TLS
+     * metadata -- mirrors the PE arm of proc_spawn (proc.c). */
+    p->personality      = ABI_PERS_WIN32;
+    p->gs_base          = pe_info.teb;
+    p->win_image_base   = pe_info.image_base;
+    p->win_rsrc_rva     = pe_info.rsrc_rva;
+    p->win_rsrc_size    = pe_info.rsrc_size;
+    p->win_tls_raw_va   = pe_info.tls_raw_va;
+    p->win_tls_raw_size = pe_info.tls_raw_size;
+    p->win_tls_total    = pe_info.tls_total;
+    p->win_tls_index    = pe_info.tls_index;
+
+    /* Update name from the new path. */
+    const char *base = kpath;
+    for (const char *c = kpath; *c; c++) if (*c == '/') base = c + 1;
+    size_t n = strlen(base);
+    if (n >= PROC_NAME_MAX) n = PROC_NAME_MAX - 1;
+    memcpy(p->name, base, n);
+    p->name[n] = '\0';
+
+    p->user_entry = pe_info.entry;
+    /* Win32 ABI: enter with RSP%16==8 (as if reached by a CALL). Headroom
+     * above RSP for the marshalling gate's MS-x64 stack-arg reads. */
+    p->user_rsp   = ((USER_STACK_TOP_VA - 0x400) & ~0xFULL) - 8;
+
+    signal_init_proc(&p->sigstate);
+    p->pending_signals = 0;
+
+    /* execve normally relies on do_switch having put this proc's GS base in the
+     * SWAPGS shadow before it runs. But we are NOT going through the scheduler
+     * -- we iretq directly via proc_enter_user_asm, whose swapgs moves the
+     * shadow into the active GS. The shadow still holds the OLD (pre-execve)
+     * value, so install the PE's TEB now; otherwise the CRT's gs:[0x30]
+     * (NtCurrentTeb) reads stale kernel per-CPU data. Safe in CPL0: a kernel
+     * IRQ does not swapgs (it checks the trapped CS). */
+    wrmsr(IA32_KERNEL_GS_BASE_MSR, pe_info.teb);
+
+    kprintf("[execve] pid=%d now running Win32 PE '%s' entry=%p teb=%p "
+            "rsp=%p\n", p->pid, p->name, (void *)p->user_entry,
+            (void *)pe_info.teb, (void *)p->user_rsp);
+
+    bkl_exit();
+    proc_enter_user_asm(p->user_entry, p->user_rsp);
+}
+
 long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     struct proc *p = current_proc();
     if (!p || p->pid == 0) return -ABI_EINVAL;
@@ -486,6 +612,16 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     uint64_t saved_cr3  = read_cr3();
     uint64_t old_editor = vmm_set_editor_root(new_pml4);
     write_cr3(new_pml4);
+
+    /* Track X / X1: a Windows PE/COFF image loads via an entirely separate
+     * path (sections + IAT thunks, Win32 personality, TEB/GS). Detect it by
+     * the 'MZ'/'PE' magic and branch -- this is what lets a Linux or native
+     * process (e.g. a busybox `sh` pipeline stage) execve() a .exe, so a
+     * single pipeline can mix Windows and Linux binaries. */
+    if (pe_is_image(image, image_size)) {
+        return execve_pe(p, image, image_size, kpath, kargc, kargv_buf,
+                         old_pml4, new_pml4, saved_cr3, old_editor);
+    }
 
     /* Check for PT_INTERP. */
     char interp_path[ABI_PATH_MAX];
