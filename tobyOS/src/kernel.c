@@ -5526,6 +5526,38 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXHTTP_BOOT
+    /* Track B milestone B16 -- networking CLIENT capstone. A genuine Linux
+     * x86-64 ELF (raw syscalls) RESOLVES a hostname over a UDP DNS socket
+     * (sendto/recvfrom to the nameserver in /etc/resolv.conf) and then FETCHES
+     * it over a TCP active-open (connect) + HTTP GET, parsing the A record and
+     * checking the reply begins "HTTP/". Exit 55 is reachable only if BOTH the
+     * DNS resolve and the real HTTP fetch succeed -- over QEMU SLIRP this is a
+     * live round-trip to the real internet via the host. Build
+     * EXTRA_CFLAGS+=-DLXHTTP_BOOT and run logs/b16.sh (needs host internet). */
+    {
+        kprintf("[boot] LXHTTP: net_up=%d -- spawning /bin/linux-httpget "
+                "(UDP DNS + TCP HTTP GET)\n", (int)net_is_up());
+        char *hargv[] = { (char *)"linux-httpget", 0 };
+        char *henvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec hspec = {
+            .path = "/bin/linux-httpget", .name = "linux-httpget",
+            .argc = 1, .argv = hargv, .envc = 1, .envp = henvp,
+        };
+        int hpid = proc_spawn(&hspec);
+        if (hpid < 0) {
+            kprintf("[LXHTTP] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int hrc = proc_wait(hpid);
+            kprintf("[boot] LXHTTP: /bin/linux-httpget (pid=%d) exit=%d\n",
+                    hpid, hrc);
+            kprintf("[LXHTTP] VERDICT: %s exit=%d (expected 55; UDP DNS resolve "
+                    "+ TCP active-open HTTP GET over SLIRP)\n",
+                    hrc == 55 ? "PASS" : "FAIL", hrc);
+        }
+    }
+#endif
+
 #ifdef LINUXBB_BOOT
     /* Track B milestone B2 -- run a REAL musl-libc binary (busybox). Build
      * EXTRA_CFLAGS+=-DLINUXBB_BOOT, with an opt-in musl-static busybox staged

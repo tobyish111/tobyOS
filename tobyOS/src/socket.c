@@ -19,6 +19,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/cpu.h>
 #include <tobyos/cap.h>
+#include <tobyos/pit.h>
 
 static struct sock g_socks[SOCK_MAX];
 static uint16_t    g_next_ephemeral = 33000;
@@ -179,14 +180,27 @@ long sock_sendto(struct sock *s, const void *buf, size_t len,
 
 long sock_recvfrom(struct sock *s, void *buf, size_t n,
                    uint32_t *src_ip_be, uint16_t *src_port_be) {
+    return sock_recvfrom_to(s, buf, n, src_ip_be, src_port_be, 0);
+}
+
+long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
+                      uint32_t *src_ip_be, uint16_t *src_port_be,
+                      uint32_t timeout_ms) {
     if (!cap_check(current_proc(), CAP_NET, "sock_recvfrom")) return -1;
     if (!s || !s->in_use)  return -1;
     if (!buf && n)         return -1;
+
+    uint64_t deadline = 0;
+    if (timeout_ms) {
+        uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
+        deadline = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
+    }
 
     while (s->count == 0) {
         struct proc *self = current_proc();
         if (self->pending_signals) return EINTR_RET;
         if (!s->in_use)            return -1;
+        if (deadline && pit_ticks() >= deadline) return 0;   /* timed out */
         /* Actively pull the NIC RX ring so inbound datagrams are delivered
          * (udp_recv -> sock_deliver) while we wait. The e1000 IRQ-driven wake
          * alone does not reliably advance a blocked UDP recv -- every other

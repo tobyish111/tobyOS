@@ -34,6 +34,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/cpu.h>
 #include <tobyos/klibc.h>
+#include <tobyos/vfs.h>
 
 /* ---- runtime state --------------------------------------------- */
 
@@ -228,6 +229,28 @@ static void net_dhcp_retry_gap(struct net_dev *nd, unsigned ms) {
     }
 }
 
+/* Refresh the resolver config from the live DHCP lease so a Linux binary's
+ * libc (e.g. musl getaddrinfo) finds the nameserver the same way it would on
+ * Linux. Best-effort: the initrd root is a read-only ramfs, so today this is a
+ * silent no-op and /etc/resolv.conf is the static one shipped in the initrd
+ * (SLIRP's 10.0.2.3, which DHCP also hands out); on any writable root mount it
+ * rewrites the file to match the real lease. */
+static void net_write_resolv_conf(uint32_t dns_be) {
+    if (dns_be == 0) return;
+    char dnsbuf[16];
+    net_format_ip(dnsbuf, dns_be);
+    char line[64];
+    int n = 0;
+    const char *pfx = "nameserver ";
+    for (const char *p = pfx; *p && n < (int)sizeof line - 1; p++) line[n++] = *p;
+    for (const char *p = dnsbuf; *p && n < (int)sizeof line - 1; p++) line[n++] = *p;
+    if (n < (int)sizeof line - 1) line[n++] = '\n';
+    line[n] = 0;
+    int rc = vfs_write_all("/etc/resolv.conf", line, (size_t)n);
+    if (rc == VFS_OK)
+        kprintf("[net] /etc/resolv.conf -> %s\n", dnsbuf);
+}
+
 /* Apply a successful DHCP lease into the kernel globals. Logged with
  * a single human-readable line so post-mortem analysis is one grep. */
 static void net_apply_lease(const struct dhcp_lease *L, const char *src) {
@@ -243,6 +266,8 @@ static void net_apply_lease(const struct dhcp_lease *L, const char *src) {
     net_format_ip(dnsbuf, g_my_dns_be);
     kprintf("[net] %s lease applied: ip=%s mask=%s gw=%s dns=%s\n",
             src, ipbuf, mskbuf, gwbuf, dnsbuf);
+
+    net_write_resolv_conf(g_my_dns_be);
 }
 
 /* Static fallback when DHCP times out.

@@ -3356,6 +3356,7 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
  * uses read()/write() and so is unaffected either way. */
 
 /* errno values not in abi.h but expected by Linux-personality callers. */
+#define LXE_EINTR          4
 #define LXE_EAGAIN        11
 #define LXE_ENOTSOCK      88
 #define LXE_EADDRINUSE    98
@@ -3452,13 +3453,22 @@ static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen) {
 static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
-    if (s->kind != SOCK_KIND_TCP) return -LXE_EOPNOTSUPP;
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     if (alen < 8 || !uaddr ||
         copy_from_user(&sa, (const void *)(uintptr_t)uaddr, sizeof sa) != 0)
         return -ABI_EFAULT;
     if (sa.sin_family != AF_INET) return -ABI_EINVAL;
+
+    if (s->kind == SOCK_KIND_UDP) {
+        /* "Connected" UDP: just remember the peer; send()/recv() (and the
+         * connected read()/write() byte forms) then use it as the default
+         * destination. No handshake. */
+        s->peer_ip   = sa.sin_addr;
+        s->peer_port = sa.sin_port;
+        return 0;
+    }
+
     uint32_t to = s->send_timeout_ms ? s->send_timeout_ms : LX_SOCK_DEF_CONNECT_MS;
     struct tcp_conn *c = tcp_connect(sa.sin_addr, sa.sin_port, to);
     if (!c) return -LXE_ECONNREFUSED;
@@ -3466,11 +3476,49 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
     return 0;
 }
 
-/* send/recv on a CONNECTED TCP socket (addr ignored; UDP forms unsupported
- * here because the 6th syscall arg -- addrlen -- isn't delivered). */
+/* Pull a destination (ip/port, network order) for a UDP send: prefer an
+ * explicit sockaddr_in at `uaddr` (sendto's 5th arg; the 6th -- addrlen -- is
+ * not delivered, so we assume sizeof(sockaddr_in)), else the connect()-ed peer.
+ * Returns false if neither is available. */
+static bool lx_udp_dest(struct sock *s, uint64_t uaddr,
+                        uint32_t *ip_be, uint16_t *port_be) {
+    if (uaddr) {
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof sa);
+        if (copy_from_user(&sa, (const void *)(uintptr_t)uaddr, sizeof sa) != 0)
+            return false;
+        if (sa.sin_family != AF_INET) return false;
+        *ip_be = sa.sin_addr; *port_be = sa.sin_port;
+        return true;
+    }
+    if (s->peer_port) { *ip_be = s->peer_ip; *port_be = s->peer_port; return true; }
+    return false;
+}
+
+/* send/recv on a CONNECTED TCP socket, or a UDP socket (datagram to an explicit
+ * sendto address or the connect()-ed peer). */
 static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
     struct sock *s = lx_sock_of(fd);
-    if (!s || s->kind != SOCK_KIND_TCP || !s->tcp) return -LXE_ENOTSOCK;
+    if (!s) return -LXE_ENOTSOCK;
+
+    if (s->kind == SOCK_KIND_UDP) {
+        uint32_t dip; uint16_t dport;
+        if (!lx_udp_dest(s, uaddr, &dip, &dport)) return -ABI_EINVAL;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k = len ? kmalloc(len) : 0;
+        if (len && !k) return -ABI_ENOMEM;
+        long rv;
+        if (len && copy_from_user(k, (const void *)(uintptr_t)ubuf, len) != 0)
+            rv = -ABI_EFAULT;
+        else {
+            long n = sock_sendto(s, k, len, dip, dport);
+            rv = (n < 0) ? -LXE_EAGAIN : n;
+        }
+        if (k) kfree(k);
+        return rv;
+    }
+
+    if (s->kind != SOCK_KIND_TCP || !s->tcp) return -LXE_ENOTSOCK;
     (void)uaddr;
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
@@ -3488,7 +3536,34 @@ static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
 
 static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr, uint64_t ualen) {
     struct sock *s = lx_sock_of(fd);
-    if (!s || s->kind != SOCK_KIND_TCP || !s->tcp) return -LXE_ENOTSOCK;
+    if (!s) return -LXE_ENOTSOCK;
+
+    if (s->kind == SOCK_KIND_UDP) {
+        if (len == 0) return 0;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k = kmalloc(len);
+        if (!k) return -ABI_ENOMEM;
+        uint32_t sip = 0; uint16_t sport = 0;
+        uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
+        long n = sock_recvfrom_to(s, k, len, &sip, &sport, to);
+        long rv;
+        if (n == EINTR_RET) rv = -LXE_EINTR;
+        else if (n < 0)     rv = -LXE_EAGAIN;
+        else if (n == 0 && to) rv = -LXE_EAGAIN;       /* timeout, no datagram */
+        else if (copy_to_user((void *)(uintptr_t)ubuf, k, (size_t)n) != 0) rv = -ABI_EFAULT;
+        else rv = n;
+        kfree(k);
+        if (rv >= 0 && uaddr) {        /* report the sender's ip/port */
+            struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+            sa.sin_family = AF_INET; sa.sin_addr = sip; sa.sin_port = sport;
+            (void)copy_to_user((void *)(uintptr_t)uaddr, &sa, sizeof sa);
+            if (ualen) { uint32_t al = (uint32_t)sizeof sa;
+                         (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
+        }
+        return rv;
+    }
+
+    if (s->kind != SOCK_KIND_TCP || !s->tcp) return -LXE_ENOTSOCK;
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
     void *k = kmalloc(len);

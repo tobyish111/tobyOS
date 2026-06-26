@@ -1317,6 +1317,17 @@ programs/linux-siginfo/linux-siginfo.elf: programs/linux-siginfo/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# Track B/B16: a genuine Linux x86-64 static ELF proving the networking CLIENT
+# path -- a Linux binary RESOLVES a hostname over a UDP DNS socket and FETCHES
+# it over a TCP active-open + HTTP GET, all via the Linux BSD-socket syscalls
+# (socket/connect/sendto/recvfrom). Over QEMU SLIRP this reaches the real
+# internet. Same brandelf'd build shape as the other Linux ELFs.
+programs/linux-httpget/linux-httpget.elf: programs/linux-httpget/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 # ---------- Track C (Win32/PE app compat): win-hello.exe ----------
 #
 # win-hello.exe is NOT a tobyOS program: it is a GENUINE Windows x86-64
@@ -1862,6 +1873,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-poll/linux-poll.elf \
                programs/linux-netserver/linux-netserver.elf \
                programs/linux-siginfo/linux-siginfo.elf \
+               programs/linux-httpget/linux-httpget.elf \
                programs/win-hello/win-hello.exe \
                programs/win-crt/win-crt.exe \
                programs/win-hello3/win-hello3.exe \
@@ -1906,7 +1918,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
                initrd/etc/Lato-BoldItalic.ttf \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
-               initrd/etc/lua_selftest.lua \
+               initrd/etc/lua_selftest.lua initrd/etc/resolv.conf \
                $(HELLOAPP_TPKG) $(HELLOAPP_TPKG_V2) $(SDK_SAMPLE_TPKGS) \
                $(HELLOAPP_TPKG_CORRUPT) $(HELLOAPP_TPKG_BADHASH) \
                $(HELLOAPP_TPKG_NOHASH)  $(HELLOAPP_TPKG_BADFHASH) \
@@ -1927,6 +1939,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/drvmatch.conf              $(INITRD_STAGE)/etc/drvmatch.conf
 	cp initrd/etc/drvmatch.conf.test         $(INITRD_STAGE)/etc/drvmatch.conf.test
 	cp initrd/etc/lua_selftest.lua           $(INITRD_STAGE)/etc/lua_selftest.lua
+	cp initrd/etc/resolv.conf                $(INITRD_STAGE)/etc/resolv.conf
 	cp initrd/readme.txt                     $(INITRD_STAGE)/readme.txt
 	cp programs/user_hello/user_hello.elf    $(INITRD_STAGE)/bin/hello
 	cp programs/user_bad/user_bad.elf        $(INITRD_STAGE)/bin/bad
@@ -1961,6 +1974,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-poll/linux-poll.elf             $(INITRD_STAGE)/bin/linux-poll
 	cp programs/linux-netserver/linux-netserver.elf   $(INITRD_STAGE)/bin/linux-netserver
 	cp programs/linux-siginfo/linux-siginfo.elf       $(INITRD_STAGE)/bin/linux-siginfo
+	cp programs/linux-httpget/linux-httpget.elf       $(INITRD_STAGE)/bin/linux-httpget
 	cp programs/win-hello/win-hello.exe               $(INITRD_STAGE)/bin/win-hello.exe
 	cp programs/win-crt/win-crt.exe                   $(INITRD_STAGE)/bin/win-crt.exe
 	cp programs/win-hello3/win-hello3.exe             $(INITRD_STAGE)/bin/win-hello3.exe
@@ -2209,7 +2223,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-join bin/linux-poll \
-	    bin/linux-netserver bin/linux-siginfo \
+	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget \
 	    bin/win-hello.exe \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
 	    bin/win-fileio.exe bin/win-thread.exe bin/win-tls18b.exe       \
@@ -2248,6 +2262,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    system/keys/trust.db                                              \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
 	    etc/motd etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
+	    etc/resolv.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    readme.txt $$EXTRA_FILES
 

@@ -18,6 +18,7 @@
 #include <tobyos/pipe.h>
 #include <tobyos/socket.h>
 #include <tobyos/tcp.h>
+#include <tobyos/signal.h>   /* EINTR_RET */
 #include <tobyos/gui.h>
 #include <tobyos/term.h>
 #include <tobyos/heap.h>
@@ -201,13 +202,18 @@ long file_read(struct file *f, void *buf, size_t n) {
         if (!f->vfs.ops || !f->vfs.ops->read) return -1;
         return f->vfs.ops->read(&f->vfs, buf, n);
     case FILE_KIND_SOCKET:
-        /* A CONNECTED TCP socket is a byte stream: read() == recv(). UDP
-         * still needs an address, so only stream sockets are served here. */
+        /* A CONNECTED TCP socket is a byte stream: read() == recv(). A
+         * connect()-ed UDP socket reads the next datagram. */
         if (f->sock && f->sock->kind == SOCK_KIND_TCP && f->sock->tcp &&
             !f->sock->tcp_listening) {
             long r = tcp_recv(f->sock->tcp, buf, n,
                               f->sock->recv_timeout_ms);
             return (r == -1) ? 0 : r;    /* peer FIN -> EOF */
+        }
+        if (f->sock && f->sock->kind == SOCK_KIND_UDP) {
+            long r = sock_recvfrom_to(f->sock, buf, n, 0, 0,
+                                      f->sock->recv_timeout_ms);
+            return (r == EINTR_RET) ? -1 : (r < 0 ? 0 : r);
         }
         return -2;
     case FILE_KIND_WINDOW:
@@ -237,10 +243,16 @@ long file_write(struct file *f, const void *buf, size_t n) {
         if (!f->vfs.ops || !f->vfs.ops->write) return -1;
         return f->vfs.ops->write(&f->vfs, buf, n);
     case FILE_KIND_SOCKET:
-        /* Connected TCP byte stream: write() == send(). */
+        /* Connected TCP byte stream: write() == send(). A connect()-ed UDP
+         * socket sends a datagram to its peer. */
         if (f->sock && f->sock->kind == SOCK_KIND_TCP && f->sock->tcp &&
             !f->sock->tcp_listening) {
             long w = tcp_send(f->sock->tcp, buf, n);
+            return (w < 0) ? -1 : w;
+        }
+        if (f->sock && f->sock->kind == SOCK_KIND_UDP && f->sock->peer_port) {
+            long w = sock_sendto(f->sock, buf, n,
+                                 f->sock->peer_ip, f->sock->peer_port);
             return (w < 0) ? -1 : w;
         }
         return -2;
