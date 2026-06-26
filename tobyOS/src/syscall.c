@@ -3674,6 +3674,7 @@ static long win32_vformat(int fd, uint64_t ufmt, uint64_t uva) {
         bool wide = false;
         if (*p == 'l') { p++; if (*p == 'l') { wide = true; p++; } }
         else if (*p == 'h') { p++; if (*p == 'h') p++; }
+        else if (*p == 'L') { p++; }            /* long double == double on Windows */
         else if (*p == 'z' || *p == 'j' || *p == 't') { wide = true; p++; }
         else if (*p == 'I') {
             p++;
@@ -3740,6 +3741,20 @@ static long win32_vformat(int fd, uint64_t ufmt, uint64_t uva) {
             }
             if (prec >= 0 && prec < sl) sl = prec;
             emit_field(&fb, pre, 0, sbuf, sl, width, left, false);
+            break;
+        }
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+            /* C21: float printing. The double arrives as its 8-byte bit pattern
+             * in the next va_list slot (MS-x64 spills variadic doubles to the
+             * stack, which is what the C2 gate marshals). The double->decimal
+             * conversion needs FP, so it runs in the -msse kmath unit; we get
+             * back the magnitude body + sign and reuse emit_field for padding. */
+            uint64_t bits = va_next(uva, &ai);
+            unsigned ff = (plus ? KMF_PLUS : 0u) | (space ? KMF_SPACE : 0u) | (alt ? KMF_HASH : 0u);
+            char body[256]; int sgn = 0, special = 0;
+            int bl = kmath_fmt_double(bits, conv, prec, ff, body, sizeof(body), &sgn, &special);
+            if (sgn) pre[pl++] = (char)sgn;
+            emit_field(&fb, pre, pl, body, bl, width, left, zero && !special);
             break;
         }
         case '\0':

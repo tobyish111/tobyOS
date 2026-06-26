@@ -5098,6 +5098,102 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE21_BOOT
+    /* Track C -- float PRINTING through the kernel printf engine, milestone C21.
+     * Build EXTRA_CFLAGS+=-DWINPE21_BOOT. /bin/win-printf21.exe is a clang/ucrt
+     * PE (built like win-crt, so printf/fprintf route to __stdio_common_vfprintf
+     * -> win32_vformat). It fprintf()s a battery of %f/%e/%g doubles -- default
+     * and explicit precision, width, flags, exponent selection, %g zero-strip, a
+     * negative value, and a 14-sig-digit %g -- to C:\c21.out, then exits 21. The
+     * kernel re-reads /data/c21.out and matches the EXACT expected text, so the
+     * verdict is PASS only if every double rendered correctly through the engine
+     * (the C20 gap: doubles could be computed/returned but not yet printed). */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE21: spawning /bin/win-printf21.exe (kernel printf %%f/%%e/%%g)\n");
+        char *argv[] = { (char *)"win-printf21.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-printf21.exe", .name = "win-printf21.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE21] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE21: /bin/win-printf21.exe (pid=%d) exit=%d\n", pid, rc);
+            void *buf = 0; size_t sz = 0; int found = 0;
+            if (vfs_read_all("/data/c21.out", &buf, &sz) == 0 && buf) {
+                const char *p = (const char *)buf;
+                const char *needle =
+                    "C21|3.141593|1.50|0.5|100000|1e+06|1.234568e+04|1.563e-02|-2.500|0.66666666666667|    3.14|";
+                size_t nl = 0; while (needle[nl]) nl++;
+                for (size_t i = 0; sz >= nl && i + nl <= sz; i++) {
+                    size_t k = 0; while (k < nl && p[i + k] == needle[k]) k++;
+                    if (k == nl) { found = 1; break; }
+                }
+                kprintf("[boot] WINPE21: /data/c21.out = %lu bytes, match %s\n",
+                        (unsigned long)sz, found ? "FOUND" : "MISSING");
+                kfree(buf);
+            } else {
+                kprintf("[boot] WINPE21: /data/c21.out not readable\n");
+            }
+            int pass = (rc == 21 && found);
+            kprintf("[WINPE21] VERDICT: %s exit=%d match=%d (expect 21 + exact %%f/%%e/%%g output)\n",
+                    pass ? "PASS" : "FAIL", rc, found);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE21L_BOOT
+    /* Track C -- the REAL Lua 5.4 interpreter PRINTING computed floats, C21
+     * capstone. Build EXTRA_CFLAGS+=-DWINPE21L_BOOT. /bin/win-lua.exe runs
+     * /etc/c21.lua, which formats doubles (1/4, 0.1, 10/3 at 14 sig digits,
+     * sqrt(2)) to decimal text and writes C:\c21l.out (-> /data). win-lua is a
+     * mingw build so its float formatting is libmingwex IN-PROCESS (the kernel
+     * engine itself is proven by WINPE21); this confirms the full real-app story
+     * -- compute a double, print it correctly -- works end to end. */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE21L: spawning /bin/win-lua.exe /etc/c21.lua (real Lua float printing)\n");
+        char *argv[] = { (char *)"win-lua.exe", (char *)"/etc/c21.lua", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-lua.exe", .name = "win-lua.exe",
+            .argc = 2, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE21L] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE21L: /bin/win-lua.exe (pid=%d) exit=%d\n", pid, rc);
+            void *buf = 0; size_t sz = 0; int found = 0;
+            if (vfs_read_all("/data/c21l.out", &buf, &sz) == 0 && buf) {
+                const char *p = (const char *)buf;
+                const char *needle =
+                    "C21LUA=== quarter=0.250 tenth=0.1 third=3.3333333333333 root2=1.414214";
+                size_t nl = 0; while (needle[nl]) nl++;
+                for (size_t i = 0; sz >= nl && i + nl <= sz; i++) {
+                    size_t k = 0; while (k < nl && p[i + k] == needle[k]) k++;
+                    if (k == nl) { found = 1; break; }
+                }
+                kprintf("[boot] WINPE21L: /data/c21l.out = %lu bytes, sentinel %s\n",
+                        (unsigned long)sz, found ? "FOUND" : "MISSING");
+                kfree(buf);
+            } else {
+                kprintf("[boot] WINPE21L: /data/c21l.out not readable\n");
+            }
+            int pass = (rc == 0 && found);
+            kprintf("[WINPE21L] VERDICT: %s exit=%d sentinel=%d (expect exit 0 + Lua float text)\n",
+                    pass ? "PASS" : "FAIL", rc, found);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery

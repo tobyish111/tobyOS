@@ -1316,6 +1316,16 @@ programs/win-crt/win-crt.exe: programs/win-crt/main.c
 	      -fno-stack-protector -O1 -Wl,-e,c2_entry -Wl,--subsystem,console \
 	      -o $@ $<
 
+# Track C/C21: float PRINTING through the kernel printf engine. Same build as
+# win-crt (-D__USE_MINGW_ANSI_STDIO=0 routes printf/fprintf to the ucrt stdio
+# primitive __stdio_common_vfprintf -> win32_vformat) so the %f/%e/%g doubles are
+# rendered by the kernel engine (via the -msse kmath unit), not in-process.
+programs/win-printf21/win-printf21.exe: programs/win-printf21/main.c
+	@mkdir -p $(dir $@)
+	$(CC) --target=x86_64-w64-mingw32 -nostartfiles -D__USE_MINGW_ANSI_STDIO=0 \
+	      -fno-stack-protector -O1 -Wl,-e,c21_entry -Wl,--subsystem,console \
+	      -o $@ $<
+
 # Track C/C3: a STOCK Windows .exe -- a plain `clang main.c -o win-hello3.exe`
 # with NO special flags and NO custom entry, so it runs the FULL ucrt
 # mainCRTStartup before main(). Proves tobyOS runs unmodified off-the-shelf
@@ -1834,8 +1844,10 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-lua/win-lua.exe \
                programs/win-com19c/win-com19c.exe \
                programs/win-math20/win-math20.exe \
+               programs/win-printf21/win-printf21.exe \
                 initrd/etc/c19b.lua \
                 initrd/etc/c20.lua \
+                initrd/etc/c21.lua \
                initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
                initrd/etc/Lato-BoldItalic.ttf \
@@ -1925,8 +1937,10 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-lua/win-lua.exe                   $(INITRD_STAGE)/bin/win-lua.exe
 	cp programs/win-com19c/win-com19c.exe             $(INITRD_STAGE)/bin/win-com19c.exe
 	cp programs/win-math20/win-math20.exe             $(INITRD_STAGE)/bin/win-math20.exe
+	cp programs/win-printf21/win-printf21.exe         $(INITRD_STAGE)/bin/win-printf21.exe
 	cp initrd/etc/c19b.lua                            $(INITRD_STAGE)/etc/c19b.lua
 	cp initrd/etc/c20.lua                             $(INITRD_STAGE)/etc/c20.lua
+	cp initrd/etc/c21.lua                             $(INITRD_STAGE)/etc/c21.lua
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -2142,8 +2156,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-env16.exe bin/win-tls16.exe bin/win-net17.exe         \
 	    bin/win-srv17.exe bin/win-udp17.exe bin/win-sqlite.exe        \
 	    bin/win-font18c.exe bin/win-lua.exe bin/win-com19c.exe        \
-	    bin/win-math20.exe                                            \
-	    etc/c19b.lua etc/c20.lua                                      \
+	    bin/win-math20.exe bin/win-printf21.exe                       \
+	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
 	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
 	    etc/Lato-BoldItalic.ttf                                       \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \

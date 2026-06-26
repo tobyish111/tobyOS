@@ -29,4 +29,18 @@ uint64_t kmath_ldexp(uint64_t xbits, long n);   /* ldexp(x, int) -- mixed args *
  * binary exponent through e_out (a KERNEL pointer the shim copies to user). */
 uint64_t kmath_frexp(uint64_t xbits, int *e_out);
 
+/* C21: float PRINTING for the Win32 printf engine (win32_vformat). That engine
+ * is -mno-sse, so the double->decimal conversion (which needs FP) lives here.
+ * Renders the MAGNITUDE of the double `bits` for a %f/%e/%g conversion (and the
+ * upper-case variants) into out[] -- NO sign and NO field padding, both of which
+ * the engine applies via emit_field exactly like the integer conversions. The
+ * sign char ('-','+',' ' or 0) is reported through *sign_out and inf/nan through
+ * *special_out (the engine suppresses zero-padding for specials). prec<0 means
+ * the default (6). Returns the body length. flags is a bitmask of KMF_*. */
+#define KMF_PLUS  1u    /* '+' flag: force a leading sign on non-negative values */
+#define KMF_SPACE 2u    /* ' ' flag: leading space on non-negative values        */
+#define KMF_HASH  4u    /* '#' flag: keep the '.' and (for %g) trailing zeros     */
+int kmath_fmt_double(uint64_t bits, char conv, int prec, unsigned flags,
+                     char *out, int outcap, int *sign_out, int *special_out);
+
 #endif

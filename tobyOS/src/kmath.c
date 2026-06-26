@@ -198,6 +198,106 @@ uint64_t kmath_ldexp(uint64_t xbits, long n) {
     return rb;
 }
 
+/* C21: render a double for %f/%e/%g. Ported from libtoby's conv_float (the
+ * native libc float formatter) but emits only the magnitude body + reports the
+ * sign separately, so the kernel printf engine reuses its emit_field padding.
+ * Like every entry point here it brackets the FP work in kmfpu_begin/end, and
+ * all results (body chars, length, sign) are materialised to memory/integers
+ * before kmfpu_end's fxrstor runs (see kmath_op1's note on the xmm clobber). */
+int kmath_fmt_double(uint64_t bits, char conv, int prec, unsigned flags,
+                     char *out, int outcap, int *sign_out, int *special_out) {
+    kmfpu_begin();
+    int n = 0, special = 0;
+    char sign = 0;
+    int upper = (conv >= 'A' && conv <= 'Z');
+    char lc = (char)(conv | 0x20);              /* 'f' | 'e' | 'g' */
+    int hash = (flags & KMF_HASH) != 0;
+    int cap = (outcap > 8) ? outcap - 8 : 0;    /* leave slack for exponent tail */
+    if (prec < 0) prec = 6;
+    if (prec > 60) prec = 60;                   /* bound buffers; doubles show no more */
+
+    double val = b2d(bits);
+    uint64_t ab = bits & 0x7fffffffffffffffULL;
+    if (bits >> 63)             { sign = '-'; val = -val; }
+    else if (flags & KMF_PLUS)  sign = '+';
+    else if (flags & KMF_SPACE) sign = ' ';
+
+    if ((ab >> 52) == 0x7ffULL) {               /* Inf / NaN */
+        int nan = (ab & 0xfffffffffffffULL) != 0;
+        const char *t = nan ? (upper ? "NAN" : "nan") : (upper ? "INF" : "inf");
+        if (nan) sign = 0;                       /* NaN carries no sign */
+        while (*t) out[n++] = *t++;
+        special = 1;
+    } else {
+        int strip = 0;                           /* %g strips trailing zeros */
+        if (lc == 'g') {
+            int P = (prec == 0) ? 1 : prec;
+            int X = 0;
+            double t = val;
+            if (t != 0.0) { while (t >= 10.0) { t /= 10.0; X++; }
+                            while (t <  1.0) { t *= 10.0; X--; } }
+            if (X < -4 || X >= P) { lc = 'e'; prec = P - 1; }
+            else                  { lc = 'f'; prec = P - 1 - X; if (prec < 0) prec = 0; }
+            if (!hash) strip = 1;
+        }
+        if (lc == 'f' && val >= 1.8e19) lc = 'e';    /* avoid u64 overflow */
+
+        if (lc == 'e') {
+            int X = 0;
+            double m = val;
+            if (m != 0.0) { while (m >= 10.0) { m /= 10.0; X++; }
+                            while (m <  1.0) { m *= 10.0; X--; } }
+            double scale = 1.0;
+            for (int i = 0; i < prec; i++) scale *= 10.0;
+            unsigned long long one = (unsigned long long)(scale + 0.5);
+            unsigned long long md  = (unsigned long long)(m * scale + 0.5);
+            if (md >= 10ULL * one) { md /= 10; X++; }   /* 9.99..->10.0 carry */
+            char tb[80]; int tn = 0;
+            unsigned long long q = md;
+            for (int i = 0; i <= prec && tn < (int)sizeof(tb); i++) { tb[tn++] = (char)('0' + q % 10); q /= 10; }
+            if (n < cap) out[n++] = tb[tn - 1];
+            if (prec > 0 || hash) { if (n < cap) out[n++] = '.'; }
+            for (int i = tn - 2; i >= 0 && n < cap; i--) out[n++] = tb[i];
+            if (strip) { while (n > 0 && out[n-1] == '0') n--;
+                         if (n > 0 && out[n-1] == '.') n--; }
+            out[n++] = upper ? 'E' : 'e';
+            out[n++] = (X < 0) ? '-' : '+';
+            int ax = X < 0 ? -X : X;
+            char eb[8]; int en = 0;
+            do { eb[en++] = (char)('0' + ax % 10); ax /= 10; } while (ax && en < (int)sizeof(eb));
+            while (en < 2) eb[en++] = '0';
+            for (int i = en - 1; i >= 0; i--) out[n++] = eb[i];
+        } else {                                  /* %f */
+            double scale = 1.0;
+            for (int i = 0; i < prec; i++) scale *= 10.0;
+            unsigned long long ip  = (unsigned long long) val;
+            double frac = val - (double) ip;
+            unsigned long long one = (unsigned long long)(scale + 0.5);
+            unsigned long long fd  = (unsigned long long)(frac * scale + 0.5);
+            if (prec == 0) { if (frac >= 0.5) ip++; }
+            else if (fd >= one) { fd -= one; ip++; }  /* fractional carry */
+            char tb[24]; int tn = 0;
+            unsigned long long q = ip;
+            do { tb[tn++] = (char)('0' + q % 10); q /= 10; } while (q && tn < (int)sizeof(tb));
+            for (int i = tn - 1; i >= 0 && n < cap; i--) out[n++] = tb[i];
+            if (prec > 0 || hash) {
+                if (n < cap) out[n++] = '.';
+                char fb[80]; int fn = 0;
+                unsigned long long fq = fd;
+                for (int i = 0; i < prec && fn < (int)sizeof(fb); i++) { fb[fn++] = (char)('0' + fq % 10); fq /= 10; }
+                for (int i = fn - 1; i >= 0 && n < cap; i--) out[n++] = fb[i];
+                if (strip) { while (n > 0 && out[n-1] == '0') n--;
+                             if (n > 0 && out[n-1] == '.') n--; }
+            }
+        }
+    }
+
+    *sign_out = sign;
+    *special_out = special;
+    kmfpu_end();
+    return n;
+}
+
 uint64_t kmath_frexp(uint64_t xbits, int *e_out) {
     kmfpu_begin();
     double x = b2d(xbits);
