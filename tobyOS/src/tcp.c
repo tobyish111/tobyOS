@@ -869,6 +869,31 @@ static int pred_accept(const struct tcp_conn *lsn) {
     return lsn->acc_count > 0 ? 1 : 0;
 }
 
+/* ---- B14: poll/epoll readiness predicates ---------------------------- */
+
+bool tcp_can_accept(const struct tcp_conn *listener) {
+    return listener && listener->in_use &&
+           listener->state == TCP_LISTEN && listener->acc_count > 0;
+}
+
+int tcp_poll_flags(const struct tcp_conn *c) {
+    if (!c || !c->in_use) return TCP_RDY_ERR | TCP_RDY_HUP | TCP_RDY_RECV;
+    int f = 0;
+    /* recv() returns immediately when there is buffered data, when the peer
+     * has half-closed (next recv yields EOF), or when the connection was
+     * reset/closed (next recv yields an error). All three count as POLLIN. */
+    if (c->rx_count > 0) f |= TCP_RDY_RECV;
+    if (c->remote_rst_seen) f |= TCP_RDY_ERR | TCP_RDY_RECV;
+    if (c->remote_fin_seen || c->state == TCP_CLOSE_WAIT ||
+        c->state == TCP_CLOSED || c->state >= TCP_FIN_WAIT_1)
+        f |= TCP_RDY_HUP | TCP_RDY_RECV;
+    /* send() is OK while our send side is open: ESTABLISHED, or CLOSE_WAIT
+     * (peer closed their write half but we may still write). */
+    if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT)
+        f |= TCP_RDY_SEND;
+    return f;
+}
+
 struct tcp_conn *tcp_accept(struct tcp_conn *listener, uint32_t timeout_ms) {
     if (!listener || listener->state != TCP_LISTEN) return NULL;
     uint32_t hz = pit_hz();

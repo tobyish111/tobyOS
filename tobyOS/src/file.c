@@ -17,6 +17,7 @@
 #include <tobyos/file.h>
 #include <tobyos/pipe.h>
 #include <tobyos/socket.h>
+#include <tobyos/tcp.h>
 #include <tobyos/gui.h>
 #include <tobyos/term.h>
 #include <tobyos/heap.h>
@@ -200,8 +201,14 @@ long file_read(struct file *f, void *buf, size_t n) {
         if (!f->vfs.ops || !f->vfs.ops->read) return -1;
         return f->vfs.ops->read(&f->vfs, buf, n);
     case FILE_KIND_SOCKET:
-        /* Sockets need a destination/source address -- read/write
-         * have nowhere to put it. Use SYS_RECVFROM instead. */
+        /* A CONNECTED TCP socket is a byte stream: read() == recv(). UDP
+         * still needs an address, so only stream sockets are served here. */
+        if (f->sock && f->sock->kind == SOCK_KIND_TCP && f->sock->tcp &&
+            !f->sock->tcp_listening) {
+            long r = tcp_recv(f->sock->tcp, buf, n,
+                              f->sock->recv_timeout_ms);
+            return (r == -1) ? 0 : r;    /* peer FIN -> EOF */
+        }
         return -2;
     case FILE_KIND_WINDOW:
         /* Windows are drawn via SYS_GUI_FILL/TEXT and event-polled via
@@ -230,7 +237,12 @@ long file_write(struct file *f, const void *buf, size_t n) {
         if (!f->vfs.ops || !f->vfs.ops->write) return -1;
         return f->vfs.ops->write(&f->vfs, buf, n);
     case FILE_KIND_SOCKET:
-        /* See file_read above. */
+        /* Connected TCP byte stream: write() == send(). */
+        if (f->sock && f->sock->kind == SOCK_KIND_TCP && f->sock->tcp &&
+            !f->sock->tcp_listening) {
+            long w = tcp_send(f->sock->tcp, buf, n);
+            return (w < 0) ? -1 : w;
+        }
         return -2;
     case FILE_KIND_WINDOW:
         return -2;

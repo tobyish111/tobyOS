@@ -85,6 +85,21 @@ void tcp_dump(void);
 tcp_state_t tcp_state(const struct tcp_conn *c);
 const char *tcp_state_name(tcp_state_t s);
 
+/* ---- Poll/epoll readiness predicates (B14) ----------------------------
+ * Non-blocking, side-effect-free queries used by the syscall layer's
+ * file_poll_ready() so poll/select/epoll can report TCP-socket readiness. */
+
+/* True when `listener` has a completed handshake queued -- i.e. accept()
+ * would return a connection immediately without blocking. */
+bool tcp_can_accept(const struct tcp_conn *listener);
+
+/* Readiness bitmask for a connected (non-listening) connection. */
+#define TCP_RDY_RECV  0x1   /* recv won't block: data buffered, or EOF/error */
+#define TCP_RDY_SEND  0x2   /* established/half-closed our way: send is OK */
+#define TCP_RDY_HUP   0x4   /* peer sent FIN / connection torn down */
+#define TCP_RDY_ERR   0x8   /* RST seen / aborted */
+int tcp_poll_flags(const struct tcp_conn *c);
+
 /* Jacobson/Karels RTT estimator (RFC 6298). */
 void tcp_rtt_update(struct tcp_conn *c, uint32_t measured_rtt_ms);
 

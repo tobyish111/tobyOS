@@ -5458,6 +5458,41 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXNETSRV_BOOT
+    /* Track B milestone B14 -- networking capstone. A genuine Linux x86-64
+     * ELF (raw syscalls) runs an EVENT-DRIVEN TCP echo server on the Linux
+     * socket family + epoll, with TCP-socket readiness (accept-pending,
+     * recv-available) wired into the kernel's file_poll_ready predicate.
+     * Build EXTRA_CFLAGS+=-DLXNETSRV_BOOT and run logs/b14.sh: QEMU forwards
+     * tcp::18082-:8080 and the host connects once "[b14] listening" shows,
+     * sending the TOBYNET token. The server epoll_waits for the listener to
+     * become accept-ready, accepts the connection, epoll_waits for the new
+     * fd's recv-readiness, echoes the request, and exits 14 -- a code only
+     * reachable if a REAL external peer connected AND its readiness flowed
+     * through epoll (the same NIC-RX path the C17 winsock proofs exercised). */
+    {
+        kprintf("[boot] LXNETSRV: net_up=%d -- spawning /bin/linux-netserver "
+                "(epoll-driven TCP echo)\n", (int)net_is_up());
+        char *nargv[] = { (char *)"linux-netserver", 0 };
+        char *nenvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec nspec = {
+            .path = "/bin/linux-netserver", .name = "linux-netserver",
+            .argc = 1, .argv = nargv, .envc = 1, .envp = nenvp,
+        };
+        int npid = proc_spawn(&nspec);
+        if (npid < 0) {
+            kprintf("[LXNETSRV] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int nrc = proc_wait(npid);
+            kprintf("[boot] LXNETSRV: /bin/linux-netserver (pid=%d) exit=%d\n",
+                    npid, nrc);
+            kprintf("[LXNETSRV] VERDICT: %s exit=%d (expected 14; epoll-driven "
+                    "TCP accept+recv readiness + echo)\n",
+                    nrc == 14 ? "PASS" : "FAIL", nrc);
+        }
+    }
+#endif
+
 #ifdef LINUXBB_BOOT
     /* Track B milestone B2 -- run a REAL musl-libc binary (busybox). Build
      * EXTRA_CFLAGS+=-DLINUXBB_BOOT, with an opt-in musl-static busybox staged

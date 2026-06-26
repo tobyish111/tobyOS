@@ -27,6 +27,7 @@
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/socket.h>
+#include <tobyos/tcp.h>
 #include <tobyos/dns.h>
 #include <tobyos/rtc.h>
 #include <tobyos/gui.h>
@@ -2911,6 +2912,11 @@ enum {
     LX_poll = 7, LX_select = 23, LX_epoll_create = 213, LX_epoll_wait = 232,
     LX_epoll_ctl = 233, LX_pselect6 = 270, LX_ppoll = 271, LX_epoll_pwait = 281,
     LX_epoll_create1 = 291,
+    /* B14: BSD sockets (event-driven TCP servers). */
+    LX_socket = 41, LX_connect = 42, LX_accept = 43, LX_sendto = 44,
+    LX_recvfrom = 45, LX_shutdown = 48, LX_bind = 49, LX_listen = 50,
+    LX_getsockname = 51, LX_getpeername = 52, LX_setsockopt = 54,
+    LX_getsockopt = 55, LX_accept4 = 288,
 };
 
 /* arch_prctl codes. */
@@ -3130,8 +3136,24 @@ static short file_poll_ready(struct file *f) {
         }
         break;
     case FILE_KIND_SOCKET:
-        r |= LXP_POLLOUT;                    /* assume sendable */
-        if (f->sock && f->sock->count > 0) r |= LXP_POLLIN;  /* UDP rx queued */
+        if (f->sock && f->sock->kind == SOCK_KIND_TCP) {
+            /* B14: real TCP readiness. A listening socket is "readable" when a
+             * handshake has completed (accept won't block); a connected socket
+             * reports recv/send/hup/err from the live connection state. */
+            struct tcp_conn *c = f->sock->tcp;
+            if (f->sock->tcp_listening) {
+                if (tcp_can_accept(c)) r |= LXP_POLLIN;
+            } else if (c) {
+                int tf = tcp_poll_flags(c);
+                if (tf & TCP_RDY_RECV) r |= LXP_POLLIN;
+                if (tf & TCP_RDY_SEND) r |= LXP_POLLOUT;
+                if (tf & TCP_RDY_HUP)  r |= LXP_POLLHUP;
+                if (tf & TCP_RDY_ERR)  r |= LXP_POLLERR;
+            }
+        } else {
+            r |= LXP_POLLOUT;                    /* UDP: assume sendable */
+            if (f->sock && f->sock->count > 0) r |= LXP_POLLIN;  /* rx queued */
+        }
         break;
     default:                                 /* console/term/window/etc. */
         r |= LXP_POLLOUT;                    /* writable; input best-effort */
@@ -3156,10 +3178,13 @@ static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
                                  : perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
     for (;;) {
         int nready = 0;
+        bool saw_sock = false;
         for (unsigned long i = 0; i < nfds; i++) {
             fds[i].revents = 0;
             if (fds[i].fd < 0) continue;           /* negative fd: ignored */
-            short cond = file_poll_ready(fd_lookup(fds[i].fd));
+            struct file *f = fd_lookup(fds[i].fd);
+            if (f && f->kind == FILE_KIND_SOCKET) saw_sock = true;
+            short cond = file_poll_ready(f);
             short want = fds[i].events | LXP_POLLERR | LXP_POLLHUP | LXP_POLLNVAL;
             short rev  = cond & want;
             fds[i].revents = rev;
@@ -3173,6 +3198,10 @@ static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
             return nready;
         }
         if (self && self->pending_signals) return -LX_EINTR;
+        /* B14: drive RX so inbound TCP segments (handshakes completing on the
+         * listener, data arriving on a conn, peer FIN) make a watched socket
+         * ready while we cooperatively block -- the same pump tcp_accept uses. */
+        if (saw_sock) net_poll();
         sched_yield();
     }
 }
@@ -3198,13 +3227,16 @@ static long lx_do_select(int nfds, uint64_t urd, uint64_t uwr, uint64_t uex,
     for (;;) {
         memset(ord, 0, sizeof(ord)); memset(owr, 0, sizeof(owr)); memset(oex, 0, sizeof(oex));
         int nready = 0;
+        bool saw_sock = false;
         for (int fd = 0; fd < nfds; fd++) {
             int bit = 1 << (fd & 7), by = fd >> 3;
             bool wr_r = (urd && (rd[by] & bit));
             bool wr_w = (uwr && (wr[by] & bit));
             bool wr_e = (uex && (ex[by] & bit));
             if (!wr_r && !wr_w && !wr_e) continue;
-            short cond = file_poll_ready(fd_lookup(fd));
+            struct file *f = fd_lookup(fd);
+            if (f && f->kind == FILE_KIND_SOCKET) saw_sock = true;
+            short cond = file_poll_ready(f);
             if (wr_r && (cond & (LXP_POLLIN | LXP_POLLHUP | LXP_POLLERR))) { ord[by] |= bit; nready++; }
             if (wr_w && (cond & (LXP_POLLOUT | LXP_POLLERR)))             { owr[by] |= bit; nready++; }
             if (wr_e && (cond & LXP_POLLPRI))                            { oex[by] |= bit; nready++; }
@@ -3217,6 +3249,7 @@ static long lx_do_select(int nfds, uint64_t urd, uint64_t uwr, uint64_t uex,
             return nready;
         }
         if (self && self->pending_signals) return -LX_EINTR;
+        if (saw_sock) net_poll();              /* B14: pump RX (see lx_do_poll) */
         sched_yield();
     }
 }
@@ -3282,9 +3315,12 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
                                  : perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
     for (;;) {
         int n = 0;
+        bool saw_sock = false;
         for (int i = 0; i < EPOLL_MAX && n < maxevents; i++) {
             if (!ei->e[i].used) continue;
-            short cond = file_poll_ready(fd_lookup(ei->e[i].fd));
+            struct file *f = fd_lookup(ei->e[i].fd);
+            if (f && f->kind == FILE_KIND_SOCKET) saw_sock = true;
+            short cond = file_poll_ready(f);
             uint32_t want = ei->e[i].events | LXP_POLLERR | LXP_POLLHUP;
             uint32_t rev  = (uint32_t)cond & want;
             if (!rev) continue;
@@ -3298,8 +3334,208 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
             (!infinite && perf_now_ns() >= deadline))
             return n;
         if (self && self->pending_signals) return -LX_EINTR;
+        /* B14: epoll over sockets must pump RX while blocked (a full scan
+         * before yielding would otherwise never see the handshake complete). */
+        if (saw_sock) net_poll();
         sched_yield();
     }
+}
+
+/* ---- B14: Linux BSD sockets (event-driven TCP servers) ---------------
+ *
+ * POSIX sockets ARE file descriptors, so each socket is a FILE_KIND_SOCKET
+ * struct file in the proc fd table -- this is what lets poll/select/epoll,
+ * read/write and close all operate on a socket uniformly (file_poll_ready
+ * already understands TCP readiness). The handlers wrap the kernel socket
+ * pool (struct sock) and the TCP engine (tcp.c) directly rather than going
+ * through ksock_* (which use a separate Win32-style handle space).
+ *
+ * The x86-64 syscall trap only delivers 5 register args here, so the 6-arg
+ * sendto/recvfrom are supported only in their connected form (addr == NULL),
+ * which is exactly what send()/recv() on a TCP socket use; the proof server
+ * uses read()/write() and so is unaffected either way. */
+
+/* errno values not in abi.h but expected by Linux-personality callers. */
+#define LXE_EAGAIN        11
+#define LXE_ENOTSOCK      88
+#define LXE_EADDRINUSE    98
+#define LXE_EOPNOTSUPP    95
+#define LXE_ECONNREFUSED 111
+#define LXE_ENOTCONN     107
+
+#define LX_SOCK_DEF_ACCEPT_MS  3000   /* fallback accept() wait (cooperative) */
+#define LX_SOCK_DEF_CONNECT_MS 5000   /* fallback connect() wait */
+
+/* Wrap an allocated struct sock in a fresh FILE_KIND_SOCKET fd. */
+static int lx_sock_install(struct sock *s) {
+    struct file *f = (struct file *)kmalloc(sizeof(*f));
+    if (!f) return -1;
+    memset(f, 0, sizeof(*f));
+    f->kind = FILE_KIND_SOCKET;
+    f->sock = s;
+    int fd = fd_alloc_into(current_proc(), f);
+    if (fd < 0) { kfree(f); return -1; }
+    return fd;
+}
+
+static struct sock *lx_sock_of(int fd) {
+    struct file *f = fd_lookup(fd);
+    if (!f || f->kind != FILE_KIND_SOCKET) return NULL;
+    return f->sock;
+}
+
+static long lx_socket(int domain, int type, int proto) {
+    (void)proto;
+    if (domain != AF_INET) return -ABI_EINVAL;
+    int t = type & 0xff;                /* strip SOCK_NONBLOCK/SOCK_CLOEXEC */
+    int kind;
+    if (t == SOCK_STREAM)      kind = SOCK_KIND_TCP;
+    else if (t == SOCK_DGRAM)  kind = SOCK_KIND_UDP;
+    else return -ABI_EINVAL;
+    if (!cap_check(current_proc(), CAP_NET, "lx_socket")) return -ABI_EACCES;
+    struct sock *s = sock_alloc(kind);
+    if (!s) return -ABI_EMFILE;
+    int fd = lx_sock_install(s);
+    if (fd < 0) { sock_close(s); return -ABI_EMFILE; }
+    return fd;
+}
+
+static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s) return -LXE_ENOTSOCK;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    if (alen < 8 || !uaddr ||
+        copy_from_user(&sa, (const void *)(uintptr_t)uaddr, sizeof sa) != 0)
+        return -ABI_EFAULT;
+    if (sa.sin_family != AF_INET) return -ABI_EINVAL;
+    return sock_bind(s, sa.sin_port) == 0 ? 0 : -LXE_EADDRINUSE;
+}
+
+static long lx_listen(int fd, int backlog) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s) return -LXE_ENOTSOCK;
+    if (s->kind != SOCK_KIND_TCP) return -LXE_EOPNOTSUPP;
+    if (s->local_port == 0)       return -ABI_EINVAL;   /* must bind first */
+    struct tcp_conn *lsn = tcp_listen(s->local_port, backlog);
+    if (!lsn) return -LXE_EADDRINUSE;
+    s->tcp = lsn;
+    s->tcp_listening = true;
+    return 0;
+}
+
+static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s) return -LXE_ENOTSOCK;
+    if (s->kind != SOCK_KIND_TCP || !s->tcp_listening || !s->tcp)
+        return -ABI_EINVAL;
+    uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : LX_SOCK_DEF_ACCEPT_MS;
+    struct tcp_conn *child = tcp_accept(s->tcp, to);
+    if (!child) return -LXE_EAGAIN;
+    struct sock *ns = sock_alloc(SOCK_KIND_TCP);
+    if (!ns) { tcp_close(child); return -ABI_EMFILE; }
+    ns->tcp = child;
+    ns->local_port = s->local_port;
+    int nfd = lx_sock_install(ns);
+    if (nfd < 0) { tcp_close(child); sock_close(ns); return -ABI_EMFILE; }
+    if (uaddr) {
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET;        /* peer ip/port not exposed; family only */
+        (void)copy_to_user((void *)(uintptr_t)uaddr, &sa, sizeof sa);
+        if (ualen) { uint32_t al = (uint32_t)sizeof sa;
+                     (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
+    }
+    return nfd;
+}
+
+static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s) return -LXE_ENOTSOCK;
+    if (s->kind != SOCK_KIND_TCP) return -LXE_EOPNOTSUPP;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    if (alen < 8 || !uaddr ||
+        copy_from_user(&sa, (const void *)(uintptr_t)uaddr, sizeof sa) != 0)
+        return -ABI_EFAULT;
+    if (sa.sin_family != AF_INET) return -ABI_EINVAL;
+    uint32_t to = s->send_timeout_ms ? s->send_timeout_ms : LX_SOCK_DEF_CONNECT_MS;
+    struct tcp_conn *c = tcp_connect(sa.sin_addr, sa.sin_port, to);
+    if (!c) return -LXE_ECONNREFUSED;
+    s->tcp = c;
+    return 0;
+}
+
+/* send/recv on a CONNECTED TCP socket (addr ignored; UDP forms unsupported
+ * here because the 6th syscall arg -- addrlen -- isn't delivered). */
+static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s || s->kind != SOCK_KIND_TCP || !s->tcp) return -LXE_ENOTSOCK;
+    (void)uaddr;
+    if (len == 0) return 0;
+    if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+    void *k = kmalloc(len);
+    if (!k) return -ABI_ENOMEM;
+    long rv;
+    if (copy_from_user(k, (const void *)(uintptr_t)ubuf, len) != 0) rv = -ABI_EFAULT;
+    else {
+        long n = tcp_send(s->tcp, k, len);
+        rv = (n < 0) ? -ABI_EPIPE : n;
+    }
+    kfree(k);
+    return rv;
+}
+
+static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr, uint64_t ualen) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s || s->kind != SOCK_KIND_TCP || !s->tcp) return -LXE_ENOTSOCK;
+    if (len == 0) return 0;
+    if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+    void *k = kmalloc(len);
+    if (!k) return -ABI_ENOMEM;
+    uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
+    long n = tcp_recv(s->tcp, k, len, to);
+    long rv;
+    if (n == -1) rv = 0;                 /* peer closed -> EOF */
+    else if (n < 0) rv = -LXE_ECONNREFUSED;
+    else if (copy_to_user((void *)(uintptr_t)ubuf, k, (size_t)n) != 0) rv = -ABI_EFAULT;
+    else rv = n;
+    kfree(k);
+    if (rv >= 0 && uaddr) {              /* connected: report family only */
+        struct sockaddr_in sa; memset(&sa, 0, sizeof sa); sa.sin_family = AF_INET;
+        (void)copy_to_user((void *)(uintptr_t)uaddr, &sa, sizeof sa);
+        if (ualen) { uint32_t al = (uint32_t)sizeof sa;
+                     (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
+    }
+    return rv;
+}
+
+static long lx_setsockopt(int fd, int level, int optname, uint64_t uval, uint32_t olen) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s) return -LXE_ENOTSOCK;
+    if (level != SOL_SOCKET) return 0;   /* accept-and-ignore other levels */
+    if ((optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) && uval && olen >= 16) {
+        int64_t tv[2];                   /* struct timeval { sec; usec; } */
+        if (copy_from_user(tv, (const void *)(uintptr_t)uval, sizeof tv) != 0)
+            return -ABI_EFAULT;
+        uint32_t ms = (uint32_t)(tv[0] * 1000 + tv[1] / 1000);
+        if (optname == SO_RCVTIMEO) s->recv_timeout_ms = ms;
+        else                        s->send_timeout_ms = ms;
+    }
+    return 0;                            /* SO_REUSEADDR etc.: no-op success */
+}
+
+static long lx_getsockname(int fd, uint64_t uaddr, uint64_t ualen) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s || !uaddr) return -LXE_ENOTSOCK;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = s->local_port;
+    if (copy_to_user((void *)(uintptr_t)uaddr, &sa, sizeof sa) != 0) return -ABI_EFAULT;
+    if (ualen) { uint32_t al = (uint32_t)sizeof sa;
+                 (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
+    return 0;
 }
 
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
@@ -3350,6 +3586,21 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         return do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
     case LX_pipe:   return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
     case LX_pipe2:  return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
+
+    /* ---- B14: BSD sockets (FILE_KIND_SOCKET fds; poll/epoll-ready) ---- */
+    case LX_socket:      return lx_socket((int)a1, (int)a2, (int)a3);
+    case LX_bind:        return lx_bind((int)a1, (uint64_t)a2, (uint32_t)a3);
+    case LX_listen:      return lx_listen((int)a1, (int)a2);
+    case LX_accept:      return lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3);
+    case LX_accept4:     return lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3);
+    case LX_connect:     return lx_connect((int)a1, (uint64_t)a2, (uint32_t)a3);
+    case LX_sendto:      return lx_send((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5);
+    case LX_recvfrom:    return lx_recv((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5, 0);
+    case LX_setsockopt:  return lx_setsockopt((int)a1, (int)a2, (int)a3, (uint64_t)a4, (uint32_t)a5);
+    case LX_getsockopt:  return 0;       /* accept-and-ignore (returns 0/optlen unchanged) */
+    case LX_getsockname: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
+    case LX_getpeername: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
+    case LX_shutdown:    return 0;       /* half-close not modelled; close() tears down */
 
     /* ---- B13: poll / select / epoll (readiness multiplexing) ---- */
     case LX_poll:                  /* poll(fds, nfds, timeout_ms) */
