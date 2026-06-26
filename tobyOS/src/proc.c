@@ -794,15 +794,18 @@ static int spawn_internal(const char *path, const char *name,
     perf_zone_end(PERF_Z_ELF_LOAD, t_elf);
     kfree(image);                  /* segments now live in their own frames */
 
-    /* Track B: latch the ABI personality from the program's EI_OSABI. A
-     * binary branded ELFOSABI_LINUX runs through the Linux syscall
-     * translation layer; everything else keeps the tobyOS default. */
+    /* Track B: latch the ABI personality. A binary runs through the Linux
+     * syscall translation layer if it's branded ELFOSABI_LINUX *or* (B10)
+     * names a known Linux dynamic loader as its PT_INTERP -- so an unbranded
+     * off-the-shelf dynamic Linux binary drops-and-runs. Everything else keeps
+     * the tobyOS default. */
     if (ok) {
-        p->personality = (prog_info.osabi == ELFOSABI_LINUX)
-                             ? ABI_PERS_LINUX : ABI_PERS_TOBY;
-        if (p->personality == ABI_PERS_LINUX) {
+        bool is_linux = elf_is_linux_abi(prog_info.osabi, has_interp, interp_path);
+        p->personality = is_linux ? ABI_PERS_LINUX : ABI_PERS_TOBY;
+        if (is_linux) {
             kprintf("[proc] pid %d '%s' -> Linux ABI personality "
-                    "(EI_OSABI=%u)\n", p->pid, p->name, prog_info.osabi);
+                    "(EI_OSABI=%u interp=%s)\n", p->pid, p->name,
+                    prog_info.osabi, has_interp ? interp_path : "(none)");
         }
     }
 

@@ -5551,6 +5551,53 @@ void _start(void) {
     }
 #endif
 
+#ifdef LINUXAUTO_BOOT
+    /* Track B/B10: drop-and-run an UNBRANDED Linux binary. /bin/busybox-auto
+     * is a byte-for-byte copy of the musl busybox with e_ident[EI_OSABI]
+     * forced to 0 (ELFOSABI_SYSV) -- i.e. NO `brandelf` tag, exactly what a
+     * vanilla off-the-shelf Linux ELF looks like. Before B10 it would have
+     * fallen to the native personality and mis-dispatched its first syscall.
+     * Now the kernel auto-detects its PT_INTERP (/lib/ld-musl-x86_64.so.1) and
+     * switches the process to ABI_PERS_LINUX with zero preparation. The
+     * harness first re-reads the file to ASSERT it is genuinely unbranded
+     * (OSABI byte == 0), so a PASS can only mean the loader auto-detected it. */
+    {
+        const char *path = "/bin/busybox-auto";
+        void  *img = 0;
+        size_t isz = 0;
+        if (vfs_read_all(path, &img, &isz) != 0 || isz < 8) {
+            if (img) kfree(img);
+            kprintf("[boot] LXAUTO: %s not present -- SKIPPED\n", path);
+            kprintf("[LXAUTO] VERDICT: SKIP reason=no-unbranded-binary\n");
+        } else {
+            uint8_t osabi = ((const uint8_t *)img)[7];   /* e_ident[EI_OSABI] */
+            kfree(img);
+            kprintf("[boot] LXAUTO: %s on-disk EI_OSABI=%u (%s)\n", path,
+                    (unsigned)osabi,
+                    osabi == 0 ? "ELFOSABI_SYSV/unbranded" : "BRANDED");
+            if (osabi != 0) {
+                kprintf("[LXAUTO] VERDICT: FAIL reason=test-binary-not-unbranded "
+                        "osabi=%u\n", (unsigned)osabi);
+            } else {
+                char *argv[] = { (char *)"busybox-auto", (char *)"echo",
+                                 (char *)"hello from an UNBRANDED, auto-detected "
+                                         "Linux binary", 0 };
+                char *envp[] = { (char *)"PATH=/bin", 0 };
+                struct proc_spec spec = {
+                    .path = path, .name = "busybox-auto",
+                    .argc = 3, .argv = argv, .envc = 1, .envp = envp,
+                };
+                kprintf("[boot] LXAUTO: spawning %s echo ... (no brand)\n", path);
+                int pid = proc_spawn(&spec);
+                int rc  = (pid < 0) ? -1 : proc_wait(pid);
+                kprintf("[LXAUTO] VERDICT: %s exit=%d (unbranded OSABI=0 dynamic "
+                        "Linux binary; personality auto-detected from "
+                        "PT_INTERP)\n", rc == 0 ? "PASS" : "FAIL", rc);
+            }
+        }
+    }
+#endif
+
 #ifdef M36_SELFTEST
     /* Milestone 36E: in-OS compile + run self-test (TobyC stage-1). */
     {

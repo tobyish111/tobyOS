@@ -497,11 +497,12 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     bool ok = elf_load_user_at(image, image_size, prog_load_base, &prog_info);
     kfree(image);
 
-    /* Track B: re-latch the ABI personality from the new image's brand,
-     * so `exec`ing a Linux binary from a native one (or vice-versa)
-     * switches the syscall ABI for the replaced process. */
+    /* Track B: re-latch the ABI personality from the new image (brand OR a
+     * Linux-loader PT_INTERP, per B10), so `exec`ing a Linux binary from a
+     * native one (or vice-versa) switches the syscall ABI for the replaced
+     * process. */
     if (ok) {
-        p->personality = (prog_info.osabi == ELFOSABI_LINUX)
+        p->personality = elf_is_linux_abi(prog_info.osabi, has_interp, interp_path)
                              ? ABI_PERS_LINUX : ABI_PERS_TOBY;
     }
 

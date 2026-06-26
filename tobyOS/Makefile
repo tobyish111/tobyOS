@@ -2135,6 +2135,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] Track B/B5: bundling DYNAMIC musl busybox +"       \
 	         "ld-musl loader -- OPT-IN (not committed)";                 \
 	    EXTRA_FILES="$$EXTRA_FILES bin/busybox-dyn lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
+	    cp programs/busybox/busybox-dyn $(INITRD_STAGE)/bin/busybox-auto; \
+	    printf '\000' | dd of=$(INITRD_STAGE)/bin/busybox-auto bs=1       \
+	         seek=7 count=1 conv=notrunc 2>/dev/null;                    \
+	    echo "[initrd] Track B/B10: bundling UNBRANDED (EI_OSABI=0) musl" \
+	         "busybox -- proves PT_INTERP auto-detect, OPT-IN";          \
+	    EXTRA_FILES="$$EXTRA_FILES bin/busybox-auto";                     \
 	    if [ -f programs/busybox/file ] &&                               \
 	       [ -f programs/busybox/libmagic.so.1 ]; then                   \
 	        cp programs/busybox/file $(INITRD_STAGE)/bin/file;            \

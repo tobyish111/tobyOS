@@ -428,6 +428,37 @@ bool elf_peek_interp(const void *image, size_t size, char *out, size_t cap) {
     return false;
 }
 
+bool elf_is_linux_abi(uint8_t osabi, bool has_interp, const char *interp_path) {
+    /* Decide whether an ELF should run under the Linux ABI personality.
+     * Two signals, both CONSERVATIVE -- the default is always native tobyOS,
+     * and we only switch to Linux on positive evidence, so a native binary is
+     * never misclassified (which would route its whole syscall stream through
+     * the Linux translation layer and break it):
+     *
+     *   1. e_ident[EI_OSABI] == ELFOSABI_LINUX/GNU (3): the explicit
+     *      FreeBSD-style `brandelf` tag. (Original Track B mechanism.)
+     *
+     *   2. PT_INTERP names a known Linux dynamic loader (ld-linux* / ld-musl*).
+     *      This lets an UNBRANDED, off-the-shelf ELFOSABI_SYSV (0) *dynamic*
+     *      Linux binary drop-and-run with no preparation. tobyOS's own dynamic
+     *      loader is /lib/ld-toby.so, whose basename ("ld-toby") matches
+     *      neither prefix, so native PIEs stay native.
+     *
+     * A *static*, note-less ELFOSABI_SYSV binary carries no distinguishing
+     * mark from a native static binary (both are OSABI 0, no PT_INTERP, no
+     * notes), so it cannot be auto-detected and still requires the brand. */
+    if (osabi == ELFOSABI_LINUX) return true;       /* == ELFOSABI_GNU (3) */
+    if (has_interp && interp_path) {
+        const char *base = interp_path;
+        for (const char *p = interp_path; *p; p++)
+            if (*p == '/') base = p + 1;
+        if (strncmp(base, "ld-linux", 8) == 0 ||
+            strncmp(base, "ld-musl", 7) == 0)
+            return true;
+    }
+    return false;
+}
+
 bool elf_run(const void *image, size_t size, int *out_rc) {
     elf_entry_t entry;
     if (!elf_load(image, size, &entry)) return false;

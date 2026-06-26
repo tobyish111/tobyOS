@@ -254,6 +254,12 @@ bool elf_load_user_at(const void *image, size_t size, uint64_t load_base,
  * `cap`. */
 bool elf_peek_interp(const void *image, size_t size, char *out, size_t cap);
 
+/* Decide the ABI personality for an ELF: true => Linux, false => native tobyOS.
+ * Keyed off the OSABI brand (ELFOSABI_LINUX) OR a known Linux dynamic-loader
+ * PT_INTERP (ld-linux* / ld-musl*), so unbranded off-the-shelf dynamic Linux
+ * binaries drop-and-run. Conservative: native is the default. */
+bool elf_is_linux_abi(uint8_t osabi, bool has_interp, const char *interp_path);
+
 /* Convenience: elf_load + entry(); the program's int return is written
  * to *out_rc (if non-NULL). Returns false if loading fails. Only valid
  * for kernel-mode ELFs. */
