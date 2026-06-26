@@ -5493,6 +5493,49 @@ void _start(void) {
             kprintf("[LXSH] VERDICT: %s exit=%d (fork+execve+wait4 via a real "
                     "shell)\n", rc == 0 ? "PASS" : "FAIL", rc);
         }
+
+        /* B12: shell PIPELINES -- each stage is a separate fork+dup2(pipe fd
+         * onto 0/1)+execve, joined by wait4. A multi-stage pipeline only
+         * succeeds if pipe/pipe2 + dup2/dup3 wiring works AND the data flows
+         * through every stage in order. Each command's exit status is the
+         * LAST stage's, and the last stage is `grep -q <token>` (or a count),
+         * so exit 0 means the expected bytes actually traversed every pipe. */
+        static const char *pipes[] = {
+            /* 2-stage: bytes flow echo -> grep */
+            "busybox echo pipe-flows-ok | busybox grep -q pipe-flows-ok",
+            /* 3-stage: through an intermediate `cat`, content preserved */
+            "busybox echo alpha bravo charlie | busybox cat | "
+                "busybox grep -q 'alpha bravo charlie'",
+            /* 3-stage: a real transform (word count) reaches the asserting stage */
+            "busybox echo w x y z | busybox wc -w | busybox grep -q 4",
+        };
+        int pn = (int)(sizeof(pipes) / sizeof(pipes[0]));
+        int ppass = 0, prun = 0;
+        for (int t = 0; t < pn; t++) {
+            char *pargv[] = { (char *)"sh", (char *)"-c", (char *)pipes[t], 0 };
+            char *penvp[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec pspec = {
+                .path = "/bin/busybox", .name = "sh",
+                .argc = 3, .argv = pargv, .envc = 1, .envp = penvp,
+            };
+            kprintf("[boot] LXPIPE: sh -c '%s'\n", pipes[t]);
+            int ppid = proc_spawn(&pspec);
+            if (ppid < 0) {
+                kprintf("[boot] LXPIPE: /bin/busybox not present -- SKIPPED\n");
+                kprintf("[LXPIPE] VERDICT: SKIP reason=no-busybox\n");
+                prun = -1;
+                break;
+            }
+            int prc = proc_wait(ppid);
+            prun++;
+            if (prc == 0) ppass++;
+            kprintf("[LXPIPE] stage-test %d exit=%d %s\n", t, prc,
+                    prc == 0 ? "OK" : "FAIL");
+        }
+        if (prun >= 0)
+            kprintf("[LXPIPE] VERDICT: %s pass=%d/%d (multi-stage pipe + dup2 "
+                    "wiring, data flows in order)\n",
+                    (ppass == prun && prun > 0) ? "PASS" : "FAIL", ppass, prun);
     }
 #endif
 

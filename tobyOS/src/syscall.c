@@ -2906,6 +2906,7 @@ enum {
     LX_getdents64 = 217, LX_set_tid_address = 218, LX_clock_gettime = 228,
     LX_exit_group = 231, LX_tgkill = 234, LX_openat = 257,
     LX_newfstatat = 262, LX_set_robust_list = 273, LX_getrandom = 318,
+    LX_dup3 = 292, LX_pipe2 = 293,   /* B12: shell pipelines (dup3/pipe2) */
 };
 
 /* arch_prctl codes. */
@@ -3115,7 +3116,18 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         return do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
     }
     case LX_dup:    return do_syscall(SYS_DUP, a1, 0, 0, 0, 0);
+    /* B12: shell pipelines wire stage fds with dup2/dup3 and create the pipe
+     * with pipe or pipe2. dup3's flags (O_CLOEXEC) and pipe2's flags
+     * (O_CLOEXEC/O_NONBLOCK) are accepted but not tracked -- short-lived
+     * pipeline stages exec immediately, so CLOEXEC is moot and the blocking
+     * pipe semantics already give correct EOF/EPIPE. dup3 requires
+     * oldfd != newfd (EINVAL otherwise), unlike dup2. */
+    case LX_dup2:   return do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
+    case LX_dup3:
+        if (a1 == a2) return -ABI_EINVAL;
+        return do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
     case LX_pipe:   return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
+    case LX_pipe2:  return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
     case LX_getcwd: return do_syscall(SYS_GETCWD, a1, a2, 0, 0, 0);
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
