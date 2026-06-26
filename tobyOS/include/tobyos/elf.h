@@ -94,6 +94,19 @@ typedef struct {
 #define PT_PHDR    6
 #define PT_TLS     7
 
+/* GNU OS-specific program headers (the 0x6474e55x "GNU_*" range). These are
+ * emitted by GNU/LLVM toolchains targeting an OS triple (x86_64-*-linux-*) and
+ * are absent from bare-metal (x86_64-elf) output -- which is what tobyOS's own
+ * native programs build as. PT_GNU_STACK in particular is emitted on EVERY
+ * Linux-target binary, static or dynamic, branded or not, even under
+ * -nostdlib. That makes it the one signal that distinguishes a note-less,
+ * static, unbranded SYSV *Linux* binary from a native tobyOS static binary
+ * (see elf_is_linux_abi / B19). */
+#define PT_GNU_EH_FRAME 0x6474e550u
+#define PT_GNU_STACK    0x6474e551u
+#define PT_GNU_RELRO    0x6474e552u
+#define PT_GNU_PROPERTY 0x6474e553u
+
 #define PF_X 0x1
 #define PF_W 0x2
 #define PF_R 0x4
@@ -239,6 +252,9 @@ struct elf_load_info {
     uint16_t phent;
     bool     has_interp;
     uint8_t  osabi;        /* e_ident[EI_OSABI] -- drives ABI personality */
+    bool     has_gnu_phdr; /* B19: a PT_GNU_STACK/RELRO/PROPERTY phdr was seen
+                            * -- a GNU/Linux toolchain fingerprint that native
+                            * x86_64-elf binaries never carry. */
 };
 
 bool elf_load_user_at(const void *image, size_t size, uint64_t load_base,
@@ -255,10 +271,19 @@ bool elf_load_user_at(const void *image, size_t size, uint64_t load_base,
 bool elf_peek_interp(const void *image, size_t size, char *out, size_t cap);
 
 /* Decide the ABI personality for an ELF: true => Linux, false => native tobyOS.
- * Keyed off the OSABI brand (ELFOSABI_LINUX) OR a known Linux dynamic-loader
- * PT_INTERP (ld-linux* / ld-musl*), so unbranded off-the-shelf dynamic Linux
- * binaries drop-and-run. Conservative: native is the default. */
-bool elf_is_linux_abi(uint8_t osabi, bool has_interp, const char *interp_path);
+ * Positive Linux evidence, in order:
+ *   1. OSABI brand == ELFOSABI_LINUX (FreeBSD-style `brandelf` tag).
+ *   2. PT_INTERP names a known Linux dynamic loader (ld-linux* / ld-musl*) --
+ *      unbranded dynamic Linux binaries drop-and-run.
+ *   3. (B19) A *static* (no PT_INTERP) binary with a GNU OS-specific program
+ *      header (PT_GNU_STACK/RELRO/PROPERTY) -- catches the last gap: note-less,
+ *      static, unbranded SYSV Linux binaries, which still carry PT_GNU_STACK
+ *      from their Linux-target toolchain. Native *static* tobyOS (x86_64-elf)
+ *      binaries never do; the !has_interp guard exempts native *dynamic*
+ *      programs (ld-toby.so), which do carry it but are classified by rule 2.
+ * Conservative: native is the default. */
+bool elf_is_linux_abi(uint8_t osabi, bool has_interp, const char *interp_path,
+                      bool has_gnu_phdr);
 
 /* Convenience: elf_load + entry(); the program's int return is written
  * to *out_rc (if non-NULL). Returns false if loading fails. Only valid

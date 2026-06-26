@@ -801,12 +801,14 @@ static int spawn_internal(const char *path, const char *name,
      * off-the-shelf dynamic Linux binary drops-and-runs. Everything else keeps
      * the tobyOS default. */
     if (ok) {
-        bool is_linux = elf_is_linux_abi(prog_info.osabi, has_interp, interp_path);
+        bool is_linux = elf_is_linux_abi(prog_info.osabi, has_interp,
+                                         interp_path, prog_info.has_gnu_phdr);
         p->personality = is_linux ? ABI_PERS_LINUX : ABI_PERS_TOBY;
         if (is_linux) {
             kprintf("[proc] pid %d '%s' -> Linux ABI personality "
-                    "(EI_OSABI=%u interp=%s)\n", p->pid, p->name,
-                    prog_info.osabi, has_interp ? interp_path : "(none)");
+                    "(EI_OSABI=%u interp=%s gnu_phdr=%d)\n", p->pid, p->name,
+                    prog_info.osabi, has_interp ? interp_path : "(none)",
+                    (int)prog_info.has_gnu_phdr);
         }
     }
 

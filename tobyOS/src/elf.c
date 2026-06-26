@@ -196,8 +196,9 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
     info->phdr_va    = 0;
     info->phnum      = 0;
     info->phent      = 0;
-    info->has_interp = false;
-    info->osabi      = ELFOSABI_SYSV;
+    info->has_interp   = false;
+    info->osabi        = ELFOSABI_SYSV;
+    info->has_gnu_phdr = false;
 
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
     if (!validate_ehdr(eh, size, user_mode, load_base)) return false;
@@ -239,6 +240,17 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
         if (ph->p_type == PT_PHDR) {
             pt_phdr_vaddr = ph->p_vaddr + bias;
             have_pt_phdr  = true;
+            continue;
+        }
+        /* B19: note a GNU OS-specific phdr -- a GNU/Linux-toolchain
+         * fingerprint absent from native x86_64-elf output. Lets a
+         * note-less static SYSV Linux binary auto-detect (see
+         * elf_is_linux_abi). PT_GNU_EH_FRAME is intentionally excluded:
+         * it's more generic and can appear on freestanding output. */
+        if (ph->p_type == PT_GNU_STACK ||
+            ph->p_type == PT_GNU_RELRO ||
+            ph->p_type == PT_GNU_PROPERTY) {
+            info->has_gnu_phdr = true;
             continue;
         }
         if (ph->p_type != PT_LOAD) continue;
@@ -428,9 +440,10 @@ bool elf_peek_interp(const void *image, size_t size, char *out, size_t cap) {
     return false;
 }
 
-bool elf_is_linux_abi(uint8_t osabi, bool has_interp, const char *interp_path) {
+bool elf_is_linux_abi(uint8_t osabi, bool has_interp, const char *interp_path,
+                      bool has_gnu_phdr) {
     /* Decide whether an ELF should run under the Linux ABI personality.
-     * Two signals, both CONSERVATIVE -- the default is always native tobyOS,
+     * Three signals, all CONSERVATIVE -- the default is always native tobyOS,
      * and we only switch to Linux on positive evidence, so a native binary is
      * never misclassified (which would route its whole syscall stream through
      * the Linux translation layer and break it):
@@ -444,9 +457,20 @@ bool elf_is_linux_abi(uint8_t osabi, bool has_interp, const char *interp_path) {
      *      loader is /lib/ld-toby.so, whose basename ("ld-toby") matches
      *      neither prefix, so native PIEs stay native.
      *
-     * A *static*, note-less ELFOSABI_SYSV binary carries no distinguishing
-     * mark from a native static binary (both are OSABI 0, no PT_INTERP, no
-     * notes), so it cannot be auto-detected and still requires the brand. */
+     *   3. (B19) A *static* (no PT_INTERP) binary that carries a GNU OS-specific
+     *      program header (PT_GNU_STACK/RELRO/PROPERTY). This closes the last
+     *      gap: a static, note-less, unbranded ELFOSABI_SYSV Linux binary has
+     *      neither a brand nor a PT_INTERP, but its GNU/Linux toolchain still
+     *      emits PT_GNU_STACK (on every Linux-target link, even -nostdlib).
+     *      tobyOS's own *static* native binaries build for the bare x86_64-elf
+     *      target, which emits no PT_GNU_* phdrs, so this never fires on one
+     *      (verified across the whole initrd: 0 native static ELFs carry it).
+     *
+     *      The !has_interp guard is essential: native *dynamic* programs link
+     *      against /lib/libtoby.so via /lib/ld-toby.so and DO carry
+     *      PT_GNU_STACK, but they are already correctly classified by rule 2
+     *      (ld-toby matches neither Linux-loader prefix => native). Gating the
+     *      GNU-phdr signal to interp-less binaries keeps them native. */
     if (osabi == ELFOSABI_LINUX) return true;       /* == ELFOSABI_GNU (3) */
     if (has_interp && interp_path) {
         const char *base = interp_path;
@@ -456,6 +480,7 @@ bool elf_is_linux_abi(uint8_t osabi, bool has_interp, const char *interp_path) {
             strncmp(base, "ld-musl", 7) == 0)
             return true;
     }
+    if (!has_interp && has_gnu_phdr) return true;
     return false;
 }
 

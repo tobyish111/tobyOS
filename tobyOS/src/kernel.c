@@ -41,6 +41,7 @@
 #include <tobyos/tss.h>
 #include <tobyos/syscall.h>
 #include <tobyos/proc.h>
+#include <tobyos/elf.h>   /* B19 LXSAUTO harness: Elf64 phdr scan */
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/acpi.h>
@@ -5947,6 +5948,67 @@ void _start(void) {
                 kprintf("[LXAUTO] VERDICT: %s exit=%d (unbranded OSABI=0 dynamic "
                         "Linux binary; personality auto-detected from "
                         "PT_INTERP)\n", rc == 0 ? "PASS" : "FAIL", rc);
+            }
+        }
+    }
+#endif
+
+#ifdef LXSAUTO_BOOT
+    /* Track B/B19: drop-and-run a STATIC, NOTE-LESS, UNBRANDED Linux binary --
+     * the last shape the loader couldn't auto-detect. /bin/linux-static-auto
+     * is a genuine static Linux x86-64 ELF with e_ident[EI_OSABI]==0
+     * (ELFOSABI_SYSV) and NO PT_INTERP, so neither the brand rule nor the
+     * Linux-loader-interp rule fires. Its only Linux fingerprint is the
+     * PT_GNU_STACK program header, which B19 keys off. The harness first
+     * re-reads the file to ASSERT it is genuinely unbranded (OSABI byte == 0)
+     * AND carries no PT_INTERP, so a PASS (exit==73) can only mean the loader
+     * auto-detected the Linux personality from the GNU phdr alone. */
+    {
+        const char *path = "/bin/linux-static-auto";
+        void  *img = 0;
+        size_t isz = 0;
+        if (vfs_read_all(path, &img, &isz) != 0 || isz < 64) {
+            if (img) kfree(img);
+            kprintf("[boot] LXSAUTO: %s not present -- SKIPPED\n", path);
+            kprintf("[LXSAUTO] VERDICT: SKIP reason=no-static-auto-binary\n");
+        } else {
+            const uint8_t *b = (const uint8_t *)img;
+            uint8_t osabi = b[7];                 /* e_ident[EI_OSABI] */
+            /* scan program headers for PT_INTERP (type 3) and PT_GNU_STACK */
+            const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
+            bool has_interp = false, has_gnu_stack = false;
+            if (isz >= sizeof(Elf64_Ehdr) &&
+                (uint64_t)eh->e_phoff +
+                    (uint64_t)eh->e_phnum * eh->e_phentsize <= isz) {
+                const Elf64_Phdr *ph =
+                    (const Elf64_Phdr *)(b + eh->e_phoff);
+                for (uint16_t i = 0; i < eh->e_phnum; i++) {
+                    if (ph[i].p_type == PT_INTERP)   has_interp    = true;
+                    if (ph[i].p_type == PT_GNU_STACK) has_gnu_stack = true;
+                }
+            }
+            kfree(img);
+            kprintf("[boot] LXSAUTO: %s EI_OSABI=%u interp=%s gnu_stack=%s\n",
+                    path, (unsigned)osabi, has_interp ? "yes" : "no",
+                    has_gnu_stack ? "yes" : "no");
+            if (osabi != 0 || has_interp || !has_gnu_stack) {
+                kprintf("[LXSAUTO] VERDICT: FAIL reason=test-binary-wrong-shape "
+                        "(need OSABI=0, no PT_INTERP, PT_GNU_STACK present)\n");
+            } else {
+                char *argv[] = { (char *)"linux-static-auto", 0 };
+                char *envp[] = { (char *)"PATH=/bin", 0 };
+                struct proc_spec spec = {
+                    .path = path, .name = "linux-static-auto",
+                    .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+                };
+                kprintf("[boot] LXSAUTO: spawning %s (no brand, no interp)\n",
+                        path);
+                int pid = proc_spawn(&spec);
+                int rc  = (pid < 0) ? -1 : proc_wait(pid);
+                kprintf("[LXSAUTO] VERDICT: %s exit=%d (static note-less "
+                        "unbranded SYSV Linux binary; personality "
+                        "auto-detected from PT_GNU_STACK)\n",
+                        rc == 73 ? "PASS" : "FAIL", rc);
             }
         }
     }

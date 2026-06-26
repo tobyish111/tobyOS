@@ -645,7 +645,8 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
      * native one (or vice-versa) switches the syscall ABI for the replaced
      * process. */
     if (ok) {
-        p->personality = elf_is_linux_abi(prog_info.osabi, has_interp, interp_path)
+        p->personality = elf_is_linux_abi(prog_info.osabi, has_interp,
+                                          interp_path, prog_info.has_gnu_phdr)
                              ? ABI_PERS_LINUX : ABI_PERS_TOBY;
     }
 
