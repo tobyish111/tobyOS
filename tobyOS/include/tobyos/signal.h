@@ -88,6 +88,15 @@ struct sigaction {
 /* si_code values */
 #define SI_USER    0       /* kill()/raise()/tty-generated */
 #define SI_KERNEL  0x80    /* kernel-synthesized */
+#define SI_TKILL  (-6)     /* tkill/tgkill-generated (Linux) */
+
+/* Synchronous-fault si_code values (Linux x86-64). Reported in the
+ * siginfo_t a SIGSEGV/SIGFPE/SIGILL handler receives. */
+#define SEGV_MAPERR 1      /* address not mapped to object */
+#define SEGV_ACCERR 2      /* invalid permissions for mapped object */
+#define FPE_INTDIV  1      /* integer divide by zero */
+#define FPE_FLTDIV  3      /* floating-point divide by zero */
+#define ILL_ILLOPC  1      /* illegal opcode */
 
 typedef struct {
     int          si_signo;   /* signal number                       */
@@ -151,6 +160,7 @@ struct syscall_regs {
 };
 
 struct proc;
+struct regs;   /* CPU exception trapframe (isr.h) */
 
 /* Initialise signal state. */
 void signal_init(void);
@@ -181,6 +191,16 @@ void signal_deliver_if_pending(void);
  * and rewrites the saved trapframe so the SYSRETQ lands in the handler;
  * sys_sigreturn later restores the context. */
 void signal_deliver_syscall(long rv, long num);
+
+/* Deliver a SYNCHRONOUS CPU-fault signal (SIGSEGV/SIGFPE/SIGILL/...) to the
+ * faulting user process from the exception path. `r` is the CPU exception
+ * trapframe (rewritten in place so the trailing iretq enters the handler),
+ * `si_code` is the fault sub-code (e.g. SEGV_MAPERR), and `fault_addr` is the
+ * offending address (CR2 for #PF; 0 otherwise) reported as siginfo si_addr.
+ * Returns true if a user handler was set up (caller should iretq); false if
+ * the process has no catchable handler (caller takes the fatal path). */
+bool signal_deliver_fault(struct regs *r, int sig, int si_code,
+                          uint64_t fault_addr);
 
 /* Quick non-destructive query */
 bool signal_pending_self(void);

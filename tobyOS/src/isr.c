@@ -15,6 +15,7 @@
 #include <tobyos/page_fault.h>
 #include <tobyos/pmm.h>
 #include <tobyos/smp.h>
+#include <tobyos/signal.h>
 
 /* During pid-0 bring-up, demand-map HHDM mirror gaps (UEFI memmap
  * holes, GOP framebuffer tagged RESERVED, freshly PMM'd pages). */
@@ -148,6 +149,31 @@ static void default_exception(struct regs *r) {
             if (kernel_boot_demand_map(fault_addr))
                 return;
         }
+    }
+
+    /* B15: a ring-3 CPU fault that maps to a catchable POSIX signal is offered
+     * to a user-installed handler before the fatal path. If the process
+     * registered one (with a sigreturn trampoline), signal_deliver_fault
+     * rewrites this trapframe so the trailing iretq enters the handler; we
+     * return straight away. Otherwise it returns false and we fall through to
+     * the diagnostic dump + terminate exactly as before. */
+    if (from_user) {
+        int sig = 0, code = 0;
+        uint64_t addr = 0;
+        switch (r->vector) {
+        case 0:  sig = SIGFPE;  code = FPE_INTDIV; break;   /* #DE */
+        case 6:  sig = SIGILL;  code = ILL_ILLOPC; break;   /* #UD */
+        case 13: sig = SIGSEGV; code = SEGV_ACCERR; break;  /* #GP */
+        case 14:                                            /* #PF */
+            sig  = SIGSEGV;
+            addr = read_cr2();
+            code = (r->error_code & 0x1) ? SEGV_ACCERR : SEGV_MAPERR;
+            break;
+        case 16: case 19: sig = SIGFPE; code = FPE_FLTDIV; break; /* #MF/#XM */
+        default: break;
+        }
+        if (sig && signal_deliver_fault(r, sig, code, addr))
+            return;   /* iretq lands in the user handler */
     }
 
     kprintf("\n*** EXCEPTION %lu: %s%s ***\n",

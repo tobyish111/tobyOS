@@ -14,8 +14,42 @@
 #include <tobyos/printk.h>
 #include <tobyos/uaccess.h>
 #include <tobyos/klibc.h>
+#include <tobyos/isr.h>
+#include <tobyos/abi/abi.h>
 
 static int g_foreground_pid = 0;
+
+/* ---- Linux x86-64 SA_SIGINFO ABI (B15) ----
+ *
+ * A Linux binary's 3-arg handler `void h(int, siginfo_t*, void*)` reads its
+ * siginfo_t / ucontext_t at the EXACT byte offsets the Linux kernel uses, which
+ * differ from tobyOS's native layout (signal.h). So when delivering to an
+ * ABI_PERS_LINUX process we synthesize the Linux-layout structures by hand.
+ * Field offsets below are from the x86-64 Linux uapi (asm/sigcontext.h,
+ * bits/types/siginfo_t.h) and are ABI -- they must match byte-for-byte. */
+#define LX_SIGINFO_SIZE   128   /* sizeof(siginfo_t) on x86-64 Linux         */
+#define LX_UCONTEXT_SIZE  968   /* sizeof(ucontext_t) on x86-64 Linux        */
+
+/* siginfo_t field offsets (common header + the relevant union members). */
+#define LXSI_SIGNO   0          /* int  si_signo                             */
+#define LXSI_ERRNO   4          /* int  si_errno                             */
+#define LXSI_CODE    8          /* int  si_code                              */
+#define LXSI_PID    16          /* _kill: pid_t si_pid (kill/raise origin)   */
+#define LXSI_UID    20          /* _kill: uid_t si_uid                       */
+#define LXSI_ADDR   16          /* _sigfault: void *si_addr (fault address)  */
+
+/* ucontext_t: uc_mcontext.gregs[] starts at offset 40 (after uc_flags,
+ * uc_link, and the 24-byte uc_stack). gregs is greg_t[23] in this fixed
+ * order; uc_sigmask follows the 256-byte mcontext_t at offset 296. */
+#define LXUC_GREGS   40
+#define LXUC_SIGMASK 296
+enum {
+    LXREG_R8=0, LXREG_R9, LXREG_R10, LXREG_R11, LXREG_R12, LXREG_R13,
+    LXREG_R14, LXREG_R15, LXREG_RDI, LXREG_RSI, LXREG_RBP, LXREG_RBX,
+    LXREG_RDX, LXREG_RAX, LXREG_RCX, LXREG_RSP, LXREG_RIP, LXREG_EFL,
+    LXREG_CSGSFS, LXREG_ERR, LXREG_TRAPNO, LXREG_OLDMASK, LXREG_CR2
+};
+#define LX_USER_CS 0x33         /* ring-3 %cs packed into gregs[CSGSFS]      */
 
 /* Marker stamped into the on-user-stack signal frame; sys_sigreturn refuses
  * to restore a frame without it (a corrupt/forged frame -> SIGSEGV). */
@@ -214,6 +248,92 @@ static void signal_apply_default(struct proc *p, int sig) {
  * handler instead of the interrupted instruction. Returns false if no frame
  * could be built (no restorer registered) -- caller then falls back to the
  * default disposition. Requires a valid `regs` (syscall return path). */
+/* Write the siginfo_t + ucontext_t a 3-arg SA_SIGINFO handler reads, in either
+ * native tobyOS layout or x86-64 Linux layout (B15), at info_addr/uctx_addr on
+ * the user stack. `ctx` carries the saved registers of the interrupted context;
+ * rcx/r11 (absent from sig_context) are supplied separately. Returns false on a
+ * uaccess failure. */
+static bool sig_emit_info_uctx(struct proc *p, int sig, int si_code,
+                               uint64_t fault_addr,
+                               const struct sig_context *ctx,
+                               uint64_t rcx, uint64_t r11,
+                               uint64_t info_addr, uint64_t uctx_addr,
+                               bool linux_layout) {
+    bool is_fault = (sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE ||
+                     sig == SIGILL  || sig == SIGTRAP);
+
+    if (linux_layout) {
+        uint8_t ib[LX_SIGINFO_SIZE];
+        uint8_t ub[LX_UCONTEXT_SIZE];
+        memset(ib, 0, sizeof ib);
+        memset(ub, 0, sizeof ub);
+
+        *(int32_t *)(ib + LXSI_SIGNO) = sig;
+        *(int32_t *)(ib + LXSI_ERRNO) = 0;
+        *(int32_t *)(ib + LXSI_CODE)  = si_code;
+        if (is_fault) {
+            *(uint64_t *)(ib + LXSI_ADDR) = fault_addr;
+        } else {
+            *(int32_t  *)(ib + LXSI_PID) = p->sigstate.si_pid[sig];
+            *(uint32_t *)(ib + LXSI_UID) = p->sigstate.si_uid[sig];
+        }
+
+        uint64_t *g = (uint64_t *)(ub + LXUC_GREGS);
+        g[LXREG_R8]=ctx->r8;   g[LXREG_R9]=ctx->r9;   g[LXREG_R10]=ctx->r10;
+        g[LXREG_R11]=r11;      g[LXREG_R12]=ctx->r12; g[LXREG_R13]=ctx->r13;
+        g[LXREG_R14]=ctx->r14; g[LXREG_R15]=ctx->r15; g[LXREG_RDI]=ctx->rdi;
+        g[LXREG_RSI]=ctx->rsi; g[LXREG_RBP]=ctx->rbp; g[LXREG_RBX]=ctx->rbx;
+        g[LXREG_RDX]=ctx->rdx; g[LXREG_RAX]=ctx->rax; g[LXREG_RCX]=rcx;
+        g[LXREG_RSP]=ctx->rsp; g[LXREG_RIP]=ctx->rip; g[LXREG_EFL]=ctx->rflags;
+        g[LXREG_CSGSFS]=LX_USER_CS; g[LXREG_ERR]=0; g[LXREG_TRAPNO]=0;
+        g[LXREG_OLDMASK]=0; g[LXREG_CR2]=fault_addr;
+        *(uint64_t *)(ub + LXUC_SIGMASK) = (uint64_t)p->sigstate.mask;
+
+        if (copy_to_user((void *)info_addr, ib, sizeof ib) != 0 ||
+            copy_to_user((void *)uctx_addr, ub, sizeof ub) != 0)
+            return false;
+        return true;
+    }
+
+    /* Native tobyOS layout (libtoby <signal.h>). */
+    siginfo_t info = {
+        .si_signo  = sig,
+        .si_code   = si_code,
+        .si_pid    = is_fault ? 0 : p->sigstate.si_pid[sig],
+        .si_uid    = is_fault ? 0 : p->sigstate.si_uid[sig],
+        .si_addr   = (void *)(uintptr_t)(is_fault ? fault_addr : 0),
+        .si_status = 0,
+        ._pad      = 0,
+    };
+    ucontext_t uctx;
+    memset(&uctx, 0, sizeof(uctx));
+    uctx.uc_sigmask = p->sigstate.mask;
+    uctx.uc_mcontext.rax = ctx->rax; uctx.uc_mcontext.rbx = ctx->rbx;
+    uctx.uc_mcontext.rcx = rcx;      uctx.uc_mcontext.rdx = ctx->rdx;
+    uctx.uc_mcontext.rsi = ctx->rsi; uctx.uc_mcontext.rdi = ctx->rdi;
+    uctx.uc_mcontext.rbp = ctx->rbp;
+    uctx.uc_mcontext.r8  = ctx->r8;  uctx.uc_mcontext.r9  = ctx->r9;
+    uctx.uc_mcontext.r10 = ctx->r10; uctx.uc_mcontext.r11 = r11;
+    uctx.uc_mcontext.r12 = ctx->r12; uctx.uc_mcontext.r13 = ctx->r13;
+    uctx.uc_mcontext.r14 = ctx->r14; uctx.uc_mcontext.r15 = ctx->r15;
+    uctx.uc_mcontext.rip = ctx->rip;
+    uctx.uc_mcontext.rsp = ctx->rsp;
+    uctx.uc_mcontext.rflags = ctx->rflags;
+    if (copy_to_user((void *)info_addr, &info, sizeof(info)) != 0 ||
+        copy_to_user((void *)uctx_addr, &uctx, sizeof(uctx)) != 0)
+        return false;
+    return true;
+}
+
+/* Compute the on-user-stack siginfo_t / ucontext_t block sizes for the given
+ * personality. Linux binaries get the larger Linux-ABI structures. */
+static inline uint64_t sig_info_size(bool linux_layout) {
+    return linux_layout ? LX_SIGINFO_SIZE : (uint64_t)sizeof(siginfo_t);
+}
+static inline uint64_t sig_uctx_size(bool linux_layout) {
+    return linux_layout ? LX_UCONTEXT_SIZE : (uint64_t)sizeof(ucontext_t);
+}
+
 static bool signal_setup_user_frame(struct proc *p, int sig,
                                      struct sigaction *sa,
                                      struct syscall_regs *regs, long rv,
@@ -226,6 +346,7 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     }
 
     bool siginfo = (sa->sa_flags & SA_SIGINFO) != 0;
+    bool linux_layout = (p->personality == ABI_PERS_LINUX);
 
     /* Carve the frame out of the user stack, below the SysV red zone. Build
      * each piece in a kernel local and copy out (per-copy uaccess). Layout,
@@ -239,8 +360,8 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     uint64_t top = regs->user_rsp - 128;      /* skip the 128-byte red zone */
     uint64_t info_addr = 0, uctx_addr = 0;
     if (siginfo) {
-        info_addr = (top - sizeof(siginfo_t)) & ~(uint64_t)0xF;
-        uctx_addr = (info_addr - sizeof(ucontext_t)) & ~(uint64_t)0xF;
+        info_addr = (top - sig_info_size(linux_layout)) & ~(uint64_t)0xF;
+        uctx_addr = (info_addr - sig_uctx_size(linux_layout)) & ~(uint64_t)0xF;
         top = uctx_addr;
     }
     uint64_t sp = (top - sizeof(struct sig_context)) & ~(uint64_t)0xF;
@@ -281,33 +402,12 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     }
 
     /* SA_SIGINFO: also write the siginfo_t and ucontext_t the 3-arg handler
-     * expects, and pass their addresses in RSI/RDX. */
+     * expects (native or Linux ABI layout), and pass their addresses in
+     * RSI/RDX. regs->rcx/r11 hold the user's RIP/RFLAGS on the sysret frame. */
     if (siginfo) {
-        siginfo_t info = {
-            .si_signo = sig,
-            .si_code  = SI_USER,
-            .si_pid   = p->sigstate.si_pid[sig],
-            .si_uid   = p->sigstate.si_uid[sig],
-            .si_addr  = 0,
-            .si_status = 0,
-            ._pad     = 0,
-        };
-        ucontext_t uctx;
-        memset(&uctx, 0, sizeof(uctx));
-        uctx.uc_sigmask = p->sigstate.mask;
-        uctx.uc_mcontext.rax = ctx->rax; uctx.uc_mcontext.rbx = ctx->rbx;
-        uctx.uc_mcontext.rcx = regs->rcx; uctx.uc_mcontext.rdx = ctx->rdx;
-        uctx.uc_mcontext.rsi = ctx->rsi; uctx.uc_mcontext.rdi = ctx->rdi;
-        uctx.uc_mcontext.rbp = ctx->rbp;
-        uctx.uc_mcontext.r8  = ctx->r8;  uctx.uc_mcontext.r9  = ctx->r9;
-        uctx.uc_mcontext.r10 = ctx->r10; uctx.uc_mcontext.r11 = regs->r11;
-        uctx.uc_mcontext.r12 = ctx->r12; uctx.uc_mcontext.r13 = ctx->r13;
-        uctx.uc_mcontext.r14 = ctx->r14; uctx.uc_mcontext.r15 = ctx->r15;
-        uctx.uc_mcontext.rip = ctx->rip;
-        uctx.uc_mcontext.rsp = ctx->rsp;
-        uctx.uc_mcontext.rflags = ctx->rflags;
-        if (copy_to_user((void *)info_addr, &info, sizeof(info)) != 0 ||
-            copy_to_user((void *)uctx_addr, &uctx, sizeof(uctx)) != 0) {
+        if (!sig_emit_info_uctx(p, sig, SI_USER, 0, ctx,
+                                regs->rcx, regs->r11,
+                                info_addr, uctx_addr, linux_layout)) {
             kprintf("[signal] pid=%d sig %d: cannot write siginfo/ucontext\n",
                     p->pid, sig);
             return false;
@@ -413,6 +513,90 @@ void signal_deliver_if_pending(void) {
  * caught handlers by pushing a signal frame and redirecting the return. */
 void signal_deliver_syscall(long rv, long num) {
     signal_deliver(current_syscall_regs(), rv, num);
+}
+
+/* SYNCHRONOUS CPU-fault delivery (B15). Called from the exception dispatcher
+ * (isr.c) for a ring-3 fault (#PF/#GP/#DE/#UD/...) that maps to a catchable
+ * signal. Builds a signal frame from the CPU exception trapframe `r` and
+ * rewrites it so the trailing iretq enters the user handler; the handler later
+ * returns through the restorer -> rt_sigreturn, which restores the saved
+ * context via sys_sigreturn exactly like the syscall path. Returns false (and
+ * leaves `r` untouched) when the process has no usable handler -- the caller
+ * then takes the fatal proc_exit path.
+ *
+ * NOTE: tobyOS's sigreturn restores from its own sig_context, not from the
+ * handler-visible ucontext, so a handler cannot RESUME at a different RIP by
+ * editing uc_mcontext (returning re-executes the faulting instruction). Real
+ * crash handlers that report-and-exit (or longjmp) work; in-place fixups that
+ * rely on ucontext-driven resumption do not yet. */
+bool signal_deliver_fault(struct regs *r, int sig, int si_code,
+                          uint64_t fault_addr) {
+    if (!r) return false;
+    struct proc *p = current_proc();
+    if (!p || p->pid == 0) return false;
+    if (sig <= 0 || sig >= SIG_MAX) return false;
+
+    struct sigaction *sa = &p->sigstate.actions[sig];
+    if (sa->sa_handler == SIG_DFL || sa->sa_handler == SIG_IGN) return false;
+    if (p->sigstate.restorer == 0) return false;
+    /* A fault arriving while its own signal is blocked is undefined in POSIX
+     * and would recurse forever -- take the fatal path instead. */
+    if (p->sigstate.mask & SIGMASK(sig)) return false;
+
+    bool linux_layout = (p->personality == ABI_PERS_LINUX);
+    bool siginfo = (sa->sa_flags & SA_SIGINFO) != 0;
+
+    uint64_t top = r->rsp - 128;              /* skip the 128-byte red zone */
+    uint64_t info_addr = 0, uctx_addr = 0;
+    if (siginfo) {
+        info_addr = (top - sig_info_size(linux_layout)) & ~(uint64_t)0xF;
+        uctx_addr = (info_addr - sig_uctx_size(linux_layout)) & ~(uint64_t)0xF;
+        top = uctx_addr;
+    }
+    uint64_t sp = (top - sizeof(struct sig_context)) & ~(uint64_t)0xF;
+
+    struct sig_context kctx;
+    struct sig_context *ctx = &kctx;
+    ctx->rax = r->rax; ctx->rdi = r->rdi; ctx->rsi = r->rsi; ctx->rdx = r->rdx;
+    ctx->r10 = r->r10; ctx->r8 = r->r8;   ctx->r9 = r->r9;
+    ctx->rbx = r->rbx; ctx->rbp = r->rbp;
+    ctx->r12 = r->r12; ctx->r13 = r->r13; ctx->r14 = r->r14; ctx->r15 = r->r15;
+    ctx->rip = r->rip;                 /* resume at the faulting instruction */
+    ctx->rsp = r->rsp;
+    ctx->rflags = r->rflags;
+    ctx->saved_mask = p->sigstate.mask;
+    ctx->magic = SIG_FRAME_MAGIC;
+
+    if (copy_to_user((void *)sp, &kctx, sizeof(kctx)) != 0)
+        return false;
+
+    if (siginfo) {
+        if (!sig_emit_info_uctx(p, sig, si_code, fault_addr, ctx,
+                                r->rcx, r->r11,
+                                info_addr, uctx_addr, linux_layout))
+            return false;
+    }
+
+    uint64_t frame = (uint64_t)sp - 8;
+    if (put_user_u64((void *)frame, p->sigstate.restorer) != 0)
+        return false;
+
+    sigset_t newmask = p->sigstate.mask | sa->sa_mask;
+    if (!(sa->sa_flags & SA_NODEFER)) newmask |= SIGMASK(sig);
+    newmask &= ~(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
+    p->sigstate.mask = newmask;
+
+    if (sa->sa_flags & SA_RESETHAND) sa->sa_handler = SIG_DFL;
+
+    /* Rewrite the iret frame: enter the handler with the SysV arg registers. */
+    r->rip = (uint64_t)(uintptr_t)sa->sa_handler;
+    r->rsp = frame;
+    r->rdi = (uint64_t)sig;
+    if (siginfo) {
+        r->rsi = info_addr;
+        r->rdx = uctx_addr;
+    }
+    return true;
 }
 
 /* ---- Syscall implementations ---- */
@@ -540,10 +724,19 @@ int sys_kill(int pid, int sig) {
     struct proc *p = current_proc();
     if (!p) return -1;
 
+    /* kill()/raise() is an explicit USER source: the siginfo si_pid/si_uid
+     * must report the calling process (the sender) -- including the self-kill
+     * case kill(getpid(), sig), which Linux reports as si_pid == getpid().
+     * signal_send's generic stamp can't tell a kill() syscall from a tty/kernel
+     * source, so stamp the true sender here, after delivery. */
     if (pid > 0) {
         struct proc *target = proc_lookup(pid);
         if (!target) return -3; /* ESRCH */
         signal_send(target, sig);
+        if (sig > 0) {
+            target->sigstate.si_pid[sig] = p->pid;
+            target->sigstate.si_uid[sig] = p->uid;
+        }
     } else if (pid == 0) {
         /* Send to all processes in the same process group (simplified:
          * send to all in same session) */
@@ -552,6 +745,10 @@ int sys_kill(int pid, int sig) {
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].session_id == p->session_id) {
                 signal_send(&g_proc[i], sig);
+                if (sig > 0) {
+                    g_proc[i].sigstate.si_pid[sig] = p->pid;
+                    g_proc[i].sigstate.si_uid[sig] = p->uid;
+                }
             }
         }
     } else if (pid == -1) {
@@ -560,6 +757,10 @@ int sys_kill(int pid, int sig) {
         for (int i = 1; i < PROC_MAX; i++) {
             if (g_proc[i].state != PROC_UNUSED) {
                 signal_send(&g_proc[i], sig);
+                if (sig > 0) {
+                    g_proc[i].sigstate.si_pid[sig] = p->pid;
+                    g_proc[i].sigstate.si_uid[sig] = p->uid;
+                }
             }
         }
     }

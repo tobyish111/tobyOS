@@ -3935,13 +3935,14 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         return (long)len;
     }
 
-    /* ---- signals (B4): translate the Linux signal ABI onto the native
+    /* ---- signals (B4 + B15): translate the Linux signal ABI onto the native
      * signal layer. musl supplies its own sa_restorer trampoline (which
      * just issues rt_sigreturn); we record it as the proc's restorer so
      * delivery has a return path -- a Linux process never calls the
-     * tobyOS SYS_SIGRESTORER. 1-arg handlers are fully supported; an
-     * SA_SIGINFO 3-arg handler would receive tobyOS-layout siginfo/
-     * ucontext (a known gap). ---- */
+     * tobyOS SYS_SIGRESTORER. Both 1-arg and SA_SIGINFO 3-arg handlers are
+     * supported: delivery writes the siginfo_t/ucontext_t in x86-64 Linux
+     * layout for ABI_PERS_LINUX procs (signal.c), and synchronous CPU faults
+     * (SIGSEGV/SIGFPE/SIGILL) are delivered to handlers from the fault path. */
     case LX_rt_sigaction: {            /* (sig, act, oldact, sigsetsize) */
         int sig = (int)a1;
         if (sig <= 0 || sig >= SIG_MAX) return -ABI_EINVAL;

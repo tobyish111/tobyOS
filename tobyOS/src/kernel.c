@@ -5493,6 +5493,39 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXSIGINFO_BOOT
+    /* Track B milestone B15 -- signal completeness. A genuine Linux x86-64 ELF
+     * (raw syscalls) installs SA_SIGINFO 3-arg handlers and verifies, at the
+     * exact x86-64 Linux siginfo_t/ucontext_t byte offsets, that (1) an async
+     * SIGUSR1 (kill) carries the right si_signo/si_code/si_pid + ucontext
+     * gregs (REG_CSGSFS == user %cs), and (2) a SYNCHRONOUS SIGSEGV from a real
+     * unmapped-pointer dereference is delivered to the handler with si_addr ==
+     * the faulting address. Exit 42 is reachable only if BOTH layouts are
+     * correct AND the synchronous fault was caught (not fatal-terminated).
+     * Build EXTRA_CFLAGS+=-DLXSIGINFO_BOOT. */
+    {
+        kprintf("[boot] LXSIGINFO: spawning /bin/linux-siginfo "
+                "(SA_SIGINFO Linux-layout + catchable SIGSEGV)\n");
+        char *gargv[] = { (char *)"linux-siginfo", 0 };
+        char *genvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec gspec = {
+            .path = "/bin/linux-siginfo", .name = "linux-siginfo",
+            .argc = 1, .argv = gargv, .envc = 1, .envp = genvp,
+        };
+        int gpid = proc_spawn(&gspec);
+        if (gpid < 0) {
+            kprintf("[LXSIGINFO] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int grc = proc_wait(gpid);
+            kprintf("[boot] LXSIGINFO: /bin/linux-siginfo (pid=%d) exit=%d\n",
+                    gpid, grc);
+            kprintf("[LXSIGINFO] VERDICT: %s exit=%d (expected 42; "
+                    "Linux-layout siginfo/ucontext + catchable SIGSEGV)\n",
+                    grc == 42 ? "PASS" : "FAIL", grc);
+        }
+    }
+#endif
+
 #ifdef LINUXBB_BOOT
     /* Track B milestone B2 -- run a REAL musl-libc binary (busybox). Build
      * EXTRA_CFLAGS+=-DLINUXBB_BOOT, with an opt-in musl-static busybox staged

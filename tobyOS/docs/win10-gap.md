@@ -357,6 +357,27 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-26** — **Track B milestone B15: signal completeness — Linux-layout `SA_SIGINFO` + catchable synchronous CPU faults.**
+  Two gaps blocked real signal-using programs (crash handlers, JITs, GC/runtime preemption). (1) **`SA_SIGINFO` 3-arg
+  handlers now get the x86-64 *Linux* `siginfo_t`/`ucontext_t` layout.** The native path already passed `&info`/`&uctx`
+  in RSI/RDX, but always in *tobyOS-native* struct layout — a Linux binary read garbage at the Linux field offsets. A
+  new personality-aware writer (`sig_emit_info_uctx`) emits the structures byte-for-byte per the Linux uapi for
+  `ABI_PERS_LINUX` procs (siginfo `si_signo`/`si_errno`/`si_code` + the `_kill`/`_sigfault` union; `ucontext.uc_mcontext.gregs[]`
+  in the fixed `REG_*` order incl. `REG_CSGSFS`=user `%cs` and `REG_CR2`), and keeps the native layout unchanged for
+  toby/Win32 procs. (2) **Synchronous CPU faults are now delivered to user handlers.** Previously a ring-3 `#PF`/`#GP`/
+  `#DE`/`#UD` that wasn't a demand-page/COW fault just `proc_exit`'d the process; now the exception dispatcher
+  (`isr.c`) maps the vector to a signal (`SIGSEGV`/`SIGFPE`/`SIGILL`) and calls **`signal_deliver_fault()`**, which builds
+  a signal frame from the exception trapframe and rewrites it so the trailing `iretq` enters the handler — with `si_addr`
+  = the faulting `CR2` for `#PF`. If the process has no catchable handler it falls back to the exact prior fatal path
+  (so default behavior is unchanged). `kill(getpid(), …)`/`raise()` now also report `si_pid`=sender (Linux-correct;
+  `sys_kill` stamps the true sender, fixing the self-kill `si_pid=0` case). Limitation: tobyOS `sigreturn` restores from
+  its own saved context, not the handler-visible `ucontext`, so report-and-exit / `longjmp` crash handlers work but
+  in-place `ucontext`-driven resumption does not yet. **Proof, clean under `+smep,+smap`, 0 faults:** `[LXSIGINFO]
+  VERDICT: PASS exit=42` — a genuine raw-syscall Linux ELF (`/bin/linux-siginfo`, `logs/b15.sh`) installs `SA_SIGINFO`
+  handlers, checks an async `SIGUSR1`'s siginfo/ucontext at the exact Linux byte offsets (incl. `gregs[REG_CSGSFS]&0xffff
+  ==0x33`), then dereferences an unmapped pointer and confirms the handler is entered with `si_addr`==the bad address —
+  exit 42 only if both layouts are right *and* the synchronous fault was caught. No-regression: full Linux track green
+  (`LXABI`/`LXSIG`/`LXMMAP`/`LXTHREAD` all PASS), and `validate.sh 3 90` (default) = 3/3 ALIVE, exc/panic=0.
 - **2026-06-26** — **Track B milestone B14: networking capstone — Linux BSD sockets + epoll, and an event-driven TCP server.**
   B13 gave `poll`/`select`/`epoll`, but TCP-socket readiness was best-effort and the Linux personality had **no socket
   syscalls at all** — so a real network server couldn't be built. Two pieces close that: (1) **TCP readiness wired into
