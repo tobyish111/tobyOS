@@ -6056,6 +6056,77 @@ void _start(void) {
     }
 #endif
 
+#ifdef REALTOOLS_BOOT
+    /* Track B: run a BATTERY of real, UNMODIFIED, off-the-shelf GNU Binutils
+     * tools -- a clear step past the single `readelf` of the realtool
+     * milestone. Five genuine third-party programs (GNU Binutils 2.43.1,
+     * lifted byte-for-byte from a Bootlin glibc 2.41 toolchain), each a dynamic
+     * glibc PIE that loads BOTH libc.so.6 AND the libdl.so.2 stub via the B26
+     * ld.so path, and exercises the heavyweight libbfd surface:
+     *   objdump --version       -> identity ("GNU objdump (GNU Binutils)")
+     *   objdump -d /bin/hello    -> DISASSEMBLE a native ELF (full x86-64 disasm)
+     *   nm -D /bin/objdump       -> dump dynamic symbols (libbfd symtab)
+     *   size /bin/objdump        -> section sizes (text/data/bss)
+     *   c++filt _Z4testi         -> demangle a C++ symbol -> "test(int)"
+     * stdout goes to the console so the serial log carries the genuine GNU
+     * output the proof script greps for. Each must exit 0. */
+    {
+        static const char *targ[][5] = {
+            { "objdump", "--version", 0, 0, 0 },
+            { "objdump", "-d", "/bin/hello", 0, 0 },
+            { "nm", "-D", "/bin/objdump", 0, 0 },
+            { "size", "/bin/objdump", 0, 0, 0 },
+            { "cppfilt", "_Z4testi", 0, 0, 0 },
+        };
+        static const char *tpath[] = {
+            "/bin/objdump", "/bin/objdump", "/bin/nm", "/bin/size", "/bin/cppfilt",
+        };
+        static const char *tname[] = {
+            "objdump", "objdump", "nm", "size", "c++filt",
+        };
+        static const char *tdesc[] = {
+            "objdump --version (identity)",
+            "objdump -d /bin/hello (disassemble a native ELF)",
+            "nm -D /bin/objdump (dynamic symbols)",
+            "size /bin/objdump (section sizes)",
+            "c++filt _Z4testi (demangle -> test(int))",
+        };
+        char *envp[] = {
+            (char *)"PATH=/bin", (char *)"HOME=/",
+            (char *)"LD_LIBRARY_PATH=/lib64", 0,
+        };
+        int tn = (int)(sizeof(targ) / sizeof(targ[0]));
+        int tpass = 0, trun = 0;
+        for (int t = 0; t < tn; t++) {
+            int ac = 0;
+            while (ac < 4 && targ[t][ac]) ac++;
+            struct proc_spec spec = {
+                .path = tpath[t], .name = tname[t],
+                .argc = ac, .argv = (char **)targ[t],
+                .envc = 3, .envp = envp,
+            };
+            kprintf("[boot] REALTOOLS: spawning GNU %s\n", tdesc[t]);
+            int pid = proc_spawn(&spec);
+            if (pid < 0) {
+                kprintf("[boot] REALTOOLS: %s not present -- SKIPPED\n", tpath[t]);
+                kprintf("[REALTOOLS] VERDICT: SKIP reason=no-binary\n");
+                trun = -1;
+                break;
+            }
+            int rc = proc_wait(pid);
+            trun++;
+            if (rc == 0) tpass++;
+            kprintf("[REALTOOLS] case %d (%s) exit=%d %s\n", t, tdesc[t], rc,
+                    rc == 0 ? "OK" : "FAIL");
+        }
+        if (trun >= 0)
+            kprintf("[REALTOOLS] VERDICT: %s pass=%d/%d (UNMODIFIED GNU Binutils "
+                    "battery: objdump disasm + nm + size + c++filt, glibc ld.so "
+                    "+ libdl + libbfd)\n",
+                    (tpass == trun && trun > 0) ? "PASS" : "FAIL", tpass, trun);
+    }
+#endif
+
 #ifdef XPIPE_BOOT
     /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
      * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux

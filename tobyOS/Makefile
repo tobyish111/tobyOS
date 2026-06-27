@@ -2366,6 +2366,26 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "readelf + glibc runtime under /lib64 -- OPT-IN";           \
 	    EXTRA_FILES="$$EXTRA_FILES bin/readelf lib64/ld-linux-x86-64.so.2 lib64/libc.so.6"; \
 	fi;                                                                   \
+	if [ -f programs/realtools/objdump ] &&                              \
+	   [ -f programs/realtools/lib64/ld-linux-x86-64.so.2 ] &&           \
+	   [ -f programs/realtools/lib64/libc.so.6 ] &&                      \
+	   [ -f programs/realtools/lib64/libdl.so.2 ]; then                  \
+	    mkdir -p $(INITRD_STAGE)/lib64;                                   \
+	    cp programs/realtools/objdump $(INITRD_STAGE)/bin/objdump;        \
+	    cp programs/realtools/nm      $(INITRD_STAGE)/bin/nm;             \
+	    cp programs/realtools/size    $(INITRD_STAGE)/bin/size;           \
+	    cp programs/realtools/strings $(INITRD_STAGE)/bin/strings;        \
+	    cp programs/realtools/cppfilt $(INITRD_STAGE)/bin/cppfilt;        \
+	    cp programs/realtools/lib64/ld-linux-x86-64.so.2                 \
+	         $(INITRD_STAGE)/lib64/ld-linux-x86-64.so.2;                 \
+	    cp programs/realtools/lib64/libc.so.6                            \
+	         $(INITRD_STAGE)/lib64/libc.so.6;                            \
+	    cp programs/realtools/lib64/libdl.so.2                           \
+	         $(INITRD_STAGE)/lib64/libdl.so.2;                           \
+	    echo "[initrd] realtools: bundling UNMODIFIED GNU Binutils"      \
+	         "battery (objdump/nm/size/strings/c++filt) + glibc -- OPT-IN"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/objdump bin/nm bin/size bin/strings bin/cppfilt lib64/ld-linux-x86-64.so.2 lib64/libc.so.6 lib64/libdl.so.2"; \
+	fi;                                                                   \
 	if [ -f programs/realbash/bash ]; then                               \
 	    cp programs/realbash/bash $(INITRD_STAGE)/bin/bash;               \
 	    printf '\003' | dd of=$(INITRD_STAGE)/bin/bash bs=1 seek=7        \

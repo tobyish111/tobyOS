@@ -377,6 +377,22 @@ driver model; POSIX libc surface.
   `[LXISH] PASS 42`, pty `[LXPTY] PASS 63`, `[LXPROCFS2] PASS 63`, static auto-detect `[LXSAUTO] PASS 73`, all in one ISO with
   0 faults (`logs/bashregress.sh`). *Opt-in:* the bash binary is gitignored (GPL); the initrd stages + brandelf's it only when
   present (`programs/realbash/build.sh`).
+- **2026-06-27** — **Track B: a *BATTERY* of real, off-the-shelf, DYNAMIC glibc GNU Binutils runs — objdump/nm/size/c++filt 2.43.1.**
+  The `realtool` milestone ran one tool (`readelf`); this runs five genuine, unmodified GNU Binutils 2.43.1 programs back-to-back,
+  all **dynamically linked against glibc** (`ld-linux-x86-64.so.2` + `libc.so.6` + `libdl.so.2`, the Bootlin 2025.08 toolchain):
+  `objdump --version` (identity → **`GNU objdump (GNU Binutils) 2.43.1`**), `objdump -d /bin/hello` (disassemble a native tobyOS
+  ELF through libbfd), `nm -D /bin/objdump` (dump objdump's own dynamic symbols), `size /bin/objdump` (section sizes), and
+  `c++filt _Z4testi` (Itanium-ABI demangle → **`test(int)`**). **Kernel gap fixed — the loader bug that blocked all multi-DSO
+  glibc programs:** every file's `stat`/`fstat` reported `st_ino = 1`, but glibc's `ld.so` dedups already-loaded shared objects by
+  `(st_dev, st_ino)`. So once `libdl.so.2` loaded (ino 1), opening `libc.so.6` (ino 1 too) looked like *the same file already
+  mapped* → ld.so aliased libc's link-map to libdl's, and every `libc` symbol-version lookup (`GLIBC_2.7`, `GLIBC_2.36`, …) failed
+  against libdl's tiny verdef table (`version 'GLIBC_2.7' not found`). Fixed by synthesizing a **stable, per-file inode** (FNV-1a
+  over the path for path stats; over the backing-node pointer `f->vfs.priv` for `fstat`) so distinct files get distinct inodes and
+  ld.so's dedup behaves — `libc.so.6` now generates its own link map and versions resolve. (Diagnosed with glibc's own
+  `LD_DEBUG=libs,versions,files`; also bumped `VMA_MAX_PER_PROC` 64→256 and added mmap-failure logging while ruling out an OOM/VMA
+  cause.) **Proof, clean under `+smep,+smap`, 0 faults / 0 unhandled syscalls:** `[REALTOOLS] VERDICT: PASS pass=5/5`
+  (`logs/realtools.sh`). *Opt-in:* the binutils + glibc runtime are gitignored; the initrd stages them only when present
+  (`programs/realtools/build.sh`).
 - **2026-06-27** — **Track B: a REAL, off-the-shelf Linux *tool* runs end-to-end — GNU Binutils `readelf`, unmodified.**
   B25/B26 ran glibc proof binaries *we wrote*; this runs an actual third-party program we did **not** author: GNU Binutils
   **`readelf` 2.43.1** (~1.1 MB), lifted byte-for-byte from a Bootlin x86-64 glibc 2.41 toolchain. It is a dynamic PIE

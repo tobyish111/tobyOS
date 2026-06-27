@@ -3068,15 +3068,32 @@ struct lx_stat {
     int64_t  __unused3[3];
 };
 
-/* Build a Linux struct stat from a tobyOS vfs_stat and copy it out. */
-static long linux_emit_stat(const struct vfs_stat *vs, void *ubuf) {
+/* FNV-1a 64-bit, used to synthesize a stable, per-file st_ino from a path.
+ * tobyOS's VFS has no real inode numbers, but glibc's ld.so dedups already-
+ * loaded shared libraries by (st_dev, st_ino): if every file reports the same
+ * ino, ld.so thinks the 2nd DSO it opens is identical to the 1st and reuses the
+ * wrong link map (so e.g. libc.so.6 silently aliases libdl.so.2 and every
+ * libc symbol version lookup fails). A path/identity hash gives each file a
+ * distinct, deterministic ino so dedup behaves. */
+static uint64_t lx_ino_hash(const char *s) {
+    uint64_t h = 1469598103934665603ULL;   /* FNV offset basis */
+    if (s) for (; *s; s++) { h ^= (uint8_t)*s; h *= 1099511628211ULL; }
+    if (h <= 1) h += 2;                     /* never 0/1 (1 was the old stub) */
+    return h;
+}
+
+/* Build a Linux struct stat from a tobyOS vfs_stat and copy it out. `ino` is a
+ * synthetic-but-stable inode number (see lx_ino_hash) so distinct files get
+ * distinct inodes -- required for glibc ld.so's shared-library dedup. */
+static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf) {
     struct lx_stat st;
     memset(&st, 0, sizeof st);
     uint32_t typ  = (vs->type == VFS_TYPE_DIR) ? 0x4000u : 0x8000u; /* S_IFDIR/REG */
     uint32_t perm = vs->mode & 0xFFFu;
     if (perm == 0) perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
     st.st_mode    = typ | perm;
-    st.st_ino     = 1;                 /* synthetic; tobyOS VFS has no stable ino here */
+    st.st_dev     = 1;
+    st.st_ino     = ino ? ino : 1;
     st.st_nlink   = 1;
     st.st_uid     = vs->uid;
     st.st_gid     = vs->gid;
@@ -3085,6 +3102,29 @@ static long linux_emit_stat(const struct vfs_stat *vs, void *ubuf) {
     st.st_blocks  = (int64_t)((vs->size + 511) / 512);
     if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
     return 0;
+}
+
+/* Synthesize a stable per-fd inode for fstat(). For VFS handles we hash the
+ * backing node pointer (f->vfs.priv) -- distinct files => distinct nodes =>
+ * distinct inodes, while two handles onto the same file share a node (so
+ * glibc's ld.so sees them as the same object, which is correct). Directories
+ * hash their path; other kinds fall back to an fd-derived value. */
+static uint64_t lx_fd_ino(struct file *f, int fd) {
+    if (f) {
+        if (f->kind == FILE_KIND_DIR && f->dirpath)
+            return lx_ino_hash(f->dirpath);
+        if (f->kind == FILE_KIND_VFS && f->vfs.priv) {
+            uintptr_t p = (uintptr_t)f->vfs.priv;
+            char buf[2 + 16 + 1];
+            const char *hex = "0123456789abcdef";
+            buf[0] = 'n'; buf[1] = ':';
+            for (int i = 0; i < 16; i++)
+                buf[2 + i] = hex[(p >> ((15 - i) * 4)) & 0xf];
+            buf[18] = '\0';
+            return lx_ino_hash(buf);
+        }
+    }
+    return lx_ino_hash("fd-fallback") + (uint64_t)(uint32_t)fd + 3;
 }
 
 /* Translate a Linux mmap flags word into the tobyOS VMA flag word that
@@ -4131,7 +4171,7 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         int sr = vfs_stat(kpath, &vs);
         if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
         if (sr != VFS_OK)        return -ABI_EACCES;
-        return linux_emit_stat(&vs, (void *)a2);
+        return linux_emit_stat(&vs, lx_ino_hash(kpath), (void *)a2);
     }
     case LX_newfstatat: {              /* (dirfd, path, struct stat*, flags) */
         /* We honour absolute paths and AT_FDCWD; AT_EMPTY_PATH (stat the
@@ -4147,7 +4187,7 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
                                    .uid = f->vfs.uid, .gid = f->vfs.gid,
                                    .mode = f->vfs.mode };
             if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
-            return linux_emit_stat(&vs, (void *)a3);
+            return linux_emit_stat(&vs, lx_fd_ino(f, (int)a1), (void *)a3);
         }
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path(upath, kpath, sizeof kpath);
@@ -4156,7 +4196,7 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         int sr = vfs_stat(kpath, &vs);
         if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
         if (sr != VFS_OK)        return -ABI_EACCES;
-        return linux_emit_stat(&vs, (void *)a3);
+        return linux_emit_stat(&vs, lx_ino_hash(kpath), (void *)a3);
     }
     case LX_fstat: {                   /* (fd, struct stat*) */
         struct file *f = fd_lookup((int)a1);
@@ -4174,7 +4214,7 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
             vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = 0,
                                     .mode = 0666 };
         }
-        return linux_emit_stat(&vs, (void *)a2);
+        return linux_emit_stat(&vs, lx_fd_ino(f, (int)a1), (void *)a2);
     }
     case LX_getdents64: {              /* (fd, void *dirp, count) */
         struct file *f = fd_lookup((int)a1);

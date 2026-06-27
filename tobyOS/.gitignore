@@ -35,6 +35,15 @@ programs/realtool/lib64/
 # via programs/realbash/build.sh (GPL; not committed).
 programs/realbash/bash
 
+# Track B/realtools: opt-in UNMODIFIED GNU Binutils battery + glibc runtime,
+# lifted from the Bootlin toolchain via programs/realtools/build.sh (not committed).
+programs/realtools/objdump
+programs/realtools/nm
+programs/realtools/size
+programs/realtools/strings
+programs/realtools/cppfilt
+programs/realtools/lib64/
+
 # Bootable images / filesystems produced by the build
 *.iso
 disk.img

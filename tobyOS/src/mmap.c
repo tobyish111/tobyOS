@@ -29,7 +29,7 @@
 
 /* ---- VMA definitions ---- */
 
-#define VMA_MAX_PER_PROC  64
+#define VMA_MAX_PER_PROC  256
 
 #define VMA_PROT_READ   0x01
 #define VMA_PROT_WRITE  0x02
@@ -105,7 +105,11 @@ static struct mmap_vma *vma_find_internal(struct vma_table *vt, uint64_t addr) {
 }
 
 static struct mmap_vma *vma_alloc(struct vma_table *vt) {
-    if (vt->count >= VMA_MAX_PER_PROC) return NULL;
+    if (vt->count >= VMA_MAX_PER_PROC) {
+        kprintf("[mmap] WARN: VMA table FULL (%d entries) -- mmap will fail\n",
+                vt->count);
+        return NULL;
+    }
     return &vt->entries[vt->count++];
 }
 
@@ -138,6 +142,8 @@ static uint64_t find_free_region(struct vma_table *vt, uint64_t len) {
             return addr;
         }
     }
+    kprintf("[mmap] WARN: find_free_region FAILED len=0x%lx (no hole)\n",
+            (unsigned long)len);
     return 0;
 }
 
@@ -186,6 +192,10 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
         for (uint64_t a = base; a < base + len; a += PAGE_SIZE) {
             uint64_t phys = pmm_alloc_page();
             if (!phys) {
+                kprintf("[mmap] WARN: pmm_alloc_page FAILED at a=0x%lx "
+                        "(base=0x%lx len=0x%lx) -- OOM\n",
+                        (unsigned long)a, (unsigned long)base,
+                        (unsigned long)len);
                 vmm_set_editor_root(saved_root);
                 return -12;
             }
