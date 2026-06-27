@@ -46,6 +46,7 @@ struct pipe;
 struct sock;
 struct window;
 struct term_session;
+struct pty;
 
 enum file_kind {
     FILE_KIND_NULL    = 0,
@@ -65,6 +66,11 @@ enum file_kind {
      * is a kmalloc'd struct epoll_inst (an interest list of {fd,events,data}).
      * See linux_syscall epoll_ctl/epoll_wait in syscall.c. */
     FILE_KIND_EPOLL   = 9,
+    /* Track B/B23: the two ends of a pseudoterminal pair. Both reference the
+     * same kmalloc'd struct pty; the slave carries the termios + line
+     * discipline. See pty.c. */
+    FILE_KIND_PTY_MASTER = 10,
+    FILE_KIND_PTY_SLAVE  = 11,
 };
 
 struct file {
@@ -92,6 +98,8 @@ struct file {
     uint32_t        dir_off;
     /* For FILE_KIND_EPOLL (Track B/B13): the epoll interest list. */
     struct epoll_inst *epoll;
+    /* For FILE_KIND_PTY_MASTER / FILE_KIND_PTY_SLAVE (Track B/B23). */
+    struct pty *pty;
 };
 
 /* Allocate + initialise the well-known console-backed file. Each call

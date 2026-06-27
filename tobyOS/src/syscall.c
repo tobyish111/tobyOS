@@ -69,6 +69,7 @@
 #include <tobyos/mouse.h>
 #include <tobyos/keyboard.h>
 #include <tobyos/tty.h>
+#include <tobyos/pty.h>
 #include <tobyos/usb_legacy.h>
 #include <tobyos/xhci.h>
 #include <tobyos/http.h>
@@ -982,6 +983,35 @@ static long sys_open(const char *path, int flags, int mode) {
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
+
+    /* B23: pseudoterminal device nodes. /dev/ptmx allocates a fresh pair and
+     * yields its master; /dev/pts/<N> yields the slave of pair N. These are
+     * synthesized (no VFS backing). */
+    if (kpath[0] == '/' && kpath[1] == 'd' && kpath[2] == 'e' &&
+        kpath[3] == 'v' && kpath[4] == '/') {
+        const char *dev = kpath + 5;
+        if (strcmp(dev, "ptmx") == 0) {
+            struct file *f = pty_open_master();
+            if (!f) return -ABI_ENOMEM;
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { file_close(f); return -ABI_EMFILE; }
+            return fd;
+        }
+        if (dev[0] == 'p' && dev[1] == 't' && dev[2] == 's' && dev[3] == '/') {
+            const char *ns = dev + 4;
+            int idx = 0; bool any = false;
+            for (const char *q = ns; *q; q++) {
+                if (*q < '0' || *q > '9') { any = false; break; }
+                idx = idx * 10 + (*q - '0'); any = true;
+            }
+            if (!any) return -ABI_ENOENT;
+            struct file *f = pty_open_slave(idx);
+            if (!f) return -ABI_ENOENT;
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { file_close(f); return -ABI_EMFILE; }
+            return fd;
+        }
+    }
 
     int access = flags & ABI_O_ACCMODE;
     bool want_create = (flags & ABI_O_CREAT) != 0;
@@ -3165,6 +3195,12 @@ static short file_poll_ready(struct file *f) {
         r |= LXP_POLLOUT;                    /* always writable */
         if (tty_console_readable()) r |= LXP_POLLIN;
         break;
+    case FILE_KIND_PTY_MASTER:               /* B23: pseudoterminal readiness */
+    case FILE_KIND_PTY_SLAVE:
+        r |= LXP_POLLOUT;
+        if (pty_readable(f)) r |= LXP_POLLIN;
+        if (pty_hup(f))      r |= LXP_POLLHUP;
+        break;
     default:                                 /* term/window/etc. */
         r |= LXP_POLLOUT;                    /* writable; input best-effort */
         break;
@@ -4184,6 +4220,8 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         if (!f) return -ABI_EBADF;
         if (f->kind == FILE_KIND_CONSOLE)
             return tty_console_ioctl((unsigned long)a2, (unsigned long)a3);
+        if (f->kind == FILE_KIND_PTY_MASTER || f->kind == FILE_KIND_PTY_SLAVE)
+            return pty_ioctl(f, (unsigned long)a2, (unsigned long)a3);
         return -ABI_ENOTTY;
     }
 

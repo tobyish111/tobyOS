@@ -26,6 +26,7 @@
 #include <tobyos/keyboard.h>
 #include <tobyos/signal.h>
 #include <tobyos/tty.h>
+#include <tobyos/pty.h>
 #include <tobyos/klibc.h>
 #include <tobyos/cpu.h>
 
@@ -115,6 +116,13 @@ struct file *file_clone(struct file *src) {
          * sharing across fork. */
         kfree(f);
         return 0;
+    case FILE_KIND_PTY_MASTER:
+    case FILE_KIND_PTY_SLAVE:
+        /* dup()/dup2()/fork inheritance of a PTY end shares the same pair;
+         * bump the end's refcount so close()s balance out. */
+        f->pty = src->pty;
+        pty_clone_ref(f);
+        break;
     case FILE_KIND_DIR:
         /* Deep-copy the directory path so each clone owns its own buffer
          * (avoids a double-free on close); resume offset carries over. */
@@ -170,6 +178,10 @@ void file_close(struct file *f) {
     case FILE_KIND_EPOLL:
         if (f->epoll) kfree(f->epoll);
         break;
+    case FILE_KIND_PTY_MASTER:
+    case FILE_KIND_PTY_SLAVE:
+        pty_close(f);
+        break;
     case FILE_KIND_CONSOLE:
     case FILE_KIND_NULL:
         break;
@@ -183,6 +195,10 @@ long file_read(struct file *f, void *buf, size_t n) {
     switch (f->kind) {
     case FILE_KIND_CONSOLE:
         return console_read(buf, n);
+    case FILE_KIND_PTY_MASTER:
+        return pty_master_read(f, buf, n);
+    case FILE_KIND_PTY_SLAVE:
+        return pty_slave_read(f, buf, n);
     case FILE_KIND_PIPE_R:
         return pipe_read(f->pipe, buf, n);
     case FILE_KIND_VFS:
@@ -224,6 +240,10 @@ long file_write(struct file *f, const void *buf, size_t n) {
     switch (f->kind) {
     case FILE_KIND_CONSOLE:
         return console_write(buf, n);
+    case FILE_KIND_PTY_MASTER:
+        return pty_master_write(f, buf, n);
+    case FILE_KIND_PTY_SLAVE:
+        return pty_slave_write(f, buf, n);
     case FILE_KIND_PIPE_W:
         return pipe_write(f->pipe, buf, n);
     case FILE_KIND_VFS:

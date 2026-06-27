@@ -5815,6 +5815,35 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXPTY_BOOT
+    /* Track B/B23: pseudoterminal pairs. The proof ELF does the full Linux
+     * openpty() handshake (open /dev/ptmx -> TIOCGPTN -> open /dev/pts/N),
+     * drives both ends through the cooked line discipline + termios + winsize,
+     * and finally forks a child whose stdio is the slave and execve's a REAL
+     * busybox `sh -c 'echo PTY-SHELL'`, reading the output back off the master.
+     * All six checks -> exit 63. Opt-in: needs busybox staged. */
+    {
+        char *argv[] = { (char *)"linux-pty", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-pty", .name = "linux-pty",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] LXPTY: spawning /bin/linux-pty (pseudoterminal proof)\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LXPTY: /bin/linux-pty not present -- SKIPPED\n");
+            kprintf("[LXPTY] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] LXPTY: linux-pty (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[LXPTY] VERDICT: %s exit=%d (openpty + bidir line discipline "
+                    "+ termios/winsize + a real shell on the pts; expect 63)\n",
+                    rc == 63 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef XPIPE_BOOT
     /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
      * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux

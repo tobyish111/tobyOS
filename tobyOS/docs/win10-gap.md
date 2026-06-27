@@ -357,6 +357,24 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-26** — **Track B milestone B23: pseudoterminals — `/dev/ptmx` + `/dev/pts/N`, the Linux `openpty()` pair.**
+  B21/B22 gave the *console* a controlling TTY; B23 lets userspace mint its own terminals — the substrate every terminal
+  emulator, `script`, `expect`, `tmux` and `sshd` is built on. New `src/pty.c` implements `struct pty` pairs: two byte rings
+  wired back-to-back (master write → slave input, slave write → master output) plus a per-slave `ktermios` running the same
+  cooked line discipline as the console (canonical line editing + VERASE/VKILL/VEOF, raw/VMIN, ECHO at receive time, `ICRNL`
+  on input / `ONLCR` on output). `sys_open` intercepts the device nodes: **`/dev/ptmx`** allocates a fresh pair and returns
+  the master; **`/dev/pts/N`** returns slave N — exactly the glibc/musl `openpty()` handshake
+  (`open(ptmx)` → `TIOCSPTLCK` unlock → `TIOCGPTN` → `open(/dev/pts/N)`). Two new `FILE_KIND_PTY_MASTER/SLAVE` with
+  refcounted ends (dup/fork via `file_clone`), wired through `file_read/write/close`, `LX_ioctl`
+  (`TCGETS/TCSETS`, `TIOCGWINSZ/TIOCSWINSZ`, `TIOCGPGRP/TIOCSPGRP`, `TIOCGPTN`, `TIOCSPTLCK`, `TIOCSCTTY`, `FIONREAD`),
+  and poll/select (`POLLIN`/`POLLHUP` off live ring + peer-closed state). Blocking reads use the cooperative wait-queue
+  protocol (signals → `EINTR`).
+  **Proof, clean under `+smep,+smap`, 0 faults, 0 unhandled syscalls:** `[LXPTY] VERDICT: PASS exit=63` (`logs/b23.sh`) — a
+  raw-syscall Linux ELF runs the full openpty handshake, drives **master→slave** (write `hello\n` to master, cooked read on
+  the slave returns exactly `hello\n`) and **slave→master** (write `world\n` on the slave, master reads `world\r\n` — the
+  ldisc mapped NL→CRNL), round-trips the window size 40×120, and finally **forks a child whose stdio is the slave and
+  `execve`'s a real `busybox sh -c 'echo PTY-SHELL'`, reading the output back off the master** — a genuine program running on
+  a pseudoterminal. **No regression:** full Linux-track battery green (`LXABI…LXSAUTO`), busybox file battery `[LXBB] PASS 10/10`.
 - **2026-06-26** — **Track B milestone B22: a REAL interactive Linux shell — `busybox sh -i` runs a read-eval loop over the B21 TTY.**
   B21 made the console a controlling TTY; B22 is the payoff: a genuine interactive shell. The blocker turned out to be the
   **terminal-query handshake** — busybox's line editor writes `ESC[6n` (Device Status Report → cursor position) and *blocks
