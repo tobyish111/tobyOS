@@ -3016,6 +3016,8 @@ enum {
      * fell through to -ENOSYS. */
     LX_madvise = 28, LX_getrlimit = 97, LX_setrlimit = 160,
     LX_prlimit64 = 302, LX_rseq = 334, LX_clone3 = 435,
+    /* realbash: PATH lookups / `test -e/-x` use the *at access variants. */
+    LX_faccessat = 269, LX_faccessat2 = 439,
 };
 
 /* arch_prctl codes. */
@@ -3918,6 +3920,21 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
     return n;
 }
 
+/* access(2)/faccessat(2) family: resolve the path and report existence. We do
+ * not enforce per-file R/W/X bits (tobyOS files in /bin are all executable and
+ * the VFS doesn't model Unix mode bits here), so any existing path is
+ * accessible -- exactly what PATH search / `test -e` / shell rc-probing need.
+ * AT_FDCWD and absolute paths are honoured (resolve_user_path also handles
+ * cwd-relative); a non-AT_FDCWD dirfd-relative path is resolved against the cwd
+ * (best-effort -- bash/coreutils use AT_FDCWD). */
+static long lx_faccess(const char *upath) {
+    char kpath[ABI_PATH_MAX];
+    if (resolve_user_path(upath, kpath, sizeof kpath) != 0)
+        return -ABI_EFAULT;
+    struct vfs_stat vs;
+    return (vfs_stat(kpath, &vs) == VFS_OK) ? 0 : -ABI_ENOENT;
+}
+
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     switch (n) {
     /* ---- exits ---- */
@@ -4496,8 +4513,11 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_futex:
         return futex((uint32_t *)(uintptr_t)a1, (int)(a2 & 0x7f), (uint32_t)a3);
 
-    case LX_access:
-        return -ABI_ENOENT;     /* conservative: report "not there" */
+    case LX_access:                 /* (path, mode) */
+        return lx_faccess((const char *)a1);
+    case LX_faccessat:              /* (dirfd, path, mode) */
+    case LX_faccessat2:             /* (dirfd, path, mode, flags) */
+        return lx_faccess((const char *)a2);
 
     /* Known-optional: libc/busybox probe these and fall back cleanly on
      * -ENOSYS. Handled explicitly (quietly) so they don't spam the log. */

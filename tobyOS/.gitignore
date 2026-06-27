@@ -31,6 +31,10 @@ programs/linux-glibc-dyn/lib/
 programs/realtool/readelf
 programs/realtool/lib64/
 
+# Track B/realbash: opt-in UNMODIFIED GNU bash 5.2 (static), fetched out-of-tree
+# via programs/realbash/build.sh (GPL; not committed).
+programs/realbash/bash
+
 # Bootable images / filesystems produced by the build
 *.iso
 disk.img

@@ -5999,6 +5999,63 @@ void _start(void) {
     }
 #endif
 
+#ifdef REALBASH_BOOT
+    /* Track B: run a REAL, UNMODIFIED, off-the-shelf GNU bash 5.2 as an
+     * INTERACTIVE shell over the console TTY. Where B22 ran busybox's small
+     * `ash` interactively, bash is the canonical, full-featured Unix shell --
+     * with its own bundled readline line editor (raw-mode termios, ESC[6n
+     * cursor-position queries, SIGWINCH), $((arithmetic)), command
+     * substitution, job-control setup, and a much larger libc/syscall surface.
+     * It exercises the B21/B22 TTY line discipline far harder than ash did.
+     *
+     * We "type" a 3-line session into the keyboard ring before spawning
+     * (kbd_inject_raw bypasses the GUI key gate, like LXISH):
+     *
+     *     X=$(busybox echo 35)                 <- command substitution (fork+exec)
+     *     echo BASH-OK ver=$BASH_VERSION sum=$((X+7))   <- bash arithmetic + var
+     *     exit $((X+7))                        <- arithmetic exit status
+     *
+     * A PASS means bash read all three lines from the TTY in its interactive
+     * read-eval loop, forked+exec'd busybox for the substitution, evaluated the
+     * arithmetic, printed its real $BASH_VERSION ("5.2.15(1)-release"), and
+     * exited 42 (= 35 + 7). The proof script also greps the serial log for the
+     * genuine "BASH-OK ver=5.2" banner. Opt-in: needs bash + busybox staged. */
+    {
+        const char *session =
+            "X=$(busybox echo 35)\n"
+            "echo BASH-OK ver=$BASH_VERSION sum=$((X+7))\n"
+            "exit $((X+7))\n";
+        for (const char *p = session; *p; p++) kbd_inject_raw(*p);
+
+        char *argv[] = {
+            (char *)"bash", (char *)"--norc", (char *)"--noprofile",
+            (char *)"-i", 0
+        };
+        char *envp[] = {
+            (char *)"PATH=/bin", (char *)"PS1=tobyos$ ",
+            (char *)"HOME=/", (char *)"TERM=tobyos", 0
+        };
+        struct proc_spec spec = {
+            .path = "/bin/bash", .name = "bash",
+            .argc = 4, .argv = argv, .envc = 4, .envp = envp,
+        };
+        kprintf("[boot] REALBASH: spawning interactive GNU `bash -i` "
+                "(injected a 3-line session)\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] REALBASH: /bin/bash not present -- SKIPPED\n");
+            kprintf("[REALBASH] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] REALBASH: interactive bash (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[REALBASH] VERDICT: %s exit=%d (UNMODIFIED GNU bash 5.2 "
+                    "interactive read-eval loop over the TTY + cmd-subst + "
+                    "arithmetic; expect 42)\n",
+                    rc == 42 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef XPIPE_BOOT
     /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
      * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux

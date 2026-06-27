@@ -357,6 +357,26 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-27** — **Track B: a REAL, off-the-shelf GNU *bash* runs INTERACTIVELY over the TTY — unmodified GNU bash 5.2.**
+  Where B22 ran busybox's small `ash` interactively, this runs the canonical, full-featured Unix shell: **unmodified GNU bash
+  5.2-015** (the public reproducible `robxu9/bash-static` build, statically linked against musl 1.2.3 — so it runs through the
+  proven static-Linux loader path with no DSO version-matching; the milestone's new content is the *interactive bash read-eval
+  loop over the TTY*, not the libc linkage). bash brings its own bundled **readline** line editor (raw-mode termios, `ESC[6n`
+  cursor-position queries, `SIGWINCH`), `$((arithmetic))`, command substitution, and a much larger libc/syscall surface, so it
+  exercises the B21/B22 console line discipline far harder than `ash` did. We "type" a 3-line session into the keyboard ring
+  (`kbd_inject_raw`, like LXISH) — `X=$(busybox echo 35)` (command substitution → fork+exec), `echo BASH-OK
+  ver=$BASH_VERSION sum=$((X+7))`, `exit $((X+7))` — and a PASS means bash read all three lines in its interactive loop,
+  forked+exec'd busybox for the substitution, evaluated the arithmetic, printed its genuine **`ver=5.2.15(1)-release`**
+  banner, and exited 42 (= 35 + 7). **Kernel gap filled:** `access` (syscall 21) was a blanket `-ENOENT` stub, and
+  `faccessat` (269) / `faccessat2` (439) were unimplemented (`-ENOSYS`) — every shell PATH lookup / `test -e/-x` uses these.
+  Replaced with a real `lx_faccess()` that resolves the path and `vfs_stat()`s it (existence-based; tobyOS doesn't model
+  per-file Unix mode bits, and `/bin` is all-executable, so any existing path is accessible — exactly what PATH search needs).
+  **Proof, clean under `+smep,+smap`, 0 faults / 0 unhandled syscalls:** `[REALBASH] VERDICT: PASS exit=42` (`logs/bashrun.sh`).
+  **No regression** (touches core syscall dispatch + the access path): combined boot of the hand-rolled Linux battery
+  (`LXABI/LXSIG/LXMMAP/LXTHREAD/LXJOIN/LXPOLL` all PASS), static musl busybox `[LXBB] PASS 10/10`, interactive busybox
+  `[LXISH] PASS 42`, pty `[LXPTY] PASS 63`, `[LXPROCFS2] PASS 63`, static auto-detect `[LXSAUTO] PASS 73`, all in one ISO with
+  0 faults (`logs/bashregress.sh`). *Opt-in:* the bash binary is gitignored (GPL); the initrd stages + brandelf's it only when
+  present (`programs/realbash/build.sh`).
 - **2026-06-27** — **Track B: a REAL, off-the-shelf Linux *tool* runs end-to-end — GNU Binutils `readelf`, unmodified.**
   B25/B26 ran glibc proof binaries *we wrote*; this runs an actual third-party program we did **not** author: GNU Binutils
   **`readelf` 2.43.1** (~1.1 MB), lifted byte-for-byte from a Bootlin x86-64 glibc 2.41 toolchain. It is a dynamic PIE

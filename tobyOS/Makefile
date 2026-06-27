@@ -2366,6 +2366,14 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "readelf + glibc runtime under /lib64 -- OPT-IN";           \
 	    EXTRA_FILES="$$EXTRA_FILES bin/readelf lib64/ld-linux-x86-64.so.2 lib64/libc.so.6"; \
 	fi;                                                                   \
+	if [ -f programs/realbash/bash ]; then                               \
+	    cp programs/realbash/bash $(INITRD_STAGE)/bin/bash;               \
+	    printf '\003' | dd of=$(INITRD_STAGE)/bin/bash bs=1 seek=7        \
+	         count=1 conv=notrunc 2>/dev/null;                           \
+	    echo "[initrd] realbash: bundling UNMODIFIED GNU bash 5.2"        \
+	         "(static musl, brandelf EI_OSABI=Linux) -- OPT-IN";         \
+	    EXTRA_FILES="$$EXTRA_FILES bin/bash";                             \
+	fi;                                                                   \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
