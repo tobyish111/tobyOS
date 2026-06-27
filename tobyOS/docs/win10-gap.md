@@ -424,6 +424,21 @@ driver model; POSIX libc surface.
   harness inside `#ifdef REALCC_BOOT`, which is not defined in default/regression builds, so default boot logic is unchanged.
   *Opt-in:* the TinyCC binary + `libtcc.so` + `libtcc1.a` are gitignored; `programs/realcc/build.sh` fetches them from the
   Alpine package mirror and the initrd stages them only when present (the `hello_cc.c` proof source is committed).
+- **2026-06-27** — **Track C (graphics): the virtio-gpu driver + GPU-accelerated present path proven HEADLESSLY — `[VIRTGPU] VERDICT: PASS`.**
+  The `src/virtio_gpu.c` driver (modern non-transitional virtio, vid:did `1af4:1050`) was already implemented and wired, but its
+  only proof was the **interactive** `make run-virtio-gpu` target — nothing automated/greppable. This adds a deterministic,
+  headless proof. Booting `-vga none -device virtio-gpu-pci`, the driver binds during `pci_bind_drivers`, parses the modern virtio
+  cap chain, negotiates features (virgl=no on this host), brings up scanout 0 (**GET_DISPLAY_INFO → RESOURCE_CREATE_2D →
+  RESOURCE_ATTACH_BACKING → SET_SCANOUT**, 1280×800 BGRX backed by 1000 physically-contiguous PMM pages), and — once
+  `gfx_layer_init()` runs — `virtio_gpu_install_backend()` hooks `gfx_flip()` so every present goes through **TRANSFER_TO_HOST_2D +
+  RESOURCE_FLUSH** on the GPU instead of the Limine memcpy fallback (the HW cursor plane and per-window GPU resources come up too).
+  The new `#ifdef VIRTGPU_BOOT` harness drives a burst of 24 frames through the compositor's `gfx_flip()` and **asserts the GPU
+  present counters actually advanced** (a new `virtio_gpu_proof_stats()` accessor reports `full`/`partial` present counts + live
+  backend state) — so a PASS proves real GPU commands flowed, not that the binary merely started. **Proof, clean under
+  `+smep,+smap`, 0 faults / 0 unhandled syscalls:** `present=1 backend_active=1 scanout=1280x800`, `presents full=25 partial=0
+  (delta=24)`, `[VIRTGPU] VERDICT: PASS` (`logs/virtgpu.sh`). **No regression:** the only always-compiled change is the additive
+  read-only `virtio_gpu_proof_stats()` (never called in default builds); the harness lives inside `#ifdef VIRTGPU_BOOT`
+  (undefined in default/regression builds), so default boot logic is unchanged.
 - **2026-06-27** — **Track B: a REAL, off-the-shelf Linux *tool* runs end-to-end — GNU Binutils `readelf`, unmodified.**
   B25/B26 ran glibc proof binaries *we wrote*; this runs an actual third-party program we did **not** author: GNU Binutils
   **`readelf` 2.43.1** (~1.1 MB), lifted byte-for-byte from a Bootlin x86-64 glibc 2.41 toolchain. It is a dynamic PIE

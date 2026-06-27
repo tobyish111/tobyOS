@@ -1578,6 +1578,19 @@ bool virtio_gpu_present(void) {
     return g_vgpu_bound;
 }
 
+/* Proof/diagnostics: report whether the gfx backend is live and how many
+ * TRANSFER_TO_HOST_2D+RESOURCE_FLUSH presents have gone through the GPU path
+ * (full = whole-surface .flip(), partial = dirty-rect .present_rect()). Lets a
+ * headless boot harness assert the compositor is really driving the GPU. */
+bool virtio_gpu_proof_stats(uint64_t *full_out, uint64_t *partial_out,
+                            uint32_t *w_out, uint32_t *h_out) {
+    if (full_out)    *full_out    = g_vgpu.full_flips;
+    if (partial_out) *partial_out = g_vgpu.partial_flips;
+    if (w_out)       *w_out       = g_vgpu.width;
+    if (h_out)       *h_out       = g_vgpu.height;
+    return g_vgpu_active;
+}
+
 void virtio_gpu_install_backend(void) {
     if (!g_vgpu_bound) {
         /* No GPU found at probe time. Silent -- gfx_flip stays on the

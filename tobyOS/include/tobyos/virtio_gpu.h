@@ -57,6 +57,14 @@ void virtio_gpu_install_backend(void);
  * the regression-table-friendly "[virtio-gpu] backend active" line. */
 bool virtio_gpu_present(void);
 
+/* Proof/diagnostics: returns true if the virtio-gpu gfx backend is live
+ * (installed and not torn down). Optionally reports the cumulative count of
+ * full-surface and dirty-rect presents pushed through TRANSFER_TO_HOST_2D +
+ * RESOURCE_FLUSH, plus the active scanout geometry. Used by the headless boot
+ * proof harness to assert the compositor is really driving the GPU. */
+bool virtio_gpu_proof_stats(uint64_t *full_out, uint64_t *partial_out,
+                            uint32_t *w_out, uint32_t *h_out);
+
 /* VirGL 3D support (Phase 3 foundation) */
 bool virtio_gpu_virgl_available(void);
 int  virtio_gpu_ctx_create(uint32_t ctx_id, const char *debug_name);

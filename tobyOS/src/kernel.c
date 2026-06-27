@@ -6231,6 +6231,48 @@ void _start(void) {
     }
 #endif
 
+#ifdef VIRTGPU_BOOT
+    /* Track B: PROVE the virtio-gpu driver + GPU-accelerated present path
+     * headlessly. With `-vga none -device virtio-gpu-pci`, the driver binds
+     * during pci_bind_drivers, brings up scanout 0 (GET_DISPLAY_INFO ->
+     * RESOURCE_CREATE_2D -> ATTACH_BACKING -> SET_SCANOUT), and
+     * virtio_gpu_install_backend() hooks gfx_flip() to push pixels via
+     * TRANSFER_TO_HOST_2D + RESOURCE_FLUSH. Here we drive a burst of real
+     * frames through the compositor's gfx_flip() and assert that the present
+     * counters advanced -- i.e. genuine GPU commands flowed, not the Limine
+     * memcpy fallback. PASS = device present + backend live + counters moved. */
+    {
+        uint64_t f0 = 0, p0 = 0, f1 = 0, p1 = 0;
+        uint32_t gw = 0, gh = 0;
+        bool present = virtio_gpu_present();
+        bool active0 = virtio_gpu_proof_stats(&f0, &p0, &gw, &gh);
+        kprintf("[boot] VIRTGPU: present=%d backend_active=%d scanout=%ux%u "
+                "(driving %d frames through gfx_flip)\n",
+                present, active0, gw, gh, 24);
+        if (gfx_ready()) {
+            static const uint32_t pal[] = {
+                0x101820u, 0x202830u, 0x301828u, 0x183028u,
+            };
+            for (int i = 0; i < 24; i++) {
+                gfx_clear(pal[i & 3]);
+                gfx_fill_rect(40 + (i * 8) % 200, 60, 120, 80, 0x40A0FFu);
+                gfx_draw_text16(48, 70, "VIRTGPU-FRAME", 0xFFFFFFu, GFX_TRANSPARENT);
+                gfx_flip();
+            }
+        }
+        bool active1 = virtio_gpu_proof_stats(&f1, &p1, &gw, &gh);
+        uint64_t before = f0 + p0, after = f1 + p1;
+        bool pass = present && active1 && (after > before);
+        kprintf("[boot] VIRTGPU: presents full=%lu partial=%lu (delta=%lu)\n",
+                (unsigned long)f1, (unsigned long)p1,
+                (unsigned long)(after - before));
+        kprintf("[VIRTGPU] VERDICT: %s (REAL virtio-gpu-pci: scanout %ux%u, "
+                "gfx_flip -> TRANSFER_TO_HOST_2D + RESOURCE_FLUSH, %lu GPU "
+                "presents; expect present+active+delta>0)\n",
+                pass ? "PASS" : "FAIL", gw, gh, (unsigned long)after);
+    }
+#endif
+
 #ifdef XPIPE_BOOT
     /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
      * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux
