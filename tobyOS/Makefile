@@ -2360,6 +2360,19 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "(linux-fbgui) + ld-musl loader -- OPT-IN";                 \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-fbgui lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
 	fi;                                                                   \
+	if [ -f programs/linux-evdev/linux-evdev.elf ] &&                    \
+	   [ -f programs/busybox/ld-musl-x86_64.so.1 ]; then                 \
+	    mkdir -p $(INITRD_STAGE)/lib;                                     \
+	    cp programs/linux-evdev/linux-evdev.elf                          \
+	         $(INITRD_STAGE)/bin/linux-evdev;                            \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/ld-musl-x86_64.so.1;                    \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/libc.musl-x86_64.so.1;                  \
+	    echo "[initrd] Track B input: bundling DYNAMIC musl evdev reader" \
+	         "(linux-evdev) + ld-musl loader -- OPT-IN";                 \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-evdev lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
+	fi;                                                                   \
 	if [ -f programs/busybox/busybox ]; then                             \
 	    cp programs/busybox/busybox $(INITRD_STAGE)/bin/busybox;          \
 	    printf '\003' | dd of=$(INITRD_STAGE)/bin/busybox bs=1 seek=7     \

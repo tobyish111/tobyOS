@@ -8,6 +8,7 @@
  */
 
  #include <tobyos/keyboard.h>
+ #include <tobyos/evdev.h>
  #include <tobyos/mouse.h>
  #include <tobyos/isr.h>
  #include <tobyos/irq.h>
@@ -227,10 +228,18 @@ bool kbd_haschar(void) {
          return;
      }
  
-     bool released = (sc & 0x80) != 0;
-     uint8_t code  = (uint8_t)(sc & 0x7F);
- 
-     switch (code) {
+    bool released = (sc & 0x80) != 0;
+    uint8_t code  = (uint8_t)(sc & 0x7F);
+
+    /* Track B input: feed the raw make/break to /dev/input/event0 (evdev).
+     * For PS/2 scancode set 1 the Linux keycode equals the scancode across
+     * the main block (1..0x53), so the mapping is the identity. This runs for
+     * every key -- including modifiers -- exactly as a real evdev device does,
+     * before the cooked-char path below consumes/translates it. */
+    if (code >= 1 && code <= 0x53)
+        evdev_feed_key(code, released ? 0 : 1);
+
+    switch (code) {
      case 0x2A:
      case 0x36:
          g_shift = !released;

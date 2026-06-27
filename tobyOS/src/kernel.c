@@ -32,6 +32,7 @@
 #include <tobyos/rtc.h>
 #include <tobyos/perf.h>
 #include <tobyos/keyboard.h>
+#include <tobyos/evdev.h>
 #include <tobyos/tty.h>
 #include <tobyos/limine.h>
 #include <tobyos/pmm.h>
@@ -3695,6 +3696,46 @@ void _start(void) {
                     (rc == 0 && pix_ok) ? "PASS" : "FAIL", rc,
                     pix_ok ? "ok" : "MISMATCH");
             pit_sleep_ms(3000);
+        }
+    }
+#endif
+
+#ifdef EVDEV_BOOT
+    /* Track B (Linux input): prove the Linux input layer -- /dev/input/event0
+     * (evdev). A DYNAMICALLY-linked musl Linux app opens the device, queries
+     * its identity/capabilities with the standard EVIOCG* ioctls, and read()s
+     * fixed 24-byte struct input_event records via real libc. We inject a
+     * deterministic key sequence (the keycodes for T, O, B, Y, then ENTER) the
+     * same way the PS/2 driver feeds real keystrokes; the app collects the
+     * EV_KEY presses until ENTER and exits 0 only if it decoded exactly
+     * "TOBY". A PASS proves a Linux graphical app can read the keyboard
+     * through the genuine evdev ABI (EV_KEY/EV_SYN + EVIOCG* + input_event). */
+    {
+        /* Linux keycodes: KEY_T=20 KEY_O=24 KEY_B=48 KEY_Y=21 KEY_ENTER=28. */
+        static const uint8_t seq[] = { 20, 24, 48, 21, 28 };
+        evdev_reset();
+        for (unsigned i = 0; i < sizeof(seq); i++) {
+            evdev_feed_key(seq[i], 1);   /* press   */
+            evdev_feed_key(seq[i], 0);   /* release */
+        }
+        char *argv[] = { (char *)"linux-evdev", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-evdev", .name = "linux-evdev",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] EVDEV: injected T,O,B,Y,ENTER; spawning DYNAMIC musl "
+                "reader on /dev/input/event0\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[EVDEV] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[EVDEV] VERDICT: %s exit=%d (a dynamically-linked musl "
+                    "Linux app read EV_KEY make/break + EV_SYN records from "
+                    "/dev/input/event0 via libc and decoded the injected keys; "
+                    "expect exit0 == it read \"TOBY\")\n",
+                    rc == 0 ? "PASS" : "FAIL", rc);
         }
     }
 #endif

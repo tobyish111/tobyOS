@@ -98,6 +98,7 @@ extern "C" {
 #define ABI_E2BIG            7   /* arg/env list too long */
 #define ABI_EBADF            9   /* bad file descriptor */
 #define ABI_ECHILD          10   /* no child processes */
+#define ABI_EAGAIN          11   /* resource temporarily unavailable (== EWOULDBLOCK) */
 #define ABI_ENOMEM          12   /* out of memory */
 #define ABI_EACCES          13   /* permission denied */
 #define ABI_EFAULT          14   /* bad address */
@@ -1126,6 +1127,7 @@ _Static_assert(sizeof(struct abi_display_info) ==
 #define ABI_O_EXCL      0x080
 #define ABI_O_TRUNC     0x200
 #define ABI_O_APPEND    0x400
+#define ABI_O_NONBLOCK  0x800
 
 /* ============================================================
  *  lseek() whence values

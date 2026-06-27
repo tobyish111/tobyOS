@@ -68,6 +68,7 @@
 #include <tobyos/sysmon.h>
 #include <tobyos/mouse.h>
 #include <tobyos/keyboard.h>
+#include <tobyos/evdev.h>
 #include <tobyos/tty.h>
 #include <tobyos/pty.h>
 #include <tobyos/usb_legacy.h>
@@ -222,12 +223,16 @@ static long sys_write(int fd, const void *buf, size_t len) {
     return rv;
 }
 
+static long evdev_read(uint64_t ubuf, size_t len);   /* defined below (evdev dev) */
+
 static long sys_read(int fd, void *buf, size_t len) {
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
     if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
+    if (f->kind == FILE_KIND_EVDEV)      /* /dev/input/event0: struct input_event stream */
+        return evdev_read((uint64_t)(uintptr_t)buf, len);
     void *k = kmalloc(len);
     if (!k) return -ABI_ENOMEM;
     long rv = file_read(f, k, len);
@@ -1138,6 +1143,156 @@ static long fbdev_mmap(uint64_t len) {
     return base;
 }
 
+/* ---- Track B input: the Linux evdev device /dev/input/event0 ----------
+ *
+ * A genuine Linux input device: open("/dev/input/event0") -> FILE_KIND_EVDEV;
+ * read() returns a stream of fixed 24-byte `struct input_event` records
+ * (EV_KEY make/break + EV_SYN frames); the EVIOCG* ioctls report identity +
+ * capabilities. The PS/2 keyboard driver feeds raw make/break here via
+ * evdev_feed_key() -- for scancode set 1 the Linux keycode equals the
+ * scancode across the main block, so the mapping is the identity. A small
+ * ring buffers events; read blocks (yield) when empty unless O_NONBLOCK. */
+
+#define EV_SYN          0x00
+#define EV_KEY          0x01
+#define SYN_REPORT      0x00
+#define INPUT_EVENT_SZ  24u            /* sizeof(struct input_event) on x86-64 */
+
+extern uint64_t pit_ticks(void);       /* full decls appear later in this file */
+extern uint32_t pit_hz(void);
+
+#define EVDEV_RING      512u           /* power of two */
+struct evdev_evt { uint16_t type; uint16_t code; int32_t value; };
+struct evdev_ctx {
+    bool     open;
+    bool     nonblock;
+    int      owner_pid;
+    volatile uint32_t head, tail;      /* head=producer, tail=consumer */
+    struct evdev_evt ring[EVDEV_RING];
+    uint64_t produced, consumed;
+};
+static struct evdev_ctx g_evdev;
+
+/* evdev ioctl request numbers (Linux UAPI _IOC encoding -> low byte = nr,
+ * second byte = type 'E'). We dispatch on nr after checking type=='E'. */
+#define EVIOC_TYPE      'E'
+
+static void evdev_push(uint16_t type, uint16_t code, int32_t value) {
+    uint32_t next = (g_evdev.head + 1u) & (EVDEV_RING - 1u);
+    if (next == g_evdev.tail) {        /* full: drop oldest */
+        g_evdev.tail = (g_evdev.tail + 1u) & (EVDEV_RING - 1u);
+        g_evdev.consumed++;
+    }
+    g_evdev.ring[g_evdev.head].type  = type;
+    g_evdev.ring[g_evdev.head].code  = code;
+    g_evdev.ring[g_evdev.head].value = value;
+    g_evdev.head = next;
+    g_evdev.produced++;
+}
+
+void evdev_feed_key(uint8_t code, int value) {
+    /* A real evdev key event is the EV_KEY followed by a SYN_REPORT frame. */
+    evdev_push(EV_KEY, code, value);
+    evdev_push(EV_SYN, SYN_REPORT, 0);
+}
+
+void evdev_reset(void) {
+    g_evdev.head = g_evdev.tail = 0;
+    g_evdev.produced = g_evdev.consumed = 0;
+}
+
+/* Serialise one queued event into the 24-byte Linux struct input_event:
+ *   struct timeval { long sec; long usec; } time;  __u16 type; __u16 code;
+ *   __s32 value;  (offsets: time@0, type@16, code@18, value@20). */
+static void evdev_serialise(const struct evdev_evt *e, uint8_t out[INPUT_EVENT_SZ]) {
+    uint64_t hz = pit_hz(); if (!hz) hz = 100;
+    uint64_t t  = pit_ticks();
+    long sec  = (long)(t / hz);
+    long usec = (long)((t % hz) * (1000000ull / hz));
+    memset(out, 0, INPUT_EVENT_SZ);
+    *(long *)(out + 0)      = sec;
+    *(long *)(out + 8)      = usec;
+    *(uint16_t *)(out + 16) = e->type;
+    *(uint16_t *)(out + 18) = e->code;
+    *(int32_t  *)(out + 20) = e->value;
+}
+
+/* read() on /dev/input/event0: copy as many whole input_events as fit. Blocks
+ * (yield) on an empty queue unless O_NONBLOCK, matching the evdev semantics. */
+static long evdev_read(uint64_t ubuf, size_t len) {
+    size_t cap = len / INPUT_EVENT_SZ;
+    if (cap == 0) return -ABI_EINVAL;     /* evdev requires >= one event */
+
+    while (g_evdev.tail == g_evdev.head) {
+        if (g_evdev.nonblock) return -ABI_EAGAIN;
+        if (signal_pending_self()) return EINTR_RET;
+        sti(); hlt();
+    }
+
+    size_t n = 0;
+    uint8_t rec[INPUT_EVENT_SZ];
+    while (n < cap && g_evdev.tail != g_evdev.head) {
+        struct evdev_evt e = g_evdev.ring[g_evdev.tail];
+        g_evdev.tail = (g_evdev.tail + 1u) & (EVDEV_RING - 1u);
+        g_evdev.consumed++;
+        evdev_serialise(&e, rec);
+        if (copy_to_user((void *)(uintptr_t)(ubuf + n * INPUT_EVENT_SZ),
+                         rec, INPUT_EVENT_SZ) != 0)
+            return n ? (long)(n * INPUT_EVENT_SZ) : -ABI_EFAULT;
+        n++;
+    }
+    return (long)(n * INPUT_EVENT_SZ);
+}
+
+/* Fill `nbytes` of a little-endian bitmask `out` with bit `bit` set. */
+static long evdev_copy_bits(uint64_t up, unsigned size, const uint8_t *bits,
+                            unsigned nbits_bytes) {
+    unsigned n = size < nbits_bytes ? size : nbits_bytes;
+    return (copy_to_user((void *)(uintptr_t)up, bits, n) == 0) ? (long)n
+                                                               : -ABI_EFAULT;
+}
+
+static long evdev_ioctl(unsigned long req, unsigned long arg) {
+    unsigned nr   = req & 0xFFu;
+    unsigned type = (req >> 8) & 0xFFu;
+    unsigned size = (req >> 16) & 0x3FFFu;
+    if (type != EVIOC_TYPE) return -ABI_ENOTTY;
+
+    switch (nr) {
+    case 0x01: {                                   /* EVIOCGVERSION (int) */
+        int ver = 0x010001;                        /* EV_VERSION */
+        return (copy_to_user((void *)(uintptr_t)arg, &ver, sizeof(ver)) == 0)
+               ? 0 : -ABI_EFAULT;
+    }
+    case 0x02: {                                   /* EVIOCGID (struct input_id) */
+        uint16_t id[4] = { 0x0011 /*BUS_I8042*/, 0x0001, 0x0001, 0xAB41 };
+        return (copy_to_user((void *)(uintptr_t)arg, id, sizeof(id)) == 0)
+               ? 0 : -ABI_EFAULT;
+    }
+    case 0x06: {                                   /* EVIOCGNAME(len) */
+        static const char name[] = "tobyOS PS/2 Keyboard";
+        unsigned nl = (unsigned)sizeof(name);      /* includes NUL */
+        unsigned n  = size < nl ? size : nl;
+        return (copy_to_user((void *)(uintptr_t)arg, name, n) == 0)
+               ? (long)n : -ABI_EFAULT;
+    }
+    case 0x20: {                                   /* EVIOCGBIT(0): event types */
+        uint8_t evbits[4] = { 0 };
+        evbits[0] = (1u << EV_SYN) | (1u << EV_KEY);  /* 0x03 */
+        return evdev_copy_bits(arg, size, evbits, sizeof(evbits));
+    }
+    case 0x21: {                                   /* EVIOCGBIT(EV_KEY): key map */
+        uint8_t keybits[(0x53 / 8) + 1];
+        memset(keybits, 0, sizeof(keybits));
+        for (unsigned k = 1; k <= 0x53; k++)        /* main block we emit */
+            keybits[k >> 3] |= (uint8_t)(1u << (k & 7));
+        return evdev_copy_bits(arg, size, keybits, sizeof(keybits));
+    }
+    default:
+        return -ABI_ENOTTY;
+    }
+}
+
 /* ---- file open / close / dup ----------------------------------- */
 
 static long sys_open(const char *path, int flags, int mode) {
@@ -1186,6 +1341,22 @@ static long sys_open(const char *path, int flags, int mode) {
             g_fbdev.open = true;
             g_fbdev.owner_pid = p ? (p->is_thread ? p->tgid : p->pid) : 0;
             fbdev_init_geometry();
+            return fd;
+        }
+        /* Track B input: the Linux evdev keyboard device. Attaches to the
+         * global event queue (does NOT flush it, so events injected before
+         * the reader opened are still delivered). */
+        if (strcmp(dev, "input/event0") == 0) {
+            struct file *f = (struct file *)kmalloc(sizeof(*f));
+            if (!f) return -ABI_ENOMEM;
+            memset(f, 0, sizeof(*f));
+            f->kind = FILE_KIND_EVDEV;
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            struct proc *p = current_proc();
+            g_evdev.open = true;
+            g_evdev.nonblock = (flags & ABI_O_NONBLOCK) != 0;
+            g_evdev.owner_pid = p ? (p->is_thread ? p->tgid : p->pid) : 0;
             return fd;
         }
     }
@@ -4623,6 +4794,8 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
             return pty_ioctl(f, (unsigned long)a2, (unsigned long)a3);
         if (f->kind == FILE_KIND_FB)
             return fbdev_ioctl((unsigned long)a2, (unsigned long)a3);
+        if (f->kind == FILE_KIND_EVDEV)
+            return evdev_ioctl((unsigned long)a2, (unsigned long)a3);
         return -ABI_ENOTTY;
     }
 

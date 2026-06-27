@@ -83,6 +83,13 @@ enum file_kind {
      * flips). file_read/write hit the default error; close just frees. The
      * per-open geometry + mmap base live in a global fbdev context (syscall.c). */
     FILE_KIND_FB         = 13,
+    /* Track B (input): the Linux evdev device /dev/input/event0. A Linux app
+     * opens it, queries identity/capabilities via the EVIOCG* ioctls, and
+     * read()s fixed-size struct input_event records (EV_KEY make/break +
+     * EV_SYN frames) fed from the PS/2 keyboard. read on an empty queue blocks
+     * (or returns EAGAIN when O_NONBLOCK). The event ring lives in a global
+     * evdev context (syscall.c); close just frees the struct file. */
+    FILE_KIND_EVDEV      = 14,
 };
 
 struct eventfd;
