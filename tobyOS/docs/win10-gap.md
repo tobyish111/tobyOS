@@ -357,6 +357,20 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-26** — **Track B milestone B24: `/proc` + `/sys` breadth — the introspection nodes real tools read.**
+  Broadens B20's `/proc` and the existing `/sys` so memory/uptime/mount/fd-introspecting software works. **`/proc`** (in
+  `procfs.c`): `meminfo` rewritten to the Linux labelled-kB format (`MemTotal`/`MemFree`/`MemAvailable`/… in kB with a `kB`
+  unit, what `free`/`top`/sysconf parse); `uptime` now emits the two-float form (`uptime idle`); new `loadavg`
+  (`0.00 0.00 0.00 running/total lastpid`), `stat` (aggregate + per-CPU `cpu` lines, `btime`, `processes`, `procs_running`),
+  and `mounts` (one line per VFS mount via `vfs_iter_mounts`). New **`/proc/[pid]/fd/`** directory: lists a symlink per open
+  descriptor and `readlink`s each to its target (`/dev/console`, `/dev/ptmx`, `/dev/pts/N`, `pipe:[..]`, `socket:[..]`,
+  `anon_inode:[eventpoll]`, the dir path) — wired through `procfs_stat`/`opendir`/`readdir`/`readlink`. **`/sys`** (in the
+  existing `sysfs.c`) gains the Linux-layout nodes startup code reads: `/sys/devices/system/cpu/{online,possible,present}`
+  (the cpulist `0`/`0-N` that glibc `get_nprocs()`/`sysconf(_SC_NPROCESSORS_ONLN)` consults) and `/sys/kernel/{ostype,osrelease}`.
+  **Proof, clean under `+smep,+smap`, 0 faults:** `[LXPROCFS2] VERDICT: PASS exit=63` (`logs/b24.sh`) — a raw-syscall Linux ELF
+  reads `meminfo` (asserts `MemTotal:` + `kB`), `uptime` (two fields), `mounts` (finds `/proc`), `stat` (`cpu …` + `processes`),
+  enumerates `/proc/self/fd` (sees fds 0/1/2 + `readlink`s fd/0) and reads `/sys/.../cpu/online`. **No regression:** B20 procfs
+  proof `[LXPROCFS] PASS exit=15`, full Linux-track battery green, busybox file battery `[LXBB] PASS 10/10`.
 - **2026-06-26** — **Track B milestone B23: pseudoterminals — `/dev/ptmx` + `/dev/pts/N`, the Linux `openpty()` pair.**
   B21/B22 gave the *console* a controlling TTY; B23 lets userspace mint its own terminals — the substrate every terminal
   emulator, `script`, `expect`, `tmux` and `sshd` is built on. New `src/pty.c` implements `struct pty` pairs: two byte rings

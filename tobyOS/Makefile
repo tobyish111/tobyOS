@@ -1363,6 +1363,13 @@ programs/linux-pty/linux-pty.elf: programs/linux-pty/main.c
 	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
 	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
 	      -Wl,-e,_start -o $@ $<
+
+# B24: /proc + /sys breadth proof (meminfo/uptime/mounts/stat, /proc/self/fd,
+# /sys cpu/online). Static, branded Linux by the %.elf EI_OSABI dd step.
+programs/linux-procfs2/linux-procfs2.elf: programs/linux-procfs2/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
 # Track B/B19: a genuine STATIC, NOTE-LESS, UNBRANDED Linux x86-64 ELF -- the
@@ -1952,6 +1959,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-procfs/linux-procfs.elf \
                programs/linux-tty/linux-tty.elf \
                programs/linux-pty/linux-pty.elf \
+               programs/linux-procfs2/linux-procfs2.elf \
                programs/win-hello/win-hello.exe \
                programs/win-crt/win-crt.exe \
                programs/win-hello3/win-hello3.exe \
@@ -2061,6 +2069,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-procfs/linux-procfs.elf         $(INITRD_STAGE)/bin/linux-procfs
 	cp programs/linux-tty/linux-tty.elf               $(INITRD_STAGE)/bin/linux-tty
 	cp programs/linux-pty/linux-pty.elf               $(INITRD_STAGE)/bin/linux-pty
+	cp programs/linux-procfs2/linux-procfs2.elf       $(INITRD_STAGE)/bin/linux-procfs2
 	cp programs/win-hello/win-hello.exe               $(INITRD_STAGE)/bin/win-hello.exe
 	cp programs/win-crt/win-crt.exe                   $(INITRD_STAGE)/bin/win-crt.exe
 	cp programs/win-hello3/win-hello3.exe             $(INITRD_STAGE)/bin/win-hello3.exe
@@ -2313,7 +2322,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
-	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty \
+	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
 	    bin/win-hello.exe \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
 	    bin/win-fileio.exe bin/win-thread.exe bin/win-tls18b.exe       \

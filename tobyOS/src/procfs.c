@@ -23,12 +23,37 @@
 #include <tobyos/procfs.h>
 #include <tobyos/vfs.h>
 #include <tobyos/proc.h>
+#include <tobyos/file.h>
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/pit.h>
 #include <tobyos/pmm.h>
 #include <tobyos/smp.h>
+
+/* Describe an open file for /proc/<pid>/fd/<n> readlink: a real path where we
+ * have one, else the Linux-style synthetic target (pipe:[..], socket:[..],
+ * /dev/console, /dev/pts, anon_inode:...). */
+static void describe_fd_target(struct file *f, char *out, size_t cap) {
+    const char *s = "anon_inode:[unknown]";
+    switch (f->kind) {
+    case FILE_KIND_CONSOLE:     s = "/dev/console";          break;
+    case FILE_KIND_PTY_MASTER:  s = "/dev/ptmx";             break;
+    case FILE_KIND_PTY_SLAVE:   s = "/dev/pts/0";            break;
+    case FILE_KIND_PIPE_R:      s = "pipe:[r]";              break;
+    case FILE_KIND_PIPE_W:      s = "pipe:[w]";              break;
+    case FILE_KIND_SOCKET:      s = "socket:[0]";            break;
+    case FILE_KIND_WINDOW:      s = "anon_inode:[window]";   break;
+    case FILE_KIND_EPOLL:       s = "anon_inode:[eventpoll]";break;
+    case FILE_KIND_DIR:         s = (f->dirpath ? f->dirpath : "/");  break;
+    case FILE_KIND_VFS:         s = "/";                     break;
+    default:                    s = "anon_inode:[unknown]";  break;
+    }
+    size_t sl = strlen(s);
+    if (sl >= cap) sl = cap - 1;
+    memcpy(out, s, sl);
+    out[sl] = '\0';
+}
 
 extern struct proc g_proc[PROC_MAX];
 
@@ -111,20 +136,38 @@ static void subst_self(const char *rel, char *out, size_t cap) {
 
 /* ---- content generators ---- */
 
+/* /proc/uptime -- Linux emits two space-separated floats: total uptime and
+ * cumulative idle time, both in seconds. We don't track idle separately, so
+ * the second field mirrors the first (tools like busybox `uptime` parse the
+ * first field only). */
 static int gen_uptime(char *buf, size_t cap) {
     uint64_t ticks = pit_ticks();
     uint32_t hz    = pit_hz();
     uint64_t secs  = (hz > 0) ? ticks / hz : 0;
-    int n = uint_to_str(buf, cap, secs);
-    if (n < 0 || (size_t)(n + 2) >= cap) return 0;
-    buf[n] = '\n'; buf[n+1] = '\0';
-    return n + 1;
+    uint64_t frac  = (hz > 0) ? ((ticks % hz) * 100) / hz : 0;
+    int off = 0;
+    char tmp[24];
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    #define APPEND_UINT(v) do { uint_to_str(tmp, sizeof(tmp), (uint64_t)(v)); APPEND_STR(tmp); } while (0)
+    #define APPEND_FRAC2(v) do { char f[3]; f[0] = (char)('0' + (int)(((v)/10)%10)); \
+        f[1] = (char)('0' + (int)((v)%10)); f[2] = 0; APPEND_STR(f); } while (0)
+    APPEND_UINT(secs); APPEND_STR("."); APPEND_FRAC2(frac);
+    APPEND_STR(" ");
+    APPEND_UINT(secs); APPEND_STR(".00\n");
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+    #undef APPEND_UINT
+    #undef APPEND_FRAC2
 }
 
+/* /proc/meminfo -- Linux format: labelled fields in kB with a "kB" suffix.
+ * `free`/`top`/sysconf parse MemTotal/MemFree/MemAvailable. kB = pages*4. */
 static int gen_meminfo(char *buf, size_t cap) {
-    size_t total = pmm_total_pages();
-    size_t used  = pmm_used_pages();
-    size_t fr    = pmm_free_pages();
+    uint64_t total = (uint64_t)pmm_total_pages() * 4;   /* pages*4096/1024 */
+    uint64_t fr    = (uint64_t)pmm_free_pages()  * 4;
     char tmp[24];
     int off = 0;
 
@@ -133,19 +176,102 @@ static int gen_meminfo(char *buf, size_t cap) {
         if ((size_t)off + sl >= cap) return off; \
         memcpy(buf + off, s, sl); off += (int)sl; \
     } while (0)
-    #define APPEND_UINT(v) do { \
-        uint_to_str(tmp, sizeof(tmp), (uint64_t)(v) * 4096); \
-        APPEND_STR(tmp); \
+    #define APPEND_KB(v) do { \
+        uint_to_str(tmp, sizeof(tmp), (uint64_t)(v)); \
+        APPEND_STR(tmp); APPEND_STR(" kB"); \
     } while (0)
 
-    APPEND_STR("MemTotal: "); APPEND_UINT(total); APPEND_STR("\n");
-    APPEND_STR("MemFree:  "); APPEND_UINT(fr);    APPEND_STR("\n");
-    APPEND_STR("MemUsed:  "); APPEND_UINT(used);  APPEND_STR("\n");
+    APPEND_STR("MemTotal:     "); APPEND_KB(total); APPEND_STR("\n");
+    APPEND_STR("MemFree:      "); APPEND_KB(fr);    APPEND_STR("\n");
+    APPEND_STR("MemAvailable: "); APPEND_KB(fr);    APPEND_STR("\n");
+    APPEND_STR("Buffers:      "); APPEND_KB(0);     APPEND_STR("\n");
+    APPEND_STR("Cached:       "); APPEND_KB(0);     APPEND_STR("\n");
+    APPEND_STR("SwapTotal:    "); APPEND_KB(0);     APPEND_STR("\n");
+    APPEND_STR("SwapFree:     "); APPEND_KB(0);     APPEND_STR("\n");
     buf[off] = '\0';
     return off;
 
     #undef APPEND_STR
-    #undef APPEND_UINT
+    #undef APPEND_KB
+}
+
+/* Count live (non-UNUSED) processes. */
+static int live_proc_count(void) {
+    int n = 0;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (g_proc[i].state != PROC_UNUSED) n++;
+    return n;
+}
+
+/* /proc/loadavg -- "0.00 0.00 0.00 <running>/<total> <lastpid>". We don't
+ * compute real load averages; the running/total + lastpid fields are real. */
+static int gen_loadavg(char *buf, size_t cap) {
+    int total = live_proc_count();
+    int lastpid = 0;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (g_proc[i].state != PROC_UNUSED && g_proc[i].pid > lastpid)
+            lastpid = g_proc[i].pid;
+    int off = 0;
+    char tmp[24];
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    #define APPEND_INT(v) do { int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); } while (0)
+    APPEND_STR("0.00 0.00 0.00 1/");
+    APPEND_INT(total); APPEND_STR(" "); APPEND_INT(lastpid); APPEND_STR("\n");
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+    #undef APPEND_INT
+}
+
+/* /proc/stat -- the aggregate "cpu" line + per-cpu lines + a few counters
+ * tools parse (btime, processes, procs_running). Jiffy counters are zero. */
+static int gen_stat(char *buf, size_t cap) {
+    int off = 0;
+    char tmp[24];
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    #define APPEND_INT(v) do { int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); } while (0)
+    uint32_t ncpu = smp_cpu_count();
+    if (ncpu == 0) ncpu = 1;
+    APPEND_STR("cpu  0 0 0 0 0 0 0 0 0 0\n");
+    for (uint32_t i = 0; i < ncpu; i++) {
+        APPEND_STR("cpu"); APPEND_INT(i);
+        APPEND_STR(" 0 0 0 0 0 0 0 0 0 0\n");
+    }
+    APPEND_STR("intr 0\n");
+    APPEND_STR("ctxt 0\n");
+    APPEND_STR("btime 0\n");
+    APPEND_STR("processes "); APPEND_INT(live_proc_count()); APPEND_STR("\n");
+    APPEND_STR("procs_running 1\n");
+    APPEND_STR("procs_blocked 0\n");
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+    #undef APPEND_INT
+}
+
+/* /proc/mounts -- one line per VFS mount: "<dev> <point> <type> <opts> 0 0".
+ * Built by walking the mount table. */
+struct mounts_ctx { char *buf; int off; size_t cap; };
+static bool mounts_cb(const char *point, const struct vfs_ops *ops,
+                      void *mnt, void *cookie) {
+    (void)ops; (void)mnt;
+    struct mounts_ctx *c = (struct mounts_ctx *)cookie;
+    #define MAPP(s) do { size_t sl = strlen(s); \
+        if ((size_t)c->off + sl >= c->cap) return false; \
+        memcpy(c->buf + c->off, s, sl); c->off += (int)sl; } while (0)
+    MAPP("none "); MAPP(point); MAPP(" tobyos rw,relatime 0 0\n");
+    #undef MAPP
+    return true;
+}
+static int gen_mounts(char *buf, size_t cap) {
+    struct mounts_ctx c = { buf, 0, cap };
+    vfs_iter_mounts(mounts_cb, &c);
+    buf[c.off] = '\0';
+    return c.off;
 }
 
 static int gen_version(char *buf, size_t cap) {
@@ -333,6 +459,9 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
     else if (strcmp(rel, "meminfo") == 0) { len = gen_meminfo(buf, sizeof(buf)); }
     else if (strcmp(rel, "version") == 0) { len = gen_version(buf, sizeof(buf)); }
     else if (strcmp(rel, "cpuinfo") == 0) { len = gen_cpuinfo(buf, sizeof(buf)); }
+    else if (strcmp(rel, "loadavg") == 0) { len = gen_loadavg(buf, sizeof(buf)); }
+    else if (strcmp(rel, "stat") == 0)    { len = gen_stat(buf, sizeof(buf)); }
+    else if (strcmp(rel, "mounts") == 0)  { len = gen_mounts(buf, sizeof(buf)); }
     else {
         /* Try /proc/<pid>/<file> */
         if (rel[0] >= '0' && rel[0] <= '9') {
@@ -432,6 +561,25 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
             }
             return VFS_ERR_NOENT;
         }
+        /* /proc/<pid>/fd (dir) and /proc/<pid>/fd/<n> (symlink) */
+        if (*s == '/' && (strcmp(s + 1, "fd") == 0 ||
+                          (s[1]=='f' && s[2]=='d' && s[3]=='/'))) {
+            int pid = parse_int(rel);
+            struct proc *p = proc_lookup(pid);
+            if (!p) return VFS_ERR_NOENT;
+            if (strcmp(s + 1, "fd") == 0) {        /* the fd directory */
+                out->type = VFS_TYPE_DIR;
+                out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+                return VFS_OK;
+            }
+            int fd = parse_int(s + 4);             /* fd/<n> */
+            if (fd >= 0 && fd < PROC_NFDS && p->fds[fd]) {
+                out->type = VFS_TYPE_SYMLINK;
+                out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+                return VFS_OK;
+            }
+            return VFS_ERR_NOENT;
+        }
     }
 
     /* Try opening the file to determine its size. */
@@ -451,6 +599,7 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
 struct procfs_dir_handle {
     int index;
     int pid;    /* -1 for /proc root, else the pid we're listing */
+    int isfd;   /* 1 if listing /proc/<pid>/fd */
 };
 
 static int procfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
@@ -459,6 +608,7 @@ static int procfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
     struct procfs_dir_handle *dh = kmalloc(sizeof(*dh));
     if (!dh) return VFS_ERR_NOMEM;
     dh->index = 0;
+    dh->isfd  = 0;
 
     if (strcmp(path, "/") == 0) {
         dh->pid = -1;
@@ -468,6 +618,11 @@ static int procfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
         const char *rel = normbuf + 1;
         dh->pid = parse_int(rel);
         if (!proc_lookup(dh->pid)) { kfree(dh); return VFS_ERR_NOENT; }
+        /* /proc/<pid>/fd is itself a directory of open-fd symlinks. */
+        const char *s = rel;
+        while (*s >= '0' && *s <= '9') s++;
+        if (*s == '/' && strcmp(s + 1, "fd") == 0) dh->isfd = 1;
+        else if (*s != '\0') { kfree(dh); return VFS_ERR_NOENT; }
     }
     out->priv = dh;
     return VFS_OK;
@@ -483,11 +638,33 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     struct procfs_dir_handle *dh = d->priv;
     if (!dh) return VFS_ERR_INVAL;
 
+    if (dh->isfd) {
+        /* /proc/<pid>/fd: one symlink-named-N per open descriptor. */
+        struct proc *p = proc_lookup(dh->pid);
+        if (!p) return VFS_ERR_NOENT;
+        for (int i = dh->index; i < PROC_NFDS; i++) {
+            if (p->fds[i]) {
+                memset(out->name, 0, VFS_NAME_MAX);
+                char tmp[16];
+                int_to_str(tmp, sizeof(tmp), i);
+                size_t tl = strlen(tmp);
+                memcpy(out->name, tmp, tl);
+                out->type = VFS_TYPE_SYMLINK;
+                out->size = 0;
+                out->uid = 0; out->gid = 0; out->mode = 0;
+                dh->index = i + 1;
+                return VFS_OK;
+            }
+        }
+        return VFS_ERR_NOENT;
+    }
+
     if (dh->pid == -1) {
         /* Root /proc listing: global files first, then pid dirs */
         static const char *globals[] = { "uptime", "meminfo", "version",
-                                         "cpuinfo", "self" };
-        const int nglobals = 5;
+                                         "cpuinfo", "loadavg", "stat",
+                                         "mounts", "self" };
+        const int nglobals = 8;
         if (dh->index < nglobals) {
             memset(out->name, 0, VFS_NAME_MAX);
             size_t nl = strlen(globals[dh->index]);
@@ -518,15 +695,17 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
         return VFS_ERR_NOENT;
     }
 
-    /* Per-pid directory listing */
-    static const char *entries[] = { "status", "cmdline", "maps", "stat", "exe" };
-    const int nentries = 5;
+    /* Per-pid directory listing. "exe" is a symlink, "fd" is a directory,
+     * the rest are files. */
+    static const char *entries[] = { "status", "cmdline", "maps", "stat", "exe", "fd" };
+    const int nentries = 6;
     if (dh->index >= nentries) return VFS_ERR_NOENT;
     memset(out->name, 0, VFS_NAME_MAX);
     size_t nl = strlen(entries[dh->index]);
     memcpy(out->name, entries[dh->index], nl);
-    /* "exe" is a symlink; the rest are files */
-    out->type = (dh->index == nentries - 1) ? VFS_TYPE_SYMLINK : VFS_TYPE_FILE;
+    if (dh->index == 4)      out->type = VFS_TYPE_SYMLINK;   /* exe */
+    else if (dh->index == 5) out->type = VFS_TYPE_DIR;       /* fd  */
+    else                     out->type = VFS_TYPE_FILE;
     out->size = 0;
     out->uid = 0; out->gid = 0; out->mode = 0;
     dh->index++;
@@ -573,6 +752,16 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
             if (tl >= bufsz) tl = bufsz - 1;
             memcpy(buf, tgt, tl);
             buf[tl] = '\0';
+            return VFS_OK;
+        }
+        /* /proc/<pid>/fd/<n> -> a description of the open file */
+        if (*s == '/' && s[1]=='f' && s[2]=='d' && s[3]=='/') {
+            int pid = parse_int(rel);
+            struct proc *p = proc_lookup(pid);
+            if (!p) return VFS_ERR_NOENT;
+            int fd = parse_int(s + 4);
+            if (fd < 0 || fd >= PROC_NFDS || !p->fds[fd]) return VFS_ERR_NOENT;
+            describe_fd_target(p->fds[fd], buf, bufsz);
             return VFS_OK;
         }
     }

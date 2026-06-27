@@ -123,6 +123,42 @@ static int gen_kernel_uptime(char *buf, size_t sz) {
     return len;
 }
 
+/* B24: Linux-compatible nodes. get_nprocs()/sysconf(_SC_NPROCESSORS_ONLN)
+ * read /sys/devices/system/cpu/online (the cpulist: "0" for one CPU,
+ * "0-<n-1>" for several); uname-ish probes read /sys/kernel/{ostype,osrelease}. */
+static int gen_cpu_online(char *buf, size_t sz) {
+    uint32_t n = smp_cpu_count();
+    if (n == 0) n = 1;
+    int len = 0;
+    buf[len++] = '0';
+    if (n > 1) {
+        buf[len++] = '-';
+        char tmp[16]; int tl = 0; uint32_t v = n - 1;
+        if (v == 0) tmp[tl++] = '0';
+        else { while (v) { tmp[tl++] = (char)('0' + v % 10); v /= 10; } }
+        while (tl > 0 && (size_t)len < sz - 2) buf[len++] = tmp[--tl];
+    }
+    buf[len++] = '\n';
+    buf[len] = '\0';
+    return len;
+}
+
+static int gen_ostype(char *buf, size_t sz) {
+    const char *s = "Linux\n";
+    size_t len = strlen(s);
+    if (len >= sz) len = sz - 1;
+    memcpy(buf, s, len); buf[len] = '\0';
+    return (int)len;
+}
+
+static int gen_osrelease(char *buf, size_t sz) {
+    const char *s = "6.1.0-tobyos\n";
+    size_t len = strlen(s);
+    if (len >= sz) len = sz - 1;
+    memcpy(buf, s, len); buf[len] = '\0';
+    return (int)len;
+}
+
 /* ---- registration ---- */
 
 static void sysfs_add_dir(const char *path) {
@@ -299,6 +335,16 @@ void sysfs_init(void) {
     sysfs_add_file("/mem/free", gen_mem_free);
     sysfs_add_file("/kernel/version", gen_kernel_version);
     sysfs_add_file("/kernel/uptime", gen_kernel_uptime);
+
+    /* B24: Linux-layout nodes real software reads at startup. */
+    sysfs_add_dir("/devices");
+    sysfs_add_dir("/devices/system");
+    sysfs_add_dir("/devices/system/cpu");
+    sysfs_add_file("/devices/system/cpu/online",   gen_cpu_online);
+    sysfs_add_file("/devices/system/cpu/possible", gen_cpu_online);
+    sysfs_add_file("/devices/system/cpu/present",  gen_cpu_online);
+    sysfs_add_file("/kernel/ostype",    gen_ostype);
+    sysfs_add_file("/kernel/osrelease", gen_osrelease);
 
     int rc = vfs_mount("/sys", &sysfs_ops, 0);
     if (rc == VFS_OK) {
