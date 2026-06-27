@@ -2984,7 +2984,8 @@ enum {
     LX_rt_sigaction = 13, LX_rt_sigprocmask = 14, LX_rt_sigreturn = 15,
     LX_ioctl = 16, LX_pread64 = 17, LX_pwrite64 = 18,
     LX_readv = 19, LX_writev = 20, LX_access = 21,
-    LX_pipe = 22, LX_sched_yield = 24, LX_dup = 32, LX_dup2 = 33,
+    LX_pipe = 22, LX_sched_yield = 24, LX_mremap = 25,
+    LX_dup = 32, LX_dup2 = 33,
     LX_nanosleep = 35,
     LX_sendfile = 40, LX_getpid = 39, LX_clone = 56, LX_fork = 57,
     LX_vfork = 58, LX_execve = 59, LX_exit = 60, LX_wait4 = 61,
@@ -3196,6 +3197,40 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
     /* Tighten to the loader's requested protection (R-X for .text, etc.). */
     sys_mprotect((uint64_t)base, len, prot);
     return base;
+}
+
+/* mremap(old_addr, old_size, new_size, flags, new_addr) -- resize a mapping.
+ * Used by glibc/musl realloc and CPython's obmalloc arena resize. tobyOS has
+ * no in-place VMA-grow primitive, so: shrinking frees the tail in place; growing
+ * (only with MREMAP_MAYMOVE, which malloc always passes) allocates a fresh anon
+ * region, copies the old bytes across (both regions are mapped in the current
+ * address space during the syscall), and unmaps the old one. */
+#define LX_MREMAP_MAYMOVE 1u
+static long linux_mremap(uint64_t old_addr, uint64_t old_sz,
+                         uint64_t new_sz, uint32_t flags) {
+    if (old_sz == 0 || new_sz == 0) return -ABI_EINVAL;
+    if (old_addr & 0xfffULL) return -ABI_EINVAL;     /* must be page-aligned */
+    uint64_t os = (old_sz + 0xfffULL) & ~0xfffULL;
+    uint64_t ns = (new_sz + 0xfffULL) & ~0xfffULL;
+    if (ns == os) return (long)old_addr;             /* no size change */
+    if (ns < os) {                                   /* shrink: free the tail */
+        sys_munmap(old_addr + ns, os - ns);
+        return (long)old_addr;
+    }
+    if (!(flags & LX_MREMAP_MAYMOVE)) return -ABI_ENOMEM;  /* can't grow in place */
+    long nb = sys_mmap(0, ns, 0x1u | 0x2u /*RW*/, 0x05 /*ANON|PRIVATE*/, -1, 0);
+    if (nb < 0) return nb;
+    uint8_t *buf = (uint8_t *)kmalloc(4096);
+    if (!buf) { sys_munmap((uint64_t)nb, ns); return -ABI_ENOMEM; }
+    for (uint64_t off = 0; off < os; off += 4096) {
+        size_t chunk = (os - off) > 4096 ? 4096 : (size_t)(os - off);
+        if (copy_from_user(buf, (const void *)(old_addr + off), chunk) != 0)
+            break;                                   /* PROT_NONE tail: stop */
+        (void)copy_to_user((void *)((uint64_t)nb + off), buf, chunk);
+    }
+    kfree(buf);
+    sys_munmap(old_addr, os);
+    return nb;
 }
 
 /* Linux struct linux_dirent64 (getdents64). The byte layout is ABI; d_name
@@ -4455,6 +4490,9 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         return do_syscall(ABI_SYS_MUNMAP, a1, a2, 0, 0, 0);
     case LX_mprotect:
         return do_syscall(ABI_SYS_MPROTECT, a1, a2, a3, 0, 0);
+    case LX_mremap:                 /* (old, old_sz, new_sz, flags, new_addr) */
+        return linux_mremap((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
+                            (uint32_t)a4);
 
     /* ---- time ---- */
     case LX_nanosleep: {

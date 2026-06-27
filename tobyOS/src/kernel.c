@@ -6127,6 +6127,49 @@ void _start(void) {
     }
 #endif
 
+#ifdef REALPYTHON_BOOT
+    /* Track B: run a REAL, UNMODIFIED, off-the-shelf CPython interpreter --
+     * the astral-sh/python-build-standalone static-stdlib CPython 3.10.20, a
+     * dynamic musl PIE (interp /lib/ld-musl-x86_64.so.1 -- the SAME musl loader
+     * busybox-dyn uses; musl has no symbol versioning so no GLIBC-style DSO
+     * matching). It runs an actual .py file (/hello.py) that builds a list via
+     * a comprehension, sums it, imports `json` FROM THE ZIPIMPORT ARCHIVE
+     * (/lib/python310.zip -- proving CPython's built-in zipimport works on the
+     * tobyOS VFS), formats a string, prints a genuine "PYTHON-OK ver=3.10.20
+     * ..." banner, and exits 42 (= 140-98) so a PASS proves the bytecode VM
+     * actually executed, not merely that the binary started. The whole stdlib
+     * is a single 2.9 MB zip + the 18 MB interpreter -- two files. */
+    {
+        char *argv[] = {
+            (char *)"python3", (char *)"-S", (char *)"-B",
+            (char *)"/hello.py", 0,
+        };
+        char *envp[] = {
+            (char *)"PATH=/bin", (char *)"HOME=/",
+            (char *)"PYTHONHOME=/", (char *)"PYTHONPATH=/lib/python310.zip",
+            (char *)"PYTHONDONTWRITEBYTECODE=1", (char *)"LANG=C", 0,
+        };
+        struct proc_spec spec = {
+            .path = "/bin/python3", .name = "python3",
+            .argc = 4, .argv = argv, .envc = 6, .envp = envp,
+        };
+        kprintf("[boot] REALPYTHON: spawning UNMODIFIED CPython 3.10 "
+                "`python3 -S -B /hello.py` (stdlib from zipimport)\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] REALPYTHON: /bin/python3 not present -- SKIPPED\n");
+            kprintf("[REALPYTHON] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] REALPYTHON: python3 (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[REALPYTHON] VERDICT: %s exit=%d (UNMODIFIED CPython 3.10 "
+                    "ran a .py: comprehension + sum + json-from-zipimport; "
+                    "expect 42)\n",
+                    rc == 42 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef XPIPE_BOOT
     /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
      * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux

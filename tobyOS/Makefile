@@ -2394,6 +2394,24 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "(static musl, brandelf EI_OSABI=Linux) -- OPT-IN";         \
 	    EXTRA_FILES="$$EXTRA_FILES bin/bash";                             \
 	fi;                                                                   \
+	if [ -f programs/realpython/python3 ] &&                             \
+	   [ -f programs/realpython/python310.zip ] &&                       \
+	   [ -f programs/busybox/ld-musl-x86_64.so.1 ]; then                 \
+	    mkdir -p $(INITRD_STAGE)/lib;                                     \
+	    cp programs/realpython/python3 $(INITRD_STAGE)/bin/python3;       \
+	    printf '\003' | dd of=$(INITRD_STAGE)/bin/python3 bs=1 seek=7     \
+	         count=1 conv=notrunc 2>/dev/null;                           \
+	    cp programs/realpython/python310.zip                             \
+	         $(INITRD_STAGE)/lib/python310.zip;                          \
+	    cp programs/realpython/hello.py $(INITRD_STAGE)/hello.py;         \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/ld-musl-x86_64.so.1;                    \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/libc.musl-x86_64.so.1;                  \
+	    echo "[initrd] realpython: bundling UNMODIFIED CPython 3.10"     \
+	         "(dynamic musl, brandelf EI_OSABI=Linux) + zipimport stdlib -- OPT-IN"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/python3 lib/python310.zip hello.py lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
+	fi;                                                                   \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \

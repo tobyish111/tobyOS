@@ -393,6 +393,23 @@ driver model; POSIX libc surface.
   cause.) **Proof, clean under `+smep,+smap`, 0 faults / 0 unhandled syscalls:** `[REALTOOLS] VERDICT: PASS pass=5/5`
   (`logs/realtools.sh`). *Opt-in:* the binutils + glibc runtime are gitignored; the initrd stages them only when present
   (`programs/realtools/build.sh`).
+- **2026-06-27** — **Track B: a REAL CPython interpreter runs a `.py` script — unmodified CPython 3.10.20.**
+  tobyOS now runs a genuine, off-the-shelf **CPython 3.10.20** (the public, reproducible `astral-sh/python-build-standalone`
+  build) — a dynamic musl PIE whose interpreter is `/lib/ld-musl-x86_64.so.1`, the *same* musl loader `busybox-dyn` already
+  uses (musl has no symbol versioning, so no GLIBC-style DSO version-matching). The whole interpreter is **two files**: the
+  18 MB `python3` (with libpython statically linked in) plus a 2.9 MB `python310.zip` holding the pure-python standard library —
+  CPython's **built-in `zipimport`** reads modules straight out of that archive on the tobyOS VFS, so there's no need to stage
+  thousands of stdlib files. We run an actual file, `python3 -S -B /hello.py`, that builds a list via a comprehension, sums it
+  (`140`), **imports `json` from the zipimport archive** and serializes a dict, prints a real **`PYTHON-OK ver=3.10.20
+  sum=140 json={"n": 7, "sum": 140}`** banner, and `sys.exit(140-98)` → 42, so a PASS proves the bytecode VM actually executed,
+  not merely that the binary started. **Kernel gap filled:** `mremap` (syscall 25) was unimplemented — glibc/musl `realloc` and
+  CPython's obmalloc arena resize use it; added a real `linux_mremap()` (shrink frees the tail in place; grow with
+  `MREMAP_MAYMOVE` allocates a fresh anon region, copies the old bytes across, unmaps the old). This milestone also rode on the
+  `realtools` inode fix — CPython opens its loader + the zip and would have aliased them under the old `st_ino = 1` dedup bug.
+  **Proof, clean under `+smep,+smap`, 0 faults / 0 unhandled syscalls:** `[REALPYTHON] VERDICT: PASS exit=42`
+  (`logs/realpython.sh`). **No regression** (`mremap` is additive to the syscall dispatch): the full Linux-track regression
+  (`logs/bashregress.sh`) stays green. *Opt-in:* the interpreter + stdlib zip are gitignored; `programs/realpython/build.sh`
+  fetches + zips them and the initrd stages them only when present (the `hello.py` proof script is committed).
 - **2026-06-27** — **Track B: a REAL, off-the-shelf Linux *tool* runs end-to-end — GNU Binutils `readelf`, unmodified.**
   B25/B26 ran glibc proof binaries *we wrote*; this runs an actual third-party program we did **not** author: GNU Binutils
   **`readelf` 2.43.1** (~1.1 MB), lifted byte-for-byte from a Bootlin x86-64 glibc 2.41 toolchain. It is a dynamic PIE

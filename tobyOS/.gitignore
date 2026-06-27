@@ -44,6 +44,14 @@ programs/realtools/strings
 programs/realtools/cppfilt
 programs/realtools/lib64/
 
+# Track B/realpython: opt-in UNMODIFIED static-stdlib CPython 3.10 (dynamic musl)
+# fetched out-of-tree via programs/realpython/build.sh (not committed). The
+# build.sh and the tiny hello.py proof script ARE committed.
+programs/realpython/python3
+programs/realpython/python310.zip
+programs/realpython/*.tar.gz
+programs/realpython/extract/
+
 # Bootable images / filesystems produced by the build
 *.iso
 disk.img
