@@ -5719,6 +5719,49 @@ void _start(void) {
     }
 #endif
 
+#ifdef REALCURL_BOOT
+    /* Track C (networking) -- run a REAL, off-the-shelf third-party HTTP client:
+     * UNMODIFIED upstream curl 8.20.0 (libcurl), statically linked against musl
+     * (stunnel/static-curl), branded EI_OSABI=Linux. This is a much larger
+     * real-world networking surface than the B17 busybox wget applet: libcurl's
+     * URL parser, its own musl getaddrinfo (UDP DNS via /etc/resolv.conf), a
+     * non-blocking TCP connect()/poll() state machine, and a full HTTP/1.1 GET.
+     * It fetches http://example.com/ over e1000 + SLIRP (DHCP 10.0.2.15, DNS
+     * 10.0.2.3 -> host internet). PASS iff curl exits 0 (it only does so when
+     * the HTTP transfer completed). Opt-in: stage programs/realcurl/curl via
+     * programs/realcurl/build.sh + build EXTRA_CFLAGS+=-DREALCURL_BOOT
+     * (logs/realcurl.sh; needs host internet). Any [linux] unhandled syscall is
+     * self-identifying. */
+    {
+        /* -sS: no progress meter but still report errors; --max-time bounds the
+         * run; -o /data/curl.out captures the body; -w writes a one-line,
+         * greppable result summary to stdout (serial). */
+        char *argv[] = {
+            (char *)"curl", (char *)"-sS", (char *)"--max-time", (char *)"30",
+            (char *)"-o", (char *)"/data/curl.out",
+            (char *)"-w", (char *)"REALCURL http_code=%{http_code} size=%{size_download} url=%{url_effective}\\n",
+            (char *)"http://example.com/", 0
+        };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/curl-real", .name = "curl",
+            .argc = 9, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] REALCURL: spawning UNMODIFIED static curl 8.20.0 "
+                "(libcurl/musl) -> http://example.com/ over e1000+SLIRP\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[REALCURL] VERDICT: SKIP reason=no-curl "
+                    "(run programs/realcurl/build.sh to stage)\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[REALCURL] curl exit=%d\n", rc);
+            kprintf("[REALCURL] VERDICT: %s exit=%d (real unmodified curl HTTP "
+                    "GET over e1000+SLIRP)\n", rc == 0 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef LINUXBB_BOOT
     /* Track B milestone B2 -- run a REAL musl-libc binary (busybox). Build
      * EXTRA_CFLAGS+=-DLINUXBB_BOOT, with an opt-in musl-static busybox staged

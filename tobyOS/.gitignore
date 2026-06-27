@@ -70,6 +70,12 @@ programs/realtui/terminfo/
 programs/realtui/*.apk
 programs/realtui/extract/
 
+# Track C/realcurl: opt-in UNMODIFIED static curl (stunnel/static-curl, musl)
+# fetched out-of-tree via programs/realcurl/build.sh (not committed). build.sh
+# IS committed (pins version + sha256).
+programs/realcurl/curl
+programs/realcurl/*.tar.xz
+
 # Bootable images / filesystems produced by the build
 *.iso
 disk.img

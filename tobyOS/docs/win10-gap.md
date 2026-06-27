@@ -439,6 +439,20 @@ driver model; POSIX libc surface.
   (delta=24)`, `[VIRTGPU] VERDICT: PASS` (`logs/virtgpu.sh`). **No regression:** the only always-compiled change is the additive
   read-only `virtio_gpu_proof_stats()` (never called in default builds); the harness lives inside `#ifdef VIRTGPU_BOOT`
   (undefined in default/regression builds), so default boot logic is unchanged.
+- **2026-06-27** — **Track C (networking): a REAL, off-the-shelf third-party HTTP client runs over e1000+SLIRP — unmodified upstream `curl` 8.20.0 (libcurl) — `[REALCURL] VERDICT: PASS`.**
+  B17 already ran real musl busybox `wget`; this raises the bar to a full **libcurl** stack — **unmodified upstream curl 8.20.0**, fully
+  static against musl (stunnel/static-curl, sha256-pinned, branded `EI_OSABI=Linux`). It re-drives the whole client path with a far larger
+  real-world surface than the busybox applet: libcurl's URL parser, musl `getaddrinfo` (AF_INET6 probe → `EAFNOSUPPORT` fallback → AF_INET
+  UDP DNS via `/etc/resolv.conf` → `10.0.2.3`), a **non-blocking** `connect()` + `poll()`-driven multi-handle state machine, and a complete
+  HTTP/1.1 GET. The one gap stock curl hit that busybox did not: **libcurl's multi handle creates an `eventfd2` as its wakeup descriptor**
+  (`EFD_CLOEXEC|EFD_NONBLOCK`); without it `curl_multi_handle()` fails and `curl_easy_perform()` returns `CURLE_OUT_OF_MEMORY` (exit 27).
+  This adds a real **`eventfd`/`eventfd2`** implementation: a new `FILE_KIND_EVENTFD` backed by a refcounted counter object with the 8-byte
+  read/write ABI (drain-to-zero or `EFD_SEMAPHORE` decrement), `EFD_NONBLOCK` → `EAGAIN`, `poll`/`epoll` readiness (`POLLIN` when count > 0),
+  and dup/fork sharing. The `#ifdef REALCURL_BOOT` harness (runs after `net_init`, like B17) spawns `curl -sS -o /data/curl.out -w '...'
+  http://example.com/` and `proc_wait`s; PASS iff curl exits 0 (only when the transfer completed). **Proof, clean under `+smep,+smap`,
+  0 faults / 0 unhandled syscalls:** `REALCURL http_code=200 size=559 url=http://example.com/`, `curl exit=0`, `[REALCURL] VERDICT: PASS`
+  (`logs/realcurl.sh`, needs host internet). **No regression** (default build still boots to desktop/login, 0 faults): the only
+  always-compiled changes are the additive eventfd file-kind + its poll case + the two syscalls; the harness is gated by `#ifdef REALCURL_BOOT`.
 - **2026-06-27** — **Track C (terminal): a REAL, interactive FULL-SCREEN ncurses app runs over the console — unmodified GNU `nano` 9.1 — `[REALTUI] VERDICT: PASS`.**
   Previous Track-B proofs (bash/binutils/CPython/TinyCC) were line-oriented; the kernel framebuffer console was a teletype, not a
   terminal emulator (it ignored CUP/ED/EL/SGR/alt-screen), so no curses app could render. This turns **`src/console.c` into a real

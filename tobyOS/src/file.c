@@ -29,6 +29,8 @@
 #include <tobyos/pty.h>
 #include <tobyos/klibc.h>
 #include <tobyos/cpu.h>
+#include <tobyos/sched.h>
+#include <tobyos/abi/abi.h>
 
 static long console_read(void *buf, size_t n) {
     if (n == 0) return 0;
@@ -55,6 +57,70 @@ struct file *console_file_make(void) {
     memset(f, 0, sizeof(*f));
     f->kind = FILE_KIND_CONSOLE;
     return f;
+}
+
+/* ---- eventfd (Track C) ----------------------------------------------------
+ * A counting object: write(8) adds to the counter, read(8) drains it (or
+ * decrements by 1 in EFD_SEMAPHORE mode). libcurl's multi handle creates one
+ * as its wakeup fd; it's added to a poll set and only becomes readable once
+ * curl_multi_wakeup() writes to it, so for a plain transfer it simply sits
+ * not-readable. Blocking read/write fall back to a cooperative yield loop
+ * (only reachable for the non-NONBLOCK case, which curl never uses). */
+#define EFD_MAXVAL 0xfffffffffffffffeULL
+#define EFD_EAGAIN 11           /* Linux EAGAIN (== EWOULDBLOCK) */
+
+struct eventfd {
+    uint64_t count;
+    uint32_t flags;
+    int      refs;
+};
+
+struct file *eventfd_file_make(unsigned int initval, unsigned int flags) {
+    struct eventfd *e = (struct eventfd *)kmalloc(sizeof(*e));
+    if (!e) return 0;
+    e->count = (uint64_t)initval;
+    e->flags = flags;
+    e->refs  = 1;
+    struct file *f = (struct file *)kmalloc(sizeof(*f));
+    if (!f) { kfree(e); return 0; }
+    memset(f, 0, sizeof(*f));
+    f->kind = FILE_KIND_EVENTFD;
+    f->efd  = e;
+    return f;
+}
+
+static long eventfd_read(struct file *f, void *buf, size_t n) {
+    struct eventfd *e = f->efd;
+    if (!e) return -1;
+    if (n < 8) return -ABI_EINVAL;
+    while (e->count == 0) {
+        if (e->flags & EFD_NONBLOCK) return -EFD_EAGAIN;
+        sched_yield();                 /* cooperative wait for a writer */
+    }
+    uint64_t out;
+    if (e->flags & EFD_SEMAPHORE) { out = 1; e->count -= 1; }
+    else                         { out = e->count; e->count = 0; }
+    memcpy(buf, &out, 8);
+    return 8;
+}
+
+int eventfd_pollin(struct file *f) {
+    return (f && f->efd && f->efd->count > 0) ? 1 : 0;
+}
+
+static long eventfd_write(struct file *f, const void *buf, size_t n) {
+    struct eventfd *e = f->efd;
+    if (!e) return -1;
+    if (n < 8) return -ABI_EINVAL;
+    uint64_t add;
+    memcpy(&add, buf, 8);
+    if (add == 0xffffffffffffffffULL) return -ABI_EINVAL;  /* reserved */
+    while (e->count + add > EFD_MAXVAL) {
+        if (e->flags & EFD_NONBLOCK) return -EFD_EAGAIN;
+        sched_yield();                 /* cooperative wait for a reader */
+    }
+    e->count += add;
+    return 8;
 }
 
 struct file *file_clone(struct file *src) {
@@ -123,6 +189,11 @@ struct file *file_clone(struct file *src) {
         f->pty = src->pty;
         pty_clone_ref(f);
         break;
+    case FILE_KIND_EVENTFD:
+        /* dup/fork share the same counter object; bump its refcount. */
+        f->efd = src->efd;
+        if (f->efd) f->efd->refs++;
+        break;
     case FILE_KIND_DIR:
         /* Deep-copy the directory path so each clone owns its own buffer
          * (avoids a double-free on close); resume offset carries over. */
@@ -182,6 +253,9 @@ void file_close(struct file *f) {
     case FILE_KIND_PTY_SLAVE:
         pty_close(f);
         break;
+    case FILE_KIND_EVENTFD:
+        if (f->efd && --f->efd->refs == 0) kfree(f->efd);
+        break;
     case FILE_KIND_CONSOLE:
     case FILE_KIND_NULL:
         break;
@@ -199,6 +273,8 @@ long file_read(struct file *f, void *buf, size_t n) {
         return pty_master_read(f, buf, n);
     case FILE_KIND_PTY_SLAVE:
         return pty_slave_read(f, buf, n);
+    case FILE_KIND_EVENTFD:
+        return eventfd_read(f, buf, n);
     case FILE_KIND_PIPE_R:
         return pipe_read(f->pipe, buf, n);
     case FILE_KIND_VFS:
@@ -244,6 +320,8 @@ long file_write(struct file *f, const void *buf, size_t n) {
         return pty_master_write(f, buf, n);
     case FILE_KIND_PTY_SLAVE:
         return pty_slave_write(f, buf, n);
+    case FILE_KIND_EVENTFD:
+        return eventfd_write(f, buf, n);
     case FILE_KIND_PIPE_W:
         return pipe_write(f->pipe, buf, n);
     case FILE_KIND_VFS:

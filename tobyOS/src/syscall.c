@@ -3019,6 +3019,8 @@ enum {
     LX_prlimit64 = 302, LX_rseq = 334, LX_clone3 = 435,
     /* realbash: PATH lookups / `test -e/-x` use the *at access variants. */
     LX_faccessat = 269, LX_faccessat2 = 439,
+    /* Track C: libcurl's multi handle creates an eventfd as its wakeup fd. */
+    LX_eventfd = 284, LX_eventfd2 = 290,
 };
 
 /* arch_prctl codes. */
@@ -3341,6 +3343,10 @@ static short file_poll_ready(struct file *f) {
         if (pty_readable(f)) r |= LXP_POLLIN;
         if (pty_hup(f))      r |= LXP_POLLHUP;
         break;
+    case FILE_KIND_EVENTFD:                  /* Track C: eventfd readiness */
+        r |= LXP_POLLOUT;                    /* writable unless at max (rare) */
+        if (eventfd_pollin(f)) r |= LXP_POLLIN;
+        break;
     default:                                 /* term/window/etc. */
         r |= LXP_POLLOUT;                    /* writable; input best-effort */
         break;
@@ -3570,6 +3576,18 @@ static struct sock *lx_sock_of(int fd) {
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_SOCKET) return NULL;
     return f->sock;
+}
+
+/* eventfd2(initval, flags): create a counting eventfd. libcurl's multi handle
+ * uses one (EFD_CLOEXEC|EFD_NONBLOCK) as its wakeup descriptor; without it
+ * curl_multi_handle() fails and curl_easy_perform() returns CURLE_OUT_OF_MEMORY.
+ * The fd is read/write/poll-capable (see file.c) and pollable in poll/epoll. */
+static long lx_eventfd(unsigned int initval, unsigned int flags) {
+    struct file *f = eventfd_file_make(initval, flags);
+    if (!f) return -ABI_ENOMEM;
+    int fd = fd_alloc_into(current_proc(), f);
+    if (fd < 0) { file_close(f); return -ABI_EMFILE; }
+    return fd;
 }
 
 static long lx_socket(int domain, int type, int proto) {
@@ -4062,6 +4080,10 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         return do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
     case LX_pipe:   return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
     case LX_pipe2:  return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
+
+    /* ---- Track C: eventfd/eventfd2 (libcurl multi-handle wakeup fd) ---- */
+    case LX_eventfd:   return lx_eventfd((unsigned int)a1, 0);
+    case LX_eventfd2:  return lx_eventfd((unsigned int)a1, (unsigned int)a2);
 
     /* ---- B14: BSD sockets (FILE_KIND_SOCKET fds; poll/epoll-ready) ---- */
     case LX_socket:      return lx_socket((int)a1, (int)a2, (int)a3);

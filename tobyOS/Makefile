@@ -2454,6 +2454,14 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "+ terminfo (dynamic musl) for the VT100 console -- OPT-IN"; \
 	    EXTRA_FILES="$$EXTRA_FILES bin/nano usr/lib/libncursesw.so.6 usr/share/terminfo lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
 	fi;                                                                   \
+	if [ -f programs/realcurl/curl ]; then                               \
+	    cp programs/realcurl/curl $(INITRD_STAGE)/bin/curl-real;          \
+	    printf '\003' | dd of=$(INITRD_STAGE)/bin/curl-real bs=1 seek=7   \
+	         count=1 conv=notrunc 2>/dev/null;                           \
+	    echo "[initrd] realcurl: bundling UNMODIFIED static curl 8.20.0"  \
+	         "(static musl, brandelf EI_OSABI=Linux) -- OPT-IN";         \
+	    EXTRA_FILES="$$EXTRA_FILES bin/curl-real";                        \
+	fi;                                                                   \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \

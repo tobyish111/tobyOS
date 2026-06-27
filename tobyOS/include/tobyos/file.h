@@ -71,7 +71,14 @@ enum file_kind {
      * discipline. See pty.c. */
     FILE_KIND_PTY_MASTER = 10,
     FILE_KIND_PTY_SLAVE  = 11,
+    /* Track C (networking): a Linux eventfd (eventfd2). A counting object with
+     * an 8-byte read/write ABI; libcurl's multi handle creates one as its
+     * wakeup descriptor (EFD_CLOEXEC|EFD_NONBLOCK). Backed by a kmalloc'd
+     * struct eventfd shared across dup/fork via a refcount. See file.c. */
+    FILE_KIND_EVENTFD    = 12,
 };
+
+struct eventfd;
 
 struct file {
     enum file_kind  kind;
@@ -100,7 +107,22 @@ struct file {
     struct epoll_inst *epoll;
     /* For FILE_KIND_PTY_MASTER / FILE_KIND_PTY_SLAVE (Track B/B23). */
     struct pty *pty;
+    /* For FILE_KIND_EVENTFD (Track C): the shared counter object. */
+    struct eventfd *efd;
 };
+
+/* eventfd flags (Linux ABI) */
+#define EFD_SEMAPHORE 00000001u
+#define EFD_CLOEXEC   02000000u
+#define EFD_NONBLOCK  00004000u
+
+/* Allocate a fresh eventfd-backed struct file with the given initial counter
+ * value and flags (EFD_SEMAPHORE / EFD_NONBLOCK honoured). Returns NULL on
+ * OOM. */
+struct file *eventfd_file_make(unsigned int initval, unsigned int flags);
+
+/* Poll readiness helper: nonzero if the eventfd counter is > 0 (POLLIN). */
+int eventfd_pollin(struct file *f);
 
 /* Allocate + initialise the well-known console-backed file. Each call
  * returns a fresh kmalloc'd struct -- never share, so close() can
