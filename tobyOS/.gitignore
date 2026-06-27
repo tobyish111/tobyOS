@@ -61,6 +61,15 @@ programs/realcc/tcclib/
 programs/realcc/*.apk
 programs/realcc/extract/
 
+# Track C/realtui: opt-in UNMODIFIED GNU nano + libncursesw + terminfo (Alpine,
+# dynamic musl) fetched out-of-tree via programs/realtui/build.sh (not
+# committed). build.sh IS committed (resolves versions live from APKINDEX).
+programs/realtui/nano
+programs/realtui/libncursesw.so.6
+programs/realtui/terminfo/
+programs/realtui/*.apk
+programs/realtui/extract/
+
 # Bootable images / filesystems produced by the build
 *.iso
 disk.img

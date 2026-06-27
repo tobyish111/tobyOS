@@ -2990,7 +2990,7 @@ enum {
     LX_sendfile = 40, LX_getpid = 39, LX_clone = 56, LX_fork = 57,
     LX_vfork = 58, LX_execve = 59, LX_exit = 60, LX_wait4 = 61,
     LX_kill = 62, LX_setpgid = 109, LX_getpgrp = 111, LX_setsid = 112,
-    LX_getpgid = 121,
+    LX_getpgid = 121, LX_setfsuid = 122, LX_setfsgid = 123,
     LX_uname = 63, LX_fcntl = 72, LX_getcwd = 79, LX_chdir = 80,
     LX_mkdir = 83, LX_unlink = 87, LX_getuid = 102, LX_getgid = 104,
     LX_geteuid = 107, LX_getegid = 108, LX_getppid = 110,
@@ -4302,6 +4302,13 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_geteuid: return do_syscall(SYS_GETUID, 0, 0, 0, 0, 0);
     case LX_getgid:
     case LX_getegid: return do_syscall(SYS_GETGID, 0, 0, 0, 0, 0);
+
+    /* setfsuid/setfsgid: tobyOS has a single (root) identity, so there is no
+     * separate fs-uid to change. Per the Linux contract these return the
+     * PREVIOUS fs-uid/gid (always 0 here) and never fail; ncurses/nano probe
+     * them when writing files. */
+    case LX_setfsuid:
+    case LX_setfsgid: return 0;
 
     /* ---- scatter/gather: fan out onto the byte handlers ---- */
     case LX_writev:

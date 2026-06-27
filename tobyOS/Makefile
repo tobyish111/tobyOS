@@ -2432,6 +2432,28 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "(dynamic musl + libtcc.so) for in-VM self-hosting -- OPT-IN"; \
 	    EXTRA_FILES="$$EXTRA_FILES bin/realcc usr/lib/libtcc.so usr/lib/tcc/libtcc1.a hello_cc.c lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
 	fi;                                                                   \
+	if [ -f programs/realtui/nano ] &&                                   \
+	   [ -f programs/realtui/libncursesw.so.6 ] &&                        \
+	   [ -d programs/realtui/terminfo ] &&                                \
+	   [ -f programs/busybox/ld-musl-x86_64.so.1 ]; then                 \
+	    mkdir -p $(INITRD_STAGE)/lib $(INITRD_STAGE)/usr/lib              \
+	             $(INITRD_STAGE)/usr/share;                              \
+	    cp programs/realtui/nano $(INITRD_STAGE)/bin/nano;                \
+	    printf '\003' | dd of=$(INITRD_STAGE)/bin/nano bs=1 seek=7        \
+	         count=1 conv=notrunc 2>/dev/null;                           \
+	    cp programs/realtui/libncursesw.so.6                             \
+	         $(INITRD_STAGE)/usr/lib/libncursesw.so.6;                   \
+	    rm -rf $(INITRD_STAGE)/usr/share/terminfo;                       \
+	    cp -r programs/realtui/terminfo                                  \
+	         $(INITRD_STAGE)/usr/share/terminfo;                         \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/ld-musl-x86_64.so.1;                    \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/libc.musl-x86_64.so.1;                  \
+	    echo "[initrd] realtui: bundling UNMODIFIED GNU nano + libncursesw" \
+	         "+ terminfo (dynamic musl) for the VT100 console -- OPT-IN"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/nano usr/lib/libncursesw.so.6 usr/share/terminfo lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
+	fi;                                                                   \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \

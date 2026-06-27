@@ -48,4 +48,10 @@ void console_tick(uint64_t ticks, uint32_t hz);
  * the cached "FB is mapped" flag until framebuffer_sync remaps it. */
 void console_notify_cr3_switch(void);
 
+/* VT100/ANSI emulator activity counters. A full-screen ncurses program
+ * (nano/vim/htop) drives the console with many CSI cursor ops and enters
+ * the alternate screen; a boot proof harness reads these to assert the app
+ * really spoke VT100 to the emulator (not just that the binary started). */
+void console_vt_stats(uint64_t *csi_ops, uint64_t *altscreen_enters);
+
 #endif /* TOBYOS_CONSOLE_H */

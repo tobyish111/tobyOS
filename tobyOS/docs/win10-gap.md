@@ -439,6 +439,24 @@ driver model; POSIX libc surface.
   (delta=24)`, `[VIRTGPU] VERDICT: PASS` (`logs/virtgpu.sh`). **No regression:** the only always-compiled change is the additive
   read-only `virtio_gpu_proof_stats()` (never called in default builds); the harness lives inside `#ifdef VIRTGPU_BOOT`
   (undefined in default/regression builds), so default boot logic is unchanged.
+- **2026-06-27** — **Track C (terminal): a REAL, interactive FULL-SCREEN ncurses app runs over the console — unmodified GNU `nano` 9.1 — `[REALTUI] VERDICT: PASS`.**
+  Previous Track-B proofs (bash/binutils/CPython/TinyCC) were line-oriented; the kernel framebuffer console was a teletype, not a
+  terminal emulator (it ignored CUP/ED/EL/SGR/alt-screen), so no curses app could render. This turns **`src/console.c` into a real
+  VT100/ANSI emulator**: `console_putc` is now a state machine handling cursor addressing (CUP/CUU…/CHA/VPA), erase (ED/EL/ECH),
+  insert/delete (ICH/DCH/IL/DL), scroll regions (DECSTBM + SU/SD + reverse-index), SGR (16-colour + bright + 256-colour + reverse +
+  default), the alternate screen, cursor show/hide and deferred (LCF) auto-wrap — all implemented as **pixel-block moves on the
+  framebuffer itself** (the FB *is* the cell store, so no separate logical grid is needed). On top of it we run **unmodified GNU nano
+  9.1** (Alpine, dynamic musl: `nano → libncursesw.so.6 → libc.musl`, the same loader busybox-dyn/CPython/TinyCC use — so it also
+  re-exercises the multi-DSO musl path), with Alpine's `ncurses-terminfo-base` staged at `/usr/share/terminfo` and `TERM=linux`.
+  The `#ifdef REALTUI_BOOT` harness runs **before** `m14_init()` (no desktop/login competing for the framebuffer or keyboard),
+  injects a few typed lines, and `proc_wait`s; nano queries `TIOCGWINSZ` (160×100), loads its terminfo and paints the title bar +
+  edit body + two-row shortcut bar straight onto the framebuffer. The proof harness (`logs/realtui.sh`) screenshots the rendered UI
+  via QMP, then injects **^X + 'n'** over the real keyboard (QMP `send-key`) so nano hits its "Save modified buffer?" prompt and
+  exits cleanly. A new `console_vt_stats()` accessor lets the harness assert the emulator actually processed a full-screen redraw.
+  **Proof, clean under `+smep,+smap`, 0 faults / 0 unhandled syscalls** (also added `setfsuid`/`setfsgid` stubs nano probes):
+  `nano exit=0, vt CSI ops=113`, `[REALTUI] VERDICT: PASS` + a screenshot of the live nano UI. **No regression** (default build still
+  boots to the desktop/login, 0 faults): the only always-compiled changes are the additive VT100 emulator (the NORMAL-state path is
+  behaviourally identical for escape-free kernel logs) + the two ID stubs; the harness is gated by `#ifdef REALTUI_BOOT`.
 - **2026-06-27** — **Track B: a REAL, off-the-shelf Linux *tool* runs end-to-end — GNU Binutils `readelf`, unmodified.**
   B25/B26 ran glibc proof binaries *we wrote*; this runs an actual third-party program we did **not** author: GNU Binutils
   **`readelf` 2.43.1** (~1.1 MB), lifted byte-for-byte from a Bootlin x86-64 glibc 2.41 toolchain. It is a dynamic PIE

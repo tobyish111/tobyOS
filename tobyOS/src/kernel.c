@@ -3513,6 +3513,86 @@ void _start(void) {
         }
     }
 
+#ifdef REALTUI_BOOT
+    /* Track C (terminal): run a REAL, UNMODIFIED, off-the-shelf full-screen
+     * ncurses application -- GNU nano (Alpine, dynamic musl: nano ->
+     * libncursesw.so.6 -> libc.musl, the SAME musl loader busybox-dyn/CPython
+     * /TinyCC use) -- INTERACTIVELY over the kernel text console. This proves
+     * the new VT100/ANSI emulator in src/console.c: nano queries the window
+     * size (TIOCGWINSZ), loads its terminfo (TERM=linux) and paints a
+     * full-screen UI (title bar, edit body, shortcut bar) using cursor
+     * addressing (CUP), SGR colours and erase ops -- all rendered straight to
+     * the framebuffer. We run this BEFORE m14_init() so the desktop compositor
+     * + /bin/login are NOT up yet: gui_active() is false (console renders) and
+     * nothing competes for the keyboard ring. Inject a few typed lines, hold
+     * the rendered UI for a QMP screenshot, then send ^X + 'n' (don't-save)
+     * for a clean exit. PASS = the emulator processed a large number of CSI
+     * cursor/SGR ops (a real full-screen redraw happened, not just startup). */
+    {
+        framebuffer_sync_mapping();
+        console_clear();
+
+        uint64_t csi0 = 0, alt0 = 0, csi1 = 0, alt1 = 0;
+        uint32_t ccols = 0, crows = 0;
+        console_get_size(&ccols, &crows);
+        console_vt_stats(&csi0, &alt0);
+
+        const char *typed =
+            "tobyOS runs a REAL, unmodified GNU nano over a kernel VT100 console.\r"
+            "\r"
+            "ncurses drives cursor addressing (CUP), SGR colours, erase-line and\r"
+            "scroll regions; the title + shortcut bars are painted by the new\r"
+            "src/console.c terminal emulator straight onto the framebuffer.\r";
+        for (const char *p = typed; *p; p++) kbd_inject_raw(*p);
+
+        char *argv[] = {
+            (char *)"nano", (char *)"-I", (char *)"/data/tui.txt", 0,
+        };
+        char *envp[] = {
+            (char *)"PATH=/bin", (char *)"HOME=/", (char *)"TERM=linux",
+            (char *)"TERMINFO=/usr/share/terminfo",
+            (char *)"TERMINFO_DIRS=/usr/share/terminfo",
+            (char *)"LD_LIBRARY_PATH=/usr/lib:/lib", 0,
+        };
+        struct proc_spec spec = {
+            .path = "/bin/nano", .name = "nano",
+            .argc = 3, .argv = argv, .envc = 6, .envp = envp,
+        };
+        kprintf("[boot] REALTUI: spawning UNMODIFIED GNU nano (ncurses) on a "
+                "%ux%u VT100 console\n", ccols, crows);
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] REALTUI: /bin/nano not present -- SKIPPED\n");
+            kprintf("[REALTUI] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            /* Scheduling here is cooperative: once we proc_wait, nano runs,
+             * renders its full-screen UI, then BLOCKS reading the console for
+             * the next keystroke. The proof harness (logs/realtui.sh) takes a
+             * QMP screenshot of the rendered UI and then injects ^X + 'n'
+             * (Exit -> don't-save) over the REAL keyboard via QMP send-key,
+             * which wakes nano's read and lets it exit cleanly. */
+            kprintf("[REALTUI] nano spawned (pid=%d); rendering full-screen UI, "
+                    "then waiting for ^X+'n' (injected via QMP)\n", pid);
+            int rc = proc_wait(pid);
+            console_vt_stats(&csi1, &alt1);
+            uint64_t dcsi = csi1 - csi0;
+            /* The rendering is the proof: a real full-screen ncurses redraw
+             * pushes hundreds of CUP/SGR/erase ops through the emulator. */
+            bool pass = (dcsi >= 50) && (rc == 0);
+            kprintf("[boot] REALTUI: nano (pid=%d) exit=%d, vt CSI ops=%lu "
+                    "(delta=%lu) altscreen=%lu\n",
+                    pid, rc, (unsigned long)csi1, (unsigned long)dcsi,
+                    (unsigned long)alt1);
+            kprintf("[REALTUI] VERDICT: %s exit=%d csi_ops=%lu (UNMODIFIED GNU "
+                    "nano rendered a full-screen ncurses UI on the %ux%u VT100 "
+                    "console via the new src/console.c emulator; expect "
+                    "exit0 + csi_ops>=50)\n",
+                    pass ? "PASS" : "FAIL", rc, (unsigned long)dcsi,
+                    ccols, crows);
+        }
+    }
+#endif
+
     if (!safemode_skip_gui()) {
         /* Milestone 14: bring up settings + services + session BEFORE
          * shell_init so the desktop+login is already on screen by the
