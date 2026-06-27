@@ -5764,6 +5764,14 @@ static long w32_LeaveCriticalSection(uint64_t *a) {
 #define WIN32_CTRL_RADIO     8   /* C14: mutually-exclusive radio button */
 #define WIN32_CTRL_GROUPBOX  9   /* C14: a labelled frame (visual only)  */
 #define WIN32_CTRL_TAB       10  /* C14: SysTabControl32 tab strip       */
+/* C25: comctl32 common controls (real comctl32 window classes). These use the
+ * dedicated g_win32_cc[] store (rich enough for columns/rows/tree nodes/parts)
+ * rather than the small g_win32_lb[] item store the C14 controls share. */
+#define WIN32_CTRL_LISTVIEW  11  /* C25: SysListView32 (report view)        */
+#define WIN32_CTRL_TREEVIEW  12  /* C25: SysTreeView32                      */
+#define WIN32_CTRL_STATUSBAR 13  /* C25: msctls_statusbar32                 */
+#define WIN32_CTRL_PROGRESS  14  /* C25: msctls_progress32                  */
+#define WIN32_CTRL_TOOLBAR   15  /* C25: ToolbarWindow32                    */
 #define WIN32_LB_MAX_ITEMS   8
 #define WIN32_LB_ITEM_LEN    24
 
@@ -5836,6 +5844,44 @@ static struct {
  * safe. */
 static struct win32_lb g_win32_lb[WIN32_MAX_CTRLS];
 
+/* C25 comctl32 common-control store, indexed by the control's slot (parallel to
+ * g_win32_lb). Rich enough for a ListView report grid, a TreeView, a multi-part
+ * StatusBar and a Progress bar. Cleared when its control is created. */
+#define CC_TEXT     28
+#define CC_LV_COLS  6
+#define CC_LV_ROWS  12
+#define CC_LV_SUB   6
+#define CC_TV_NODES 20
+#define CC_SB_PARTS 4
+struct win32_cc {
+    /* SysListView32 (report view): columns + a row x subitem text grid. */
+    int  lv_ncol;
+    struct { int cx; char text[CC_TEXT]; } lv_col[CC_LV_COLS];
+    int  lv_nrow;
+    char lv_cell[CC_LV_ROWS][CC_LV_SUB][CC_TEXT];
+    int  lv_sel;                 /* selected row (-1 = none) */
+    /* SysTreeView32: a flat node array; hItem == (node index + 1). */
+    int  tv_n;
+    struct { char text[CC_TEXT]; int parent; int level;
+             unsigned char expanded; unsigned char haskids; } tv[CC_TV_NODES];
+    int  tv_sel;                 /* selected node index (-1 = none) */
+    /* msctls_statusbar32: up to CC_SB_PARTS text panes. */
+    int  sb_nparts;
+    char sb_part[CC_SB_PARTS][CC_TEXT];
+    /* msctls_progress32. */
+    int  pb_min, pb_max, pb_pos, pb_step;
+    /* ToolbarWindow32: just a button count (drawn as a strip). */
+    int  tb_n;
+};
+static struct win32_cc g_win32_cc[WIN32_MAX_CTRLS];
+
+/* True for the comctl32 control kinds that use g_win32_cc[] (C25). */
+static bool win32_is_comctl(int type) {
+    return type == WIN32_CTRL_LISTVIEW || type == WIN32_CTRL_TREEVIEW ||
+           type == WIN32_CTRL_STATUSBAR || type == WIN32_CTRL_PROGRESS ||
+           type == WIN32_CTRL_TOOLBAR;
+}
+
 /* Window-table entry for an HWND/HDC fd, or NULL. */
 static struct win32_win *win32_win_find(int fd) {
     if (fd <= 0) return NULL;
@@ -5878,6 +5924,12 @@ static int win32_ctrl_class(const char *cn) {
     if (win32_streq_ci(cn, "SCROLLBAR"))  return WIN32_CTRL_SCROLLBAR;
     if (win32_streq_ci(cn, "COMBOBOX"))   return WIN32_CTRL_COMBOBOX;
     if (win32_streq_ci(cn, "SysTabControl32")) return WIN32_CTRL_TAB;
+    /* C25: comctl32 common-control classes. */
+    if (win32_streq_ci(cn, "SysListView32"))     return WIN32_CTRL_LISTVIEW;
+    if (win32_streq_ci(cn, "SysTreeView32"))      return WIN32_CTRL_TREEVIEW;
+    if (win32_streq_ci(cn, "msctls_statusbar32")) return WIN32_CTRL_STATUSBAR;
+    if (win32_streq_ci(cn, "msctls_progress32"))  return WIN32_CTRL_PROGRESS;
+    if (win32_streq_ci(cn, "ToolbarWindow32"))    return WIN32_CTRL_TOOLBAR;
     return 0;
 }
 /* BUTTON styles (low nibble of dwStyle) select the button subtype. */
@@ -6038,6 +6090,51 @@ static void win32_stash_wndproc(const struct win32_win *w) {
 #define TCM_GETITEMCOUNT  (TCM_FIRST + 4)
 #define TCM_GETCURSEL     (TCM_FIRST + 11)
 #define TCM_SETCURSEL     (TCM_FIRST + 12)
+/* ---- C25: comctl32 common-control messages ---- */
+#define WM_USER           0x0400
+/* SysListView32 (LVM_FIRST 0x1000). */
+#define LVM_FIRST         0x1000
+#define LVM_GETITEMCOUNT  (LVM_FIRST + 4)
+#define LVM_SETITEMA      (LVM_FIRST + 6)
+#define LVM_INSERTITEMA   (LVM_FIRST + 7)
+#define LVM_DELETEALLITEMS (LVM_FIRST + 9)
+#define LVM_GETNEXTITEM   (LVM_FIRST + 12)
+#define LVM_INSERTCOLUMNA (LVM_FIRST + 27)
+#define LVM_SETITEMSTATE  (LVM_FIRST + 43)
+#define LVM_GETITEMTEXTA  (LVM_FIRST + 45)
+#define LVM_SETITEMTEXTA  (LVM_FIRST + 46)
+#define LVIS_FOCUSED      0x0001
+#define LVIS_SELECTED     0x0002
+#define LVNI_SELECTED     0x0002
+/* SysTreeView32 (TVM_FIRST 0x1100). */
+#define TVM_FIRST         0x1100
+#define TVM_INSERTITEMA   (TVM_FIRST + 0)
+#define TVM_DELETEITEM    (TVM_FIRST + 1)
+#define TVM_EXPAND        (TVM_FIRST + 2)
+#define TVM_GETCOUNT      (TVM_FIRST + 5)
+#define TVM_GETNEXTITEM   (TVM_FIRST + 10)
+#define TVM_SELECTITEM    (TVM_FIRST + 11)
+#define TVGN_ROOT         0x0000
+#define TVGN_CARET        0x0009
+#define TVE_COLLAPSE      0x0001
+#define TVE_EXPAND        0x0002
+/* msctls_statusbar32 (SB_* = WM_USER + n). */
+#define SB_SETTEXTA       (WM_USER + 1)
+#define SB_GETTEXTA       (WM_USER + 2)
+#define SB_GETTEXTLENGTHA (WM_USER + 3)
+#define SB_SETPARTS       (WM_USER + 4)
+#define SB_GETPARTS       (WM_USER + 6)
+/* msctls_progress32 (PBM_* = WM_USER + n). */
+#define PBM_SETRANGE      (WM_USER + 1)
+#define PBM_SETPOS        (WM_USER + 2)
+#define PBM_DELTAPOS      (WM_USER + 3)
+#define PBM_SETSTEP       (WM_USER + 4)
+#define PBM_STEPIT        (WM_USER + 5)
+#define PBM_SETRANGE32    (WM_USER + 6)
+#define PBM_GETPOS        (WM_USER + 8)
+/* ToolbarWindow32 (TB_* = WM_USER + n). */
+#define TB_ADDBUTTONS     (WM_USER + 20)
+#define TB_BUTTONCOUNT    (WM_USER + 24)
 /* Scrollbar notification codes (wParam low word of WM_VSCROLL). */
 #define SB_LINEUP         0
 #define SB_LINEDOWN       1
@@ -6196,6 +6293,17 @@ static int win32_ctrl_make(int parent_fd, int type, int x, int y, int w, int h,
         case WIN32_CTRL_SCROLLBAR:
             c->sb_min = 0; c->sb_max = 100; c->sb_pos = 0;
             break;
+        case WIN32_CTRL_LISTVIEW:
+        case WIN32_CTRL_TREEVIEW:
+        case WIN32_CTRL_STATUSBAR:
+        case WIN32_CTRL_PROGRESS:
+        case WIN32_CTRL_TOOLBAR: {     /* C25: comctl32 store */
+            struct win32_cc *cc = &g_win32_cc[i];
+            memset(cc, 0, sizeof(*cc));
+            cc->lv_sel = -1; cc->tv_sel = -1;
+            cc->pb_min = 0; cc->pb_max = 100; cc->pb_pos = 0; cc->pb_step = 10;
+            break;
+        }
         }
         struct win32_win *pw = win32_win_find(parent_fd);
         if (pw) pw->needs_paint = true;            /* redraw parent -> draw control */
@@ -7919,6 +8027,102 @@ static void win32_draw_controls(int parent_fd) {
             (void)gui_window_fill(win, c->x + 1, c->y + th + 1, c->w - 2, c->h - th - 2, 0x00D8D8D8);
             break;
         }
+        case WIN32_CTRL_LISTVIEW: {     /* C25: report-view grid */
+            struct win32_cc *cc = &g_win32_cc[i];
+            (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00FFFFFF);
+            (void)gui_window_rect(win, c->x, c->y, c->w, c->h, 0x00808080);
+            int hh = 18;                /* column-header band */
+            (void)gui_window_fill(win, c->x + 1, c->y + 1, c->w - 2, hh, 0x00DCDCDC);
+            int cx = c->x;
+            for (int col = 0; col < cc->lv_ncol; col++) {
+                int cw = cc->lv_col[col].cx > 0 ? cc->lv_col[col].cx : 80;
+                (void)gui_window_line(win, cx + cw, c->y + 1, cx + cw, c->y + hh, 0x00A0A0A0);
+                (void)win32_ui_text(win, cx + 5, c->y + 5, cc->lv_col[col].text, 0x00202020, 0x00DCDCDC);
+                cx += cw;
+            }
+            int rh = 16;
+            for (int r = 0; r < cc->lv_nrow && c->y + hh + (r + 1) * rh < c->y + c->h; r++) {
+                int ry = c->y + 1 + hh + r * rh;
+                uint32_t bg = (r == cc->lv_sel) ? 0x002E8AE0 : 0x00FFFFFF;
+                uint32_t fg = (r == cc->lv_sel) ? 0x00FFFFFF : 0x00101010;
+                (void)gui_window_fill(win, c->x + 1, ry, c->w - 2, rh, bg);
+                int gx = c->x;
+                for (int col = 0; col < cc->lv_ncol && col < CC_LV_SUB; col++) {
+                    int cw = cc->lv_col[col].cx > 0 ? cc->lv_col[col].cx : 80;
+                    (void)win32_ui_text(win, gx + 5, ry + 4, cc->lv_cell[r][col], fg, bg);
+                    gx += cw;
+                }
+            }
+            break;
+        }
+        case WIN32_CTRL_TREEVIEW: {     /* C25: indented node tree */
+            struct win32_cc *cc = &g_win32_cc[i];
+            (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00FFFFFF);
+            (void)gui_window_rect(win, c->x, c->y, c->w, c->h, 0x00808080);
+            int rh = 16, row = 0;
+            for (int n = 0; n < cc->tv_n; n++) {
+                /* hide nodes whose any ancestor is collapsed */
+                bool vis = true;
+                int p = cc->tv[n].parent;
+                while (p >= 0) { if (!cc->tv[p].expanded) { vis = false; break; } p = cc->tv[p].parent; }
+                if (!vis) continue;
+                int ry = c->y + 2 + row * rh;
+                if (ry + rh > c->y + c->h) break;
+                int ind = c->x + 6 + cc->tv[n].level * 16;
+                bool seln = (n == cc->tv_sel);
+                if (seln) (void)gui_window_fill(win, c->x + 1, ry, c->w - 2, rh, 0x002E8AE0);
+                if (cc->tv[n].haskids)
+                    (void)win32_ui_text(win, ind - 2, ry + 3,
+                                        cc->tv[n].expanded ? "-" : "+",
+                                        seln ? 0x00FFFFFF : 0x00404040,
+                                        seln ? 0x002E8AE0 : 0x00FFFFFF);
+                (void)win32_ui_text(win, ind + 12, ry + 3, cc->tv[n].text,
+                                    seln ? 0x00FFFFFF : 0x00101010,
+                                    seln ? 0x002E8AE0 : 0x00FFFFFF);
+                row++;
+            }
+            break;
+        }
+        case WIN32_CTRL_STATUSBAR: {    /* C25: bottom-docked multi-part bar */
+            struct win32_cc *cc = &g_win32_cc[i];
+            int sx = 0, sw = pw ? pw->w : c->w, sh = 20;
+            int sy = (pw ? pw->h : (c->y + c->h)) - sh;
+            (void)gui_window_fill(win, sx, sy, sw, sh, 0x00C8C8C8);
+            (void)gui_window_line(win, sx, sy, sx + sw, sy, 0x00808080);
+            int nparts = cc->sb_nparts > 0 ? cc->sb_nparts : 1;
+            int pw_each = sw / nparts;
+            for (int p = 0; p < nparts; p++) {
+                int px = sx + p * pw_each;
+                if (p > 0) (void)gui_window_line(win, px, sy + 2, px, sy + sh - 2, 0x00909090);
+                (void)win32_ui_text(win, px + 6, sy + 6, cc->sb_part[p], 0x00101010, 0x00C8C8C8);
+            }
+            break;
+        }
+        case WIN32_CTRL_PROGRESS: {     /* C25: filled proportion bar */
+            struct win32_cc *cc = &g_win32_cc[i];
+            (void)gui_window_fill(win, c->x, c->y, c->w, c->h, 0x00FFFFFF);
+            (void)gui_window_rect(win, c->x, c->y, c->w, c->h, 0x00808080);
+            int span = cc->pb_max - cc->pb_min;
+            if (span < 1) span = 1;
+            int filled = (int)(((long)(cc->pb_pos - cc->pb_min) * (c->w - 2)) / span);
+            if (filled < 0) filled = 0;
+            if (filled > c->w - 2) filled = c->w - 2;
+            if (filled > 0)
+                (void)gui_window_fill(win, c->x + 1, c->y + 1, filled, c->h - 2, 0x0028A828);
+            break;
+        }
+        case WIN32_CTRL_TOOLBAR: {      /* C25: a strip of flat buttons */
+            struct win32_cc *cc = &g_win32_cc[i];
+            int tw = pw ? pw->w : c->w, th = 26;
+            (void)gui_window_fill(win, 0, c->y, tw, th, 0x00E4E4E4);
+            (void)gui_window_line(win, 0, c->y + th, tw, c->y + th, 0x00A0A0A0);
+            for (int b = 0; b < cc->tb_n; b++) {
+                int bx = 6 + b * 34;
+                (void)gui_window_fill(win, bx, c->y + 3, 30, th - 6, 0x00C8C8C8);
+                (void)gui_window_rect(win, bx, c->y + 3, 30, th - 6, 0x00808080);
+            }
+            break;
+        }
         }
     }
     /* Pass 2: open COMBOBOX dropdowns, drawn on top of sibling controls. */
@@ -8299,9 +8503,11 @@ static bool win32_route_control_input(int parent_fd, const struct gui_event *ev)
             struct win32_ctrl *c = &g_win32_gui.ctrl[i];
             if (!c->in_use || c->parent_fd != parent_fd || c->hidden) continue;
             /* COMBOBOX is handled above; GROUPBOX/TAB page areas are click-
-             * transparent so controls drawn over them still receive clicks. */
+             * transparent so controls drawn over them still receive clicks.
+             * C25: the comctl32 controls are driven by messages in this proof,
+             * so they are click-transparent too (no spurious hit regions). */
             if (c->type == WIN32_CTRL_COMBOBOX || c->type == WIN32_CTRL_GROUPBOX ||
-                c->type == WIN32_CTRL_TAB) continue;
+                c->type == WIN32_CTRL_TAB || win32_is_comctl(c->type)) continue;
             if (ev->x < c->x || ev->x >= c->x + c->w ||
                 ev->y < c->y || ev->y >= c->y + c->h) continue;
             uint64_t hctrl = WIN32_CTRL_TAG | (uint64_t)i;
@@ -8431,12 +8637,212 @@ static int win32_ctrl_slot(const struct win32_ctrl *c) {
     return (int)(c - g_win32_gui.ctrl);
 }
 
+/* C25: read an int32 / a char*-string field out of a user-space control struct
+ * (LVITEM/LVCOLUMN/TVINSERTSTRUCT) by byte offset. */
+static int cc_rd_i32(uint64_t base, uint64_t off) {
+    int32_t v = 0;
+    (void)copy_from_user(&v, (const void *)(uintptr_t)(base + off), 4);
+    return v;
+}
+static void cc_rd_str(uint64_t base, uint64_t off, char *dst, int dstsz) {
+    dst[0] = 0;
+    uint64_t p = 0;
+    if (copy_from_user(&p, (const void *)(uintptr_t)(base + off), 8) == 0 && p)
+        (void)strncpy_from_user(dst, (const char *)(uintptr_t)p, dstsz);
+}
+static int cc_copy_out(uint64_t base, uint64_t ptroff, const char *src) {
+    uint64_t buf = 0;
+    if (copy_from_user(&buf, (const void *)(uintptr_t)(base + ptroff), 8) != 0 || !buf)
+        return 0;
+    int n = 0; while (src[n]) n++;
+    (void)copy_to_user((void *)(uintptr_t)buf, src, n);
+    char z = 0; (void)copy_to_user((void *)(uintptr_t)(buf + n), &z, 1);
+    return n;
+}
+
+/* C25: comctl32 common-control message handler (SysListView32/SysTreeView32/
+ * msctls_statusbar32/msctls_progress32/ToolbarWindow32). Dispatched by control
+ * TYPE first because the StatusBar/Progress/Toolbar messages share WM_USER+n
+ * numeric values. The kernel IS the control's WndProc. */
+static long win32_cc_sendmessage(struct win32_ctrl *c, int slot,
+                                 uint32_t msg, uint64_t wp, uint64_t lp) {
+    struct win32_cc *cc = &g_win32_cc[slot];
+    switch (c->type) {
+    case WIN32_CTRL_LISTVIEW:
+        switch (msg) {
+        case LVM_INSERTCOLUMNA: {
+            if (cc->lv_ncol >= CC_LV_COLS) return -1;
+            int idx = cc->lv_ncol++;
+            cc->lv_col[idx].cx = cc_rd_i32(lp, 0x08);          /* LVCOLUMN.cx   */
+            cc_rd_str(lp, 0x10, cc->lv_col[idx].text, CC_TEXT);/* LVCOLUMN.pszText */
+            win32_refresh_controls(c->parent_fd);
+            return idx;
+        }
+        case LVM_INSERTITEMA: {
+            int row = cc_rd_i32(lp, 0x04);                     /* LVITEM.iItem  */
+            if (row < 0) row = 0;
+            if (row >= CC_LV_ROWS) return -1;
+            cc_rd_str(lp, 0x18, cc->lv_cell[row][0], CC_TEXT); /* LVITEM.pszText */
+            for (int s = 1; s < CC_LV_SUB; s++) cc->lv_cell[row][s][0] = 0;
+            if (row + 1 > cc->lv_nrow) cc->lv_nrow = row + 1;
+            win32_refresh_controls(c->parent_fd);
+            return row;
+        }
+        case LVM_SETITEMA:
+        case LVM_SETITEMTEXTA: {
+            int row = (msg == LVM_SETITEMTEXTA) ? (int)(int32_t)wp : cc_rd_i32(lp, 0x04);
+            int sub = cc_rd_i32(lp, 0x08);                     /* iSubItem */
+            if (row < 0 || row >= CC_LV_ROWS || sub < 0 || sub >= CC_LV_SUB) return 0;
+            cc_rd_str(lp, 0x18, cc->lv_cell[row][sub], CC_TEXT);
+            if (row + 1 > cc->lv_nrow) cc->lv_nrow = row + 1;
+            win32_refresh_controls(c->parent_fd);
+            return 1;
+        }
+        case LVM_GETITEMTEXTA: {
+            int row = (int)(int32_t)wp;
+            int sub = cc_rd_i32(lp, 0x08);
+            if (row < 0 || row >= cc->lv_nrow || sub < 0 || sub >= CC_LV_SUB) return 0;
+            return cc_copy_out(lp, 0x18, cc->lv_cell[row][sub]);  /* LVITEM.pszText */
+        }
+        case LVM_GETITEMCOUNT:   return cc->lv_nrow;
+        case LVM_DELETEALLITEMS: cc->lv_nrow = 0; cc->lv_sel = -1;
+                                 win32_refresh_controls(c->parent_fd); return 1;
+        case LVM_SETITEMSTATE: {
+            int row = (int)(int32_t)wp;
+            uint32_t state = (uint32_t)cc_rd_i32(lp, 0x0C);    /* LVITEM.state */
+            if (state & LVIS_SELECTED) { cc->lv_sel = row; win32_refresh_controls(c->parent_fd); }
+            return 1;
+        }
+        case LVM_GETNEXTITEM:
+            return ((uint32_t)lp & LVNI_SELECTED) ? cc->lv_sel : -1;
+        }
+        return 0;
+    case WIN32_CTRL_TREEVIEW:
+        switch (msg) {
+        case TVM_INSERTITEMA: {
+            if (cc->tv_n >= CC_TV_NODES) return 0;
+            int idx = cc->tv_n++;
+            uint64_t hParent = 0;
+            (void)copy_from_user(&hParent, (const void *)(uintptr_t)(lp + 0x00), 8);
+            int parent = (hParent == 0) ? -1 : (int)hParent - 1;
+            if (parent < -1 || parent >= idx) parent = -1;
+            cc->tv[idx].parent   = parent;
+            cc->tv[idx].level    = (parent < 0) ? 0 : cc->tv[parent].level + 1;
+            cc->tv[idx].expanded = 1;
+            cc->tv[idx].haskids  = 0;
+            if (parent >= 0) cc->tv[parent].haskids = 1;
+            cc_rd_str(lp, 0x28, cc->tv[idx].text, CC_TEXT);    /* TVINSERTSTRUCT.item.pszText */
+            win32_refresh_controls(c->parent_fd);
+            return (long)(idx + 1);                            /* HTREEITEM */
+        }
+        case TVM_GETCOUNT: return cc->tv_n;
+        case TVM_EXPAND: {
+            int node = (int)lp - 1;
+            if (node < 0 || node >= cc->tv_n) return 0;
+            if (wp & TVE_EXPAND)        cc->tv[node].expanded = 1;
+            else if (wp & TVE_COLLAPSE) cc->tv[node].expanded = 0;
+            win32_refresh_controls(c->parent_fd);
+            return 1;
+        }
+        case TVM_SELECTITEM: {
+            int node = (int)lp - 1;
+            cc->tv_sel = (node >= 0 && node < cc->tv_n) ? node : -1;
+            win32_refresh_controls(c->parent_fd);
+            return 1;
+        }
+        case TVM_GETNEXTITEM:
+            if (wp == TVGN_CARET) return cc->tv_sel >= 0 ? (long)(cc->tv_sel + 1) : 0;
+            if (wp == TVGN_ROOT) {
+                for (int n = 0; n < cc->tv_n; n++)
+                    if (cc->tv[n].parent < 0) return (long)(n + 1);
+                return 0;
+            }
+            return 0;
+        }
+        return 0;
+    case WIN32_CTRL_STATUSBAR:
+        switch (msg) {
+        case SB_SETPARTS: {
+            int n = (int)(int32_t)wp;
+            if (n < 1) n = 1; if (n > CC_SB_PARTS) n = CC_SB_PARTS;
+            cc->sb_nparts = n; win32_refresh_controls(c->parent_fd); return 1;
+        }
+        case SB_SETTEXTA: {
+            int part = (int)(wp & 0xFF);
+            if (part < 0 || part >= CC_SB_PARTS) return 0;
+            cc->sb_part[part][0] = 0;
+            if (lp) (void)strncpy_from_user(cc->sb_part[part], (const char *)(uintptr_t)lp, CC_TEXT);
+            if (part + 1 > cc->sb_nparts) cc->sb_nparts = part + 1;
+            win32_refresh_controls(c->parent_fd);
+            return 1;
+        }
+        case SB_GETTEXTA: {
+            int part = (int)(wp & 0xFF);
+            if (part < 0 || part >= CC_SB_PARTS) return 0;
+            int n = 0; while (cc->sb_part[part][n]) n++;
+            if (lp) {
+                (void)copy_to_user((void *)(uintptr_t)lp, cc->sb_part[part], n);
+                char z = 0; (void)copy_to_user((void *)(uintptr_t)(lp + n), &z, 1);
+            }
+            return n;
+        }
+        case SB_GETTEXTLENGTHA: {
+            int part = (int)(wp & 0xFF);
+            if (part < 0 || part >= CC_SB_PARTS) return 0;
+            int n = 0; while (cc->sb_part[part][n]) n++;
+            return n;
+        }
+        case SB_GETPARTS: return cc->sb_nparts;
+        }
+        return 0;
+    case WIN32_CTRL_PROGRESS:
+        switch (msg) {
+        case PBM_SETRANGE:
+            cc->pb_min = (int)(lp & 0xFFFF); cc->pb_max = (int)((lp >> 16) & 0xFFFF);
+            win32_refresh_controls(c->parent_fd); return 1;
+        case PBM_SETRANGE32:
+            cc->pb_min = (int)(int32_t)wp; cc->pb_max = (int)(int32_t)lp;
+            win32_refresh_controls(c->parent_fd); return 1;
+        case PBM_SETPOS: {
+            int old = cc->pb_pos; cc->pb_pos = (int)(int32_t)wp;
+            if (cc->pb_pos < cc->pb_min) cc->pb_pos = cc->pb_min;
+            if (cc->pb_pos > cc->pb_max) cc->pb_pos = cc->pb_max;
+            win32_refresh_controls(c->parent_fd); return old;
+        }
+        case PBM_DELTAPOS: {
+            int old = cc->pb_pos; cc->pb_pos += (int)(int32_t)wp;
+            if (cc->pb_pos > cc->pb_max) cc->pb_pos = cc->pb_max;
+            win32_refresh_controls(c->parent_fd); return old;
+        }
+        case PBM_SETSTEP: { int old = cc->pb_step; cc->pb_step = (int)(int32_t)wp; return old; }
+        case PBM_STEPIT: {
+            int old = cc->pb_pos; cc->pb_pos += cc->pb_step;
+            if (cc->pb_pos > cc->pb_max) cc->pb_pos = cc->pb_max;
+            win32_refresh_controls(c->parent_fd); return old;
+        }
+        case PBM_GETPOS: return cc->pb_pos;
+        }
+        return 0;
+    case WIN32_CTRL_TOOLBAR:
+        switch (msg) {
+        case TB_ADDBUTTONS:  cc->tb_n += (int)(int32_t)wp;
+                             win32_refresh_controls(c->parent_fd); return 1;
+        case TB_BUTTONCOUNT: return cc->tb_n;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 /* user32!SendMessageA(hwnd, msg, wParam, lParam) -> result. Handles the control
  * messages used to drive BUTTON(checkbox)/EDIT/LISTBOX controls (the kernel IS
  * the control's WndProc); non-control targets / unknown messages return 0. */
 static long w32_SendMessageA(uint64_t *a) {
     struct win32_ctrl *c = win32_ctrl_find(a[0]);
     if (!c) return 0;
+    if (win32_is_comctl(c->type))
+        return win32_cc_sendmessage(c, win32_ctrl_slot(c),
+                                    (uint32_t)a[1], a[2], a[3]);
     uint32_t msg = (uint32_t)a[1];
     uint64_t wp = a[2], lp = a[3];
     int slot = win32_ctrl_slot(c);
@@ -10578,6 +10984,17 @@ static long w32_frexp(uint64_t *a){
     return (long)mb;
 }
 
+/* C25: comctl32. InitCommonControlsEx registers the common-control window
+ * classes; in our model the classes are recognised unconditionally by
+ * win32_ctrl_class(), so this just acknowledges. ImageList_* are tolerated
+ * stubs (report-view ListViews here carry no images). */
+static long w32_InitCommonControlsEx(uint64_t *a) { (void)a; return 1; }
+static long w32_InitCommonControls(uint64_t *a)   { (void)a; return 0; }
+static long w32_ImageList_Create(uint64_t *a)     { (void)a; return 0x69000001; }
+static long w32_ImageList_AddMasked(uint64_t *a)  { (void)a; return 0; }
+static long w32_ImageList_ReplaceIcon(uint64_t *a){ (void)a; return 0; }
+static long w32_ImageList_Destroy(uint64_t *a)    { (void)a; return 1; }
+
 struct win32_shim {
     const char    *dll;     /* lower-case DLL name, no path */
     const char    *func;    /* exact exported symbol */
@@ -10791,6 +11208,14 @@ static const struct win32_shim g_win32_shims[] = {
     { "shell32.dll",  "ShellExecuteA",           w32_ShellExecuteA },
     { "shell32.dll",  "Shell_NotifyIconA",       w32_Shell_NotifyIconA },
     { "shell32.dll",  "DragQueryFileA",          w32_DragQueryFileA },
+    /* C25: comctl32 -- common controls (ListView/TreeView/StatusBar/Progress/
+     * Toolbar) are driven through SendMessageA; these are the DLL's own exports. */
+    { "comctl32.dll", "InitCommonControlsEx",    w32_InitCommonControlsEx },
+    { "comctl32.dll", "InitCommonControls",      w32_InitCommonControls },
+    { "comctl32.dll", "ImageList_Create",        w32_ImageList_Create },
+    { "comctl32.dll", "ImageList_AddMasked",     w32_ImageList_AddMasked },
+    { "comctl32.dll", "ImageList_ReplaceIcon",   w32_ImageList_ReplaceIcon },
+    { "comctl32.dll", "ImageList_Destroy",       w32_ImageList_Destroy },
     { "kernel32.dll", "FindFirstFileA",      w32_FindFirstFileA },
     { "kernel32.dll", "FindNextFileA",       w32_FindNextFileA },
     { "kernel32.dll", "FindClose",           w32_FindClose },

@@ -1596,6 +1596,15 @@ programs/win-ctrl14/win-ctrl14.exe: programs/win-ctrl14/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
 	      -o $@ $< -lgdi32 -luser32
 
+# Track C/C25: a STOCK Win32 GUI .exe exercising the comctl32 COMMON CONTROLS --
+# a report-view SysListView32, a SysTreeView32, an msctls_statusbar32, an
+# msctls_progress32 and a ToolbarWindow32 -- driven entirely through the real
+# comctl32 API (InitCommonControlsEx + LVM_*/TVM_*/SB_*/PBM_*/TB_*) with every
+# value read back to prove the round-trip. Links comctl32.
+programs/win-cc25/win-cc25.exe: programs/win-cc25/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -Wl,--subsystem,windows \
+	      -o $@ $< -lcomctl32 -lgdi32 -luser32
+
 # Track C/C14a: a STOCK Win32 GUI .exe driven from a RESOURCE dialog template
 # (DialogBoxParamA + RT_DIALOG in .rsrc + DialogProc + EndDialog).
 programs/win-dlg14/win-dlg14.exe: programs/win-dlg14/main.c programs/win-dlg14/dlg.rc
@@ -2005,6 +2014,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-ctrl13/win-ctrl13.exe \
                programs/win-font13/win-font13.exe \
                programs/win-ctrl14/win-ctrl14.exe \
+               programs/win-cc25/win-cc25.exe \
                programs/win-dlg14/win-dlg14.exe \
                programs/win-font14b/win-font14b.exe \
                programs/win-menu15/win-menu15.exe \
@@ -2124,6 +2134,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-ctrl13/win-ctrl13.exe             $(INITRD_STAGE)/bin/win-ctrl13.exe
 	cp programs/win-font13/win-font13.exe             $(INITRD_STAGE)/bin/win-font13.exe
 	cp programs/win-ctrl14/win-ctrl14.exe             $(INITRD_STAGE)/bin/win-ctrl14.exe
+	cp programs/win-cc25/win-cc25.exe                 $(INITRD_STAGE)/bin/win-cc25.exe
 	cp programs/win-dlg14/win-dlg14.exe               $(INITRD_STAGE)/bin/win-dlg14.exe
 	cp programs/win-font14b/win-font14b.exe           $(INITRD_STAGE)/bin/win-font14b.exe
 	cp programs/win-menu15/win-menu15.exe             $(INITRD_STAGE)/bin/win-menu15.exe
@@ -2495,6 +2506,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-bmp12.exe bin/win-ctrl12.exe                           \
 	    bin/win-ctrl13.exe bin/win-font13.exe                          \
 	    bin/win-ctrl14.exe bin/win-dlg14.exe bin/win-font14b.exe       \
+	    bin/win-cc25.exe                                               \
 	    bin/win-menu15.exe bin/win-reg16.exe bin/win-fdlg16.exe        \
 	    bin/win-env16.exe bin/win-tls16.exe bin/win-net17.exe         \
 	    bin/win-srv17.exe bin/win-udp17.exe bin/win-sqlite.exe        \

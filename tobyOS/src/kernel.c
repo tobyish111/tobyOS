@@ -2348,7 +2348,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT) || defined(WINPE16D_BOOT) || defined(WINPE18C_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT) || defined(WINPE16D_BOOT) || defined(WINPE18C_BOOT) || defined(WINPE25_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -4503,6 +4503,44 @@ void _start(void) {
                 int rc = proc_wait(dpid);
                 kprintf("[boot] WINPE14: /bin/win-dlg14.exe (pid=%d) exit=%d\n", dpid, rc);
                 kprintf("[WINPE14D] VERDICT: %s exit=%d (expected 14)\n", rc == 14 ? "PASS" : "FAIL", rc);
+            }
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
+#ifdef WINPE25_BOOT
+    /* Track C -- comctl32 COMMON CONTROLS, milestone C25. Build EXTRA_CFLAGS+=
+     * -DWINPE25_BOOT. A stock Win32 GUI .exe links comctl32 and builds a
+     * report-view SysListView32 (3 columns x 4 rows + subitems + selection), a
+     * SysTreeView32 (root/3 children/grandchild, expand, caret select), a
+     * multi-part msctls_statusbar32, an msctls_progress32, and a ToolbarWindow32
+     * -- ALL via the real comctl32 API (InitCommonControlsEx + LVM_/TVM_/SB_/
+     * PBM_/TB_ messages). The app READS BACK every value (counts, item/subitem
+     * text, selection, tree caret, progress pos, status text, button count) and
+     * exits 25 IFF all round-trips matched -- so a PASS proves the control state
+     * really lives in the kernel comctl32 layer, not that the .exe merely ran.
+     * The app self-closes after rendering, so no input injection is needed. */
+    {
+        win32_gui_set_log(true);
+        winpe_autologin_clear();
+        kprintf("[boot] WINPE25: spawning /bin/win-cc25.exe (comctl32 common controls)\n");
+        int cpid = winpe_spawn_session_app("/bin/win-cc25.exe", "win-cc25.exe");
+        if (cpid < 0) {
+            kprintf("[WINPE25] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int wfd = -1;
+            for (int i = 0; i < 120 && wfd < 0; i++) { winpe8_pump_ms(50); wfd = win32_gui_window_fd(cpid); }
+            if (wfd < 0) {
+                kprintf("[WINPE25] VERDICT: FAIL reason=nowindow\n");
+                signal_send_to_pid(cpid, SIGKILL); (void)proc_wait(cpid);
+            } else {
+                kprintf("[WINPE25] common controls built; holding ~4s for screenshot\n");
+                /* the app validates immediately, renders, then self-closes */
+                for (int i = 0; i < 200 && win32_gui_window_count(cpid) > 0; i++) winpe8_pump_ms(50);
+                int rc = proc_wait(cpid);
+                kprintf("[boot] WINPE25: /bin/win-cc25.exe (pid=%d) exit=%d\n", cpid, rc);
+                kprintf("[WINPE25] VERDICT: %s exit=%d (expected 25)\n", rc == 25 ? "PASS" : "FAIL", rc);
             }
         }
         win32_gui_set_log(false);
