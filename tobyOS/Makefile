@@ -526,7 +526,7 @@ SDK_SAMPLE_TPKGS    := $(addprefix build/samples/,$(addsuffix .tpkg,$(SDK_SAMPLE
         run-rtl8139 run-rtl8139-uefi \
         run-xhci run-xhci-uefi \
         run-xhci-usb run-xhci-usb-uefi run-xhci-hub run-gpt-usb usb-stick-img \
-        run-virtio-gpu run-virtio-gpu-uefi \
+        run-virtio-gpu run-virtio-gpu-uefi run-virtio-gpu-gl \
         run-installed run-installed-uefi clean inspect \
         programs initrd disk wipe-disk mkfs mkpkg helloapp-tpkg \
         helloapp-tpkg-v2 sdk sdk-tree sdk-headers sdk-libs sdk-tools \
@@ -3874,6 +3874,28 @@ run-virtio-gpu: $(ISO) $(DISK_IMG)
 	cat $(LOGDIR)/debug.log 2>/dev/null || echo "(empty)"; \
 	echo ""; echo "=== serial (COM1, virtio-gpu) ==="; \
 	cat $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
+
+# `make run-virtio-gpu-gl` boots with the GL-accelerated virtio-gpu variant
+# (`virtio-gpu-gl-pci`) plus a host OpenGL context via `-display egl-headless`.
+# On a host with a working virglrenderer + GL stack this makes the device
+# advertise VIRTIO_GPU_F_VIRGL, so the C24/VIRGL path (CTX_CREATE/SUBMIT_3D)
+# goes live. NOTE: the GL device REQUIRES a gl=on display backend -- `-display
+# none` is rejected, and on QEMU-for-Windows the only headless GL backend
+# (egl-headless) currently crashes, so this target is for Linux/virglrenderer
+# hosts. Build the ISO with EXTRA_CFLAGS+=-DVIRGL_BOOT to run the proof harness.
+run-virtio-gpu-gl: $(ISO) $(DISK_IMG)
+	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log
+	$(QEMU) -cdrom $(ISO) \
+	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
+	        -boot d \
+	        -smp 4 \
+	        -vga none \
+	        -device virtio-gpu-gl-pci \
+	        -display egl-headless \
+	        -serial file:$(LOGDIR)/serial.log \
+	        -no-reboot; \
+	echo ""; echo "=== serial (COM1, virtio-gpu-gl) ==="; \
+	grep -aE 'virtio-gpu|VIRGL|virgl' $(LOGDIR)/serial.log 2>/dev/null || echo "(empty)"
 
 run-virtio-gpu-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	@mkdir -p $(LOGDIR) && rm -f $(LOGDIR)/serial.log $(LOGDIR)/debug.log $(LOGDIR)/qemu.log

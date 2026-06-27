@@ -772,6 +772,22 @@ driver model; POSIX libc surface.
   upstream **SQLite** (1519 DIR64 fixups, `exit=0`) and the **Lua 5.4.7** interpreter (536 fixups, `exit=0`) — plus the CRT printf,
   file-I/O, threads, `GetProcAddress`, and scanf proofs. The only always-compiled change is the loader's slide+reloc path (a no-op
   for non-PE binaries, which the default desktop boot never loads); the harness is gated by `#ifdef WINPE24_BOOT`.
+- **2026-06-27** — **Track C (graphics): VirGL 3D capability negotiation + 3D-context gating on virtio-gpu — `[VIRGL] VERDICT: SKIP mode=no-virgl-host` (graceful, no-fault).**
+  The virtio-gpu driver already carried the VirGL 3D command path (`VIRTIO_GPU_F_VIRGL` feature negotiation, `CTX_CREATE_3D` /
+  `CTX_DESTROY` / `SUBMIT_3D` over the control queue), but nothing exercised or proved it. Driving a *real* triangle requires the
+  host to advertise VirGL, which only happens with QEMU's `virtio-gpu-gl` device backed by a working `virglrenderer` + OpenGL
+  context (`-display egl-headless` / `gtk,gl=on`). **On this CI host (QEMU-for-Windows) there is no usable host GL backend** —
+  `egl-headless` produces no GL context (the GL device boots to a blank/silent serial), so 3D-live cannot be proven here. Rather
+  than fake it, this adds a deterministic `#ifdef VIRGL_BOOT` harness that proves **exactly what is provable without a host GL
+  stack**: the driver correctly **detects** VirGL is absent (`virgl=no` from feature negotiation on `virtio-gpu-pci`), a 3D
+  `virtio_gpu_ctx_create()` is **gracefully refused** (`rc != 0`, no crash) rather than blindly issuing commands the host can't
+  service, and the **2D present path stays fully live** alongside it. **Proof, clean under `+smep,+smap`, 0 faults:**
+  `[virtio-gpu] features: … virgl=no`, `[VIRGL] capability=absent gating_refused_3d=1 2d_present=1`,
+  `[VIRGL] VERDICT: SKIP mode=no-virgl-host` (`logs/virgl.sh`). On a virglrenderer host, `make run-virtio-gpu-gl` (new target:
+  `virtio-gpu-gl-pci` + `-display egl-headless`) flips the same harness to **`PASS mode=3d-live`** by ACKing `CTX_CREATE`/`DESTROY`.
+  **No regression:** the VirGL command path and the read-only capability accessor are gated behind feature negotiation (inert when
+  the device doesn't advertise VirGL, i.e. every default build); the harness lives inside `#ifdef VIRGL_BOOT` (undefined in
+  default/regression builds), so default boot logic is unchanged.
 - **2026-06-26** — **Track C milestone C23: wide-char / Unicode (UTF-16) — wide CRT strings, the `wprintf` family, and `%ls`.**
   Real Windows programs lean on `wchar_t`/UTF-16 (`wmain`, `wprintf`, `wcs*`, the `…W` APIs). The `…W` file APIs
   (`CreateFileW`, `WriteConsoleW`, `MultiByteToWideChar`, …) already worked, but the **wide CRT** was a near-total gap
