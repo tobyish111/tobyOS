@@ -1372,6 +1372,11 @@ programs/linux-procfs2/linux-procfs2.elf: programs/linux-procfs2/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# B25: the REAL glibc 2.41 static proof (programs/linux-glibc) is deliberately
+# NOT built here -- it must link against an actual glibc sysroot, which the
+# freestanding in-tree clang cannot supply. Build it out-of-tree with
+# programs/linux-glibc/build.sh; the initrd stages it opt-in when present.
+
 # Track B/B19: a genuine STATIC, NOTE-LESS, UNBRANDED Linux x86-64 ELF -- the
 # one shape the loader could not previously auto-detect (no OSABI brand, no
 # PT_INTERP). Built exactly like the others EXCEPT there is deliberately NO
@@ -2070,6 +2075,13 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-tty/linux-tty.elf               $(INITRD_STAGE)/bin/linux-tty
 	cp programs/linux-pty/linux-pty.elf               $(INITRD_STAGE)/bin/linux-pty
 	cp programs/linux-procfs2/linux-procfs2.elf       $(INITRD_STAGE)/bin/linux-procfs2
+	@# B25 (opt-in): the real glibc static proof is built out-of-tree against a
+	@# glibc sysroot (programs/linux-glibc/build.sh) since the in-tree clang is
+	@# freestanding. Stage it only when present so normal builds never require it.
+	@test -f programs/linux-glibc/linux-glibc.elf \
+	  && cp programs/linux-glibc/linux-glibc.elf      $(INITRD_STAGE)/bin/linux-glibc \
+	  && echo "[initrd] staged linux-glibc (B25 real glibc proof)" \
+	  || echo "[initrd] linux-glibc.elf absent (B25 opt-in) -- skipping"
 	cp programs/win-hello/win-hello.exe               $(INITRD_STAGE)/bin/win-hello.exe
 	cp programs/win-crt/win-crt.exe                   $(INITRD_STAGE)/bin/win-crt.exe
 	cp programs/win-hello3/win-hello3.exe             $(INITRD_STAGE)/bin/win-hello3.exe
@@ -2323,6 +2335,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
+	    bin/linux-glibc \
 	    bin/win-hello.exe \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
 	    bin/win-fileio.exe bin/win-thread.exe bin/win-tls18b.exe       \

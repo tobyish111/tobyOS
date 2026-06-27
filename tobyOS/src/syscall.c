@@ -2953,6 +2953,10 @@ enum {
     /* B17: real busybox network clients arm an alarm-timeout (setitimer) around
      * each network op and ftruncate the wget output file. */
     LX_ftruncate = 77, LX_getitimer = 36, LX_setitimer = 38,
+    /* B25: syscalls glibc 2.41 startup/pthread/malloc issue that previously
+     * fell through to -ENOSYS. */
+    LX_madvise = 28, LX_getrlimit = 97, LX_setrlimit = 160,
+    LX_prlimit64 = 302, LX_rseq = 334, LX_clone3 = 435,
 };
 
 /* arch_prctl codes. */
@@ -4195,6 +4199,82 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     }
     case LX_set_robust_list:
         return 0;
+
+    /* B25: glibc 2.41 startup/pthread/malloc gap-fills (previously -ENOSYS).
+     *
+     * rseq(): restartable sequences. We don't implement the rseq area, and
+     * returning -ENOSYS is the *standard* contract glibc handles -- it simply
+     * disables rseq and proceeds. We name the case so it isn't logged as an
+     * "unhandled" syscall. */
+    case LX_rseq:
+        return -ABI_ENOSYS;
+
+    /* madvise(): purely advisory; we don't reclaim on advice. Accept all and
+     * report success (a real kernel may also no-op MADV_DONTNEED etc.). */
+    case LX_madvise:
+        return 0;
+
+    /* prlimit64(pid, resource, *new, *old) and the legacy getrlimit/setrlimit.
+     * glibc reads RLIMIT_STACK at startup (to size the main+default thread
+     * stacks) and RLIMIT_NOFILE elsewhere. We don't enforce limits, so report
+     * sane values and accept any set as a no-op. */
+    case LX_prlimit64: {
+        int      resource = (int)a2;
+        uint64_t oldp     = (uint64_t)a4;
+        if (oldp) {
+            struct { uint64_t cur, max; } rl;
+            rl.max = ~0ULL;                 /* RLIM64_INFINITY */
+            switch (resource) {
+            case 3:  rl.cur = 0x800000ULL; break;          /* RLIMIT_STACK 8 MiB */
+            case 7:  rl.cur = 1024; rl.max = 4096; break;  /* RLIMIT_NOFILE      */
+            default: rl.cur = ~0ULL; break;                /* AS/DATA/...: inf   */
+            }
+            if (copy_to_user((void *)(uintptr_t)oldp, &rl, sizeof rl) != 0)
+                return -ABI_EFAULT;
+        }
+        return 0;                            /* a3 (new limit) accepted as no-op */
+    }
+    case LX_getrlimit: {                     /* (resource, *rlim) */
+        int      resource = (int)a1;
+        uint64_t out      = (uint64_t)a2;
+        if (out) {
+            struct { uint64_t cur, max; } rl;
+            rl.max = ~0ULL;
+            switch (resource) {
+            case 3:  rl.cur = 0x800000ULL; break;
+            case 7:  rl.cur = 1024; rl.max = 4096; break;
+            default: rl.cur = ~0ULL; break;
+            }
+            if (copy_to_user((void *)(uintptr_t)out, &rl, sizeof rl) != 0)
+                return -ABI_EFAULT;
+        }
+        return 0;
+    }
+    case LX_setrlimit:
+        return 0;
+
+    /* clone3(*cl_args, size): the modern thread-spawn entry glibc 2.41 tries
+     * FIRST for pthread_create (falling back to clone on -ENOSYS). Translate
+     * the cl_args struct to our existing clone-thread path. NOTE clone3 passes
+     * the stack BASE + size (top = base+size), unlike legacy clone which passes
+     * the stack TOP directly. */
+    case LX_clone3: {
+        struct lx_clone_args {
+            uint64_t flags, pidfd, child_tid, parent_tid, exit_signal,
+                     stack, stack_size, tls, set_tid, set_tid_size, cgroup;
+        } ca;
+        size_t want = (size_t)a2;
+        if (want > sizeof ca) want = sizeof ca;
+        for (size_t i = 0; i < sizeof ca; i++) ((uint8_t *)&ca)[i] = 0;
+        if (copy_from_user(&ca, (const void *)(uintptr_t)a1, want) != 0)
+            return -ABI_EFAULT;
+        if (ca.flags & 0x100u /* CLONE_VM => thread */) {
+            uint64_t stack_top = ca.stack + ca.stack_size;
+            return sys_clone_thread(ca.flags, stack_top, ca.parent_tid,
+                                    ca.child_tid, ca.tls);
+        }
+        return do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+    }
 
     /* B17: busybox wraps each network op in an alarm-timeout via setitimer
      * (arm + disarm). We don't model interval timers, so accept-and-ignore as

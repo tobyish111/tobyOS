@@ -5844,6 +5844,63 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXPROCFS2_BOOT
+    /* Track B/B24: /proc + /sys breadth. The proof reads /proc/meminfo (kB),
+     * /proc/uptime (2 fields), /proc/mounts, /proc/stat, enumerates
+     * /proc/self/fd + readlinks fd/0, and reads /sys/.../cpu/online. All six
+     * checks -> exit 63. */
+    {
+        char *argv[] = { (char *)"linux-procfs2", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-procfs2", .name = "linux-procfs2",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] LXPROCFS2: spawning /bin/linux-procfs2 (/proc + /sys breadth)\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LXPROCFS2: not present -- SKIPPED\n");
+            kprintf("[LXPROCFS2] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] LXPROCFS2: linux-procfs2 (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[LXPROCFS2] VERDICT: %s exit=%d (meminfo/uptime/mounts/stat + "
+                    "/proc/self/fd + /sys cpu/online; expect 63)\n",
+                    rc == 63 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
+#ifdef LXGLIBC_BOOT
+    /* Track B/B25: run a REAL glibc (2.41, Buildroot 2025.08) statically-linked
+     * x86-64 Linux binary -- not musl, not freestanding. Exercises glibc C
+     * runtime startup (TLS via arch_prctl, __libc_start_main, rseq/robust-list
+     * registration, brk-backed malloc), libc surface (printf/malloc/snprintf
+     * float/clock_gettime/getpid) and a pthread (clone + futex + TLS). Six
+     * checks -> exit 63. The ELF is prebuilt out-of-tree (logs/b25.sh) against
+     * a downloaded glibc sysroot since the in-tree clang is freestanding. */
+    {
+        char *argv[] = { (char *)"linux-glibc", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-glibc", .name = "linux-glibc",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] LXGLIBC: spawning /bin/linux-glibc (real glibc 2.41 static)\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LXGLIBC: not present -- SKIPPED\n");
+            kprintf("[LXGLIBC] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] LXGLIBC: linux-glibc (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[LXGLIBC] VERDICT: %s exit=%d (glibc startup + stdio/heap/"
+                    "sprintf/clock/pid/pthread; expect 63)\n",
+                    rc == 63 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef XPIPE_BOOT
     /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
      * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux

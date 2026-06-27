@@ -357,6 +357,24 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-26** — **Track B milestone B25: a REAL glibc static binary runs — not musl, not freestanding.**
+  Until now every Linux proof was either freestanding (hand-rolled syscalls) or musl (busybox). B25 closes that by running an
+  actual **glibc 2.41** statically-linked x86-64 ELF (linked against a Buildroot 2025.08 glibc sysroot with the in-tree
+  clang/lld — see `programs/linux-glibc/build.sh`). glibc is the most demanding mainstream libc, so this exercises the whole
+  C-runtime startup it does that musl skips: TLS setup via `arch_prctl`, `__libc_start_main`, `rseq`/robust-list registration,
+  `brk`-backed malloc arena, and `clock_gettime`/`getrandom` probing. **Gap-fills** surfaced and implemented in `syscall.c`
+  (glibc previously got `-ENOSYS` and limped along on fallbacks): `clone3(435)` (the modern `pthread_create` entry — translate
+  its `clone_args` to the existing clone-thread path, accounting for clone3 passing stack *base+size* vs legacy clone's stack
+  *top*), `prlimit64(302)` + legacy `getrlimit/setrlimit` (report sane `RLIMIT_STACK`=8 MiB / `RLIMIT_NOFILE`=1024, accept sets
+  as no-ops — glibc reads `RLIMIT_STACK` to size thread stacks), `madvise(28)` (advisory no-op success), and `rseq(334)` named
+  as an intentional `-ENOSYS` (the standard contract glibc handles by disabling rseq — no longer logged as "unhandled").
+  **Proof, clean under `+smep,+smap`, 0 faults, 0 unhandled syscalls:** `[LXGLIBC] VERDICT: PASS exit=63` (`logs/b25.sh`) — the
+  glibc binary passes all six checks: `stdio` (buffered `printf`), `heap` (malloc/strcmp), `sprintf` (float `%.3f`), `clock`
+  (`clock_gettime`), `pid` (`getpid`), and **`pthread`** (create+join: clone3→clone + futex + TLS, returns the expected value).
+  **No regression:** full Linux-track battery green (`LXABI/LXSIG/LXMMAP/LXTHREAD/LXJOIN/LXPOLL` all PASS — confirming the
+  thread changes didn't break musl threads), busybox file battery `[LXBB] PASS 10/10`, unbranded auto-detect `[LXAUTO] PASS`.
+  *Opt-in:* the glibc ELF is gitignored (needs the external sysroot); the initrd stages it only when present, so normal builds
+  never require the toolchain.
 - **2026-06-26** — **Track B milestone B24: `/proc` + `/sys` breadth — the introspection nodes real tools read.**
   Broadens B20's `/proc` and the existing `/sys` so memory/uptime/mount/fd-introspecting software works. **`/proc`** (in
   `procfs.c`): `meminfo` rewritten to the Linux labelled-kB format (`MemTotal`/`MemFree`/`MemAvailable`/… in kB with a `kB`
