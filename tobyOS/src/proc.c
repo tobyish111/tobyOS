@@ -1024,8 +1024,17 @@ static void wakeup_waiters(int pid) {
     }
 }
 
+/* Defined in syscall.c: if this process owns an active Linux fbdev mmap,
+ * present its final frame to the scanout before the address space is torn
+ * down (real fbdev programs draw into the mmap and exit without panning). */
+extern void fbdev_proc_exit(int pid);
+
 __attribute__((noreturn)) void proc_exit(int code) {
     struct proc *p = current_proc();
+
+    /* Track B graphics: flush a Linux /dev/fb0 mmap to the display while this
+     * process's pages are still mapped (before cli()/teardown below). */
+    if (p) fbdev_proc_exit(p->is_thread ? p->tgid : p->pid);
 
     /* B11: Linux pthread_join. If this thread registered a clear_child_tid
      * (via clone(CLONE_CHILD_CLEARTID) or set_tid_address), write 0 to that

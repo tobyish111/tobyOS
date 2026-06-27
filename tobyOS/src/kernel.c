@@ -3740,6 +3740,71 @@ void _start(void) {
     }
 #endif
 
+#ifdef OTSGFX_BOOT
+    /* Track B (Linux graphics): run a REAL, UNMODIFIED, off-the-shelf graphical
+     * Linux program on /dev/fb0 -- the busybox `fbsplash` applet from the
+     * prebuilt Alpine musl busybox (a dynamic PIE run through ld-musl). It is
+     * a genuine third-party binary we did not write: it open()s /dev/fb0,
+     * queries geometry with FBIOGET_*SCREENINFO, mmap()s the scanout, and draws
+     * a PPM image straight into the mapping (then exits WITHOUT panning -- on
+     * real hardware the mmap is the live scanout; our present-on-exit hook does
+     * the final blit). We first also run busybox `fbset` (reads the geometry
+     * via the same ioctls) as a read-only identity check. Then we sample the
+     * three RGB marker squares baked into the PPM straight off the gfx scanout,
+     * so a PASS proves an unmodified off-the-shelf binary rendered real pixels
+     * through our Linux framebuffer device. Runs before m14_init(). */
+    {
+        framebuffer_sync_mapping();
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+
+        char *fsargv[] = { (char *)"busybox-dyn", (char *)"fbset", 0 };
+        struct proc_spec fs = {
+            .path = "/bin/busybox-dyn", .name = "fbset",
+            .argc = 2, .argv = fsargv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] OTSGFX: off-the-shelf busybox `fbset` reading /dev/fb0\n");
+        int fpid = proc_spawn(&fs);
+        int frc  = (fpid < 0) ? -1 : proc_wait(fpid);
+
+        char *spargv[] = { (char *)"busybox-dyn", (char *)"fbsplash",
+                           (char *)"-s", (char *)"/etc/splash.ppm", 0 };
+        struct proc_spec sp = {
+            .path = "/bin/busybox-dyn", .name = "fbsplash",
+            .argc = 4, .argv = spargv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] OTSGFX: off-the-shelf busybox `fbsplash` drawing "
+                "/etc/splash.ppm to /dev/fb0\n");
+        int spid = proc_spawn(&sp);
+        if (spid < 0) {
+            kprintf("[OTSGFX] VERDICT: SKIP reason=no-binary (need opt-in "
+                    "programs/busybox/busybox-dyn + splash.ppm)\n");
+        } else {
+            int src = proc_wait(spid);
+            struct gfx_surface surf; gfx_surface_from_backbuf(&surf);
+            uint32_t got[3] = { 0, 0, 0 };
+            const uint32_t want[3] = { 0x00FF0000u, 0x0000FF00u, 0x000000FFu };
+            const int sx[3] = { 70, 170, 270 };
+            for (int i = 0; i < 3; i++)
+                (void)gfx_surface_get_pixels(&surf, sx[i], 60, 1, 1, &got[i]);
+            bool pix_ok = ((got[0] & 0x00FFFFFFu) == want[0]) &&
+                          ((got[1] & 0x00FFFFFFu) == want[1]) &&
+                          ((got[2] & 0x00FFFFFFu) == want[2]);
+            kprintf("[boot] OTSGFX: fbset exit=%d fbsplash exit=%d; marker "
+                    "pixels R=%06x G=%06x B=%06x (expect ff0000/00ff00/0000ff)\n",
+                    frc, src, (unsigned)(got[0] & 0x00FFFFFFu),
+                    (unsigned)(got[1] & 0x00FFFFFFu),
+                    (unsigned)(got[2] & 0x00FFFFFFu));
+            kprintf("[OTSGFX] VERDICT: %s fbset=%d fbsplash=%d markers=%s (an "
+                    "UNMODIFIED off-the-shelf busybox `fbsplash` mmap'd "
+                    "/dev/fb0 and rendered a PPM, and the pixels reached the "
+                    "scanout; expect fbsplash exit0 + markers ok)\n",
+                    (src == 0 && pix_ok) ? "PASS" : "FAIL", frc, src,
+                    pix_ok ? "ok" : "MISMATCH");
+            pit_sleep_ms(3000);
+        }
+    }
+#endif
+
     if (!safemode_skip_gui()) {
         /* Milestone 14: bring up settings + services + session BEFORE
          * shell_init so the desktop+login is already on screen by the

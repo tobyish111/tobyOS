@@ -1143,6 +1143,22 @@ static long fbdev_mmap(uint64_t len) {
     return base;
 }
 
+/* Present-on-exit: many real fbdev programs (e.g. busybox fbsplash) mmap the
+ * device, draw straight into the mapping, and exit WITHOUT an explicit
+ * FBIOPAN_DISPLAY -- on real hardware the mmap *is* the live scanout. Our
+ * shadow model needs a present, so we do the final blit when the owning
+ * process exits: at proc_exit the dying process's address space is still live
+ * (so copy_from_user of the shadow works) and the hardware scanout keeps the
+ * pixels after teardown. Called from proc_exit() for every exiting process. */
+void fbdev_proc_exit(int pid) {
+    if (!g_fbdev.open || !g_fbdev.user_base) return;
+    if (g_fbdev.owner_pid != pid) return;
+    (void)fbdev_present();              /* blit the final frame to the scanout */
+    g_fbdev.open = false;               /* release for the next opener */
+    g_fbdev.user_base = 0;
+    g_fbdev.user_len  = 0;
+}
+
 /* ---- Track B input: the Linux evdev device /dev/input/event0 ----------
  *
  * A genuine Linux input device: open("/dev/input/event0") -> FILE_KIND_EVDEV;
@@ -1358,6 +1374,26 @@ static long sys_open(const char *path, int flags, int mode) {
             g_evdev.nonblock = (flags & ABI_O_NONBLOCK) != 0;
             g_evdev.owner_pid = p ? (p->is_thread ? p->tgid : p->pid) : 0;
             return fd;
+        }
+        /* Console / virtual-terminal device nodes: /dev/console, /dev/tty,
+         * /dev/tty<N>. Real programs (e.g. busybox fbsplash) open the console
+         * to switch the VT to graphics mode + hide the cursor. Back them all
+         * with the kernel console; the KD/VT ioctls are accepted (see
+         * LX_ioctl). */
+        {
+            bool is_con = (strcmp(dev, "console") == 0) || (strcmp(dev, "tty") == 0);
+            if (!is_con && dev[0] == 't' && dev[1] == 't' && dev[2] == 'y') {
+                is_con = true;                       /* /dev/tty<N> */
+                for (const char *q = dev + 3; *q; q++)
+                    if (*q < '0' || *q > '9') { is_con = false; break; }
+            }
+            if (is_con) {
+                struct file *f = console_file_make();
+                if (!f) return -ABI_ENOMEM;
+                int fd = fd_alloc_into(current_proc(), f);
+                if (fd < 0) { file_close(f); return -ABI_EMFILE; }
+                return fd;
+            }
         }
     }
 
@@ -4788,8 +4824,20 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_ioctl: {
         struct file *f = fd_lookup((int)a1);
         if (!f) return -ABI_EBADF;
-        if (f->kind == FILE_KIND_CONSOLE)
-            return tty_console_ioctl((unsigned long)a2, (unsigned long)a3);
+        if (f->kind == FILE_KIND_CONSOLE) {
+            unsigned long rq = (unsigned long)a2;
+            /* KD* (0x4B00) and VT* (0x5600) console ioctls: accept as no-ops so
+             * programs that put the VT into graphics mode (e.g. fbsplash) work.
+             * Zero-fill the "get" queries (KDGETMODE/KDGKBMODE). */
+            if ((rq & 0xFF00u) == 0x4B00u || (rq & 0xFF00u) == 0x5600u) {
+                if (rq == 0x4B3Bu /*KDGETMODE*/ || rq == 0x4B44u /*KDGKBMODE*/) {
+                    int z = 0;
+                    (void)copy_to_user((void *)(uintptr_t)a3, &z, sizeof(z));
+                }
+                return 0;
+            }
+            return tty_console_ioctl(rq, (unsigned long)a3);
+        }
         if (f->kind == FILE_KIND_PTY_MASTER || f->kind == FILE_KIND_PTY_SLAVE)
             return pty_ioctl(f, (unsigned long)a2, (unsigned long)a3);
         if (f->kind == FILE_KIND_FB)

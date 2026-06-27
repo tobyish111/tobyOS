@@ -2373,6 +2373,13 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "(linux-evdev) + ld-musl loader -- OPT-IN";                 \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-evdev lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
 	fi;                                                                   \
+	if [ -f programs/fbsplash/splash.ppm ]; then                         \
+	    mkdir -p $(INITRD_STAGE)/etc;                                     \
+	    cp programs/fbsplash/splash.ppm $(INITRD_STAGE)/etc/splash.ppm;   \
+	    echo "[initrd] Track B graphics: bundling splash.ppm for the"     \
+	         "off-the-shelf busybox fbsplash demo -- OPT-IN";            \
+	    EXTRA_FILES="$$EXTRA_FILES etc/splash.ppm";                       \
+	fi;                                                                   \
 	if [ -f programs/busybox/busybox ]; then                             \
 	    cp programs/busybox/busybox $(INITRD_STAGE)/bin/busybox;          \
 	    printf '\003' | dd of=$(INITRD_STAGE)/bin/busybox bs=1 seek=7     \
