@@ -755,6 +755,23 @@ driver model; POSIX libc surface.
   tcp::18082-:8080`, `logs/b14.sh`) connects and receives its bytes echoed back — reachable only if the handshake + recv
   readiness flowed through `epoll`. No-regression: full Linux track green (`LXABI`/`LXJOIN`/`LXPOLL` all PASS), and
   `validate.sh 3 90` (default) = 3/3 ALIVE, exc/panic=0.
+- **2026-06-27** — **Track C milestone C24: PE base relocation / ASLR — every `/DYNAMICBASE` Windows PE now loads at a randomized slide.**
+  Through C23 the PE loader only ever mapped an image at its preferred `ImageBase` (`delta == 0`); the base-reloc fixup code
+  existed but was never exercised, and a real DLL (or any third-party EXE whose preferred base is occupied) could not be rebased.
+  This wires up real **ASLR**: when an image carries `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE` **and** a `.reloc` table (the default
+  for every clang/lld mingw build), `src/pe_loader.c` now loads it at a **randomized, 64 KiB-aligned slide** (16–80 MiB above
+  `ImageBase`, derived from `rdtsc`, kept inside the loader's verified user window and clear of the fixed shim/TEB/TLS/CRT pages)
+  and rewrites **every** absolute address in the image via the `IMAGE_REL_BASED_DIR64` fixups before binding imports/TLS. A new
+  first-party `win-reloc24.exe` (linked `-Wl,--dynamicbase`) proves the relocation is *correct*, not merely applied: it calls
+  through a global array of relocated **code** pointers (`fnsum==7`), dereferences relocated **data** pointers (string lengths
+  `==17`), and checks a **self-referential** relocated pointer — exiting `24` only if all three classes of fixup landed, with the
+  observed pointers (`&fns`, `main`, `a`) all at the slid base. **Proof, clean under `+smep,+smap`, 0 faults:**
+  `[pe] C24 ASLR: ImageBase=0x140000000 -> load_base=0x142dd0000 slide=0x2dd0000`, `45 DIR64 fixups`, `[WINPE24] VERDICT: PASS exit=24`
+  (`logs/c24.sh`). **No regression — this is validated at scale:** a battery of representative console PEs re-run under the always-on
+  slide all PASS at *distinct* random bases (`logs/c24regr.sh`, 8/8), **including the two large real third-party programs** — unmodified
+  upstream **SQLite** (1519 DIR64 fixups, `exit=0`) and the **Lua 5.4.7** interpreter (536 fixups, `exit=0`) — plus the CRT printf,
+  file-I/O, threads, `GetProcAddress`, and scanf proofs. The only always-compiled change is the loader's slide+reloc path (a no-op
+  for non-PE binaries, which the default desktop boot never loads); the harness is gated by `#ifdef WINPE24_BOOT`.
 - **2026-06-26** — **Track C milestone C23: wide-char / Unicode (UTF-16) — wide CRT strings, the `wprintf` family, and `%ls`.**
   Real Windows programs lean on `wchar_t`/UTF-16 (`wmain`, `wprintf`, `wcs*`, the `…W` APIs). The `…W` file APIs
   (`CreateFileW`, `WriteConsoleW`, `MultiByteToWideChar`, …) already worked, but the **wide CRT** was a near-total gap

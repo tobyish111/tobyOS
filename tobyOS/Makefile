@@ -1512,6 +1512,16 @@ programs/win-tls18b/win-tls18b.exe: programs/win-tls18b/main.c
 programs/win-shell18d/win-shell18d.exe: programs/win-shell18d/main.c
 	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $< -lshell32
 
+# Track C/C24: a STOCK console .exe linked with --dynamicbase (ASLR) so the PE
+# keeps its .reloc table + IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE. tobyOS loads it
+# at a randomized 64KB-aligned slide and rewrites all absolute addresses via the
+# base-reloc fixups; the program proves relocated CODE + DATA + self pointers
+# still resolve (exit 24). --high-entropy-va is disabled to keep the slide inside
+# the loader's verified user window.
+programs/win-reloc24/win-reloc24.exe: programs/win-reloc24/main.c
+	$(CC) --target=x86_64-w64-mingw32 -O1 -o $@ $< \
+	      -Wl,--dynamicbase -Wl,--disable-high-entropy-va
+
 # Track C/C7: a STOCK Win32 GUI .exe (Windows subsystem) -- RegisterClass +
 # CreateWindowEx + a GetMessage/DispatchMessage loop whose WndProc draws via
 # BeginPaint/FillRect/TextOut. Proves the user32/gdi32 -> SYS_GUI_* bridge incl.
@@ -2013,6 +2023,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/win-printf21/win-printf21.exe \
                programs/win-scan22/win-scan22.exe \
                programs/win-wide23/win-wide23.exe \
+               programs/win-reloc24/win-reloc24.exe \
                programs/win-xprod/win-xprod.exe \
                programs/win-xcons/win-xcons.exe \
                programs/win-xfilter/win-xfilter.exe \
@@ -2131,6 +2142,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/win-printf21/win-printf21.exe         $(INITRD_STAGE)/bin/win-printf21.exe
 	cp programs/win-scan22/win-scan22.exe             $(INITRD_STAGE)/bin/win-scan22.exe
 	cp programs/win-wide23/win-wide23.exe             $(INITRD_STAGE)/bin/win-wide23.exe
+	cp programs/win-reloc24/win-reloc24.exe           $(INITRD_STAGE)/bin/win-reloc24.exe
 	cp programs/win-xprod/win-xprod.exe               $(INITRD_STAGE)/bin/win-xprod.exe
 	cp programs/win-xcons/win-xcons.exe               $(INITRD_STAGE)/bin/win-xcons.exe
 	cp programs/win-xfilter/win-xfilter.exe           $(INITRD_STAGE)/bin/win-xfilter.exe
@@ -2488,7 +2500,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-srv17.exe bin/win-udp17.exe bin/win-sqlite.exe        \
 	    bin/win-font18c.exe bin/win-lua.exe bin/win-com19c.exe        \
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
-	    bin/win-wide23.exe                                            \
+	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
 	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \

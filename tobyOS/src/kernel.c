@@ -5358,6 +5358,40 @@ void _start(void) {
     }
 #endif
 
+#ifdef WINPE24_BOOT
+    /* Track C -- PE base relocation / ASLR, milestone C24. Build
+     * EXTRA_CFLAGS+=-DWINPE24_BOOT. /bin/win-reloc24.exe is a clang/ucrt PE
+     * linked with --dynamicbase, so it keeps its .reloc table and the loader
+     * (src/pe_loader.c) loads it at a RANDOMIZED 64KB-aligned slide above its
+     * preferred ImageBase, rewriting every absolute address via the base-reloc
+     * fixups. The program calls through relocated CODE pointers, dereferences
+     * relocated DATA pointers, and checks a self-referential relocated pointer,
+     * exiting 24 ONLY if every fixup landed correctly. The "[pe] C24 ASLR" +
+     * "[pe] C24 relocations applied" log lines (load_base != ImageBase, nfix>0)
+     * are the kernel-side proof the slide really happened. */
+    {
+        win32_gui_set_log(true);
+        kprintf("[boot] WINPE24: spawning /bin/win-reloc24.exe (ASLR + base reloc)\n");
+        char *argv[] = { (char *)"win-reloc24.exe", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/win-reloc24.exe", .name = "win-reloc24.exe",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[WINPE24] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] WINPE24: /bin/win-reloc24.exe (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[WINPE24] VERDICT: %s exit=%d (expect 24; relocated code+data+"
+                    "self pointers resolve at a slid base)\n",
+                    rc == 24 ? "PASS" : "FAIL", rc);
+        }
+        win32_gui_set_log(false);
+    }
+#endif
+
 #ifdef WINPE16D_BOOT
     /* Track C -- TTF everywhere (Win32 UI text), milestone C16d. Build
      * EXTRA_CFLAGS+=-DWINPE16D_BOOT. Re-runs the C14a control gallery

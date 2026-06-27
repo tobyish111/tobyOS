@@ -37,6 +37,10 @@
 #include <tobyos/uaccess.h>
 #include <tobyos/pe.h>
 #include <tobyos/abi/abi.h>
+#include <tobyos/perf.h>
+
+/* IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: the PE opted into ASLR (C24). */
+#define PE_DLLCHAR_DYNAMIC_BASE 0x0040u
 
 /* ---- PE/COFF on-disk structures (all little-endian, packed) ---- */
 
@@ -631,17 +635,44 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
                 "user range\n", (void *)image_base, (unsigned long)size_of_image);
         return -1;
     }
-    uint64_t load_base = image_base;
-    int64_t  delta     = (int64_t)(load_base - image_base);   /* 0 for C1 */
 
     const struct pe_data_dir *dirs = (const struct pe_data_dir *)
         ((const uint8_t *)opt + sizeof(*opt));
     const struct pe_section *secs = (const struct pe_section *)
         ((const uint8_t *)opt + coff->opt_header_size);
 
+    uint64_t load_base = image_base;
+    int64_t  delta     = 0;                                   /* 0 == load at ImageBase */
+
+    /* ---- C24: ASLR / base relocation -----------------------------------
+     * If the image opted into dynamic basing (linked with --dynamicbase, which
+     * sets IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE and keeps the .reloc table),
+     * load it at a RANDOMIZED, 64KB-aligned slide instead of its preferred
+     * ImageBase and let step 3 rewrite every absolute address via the base-reloc
+     * fixups. This exercises the relocation engine (a prerequisite for loading
+     * real DLLs and third-party PEs whose preferred base is occupied). The slide
+     * stays in [16 MiB, ~80 MiB) above ImageBase: a mingw EXE bases at ~5 GiB, so
+     * the slid image stays far above the fixed shim/TEB/TLS/CRT pages (all
+     * < 0x32000000) and far below the user stack (0x800000000000). */
+    bool has_reloc = (opt->num_data_dirs > PE_DIR_BASERELOC) &&
+                     dirs[PE_DIR_BASERELOC].rva && dirs[PE_DIR_BASERELOC].size;
+    if ((opt->dll_characteristics & PE_DLLCHAR_DYNAMIC_BASE) && has_reloc) {
+        uint64_t r     = (perf_rdtsc() >> 8) & 0x3FFu;        /* 0..1023 */
+        uint64_t slide = 0x01000000ULL + (r << 16);           /* 16 MiB + n*64 KiB */
+        if (image_base + slide + size_of_image <= 0x0000800000000000ULL) {
+            load_base = image_base + slide;
+            delta     = (int64_t)(load_base - image_base);
+        }
+    }
+
     kprintf("[pe] PE32+ base=%p size=0x%lx entry_rva=0x%x sections=%u dirs=%u\n",
             (void *)load_base, (unsigned long)size_of_image,
             opt->entry_point_rva, coff->num_sections, opt->num_data_dirs);
+    if (delta != 0)
+        kprintf("[pe] C24 ASLR: ImageBase=%p -> load_base=%p slide=0x%lx "
+                "(reloc dir rva=0x%x size=0x%x)\n",
+                (void *)image_base, (void *)load_base, (unsigned long)delta,
+                dirs[PE_DIR_BASERELOC].rva, dirs[PE_DIR_BASERELOC].size);
 
     /* ---- 1. map the image span + the shim page (RW, user) ---- */
     if (!pe_map_user(load_base, load_base + size_of_image)) {
@@ -754,6 +785,7 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
         unsigned long uf = uaccess_begin();
         const uint8_t *rp  = (const uint8_t *)(load_base + dirs[PE_DIR_BASERELOC].rva);
         const uint8_t *end = rp + dirs[PE_DIR_BASERELOC].size;
+        uint32_t nfix = 0;
         while (rp + sizeof(struct pe_base_reloc) <= end) {
             const struct pe_base_reloc *blk = (const struct pe_base_reloc *)rp;
             if (blk->block_size < sizeof(*blk)) break;
@@ -763,11 +795,14 @@ int pe_load_user(const void *image, size_t size, int argc, char **argv,
                 if ((e[j] >> 12) == PE_RELOC_DIR64) {
                     uint64_t *patch = (uint64_t *)(load_base + blk->page_rva + (e[j] & 0xFFF));
                     *patch += (uint64_t)delta;
+                    nfix++;
                 }
             }
             rp += blk->block_size;
         }
         uaccess_end(uf);
+        kprintf("[pe] C24 relocations applied: %u DIR64 fixups (delta=0x%lx)\n",
+                nfix, (unsigned long)delta);
     }
 
     /* ---- 4. bind the IAT to the Win32 shim thunks ---- */
