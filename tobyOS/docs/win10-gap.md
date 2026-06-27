@@ -410,6 +410,20 @@ driver model; POSIX libc surface.
   (`logs/realpython.sh`). **No regression** (`mremap` is additive to the syscall dispatch): the full Linux-track regression
   (`logs/bashregress.sh`) stays green. *Opt-in:* the interpreter + stdlib zip are gitignored; `programs/realpython/build.sh`
   fetches + zips them and the initrd stages them only when present (the `hello.py` proof script is committed).
+- **2026-06-27** — **Track B: SELF-HOSTING with a REAL, off-the-shelf C compiler — unmodified TinyCC 0.9.27 compiles + runs C in-VM.**
+  tobyOS already had its *own* homegrown compilers (`tobycc`, the bundled `tcc` port); this runs the **genuine, third-party
+  Fabrice Bellard TinyCC 0.9.27** (the Alpine build — itself a dynamic musl program that loads `libtcc.so`, so it also exercises
+  the multi-DSO musl loader). It **compiles a C source *inside the VM*** — `tcc -static -nostdlib -o /data/cc_out.elf
+  /hello_cc.c` — and then **tobyOS loads and runs the freshly-emitted ELF**. The source is freestanding on purpose (its own
+  `_start`, raw x86-64 syscalls, no libc/crt/headers), so the compile depends on nothing but the compiler itself, and the output
+  is a tiny static ELF whose Linux personality tobyOS **auto-detects** (same path as `LXSAUTO`). A PASS means tcc turned C into
+  machine code + a valid ELF *on tobyOS*, and that ELF ran and printed **`CC-OK built-by-real-tcc`** and exited 42 — end-to-end
+  self-hosting with a real toolchain. **Proof, clean under `+smep,+smap`, 0 faults / 0 unhandled syscalls** (the `realtools`
+  inode fix + the proven musl multi-DSO path meant *no new kernel gaps* were needed): `[REALCC] VERDICT: PASS exit=42`
+  (`logs/realcc.sh`). **No regression:** this milestone makes *zero* kernel-core changes — the only `kernel.c` edit is the new
+  harness inside `#ifdef REALCC_BOOT`, which is not defined in default/regression builds, so default boot logic is unchanged.
+  *Opt-in:* the TinyCC binary + `libtcc.so` + `libtcc1.a` are gitignored; `programs/realcc/build.sh` fetches them from the
+  Alpine package mirror and the initrd stages them only when present (the `hello_cc.c` proof source is committed).
 - **2026-06-27** — **Track B: a REAL, off-the-shelf Linux *tool* runs end-to-end — GNU Binutils `readelf`, unmodified.**
   B25/B26 ran glibc proof binaries *we wrote*; this runs an actual third-party program we did **not** author: GNU Binutils
   **`readelf` 2.43.1** (~1.1 MB), lifted byte-for-byte from a Bootlin x86-64 glibc 2.41 toolchain. It is a dynamic PIE

@@ -2412,6 +2412,26 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "(dynamic musl, brandelf EI_OSABI=Linux) + zipimport stdlib -- OPT-IN"; \
 	    EXTRA_FILES="$$EXTRA_FILES bin/python3 lib/python310.zip hello.py lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
 	fi;                                                                   \
+	if [ -f programs/realcc/tcc ] &&                                     \
+	   [ -f programs/realcc/libtcc.so ] &&                               \
+	   [ -f programs/realcc/tcclib/libtcc1.a ] &&                        \
+	   [ -f programs/busybox/ld-musl-x86_64.so.1 ]; then                 \
+	    mkdir -p $(INITRD_STAGE)/lib $(INITRD_STAGE)/usr/lib/tcc;         \
+	    cp programs/realcc/tcc $(INITRD_STAGE)/bin/realcc;                \
+	    printf '\003' | dd of=$(INITRD_STAGE)/bin/realcc bs=1 seek=7      \
+	         count=1 conv=notrunc 2>/dev/null;                           \
+	    cp programs/realcc/libtcc.so $(INITRD_STAGE)/usr/lib/libtcc.so;   \
+	    cp programs/realcc/tcclib/libtcc1.a                              \
+	         $(INITRD_STAGE)/usr/lib/tcc/libtcc1.a;                      \
+	    cp programs/realcc/hello_cc.c $(INITRD_STAGE)/hello_cc.c;         \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/ld-musl-x86_64.so.1;                    \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/libc.musl-x86_64.so.1;                  \
+	    echo "[initrd] realcc: bundling UNMODIFIED TinyCC 0.9.27"        \
+	         "(dynamic musl + libtcc.so) for in-VM self-hosting -- OPT-IN"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/realcc usr/lib/libtcc.so usr/lib/tcc/libtcc1.a hello_cc.c lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
+	fi;                                                                   \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \

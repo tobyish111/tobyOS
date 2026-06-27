@@ -6170,6 +6170,67 @@ void _start(void) {
     }
 #endif
 
+#ifdef REALCC_BOOT
+    /* Track B: SELF-HOSTING with a REAL, UNMODIFIED, off-the-shelf C COMPILER.
+     * tobyOS already has its OWN homegrown compilers (tobycc / the bundled tcc
+     * port); this runs the genuine, third-party Fabrice Bellard TinyCC 0.9.27
+     * (the Alpine build -- a dynamic musl program that itself loads libtcc.so,
+     * so it also exercises the multi-DSO musl loader). It COMPILES a C source
+     * IN THE VM (/hello_cc.c -> /data/cc_out.elf) and then tobyOS LOADS AND RUNS
+     * the freshly-emitted ELF. The source is freestanding (raw syscalls, no libc
+     * /crt), so the compile depends on nothing but the compiler. A PASS means
+     * tcc turned C into machine code + a valid ELF, and that ELF ran and exited
+     * 42 -- end-to-end self-hosting with a real toolchain. */
+    {
+        char *cc_argv[] = {
+            (char *)"tcc", (char *)"-B/usr/lib/tcc",
+            (char *)"-static", (char *)"-nostdlib",
+            (char *)"-o", (char *)"/data/cc_out.elf",
+            (char *)"/hello_cc.c", 0,
+        };
+        char *cc_envp[] = {
+            (char *)"PATH=/bin", (char *)"HOME=/",
+            (char *)"LD_LIBRARY_PATH=/usr/lib:/lib", 0,
+        };
+        struct proc_spec cc_spec = {
+            .path = "/bin/realcc", .name = "tcc",
+            .argc = 7, .argv = cc_argv, .envc = 3, .envp = cc_envp,
+        };
+        kprintf("[boot] REALCC: invoking REAL TinyCC to compile "
+                "/hello_cc.c -> /data/cc_out.elf\n");
+        int cpid = proc_spawn(&cc_spec);
+        if (cpid < 0) {
+            kprintf("[boot] REALCC: /bin/realcc not present -- SKIPPED\n");
+            kprintf("[REALCC] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int crc = proc_wait(cpid);
+            kprintf("[boot] REALCC: tcc (pid=%d) exit=%d\n", cpid, crc);
+            if (crc != 0) {
+                kprintf("[REALCC] VERDICT: FAIL (tcc compile exit=%d)\n", crc);
+            } else {
+                char *r_argv[] = { (char *)"cc_out", 0 };
+                char *r_envp[] = { (char *)"PATH=/bin", 0 };
+                struct proc_spec r_spec = {
+                    .path = "/data/cc_out.elf", .name = "cc_out",
+                    .argc = 1, .argv = r_argv, .envc = 1, .envp = r_envp,
+                };
+                kprintf("[boot] REALCC: running the freshly-compiled "
+                        "/data/cc_out.elf\n");
+                int rpid = proc_spawn(&r_spec);
+                if (rpid < 0) {
+                    kprintf("[REALCC] VERDICT: FAIL (cannot exec compiled ELF)\n");
+                } else {
+                    int rrc = proc_wait(rpid);
+                    kprintf("[boot] REALCC: compiled program exit=%d\n", rrc);
+                    kprintf("[REALCC] VERDICT: %s exit=%d (REAL TinyCC compiled "
+                            "C -> ELF in-VM, tobyOS ran it; expect 42)\n",
+                            rrc == 42 ? "PASS" : "FAIL", rrc);
+                }
+            }
+        }
+    }
+#endif
+
 #ifdef XPIPE_BOOT
     /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
      * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux

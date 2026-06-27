@@ -52,6 +52,15 @@ programs/realpython/python310.zip
 programs/realpython/*.tar.gz
 programs/realpython/extract/
 
+# Track B/realcc: opt-in UNMODIFIED TinyCC 0.9.27 (dynamic musl) fetched
+# out-of-tree via programs/realcc/build.sh (not committed). build.sh and the
+# tiny hello_cc.c proof source ARE committed.
+programs/realcc/tcc
+programs/realcc/libtcc.so
+programs/realcc/tcclib/
+programs/realcc/*.apk
+programs/realcc/extract/
+
 # Bootable images / filesystems produced by the build
 *.iso
 disk.img
