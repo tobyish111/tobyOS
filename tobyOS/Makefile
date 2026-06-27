@@ -2298,6 +2298,22 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "/etc/drvtest_now baked into initrd";                        \
 	    EXTRA_FILES="$$EXTRA_FILES etc/drvtest_now";                      \
 	fi;                                                                   \
+	if [ -f programs/linux-glibc-dyn/linux-glibc-dyn.elf ] &&            \
+	   [ -f programs/linux-glibc-dyn/lib/libc.so.6 ] &&                  \
+	   [ -f programs/linux-glibc-dyn/lib/ld-linux-x86-64.so.2 ]; then    \
+	    mkdir -p $(INITRD_STAGE)/lib;                                     \
+	    cp programs/linux-glibc-dyn/linux-glibc-dyn.elf                  \
+	         $(INITRD_STAGE)/bin/linux-glibc-dyn;                        \
+	    cp programs/linux-glibc-dyn/lib/ld-linux-x86-64.so.2             \
+	         $(INITRD_STAGE)/lib/ld-linux-x86-64.so.2;                   \
+	    cp programs/linux-glibc-dyn/lib/libc.so.6                        \
+	         $(INITRD_STAGE)/lib/libc.so.6;                              \
+	    cp programs/linux-glibc-dyn/lib/libm.so.6                        \
+	         $(INITRD_STAGE)/lib/libm.so.6;                              \
+	    echo "[initrd] Track B/B26: bundling DYNAMIC glibc proof +"      \
+	         "ld-linux-x86-64.so.2 + libc.so.6/libm.so.6 -- OPT-IN";     \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-glibc-dyn lib/ld-linux-x86-64.so.2 lib/libc.so.6 lib/libm.so.6"; \
+	fi;                                                                   \
 	if [ -f programs/busybox/busybox ]; then                             \
 	    cp programs/busybox/busybox $(INITRD_STAGE)/bin/busybox;          \
 	    printf '\003' | dd of=$(INITRD_STAGE)/bin/busybox bs=1 seek=7     \

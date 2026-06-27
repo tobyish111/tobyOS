@@ -321,9 +321,23 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
         if (ph->p_filesz) {
             memcpy((void *)seg_vaddr, bytes + ph->p_offset, ph->p_filesz);
         }
-        if (ph->p_memsz > ph->p_filesz) {
-            memset((void *)(seg_vaddr + ph->p_filesz), 0,
-                   ph->p_memsz - ph->p_filesz);
+        /* Zero from the end of the file-backed data all the way to the
+         * page-rounded end of the segment (virt_hi). This clears the BSS
+         * [filesz, memsz) AND the tail of the final mapped page
+         * [memsz, virt_hi). ensure_writable_pages() hands out fresh
+         * pmm_alloc_page() frames WITHOUT zeroing, so that tail would
+         * otherwise hold stale physical-page content. Linux guarantees the
+         * BSS page-tail reads as zero, and glibc's ld.so minimal allocator
+         * (__minimal_malloc) places its first objects -- including the main
+         * executable's link_map -- in exactly that &_end..page-end region,
+         * trusting it to be zero. Leaving garbage there corrupts l_info and
+         * #GPs in dl_main. Matching Linux's zero-fill-to-page-boundary fixes
+         * dynamic glibc (B26) and is correct for every other segment too. */
+        {
+            uint64_t zero_from = seg_vaddr + ph->p_filesz;
+            if (virt_hi > zero_from) {
+                memset((void *)zero_from, 0, virt_hi - zero_from);
+            }
         }
         uaccess_end(uflags);
         loaded++;

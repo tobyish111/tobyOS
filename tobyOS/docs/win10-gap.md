@@ -357,6 +357,27 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-27** — **Track B milestone B26: a REAL glibc *DYNAMIC* binary runs — ld-linux.so.2 + shared libc.so.6.**
+  B25 ran static glibc; B26 closes the single biggest remaining Linux-app gap by running an actual **glibc 2.41** *dynamically*
+  linked PIE — the shape essentially every off-the-shelf Linux distro binary takes. The ELF is UNBRANDED (`EI_OSABI=SysV`) and
+  declares `PT_INTERP=/lib/ld-linux-x86-64.so.2` + `DT_NEEDED libc.so.6/libm.so.6`; the kernel loads BOTH the PIE and glibc's
+  ld.so and hands ld.so the auxv, and glibc's loader self-relocates, opens + file-backed-mmaps `libc.so.6` from the initrd
+  `/lib`, relocates it, builds the DTV/TLS, and resolves PLT entries. A PASS therefore *also* proves the PT_INTERP-based
+  Linux-personality auto-detect fires for a stock dynamic glibc binary. The proof goes one step past startup: a **runtime
+  `dlopen("libm.so.6")` + `dlsym("cos")`** forces ld.so to open/map/relocate a *fresh* DSO long after startup — the hardest
+  dynamic-loader path there is. **Root-cause kernel fix (general correctness):** glibc's ld.so minimal allocator
+  (`__minimal_malloc`) places its first objects — including the main executable's `link_map` — in the tail of ld.so's own last
+  BSS page (`&_end .. page-end`), trusting the OS to have zero-filled it (Linux guarantees this). tobyOS's ELF loader
+  (`elf.c`) mapped fresh `pmm_alloc_page()` frames *without zeroing* and only zeroed `[filesz, memsz)`, leaving the page tail
+  `[memsz, page-end)` as stale physical-page content (old code). That garbage landed in `link_map->l_info[]`, and `dl_main`'s
+  dynamic-info adjust loop `#GP`'d on the non-canonical pointer. Fix: zero from end-of-file-data all the way to the
+  page-rounded segment end, matching Linux's zero-fill-to-page-boundary — correct for *every* ELF, not just glibc. **Proof,
+  clean under `+smep,+smap`, 0 faults:** `[LXGLIBCDYN] VERDICT: PASS exit=127` (`logs/b26.sh`) — all 7 checks: stdio, heap,
+  float `sprintf`, `clock_gettime`, `getpid`, **pthread** (clone3+futex+TLS through the shared libc), and **runtime dlopen**.
+  **No regression** (the loader change touches a core path, so the full dynamic battery was re-run): static musl busybox
+  `[LXBB] PASS 10/10`, **dynamic musl busybox `[LXDYN] PASS 7/7` (ld-musl path unaffected)**, static glibc `[LXGLIBC] PASS
+  exit=63`, and a stock desktop boot runs every native-ELF boot demo with 0 panics. *Opt-in:* the dynamic ELF + glibc
+  `.so`s are gitignored (need the external sysroot); the initrd stages them only when present (`programs/linux-glibc-dyn/build.sh`).
 - **2026-06-26** — **Track X capstone X2: one pipeline through ALL THREE personalities — Windows .exe -> Linux tool -> tobyOS GUI.**
   X1 proved Windows<->Linux pipelines over kernel pipes; X2 is the signature tobyOS trick taken to its conclusion: a single
   busybox `sh` pipeline whose bytes flow through a genuine Win32 PE, a real Linux/musl binary, AND a native tobyOS GUI app no

@@ -5901,6 +5901,40 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXGLIBCDYN_BOOT
+    /* Track B/B26: run a REAL glibc (2.41) *DYNAMICALLY* linked x86-64 Linux
+     * binary. Where B25 proved static glibc, this proves the full dynamic path:
+     * the PIE declares PT_INTERP=/lib/ld-linux-x86-64.so.2 + DT_NEEDED
+     * libc.so.6/libm.so.6, the kernel loads BOTH the PIE and glibc's ld.so and
+     * hands ld.so the auxv; ld.so then self-relocates, opens + file-backed-mmaps
+     * libc.so.6 from the initrd /lib, relocates it, builds the DTV/TLS, and
+     * resolves PLT entries. The binary is UNBRANDED (EI_OSABI=SysV), so a PASS
+     * also proves the PT_INTERP-based Linux-personality auto-detect on a stock
+     * dynamic glibc binary. Core checks -> 63; +runtime dlopen("libm.so.6") ->
+     * 127. The ELF + glibc .so's are prebuilt out-of-tree
+     * (programs/linux-glibc-dyn/build.sh) and staged opt-in. */
+    {
+        char *argv[] = { (char *)"linux-glibc-dyn", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-glibc-dyn", .name = "linux-glibc-dyn",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] LXGLIBCDYN: spawning /bin/linux-glibc-dyn (real DYNAMIC glibc 2.41)\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LXGLIBCDYN: not present -- SKIPPED\n");
+            kprintf("[LXGLIBCDYN] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] LXGLIBCDYN: linux-glibc-dyn (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[LXGLIBCDYN] VERDICT: %s exit=%d (ld.so relocate + shared "
+                    "libc; core=63, core+dlopen=127)\n",
+                    (rc == 63 || rc == 127) ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
 #ifdef XPIPE_BOOT
     /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
      * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux
