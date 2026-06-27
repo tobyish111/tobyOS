@@ -108,6 +108,7 @@ extern "C" {
 #define ABI_EINVAL          22   /* invalid argument */
 #define ABI_EMFILE          24   /* too many open files (per-proc cap) */
 #define ABI_ENOSPC          28   /* no space left on device */
+#define ABI_ESPIPE          29   /* illegal seek (pread/pwrite on pipe) */
 #define ABI_EROFS           30   /* read-only filesystem */
 #define ABI_EPIPE           32   /* broken pipe */
 #define ABI_ERANGE          34   /* result out of range */

@@ -357,6 +357,23 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-27** — **Track B: a REAL, off-the-shelf Linux *tool* runs end-to-end — GNU Binutils `readelf`, unmodified.**
+  B25/B26 ran glibc proof binaries *we wrote*; this runs an actual third-party program we did **not** author: GNU Binutils
+  **`readelf` 2.43.1** (~1.1 MB), lifted byte-for-byte from a Bootlin x86-64 glibc 2.41 toolchain. It is a dynamic PIE
+  (`PT_INTERP=/lib64/ld-linux-x86-64.so.2`, `NEEDED libc.so.6`), so it re-drives the whole B26 glibc dynamic-loader path **and**
+  a large real-world libc surface the toy proofs never touch: `getopt_long` option parsing, locale/gettext probing, the full
+  `printf` family, and — the tool's actual job — `open()`/`mmap()`/parse of *another* ELF off the initrd, formatted to stdout.
+  Run three ways, each `exit=0`: `readelf --version` → `GNU readelf (GNU Binutils) 2.43.1`; `readelf -h /bin/hello` →
+  `Class: ELF64 / Type: EXEC / Machine: Advanced Micro Devices X86-64`; `readelf -dl /bin/readelf` → the `INTERP` segment +
+  `NEEDED libc.so.6`. **Kernel gap fixed:** `pread64` (syscall **17**) — and its sibling `pwrite64` (18) — were unimplemented
+  (`-ENOSYS`). glibc's loader (`dl-load.c open_verify`) `pread64()`s every DSO's ELF header/phdrs, and `readelf` `pread64()`s
+  the file it inspects, so both died immediately. Added `sys_pread64`/`sys_pwrite64`: positioned I/O that saves/restores
+  `file.vfs.pos` so the current offset is undisturbed, `ESPIPE` on non-seekable fds — matching Linux. **Proof, clean under
+  `+smep,+smap`, 0 faults / 0 unhandled syscalls:** `[REALTOOL] VERDICT: PASS pass=3/3` (`logs/realtool.sh`). **No regression**
+  (touches the core syscall dispatch): static musl busybox `[LXBB] PASS 10/10`, dynamic musl busybox `[LXDYN] PASS 7/7`, static
+  glibc `[LXGLIBC] PASS exit=63`, dynamic glibc `[LXGLIBCDYN] PASS exit=127`, and a stock desktop boot reaches login with 0
+  panics. *Opt-in:* the GNU binary + glibc runtime are gitignored (need the external toolchain); the initrd stages them under
+  `/lib64` only when present (`programs/realtool/build.sh`).
 - **2026-06-27** — **Track B milestone B26: a REAL glibc *DYNAMIC* binary runs — ld-linux.so.2 + shared libc.so.6.**
   B25 ran static glibc; B26 closes the single biggest remaining Linux-app gap by running an actual **glibc 2.41** *dynamically*
   linked PIE — the shape essentially every off-the-shelf Linux distro binary takes. The ELF is UNBRANDED (`EI_OSABI=SysV`) and

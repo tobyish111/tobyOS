@@ -236,6 +236,48 @@ static long sys_read(int fd, void *buf, size_t len) {
     return rv;
 }
 
+/* pread64/pwrite64: positioned I/O that does NOT disturb the file's current
+ * offset. glibc's dynamic loader (dl-load.c open_verify) pread64()s the ELF
+ * header + program headers of every shared object it maps, and real tools like
+ * GNU readelf pread64() the file they inspect, so this is on the critical path
+ * for off-the-shelf dynamic Linux binaries. Only regular (seekable) VFS files
+ * support it; pipes/sockets/ttys are unseekable -> ESPIPE, matching Linux. */
+static long sys_pread64(int fd, void *buf, size_t len, int64_t offset) {
+    if (len == 0) return 0;
+    if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+    if (offset < 0) return -ABI_EINVAL;
+    if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
+    struct file *f = fd_lookup(fd);
+    if (!f) return -ABI_EBADF;
+    if (f->kind != FILE_KIND_VFS) return -ABI_ESPIPE;
+    void *k = kmalloc(len);
+    if (!k) return -ABI_ENOMEM;
+    size_t saved = f->vfs.pos;
+    f->vfs.pos = (size_t)offset;
+    long rv = file_read(f, k, len);
+    f->vfs.pos = saved;          /* positioned read must not move the offset */
+    if (rv > 0 && copy_to_user(buf, k, (size_t)rv) != 0) rv = -ABI_EFAULT;
+    kfree(k);
+    return rv;
+}
+
+static long sys_pwrite64(int fd, const void *buf, size_t len, int64_t offset) {
+    if (len == 0) return 0;
+    if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+    if (offset < 0) return -ABI_EINVAL;
+    struct file *f = fd_lookup(fd);
+    if (!f) return -ABI_EBADF;
+    if (f->kind != FILE_KIND_VFS) return -ABI_ESPIPE;
+    void *k = bounce_in(buf, len);
+    if (!k) return -ABI_EFAULT;
+    size_t saved = f->vfs.pos;
+    f->vfs.pos = (size_t)offset;
+    long rv = file_write(f, k, len);
+    f->vfs.pos = saved;
+    kfree(k);
+    return rv;
+}
+
 /* SYS_PIPE: returns two fds. user_fds_out points at int[2] in userspace. */
 static long sys_pipe(int *user_fds_out) {
     struct file *r = 0, *w = 0;
@@ -2940,7 +2982,8 @@ enum {
     LX_stat = 4, LX_fstat = 5, LX_lstat = 6, LX_lseek = 8, LX_mmap = 9,
     LX_mprotect = 10, LX_munmap = 11, LX_brk = 12,
     LX_rt_sigaction = 13, LX_rt_sigprocmask = 14, LX_rt_sigreturn = 15,
-    LX_ioctl = 16, LX_readv = 19, LX_writev = 20, LX_access = 21,
+    LX_ioctl = 16, LX_pread64 = 17, LX_pwrite64 = 18,
+    LX_readv = 19, LX_writev = 20, LX_access = 21,
     LX_pipe = 22, LX_sched_yield = 24, LX_dup = 32, LX_dup2 = 33,
     LX_nanosleep = 35,
     LX_sendfile = 40, LX_getpid = 39, LX_clone = 56, LX_fork = 57,
@@ -3886,6 +3929,10 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     /* ---- plain byte I/O (tobyOS handlers already take user buffers) ---- */
     case LX_read:   return sys_read((int)a1, (void *)a2, (size_t)a3);
     case LX_write:  return sys_write((int)a1, (const void *)a2, (size_t)a3);
+    case LX_pread64:
+        return sys_pread64((int)a1, (void *)a2, (size_t)a3, (int64_t)a4);
+    case LX_pwrite64:
+        return sys_pwrite64((int)a1, (const void *)a2, (size_t)a3, (int64_t)a4);
     case LX_close:  return do_syscall(SYS_CLOSE, a1, 0, 0, 0, 0);
     case LX_lseek:  return do_syscall(SYS_LSEEK, a1, a2, a3, 0, 0);
     case LX_open: {                    /* (path, flags, mode) */

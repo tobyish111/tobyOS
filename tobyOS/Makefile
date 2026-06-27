@@ -2353,6 +2353,19 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	        EXTRA_FILES="$$EXTRA_FILES bin/file lib/libmagic.so.1";       \
 	    fi;                                                              \
 	fi;                                                                   \
+	if [ -f programs/realtool/readelf ] &&                               \
+	   [ -f programs/realtool/lib64/ld-linux-x86-64.so.2 ] &&            \
+	   [ -f programs/realtool/lib64/libc.so.6 ]; then                    \
+	    mkdir -p $(INITRD_STAGE)/lib64;                                   \
+	    cp programs/realtool/readelf $(INITRD_STAGE)/bin/readelf;         \
+	    cp programs/realtool/lib64/ld-linux-x86-64.so.2                  \
+	         $(INITRD_STAGE)/lib64/ld-linux-x86-64.so.2;                 \
+	    cp programs/realtool/lib64/libc.so.6                             \
+	         $(INITRD_STAGE)/lib64/libc.so.6;                            \
+	    echo "[initrd] realtool: bundling UNMODIFIED GNU binutils"       \
+	         "readelf + glibc runtime under /lib64 -- OPT-IN";           \
+	    EXTRA_FILES="$$EXTRA_FILES bin/readelf lib64/ld-linux-x86-64.so.2 lib64/libc.so.6"; \
+	fi;                                                                   \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \

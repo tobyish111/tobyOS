@@ -26,6 +26,11 @@ programs/busybox/libmagic.so.1
 # loader + shared libs fetched out-of-tree via programs/linux-glibc-dyn/build.sh).
 programs/linux-glibc-dyn/lib/
 
+# Track B/realtool: opt-in UNMODIFIED GNU binutils readelf + glibc runtime,
+# lifted from the Bootlin toolchain via programs/realtool/build.sh (not committed).
+programs/realtool/readelf
+programs/realtool/lib64/
+
 # Bootable images / filesystems produced by the build
 *.iso
 disk.img

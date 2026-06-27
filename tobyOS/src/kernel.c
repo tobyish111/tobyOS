@@ -5935,6 +5935,70 @@ void _start(void) {
     }
 #endif
 
+#ifdef REALTOOL_BOOT
+    /* Track B: run a REAL, UNMODIFIED, off-the-shelf Linux program end-to-end.
+     * Where B25/B26 ran glibc proof binaries *we* wrote, this runs an actual GNU
+     * binutils tool -- `readelf` (~1.1 MB, lifted byte-for-byte from a Bootlin
+     * x86-64 glibc 2.41 toolchain). It is a dynamic PIE
+     * (PT_INTERP=/lib64/ld-linux-x86-64.so.2, NEEDED libc.so.6), so it re-drives
+     * the whole B26 glibc dynamic-loader path AND a large real-world libc surface
+     * the toy proofs never touch: getopt_long option parsing, locale/gettext
+     * probing, the full printf family, and -- the point of the tool -- open()ing,
+     * mmap()ing and parsing another ELF off the initrd, then formatting the
+     * result to stdout. The runtime (ld.so + libc.so.6) is staged under /lib64
+     * (no collision with B26's /lib) and we also set LD_LIBRARY_PATH=/lib64.
+     *
+     * We invoke it three ways, each must exit 0:
+     *   readelf --version          -> proves identity ("GNU readelf ...")
+     *   readelf -h /bin/hello       -> dumps a native ELF64 header
+     *   readelf -dl /bin/readelf    -> program headers + dynamic (INTERP/NEEDED)
+     * stdout goes to the console, so the serial log carries the genuine GNU
+     * output the proof script greps for ("GNU readelf", "ELF64", "NEEDED"). */
+    {
+        static const char *targ[][5] = {
+            { "readelf", "--version", 0, 0, 0 },
+            { "readelf", "-h", "/bin/hello", 0, 0 },
+            { "readelf", "-dl", "/bin/readelf", 0, 0 },
+        };
+        static const char *tdesc[] = {
+            "--version (identity)", "-h /bin/hello (ELF header)",
+            "-dl /bin/readelf (phdrs + dynamic)",
+        };
+        char *envp[] = {
+            (char *)"PATH=/bin", (char *)"HOME=/",
+            (char *)"LD_LIBRARY_PATH=/lib64", 0,
+        };
+        int tn = (int)(sizeof(targ) / sizeof(targ[0]));
+        int tpass = 0, trun = 0;
+        for (int t = 0; t < tn; t++) {
+            int ac = 0;
+            while (ac < 4 && targ[t][ac]) ac++;
+            struct proc_spec spec = {
+                .path = "/bin/readelf", .name = "readelf",
+                .argc = ac, .argv = (char **)targ[t],
+                .envc = 3, .envp = envp,
+            };
+            kprintf("[boot] REALTOOL: spawning GNU readelf %s\n", tdesc[t]);
+            int pid = proc_spawn(&spec);
+            if (pid < 0) {
+                kprintf("[boot] REALTOOL: /bin/readelf not present -- SKIPPED\n");
+                kprintf("[REALTOOL] VERDICT: SKIP reason=no-binary\n");
+                trun = -1;
+                break;
+            }
+            int rc = proc_wait(pid);
+            trun++;
+            if (rc == 0) tpass++;
+            kprintf("[REALTOOL] case %d (%s) exit=%d %s\n", t, tdesc[t], rc,
+                    rc == 0 ? "OK" : "FAIL");
+        }
+        if (trun >= 0)
+            kprintf("[REALTOOL] VERDICT: %s pass=%d/%d (UNMODIFIED GNU binutils "
+                    "readelf: glibc ld.so + getopt + file mmap + ELF parse)\n",
+                    (tpass == trun && trun > 0) ? "PASS" : "FAIL", tpass, trun);
+    }
+#endif
+
 #ifdef XPIPE_BOOT
     /* Track X / X1: CROSS-PERSONALITY pipelines -- the signature tobyOS trick.
      * A single busybox `sh` pipeline mixes a GENUINE Windows .exe and Linux
