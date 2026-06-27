@@ -2477,7 +2477,23 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
         int sx = (int)(int16_t)(a2 & 0xFFFF), sy = (int)(int16_t)(a2 >> 16);
         int w = (int)(int16_t)(a4 & 0xFFFF), h = (int)(int16_t)(a4 >> 16);
-        return gui_window_getpixels(f->win, sx, sy, w, h, (uint32_t *)a3);
+        if (w <= 0 || h <= 0) return 0;
+        /* SMAP-safe: gui_window_getpixels writes its destination DIRECTLY, so
+         * handing it the user pointer faults under CR4.SMAP. Stage each row
+         * through a kernel buffer and copy_to_user it out instead. */
+        static uint32_t krow[1024];
+        if (w > 1024) w = 1024;
+        uint32_t *udst = (uint32_t *)a3;
+        long total = 0;
+        for (int yy = 0; yy < h; yy++) {
+            int got = gui_window_getpixels(f->win, sx, sy + yy, w, 1, krow);
+            if (got <= 0) break;
+            if (copy_to_user(udst + (long)yy * w, krow,
+                             (size_t)got * sizeof(uint32_t)) != 0)
+                return -ABI_EFAULT;
+            total += got;
+        }
+        return total;
     }
     case ABI_SYS_GUI_GRADIENT: {
         struct file *f = fd_lookup((int)a1);

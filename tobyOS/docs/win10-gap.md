@@ -357,6 +357,20 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-06-26** — **Track X capstone X2: one pipeline through ALL THREE personalities — Windows .exe -> Linux tool -> tobyOS GUI.**
+  X1 proved Windows<->Linux pipelines over kernel pipes; X2 is the signature tobyOS trick taken to its conclusion: a single
+  busybox `sh` pipeline whose bytes flow through a genuine Win32 PE, a real Linux/musl binary, AND a native tobyOS GUI app no
+  other OS can run — on one kernel. The pipeline is `/bin/win-xprod.exe | busybox sed 's/XPIPE/X2/' | /bin/x2gui`: the Windows
+  PE `WriteFile`s `XPIPE_TOKEN_OK`, busybox `sed` (musl Linux) transforms it to `X2_TOKEN_OK`, and **`x2gui`** — a new native
+  app speaking the tobyOS `SYS_GUI_*` syscalls — reads the bytes off its stdin pipe, renders them into a real compositor
+  window (`sys_gui_create`/`fill`/`text`/`flip`), and *proves the render* by reading its own window backbuffer pixels back
+  (`SYS_GUI_GETPIXELS`) and counting glyph ink. `x2gui` is the pipeline tail, so its exit code becomes the pipeline's: a 3-bit
+  mask, `7` = got input | Linux stage transformed the token | GUI render verified. **Kernel gap fixed:** the
+  `ABI_SYS_GUI_GETPIXELS` syscall wrote its destination DIRECTLY, which faults under `CR4.SMAP`; it now stages each row through
+  a kernel buffer and `copy_to_user`s it out (SMAP-safe), matching the rest of the uaccess surface. **Proof, 0 faults under
+  `+smep,+smap`:** `[X2GUI] received='X2_TOKEN_OK'`, `[X2GUI] VERDICT: PASS token=yes rendered=yes inkpx=19`,
+  `[X2PIPE] VERDICT: PASS exit=7` (`logs/x2.sh`). **No regression:** X1 cross-personality battery still `[XPIPE] PASS 3/3`;
+  GUI desktop boots normally (login + app windows created). `x2gui` builds in-tree (freestanding clang), no external toolchain.
 - **2026-06-26** — **Track B milestone B25: a REAL glibc static binary runs — not musl, not freestanding.**
   Until now every Linux proof was either freestanding (hand-rolled syscalls) or musl (busybox). B25 closes that by running an
   actual **glibc 2.41** statically-linked x86-64 ELF (linked against a Buildroot 2025.08 glibc sysroot with the in-tree

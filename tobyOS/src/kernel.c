@@ -5957,6 +5957,48 @@ void _start(void) {
     }
 #endif
 
+#ifdef X2_BOOT
+    /* Track X / X2: the CROSS-PERSONALITY CAPSTONE. A single busybox `sh`
+     * pipeline threads bytes through ALL THREE personalities tobyOS hosts on
+     * one kernel:
+     *
+     *   /bin/win-xprod.exe | busybox sed 's/XPIPE/X2/' | /bin/x2gui
+     *    \_ Windows PE _/    \__ Linux (musl) tool __/   \_ tobyOS GUI _/
+     *
+     * The Win32 PE WriteFile()s a token, a genuine Linux/musl binary (busybox
+     * sed) transforms it (XPIPE_TOKEN_OK -> X2_TOKEN_OK), and the native tobyOS
+     * GUI app -- which speaks SYS_GUI_* syscalls no Windows or Linux binary can
+     * -- reads the bytes off its stdin pipe, renders them into a real
+     * compositor window, and PROVES the render by reading its own backbuffer
+     * pixels back (SYS_GUI_GETPIXELS). No other OS can run this pipeline. x2gui
+     * is the tail, so its exit CODE becomes the pipeline's: a 3-bit mask
+     * 7 = bit0 got input | bit1 Linux stage transformed the token | bit2 the
+     * tobyOS GUI render was verified via backbuffer pixel readback. */
+    {
+        static const char *pipeline =
+            "/bin/win-xprod.exe | busybox sed 's/XPIPE/X2/' | /bin/x2gui";
+        char *xargv[] = { (char *)"sh", (char *)"-c", (char *)pipeline, 0 };
+        char *xenvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec xspec = {
+            .path = "/bin/busybox", .name = "sh",
+            .argc = 3, .argv = xargv, .envc = 1, .envp = xenvp,
+        };
+        kprintf("[boot] X2: sh -c '%s'\n", pipeline);
+        int xpid = proc_spawn(&xspec);
+        if (xpid < 0) {
+            kprintf("[boot] X2: /bin/busybox not present -- SKIPPED\n");
+            kprintf("[X2PIPE] VERDICT: SKIP reason=no-busybox\n");
+        } else {
+            int xrc = proc_wait(xpid);
+            kprintf("[boot] X2: pipeline (pid=%d) exit=%d (bits: 1=input 2=token "
+                    "3=gui-render)\n", xpid, xrc);
+            kprintf("[X2PIPE] VERDICT: %s exit=%d (Windows .exe -> Linux sed -> "
+                    "tobyOS native GUI in one pipeline; expect 7)\n",
+                    xrc == 7 ? "PASS" : "FAIL", xrc);
+        }
+    }
+#endif
+
 #ifdef LINUXDYN_BOOT
     /* Track B/B5: run a DYNAMICALLY-linked Linux binary -- a real musl
      * busybox (PT_INTERP=/lib/ld-musl-x86_64.so.1, NEEDED libc.musl).

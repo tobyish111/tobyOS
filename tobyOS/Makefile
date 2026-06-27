@@ -307,6 +307,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_long/user_long.elf \
             programs/user_netecho/user_netecho.elf \
             programs/user_gui_demo/user_gui_demo.elf \
+            programs/x2gui/x2gui.elf \
             programs/user_gui_clock/user_gui_clock.elf \
             programs/user_gui_widgets/user_gui_widgets.elf \
             programs/user_gui_about/user_gui_about.elf \
@@ -1782,6 +1783,16 @@ programs/user_gui_demo/user_gui_demo.elf: programs/user_gui_demo/user_gui_demo.o
 	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_demo/program.ld -o $@ \
 	      programs/common/start.o programs/user_gui_demo/user_gui_demo.o
 
+# X2 capstone: native tobyOS GUI tail of the cross-personality pipeline.
+programs/x2gui/x2gui.o: programs/x2gui/main.c
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+programs/x2gui/x2gui.elf: programs/x2gui/x2gui.o \
+                          programs/common/start.o \
+                          programs/x2gui/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/x2gui/program.ld -o $@ \
+	      programs/common/start.o programs/x2gui/x2gui.o
+
 programs/user_gui_clock/user_gui_clock.o: programs/user_gui_clock/main.c
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -2042,6 +2053,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_long/user_long.elf      $(INITRD_STAGE)/bin/long_task
 	cp programs/user_netecho/user_netecho.elf $(INITRD_STAGE)/bin/netecho
 	cp programs/user_gui_demo/user_gui_demo.elf   $(INITRD_STAGE)/bin/gui_demo
+	cp programs/x2gui/x2gui.elf                   $(INITRD_STAGE)/bin/x2gui
 	cp programs/user_gui_clock/user_gui_clock.elf $(INITRD_STAGE)/bin/gui_clock
 	cp programs/user_gui_widgets/user_gui_widgets.elf $(INITRD_STAGE)/bin/gui_widgets
 	cp programs/user_gui_about/user_gui_about.elf     $(INITRD_STAGE)/bin/gui_about
@@ -2327,7 +2339,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	fi;                                                                   \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
-	    bin/gui_demo bin/gui_clock bin/gui_widgets bin/gui_about          \
+	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
 	    bin/login bin/gui_settings bin/abi_test                           \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
@@ -3936,6 +3948,7 @@ clean:
 	       programs/user_long/user_long.o programs/user_long/user_long.elf \
 	       programs/user_netecho/user_netecho.o programs/user_netecho/user_netecho.elf \
 	       programs/user_gui_demo/user_gui_demo.o programs/user_gui_demo/user_gui_demo.elf \
+	       programs/x2gui/x2gui.o programs/x2gui/x2gui.elf \
 	       programs/user_gui_clock/user_gui_clock.o programs/user_gui_clock/user_gui_clock.elf \
 	       programs/user_gui_widgets/user_gui_widgets.o programs/user_gui_widgets/user_gui_widgets.elf \
 	       programs/user_gui_about/user_gui_about.o programs/user_gui_about/user_gui_about.elf \
