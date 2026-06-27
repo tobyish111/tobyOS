@@ -2347,6 +2347,19 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "ld-linux-x86-64.so.2 + libc.so.6/libm.so.6 -- OPT-IN";     \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-glibc-dyn lib/ld-linux-x86-64.so.2 lib/libc.so.6 lib/libm.so.6"; \
 	fi;                                                                   \
+	if [ -f programs/linux-fbgui/linux-fbgui.elf ] &&                    \
+	   [ -f programs/busybox/ld-musl-x86_64.so.1 ]; then                 \
+	    mkdir -p $(INITRD_STAGE)/lib;                                     \
+	    cp programs/linux-fbgui/linux-fbgui.elf                          \
+	         $(INITRD_STAGE)/bin/linux-fbgui;                            \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/ld-musl-x86_64.so.1;                    \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/libc.musl-x86_64.so.1;                  \
+	    echo "[initrd] Track B graphics: bundling DYNAMIC musl fbdev app" \
+	         "(linux-fbgui) + ld-musl loader -- OPT-IN";                 \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-fbgui lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
+	fi;                                                                   \
 	if [ -f programs/busybox/busybox ]; then                             \
 	    cp programs/busybox/busybox $(INITRD_STAGE)/bin/busybox;          \
 	    printf '\003' | dd of=$(INITRD_STAGE)/bin/busybox bs=1 seek=7     \

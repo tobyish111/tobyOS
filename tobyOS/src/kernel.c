@@ -3646,6 +3646,59 @@ void _start(void) {
     }
 #endif
 
+#ifdef FBGUI_BOOT
+    /* Track B (Linux graphics, DYNAMIC): the same /dev/fb0 device, but driven
+     * this time by a DYNAMICALLY-LINKED Linux graphical app instead of a
+     * static raw-syscall one. /bin/linux-fbgui is a musl PIE
+     * (PT_INTERP=/lib/ld-musl-x86_64.so.1, NEEDED libc.musl-x86_64.so.1 -- the
+     * same ld-musl loader busybox-dyn uses), so a PASS proves the FULL
+     * real-world Linux graphics path: the kernel loads the PIE + ld-musl, the
+     * loader self-relocates + resolves the libc symbols, and the app draws via
+     * genuine libc calls -- open()/ioctl()/mmap() syscall wrappers, the stdio
+     * printf family, and the malloc heap -- using the standard <linux/fb.h>
+     * UAPI. It paints colour bars + three RGB markers and presents with
+     * FBIOPAN_DISPLAY; we sample the markers straight off the gfx scanout to
+     * prove the libc-drawn pixels actually reached the display. Runs before
+     * m14_init() so nothing competes for the framebuffer. */
+    {
+        framebuffer_sync_mapping();
+        char *argv[] = { (char *)"linux-fbgui", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-fbgui", .name = "linux-fbgui",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] FBGUI: spawning DYNAMIC musl fbdev app (ld-musl) on /dev/fb0\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[FBGUI] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            struct gfx_surface surf; gfx_surface_from_backbuf(&surf);
+            uint32_t got[3] = { 0, 0, 0 };
+            const uint32_t want[3] = { 0x00FF0000u, 0x0000FF00u, 0x000000FFu };
+            const int sx[3] = { 70, 170, 270 };
+            for (int i = 0; i < 3; i++)
+                (void)gfx_surface_get_pixels(&surf, sx[i], 60, 1, 1, &got[i]);
+            bool pix_ok = ((got[0] & 0x00FFFFFFu) == want[0]) &&
+                          ((got[1] & 0x00FFFFFFu) == want[1]) &&
+                          ((got[2] & 0x00FFFFFFu) == want[2]);
+            kprintf("[boot] FBGUI: app exit=%d; marker pixels R=%06x G=%06x "
+                    "B=%06x (expect ff0000/00ff00/0000ff)\n", rc,
+                    (unsigned)(got[0] & 0x00FFFFFFu),
+                    (unsigned)(got[1] & 0x00FFFFFFu),
+                    (unsigned)(got[2] & 0x00FFFFFFu));
+            kprintf("[FBGUI] VERDICT: %s exit=%d markers=%s (a DYNAMICALLY-linked "
+                    "musl Linux app drew to /dev/fb0 via libc open/ioctl/mmap + "
+                    "FBIOPAN_DISPLAY through the real ld-musl loader, and the "
+                    "pixels reached the scanout; expect exit0 + markers ok)\n",
+                    (rc == 0 && pix_ok) ? "PASS" : "FAIL", rc,
+                    pix_ok ? "ok" : "MISMATCH");
+            pit_sleep_ms(3000);
+        }
+    }
+#endif
+
     if (!safemode_skip_gui()) {
         /* Milestone 14: bring up settings + services + session BEFORE
          * shell_init so the desktop+login is already on screen by the
