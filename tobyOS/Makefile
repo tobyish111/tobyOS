@@ -1292,6 +1292,14 @@ programs/linux-thread/linux-thread.elf: programs/linux-thread/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# Track B (graphics): a genuine Linux x86-64 fbdev app -- open /dev/fb0,
+# FBIOGET_VSCREENINFO/FSCREENINFO, mmap the scanout, draw pixels, FBIOPAN_DISPLAY.
+programs/linux-fb/linux-fb.elf: programs/linux-fb/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 programs/linux-join/linux-join.elf: programs/linux-join/main.c
 	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
 	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
@@ -1984,6 +1992,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-sigtest/linux-sigtest.elf \
                programs/linux-mmaptest/linux-mmaptest.elf \
                programs/linux-thread/linux-thread.elf \
+               programs/linux-fb/linux-fb.elf \
                programs/linux-join/linux-join.elf \
                programs/linux-poll/linux-poll.elf \
                programs/linux-netserver/linux-netserver.elf \
@@ -2097,6 +2106,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-sigtest/linux-sigtest.elf       $(INITRD_STAGE)/bin/linux-sigtest
 	cp programs/linux-mmaptest/linux-mmaptest.elf     $(INITRD_STAGE)/bin/linux-mmaptest
 	cp programs/linux-thread/linux-thread.elf         $(INITRD_STAGE)/bin/linux-thread
+	cp programs/linux-fb/linux-fb.elf                 $(INITRD_STAGE)/bin/linux-fb
 	cp programs/linux-join/linux-join.elf             $(INITRD_STAGE)/bin/linux-join
 	cp programs/linux-poll/linux-poll.elf             $(INITRD_STAGE)/bin/linux-poll
 	cp programs/linux-netserver/linux-netserver.elf   $(INITRD_STAGE)/bin/linux-netserver
@@ -2492,7 +2502,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/login bin/gui_settings bin/abi_test                           \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
-	    bin/linux-mmaptest bin/linux-thread bin/linux-join bin/linux-poll \
+	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
 	    bin/linux-glibc \

@@ -3593,6 +3593,59 @@ void _start(void) {
     }
 #endif
 
+#ifdef FBDEV_BOOT
+    /* Track B (graphics): run a REAL Linux FRAMEBUFFER app -- a genuine Linux
+     * x86-64 static ELF (raw syscalls, would run unmodified on Linux) that
+     * open()s /dev/fb0, queries geometry with FBIOGET_VSCREENINFO/FSCREENINFO,
+     * mmap()s the scanout, draws a gradient + three RGB marker squares, and
+     * presents with FBIOPAN_DISPLAY. We run it BEFORE m14_init() so the desktop
+     * compositor is NOT up and the framebuffer is the app's to draw on. PASS =
+     * the app exits 0 AND the three marker pixels actually reached the gfx
+     * scanout (the kernel samples the back buffer at the squares' centres) --
+     * proving the new /dev/fb0 + fbdev-ioctl + mmap + present path end to end. */
+    {
+        framebuffer_sync_mapping();
+        char *argv[] = { (char *)"linux-fb", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-fb", .name = "linux-fb",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] FBDEV: spawning genuine Linux fbdev app on /dev/fb0\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[FBDEV] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            /* Sample the three marker squares (40x40 at x=50/150/250, y=40..80;
+             * centres ~ (70,60),(170,60),(270,60)) straight off the back buffer. */
+            struct gfx_surface surf; gfx_surface_from_backbuf(&surf);
+            uint32_t got[3] = { 0, 0, 0 };
+            const uint32_t want[3] = { 0x00FF0000u, 0x0000FF00u, 0x000000FFu };
+            const int sx[3] = { 70, 170, 270 };
+            for (int i = 0; i < 3; i++)
+                (void)gfx_surface_get_pixels(&surf, sx[i], 60, 1, 1, &got[i]);
+            bool pix_ok = ((got[0] & 0x00FFFFFFu) == want[0]) &&
+                          ((got[1] & 0x00FFFFFFu) == want[1]) &&
+                          ((got[2] & 0x00FFFFFFu) == want[2]);
+            kprintf("[boot] FBDEV: app exit=%d; marker pixels R=%06x G=%06x "
+                    "B=%06x (expect ff0000/00ff00/0000ff)\n", rc,
+                    (unsigned)(got[0] & 0x00FFFFFFu),
+                    (unsigned)(got[1] & 0x00FFFFFFu),
+                    (unsigned)(got[2] & 0x00FFFFFFu));
+            kprintf("[FBDEV] VERDICT: %s exit=%d markers=%s (a genuine Linux "
+                    "fbdev app drew to /dev/fb0 via mmap + FBIOPAN_DISPLAY and "
+                    "the pixels reached the scanout; expect exit0 + markers ok)\n",
+                    (rc == 0 && pix_ok) ? "PASS" : "FAIL", rc,
+                    pix_ok ? "ok" : "MISMATCH");
+            /* Hold the rendered frame on the scanout for a few seconds so a
+             * headless screenshot can capture it before m14_init()'s desktop
+             * compositor starts and overdraws the framebuffer. */
+            pit_sleep_ms(3000);
+        }
+    }
+#endif
+
     if (!safemode_skip_gui()) {
         /* Milestone 14: bring up settings + services + session BEFORE
          * shell_init so the desktop+login is already on screen by the

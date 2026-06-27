@@ -76,6 +76,13 @@ enum file_kind {
      * wakeup descriptor (EFD_CLOEXEC|EFD_NONBLOCK). Backed by a kmalloc'd
      * struct eventfd shared across dup/fork via a refcount. See file.c. */
     FILE_KIND_EVENTFD    = 12,
+    /* Track B (graphics): the Linux framebuffer device /dev/fb0. A Linux app
+     * opens it, queries geometry via FBIOGET_VSCREENINFO/FSCREENINFO, mmaps a
+     * shadow scanout buffer, draws XRGB8888 pixels, and presents it with
+     * FBIOPAN_DISPLAY (the kernel blits the shadow into the gfx backbuffer and
+     * flips). file_read/write hit the default error; close just frees. The
+     * per-open geometry + mmap base live in a global fbdev context (syscall.c). */
+    FILE_KIND_FB         = 13,
 };
 
 struct eventfd;

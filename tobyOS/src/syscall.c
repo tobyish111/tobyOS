@@ -1018,6 +1018,126 @@ static int resolve_user_path(const char *user_path, char *out, size_t cap) {
     return 0;
 }
 
+/* ---- Track B graphics: the Linux framebuffer device /dev/fb0 -----------
+ *
+ * A genuine Linux fbdev: open("/dev/fb0") -> FILE_KIND_FB; FBIOGET_VSCREENINFO
+ * / FBIOGET_FSCREENINFO report a 32bpp XRGB8888 surface matching the gfx
+ * scanout; mmap(fd) reserves a SHADOW scanout buffer (a normal anonymous user
+ * region, so it tears down cleanly at exit -- never the real device pages);
+ * the app draws XRGB pixels into it and presents with FBIOPAN_DISPLAY (or
+ * FBIO_WAITFORVSYNC), which blits the shadow into the gfx back buffer and
+ * flips. This is the standard double-buffered fbdev pan pattern. Single
+ * global context: the proof runs one fbdev app at a time (before the
+ * compositor, like REALTUI), so one open is enough. */
+struct fbdev_ctx {
+    bool     open;
+    uint32_t xres, yres;       /* visible resolution (== gfx scanout) */
+    uint32_t bpp;              /* 32 */
+    uint32_t line_length;      /* bytes per row in the shadow (xres*4) */
+    uint32_t smem_len;         /* shadow size in bytes (line_length*yres) */
+    uint64_t user_base;        /* mmap'd shadow base in the app's address space */
+    uint64_t user_len;         /* mmap'd length */
+    int      owner_pid;        /* tgid that opened it */
+    uint64_t present_count;    /* FBIOPAN_DISPLAY / vsync presents served */
+};
+static struct fbdev_ctx g_fbdev;
+
+/* Linux fbdev ioctl request numbers. */
+#define FBIOGET_VSCREENINFO 0x4600
+#define FBIOPUT_VSCREENINFO 0x4601
+#define FBIOGET_FSCREENINFO 0x4602
+#define FBIOPAN_DISPLAY     0x4606
+#define FBIO_WAITFORVSYNC   0x4620   /* _IOW('F',0x20,u32); low 16 bits suffice */
+
+/* Initialise the global fbdev geometry from the live gfx scanout. */
+static void fbdev_init_geometry(void) {
+    uint32_t w = gfx_width(), h = gfx_height();
+    if (w == 0 || h == 0) { w = 1024; h = 768; }
+    g_fbdev.xres = w; g_fbdev.yres = h; g_fbdev.bpp = 32;
+    g_fbdev.line_length = w * 4;
+    g_fbdev.smem_len = g_fbdev.line_length * h;
+}
+
+/* Present the shadow buffer: copy the app's XRGB pixels row-by-row into the
+ * gfx back buffer, then flip to the hardware scanout. Returns 0 on success. */
+static long fbdev_present(void) {
+    if (!g_fbdev.open || !g_fbdev.user_base) return -ABI_EINVAL;
+    uint32_t w = g_fbdev.xres, h = g_fbdev.yres;
+    if (w > gfx_width())  w = gfx_width();
+    if (h > gfx_height()) h = gfx_height();
+    uint32_t *row = (uint32_t *)kmalloc(g_fbdev.line_length);
+    if (!row) return -ABI_ENOMEM;
+    for (uint32_t y = 0; y < h; y++) {
+        if (copy_from_user(row,
+                (const void *)(uintptr_t)(g_fbdev.user_base + (uint64_t)y * g_fbdev.line_length),
+                w * 4) != 0)
+            break;
+        gfx_blit(0, (int)y, (int)w, 1, row, (int)w);
+    }
+    kfree(row);
+    gfx_flip();
+    g_fbdev.present_count++;
+    return 0;
+}
+
+/* FBIOGET_VSCREENINFO: fill the app's struct fb_var_screeninfo (160 bytes on
+ * x86-64). We set xres/yres/virtual/bpp + the XRGB8888 bitfields. */
+static long fbdev_get_vscreeninfo(uint64_t up) {
+    uint8_t v[160];
+    memset(v, 0, sizeof(v));
+    uint32_t *u32 = (uint32_t *)v;
+    u32[0] = g_fbdev.xres;          /* xres            @0  */
+    u32[1] = g_fbdev.yres;          /* yres            @4  */
+    u32[2] = g_fbdev.xres;          /* xres_virtual    @8  */
+    u32[3] = g_fbdev.yres;          /* yres_virtual    @12 */
+    u32[6] = g_fbdev.bpp;           /* bits_per_pixel  @24 */
+    /* fb_bitfield {offset,length,msb_right}: red@32, green@44, blue@56, transp@68 */
+    u32[8]  = 16; u32[9]  = 8;      /* red.offset=16, len=8   */
+    u32[11] = 8;  u32[12] = 8;      /* green.offset=8,  len=8 */
+    u32[14] = 0;  u32[15] = 8;      /* blue.offset=0,   len=8 */
+    u32[17] = 24; u32[18] = 8;      /* transp.offset=24,len=8 */
+    return (copy_to_user((void *)(uintptr_t)up, v, sizeof(v)) == 0) ? 0 : -ABI_EFAULT;
+}
+
+/* FBIOGET_FSCREENINFO: fill the app's struct fb_fix_screeninfo (80 bytes). */
+static long fbdev_get_fscreeninfo(uint64_t up) {
+    uint8_t v[80];
+    memset(v, 0, sizeof(v));
+    const char id[] = "tobyos-fb";
+    for (int i = 0; id[i] && i < 15; i++) v[i] = (uint8_t)id[i];   /* id[16] @0 */
+    *(uint32_t *)(v + 24) = g_fbdev.smem_len;    /* smem_len    @24 */
+    *(uint32_t *)(v + 28) = 0;                   /* type=PACKED @28 */
+    *(uint32_t *)(v + 36) = 2;                   /* visual=TRUECOLOR @36 */
+    *(uint32_t *)(v + 48) = g_fbdev.line_length; /* line_length @48 */
+    return (copy_to_user((void *)(uintptr_t)up, v, sizeof(v)) == 0) ? 0 : -ABI_EFAULT;
+}
+
+/* Linux fbdev ioctl dispatch for a FILE_KIND_FB handle. */
+static long fbdev_ioctl(unsigned long req, unsigned long arg) {
+    switch (req & 0xFFFFu) {
+    case FBIOGET_VSCREENINFO: return fbdev_get_vscreeninfo((uint64_t)arg);
+    case FBIOGET_FSCREENINFO: return fbdev_get_fscreeninfo((uint64_t)arg);
+    case FBIOPUT_VSCREENINFO: return 0;           /* accept (geometry is fixed) */
+    case FBIOPAN_DISPLAY:                          /* present (double-buffer pan) */
+    case FBIO_WAITFORVSYNC:   return fbdev_present();
+    default:                  return -ABI_ENOTTY;
+    }
+}
+
+/* mmap of /dev/fb0: reserve a fresh anonymous RW shadow scanout in the app's
+ * address space and remember it as the present source. */
+static long fbdev_mmap(uint64_t len) {
+    if (g_fbdev.smem_len == 0) fbdev_init_geometry();
+    uint64_t want = g_fbdev.smem_len;
+    if (len > want) want = len;       /* honour an over-large request */
+    long base = sys_mmap(0, want, 0x1u | 0x2u /*R|W*/,
+                         0x01u | 0x02u /*ANON|SHARED*/, -1, 0);
+    if (base < 0) return base;
+    g_fbdev.user_base = (uint64_t)base;
+    g_fbdev.user_len  = want;
+    return base;
+}
+
 /* ---- file open / close / dup ----------------------------------- */
 
 static long sys_open(const char *path, int flags, int mode) {
@@ -1051,6 +1171,21 @@ static long sys_open(const char *path, int flags, int mode) {
             if (!f) return -ABI_ENOENT;
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { file_close(f); return -ABI_EMFILE; }
+            return fd;
+        }
+        /* Track B graphics: the Linux framebuffer device. */
+        if (strcmp(dev, "fb0") == 0) {
+            struct file *f = (struct file *)kmalloc(sizeof(*f));
+            if (!f) return -ABI_ENOMEM;
+            memset(f, 0, sizeof(*f));
+            f->kind = FILE_KIND_FB;
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            struct proc *p = current_proc();
+            memset(&g_fbdev, 0, sizeof(g_fbdev));
+            g_fbdev.open = true;
+            g_fbdev.owner_pid = p ? (p->is_thread ? p->tgid : p->pid) : 0;
+            fbdev_init_geometry();
             return fd;
         }
     }
@@ -4486,6 +4621,8 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
             return tty_console_ioctl((unsigned long)a2, (unsigned long)a3);
         if (f->kind == FILE_KIND_PTY_MASTER || f->kind == FILE_KIND_PTY_SLAVE)
             return pty_ioctl(f, (unsigned long)a2, (unsigned long)a3);
+        if (f->kind == FILE_KIND_FB)
+            return fbdev_ioctl((unsigned long)a2, (unsigned long)a3);
         return -ABI_ENOTTY;
     }
 
@@ -4501,7 +4638,10 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         uint32_t lf = (uint32_t)a4;
         int      fd = (int)a5;
         long ret;
-        if ((lf & LXMAP_ANONYMOUS) || fd < 0)        /* anonymous (malloc/TLS) */
+        struct file *mf = (fd >= 0) ? fd_lookup(fd) : NULL;
+        if (mf && mf->kind == FILE_KIND_FB)          /* /dev/fb0 shadow scanout */
+            ret = fbdev_mmap((uint64_t)a2);
+        else if ((lf & LXMAP_ANONYMOUS) || fd < 0)   /* anonymous (malloc/TLS) */
             ret = sys_mmap((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
                            lx_mmap_flags(lf), -1, 0);
         else
