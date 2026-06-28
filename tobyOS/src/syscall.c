@@ -223,7 +223,7 @@ static long sys_write(int fd, const void *buf, size_t len) {
     return rv;
 }
 
-static long evdev_read(uint64_t ubuf, size_t len);   /* defined below (evdev dev) */
+static long evdev_read(unsigned dev, uint64_t ubuf, size_t len); /* evdev dev, below */
 
 static long sys_read(int fd, void *buf, size_t len) {
     if (len == 0) return 0;
@@ -231,8 +231,8 @@ static long sys_read(int fd, void *buf, size_t len) {
     if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
-    if (f->kind == FILE_KIND_EVDEV)      /* /dev/input/event0: struct input_event stream */
-        return evdev_read((uint64_t)(uintptr_t)buf, len);
+    if (f->kind == FILE_KIND_EVDEV)      /* /dev/input/event<N>: input_event stream */
+        return evdev_read((unsigned)f->dir_off, (uint64_t)(uintptr_t)buf, len);
     void *k = kmalloc(len);
     if (!k) return -ABI_ENOMEM;
     long rv = file_read(f, k, len);
@@ -1159,62 +1159,92 @@ void fbdev_proc_exit(int pid) {
     g_fbdev.user_len  = 0;
 }
 
-/* ---- Track B input: the Linux evdev device /dev/input/event0 ----------
+/* ---- Track B input: the Linux evdev devices /dev/input/event{0,1} -----
  *
- * A genuine Linux input device: open("/dev/input/event0") -> FILE_KIND_EVDEV;
- * read() returns a stream of fixed 24-byte `struct input_event` records
- * (EV_KEY make/break + EV_SYN frames); the EVIOCG* ioctls report identity +
- * capabilities. The PS/2 keyboard driver feeds raw make/break here via
- * evdev_feed_key() -- for scancode set 1 the Linux keycode equals the
- * scancode across the main block, so the mapping is the identity. A small
- * ring buffers events; read blocks (yield) when empty unless O_NONBLOCK. */
+ * Genuine Linux input devices: open("/dev/input/event0") -> FILE_KIND_EVDEV
+ * minor 0 (the KEYBOARD), event1 -> minor 1 (the MOUSE). read() returns a
+ * stream of fixed 24-byte `struct input_event` records and the EVIOCG* ioctls
+ * report per-device identity + capabilities. The PS/2 drivers feed raw input
+ * here: the keyboard via evdev_feed_key() (for scancode set 1 the Linux
+ * keycode equals the scancode across the main block, so the mapping is the
+ * identity); the mouse via evdev_feed_mouse() as EV_REL deltas + BTN_* keys.
+ * Each device has its own ring; read blocks (yield) when empty unless
+ * O_NONBLOCK. */
 
 #define EV_SYN          0x00
 #define EV_KEY          0x01
+#define EV_REL          0x02
 #define SYN_REPORT      0x00
+#define REL_X           0x00
+#define REL_Y           0x01
+#define BTN_LEFT        0x110
+#define BTN_RIGHT       0x111
+#define BTN_MIDDLE      0x112
 #define INPUT_EVENT_SZ  24u            /* sizeof(struct input_event) on x86-64 */
 
 extern uint64_t pit_ticks(void);       /* full decls appear later in this file */
 extern uint32_t pit_hz(void);
 
+#define EVDEV_NDEV      2u
+#define EVDEV_KBD       0u
+#define EVDEV_MOUSE     1u
 #define EVDEV_RING      512u           /* power of two */
 struct evdev_evt { uint16_t type; uint16_t code; int32_t value; };
 struct evdev_ctx {
     bool     open;
     bool     nonblock;
     int      owner_pid;
+    int      kind;                     /* EVDEV_KBD / EVDEV_MOUSE */
     volatile uint32_t head, tail;      /* head=producer, tail=consumer */
     struct evdev_evt ring[EVDEV_RING];
     uint64_t produced, consumed;
 };
-static struct evdev_ctx g_evdev;
+static struct evdev_ctx g_evdev[EVDEV_NDEV];
 
 /* evdev ioctl request numbers (Linux UAPI _IOC encoding -> low byte = nr,
  * second byte = type 'E'). We dispatch on nr after checking type=='E'. */
 #define EVIOC_TYPE      'E'
 
-static void evdev_push(uint16_t type, uint16_t code, int32_t value) {
-    uint32_t next = (g_evdev.head + 1u) & (EVDEV_RING - 1u);
-    if (next == g_evdev.tail) {        /* full: drop oldest */
-        g_evdev.tail = (g_evdev.tail + 1u) & (EVDEV_RING - 1u);
-        g_evdev.consumed++;
+static void evdev_push(unsigned dev, uint16_t type, uint16_t code, int32_t value) {
+    struct evdev_ctx *d = &g_evdev[dev];
+    uint32_t next = (d->head + 1u) & (EVDEV_RING - 1u);
+    if (next == d->tail) {             /* full: drop oldest */
+        d->tail = (d->tail + 1u) & (EVDEV_RING - 1u);
+        d->consumed++;
     }
-    g_evdev.ring[g_evdev.head].type  = type;
-    g_evdev.ring[g_evdev.head].code  = code;
-    g_evdev.ring[g_evdev.head].value = value;
-    g_evdev.head = next;
-    g_evdev.produced++;
+    d->ring[d->head].type  = type;
+    d->ring[d->head].code  = code;
+    d->ring[d->head].value = value;
+    d->head = next;
+    d->produced++;
 }
 
 void evdev_feed_key(uint8_t code, int value) {
     /* A real evdev key event is the EV_KEY followed by a SYN_REPORT frame. */
-    evdev_push(EV_KEY, code, value);
-    evdev_push(EV_SYN, SYN_REPORT, 0);
+    evdev_push(EVDEV_KBD, EV_KEY, code, value);
+    evdev_push(EVDEV_KBD, EV_SYN, SYN_REPORT, 0);
+}
+
+/* Feed one mouse report: relative motion + button edges, then a SYN frame --
+ * exactly the packet shape a real PS/2 evdev mouse emits. `prev` is the button
+ * bitmask before this report so we can emit press/release edges. The button
+ * masks are the PS/2 driver's MOUSE_BTN_* bits (1=left,2=right,4=middle). */
+void evdev_feed_mouse(int dx, int dy, uint8_t buttons, uint8_t prev) {
+    if (dx) evdev_push(EVDEV_MOUSE, EV_REL, REL_X, dx);
+    if (dy) evdev_push(EVDEV_MOUSE, EV_REL, REL_Y, dy);
+    uint8_t changed = (uint8_t)(buttons ^ prev);
+    if (changed & 0x01) evdev_push(EVDEV_MOUSE, EV_KEY, BTN_LEFT,   (buttons & 0x01) ? 1 : 0);
+    if (changed & 0x02) evdev_push(EVDEV_MOUSE, EV_KEY, BTN_RIGHT,  (buttons & 0x02) ? 1 : 0);
+    if (changed & 0x04) evdev_push(EVDEV_MOUSE, EV_KEY, BTN_MIDDLE, (buttons & 0x04) ? 1 : 0);
+    if (dx || dy || changed)
+        evdev_push(EVDEV_MOUSE, EV_SYN, SYN_REPORT, 0);
 }
 
 void evdev_reset(void) {
-    g_evdev.head = g_evdev.tail = 0;
-    g_evdev.produced = g_evdev.consumed = 0;
+    for (unsigned i = 0; i < EVDEV_NDEV; i++) {
+        g_evdev[i].head = g_evdev[i].tail = 0;
+        g_evdev[i].produced = g_evdev[i].consumed = 0;
+    }
 }
 
 /* Serialise one queued event into the 24-byte Linux struct input_event:
@@ -1233,24 +1263,26 @@ static void evdev_serialise(const struct evdev_evt *e, uint8_t out[INPUT_EVENT_S
     *(int32_t  *)(out + 20) = e->value;
 }
 
-/* read() on /dev/input/event0: copy as many whole input_events as fit. Blocks
- * (yield) on an empty queue unless O_NONBLOCK, matching the evdev semantics. */
-static long evdev_read(uint64_t ubuf, size_t len) {
+/* read() on /dev/input/event<dev>: copy as many whole input_events as fit.
+ * Blocks (yield) on an empty queue unless O_NONBLOCK, per evdev semantics. */
+static long evdev_read(unsigned dev, uint64_t ubuf, size_t len) {
+    if (dev >= EVDEV_NDEV) return -ABI_EBADF;
+    struct evdev_ctx *d = &g_evdev[dev];
     size_t cap = len / INPUT_EVENT_SZ;
     if (cap == 0) return -ABI_EINVAL;     /* evdev requires >= one event */
 
-    while (g_evdev.tail == g_evdev.head) {
-        if (g_evdev.nonblock) return -ABI_EAGAIN;
+    while (d->tail == d->head) {
+        if (d->nonblock) return -ABI_EAGAIN;
         if (signal_pending_self()) return EINTR_RET;
         sti(); hlt();
     }
 
     size_t n = 0;
     uint8_t rec[INPUT_EVENT_SZ];
-    while (n < cap && g_evdev.tail != g_evdev.head) {
-        struct evdev_evt e = g_evdev.ring[g_evdev.tail];
-        g_evdev.tail = (g_evdev.tail + 1u) & (EVDEV_RING - 1u);
-        g_evdev.consumed++;
+    while (n < cap && d->tail != d->head) {
+        struct evdev_evt e = d->ring[d->tail];
+        d->tail = (d->tail + 1u) & (EVDEV_RING - 1u);
+        d->consumed++;
         evdev_serialise(&e, rec);
         if (copy_to_user((void *)(uintptr_t)(ubuf + n * INPUT_EVENT_SZ),
                          rec, INPUT_EVENT_SZ) != 0)
@@ -1260,7 +1292,6 @@ static long evdev_read(uint64_t ubuf, size_t len) {
     return (long)(n * INPUT_EVENT_SZ);
 }
 
-/* Fill `nbytes` of a little-endian bitmask `out` with bit `bit` set. */
 static long evdev_copy_bits(uint64_t up, unsigned size, const uint8_t *bits,
                             unsigned nbits_bytes) {
     unsigned n = size < nbits_bytes ? size : nbits_bytes;
@@ -1268,7 +1299,9 @@ static long evdev_copy_bits(uint64_t up, unsigned size, const uint8_t *bits,
                                                                : -ABI_EFAULT;
 }
 
-static long evdev_ioctl(unsigned long req, unsigned long arg) {
+static long evdev_ioctl(unsigned dev, unsigned long req, unsigned long arg) {
+    if (dev >= EVDEV_NDEV) return -ABI_EBADF;
+    bool is_mouse = (g_evdev[dev].kind == (int)EVDEV_MOUSE);
     unsigned nr   = req & 0xFFu;
     unsigned type = (req >> 8) & 0xFFu;
     unsigned size = (req >> 16) & 0x3FFFu;
@@ -1281,27 +1314,41 @@ static long evdev_ioctl(unsigned long req, unsigned long arg) {
                ? 0 : -ABI_EFAULT;
     }
     case 0x02: {                                   /* EVIOCGID (struct input_id) */
-        uint16_t id[4] = { 0x0011 /*BUS_I8042*/, 0x0001, 0x0001, 0xAB41 };
+        uint16_t id[4] = { 0x0011 /*BUS_I8042*/, 0x0001,
+                           (uint16_t)(is_mouse ? 0x0002 : 0x0001), 0xAB41 };
         return (copy_to_user((void *)(uintptr_t)arg, id, sizeof(id)) == 0)
                ? 0 : -ABI_EFAULT;
     }
     case 0x06: {                                   /* EVIOCGNAME(len) */
-        static const char name[] = "tobyOS PS/2 Keyboard";
-        unsigned nl = (unsigned)sizeof(name);      /* includes NUL */
+        const char *name = is_mouse ? "tobyOS PS/2 Mouse"
+                                     : "tobyOS PS/2 Keyboard";
+        unsigned nl = 0; while (name[nl]) nl++; nl++;   /* include NUL */
         unsigned n  = size < nl ? size : nl;
         return (copy_to_user((void *)(uintptr_t)arg, name, n) == 0)
                ? (long)n : -ABI_EFAULT;
     }
     case 0x20: {                                   /* EVIOCGBIT(0): event types */
         uint8_t evbits[4] = { 0 };
-        evbits[0] = (1u << EV_SYN) | (1u << EV_KEY);  /* 0x03 */
+        evbits[0] = is_mouse ? ((1u << EV_SYN) | (1u << EV_KEY) | (1u << EV_REL))
+                             : ((1u << EV_SYN) | (1u << EV_KEY));
         return evdev_copy_bits(arg, size, evbits, sizeof(evbits));
     }
+    case 0x22: {                                   /* EVIOCGBIT(EV_REL): rel axes */
+        uint8_t relbits[4] = { 0 };
+        if (is_mouse) relbits[0] = (1u << REL_X) | (1u << REL_Y);  /* 0x03 */
+        return evdev_copy_bits(arg, size, relbits, sizeof(relbits));
+    }
     case 0x21: {                                   /* EVIOCGBIT(EV_KEY): key map */
-        uint8_t keybits[(0x53 / 8) + 1];
+        uint8_t keybits[(0x120 / 8) + 1];
         memset(keybits, 0, sizeof(keybits));
-        for (unsigned k = 1; k <= 0x53; k++)        /* main block we emit */
-            keybits[k >> 3] |= (uint8_t)(1u << (k & 7));
+        if (is_mouse) {
+            keybits[BTN_LEFT   >> 3] |= (uint8_t)(1u << (BTN_LEFT   & 7));
+            keybits[BTN_RIGHT  >> 3] |= (uint8_t)(1u << (BTN_RIGHT  & 7));
+            keybits[BTN_MIDDLE >> 3] |= (uint8_t)(1u << (BTN_MIDDLE & 7));
+        } else {
+            for (unsigned k = 1; k <= 0x53; k++)    /* main block we emit */
+                keybits[k >> 3] |= (uint8_t)(1u << (k & 7));
+        }
         return evdev_copy_bits(arg, size, keybits, sizeof(keybits));
     }
     default:
@@ -1359,20 +1406,24 @@ static long sys_open(const char *path, int flags, int mode) {
             fbdev_init_geometry();
             return fd;
         }
-        /* Track B input: the Linux evdev keyboard device. Attaches to the
-         * global event queue (does NOT flush it, so events injected before
-         * the reader opened are still delivered). */
-        if (strcmp(dev, "input/event0") == 0) {
+        /* Track B input: the Linux evdev devices. event0 = keyboard, event1 =
+         * mouse. Attaches to the device's global event queue (does NOT flush
+         * it, so events injected before the reader opened are still delivered).
+         * The minor is stashed in f->dir_off (unused for this kind). */
+        if (strcmp(dev, "input/event0") == 0 || strcmp(dev, "input/event1") == 0) {
+            unsigned minor = (dev[11] == '1') ? EVDEV_MOUSE : EVDEV_KBD;
             struct file *f = (struct file *)kmalloc(sizeof(*f));
             if (!f) return -ABI_ENOMEM;
             memset(f, 0, sizeof(*f));
             f->kind = FILE_KIND_EVDEV;
+            f->dir_off = minor;
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { kfree(f); return -ABI_EMFILE; }
             struct proc *p = current_proc();
-            g_evdev.open = true;
-            g_evdev.nonblock = (flags & ABI_O_NONBLOCK) != 0;
-            g_evdev.owner_pid = p ? (p->is_thread ? p->tgid : p->pid) : 0;
+            g_evdev[minor].open = true;
+            g_evdev[minor].kind = (int)minor;
+            g_evdev[minor].nonblock = (flags & ABI_O_NONBLOCK) != 0;
+            g_evdev[minor].owner_pid = p ? (p->is_thread ? p->tgid : p->pid) : 0;
             return fd;
         }
         /* Console / virtual-terminal device nodes: /dev/console, /dev/tty,
@@ -4843,7 +4894,8 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         if (f->kind == FILE_KIND_FB)
             return fbdev_ioctl((unsigned long)a2, (unsigned long)a3);
         if (f->kind == FILE_KIND_EVDEV)
-            return evdev_ioctl((unsigned long)a2, (unsigned long)a3);
+            return evdev_ioctl((unsigned)f->dir_off, (unsigned long)a2,
+                               (unsigned long)a3);
         return -ABI_ENOTTY;
     }
 

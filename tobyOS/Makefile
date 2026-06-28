@@ -2373,6 +2373,19 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "(linux-evdev) + ld-musl loader -- OPT-IN";                 \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-evdev lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
 	fi;                                                                   \
+	if [ -f programs/linux-paint/linux-paint.elf ] &&                    \
+	   [ -f programs/busybox/ld-musl-x86_64.so.1 ]; then                 \
+	    mkdir -p $(INITRD_STAGE)/lib;                                     \
+	    cp programs/linux-paint/linux-paint.elf                          \
+	         $(INITRD_STAGE)/bin/linux-paint;                            \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/ld-musl-x86_64.so.1;                    \
+	    cp programs/busybox/ld-musl-x86_64.so.1                          \
+	         $(INITRD_STAGE)/lib/libc.musl-x86_64.so.1;                  \
+	    echo "[initrd] Track B input+graphics: bundling DYNAMIC musl"     \
+	         "interactive paint app (linux-paint) -- OPT-IN";            \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-paint lib/ld-musl-x86_64.so.1 lib/libc.musl-x86_64.so.1"; \
+	fi;                                                                   \
 	if [ -f programs/fbsplash/splash.ppm ]; then                         \
 	    mkdir -p $(INITRD_STAGE)/etc;                                     \
 	    cp programs/fbsplash/splash.ppm $(INITRD_STAGE)/etc/splash.ppm;   \

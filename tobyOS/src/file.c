@@ -205,6 +205,11 @@ struct file *file_clone(struct file *src) {
         }
         f->dir_off = src->dir_off;
         break;
+    case FILE_KIND_EVDEV:
+        /* dir_off holds the evdev minor (0=kbd,1=mouse); the queue is global,
+         * so a clone just remembers which device it reads. */
+        f->dir_off = src->dir_off;
+        break;
     }
     return f;
 }

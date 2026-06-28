@@ -10,6 +10,7 @@
 
  #include <tobyos/mouse.h>
  #include <tobyos/keyboard.h>
+ #include <tobyos/evdev.h>
  #include <tobyos/cpu.h>
  #include <tobyos/isr.h>
  #include <tobyos/irq.h>
@@ -207,8 +208,13 @@
      return g_buttons;
  }
  
- void mouse_inject_event(int dx, int dy, uint8_t buttons) {
-     uint8_t newly = (uint8_t)(buttons & ~g_last_buttons);
+void mouse_inject_event(int dx, int dy, uint8_t buttons) {
+    /* Track B input: mirror this report into /dev/input/event1 (evdev mouse)
+     * as EV_REL motion + BTN_* edges, before g_last_buttons is updated below.
+     * A Linux app reading the device sees a genuine PS/2-mouse event stream. */
+    evdev_feed_mouse(dx, dy, buttons, g_last_buttons);
+
+    uint8_t newly = (uint8_t)(buttons & ~g_last_buttons);
  
      if (newly & MOUSE_BTN_LEFT)   g_btn_press_total++;
      if (newly & MOUSE_BTN_RIGHT)  g_btn_press_total++;

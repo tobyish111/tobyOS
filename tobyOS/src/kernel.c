@@ -3805,6 +3805,68 @@ void _start(void) {
     }
 #endif
 
+#ifdef PAINT_BOOT
+    /* Track B (Linux input + graphics together): a single INTERACTIVE
+     * dynamically-linked musl Linux app that reads the MOUSE via
+     * /dev/input/event1 (evdev) AND draws to /dev/fb0 -- "paint where you
+     * click". We inject three mouse moves + left-clicks exactly as the PS/2
+     * mouse driver would (mouse_inject_event -> evdev_feed_mouse as EV_REL +
+     * BTN_LEFT); the app accumulates the relative motion into a cursor and
+     * stamps a coloured square at each click. The app's cursor starts at the
+     * screen centre, so we move with deltas to three known targets, then
+     * sample those pixels off the scanout. A PASS proves a Linux GUI app can
+     * consume real pointer input and render to the framebuffer in one loop. */
+    {
+        framebuffer_sync_mapping();
+        int W = (int)gfx_width(), H = (int)gfx_height();
+        int curx = W / 2, cury = H / 2;             /* matches the app's start */
+        const int tx[3] = { 300, 700, 1000 };
+        const int ty[3] = { 300, 400, 560 };
+        evdev_reset();
+        for (int i = 0; i < 3; i++) {
+            mouse_inject_event(tx[i] - curx, ty[i] - cury, 0);  /* move */
+            curx = tx[i]; cury = ty[i];
+            mouse_inject_event(0, 0, MOUSE_BTN_LEFT);           /* press  */
+            mouse_inject_event(0, 0, 0);                        /* release */
+        }
+        char *argv[] = { (char *)"linux-paint", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-paint", .name = "linux-paint",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] PAINT: injected 3 mouse moves+left-clicks via evdev; "
+                "spawning interactive paint app\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[PAINT] VERDICT: SKIP reason=no-binary (need opt-in "
+                    "programs/linux-paint + ld-musl)\n");
+        } else {
+            int rc = proc_wait(pid);
+            struct gfx_surface surf; gfx_surface_from_backbuf(&surf);
+            uint32_t got[3] = { 0, 0, 0 };
+            const uint32_t want[3] = { 0x00FF3030u, 0x0030FF30u, 0x003060FFu };
+            for (int i = 0; i < 3; i++)
+                (void)gfx_surface_get_pixels(&surf, tx[i], ty[i], 1, 1, &got[i]);
+            bool pix_ok = ((got[0] & 0x00FFFFFFu) == want[0]) &&
+                          ((got[1] & 0x00FFFFFFu) == want[1]) &&
+                          ((got[2] & 0x00FFFFFFu) == want[2]);
+            kprintf("[boot] PAINT: exit=%d stroke pixels @clicks R=%06x G=%06x "
+                    "B=%06x (expect ff3030/30ff30/3060ff)\n", rc,
+                    (unsigned)(got[0] & 0x00FFFFFFu),
+                    (unsigned)(got[1] & 0x00FFFFFFu),
+                    (unsigned)(got[2] & 0x00FFFFFFu));
+            kprintf("[PAINT] VERDICT: %s exit=%d strokes=%s (a dynamically-"
+                    "linked musl Linux app read the mouse via /dev/input/event1 "
+                    "evdev and painted to /dev/fb0 where we clicked; expect "
+                    "exit0 + strokes ok)\n",
+                    (rc == 0 && pix_ok) ? "PASS" : "FAIL", rc,
+                    pix_ok ? "ok" : "MISMATCH");
+            pit_sleep_ms(3000);
+        }
+    }
+#endif
+
     if (!safemode_skip_gui()) {
         /* Milestone 14: bring up settings + services + session BEFORE
          * shell_init so the desktop+login is already on screen by the

@@ -11,12 +11,18 @@
 
 #include <tobyos/types.h>
 
-/* Push one key make/break into the evdev queue (emits EV_KEY then a
+/* Push one key make/break into the keyboard evdev queue (emits EV_KEY then a
  * SYN_REPORT, exactly like the kernel evdev layer). `code` is the Linux
  * keycode (KEY_*); `value` is 1=press, 0=release, 2=autorepeat. */
 void evdev_feed_key(uint8_t code, int value);
 
-/* Drop any queued events (used by the proof harness before injecting). */
+/* Push one mouse report into the mouse evdev queue: EV_REL motion + BTN_*
+ * edges + a SYN frame. `buttons`/`prev` are the PS/2 button bitmasks
+ * (1=left,2=right,4=middle) now and before this report. */
+void evdev_feed_mouse(int dx, int dy, uint8_t buttons, uint8_t prev);
+
+/* Drop any queued events on all devices (used by proof harnesses before
+ * injecting a deterministic sequence). */
 void evdev_reset(void);
 
 #endif /* TOBYOS_EVDEV_H */
