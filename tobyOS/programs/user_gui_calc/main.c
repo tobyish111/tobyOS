@@ -1,173 +1,31 @@
 /* user_gui_calc/main.c -- Calculator for tobyOS.
  *
- * 280x380 window, 6-row x 4-col button grid. Fixed-point arithmetic
- * (4 decimal places, SCALE=10000) for freestanding environment.
- * Supports +, -, *, /, %, sqrt, negate, decimal, and memory.
+ * Migrated to the TobyTK toolkit (toby/tk.h): a vbox display panel above a
+ * 6x4 grid of buttons laid out by the toolkit's flex engine. The
+ * fixed-point arithmetic + calculator state machine below is unchanged from
+ * the original raw-gui_* version -- only the rendering/input layer moved to
+ * TobyTK so the calculator shares the system theme and widget behaviour.
+ *
+ * Fixed-point (4 decimal places, SCALE=10000). Supports + - * / %, sqrt,
+ * negate, decimal, and memory. Keyboard via the window-level key hook.
  */
 
-typedef unsigned long      size_t;
-typedef long               ssize_t;
-typedef unsigned long long uint64_t;
-typedef long long          int64_t;
-typedef unsigned int       uint32_t;
-typedef int                int32_t;
-typedef unsigned short     uint16_t;
-typedef unsigned char      uint8_t;
+#include <toby/tk.h>
 
-#define SYS_WRITE           1
-#define SYS_YIELD           5
-#define SYS_GUI_CREATE     10
-#define SYS_GUI_FILL       11
-#define SYS_GUI_TEXT       12
-#define SYS_GUI_FLIP       13
-#define SYS_GUI_POLL_EVENT 14
-
-struct gui_event {
-    int     type;
-    int     x;
-    int     y;
-    uint8_t button;
-    uint8_t key;
-    uint8_t _pad[2];
-};
-
-#define GUI_EV_MOUSE_DOWN 2
-#define GUI_EV_KEY        4
-#define GUI_EV_CLOSE      5
-
-/* ── syscall wrappers ─────────────────────────────────────────────── */
-
-static inline ssize_t sys_write(int fd, const void *buf, size_t len) {
-    ssize_t r;
-    __asm__ volatile("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_WRITE), "D"((long)fd), "S"(buf), "d"(len)
-        : "rcx", "r11", "memory");
-    return r;
-}
-
-static inline void sys_yield(void) {
-    long _dummy;
-    __asm__ volatile("syscall"
-        : "=a"(_dummy) : "0"((long)SYS_YIELD)
-        : "rcx", "r11", "memory");
-}
-
-static inline int sys_gui_create(uint32_t w, uint32_t h, const char *title) {
-    long r;
-    __asm__ volatile("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_CREATE), "D"((long)w), "S"((long)h), "d"(title)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-
-static inline int sys_gui_fill(int fd, int x, int y, int w, int h,
-                               uint32_t color) {
-    long r;
-    uint32_t whlen = ((uint32_t)(uint16_t)w) |
-                     (((uint32_t)(uint16_t)h) << 16);
-    register long r10 __asm__("r10") = (long)whlen;
-    register long r8  __asm__("r8")  = (long)color;
-    __asm__ volatile("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_FILL), "D"((long)fd),
-          "S"((long)x), "d"((long)y),
-          "r"(r10), "r"(r8)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-
-static inline int sys_gui_text(int fd, int x, int y, const char *s,
-                               uint32_t fg, uint32_t bg) {
-    long r;
-    uint32_t xy = ((uint32_t)(uint16_t)x) | (((uint32_t)(uint16_t)y) << 16);
-    register long r10 __asm__("r10") = (long)fg;
-    register long r8  __asm__("r8")  = (long)bg;
-    __asm__ volatile("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_TEXT), "D"((long)fd),
-          "S"((long)xy), "d"(s),
-          "r"(r10), "r"(r8)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-
-static inline int sys_gui_flip(int fd) {
-    long r;
-    __asm__ volatile("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_FLIP), "D"((long)fd)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-
-static inline int sys_gui_poll_event(int fd, struct gui_event *ev) {
-    long r;
-    __asm__ volatile("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_POLL_EVENT), "D"((long)fd), "S"(ev)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-
-/* ── layout constants ─────────────────────────────────────────────── */
-
-#define WIN_W 280
-#define WIN_H 380
-
-#define COL_BG      0x001E1E2Eu
-#define COL_BTN     0x00313244u
-#define COL_DISPLAY 0x00181825u
-#define COL_TEXT    0x00CDD6F4u
-#define COL_OP      0x00F38BA8u
-#define COL_EQ      0x00A6E3A1u
-#define COL_MEM     0x00585B70u
-#define COL_DIM     0x00585B70u
-#define COL_BORDER  0x0045475Au
-
-#define MARGIN   8
-#define GAP      4
-#define DISP_H   70
-#define GRID_TOP (MARGIN + DISP_H + GAP)
-#define ROWS     6
-#define COLS     4
-
-#define BTN_W ((WIN_W - 2 * MARGIN - (COLS - 1) * GAP) / COLS)
-#define BTN_H ((WIN_H - GRID_TOP - MARGIN - (ROWS - 1) * GAP) / ROWS)
-
-#define SCALE 10000LL
-
-/* ── button identifiers (row-major order) ─────────────────────────── */
-
-enum {
-    B_MC, B_MR, B_MADD, B_MSUB,
-    B_C,  B_NEG, B_PCT, B_DIV,
-    B_7,  B_8,   B_9,   B_MUL,
-    B_4,  B_5,   B_6,   B_SUB,
-    B_1,  B_2,   B_3,   B_ADD,
-    B_0,  B_DOT, B_SQRT, B_EQ,
-    B_COUNT
-};
-
-static const char *btn_labels[B_COUNT] = {
-    "MC", "MR", "M+", "M-",
-    "C",  "+/-", "%",  "/",
-    "7",  "8",   "9",  "*",
-    "4",  "5",   "6",  "-",
-    "1",  "2",   "3",  "+",
-    "0",  ".",   "sq", "=",
-};
+typedef unsigned long long uint64_t_;
+typedef long long          int64_t_;
 
 /* ── utility ──────────────────────────────────────────────────────── */
 
-static size_t my_strlen(const char *s) {
+static unsigned long my_strlen(const char *s) {
     const char *p = s;
     while (*p) p++;
-    return (size_t)(p - s);
+    return (unsigned long)(p - s);
 }
 
-static void fixed_to_str(char *out, int cap, int64_t val) {
+#define SCALE 10000LL
+
+static void fixed_to_str(char *out, int cap, long long val) {
     if (cap <= 0) return;
     int pos = 0;
 
@@ -176,8 +34,8 @@ static void fixed_to_str(char *out, int cap, int64_t val) {
         val = -val;
     }
 
-    int64_t ipart = val / SCALE;
-    int64_t frac  = val % SCALE;
+    long long ipart = val / SCALE;
+    long long frac  = val % SCALE;
 
     char tmp[20];
     int n = 0;
@@ -204,18 +62,48 @@ static void fixed_to_str(char *out, int cap, int64_t val) {
     out[pos] = '\0';
 }
 
-static int64_t isqrt64(int64_t n) {
+static long long isqrt64(long long n) {
     if (n <= 0) return 0;
-    int64_t x = n, y = (x + 1) / 2;
+    long long x = n, y = (x + 1) / 2;
     while (y < x) { x = y; y = (x + n / x) / 2; }
     return x;
 }
 
+/* ── button identifiers (row-major order) ─────────────────────────── */
+
+enum {
+    B_MC, B_MR, B_MADD, B_MSUB,
+    B_C,  B_NEG, B_PCT, B_DIV,
+    B_7,  B_8,   B_9,   B_MUL,
+    B_4,  B_5,   B_6,   B_SUB,
+    B_1,  B_2,   B_3,   B_ADD,
+    B_0,  B_DOT, B_SQRT, B_EQ,
+    B_COUNT
+};
+
+static const char *btn_labels[B_COUNT] = {
+    "MC", "MR", "M+", "M-",
+    "C",  "+/-", "%",  "/",
+    "7",  "8",   "9",  "*",
+    "4",  "5",   "6",  "-",
+    "1",  "2",   "3",  "+",
+    "0",  ".",   "sq", "=",
+};
+
+/* Calculator palette (kept from the original for visual identity). */
+#define COL_DISPLAY 0x00181825u
+#define COL_TEXT    0x00CDD6F4u
+#define COL_OP      0x00F38BA8u
+#define COL_EQ      0x00A6E3A1u
+#define COL_MEM     0x00585B70u
+#define COL_DIM     0x00A6ADC8u
+#define COL_DARK    0x001E1E2Eu
+
 /* ── calculator state ─────────────────────────────────────────────── */
 
-static int64_t current;
-static int64_t accum;
-static int64_t memory;
+static long long current;
+static long long accum;
+static long long memory;
 static char    pending_op;
 static int     new_entry;
 static int     has_accum;
@@ -244,7 +132,7 @@ static void reset_all(void) {
 }
 
 /* fixed-point ops: a and b are scaled by SCALE */
-static int64_t apply_op(int64_t a, int64_t b, char op) {
+static long long apply_op(long long a, long long b, char op) {
     switch (op) {
     case '+': return a + b;
     case '-': return a - b;
@@ -260,22 +148,22 @@ static int64_t apply_op(int64_t a, int64_t b, char op) {
 
 static void push_digit(int d) {
     if (new_entry) {
-        current = (int64_t)d * SCALE;
+        current = (long long)d * SCALE;
         new_entry = 0;
         decimal_mode = 0;
         decimal_places = 0;
     } else if (decimal_mode) {
         if (decimal_places >= 4) return;
         decimal_places++;
-        int64_t mult = SCALE;
+        long long mult = SCALE;
         for (int i = 0; i < decimal_places; i++) mult /= 10;
         if (current < 0)
-            current -= (int64_t)d * mult;
+            current -= (long long)d * mult;
         else
-            current += (int64_t)d * mult;
+            current += (long long)d * mult;
     } else {
-        int64_t ip = current / SCALE;
-        int64_t next = ip * 10 + (ip >= 0 ? d : -d);
+        long long ip = current / SCALE;
+        long long next = ip * 10 + (ip >= 0 ? d : -d);
         if (next > 999999999LL || next < -999999999LL) return;
         current = next * SCALE;
     }
@@ -293,7 +181,7 @@ static void push_dot(void) {
     update_display();
 }
 
-static void build_expr(int64_t val, char op) {
+static void build_expr(long long val, char op) {
     fixed_to_str(expr_line, (int)sizeof(expr_line) - 3, val);
     int len = (int)my_strlen(expr_line);
     expr_line[len++] = ' ';
@@ -353,76 +241,6 @@ static void push_sqrt_fn(void) {
     update_display();
 }
 
-/* ── grid helpers ─────────────────────────────────────────────────── */
-
-static int btn_x(int col) { return MARGIN + col * (BTN_W + GAP); }
-static int btn_y(int row) { return GRID_TOP + row * (BTN_H + GAP); }
-
-static int hit_test(int mx, int my) {
-    for (int r = 0; r < ROWS; r++)
-        for (int c = 0; c < COLS; c++) {
-            int bx = btn_x(c), by = btn_y(r);
-            if (mx >= bx && mx < bx + BTN_W &&
-                my >= by && my < by + BTN_H)
-                return r * COLS + c;
-        }
-    return -1;
-}
-
-static void btn_colors(int id, uint32_t *bg, uint32_t *fg) {
-    *bg = COL_BTN;
-    *fg = COL_TEXT;
-
-    if (id <= B_MSUB)
-        { *bg = COL_MEM; }
-    else if (id == B_DIV || id == B_MUL || id == B_SUB || id == B_ADD)
-        { *bg = COL_OP; *fg = COL_BG; }
-    else if (id == B_EQ)
-        { *bg = COL_EQ; *fg = COL_BG; }
-    else if (id == B_C)
-        { *fg = COL_OP; }
-}
-
-/* ── drawing ──────────────────────────────────────────────────────── */
-
-static void draw(int fd) {
-    sys_gui_fill(fd, 0, 0, WIN_W, WIN_H, COL_BG);
-
-    int dx = MARGIN, dy = MARGIN, dw = WIN_W - 2 * MARGIN;
-    sys_gui_fill(fd, dx, dy, dw, DISP_H, COL_DISPLAY);
-    sys_gui_fill(fd, dx, dy, dw, 1, COL_BORDER);
-    sys_gui_fill(fd, dx, dy + DISP_H - 1, dw, 1, COL_BORDER);
-
-    if (expr_line[0])
-        sys_gui_text(fd, dx + 8, dy + 6, expr_line, COL_DIM, COL_DISPLAY);
-
-    if (memory != 0)
-        sys_gui_text(fd, dx + 8, dy + 22, "M", COL_DIM, COL_DISPLAY);
-
-    int dlen = (int)my_strlen(display);
-    int tx = dx + dw - 8 - dlen * 8;
-    if (tx < dx + 8) tx = dx + 8;
-    sys_gui_text(fd, tx, dy + 42, display, COL_TEXT, COL_DISPLAY);
-
-    for (int i = 0; i < B_COUNT; i++) {
-        int r = i / COLS, c = i % COLS;
-        int bx = btn_x(c), by = btn_y(r);
-        uint32_t bg, fg;
-        btn_colors(i, &bg, &fg);
-        sys_gui_fill(fd, bx, by, BTN_W, BTN_H, bg);
-
-        const char *lbl = btn_labels[i];
-        int llen = (int)my_strlen(lbl);
-        int ltx = bx + BTN_W / 2 - llen * 4;
-        int lty = by + BTN_H / 2 - 6;
-        sys_gui_text(fd, ltx, lty, lbl, fg, bg);
-    }
-
-    sys_gui_flip(fd);
-}
-
-/* ── input dispatch ───────────────────────────────────────────────── */
-
 static int digit_for_btn(int id) {
     if (id == B_0) return 0;
     if (id >= B_7 && id <= B_9) return 7 + (id - B_7);
@@ -459,7 +277,7 @@ static void handle_btn(int id) {
     }
 }
 
-static void handle_key(uint8_t key) {
+static void handle_key(unsigned char key) {
     if (key >= '0' && key <= '9')                    push_digit(key - '0');
     else if (key == '.')                             push_dot();
     else if (key == '+')                             push_op('+');
@@ -472,9 +290,9 @@ static void handle_key(uint8_t key) {
     else if (key == 8 || key == 127) {
         if (!new_entry) {
             if (decimal_mode && decimal_places > 0) {
-                int64_t mult = SCALE;
+                long long mult = SCALE;
                 for (int i = 0; i < decimal_places; i++) mult /= 10;
-                int64_t last_digit;
+                long long last_digit;
                 if (current >= 0)
                     last_digit = (current / mult) % 10;
                 else
@@ -487,7 +305,7 @@ static void handle_key(uint8_t key) {
                 if (decimal_places == 0 && (current % SCALE) == 0)
                     decimal_mode = 0;
             } else if (!decimal_mode) {
-                int64_t ip = current / SCALE;
+                long long ip = current / SCALE;
                 ip /= 10;
                 current = ip * SCALE;
                 if (ip == 0) new_entry = 1;
@@ -497,43 +315,82 @@ static void handle_key(uint8_t key) {
     }
 }
 
-/* ── main ─────────────────────────────────────────────────────────── */
+/* ── TobyTK UI ────────────────────────────────────────────────────── */
+
+static struct tk_window win;
+static struct tk_widget *w_expr;     /* small dim expression line   */
+static struct tk_widget *w_disp;     /* large current-value display */
+
+static void refresh(struct tk_window *w) {
+    char ex[56];
+    int p = 0;
+    if (memory != 0) { ex[p++] = 'M'; ex[p++] = ' '; }
+    for (int i = 0; expr_line[i] && p < (int)sizeof(ex) - 1; i++) ex[p++] = expr_line[i];
+    ex[p] = '\0';
+    tk_set_text(w, w_expr, ex);
+    tk_set_text(w, w_disp, display);
+}
+
+static void on_btn(struct tk_window *w, struct tk_widget *b) {
+    handle_btn((int)(long)b->user);
+    refresh(w);
+}
+
+static void on_key(struct tk_window *w, struct tk_event *ev) {
+    if (ev->key == 27 || ev->key == 'q') { tk_quit(w); return; }
+    handle_key(ev->key);
+    refresh(w);
+}
+
+static void make_button(struct tk_widget *row, int id) {
+    struct tk_widget *b = tk_button(&win, row, btn_labels[id], on_btn);
+    if (!b) return;
+    b->user = (void *)(long)id;
+    tk_grow(b, 1);
+    tk_font(b, 17);
+    /* per-type colours (kept from the original identity) */
+    if (id <= B_MSUB)
+        tk_colors(b, COL_MEM, COL_TEXT);
+    else if (id == B_DIV || id == B_MUL || id == B_SUB || id == B_ADD)
+        tk_colors(b, COL_OP, COL_DARK);
+    else if (id == B_EQ)
+        tk_colors(b, COL_EQ, COL_DARK);
+    else if (id == B_C)
+        tk_colors(b, 0, COL_OP);
+}
 
 int main(int argc, char **argv);
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
-    int fd = sys_gui_create(WIN_W, WIN_H, "Calculator");
-    if (fd < 0) {
-        const char *msg = "gui_calc: sys_gui_create failed\n";
-        sys_write(1, msg, my_strlen(msg));
+    if (tk_window_open(&win, 280, 380, "Calculator") != 0)
         return 1;
-    }
 
     reset_all();
-    draw(fd);
+    tk_on_key(&win, on_key);
 
-    for (;;) {
-        struct gui_event ev;
-        int got = sys_gui_poll_event(fd, &ev);
-        if (got <= 0) { sys_yield(); continue; }
+    struct tk_widget *root = tk_root(&win);
+    tk_pad(root, 8);
+    root->gap = 8;
 
-        if (ev.type == GUI_EV_CLOSE)
-            return 0;
+    /* display panel */
+    struct tk_widget *disp = tk_vbox(&win, root, 2);
+    tk_size(disp, 0, 74);
+    tk_pad(disp, 8);
+    tk_colors(disp, COL_DISPLAY, 0);
+    w_expr = tk_align(tk_font(tk_colors(tk_label(&win, disp, ""), 0, COL_DIM), 13), TK_ALIGN_RIGHT);
+    w_disp = tk_align(tk_grow(tk_font(tk_colors(tk_label(&win, disp, "0"), 0, COL_TEXT), 30), 1), TK_ALIGN_RIGHT);
 
-        int dirty = 0;
-
-        if (ev.type == GUI_EV_KEY) {
-            if (ev.key == 'q' || ev.key == 27) return 0;
-            handle_key(ev.key);
-            dirty = 1;
-        }
-
-        if (ev.type == GUI_EV_MOUSE_DOWN) {
-            int id = hit_test(ev.x, ev.y);
-            if (id >= 0) { handle_btn(id); dirty = 1; }
-        }
-
-        if (dirty) draw(fd);
+    /* 6x4 button grid */
+    struct tk_widget *grid = tk_vbox(&win, root, 6);
+    tk_grow(grid, 1);
+    for (int r = 0; r < 6; r++) {
+        struct tk_widget *row = tk_hbox(&win, grid, 6);
+        tk_grow(row, 1);
+        for (int c = 0; c < 4; c++)
+            make_button(row, r * 4 + c);
     }
+
+    refresh(&win);
+    return tk_run(&win);
 }

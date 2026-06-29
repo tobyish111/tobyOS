@@ -2418,7 +2418,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT) || defined(WINPE16D_BOOT) || defined(WINPE18C_BOOT) || defined(WINPE25_BOOT) || defined(TKDEMO_BOOT) || defined(THREEWORLDS_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT) || defined(WINPE16D_BOOT) || defined(WINPE18C_BOOT) || defined(WINPE25_BOOT) || defined(TKDEMO_BOOT) || defined(TKAPP_BOOT) || defined(THREEWORLDS_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -7616,6 +7616,66 @@ void _start(void) {
                     (sp && sp->state != PROC_TERMINATED) ? "ALIVE" : "EXITED");
             winpe8_pump_ms(8000);
         }
+    }
+#endif
+
+#ifdef TKAPP_BOOT
+    /* Generic TobyTK migration screenshot harness: auto-login, launch one
+     * TobyTK app, optionally type some keys, then hold for a QMP screenshot
+     * before idle_loop keeps the desktop live. Parametrised by macros so any
+     * app is a one-flag build (edit the #defines below per app, or override on
+     * the command line):
+     *   EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DTKAPP_BOOT"
+     * Ordering mirrors THREEWORLDS_BOOT: spawn the app WHILE login is still
+     * alive (the desktop pump stalls if user-procs hit zero), then dismiss
+     * login, and use a guard-capped pump (TKA_PUMP) not winpe8_pump_ms. */
+    #ifndef TKAPP_PATH
+    #define TKAPP_PATH "/bin/gui_about"
+    #endif
+    #ifndef TKAPP_NAME
+    #define TKAPP_NAME "gui_about"
+    #endif
+    #ifndef TKAPP_KEYS
+    #define TKAPP_KEYS ""       /* keys typed after launch; "" for none */
+    #endif
+    {
+        #define TKA_PUMP(ms) do { \
+            uint64_t _hz = pit_hz(); if (!_hz) _hz = 1000; \
+            uint64_t _end = pit_ticks() + ((uint64_t)(ms) * _hz + 999) / 1000; \
+            long _g = 0; \
+            while (pit_ticks() < _end && _g < 4000000L) { \
+                sched_yield(); mouse_flush_pending(); kbd_flush_pending(); \
+                gui_tick(); _g++; \
+            } \
+        } while (0)
+
+        kprintf("[TKAPP] autologin (session_login root)\n");
+        session_login("root", "");
+        kprintf("[TKAPP] launching %s (TobyTK) first\n", TKAPP_PATH);
+        int spid = winpe_spawn_session_app(TKAPP_PATH, TKAPP_NAME);
+        TKA_PUMP(1500);
+
+        /* dismiss login now that the app keeps the proc count >= 1 */
+        service_stop("login");
+        for (int pid = 1; pid < 64; pid++) {
+            struct proc *p = proc_lookup(pid);
+            if (p && p->name[0] && strcmp(p->name, "login") == 0)
+                signal_send_to_pid(pid, SIGKILL);
+        }
+        gui_invalidate_full();
+        TKA_PUMP(600);
+
+        const char *keys = TKAPP_KEYS;
+        if (keys[0]) {
+            kprintf("[TKAPP] %s pid=%d up; typing '%s'\n", TKAPP_NAME, spid, keys);
+            for (const char *p = keys; *p; p++) { gui_post_key((uint8_t)*p); TKA_PUMP(300); }
+        }
+
+        struct proc *sp = proc_lookup(spid);
+        kprintf("[TKAPP] %s %s; holding ~8s for screenshot\n", TKAPP_NAME,
+                (sp && sp->state != PROC_TERMINATED) ? "ALIVE" : "EXITED");
+        TKA_PUMP(8000);
+        #undef TKA_PUMP
     }
 #endif
 

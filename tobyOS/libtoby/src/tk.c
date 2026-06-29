@@ -90,6 +90,43 @@ static int g_text_w(const char *s, int px, int face) {
     long r = sc2(ABI_SYS_GUI_TEXT_TTF_WIDTH, (long)s, a2);
     return r < 0 ? 0 : (int)r;
 }
+/* RECT (outline): a2=x, a3=y, a4=(w&0xFFFF)|(h<<16), a5=color */
+static void g_rect(int fd, int x, int y, int w, int h, uint32_t c) {
+    if (w <= 0 || h <= 0) return;
+    long wh = ((long)(uint16_t)w) | ((long)(uint16_t)h << 16);
+    sc5(ABI_SYS_GUI_RECT, fd, x, y, wh, (long)c);
+}
+/* CIRCLE (filled): a2=(cx&0xFFFF)|(cy<<16) int16, a3=radius, a4=color */
+static void g_circle(int fd, int cx, int cy, int r, uint32_t c) {
+    if (r <= 0) return;
+    long a2 = ((long)(uint16_t)cx) | ((long)(uint16_t)cy << 16);
+    sc5(ABI_SYS_GUI_CIRCLE, fd, a2, r, (long)c, 0);
+}
+/* CIRCLE_OUTLINE: same packing as CIRCLE */
+static void g_circle_outline(int fd, int cx, int cy, int r, uint32_t c) {
+    if (r <= 0) return;
+    long a2 = ((long)(uint16_t)cx) | ((long)(uint16_t)cy << 16);
+    sc5(ABI_SYS_GUI_CIRCLE_OUTLINE, fd, a2, r, (long)c, 0);
+}
+/* BLIT (opaque): a2=(dx&0xFFFF)|(dy<<16) int16, a3=src(uint32_t*),
+ *                a4=(w&0xFFFF)|(h<<16) int16. The kernel treats src as a
+ * tightly-packed w*h ARGB buffer, so a strided source is blitted row-wise. */
+static void g_blit(int fd, int dx, int dy, int w, int h,
+                   const uint32_t *src, int pitch, int op) {
+    if (w <= 0 || h <= 0 || !src) return;
+    if (pitch <= 0) pitch = w;
+    if (pitch == w) {
+        long a2 = ((long)(uint16_t)dx) | ((long)(uint16_t)dy << 16);
+        long a4 = ((long)(uint16_t)w) | ((long)(uint16_t)h << 16);
+        sc5(op, fd, a2, (long)src, a4, 0);
+        return;
+    }
+    for (int r = 0; r < h; r++) {
+        long a2 = ((long)(uint16_t)dx) | ((long)(uint16_t)(dy + r) << 16);
+        long a4 = ((long)(uint16_t)w) | ((long)(uint16_t)1 << 16);
+        sc5(op, fd, a2, (long)(src + (long)r * pitch), a4, 0);
+    }
+}
 
 /* ---- tiny local helpers (avoid libc header coupling) ---------------- */
 
@@ -101,6 +138,29 @@ static void t_strcpy_cap(char *d, const char *s, int cap) {
     d[i] = '\0';
 }
 static void t_zero(void *p, int n) { char *c = (char *)p; for (int i = 0; i < n; i++) c[i] = 0; }
+
+/* Line iteration over NUL-terminated, '\n'-separated text (TK_TEXTAREA). */
+static int t_line_count(const char *s) {
+    if (!s || !*s) return 0;
+    int n = 1;
+    for (const char *p = s; *p; p++) if (*p == '\n') n++;
+    return n;
+}
+/* Pointer to start of line `idx` (0-based); sets *len to its length sans NL. */
+static const char *t_line_at(const char *s, int idx, int *len) {
+    if (len) *len = 0;
+    if (!s) return 0;
+    const char *p = s;
+    for (int line = 0; line < idx; line++) {
+        while (*p && *p != '\n') p++;
+        if (!*p) return 0;
+        p++;
+    }
+    const char *e = p;
+    while (*e && *e != '\n') e++;
+    if (len) *len = (int)(e - p);
+    return p;
+}
 
 /* ---- theme ---------------------------------------------------------- */
 
@@ -228,6 +288,55 @@ struct tk_widget *tk_separator(struct tk_window *win, struct tk_widget *p) {
     if (w) attach(win, p, w);
     return w;
 }
+struct tk_widget *tk_canvas(struct tk_window *win, struct tk_widget *p, tk_cb on_paint) {
+    struct tk_widget *w = alloc_widget(win, TK_CANVAS);
+    if (w) {
+        w->on_paint = on_paint;
+        w->focusable = 1;        /* so it can take keyboard focus on click */
+        attach(win, p, w);
+    }
+    return w;
+}
+struct tk_widget *tk_on_event(struct tk_widget *w, tk_event_cb on_event) {
+    if (w) w->on_event = on_event;
+    return w;
+}
+struct tk_widget *tk_table(struct tk_window *win, struct tk_widget *p,
+                           const char *const *headers, const int *col_w, int ncols) {
+    struct tk_widget *w = alloc_widget(win, TK_TABLE);
+    if (w) {
+        w->th = headers; w->col_w = col_w; w->ncols = ncols;
+        w->nrows = 0; w->sel = -1; w->scroll = 0;
+        w->focusable = 1;
+        attach(win, p, w);
+    }
+    return w;
+}
+void tk_table_rows(struct tk_window *win, struct tk_widget *w, int nrows,
+                   const char *(*cell)(void *user, int row, int col), void *user) {
+    if (!w) return;
+    w->nrows = nrows < 0 ? 0 : nrows;
+    w->cell = cell; w->cell_user = user;
+    if (w->sel >= w->nrows) w->sel = w->nrows - 1;
+    if (win) win->want_redraw = 1;
+}
+int tk_table_selected(struct tk_widget *w) { return w ? w->sel : -1; }
+struct tk_widget *tk_textarea(struct tk_window *win, struct tk_widget *p, const char *text) {
+    struct tk_widget *w = alloc_widget(win, TK_TEXTAREA);
+    if (w) {
+        w->ta_text = text ? text : "";
+        w->scroll = 0;
+        w->focusable = 1;
+        attach(win, p, w);
+    }
+    return w;
+}
+void tk_textarea_set(struct tk_window *win, struct tk_widget *w, const char *text) {
+    if (!w) return;
+    w->ta_text = text ? text : "";
+    w->scroll = 0;
+    if (win) win->want_redraw = 1;
+}
 
 /* ---- configuration -------------------------------------------------- */
 
@@ -242,6 +351,50 @@ struct tk_widget *tk_colors(struct tk_widget *w, uint32_t bg, uint32_t fg) {
 }
 struct tk_widget *tk_font(struct tk_widget *w, int px) { if (w) w->font_px = px; return w; }
 struct tk_widget *tk_bold(struct tk_widget *w)         { if (w) w->bold = 1;     return w; }
+
+/* ---- canvas draw API (public; wraps the verified g_* primitives) ---- */
+
+void tk_geom(struct tk_widget *w, int *x, int *y, int *ww, int *hh) {
+    if (x)  *x  = w ? w->x : 0;
+    if (y)  *y  = w ? w->y : 0;
+    if (ww) *ww = w ? w->w : 0;
+    if (hh) *hh = w ? w->h : 0;
+}
+void tk_draw_fill(struct tk_window *win, int x, int y, int w, int h, uint32_t c) {
+    if (win) g_fill(win->fd, x, y, w, h, c);
+}
+void tk_draw_rect(struct tk_window *win, int x, int y, int w, int h, uint32_t c) {
+    if (win) g_rect(win->fd, x, y, w, h, c);
+}
+void tk_draw_rrect(struct tk_window *win, int x, int y, int w, int h, int rad, uint32_t c) {
+    if (win) g_rrect(win->fd, x, y, w, h, rad, c);
+}
+void tk_draw_line(struct tk_window *win, int x0, int y0, int x1, int y1, uint32_t c) {
+    if (win) g_line(win->fd, x0, y0, x1, y1, c);
+}
+void tk_draw_circle(struct tk_window *win, int cx, int cy, int r, uint32_t c) {
+    if (win) g_circle(win->fd, cx, cy, r, c);
+}
+void tk_draw_circle_outline(struct tk_window *win, int cx, int cy, int r, uint32_t c) {
+    if (win) g_circle_outline(win->fd, cx, cy, r, c);
+}
+void tk_draw_gradient(struct tk_window *win, int x, int y, int w, int h, uint32_t top, uint32_t bot) {
+    if (win) g_gradient(win->fd, x, y, w, h, top, bot);
+}
+void tk_draw_text(struct tk_window *win, int x, int y, const char *s, uint32_t fg, int px, int bold) {
+    if (win && s) g_text(win->fd, x, y, s, fg, px < 8 ? 8 : px, bold ? 1 : 0);
+}
+int tk_text_width(const char *s, int px, int bold) {
+    return g_text_w(s ? s : "", px < 8 ? 8 : px, bold ? 1 : 0);
+}
+void tk_draw_blit(struct tk_window *win, int x, int y, int w, int h,
+                  const uint32_t *argb, int pitch) {
+    if (win) g_blit(win->fd, x, y, w, h, argb, pitch, ABI_SYS_GUI_BLIT);
+}
+void tk_draw_blit_blend(struct tk_window *win, int x, int y, int w, int h,
+                        const uint32_t *argb, int pitch) {
+    if (win) g_blit(win->fd, x, y, w, h, argb, pitch, ABI_SYS_GUI_BLIT_BLEND);
+}
 
 /* ---- accessors ------------------------------------------------------ */
 
@@ -281,6 +434,7 @@ void tk_rewind(struct tk_window *win, int cp) {
 }
 struct tk_widget *tk_root(struct tk_window *win) { return win ? win->root : 0; }
 void tk_maximize(struct tk_window *win) { if (win) g_state(win->fd, TK_WIN_MAXIMIZED); }
+void tk_on_key(struct tk_window *win, tk_key_cb on_key) { if (win) win->on_key = on_key; }
 
 /* ---- font helpers --------------------------------------------------- */
 
@@ -290,6 +444,7 @@ static int wid_px(struct tk_window *win, struct tk_widget *w) {
     return px;
 }
 #define LIST_ITEM_H 22
+#define TABLE_HEAD_H 24
 
 /* ---- measure (natural size) ----------------------------------------- */
 
@@ -308,6 +463,11 @@ static int leaf_w(struct tk_window *win, struct tk_widget *w) {
     case TK_PROGRESS: return 140;
     case TK_SLIDER:   return 140;
     case TK_LISTBOX:  return 180;
+    case TK_TABLE: {
+        int tw = 0;
+        for (int i = 0; i < w->ncols && w->col_w; i++) tw += w->col_w[i];
+        return tw > 0 ? tw + 2 : 240;
+    }
     default:          return 0;
     }
 }
@@ -322,6 +482,10 @@ static int leaf_h(struct tk_window *win, struct tk_widget *w) {
     case TK_PROGRESS: return 18;
     case TK_SLIDER:   return 24;
     case TK_LISTBOX:  return LIST_ITEM_H * (w->n_items > 0 ? w->n_items : 1) + 4;
+    case TK_TABLE: {
+        int rows = w->nrows > 0 ? (w->nrows < 8 ? w->nrows : 8) : 3;
+        return (w->th ? TABLE_HEAD_H : 0) + rows * LIST_ITEM_H + 4;
+    }
     default:          return 0;
     }
 }
@@ -565,6 +729,83 @@ static void paint_widget(struct tk_window *win, struct tk_widget *w) {
         if (fillw > 0) g_fill(win->fd, w->x + 1, w->y + 1, fillw, w->h - 2, t->track_fill);
         break;
     }
+    case TK_CANVAS:
+        if (w->bg) g_fill(win->fd, w->x, w->y, w->w, w->h, w->bg);
+        if (w->on_paint) w->on_paint(win, w);
+        break;
+    case TK_TABLE: {
+        g_fill(win->fd, w->x, w->y, w->w, w->h, t->list_bg);
+        border(win, w->x, w->y, w->w, w->h, w->focused ? t->focus_ring : t->field_border);
+        int head_h = w->th ? TABLE_HEAD_H : 0;
+        if (w->th) {
+            g_fill(win->fd, w->x + 1, w->y + 1, w->w - 2, head_h - 1, t->panel_bg);
+            g_fill(win->fd, w->x + 1, w->y + head_h, w->w - 2, 1, t->border);
+            int cx = w->x + 8;
+            int hpy = w->y + (head_h - px) / 2; if (hpy < w->y + 1) hpy = w->y + 1;
+            for (int c = 0; c < w->ncols; c++) {
+                if (w->th[c]) g_text(win->fd, cx, hpy, w->th[c], t->text_dim, px, 1);
+                cx += w->col_w ? w->col_w[c] : 80;
+            }
+        }
+        int area_y = w->y + head_h + 1;
+        int area_h = w->h - head_h - 2;
+        int vis = area_h / LIST_ITEM_H; if (vis < 1) vis = 1;
+        if (w->sel >= 0) {
+            if (w->scroll > w->sel) w->scroll = w->sel;
+            if (w->scroll + vis <= w->sel) w->scroll = w->sel - vis + 1;
+        }
+        if (w->scroll < 0) w->scroll = 0;
+        for (int i = 0; i < vis; i++) {
+            int row = w->scroll + i;
+            if (row >= w->nrows) break;
+            int ry = area_y + i * LIST_ITEM_H;
+            if (row == w->sel) g_fill(win->fd, w->x + 1, ry, w->w - 2, LIST_ITEM_H, t->list_sel);
+            int cx = w->x + 8;
+            int tpy = ry + (LIST_ITEM_H - px) / 2; if (tpy < ry) tpy = ry;
+            for (int c = 0; c < w->ncols; c++) {
+                const char *s = w->cell ? w->cell(w->cell_user, row, c) : "";
+                if (s) g_text(win->fd, cx, tpy, s, t->list_text, px, 0);
+                cx += w->col_w ? w->col_w[c] : 80;
+            }
+        }
+        if (w->nrows > vis) {
+            int thumb = area_h * vis / w->nrows; if (thumb < 8) thumb = 8;
+            int sy = area_y + (area_h - thumb) * w->scroll / (w->nrows - vis);
+            g_fill(win->fd, w->x + w->w - 5, sy, 3, thumb, t->border);
+        }
+        break;
+    }
+    case TK_TEXTAREA: {
+        g_fill(win->fd, w->x, w->y, w->w, w->h, t->field_bg);
+        border(win, w->x, w->y, w->w, w->h, w->focused ? t->focus_ring : t->field_border);
+        int pad = 6;
+        int line_h = px + 4;
+        int vis = (w->h - 2 * pad) / line_h; if (vis < 1) vis = 1;
+        int total = t_line_count(w->ta_text);
+        int maxscroll = total - vis; if (maxscroll < 0) maxscroll = 0;
+        if (w->scroll > maxscroll) w->scroll = maxscroll;
+        if (w->scroll < 0) w->scroll = 0;
+        int avail = w->w - 2 * pad;
+        for (int i = 0; i < vis; i++) {
+            int ll;
+            const char *lp = t_line_at(w->ta_text, w->scroll + i, &ll);
+            if (!lp) break;
+            char line[256];
+            int n = ll < (int)sizeof(line) - 1 ? ll : (int)sizeof(line) - 1;
+            for (int k = 0; k < n; k++) line[k] = lp[k];
+            line[n] = '\0';
+            while (n > 0 && g_text_w(line, px, 0) > avail) line[--n] = '\0';
+            if (n > 0)
+                g_text(win->fd, w->x + pad, w->y + pad + i * line_h, line, t->field_text, px, 0);
+        }
+        if (total > vis) {
+            int track_h = w->h - 4;
+            int thumb = track_h * vis / total; if (thumb < 8) thumb = 8;
+            int sy = w->y + 2 + (track_h - thumb) * w->scroll / (total - vis);
+            g_fill(win->fd, w->x + w->w - 5, sy, 3, thumb, t->border);
+        }
+        break;
+    }
     default: break;
     }
 
@@ -658,6 +899,21 @@ static void dispatch(struct tk_window *win, struct tk_event *ev) {
         } else if (h->kind == TK_SLIDER) {
             win->capture = h;
             slider_set_from_x(win, h, ev->x);
+        } else if (h->kind == TK_CANVAS) {
+            win->capture = h;
+            if (h->on_event) h->on_event(win, h, ev);
+        } else if (h->kind == TK_TABLE) {
+            int head_h = h->th ? TABLE_HEAD_H : 0;
+            int rel = ev->y - (h->y + head_h + 1);
+            if (rel >= 0) {
+                int row = h->scroll + rel / LIST_ITEM_H;
+                if (row >= 0 && row < h->nrows) {
+                    h->sel = row;
+                    if (h->on_click) h->on_click(win, h);
+                    if (h->on_change) h->on_change(win, h);
+                    win->want_redraw = 1;
+                }
+            }
         }
         return;
     }
@@ -670,6 +926,8 @@ static void dispatch(struct tk_window *win, struct tk_event *ev) {
             win->want_redraw = 1;
             if (was && point_in(cap, ev->x, ev->y) && cap->on_click)
                 cap->on_click(win, cap);
+        } else if (cap && cap->kind == TK_CANVAS) {
+            if (cap->on_event) cap->on_event(win, cap, ev);
         }
         return;
     }
@@ -680,6 +938,8 @@ static void dispatch(struct tk_window *win, struct tk_event *ev) {
             if (now != cap->pressed) { cap->pressed = now; win->want_redraw = 1; }
         } else if (cap && cap->kind == TK_SLIDER) {
             slider_set_from_x(win, cap, ev->x);
+        } else if (cap && cap->kind == TK_CANVAS) {
+            if (cap->on_event) cap->on_event(win, cap, ev);
         } else {
             /* hover tracking */
             struct tk_widget *h = hit_test(win->root, ev->x, ev->y);
@@ -697,6 +957,7 @@ static void dispatch(struct tk_window *win, struct tk_event *ev) {
         return;
     }
     case TK_EV_KEY: {
+        if (win->on_key) { win->on_key(win, ev); return; }
         struct tk_widget *f = win->focus;
         if (!f) return;
         if (f->kind == TK_FIELD) {
@@ -723,6 +984,17 @@ static void dispatch(struct tk_window *win, struct tk_event *ev) {
             } else if (ev->key == TK_KEY_UP && f->value < f->value_max) {
                 f->value++; if (f->on_change) f->on_change(win, f); win->want_redraw = 1;
             }
+        } else if (f->kind == TK_CANVAS) {
+            if (f->on_event) f->on_event(win, f, ev);
+        } else if (f->kind == TK_TABLE) {
+            if (ev->key == TK_KEY_DOWN && f->sel < f->nrows - 1) {
+                f->sel++; if (f->on_change) f->on_change(win, f); win->want_redraw = 1;
+            } else if (ev->key == TK_KEY_UP && f->sel > 0) {
+                f->sel--; if (f->on_change) f->on_change(win, f); win->want_redraw = 1;
+            }
+        } else if (f->kind == TK_TEXTAREA) {
+            if (ev->key == TK_KEY_DOWN) { f->scroll++; win->want_redraw = 1; }
+            else if (ev->key == TK_KEY_UP && f->scroll > 0) { f->scroll--; win->want_redraw = 1; }
         }
         return;
     }

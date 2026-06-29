@@ -1810,14 +1810,18 @@ programs/user_netecho/user_netecho.elf: programs/user_netecho/user_netecho.o \
 	$(LD) $(PROG_LDFLAGS) -T programs/user_netecho/program.ld -o $@ \
 	      programs/common/start.o programs/user_netecho/user_netecho.o
 
-programs/user_gui_demo/user_gui_demo.o: programs/user_gui_demo/main.c
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+# Migrated to TobyTK: the demo app is now the TobyTK widget gallery, so it
+# links libtoby (crt0 + libtoby.a) like gui_calc / gui_settings.
+programs/user_gui_demo/user_gui_demo.o: programs/user_gui_demo/main.c \
+                                        $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
 
 programs/user_gui_demo/user_gui_demo.elf: programs/user_gui_demo/user_gui_demo.o \
-                                          programs/common/start.o \
+                                          $(LIBTOBY_CRT0) \
+                                          $(LIBTOBY_AR) \
                                           programs/user_gui_demo/program.ld
 	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_demo/program.ld -o $@ \
-	      programs/common/start.o programs/user_gui_demo/user_gui_demo.o
+	      $(LIBTOBY_CRT0) programs/user_gui_demo/user_gui_demo.o $(LIBTOBY_AR)
 
 # X2 capstone: native tobyOS GUI tail of the cross-personality pipeline.
 programs/x2gui/x2gui.o: programs/x2gui/main.c
@@ -1857,18 +1861,18 @@ programs/user_gui_widgets/user_gui_widgets.elf: \
 	      programs/common/start.o programs/common/toby_gui.o \
 	      programs/user_gui_widgets/user_gui_widgets.o
 
+# Migrated to TobyTK: links libtoby (crt0 + libtoby.a) like gui_calc.
 programs/user_gui_about/user_gui_about.o: programs/user_gui_about/main.c \
-                                          programs/common/toby_gui.h
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+                                          $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
 
 programs/user_gui_about/user_gui_about.elf: \
         programs/user_gui_about/user_gui_about.o \
-        programs/common/start.o \
-        programs/common/toby_gui.o \
+        $(LIBTOBY_CRT0) \
+        $(LIBTOBY_AR) \
         programs/user_gui_about/program.ld
 	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_about/program.ld -o $@ \
-	      programs/common/start.o programs/common/toby_gui.o \
-	      programs/user_gui_about/user_gui_about.o
+	      $(LIBTOBY_CRT0) programs/user_gui_about/user_gui_about.o $(LIBTOBY_AR)
 
 # Milestone-13 GUI apps: terminal emulator, file manager, text viewer.
 # Each uses raw syscall stubs (no toby_gui toolkit) because they build
@@ -2547,6 +2551,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
+	    bin/gui_calc bin/gui_taskmgr bin/gui_edit bin/gui_browser         \
 	    bin/login bin/gui_settings bin/abi_test                           \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \

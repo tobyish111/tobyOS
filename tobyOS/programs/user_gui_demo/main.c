@@ -1,198 +1,152 @@
-/* user_gui_demo/main.c -- interactive GUI demo for /bin/gui_demo.
+/* user_gui_demo/main.c -- TobyTK widget gallery (/bin/gui_demo).
  *
- * Creates a 320x200 window, paints a checkerboard background with
- * instructions, then loops:
- *   - sys_gui_poll_event() for mouse events
- *   - on MOUSE_DOWN: drop a 16x16 coloured square at the click point
- *     and flip the window
- *   - on MOUSE_MOVE while a button is held: drag a paint trail
- *   - sys_yield() between polls so we don't peg a CPU
- *
- * Ctrl+C from the shell tears the process down; the kernel auto-closes
- * the window via the FILE_KIND_WINDOW close dispatch.
+ * Migrated to the TobyTK toolkit (toby/tk.h). Exercises every widget the
+ * toolkit provides -- the basic set (label/button/field/checkbox/listbox/
+ * slider/progress/separator) plus the additions made for the unify-on-TobyTK
+ * effort: TK_TABLE, TK_TEXTAREA and the TK_CANVAS custom-draw surface. It
+ * doubles as the toolkit's live regression demo: if a widget renders or
+ * behaves wrong, it shows here first.
  */
 
-typedef unsigned long      size_t;
-typedef long               ssize_t;
-typedef unsigned int       uint32_t;
-typedef int                int32_t;
-typedef unsigned short     uint16_t;
-typedef unsigned char      uint8_t;
+#include <toby/tk.h>
 
-#define SYS_WRITE           1
-#define SYS_YIELD           5
-#define SYS_GUI_CREATE     10
-#define SYS_GUI_FILL       11
-#define SYS_GUI_TEXT       12
-#define SYS_GUI_FLIP       13
-#define SYS_GUI_POLL_EVENT 14
+static struct tk_window win;
+static struct tk_widget *w_status;
+static struct tk_widget *w_progress;
 
-#define GUI_EV_NONE        0
-#define GUI_EV_MOUSE_MOVE  1
-#define GUI_EV_MOUSE_DOWN  2
-#define GUI_EV_MOUSE_UP    3
-#define GUI_EV_CLOSE       5
-
-struct gui_event {
-    int     type;
-    int     x;
-    int     y;
-    uint8_t button;
-    uint8_t key;
-    uint8_t _pad[2];
+/* ---- listbox data ---------------------------------------------------- */
+static const char *list_items[] = {
+    "Documents", "Downloads", "Pictures", "Music", "Videos", "Projects",
 };
 
-/* ---- syscall stubs --------------------------------------------- */
-
-static inline ssize_t sys_write(int fd, const void *buf, size_t len) {
-    ssize_t r;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_WRITE), "D"((long)fd), "S"(buf), "d"(len)
-        : "rcx", "r11", "memory");
-    return r;
-}
-/* sys_exit is intentionally not declared here -- start.S calls SYS_EXIT
- * with main's return value, so a return is enough to terminate. */
-
-static inline void sys_yield(void) {
-    long _dummy;
-    __asm__ volatile ("syscall"
-        : "=a"(_dummy) : "0"((long)SYS_YIELD)
-        : "rcx", "r11", "memory");
-}
-static inline int sys_gui_create(uint32_t w, uint32_t h, const char *title) {
-    long r;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_CREATE), "D"((long)w), "S"((long)h), "d"(title)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-static inline int sys_gui_fill(int fd, int x, int y, int w, int h,
-                               uint32_t color) {
-    long r;
-    /* Pack (w, h) into one 32-bit value; both fit in 16 bits. */
-    uint32_t whlen = ((uint32_t)(uint16_t)w) |
-                     (((uint32_t)(uint16_t)h) << 16);
-    register long r10 __asm__("r10") = (long)whlen;
-    register long r8  __asm__("r8")  = (long)color;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_FILL), "D"((long)fd),
-          "S"((long)x), "d"((long)y),
-          "r"(r10), "r"(r8)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-static inline int sys_gui_text(int fd, int x, int y, const char *s,
-                               uint32_t fg, uint32_t bg) {
-    long r;
-    uint32_t xy = ((uint32_t)(uint16_t)x) | (((uint32_t)(uint16_t)y) << 16);
-    register long r10 __asm__("r10") = (long)fg;
-    register long r8  __asm__("r8")  = (long)bg;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_TEXT), "D"((long)fd),
-          "S"((long)xy), "d"(s),
-          "r"(r10), "r"(r8)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-static inline int sys_gui_flip(int fd) {
-    long r;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_FLIP), "D"((long)fd)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-static inline int sys_gui_poll_event(int fd, struct gui_event *ev) {
-    long r;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_POLL_EVENT), "D"((long)fd), "S"(ev)
-        : "rcx", "r11", "memory");
-    return (int)r;
+/* ---- table data (cell accessor; no per-row widgets) ------------------ */
+static const char *const table_headers[] = { "Name", "Type", "Size" };
+static const int    table_widths[]  = { 120, 90, 70 };
+static const char  *table_cells[][3] = {
+    { "kernel.c",   "C source", "210 KB" },
+    { "tk.c",       "C source", "36 KB"  },
+    { "Lato.ttf",   "Font",     "75 KB"  },
+    { "boot.log",   "Log",      "20 KB"  },
+    { "disk.img",   "Image",    "16 MB"  },
+    { "readme.txt", "Text",     "2 KB"   },
+};
+static const char *table_cell(void *user, int row, int col) {
+    (void)user;
+    if (row < 0 || row >= (int)(sizeof(table_cells) / sizeof(table_cells[0]))) return "";
+    if (col < 0 || col > 2) return "";
+    return table_cells[row][col];
 }
 
-/* ---- helpers --------------------------------------------------- */
+static const char *area_text =
+    "TobyTK textarea\n"
+    "----------------\n"
+    "Read-only, scrollable,\n"
+    "antialiased TrueType.\n"
+    "Use Up / Down when focused.\n"
+    "\n"
+    "Editors layer their own\n"
+    "cursor logic over a canvas.\n"
+    "Line 9\n"
+    "Line 10\n"
+    "Line 11 (scroll to see me)\n";
 
-static size_t my_strlen(const char *s) {
-    const char *p = s;
-    while (*p) p++;
-    return (size_t)(p - s);
+/* ---- callbacks ------------------------------------------------------- */
+static void on_ok(struct tk_window *w, struct tk_widget *b) {
+    (void)b; tk_set_text(w, w_status, "OK clicked");
 }
-static void putstr(const char *s) {
-    sys_write(1, s, my_strlen(s));
+static void on_cancel(struct tk_window *w, struct tk_widget *b) {
+    (void)b; tk_set_text(w, w_status, "Cancel clicked");
+}
+static void on_slide(struct tk_window *w, struct tk_widget *s) {
+    tk_set_value(w, w_progress, s->value);
+    char msg[40];
+    int v = s->value, p = 0;
+    const char *pre = "Slider = ";
+    for (int i = 0; pre[i]; i++) msg[p++] = pre[i];
+    if (v >= 100) { msg[p++] = '1'; msg[p++] = '0'; msg[p++] = '0'; }
+    else { if (v >= 10) msg[p++] = '0' + v / 10; msg[p++] = '0' + v % 10; }
+    msg[p] = '\0';
+    tk_set_text(w, w_status, msg);
+}
+static void on_list(struct tk_window *w, struct tk_widget *l) {
+    int i = tk_selected(l);
+    if (i >= 0 && i < (int)(sizeof(list_items) / sizeof(list_items[0])))
+        tk_set_text(w, w_status, list_items[i]);
 }
 
-/* Tiny LCG so each click gets a different colour without dragging in
- * a real RNG. Period is plenty for a demo. */
-static uint32_t g_rng_state = 0xc0ffee01u;
-static uint32_t prng(void) {
-    g_rng_state = g_rng_state * 1103515245u + 12345u;
-    return g_rng_state;
-}
-
-#define WIN_W 320
-#define WIN_H 200
-
-static void paint_background(int fd) {
-    /* Checkerboard so it's obvious the window has its own framebuffer
-     * separate from the desktop background. */
-    const uint32_t a = 0x00203040u;
-    const uint32_t b = 0x00405060u;
-    for (int ty = 0; ty < WIN_H; ty += 16) {
-        for (int tx = 0; tx < WIN_W; tx += 16) {
-            uint32_t c = ((tx ^ ty) & 16) ? a : b;
-            sys_gui_fill(fd, tx, ty, 16, 16, c);
-        }
-    }
-    sys_gui_text(fd, 8,  8,  "tobyOS GUI demo",            0x00FFFFFFu, 0xFF000000u);
-    sys_gui_text(fd, 8,  24, "drag the title to move me",  0x00CCCCCCu, 0xFF000000u);
-    sys_gui_text(fd, 8,  36, "click to drop a paint cell", 0x00CCCCCCu, 0xFF000000u);
-    sys_gui_text(fd, 8,  48, "Ctrl+C in shell to quit",    0x00CCCCCCu, 0xFF000000u);
+/* ---- canvas: prove the tk_draw_* primitive API ----------------------- */
+static void paint_canvas(struct tk_window *w, struct tk_widget *c) {
+    int x, y, cw, ch;
+    tk_geom(c, &x, &y, &cw, &ch);
+    tk_draw_rrect(w, x, y, cw, ch, 8, 0x00141A24);
+    uint32_t sw[5] = { 0x00E06C75, 0x0098C379, 0x00E5C07B, 0x0061AFEF, 0x00C678DD };
+    for (int i = 0; i < 5; i++)
+        tk_draw_fill(w, x + 10 + i * 26, y + 10, 22, 22, sw[i]);
+    int cx = x + cw - 40, cy = y + 30;
+    tk_draw_circle(w, cx, cy, 18, 0x0061AFEF);
+    tk_draw_circle_outline(w, cx, cy, 18, 0x00FFFFFF);
+    tk_draw_line(w, x + 10, y + 50, x + cw - 10, y + 50, 0x00343A45);
+    tk_draw_text(w, x + 10, y + ch - 22, "tk_draw_* canvas", 0x00C8D0DA, 14, 0);
 }
 
 int main(int argc, char **argv);
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
-    int fd = sys_gui_create(WIN_W, WIN_H, "tobyOS demo");
-    if (fd < 0) {
-        putstr("gui_demo: sys_gui_create failed (no GUI? out of slots?)\n");
+    if (tk_window_open(&win, 780, 560, "TobyTK Widget Gallery") != 0)
         return 1;
+
+    struct tk_widget *root = tk_root(&win);
+    tk_pad(root, 12);
+    root->gap = 8;
+
+    tk_bold(tk_font(tk_label(&win, root, "TobyTK Widget Gallery"), 20));
+    tk_separator(&win, root);
+
+    struct tk_widget *cols = tk_hbox(&win, root, 16);
+    tk_grow(cols, 1);
+
+    /* ---- left column: basic widgets ---- */
+    struct tk_widget *left = tk_vbox(&win, cols, 8);
+    tk_grow(left, 1);
+    tk_label(&win, left, "Buttons");
+    struct tk_widget *brow = tk_hbox(&win, left, 8);
+    tk_button(&win, brow, "OK", on_ok);
+    tk_button(&win, brow, "Cancel", on_cancel);
+    tk_label(&win, left, "Text field");
+    tk_field(&win, left, "edit me");
+    tk_checkbox(&win, left, "Enable feature", 1);
+    tk_label(&win, left, "Slider + progress");
+    {
+        struct tk_widget *s = tk_slider(&win, left, 0, 100, 60);
+        s->on_change = on_slide;
     }
-    paint_background(fd);
-    sys_gui_flip(fd);
-
-    int last_left = 0;
-
-    for (;;) {
-        struct gui_event ev;
-        int got = sys_gui_poll_event(fd, &ev);
-        if (got < 0) { putstr("gui_demo: poll error\n"); return 1; }
-        if (got == 0) {
-            sys_yield();
-            continue;
-        }
-        if (ev.type == GUI_EV_CLOSE) return 0;
-
-        int redraw = 0;
-        if (ev.type == GUI_EV_MOUSE_DOWN) {
-            uint32_t c = (prng() & 0x00FFFFFFu) | 0x00404040u;
-            sys_gui_fill(fd, ev.x - 8, ev.y - 8, 16, 16, c);
-            last_left = (ev.button & 1);
-            redraw = 1;
-        } else if (ev.type == GUI_EV_MOUSE_UP) {
-            last_left = 0;
-        } else if (ev.type == GUI_EV_MOUSE_MOVE && last_left &&
-                   (ev.button & 1)) {
-            uint32_t c = (prng() & 0x00FFFFFFu) | 0x00404040u;
-            sys_gui_fill(fd, ev.x - 3, ev.y - 3, 6, 6, c);
-            redraw = 1;
-        }
-        if (redraw) sys_gui_flip(fd);
+    w_progress = tk_progress(&win, left, 60, 100);
+    tk_label(&win, left, "Listbox");
+    {
+        struct tk_widget *lb = tk_listbox(&win, left,
+            list_items, (int)(sizeof(list_items) / sizeof(list_items[0])));
+        lb->on_change = on_list;
+        tk_grow(lb, 1);
     }
+
+    /* ---- right column: new widgets ---- */
+    struct tk_widget *right = tk_vbox(&win, cols, 8);
+    tk_grow(right, 1);
+    tk_label(&win, right, "Table");
+    {
+        struct tk_widget *tbl = tk_table(&win, right, table_headers, table_widths, 3);
+        tk_table_rows(&win, tbl,
+            (int)(sizeof(table_cells) / sizeof(table_cells[0])), table_cell, 0);
+        tk_grow(tbl, 1);
+    }
+    tk_label(&win, right, "Textarea");
+    tk_grow(tk_textarea(&win, right, area_text), 1);
+    tk_label(&win, right, "Canvas");
+    tk_size(tk_canvas(&win, right, paint_canvas), 0, 96);
+
+    tk_separator(&win, root);
+    w_status = tk_colors(tk_label(&win, root, "Ready"), 0, 0x0080C0FF);
+
+    return tk_run(&win);
 }
