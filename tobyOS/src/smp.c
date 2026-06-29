@@ -117,8 +117,34 @@ uint32_t smp_current_cpu_idx(void) {
     return 0;
 }
 
+/* Set true once every online CPU has installed its GS base (BSP in
+ * syscall_init, APs in ap_entry) AND each percpu->self is filled in.
+ * Until then smp_this_cpu() uses the slow LAPIC-ID path; flipping this
+ * on (smp_enable_fast_cpu_id, called right after smp_start_aps) switches
+ * every core to the gs-relative fast path. */
+static volatile bool g_percpu_gs_ready = false;
+
+void smp_enable_fast_cpu_id(void) {
+    g_percpu_gs_ready = true;
+}
+
 struct percpu *smp_this_cpu(void) {
     if (g_cpu_count == 0) return &g_percpu[0];
+    /* Fast path: GS base on every CPU points at that CPU's struct percpu,
+     * and we stashed a self-pointer there. A single gs-relative load
+     * identifies the running CPU with no LAPIC MMIO read (which is a VM
+     * exit / device-model dispatch -- ~1000x a plain load under TCG, and
+     * called often enough in spin paths to livelock the box headless). */
+    if (g_percpu_gs_ready) {
+        struct percpu *self;
+        __asm__ volatile ("movq %%gs:%c1, %0"
+                          : "=r"(self)
+                          : "i"(__builtin_offsetof(struct percpu, self)));
+        if (self) return self;
+        /* self == NULL should never happen post-boot, but if GS were ever
+         * unexpectedly clobbered, fall through to the safe slow path
+         * rather than return a bogus pointer. */
+    }
     return &g_percpu[smp_current_cpu_idx()];
 }
 
@@ -178,6 +204,8 @@ static __attribute__((noreturn, used)) void ap_entry(uint32_t cpu_idx) {
      *   - a sane initial syscall_rsp (overwritten on the first context switch).
      * Order: hardening before anything that might rely on SSE; GS base last. */
     hardening_init_ap();
+    vmm_pat_init();         /* PAT slot 4 = WC (per-CPU MSR); matches the BSP so
+                             * this core also sees the framebuffer as write-combining */
     syscall_init_ap();      /* EFER.SCE/STAR/LSTAR/FMASK -- else `syscall` #UDs */
     tss_init_ap(cpu_idx, me->stack_top);
     me->syscall_rsp = me->stack_top;
@@ -272,6 +300,13 @@ static void build_percpu_table(void) {
      * correct initial state for a SPINLOCK_INIT spinlock. The
      * per-CPU ready_head/ready_tail/current/timer_ticks are also
      * implicitly zeroed here, which is what we want. */
+
+    /* Fill in each slot's self-pointer up front (for ALL slots, not just
+     * the ones we end up using) so the gs-relative fast path in
+     * smp_this_cpu() reads a valid &g_percpu[idx] no matter which CPU's
+     * GS base it lands on. */
+    for (uint32_t i = 0; i < MAX_CPUS; i++)
+        g_percpu[i].self = &g_percpu[i];
 
     if (!info || !info->ok || info->cpu_count == 0) {
         kprintf("[smp] no ACPI MADT -- assuming uniprocessor\n");

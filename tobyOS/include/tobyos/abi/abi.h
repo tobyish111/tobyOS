@@ -566,6 +566,20 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
 #define ABI_SYS_GUI_WAIT_VSYNC        92
 #define ABI_SYS_GUI_BATCH_FILL        93  /* (int fd, const struct abi_batch_fill *cmds, int count) */
 
+/* Native TrueType text (toby/tk toolkit). Routes the native gui_* path to the
+ * same kernel stb_truetype rasterizer (kfont.c) the Win32 GDI shims use, so
+ * native apps render real antialiased glyphs instead of the scaled 8x8 bitmap.
+ *   GUI_TEXT_TTF:        a1=fd, a2=xy (x|y<<16, int16 each = top-left of text),
+ *                        a3=utf8 string, a4=fg 0x00RRGGBB,
+ *                        a5=(px & 0xFFFF) | (face << 16)  [face = KFONT_*]
+ *                        -> advance width drawn (text is alpha-blended; the
+ *                        caller fills the widget background first).
+ *   GUI_TEXT_TTF_WIDTH:  a1=string, a2=(px & 0xFFFF)|(face<<16) -> pixel width.
+ * If no font is loaded the draw falls back to the smoothed scaled-bitmap path
+ * so text never vanishes. */
+#define ABI_SYS_GUI_TEXT_TTF          94
+#define ABI_SYS_GUI_TEXT_TTF_WIDTH    95
+
 /* ---- 3D Graphics / VirGL (Phase 3) ------------------------------- */
 #define ABI_SYS_GL_CREATE_CTX         100
 #define ABI_SYS_GL_DESTROY_CTX        101

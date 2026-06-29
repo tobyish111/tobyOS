@@ -20,7 +20,19 @@
 
 #define DBGCON_PORT 0xE9
 
+/* Baud configuration. The 16550 input clock is 115200 Hz, so the divisor
+ * latch value is 115200 / baud. We default to 38400 (divisor 3) because
+ * that is what the documented real-hardware capture setup uses
+ * (docs/smep-ap-capture.md -- HP EliteDesk null-modem @ 38400 8N1). To
+ * monitor at the more common 115200, set COM1_BAUD to 115200 (divisor 1)
+ * and configure the capture terminal to match. */
+#define UART_INPUT_CLOCK 115200u
+#define COM1_BAUD        38400u
+#define COM1_DIVISOR     (UART_INPUT_CLOCK / COM1_BAUD)
+
 static bool s_serial_ready = false;
+
+unsigned serial_baud(void) { return COM1_BAUD; }
 
 static inline void dbgcon_putc(char c) {
     outb(DBGCON_PORT, (uint8_t)c);
@@ -28,11 +40,11 @@ static inline void dbgcon_putc(char c) {
 
 void serial_init(void) {
     if (s_serial_ready) return;
-    outb(COM1_INT_EN,     0x00);  /* mask all UART interrupts */
-    outb(COM1_LINE_CTRL,  0x80);  /* DLAB on -> baud divisor */
-    outb(COM1_DATA,       0x03);  /* divisor low  (38400 baud) */
-    outb(COM1_INT_EN,     0x00);  /* divisor high */
-    outb(COM1_LINE_CTRL,  0x03);  /* 8N1, DLAB off */
+    outb(COM1_INT_EN,     0x00);                       /* mask all UART interrupts */
+    outb(COM1_LINE_CTRL,  0x80);                       /* DLAB on -> baud divisor */
+    outb(COM1_DATA,       COM1_DIVISOR & 0xFF);        /* divisor low  (COM1_BAUD) */
+    outb(COM1_INT_EN,     (COM1_DIVISOR >> 8) & 0xFF); /* divisor high */
+    outb(COM1_LINE_CTRL,  0x03);                       /* 8N1, DLAB off */
     outb(COM1_FIFO_CTRL,  0xC7);  /* enable + clear FIFO, 14-byte threshold */
     outb(COM1_MODEM_CTRL, 0x0B);  /* DTR/RTS/OUT2 -- IRQs gated by OUT2 */
     s_serial_ready = true;

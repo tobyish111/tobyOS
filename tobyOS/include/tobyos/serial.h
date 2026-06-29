@@ -16,4 +16,8 @@ void serial_putc(char c);
 void serial_write(const char *s, size_t n);
 void serial_puts(const char *s);
 
+/* Configured COM1 line rate (bits/s). The capture terminal on the other
+ * end of the cable must match this (8 data bits, no parity, 1 stop). */
+unsigned serial_baud(void);
+
 #endif /* TOBYOS_SERIAL_H */

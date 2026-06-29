@@ -50,6 +50,7 @@
 #include <tobyos/spinlock.h>
 #include <tobyos/irq.h>
 #include <tobyos/apic.h>
+#include <tobyos/pit.h>
 
 /* ----- register offsets ------------------------------------------ */
 /* These match the 82540EM exactly for everything we touch -- the
@@ -75,9 +76,22 @@
 #define E1000E_TDLEN      0x3808
 #define E1000E_TDH        0x3810
 #define E1000E_TDT        0x3818
+#define E1000E_TXDCTL     0x3828          /* TX descriptor control, queue 0 */
+#define TXDCTL_ENABLE     (1u << 25)      /* per-queue enable (82575+/PCH-LOM) */
 #define E1000E_MTA_BASE   0x5200          /* 128 dwords */
 #define E1000E_RAL0       0x5400
 #define E1000E_RAH0       0x5404
+
+/* Statistics registers (clear-on-read). Used by e1000e_dump_stats to tell
+ * a TX failure (GPTC/TPT stay 0 -> nothing left the MAC) apart from an RX
+ * failure (GPTC>0 but GPRC/TPR==0 -> we transmit but receive nothing) when
+ * DHCP can't get a lease on real hardware. */
+#define E1000E_CRCERRS    0x4000          /* CRC error count        */
+#define E1000E_MPC        0x4010          /* missed packets (RX no buf) */
+#define E1000E_GPRC       0x4074          /* good packets received  */
+#define E1000E_GPTC       0x4080          /* good packets transmitted */
+#define E1000E_TPR        0x40D0          /* total packets received */
+#define E1000E_TPT        0x40D4          /* total packets transmitted */
 
 /* CTRL bits. */
 #define CTRL_RST         (1u << 26)
@@ -85,6 +99,16 @@
 #define CTRL_SLU         (1u << 6)
 #define CTRL_PHY_RST     (1u << 31)       /* e1000e: cleared after RST */
 #define CTRL_LRST        (1u << 3)        /* link reset, must be 0 */
+#define CTRL_GIO_MASTER_DISABLE (1u << 2) /* quiesce PCIe master before reset */
+
+/* STATUS bits (offset 0x0008) -- used to report link state at probe so a
+ * failed DHCP can be told apart from a down PHY link (esp. on PCH-LOM
+ * parts where CTRL.SLU does not by itself guarantee copper link). */
+#define STATUS_FD          (1u << 0)       /* full duplex */
+#define STATUS_LU          (1u << 1)       /* link up */
+#define STATUS_GIO_MASTER_EN (1u << 19)    /* PCIe master enabled (DMA in flight) */
+#define STATUS_SPEED_SHIFT 6
+#define STATUS_SPEED_MASK  (3u << 6)       /* 00=10 01=100 10/11=1000 Mb/s */
 
 /* RCTL bits. */
 #define RCTL_EN          (1u << 1)
@@ -273,18 +297,54 @@ static void e1000e_read_mac(uint8_t out_mac[ETH_ADDR_LEN]) {
 
 /* ----- TX / RX (driver-side, called via the net_dev vtable) ------ */
 
+/* After this many consecutive ring-full failures we latch the TX engine
+ * "presumed dead" and stop spinning/logging on every frame. */
+#define E1000E_TX_DEAD_THRESH 8
+
 static bool e1000e_tx_op(struct net_dev *dev, const void *frame, size_t len) {
     (void)dev;
     if (len == 0 || len > BUF_SIZE) return false;
 
+    /* Dead-TX backoff. On hardware where the TX engine never completes a
+     * descriptor (e.g. the I217-LM PCH LOM on the EliteDesk: TXDCTL.ENABLE is
+     * set but GPTC/TPT stay 0 -- see real-hardware-elitedesk-bringup), every
+     * send would otherwise spin 100000 iterations and then log "ring full",
+     * flooding the serial log and burning the BKL on each frame. After a run
+     * of consecutive ring-full failures we latch the engine "presumed dead":
+     * log ONCE, then fail-fast (no spin) on every subsequent send. Observing
+     * any TXD_STAT_DD completion clears the latch, so a merely transient stall
+     * is never permanently masked. This is purely a log/back-off change -- it
+     * does not attempt to fix the I217 TX silicon problem. */
+    static int  s_txfail_run;       /* consecutive ring-full failures */
+    static bool s_tx_dead;          /* latched: skip the spin entirely */
+
     uint16_t i = g_tx_tail;
-    for (int spin = 0; spin < 100000; spin++) {
-        if (g_tx_ring[i].status & TXD_STAT_DD) break;
+    bool dd;
+
+    if (s_tx_dead) {
+        /* Fail-fast: a single cheap probe instead of the 100000-iter spin. */
+        dd = (g_tx_ring[i].status & TXD_STAT_DD) != 0;
+        if (!dd) return false;
+        kprintf("[e1000e] tx: engine recovered, resuming\n");
+    } else {
+        for (int spin = 0; spin < 100000; spin++) {
+            if (g_tx_ring[i].status & TXD_STAT_DD) break;
+        }
+        dd = (g_tx_ring[i].status & TXD_STAT_DD) != 0;
+        if (!dd) {
+            if (++s_txfail_run >= E1000E_TX_DEAD_THRESH) {
+                s_tx_dead = true;
+                kprintf("[e1000e] tx: engine presumed dead, backing off\n");
+            } else {
+                kprintf("[e1000e] tx: ring full at idx %u\n", i);
+            }
+            return false;
+        }
     }
-    if (!(g_tx_ring[i].status & TXD_STAT_DD)) {
-        kprintf("[e1000e] tx: ring full at idx %u\n", i);
-        return false;
-    }
+
+    /* A descriptor completed -> the TX engine is alive; clear the latch. */
+    s_tx_dead = false;
+    s_txfail_run = 0;
 
     memcpy(g_tx_bufs[i], frame, len);
     g_tx_ring[i].length = (uint16_t)len;
@@ -327,6 +387,45 @@ static void e1000e_irq_handler(void *ctx) {
     e1000e_rx_drain_op(0);
 }
 
+/* Dump the MAC's hardware packet counters. Called after the boot-time
+ * DHCP window so a failed lease can be diagnosed at the silicon level:
+ *   - link DOWN              -> PHY/cable problem
+ *   - link UP, TX good == 0  -> our transmit path never put a frame on the
+ *                               wire (descriptor/TCTL/doorbell issue)
+ *   - TX good > 0, RX good 0 -> we transmit but receive nothing (RX ring /
+ *                               filter / RCTL issue, or replies not arriving)
+ *   - both > 0 but no lease  -> higher-level (ARP/UDP/DHCP) problem
+ * The counters are clear-on-read, so this reflects traffic since the last
+ * call. Safe no-op if the driver never bound. */
+void e1000e_dump_stats(const char *when) {
+    if (!g_mmio) return;
+    uint32_t status = mmio_read32(E1000E_STATUS);
+    uint32_t gptc = mmio_read32(E1000E_GPTC);
+    uint32_t gprc = mmio_read32(E1000E_GPRC);
+    uint32_t tpt  = mmio_read32(E1000E_TPT);
+    uint32_t tpr  = mmio_read32(E1000E_TPR);
+    uint32_t crc  = mmio_read32(E1000E_CRCERRS);
+    uint32_t mpc  = mmio_read32(E1000E_MPC);
+    kprintf("[e1000e] stats(%s): link=%s TX(good=%u tot=%u) RX(good=%u tot=%u) "
+            "err(crc=%u miss=%u) irqs=%lu\n",
+            when ? when : "?",
+            (status & STATUS_LU) ? "UP" : "DOWN",
+            (unsigned)gptc, (unsigned)tpt, (unsigned)gprc, (unsigned)tpr,
+            (unsigned)crc, (unsigned)mpc, (unsigned long)g_irq_count);
+
+    /* TX-engine register snapshot. With TX good/tot == 0 above, this pins
+     * down WHY the MAC fetches no descriptors: is TCTL.EN actually set? is
+     * the queue enabled (TXDCTL bit 25)? is TDH stuck at 0 while software
+     * advanced TDT (HW not consuming the ring)? CTRL.SLU/STATUS.LU/TXOFF
+     * (CTRL bit 22) reveal a link/transmit-paused gate. Pure reads. */
+    kprintf("[e1000e]   regs: CTRL=0x%08x STATUS=0x%08x RCTL=0x%08x TCTL=0x%08x "
+            "TDH=%u TDT=%u TXDCTL=0x%08x\n",
+            (unsigned)mmio_read32(E1000E_CTRL), (unsigned)status,
+            (unsigned)mmio_read32(E1000E_RCTL), (unsigned)mmio_read32(E1000E_TCTL),
+            (unsigned)mmio_read32(E1000E_TDH), (unsigned)mmio_read32(E1000E_TDT),
+            (unsigned)mmio_read32(E1000E_TXDCTL));
+}
+
 /* ----- net_dev publication --------------------------------------- */
 
 static struct net_dev g_e1000e_dev = {
@@ -335,6 +434,42 @@ static struct net_dev g_e1000e_dev = {
     .tx       = e1000e_tx_op,
     .rx_drain = e1000e_rx_drain_op,
 };
+
+/* ----- PCH-integrated LAN detection ------------------------------ */
+
+/* Intel's PCH-integrated LAN parts (the "ich8lan" family in Linux
+ * terms -- 82577/82579 and every I217/I218/I219 onward) share the
+ * 8254x register layout for basic RX/TX, but a software-issued device
+ * reset (CTRL.RST) is NOT safe on them the way it is on the discrete
+ * 82573/82574/82583 PCIe cards. On these LOM parts the MAC sits behind
+ * the Management Engine and is wired to the PHY over an internal link
+ * that the ME also drives; issuing CTRL.RST without first taking the
+ * SW/FW semaphore (EXTCNF_CTRL.SWFLAG) and walking the PCIe-master-
+ * disable + ULP/K1 exit sequence wedges that internal MAC<->PHY bus,
+ * and the very next CSR read then stalls the CPU forever -- the read
+ * completion never arrives, so it is NOT a master-abort that returns
+ * 0xFFFFFFFF, it is a hard hang.
+ *
+ * That is exactly the failure on an HP EliteDesk 800 G1's onboard
+ * I217-LM (8086:153A): the boot stops right after BAR0 is mapped, at
+ * the first post-reset register read inside the reset-wait loop.
+ *
+ * The BIOS has already fully initialized these MACs by the time we
+ * probe, so we simply DON'T reset them -- we read the MAC out of
+ * RAL/RAH and program the rings on top of the firmware-configured MAC.
+ * Only the discrete parts (and QEMU's emulated 82574L, did 0x10D3,
+ * which `make run-e1000e` boots) take the original reset path, so the
+ * emulated test target is byte-for-byte unchanged. */
+static bool e1000e_is_pch_lan(uint16_t did) {
+    switch (did) {
+    case 0x10D3:   /* 82574L -- discrete, QEMU `-device e1000e`        */
+    case 0x10F6:   /* 82573 family discrete PCIe                       */
+    case 0x150C:   /* 82583 family discrete PCIe                       */
+        return false;
+    default:       /* 82577/82579 + all I217/I218/I219 LOM: no reset   */
+        return true;
+    }
+}
 
 /* ----- PCI probe ------------------------------------------------- */
 
@@ -365,12 +500,45 @@ static int e1000e_probe(struct pci_dev *dev) {
     mmio_write32(E1000E_IMC, 0xFFFFFFFF);
     mmio_write32(E1000E_IAM, 0x00000000);
 
-    /* 2. Soft reset and wait for it to clear. The 82574L typically
-     * clears CTRL.RST within ~1 us; we still spin generously to
-     * cover slower real silicon. */
-    mmio_write32(E1000E_CTRL, mmio_read32(E1000E_CTRL) | CTRL_RST);
-    for (int i = 0; i < 1000000; i++) {
-        if ((mmio_read32(E1000E_CTRL) & CTRL_RST) == 0) break;
+    /* 2. Reset the MAC.
+     *
+     * Discrete parts (82574L/QEMU): a bare CTRL.RST is fine.
+     *
+     * PCH-integrated LOM parts (I217/I218/I219): a BARE CTRL.RST hangs the
+     * CPU -- the wait-loop MMIO read never returns -- because it is issued
+     * while the PCIe master is still enabled with DMA in flight. We
+     * previously worked around that by SKIPPING the reset, but that left
+     * the transmit DMA engine dead (TDH stuck at 0 while TDT advanced, TX
+     * good=0, even with TCTL.EN + TXDCTL.ENABLE set), so DHCP never got a
+     * frame onto the wire. The documented safe sequence fixes BOTH: quiesce
+     * RX/TX, disable the GIO master and wait for STATUS.GIO_MASTER_EN to
+     * clear (drains in-flight DMA so the reset can't wedge the internal
+     * bus), THEN issue CTRL.RST. This is exactly what Linux's e1000e does
+     * on these parts. Bounded, PIT-timed waits throughout. */
+    if (e1000e_is_pch_lan(dev->device)) {
+        mmio_write32(E1000E_RCTL, 0);
+        mmio_write32(E1000E_TCTL, 0);
+        mmio_write32(E1000E_CTRL,
+                     mmio_read32(E1000E_CTRL) | CTRL_GIO_MASTER_DISABLE);
+        for (int i = 0; i < 1000; i++) {
+            if ((mmio_read32(E1000E_STATUS) & STATUS_GIO_MASTER_EN) == 0) break;
+            pit_sleep_ms(1);
+        }
+        mmio_write32(E1000E_CTRL, mmio_read32(E1000E_CTRL) | CTRL_RST);
+        pit_sleep_ms(5);
+        for (int i = 0; i < 1000; i++) {
+            if ((mmio_read32(E1000E_CTRL) & CTRL_RST) == 0) break;
+            pit_sleep_ms(1);
+        }
+        kprintf("[e1000e] PCH safe reset done (did %04x, CTRL=0x%08x "
+                "STATUS=0x%08x)\n", (unsigned)dev->device,
+                (unsigned)mmio_read32(E1000E_CTRL),
+                (unsigned)mmio_read32(E1000E_STATUS));
+    } else {
+        mmio_write32(E1000E_CTRL, mmio_read32(E1000E_CTRL) | CTRL_RST);
+        for (int i = 0; i < 1000000; i++) {
+            if ((mmio_read32(E1000E_CTRL) & CTRL_RST) == 0) break;
+        }
     }
 
     /* 3. After reset, mask interrupts AGAIN -- some 82574 revisions
@@ -397,6 +565,24 @@ static int e1000e_probe(struct pci_dev *dev) {
 
     if (!e1000e_setup_rx() || !e1000e_setup_tx()) return -3;
 
+    /* On PCH-integrated LOM parts (I217/I218/I219) the legacy TCTL.EN bit
+     * is NOT sufficient to start the transmit DMA queue -- the per-queue
+     * TXDCTL.ENABLE (bit 25, the 82575+/igb-style enable) must also be set,
+     * or the MAC silently fetches no TX descriptors: GPTC/TPT stay 0 while
+     * RX works fine. That is exactly the e1000e_dump_stats signature seen on
+     * the EliteDesk I217 (link UP, RX good=106, TX good=0), which made every
+     * DHCP DISCOVER die before reaching the wire. The discrete 82574 (QEMU)
+     * does not have/need this gate, so it stays on the plain TCTL.EN path and
+     * the emulated target is unchanged. */
+    if (e1000e_is_pch_lan(dev->device)) {
+        mmio_write32(E1000E_TXDCTL, mmio_read32(E1000E_TXDCTL) | TXDCTL_ENABLE);
+        for (int i = 0; i < 1000; i++) {
+            if (mmio_read32(E1000E_TXDCTL) & TXDCTL_ENABLE) break;
+        }
+        kprintf("[e1000e] PCH TX queue enabled (TXDCTL=0x%08x)\n",
+                mmio_read32(E1000E_TXDCTL));
+    }
+
     /* 6. Try MSI-X first (the 82574L has a 5-vector MSI-X table that
      * QEMU's e1000e correctly emulates), fall back to plain MSI. We
      * route a single vector at the BSP LAPIC; the 82574L delivers all
@@ -420,6 +606,23 @@ static int e1000e_probe(struct pci_dev *dev) {
         kprintf("[e1000e] IRQ live on vec 0x%02x  IMS=0x%02x  RX/TX irq-driven\n",
                 (unsigned)g_irq_vector, IMS_BITS);
     }
+
+    /* 7. Wait (bounded) for the PHY to bring the copper link up, then
+     * report it. DHCP runs shortly after this probe, so giving the link a
+     * moment to settle makes the boot-time lease more reliable; logging the
+     * final state means a DHCP failure can be diagnosed (link DOWN => PHY
+     * problem; link UP => look at TX/RX) instead of guessed at. ~2s cap so
+     * an unplugged port only costs a brief delay. */
+    uint32_t status = mmio_read32(E1000E_STATUS);
+    for (int i = 0; i < 200 && !(status & STATUS_LU); i++) {
+        pit_sleep_ms(10);
+        status = mmio_read32(E1000E_STATUS);
+    }
+    static const char *const spd[4] = { "10Mb/s", "100Mb/s", "1Gb/s", "1Gb/s" };
+    kprintf("[e1000e] link %s (STATUS=0x%08x speed=%s duplex=%s)\n",
+            (status & STATUS_LU) ? "UP" : "DOWN", status,
+            spd[(status & STATUS_SPEED_MASK) >> STATUS_SPEED_SHIFT],
+            (status & STATUS_FD) ? "full" : "half");
 
     static const char hex[] = "0123456789abcdef";
     char *n = g_e1000e_name;

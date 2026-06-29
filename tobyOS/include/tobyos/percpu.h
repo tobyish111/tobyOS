@@ -12,10 +12,12 @@
  * `sti; hlt` inside sched_idle() and wake up on the next timer tick
  * (or when somebody enqueues something onto their queue).
  *
- * GS_BASE per-CPU is still NOT installed; APs receive their cpu_idx
- * as the first argument to ap_entry() and the rest of the kernel
- * resolves "which CPU am I?" via smp_current_cpu_idx() (which reads
- * the LAPIC ID once and matches it against g_percpu[].apic_id).
+ * GS_BASE per-CPU IS installed now (syscall_init on the BSP, ap_entry on
+ * each AP both wrmsr GS base -> this CPU's struct percpu). After boot,
+ * smp_this_cpu() resolves "which CPU am I?" with a single gs-relative
+ * load of the `self` pointer (see below). Before GS bases are installed
+ * (early boot), it falls back to smp_current_cpu_idx(), which reads the
+ * LAPIC ID and matches it against g_percpu[].apic_id.
  */
 
 #ifndef TOBYOS_PERCPU_H
@@ -80,6 +82,17 @@ struct percpu {
     /* Count of LAPIC timer interrupts taken on this CPU. Mostly a
      * "is the timer alive" diagnostic for the `cpus` shell command. */
     uint64_t        timer_ticks;
+
+    /* Self-pointer (== &g_percpu[cpu_idx]). Each CPU's GS base points at
+     * its own struct percpu, so once GS is installed on every core,
+     * smp_this_cpu() can read `gs:[offsetof(self)]` -- a single ordinary
+     * load, no VM exit -- instead of doing an LAPIC MMIO read on every
+     * call. The MMIO read (apic_read_id) is ~1000x slower than a memory
+     * load under TCG, and smp_this_cpu()/current_proc() are called in the
+     * hottest spin paths (BKL, sched_yield), so on headless QEMU the MMIO
+     * cost collapsed throughput into a multi-core busy-spin livelock
+     * (both cores pinned in apic_read_id, gui_tick never completing). */
+    struct percpu  *self;
 };
 
 #endif /* TOBYOS_PERCPU_H */

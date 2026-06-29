@@ -477,6 +477,49 @@ static long sys_gui_text_scaled(int fd, uint32_t xy, const char *s,
     return gui_window_text_scaled(f->win, x, y, buf, fg, bg, scale, smooth);
 }
 
+/* Native TrueType text via the kernel kfont rasterizer (the same one the Win32
+ * GDI path uses). a5 packs px (low 16) and face (high 16, KFONT_*). The glyphs
+ * are alpha-blended onto the window backbuf -- the toolkit fills the widget
+ * background first -- so there is no bg argument. Returns the advance width.
+ * Falls back to the smoothed scaled-bitmap path if no font is loaded so text
+ * never silently vanishes. */
+static long sys_gui_text_ttf(int fd, uint32_t xy, const char *s,
+                             uint32_t fg, uint32_t px_face) {
+    struct file *f = fd_lookup(fd);
+    if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+    char buf[256];
+    long n = strncpy_from_user(buf, s, sizeof(buf));
+    if (n < 0) return -1;
+    int x    = (int)(int16_t)(xy & 0xFFFFu);
+    int y    = (int)(int16_t)((xy >> 16) & 0xFFFFu);
+    int px   = (int)(px_face & 0xFFFFu);
+    int face = (int)((px_face >> 16) & 0x3u);
+    if (px <= 0)  px = 16;
+    if (px > 256) px = 256;
+    if (!kfont_available()) {
+        int scale = px >= 24 ? 3 : (px >= 14 ? 2 : 1);
+        return gui_window_text_scaled(f->win, x, y, buf, fg, GFX_TRANSPARENT, scale, 1);
+    }
+    return kfont_draw_window_f(f->win, x, y, buf, (int)n, fg, px, face);
+}
+
+/* Companion metrics query so the toolkit can centre/right-align TTF text.
+ * a1=string, a2=(px & 0xFFFF)|(face<<16). Returns the pixel advance width. */
+static long sys_gui_text_ttf_width(const char *s, uint32_t px_face) {
+    char buf[256];
+    long n = strncpy_from_user(buf, s, sizeof(buf));
+    if (n < 0) return -1;
+    int px   = (int)(px_face & 0xFFFFu);
+    int face = (int)((px_face >> 16) & 0x3u);
+    if (px <= 0)  px = 16;
+    if (px > 256) px = 256;
+    if (!kfont_available()) {
+        int scale = px >= 24 ? 3 : (px >= 14 ? 2 : 1);
+        return (long)n * 8 * scale;
+    }
+    return kfont_text_width_f(buf, (int)n, px, face);
+}
+
 static long sys_gui_text(int fd, uint32_t xy, const char *s,
                          uint32_t fg, uint32_t bg) {
     struct file *f = fd_lookup(fd);
@@ -1036,7 +1079,7 @@ static int resolve_user_path(const char *user_path, char *out, size_t cap) {
  * compositor, like REALTUI), so one open is enough. */
 struct fbdev_ctx {
     bool     open;
-    uint32_t xres, yres;       /* visible resolution (== gfx scanout) */
+    uint32_t xres, yres;       /* visible resolution */
     uint32_t bpp;              /* 32 */
     uint32_t line_length;      /* bytes per row in the shadow (xres*4) */
     uint32_t smem_len;         /* shadow size in bytes (line_length*yres) */
@@ -1044,8 +1087,18 @@ struct fbdev_ctx {
     uint64_t user_len;         /* mmap'd length */
     int      owner_pid;        /* tgid that opened it */
     uint64_t present_count;    /* FBIOPAN_DISPLAY / vsync presents served */
+    /* M3: when the compositor is up, a fbdev app is presented INTO a compositor
+     * window instead of the raw scanout, so a Linux GUI app appears as a normal,
+     * movable, composited window alongside native + Win32 windows. `win` NULL =
+     * the legacy direct-scanout fallback (pre-compositor boot harness). */
+    struct window *win;        /* compositor window, or NULL for scanout mode */
+    int      last_mx, last_my; /* last window-relative cursor pos (evdev deltas) */
 };
 static struct fbdev_ctx g_fbdev;
+
+/* The Linux fbdev window's client size (a normal windowed resolution). */
+#define FBDEV_WIN_W 640
+#define FBDEV_WIN_H 480
 
 /* Linux fbdev ioctl request numbers. */
 #define FBIOGET_VSCREENINFO 0x4600
@@ -1068,6 +1121,29 @@ static void fbdev_init_geometry(void) {
 static long fbdev_present(void) {
     if (!g_fbdev.open || !g_fbdev.user_base) return -ABI_EINVAL;
     uint32_t w = g_fbdev.xres, h = g_fbdev.yres;
+
+    /* M3: present into the compositor window. We stage each row through a kernel
+     * buffer (copy_from_user the app's shadow) and gui_window_blit it into the
+     * window's backbuf -- struct window is opaque here, so we never touch its
+     * internals directly. The compositor composites + flips it on the next tick;
+     * the Linux app is now a normal movable window. */
+    if (g_fbdev.win) {
+        uint32_t *row = (uint32_t *)kmalloc(g_fbdev.line_length);
+        if (!row) return -ABI_ENOMEM;
+        for (uint32_t y = 0; y < h; y++) {
+            if (copy_from_user(row,
+                    (const void *)(uintptr_t)(g_fbdev.user_base + (uint64_t)y * g_fbdev.line_length),
+                    w * 4) != 0)
+                break;
+            gui_window_blit(g_fbdev.win, 0, (int)y, (int)w, 1, row);
+        }
+        kfree(row);
+        gui_window_flip(g_fbdev.win);
+        g_fbdev.present_count++;
+        return 0;
+    }
+
+    /* Legacy direct-scanout path (pre-compositor boot harness: REALTUI/fbsplash). */
     if (w > gfx_width())  w = gfx_width();
     if (h > gfx_height()) h = gfx_height();
     uint32_t *row = (uint32_t *)kmalloc(g_fbdev.line_length);
@@ -1151,13 +1227,20 @@ static long fbdev_mmap(uint64_t len) {
  * (so copy_from_user of the shadow works) and the hardware scanout keeps the
  * pixels after teardown. Called from proc_exit() for every exiting process. */
 void fbdev_proc_exit(int pid) {
-    if (!g_fbdev.open || !g_fbdev.user_base) return;
+    if (!g_fbdev.open) return;
     if (g_fbdev.owner_pid != pid) return;
-    (void)fbdev_present();              /* blit the final frame to the scanout */
+    if (g_fbdev.user_base) (void)fbdev_present();   /* final frame */
+    if (g_fbdev.win) {                  /* M3: tear down the compositor window */
+        gui_window_close(g_fbdev.win);
+        g_fbdev.win = 0;
+    }
     g_fbdev.open = false;               /* release for the next opener */
     g_fbdev.user_base = 0;
     g_fbdev.user_len  = 0;
 }
+
+/* fbdev_window_event() is defined further down, after evdev_push and the
+ * EV_x / BTN_x constants it uses are in scope. */
 
 /* ---- Track B input: the Linux evdev devices /dev/input/event{0,1} -----
  *
@@ -1220,6 +1303,9 @@ static void evdev_push(unsigned dev, uint16_t type, uint16_t code, int32_t value
 }
 
 void evdev_feed_key(uint8_t code, int value) {
+    /* M3: while a Linux app is windowed, its input is delivered focus-routed via
+     * fbdev_window_event(); suppress the global PS/2 feed so it isn't doubled. */
+    if (g_fbdev.win) return;
     /* A real evdev key event is the EV_KEY followed by a SYN_REPORT frame. */
     evdev_push(EVDEV_KBD, EV_KEY, code, value);
     evdev_push(EVDEV_KBD, EV_SYN, SYN_REPORT, 0);
@@ -1230,6 +1316,7 @@ void evdev_feed_key(uint8_t code, int value) {
  * bitmask before this report so we can emit press/release edges. The button
  * masks are the PS/2 driver's MOUSE_BTN_* bits (1=left,2=right,4=middle). */
 void evdev_feed_mouse(int dx, int dy, uint8_t buttons, uint8_t prev) {
+    if (g_fbdev.win) return;        /* M3: windowed -> focus-routed feed instead */
     if (dx) evdev_push(EVDEV_MOUSE, EV_REL, REL_X, dx);
     if (dy) evdev_push(EVDEV_MOUSE, EV_REL, REL_Y, dy);
     uint8_t changed = (uint8_t)(buttons ^ prev);
@@ -1238,6 +1325,46 @@ void evdev_feed_mouse(int dx, int dy, uint8_t buttons, uint8_t prev) {
     if (changed & 0x04) evdev_push(EVDEV_MOUSE, EV_KEY, BTN_MIDDLE, (buttons & 0x04) ? 1 : 0);
     if (dx || dy || changed)
         evdev_push(EVDEV_MOUSE, EV_SYN, SYN_REPORT, 0);
+}
+
+/* M3: the compositor (gui.c enqueue_event, IRQ context) calls this for EVERY
+ * window event. When the event belongs to the Linux app's fbdev window, we
+ * translate it into evdev records (event1 = mouse REL+BTN, event0 = key) and
+ * push them onto the same rings the global PS/2 feed uses -- so the app's
+ * blocking read() on /dev/input/event1 wakes on the IRQ exactly as before, but
+ * the input is now focus-routed by the compositor (only the focused/hovered
+ * window gets events). The global PS/2 feed is suppressed while a fbdev window
+ * is up (evdev_feed_*), so there is no double input. */
+void fbdev_window_event(struct window *w, const struct gui_event *e) {
+    if (!w || w != g_fbdev.win || !e) return;
+    switch (e->type) {
+    case GUI_EV_MOUSE_MOVE:
+        if (g_fbdev.last_mx >= 0) {
+            int dx = e->x - g_fbdev.last_mx, dy = e->y - g_fbdev.last_my;
+            if (dx) evdev_push(EVDEV_MOUSE, EV_REL, REL_X, dx);
+            if (dy) evdev_push(EVDEV_MOUSE, EV_REL, REL_Y, dy);
+            if (dx || dy) evdev_push(EVDEV_MOUSE, EV_SYN, SYN_REPORT, 0);
+        }
+        g_fbdev.last_mx = e->x; g_fbdev.last_my = e->y;
+        break;
+    case GUI_EV_MOUSE_DOWN:
+    case GUI_EV_MOUSE_UP: {
+        int val = (e->type == GUI_EV_MOUSE_DOWN) ? 1 : 0;
+        uint16_t code = (e->button & 0x02) ? BTN_RIGHT
+                      : (e->button & 0x04) ? BTN_MIDDLE : BTN_LEFT;
+        g_fbdev.last_mx = e->x; g_fbdev.last_my = e->y;
+        evdev_push(EVDEV_MOUSE, EV_KEY, code, val);
+        evdev_push(EVDEV_MOUSE, EV_SYN, SYN_REPORT, 0);
+        break;
+    }
+    case GUI_EV_KEY:
+        /* deliver a press+release pair (the compositor has no key-up event) */
+        evdev_push(EVDEV_KBD, EV_KEY, e->key, 1);
+        evdev_push(EVDEV_KBD, EV_KEY, e->key, 0);
+        evdev_push(EVDEV_KBD, EV_SYN, SYN_REPORT, 0);
+        break;
+    default: break;
+    }
 }
 
 void evdev_reset(void) {
@@ -1403,7 +1530,24 @@ static long sys_open(const char *path, int flags, int mode) {
             memset(&g_fbdev, 0, sizeof(g_fbdev));
             g_fbdev.open = true;
             g_fbdev.owner_pid = p ? (p->is_thread ? p->tgid : p->pid) : 0;
-            fbdev_init_geometry();
+            g_fbdev.last_mx = g_fbdev.last_my = -1;
+            /* M3: if the desktop compositor is up, present this Linux app INTO a
+             * compositor window (so it appears as a normal composited window),
+             * sized to a windowed resolution we report as the fbdev geometry.
+             * Otherwise fall back to the full-screen scanout (boot harness). */
+            if (gui_in_desktop_mode()) {
+                struct window *win = gui_window_create(FBDEV_WIN_W, FBDEV_WIN_H,
+                                                       "Linux App");
+                if (win) {
+                    g_fbdev.win = win;
+                    g_fbdev.xres = FBDEV_WIN_W;
+                    g_fbdev.yres = FBDEV_WIN_H;
+                    g_fbdev.bpp = 32;
+                    g_fbdev.line_length = FBDEV_WIN_W * 4;
+                    g_fbdev.smem_len = g_fbdev.line_length * FBDEV_WIN_H;
+                }
+            }
+            if (!g_fbdev.win) fbdev_init_geometry();
             return fd;
         }
         /* Track B input: the Linux evdev devices. event0 = keyboard, event1 =
@@ -1735,8 +1879,24 @@ static long sys_nanosleep(uint64_t ns) {
     while (perf_now_ns() < end) {
         sched_yield();
         if (perf_now_ns() >= end) break;
+        /* PAUSE-spin, NOT `sti(); hlt()`.
+         *
+         * A parked HLT can wedge the whole machine: once every core is
+         * halted, headless QEMU/TCG (and, defensively, any box where an
+         * IOAPIC->LAPIC timer edge gets dropped) stops delivering the timer
+         * interrupt that would wake us, so the HLT never returns. That is the
+         * exact "silent stall a few seconds into boot" signature -- the single
+         * runnable thing (pid 0's pause-spin idle loop) ends up parked behind
+         * a sleeper's HLT and the box freezes with no fault.
+         *
+         * Spinning on PAUSE keeps this core executing, which (a) re-checks the
+         * TSC deadline above every iteration so the sleep ALWAYS completes on
+         * the monotonic clock (perf_now_ns keeps advancing regardless of IRQ
+         * delivery), and (b) lets any genuinely-pending IRQ get taken at an
+         * instruction boundary. We still sched_yield() each iteration so peers
+         * (and pid 0) keep running, and we keep IRQs enabled. */
         sti();
-        hlt();
+        __asm__ volatile ("pause" ::: "memory");
     }
     if (had_bkl) bkl_enter();
     return 0;
@@ -2686,6 +2846,11 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_gui_text_scaled((int)a1, (uint32_t)a2,
                                    (const char *)a3,
                                    (uint32_t)a4, (uint32_t)a5);
+    case ABI_SYS_GUI_TEXT_TTF:
+        return sys_gui_text_ttf((int)a1, (uint32_t)a2, (const char *)a3,
+                                (uint32_t)a4, (uint32_t)a5);
+    case ABI_SYS_GUI_TEXT_TTF_WIDTH:
+        return sys_gui_text_ttf_width((const char *)a1, (uint32_t)a2);
     case SYS_GUI_TEXT:
         return sys_gui_text((int)a1, (uint32_t)a2, (const char *)a3,
                             (uint32_t)a4, (uint32_t)a5);

@@ -237,6 +237,11 @@ int ramfs_mount(const void *image, size_t size) {
 
     kprintf("[ramfs] mounted: %lu entries from %lu-byte tar at %p\n",
             (unsigned long)idx, (unsigned long)size, image);
+    /* The per-file dump is ~240 lines on a full initrd -- on a real
+     * framebuffer console that is ~20s of scrolling AND it pushes the
+     * later, interesting boot stages (net/DHCP, desktop/login) past the
+     * end of any practical serial capture. Keep it opt-in. */
+#ifdef RAMFS_VERBOSE_LISTING
     for (size_t i = 0; i < idx; i++) {
         kprintf("  %s %-32s  %lu B  data@%p\n",
                 nodes[i].type == VFS_TYPE_DIR ? "d" : "-",
@@ -244,6 +249,7 @@ int ramfs_mount(const void *image, size_t size) {
                 (unsigned long)nodes[i].size,
                 nodes[i].data);
     }
+#endif
     return VFS_OK;
 }
 

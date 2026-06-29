@@ -87,6 +87,11 @@ struct window {
     uint64_t   close_request_tick;  /* tick when GUI_EV_CLOSE was sent (0=none) */
 
     uint8_t    opacity;             /* 0=invisible, 255=fully opaque */
+    bool       opacity_app_set;     /* true once the app drives its own opacity
+                                     * (via gui_window_set_opacity) -- tells the
+                                     * anim_tick self-healing watchdog NOT to
+                                     * snap this window back to opaque (e.g. the
+                                     * login fade-out is app-driven). */
 
     /* Per-window VirtIO-GPU 2D resource (GPU_ACCEL mode). */
     uint32_t   gpu_resource_id;    /* 0 = no resource allocated */
@@ -1073,6 +1078,7 @@ static void anim_start_fade_in(struct window *w) {
     a->progress = 0;
     a->active = true;
     w->opacity = 0;
+    w->opacity_app_set = false;   /* compositor owns the fade; watchdog may heal */
     g.dirty = true;
 }
 
@@ -1123,7 +1129,10 @@ static void anim_tick(void) {
         struct gui_anim *a = &g.anims[i];
         if (!a->active) continue;
         any_active = true;
-        uint64_t elapsed = now - a->start_ms;
+        /* Self-healing: a start_ms in the future (clock skew / a paused timer
+         * resuming) must NOT wrap `elapsed` to a huge unsigned value -- clamp
+         * to 0 so the animation plays forward from now instead of snapping. */
+        uint64_t elapsed = (now >= a->start_ms) ? (now - a->start_ms) : 0;
         if (elapsed >= a->duration_ms) {
             a->progress = 255;
             a->active = false;
@@ -1155,6 +1164,27 @@ static void anim_tick(void) {
             }
         }
     }
+
+    /* Self-healing watchdog: a window can be left stranded at opacity < 255 if
+     * a fade animation was lost (slot reused, window churned, or anim_tick not
+     * pumped for a stretch -- exactly the "fade-in stuck invisible" class of bug
+     * this guards against). Snap any such window back to opaque UNLESS the app
+     * is driving its own opacity (e.g. the login fade-out) or the window is
+     * minimized (legitimately not shown). Skipped while an animation owns it. */
+    for (int i = 0; i < GUI_WINDOW_MAX; i++) {
+        struct window *w = &g_pool[i];
+        if (!w->in_use || w->opacity >= 255) continue;
+        if (w->opacity_app_set || w->state == GUI_WIN_MINIMIZED) continue;
+        bool owned = false;
+        for (int j = 0; j < ANIM_MAX; j++) {
+            if (g.anims[j].active && g.anims[j].win == w) { owned = true; break; }
+        }
+        if (!owned) {
+            w->opacity = 255;     /* heal: a lost fade can't leave it invisible */
+            g.dirty = true;
+        }
+    }
+
     if (any_active) g.dirty = true;
 }
 
@@ -1619,6 +1649,11 @@ static struct window *window_at(int px, int py) {
 /* Push from IRQ context. If the ring is full we drop the OLDEST event
  * to keep input fresh -- a stuck window shouldn't be able to back-
  * pressure cursor updates. */
+/* M3 (unified stacks): syscall.c translates a fbdev window's events into Linux
+ * evdev records. Declared here (no shared header) so the compositor can feed a
+ * windowed Linux app's input straight from the event-producer path. */
+void fbdev_window_event(struct window *w, const struct gui_event *e);
+
 static void enqueue_event(struct window *w, int type, int x, int y,
                           uint8_t button, uint8_t key) {
     uint8_t next = (uint8_t)((w->ev_head + 1u) % GUI_EVENT_RING);
@@ -1634,6 +1669,10 @@ static void enqueue_event(struct window *w, int type, int x, int y,
     e->key    = key;
     e->_pad[0] = e->_pad[1] = 0;
     w->ev_head = next;
+
+    /* If this window is a windowed Linux app, mirror the event to its evdev
+     * rings (focus-routed input; no-op for every other window). */
+    fbdev_window_event(w, e);
 }
 
 /* Forward decls -- needed because on_mouse_event() (below) calls
@@ -2958,10 +2997,18 @@ static void compositor_paint_one(struct window *w, bool focused) {
     /* During login (session not yet active) or during the login window's
      * fade-out (opacity < 255 on a maximized window), skip chrome so the
      * login window appears borderless/fullscreen. */
-    if (!session_active() ||
+    bool login_screen = !session_active();
+    if (login_screen ||
         (w->state == GUI_WIN_MAXIMIZED && w->opacity < 255 && w->opacity > 0)) {
         if (w->backbuf) {
-            if (w->opacity >= 255) {
+            /* The login screen MUST render fully even if its fade-in never
+             * completed. Windows are created at opacity 0 and ramped to 255
+             * by the pid0 anim_tick; on real hardware that tick can stall,
+             * leaving the login window stuck invisible over the desktop.
+             * Ignore the fade for the login screen -- only the post-login
+             * fade-OUT (session active + maximized + 0<opacity<255) takes
+             * the alpha-blend branch below. */
+            if (login_screen || w->opacity >= 255) {
                 gfx_blit(w->x, w->y,
                          w->client_w, w->client_h,
                          w->backbuf, w->client_w);
@@ -4427,12 +4474,22 @@ static bool any_tracked_alive(void) {
     return false;
 }
 
+/* Set by idle_loop around its gui_tick() call. idle_loop IS pid 0 and holds
+ * the BKL, so this is the authoritative "running as the pid-0 compositor
+ * driver" signal -- used because current_proc() (gs-relative per-CPU current)
+ * can read back stale on real-hardware SMP, which otherwise made gui_tick
+ * skip its entire pid-0 block (compositor/anim/reap), freezing the desktop. */
+static bool g_gui_driver_ctx;
+void gui_set_driver_ctx(bool on) { g_gui_driver_ctx = on; }
+
 void gui_tick(void) {
     if (!g.ready) return;
 
-    /* Process-spawn / reap operations need pid 0's address space. */
+    /* Process-spawn / reap operations need pid 0's address space. idle_loop
+     * runs with pid 0's CR3 and sets g_gui_driver_ctx, so trust that over a
+     * possibly-stale current_proc() read (see gui_set_driver_ctx). */
     struct proc *cur = current_proc();
-    bool on_pid0 = (cur && cur->pid == 0);
+    bool on_pid0 = (cur && cur->pid == 0) || g_gui_driver_ctx;
 
     if (g.input_boost_pid > 0) {
         int pid = g.input_boost_pid;
@@ -4623,6 +4680,12 @@ void gui_tick(void) {
 }
 
 bool gui_active(void) { return g.active; }
+
+int gui_window_count(void) {
+    int n = 0;
+    for (struct window *w = g.z_top; w; w = w->z_next) n++;
+    return n;
+}
 
 void gui_settings_changed(const char *key, const char *val) {
     if (!key) return;
@@ -5163,6 +5226,7 @@ int gui_window_gradient(struct window *w, int x, int y, int rw, int rh, uint32_t
 int gui_window_set_opacity(struct window *w, uint8_t alpha) {
     if (!w || !w->in_use) return -1;
     w->opacity = alpha;
+    w->opacity_app_set = true;   /* the app owns this window's opacity now */
     return 0;
 }
 

@@ -125,6 +125,7 @@
 #define PCI_CLASS_SERIAL_BUS     0x0C
 
 #define PCI_SUBCLASS_IDE         0x01    /* under MASS_STORAGE */
+#define PCI_SUBCLASS_RAID        0x04    /* under MASS_STORAGE (Intel RST RAID mode) */
 #define PCI_SUBCLASS_AHCI        0x06    /* under MASS_STORAGE */
 #define PCI_SUBCLASS_NVME        0x08    /* under MASS_STORAGE */
 #define PCI_SUBCLASS_ETHERNET    0x00    /* under NETWORK      */

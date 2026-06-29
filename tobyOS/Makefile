@@ -779,7 +779,8 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/termios.c \
                    $(LIBTOBY_SRC)/poll.c \
                    $(LIBTOBY_SRC)/mman.c \
-                   $(LIBTOBY_SRC)/config.c
+                   $(LIBTOBY_SRC)/config.c \
+                   $(LIBTOBY_SRC)/tk.c
 # M29B SYS_DRVMATCH ships in libtoby/src/hwinfo.c -- no new translation
 # unit. The list above is intentionally non-exhaustive of headers; the
 # hwinfo.c TU now also exports tobyhw_drvmatch.
@@ -1295,6 +1296,14 @@ programs/linux-thread/linux-thread.elf: programs/linux-thread/main.c
 # Track B (graphics): a genuine Linux x86-64 fbdev app -- open /dev/fb0,
 # FBIOGET_VSCREENINFO/FSCREENINFO, mmap the scanout, draw pixels, FBIOPAN_DISPLAY.
 programs/linux-fb/linux-fb.elf: programs/linux-fb/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
+# GUI-framework M3: a long-lived (animated) Linux fbdev app for the three-worlds
+# demo. Same toolchain/branding as linux-fb; presents into a compositor window.
+programs/linux-fbwin/linux-fbwin.elf: programs/linux-fbwin/main.c
 	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
 	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
 	      -Wl,-e,_start -o $@ $<
@@ -1921,19 +1930,10 @@ programs/user_login/user_login.elf: \
 	      programs/common/start.o \
 	      programs/user_login/user_login.o
 
-programs/user_gui_settings/user_gui_settings.o: \
-        programs/user_gui_settings/main.c \
-        programs/common/toby_gui.h
-	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-programs/user_gui_settings/user_gui_settings.elf: \
-        programs/user_gui_settings/user_gui_settings.o \
-        programs/common/start.o \
-        programs/common/toby_gui.o \
-        programs/user_gui_settings/program.ld
-	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_settings/program.ld -o $@ \
-	      programs/common/start.o programs/common/toby_gui.o \
-	      programs/user_gui_settings/user_gui_settings.o
+# GUI-framework Milestone 1: the Settings app is now a LIBTOBY_PROGRAM built on
+# the TobyTK toolkit (toby/tk.h) -- it links crt0.o + libtoby.a like every other
+# native app, instead of the old start.o + toby_gui.o.
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_settings,user_gui_settings))
 
 # Milestone-16 packaged app: built with the same flags as every other
 # GUI program, but NOT dropped into /bin/ at initrd time. Instead the
@@ -1993,6 +1993,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-mmaptest/linux-mmaptest.elf \
                programs/linux-thread/linux-thread.elf \
                programs/linux-fb/linux-fb.elf \
+               programs/linux-fbwin/linux-fbwin.elf \
                programs/linux-join/linux-join.elf \
                programs/linux-poll/linux-poll.elf \
                programs/linux-netserver/linux-netserver.elf \
@@ -2107,6 +2108,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-mmaptest/linux-mmaptest.elf     $(INITRD_STAGE)/bin/linux-mmaptest
 	cp programs/linux-thread/linux-thread.elf         $(INITRD_STAGE)/bin/linux-thread
 	cp programs/linux-fb/linux-fb.elf                 $(INITRD_STAGE)/bin/linux-fb
+	cp programs/linux-fbwin/linux-fbwin.elf           $(INITRD_STAGE)/bin/linux-fbwin
 	cp programs/linux-join/linux-join.elf             $(INITRD_STAGE)/bin/linux-join
 	cp programs/linux-poll/linux-poll.elf             $(INITRD_STAGE)/bin/linux-poll
 	cp programs/linux-netserver/linux-netserver.elf   $(INITRD_STAGE)/bin/linux-netserver
@@ -2548,7 +2550,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/login bin/gui_settings bin/abi_test                           \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
-	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-join bin/linux-poll \
+	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-fbwin bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
 	    bin/linux-glibc \

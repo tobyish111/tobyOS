@@ -916,13 +916,18 @@ static void limine_flip(void) {
      * one big memcpy beats H separate ones. Otherwise walk row by row. */
     if (g.fb_pitch_px == g.width) {
         memcpy(fb, g.back, (size_t)g.width * g.height * 4u);
-        return;
+    } else {
+        for (uint32_t row = 0; row < g.height; row++) {
+            memcpy(&fb[row * g.fb_pitch_px],
+                   &g.back[row * g.width],
+                   (size_t)g.width * 4u);
+        }
     }
-    for (uint32_t row = 0; row < g.height; row++) {
-        memcpy(&fb[row * g.fb_pitch_px],
-               &g.back[row * g.width],
-               (size_t)g.width * 4u);
-    }
+    /* The framebuffer is mapped Write-Combining (PAT slot 4) on real
+     * hardware -- flush the WC store buffers so the pixels actually reach
+     * the scanout instead of lingering in the CPU's write-combine buffers.
+     * No-op-cost on QEMU; required for a visible display on a real IGD. */
+    __asm__ volatile ("sfence" ::: "memory");
 }
 
 /* M27B: Limine partial present. Same row-walk as limine_flip() but
@@ -942,6 +947,9 @@ static void limine_present_rect(int x, int y, int w, int h) {
                &g.back[(uint32_t)(y + row) * g.width      + (uint32_t)x],
                (size_t)w * 4u);
     }
+    /* Flush WC store buffers (see limine_flip) -- small dirty-rect copies
+     * are especially prone to lingering in the write-combine buffers. */
+    __asm__ volatile ("sfence" ::: "memory");
 }
 
 /* M27B: limine "describe" -- short string for displayinfo --json. */

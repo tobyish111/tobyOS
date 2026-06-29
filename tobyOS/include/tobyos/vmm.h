@@ -26,6 +26,8 @@
 #define VMM_NOCACHE  (1u << 3)   /* PCD|PWT, for MMIO */
 #define VMM_NX       (1u << 4)   /* no-execute (requires EFER.NXE, set in vmm_init) */
 #define VMM_HUGE_2M  (1u << 5)   /* request a 2 MiB leaf (virt+phys must be 2M-aligned) */
+#define VMM_WC       (1u << 6)   /* write-combining (PAT slot 4) -- for the linear framebuffer.
+                                  * Mutually exclusive with VMM_NOCACHE; needs vmm_pat_init(). */
 
 struct limine_memmap_response;
 
@@ -117,6 +119,12 @@ uint64_t vmm_set_editor_root(uint64_t pml4_phys);
 
 /* Return the HHDM base offset. */
 uint64_t vmm_hhdm_offset(void);
+
+/* Program IA32_PAT on the CURRENT cpu so PAT slot 4 = Write-Combining.
+ * Idempotent + safe to call on every CPU (BSP from vmm_init right after
+ * the CR3 switch, each AP from ap_entry). Must run before any VMM_WC
+ * mapping is actually touched, or that page reads as its WB default. */
+void vmm_pat_init(void);
 
 /* Map [phys, phys+len) into HHDM on demand if vmm_init skipped the
  * region (common on UEFI firmware: framebuffer/ACPI/modules tagged

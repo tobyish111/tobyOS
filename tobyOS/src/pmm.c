@@ -85,11 +85,16 @@ void pmm_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
     kprintf("[pmm] Limine memmap (%lu entries):\n", memmap->entry_count);
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry *e = memmap->entries[i];
+        /* Per-entry dump is ~115 lines on real firmware -- opt-in so it
+         * doesn't crowd the later boot stages out of a serial capture.
+         * (The accumulation below is NOT gated -- it's load-bearing.) */
+#ifdef PMM_VERBOSE_MEMMAP
         kprintf("  %p..%p  %8lu KiB  %s\n",
                 (void *)e->base,
                 (void *)(e->base + e->length),
                 e->length / 1024,
                 type_name(e->type));
+#endif
         if (e->type == LIMINE_MEMMAP_USABLE) {
             total_usable_bytes += e->length;
             uint64_t end = e->base + e->length;

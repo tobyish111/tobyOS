@@ -233,6 +233,13 @@ static void early_init(void) {
     serial_init();
     serial_puts("\n[boot] tobyOS kernel entry\n");
     bootlog_init();
+    /* Announce the serial console parameters up front so a remote monitor
+     * knows exactly how to connect (8 data bits, no parity, 1 stop). All
+     * kprintf/slog output streams here in real time from this point on. */
+    kprintf("[boot] ============================================\n");
+    kprintf("[boot]  SERIAL CONSOLE: COM1 (0x3F8) @ %u 8N1\n", serial_baud());
+    kprintf("[boot]  connect your monitor terminal here\n");
+    kprintf("[boot] ============================================\n");
     kprintf("[boot] serial up (COM1 + debugcon)\n");
     /* Milestone 28A: bring the structured-log ring up as early as
      * possible so every subsequent subsystem can SLOG_INFO/etc. into
@@ -531,6 +538,45 @@ static void smp_init_bsp(void) {
     }
 }
 
+/* Serial liveness heartbeat. Emitted from pid 0's idle loop, so it ticks
+ * in every boot profile (text, GUI, and safe mode) -- unlike the GUI-only
+ * compositor heartbeat. It goes ONLY to COM1 (kprintf_serial), so a remote
+ * monitor can tell "idle" from "frozen" and watch live stats without the
+ * line cluttering the on-screen console. If pid 0 ever wedges, the beat
+ * simply stops -- which is itself the signal. Define NO_SERIAL_HEARTBEAT
+ * to compile it out. */
+#ifndef NO_SERIAL_HEARTBEAT
+#define HEARTBEAT_PERIOD_SECS 2u
+static void serial_heartbeat(void) {
+    /* Use the TSC-based monotonic clock (perf_now_ns), NOT pit_ticks:
+     * the PIT IRQ stops incrementing once the kernel switches the timer
+     * over to the LAPIC, which would otherwise freeze the heartbeat a
+     * few seconds into boot. perf_now_ns returns 0 until the TSC is
+     * calibrated -- before that we simply don't beat. */
+    uint64_t now_ns = perf_now_ns();
+    if (now_ns == 0) return;
+
+    static uint64_t last_ns = 0;
+    static uint64_t beat = 0;
+    uint64_t period_ns = (uint64_t)HEARTBEAT_PERIOD_SECS * 1000000000ull;
+    if (last_ns != 0 && now_ns - last_ns < period_ns) return;
+    last_ns = now_ns;
+
+    uint64_t up_s   = now_ns / 1000000000ull;
+    size_t   total  = pmm_total_pages();
+    size_t   freep  = pmm_free_pages();
+    /* 4 KiB pages -> MiB == pages / 256. */
+    unsigned free_mib  = (unsigned)(freep / 256);
+    unsigned total_mib = (unsigned)(total / 256);
+
+    kprintf_serial("[hb] #%lu up=%lus mem=%u/%uMiB free gui=%s\n",
+                   (unsigned long)(++beat),
+                   (unsigned long)up_s,
+                   free_mib, total_mib,
+                   gui_active() ? "on" : "off");
+}
+#endif
+
 static __attribute__((noreturn)) void idle_loop(void) {
     uint32_t hz = pit_hz();
     if (hz == 0) hz = 1;
@@ -547,6 +593,14 @@ static __attribute__((noreturn)) void idle_loop(void) {
         } while (0)
 
     for (;;) {
+#ifndef NO_SERIAL_HEARTBEAT
+        /* Serial-only liveness beat, emitted at the TOP of the loop --
+         * before the GUI/service phases -- so the last beat pinpoints
+         * "pid 0 was alive entering this iteration". No BKL needed: it
+         * reads its own locked counters and kprintf_serial self-serialises. */
+        serial_heartbeat();
+#endif
+
         /* SMP: pid 0's per-tick work (gui_tick, service ticks, net/USB/shell)
          * touches shared kernel state that user procs on other cores reach via
          * their syscalls, so each phase runs under the BKL.
@@ -586,9 +640,14 @@ static __attribute__((noreturn)) void idle_loop(void) {
         SERVICE_INPUT();
         bkl_exit();
 
-        /* GUI/window manager tick. */
+        /* GUI/window manager tick. We are pid 0 here and hold the BKL;
+         * tell gui_tick that authoritatively (current_proc() can read back
+         * stale under real-hardware SMP, which would make gui_tick skip its
+         * whole pid-0 compositor/anim/reap block and freeze the desktop). */
         bkl_enter();
+        gui_set_driver_ctx(true);
         gui_tick();
+        gui_set_driver_ctx(false);
         bkl_exit();
 
         /* If GUI work yielded back after a repaint burst, give the
@@ -831,6 +890,15 @@ static void user_first_run(void) {
     kprintf("[boot] /bin/hello (pid=%d) finished, exit code=%d (0x%x)\n",
             pid, rc, (unsigned)rc);
 
+    /* The M25A-E boot self-test battery (abi_test, the libtoby c_* demos,
+     * the dynamic-linker smoke, and the ported p_* userland tools) is a
+     * developer/CI validation harness, NOT part of bringing the system up.
+     * On real hardware it adds ~30s of boot time and floods the serial log,
+     * so it is folded into the existing QUICK_BOOT gate -- default builds set
+     * -DQUICK_BOOT and skip it; `make fullboot` runs the full battery. The
+     * /bin/hello round-trip above stays unconditional as a minimal "first
+     * userspace process actually runs" proof, so the boot path is unchanged. */
+#ifndef QUICK_BOOT
     /* Milestone 25A smoke test: exercise every new syscall through
      * /bin/abi_test. The program is a freestanding ELF with inline
      * SYSCALL trampolines (no libc), so a regression in the libc
@@ -1064,6 +1132,7 @@ static void user_first_run(void) {
         kprintf("[boot] M25E: ports %d/%lu PASS\n",
                 passed, (unsigned long)(sizeof(ports) / sizeof(ports[0])));
     }
+#endif /* !QUICK_BOOT -- M25A-E boot self-test battery */
 }
 
 /* Milestone 25C: post-shell_init validation. Runs a short sequence of
@@ -2349,7 +2418,7 @@ static void m28e_run_fscheck_harness(void) {
     }
 }
 
-#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT) || defined(WINPE16D_BOOT) || defined(WINPE18C_BOOT) || defined(WINPE25_BOOT)
+#if defined(WINPE8_BOOT) || defined(WINPE10_BOOT) || defined(WINPE11_BOOT) || defined(WINPE12_BOOT) || defined(WINPE13_BOOT) || defined(WINPE14_BOOT) || defined(WINPE14B_BOOT) || defined(WINPE15_BOOT) || defined(WINPE16B_BOOT) || defined(WINPE16D_BOOT) || defined(WINPE18C_BOOT) || defined(WINPE25_BOOT) || defined(TKDEMO_BOOT) || defined(THREEWORLDS_BOOT)
 /* ---- Track C / C8: a VISIBLE + INTERACTIVE stock Win32 GUI .exe ----
  *
  * C7 proved the user32/gdi32 bridge but the window was (a) hidden behind the
@@ -2735,6 +2804,18 @@ void _start(void) {
             }
         }
 
+        /* DATA SAFETY (real hardware): tobyOS must NOT auto-mount or write
+         * filesystems that belong to OTHER operating systems on the
+         * machine's disks (e.g. the Windows EFI System Partition / NTFS
+         * data partitions on an internal SATA disk). The opportunistic
+         * /fat, /usb and /ext mounts below -- and their read/WRITE smoke
+         * tests -- were dev-time milestone self-tests; on a real box they
+         * touch foreign partitions (this boot wrote SELFTEST.LOG onto the
+         * live Windows ESP). They are now compiled OUT by default and built
+         * only when FS_BOOT_SELFTESTS is explicitly defined (QEMU dev
+         * images). tobyOS's OWN tobyfs /data probe above stays -- it only
+         * READS a superblock magic and never writes to a non-tobyfs disk. */
+#ifdef FS_BOOT_SELFTESTS
         /* Milestone 23B: opportunistically mount the FIRST FAT32-looking
          * partition at /fat. We don't fail boot if there's no FAT32
          * volume present -- this is purely a convenience so the live
@@ -3211,6 +3292,7 @@ void _start(void) {
 
             kprintf("[ext4-test] <<< end smoke test on /ext\n");
         }
+#endif /* FS_BOOT_SELFTESTS -- foreign-FS auto-mount + smoke tests */
 
         installer_scan_modules();
         vfs_dump_mounts();
@@ -3265,6 +3347,15 @@ void _start(void) {
                 (unsigned)0x40);
     }
     smp_start_aps();         /* INIT-SIPI-SIPI (BSP/IO APIC already up) */
+
+    /* Every online CPU now has its GS base installed (BSP in syscall_init
+     * above, each AP in ap_entry before it reached `online`). Switch
+     * smp_this_cpu()/current_proc() to the gs-relative fast path: a plain
+     * load instead of an LAPIC MMIO read on every call. This is what keeps
+     * the multi-core hot paths (BKL, sched_yield, gui_tick) from drowning
+     * in MMIO exits under TCG -- the headless desktop-freeze livelock. */
+    smp_enable_fast_cpu_id();
+
     /* Networking intentionally starts after the GUI/input layer setup
      * below, but before desktop/login services are launched. On the HP
      * Realtek 8168 machine, moving NIC/DHCP before GUI setup regressed
@@ -3486,6 +3577,13 @@ void _start(void) {
         bool net_ok = net_init();
         kprintf("[boot] after net_init ok=%d net_up=%d\n",
                 (int)net_ok, (int)net_is_up());
+
+        /* Real-hardware NIC diagnosis: dump the e1000e MAC's HW packet
+         * counters right after the DHCP window so a failed lease tells us
+         * whether the TX or the RX path is the problem (see
+         * e1000e_dump_stats). No-op on non-e1000e machines. */
+        { extern void e1000e_dump_stats(const char *when);
+          e1000e_dump_stats("post-net_init"); }
 
         if (net_ok) {
             kprintf("[boot] net_init OK; starting TCP services\n");
@@ -7483,6 +7581,107 @@ void _start(void) {
         bkl_exit();
         kprintf("[boot] SCHEDINT: pipe-reader avg wake latency = %d ms "
                 "(io_boost=%d)\n", rinfo.exit_code, SCHED_IO_BOOST);
+    }
+#endif
+
+#ifdef TKDEMO_BOOT
+    /* GUI-framework Milestone 1 proof: auto-login, launch the toolkit-based
+     * Settings app onto the logged-in desktop, drive a nav click to prove the
+     * widget tree rebuilds, then hold for a QMP screenshot before falling
+     * through to idle_loop (which keeps the desktop live + interactive).
+     * Build: make EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DTKDEMO_BOOT". */
+    {
+        winpe_autologin_clear();
+        kprintf("[boot] TKDEMO: launching /bin/gui_settings (TobyTK toolkit)\n");
+        int spid = winpe_spawn_session_app("/bin/gui_settings", "gui_settings");
+        if (spid < 0) {
+            kprintf("[TKDEMO] VERDICT: FAIL reason=spawn rc=%d\n", spid);
+        } else {
+            winpe8_pump_ms(1500);   /* window create + first toolkit paint */
+            kprintf("[boot] TKDEMO: settings pid=%d up; driving a nav click\n", spid);
+            /* Click the "Sound" nav button in the sidebar (client coords). */
+            gui_post_mouse(GUI_EV_MOUSE_MOVE, 98, 155, 0);
+            gui_post_mouse(GUI_EV_MOUSE_DOWN, 98, 155, MOUSE_BTN_LEFT);
+            winpe8_pump_ms(120);
+            gui_post_mouse(GUI_EV_MOUSE_UP, 98, 155, MOUSE_BTN_LEFT);
+            winpe8_pump_ms(600);
+            /* Click "About" to show live metrics. */
+            gui_post_mouse(GUI_EV_MOUSE_MOVE, 98, 269, 0);
+            gui_post_mouse(GUI_EV_MOUSE_DOWN, 98, 269, MOUSE_BTN_LEFT);
+            winpe8_pump_ms(120);
+            gui_post_mouse(GUI_EV_MOUSE_UP, 98, 269, MOUSE_BTN_LEFT);
+            winpe8_pump_ms(600);
+            struct proc *sp = proc_lookup(spid);
+            kprintf("[TKDEMO] settings %s; holding ~8s for screenshot\n",
+                    (sp && sp->state != PROC_TERMINATED) ? "ALIVE" : "EXITED");
+            winpe8_pump_ms(8000);
+        }
+    }
+#endif
+
+#ifdef THREEWORLDS_BOOT
+    /* GUI-framework Milestone 3 -- the headline: a native tobyOS app, an
+     * unmodified Windows .exe, and an unmodified Linux ELF open as three peer
+     * windows composited on ONE desktop. Build:
+     *   make EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DTHREEWORLDS_BOOT"
+     * Then idle_loop keeps the desktop live for the QMP screenshot. */
+    {
+        /* Guard-capped pump: gives wall-clock time for apps to run/composite,
+         * but a tight pit_ticks-deadline pump (winpe8_pump_ms) was observed to
+         * stall after the login proc is torn down here -- so we cap the spin so
+         * the demo can never hang. */
+        #define TW_PUMP(ms) do { \
+            uint64_t _hz = pit_hz(); if (!_hz) _hz = 1000; \
+            uint64_t _end = pit_ticks() + ((uint64_t)(ms) * _hz + 999) / 1000; \
+            long _g = 0; \
+            while (pit_ticks() < _end && _g < 4000000L) { \
+                sched_yield(); mouse_flush_pending(); kbd_flush_pending(); \
+                gui_tick(); _g++; \
+            } \
+        } while (0)
+
+        kprintf("[3W] autologin (session_login root)\n");
+        session_login("root", "");
+
+        /* Spawn the native app FIRST (while the login proc is still alive), so
+         * the user-proc count never drops to zero -- the desktop pump path is
+         * fragile when no user proc is runnable. */
+        kprintf("[3W] (1/3) native: /bin/gui_settings (TobyTK toolkit)\n");
+        int np = winpe_spawn_session_app("/bin/gui_settings", "gui_settings");
+        TW_PUMP(1400);
+
+        /* Now dismiss login: stop its service (no restart) + SIGKILL it (it
+         * ignores SIGTERM). gui_settings is alive, so procs never hit zero. */
+        service_stop("login");
+        for (int pid = 1; pid < 64; pid++) {
+            struct proc *p = proc_lookup(pid);
+            if (p && p->name[0] && strcmp(p->name, "login") == 0)
+                signal_send_to_pid(pid, SIGKILL);
+        }
+        gui_invalidate_full();
+        TW_PUMP(500);
+        kprintf("[3W] login dismissed; active=%d\n", (int)session_active());
+
+        kprintf("[3W] (2/3) windows: /bin/win-gui8.exe (PE32+ user32/gdi32)\n");
+        int wp = winpe_spawn_session_app("/bin/win-gui8.exe", "win-gui8.exe");
+        TW_PUMP(1400);
+
+        kprintf("[3W] (3/3) linux: /bin/linux-fbwin (fbdev ELF -> compositor window)\n");
+        int lp = winpe_spawn_session_app("/bin/linux-fbwin", "linux-fbwin");
+        TW_PUMP(2200);
+
+        int wins = gui_window_count();
+        kprintf("[3W] windows composited: %d (native pid=%d, win32 pid=%d, linux pid=%d)\n",
+                wins, np, wp, lp);
+        if (wins >= 3)
+            kprintf("[3W] VERDICT: PASS -- three worlds, three windows, one desktop\n");
+        else
+            kprintf("[3W] VERDICT: only %d windows up (want >=3)\n", wins);
+        gui_dump_status("threeworlds");
+
+        kprintf("[3W] holding ~10s for screenshot\n");
+        TW_PUMP(10000);
+        #undef TW_PUMP
     }
 #endif
 

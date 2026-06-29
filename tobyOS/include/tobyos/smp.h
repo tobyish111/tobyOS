@@ -45,6 +45,11 @@ uint32_t smp_current_cpu_idx(void);
  * table is built; before that it returns the BSP slot. */
 struct percpu *smp_this_cpu(void);
 
+/* Switch smp_this_cpu() to the gs-relative fast path. Call once, after
+ * smp_start_aps() returns (every online CPU has installed its GS base by
+ * then). Before this, smp_this_cpu() uses the slow LAPIC-ID lookup. */
+void smp_enable_fast_cpu_id(void);
+
 /* Mutable view of g_percpu[idx]. Internal-ish: the scheduler uses
  * this to push/pop the BSP queue from any CPU. NULL if idx is OOR. */
 struct percpu *smp_cpu_mut(uint32_t idx);

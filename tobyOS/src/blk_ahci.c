@@ -1,10 +1,12 @@
 /* blk_ahci.c -- AHCI 1.0 SATA driver (MSI-driven completion, polled fallback).
  *
  * Bound through the milestone-21 PCI driver registry. Matches any
- * mass-storage SATA controller (class 0x01, subclass 0x06). On QEMU's
- * q35 machine that's the ICH9 SATA HBA at 00:1F.2 (8086:2922). On real
- * hardware it's whatever AHCI HBA the chipset exposes (Intel PCH /
- * AMD FCH SATA in AHCI mode, Marvell, ASMedia, ...).
+ * mass-storage SATA controller (class 0x01, subclass 0x06) PLUS Intel
+ * RAID-mode controllers (class 0x01, subclass 0x04 -- same ABAR layout;
+ * see the match table). On QEMU's q35 machine that's the ICH9 SATA HBA
+ * at 00:1F.2 (8086:2922). On real hardware it's whatever AHCI HBA the
+ * chipset exposes (Intel PCH / AMD FCH SATA in AHCI mode, Marvell,
+ * ASMedia, ...), or an Intel PCH whose BIOS SATA mode is set to RAID.
  *
  * Architecture
  * ------------
@@ -1164,6 +1166,24 @@ static const struct pci_match g_ahci_matches[] = {
      * (0x02 = serial storage bus, etc.) still bind. */
     { PCI_ANY_ID, PCI_ANY_ID,
       PCI_CLASS_MASS_STORAGE, PCI_SUBCLASS_AHCI, PCI_ANY_CLASS },
+
+    /* Intel "RST" / RAID-mode SATA controllers present PCI class
+     * 0x01/0x04 (RAID) instead of 0x01/0x06 (AHCI), but the BAR5 ABAR
+     * register block is the SAME AHCI 1.x layout -- the GHC.AE write in
+     * ahci_pci_probe forces AHCI behaviour, and a single non-array disk
+     * still shows up on its native port in PI. This is the onboard SATA
+     * controller on machines whose BIOS SATA mode is set to RAID/RST
+     * rather than AHCI (e.g. HP EliteDesk 800 G1 -> 8086:2822).
+     *
+     * Scoped to Intel (0x8086) on purpose: only Intel guarantees the
+     * RAID-mode function is AHCI-register-compatible. Non-Intel RAID
+     * HBAs (LSI/Marvell/etc.) are class 0x01/0x04 too but are NOT AHCI,
+     * so they must not match here. Even within Intel, the probe declines
+     * gracefully (returns <0) if BAR5 won't map or no SATA drive is
+     * found, so a true RAID-array config simply stays unbound rather
+     * than misbehaving. */
+    { 0x8086, PCI_ANY_ID,
+      PCI_CLASS_MASS_STORAGE, PCI_SUBCLASS_RAID, PCI_ANY_CLASS },
     PCI_MATCH_END,
 };
 

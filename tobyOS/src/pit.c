@@ -20,6 +20,7 @@
 #include <tobyos/sched.h>
 #include <tobyos/proc.h>
 #include <tobyos/xhci.h>
+#include <tobyos/perf.h>
 
 #define PIT_CH0_DATA  0x40
 #define PIT_CMD       0x43
@@ -104,12 +105,36 @@ uint64_t pit_ticks(void) { return g_ticks; }
 uint32_t pit_hz(void)    { return g_hz; }
 
 void pit_sleep_ms(uint64_t ms) {
+    /* Robust busy delay. Two reasons this no longer does `while (pit_ticks() <
+     * end) hlt();`:
+     *
+     *  1. It must not depend on the PIT IRQ still advancing. The scheduler
+     *     moves the tick to the LAPIC timer early in boot, and on headless
+     *     QEMU/TCG (and defensively on real HW) the IOAPIC->LAPIC PIT edge can
+     *     stop being delivered. A pit_ticks()-based wait would then spin/sleep
+     *     forever.
+     *  2. It must not park the core in HLT. Once every core is halted, a
+     *     dropped timer wake never returns from HLT and the box freezes with no
+     *     fault (the classic "stall ~3s into boot"). PAUSE keeps the core live
+     *     so the deadline is always re-checked and any pending IRQ is taken at
+     *     an instruction boundary.
+     *
+     * Prefer the TSC monotonic clock (perf_now_ns), which keeps advancing no
+     * matter what happens to interrupt delivery. */
+    uint64_t now_ns = perf_now_ns();
+    if (now_ns != 0) {
+        uint64_t end_ns = now_ns + ms * 1000000ull;
+        while (perf_now_ns() < end_ns)
+            __asm__ volatile ("pause" ::: "memory");
+        return;
+    }
+
+    /* Pre-TSC fallback (very early boot, before perf_init): the PIT IRQ is
+     * still the only clock we have. Spin on PAUSE rather than HLT so a missed
+     * wake can't wedge us; this window is short and single-threaded. */
     if (g_hz == 0) return;
-    /* ticks_to_wait = ms * hz / 1000; round up so very small sleeps
-     * still wait at least one tick. */
     uint64_t wait = (ms * (uint64_t)g_hz + 999) / 1000;
     uint64_t end  = pit_ticks() + wait;
-    while (pit_ticks() < end) {
-        hlt();
-    }
+    while (pit_ticks() < end)
+        __asm__ volatile ("pause" ::: "memory");
 }

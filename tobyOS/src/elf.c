@@ -299,6 +299,11 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
         uint64_t virt_lo = round_down(seg_vaddr,                 PAGE_SIZE);
         uint64_t virt_hi = round_up  (seg_vaddr + ph->p_memsz,   PAGE_SIZE);
 
+        /* Per-segment phdr logging is ~3-4 lines per program load -- with
+         * the boot demo battery that is ~100 lines that crowd the later
+         * boot stages out of a serial capture. The "load OK" summary below
+         * stays; gate the verbose per-phdr line behind ELF_VERBOSE_LOAD. */
+#ifdef ELF_VERBOSE_LOAD
         kprintf("[elf] phdr[%u] LOAD vaddr=%p memsz=0x%lx filesz=0x%lx "
                 "flags=%c%c%c%s -> pages [%p..%p)\n",
                 i, (void *)seg_vaddr,
@@ -308,6 +313,7 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
                 (ph->p_flags & PF_X) ? 'X' : '-',
                 user_mode ? " U" : "",
                 (void *)virt_lo, (void *)virt_hi);
+#endif
 
         if (!ensure_writable_pages(virt_lo, virt_hi, user_mode)) return false;
 

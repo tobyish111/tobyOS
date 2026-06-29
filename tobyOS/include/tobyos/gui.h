@@ -123,10 +123,21 @@ void gui_init(void);
  * otherwise returns immediately. Cheap to call at ~100 Hz. */
 void gui_tick(void);
 
+/* idle_loop (the authoritative pid-0 compositor driver) wraps its
+ * gui_tick() call in gui_set_driver_ctx(true/false). It tells gui_tick it
+ * is running as pid 0 even when the gs-relative current_proc() reads back
+ * stale under real-hardware SMP -- otherwise the whole pid-0 compositor
+ * block is skipped and the desktop freezes (login window stuck invisible). */
+void gui_set_driver_ctx(bool on);
+
 /* True once at least one window is alive. The compositor only owns the
  * framebuffer while active -- when inactive, console_putc and friends
  * keep working as before. */
 bool gui_active(void);
+
+/* Number of live windows currently in the z-order list (all stacks: native,
+ * Win32, and windowed Linux apps all count). Used by the three-worlds demo. */
+int gui_window_count(void);
 
 /* Called by settings syscalls after a desktop-related key changes so
  * compositor-owned shell chrome can reflect it immediately. */

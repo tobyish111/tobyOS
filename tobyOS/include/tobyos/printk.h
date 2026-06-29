@@ -38,6 +38,14 @@ void kputc(char c);
 __attribute__((format(printf, 1, 2)))
 void kprintf(const char *fmt, ...);
 
+/* Same formatting as kprintf, but the line is emitted ONLY to the COM1
+ * serial sink -- not the framebuffer console, mirror sink, or boot log.
+ * Intended for serial-only diagnostics (e.g. the boot/idle heartbeat)
+ * that should be visible on a remote monitor without disturbing the
+ * on-screen console or a full-screen terminal app. */
+__attribute__((format(printf, 1, 2)))
+void kprintf_serial(const char *fmt, ...);
+
 void kvprintf(const char *fmt, va_list ap);
 
 /* Optional "mirror" sink for kprintf output. When installed, every

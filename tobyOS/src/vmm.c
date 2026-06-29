@@ -57,6 +57,13 @@
 #define PTE_G    (1ULL << 8)
 #define PTE_NX   (1ULL << 63)
 
+/* PAT-select bit. Its position depends on the leaf size: bit 7 in a 4 KiB
+ * PT entry, but bit 12 in a 2 MiB PD leaf (bit 7 there is PS). Combined
+ * with PCD/PWT it indexes one of the 8 IA32_PAT slots; with PCD=PWT=0 and
+ * this bit set, the index is slot 4 -- which vmm_pat_init programs to WC. */
+#define PTE_PAT_4K (1ULL << 7)
+#define PTE_PAT_2M (1ULL << 12)
+
 /* Bits 12..51 hold the physical frame number << 12. Top 12 bits of a
  * canonical phys are zero on x86_64, so this mask grabs the address
  * cleanly without touching the flag bits. */
@@ -180,7 +187,9 @@ static bool map_4k(uint64_t virt, uint64_t phys, uint32_t flags) {
         kprintf("[vmm] WARN: map_4k: virt %p already mapped (entry=0x%lx)\n",
                 (void *)virt, pt[i]);
     }
-    pt[i] = (phys & PTE_ADDR_MASK) | flags_to_leaf(flags);
+    uint64_t leaf = flags_to_leaf(flags);
+    if (flags & VMM_WC) leaf |= PTE_PAT_4K;   /* PCD=PWT=0 + PAT => slot 4 (WC) */
+    pt[i] = (phys & PTE_ADDR_MASK) | leaf;
     invlpg(virt);
     return true;
 }
@@ -196,7 +205,9 @@ static bool map_2m(uint64_t virt, uint64_t phys, uint32_t flags) {
         kprintf("[vmm] WARN: map_2m: virt %p already mapped (entry=0x%lx)\n",
                 (void *)virt, pd[i]);
     }
-    pd[i] = (phys & ~PAGE_2M_MASK) | flags_to_leaf(flags) | PTE_PS;
+    uint64_t leaf = flags_to_leaf(flags) | PTE_PS;
+    if (flags & VMM_WC) leaf |= PTE_PAT_2M;   /* PCD=PWT=0 + PAT(bit12) => slot 4 (WC) */
+    pd[i] = (phys & ~PAGE_2M_MASK) | leaf;
     invlpg(virt);
     return true;
 }
@@ -580,6 +591,33 @@ static void enable_nxe(void) {
     }
 }
 
+#define IA32_PAT          0x277u
+
+/* PAT layout we install: identical to the x86 power-on default in every
+ * slot EXCEPT slot 4, which we repurpose from WB to Write-Combining (0x01).
+ * Slots 0..3 keep their reset meanings so every existing WB mapping (slot
+ * 0) and every VMM_NOCACHE mapping (=UC, slot 3 via PCD|PWT) is unchanged.
+ * Slot 4 is selected only by a PTE with the PAT bit set + PCD=PWT=0, which
+ * NO mapping used before VMM_WC existed -- so installing this with a plain
+ * wrmsr is safe: we are not changing the memory type of any page that is
+ * currently cached, just defining a previously-unused slot.
+ *
+ *   slot:  7    6    5    4    3    2    1    0
+ *   type: UC   UC-  WT   WC   UC   UC-  WT   WB
+ *   byte: 00   07   04   01   00   07   04   06   -> 0x0007040100070406
+ *
+ * NOTE the byte order: slot 4 (selected by VMM_WC: PAT=1,PCD=PWT=0) must
+ * be the WC=0x01 byte, and slot 3 (selected by VMM_NOCACHE: PCD=PWT=1)
+ * must stay UC=0x00. Getting these two transposed makes every MMIO
+ * mapping (LAPIC/IOAPIC/BARs) write-combining and triple-faults the box
+ * the instant apic_init touches the LAPIC.
+ */
+#define VMM_PAT_VALUE     0x0007040100070406ULL
+
+void vmm_pat_init(void) {
+    wrmsr(IA32_PAT, VMM_PAT_VALUE);
+}
+
 /* Decide whether a memmap entry should be mirrored into HHDM.
  * RESERVED is intentionally skipped: it usually points at MMIO holes or
  * very-high sparse regions (we saw a 12 GiB RESERVED entry at
@@ -640,8 +678,19 @@ void vmm_init(struct limine_memmap_response *memmap) {
         if (base < hhdm_high) base = hhdm_high;    /* skip the overlap */
 
         size_t bytes = (size_t)(end - base);
-        if (!vmm_map(g_hhdm + base, base, bytes,
-                     VMM_WRITE | VMM_NX | VMM_HUGE_2M)) {
+
+        /* The linear framebuffer must NOT be write-back: WB keeps the
+         * compositor's pixels in CPU cache and the GPU scanout never sees
+         * them on real hardware (black/stale screen -- it only "works" on
+         * QEMU because its FB is host RAM, insensitive to the memory type).
+         * Map it Write-Combining instead: writes reach the scanout promptly
+         * AND coalesce into burst transactions, so full-screen blits/scrolls
+         * aren't death-by-uncached-write. FB regions are firmware-aligned and
+         * isolated by RESERVED gaps, so this 2M span covers only the FB. */
+        uint32_t mflags = VMM_WRITE | VMM_NX | VMM_HUGE_2M;
+        if (e->type == LIMINE_MEMMAP_FRAMEBUFFER) mflags |= VMM_WC;
+
+        if (!vmm_map(g_hhdm + base, base, bytes, mflags)) {
             kpanic("vmm_init: HHDM mirror failed for phys %p..%p (type=%lu)",
                    (void *)base, (void *)end, (unsigned long)e->type);
         }
@@ -682,11 +731,18 @@ void vmm_init(struct limine_memmap_response *memmap) {
 
     write_cr3(g_pml4_phys);
 
+    /* Install our PAT (slot 4 = Write-Combining) BEFORE anything touches
+     * the now-WC framebuffer mapping -- until this runs, slot 4 reads as
+     * its WB power-on default and FB writes would be cached. Each AP does
+     * the same in ap_entry (PAT is per-logical-CPU). */
+    vmm_pat_init();
+
     /* Console may already be live from Limine's tables; the first
      * kprintf after CR3 would fault if UEFI tagged the FB RESERVED. */
     vmm_post_cr3_hook();
 
-    kprintf("[vmm] CR3 switched. Running on tobyOS page tables.\n");
+    kprintf("[vmm] CR3 switched + PAT slot4=WC; framebuffer mapped "
+            "write-combining.\n");
 }
 
 void vmm_init_and_test(struct limine_memmap_response *memmap) {

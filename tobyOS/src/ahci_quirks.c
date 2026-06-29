@@ -236,7 +236,9 @@ void ahci_quirks_init(void) {
     bool found = false;
     for (size_t i = 0; i < pci_device_count(); i++) {
         struct pci_dev *d = pci_device_at(i);
-        if (d && d->class_code == 0x01 && d->subclass == 0x06) {
+        /* 0x06 = AHCI/SATA, 0x04 = Intel RAID mode (same ABAR layout). */
+        if (d && d->class_code == 0x01 &&
+            (d->subclass == 0x06 || d->subclass == 0x04)) {
             dev = d;
             found = true;
             break;

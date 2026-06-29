@@ -17,12 +17,20 @@
 #include <tobyos/klibc.h>
 #include <tobyos/spinlock.h>
 #include <tobyos/pit.h>
+#include <tobyos/perf.h>
 
 /* Optional "mirror" sink: when set, every emitted byte is also handed
  * off to cb(ctx, c). See printk.h for the semantics + caveats. */
 static void (*g_sink_cb)(void *ctx, char c) = 0;
 static void *g_sink_ctx = 0;
 static bool g_sink_suppress = false;
+
+/* When set, emit_char routes ONLY to the COM1 serial sink -- not the
+ * framebuffer console, the mirror sink, or the boot log. Used by
+ * kprintf_serial() so a periodic heartbeat (or any serial-only trace)
+ * never clutters the on-screen console or a full-screen TUI. Guarded by
+ * g_printk_lock, so it composes with normal kprintf without interleaving. */
+static bool g_emit_serial_only = false;
 
 /* Milestone 22 step 5: serialise the entire kvprintf body so two
  * CPUs printing concurrently never interleave individual characters
@@ -58,6 +66,10 @@ void printk_get_sink(void (**cb)(void *ctx, char c), void **ctx,
 }
 
 static void emit_char(char c) {
+    if (g_emit_serial_only) {
+        serial_putc(c);
+        return;
+    }
     if (!g_sink_suppress) {
         serial_putc(c);
         if (console_ready()) console_putc(c);
@@ -100,17 +112,46 @@ static void emit_uint(uint64_t v, unsigned base, bool upper,
     if (pad > 0 && left_align) emit_pad(' ', pad);  /* left-align: never zero-pad */
 }
 
-/* Monotonic ms since PIT started (IRQ0 ticks); before pit_init(), hz is 0. */
+/* Monotonic ms-since-boot for the log prefix.
+ *
+ * Early boot uses the PIT tick counter. But the PIT IRQ stops firing once
+ * the kernel hands the timer tick to the LAPIC, which froze the old
+ * pit-only prefix a few seconds into boot. Once the TSC is calibrated
+ * (perf_now_ns != 0) we switch to it -- it never stalls. To keep the
+ * timeline continuous across the switch (perf_now_ns counts from
+ * calibration, not reset) we capture a one-time offset = the pit-based ms
+ * at the moment of the switch, so timestamps neither jump backward nor
+ * reset. Called under g_printk_lock, so the lazy offset init is safe. */
+static uint64_t g_ts_offset_ms = 0;
+static bool     g_ts_offset_set = false;
+
+/* Returns ms-since-boot, or UINT64_MAX if no clock is available yet. */
+static uint64_t now_log_ms(void) {
+    uint64_t ns = perf_now_ns();
+    if (ns) {
+        uint64_t pms = ns / 1000000ull;
+        if (!g_ts_offset_set) {
+            uint32_t hz = pit_hz();
+            uint64_t pit_ms = hz ? (pit_ticks() * 1000ull) / (uint64_t)hz : 0;
+            g_ts_offset_ms = (pit_ms > pms) ? (pit_ms - pms) : 0;
+            g_ts_offset_set = true;
+        }
+        return g_ts_offset_ms + pms;
+    }
+    uint32_t hz = pit_hz();
+    if (hz == 0) return (uint64_t)-1;
+    return (pit_ticks() * 1000ull) / (uint64_t)hz;
+}
+
 static void emit_ts_prefix(void) {
     if (g_sink_suppress) return;
     emit_char('[');
-    uint32_t hz = pit_hz();
-    if (hz == 0) {
+    uint64_t ms = now_log_ms();
+    if (ms == (uint64_t)-1) {
         emit_str("------");
         emit_str("] ");
         return;
     }
-    uint64_t ms = (pit_ticks() * 1000ull) / (uint64_t)hz;
     emit_uint(ms, 10, false, 0, false, false);
     emit_str(" ms] ");
 }
@@ -222,6 +263,22 @@ void kprintf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     kvprintf(fmt, ap);
+    va_end(ap);
+}
+
+/* Like kprintf, but the formatted line goes ONLY to COM1 serial -- never
+ * the framebuffer console, mirror sink, or boot log. Still timestamped and
+ * serialised under g_printk_lock so it can't interleave with kprintf. */
+void kprintf_serial(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    uint64_t flags = spin_lock_irqsave(&g_printk_lock);
+    bool prev = g_emit_serial_only;
+    g_emit_serial_only = true;
+    emit_ts_prefix();
+    kvprintf_unlocked(fmt, ap);
+    g_emit_serial_only = prev;
+    spin_unlock_irqrestore(&g_printk_lock, flags);
     va_end(ap);
 }
 
