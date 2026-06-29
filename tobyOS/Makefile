@@ -1945,19 +1945,19 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_settings,user_gui_settings))
 # initrd/repo/, and the user runs `pkg install helloapp` to extract it
 # onto /data/apps/.
 
+# Migrated to TobyTK: links libtoby (crt0 + libtoby.a) like gui_calc.
 programs/user_gui_helloapp/user_gui_helloapp.o: \
         programs/user_gui_helloapp/main.c \
-        programs/common/toby_gui.h
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+        $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
 
 programs/user_gui_helloapp/user_gui_helloapp.elf: \
         programs/user_gui_helloapp/user_gui_helloapp.o \
-        programs/common/start.o \
-        programs/common/toby_gui.o \
+        $(LIBTOBY_CRT0) \
+        $(LIBTOBY_AR) \
         programs/user_gui_helloapp/program.ld
 	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_helloapp/program.ld -o $@ \
-	      programs/common/start.o programs/common/toby_gui.o \
-	      programs/user_gui_helloapp/user_gui_helloapp.o
+	      $(LIBTOBY_CRT0) programs/user_gui_helloapp/user_gui_helloapp.o $(LIBTOBY_AR)
 
 programs/user_gui_taskmgr/user_gui_taskmgr.o: programs/user_gui_taskmgr/main.c
 	$(CC) $(USER_CFLAGS) -c $< -o $@
