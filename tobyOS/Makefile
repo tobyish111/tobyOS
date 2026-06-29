@@ -1919,20 +1919,11 @@ programs/user_gui_browser/user_gui_browser.elf: \
 	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_browser/program.ld -o $@ \
 	      programs/common/start.o programs/user_gui_browser/user_gui_browser.o
 
-# Milestone-14 GUI apps: login screen and settings editor. Both use the
-# toby_gui toolkit + a small handful of inline syscall stubs (settings
-# get/set, login, logout) defined directly in their main.c.
-
-programs/user_login/user_login.o: programs/user_login/main.c
-	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-programs/user_login/user_login.elf: \
-        programs/user_login/user_login.o \
-        programs/common/start.o \
-        programs/user_login/program.ld
-	$(LD) $(PROG_LDFLAGS) -T programs/user_login/program.ld -o $@ \
-	      programs/common/start.o \
-	      programs/user_login/user_login.o
+# Milestone-14 GUI login screen. Migrated to TobyTK: links libtoby
+# (crt0 + libtoby.a) like every other native app instead of the old
+# start.o + toby_gui.o. The settings get/login/opacity syscall stubs
+# remain inline in its main.c.
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_login,user_login))
 
 # GUI-framework Milestone 1: the Settings app is now a LIBTOBY_PROGRAM built on
 # the TobyTK toolkit (toby/tk.h) -- it links crt0.o + libtoby.a like every other
