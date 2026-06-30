@@ -49,6 +49,13 @@ struct gui_event {
 #define GUI_EV_KEY 4
 #define GUI_EV_CLOSE 5
 
+/* Migrated to the TobyTK toolkit (toby/tk.h): the whole browser chrome + the
+ * monospace content grid render through a full-window TK_CANVAS, and the
+ * drawing helpers below now forward to tk_draw_*. All HTML rendering, history,
+ * link and find logic is unchanged. */
+#include <toby/tk.h>
+static struct tk_window win;
+
 /* ---- Syscall stubs --------------------------------------------- */
 
 static inline ssize_t sys_write(int fd, const void *buf, size_t len) {
@@ -59,12 +66,6 @@ static inline ssize_t sys_write(int fd, const void *buf, size_t len) {
         : "rcx", "r11", "memory");
     return r;
 }
-static inline void sys_yield(void) {
-    long _dummy;
-    __asm__ volatile ("syscall"
-        : "=a"(_dummy) : "0"((long)SYS_YIELD)
-        : "rcx", "r11", "memory");
-}
 __attribute__((noreturn))
 static inline void sys_exit(int code) {
     __asm__ volatile ("syscall"
@@ -72,59 +73,13 @@ static inline void sys_exit(int code) {
         : "rcx", "r11", "memory");
     for (;;) { }
 }
-static inline int sys_gui_create(uint32_t w, uint32_t h, const char *title) {
-    long r;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_CREATE), "D"((long)w), "S"((long)h), "d"(title)
-        : "rcx", "r11", "memory");
-    return (int)r;
+/* Drawing now forwards to TobyTK. The content grid is monospace (CELL_W=8), so
+ * text uses tk_draw_text_mono (column-aligned, opaque bg). `fd` is ignored. */
+static inline int sys_gui_fill(int fd, int x, int y, int w, int h, uint32_t color) {
+    (void)fd; tk_draw_fill(&win, x, y, w, h, color); return 0;
 }
-static inline int sys_gui_fill(int fd, int x, int y, int w, int h,
-                               uint32_t color) {
-    long r;
-    uint32_t whlen = ((uint32_t)(uint16_t)w) |
-                     (((uint32_t)(uint16_t)h) << 16);
-    register long r10 __asm__("r10") = (long)whlen;
-    register long r8  __asm__("r8")  = (long)color;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_FILL), "D"((long)fd),
-          "S"((long)x), "d"((long)y),
-          "r"(r10), "r"(r8)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-static inline int sys_gui_text(int fd, int x, int y, const char *s,
-                               uint32_t fg, uint32_t bg) {
-    long r;
-    uint32_t xy = ((uint32_t)(uint16_t)x) |
-                  (((uint32_t)(uint16_t)y) << 16);
-    register long r10 __asm__("r10") = (long)fg;
-    register long r8  __asm__("r8")  = (long)bg;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_TEXT), "D"((long)fd),
-          "S"((long)xy), "d"(s),
-          "r"(r10), "r"(r8)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-static inline int sys_gui_flip(int fd) {
-    long r;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_FLIP), "D"((long)fd)
-        : "rcx", "r11", "memory");
-    return (int)r;
-}
-static inline int sys_gui_poll_event(int fd, struct gui_event *ev) {
-    long r;
-    __asm__ volatile ("syscall"
-        : "=a"(r)
-        : "0"((long)SYS_GUI_POLL_EVENT), "D"((long)fd), "S"(ev)
-        : "rcx", "r11", "memory");
-    return (int)r;
+static inline int sys_gui_text(int fd, int x, int y, const char *s, uint32_t fg, uint32_t bg) {
+    (void)fd; tk_draw_text_mono(&win, x, y, s, fg, bg); return 0;
 }
 static inline long sys_http_get(const char *url, void *buf, uint32_t buf_sz) {
     long r;
@@ -1089,7 +1044,11 @@ static void draw_hline(int fd, int x, int y, int w, uint32_t color) {
     sys_gui_fill(fd, x, y, w, 1, color);
 }
 
-static void redraw(int fd) {
+/* paint_all() draws the whole window (called from the canvas on_paint);
+ * redraw() just requests a repaint and is what the event handlers call. */
+static void redraw(int fd) { (void)fd; tk_redraw(&win); }
+static void paint_all(void) {
+    int fd = 0; (void)fd;
     /* Tab Bar */
     sys_gui_fill(fd, 0, 0, WIN_W, TAB_BAR_H, COL_TAB_BG);
     sys_gui_fill(fd, 0, 0, 220, TAB_BAR_H, COL_TAB_ACTIVE);
@@ -1274,8 +1233,6 @@ static void redraw(int fd) {
     if (g_source_view) {
         sys_gui_text(fd, WIN_W - 80, status_y + 3, "[SOURCE]", COL_FIND_HL, COL_STATUS_BG);
     }
-
-    sys_gui_flip(fd);
 }
 
 /* ---- Link following -------------------------------------------- */
@@ -1410,44 +1367,17 @@ static void handle_mouse_move(int fd, int mx, int my) {
 
 /* ---- Main ------------------------------------------------------ */
 
-int main(int argc, char **argv);
-int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+/* ---- TobyTK callbacks ------------------------------------------ */
+static void on_paint(struct tk_window *w, struct tk_widget *c) { (void)w; (void)c; paint_all(); }
+static void on_event(struct tk_window *w, struct tk_widget *c, struct tk_event *ev) {
+    (void)w; (void)c;
+    if (ev->type == TK_EV_MOUSE_DOWN) handle_mouse_down(0, ev->x, ev->y);
+    else if (ev->type == TK_EV_MOUSE_MOVE) handle_mouse_move(0, ev->x, ev->y);
+}
 
-    mem_zero(g_url, sizeof(g_url));
-    mem_zero(g_title, sizeof(g_title));
-    mem_zero(g_status_text, sizeof(g_status_text));
-    mem_zero(g_find_buf, sizeof(g_find_buf));
-
-    set_home_page();
-    set_status("Ready - Press Tab to focus address bar");
-
-    int fd = sys_gui_create(WIN_W, WIN_H, "TobyOS Browser");
-    if (fd < 0) {
-        sys_write(1, "gui_browser: window failed\n", 27);
-        return 1;
-    }
-    redraw(fd);
-
-    for (;;) {
-        struct gui_event ev;
-        int got = sys_gui_poll_event(fd, &ev);
-        if (got <= 0) { sys_yield(); continue; }
-        if (ev.type == GUI_EV_CLOSE) sys_exit(0);
-
-        if (ev.type == GUI_EV_MOUSE_DOWN) {
-            handle_mouse_down(fd, ev.x, ev.y);
-            continue;
-        }
-
-        if (ev.type == GUI_EV_MOUSE_MOVE) {
-            handle_mouse_move(fd, ev.x, ev.y);
-            continue;
-        }
-
-        if (ev.type != GUI_EV_KEY) continue;
-
-        uint8_t key = ev.key;
+static void on_key(struct tk_window *w, struct tk_event *ev) {
+    (void)w;
+    uint8_t key = ev->key;
 
         /* Find mode input */
         if (g_find_mode) {
@@ -1455,22 +1385,22 @@ int main(int argc, char **argv) {
                 g_find_mode = 0;
                 g_find_line = -1;
                 set_status("Find cancelled");
-                redraw(fd);
-                continue;
+                redraw(0);
+                return;
             } else if (key == '\n' || key == '\r') {
                 find_next_match();
-                redraw(fd);
-                continue;
+                redraw(0);
+                return;
             } else if (key == '\b' || key == 127) {
                 if (g_find_len > 0) g_find_len--;
-                redraw(fd);
-                continue;
+                redraw(0);
+                return;
             } else if (key >= 0x20 && key <= 0x7E && g_find_len < FIND_MAX) {
                 g_find_buf[g_find_len++] = (char)key;
-                redraw(fd);
-                continue;
+                redraw(0);
+                return;
             }
-            continue;
+            return;
         }
 
         /* Ctrl+F (key code 0x06) enters find mode */
@@ -1479,8 +1409,8 @@ int main(int argc, char **argv) {
             g_find_len = 0;
             g_find_line = -1;
             g_focus_url = 0;
-            redraw(fd);
-            continue;
+            redraw(0);
+            return;
         }
 
         /* Tab switches focus */
@@ -1491,8 +1421,8 @@ int main(int argc, char **argv) {
             else
                 set_status("Content focused - j/k scroll, [ back, ] fwd");
             g_link_input_mode = 0;
-            redraw(fd);
-            continue;
+            redraw(0);
+            return;
         }
 
         if (g_focus_url) {
@@ -1515,18 +1445,18 @@ int main(int argc, char **argv) {
                     }
                     do_navigate(g_url);
                 }
-                redraw(fd);
+                redraw(0);
             } else if (key == '\b' || key == 127) {
                 if (g_url_len > 0) g_url_len--;
-                redraw(fd);
+                redraw(0);
             } else if (key == 27) {
                 g_url_len = 0;
                 g_focus_url = 0;
                 set_status("Cancelled");
-                redraw(fd);
+                redraw(0);
             } else if (key >= 0x20 && key <= 0x7E && g_url_len < URL_MAX) {
                 g_url[g_url_len++] = (char)key;
-                redraw(fd);
+                redraw(0);
             }
         } else {
             /* Content area input */
@@ -1540,18 +1470,18 @@ int main(int argc, char **argv) {
                     msg[p++] = '0' + g_link_num % 10;
                     msg[p] = '\0';
                     set_status(msg);
-                    redraw(fd);
-                    continue;
+                    redraw(0);
+                    return;
                 } else if (key == '\n' || key == '\r') {
                     g_link_input_mode = 0;
                     follow_link(g_link_num);
-                    redraw(fd);
-                    continue;
+                    redraw(0);
+                    return;
                 } else {
                     g_link_input_mode = 0;
                     set_status("Link follow cancelled");
-                    redraw(fd);
-                    continue;
+                    redraw(0);
+                    return;
                 }
             }
 
@@ -1655,7 +1585,28 @@ int main(int argc, char **argv) {
                 }
                 break;
             }
-            redraw(fd);
+            redraw(0);
         }
+}
+
+int main(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    mem_zero(g_url, sizeof(g_url));
+    mem_zero(g_title, sizeof(g_title));
+    mem_zero(g_status_text, sizeof(g_status_text));
+    mem_zero(g_find_buf, sizeof(g_find_buf));
+
+    set_home_page();
+    set_status("Ready - Press Tab to focus address bar");
+
+    if (tk_window_open(&win, WIN_W, WIN_H, "TobyOS Browser") != 0) {
+        sys_write(1, "gui_browser: window failed\n", 27);
+        return 1;
     }
+    tk_on_key(&win, on_key);
+    struct tk_widget *root = tk_root(&win); tk_pad(root, 0);
+    struct tk_widget *cv = tk_canvas(&win, root, on_paint);
+    tk_grow(cv, 1); tk_on_event(cv, on_event);
+    return tk_run(&win);
 }
