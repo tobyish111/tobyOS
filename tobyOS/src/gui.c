@@ -232,7 +232,7 @@ struct ctx_menu_item {
  * by the package manager, plus one pinned "Logout" entry at the
  * bottom. LAUNCHER_MAX sizes the internal cursor math; keep it big
  * enough to hold all three plus headroom. */
-#define LAUNCHER_SYS_MAX  10
+#define LAUNCHER_SYS_MAX  12
 #define LAUNCHER_MAX      (LAUNCHER_SYS_MAX + GUI_LAUNCHER_USER_MAX + 1)
 #define LAUNCHER_W        420
 #define LAUNCHER_HEAD_H    84
@@ -264,6 +264,8 @@ static const struct launcher_item g_launcher_sys[LAUNCHER_SYS_MAX] = {
     { "Notes",         "/bin/gui_widgets"  },
     { "Photos",        "/bin/gui_viewer"   },
     { "Clock",         "/bin/gui_clock"    },
+    { "Calculator",    "/bin/gui_calc"     },
+    { "Task Manager",  "/bin/gui_taskmgr"  },
     { "About TobyOS",  "/bin/gui_about"    },
     { 0, 0 },
 };

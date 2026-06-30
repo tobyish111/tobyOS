@@ -1545,6 +1545,12 @@ static long sys_open(const char *path, int flags, int mode) {
                     g_fbdev.bpp = 32;
                     g_fbdev.line_length = FBDEV_WIN_W * 4;
                     g_fbdev.smem_len = g_fbdev.line_length * FBDEV_WIN_H;
+                    /* Phase 3 (foreign chrome): paint the client area with the
+                     * active theme's window background so a Linux app that hasn't
+                     * drawn yet (or clears its fb) blends with the desktop instead
+                     * of flashing white. */
+                    gui_window_fill(win, 0, 0, FBDEV_WIN_W, FBDEV_WIN_H,
+                                    theme_active()->win_bg);
                 }
             }
             if (!g_fbdev.win) fbdev_init_geometry();
