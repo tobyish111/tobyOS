@@ -3,8 +3,8 @@
 An SDK app is a freestanding 64-bit ELF that:
 
 1. Talks to the kernel via the **frozen syscall ABI** (`abi.h`).
-2. Optionally links **libtoby** (POSIX-shape libc) + **libtoby_gui**
-   (GUI toolkit) for ergonomics.
+2. Optionally links **libtoby** for ergonomics — a POSIX-shape libc *plus* the
+   **TobyTK** widget toolkit (`<toby/tk.h>`), both in one archive.
 3. Ships as a **`.tpkg`** package; the in-kernel `pkg install` command
    unpacks it under `/data/`, registers any launcher entry, and
    refreshes the desktop menu.
@@ -16,15 +16,15 @@ An SDK app is a freestanding 64-bit ELF that:
          │          your app (src/main.c, src/*.c)             │
          └────────────┬────────────────────────────┬───────────┘
                       │                            │
-                      │ <toby/gui.h>               │ <stdio.h>, <unistd.h>,
-                      │ <toby/gui.hpp>             │ <fcntl.h>, <string.h>,
+                      │ <toby/tk.h>                │ <stdio.h>, <unistd.h>,
+                      │ (TobyTK widgets)           │ <fcntl.h>, <string.h>,
                       │                            │ <tobyos_notify.h>,
                       │                            │ <tobyos_slog.h>, ...
                       ▼                            ▼
-         ┌──────────────────────────┐ ┌──────────────────────────┐
-         │   libtoby_gui.a (toolkit)│ │   libtoby.a (libc-shape) │
-         └────────────┬─────────────┘ └────────────┬─────────────┘
-                      │                            │
+         ┌─────────────────────────────────────────────────────┐
+         │   libtoby.a  (libc-shape helpers + TobyTK toolkit)   │
+         └────────────────────────┬────────────────────────────┘
+                                  │
                       │     <tobyos/abi/abi.h>     │
                       ▼                            ▼
                 ┌──────────────────────────────────────┐
@@ -37,8 +37,8 @@ An SDK app is a freestanding 64-bit ELF that:
 
 You can pick where to enter:
 
-- **Highest level** -- include `<toby/gui.h>`, write a callback-driven
-  GUI app. See `samples/hello_gui/`.
+- **Highest level** -- include `<toby/tk.h>`, write a callback-driven
+  TobyTK GUI app. See `samples/hello_gui/` and `samples/notes_app/`.
 - **POSIX-ish** -- include `<stdio.h>`, write CLI tools that look like
   Unix utilities. See `samples/hello_cli/`.
 - **Raw syscalls** -- include `<tobyos/abi/abi.h>`, drop into inline

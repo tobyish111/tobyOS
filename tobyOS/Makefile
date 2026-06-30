@@ -1799,11 +1799,8 @@ programs/x2gui/x2gui.elf: programs/x2gui/x2gui.o \
 # Clock -- migrated to TobyTK (crt0 + libtoby.a).
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_clock,user_gui_clock))
 
-# NOTE: the old user-mode toby_gui toolkit is no longer linked by any in-tree
-# app (all migrated to TobyTK, libtoby/toby/tk.h). Its source
-# (programs/common/toby_gui.c/.h) is kept ONLY because the SDK still wraps it as
-# the frozen <toby/gui.h> + libtoby_gui.a contract for out-of-tree apps; the
-# in-tree object rule was removed.
+# NOTE: the old user-mode toby_gui toolkit is gone -- every in-tree app and the
+# SDK now use TobyTK (libtoby/include/toby/tk.h, inside libtoby.a).
 
 # Notes app -- migrated to TobyTK: links libtoby (crt0 + libtoby.a) like
 # every other native app instead of the old start.o + toby_gui.o.
@@ -2945,8 +2942,8 @@ m34-fixtures: $(HELLOAPP_TPKG_CORRUPT) $(HELLOAPP_TPKG_BADHASH) \
 # ---------- Milestone 32: Developer SDK ---------------------------
 #
 # Builds an out-of-tree-friendly distribution under build/sdk-<ver>/
-# containing the public ABI header, libtoby + libtoby_gui static
-# archives, the canonical linker script, the host pkgbuild tool, the
+# containing the public ABI header, the libtoby static archive (libc-shape
+# helpers + the TobyTK widget toolkit), the canonical linker script, the
 # three samples, the three templates, and the API docs. The committed
 # sdk/ tree provides the SDK-authored sources (linker script, toby/
 # headers, samples, templates, docs); `make sdk` mirrors the kernel-
@@ -2977,28 +2974,12 @@ $(PKGBUILD_BIN): $(PKGBUILD_SRC)
 
 pkgbuild: $(PKGBUILD_BIN)
 
-# libtoby_gui.a -- the M16 GUI toolkit (programs/common/toby_gui.c) is
-# already used by every in-tree GUI app as a loose .o. For the SDK we
-# wrap the SAME source into a real static archive, named libtoby_gui.a,
-# so out-of-tree apps link with `-l toby_gui -l toby` (or by spelling
-# out the path, as the templates do).
-#
-# The .o is built with the same USER_CFLAGS as the in-tree GUI apps,
-# pointed at the in-tree toby_gui.h via -I programs/common. The SDK's
-# <toby/gui.h> is byte-equivalent so callers including either header
-# resolve to the same symbols at link time.
-LIBTOBY_GUI_BUILD   := $(SDK_STAGE)/lib/build
-LIBTOBY_GUI_OBJ     := $(LIBTOBY_GUI_BUILD)/toby_gui.o
-LIBTOBY_GUI_AR      := $(SDK_STAGE)/lib/libtoby_gui.a
-
-$(LIBTOBY_GUI_OBJ): programs/common/toby_gui.c programs/common/toby_gui.h | sdk-tree
-	mkdir -p $(LIBTOBY_GUI_BUILD)
-	$(CC) $(USER_CFLAGS) -isystem $(LIBTOBY_INC) \
-	      -I programs/common -c $< -o $@
-
-$(LIBTOBY_GUI_AR): $(LIBTOBY_GUI_OBJ)
-	rm -f $@
-	$(AR) rcs $@ $(LIBTOBY_GUI_OBJ)
+# GUI for SDK apps is TobyTK (<toby/tk.h>), which lives inside libtoby.a (tk.c is
+# in LIBTOBY_C_SRCS). There is no separate GUI archive: an SDK GUI app links the
+# same crt0.o + libtoby.a as a CLI app and the linker drops the widget code it
+# doesn't call. The header is mirrored from libtoby/include/toby/tk.h in
+# sdk-headers (one source of truth). The old libtoby_gui.a / <toby/gui.h>
+# toolkit (programs/common/toby_gui.c) was retired in the unify-on-TobyTK work.
 
 # sdk-tree: stamp the COMMITTED sdk/ contents into the staging area.
 # This wipes the staging area first so re-staging is reproducible.
@@ -3024,11 +3005,12 @@ sdk-tree:
 sdk-headers: sdk-tree
 	cp $(LIBTOBY_INC)/*.h         $(SDK_STAGE)/include/
 	cp $(LIBTOBY_INC)/sys/*.h     $(SDK_STAGE)/include/sys/
+	cp $(LIBTOBY_INC)/toby/tk.h   $(SDK_STAGE)/include/toby/
 	cp include/tobyos/abi/abi.h   $(SDK_STAGE)/include/tobyos/abi/
 
-# Drop the prebuilt libtoby.a and crt0.o into the SDK lib dir, plus
-# build libtoby_gui.a directly into it.
-sdk-libs: sdk-tree $(LIBTOBY_AR) $(LIBTOBY_CRT0) $(LIBTOBY_GUI_AR)
+# Drop the prebuilt libtoby.a and crt0.o into the SDK lib dir. GUI (TobyTK) is
+# inside libtoby.a -- no separate GUI archive.
+sdk-libs: sdk-tree $(LIBTOBY_AR) $(LIBTOBY_CRT0)
 	cp $(LIBTOBY_AR)   $(SDK_STAGE)/lib/
 	cp $(LIBTOBY_CRT0) $(SDK_STAGE)/lib/
 

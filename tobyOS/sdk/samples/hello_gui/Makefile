@@ -1,8 +1,8 @@
-# hello_gui/Makefile -- builds a tobyOS SDK 1.0 GUI sample out of tree.
+# hello_gui/Makefile -- builds a tobyOS SDK GUI sample out of tree.
 #
-# Differs from hello_cli/Makefile only by linking libtoby_gui.a in
-# addition to libtoby.a -- the GUI toolkit lives in its own archive
-# so CLI apps don't pay for code they don't call.
+# Uses the TobyTK toolkit (<toby/tk.h>), which lives in libtoby.a -- so a GUI
+# app links exactly the same libs as a CLI app (crt0.o + libtoby.a); the linker
+# drops the widget code from apps that don't call it.
 
 TOBYOS_SDK ?= ../..
 
@@ -32,10 +32,8 @@ all: $(ELF)
 
 $(ELF): $(OBJ) \
         $(TOBYOS_SDK)/lib/crt0.o \
-        $(TOBYOS_SDK)/lib/libtoby_gui.a \
         $(TOBYOS_SDK)/lib/libtoby.a | build
 	$(LD) $(LDFLAGS) -o $@ $(TOBYOS_SDK)/lib/crt0.o $(OBJ) \
-	    $(TOBYOS_SDK)/lib/libtoby_gui.a \
 	    $(TOBYOS_SDK)/lib/libtoby.a
 
 $(OBJ): src/main.c | build

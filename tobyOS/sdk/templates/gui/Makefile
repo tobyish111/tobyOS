@@ -1,4 +1,5 @@
-# GUI app template Makefile -- links libtoby_gui.a in addition to libtoby.a.
+# GUI app template Makefile -- TobyTK (<toby/tk.h>) lives in libtoby.a, so a GUI
+# app links the same crt0.o + libtoby.a as a CLI app.
 #
 # Quick reference (run `make help` any time):
 #   make           -- build the ELF
@@ -44,10 +45,8 @@ all: $(ELF)
 
 $(ELF): $(OBJS) \
         $(TOBYOS_SDK)/lib/crt0.o \
-        $(TOBYOS_SDK)/lib/libtoby_gui.a \
         $(TOBYOS_SDK)/lib/libtoby.a | build
 	$(LD) $(LDFLAGS) -o $@ $(TOBYOS_SDK)/lib/crt0.o $(OBJS) \
-	    $(TOBYOS_SDK)/lib/libtoby_gui.a \
 	    $(TOBYOS_SDK)/lib/libtoby.a
 
 build/%.o: src/%.c | build

@@ -9,7 +9,7 @@ sdk/
 ├── VERSION                     SDK version string
 ├── README.md                   you are here
 ├── include/                    public C headers (libtoby + tobyos_* + toby/)
-├── lib/                        crt0.o, libtoby.a, libtoby_gui.a, program.ld
+├── lib/                        crt0.o, libtoby.a (libc + TobyTK), program.ld
 ├── tools/                      pkgbuild + tobycc/tobyld convenience wrappers
 ├── docs/                       full API and packaging reference
 ├── templates/                  starter projects: cli/, gui/, service/
@@ -64,11 +64,10 @@ make package     # build + produce build/myapp.tpkg
 
 ## C and C++
 
-Every SDK surface (libc, GUI, notifications, packaging, samples) is
-**C**. Two optional header-only C++ wrappers ship at
-`include/toby/gui.hpp` and `include/toby/notify.hpp`; they're fully
-opt-in and add no runtime dependencies. You can write SDK apps in C
-without touching either.
+Every SDK surface (libc, the TobyTK GUI toolkit, notifications, packaging,
+samples) is **C**. An optional header-only C++ wrapper ships at
+`include/toby/notify.hpp`; it's fully opt-in and adds no runtime dependencies.
+You can write SDK apps in C without touching it.
 
 ## Versioning
 

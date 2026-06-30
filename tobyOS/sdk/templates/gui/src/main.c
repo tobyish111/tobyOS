@@ -1,23 +1,31 @@
-/* GUI app template -- single window with a label + Quit button.
+/* GUI app template -- single window with a label + Quit button, on TobyTK.
  * Replace the widgets / callbacks with your own.
  */
 
 #include <stdio.h>
-#include <toby/gui.h>
+#include <toby/tk.h>
 
-static void on_quit(struct tg_widget *btn, struct tg_app *app) {
+/* tk_window embeds the widget pool (~150 KB) -- keep it static, not on the stack. */
+static struct tk_window win;
+
+static void on_quit(struct tk_window *w, struct tk_widget *btn) {
     (void)btn;
-    tg_app_quit(app);
+    tk_quit(w);
 }
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
-    struct tg_app app;
-    if (tg_app_init(&app, 320, 160, "My App") != 0) return 1;
+    if (tk_window_open(&win, 320, 160, "My App") != 0) return 1;
 
-    tg_label (&app,  16,  20, 288, 24, "Edit me!");
-    tg_button(&app, 232, 110,  72, 28, "Quit", on_quit);
+    struct tk_widget *root = tk_root(&win);
+    tk_pad(root, 16);
+    root->gap = 8;
 
-    return tg_run(&app);
+    tk_label(&win, root, "Edit me!");
+    struct tk_widget *row = tk_hbox(&win, root, 8);
+    tk_grow(tk_label(&win, row, ""), 1);
+    tk_button(&win, row, "Quit", on_quit);
+
+    return tk_run(&win);
 }

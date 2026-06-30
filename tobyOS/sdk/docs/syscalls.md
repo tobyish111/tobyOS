@@ -66,16 +66,16 @@ unbuffered but POSIX-shaped.
 
 ## GUI
 
-| # | Syscall | libtoby wrapper |
+| # | Syscall | TobyTK wrapper |
 |---|---------|------------------|
-| 50 | `SYS_GUI_CREATE` | `tg_app_init` |
-| 51 | `SYS_GUI_FILL` | `tg_run` (internal) |
-| 52 | `SYS_GUI_TEXT` | `tg_run` (internal) |
-| 53 | `SYS_GUI_FLIP` | `tg_run` (internal) |
-| 54 | `SYS_GUI_POLL_EVENT` | `tg_run` (internal) |
+| 50 | `SYS_GUI_CREATE` | `tk_window_open` |
+| 51 | `SYS_GUI_FILL` | `tk_run` / `tk_draw_*` (internal) |
+| 52 | `SYS_GUI_TEXT` | `tk_run` / `tk_draw_text*` (internal) |
+| 53 | `SYS_GUI_FLIP` | `tk_run` (internal) |
+| 54 | `SYS_GUI_POLL_EVENT` | `tk_run` (internal) |
 
-The GUI toolkit owns these; you should never call them directly from
-an application.
+The TobyTK toolkit (`<toby/tk.h>`) owns these; you should never call them
+directly from an application.
 
 ## Notifications  *(M31)*
 

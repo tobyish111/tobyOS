@@ -1,7 +1,7 @@
-# notes_app/Makefile -- "real" SDK 1.0 sample.
+# notes_app/Makefile -- "real" SDK sample (TobyTK).
 #
-# Identical link recipe to hello_gui (libtoby_gui.a + libtoby.a), only
-# the binary name and source path differ.
+# Identical link recipe to hello_gui (crt0.o + libtoby.a -- TobyTK lives in
+# libtoby.a), only the binary name and source path differ.
 
 TOBYOS_SDK ?= ../..
 
@@ -31,10 +31,8 @@ all: $(ELF)
 
 $(ELF): $(OBJ) \
         $(TOBYOS_SDK)/lib/crt0.o \
-        $(TOBYOS_SDK)/lib/libtoby_gui.a \
         $(TOBYOS_SDK)/lib/libtoby.a | build
 	$(LD) $(LDFLAGS) -o $@ $(TOBYOS_SDK)/lib/crt0.o $(OBJ) \
-	    $(TOBYOS_SDK)/lib/libtoby_gui.a \
 	    $(TOBYOS_SDK)/lib/libtoby.a
 
 $(OBJ): src/main.c | build
