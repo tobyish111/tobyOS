@@ -1833,14 +1833,8 @@ programs/x2gui/x2gui.elf: programs/x2gui/x2gui.o \
 	$(LD) $(PROG_LDFLAGS) -T programs/x2gui/program.ld -o $@ \
 	      programs/common/start.o programs/x2gui/x2gui.o
 
-programs/user_gui_clock/user_gui_clock.o: programs/user_gui_clock/main.c
-	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-programs/user_gui_clock/user_gui_clock.elf: programs/user_gui_clock/user_gui_clock.o \
-                                            programs/common/start.o \
-                                            programs/user_gui_clock/program.ld
-	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_clock/program.ld -o $@ \
-	      programs/common/start.o programs/user_gui_clock/user_gui_clock.o
+# Clock -- migrated to TobyTK (crt0 + libtoby.a).
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_clock,user_gui_clock))
 
 # Shared user-mode GUI toolkit -- compiled once, linked into every
 # milestone-11+ widget app. Lives in programs/common/ next to start.S
