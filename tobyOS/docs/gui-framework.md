@@ -93,8 +93,17 @@ equal to these and documents the history; do not re-derive the numbers.
 — the canonical native app layer. It supersedes two earlier half-finished
 attempts: `programs/common/toby_gui.c` (worked but absolute-positioned, 8×8 text,
 outside libtoby) and `libtoby/src/ui.c` "TobyUI" (had a layout engine but its
-text rendering was a no-op stub and it drew into a disconnected buffer). Both are
-retained for now; `toby_gui.c` apps migrate gradually, `ui.c` is deprecated.
+text rendering was a no-op stub and it drew into a disconnected buffer).
+
+**Status (2026-06-30): TobyTK is now universal.** Every native GUI app is on the
+toolkit — the `user_gui_*` family (files, browser, settings, term, edit, viewer,
+clock, calc, taskmgr, widgets/Notes, about, demo, helloapp, login) plus the
+standalone inspectors (devmgr, diskmgr, eventview, mediaplayer) and the
+tray/system apps (volctrl, wifipicker, appinstall, updater, lockscreen). Nothing
+ships on raw `gui_*` hand-drawing except `bluescreen` (panic context). `ui.c`
+"TobyUI" is dead (no includer) and slated for removal; `toby_gui.c` is no longer
+used by any in-tree app but is still wrapped by the SDK as `libtoby_gui.a` for
+out-of-tree apps, so it stays until the SDK drops it.
 
 Design:
 - **No malloc.** Widgets live in a fixed pool inside `struct tk_window` (declare
@@ -103,7 +112,12 @@ Design:
 - **Layout:** `vbox`/`hbox` containers with padding, gap, flex-grow, fixed and
   shrink-to-fit (measured) sizing. Root is a vbox filling the window.
 - **Widgets:** panel/vbox/hbox, label, button, text field, checkbox, scrollable
-  listbox, slider, progress, separator.
+  listbox, slider, progress, separator, plus `TK_CANVAS` (custom-draw escape
+  hatch: `on_paint`/`on_event` + the `tk_draw_*` primitives incl.
+  `tk_draw_text_mono` for column-aligned 8×16 bitmap text — terminals, editors,
+  the clock face, the partition bar), `TK_TABLE` (columns + scrollable rows via
+  an app cell-accessor — no slot per row) and `TK_TEXTAREA` (scrollable
+  read-only multiline). Window-level key hook via `tk_on_key`.
 - **Event loop:** `tk_run()` polls events, hit-tests the tree, manages
   focus/capture, fires callbacks, repaints only when dirty, and **self-paces with
   `nanosleep(~15ms)` when idle** — never a busy-yield (a tight yield loop with
