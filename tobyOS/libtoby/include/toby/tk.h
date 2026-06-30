@@ -280,6 +280,10 @@ void tk_draw_circle_outline(struct tk_window*, int cx, int cy, int r, uint32_t c
 void tk_draw_gradient(struct tk_window*, int x, int y, int w, int h, uint32_t top, uint32_t bot);
 void tk_draw_text   (struct tk_window*, int x, int y, const char *s, uint32_t fg, int px, int bold);
 int  tk_text_width  (const char *s, int px, int bold);
+/* Monospace bitmap text: an 8x16 fixed-cell VGA font with an opaque bg, one
+ * call per run. For char grids (terminals) where the proportional TTF
+ * tk_draw_text would not column-align. Advance is 8px/char; position at col*8. */
+void tk_draw_text_mono(struct tk_window*, int x, int y, const char *s, uint32_t fg, uint32_t bg);
 /* Blit an ARGB8888 source. `src_pitch` is the source row stride in pixels
  * (pass w for a tightly packed buffer). _blend alpha-composites. */
 void tk_draw_blit      (struct tk_window*, int x, int y, int w, int h, const uint32_t *argb, int src_pitch);

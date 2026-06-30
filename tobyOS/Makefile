@@ -1864,15 +1864,8 @@ programs/user_gui_about/user_gui_about.elf: \
 # their own custom layouts (text grid / scrollable list / scrolling
 # line viewer).
 
-programs/user_gui_term/user_gui_term.o: programs/user_gui_term/main.c
-	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-programs/user_gui_term/user_gui_term.elf: \
-        programs/user_gui_term/user_gui_term.o \
-        programs/common/start.o \
-        programs/user_gui_term/program.ld
-	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_term/program.ld -o $@ \
-	      programs/common/start.o programs/user_gui_term/user_gui_term.o
+# Terminal -- migrated to TobyTK (crt0 + libtoby.a); uses tk_draw_text_mono.
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_term,user_gui_term))
 
 # File Explorer -- migrated to TobyTK (crt0 + libtoby.a).
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_files,user_gui_files))
