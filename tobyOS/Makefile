@@ -1880,15 +1880,8 @@ programs/user_gui_term/user_gui_term.elf: \
 	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_term/program.ld -o $@ \
 	      programs/common/start.o programs/user_gui_term/user_gui_term.o
 
-programs/user_gui_files/user_gui_files.o: programs/user_gui_files/main.c
-	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-programs/user_gui_files/user_gui_files.elf: \
-        programs/user_gui_files/user_gui_files.o \
-        programs/common/start.o \
-        programs/user_gui_files/program.ld
-	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_files/program.ld -o $@ \
-	      programs/common/start.o programs/user_gui_files/user_gui_files.o
+# File Explorer -- migrated to TobyTK (crt0 + libtoby.a).
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_files,user_gui_files))
 
 programs/user_gui_viewer/user_gui_viewer.o: programs/user_gui_viewer/main.c
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -1941,15 +1934,9 @@ programs/user_gui_helloapp/user_gui_helloapp.elf: \
 	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_helloapp/program.ld -o $@ \
 	      $(LIBTOBY_CRT0) programs/user_gui_helloapp/user_gui_helloapp.o $(LIBTOBY_AR)
 
-programs/user_gui_taskmgr/user_gui_taskmgr.o: programs/user_gui_taskmgr/main.c
-	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-programs/user_gui_taskmgr/user_gui_taskmgr.elf: \
-        programs/user_gui_taskmgr/user_gui_taskmgr.o \
-        programs/common/start.o \
-        programs/user_gui_taskmgr/program.ld
-	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_taskmgr/program.ld -o $@ \
-	      programs/common/start.o programs/user_gui_taskmgr/user_gui_taskmgr.o
+# Task Manager -- migrated to TobyTK (crt0 + libtoby.a). Needs <tobyos/abi/abi.h>?
+# No: it declares its own syscall numbers inline, so the plain rule suffices.
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_taskmgr,user_gui_taskmgr))
 
 programs/user_gui_edit/user_gui_edit.o: programs/user_gui_edit/main.c
 	$(CC) $(USER_CFLAGS) -c $< -o $@
