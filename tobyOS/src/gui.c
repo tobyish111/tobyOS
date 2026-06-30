@@ -4707,17 +4707,13 @@ void gui_settings_changed(const char *key, const char *val) {
 void gui_set_desktop_mode(bool on) {
     if (!g.ready) return;
     if (g.desktop_mode == on) return;
-    /* Auto-enable NORMAL trace when entering desktop mode so the next
-     * launch / mouse-edge / heartbeat already shows up in serial.log
-     * without the user having to remember to run `trace on` first.
-     * Leaving desktop mode does NOT auto-disable -- the user may want
-     * the trace to keep flowing across mode transitions during a
-     * debugging session. */
-    if (on && g_trace == GUI_TRACE_OFF) {
-        gui_trace_set(GUI_TRACE_NORMAL);
-        kprintf("[gui] auto-enabled trace (level=%d) for desktop session\n",
-                g_trace);
-    }
+    /* Trace is OPT-IN (`trace on`), NOT auto-enabled here. At NORMAL level
+     * the per-tick heartbeat + every mouse-edge/hit-test logs from the
+     * mouse IRQ; on real hardware that flooded COM1 and (with the old
+     * blocking serial) stalled the compositor and input path ~40 ms per
+     * line, making the desktop feel slow and "eat" clicks. Serial is async
+     * now, but a continuous NORMAL stream still can't drain at 38400 baud
+     * and shouldn't be the default -- run `trace on` when debugging. */
     gui_trace_logf("gui_set_desktop_mode: %s -> %s",
                    g.desktop_mode ? "on" : "off",
                    on ? "on" : "off");
