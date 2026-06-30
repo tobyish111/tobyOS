@@ -29,6 +29,7 @@
 #include <tobyos/panic.h>
 #include <tobyos/printk.h>
 #include <tobyos/console.h>
+#include <tobyos/serial.h>
 #include <tobyos/cpu.h>
 #include <tobyos/proc.h>
 #include <tobyos/klibc.h>
@@ -319,6 +320,11 @@ void kpanic_at(const char *file, int line, const char *fmt, ...) {
         hlt_forever();
     }
     s_in_panic = true;
+
+    /* IRQs are off and the scheduler is dead, so the async-serial THRE IRQ
+     * and idle-loop pump will never run. Flush the ring and switch COM1 to
+     * bounded-spin sync output so the full panic message reaches the wire. */
+    serial_set_sync_mode();
 
     /* Snapshot regs as early as possible. */
     struct panic_regs regs;

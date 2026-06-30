@@ -171,6 +171,24 @@ GT/Intel acceleration is opt-in and out of scope here; the software scanout path
 (`gfx.c`, write-combining framebuffer + sfenced flips on real hardware) is the
 contract.
 
+### Real-hardware responsiveness — non-blocking serial + opt-in trace
+On the EliteDesk bring-up the desktop was very slow and "ate" clicks on real HW
+but was fine in QEMU. Root cause was **not** the compositor (the FB is already
+write-combining and the present is damage-tracked). It was serial output:
+`serial_putc()` busy-waited the 38400-baud UART per byte (free in QEMU, where THRE
+is always ready; ~40 ms per log line on real HW), and entering the desktop
+auto-enabled NORMAL trace, so the per-tick heartbeat *and the mouse IRQ handler*
+(`on_mouse_event`, which logs on every button edge / hit-test) spun the CPU — with
+IRQs disabled — on the UART. Fixes:
+- **Async serial TX** (`src/serial.c`): `serial_putc()` pushes into a ring and
+  returns; COM1's THRE IRQ (IRQ4) drains it, with a pid-0 idle-loop
+  `serial_tx_pump()` safety net (so output flows even where legacy IRQ4 doesn't
+  route) and a **bounded-spin** sync fallback for early boot / `kpanic`
+  (`serial_set_sync_mode()`). `kprintf` never blocks.
+- **Trace is opt-in** (`trace on`), no longer auto-enabled in
+  `gui_set_desktop_mode()`.
+- The dead-NIC DHCP retry storm is capped (`net.c`) so it stops flooding the log.
+
 ## Unifying the three stacks
 
 **Native** apps use TobyTK → `gui_*` → `struct window`. Done.

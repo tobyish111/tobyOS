@@ -536,6 +536,14 @@ static void smp_init_bsp(void) {
     if (ioapic_init()) {
         irq_switch_to_ioapic();
     }
+
+    /* The IRQ facade is up: arm async (non-blocking) serial TX. COM1's
+     * THRE IRQ + a ring buffer replace the per-byte busy-wait that
+     * crippled the desktop on real hardware (every trace line stalled the
+     * CPU ~40 ms at 38400 baud, including from the mouse IRQ). Works in
+     * PIC or IO APIC mode; degrades safely if IRQ4 doesn't route (the
+     * idle-loop pump still drains the ring). */
+    serial_enable_tx_irq();
 }
 
 /* Serial liveness heartbeat. Emitted from pid 0's idle loop, so it ticks
@@ -662,6 +670,11 @@ static __attribute__((noreturn)) void idle_loop(void) {
             console_tick(pit_ticks(), hz);
         acpi_m22_selftest_tick();
         bkl_exit();
+
+        /* Drain any queued serial bytes without spinning. The THRE IRQ
+         * normally does this; pumping here guarantees the ring empties
+         * even on boards where COM1's legacy IRQ4 never routes. */
+        serial_tx_pump();
 
         /*
          * Critical:
