@@ -90,6 +90,13 @@ static unsigned net_boot_retry_delay_ms(unsigned attempt) {
     return 3000u;
 }
 
+/* Cap on deferred DHCP retries. Without it, a NIC whose TX is dead (e.g.
+ * the PCH I217 on the EliteDesk -- RX works, TX never drains) retries DHCP
+ * forever from the idle lane, each attempt failing fast and flooding the
+ * log. ~10 attempts with backoff spans ~20 s -- long enough to catch a
+ * slow DHCP server, after which we stay on the lease we have. */
+#define NET_BOOT_MAX_DEFERRED_ATTEMPTS 10u
+
 static bool net_boot_has_dhcp_lease(void) {
     return g_net_up && g_net_boot_via_dhcp &&
            g_net_status == NET_STATUS_DHCP_OK && g_my_ip != 0;
@@ -483,6 +490,16 @@ void net_service_tick(void) {
             g_net_boot_done = true;
             kprintf("[net] deferred boot bring-up complete\n");
             ssh_init();
+        } else if (g_net_boot_attempts >= NET_BOOT_MAX_DEFERRED_ATTEMPTS) {
+            /* Give up the deferred DHCP storm. Static fallback was already
+             * applied in net_init(), so we have a usable lease; stop
+             * retrying (and stop flooding the log) rather than spin
+             * forever on a NIC that can't transmit. Logged once. */
+            g_net_boot_done = true;
+            if (g_net_up && g_my_ip != 0) ssh_init();
+            kprintf("[net] giving up deferred DHCP after %u attempts "
+                    "(NIC TX / DHCP unavailable) -- staying on current lease\n",
+                    g_net_boot_attempts);
         } else {
             unsigned delay_ms = net_boot_retry_delay_ms(g_net_boot_attempts);
             g_net_boot_requested = true;
