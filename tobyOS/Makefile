@@ -1870,15 +1870,8 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_term,user_gui_term))
 # File Explorer -- migrated to TobyTK (crt0 + libtoby.a).
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_files,user_gui_files))
 
-programs/user_gui_viewer/user_gui_viewer.o: programs/user_gui_viewer/main.c
-	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-programs/user_gui_viewer/user_gui_viewer.elf: \
-        programs/user_gui_viewer/user_gui_viewer.o \
-        programs/common/start.o \
-        programs/user_gui_viewer/program.ld
-	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_viewer/program.ld -o $@ \
-	      programs/common/start.o programs/user_gui_viewer/user_gui_viewer.o
+# File viewer (text/hex) -- migrated to TobyTK; monospace via tk_draw_text_mono.
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_viewer,user_gui_viewer))
 
 programs/user_gui_browser/user_gui_browser.o: programs/user_gui_browser/main.c
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -1925,15 +1918,8 @@ programs/user_gui_helloapp/user_gui_helloapp.elf: \
 # No: it declares its own syscall numbers inline, so the plain rule suffices.
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_taskmgr,user_gui_taskmgr))
 
-programs/user_gui_edit/user_gui_edit.o: programs/user_gui_edit/main.c
-	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-programs/user_gui_edit/user_gui_edit.elf: \
-        programs/user_gui_edit/user_gui_edit.o \
-        programs/common/start.o \
-        programs/user_gui_edit/program.ld
-	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_edit/program.ld -o $@ \
-	      programs/common/start.o programs/user_gui_edit/user_gui_edit.o
+# Text editor -- migrated to TobyTK (crt0 + libtoby.a); monospace via tk_draw_text_mono.
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_edit,user_gui_edit))
 
 # ---------- Build initramfs (USTAR tar) ----------
 #
