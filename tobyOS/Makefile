@@ -1848,18 +1848,9 @@ programs/user_gui_clock/user_gui_clock.elf: programs/user_gui_clock/user_gui_clo
 programs/common/toby_gui.o: programs/common/toby_gui.c programs/common/toby_gui.h
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-programs/user_gui_widgets/user_gui_widgets.o: programs/user_gui_widgets/main.c \
-                                              programs/common/toby_gui.h
-	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-programs/user_gui_widgets/user_gui_widgets.elf: \
-        programs/user_gui_widgets/user_gui_widgets.o \
-        programs/common/start.o \
-        programs/common/toby_gui.o \
-        programs/user_gui_widgets/program.ld
-	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_widgets/program.ld -o $@ \
-	      programs/common/start.o programs/common/toby_gui.o \
-	      programs/user_gui_widgets/user_gui_widgets.o
+# Notes app -- migrated to TobyTK: links libtoby (crt0 + libtoby.a) like
+# every other native app instead of the old start.o + toby_gui.o.
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_widgets,user_gui_widgets))
 
 # Migrated to TobyTK: links libtoby (crt0 + libtoby.a) like gui_calc.
 programs/user_gui_about/user_gui_about.o: programs/user_gui_about/main.c \
