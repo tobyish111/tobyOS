@@ -382,28 +382,16 @@ PROGRAMS := programs/hello/hello.elf \
             programs/strace/strace.elf \
             programs/debugger/debugger.elf \
             programs/pkgmgr/pkgmgr.elf \
-            programs/browser/browser.elf \
             programs/init/init.elf \
-            programs/shell/shell.elf \
             programs/sh/sh.elf \
-            programs/settings/settings.elf \
-            programs/netui/netui.elf \
             programs/devmgr/devmgr.elf \
             programs/indexer/indexer.elf \
             programs/updater/updater.elf \
             programs/bluescreen/bluescreen.elf \
-            programs/login/login.elf \
             programs/lockscreen/lockscreen.elf \
-            programs/files/files.elf \
-            programs/terminal/terminal.elf \
-            programs/notepad/notepad.elf \
-            programs/calc/calc.elf \
-            programs/imgview/imgview.elf \
             programs/mediaplayer/mediaplayer.elf \
-            programs/taskmgr/taskmgr.elf \
             programs/diskmgr/diskmgr.elf \
             programs/eventview/eventview.elf \
-            programs/sysinfo/sysinfo.elf \
             programs/lua/lua.elf \
             programs/make/make.elf \
             programs/less/less.elf \
@@ -412,7 +400,6 @@ PROGRAMS := programs/hello/hello.elf \
             programs/as/as.elf \
             programs/ld/ld.elf \
             programs/wifipicker/wifipicker.elf \
-            programs/netsettings/netsettings.elf \
             programs/volctrl/volctrl.elf \
             programs/appinstall/appinstall.elf \
             $(PORTS_SBASE_ELFS) \
@@ -755,7 +742,6 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/gl_raster.c \
                    $(LIBTOBY_SRC)/pthread.c \
                    $(LIBTOBY_SRC)/font.c \
-                   $(LIBTOBY_SRC)/ui.c \
                    $(LIBTOBY_SRC)/posix_compat.c \
                    $(LIBTOBY_SRC)/signal.c \
                    $(LIBTOBY_SRC)/dlfcn.c \
@@ -1146,16 +1132,13 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_nslookup,user_nslookup))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_gui_calc,user_gui_calc))
 
 # ---------- Browser application ----------
-$(eval $(call LIBTOBY_PROGRAM_RULES,browser,browser))
 
 # ---------- Milestone 6: Settings application ----------
-$(eval $(call LIBTOBY_PROGRAM_RULES,settings,settings))
 
 # ---------- Phase 10: Graphical installer ----------
 $(eval $(call LIBTOBY_PROGRAM_RULES,installer,installer))
 
 # ---------- Milestones 9-12: Advanced Networking / PnP / Search / Recovery ----------
-$(eval $(call LIBTOBY_PROGRAM_RULES,netui,netui))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devmgr,devmgr))
 $(eval $(call LIBTOBY_PROGRAM_RULES,indexer,indexer))
 $(eval $(call LIBTOBY_PROGRAM_RULES,updater,updater))
@@ -1171,24 +1154,15 @@ programs/bluescreen/bluescreen.elf: programs/bluescreen/bluescreen.o \
 	      programs/common/start.o programs/bluescreen/bluescreen.o
 
 # ---------- Milestones 4-5: Multi-User + System Applications ----------
-$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,login,login))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,lockscreen,lockscreen))
-$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,files,files))
-$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,terminal,terminal))
-$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,notepad,notepad))
-$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,calc,calc))
-$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,imgview,imgview))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,mediaplayer,mediaplayer))
-$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,taskmgr,taskmgr))
 
 # ---------- Phase 2-4: System Management + PnP + Security ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,diskmgr,diskmgr))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,eventview,eventview))
-$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,sysinfo,sysinfo))
 
 # ---------- Phases 5-8: Networking UX / Multimedia / App Lifecycle / Reliability ----------
 $(eval $(call LIBTOBY_PROGRAM_RULES,wifipicker,wifipicker))
-$(eval $(call LIBTOBY_PROGRAM_RULES,netsettings,netsettings))
 $(eval $(call LIBTOBY_PROGRAM_RULES,volctrl,volctrl))
 $(eval $(call LIBTOBY_PROGRAM_RULES,appinstall,appinstall))
 
@@ -1208,22 +1182,11 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,tcc,tcc))
 $(eval $(call LIBTOBY_PROGRAM_RULES,as,as))
 $(eval $(call LIBTOBY_PROGRAM_RULES,ld,ld))
 
-# ---------- Milestone 3: Desktop Shell (multi-file program) ----------
-SHELL_SRCS := programs/shell/main.c \
-              programs/shell/taskbar.c \
-              programs/shell/startmenu.c \
-              programs/shell/desktop_wire.c
-SHELL_OBJS := $(SHELL_SRCS:.c=.o)
-
-programs/shell/%.o: programs/shell/%.c $(LIBTOBY_AR)
-	$(CC) $(LIBTOBY_CFLAGS) -c $< -o $@
-
-programs/shell/shell.elf: $(SHELL_OBJS) \
-                          $(LIBTOBY_CRT0) \
-                          $(LIBTOBY_AR) \
-                          programs/shell/program.ld
-	$(LD) $(PROG_LDFLAGS) -T programs/shell/program.ld -o $@ \
-	      $(LIBTOBY_CRT0) $(SHELL_OBJS) $(LIBTOBY_AR)
+# ---------- Milestone 3 desktop shell: RETIRED ----------
+# The userspace desktop shell (programs/shell/{main,taskbar,startmenu,
+# desktop_wire}.c) was superseded by the in-kernel compositor (src/gui.c),
+# which owns the taskbar/launcher/desktop. It was built but never shipped;
+# removed in the unify-on-TobyTK cleanup.
 
 # ---------- Phase 5: Real POSIX shell (multi-file program) ----------
 SH_SRCS := programs/sh/main.c \
@@ -1836,11 +1799,11 @@ programs/x2gui/x2gui.elf: programs/x2gui/x2gui.o \
 # Clock -- migrated to TobyTK (crt0 + libtoby.a).
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_clock,user_gui_clock))
 
-# Shared user-mode GUI toolkit -- compiled once, linked into every
-# milestone-11+ widget app. Lives in programs/common/ next to start.S
-# so it's easy to find and obviously shared.
-programs/common/toby_gui.o: programs/common/toby_gui.c programs/common/toby_gui.h
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+# NOTE: the old user-mode toby_gui toolkit is no longer linked by any in-tree
+# app (all migrated to TobyTK, libtoby/toby/tk.h). Its source
+# (programs/common/toby_gui.c/.h) is kept ONLY because the SDK still wraps it as
+# the frozen <toby/gui.h> + libtoby_gui.a contract for out-of-tree apps; the
+# in-tree object rule was removed.
 
 # Notes app -- migrated to TobyTK: links libtoby (crt0 + libtoby.a) like
 # every other native app instead of the old start.o + toby_gui.o.
@@ -2138,8 +2101,6 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/strace/strace.elf                     $(INITRD_STAGE)/bin/strace
 	cp programs/debugger/debugger.elf                 $(INITRD_STAGE)/bin/debugger
 	cp programs/pkgmgr/pkgmgr.elf                    $(INITRD_STAGE)/bin/pkgmgr
-	cp programs/browser/browser.elf                  $(INITRD_STAGE)/bin/browser
-	cp programs/settings/settings.elf                $(INITRD_STAGE)/bin/settings
 	cp programs/tobycc/tobycc.elf                     $(INITRD_STAGE)/bin/tobycc
 	cp programs/tobybuild/tobybuild.elf             $(INITRD_STAGE)/bin/tobybuild
 	cp programs/selfhosttest/selfhosttest.elf       $(INITRD_STAGE)/bin/selfhosttest
@@ -2167,23 +2128,14 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_ifconfig/user_ifconfig.elf     $(INITRD_STAGE)/bin/ifconfig
 	cp programs/user_nslookup/user_nslookup.elf     $(INITRD_STAGE)/bin/nslookup
 	cp programs/user_gui_calc/user_gui_calc.elf     $(INITRD_STAGE)/bin/gui_calc
-	cp programs/netui/netui.elf                     $(INITRD_STAGE)/bin/netui
 	cp programs/devmgr/devmgr.elf                   $(INITRD_STAGE)/bin/devmgr
 	cp programs/indexer/indexer.elf                 $(INITRD_STAGE)/bin/indexer
 	cp programs/updater/updater.elf                 $(INITRD_STAGE)/bin/updater
 	cp programs/bluescreen/bluescreen.elf           $(INITRD_STAGE)/bin/bluescreen
-	cp programs/login/login.elf                     $(INITRD_STAGE)/bin/login2
 	cp programs/lockscreen/lockscreen.elf           $(INITRD_STAGE)/bin/lockscreen
-	cp programs/files/files.elf                     $(INITRD_STAGE)/bin/files
-	cp programs/terminal/terminal.elf               $(INITRD_STAGE)/bin/terminal
-	cp programs/notepad/notepad.elf                 $(INITRD_STAGE)/bin/notepad
-	cp programs/calc/calc.elf                       $(INITRD_STAGE)/bin/calc
-	cp programs/imgview/imgview.elf                 $(INITRD_STAGE)/bin/imgview
 	cp programs/mediaplayer/mediaplayer.elf         $(INITRD_STAGE)/bin/mediaplayer
-	cp programs/taskmgr/taskmgr.elf                 $(INITRD_STAGE)/bin/taskmgr
 	cp programs/diskmgr/diskmgr.elf                 $(INITRD_STAGE)/bin/diskmgr
 	cp programs/eventview/eventview.elf             $(INITRD_STAGE)/bin/eventview
-	cp programs/sysinfo/sysinfo.elf                 $(INITRD_STAGE)/bin/sysinfo
 	cp programs/lua/lua.elf                         $(INITRD_STAGE)/bin/lua
 	cp programs/make/make.elf                       $(INITRD_STAGE)/bin/make
 	cp programs/less/less.elf                       $(INITRD_STAGE)/bin/less
@@ -2192,7 +2144,6 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/as/as.elf                           $(INITRD_STAGE)/bin/as
 	cp programs/ld/ld.elf                           $(INITRD_STAGE)/bin/ld
 	cp programs/wifipicker/wifipicker.elf           $(INITRD_STAGE)/bin/wifipicker
-	cp programs/netsettings/netsettings.elf         $(INITRD_STAGE)/bin/netsettings
 	cp programs/volctrl/volctrl.elf                 $(INITRD_STAGE)/bin/volctrl
 	cp programs/appinstall/appinstall.elf           $(INITRD_STAGE)/bin/appinstall
 	cp initrd/m36/m36_part2.c                         $(INITRD_STAGE)/m36/m36_part2.c
@@ -4193,5 +4144,5 @@ clean:
 	       $(PORTS_SBASE_OBJS) $(PORTS_SBASE_ELFS) $(PORTS_SBASE_UTIL_O) \
 	       libtoby/libtoby.a libtoby/crt0.o $(LIBTOBY_OBJS) \
 	       libtoby/libtoby.so libtoby/Scrt0.o $(LDTOBY_OBJS) $(LDTOBY_SO) \
-	       programs/common/start.o programs/common/toby_gui.o $(LOGDIR)/net.pcap
+	       programs/common/start.o $(LOGDIR)/net.pcap
 	@echo "(disk.img preserved -- 'make wipe-disk' to reformat the persistent FS)"
