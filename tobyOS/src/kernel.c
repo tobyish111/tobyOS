@@ -3551,6 +3551,17 @@ void _start(void) {
          * has no Intel GT, so this is a no-op there (gen<8 / no GPU). */
         intel_gt_init();
 
+        /* i915-lite Stage 3: if the GT self-test passed, validate an
+         * XY_SRC_COPY_BLT (scratch-buffer blit self-test, read back +
+         * compare) and, on success, route the compositor present path
+         * through the GPU blitter -- each dirty rect is blitted from the
+         * back buffer straight into the live scanout, with the Limine CPU
+         * memcpy as an automatic per-flip fallback. NEVER programs the
+         * pipe/plane/DPLL, so it can't blackscreen the box. No-op off real
+         * Intel gen7 HW (self-test flag is 0 in QEMU). */
+        if (intel_gt_selftest_ok() && intel_gt_present_setup())
+            gfx_use_intel_backend();
+
         mouse_init();
         gui_init();
 

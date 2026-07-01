@@ -222,6 +222,21 @@ void     intel_gpu_gt_recon(void);
 void     intel_gt_init(void);
 int      intel_gt_selftest_ok(void);   /* 1 only if the GT proved itself */
 
+/* ---- Stage 3 (i915-lite): GPU-blitter present path -------------------
+ * With the Stage-2 GT self-test passed, offload the compositor's present
+ * copy from the CPU (memcpy back-buffer -> scanout) to the BCS blitter via
+ * XY_SRC_COPY_BLT. intel_gt_present_setup() validates the blit encoding with
+ * a scratch-buffer self-test (safe -- never touches the display) and, on
+ * success, records the live scanout's GGTT address; it returns 1 when the
+ * GPU present path is armed, 0 to stay on the Limine CPU memcpy.
+ * intel_gt_present_rect() then blits one dirty rect from the CPU back buffer
+ * straight to the live scanout, returning 0 on success or negative on any
+ * failure (the caller MUST fall back to the CPU copy). Gen7 (Haswell) only
+ * for now; QEMU no-op (self-test flag 0). */
+int      intel_gt_present_setup(void);
+int      intel_gt_present_rect(const uint32_t *back, uint32_t back_w,
+                               uint32_t back_h, int x, int y, int w, int h);
+
 /* ---- Stage 4 (deferred): hardware page-flip via PLANE_SURF ----
  * The display plane scans through the GGTT, so a tear-free flip would just
  * repoint PLANE_SURF at a GGTT offset (no timing/DPLL/format change). The

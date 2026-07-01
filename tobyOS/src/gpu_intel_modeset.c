@@ -18,6 +18,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/pit.h>
+#include <tobyos/gfx.h>
 
 #define printk kprintf
 
@@ -878,6 +879,366 @@ void intel_gt_init(void) {
     /* Keep forcewake held while the GT is in use (Stage 3 will rely on it).
      * If the self-test failed we could drop it, but holding it is harmless
      * and simpler; the GT is otherwise idle. */
+}
+
+/* ======================================================================
+ * Stage 3: GPU-blitter present path (XY_SRC_COPY_BLT: back buffer -> scanout)
+ *
+ * With the Stage-2 GT self-test passed, offload the compositor's present
+ * copy from the CPU (memcpy back-buffer -> Limine framebuffer) to the BCS
+ * blitter. Each present is one XY_SRC_COPY_BLT of the dirty rect from the
+ * CPU back buffer straight into the LIVE scanout surface -- addressed by the
+ * display plane's OWN GGTT address (PLANE_A_SURF), so we write exactly the
+ * pixels the pipe is scanning. We NEVER program pipe/plane/DPLL/VGA, so a
+ * broken blit can at worst leave the screen stale (and the drain watchdog
+ * then reverts to the CPU memcpy) -- it can't blackscreen the box.
+ *
+ * SAFETY / VALIDATION: before arming, intel_gt_present_setup() runs a
+ * scratch-buffer blit self-test (pattern src -> scratch dst, read back and
+ * compare) that lives near the proven ring/scratch GGTT region and touches
+ * NO display register. Only a passing self-test arms the real path -- the
+ * gen7 analog of the Stage-2 store self-test. Gen7 (Haswell) only for now;
+ * QEMU no-op (intel_gt_selftest_ok()==0). See igpu-i915lite memory.
+ * ====================================================================== */
+
+/* Blit-self-test GGTT VAs, adjacent to the proven Stage-2 ring (0x40000) /
+ * scratch (0x41000) -- known-safe (Stage 2 wrote PTEs there without
+ * disturbing the display). */
+#define GT_BLTST_SRC_OFF   0x50000u
+#define GT_BLTST_DST_OFF   0x60000u
+/* Bounded ring-drain budget for the real present path; only ever reached on
+ * a genuine engine hang (a healthy blit drains in ~1 iteration). */
+#define GT_PRESENT_DRAIN_MAX 500000
+
+static struct {
+    int      ready;             /* present path validated + armed        */
+    int      disabled;          /* a ring-drain timeout retired it       */
+    uint32_t dst_ggtt_off;      /* live scanout GT VA (PLANE_A_SURF)      */
+    uint32_t dst_pitch;         /* scanout stride in BYTES (gen7)        */
+    uint32_t ring_tail;         /* our tracked BCS ring write offset     */
+    uint32_t next_src_ggtt_off; /* bump allocator for source GT VAs      */
+    /* GGTT-map cache for the (up to 2, double-buffered) CPU back buffers.
+     * Each is mapped once; va0 is the GT VA of the buffer's pixel (0,0)
+     * (== mapped page base + the buffer's sub-page byte offset). */
+    struct { const uint32_t *base; uint32_t va0; } src[2];
+    int      src_count;
+} g_present;
+
+static inline uint32_t gt_align_up_u32(uint32_t x, uint32_t a) {
+    return (x + (a - 1u)) & ~(a - 1u);
+}
+
+/* Flush a CPU (write-back) range to DRAM so the blitter's uncached GGTT
+ * read sees it (gen7 GGTT PTEs are cache-level-0). Rounded to cache lines. */
+static void gt_clflush_range(const void *p, size_t bytes) {
+    if (!bytes) return;
+    const uint8_t *a = (const uint8_t *)((uintptr_t)p & ~63ull);
+    const uint8_t *e = (const uint8_t *)p + bytes;
+    for (; a < e; a += 64)
+        __asm__ __volatile__("clflush (%0)" :: "r"(a) : "memory");
+    __asm__ __volatile__("mfence" ::: "memory");
+}
+
+/* Append `n` dwords to the BCS ring, handling wrap, then publish RING_TAIL.
+ * The ring buffer is CPU write-back but the engine fetches it uncached via
+ * the GGTT, so clflush the bytes we wrote before advancing the tail. */
+static void gt_ring_emit(const uint32_t *dw, int n) {
+    uint32_t size  = g_gt.ring_pages * 4096u;
+    uint32_t bytes = (uint32_t)n * 4u;
+    if (g_present.ring_tail + bytes + 8u > size) {
+        /* Pad the tail of the ring with NOOPs and wrap; the engine executes
+         * HEAD..end (NOOPs) then 0..new-tail. */
+        while (g_present.ring_tail < size) {
+            g_gt.ring_virt[g_present.ring_tail / 4] = MI_NOOP;
+            g_present.ring_tail += 4;
+        }
+        gt_clflush_range(g_gt.ring_virt, size);
+        g_present.ring_tail = 0;
+    }
+    uint32_t start = g_present.ring_tail;
+    for (int i = 0; i < n; i++)
+        g_gt.ring_virt[start / 4 + (uint32_t)i] = dw[i];
+    g_present.ring_tail = start + bytes;
+    if (g_present.ring_tail & 7u) {            /* qword-align the tail */
+        g_gt.ring_virt[g_present.ring_tail / 4] = MI_NOOP;
+        g_present.ring_tail += 4;
+    }
+    if (g_present.ring_tail >= size) g_present.ring_tail = 0;
+    gt_clflush_range(&g_gt.ring_virt[start / 4],
+                     (size_t)(g_present.ring_tail >= start
+                              ? g_present.ring_tail - start
+                              : size - start));
+    igpu_write(GEN8_BCS_RING_BASE + RING_TAIL,
+               g_present.ring_tail & RING_TAIL_MASK);
+    (void)igpu_read(GEN8_BCS_RING_BASE + RING_TAIL);
+}
+
+/* Spin (bounded) until the engine's HEAD reaches our TAIL == it parsed our
+ * command stream. Returns 1 on drain, 0 on timeout. */
+static int gt_ring_drain(int max_iters) {
+    uint32_t want = g_present.ring_tail & RING_HEAD_MASK;
+    for (int i = 0; i < max_iters; i++) {
+        uint32_t head = igpu_read(GEN8_BCS_RING_BASE + RING_HEAD)
+                        & RING_HEAD_MASK;
+        if (head == want) return 1;
+        for (volatile int j = 0; j < 50; j++) {}
+    }
+    return 0;
+}
+
+/* Emit one XY_SRC_COPY_BLT (gen2-7 8-dword form) copying a wxh rect from
+ * src(sx,sy) to dst(dx,dy). Addresses are GGTT byte offsets (GT VAs);
+ * pitches are BYTES and must fit the signed-16-bit BR11/BR13 field.
+ * Returns 0 on success, -1 if a parameter is out of range. */
+static int gt_emit_blit(uint32_t dst_base, uint32_t dst_pitch, int dx, int dy,
+                        uint32_t src_base, uint32_t src_pitch, int sx, int sy,
+                        int w, int h) {
+    if (w <= 0 || h <= 0) return 0;
+    if (dst_pitch > 0x7FFFu || src_pitch > 0x7FFFu) return -1;
+    if ((dx + w) > 0xFFFF || (dy + h) > 0xFFFF) return -1;
+    uint32_t cmd[8];
+    cmd[0] = XY_SRC_COPY_BLT_CMD | BLT_WRITE_ALPHA | BLT_WRITE_RGB;
+    cmd[1] = BLT_DEPTH_32 | BLT_ROP_SRCCOPY | (dst_pitch & 0xFFFFu); /* BR13 */
+    cmd[2] = ((uint32_t)dy << 16) | (uint32_t)(dx & 0xFFFF);         /* BR22 dst TL */
+    cmd[3] = ((uint32_t)(dy + h) << 16) | (uint32_t)((dx + w) & 0xFFFF); /* BR23 dst BR (excl) */
+    cmd[4] = dst_base;                                               /* BR09 dst addr */
+    cmd[5] = ((uint32_t)sy << 16) | (uint32_t)(sx & 0xFFFF);         /* BR26 src TL */
+    cmd[6] = src_pitch & 0xFFFFu;                                    /* BR11 src pitch */
+    cmd[7] = src_base;                                               /* BR12 src addr */
+    gt_ring_emit(cmd, 8);
+    return 0;
+}
+
+/* GGTT-map a CPU back buffer (once) and return the GT VA of its pixel (0,0).
+ * The buffer is kmalloc'd (16-byte aligned, NOT page aligned, and not
+ * guaranteed physically contiguous), so we translate each 4 KiB page and
+ * carry the sub-page byte offset into the returned GT VA. Cached by base
+ * pointer (there are only ever the 1-2 double-buffered surfaces). Returns 0
+ * on failure (unmapped page / cache full). */
+static uint32_t gt_src_map(const uint32_t *back, uint32_t w, uint32_t h) {
+    for (int i = 0; i < g_present.src_count; i++)
+        if (g_present.src[i].base == back) return g_present.src[i].va0;
+    if (g_present.src_count >= (int)(sizeof(g_present.src) /
+                                     sizeof(g_present.src[0])))
+        return 0;
+
+    uintptr_t b        = (uintptr_t)back;
+    uint32_t  page_off = (uint32_t)(b & 0xFFFu);
+    uint64_t  first    = b & ~0xFFFull;
+    size_t    total    = (size_t)page_off + (size_t)w * h * 4u;
+    uint32_t  pages    = (uint32_t)((total + 0xFFFu) / 4096u);
+    uint32_t  ggtt     = g_present.next_src_ggtt_off;
+
+    for (uint32_t i = 0; i < pages; i++) {
+        uint64_t phys = vmm_translate(first + (uint64_t)i * 4096u);
+        if (!phys) {
+            kprintf("[intel_gpu] Stage3: back buffer %p page %u unmapped -- "
+                    "GT present unavailable\n", (const void *)back, i);
+            return 0;
+        }
+        gt_ggtt_map(ggtt + i * 4096u, phys & ~0xFFFull);
+    }
+    /* Reserve this buffer's GT VA range plus a 1 MiB gap before the next. */
+    g_present.next_src_ggtt_off =
+        ggtt + gt_align_up_u32(pages * 4096u + 0x100000u, 0x100000u);
+
+    int idx = g_present.src_count++;
+    g_present.src[idx].base = back;
+    g_present.src[idx].va0  = ggtt + page_off;
+    kprintf("[intel_gpu] Stage3: mapped back buffer %p -> GT VA 0x%x "
+            "(%u pages, sub-page off 0x%x)\n",
+            (const void *)back, ggtt + page_off, pages, page_off);
+    return ggtt + page_off;
+}
+
+/* Scratch-buffer blit self-test: CPU-fills a source with a per-pixel pattern
+ * (at the SAME sub-page offset the real back buffer will have, so we prove
+ * that alignment too), blits it to a scratch dest with a DIFFERENT pitch,
+ * then reads the dest back and compares. Touches only scratch pages + the
+ * GT ring -- never the display. Returns 1 on a byte-exact copy. */
+static int gt_blit_selftest(void) {
+    enum { TW = 48, TH = 8 };
+    uint32_t src_pitch = TW * 4u;               /* tight source rows        */
+    uint32_t dst_pitch = (TW + 16u) * 4u;       /* padded dest (distinct)   */
+
+    uint64_t sp = pmm_alloc_pages(2);
+    uint64_t dp = pmm_alloc_pages(2);
+    if (!sp || !dp) {
+        kprintf("[intel_gpu] Stage3: blit self-test OOM\n");
+        return 0;
+    }
+    uint32_t *sv = (uint32_t *)pmm_phys_to_virt(sp);
+    uint32_t *dv = (uint32_t *)pmm_phys_to_virt(dp);
+
+    /* Mimic the real back buffer's sub-page (dword) alignment. */
+    uint32_t *bb = gfx_backbuf();
+    uint32_t page_off = bb ? ((uint32_t)((uintptr_t)bb & 0xFFFu) & ~3u) : 0u;
+    uint32_t *src_px = (uint32_t *)((uint8_t *)sv + page_off);
+
+    for (int y = 0; y < TH; y++)
+        for (int x = 0; x < TW; x++)
+            src_px[y * TW + x] = 0xC0DE0000u ^ (uint32_t)((y << 8) | x);
+    memset(dv, 0, 2u * 4096u);
+
+    gt_ggtt_map(GT_BLTST_SRC_OFF,          sp);
+    gt_ggtt_map(GT_BLTST_SRC_OFF + 0x1000, sp + 4096);
+    gt_ggtt_map(GT_BLTST_DST_OFF,          dp);
+    gt_ggtt_map(GT_BLTST_DST_OFF + 0x1000, dp + 4096);
+
+    gt_clflush_range(sv, 2u * 4096u);
+
+    if (gt_emit_blit(GT_BLTST_DST_OFF, dst_pitch, 0, 0,
+                     GT_BLTST_SRC_OFF + page_off, src_pitch, 0, 0,
+                     TW, TH) < 0) {
+        kprintf("[intel_gpu] Stage3: blit self-test emit rejected\n");
+        return 0;
+    }
+    int drained = gt_ring_drain(GT_PRESENT_DRAIN_MAX);
+
+    /* The blit's writes complete ASYNCHRONOUSLY: ring drain means the engine
+     * parsed the command, but the pixels reach DRAM via the GPU write pipeline
+     * a little later (the same async-store effect the Stage-2 store self-test
+     * hit -- pass one boot, fail the next). So poll the LAST-written pixel
+     * (writes retire in order, so once it lands the rest have too) before the
+     * full compare, flushing its cache line each iteration. */
+    volatile uint32_t *last = (volatile uint32_t *)
+        ((uint8_t *)dv + (TH - 1) * dst_pitch + (TW - 1) * 4);
+    uint32_t last_want = 0xC0DE0000u ^ (uint32_t)(((TH - 1) << 8) | (TW - 1));
+    int settle = -1;
+    for (int i = 0; i < 100000; i++) {
+        gt_clflush_range((const void *)last, 4);
+        if (*last == last_want) { settle = i; break; }
+        for (volatile int j = 0; j < 50; j++) {}
+    }
+
+    gt_clflush_range(dv, 2u * 4096u);
+    int ok = 1;
+    uint32_t bad_x = 0, bad_y = 0, bad_got = 0, bad_want = 0;
+    for (int y = 0; y < TH && ok; y++) {
+        for (int x = 0; x < TW; x++) {
+            uint32_t want = 0xC0DE0000u ^ (uint32_t)((y << 8) | x);
+            uint32_t got  = *(uint32_t *)((uint8_t *)dv + y * dst_pitch + x * 4);
+            if (got != want) {
+                ok = 0; bad_x = x; bad_y = y; bad_got = got; bad_want = want;
+                break;
+            }
+        }
+    }
+    kprintf("[intel_gpu] Stage3: blit self-test drained=%d settle_iters=%d "
+            "copy=%s", drained, settle, (drained && ok) ? "OK" : "MISMATCH");
+    if (!(drained && ok))
+        kprintf(" (first bad @%u,%u got=0x%08x want=0x%08x)",
+                bad_x, bad_y, bad_got, bad_want);
+    kprintf("\n");
+    /* Leave the scratch pages allocated + GGTT-mapped: the real present path
+     * never references these GT VAs again, and not freeing avoids any chance
+     * of a reused physical page sitting under a stale PTE. 16 KiB, one-time. */
+    return drained && ok;
+}
+
+int intel_gt_present_setup(void) {
+    if (!g_gt.selftest_ok) {
+        kprintf("[intel_gpu] Stage3: GT self-test did not pass -- present "
+                "path unavailable (staying on Limine)\n");
+        return 0;
+    }
+    if (!g_igpu.mmio) return 0;
+    if (g_igpu.gen != 7) {
+        /* Only gen7 (Haswell EliteDesk) is validated: PLANE_A_STRIDE reads in
+         * bytes here, whereas gen9 uses 64-byte units. Bail rather than blit
+         * with a wrong pitch. */
+        kprintf("[intel_gpu] Stage3: gen %d present path not implemented "
+                "(gen7 only) -- staying on Limine\n", g_igpu.gen);
+        return 0;
+    }
+    if (!gfx_ready()) {
+        kprintf("[intel_gpu] Stage3: gfx layer not ready -- staying on Limine\n");
+        return 0;
+    }
+
+    uint32_t ctrl = igpu_read(PLANE_A_CTRL);
+    uint32_t surf = igpu_read(PLANE_A_SURF);
+    uint32_t strd = igpu_read(PLANE_A_STRIDE);   /* gen7: bytes/line */
+    kprintf("[intel_gpu] Stage3: scanout PLANE_A ctrl=0x%08x (en=%d) "
+            "surf(GTVA)=0x%08x stride=%u bytes\n",
+            ctrl, (ctrl >> 31) & 1u, surf, strd);
+    if (!((ctrl >> 31) & 1u)) {
+        kprintf("[intel_gpu] Stage3: primary plane disabled -- abort\n");
+        return 0;
+    }
+    uint32_t need_pitch = gfx_width() * 4u;
+    if (strd < need_pitch || strd > 0x7FFFu) {
+        kprintf("[intel_gpu] Stage3: scanout stride %u out of range "
+                "(need >=%u, <=0x7FFF) -- abort\n", strd, need_pitch);
+        return 0;
+    }
+
+    g_present.dst_ggtt_off = surf & ~0xFFFu;
+    g_present.dst_pitch    = strd;
+    /* Continue the BCS ring where Stage 2's self-test left HEAD==TAIL. */
+    g_present.ring_tail =
+        igpu_read(GEN8_BCS_RING_BASE + RING_TAIL) & RING_TAIL_MASK;
+
+    /* Source back buffers get GT VAs at 1 GiB into the (2 GiB) GGTT -- well
+     * clear of the low-aperture scanout. Shift above the scanout on the
+     * (unexpected) chance it maps into that window. */
+    uint32_t src_span = 0x02000000u;                       /* reserve 32 MiB */
+    uint32_t base     = 0x40000000u;                       /* 1 GiB          */
+    uint32_t so = g_present.dst_ggtt_off;
+    uint32_t se = so + gt_align_up_u32(strd * gfx_height(), 0x100000u);
+    if (!(base >= se || base + src_span <= so))
+        base = gt_align_up_u32(se, 0x100000u);
+    g_present.next_src_ggtt_off = base;
+
+    if (!gt_blit_selftest()) {
+        kprintf("[intel_gpu] Stage3: blit self-test FAILED -- staying on "
+                "Limine CPU present\n");
+        return 0;
+    }
+
+    g_present.ready    = 1;
+    g_present.disabled = 0;
+    kprintf("[intel_gpu] Stage3: GT present ARMED (dst GTVA=0x%x pitch=%u, "
+            "src base GTVA=0x%x)\n",
+            g_present.dst_ggtt_off, g_present.dst_pitch,
+            g_present.next_src_ggtt_off);
+    return 1;
+}
+
+int intel_gt_present_rect(const uint32_t *back, uint32_t back_w, uint32_t back_h,
+                          int x, int y, int w, int h) {
+    if (!g_present.ready || g_present.disabled) return -1;
+    if (!back || back_w == 0 || back_h == 0)    return -1;
+
+    /* Clamp the rect to the buffer (the gfx layer already clips, but be
+     * defensive -- a bad coord would blit garbage into scanout). */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)back_w) w = (int)back_w - x;
+    if (y + h > (int)back_h) h = (int)back_h - y;
+    if (w <= 0 || h <= 0) return 0;             /* nothing to do == success */
+
+    uint32_t src_base = gt_src_map(back, back_w, back_h);
+    if (!src_base) return -1;
+
+    uint32_t src_pitch = back_w * 4u;
+    /* Flush the dirty rows to DRAM so the blitter's uncached read is fresh. */
+    for (int r = 0; r < h; r++)
+        gt_clflush_range((const uint8_t *)back
+                         + (size_t)(y + r) * src_pitch + (size_t)x * 4u,
+                         (size_t)w * 4u);
+
+    if (gt_emit_blit(g_present.dst_ggtt_off, g_present.dst_pitch, x, y,
+                     src_base, src_pitch, x, y, w, h) < 0)
+        return -1;
+
+    if (!gt_ring_drain(GT_PRESENT_DRAIN_MAX)) {
+        g_present.disabled = 1;
+        kprintf("[intel_gpu] Stage3: ring-drain TIMEOUT -- retiring GT "
+                "present, reverting to Limine CPU copy\n");
+        return -1;
+    }
+    return 0;
 }
 
 /* ======================================================================

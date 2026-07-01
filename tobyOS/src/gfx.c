@@ -40,6 +40,11 @@ static void limine_flip(void);
 static void limine_present_rect(int x, int y, int w, int h);
 static int  limine_describe(char *extra, int cap);
 
+/* The Stage-3 Intel GT blitter backend (defined near gfx_set_backend
+ * below). Forward-declared here so the cursor-overlay support check can
+ * recognise it as a direct-scanout backend. */
+static const struct gfx_backend g_backend_intel;
+
 /* M27B: Limine framebuffer backend. The default. Implements the full
  * gfx_backend ABI (flip + present_rect + describe). present_rect lets
  * the M27E dirty-rectangle path push a partial update; on the Limine
@@ -885,7 +890,15 @@ void gfx_draw_cursor(int x, int y) {
 }
 
 static bool cursor_overlay_supported(void) {
-    return g.ready && g.fb && ((g.backend ? g.backend : &g_backend_limine) == &g_backend_limine);
+    const struct gfx_backend *b = g.backend ? g.backend : &g_backend_limine;
+    /* The overlay draws the cursor directly into the Limine scanout FB via
+     * the CPU. That's valid for the default limine memcpy backend AND for the
+     * Stage-3 Intel GT backend -- both keep g.fb pointing at real scanout
+     * memory, and the GT backend blits each frame into that SAME scanout, so
+     * the cursor (drawn on top after every present) behaves identically. It
+     * is NOT valid for backends like virtio-gpu whose present path does not
+     * go through the linear FB pointer. */
+    return g.ready && g.fb && (b == &g_backend_limine || b == &g_backend_intel);
 }
 
 static inline uint32_t *fb_pixel_ptr(int x, int y) {
@@ -1070,6 +1083,51 @@ void gfx_flip(void) {
         }
         g.back = next;
     }
+}
+
+/* ---- Stage 3: Intel GT blitter present backend --------------------
+ *
+ * On the real EliteDesk (gen7 Haswell) the i915-lite GT bring-up + blit
+ * self-test may arm a GPU present path: each flip/present_rect blits the
+ * dirty region from THIS back buffer straight into the live scanout via
+ * XY_SRC_COPY_BLT. If the blit fails for any reason (unmapped page, ring
+ * hang, out-of-range param) intel_gt_present_rect() returns negative and we
+ * fall through to the universal Limine CPU memcpy -- so the display is never
+ * lost. Implemented as a gfx_backend so it plugs in via gfx_set_backend()
+ * exactly like virtio-gpu, and keeps the memcpy fallback in-file. */
+int intel_gt_present_rect(const uint32_t *back, uint32_t back_w,
+                          uint32_t back_h, int x, int y, int w, int h);
+
+static void intel_flip(void) {
+    if (intel_gt_present_rect(g.back, g.width, g.height,
+                              0, 0, (int)g.width, (int)g.height) == 0)
+        return;
+    limine_flip();
+}
+
+static void intel_present_rect(int x, int y, int w, int h) {
+    if (intel_gt_present_rect(g.back, g.width, g.height, x, y, w, h) == 0)
+        return;
+    limine_present_rect(x, y, w, h);
+}
+
+static int intel_describe(char *extra, int cap) {
+    if (!extra || cap <= 0) return 0;
+    return ksnprintf(extra, (size_t)cap,
+                     "intel-gt-blit (fallback=limine-fb) fb_pitch_px=%u",
+                     g.fb_pitch_px);
+}
+
+static const struct gfx_backend g_backend_intel = {
+    .flip            = intel_flip,
+    .present_rect    = intel_present_rect,
+    .describe        = intel_describe,
+    .name            = "intel-gt",
+    .bytes_per_pixel = 4,
+};
+
+void gfx_use_intel_backend(void) {
+    gfx_set_backend(&g_backend_intel);
 }
 
 void gfx_set_backend(const struct gfx_backend *backend) {

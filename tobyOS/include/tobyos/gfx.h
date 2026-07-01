@@ -224,6 +224,12 @@ struct gfx_backend {
 void                      gfx_set_backend(const struct gfx_backend *backend);
 const struct gfx_backend *gfx_get_backend(void);
 
+/* Stage 3 (i915-lite): install the Intel GT blitter present backend (see
+ * src/gpu_intel_modeset.c). Call ONLY after intel_gt_present_setup() has
+ * returned 1. The backend blits dirty rects to the live scanout via the
+ * GPU and falls back to the Limine CPU memcpy on any per-flip failure. */
+void                      gfx_use_intel_backend(void);
+
 /* ---- region invalidation (groundwork for M27E) -------------------
  *
  * Drawing primitives mark the union of every rect they touch since the
