@@ -706,17 +706,30 @@ static void min_btn_rect(const struct window *w,
            - GUI_BTN_GAP - GUI_MIN_BTN_SIZE;
     *by = w->y + (GUI_TITLE_BAR_H - GUI_MIN_BTN_SIZE) / 2;
 }
+/* Title-bar button hit-tests. The DRAWN glyphs are small + vertically
+ * centred, but the clickable area is the full title-bar height (and, for
+ * close, all the way to the window's right edge) so the top-right corner
+ * is an easy target -- otherwise a click a few px high/low or near the
+ * edge misses the button and starts a title drag instead (observed on
+ * real hardware: "the X doesn't close the window"). Order of the callers
+ * (min, then max, then close) keeps the regions unambiguous. */
 static bool point_in_close(const struct window *w, int px, int py) {
     int bx, by, bw, bh; close_btn_rect(w, &bx, &by, &bw, &bh);
-    return px >= bx && py >= by && px < bx + bw && py < by + bh;
+    (void)by; (void)bw; (void)bh;
+    return px >= bx && px < w->x + outer_w(w) &&
+           py >= w->y && py < w->y + GUI_TITLE_BAR_H;
 }
 static bool point_in_max(const struct window *w, int px, int py) {
     int bx, by, bw, bh; max_btn_rect(w, &bx, &by, &bw, &bh);
-    return px >= bx && py >= by && px < bx + bw && py < by + bh;
+    (void)by; (void)bh;
+    return px >= bx && px < bx + bw &&
+           py >= w->y && py < w->y + GUI_TITLE_BAR_H;
 }
 static bool point_in_min(const struct window *w, int px, int py) {
     int bx, by, bw, bh; min_btn_rect(w, &bx, &by, &bw, &bh);
-    return px >= bx && py >= by && px < bx + bw && py < by + bh;
+    (void)by; (void)bh;
+    return px >= bx && px < bx + bw &&
+           py >= w->y && py < w->y + GUI_TITLE_BAR_H;
 }
 
 /* ---- desktop / taskbar geometry ----------------------------------- */
@@ -1758,6 +1771,13 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
                        "at (%d,%d)",
                        (unsigned)prev, (unsigned)buttons,
                        (int)went_down, (int)went_up, nx, ny);
+        /* A click can toggle the start menu / notification center / widgets
+         * panel or change window state -- most of those set g.dirty but do
+         * NOT register a damage rect, so with damage-clipped compositing a
+         * stale cursor-bbox invalidation would clip them out and they'd
+         * appear only on the next full frame ("menu slow to pop up"). Clicks
+         * are infrequent, so force a full recomposite on any button edge. */
+        gui_invalidate_full();
     }
 
     /* If the GUI isn't even displayed (no windows AND no desktop), do
