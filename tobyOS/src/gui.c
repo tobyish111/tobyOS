@@ -4589,13 +4589,22 @@ void gui_tick(void) {
     if (on_pid0) {
         anim_tick();
         if (g.launch_tail != g.launch_head) drain_launch_queue();
-        reap_tracked();
         /* Service manager pump: monitor PROGRAM services, restart
          * any that exited if their policy says so. Cheap when there
          * are no live services to watch. We piggy-back on the GUI
          * tick because it already runs ~100 Hz from the idle loop
-         * and is guaranteed to be on pid 0. */
+         * and is guaranteed to be on pid 0.
+         *
+         * MUST run BEFORE reap_tracked(): a service proc that is also a
+         * tracked desktop proc (e.g. /bin/login) is reaped by
+         * reap_tracked(), which recycles the slot. If that ran first,
+         * service_tick() would look up the pid, find it gone, and default
+         * to exit_code -1 -- mis-classifying a clean login hand-off (rc=0)
+         * as a crash ("Service 'login' crashed rc=-1", spurious restart
+         * toast + crash count). Reading the exit code before the reap
+         * fixes it and works for genuine crashes too. */
         service_tick();
+        reap_tracked();
     }
 
     /* Heartbeat: at NORMAL trace level, emit a one-line liveness summary

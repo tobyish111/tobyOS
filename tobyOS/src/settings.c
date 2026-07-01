@@ -253,10 +253,21 @@ int settings_save(void) {
 
     int rc = vfs_write_all(SETTINGS_PATH, buf, n);
     kfree(buf);
+    /* Every setting toggle calls settings_save(). On a read-only root (no
+     * /data tobyfs) that fails every time -- log it ONCE, not once per
+     * toggle (the gui_settings app flooded the log). Reset on a successful
+     * save so a later writable mount re-warns if it breaks again. */
+    static bool s_save_warned;
     if (rc != VFS_OK) {
-        kprintf("[settings] save failed: %s\n", vfs_strerror(rc));
+        if (!s_save_warned) {
+            kprintf("[settings] save failed: %s "
+                    "(suppressing repeats until a save succeeds)\n",
+                    vfs_strerror(rc));
+            s_save_warned = true;
+        }
         return -1;
     }
+    s_save_warned = false;
     kprintf("[settings] saved %d entries to %s (%lu bytes)\n",
             (int)n /* cosmetic */, SETTINGS_PATH, (unsigned long)n);
     return 0;
