@@ -116,7 +116,7 @@ static void format_uptime(char *buf, uint64_t ms) {
 
 /* ---- TobyTK UI ------------------------------------------------------- */
 static struct tk_window win;
-static struct tk_widget *content, *w_table, *w_status, *w_tabbtn[3];
+static struct tk_widget *content, *w_table, *w_status, *w_tabbtn[3], *w_canvas;
 static int g_base;
 
 static void rebuild(void);
@@ -254,7 +254,7 @@ static void rebuild(void){
     tk_clear_children(&win,win.root);
     tk_rewind(&win,g_base);
     win.capture=0; win.focus=0;
-    content=w_table=w_status=0;
+    content=w_table=w_status=w_canvas=0;
 
     struct tk_widget *root=tk_root(&win);
     tk_pad(root,0); root->gap=0;
@@ -285,7 +285,7 @@ static void rebuild(void){
         tk_grow(w_table,1);
         w_status=tk_colors(tk_label(&win,content,""),0,COL_DIM);
     } else {
-        tk_grow(tk_canvas(&win,content,perf_paint),1);
+        w_canvas=tk_grow(tk_canvas(&win,content,perf_paint),1);
     }
     update_status();
     tk_redraw(&win);
@@ -320,9 +320,12 @@ int main(int argc,char **argv){
         if(now-last>=1000){
             last=now;
             refresh_data();
+            /* Per-widget dirty: the setters mark the table + status line, and
+             * we mark the perf-tab canvas explicitly -- so the 1 s refresh
+             * repaints only what changed, not the whole window. */
             if(w_table)tk_table_rows(&win,w_table,g_svc_count,g_tab==TAB_SERVICES?svc_cell:proc_cell,0);
             update_status();
-            tk_redraw(&win);
+            if(w_canvas)tk_dirty(&win,w_canvas);
         }
         usleep(40000);
     }

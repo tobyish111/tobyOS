@@ -84,6 +84,9 @@ struct tk_event {
 #define TK_MAX_WIDGETS   256
 #define TK_MAX_CHILDREN  32
 #define TK_TEXT_MAX      96
+/* Per-widget dirty tracking: max widgets that can be partial-repainted in
+ * one pass before falling back to a whole-window repaint. */
+#define TK_MAX_DIRTY     8
 
 /* ---- widget kinds --------------------------------------------------- */
 enum tk_kind {
@@ -201,6 +204,13 @@ struct tk_window {
 
     int  want_redraw;
     int  want_quit;
+    /* Per-widget dirty tracking: widgets changed since the last repaint via
+     * the live-update setters. The next repaint touches only their rects
+     * (flipping each sub-rect). Any event-driven change, structural rebuild,
+     * or overflow sets dirty_full => a whole-window repaint (safe default). */
+    struct tk_widget *dirty[TK_MAX_DIRTY];
+    int  n_dirty;
+    int  dirty_full;
     tk_key_cb on_key;            /* optional global key hook (see tk_on_key) */
     void *user;                  /* app-owned */
 };
@@ -321,7 +331,11 @@ void tk_rewind(struct tk_window *win, int checkpoint);
 void tk_clear_children(struct tk_window *win, struct tk_widget *w);
 
 /* ---- loop ----------------------------------------------------------- */
-void  tk_redraw(struct tk_window*);   /* request a repaint next iteration */
+void  tk_redraw(struct tk_window*);   /* request a whole-window repaint next iter */
+/* Mark ONE widget dirty for a partial (per-widget) repaint next iteration --
+ * the setters (tk_set_text/tk_table_rows/...) do this automatically; call it
+ * directly for a TK_CANVAS whose app-drawn content changed. */
+void  tk_dirty (struct tk_window*, struct tk_widget*);
 void  tk_quit  (struct tk_window*);
 int   tk_run   (struct tk_window*);   /* blocking loop until quit; returns 0 */
 /* Non-blocking single pump: drain pending events + repaint if dirty.

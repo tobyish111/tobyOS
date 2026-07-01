@@ -209,6 +209,28 @@ Now the compositor scopes the whole paint to the invalidated region:
   full frame. Verified in QEMU (post-login desktop stays pristine through many partial
   frames + cursor sweeps, no artifacts).
 
+### Per-widget dirty tracking (TobyTK, app side)
+The compositor optimization above only helped once a window flipped; every TobyTK
+`repaint()` still redrew the *whole* window (full bg fill + ~100 `gui_*` syscalls) and
+flipped the whole window, so a live counter tick cost a full-window repaint. Now
+TobyTK tracks which widgets changed:
+- The live-update setters (`tk_set_text`/`tk_table_rows`/`tk_set_value`/…) and the new
+  public `tk_dirty(win, widget)` mark individual widgets into a small dirty list; any
+  event-driven change or structural rebuild (`tk_redraw`) sets `dirty_full` (the safe
+  whole-window path). `tk_pump`/`tk_run` force full whenever an event was dispatched.
+- A partial `repaint()` snapshots the dirty widgets' geometry, re-lays-out (falling
+  back to full if anything moved/resized), then repaints the tree **clipped to each
+  dirty widget's exact rect** (a userspace clip in the `g_*` wrappers: `g_fill` trims,
+  `paint_widget` skips off-clip widgets) and flips just that rect via the new
+  `ABI_SYS_GUI_FLIP_RECT` syscall → `gui_window_flip_rect` (invalidate a client
+  sub-rect). So a task-manager refresh repaints only the table + status line, which the
+  damage-clipped compositor then recomposites as a tiny region.
+- Correctness mirrors the kernel: clip = the exact widget rect (content draws are
+  bounded by their widget, so nothing straddles → no AA double-blend), and the window
+  backbuffer persists between flips. Verified in QEMU: the task-manager table + status
+  update in place across many 1 Hz partial refreshes with no torn/stale rows; the
+  login→desktop full-repaint path is unregressed.
+
 ## Unifying the three stacks
 
 **Native** apps use TobyTK → `gui_*` → `struct window`. Done.

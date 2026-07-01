@@ -580,6 +580,13 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
 #define ABI_SYS_GUI_TEXT_TTF          94
 #define ABI_SYS_GUI_TEXT_TTF_WIDTH    95
 
+/* Flip only a sub-rectangle of a window (per-widget dirty tracking).
+ * Like GUI_FLIP but the compositor invalidates just this client-relative
+ * rect instead of the whole window:
+ *   a1 = fd, a2 = (x & 0xFFFF) | (y << 16), a3 = (w & 0xFFFF) | (h << 16)
+ * Coords are int16 window-CLIENT coordinates (0,0 = client top-left). */
+#define ABI_SYS_GUI_FLIP_RECT         96
+
 /* ---- 3D Graphics / VirGL (Phase 3) ------------------------------- */
 #define ABI_SYS_GL_CREATE_CTX         100
 #define ABI_SYS_GL_DESTROY_CTX        101

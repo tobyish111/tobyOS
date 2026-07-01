@@ -5447,6 +5447,28 @@ int gui_window_flip(struct window *w) {
     return 0;
 }
 
+/* Per-widget dirty tracking: flip only a CLIENT-relative sub-rect. Maps
+ * client coords to screen (client origin = x+BORDER, y+TITLE_BAR_H) and
+ * invalidates just that, so the damage-clipped compositor recomposites a
+ * tiny region. Degenerate / near-full rects fall back to a whole-window
+ * flip. */
+int gui_window_flip_rect(struct window *w, int rx, int ry, int rw, int rh) {
+    if (!w || !w->in_use) return -1;
+    if (rw <= 0 || rh <= 0) return gui_window_flip(w);
+    /* Clamp to the client area. */
+    if (rx < 0) { rw += rx; rx = 0; }
+    if (ry < 0) { rh += ry; ry = 0; }
+    if (rx + rw > w->client_w) rw = w->client_w - rx;
+    if (ry + rh > w->client_h) rh = w->client_h - ry;
+    if (rw <= 0 || rh <= 0) return gui_window_flip(w);
+    w->gpu_dirty = true;
+    g.dirty = true;
+    int sx = w->x + GUI_BORDER + rx;
+    int sy = w->y + GUI_TITLE_BAR_H + ry;
+    gui_invalidate_rect(sx, sy, rw, rh);
+    return 0;
+}
+
 /* ---- keyboard delivery (called from keyboard IRQ / USB HID poll) --- *
  *
  * Milestone 11: when the GUI is active, the keyboard IRQ no longer

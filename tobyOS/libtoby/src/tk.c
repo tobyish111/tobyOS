@@ -40,15 +40,69 @@ static int  g_create(int w, int h, const char *t) {
     return (int)sc3(ABI_SYS_GUI_CREATE, w, h, (long)t);
 }
 static void g_flip(int fd)             { sc1(ABI_SYS_GUI_FLIP, fd); }
+/* Flip only a client-relative sub-rect (per-widget dirty tracking). */
+static void g_flip_rect(int fd, int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) { g_flip(fd); return; }
+    long a2 = ((long)(uint16_t)x) | ((long)(uint16_t)y << 16);
+    long a3 = ((long)(uint16_t)w) | ((long)(uint16_t)h << 16);
+    sc3(ABI_SYS_GUI_FLIP_RECT, fd, a2, a3);
+}
+
+/* ---- userspace draw clip (per-widget partial repaint) --------------- *
+ * When active, g_fill trims to it and paint_widget skips widgets fully
+ * outside it, so a repaint scoped to a dirty widget's rect only touches
+ * that region of the window backbuffer. File-static because the g_*
+ * wrappers take an fd, not the window, and repaint is synchronous per
+ * window on a single-threaded app. */
+static int gclip_on, gclip_x, gclip_y, gclip_w, gclip_h;
+static void clip_set(int x, int y, int w, int h) {
+    gclip_x = x; gclip_y = y; gclip_w = w; gclip_h = h; gclip_on = 1;
+}
+static void clip_off(void) { gclip_on = 0; }
+/* true => rect (x,y,w,h) is entirely outside the active clip (skip it). */
+static int clip_reject(int x, int y, int w, int h) {
+    if (!gclip_on) return 0;
+    return (x >= gclip_x + gclip_w) || (y >= gclip_y + gclip_h) ||
+           (x + w <= gclip_x)       || (y + h <= gclip_y);
+}
+
+/* Force a whole-window repaint next pass. Chained assignment dodges any
+ * mechanical want_redraw rewrite and marks both flags. */
+static void tk_mark_full(struct tk_window *win) {
+    if (win) win->want_redraw = win->dirty_full = 1;
+}
+/* Mark one widget dirty (live-update setters). The next repaint touches
+ * only the listed widgets' rects. Overflow / a listed-full window falls
+ * back to a whole-window repaint. */
+static void tk_mark_dirty(struct tk_window *win, struct tk_widget *w) {
+    if (!win || !w) return;
+    win->want_redraw = 1;
+    if (win->dirty_full) return;
+    for (int i = 0; i < win->n_dirty; i++)
+        if (win->dirty[i] == w) return;              /* already listed */
+    if (win->n_dirty >= TK_MAX_DIRTY) { win->dirty_full = 1; return; }
+    win->dirty[win->n_dirty++] = w;
+}
 static int  g_poll(int fd, struct tk_event *e) {
     return (int)sc2(ABI_SYS_GUI_POLL_EVENT, fd, (long)e);
 }
 static void g_state(int fd, int s)     { sc2(ABI_SYS_GUI_SET_STATE, fd, s); }
 static void g_sleep_ms(int ms)         { sc1(ABI_SYS_NANOSLEEP, (long)ms * 1000000L); }
 
-/* FILL: a1=fd, a2=x, a3=y, a4=(w|h<<16), a5=color */
+/* FILL: a1=fd, a2=x, a3=y, a4=(w|h<<16), a5=color. Trims to the active
+ * userspace clip so the whole-window / container bg fills only touch the
+ * dirty region during a partial repaint. */
 static void g_fill(int fd, int x, int y, int w, int h, uint32_t c) {
     if (w <= 0 || h <= 0) return;
+    if (gclip_on) {
+        int x1 = x + w, y1 = y + h;
+        if (x  < gclip_x)             x  = gclip_x;
+        if (y  < gclip_y)             y  = gclip_y;
+        if (x1 > gclip_x + gclip_w)   x1 = gclip_x + gclip_w;
+        if (y1 > gclip_y + gclip_h)   y1 = gclip_y + gclip_h;
+        w = x1 - x; h = y1 - y;
+        if (w <= 0 || h <= 0) return;
+    }
     long wh = ((long)(uint16_t)w) | ((long)(uint16_t)h << 16);
     sc5(ABI_SYS_GUI_FILL, fd, x, y, wh, (long)c);
 }
@@ -325,7 +379,7 @@ void tk_table_rows(struct tk_window *win, struct tk_widget *w, int nrows,
     w->nrows = nrows < 0 ? 0 : nrows;
     w->cell = cell; w->cell_user = user;
     if (w->sel >= w->nrows) w->sel = w->nrows - 1;
-    if (win) win->want_redraw = 1;
+    tk_mark_dirty(win, w);
 }
 int tk_table_selected(struct tk_widget *w) { return w ? w->sel : -1; }
 struct tk_widget *tk_textarea(struct tk_window *win, struct tk_widget *p, const char *text) {
@@ -342,7 +396,7 @@ void tk_textarea_set(struct tk_window *win, struct tk_widget *w, const char *tex
     if (!w) return;
     w->ta_text = text ? text : "";
     w->scroll = 0;
-    if (win) win->want_redraw = 1;
+    tk_mark_dirty(win, w);
 }
 
 /* ---- configuration -------------------------------------------------- */
@@ -411,28 +465,32 @@ void tk_draw_blit_blend(struct tk_window *win, int x, int y, int w, int h,
 void tk_set_text(struct tk_window *win, struct tk_widget *w, const char *text) {
     if (!w) return;
     t_strcpy_cap(w->text, text, TK_TEXT_MAX);
-    if (win) win->want_redraw = 1;
+    tk_mark_dirty(win, w);
 }
 const char *tk_get_text(struct tk_widget *w) { return w ? w->text : ""; }
 int  tk_checked(struct tk_widget *w) { return w ? w->checked : 0; }
 void tk_set_checked(struct tk_window *win, struct tk_widget *w, int on) {
-    if (!w) return; w->checked = on ? 1 : 0; if (win) win->want_redraw = 1;
+    if (!w) return; w->checked = on ? 1 : 0; tk_mark_dirty(win, w);
 }
 int  tk_selected(struct tk_widget *w) { return w ? w->sel : -1; }
 void tk_set_value(struct tk_window *win, struct tk_widget *w, int v) {
     if (!w) return;
     if (v < w->value_min) v = w->value_min;
     if (w->value_max > w->value_min && v > w->value_max) v = w->value_max;
-    w->value = v; if (win) win->want_redraw = 1;
+    w->value = v; tk_mark_dirty(win, w);
 }
 
-void tk_redraw(struct tk_window *win) { if (win) win->want_redraw = 1; }
+/* Explicit "repaint everything" -- the escape hatch for structural changes
+ * (page swaps, rebuilds). Forces a whole-window repaint. */
+void tk_redraw(struct tk_window *win) { tk_mark_full(win); }
+/* Public per-widget dirty mark (e.g. a canvas whose content changed). */
+void tk_dirty(struct tk_window *win, struct tk_widget *w) { tk_mark_dirty(win, w); }
 void tk_quit(struct tk_window *win)   { if (win) win->want_quit = 1; }
 
 int tk_checkpoint(struct tk_window *win) { return win ? win->n : 0; }
 void tk_clear_children(struct tk_window *win, struct tk_widget *w) {
     if (w) w->n_child = 0;
-    if (win) win->want_redraw = 1;
+    tk_mark_full(win);       /* structural change -> whole-window repaint */
 }
 void tk_rewind(struct tk_window *win, int cp) {
     if (!win || cp < 0 || cp > win->n) return;
@@ -440,7 +498,7 @@ void tk_rewind(struct tk_window *win, int cp) {
     if (win->focus   && (int)(win->focus   - win->pool) >= cp) win->focus = 0;
     if (win->capture && (int)(win->capture - win->pool) >= cp) win->capture = 0;
     win->n = cp;
-    win->want_redraw = 1;
+    tk_mark_full(win);       /* structural change -> whole-window repaint */
 }
 struct tk_widget *tk_root(struct tk_window *win) { return win ? win->root : 0; }
 void tk_maximize(struct tk_window *win) { if (win) g_state(win->fd, TK_WIN_MAXIMIZED); }
@@ -630,6 +688,10 @@ static void border(struct tk_window *win, int x, int y, int w, int h, uint32_t c
 
 static void paint_widget(struct tk_window *win, struct tk_widget *w) {
     if (!w || !w->visible) return;
+    /* Partial repaint: skip widgets fully outside the active clip. A
+     * container that merely contains the clip still intersects, so it
+     * paints (bg trimmed by g_fill) and recurses into its children. */
+    if (clip_reject(w->x, w->y, w->w, w->h)) return;
     struct tk_theme *t = &win->theme;
     int px = wid_px(win, w);
     int ty = w->y + (w->h - px) / 2;     /* vertical text centring */
@@ -822,12 +884,55 @@ static void paint_widget(struct tk_window *win, struct tk_widget *w) {
     for (int i = 0; i < w->n_child; i++) paint_widget(win, w->child[i]);
 }
 
-static void repaint(struct tk_window *win) {
+/* Whole-window repaint: fill the bg + walk the tree + flip everything. */
+static void repaint_full(struct tk_window *win) {
+    clip_off();
     do_layout(win);
     g_fill(win->fd, 0, 0, win->w, win->h, win->theme.window_bg);
     paint_widget(win, win->root);
     g_flip(win->fd);
+}
+
+static void repaint(struct tk_window *win) {
+    if (win->dirty_full || win->n_dirty == 0) {
+        repaint_full(win);
+    } else {
+        /* Partial repaint: only the dirty widgets' rects changed. Snapshot
+         * their geometry, re-layout, and if anything moved/resized (e.g. a
+         * shrink-to-fit label grew) fall back to a full repaint -- else the
+         * old rect would leave stale pixels. Otherwise repaint each dirty
+         * widget's exact rect (window bg + ancestor bgs + the widget's
+         * subtree, all fresh within that rect) and flip just that rect. */
+        int ox[TK_MAX_DIRTY], oy[TK_MAX_DIRTY], ow[TK_MAX_DIRTY], oh[TK_MAX_DIRTY];
+        int nd = win->n_dirty;
+        for (int i = 0; i < nd; i++) {
+            struct tk_widget *d = win->dirty[i];
+            ox[i] = d->x; oy[i] = d->y; ow[i] = d->w; oh[i] = d->h;
+        }
+        do_layout(win);
+        int moved = 0;
+        for (int i = 0; i < nd; i++) {
+            struct tk_widget *d = win->dirty[i];
+            if (d->x != ox[i] || d->y != oy[i] || d->w != ow[i] || d->h != oh[i]) { moved = 1; break; }
+        }
+        if (moved) {
+            repaint_full(win);
+        } else {
+            for (int i = 0; i < nd; i++) {
+                struct tk_widget *d = win->dirty[i];
+                if (d->w <= 0 || d->h <= 0) continue;
+                clip_set(d->x, d->y, d->w, d->h);
+                g_fill(win->fd, d->x, d->y, d->w, d->h, win->theme.window_bg);
+                paint_widget(win, win->root);
+                clip_off();
+                g_flip_rect(win->fd, d->x, d->y, d->w, d->h);
+            }
+        }
+    }
     win->want_redraw = 0;
+    win->dirty_full  = 0;
+    win->n_dirty     = 0;
+    clip_off();
 }
 
 /* ---- hit-testing + event dispatch ----------------------------------- */
@@ -1026,7 +1131,7 @@ int tk_window_open(struct tk_window *win, int w, int h, const char *title) {
     struct tk_widget *root = alloc_widget(win, TK_PANEL);
     root->layout = TK_LAYOUT_VBOX;
     win->root = root;
-    win->want_redraw = 1;
+    tk_mark_full(win);       /* first paint is a whole-window repaint */
     return 0;
 }
 
@@ -1038,8 +1143,13 @@ int tk_pump(struct tk_window *win) {
         any = 1;
         if (win->want_quit) return 1;
     }
-    (void)any;
-    if (win->want_redraw) repaint(win);
+    if (win->want_redraw) {
+        /* Event handlers set want_redraw without per-widget marking, so an
+         * event-driven repaint must be full. A repaint with no events is
+         * pure setter marks (e.g. a live metrics refresh) -> partial. */
+        if (any) win->dirty_full = 1;
+        repaint(win);
+    }
     return win->want_quit;
 }
 
@@ -1059,6 +1169,6 @@ int tk_run(struct tk_window *win) {
             continue;
         }
         dispatch(win, &ev);
-        if (win->want_redraw) repaint(win);
+        if (win->want_redraw) { win->dirty_full = 1; repaint(win); }
     }
 }

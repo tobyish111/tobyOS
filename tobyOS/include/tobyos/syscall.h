@@ -96,6 +96,7 @@
 #define SYS_GUI_FILL        ABI_SYS_GUI_FILL
 #define SYS_GUI_TEXT        ABI_SYS_GUI_TEXT
 #define SYS_GUI_FLIP        ABI_SYS_GUI_FLIP
+#define SYS_GUI_FLIP_RECT   ABI_SYS_GUI_FLIP_RECT
 #define SYS_GUI_POLL_EVENT  ABI_SYS_GUI_POLL_EVENT
 
 /* --- terminal + filesystem + exec (milestone 13) ---------------- *

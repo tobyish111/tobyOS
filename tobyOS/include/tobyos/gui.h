@@ -279,6 +279,12 @@ int gui_window_text_scaled(struct window *w, int x, int y, const char *s,
  * framebuffer. Cheap to call multiple times per frame. */
 int gui_window_flip(struct window *w);
 
+/* Like gui_window_flip but hint the compositor that only a CLIENT-relative
+ * sub-rectangle changed (per-widget dirty tracking). The compositor
+ * recomposites just that region instead of the whole window. Coords are in
+ * client space (0,0 = client top-left); the kernel maps them to screen. */
+int gui_window_flip_rect(struct window *w, int rx, int ry, int rw, int rh);
+
 /* M27E: hint the compositor that a screen-coordinate region needs
  * presenting next frame. The compositor still does a correct full
  * repaint into the back buffer; the hint controls only how MUCH of

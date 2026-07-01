@@ -547,6 +547,18 @@ static long sys_gui_flip(int fd) {
     return gui_window_flip(f->win);
 }
 
+/* Per-widget dirty tracking: flip only a client-relative sub-rect.
+ * a2 = (x&0xFFFF)|(y<<16), a3 = (w&0xFFFF)|(h<<16), int16 client coords. */
+static long sys_gui_flip_rect(int fd, long a2, long a3) {
+    struct file *f = fd_lookup(fd);
+    if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+    int x = (int)(int16_t)(a2 & 0xFFFF);
+    int y = (int)(int16_t)((a2 >> 16) & 0xFFFF);
+    int w = (int)(int16_t)(a3 & 0xFFFF);
+    int h = (int)(int16_t)((a3 >> 16) & 0xFFFF);
+    return gui_window_flip_rect(f->win, x, y, w, h);
+}
+
 static long sys_gui_poll_event(int fd, struct gui_event *out) {
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
@@ -2862,6 +2874,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
                             (uint32_t)a4, (uint32_t)a5);
     case SYS_GUI_FLIP:
         return sys_gui_flip((int)a1);
+    case SYS_GUI_FLIP_RECT:
+        return sys_gui_flip_rect((int)a1, a2, a3);
     case SYS_GUI_POLL_EVENT:
         return sys_gui_poll_event((int)a1, (struct gui_event *)a2);
     case SYS_TERM_OPEN:
