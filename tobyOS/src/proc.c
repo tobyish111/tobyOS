@@ -260,6 +260,15 @@ struct proc *proc_ap_idle(uint32_t cpu, uint64_t kstack_top) {
     k->is_idle     = true;
     k->cwd[0] = '/'; k->cwd[1] = '\0';
     name_copy(k->name, "ap_idle", PROC_NAME_MAX);
+    /* An AP idle proc is pid-0 kernel context, exactly like the BSP's
+     * kernel_main. It must hold the same ADMIN blanket bypass so any
+     * kernel-invoked VFS/syscall path sails through cap_check -- notably
+     * the desktop launch queue (gui_tick -> drain_launch_queue), which
+     * vfs_stat/reads the app binary while running on whichever idle loop
+     * happens to be pumping the compositor. Without this, a launch that
+     * drained on an AP failed with "[cap] deny pid=0 'ap_idle' ... missing
+     * FILE_READ" and the app never started. */
+    cap_grant_admin(k);
     signal_init_proc(&k->sigstate);
     fpu_init_default(k->fpu_state);
     return k;
