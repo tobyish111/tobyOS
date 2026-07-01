@@ -238,6 +238,14 @@ const struct gfx_backend *gfx_get_backend(void);
 void gfx_mark_dirty_rect(int x, int y, int w, int h);
 void gfx_mark_dirty_full(void);
 
+/* Global clip rectangle: scope subsequent primitive drawing to a region
+ * (intersected with the screen). The compositor uses this to repaint only
+ * a damage rect. gfx_reset_clip() restores whole-screen drawing;
+ * gfx_get_clip() reports the active clip (false when none). */
+void gfx_set_clip(int x, int y, int w, int h);
+void gfx_reset_clip(void);
+bool gfx_get_clip(int *x, int *y, int *w, int *h);
+
 /* Test/diagnostic accessors -- the compositor doesn't need these but
  * the M27 test harness does. Returns false if no rect is currently
  * dirty (i.e. flip() would be a no-op present-wise). */

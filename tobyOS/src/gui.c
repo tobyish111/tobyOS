@@ -3197,9 +3197,21 @@ static void paint_wallpaper(void) {
         render_wallpaper_to_cache();
     }
 
-    /* Fast blit from cache -> backbuffer */
+    /* Fast blit from cache -> backbuffer. Under a partial compositor clip
+     * copy only the clipped sub-rect (the rest of the back buffer already
+     * holds the correct prior frame); otherwise blit the whole cache. */
     if (g.wp_cache) {
-        memcpy(gfx_backbuf(), g.wp_cache, (size_t)W * (size_t)H * 4);
+        uint32_t *bb = gfx_backbuf();
+        int cx, cy, cw, ch;
+        if (gfx_get_clip(&cx, &cy, &cw, &ch)) {
+            for (int row = cy; row < cy + ch; row++) {
+                memcpy(&bb[(size_t)row * W + cx],
+                       &g.wp_cache[(size_t)row * W + cx],
+                       (size_t)cw * 4);
+            }
+        } else {
+            memcpy(bb, g.wp_cache, (size_t)W * (size_t)H * 4);
+        }
     } else {
         gfx_clear(t->bg);
     }
@@ -4149,6 +4161,33 @@ static void compositor_pass(void) {
         g.direct_scanout_wid = 0;
     }
 
+    /* Damage-tracked compositing: scope the whole CPU paint to the
+     * invalidated region so a small change (a live counter, the cursor,
+     * a window flip) doesn't recomposite all of 1920x1080. Correctness
+     * relies only on the damage rect covering every change (it does --
+     * gui_window_flip/cursor/drag all invalidate) plus the back buffer
+     * persisting the prior frame (gfx_flip keeps it in sync). EXCEPTION:
+     * the opacity<255 fade blits in compositor_paint_one READ the back
+     * buffer and would double-blend under a partial clip, so force a full
+     * frame whenever any visible window is mid-fade. */
+    bool clip_set = false;
+    {
+        bool mid_fade = false;
+        for (struct window *w = g.z_top; w; w = w->z_next) {
+            if (w->state != GUI_WIN_MINIMIZED &&
+                w->opacity > 0 && w->opacity < 255) { mid_fade = true; break; }
+        }
+        if (mid_fade) gui_invalidate_full();
+        if (!g.inv_full && g.inv_w > 0 && g.inv_h > 0) {
+            uint64_t hint_area = (uint64_t)g.inv_w * (uint64_t)g.inv_h;
+            uint64_t full_area = (uint64_t)gfx_width() * (uint64_t)gfx_height();
+            if (full_area && hint_area * 100u < full_area * 95u) {
+                gfx_set_clip(g.inv_x, g.inv_y, g.inv_w, g.inv_h);
+                clip_set = true;
+            }
+        }
+    }
+
     const struct theme_palette *theme = theme_active();
     if (g.desktop_mode) {
         paint_wallpaper();
@@ -4221,6 +4260,10 @@ static void compositor_pass(void) {
      * through the scanout resource via gfx_flip(). */
     if (g.comp_mode == COMPOSITOR_GPU_ACCEL)
         gpu_accel_transfer_dirty();
+
+    /* Done painting: drop the clip so the present + flip run unclipped. */
+    if (clip_set) { gfx_reset_clip(); g.cmp_partial_frames++; }
+    else            g.cmp_full_frames++;
 
     perf_zone_end(PERF_Z_GUI_COMPOSITE, t_comp);
 

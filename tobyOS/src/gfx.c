@@ -73,6 +73,18 @@ static struct {
     int  dirty_x, dirty_y, dirty_w, dirty_h;
     bool dirty_full;
 
+    /* Global clip rectangle. When active, clip_rect() intersects every
+     * primitive's target rect with this, so the compositor can scope a
+     * whole paint pass to a damage region (damage-tracked compositing)
+     * without touching each draw call. Default = inactive (whole screen).
+     * Over-drawing outside the clip would only reproduce identical pixels
+     * on the persisted back buffer, so this is a perf lever, not a
+     * correctness dependency -- with the exception of read-modify-write
+     * blends that read the back buffer, which the caller must keep out of
+     * the clipped path (see gui.c mid-fade guard). */
+    bool clip_active;
+    int  clip_x, clip_y, clip_w, clip_h;
+
     /* M27E: per-flip statistics. Bumped from gfx_flip and exposed via
      * gfx_present_stats() so the compositor self-test can prove that
      * partial-present is actually shrinking the work the backend does
@@ -251,8 +263,9 @@ static inline void put_back(int x, int y, uint32_t color) {
     g.back[(uint32_t)y * g.width + (uint32_t)x] = color;
 }
 
-/* Clamp a (x, y, w, h) rect to the back buffer. Returns false if the
- * intersection is empty. Updates the rect in place. */
+/* Clamp a (x, y, w, h) rect to the back buffer AND the active clip rect
+ * (if any). Returns false if the intersection is empty. Updates the rect
+ * in place. */
 static bool clip_rect(int *x, int *y, int *w, int *h) {
     if (*w <= 0 || *h <= 0) return false;
     int x0 = *x, y0 = *y, x1 = *x + *w, y1 = *y + *h;
@@ -260,8 +273,43 @@ static bool clip_rect(int *x, int *y, int *w, int *h) {
     if (y0 < 0) y0 = 0;
     if (x1 > (int)g.width)  x1 = (int)g.width;
     if (y1 > (int)g.height) y1 = (int)g.height;
+    if (g.clip_active) {
+        if (x0 < g.clip_x)             x0 = g.clip_x;
+        if (y0 < g.clip_y)             y0 = g.clip_y;
+        if (x1 > g.clip_x + g.clip_w)  x1 = g.clip_x + g.clip_w;
+        if (y1 > g.clip_y + g.clip_h)  y1 = g.clip_y + g.clip_h;
+    }
     if (x1 <= x0 || y1 <= y0) return false;
     *x = x0; *y = y0; *w = x1 - x0; *h = y1 - y0;
+    return true;
+}
+
+/* Scope subsequent primitive drawing to a rectangle (intersected with
+ * the screen). Used by the compositor to repaint only a damage region.
+ * gfx_reset_clip() restores whole-screen drawing. */
+void gfx_set_clip(int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) { g.clip_active = false; return; }
+    int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int)g.width)  x1 = (int)g.width;
+    if (y1 > (int)g.height) y1 = (int)g.height;
+    if (x1 <= x0 || y1 <= y0) { g.clip_active = false; return; }
+    g.clip_x = x0; g.clip_y = y0;
+    g.clip_w = x1 - x0; g.clip_h = y1 - y0;
+    g.clip_active = true;
+}
+
+void gfx_reset_clip(void) { g.clip_active = false; }
+
+/* Report the active clip (false when none). Lets a direct back-buffer
+ * writer (e.g. paint_wallpaper's cache blit) scope itself to match. */
+bool gfx_get_clip(int *x, int *y, int *w, int *h) {
+    if (!g.clip_active) return false;
+    if (x) *x = g.clip_x;
+    if (y) *y = g.clip_y;
+    if (w) *w = g.clip_w;
+    if (h) *h = g.clip_h;
     return true;
 }
 
@@ -1005,7 +1053,21 @@ void gfx_flip(void) {
             next = g.back;
             g.active_buf = 0;
         }
-        memcpy(next, presented, (size_t)g.width * g.height * 4u);
+        /* Keep the two buffers in sync so incremental drawing is correct.
+         * `next` held the previous presented frame, and (frame N) = (frame
+         * N-1) + (damage), so on a PARTIAL present we only need to copy the
+         * damage rect. A full present (covers_all) re-syncs everything and
+         * is the safety net if damage tracking ever misses a region -- so a
+         * bug degrades to a stale region for one frame, never corruption. */
+        if (!covers_all && have_dirty && dw > 0 && dh > 0) {
+            for (int row = dy; row < dy + dh; row++) {
+                memcpy(&next[(size_t)row * g.width + dx],
+                       &presented[(size_t)row * g.width + dx],
+                       (size_t)dw * 4u);
+            }
+        } else {
+            memcpy(next, presented, (size_t)g.width * g.height * 4u);
+        }
         g.back = next;
     }
 }

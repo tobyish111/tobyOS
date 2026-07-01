@@ -144,8 +144,9 @@ reading live metrics and persisting settings via `SYS_SETTING_GET/SET`.
 ## Layer 3 — the compositor (src/gui.c)
 
 One global compositor owns a z-ordered doubly-linked `struct window` list
-(`g.z_top` = topmost = keyboard focus). Already implemented: dirty-rectangle
-tracking + `gui_invalidate_*` damage hints, double-buffering, window decorations,
+(`g.z_top` = topmost = keyboard focus). Already implemented: **damage-clipped
+compositing** (see below), dirty-rectangle tracking + `gui_invalidate_*` damage
+hints, double-buffering, window decorations,
 title-bar drag (`g.drag_win`), edge resize (`g.resize_win` + `RESIZE_BORDER`),
 snap zones (`g.snap_zone`), focus-blur, fade/minimize/restore animations
 (`anim_tick`), taskbar, launcher, and notification toasts. It is pumped by
@@ -188,6 +189,25 @@ IRQs disabled — on the UART. Fixes:
 - **Trace is opt-in** (`trace on`), no longer auto-enabled in
   `gui_set_desktop_mode()`.
 - The dead-NIC DHCP retry storm is capped (`net.c`) so it stops flooding the log.
+
+### Damage-clipped compositing
+`compositor_pass()` used to CPU-recomposite the whole screen (wallpaper + every
+window + chrome) on every dirty frame; only the front-buffer *present* was
+damage-limited. On a 1920×1080 WC framebuffer that full-screen paint per frame was
+the felt lag (a live task-manager counter or a cursor move cost a full recomposite).
+Now the compositor scopes the whole paint to the invalidated region:
+- `gfx.c` has a **global clip rect** (`gfx_set_clip`/`gfx_reset_clip`/`gfx_get_clip`)
+  honored by `clip_rect()`, through which every primitive already funnels — so one
+  clip scopes all drawing with no per-call changes.
+- `compositor_pass()` sets the clip to the `g.inv_*` damage rect on partial frames
+  (same partial-vs-full test as the present, `<95%` of screen). `paint_wallpaper()`'s
+  cache blit copies only the clipped sub-rect. The double-buffer sync in `gfx_flip()`
+  copies only the damage rect on partial flips (full copy on full flips = safety net).
+- Correctness: over-drawing outside the clip is harmless (deterministic paint on the
+  persisted back buffer), so this is a perf lever; the only hazard is the two
+  opacity<255 fade blits that *read* the back buffer, so any mid-fade window forces a
+  full frame. Verified in QEMU (post-login desktop stays pristine through many partial
+  frames + cursor sweeps, no artifacts).
 
 ## Unifying the three stacks
 
