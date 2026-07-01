@@ -196,9 +196,10 @@ static int igpu_probe_pci(void) {
                 g_igpu.bdf_valid = 1;
 
                 printk("[intel_gpu] found device %04x at %02x:%02x.%d "
-                       "gen=%d mmio=0x%llx size=0x%zx\n",
+                       "gen=%d mmio=0x%llx size=0x%llx\n",
                        device, bus, dev, func,
-                       g_igpu.gen, (unsigned long long)mmio_base, mmio_size);
+                       g_igpu.gen, (unsigned long long)mmio_base,
+                       (unsigned long long)mmio_size);
                 return 1;
             }
         }
@@ -532,9 +533,10 @@ void intel_gpu_gt_recon(void) {
         return;
     }
 
-    kprintf("[intel_gpu] GT recon: device=%04x gen=%d mmio=0x%llx size=0x%zx\n",
+    kprintf("[intel_gpu] GT recon: device=%04x gen=%d mmio=0x%llx size=0x%llx\n",
             g_igpu.device_id, g_igpu.gen,
-            (unsigned long long)g_igpu.mmio_phys, g_igpu.mmio_size);
+            (unsigned long long)g_igpu.mmio_phys,
+            (unsigned long long)g_igpu.mmio_size);
 
     /* --- Stolen memory + GGTT geometry, from PCI config (read-only). On
      * Gen8/9 MGGC0[15:8] encodes GGTT size, [7:6]+[15:8] encode stolen
