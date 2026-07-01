@@ -166,6 +166,14 @@ void     intel_gpu_gt_recon(void);
 #define FORCEWAKE_BLITTER_ACK   0x130044u
 #define FORCEWAKE_KERNEL_BIT    0          /* we drive bit 0 (mask<<16|val) */
 
+/* Gen7.5 (Haswell) forcewake: a SINGLE multi-threaded domain wakes render +
+ * blitter + media together (gen9 later split them). Same masked-write
+ * (mask<<16|val) protocol as gt_forcewake_get. The address happens to match
+ * FORCEWAKE_BLITTER_GEN9 -- gen9 reused it for its blitter domain -- but the
+ * semantics differ, so name it for gen7. */
+#define FORCEWAKE_MT_HSW        0x0A188u   /* Haswell FORCEWAKE_MT           */
+#define FORCEWAKE_ACK_HSW       0x130044u  /* Haswell forcewake ack          */
+
 /* Blitter Command Streamer (BCS) ring registers (gen8+ island base). */
 #define GEN8_BCS_RING_BASE      0x22000u
 #define RING_TAIL               0x30u
@@ -191,6 +199,10 @@ void     intel_gpu_gt_recon(void);
  * even though the command retires (ring head still advances). */
 #define MI_USE_GLOBAL_GTT       (1u << 22)
 #define MI_STORE_DWORD_IMM_GEN8 ((0x20u << 23) | MI_USE_GLOBAL_GTT | 2u)
+/* Gen7 MI_STORE_DWORD_IMM: the address is a SINGLE 32-bit dword (gen8 widened
+ * it to 64-bit / 2 dwords), so the command is 3 dwords total -> DWord Length 1
+ * (len = total_dwords - 2). Same 0x20 opcode + "Use Global GTT" bit. */
+#define MI_STORE_DWORD_IMM_GEN7 ((0x20u << 23) | MI_USE_GLOBAL_GTT | 1u)
 #define MI_BATCH_BUFFER_END     (0x0Au << 23)
 #define XY_COLOR_BLT_CMD        ((2u << 29) | (0x50u << 22) | 0x4u) /* + BPP */
 #define XY_SRC_COPY_BLT_CMD     ((2u << 29) | (0x53u << 22) | 0x6u)

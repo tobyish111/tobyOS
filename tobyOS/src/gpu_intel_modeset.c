@@ -639,9 +639,19 @@ static void gt_forcewake_put(uint32_t req_reg) {
 
 /* Install a 4 KiB page into the GGTT at byte offset `ggtt_off` (which is
  * also the GPU virtual address the engines will use). Gen8/9 PTEs are 8
- * bytes and live in the top half of BAR0. */
+ * bytes in the top half of BAR0; gen7 (IVB/HSW) PTEs are 4 bytes at
+ * GTT_BASE (2 MiB in), and pack the address' high bits [38:32] into PTE
+ * bits [11:4] (GEN6_PTE_ADDR_ENCODE) so pages above 4 GiB still map. */
 static void gt_ggtt_map(uint32_t ggtt_off, uint64_t phys) {
     uint32_t pte_index = ggtt_off >> 12;
+    if (g_igpu.gen == 7) {
+        volatile uint32_t *ggtt = (volatile uint32_t *)g_gt.ggtt_mmio;
+        ggtt[pte_index] = (uint32_t)((phys & 0xFFFFF000ull) |
+                                     ((phys >> 28) & 0xFF0ull) |
+                                     GTT_ENTRY_VALID);
+        (void)ggtt[pte_index];           /* posting read */
+        return;
+    }
     volatile uint64_t *ggtt = (volatile uint64_t *)g_gt.ggtt_mmio;
     ggtt[pte_index] = (phys & ~0xFFFull) | GEN8_GGTT_PTE_PRESENT;
     (void)ggtt[pte_index];               /* posting read */
@@ -687,15 +697,23 @@ static int gt_run_selftest(void) {
     g_gt.scratch_ggtt_off = 0x41000u;               /* next GGTT page */
     gt_ggtt_map(g_gt.scratch_ggtt_off, g_gt.scratch_phys);
 
-    /* Build the command stream at ring head 0. MI_STORE_DWORD_IMM (gen8)
-     * is: dword0=cmd, dword1:2=64-bit GT address, dword3=immediate. */
+    /* Build the command stream at ring head 0. MI_STORE_DWORD_IMM:
+     *   gen8: dword0=cmd, dword1:2=64-bit GT addr, dword3=immediate.
+     *   gen7: dword0=cmd, dword1=32-bit GT addr, dword2=immediate. */
     uint32_t *r = g_gt.ring_virt;
     int n = 0;
-    r[n++] = MI_STORE_DWORD_IMM_GEN8;
-    r[n++] = g_gt.scratch_ggtt_off;                 /* addr lo (GT VA) */
-    r[n++] = 0;                                      /* addr hi         */
-    r[n++] = GT_SELFTEST_MAGIC;                      /* immediate data  */
-    r[n++] = MI_NOOP;
+    if (g_igpu.gen == 7) {
+        r[n++] = MI_STORE_DWORD_IMM_GEN7;
+        r[n++] = g_gt.scratch_ggtt_off;             /* addr (GT VA)    */
+        r[n++] = GT_SELFTEST_MAGIC;                 /* immediate data  */
+        r[n++] = MI_NOOP;
+    } else {
+        r[n++] = MI_STORE_DWORD_IMM_GEN8;
+        r[n++] = g_gt.scratch_ggtt_off;             /* addr lo (GT VA) */
+        r[n++] = 0;                                 /* addr hi         */
+        r[n++] = GT_SELFTEST_MAGIC;                 /* immediate data  */
+        r[n++] = MI_NOOP;
+    }
     /* TAIL is a byte offset into the ring; must be 8-byte (qword) aligned. */
     uint32_t tail = (uint32_t)(n * 4);
     tail = (tail + 7u) & ~7u;
@@ -751,7 +769,49 @@ void intel_gt_init(void) {
         }
     }
 
-    /* Only gen8/gen9 GGTT/forcewake layout is implemented here. */
+    /* Gen7 (Ivy Bridge / Haswell, e.g. the EliteDesk HD 4600) path: 4-byte
+     * GGTT PTEs at GTT_BASE (2 MiB into the BAR), a single multi-threaded
+     * forcewake, and the 32-bit-address store command. Shares gt_ring_init /
+     * gt_run_selftest with gen8/9 (both are gen-dispatched). SAFETY is
+     * identical -- only forcewake/GGTT/ring/our pages, never pipe/plane/DPLL/
+     * VGA -- so a broken blitter leaves the Limine display untouched. */
+    if (g_igpu.gen == 7) {
+        size_t need = GTT_BASE + (64u << 10);   /* base + 64 KiB of PTEs */
+        if (g_igpu.mmio_size < need) {
+            kprintf("[intel_gpu] GT init (gen7): BAR0 size 0x%zx too small for "
+                    "GGTT (need >= 0x%zx) -- staying on Limine\n",
+                    g_igpu.mmio_size, need);
+            return;
+        }
+        g_gt.ggtt_mmio = (uint64_t)g_igpu.mmio + GTT_BASE;
+
+        int fw = gt_forcewake_get(FORCEWAKE_MT_HSW, FORCEWAKE_ACK_HSW);
+        g_gt.fw_render = g_gt.fw_blitter = fw;
+        kprintf("[intel_gpu] GT init (gen7): forcewake(MT)=%d\n", fw);
+        if (!fw) {
+            kprintf("[intel_gpu] GT init (gen7): forcewake failed -- aborting "
+                    "GT accel (display unaffected)\n");
+            return;
+        }
+
+        if (!gt_ring_init()) {
+            kprintf("[intel_gpu] GT init (gen7): BCS ring setup failed\n");
+            gt_forcewake_put(FORCEWAKE_MT_HSW);
+            return;
+        }
+        kprintf("[intel_gpu] GT init (gen7): BCS ring up (phys=0x%llx "
+                "gtt_off=0x%x ctl=0x%08x)\n",
+                (unsigned long long)g_gt.ring_phys, g_gt.ring_ggtt_off,
+                igpu_read(GEN8_BCS_RING_BASE + RING_CTL));
+
+        g_gt.selftest_ok = gt_run_selftest();
+        kprintf("[intel_gpu] GT init (gen7): self-test %s\n",
+                g_gt.selftest_ok ? "PASS -- blitter accel available"
+                                 : "FAIL -- staying on Limine compositor");
+        return;
+    }
+
+    /* Only gen7 (above) + gen8/gen9 GGTT/forcewake layouts are implemented. */
     if (g_igpu.gen < 8) {
         kprintf("[intel_gpu] GT init: gen %d < 8, GT accel unsupported "
                 "(display stays on Limine)\n", g_igpu.gen);
