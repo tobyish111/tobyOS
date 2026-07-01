@@ -537,13 +537,11 @@ static void smp_init_bsp(void) {
         irq_switch_to_ioapic();
     }
 
-    /* The IRQ facade is up: arm async (non-blocking) serial TX. COM1's
-     * THRE IRQ + a ring buffer replace the per-byte busy-wait that
-     * crippled the desktop on real hardware (every trace line stalled the
-     * CPU ~40 ms at 38400 baud, including from the mouse IRQ). Works in
-     * PIC or IO APIC mode; degrades safely if IRQ4 doesn't route (the
-     * idle-loop pump still drains the ring). */
-    serial_enable_tx_irq();
+    /* NB: async (non-blocking) serial TX is armed LATER, just before the
+     * idle loop -- see the serial_enable_tx_irq() call there. Boot logging
+     * stays on the bounded-spin sync path so the full boot log is captured
+     * without the ring dropping bytes during dense bursts (e.g. SMP
+     * bring-up); async only matters for the interactive desktop phase. */
 }
 
 /* Serial liveness heartbeat. Emitted from pid 0's idle loop, so it ticks
@@ -7757,6 +7755,16 @@ void _start(void) {
         #undef TW_PUMP
     }
 #endif
+
+    /* Boot init is done; the interactive desktop runs from idle_loop().
+     * Arm async (non-blocking) serial TX now: COM1's THRE IRQ + ring
+     * buffer replace the per-byte busy-wait that crippled the desktop on
+     * real hardware (every trace/log line stalled the CPU ~40 ms at 38400
+     * baud, including from the mouse IRQ). Deferring to here keeps the
+     * whole boot log on the reliable sync path. Works in PIC or IO APIC
+     * mode; degrades safely if IRQ4 doesn't route (the idle-loop pump in
+     * idle_loop() still drains the ring). */
+    serial_enable_tx_irq();
 
     idle_loop();
 }
