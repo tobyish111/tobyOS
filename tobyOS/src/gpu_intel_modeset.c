@@ -697,15 +697,26 @@ static int gt_run_selftest(void) {
     g_gt.scratch_ggtt_off = 0x41000u;               /* next GGTT page */
     gt_ggtt_map(g_gt.scratch_ggtt_off, g_gt.scratch_phys);
 
+    /* Diagnostic: read the scratch page's GGTT PTE back so a failed store
+     * can be attributed to the store COMMAND (PTE correct) vs the MAPPING
+     * (PTE wrong). gen7 PTEs are 4 bytes at GTT_BASE; gen8/9 are 8 bytes. */
+    if (g_igpu.gen == 7) {
+        volatile uint32_t *ggtt = (volatile uint32_t *)g_gt.ggtt_mmio;
+        kprintf("[intel_gpu] GT selftest: scratch phys=0x%llx off=0x%x "
+                "pte=0x%08x\n", (unsigned long long)g_gt.scratch_phys,
+                g_gt.scratch_ggtt_off, ggtt[g_gt.scratch_ggtt_off >> 12]);
+    }
+
     /* Build the command stream at ring head 0. MI_STORE_DWORD_IMM:
      *   gen8: dword0=cmd, dword1:2=64-bit GT addr, dword3=immediate.
      *   gen7: dword0=cmd, dword1=32-bit GT addr, dword2=immediate. */
     uint32_t *r = g_gt.ring_virt;
     int n = 0;
     if (g_igpu.gen == 7) {
-        r[n++] = MI_STORE_DWORD_IMM_GEN7;
-        r[n++] = g_gt.scratch_ggtt_off;             /* addr (GT VA)    */
-        r[n++] = GT_SELFTEST_MAGIC;                 /* immediate data  */
+        r[n++] = MI_STORE_DWORD_IMM_GEN7;           /* DW0 header (len 2) */
+        r[n++] = 0;                                 /* DW1 reserved       */
+        r[n++] = g_gt.scratch_ggtt_off;             /* DW2 addr (GT VA)   */
+        r[n++] = GT_SELFTEST_MAGIC;                 /* DW3 immediate data */
         r[n++] = MI_NOOP;
     } else {
         r[n++] = MI_STORE_DWORD_IMM_GEN8;

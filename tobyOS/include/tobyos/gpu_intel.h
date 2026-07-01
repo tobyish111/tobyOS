@@ -199,10 +199,14 @@ void     intel_gpu_gt_recon(void);
  * even though the command retires (ring head still advances). */
 #define MI_USE_GLOBAL_GTT       (1u << 22)
 #define MI_STORE_DWORD_IMM_GEN8 ((0x20u << 23) | MI_USE_GLOBAL_GTT | 2u)
-/* Gen7 MI_STORE_DWORD_IMM: the address is a SINGLE 32-bit dword (gen8 widened
- * it to 64-bit / 2 dwords), so the command is 3 dwords total -> DWord Length 1
- * (len = total_dwords - 2). Same 0x20 opcode + "Use Global GTT" bit. */
-#define MI_STORE_DWORD_IMM_GEN7 ((0x20u << 23) | MI_USE_GLOBAL_GTT | 1u)
+/* Gen4-7 MI_STORE_DWORD_IMM (a.k.a. MI_STORE_DWORD_IMM_GEN4): a 4-dword
+ * command -> DWord Length 2. Layout: DW0=header, DW1=reserved(0),
+ * DW2=address (32-bit GGTT byte offset, dword-aligned), DW3=data. (gen8
+ * later reused DW1/DW2 as the 64-bit addr low/high.) The earlier 3-dword
+ * length-1 form is the legacy gen2-3 encoding; on Haswell the engine
+ * retires it (ring drains) but drops the store -- the observed
+ * drained=1/scratch=0 -- so use the GEN4 form. */
+#define MI_STORE_DWORD_IMM_GEN7 ((0x20u << 23) | MI_USE_GLOBAL_GTT | 2u)
 #define MI_BATCH_BUFFER_END     (0x0Au << 23)
 #define XY_COLOR_BLT_CMD        ((2u << 29) | (0x50u << 22) | 0x4u) /* + BPP */
 #define XY_SRC_COPY_BLT_CMD     ((2u << 29) | (0x53u << 22) | 0x6u)
