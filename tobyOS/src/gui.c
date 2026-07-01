@@ -1744,6 +1744,11 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
     if (moved) {
         if (virtio_gpu_hw_cursor_available()) {
             virtio_gpu_hw_cursor_move(nx, ny);
+        } else if (gfx_hw_cursor_available()) {
+            /* Intel HW cursor plane (Stage-4 page-flip): a register poke, no
+             * invalidate/flip -- the pointer moves independently of the
+             * 60 Hz page-flip, so it stays smooth. */
+            gfx_hw_cursor_move(nx, ny);
         } else {
             gui_invalidate_rect(old_x, old_y, 12, 19);
             gui_invalidate_rect(nx,    ny,    12, 19);

@@ -149,6 +149,14 @@ uint32_t gfx_blend_pixel_argb(uint32_t dst_xrgb, uint32_t src_argb);
  * over any background. The compositor calls this last in each frame. */
 void gfx_draw_cursor(int x, int y);
 
+/* Hardware cursor plane query/move (Stage-4 Intel page-flip backend). When
+ * available, the compositor moves the pointer with gfx_hw_cursor_move()
+ * instead of invalidating + flipping -- keeping the mouse smooth under
+ * page-flipping. gfx_hw_cursor_available() is false for every other backend
+ * (they use the software overlay below). */
+bool gfx_hw_cursor_available(void);
+void gfx_hw_cursor_move(int x, int y);
+
 /* Fast software cursor overlay for the direct Limine framebuffer path.
  * These draw directly to scanout after saving/restoring the pixels under
  * the cursor, so pointer movement does not require a full compositor pass.

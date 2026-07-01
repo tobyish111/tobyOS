@@ -894,6 +894,21 @@ void gfx_draw_cursor(int x, int y) {
     gfx_mark_dirty_rect(x, y, CUR_W + 2, CUR_H + 2);
 }
 
+/* Stage-4 hardware cursor plane (src/gpu_intel_modeset.c). */
+int  intel_gt_cursor_active(void);
+void intel_gt_cursor_move(int x, int y);
+
+/* True when the active backend provides a hardware cursor plane (the Intel
+ * page-flip backend with its cursor plane up). The compositor uses this to
+ * move the pointer via a register poke instead of invalidating + flipping. */
+bool gfx_hw_cursor_available(void) {
+    return (g.backend == &g_backend_intel_flip) && intel_gt_cursor_active();
+}
+
+void gfx_hw_cursor_move(int x, int y) {
+    if (gfx_hw_cursor_available()) intel_gt_cursor_move(x, y);
+}
+
 static bool cursor_overlay_supported(void) {
     const struct gfx_backend *b = g.backend ? g.backend : &g_backend_limine;
     /* The overlay draws the cursor directly into the Limine scanout FB via
@@ -938,6 +953,9 @@ void gfx_cursor_overlay_show(int x, int y) {
      * flipped frame. */
     g_cursor_overlay.x = x;
     g_cursor_overlay.y = y;
+    /* Hardware cursor plane: just reposition it (keeps it synced after each
+     * flip and handles the initial position). */
+    if (gfx_hw_cursor_available()) { gfx_hw_cursor_move(x, y); return; }
     if (!cursor_overlay_supported()) return;
     for (int i = 0; i < CUR_W * CUR_H; i++) {
         g_cursor_overlay.saved[i] = 0;
@@ -967,12 +985,10 @@ void gfx_cursor_overlay_show(int x, int y) {
 }
 
 void gfx_cursor_overlay_move(int x, int y) {
-    if (!cursor_overlay_supported()) {
-        /* Page-flip backend: just track the position (composited on flip). */
-        g_cursor_overlay.x = x;
-        g_cursor_overlay.y = y;
-        return;
-    }
+    g_cursor_overlay.x = x;
+    g_cursor_overlay.y = y;
+    if (gfx_hw_cursor_available()) { gfx_hw_cursor_move(x, y); return; }
+    if (!cursor_overlay_supported()) return;   /* SW-in-frame: tracked above */
     gfx_cursor_overlay_hide();
     gfx_cursor_overlay_show(x, y);
 }

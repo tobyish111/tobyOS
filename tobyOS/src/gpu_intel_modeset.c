@@ -1338,6 +1338,65 @@ static void gt_flip_draw_cursor(uint32_t *buf, uint32_t w, uint32_t h,
     }
 }
 
+/* ---- Hardware cursor plane -------------------------------------------
+ * The display composites a 64x64 ARGB cursor over the primary plane at
+ * scanout, independent of the page-flip -- so moving the pointer is a single
+ * CUR_A_POS register write, NOT a compositor flip. This is what makes the
+ * mouse smooth under page-flipping (the software overlay pokes the scanout
+ * FB, which the page-flip no longer scans). Separate plane from the pipe/
+ * DPLL, so a wrong cursor can't blackscreen -- worst case it doesn't show
+ * (and we fall back to compositing the cursor into the flipped frame). */
+#define GT_HWCUR_OFF   0x20000000u   /* cursor BO GGTT offset (512 MiB in) */
+static struct {
+    uint64_t phys; uint32_t *virt; uint32_t ggtt; int ready;
+} g_hwcur;
+
+static int intel_gt_cursor_setup(void) {
+    g_hwcur.phys = pmm_alloc_pages(4);              /* 64x64x4 = 16 KiB */
+    if (!g_hwcur.phys) return 0;
+    g_hwcur.virt = (uint32_t *)pmm_phys_to_virt(g_hwcur.phys);
+    g_hwcur.ggtt = GT_HWCUR_OFF;
+    memset(g_hwcur.virt, 0, 4u * 4096u);            /* fully transparent */
+
+    /* Rasterise the arrow into the top-left of the 64x64 ARGB image
+     * (0xAARRGGBB): opaque black outline, opaque white fill, else clear. */
+    for (int dy = 0; dy < GT_CUR_H; dy++) {
+        const char *row = g_flip_cursor[dy];
+        for (int dx = 0; dx < GT_CUR_W && row[dx]; dx++) {
+            if      (row[dx] == '#') g_hwcur.virt[dy * 64 + dx] = 0xFF000000u;
+            else if (row[dx] == '.') g_hwcur.virt[dy * 64 + dx] = 0xFFFFFFFFu;
+        }
+    }
+    gt_clflush_range(g_hwcur.virt, 4u * 4096u);
+    for (uint32_t p = 0; p < 4; p++)
+        gt_ggtt_map(g_hwcur.ggtt + p * 4096u, g_hwcur.phys + (uint64_t)p * 4096u);
+
+    /* Program pipe-A's cursor plane: 64x64 ARGB, base = GGTT offset. */
+    igpu_write(CUR_A_CTL, CUR_MODE_64_ARGB);
+    igpu_write(CUR_A_BASE, g_hwcur.ggtt);           /* base write latches it */
+    (void)igpu_read(CUR_A_BASE);
+    igpu_write(CUR_A_POS, 0);
+    (void)igpu_read(CUR_A_POS);
+
+    kprintf("[intel_gpu] Stage4: HW cursor plane enabled (ggtt=0x%x "
+            "ctl=0x%08x base=0x%08x)\n", g_hwcur.ggtt,
+            igpu_read(CUR_A_CTL), igpu_read(CUR_A_BASE));
+    g_hwcur.ready = 1;
+    return 1;
+}
+
+int intel_gt_cursor_active(void) { return g_hwcur.ready; }
+
+void intel_gt_cursor_move(int x, int y) {
+    if (!g_hwcur.ready) return;
+    uint32_t pos = 0;
+    if (x < 0) pos |= (1u << 15) | ((uint32_t)(-x) & 0x7FFFu);
+    else       pos |=              ((uint32_t)x  & 0x7FFFu);
+    if (y < 0) pos |= (1u << 31) | (((uint32_t)(-y) & 0x7FFFu) << 16);
+    else       pos |=              (((uint32_t)y  & 0x7FFFu) << 16);
+    igpu_write(CUR_A_POS, pos);
+}
+
 int intel_gt_flip_setup(void) {
     if (!g_gt.selftest_ok || !g_igpu.mmio) return 0;
     if (g_igpu.gen != 7) {
@@ -1413,6 +1472,13 @@ int intel_gt_flip_setup(void) {
             "orig 0x%x, %ux%u pitch=%u)\n",
             g_flip.buf[0].ggtt, g_flip.buf[1].ggtt, g_flip.orig_surf,
             g_flip.width, g_flip.height, g_flip.pitch);
+
+    /* Bring up the hardware cursor plane so pointer motion is a register
+     * poke instead of a full flip. Best-effort: if it fails we composite the
+     * cursor into the flipped frame instead (slower, but visible). */
+    if (!intel_gt_cursor_setup())
+        kprintf("[intel_gpu] Stage4: HW cursor setup failed -- compositing "
+                "cursor into the frame (pointer motion will flip)\n");
     return 1;
 }
 
@@ -1442,6 +1508,10 @@ int intel_gt_flip_present(const uint32_t *back, uint32_t back_w, uint32_t back_h
     uint32_t pitch = g_flip.pitch;
     uint32_t last  = g_flip.width * g_flip.height - 1u;   /* bottom-right px */
     const uint32_t MAGIC = 0xDEAD1234u;
+    /* The hardware cursor plane composites the pointer independently; only
+     * when it's unavailable do we draw the cursor into the frame (and then
+     * need the sentinel to order it after the async blit). */
+    int sw_cursor = (!g_hwcur.ready && cur_visible);
 
     /* Flush the whole source so the blitter's uncached read is fresh. (A
      * dirty-rect + damage-accumulation optimisation is a future step; the
@@ -1450,8 +1520,10 @@ int intel_gt_flip_present(const uint32_t *back, uint32_t back_w, uint32_t back_h
 
     /* Sentinel: poison the dest's last pixel so we can tell when the blit's
      * (async) writes have actually landed, before we draw the cursor on top. */
-    g_flip.buf[off].virt[last] = MAGIC;
-    gt_clflush_range(&g_flip.buf[off].virt[last], 4);
+    if (sw_cursor) {
+        g_flip.buf[off].virt[last] = MAGIC;
+        gt_clflush_range(&g_flip.buf[off].virt[last], 4);
+    }
 
     if (gt_emit_blit(g_flip.buf[off].ggtt, pitch, 0, 0,
                      src_base, g_flip.width * 4u, 0, 0,
@@ -1459,17 +1531,19 @@ int intel_gt_flip_present(const uint32_t *back, uint32_t back_w, uint32_t back_h
         return -1;
     if (!gt_ring_drain(GT_PRESENT_DRAIN_MAX)) { gt_flip_revert(); return -1; }
 
-    /* Wait for the blit to fully land (writes retire in order, so the last
-     * pixel losing the sentinel means the frame is complete in DRAM), then
-     * composite the cursor -- so late blit writes can't erase it. */
-    for (int i = 0; i < 100000; i++) {
-        gt_clflush_range(&g_flip.buf[off].virt[last], 4);
-        if (g_flip.buf[off].virt[last] != MAGIC) break;
-        for (volatile int j = 0; j < 50; j++) {}
-    }
-    if (cur_visible)
+    /* Software-cursor fallback: wait for the blit to fully land (writes retire
+     * in order, so the last pixel losing the sentinel means the frame is
+     * complete in DRAM), then composite the cursor so late blit writes can't
+     * erase it. */
+    if (sw_cursor) {
+        for (int i = 0; i < 100000; i++) {
+            gt_clflush_range(&g_flip.buf[off].virt[last], 4);
+            if (g_flip.buf[off].virt[last] != MAGIC) break;
+            for (volatile int j = 0; j < 50; j++) {}
+        }
         gt_flip_draw_cursor(g_flip.buf[off].virt, g_flip.width, g_flip.height,
                             cur_x, cur_y);
+    }
 
     /* Arm the flip and wait (bounded) for the pipe to latch the new surface. */
     igpu_write(PLANE_A_SURF, g_flip.buf[off].ggtt);

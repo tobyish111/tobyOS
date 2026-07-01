@@ -253,6 +253,13 @@ int      intel_gt_flip_present(const uint32_t *back, uint32_t back_w,
                                uint32_t back_h, int cur_x, int cur_y,
                                int cur_visible);
 
+/* Hardware cursor plane (brought up by intel_gt_flip_setup). With it active,
+ * pointer motion is a single CUR_A_POS register write -- no compositor flip --
+ * which keeps the mouse smooth under page-flipping. intel_gt_cursor_active()
+ * is 1 once the plane is up; intel_gt_cursor_move() repositions it. */
+int      intel_gt_cursor_active(void);
+void     intel_gt_cursor_move(int x, int y);
+
 /* ---- Stage 4 (deferred): hardware page-flip via PLANE_SURF ----
  * The display plane scans through the GGTT, so a tear-free flip would just
  * repoint PLANE_SURF at a GGTT offset (no timing/DPLL/format change). The
