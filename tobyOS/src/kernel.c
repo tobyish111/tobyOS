@@ -3559,8 +3559,18 @@ void _start(void) {
          * memcpy as an automatic per-flip fallback. NEVER programs the
          * pipe/plane/DPLL, so it can't blackscreen the box. No-op off real
          * Intel gen7 HW (self-test flag is 0 in QEMU). */
-        if (intel_gt_selftest_ok() && intel_gt_present_setup())
+        if (intel_gt_selftest_ok() && intel_gt_present_setup()) {
             gfx_use_intel_backend();
+
+            /* i915-lite Stage 4: tear-free hardware page-flip. Preferred over
+             * the Stage-3 blit when its (safe, auto-restoring) flip self-test
+             * proves the mechanism; otherwise we keep the Stage-3 blit armed
+             * above. Only pokes the plane's surface-address register (latched
+             * at vblank) -- never pipe/DPLL -- and a runtime flip failure
+             * reverts to the CPU present. No-op off real gen7 HW. */
+            if (intel_gt_flip_setup())
+                gfx_use_intel_flip_backend();
+        }
 
         mouse_init();
         gui_init();

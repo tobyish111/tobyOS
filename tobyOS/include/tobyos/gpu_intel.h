@@ -237,6 +237,22 @@ int      intel_gt_present_setup(void);
 int      intel_gt_present_rect(const uint32_t *back, uint32_t back_w,
                                uint32_t back_h, int x, int y, int w, int h);
 
+/* ---- Stage 4 (i915-lite): tear-free hardware page-flip -----------------
+ * Double-buffers the scanout: intel_gt_flip_setup() allocates two dedicated
+ * GGTT-mapped scanout buffers and validates the flip mechanism with a safe,
+ * auto-restoring self-test (flip to a scratch buffer, confirm PLANE_A_SURFLIVE
+ * tracks it, restore the Limine FB). Returns 1 when the page-flip is armed, 0
+ * to stay on the Stage-3 blit path. intel_gt_flip_present() then blits the
+ * full frame into the off-screen buffer (compositing the cursor, since the
+ * scanout is no longer the Limine FB the software overlay pokes) and retargets
+ * PLANE_A_SURF at vblank -- tear-free. Returns 0 on success or negative on any
+ * failure (a failed flip restores the Limine FB, so the caller's CPU fallback
+ * targets the live surface). Gen7 only; QEMU no-op. */
+int      intel_gt_flip_setup(void);
+int      intel_gt_flip_present(const uint32_t *back, uint32_t back_w,
+                               uint32_t back_h, int cur_x, int cur_y,
+                               int cur_visible);
+
 /* ---- Stage 4 (deferred): hardware page-flip via PLANE_SURF ----
  * The display plane scans through the GGTT, so a tear-free flip would just
  * repoint PLANE_SURF at a GGTT offset (no timing/DPLL/format change). The

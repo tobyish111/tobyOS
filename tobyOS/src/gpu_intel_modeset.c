@@ -19,6 +19,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/pit.h>
 #include <tobyos/gfx.h>
+#include <tobyos/perf.h>
 
 #define printk kprintf
 
@@ -1240,6 +1241,246 @@ int intel_gt_present_rect(const uint32_t *back, uint32_t back_w, uint32_t back_h
                 "present, reverting to Limine CPU copy\n");
         return -1;
     }
+    return 0;
+}
+
+/* ======================================================================
+ * Stage 4: tear-free hardware page-flip (double-buffered PLANE_A_SURF)
+ *
+ * Stage 3 blits into the LIVE scanout (tears, like the CPU memcpy did).
+ * Stage 4 gives the display its OWN pair of buffers: each frame we blit the
+ * full compositor frame into the OFF-screen buffer (never the one being
+ * scanned), then retarget PLANE_A_SURF at it -- the hardware latches the new
+ * surface at vblank, so the swap is tear-free. We touch ONLY the plane's
+ * surface-address register (double-buffered, latched at vblank) -- never the
+ * pipe/DPLL/timings -- so it cannot re-modeset or blackscreen.
+ *
+ * SAFETY: the flip is armed only after a self-test proves the mechanism --
+ * flip the scanout to a scratch buffer, confirm PLANE_A_SURFLIVE tracks it,
+ * then RESTORE the original Limine FB and confirm SURFLIVE tracks back. If
+ * either doesn't latch (the gen9 attempt hung here on an UNBOUNDED vblank
+ * wait -- ours is bounded by perf_now_ns), we stay on the Stage-3 blit path.
+ * A runtime flip that fails to latch trips a watchdog that restores the
+ * Limine FB and reverts to the CPU present. Gen7 only; QEMU no-op.
+ * ====================================================================== */
+
+/* Dedicated scanout buffers live high in the GGTT, clear of the firmware
+ * scanout (offset 0, ~8 MiB), the ring/scratch (0x40000..0x60000), and the
+ * Stage-3 source cache (1 GiB+). */
+#define GT_FLIP_BUF0_OFF   0x10000000u   /* 256 MiB into the GGTT */
+#define GT_FLIP_BUF1_OFF   0x18000000u   /* 384 MiB into the GGTT */
+/* Bounded vblank/flip-latch wait (real time, not spins -- the gen9 hang was
+ * an unbounded spin). A flip latches within one refresh (~16 ms @ 60 Hz). */
+#define GT_FLIP_LATCH_NS   80000000ull   /* 80 ms */
+
+static struct {
+    int      ready;             /* page-flip present armed                */
+    int      disabled;          /* a flip watchdog retired it            */
+    int      selftest_ok;       /* SURFLIVE tracked a test flip + restore*/
+    uint32_t orig_surf;         /* the Limine FB's GGTT offset (restore) */
+    int      front;             /* index scanned now: -1=orig FB, 0/1=buf*/
+    uint32_t width, height, pitch;   /* scanout geometry (pitch in bytes)*/
+    uint32_t size_pages;        /* per-buffer size in 4 KiB pages        */
+    struct { uint64_t phys; uint32_t *virt; uint32_t ggtt; } buf[2];
+    uint64_t flip_count;
+} g_flip;
+
+/* 12x19 arrow, drawn into the off-screen buffer each present (the scanout is
+ * no longer the Limine FB the software overlay pokes). Mirrors gfx.c's. */
+#define GT_CUR_W 12
+#define GT_CUR_H 19
+static const char g_flip_cursor[GT_CUR_H][GT_CUR_W + 1] = {
+    "#           ", "##          ", "#.#         ", "#..#        ",
+    "#...#       ", "#....#      ", "#.....#     ", "#......#    ",
+    "#.......#   ", "#........#  ", "#.........# ", "#......#####",
+    "#...##.#    ", "#..# #.#    ", "#.#  #.#    ", "##    #.#   ",
+    "      #.#   ", "       #.#  ", "       ###  ",
+};
+
+/* Poll PLANE_A_SURFLIVE (the address the pipe is CURRENTLY scanning) until it
+ * equals `want` (page-granular) or `timeout_ns` elapses. Bounded by real time
+ * so a plane that never latches can't hang the box. Returns 1 on latch. */
+static int gt_wait_surflive(uint32_t want, uint64_t timeout_ns,
+                            uint64_t *elapsed_ns) {
+    uint64_t t0 = perf_now_ns();
+    want &= ~0xFFFu;
+    for (;;) {
+        uint32_t live = igpu_read(PLANE_A_SURFLIVE) & ~0xFFFu;
+        uint64_t dt = perf_now_ns() - t0;
+        if (live == want)      { if (elapsed_ns) *elapsed_ns = dt; return 1; }
+        if (dt > timeout_ns)   { if (elapsed_ns) *elapsed_ns = dt; return 0; }
+    }
+}
+
+/* Draw the arrow opaquely into a linear XRGB buffer (no shadow/blend -- a
+ * blend would have to read the buffer the GT just wrote asynchronously), then
+ * flush the touched rows so the (uncached) scanout sees the cursor. */
+static void gt_flip_draw_cursor(uint32_t *buf, uint32_t w, uint32_t h,
+                                int cx, int cy) {
+    for (int dy = 0; dy < GT_CUR_H; dy++) {
+        int py = cy + dy;
+        if (py < 0 || py >= (int)h) continue;
+        const char *row = g_flip_cursor[dy];
+        int minx = -1, maxx = -1;
+        for (int dx = 0; dx < GT_CUR_W && row[dx]; dx++) {
+            int px = cx + dx;
+            if (px < 0 || px >= (int)w) continue;
+            char c = row[dx];
+            if      (c == '#') buf[(uint32_t)py * w + (uint32_t)px] = 0x00000000u;
+            else if (c == '.') buf[(uint32_t)py * w + (uint32_t)px] = 0x00FFFFFFu;
+            else continue;
+            if (minx < 0) minx = px;
+            maxx = px;
+        }
+        if (minx >= 0)
+            gt_clflush_range(&buf[(uint32_t)py * w + (uint32_t)minx],
+                             (size_t)(maxx - minx + 1) * 4u);
+    }
+}
+
+int intel_gt_flip_setup(void) {
+    if (!g_gt.selftest_ok || !g_igpu.mmio) return 0;
+    if (g_igpu.gen != 7) {
+        kprintf("[intel_gpu] Stage4: gen %d page-flip not implemented "
+                "(gen7 only)\n", g_igpu.gen);
+        return 0;
+    }
+    if (!gfx_ready()) return 0;
+
+    memset(&g_flip, 0, sizeof(g_flip));
+    g_flip.front     = -1;                       /* still on the Limine FB */
+    g_flip.orig_surf = igpu_read(PLANE_A_SURF) & ~0xFFFu;
+    g_flip.pitch     = igpu_read(PLANE_A_STRIDE);
+    g_flip.width     = gfx_width();
+    g_flip.height    = gfx_height();
+    if (g_flip.pitch < g_flip.width * 4u || g_flip.pitch > 0x7FFFu) {
+        kprintf("[intel_gpu] Stage4: scanout stride %u out of range -- "
+                "no page-flip\n", g_flip.pitch);
+        return 0;
+    }
+    g_flip.size_pages = (g_flip.pitch * g_flip.height + 0xFFFu) / 4096u;
+
+    uint32_t bases[2] = { GT_FLIP_BUF0_OFF, GT_FLIP_BUF1_OFF };
+    for (int i = 0; i < 2; i++) {
+        g_flip.buf[i].phys = pmm_alloc_pages(g_flip.size_pages);
+        if (!g_flip.buf[i].phys) {
+            kprintf("[intel_gpu] Stage4: OOM allocating scanout buffer %d "
+                    "(%u pages) -- no page-flip\n", i, g_flip.size_pages);
+            return 0;
+        }
+        g_flip.buf[i].virt = (uint32_t *)pmm_phys_to_virt(g_flip.buf[i].phys);
+        g_flip.buf[i].ggtt = bases[i];
+        for (uint32_t p = 0; p < g_flip.size_pages; p++)
+            gt_ggtt_map(g_flip.buf[i].ggtt + p * 4096u,
+                        g_flip.buf[i].phys + (uint64_t)p * 4096u);
+        memset(g_flip.buf[i].virt, 0, (size_t)g_flip.size_pages * 4096u);
+        gt_clflush_range(g_flip.buf[i].virt, (size_t)g_flip.size_pages * 4096u);
+    }
+
+    /* --- Flip self-test: flip to buf[0], confirm SURFLIVE tracks, restore.
+     * buf[0] is black; content is irrelevant -- we only test that writing
+     * PLANE_A_SURF actually moves the scanout and that SURFLIVE reports it.
+     * Always restore to the original FB so the boot console stays visible. */
+    uint32_t live0 = igpu_read(PLANE_A_SURFLIVE);
+    uint64_t t_flip = 0, t_restore = 0;
+
+    igpu_write(PLANE_A_SURF, g_flip.buf[0].ggtt);
+    (void)igpu_read(PLANE_A_SURF);
+    int flipped = gt_wait_surflive(g_flip.buf[0].ggtt, GT_FLIP_LATCH_NS, &t_flip);
+
+    igpu_write(PLANE_A_SURF, g_flip.orig_surf);
+    (void)igpu_read(PLANE_A_SURF);
+    int restored = gt_wait_surflive(g_flip.orig_surf, GT_FLIP_LATCH_NS, &t_restore);
+
+    kprintf("[intel_gpu] Stage4: flip self-test surflive0=0x%08x  "
+            "flip->buf0 latched=%d (%llu us)  restore->orig latched=%d "
+            "(%llu us)\n",
+            live0, flipped, (unsigned long long)(t_flip / 1000),
+            restored, (unsigned long long)(t_restore / 1000));
+
+    if (!flipped || !restored) {
+        /* Make certain we're back on the original FB, then decline. */
+        igpu_write(PLANE_A_SURF, g_flip.orig_surf);
+        (void)igpu_read(PLANE_A_SURF);
+        kprintf("[intel_gpu] Stage4: flip self-test FAILED -- staying on "
+                "Stage-3 blit present\n");
+        return 0;
+    }
+
+    g_flip.selftest_ok = 1;
+    g_flip.ready       = 1;
+    kprintf("[intel_gpu] Stage4: page-flip ARMED (bufs GTVA 0x%x/0x%x, "
+            "orig 0x%x, %ux%u pitch=%u)\n",
+            g_flip.buf[0].ggtt, g_flip.buf[1].ggtt, g_flip.orig_surf,
+            g_flip.width, g_flip.height, g_flip.pitch);
+    return 1;
+}
+
+/* Restore the scanout to the Limine FB and disable the page-flip path (called
+ * when a flip fails to latch). Because a failed flip never left the current
+ * front, the CPU limine present then targets the correct live surface. */
+static void gt_flip_revert(void) {
+    igpu_write(PLANE_A_SURF, g_flip.orig_surf);
+    (void)igpu_read(PLANE_A_SURF);
+    gt_wait_surflive(g_flip.orig_surf, GT_FLIP_LATCH_NS, NULL);   /* best effort */
+    g_flip.disabled = 1;
+    g_flip.front    = -1;
+    kprintf("[intel_gpu] Stage4: flip watchdog -- scanout restored to Limine "
+            "FB (0x%x), page-flip disabled\n", g_flip.orig_surf);
+}
+
+int intel_gt_flip_present(const uint32_t *back, uint32_t back_w, uint32_t back_h,
+                          int cur_x, int cur_y, int cur_visible) {
+    if (!g_flip.ready || g_flip.disabled) return -1;
+    if (!back || back_w != g_flip.width || back_h != g_flip.height) return -1;
+
+    int off = (g_flip.front == 0) ? 1 : 0;   /* -1->0, 0->1, 1->0 (ping-pong) */
+
+    uint32_t src_base = gt_src_map(back, back_w, back_h);
+    if (!src_base) return -1;
+
+    uint32_t pitch = g_flip.pitch;
+    uint32_t last  = g_flip.width * g_flip.height - 1u;   /* bottom-right px */
+    const uint32_t MAGIC = 0xDEAD1234u;
+
+    /* Flush the whole source so the blitter's uncached read is fresh. (A
+     * dirty-rect + damage-accumulation optimisation is a future step; the
+     * full-frame blit keeps the two buffers trivially consistent.) */
+    gt_clflush_range(back, (size_t)g_flip.width * g_flip.height * 4u);
+
+    /* Sentinel: poison the dest's last pixel so we can tell when the blit's
+     * (async) writes have actually landed, before we draw the cursor on top. */
+    g_flip.buf[off].virt[last] = MAGIC;
+    gt_clflush_range(&g_flip.buf[off].virt[last], 4);
+
+    if (gt_emit_blit(g_flip.buf[off].ggtt, pitch, 0, 0,
+                     src_base, g_flip.width * 4u, 0, 0,
+                     (int)g_flip.width, (int)g_flip.height) < 0)
+        return -1;
+    if (!gt_ring_drain(GT_PRESENT_DRAIN_MAX)) { gt_flip_revert(); return -1; }
+
+    /* Wait for the blit to fully land (writes retire in order, so the last
+     * pixel losing the sentinel means the frame is complete in DRAM), then
+     * composite the cursor -- so late blit writes can't erase it. */
+    for (int i = 0; i < 100000; i++) {
+        gt_clflush_range(&g_flip.buf[off].virt[last], 4);
+        if (g_flip.buf[off].virt[last] != MAGIC) break;
+        for (volatile int j = 0; j < 50; j++) {}
+    }
+    if (cur_visible)
+        gt_flip_draw_cursor(g_flip.buf[off].virt, g_flip.width, g_flip.height,
+                            cur_x, cur_y);
+
+    /* Arm the flip and wait (bounded) for the pipe to latch the new surface. */
+    igpu_write(PLANE_A_SURF, g_flip.buf[off].ggtt);
+    (void)igpu_read(PLANE_A_SURF);
+    if (!gt_wait_surflive(g_flip.buf[off].ggtt, GT_FLIP_LATCH_NS, NULL)) {
+        gt_flip_revert();
+        return -1;
+    }
+
+    g_flip.front = off;
+    g_flip.flip_count++;
     return 0;
 }
 

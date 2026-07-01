@@ -44,6 +44,11 @@ static int  limine_describe(char *extra, int cap);
  * below). Forward-declared here so the cursor-overlay support check can
  * recognise it as a direct-scanout backend. */
 static const struct gfx_backend g_backend_intel;
+/* The Stage-4 Intel GT page-flip backend (also below). It scans its OWN
+ * buffers, not the Limine FB, so the software cursor overlay can't reach the
+ * scanout -- the backend composites the cursor into the flipped frame
+ * instead. Forward-declared so cursor_overlay_supported() excludes it. */
+static const struct gfx_backend g_backend_intel_flip;
 
 /* M27B: Limine framebuffer backend. The default. Implements the full
  * gfx_backend ABI (flip + present_rect + describe). present_rect lets
@@ -928,10 +933,12 @@ void gfx_cursor_overlay_hide(void) {
 }
 
 void gfx_cursor_overlay_show(int x, int y) {
-    if (!cursor_overlay_supported()) return;
-
+    /* Always record the position: the Stage-4 page-flip backend disables the
+     * direct-scanout overlay but reads this to composite the cursor into the
+     * flipped frame. */
     g_cursor_overlay.x = x;
     g_cursor_overlay.y = y;
+    if (!cursor_overlay_supported()) return;
     for (int i = 0; i < CUR_W * CUR_H; i++) {
         g_cursor_overlay.saved[i] = 0;
         g_cursor_overlay.valid[i] = 0;
@@ -960,7 +967,12 @@ void gfx_cursor_overlay_show(int x, int y) {
 }
 
 void gfx_cursor_overlay_move(int x, int y) {
-    if (!cursor_overlay_supported()) return;
+    if (!cursor_overlay_supported()) {
+        /* Page-flip backend: just track the position (composited on flip). */
+        g_cursor_overlay.x = x;
+        g_cursor_overlay.y = y;
+        return;
+    }
     gfx_cursor_overlay_hide();
     gfx_cursor_overlay_show(x, y);
 }
@@ -1128,6 +1140,55 @@ static const struct gfx_backend g_backend_intel = {
 
 void gfx_use_intel_backend(void) {
     gfx_set_backend(&g_backend_intel);
+}
+
+/* ---- Stage 4: Intel GT tear-free page-flip backend ----------------
+ *
+ * Presents by blitting the whole back buffer into an off-screen scanout
+ * buffer and retargeting the display plane at vblank (see
+ * src/gpu_intel_modeset.c). Because the scanout is no longer the Limine FB,
+ * the cursor is composited into the flipped frame from the tracked overlay
+ * position. Any per-flip failure restores the Limine FB and returns negative,
+ * so we fall through to the universal CPU present. The page-flip always
+ * presents the entire frame, so present_rect is handled as a full flip. */
+int intel_gt_flip_present(const uint32_t *back, uint32_t back_w,
+                          uint32_t back_h, int cur_x, int cur_y,
+                          int cur_visible);
+
+static void intel_flip_flip(void) {
+    if (intel_gt_flip_present(g.back, g.width, g.height,
+                              g_cursor_overlay.x, g_cursor_overlay.y, 1) == 0)
+        return;
+    limine_flip();   /* watchdog restored the Limine FB -- CPU present to it */
+}
+
+static void intel_flip_present_rect(int x, int y, int w, int h) {
+    (void)x; (void)y; (void)w; (void)h;
+    if (intel_gt_flip_present(g.back, g.width, g.height,
+                              g_cursor_overlay.x, g_cursor_overlay.y, 1) == 0)
+        return;
+    /* On fallback repaint the WHOLE Limine FB: a partial push would leave the
+     * (stale, unused-while-flipping) FB corrupt outside the dirty rect. */
+    limine_flip();
+}
+
+static int intel_flip_describe(char *extra, int cap) {
+    if (!extra || cap <= 0) return 0;
+    return ksnprintf(extra, (size_t)cap,
+                     "intel-gt-flip (fallback=limine-fb) fb_pitch_px=%u",
+                     g.fb_pitch_px);
+}
+
+static const struct gfx_backend g_backend_intel_flip = {
+    .flip            = intel_flip_flip,
+    .present_rect    = intel_flip_present_rect,
+    .describe        = intel_flip_describe,
+    .name            = "intel-gt-flip",
+    .bytes_per_pixel = 4,
+};
+
+void gfx_use_intel_flip_backend(void) {
+    gfx_set_backend(&g_backend_intel_flip);
 }
 
 void gfx_set_backend(const struct gfx_backend *backend) {

@@ -230,6 +230,13 @@ const struct gfx_backend *gfx_get_backend(void);
  * GPU and falls back to the Limine CPU memcpy on any per-flip failure. */
 void                      gfx_use_intel_backend(void);
 
+/* Stage 4 (i915-lite): install the Intel GT tear-free page-flip backend.
+ * Call ONLY after intel_gt_flip_setup() has returned 1. Presents via a
+ * full-frame blit into an off-screen buffer + vblank-latched PLANE_A_SURF
+ * flip; composites the cursor into the frame; falls back to the Limine CPU
+ * present (after restoring the Limine FB) on any per-flip failure. */
+void                      gfx_use_intel_flip_backend(void);
+
 /* ---- region invalidation (groundwork for M27E) -------------------
  *
  * Drawing primitives mark the union of every rect they touch since the
