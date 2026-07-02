@@ -598,7 +598,17 @@ static __attribute__((noreturn)) void idle_loop(void) {
             mouse_flush_pending();                                     \
         } while (0)
 
+    /* Idle power: spin (poll fast) while the desktop is doing visible work,
+     * then hlt once it's been quiet for a grace window so we stop pinning the
+     * core at 100%. "Visible work" = the compositor presented a frame this
+     * iteration (gfx_frame_count changed); animations/drags keep it changing
+     * so we keep spinning, but a static desktop settles into hlt. See the
+     * wait at the bottom of the loop. */
+    uint64_t last_active_tick = pit_ticks();
+    const uint64_t IDLE_GRACE_TICKS = 30;    /* ~30 ms at the 1 kHz PIT */
+
     for (;;) {
+        uint64_t frames_before = gfx_frame_count();
 #ifndef NO_SERIAL_HEARTBEAT
         /* Serial-only liveness beat, emitted at the TOP of the loop --
          * before the GUI/service phases -- so the last beat pinpoints
@@ -674,14 +684,38 @@ static __attribute__((noreturn)) void idle_loop(void) {
          * even on boards where COM1's legacy IRQ4 never routes. */
         serial_tx_pump();
 
+        /* If the compositor presented a frame this iteration, the desktop is
+         * doing visible work -- stay hot. */
+        uint64_t now = pit_ticks();
+        if (gfx_frame_count() != frames_before)
+            last_active_tick = now;
+
         /*
-         * Critical:
+         * Idle vs busy wait.
          *
-         * If xHCI interrupts are enabled, hlt is good.
-         * If xHCI is polling-only, hlt makes USB HID PIT-limited and
-         * mouse movement becomes chunky.
+         * BUSY (recent visible work): `pause` and loop again immediately --
+         * bit-identical to the old always-spin behaviour, so animations,
+         * drags, and polled-USB HID stay maximally responsive.
+         *
+         * IDLE (no frame for IDLE_GRACE_TICKS ms): `sti; hlt` to stop pinning
+         * the core. Any device IRQ -- PS/2/BIOS-legacy mouse+kbd (IRQ12/IRQ1),
+         * xHCI, NIC -- or the 1 kHz PIT / 100 Hz LAPIC timer wakes us within
+         * <=1 ms, so input, animation restart, and net resume promptly; the
+         * next iteration re-evaluates and drops back to spinning. hlt runs
+         * with the BKL released (all phases above exit it), so APs are never
+         * blocked. The sti/hlt pairing is the race-free idiom: sti's one-
+         * instruction delay lets hlt commit before interrupts re-enable.
+         *
+         * (The old code always spun -- via `pause` -- to keep xHCI-polling-
+         * only boards' HID smooth. That's preserved for the BUSY case; on
+         * such a board, genuine idle means no HID activity anyway, and the
+         * first movement wakes us via the PIT within 1 ms, after which the
+         * grace window keeps us spinning through the motion.)
          */
-         __asm__ __volatile__("pause");
+        if ((now - last_active_tick) >= IDLE_GRACE_TICKS)
+            __asm__ __volatile__("sti; hlt");
+        else
+            __asm__ __volatile__("pause");
     }
 
     #undef SERVICE_INPUT
