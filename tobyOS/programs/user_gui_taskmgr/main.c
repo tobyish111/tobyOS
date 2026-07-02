@@ -15,6 +15,7 @@
 
 #define SYS_CLOCK_MS       48
 #define SYS_SVC_LIST       65
+#define SYS_HWINFO         67
 #define SYS_SYSTEM_METRICS 74
 #define SYS_KILL           75
 
@@ -48,6 +49,23 @@ struct abi_system_metrics {
     uint32_t net_packets_per_s, net_up, net_ip_be, tsc_mhz, _reserved[9];
 };
 
+/* Mirror of the kernel-frozen struct abi_hwinfo_summary (SYS_HWINFO, 192 B).
+ * Static hardware identity read once from CPUID/SMP -- lets the monitor name
+ * the actual CPU + core count of the machine it booted on, not a guess. */
+struct abi_hwinfo_summary {
+    char     cpu_vendor[16];       /* "GenuineIntel"                     */
+    char     cpu_brand[48];        /* "Intel(R) Core(TM) i5-4590 ..."    */
+    uint32_t cpu_count;            /* logical CPUs detected (all cores)  */
+    uint32_t cpu_family, cpu_model, cpu_stepping, cpu_features, _pad0;
+    uint64_t mem_total_pages, mem_used_pages, mem_free_pages;
+    uint16_t pci_count, usb_count, blk_count, input_count;
+    uint16_t audio_count, battery_count, hub_count, display_count;
+    uint64_t boot_uptime_ms, snapshot_epoch;
+    uint32_t kernel_abi_ver, safe_mode;
+    char     profile_hint[16];
+    uint64_t _reserved[3];
+};
+
 /* ---- syscall stubs (data only; drawing is via TobyTK) ---------------- */
 static inline long sc0(long n){long r;__asm__ volatile("syscall":"=a"(r):"0"(n):"rcx","r11","memory");return r;}
 static inline long sc1(long n,long a){long r;__asm__ volatile("syscall":"=a"(r):"0"(n),"D"(a):"rcx","r11","memory");return r;}
@@ -55,6 +73,7 @@ static inline long sc2(long n,long a,long b){long r;__asm__ volatile("syscall":"
 static long sys_clock_ms(void){ return sc0(SYS_CLOCK_MS); }
 static long sys_svc_list(struct abi_service_info *o,uint32_t cap){ return sc2(SYS_SVC_LIST,(long)o,(long)cap); }
 static long sys_system_metrics(struct abi_system_metrics *o){ return sc1(SYS_SYSTEM_METRICS,(long)o); }
+static long sys_hwinfo(struct abi_hwinfo_summary *o){ return sc1(SYS_HWINFO,(long)o); }
 static long sys_kill(int pid){ return sc1(SYS_KILL,(long)pid); }
 
 /* ---- tiny helpers ---------------------------------------------------- */
@@ -85,6 +104,8 @@ enum { TAB_PROCESSES, TAB_PERFORMANCE, TAB_SERVICES };
 static struct abi_service_info  g_svcs[MAX_SVCS];
 static int  g_svc_count;
 static struct abi_system_metrics g_metrics;
+static struct abi_hwinfo_summary g_hw;   /* static CPU/machine identity */
+static int  g_hw_ok;
 static int  g_tab;
 static uint32_t g_cpu_hist[HISTORY_LEN], g_ram_hist[HISTORY_LEN];
 static int g_hist_idx, g_hist_filled;
@@ -92,6 +113,11 @@ static int g_hist_idx, g_hist_filled;
 static void refresh_data(void) {
     my_memset(&g_metrics, 0, sizeof(g_metrics));
     sys_system_metrics(&g_metrics);
+    /* CPU/machine identity is static -- fetch once. */
+    if (!g_hw_ok) {
+        my_memset(&g_hw, 0, sizeof(g_hw));
+        if (sys_hwinfo(&g_hw) == 0) g_hw_ok = 1;
+    }
     my_memset(g_svcs, 0, sizeof(g_svcs));
     long n = sys_svc_list(g_svcs, MAX_SVCS);
     g_svc_count = (n > 0) ? (int)n : 0;
@@ -177,7 +203,11 @@ static void perf_paint(struct tk_window *w,struct tk_widget *c){
     int lx=ox+20, y=oy+12, rx=ox+360;
     char buf[64];
 
-    tk_draw_text(w,lx,y,"CPU Usage",COL_ACCENT,15,1); y+=22;
+    { int p=str_append(buf,0,"CPU Usage");
+      if(g_hw_ok){ p=str_append(buf,p," ("); p=str_append_uint(buf,p,g_hw.cpu_count);
+                   p=str_append(buf,p,g_hw.cpu_count==1?" core)":" cores)"); }
+      buf[p]='\0'; }
+    tk_draw_text(w,lx,y,buf,COL_ACCENT,15,1); y+=22;
     { int p=str_append_uint(buf,0,g_metrics.cpu_pct); buf[p++]='%'; buf[p]='\0'; }
     tk_draw_text(w,lx,y,buf,COL_GREEN,15,0);
     draw_bar(w,lx+60,y,250,12,g_metrics.cpu_pct,COL_GREEN); y+=24;
@@ -193,6 +223,14 @@ static void perf_paint(struct tk_window *w,struct tk_widget *c){
 
     int sy=oy+12;
     tk_draw_text(w,rx,sy,"System Info",COL_ACCENT,15,1); sy+=24;
+    /* Real CPU identity for THIS machine (CPUID/SMP via SYS_HWINFO). */
+    if(g_hw_ok){
+        tk_draw_text(w,rx,sy,g_hw.cpu_brand[0]?g_hw.cpu_brand:"CPU: (unknown)",COL_TEXT,12,0); sy+=18;
+        { int p=str_append(buf,0,"Cores:   "); p=str_append_uint(buf,p,g_hw.cpu_count);
+          if(g_metrics.tsc_mhz){ p=str_append(buf,p,"  @ "); p=str_append_uint(buf,p,g_metrics.tsc_mhz); p=str_append(buf,p," MHz"); }
+          buf[p]='\0'; }
+        tk_draw_text(w,rx,sy,buf,COL_TEXT,13,0); sy+=24;
+    }
     { int p=str_append(buf,0,"Uptime:  "); char u[32]; format_uptime(u,g_metrics.uptime_ms); p=str_append(buf,p,u); buf[p]='\0'; }
     tk_draw_text(w,rx,sy,buf,COL_TEXT,13,0); sy+=20;
     { int p=str_append(buf,0,"Pages:   "); p=str_append_uint64(buf,p,g_metrics.used_pages); p=str_append(buf,p," / "); p=str_append_uint64(buf,p,g_metrics.total_pages); buf[p]='\0'; }
