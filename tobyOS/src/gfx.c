@@ -1169,19 +1169,20 @@ void gfx_use_intel_backend(void) {
  * presents the entire frame, so present_rect is handled as a full flip. */
 int intel_gt_flip_present(const uint32_t *back, uint32_t back_w,
                           uint32_t back_h, int cur_x, int cur_y,
-                          int cur_visible);
+                          int cur_visible, int dx, int dy, int dw, int dh);
 
 static void intel_flip_flip(void) {
     if (intel_gt_flip_present(g.back, g.width, g.height,
-                              g_cursor_overlay.x, g_cursor_overlay.y, 1) == 0)
+                              g_cursor_overlay.x, g_cursor_overlay.y, 1,
+                              0, 0, (int)g.width, (int)g.height) == 0)
         return;
     limine_flip();   /* watchdog restored the Limine FB -- CPU present to it */
 }
 
 static void intel_flip_present_rect(int x, int y, int w, int h) {
-    (void)x; (void)y; (void)w; (void)h;
     if (intel_gt_flip_present(g.back, g.width, g.height,
-                              g_cursor_overlay.x, g_cursor_overlay.y, 1) == 0)
+                              g_cursor_overlay.x, g_cursor_overlay.y, 1,
+                              x, y, w, h) == 0)
         return;
     /* On fallback repaint the WHOLE Limine FB: a partial push would leave the
      * (stale, unused-while-flipping) FB corrupt outside the dirty rect. */

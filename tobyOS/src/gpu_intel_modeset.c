@@ -1248,12 +1248,21 @@ int intel_gt_present_rect(const uint32_t *back, uint32_t back_w, uint32_t back_h
  * Stage 4: tear-free hardware page-flip (double-buffered PLANE_A_SURF)
  *
  * Stage 3 blits into the LIVE scanout (tears, like the CPU memcpy did).
- * Stage 4 gives the display its OWN pair of buffers: each frame we blit the
- * full compositor frame into the OFF-screen buffer (never the one being
- * scanned), then retarget PLANE_A_SURF at it -- the hardware latches the new
- * surface at vblank, so the swap is tear-free. We touch ONLY the plane's
- * surface-address register (double-buffered, latched at vblank) -- never the
- * pipe/DPLL/timings -- so it cannot re-modeset or blackscreen.
+ * Stage 4 gives the display its OWN pair of buffers and page-flips between
+ * them: each frame we blit only the DIRTY region into the OFF-screen buffer
+ * (never the one being scanned), then retarget PLANE_A_SURF at it -- the
+ * hardware latches the new surface at vblank, so the swap is tear-free. We
+ * touch ONLY the plane's surface-address register (double-buffered, latched
+ * at vblank) -- never the pipe/DPLL/timings -- so it cannot re-modeset or
+ * blackscreen.
+ *
+ * PERF: (1) dirty-rect blit -- because each buffer is two flips stale when we
+ * return to it, we blit the union of the last two frames' damage, not the
+ * whole frame (the first two flips prime both buffers full). (2) pipelined
+ * flip -- we arm the flip and return WITHOUT busy-waiting for vblank; the
+ * next present waits for the previous flip to latch (bounded) before it
+ * touches the buffer that flip moved away from. So the compositor isn't
+ * blocked ~16 ms per frame, and window drags blit only the damaged pixels.
  *
  * SAFETY: the flip is armed only after a self-test proves the mechanism --
  * flip the scanout to a scratch buffer, confirm PLANE_A_SURFLIVE tracks it,
@@ -1283,6 +1292,10 @@ static struct {
     uint32_t size_pages;        /* per-buffer size in 4 KiB pages        */
     struct { uint64_t phys; uint32_t *virt; uint32_t ggtt; } buf[2];
     uint64_t flip_count;
+    /* Previous present's dirty rect. Each buffer is 2 flips stale when we
+     * come back to it, so a dirty-rect present blits the union of the last
+     * two frames' damage (dirty_{N} u dirty_{N+1}) to bring it current. */
+    int      prev_dx, prev_dy, prev_dw, prev_dh;
 } g_flip;
 
 /* 12x19 arrow, drawn into the off-screen buffer each present (the scanout is
@@ -1495,66 +1508,120 @@ static void gt_flip_revert(void) {
             "FB (0x%x), page-flip disabled\n", g_flip.orig_surf);
 }
 
+/* Bounding-box union of (*x,*y,*w,*h) with (ax,ay,aw,ah), result in place. */
+static void gt_rect_union(int *x, int *y, int *w, int *h,
+                          int ax, int ay, int aw, int ah) {
+    if (aw <= 0 || ah <= 0) return;
+    if (*w <= 0 || *h <= 0) { *x = ax; *y = ay; *w = aw; *h = ah; return; }
+    int x0 = *x < ax ? *x : ax;
+    int y0 = *y < ay ? *y : ay;
+    int x1 = (*x + *w) > (ax + aw) ? (*x + *w) : (ax + aw);
+    int y1 = (*y + *h) > (ay + ah) ? (*y + *h) : (ay + ah);
+    *x = x0; *y = y0; *w = x1 - x0; *h = y1 - y0;
+}
+
 int intel_gt_flip_present(const uint32_t *back, uint32_t back_w, uint32_t back_h,
-                          int cur_x, int cur_y, int cur_visible) {
+                          int cur_x, int cur_y, int cur_visible,
+                          int dx, int dy, int dw, int dh) {
     if (!g_flip.ready || g_flip.disabled) return -1;
     if (!back || back_w != g_flip.width || back_h != g_flip.height) return -1;
 
     int off = (g_flip.front == 0) ? 1 : 0;   /* -1->0, 0->1, 1->0 (ping-pong) */
 
-    uint32_t src_base = gt_src_map(back, back_w, back_h);
-    if (!src_base) return -1;
-
-    uint32_t pitch = g_flip.pitch;
-    uint32_t last  = g_flip.width * g_flip.height - 1u;   /* bottom-right px */
-    const uint32_t MAGIC = 0xDEAD1234u;
-    /* The hardware cursor plane composites the pointer independently; only
-     * when it's unavailable do we draw the cursor into the frame (and then
-     * need the sentinel to order it after the async blit). */
-    int sw_cursor = (!g_hwcur.ready && cur_visible);
-
-    /* Flush the whole source so the blitter's uncached read is fresh. (A
-     * dirty-rect + damage-accumulation optimisation is a future step; the
-     * full-frame blit keeps the two buffers trivially consistent.) */
-    gt_clflush_range(back, (size_t)g_flip.width * g_flip.height * 4u);
-
-    /* Sentinel: poison the dest's last pixel so we can tell when the blit's
-     * (async) writes have actually landed, before we draw the cursor on top. */
-    if (sw_cursor) {
-        g_flip.buf[off].virt[last] = MAGIC;
-        gt_clflush_range(&g_flip.buf[off].virt[last], 4);
-    }
-
-    if (gt_emit_blit(g_flip.buf[off].ggtt, pitch, 0, 0,
-                     src_base, g_flip.width * 4u, 0, 0,
-                     (int)g_flip.width, (int)g_flip.height) < 0)
-        return -1;
-    if (!gt_ring_drain(GT_PRESENT_DRAIN_MAX)) { gt_flip_revert(); return -1; }
-
-    /* Software-cursor fallback: wait for the blit to fully land (writes retire
-     * in order, so the last pixel losing the sentinel means the frame is
-     * complete in DRAM), then composite the cursor so late blit writes can't
-     * erase it. */
-    if (sw_cursor) {
-        for (int i = 0; i < 100000; i++) {
-            gt_clflush_range(&g_flip.buf[off].virt[last], 4);
-            if (g_flip.buf[off].virt[last] != MAGIC) break;
-            for (volatile int j = 0; j < 50; j++) {}
-        }
-        gt_flip_draw_cursor(g_flip.buf[off].virt, g_flip.width, g_flip.height,
-                            cur_x, cur_y);
-    }
-
-    /* Arm the flip and wait (bounded) for the pipe to latch the new surface. */
-    igpu_write(PLANE_A_SURF, g_flip.buf[off].ggtt);
-    (void)igpu_read(PLANE_A_SURF);
-    if (!gt_wait_surflive(g_flip.buf[off].ggtt, GT_FLIP_LATCH_NS, NULL)) {
+    /* Pipelined flip: before touching buf[off] (the surface the PREVIOUS flip
+     * moved away from), wait -- bounded -- for that flip to have latched, so
+     * we never blit into a buffer the pipe is still scanning. On the first
+     * present the front is the Limine FB (orig_surf), already live. A stuck
+     * flip is caught here (one present later) and reverts. */
+    uint32_t front_ggtt = (g_flip.front < 0) ? g_flip.orig_surf
+                                             : g_flip.buf[g_flip.front].ggtt;
+    if (!gt_wait_surflive(front_ggtt, GT_FLIP_LATCH_NS, NULL)) {
         gt_flip_revert();
         return -1;
     }
 
+    uint32_t src_base = gt_src_map(back, back_w, back_h);
+    if (!src_base) return -1;
+
+    uint32_t pitch = g_flip.pitch;
+    const uint32_t MAGIC = 0xDEAD1234u;
+    /* The hardware cursor plane composites the pointer independently; only
+     * when it's unavailable do we draw the cursor into the frame (and then
+     * need the sentinel to order it after the async blit, and a full-frame
+     * blit so the cursor's old position elsewhere in this stale buffer is
+     * overwritten). */
+    int sw_cursor = (!g_hwcur.ready && cur_visible);
+
+    /* Blit region: the union of this frame's dirty rect and the previous
+     * present's (buf[off] is two flips stale). Prime both buffers with a full
+     * blit for the first two flips; force full for the SW-cursor path. */
+    int rx, ry, rw, rh;
+    if (sw_cursor || g_flip.flip_count < 2) {
+        rx = 0; ry = 0; rw = (int)g_flip.width; rh = (int)g_flip.height;
+    } else {
+        rx = dx; ry = dy; rw = dw; rh = dh;
+        gt_rect_union(&rx, &ry, &rw, &rh,
+                      g_flip.prev_dx, g_flip.prev_dy,
+                      g_flip.prev_dw, g_flip.prev_dh);
+    }
+    /* Clamp to the surface; fall back to full on anything degenerate. */
+    if (rx < 0) { rw += rx; rx = 0; }
+    if (ry < 0) { rh += ry; ry = 0; }
+    if (rx + rw > (int)g_flip.width)  rw = (int)g_flip.width  - rx;
+    if (ry + rh > (int)g_flip.height) rh = (int)g_flip.height - ry;
+    if (rw <= 0 || rh <= 0) { rx = 0; ry = 0; rw = (int)g_flip.width; rh = (int)g_flip.height; }
+
+    /* Flush the source region rows so the blitter's uncached read is fresh. */
+    for (int r = 0; r < rh; r++)
+        gt_clflush_range((const uint8_t *)back
+                         + (size_t)(ry + r) * g_flip.width * 4u
+                         + (size_t)rx * 4u,
+                         (size_t)rw * 4u);
+
+    /* Sentinel: poison the blit region's bottom-right pixel (written LAST in
+     * raster order). Because we arm the flip WITHOUT then waiting for vblank,
+     * we must confirm the blit's async writes have fully landed first -- else
+     * a vblank that fires mid-blit would latch a partial frame (tear). The
+     * old blocking code got this for free from its post-arm SURFLIVE wait. */
+    uint32_t region_last = (uint32_t)(ry + rh - 1) * g_flip.width
+                         + (uint32_t)(rx + rw - 1);
+    g_flip.buf[off].virt[region_last] = MAGIC;
+    gt_clflush_range(&g_flip.buf[off].virt[region_last], 4);
+
+    if (gt_emit_blit(g_flip.buf[off].ggtt, pitch, rx, ry,
+                     src_base, g_flip.width * 4u, rx, ry, rw, rh) < 0)
+        return -1;
+    if (!gt_ring_drain(GT_PRESENT_DRAIN_MAX)) { gt_flip_revert(); return -1; }
+
+    /* Wait (bounded) for the blit to land -- the region's last pixel losing
+     * the sentinel means the whole region is in DRAM. Cheap for a small drag
+     * rect (settles in ~microseconds); this REPLACES the old ~16 ms vblank
+     * busy-wait rather than adding to it. */
+    for (int i = 0; i < 100000; i++) {
+        gt_clflush_range(&g_flip.buf[off].virt[region_last], 4);
+        if (g_flip.buf[off].virt[region_last] != MAGIC) break;
+        for (volatile int j = 0; j < 50; j++) {}
+    }
+
+    /* SW-cursor fallback: composite the pointer on top of the (now-landed)
+     * frame. The HW cursor plane handles this independently otherwise. */
+    if (sw_cursor)
+        gt_flip_draw_cursor(g_flip.buf[off].virt, g_flip.width, g_flip.height,
+                            cur_x, cur_y);
+
+    /* Arm the flip and return WITHOUT waiting for the vblank latch -- the pipe
+     * latches on its own, and the NEXT present's pre-blit wait enforces the
+     * buffer-reuse ordering. This is what keeps the compositor from busy-
+     * waiting a full refresh every frame. */
+    igpu_write(PLANE_A_SURF, g_flip.buf[off].ggtt);
+    (void)igpu_read(PLANE_A_SURF);
+
     g_flip.front = off;
     g_flip.flip_count++;
+    /* Record THIS frame's actual dirty rect (not the widened blit region) for
+     * the next present's union. */
+    g_flip.prev_dx = dx; g_flip.prev_dy = dy;
+    g_flip.prev_dw = dw; g_flip.prev_dh = dh;
     return 0;
 }
 

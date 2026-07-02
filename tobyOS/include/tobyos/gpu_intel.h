@@ -251,7 +251,7 @@ int      intel_gt_present_rect(const uint32_t *back, uint32_t back_w,
 int      intel_gt_flip_setup(void);
 int      intel_gt_flip_present(const uint32_t *back, uint32_t back_w,
                                uint32_t back_h, int cur_x, int cur_y,
-                               int cur_visible);
+                               int cur_visible, int dx, int dy, int dw, int dh);
 
 /* Hardware cursor plane (brought up by intel_gt_flip_setup). With it active,
  * pointer motion is a single CUR_A_POS register write -- no compositor flip --
