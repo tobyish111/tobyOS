@@ -19,6 +19,9 @@
 #include <tobyos/perf.h>
 #include <tobyos/net.h>
 #include <tobyos/klibc.h>
+#include <tobyos/smp.h>
+#include <tobyos/percpu.h>
+#include <tobyos/abi/abi.h>
 
 struct sysmon_state {
     bool     have_prev;
@@ -40,6 +43,13 @@ struct sysmon_state {
     uint32_t gui_fps;
     uint32_t vfs_ops_per_s;
     uint32_t net_packets_per_s;
+
+    /* Per-core usage sampler state (diffed against the percpu tick counters
+     * each sysmon window). core_pct[i] is core i's utilisation 0-100. */
+    uint64_t prev_cpu_busy[MAX_CPUS];
+    uint64_t prev_cpu_total[MAX_CPUS];
+    uint8_t  core_pct[MAX_CPUS];
+    uint32_t core_count;
 
     struct abi_system_metrics last;
 };
@@ -168,6 +178,29 @@ void sysmon_sample(struct abi_system_metrics *out) {
         if (dnpk && g_sysmon.net_pct == 0) g_sysmon.net_pct = 1;
     }
 
+    /* Per-core utilisation: diff each CPU's busy/total tick counters (bumped
+     * by sched_tick at 100 Hz) over this window. Independent of the aggregate
+     * above; uses have_prev the same way (first call just records prevs). */
+    {
+        uint32_t ncpu = smp_cpu_count();
+        if (ncpu > MAX_CPUS) ncpu = MAX_CPUS;
+        g_sysmon.core_count = ncpu;
+        for (uint32_t i = 0; i < ncpu; i++) {
+            const struct percpu *pc = smp_cpu(i);
+            uint64_t busy  = pc ? pc->sched_busy_ticks : 0;
+            uint64_t total = pc ? pc->timer_ticks      : 0;
+            if (g_sysmon.have_prev) {
+                uint64_t db = busy  - g_sysmon.prev_cpu_busy[i];
+                uint64_t dt = total - g_sysmon.prev_cpu_total[i];
+                uint64_t p  = dt ? (db * 100ull) / dt : 0;
+                if (p > 100ull) p = 100ull;
+                g_sysmon.core_pct[i] = (uint8_t)p;
+            }
+            g_sysmon.prev_cpu_busy[i]  = busy;
+            g_sysmon.prev_cpu_total[i] = total;
+        }
+    }
+
     g_sysmon.prev_ns          = now_ns;
     g_sysmon.prev_cpu_user_ns = snap.cpu_user_ns;
     g_sysmon.prev_syscalls    = snap.total_syscalls;
@@ -199,4 +232,16 @@ void sysmon_snapshot(struct abi_system_metrics *out) {
         return;
     }
     *out = g_sysmon.last;
+}
+
+/* Copy the last-computed per-core utilisation into `out` (0-100 per core).
+ * Returns the number of cores written. Reads the values sysmon_sample()
+ * last computed -- the desktop/task-manager samples metrics right before
+ * this, so they're fresh. */
+uint32_t sysmon_cpu_pcts(uint8_t *out, uint32_t max) {
+    uint32_t n = g_sysmon.core_count;
+    if (n > max) n = max;
+    for (uint32_t i = 0; i < n; i++)
+        out[i] = g_sysmon.core_pct[i];
+    return n;
 }

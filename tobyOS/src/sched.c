@@ -584,7 +584,15 @@ void sched_idle(void) {
 
 void sched_tick(struct regs *r) {
     struct percpu *me = smp_this_cpu();
-    if (me) me->timer_ticks++;
+    if (me) {
+        me->timer_ticks++;
+        /* Per-core usage sampler: this tick caught the core doing real work
+         * unless the interrupted proc was its idle task (pid 0 / ap_idle).
+         * Sampled here -- before the ring-3-only preempt guard below -- so
+         * idle (kernel-mode) ticks are counted in the denominator too. */
+        struct proc *c = me->current;
+        if (c && !c->is_idle) me->sched_busy_ticks++;
+    }
     /* M28C: count scheduler-tick events as heartbeats too. */
     wdog_kick_sched();
 

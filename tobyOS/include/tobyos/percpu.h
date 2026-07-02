@@ -80,8 +80,15 @@ struct percpu {
     spinlock_t      ready_lock;
 
     /* Count of LAPIC timer interrupts taken on this CPU. Mostly a
-     * "is the timer alive" diagnostic for the `cpus` shell command. */
+     * "is the timer alive" diagnostic for the `cpus` shell command.
+     * Also the "total samples" denominator for per-core CPU usage. */
     uint64_t        timer_ticks;
+
+    /* Statistical per-core usage: subset of timer_ticks where this CPU was
+     * running real work (not its idle task) when the tick fired. sysmon
+     * diffs (busy, total=timer_ticks) over its sample window to get the
+     * per-core utilisation % shown by the task manager. */
+    uint64_t        sched_busy_ticks;
 
     /* Self-pointer (== &g_percpu[cpu_idx]). Each CPU's GS base points at
      * its own struct percpu, so once GS is installed on every core,

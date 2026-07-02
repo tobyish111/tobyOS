@@ -18,6 +18,7 @@
 #define SYS_HWINFO         67
 #define SYS_SYSTEM_METRICS 74
 #define SYS_KILL           75
+#define SYS_CPU_STATS      168
 
 #define ABI_SVC_NAME_MAX 16
 #define ABI_SVC_PATH_MAX 64
@@ -66,6 +67,14 @@ struct abi_hwinfo_summary {
     uint64_t _reserved[3];
 };
 
+/* Mirror of the kernel-frozen struct abi_cpu_stats (SYS_CPU_STATS, 64 B). */
+struct abi_cpu_stats {
+    uint32_t cpu_count;         /* valid entries in busy_pct[]        */
+    uint32_t _pad;
+    uint8_t  busy_pct[32];      /* per-core busy %, 0-100             */
+    uint8_t  _reserved[24];
+};
+
 /* ---- syscall stubs (data only; drawing is via TobyTK) ---------------- */
 static inline long sc0(long n){long r;__asm__ volatile("syscall":"=a"(r):"0"(n):"rcx","r11","memory");return r;}
 static inline long sc1(long n,long a){long r;__asm__ volatile("syscall":"=a"(r):"0"(n),"D"(a):"rcx","r11","memory");return r;}
@@ -74,6 +83,7 @@ static long sys_clock_ms(void){ return sc0(SYS_CLOCK_MS); }
 static long sys_svc_list(struct abi_service_info *o,uint32_t cap){ return sc2(SYS_SVC_LIST,(long)o,(long)cap); }
 static long sys_system_metrics(struct abi_system_metrics *o){ return sc1(SYS_SYSTEM_METRICS,(long)o); }
 static long sys_hwinfo(struct abi_hwinfo_summary *o){ return sc1(SYS_HWINFO,(long)o); }
+static long sys_cpu_stats(struct abi_cpu_stats *o){ return sc1(SYS_CPU_STATS,(long)o); }
 static long sys_kill(int pid){ return sc1(SYS_KILL,(long)pid); }
 
 /* ---- tiny helpers ---------------------------------------------------- */
@@ -106,13 +116,16 @@ static int  g_svc_count;
 static struct abi_system_metrics g_metrics;
 static struct abi_hwinfo_summary g_hw;   /* static CPU/machine identity */
 static int  g_hw_ok;
+static struct abi_cpu_stats g_cpu;       /* live per-core utilisation */
 static int  g_tab;
 static uint32_t g_cpu_hist[HISTORY_LEN], g_ram_hist[HISTORY_LEN];
 static int g_hist_idx, g_hist_filled;
 
 static void refresh_data(void) {
     my_memset(&g_metrics, 0, sizeof(g_metrics));
-    sys_system_metrics(&g_metrics);
+    sys_system_metrics(&g_metrics);   /* advances the sysmon window first */
+    my_memset(&g_cpu, 0, sizeof(g_cpu));
+    sys_cpu_stats(&g_cpu);            /* ...then read fresh per-core usage */
     /* CPU/machine identity is static -- fetch once. */
     if (!g_hw_ok) {
         my_memset(&g_hw, 0, sizeof(g_hw));
@@ -213,6 +226,22 @@ static void perf_paint(struct tk_window *w,struct tk_widget *c){
     draw_bar(w,lx+60,y,250,12,g_metrics.cpu_pct,COL_GREEN); y+=24;
     tk_draw_text(w,lx,y,"History (16s)",COL_DIM,12,0); y+=16;
     draw_graph(w,lx,y,HISTORY_LEN*18,60,g_cpu_hist,g_hist_filled,g_hist_idx,COL_GREEN); y+=72;
+
+    /* Per-core utilisation bars (live, from SYS_CPU_STATS). */
+    if(g_cpu.cpu_count){
+        tk_draw_text(w,lx,y,"Per-Core",COL_DIM,12,0); y+=16;
+        for(uint32_t ci=0; ci<g_cpu.cpu_count && ci<8; ci++){
+            uint32_t pct=g_cpu.busy_pct[ci];
+            uint32_t col = pct>=80?COL_RED : (pct>=50?COL_BLUE:COL_GREEN);
+            { int p=str_append(buf,0,"C"); p=str_append_uint(buf,p,ci); buf[p]='\0'; }
+            tk_draw_text(w,lx,y,buf,COL_TEXT,12,0);
+            { int p=str_append_uint(buf,0,pct); buf[p++]='%'; buf[p]='\0'; }
+            tk_draw_text(w,lx+28,y,buf,COL_DIM,12,0);
+            draw_bar(w,lx+66,y+1,214,9,pct,col);
+            y+=15;
+        }
+        y+=6;
+    }
 
     tk_draw_text(w,lx,y,"Memory Usage",COL_ACCENT,15,1); y+=22;
     { int p=str_append_uint(buf,0,g_metrics.ram_pct); buf[p++]='%'; buf[p]='\0'; }

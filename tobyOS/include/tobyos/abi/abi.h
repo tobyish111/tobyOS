@@ -730,8 +730,14 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
  * outside the valid range so it can never alias a real priority. */
 #define ABI_PRIO_NONE   (-1000000)
 
+/* Per-core CPU utilisation snapshot. Fills abi_cpu_stats (below) with the
+ * detected core count + each core's busy % over the last sysmon window.
+ *   args:  (struct abi_cpu_stats *out)
+ *   ret:   0 on success, -ABI_EFAULT on a bad pointer. */
+#define ABI_SYS_CPU_STATS      168
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          168
+#define ABI_SYS_NR_MAX          169
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
@@ -1540,6 +1546,20 @@ struct abi_system_metrics {
 };
 _Static_assert(sizeof(struct abi_system_metrics) == 224,
                "abi_system_metrics layout is FROZEN at 224 bytes");
+
+/* SYS_CPU_STATS: per-core CPU utilisation. abi_system_metrics is frozen with
+ * too few reserved slots for MAX_CPUS cores, so per-core usage rides its own
+ * (small, fixed) struct. busy_pct[i] is core i's utilisation 0-100 over the
+ * last sysmon sample window; entries [0, cpu_count) are valid. */
+#define ABI_CPU_STATS_MAX   32   /* == kernel MAX_CPUS */
+struct abi_cpu_stats {
+    uint32_t cpu_count;                    /* valid entries in busy_pct[]   */
+    uint32_t _pad;
+    uint8_t  busy_pct[ABI_CPU_STATS_MAX];  /* per-core busy %, 0-100        */
+    uint8_t  _reserved[24];                /* round to 64 B; future use     */
+};
+_Static_assert(sizeof(struct abi_cpu_stats) == 64,
+               "abi_cpu_stats layout is FROZEN at 64 bytes");
 
 /* ============================================================
  *  M35D: hardware compatibility database

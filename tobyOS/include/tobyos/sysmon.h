@@ -20,4 +20,8 @@ void sysmon_sample(struct abi_system_metrics *out);
  * If no sample has happened yet, this takes the first one. */
 void sysmon_snapshot(struct abi_system_metrics *out);
 
+/* Copy the last-computed per-core utilisation (0-100 per core) into `out`,
+ * up to `max` entries. Returns the number of cores written. */
+uint32_t sysmon_cpu_pcts(uint8_t *out, uint32_t max);
+
 #endif /* TOBYOS_SYSMON_H */

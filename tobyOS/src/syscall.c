@@ -2313,6 +2313,18 @@ static long sys_system_metrics(struct abi_system_metrics *out) {
     return 0;
 }
 
+/* Per-core CPU utilisation. Returns the last-computed per-core busy % (the
+ * caller samples SYS_SYSTEM_METRICS first, which advances the window). */
+static long sys_cpu_stats(struct abi_cpu_stats *out) {
+    if (!user_buf_ok((uint64_t)(uintptr_t)out, sizeof(*out)))
+        return -ABI_EFAULT;
+    struct abi_cpu_stats staging;
+    memset(&staging, 0, sizeof(staging));
+    staging.cpu_count = sysmon_cpu_pcts(staging.busy_pct, ABI_CPU_STATS_MAX);
+    if (copy_to_user(out, &staging, sizeof(staging)) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
 /* ---- Milestone 28C: watchdog status ------------------------- */
 
 static long sys_wdog_status(struct abi_wdog_status *out) {
@@ -3023,6 +3035,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Milestone 36B: desktop/system monitor ------------------ */
     case ABI_SYS_SYSTEM_METRICS:
         return sys_system_metrics((struct abi_system_metrics *)a1);
+    case ABI_SYS_CPU_STATS:
+        return sys_cpu_stats((struct abi_cpu_stats *)a1);
 
     /* ---- Milestone 38: window management ------------------------ */
     case ABI_SYS_GUI_SET_STATE:
