@@ -225,6 +225,25 @@ bool kbd_haschar(void) {
  
      if (g_ext_e0) {
          g_ext_e0 = false;
+         /* E0-extended keys: deliver the grey arrow cluster to the GUI
+          * as the toolkit's arrow byte codes (TK_KEY_UP/DOWN/LEFT/RIGHT
+          * = 0x80..0x83) so list widgets and the taskbar search panel
+          * can be keyboard-driven. Only make codes, and only while the
+          * GUI owns the keyboard -- the text console's line discipline
+          * has no use for these bytes. */
+         if (!(sc & 0x80) && gui_active()) {
+             switch (sc) {
+             case 0x48: kbd_dispatch_char((char)0x80); break; /* Up    */
+             case 0x50: kbd_dispatch_char((char)0x81); break; /* Down  */
+             case 0x4B: kbd_dispatch_char((char)0x82); break; /* Left  */
+             case 0x4D: kbd_dispatch_char((char)0x83); break; /* Right */
+             /* Win/Super key -> toggle the taskbar app search, so an
+              * app launch is: Win, type a few letters, Enter. */
+             case 0x5B:                                       /* LWin  */
+             case 0x5C: gui_toggle_search(); break;           /* RWin  */
+             default: break;
+             }
+         }
          return;
      }
  

@@ -59,6 +59,8 @@ extern "C" {
 #define TK_KEY_ENTER      0x0A
 #define TK_KEY_UP         0x80
 #define TK_KEY_DOWN       0x81
+#define TK_KEY_LEFT       0x82
+#define TK_KEY_RIGHT      0x83
 
 /* Byte-compatible with the kernel struct gui_event. */
 struct tk_event {

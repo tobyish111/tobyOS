@@ -210,6 +210,17 @@ static void hid_kbd_press(struct hid_dev_state *st, uint8_t usage,
         return;
     }
 
+    /* Arrow cluster (usages 0x4F..0x52) -> the GUI arrow byte codes
+     * (TK_KEY_RIGHT/LEFT/DOWN/UP = 0x83/0x82/0x81/0x80), mirroring the
+     * PS/2 E0 path. GUI-only: the text console has no use for them. */
+    if (usage >= 0x4F && usage <= 0x52) {
+        if (gui_active()) {
+            static const uint8_t arrow_code[4] = { 0x83, 0x82, 0x81, 0x80 };
+            kbd_dispatch_char((char)arrow_code[usage - 0x4F]);
+        }
+        return;
+    }
+
     if (usage >= 0x7F) return;
     char c = shift ? g_kbd_shift[usage] : g_kbd_base[usage];
     if (c == 0) return;
@@ -243,6 +254,17 @@ static void hid_kbd_handle(struct hid_dev_state *st,
 
     bool shift = (mod & (HID_MOD_LSHIFT | HID_MOD_RSHIFT)) != 0;
     bool ctrl  = (mod & (HID_MOD_LCTRL  | HID_MOD_RCTRL )) != 0;
+
+    /* Win/Super key press-edge -> toggle the taskbar app search
+     * (mirrors the PS/2 E0-5B path). GUI keys are modifiers in HID, so
+     * detect the 0->1 transition against the previous report's mask. */
+    {
+        uint8_t gui_bits  = HID_MOD_LGUI | HID_MOD_RGUI;
+        uint8_t gui_now   = (uint8_t)(mod & gui_bits);
+        uint8_t gui_prev  = (uint8_t)(st->last_modmask & gui_bits);
+        if ((gui_now & ~gui_prev) && gui_active())
+            gui_toggle_search();
+    }
 
     st->last_modmask = mod;
 

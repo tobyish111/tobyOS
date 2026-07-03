@@ -395,6 +395,12 @@ void gui_emergency_exit(const char *reason);
  * z-order. Called from keyboard IRQ when Alt+Tab is detected. */
 void gui_alt_tab_cycle(void);
 
+/* Toggle the taskbar app-search panel (same action as clicking the
+ * taskbar search box). Called from the keyboard paths on the Win/Super
+ * key so apps can be launched entirely from the keyboard: Win, type a
+ * few letters, Enter. No-op unless the desktop is up. */
+void gui_toggle_search(void);
+
 /* Clipboard */
 int gui_clip_copy(const char *data, uint32_t len);
 int gui_clip_paste(char *buf, uint32_t max);

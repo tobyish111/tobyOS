@@ -165,7 +165,7 @@ struct ctx_menu_item {
 #define START_BTN_W       62
 #define START_BTN_LABEL   "TO"
 #define TASKBAR_SEARCH_W  160
-#define TASKBAR_PIN_COUNT 7
+#define TASKBAR_PIN_COUNT 8
 #define TASKBAR_PIN_W      44
 #define TAB_W             152
 #define TAB_PAD           6
@@ -476,6 +476,15 @@ static struct {
     /* Start menu search */
     char          menu_search_buf[32];
     int           menu_search_len;
+
+    /* Taskbar search panel: a dedicated app-search overlay anchored
+     * above the taskbar search box. `search_sel` is the highlighted
+     * result row -- shared by arrow keys and mouse hover, launched by
+     * Enter or a click. */
+    bool          search_open;
+    char          search_buf[32];
+    int           search_len;
+    int           search_sel;
 
     /* Wallpaper cache: rendered once, then blitted on each frame.
      * Invalidated on theme change or resolution change. */
@@ -798,6 +807,108 @@ static bool point_in_taskbar_search(int px, int py) {
     int sx = START_BTN_W + 4;
     return px >= sx && px < sx + TASKBAR_SEARCH_W &&
            py >= yt + 5 && py < yt + GUI_TASKBAR_H - 5;
+}
+
+/* ---- taskbar search panel ------------------------------------------ *
+ *
+ * Clicking the taskbar search box opens a compact overlay anchored
+ * just above it: an input row plus a ranked result list over every
+ * launcher entry (system + installed packages). Typing filters live,
+ * Up/Down (or hovering) move the highlight, Enter or a click launches
+ * the highlighted app, Esc or a click outside dismisses. */
+
+#define SEARCH_PANEL_W      380
+#define SEARCH_INPUT_H      30
+#define SEARCH_ROW_H        26
+#define SEARCH_MAX_RESULTS  9
+
+/* Case-insensitive substring match; *prefix reports whether the match
+ * starts at the first character (used for ranking). An empty query
+ * matches everything as a "prefix" so pass 0 below emits the whole
+ * list in natural order. */
+static bool search_label_matches(const char *label, const char *q,
+                                 int qlen, bool *prefix) {
+    if (qlen == 0) {
+        if (prefix) *prefix = true;
+        return true;
+    }
+    if (prefix) *prefix = false;
+    bool first = true;
+    for (const char *s = label; *s; s++, first = false) {
+        bool eq = true;
+        for (int k = 0; k < qlen && eq; k++) {
+            char a = s[k], b = q[k];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (!a || a != b) eq = false;
+        }
+        if (eq) {
+            if (prefix && first) *prefix = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Fill out[] with up to `max` launcher indices matching the current
+ * query, best match first: labels that START with the query rank
+ * ahead of mid-label matches. Excludes the pinned Logout entry (it is
+ * not an app). Returns the count. */
+static int search_results(int *out, int max) {
+    int n = launcher_count();
+    int cnt = 0;
+    for (int pass = 0; pass < 2 && cnt < max; pass++) {
+        for (int i = 0; i < n - 1 && cnt < max; i++) {
+            struct launcher_item li;
+            if (!launcher_resolve(i, &li) || !li.label || !li.path) continue;
+            bool prefix = false;
+            if (!search_label_matches(li.label, g.search_buf,
+                                      g.search_len, &prefix)) continue;
+            if ((pass == 0) != prefix) continue;   /* pass 0 = prefix hits */
+            out[cnt++] = i;
+        }
+    }
+    return cnt;
+}
+
+static void search_panel_rect(int *px, int *py, int *pw, int *ph) {
+    int idx[SEARCH_MAX_RESULTS];
+    int cnt  = search_results(idx, SEARCH_MAX_RESULTS);
+    int rows = cnt > 0 ? cnt : 1;          /* keep room for "no matches" */
+    int W = (int)gfx_width();
+    *pw = SEARCH_PANEL_W;
+    if (*pw > W - 16) *pw = W - 16;
+    *ph = 10 + SEARCH_INPUT_H + 6 + rows * SEARCH_ROW_H + 10;
+    *px = TASKBAR_FLOAT_MX + START_BTN_W + 4;
+    if (*px + *pw > W - 8) *px = W - 8 - *pw;
+    *py = taskbar_top() - *ph - 6;
+    if (*py < 6) *py = 6;
+}
+
+static bool point_in_search_panel(int x, int y) {
+    if (!g.search_open) return false;
+    int px, py, pw, ph; search_panel_rect(&px, &py, &pw, &ph);
+    return x >= px && x < px + pw && y >= py && y < py + ph;
+}
+
+/* Result row under the cursor, or -1. */
+static int search_row_at(int x, int y) {
+    if (!g.search_open) return -1;
+    int px, py, pw, ph; search_panel_rect(&px, &py, &pw, &ph);
+    if (x < px + 6 || x >= px + pw - 6) return -1;
+    int list_y = py + 10 + SEARCH_INPUT_H + 6;
+    if (y < list_y) return -1;
+    int row = (y - list_y) / SEARCH_ROW_H;
+    int idx[SEARCH_MAX_RESULTS];
+    int cnt = search_results(idx, SEARCH_MAX_RESULTS);
+    if (row < 0 || row >= cnt) return -1;
+    return row;
+}
+
+static void search_close(void) {
+    g.search_open = false;
+    g.search_len  = 0;
+    g.search_sel  = 0;
 }
 
 static int desktop_icon_at(int px, int py) {
@@ -1288,6 +1399,8 @@ static void launch_enqueue_with_profile_caps(const char *path,
     (void)gui_launch_enqueue_arg_profile_caps(path, 0, profile, caps);
 }
 
+static void search_launch_row(int row);   /* fwd: uses shell_launch_path */
+
 static void shell_launch_path(const char *path) {
     if (!path || !path[0]) return;
     launch_enqueue_with_profile_caps(path,
@@ -1309,6 +1422,24 @@ static void shell_launch_desktop_icon(int icon) {
     }
 }
 
+/* Launch the row'th current search result and dismiss the panel.
+ * Bounds-checked against a fresh result enumeration so a stale
+ * selection (results shrank since the last repaint) can't launch the
+ * wrong app. */
+static void search_launch_row(int row) {
+    int idx[SEARCH_MAX_RESULTS];
+    int cnt = search_results(idx, SEARCH_MAX_RESULTS);
+    if (row >= 0 && row < cnt) {
+        struct launcher_item li;
+        if (launcher_resolve(idx[row], &li) && li.path) {
+            gui_trace_logf("search: launch '%s' (%s)", li.label, li.path);
+            shell_launch_path(li.path);
+        }
+    }
+    search_close();
+    g.dirty = true;
+}
+
 static void shell_launch_pin(int pin) {
     switch (pin) {
     case 0: shell_launch_path("/bin/gui_files");    break;
@@ -1318,6 +1449,7 @@ static void shell_launch_pin(int pin) {
     case 4: shell_launch_path("/bin/gui_settings"); break;
     case 5: shell_launch_path("/bin/gui_calc");     break;
     case 6: shell_launch_path("/bin/gui_about");    break;
+    case 7: shell_launch_path("/bin/gui_taskmgr");  break;
     default: break;
     }
 }
@@ -1915,6 +2047,17 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
         return;
     }
 
+    /* Hovering a search-panel row moves its highlight, so the mouse
+     * and the arrow keys share one selection (Enter always launches
+     * whatever is visibly highlighted). */
+    if (g.search_open && moved) {
+        int row = search_row_at(nx, ny);
+        if (row >= 0 && row != g.search_sel) {
+            g.search_sel = row;
+            g.dirty = true;
+        }
+    }
+
     /* ---- context menu interaction ---------------------------------- *
      *
      * The context menu floats above everything (except the cursor), so
@@ -1948,6 +2091,28 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
      * only events these zones consume; movement still falls through so
      * the cursor keeps repainting smoothly. */
     if (g.desktop_mode && went_down) {
+        /* Search panel first -- it floats above the taskbar like the
+         * launcher menu does. A result row launches; the input row and
+         * padding swallow the click; anywhere else dismisses it (and
+         * the click falls through to whatever was underneath). */
+        if (g.search_open) {
+            int row = search_row_at(nx, ny);
+            if (row >= 0) {
+                gui_trace_logf("mouse down=(%d,%d) hit=search-row idx=%d",
+                               nx, ny, row);
+                search_launch_row(row);
+                return;
+            }
+            if (point_in_search_panel(nx, ny)) {
+                g.dirty = true;
+                return;
+            }
+            if (!point_in_taskbar_search(nx, ny)) {
+                search_close();
+                g.dirty = true;
+                /* fall through */
+            }
+        }
         /* Click inside the launcher menu? */
         if (g.menu_open) {
             int item = launcher_item_at(nx, ny);
@@ -2000,6 +2165,7 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
         if (point_in_start_btn(nx, ny)) {
             g.menu_open = !g.menu_open;
             g.menu_search_len = 0;
+            search_close();
             gui_trace_logf("mouse down=(%d,%d) hit=start-button menu_open=%d",
                            nx, ny, (int)g.menu_open);
             g.dirty = true;
@@ -2024,6 +2190,7 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
                                nx, ny, pill);
             }
             g.menu_open = false;
+            search_close();
             g.dirty = true;
             return;
         }
@@ -2100,8 +2267,14 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
         /* Taskbar tab raises the corresponding window. */
         if (point_in_taskbar(nx, ny)) {
             if (point_in_taskbar_search(nx, ny)) {
-                g.menu_open = true;
-                g.menu_search_len = 0;
+                /* Toggle the dedicated search panel (not the start
+                 * menu) -- typing goes straight into it. */
+                bool opening = !g.search_open;
+                search_close();
+                g.search_open = opening;
+                g.menu_open = false;
+                gui_trace_logf("mouse down=(%d,%d) hit=taskbar-search open=%d",
+                               nx, ny, (int)g.search_open);
                 g.dirty = true;
                 return;
             }
@@ -2111,6 +2284,7 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
                 gui_trace_logf("mouse down=(%d,%d) hit=taskbar-pin idx=%d",
                                nx, ny, pin);
                 g.menu_open = false;
+                search_close();
                 g.dirty = true;
                 return;
             }
@@ -2129,6 +2303,7 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
                 }
             }
             g.menu_open = false;
+            search_close();
             g.dirty = true;
             return;
         }
@@ -3534,6 +3709,13 @@ static void paint_taskbar_pin_icon(int cx, int cy, int pin,
         gfx_fill_rect(x + 9, y + 7, 2, 2, fg2);
         gfx_fill_rect(x + 9, y + 10, 2, 4, fg);
         break;
+    case 7: /* Task Manager -- window frame with performance bars */
+        gfx_draw_rect(x + 2, y + 3, 16, 14, fg);
+        gfx_fill_rect(x + 3, y + 4, 14, 2, fg);
+        gfx_fill_rect(x + 5, y + 12, 2, 3, fg2);   /* short bar  */
+        gfx_fill_rect(x + 9, y + 9,  2, 6, fg2);   /* medium bar */
+        gfx_fill_rect(x + 13, y + 7, 2, 8, fg);    /* tall bar   */
+        break;
     default:
         gfx_fill_rect(x + 5, y + 5, 10, 10, fg);
         break;
@@ -3615,11 +3797,14 @@ static void paint_taskbar(void) {
     paint_toby_hex_logo(fx + 16, cy + (ch - 22) / 2, 22,
                         t->glow_orange, t->border_orange);
 
-    /* Search area -- opens launcher with search focus. */
+    /* Search area -- opens the app-search panel. While the panel is
+     * open the box echoes the live query so the whole affordance reads
+     * as one control. */
     int sx = fx + START_BTN_W + 4;
     int sy = cy + 2;
     int sh = ch - 4;
-    bool search_hot = point_in_taskbar_search(g.cur_x, g.cur_y);
+    bool search_hot = point_in_taskbar_search(g.cur_x, g.cur_y) ||
+                      g.search_open;
     paint_glass_rect(sx, sy, TASKBAR_SEARCH_W, sh,
                      search_hot ? 0x000D1520u : 0x00070C16u,
                      argb(search_hot ? 0x44 : 0x34, t->panel),
@@ -3628,8 +3813,24 @@ static void paint_taskbar(void) {
     gfx_draw_rect(sx + 10, sy + (sh - 10) / 2, 10, 10, t->text_primary);
     draw_line(sx + 18, sy + (sh - 10) / 2 + 8,
               sx + 24, sy + (sh - 10) / 2 + 14, t->text_primary);
-    gfx_draw_text_smooth(sx + 34, sy + (sh - 16) / 2, "Search TobyOS",
-                    t->text_secondary, GFX_TRANSPARENT, 2);
+    if (g.search_open && g.search_len > 0) {
+        /* Echo the tail of the query + caret (box fits ~14 chars). */
+        char disp[16];
+        int max = 13;
+        int len = g.search_len > max ? max : g.search_len;
+        int off = g.search_len - len;
+        for (int ci = 0; ci < len; ci++) disp[ci] = g.search_buf[off + ci];
+        disp[len] = '_';
+        disp[len + 1] = '\0';
+        gfx_draw_text_smooth(sx + 34, sy + (sh - 16) / 2, disp,
+                        t->text_primary, GFX_TRANSPARENT, 2);
+    } else if (g.search_open) {
+        gfx_draw_text_smooth(sx + 34, sy + (sh - 16) / 2, "_",
+                        t->text_primary, GFX_TRANSPARENT, 2);
+    } else {
+        gfx_draw_text_smooth(sx + 34, sy + (sh - 16) / 2, "Search TobyOS",
+                        t->text_secondary, GFX_TRANSPARENT, 2);
+    }
 
     int px = sx + TASKBAR_SEARCH_W + 8;
     int hovered_pin = -1;
@@ -3654,7 +3855,7 @@ static void paint_taskbar(void) {
     if (hovered_pin >= 0) {
         static const char *pin_names[TASKBAR_PIN_COUNT] = {
             "Files", "Browser", "Terminal", "Notes",
-            "Settings", "Calculator", "About"
+            "Settings", "Calculator", "About", "Task Manager"
         };
         const char *tip = pin_names[hovered_pin];
         int tip_len = 0;
@@ -3874,6 +4075,74 @@ static void paint_launcher(void) {
     } else {
         gfx_draw_text_smooth(mx + 28, my + mh - 30, "Search programs and files...",
                         t->text_secondary, GFX_TRANSPARENT, 2);
+    }
+}
+
+static void paint_search_panel(void) {
+    if (!g.search_open) return;
+    const struct theme_palette *t = theme_active();
+    int px, py, pw, ph; search_panel_rect(&px, &py, &pw, &ph);
+
+    int idx[SEARCH_MAX_RESULTS];
+    int cnt = search_results(idx, SEARCH_MAX_RESULTS);
+    /* Keep the highlight valid as results shrink under a narrowing
+     * query -- the compositor is single-threaded, so clamping here is
+     * race-free and saves every producer from doing it. */
+    if (g.search_sel >= cnt) g.search_sel = cnt > 0 ? cnt - 1 : 0;
+
+    /* Panel body -- same soft-glass family as the launcher menu. */
+    gfx_fill_rect_blend(px + 6, py + 8, pw, ph, 0x60000000u);
+    paint_soft_panel(px, py, pw, ph, t->menu_bg, argb(0x86, t->menu_bg),
+                     t->menu_border, t->border_cyan);
+
+    /* Input row. */
+    int ix = px + 10, iy = py + 10, iw = pw - 20;
+    paint_glass_rect(ix, iy, iw, SEARCH_INPUT_H, 0x00070C16u,
+                     argb(0x40, t->panel), t->border_cyan, t->border_cyan);
+    if (g.search_len > 0) {
+        char disp[sizeof(g.search_buf) + 2];
+        for (int ci = 0; ci < g.search_len; ci++) disp[ci] = g.search_buf[ci];
+        disp[g.search_len] = '_';
+        disp[g.search_len + 1] = '\0';
+        gfx_draw_text_smooth(ix + 10, iy + (SEARCH_INPUT_H - 16) / 2, disp,
+                        t->text_primary, GFX_TRANSPARENT, 2);
+    } else {
+        gfx_draw_text_smooth(ix + 10, iy + (SEARCH_INPUT_H - 16) / 2,
+                        "Type to search apps...", t->text_secondary,
+                        GFX_TRANSPARENT, 2);
+    }
+
+    /* Result rows. The highlighted row is what Enter launches; hover
+     * moves the highlight (see the mouse-move path), so mouse + arrow
+     * keys always agree with what's on screen. */
+    int list_y = py + 10 + SEARCH_INPUT_H + 6;
+    if (cnt == 0) {
+        gfx_draw_text(px + 20, list_y + 6, "No matching apps",
+                      t->text_secondary, GFX_TRANSPARENT);
+    }
+    for (int r = 0; r < cnt; r++) {
+        struct launcher_item li;
+        if (!launcher_resolve(idx[r], &li) || !li.label) continue;
+        int ry = list_y + r * SEARCH_ROW_H;
+        bool sel = (r == g.search_sel);
+        if (sel) {
+            gfx_fill_rect_blend(px + 6, ry, pw - 12, SEARCH_ROW_H - 2,
+                                argb(0xD8, t->menu_hot));
+            gfx_fill_rect(px + 6, ry, 3, SEARCH_ROW_H - 2, t->border_cyan);
+        }
+        char letter[2] = { li.label[0], 0 };
+        gfx_draw_text_smooth(px + 18, ry + 5, letter, t->glow_orange,
+                        GFX_TRANSPARENT, 2);
+        gfx_draw_text_smooth(px + 38, ry + 5, li.label,
+                        sel ? t->text_primary : t->menu_text,
+                        GFX_TRANSPARENT, 2);
+        if (sel) {
+            /* Right-aligned affordance hint on the highlighted row. */
+            static const char hint[] = "Enter";
+            int hx = px + pw - 12 - (int)(sizeof(hint) - 1) * 8;
+            gfx_draw_text(hx, ry + 7, hint, t->text_secondary,
+                          GFX_TRANSPARENT);
+        }
     }
 }
 
@@ -4269,6 +4538,7 @@ static void compositor_pass(void) {
         if (!fullscreen_cover) {
             paint_taskbar();
             paint_launcher();
+            paint_search_panel();
             /* M31: notification center first (acts as a modal-ish panel
              * over the wallpaper + windows), THEN the toast above it so
              * a freshly-arrived toast is always on top of the panel. */
@@ -5520,6 +5790,32 @@ int gui_window_flip_rect(struct window *w, int rx, int ry, int rw, int rh) {
 void gui_post_key(uint8_t c) {
     if (!g.ready || !g.active) return;
 
+    /* The taskbar search panel owns the keyboard while open: printable
+     * characters filter live, Up/Down move the highlight, Enter
+     * launches it, Esc dismisses. */
+    if (g.search_open) {
+        if (c == 0x1B) {
+            search_close();
+        } else if (c == '\b' || c == 0x7F) {
+            if (g.search_len > 0) g.search_len--;
+            g.search_sel = 0;
+        } else if (c == '\n' || c == '\r') {
+            search_launch_row(g.search_sel);
+        } else if (c == 0x80) {                    /* arrow up   */
+            if (g.search_sel > 0) g.search_sel--;
+        } else if (c == 0x81) {                    /* arrow down */
+            int idx[SEARCH_MAX_RESULTS];
+            int cnt = search_results(idx, SEARCH_MAX_RESULTS);
+            if (g.search_sel + 1 < cnt) g.search_sel++;
+        } else if (c >= 0x20 && c < 0x7F) {
+            if (g.search_len < (int)sizeof(g.search_buf) - 1)
+                g.search_buf[g.search_len++] = (char)c;
+            g.search_sel = 0;      /* new query -> highlight best match */
+        }
+        g.dirty = true;
+        return;
+    }
+
     /* When the start menu is open, route keystrokes to the search
      * buffer instead of the focused window. */
     if (g.menu_open) {
@@ -5579,6 +5875,15 @@ void gui_close_focused(void) {
     if (w->state == GUI_WIN_MINIMIZED) return;
     enqueue_event(w, GUI_EV_CLOSE, 0, 0, 0, 0);
     w->close_request_tick = pit_ticks();
+    g.dirty = true;
+}
+
+void gui_toggle_search(void) {
+    if (!g.ready || !g.active || !g.desktop_mode) return;
+    bool opening = !g.search_open;
+    search_close();
+    g.search_open = opening;
+    g.menu_open = false;
     g.dirty = true;
 }
 
