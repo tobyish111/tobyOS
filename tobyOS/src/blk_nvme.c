@@ -123,6 +123,7 @@
 #define NVME_CQ_IEN         (1u << 1)       /* interrupts enabled    */
 
 /* I/O opcodes. */
+#define NVME_IO_FLUSH       0x00
 #define NVME_IO_WRITE       0x01
 #define NVME_IO_READ        0x02
 
@@ -219,6 +220,11 @@ struct nvme_controller {
     uint8_t            irq_vector;
     bool               irq_enabled;
     volatile uint64_t  irq_count;
+
+    /* Model number from IDENTIFY CONTROLLER (bytes 24..63, space-
+     * padded ASCII). Copied into every namespace's blk_dev so the
+     * disk-manager confirm flow can show which drive it is. */
+    char               model[41];
 };
 
 struct nvme_namespace {
@@ -605,9 +611,51 @@ static int nvme_blk_write(struct blk_dev *dev, uint64_t lba,
     return nvme_rw_logical(ns, lba, count, (void *)buf, /*write*/ true);
 }
 
+/* Submit an NVMe FLUSH (opcode 0x00) asynchronously. No data phase:
+ * NSID selects the namespace, PRPs stay zero. Same CID accounting as
+ * the read/write path so the CQE reaper completes it uniformly. */
+static int nvme_submit_flush_async(struct nvme_namespace *ns,
+                                   struct blk_io *io) {
+    struct nvme_controller *c = ns->ctrl;
+    struct nvme_queue      *q = &c->io;
+
+    uint64_t f = spin_lock_irqsave(&c->io_lock);
+    int cid = nvme_alloc_cid(c);
+    if (cid < 0) { spin_unlock_irqrestore(&c->io_lock, f); return -1; }
+
+    struct nvme_sqe *slot = &q->sq[q->sq_tail];
+    memset(slot, 0, sizeof(*slot));
+    slot->opc  = NVME_IO_FLUSH;
+    slot->cid  = (uint16_t)cid;
+    slot->nsid = ns->nsid;
+
+    q->sq_tail = (uint16_t)((q->sq_tail + 1u) % q->depth);
+    *q->sq_dbl = q->sq_tail;
+
+    c->inflight[cid] = io;
+    c->inflight_now++;
+    if (c->inflight_now > c->max_inflight) c->max_inflight = c->inflight_now;
+    spin_unlock_irqrestore(&c->io_lock, f);
+    return 0;
+}
+
+/* Flush the controller's volatile write cache for this namespace. */
+static int nvme_blk_flush(struct blk_dev *dev) {
+    struct nvme_namespace  *ns = (struct nvme_namespace *)dev->priv;
+    struct nvme_controller *c  = ns->ctrl;
+    struct blk_io io;
+    blk_io_prep(&io, 0, 0, 0, /*is_write*/ false);
+    while (nvme_submit_flush_async(ns, &io) != 0) {
+        nvme_io_poll(c);                 /* free a CID by reaping a CQE */
+        __asm__ volatile ("pause");
+    }
+    return blk_io_wait(&io, nvme_io_poll_cb, c);
+}
+
 static const struct blk_ops g_nvme_ops = {
     .read  = nvme_blk_read,
     .write = nvme_blk_write,
+    .flush = nvme_blk_flush,
 };
 
 /* ---- name formatting ----------------------------------------- */
@@ -809,6 +857,12 @@ static int nvme_init_controller(struct nvme_controller *c) {
     /* Trim trailing spaces (NVMe pads SN with 0x20). */
     for (int i = 19; i >= 0 && sn[i] == ' '; i--) sn[i] = '\0';
 
+    /* Model number: bytes 24..63, same space padding. */
+    memcpy(c->model, (uint8_t *)id_data + 24, 40);
+    c->model[40] = '\0';
+    for (int i = 39; i >= 0 && (c->model[i] == ' ' || c->model[i] == 0); i--)
+        c->model[i] = '\0';
+
     kprintf("[nvme] IDENTIFY CTRL: NN=%u  serial='%s'\n", nn, sn);
 
     if (nn == 0) {
@@ -921,6 +975,7 @@ static int nvme_init_controller(struct nvme_controller *c) {
         d->blk.ops          = &g_nvme_ops;
         d->blk.sector_count = log_sectors;
         d->blk.priv         = &d->ns;
+        memcpy(d->blk.model, c->model, sizeof(d->blk.model));
 
         kprintf("[nvme] NS %u registered as '%s'  (%lu x %u-byte LBAs = "
                 "%lu logical sectors, %lu KiB)\n",

@@ -51,6 +51,8 @@
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
 #include <tobyos/devtest.h>
+#include <tobyos/blk.h>
+#include <tobyos/provision.h>
 #include <tobyos/display.h>
 #include <tobyos/hotplug.h>
 #include <tobyos/slog.h>
@@ -2343,6 +2345,42 @@ static long sys_safe_mode(void) {
     return safemode_active() ? 1 : 0;
 }
 
+/* ---- persistent-storage provisioning ------------------------ */
+
+static long sys_blk_list(struct abi_blk_info *out, uint32_t cap) {
+    if (!out || cap == 0) return 0;
+    if (cap > ABI_BLK_MAX_DEVICES) cap = ABI_BLK_MAX_DEVICES;
+    if (!user_buf_ok((uint64_t)(uintptr_t)out, sizeof(*out) * cap))
+        return -ABI_EFAULT;
+    /* Kernel staging, exact-prefix copy-out -- same pattern (and same
+     * BKL-serialised safety argument) as sys_dev_list above. */
+    static struct abi_blk_info staging[ABI_BLK_MAX_DEVICES];
+    long n = provision_fill_blk_list(staging, cap);
+    if (n <= 0) return n;
+    if (copy_to_user(out, staging, sizeof(staging[0]) * (size_t)n) != 0)
+        return -ABI_EFAULT;
+    return n;
+}
+
+static long sys_data_provision(const struct abi_provision_req *ureq) {
+    /* Formatting a disk is the most destructive syscall in the system:
+     * gate it on the same capability as the other system-mutating
+     * calls (settings/login/chmod). The kernel guard inside
+     * provision_create_data_volume re-validates the target itself. */
+    if (!cap_check(current_proc(), CAP_SETTINGS_WRITE,
+                   "sys_data_provision"))
+        return -ABI_EPERM;
+
+    struct abi_provision_req req;
+    if (copy_from_user(&req, ureq, sizeof(req)) != 0) return -ABI_EFAULT;
+    req.dev[sizeof(req.dev) - 1] = '\0';
+
+    struct blk_dev *d = blk_find(req.dev);
+    if (!d) return -ABI_ENOENT;
+    return provision_create_data_volume(d,
+        (req.flags & ABI_PROV_F_FORCE) != 0);
+}
+
 /* ---- Milestone 28E: filesystem check ------------------------ */
 
 /* Cookie used by vfs_iter_mounts() to find the tobyfs mount whose
@@ -2966,6 +3004,12 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
                             (uint32_t)a2, (uint32_t)a3);
     case ABI_SYS_DEV_TEST:
         return sys_dev_test((const char *)a1, (char *)a2, (uint32_t)a3);
+
+    /* ---- persistent-storage provisioning ------------------------ */
+    case ABI_SYS_BLK_LIST:
+        return sys_blk_list((struct abi_blk_info *)a1, (uint32_t)a2);
+    case ABI_SYS_DATA_PROVISION:
+        return sys_data_provision((const struct abi_provision_req *)a1);
 
     /* ---- Milestone 26C: hot-plug event drain --------------------- */
     case ABI_SYS_HOT_DRAIN:

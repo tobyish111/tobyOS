@@ -226,6 +226,13 @@ static int journal_commit(struct tobyfs *fs) {
         return VFS_ERR_IO;
     }
 
+    /* WAL barrier: force the log (header + data + commit marker) out of
+     * the DRIVE's volatile cache before any checkpoint write can reach
+     * the device. Without this a power cut could land checkpoint blocks
+     * on media while the commit marker is still lost in drive cache --
+     * partial home writes with a rolled-back journal = corruption. */
+    (void)blk_flush(fs->dev);
+
     /* 4. Checkpoint: write every buffered block to its real location. */
     for (int i = 0; i < count; i++)
         (void)write_block_raw(fs, fs->txn_blocks[i], fs->txn_data[i]);
@@ -1177,6 +1184,16 @@ static const struct vfs_ops tobyfs_ops = {
 /* M28E: identification helper used by sys_fs_check() to recognise
  * tobyfs mounts in the VFS table without exposing the static vtable. */
 const void *tobyfs_ops_addr(void) { return &tobyfs_ops; }
+
+/* Map an opaque tobyfs mount-data pointer back to its backing block
+ * device. Same contract as fat32_blkdev_of / ext2_blkdev_of: caller
+ * must have verified the vfs_ops pointer against tobyfs_ops_addr()
+ * first. Used by the provisioning guard to refuse formatting a disk
+ * that carries a live mount. */
+struct blk_dev *tobyfs_blkdev_of(void *mnt) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    return fs ? fs->dev : 0;
+}
 
 /* -------- mount -------- */
 

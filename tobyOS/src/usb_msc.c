@@ -111,6 +111,7 @@ _Static_assert(sizeof(struct csw) == 13, "BBB CSW must be 13 B");
 #define SCSI_READ_CAPACITY_10   0x25
 #define SCSI_READ_10            0x28
 #define SCSI_WRITE_10           0x2A
+#define SCSI_SYNCHRONIZE_CACHE_10 0x35
 
 /* ============================================================== */
 /* Per-device state                                                 */
@@ -386,9 +387,24 @@ static int msc_write(struct blk_dev *dev, uint64_t lba, uint32_t count,
     return 0;
 }
 
+/* SCSI SYNCHRONIZE CACHE (10): ask the device to commit its volatile
+ * write cache to media. Many flash sticks have no cache and either
+ * no-op or CHECK CONDITION (invalid opcode) -- treat a SCSI-level
+ * failure as success since there is nothing better we can do, but
+ * still propagate transport errors (device gone). */
+static int msc_flush(struct blk_dev *dev) {
+    struct usb_msc *m = (struct usb_msc *)dev->priv;
+    if (!m) return 0;
+    if (!m->udev) return -1;
+    uint8_t cdb[10] = { SCSI_SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    int rc = do_cbw_data_csw(m, true, 0, 0, cdb, 10);
+    return (rc < 0) ? rc : 0;
+}
+
 static const struct blk_ops g_msc_blk_ops = {
     .read  = msc_read,
     .write = msc_write,
+    .flush = msc_flush,
 };
 
 /* ============================================================== */
@@ -553,6 +569,20 @@ bool usb_msc_probe(struct usb_device *dev,
     m->blk.priv         = m;
     m->blk.class        = BLK_CLASS_DISK;
     m->self             = m;
+    /* Model = INQUIRY vendor (8 chars) + product (16 chars), trimmed. */
+    {
+        char *mm = m->blk.model;
+        size_t w = 0;
+        for (int i = 8; i < 32; i++) {
+            char ch = (char)inq[i];
+            if (i == 16 && w > 0 && mm[w - 1] != ' ') mm[w++] = ' ';
+            if (ch < 0x20 || ch > 0x7E) ch = ' ';
+            if (ch == ' ' && (w == 0 || mm[w - 1] == ' ')) continue;
+            mm[w++] = ch;
+        }
+        while (w > 0 && mm[w - 1] == ' ') w--;
+        mm[w] = '\0';
+    }
     blk_register(&m->blk);
     dev->msc_state = m;
 

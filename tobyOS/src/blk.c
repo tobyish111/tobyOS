@@ -195,6 +195,24 @@ void blk_mark_gone(struct blk_dev *disk) {
     }
 }
 
+void blk_model_from_ata_id(struct blk_dev *dev, const uint16_t id[256]) {
+    if (!dev || !id) return;
+    /* ATA model = words 27..46, two chars per word, high byte first,
+     * space-padded to 40 chars. */
+    char *m = dev->model;
+    size_t w = 0;
+    for (int i = 27; i <= 46; i++) {
+        m[w++] = (char)(id[i] >> 8);
+        m[w++] = (char)(id[i] & 0xFF);
+    }
+    m[w] = 0;
+    /* Trim trailing spaces + replace non-printables. */
+    while (w > 0 && (m[w - 1] == ' ' || m[w - 1] == 0)) m[--w] = 0;
+    for (size_t i = 0; i < w; i++) {
+        if (m[i] < 0x20 || m[i] > 0x7E) m[i] = '?';
+    }
+}
+
 void blk_dump(void) {
     if (g_count == 0) {
         kprintf("[blk] no block devices registered\n");

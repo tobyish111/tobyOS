@@ -53,6 +53,7 @@
 #include <tobyos/vfs.h>
 #include <tobyos/blk.h>
 #include <tobyos/partition.h>
+#include <tobyos/provision.h>
 #include <tobyos/tobyfs.h>
 #include <tobyos/fat32.h>
 #include <tobyos/ext4.h>
@@ -2933,6 +2934,64 @@ void _start(void) {
                 kprintf("[boot] /data unavailable this boot -- even the RAM "
                         "fallback failed (out of memory?).\n");
         }
+
+#ifdef PROVISION_SELFTEST
+        /* Opt-in guard + end-to-end provisioning proof on RAM-backed
+         * fake disks (marker "[PROV]"). Run it in a boot WITHOUT real
+         * data disks attached -- it temporarily takes /data over from
+         * the RAM fallback and restores it afterwards. */
+        provision_selftest();
+#endif
+#ifdef PROVISION_BLANK_BOOT
+        /* Opt-in headless stand-in for the disk-manager click: run the
+         * guard over every disk and provision the FIRST one it deems
+         * BLANK (marker "[PROVBOOT]"). Proves the real-backend GPT
+         * write + format + mount, and that the next boot rediscovers
+         * the volume through the tobyOS-data GPT priority path. */
+        {
+            size_t pit = 0;
+            struct blk_dev *pd;
+            bool provisioned = false;
+            while ((pd = blk_iter_next(&pit, BLK_CLASS_DISK)) != NULL) {
+                char pfs[ABI_BLK_FS_MAX];
+                uint32_t pfl = 0;
+                if (provision_classify(pd, &pfl, pfs) != ABI_BLKV_BLANK)
+                    continue;
+                long prc = provision_create_data_volume(pd, false);
+                kprintf("[PROVBOOT] provision '%s' -> rc=%ld (%s)\n",
+                        pd->name, prc,
+                        prc >= 0 ? "OK" : "FAILED");
+                provisioned = true;
+                break;
+            }
+            if (!provisioned)
+                kprintf("[PROVBOOT] no blank disk found -- nothing to do\n");
+        }
+#endif
+#ifdef DATA_PERSIST_BOOT
+        /* Opt-in reboot/power-cut persistence probe (marker
+         * "[PERSIST]"): first boot writes a marker file to /data,
+         * every later boot reports whether it survived. Kill QEMU
+         * right after "created marker" to model a power cut. */
+        {
+            struct vfs_file pf;
+            if (vfs_open("/data/persist.txt", &pf) == VFS_OK) {
+                char pbuf[64];
+                long pn = vfs_read(&pf, pbuf, sizeof(pbuf) - 1);
+                vfs_close(&pf);
+                pbuf[pn > 0 ? pn : 0] = '\0';
+                kprintf("[PERSIST] found marker: '%s'\n", pbuf);
+            } else if (vfs_create("/data/persist.txt") == VFS_OK &&
+                       vfs_open("/data/persist.txt", &pf) == VFS_OK) {
+                static const char pmsg[] = "persist-marker-v1";
+                long pw = vfs_write(&pf, pmsg, sizeof(pmsg) - 1);
+                vfs_close(&pf);
+                kprintf("[PERSIST] created marker (wrote %ld bytes)\n", pw);
+            } else {
+                kprintf("[PERSIST] FAILED to create marker on /data\n");
+            }
+        }
+#endif
 
         /* DATA SAFETY (real hardware): tobyOS must NOT auto-mount or write
          * filesystems that belong to OTHER operating systems on the
@@ -7780,6 +7839,13 @@ void _start(void) {
      * Ordering mirrors THREEWORLDS_BOOT: spawn the app WHILE login is still
      * alive (the desktop pump stalls if user-procs hit zero), then dismiss
      * login, and use a guard-capped pump (TKA_PUMP) not winpe8_pump_ms. */
+    /* Convenience one-word app selectors: string-valued -D defines get
+     * their "/bin/..." value path-converted by MSYS shells on Windows,
+     * so give frequently-shot apps a quoting-proof flag. */
+    #ifdef TKAPP_DISKMGR
+    #define TKAPP_PATH "/bin/diskmgr"
+    #define TKAPP_NAME "diskmgr"
+    #endif
     #ifndef TKAPP_PATH
     #define TKAPP_PATH "/bin/gui_about"
     #endif

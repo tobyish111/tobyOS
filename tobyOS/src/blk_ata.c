@@ -169,9 +169,22 @@ static int ata_pio_write(struct blk_dev *dev, uint64_t lba,
     return 0;
 }
 
+/* Explicit write-cache flush (0xE7). The write path above already
+ * flushes after every chunk, so this is usually a no-op that returns
+ * quickly -- it exists so the generic blk_flush() durability barrier
+ * works uniformly across every bus. */
+static int ata_pio_flush(struct blk_dev *dev) {
+    (void)dev;
+    if (ata_wait_not_busy() != 0) return -1;
+    outb(ATA_REG_CMD, ATA_CMD_CACHE_FLUSH);
+    if (ata_wait_not_busy() != 0) return -2;
+    return 0;
+}
+
 static const struct blk_ops g_ata_ops = {
     .read  = ata_pio_read,
     .write = ata_pio_write,
+    .flush = ata_pio_flush,
 };
 
 static struct blk_dev g_ata_dev = {
@@ -218,6 +231,7 @@ static int ata_identify(uint64_t *out_sectors) {
     /* Words 60..61 = 32-bit LBA28 max sector count. */
     uint32_t lba28 = ((uint32_t)id[61] << 16) | id[60];
     *out_sectors = lba28;
+    blk_model_from_ata_id(&g_ata_dev, id);
     return 0;
 }
 

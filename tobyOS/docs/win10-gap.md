@@ -357,6 +357,28 @@ driver model; POSIX libc surface.
 ---
 
 ## Changelog
+- **2026-07-03** — **Storage: user-driven persistent-storage PROVISIONING + true drive-cache durability (SATA/NVMe/USB/IDE).**
+  Two gaps closed. **(1) Drive write-cache flush:** `struct blk_ops` gained an optional `->flush` op — ATA `FLUSH CACHE`
+  (0xE7), AHCI `FLUSH CACHE EXT` (0xEA, with an NCQ quiesce so the non-queued command never mixes with in-flight tags),
+  NVMe `FLUSH` (opcode 0x00 through the same CID-tagged async queue), USB-MSC SCSI `SYNCHRONIZE CACHE(10)`, and the
+  offset/partition wrapper delegating to its parent. `bcache_sync`/`bcache_invalidate` now end with a device flush
+  (collected under the lock, issued outside it), and `journal_commit` gained the classic WAL barrier — a flush after the
+  commit marker, BEFORE checkpointing — so a power cut can no longer land checkpoint blocks on media while the commit
+  marker is still lost in the drive's volatile cache. **(2) Provisioning:** a fresh machine's only path to a persistent
+  `/data` used to be host-side `mkfs_tobyfs`; now the **Disk Manager** GUI (rebuilt on real data via the new
+  `ABI_SYS_BLK_LIST`, which reports name/model/geometry/partitions/FS signatures + a kernel-computed verdict) offers
+  **"Create tobyOS data volume…"** on eligible disks: a confirmation page shows the drive MODEL (captured from ATA/NVMe
+  IDENTIFY / SCSI INQUIRY into `blk_dev.model`) + exact byte size and requires TYPING THE DEVICE NAME before issuing
+  `ABI_SYS_DATA_PROVISION`. The kernel (`src/provision.c`) re-runs its guard regardless of the app: targets carrying a
+  foreign filesystem (NTFS/FAT/exFAT/ext/ISO9660) or foreign partition table (MBR with entries, GPT with any
+  non-tobyOS partition) are refused UNCONDITIONALLY — no flag overrides it, so the Windows disk and the live boot stick
+  are unwritable through this path; mounted volumes are refused; re-provisioning tobyOS-owned media needs FORCE (set by
+  the UI only after the typed confirm). Provisioning writes a spec-correct GPT (protective MBR, primary + backup
+  header/array, one `tobyOS-data`-GUID partition at LBA 2048) — exactly the layout boot discovery priority 0 keys on —
+  then tobyfs-formats and (when /data was RAM-backed) swaps the mount live. Proven by `-DPROVISION_SELFTEST` (guard
+  verdict battery incl. a "Windows-like" retyped GPT refused even with FORCE, `[PROV] ALL PASS`), `-DPROVISION_BLANK_BOOT`
+  (headless click stand-in: blank disk → GPT+format+mount, next boot rediscovers it via the GPT path), and
+  `-DDATA_PERSIST_BOOT` (marker file survives an abrupt QEMU kill = power cut, on AHCI and NVMe). Storage ~31% → ~33%.
 - **2026-06-27** — **Track B: a REAL, off-the-shelf GNU *bash* runs INTERACTIVELY over the TTY — unmodified GNU bash 5.2.**
   Where B22 ran busybox's small `ash` interactively, this runs the canonical, full-featured Unix shell: **unmodified GNU bash
   5.2-015** (the public reproducible `robxu9/bash-static` build, statically linked against musl 1.2.3 — so it runs through the

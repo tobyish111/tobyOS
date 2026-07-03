@@ -50,9 +50,15 @@ static int off_write(struct blk_dev *d, uint64_t lba, uint32_t count,
     return p->parent->ops->write(p->parent, p->offset_lba + lba, count, buf);
 }
 
+static int off_flush(struct blk_dev *d) {
+    struct blk_offset_priv *p = (struct blk_offset_priv *)d->priv;
+    return blk_flush(p->parent);
+}
+
 static const struct blk_ops g_off_ops = {
     .read  = off_read,
     .write = off_write,
+    .flush = off_flush,
 };
 
 /* Internal: do the heap allocation + plumbing. Public wrappers below
@@ -87,12 +93,13 @@ static struct blk_dev *wrap_internal(struct blk_dev *parent,
     dev->sector_count = size_lba;
     dev->priv         = priv;
     dev->class        = class;
-    /* For partitions, the caller fills these in after we return. For
-     * wrappers, parent stays NULL by design (they're "anonymous"). */
-    if (class == BLK_CLASS_PARTITION) {
-        dev->parent     = parent;
-        dev->offset_lba = offset_lba;
-    }
+    /* Both classes record their parent + offset now. Wrappers used to
+     * leave parent NULL ("anonymous"), but the provisioning guard must
+     * be able to see that a legacy installer wrapper mount lives on a
+     * given disk -- consumers that only want real partitions already
+     * filter on class, not on parent presence. */
+    dev->parent     = parent;
+    dev->offset_lba = offset_lba;
     return dev;
 }
 

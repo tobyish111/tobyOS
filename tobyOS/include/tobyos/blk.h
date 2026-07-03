@@ -47,6 +47,14 @@ struct blk_ops {
     int (*read) (struct blk_dev *dev, uint64_t lba, uint32_t count, void *buf);
     int (*write)(struct blk_dev *dev, uint64_t lba, uint32_t count,
                  const void *buf);
+    /* Flush the DEVICE's volatile write cache to stable media. blk_write
+     * returning 0 only means the drive accepted the data -- on real SSDs
+     * and HDDs it may still sit in the drive's RAM cache, where an abrupt
+     * power cut loses it. Durability barriers (tobyfs journal commit,
+     * bcache_sync) call blk_flush() after their writes. Optional: NULL
+     * means the device has no volatile cache to flush (RAM disks) or the
+     * driver predates the op; blk_flush() treats NULL as success. */
+    int (*flush)(struct blk_dev *dev);
 };
 
 /* Device class -- set by the registering layer. Disks come from PCI
@@ -94,6 +102,14 @@ struct blk_dev {
      * record visible lets `devlist blk` and `usbtest storage` report
      * "removed" instead of silently disappearing. */
     bool                gone;
+
+    /* Human-readable model string from the drive's IDENTIFY / INQUIRY
+     * data (ATA words 27..46, NVMe controller MN, SCSI vendor+product).
+     * Filled by the disk drivers at probe time; empty for partitions,
+     * wrappers, and drivers that predate the field. Shown to the user
+     * by the disk-manager confirm flow so "which physical drive am I
+     * about to format" is never a guess. */
+    char                model[41];
 };
 
 /* ---- block-device registry (milestone 21, expanded in 23A) -------
@@ -139,6 +155,11 @@ struct blk_dev *blk_first_partition(void);
 /* Diagnostic: one-line-per-device summary printed to serial. The M23A
  * version groups partitions under their parent disk for readability. */
 void blk_dump(void);
+
+/* Decode the model string out of a raw ATA IDENTIFY block (words
+ * 27..46, chars byte-swapped within each word) into dev->model,
+ * trimming the space padding. Shared by blk_ata + blk_ahci. */
+void blk_model_from_ata_id(struct blk_dev *dev, const uint16_t id[256]);
 
 /* Driver registration entry points called from kernel.c during boot.
  * Each one inserts a struct pci_driver into the bus registry. The
@@ -222,6 +243,11 @@ static inline int blk_write(struct blk_dev *d, uint64_t lba, uint32_t n, const v
     if (!d || d->gone) return -1;
     if (!d->ops->write) return -1;
     return d->ops->write(d, lba, n, b);
+}
+static inline int blk_flush(struct blk_dev *d) {
+    if (!d || d->gone) return -1;
+    if (!d->ops->flush) return 0;   /* no volatile cache -- trivially durable */
+    return d->ops->flush(d);
 }
 
 /* ---- async block I/O (command queuing) ---------------------------

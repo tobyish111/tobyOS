@@ -155,6 +155,7 @@
 #define ATA_CMD_IDENTIFY            0xEC
 #define ATA_CMD_READ_DMA_EXT        0x25
 #define ATA_CMD_WRITE_DMA_EXT       0x35
+#define ATA_CMD_FLUSH_CACHE_EXT     0xEA   /* drive write-cache -> media */
 #define ATA_CMD_READ_FPDMA_QUEUED   0x60   /* NCQ read  */
 #define ATA_CMD_WRITE_FPDMA_QUEUED  0x61   /* NCQ write */
 
@@ -258,6 +259,11 @@ struct ahci_port {
     struct blk_io            *inflight[AHCI_NCQ_SLOTS];
     volatile uint64_t         inflight_now;
     volatile uint64_t         max_inflight;
+    /* Set while a non-NCQ command (FLUSH CACHE EXT) needs the queue
+     * empty: ahci_ncq_submit refuses new tags (callers reap + retry,
+     * exactly like a full queue) until the flush completes. Mixing
+     * queued and non-queued commands is illegal per the SATA spec. */
+    volatile bool             quiesce;
 };
 
 /* Per-disk wrapper. blk_dev.priv -> &ahci_drive::port. */
@@ -578,6 +584,10 @@ static int ahci_identify(struct ahci_port *p, uint64_t *out_sectors) {
     if (qd > AHCI_NCQ_SLOTS) qd = AHCI_NCQ_SLOTS;
     p->nslots = qd;
 
+    /* `p` is always the first member of its enclosing ahci_drive, so
+     * this cast reaches the blk_dev whose model field we're filling. */
+    blk_model_from_ata_id(&((struct ahci_drive *)p)->blk, id);
+
     pmm_free_page(scratch_phys);
     return 0;
 }
@@ -688,7 +698,10 @@ static int ahci_ncq_submit(struct ahci_port *p, struct blk_io *io,
                            uint64_t lba, uint16_t count, void *buf,
                            bool is_write) {
     uint64_t f = spin_lock_irqsave(&p->lock);
-    if (p->free_slots == 0) { spin_unlock_irqrestore(&p->lock, f); return -1; }
+    if (p->quiesce || p->free_slots == 0) {
+        spin_unlock_irqrestore(&p->lock, f);
+        return -1;
+    }
     int tag = __builtin_ctz(p->free_slots);
 
     int n = build_prdt(p->ct[tag], buf, (uint32_t)count * BLK_SECTOR_SIZE);
@@ -780,9 +793,31 @@ static int ahci_blk_write(struct blk_dev *dev, uint64_t lba,
     return 0;
 }
 
+/* Flush the drive's volatile write cache (FLUSH CACHE EXT). A non-NCQ
+ * command may only be issued while no queued commands are outstanding,
+ * so on an NCQ port we first quiesce: block new tag submissions and
+ * reap until the queue drains, then run the flush through the legacy
+ * slot-0 path (zero PRDT entries -- non-data command). */
+static int ahci_blk_flush(struct blk_dev *dev) {
+    struct ahci_port *p = (struct ahci_port *)dev->priv;
+    if (p->ncq) {
+        p->quiesce = true;
+        while (p->inflight_mask) {
+            ahci_ncq_poll(p);
+            __asm__ volatile ("pause");
+        }
+    }
+    build_h2d_fis(p->ct[0]->cfis, ATA_CMD_FLUSH_CACHE_EXT, 0, 0);
+    int rc = ahci_issue(p, /*prdt_count*/ 0, /*is_write*/ false);
+    if (rc == 0 && (prt_r32(p->regs, AHCI_PxTFD) & AHCI_TFD_ERR)) rc = -3;
+    p->quiesce = false;
+    return rc;
+}
+
 static const struct blk_ops g_ahci_ops = {
     .read  = ahci_blk_read,
     .write = ahci_blk_write,
+    .flush = ahci_blk_flush,
 };
 
 /* ---- per-port + per-HBA init ----------------------------------- */

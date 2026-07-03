@@ -138,6 +138,7 @@ C_SRCS := src/kernel.c \
           src/blk_nvme.c \
           src/blk_offset.c \
           src/partition.c \
+          src/provision.c \
           src/tobyfs.c \
           src/fat32.c \
           src/ext4.c \

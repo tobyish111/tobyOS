@@ -736,8 +736,35 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
  *   ret:   0 on success, -ABI_EFAULT on a bad pointer. */
 #define ABI_SYS_CPU_STATS      168
 
+/* Persistent-storage provisioning (disk manager backend).
+ *
+ * SYS_BLK_LIST: enumerate every registered block device with real
+ * geometry + a provisioning verdict computed by the kernel guard.
+ *   args:  (struct abi_blk_info *out, uint32_t cap)
+ *   ret:   number of records written (>= 0), or -ABI_E*.
+ *
+ * SYS_DATA_PROVISION: create a tobyOS data volume on a whole disk:
+ * write a GPT with a single tobyOS-data partition, format it with
+ * tobyfs, and (when /data is RAM-backed or unmounted) mount it as
+ * /data. The KERNEL re-runs the safety guard regardless of what the
+ * calling app checked: targets carrying a foreign filesystem or a
+ * foreign partition table are refused unconditionally (no flag
+ * overrides this); targets that back a live mount are refused;
+ * targets already carrying tobyOS data need ABI_PROV_F_FORCE (set by
+ * the disk manager only after its typed confirmation).
+ *   args:  (const struct abi_provision_req *req)
+ *   ret:   ABI_PROV_OK_MOUNTED    -- provisioned + live as /data now
+ *          ABI_PROV_OK_NEXT_BOOT  -- provisioned; discovered next boot
+ *          -ABI_EPERM   foreign FS / partition table (never allowed)
+ *          -ABI_EBUSY   device (or a partition on it) is mounted
+ *          -ABI_EEXIST  tobyOS data present and FORCE not set
+ *          -ABI_EINVAL  not a whole disk / RAM disk / too small
+ *          -ABI_EIO     write/format/mount failed */
+#define ABI_SYS_BLK_LIST       169
+#define ABI_SYS_DATA_PROVISION 170
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          169
+#define ABI_SYS_NR_MAX          171
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
@@ -1018,6 +1045,79 @@ struct abi_dev_info {
 _Static_assert(sizeof(struct abi_dev_info) == 16 + ABI_DEVT_NAME_MAX +
                ABI_DEVT_DRIVER_MAX + ABI_DEVT_EXTRA_MAX,
                "abi_dev_info layout is FROZEN");
+
+/* ============================================================
+ *  Persistent-storage provisioning (SYS_BLK_LIST / SYS_DATA_PROVISION)
+ * ============================================================ */
+
+/* Provisioning verdict for a whole disk, computed by the kernel guard
+ * from read-only probes (partition table + filesystem signatures +
+ * the live VFS mount table). Only BLANK and TOBYOS are ever
+ * provisionable; everything else is refused by the kernel no matter
+ * what the calling app requests. */
+#define ABI_BLKV_UNKNOWN   0u   /* couldn't probe (I/O error, RAM disk) */
+#define ABI_BLKV_BLANK     1u   /* no partition table, no known FS      */
+#define ABI_BLKV_TOBYOS    2u   /* tobyOS data already present (FORCE)  */
+#define ABI_BLKV_FOREIGN   3u   /* foreign FS/table -- NEVER writable   */
+#define ABI_BLKV_MOUNTED   4u   /* backs a live mount -- never writable */
+#define ABI_BLKV_NOT_DISK  5u   /* partition/wrapper -- pick the disk   */
+
+/* abi_blk_info.flags bits. */
+#define ABI_BLK_F_MOUNTED  0x01u  /* dev (or a child) backs a live mount */
+#define ABI_BLK_F_DATA     0x02u  /* dev is the volume behind /data      */
+#define ABI_BLK_F_GPT      0x04u  /* GPT partition table present         */
+#define ABI_BLK_F_MBR      0x08u  /* legacy MBR partition table present  */
+#define ABI_BLK_F_TOBYFS   0x10u  /* tobyfs superblock found             */
+#define ABI_BLK_F_RAM      0x20u  /* RAM-backed (contents lost on boot)  */
+#define ABI_BLK_F_GONE     0x40u  /* hardware removed                    */
+
+#define ABI_BLK_NAME_MAX   32
+#define ABI_BLK_MODEL_MAX  44
+#define ABI_BLK_LABEL_MAX  24
+#define ABI_BLK_FS_MAX     12
+#define ABI_BLK_MAX_DEVICES 16    /* matches the kernel blk registry cap */
+
+/* One block device record. FROZEN 160-byte layout; new fields take
+ * over _reserved on the next ABI bump. */
+struct abi_blk_info {
+    char     name  [ABI_BLK_NAME_MAX];   /* "ahci0:p0", "nvme0:n1.p1"   */
+    char     model [ABI_BLK_MODEL_MAX];  /* IDENTIFY/INQUIRY model (disks) */
+    char     label [ABI_BLK_LABEL_MAX];  /* GPT partition label          */
+    char     fs    [ABI_BLK_FS_MAX];     /* "tobyfs","fat","ntfs","ext",
+                                          * "exfat","iso9660" or ""      */
+    uint64_t sector_count;               /* 512-byte sectors             */
+    uint64_t offset_lba;                 /* partitions: offset in parent */
+    uint8_t  class;                      /* 1=disk 2=partition 3=wrapper */
+    uint8_t  verdict;                    /* ABI_BLKV_* (disks only)      */
+    uint8_t  partition_index;            /* 1-based GPT slot (partitions)*/
+    uint8_t  _pad0;
+    uint32_t flags;                      /* ABI_BLK_F_*                  */
+    int16_t  parent;                     /* index into this list; -1 none*/
+    uint16_t _pad1;
+    uint32_t _reserved[5];
+};
+_Static_assert(sizeof(struct abi_blk_info) == 160,
+               "abi_blk_info layout is FROZEN");
+
+/* Success codes for SYS_DATA_PROVISION (failures are -ABI_E*). */
+#define ABI_PROV_OK_MOUNTED    0   /* volume created and live as /data  */
+#define ABI_PROV_OK_NEXT_BOOT  1   /* created; /data already on a real
+                                    * volume -- discovery picks the new
+                                    * partition up on the next boot     */
+
+/* Request flags. FORCE unlocks re-provisioning a target that already
+ * carries tobyOS data (whole-disk tobyfs or a tobyOS-only GPT). It
+ * does NOT unlock foreign filesystems / partition tables -- those are
+ * refused unconditionally in the kernel. */
+#define ABI_PROV_F_FORCE   0x1u
+
+struct abi_provision_req {
+    char     dev[ABI_BLK_NAME_MAX];      /* whole-disk device name       */
+    uint32_t flags;                      /* ABI_PROV_F_*                 */
+    uint32_t _reserved[7];
+};
+_Static_assert(sizeof(struct abi_provision_req) == 64,
+               "abi_provision_req layout is FROZEN");
 
 /* ============================================================
  *  Hot-plug events (Milestone 26C)

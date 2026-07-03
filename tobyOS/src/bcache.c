@@ -149,28 +149,59 @@ void bcache_release(struct blk_dev *dev, uint64_t block_lba) {
     spin_unlock_irqrestore(&g_lock, flags);
 }
 
+/* Devices whose dirty blocks were written back during one sync /
+ * invalidate pass. Collected under the lock, flushed after release --
+ * blk_flush may take milliseconds on spinning media and can yield in
+ * blk_io_wait, neither of which belongs inside a spinlock. */
+struct bcache_flush_set {
+    struct blk_dev *devs[8];
+    int             n;
+};
+
+static void flush_set_add(struct bcache_flush_set *s, struct blk_dev *d) {
+    for (int i = 0; i < s->n; i++)
+        if (s->devs[i] == d) return;
+    if (s->n < (int)(sizeof(s->devs) / sizeof(s->devs[0])))
+        s->devs[s->n++] = d;
+}
+
+static void flush_set_run(struct bcache_flush_set *s) {
+    for (int i = 0; i < s->n; i++)
+        (void)blk_flush(s->devs[i]);
+}
+
 void bcache_sync(struct blk_dev *dev) {
+    struct bcache_flush_set fs = { .n = 0 };
     uint64_t flags = spin_lock_irqsave(&g_lock);
     for (uint32_t i = 0; i < BCACHE_MAX_ENTRIES; i++) {
         struct bcache_entry *e = &g_cache[i];
         if (!e->valid || !e->dirty) continue;
         if (dev && e->dev != dev) continue;
-        flush_entry(e);
+        if (flush_entry(e) == 0) flush_set_add(&fs, e->dev);
     }
     spin_unlock_irqrestore(&g_lock, flags);
+    /* Durability barrier: the writes above only reached the DRIVE's
+     * volatile cache. Callers (tobyfs journal checkpoint) rely on
+     * bcache_sync meaning "on stable media", so issue the device
+     * flush too. Always include the named dev -- its journal writes
+     * go direct via blk_write and never show up as dirty entries. */
+    if (dev) flush_set_add(&fs, dev);
+    flush_set_run(&fs);
 }
 
 void bcache_invalidate(struct blk_dev *dev) {
+    struct bcache_flush_set fs = { .n = 0 };
     uint64_t flags = spin_lock_irqsave(&g_lock);
     for (uint32_t i = 0; i < BCACHE_MAX_ENTRIES; i++) {
         struct bcache_entry *e = &g_cache[i];
         if (!e->valid) continue;
         if (dev && e->dev != dev) continue;
-        if (e->dirty) flush_entry(e);
+        if (e->dirty && flush_entry(e) == 0) flush_set_add(&fs, e->dev);
         e->valid    = false;
         e->refcount = 0;
     }
     spin_unlock_irqrestore(&g_lock, flags);
+    flush_set_run(&fs);
 }
 
 void bcache_discard(struct blk_dev *dev) {

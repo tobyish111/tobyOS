@@ -180,6 +180,13 @@ int tobyfs_mount(const char *mount_point, struct blk_dev *dev);
  * or VFS_ERR_IO / VFS_ERR_INVAL. */
 int tobyfs_format(struct blk_dev *dev);
 
+/* Identification helpers for VFS mount-table walks (see vfs_iter_mounts):
+ * tobyfs_ops_addr() returns the static vtable pointer so callers can
+ * recognise tobyfs mounts; tobyfs_blkdev_of() maps a recognised mount's
+ * opaque mount-data back to its backing block device. */
+const void *tobyfs_ops_addr(void);
+struct blk_dev *tobyfs_blkdev_of(void *mnt);
+
 /* ============================================================
  *  Milestone 28E: filesystem integrity checker.
  *
