@@ -2795,59 +2795,87 @@ void _start(void) {
                         (unsigned long)gpt_data->sector_count);
                 data_mounted = true;
             } else {
-                kprintf("[boot] GPT data partition '%s' present but tobyfs "
-                        "mount failed: %s -- falling through to legacy paths\n",
+                /* Tagged as ours but not yet a tobyfs -> provision it. This is
+                 * the ONLY place tobyOS creates a filesystem unprompted, and
+                 * only on a partition the user explicitly designated for us via
+                 * this GPT type GUID -- never a foreign/Windows one. */
+                kprintf("[boot] tobyOS-data partition '%s' has no tobyfs (%s) "
+                        "-- auto-formatting it for /data\n",
                         gpt_data->name, vfs_strerror(rc));
+                int fmt = tobyfs_format(gpt_data);
+                /* The failed probe above cached this partition's (blank)
+                 * superblock; format just wrote a fresh one straight to the
+                 * device, so drop the stale cache before re-mounting or the
+                 * mount re-reads the pre-format bytes and fails. */
+                if (fmt == VFS_OK) bcache_invalidate(gpt_data);
+                if (fmt == VFS_OK &&
+                    tobyfs_mount("/data", gpt_data) == VFS_OK) {
+                    kprintf("[boot] provisioned + mounted /data on tobyOS-data "
+                            "partition '%s'\n", gpt_data->name);
+                    data_mounted = true;
+                } else {
+                    kprintf("[boot] could not provision tobyOS-data partition "
+                            "'%s' -- trying other volumes\n", gpt_data->name);
+                }
             }
         }
 
+        /* ---- Priority 2: sweep EVERY block device -- SATA, NVMe, a USB stick
+         * (usb_msc), IDE -- for one that ALREADY holds a valid tobyfs, and
+         * mount the first match. Probing is READ-ONLY: tobyfs_mount validates
+         * the superblock magic and returns without writing on a non-tobyfs
+         * device, so sweeping even a foreign Windows disk is safe. This is what
+         * lets /data live on a plain tobyfs-formatted USB stick or spare disk
+         * (no partition table needed) no matter which disk enumerated first --
+         * the old code only tried blk_first_disk(), so a tobyfs USB was missed
+         * whenever an internal disk came first. Partitions before whole disks
+         * so an explicit data partition wins over a whole-disk image. */
         if (!data_mounted) {
-            /* Milestone 21: ask the block-device registry for "first
-             * disk".  blk_ata's PCI probe (run during pci_bind_drivers
-             * above) will have called blk_register() if it found an
-             * IDE primary master. On boards/QEMU configurations
-             * without IDE this returns NULL and we fall through to
-             * the "/data unavailable" path -- exactly the behaviour
-             * the old direct-init had. AHCI/NVMe drivers will
-             * register their disks the same way in steps 1 and 2. */
-            struct blk_dev *disk = blk_first_disk();
-            if (!disk) disk = blk_get_first();
-            if (disk) {
-                int rc = tobyfs_mount("/data", disk);
-                if (rc == VFS_OK) {
-                    kprintf("[boot] mounted /data on whole disk '%s' "
-                            "(legacy LBA-0 layout)\n", disk->name);
-                    data_mounted = true;
-                } else {
-                    kprintf("[boot] /data at LBA 0 not a tobyfs (%s); "
-                            "trying installed layout at LBA %u...\n",
-                            vfs_strerror(rc), INSTALLER_BOOT_SECTORS);
-                    uint64_t avail = disk->sector_count > INSTALLER_BOOT_SECTORS
-                        ? disk->sector_count - INSTALLER_BOOT_SECTORS : 0;
-                    if (avail >= TFS_TOTAL_BLOCKS * TFS_SECTORS_PER_BLOCK) {
-                        struct blk_dev *part = blk_offset_wrap(
-                            disk, INSTALLER_BOOT_SECTORS, avail, "data");
-                        if (part) {
-                            rc = tobyfs_mount("/data", part);
-                            if (rc != VFS_OK) {
-                                kprintf("[boot] no tobyfs at installed offset "
-                                        "either: %s -- /data unavailable\n",
-                                        vfs_strerror(rc));
-                            } else {
-                                kprintf("[boot] mounted installed /data at "
-                                        "LBA %u\n", INSTALLER_BOOT_SECTORS);
-                                data_mounted = true;
-                            }
-                        }
-                    } else {
-                        kprintf("[boot] disk too small for installed layout "
-                                "-- /data unavailable\n");
+            const enum blk_dev_class sweep[2] = {
+                BLK_CLASS_PARTITION, BLK_CLASS_DISK
+            };
+            for (unsigned s = 0; !data_mounted && s < 2; s++) {
+                size_t it = 0;
+                struct blk_dev *d;
+                while ((d = blk_iter_next(&it, sweep[s])) != NULL) {
+                    if (d == gpt_data) continue;      /* already tried above */
+                    if (tobyfs_mount("/data", d) == VFS_OK) {
+                        kprintf("[boot] mounted /data on %s '%s' "
+                                "(existing tobyfs)\n",
+                                sweep[s] == BLK_CLASS_PARTITION ? "partition"
+                                                                : "disk",
+                                d->name);
+                        data_mounted = true;
+                        break;
                     }
                 }
-            } else {
-                kprintf("[boot] no disk -- /data unavailable this boot\n");
             }
         }
+
+        /* ---- Priority 3: legacy installed layout (tobyfs at LBA
+         * INSTALLER_BOOT_SECTORS on the first disk -- carved without a
+         * partition table by the old installer). */
+        if (!data_mounted) {
+            struct blk_dev *disk = blk_first_disk();
+            if (!disk) disk = blk_get_first();
+            if (disk && disk->sector_count > INSTALLER_BOOT_SECTORS) {
+                uint64_t avail = disk->sector_count - INSTALLER_BOOT_SECTORS;
+                if (avail >= TFS_TOTAL_BLOCKS * TFS_SECTORS_PER_BLOCK) {
+                    struct blk_dev *part = blk_offset_wrap(
+                        disk, INSTALLER_BOOT_SECTORS, avail, "data");
+                    if (part && tobyfs_mount("/data", part) == VFS_OK) {
+                        kprintf("[boot] mounted installed /data at LBA %u on "
+                                "'%s'\n", INSTALLER_BOOT_SECTORS, disk->name);
+                        data_mounted = true;
+                    }
+                }
+            }
+        }
+
+        if (!data_mounted)
+            kprintf("[boot] /data unavailable this boot -- no tobyfs volume "
+                    "found on any disk/USB. Format a stick with mkfs_tobyfs or "
+                    "create a tobyOS-data GPT partition to enable persistence.\n");
 
         /* DATA SAFETY (real hardware): tobyOS must NOT auto-mount or write
          * filesystems that belong to OTHER operating systems on the
