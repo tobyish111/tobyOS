@@ -31,7 +31,13 @@ typedef long               ssize_t;
 #define SYS_FS_NAME_MAX    64
 #define SYS_FS_TYPE_FILE   1
 
-struct vfs_dirent_user { char name[SYS_FS_NAME_MAX]; unsigned type; unsigned size; };
+/* MUST match the kernel ABI struct (name/type/size/uid/gid/mode); omitting the
+ * trailing fields makes each entry 12 B short and sys_fs_readdir overruns this
+ * array -- see the gui_files fix for the full story. */
+struct vfs_dirent_user {
+    char     name[SYS_FS_NAME_MAX];
+    unsigned type, size, uid, gid, mode;
+};
 
 /* arrow / nav key codes posted by the kernel (match the original) */
 #define KEY_UP    0x80

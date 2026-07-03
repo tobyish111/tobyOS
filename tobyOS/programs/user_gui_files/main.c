@@ -31,7 +31,15 @@ typedef long          ssize_t;
 #define SYS_FS_TYPE_FILE   1
 #define SYS_FS_TYPE_DIR    2
 
-struct vfs_dirent_user { char name[SYS_FS_NAME_MAX]; uint32_t type; uint32_t size; };
+/* MUST match the kernel ABI struct (include/tobyos/syscall.h): the kernel's
+ * sys_fs_readdir writes uid/gid/mode too, so omitting them makes each entry
+ * 12 B short -- the kernel then strides by its (larger) size and OVERRUNS this
+ * array once a directory has enough entries, clobbering the globals right
+ * after g_entries[] (the widget pointers) and GP-faulting in tk_set_text. */
+struct vfs_dirent_user {
+    char     name[SYS_FS_NAME_MAX];
+    uint32_t type, size, uid, gid, mode;
+};
 
 /* ---- syscall stubs (filesystem only) --------------------------------- */
 static inline ssize_t sys_write_to(int fd,const void *b,usize n){ ssize_t r; __asm__ volatile("syscall":"=a"(r):"0"((long)SYS_WRITE),"D"((long)fd),"S"(b),"d"(n):"rcx","r11","memory"); return r; }
@@ -119,6 +127,7 @@ static void refresh_listing(void){
     g_entry_count=0; g_selected=0;
     long n=sys_fs_readdir(g_path,g_entries,ENTRIES_MAX,0);
     if(n<0){ g_entry_count=0; set_status("Error reading directory"); return; }
+    if(n>ENTRIES_MAX)n=ENTRIES_MAX;   /* defensive: never index past g_entries[] */
     g_entry_count=(int)n; sort_entries();
     for(int i=0;i<SIDEBAR_COUNT;i++) if(streq(g_path,g_sidebar_paths[i])){ g_sidebar_sel=i; break; }
     int dirs=0,files=0;
