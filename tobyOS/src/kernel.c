@@ -112,6 +112,48 @@
 #include <tobyos/page_fault.h>
 #include <tobyos/bcache.h>
 
+/* ---- RAM-backed /data fallback ------------------------------------------
+ * When NO writable tobyfs volume is found on any disk/USB, back /data with an
+ * in-RAM tobyfs so the desktop is still fully usable -- files, settings, and
+ * users all save in-session -- instead of a read-only /data where every write
+ * fails. It is NON-persistent (contents reset on reboot) and is always
+ * superseded by a real volume (the disk sweep runs first). See the /data
+ * mount block in the boot path. */
+#define RAMDATA_BYTES  (8u * 1024u * 1024u)      /* 8 MiB in-RAM /data */
+static uint8_t       *g_ramdata;
+static struct blk_dev g_ramdata_dev;
+
+static int ramdata_read(struct blk_dev *d, uint64_t lba, uint32_t n, void *buf) {
+    (void)d;
+    uint64_t off = lba * 512ull, len = (uint64_t)n * 512ull;
+    if (!g_ramdata || off + len > RAMDATA_BYTES) return -1;
+    memcpy(buf, g_ramdata + off, (size_t)len);
+    return 0;
+}
+static int ramdata_write(struct blk_dev *d, uint64_t lba, uint32_t n,
+                         const void *buf) {
+    (void)d;
+    uint64_t off = lba * 512ull, len = (uint64_t)n * 512ull;
+    if (!g_ramdata || off + len > RAMDATA_BYTES) return -1;
+    memcpy(g_ramdata + off, buf, (size_t)len);
+    return 0;
+}
+static const struct blk_ops g_ramdata_ops = {
+    .read = ramdata_read, .write = ramdata_write,
+};
+/* Build (once) the in-RAM block device backing the /data fallback. */
+static struct blk_dev *ramdata_device(void) {
+    if (g_ramdata) return &g_ramdata_dev;
+    g_ramdata = (uint8_t *)kmalloc(RAMDATA_BYTES);
+    if (!g_ramdata) return 0;
+    memset(g_ramdata, 0, RAMDATA_BYTES);
+    g_ramdata_dev.name         = "ramdata";
+    g_ramdata_dev.ops          = &g_ramdata_ops;
+    g_ramdata_dev.sector_count = RAMDATA_BYTES / 512u;
+    g_ramdata_dev.class        = BLK_CLASS_DISK;
+    return &g_ramdata_dev;
+}
+
 /* New subsystem headers */
 extern void devmgr_init(void);
 extern void devmgr_enumerate(void);
@@ -2872,10 +2914,25 @@ void _start(void) {
             }
         }
 
-        if (!data_mounted)
-            kprintf("[boot] /data unavailable this boot -- no tobyfs volume "
-                    "found on any disk/USB. Format a stick with mkfs_tobyfs or "
-                    "create a tobyOS-data GPT partition to enable persistence.\n");
+        /* ---- Priority 4: no persistent volume found -> RAM-backed /data so
+         * the desktop still works (files/settings save in-session). Non-
+         * persistent; a real disk/USB is always preferred by the sweep above. */
+        if (!data_mounted) {
+            struct blk_dev *rd = ramdata_device();
+            if (rd && tobyfs_format(rd) == VFS_OK) {
+                bcache_invalidate(rd);
+                if (tobyfs_mount("/data", rd) == VFS_OK) {
+                    kprintf("[boot] /data is RAM-backed (8 MiB, NOT persistent "
+                            "-- no disk/USB tobyfs volume found; contents reset "
+                            "on reboot). Format a stick/disk with mkfs_tobyfs, "
+                            "or make a tobyOS-data GPT partition, to persist.\n");
+                    data_mounted = true;
+                }
+            }
+            if (!data_mounted)
+                kprintf("[boot] /data unavailable this boot -- even the RAM "
+                        "fallback failed (out of memory?).\n");
+        }
 
         /* DATA SAFETY (real hardware): tobyOS must NOT auto-mount or write
          * filesystems that belong to OTHER operating systems on the
