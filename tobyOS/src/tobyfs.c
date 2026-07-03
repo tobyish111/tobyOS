@@ -230,6 +230,15 @@ static int journal_commit(struct tobyfs *fs) {
     for (int i = 0; i < count; i++)
         (void)write_block_raw(fs, fs->txn_blocks[i], fs->txn_data[i]);
 
+    /* Durability barrier. write_block_raw goes through the WRITE-BACK block
+     * cache, so the checkpointed data currently lives only in RAM. Flush it to
+     * the physical device BEFORE clearing the journal below -- otherwise a
+     * power loss after the (on-disk) journal is cleared loses the committed
+     * data with no log left to replay, which silently defeats the whole
+     * journal (observed: a saved file vanishing across a reboot). A crash
+     * between this flush and the clear just re-replays the txn (idempotent). */
+    bcache_sync(fs->dev);
+
     /* 5. Clear the journal header (marks txn as fully checkpointed). */
     memset(buf, 0, sizeof(buf));
     (void)blk_write(fs->dev, (uint64_t)jbase * TFS_SECTORS_PER_BLOCK,
@@ -295,8 +304,14 @@ static void journal_recover(struct tobyfs *fs) {
     }
 
 clear:
+    /* Flush any replayed blocks to the device, THEN clear the on-disk journal
+     * durably (blk_write, not the write-back cache) -- same ordering as
+     * journal_commit, so a crash mid-recovery re-replays (idempotent) rather
+     * than clearing the log while the recovered data is still only in RAM. */
+    bcache_sync(fs->dev);
     memset(buf, 0, sizeof(buf));
-    (void)write_block_raw(fs, jbase, buf);
+    (void)blk_write(fs->dev, (uint64_t)jbase * TFS_SECTORS_PER_BLOCK,
+                    TFS_SECTORS_PER_BLOCK, buf);
 }
 
 /* -------- bitmap helpers (operate on the in-memory copy + flush) -------- */
