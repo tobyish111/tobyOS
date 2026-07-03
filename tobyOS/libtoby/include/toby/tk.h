@@ -61,6 +61,15 @@ extern "C" {
 #define TK_KEY_DOWN       0x81
 #define TK_KEY_LEFT       0x82
 #define TK_KEY_RIGHT      0x83
+#define TK_KEY_HOME       0x84
+#define TK_KEY_END        0x85
+#define TK_KEY_DELETE     0x86
+#define TK_KEY_MENU       0x87   /* keyboard context-menu (Apps) key */
+
+/* tk_event.button bit masks (mirror the kernel's gui_event buttons). */
+#define TK_BTN_LEFT       0x01
+#define TK_BTN_RIGHT      0x02
+#define TK_BTN_MIDDLE     0x04
 
 /* Byte-compatible with the kernel struct gui_event. */
 struct tk_event {
@@ -122,6 +131,16 @@ typedef void (*tk_event_cb)(struct tk_window *win, struct tk_widget *w,
  * key routing -- the app owns the keyboard. Leave unset for normal
  * field/checkbox/list keyboard behaviour. */
 typedef void (*tk_key_cb)(struct tk_window *win, struct tk_event *ev);
+/* Context-menu selection callback: `id` is the ids[] entry of the item
+ * the user picked (the menu is already closed when this runs). */
+typedef void (*tk_menu_cb)(struct tk_window *win, int id);
+/* Window-level right-click hook (tk_on_context). Fires on a MOUSE_DOWN
+ * whose button mask has TK_BTN_RIGHT set, after the toolkit updated the
+ * selection of the table/listbox under the cursor (so the handler can
+ * open a context menu for the row that was right-clicked). `w` is the
+ * hit widget (may be NULL for the window background). */
+typedef void (*tk_context_cb)(struct tk_window *win, struct tk_widget *w,
+                              struct tk_event *ev);
 
 struct tk_widget {
     int  kind;
@@ -214,6 +233,19 @@ struct tk_window {
     int  n_dirty;
     int  dirty_full;
     tk_key_cb on_key;            /* optional global key hook (see tk_on_key) */
+    tk_context_cb on_context;    /* optional right-click hook (tk_on_context) */
+
+    /* Popup context menu (tk_menu_open). Painted above every widget and
+     * given first claim on mouse/key events while open. `menu_items` /
+     * `menu_ids` are app-owned and must stay alive until the menu
+     * closes. An item whose text is "-" draws as a separator. */
+    int  menu_open;
+    int  menu_x, menu_y, menu_w, menu_h;
+    int  menu_n, menu_hover;
+    const char *const *menu_items;
+    const int *menu_ids;
+    tk_menu_cb menu_cb;
+
     void *user;                  /* app-owned */
 };
 
@@ -225,6 +257,19 @@ void tk_theme_default(struct tk_theme *t);
 struct tk_widget *tk_root(struct tk_window *win);
 void tk_maximize(struct tk_window *win);   /* fill the screen */
 void tk_on_key(struct tk_window *win, tk_key_cb on_key);  /* global key hook */
+void tk_on_context(struct tk_window *win, tk_context_cb cb); /* right-click hook */
+
+/* ---- popup context menu --------------------------------------------- *
+ * Open a floating menu at window-client (x, y) -- typically the ev->x/y
+ * of the right-click that triggered it. `items` are the visible labels
+ * ("-" = separator), `ids` the values handed to `cb` on selection; both
+ * arrays are borrowed until the menu closes. The menu claims mouse and
+ * keyboard (arrows + Enter + Esc) while open; clicking outside or Esc
+ * dismisses it without a callback. */
+void tk_menu_open(struct tk_window *win, int x, int y,
+                  const char *const *items, const int *ids, int n,
+                  tk_menu_cb cb);
+void tk_menu_close(struct tk_window *win);
 
 /* ---- widget construction ------------------------------------------- *
  * `parent` NULL means "attach to root". All return a pointer into the

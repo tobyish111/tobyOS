@@ -210,14 +210,29 @@ static void hid_kbd_press(struct hid_dev_state *st, uint8_t usage,
         return;
     }
 
-    /* Arrow cluster (usages 0x4F..0x52) -> the GUI arrow byte codes
-     * (TK_KEY_RIGHT/LEFT/DOWN/UP = 0x83/0x82/0x81/0x80), mirroring the
-     * PS/2 E0 path. GUI-only: the text console has no use for them. */
-    if (usage >= 0x4F && usage <= 0x52) {
-        if (gui_active()) {
-            static const uint8_t arrow_code[4] = { 0x83, 0x82, 0x81, 0x80 };
-            kbd_dispatch_char((char)arrow_code[usage - 0x4F]);
-        }
+    /* Navigation cluster -> the GUI byte codes (TK_KEY_*), mirroring
+     * the PS/2 E0 path. GUI-only: the text console has no use for
+     * them. Usages: 0x4A Home, 0x4C Delete, 0x4D End, 0x4F Right,
+     * 0x50 Left, 0x51 Down, 0x52 Up. */
+    if (usage >= 0x4A && usage <= 0x52) {
+        static const uint8_t nav_code[9] = {
+            0x84,       /* 0x4A Home   */
+            0,          /* 0x4B PageUp (unmapped) */
+            0x86,       /* 0x4C Delete */
+            0x85,       /* 0x4D End    */
+            0,          /* 0x4E PageDn (unmapped) */
+            0x83,       /* 0x4F Right  */
+            0x82,       /* 0x50 Left   */
+            0x81,       /* 0x51 Down   */
+            0x80,       /* 0x52 Up     */
+        };
+        uint8_t code = nav_code[usage - 0x4A];
+        if (code && gui_active()) kbd_dispatch_char((char)code);
+        return;
+    }
+    /* Application (context-menu) key. */
+    if (usage == 0x65) {
+        if (gui_active()) kbd_dispatch_char((char)0x87);
         return;
     }
 

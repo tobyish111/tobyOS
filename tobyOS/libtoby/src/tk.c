@@ -884,16 +884,23 @@ static void paint_widget(struct tk_window *win, struct tk_widget *w) {
     for (int i = 0; i < w->n_child; i++) paint_widget(win, w->child[i]);
 }
 
+/* Forward decl: defined with the popup-menu machinery below. */
+static void paint_menu(struct tk_window *win);
+
 /* Whole-window repaint: fill the bg + walk the tree + flip everything. */
 static void repaint_full(struct tk_window *win) {
     clip_off();
     do_layout(win);
     g_fill(win->fd, 0, 0, win->w, win->h, win->theme.window_bg);
     paint_widget(win, win->root);
+    paint_menu(win);         /* context menu floats above everything */
     g_flip(win->fd);
 }
 
 static void repaint(struct tk_window *win) {
+    /* The floating menu overlaps arbitrary widget rects, so partial
+     * repaints are unsafe while it is up (they'd punch holes in it). */
+    if (win->menu_open) win->dirty_full = 1;
     if (win->dirty_full || win->n_dirty == 0) {
         repaint_full(win);
     } else {
@@ -933,6 +940,127 @@ static void repaint(struct tk_window *win) {
     win->dirty_full  = 0;
     win->n_dirty     = 0;
     clip_off();
+}
+
+/* ---- popup context menu ---------------------------------------------- *
+ *
+ * A single window-level floating menu (tk_menu_open). It is not a
+ * widget: it renders after the whole tree (so it floats above every
+ * sibling regardless of layout) and gets first claim on events in
+ * dispatch() (so it behaves modally, like a Windows context menu). */
+
+#define MENU_ITEM_H  24
+#define MENU_SEP_H   9
+#define MENU_PAD     4
+#define MENU_MIN_W   140
+
+static int menu_is_sep(const char *s) { return s && s[0] == '-' && !s[1]; }
+static int menu_row_h(const char *s)  { return menu_is_sep(s) ? MENU_SEP_H : MENU_ITEM_H; }
+
+/* Selectable row index under (x, y), or -1 (separator / outside). */
+static int menu_row_at(struct tk_window *win, int x, int y) {
+    if (!win->menu_open) return -1;
+    if (x < win->menu_x || x >= win->menu_x + win->menu_w) return -1;
+    int ry = win->menu_y + MENU_PAD;
+    for (int i = 0; i < win->menu_n; i++) {
+        int h = menu_row_h(win->menu_items[i]);
+        if (y >= ry && y < ry + h)
+            return menu_is_sep(win->menu_items[i]) ? -1 : i;
+        ry += h;
+    }
+    return -1;
+}
+
+static int menu_point_in(struct tk_window *win, int x, int y) {
+    return win->menu_open &&
+           x >= win->menu_x && x < win->menu_x + win->menu_w &&
+           y >= win->menu_y && y < win->menu_y + win->menu_h;
+}
+
+void tk_menu_close(struct tk_window *win) {
+    if (!win || !win->menu_open) return;
+    win->menu_open = 0;
+    tk_mark_full(win);
+}
+
+void tk_menu_open(struct tk_window *win, int x, int y,
+                  const char *const *items, const int *ids, int n,
+                  tk_menu_cb cb) {
+    if (!win || !items || !ids || n <= 0) return;
+    int px = win->default_font_px;
+    int w = MENU_MIN_W, h = 2 * MENU_PAD;
+    for (int i = 0; i < n; i++) {
+        h += menu_row_h(items[i]);
+        int tw = g_text_w(items[i], px, 0) + 36;
+        if (!menu_is_sep(items[i]) && tw > w) w = tw;
+    }
+    /* Keep the whole menu inside the window: flip up/left if it would
+     * run off the bottom/right edge, then clamp to the origin. */
+    if (y + h > win->h) y = y - h;
+    if (x + w > win->w) x = win->w - w;
+    if (y < 0) y = 0;
+    if (x < 0) x = 0;
+    win->menu_x = x; win->menu_y = y;
+    win->menu_w = w; win->menu_h = h;
+    win->menu_items = items;
+    win->menu_ids   = ids;
+    win->menu_n     = n;
+    win->menu_hover = -1;
+    win->menu_cb    = cb;
+    win->menu_open  = 1;
+    tk_mark_full(win);
+}
+
+static void paint_menu(struct tk_window *win) {
+    if (!win->menu_open) return;
+    struct tk_theme *t = &win->theme;
+    int px = win->default_font_px;
+    int mx = win->menu_x, my = win->menu_y;
+    int mw = win->menu_w, mh = win->menu_h;
+
+    g_fill(win->fd, mx + 3, my + 3, mw, mh, 0x000A0C10);   /* soft shadow */
+    g_fill(win->fd, mx, my, mw, mh, t->panel_bg);
+    border(win, mx, my, mw, mh, t->border);
+
+    int ry = my + MENU_PAD;
+    for (int i = 0; i < win->menu_n; i++) {
+        const char *s = win->menu_items[i];
+        int rh = menu_row_h(s);
+        if (menu_is_sep(s)) {
+            g_fill(win->fd, mx + 8, ry + rh / 2, mw - 16, 1, t->border);
+        } else {
+            if (i == win->menu_hover) {
+                g_fill(win->fd, mx + 2, ry, mw - 4, rh, t->list_sel);
+                g_fill(win->fd, mx + 2, ry, 3, rh, t->accent);
+            }
+            g_text(win->fd, mx + 14, ry + (rh - px) / 2, s,
+                   i == win->menu_hover ? t->text : t->list_text, px, 0);
+        }
+        ry += rh;
+    }
+}
+
+/* Move the menu hover to the next/prev selectable row (keyboard nav). */
+static void menu_hover_step(struct tk_window *win, int dir) {
+    int i = win->menu_hover;
+    for (int tries = 0; tries < win->menu_n + 1; tries++) {
+        i += dir;
+        if (i < 0) i = win->menu_n - 1;
+        if (i >= win->menu_n) i = 0;
+        if (!menu_is_sep(win->menu_items[i])) { win->menu_hover = i; return; }
+    }
+}
+
+static void menu_select(struct tk_window *win, int row) {
+    if (row < 0 || row >= win->menu_n) return;
+    tk_menu_cb cb = win->menu_cb;
+    int id = win->menu_ids[row];
+    tk_menu_close(win);          /* close FIRST -- the cb may rebuild */
+    if (cb) cb(win, id);
+}
+
+void tk_on_context(struct tk_window *win, tk_context_cb cb) {
+    if (win) win->on_context = cb;
 }
 
 /* ---- hit-testing + event dispatch ----------------------------------- */
@@ -982,6 +1110,41 @@ static void slider_set_from_x(struct tk_window *win, struct tk_widget *w, int mx
 }
 
 static void dispatch(struct tk_window *win, struct tk_event *ev) {
+    /* An open context menu is modal: it owns the mouse and keyboard
+     * until a selection is made or it is dismissed. */
+    if (win->menu_open) {
+        switch (ev->type) {
+        case TK_EV_MOUSE_DOWN: {
+            int row = menu_row_at(win, ev->x, ev->y);
+            if (row >= 0) { menu_select(win, row); return; }
+            if (!menu_point_in(win, ev->x, ev->y)) tk_menu_close(win);
+            return;                       /* swallow the click either way */
+        }
+        case TK_EV_MOUSE_UP:
+            return;
+        case TK_EV_MOUSE_MOVE: {
+            int row = menu_row_at(win, ev->x, ev->y);
+            if (row != win->menu_hover) {
+                win->menu_hover = row;
+                tk_mark_full(win);
+            }
+            return;
+        }
+        case TK_EV_KEY:
+            if (ev->key == 0x1B) { tk_menu_close(win); return; }
+            if (ev->key == TK_KEY_DOWN) { menu_hover_step(win, 1);  tk_mark_full(win); return; }
+            if (ev->key == TK_KEY_UP)   { menu_hover_step(win, -1); tk_mark_full(win); return; }
+            if (ev->key == TK_KEY_ENTER || ev->key == '\r') {
+                if (win->menu_hover >= 0) menu_select(win, win->menu_hover);
+                return;
+            }
+            return;                        /* menu swallows all other keys */
+        default:
+            tk_menu_close(win);            /* close/resize: drop the menu */
+            break;                         /* ...then handle normally */
+        }
+    }
+
     switch (ev->type) {
     case TK_EV_CLOSE:
         win->want_quit = 1;
@@ -992,6 +1155,37 @@ static void dispatch(struct tk_window *win, struct tk_event *ev) {
         return;
     case TK_EV_MOUSE_DOWN: {
         struct tk_widget *h = hit_test(win->root, ev->x, ev->y);
+
+        /* Right-click: update the selection of the table/listbox under
+         * the cursor (so a context menu targets the row that was
+         * clicked), then hand the event to the app's tk_on_context
+         * hook. Never runs button/checkbox/slider actions. */
+        if (ev->button & TK_BTN_RIGHT) {
+            if (h && h->kind == TK_TABLE) {
+                int head_h = h->th ? TABLE_HEAD_H : 0;
+                int rel = ev->y - (h->y + head_h + 1);
+                if (rel >= 0) {
+                    int row = h->scroll + rel / LIST_ITEM_H;
+                    if (row >= 0 && row < h->nrows && row != h->sel) {
+                        h->sel = row;
+                        if (h->on_change) h->on_change(win, h);
+                    }
+                }
+                win->want_redraw = 1;
+            } else if (h && h->kind == TK_LISTBOX) {
+                int rel = ev->y - (h->y + 2);
+                if (rel >= 0) {
+                    int idx = h->scroll + rel / LIST_ITEM_H;
+                    if (idx >= 0 && idx < h->n_items && idx != h->sel) {
+                        h->sel = idx;
+                        if (h->on_change) h->on_change(win, h);
+                    }
+                }
+                win->want_redraw = 1;
+            }
+            if (win->on_context) win->on_context(win, h, ev);
+            return;
+        }
         set_focus(win, (h && h->focusable) ? h : 0);
         if (!h) return;
         if (h->kind == TK_BUTTON) {
@@ -1072,6 +1266,35 @@ static void dispatch(struct tk_window *win, struct tk_event *ev) {
         return;
     }
     case TK_EV_KEY: {
+        /* Keyboard Menu (Apps) key: open the context menu for the
+         * focused widget -- anchored at the selected row for tables/
+         * listboxes so it matches what a right-click there would do. */
+        if (ev->key == TK_KEY_MENU) {
+            if (win->on_context) {
+                struct tk_widget *f = win->focus;
+                struct tk_event cev = *ev;
+                cev.type   = TK_EV_MOUSE_DOWN;
+                cev.button = TK_BTN_RIGHT;
+                if (f && f->kind == TK_TABLE && f->sel >= 0) {
+                    int head_h = f->th ? TABLE_HEAD_H : 0;
+                    cev.x = f->x + 48;
+                    cev.y = f->y + head_h + 1 +
+                            (f->sel - f->scroll) * LIST_ITEM_H + LIST_ITEM_H / 2;
+                } else if (f && f->kind == TK_LISTBOX && f->sel >= 0) {
+                    cev.x = f->x + 48;
+                    cev.y = f->y + 2 + (f->sel - f->scroll) * LIST_ITEM_H +
+                            LIST_ITEM_H / 2;
+                } else if (f) {
+                    cev.x = f->x + f->w / 2;
+                    cev.y = f->y + f->h / 2;
+                } else {
+                    cev.x = win->w / 2;
+                    cev.y = win->h / 2;
+                }
+                win->on_context(win, f, &cev);
+            }
+            return;
+        }
         if (win->on_key) { win->on_key(win, ev); return; }
         struct tk_widget *f = win->focus;
         if (!f) return;

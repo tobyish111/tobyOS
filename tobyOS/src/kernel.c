@@ -7846,6 +7846,10 @@ void _start(void) {
     #define TKAPP_PATH "/bin/diskmgr"
     #define TKAPP_NAME "diskmgr"
     #endif
+    #ifdef TKAPP_FILES
+    #define TKAPP_PATH "/bin/gui_files"
+    #define TKAPP_NAME "gui_files"
+    #endif
     #ifndef TKAPP_PATH
     #define TKAPP_PATH "/bin/gui_about"
     #endif

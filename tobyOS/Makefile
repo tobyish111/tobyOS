@@ -787,8 +787,12 @@ LIBTOBY_OBJS     += $(LIBTOBY_ASM_OBJS)
 # CFLAGS for compiling the libtoby implementation. Same freestanding
 # base as USER_CFLAGS, plus access to its OWN public headers and to
 # the kernel ABI header (read-only for the syscall numbers).
+# NOTE: the LIVE libtoby headers must come first as a plain -I --
+# plain -I dirs are searched before every -isystem dir, so without it
+# the STALE toby/* mirror under build/sdk-1.0.0/include (refreshed only
+# by the sdk target) shadows libtoby/include after any header change.
 LIBTOBY_BUILD_CFLAGS := $(USER_CFLAGS) \
-                        -isystem $(LIBTOBY_INC) \
+                        -I $(LIBTOBY_INC) \
                         -I include \
                         -I build/sdk-1.0.0/include
 
@@ -1015,8 +1019,10 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,drawtest,drawtest))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,fonttest,fonttest))
 
 # rendertest needs both the kernel ABI header and the SDK GL header.
+# LIVE libtoby headers first (plain -I beats -isystem) so the stale
+# sdk-stage toby/* mirror can never shadow them -- see LIBTOBY_BUILD_CFLAGS.
 programs/rendertest/rendertest.o: programs/rendertest/main.c $(LIBTOBY_AR)
-	$(CC) $(LIBTOBY_CFLAGS) -I include -I build/sdk-1.0.0/include -c $< -o $@
+	$(CC) $(LIBTOBY_CFLAGS) -I $(LIBTOBY_INC) -I include -I build/sdk-1.0.0/include -c $< -o $@
 
 programs/rendertest/rendertest.elf: programs/rendertest/rendertest.o \
                                     $(LIBTOBY_CRT0) \

@@ -237,6 +237,10 @@ bool kbd_haschar(void) {
              case 0x50: kbd_dispatch_char((char)0x81); break; /* Down  */
              case 0x4B: kbd_dispatch_char((char)0x82); break; /* Left  */
              case 0x4D: kbd_dispatch_char((char)0x83); break; /* Right */
+             case 0x47: kbd_dispatch_char((char)0x84); break; /* Home  */
+             case 0x4F: kbd_dispatch_char((char)0x85); break; /* End   */
+             case 0x53: kbd_dispatch_char((char)0x86); break; /* Del   */
+             case 0x5D: kbd_dispatch_char((char)0x87); break; /* Menu  */
              /* Win/Super key -> toggle the taskbar app search, so an
               * app launch is: Win, type a few letters, Enter. */
              case 0x5B:                                       /* LWin  */
