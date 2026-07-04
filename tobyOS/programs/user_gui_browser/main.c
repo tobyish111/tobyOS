@@ -104,6 +104,15 @@ static inline long sys_http_fetch(struct http_fetch *req) {
         : "rcx", "r11", "memory");
     return r;
 }
+#define SYS_GUI_SET_TITLE  76
+static inline void sys_gui_set_title(int fd, const char *t) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_GUI_SET_TITLE), "D"((long)fd), "S"(t)
+        : "rcx", "r11", "memory");
+    (void)r;
+}
 
 /* ---- Utility functions ----------------------------------------- */
 
@@ -168,7 +177,6 @@ static int str_contains(const char *haystack, int hlen, const char *needle, int 
 #define PAD            6
 #define CELL_W         8
 #define CELL_H        12
-#define MAX_COLS     480          /* line buffer capacity; g_cols clamps here */
 
 /* Live layout metrics, refreshed from the toolkit window each paint /
  * mouse event (sync_geometry) so a WM resize reflows everything. The
@@ -177,8 +185,6 @@ static int str_contains(const char *haystack, int hlen, const char *needle, int 
 static int g_win_w     = WIN_W;
 static int g_win_h     = WIN_H;
 static int g_content_h = WIN_H - TOOLBAR_H - STATUS_H;
-static int g_cols      = (WIN_W - 2 * PAD) / CELL_W;
-static int g_rows      = (WIN_H - TOOLBAR_H - STATUS_H) / CELL_H;
 
 /* ---- Colors (Chrome dark theme inspired) ----------------------- */
 
@@ -235,25 +241,86 @@ static char g_raw[RAW_CAP + 1];
 static long g_raw_len = 0;
 
 #define RENDER_CAP    (128 * 1024)
-static char g_render[RENDER_CAP + 1];
+static char g_render[RENDER_CAP + 1];   /* normalized document text */
 static long g_render_len = 0;
 
-#define LINES_MAX     8192
-static long g_line_off[LINES_MAX];
-static int  g_line_count = 0;
-static int  g_top_line   = 0;
+/* ---- Layout-engine document model ------------------------------- *
+ * Parse once into styled SPANS grouped into BLOCKS; lay out per
+ * viewport width into positioned RUNS drawn with the kernel TTF
+ * rasterizer. A resize re-runs layout() only; a fetch re-parses. */
 
-#define STYLE_NORMAL   0
-#define STYLE_H1       1
-#define STYLE_H2       2
-#define STYLE_H3       3
-#define STYLE_LINK     4
-#define STYLE_CODE     5
-#define STYLE_BULLET   6
-#define STYLE_HR       7
-#define STYLE_BOLD     8
+#define FL_BOLD   0x01
+#define FL_LINK   0x02
+#define FL_CODE   0x04           /* monospace (pre/code) */
+#define FL_BR     0x08           /* forced line break before this span */
+#define FL_DIM    0x10           /* de-emphasized ([img] placeholders) */
 
-static uint8_t g_line_style[LINES_MAX];
+/* Block types */
+#define BT_P      0
+#define BT_H1     1
+#define BT_H2     2
+#define BT_H3     3
+#define BT_LI     4
+#define BT_HR     5
+#define BT_PRE    6
+
+/* Font sizes (px) per role; code uses the fixed 8x16 mono font. */
+#define PX_BODY   15
+#define PX_H1     26
+#define PX_H2     21
+#define PX_H3     17
+#define MONO_W     8
+#define MONO_H    16
+
+struct span {                    /* style-consistent slice of g_render */
+    int32_t  off;
+    int32_t  len;
+    int16_t  link;               /* g_links index or -1 */
+    uint8_t  px;
+    uint8_t  fl;
+};
+#define SPAN_MAX  16384
+static struct span g_spans[SPAN_MAX];
+static int  g_nspans = 0;
+
+struct blk {
+    int32_t  s0;                 /* first span */
+    int32_t  ns;
+    uint8_t  type;
+};
+#define BLK_MAX   4096
+static struct blk g_blks[BLK_MAX];
+static int  g_nblks = 0;
+
+struct run {                     /* positioned draw command (doc coords) */
+    int32_t  off;                /* text slice (unused for HR/bullet) */
+    int32_t  y;
+    int16_t  x, w, len;
+    int16_t  link;
+    uint8_t  px;
+    uint8_t  fl;
+};
+#define RUN_MAX   16384
+static struct run g_runs[RUN_MAX];
+static int  g_nruns = 0;
+
+static int  g_doc_h    = 0;      /* laid-out document height (px) */
+static int  g_scroll_y = 0;      /* viewport top in doc coords */
+static int  g_layout_w = 0;      /* width the runs were laid out at */
+static int  g_find_run = -1;     /* highlighted run (find-in-page) */
+
+/* Advance-width tables for the proportional faces we use, indexed by
+ * (style, ch - 32). Filled lazily via SYS_GUI_TEXT_TTF_WIDTH one char
+ * at a time (the kernel rasterizer is advance-based, so per-char sums
+ * equal string widths); afterwards all wrapping math is userspace. */
+#define FACE_BODY   0            /* PX_BODY regular */
+#define FACE_BOLD   1            /* PX_BODY bold */
+#define FACE_H1     2            /* PX_H1 bold */
+#define FACE_H2     3            /* PX_H2 bold */
+#define FACE_H3     4            /* PX_H3 bold */
+#define NFACES      5
+static short g_adv[NFACES][95];
+static int   g_adv_ready = 0;
 
 #define LINK_MAX       128
 #define LINK_URL_MAX   256
@@ -281,7 +348,6 @@ static int  g_loading = 0;
 static int  g_find_mode = 0;
 static char g_find_buf[FIND_MAX + 1];
 static int  g_find_len = 0;
-static int  g_find_line = -1;
 
 /* Source view toggle */
 static int  g_source_view = 0;
@@ -292,7 +358,6 @@ static int  g_source_view = 0;
 #define VIEW_PLAIN   1
 #define VIEW_SOURCE  2
 static int  g_view_mode = VIEW_HTML;
-static int  g_wrap_cols = 0;    /* column count the line index was built at */
 
 /* HTTP status of the last successful transport fetch (0 = none). */
 static int  g_last_status = 0;
@@ -314,19 +379,10 @@ static int tag_match(const char *src, const char *tag) {
     return (*src == '>' || *src == ' ' || *src == '/' || *src == '\0');
 }
 
-static void emit_char(char c) {
-    if (g_render_len < RENDER_CAP)
-        g_render[g_render_len++] = c;
-}
-
-static void emit_str(const char *s) {
-    while (*s && g_render_len < RENDER_CAP)
-        g_render[g_render_len++] = *s++;
-}
-
-static void emit_newline(void) {
-    emit_char('\n');
-}
+/* emit_char / emit_str are defined with the layout engine below (they
+ * append normalized text AND maintain the styled span stream). */
+static void emit_char(char c);
+static void emit_str(const char *s);
 
 /* Entity matching helper: returns 1 if src[pos..] starts with `name;` */
 static int entity_match(const char *src, long pos, long len, const char *name) {
@@ -402,93 +458,238 @@ static int decode_entity(const char *src, long i, long len, char *out) {
     return 0;
 }
 
-/* Build the line index over g_render at the CURRENT g_cols width. This
- * is the reflow primitive: a window resize re-runs just this (the
- * rendered text and links are width-independent). Style rules follow
- * g_view_mode: HTML detects heading sentinels + bullet/link/hr patterns
- * and word-wraps at spaces; PLAIN/SOURCE hard-wrap at the column edge. */
-static void index_lines(void) {
-    int wrap_col = g_cols - 2;
-    if (wrap_col < 8) wrap_col = 8;
-    int html = (g_view_mode == VIEW_HTML);
-    uint8_t defstyle = (g_view_mode == VIEW_SOURCE) ? STYLE_CODE : STYLE_NORMAL;
+/* ---- Measurement ------------------------------------------------- */
 
-    g_wrap_cols = g_cols;
-    g_line_off[0] = 0;
-    g_line_style[0] = defstyle;
+#define FL_BULLET 0x20           /* run-only: list bullet marker */
+#define FL_HRULE  0x40           /* run-only: horizontal rule */
 
-    if (html && g_render_len > 0 && (unsigned char)g_render[0] >= SENTINEL_H1 &&
-        (unsigned char)g_render[0] <= SENTINEL_H3) {
-        int s = (unsigned char)g_render[0];
-        g_line_style[0] = (s == SENTINEL_H1) ? STYLE_H1 :
-                          (s == SENTINEL_H2) ? STYLE_H2 : STYLE_H3;
-        g_line_off[0] = 1;
+static int face_for(uint8_t px, uint8_t fl) {
+    if (px == PX_H1) return FACE_H1;
+    if (px == PX_H2) return FACE_H2;
+    if (px == PX_H3) return FACE_H3;
+    return (fl & FL_BOLD) ? FACE_BOLD : FACE_BODY;
+}
+
+static void adv_init(void) {
+    static const uint8_t face_px[NFACES]   = { PX_BODY, PX_BODY, PX_H1, PX_H2, PX_H3 };
+    static const uint8_t face_bold[NFACES] = { 0, 1, 1, 1, 1 };
+    char one[2] = { 0, 0 };
+    for (int f = 0; f < NFACES; f++) {
+        for (int c = 0; c < 95; c++) {
+            one[0] = (char)(32 + c);
+            int w = tk_text_width(one, face_px[f], face_bold[f]);
+            g_adv[f][c] = (short)(w > 0 ? w : face_px[f] / 2);
+        }
     }
-    g_line_count = 1;
+    g_adv_ready = 1;
+}
 
-    int col = 0;
-    for (long i = g_line_off[0]; i < g_render_len && g_line_count < LINES_MAX; i++) {
-        if (g_render[i] == '\n') {
-            col = 0;
-            if (g_line_count < LINES_MAX && i + 1 < g_render_len) {
-                long next_start = i + 1;
-                uint8_t style = defstyle;
-                /* Check for heading sentinel at line start */
-                if (html && next_start < g_render_len &&
-                    (unsigned char)g_render[next_start] >= SENTINEL_H1 &&
-                    (unsigned char)g_render[next_start] <= SENTINEL_H3) {
-                    int s = (unsigned char)g_render[next_start];
-                    style = (s == SENTINEL_H1) ? STYLE_H1 :
-                            (s == SENTINEL_H2) ? STYLE_H2 : STYLE_H3;
-                    next_start++;
-                }
-                g_line_off[g_line_count] = next_start;
-                g_line_style[g_line_count] = style;
-                g_line_count++;
+/* Width of a g_render slice in the given style (advance-sum). */
+static int text_w(long off, int len, uint8_t px, uint8_t fl) {
+    if (fl & FL_CODE) return len * MONO_W;
+    const short *adv = g_adv[face_for(px, fl)];
+    int w = 0;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)g_render[off + i];
+        w += adv[(c >= 32 && c <= 126) ? c - 32 : '?' - 32];
+    }
+    return w;
+}
+
+static int line_h_for(uint8_t px, uint8_t fl) {
+    if (fl & FL_CODE) return MONO_H + 2;
+    return px + px / 3;
+}
+
+/* ---- Parser emit API (styled spans grouped into blocks) ---------- */
+
+static uint8_t g_cur_px, g_cur_fl;
+static short   g_cur_link;
+static int     g_blk_openp;      /* a block is being filled */
+static int     g_pending_br;     /* <br>: mark next span FL_BR */
+
+static void span_break(void) {   /* close the span under construction */
+    if (g_nspans > 0) {
+        struct span *s = &g_spans[g_nspans - 1];
+        if (s->len == 0 && !(s->fl & FL_BR)) g_nspans--;   /* drop empties */
+    }
+}
+
+static void blk_close(void) {
+    if (!g_blk_openp) return;
+    span_break();
+    struct blk *b = &g_blks[g_nblks];
+    b->ns = g_nspans - b->s0;
+    if (b->ns > 0 || b->type == BT_HR) g_nblks++;
+    g_blk_openp = 0;
+}
+
+static void blk_open(uint8_t type) {
+    blk_close();
+    if (g_nblks >= BLK_MAX) return;
+    g_blks[g_nblks].s0 = g_nspans;
+    g_blks[g_nblks].ns = 0;
+    g_blks[g_nblks].type = type;
+    g_blk_openp = 1;
+    g_pending_br = 0;
+    switch (type) {
+    case BT_H1: g_cur_px = PX_H1; break;
+    case BT_H2: g_cur_px = PX_H2; break;
+    case BT_H3: g_cur_px = PX_H3; break;
+    default:    g_cur_px = PX_BODY; break;
+    }
+}
+
+/* Append one normalized character in the current style. Opens spans /
+ * blocks as needed; splits the span when the style changed. */
+static void emit_char(char c) {
+    if (g_render_len >= RENDER_CAP) return;
+    if (!g_blk_openp) blk_open(BT_P);
+    uint8_t fl = g_cur_fl | (g_pending_br ? FL_BR : 0);
+    struct span *s = (g_nspans > 0) ? &g_spans[g_nspans - 1] : NULL;
+    int fresh = (!s || g_nspans <= g_blks[g_nblks].s0 ||
+                 s->off + s->len != g_render_len ||
+                 s->px != g_cur_px || s->fl != fl || s->link != g_cur_link);
+    if (fresh) {
+        if (g_nspans >= SPAN_MAX) return;
+        s = &g_spans[g_nspans++];
+        s->off = (int32_t)g_render_len;
+        s->len = 0;
+        s->px = g_cur_px;
+        s->fl = fl;
+        s->link = g_cur_link;
+    }
+    g_pending_br = 0;
+    g_render[g_render_len++] = c;
+    s->len++;
+}
+
+static void emit_str(const char *str) {
+    while (*str) emit_char(*str++);
+}
+
+/* ---- Layout: blocks + spans -> positioned runs ------------------- */
+
+#define MARGIN_L   10
+#define MARGIN_R   16            /* leaves room for the scrollbar */
+#define LI_INDENT  20
+
+static void run_flush(long off, int len, int x, int y, int w,
+                      uint8_t px, uint8_t fl, short link) {
+    if (len <= 0 || g_nruns >= RUN_MAX) return;
+    struct run *r = &g_runs[g_nruns++];
+    r->off = (int32_t)off;
+    r->len = (int16_t)len;
+    r->x = (int16_t)x;
+    r->y = (int32_t)y;
+    r->w = (int16_t)w;
+    r->px = px;
+    r->fl = fl;
+    r->link = link;
+}
+
+static void layout(int width) {
+    if (!g_adv_ready) adv_init();
+    g_nruns = 0;
+    g_find_run = -1;
+    int y = 8;
+    int usable = width - MARGIN_R;
+
+    for (int bi = 0; bi < g_nblks; bi++) {
+        struct blk *b = &g_blks[bi];
+        int indent = MARGIN_L + (b->type == BT_LI ? LI_INDENT : 0);
+
+        /* top margins */
+        switch (b->type) {
+        case BT_H1: y += 14; break;
+        case BT_H2: y += 12; break;
+        case BT_H3: y += 10; break;
+        case BT_HR: y += 8;  break;
+        case BT_LI: y += 2;  break;
+        case BT_PRE: y += 1; break;
+        default:    y += 8;  break;
+        }
+
+        if (b->type == BT_HR) {
+            if (g_nruns < RUN_MAX) {
+                struct run *r = &g_runs[g_nruns++];
+                r->off = 0; r->len = 0;
+                r->x = (int16_t)MARGIN_L;
+                r->y = (int32_t)y;
+                r->w = (int16_t)(usable - MARGIN_L);
+                r->px = PX_BODY; r->fl = FL_HRULE; r->link = -1;
             }
-        } else {
-            col++;
-            if (col >= wrap_col) {
-                long wrap_at = i;
-                if (html) {
-                    /* word wrap: back up to the last space on the line */
-                    long search = i;
-                    while (search > g_line_off[g_line_count - 1] && g_render[search] != ' ')
-                        search--;
-                    if (search > g_line_off[g_line_count - 1])
-                        wrap_at = search;
+            y += 6;
+            continue;
+        }
+
+        /* line metrics from the tallest span in the block */
+        int lh = 0;
+        for (int si = 0; si < b->ns; si++) {
+            struct span *s = &g_spans[b->s0 + si];
+            int h = line_h_for(s->px, s->fl);
+            if (h > lh) lh = h;
+        }
+        if (lh == 0) lh = line_h_for(PX_BODY, 0);
+
+        if (b->type == BT_LI && g_nruns < RUN_MAX) {
+            struct run *r = &g_runs[g_nruns++];
+            r->off = 0; r->len = 0;
+            r->x = (int16_t)(MARGIN_L + 6);
+            r->y = (int32_t)y;
+            r->w = 5;
+            r->px = PX_BODY; r->fl = FL_BULLET; r->link = -1;
+        }
+
+        int x = indent;
+        for (int si = 0; si < b->ns; si++) {
+            struct span *s = &g_spans[b->s0 + si];
+            if (s->fl & FL_BR) { y += lh; x = indent; }
+
+            /* walk the span word-by-word, coalescing words that stay on
+             * the same line into one run */
+            long roff = s->off; int rlen = 0, rx = x, rw = 0;
+            long i = s->off, end = s->off + s->len;
+            while (i < end) {
+                /* next word (including one leading space if present) */
+                long wstart = i;
+                int  sp = 0;
+                if (g_render[i] == ' ') { sp = 1; i++; }
+                while (i < end && g_render[i] != ' ') i++;
+                int wlen = (int)(i - wstart);
+                int ww = text_w(wstart, wlen, s->px, s->fl);
+
+                if (x + ww > usable && x > indent) {
+                    /* wrap: flush current run, drop the leading space */
+                    run_flush(roff, rlen, rx, y, rw, s->px, s->fl, s->link);
+                    y += lh; x = indent;
+                    roff = wstart + sp; rlen = 0; rx = x; rw = 0;
+                    ww = text_w(wstart + sp, wlen - sp, s->px, s->fl);
+                    wlen -= sp;
+                    wstart += sp;
                 }
-                if (g_line_count < LINES_MAX) {
-                    g_line_off[g_line_count] = wrap_at + 1;
-                    g_line_style[g_line_count] = html ? g_line_style[g_line_count - 1]
-                                                      : defstyle;
-                    g_line_count++;
-                    i = wrap_at;
-                    col = 0;
-                }
+                if (rlen == 0) { roff = wstart; rx = x; }
+                rlen = (int)(wstart + wlen - roff);
+                rw += ww;
+                x += ww;
             }
+            run_flush(roff, rlen, rx, y, rw, s->px, s->fl, s->link);
+        }
+        y += lh;
+
+        /* bottom margins */
+        switch (b->type) {
+        case BT_H1: y += 6; break;
+        case BT_H2: y += 5; break;
+        case BT_H3: y += 4; break;
+        case BT_LI: y += 0; break;
+        case BT_PRE: y += 0; break;
+        default:    y += 2; break;
         }
     }
 
-    if (!html) return;
-
-    /* Tag remaining line styles based on content patterns (bullets, links, hr) */
-    for (int li = 0; li < g_line_count; li++) {
-        if (g_line_style[li] != STYLE_NORMAL) continue;
-        long start = g_line_off[li];
-        if (g_render_len > start + 3 &&
-            g_render[start] == (char)0xE2 && g_render[start+1] == (char)0x94 &&
-            g_render[start+2] == (char)0x80) {
-            g_line_style[li] = STYLE_HR;
-        } else if (g_render_len > start + 2 &&
-                   g_render[start] == ' ' && g_render[start+1] == ' ' &&
-                   g_render[start+2] == '*') {
-            g_line_style[li] = STYLE_BULLET;
-        } else if (g_render_len > start + 1 && g_render[start] == '[' &&
-                   g_render[start+1] >= '0' && g_render[start+1] <= '9') {
-            g_line_style[li] = STYLE_LINK;
-        }
-    }
+    g_doc_h = y + 12;
+    g_layout_w = width;
 }
 
 /* Handle multi-char entity expansions that decode_entity signals with out=0 */
@@ -503,20 +704,40 @@ static int emit_multi_entity(const char *src, long start, long len) {
     return 0;
 }
 
-static void render_html(void) {
+/* Reset all per-page document state (text, spans, blocks, runs). */
+static void doc_reset(void) {
     g_render_len = 0;
+    g_nspans = 0;
+    g_nblks = 0;
+    g_nruns = 0;
+    g_blk_openp = 0;
+    g_pending_br = 0;
+    g_cur_px = PX_BODY;
+    g_cur_fl = 0;
+    g_cur_link = -1;
     g_link_count = 0;
     g_title[0] = '\0';
+    g_scroll_y = 0;
+    g_doc_h = 0;
+    g_layout_w = 0;
+    g_find_run = -1;
+}
+
+static int blk_is_empty(void) {
+    return !g_blk_openp || g_nspans == g_blks[g_nblks].s0;
+}
+
+static void render_html(void) {
+    doc_reset();
 
     int in_tag = 0;
     int in_script = 0;
     int in_style = 0;
     int in_title = 0;
     int in_pre = 0;
-    int line_has_content = 0;
     int title_pos = 0;
-    int last_was_space = 0;
-    int heading_level = 0;
+    int last_was_space = 1;
+    int bold_depth = 0;
 
     char tag_buf[64];
     int tag_buf_len = 0;
@@ -546,63 +767,49 @@ static void render_html(void) {
                 } else if (tag_match(t, "title")) {
                     if (!closing) { in_title = 1; title_pos = 0; }
                     else { in_title = 0; g_title[title_pos] = '\0'; }
-                } else if (tag_match(t, "pre") || tag_match(t, "code")) {
+                } else if (tag_match(t, "pre")) {
                     if (!closing) {
                         in_pre = 1;
-                        if (line_has_content) { emit_newline(); line_has_content = 0; }
+                        g_cur_fl |= FL_CODE;
+                        blk_open(BT_PRE);
                     } else {
                         in_pre = 0;
-                        if (line_has_content) { emit_newline(); line_has_content = 0; }
+                        g_cur_fl &= (uint8_t)~FL_CODE;
+                        blk_close();
                     }
+                    last_was_space = 1;
+                } else if (tag_match(t, "code")) {
+                    if (!closing) g_cur_fl |= FL_CODE;
+                    else g_cur_fl &= (uint8_t)~FL_CODE;
                 } else if (tag_match(t, "h1") || tag_match(t, "h2") ||
                            tag_match(t, "h3") || tag_match(t, "h4") ||
                            tag_match(t, "h5") || tag_match(t, "h6")) {
                     if (!closing) {
-                        if (line_has_content || g_render_len > 0) {
-                            emit_newline(); emit_newline();
-                        }
-                        line_has_content = 0;
-                        if (t[1] == '1') heading_level = 1;
-                        else if (t[1] == '2') heading_level = 2;
-                        else heading_level = 3;
-                        /* Emit sentinel at start of heading line */
-                        emit_char((char)heading_level);
+                        blk_open(t[1] == '1' ? BT_H1 :
+                                 t[1] == '2' ? BT_H2 : BT_H3);
                     } else {
-                        heading_level = 0;
-                        emit_newline();
-                        line_has_content = 0;
+                        blk_close();
                     }
+                    last_was_space = 1;
                 } else if (tag_match(t, "p") || tag_match(t, "div") ||
                            tag_match(t, "section") || tag_match(t, "article") ||
                            tag_match(t, "header") || tag_match(t, "footer") ||
-                           tag_match(t, "main") || tag_match(t, "nav")) {
-                    if (line_has_content) {
-                        emit_newline();
-                        if (!closing) emit_newline();
-                        line_has_content = 0;
-                    }
-                    heading_level = 0;
+                           tag_match(t, "main") || tag_match(t, "nav") ||
+                           tag_match(t, "ul") || tag_match(t, "ol") ||
+                           tag_match(t, "table") || tag_match(t, "tr")) {
+                    blk_close();
+                    last_was_space = 1;
                 } else if (tag_match(t, "br")) {
-                    emit_newline();
-                    if (heading_level) emit_char((char)heading_level);
-                    line_has_content = 0;
+                    g_pending_br = 1;
+                    last_was_space = 1;
                 } else if (tag_match(t, "hr")) {
-                    if (line_has_content) emit_newline();
-                    emit_str("────────────────────────────────────────");
-                    emit_newline();
-                    line_has_content = 0;
+                    blk_open(BT_HR);
+                    blk_close();
+                    last_was_space = 1;
                 } else if (tag_match(t, "li")) {
-                    if (!closing) {
-                        if (line_has_content) emit_newline();
-                        emit_str("  * ");
-                        line_has_content = 1;
-                    } else {
-                        if (line_has_content) emit_newline();
-                        line_has_content = 0;
-                    }
-                } else if (tag_match(t, "ul") || tag_match(t, "ol")) {
-                    if (line_has_content) emit_newline();
-                    line_has_content = 0;
+                    if (!closing) blk_open(BT_LI);
+                    else blk_close();
+                    last_was_space = 1;
                 } else if (tag_match(t, "a")) {
                     if (!closing) {
                         href_len = 0;
@@ -630,35 +837,38 @@ static void render_html(void) {
                         }
                         if (href_len > 0 && g_link_count < LINK_MAX) {
                             str_copy(g_links[g_link_count], href_buf, LINK_URL_MAX);
-                            emit_char('[');
-                            int ln = g_link_count + 1;
-                            if (ln >= 100) emit_char('0' + (ln / 100) % 10);
-                            if (ln >= 10) emit_char('0' + (ln / 10) % 10);
-                            emit_char('0' + ln % 10);
-                            emit_char(']');
+                            g_cur_link = (short)g_link_count;
                             g_link_count++;
+                            g_cur_fl |= FL_LINK;
                         }
+                    } else {
+                        g_cur_link = -1;
+                        g_cur_fl &= (uint8_t)~FL_LINK;
                     }
                 } else if (tag_match(t, "b") || tag_match(t, "strong")) {
-                    /* inline bold */
+                    if (!closing) { bold_depth++; g_cur_fl |= FL_BOLD; }
+                    else {
+                        if (bold_depth > 0) bold_depth--;
+                        if (bold_depth == 0) g_cur_fl &= (uint8_t)~FL_BOLD;
+                    }
                 } else if (tag_match(t, "i") || tag_match(t, "em")) {
-                    /* inline italic */
+                    /* no italic face yet */
                 } else if (tag_match(t, "img")) {
+                    uint8_t sv = g_cur_fl;
+                    g_cur_fl |= FL_DIM;
                     emit_str("[img]");
-                    line_has_content = 1;
-                } else if (tag_match(t, "table")) {
-                    if (!closing && line_has_content) { emit_newline(); line_has_content = 0; }
-                } else if (tag_match(t, "tr")) {
-                    if (closing && line_has_content) { emit_newline(); line_has_content = 0; }
+                    g_cur_fl = sv;
+                    last_was_space = 0;
                 } else if (tag_match(t, "td") || tag_match(t, "th")) {
-                    if (!closing && line_has_content) emit_str(" | ");
+                    if (!closing && !blk_is_empty()) {
+                        emit_char(' ');
+                        emit_char(' ');
+                        last_was_space = 1;
+                    }
                 }
-
-                last_was_space = 0;
-            } else {
-                if (tag_buf_len < 63)
-                    tag_buf[tag_buf_len++] = c;
+                continue;
             }
+            if (tag_buf_len < 63) tag_buf[tag_buf_len++] = c;
             continue;
         }
 
@@ -672,12 +882,10 @@ static void render_html(void) {
 
         /* HTML entity decoding */
         if (c == '&') {
-            /* Try multi-char entities first */
             int skip = emit_multi_entity(src, i, len);
             if (skip > 0) {
                 i += skip;
                 last_was_space = 0;
-                line_has_content = 1;
                 continue;
             }
             char decoded;
@@ -686,7 +894,6 @@ static void render_html(void) {
                 c = decoded;
                 i += skip;
             } else {
-                /* Unknown entity: skip to semicolon */
                 long j = i + 1;
                 while (j < len && j < i + 10 && src[j] != ';' && src[j] != '<') j++;
                 if (j < len && src[j] == ';') { i = j; continue; }
@@ -699,13 +906,17 @@ static void render_html(void) {
         }
 
         if (in_pre) {
-            emit_char(c);
-            line_has_content = (c != '\n');
+            if (c == '\n') {
+                if (blk_is_empty()) emit_char(' ');   /* keep blank lines */
+                blk_open(BT_PRE);
+            } else if (c != '\r') {
+                emit_char(c == '\t' ? ' ' : c);
+            }
             continue;
         }
 
         if (is_whitespace(c)) {
-            if (line_has_content && !last_was_space) {
+            if (!last_was_space && !blk_is_empty()) {
                 emit_char(' ');
                 last_was_space = 1;
             }
@@ -713,42 +924,51 @@ static void render_html(void) {
         }
 
         last_was_space = 0;
-        line_has_content = 1;
         emit_char(c);
     }
 
+    blk_close();
     g_render[g_render_len] = '\0';
 
     g_view_mode = VIEW_HTML;
-    index_lines();
+    layout(g_win_w);
+}
+
+/* Whole-buffer monospace document (plain text + source view). */
+static void render_mono_doc(void) {
+    doc_reset();
+    g_cur_fl = FL_CODE;
+    blk_open(BT_PRE);
+    for (long i = 0; i < g_raw_len && g_render_len < RENDER_CAP - 1; i++) {
+        char c = g_raw[i];
+        if (c == '\n') {
+            if (blk_is_empty()) emit_char(' ');
+            blk_open(BT_PRE);
+        } else if (c == '\t') {
+            emit_char(' '); emit_char(' ');
+        } else if ((unsigned char)c >= 0x20 && (unsigned char)c <= 0x7E) {
+            emit_char(c);
+        } else if ((unsigned char)c > 0x7E) {
+            emit_char('.');
+        }
+    }
+    blk_close();
+    g_cur_fl = 0;
+    g_render[g_render_len] = '\0';
+    layout(g_win_w);
 }
 
 static void render_plain_text(void) {
-    g_render_len = 0;
-    g_link_count = 0;
-    g_title[0] = '\0';
+    render_mono_doc();
     str_copy(g_title, "Plain Text", TITLE_MAX);
-
-    for (long i = 0; i < g_raw_len && g_render_len < RENDER_CAP; i++)
-        g_render[g_render_len++] = g_raw[i];
-    g_render[g_render_len] = '\0';
-
     g_view_mode = VIEW_PLAIN;
-    index_lines();
 }
 
-/* Source view: show raw HTML with line wrapping */
+/* Source view: show raw HTML */
 static void render_source_view(void) {
-    g_render_len = 0;
-    g_link_count = 0;
+    render_mono_doc();
     str_copy(g_title, "Source View", TITLE_MAX);
-
-    for (long i = 0; i < g_raw_len && g_render_len < RENDER_CAP; i++)
-        g_render[g_render_len++] = g_raw[i];
-    g_render[g_render_len] = '\0';
-
     g_view_mode = VIEW_SOURCE;
-    index_lines();
 }
 
 static int is_html_content(void) {
@@ -789,6 +1009,19 @@ static int can_go_forward(void) { return g_hist_pos < g_hist_count - 1; }
 
 static void set_status(const char *s) {
     str_copy(g_status_text, s, sizeof(g_status_text));
+}
+
+/* Reflect the page title in the WM title bar (Chrome-style). Safe to
+ * call before the window exists (the kernel ignores a bad fd). */
+static void update_title(void) {
+    char t[TITLE_MAX + 24];
+    const char *name = g_title[0] ? g_title : "New Tab";
+    int p = 0;
+    while (name[p] && p < TITLE_MAX) { t[p] = name[p]; p++; }
+    const char *suf = " - TobyOS Browser";
+    for (int i = 0; suf[i] && p < (int)sizeof(t) - 1; i++) t[p++] = suf[i];
+    t[p] = '\0';
+    sys_gui_set_title(win.fd, t);
 }
 
 static long do_navigate(const char *url);
@@ -889,8 +1122,8 @@ static void set_home_page(void) {
     g_raw[g_raw_len] = '\0';
 
     render_html();
-    g_top_line = 0;
     g_source_view = 0;
+    update_title();
     set_status("Ready");
 }
 
@@ -947,7 +1180,7 @@ static void show_error_page(const char *url, int err) {
                "</body></html>");
     g_raw[g_raw_len] = '\0';
     render_html();
-    g_top_line = 0;
+    update_title();
 }
 
 /* Transport-only fetch of `url` into g_raw via SYS_HTTP_FETCH (kernel
@@ -982,7 +1215,7 @@ static void render_fetched(void) {
         render_html();
     else
         render_plain_text();
-    g_top_line = 0;
+    update_title();
 
     char m[96];
     int p = 0;
@@ -993,13 +1226,8 @@ static void render_fetched(void) {
     } else {
         p = msg_append(m, p, sizeof(m), "Done - ");
     }
-    p = msg_append_int(m, p, sizeof(m), g_line_count);
-    p = msg_append(m, p, sizeof(m), " lines");
-    if (g_link_count > 0) {
-        p = msg_append(m, p, sizeof(m), ", ");
-        p = msg_append_int(m, p, sizeof(m), g_link_count);
-        p = msg_append(m, p, sizeof(m), " links");
-    }
+    p = msg_append_int(m, p, sizeof(m), g_link_count);
+    p = msg_append(m, p, sizeof(m), " links");
     set_status(m);
 }
 
@@ -1172,57 +1400,42 @@ static void navigate_input(const char *input_raw) {
     g_focus_url = 0;
 }
 
-/* ---- Scrolling ------------------------------------------------- */
-
-static void scroll_up(int n) {
-    g_top_line -= n;
-    if (g_top_line < 0) g_top_line = 0;
-}
-static void scroll_down(int n) {
-    g_top_line += n;
-    int max_top = g_line_count - g_rows;
-    if (max_top < 0) max_top = 0;
-    if (g_top_line > max_top) g_top_line = max_top;
-}
+/* ---- Scrolling (pixels) ----------------------------------------- */
 
 static void clamp_scroll(void) {
-    int max_top = g_line_count - g_rows;
-    if (max_top < 0) max_top = 0;
-    if (g_top_line > max_top) g_top_line = max_top;
-    if (g_top_line < 0) g_top_line = 0;
+    int maxs = g_doc_h - g_content_h;
+    if (maxs < 0) maxs = 0;
+    if (g_scroll_y > maxs) g_scroll_y = maxs;
+    if (g_scroll_y < 0) g_scroll_y = 0;
 }
+static void scroll_up(int px)   { g_scroll_y -= px; clamp_scroll(); }
+static void scroll_down(int px) { g_scroll_y += px; clamp_scroll(); }
 
 /* Refresh the layout metrics from the live toolkit window size (the
- * toolkit updates win.w/h on TK_EV_RESIZE) and re-wrap the page text
- * when the column count changed. Called at the top of every paint and
- * mouse handler, so the browser self-corrects on any repaint -- no
- * resize-event plumbing needed. Keeps the reader's place by re-finding
- * the line that contains the old top line's character offset. */
+ * toolkit updates win.w/h on TK_EV_RESIZE) and re-run layout() when
+ * the width changed. Called at the top of every paint and mouse
+ * handler, so the browser self-corrects on any repaint. Scroll
+ * position is kept proportionally across reflows. */
 static void sync_geometry(void) {
     if (win.w > 0)  g_win_w = win.w;
     if (win.h > 0)  g_win_h = win.h;
 
     g_content_h = g_win_h - TOOLBAR_H - STATUS_H;
-    if (g_content_h < CELL_H) g_content_h = CELL_H;
-    g_rows = g_content_h / CELL_H;
-    if (g_rows < 1) g_rows = 1;
+    if (g_content_h < MONO_H) g_content_h = MONO_H;
 
-    g_cols = (g_win_w - 2 * PAD) / CELL_W;
-    if (g_cols < 10) g_cols = 10;
-    if (g_cols > MAX_COLS) g_cols = MAX_COLS;
-
-    if (g_cols != g_wrap_cols && g_render_len > 0) {
-        long anchor = (g_top_line > 0 && g_top_line < g_line_count)
-                          ? g_line_off[g_top_line] : 0;
-        index_lines();
-        int nt = 0;
-        for (int li = 0; li < g_line_count; li++) {
-            if (g_line_off[li] <= anchor) nt = li;
-            else break;
-        }
-        g_top_line = nt;
+    if (g_layout_w != g_win_w && g_nblks > 0) {
+        int old_doc = g_doc_h > 0 ? g_doc_h : 1;
+        long keep = g_scroll_y;
+        layout(g_win_w);
+        g_scroll_y = (int)(keep * (long)g_doc_h / old_doc);
     }
     clamp_scroll();
+}
+
+/* Approximate line height of a run (hit-testing + visibility). */
+static int run_h(const struct run *r) {
+    if (r->fl & FL_CODE) return MONO_H + 2;
+    return r->px + r->px / 3;
 }
 
 /* ---- Find in page ---------------------------------------------- */
@@ -1231,47 +1444,34 @@ static void find_next_match(void) {
     if (g_find_len == 0) return;
     g_find_buf[g_find_len] = '\0';
 
-    int start_line = (g_find_line >= 0) ? g_find_line + 1 : 0;
-    for (int pass = 0; pass < 2; pass++) {
-        int from = (pass == 0) ? start_line : 0;
-        int to   = (pass == 0) ? g_line_count : start_line;
-        for (int li = from; li < to; li++) {
-            long lstart = g_line_off[li];
-            long lend;
-            if (li + 1 < g_line_count) lend = g_line_off[li + 1];
-            else lend = g_render_len;
-            int llen = (int)(lend - lstart);
-            if (str_contains(&g_render[lstart], llen, g_find_buf, g_find_len) >= 0) {
-                g_find_line = li;
-                g_top_line = li - g_rows / 2;
-                if (g_top_line < 0) g_top_line = 0;
-                int max_top = g_line_count - g_rows;
-                if (max_top < 0) max_top = 0;
-                if (g_top_line > max_top) g_top_line = max_top;
-                set_status("Found");
-                return;
-            }
+    /* continue after the current match, wrapping once */
+    long start = 0;
+    if (g_find_run >= 0 && g_find_run < g_nruns)
+        start = g_runs[g_find_run].off + 1;
+
+    long hit = -1;
+    int idx = str_contains(&g_render[start], (int)(g_render_len - start),
+                           g_find_buf, g_find_len);
+    if (idx >= 0) hit = start + idx;
+    else {
+        idx = str_contains(g_render, (int)g_render_len, g_find_buf, g_find_len);
+        if (idx >= 0) hit = idx;
+    }
+    if (hit < 0) { g_find_run = -1; set_status("Not found"); return; }
+
+    /* find the run containing the hit offset */
+    for (int ri = 0; ri < g_nruns; ri++) {
+        struct run *r = &g_runs[ri];
+        if (r->len > 0 && hit >= r->off && hit < r->off + r->len) {
+            g_find_run = ri;
+            g_scroll_y = r->y - g_content_h / 3;
+            clamp_scroll();
+            set_status("Found");
+            return;
         }
     }
+    g_find_run = -1;
     set_status("Not found");
-}
-
-/* ---- Link detection for mouse click ----------------------------- */
-
-static int get_link_number_at_line(int li) {
-    if (li < 0 || li >= g_line_count) return 0;
-    long start = g_line_off[li];
-    if (start >= g_render_len) return 0;
-    if (g_render[start] != '[') return 0;
-    long p = start + 1;
-    int num = 0;
-    while (p < g_render_len && g_render[p] >= '0' && g_render[p] <= '9') {
-        num = num * 10 + (g_render[p] - '0');
-        p++;
-    }
-    if (p < g_render_len && g_render[p] == ']' && num > 0)
-        return num;
-    return 0;
 }
 
 /* ---- Drawing --------------------------------------------------- */
@@ -1362,71 +1562,74 @@ static void paint_all(void) {
         sys_gui_fill(fd, url_x, url_y + url_h - 2, url_w / 3, 2, COL_URL_FOCUS_BD);
     }
 
-    /* Content Area */
+    /* Content Area: draw the laid-out runs that intersect the viewport */
     sys_gui_fill(fd, 0, CONTENT_TOP, g_win_w, g_content_h, COL_PAGE_BG);
 
-    int content_y = CONTENT_TOP;
-    static char line[MAX_COLS + 1];
+    {
+        static char tb[512];
+        int vtop = g_scroll_y;
+        int vbot = g_scroll_y + g_content_h;
 
-    for (int r = 0; r < g_rows; r++) {
-        int li = g_top_line + r;
-        if (li >= g_line_count) break;
+        for (int ri = 0; ri < g_nruns; ri++) {
+            struct run *r = &g_runs[ri];
+            int rh = run_h(r);
+            if (r->y + rh <= vtop) continue;
+            if (r->y >= vbot) break;              /* runs are y-sorted */
+            int sy = CONTENT_TOP + (r->y - vtop);
 
-        long start = g_line_off[li];
-        long end;
-        if (li + 1 < g_line_count)
-            end = g_line_off[li + 1];
-        else
-            end = g_render_len;
-        if (end > start && g_render[end - 1] == '\n') end--;
+            if (r->fl & FL_HRULE) {
+                sys_gui_fill(fd, r->x, sy + 2, r->w, 1, COL_HR_FG);
+                continue;
+            }
+            if (r->fl & FL_BULLET) {
+                sys_gui_fill(fd, r->x, sy + (rh / 2) - 2, 5, 5, COL_LIST_FG);
+                continue;
+            }
+            if (r->len <= 0) continue;
 
-        long len = end - start;
-        if (len > g_cols) len = g_cols;
+            int n = r->len < (int)sizeof(tb) - 1 ? r->len : (int)sizeof(tb) - 1;
+            for (int k = 0; k < n; k++) {
+                char ch = g_render[r->off + k];
+                tb[k] = ((unsigned char)ch < 0x20 || (unsigned char)ch > 0x7E)
+                            ? ' ' : ch;
+            }
+            tb[n] = '\0';
 
-        for (long k = 0; k < len; k++) {
-            char c = g_render[start + k];
-            if ((unsigned char)c < 0x20 && c != '\t') c = ' ';
-            if ((unsigned char)c > 0x7E) c = '.';
-            if (c == '\t') c = ' ';
-            line[k] = c;
+            if (ri == g_find_run)
+                sys_gui_fill(fd, r->x - 2, sy - 1, r->w + 4, rh, 0x00554400u);
+
+            if (r->fl & FL_CODE) {
+                sys_gui_fill(fd, r->x - 2, sy, r->w + 4, MONO_H, COL_CODE_BG);
+                sys_gui_text(fd, r->x, sy, tb, COL_CODE_FG, COL_CODE_BG);
+                continue;
+            }
+
+            uint32_t fg = COL_TEXT_FG;
+            if (r->px == PX_H1)      fg = COL_H1_FG;
+            else if (r->px == PX_H2) fg = COL_H2_FG;
+            else if (r->px == PX_H3) fg = COL_H3_FG;
+            else if (r->fl & FL_LINK) fg = COL_LINK_FG;
+            else if (r->fl & FL_BOLD) fg = COL_BOLD_FG;
+            else if (r->fl & FL_DIM)  fg = COL_URL_HINT;
+
+            tk_draw_text(&win, r->x, sy, tb, fg, r->px,
+                         (r->fl & FL_BOLD) || r->px != PX_BODY);
+            if (r->fl & FL_LINK)
+                sys_gui_fill(fd, r->x, sy + r->px + 2, r->w, 1, COL_LINK_FG);
         }
-        line[len] = '\0';
-
-        uint32_t fg = COL_TEXT_FG;
-        uint32_t bg = COL_PAGE_BG;
-
-        switch (g_line_style[li]) {
-        case STYLE_H1:   fg = COL_H1_FG; break;
-        case STYLE_H2:   fg = COL_H2_FG; break;
-        case STYLE_H3:   fg = COL_H3_FG; break;
-        case STYLE_LINK: fg = COL_LINK_FG; break;
-        case STYLE_CODE: fg = COL_CODE_FG; bg = COL_CODE_BG; break;
-        case STYLE_BULLET: fg = COL_TEXT_FG; break;
-        case STYLE_HR:   fg = COL_HR_FG; break;
-        case STYLE_BOLD: fg = COL_BOLD_FG; break;
-        default: break;
-        }
-
-        /* Highlight find match line */
-        if (g_find_mode && g_find_line == li) {
-            bg = 0x003A3A00u;
-        }
-
-        if (len > 0)
-            sys_gui_text(fd, PAD, content_y, line, fg, bg);
-        content_y += CELL_H;
     }
 
-    /* Scrollbar */
-    if (g_line_count > g_rows) {
+    /* Scrollbar (pixel-proportional) */
+    if (g_doc_h > g_content_h) {
         int track_x = g_win_w - 6;
         int track_h = g_content_h;
         sys_gui_fill(fd, track_x, CONTENT_TOP, 4, track_h, 0x002D2E31u);
 
-        int thumb_h = (g_rows * track_h) / g_line_count;
+        int thumb_h = (int)((long)track_h * g_content_h / g_doc_h);
         if (thumb_h < 20) thumb_h = 20;
-        int thumb_y = CONTENT_TOP + (g_top_line * (track_h - thumb_h)) /
-                      (g_line_count - g_rows > 0 ? g_line_count - g_rows : 1);
+        int maxs = g_doc_h - g_content_h;
+        int thumb_y = CONTENT_TOP +
+                      (int)((long)g_scroll_y * (track_h - thumb_h) / (maxs > 0 ? maxs : 1));
         sys_gui_fill(fd, track_x, thumb_y, 4, thumb_h, 0x005F6368u);
     }
 
@@ -1452,16 +1655,17 @@ static void paint_all(void) {
     }
 
     /* Scroll position indicator */
-    if (g_line_count > g_rows && !g_find_mode) {
-        int pct = (g_top_line * 100) / (g_line_count - g_rows > 0 ? g_line_count - g_rows : 1);
+    if (g_doc_h > g_content_h && !g_find_mode) {
+        int maxs = g_doc_h - g_content_h;
+        int pct = (int)((long)g_scroll_y * 100 / (maxs > 0 ? maxs : 1));
         if (pct > 100) pct = 100;
         char pct_str[8];
         int pp = 0;
         if (pct >= 100) pct_str[pp++] = '1';
         if (pct >= 10)  pct_str[pp++] = '0' + (pct / 10) % 10;
         pct_str[pp++] = '0' + pct % 10;
-        pct_str[pp++] = '%';
-        pct_str[pp] = '\0';
+        pct_str[pp++] = 37;   /* percent sign */
+        pct_str[pp] = 0;
         sys_gui_text(fd, g_win_w - (pp * CELL_W) - PAD, status_y + 3,
                      pct_str, COL_STATUS_FG, COL_STATUS_BG);
     }
@@ -1492,6 +1696,20 @@ static void follow_link(int num) {
         str_copy(resolved, href, URL_MAX);
 
     do_navigate(resolved);
+}
+
+/* Doc-space hit-test: link index of the run under client (mx,my), -1. */
+static int run_link_at(int mx, int my) {
+    int dy = my - CONTENT_TOP + g_scroll_y;
+    for (int ri = 0; ri < g_nruns; ri++) {
+        struct run *r = &g_runs[ri];
+        if (r->y > dy) break;
+        if (r->link < 0 || r->len <= 0) continue;
+        if (dy >= r->y && dy < r->y + run_h(r) &&
+            mx >= r->x && mx < r->x + r->w)
+            return r->link;
+    }
+    return -1;
 }
 
 /* ---- Mouse event handling -------------------------------------- */
@@ -1555,29 +1773,22 @@ static void handle_mouse_down(int fd, int mx, int my) {
 
     /* Content area */
     if (my >= CONTENT_TOP && my < g_win_h - STATUS_H) {
-        /* Scrollbar area (right 6px) */
-        if (mx >= g_win_w - 6 && g_line_count > g_rows) {
-            int track_h = g_content_h;
+        /* Scrollbar area (right 6px): jump-scroll to position */
+        if (mx >= g_win_w - 8 && g_doc_h > g_content_h) {
             int rel_y = my - CONTENT_TOP;
-            int max_top = g_line_count - g_rows;
-            if (max_top < 0) max_top = 0;
-            g_top_line = (rel_y * max_top) / track_h;
-            if (g_top_line < 0) g_top_line = 0;
-            if (g_top_line > max_top) g_top_line = max_top;
+            int maxs = g_doc_h - g_content_h;
+            g_scroll_y = (int)((long)rel_y * maxs / g_content_h);
+            clamp_scroll();
             redraw(fd);
             return;
         }
 
-        /* Content click: determine which line */
-        int row = (my - CONTENT_TOP) / CELL_H;
-        int li = g_top_line + row;
-        if (li >= 0 && li < g_line_count) {
-            int link_num = get_link_number_at_line(li);
-            if (link_num > 0 && link_num <= g_link_count) {
-                follow_link(link_num);
-                redraw(fd);
-                return;
-            }
+        /* Inline link click: hit-test the laid-out runs */
+        int lnk = run_link_at(mx, my);
+        if (lnk >= 0 && lnk < g_link_count) {
+            follow_link(lnk + 1);
+            redraw(fd);
+            return;
         }
         /* Click in content area unfocuses URL bar */
         g_focus_url = 0;
@@ -1588,15 +1799,15 @@ static void handle_mouse_down(int fd, int mx, int my) {
     redraw(fd);
 }
 
-/* Show link URL in status bar on mouse move over content */
+/* Show the link target in the status bar on hover (Chrome-style). */
 static void handle_mouse_move(int fd, int mx, int my) {
-    if (my >= CONTENT_TOP && my < g_win_h - STATUS_H && mx < g_win_w - 6) {
-        int row = (my - CONTENT_TOP) / CELL_H;
-        int li = g_top_line + row;
-        int link_num = get_link_number_at_line(li);
-        if (link_num > 0 && link_num <= g_link_count) {
-            str_copy(g_status_text, g_links[link_num - 1], sizeof(g_status_text));
-            redraw(fd);
+    if (my >= CONTENT_TOP && my < g_win_h - STATUS_H && mx < g_win_w - 8) {
+        int lnk = run_link_at(mx, my);
+        if (lnk >= 0 && lnk < g_link_count) {
+            if (!str_eq(g_status_text, g_links[lnk])) {
+                str_copy(g_status_text, g_links[lnk], sizeof(g_status_text));
+                redraw(fd);
+            }
             return;
         }
     }
@@ -1621,7 +1832,7 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
         if (g_find_mode) {
             if (key == 27) {
                 g_find_mode = 0;
-                g_find_line = -1;
+                g_find_run = -1;
                 set_status("Find cancelled");
                 redraw(0);
                 return;
@@ -1645,7 +1856,7 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
         if (key == 0x06) {
             g_find_mode = 1;
             g_find_len = 0;
-            g_find_line = -1;
+            g_find_run = -1;
             g_focus_url = 0;
             redraw(0);
             return;
@@ -1715,17 +1926,15 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
             }
 
             switch (key) {
-            case 'j':  scroll_down(1);    break;
-            case 'k':  scroll_up(1);      break;
-            case 'd':  scroll_down(g_rows); break;
-            case 'u':  scroll_up(g_rows);   break;
-            case 'g':  g_top_line = 0;    break;
-            case 'G': {
-                int max_top = g_line_count - g_rows;
-                if (max_top < 0) max_top = 0;
-                g_top_line = max_top;
+            case 'j':  scroll_down(48);   break;
+            case 'k':  scroll_up(48);     break;
+            case 'd':  scroll_down(g_content_h - 24); break;
+            case 'u':  scroll_up(g_content_h - 24);   break;
+            case 'g':  g_scroll_y = 0;    break;
+            case 'G':
+                g_scroll_y = g_doc_h;
+                clamp_scroll();
                 break;
-            }
             case 'n':
                 if (g_find_len > 0) find_next_match();
                 break;
@@ -1745,7 +1954,7 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
                         else
                             render_plain_text();
                     }
-                    g_top_line = 0;
+                    g_scroll_y = 0;
                     set_status(g_source_view ? "Source view" : "Rendered view");
                 }
                 break;
@@ -1831,9 +2040,6 @@ int main(int argc, char **argv) {
     mem_zero(g_status_text, sizeof(g_status_text));
     mem_zero(g_find_buf, sizeof(g_find_buf));
 
-    set_home_page();
-    set_status("Ready - Press Tab to focus address bar");
-
     if (tk_window_open(&win, WIN_W, WIN_H, "TobyOS Browser") != 0) {
         sys_write(1, "gui_browser: window failed\n", 27);
         return 1;
@@ -1842,5 +2048,12 @@ int main(int argc, char **argv) {
     struct tk_widget *root = tk_root(&win); tk_pad(root, 0);
     struct tk_widget *cv = tk_canvas(&win, root, on_paint);
     tk_grow(cv, 1); tk_on_event(cv, on_event);
+
+    /* Build the home page after the window exists: layout measures
+     * glyph advances through the TTF-width syscall and update_title
+     * needs the window fd. */
+    set_home_page();
+    set_status("Ready - Press Tab to focus address bar");
+
     return tk_run(&win);
 }
