@@ -276,6 +276,7 @@ struct span {                    /* style-consistent slice of g_render */
     int32_t  off;
     int32_t  len;
     int16_t  link;               /* g_links index or -1 */
+    int16_t  field;              /* g_fields index or -1 (FL_INPUT/SUBMIT) */
     uint8_t  px;
     uint8_t  fl;
 };
@@ -297,6 +298,7 @@ struct run {                     /* positioned draw command (doc coords) */
     int32_t  y;
     int16_t  x, w, len;
     int16_t  link;
+    int16_t  field;              /* g_fields index or -1 */
     uint8_t  px;
     uint8_t  fl;
 };
@@ -308,6 +310,39 @@ static int  g_doc_h    = 0;      /* laid-out document height (px) */
 static int  g_scroll_y = 0;      /* viewport top in doc coords */
 static int  g_layout_w = 0;      /* width the runs were laid out at */
 static int  g_find_run = -1;     /* highlighted run (find-in-page) */
+
+/* ---- Forms (GET submission) -------------------------------------- */
+
+#define FT_TEXT    0
+#define FT_HIDDEN  1
+#define FT_SUBMIT  2
+
+#define FL_INPUT   0x80          /* span/run is a text-input box */
+/* FL_BULLET doubles as the submit-button flag on field runs (a field
+ * run is never a list bullet, so the bit is unambiguous there). */
+#define FL_SUBMITB FL_BULLET
+
+struct form {
+    int16_t  first, nf;          /* g_fields slice */
+    uint8_t  post;               /* method=post (submit refused for now) */
+    char     action[512];
+};
+#define FORM_MAX 16
+static struct form g_forms[FORM_MAX];
+static int g_nforms = 0;
+
+struct field {
+    int16_t  form;
+    uint8_t  type;               /* FT_* */
+    int16_t  size;               /* <input size=N> or 0 */
+    char     name[64];
+    char     value[192];         /* editable in place for FT_TEXT */
+};
+#define FIELD_MAX 64
+static struct field g_fields[FIELD_MAX];
+static int g_nfields = 0;
+
+static int g_focus_field = -1;   /* focused FT_TEXT field or -1 */
 
 /* Advance-width tables for the proportional faces we use, indexed by
  * (style, ch - 32). Filled lazily via SYS_GUI_TEXT_TTF_WIDTH one char
@@ -511,7 +546,8 @@ static int     g_pending_br;     /* <br>: mark next span FL_BR */
 static void span_break(void) {   /* close the span under construction */
     if (g_nspans > 0) {
         struct span *s = &g_spans[g_nspans - 1];
-        if (s->len == 0 && !(s->fl & FL_BR)) g_nspans--;   /* drop empties */
+        if (s->len == 0 && !(s->fl & (FL_BR | FL_INPUT | FL_SUBMITB)))
+            g_nspans--;                                    /* drop empties */
     }
 }
 
@@ -549,7 +585,8 @@ static void emit_char(char c) {
     struct span *s = (g_nspans > 0) ? &g_spans[g_nspans - 1] : NULL;
     int fresh = (!s || g_nspans <= g_blks[g_nblks].s0 ||
                  s->off + s->len != g_render_len ||
-                 s->px != g_cur_px || s->fl != fl || s->link != g_cur_link);
+                 s->px != g_cur_px || s->fl != fl || s->link != g_cur_link ||
+                 s->field >= 0);
     if (fresh) {
         if (g_nspans >= SPAN_MAX) return;
         s = &g_spans[g_nspans++];
@@ -558,6 +595,7 @@ static void emit_char(char c) {
         s->px = g_cur_px;
         s->fl = fl;
         s->link = g_cur_link;
+        s->field = -1;
     }
     g_pending_br = 0;
     g_render[g_render_len++] = c;
@@ -568,11 +606,40 @@ static void emit_str(const char *str) {
     while (*str) emit_char(*str++);
 }
 
+/* Place a form control (text box / submit button) into the flow. */
+static void emit_field(short fi, uint8_t fl) {
+    if (!g_blk_openp) blk_open(BT_P);
+    span_break();
+    if (g_nspans >= SPAN_MAX) return;
+    struct span *s = &g_spans[g_nspans++];
+    s->off = (int32_t)g_render_len;
+    s->len = 0;
+    s->px = PX_BODY;
+    s->fl = fl | (g_pending_br ? FL_BR : 0);
+    s->link = -1;
+    s->field = fi;
+    g_pending_br = 0;
+}
+
 /* ---- Layout: blocks + spans -> positioned runs ------------------- */
 
 #define MARGIN_L   10
 #define MARGIN_R   16            /* leaves room for the scrollbar */
 #define LI_INDENT  20
+
+/* On-screen width of a form control. */
+static int field_w(const struct field *f, uint8_t fl) {
+    if (fl & FL_INPUT)
+        return f->size > 0 ? f->size * 8 + 18 : 190;
+    /* submit button: label width + padding */
+    int lw = 0;
+    for (int i = 0; f->value[i]; i++) {
+        unsigned char ch = (unsigned char)f->value[i];
+        lw += g_adv[FACE_BODY][(ch >= 32 && ch <= 126) ? ch - 32 : 31];
+    }
+    return lw + 28;
+}
+#define FIELD_H (PX_BODY + 12)
 
 static void run_flush(long off, int len, int x, int y, int w,
                       uint8_t px, uint8_t fl, short link) {
@@ -586,6 +653,7 @@ static void run_flush(long off, int len, int x, int y, int w,
     r->px = px;
     r->fl = fl;
     r->link = link;
+    r->field = -1;
 }
 
 static void layout(int width) {
@@ -617,7 +685,7 @@ static void layout(int width) {
                 r->x = (int16_t)MARGIN_L;
                 r->y = (int32_t)y;
                 r->w = (int16_t)(usable - MARGIN_L);
-                r->px = PX_BODY; r->fl = FL_HRULE; r->link = -1;
+                r->px = PX_BODY; r->fl = FL_HRULE; r->link = -1; r->field = -1;
             }
             y += 6;
             continue;
@@ -627,7 +695,7 @@ static void layout(int width) {
         int lh = 0;
         for (int si = 0; si < b->ns; si++) {
             struct span *s = &g_spans[b->s0 + si];
-            int h = line_h_for(s->px, s->fl);
+            int h = (s->field >= 0) ? FIELD_H + 4 : line_h_for(s->px, s->fl);
             if (h > lh) lh = h;
         }
         if (lh == 0) lh = line_h_for(PX_BODY, 0);
@@ -638,13 +706,31 @@ static void layout(int width) {
             r->x = (int16_t)(MARGIN_L + 6);
             r->y = (int32_t)y;
             r->w = 5;
-            r->px = PX_BODY; r->fl = FL_BULLET; r->link = -1;
+            r->px = PX_BODY; r->fl = FL_BULLET; r->link = -1; r->field = -1;
         }
 
         int x = indent;
         for (int si = 0; si < b->ns; si++) {
             struct span *s = &g_spans[b->s0 + si];
             if (s->fl & FL_BR) { y += lh; x = indent; }
+
+            if (s->field >= 0) {                 /* inline form control */
+                int fw = field_w(&g_fields[s->field], s->fl);
+                if (x + fw > usable && x > indent) { y += lh; x = indent; }
+                if (g_nruns < RUN_MAX) {
+                    struct run *r = &g_runs[g_nruns++];
+                    r->off = 0; r->len = 0;
+                    r->x = (int16_t)x;
+                    r->y = (int32_t)y;
+                    r->w = (int16_t)fw;
+                    r->px = PX_BODY;
+                    r->fl = s->fl;
+                    r->link = -1;
+                    r->field = s->field;
+                }
+                x += fw + 6;
+                continue;
+            }
 
             /* walk the span word-by-word, coalescing words that stay on
              * the same line into one run */
@@ -721,10 +807,48 @@ static void doc_reset(void) {
     g_doc_h = 0;
     g_layout_w = 0;
     g_find_run = -1;
+    g_nforms = 0;
+    g_nfields = 0;
+    g_focus_field = -1;
 }
 
 static int blk_is_empty(void) {
     return !g_blk_openp || g_nspans == g_blks[g_nblks].s0;
+}
+
+/* Extract attribute `name` from a tag body ("input type=text ...").
+ * Case-insensitive, handles quoted and bare values. Returns 1 if the
+ * attribute exists (out may be empty for a valueless attribute). */
+static int tag_attr(const char *t, const char *name, char *out, int cap) {
+    int nlen = (int)str_len(name);
+    out[0] = 0;
+    const char *p = t;
+    while (*p && !is_whitespace(*p)) p++;          /* skip the tag name */
+    while (*p) {
+        while (is_whitespace(*p)) p++;
+        if (!*p) break;
+        const char *k = p;
+        while (*p && !is_whitespace(*p) && *p != '=' && *p != '>') p++;
+        int klen = (int)(p - k);
+        int match = (klen == nlen && str_ncasecmp(k, name, nlen) == 0);
+        while (is_whitespace(*p)) p++;
+        if (*p != '=') {                            /* valueless attr */
+            if (match) return 1;
+            continue;
+        }
+        p++;
+        while (is_whitespace(*p)) p++;
+        char q = 0;
+        if (*p == 34 || *p == 39) { q = *p; p++; }
+        int o = 0;
+        while (*p && (q ? *p != q : !is_whitespace(*p) && *p != '>')) {
+            if (match && o < cap - 1) out[o++] = *p;
+            p++;
+        }
+        if (q && *p == q) p++;
+        if (match) { out[o] = 0; return 1; }
+    }
+    return 0;
 }
 
 static void render_html(void) {
@@ -739,8 +863,9 @@ static void render_html(void) {
     int last_was_space = 1;
     int bold_depth = 0;
 
-    char tag_buf[64];
+    char tag_buf[512];
     int tag_buf_len = 0;
+    int cur_form = -1;
 
     char href_buf[LINK_URL_MAX];
     int href_len = 0;
@@ -859,6 +984,58 @@ static void render_html(void) {
                     emit_str("[img]");
                     g_cur_fl = sv;
                     last_was_space = 0;
+                } else if (tag_match(t, "form")) {
+                    if (!closing && g_nforms < FORM_MAX) {
+                        struct form *f = &g_forms[g_nforms];
+                        f->first = (int16_t)g_nfields;
+                        f->nf = 0;
+                        tag_attr(t, "action", f->action, sizeof(f->action));
+                        char meth[12];
+                        f->post = tag_attr(t, "method", meth, sizeof(meth)) &&
+                                  (meth[0] == 'p' || meth[0] == 'P');
+                        cur_form = g_nforms++;
+                    } else if (closing) {
+                        cur_form = -1;
+                    }
+                    blk_close();
+                    last_was_space = 1;
+                } else if (tag_match(t, "input")) {
+                    if (cur_form >= 0 && g_nfields < FIELD_MAX) {
+                        char ty[20];
+                        if (!tag_attr(t, "type", ty, sizeof(ty))) ty[0] = 0;
+                        int ftype = -1;
+                        if (!ty[0] || str_ncasecmp(ty, "text", 5) == 0 ||
+                            str_ncasecmp(ty, "search", 7) == 0)
+                            ftype = FT_TEXT;
+                        else if (str_ncasecmp(ty, "hidden", 7) == 0)
+                            ftype = FT_HIDDEN;
+                        else if (str_ncasecmp(ty, "submit", 7) == 0)
+                            ftype = FT_SUBMIT;
+                        if (ftype >= 0) {
+                            struct field *fl2 = &g_fields[g_nfields];
+                            fl2->form = (int16_t)cur_form;
+                            fl2->type = (uint8_t)ftype;
+                            tag_attr(t, "name", fl2->name, sizeof(fl2->name));
+                            tag_attr(t, "value", fl2->value, sizeof(fl2->value));
+                            char szs[8];
+                            fl2->size = 0;
+                            if (tag_attr(t, "size", szs, sizeof(szs))) {
+                                int v = 0;
+                                for (int k = 0; szs[k] >= 48 && szs[k] <= 57; k++)
+                                    v = v * 10 + (szs[k] - 48);
+                                fl2->size = (int16_t)v;
+                            }
+                            if (ftype == FT_SUBMIT && !fl2->value[0])
+                                str_copy(fl2->value, "Submit", sizeof(fl2->value));
+                            if (ftype == FT_TEXT)
+                                emit_field((short)g_nfields, FL_INPUT);
+                            else if (ftype == FT_SUBMIT)
+                                emit_field((short)g_nfields, FL_SUBMITB);
+                            g_forms[cur_form].nf++;
+                            g_nfields++;
+                            if (ftype != FT_HIDDEN) last_was_space = 1;
+                        }
+                    }
                 } else if (tag_match(t, "td") || tag_match(t, "th")) {
                     if (!closing && !blk_is_empty()) {
                         emit_char(' ');
@@ -868,7 +1045,8 @@ static void render_html(void) {
                 }
                 continue;
             }
-            if (tag_buf_len < 63) tag_buf[tag_buf_len++] = c;
+            if (tag_buf_len < (int)sizeof(tag_buf) - 1)
+                tag_buf[tag_buf_len++] = c;
             continue;
         }
 
@@ -1025,8 +1203,6 @@ static void update_title(void) {
 }
 
 static long do_navigate(const char *url);
-static void build_search_url(const char *base, const char *q,
-                             char *out, int out_max);
 
 static void resolve_relative_url(const char *base, const char *rel, char *out, int out_max) {
     if (rel[0] == 'h' && rel[1] == 't' && rel[2] == 't' && rel[3] == 'p') {
@@ -1050,7 +1226,7 @@ static void resolve_relative_url(const char *base, const char *rel, char *out, i
             out[pos++] = base[i];
         for (int i = 0; rel[i] && pos < out_max - 1; i++)
             out[pos++] = rel[i];
-        out[pos] = '\0';
+        out[pos] = 0;
     } else {
         int last_slash = origin_end;
         for (int i = origin_end; base[i]; i++)
@@ -1061,8 +1237,35 @@ static void resolve_relative_url(const char *base, const char *rel, char *out, i
             out[pos++] = base[i];
         for (int i = 0; rel[i] && pos < out_max - 1; i++)
             out[pos++] = rel[i];
-        out[pos] = '\0';
+        out[pos] = 0;
     }
+}
+/* Append `s` to out[*pos] percent-encoded (form/query component). */
+static void url_encode_append(const char *s, char *out, int *pos, int out_max) {
+    static const char hex[] = "0123456789ABCDEF";
+    for (int i = 0; s[i] && *pos < out_max - 4; i++) {
+        char c = s[i];
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+            (c >= 48 && c <= 57) ||
+            c == 45 || c == 95 || c == 46 || c == 126) {
+            out[(*pos)++] = c;
+        } else if (c == 32) {
+            out[(*pos)++] = 43;              /* '+' */
+        } else {
+            out[(*pos)++] = 37;              /* '%' */
+            out[(*pos)++] = hex[((unsigned char)c >> 4) & 0xF];
+            out[(*pos)++] = hex[(unsigned char)c & 0xF];
+        }
+    }
+    out[*pos] = 0;
+}
+
+static void build_search_url(const char *base, const char *q,
+                             char *out, int out_max) {
+    int pos = 0;
+    while (base[pos] && pos < out_max - 4) { out[pos] = base[pos]; pos++; }
+    out[pos] = 0;
+    url_encode_append(q, out, &pos, out_max);
 }
 
 static void set_home_page(void) {
@@ -1079,7 +1282,7 @@ static void set_home_page(void) {
         "<li>Use <b>j/k</b> to scroll, <b>d/u</b> for page scroll</li>"
         "<li>Press <b>[</b> to go back, <b>]</b> to go forward</li>"
         "<li>Click links or type link number + Enter</li>"
-        "<li>Press <b>r</b> to refresh, <b>h</b> for home</li>"
+        "<li>Press <b>r</b> to refresh, <b>h</b> for home, <b>e</b> to edit a form field</li>"
         "</ul>"
         "<h2>Keyboard Shortcuts</h2>"
         "<ul>"
@@ -1260,6 +1463,42 @@ static long do_navigate(const char *url) {
     return n;
 }
 
+/* GET-submit a form: resolve its action against the current page,
+ * append ?name=value pairs for every named text/hidden field, and
+ * navigate. POST forms are refused (no request-body support yet). */
+static void submit_form(int fi) {
+    if (fi < 0 || fi >= g_nforms) return;
+    struct form *f = &g_forms[fi];
+    if (f->post) { set_status("POST forms not supported yet"); return; }
+
+    char base[URL_MAX + 1];
+    if (f->action[0]) {
+        resolve_relative_url(g_url, f->action, base, URL_MAX);
+    } else {
+        str_copy(base, g_url, URL_MAX);      /* action="" = same URL */
+    }
+    /* a GET submission replaces any existing query */
+    for (int i = 0; base[i]; i++)
+        if (base[i] == 63) { base[i] = 0; break; }   /* '?' */
+
+    char out[URL_MAX + 1];
+    int pos = 0;
+    for (int i = 0; base[i] && pos < URL_MAX - 2; i++) out[pos++] = base[i];
+    int first = 1;
+    for (int k = 0; k < f->nf; k++) {
+        struct field *fd2 = &g_fields[f->first + k];
+        if (!fd2->name[0] || fd2->type == FT_SUBMIT) continue;
+        if (pos >= URL_MAX - 4) break;
+        out[pos++] = first ? 63 : 38;        /* '?' then '&' */
+        first = 0;
+        url_encode_append(fd2->name, out, &pos, URL_MAX);
+        if (pos < URL_MAX - 2) out[pos++] = 61;   /* '=' */
+        url_encode_append(fd2->value, out, &pos, URL_MAX);
+    }
+    out[pos] = 0;
+    do_navigate(out);
+}
+
 /* Run a web search: DuckDuckGo's HTML endpoint first; its 202
  * bot-challenge page (or a transport failure) falls back to Mojeek,
  * which serves plain HTML without a challenge wall. */
@@ -1304,27 +1543,6 @@ static int input_is_query(const char *s) {
     return 1;
 }
 
-static void build_search_url(const char *base, const char *q,
-                             char *out, int out_max) {
-    static const char hex[] = "0123456789ABCDEF";
-    int pos = 0;
-    while (base[pos] && pos < out_max - 4) { out[pos] = base[pos]; pos++; }
-    for (int i = 0; q[i] && pos < out_max - 4; i++) {
-        char c = q[i];
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') ||
-            c == '-' || c == '_' || c == '.' || c == '~') {
-            out[pos++] = c;
-        } else if (c == ' ') {
-            out[pos++] = '+';
-        } else {
-            out[pos++] = '%';
-            out[pos++] = hex[((unsigned char)c >> 4) & 0xF];
-            out[pos++] = hex[(unsigned char)c & 0xF];
-        }
-    }
-    out[pos] = '\0';
-}
 
 static void str_concat2(char *out, int max, const char *a, const char *b) {
     int pos = 0;
@@ -1581,6 +1799,53 @@ static void paint_all(void) {
                 sys_gui_fill(fd, r->x, sy + 2, r->w, 1, COL_HR_FG);
                 continue;
             }
+            if (r->field >= 0) {
+                struct field *ff = &g_fields[r->field];
+                if (r->fl & FL_INPUT) {
+                    uint32_t bd = (r->field == g_focus_field)
+                                      ? COL_URL_FOCUS_BD : COL_URL_BORDER;
+                    sys_gui_fill(fd, r->x, sy, r->w, FIELD_H, COL_URL_FOCUS_BG);
+                    sys_gui_fill(fd, r->x, sy, r->w, 1, bd);
+                    sys_gui_fill(fd, r->x, sy + FIELD_H - 1, r->w, 1, bd);
+                    sys_gui_fill(fd, r->x, sy, 1, FIELD_H, bd);
+                    sys_gui_fill(fd, r->x + r->w - 1, sy, 1, FIELD_H, bd);
+                    /* show the tail of the value if it overflows */
+                    const char *v = ff->value;
+                    int vl = (int)str_len(v);
+                    int avail = r->w - 14;
+                    while (vl > 0) {
+                        int wpx = 0;
+                        for (int k2 = 0; v[k2]; k2++) {
+                            unsigned char c2 = (unsigned char)v[k2];
+                            wpx += g_adv[FACE_BODY][(c2 >= 32 && c2 <= 126) ? c2 - 32 : 31];
+                        }
+                        if (wpx <= avail) break;
+                        v++; vl--;
+                    }
+                    if (vl > 0)
+                        tk_draw_text(&win, r->x + 6, sy + 5, v, COL_URL_TEXT,
+                                     PX_BODY, 0);
+                    if (r->field == g_focus_field) {
+                        int cx = r->x + 6;
+                        for (int k2 = 0; v[k2]; k2++) {
+                            unsigned char c2 = (unsigned char)v[k2];
+                            cx += g_adv[FACE_BODY][(c2 >= 32 && c2 <= 126) ? c2 - 32 : 31];
+                        }
+                        if (cx > r->x + r->w - 4) cx = r->x + r->w - 4;
+                        sys_gui_fill(fd, cx, sy + 3, 2, FIELD_H - 6, COL_URL_FOCUS_BD);
+                    }
+                } else {
+                    /* submit button */
+                    sys_gui_fill(fd, r->x, sy, r->w, FIELD_H, 0x00313845u);
+                    sys_gui_fill(fd, r->x, sy, r->w, 1, COL_URL_BORDER);
+                    sys_gui_fill(fd, r->x, sy + FIELD_H - 1, r->w, 1, COL_URL_BORDER);
+                    sys_gui_fill(fd, r->x, sy, 1, FIELD_H, COL_URL_BORDER);
+                    sys_gui_fill(fd, r->x + r->w - 1, sy, 1, FIELD_H, COL_URL_BORDER);
+                    tk_draw_text(&win, r->x + 14, sy + 5, ff->value,
+                                 0x00EAF0F7u, PX_BODY, 0);
+                }
+                continue;
+            }
             if (r->fl & FL_BULLET) {
                 sys_gui_fill(fd, r->x, sy + (rh / 2) - 2, 5, 5, COL_LIST_FG);
                 continue;
@@ -1698,18 +1963,25 @@ static void follow_link(int num) {
     do_navigate(resolved);
 }
 
-/* Doc-space hit-test: link index of the run under client (mx,my), -1. */
-static int run_link_at(int mx, int my) {
+/* Doc-space hit-test: interactive run (link or form control) under
+ * client (mx,my), or NULL. */
+static struct run *run_at(int mx, int my) {
     int dy = my - CONTENT_TOP + g_scroll_y;
     for (int ri = 0; ri < g_nruns; ri++) {
         struct run *r = &g_runs[ri];
         if (r->y > dy) break;
-        if (r->link < 0 || r->len <= 0) continue;
-        if (dy >= r->y && dy < r->y + run_h(r) &&
+        if (r->link < 0 && r->field < 0) continue;
+        int rh = (r->field >= 0) ? FIELD_H : run_h(r);
+        if (dy >= r->y && dy < r->y + rh &&
             mx >= r->x && mx < r->x + r->w)
-            return r->link;
+            return r;
     }
-    return -1;
+    return NULL;
+}
+
+static int run_link_at(int mx, int my) {
+    struct run *r = run_at(mx, my);
+    return (r && r->link >= 0) ? r->link : -1;
 }
 
 /* ---- Mouse event handling -------------------------------------- */
@@ -1783,15 +2055,28 @@ static void handle_mouse_down(int fd, int mx, int my) {
             return;
         }
 
-        /* Inline link click: hit-test the laid-out runs */
-        int lnk = run_link_at(mx, my);
-        if (lnk >= 0 && lnk < g_link_count) {
-            follow_link(lnk + 1);
+        /* Inline link / form-control click: hit-test the runs */
+        struct run *hit = run_at(mx, my);
+        if (hit && hit->field >= 0) {
+            g_focus_url = 0;
+            if (hit->fl & FL_INPUT) {
+                g_focus_field = hit->field;
+                set_status("Type into the field; Enter submits");
+            } else {
+                g_focus_field = -1;
+                submit_form(g_fields[hit->field].form);
+            }
             redraw(fd);
             return;
         }
-        /* Click in content area unfocuses URL bar */
+        if (hit && hit->link >= 0 && hit->link < g_link_count) {
+            follow_link(hit->link + 1);
+            redraw(fd);
+            return;
+        }
+        /* Click in empty content unfocuses URL bar + fields */
         g_focus_url = 0;
+        g_focus_field = -1;
         redraw(fd);
         return;
     }
@@ -1827,6 +2112,40 @@ static void on_event(struct tk_window *w, struct tk_widget *c, struct tk_event *
 static void on_key(struct tk_window *w, struct tk_event *ev) {
     (void)w;
     uint8_t key = ev->key;
+
+    /* A focused form field owns the keyboard (Tab hands off, Esc
+     * unfocuses, Enter submits the field's form). */
+    if (g_focus_field >= 0 && !g_focus_url && !g_find_mode) {
+        struct field *f = &g_fields[g_focus_field];
+        if (key == 27) {
+            g_focus_field = -1;
+            set_status("Field unfocused");
+            redraw(0);
+            return;
+        }
+        if (key == 9) {
+            g_focus_field = -1;              /* fall through to Tab */
+        } else if (key == 10 || key == 13) {
+            submit_form(f->form);
+            redraw(0);
+            return;
+        } else if (key == 8 || key == 127) {
+            int l = (int)str_len(f->value);
+            if (l > 0) f->value[l - 1] = 0;
+            redraw(0);
+            return;
+        } else if (key >= 0x20 && key <= 0x7E) {
+            int l = (int)str_len(f->value);
+            if (l < (int)sizeof(f->value) - 1) {
+                f->value[l] = (char)key;
+                f->value[l + 1] = 0;
+            }
+            redraw(0);
+            return;
+        } else {
+            return;
+        }
+    }
 
         /* Find mode input */
         if (g_find_mode) {
@@ -2014,6 +2333,30 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
                 g_focus_url = 1;
                 set_status("Address bar focused");
                 break;
+            case 'e': {
+                /* Focus the next text field on the page and scroll to
+                 * it (keyboard access to form inputs). */
+                int start = g_focus_field + 1;
+                int found = -1;
+                for (int k = 0; k < g_nfields; k++) {
+                    int idx = (start + k) % (g_nfields > 0 ? g_nfields : 1);
+                    if (g_nfields > 0 && g_fields[idx].type == FT_TEXT) {
+                        found = idx; break;
+                    }
+                }
+                if (found < 0) { set_status("No text fields on this page"); break; }
+                g_focus_field = found;
+                g_focus_url = 0;
+                for (int ri = 0; ri < g_nruns; ri++) {
+                    if (g_runs[ri].field == found) {
+                        g_scroll_y = g_runs[ri].y - g_content_h / 3;
+                        clamp_scroll();
+                        break;
+                    }
+                }
+                set_status("Field focused - type, Enter submits, Esc cancels");
+                break;
+            }
             case 'q':
                 sys_exit(0);
             default:
