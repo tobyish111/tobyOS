@@ -5126,8 +5126,13 @@ void gui_dump_status(const char *reason) {
         if (!p) {
             kprintf("    slot[%d] pid=%d (gone)\n", i, pid);
         } else {
-            kprintf("    slot[%d] pid=%d state=%s name='%s'\n",
-                    i, pid, proc_state_str_local((int)p->state), p->name);
+            /* syscalls: compare across two dumps a few seconds apart --
+             * a frozen count on a RUNNING proc = spinning in pure
+             * userspace (SIGINT can't land until it traps); a racing
+             * count = a syscall loop; use it to triage app freezes. */
+            kprintf("    slot[%d] pid=%d state=%s syscalls=%lu name='%s'\n",
+                    i, pid, proc_state_str_local((int)p->state),
+                    (unsigned long)p->syscall_count, p->name);
             if (p->state != PROC_TERMINATED) nlive++;
         }
     }

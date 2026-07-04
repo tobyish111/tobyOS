@@ -1161,25 +1161,23 @@ static void dispatch(struct tk_window *win, struct tk_event *ev) {
          * clicked), then hand the event to the app's tk_on_context
          * hook. Never runs button/checkbox/slider actions. */
         if (ev->button & TK_BTN_RIGHT) {
+            /* Move the selection SILENTLY (no on_change): apps run
+             * click/double-click logic in on_change, and a right-click
+             * must never trigger it. The on_context handler reads the
+             * fresh ->sel itself. */
             if (h && h->kind == TK_TABLE) {
                 int head_h = h->th ? TABLE_HEAD_H : 0;
                 int rel = ev->y - (h->y + head_h + 1);
                 if (rel >= 0) {
                     int row = h->scroll + rel / LIST_ITEM_H;
-                    if (row >= 0 && row < h->nrows && row != h->sel) {
-                        h->sel = row;
-                        if (h->on_change) h->on_change(win, h);
-                    }
+                    if (row >= 0 && row < h->nrows) h->sel = row;
                 }
                 win->want_redraw = 1;
             } else if (h && h->kind == TK_LISTBOX) {
                 int rel = ev->y - (h->y + 2);
                 if (rel >= 0) {
                     int idx = h->scroll + rel / LIST_ITEM_H;
-                    if (idx >= 0 && idx < h->n_items && idx != h->sel) {
-                        h->sel = idx;
-                        if (h->on_change) h->on_change(win, h);
-                    }
+                    if (idx >= 0 && idx < h->n_items) h->sel = idx;
                 }
                 win->want_redraw = 1;
             }
@@ -1392,6 +1390,13 @@ int tk_run(struct tk_window *win) {
             continue;
         }
         dispatch(win, &ev);
+        /* Coalesce: drain everything already queued before repainting
+         * once. Repainting per event (a full-window pass each time)
+         * lets a mouse-move burst on real hardware outrun the app --
+         * the window goes unresponsive while it replays stale input. */
+        while (!win->want_quit && g_poll(win->fd, &ev) > 0)
+            dispatch(win, &ev);
+        if (win->want_quit) return 0;
         if (win->want_redraw) { win->dirty_full = 1; repaint(win); }
     }
 }
