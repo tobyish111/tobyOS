@@ -791,7 +791,9 @@ static void set_status(const char *s) {
     str_copy(g_status_text, s, sizeof(g_status_text));
 }
 
-static void do_navigate(const char *url);
+static long do_navigate(const char *url);
+static void build_search_url(const char *base, const char *q,
+                             char *out, int out_max);
 
 static void resolve_relative_url(const char *base, const char *rel, char *out, int out_max) {
     if (rel[0] == 'h' && rel[1] == 't' && rel[2] == 't' && rel[3] == 'p') {
@@ -1009,8 +1011,9 @@ static long do_fetch_url(const char *url) {
     return n;
 }
 
-/* Navigate to a fully-formed URL (links, search, explicit schemes). */
-static void do_navigate(const char *url) {
+/* Navigate to a fully-formed URL (links, search, explicit schemes).
+ * Returns the fetch result so callers can chain fallbacks. */
+static long do_navigate(const char *url) {
     char target[URL_MAX + 1];
     str_copy(target, url, URL_MAX);
 
@@ -1026,6 +1029,23 @@ static void do_navigate(const char *url) {
         history_push(g_url);      /* the post-redirect URL */
     }
     g_focus_url = 0;
+    return n;
+}
+
+/* Run a web search: DuckDuckGo's HTML endpoint first; its 202
+ * bot-challenge page (or a transport failure) falls back to Mojeek,
+ * which serves plain HTML without a challenge wall. */
+static void navigate_search(const char *query) {
+    char surl[URL_MAX + 1];
+    build_search_url("https://html.duckduckgo.com/html/?q=", query,
+                     surl, URL_MAX);
+    long rc = do_navigate(surl);
+    if (rc < 0 || g_last_status == 202) {
+        set_status("Search challenged - trying Mojeek...");
+        build_search_url("https://www.mojeek.com/search?q=", query,
+                         surl, URL_MAX);
+        do_navigate(surl);
+    }
 }
 
 /* ---- Omnibox input resolution (Chrome-style) --------------------- */
@@ -1056,9 +1076,9 @@ static int input_is_query(const char *s) {
     return 1;
 }
 
-static void build_search_url(const char *q, char *out, int out_max) {
+static void build_search_url(const char *base, const char *q,
+                             char *out, int out_max) {
     static const char hex[] = "0123456789ABCDEF";
-    const char *base = "https://html.duckduckgo.com/html/?q=";
     int pos = 0;
     while (base[pos] && pos < out_max - 4) { out[pos] = base[pos]; pos++; }
     for (int i = 0; q[i] && pos < out_max - 4; i++) {
@@ -1111,9 +1131,7 @@ static void navigate_input(const char *input_raw) {
     if (has_scheme(input)) { do_navigate(input); return; }
 
     if (input_is_query(input)) {
-        char surl[URL_MAX + 1];
-        build_search_url(input, surl, URL_MAX);
-        do_navigate(surl);
+        navigate_search(input);
         return;
     }
 

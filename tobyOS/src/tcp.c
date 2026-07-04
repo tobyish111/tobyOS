@@ -562,12 +562,16 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
     c->snd_wnd = (uint32_t)ntohs(h->window) << c->snd_wnd_shift;
 
     if (fl & TCP_FLAG_RST) {
-        kprintf("[tcp] RST rx tcp[%d] lp=%u rp=%u state=%s\n",
-                conn_index(c),
-                (unsigned)ntohs(c->local_port_be),
-                (unsigned)ntohs(c->remote_port_be),
-                tcp_state_name(c->state));
-    
+        /* Log the FIRST reset only: a peer that RSTs a torn-down
+         * connection often retransmits it a dozen times (observed from
+         * youtube.com), and one line per repeat is serial noise. */
+        if (c->state != TCP_CLOSED)
+            kprintf("[tcp] RST rx tcp[%d] lp=%u rp=%u state=%s\n",
+                    conn_index(c),
+                    (unsigned)ntohs(c->local_port_be),
+                    (unsigned)ntohs(c->remote_port_be),
+                    tcp_state_name(c->state));
+
         c->remote_rst_seen = true;
         tcp_state_t was = c->state;
         c->state = TCP_CLOSED;

@@ -202,7 +202,8 @@ int http_parse_url(const char *url, struct http_url *out) {
  * written (excluding NUL), or -1 if it didn't fit. */
 static long build_request(const struct http_url *u, char *buf, size_t cap) {
     /* "GET <path> HTTP/1.0\r\nHost: <host>:<port>\r\n..." */
-    static const char ua[] = "tobyOS-http/0.1";
+    static const char ua[] =
+        "Mozilla/5.0 (compatible; tobyOS 1.0; x86_64) tobyOS-Browser/3.0";
     size_t need = 0;
 
     /* Quick upper bound check. Paths and hosts already capped by
@@ -244,8 +245,11 @@ static long build_request(const struct http_url *u, char *buf, size_t cap) {
         memcpy(buf + pos, tmp, (size_t)ti);
         pos += (size_t)ti;
     }
+    /* Browser-shaped UA: several endpoints (DuckDuckGo's html frontend
+     * among them) answer obvious robot UAs with 202 bot-challenge pages
+     * instead of content. */
     APPEND_LIT("\r\nUser-Agent: ");
-    APPEND_LIT("tobyOS-http/0.1");
+    APPEND_LIT("Mozilla/5.0 (compatible; tobyOS 1.0; x86_64) tobyOS-Browser/3.0");
     APPEND_LIT("\r\nAccept: */*\r\nConnection: close\r\n\r\n");
 
     if (pos < cap) buf[pos] = 0;            /* convenience NUL */
@@ -431,8 +435,18 @@ int http_get(const char *url,
              uint32_t    timeout_ms,
              struct http_response *out)
 {
+    return http_get_opt(url, max_body_bytes, timeout_ms, 0, out);
+}
+
+int http_get_opt(const char *url,
+                 size_t      max_body_bytes,
+                 uint32_t    timeout_ms,
+                 unsigned    flags,
+                 struct http_response *out)
+{
     if (!url || !out) return HTTP_ERR_URL;
     memset(out, 0, sizeof(*out));
+    out->content_len = -1;
 
     if (timeout_ms == 0)    timeout_ms = HTTP_DEFAULT_TIMEOUT_MS;
     if (max_body_bytes == 0) max_body_bytes = 1u << 20; /* 1 MiB default */
@@ -568,14 +582,24 @@ int http_get(const char *url,
     size_t   body_cap = 0;
     size_t   body_len = 0;
 
+    out->content_len = content_len;
+
     if (content_len >= 0) {
-        if ((size_t)content_len > max_body_bytes) {
-            kprintf("[http] Content-Length %ld > max %lu\n",
-                    content_len, (unsigned long)max_body_bytes);
-            kfree(buf); transport_close(&tr);
-            return HTTP_ERR_TOOBIG;
-        }
         body_cap = (size_t)content_len;
+        if ((size_t)content_len > max_body_bytes) {
+            if (!(flags & HTTP_F_TRUNCATE)) {
+                kprintf("[http] Content-Length %ld > max %lu\n",
+                        content_len, (unsigned long)max_body_bytes);
+                kfree(buf); transport_close(&tr);
+                return HTTP_ERR_TOOBIG;
+            }
+            /* Truncate mode: read only what the caller can use, then
+             * drop the connection -- no point downloading megabytes the
+             * renderer will never see. */
+            kprintf("[http] truncating body: Content-Length %ld, keeping %lu\n",
+                    content_len, (unsigned long)max_body_bytes);
+            body_cap = max_body_bytes;
+        }
         body = (uint8_t *)kmalloc(body_cap > 0 ? body_cap : 1);
         if (!body) { kfree(buf); transport_close(&tr); return HTTP_ERR_NOMEM; }
         if (already > body_cap) already = body_cap;       /* guard */
@@ -583,11 +607,18 @@ int http_get(const char *url,
         body_len = already;
 
         /* If we haven't already received the whole body and the peer
-         * hasn't closed, keep pulling until full or error. */
+         * hasn't closed, keep pulling until full or error. A reset
+         * after data has arrived degrades to a short body rather than
+         * discarding everything (some peers RST instead of FIN). */
         while (body_len < body_cap && !peer_fin) {
             long n = transport_recv(&tr, body + body_len, body_cap - body_len);
             if (n > 0) { body_len += (size_t)n; continue; }
             if (n == -1) { peer_fin = true; break; }
+            if (n == -2 && body_len > 0) {
+                kprintf("[http] reset after %lu bytes -- keeping partial body\n",
+                        (unsigned long)body_len);
+                peer_fin = true; break;
+            }
             if (n == -2) { kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_RESET; }
             if (n == 0)  { kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_TIMEOUT; }
             kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_PROTOCOL;
@@ -608,6 +639,11 @@ int http_get(const char *url,
                 size_t new_cap = body_cap * 2;
                 if (new_cap > max_body_bytes) new_cap = max_body_bytes;
                 if (new_cap == body_cap) {
+                    if (flags & HTTP_F_TRUNCATE) {
+                        kprintf("[http] truncating body at max %lu bytes\n",
+                                (unsigned long)max_body_bytes);
+                        break;
+                    }
                     kprintf("[http] body exceeds max %lu bytes\n",
                             (unsigned long)max_body_bytes);
                     kfree(body); kfree(buf); transport_close(&tr);
@@ -620,6 +656,11 @@ int http_get(const char *url,
             long n = transport_recv(&tr, body + body_len, body_cap - body_len);
             if (n > 0) { body_len += (size_t)n; continue; }
             if (n == -1) { peer_fin = true; break; }
+            if (n == -2 && body_len > 0) {
+                kprintf("[http] reset after %lu bytes -- keeping partial body\n",
+                        (unsigned long)body_len);
+                peer_fin = true; break;
+            }
             if (n == -2) { kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_RESET; }
             if (n == 0)  { kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_TIMEOUT; }
             kfree(body); kfree(buf); transport_close(&tr); return HTTP_ERR_PROTOCOL;

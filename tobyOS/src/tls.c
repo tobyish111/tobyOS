@@ -315,7 +315,11 @@ static long tls_send_encrypted(struct tls_conn *c, uint8_t inner_type,
     return (s == (long)(5 + record_payload)) ? (long)plain_len : TLS_ERR_SEND;
 }
 
-/* Read a full TLS record from TCP. Returns content type, fills *out_data, *out_len. */
+/* Read a full TLS record from TCP. Returns content type, fills *out_data, *out_len.
+ * A TCP FIN between records returns TLS_ERR_CLOSED: many servers (Google's
+ * GFE among them) end a Connection:-close response with a bare FIN and no
+ * close_notify alert. Conflating that with TLS_ERR_RECV made http.c report
+ * every completed no-Content-Length HTTPS body as a TIMEOUT and discard it. */
 static int tls_read_record(struct tls_conn *c, uint8_t *out_type,
                            uint8_t **out_data, size_t *out_len) {
     /* Read 5-byte header */
@@ -323,7 +327,9 @@ static int tls_read_record(struct tls_conn *c, uint8_t *out_type,
     size_t hdr_got = 0;
     while (hdr_got < 5) {
         long n = tcp_recv(c->tcp, hdr + hdr_got, 5 - hdr_got, c->timeout_ms);
-        if (n <= 0) return TLS_ERR_RECV;
+        if (n == -1) return TLS_ERR_CLOSED;   /* FIN (clean between records) */
+        if (n == -2) return TLS_ERR_CLOSED;   /* RST -- treat as abrupt close */
+        if (n <= 0) return TLS_ERR_RECV;      /* timeout */
         hdr_got += (size_t)n;
     }
 
@@ -337,6 +343,7 @@ static int tls_read_record(struct tls_conn *c, uint8_t *out_type,
     size_t got = 0;
     while (got < rec_len) {
         long n = tcp_recv(c->tcp, data + got, rec_len - got, c->timeout_ms);
+        if (n == -1 || n == -2) { kfree(data); return TLS_ERR_CLOSED; }
         if (n <= 0) { kfree(data); return TLS_ERR_RECV; }
         got += (size_t)n;
     }
@@ -987,6 +994,7 @@ long tls_recv(struct tls_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
         c->timeout_ms = tm;
         int rc = tls_read_record(c, &rec_type, &rec_data, &rec_len);
         c->timeout_ms = old_tm;
+        if (rc == TLS_ERR_CLOSED) { c->closed = 1; return TLS_ERR_CLOSED; }
         if (rc != TLS_OK) return (long)rc;
 
         if (rec_type == TLS_RT_CHANGE_CIPHER) {

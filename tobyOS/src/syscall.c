@@ -709,10 +709,11 @@ static int http_resolve_location(const char *cur, const char *loc,
  * rewritten in place to the URL that produced the final response (so
  * callers can report the post-redirect address). On 0, *resp is live
  * and the caller must http_free() it. */
-static int http_get_follow(char cur_url[512], size_t max_body,
+static int http_get_follow(char cur_url[512], size_t max_body, unsigned flags,
                            struct http_response *resp) {
     for (int redir = 0; redir <= HTTP_MAX_REDIRECTS; redir++) {
-        int rc = http_get(cur_url, max_body, HTTP_DEFAULT_TIMEOUT_MS, resp);
+        int rc = http_get_opt(cur_url, max_body, HTTP_DEFAULT_TIMEOUT_MS,
+                              flags, resp);
         if (rc < 0) return rc;
 
         if (http_is_redirect(resp->status) && resp->location[0]) {
@@ -743,7 +744,7 @@ static long sys_http_get(const char *url, void *buf, uint32_t buf_sz) {
         return -ABI_EFAULT;
 
     struct http_response resp;
-    int rc = http_get_follow(cur_url, (size_t)cap, &resp);
+    int rc = http_get_follow(cur_url, (size_t)cap, 0, &resp);
     if (rc < 0) return (long)rc;
 
     size_t copy = resp.body_len < (size_t)cap ? resp.body_len : (size_t)cap;
@@ -773,8 +774,15 @@ static long sys_http_fetch(struct abi_http_fetch *ureq) {
                           sizeof(cur_url)) < 0)
         return -ABI_EFAULT;
 
+    /* Truncate mode, capped at the caller's buffer: the browser renders
+     * at most buf_sz bytes, so downloading past that (a 1.6 MiB
+     * Wikipedia article, say) is pure waste -- and the old TOOBIG
+     * refusal turned every big page into an error. */
+    size_t kmax = (size_t)req.buf_sz;
+    if (kmax > HTTP_FETCH_KERNEL_MAX) kmax = HTTP_FETCH_KERNEL_MAX;
+
     struct http_response resp;
-    int rc = http_get_follow(cur_url, HTTP_FETCH_KERNEL_MAX, &resp);
+    int rc = http_get_follow(cur_url, kmax, HTTP_F_TRUNCATE, &resp);
     if (rc < 0) return (long)rc;
 
     size_t copy = resp.body_len < (size_t)req.buf_sz ? resp.body_len
@@ -786,7 +794,8 @@ static long sys_http_fetch(struct abi_http_fetch *ureq) {
     }
 
     req.status     = resp.status;
-    req.body_total = (uint32_t)resp.body_len;
+    req.body_total = (resp.content_len >= 0) ? (uint32_t)resp.content_len
+                                             : (uint32_t)resp.body_len;
     _Static_assert(sizeof(req.final_url) >= sizeof(cur_url),
                    "abi_http_fetch.final_url must hold a kernel URL");
     memcpy(req.final_url, cur_url, strlen(cur_url) + 1);

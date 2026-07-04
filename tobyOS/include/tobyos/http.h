@@ -69,7 +69,17 @@ struct http_response {
     char       location[256];           /* "Location:" for 3xx redirects */
     size_t     body_len;                /* bytes actually downloaded     */
     uint8_t   *body;                    /* kmalloc'd; may be NULL on err */
+    long       content_len;             /* Content-Length header, -1 if absent */
 };
+
+/* http_get_opt() flags. */
+#define HTTP_F_TRUNCATE  0x1u  /* body > max_body_bytes: stop reading at the
+                                * cap and return success with a truncated
+                                * body (content_len still reports the full
+                                * size) instead of HTTP_ERR_TOOBIG. The
+                                * browser path wants this -- it only renders
+                                * the first N KiB anyway; downloads (wget,
+                                * pkg) must keep the exact-or-error contract. */
 
 /* Parse a URL string into `out`. Accepts:
  *   http://host
@@ -103,6 +113,13 @@ int http_get(const char *url,
              size_t      max_body_bytes,
              uint32_t    timeout_ms,
              struct http_response *out);
+
+/* http_get with behaviour flags (HTTP_F_*). http_get() == flags 0. */
+int http_get_opt(const char *url,
+                 size_t      max_body_bytes,
+                 uint32_t    timeout_ms,
+                 unsigned    flags,
+                 struct http_response *out);
 
 /* Free an http_response. NULL-safe; idempotent (clears the struct
  * after free so a double-free becomes a no-op). */
