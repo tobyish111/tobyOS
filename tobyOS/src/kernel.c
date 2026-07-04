@@ -7850,6 +7850,10 @@ void _start(void) {
     #define TKAPP_PATH "/bin/gui_files"
     #define TKAPP_NAME "gui_files"
     #endif
+    #ifdef TKAPP_BROWSER
+    #define TKAPP_PATH "/bin/gui_browser"
+    #define TKAPP_NAME "gui_browser"
+    #endif
     #ifndef TKAPP_PATH
     #define TKAPP_PATH "/bin/gui_about"
     #endif

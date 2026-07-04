@@ -18,28 +18,18 @@
 #include <tobyos/printk.h>
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
+#include <tobyos/rng.h>
 
 #include "monocypher.h"
 
-/* RDRAND for random bytes */
-static int rdrand64(uint64_t *out) {
-    unsigned char ok;
-    __asm__ volatile ("rdrand %0; setc %1" : "=r"(*out), "=qm"(ok));
-    return ok;
-}
-
+/* TLS randomness comes from the kernel CSPRNG (rng.c), which feature-
+ * detects RDRAND via CPUID. The previous private helper here executed a
+ * raw RDRAND unconditionally -- an instant #UD kernel panic on any CPU
+ * without the instruction (QEMU's default qemu64 model; first hit when
+ * the browser went HTTPS-first) -- and substituted hardcoded constants
+ * when RDRAND reported failure, which is not randomness at all. */
 static void random_bytes(uint8_t *buf, size_t n) {
-    while (n >= 8) {
-        uint64_t r;
-        if (!rdrand64(&r)) r = 0x0123456789ABCDEFULL;
-        memcpy(buf, &r, 8);
-        buf += 8; n -= 8;
-    }
-    if (n > 0) {
-        uint64_t r;
-        if (!rdrand64(&r)) r = 0xFEDCBA9876543210ULL;
-        memcpy(buf, &r, n);
-    }
+    rng_fill(buf, n);
 }
 
 /* ---- TLS record types and constants ----------------------------- */
@@ -205,6 +195,60 @@ static void put_u24(uint8_t *p, uint32_t v) { p[0]=(uint8_t)(v>>16); p[1]=(uint8
 static uint16_t get_u16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static uint32_t get_u24(const uint8_t *p) { return ((uint32_t)p[0]<<16)|((uint32_t)p[1]<<8)|p[2]; }
 
+/* ---- RFC 8439 IETF ChaCha20-Poly1305 ----------------------------- *
+ * TLS_CHACHA20_POLY1305_SHA256 uses the IETF AEAD with a 12-byte
+ * per-record nonce. Monocypher's crypto_aead_lock/unlock are the
+ * XChaCha20 variant taking a nonce[24] -- feeding them the 12-byte TLS
+ * nonce both overread the stack and computed a cipher no TLS peer
+ * speaks (every record decrypt failed against real servers). Compose
+ * the IETF construction from the low-level primitives instead. */
+
+static void tls_poly1305_aead_mac(uint8_t mac[16], const uint8_t poly_key[32],
+                                  const uint8_t *ad, size_t ad_len,
+                                  const uint8_t *ct, size_t ct_len) {
+    static const uint8_t zeros[16] = {0};
+    crypto_poly1305_ctx ctx;
+    crypto_poly1305_init(&ctx, poly_key);
+    crypto_poly1305_update(&ctx, ad, ad_len);
+    if (ad_len % 16) crypto_poly1305_update(&ctx, zeros, 16 - ad_len % 16);
+    crypto_poly1305_update(&ctx, ct, ct_len);
+    if (ct_len % 16) crypto_poly1305_update(&ctx, zeros, 16 - ct_len % 16);
+    uint8_t lens[16];
+    for (int i = 0; i < 8; i++) {
+        lens[i]     = (uint8_t)((uint64_t)ad_len >> (8 * i));
+        lens[8 + i] = (uint8_t)((uint64_t)ct_len >> (8 * i));
+    }
+    crypto_poly1305_update(&ctx, lens, 16);
+    crypto_poly1305_final(&ctx, mac);
+}
+
+static void tls_aead_encrypt(uint8_t *ct, uint8_t mac[16],
+                             const uint8_t key[32], const uint8_t nonce[12],
+                             const uint8_t *ad, size_t ad_len,
+                             const uint8_t *plain, size_t len) {
+    uint8_t block0[64];
+    crypto_chacha20_ietf(block0, NULL, 64, key, nonce, 0);   /* poly key */
+    crypto_chacha20_ietf(ct, plain, len, key, nonce, 1);
+    tls_poly1305_aead_mac(mac, block0, ad, ad_len, ct, len);
+    crypto_wipe(block0, sizeof(block0));
+}
+
+/* Returns 0 on success, -1 on MAC mismatch (same contract as
+ * crypto_aead_unlock). */
+static int tls_aead_decrypt(uint8_t *plain, const uint8_t mac[16],
+                            const uint8_t key[32], const uint8_t nonce[12],
+                            const uint8_t *ad, size_t ad_len,
+                            const uint8_t *ct, size_t len) {
+    uint8_t block0[64];
+    crypto_chacha20_ietf(block0, NULL, 64, key, nonce, 0);
+    uint8_t expect[16];
+    tls_poly1305_aead_mac(expect, block0, ad, ad_len, ct, len);
+    crypto_wipe(block0, sizeof(block0));
+    if (crypto_verify16(expect, mac) != 0) return -1;
+    crypto_chacha20_ietf(plain, ct, len, key, nonce, 1);
+    return 0;
+}
+
 /* ---- Record I/O ------------------------------------------------- */
 
 static long tls_send_record(struct tls_conn *c, uint8_t type,
@@ -255,7 +299,7 @@ static long tls_send_encrypted(struct tls_conn *c, uint8_t inner_type,
     put_u16(ad + 3, (uint16_t)record_payload);
 
     /* Encrypt */
-    crypto_aead_lock(buf + 5, buf + 5 + payload_len,  /* ciphertext, mac */
+    tls_aead_encrypt(buf + 5, buf + 5 + payload_len,  /* ciphertext, mac */
                      c->client_key, nonce,
                      ad, 5,
                      ptxt, payload_len);
@@ -325,7 +369,7 @@ static int tls_decrypt_record(struct tls_conn *c, uint8_t *data, size_t len,
     uint8_t *plain = (uint8_t *)kmalloc(ciphertext_len);
     if (!plain) return TLS_ERR_NOMEM;
 
-    if (crypto_aead_unlock(plain, mac, c->server_key, nonce,
+    if (tls_aead_decrypt(plain, mac, c->server_key, nonce,
                            ad, 5, data, ciphertext_len) != 0) {
         kfree(plain);
         return TLS_ERR_RECORD;
@@ -353,6 +397,17 @@ static size_t build_client_hello(uint8_t *buf, size_t cap,
     size_t pos = 0;
     size_t hostname_len = 0;
     if (hostname) while (hostname[hostname_len]) hostname_len++;
+
+    /* RFC 6066: literal IP addresses are not permitted in SNI; strict
+     * servers reject them. Send no SNI for a dotted-quad host. */
+    if (hostname_len > 0) {
+        int only_ip = 1;
+        for (size_t i = 0; i < hostname_len; i++) {
+            char ch = hostname[i];
+            if (!((ch >= '0' && ch <= '9') || ch == '.')) { only_ip = 0; break; }
+        }
+        if (only_ip) hostname_len = 0;
+    }
 
     /* We'll build the handshake message body first, then wrap it.
      * Start after the 4-byte handshake header placeholder. */
@@ -392,10 +447,14 @@ static size_t build_client_hello(uint8_t *buf, size_t cap,
     put_u16(buf + pos, 2); pos += 2;  /* named_group_list length */
     put_u16(buf + pos, TLS_GROUP_X25519); pos += 2;
 
-    /* Extension: key_share (X25519 public key) */
+    /* Extension: key_share (X25519 public key). RFC 8446 4.2.8: the
+     * KeyShareEntry is group(2) + key_exchange length(2) + key(32) = 36
+     * bytes, so client_shares = 36 and ext data = 38. These were written
+     * two bytes short (34/36) -- spec-strict servers (OpenSSL, Cloudflare)
+     * answered every ClientHello with a fatal decode_error(50) alert. */
     put_u16(buf + pos, TLS_EXT_KEY_SHARE); pos += 2;
-    put_u16(buf + pos, 36); pos += 2; /* ext data length: 2 + 2 + 2 + 32 - 2 = 36 */
-    put_u16(buf + pos, 34); pos += 2; /* client_shares length */
+    put_u16(buf + pos, 38); pos += 2; /* ext data length */
+    put_u16(buf + pos, 36); pos += 2; /* client_shares length */
     put_u16(buf + pos, TLS_GROUP_X25519); pos += 2;
     put_u16(buf + pos, 32); pos += 2; /* key_exchange length */
     memcpy(buf + pos, pubkey, 32); pos += 32;
@@ -605,6 +664,12 @@ static int tls_do_handshake(struct tls_conn *c, const char *hostname) {
     rc = tls_read_record(c, &rec_type, &rec_data, &rec_len);
     if (rc != TLS_OK) return rc;
     if (rec_type != TLS_RT_HANDSHAKE || rec_len < 4) {
+        if (rec_type == TLS_RT_ALERT && rec_len >= 2)
+            kprintf("[tls] server alert before ServerHello: level=%d desc=%d\n",
+                    rec_data[0], rec_data[1]);
+        else
+            kprintf("[tls] expected ServerHello record, got type=%d len=%u\n",
+                    rec_type, (unsigned)rec_len);
         kfree(rec_data);
         return TLS_ERR_HANDSHAKE;
     }
@@ -680,7 +745,14 @@ static int tls_do_handshake(struct tls_conn *c, const char *hostname) {
         }
 
         if (rec_type != TLS_RT_APPLICATION) {
-            /* Unexpected record type during handshake */
+            /* Unexpected record type during handshake. A plaintext
+             * alert here is the server rejecting our flight -- name it. */
+            if (rec_type == TLS_RT_ALERT && rec_len >= 2)
+                kprintf("[tls] plaintext alert during handshake: level=%d desc=%d\n",
+                        rec_data[0], rec_data[1]);
+            else
+                kprintf("[tls] unexpected record type %d (len=%u) during handshake\n",
+                        rec_type, (unsigned)rec_len);
             kfree(rec_data);
             return TLS_ERR_HANDSHAKE;
         }
@@ -703,7 +775,7 @@ static int tls_do_handshake(struct tls_conn *c, const char *hostname) {
         uint8_t *plain = (uint8_t *)kmalloc(ct_len);
         if (!plain) { kfree(rec_data); return TLS_ERR_NOMEM; }
 
-        if (crypto_aead_unlock(plain, mac, hs_server_key, nonce,
+        if (tls_aead_decrypt(plain, mac, hs_server_key, nonce,
                                ad, 5, rec_data, ct_len) != 0) {
             kfree(plain); kfree(rec_data);
             kprintf("[tls] handshake decrypt failed at seq %lu\n", (unsigned long)server_hs_seq);
@@ -808,7 +880,7 @@ static int tls_do_handshake(struct tls_conn *c, const char *hostname) {
         uint8_t *out_buf = (uint8_t *)kmalloc(5 + record_payload);
         if (!out_buf) { kfree(ptxt); return TLS_ERR_NOMEM; }
         memcpy(out_buf, ad, 5);
-        crypto_aead_lock(out_buf + 5, out_buf + 5 + payload_len,
+        tls_aead_encrypt(out_buf + 5, out_buf + 5 + payload_len,
                          hs_client_key, nonce,
                          ad, 5, ptxt, payload_len);
 

@@ -626,6 +626,109 @@ static long sys_clip_paste(char *buf, uint32_t max) {
 /* ---- HTTP GET syscall ------------------------------------------ */
 #define HTTP_SYSCALL_MAX_BODY  65536u  /* 64KB cap for userspace fetches */
 #define HTTP_MAX_REDIRECTS     5
+/* SYS_HTTP_FETCH downloads the whole body kernel-side (transient
+ * kmalloc), then truncates to the caller's buffer. */
+#define HTTP_FETCH_KERNEL_MAX  (1u << 20)
+
+static int http_is_redirect(int status) {
+    return status == 301 || status == 302 || status == 303 ||
+           status == 307 || status == 308;
+}
+
+/* Append src to dst[*pos] within cap; returns 0, or -1 if it didn't fit. */
+static int url_append(char *dst, size_t cap, size_t *pos, const char *src) {
+    size_t l = strlen(src);
+    if (*pos + l + 1 > cap) return -1;
+    memcpy(dst + *pos, src, l);
+    *pos += l;
+    dst[*pos] = 0;
+    return 0;
+}
+
+/* Case-insensitive prefix match (klibc has no strncasecmp). */
+static int http_ci_prefix(const char *s, const char *prefix) {
+    for (int i = 0; prefix[i]; i++) {
+        char a = s[i], b = prefix[i];
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (b >= 'A' && b <= 'Z') b += 32;
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+/* Resolve a redirect Location against the URL that produced it. Real
+ * sites routinely send relative forms ("/en/", "//host/p", "next.html"),
+ * which the old verbatim copy turned into a Bad-URL failure. */
+static int http_resolve_location(const char *cur, const char *loc,
+                                 char *out, size_t cap) {
+    /* Absolute: use as-is. */
+    if (http_ci_prefix(loc, "http://") || http_ci_prefix(loc, "https://")) {
+        size_t l = strlen(loc);
+        if (l + 1 > cap) return -1;
+        memcpy(out, loc, l + 1);
+        return 0;
+    }
+
+    struct http_url u;
+    if (http_parse_url(cur, &u) != 0) return -1;
+
+    size_t pos = 0;
+    if (url_append(out, cap, &pos, u.tls ? "https:" : "http:")) return -1;
+
+    /* Protocol-relative: scheme + "//host/path". */
+    if (loc[0] == '/' && loc[1] == '/')
+        return url_append(out, cap, &pos, loc);
+
+    if (url_append(out, cap, &pos, "//")) return -1;
+    if (url_append(out, cap, &pos, u.host)) return -1;
+    if (u.port != (u.tls ? 443 : 80)) {
+        char pbuf[8];
+        int  pi = 0;
+        uint16_t v = u.port;
+        char rev[6]; int ri = 0;
+        do { rev[ri++] = (char)('0' + v % 10); v /= 10; } while (v);
+        pbuf[pi++] = ':';
+        while (ri > 0) pbuf[pi++] = rev[--ri];
+        pbuf[pi] = 0;
+        if (url_append(out, cap, &pos, pbuf)) return -1;
+    }
+
+    if (loc[0] == '/')                      /* root-relative */
+        return url_append(out, cap, &pos, loc);
+
+    /* Path-relative: replace everything after the last '/' of the path. */
+    int last_slash = 0;
+    for (int i = 0; u.path[i]; i++)
+        if (u.path[i] == '/') last_slash = i;
+    u.path[last_slash + 1] = 0;
+    if (url_append(out, cap, &pos, u.path)) return -1;
+    return url_append(out, cap, &pos, loc);
+}
+
+/* GET cur_url following up to HTTP_MAX_REDIRECTS redirects. cur_url is
+ * rewritten in place to the URL that produced the final response (so
+ * callers can report the post-redirect address). On 0, *resp is live
+ * and the caller must http_free() it. */
+static int http_get_follow(char cur_url[512], size_t max_body,
+                           struct http_response *resp) {
+    for (int redir = 0; redir <= HTTP_MAX_REDIRECTS; redir++) {
+        int rc = http_get(cur_url, max_body, HTTP_DEFAULT_TIMEOUT_MS, resp);
+        if (rc < 0) return rc;
+
+        if (http_is_redirect(resp->status) && resp->location[0]) {
+            char next[512];
+            if (http_resolve_location(cur_url, resp->location,
+                                      next, sizeof(next)) == 0) {
+                kprintf("[http] %d redirect -> %s\n", resp->status, next);
+                memcpy(cur_url, next, strlen(next) + 1);
+                http_free(resp);
+                continue;
+            }
+        }
+        return 0;
+    }
+    return HTTP_ERR_PROTOCOL;                /* redirect loop */
+}
 
 static long sys_http_get(const char *url, void *buf, uint32_t buf_sz) {
     if (!cap_check(current_proc(), CAP_NET, "sys_http_get")) return -ABI_EPERM;
@@ -639,33 +742,62 @@ static long sys_http_get(const char *url, void *buf, uint32_t buf_sz) {
     if (strncpy_from_user(cur_url, url, sizeof(cur_url)) < 0)
         return -ABI_EFAULT;
 
-    for (int redir = 0; redir <= HTTP_MAX_REDIRECTS; redir++) {
-        struct http_response resp;
-        int rc = http_get(cur_url, (size_t)cap, HTTP_DEFAULT_TIMEOUT_MS, &resp);
-        if (rc < 0) return (long)rc;
+    struct http_response resp;
+    int rc = http_get_follow(cur_url, (size_t)cap, &resp);
+    if (rc < 0) return (long)rc;
 
-        /* Follow 301/302/303/307/308 redirects */
-        if ((resp.status == 301 || resp.status == 302 || resp.status == 303 ||
-             resp.status == 307 || resp.status == 308) && resp.location[0]) {
-            size_t loc_len = 0;
-            while (resp.location[loc_len]) loc_len++;
-            if (loc_len < sizeof(cur_url)) {
-                memcpy(cur_url, resp.location, loc_len + 1);
-                http_free(&resp);
-                continue;
-            }
-        }
-
-        size_t copy = resp.body_len < (size_t)cap ? resp.body_len : (size_t)cap;
-        if (copy_to_user(buf, resp.body, copy) != 0) {
-            http_free(&resp);
-            return -ABI_EFAULT;
-        }
+    size_t copy = resp.body_len < (size_t)cap ? resp.body_len : (size_t)cap;
+    if (copy_to_user(buf, resp.body, copy) != 0) {
         http_free(&resp);
-        return (long)copy;
+        return -ABI_EFAULT;
+    }
+    http_free(&resp);
+    return (long)copy;
+}
+
+/* SYS_HTTP_FETCH: the browser-grade fetch (see abi.h). Downloads up to
+ * HTTP_FETCH_KERNEL_MAX kernel-side, truncates into the user buffer,
+ * and reports status / total length / final URL / content type. */
+static long sys_http_fetch(struct abi_http_fetch *ureq) {
+    if (!cap_check(current_proc(), CAP_NET, "sys_http_fetch")) return -ABI_EPERM;
+    if (!ureq) return -ABI_EINVAL;
+
+    struct abi_http_fetch req;
+    if (copy_from_user(&req, ureq, sizeof(req)) != 0) return -ABI_EFAULT;
+    if (req.flags != 0) return -ABI_EINVAL;
+    if (!req.url || !req.buf || req.buf_sz == 0) return -ABI_EINVAL;
+    if (!user_buf_ok(req.buf, req.buf_sz)) return -ABI_EFAULT;
+
+    char cur_url[512];
+    if (strncpy_from_user(cur_url, (const char *)(uintptr_t)req.url,
+                          sizeof(cur_url)) < 0)
+        return -ABI_EFAULT;
+
+    struct http_response resp;
+    int rc = http_get_follow(cur_url, HTTP_FETCH_KERNEL_MAX, &resp);
+    if (rc < 0) return (long)rc;
+
+    size_t copy = resp.body_len < (size_t)req.buf_sz ? resp.body_len
+                                                     : (size_t)req.buf_sz;
+    if (copy > 0 &&
+        copy_to_user((void *)(uintptr_t)req.buf, resp.body, copy) != 0) {
+        http_free(&resp);
+        return -ABI_EFAULT;
     }
 
-    return HTTP_ERR_PROTOCOL;
+    req.status     = resp.status;
+    req.body_total = (uint32_t)resp.body_len;
+    _Static_assert(sizeof(req.final_url) >= sizeof(cur_url),
+                   "abi_http_fetch.final_url must hold a kernel URL");
+    memcpy(req.final_url, cur_url, strlen(cur_url) + 1);
+    size_t ctl = strlen(resp.content_type);
+    if (ctl >= sizeof(req.content_type)) ctl = sizeof(req.content_type) - 1;
+    memcpy(req.content_type, resp.content_type, ctl);
+    req.content_type[ctl] = 0;
+    http_free(&resp);
+
+    if (copy_to_user(ureq, &req, sizeof(req)) != 0) return -ABI_EFAULT;
+    return (long)copy;
 }
 
 /* ---- terminal session syscalls (milestone 13) ------------------ */
@@ -3095,6 +3227,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Network: HTTP GET ------------------------------------------ */
     case ABI_SYS_HTTP_GET:
         return sys_http_get((const char *)a1, (void *)a2, (uint32_t)a3);
+    case ABI_SYS_HTTP_FETCH:
+        return sys_http_fetch((struct abi_http_fetch *)a1);
 
     /* ---- Advanced GUI drawing (Phase 1) ----------------------------- */
     case ABI_SYS_GUI_LINE: {

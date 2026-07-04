@@ -763,8 +763,37 @@ _Static_assert(sizeof(struct abi_display_present_stats) == 64,
 #define ABI_SYS_BLK_LIST       169
 #define ABI_SYS_DATA_PROVISION 170
 
+/* Rich HTTP fetch (browser navigation). Unlike ABI_SYS_HTTP_GET (which
+ * keeps its exact-or-TOOBIG contract for wget/pkg downloads), this one
+ * TRUNCATES an oversized body to buf_sz and reports the full length, and
+ * it surfaces what the address bar needs: the HTTP status of the final
+ * response and the URL that actually served it after redirects (the
+ * kernel follows up to 5, resolving relative Location values).
+ *   args:  (struct abi_http_fetch *req)   -- in/out, reserved-padded
+ *   ret:   bytes copied into req->buf (>= 0), or HTTP_ERR_* / -ABI_E*
+ *          (< 0) on transport failure. A non-2xx status is NOT an error
+ *          here -- read req->status. */
+#define ABI_SYS_HTTP_FETCH     171
+
+#define ABI_HTTP_FETCH_URL_MAX  512
+#define ABI_HTTP_FETCH_CT_MAX    64
+
+struct abi_http_fetch {
+    /* in */
+    uint64_t url;          /* const char * user VA, NUL-terminated */
+    uint64_t buf;          /* body destination */
+    uint32_t buf_sz;
+    uint32_t flags;        /* reserved, must be 0 */
+    /* out */
+    int32_t  status;       /* HTTP status of the final response */
+    uint32_t body_total;   /* full body length before truncation */
+    char     final_url[ABI_HTTP_FETCH_URL_MAX];   /* post-redirect URL */
+    char     content_type[ABI_HTTP_FETCH_CT_MAX];
+    uint8_t  reserved[64];
+};
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          171
+#define ABI_SYS_NR_MAX          172
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

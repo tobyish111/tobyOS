@@ -34,7 +34,22 @@ typedef unsigned char      uint8_t;
 #define SYS_GUI_TEXT       12
 #define SYS_GUI_FLIP       13
 #define SYS_GUI_POLL_EVENT 14
-#define SYS_HTTP_GET       79
+#define SYS_HTTP_FETCH    171
+
+/* MUST mirror struct abi_http_fetch in include/tobyos/abi/abi.h (user
+ * programs build against libtoby headers only, so the layout is
+ * duplicated here; the struct is reserved-padded and ABI-frozen). */
+struct http_fetch {
+    unsigned long url;              /* in: const char * */
+    unsigned long buf;              /* in: body destination */
+    uint32_t      buf_sz;
+    uint32_t      flags;            /* must be 0 */
+    int32_t       status;           /* out: HTTP status of final response */
+    uint32_t      body_total;       /* out: full body length pre-truncation */
+    char          final_url[512];   /* out: post-redirect URL */
+    char          content_type[64];
+    uint8_t       reserved[64];
+};
 
 struct gui_event {
     int     type;
@@ -81,11 +96,11 @@ static inline int sys_gui_fill(int fd, int x, int y, int w, int h, uint32_t colo
 static inline int sys_gui_text(int fd, int x, int y, const char *s, uint32_t fg, uint32_t bg) {
     (void)fd; tk_draw_text_mono(&win, x, y, s, fg, bg); return 0;
 }
-static inline long sys_http_get(const char *url, void *buf, uint32_t buf_sz) {
+static inline long sys_http_fetch(struct http_fetch *req) {
     long r;
     __asm__ volatile ("syscall"
         : "=a"(r)
-        : "0"((long)SYS_HTTP_GET), "D"(url), "S"(buf), "d"((long)buf_sz)
+        : "0"((long)SYS_HTTP_FETCH), "D"(req)
         : "rcx", "r11", "memory");
     return r;
 }
@@ -142,7 +157,7 @@ static int str_contains(const char *haystack, int hlen, const char *needle, int 
 
 /* ---- Window Layout --------------------------------------------- */
 
-#define WIN_W        720
+#define WIN_W        720          /* initial window size only */
 #define WIN_H        500
 
 #define TAB_BAR_H     22
@@ -150,12 +165,20 @@ static int str_contains(const char *haystack, int hlen, const char *needle, int 
 #define TOOLBAR_H     (TAB_BAR_H + NAV_BAR_H)
 #define STATUS_H      16
 #define CONTENT_TOP   TOOLBAR_H
-#define CONTENT_H     (WIN_H - TOOLBAR_H - STATUS_H)
 #define PAD            6
 #define CELL_W         8
 #define CELL_H        12
-#define COLS         ((WIN_W - 2 * PAD) / CELL_W)
-#define ROWS         (CONTENT_H / CELL_H)
+#define MAX_COLS     480          /* line buffer capacity; g_cols clamps here */
+
+/* Live layout metrics, refreshed from the toolkit window each paint /
+ * mouse event (sync_geometry) so a WM resize reflows everything. The
+ * chrome bands (tab/nav/status) keep fixed heights; the page area and
+ * the text grid are derived from the live client size. */
+static int g_win_w     = WIN_W;
+static int g_win_h     = WIN_H;
+static int g_content_h = WIN_H - TOOLBAR_H - STATUS_H;
+static int g_cols      = (WIN_W - 2 * PAD) / CELL_W;
+static int g_rows      = (WIN_H - TOOLBAR_H - STATUS_H) / CELL_H;
 
 /* ---- Colors (Chrome dark theme inspired) ----------------------- */
 
@@ -207,15 +230,15 @@ static int str_contains(const char *haystack, int hlen, const char *needle, int 
 
 /* ---- Content buffer & HTML renderer ---------------------------- */
 
-#define RAW_CAP       (32 * 1024)
+#define RAW_CAP       (96 * 1024)
 static char g_raw[RAW_CAP + 1];
 static long g_raw_len = 0;
 
-#define RENDER_CAP    (48 * 1024)
+#define RENDER_CAP    (128 * 1024)
 static char g_render[RENDER_CAP + 1];
 static long g_render_len = 0;
 
-#define LINES_MAX     4096
+#define LINES_MAX     8192
 static long g_line_off[LINES_MAX];
 static int  g_line_count = 0;
 static int  g_top_line   = 0;
@@ -262,6 +285,17 @@ static int  g_find_line = -1;
 
 /* Source view toggle */
 static int  g_source_view = 0;
+
+/* What produced g_render -- picks the line-index style + wrap rules,
+ * and lets a resize re-wrap without re-fetching or re-parsing. */
+#define VIEW_HTML    0
+#define VIEW_PLAIN   1
+#define VIEW_SOURCE  2
+static int  g_view_mode = VIEW_HTML;
+static int  g_wrap_cols = 0;    /* column count the line index was built at */
+
+/* HTTP status of the last successful transport fetch (0 = none). */
+static int  g_last_status = 0;
 
 /* ---- HTML Parser/Renderer -------------------------------------- */
 
@@ -366,6 +400,95 @@ static int decode_entity(const char *src, long i, long len, char *out) {
     if (entity_match(src, start, len, "raquo"))  { *out = 0; return 6; }
 
     return 0;
+}
+
+/* Build the line index over g_render at the CURRENT g_cols width. This
+ * is the reflow primitive: a window resize re-runs just this (the
+ * rendered text and links are width-independent). Style rules follow
+ * g_view_mode: HTML detects heading sentinels + bullet/link/hr patterns
+ * and word-wraps at spaces; PLAIN/SOURCE hard-wrap at the column edge. */
+static void index_lines(void) {
+    int wrap_col = g_cols - 2;
+    if (wrap_col < 8) wrap_col = 8;
+    int html = (g_view_mode == VIEW_HTML);
+    uint8_t defstyle = (g_view_mode == VIEW_SOURCE) ? STYLE_CODE : STYLE_NORMAL;
+
+    g_wrap_cols = g_cols;
+    g_line_off[0] = 0;
+    g_line_style[0] = defstyle;
+
+    if (html && g_render_len > 0 && (unsigned char)g_render[0] >= SENTINEL_H1 &&
+        (unsigned char)g_render[0] <= SENTINEL_H3) {
+        int s = (unsigned char)g_render[0];
+        g_line_style[0] = (s == SENTINEL_H1) ? STYLE_H1 :
+                          (s == SENTINEL_H2) ? STYLE_H2 : STYLE_H3;
+        g_line_off[0] = 1;
+    }
+    g_line_count = 1;
+
+    int col = 0;
+    for (long i = g_line_off[0]; i < g_render_len && g_line_count < LINES_MAX; i++) {
+        if (g_render[i] == '\n') {
+            col = 0;
+            if (g_line_count < LINES_MAX && i + 1 < g_render_len) {
+                long next_start = i + 1;
+                uint8_t style = defstyle;
+                /* Check for heading sentinel at line start */
+                if (html && next_start < g_render_len &&
+                    (unsigned char)g_render[next_start] >= SENTINEL_H1 &&
+                    (unsigned char)g_render[next_start] <= SENTINEL_H3) {
+                    int s = (unsigned char)g_render[next_start];
+                    style = (s == SENTINEL_H1) ? STYLE_H1 :
+                            (s == SENTINEL_H2) ? STYLE_H2 : STYLE_H3;
+                    next_start++;
+                }
+                g_line_off[g_line_count] = next_start;
+                g_line_style[g_line_count] = style;
+                g_line_count++;
+            }
+        } else {
+            col++;
+            if (col >= wrap_col) {
+                long wrap_at = i;
+                if (html) {
+                    /* word wrap: back up to the last space on the line */
+                    long search = i;
+                    while (search > g_line_off[g_line_count - 1] && g_render[search] != ' ')
+                        search--;
+                    if (search > g_line_off[g_line_count - 1])
+                        wrap_at = search;
+                }
+                if (g_line_count < LINES_MAX) {
+                    g_line_off[g_line_count] = wrap_at + 1;
+                    g_line_style[g_line_count] = html ? g_line_style[g_line_count - 1]
+                                                      : defstyle;
+                    g_line_count++;
+                    i = wrap_at;
+                    col = 0;
+                }
+            }
+        }
+    }
+
+    if (!html) return;
+
+    /* Tag remaining line styles based on content patterns (bullets, links, hr) */
+    for (int li = 0; li < g_line_count; li++) {
+        if (g_line_style[li] != STYLE_NORMAL) continue;
+        long start = g_line_off[li];
+        if (g_render_len > start + 3 &&
+            g_render[start] == (char)0xE2 && g_render[start+1] == (char)0x94 &&
+            g_render[start+2] == (char)0x80) {
+            g_line_style[li] = STYLE_HR;
+        } else if (g_render_len > start + 2 &&
+                   g_render[start] == ' ' && g_render[start+1] == ' ' &&
+                   g_render[start+2] == '*') {
+            g_line_style[li] = STYLE_BULLET;
+        } else if (g_render_len > start + 1 && g_render[start] == '[' &&
+                   g_render[start+1] >= '0' && g_render[start+1] <= '9') {
+            g_line_style[li] = STYLE_LINK;
+        }
+    }
 }
 
 /* Handle multi-char entity expansions that decode_entity signals with out=0 */
@@ -596,81 +719,8 @@ static void render_html(void) {
 
     g_render[g_render_len] = '\0';
 
-    /* Build line index: detect sentinels for heading style tagging */
-    g_line_count = 0;
-    g_line_off[0] = 0;
-    g_line_style[0] = STYLE_NORMAL;
-
-    /* Check first char for sentinel */
-    if (g_render_len > 0 && (unsigned char)g_render[0] >= SENTINEL_H1 &&
-        (unsigned char)g_render[0] <= SENTINEL_H3) {
-        int s = (unsigned char)g_render[0];
-        g_line_style[0] = (s == SENTINEL_H1) ? STYLE_H1 :
-                          (s == SENTINEL_H2) ? STYLE_H2 : STYLE_H3;
-        g_line_off[0] = 1;
-    }
-    g_line_count = 1;
-
-    int word_wrap_col = COLS - 2;
-    int col = 0;
-
-    for (long i = g_line_off[0]; i < g_render_len && g_line_count < LINES_MAX; i++) {
-        if (g_render[i] == '\n') {
-            col = 0;
-            if (g_line_count < LINES_MAX && i + 1 < g_render_len) {
-                long next_start = i + 1;
-                uint8_t style = STYLE_NORMAL;
-                /* Check for heading sentinel at line start */
-                if (next_start < g_render_len &&
-                    (unsigned char)g_render[next_start] >= SENTINEL_H1 &&
-                    (unsigned char)g_render[next_start] <= SENTINEL_H3) {
-                    int s = (unsigned char)g_render[next_start];
-                    style = (s == SENTINEL_H1) ? STYLE_H1 :
-                            (s == SENTINEL_H2) ? STYLE_H2 : STYLE_H3;
-                    next_start++;
-                }
-                g_line_off[g_line_count] = next_start;
-                g_line_style[g_line_count] = style;
-                g_line_count++;
-            }
-        } else {
-            col++;
-            if (col >= word_wrap_col) {
-                long wrap_at = i;
-                long search = i;
-                while (search > g_line_off[g_line_count - 1] && g_render[search] != ' ')
-                    search--;
-                if (search > g_line_off[g_line_count - 1])
-                    wrap_at = search;
-
-                if (g_line_count < LINES_MAX) {
-                    g_line_off[g_line_count] = wrap_at + 1;
-                    g_line_style[g_line_count] = g_line_style[g_line_count - 1];
-                    g_line_count++;
-                    i = wrap_at;
-                    col = 0;
-                }
-            }
-        }
-    }
-
-    /* Tag remaining line styles based on content patterns (bullets, links, hr) */
-    for (int li = 0; li < g_line_count; li++) {
-        if (g_line_style[li] != STYLE_NORMAL) continue;
-        long start = g_line_off[li];
-        if (g_render_len > start + 3 &&
-            g_render[start] == (char)0xE2 && g_render[start+1] == (char)0x94 &&
-            g_render[start+2] == (char)0x80) {
-            g_line_style[li] = STYLE_HR;
-        } else if (g_render_len > start + 2 &&
-                   g_render[start] == ' ' && g_render[start+1] == ' ' &&
-                   g_render[start+2] == '*') {
-            g_line_style[li] = STYLE_BULLET;
-        } else if (g_render_len > start + 1 && g_render[start] == '[' &&
-                   g_render[start+1] >= '0' && g_render[start+1] <= '9') {
-            g_line_style[li] = STYLE_LINK;
-        }
-    }
+    g_view_mode = VIEW_HTML;
+    index_lines();
 }
 
 static void render_plain_text(void) {
@@ -683,31 +733,8 @@ static void render_plain_text(void) {
         g_render[g_render_len++] = g_raw[i];
     g_render[g_render_len] = '\0';
 
-    g_line_count = 0;
-    g_line_off[0] = 0;
-    g_line_style[0] = STYLE_NORMAL;
-    g_line_count = 1;
-
-    int col = 0;
-    int word_wrap_col = COLS - 2;
-    for (long i = 0; i < g_render_len && g_line_count < LINES_MAX; i++) {
-        if (g_render[i] == '\n') {
-            col = 0;
-            if (i + 1 < g_render_len && g_line_count < LINES_MAX) {
-                g_line_off[g_line_count] = i + 1;
-                g_line_style[g_line_count] = STYLE_NORMAL;
-                g_line_count++;
-            }
-        } else {
-            col++;
-            if (col >= word_wrap_col && g_line_count < LINES_MAX) {
-                g_line_off[g_line_count] = i + 1;
-                g_line_style[g_line_count] = STYLE_NORMAL;
-                g_line_count++;
-                col = 0;
-            }
-        }
-    }
+    g_view_mode = VIEW_PLAIN;
+    index_lines();
 }
 
 /* Source view: show raw HTML with line wrapping */
@@ -720,31 +747,8 @@ static void render_source_view(void) {
         g_render[g_render_len++] = g_raw[i];
     g_render[g_render_len] = '\0';
 
-    g_line_count = 0;
-    g_line_off[0] = 0;
-    g_line_style[0] = STYLE_CODE;
-    g_line_count = 1;
-
-    int col = 0;
-    int word_wrap_col = COLS - 2;
-    for (long i = 0; i < g_render_len && g_line_count < LINES_MAX; i++) {
-        if (g_render[i] == '\n') {
-            col = 0;
-            if (i + 1 < g_render_len && g_line_count < LINES_MAX) {
-                g_line_off[g_line_count] = i + 1;
-                g_line_style[g_line_count] = STYLE_CODE;
-                g_line_count++;
-            }
-        } else {
-            col++;
-            if (col >= word_wrap_col && g_line_count < LINES_MAX) {
-                g_line_off[g_line_count] = i + 1;
-                g_line_style[g_line_count] = STYLE_CODE;
-                g_line_count++;
-                col = 0;
-            }
-        }
-    }
+    g_view_mode = VIEW_SOURCE;
+    index_lines();
 }
 
 static int is_html_content(void) {
@@ -835,8 +839,8 @@ static void set_home_page(void) {
         "<h2>Quick Start</h2>"
         "<ul>"
         "<li>Press <b>Tab</b> to focus the address bar</li>"
-        "<li>Type a URL and press Enter</li>"
-        "<li>Supports HTTP and HTTPS</li>"
+        "<li>Type a URL (https tried first) or search terms and press Enter</li>"
+        "<li>Supports HTTP and HTTPS, follows redirects</li>"
         "<li>Use <b>j/k</b> to scroll, <b>d/u</b> for page scroll</li>"
         "<li>Press <b>[</b> to go back, <b>]</b> to go forward</li>"
         "<li>Click links or type link number + Enter</li>"
@@ -853,6 +857,7 @@ static void set_home_page(void) {
         "<li><b>f</b> - Follow link (type number then Enter)</li>"
         "<li><b>Ctrl+F</b> - Find in page</li>"
         "<li><b>n</b> - Find next</li>"
+        "<li><b>M</b> - Maximize window</li>"
         "<li><b>S</b> - Toggle page source view</li>"
         "<li><b>q</b> - Quit browser</li>"
         "</ul>"
@@ -887,92 +892,265 @@ static void set_home_page(void) {
     set_status("Ready");
 }
 
-static void do_fetch_url(const char *url) {
+/* ---- Fetching + Chrome-style navigation ------------------------- */
+
+static const char *http_err_str(int err) {
+    static const char *errs[] = {
+        "OK", "Bad URL", "DNS lookup failed", "Connection failed",
+        "Protocol error", "Chunked encoding (unsupported)",
+        "Response too large", "Timed out", "Out of memory",
+        "Connection reset"
+    };
+    int idx = -err;
+    return (idx >= 1 && idx <= 9) ? errs[idx] : "Unknown error";
+}
+#define HTTPE_DNS (-2)
+
+static int msg_append(char *dst, int pos, int max, const char *s) {
+    while (*s && pos < max - 1) dst[pos++] = *s++;
+    dst[pos] = '\0';
+    return pos;
+}
+static int msg_append_int(char *dst, int pos, int max, int v) {
+    char rev[12];
+    int t = 0;
+    if (v <= 0) rev[t++] = '0';
+    while (v > 0 && t < 11) { rev[t++] = (char)('0' + v % 10); v /= 10; }
+    while (t > 0 && pos < max - 1) dst[pos++] = rev[--t];
+    dst[pos] = '\0';
+    return pos;
+}
+
+static void raw_append(const char *s) {
+    while (*s && g_raw_len < RAW_CAP) g_raw[g_raw_len++] = *s++;
+}
+
+/* In-page error report: names the URL tried and the failure, so a dead
+ * fetch on real HW is diagnosable from the screen alone. */
+static void show_error_page(const char *url, int err) {
+    const char *emsg = http_err_str(err);
+    set_status(emsg);
+
+    g_raw_len = 0;
+    raw_append("<html><head><title>Problem loading page</title></head><body>"
+               "<h1>This site can't be reached</h1><p>");
+    raw_append(url);
+    raw_append("</p><p>Error: <b>");
+    raw_append(emsg);
+    raw_append("</b></p><hr><ul>"
+               "<li>Check the address for typos</li>"
+               "<li>DNS failed? The gateway/DNS server may be unreachable</li>"
+               "<li>Connection failed? The host may be down, or HTTPS-only</li>"
+               "</ul><p>Press <b>r</b> to retry, <b>[</b> to go back.</p>"
+               "</body></html>");
+    g_raw[g_raw_len] = '\0';
+    render_html();
+    g_top_line = 0;
+}
+
+/* Transport-only fetch of `url` into g_raw via SYS_HTTP_FETCH (kernel
+ * follows redirects). On success the address bar is updated to the
+ * URL that actually served the page. Returns bytes (>= 0) or HTTP_ERR. */
+static long fetch_page(const char *url) {
     g_loading = 1;
     set_status("Loading...");
 
-    long n = sys_http_get(url, g_raw, RAW_CAP);
+    struct http_fetch req;
+    mem_zero(&req, sizeof(req));
+    req.url    = (unsigned long)url;
+    req.buf    = (unsigned long)g_raw;
+    req.buf_sz = RAW_CAP;
+    long n = sys_http_fetch(&req);
     g_loading = 0;
+    if (n < 0) return n;
 
-    if (n < 0) {
-        const char *errs[] = {
-            "OK", "Bad URL", "DNS failed", "Connect failed",
-            "Protocol error", "Chunked (unsupported)", "Response too large",
-            "Timeout", "Out of memory", "Connection reset"
-        };
-        int idx = (int)(-n);
-        const char *emsg = (idx >= 1 && idx <= 9) ? errs[idx] : "Unknown error";
-        set_status(emsg);
-
-        g_raw_len = 0;
-        const char *pre = "<html><body><h1>Page Load Error</h1><p>Could not load: ";
-        while (*pre && g_raw_len < RAW_CAP) g_raw[g_raw_len++] = *pre++;
-        for (int i = 0; url[i] && g_raw_len < RAW_CAP; i++) g_raw[g_raw_len++] = url[i];
-        const char *mid = "</p><p>Error: <b>";
-        while (*mid && g_raw_len < RAW_CAP) g_raw[g_raw_len++] = *mid++;
-        while (*emsg && g_raw_len < RAW_CAP) g_raw[g_raw_len++] = *emsg++;
-        const char *suf = "</b></p><p>Check the URL and try again.</p></body></html>";
-        while (*suf && g_raw_len < RAW_CAP) g_raw[g_raw_len++] = *suf++;
-        g_raw[g_raw_len] = '\0';
-        render_html();
-        g_top_line = 0;
-        return;
-    }
-
+    g_last_status = req.status;
     g_raw_len = n;
     g_raw[g_raw_len] = '\0';
+    if (req.final_url[0]) {
+        str_copy(g_url, req.final_url, URL_MAX);
+        g_url_len = (int)str_len(g_url);
+    }
+    return n;
+}
 
+static void render_fetched(void) {
     g_source_view = 0;
     if (is_html_content())
         render_html();
     else
         render_plain_text();
-
     g_top_line = 0;
 
-    char done_msg[64];
-    str_copy(done_msg, "Done - ", 8);
-    int pos = 7;
-    int lc = g_line_count;
-    if (lc >= 10000) done_msg[pos++] = '0' + (lc / 10000) % 10;
-    if (lc >= 1000)  done_msg[pos++] = '0' + (lc / 1000) % 10;
-    if (lc >= 100)   done_msg[pos++] = '0' + (lc / 100) % 10;
-    if (lc >= 10)    done_msg[pos++] = '0' + (lc / 10) % 10;
-    done_msg[pos++] = '0' + lc % 10;
-    done_msg[pos++] = ' ';
-    done_msg[pos++] = 'l';
-    done_msg[pos++] = 'i';
-    done_msg[pos++] = 'n';
-    done_msg[pos++] = 'e';
-    done_msg[pos++] = 's';
-    if (g_link_count > 0) {
-        done_msg[pos++] = ',';
-        done_msg[pos++] = ' ';
-        int nlk = g_link_count;
-        if (nlk >= 100) done_msg[pos++] = '0' + (nlk / 100) % 10;
-        if (nlk >= 10)  done_msg[pos++] = '0' + (nlk / 10) % 10;
-        done_msg[pos++] = '0' + nlk % 10;
-        done_msg[pos++] = ' ';
-        done_msg[pos++] = 'l';
-        done_msg[pos++] = 'i';
-        done_msg[pos++] = 'n';
-        done_msg[pos++] = 'k';
-        done_msg[pos++] = 's';
+    char m[96];
+    int p = 0;
+    if (g_last_status >= 400) {
+        p = msg_append(m, p, sizeof(m), "HTTP ");
+        p = msg_append_int(m, p, sizeof(m), g_last_status);
+        p = msg_append(m, p, sizeof(m), " - ");
+    } else {
+        p = msg_append(m, p, sizeof(m), "Done - ");
     }
-    done_msg[pos] = '\0';
-    set_status(done_msg);
+    p = msg_append_int(m, p, sizeof(m), g_line_count);
+    p = msg_append(m, p, sizeof(m), " lines");
+    if (g_link_count > 0) {
+        p = msg_append(m, p, sizeof(m), ", ");
+        p = msg_append_int(m, p, sizeof(m), g_link_count);
+        p = msg_append(m, p, sizeof(m), " links");
+    }
+    set_status(m);
 }
 
-static void do_navigate(const char *url) {
-    g_url_len = 0;
-    while (url[g_url_len] && g_url_len < URL_MAX) {
-        g_url[g_url_len] = url[g_url_len];
-        g_url_len++;
-    }
-    g_url[g_url_len] = '\0';
+/* Fetch + render, error page on failure. Back/Forward/Refresh path. */
+static long do_fetch_url(const char *url) {
+    long n = fetch_page(url);
+    if (n < 0) show_error_page(url, (int)n);
+    else render_fetched();
+    return n;
+}
 
-    history_push(url);
-    do_fetch_url(url);
+/* Navigate to a fully-formed URL (links, search, explicit schemes). */
+static void do_navigate(const char *url) {
+    char target[URL_MAX + 1];
+    str_copy(target, url, URL_MAX);
+
+    str_copy(g_url, target, URL_MAX);
+    g_url_len = (int)str_len(g_url);
+
+    long n = fetch_page(target);
+    if (n < 0) {
+        show_error_page(target, (int)n);
+        history_push(target);
+    } else {
+        render_fetched();
+        history_push(g_url);      /* the post-redirect URL */
+    }
+    g_focus_url = 0;
+}
+
+/* ---- Omnibox input resolution (Chrome-style) --------------------- */
+
+static int has_scheme(const char *s) {
+    int i = 0;
+    const char *p = "http";
+    for (; i < 4; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c != p[i]) return 0;
+    }
+    if (s[i] == 's' || s[i] == 'S') i++;
+    return s[i] == ':' && s[i + 1] == '/' && s[i + 2] == '/';
+}
+
+/* Search query vs. navigable host: spaces always mean search; a single
+ * token with no dot, no colon and no slash (and not "localhost") does
+ * too. Everything else is treated as a URL. */
+static int input_is_query(const char *s) {
+    int urlish = 0;
+    for (int i = 0; s[i]; i++) {
+        if (s[i] == ' ') return 1;
+        if (s[i] == '.' || s[i] == ':' || s[i] == '/') urlish = 1;
+    }
+    if (urlish) return 0;
+    if (str_eq(s, "localhost")) return 0;
+    return 1;
+}
+
+static void build_search_url(const char *q, char *out, int out_max) {
+    static const char hex[] = "0123456789ABCDEF";
+    const char *base = "https://html.duckduckgo.com/html/?q=";
+    int pos = 0;
+    while (base[pos] && pos < out_max - 4) { out[pos] = base[pos]; pos++; }
+    for (int i = 0; q[i] && pos < out_max - 4; i++) {
+        char c = q[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            out[pos++] = c;
+        } else if (c == ' ') {
+            out[pos++] = '+';
+        } else {
+            out[pos++] = '%';
+            out[pos++] = hex[((unsigned char)c >> 4) & 0xF];
+            out[pos++] = hex[(unsigned char)c & 0xF];
+        }
+    }
+    out[pos] = '\0';
+}
+
+static void str_concat2(char *out, int max, const char *a, const char *b) {
+    int pos = 0;
+    for (int i = 0; a[i] && pos < max - 1; i++) out[pos++] = a[i];
+    for (int i = 0; b[i] && pos < max - 1; i++) out[pos++] = b[i];
+    out[pos] = '\0';
+}
+
+static int nav_success(long rc) {
+    if (rc < 0) return 0;
+    render_fetched();
+    history_push(g_url);
+    g_focus_url = 0;
+    return 1;
+}
+
+/* The omnibox: what runs when Enter is pressed in the address bar.
+ *   - explicit scheme        -> use as-is
+ *   - non-URL text           -> DuckDuckGo HTML search
+ *   - bare host[/path]       -> https:// first, http:// fallback,
+ *                               www. retry when DNS says no such host */
+static void navigate_input(const char *input_raw) {
+    char input[URL_MAX + 1];
+    int s = 0;
+    while (input_raw[s] == ' ' || input_raw[s] == '\t') s++;
+    int pos = 0;
+    for (int i = s; input_raw[i] && pos < URL_MAX; i++) input[pos++] = input_raw[i];
+    while (pos > 0 && (input[pos - 1] == ' ' || input[pos - 1] == '\t')) pos--;
+    input[pos] = '\0';
+    if (!input[0]) return;
+
+    if (has_scheme(input)) { do_navigate(input); return; }
+
+    if (input_is_query(input)) {
+        char surl[URL_MAX + 1];
+        build_search_url(input, surl, URL_MAX);
+        do_navigate(surl);
+        return;
+    }
+
+    char cand[URL_MAX + 1];
+    str_concat2(cand, URL_MAX, "https://", input);
+    str_copy(g_url, cand, URL_MAX);
+    g_url_len = (int)str_len(g_url);
+    long rc = fetch_page(cand);
+    if (nav_success(rc)) return;
+
+    if (rc == HTTPE_DNS) {
+        /* Host didn't resolve: retry with a www. prefix (https, then
+         * http only if www. actually resolved). */
+        if (!(input[0] == 'w' && input[1] == 'w' && input[2] == 'w' &&
+              input[3] == '.')) {
+            char www[URL_MAX + 1];
+            str_concat2(www, URL_MAX, "https://www.", input);
+            rc = fetch_page(www);
+            if (nav_success(rc)) return;
+            if (rc != HTTPE_DNS) {
+                str_concat2(www, URL_MAX, "http://www.", input);
+                rc = fetch_page(www);
+                if (nav_success(rc)) return;
+            }
+            str_copy(cand, www, URL_MAX);
+        }
+    } else {
+        /* Resolved but HTTPS didn't answer: fall back to plain HTTP. */
+        str_concat2(cand, URL_MAX, "http://", input);
+        rc = fetch_page(cand);
+        if (nav_success(rc)) return;
+    }
+
+    str_copy(g_url, cand, URL_MAX);
+    g_url_len = (int)str_len(g_url);
+    show_error_page(cand, (int)rc);
+    history_push(cand);
     g_focus_url = 0;
 }
 
@@ -984,9 +1162,49 @@ static void scroll_up(int n) {
 }
 static void scroll_down(int n) {
     g_top_line += n;
-    int max_top = g_line_count - ROWS;
+    int max_top = g_line_count - g_rows;
     if (max_top < 0) max_top = 0;
     if (g_top_line > max_top) g_top_line = max_top;
+}
+
+static void clamp_scroll(void) {
+    int max_top = g_line_count - g_rows;
+    if (max_top < 0) max_top = 0;
+    if (g_top_line > max_top) g_top_line = max_top;
+    if (g_top_line < 0) g_top_line = 0;
+}
+
+/* Refresh the layout metrics from the live toolkit window size (the
+ * toolkit updates win.w/h on TK_EV_RESIZE) and re-wrap the page text
+ * when the column count changed. Called at the top of every paint and
+ * mouse handler, so the browser self-corrects on any repaint -- no
+ * resize-event plumbing needed. Keeps the reader's place by re-finding
+ * the line that contains the old top line's character offset. */
+static void sync_geometry(void) {
+    if (win.w > 0)  g_win_w = win.w;
+    if (win.h > 0)  g_win_h = win.h;
+
+    g_content_h = g_win_h - TOOLBAR_H - STATUS_H;
+    if (g_content_h < CELL_H) g_content_h = CELL_H;
+    g_rows = g_content_h / CELL_H;
+    if (g_rows < 1) g_rows = 1;
+
+    g_cols = (g_win_w - 2 * PAD) / CELL_W;
+    if (g_cols < 10) g_cols = 10;
+    if (g_cols > MAX_COLS) g_cols = MAX_COLS;
+
+    if (g_cols != g_wrap_cols && g_render_len > 0) {
+        long anchor = (g_top_line > 0 && g_top_line < g_line_count)
+                          ? g_line_off[g_top_line] : 0;
+        index_lines();
+        int nt = 0;
+        for (int li = 0; li < g_line_count; li++) {
+            if (g_line_off[li] <= anchor) nt = li;
+            else break;
+        }
+        g_top_line = nt;
+    }
+    clamp_scroll();
 }
 
 /* ---- Find in page ---------------------------------------------- */
@@ -1007,9 +1225,9 @@ static void find_next_match(void) {
             int llen = (int)(lend - lstart);
             if (str_contains(&g_render[lstart], llen, g_find_buf, g_find_len) >= 0) {
                 g_find_line = li;
-                g_top_line = li - ROWS / 2;
+                g_top_line = li - g_rows / 2;
                 if (g_top_line < 0) g_top_line = 0;
-                int max_top = g_line_count - ROWS;
+                int max_top = g_line_count - g_rows;
                 if (max_top < 0) max_top = 0;
                 if (g_top_line > max_top) g_top_line = max_top;
                 set_status("Found");
@@ -1049,8 +1267,9 @@ static void draw_hline(int fd, int x, int y, int w, uint32_t color) {
 static void redraw(int fd) { (void)fd; tk_redraw(&win); }
 static void paint_all(void) {
     int fd = 0; (void)fd;
+    sync_geometry();             /* track live window size; reflow if needed */
     /* Tab Bar */
-    sys_gui_fill(fd, 0, 0, WIN_W, TAB_BAR_H, COL_TAB_BG);
+    sys_gui_fill(fd, 0, 0, g_win_w, TAB_BAR_H, COL_TAB_BG);
     sys_gui_fill(fd, 0, 0, 220, TAB_BAR_H, COL_TAB_ACTIVE);
     draw_hline(fd, 0, TAB_BAR_H - 1, 220, COL_NAV_BG);
 
@@ -1069,7 +1288,7 @@ static void paint_all(void) {
 
     /* Navigation Bar */
     int nav_y = TAB_BAR_H;
-    sys_gui_fill(fd, 0, nav_y, WIN_W, NAV_BAR_H, COL_NAV_BG);
+    sys_gui_fill(fd, 0, nav_y, g_win_w, NAV_BAR_H, COL_NAV_BG);
 
     uint32_t back_col = can_go_back() ? COL_NAV_BTN : COL_NAV_BTN_DIM;
     sys_gui_text(fd, 8, nav_y + 8, "<", back_col, COL_NAV_BG);
@@ -1082,7 +1301,7 @@ static void paint_all(void) {
 
     /* URL bar */
     int url_x = 72;
-    int url_w = WIN_W - url_x - 8;
+    int url_w = g_win_w - url_x - 8;
     int url_y = nav_y + 4;
     int url_h = NAV_BAR_H - 8;
 
@@ -1126,12 +1345,12 @@ static void paint_all(void) {
     }
 
     /* Content Area */
-    sys_gui_fill(fd, 0, CONTENT_TOP, WIN_W, CONTENT_H, COL_PAGE_BG);
+    sys_gui_fill(fd, 0, CONTENT_TOP, g_win_w, g_content_h, COL_PAGE_BG);
 
     int content_y = CONTENT_TOP;
-    char line[COLS + 1];
+    static char line[MAX_COLS + 1];
 
-    for (int r = 0; r < ROWS; r++) {
+    for (int r = 0; r < g_rows; r++) {
         int li = g_top_line + r;
         if (li >= g_line_count) break;
 
@@ -1144,7 +1363,7 @@ static void paint_all(void) {
         if (end > start && g_render[end - 1] == '\n') end--;
 
         long len = end - start;
-        if (len > COLS) len = COLS;
+        if (len > g_cols) len = g_cols;
 
         for (long k = 0; k < len; k++) {
             char c = g_render[start + k];
@@ -1181,25 +1400,25 @@ static void paint_all(void) {
     }
 
     /* Scrollbar */
-    if (g_line_count > ROWS) {
-        int track_x = WIN_W - 6;
-        int track_h = CONTENT_H;
+    if (g_line_count > g_rows) {
+        int track_x = g_win_w - 6;
+        int track_h = g_content_h;
         sys_gui_fill(fd, track_x, CONTENT_TOP, 4, track_h, 0x002D2E31u);
 
-        int thumb_h = (ROWS * track_h) / g_line_count;
+        int thumb_h = (g_rows * track_h) / g_line_count;
         if (thumb_h < 20) thumb_h = 20;
         int thumb_y = CONTENT_TOP + (g_top_line * (track_h - thumb_h)) /
-                      (g_line_count - ROWS > 0 ? g_line_count - ROWS : 1);
+                      (g_line_count - g_rows > 0 ? g_line_count - g_rows : 1);
         sys_gui_fill(fd, track_x, thumb_y, 4, thumb_h, 0x005F6368u);
     }
 
     /* Status Bar (or Find Bar if in find mode) */
-    int status_y = WIN_H - STATUS_H;
-    sys_gui_fill(fd, 0, status_y, WIN_W, STATUS_H, COL_STATUS_BG);
-    draw_hline(fd, 0, status_y, WIN_W, 0x003C4043u);
+    int status_y = g_win_h - STATUS_H;
+    sys_gui_fill(fd, 0, status_y, g_win_w, STATUS_H, COL_STATUS_BG);
+    draw_hline(fd, 0, status_y, g_win_w, 0x003C4043u);
 
     if (g_find_mode) {
-        sys_gui_fill(fd, 0, status_y, WIN_W, STATUS_H, COL_FIND_BG);
+        sys_gui_fill(fd, 0, status_y, g_win_w, STATUS_H, COL_FIND_BG);
         char find_disp[FIND_MAX + 8];
         find_disp[0] = 'F'; find_disp[1] = 'i'; find_disp[2] = 'n';
         find_disp[3] = 'd'; find_disp[4] = ':'; find_disp[5] = ' ';
@@ -1215,8 +1434,8 @@ static void paint_all(void) {
     }
 
     /* Scroll position indicator */
-    if (g_line_count > ROWS && !g_find_mode) {
-        int pct = (g_top_line * 100) / (g_line_count - ROWS > 0 ? g_line_count - ROWS : 1);
+    if (g_line_count > g_rows && !g_find_mode) {
+        int pct = (g_top_line * 100) / (g_line_count - g_rows > 0 ? g_line_count - g_rows : 1);
         if (pct > 100) pct = 100;
         char pct_str[8];
         int pp = 0;
@@ -1225,13 +1444,13 @@ static void paint_all(void) {
         pct_str[pp++] = '0' + pct % 10;
         pct_str[pp++] = '%';
         pct_str[pp] = '\0';
-        sys_gui_text(fd, WIN_W - (pp * CELL_W) - PAD, status_y + 3,
+        sys_gui_text(fd, g_win_w - (pp * CELL_W) - PAD, status_y + 3,
                      pct_str, COL_STATUS_FG, COL_STATUS_BG);
     }
 
     /* Source view indicator */
     if (g_source_view) {
-        sys_gui_text(fd, WIN_W - 80, status_y + 3, "[SOURCE]", COL_FIND_HL, COL_STATUS_BG);
+        sys_gui_text(fd, g_win_w - 80, status_y + 3, "[SOURCE]", COL_FIND_HL, COL_STATUS_BG);
     }
 }
 
@@ -1260,6 +1479,7 @@ static void follow_link(int num) {
 /* ---- Mouse event handling -------------------------------------- */
 
 static void handle_mouse_down(int fd, int mx, int my) {
+    sync_geometry();
     int nav_y = TAB_BAR_H;
 
     /* Tab close button area */
@@ -1316,12 +1536,12 @@ static void handle_mouse_down(int fd, int mx, int my) {
     }
 
     /* Content area */
-    if (my >= CONTENT_TOP && my < WIN_H - STATUS_H) {
+    if (my >= CONTENT_TOP && my < g_win_h - STATUS_H) {
         /* Scrollbar area (right 6px) */
-        if (mx >= WIN_W - 6 && g_line_count > ROWS) {
-            int track_h = CONTENT_H;
+        if (mx >= g_win_w - 6 && g_line_count > g_rows) {
+            int track_h = g_content_h;
             int rel_y = my - CONTENT_TOP;
-            int max_top = g_line_count - ROWS;
+            int max_top = g_line_count - g_rows;
             if (max_top < 0) max_top = 0;
             g_top_line = (rel_y * max_top) / track_h;
             if (g_top_line < 0) g_top_line = 0;
@@ -1352,7 +1572,7 @@ static void handle_mouse_down(int fd, int mx, int my) {
 
 /* Show link URL in status bar on mouse move over content */
 static void handle_mouse_move(int fd, int mx, int my) {
-    if (my >= CONTENT_TOP && my < WIN_H - STATUS_H && mx < WIN_W - 6) {
+    if (my >= CONTENT_TOP && my < g_win_h - STATUS_H && mx < g_win_w - 6) {
         int row = (my - CONTENT_TOP) / CELL_H;
         int li = g_top_line + row;
         int link_num = get_link_number_at_line(li);
@@ -1429,21 +1649,12 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
             if (key == '\n' || key == '\r') {
                 if (g_url_len > 0) {
                     g_url[g_url_len] = '\0';
-                    /* Auto-prepend http:// if no scheme present.
-                     * Accept both http:// and https:// typed by user. */
-                    if (g_url_len < 7 ||
-                        !(g_url[0]=='h' && g_url[1]=='t' && g_url[2]=='t' && g_url[3]=='p')) {
-                        char tmp[URL_MAX + 1];
-                        str_copy(tmp, g_url, URL_MAX);
-                        g_url[0] = 'h'; g_url[1] = 't'; g_url[2] = 't'; g_url[3] = 'p';
-                        g_url[4] = ':'; g_url[5] = '/'; g_url[6] = '/';
-                        int tl = (int)str_len(tmp);
-                        for (int i = 0; i < tl && i + 7 < URL_MAX; i++)
-                            g_url[7 + i] = tmp[i];
-                        g_url_len = 7 + tl;
-                        g_url[g_url_len] = '\0';
-                    }
-                    do_navigate(g_url);
+                    /* Omnibox: navigate_input() rewrites g_url as it
+                     * resolves (scheme inference / search / redirects),
+                     * so hand it a stable copy of what was typed. */
+                    char typed[URL_MAX + 1];
+                    str_copy(typed, g_url, URL_MAX);
+                    navigate_input(typed);
                 }
                 redraw(0);
             } else if (key == '\b' || key == 127) {
@@ -1488,17 +1699,22 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
             switch (key) {
             case 'j':  scroll_down(1);    break;
             case 'k':  scroll_up(1);      break;
-            case 'd':  scroll_down(ROWS); break;
-            case 'u':  scroll_up(ROWS);   break;
+            case 'd':  scroll_down(g_rows); break;
+            case 'u':  scroll_up(g_rows);   break;
             case 'g':  g_top_line = 0;    break;
             case 'G': {
-                int max_top = g_line_count - ROWS;
+                int max_top = g_line_count - g_rows;
                 if (max_top < 0) max_top = 0;
                 g_top_line = max_top;
                 break;
             }
             case 'n':
                 if (g_find_len > 0) find_next_match();
+                break;
+            case 'M':
+                /* Maximize; the WM answers with TK_EV_RESIZE and the next
+                 * paint reflows from the live geometry. */
+                tk_maximize(&win);
                 break;
             case 'S':
                 if (g_raw_len > 0) {
