@@ -77,7 +77,22 @@
 #define E1000E_TDH        0x3810
 #define E1000E_TDT        0x3818
 #define E1000E_TXDCTL     0x3828          /* TX descriptor control, queue 0 */
-#define TXDCTL_ENABLE     (1u << 25)      /* per-queue enable (82575+/PCH-LOM) */
+#define E1000E_TXDCTL1    0x3928          /* TX descriptor control, queue 1 */
+#define E1000E_TARC0      0x3840          /* TX arbitration count, queue 0  */
+#define E1000E_TARC1      0x3940          /* TX arbitration count, queue 1  */
+#define E1000E_CTRL_EXT   0x0018
+#define E1000E_FWSM       0x5B54          /* firmware semaphore (ME state)  */
+
+/* Linux e1000e's TXDCTL "DMA burst enable" for the PCH/LPT family
+ * (netdev.c): GRAN=1 (thresholds in descriptors), COUNT_DESC, WTHRESH=1,
+ * HTHRESH=1, PTHRESH=0x1f. The prefetch thresholds are the load-bearing
+ * part on PCH silicon -- with PTHRESH/HTHRESH left at 0 the I217's TX
+ * unit never fetches a descriptor (TDH pinned at 0 while TDT walks away,
+ * which is exactly the EliteDesk failure signature). */
+#define TXDCTL_GRAN        (1u << 24)
+#define TXDCTL_COUNT_DESC  (1u << 22)
+#define TXDCTL_DMA_BURST   (TXDCTL_GRAN | TXDCTL_COUNT_DESC | \
+                            (1u << 16) | (1u << 8) | 0x1Fu)
 #define E1000E_MTA_BASE   0x5200          /* 128 dwords */
 #define E1000E_RAL0       0x5400
 #define E1000E_RAH0       0x5404
@@ -419,11 +434,13 @@ void e1000e_dump_stats(const char *when) {
      * advanced TDT (HW not consuming the ring)? CTRL.SLU/STATUS.LU/TXOFF
      * (CTRL bit 22) reveal a link/transmit-paused gate. Pure reads. */
     kprintf("[e1000e]   regs: CTRL=0x%08x STATUS=0x%08x RCTL=0x%08x TCTL=0x%08x "
-            "TDH=%u TDT=%u TXDCTL=0x%08x\n",
+            "TDH=%u TDT=%u TXDCTL=0x%08x TARC0=0x%08x TARC1=0x%08x\n",
             (unsigned)mmio_read32(E1000E_CTRL), (unsigned)status,
             (unsigned)mmio_read32(E1000E_RCTL), (unsigned)mmio_read32(E1000E_TCTL),
             (unsigned)mmio_read32(E1000E_TDH), (unsigned)mmio_read32(E1000E_TDT),
-            (unsigned)mmio_read32(E1000E_TXDCTL));
+            (unsigned)mmio_read32(E1000E_TXDCTL),
+            (unsigned)mmio_read32(E1000E_TARC0),
+            (unsigned)mmio_read32(E1000E_TARC1));
 }
 
 /* ----- net_dev publication --------------------------------------- */
@@ -530,10 +547,17 @@ static int e1000e_probe(struct pci_dev *dev) {
             if ((mmio_read32(E1000E_CTRL) & CTRL_RST) == 0) break;
             pit_sleep_ms(1);
         }
+        /* Post-reset the MAC reloads its NVM config; register writes
+         * made before STATUS.LAN_INIT_DONE can be silently lost. */
+        for (int i = 0; i < 100; i++) {
+            if (mmio_read32(E1000E_STATUS) & (1u << 9)) break;
+            pit_sleep_ms(1);
+        }
         kprintf("[e1000e] PCH safe reset done (did %04x, CTRL=0x%08x "
-                "STATUS=0x%08x)\n", (unsigned)dev->device,
+                "STATUS=0x%08x FWSM=0x%08x)\n", (unsigned)dev->device,
                 (unsigned)mmio_read32(E1000E_CTRL),
-                (unsigned)mmio_read32(E1000E_STATUS));
+                (unsigned)mmio_read32(E1000E_STATUS),
+                (unsigned)mmio_read32(E1000E_FWSM));
     } else {
         mmio_write32(E1000E_CTRL, mmio_read32(E1000E_CTRL) | CTRL_RST);
         for (int i = 0; i < 1000000; i++) {
@@ -565,22 +589,47 @@ static int e1000e_probe(struct pci_dev *dev) {
 
     if (!e1000e_setup_rx() || !e1000e_setup_tx()) return -3;
 
-    /* On PCH-integrated LOM parts (I217/I218/I219) the legacy TCTL.EN bit
-     * is NOT sufficient to start the transmit DMA queue -- the per-queue
-     * TXDCTL.ENABLE (bit 25, the 82575+/igb-style enable) must also be set,
-     * or the MAC silently fetches no TX descriptors: GPTC/TPT stay 0 while
-     * RX works fine. That is exactly the e1000e_dump_stats signature seen on
-     * the EliteDesk I217 (link UP, RX good=106, TX good=0), which made every
-     * DHCP DISCOVER die before reaching the wire. The discrete 82574 (QEMU)
-     * does not have/need this gate, so it stays on the plain TCTL.EN path and
-     * the emulated target is unchanged. */
+    /* PCH-integrated LOM parts (I217/I218/I219): the transmit unit needs
+     * the ich8lan-family "initialize hw bits" that Linux's e1000e applies
+     * after every reset -- WITHOUT them the MAC fetches no TX descriptors
+     * at all (TDH pinned at 0 while TDT walks away, GPTC/TPT stay 0, RX
+     * fine: the exact EliteDesk I217 field signature). The earlier attempt
+     * set TXDCTL bit 25, but that is the 82575/igb queue-enable; on this
+     * family bit 25 is just LWTHRESH and does nothing. What actually
+     * matters:
+     *   - TXDCTL: GRAN + COUNT_DESC + NONZERO prefetch thresholds
+     *     (PTHRESH/HTHRESH/WTHRESH -- the DMA burst profile);
+     *   - TARC0/TARC1: the transmit arbitration enables (bits 23/24/26/27
+     *     on queue 0; 24/26/30 on queue 1, bit 28 cleared when TCTL.PSP);
+     *   - CTRL_EXT bit 22 (required by the family init spec).
+     * The discrete 82574 (QEMU) path is untouched. */
     if (e1000e_is_pch_lan(dev->device)) {
-        mmio_write32(E1000E_TXDCTL, mmio_read32(E1000E_TXDCTL) | TXDCTL_ENABLE);
-        for (int i = 0; i < 1000; i++) {
-            if (mmio_read32(E1000E_TXDCTL) & TXDCTL_ENABLE) break;
-        }
-        kprintf("[e1000e] PCH TX queue enabled (TXDCTL=0x%08x)\n",
-                mmio_read32(E1000E_TXDCTL));
+        uint32_t txdctl0_old = mmio_read32(E1000E_TXDCTL);
+        uint32_t tarc0_old   = mmio_read32(E1000E_TARC0);
+        uint32_t tarc1_old   = mmio_read32(E1000E_TARC1);
+
+        mmio_write32(E1000E_CTRL_EXT,
+                     mmio_read32(E1000E_CTRL_EXT) | (1u << 22));
+
+        mmio_write32(E1000E_TXDCTL, TXDCTL_DMA_BURST);
+        mmio_write32(E1000E_TXDCTL1,
+                     mmio_read32(E1000E_TXDCTL1) | TXDCTL_COUNT_DESC);
+
+        uint32_t tarc0 = tarc0_old;
+        tarc0 |= (1u << 23) | (1u << 24) | (1u << 26) | (1u << 27);
+        mmio_write32(E1000E_TARC0, tarc0);
+
+        uint32_t tarc1 = tarc1_old;
+        tarc1 |= (1u << 24) | (1u << 26) | (1u << 30);
+        if (mmio_read32(E1000E_TCTL) & TCTL_PSP) tarc1 &= ~(1u << 28);
+        mmio_write32(E1000E_TARC1, tarc1);
+
+        kprintf("[e1000e] PCH TX bring-up: TXDCTL 0x%08x->0x%08x  "
+                "TARC0 0x%08x->0x%08x  TARC1 0x%08x->0x%08x  TIPG=0x%08x\n",
+                txdctl0_old, (unsigned)mmio_read32(E1000E_TXDCTL),
+                tarc0_old,   (unsigned)mmio_read32(E1000E_TARC0),
+                tarc1_old,   (unsigned)mmio_read32(E1000E_TARC1),
+                (unsigned)mmio_read32(E1000E_TIPG));
     }
 
     /* 6. Try MSI-X first (the 82574L has a 5-vector MSI-X table that
