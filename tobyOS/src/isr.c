@@ -15,6 +15,7 @@
 #include <tobyos/page_fault.h>
 #include <tobyos/pmm.h>
 #include <tobyos/smp.h>
+#include <tobyos/percpu.h>   /* MAX_CPUS */
 #include <tobyos/signal.h>
 
 /* During pid-0 bring-up, demand-map HHDM mirror gaps (UEFI memmap
@@ -116,6 +117,54 @@ static void dump_regs(struct regs *r) {
             read_cr0(), read_cr4());
 }
 
+/* ---- repeated-fault (livelock) detector + mitigation --------------
+ *
+ * A page fault that the handler REPORTS as resolved but that then
+ * immediately re-faults at the same rip+addr spins the process forever:
+ * it stays RUNNABLE, makes no forward progress, never returns to its
+ * event loop, yet each fault is brief and drops the BKL, so pid-0's
+ * heartbeat keeps ticking -- the exact fingerprint of the EliteDesk
+ * File Explorer freeze (window went unresponsive + empty; kernel
+ * healthy; no crash logged). The prime suspect is a stale TLB entry on
+ * a real multi-core box (this kernel has no cross-CPU TLB shootdown),
+ * which QEMU-TCG does not reproduce.
+ *
+ * Per-CPU tracking: if the SAME (rip,addr) resolves PFLOOP_TRIP times in
+ * a row, log it loudly (greppable [PFLOOP], names the exact faulting
+ * instruction + address) and reload CR3 to flush this CPU's whole TLB.
+ * A full TLB flush is always safe; if the loop was TLB-staleness it
+ * ends here, and either way the log pins down the culprit on the next
+ * real-HW boot. */
+#define PFLOOP_TRIP  4096
+static struct { uint64_t rip, addr; uint32_t count; bool warned; }
+    g_pfloop[MAX_CPUS];
+
+static void pfloop_note_resolved(struct regs *r, uint64_t fault_addr) {
+    uint32_t ci = smp_current_cpu_idx();
+    if (ci >= MAX_CPUS) return;
+    struct proc *cp = current_proc();
+    if (cp) { cp->fault_count++; cp->last_fault_rip = r->rip;
+              cp->last_fault_cr2 = fault_addr; }
+    if (g_pfloop[ci].rip == r->rip && g_pfloop[ci].addr == fault_addr) {
+        if (++g_pfloop[ci].count >= PFLOOP_TRIP) {
+            if (!g_pfloop[ci].warned) {
+                kprintf("[PFLOOP] cpu%u pid=%d '%s' spun on the SAME fault "
+                        "%u times: rip=%p cr2=%p err=0x%lx -- flushing TLB "
+                        "(likely missing SMP shootdown)\n",
+                        ci, cp ? cp->pid : -1, cp ? cp->name : "?",
+                        (unsigned)g_pfloop[ci].count, (void *)r->rip,
+                        (void *)fault_addr, r->error_code);
+                g_pfloop[ci].warned = true;
+            }
+            write_cr3(read_cr3());          /* full TLB flush -- always safe */
+            g_pfloop[ci].count = 0;
+        }
+    } else {
+        g_pfloop[ci].rip = r->rip; g_pfloop[ci].addr = fault_addr;
+        g_pfloop[ci].count = 1; g_pfloop[ci].warned = false;
+    }
+}
+
 static void default_exception(struct regs *r) {
     bool from_user = (r->cs & 3) == 3;
 
@@ -125,9 +174,11 @@ static void default_exception(struct regs *r) {
         uint64_t fault_addr = read_cr2();
         if (from_user) {
             if (page_fault_handler(fault_addr, r->error_code, current_proc())) {
+                pfloop_note_resolved(r, fault_addr);
                 return; /* fault resolved via COW / demand-zero / swap-in */
             }
             if (mmap_handle_page_fault(fault_addr, r->error_code)) {
+                pfloop_note_resolved(r, fault_addr);
                 return; /* fault resolved via mmap demand paging */
             }
         } else {

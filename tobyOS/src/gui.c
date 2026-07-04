@@ -5126,13 +5126,19 @@ void gui_dump_status(const char *reason) {
         if (!p) {
             kprintf("    slot[%d] pid=%d (gone)\n", i, pid);
         } else {
-            /* syscalls: compare across two dumps a few seconds apart --
-             * a frozen count on a RUNNING proc = spinning in pure
-             * userspace (SIGINT can't land until it traps); a racing
-             * count = a syscall loop; use it to triage app freezes. */
-            kprintf("    slot[%d] pid=%d state=%s syscalls=%lu name='%s'\n",
+            /* Triage a frozen app across two F1 dumps a few seconds
+             * apart: syscalls RACING = syscall loop; faults RACING =
+             * repeating-fault livelock (last_fault rip/cr2 name it);
+             * BOTH static while state stays RUN = pure userspace spin
+             * (SIGINT can't land until it next traps into the kernel). */
+            kprintf("    slot[%d] pid=%d state=%s syscalls=%lu faults=%lu "
+                    "name='%s'\n",
                     i, pid, proc_state_str_local((int)p->state),
-                    (unsigned long)p->syscall_count, p->name);
+                    (unsigned long)p->syscall_count,
+                    (unsigned long)p->fault_count, p->name);
+            if (p->fault_count)
+                kprintf("             last_fault rip=%p cr2=%p\n",
+                        (void *)p->last_fault_rip, (void *)p->last_fault_cr2);
             if (p->state != PROC_TERMINATED) nlive++;
         }
     }

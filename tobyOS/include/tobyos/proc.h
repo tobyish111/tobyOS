@@ -335,6 +335,15 @@ struct proc {
     uint64_t        syscall_count;
     uint64_t        created_ns;
     uint64_t        user_pages;
+
+    /* Page-fault forensics (isr.c). `fault_count` and the last resolved
+     * fault's rip/cr2 let a freeze diagnosis distinguish a repeating-
+     * fault livelock (fault_count RACES between two F1 dumps -> the rip
+     * names the stuck instruction) from a pure userspace spin
+     * (fault_count static while state stays RUN). Diagnostic only. */
+    uint64_t        fault_count;
+    uint64_t        last_fault_rip;
+    uint64_t        last_fault_cr2;
 };
 
 /* ---- Milestone 19: time a child's exit --------------------------- *

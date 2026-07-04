@@ -204,6 +204,23 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
         if ((error_code & PF_ERR_WRITE) && !(v->flags & VMA_WRITE))
             return false;
 
+        /* Already-present page in a VMA = a pure PERMISSION fault (e.g. a
+         * write to a read-only-but-writable-VMA page). The mapping code
+         * below allocates a FRESH zero page and remaps -- which would
+         * clobber the live page's contents and leak the old frame, and
+         * (if the write bit still didn't take) re-fault forever. Fix it
+         * in place: grant write on the existing PTE + invlpg, or refuse
+         * (segfault) rather than resolve-without-fixing. This closes an
+         * infinite resolved-fault loop avenue and never destroys data. */
+        if (pte && (*pte & PTE_PRESENT)) {
+            if ((error_code & PF_ERR_WRITE) && (v->flags & VMA_WRITE)) {
+                *pte |= PTE_WRITABLE;
+                invlpg(page_va);
+                return true;
+            }
+            return false;   /* present + not a grantable write = real fault */
+        }
+
         /* File-backed mmap: read page from disk */
         if (v->flags & VMA_FILE) {
             uint64_t new_phys = pmm_alloc_page();
