@@ -553,11 +553,35 @@ static int e1000e_probe(struct pci_dev *dev) {
             if (mmio_read32(E1000E_STATUS) & (1u << 9)) break;
             pit_sleep_ms(1);
         }
+        uint32_t fwsm = mmio_read32(E1000E_FWSM);
         kprintf("[e1000e] PCH safe reset done (did %04x, CTRL=0x%08x "
                 "STATUS=0x%08x FWSM=0x%08x)\n", (unsigned)dev->device,
                 (unsigned)mmio_read32(E1000E_CTRL),
                 (unsigned)mmio_read32(E1000E_STATUS),
-                (unsigned)mmio_read32(E1000E_FWSM));
+                (unsigned)fwsm);
+
+        /* CONFIRMED on an HP EliteDesk 800 G1 (I217-LM, vPro/AMT box),
+         * 2026-07-04: when Intel AMT / the Management Engine is enabled,
+         * FWSM.FW_VALID (bit 15) reads 1 and the ME holds the MAC<->PHY
+         * interconnect for out-of-band management. RX still works (inbound
+         * frames are delivered), but the OS driver's TX never reaches the
+         * wire: TDH stays pinned at 0 while TDT advances, TX good=0, even
+         * with TCTL.EN + the full TARC/TXDCTL init programmed correctly
+         * (every reg reads back as written). Disabling AMT in the BIOS
+         * hands the PHY back to the OS and TX/DHCP work immediately.
+         *
+         * Coexisting WITH AMT enabled needs the ich8lan SW/FW/HW-semaphore
+         * + H2ME ownership handshake (a large, delicate piece; not done).
+         * Until then, surface a loud, greppable hint so this exact
+         * TX-dead-RX-alive signature on any future vPro part is a one-line
+         * diagnosis instead of a multi-day hunt. Diagnostic only -- no
+         * register writes, so it cannot destabilise a working config. */
+        if (fwsm & (1u << 15)) {
+            kprintf("[e1000e] NOTE: Intel ME/AMT firmware is ACTIVE "
+                    "(FWSM.FW_VALID=1). If TX is dead (TDH stuck at 0, "
+                    "TX good=0) while RX works, the ME owns the PHY -- "
+                    "DISABLE Intel AMT/ME in the BIOS to give TX to the OS.\n");
+        }
     } else {
         mmio_write32(E1000E_CTRL, mmio_read32(E1000E_CTRL) | CTRL_RST);
         for (int i = 0; i < 1000000; i++) {
