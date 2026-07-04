@@ -10,7 +10,12 @@
 #include <tobyos/sched.h>   /* bkl_held/bkl_exit/bkl_enter for the wait loop */
 
 #define TCP_MAX_CONNS         12
-#define TCP_RX_BUF_BYTES    8192
+/* Per-conn receive buffer == our advertised window. 8 KiB forced a
+ * stop-and-wait window refill every ~15 MSS-sized segments, which on a
+ * real WAN link (EliteDesk, google.com ~300 KiB) collapsed throughput
+ * and let the 5 s per-recv HTTP timeout fire mid-body. 64 KiB rides
+ * the already-advertised wscale shift=4. 12 conns x 64 KiB = 768 KiB. */
+#define TCP_RX_BUF_BYTES   65536
 #define TCP_DEFAULT_MSS     1460
 #define TCP_MAX_TX_PENDING  4
 #define TCP_LISTEN_BACKLOG  4
@@ -86,6 +91,16 @@ struct tcp_conn {
 };
 
 static struct tcp_conn g_conns[TCP_MAX_CONNS];
+
+/* Per-segment rx tracing (payload/out-of-order/buffer-full lines).
+ * Default OFF: on real HW a single big HTTPS download is hundreds of
+ * segments, and one log line per segment saturates the 38400-baud
+ * serial ring -- the resulting ACK delays made WAN senders back off
+ * until the 5 s HTTP recv timeout fired (the EliteDesk "Timed out on
+ * every site" field report, 2026-07-04). Rare events (FIN/RST/drops)
+ * still log unconditionally. */
+static int g_tcp_trace = 0;
+void tcp_set_trace(int on) { g_tcp_trace = on ? 1 : 0; }
 static uint16_t        g_eph_next = TCP_EPHEMERAL_LO;
 
 static int conn_index(const struct tcp_conn *c) {
@@ -310,10 +325,16 @@ static bool tcp_emit(struct tcp_conn *c, uint8_t flags,
     h->data_off = (uint8_t)((hdr_len / 4u) << 4);
     h->flags    = flags;
 
-    /* Advertise receive window (shifted if wscale negotiated) */
-    uint16_t adv_wnd = (uint16_t)(TCP_RX_BUF_BYTES - c->rx_count);
+    /* Advertise receive window (shifted if wscale negotiated). The
+     * unscaled form (SYN segments, or a peer without wscale) is capped
+     * at 65535: with a 64 KiB buffer the raw value is 65536, which a
+     * bare uint16_t cast would truncate to a ZERO window. */
+    uint32_t free_wnd = (uint32_t)(TCP_RX_BUF_BYTES - c->rx_count);
+    uint16_t adv_wnd;
     if (c->wscale_ok && !(flags & TCP_FLAG_SYN))
-        adv_wnd = (uint16_t)((TCP_RX_BUF_BYTES - c->rx_count) >> c->rcv_wnd_shift);
+        adv_wnd = (uint16_t)(free_wnd >> c->rcv_wnd_shift);
+    else
+        adv_wnd = (free_wnd > 0xFFFFu) ? 0xFFFFu : (uint16_t)free_wnd;
     h->window   = htons(adv_wnd);
     h->urgent   = 0;
     h->checksum = 0;
@@ -638,25 +659,28 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
             rx_push(c, payload, plen);
             c->rcv_nxt += (uint32_t)plen;
             need_ack = true;
-    
-            kprintf("[tcp] payload rx tcp[%d] len=%u seq=%u new_rcv_nxt=%u\n",
+
+            if (g_tcp_trace)
+                kprintf("[tcp] payload rx tcp[%d] len=%u seq=%u new_rcv_nxt=%u\n",
+                        conn_index(c),
+                        (unsigned)plen,
+                        (unsigned)seq,
+                        (unsigned)c->rcv_nxt);
+        } else {
+            if (g_tcp_trace)
+                kprintf("[tcp] RX buffer full tcp[%d] plen=%u free=%u\n",
+                        conn_index(c),
+                        (unsigned)plen,
+                        (unsigned)free_space);
+            need_ack = true;
+        }
+    } else if (plen > 0 && seq != c->rcv_nxt) {
+        if (g_tcp_trace)
+            kprintf("[tcp] out-of-order payload tcp[%d] len=%u seq=%u expected=%u\n",
                     conn_index(c),
                     (unsigned)plen,
                     (unsigned)seq,
                     (unsigned)c->rcv_nxt);
-        } else {
-            kprintf("[tcp] RX buffer full tcp[%d] plen=%u free=%u\n",
-                    conn_index(c),
-                    (unsigned)plen,
-                    (unsigned)free_space);
-            need_ack = true;
-        }
-    } else if (plen > 0 && seq != c->rcv_nxt) {
-        kprintf("[tcp] out-of-order payload tcp[%d] len=%u seq=%u expected=%u\n",
-                conn_index(c),
-                (unsigned)plen,
-                (unsigned)seq,
-                (unsigned)c->rcv_nxt);
         need_ack = true;
     }
 

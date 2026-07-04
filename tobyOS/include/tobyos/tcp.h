@@ -81,6 +81,9 @@ long tcp_send(struct tcp_conn *c, const void *buf, size_t len);
 long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms);
 void tcp_close(struct tcp_conn *c);
 void tcp_dump(void);
+/* Toggle per-segment rx trace lines (default off -- they saturate a
+ * 38400-baud serial link during any large download). */
+void tcp_set_trace(int on);
 
 tcp_state_t tcp_state(const struct tcp_conn *c);
 const char *tcp_state_name(tcp_state_t s);
