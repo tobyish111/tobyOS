@@ -782,7 +782,7 @@ static long sys_http_fetch(struct abi_http_fetch *ureq) {
     if (kmax > HTTP_FETCH_KERNEL_MAX) kmax = HTTP_FETCH_KERNEL_MAX;
 
     struct http_response resp;
-    int rc = http_get_follow(cur_url, kmax, HTTP_F_TRUNCATE, &resp);
+    int rc = http_get_follow(cur_url, kmax, HTTP_F_TRUNCATE | HTTP_F_GZIP, &resp);
     if (rc < 0) return (long)rc;
 
     size_t copy = resp.body_len < (size_t)req.buf_sz ? resp.body_len
@@ -803,6 +803,9 @@ static long sys_http_fetch(struct abi_http_fetch *ureq) {
     if (ctl >= sizeof(req.content_type)) ctl = sizeof(req.content_type) - 1;
     memcpy(req.content_type, resp.content_type, ctl);
     req.content_type[ctl] = 0;
+    /* Kernel inflates gzip transparently, so this is normally IDENTITY;
+     * report it for completeness / future browser-side handling. */
+    req.content_encoding = resp.encoding;
     http_free(&resp);
 
     if (copy_to_user(ureq, &req, sizeof(req)) != 0) return -ABI_EFAULT;

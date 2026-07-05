@@ -789,8 +789,13 @@ struct abi_http_fetch {
     uint32_t body_total;   /* full body length before truncation */
     char     final_url[ABI_HTTP_FETCH_URL_MAX];   /* post-redirect URL */
     char     content_type[ABI_HTTP_FETCH_CT_MAX];
-    uint8_t  reserved[64];
+    uint8_t  content_encoding;  /* out: 0 identity, 1 gzip (caller inflates) */
+    uint8_t  reserved[63];
 };
+
+/* abi_http_fetch.content_encoding values. */
+#define ABI_HTTP_ENC_IDENTITY  0
+#define ABI_HTTP_ENC_GZIP      1
 
 /* Highest assigned syscall number plus one. */
 #define ABI_SYS_NR_MAX          172

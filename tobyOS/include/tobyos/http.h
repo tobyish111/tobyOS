@@ -36,6 +36,7 @@
  * to use the defaults. */
 #define HTTP_DEFAULT_TIMEOUT_MS    5000u
 #define HTTP_MAX_HEADER_BYTES      8192u    /* cap on total header block */
+#define HTTP_GZIP_READ_MAX         (512u*1024u) /* compressed body read cap */
 #define HTTP_MAX_URL_LEN           512u
 #define HTTP_MAX_HOST_LEN          128u
 #define HTTP_MAX_PATH_LEN          384u
@@ -70,7 +71,14 @@ struct http_response {
     size_t     body_len;                /* bytes actually downloaded     */
     uint8_t   *body;                    /* kmalloc'd; may be NULL on err */
     long       content_len;             /* Content-Length header, -1 if absent */
+    uint8_t    encoding;                /* HTTP_ENC_* Content-Encoding    */
 };
+
+/* Content-Encoding of the body (the client is responsible for inflating
+ * a gzip body -- http_get does NOT decompress, it only advertises the
+ * capability and reports what came back). */
+#define HTTP_ENC_IDENTITY 0
+#define HTTP_ENC_GZIP     1
 
 /* http_get_opt() flags. */
 #define HTTP_F_TRUNCATE  0x1u  /* body > max_body_bytes: stop reading at the
@@ -80,6 +88,9 @@ struct http_response {
                                 * browser path wants this -- it only renders
                                 * the first N KiB anyway; downloads (wget,
                                 * pkg) must keep the exact-or-error contract. */
+#define HTTP_F_GZIP      0x2u  /* advertise Accept-Encoding: gzip; a gzip
+                                * response comes back RAW with encoding set
+                                * (the caller inflates). Off => identity. */
 
 /* Parse a URL string into `out`. Accepts:
  *   http://host
@@ -124,6 +135,13 @@ int http_get_opt(const char *url,
 /* Free an http_response. NULL-safe; idempotent (clears the struct
  * after free so a double-free becomes a no-op). */
 void http_free(struct http_response *r);
+
+/* Cookie jar (RFC 6265-lite): session cookies kept in memory, keyed by
+ * host, sent back on same-host requests. No Domain/Path/Expiry/Secure
+ * semantics yet -- enough for login/session continuity within a site.
+ * Managed automatically by http_get; exposed for tests/inspection. */
+void cookie_jar_clear(void);
+int  cookie_jar_count(void);
 
 /* Render a HTTP_ERR_* code into a static string for logging. */
 const char *http_strerror(int err);

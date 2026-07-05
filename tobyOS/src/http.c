@@ -33,6 +33,7 @@
 #include <tobyos/heap.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+#include <tobyos/puff.h>
 
 /* Transport abstraction: either raw TCP or TLS-wrapped TCP. */
 struct http_transport {
@@ -196,11 +197,106 @@ int http_parse_url(const char *url, struct http_url *out) {
     return 0;
 }
 
+/* ---- cookie jar (RFC 6265-lite, in-memory session cookies) ---------- */
+
+#define COOKIE_MAX      48
+#define COOKIE_HOST_MAX 128
+#define COOKIE_NAME_MAX 64
+#define COOKIE_VAL_MAX  320
+
+struct cookie {
+    char host[COOKIE_HOST_MAX];
+    char name[COOKIE_NAME_MAX];
+    char value[COOKIE_VAL_MAX];
+    bool used;
+};
+static struct cookie g_cookies[COOKIE_MAX];
+
+void cookie_jar_clear(void) {
+    for (int i = 0; i < COOKIE_MAX; i++) g_cookies[i].used = false;
+}
+int cookie_jar_count(void) {
+    int n = 0;
+    for (int i = 0; i < COOKIE_MAX; i++) if (g_cookies[i].used) n++;
+    return n;
+}
+
+/* Does request host `h` match a cookie stored for `ch`? Exact, or a
+ * domain-suffix match (".example.com" style) -- lenient for v1. */
+static bool cookie_host_match(const char *h, const char *ch) {
+    size_t hl = strlen(h), cl = strlen(ch);
+    if (hl == cl) return ascii_strncasecmp(h, ch, hl) == 0;
+    if (cl < hl) {                     /* ch is a suffix of h (subdomain) */
+        return ascii_strncasecmp(h + (hl - cl), ch, cl) == 0 &&
+               h[hl - cl - 1] == '.';
+    }
+    return false;
+}
+
+/* Store/replace a cookie from a Set-Cookie value ("name=value; attrs").
+ * Attributes (Path/Domain/Expires/Secure/HttpOnly) are ignored for v1. */
+static void cookie_store(const char *host, const char *setval) {
+    /* split name=value at the first '=', up to ';' or end */
+    const char *eq = NULL, *p = setval;
+    while (*p && *p != ';' && *p != '=') p++;
+    if (*p != '=') return;             /* attribute-only / malformed */
+    eq = p;
+    char name[COOKIE_NAME_MAX];
+    size_t nl = (size_t)(eq - setval);
+    while (nl > 0 && (setval[nl-1] == ' ')) nl--;   /* rtrim name */
+    if (nl == 0 || nl >= sizeof(name)) return;
+    memcpy(name, setval, nl); name[nl] = 0;
+
+    const char *vs = eq + 1;
+    while (*vs == ' ') vs++;
+    const char *ve = vs;
+    while (*ve && *ve != ';') ve++;
+    size_t vl = (size_t)(ve - vs);
+    while (vl > 0 && vs[vl-1] == ' ') vl--;
+    if (vl >= COOKIE_VAL_MAX) vl = COOKIE_VAL_MAX - 1;
+
+    /* find existing (host+name) or a free slot */
+    int slot = -1, freeslot = -1;
+    for (int i = 0; i < COOKIE_MAX; i++) {
+        if (!g_cookies[i].used) { if (freeslot < 0) freeslot = i; continue; }
+        if (ascii_strncasecmp(g_cookies[i].host, host, COOKIE_HOST_MAX) == 0 &&
+            strcmp(g_cookies[i].name, name) == 0) { slot = i; break; }
+    }
+    if (slot < 0) slot = freeslot;
+    if (slot < 0) slot = 0;            /* jar full: clobber slot 0 */
+    struct cookie *c = &g_cookies[slot];
+    size_t hl2 = strlen(host);
+    if (hl2 >= sizeof(c->host)) hl2 = sizeof(c->host) - 1;
+    memcpy(c->host, host, hl2); c->host[hl2] = 0;
+    memcpy(c->name, name, nl + 1);
+    memcpy(c->value, vs, vl); c->value[vl] = 0;
+    c->used = true;
+}
+
+/* Build the "n1=v1; n2=v2" Cookie header value for `host` into `out`.
+ * Returns the length (0 if no cookies apply). */
+static size_t cookie_header(const char *host, char *out, size_t cap) {
+    size_t pos = 0;
+    for (int i = 0; i < COOKIE_MAX; i++) {
+        struct cookie *c = &g_cookies[i];
+        if (!c->used || !cookie_host_match(host, c->host)) continue;
+        size_t need = strlen(c->name) + strlen(c->value) + 3;
+        if (pos + need >= cap) break;
+        if (pos) { out[pos++] = ';'; out[pos++] = ' '; }
+        size_t l = strlen(c->name); memcpy(out + pos, c->name, l); pos += l;
+        out[pos++] = '=';
+        l = strlen(c->value); memcpy(out + pos, c->value, l); pos += l;
+    }
+    out[pos] = 0;
+    return pos;
+}
+
 /* ---- request emission ----------------------------------------------- */
 
 /* Construct the request into `buf`. Returns the number of bytes
  * written (excluding NUL), or -1 if it didn't fit. */
-static long build_request(const struct http_url *u, char *buf, size_t cap) {
+static long build_request(const struct http_url *u, char *buf, size_t cap,
+                          unsigned flags, const char *cookie_hdr) {
     /* "GET <path> HTTP/1.0\r\nHost: <host>:<port>\r\n..." */
     static const char ua[] =
         "Mozilla/5.0 (compatible; tobyOS 1.0; x86_64) tobyOS-Browser/3.0";
@@ -250,7 +346,14 @@ static long build_request(const struct http_url *u, char *buf, size_t cap) {
      * instead of content. */
     APPEND_LIT("\r\nUser-Agent: ");
     APPEND_LIT("Mozilla/5.0 (compatible; tobyOS 1.0; x86_64) tobyOS-Browser/3.0");
-    APPEND_LIT("\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    APPEND_LIT("\r\nAccept: */*");
+    if (flags & HTTP_F_GZIP)
+        APPEND_LIT("\r\nAccept-Encoding: gzip");
+    if (cookie_hdr && cookie_hdr[0]) {
+        APPEND_LIT("\r\nCookie: ");
+        APPEND_STR(cookie_hdr);
+    }
+    APPEND_LIT("\r\nConnection: close\r\n\r\n");
 
     if (pos < cap) buf[pos] = 0;            /* convenience NUL */
     return (long)pos;
@@ -326,11 +429,12 @@ static int parse_status_line(const char *line, size_t len,
  * Returns 0 on success, HTTP_ERR_PROTOCOL if a line lacks ':'. */
 static int parse_headers(const char *base, size_t len,
                          long *out_content_len, bool *out_chunked,
-                         struct http_response *out) {
+                         struct http_response *out, const char *host) {
     *out_content_len = -1;
     *out_chunked     = false;
     out->content_type[0] = 0;
     out->location[0] = 0;
+    out->encoding = HTTP_ENC_IDENTITY;
 
     while (len > 0) {
         size_t line_len = 0;
@@ -375,6 +479,18 @@ static int parse_headers(const char *base, size_t len,
             if (cl >= sizeof(out->location)) cl = sizeof(out->location) - 1;
             memcpy(out->location, base + v_off, cl);
             out->location[cl] = 0;
+        } else if (colon == 16 && ascii_strncasecmp(base, "Content-Encoding", 16) == 0) {
+            for (size_t i = 0; i + 3 < v_len; i++)
+                if (ascii_strncasecmp(base + v_off + i, "gzip", 4) == 0) {
+                    out->encoding = HTTP_ENC_GZIP; break;
+                }
+        } else if (colon == 10 && ascii_strncasecmp(base, "Set-Cookie", 10) == 0 &&
+                   host) {
+            char sv[COOKIE_VAL_MAX + COOKIE_NAME_MAX + 8];
+            size_t cl = v_len;
+            if (cl >= sizeof(sv)) cl = sizeof(sv) - 1;
+            memcpy(sv, base + v_off, cl); sv[cl] = 0;
+            cookie_store(host, sv);
         }
 
         size_t advance = (size_t)((eol + 2) - base);
@@ -451,6 +567,16 @@ int http_get_opt(const char *url,
     if (timeout_ms == 0)    timeout_ms = HTTP_DEFAULT_TIMEOUT_MS;
     if (max_body_bytes == 0) max_body_bytes = 1u << 20; /* 1 MiB default */
 
+    /* When gzip is allowed the body is read COMPRESSED, so the read cap
+     * must exceed the caller's (decompressed) output cap -- a page that
+     * renders to 96 KiB may compress from many times that. Read up to
+     * HTTP_GZIP_READ_MAX compressed, then inflate into max_body_bytes. */
+    size_t read_cap = max_body_bytes;
+    if (flags & HTTP_F_GZIP) {
+        read_cap = HTTP_GZIP_READ_MAX;
+        if (read_cap < max_body_bytes) read_cap = max_body_bytes;
+    }
+
     /* 1. URL parse. */
     struct http_url u;
     int prc = http_parse_url(url, &u);
@@ -494,9 +620,11 @@ int http_get_opt(const char *url,
         }
     }
 
-    /* 4. Build + send request. */
-    char  reqbuf[768];
-    long  reqlen = build_request(&u, reqbuf, sizeof(reqbuf));
+    /* 4. Build + send request (with any stored cookies + gzip advert). */
+    char  cookiebuf[1024];
+    cookie_header(u.host, cookiebuf, sizeof(cookiebuf));
+    char  reqbuf[2048];
+    long  reqlen = build_request(&u, reqbuf, sizeof(reqbuf), flags, cookiebuf);
     if (reqlen <= 0) {
         transport_close(&tr);
         return HTTP_ERR_URL;
@@ -561,7 +689,7 @@ int http_get_opt(const char *url,
     size_t      headers_len  = (size_t)(header_end - status_line_len - 2);
     long content_len = -1;
     bool chunked     = false;
-    rc = parse_headers(headers_base, headers_len, &content_len, &chunked, out);
+    rc = parse_headers(headers_base, headers_len, &content_len, &chunked, out, u.host);
     if (rc != 0) { kfree(buf); transport_close(&tr); return rc; }
     if (chunked) {
         kprintf("[http] response uses chunked encoding (unsupported)\n");
@@ -670,6 +798,30 @@ int http_get_opt(const char *url,
     /* 8. Wrap up. */
     kfree(buf);
     transport_close(&tr);
+
+    /* Inflate a gzip body kernel-side (transparent to the caller): the
+     * compressed body was read up to read_cap; decompress into a buffer
+     * capped at max_body_bytes, so the caller still sees at most its
+     * requested (decompressed) size. On failure keep the raw body. */
+    if (out->encoding == HTTP_ENC_GZIP && body_len > 0) {
+        unsigned long dlen = max_body_bytes;
+        uint8_t *dbody = (uint8_t *)kmalloc(dlen > 0 ? dlen : 1);
+        if (dbody) {
+            int pr = puff_gzip(dbody, &dlen, body, body_len);
+            if (pr == PUFF_OK || pr == PUFF_TRUNC) {
+                kprintf("[http] gunzip %lu -> %lu%s\n",
+                        (unsigned long)body_len, dlen,
+                        pr == PUFF_TRUNC ? " (truncated)" : "");
+                kfree(body);
+                body = dbody; body_len = dlen;
+                out->encoding = HTTP_ENC_IDENTITY;
+                out->content_len = (long)dlen;
+            } else {
+                kprintf("[http] gunzip FAILED (%d) -- keeping raw body\n", pr);
+                kfree(dbody);
+            }
+        }
+    }
 
     out->body     = body;
     out->body_len = body_len;
