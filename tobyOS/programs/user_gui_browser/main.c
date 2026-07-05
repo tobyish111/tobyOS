@@ -69,7 +69,13 @@ struct gui_event {
  * drawing helpers below now forward to tk_draw_*. All HTML rendering, history,
  * link and find logic is unchanged. */
 #include <toby/tk.h>
+#include <toby/image.h>     /* stb_image-backed ARGB decoder (libtoby) */
 static struct tk_window win;
+
+/* libtoby heap (stdlib.c over sbrk); the image path allocates fetch +
+ * decode buffers. Declared here to avoid pulling <stdlib.h>. */
+extern void *malloc(unsigned long);
+extern void  free(void *);
 
 /* ---- Syscall stubs --------------------------------------------- */
 
@@ -147,6 +153,12 @@ static int str_ncasecmp(const char *a, const char *b, int n) {
 static void mem_zero(void *dst, size_t n) {
     char *d = (char *)dst;
     for (size_t i = 0; i < n; i++) d[i] = 0;
+}
+
+static int atoi_simple(const char *s) {
+    int v = 0;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
+    return v;
 }
 
 static int str_contains(const char *haystack, int hlen, const char *needle, int nlen) {
@@ -277,6 +289,7 @@ struct span {                    /* style-consistent slice of g_render */
     int32_t  len;
     int16_t  link;               /* g_links index or -1 */
     int16_t  field;              /* g_fields index or -1 (FL_INPUT/SUBMIT) */
+    int16_t  img;                /* g_images index or -1 */
     uint8_t  px;
     uint8_t  fl;
 };
@@ -297,8 +310,10 @@ struct run {                     /* positioned draw command (doc coords) */
     int32_t  off;                /* text slice (unused for HR/bullet) */
     int32_t  y;
     int16_t  x, w, len;
+    int16_t  h;                  /* explicit height (images); 0 = derive */
     int16_t  link;
     int16_t  field;              /* g_fields index or -1 */
+    int16_t  img;                /* g_images index or -1 */
     uint8_t  px;
     uint8_t  fl;
 };
@@ -343,6 +358,23 @@ static struct field g_fields[FIELD_MAX];
 static int g_nfields = 0;
 
 static int g_focus_field = -1;   /* focused FT_TEXT field or -1 */
+static int g_in_image_load = 0;  /* re-entrancy guard during load_images */
+
+/* ---- Images ------------------------------------------------------ */
+
+struct img {
+    char      src[512];          /* resolved absolute URL */
+    int16_t   attr_w, attr_h;    /* width/height attributes, 0 if absent */
+    int16_t   w, h;              /* decoded dimensions (0 until loaded) */
+    uint32_t *pixels;            /* decoded ARGB8888, NULL until loaded */
+    int8_t    state;             /* 0 pending, 1 loaded, -1 failed */
+};
+#define IMG_MAX      48          /* image records tracked per page */
+#define IMG_FETCH_N  16          /* how many we actually fetch+decode */
+#define IMG_FETCH_CAP (1u << 20) /* per-image download cap (1 MiB) */
+#define IMG_MAX_DIM  1600        /* skip absurd decoded dimensions */
+static struct img g_images[IMG_MAX];
+static int g_nimages = 0;
 
 /* Advance-width tables for the proportional faces we use, indexed by
  * (style, ch - 32). Filled lazily via SYS_GUI_TEXT_TTF_WIDTH one char
@@ -546,7 +578,8 @@ static int     g_pending_br;     /* <br>: mark next span FL_BR */
 static void span_break(void) {   /* close the span under construction */
     if (g_nspans > 0) {
         struct span *s = &g_spans[g_nspans - 1];
-        if (s->len == 0 && !(s->fl & (FL_BR | FL_INPUT | FL_SUBMITB)))
+        if (s->len == 0 && !(s->fl & (FL_BR | FL_INPUT | FL_SUBMITB)) &&
+            s->field < 0 && s->img < 0)
             g_nspans--;                                    /* drop empties */
     }
 }
@@ -586,7 +619,7 @@ static void emit_char(char c) {
     int fresh = (!s || g_nspans <= g_blks[g_nblks].s0 ||
                  s->off + s->len != g_render_len ||
                  s->px != g_cur_px || s->fl != fl || s->link != g_cur_link ||
-                 s->field >= 0);
+                 s->field >= 0 || s->img >= 0);
     if (fresh) {
         if (g_nspans >= SPAN_MAX) return;
         s = &g_spans[g_nspans++];
@@ -596,6 +629,7 @@ static void emit_char(char c) {
         s->fl = fl;
         s->link = g_cur_link;
         s->field = -1;
+        s->img = -1;
     }
     g_pending_br = 0;
     g_render[g_render_len++] = c;
@@ -618,6 +652,23 @@ static void emit_field(short fi, uint8_t fl) {
     s->fl = fl | (g_pending_br ? FL_BR : 0);
     s->link = -1;
     s->field = fi;
+    s->img = -1;
+    g_pending_br = 0;
+}
+
+/* Place an <img> into the flow (its own span carrying the image idx). */
+static void emit_image(short ii) {
+    if (!g_blk_openp) blk_open(BT_P);
+    span_break();
+    if (g_nspans >= SPAN_MAX) return;
+    struct span *s = &g_spans[g_nspans++];
+    s->off = (int32_t)g_render_len;
+    s->len = 0;
+    s->px = PX_BODY;
+    s->fl = (g_pending_br ? FL_BR : 0);
+    s->link = g_cur_link;        /* an <a><img></a> stays clickable */
+    s->field = -1;
+    s->img = ii;
     g_pending_br = 0;
 }
 
@@ -626,6 +677,26 @@ static void emit_field(short fi, uint8_t fl) {
 #define MARGIN_L   10
 #define MARGIN_R   16            /* leaves room for the scrollbar */
 #define LI_INDENT  20
+
+/* Display size of an image scaled to fit `avail` px wide (aspect
+ * preserved). Loaded images use decoded dims; pending/failed fall back
+ * to width/height attributes or a default placeholder box. */
+static void img_disp_dims(const struct img *im, int avail, int *dw, int *dh) {
+    int w, h;
+    if (im->state == 1 && im->w > 0 && im->h > 0) {
+        w = im->w; h = im->h;
+    } else if (im->attr_w > 0 && im->attr_h > 0) {
+        w = im->attr_w; h = im->attr_h;
+    } else if (im->attr_w > 0) {
+        w = im->attr_w; h = im->attr_w * 3 / 4;
+    } else {
+        w = 180; h = 120;                 /* placeholder box */
+    }
+    if (avail < 16) avail = 16;
+    if (w > avail) { h = (int)((long)h * avail / w); w = avail; }
+    if (h < 1) h = 1;
+    *dw = w; *dh = h;
+}
 
 /* On-screen width of a form control. */
 static int field_w(const struct field *f, uint8_t fl) {
@@ -654,6 +725,8 @@ static void run_flush(long off, int len, int x, int y, int w,
     r->fl = fl;
     r->link = link;
     r->field = -1;
+    r->img = -1;
+    r->h = 0;
 }
 
 static void layout(int width) {
@@ -685,7 +758,7 @@ static void layout(int width) {
                 r->x = (int16_t)MARGIN_L;
                 r->y = (int32_t)y;
                 r->w = (int16_t)(usable - MARGIN_L);
-                r->px = PX_BODY; r->fl = FL_HRULE; r->link = -1; r->field = -1;
+                r->px = PX_BODY; r->fl = FL_HRULE; r->link = -1; r->field = -1; r->img = -1; r->h = 0;
             }
             y += 6;
             continue;
@@ -706,13 +779,35 @@ static void layout(int width) {
             r->x = (int16_t)(MARGIN_L + 6);
             r->y = (int32_t)y;
             r->w = 5;
-            r->px = PX_BODY; r->fl = FL_BULLET; r->link = -1; r->field = -1;
+            r->px = PX_BODY; r->fl = FL_BULLET; r->link = -1; r->field = -1; r->img = -1; r->h = 0;
         }
 
         int x = indent;
         for (int si = 0; si < b->ns; si++) {
             struct span *s = &g_spans[b->s0 + si];
             if (s->fl & FL_BR) { y += lh; x = indent; }
+
+            if (s->img >= 0) {                   /* image: own line block */
+                if (x > indent) { y += lh; x = indent; }
+                int dw, dh;
+                img_disp_dims(&g_images[s->img], usable - indent, &dw, &dh);
+                if (g_nruns < RUN_MAX) {
+                    struct run *r = &g_runs[g_nruns++];
+                    r->off = 0; r->len = 0;
+                    r->x = (int16_t)indent;
+                    r->y = (int32_t)y;
+                    r->w = (int16_t)dw;
+                    r->h = (int16_t)dh;
+                    r->px = PX_BODY;
+                    r->fl = s->fl;
+                    r->link = s->link;           /* clickable if in an <a> */
+                    r->field = -1;
+                    r->img = s->img;
+                }
+                y += dh + 4;
+                x = indent;
+                continue;
+            }
 
             if (s->field >= 0) {                 /* inline form control */
                 int fw = field_w(&g_fields[s->field], s->fl);
@@ -727,6 +822,8 @@ static void layout(int width) {
                     r->fl = s->fl;
                     r->link = -1;
                     r->field = s->field;
+                    r->img = -1;
+                    r->h = 0;
                 }
                 x += fw + 6;
                 continue;
@@ -810,6 +907,8 @@ static void doc_reset(void) {
     g_nforms = 0;
     g_nfields = 0;
     g_focus_field = -1;
+    /* NOTE: caller frees decoded pixels via images_free() before reset. */
+    g_nimages = 0;
 }
 
 static int blk_is_empty(void) {
@@ -851,7 +950,13 @@ static int tag_attr(const char *t, const char *name, char *out, int cap) {
     return 0;
 }
 
+static void resolve_relative_url(const char *base, const char *rel, char *out, int out_max);
+static void images_free(void);
+static void layout(int width);
+static void clamp_scroll(void);
+
 static void render_html(void) {
+    images_free();
     doc_reset();
 
     int in_tag = 0;
@@ -979,11 +1084,31 @@ static void render_html(void) {
                 } else if (tag_match(t, "i") || tag_match(t, "em")) {
                     /* no italic face yet */
                 } else if (tag_match(t, "img")) {
-                    uint8_t sv = g_cur_fl;
-                    g_cur_fl |= FL_DIM;
-                    emit_str("[img]");
-                    g_cur_fl = sv;
-                    last_was_space = 0;
+                    char isrc[512];
+                    if (g_nimages < IMG_MAX &&
+                        tag_attr(t, "src", isrc, sizeof(isrc)) && isrc[0] &&
+                        /* skip data: URIs and 1px tracker gifs cheaply */
+                        !(isrc[0] == 'd' && isrc[1] == 'a' && isrc[2] == 't' &&
+                          isrc[3] == 'a' && isrc[4] == ':')) {
+                        struct img *im = &g_images[g_nimages];
+                        mem_zero(im, sizeof(*im));
+                        resolve_relative_url(g_url, isrc, im->src, sizeof(im->src));
+                        char dbuf[8];
+                        im->attr_w = tag_attr(t, "width", dbuf, sizeof(dbuf))
+                                         ? (int16_t)atoi_simple(dbuf) : 0;
+                        im->attr_h = tag_attr(t, "height", dbuf, sizeof(dbuf))
+                                         ? (int16_t)atoi_simple(dbuf) : 0;
+                        im->state = 0;
+                        emit_image((short)g_nimages);
+                        g_nimages++;
+                        last_was_space = 0;
+                    } else {
+                        uint8_t sv = g_cur_fl;
+                        g_cur_fl |= FL_DIM;
+                        emit_str("[img]");
+                        g_cur_fl = sv;
+                        last_was_space = 0;
+                    }
                 } else if (tag_match(t, "form")) {
                     if (!closing && g_nforms < FORM_MAX) {
                         struct form *f = &g_forms[g_nforms];
@@ -1114,6 +1239,7 @@ static void render_html(void) {
 
 /* Whole-buffer monospace document (plain text + source view). */
 static void render_mono_doc(void) {
+    images_free();
     doc_reset();
     g_cur_fl = FL_CODE;
     blk_open(BT_PRE);
@@ -1279,6 +1405,7 @@ static void set_home_page(void) {
         "<li>Press <b>Tab</b> to focus the address bar</li>"
         "<li>Type a URL (https tried first) or search terms and press Enter</li>"
         "<li>Supports HTTP and HTTPS, follows redirects</li>"
+        "<li>Renders images (PNG/JPEG/GIF/BMP), forms, and links</li>"
         "<li>Use <b>j/k</b> to scroll, <b>d/u</b> for page scroll</li>"
         "<li>Press <b>[</b> to go back, <b>]</b> to go forward</li>"
         "<li>Click links or type link number + Enter</li>"
@@ -1386,6 +1513,72 @@ static void show_error_page(const char *url, int err) {
     update_title();
 }
 
+/* Release decoded image pixels from the previous page. */
+static void images_free(void) {
+    for (int i = 0; i < g_nimages; i++) {
+        if (g_images[i].pixels) { free(g_images[i].pixels); g_images[i].pixels = NULL; }
+    }
+}
+
+/* Fetch + decode up to IMG_FETCH_N page images, re-laying-out and
+ * repainting as each arrives so the page fills in progressively. Each
+ * image is a fresh HTTP(S) GET (bounded to IMG_FETCH_CAP); non-images
+ * and oversize decodes are marked failed. Runs synchronously after the
+ * page renders -- the browser is single-threaded, so this blocks input
+ * until images finish (acceptable for a first cut; bounded count). */
+static void load_images(void) {
+    if (g_nimages == 0) return;
+    uint8_t *buf = (uint8_t *)malloc(IMG_FETCH_CAP);
+    if (!buf) return;
+
+    g_in_image_load = 1;
+
+    /* Paint the text + "loading" placeholders before the (blocking)
+     * fetch loop, so the page is readable immediately. */
+    set_status("Loading images...");
+    tk_redraw(&win);
+    tk_pump(&win);
+
+    int done = 0;
+    for (int i = 0; i < g_nimages && done < IMG_FETCH_N; i++) {
+        struct img *im = &g_images[i];
+        if (im->state != 0 || !im->src[0]) continue;
+        done++;
+
+        struct http_fetch req;
+        mem_zero(&req, sizeof(req));
+        req.url    = (unsigned long)im->src;
+        req.buf    = (unsigned long)buf;
+        req.buf_sz = IMG_FETCH_CAP;
+        long n = sys_http_fetch(&req);
+        if (n <= 0) { im->state = -1; continue; }
+
+        toby_image_t *dec = toby_image_load(buf, (size_t)n);
+        if (!dec || dec->width <= 0 || dec->height <= 0 ||
+            dec->width > IMG_MAX_DIM || dec->height > IMG_MAX_DIM) {
+            if (dec) toby_image_free(dec);
+            im->state = -1;
+            continue;
+        }
+        /* Steal the decoded buffer (own it; free the wrapper only). */
+        im->pixels = dec->pixels;
+        im->w = (int16_t)dec->width;
+        im->h = (int16_t)dec->height;
+        im->state = 1;
+        dec->pixels = NULL;
+        toby_image_free(dec);
+
+        /* Dimensions likely changed -> re-flow + repaint progressively. */
+        layout(g_win_w);
+        clamp_scroll();
+        tk_redraw(&win);
+        if (tk_pump(&win)) break;      /* WM close during load -> stop */
+    }
+    free(buf);
+    g_in_image_load = 0;
+    set_status("Done");
+}
+
 /* Transport-only fetch of `url` into g_raw via SYS_HTTP_FETCH (kernel
  * follows redirects). On success the address bar is updated to the
  * URL that actually served the page. Returns bytes (>= 0) or HTTP_ERR. */
@@ -1432,6 +1625,8 @@ static void render_fetched(void) {
     p = msg_append_int(m, p, sizeof(m), g_link_count);
     p = msg_append(m, p, sizeof(m), " links");
     set_status(m);
+
+    load_images();
 }
 
 /* Fetch + render, error page on failure. Back/Forward/Refresh path. */
@@ -1652,6 +1847,8 @@ static void sync_geometry(void) {
 
 /* Approximate line height of a run (hit-testing + visibility). */
 static int run_h(const struct run *r) {
+    if (r->img >= 0 && r->h > 0) return r->h;
+    if (r->field >= 0) return FIELD_H;
     if (r->fl & FL_CODE) return MONO_H + 2;
     return r->px + r->px / 3;
 }
@@ -1700,6 +1897,48 @@ static void draw_hline(int fd, int x, int y, int w, uint32_t color) {
 
 /* paint_all() draws the whole window (called from the canvas on_paint);
  * redraw() just requests a repaint and is what the event handlers call. */
+/* Paint one image run at screen-y `sy`. Loaded images nearest-neighbor
+ * scale-blit row-by-row (alpha-composited) into the run rect; pending
+ * and failed images draw a placeholder box with a label. Clipped
+ * vertically to the content viewport. */
+#define IMG_ROW_MAX 2048
+static uint32_t g_img_row[IMG_ROW_MAX];
+
+static void paint_image(const struct run *r, int sy) {
+    struct img *im = &g_images[r->img];
+    int dw = r->w, dh = r->h;
+
+    if (im->state == 1 && im->pixels && im->w > 0 && im->h > 0) {
+        int cw = dw < IMG_ROW_MAX ? dw : IMG_ROW_MAX;
+        int vis0 = CONTENT_TOP, vis1 = CONTENT_TOP + g_content_h;
+        for (int dy = 0; dy < dh; dy++) {
+            int ry = sy + dy;
+            if (ry < vis0 || ry >= vis1) continue;      /* vertical clip */
+            int syx = (int)((long)dy * im->h / dh);
+            if (syx >= im->h) syx = im->h - 1;
+            const uint32_t *srow = im->pixels + (long)syx * im->w;
+            for (int dx = 0; dx < cw; dx++) {
+                int sxx = (int)((long)dx * im->w / dw);
+                if (sxx >= im->w) sxx = im->w - 1;
+                g_img_row[dx] = srow[sxx];
+            }
+            tk_draw_blit_blend(&win, r->x, ry, cw, 1, g_img_row, cw);
+        }
+        return;
+    }
+
+    /* placeholder / failed box */
+    uint32_t bg = 0x0026282Cu, bd = COL_URL_BORDER;
+    sys_gui_fill(0, r->x, sy, dw, dh, bg);
+    sys_gui_fill(0, r->x, sy, dw, 1, bd);
+    sys_gui_fill(0, r->x, sy + dh - 1, dw, 1, bd);
+    sys_gui_fill(0, r->x, sy, 1, dh, bd);
+    sys_gui_fill(0, r->x + dw - 1, sy, 1, dh, bd);
+    const char *lbl = (im->state < 0) ? "[image failed]" : "[loading image...]";
+    if (dw > 40 && dh > 16)
+        tk_draw_text(&win, r->x + 6, sy + dh / 2 - 7, lbl, COL_URL_HINT, PX_BODY, 0);
+}
+
 static void redraw(int fd) { (void)fd; tk_redraw(&win); }
 static void paint_all(void) {
     int fd = 0; (void)fd;
@@ -1797,6 +2036,10 @@ static void paint_all(void) {
 
             if (r->fl & FL_HRULE) {
                 sys_gui_fill(fd, r->x, sy + 2, r->w, 1, COL_HR_FG);
+                continue;
+            }
+            if (r->img >= 0) {
+                paint_image(r, sy);
                 continue;
             }
             if (r->field >= 0) {
@@ -2105,6 +2348,10 @@ static void handle_mouse_move(int fd, int mx, int my) {
 static void on_paint(struct tk_window *w, struct tk_widget *c) { (void)w; (void)c; paint_all(); }
 static void on_event(struct tk_window *w, struct tk_widget *c, struct tk_event *ev) {
     (void)w; (void)c;
+    /* Drop clicks while synchronously loading images (load_images pumps
+     * events for progressive paint; a click must not re-enter navigation
+     * and free images being blitted). */
+    if (g_in_image_load) return;
     if (ev->type == TK_EV_MOUSE_DOWN) handle_mouse_down(0, ev->x, ev->y);
     else if (ev->type == TK_EV_MOUSE_MOVE) handle_mouse_move(0, ev->x, ev->y);
 }
@@ -2112,6 +2359,8 @@ static void on_event(struct tk_window *w, struct tk_widget *c, struct tk_event *
 static void on_key(struct tk_window *w, struct tk_event *ev) {
     (void)w;
     uint8_t key = ev->key;
+
+    if (g_in_image_load) return;         /* see on_event */
 
     /* A focused form field owns the keyboard (Tab hands off, Esc
      * unfocuses, Enter submits the field's form). */
