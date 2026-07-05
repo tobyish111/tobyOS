@@ -119,6 +119,14 @@ static inline void sys_gui_set_title(int fd, const char *t) {
         : "rcx", "r11", "memory");
     (void)r;
 }
+#define SYS_NANOSLEEP  47
+static inline void sys_sleep_ms(int ms) {
+    long r, ns = (long)ms * 1000000L;
+    __asm__ volatile ("syscall"
+        : "=a"(r) : "0"((long)SYS_NANOSLEEP), "D"(ns)
+        : "rcx", "r11", "memory");
+    (void)r;
+}
 
 /* ---- Utility functions ----------------------------------------- */
 
@@ -339,7 +347,6 @@ struct field {
 };
 #define FIELD_MAX 64
 
-static int g_in_image_load = 0;  /* re-entrancy guard during load_images */
 
 /* ---- Images ------------------------------------------------------ */
 
@@ -1607,63 +1614,69 @@ static void tab_images_free(struct tab *t) {
 
 static void images_free(void) { tab_images_free(cur); }
 
-/* Fetch + decode up to IMG_FETCH_N page images, re-laying-out and
- * repainting as each arrives so the page fills in progressively. Each
- * image is a fresh HTTP(S) GET (bounded to IMG_FETCH_CAP); non-images
- * and oversize decodes are marked failed. Runs synchronously after the
- * page renders -- the browser is single-threaded, so this blocks input
- * until images finish (acceptable for a first cut; bounded count). */
-static void load_images(void) {
-    if (g_nimages == 0) return;
-    uint8_t *buf = (uint8_t *)malloc(IMG_FETCH_CAP);
-    if (!buf) return;
+/* Cooperative (incremental) image loading. Images parse as state=0
+ * "pending"; the main idle loop calls load_one_pending_image() which
+ * fetches+decodes exactly ONE pending image per call -- across ALL tabs,
+ * active first -- so the UI stays responsive between images and
+ * background tabs fill in too. (A single image's fetch still blocks
+ * briefly since the kernel HTTP is synchronous; that's bounded to one
+ * image, vs the old freeze-for-all-N.) Returns 1 if it did work. */
+static uint8_t *g_img_fetch_buf = NULL;
 
-    g_in_image_load = 1;
-
-    /* Paint the text + "loading" placeholders before the (blocking)
-     * fetch loop, so the page is readable immediately. */
-    set_status("Loading images...");
-    tk_redraw(&win);
-    tk_pump(&win);
-
-    int done = 0;
-    for (int i = 0; i < g_nimages && done < IMG_FETCH_N; i++) {
-        struct img *im = &g_images[i];
-        if (im->state != 0 || !im->src[0]) continue;
-        done++;
-
-        struct http_fetch req;
-        mem_zero(&req, sizeof(req));
-        req.url    = (unsigned long)im->src;
-        req.buf    = (unsigned long)buf;
-        req.buf_sz = IMG_FETCH_CAP;
-        long n = sys_http_fetch(&req);
-        if (n <= 0) { im->state = -1; continue; }
-
-        toby_image_t *dec = toby_image_load(buf, (size_t)n);
-        if (!dec || dec->width <= 0 || dec->height <= 0 ||
-            dec->width > IMG_MAX_DIM || dec->height > IMG_MAX_DIM) {
-            if (dec) toby_image_free(dec);
-            im->state = -1;
-            continue;
+static int load_one_pending_image(void) {
+    int ti_sel = -1, ii_sel = -1;
+    for (int pass = 0; pass < 2 && ti_sel < 0; pass++) {
+        for (int ti = 0; ti < g_ntabs; ti++) {
+            if ((pass == 0) != (ti == g_active)) continue;   /* active first */
+            struct tab *t = &g_tabs[ti];
+            int budget = t->nimages < IMG_FETCH_N ? t->nimages : IMG_FETCH_N;
+            for (int ii = 0; ii < budget; ii++)
+                if (t->images[ii].state == 0 && t->images[ii].src[0]) {
+                    ti_sel = ti; ii_sel = ii; break;
+                }
+            if (ti_sel >= 0) break;
         }
-        /* Steal the decoded buffer (own it; free the wrapper only). */
-        im->pixels = dec->pixels;
-        im->w = (int16_t)dec->width;
-        im->h = (int16_t)dec->height;
-        im->state = 1;
-        dec->pixels = NULL;
-        toby_image_free(dec);
-
-        /* Dimensions likely changed -> re-flow + repaint progressively. */
-        layout(g_win_w);
-        clamp_scroll();
-        tk_redraw(&win);
-        if (tk_pump(&win)) break;      /* WM close during load -> stop */
     }
-    free(buf);
-    g_in_image_load = 0;
-    set_status("Done");
+    if (ti_sel < 0) return 0;
+
+    if (!g_img_fetch_buf) {
+        g_img_fetch_buf = (uint8_t *)malloc(IMG_FETCH_CAP);
+        if (!g_img_fetch_buf) return 0;
+    }
+    struct img *im = &g_tabs[ti_sel].images[ii_sel];
+
+    struct http_fetch req;
+    mem_zero(&req, sizeof(req));
+    req.url    = (unsigned long)im->src;
+    req.buf    = (unsigned long)g_img_fetch_buf;
+    req.buf_sz = IMG_FETCH_CAP;
+    long n = sys_http_fetch(&req);          /* blocks (this image only) */
+    if (n <= 0) { im->state = -1; return 1; }
+
+    toby_image_t *dec = toby_image_load(g_img_fetch_buf, (size_t)n);
+    if (!dec || dec->width <= 0 || dec->height <= 0 ||
+        dec->width > IMG_MAX_DIM || dec->height > IMG_MAX_DIM) {
+        if (dec) toby_image_free(dec);
+        im->state = -1;
+        return 1;
+    }
+    im->pixels = dec->pixels;               /* steal the decoded buffer */
+    im->w = (int16_t)dec->width;
+    im->h = (int16_t)dec->height;
+    im->state = 1;
+    dec->pixels = NULL;
+    toby_image_free(dec);
+
+    /* Re-layout the affected tab. The layout shim addresses `cur`, so
+     * temporarily point it at the affected tab (safe: single-threaded,
+     * no events run here), then restore + request a repaint. */
+    int save = g_active;
+    g_active = ti_sel;
+    layout(g_win_w);
+    if (ti_sel == save) clamp_scroll();
+    g_active = save;
+    tk_redraw(&win);
+    return 1;
 }
 
 /* Transport-only fetch of `url` into g_raw via SYS_HTTP_FETCH (kernel
@@ -1712,8 +1725,7 @@ static void render_fetched(void) {
     p = msg_append_int(m, p, sizeof(m), g_link_count);
     p = msg_append(m, p, sizeof(m), " links");
     set_status(m);
-
-    load_images();
+    /* Images (state=0 pending) stream in from the main idle loop. */
 }
 
 /* Fetch + render, error page on failure. Back/Forward/Refresh path. */
@@ -2477,10 +2489,6 @@ static void handle_mouse_move(int fd, int mx, int my) {
 static void on_paint(struct tk_window *w, struct tk_widget *c) { (void)w; (void)c; paint_all(); }
 static void on_event(struct tk_window *w, struct tk_widget *c, struct tk_event *ev) {
     (void)w; (void)c;
-    /* Drop clicks while synchronously loading images (load_images pumps
-     * events for progressive paint; a click must not re-enter navigation
-     * and free images being blitted). */
-    if (g_in_image_load) return;
     if (ev->type == TK_EV_MOUSE_DOWN) handle_mouse_down(0, ev->x, ev->y);
     else if (ev->type == TK_EV_MOUSE_MOVE) handle_mouse_move(0, ev->x, ev->y);
 }
@@ -2488,8 +2496,6 @@ static void on_event(struct tk_window *w, struct tk_widget *c, struct tk_event *
 static void on_key(struct tk_window *w, struct tk_event *ev) {
     (void)w;
     uint8_t key = ev->key;
-
-    if (g_in_image_load) return;         /* see on_event */
 
     /* Global tab accelerators (control codes; work in any mode -- these
      * are never printable text). Ctrl+Tab is unusable (indistinguishable
@@ -2786,5 +2792,16 @@ int main(int argc, char **argv) {
     set_home_page();
     set_status("Ready - Press Tab to focus address bar");
 
-    return tk_run(&win);
+    /* Cooperative loop: pump events + repaint, then fetch ONE pending
+     * image per idle pass (keeps the UI live during image loading and
+     * lets background tabs load). Idle-sleep only when there is no image
+     * work, so a page with images fills in as fast as the network + a
+     * repaint between each allows. */
+    tk_redraw(&win);
+    for (;;) {
+        if (tk_pump(&win)) break;          /* events + repaint; 1 = quit */
+        if (!load_one_pending_image())
+            sys_sleep_ms(15);              /* nothing pending -> idle */
+    }
+    return 0;
 }
