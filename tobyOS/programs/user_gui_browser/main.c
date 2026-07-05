@@ -249,12 +249,8 @@ static int g_content_h = WIN_H - TOOLBAR_H - STATUS_H;
 /* ---- Content buffer & HTML renderer ---------------------------- */
 
 #define RAW_CAP       (96 * 1024)
-static char g_raw[RAW_CAP + 1];
-static long g_raw_len = 0;
 
 #define RENDER_CAP    (128 * 1024)
-static char g_render[RENDER_CAP + 1];   /* normalized document text */
-static long g_render_len = 0;
 
 /* ---- Layout-engine document model ------------------------------- *
  * Parse once into styled SPANS grouped into BLOCKS; lay out per
@@ -294,8 +290,6 @@ struct span {                    /* style-consistent slice of g_render */
     uint8_t  fl;
 };
 #define SPAN_MAX  16384
-static struct span g_spans[SPAN_MAX];
-static int  g_nspans = 0;
 
 struct blk {
     int32_t  s0;                 /* first span */
@@ -303,8 +297,6 @@ struct blk {
     uint8_t  type;
 };
 #define BLK_MAX   4096
-static struct blk g_blks[BLK_MAX];
-static int  g_nblks = 0;
 
 struct run {                     /* positioned draw command (doc coords) */
     int32_t  off;                /* text slice (unused for HR/bullet) */
@@ -318,13 +310,7 @@ struct run {                     /* positioned draw command (doc coords) */
     uint8_t  fl;
 };
 #define RUN_MAX   16384
-static struct run g_runs[RUN_MAX];
-static int  g_nruns = 0;
 
-static int  g_doc_h    = 0;      /* laid-out document height (px) */
-static int  g_scroll_y = 0;      /* viewport top in doc coords */
-static int  g_layout_w = 0;      /* width the runs were laid out at */
-static int  g_find_run = -1;     /* highlighted run (find-in-page) */
 
 /* ---- Forms (GET submission) -------------------------------------- */
 
@@ -343,8 +329,6 @@ struct form {
     char     action[512];
 };
 #define FORM_MAX 16
-static struct form g_forms[FORM_MAX];
-static int g_nforms = 0;
 
 struct field {
     int16_t  form;
@@ -354,10 +338,7 @@ struct field {
     char     value[192];         /* editable in place for FT_TEXT */
 };
 #define FIELD_MAX 64
-static struct field g_fields[FIELD_MAX];
-static int g_nfields = 0;
 
-static int g_focus_field = -1;   /* focused FT_TEXT field or -1 */
 static int g_in_image_load = 0;  /* re-entrancy guard during load_images */
 
 /* ---- Images ------------------------------------------------------ */
@@ -373,8 +354,6 @@ struct img {
 #define IMG_FETCH_N  16          /* how many we actually fetch+decode */
 #define IMG_FETCH_CAP (1u << 20) /* per-image download cap (1 MiB) */
 #define IMG_MAX_DIM  1600        /* skip absurd decoded dimensions */
-static struct img g_images[IMG_MAX];
-static int g_nimages = 0;
 
 /* Advance-width tables for the proportional faces we use, indexed by
  * (style, ch - 32). Filled lazily via SYS_GUI_TEXT_TTF_WIDTH one char
@@ -391,43 +370,99 @@ static int   g_adv_ready = 0;
 
 #define LINK_MAX       128
 #define LINK_URL_MAX   256
-static char g_links[LINK_MAX][LINK_URL_MAX];
-static int  g_link_count = 0;
 
 #define URL_MAX        1024
-static char g_url[URL_MAX + 1];
-static int  g_url_len = 0;
 
 #define TITLE_MAX      64
-static char g_title[TITLE_MAX + 1];
 
 #define HISTORY_MAX    32
-static char g_history[HISTORY_MAX][URL_MAX + 1];
-static int  g_hist_pos  = -1;
-static int  g_hist_count = 0;
 
-static int  g_focus_url = 1;
 static char g_status_text[128];
-static int  g_loading = 0;
 
 /* Find-in-page state */
 #define FIND_MAX 64
-static int  g_find_mode = 0;
-static char g_find_buf[FIND_MAX + 1];
-static int  g_find_len = 0;
 
 /* Source view toggle */
-static int  g_source_view = 0;
 
 /* What produced g_render -- picks the line-index style + wrap rules,
  * and lets a resize re-wrap without re-fetching or re-parsing. */
 #define VIEW_HTML    0
 #define VIEW_PLAIN   1
 #define VIEW_SOURCE  2
-static int  g_view_mode = VIEW_HTML;
 
 /* HTTP status of the last successful transport fetch (0 = none). */
-static int  g_last_status = 0;
+
+/* ---- Tabs: per-page state bundle -------------------------------- *
+ * Every field that makes up "the current page" lives here; the browser
+ * keeps an array of tabs and an active index. A `#define g_foo
+ * (cur->foo)` shim below lets the ~500 existing g_* accesses address the
+ * active tab unchanged, so switching tabs is just moving g_active +
+ * re-layout + repaint (no re-fetch, no re-render). Bundle is ~1 MiB;
+ * TAB_MAX inline tabs => a few MiB of BSS (the ELF loader maps+zeroes it
+ * eagerly, trivially affordable). Window geometry, the font advance
+ * tables, the status bar and parser scratch stay app-global (below). */
+struct tab {
+    char   raw[RAW_CAP + 1];   long raw_len;
+    char   render[RENDER_CAP + 1]; long render_len;
+    struct span spans[SPAN_MAX];   int nspans;
+    struct blk  blks[BLK_MAX];      int nblks;
+    struct run  runs[RUN_MAX];      int nruns;
+    struct form forms[FORM_MAX];    int nforms;
+    struct field fields[FIELD_MAX]; int nfields; int focus_field;
+    struct img  images[IMG_MAX];    int nimages;
+    char   links[LINK_MAX][LINK_URL_MAX]; int link_count;
+    char   url[URL_MAX + 1];   int url_len;
+    char   title[TITLE_MAX + 1];
+    char   history[HISTORY_MAX][URL_MAX + 1]; int hist_pos, hist_count;
+    int    doc_h, scroll_y, layout_w, find_run;
+    int    focus_url, loading;
+    int    find_mode; char find_buf[FIND_MAX + 1]; int find_len;
+    int    source_view, view_mode, last_status;
+    int    used;               /* slot occupied */
+};
+#define TAB_MAX 6
+static struct tab g_tabs[TAB_MAX];
+static int g_ntabs  = 0;
+static int g_active = 0;
+#define cur (&g_tabs[g_active])
+
+#define g_raw         (cur->raw)
+#define g_raw_len     (cur->raw_len)
+#define g_render      (cur->render)
+#define g_render_len  (cur->render_len)
+#define g_spans       (cur->spans)
+#define g_nspans      (cur->nspans)
+#define g_blks        (cur->blks)
+#define g_nblks       (cur->nblks)
+#define g_runs        (cur->runs)
+#define g_nruns       (cur->nruns)
+#define g_forms       (cur->forms)
+#define g_nforms      (cur->nforms)
+#define g_fields      (cur->fields)
+#define g_nfields     (cur->nfields)
+#define g_focus_field (cur->focus_field)
+#define g_images      (cur->images)
+#define g_nimages     (cur->nimages)
+#define g_links       (cur->links)
+#define g_link_count  (cur->link_count)
+#define g_url         (cur->url)
+#define g_url_len     (cur->url_len)
+#define g_title       (cur->title)
+#define g_history     (cur->history)
+#define g_hist_pos    (cur->hist_pos)
+#define g_hist_count  (cur->hist_count)
+#define g_doc_h       (cur->doc_h)
+#define g_scroll_y    (cur->scroll_y)
+#define g_layout_w    (cur->layout_w)
+#define g_find_run    (cur->find_run)
+#define g_focus_url   (cur->focus_url)
+#define g_loading     (cur->loading)
+#define g_find_mode   (cur->find_mode)
+#define g_find_buf    (cur->find_buf)
+#define g_find_len    (cur->find_len)
+#define g_source_view (cur->source_view)
+#define g_view_mode   (cur->view_mode)
+#define g_last_status (cur->last_status)
 
 /* ---- HTML Parser/Renderer -------------------------------------- */
 
@@ -952,6 +987,7 @@ static int tag_attr(const char *t, const char *name, char *out, int cap) {
 
 static void resolve_relative_url(const char *base, const char *rel, char *out, int out_max);
 static void images_free(void);
+static void tab_images_free(struct tab *t);
 static void layout(int width);
 static void clamp_scroll(void);
 
@@ -1406,6 +1442,7 @@ static void set_home_page(void) {
         "<li>Type a URL (https tried first) or search terms and press Enter</li>"
         "<li>Supports HTTP and HTTPS, follows redirects</li>"
         "<li>Renders images (PNG/JPEG/GIF/BMP), forms, and links</li>"
+        "<li>Tabs: click + or Ctrl+T to open, Ctrl+W close, Ctrl+N/P switch</li>"
         "<li>Use <b>j/k</b> to scroll, <b>d/u</b> for page scroll</li>"
         "<li>Press <b>[</b> to go back, <b>]</b> to go forward</li>"
         "<li>Click links or type link number + Enter</li>"
@@ -1455,6 +1492,54 @@ static void set_home_page(void) {
     g_source_view = 0;
     update_title();
     set_status("Ready");
+}
+
+/* ---- Tab management --------------------------------------------- */
+
+static void tab_reset(struct tab *t) {
+    tab_images_free(t);
+    mem_zero(t, sizeof(*t));
+    t->hist_pos     = -1;
+    t->focus_url    = 1;
+    t->view_mode    = VIEW_HTML;
+    t->find_run     = -1;
+    t->focus_field  = -1;
+    t->used         = 1;
+}
+
+/* Open a fresh tab on the home page and make it active. No-op (just
+ * switches to the last tab) when the tab array is full. */
+static void tab_open(void) {
+    if (g_ntabs >= TAB_MAX) { set_status("Tab limit reached"); return; }
+    int idx = g_ntabs++;
+    g_active = idx;
+    tab_reset(&g_tabs[idx]);
+    set_home_page();
+    update_title();
+}
+
+/* Close tab `idx`; the last tab closing quits the app. Neighbours shift
+ * down so g_tabs[0..g_ntabs) stays dense. */
+static void tab_close(int idx) {
+    if (idx < 0 || idx >= g_ntabs) return;
+    if (g_ntabs == 1) sys_exit(0);
+    tab_images_free(&g_tabs[idx]);
+    for (int i = idx; i < g_ntabs - 1; i++)
+        g_tabs[i] = g_tabs[i + 1];        /* struct copy shifts the bundle */
+    g_ntabs--;
+    /* The shift duplicated the last tab's image pointers into the now-
+     * vacated slot; clear it WITHOUT freeing (the live shifted-down tab
+     * owns those pixels now) so a future tab_reset can't double-free. */
+    mem_zero(&g_tabs[g_ntabs], sizeof(struct tab));
+    if (g_active >= g_ntabs) g_active = g_ntabs - 1;
+    else if (g_active > idx) g_active--;
+    update_title();
+}
+
+static void tab_switch(int idx) {
+    if (idx < 0 || idx >= g_ntabs || idx == g_active) return;
+    g_active = idx;
+    update_title();
 }
 
 /* ---- Fetching + Chrome-style navigation ------------------------- */
@@ -1514,11 +1599,13 @@ static void show_error_page(const char *url, int err) {
 }
 
 /* Release decoded image pixels from the previous page. */
-static void images_free(void) {
-    for (int i = 0; i < g_nimages; i++) {
-        if (g_images[i].pixels) { free(g_images[i].pixels); g_images[i].pixels = NULL; }
-    }
+/* Free decoded pixels held by a specific tab. */
+static void tab_images_free(struct tab *t) {
+    for (int i = 0; i < t->nimages; i++)
+        if (t->images[i].pixels) { free(t->images[i].pixels); t->images[i].pixels = NULL; }
 }
+
+static void images_free(void) { tab_images_free(cur); }
 
 /* Fetch + decode up to IMG_FETCH_N page images, re-laying-out and
  * repainting as each arrives so the page fills in progressively. Each
@@ -1939,27 +2026,57 @@ static void paint_image(const struct run *r, int sy) {
         tk_draw_text(&win, r->x + 6, sy + dh / 2 - 7, lbl, COL_URL_HINT, PX_BODY, 0);
 }
 
+/* ---- Tab strip geometry (shared by paint + hit-testing) --------- */
+#define TAB_PLUS_W  26           /* the "+" new-tab button at the strip end */
+#define TAB_W_MAX  190
+#define TAB_W_MIN   46
+
+static int tab_cell_w(void) {
+    int avail = g_win_w - TAB_PLUS_W;
+    int n = g_ntabs > 0 ? g_ntabs : 1;
+    int w = avail / n;
+    if (w > TAB_W_MAX) w = TAB_W_MAX;
+    if (w < TAB_W_MIN) w = TAB_W_MIN;
+    return w;
+}
+static int tab_x(int i) { return i * tab_cell_w(); }
+
 static void redraw(int fd) { (void)fd; tk_redraw(&win); }
 static void paint_all(void) {
     int fd = 0; (void)fd;
     sync_geometry();             /* track live window size; reflow if needed */
-    /* Tab Bar */
+    /* Tab Bar: one cell per tab (active highlighted) + a "+" button. */
     sys_gui_fill(fd, 0, 0, g_win_w, TAB_BAR_H, COL_TAB_BG);
-    sys_gui_fill(fd, 0, 0, 220, TAB_BAR_H, COL_TAB_ACTIVE);
-    draw_hline(fd, 0, TAB_BAR_H - 1, 220, COL_NAV_BG);
+    {
+        int cw = tab_cell_w();
+        for (int i = 0; i < g_ntabs; i++) {
+            int tx = tab_x(i);
+            int active = (i == g_active);
+            uint32_t cbg = active ? COL_TAB_ACTIVE : COL_TAB_BG;
+            sys_gui_fill(fd, tx, 0, cw - 1, TAB_BAR_H, cbg);
+            if (active) draw_hline(fd, tx, TAB_BAR_H - 1, cw - 1, COL_NAV_BG);
+            else sys_gui_fill(fd, tx + cw - 1, 4, 1, TAB_BAR_H - 8, COL_URL_BORDER);
 
-    sys_gui_text(fd, 8, 5, "@", COL_URL_CURSOR, COL_TAB_ACTIVE);
-
-    char tab_title[28];
-    int tlen = 0;
-    const char *title_src = g_title[0] ? g_title : "New Tab";
-    while (title_src[tlen] && tlen < 24) { tab_title[tlen] = title_src[tlen]; tlen++; }
-    if (tlen >= 24) { tab_title[21] = '.'; tab_title[22] = '.'; tab_title[23] = '.'; }
-    tab_title[tlen] = '\0';
-    sys_gui_text(fd, 22, 5, tab_title, COL_TAB_TEXT, COL_TAB_ACTIVE);
-
-    sys_gui_text(fd, 200, 5, "x", COL_TAB_CLOSE, COL_TAB_ACTIVE);
-    sys_gui_text(fd, 230, 5, "+", COL_NAV_BTN, COL_TAB_BG);
+            /* title, truncated to the cell (leave room for the close x) */
+            const char *ts = g_tabs[i].title[0] ? g_tabs[i].title : "New Tab";
+            int maxc = (cw - 24) / CELL_W;
+            if (maxc < 1) maxc = 1;
+            if (maxc > 30) maxc = 30;
+            char tb[32];
+            int tl = 0;
+            while (ts[tl] && tl < maxc) { tb[tl] = ts[tl]; tl++; }
+            if (ts[tl] && tl >= 3) { tb[tl-1] = '.'; tb[tl-2] = '.'; }
+            tb[tl] = '\0';
+            sys_gui_text(fd, tx + 6, 5, tb,
+                         active ? COL_TAB_TEXT : COL_NAV_BTN, cbg);
+            /* per-tab close x near the right edge */
+            sys_gui_text(fd, tx + cw - 14, 5, "x", COL_TAB_CLOSE, cbg);
+        }
+        /* new-tab button */
+        int px = g_ntabs * cw + 6;
+        if (px < g_win_w - 10)
+            sys_gui_text(fd, px, 5, "+", COL_NAV_BTN, COL_TAB_BG);
+    }
 
     /* Navigation Bar */
     int nav_y = TAB_BAR_H;
@@ -2233,9 +2350,21 @@ static void handle_mouse_down(int fd, int mx, int my) {
     sync_geometry();
     int nav_y = TAB_BAR_H;
 
-    /* Tab close button area */
-    if (my < TAB_BAR_H && mx >= 195 && mx <= 215) {
-        sys_exit(0);
+    /* Tab strip: switch tab, close its x, or open a new tab. */
+    if (my < TAB_BAR_H) {
+        int cw = tab_cell_w();
+        for (int i = 0; i < g_ntabs; i++) {
+            int tx = tab_x(i);
+            if (mx >= tx && mx < tx + cw) {
+                if (mx >= tx + cw - 18) tab_close(i);   /* the x hit-box */
+                else tab_switch(i);
+                redraw(fd);
+                return;
+            }
+        }
+        /* past the last tab -> the + button */
+        if (mx >= g_ntabs * cw) { tab_open(); redraw(fd); }
+        return;
     }
 
     /* Navigation bar buttons */
@@ -2361,6 +2490,16 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
     uint8_t key = ev->key;
 
     if (g_in_image_load) return;         /* see on_event */
+
+    /* Global tab accelerators (control codes; work in any mode -- these
+     * are never printable text). Ctrl+Tab is unusable (indistinguishable
+     * from Tab), so tobyOS uses Ctrl+N / Ctrl+P to cycle. */
+    if (key == 0x14) { tab_open();  redraw(0); return; }              /* Ctrl+T */
+    if (key == 0x17) { tab_close(g_active); redraw(0); return; }      /* Ctrl+W */
+    if (key == 0x0E) { tab_switch((g_active + 1) % (g_ntabs>0?g_ntabs:1));
+                       redraw(0); return; }                          /* Ctrl+N */
+    if (key == 0x10) { tab_switch((g_active + g_ntabs - 1) % (g_ntabs>0?g_ntabs:1));
+                       redraw(0); return; }                          /* Ctrl+P */
 
     /* A focused form field owns the keyboard (Tab hands off, Esc
      * unfocuses, Enter submits the field's form). */
@@ -2627,10 +2766,10 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
-    mem_zero(g_url, sizeof(g_url));
-    mem_zero(g_title, sizeof(g_title));
     mem_zero(g_status_text, sizeof(g_status_text));
-    mem_zero(g_find_buf, sizeof(g_find_buf));
+    /* One tab to start (its bundle non-zero defaults set by tab_reset). */
+    g_ntabs = 1; g_active = 0;
+    tab_reset(&g_tabs[0]);
 
     if (tk_window_open(&win, WIN_W, WIN_H, "TobyOS Browser") != 0) {
         sys_write(1, "gui_browser: window failed\n", 27);
