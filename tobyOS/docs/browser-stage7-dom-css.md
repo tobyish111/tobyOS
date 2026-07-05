@@ -60,8 +60,20 @@ cookies/gzip/TLS networking — survives on top of the new core.
   patched after) — paint is a flat walk in emission order.
 - Page background = body/html bg promoted to the whole viewport.
 
+## Floats (added in the follow-up commit)
+`float: left/right` + `clear` are real: floated boxes leave the flow,
+line boxes shrink around their margin boxes (`float_bounds` per line),
+words that can't fit a float-shortened line drop below the float,
+auto-width floats get shrink-to-fit via a frozen measure pass laid in a
+provisional y-space (y+1M, so real float bands can't interfere) and are
+shifted into place, floated images use intrinsic dims, legacy
+`<img align=right>` maps to float. Parents don't grow around floats
+(classic un-clearfixed CSS behavior) but the doc height does. Known
+paint-order nit: a later sibling's background paints over an
+overflowing earlier float.
+
 ## What is intentionally NOT here yet (known limits)
-- No floats, no `position: absolute/fixed/relative` (laid out in-flow),
+- No `position: absolute/fixed/relative` (laid out in-flow),
   no real flexbox/grid (block fallback), no table column layout
   (`td`/`th` flow inline within a block `tr`).
 - Non-replaced `inline-block` degrades to inline; block-in-inline

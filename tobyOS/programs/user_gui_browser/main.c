@@ -371,6 +371,8 @@ struct cstyle {
     uint8_t  fl;                 /* SF_* */
     uint8_t  talign;             /* 0 left, 1 center, 2 right */
     int16_t  line_h;             /* >0 px; <0 scale*-100; 0 auto */
+    uint8_t  flt;                /* float: 0 none, 1 left, 2 right */
+    uint8_t  clr;                /* clear mask: 1 left, 2 right, 3 both */
 };
 
 /* ---- DOM ---------------------------------------------------------- */
@@ -440,6 +442,7 @@ enum {
     CP_BORDER, CP_BTOP, CP_BRIGHT, CP_BBOTTOM, CP_BLEFT,
     CP_BWIDTH, CP_BCOLOR,
     CP_WIDTH, CP_HEIGHT, CP_MAXW, CP_VISIBILITY,
+    CP_FLOAT, CP_CLEAR,
     CP__N
 };
 
@@ -1361,6 +1364,7 @@ static int prop_lookup(const char *s, int len) {
         {"border-color",CP_BCOLOR},
         {"width",CP_WIDTH},{"height",CP_HEIGHT},{"max-width",CP_MAXW},
         {"visibility",CP_VISIBILITY},
+        {"float",CP_FLOAT},{"clear",CP_CLEAR},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -1754,6 +1758,8 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->max_w = -1;
     for (int i = 0; i < 4; i++) { st->m[i] = 0; st->p[i] = 0; st->bw[i] = 0; }
     st->disp = D_INLINE;
+    st->flt = 0;
+    st->clr = 0;
 }
 
 static int clamp_px(int v) {
@@ -2064,6 +2070,21 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
             str_contains(v, n, "collapse", 8) >= 0)
             st->disp = D_NONE;
         break;
+    case CP_FLOAT:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "left")) st->flt = 1;
+            else if (tok_is(&t, "right")) st->flt = 2;
+            else st->flt = 0;
+        }
+        break;
+    case CP_CLEAR:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "left")) st->clr = 1;
+            else if (tok_is(&t, "right")) st->clr = 2;
+            else if (tok_is(&t, "both")) st->clr = 3;
+            else st->clr = 0;
+        }
+        break;
     default:
         break;
     }
@@ -2083,6 +2104,15 @@ static void style_node(int ni, const struct cstyle *pst) {
     }
     struct cstyle st;
     st_init(&st, pst);
+    /* presentational hint: legacy align= on images/tables floats them
+     * (lowest priority; any CSS float overrides) */
+    if (nd->tag == T_IMG || nd->tag == T_TABLE) {
+        char al[12];
+        if (node_attr_str(nd, "align", al, sizeof(al))) {
+            if (lc(al[0]) == 'l') st.flt = 1;
+            else if (lc(al[0]) == 'r') st.flt = 2;
+        }
+    }
     struct smatch M[MATCH_MAX];
     int nm = 0;
     for (int r = 0; r < E->nrules; r++) {
@@ -2225,6 +2255,54 @@ static int emit_rect(int x, int y, int w, int h, uint32_t col) {
     return (int)(it - E->items);
 }
 
+/* ---- Floats --------------------------------------------------------- *
+ * Out-of-flow boxes in doc coordinates, reset per layout() pass. Only
+ * LINE boxes avoid them (block boxes extend under floats, per CSS);
+ * parents don't grow around them (the classic un-clearfixed behavior). */
+
+#define FLOAT_MAX 64
+struct fltbox { int32_t x0, x1, y0, y1; uint8_t side; };
+static struct fltbox g_flts[FLOAT_MAX];
+static int g_nflts;
+static int g_flt_bottom;
+static int g_flt_freeze;   /* shrink-to-fit measure pass: floats are
+                              neither consulted nor registered */
+
+/* Line-box bounds at band [y, y+h) within [cx, cx+cw). */
+static void float_bounds(int y, int h, int cx, int cw, int *lx0, int *lx1) {
+    int x0 = cx, x1 = cx + cw;
+    if (g_flt_freeze) { *lx0 = x0; *lx1 = x1; return; }
+    for (int i = 0; i < g_nflts; i++) {
+        struct fltbox *f = &g_flts[i];
+        if (y >= f->y1 || y + h <= f->y0) continue;
+        if (f->side == 1) { if (f->x1 > x0) x0 = f->x1; }
+        else { if (f->x0 < x1) x1 = f->x0; }
+    }
+    if (x1 < x0 + 8) x1 = x0 + 8;
+    *lx0 = x0;
+    *lx1 = x1;
+}
+
+static int float_clear_y(int y, int mask) {
+    if (g_flt_freeze) return y;
+    for (int i = 0; i < g_nflts; i++)
+        if ((g_flts[i].side & mask) && g_flts[i].y1 > y)
+            y = g_flts[i].y1;
+    return y;
+}
+
+/* First y below the shallowest float constraining the band at y. */
+static int float_next_y(int y, int h) {
+    int ny = -1;
+    if (g_flt_freeze) return y;
+    for (int i = 0; i < g_nflts; i++) {
+        struct fltbox *f = &g_flts[i];
+        if (y < f->y1 && y + h > f->y0)
+            if (ny < 0 || f->y1 < ny) ny = f->y1;
+    }
+    return ny < 0 ? y : ny;
+}
+
 /* ---- Inline formatting context ------------------------------------- */
 
 struct istyle {
@@ -2238,6 +2316,8 @@ struct istyle {
 struct ictx {
     int cx, cw;                  /* content box left + width */
     int x, y;                    /* cursor (y = top of current line) */
+    int lx0, lx1;                /* current line-box bounds (floats) */
+    int def_lh;                  /* representative line height for bounds */
     int line_h;
     int line_i0;                 /* first item of the current line */
     int talign;
@@ -2245,13 +2325,19 @@ struct ictx {
     int citem;                   /* open coalescing text item or -1 */
 };
 
+/* Recompute the line bounds at the current y (line start only). */
+static void ic_rebound(struct ictx *ic) {
+    float_bounds(ic->y, ic->def_lh, ic->cx, ic->cw, &ic->lx0, &ic->lx1);
+    ic->x = ic->lx0;
+}
+
 /* Finish the current line: bottom-align items, apply text-align. */
 static void ic_break(struct ictx *ic, int min_h) {
     int lh = ic->line_h > 0 ? ic->line_h : min_h;
-    int used = ic->x - ic->cx;
+    int used = ic->x - ic->lx0;
     int shift = 0;
-    if (ic->talign == 1) shift = (ic->cw - used) / 2;
-    else if (ic->talign == 2) shift = ic->cw - used;
+    if (ic->talign == 1) shift = ((ic->lx1 - ic->lx0) - used) / 2;
+    else if (ic->talign == 2) shift = ic->lx1 - ic->x;
     if (shift < 0) shift = 0;
     for (int i = ic->line_i0; i < E->nitems; i++) {
         struct ditem *it = &E->items[i];
@@ -2259,11 +2345,11 @@ static void ic_break(struct ictx *ic, int min_h) {
         if (shift) it->x += shift;
     }
     ic->y += lh;
-    ic->x = ic->cx;
     ic->line_h = 0;
     ic->line_i0 = E->nitems;
     ic->citem = -1;
     ic->pend_sp = 0;
+    ic_rebound(ic);
 }
 
 /* Append one word to the line, wrapping as needed; coalesces into the
@@ -2273,10 +2359,27 @@ static void ic_word(struct ictx *ic, const char *w, int wl, const struct istyle 
     int bold = is->fl & IF_BOLD;
     int ww = text_px_w(w, wl, is->px, bold, mono);
     int sw = ic->pend_sp ? text_px_w(" ", 1, is->px, bold, mono) : 0;
-    int limit = ic->cx + ic->cw;
-    if (ic->x > ic->cx && ic->x + sw + ww > limit)
-        ic_break(ic, is->lh);
-    int sp = (ic->x > ic->cx) ? ic->pend_sp : 0;
+    for (int guard = 0; guard < 64; guard++) {
+        if (ic->x > ic->lx0 && ic->x + sw + ww > ic->lx1) {
+            ic_break(ic, is->lh);      /* wrap within the line box */
+            sw = 0;
+            continue;
+        }
+        if (ic->x == ic->lx0 && ic->x + ww > ic->lx1 &&
+            (ic->lx0 > ic->cx || ic->lx1 < ic->cx + ic->cw)) {
+            /* empty float-shortened line can't fit the word: drop below */
+            int ny = float_next_y(ic->y, is->lh);
+            if (ny > ic->y) {
+                ic->y = ny;
+                ic->line_i0 = E->nitems;
+                ic->citem = -1;
+                ic_rebound(ic);
+                continue;
+            }
+        }
+        break;
+    }
+    int sp = (ic->x > ic->lx0) ? ic->pend_sp : 0;
     ic->pend_sp = 0;
     sw = sp ? text_px_w(" ", 1, is->px, bold, mono) : 0;
     struct ditem *cu = (ic->citem >= 0) ? &E->items[ic->citem] : NULL;
@@ -2321,9 +2424,24 @@ static void ic_word(struct ictx *ic, const char *w, int wl, const struct istyle 
 /* Atomic inline box (image / form control). */
 static void ic_atomic(struct ictx *ic, int kind, int w, int h,
                       int link, int field, int img, int fl) {
-    int limit = ic->cx + ic->cw;
-    if (ic->x > ic->cx && ic->x + w > limit)
-        ic_break(ic, h + 2);
+    for (int guard = 0; guard < 64; guard++) {
+        if (ic->x > ic->lx0 && ic->x + w > ic->lx1) {
+            ic_break(ic, h + 2);
+            continue;
+        }
+        if (ic->x == ic->lx0 && ic->x + w > ic->lx1 &&
+            (ic->lx0 > ic->cx || ic->lx1 < ic->cx + ic->cw)) {
+            int ny = float_next_y(ic->y, h);
+            if (ny > ic->y) {
+                ic->y = ny;
+                ic->line_i0 = E->nitems;
+                ic->citem = -1;
+                ic_rebound(ic);
+                continue;
+            }
+        }
+        break;
+    }
     struct ditem *it = item_new(kind);
     if (!it) return;
     it->x = ic->x;
@@ -2359,7 +2477,7 @@ static void inl_text_pre(struct ictx *ic, const char *t, int tl, const struct is
             i++;
             continue;
         }
-        int budget = ic->cx + ic->cw - ic->x;
+        int budget = ic->lx1 - ic->x;
         int w = 0, j = i;
         while (j < tl && t[j] != '\n') {
             int cw2 = text_px_w(&t[j], 1, is->px, is->fl & IF_BOLD, is->fl & IF_MONO);
@@ -2368,7 +2486,7 @@ static void inl_text_pre(struct ictx *ic, const char *t, int tl, const struct is
             j++;
         }
         if (j == i) {                     /* nothing fits */
-            if (ic->x > ic->cx) { ic_break(ic, is->lh); continue; }
+            if (ic->x > ic->lx0) { ic_break(ic, is->lh); continue; }
             j = i + 1;
         }
         ic->pend_sp = 0;
@@ -2429,8 +2547,9 @@ static void inl_walk(struct ictx *ic, int ni, const struct istyle *is) {
 static int is_inline_level(int ci) {
     struct dnode *c = &E->nodes[ci];
     if (c->tag == T_TEXT) return 1;
+    if (c->st.disp == D_NONE) return 1;   /* skipped inside either path */
+    if (c->st.flt) return 0;              /* floats leave the flow */
     int d = c->st.disp;
-    if (d == D_NONE) return 1;            /* skipped inside either path */
     return d == D_INLINE || d == D_INLBLOCK;
 }
 
@@ -2444,13 +2563,14 @@ static int flush_inline(int first_child, int stop_child, int cx, int cw,
     struct ictx ic;
     ic.cx = cx;
     ic.cw = cw > 8 ? cw : 8;
-    ic.x = cx;
     ic.y = y;
+    ic.def_lh = st_line_h(bst);
     ic.line_h = 0;
     ic.line_i0 = E->nitems;
     ic.talign = bst->talign;
     ic.pend_sp = 0;
     ic.citem = -1;
+    ic_rebound(&ic);                      /* sets x/lx0/lx1 vs floats */
     struct istyle is;
     is.fg = bst->color;
     is.bg = ((inbg >> 24) &&
@@ -2466,12 +2586,138 @@ static int flush_inline(int first_child, int stop_child, int cx, int cw,
     int n0 = E->nitems;
     for (int c = first_child; c >= 0 && c != stop_child; c = E->nodes[c].next)
         inl_walk(&ic, c, &is);
-    if (E->nitems > n0 || ic.x > ic.cx)
+    if (E->nitems > n0 || ic.x > ic.lx0)
         ic_break(&ic, is.lh);
     return ic.y;
 }
 
 /* ---- Block flow ----------------------------------------------------- */
+
+static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg);
+
+/* Widest non-rect item extent since i0 (bg/border rects excluded: an
+ * auto-width block's bg spans the whole avail width). */
+static int items_extent(int i0) {
+    int e = 0;
+    for (int i = i0; i < E->nitems; i++) {
+        struct ditem *it = &E->items[i];
+        if (it->kind == DI_RECT) continue;
+        if (it->x + it->w > e) e = it->x + it->w;
+    }
+    return e;
+}
+
+/* Take a floated box out of flow: lay it (shrink-to-fit when width is
+ * auto), slide it against the left/right line edge (dropping below
+ * other floats when it doesn't fit), shift its items to the placed
+ * origin, and register its margin box so line boxes wrap around it. */
+static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
+    struct dnode *nd = &E->nodes[ni];
+    struct cstyle *st = &nd->st;
+    if (st->clr) cy = float_clear_y(cy, st->clr);
+
+    int ml = st->m[3] == M_AUTO ? 0 : st->m[3];
+    int mr = st->m[1] == M_AUTO ? 0 : st->m[1];
+    int mt = st->m[0] == M_AUTO ? 0 : st->m[0];
+    int mb = st->m[2] == M_AUTO ? 0 : st->m[2];
+
+    int i0 = E->nitems, f1;
+    int by = cy + mt;                      /* real flow position (search start) */
+    int laytop = by;                       /* where the content was laid */
+    int bw2, bbh;                          /* border-box width incl. ml, height */
+
+    if (nd->img >= 0) {
+        int dw, dh;
+        img_disp_dims(&g_images[nd->img], cw > 48 ? cw / 2 : cw, &dw, &dh);
+        if (st->width > 0 && !(st->fl & SF_WPCT)) {
+            int nw = st->width > cw ? cw : st->width;
+            dh = (int)((long)dh * nw / (dw > 0 ? dw : 1));
+            dw = nw;
+        }
+        if (st->height > 0) dh = st->height;
+        f1 = g_nflts;
+        struct ditem *it = item_new(DI_IMG);
+        if (!it) return;
+        it->x = ml;
+        it->y = by;
+        it->w = dw;
+        it->h = dh;
+        it->img = nd->img;
+        it->link = (int16_t)(nd->link >= 0 ? nd->link : link);
+        bw2 = ml + dw;
+        bbh = dh;
+    } else {
+        /* Lay the float's content in a provisional space far below any
+         * real content (y + 1M): its lines must not consult the real
+         * float list (coordinates are pre-shift), while its own inner
+         * floats still work locally. Items shift into place below. */
+        int prov = (1 << 20) + by;
+        int lay_cw = cw;
+        if (st->width < 0) {
+            /* shrink-to-fit: measure the preferred (unwrapped) width
+             * with floats frozen (no consulting, no registering) */
+            int mi = E->nitems, mrr = E->render_len, mf = g_nflts;
+            g_flt_freeze++;
+            lay_block(ni, 0, 100000, prov, link, inbg);
+            g_flt_freeze--;
+            int pref = items_extent(mi) + st->p[1] + st->bw[1];
+            E->nitems = mi;
+            E->render_len = mrr;
+            g_nflts = mf;
+            lay_cw = pref + mr + 2;
+            if (lay_cw > cw) lay_cw = cw;
+            if (lay_cw < 24) lay_cw = 24;
+        }
+        f1 = g_nflts;
+        int bot = lay_block(ni, 0, lay_cw, prov, link, inbg);
+        bbh = bot - prov;
+        laytop = prov;
+        if (st->width >= 0) {
+            int avail = lay_cw - ml - mr - st->bw[3] - st->bw[1] - st->p[3] - st->p[1];
+            if (avail < 8) avail = 8;
+            int cwid = (st->fl & SF_WPCT) ? (int)((long)avail * st->width / 100)
+                                          : st->width;
+            if (cwid > avail) cwid = avail;
+            if (cwid < 8) cwid = 8;
+            if (st->max_w >= 0 && cwid > st->max_w) cwid = st->max_w;
+            bw2 = ml + st->bw[3] + st->p[3] + cwid + st->p[1] + st->bw[1];
+        } else {
+            bw2 = items_extent(i0) + st->p[1] + st->bw[1];
+        }
+    }
+
+    /* place: walk down until the margin box fits between other floats */
+    int mbw = bw2 + mr;
+    int fy = by, lx0, lx1;
+    for (int guard = 0; guard < 64; guard++) {
+        float_bounds(fy, bbh > 0 ? bbh : 1, cx, cw, &lx0, &lx1);
+        if (lx1 - lx0 >= mbw) break;
+        if (lx0 == cx && lx1 == cx + cw) break;   /* nothing to dodge */
+        int ny = float_next_y(fy, bbh > 0 ? bbh : 1);
+        if (ny <= fy) break;
+        fy = ny;
+    }
+    float_bounds(fy, bbh > 0 ? bbh : 1, cx, cw, &lx0, &lx1);
+    int dx = (st->flt == 1) ? lx0 : lx1 - mbw;
+    if (dx < cx) dx = cx;
+    int dy = fy - laytop;
+    for (int i = i0; i < E->nitems; i++) {
+        E->items[i].x += dx;
+        E->items[i].y += dy;
+    }
+    for (int i = f1; i < g_nflts; i++) {   /* floats nested in this float */
+        g_flts[i].x0 += dx; g_flts[i].x1 += dx;
+        g_flts[i].y0 += dy; g_flts[i].y1 += dy;
+    }
+    if (!g_flt_freeze && g_nflts < FLOAT_MAX) {
+        struct fltbox *f = &g_flts[g_nflts++];
+        f->x0 = dx;
+        f->x1 = dx + mbw;
+        f->y0 = fy - mt;
+        f->y1 = fy + bbh + mb;
+        f->side = st->flt;
+    }
+}
 
 static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     struct dnode *nd = &E->nodes[ni];
@@ -2521,10 +2767,17 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
         }
     }
 
-    /* children: block flow with anonymous inline runs */
+    /* children: block flow with anonymous inline runs; floats leave
+     * the flow entirely (cy does not advance past them) */
     int c = nd->first;
     int prev_mb = 0;
     while (c >= 0) {
+        struct dnode *cn = &E->nodes[c];
+        if (cn->tag != T_TEXT && cn->st.disp != D_NONE && cn->st.flt) {
+            lay_float(c, cx, content_w, cy, link, curbg);
+            c = cn->next;
+            continue;
+        }
         if (is_inline_level(c)) {
             int start = c;
             while (c >= 0 && is_inline_level(c))
@@ -2533,7 +2786,7 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
             if (ny != cy) prev_mb = 0;
             cy = ny;
         } else {
-            struct dnode *cn = &E->nodes[c];
+            if (cn->st.clr) cy = float_clear_y(cy, cn->st.clr);
             int mt = cn->st.m[0] == M_AUTO ? 0 : cn->st.m[0];
             int mb = cn->st.m[2] == M_AUTO ? 0 : cn->st.m[2];
             cy += mt > prev_mb ? mt : prev_mb;     /* sibling collapse */
@@ -2583,10 +2836,17 @@ static void layout(int width) {
     int root = E->body >= 0 ? E->body : 0;
     int cw = width - 12;                  /* room for the scrollbar */
     if (cw < 60) cw = 60;
+    g_nflts = 0;
+    g_flt_bottom = 0;
     struct cstyle *rst = &E->nodes[root].st;
     int y = rst->m[0] == M_AUTO ? 0 : rst->m[0];
     int end = lay_block(root, 0, cw, y, -1, 0);
     g_doc_h = end + (rst->m[2] == M_AUTO ? 0 : rst->m[2]) + 10;
+    g_flt_bottom = 0;
+    for (int i = 0; i < g_nflts; i++)
+        if (g_flts[i].y1 > g_flt_bottom) g_flt_bottom = g_flts[i].y1;
+    if (g_flt_bottom + 10 > g_doc_h)
+        g_doc_h = g_flt_bottom + 10;      /* floats may outgrow the flow */
     E->render[E->render_len] = 0;
 }
 
