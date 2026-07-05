@@ -721,6 +721,7 @@ LIBTOBY_AR      := $(LIBTOBY_DIR)/libtoby.a
 LIBTOBY_CRT0    := $(LIBTOBY_DIR)/crt0.o
 
 LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
+                   $(LIBTOBY_SRC)/int128.c \
                    $(LIBTOBY_SRC)/syscall.c \
                    $(LIBTOBY_SRC)/errno.c \
                    $(LIBTOBY_SRC)/string.c \
@@ -1841,8 +1842,36 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_files,user_gui_files))
 # File viewer (text/hex) -- migrated to TobyTK; monospace via tk_draw_text_mono.
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_viewer,user_gui_viewer))
 
-# Web browser -- migrated to TobyTK; monospace content grid via tk_draw_text_mono.
-$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_browser,user_gui_browser))
+# ---------- QuickJS (M-JS: browser JavaScript engine, phase 9) ----------
+# Vendored Bellard QuickJS 2025-04-26 (third_party/quickjs), compiled
+# freestanding against libtoby. FP-heavy like math.c/stdio.c, so it
+# builds -msse -msse2 (the kernel FXSAVEs user FP state). Atomics are
+# opted out (single-threaded browser; no pthread dependency).
+QJS_DIR  := third_party/quickjs
+QJS_OBJS := $(QJS_DIR)/quickjs.o $(QJS_DIR)/libregexp.o \
+            $(QJS_DIR)/libunicode.o $(QJS_DIR)/cutils.o $(QJS_DIR)/dtoa.o
+QJS_CFLAGS := $(LIBTOBY_CFLAGS) -msse -msse2 \
+              -DCONFIG_VERSION='"2025-04-26"' -DQJS_NO_ATOMICS -D__TOBYOS__ \
+              -Dalloca=__builtin_alloca \
+              -Wno-unused-parameter -Wno-sign-compare -Wno-unused-variable \
+              -Wno-unused-but-set-variable -Wno-implicit-fallthrough
+
+$(QJS_DIR)/%.o: $(QJS_DIR)/%.c $(LIBTOBY_AR)
+	$(CC) $(QJS_CFLAGS) -c $< -o $@
+
+# Web browser -- TobyTK shell + DOM/CSS engine + QuickJS. main.c builds
+# -msse (it exchanges doubles with QuickJS) and sees the QuickJS API.
+programs/user_gui_browser/user_gui_browser.o: programs/user_gui_browser/main.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -msse -msse2 -I $(QJS_DIR) -c $< -o $@
+
+programs/user_gui_browser/user_gui_browser.elf: programs/user_gui_browser/user_gui_browser.o \
+                        $(QJS_OBJS) \
+                        $(LIBTOBY_CRT0) \
+                        $(LIBTOBY_AR) \
+                        programs/user_gui_browser/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_gui_browser/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/user_gui_browser/user_gui_browser.o \
+	      $(QJS_OBJS) $(LIBTOBY_AR)
 
 # Milestone-14 GUI login screen. Migrated to TobyTK: links libtoby
 # (crt0 + libtoby.a) like every other native app instead of the old

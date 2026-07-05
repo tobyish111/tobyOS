@@ -70,6 +70,14 @@ struct gui_event {
  * link and find logic is unchanged. */
 #include <toby/tk.h>
 #include <toby/image.h>     /* stb_image-backed ARGB decoder (libtoby) */
+/* QuickJS (third_party/quickjs, linked by the Makefile). Included this
+ * early so its headers see none of the short macros defined below
+ * (E, cur, g_raw, ...). Its inline helpers trip -Wextra; scoped off. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#pragma clang diagnostic ignored "-Wcast-function-type-mismatch"
+#include "quickjs.h"
+#pragma clang diagnostic pop
 static struct tk_window win;
 
 /* libtoby heap (stdlib.c over sbrk); the image path allocates fetch +
@@ -770,6 +778,32 @@ static int tp_put_html(const char *s, long n) {
     return E->tpool_len - start;
 }
 
+/* Append UTF-8 text [s, s+n) to the tpool WITHOUT entity decoding
+ * (JS textContent strings are literal). */
+static int tp_put_utf8(const char *s, long n) {
+    int start = E->tpool_len;
+    for (long i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\r') continue;
+        if (c < 0x80) { tp_put_cp(c); continue; }
+        unsigned int cp = 0;
+        int extra = 0;
+        if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; extra = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
+        else continue;
+        if (i + extra >= n) break;
+        int ok = 1;
+        for (int k = 1; k <= extra; k++) {
+            unsigned char cc = (unsigned char)s[i + k];
+            if ((cc & 0xC0) != 0x80) { ok = 0; break; }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (ok) { tp_put_cp(cp); i += extra; }
+    }
+    return E->tpool_len - start;
+}
+
 /* ---- Tag table ---------------------------------------------------- */
 
 static const char * const g_tag_names[T_NTAGS] = {
@@ -926,14 +960,12 @@ static long parse_attrs(const char *s, long i, long n,
 
 #define DOM_STACK_MAX 96
 
-/* g_raw -> DOM tree in E (tokenizer + tree constructor). */
-static void dom_build(void) {
-    int root = dom_new(T_UNK, -1);        /* document node */
+/* Parse HTML [s, s+n) appending under `root` (the tree-constructor
+ * core; also reused for JS innerHTML fragments). */
+static void dom_parse(const char *s, long n, int root) {
     int stack[DOM_STACK_MAX];
     int sp = 0;
     stack[0] = root;
-    const char *s = g_raw;
-    long n = g_raw_len;
     long i = 0;
     while (i < n && E->nnodes < NODE_MAX - 2) {
         if (s[i] == '<' && i + 1 < n &&
@@ -992,9 +1024,9 @@ static void dom_build(void) {
                         break;
                     j++;
                 }
-                if (t != T_SCRIPT && j > i) {
+                if (j > i) {
                     int toff = E->tpool_len, tl;
-                    if (t == T_STYLE) {   /* CSS: no entity decoding */
+                    if (t == T_STYLE || t == T_SCRIPT) {   /* raw: no entities */
                         for (long q2 = i; q2 < j && E->tpool_len < TPOOL_CAP - 1; q2++)
                             if (s[q2] != '\r') tp_putc(s[q2]);
                         tl = E->tpool_len - toff;
@@ -1042,6 +1074,12 @@ static void dom_build(void) {
             }
         }
     }
+}
+
+/* g_raw -> DOM tree in E. */
+static void dom_build(void) {
+    int root = dom_new(T_UNK, -1);        /* document node */
+    dom_parse(g_raw, g_raw_len, root);
 }
 
 /* =================== CSS parser =================== */
@@ -3044,6 +3082,552 @@ static void collect_node(int ni) {
     g_form_open = save_form;
 }
 
+/* =================== JavaScript: QuickJS + DOM bindings ===============
+ * Phase 9 of the engine roadmap. Scripts run ONCE at page load (after
+ * the DOM is built, before styles/layout); mutations are picked up by
+ * the normal collect -> cascade -> layout pipeline. No event loop yet
+ * (that is phase 10): the runtime is created per load and freed after
+ * the scripts finish. C exposes small __dom primitives on ints (node
+ * indices); a JS prelude wraps them in document/Element objects. */
+
+static void set_status(const char *s);
+static void update_title(void);
+static int  msg_append(char *dst, int pos, int max, const char *s);
+
+/* ---- DOM mutation helpers ------------------------------------------ */
+
+static void dom_unlink(int ni) {
+    if (ni <= 0 || ni >= E->nnodes) return;
+    int p = E->nodes[ni].parent;
+    if (p < 0) return;
+    int prev = -1, c = E->nodes[p].first;
+    while (c >= 0 && c != ni) { prev = c; c = E->nodes[c].next; }
+    if (c != ni) return;
+    if (prev < 0) E->nodes[p].first = E->nodes[ni].next;
+    else E->nodes[prev].next = E->nodes[ni].next;
+    if (E->nodes[p].last == ni) E->nodes[p].last = prev;
+    E->nodes[ni].parent = -1;
+    E->nodes[ni].next = -1;
+}
+
+static void dom_attach(int parent, int child) {
+    if (parent < 0 || child <= 0 || parent == child) return;
+    if (parent >= E->nnodes || child >= E->nnodes) return;
+    for (int a = parent; a >= 0; a = E->nodes[a].parent)
+        if (a == child) return;           /* would create a cycle */
+    dom_unlink(child);
+    struct dnode *p = &E->nodes[parent];
+    E->nodes[child].parent = parent;
+    E->nodes[child].next = -1;
+    if (p->last >= 0) E->nodes[p->last].next = child;
+    else p->first = child;
+    p->last = child;
+}
+
+static int dom_find_by_id(const char *id) {
+    int idl = (int)str_len(id);
+    if (!idl) return -1;
+    for (int i = 1; i < E->nnodes; i++) {
+        if (E->nodes[i].tag == T_TEXT) continue;
+        int vlen;
+        const char *v = node_attr(&E->nodes[i], "id", &vlen);
+        if (v && vlen == idl) {
+            int k = 0;
+            while (k < idl && v[k] == id[k]) k++;
+            if (k == idl) return i;
+        }
+    }
+    return -1;
+}
+
+/* querySelector: parse one selector into scratch parts, scan the tree. */
+static int dom_query_first(const char *sel, long n) {
+    int p0 = E->nparts, c0 = E->csspool_len;
+    struct ccur c = { sel, 0, n };
+    int pending = 0, valid = 1;
+    int sid = 0, scls = 0, sty = 0;
+    for (;;) {
+        css_ws(&c);
+        if (c.i >= c.n) break;
+        char ch = c.s[c.i];
+        if (ch == '>') { pending = 2; c.i++; continue; }
+        if (ch == '+' || ch == '~' || ch == ',') { valid = 0; break; }
+        struct cpart tmp;
+        long before = c.i;
+        if (!css_parse_part(&c, &tmp, &sid, &scls, &sty) || c.i == before) {
+            valid = 0;
+            break;
+        }
+        tmp.comb = (uint8_t)((E->nparts == p0) ? 0 : (pending ? pending : 1));
+        pending = 0;
+        if (E->nparts < PART_MAX) E->parts[E->nparts++] = tmp;
+        else { valid = 0; break; }
+    }
+    int found = -1;
+    if (valid && E->nparts > p0) {
+        const struct cpart *parts = &E->parts[p0];
+        int np = E->nparts - p0;
+        for (int i = 1; i < E->nnodes && found < 0; i++) {
+            if (E->nodes[i].tag == T_TEXT) continue;
+            if (match_upward(parts, np - 1, i)) found = i;
+        }
+    }
+    E->nparts = p0;
+    E->csspool_len = c0;
+    return found;
+}
+
+static int dom_text_collect(int ni, char *buf, int pos, int cap) {
+    struct dnode *n = &E->nodes[ni];
+    if (n->tag == T_TEXT) {
+        for (int k = 0; k < n->tlen && pos < cap; k++)
+            buf[pos++] = E->tpool[n->toff + k];
+        return pos;
+    }
+    for (int c = n->first; c >= 0; c = E->nodes[c].next)
+        pos = dom_text_collect(c, buf, pos, cap);
+    return pos;
+}
+
+/* Set/replace one attribute: the node's records are rebuilt as a fresh
+ * contiguous block (old slices are shared; the arena resets per page). */
+static void dom_set_attr(int ni, const char *name, const char *val) {
+    if (ni <= 0 || ni >= E->nnodes) return;
+    struct dnode *n = &E->nodes[ni];
+    int nlen = (int)str_len(name);
+    if (nlen > 48) nlen = 48;
+    if (!nlen) return;
+    int new0 = E->nattrs;
+    int replaced = 0;
+    for (int i = 0; i < n->nattr && E->nattrs < ATTR_MAX; i++) {
+        struct dattr *a = &E->attrs[n->attr0 + i];
+        int match = (a->nlen == nlen);
+        if (match)
+            for (int k = 0; k < nlen; k++)
+                if (lc(E->tpool[a->noff + k]) != lc(name[k])) { match = 0; break; }
+        struct dattr *d = &E->attrs[E->nattrs++];
+        if (match && !replaced) {
+            int noff = E->tpool_len;
+            for (int k = 0; k < nlen; k++) tp_putc((char)lc(name[k]));
+            int voff = E->tpool_len;
+            int vlen = tp_put_utf8(val, (long)str_len(val));
+            d->noff = noff; d->nlen = (int16_t)nlen;
+            d->voff = voff; d->vlen = vlen;
+            replaced = 1;
+        } else {
+            *d = *a;
+        }
+    }
+    if (!replaced && E->nattrs < ATTR_MAX) {
+        int noff = E->tpool_len;
+        for (int k = 0; k < nlen; k++) tp_putc((char)lc(name[k]));
+        int voff = E->tpool_len;
+        int vlen = tp_put_utf8(val, (long)str_len(val));
+        struct dattr *d = &E->attrs[E->nattrs++];
+        d->noff = noff; d->nlen = (int16_t)nlen;
+        d->voff = voff; d->vlen = vlen;
+    }
+    n->attr0 = new0;
+    n->nattr = (int16_t)(E->nattrs - new0);
+}
+
+/* ---- __dom primitives (C side) -------------------------------------- */
+
+static int jsi(JSContext *cx, JSValueConst v) {
+    int32_t i;
+    if (JS_ToInt32(cx, &i, v)) return -1;
+    if (i < 0 || i >= E->nnodes) return -1;
+    return i;
+}
+
+static JSValue js_console_log(JSContext *cx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    (void)this_val;
+    char line[512];
+    int p = 0;
+    for (int i = 0; i < argc; i++) {
+        const char *s = JS_ToCString(cx, argv[i]);
+        if (!s) continue;
+        if (i && p < 510) line[p++] = ' ';
+        for (const char *q = s; *q && p < 510; q++) line[p++] = *q;
+        JS_FreeCString(cx, s);
+    }
+    line[p++] = '\n';
+    sys_write(1, "[js] ", 5);
+    sys_write(1, line, (size_t)p);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_dom_byid(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NewInt32(cx, -1);
+    const char *s = JS_ToCString(cx, argv[0]);
+    int r = s ? dom_find_by_id(s) : -1;
+    if (s) JS_FreeCString(cx, s);
+    return JS_NewInt32(cx, r);
+}
+
+static JSValue js_dom_query(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NewInt32(cx, -1);
+    const char *s = JS_ToCString(cx, argv[0]);
+    int r = s ? dom_query_first(s, (long)str_len(s)) : -1;
+    if (s) JS_FreeCString(cx, s);
+    return JS_NewInt32(cx, r);
+}
+
+static JSValue js_dom_create(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NewInt32(cx, -1);
+    const char *s = JS_ToCString(cx, argv[0]);
+    int r = -1;
+    if (s) {
+        int tag = tag_lookup(s, (int)str_len(s));
+        r = dom_new(tag, -1);
+        JS_FreeCString(cx, s);
+    }
+    return JS_NewInt32(cx, r);
+}
+
+static JSValue js_dom_text(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NewInt32(cx, -1);
+    const char *s = JS_ToCString(cx, argv[0]);
+    int r = -1;
+    if (s) {
+        r = dom_new(T_TEXT, -1);
+        if (r >= 0) {
+            E->nodes[r].toff = E->tpool_len;
+            E->nodes[r].tlen = tp_put_utf8(s, (long)str_len(s));
+        }
+        JS_FreeCString(cx, s);
+    }
+    return JS_NewInt32(cx, r);
+}
+
+static JSValue js_dom_append(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc >= 2) dom_attach(jsi(cx, argv[0]), jsi(cx, argv[1]));
+    return JS_UNDEFINED;
+}
+
+static JSValue js_dom_remove(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc >= 1) dom_unlink(jsi(cx, argv[0]));
+    return JS_UNDEFINED;
+}
+
+static JSValue js_dom_settext(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_UNDEFINED;
+    int ni = jsi(cx, argv[0]);
+    const char *s = JS_ToCString(cx, argv[1]);
+    if (ni > 0 && s) {
+        E->nodes[ni].first = E->nodes[ni].last = -1;
+        int tn = dom_new(T_TEXT, ni);
+        if (tn >= 0) {
+            E->nodes[tn].toff = E->tpool_len;
+            E->nodes[tn].tlen = tp_put_utf8(s, (long)str_len(s));
+        }
+    }
+    if (s) JS_FreeCString(cx, s);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_dom_gettext(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    static char buf[4096];
+    if (argc < 1) return JS_NewString(cx, "");
+    int ni = jsi(cx, argv[0]);
+    int len = (ni >= 0) ? dom_text_collect(ni, buf, 0, (int)sizeof(buf)) : 0;
+    return JS_NewStringLen(cx, buf, (size_t)len);
+}
+
+static JSValue js_dom_sethtml(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_UNDEFINED;
+    int ni = jsi(cx, argv[0]);
+    const char *s = JS_ToCString(cx, argv[1]);
+    if (ni > 0 && s) {
+        E->nodes[ni].first = E->nodes[ni].last = -1;
+        dom_parse(s, (long)str_len(s), ni);
+    }
+    if (s) JS_FreeCString(cx, s);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_dom_getattr(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_NULL;
+    int ni = jsi(cx, argv[0]);
+    const char *name = JS_ToCString(cx, argv[1]);
+    JSValue r = JS_NULL;
+    if (ni > 0 && name) {
+        int vlen;
+        const char *v = node_attr(&E->nodes[ni], name, &vlen);
+        if (v) r = JS_NewStringLen(cx, v, (size_t)vlen);
+    }
+    if (name) JS_FreeCString(cx, name);
+    return r;
+}
+
+static JSValue js_dom_setattr(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 3) return JS_UNDEFINED;
+    int ni = jsi(cx, argv[0]);
+    const char *name = JS_ToCString(cx, argv[1]);
+    const char *val = JS_ToCString(cx, argv[2]);
+    if (ni > 0 && name && val) dom_set_attr(ni, name, val);
+    if (name) JS_FreeCString(cx, name);
+    if (val) JS_FreeCString(cx, val);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_dom_tag(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    return JS_NewString(cx, ni >= 0 ? g_tag_names[E->nodes[ni].tag] : "");
+}
+
+static JSValue js_dom_parent(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    return JS_NewInt32(cx, ni >= 0 ? E->nodes[ni].parent : -1);
+}
+
+static JSValue js_dom_children(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    JSValue arr = JS_NewArray(cx);
+    int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    if (ni >= 0) {
+        uint32_t k = 0;
+        for (int c = E->nodes[ni].first; c >= 0; c = E->nodes[c].next)
+            if (E->nodes[c].tag != T_TEXT)
+                JS_SetPropertyUint32(cx, arr, k++, JS_NewInt32(cx, c));
+    }
+    return arr;
+}
+
+static JSValue js_dom_body(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t; (void)argc; (void)argv;
+    return JS_NewInt32(cx, E->body >= 0 ? E->body : 0);
+}
+
+static JSValue js_dom_title(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc >= 1) {
+        const char *s = JS_ToCString(cx, argv[0]);
+        if (s) {
+            str_copy(g_title, s, TITLE_MAX);
+            update_title();
+            JS_FreeCString(cx, s);
+        }
+    }
+    return JS_UNDEFINED;
+}
+
+/* ---- prelude: document/Element wrappers over __dom ------------------ */
+
+static const char JS_PRELUDE[] =
+"(function(g){\n"
+"  var D = g.__dom;\n"
+"  var wrap = new Map();\n"
+"  function Element(i){\n"
+"    this.__i = i;\n"
+"    var self = this;\n"
+"    this.style = new Proxy({}, {\n"
+"      set: function(tg, k, v){\n"
+"        tg[k] = v;\n"
+"        var s = '';\n"
+"        for (var kk in tg){\n"
+"          var name = '';\n"
+"          for (var ci = 0; ci < kk.length; ci++){\n"
+"            var ch = kk[ci];\n"
+"            name += (ch >= 'A' && ch <= 'Z') ? '-' + ch.toLowerCase() : ch;\n"
+"          }\n"
+"          s += name + ':' + tg[kk] + ';';\n"
+"        }\n"
+"        D.setAttr(self.__i, 'style', s);\n"
+"        return true;\n"
+"      }\n"
+"    });\n"
+"  }\n"
+"  function el(i){\n"
+"    if (i === null || i === undefined || i < 0) return null;\n"
+"    var w = wrap.get(i);\n"
+"    if (!w){ w = new Element(i); wrap.set(i, w); }\n"
+"    return w;\n"
+"  }\n"
+"  Object.defineProperties(Element.prototype, {\n"
+"    textContent: {\n"
+"      get: function(){ return D.getText(this.__i); },\n"
+"      set: function(v){ D.setText(this.__i, String(v)); }\n"
+"    },\n"
+"    innerText: {\n"
+"      get: function(){ return D.getText(this.__i); },\n"
+"      set: function(v){ D.setText(this.__i, String(v)); }\n"
+"    },\n"
+"    innerHTML: {\n"
+"      get: function(){ return ''; },\n"
+"      set: function(v){ D.setHTML(this.__i, String(v)); }\n"
+"    },\n"
+"    id: {\n"
+"      get: function(){ return D.getAttr(this.__i, 'id') || ''; },\n"
+"      set: function(v){ D.setAttr(this.__i, 'id', String(v)); }\n"
+"    },\n"
+"    className: {\n"
+"      get: function(){ return D.getAttr(this.__i, 'class') || ''; },\n"
+"      set: function(v){ D.setAttr(this.__i, 'class', String(v)); }\n"
+"    },\n"
+"    tagName: { get: function(){ return D.tag(this.__i).toUpperCase(); } },\n"
+"    parentNode: { get: function(){ return el(D.parent(this.__i)); } },\n"
+"    children: { get: function(){ return D.children(this.__i).map(el); } }\n"
+"  });\n"
+"  Element.prototype.appendChild = function(c){ D.append(this.__i, c.__i); return c; };\n"
+"  Element.prototype.removeChild = function(c){ D.remove(c.__i); return c; };\n"
+"  Element.prototype.remove = function(){ D.remove(this.__i); };\n"
+"  Element.prototype.setAttribute = function(n, v){ D.setAttr(this.__i, String(n), String(v)); };\n"
+"  Element.prototype.getAttribute = function(n){ return D.getAttr(this.__i, String(n)); };\n"
+"  Element.prototype.querySelector = function(s){ return el(D.query(String(s))); };\n"
+"  Element.prototype.addEventListener = function(){};\n"
+"  g.document = {\n"
+"    getElementById: function(id){ return el(D.byId(String(id))); },\n"
+"    querySelector: function(s){ return el(D.query(String(s))); },\n"
+"    createElement: function(t){ return el(D.create(String(t))); },\n"
+"    createTextNode: function(t){ return el(D.text(String(t))); },\n"
+"    addEventListener: function(){},\n"
+"    get body(){ return el(D.body()); },\n"
+"    set title(v){ D.title(String(v)); },\n"
+"    get title(){ return ''; }\n"
+"  };\n"
+"  g.window = g;\n"
+"  g.alert = function(m){ g.console.log('[alert]', m); };\n"
+"  g.setTimeout = function(f){ if (typeof f === 'function') f(); return 0; };\n"
+"  g.setInterval = function(){ return 0; };\n"
+"  g.requestAnimationFrame = function(f){ if (typeof f === 'function') f(0); return 0; };\n"
+"  g.navigator = { userAgent: 'TobyOS/4.0 (tobyOS x86_64) QuickJS' };\n"
+"})(globalThis);\n";
+
+/* ---- run every <script> at load -------------------------------------- */
+
+#define JS_SRC_CAP (192 * 1024)
+
+static void js_dump_error(JSContext *cx) {
+    JSValue e = JS_GetException(cx);
+    const char *s = JS_ToCString(cx, e);
+    if (s) {
+        char m[120];
+        int p = 0;
+        p = msg_append(m, p, sizeof(m), "JS error: ");
+        p = msg_append(m, p, sizeof(m), s);
+        set_status(m);
+        sys_write(1, "[js] ERROR: ", 12);
+        sys_write(1, s, str_len(s));
+        sys_write(1, "\n", 1);
+        JS_FreeCString(cx, s);
+    }
+    JS_FreeValue(cx, e);
+}
+
+static void run_scripts(void) {
+    int scripts[64];
+    int ns = 0;
+    for (int i = 1; i < E->nnodes && ns < 64; i++)
+        if (E->nodes[i].tag == T_SCRIPT) scripts[ns++] = i;
+    if (!ns) return;
+
+    JSRuntime *rt = JS_NewRuntime();
+    if (!rt) return;
+    JS_SetMemoryLimit(rt, 32u * 1024 * 1024);
+    JS_SetMaxStackSize(rt, 192 * 1024);
+    JSContext *cx = JS_NewContext(rt);
+    if (!cx) { JS_FreeRuntime(rt); return; }
+
+    {
+        JSValue g = JS_GetGlobalObject(cx);
+        JSValue dom = JS_NewObject(cx);
+        static const struct { const char *n; JSCFunction *f; int na; } B[] = {
+            {"byId", js_dom_byid, 1},     {"query", js_dom_query, 1},
+            {"create", js_dom_create, 1}, {"text", js_dom_text, 1},
+            {"append", js_dom_append, 2}, {"remove", js_dom_remove, 1},
+            {"setText", js_dom_settext, 2},{"getText", js_dom_gettext, 1},
+            {"setHTML", js_dom_sethtml, 2},{"getAttr", js_dom_getattr, 2},
+            {"setAttr", js_dom_setattr, 3},{"tag", js_dom_tag, 1},
+            {"parent", js_dom_parent, 1}, {"children", js_dom_children, 1},
+            {"body", js_dom_body, 0},     {"title", js_dom_title, 1},
+        };
+        for (unsigned k = 0; k < sizeof(B) / sizeof(B[0]); k++)
+            JS_SetPropertyStr(cx, dom, B[k].n,
+                              JS_NewCFunction(cx, B[k].f, B[k].n, B[k].na));
+        JS_SetPropertyStr(cx, g, "__dom", dom);
+        JSValue cons = JS_NewObject(cx);
+        JS_SetPropertyStr(cx, cons, "log",
+                          JS_NewCFunction(cx, js_console_log, "log", 1));
+        JS_SetPropertyStr(cx, cons, "warn",
+                          JS_NewCFunction(cx, js_console_log, "warn", 1));
+        JS_SetPropertyStr(cx, cons, "error",
+                          JS_NewCFunction(cx, js_console_log, "error", 1));
+        JS_SetPropertyStr(cx, g, "console", cons);
+        JS_FreeValue(cx, g);
+    }
+    {
+        JSValue r = JS_Eval(cx, JS_PRELUDE, sizeof(JS_PRELUDE) - 1,
+                            "<prelude>", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(r)) js_dump_error(cx);
+        JS_FreeValue(cx, r);
+    }
+
+    for (int k = 0; k < ns; k++) {
+        struct dnode *nd = &E->nodes[scripts[k]];
+        char ty[40];
+        if (node_attr_str(nd, "type", ty, sizeof(ty)) && ty[0] &&
+            str_contains(ty, (int)str_len(ty), "javascript", 10) < 0 &&
+            str_contains(ty, (int)str_len(ty), "module", 6) < 0)
+            continue;                     /* JSON/templates/etc. */
+        /* JS_Eval requires a NUL-terminated buffer (the lexer relies on
+         * the sentinel), so scripts always run from an owned copy. */
+        char *fbuf = NULL;
+        long slen = 0;
+        char surl[URL_MAX + 1];
+        if (node_attr_str(nd, "src", surl, sizeof(surl)) && surl[0]) {
+            char url[URL_MAX + 1];
+            resolve_relative_url(g_url, surl, url, URL_MAX);
+            if (has_scheme(url)) {
+                fbuf = (char *)malloc(JS_SRC_CAP + 1);
+                if (fbuf) {
+                    struct http_fetch req;
+                    mem_zero(&req, sizeof(req));
+                    req.url = (unsigned long)url;
+                    req.buf = (unsigned long)fbuf;
+                    req.buf_sz = JS_SRC_CAP;
+                    long r = sys_http_fetch(&req);
+                    if (r > 0 && req.status > 0 && req.status < 400)
+                        slen = r;
+                }
+            }
+        } else if (nd->first >= 0 && E->nodes[nd->first].tag == T_TEXT) {
+            long tl = E->nodes[nd->first].tlen;
+            fbuf = (char *)malloc((unsigned long)tl + 1);
+            if (fbuf) {
+                for (long q = 0; q < tl; q++)
+                    fbuf[q] = E->tpool[E->nodes[nd->first].toff + q];
+                slen = tl;
+            }
+        }
+        if (fbuf && slen > 0) {
+            fbuf[slen] = '\0';
+            JSValue r = JS_Eval(cx, fbuf, (size_t)slen, "script",
+                                JS_EVAL_TYPE_GLOBAL);
+            if (JS_IsException(r)) js_dump_error(cx);
+            JS_FreeValue(cx, r);
+        }
+        if (fbuf) free(fbuf);
+    }
+
+    JS_FreeContext(cx);
+    JS_FreeRuntime(rt);
+}
+
 /* ---- The full pipeline: raw -> DOM -> CSSOM -> style -> layout ------ */
 
 static void render_html(void) {
@@ -3052,6 +3636,7 @@ static void render_html(void) {
     page_reset();
 
     dom_build();
+    run_scripts();                        /* phase 9: mutate, then style */
     css_parse_sheet(UA_SHEET, (long)sizeof(UA_SHEET) - 1, 0);
     g_form_open = -1;
     collect_node(0);

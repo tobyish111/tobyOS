@@ -325,3 +325,47 @@ float fmodf(float x, float y) { return (float)fmod((double)x, (double)y); }
 float powf(float x, float y)  { return (float)pow((double)x, (double)y); }
 float expf(float x)   { return (float)exp((double)x); }
 float logf(float x)   { return (float)log((double)x); }
+
+/* ---- hyperbolics + friends (M-JS: QuickJS Math object) ------------- */
+
+double fmin(double a, double b) { return (isnan(a) || b < a) ? b : a; }
+double fmax(double a, double b) { return (isnan(a) || b > a) ? b : a; }
+
+double hypot(double x, double y)
+{
+    x = fabs(x); y = fabs(y);
+    if (isinf(x) || isinf(y)) return INFINITY;
+    if (x < y) { double t = x; x = y; y = t; }
+    if (x == 0.0) return 0.0;
+    { double r = y / x; return x * sqrt(1.0 + r * r); }
+}
+
+double sinh(double x) { double e = exp(x); return (e - 1.0 / e) * 0.5; }
+double cosh(double x) { double e = exp(x); return (e + 1.0 / e) * 0.5; }
+double tanh(double x)
+{
+    if (x > 20.0) return 1.0;
+    if (x < -20.0) return -1.0;
+    { double e = exp(2.0 * x); return (e - 1.0) / (e + 1.0); }
+}
+
+double asinh(double x) { return log(x + sqrt(x * x + 1.0)); }
+double acosh(double x) { return log(x + sqrt(x * x - 1.0)); }
+double atanh(double x) { return 0.5 * log((1.0 + x) / (1.0 - x)); }
+
+/* expm1/log1p: series near zero, direct elsewhere (JS-grade accuracy) */
+double expm1(double x)
+{
+    if (fabs(x) < 1e-5) return x + 0.5 * x * x + x * x * x / 6.0;
+    return exp(x) - 1.0;
+}
+double log1p(double x)
+{
+    if (fabs(x) < 1e-5) return x - 0.5 * x * x + x * x * x / 3.0;
+    return log(1.0 + x);
+}
+
+double rint(double x) { return round(x); }
+double nearbyint(double x) { return round(x); }
+
+long lrint(double x) { return (long)round(x); }

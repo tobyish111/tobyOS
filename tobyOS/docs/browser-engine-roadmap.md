@@ -91,6 +91,16 @@ produce a layout/box tree; paint walks the box tree. Do this alongside
 Phase 7 — CSS and DOM are co-dependent.
 
 ### Phase 9 — JavaScript engine. Port, don't write.
+**STATUS: v1 LANDED on branch `browser-js`** (see `browser-stage9-js.md`):
+QuickJS 2025-04-26 vendored (`third_party/quickjs`), compiled
+freestanding against libtoby (3 tiny guarded patches; libtoby grew
+inttypes/fenv/sys-time/gettimeofday/hyperbolic-math/int128-division).
+DOM bindings: `__dom` C primitives + JS prelude = document/Element/
+style-Proxy/innerHTML(real fragment parse)/createElement/appendChild/
+querySelector(engine's own selector matcher). Scripts (inline + src=)
+run once at load, then collect->cascade->layout. Milestone met: a
+`<script>` page mutates the DOM on screen. NOT yet (phase 10): event
+loop, listeners, timers, fetch — the runtime is per-load.
 Writing a JS engine is folly; **port an embeddable one**. Best fit for a
 freestanding, no-JIT, small-footprint target:
 - **QuickJS** (Bellard) — ES2020, small, clean C, no OS deps beyond

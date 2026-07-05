@@ -238,3 +238,19 @@ size_t strftime(char *s, size_t maxsize, const char *fmt,
     *p = '\0';
     return (size_t)(p - s);
 }
+
+/* ---- gettimeofday (M-JS: QuickJS Date.now / seeding) --------------- */
+
+#include <sys/time.h>
+
+int gettimeofday(struct timeval *tv, struct timezone *tz)
+{
+    (void)tz;
+    if (tv) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        tv->tv_sec  = ts.tv_sec;
+        tv->tv_usec = ts.tv_nsec / 1000;
+    }
+    return 0;
+}

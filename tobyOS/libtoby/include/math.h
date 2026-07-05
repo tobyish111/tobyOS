@@ -72,6 +72,22 @@ double ldexp(double x, int exp);
 double modf(double x, double *iptr);
 double copysign(double x, double y);
 
+/* M-JS additions (QuickJS Math object) */
+double fmin(double a, double b);
+double fmax(double a, double b);
+double hypot(double x, double y);
+double sinh(double x);
+double cosh(double x);
+double tanh(double x);
+double asinh(double x);
+double acosh(double x);
+double atanh(double x);
+double expm1(double x);
+double log1p(double x);
+double rint(double x);
+double nearbyint(double x);
+long   lrint(double x);
+
 float  sinf(float x);
 float  cosf(float x);
 float  sqrtf(float x);
