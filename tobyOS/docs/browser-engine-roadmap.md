@@ -49,6 +49,13 @@ and the networking/tabs/omnibox shell (those stay).
 ## PHASED ROADMAP (each phase is its own feature branch off `main`)
 
 ### Phase 7 — CSS engine (NO JavaScript). Biggest visual win.
+**STATUS: v1 LANDED with Phase 8 on branch `browser-dom-css`** (see
+`browser-stage7-dom-css.md`): tokenizer/parser for `<style>`/`style=`/
+fetched `<link>` sheets, type/class/id/attr/descendant/child selectors,
+cascade+specificity+inheritance, box model (margin/border/padding/
+width/max-width/margin-auto), colors/backgrounds/fonts/text-align/
+line-height, `@media`, block+inline flow. NOT yet: floats, position,
+real flexbox/grid (degrade to block), table columns.
 Static sites look "plain" today because we ignore CSS. A CSS engine is
 the highest-leverage no-JS step and makes content sites (news, blogs,
 docs, Wikipedia) actually look designed. Scope, in order:
@@ -69,6 +76,12 @@ Milestone: a real news article or Wikipedia page renders with its actual
 column/sidebar layout, fonts, and colors — recognizably itself.
 
 ### Phase 8 — DOM tree (the pivot). Prerequisite for all dynamic behavior.
+**STATUS: v1 LANDED with Phase 7 on branch `browser-dom-css`**: real
+parent/child node tree (`struct dnode`, index-linked, per-tab heap
+engine), HTML5-subset tokenizer + tree constructor (void elements,
+implied end tags, raw-text elements), attribute pool, computed style
+per node; layout + paint + find + forms + images all hang off the tree.
+The flat span/block/run model is gone.
 Replace the flat span/block model with a retained node tree:
 `struct dom_node { type (element/text/comment); tag; attrs[]; children[];
 parent; computed_style; layout_box; }`. Rebuild the HTML parser to emit

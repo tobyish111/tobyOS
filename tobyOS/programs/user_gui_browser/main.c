@@ -248,88 +248,22 @@ static int g_content_h = WIN_H - TOOLBAR_H - STATUS_H;
 
 #define COL_HTTPS_FG     0x0081C995u
 
-/* Heading sentinel bytes: placed at start of heading lines during render,
- * detected during line-index build to tag styles, then removed for display */
-#define SENTINEL_H1  0x01
-#define SENTINEL_H2  0x02
-#define SENTINEL_H3  0x03
-
-/* ---- Content buffer & HTML renderer ---------------------------- */
+/* ---- Content buffer -------------------------------------------- */
 
 #define RAW_CAP       (96 * 1024)
 
 #define RENDER_CAP    (128 * 1024)
 
-/* ---- Layout-engine document model ------------------------------- *
- * Parse once into styled SPANS grouped into BLOCKS; lay out per
- * viewport width into positioned RUNS drawn with the kernel TTF
- * rasterizer. A resize re-runs layout() only; a fetch re-parses. */
-
-#define FL_BOLD   0x01
-#define FL_LINK   0x02
-#define FL_CODE   0x04           /* monospace (pre/code) */
-#define FL_BR     0x08           /* forced line break before this span */
-#define FL_DIM    0x10           /* de-emphasized ([img] placeholders) */
-
-/* Block types */
-#define BT_P      0
-#define BT_H1     1
-#define BT_H2     2
-#define BT_H3     3
-#define BT_LI     4
-#define BT_HR     5
-#define BT_PRE    6
-
-/* Font sizes (px) per role; code uses the fixed 8x16 mono font. */
+/* Body font size (px); code/pre use the fixed 8x16 mono font. */
 #define PX_BODY   15
-#define PX_H1     26
-#define PX_H2     21
-#define PX_H3     17
 #define MONO_W     8
 #define MONO_H    16
-
-struct span {                    /* style-consistent slice of g_render */
-    int32_t  off;
-    int32_t  len;
-    int16_t  link;               /* g_links index or -1 */
-    int16_t  field;              /* g_fields index or -1 (FL_INPUT/SUBMIT) */
-    int16_t  img;                /* g_images index or -1 */
-    uint8_t  px;
-    uint8_t  fl;
-};
-#define SPAN_MAX  16384
-
-struct blk {
-    int32_t  s0;                 /* first span */
-    int32_t  ns;
-    uint8_t  type;
-};
-#define BLK_MAX   4096
-
-struct run {                     /* positioned draw command (doc coords) */
-    int32_t  off;                /* text slice (unused for HR/bullet) */
-    int32_t  y;
-    int16_t  x, w, len;
-    int16_t  h;                  /* explicit height (images); 0 = derive */
-    int16_t  link;
-    int16_t  field;              /* g_fields index or -1 */
-    int16_t  img;                /* g_images index or -1 */
-    uint8_t  px;
-    uint8_t  fl;
-};
-#define RUN_MAX   16384
-
 
 /* ---- Forms (GET submission) -------------------------------------- */
 
 #define FT_TEXT    0
 #define FT_HIDDEN  1
 #define FT_SUBMIT  2
-
-#define FL_INPUT   0x80          /* span/run is a text-input box */
-/* FL_BULLET doubles as the submit-button flag on field runs (a field
- * run is never a list bullet, so the bit is unambiguous there). */
-#define FL_SUBMITB FL_BULLET
 
 struct form {
     int16_t  first, nf;          /* g_fields slice */
@@ -362,18 +296,198 @@ struct img {
 #define IMG_FETCH_CAP (1u << 20) /* per-image download cap (1 MiB) */
 #define IMG_MAX_DIM  1600        /* skip absurd decoded dimensions */
 
-/* Advance-width tables for the proportional faces we use, indexed by
- * (style, ch - 32). Filled lazily via SYS_GUI_TEXT_TTF_WIDTH one char
- * at a time (the kernel rasterizer is advance-based, so per-char sums
- * equal string widths); afterwards all wrapping math is userspace. */
-#define FACE_BODY   0            /* PX_BODY regular */
-#define FACE_BOLD   1            /* PX_BODY bold */
-#define FACE_H1     2            /* PX_H1 bold */
-#define FACE_H2     3            /* PX_H2 bold */
-#define FACE_H3     4            /* PX_H3 bold */
-#define NFACES      5
-static short g_adv[NFACES][95];
-static int   g_adv_ready = 0;
+/* Advance-width cache for the proportional TTF faces, keyed by
+ * (px, bold) since CSS font-size is continuous. Filled lazily one char
+ * at a time via tk_text_width (the kernel rasterizer is advance-based,
+ * so per-char sums equal string widths); afterwards all wrapping math
+ * is userspace. Round-robin eviction; a page uses a handful of sizes. */
+#define ADV_SLOTS 14
+struct advtab { short adv[95]; short px; short bold; short used; };
+static struct advtab g_advc[ADV_SLOTS];
+static int g_advc_rr = 0;
+
+/* =================================================================
+ *  ENGINE: DOM tree + CSSOM + computed styles + box layout
+ *
+ *  The retained-tree pipeline that replaces the flat span/block/run
+ *  model:  HTML -> DOM tree; CSS (<style>, style=, <link rel=
+ *  stylesheet>) -> rules; cascade -> computed style per node; layout
+ *  (block flow + inline formatting contexts) -> display-list items
+ *  painted with the kernel TTF/blit primitives. All storage lives in
+ *  one heap-allocated `struct eng` per tab; nodes link by index so
+ *  the tab-close struct-copy shift stays safe.
+ * ================================================================= */
+
+/* ---- Tag ids ----------------------------------------------------- */
+enum {
+    T_TEXT = 0, T_UNK,
+    T_HTML, T_HEAD, T_BODY, T_TITLE, T_STYLE, T_SCRIPT, T_LINKE, T_META,
+    T_NOSCRIPT, T_TEMPLATE,
+    T_DIV, T_P, T_H1, T_H2, T_H3, T_H4, T_H5, T_H6,
+    T_UL, T_OL, T_LI, T_DL, T_DT, T_DD,
+    T_TABLE, T_THEAD, T_TBODY, T_TFOOT, T_TR, T_TD, T_TH, T_CAPTION,
+    T_COL, T_COLGROUP,
+    T_PRE, T_BLOCKQUOTE, T_HR, T_BR,
+    T_A, T_SPAN, T_B, T_STRONG, T_I, T_EM, T_U, T_S, T_CODE, T_TT,
+    T_KBD, T_SAMP, T_VAR, T_MARK, T_SMALL, T_BIG, T_SUB, T_SUP, T_FONT,
+    T_CENTER, T_ABBR, T_CITE, T_Q, T_LABEL, T_TIME,
+    T_IMG, T_FORM, T_INPUT, T_BUTTON, T_SELECT, T_OPTION, T_TEXTAREA,
+    T_FIELDSET, T_LEGEND,
+    T_HEADER, T_FOOTER, T_NAV, T_MAIN, T_SECTION, T_ARTICLE, T_ASIDE,
+    T_FIGURE, T_FIGCAPTION, T_ADDRESS, T_DETAILS, T_SUMMARY,
+    T_IFRAME, T_OBJECT, T_EMBED, T_VIDEO, T_AUDIO, T_CANVAS, T_SVG,
+    T_AREA, T_BASE, T_SOURCE, T_TRACK, T_WBR, T_PARAM, T_MAPE, T_PICTURE,
+    T_NTAGS
+};
+
+/* ---- Computed style ---------------------------------------------- */
+
+#define D_INLINE    0
+#define D_BLOCK     1
+#define D_NONE      2
+#define D_LISTITEM  3
+#define D_INLBLOCK  4
+
+/* style flag bits */
+#define SF_BOLD     0x01
+#define SF_UNDER    0x02
+#define SF_MONO     0x04
+#define SF_PRE      0x08
+#define SF_WPCT     0x10         /* width is a percentage */
+#define SF_NOBULLET 0x20         /* list-style: none */
+
+#define M_AUTO  (-32768)         /* margin: auto sentinel */
+
+struct cstyle {
+    uint32_t color;
+    uint32_t bg;                 /* 0 alpha = transparent/none */
+    uint32_t border_col;
+    int32_t  width, height;      /* px (-1 auto; width may be % per SF_WPCT) */
+    int32_t  max_w;              /* px, -1 none */
+    int16_t  m[4], p[4];         /* margin/padding: T R B L */
+    uint8_t  bw[4];              /* border widths:  T R B L */
+    uint8_t  disp;               /* D_* */
+    uint8_t  px;                 /* font size */
+    uint8_t  fl;                 /* SF_* */
+    uint8_t  talign;             /* 0 left, 1 center, 2 right */
+    int16_t  line_h;             /* >0 px; <0 scale*-100; 0 auto */
+};
+
+/* ---- DOM ---------------------------------------------------------- */
+
+struct dnode {
+    int32_t parent, first, last, next;   /* tree links (node idx, -1) */
+    int32_t toff, tlen;          /* T_TEXT: tpool slice (decoded) */
+    int32_t attr0;               /* first attr in attr pool */
+    int16_t nattr;
+    int16_t tag;                 /* T_* */
+    int16_t link, field, img;    /* interaction indices or -1 */
+    int16_t _pad;
+    struct cstyle st;            /* computed by the style pass */
+};
+#define NODE_MAX  12288
+
+struct dattr {                   /* name/value slices in tpool */
+    int32_t noff, voff, vlen;
+    int16_t nlen;
+    int16_t _pad;
+};
+#define ATTR_MAX  12288
+#define TPOOL_CAP (224 * 1024)
+
+/* ---- CSSOM -------------------------------------------------------- */
+
+struct cpart {                   /* one compound selector part */
+    int16_t tag;                 /* T_* or -1 = any */
+    uint8_t comb;                /* combinator to the LEFT: 0 none/first,
+                                    1 descendant, 2 child */
+    uint8_t nclass;
+    uint8_t pseudo_link;         /* :link / :visited present */
+    uint8_t has_attr;
+    int32_t id_off;   int16_t id_len;
+    int32_t cls_off[2]; int16_t cls_len[2];
+    int32_t an_off;   int16_t an_len;    /* [name] / [name=value] */
+    int32_t av_off;   int16_t av_len;    /* 0 len = presence test */
+};
+#define PART_MAX  6144
+
+struct cdecl {
+    uint8_t prop;                /* CP_* */
+    uint8_t imp;                 /* !important */
+    int16_t vlen;
+    int32_t voff;                /* raw value text in csspool */
+};
+#define DECL_MAX  8192
+
+struct crule {
+    int32_t part0; int16_t nparts;
+    int16_t origin;              /* 0 UA, 1 author */
+    int32_t decl0; int16_t ndecl;
+    uint16_t spec;               /* specificity: 100*id + 10*(cls/attr) + type */
+    int32_t order;               /* source order for cascade ties */
+};
+#define RULE_MAX    2048
+#define CSSPOOL_CAP (96 * 1024)
+
+/* property ids */
+enum {
+    CP_DISPLAY, CP_COLOR, CP_BGCOLOR, CP_BG,
+    CP_FONT_SIZE, CP_FONT_WEIGHT, CP_FONT_FAMILY, CP_FONT_STYLE, CP_FONT,
+    CP_TALIGN, CP_TDECOR, CP_LINEH, CP_WSPACE,
+    CP_LSTYLE, CP_LSTYLE_TYPE,
+    CP_MARGIN, CP_MT, CP_MR, CP_MB, CP_ML,
+    CP_PADDING, CP_PT, CP_PR, CP_PB, CP_PL,
+    CP_BORDER, CP_BTOP, CP_BRIGHT, CP_BBOTTOM, CP_BLEFT,
+    CP_BWIDTH, CP_BCOLOR,
+    CP_WIDTH, CP_HEIGHT, CP_MAXW, CP_VISIBILITY,
+    CP__N
+};
+
+/* ---- Display list -------------------------------------------------- */
+
+#define DI_RECT   1              /* backgrounds, borders, hr */
+#define DI_TEXT   2
+#define DI_IMG    3
+#define DI_FIELD  4
+#define DI_BULLET 5
+
+/* item flag bits */
+#define IF_BOLD    0x01
+#define IF_UNDER   0x02
+#define IF_MONO    0x04
+#define IF_INPUT   0x08          /* field: text input box */
+#define IF_SUBMITB 0x10          /* field: submit button */
+
+struct ditem {
+    int32_t x, y, w, h;          /* doc coords */
+    uint32_t fg, bg;             /* text fg / rect color; text bg (0=none) */
+    int32_t off;                 /* render-pool slice (DI_TEXT) */
+    int16_t len;
+    int16_t link, field, img;    /* interaction indices or -1 */
+    uint8_t kind, px, fl, _pad2;
+};
+#define ITEM_MAX  20480
+
+/* ---- The per-tab engine (heap-allocated, ~2.8 MiB) ----------------- */
+
+struct eng {
+    /* DOM */
+    struct dnode nodes[NODE_MAX];   int nnodes;
+    struct dattr attrs[ATTR_MAX];   int nattrs;
+    char   tpool[TPOOL_CAP];        int tpool_len;
+    int    body;                    /* <body> node idx or -1 */
+    /* CSSOM (UA rules first, then author) */
+    struct cpart parts[PART_MAX];   int nparts;
+    struct cdecl decls[DECL_MAX];   int ndecls;
+    struct crule rules[RULE_MAX];   int nrules;
+    char   csspool[CSSPOOL_CAP];    int csspool_len;
+    int    css_order;               /* running decl-order counter */
+    int    nsheets;                 /* fetched <link> sheets so far */
+    /* display list + collapsed visible text (find-in-page) */
+    struct ditem items[ITEM_MAX];   int nitems;
+    char   render[RENDER_CAP + 1];  int render_len;
+    uint32_t page_bg;               /* body/html background */
+};
 
 #define LINK_MAX       128
 #define LINK_URL_MAX   256
@@ -410,10 +524,7 @@ static char g_status_text[128];
  * tables, the status bar and parser scratch stay app-global (below). */
 struct tab {
     char   raw[RAW_CAP + 1];   long raw_len;
-    char   render[RENDER_CAP + 1]; long render_len;
-    struct span spans[SPAN_MAX];   int nspans;
-    struct blk  blks[BLK_MAX];      int nblks;
-    struct run  runs[RUN_MAX];      int nruns;
+    struct eng *eng;           /* DOM/CSS/layout engine (heap, ~2.8 MiB) */
     struct form forms[FORM_MAX];    int nforms;
     struct field fields[FIELD_MAX]; int nfields; int focus_field;
     struct img  images[IMG_MAX];    int nimages;
@@ -432,17 +543,14 @@ static struct tab g_tabs[TAB_MAX];
 static int g_ntabs  = 0;
 static int g_active = 0;
 #define cur (&g_tabs[g_active])
+#define E   (cur->eng)
 
 #define g_raw         (cur->raw)
 #define g_raw_len     (cur->raw_len)
-#define g_render      (cur->render)
-#define g_render_len  (cur->render_len)
-#define g_spans       (cur->spans)
-#define g_nspans      (cur->nspans)
-#define g_blks        (cur->blks)
-#define g_nblks       (cur->nblks)
-#define g_runs        (cur->runs)
-#define g_nruns       (cur->nruns)
+#define g_render      (E->render)
+#define g_render_len  (E->render_len)
+#define g_items       (E->items)
+#define g_nitems      (E->nitems)
 #define g_forms       (cur->forms)
 #define g_nforms      (cur->nforms)
 #define g_fields      (cur->fields)
@@ -471,27 +579,15 @@ static int g_active = 0;
 #define g_view_mode   (cur->view_mode)
 #define g_last_status (cur->last_status)
 
-/* ---- HTML Parser/Renderer -------------------------------------- */
+/* ---- Parsing helpers -------------------------------------------- */
 
 static int is_whitespace(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
-static int tag_match(const char *src, const char *tag) {
-    while (*tag) {
-        char cs = *src, ct = *tag;
-        if (cs >= 'A' && cs <= 'Z') cs += 32;
-        if (ct >= 'A' && ct <= 'Z') ct += 32;
-        if (cs != ct) return 0;
-        src++; tag++;
-    }
-    return (*src == '>' || *src == ' ' || *src == '/' || *src == '\0');
-}
+static int lc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
-/* emit_char / emit_str are defined with the layout engine below (they
- * append normalized text AND maintain the styled span stream). */
-static void emit_char(char c);
-static void emit_str(const char *s);
+static int is_alpha(char c) { c = (char)lc(c); return c >= 'a' && c <= 'z'; }
 
 /* Entity matching helper: returns 1 if src[pos..] starts with `name;` */
 static int entity_match(const char *src, long pos, long len, const char *name) {
@@ -512,213 +608,1575 @@ static int hex_digit(char c) {
     return -1;
 }
 
-/* Decode HTML entity at src[i] (which is '&'). Returns chars consumed after '&',
- * writes decoded char to *out. Returns 0 if not recognized. */
-static int decode_entity(const char *src, long i, long len, char *out) {
-    long start = i + 1;
+/* ---- Text measurement (dynamic advance cache) --------------------- */
 
-    if (start >= len) return 0;
-
-    /* Numeric: &#NNN; or &#xHH; */
-    if (src[start] == '#') {
-        long p = start + 1;
-        int val = 0;
-        if (p < len && (src[p] == 'x' || src[p] == 'X')) {
-            p++;
-            int digits = 0;
-            while (p < len && hex_digit(src[p]) >= 0 && digits < 6) {
-                val = val * 16 + hex_digit(src[p]);
-                p++; digits++;
-            }
-            if (digits == 0) return 0;
-        } else {
-            int digits = 0;
-            while (p < len && src[p] >= '0' && src[p] <= '9' && digits < 7) {
-                val = val * 10 + (src[p] - '0');
-                p++; digits++;
-            }
-            if (digits == 0) return 0;
-        }
-        if (p < len && src[p] == ';') {
-            if (val > 0 && val < 127) *out = (char)val;
-            else *out = '?';
-            return (int)(p - i);
-        }
-        return 0;
-    }
-
-    /* Named entities */
-    if (entity_match(src, start, len, "lt"))    { *out = '<'; return 3; }
-    if (entity_match(src, start, len, "gt"))    { *out = '>'; return 3; }
-    if (entity_match(src, start, len, "amp"))   { *out = '&'; return 4; }
-    if (entity_match(src, start, len, "nbsp"))  { *out = ' '; return 5; }
-    if (entity_match(src, start, len, "quot"))  { *out = '"'; return 5; }
-    if (entity_match(src, start, len, "apos"))  { *out = '\''; return 5; }
-
-    /* Multi-char entities: emit string directly */
-    if (entity_match(src, start, len, "mdash"))  { *out = '-'; return 6; }
-    if (entity_match(src, start, len, "ndash"))  { *out = '-'; return 6; }
-    if (entity_match(src, start, len, "copy"))   { *out = 0; return 5; }
-    if (entity_match(src, start, len, "reg"))    { *out = 0; return 4; }
-    if (entity_match(src, start, len, "hellip")) { *out = 0; return 7; }
-    if (entity_match(src, start, len, "laquo"))  { *out = 0; return 6; }
-    if (entity_match(src, start, len, "raquo"))  { *out = 0; return 6; }
-
-    return 0;
-}
-
-/* ---- Measurement ------------------------------------------------- */
-
-#define FL_BULLET 0x20           /* run-only: list bullet marker */
-#define FL_HRULE  0x40           /* run-only: horizontal rule */
-
-static int face_for(uint8_t px, uint8_t fl) {
-    if (px == PX_H1) return FACE_H1;
-    if (px == PX_H2) return FACE_H2;
-    if (px == PX_H3) return FACE_H3;
-    return (fl & FL_BOLD) ? FACE_BOLD : FACE_BODY;
-}
-
-static void adv_init(void) {
-    static const uint8_t face_px[NFACES]   = { PX_BODY, PX_BODY, PX_H1, PX_H2, PX_H3 };
-    static const uint8_t face_bold[NFACES] = { 0, 1, 1, 1, 1 };
+static const short *adv_for(int px, int bold) {
+    if (px < 8) px = 8;
+    if (px > 40) px = 40;
+    bold = bold ? 1 : 0;
+    for (int i = 0; i < ADV_SLOTS; i++)
+        if (g_advc[i].used && g_advc[i].px == px && g_advc[i].bold == bold)
+            return g_advc[i].adv;
+    struct advtab *t = &g_advc[g_advc_rr];
+    g_advc_rr = (g_advc_rr + 1) % ADV_SLOTS;
     char one[2] = { 0, 0 };
-    for (int f = 0; f < NFACES; f++) {
-        for (int c = 0; c < 95; c++) {
-            one[0] = (char)(32 + c);
-            int w = tk_text_width(one, face_px[f], face_bold[f]);
-            g_adv[f][c] = (short)(w > 0 ? w : face_px[f] / 2);
-        }
+    for (int c = 0; c < 95; c++) {
+        one[0] = (char)(32 + c);
+        int w = tk_text_width(one, px, bold);
+        t->adv[c] = (short)(w > 0 ? w : px / 2);
     }
-    g_adv_ready = 1;
+    t->px = (short)px; t->bold = (short)bold; t->used = 1;
+    return t->adv;
 }
 
-/* Width of a g_render slice in the given style (advance-sum). */
-static int text_w(long off, int len, uint8_t px, uint8_t fl) {
-    if (fl & FL_CODE) return len * MONO_W;
-    const short *adv = g_adv[face_for(px, fl)];
+static int text_px_w(const char *s, int len, int px, int bold, int mono) {
+    if (mono) return len * MONO_W;
+    const short *adv = adv_for(px, bold);
     int w = 0;
     for (int i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)g_render[off + i];
+        unsigned char c = (unsigned char)s[i];
         w += adv[(c >= 32 && c <= 126) ? c - 32 : '?' - 32];
     }
     return w;
 }
 
-static int line_h_for(uint8_t px, uint8_t fl) {
-    if (fl & FL_CODE) return MONO_H + 2;
-    return px + px / 3;
+/* Resolve a computed line-height against the node's font. */
+static int st_line_h(const struct cstyle *st) {
+    if (st->fl & SF_MONO) return MONO_H + 2;
+    if (st->line_h > 0) return st->line_h;
+    if (st->line_h < 0) {
+        int lh = (-st->line_h * st->px) / 100;
+        return lh < st->px ? st->px : lh;
+    }
+    return st->px + st->px / 3;
 }
 
-/* ---- Parser emit API (styled spans grouped into blocks) ---------- */
+/* ---- Text pool: entity decoding + UTF-8 -> ASCII ------------------ */
 
-static uint8_t g_cur_px, g_cur_fl;
-static short   g_cur_link;
-static int     g_blk_openp;      /* a block is being filled */
-static int     g_pending_br;     /* <br>: mark next span FL_BR */
+static void tp_putc(char c) {
+    if (E->tpool_len < TPOOL_CAP - 1) E->tpool[E->tpool_len++] = c;
+}
+static void tp_puts(const char *s) { while (*s) tp_putc(*s++); }
 
-static void span_break(void) {   /* close the span under construction */
-    if (g_nspans > 0) {
-        struct span *s = &g_spans[g_nspans - 1];
-        if (s->len == 0 && !(s->fl & (FL_BR | FL_INPUT | FL_SUBMITB)) &&
-            s->field < 0 && s->img < 0)
-            g_nspans--;                                    /* drop empties */
+/* Transliterate a Unicode codepoint to ASCII into the tpool (the
+ * kernel TTF paint path is ASCII-only). */
+static void tp_put_cp(unsigned int cp) {
+    if (cp == 0xA0) { tp_putc(' '); return; }
+    if (cp == '\t') { tp_putc(' '); tp_putc(' '); return; }
+    if (cp < 0x20) { if (cp == '\n') tp_putc('\n'); return; }
+    if (cp < 0x7F) { tp_putc((char)cp); return; }
+    if (cp >= 0xC0 && cp <= 0xFF) {          /* Latin-1 letters */
+        static const char l1[65] =
+            "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPsaaaaaaaceeeeiiiidnooooo/ouuuuypy";
+        tp_putc(l1[cp - 0xC0]);
+        return;
+    }
+    switch (cp) {
+    case 0x2018: case 0x2019: case 0x201A: tp_putc('\''); return;
+    case 0x201C: case 0x201D: case 0x201E: tp_putc('"');  return;
+    case 0x2013: case 0x2014: case 0x2212: tp_putc('-');  return;
+    case 0x2026: tp_puts("...");  return;
+    case 0x2022: case 0xB7: tp_putc('*'); return;
+    case 0xA9:   tp_puts("(c)");  return;
+    case 0xAE:   tp_puts("(R)");  return;
+    case 0x2122: tp_puts("(TM)"); return;
+    case 0xD7:   tp_putc('x');  return;
+    case 0xAB:   tp_puts("<<"); return;
+    case 0xBB:   tp_puts(">>"); return;
+    case 0x2192: tp_puts("->"); return;
+    case 0x2190: tp_puts("<-"); return;
+    case 0x200B: case 0x200C: case 0x200D: case 0xFEFF: case 0xAD: return;
+    default:     tp_putc('?');  return;
     }
 }
 
-static void blk_close(void) {
-    if (!g_blk_openp) return;
-    span_break();
-    struct blk *b = &g_blks[g_nblks];
-    b->ns = g_nspans - b->s0;
-    if (b->ns > 0 || b->type == BT_HR) g_nblks++;
-    g_blk_openp = 0;
+/* Decode the HTML entity at src[i]=='&'. Returns total chars consumed
+ * (including the '&') and sets *cp, or 0 if unrecognized. */
+static int entity_cp(const char *src, long i, long len, unsigned int *cp) {
+    long start = i + 1;
+    if (start >= len) return 0;
+    if (src[start] == '#') {
+        long p = start + 1;
+        unsigned int val = 0;
+        int digits = 0;
+        if (p < len && (src[p] == 'x' || src[p] == 'X')) {
+            p++;
+            while (p < len && hex_digit(src[p]) >= 0 && digits < 6) {
+                val = val * 16 + (unsigned)hex_digit(src[p]);
+                p++; digits++;
+            }
+        } else {
+            while (p < len && src[p] >= '0' && src[p] <= '9' && digits < 7) {
+                val = val * 10 + (unsigned)(src[p] - '0');
+                p++; digits++;
+            }
+        }
+        if (!digits || p >= len || src[p] != ';') return 0;
+        *cp = val;
+        return (int)(p - i + 1);
+    }
+    {
+        static const struct { const char *n; unsigned short c; } ents[] = {
+            {"lt",'<'},{"gt",'>'},{"amp",'&'},{"quot",'"'},{"apos",'\''},
+            {"nbsp",0xA0},{"copy",0xA9},{"reg",0xAE},{"trade",0x2122},
+            {"mdash",0x2014},{"ndash",0x2013},{"hellip",0x2026},
+            {"laquo",0xAB},{"raquo",0xBB},{"lsquo",0x2018},{"rsquo",0x2019},
+            {"ldquo",0x201C},{"rdquo",0x201D},{"bull",0x2022},
+            {"middot",0xB7},{"times",0xD7},{"shy",0xAD},
+        };
+        for (unsigned k = 0; k < sizeof(ents) / sizeof(ents[0]); k++)
+            if (entity_match(src, start, len, ents[k].n)) {
+                *cp = ents[k].c;
+                return (int)str_len(ents[k].n) + 2;
+            }
+    }
+    return 0;
 }
 
-static void blk_open(uint8_t type) {
-    blk_close();
-    if (g_nblks >= BLK_MAX) return;
-    g_blks[g_nblks].s0 = g_nspans;
-    g_blks[g_nblks].ns = 0;
-    g_blks[g_nblks].type = type;
-    g_blk_openp = 1;
-    g_pending_br = 0;
-    switch (type) {
-    case BT_H1: g_cur_px = PX_H1; break;
-    case BT_H2: g_cur_px = PX_H2; break;
-    case BT_H3: g_cur_px = PX_H3; break;
-    default:    g_cur_px = PX_BODY; break;
+/* Append raw HTML text [s, s+n) to the tpool: decodes entities,
+ * transliterates UTF-8, drops CR. Returns bytes appended. */
+static int tp_put_html(const char *s, long n) {
+    int start = E->tpool_len;
+    for (long i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\r') continue;
+        if (c == '&') {
+            unsigned int cp;
+            int adv = entity_cp(s, i, n, &cp);
+            if (adv > 0) { tp_put_cp(cp); i += adv - 1; continue; }
+            tp_putc('&');
+            continue;
+        }
+        if (c < 0x80) { tp_put_cp(c); continue; }
+        /* UTF-8 sequence -> codepoint */
+        unsigned int cp = 0;
+        int extra = 0;
+        if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; extra = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
+        else continue;                    /* stray continuation byte */
+        if (i + extra >= n) break;
+        int ok = 1;
+        for (int k = 1; k <= extra; k++) {
+            unsigned char cc = (unsigned char)s[i + k];
+            if ((cc & 0xC0) != 0x80) { ok = 0; break; }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (ok) { tp_put_cp(cp); i += extra; }
+    }
+    return E->tpool_len - start;
+}
+
+/* ---- Tag table ---------------------------------------------------- */
+
+static const char * const g_tag_names[T_NTAGS] = {
+    "#text","#unk",
+    "html","head","body","title","style","script","link","meta",
+    "noscript","template",
+    "div","p","h1","h2","h3","h4","h5","h6",
+    "ul","ol","li","dl","dt","dd",
+    "table","thead","tbody","tfoot","tr","td","th","caption",
+    "col","colgroup",
+    "pre","blockquote","hr","br",
+    "a","span","b","strong","i","em","u","s","code","tt",
+    "kbd","samp","var","mark","small","big","sub","sup","font",
+    "center","abbr","cite","q","label","time",
+    "img","form","input","button","select","option","textarea",
+    "fieldset","legend",
+    "header","footer","nav","main","section","article","aside",
+    "figure","figcaption","address","details","summary",
+    "iframe","object","embed","video","audio","canvas","svg",
+    "area","base","source","track","wbr","param","map","picture",
+};
+
+static int tag_lookup(const char *s, int len) {
+    if (len <= 0 || len > 12) return T_UNK;
+    for (int t = T_HTML; t < T_NTAGS; t++) {
+        const char *n = g_tag_names[t];
+        int i = 0;
+        while (i < len && n[i] && lc(s[i]) == n[i]) i++;
+        if (i == len && !n[i]) return t;
+    }
+    return T_UNK;
+}
+
+static int tag_is_void(int t) {
+    return t == T_BR || t == T_HR || t == T_IMG || t == T_INPUT ||
+           t == T_LINKE || t == T_META || t == T_AREA || t == T_BASE ||
+           t == T_COL || t == T_EMBED || t == T_SOURCE || t == T_TRACK ||
+           t == T_WBR || t == T_PARAM;
+}
+
+/* HTML5-ish implied end tags: opening `nt` auto-closes an open `ot`. */
+static int tag_autocloses(int ot, int nt) {
+    if (ot == T_P) {
+        switch (nt) {
+        case T_DIV: case T_P: case T_H1: case T_H2: case T_H3: case T_H4:
+        case T_H5: case T_H6: case T_UL: case T_OL: case T_LI: case T_DL:
+        case T_DT: case T_DD: case T_TABLE: case T_PRE: case T_BLOCKQUOTE:
+        case T_HR: case T_FORM: case T_HEADER: case T_FOOTER: case T_NAV:
+        case T_MAIN: case T_SECTION: case T_ARTICLE: case T_ASIDE:
+        case T_FIGURE: case T_FIGCAPTION: case T_ADDRESS: case T_FIELDSET:
+        case T_DETAILS:
+            return 1;
+        }
+        return 0;
+    }
+    if (ot == T_LI && nt == T_LI) return 1;
+    if ((ot == T_DT || ot == T_DD) && (nt == T_DT || nt == T_DD)) return 1;
+    if ((ot == T_TD || ot == T_TH) &&
+        (nt == T_TD || nt == T_TH || nt == T_TR)) return 1;
+    if (ot == T_TR && nt == T_TR) return 1;
+    if (ot == T_OPTION && nt == T_OPTION) return 1;
+    return 0;
+}
+
+/* ---- DOM construction ---------------------------------------------- */
+
+static int dom_new(int tag, int parent) {
+    if (E->nnodes >= NODE_MAX) return -1;
+    int ni = E->nnodes++;
+    struct dnode *n = &E->nodes[ni];
+    mem_zero(n, sizeof(*n));
+    n->parent = parent;
+    n->first = n->last = n->next = -1;
+    n->tag = (int16_t)tag;
+    n->link = n->field = n->img = -1;
+    if (parent >= 0) {
+        struct dnode *p = &E->nodes[parent];
+        if (p->last >= 0) E->nodes[p->last].next = ni;
+        else p->first = ni;
+        p->last = ni;
+    }
+    return ni;
+}
+
+/* Attribute lookup: value slice in tpool, or NULL. */
+static const char *node_attr(const struct dnode *n, const char *name, int *out_len) {
+    int nlen = (int)str_len(name);
+    for (int i = 0; i < n->nattr; i++) {
+        const struct dattr *a = &E->attrs[n->attr0 + i];
+        if (a->nlen != nlen) continue;
+        int k = 0;
+        while (k < nlen && lc(E->tpool[a->noff + k]) == lc(name[k])) k++;
+        if (k == nlen) {
+            if (out_len) *out_len = a->vlen;
+            return &E->tpool[a->voff];
+        }
+    }
+    if (out_len) *out_len = 0;
+    return NULL;
+}
+
+static int node_attr_str(const struct dnode *n, const char *name, char *out, int cap) {
+    int vlen;
+    const char *v = node_attr(n, name, &vlen);
+    if (!v) { out[0] = 0; return 0; }
+    int o = 0;
+    while (o < vlen && o < cap - 1) { out[o] = v[o]; o++; }
+    out[o] = 0;
+    return 1;
+}
+
+/* Parse the attributes of a start tag (cursor just past the name);
+ * returns the index one past '>'. Names lowercased, values entity-
+ * decoded, both stored in the tpool. */
+static long parse_attrs(const char *s, long i, long n,
+                        int *attr0, int *nattr, int *selfclose) {
+    *attr0 = E->nattrs;
+    *nattr = 0;
+    *selfclose = 0;
+    while (i < n && s[i] != '>') {
+        if (is_whitespace(s[i])) { i++; continue; }
+        if (s[i] == '/') { *selfclose = 1; i++; continue; }
+        long k0 = i;
+        while (i < n && !is_whitespace(s[i]) && s[i] != '=' && s[i] != '>' && s[i] != '/')
+            i++;
+        long klen = i - k0;
+        while (i < n && is_whitespace(s[i])) i++;
+        int noff = E->tpool_len;
+        for (long k = 0; k < klen && k < 48; k++) tp_putc((char)lc(s[k0 + k]));
+        int nlen = E->tpool_len - noff;
+        int voff = E->tpool_len, vlen = 0;
+        if (i < n && s[i] == '=') {
+            i++;
+            while (i < n && is_whitespace(s[i])) i++;
+            char q = 0;
+            if (i < n && (s[i] == '"' || s[i] == '\'')) { q = s[i]; i++; }
+            long v0 = i;
+            while (i < n && (q ? s[i] != q
+                               : (!is_whitespace(s[i]) && s[i] != '>')))
+                i++;
+            vlen = tp_put_html(s + v0, i - v0);
+            if (q && i < n && s[i] == q) i++;
+        }
+        if (klen > 0 && nlen > 0 && E->nattrs < ATTR_MAX) {
+            struct dattr *a = &E->attrs[E->nattrs++];
+            a->noff = noff; a->nlen = (int16_t)nlen;
+            a->voff = voff; a->vlen = vlen;
+            (*nattr)++;
+        }
+    }
+    if (i < n) i++;                       /* consume '>' */
+    return i;
+}
+
+#define DOM_STACK_MAX 96
+
+/* g_raw -> DOM tree in E (tokenizer + tree constructor). */
+static void dom_build(void) {
+    int root = dom_new(T_UNK, -1);        /* document node */
+    int stack[DOM_STACK_MAX];
+    int sp = 0;
+    stack[0] = root;
+    const char *s = g_raw;
+    long n = g_raw_len;
+    long i = 0;
+    while (i < n && E->nnodes < NODE_MAX - 2) {
+        if (s[i] == '<' && i + 1 < n &&
+            (is_alpha(s[i + 1]) || s[i + 1] == '/' || s[i + 1] == '!' || s[i + 1] == '?')) {
+            if (i + 3 < n && s[i + 1] == '!' && s[i + 2] == '-' && s[i + 3] == '-') {
+                i += 4;                   /* comment */
+                while (i + 2 < n && !(s[i] == '-' && s[i + 1] == '-' && s[i + 2] == '>'))
+                    i++;
+                i = (i + 3 <= n) ? i + 3 : n;
+                continue;
+            }
+            if (s[i + 1] == '!' || s[i + 1] == '?') {   /* doctype / PI */
+                while (i < n && s[i] != '>') i++;
+                if (i < n) i++;
+                continue;
+            }
+            if (s[i + 1] == '/') {        /* end tag */
+                long k0 = i + 2, k = k0;
+                while (k < n && s[k] != '>' && !is_whitespace(s[k])) k++;
+                int t = tag_lookup(s + k0, (int)(k - k0));
+                while (k < n && s[k] != '>') k++;
+                i = (k < n) ? k + 1 : n;
+                for (int d = sp; d >= 1; d--)
+                    if (E->nodes[stack[d]].tag == t) { sp = d - 1; break; }
+                continue;
+            }
+            /* start tag */
+            long k0 = i + 1, k = k0;
+            while (k < n && !is_whitespace(s[k]) && s[k] != '>' && s[k] != '/')
+                k++;
+            int t = tag_lookup(s + k0, (int)(k - k0));
+            int attr0, nattr, selfclose;
+            i = parse_attrs(s, k, n, &attr0, &nattr, &selfclose);
+            while (sp > 0 && tag_autocloses(E->nodes[stack[sp]].tag, t))
+                sp--;
+            if (t == T_HTML || t == T_HEAD || t == T_BODY) {
+                int seen = 0;
+                for (int q = 1; q < E->nnodes; q++)
+                    if (E->nodes[q].tag == t) { seen = 1; break; }
+                if (seen) continue;       /* one each; re-opens ignored */
+            }
+            int ni = dom_new(t, stack[sp]);
+            if (ni < 0) break;
+            E->nodes[ni].attr0 = attr0;
+            E->nodes[ni].nattr = (int16_t)nattr;
+            if (t == T_BODY && E->body < 0) E->body = ni;
+            if (t == T_SCRIPT || t == T_STYLE || t == T_TITLE || t == T_TEXTAREA) {
+                /* raw-text element: capture verbatim to the end tag */
+                const char *close = g_tag_names[t];
+                int clen = (int)str_len(close);
+                long j = i;
+                while (j < n) {
+                    if (s[j] == '<' && j + 1 < n && s[j + 1] == '/' &&
+                        j + 2 + clen <= n &&
+                        str_ncasecmp(s + j + 2, close, clen) == 0)
+                        break;
+                    j++;
+                }
+                if (t != T_SCRIPT && j > i) {
+                    int toff = E->tpool_len, tl;
+                    if (t == T_STYLE) {   /* CSS: no entity decoding */
+                        for (long q2 = i; q2 < j && E->tpool_len < TPOOL_CAP - 1; q2++)
+                            if (s[q2] != '\r') tp_putc(s[q2]);
+                        tl = E->tpool_len - toff;
+                    } else {
+                        tl = tp_put_html(s + i, j - i);
+                    }
+                    if (tl > 0) {
+                        int tn = dom_new(T_TEXT, ni);
+                        if (tn >= 0) {
+                            E->nodes[tn].toff = toff;
+                            E->nodes[tn].tlen = tl;
+                        }
+                    }
+                }
+                while (j < n && s[j] != '>') j++;
+                i = (j < n) ? j + 1 : n;
+                continue;
+            }
+            if (!tag_is_void(t) && !selfclose && sp < DOM_STACK_MAX - 1)
+                stack[++sp] = ni;
+            continue;
+        }
+        /* text run up to the next real tag opener */
+        long t0 = i;
+        while (i < n) {
+            if (s[i] == '<' && i + 1 < n &&
+                (is_alpha(s[i + 1]) || s[i + 1] == '/' || s[i + 1] == '!' || s[i + 1] == '?'))
+                break;
+            i++;
+        }
+        int toff = E->tpool_len;
+        int tl = tp_put_html(s + t0, i - t0);
+        if (tl > 0) {
+            int parent = stack[sp];
+            struct dnode *p = &E->nodes[parent];
+            if (p->last >= 0 && E->nodes[p->last].tag == T_TEXT &&
+                E->nodes[p->last].toff + E->nodes[p->last].tlen == toff) {
+                E->nodes[p->last].tlen += tl;   /* coalesce */
+            } else {
+                int tn = dom_new(T_TEXT, parent);
+                if (tn >= 0) {
+                    E->nodes[tn].toff = toff;
+                    E->nodes[tn].tlen = tl;
+                }
+            }
+        }
     }
 }
 
-/* Append one normalized character in the current style. Opens spans /
- * blocks as needed; splits the span when the style changed. */
-static void emit_char(char c) {
-    if (g_render_len >= RENDER_CAP) return;
-    if (!g_blk_openp) blk_open(BT_P);
-    uint8_t fl = g_cur_fl | (g_pending_br ? FL_BR : 0);
-    struct span *s = (g_nspans > 0) ? &g_spans[g_nspans - 1] : NULL;
-    int fresh = (!s || g_nspans <= g_blks[g_nblks].s0 ||
-                 s->off + s->len != g_render_len ||
-                 s->px != g_cur_px || s->fl != fl || s->link != g_cur_link ||
-                 s->field >= 0 || s->img >= 0);
-    if (fresh) {
-        if (g_nspans >= SPAN_MAX) return;
-        s = &g_spans[g_nspans++];
-        s->off = (int32_t)g_render_len;
-        s->len = 0;
-        s->px = g_cur_px;
-        s->fl = fl;
-        s->link = g_cur_link;
-        s->field = -1;
-        s->img = -1;
+/* =================== CSS parser =================== */
+
+static int cssp_putc(char c) {
+    if (E->csspool_len < CSSPOOL_CAP - 1) {
+        E->csspool[E->csspool_len++] = c;
+        return 1;
     }
-    g_pending_br = 0;
-    g_render[g_render_len++] = c;
-    s->len++;
+    return 0;
 }
 
-static void emit_str(const char *str) {
-    while (*str) emit_char(*str++);
+struct ccur { const char *s; long i, n; };
+
+static void css_ws(struct ccur *c) {
+    for (;;) {
+        while (c->i < c->n && is_whitespace(c->s[c->i])) c->i++;
+        if (c->i + 1 < c->n && c->s[c->i] == '/' && c->s[c->i + 1] == '*') {
+            c->i += 2;
+            while (c->i + 1 < c->n && !(c->s[c->i] == '*' && c->s[c->i + 1] == '/'))
+                c->i++;
+            c->i = (c->i + 2 <= c->n) ? c->i + 2 : c->n;
+            continue;
+        }
+        break;
+    }
 }
 
-/* Place a form control (text box / submit button) into the flow. */
-static void emit_field(short fi, uint8_t fl) {
-    if (!g_blk_openp) blk_open(BT_P);
-    span_break();
-    if (g_nspans >= SPAN_MAX) return;
-    struct span *s = &g_spans[g_nspans++];
-    s->off = (int32_t)g_render_len;
-    s->len = 0;
-    s->px = PX_BODY;
-    s->fl = fl | (g_pending_br ? FL_BR : 0);
-    s->link = -1;
-    s->field = fi;
-    s->img = -1;
-    g_pending_br = 0;
+/* Skip an unsupported at-rule: to ';' or over a balanced {...} block. */
+static void css_skip_block_or_semi(struct ccur *c) {
+    while (c->i < c->n) {
+        char ch = c->s[c->i];
+        if (ch == ';') { c->i++; return; }
+        if (ch == '{') {
+            int depth = 0;
+            while (c->i < c->n) {
+                if (c->s[c->i] == '{') depth++;
+                else if (c->s[c->i] == '}') {
+                    depth--;
+                    if (!depth) { c->i++; return; }
+                }
+                c->i++;
+            }
+            return;
+        }
+        c->i++;
+    }
 }
 
-/* Place an <img> into the flow (its own span carrying the image idx). */
-static void emit_image(short ii) {
-    if (!g_blk_openp) blk_open(BT_P);
-    span_break();
-    if (g_nspans >= SPAN_MAX) return;
-    struct span *s = &g_spans[g_nspans++];
-    s->off = (int32_t)g_render_len;
-    s->len = 0;
-    s->px = PX_BODY;
-    s->fl = (g_pending_br ? FL_BR : 0);
-    s->link = g_cur_link;        /* an <a><img></a> stays clickable */
-    s->field = -1;
-    s->img = ii;
-    g_pending_br = 0;
+/* Evaluate a media query list against the viewport ("screen and
+ * (min-width: 600px)", comma = OR). Unknown features fail their query. */
+static int media_matches(const char *s, int len) {
+    int allws = 1;
+    for (int k = 0; k < len; k++)
+        if (!is_whitespace(s[k])) { allws = 0; break; }
+    if (allws) return 1;
+    int i = 0;
+    while (i < len) {
+        int ok = 1, neg = 0;
+        while (i < len && s[i] != ',') {
+            if (is_whitespace(s[i])) { i++; continue; }
+            if (s[i] == '(') {
+                int f0 = ++i;
+                while (i < len && s[i] != ':' && s[i] != ')') i++;
+                int flen = i - f0;
+                while (flen > 0 && is_whitespace(s[f0 + flen - 1])) flen--;
+                int vv0 = 0, vvn = 0;
+                if (i < len && s[i] == ':') {
+                    i++;
+                    while (i < len && is_whitespace(s[i])) i++;
+                    vv0 = i;
+                    while (i < len && s[i] != ')') i++;
+                    vvn = i - vv0;
+                }
+                if (i < len) i++;         /* ')' */
+                int px = 0;
+                for (int k = vv0; k < vv0 + vvn && s[k] >= '0' && s[k] <= '9'; k++)
+                    px = px * 10 + (s[k] - '0');
+                int val;
+                if (flen == 9 && str_ncasecmp(s + f0, "min-width", 9) == 0)
+                    val = g_win_w >= px;
+                else if (flen == 9 && str_ncasecmp(s + f0, "max-width", 9) == 0)
+                    val = g_win_w <= px;
+                else if (flen == 5 && str_ncasecmp(s + f0, "width", 5) == 0)
+                    val = g_win_w == px;
+                else if (flen == 11 && str_ncasecmp(s + f0, "orientation", 11) == 0)
+                    val = (vvn > 0 && lc(s[vv0]) == 'l') ? (g_win_w >= g_win_h)
+                                                         : (g_win_w < g_win_h);
+                else if (flen == 20 && str_ncasecmp(s + f0, "prefers-color-scheme", 20) == 0)
+                    val = vvn > 0 && lc(s[vv0]) == 'l';
+                else
+                    val = 0;
+                if (!val) ok = 0;
+                continue;
+            }
+            int w0 = i;
+            while (i < len && !is_whitespace(s[i]) && s[i] != ',' && s[i] != '(')
+                i++;
+            int wl = i - w0;
+            if (wl == 3 && str_ncasecmp(s + w0, "not", 3) == 0) neg = 1;
+            else if (wl == 4 && str_ncasecmp(s + w0, "only", 4) == 0) { }
+            else if (wl == 3 && str_ncasecmp(s + w0, "and", 3) == 0) { }
+            else if (wl == 6 && str_ncasecmp(s + w0, "screen", 6) == 0) { }
+            else if (wl == 3 && str_ncasecmp(s + w0, "all", 3) == 0) { }
+            else if (wl > 0) ok = 0;      /* print, speech, unknown */
+        }
+        if (neg) ok = !ok;
+        if (ok) return 1;
+        if (i < len && s[i] == ',') i++;
+    }
+    return 0;
 }
 
-/* ---- Layout: blocks + spans -> positioned runs ------------------- */
+/* CSS identifier -> lowercased copy in csspool. */
+static int css_ident(struct ccur *c, int *off, int *outlen) {
+    int o = E->csspool_len, l = 0;
+    while (c->i < c->n) {
+        char ch = c->s[c->i];
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
+            (unsigned char)ch >= 0x80) {
+            cssp_putc((char)lc(ch));
+            l++;
+            c->i++;
+        } else break;
+    }
+    *off = o;
+    *outlen = l;
+    return l > 0;
+}
 
-#define MARGIN_L   10
-#define MARGIN_R   16            /* leaves room for the scrollbar */
-#define LI_INDENT  20
+/* ---- Value tokens -------------------------------------------------- */
+
+struct vtok { const char *s; int len; };
+
+static int vtok_next(const char *v, int n, int *pos, struct vtok *t) {
+    int i = *pos;
+    while (i < n && (is_whitespace(v[i]) || v[i] == ',' || v[i] == '/')) i++;
+    if (i >= n) return 0;
+    int s0 = i, paren = 0;
+    while (i < n) {
+        char c = v[i];
+        if (paren) {
+            if (c == '(') paren++;
+            else if (c == ')') { paren--; i++; if (!paren) break; continue; }
+            i++;
+            continue;
+        }
+        if (c == '(') { paren = 1; i++; continue; }
+        if (is_whitespace(c) || c == ',' || c == '/') break;
+        i++;
+    }
+    t->s = v + s0;
+    t->len = i - s0;
+    *pos = i;
+    return 1;
+}
+
+static int tok_is(const struct vtok *t, const char *kw) {
+    int l = (int)str_len(kw);
+    if (t->len != l) return 0;
+    for (int i = 0; i < l; i++)
+        if (lc(t->s[i]) != lc(kw[i])) return 0;
+    return 1;
+}
+
+static int hexv(char c) { int d = hex_digit(c); return d < 0 ? 0 : d; }
+
+/* One color token -> ARGB. */
+static int css_color_tok(const char *s, int len, uint32_t *out) {
+    if (len >= 4 && s[0] == '#') {
+        if (len == 4) {
+            int r = hexv(s[1]), g = hexv(s[2]), b = hexv(s[3]);
+            *out = 0xFF000000u | (uint32_t)(r * 17) << 16 |
+                   (uint32_t)(g * 17) << 8 | (uint32_t)(b * 17);
+            return 1;
+        }
+        if (len == 7 || len == 9) {
+            uint32_t v = 0;
+            for (int i = 1; i < 7; i++) v = v * 16 + (uint32_t)hexv(s[i]);
+            uint32_t a = 255;
+            if (len == 9) a = (uint32_t)(hexv(s[7]) * 16 + hexv(s[8]));
+            *out = (a << 24) | v;
+            return 1;
+        }
+        return 0;
+    }
+    if (len > 4 && str_ncasecmp(s, "rgb", 3) == 0) {
+        int vals[4] = { 0, 0, 0, 255 };
+        int nv = 0, i = 0;
+        while (i < len && s[i] != '(') i++;
+        i++;
+        while (i < len && nv < 4) {
+            while (i < len && !((s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == '-'))
+                i++;
+            if (i >= len || s[i] == ')') break;
+            int v = 0, neg = 0;
+            if (s[i] == '-') { neg = 1; i++; }
+            while (i < len && s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; }
+            if (i < len && s[i] == '.') {
+                i++;
+                int f = 0, fd = 0;
+                while (i < len && s[i] >= '0' && s[i] <= '9') {
+                    if (fd < 2) { f = f * 10 + (s[i] - '0'); fd++; }
+                    i++;
+                }
+                if (nv == 3) v = v * 255 + (fd == 1 ? f * 255 / 10 : f * 255 / 100);
+            }
+            if (i < len && s[i] == '%') { v = v * 255 / 100; i++; }
+            if (neg) v = 0;
+            if (v > 255) v = 255;
+            vals[nv++] = v;
+        }
+        *out = ((uint32_t)vals[3] << 24) | ((uint32_t)vals[0] << 16) |
+               ((uint32_t)vals[1] << 8) | (uint32_t)vals[2];
+        return 1;
+    }
+    {
+        static const struct { const char *n; uint32_t c; } NC[] = {
+            {"black",0xFF000000},{"white",0xFFFFFFFF},{"red",0xFFFF0000},
+            {"green",0xFF008000},{"blue",0xFF0000FF},{"yellow",0xFFFFFF00},
+            {"orange",0xFFFFA500},{"purple",0xFF800080},{"gray",0xFF808080},
+            {"grey",0xFF808080},{"silver",0xFFC0C0C0},{"maroon",0xFF800000},
+            {"navy",0xFF000080},{"teal",0xFF008080},{"aqua",0xFF00FFFF},
+            {"cyan",0xFF00FFFF},{"fuchsia",0xFFFF00FF},{"magenta",0xFFFF00FF},
+            {"lime",0xFF00FF00},{"olive",0xFF808000},{"brown",0xFFA52A2A},
+            {"pink",0xFFFFC0CB},{"gold",0xFFFFD700},{"tan",0xFFD2B48C},
+            {"beige",0xFFF5F5DC},{"ivory",0xFFFFFFF0},{"snow",0xFFFFFAFA},
+            {"whitesmoke",0xFFF5F5F5},{"lightgray",0xFFD3D3D3},
+            {"lightgrey",0xFFD3D3D3},{"darkgray",0xFFA9A9A9},
+            {"darkgrey",0xFFA9A9A9},{"dimgray",0xFF696969},
+            {"lightblue",0xFFADD8E6},{"lightgreen",0xFF90EE90},
+            {"lightyellow",0xFFFFFFE0},{"darkred",0xFF8B0000},
+            {"darkblue",0xFF00008B},{"darkgreen",0xFF006400},
+            {"steelblue",0xFF4682B4},{"royalblue",0xFF4169E1},
+            {"slategray",0xFF708090},{"tomato",0xFFFF6347},
+            {"coral",0xFFFF7F50},{"salmon",0xFFFA8072},{"khaki",0xFFF0E68C},
+            {"indigo",0xFF4B0082},{"violet",0xFFEE82EE},{"plum",0xFFDDA0DD},
+            {"orchid",0xFFDA70D6},{"turquoise",0xFF40E0D0},
+            {"crimson",0xFFDC143C},{"chocolate",0xFFD2691E},
+            {"rebeccapurple",0xFF663399},{"transparent",0x00000000},
+        };
+        for (unsigned k = 0; k < sizeof(NC) / sizeof(NC[0]); k++) {
+            const char *n = NC[k].n;
+            int i = 0;
+            while (i < len && n[i] && lc(s[i]) == n[i]) i++;
+            if (i == len && !n[i]) { *out = NC[k].c; return 1; }
+        }
+    }
+    return 0;
+}
+
+/* Length token -> px. */
+#define LK_PX   0
+#define LK_PCT  1
+#define LK_AUTO 2
+#define LK_BAD  3
+
+static int css_len_tok(const char *s, int len, int own_px, int *out) {
+    if (len == 4 && str_ncasecmp(s, "auto", 4) == 0) return LK_AUTO;
+    int i = 0, neg = 0;
+    if (i < len && (s[i] == '-' || s[i] == '+')) { neg = (s[i] == '-'); i++; }
+    long whole = 0;
+    int digits = 0;
+    while (i < len && s[i] >= '0' && s[i] <= '9') {
+        whole = whole * 10 + (s[i] - '0');
+        i++; digits++;
+    }
+    long frac = 0, fdiv = 1;
+    if (i < len && s[i] == '.') {
+        i++;
+        while (i < len && s[i] >= '0' && s[i] <= '9') {
+            if (fdiv < 1000) { frac = frac * 10 + (s[i] - '0'); fdiv *= 10; }
+            i++; digits++;
+        }
+    }
+    if (!digits) return LK_BAD;
+    long v1000 = whole * 1000 + (fdiv > 1 ? frac * 1000 / fdiv : 0);
+    if (neg) v1000 = -v1000;
+    int px;
+    if (i >= len) px = (int)(v1000 / 1000);
+    else if (s[i] == '%') { *out = (int)(v1000 / 1000); return LK_PCT; }
+    else if (len - i == 2 && lc(s[i]) == 'p' && lc(s[i + 1]) == 'x')
+        px = (int)(v1000 / 1000);
+    else if (len - i == 2 && lc(s[i]) == 'e' && lc(s[i + 1]) == 'm')
+        px = (int)(v1000 * own_px / 1000);
+    else if (len - i == 3 && str_ncasecmp(s + i, "rem", 3) == 0)
+        px = (int)(v1000 * PX_BODY / 1000);
+    else if (len - i == 2 && lc(s[i]) == 'p' && lc(s[i + 1]) == 't')
+        px = (int)(v1000 * 4 / 3000);
+    else if (len - i == 2 && lc(s[i]) == 'c' && lc(s[i + 1]) == 'h')
+        px = (int)(v1000 * (own_px / 2) / 1000);
+    else if (len - i == 2 && lc(s[i]) == 'v' && lc(s[i + 1]) == 'w')
+        px = (int)(v1000 * g_win_w / 100000);
+    else if (len - i == 2 && lc(s[i]) == 'v' && lc(s[i + 1]) == 'h')
+        px = (int)(v1000 * g_win_h / 100000);
+    else return LK_BAD;
+    *out = px;
+    return LK_PX;
+}
+
+static int prop_lookup(const char *s, int len) {
+    static const struct { const char *n; uint8_t id; } P[] = {
+        {"display",CP_DISPLAY},{"color",CP_COLOR},
+        {"background-color",CP_BGCOLOR},{"background",CP_BG},
+        {"font-size",CP_FONT_SIZE},{"font-weight",CP_FONT_WEIGHT},
+        {"font-family",CP_FONT_FAMILY},{"font-style",CP_FONT_STYLE},
+        {"font",CP_FONT},
+        {"text-align",CP_TALIGN},{"text-decoration",CP_TDECOR},
+        {"text-decoration-line",CP_TDECOR},
+        {"line-height",CP_LINEH},{"white-space",CP_WSPACE},
+        {"list-style",CP_LSTYLE},{"list-style-type",CP_LSTYLE_TYPE},
+        {"margin",CP_MARGIN},{"margin-top",CP_MT},{"margin-right",CP_MR},
+        {"margin-bottom",CP_MB},{"margin-left",CP_ML},
+        {"padding",CP_PADDING},{"padding-top",CP_PT},{"padding-right",CP_PR},
+        {"padding-bottom",CP_PB},{"padding-left",CP_PL},
+        {"border",CP_BORDER},{"border-top",CP_BTOP},
+        {"border-right",CP_BRIGHT},{"border-bottom",CP_BBOTTOM},
+        {"border-left",CP_BLEFT},{"border-width",CP_BWIDTH},
+        {"border-color",CP_BCOLOR},
+        {"width",CP_WIDTH},{"height",CP_HEIGHT},{"max-width",CP_MAXW},
+        {"visibility",CP_VISIBILITY},
+    };
+    for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
+        const char *n = P[k].n;
+        int i = 0;
+        while (i < len && n[i] && s[i] == n[i]) i++;
+        if (i == len && !n[i]) return P[k].id;
+    }
+    return -1;
+}
+
+/* Parse declarations "a: b; c: d" until '}' (consumed) or EOF. */
+static void css_parse_decls(struct ccur *c) {
+    for (;;) {
+        css_ws(c);
+        if (c->i >= c->n) break;
+        if (c->s[c->i] == '}') { c->i++; break; }
+        if (c->s[c->i] == ';') { c->i++; continue; }
+        int po, pl;
+        if (!css_ident(c, &po, &pl)) {
+            while (c->i < c->n && c->s[c->i] != ';' && c->s[c->i] != '}') c->i++;
+            continue;
+        }
+        E->csspool_len = po;              /* name is transient */
+        int prop = prop_lookup(&E->csspool[po], pl);
+        css_ws(c);
+        if (c->i >= c->n || c->s[c->i] != ':') {
+            while (c->i < c->n && c->s[c->i] != ';' && c->s[c->i] != '}') c->i++;
+            continue;
+        }
+        c->i++;
+        css_ws(c);
+        int vo = E->csspool_len, vl = 0, paren = 0;
+        while (c->i < c->n) {
+            char ch2 = c->s[c->i];
+            if (!paren && (ch2 == ';' || ch2 == '}')) break;
+            if (ch2 == '(') paren++;
+            if (ch2 == ')' && paren) paren--;
+            if (ch2 == '/' && c->i + 1 < c->n && c->s[c->i + 1] == '*') {
+                c->i += 2;
+                while (c->i + 1 < c->n && !(c->s[c->i] == '*' && c->s[c->i + 1] == '/'))
+                    c->i++;
+                c->i = (c->i + 2 <= c->n) ? c->i + 2 : c->n;
+                continue;
+            }
+            if (cssp_putc(ch2)) vl++;
+            c->i++;
+        }
+        int imp = 0;
+        while (vl > 0 && is_whitespace(E->csspool[vo + vl - 1])) vl--;
+        for (int k = vl - 1; k >= 0; k--) {
+            if (E->csspool[vo + k] == '!') {
+                int q = k + 1;
+                while (q < vl && is_whitespace(E->csspool[vo + q])) q++;
+                if (vl - q == 9 &&
+                    str_ncasecmp(&E->csspool[vo + q], "important", 9) == 0) {
+                    imp = 1;
+                    vl = k;
+                    while (vl > 0 && is_whitespace(E->csspool[vo + vl - 1])) vl--;
+                }
+                break;
+            }
+        }
+        E->csspool_len = vo + vl;
+        if (prop >= 0 && vl > 0 && E->ndecls < DECL_MAX) {
+            struct cdecl *d = &E->decls[E->ndecls++];
+            d->prop = (uint8_t)prop;
+            d->imp = (uint8_t)imp;
+            d->voff = vo;
+            d->vlen = (int16_t)(vl > 32767 ? 32767 : vl);
+        }
+        if (c->i < c->n && c->s[c->i] == ';') c->i++;
+    }
+}
+
+/* One compound selector part. Returns 1 ok, 0 unsupported/invalid. */
+static int css_parse_part(struct ccur *c, struct cpart *p,
+                          int *spec_id, int *spec_cls, int *spec_type) {
+    p->tag = -1;
+    p->nclass = 0;
+    p->pseudo_link = 0;
+    p->has_attr = 0;
+    p->id_len = 0;
+    p->an_len = 0;
+    p->av_len = 0;
+    int got = 0;
+    for (;;) {
+        if (c->i >= c->n) break;
+        char ch = c->s[c->i];
+        if (ch == '*') { c->i++; got = 1; continue; }
+        if (ch == '.') {
+            c->i++;
+            int off, l;
+            if (!css_ident(c, &off, &l)) return 0;
+            if (p->nclass < 2) {
+                p->cls_off[p->nclass] = off;
+                p->cls_len[p->nclass] = (int16_t)l;
+                p->nclass++;
+            }
+            (*spec_cls)++;
+            got = 1;
+            continue;
+        }
+        if (ch == '#') {
+            c->i++;
+            int off, l;
+            if (!css_ident(c, &off, &l)) return 0;
+            p->id_off = off;
+            p->id_len = (int16_t)l;
+            (*spec_id)++;
+            got = 1;
+            continue;
+        }
+        if (ch == '[') {
+            c->i++;
+            css_ws(c);
+            int off, l;
+            if (!css_ident(c, &off, &l)) return 0;
+            p->an_off = off;
+            p->an_len = (int16_t)l;
+            css_ws(c);
+            if (c->i < c->n && c->s[c->i] == '=') {
+                c->i++;
+                css_ws(c);
+                char q = 0;
+                if (c->i < c->n && (c->s[c->i] == '"' || c->s[c->i] == '\'')) {
+                    q = c->s[c->i];
+                    c->i++;
+                }
+                int vo = E->csspool_len, vl2 = 0;
+                while (c->i < c->n &&
+                       (q ? c->s[c->i] != q
+                          : (c->s[c->i] != ']' && !is_whitespace(c->s[c->i])))) {
+                    cssp_putc((char)lc(c->s[c->i]));
+                    vl2++;
+                    c->i++;
+                }
+                if (q && c->i < c->n) c->i++;
+                p->av_off = vo;
+                p->av_len = (int16_t)vl2;
+            } else if (c->i < c->n &&
+                       (c->s[c->i] == '~' || c->s[c->i] == '|' ||
+                        c->s[c->i] == '^' || c->s[c->i] == '$' ||
+                        c->s[c->i] == '*')) {
+                return 0;                 /* fancy attr matchers unsupported */
+            }
+            css_ws(c);
+            if (c->i >= c->n || c->s[c->i] != ']') return 0;
+            c->i++;
+            p->has_attr = 1;
+            (*spec_cls)++;
+            got = 1;
+            continue;
+        }
+        if (ch == ':') {
+            c->i++;
+            if (c->i < c->n && c->s[c->i] == ':') return 0;   /* ::pseudo-elem */
+            int off, l;
+            if (!css_ident(c, &off, &l)) return 0;
+            E->csspool_len = off;         /* transient */
+            const char *pp = &E->csspool[off];
+            if ((l == 4 && str_ncasecmp(pp, "link", 4) == 0) ||
+                (l == 7 && str_ncasecmp(pp, "visited", 7) == 0)) {
+                p->pseudo_link = 1;
+                (*spec_cls)++;
+                got = 1;
+                continue;
+            }
+            return 0;                     /* :hover, :not(...), etc. */
+        }
+        if (is_alpha(ch)) {
+            long t0 = c->i;
+            while (c->i < c->n) {
+                char cc = c->s[c->i];
+                if (is_alpha(cc) || (cc >= '0' && cc <= '9') || cc == '-' || cc == '_')
+                    c->i++;
+                else break;
+            }
+            p->tag = (int16_t)tag_lookup(c->s + t0, (int)(c->i - t0));
+            if (p->tag == T_UNK) return 0;    /* unknown element: no match */
+            (*spec_type)++;
+            got = 1;
+            continue;
+        }
+        break;
+    }
+    return got;
+}
+
+/* Parse "sel1, sel2 { decls }". Decls are shared by every valid selector. */
+static void css_parse_ruleset(struct ccur *c, int origin) {
+    int sel_part0[16], sel_nparts[16];
+    uint16_t sel_spec[16];
+    int nsel = 0;
+    int cur_valid = 1;
+    int part0 = E->nparts;
+    int spec_id = 0, spec_cls = 0, spec_type = 0;
+    int pending_comb = 0;
+    for (;;) {
+        css_ws(c);
+        if (c->i >= c->n) return;
+        char ch = c->s[c->i];
+        if (ch == '{' || ch == ',') {
+            if (cur_valid && E->nparts > part0 &&
+                E->nparts - part0 <= 12 && nsel < 16) {
+                int spec = spec_id * 100 + spec_cls * 10 + spec_type;
+                if (spec > 0xFFFF) spec = 0xFFFF;
+                sel_part0[nsel] = part0;
+                sel_nparts[nsel] = E->nparts - part0;
+                sel_spec[nsel] = (uint16_t)spec;
+                nsel++;
+            } else {
+                E->nparts = part0;        /* roll back an invalid selector */
+            }
+            part0 = E->nparts;
+            spec_id = spec_cls = spec_type = 0;
+            cur_valid = 1;
+            pending_comb = 0;
+            c->i++;
+            if (ch == '{') break;
+            continue;
+        }
+        if (ch == '>') { pending_comb = 2; c->i++; continue; }
+        if (ch == '+' || ch == '~') { cur_valid = 0; c->i++; continue; }
+        if (!cur_valid) { c->i++; continue; }
+        struct cpart tmp;
+        long before = c->i;
+        int ok = css_parse_part(c, &tmp, &spec_id, &spec_cls, &spec_type);
+        if (!ok || c->i == before) {
+            cur_valid = 0;
+            if (c->i == before) c->i++;
+            continue;
+        }
+        tmp.comb = (uint8_t)((E->nparts == part0) ? 0
+                             : (pending_comb ? pending_comb : 1));
+        pending_comb = 0;
+        if (E->nparts < PART_MAX) E->parts[E->nparts++] = tmp;
+        else cur_valid = 0;
+    }
+    int decl0 = E->ndecls;
+    css_parse_decls(c);
+    int ndecl = E->ndecls - decl0;
+    for (int k = 0; k < nsel && ndecl > 0; k++) {
+        if (E->nrules >= RULE_MAX) break;
+        struct crule *r = &E->rules[E->nrules++];
+        r->part0 = sel_part0[k];
+        r->nparts = (int16_t)sel_nparts[k];
+        r->decl0 = decl0;
+        r->ndecl = (int16_t)ndecl;
+        r->spec = sel_spec[k];
+        r->origin = (int16_t)origin;
+        r->order = E->css_order++;
+    }
+}
+
+/* Parse a whole stylesheet into E's rule pools. */
+static void css_parse_sheet(const char *s, long n, int origin) {
+    struct ccur c = { s, 0, n };
+    while (c.i < c.n) {
+        css_ws(&c);
+        if (c.i >= c.n) break;
+        if (c.s[c.i] == '@') {
+            c.i++;
+            int o, l;
+            css_ident(&c, &o, &l);
+            E->csspool_len = o;
+            if (l == 5 && str_ncasecmp(&E->csspool[o], "media", 5) == 0) {
+                long m0 = c.i;
+                while (c.i < c.n && c.s[c.i] != '{' && c.s[c.i] != ';') c.i++;
+                if (c.i >= c.n || c.s[c.i] == ';') {
+                    if (c.i < c.n) c.i++;
+                    continue;
+                }
+                int cond = media_matches(c.s + m0, (int)(c.i - m0));
+                c.i++;
+                long b0 = c.i;
+                int depth = 1;
+                while (c.i < c.n && depth) {
+                    if (c.s[c.i] == '{') depth++;
+                    else if (c.s[c.i] == '}') depth--;
+                    c.i++;
+                }
+                if (cond) {
+                    long b1 = depth ? c.i : c.i - 1;
+                    css_parse_sheet(c.s + b0, b1 - b0, origin);
+                }
+                continue;
+            }
+            css_skip_block_or_semi(&c);
+            continue;
+        }
+        if (c.s[c.i] == '}') { c.i++; continue; }
+        css_parse_ruleset(&c, origin);
+    }
+}
+
+/* =================== Selector matching + cascade =================== */
+
+static int class_attr_contains(const struct dnode *nd, const char *cls, int clen) {
+    int vlen;
+    const char *v = node_attr(nd, "class", &vlen);
+    if (!v) return 0;
+    int i = 0;
+    while (i < vlen) {
+        while (i < vlen && is_whitespace(v[i])) i++;
+        int w0 = i;
+        while (i < vlen && !is_whitespace(v[i])) i++;
+        if (i - w0 == clen) {
+            int k = 0;
+            while (k < clen && lc(v[w0 + k]) == cls[k]) k++;
+            if (k == clen) return 1;
+        }
+    }
+    return 0;
+}
+
+static int part_match(const struct cpart *p, int ni) {
+    const struct dnode *nd = &E->nodes[ni];
+    if (nd->tag == T_TEXT) return 0;
+    if (p->tag >= 0 && p->tag != nd->tag) return 0;
+    if (p->pseudo_link && nd->link < 0) return 0;
+    if (p->id_len > 0) {
+        int vlen;
+        const char *v = node_attr(nd, "id", &vlen);
+        if (!v || vlen != p->id_len) return 0;
+        for (int k = 0; k < vlen; k++)
+            if (lc(v[k]) != E->csspool[p->id_off + k]) return 0;
+    }
+    for (int c = 0; c < p->nclass; c++)
+        if (!class_attr_contains(nd, &E->csspool[p->cls_off[c]], p->cls_len[c]))
+            return 0;
+    if (p->has_attr) {
+        char an[64];
+        int l = p->an_len < 63 ? p->an_len : 63;
+        for (int k = 0; k < l; k++) an[k] = E->csspool[p->an_off + k];
+        an[l] = 0;
+        int vlen;
+        const char *v = node_attr(nd, an, &vlen);
+        if (!v) return 0;
+        if (p->av_len > 0) {
+            if (vlen != p->av_len) return 0;
+            for (int k = 0; k < vlen; k++)
+                if (lc(v[k]) != E->csspool[p->av_off + k]) return 0;
+        }
+    }
+    return 1;
+}
+
+/* Right-to-left matching with ancestor backtracking. */
+static int match_upward(const struct cpart *parts, int pi, int ni) {
+    if (!part_match(&parts[pi], ni)) return 0;
+    if (pi == 0) return 1;
+    int comb = parts[pi].comb;
+    int a = E->nodes[ni].parent;
+    if (comb == 2)
+        return a >= 0 && match_upward(parts, pi - 1, a);
+    while (a >= 0) {
+        if (match_upward(parts, pi - 1, a)) return 1;
+        a = E->nodes[a].parent;
+    }
+    return 0;
+}
+
+static int sel_match_rule(const struct crule *ru, int ni) {
+    if (ru->nparts <= 0) return 0;
+    const struct cpart *parts = &E->parts[ru->part0];
+    const struct cpart *last = &parts[ru->nparts - 1];
+    if (last->tag >= 0 && last->tag != E->nodes[ni].tag) return 0;
+    return match_upward(parts, ru->nparts - 1, ni);
+}
+
+/* ---- Computed-style defaults + inheritance ------------------------ */
+
+static void st_init(struct cstyle *st, const struct cstyle *pst) {
+    if (pst) {
+        st->color = pst->color;
+        st->px = pst->px;
+        st->talign = pst->talign;
+        st->line_h = pst->line_h;
+        st->fl = pst->fl & (SF_BOLD | SF_MONO | SF_PRE | SF_UNDER | SF_NOBULLET);
+    } else {
+        st->color = 0xFF1B1B1B;
+        st->px = PX_BODY;
+        st->talign = 0;
+        st->line_h = 0;
+        st->fl = 0;
+    }
+    st->bg = 0;
+    st->border_col = 0xFF9A9A9E;
+    st->width = -1;
+    st->height = -1;
+    st->max_w = -1;
+    for (int i = 0; i < 4; i++) { st->m[i] = 0; st->p[i] = 0; st->bw[i] = 0; }
+    st->disp = D_INLINE;
+}
+
+static int clamp_px(int v) {
+    if (v < 8) return 8;
+    if (v > 40) return 40;
+    return v;
+}
+static int16_t clamp_m(int v) {
+    if (v < -2000) v = -2000;
+    if (v > 2000) v = 2000;
+    return (int16_t)v;
+}
+
+/* margin/padding shorthand expansion into T R B L. */
+static void expand_sides(int16_t out[4], const int16_t *vals, int nv) {
+    if (nv == 1) { out[0] = out[1] = out[2] = out[3] = vals[0]; }
+    else if (nv == 2) { out[0] = out[2] = vals[0]; out[1] = out[3] = vals[1]; }
+    else if (nv == 3) { out[0] = vals[0]; out[1] = out[3] = vals[1]; out[2] = vals[2]; }
+    else if (nv >= 4) { out[0] = vals[0]; out[1] = vals[1]; out[2] = vals[2]; out[3] = vals[3]; }
+}
+
+/* border[-side] shorthand: <width> <style> <color> in any order. */
+static void apply_border_shorthand(struct cstyle *st, const char *v, int n,
+                                   int side /* -1 = all */) {
+    int pos = 0, wpx = -1, saw_style = 0, none = 0;
+    struct vtok t;
+    uint32_t col;
+    while (vtok_next(v, n, &pos, &t)) {
+        int px;
+        if (tok_is(&t, "none") || tok_is(&t, "hidden")) { none = 1; continue; }
+        if (tok_is(&t, "solid") || tok_is(&t, "dashed") || tok_is(&t, "dotted") ||
+            tok_is(&t, "double") || tok_is(&t, "groove") || tok_is(&t, "ridge") ||
+            tok_is(&t, "inset") || tok_is(&t, "outset")) { saw_style = 1; continue; }
+        if (tok_is(&t, "thin")) { wpx = 1; continue; }
+        if (tok_is(&t, "medium")) { wpx = 3; continue; }
+        if (tok_is(&t, "thick")) { wpx = 5; continue; }
+        if (css_color_tok(t.s, t.len, &col)) {
+            if (col >> 24) st->border_col = col;
+            continue;
+        }
+        if (css_len_tok(t.s, t.len, st->px, &px) == LK_PX)
+            wpx = px < 0 ? 0 : (px > 16 ? 16 : px);
+    }
+    int w = none ? 0 : (wpx >= 0 ? wpx : (saw_style ? 1 : -1));
+    if (w < 0) return;
+    if (side < 0)
+        for (int i = 0; i < 4; i++) st->bw[i] = (uint8_t)w;
+    else
+        st->bw[side] = (uint8_t)w;
+}
+
+/* Apply one declaration to a computed style. Pass 0 applies only
+ * font-size (so em elsewhere resolves against the final font); pass 1
+ * applies everything else. */
+static void st_apply(struct cstyle *st, const struct cstyle *pst,
+                     const struct cdecl *d, int pass) {
+    const char *v = &E->csspool[d->voff];
+    int n = d->vlen;
+    struct vtok t;
+    int pos = 0;
+
+    int is_fs = (d->prop == CP_FONT_SIZE);
+    if (pass == 0 && !is_fs && d->prop != CP_FONT) return;
+    if (pass == 1 && is_fs) return;
+
+    switch (d->prop) {
+    case CP_FONT_SIZE:
+        if (vtok_next(v, n, &pos, &t)) {
+            int px;
+            if (tok_is(&t, "xx-small")) st->px = 9;
+            else if (tok_is(&t, "x-small")) st->px = 10;
+            else if (tok_is(&t, "small")) st->px = 13;
+            else if (tok_is(&t, "medium")) st->px = 15;
+            else if (tok_is(&t, "large")) st->px = 18;
+            else if (tok_is(&t, "x-large")) st->px = 24;
+            else if (tok_is(&t, "xx-large")) st->px = 32;
+            else if (tok_is(&t, "smaller")) st->px = (uint8_t)clamp_px(pst->px * 5 / 6);
+            else if (tok_is(&t, "larger")) st->px = (uint8_t)clamp_px(pst->px * 6 / 5);
+            else {
+                int k = css_len_tok(t.s, t.len, pst->px, &px);
+                if (k == LK_PX && px > 0) st->px = (uint8_t)clamp_px(px);
+                else if (k == LK_PCT && px > 0)
+                    st->px = (uint8_t)clamp_px(pst->px * px / 100);
+            }
+        }
+        break;
+    case CP_FONT:
+        /* shorthand: pass 0 takes the size token, pass 1 bold + family */
+        while (vtok_next(v, n, &pos, &t)) {
+            if (pass == 0) {
+                int px;
+                if (css_len_tok(t.s, t.len, pst->px, &px) == LK_PX && px >= 6 &&
+                    !tok_is(&t, "bold") && t.len > 2)
+                    st->px = (uint8_t)clamp_px(px);
+            } else {
+                if (tok_is(&t, "bold")) st->fl |= SF_BOLD;
+                if (str_contains(t.s, t.len, "mono", 4) >= 0 ||
+                    str_contains(t.s, t.len, "courier", 7) >= 0)
+                    st->fl |= SF_MONO;
+            }
+        }
+        break;
+    case CP_COLOR: {
+        uint32_t c;
+        if (vtok_next(v, n, &pos, &t) && css_color_tok(t.s, t.len, &c) &&
+            (c >> 24) >= 128)
+            st->color = c | 0xFF000000u;
+        break;
+    }
+    case CP_BGCOLOR:
+    case CP_BG: {
+        uint32_t c;
+        while (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "none")) { st->bg = 0; break; }
+            if (css_color_tok(t.s, t.len, &c)) {
+                st->bg = ((c >> 24) >= 128) ? (c | 0xFF000000u) : 0;
+                break;
+            }
+        }
+        break;
+    }
+    case CP_FONT_WEIGHT:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "bold") || tok_is(&t, "bolder")) st->fl |= SF_BOLD;
+            else if (tok_is(&t, "normal") || tok_is(&t, "lighter"))
+                st->fl &= (uint8_t)~SF_BOLD;
+            else {
+                int w = atoi_simple(t.s);
+                if (w >= 600) st->fl |= SF_BOLD;
+                else if (w > 0) st->fl &= (uint8_t)~SF_BOLD;
+            }
+        }
+        break;
+    case CP_FONT_FAMILY:
+        if (str_contains(v, n, "mono", 4) >= 0 ||
+            str_contains(v, n, "courier", 7) >= 0 ||
+            str_contains(v, n, "consol", 6) >= 0)
+            st->fl |= SF_MONO;
+        else
+            st->fl &= (uint8_t)~SF_MONO;
+        break;
+    case CP_FONT_STYLE:
+        break;                            /* no italic face yet */
+    case CP_TALIGN:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "center")) st->talign = 1;
+            else if (tok_is(&t, "right")) st->talign = 2;
+            else st->talign = 0;
+        }
+        break;
+    case CP_TDECOR:
+        if (str_contains(v, n, "underline", 9) >= 0) st->fl |= SF_UNDER;
+        else if (str_contains(v, n, "none", 4) >= 0)
+            st->fl &= (uint8_t)~SF_UNDER;
+        break;
+    case CP_LINEH:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "normal")) { st->line_h = 0; break; }
+            int has_alpha = 0;
+            for (int k = 0; k < t.len; k++)
+                if (is_alpha(t.s[k])) { has_alpha = 1; break; }
+            int px;
+            int k2 = css_len_tok(t.s, t.len, st->px, &px);
+            if (k2 == LK_PCT) st->line_h = (int16_t)-(px > 300 ? 300 : px);
+            else if (k2 == LK_PX && !has_alpha) {
+                /* bare number: scale factor (x100) */
+                long v1000 = 0;
+                int i2 = 0, dg = 0;
+                long fr = 0, fdv = 1;
+                while (i2 < t.len && t.s[i2] >= '0' && t.s[i2] <= '9') {
+                    v1000 = v1000 * 10 + (t.s[i2] - '0');
+                    i2++; dg++;
+                }
+                if (i2 < t.len && t.s[i2] == '.') {
+                    i2++;
+                    while (i2 < t.len && t.s[i2] >= '0' && t.s[i2] <= '9') {
+                        if (fdv < 100) { fr = fr * 10 + (t.s[i2] - '0'); fdv *= 10; }
+                        i2++;
+                    }
+                }
+                if (dg || fdv > 1) {
+                    int scale = (int)(v1000 * 100 + (fdv > 1 ? fr * 100 / fdv : 0));
+                    if (scale > 300) scale = 300;
+                    st->line_h = (int16_t)-scale;
+                }
+            } else if (k2 == LK_PX) {
+                if (px > 80) px = 80;
+                st->line_h = (int16_t)(px > 0 ? px : 0);
+            }
+        }
+        break;
+    case CP_WSPACE:
+        if (str_contains(v, n, "pre", 3) >= 0) st->fl |= SF_PRE;
+        else st->fl &= (uint8_t)~SF_PRE;
+        break;
+    case CP_LSTYLE:
+    case CP_LSTYLE_TYPE:
+        if (str_contains(v, n, "none", 4) >= 0) st->fl |= SF_NOBULLET;
+        break;
+    case CP_MARGIN: case CP_PADDING: {
+        int16_t vals[4];
+        int nv = 0;
+        while (nv < 4 && vtok_next(v, n, &pos, &t)) {
+            int px;
+            int k = css_len_tok(t.s, t.len, st->px, &px);
+            if (k == LK_AUTO) vals[nv] = (d->prop == CP_MARGIN) ? M_AUTO : 0;
+            else if (k == LK_PX) vals[nv] = clamp_m(px);
+            else if (k == LK_PCT) vals[nv] = 0;
+            else break;
+            nv++;
+        }
+        if (nv > 0)
+            expand_sides(d->prop == CP_MARGIN ? st->m : st->p, vals, nv);
+        if (d->prop == CP_PADDING)
+            for (int k = 0; k < 4; k++)
+                if (st->p[k] < 0 || st->p[k] == M_AUTO) st->p[k] = 0;
+        break;
+    }
+    case CP_MT: case CP_MR: case CP_MB: case CP_ML:
+    case CP_PT: case CP_PR: case CP_PB: case CP_PL: {
+        int is_margin = (d->prop <= CP_ML);
+        int side = is_margin ? d->prop - CP_MT : d->prop - CP_PT;
+        if (vtok_next(v, n, &pos, &t)) {
+            int px;
+            int k = css_len_tok(t.s, t.len, st->px, &px);
+            int16_t val = 0;
+            if (k == LK_AUTO) val = is_margin ? M_AUTO : 0;
+            else if (k == LK_PX) val = clamp_m(px);
+            else break;
+            if (is_margin) st->m[side] = val;
+            else st->p[side] = (val < 0 || val == M_AUTO) ? 0 : val;
+        }
+        break;
+    }
+    case CP_BORDER:  apply_border_shorthand(st, v, n, -1); break;
+    case CP_BTOP:    apply_border_shorthand(st, v, n, 0);  break;
+    case CP_BRIGHT:  apply_border_shorthand(st, v, n, 1);  break;
+    case CP_BBOTTOM: apply_border_shorthand(st, v, n, 2);  break;
+    case CP_BLEFT:   apply_border_shorthand(st, v, n, 3);  break;
+    case CP_BWIDTH: {
+        int16_t vals[4];
+        int nv = 0;
+        while (nv < 4 && vtok_next(v, n, &pos, &t)) {
+            int px;
+            if (tok_is(&t, "thin")) px = 1;
+            else if (tok_is(&t, "medium")) px = 3;
+            else if (tok_is(&t, "thick")) px = 5;
+            else if (css_len_tok(t.s, t.len, st->px, &px) != LK_PX) break;
+            vals[nv++] = (int16_t)(px < 0 ? 0 : (px > 16 ? 16 : px));
+        }
+        if (nv > 0) {
+            int16_t out[4];
+            expand_sides(out, vals, nv);
+            for (int k = 0; k < 4; k++) st->bw[k] = (uint8_t)out[k];
+        }
+        break;
+    }
+    case CP_BCOLOR: {
+        uint32_t c;
+        if (vtok_next(v, n, &pos, &t) && css_color_tok(t.s, t.len, &c) &&
+            (c >> 24))
+            st->border_col = c | 0xFF000000u;
+        break;
+    }
+    case CP_WIDTH:
+        if (vtok_next(v, n, &pos, &t)) {
+            int px;
+            int k = css_len_tok(t.s, t.len, st->px, &px);
+            if (k == LK_AUTO) { st->width = -1; st->fl &= (uint8_t)~SF_WPCT; }
+            else if (k == LK_PX && px >= 0) { st->width = px; st->fl &= (uint8_t)~SF_WPCT; }
+            else if (k == LK_PCT && px > 0) {
+                st->width = px > 100 ? 100 : px;
+                st->fl |= SF_WPCT;
+            }
+        }
+        break;
+    case CP_HEIGHT:
+        if (vtok_next(v, n, &pos, &t)) {
+            int px;
+            if (css_len_tok(t.s, t.len, st->px, &px) == LK_PX && px >= 0)
+                st->height = px > 4000 ? 4000 : px;
+            else st->height = -1;
+        }
+        break;
+    case CP_MAXW:
+        if (vtok_next(v, n, &pos, &t)) {
+            int px;
+            int k = css_len_tok(t.s, t.len, st->px, &px);
+            if (k == LK_PX && px > 0) st->max_w = px;
+            else if (tok_is(&t, "none")) st->max_w = -1;
+        }
+        break;
+    case CP_DISPLAY:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "none")) st->disp = D_NONE;
+            else if (tok_is(&t, "inline")) st->disp = D_INLINE;
+            else if (tok_is(&t, "inline-block") || tok_is(&t, "inline-flex") ||
+                     tok_is(&t, "inline-table"))
+                st->disp = D_INLBLOCK;
+            else if (tok_is(&t, "list-item")) st->disp = D_LISTITEM;
+            else if (tok_is(&t, "table-cell") || tok_is(&t, "contents"))
+                st->disp = D_INLINE;
+            else st->disp = D_BLOCK;      /* block, flex, grid, table... */
+        }
+        break;
+    case CP_VISIBILITY:
+        if (str_contains(v, n, "hidden", 6) >= 0 ||
+            str_contains(v, n, "collapse", 8) >= 0)
+            st->disp = D_NONE;
+        break;
+    default:
+        break;
+    }
+}
+
+/* ---- The style pass ------------------------------------------------ */
+
+#define MATCH_MAX 96
+
+struct smatch { uint32_t key; int32_t order; int32_t decl0; int16_t ndecl; };
+
+static void style_node(int ni, const struct cstyle *pst) {
+    struct dnode *nd = &E->nodes[ni];
+    if (nd->tag == T_TEXT) {
+        nd->st = *pst;                    /* text renders in parent style */
+        return;
+    }
+    struct cstyle st;
+    st_init(&st, pst);
+    struct smatch M[MATCH_MAX];
+    int nm = 0;
+    for (int r = 0; r < E->nrules; r++) {
+        struct crule *ru = &E->rules[r];
+        if (!sel_match_rule(ru, ni)) continue;
+        if (nm >= MATCH_MAX) break;
+        uint32_t key = ((uint32_t)ru->origin << 16) | ru->spec;
+        int k = nm++;
+        while (k > 0 && (M[k - 1].key > key ||
+               (M[k - 1].key == key && M[k - 1].order > ru->order))) {
+            M[k] = M[k - 1];
+            k--;
+        }
+        M[k].key = key;
+        M[k].order = ru->order;
+        M[k].decl0 = ru->decl0;
+        M[k].ndecl = ru->ndecl;
+    }
+    /* inline style="" -> transient decls (rolled back afterwards) */
+    int inl0 = E->ndecls, cp0 = E->csspool_len;
+    int vlen;
+    const char *sv = node_attr(nd, "style", &vlen);
+    if (sv && vlen > 0) {
+        struct ccur c = { sv, 0, vlen };
+        css_parse_decls(&c);
+    }
+    int inlN = E->ndecls - inl0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int m = 0; m < nm; m++)
+            for (int d2 = 0; d2 < M[m].ndecl; d2++)
+                if (!E->decls[M[m].decl0 + d2].imp)
+                    st_apply(&st, pst, &E->decls[M[m].decl0 + d2], pass);
+        for (int d2 = 0; d2 < inlN; d2++)
+            if (!E->decls[inl0 + d2].imp)
+                st_apply(&st, pst, &E->decls[inl0 + d2], pass);
+        for (int m = 0; m < nm; m++)
+            for (int d2 = 0; d2 < M[m].ndecl; d2++)
+                if (E->decls[M[m].decl0 + d2].imp)
+                    st_apply(&st, pst, &E->decls[M[m].decl0 + d2], pass);
+        for (int d2 = 0; d2 < inlN; d2++)
+            if (E->decls[inl0 + d2].imp)
+                st_apply(&st, pst, &E->decls[inl0 + d2], pass);
+    }
+    E->ndecls = inl0;
+    E->csspool_len = cp0;
+    nd->st = st;
+    for (int c = nd->first; c >= 0; c = E->nodes[c].next)
+        style_node(c, &nd->st);
+}
+
+/* ---- The user-agent stylesheet ------------------------------------- */
+
+static const char UA_SHEET[] =
+"html,body,div,p,h1,h2,h3,h4,h5,h6,ul,ol,dl,dt,dd,table,thead,tbody,"
+"tfoot,tr,caption,pre,blockquote,form,header,footer,nav,main,section,"
+"article,aside,figure,figcaption,address,details,summary,fieldset,"
+"legend,center,hr{display:block}\n"
+"li{display:list-item}\n"
+"head,script,style,title,meta,link,noscript,template,option,base,param,"
+"track,source,area,col,colgroup,select,textarea,iframe,object,embed,"
+"video,audio,canvas,svg,map,picture{display:none}\n"
+"input[type=hidden]{display:none}\n"
+"body{margin:8px;color:#1b1b1b;background-color:#ffffff;font-size:15px;"
+"line-height:1.3}\n"
+"h1{font-size:26px;font-weight:bold;margin:16px 0 8px}\n"
+"h2{font-size:21px;font-weight:bold;margin:14px 0 7px}\n"
+"h3{font-size:17px;font-weight:bold;margin:12px 0 6px}\n"
+"h4,h5,h6{font-size:15px;font-weight:bold;margin:10px 0 5px}\n"
+"p{margin:8px 0}\n"
+"ul,ol{margin:8px 0;padding-left:26px}\n"
+"li{margin:2px 0}\n"
+"dt{font-weight:bold;margin-top:6px}\n"
+"dd{margin-left:24px}\n"
+"a{color:#1558d6;text-decoration:underline}\n"
+"b,strong{font-weight:bold}\n"
+"u{text-decoration:underline}\n"
+"code,tt,kbd,samp{font-family:monospace;background-color:#f1f1f3}\n"
+"pre{font-family:monospace;white-space:pre;background-color:#f6f6f8;"
+"margin:8px 0;padding:6px;border:1px solid #e3e3e6}\n"
+"blockquote{margin:8px 0 8px 26px;color:#484848}\n"
+"hr{border-top:1px solid #c8c8cc;margin:10px 0}\n"
+"center{text-align:center}\n"
+"table{margin:6px 0}\n"
+"td,th{padding:1px 8px}\n"
+"th{font-weight:bold}\n"
+"caption{font-weight:bold;text-align:center}\n"
+"small{font-size:12px}\n"
+"big{font-size:18px}\n"
+"sub,sup{font-size:11px}\n"
+"mark{background-color:#ffef9c}\n"
+"figure{margin:8px 0 8px 24px}\n"
+"button{display:inline-block}\n";
+
+/* =================== Layout: DOM + styles -> display list =========== */
 
 /* Display size of an image scaled to fit `avail` px wide (aspect
  * preserved). Loaded images use decoded dims; pending/failed fall back
@@ -742,204 +2200,417 @@ static void img_disp_dims(const struct img *im, int avail, int *dw, int *dh) {
 
 /* On-screen width of a form control. */
 static int field_w(const struct field *f, uint8_t fl) {
-    if (fl & FL_INPUT)
+    if (fl & IF_INPUT)
         return f->size > 0 ? f->size * 8 + 18 : 190;
     /* submit button: label width + padding */
-    int lw = 0;
-    for (int i = 0; f->value[i]; i++) {
-        unsigned char ch = (unsigned char)f->value[i];
-        lw += g_adv[FACE_BODY][(ch >= 32 && ch <= 126) ? ch - 32 : 31];
-    }
+    int lw = text_px_w(f->value, (int)str_len(f->value), PX_BODY, 0, 0);
     return lw + 28;
 }
 #define FIELD_H (PX_BODY + 12)
 
-static void run_flush(long off, int len, int x, int y, int w,
-                      uint8_t px, uint8_t fl, short link) {
-    if (len <= 0 || g_nruns >= RUN_MAX) return;
-    struct run *r = &g_runs[g_nruns++];
-    r->off = (int32_t)off;
-    r->len = (int16_t)len;
-    r->x = (int16_t)x;
-    r->y = (int32_t)y;
-    r->w = (int16_t)w;
-    r->px = px;
-    r->fl = fl;
-    r->link = link;
-    r->field = -1;
-    r->img = -1;
-    r->h = 0;
+static struct ditem *item_new(int kind) {
+    if (E->nitems >= ITEM_MAX) return NULL;
+    struct ditem *it = &E->items[E->nitems++];
+    mem_zero(it, sizeof(*it));
+    it->kind = (uint8_t)kind;
+    it->link = it->field = it->img = -1;
+    return it;
 }
 
-static void layout(int width) {
-    if (!g_adv_ready) adv_init();
-    g_nruns = 0;
-    g_find_run = -1;
-    int y = 8;
-    int usable = width - MARGIN_R;
+static int emit_rect(int x, int y, int w, int h, uint32_t col) {
+    struct ditem *it = item_new(DI_RECT);
+    if (!it) return -1;
+    it->x = x; it->y = y; it->w = w; it->h = h;
+    it->fg = col;
+    return (int)(it - E->items);
+}
 
-    for (int bi = 0; bi < g_nblks; bi++) {
-        struct blk *b = &g_blks[bi];
-        int indent = MARGIN_L + (b->type == BT_LI ? LI_INDENT : 0);
+/* ---- Inline formatting context ------------------------------------- */
 
-        /* top margins */
-        switch (b->type) {
-        case BT_H1: y += 14; break;
-        case BT_H2: y += 12; break;
-        case BT_H3: y += 10; break;
-        case BT_HR: y += 8;  break;
-        case BT_LI: y += 2;  break;
-        case BT_PRE: y += 1; break;
-        default:    y += 8;  break;
-        }
+struct istyle {
+    uint32_t fg, bg;
+    int px, fl;                  /* IF_* text flags */
+    int lh;                      /* resolved line height for text items */
+    int link;
+    int pre;
+};
 
-        if (b->type == BT_HR) {
-            if (g_nruns < RUN_MAX) {
-                struct run *r = &g_runs[g_nruns++];
-                r->off = 0; r->len = 0;
-                r->x = (int16_t)MARGIN_L;
-                r->y = (int32_t)y;
-                r->w = (int16_t)(usable - MARGIN_L);
-                r->px = PX_BODY; r->fl = FL_HRULE; r->link = -1; r->field = -1; r->img = -1; r->h = 0;
-            }
-            y += 6;
+struct ictx {
+    int cx, cw;                  /* content box left + width */
+    int x, y;                    /* cursor (y = top of current line) */
+    int line_h;
+    int line_i0;                 /* first item of the current line */
+    int talign;
+    int pend_sp;
+    int citem;                   /* open coalescing text item or -1 */
+};
+
+/* Finish the current line: bottom-align items, apply text-align. */
+static void ic_break(struct ictx *ic, int min_h) {
+    int lh = ic->line_h > 0 ? ic->line_h : min_h;
+    int used = ic->x - ic->cx;
+    int shift = 0;
+    if (ic->talign == 1) shift = (ic->cw - used) / 2;
+    else if (ic->talign == 2) shift = ic->cw - used;
+    if (shift < 0) shift = 0;
+    for (int i = ic->line_i0; i < E->nitems; i++) {
+        struct ditem *it = &E->items[i];
+        it->y = ic->y + (lh - it->h);
+        if (shift) it->x += shift;
+    }
+    ic->y += lh;
+    ic->x = ic->cx;
+    ic->line_h = 0;
+    ic->line_i0 = E->nitems;
+    ic->citem = -1;
+    ic->pend_sp = 0;
+}
+
+/* Append one word to the line, wrapping as needed; coalesces into the
+ * open text item when style + render-pool position allow. */
+static void ic_word(struct ictx *ic, const char *w, int wl, const struct istyle *is) {
+    int mono = is->fl & IF_MONO;
+    int bold = is->fl & IF_BOLD;
+    int ww = text_px_w(w, wl, is->px, bold, mono);
+    int sw = ic->pend_sp ? text_px_w(" ", 1, is->px, bold, mono) : 0;
+    int limit = ic->cx + ic->cw;
+    if (ic->x > ic->cx && ic->x + sw + ww > limit)
+        ic_break(ic, is->lh);
+    int sp = (ic->x > ic->cx) ? ic->pend_sp : 0;
+    ic->pend_sp = 0;
+    sw = sp ? text_px_w(" ", 1, is->px, bold, mono) : 0;
+    struct ditem *cu = (ic->citem >= 0) ? &E->items[ic->citem] : NULL;
+    int same = cu && cu->kind == DI_TEXT && cu->px == is->px &&
+               cu->fl == (uint8_t)is->fl && cu->fg == is->fg &&
+               cu->bg == is->bg && cu->link == is->link &&
+               cu->off + cu->len == E->render_len;
+    if (!same) {
+        if (sp) { ic->x += sw; sp = 0; sw = 0; }
+        struct ditem *it = item_new(DI_TEXT);
+        if (!it) return;
+        it->x = ic->x;
+        it->y = ic->y;
+        it->w = 0;
+        it->h = is->lh;
+        it->fg = is->fg;
+        it->bg = is->bg;
+        it->off = E->render_len;
+        it->len = 0;
+        it->px = (uint8_t)is->px;
+        it->fl = (uint8_t)is->fl;
+        it->link = (int16_t)is->link;
+        ic->citem = (int)(it - E->items);
+        cu = it;
+    }
+    if (sp && E->render_len < RENDER_CAP) {
+        E->render[E->render_len++] = ' ';
+        cu->len++;
+        cu->w += sw;
+        ic->x += sw;
+    }
+    for (int k = 0; k < wl && E->render_len < RENDER_CAP; k++) {
+        char c2 = w[k];
+        E->render[E->render_len++] = ((unsigned char)c2 < 32) ? ' ' : c2;
+        cu->len++;
+    }
+    cu->w += ww;
+    ic->x += ww;
+    if (cu->h > ic->line_h) ic->line_h = cu->h;
+}
+
+/* Atomic inline box (image / form control). */
+static void ic_atomic(struct ictx *ic, int kind, int w, int h,
+                      int link, int field, int img, int fl) {
+    int limit = ic->cx + ic->cw;
+    if (ic->x > ic->cx && ic->x + w > limit)
+        ic_break(ic, h + 2);
+    struct ditem *it = item_new(kind);
+    if (!it) return;
+    it->x = ic->x;
+    it->y = ic->y;
+    it->w = w;
+    it->h = h;
+    it->link = (int16_t)link;
+    it->field = (int16_t)field;
+    it->img = (int16_t)img;
+    it->fl = (uint8_t)fl;
+    it->px = PX_BODY;
+    ic->x += w + 4;
+    if (h + 2 > ic->line_h) ic->line_h = h + 2;
+    ic->citem = -1;
+    ic->pend_sp = 0;
+}
+
+static void inl_text_norm(struct ictx *ic, const char *t, int tl, const struct istyle *is) {
+    int i = 0;
+    while (i < tl) {
+        if (is_whitespace(t[i])) { ic->pend_sp = 1; i++; continue; }
+        int w0 = i;
+        while (i < tl && !is_whitespace(t[i])) i++;
+        ic_word(ic, t + w0, i - w0, is);
+    }
+}
+
+static void inl_text_pre(struct ictx *ic, const char *t, int tl, const struct istyle *is) {
+    int i = 0;
+    while (i < tl) {
+        if (t[i] == '\n') {
+            ic_break(ic, is->lh);
+            i++;
             continue;
         }
-
-        /* line metrics from the tallest span in the block */
-        int lh = 0;
-        for (int si = 0; si < b->ns; si++) {
-            struct span *s = &g_spans[b->s0 + si];
-            int h = (s->field >= 0) ? FIELD_H + 4 : line_h_for(s->px, s->fl);
-            if (h > lh) lh = h;
+        int budget = ic->cx + ic->cw - ic->x;
+        int w = 0, j = i;
+        while (j < tl && t[j] != '\n') {
+            int cw2 = text_px_w(&t[j], 1, is->px, is->fl & IF_BOLD, is->fl & IF_MONO);
+            if (w + cw2 > budget && j > i) break;
+            w += cw2;
+            j++;
         }
-        if (lh == 0) lh = line_h_for(PX_BODY, 0);
-
-        if (b->type == BT_LI && g_nruns < RUN_MAX) {
-            struct run *r = &g_runs[g_nruns++];
-            r->off = 0; r->len = 0;
-            r->x = (int16_t)(MARGIN_L + 6);
-            r->y = (int32_t)y;
-            r->w = 5;
-            r->px = PX_BODY; r->fl = FL_BULLET; r->link = -1; r->field = -1; r->img = -1; r->h = 0;
+        if (j == i) {                     /* nothing fits */
+            if (ic->x > ic->cx) { ic_break(ic, is->lh); continue; }
+            j = i + 1;
         }
+        ic->pend_sp = 0;
+        ic_word(ic, t + i, j - i, is);
+        i = j;
+    }
+}
 
-        int x = indent;
-        for (int si = 0; si < b->ns; si++) {
-            struct span *s = &g_spans[b->s0 + si];
-            if (s->fl & FL_BR) { y += lh; x = indent; }
+static void inl_walk(struct ictx *ic, int ni, const struct istyle *is) {
+    struct dnode *nd = &E->nodes[ni];
+    if (nd->tag == T_TEXT) {
+        if (is->pre) inl_text_pre(ic, &E->tpool[nd->toff], nd->tlen, is);
+        else inl_text_norm(ic, &E->tpool[nd->toff], nd->tlen, is);
+        return;
+    }
+    const struct cstyle *st = &nd->st;
+    if (st->disp == D_NONE) return;
+    if (nd->tag == T_BR) { ic_break(ic, is->lh); return; }
 
-            if (s->img >= 0) {                   /* image: own line block */
-                if (x > indent) { y += lh; x = indent; }
-                int dw, dh;
-                img_disp_dims(&g_images[s->img], usable - indent, &dw, &dh);
-                if (g_nruns < RUN_MAX) {
-                    struct run *r = &g_runs[g_nruns++];
-                    r->off = 0; r->len = 0;
-                    r->x = (int16_t)indent;
-                    r->y = (int32_t)y;
-                    r->w = (int16_t)dw;
-                    r->h = (int16_t)dh;
-                    r->px = PX_BODY;
-                    r->fl = s->fl;
-                    r->link = s->link;           /* clickable if in an <a> */
-                    r->field = -1;
-                    r->img = s->img;
-                }
-                y += dh + 4;
-                x = indent;
-                continue;
-            }
+    struct istyle cs;
+    cs.fg = st->color;
+    cs.bg = (st->bg >> 24) ? st->bg : is->bg;
+    cs.px = st->px;
+    cs.fl = 0;
+    if (st->fl & SF_BOLD)  cs.fl |= IF_BOLD;
+    if (st->fl & SF_UNDER) cs.fl |= IF_UNDER;
+    if (st->fl & SF_MONO)  cs.fl |= IF_MONO;
+    cs.lh = st_line_h(st);
+    cs.pre = (st->fl & SF_PRE) ? 1 : 0;
+    cs.link = nd->link >= 0 ? nd->link : is->link;
 
-            if (s->field >= 0) {                 /* inline form control */
-                int fw = field_w(&g_fields[s->field], s->fl);
-                if (x + fw > usable && x > indent) { y += lh; x = indent; }
-                if (g_nruns < RUN_MAX) {
-                    struct run *r = &g_runs[g_nruns++];
-                    r->off = 0; r->len = 0;
-                    r->x = (int16_t)x;
-                    r->y = (int32_t)y;
-                    r->w = (int16_t)fw;
-                    r->px = PX_BODY;
-                    r->fl = s->fl;
-                    r->link = -1;
-                    r->field = s->field;
-                    r->img = -1;
-                    r->h = 0;
-                }
-                x += fw + 6;
-                continue;
-            }
-
-            /* walk the span word-by-word, coalescing words that stay on
-             * the same line into one run */
-            long roff = s->off; int rlen = 0, rx = x, rw = 0;
-            long i = s->off, end = s->off + s->len;
-            while (i < end) {
-                /* next word (including one leading space if present) */
-                long wstart = i;
-                int  sp = 0;
-                if (g_render[i] == ' ') { sp = 1; i++; }
-                while (i < end && g_render[i] != ' ') i++;
-                int wlen = (int)(i - wstart);
-                int ww = text_w(wstart, wlen, s->px, s->fl);
-
-                if (x + ww > usable && x > indent) {
-                    /* wrap: flush current run, drop the leading space */
-                    run_flush(roff, rlen, rx, y, rw, s->px, s->fl, s->link);
-                    y += lh; x = indent;
-                    roff = wstart + sp; rlen = 0; rx = x; rw = 0;
-                    ww = text_w(wstart + sp, wlen - sp, s->px, s->fl);
-                    wlen -= sp;
-                    wstart += sp;
-                }
-                if (rlen == 0) { roff = wstart; rx = x; }
-                rlen = (int)(wstart + wlen - roff);
-                rw += ww;
-                x += ww;
-            }
-            run_flush(roff, rlen, rx, y, rw, s->px, s->fl, s->link);
+    if (nd->img >= 0) {
+        int dw, dh;
+        img_disp_dims(&g_images[nd->img], ic->cw, &dw, &dh);
+        if (st->width > 0 && !(st->fl & SF_WPCT)) {
+            int nw = st->width > ic->cw ? ic->cw : st->width;
+            dh = (int)((long)dh * nw / (dw > 0 ? dw : 1));
+            dw = nw;
         }
-        y += lh;
+        if (st->height > 0) dh = st->height;
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        ic_atomic(ic, DI_IMG, dw, dh, cs.link, -1, nd->img, 0);
+        return;
+    }
+    if (nd->field >= 0) {
+        struct field *f = &g_fields[nd->field];
+        int fl2 = (f->type == FT_TEXT) ? IF_INPUT : IF_SUBMITB;
+        ic_atomic(ic, DI_FIELD, field_w(f, (uint8_t)fl2), FIELD_H,
+                  -1, nd->field, -1, fl2);
+        return;
+    }
+    /* inline container (block-in-inline degrades to inline flow) */
+    for (int c = nd->first; c >= 0; c = E->nodes[c].next)
+        inl_walk(ic, c, &cs);
+}
 
-        /* bottom margins */
-        switch (b->type) {
-        case BT_H1: y += 6; break;
-        case BT_H2: y += 5; break;
-        case BT_H3: y += 4; break;
-        case BT_LI: y += 0; break;
-        case BT_PRE: y += 0; break;
-        default:    y += 2; break;
+static int is_inline_level(int ci) {
+    struct dnode *c = &E->nodes[ci];
+    if (c->tag == T_TEXT) return 1;
+    int d = c->st.disp;
+    if (d == D_NONE) return 1;            /* skipped inside either path */
+    return d == D_INLINE || d == D_INLBLOCK;
+}
+
+/* Lay an anonymous run of inline-level siblings [first, stop).
+ * `inbg` is the effective background the text sits on (nearest painted
+ * ancestor box); items record it only when it differs from the page bg
+ * so the mono painter can fill matching cells. */
+static int flush_inline(int first_child, int stop_child, int cx, int cw,
+                        int y, const struct cstyle *bst, int link,
+                        uint32_t inbg) {
+    struct ictx ic;
+    ic.cx = cx;
+    ic.cw = cw > 8 ? cw : 8;
+    ic.x = cx;
+    ic.y = y;
+    ic.line_h = 0;
+    ic.line_i0 = E->nitems;
+    ic.talign = bst->talign;
+    ic.pend_sp = 0;
+    ic.citem = -1;
+    struct istyle is;
+    is.fg = bst->color;
+    is.bg = ((inbg >> 24) &&
+             (inbg & 0xFFFFFF) != (E->page_bg & 0xFFFFFF)) ? inbg : 0;
+    is.px = bst->px;
+    is.fl = 0;
+    if (bst->fl & SF_BOLD)  is.fl |= IF_BOLD;
+    if (bst->fl & SF_UNDER) is.fl |= IF_UNDER;
+    if (bst->fl & SF_MONO)  is.fl |= IF_MONO;
+    is.lh = st_line_h(bst);
+    is.pre = (bst->fl & SF_PRE) ? 1 : 0;
+    is.link = link;
+    int n0 = E->nitems;
+    for (int c = first_child; c >= 0 && c != stop_child; c = E->nodes[c].next)
+        inl_walk(&ic, c, &is);
+    if (E->nitems > n0 || ic.x > ic.cx)
+        ic_break(&ic, is.lh);
+    return ic.y;
+}
+
+/* ---- Block flow ----------------------------------------------------- */
+
+static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
+    struct dnode *nd = &E->nodes[ni];
+    struct cstyle *st = &nd->st;
+    if (st->disp == D_NONE) return y;
+    if (nd->link >= 0) link = nd->link;
+    uint32_t curbg = (st->bg >> 24) ? st->bg : inbg;
+
+    int ml = st->m[3] == M_AUTO ? 0 : st->m[3];
+    int mr = st->m[1] == M_AUTO ? 0 : st->m[1];
+    int bwt = st->bw[0], bwr = st->bw[1], bwb = st->bw[2], bwl = st->bw[3];
+    int pt = st->p[0], pr = st->p[1], pb = st->p[2], pl = st->p[3];
+
+    int avail = cw - ml - mr - bwl - bwr - pl - pr;
+    if (avail < 8) avail = 8;
+    int content_w = avail;
+    if (st->width >= 0) {
+        content_w = (st->fl & SF_WPCT) ? (int)((long)avail * st->width / 100)
+                                       : st->width;
+        if (content_w > avail) content_w = avail;
+        if (content_w < 8) content_w = 8;
+    }
+    if (st->max_w >= 0 && content_w > st->max_w) content_w = st->max_w;
+    if (content_w < avail && st->m[3] == M_AUTO && st->m[1] == M_AUTO)
+        ml += (avail - content_w) / 2;    /* margin: 0 auto centering */
+    else if (content_w < avail && st->m[3] == M_AUTO)
+        ml += avail - content_w;
+
+    int bx = x + ml;                      /* border-box left */
+    int by = y;
+    int cx = bx + bwl + pl;
+    int cy = by + bwt + pt;
+    int bbw = bwl + pl + content_w + pr + bwr;
+
+    int bg_i = -1;
+    if (st->bg >> 24)
+        bg_i = emit_rect(bx, by, bbw, 0, st->bg);   /* height patched below */
+
+    if (st->disp == D_LISTITEM && !(st->fl & SF_NOBULLET)) {
+        struct ditem *bu = item_new(DI_BULLET);
+        if (bu) {
+            bu->x = cx - 14;
+            bu->y = cy + st_line_h(st) / 2 - 4;
+            bu->w = 5;
+            bu->h = 5;
+            bu->fg = st->color;
         }
     }
 
-    g_doc_h = y + 12;
+    /* children: block flow with anonymous inline runs */
+    int c = nd->first;
+    int prev_mb = 0;
+    while (c >= 0) {
+        if (is_inline_level(c)) {
+            int start = c;
+            while (c >= 0 && is_inline_level(c))
+                c = E->nodes[c].next;
+            int ny = flush_inline(start, c, cx, content_w, cy, st, link, curbg);
+            if (ny != cy) prev_mb = 0;
+            cy = ny;
+        } else {
+            struct dnode *cn = &E->nodes[c];
+            int mt = cn->st.m[0] == M_AUTO ? 0 : cn->st.m[0];
+            int mb = cn->st.m[2] == M_AUTO ? 0 : cn->st.m[2];
+            cy += mt > prev_mb ? mt : prev_mb;     /* sibling collapse */
+            cy = lay_block(c, cx, content_w, cy, link, curbg);
+            prev_mb = mb;
+            c = cn->next;
+        }
+    }
+    cy += prev_mb;
+
+    int content_h = cy - (by + bwt + pt);
+    if (content_h < 0) content_h = 0;
+    if (st->height >= 0 && st->height > content_h) content_h = st->height;
+    int bbh = bwt + pt + content_h + pb + bwb;
+
+    if (bg_i >= 0) E->items[bg_i].h = bbh;
+    if (bwt) emit_rect(bx, by, bbw, bwt, st->border_col);
+    if (bwb) emit_rect(bx, by + bbh - bwb, bbw, bwb, st->border_col);
+    if (bwl) emit_rect(bx, by, bwl, bbh, st->border_col);
+    if (bwr) emit_rect(bx + bbw - bwr, by, bwr, bbh, st->border_col);
+
+    return by + bbh;
+}
+
+/* Rebuild the display list from the styled DOM at `width`. */
+static void layout(int width) {
+    if (!E) return;
+    E->nitems = 0;
+    E->render_len = 0;
+    g_find_run = -1;
     g_layout_w = width;
+    if (E->nnodes == 0) { g_doc_h = 0; E->render[0] = 0; return; }
+
+    /* page background: body bg, else html bg, else white */
+    uint32_t pbg = 0xFFFFFFFFu;
+    if (E->body >= 0 && (E->nodes[E->body].st.bg >> 24)) {
+        pbg = E->nodes[E->body].st.bg;
+    } else {
+        for (int i = 0; i < E->nnodes; i++)
+            if (E->nodes[i].tag == T_HTML) {
+                if (E->nodes[i].st.bg >> 24) pbg = E->nodes[i].st.bg;
+                break;
+            }
+    }
+    E->page_bg = pbg;
+
+    int root = E->body >= 0 ? E->body : 0;
+    int cw = width - 12;                  /* room for the scrollbar */
+    if (cw < 60) cw = 60;
+    struct cstyle *rst = &E->nodes[root].st;
+    int y = rst->m[0] == M_AUTO ? 0 : rst->m[0];
+    int end = lay_block(root, 0, cw, y, -1, 0);
+    g_doc_h = end + (rst->m[2] == M_AUTO ? 0 : rst->m[2]) + 10;
+    E->render[E->render_len] = 0;
 }
 
-/* Handle multi-char entity expansions that decode_entity signals with out=0 */
-static int emit_multi_entity(const char *src, long start, long len) {
-    if (entity_match(src, start + 1, len, "mdash"))  { emit_char('-'); emit_char('-'); return 6; }
-    if (entity_match(src, start + 1, len, "ndash"))  { emit_char('-'); return 6; }
-    if (entity_match(src, start + 1, len, "copy"))   { emit_char('('); emit_char('c'); emit_char(')'); return 5; }
-    if (entity_match(src, start + 1, len, "reg"))    { emit_char('('); emit_char('R'); emit_char(')'); return 4; }
-    if (entity_match(src, start + 1, len, "hellip")) { emit_char('.'); emit_char('.'); emit_char('.'); return 7; }
-    if (entity_match(src, start + 1, len, "laquo"))  { emit_char('<'); emit_char('<'); return 6; }
-    if (entity_match(src, start + 1, len, "raquo"))  { emit_char('>'); emit_char('>'); return 6; }
-    return 0;
+/* ---- Engine / page reset ------------------------------------------- */
+
+static void eng_reset(void) {
+    E->nnodes = 0;
+    E->nattrs = 0;
+    E->tpool_len = 0;
+    E->body = -1;
+    E->nparts = 0;
+    E->ndecls = 0;
+    E->nrules = 0;
+    E->csspool_len = 0;
+    E->css_order = 0;
+    E->nsheets = 0;
+    E->nitems = 0;
+    E->render_len = 0;
+    E->render[0] = 0;
+    E->page_bg = 0xFFFFFFFFu;
 }
 
-/* Reset all per-page document state (text, spans, blocks, runs). */
-static void doc_reset(void) {
-    g_render_len = 0;
-    g_nspans = 0;
-    g_nblks = 0;
-    g_nruns = 0;
-    g_blk_openp = 0;
-    g_pending_br = 0;
-    g_cur_px = PX_BODY;
-    g_cur_fl = 0;
-    g_cur_link = -1;
+static void page_reset(void) {
+    eng_reset();
     g_link_count = 0;
     g_title[0] = '\0';
     g_scroll_y = 0;
@@ -953,355 +2624,218 @@ static void doc_reset(void) {
     g_nimages = 0;
 }
 
-static int blk_is_empty(void) {
-    return !g_blk_openp || g_nspans == g_blks[g_nblks].s0;
-}
-
-/* Extract attribute `name` from a tag body ("input type=text ...").
- * Case-insensitive, handles quoted and bare values. Returns 1 if the
- * attribute exists (out may be empty for a valueless attribute). */
-static int tag_attr(const char *t, const char *name, char *out, int cap) {
-    int nlen = (int)str_len(name);
-    out[0] = 0;
-    const char *p = t;
-    while (*p && !is_whitespace(*p)) p++;          /* skip the tag name */
-    while (*p) {
-        while (is_whitespace(*p)) p++;
-        if (!*p) break;
-        const char *k = p;
-        while (*p && !is_whitespace(*p) && *p != '=' && *p != '>') p++;
-        int klen = (int)(p - k);
-        int match = (klen == nlen && str_ncasecmp(k, name, nlen) == 0);
-        while (is_whitespace(*p)) p++;
-        if (*p != '=') {                            /* valueless attr */
-            if (match) return 1;
-            continue;
-        }
-        p++;
-        while (is_whitespace(*p)) p++;
-        char q = 0;
-        if (*p == 34 || *p == 39) { q = *p; p++; }
-        int o = 0;
-        while (*p && (q ? *p != q : !is_whitespace(*p) && *p != '>')) {
-            if (match && o < cap - 1) out[o++] = *p;
-            p++;
-        }
-        if (q && *p == q) p++;
-        if (match) { out[o] = 0; return 1; }
-    }
-    return 0;
-}
-
 static void resolve_relative_url(const char *base, const char *rel, char *out, int out_max);
 static void images_free(void);
 static void tab_images_free(struct tab *t);
 static void layout(int width);
 static void clamp_scroll(void);
+static int  has_scheme(const char *s);
 
-static void render_html(void) {
-    images_free();
-    doc_reset();
+/* ---- Collect pass: interaction objects + stylesheets ---------------- *
+ * Walks the DOM in document order registering links/images/forms/title
+ * into the tab arrays (so all the existing interaction code works
+ * unchanged), parsing <style> blocks, and fetching + parsing
+ * <link rel=stylesheet> sheets. */
 
-    int in_tag = 0;
-    int in_script = 0;
-    int in_style = 0;
-    int in_title = 0;
-    int in_pre = 0;
-    int title_pos = 0;
-    int last_was_space = 1;
-    int bold_depth = 0;
+#define SHEET_MAX       3
+#define SHEET_FETCH_CAP (160 * 1024)
 
-    char tag_buf[512];
-    int tag_buf_len = 0;
-    int cur_form = -1;
+static int g_form_open;          /* collect-walk state: innermost form */
 
-    char href_buf[LINK_URL_MAX];
-    int href_len = 0;
-
-    const char *src = g_raw;
-    long len = g_raw_len;
-
-    for (long i = 0; i < len; i++) {
-        char c = src[i];
-
-        if (in_tag) {
-            if (c == '>') {
-                in_tag = 0;
-                tag_buf[tag_buf_len] = '\0';
-
-                const char *t = tag_buf;
-                int closing = 0;
-                if (*t == '/') { closing = 1; t++; }
-
-                if (tag_match(t, "script")) {
-                    in_script = !closing;
-                } else if (tag_match(t, "style")) {
-                    in_style = !closing;
-                } else if (tag_match(t, "title")) {
-                    if (!closing) { in_title = 1; title_pos = 0; }
-                    else { in_title = 0; g_title[title_pos] = '\0'; }
-                } else if (tag_match(t, "pre")) {
-                    if (!closing) {
-                        in_pre = 1;
-                        g_cur_fl |= FL_CODE;
-                        blk_open(BT_PRE);
-                    } else {
-                        in_pre = 0;
-                        g_cur_fl &= (uint8_t)~FL_CODE;
-                        blk_close();
-                    }
-                    last_was_space = 1;
-                } else if (tag_match(t, "code")) {
-                    if (!closing) g_cur_fl |= FL_CODE;
-                    else g_cur_fl &= (uint8_t)~FL_CODE;
-                } else if (tag_match(t, "h1") || tag_match(t, "h2") ||
-                           tag_match(t, "h3") || tag_match(t, "h4") ||
-                           tag_match(t, "h5") || tag_match(t, "h6")) {
-                    if (!closing) {
-                        blk_open(t[1] == '1' ? BT_H1 :
-                                 t[1] == '2' ? BT_H2 : BT_H3);
-                    } else {
-                        blk_close();
-                    }
-                    last_was_space = 1;
-                } else if (tag_match(t, "p") || tag_match(t, "div") ||
-                           tag_match(t, "section") || tag_match(t, "article") ||
-                           tag_match(t, "header") || tag_match(t, "footer") ||
-                           tag_match(t, "main") || tag_match(t, "nav") ||
-                           tag_match(t, "ul") || tag_match(t, "ol") ||
-                           tag_match(t, "table") || tag_match(t, "tr")) {
-                    blk_close();
-                    last_was_space = 1;
-                } else if (tag_match(t, "br")) {
-                    g_pending_br = 1;
-                    last_was_space = 1;
-                } else if (tag_match(t, "hr")) {
-                    blk_open(BT_HR);
-                    blk_close();
-                    last_was_space = 1;
-                } else if (tag_match(t, "li")) {
-                    if (!closing) blk_open(BT_LI);
-                    else blk_close();
-                    last_was_space = 1;
-                } else if (tag_match(t, "a")) {
-                    if (!closing) {
-                        href_len = 0;
-                        href_buf[0] = '\0';
-                        const char *p = t;
-                        while (*p && !is_whitespace(*p)) p++;
-                        while (*p) {
-                            if (str_ncasecmp(p, "href", 4) == 0) {
-                                p += 4;
-                                while (*p == ' ') p++;
-                                if (*p == '=') {
-                                    p++;
-                                    while (*p == ' ') p++;
-                                    char q = 0;
-                                    if (*p == '"' || *p == '\'') { q = *p; p++; }
-                                    while (*p && (q ? *p != q : !is_whitespace(*p) && *p != '>') &&
-                                           href_len < LINK_URL_MAX - 1) {
-                                        href_buf[href_len++] = *p++;
-                                    }
-                                    href_buf[href_len] = '\0';
-                                }
-                                break;
-                            }
-                            p++;
+static void collect_node(int ni) {
+    struct dnode *nd = &E->nodes[ni];
+    int save_form = g_form_open;
+    switch (nd->tag) {
+    case T_TITLE: {
+        int c = nd->first;
+        if (c >= 0 && E->nodes[c].tag == T_TEXT && !g_title[0]) {
+            int l = E->nodes[c].tlen;
+            if (l > TITLE_MAX) l = TITLE_MAX;
+            int w = 0;
+            for (int k = 0; k < l; k++) {
+                char ch = E->tpool[E->nodes[c].toff + k];
+                g_title[w++] = ((unsigned char)ch < 32) ? ' ' : ch;
+            }
+            g_title[w] = '\0';
+        }
+        break;
+    }
+    case T_A: {
+        char href[LINK_URL_MAX];
+        if (node_attr_str(nd, "href", href, sizeof(href)) && href[0] &&
+            g_link_count < LINK_MAX) {
+            str_copy(g_links[g_link_count], href, LINK_URL_MAX);
+            nd->link = (int16_t)g_link_count++;
+        }
+        break;
+    }
+    case T_IMG: {
+        char src[512];
+        if (g_nimages < IMG_MAX &&
+            node_attr_str(nd, "src", src, sizeof(src)) && src[0] &&
+            /* skip data: URIs cheaply */
+            !(src[0] == 'd' && src[1] == 'a' && src[2] == 't' &&
+              src[3] == 'a' && src[4] == ':')) {
+            struct img *im = &g_images[g_nimages];
+            mem_zero(im, sizeof(*im));
+            resolve_relative_url(g_url, src, im->src, sizeof(im->src));
+            char d[8];
+            im->attr_w = node_attr_str(nd, "width", d, sizeof(d))
+                             ? (int16_t)atoi_simple(d) : 0;
+            im->attr_h = node_attr_str(nd, "height", d, sizeof(d))
+                             ? (int16_t)atoi_simple(d) : 0;
+            im->state = 0;
+            nd->img = (int16_t)g_nimages++;
+        }
+        break;
+    }
+    case T_FORM:
+        if (g_nforms < FORM_MAX) {
+            struct form *f = &g_forms[g_nforms];
+            f->first = (int16_t)g_nfields;
+            f->nf = 0;
+            node_attr_str(nd, "action", f->action, sizeof(f->action));
+            char meth[12];
+            f->post = node_attr_str(nd, "method", meth, sizeof(meth)) &&
+                      (meth[0] == 'p' || meth[0] == 'P');
+            g_form_open = g_nforms++;
+        }
+        break;
+    case T_INPUT:
+        if (g_form_open >= 0 && g_nfields < FIELD_MAX) {
+            char ty[20];
+            if (!node_attr_str(nd, "type", ty, sizeof(ty))) ty[0] = 0;
+            int ftype = -1;
+            if (!ty[0] || str_ncasecmp(ty, "text", 5) == 0 ||
+                str_ncasecmp(ty, "search", 7) == 0)
+                ftype = FT_TEXT;
+            else if (str_ncasecmp(ty, "hidden", 7) == 0)
+                ftype = FT_HIDDEN;
+            else if (str_ncasecmp(ty, "submit", 7) == 0)
+                ftype = FT_SUBMIT;
+            if (ftype >= 0) {
+                struct field *fd = &g_fields[g_nfields];
+                mem_zero(fd, sizeof(*fd));
+                fd->form = (int16_t)g_form_open;
+                fd->type = (uint8_t)ftype;
+                node_attr_str(nd, "name", fd->name, sizeof(fd->name));
+                node_attr_str(nd, "value", fd->value, sizeof(fd->value));
+                char szs[8];
+                if (node_attr_str(nd, "size", szs, sizeof(szs)))
+                    fd->size = (int16_t)atoi_simple(szs);
+                if (ftype == FT_SUBMIT && !fd->value[0])
+                    str_copy(fd->value, "Submit", sizeof(fd->value));
+                if (ftype != FT_HIDDEN)
+                    nd->field = (int16_t)g_nfields;
+                g_forms[g_form_open].nf++;
+                g_nfields++;
+            }
+        }
+        break;
+    case T_STYLE: {
+        char med[128];
+        int has_med = node_attr_str(nd, "media", med, sizeof(med));
+        if (!has_med || media_matches(med, (int)str_len(med))) {
+            int c = nd->first;
+            if (c >= 0 && E->nodes[c].tag == T_TEXT)
+                css_parse_sheet(&E->tpool[E->nodes[c].toff],
+                                E->nodes[c].tlen, 1);
+        }
+        break;
+    }
+    case T_LINKE: {
+        char rel[64], href[512], med[128];
+        if (node_attr_str(nd, "rel", rel, sizeof(rel)) &&
+            str_contains(rel, (int)str_len(rel), "stylesheet", 10) >= 0 &&
+            node_attr_str(nd, "href", href, sizeof(href)) && href[0] &&
+            E->nsheets < SHEET_MAX) {
+            int has_med = node_attr_str(nd, "media", med, sizeof(med));
+            if (!has_med || media_matches(med, (int)str_len(med))) {
+                char url[URL_MAX + 1];
+                resolve_relative_url(g_url, href, url, URL_MAX);
+                if (has_scheme(url)) {
+                    char *buf = (char *)malloc(SHEET_FETCH_CAP);
+                    if (buf) {
+                        struct http_fetch req;
+                        mem_zero(&req, sizeof(req));
+                        req.url = (unsigned long)url;
+                        req.buf = (unsigned long)buf;
+                        req.buf_sz = SHEET_FETCH_CAP;
+                        long r = sys_http_fetch(&req);
+                        if (r > 0 && req.status > 0 && req.status < 400) {
+                            E->nsheets++;
+                            css_parse_sheet(buf, r, 1);
                         }
-                        if (href_len > 0 && g_link_count < LINK_MAX) {
-                            str_copy(g_links[g_link_count], href_buf, LINK_URL_MAX);
-                            g_cur_link = (short)g_link_count;
-                            g_link_count++;
-                            g_cur_fl |= FL_LINK;
-                        }
-                    } else {
-                        g_cur_link = -1;
-                        g_cur_fl &= (uint8_t)~FL_LINK;
-                    }
-                } else if (tag_match(t, "b") || tag_match(t, "strong")) {
-                    if (!closing) { bold_depth++; g_cur_fl |= FL_BOLD; }
-                    else {
-                        if (bold_depth > 0) bold_depth--;
-                        if (bold_depth == 0) g_cur_fl &= (uint8_t)~FL_BOLD;
-                    }
-                } else if (tag_match(t, "i") || tag_match(t, "em")) {
-                    /* no italic face yet */
-                } else if (tag_match(t, "img")) {
-                    char isrc[512];
-                    if (g_nimages < IMG_MAX &&
-                        tag_attr(t, "src", isrc, sizeof(isrc)) && isrc[0] &&
-                        /* skip data: URIs and 1px tracker gifs cheaply */
-                        !(isrc[0] == 'd' && isrc[1] == 'a' && isrc[2] == 't' &&
-                          isrc[3] == 'a' && isrc[4] == ':')) {
-                        struct img *im = &g_images[g_nimages];
-                        mem_zero(im, sizeof(*im));
-                        resolve_relative_url(g_url, isrc, im->src, sizeof(im->src));
-                        char dbuf[8];
-                        im->attr_w = tag_attr(t, "width", dbuf, sizeof(dbuf))
-                                         ? (int16_t)atoi_simple(dbuf) : 0;
-                        im->attr_h = tag_attr(t, "height", dbuf, sizeof(dbuf))
-                                         ? (int16_t)atoi_simple(dbuf) : 0;
-                        im->state = 0;
-                        emit_image((short)g_nimages);
-                        g_nimages++;
-                        last_was_space = 0;
-                    } else {
-                        uint8_t sv = g_cur_fl;
-                        g_cur_fl |= FL_DIM;
-                        emit_str("[img]");
-                        g_cur_fl = sv;
-                        last_was_space = 0;
-                    }
-                } else if (tag_match(t, "form")) {
-                    if (!closing && g_nforms < FORM_MAX) {
-                        struct form *f = &g_forms[g_nforms];
-                        f->first = (int16_t)g_nfields;
-                        f->nf = 0;
-                        tag_attr(t, "action", f->action, sizeof(f->action));
-                        char meth[12];
-                        f->post = tag_attr(t, "method", meth, sizeof(meth)) &&
-                                  (meth[0] == 'p' || meth[0] == 'P');
-                        cur_form = g_nforms++;
-                    } else if (closing) {
-                        cur_form = -1;
-                    }
-                    blk_close();
-                    last_was_space = 1;
-                } else if (tag_match(t, "input")) {
-                    if (cur_form >= 0 && g_nfields < FIELD_MAX) {
-                        char ty[20];
-                        if (!tag_attr(t, "type", ty, sizeof(ty))) ty[0] = 0;
-                        int ftype = -1;
-                        if (!ty[0] || str_ncasecmp(ty, "text", 5) == 0 ||
-                            str_ncasecmp(ty, "search", 7) == 0)
-                            ftype = FT_TEXT;
-                        else if (str_ncasecmp(ty, "hidden", 7) == 0)
-                            ftype = FT_HIDDEN;
-                        else if (str_ncasecmp(ty, "submit", 7) == 0)
-                            ftype = FT_SUBMIT;
-                        if (ftype >= 0) {
-                            struct field *fl2 = &g_fields[g_nfields];
-                            fl2->form = (int16_t)cur_form;
-                            fl2->type = (uint8_t)ftype;
-                            tag_attr(t, "name", fl2->name, sizeof(fl2->name));
-                            tag_attr(t, "value", fl2->value, sizeof(fl2->value));
-                            char szs[8];
-                            fl2->size = 0;
-                            if (tag_attr(t, "size", szs, sizeof(szs))) {
-                                int v = 0;
-                                for (int k = 0; szs[k] >= 48 && szs[k] <= 57; k++)
-                                    v = v * 10 + (szs[k] - 48);
-                                fl2->size = (int16_t)v;
-                            }
-                            if (ftype == FT_SUBMIT && !fl2->value[0])
-                                str_copy(fl2->value, "Submit", sizeof(fl2->value));
-                            if (ftype == FT_TEXT)
-                                emit_field((short)g_nfields, FL_INPUT);
-                            else if (ftype == FT_SUBMIT)
-                                emit_field((short)g_nfields, FL_SUBMITB);
-                            g_forms[cur_form].nf++;
-                            g_nfields++;
-                            if (ftype != FT_HIDDEN) last_was_space = 1;
-                        }
-                    }
-                } else if (tag_match(t, "td") || tag_match(t, "th")) {
-                    if (!closing && !blk_is_empty()) {
-                        emit_char(' ');
-                        emit_char(' ');
-                        last_was_space = 1;
+                        free(buf);
                     }
                 }
-                continue;
-            }
-            if (tag_buf_len < (int)sizeof(tag_buf) - 1)
-                tag_buf[tag_buf_len++] = c;
-            continue;
-        }
-
-        if (c == '<') {
-            in_tag = 1;
-            tag_buf_len = 0;
-            continue;
-        }
-
-        if (in_script || in_style) continue;
-
-        /* HTML entity decoding */
-        if (c == '&') {
-            int skip = emit_multi_entity(src, i, len);
-            if (skip > 0) {
-                i += skip;
-                last_was_space = 0;
-                continue;
-            }
-            char decoded;
-            skip = decode_entity(src, i, len, &decoded);
-            if (skip > 0) {
-                c = decoded;
-                i += skip;
-            } else {
-                long j = i + 1;
-                while (j < len && j < i + 10 && src[j] != ';' && src[j] != '<') j++;
-                if (j < len && src[j] == ';') { i = j; continue; }
             }
         }
-
-        if (in_title) {
-            if (title_pos < TITLE_MAX) g_title[title_pos++] = c;
-            continue;
-        }
-
-        if (in_pre) {
-            if (c == '\n') {
-                if (blk_is_empty()) emit_char(' ');   /* keep blank lines */
-                blk_open(BT_PRE);
-            } else if (c != '\r') {
-                emit_char(c == '\t' ? ' ' : c);
-            }
-            continue;
-        }
-
-        if (is_whitespace(c)) {
-            if (!last_was_space && !blk_is_empty()) {
-                emit_char(' ');
-                last_was_space = 1;
-            }
-            continue;
-        }
-
-        last_was_space = 0;
-        emit_char(c);
+        break;
     }
+    case T_SCRIPT:
+        g_form_open = save_form;
+        return;
+    default:
+        break;
+    }
+    for (int c = nd->first; c >= 0; c = E->nodes[c].next)
+        collect_node(c);
+    g_form_open = save_form;
+}
 
-    blk_close();
-    g_render[g_render_len] = '\0';
+/* ---- The full pipeline: raw -> DOM -> CSSOM -> style -> layout ------ */
+
+static void render_html(void) {
+    if (!E) return;
+    images_free();
+    page_reset();
+
+    dom_build();
+    css_parse_sheet(UA_SHEET, (long)sizeof(UA_SHEET) - 1, 0);
+    g_form_open = -1;
+    collect_node(0);
+
+    struct cstyle base;
+    st_init(&base, NULL);
+    base.disp = D_BLOCK;
+    style_node(0, &base);
 
     g_view_mode = VIEW_HTML;
     layout(g_win_w);
 }
 
-/* Whole-buffer monospace document (plain text + source view). */
+/* Whole-buffer monospace document (plain text + source view):
+ * synthesize doc > body > pre > #text and run the normal pipeline. */
 static void render_mono_doc(void) {
+    if (!E) return;
     images_free();
-    doc_reset();
-    g_cur_fl = FL_CODE;
-    blk_open(BT_PRE);
-    for (long i = 0; i < g_raw_len && g_render_len < RENDER_CAP - 1; i++) {
+    page_reset();
+
+    int root = dom_new(T_UNK, -1);
+    int body = dom_new(T_BODY, root);
+    int pre = dom_new(T_PRE, body);
+    E->body = body;
+    int toff = E->tpool_len;
+    for (long i = 0; i < g_raw_len && E->tpool_len < TPOOL_CAP - 2; i++) {
         char c = g_raw[i];
-        if (c == '\n') {
-            if (blk_is_empty()) emit_char(' ');
-            blk_open(BT_PRE);
-        } else if (c == '\t') {
-            emit_char(' '); emit_char(' ');
-        } else if ((unsigned char)c >= 0x20 && (unsigned char)c <= 0x7E) {
-            emit_char(c);
-        } else if ((unsigned char)c > 0x7E) {
-            emit_char('.');
-        }
+        if (c == '\n') tp_putc('\n');
+        else if (c == '\t') { tp_putc(' '); tp_putc(' '); }
+        else if ((unsigned char)c >= 0x20 && (unsigned char)c <= 0x7E)
+            tp_putc(c);
+        else if ((unsigned char)c > 0x7E)
+            tp_putc('.');
     }
-    blk_close();
-    g_cur_fl = 0;
-    g_render[g_render_len] = '\0';
+    int tn = dom_new(T_TEXT, pre);
+    if (tn >= 0) {
+        E->nodes[tn].toff = toff;
+        E->nodes[tn].tlen = E->tpool_len - toff;
+    }
+    css_parse_sheet(UA_SHEET, (long)sizeof(UA_SHEET) - 1, 0);
+    struct cstyle base;
+    st_init(&base, NULL);
+    base.disp = D_BLOCK;
+    style_node(0, &base);
     layout(g_win_w);
 }
 
@@ -1439,10 +2973,25 @@ static void build_search_url(const char *base, const char *q,
 
 static void set_home_page(void) {
     const char *html =
-        "<html><head><title>New Tab</title></head><body>"
+        "<html><head><title>New Tab</title>"
+        "<style>"
+        "body{background-color:#ffffff;color:#202124}"
+        ".hero{background-color:#f8f9fa;border:1px solid #dadce0;"
+        "padding:14px;margin:4px 0 12px;text-align:center}"
+        ".hero h1{color:#1a73e8;margin:4px 0}"
+        ".hero p{color:#5f6368;margin:4px 0}"
+        ".card{border:1px solid #dadce0;background-color:#fbfbfc;"
+        "padding:4px 12px 8px;margin:10px 0}"
+        ".card h2{font-size:17px;color:#1a73e8;margin:8px 0 4px}"
+        "kbd{font-family:monospace;background-color:#eef1f5;"
+        "border:1px solid #d3d8de;padding:0 3px}"
+        ".foot{color:#80868b;font-size:12px;text-align:center}"
+        "</style></head><body>"
+        "<div class=hero>"
         "<h1>TobyOS Browser</h1>"
-        "<p>Welcome to the TobyOS web browser. This is a Chrome-inspired "
-        "browser built into the operating system.</p>"
+        "<p>Now with a real engine: DOM tree + CSS cascade + box layout.</p>"
+        "</div>"
+        "<div class=card>"
         "<h2>Quick Start</h2>"
         "<ul>"
         "<li>Press <b>Tab</b> to focus the address bar</li>"
@@ -1455,6 +3004,7 @@ static void set_home_page(void) {
         "<li>Click links or type link number + Enter</li>"
         "<li>Press <b>r</b> to refresh, <b>h</b> for home, <b>e</b> to edit a form field</li>"
         "</ul>"
+        "</div><div class=card>"
         "<h2>Keyboard Shortcuts</h2>"
         "<ul>"
         "<li><b>Tab</b> - Toggle URL bar / content focus</li>"
@@ -1470,6 +3020,7 @@ static void set_home_page(void) {
         "<li><b>S</b> - Toggle page source view</li>"
         "<li><b>q</b> - Quit browser</li>"
         "</ul>"
+        "</div><div class=card>"
         "<h2>Mouse Support</h2>"
         "<ul>"
         "<li>Click navigation buttons (Back, Forward, Refresh, Home)</li>"
@@ -1477,18 +3028,20 @@ static void set_home_page(void) {
         "<li>Click on numbered links to follow them</li>"
         "<li>Click scrollbar to jump to position</li>"
         "</ul>"
-        "<h2>Features</h2>"
+        "</div><div class=card>"
+        "<h2>Engine Features</h2>"
         "<ul>"
-        "<li>HTTP and HTTPS support (kernel TLS 1.3)</li>"
-        "<li>HTML rendering (headings, paragraphs, links, lists)</li>"
-        "<li>Navigation history with back/forward</li>"
-        "<li>Numbered link following (keyboard and mouse)</li>"
-        "<li>Find in page with highlighting</li>"
-        "<li>Page source view</li>"
-        "<li>Word wrapping</li>"
+        "<li>DOM tree + CSS cascade: <code>&lt;style&gt;</code>, "
+        "<code>style=</code>, linked stylesheets</li>"
+        "<li>Selectors (type/class/id/descendant), specificity, inheritance</li>"
+        "<li>Box model: margins, padding, borders, backgrounds, text-align</li>"
+        "<li>HTTP and HTTPS (kernel TLS 1.3), cookies, gzip</li>"
+        "<li>Images, forms, tabs, find in page, source view</li>"
         "</ul>"
+        "</div>"
         "<hr>"
-        "<p>TobyOS Browser v3.0 - Built with the tobyOS kernel HTTP/HTTPS stack.</p>"
+        "<p class=foot>TobyOS Browser v4.0 - DOM + CSS engine on the "
+        "tobyOS kernel HTTP/HTTPS stack.</p>"
         "</body></html>";
 
     g_raw_len = 0;
@@ -1505,7 +3058,17 @@ static void set_home_page(void) {
 
 static void tab_reset(struct tab *t) {
     tab_images_free(t);
+    struct eng *e = t->eng;    /* the heap engine survives tab resets */
     mem_zero(t, sizeof(*t));
+    if (!e) e = (struct eng *)malloc(sizeof(struct eng));
+    t->eng = e;
+    if (e) {                   /* safe defaults until the first render */
+        e->nnodes = 0;
+        e->nitems = 0;
+        e->render_len = 0;
+        e->render[0] = 0;
+        e->page_bg = 0xFFFFFFFFu;
+    }
     t->hist_pos     = -1;
     t->focus_url    = 1;
     t->view_mode    = VIEW_HTML;
@@ -1531,12 +3094,13 @@ static void tab_close(int idx) {
     if (idx < 0 || idx >= g_ntabs) return;
     if (g_ntabs == 1) sys_exit(0);
     tab_images_free(&g_tabs[idx]);
+    if (g_tabs[idx].eng) { free(g_tabs[idx].eng); g_tabs[idx].eng = NULL; }
     for (int i = idx; i < g_ntabs - 1; i++)
         g_tabs[i] = g_tabs[i + 1];        /* struct copy shifts the bundle */
     g_ntabs--;
-    /* The shift duplicated the last tab's image pointers into the now-
-     * vacated slot; clear it WITHOUT freeing (the live shifted-down tab
-     * owns those pixels now) so a future tab_reset can't double-free. */
+    /* The shift duplicated the last tab's image + engine pointers into
+     * the now-vacated slot; clear it WITHOUT freeing (the live shifted-
+     * down tab owns them now) so a future tab_reset can't double-free. */
     mem_zero(&g_tabs[g_ntabs], sizeof(struct tab));
     if (g_active >= g_ntabs) g_active = g_ntabs - 1;
     else if (g_active > idx) g_active--;
@@ -1589,8 +3153,15 @@ static void show_error_page(const char *url, int err) {
     set_status(emsg);
 
     g_raw_len = 0;
-    raw_append("<html><head><title>Problem loading page</title></head><body>"
-               "<h1>This site can't be reached</h1><p>");
+    raw_append("<html><head><title>Problem loading page</title>"
+               "<style>"
+               "body{background-color:#ffffff;color:#202124}"
+               ".box{max-width:520px;margin:24px auto;padding:8px 18px;"
+               "border:1px solid #dadce0;background-color:#fbfbfc}"
+               "h1{font-size:21px;color:#c5221f}"
+               ".url{font-family:monospace;color:#5f6368}"
+               "</style></head><body><div class=box>"
+               "<h1>This site can't be reached</h1><p class=url>");
     raw_append(url);
     raw_append("</p><p>Error: <b>");
     raw_append(emsg);
@@ -1599,7 +3170,7 @@ static void show_error_page(const char *url, int err) {
                "<li>DNS failed? The gateway/DNS server may be unreachable</li>"
                "<li>Connection failed? The host may be down, or HTTPS-only</li>"
                "</ul><p>Press <b>r</b> to retry, <b>[</b> to go back.</p>"
-               "</body></html>");
+               "</div></body></html>");
     g_raw[g_raw_len] = '\0';
     render_html();
     update_title();
@@ -1935,7 +3506,7 @@ static void sync_geometry(void) {
     g_content_h = g_win_h - TOOLBAR_H - STATUS_H;
     if (g_content_h < MONO_H) g_content_h = MONO_H;
 
-    if (g_layout_w != g_win_w && g_nblks > 0) {
+    if (g_layout_w != g_win_w && E && E->nnodes > 0) {
         int old_doc = g_doc_h > 0 ? g_doc_h : 1;
         long keep = g_scroll_y;
         layout(g_win_w);
@@ -1944,24 +3515,16 @@ static void sync_geometry(void) {
     clamp_scroll();
 }
 
-/* Approximate line height of a run (hit-testing + visibility). */
-static int run_h(const struct run *r) {
-    if (r->img >= 0 && r->h > 0) return r->h;
-    if (r->field >= 0) return FIELD_H;
-    if (r->fl & FL_CODE) return MONO_H + 2;
-    return r->px + r->px / 3;
-}
-
 /* ---- Find in page ---------------------------------------------- */
 
 static void find_next_match(void) {
-    if (g_find_len == 0) return;
+    if (g_find_len == 0 || !E) return;
     g_find_buf[g_find_len] = '\0';
 
     /* continue after the current match, wrapping once */
     long start = 0;
-    if (g_find_run >= 0 && g_find_run < g_nruns)
-        start = g_runs[g_find_run].off + 1;
+    if (g_find_run >= 0 && g_find_run < g_nitems)
+        start = g_items[g_find_run].off + 1;
 
     long hit = -1;
     int idx = str_contains(&g_render[start], (int)(g_render_len - start),
@@ -1973,10 +3536,11 @@ static void find_next_match(void) {
     }
     if (hit < 0) { g_find_run = -1; set_status("Not found"); return; }
 
-    /* find the run containing the hit offset */
-    for (int ri = 0; ri < g_nruns; ri++) {
-        struct run *r = &g_runs[ri];
-        if (r->len > 0 && hit >= r->off && hit < r->off + r->len) {
+    /* find the text item containing the hit offset */
+    for (int ri = 0; ri < g_nitems; ri++) {
+        struct ditem *r = &g_items[ri];
+        if (r->kind == DI_TEXT && r->len > 0 &&
+            hit >= r->off && hit < r->off + r->len) {
             g_find_run = ri;
             g_scroll_y = r->y - g_content_h / 3;
             clamp_scroll();
@@ -2003,7 +3567,7 @@ static void draw_hline(int fd, int x, int y, int w, uint32_t color) {
 #define IMG_ROW_MAX 2048
 static uint32_t g_img_row[IMG_ROW_MAX];
 
-static void paint_image(const struct run *r, int sy) {
+static void paint_image(const struct ditem *r, int sy) {
     struct img *im = &g_images[r->img];
     int dw = r->w, dh = r->h;
 
@@ -2026,8 +3590,8 @@ static void paint_image(const struct run *r, int sy) {
         return;
     }
 
-    /* placeholder / failed box */
-    uint32_t bg = 0x0026282Cu, bd = COL_URL_BORDER;
+    /* placeholder / failed box (light page theme) */
+    uint32_t bg = 0x00F1F3F4u, bd = 0x00DADCE0u;
     sys_gui_fill(0, r->x, sy, dw, dh, bg);
     sys_gui_fill(0, r->x, sy, dw, 1, bd);
     sys_gui_fill(0, r->x, sy + dh - 1, dw, 1, bd);
@@ -2035,7 +3599,7 @@ static void paint_image(const struct run *r, int sy) {
     sys_gui_fill(0, r->x + dw - 1, sy, 1, dh, bd);
     const char *lbl = (im->state < 0) ? "[image failed]" : "[loading image...]";
     if (dw > 40 && dh > 16)
-        tk_draw_text(&win, r->x + 6, sy + dh / 2 - 7, lbl, COL_URL_HINT, PX_BODY, 0);
+        tk_draw_text(&win, r->x + 6, sy + dh / 2 - 7, lbl, 0x00757A80u, PX_BODY, 0);
 }
 
 /* ---- Tab strip geometry (shared by paint + hit-testing) --------- */
@@ -2148,35 +3712,45 @@ static void paint_all(void) {
         sys_gui_fill(fd, url_x, url_y + url_h - 2, url_w / 3, 2, COL_URL_FOCUS_BD);
     }
 
-    /* Content Area: draw the laid-out runs that intersect the viewport */
-    sys_gui_fill(fd, 0, CONTENT_TOP, g_win_w, g_content_h, COL_PAGE_BG);
+    /* Content Area: paint the display-list items that intersect the
+     * viewport. Items are painted in emission order (containing boxes
+     * before their content), so no z-sorting is needed. */
+    uint32_t page_bg = E ? (E->page_bg & 0xFFFFFF) : 0x00FFFFFFu;
+    sys_gui_fill(fd, 0, CONTENT_TOP, g_win_w, g_content_h, page_bg);
 
-    {
+    if (E) {
         static char tb[512];
         int vtop = g_scroll_y;
         int vbot = g_scroll_y + g_content_h;
+        int vy0 = CONTENT_TOP, vy1 = CONTENT_TOP + g_content_h;
 
-        for (int ri = 0; ri < g_nruns; ri++) {
-            struct run *r = &g_runs[ri];
-            int rh = run_h(r);
-            if (r->y + rh <= vtop) continue;
-            if (r->y >= vbot) break;              /* runs are y-sorted */
+        for (int ri = 0; ri < g_nitems; ri++) {
+            struct ditem *r = &g_items[ri];
+            if (r->y + r->h <= vtop || r->y >= vbot) continue;
             int sy = CONTENT_TOP + (r->y - vtop);
 
-            if (r->fl & FL_HRULE) {
-                sys_gui_fill(fd, r->x, sy + 2, r->w, 1, COL_HR_FG);
+            if (r->kind == DI_RECT) {
+                int y0 = sy, h = r->h;             /* clip to the viewport */
+                if (y0 < vy0) { h -= vy0 - y0; y0 = vy0; }
+                if (y0 + h > vy1) h = vy1 - y0;
+                if (h > 0 && r->w > 0)
+                    sys_gui_fill(fd, r->x, y0, r->w, h, r->fg & 0xFFFFFF);
                 continue;
             }
-            if (r->img >= 0) {
+            if (r->kind == DI_BULLET) {
+                sys_gui_fill(fd, r->x, sy, r->w, r->h, r->fg & 0xFFFFFF);
+                continue;
+            }
+            if (r->kind == DI_IMG) {
                 paint_image(r, sy);
                 continue;
             }
-            if (r->field >= 0) {
+            if (r->kind == DI_FIELD) {
                 struct field *ff = &g_fields[r->field];
-                if (r->fl & FL_INPUT) {
+                if (r->fl & IF_INPUT) {
                     uint32_t bd = (r->field == g_focus_field)
-                                      ? COL_URL_FOCUS_BD : COL_URL_BORDER;
-                    sys_gui_fill(fd, r->x, sy, r->w, FIELD_H, COL_URL_FOCUS_BG);
+                                      ? 0x001A73E8u : 0x009AA0A6u;
+                    sys_gui_fill(fd, r->x, sy, r->w, FIELD_H, 0x00FFFFFFu);
                     sys_gui_fill(fd, r->x, sy, r->w, 1, bd);
                     sys_gui_fill(fd, r->x, sy + FIELD_H - 1, r->w, 1, bd);
                     sys_gui_fill(fd, r->x, sy, 1, FIELD_H, bd);
@@ -2186,42 +3760,30 @@ static void paint_all(void) {
                     int vl = (int)str_len(v);
                     int avail = r->w - 14;
                     while (vl > 0) {
-                        int wpx = 0;
-                        for (int k2 = 0; v[k2]; k2++) {
-                            unsigned char c2 = (unsigned char)v[k2];
-                            wpx += g_adv[FACE_BODY][(c2 >= 32 && c2 <= 126) ? c2 - 32 : 31];
-                        }
-                        if (wpx <= avail) break;
+                        if (text_px_w(v, vl, PX_BODY, 0, 0) <= avail) break;
                         v++; vl--;
                     }
                     if (vl > 0)
-                        tk_draw_text(&win, r->x + 6, sy + 5, v, COL_URL_TEXT,
+                        tk_draw_text(&win, r->x + 6, sy + 5, v, 0x00202124u,
                                      PX_BODY, 0);
                     if (r->field == g_focus_field) {
-                        int cx = r->x + 6;
-                        for (int k2 = 0; v[k2]; k2++) {
-                            unsigned char c2 = (unsigned char)v[k2];
-                            cx += g_adv[FACE_BODY][(c2 >= 32 && c2 <= 126) ? c2 - 32 : 31];
-                        }
+                        int cx = r->x + 6 + text_px_w(v, vl, PX_BODY, 0, 0);
                         if (cx > r->x + r->w - 4) cx = r->x + r->w - 4;
-                        sys_gui_fill(fd, cx, sy + 3, 2, FIELD_H - 6, COL_URL_FOCUS_BD);
+                        sys_gui_fill(fd, cx, sy + 3, 2, FIELD_H - 6, 0x001A73E8u);
                     }
                 } else {
                     /* submit button */
-                    sys_gui_fill(fd, r->x, sy, r->w, FIELD_H, 0x00313845u);
-                    sys_gui_fill(fd, r->x, sy, r->w, 1, COL_URL_BORDER);
-                    sys_gui_fill(fd, r->x, sy + FIELD_H - 1, r->w, 1, COL_URL_BORDER);
-                    sys_gui_fill(fd, r->x, sy, 1, FIELD_H, COL_URL_BORDER);
-                    sys_gui_fill(fd, r->x + r->w - 1, sy, 1, FIELD_H, COL_URL_BORDER);
+                    sys_gui_fill(fd, r->x, sy, r->w, FIELD_H, 0x00F1F3F4u);
+                    sys_gui_fill(fd, r->x, sy, r->w, 1, 0x00DADCE0u);
+                    sys_gui_fill(fd, r->x, sy + FIELD_H - 1, r->w, 1, 0x00DADCE0u);
+                    sys_gui_fill(fd, r->x, sy, 1, FIELD_H, 0x00DADCE0u);
+                    sys_gui_fill(fd, r->x + r->w - 1, sy, 1, FIELD_H, 0x00DADCE0u);
                     tk_draw_text(&win, r->x + 14, sy + 5, ff->value,
-                                 0x00EAF0F7u, PX_BODY, 0);
+                                 0x00202124u, PX_BODY, 0);
                 }
                 continue;
             }
-            if (r->fl & FL_BULLET) {
-                sys_gui_fill(fd, r->x, sy + (rh / 2) - 2, 5, 5, COL_LIST_FG);
-                continue;
-            }
+            /* DI_TEXT */
             if (r->len <= 0) continue;
 
             int n = r->len < (int)sizeof(tb) - 1 ? r->len : (int)sizeof(tb) - 1;
@@ -2233,26 +3795,27 @@ static void paint_all(void) {
             tb[n] = '\0';
 
             if (ri == g_find_run)
-                sys_gui_fill(fd, r->x - 2, sy - 1, r->w + 4, rh, 0x00554400u);
+                sys_gui_fill(fd, r->x - 2, sy, r->w + 4, r->h, 0x00FFE49Cu);
 
-            if (r->fl & FL_CODE) {
-                sys_gui_fill(fd, r->x - 2, sy, r->w + 4, MONO_H, COL_CODE_BG);
-                sys_gui_text(fd, r->x, sy, tb, COL_CODE_FG, COL_CODE_BG);
+            uint32_t fg = r->fg & 0xFFFFFF;
+            if (r->fl & IF_MONO) {
+                uint32_t mbg = (r->bg >> 24) ? (r->bg & 0xFFFFFF) : page_bg;
+                int ty = sy + (r->h - MONO_H) / 2;
+                if ((r->bg >> 24) && ri != g_find_run)
+                    sys_gui_fill(fd, r->x - 2, sy, r->w + 4, r->h, mbg);
+                sys_gui_text(fd, r->x, ty < sy ? sy : ty, tb, fg,
+                             (ri == g_find_run) ? 0x00FFE49Cu : mbg);
                 continue;
             }
-
-            uint32_t fg = COL_TEXT_FG;
-            if (r->px == PX_H1)      fg = COL_H1_FG;
-            else if (r->px == PX_H2) fg = COL_H2_FG;
-            else if (r->px == PX_H3) fg = COL_H3_FG;
-            else if (r->fl & FL_LINK) fg = COL_LINK_FG;
-            else if (r->fl & FL_BOLD) fg = COL_BOLD_FG;
-            else if (r->fl & FL_DIM)  fg = COL_URL_HINT;
-
-            tk_draw_text(&win, r->x, sy, tb, fg, r->px,
-                         (r->fl & FL_BOLD) || r->px != PX_BODY);
-            if (r->fl & FL_LINK)
-                sys_gui_fill(fd, r->x, sy + r->px + 2, r->w, 1, COL_LINK_FG);
+            if ((r->bg >> 24) && ri != g_find_run)
+                sys_gui_fill(fd, r->x - 1, sy, r->w + 2, r->h, r->bg & 0xFFFFFF);
+            int nat = r->px + r->px / 3;
+            int ty = sy + (r->h - nat) / 2;
+            if (ty < sy) ty = sy;
+            tk_draw_text(&win, r->x, ty, tb, fg, r->px,
+                         (r->fl & IF_BOLD) ? 1 : 0);
+            if (r->fl & IF_UNDER)
+                sys_gui_fill(fd, r->x, ty + r->px + 2, r->w, 1, fg);
         }
     }
 
@@ -2335,16 +3898,17 @@ static void follow_link(int num) {
     do_navigate(resolved);
 }
 
-/* Doc-space hit-test: interactive run (link or form control) under
+/* Doc-space hit-test: interactive item (link or form control) under
  * client (mx,my), or NULL. */
-static struct run *run_at(int mx, int my) {
+static struct ditem *run_at(int mx, int my) {
+    if (!E) return NULL;
     int dy = my - CONTENT_TOP + g_scroll_y;
-    for (int ri = 0; ri < g_nruns; ri++) {
-        struct run *r = &g_runs[ri];
-        if (r->y > dy) break;
+    for (int ri = 0; ri < g_nitems; ri++) {
+        struct ditem *r = &g_items[ri];
         if (r->link < 0 && r->field < 0) continue;
-        int rh = (r->field >= 0) ? FIELD_H : run_h(r);
-        if (dy >= r->y && dy < r->y + rh &&
+        if (r->kind != DI_TEXT && r->kind != DI_IMG && r->kind != DI_FIELD)
+            continue;
+        if (dy >= r->y && dy < r->y + r->h &&
             mx >= r->x && mx < r->x + r->w)
             return r;
     }
@@ -2352,7 +3916,7 @@ static struct run *run_at(int mx, int my) {
 }
 
 static int run_link_at(int mx, int my) {
-    struct run *r = run_at(mx, my);
+    struct ditem *r = run_at(mx, my);
     return (r && r->link >= 0) ? r->link : -1;
 }
 
@@ -2439,11 +4003,11 @@ static void handle_mouse_down(int fd, int mx, int my) {
             return;
         }
 
-        /* Inline link / form-control click: hit-test the runs */
-        struct run *hit = run_at(mx, my);
+        /* Inline link / form-control click: hit-test the items */
+        struct ditem *hit = run_at(mx, my);
         if (hit && hit->field >= 0) {
             g_focus_url = 0;
-            if (hit->fl & FL_INPUT) {
+            if (hit->fl & IF_INPUT) {
                 g_focus_field = hit->field;
                 set_status("Type into the field; Enter submits");
             } else {
@@ -2741,9 +4305,9 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
                 if (found < 0) { set_status("No text fields on this page"); break; }
                 g_focus_field = found;
                 g_focus_url = 0;
-                for (int ri = 0; ri < g_nruns; ri++) {
-                    if (g_runs[ri].field == found) {
-                        g_scroll_y = g_runs[ri].y - g_content_h / 3;
+                for (int ri = 0; ri < g_nitems; ri++) {
+                    if (g_items[ri].field == found) {
+                        g_scroll_y = g_items[ri].y - g_content_h / 3;
                         clamp_scroll();
                         break;
                     }
@@ -2776,6 +4340,10 @@ int main(int argc, char **argv) {
     /* One tab to start (its bundle non-zero defaults set by tab_reset). */
     g_ntabs = 1; g_active = 0;
     tab_reset(&g_tabs[0]);
+    if (!g_tabs[0].eng) {
+        sys_write(1, "gui_browser: engine alloc failed\n", 33);
+        return 1;
+    }
 
     if (tk_window_open(&win, WIN_W, WIN_H, "TobyOS Browser") != 0) {
         sys_write(1, "gui_browser: window failed\n", 27);
