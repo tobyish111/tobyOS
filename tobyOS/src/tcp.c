@@ -9,12 +9,14 @@
 #include <tobyos/klibc.h>
 #include <tobyos/sched.h>   /* bkl_held/bkl_exit/bkl_enter for the wait loop */
 
-#define TCP_MAX_CONNS         12
+/* 16: HTTP keep-alive (http.c) parks up to KEEP_MAX=4 idle conns on top
+ * of the active fetch, listeners and TIME_WAIT remnants. */
+#define TCP_MAX_CONNS         16
 /* Per-conn receive buffer == our advertised window. 8 KiB forced a
  * stop-and-wait window refill every ~15 MSS-sized segments, which on a
  * real WAN link (EliteDesk, google.com ~300 KiB) collapsed throughput
  * and let the 5 s per-recv HTTP timeout fire mid-body. 64 KiB rides
- * the already-advertised wscale shift=4. 12 conns x 64 KiB = 768 KiB. */
+ * the already-advertised wscale shift=4. 16 conns x 64 KiB = 1 MiB. */
 #define TCP_RX_BUF_BYTES   65536
 #define TCP_DEFAULT_MSS     1460
 #define TCP_MAX_TX_PENDING  4

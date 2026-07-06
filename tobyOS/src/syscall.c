@@ -782,7 +782,9 @@ static long sys_http_fetch(struct abi_http_fetch *ureq) {
     if (kmax > HTTP_FETCH_KERNEL_MAX) kmax = HTTP_FETCH_KERNEL_MAX;
 
     struct http_response resp;
-    int rc = http_get_follow(cur_url, kmax, HTTP_F_TRUNCATE | HTTP_F_GZIP, &resp);
+    int rc = http_get_follow(cur_url, kmax,
+                             HTTP_F_TRUNCATE | HTTP_F_GZIP | HTTP_F_KEEPALIVE,
+                             &resp);
     if (rc < 0) return (long)rc;
 
     size_t copy = resp.body_len < (size_t)req.buf_sz ? resp.body_len

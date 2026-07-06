@@ -258,9 +258,15 @@ static int g_content_h = WIN_H - TOOLBAR_H - STATUS_H;
 
 /* ---- Content buffer -------------------------------------------- */
 
-#define RAW_CAP       (96 * 1024)
+/* 512 KiB of page HTML: enough for every full Wikipedia article body
+ * (kernel SYS_HTTP_FETCH truncates past this). raw[] lives inline in
+ * struct tab -> TAB_MAX * 512K = 3 MiB BSS; the eng pools below scale
+ * with it (heap, per open tab). */
+#define RAW_CAP       (512 * 1024)
 
-#define RENDER_CAP    (128 * 1024)
+/* Visible-text pool: must exceed RAW_CAP so view-source of a max-size
+ * page keeps every character (source view flows raw through a pre). */
+#define RENDER_CAP    (576 * 1024)
 
 /* Body font size (px); code/pre use the fixed 8x16 mono font. */
 #define PX_BODY   15
@@ -398,15 +404,15 @@ struct dnode {
     int16_t flags;               /* DNF_* */
     struct cstyle st;            /* computed by the style pass */
 };
-#define NODE_MAX  12288
+#define NODE_MAX  32768
 
 struct dattr {                   /* name/value slices in tpool */
     int32_t noff, voff, vlen;
     int16_t nlen;
     int16_t _pad;
 };
-#define ATTR_MAX  12288
-#define TPOOL_CAP (224 * 1024)
+#define ATTR_MAX  32768
+#define TPOOL_CAP (768 * 1024)
 
 /* ---- CSSOM -------------------------------------------------------- */
 
@@ -422,7 +428,7 @@ struct cpart {                   /* one compound selector part */
     int32_t an_off;   int16_t an_len;    /* [name] / [name=value] */
     int32_t av_off;   int16_t av_len;    /* 0 len = presence test */
 };
-#define PART_MAX  6144
+#define PART_MAX  24576
 
 struct cdecl {
     uint8_t prop;                /* CP_* */
@@ -430,7 +436,7 @@ struct cdecl {
     int16_t vlen;
     int32_t voff;                /* raw value text in csspool */
 };
-#define DECL_MAX  8192
+#define DECL_MAX  32768
 
 struct crule {
     int32_t part0; int16_t nparts;
@@ -439,8 +445,8 @@ struct crule {
     uint16_t spec;               /* specificity: 100*id + 10*(cls/attr) + type */
     int32_t order;               /* source order for cascade ties */
 };
-#define RULE_MAX    2048
-#define CSSPOOL_CAP (96 * 1024)
+#define RULE_MAX    8192
+#define CSSPOOL_CAP (320 * 1024)
 
 /* property ids */
 enum {
@@ -481,9 +487,9 @@ struct ditem {
     int16_t link, field, img;    /* interaction indices or -1 */
     uint8_t kind, px, fl, _pad2;
 };
-#define ITEM_MAX  20480
+#define ITEM_MAX  49152
 
-/* ---- The per-tab engine (heap-allocated, ~2.8 MiB) ----------------- */
+/* ---- The per-tab engine (heap-allocated, ~8 MiB) ------------------- */
 
 struct eng {
     /* DOM */
@@ -549,7 +555,7 @@ struct jstimer {
 
 struct tab {
     char   raw[RAW_CAP + 1];   long raw_len;
-    struct eng *eng;           /* DOM/CSS/layout engine (heap, ~2.8 MiB) */
+    struct eng *eng;           /* DOM/CSS/layout engine (heap, ~8 MiB) */
     /* phase 10: the page's JS world persists for the page lifetime so
      * listeners/timers/promises can fire after load */
     JSRuntime *js_rt;
@@ -2969,8 +2975,8 @@ static void js_teardown(struct tab *t);
  * unchanged), parsing <style> blocks, and fetching + parsing
  * <link rel=stylesheet> sheets. */
 
-#define SHEET_MAX       3
-#define SHEET_FETCH_CAP (160 * 1024)
+#define SHEET_MAX       6
+#define SHEET_FETCH_CAP (256 * 1024)
 
 static int g_form_open;          /* collect-walk state: innermost form */
 static int g_js_dirty;           /* a JS primitive mutated the DOM */
@@ -4037,7 +4043,7 @@ static const char JS_PRELUDE[] =
 
 /* ---- run every <script> at load -------------------------------------- */
 
-#define JS_SRC_CAP (192 * 1024)
+#define JS_SRC_CAP (384 * 1024)
 
 static void js_dump_error(JSContext *cx) {
     JSValue e = JS_GetException(cx);

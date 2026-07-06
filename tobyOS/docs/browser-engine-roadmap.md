@@ -141,8 +141,10 @@ lightweight SPA) loads and is interactive.
 - Image formats: **SVG** (Wikipedia's icons — a vector renderer, its own
   mini-project), **WebP/AVIF** (add libs to libtoby).
 - **Web fonts** (`@font-face`, WOFF2 → the TTF rasterizer already exists).
-- Networking depth: **HTTP/1.1 keep-alive + chunked transfer** (chunked
-  is currently *rejected* in `http.c` — many sites need it),
+- Networking depth: **HTTP/1.1 keep-alive + chunked transfer — DONE on
+  branch `http-chunked-keepalive`** (see `browser-stage12a-transport.md`:
+  kernel dechunker + per-host connection cache; google/wikipedia measured
+  at 46 requests over 6 handshakes; page cap 96 K → 512 K),
   **HTTP/2** (there's a stub `src/http2.c`), **WebSockets** (Gmail-class
   apps need them), **cert validation** (TLS currently accepts all certs —
   a real browser must verify), cache, `localStorage`/IndexedDB.

@@ -1,26 +1,29 @@
-/* http.h -- minimal HTTP/1.0 client (Milestone 24D).
+/* http.h -- small synchronous HTTP client (Milestone 24D + browser depth).
  *
- * Tiny synchronous "fetch a URL into a kmalloc buffer" client built
- * directly on top of dns_resolve() + tcp_connect()/tcp_send()/tcp_recv().
+ * "Fetch a URL into a kmalloc buffer" client built directly on top of
+ * dns_resolve() + tcp_connect()/tcp_send()/tcp_recv() (+ tls.c).
  *
  * What we implement:
- *   - URL parser for "http://host[:port][/path]" (no fragments, no
+ *   - URL parser for "http(s)://host[:port][/path]" (no fragments, no
  *     query-string special handling -- everything after the host is
  *     forwarded verbatim as the request-target).
- *   - HTTP GET over a fresh TCP connection.
- *   - Status line + header parsing (case-insensitive header keys).
+ *   - HTTP GET; HTTPS via the TLS 1.3 client.
+ *   - Status line + header parsing (case-insensitive header keys);
+ *     1xx interim responses (e.g. 103 Early Hints) are skipped.
  *   - Content-Length-bounded body collection with a hard ceiling.
+ *   - HTTP/1.1 chunked transfer decoding (dechunked kernel-side, the
+ *     caller always sees the payload bytes).
  *   - Body collection by reading until peer FIN when no
- *     Content-Length was supplied (the common "Connection: close +
- *     no length" path that HTTP/1.0 servers and many 1.1 servers use).
+ *     Content-Length was supplied.
+ *   - Session cookies, gzip (HTTP_F_GZIP), truncate-at-cap semantics
+ *     (HTTP_F_TRUNCATE).
+ *   - HTTP/1.1 keep-alive (HTTP_F_KEEPALIVE): a small per-(host,port,
+ *     scheme) connection cache skips the TCP+TLS handshake on repeated
+ *     fetches (stylesheets, scripts, images). Without the flag every
+ *     request is HTTP/1.0 + "Connection: close" (wget/pkg contract).
  *
- * What we DON'T implement (not required by 24D):
- *   - HTTPS / TLS.
- *   - HTTP/1.1 chunked transfer encoding (we detect it and refuse).
- *   - Redirects (3xx returns the response as-is so the caller can log).
- *   - Persistent connections / pipelining -- we always send
- *     "Connection: close".
- *   - Authentication, cookies, gzip / deflate.
+ * Not implemented: pipelining, authentication, deflate/brotli,
+ * TLS session resumption.
  *
  * Threading: synchronous, polling, no scheduler dependency. Same
  * shape as dhcp.c / dns.c / tcp.c -- safe to call from boot and from
@@ -39,14 +42,20 @@
 #define HTTP_GZIP_READ_MAX         (512u*1024u) /* compressed body read cap */
 #define HTTP_MAX_URL_LEN           512u
 #define HTTP_MAX_HOST_LEN          128u
-#define HTTP_MAX_PATH_LEN          384u
+/* 496: Wikipedia's combined Vector-skin load.php stylesheet URL carries
+ * a path measured at 458 chars on the Cat article (the module list
+ * varies per page); at the old 384 the skin sheet was rejected as a
+ * bad URL and articles rendered unstyled. Total URL stays bounded by
+ * the 512-char syscall buffer. */
+#define HTTP_MAX_PATH_LEN          496u
 
 /* Negative error codes returned by http_get(). */
 #define HTTP_ERR_URL          -1   /* malformed URL or unsupported scheme  */
 #define HTTP_ERR_DNS          -2   /* dns_resolve() failed                 */
 #define HTTP_ERR_CONNECT      -3   /* tcp_connect() failed                 */
 #define HTTP_ERR_PROTOCOL     -4   /* malformed status line / header block */
-#define HTTP_ERR_CHUNKED      -5   /* Transfer-Encoding: chunked (no impl) */
+#define HTTP_ERR_CHUNKED      -5   /* legacy (chunked decodes now); kept so
+                                    * error tables stay index-stable      */
 #define HTTP_ERR_TOOBIG       -6   /* response > max_body_bytes            */
 #define HTTP_ERR_TIMEOUT      -7   /* tcp_recv timed out mid-response      */
 #define HTTP_ERR_NOMEM        -8   /* kmalloc failed                       */
@@ -91,6 +100,12 @@ struct http_response {
 #define HTTP_F_GZIP      0x2u  /* advertise Accept-Encoding: gzip; a gzip
                                 * response comes back RAW with encoding set
                                 * (the caller inflates). Off => identity. */
+#define HTTP_F_KEEPALIVE 0x4u  /* speak HTTP/1.1 and try to reuse a cached
+                                * connection to (host, port, scheme); park
+                                * the connection for the next fetch when
+                                * the response framing allows it. Off =>
+                                * HTTP/1.0 + Connection: close (the exact
+                                * wget/pkg download contract). */
 
 /* Parse a URL string into `out`. Accepts:
  *   http://host
@@ -142,6 +157,11 @@ void http_free(struct http_response *r);
  * Managed automatically by http_get; exposed for tests/inspection. */
 void cookie_jar_clear(void);
 int  cookie_jar_count(void);
+
+/* Keep-alive connection cache: close every parked connection (e.g. on
+ * link down) and report reuse statistics for tests/inspection. */
+void http_keepalive_flush(void);
+void http_keepalive_stats(unsigned *out_reused, unsigned *out_handshakes);
 
 /* Render a HTTP_ERR_* code into a static string for logging. */
 const char *http_strerror(int err);
