@@ -386,6 +386,8 @@ struct cstyle {
 
 /* ---- DOM ---------------------------------------------------------- */
 
+#define DNF_STYLE_DONE 1     /* <style> content already parsed into rules */
+
 struct dnode {
     int32_t parent, first, last, next;   /* tree links (node idx, -1) */
     int32_t toff, tlen;          /* T_TEXT: tpool slice (decoded) */
@@ -393,7 +395,7 @@ struct dnode {
     int16_t nattr;
     int16_t tag;                 /* T_* */
     int16_t link, field, img;    /* interaction indices or -1 */
-    int16_t _pad;
+    int16_t flags;               /* DNF_* */
     struct cstyle st;            /* computed by the style pass */
 };
 #define NODE_MAX  12288
@@ -556,6 +558,7 @@ struct tab {
     int        js_has_dispatch;
     struct jstimer js_timers[JS_TIMER_MAX];
     int        js_timer_seq;
+    char       js_nav[URL_MAX + 1];   /* deferred location.href target */
     struct form forms[FORM_MAX];    int nforms;
     struct field fields[FIELD_MAX]; int nfields; int focus_field;
     struct img  images[IMG_MAX];    int nimages;
@@ -3036,7 +3039,7 @@ static void collect_node(int ni) {
         }
         break;
     case T_INPUT:
-        if (!g_collect_light && g_form_open >= 0 && g_nfields < FIELD_MAX) {
+        if (nd->field < 0 && g_nfields < FIELD_MAX) {
             char ty[20];
             if (!node_attr_str(nd, "type", ty, sizeof(ty))) ty[0] = 0;
             int ftype = -1;
@@ -3047,6 +3050,8 @@ static void collect_node(int ni) {
                 ftype = FT_HIDDEN;
             else if (str_ncasecmp(ty, "submit", 7) == 0)
                 ftype = FT_SUBMIT;
+            if (g_collect_light && ftype != FT_TEXT)
+                ftype = -1;               /* light: only new text inputs */
             if (ftype >= 0) {
                 struct field *fd = &g_fields[g_nfields];
                 mem_zero(fd, sizeof(*fd));
@@ -3062,13 +3067,16 @@ static void collect_node(int ni) {
                     str_copy(fd->value, "Submit", sizeof(fd->value));
                 if (ftype != FT_HIDDEN)
                     nd->field = (int16_t)g_nfields;
-                g_forms[g_form_open].nf++;
+                if (g_form_open >= 0)     /* form-less inputs are legal */
+                    g_forms[g_form_open].nf++;
                 g_nfields++;
             }
         }
         break;
     case T_STYLE: {
-        if (g_collect_light) break;
+        if (nd->flags & DNF_STYLE_DONE) break;
+        nd->flags |= DNF_STYLE_DONE;      /* CSS-in-JS: light mode parses
+                                             script-added styles too */
         char med[128];
         int has_med = node_attr_str(nd, "media", med, sizeof(med));
         if (!has_med || media_matches(med, (int)str_len(med))) {
@@ -3134,6 +3142,9 @@ static void update_title(void);
 static int  msg_append(char *dst, int pos, int max, const char *s);
 static void collect_node(int ni);
 static int  js_dispatch_event(int node, const char *type);
+static int  js_dispatch_key(int node, const char *type, const char *key);
+static void history_push(const char *url);
+static long do_navigate(const char *url);
 
 /* ---- DOM mutation helpers ------------------------------------------ */
 
@@ -3365,15 +3376,132 @@ static JSValue js_dom_settext(JSContext *cx, JSValueConst t, int argc, JSValueCo
     const char *s = JS_ToCString(cx, argv[1]);
     if (ni > 0 && s) {
         g_js_dirty = 1;
-        E->nodes[ni].first = E->nodes[ni].last = -1;
-        int tn = dom_new(T_TEXT, ni);
-        if (tn >= 0) {
-            E->nodes[tn].toff = E->tpool_len;
-            E->nodes[tn].tlen = tp_put_utf8(s, (long)str_len(s));
+        if (E->nodes[ni].tag == T_TEXT) {
+            /* text node: rewrite its slice (Preact sets .data/.nodeValue) */
+            E->nodes[ni].toff = E->tpool_len;
+            E->nodes[ni].tlen = tp_put_utf8(s, (long)str_len(s));
+        } else {
+            E->nodes[ni].first = E->nodes[ni].last = -1;
+            int tn = dom_new(T_TEXT, ni);
+            if (tn >= 0) {
+                E->nodes[tn].toff = E->tpool_len;
+                E->nodes[tn].tlen = tp_put_utf8(s, (long)str_len(s));
+            }
         }
     }
     if (s) JS_FreeCString(cx, s);
     return JS_UNDEFINED;
+}
+
+/* insertBefore(parent, child, ref): attach child before ref (append
+ * when ref < 0). The singly-linked child list makes this a prev-scan. */
+static JSValue js_dom_insbefore(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 3) return JS_UNDEFINED;
+    int pa = jsi(cx, argv[0]);
+    int ch = jsi(cx, argv[1]);
+    int ref = jsi(cx, argv[2]);
+    if (pa < 0 || ch <= 0 || pa == ch) return JS_UNDEFINED;
+    if (ref < 0 || E->nodes[ref].parent != pa) {
+        dom_attach(pa, ch);
+        g_js_dirty = 1;
+        return JS_UNDEFINED;
+    }
+    for (int a = pa; a >= 0; a = E->nodes[a].parent)
+        if (a == ch) return JS_UNDEFINED;  /* cycle */
+    dom_unlink(ch);
+    struct dnode *p = &E->nodes[pa];
+    int prev = -1, c = p->first;
+    while (c >= 0 && c != ref) { prev = c; c = E->nodes[c].next; }
+    E->nodes[ch].parent = pa;
+    E->nodes[ch].next = ref;
+    if (prev < 0) p->first = ch;
+    else E->nodes[prev].next = ch;
+    g_js_dirty = 1;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_dom_removeattr(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_UNDEFINED;
+    int ni = jsi(cx, argv[0]);
+    const char *name = JS_ToCString(cx, argv[1]);
+    if (ni > 0 && name) {
+        struct dnode *n = &E->nodes[ni];
+        int nlen = (int)str_len(name);
+        int new0 = E->nattrs;
+        for (int i = 0; i < n->nattr && E->nattrs < ATTR_MAX; i++) {
+            struct dattr *a = &E->attrs[n->attr0 + i];
+            int match = (a->nlen == nlen);
+            if (match)
+                for (int k = 0; k < nlen; k++)
+                    if (lc(E->tpool[a->noff + k]) != lc(name[k])) { match = 0; break; }
+            if (!match)
+                E->attrs[E->nattrs++] = *a;
+        }
+        n->attr0 = new0;
+        n->nattr = (int16_t)(E->nattrs - new0);
+        g_js_dirty = 1;
+    }
+    if (name) JS_FreeCString(cx, name);
+    return JS_UNDEFINED;
+}
+
+/* childNodes: ALL children incl. text nodes (Preact walks these). */
+static JSValue js_dom_childnodes(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    JSValue arr = JS_NewArray(cx);
+    int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    if (ni >= 0) {
+        uint32_t k = 0;
+        for (int c = E->nodes[ni].first; c >= 0; c = E->nodes[c].next)
+            JS_SetPropertyUint32(cx, arr, k++, JS_NewInt32(cx, c));
+    }
+    return arr;
+}
+
+static JSValue js_dom_nextsib(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    return JS_NewInt32(cx, ni >= 0 ? E->nodes[ni].next : -1);
+}
+
+/* pushState(url): update the address bar + history, no navigation. */
+static JSValue js_dom_pushstate(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc >= 1) {
+        const char *u = JS_ToCString(cx, argv[0]);
+        if (u && u[0]) {
+            char url[URL_MAX + 1];
+            resolve_relative_url(g_url, u, url, URL_MAX);
+            str_copy(g_url, url, URL_MAX);
+            g_url_len = (int)str_len(g_url);
+            history_push(g_url);
+        }
+        if (u) JS_FreeCString(cx, u);
+    }
+    return JS_UNDEFINED;
+}
+
+/* navigate(url): DEFERRED -- performed after JS unwinds (navigation
+ * tears down the running runtime). */
+static JSValue js_dom_navigate(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc >= 1) {
+        const char *u = JS_ToCString(cx, argv[0]);
+        if (u && u[0]) {
+            char url[URL_MAX + 1];
+            resolve_relative_url(g_url, u, url, URL_MAX);
+            str_copy(cur->js_nav, url, URL_MAX);
+        }
+        if (u) JS_FreeCString(cx, u);
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_dom_href(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t; (void)argc; (void)argv;
+    return JS_NewString(cx, g_url);
 }
 
 static JSValue js_dom_gettext(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
@@ -3622,7 +3750,19 @@ static const char JS_PRELUDE[] =
 "    this.__i = i;\n"
 "    var self = this;\n"
 "    this.style = new Proxy({}, {\n"
+"      get: function(tg, k){\n"
+"        if (k === 'setProperty')\n"
+"          return function(n, v){ self.style[String(n).replace(/-([a-z])/g,\n"
+"            function(m, c){ return c.toUpperCase(); })] = v; };\n"
+"        if (k === 'removeProperty') return function(n){};\n"
+"        if (k === 'cssText') return '';\n"
+"        return tg[k];\n"
+"      },\n"
 "      set: function(tg, k, v){\n"
+"        if (k === 'cssText'){\n"
+"          D.setAttr(self.__i, 'style', String(v));\n"
+"          return true;\n"
+"        }\n"
 "        tg[k] = v;\n"
 "        var s = '';\n"
 "        for (var kk in tg){\n"
@@ -3666,8 +3806,42 @@ static const char JS_PRELUDE[] =
 "      set: function(v){ D.setAttr(this.__i, 'class', String(v)); }\n"
 "    },\n"
 "    tagName: { get: function(){ return D.tag(this.__i).toUpperCase(); } },\n"
+"    nodeName: { get: function(){ return D.tag(this.__i).toUpperCase(); } },\n"
+"    localName: { get: function(){ return D.tag(this.__i); } },\n"
+"    nodeType: { get: function(){ return D.tag(this.__i) === '#text' ? 3 : 1; } },\n"
 "    parentNode: { get: function(){ return el(D.parent(this.__i)); } },\n"
-"    children: { get: function(){ return D.children(this.__i).map(el); } }\n"
+"    children: { get: function(){ return D.children(this.__i).map(el); } },\n"
+"    childNodes: { get: function(){ return D.childNodes(this.__i).map(el); } },\n"
+"    firstChild: { get: function(){\n"
+"      var c = D.childNodes(this.__i);\n"
+"      return c.length ? el(c[0]) : null;\n"
+"    } },\n"
+"    lastChild: { get: function(){\n"
+"      var c = D.childNodes(this.__i);\n"
+"      return c.length ? el(c[c.length - 1]) : null;\n"
+"    } },\n"
+"    nextSibling: { get: function(){ return el(D.nextSib(this.__i)); } },\n"
+"    nodeValue: {\n"
+"      get: function(){ return D.getText(this.__i); },\n"
+"      set: function(v){ D.setText(this.__i, String(v)); }\n"
+"    },\n"
+"    data: {\n"
+"      get: function(){ return D.getText(this.__i); },\n"
+"      set: function(v){ D.setText(this.__i, String(v)); }\n"
+"    },\n"
+"    classList: { get: function(){\n"
+"      var self = this;\n"
+"      function toks(){\n"
+"        return (D.getAttr(self.__i, 'class') || '').split(/\\s+/).filter(Boolean);\n"
+"      }\n"
+"      return {\n"
+"        add: function(c){ var t = toks(); if (t.indexOf(c) < 0){ t.push(c); D.setAttr(self.__i, 'class', t.join(' ')); } },\n"
+"        remove: function(c){ D.setAttr(self.__i, 'class', toks().filter(function(x){ return x !== c; }).join(' ')); },\n"
+"        toggle: function(c){ var t = toks(); var ix = t.indexOf(c); if (ix < 0) t.push(c); else t.splice(ix, 1); D.setAttr(self.__i, 'class', t.join(' ')); },\n"
+"        contains: function(c){ return toks().indexOf(c) >= 0; }\n"
+"      };\n"
+"    } },\n"
+"    ownerDocument: { get: function(){ return g.document; } }\n"
 "  });\n"
 "  Element.prototype.appendChild = function(c){ D.append(this.__i, c.__i); return c; };\n"
 "  Element.prototype.removeChild = function(c){ D.remove(c.__i); return c; };\n"
@@ -3675,14 +3849,39 @@ static const char JS_PRELUDE[] =
 "  Element.prototype.setAttribute = function(n, v){ D.setAttr(this.__i, String(n), String(v)); };\n"
 "  Element.prototype.getAttribute = function(n){ return D.getAttr(this.__i, String(n)); };\n"
 "  Element.prototype.querySelector = function(s){ return el(D.query(String(s))); };\n"
+"  Element.prototype.insertBefore = function(c, ref){\n"
+"    D.insBefore(this.__i, c.__i, ref ? ref.__i : -1);\n"
+"    return c;\n"
+"  };\n"
+"  Element.prototype.replaceChild = function(nc, oc){\n"
+"    D.insBefore(this.__i, nc.__i, oc.__i);\n"
+"    D.remove(oc.__i);\n"
+"    return oc;\n"
+"  };\n"
+"  Element.prototype.removeAttribute = function(n){ D.removeAttr(this.__i, String(n)); };\n"
+"  Element.prototype.hasAttribute = function(n){ return D.getAttr(this.__i, String(n)) !== null; };\n"
+"  Element.prototype.contains = function(o){\n"
+"    for (var n = o; n; n = n.parentNode) if (n.__i === this.__i) return true;\n"
+"    return false;\n"
+"  };\n"
 "  Element.prototype.addEventListener = function(t, f){\n"
+"    t = String(t).toLowerCase();\n"
 "    if (!this.__lst) this.__lst = {};\n"
 "    (this.__lst[t] = this.__lst[t] || []).push(f);\n"
 "  };\n"
 "  Element.prototype.removeEventListener = function(t, f){\n"
+"    t = String(t).toLowerCase();\n"
 "    var a = this.__lst && this.__lst[t];\n"
 "    if (a){ var ix = a.indexOf(f); if (ix >= 0) a.splice(ix, 1); }\n"
 "  };\n"
+"  ['click','dblclick','input','change','keydown','keyup','keypress',\n"
+"   'submit','focus','blur','focusin','focusout','mousedown','mouseup',\n"
+"   'mousemove','mouseover','mouseout','mouseenter','mouseleave','load',\n"
+"   'error','scroll','wheel','contextmenu','pointerdown','pointerup',\n"
+"   'pointermove','touchstart','touchend','touchmove','drag','drop',\n"
+"   'animationend','transitionend'].forEach(function(t){\n"
+"    Element.prototype['on' + t] = null;\n"
+"  });\n"
 "  Element.prototype.click = function(){ dispatch(this.__i, 'click'); };\n"
 "  Element.prototype.focus = function(){};\n"
 "  Object.defineProperty(Element.prototype, 'value', {\n"
@@ -3690,14 +3889,20 @@ static const char JS_PRELUDE[] =
 "    set: function(v){ D.setValue(this.__i, String(v)); }\n"
 "  });\n"
 "  var docListeners = {};\n"
-"  function dispatch(i, type){\n"
+"  function dispatch(i, type, key){\n"
 "    var pd = false, stop = false;\n"
 "    var evt = {\n"
 "      type: type,\n"
+"      key: key || '',\n"
+"      keyCode: (key && key.length === 1) ? key.charCodeAt(0)\n"
+"               : (key === 'Enter' ? 13 : key === 'Backspace' ? 8\n"
+"               : key === 'Escape' ? 27 : key === 'Tab' ? 9 : 0),\n"
 "      target: el(i >= 0 ? i : D.body()),\n"
 "      currentTarget: null,\n"
+"      bubbles: true,\n"
 "      preventDefault: function(){ pd = true; },\n"
-"      stopPropagation: function(){ stop = true; }\n"
+"      stopPropagation: function(){ stop = true; },\n"
+"      stopImmediatePropagation: function(){ stop = true; }\n"
 "    };\n"
 "    if (i < 0){\n"
 "      var ls = docListeners[type] || [];\n"
@@ -3735,6 +3940,9 @@ static const char JS_PRELUDE[] =
 "      (docListeners[t] = docListeners[t] || []).push(f);\n"
 "    },\n"
 "    removeEventListener: function(){},\n"
+"    createElementNS: function(ns, t){ return el(D.create(String(t))); },\n"
+"    createDocumentFragment: function(){ return el(D.create('div')); },\n"
+"    get documentElement(){ return el(D.body()); },\n"
 "    get body(){ return el(D.body()); },\n"
 "    set title(v){ D.title(String(v)); },\n"
 "    get title(){ return ''; }\n"
@@ -3783,6 +3991,48 @@ static const char JS_PRELUDE[] =
 "    }, 0);\n"
 "  };\n"
 "  g.navigator = { userAgent: 'TobyOS/4.0 (tobyOS x86_64) QuickJS' };\n"
+"  function parseUrl(h){\n"
+"    var m = /^(https?:)\\/\\/([^\\/?#]*)([^?#]*)(\\??[^#]*)(#?.*)$/.exec(h) || [];\n"
+"    return { protocol: m[1] || '', host: m[2] || '', pathname: m[3] || '/',\n"
+"             search: m[4] || '', hash: m[5] || '' };\n"
+"  }\n"
+"  g.location = {\n"
+"    get href(){ return D.href(); },\n"
+"    set href(v){ D.navigate(String(v)); },\n"
+"    get protocol(){ return parseUrl(D.href()).protocol; },\n"
+"    get host(){ return parseUrl(D.href()).host; },\n"
+"    get hostname(){ return parseUrl(D.href()).host.split(':')[0]; },\n"
+"    get pathname(){ return parseUrl(D.href()).pathname; },\n"
+"    get search(){ return parseUrl(D.href()).search; },\n"
+"    get hash(){ return parseUrl(D.href()).hash; },\n"
+"    get origin(){ var u = parseUrl(D.href()); return u.protocol + '//' + u.host; },\n"
+"    assign: function(u){ D.navigate(String(u)); },\n"
+"    replace: function(u){ D.navigate(String(u)); },\n"
+"    reload: function(){ D.navigate(D.href()); },\n"
+"    toString: function(){ return D.href(); }\n"
+"  };\n"
+"  g.history = {\n"
+"    pushState: function(st, ti, u){ if (u) D.pushState(String(u)); },\n"
+"    replaceState: function(st, ti, u){ if (u) D.pushState(String(u)); },\n"
+"    back: function(){},\n"
+"    forward: function(){},\n"
+"    state: null\n"
+"  };\n"
+"  function mkStorage(){\n"
+"    var st = {};\n"
+"    var o = {\n"
+"      getItem: function(k){ return (k in st) ? st[k] : null; },\n"
+"      setItem: function(k, v){ st[String(k)] = String(v); },\n"
+"      removeItem: function(k){ delete st[k]; },\n"
+"      clear: function(){ st = {}; },\n"
+"      key: function(i){ return Object.keys(st)[i] || null; }\n"
+"    };\n"
+"    Object.defineProperty(o, 'length',\n"
+"      { get: function(){ return Object.keys(st).length; } });\n"
+"    return o;\n"
+"  }\n"
+"  g.localStorage = mkStorage();\n"
+"  g.sessionStorage = mkStorage();\n"
 "})(globalThis);\n";
 
 /* ---- run every <script> at load -------------------------------------- */
@@ -3836,6 +4086,13 @@ static int js_ensure(void) {
             {"getValue", js_dom_getvalue, 1},
             {"setValue", js_dom_setvalue, 2},
             {"setDispatcher", js_dom_setdispatcher, 1},
+            {"insBefore", js_dom_insbefore, 3},
+            {"removeAttr", js_dom_removeattr, 2},
+            {"childNodes", js_dom_childnodes, 1},
+            {"nextSib", js_dom_nextsib, 1},
+            {"pushState", js_dom_pushstate, 1},
+            {"navigate", js_dom_navigate, 1},
+            {"href", js_dom_href, 0},
         };
         for (unsigned k = 0; k < sizeof(B) / sizeof(B[0]); k++)
             JS_SetPropertyStr(cx, dom, B[k].n,
@@ -3954,24 +4211,63 @@ static void js_rerender(void) {
 }
 
 /* Call the prelude dispatcher: bubble `type` from `node` (or document
- * level when node < 0). Returns 1 when preventDefault() was called. */
-static int js_dispatch_event(int node, const char *type) {
+ * level when node < 0), with a key payload for keyboard events.
+ * Returns 1 when preventDefault() was called. */
+static int js_dispatch_key(int node, const char *type, const char *key) {
     if (!cur->js_cx || !cur->js_has_dispatch) return 0;
     JSContext *cx = cur->js_cx;
-    JSValue args[2] = { JS_NewInt32(cx, node), JS_NewString(cx, type) };
-    JSValue r = JS_Call(cx, cur->js_dispatch, JS_UNDEFINED, 2, args);
+    JSValue args[3] = { JS_NewInt32(cx, node), JS_NewString(cx, type),
+                        JS_NewString(cx, key ? key : "") };
+    JSValue r = JS_Call(cx, cur->js_dispatch, JS_UNDEFINED, 3, args);
     int prevented = 0;
     if (JS_IsException(r)) js_dump_error(cx);
     else prevented = JS_ToBool(cx, r);
     JS_FreeValue(cx, r);
     JS_FreeValue(cx, args[0]);
     JS_FreeValue(cx, args[1]);
+    JS_FreeValue(cx, args[2]);
     js_drain_jobs(cur);
     if (g_js_dirty && !g_js_in_load) {
         g_js_dirty = 0;
         js_rerender();
     }
     return prevented;
+}
+
+static int js_dispatch_event(int node, const char *type) {
+    return js_dispatch_key(node, type, "");
+}
+
+/* Key byte -> DOM KeyboardEvent.key name ("" = do not dispatch). */
+static const char *js_key_name(uint8_t key, char one[2]) {
+    switch (key) {
+    case 0x0A: case 0x0D: return "Enter";
+    case 0x08: case 0x7F: return "Backspace";
+    case 0x1B: return "Escape";
+    case 0x09: return "Tab";
+    case 0x80: return "ArrowUp";
+    case 0x81: return "ArrowDown";
+    case 0x82: return "ArrowLeft";
+    case 0x83: return "ArrowRight";
+    case 0x84: return "Home";
+    case 0x85: return "End";
+    case 0x86: return "Delete";
+    }
+    if (key >= 0x20 && key <= 0x7E) {
+        one[0] = (char)key;
+        one[1] = 0;
+        return one;
+    }
+    return "";
+}
+
+/* Execute a location.href navigation once JS has fully unwound. */
+static void js_do_pending_nav(void) {
+    if (!cur->js_nav[0]) return;
+    char url[URL_MAX + 1];
+    str_copy(url, cur->js_nav, URL_MAX);
+    cur->js_nav[0] = 0;
+    do_navigate(url);
 }
 
 /* Main-loop tick: run due timers + pending jobs for every tab with a
@@ -4005,6 +4301,11 @@ static int js_pump_all(void) {
         if (g_js_dirty) {
             g_js_dirty = 0;
             js_rerender();
+            tk_redraw(&win);
+            work = 1;
+        }
+        if (cur->js_nav[0]) {             /* location.href assignment */
+            js_do_pending_nav();
             tk_redraw(&win);
             work = 1;
         }
@@ -5253,9 +5554,13 @@ static void handle_mouse_down(int fd, int mx, int my) {
                     mx >= r2->x && mx < r2->x + r2->w)
                     evn = r2->node;        /* last match = topmost */
             }
-            if (evn >= 0 && js_dispatch_event(evn, "click")) {
-                redraw(fd);
-                return;
+            if (evn >= 0) {
+                int prevented = js_dispatch_event(evn, "click");
+                js_do_pending_nav();
+                if (prevented) {
+                    redraw(fd);
+                    return;
+                }
             }
         }
 
@@ -5331,6 +5636,15 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
      * unfocuses, Enter submits the field's form). */
     if (g_focus_field >= 0 && !g_focus_url && !g_find_mode) {
         struct field *f = &g_fields[g_focus_field];
+        if (cur->js_cx && f->node >= 0) {
+            char one[2];
+            const char *kn = js_key_name(key, one);
+            if (kn[0] && js_dispatch_key(f->node, "keydown", kn)) {
+                js_do_pending_nav();
+                redraw(0);
+                return;
+            }
+        }
         if (key == 27) {
             g_focus_field = -1;
             set_status("Field unfocused");
@@ -5460,6 +5774,17 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
                     redraw(0);
                     return;
                 }
+            }
+
+            if (cur->js_cx) {
+                char one[2];
+                const char *kn = js_key_name(key, one);
+                if (kn[0] && js_dispatch_key(-1, "keydown", kn)) {
+                    js_do_pending_nav();
+                    redraw(0);
+                    return;
+                }
+                js_do_pending_nav();
             }
 
             switch (key) {

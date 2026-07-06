@@ -158,6 +158,13 @@ aiming straight at it:
 2. A `<script>` DOM-mutation demo updates on screen (Ph 9).
 3. `fetch` + a small hand-written SPA works (Ph 10).
 4. A real lightweight SPA (e.g. a simple React/Preact app) renders.
+   **DONE on branch `browser-spa`** (see `browser-stage11-spa.md`):
+   off-the-shelf Preact 10 + htm + hooks mounts and reacts — clicks
+   drive useState, keyboard flows through a controlled input, keydown
+   Enter adds items. Filled: insertBefore/childNodes/text-node
+   mutation/classList/localName, on*-property listener-name trap,
+   keydown events, location/history/localStorage, CSS-in-JS styles,
+   form-less inputs.
 5. Progressively harder real sites… Gmail is the summit, likely requiring
    most of Phase 11 too.
 
