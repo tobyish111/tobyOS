@@ -284,6 +284,7 @@ struct field {
     int16_t  form;
     uint8_t  type;               /* FT_* */
     int16_t  size;               /* <input size=N> or 0 */
+    int16_t  node;               /* DOM node (JS 'input' events + .value) */
     char     name[64];
     char     value[192];         /* editable in place for FT_TEXT */
 };
@@ -473,6 +474,7 @@ struct ditem {
     int32_t x, y, w, h;          /* doc coords */
     uint32_t fg, bg;             /* text fg / rect color; text bg (0=none) */
     int32_t off;                 /* render-pool slice (DI_TEXT) */
+    int32_t node;                /* source DOM node (JS event target), -1 */
     int16_t len;
     int16_t link, field, img;    /* interaction indices or -1 */
     uint8_t kind, px, fl, _pad2;
@@ -533,9 +535,27 @@ static char g_status_text[128];
  * TAB_MAX inline tabs => a few MiB of BSS (the ELF loader maps+zeroes it
  * eagerly, trivially affordable). Window geometry, the font advance
  * tables, the status bar and parser scratch stay app-global (below). */
+/* Phase 10: one-shot/interval timers owned by a tab's JS runtime. */
+#define JS_TIMER_MAX 32
+struct jstimer {
+    int      id;
+    long     due_ms;
+    long     interval_ms;        /* 0 = one-shot */
+    JSValue  fn;
+    uint8_t  used;
+};
+
 struct tab {
     char   raw[RAW_CAP + 1];   long raw_len;
     struct eng *eng;           /* DOM/CSS/layout engine (heap, ~2.8 MiB) */
+    /* phase 10: the page's JS world persists for the page lifetime so
+     * listeners/timers/promises can fire after load */
+    JSRuntime *js_rt;
+    JSContext *js_cx;
+    JSValue    js_dispatch;    /* prelude event dispatcher */
+    int        js_has_dispatch;
+    struct jstimer js_timers[JS_TIMER_MAX];
+    int        js_timer_seq;
     struct form forms[FORM_MAX];    int nforms;
     struct field fields[FIELD_MAX]; int nfields; int focus_field;
     struct img  images[IMG_MAX];    int nimages;
@@ -2242,7 +2262,7 @@ static const char UA_SHEET[] =
 "sub,sup{font-size:11px}\n"
 "mark{background-color:#ffef9c}\n"
 "figure{margin:8px 0 8px 24px}\n"
-"button{display:inline-block}\n";
+"button{display:inline-block;background-color:#f1f3f4;border:1px solid #babcbe;padding:2px 10px}\n";
 
 /* =================== Layout: DOM + styles -> display list =========== */
 
@@ -2282,6 +2302,7 @@ static struct ditem *item_new(int kind) {
     mem_zero(it, sizeof(*it));
     it->kind = (uint8_t)kind;
     it->link = it->field = it->img = -1;
+    it->node = -1;
     return it;
 }
 
@@ -2349,6 +2370,7 @@ struct istyle {
     int lh;                      /* resolved line height for text items */
     int link;
     int pre;
+    int node;                    /* nearest element node (event target) */
 };
 
 struct ictx {
@@ -2440,6 +2462,7 @@ static void ic_word(struct ictx *ic, const char *w, int wl, const struct istyle 
         it->px = (uint8_t)is->px;
         it->fl = (uint8_t)is->fl;
         it->link = (int16_t)is->link;
+        it->node = is->node;
         ic->citem = (int)(it - E->items);
         cu = it;
     }
@@ -2461,7 +2484,7 @@ static void ic_word(struct ictx *ic, const char *w, int wl, const struct istyle 
 
 /* Atomic inline box (image / form control). */
 static void ic_atomic(struct ictx *ic, int kind, int w, int h,
-                      int link, int field, int img, int fl) {
+                      int link, int field, int img, int fl, int node) {
     for (int guard = 0; guard < 64; guard++) {
         if (ic->x > ic->lx0 && ic->x + w > ic->lx1) {
             ic_break(ic, h + 2);
@@ -2491,6 +2514,7 @@ static void ic_atomic(struct ictx *ic, int kind, int w, int h,
     it->img = (int16_t)img;
     it->fl = (uint8_t)fl;
     it->px = PX_BODY;
+    it->node = node;
     ic->x += w + 4;
     if (h + 2 > ic->line_h) ic->line_h = h + 2;
     ic->citem = -1;
@@ -2555,6 +2579,7 @@ static void inl_walk(struct ictx *ic, int ni, const struct istyle *is) {
     cs.lh = st_line_h(st);
     cs.pre = (st->fl & SF_PRE) ? 1 : 0;
     cs.link = nd->link >= 0 ? nd->link : is->link;
+    cs.node = ni;
 
     if (nd->img >= 0) {
         int dw, dh;
@@ -2567,14 +2592,14 @@ static void inl_walk(struct ictx *ic, int ni, const struct istyle *is) {
         if (st->height > 0) dh = st->height;
         if (dw < 1) dw = 1;
         if (dh < 1) dh = 1;
-        ic_atomic(ic, DI_IMG, dw, dh, cs.link, -1, nd->img, 0);
+        ic_atomic(ic, DI_IMG, dw, dh, cs.link, -1, nd->img, 0, ni);
         return;
     }
     if (nd->field >= 0) {
         struct field *f = &g_fields[nd->field];
         int fl2 = (f->type == FT_TEXT) ? IF_INPUT : IF_SUBMITB;
         ic_atomic(ic, DI_FIELD, field_w(f, (uint8_t)fl2), FIELD_H,
-                  -1, nd->field, -1, fl2);
+                  -1, nd->field, -1, fl2, ni);
         return;
     }
     /* inline container (block-in-inline degrades to inline flow) */
@@ -2597,7 +2622,7 @@ static int is_inline_level(int ci) {
  * so the mono painter can fill matching cells. */
 static int flush_inline(int first_child, int stop_child, int cx, int cw,
                         int y, const struct cstyle *bst, int link,
-                        uint32_t inbg) {
+                        uint32_t inbg, int bnode) {
     struct ictx ic;
     ic.cx = cx;
     ic.cw = cw > 8 ? cw : 8;
@@ -2621,6 +2646,7 @@ static int flush_inline(int first_child, int stop_child, int cx, int cw,
     is.lh = st_line_h(bst);
     is.pre = (bst->fl & SF_PRE) ? 1 : 0;
     is.link = link;
+    is.node = bnode;
     int n0 = E->nitems;
     for (int c = first_child; c >= 0 && c != stop_child; c = E->nodes[c].next)
         inl_walk(&ic, c, &is);
@@ -2682,6 +2708,7 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
         it->h = dh;
         it->img = nd->img;
         it->link = (int16_t)(nd->link >= 0 ? nd->link : link);
+        it->node = ni;
         bw2 = ml + dw;
         bbh = dh;
     } else {
@@ -2791,8 +2818,10 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     int bbw = bwl + pl + content_w + pr + bwr;
 
     int bg_i = -1;
-    if (st->bg >> 24)
+    if (st->bg >> 24) {
         bg_i = emit_rect(bx, by, bbw, 0, st->bg);   /* height patched below */
+        if (bg_i >= 0) E->items[bg_i].node = ni;    /* clicks on the box */
+    }
 
     if (st->disp == D_LISTITEM && !(st->fl & SF_NOBULLET)) {
         struct ditem *bu = item_new(DI_BULLET);
@@ -2820,7 +2849,8 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
             int start = c;
             while (c >= 0 && is_inline_level(c))
                 c = E->nodes[c].next;
-            int ny = flush_inline(start, c, cx, content_w, cy, st, link, curbg);
+            int ny = flush_inline(start, c, cx, content_w, cy, st, link,
+                                  curbg, ni);
             if (ny != cy) prev_mb = 0;
             cy = ny;
         } else {
@@ -2928,6 +2958,7 @@ static void tab_images_free(struct tab *t);
 static void layout(int width);
 static void clamp_scroll(void);
 static int  has_scheme(const char *s);
+static void js_teardown(struct tab *t);
 
 /* ---- Collect pass: interaction objects + stylesheets ---------------- *
  * Walks the DOM in document order registering links/images/forms/title
@@ -2939,6 +2970,10 @@ static int  has_scheme(const char *s);
 #define SHEET_FETCH_CAP (160 * 1024)
 
 static int g_form_open;          /* collect-walk state: innermost form */
+static int g_js_dirty;           /* a JS primitive mutated the DOM */
+static int g_js_in_load;         /* inside render_html: defer rerender */
+static int g_collect_light;      /* collect pass: skip styles/forms,
+                                    register only unregistered nodes */
 
 static void collect_node(int ni) {
     struct dnode *nd = &E->nodes[ni];
@@ -2960,7 +2995,8 @@ static void collect_node(int ni) {
     }
     case T_A: {
         char href[LINK_URL_MAX];
-        if (node_attr_str(nd, "href", href, sizeof(href)) && href[0] &&
+        if (nd->link < 0 &&
+            node_attr_str(nd, "href", href, sizeof(href)) && href[0] &&
             g_link_count < LINK_MAX) {
             str_copy(g_links[g_link_count], href, LINK_URL_MAX);
             nd->link = (int16_t)g_link_count++;
@@ -2969,7 +3005,7 @@ static void collect_node(int ni) {
     }
     case T_IMG: {
         char src[512];
-        if (g_nimages < IMG_MAX &&
+        if (nd->img < 0 && g_nimages < IMG_MAX &&
             node_attr_str(nd, "src", src, sizeof(src)) && src[0] &&
             /* skip data: URIs cheaply */
             !(src[0] == 'd' && src[1] == 'a' && src[2] == 't' &&
@@ -2988,7 +3024,7 @@ static void collect_node(int ni) {
         break;
     }
     case T_FORM:
-        if (g_nforms < FORM_MAX) {
+        if (!g_collect_light && g_nforms < FORM_MAX) {
             struct form *f = &g_forms[g_nforms];
             f->first = (int16_t)g_nfields;
             f->nf = 0;
@@ -3000,7 +3036,7 @@ static void collect_node(int ni) {
         }
         break;
     case T_INPUT:
-        if (g_form_open >= 0 && g_nfields < FIELD_MAX) {
+        if (!g_collect_light && g_form_open >= 0 && g_nfields < FIELD_MAX) {
             char ty[20];
             if (!node_attr_str(nd, "type", ty, sizeof(ty))) ty[0] = 0;
             int ftype = -1;
@@ -3016,6 +3052,7 @@ static void collect_node(int ni) {
                 mem_zero(fd, sizeof(*fd));
                 fd->form = (int16_t)g_form_open;
                 fd->type = (uint8_t)ftype;
+                fd->node = (int16_t)ni;
                 node_attr_str(nd, "name", fd->name, sizeof(fd->name));
                 node_attr_str(nd, "value", fd->value, sizeof(fd->value));
                 char szs[8];
@@ -3031,6 +3068,7 @@ static void collect_node(int ni) {
         }
         break;
     case T_STYLE: {
+        if (g_collect_light) break;
         char med[128];
         int has_med = node_attr_str(nd, "media", med, sizeof(med));
         if (!has_med || media_matches(med, (int)str_len(med))) {
@@ -3042,6 +3080,7 @@ static void collect_node(int ni) {
         break;
     }
     case T_LINKE: {
+        if (g_collect_light) break;
         char rel[64], href[512], med[128];
         if (node_attr_str(nd, "rel", rel, sizeof(rel)) &&
             str_contains(rel, (int)str_len(rel), "stylesheet", 10) >= 0 &&
@@ -3093,6 +3132,8 @@ static void collect_node(int ni) {
 static void set_status(const char *s);
 static void update_title(void);
 static int  msg_append(char *dst, int pos, int max, const char *s);
+static void collect_node(int ni);
+static int  js_dispatch_event(int node, const char *type);
 
 /* ---- DOM mutation helpers ------------------------------------------ */
 
@@ -3307,13 +3348,13 @@ static JSValue js_dom_text(JSContext *cx, JSValueConst t, int argc, JSValueConst
 
 static JSValue js_dom_append(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t;
-    if (argc >= 2) dom_attach(jsi(cx, argv[0]), jsi(cx, argv[1]));
+    if (argc >= 2) { dom_attach(jsi(cx, argv[0]), jsi(cx, argv[1])); g_js_dirty = 1; }
     return JS_UNDEFINED;
 }
 
 static JSValue js_dom_remove(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t;
-    if (argc >= 1) dom_unlink(jsi(cx, argv[0]));
+    if (argc >= 1) { dom_unlink(jsi(cx, argv[0])); g_js_dirty = 1; }
     return JS_UNDEFINED;
 }
 
@@ -3323,6 +3364,7 @@ static JSValue js_dom_settext(JSContext *cx, JSValueConst t, int argc, JSValueCo
     int ni = jsi(cx, argv[0]);
     const char *s = JS_ToCString(cx, argv[1]);
     if (ni > 0 && s) {
+        g_js_dirty = 1;
         E->nodes[ni].first = E->nodes[ni].last = -1;
         int tn = dom_new(T_TEXT, ni);
         if (tn >= 0) {
@@ -3349,6 +3391,7 @@ static JSValue js_dom_sethtml(JSContext *cx, JSValueConst t, int argc, JSValueCo
     int ni = jsi(cx, argv[0]);
     const char *s = JS_ToCString(cx, argv[1]);
     if (ni > 0 && s) {
+        g_js_dirty = 1;
         E->nodes[ni].first = E->nodes[ni].last = -1;
         dom_parse(s, (long)str_len(s), ni);
     }
@@ -3377,7 +3420,7 @@ static JSValue js_dom_setattr(JSContext *cx, JSValueConst t, int argc, JSValueCo
     int ni = jsi(cx, argv[0]);
     const char *name = JS_ToCString(cx, argv[1]);
     const char *val = JS_ToCString(cx, argv[2]);
-    if (ni > 0 && name && val) dom_set_attr(ni, name, val);
+    if (ni > 0 && name && val) { dom_set_attr(ni, name, val); g_js_dirty = 1; }
     if (name) JS_FreeCString(cx, name);
     if (val) JS_FreeCString(cx, val);
     return JS_UNDEFINED;
@@ -3425,6 +3468,149 @@ static JSValue js_dom_title(JSContext *cx, JSValueConst t, int argc, JSValueCons
     }
     return JS_UNDEFINED;
 }
+
+/* ---- phase 10 primitives: timers, fetch, field values, dispatch ---- */
+
+struct sys_timeval { long tv_sec; long tv_usec; };
+extern int gettimeofday(struct sys_timeval *tv, void *tz);
+
+static long js_now_ms(void) {
+    struct sys_timeval tv;
+    gettimeofday(&tv, 0);
+    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static JSValue js_dom_timer(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2 || !JS_IsFunction(cx, argv[0])) return JS_NewInt32(cx, 0);
+    int32_t ms = 0, rep = 0;
+    JS_ToInt32(cx, &ms, argv[1]);
+    if (argc >= 3) JS_ToInt32(cx, &rep, argv[2]);
+    if (ms < 0) ms = 0;
+    for (int k = 0; k < JS_TIMER_MAX; k++) {
+        struct jstimer *tm = &cur->js_timers[k];
+        if (tm->used) continue;
+        tm->used = 1;
+        tm->id = cur->js_timer_seq++;
+        tm->due_ms = js_now_ms() + ms;
+        tm->interval_ms = rep ? (ms > 0 ? ms : 10) : 0;
+        tm->fn = JS_DupValue(cx, argv[0]);
+        return JS_NewInt32(cx, tm->id);
+    }
+    return JS_NewInt32(cx, 0);
+}
+
+static JSValue js_dom_untimer(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int32_t id = 0;
+    if (argc >= 1) JS_ToInt32(cx, &id, argv[0]);
+    for (int k = 0; k < JS_TIMER_MAX; k++) {
+        struct jstimer *tm = &cur->js_timers[k];
+        if (tm->used && tm->id == id) {
+            JS_FreeValue(cx, tm->fn);
+            tm->used = 0;
+            break;
+        }
+    }
+    return JS_UNDEFINED;
+}
+
+#define JS_FETCH_CAP (256 * 1024)
+
+/* Synchronous fetch over the kernel HTTP/TLS stack (SPAs assume async;
+ * the Promise-shaped wrapper lives in the prelude -- honest blocking
+ * until the kernel grows an async HTTP ABI). */
+static JSValue js_dom_fetchsync(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    JSValue obj = JS_NewObject(cx);
+    int status = 0;
+    int have_body = 0;
+    if (argc >= 1) {
+        const char *u = JS_ToCString(cx, argv[0]);
+        if (u) {
+            char url[URL_MAX + 1];
+            resolve_relative_url(g_url, u, url, URL_MAX);
+            if (has_scheme(url)) {
+                char *buf = (char *)malloc(JS_FETCH_CAP + 1);
+                if (buf) {
+                    struct http_fetch req;
+                    mem_zero(&req, sizeof(req));
+                    req.url = (unsigned long)url;
+                    req.buf = (unsigned long)buf;
+                    req.buf_sz = JS_FETCH_CAP;
+                    long r = sys_http_fetch(&req);
+                    if (r >= 0) {
+                        status = req.status;
+                        JS_SetPropertyStr(cx, obj, "body",
+                            JS_NewStringLen(cx, buf, (size_t)r));
+                        JS_SetPropertyStr(cx, obj, "url",
+                            JS_NewString(cx, req.final_url[0] ? req.final_url : url));
+                        have_body = 1;
+                    }
+                    free(buf);
+                }
+            }
+            JS_FreeCString(cx, u);
+        }
+    }
+    if (!have_body) {
+        JS_SetPropertyStr(cx, obj, "body", JS_NewString(cx, ""));
+        JS_SetPropertyStr(cx, obj, "url", JS_NewString(cx, ""));
+    }
+    JS_SetPropertyStr(cx, obj, "status", JS_NewInt32(cx, status));
+    return obj;
+}
+
+static JSValue js_dom_getvalue(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    if (ni > 0 && E->nodes[ni].field >= 0)
+        return JS_NewString(cx, g_fields[E->nodes[ni].field].value);
+    return JS_NewString(cx, "");
+}
+
+static JSValue js_dom_setvalue(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_UNDEFINED;
+    int ni = jsi(cx, argv[0]);
+    const char *s = JS_ToCString(cx, argv[1]);
+    if (ni > 0 && s && E->nodes[ni].field >= 0) {
+        struct field *f = &g_fields[E->nodes[ni].field];
+        str_copy(f->value, s, sizeof(f->value));
+        g_js_dirty = 1;
+    }
+    if (s) JS_FreeCString(cx, s);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_dom_setdispatcher(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc >= 1 && JS_IsFunction(cx, argv[0])) {
+        if (cur->js_has_dispatch) JS_FreeValue(cx, cur->js_dispatch);
+        cur->js_dispatch = JS_DupValue(cx, argv[0]);
+        cur->js_has_dispatch = 1;
+    }
+    return JS_UNDEFINED;
+}
+
+/* Free a tab's JS world (navigation away / tab close). */
+static void js_teardown(struct tab *t) {
+    if (!t->js_cx) { t->js_rt = NULL; return; }
+    JSContext *cx = t->js_cx;
+    for (int k = 0; k < JS_TIMER_MAX; k++)
+        if (t->js_timers[k].used) {
+            JS_FreeValue(cx, t->js_timers[k].fn);
+            t->js_timers[k].used = 0;
+        }
+    if (t->js_has_dispatch) JS_FreeValue(cx, t->js_dispatch);
+    t->js_has_dispatch = 0;
+    JS_FreeContext(cx);
+    JS_FreeRuntime(t->js_rt);
+    t->js_cx = NULL;
+    t->js_rt = NULL;
+}
+
+static void js_drain_jobs(struct tab *t);
 
 /* ---- prelude: document/Element wrappers over __dom ------------------ */
 
@@ -3489,22 +3675,113 @@ static const char JS_PRELUDE[] =
 "  Element.prototype.setAttribute = function(n, v){ D.setAttr(this.__i, String(n), String(v)); };\n"
 "  Element.prototype.getAttribute = function(n){ return D.getAttr(this.__i, String(n)); };\n"
 "  Element.prototype.querySelector = function(s){ return el(D.query(String(s))); };\n"
-"  Element.prototype.addEventListener = function(){};\n"
+"  Element.prototype.addEventListener = function(t, f){\n"
+"    if (!this.__lst) this.__lst = {};\n"
+"    (this.__lst[t] = this.__lst[t] || []).push(f);\n"
+"  };\n"
+"  Element.prototype.removeEventListener = function(t, f){\n"
+"    var a = this.__lst && this.__lst[t];\n"
+"    if (a){ var ix = a.indexOf(f); if (ix >= 0) a.splice(ix, 1); }\n"
+"  };\n"
+"  Element.prototype.click = function(){ dispatch(this.__i, 'click'); };\n"
+"  Element.prototype.focus = function(){};\n"
+"  Object.defineProperty(Element.prototype, 'value', {\n"
+"    get: function(){ return D.getValue(this.__i); },\n"
+"    set: function(v){ D.setValue(this.__i, String(v)); }\n"
+"  });\n"
+"  var docListeners = {};\n"
+"  function dispatch(i, type){\n"
+"    var pd = false, stop = false;\n"
+"    var evt = {\n"
+"      type: type,\n"
+"      target: el(i >= 0 ? i : D.body()),\n"
+"      currentTarget: null,\n"
+"      preventDefault: function(){ pd = true; },\n"
+"      stopPropagation: function(){ stop = true; }\n"
+"    };\n"
+"    if (i < 0){\n"
+"      var ls = docListeners[type] || [];\n"
+"      for (var k = 0; k < ls.length; k++){\n"
+"        try { ls[k].call(g.document, evt); }\n"
+"        catch(e){ g.console.log('[evt-err]', e); }\n"
+"      }\n"
+"      return pd;\n"
+"    }\n"
+"    var n = i;\n"
+"    while (n >= 0 && !stop){\n"
+"      var w = el(n);\n"
+"      evt.currentTarget = w;\n"
+"      var ls = (w.__lst && w.__lst[type]) || [];\n"
+"      for (var k = 0; k < ls.length && !stop; k++){\n"
+"        try { ls[k].call(w, evt); }\n"
+"        catch(e){ g.console.log('[evt-err]', e); }\n"
+"      }\n"
+"      var oc = D.getAttr(n, 'on' + type);\n"
+"      if (oc){\n"
+"        try { (new Function('event', oc)).call(w, evt); }\n"
+"        catch(e){ g.console.log('[evt-err]', e); }\n"
+"      }\n"
+"      n = D.parent(n);\n"
+"    }\n"
+"    return pd;\n"
+"  }\n"
+"  D.setDispatcher(dispatch);\n"
 "  g.document = {\n"
 "    getElementById: function(id){ return el(D.byId(String(id))); },\n"
 "    querySelector: function(s){ return el(D.query(String(s))); },\n"
 "    createElement: function(t){ return el(D.create(String(t))); },\n"
 "    createTextNode: function(t){ return el(D.text(String(t))); },\n"
-"    addEventListener: function(){},\n"
+"    addEventListener: function(t, f){\n"
+"      (docListeners[t] = docListeners[t] || []).push(f);\n"
+"    },\n"
+"    removeEventListener: function(){},\n"
 "    get body(){ return el(D.body()); },\n"
 "    set title(v){ D.title(String(v)); },\n"
 "    get title(){ return ''; }\n"
 "  };\n"
 "  g.window = g;\n"
+"  g.window.addEventListener = g.document.addEventListener;\n"
 "  g.alert = function(m){ g.console.log('[alert]', m); };\n"
-"  g.setTimeout = function(f){ if (typeof f === 'function') f(); return 0; };\n"
-"  g.setInterval = function(){ return 0; };\n"
-"  g.requestAnimationFrame = function(f){ if (typeof f === 'function') f(0); return 0; };\n"
+"  g.setTimeout = function(f, ms){\n"
+"    return (typeof f === 'function') ? D.timer(f, ms|0, 0) : 0;\n"
+"  };\n"
+"  g.setInterval = function(f, ms){\n"
+"    return (typeof f === 'function') ? D.timer(f, (ms|0) || 10, 1) : 0;\n"
+"  };\n"
+"  g.clearTimeout = g.clearInterval = function(id){ D.untimer(id|0); };\n"
+"  g.queueMicrotask = function(f){ Promise.resolve().then(f); };\n"
+"  g.requestAnimationFrame = function(f){\n"
+"    return g.setTimeout(function(){ f(0); }, 16);\n"
+"  };\n"
+"  g.fetch = function(u){\n"
+"    return new Promise(function(res, rej){\n"
+"      var r = D.fetchSync(String(u));\n"
+"      if (!r || r.status <= 0){ rej(new Error('fetch failed')); return; }\n"
+"      res({\n"
+"        ok: r.status >= 200 && r.status < 300,\n"
+"        status: r.status,\n"
+"        url: r.url,\n"
+"        text: function(){ return Promise.resolve(r.body); },\n"
+"        json: function(){ return Promise.resolve(JSON.parse(r.body)); }\n"
+"      });\n"
+"    });\n"
+"  };\n"
+"  g.XMLHttpRequest = function(){\n"
+"    this.readyState = 0; this.status = 0; this.responseText = '';\n"
+"  };\n"
+"  g.XMLHttpRequest.prototype.open = function(m, u){ this.__u = u; this.readyState = 1; };\n"
+"  g.XMLHttpRequest.prototype.setRequestHeader = function(){};\n"
+"  g.XMLHttpRequest.prototype.send = function(){\n"
+"    var r = D.fetchSync(String(this.__u));\n"
+"    this.status = r ? r.status : 0;\n"
+"    this.responseText = r ? r.body : '';\n"
+"    this.readyState = 4;\n"
+"    var sf = this;\n"
+"    g.setTimeout(function(){\n"
+"      if (sf.onreadystatechange) sf.onreadystatechange();\n"
+"      if (sf.onload) sf.onload();\n"
+"    }, 0);\n"
+"  };\n"
 "  g.navigator = { userAgent: 'TobyOS/4.0 (tobyOS x86_64) QuickJS' };\n"
 "})(globalThis);\n";
 
@@ -3529,19 +3806,18 @@ static void js_dump_error(JSContext *cx) {
     JS_FreeValue(cx, e);
 }
 
-static void run_scripts(void) {
-    int scripts[64];
-    int ns = 0;
-    for (int i = 1; i < E->nnodes && ns < 64; i++)
-        if (E->nodes[i].tag == T_SCRIPT) scripts[ns++] = i;
-    if (!ns) return;
-
+/* Create the tab's persistent JS world (bindings + prelude). */
+static int js_ensure(void) {
+    if (cur->js_cx) return 1;
     JSRuntime *rt = JS_NewRuntime();
-    if (!rt) return;
+    if (!rt) return 0;
     JS_SetMemoryLimit(rt, 32u * 1024 * 1024);
     JS_SetMaxStackSize(rt, 192 * 1024);
     JSContext *cx = JS_NewContext(rt);
-    if (!cx) { JS_FreeRuntime(rt); return; }
+    if (!cx) { JS_FreeRuntime(rt); return 0; }
+    cur->js_rt = rt;
+    cur->js_cx = cx;
+    cur->js_timer_seq = 1;
 
     {
         JSValue g = JS_GetGlobalObject(cx);
@@ -3555,6 +3831,11 @@ static void run_scripts(void) {
             {"setAttr", js_dom_setattr, 3},{"tag", js_dom_tag, 1},
             {"parent", js_dom_parent, 1}, {"children", js_dom_children, 1},
             {"body", js_dom_body, 0},     {"title", js_dom_title, 1},
+            {"timer", js_dom_timer, 3},   {"untimer", js_dom_untimer, 1},
+            {"fetchSync", js_dom_fetchsync, 1},
+            {"getValue", js_dom_getvalue, 1},
+            {"setValue", js_dom_setvalue, 2},
+            {"setDispatcher", js_dom_setdispatcher, 1},
         };
         for (unsigned k = 0; k < sizeof(B) / sizeof(B[0]); k++)
             JS_SetPropertyStr(cx, dom, B[k].n,
@@ -3576,6 +3857,17 @@ static void run_scripts(void) {
         if (JS_IsException(r)) js_dump_error(cx);
         JS_FreeValue(cx, r);
     }
+    return 1;
+}
+
+static void run_scripts(void) {
+    int scripts[64];
+    int ns = 0;
+    for (int i = 1; i < E->nnodes && ns < 64; i++)
+        if (E->nodes[i].tag == T_SCRIPT) scripts[ns++] = i;
+    if (!ns) return;
+    if (!js_ensure()) return;
+    JSContext *cx = cur->js_cx;
 
     for (int k = 0; k < ns; k++) {
         struct dnode *nd = &E->nodes[scripts[k]];
@@ -3624,19 +3916,116 @@ static void run_scripts(void) {
         if (fbuf) free(fbuf);
     }
 
-    JS_FreeContext(cx);
-    JS_FreeRuntime(rt);
+    /* microtasks queued during load, then the document lifecycle
+     * events (the runtime stays alive: phase 10) */
+    js_drain_jobs(cur);
+    js_dispatch_event(-1, "DOMContentLoaded");
+    js_dispatch_event(-1, "load");
+}
+
+/* ---- Phase 10: the event loop half ---------------------------------- */
+
+static void js_drain_jobs(struct tab *t) {
+    if (!t->js_rt) return;
+    for (int i = 0; i < 256; i++) {
+        JSContext *cx1;
+        int r = JS_ExecutePendingJob(t->js_rt, &cx1);
+        if (r <= 0) {
+            if (r < 0) js_dump_error(cx1);
+            break;
+        }
+    }
+}
+
+/* JS mutated the DOM: register new links/images (light collect),
+ * re-cascade (class/style attribute changes), re-layout. The CSSOM is
+ * NOT rebuilt: stylesheets added by scripts after load are ignored. */
+static void js_rerender(void) {
+    g_collect_light = 1;
+    g_form_open = -1;
+    collect_node(0);
+    g_collect_light = 0;
+    struct cstyle base;
+    st_init(&base, NULL);
+    base.disp = D_BLOCK;
+    style_node(0, &base);
+    layout(g_win_w);
+    clamp_scroll();
+}
+
+/* Call the prelude dispatcher: bubble `type` from `node` (or document
+ * level when node < 0). Returns 1 when preventDefault() was called. */
+static int js_dispatch_event(int node, const char *type) {
+    if (!cur->js_cx || !cur->js_has_dispatch) return 0;
+    JSContext *cx = cur->js_cx;
+    JSValue args[2] = { JS_NewInt32(cx, node), JS_NewString(cx, type) };
+    JSValue r = JS_Call(cx, cur->js_dispatch, JS_UNDEFINED, 2, args);
+    int prevented = 0;
+    if (JS_IsException(r)) js_dump_error(cx);
+    else prevented = JS_ToBool(cx, r);
+    JS_FreeValue(cx, r);
+    JS_FreeValue(cx, args[0]);
+    JS_FreeValue(cx, args[1]);
+    js_drain_jobs(cur);
+    if (g_js_dirty && !g_js_in_load) {
+        g_js_dirty = 0;
+        js_rerender();
+    }
+    return prevented;
+}
+
+/* Main-loop tick: run due timers + pending jobs for every tab with a
+ * live JS world (g_active flips like the image loader so the __dom
+ * primitives address the right engine). Returns 1 if work was done. */
+static int js_pump_all(void) {
+    int work = 0;
+    for (int ti = 0; ti < g_ntabs; ti++) {
+        struct tab *t = &g_tabs[ti];
+        if (!t->js_cx) continue;
+        int save = g_active;
+        g_active = ti;
+        long now = js_now_ms();
+        for (int k = 0; k < JS_TIMER_MAX; k++) {
+            struct jstimer *tm = &t->js_timers[k];
+            if (!tm->used || now < tm->due_ms) continue;
+            JSValue fn = JS_DupValue(t->js_cx, tm->fn);
+            if (tm->interval_ms > 0) {
+                tm->due_ms = now + tm->interval_ms;
+            } else {
+                JS_FreeValue(t->js_cx, tm->fn);
+                tm->used = 0;
+            }
+            JSValue r = JS_Call(t->js_cx, fn, JS_UNDEFINED, 0, NULL);
+            if (JS_IsException(r)) js_dump_error(t->js_cx);
+            JS_FreeValue(t->js_cx, r);
+            JS_FreeValue(t->js_cx, fn);
+            work = 1;
+        }
+        js_drain_jobs(t);
+        if (g_js_dirty) {
+            g_js_dirty = 0;
+            js_rerender();
+            tk_redraw(&win);
+            work = 1;
+        }
+        g_active = save;
+    }
+    return work;
 }
 
 /* ---- The full pipeline: raw -> DOM -> CSSOM -> style -> layout ------ */
 
 static void render_html(void) {
     if (!E) return;
+    js_teardown(cur);                     /* the old page's JS world dies */
     images_free();
     page_reset();
 
     dom_build();
-    run_scripts();                        /* phase 9: mutate, then style */
+    g_js_in_load = 1;                     /* pipeline restyles anyway */
+    run_scripts();                        /* phase 9/10: mutate, then style */
+    g_js_in_load = 0;
+    g_js_dirty = 0;
     css_parse_sheet(UA_SHEET, (long)sizeof(UA_SHEET) - 1, 0);
     g_form_open = -1;
     collect_node(0);
@@ -3654,6 +4043,7 @@ static void render_html(void) {
  * synthesize doc > body > pre > #text and run the normal pipeline. */
 static void render_mono_doc(void) {
     if (!E) return;
+    js_teardown(cur);
     images_free();
     page_reset();
 
@@ -3903,6 +4293,7 @@ static void set_home_page(void) {
 
 static void tab_reset(struct tab *t) {
     tab_images_free(t);
+    js_teardown(t);
     struct eng *e = t->eng;    /* the heap engine survives tab resets */
     mem_zero(t, sizeof(*t));
     if (!e) e = (struct eng *)malloc(sizeof(struct eng));
@@ -3939,6 +4330,7 @@ static void tab_close(int idx) {
     if (idx < 0 || idx >= g_ntabs) return;
     if (g_ntabs == 1) sys_exit(0);
     tab_images_free(&g_tabs[idx]);
+    js_teardown(&g_tabs[idx]);
     if (g_tabs[idx].eng) { free(g_tabs[idx].eng); g_tabs[idx].eng = NULL; }
     for (int i = idx; i < g_ntabs - 1; i++)
         g_tabs[i] = g_tabs[i + 1];        /* struct copy shifts the bundle */
@@ -4848,6 +5240,25 @@ static void handle_mouse_down(int fd, int mx, int my) {
             return;
         }
 
+        /* JS click dispatch first: bubble from the topmost item under
+         * the cursor; a preventDefault() suppresses the default
+         * link/submit action below. */
+        if (cur->js_cx && cur->js_has_dispatch && E) {
+            int dy2 = my - CONTENT_TOP + g_scroll_y;
+            int evn = -1;
+            for (int ri = 0; ri < g_nitems; ri++) {
+                struct ditem *r2 = &g_items[ri];
+                if (r2->node < 0) continue;
+                if (dy2 >= r2->y && dy2 < r2->y + r2->h &&
+                    mx >= r2->x && mx < r2->x + r2->w)
+                    evn = r2->node;        /* last match = topmost */
+            }
+            if (evn >= 0 && js_dispatch_event(evn, "click")) {
+                redraw(fd);
+                return;
+            }
+        }
+
         /* Inline link / form-control click: hit-test the items */
         struct ditem *hit = run_at(mx, my);
         if (hit && hit->field >= 0) {
@@ -4935,6 +5346,8 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
         } else if (key == 8 || key == 127) {
             int l = (int)str_len(f->value);
             if (l > 0) f->value[l - 1] = 0;
+            if (cur->js_cx && f->node >= 0)
+                js_dispatch_event(f->node, "input");
             redraw(0);
             return;
         } else if (key >= 0x20 && key <= 0x7E) {
@@ -4943,6 +5356,8 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
                 f->value[l] = (char)key;
                 f->value[l + 1] = 0;
             }
+            if (cur->js_cx && f->node >= 0)
+                js_dispatch_event(f->node, "input");
             redraw(0);
             return;
         } else {
@@ -5213,7 +5628,9 @@ int main(int argc, char **argv) {
     tk_redraw(&win);
     for (;;) {
         if (tk_pump(&win)) break;          /* events + repaint; 1 = quit */
-        if (!load_one_pending_image())
+        int work = load_one_pending_image();
+        work |= js_pump_all();             /* timers + promise jobs */
+        if (!work)
             sys_sleep_ms(15);              /* nothing pending -> idle */
     }
     return 0;

@@ -116,6 +116,15 @@ Milestone: a page with `<script>` that mutates the DOM (a counter, a
 toggling menu) actually updates on screen.
 
 ### Phase 10 — Event loop + Web APIs + reactive reflow. Where apps start working.
+**STATUS: v1 LANDED on branch `browser-events`** (see
+`browser-stage10-events.md`): persistent per-tab runtime, real
+setTimeout/setInterval + Promise microtask draining on the cooperative
+main loop, click/input dispatch with bubbling + preventDefault +
+onclick attrs (display items carry their DOM node), DOMContentLoaded/
+load, element.value, fetch/XHR (Promise-shaped over the SYNC kernel
+HTTP — async ABI still the known blocker), and reactive
+mutate→recollect(light)→cascade→layout→repaint. NOT yet: keydown/
+keyup, location/history, storage, JS-added stylesheets.
 - **Event loop**: microtasks/macrotasks, `setTimeout/setInterval`,
   Promises (QuickJS has Promises built-in — wire them to the loop).
 - **Events**: real dispatch (click/input/load/DOMContentLoaded) with
