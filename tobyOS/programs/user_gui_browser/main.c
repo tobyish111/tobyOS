@@ -525,6 +525,11 @@ struct cstyle {
     int32_t  gtr_off;            /* grid-template-rows raw text offset */
     int16_t  gtc_len, gtr_len;   /* 0 = none */
     uint8_t  gcol_span, grow_span; /* item column/row span (default 1) */
+    uint8_t  ovf;                /* overflow: 1 = clip (hidden/scroll/auto) */
+    uint8_t  has_tf;             /* transform: translate present */
+    int16_t  txpx, typx;         /* transform translate px */
+    int8_t   txpct, typct;       /* transform translate % (of own size) */
+    uint8_t  po_pct;             /* top/right/bottom/left are % (bits T R B L) */
 };
 
 /* ---- DOM ---------------------------------------------------------- */
@@ -606,6 +611,7 @@ enum {
     CP_POSITION, CP_TOP, CP_RIGHT, CP_BOTTOM, CP_LEFT,
     CP_VAR,                      /* --custom-property (resolved via var()) */
     CP_GRID_TC, CP_GRID_TR, CP_GRID_COL, CP_GRID_ROW,
+    CP_OVERFLOW, CP_OVERFLOWX, CP_OVERFLOWY, CP_TRANSFORM,
     CP__N
 };
 
@@ -633,7 +639,8 @@ struct ditem {
     int32_t node;                /* source DOM node (JS event target), -1 */
     int16_t len;
     int16_t link, field, img;    /* interaction indices or -1 */
-    uint8_t kind, px, fl, _pad2;
+    uint8_t kind, px, fl;
+    uint8_t clip;                /* index into g_clips (0 = no clip) */
 };
 #define ITEM_MAX  49152
 
@@ -1756,6 +1763,8 @@ static int prop_lookup(const char *s, int len) {
         {"bottom",CP_BOTTOM},{"left",CP_LEFT},
         {"grid-template-columns",CP_GRID_TC},{"grid-template-rows",CP_GRID_TR},
         {"grid-column",CP_GRID_COL},{"grid-row",CP_GRID_ROW},
+        {"overflow",CP_OVERFLOW},{"overflow-x",CP_OVERFLOWX},
+        {"overflow-y",CP_OVERFLOWY},{"transform",CP_TRANSFORM},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -2191,6 +2200,11 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->gcol_span = 1;
     st->grow_span = 1;
     /* grid template offsets are only read when gtc_len/gtr_len > 0 */
+    st->ovf = 0;
+    st->has_tf = 0;
+    st->txpx = st->typx = 0;
+    st->txpct = st->typct = 0;
+    st->po_pct = 0;
 }
 
 static int clamp_px(int v) {
@@ -2790,6 +2804,64 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         else st->grow_span = (uint8_t)span;
         break;
     }
+    case CP_OVERFLOW: case CP_OVERFLOWX: case CP_OVERFLOWY:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "hidden") || tok_is(&t, "scroll") ||
+                tok_is(&t, "auto") || tok_is(&t, "clip"))
+                st->ovf = 1;
+            else st->ovf = 0;              /* visible */
+        }
+        break;
+    case CP_TRANSFORM: {
+        /* v1: translate()/translateX()/translateY(); px or % of own size.
+         * scale/rotate/matrix are ignored (no wrong result, just no-op). */
+        st->has_tf = 0; st->txpx = 0; st->typx = 0; st->txpct = 0; st->typct = 0;
+        int fo = str_contains(v, n, "translate", 9);
+        if (fo >= 0) {
+            int isx = (fo + 9 < n && lc(v[fo + 9]) == 'x');
+            int isy = (fo + 9 < n && lc(v[fo + 9]) == 'y');
+            int p2 = fo + 9;
+            while (p2 < n && v[p2] != '(') p2++;
+            if (p2 < n) p2++;
+            int e2 = p2;
+            while (e2 < n && v[e2] != ')') e2++;
+            /* parse up to two comma-separated components */
+            int comp = 0;
+            int cs = p2;
+            for (int q = p2; q <= e2 && comp < 2; q++) {
+                if (q == e2 || v[q] == ',') {
+                    int cl = q - cs;
+                    while (cl > 0 && is_whitespace(v[cs])) { cs++; cl--; }
+                    int ce = cs + cl;
+                    while (ce > cs && is_whitespace(v[ce - 1])) ce--;
+                    cl = ce - cs;
+                    if (cl > 0) {
+                        int pct = (v[cs + cl - 1] == '%');
+                        int px = 0;
+                        if (pct) {
+                            int num = 0, neg = 0, k = cs;
+                            if (v[k] == '-') { neg = 1; k++; }
+                            for (; k < cs + cl - 1 && v[k] >= '0' && v[k] <= '9'; k++)
+                                num = num * 10 + (v[k] - '0');
+                            px = neg ? -num : num;
+                        } else {
+                            css_len_tok(v + cs, cl, st->px, &px);
+                        }
+                        int axis = isy ? 1 : (isx ? 0 : comp);
+                        if (axis == 0) {
+                            if (pct) st->txpct = (int8_t)px; else st->txpx = (int16_t)px;
+                        } else {
+                            if (pct) st->typct = (int8_t)px; else st->typx = (int16_t)px;
+                        }
+                        st->has_tf = 1;
+                    }
+                    cs = q + 1;
+                    comp++;
+                }
+            }
+        }
+        break;
+    }
     case CP_POSITION:
         if (vtok_next(v, n, &pos, &t)) {
             if (tok_is(&t, "relative") || tok_is(&t, "sticky"))
@@ -2803,9 +2875,10 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         int side = d->prop - CP_TOP;          /* T R B L, contiguous enum */
         if (vtok_next(v, n, &pos, &t)) {
             int px;
-            if (tok_is(&t, "auto")) st->po[side] = M_AUTO;
-            else if (css_len_tok(t.s, t.len, st->px, &px) == LK_PX)
-                st->po[side] = clamp_m(px);
+            int k = css_len_tok(t.s, t.len, st->px, &px);
+            if (tok_is(&t, "auto")) { st->po[side] = M_AUTO; st->po_pct &= (uint8_t)~(1 << side); }
+            else if (k == LK_PX) { st->po[side] = clamp_m(px); st->po_pct &= (uint8_t)~(1 << side); }
+            else if (k == LK_PCT) { st->po[side] = (int16_t)px; st->po_pct |= (uint8_t)(1 << side); }
         }
         break;
     }
@@ -3071,6 +3144,16 @@ static int field_w(const struct field *f, uint8_t fl) {
 }
 #define FIELD_H (PX_BODY + 12)
 
+/* overflow clip rects (stage 13D). Each display item carries a clip
+ * index; the painter intersects the item with g_clips[idx] (doc coords,
+ * already the intersection with any ancestor clip). Index 0 = no clip.
+ * g_cur_clip is the clip in force while laying the current subtree. */
+#define CLIP_MAX 128
+struct cliprect { int32_t x, y, w, h; };
+static struct cliprect g_clips[CLIP_MAX];
+static int g_nclips;       /* index 0 reserved as "no clip" */
+static int g_cur_clip;
+
 static struct ditem *item_new(int kind) {
     if (E->nitems >= ITEM_MAX) return NULL;
     struct ditem *it = &E->items[E->nitems++];
@@ -3078,6 +3161,7 @@ static struct ditem *item_new(int kind) {
     it->kind = (uint8_t)kind;
     it->link = it->field = it->img = -1;
     it->node = -1;
+    it->clip = (uint8_t)g_cur_clip;        /* overflow clip in force */
     return it;
 }
 
@@ -3101,6 +3185,7 @@ static int g_nflts;
 static int g_flt_bottom;
 static int g_flt_freeze;   /* shrink-to-fit measure pass: floats are
                               neither consulted nor registered */
+
 
 /* Line-box bounds at band [y, y+h) within [cx, cx+cw). */
 static void float_bounds(int y, int h, int cx, int cw, int *lx0, int *lx1) {
@@ -3583,7 +3668,7 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
 #define ABS_MAX 64
 struct absq {
     int     node;
-    int     cb_x, cb_y, cb_w;    /* containing block (border box) */
+    int     cb_x, cb_y, cb_w, cb_h;  /* containing block (border box) */
     int     sx, sy;              /* static-position fallback */
     uint8_t fixed;
 };
@@ -3591,9 +3676,10 @@ static struct absq g_absq[ABS_MAX];
 static int g_nabsq;
 
 /* Current positioned containing block (set by positioned ancestors in
- * lay_block; initialized to the document by layout()). */
-static int g_cb_x, g_cb_y, g_cb_w;
-static int g_vp_w;               /* viewport content width at layout() */
+ * lay_block; initialized to the document by layout()). cb_h is -1 when
+ * the positioned ancestor's height is auto (unknown at queue time). */
+static int g_cb_x, g_cb_y, g_cb_w, g_cb_h;
+static int g_vp_w, g_vp_h;       /* viewport content size at layout() */
 
 static void absq_add(int ni, int sx, int sy) {
     if (g_flt_freeze || g_nabsq >= ABS_MAX) return;   /* measure: ignore */
@@ -3601,10 +3687,10 @@ static void absq_add(int ni, int sx, int sy) {
     q->node = ni;
     q->fixed = (E->nodes[ni].st.pos == 3);
     if (q->fixed) {
-        q->cb_x = 0; q->cb_y = 0; q->cb_w = g_vp_w;
+        q->cb_x = 0; q->cb_y = 0; q->cb_w = g_vp_w; q->cb_h = g_vp_h;
         q->sx = sx; q->sy = 0;
     } else {
-        q->cb_x = g_cb_x; q->cb_y = g_cb_y; q->cb_w = g_cb_w;
+        q->cb_x = g_cb_x; q->cb_y = g_cb_y; q->cb_w = g_cb_w; q->cb_h = g_cb_h;
         q->sx = sx; q->sy = sy;
     }
 }
@@ -4372,12 +4458,14 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     int bbw = bwl + pl + content_w + pr + bwr;
 
     /* A positioned element is the containing block for its absolute
-     * descendants (queued with a snapshot of these coords). */
-    int save_cbx = g_cb_x, save_cby = g_cb_y, save_cbw = g_cb_w;
+     * descendants (queued with a snapshot of these coords). cb_h is
+     * known only when this element has an explicit height. */
+    int save_cbx = g_cb_x, save_cby = g_cb_y, save_cbw = g_cb_w, save_cbh = g_cb_h;
     if (st->pos != 0 && !g_flt_freeze) {
         g_cb_x = bx;
         g_cb_y = by;
         g_cb_w = bbw;
+        g_cb_h = (st->height >= 0) ? bwt + pt + st->height + pb + bwb : -1;
     }
 
     int bg_i = -1;
@@ -4397,6 +4485,29 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
         }
     }
 
+    /* overflow: clip descendants to this element's padding box. The
+     * box height is known upfront only when height is explicit (which
+     * is exactly when vertical clipping matters -- an auto-height box
+     * grows to fit and never clips vertically). Width always clips. */
+    int save_clip = g_cur_clip;
+    if (st->ovf && !g_flt_freeze && g_nclips < CLIP_MAX) {
+        int clx = bx + bwl, cly = by + bwt;
+        int clw = pl + content_w + pr;
+        int clh = (st->height >= 0) ? pt + st->height + pb : (1 << 24);
+        struct cliprect *pc = &g_clips[g_cur_clip];   /* intersect ancestor */
+        if (g_cur_clip) {
+            if (pc->x > clx) { clw -= pc->x - clx; clx = pc->x; }
+            if (clx + clw > pc->x + pc->w) clw = pc->x + pc->w - clx;
+            if (pc->y > cly) { clh -= pc->y - cly; cly = pc->y; }
+            if (cly + clh > pc->y + pc->h) clh = pc->y + pc->h - cly;
+        }
+        if (clw < 0) clw = 0;
+        if (clh < 0) clh = 0;
+        g_clips[g_nclips].x = clx; g_clips[g_nclips].y = cly;
+        g_clips[g_nclips].w = clw; g_clips[g_nclips].h = clh;
+        g_cur_clip = g_nclips++;
+    }
+
     /* children: table grid, flex line(s), CSS grid, or normal block flow */
     if (st->disp == D_TABLE)
         cy = lay_table_grid(ni, cx, content_w, cy, link, curbg);
@@ -4406,6 +4517,8 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
         cy = lay_grid(ni, cx, content_w, cy, link, curbg);
     else
         cy = lay_flow(ni, cx, content_w, cy, link, curbg);
+
+    g_cur_clip = save_clip;                /* pop the overflow clip */
 
     /* auto-width tables shrink-to-fit their grid: pull the border box
      * (and its already-emitted background) in to the used grid width */
@@ -4422,6 +4535,9 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     int content_h = cy - (by + bwt + pt);
     if (content_h < 0) content_h = 0;
     if (st->height >= 0 && st->height > content_h) content_h = st->height;
+    /* overflow-clip with an explicit height: the box is EXACTLY that
+     * height (content past it is clipped), not grown to fit. */
+    if (st->ovf && st->height >= 0) content_h = st->height;
     int bbh = bwt + pt + content_h + pb + bwb;
 
     if (bg_i >= 0) E->items[bg_i].h = bbh;
@@ -4430,7 +4546,7 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     if (bwl) emit_rect(bx, by, bwl, bbh, st->border_col);
     if (bwr) emit_rect(bx + bbw - bwr, by, bwr, bbh, st->border_col);
 
-    g_cb_x = save_cbx; g_cb_y = save_cby; g_cb_w = save_cbw;
+    g_cb_x = save_cbx; g_cb_y = save_cby; g_cb_w = save_cbw; g_cb_h = save_cbh;
 
     /* position: relative -- shift the whole element (its flow slot is
      * untouched: the parent keeps advancing as if unshifted). */
@@ -4439,6 +4555,19 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
                : (st->po[1] != M_AUTO ? -st->po[1] : 0);
         int dyy = st->po[0] != M_AUTO ? st->po[0]
                 : (st->po[2] != M_AUTO ? -st->po[2] : 0);
+        if (dx || dyy)
+            for (int i2 = items0; i2 < E->nitems; i2++) {
+                E->items[i2].x += dx;
+                E->items[i2].y += dyy;
+            }
+    }
+
+    /* transform: translate() -- shift the element's painted items after
+     * layout (px, or % of the element's own border-box size). Paint-only,
+     * like relative: the flow slot is unchanged. */
+    if (st->has_tf && !g_flt_freeze) {
+        int dx = st->txpx + (st->txpct ? st->txpct * bbw / 100 : 0);
+        int dyy = st->typx + (st->typct ? st->typct * bbh / 100 : 0);
         if (dx || dyy)
             for (int i2 = items0; i2 < E->nitems; i2++) {
                 E->items[i2].x += dx;
@@ -4488,15 +4617,24 @@ static int lay_abs(int qi) {
     else
         w_used = lay_cw;
 
+    /* offsets: % of the containing block (width for L/R, height for
+     * T/B); an unknown-height CB (auto) falls back to 0 for % top/bot */
+    int cbh = (q->cb_h >= 0) ? q->cb_h : 0;
+    int poL = (st->po_pct & (1 << 3)) ? (int)((long)q->cb_w * st->po[3] / 100) : st->po[3];
+    int poR = (st->po_pct & (1 << 1)) ? (int)((long)q->cb_w * st->po[1] / 100) : st->po[1];
+    int poT = (st->po_pct & (1 << 0)) ? (int)((long)cbh * st->po[0] / 100) : st->po[0];
+    int poB = (st->po_pct & (1 << 2)) ? (int)((long)cbh * st->po[2] / 100) : st->po[2];
     int x;
-    if (st->po[3] != M_AUTO)      x = q->cb_x + st->po[3];
-    else if (st->po[1] != M_AUTO) x = q->cb_x + q->cb_w - st->po[1] - w_used;
+    if (st->po[3] != M_AUTO)      x = q->cb_x + poL;
+    else if (st->po[1] != M_AUTO) x = q->cb_x + q->cb_w - poR - w_used;
     else                          x = q->sx;
     int y;
-    if (st->po[0] != M_AUTO)      y = q->cb_y + st->po[0];
+    if (st->po[0] != M_AUTO)      y = q->cb_y + poT;
     else if (st->po[2] != M_AUTO && q->fixed)
-                                  y = g_content_h - st->po[2] - bbh;
-    else                          y = q->sy;   /* bottom on abs: v1 auto */
+                                  y = g_content_h - poB - bbh;
+    else if (st->po[2] != M_AUTO && q->cb_h >= 0)
+                                  y = q->cb_y + cbh - poB - bbh;
+    else                          y = q->sy;
 
     int dx = x - 0, dyy = y - prov;
     for (int i2 = i0; i2 < E->nitems; i2++) {
@@ -4548,8 +4686,12 @@ static void layout(int width) {
     g_nflts = 0;
     g_flt_bottom = 0;
     g_nabsq = 0;
+    g_nclips = 1;                         /* index 0 = no clip */
+    g_cur_clip = 0;
     g_vp_w = cw;
+    g_vp_h = g_content_h;
     g_cb_x = 0; g_cb_y = 0; g_cb_w = cw;  /* initial containing block */
+    g_cb_h = g_content_h;
     struct cstyle *rst = &E->nodes[root].st;
     int y = rst->m[0] == M_AUTO ? 0 : rst->m[0];
     int end = lay_block(root, 0, cw, y, -1, 0);
@@ -7774,12 +7916,30 @@ static void paint_all(void) {
                 sy = CONTENT_TOP + (r->y - vtop);
             }
 
+            /* effective clip = viewport intersected with any overflow
+             * clip ancestor (stage 13D), translated to screen coords. */
+            int cx0 = 0, cx1 = g_win_w, cyy0 = vy0, cyy1 = vy1;
+            if (r->clip) {
+                struct cliprect *cl = &g_clips[r->clip];
+                int csy = (r->fl & IF_FIXED) ? (CONTENT_TOP + cl->y)
+                                             : (CONTENT_TOP + cl->y - vtop);
+                if (cl->x > cx0) cx0 = cl->x;
+                if (cl->x + cl->w < cx1) cx1 = cl->x + cl->w;
+                if (csy > cyy0) cyy0 = csy;
+                if (csy + cl->h < cyy1) cyy1 = csy + cl->h;
+            }
+            /* cull anything fully outside the effective clip */
+            if (r->x >= cx1 || r->x + r->w <= cx0 ||
+                sy >= cyy1 || sy + r->h <= cyy0) continue;
+
             if (r->kind == DI_RECT) {
-                int y0 = sy, h = r->h;             /* clip to the viewport */
-                if (y0 < vy0) { h -= vy0 - y0; y0 = vy0; }
-                if (y0 + h > vy1) h = vy1 - y0;
-                if (h > 0 && r->w > 0)
-                    sys_gui_fill(fd, r->x, y0, r->w, h, r->fg & 0xFFFFFF);
+                int x0 = r->x, w = r->w, y0 = sy, h = r->h;
+                if (x0 < cx0) { w -= cx0 - x0; x0 = cx0; }
+                if (x0 + w > cx1) w = cx1 - x0;
+                if (y0 < cyy0) { h -= cyy0 - y0; y0 = cyy0; }
+                if (y0 + h > cyy1) h = cyy1 - y0;
+                if (h > 0 && w > 0)
+                    sys_gui_fill(fd, x0, y0, w, h, r->fg & 0xFFFFFF);
                 continue;
             }
             if (r->kind == DI_BULLET) {
