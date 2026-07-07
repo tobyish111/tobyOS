@@ -479,6 +479,7 @@ enum {
 #define D_TCELL     8            /* td/th (block container in the grid) */
 #define D_CAPTION   9            /* caption: block above the grid       */
 #define D_FLEX      10           /* flex container (row/column layout)  */
+#define D_GRID      11           /* grid container (track-based layout)  */
 
 /* style flag bits */
 #define SF_BOLD     0x01
@@ -519,7 +520,11 @@ struct cstyle {
     int16_t  gap;                /* gap between items/lines, px */
     int32_t  fbasis;             /* flex-basis px (content box), -1 auto */
     int16_t  woff;               /* calc() px offset added after width% resolves */
-    int16_t  _pad1;
+    /* grid: container templates (raw text in g_gridpool) + item spans */
+    int32_t  gtc_off;            /* grid-template-columns raw text offset */
+    int32_t  gtr_off;            /* grid-template-rows raw text offset */
+    int16_t  gtc_len, gtr_len;   /* 0 = none */
+    uint8_t  gcol_span, grow_span; /* item column/row span (default 1) */
 };
 
 /* ---- DOM ---------------------------------------------------------- */
@@ -600,6 +605,7 @@ enum {
     CP_FLEX, CP_FGROW, CP_FSHRINK, CP_FBASIS, CP_GAP,
     CP_POSITION, CP_TOP, CP_RIGHT, CP_BOTTOM, CP_LEFT,
     CP_VAR,                      /* --custom-property (resolved via var()) */
+    CP_GRID_TC, CP_GRID_TR, CP_GRID_COL, CP_GRID_ROW,
     CP__N
 };
 
@@ -1744,9 +1750,12 @@ static int prop_lookup(const char *s, int len) {
         {"align-items",CP_ALITEMS},{"flex",CP_FLEX},
         {"flex-grow",CP_FGROW},{"flex-shrink",CP_FSHRINK},
         {"flex-basis",CP_FBASIS},{"gap",CP_GAP},{"column-gap",CP_GAP},
-        {"row-gap",CP_GAP},
+        {"row-gap",CP_GAP},{"grid-gap",CP_GAP},{"grid-column-gap",CP_GAP},
+        {"grid-row-gap",CP_GAP},
         {"position",CP_POSITION},{"top",CP_TOP},{"right",CP_RIGHT},
         {"bottom",CP_BOTTOM},{"left",CP_LEFT},
+        {"grid-template-columns",CP_GRID_TC},{"grid-template-rows",CP_GRID_TR},
+        {"grid-column",CP_GRID_COL},{"grid-row",CP_GRID_ROW},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -2177,6 +2186,11 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->gap = 0;
     st->fbasis = -1;
     st->woff = 0;
+    st->gtc_len = 0;
+    st->gtr_len = 0;
+    st->gcol_span = 1;
+    st->grow_span = 1;
+    /* grid template offsets are only read when gtc_len/gtr_len > 0 */
 }
 
 static int clamp_px(int v) {
@@ -2246,7 +2260,25 @@ static int  g_nvarscope;
 static char g_varpool[VARPOOL_CAP];
 static int  g_varpool_len;
 
-static void var_scope_reset(void) { g_nvarscope = 0; g_varpool_len = 0; }
+/* Grid templates are variable-length text; kept in a stable pool per
+ * style pass (cstyle stores offset+len) so lay_grid can parse them at
+ * layout time, after the per-node csspool rollback. */
+#define GRIDPOOL_CAP (16 * 1024)
+static char g_gridpool[GRIDPOOL_CAP];
+static int  g_gridpool_len;
+
+static int gridpool_put(const char *s, int n) {
+    if (n < 0) n = 0;
+    if (g_gridpool_len + n + 1 > GRIDPOOL_CAP) return -1;
+    int off = g_gridpool_len;
+    for (int i = 0; i < n; i++) g_gridpool[g_gridpool_len++] = s[i];
+    g_gridpool[g_gridpool_len++] = 0;
+    return off;
+}
+
+static void var_scope_reset(void) {
+    g_nvarscope = 0; g_varpool_len = 0; g_gridpool_len = 0;
+}
 
 static void var_push(const char *name, int nlen, const char *val, int vlen) {
     if (g_nvarscope >= VARSCOPE_MAX) return;
@@ -2581,6 +2613,8 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
             else if (tok_is(&t, "inline-block") || tok_is(&t, "inline-flex"))
                 st->disp = D_INLBLOCK;
             else if (tok_is(&t, "flex")) st->disp = D_FLEX;
+            else if (tok_is(&t, "grid") || tok_is(&t, "inline-grid"))
+                st->disp = D_GRID;
             else if (tok_is(&t, "list-item")) st->disp = D_LISTITEM;
             else if (tok_is(&t, "table") || tok_is(&t, "inline-table"))
                 st->disp = D_TABLE;
@@ -2722,6 +2756,40 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
                 st->gap = (int16_t)(px > 500 ? 500 : px);
         }
         break;
+    case CP_GRID_TC:
+        if (pass == 1) {                     /* raw text -> stable pool */
+            int off = gridpool_put(v, n);
+            if (off >= 0) { st->gtc_off = off; st->gtc_len = (int16_t)n; }
+        }
+        break;
+    case CP_GRID_TR:
+        if (pass == 1) {
+            int off = gridpool_put(v, n);
+            if (off >= 0) { st->gtr_off = off; st->gtr_len = (int16_t)n; }
+        }
+        break;
+    case CP_GRID_COL: case CP_GRID_ROW: {
+        /* v1: only the span count. "span N", or "A / B" -> B-A. */
+        int span = 1;
+        int a = -1, b = -1, saw_span = 0;
+        while (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "span")) { saw_span = 1; continue; }
+            if (t.len == 1 && t.s[0] == '/') continue;
+            if (t.s[0] >= '0' && t.s[0] <= '9') {
+                int num = 0;
+                for (int q = 0; q < t.len && t.s[q] >= '0' && t.s[q] <= '9'; q++)
+                    num = num * 10 + (t.s[q] - '0');
+                if (saw_span) { span = num; break; }
+                if (a < 0) a = num; else b = num;
+            }
+        }
+        if (!saw_span && a >= 0 && b >= 0 && b > a) span = b - a;
+        if (span < 1) span = 1;
+        if (span > 32) span = 32;
+        if (d->prop == CP_GRID_COL) st->gcol_span = (uint8_t)span;
+        else st->grow_span = (uint8_t)span;
+        break;
+    }
     case CP_POSITION:
         if (vtok_next(v, n, &pos, &t)) {
             if (tok_is(&t, "relative") || tok_is(&t, "sticky"))
@@ -4030,6 +4098,241 @@ static int lay_flex(int ni, int cx, int content_w, int y, int link,
     return cy;
 }
 
+/* ---- CSS Grid (v1) -------------------------------------------------- *
+ * display:grid with grid-template-columns (px / % / fr / auto /
+ * repeat(N,...) / repeat(auto-fill|auto-fit, minmax(min,max))), gap,
+ * auto-placement (row-major), and grid-column/grid-row span. Rows are
+ * content-sized (auto), each row as tall as its tallest cell. Items are
+ * block containers laid at their cell with the spanned width imposed.
+ * v1 skips: named lines/areas, grid-template-areas, explicit line
+ * placement start numbers, dense packing, per-axis alignment beyond
+ * stretch, and fr in rows (rows are always content-sized). */
+
+#define GRID_MAX_TRACKS 32
+#define GRID_MAX_ITEMS  256
+
+/* One simple track token (no repeat) -> type (0 px,1 pct,2 fr,3 auto)
+ * + value. minmax(a,b) collapses to its max track. Returns 1 on ok. */
+static int grid_one_track(const char *tok, int tl, int own_px,
+                          int *type, int *val) {
+    while (tl > 0 && is_whitespace(*tok)) { tok++; tl--; }
+    while (tl > 0 && is_whitespace(tok[tl - 1])) tl--;
+    if (tl <= 0) return 0;
+    if (tl > 7 && str_ncasecmp(tok, "minmax(", 7) == 0) {
+        int par = 0, comma = -1;
+        for (int k = 7; k < tl; k++) {
+            if (tok[k] == '(') par++;
+            else if (tok[k] == ')') { if (par) par--; }
+            else if (tok[k] == ',' && par == 0) { comma = k; break; }
+        }
+        int m0 = (comma >= 0) ? comma + 1 : 7;
+        int m1 = tl - (tok[tl - 1] == ')' ? 1 : 0);
+        return grid_one_track(tok + m0, m1 - m0, own_px, type, val);
+    }
+    if (tl == 4 && str_ncasecmp(tok, "auto", 4) == 0) { *type = 3; *val = 0; return 1; }
+    if (tl == 7 && str_ncasecmp(tok, "min-con", 7) == 0) { *type = 3; *val = 0; return 1; }
+    /* number + unit */
+    int i = 0;
+    double num = 0;
+    int digits = 0;
+    while (i < tl && tok[i] >= '0' && tok[i] <= '9') { num = num * 10 + (tok[i] - '0'); i++; digits++; }
+    if (i < tl && tok[i] == '.') {
+        i++;
+        double f = 0.1;
+        while (i < tl && tok[i] >= '0' && tok[i] <= '9') { num += (tok[i] - '0') * f; f *= 0.1; i++; digits++; }
+    }
+    if (!digits) return 0;
+    if (tl - i == 2 && lc(tok[i]) == 'f' && lc(tok[i + 1]) == 'r') {
+        *type = 2; *val = (int)(num + 0.5); if (*val < 1) *val = 1; return 1;
+    }
+    if (tl - i == 1 && tok[i] == '%') { *type = 1; *val = (int)(num + 0.5); return 1; }
+    int px;
+    if (css_len_tok(tok, tl, own_px, &px) == LK_PX) { *type = 0; *val = px; return 1; }
+    return 0;
+}
+
+/* Parse grid-template-columns into pixel widths. Returns ncols. */
+static int grid_resolve_cols(const char *s, int n, int W, int gap, int own_px,
+                             int colw[], int maxcols) {
+    int ty[GRID_MAX_TRACKS], vl[GRID_MAX_TRACKS], nt = 0;
+    int i = 0;
+    while (i < n && nt < maxcols) {
+        while (i < n && (is_whitespace(s[i]) || s[i] == ',')) i++;
+        if (i >= n) break;
+        int t0 = i, par = 0;
+        while (i < n) {
+            char c = s[i];
+            if (c == '(') par++;
+            else if (c == ')') { if (par) par--; }
+            else if (is_whitespace(c) && par == 0) break;
+            i++;
+        }
+        const char *tok = s + t0;
+        int tl = i - t0;
+        if (tl > 7 && str_ncasecmp(tok, "repeat(", 7) == 0) {
+            int in1 = tl - (tok[tl - 1] == ')' ? 1 : 0);
+            int j = 7;
+            while (j < in1 && is_whitespace(tok[j])) j++;
+            int is_autofill = (str_ncasecmp(tok + j, "auto-fill", 9) == 0 ||
+                               str_ncasecmp(tok + j, "auto-fit", 8) == 0);
+            int cnt = 0;
+            while (j < in1 && tok[j] >= '0' && tok[j] <= '9') { cnt = cnt * 10 + (tok[j] - '0'); j++; }
+            int par2 = 0;
+            while (j < in1 && !(tok[j] == ',' && par2 == 0)) {
+                if (tok[j] == '(') par2++; else if (tok[j] == ')') { if (par2) par2--; }
+                j++;
+            }
+            if (j < in1) j++;                    /* past comma */
+            int subt, subv;
+            /* the subtrack (single pattern in v1); for auto-fill get its
+             * min from the minmax to compute how many columns fit */
+            int sub_ok = grid_one_track(tok + j, in1 - j, own_px, &subt, &subv);
+            if (!sub_ok) continue;
+            if (is_autofill) {
+                int minpx = 0;                   /* min track width for the fit */
+                /* re-read the minmax min (first arg) */
+                const char *st2 = tok + j;
+                int sl = in1 - j;
+                if (sl > 7 && str_ncasecmp(st2, "minmax(", 7) == 0) {
+                    int mt, mv;
+                    int k2 = 7;
+                    while (k2 < sl && is_whitespace(st2[k2])) k2++;
+                    int me = k2;
+                    while (me < sl && st2[me] != ',' && st2[me] != ')') me++;
+                    if (grid_one_track(st2 + k2, me - k2, own_px, &mt, &mv) && mt == 0)
+                        minpx = mv;
+                }
+                if (minpx <= 0) minpx = (subt == 0 ? subv : 100);
+                if (minpx < 1) minpx = 1;
+                int fit = (W + gap) / (minpx + gap);
+                if (fit < 1) fit = 1;
+                for (int k = 0; k < fit && nt < maxcols; k++) {
+                    ty[nt] = 2; vl[nt] = 1; nt++;   /* each fills as 1fr */
+                }
+            } else {
+                if (cnt < 1) cnt = 1;
+                for (int k = 0; k < cnt && nt < maxcols; k++) {
+                    ty[nt] = subt; vl[nt] = subv; nt++;
+                }
+            }
+            continue;
+        }
+        int tt, tv;
+        if (grid_one_track(tok, tl, own_px, &tt, &tv)) {
+            ty[nt] = tt; vl[nt] = tv; nt++;
+        }
+    }
+    if (nt == 0) return 0;
+
+    /* resolve: fixed px/pct claim first, fr split the remainder,
+     * auto ~= 1fr (v1) */
+    long fixed = 0, frsum = 0;
+    for (int k = 0; k < nt; k++) {
+        if (ty[k] == 0) fixed += vl[k];
+        else if (ty[k] == 1) fixed += (long)W * vl[k] / 100;
+        else if (ty[k] == 2) frsum += vl[k];
+        else { ty[k] = 2; vl[k] = 1; frsum += 1; }   /* auto -> 1fr */
+    }
+    long avail = W - (long)gap * (nt - 1) - fixed;
+    if (avail < 0) avail = 0;
+    for (int k = 0; k < nt; k++) {
+        if (ty[k] == 0) colw[k] = vl[k];
+        else if (ty[k] == 1) colw[k] = (int)((long)W * vl[k] / 100);
+        else colw[k] = frsum > 0 ? (int)(avail * vl[k] / frsum) : 0;
+        if (colw[k] < 1) colw[k] = 1;
+    }
+    return nt;
+}
+
+static int lay_grid(int ni, int cx, int content_w, int y, int link,
+                    uint32_t inbg) {
+    struct dnode *nd = &E->nodes[ni];
+    struct cstyle *st = &nd->st;
+    int gap = st->gap > 0 ? st->gap : 0;
+
+    int colw[GRID_MAX_TRACKS];
+    int ncols = 0;
+    if (st->gtc_len > 0)
+        ncols = grid_resolve_cols(&g_gridpool[st->gtc_off], st->gtc_len,
+                                  content_w, gap, st->px, colw, GRID_MAX_TRACKS);
+    if (ncols <= 0) {                        /* no template -> single column */
+        ncols = 1; colw[0] = content_w;
+    }
+    /* column x offsets */
+    int colx[GRID_MAX_TRACKS + 1];
+    colx[0] = cx;
+    for (int k = 0; k < ncols; k++) colx[k + 1] = colx[k] + colw[k] + gap;
+
+    int items[GRID_MAX_ITEMS], nitem = 0;
+    for (int c = nd->first; c >= 0 && nitem < GRID_MAX_ITEMS; c = E->nodes[c].next) {
+        struct dnode *cn = &E->nodes[c];
+        if (cn->tag == T_TEXT || cn->st.disp == D_NONE) continue;
+        items[nitem++] = c;
+    }
+    if (nitem == 0) return y;
+
+    /* auto-placement (row-major), honoring column span; compute each
+     * item's (row, col, colspan) and the number of rows */
+    int it_row[GRID_MAX_ITEMS], it_col[GRID_MAX_ITEMS], it_span[GRID_MAX_ITEMS];
+    int row = 0, col = 0, nrows = 0;
+    for (int k = 0; k < nitem; k++) {
+        int span = E->nodes[items[k]].st.gcol_span;
+        if (span < 1) span = 1;
+        if (span > ncols) span = ncols;
+        if (col + span > ncols) { row++; col = 0; }
+        it_row[k] = row; it_col[k] = col; it_span[k] = span;
+        col += span;
+        if (col >= ncols) { row++; col = 0; }
+        if (it_row[k] + 1 > nrows) nrows = it_row[k] + 1;
+    }
+
+    /* lay each item at its cell x with the spanned width imposed; track
+     * per-row max height */
+    int rowh[GRID_MAX_TRACKS];
+    for (int r = 0; r < GRID_MAX_TRACKS && r < nrows; r++) rowh[r] = 0;
+    struct { int i0, i1, r, h; } placed[GRID_MAX_ITEMS];
+    int rowy[GRID_MAX_TRACKS + 1];
+
+    /* first pass: lay items in provisional y to measure row heights */
+    for (int k = 0; k < nitem; k++) {
+        int c = items[k];
+        struct cstyle *cs = &E->nodes[c].st;
+        int cwid = 0;
+        for (int s = 0; s < it_span[k]; s++) cwid += colw[it_col[k] + s];
+        cwid += gap * (it_span[k] - 1);
+        int ix = colx[it_col[k]];
+        int32_t save_w = cs->width;
+        uint8_t save_fl = cs->fl;
+        cs->width = cwid - cs->m[3] - cs->m[1] - cs->bw[3] - cs->bw[1]
+                        - cs->p[3] - cs->p[1];
+        if (cs->width < 8) cs->width = 8;
+        cs->fl &= (uint8_t)~SF_WPCT;
+        placed[k].i0 = E->nitems;
+        int bot = lay_block(c, ix, cwid, 0, link, inbg);   /* prov y=0 */
+        placed[k].i1 = E->nitems;
+        placed[k].r = it_row[k];
+        placed[k].h = bot;                   /* height (laid from y=0) */
+        cs->width = save_w;
+        cs->fl = save_fl;
+        if (it_row[k] < GRID_MAX_TRACKS && placed[k].h > rowh[it_row[k]])
+            rowh[it_row[k]] = placed[k].h;
+    }
+    /* row y offsets */
+    rowy[0] = y;
+    for (int r = 0; r < nrows && r < GRID_MAX_TRACKS; r++)
+        rowy[r + 1] = rowy[r] + rowh[r] + gap;
+
+    /* second pass: shift each item's display items down to its row y */
+    for (int k = 0; k < nitem; k++) {
+        int r = placed[k].r;
+        int dy = (r < GRID_MAX_TRACKS) ? rowy[r] : y;
+        for (int q = placed[k].i0; q < placed[k].i1; q++)
+            E->items[q].y += dy;
+    }
+    int end = (nrows > 0 && nrows <= GRID_MAX_TRACKS) ? rowy[nrows] - gap : y;
+    return end;
+}
+
 static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     struct dnode *nd = &E->nodes[ni];
     struct cstyle *st = &nd->st;
@@ -4094,11 +4397,13 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
         }
     }
 
-    /* children: table grid, flex line(s), or normal block flow */
+    /* children: table grid, flex line(s), CSS grid, or normal block flow */
     if (st->disp == D_TABLE)
         cy = lay_table_grid(ni, cx, content_w, cy, link, curbg);
     else if (st->disp == D_FLEX)
         cy = lay_flex(ni, cx, content_w, cy, link, curbg);
+    else if (st->disp == D_GRID)
+        cy = lay_grid(ni, cx, content_w, cy, link, curbg);
     else
         cy = lay_flow(ni, cx, content_w, cy, link, curbg);
 
