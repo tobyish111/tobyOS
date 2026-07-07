@@ -362,6 +362,11 @@ enum {
 #define D_NONE      2
 #define D_LISTITEM  3
 #define D_INLBLOCK  4
+#define D_TABLE     5            /* table wrapper box (grid layout)     */
+#define D_TSEC      6            /* thead/tbody/tfoot row group         */
+#define D_TROW      7            /* table row                           */
+#define D_TCELL     8            /* td/th (block container in the grid) */
+#define D_CAPTION   9            /* caption: block above the grid       */
 
 /* style flag bits */
 #define SF_BOLD     0x01
@@ -370,6 +375,7 @@ enum {
 #define SF_PRE      0x08
 #define SF_WPCT     0x10         /* width is a percentage */
 #define SF_NOBULLET 0x20         /* list-style: none */
+#define SF_BCOLLAPSE 0x40        /* border-collapse: collapse (tables) */
 
 #define M_AUTO  (-32768)         /* margin: auto sentinel */
 
@@ -388,6 +394,8 @@ struct cstyle {
     int16_t  line_h;             /* >0 px; <0 scale*-100; 0 auto */
     uint8_t  flt;                /* float: 0 none, 1 left, 2 right */
     uint8_t  clr;                /* clear mask: 1 left, 2 right, 3 both */
+    uint8_t  valign;             /* cells: 0 top/baseline, 1 middle, 2 bottom */
+    uint8_t  _pad0[3];
 };
 
 /* ---- DOM ---------------------------------------------------------- */
@@ -460,6 +468,7 @@ enum {
     CP_BWIDTH, CP_BCOLOR,
     CP_WIDTH, CP_HEIGHT, CP_MAXW, CP_VISIBILITY,
     CP_FLOAT, CP_CLEAR,
+    CP_VALIGN, CP_BCOLLAPSE,
     CP__N
 };
 
@@ -1432,6 +1441,7 @@ static int prop_lookup(const char *s, int len) {
         {"width",CP_WIDTH},{"height",CP_HEIGHT},{"max-width",CP_MAXW},
         {"visibility",CP_VISIBILITY},
         {"float",CP_FLOAT},{"clear",CP_CLEAR},
+        {"vertical-align",CP_VALIGN},{"border-collapse",CP_BCOLLAPSE},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -1620,10 +1630,16 @@ static int css_parse_part(struct ccur *c, struct cpart *p,
     return got;
 }
 
-/* Parse "sel1, sel2 { decls }". Decls are shared by every valid selector. */
+/* Parse "sel1, sel2 { decls }". Decls are shared by every valid
+ * selector. SEL_GROUP_MAX must fit real-world grouped selectors: the
+ * UA sheet's block-display group alone has 34 members, and at the old
+ * cap of 16 everything past the 16th (blockquote, form, header, nav,
+ * center...) silently rendered INLINE -- on HN, whose whole page sits
+ * inside <center>, that degraded the table grid to inline flow. */
+#define SEL_GROUP_MAX 64
 static void css_parse_ruleset(struct ccur *c, int origin) {
-    int sel_part0[16], sel_nparts[16];
-    uint16_t sel_spec[16];
+    int sel_part0[SEL_GROUP_MAX], sel_nparts[SEL_GROUP_MAX];
+    uint16_t sel_spec[SEL_GROUP_MAX];
     int nsel = 0;
     int cur_valid = 1;
     int part0 = E->nparts;
@@ -1635,7 +1651,7 @@ static void css_parse_ruleset(struct ccur *c, int origin) {
         char ch = c->s[c->i];
         if (ch == '{' || ch == ',') {
             if (cur_valid && E->nparts > part0 &&
-                E->nparts - part0 <= 12 && nsel < 16) {
+                E->nparts - part0 <= 12 && nsel < SEL_GROUP_MAX) {
                 int spec = spec_id * 100 + spec_cls * 10 + spec_type;
                 if (spec > 0xFFFF) spec = 0xFFFF;
                 sel_part0[nsel] = part0;
@@ -1827,6 +1843,7 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->disp = D_INLINE;
     st->flt = 0;
     st->clr = 0;
+    st->valign = 0;
 }
 
 static int clamp_px(int v) {
@@ -2123,13 +2140,20 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         if (vtok_next(v, n, &pos, &t)) {
             if (tok_is(&t, "none")) st->disp = D_NONE;
             else if (tok_is(&t, "inline")) st->disp = D_INLINE;
-            else if (tok_is(&t, "inline-block") || tok_is(&t, "inline-flex") ||
-                     tok_is(&t, "inline-table"))
+            else if (tok_is(&t, "inline-block") || tok_is(&t, "inline-flex"))
                 st->disp = D_INLBLOCK;
             else if (tok_is(&t, "list-item")) st->disp = D_LISTITEM;
-            else if (tok_is(&t, "table-cell") || tok_is(&t, "contents"))
-                st->disp = D_INLINE;
-            else st->disp = D_BLOCK;      /* block, flex, grid, table... */
+            else if (tok_is(&t, "table") || tok_is(&t, "inline-table"))
+                st->disp = D_TABLE;
+            else if (tok_is(&t, "table-row-group") ||
+                     tok_is(&t, "table-header-group") ||
+                     tok_is(&t, "table-footer-group"))
+                st->disp = D_TSEC;
+            else if (tok_is(&t, "table-row")) st->disp = D_TROW;
+            else if (tok_is(&t, "table-cell")) st->disp = D_TCELL;
+            else if (tok_is(&t, "table-caption")) st->disp = D_CAPTION;
+            else if (tok_is(&t, "contents")) st->disp = D_INLINE;
+            else st->disp = D_BLOCK;      /* block, flex, grid... */
         }
         break;
     case CP_VISIBILITY:
@@ -2152,6 +2176,19 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
             else st->clr = 0;
         }
         break;
+    case CP_VALIGN:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "middle")) st->valign = 1;
+            else if (tok_is(&t, "bottom")) st->valign = 2;
+            else st->valign = 0;          /* top / baseline / other */
+        }
+        break;
+    case CP_BCOLLAPSE:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "collapse")) st->fl |= SF_BCOLLAPSE;
+            else st->fl &= (uint8_t)~SF_BCOLLAPSE;
+        }
+        break;
     default:
         break;
     }
@@ -2171,6 +2208,11 @@ static void style_node(int ni, const struct cstyle *pst) {
     }
     struct cstyle st;
     st_init(&st, pst);
+    /* Tables reset inherited text-align: <center> (and align=center
+     * ancestors) center the table BOX in real browsers, not the text
+     * inside its cells (HN's whole page sits in <center>). Explicit
+     * CSS/attrs on the table or its cells still apply below. */
+    if (nd->tag == T_TABLE) st.talign = 0;
     /* presentational hint: legacy align= on images/tables floats them
      * (lowest priority; any CSS float overrides) */
     if (nd->tag == T_IMG || nd->tag == T_TABLE) {
@@ -2178,6 +2220,54 @@ static void style_node(int ni, const struct cstyle *pst) {
         if (node_attr_str(nd, "align", al, sizeof(al))) {
             if (lc(al[0]) == 'l') st.flt = 1;
             else if (lc(al[0]) == 'r') st.flt = 2;
+        }
+    }
+    /* legacy table presentational attributes (pre-cascade: CSS wins) */
+    int is_cell = (nd->tag == T_TD || nd->tag == T_TH);
+    if (is_cell || nd->tag == T_TR || nd->tag == T_TABLE) {
+        char a[24];
+        uint32_t col;
+        if (node_attr_str(nd, "bgcolor", a, sizeof(a)) &&
+            css_color_tok(a, (int)str_len(a), &col))
+            st.bg = col;
+        if ((is_cell || nd->tag == T_TABLE) &&
+            node_attr_str(nd, "width", a, sizeof(a))) {
+            int v = atoi_simple(a);
+            if (v > 0) {
+                int l = (int)str_len(a);
+                if (a[l - 1] == '%') {
+                    st.width = v > 100 ? 100 : v;
+                    st.fl |= SF_WPCT;
+                } else {
+                    st.width = v > 4000 ? 4000 : v;
+                }
+            }
+        }
+        if (is_cell && node_attr_str(nd, "height", a, sizeof(a))) {
+            int v = atoi_simple(a);
+            if (v > 0) st.height = v > 4000 ? 4000 : v;
+        }
+        if (is_cell && node_attr_str(nd, "align", a, sizeof(a))) {
+            if (lc(a[0]) == 'c') st.talign = 1;
+            else if (lc(a[0]) == 'r') st.talign = 2;
+            else if (lc(a[0]) == 'l') st.talign = 0;
+        }
+        if ((is_cell || nd->tag == T_TR) &&
+            node_attr_str(nd, "valign", a, sizeof(a))) {
+            if (lc(a[0]) == 'm' || lc(a[0]) == 'c') st.valign = 1;
+            else if (lc(a[0]) == 'b') st.valign = 2;
+            else st.valign = 0;
+        }
+        /* table border= draws 1px borders on every cell */
+        if (is_cell) {
+            int t2 = nd->parent;
+            for (int hop = 0; hop < 6 && t2 >= 0 &&
+                              E->nodes[t2].tag != T_TABLE; hop++)
+                t2 = E->nodes[t2].parent;
+            if (t2 >= 0 && E->nodes[t2].tag == T_TABLE &&
+                node_attr_str(&E->nodes[t2], "border", a, sizeof(a)) &&
+                atoi_simple(a) > 0)
+                for (int s2 = 0; s2 < 4; s2++) st.bw[s2] = 1;
         }
     }
     struct smatch M[MATCH_MAX];
@@ -2225,6 +2315,22 @@ static void style_node(int ni, const struct cstyle *pst) {
     }
     E->ndecls = inl0;
     E->csspool_len = cp0;
+    /* cellpadding= hint: applies only when the cascade left the UA
+     * default td,th padding (1px 8px) untouched -- author CSS wins */
+    if (is_cell && st.p[0] == 1 && st.p[1] == 8 &&
+        st.p[2] == 1 && st.p[3] == 8) {
+        int t2 = nd->parent;
+        for (int hop = 0; hop < 6 && t2 >= 0 &&
+                          E->nodes[t2].tag != T_TABLE; hop++)
+            t2 = E->nodes[t2].parent;
+        char a[12];
+        if (t2 >= 0 && E->nodes[t2].tag == T_TABLE &&
+            node_attr_str(&E->nodes[t2], "cellpadding", a, sizeof(a))) {
+            int v = atoi_simple(a);
+            if (v >= 0 && v <= 200)
+                for (int s2 = 0; s2 < 4; s2++) st.p[s2] = (int16_t)v;
+        }
+    }
     nd->st = st;
     for (int c = nd->first; c >= 0; c = E->nodes[c].next)
         style_node(c, &nd->st);
@@ -2233,10 +2339,15 @@ static void style_node(int ni, const struct cstyle *pst) {
 /* ---- The user-agent stylesheet ------------------------------------- */
 
 static const char UA_SHEET[] =
-"html,body,div,p,h1,h2,h3,h4,h5,h6,ul,ol,dl,dt,dd,table,thead,tbody,"
-"tfoot,tr,caption,pre,blockquote,form,header,footer,nav,main,section,"
+"html,body,div,p,h1,h2,h3,h4,h5,h6,ul,ol,dl,dt,dd,"
+"pre,blockquote,form,header,footer,nav,main,section,"
 "article,aside,figure,figcaption,address,details,summary,fieldset,"
 "legend,center,hr{display:block}\n"
+"table{display:table}\n"
+"thead,tbody,tfoot{display:table-row-group}\n"
+"tr{display:table-row}\n"
+"td,th{display:table-cell}\n"
+"caption{display:table-caption}\n"
 "li{display:list-item}\n"
 "head,script,style,title,meta,link,noscript,template,option,base,param,"
 "track,source,area,col,colgroup,select,textarea,iframe,object,embed,"
@@ -2400,13 +2511,17 @@ static void ic_rebound(struct ictx *ic) {
     ic->x = ic->lx0;
 }
 
-/* Finish the current line: bottom-align items, apply text-align. */
+/* Finish the current line: bottom-align items, apply text-align.
+ * In a frozen measure pass (shrink-to-fit / table column sizing) the
+ * alignment shift is suppressed: centering/right-aligning against the
+ * huge provisional width would inflate the measured item extents. */
 static void ic_break(struct ictx *ic, int min_h) {
     int lh = ic->line_h > 0 ? ic->line_h : min_h;
     int used = ic->x - ic->lx0;
+    int talign = g_flt_freeze ? 0 : ic->talign;
     int shift = 0;
-    if (ic->talign == 1) shift = ((ic->lx1 - ic->lx0) - used) / 2;
-    else if (ic->talign == 2) shift = ic->lx1 - ic->x;
+    if (talign == 1) shift = ((ic->lx1 - ic->lx0) - used) / 2;
+    else if (talign == 2) shift = ic->lx1 - ic->x;
     if (shift < 0) shift = 0;
     for (int i = ic->line_i0; i < E->nitems; i++) {
         struct ditem *it = &E->items[i];
@@ -2793,58 +2908,14 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
     }
 }
 
-static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
+/* ---- Block flow child loop (shared by blocks and table cells) ------- *
+ * Lays ni's children into the content box (cx, cy, content_w): floats
+ * leave the flow, inline-level runs go through the inline formatting
+ * context, block-level children recurse. Returns the flow bottom. */
+static int lay_flow(int ni, int cx, int content_w, int cy, int link,
+                    uint32_t curbg) {
     struct dnode *nd = &E->nodes[ni];
-    struct cstyle *st = &nd->st;
-    if (st->disp == D_NONE) return y;
-    if (nd->link >= 0) link = nd->link;
-    uint32_t curbg = (st->bg >> 24) ? st->bg : inbg;
-
-    int ml = st->m[3] == M_AUTO ? 0 : st->m[3];
-    int mr = st->m[1] == M_AUTO ? 0 : st->m[1];
-    int bwt = st->bw[0], bwr = st->bw[1], bwb = st->bw[2], bwl = st->bw[3];
-    int pt = st->p[0], pr = st->p[1], pb = st->p[2], pl = st->p[3];
-
-    int avail = cw - ml - mr - bwl - bwr - pl - pr;
-    if (avail < 8) avail = 8;
-    int content_w = avail;
-    if (st->width >= 0) {
-        content_w = (st->fl & SF_WPCT) ? (int)((long)avail * st->width / 100)
-                                       : st->width;
-        if (content_w > avail) content_w = avail;
-        if (content_w < 8) content_w = 8;
-    }
-    if (st->max_w >= 0 && content_w > st->max_w) content_w = st->max_w;
-    if (content_w < avail && st->m[3] == M_AUTO && st->m[1] == M_AUTO)
-        ml += (avail - content_w) / 2;    /* margin: 0 auto centering */
-    else if (content_w < avail && st->m[3] == M_AUTO)
-        ml += avail - content_w;
-
-    int bx = x + ml;                      /* border-box left */
-    int by = y;
-    int cx = bx + bwl + pl;
-    int cy = by + bwt + pt;
-    int bbw = bwl + pl + content_w + pr + bwr;
-
-    int bg_i = -1;
-    if (st->bg >> 24) {
-        bg_i = emit_rect(bx, by, bbw, 0, st->bg);   /* height patched below */
-        if (bg_i >= 0) E->items[bg_i].node = ni;    /* clicks on the box */
-    }
-
-    if (st->disp == D_LISTITEM && !(st->fl & SF_NOBULLET)) {
-        struct ditem *bu = item_new(DI_BULLET);
-        if (bu) {
-            bu->x = cx - 14;
-            bu->y = cy + st_line_h(st) / 2 - 4;
-            bu->w = 5;
-            bu->h = 5;
-            bu->fg = st->color;
-        }
-    }
-
-    /* children: block flow with anonymous inline runs; floats leave
-     * the flow entirely (cy does not advance past them) */
+    const struct cstyle *st = &nd->st;
     int c = nd->first;
     int prev_mb = 0;
     while (c >= 0) {
@@ -2872,7 +2943,350 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
             c = cn->next;
         }
     }
-    cy += prev_mb;
+    return cy + prev_mb;
+}
+
+/* ---- Table layout (CSS tables v1) ----------------------------------- *
+ * Auto + fixed column sizing from per-cell min/preferred content
+ * measures (the frozen provisional-layout trick from floats), colspan,
+ * legacy table attributes (border/cellspacing/cellpadding/bgcolor/
+ * align/valign/width), border-collapse as spacing 0, valign by item
+ * shift, caption above the grid. Rowspan degrades to 1; cells are
+ * block containers laid by lay_flow. All grid state lives on the
+ * stack so nested tables recurse safely. */
+
+#define TBL_COL_MAX 24
+
+/* Grid width used by the most recent lay_table_grid; consumed
+ * immediately by its caller lay_block (set-then-read is adjacent even
+ * under nested-table recursion). */
+static int g_tbl_used_w;
+
+static int node_attr_int(const struct dnode *n, const char *name, int dflt) {
+    char a[12];
+    if (!node_attr_str(n, name, a, sizeof(a))) return dflt;
+    return atoi_simple(a);
+}
+
+/* Min-content / preferred border-box widths of a cell, via two frozen
+ * provisional layouts (unwrapped, then narrowest) rolled back after. */
+static void tbl_measure_cell(int ci, int link, uint32_t inbg,
+                             int *out_min, int *out_pref) {
+    struct dnode *nd = &E->nodes[ci];
+    struct cstyle *st = &nd->st;
+    int ins = st->bw[3] + st->bw[1] + st->p[3] + st->p[1];
+    if (st->width >= 0 && !(st->fl & SF_WPCT)) {
+        *out_min = *out_pref = st->width + ins;
+        return;
+    }
+    int mi = E->nitems, mrr = E->render_len, mf = g_nflts;
+    int prov = 1 << 20;
+    g_flt_freeze++;
+    lay_flow(ci, 0, 100000, prov, link, inbg);
+    int pref = items_extent(mi);
+    E->nitems = mi; E->render_len = mrr; g_nflts = mf;
+    lay_flow(ci, 0, 8, prov, link, inbg);
+    int minw = items_extent(mi);
+    E->nitems = mi; E->render_len = mrr; g_nflts = mf;
+    g_flt_freeze--;
+    if (minw > pref) pref = minw;
+    *out_min = minw + ins;
+    *out_pref = pref + ins;
+}
+
+/* Fold one row's cells into the column min/pref/percent tables. */
+static void tbl_measure_row(int ri, int col_min[], int col_pref[],
+                            int col_pct[], int *ncols, int link,
+                            uint32_t inbg) {
+    int cc = 0;
+    for (int c = E->nodes[ri].first; c >= 0; c = E->nodes[c].next) {
+        struct dnode *cn = &E->nodes[c];
+        if (cn->tag == T_TEXT || cn->st.disp != D_TCELL) continue;
+        if (cc >= TBL_COL_MAX) break;
+        int span = node_attr_int(cn, "colspan", 1);
+        if (span < 1) span = 1;
+        if (span > TBL_COL_MAX - cc) span = TBL_COL_MAX - cc;
+        int mn, pf;
+        tbl_measure_cell(c, link, inbg, &mn, &pf);
+        if ((cn->st.fl & SF_WPCT) && cn->st.width > 0 && span == 1 &&
+            cn->st.width > col_pct[cc])
+            col_pct[cc] = cn->st.width;
+        if (span == 1) {
+            if (mn > col_min[cc]) col_min[cc] = mn;
+            if (pf > col_pref[cc]) col_pref[cc] = pf;
+        } else {
+            int mn_e = mn / span, pf_e = pf / span;
+            for (int k = 0; k < span; k++) {
+                if (mn_e > col_min[cc + k]) col_min[cc + k] = mn_e;
+                if (pf_e > col_pref[cc + k]) col_pref[cc + k] = pf_e;
+            }
+        }
+        cc += span;
+        if (cc > *ncols) *ncols = cc;
+    }
+}
+
+struct tcell_info { int i0, i1, bg_i, x, w, h, node; };
+
+/* Lay one row at y with resolved column widths. Returns the row
+ * bottom. Cell backgrounds stretch to the row height, valign shifts
+ * the content items, borders are drawn at the final box. Floats
+ * cannot escape their row. */
+static int tbl_lay_row(int ri, int cx, int y, const int colw[], int ncols,
+                       int spacing, int grid_w, int link, uint32_t inbg) {
+    struct dnode *rn = &E->nodes[ri];
+    uint32_t rowbg = (rn->st.bg >> 24) ? rn->st.bg : inbg;
+    int row_bg_i = -1;
+    if (rn->st.bg >> 24) {
+        row_bg_i = emit_rect(cx, y, grid_w, 0, rn->st.bg);
+        if (row_bg_i >= 0) E->items[row_bg_i].node = ri;
+    }
+    struct tcell_info cells[TBL_COL_MAX];
+    int nc = 0, cc = 0;
+    int xcur = cx + spacing;
+    int flt0 = g_nflts;
+    int row_h = rn->st.height > 0 ? rn->st.height : 0;
+    for (int c = rn->first; c >= 0; c = E->nodes[c].next) {
+        struct dnode *cn = &E->nodes[c];
+        if (cn->tag == T_TEXT || cn->st.disp != D_TCELL) continue;
+        if (cc >= ncols || nc >= TBL_COL_MAX) break;
+        int span = node_attr_int(cn, "colspan", 1);
+        if (span < 1) span = 1;
+        if (span > ncols - cc) span = ncols - cc;
+        int w = spacing * (span - 1);
+        for (int k = 0; k < span; k++) w += colw[cc + k];
+        struct cstyle *st = &cn->st;
+        struct tcell_info *tc = &cells[nc++];
+        tc->node = c;
+        tc->x = xcur;
+        tc->w = w;
+        tc->bg_i = -1;
+        uint32_t cbg = (st->bg >> 24) ? st->bg : rowbg;
+        if (st->bg >> 24) {
+            tc->bg_i = emit_rect(xcur, y, w, 0, st->bg);
+            if (tc->bg_i >= 0) E->items[tc->bg_i].node = c;
+        }
+        tc->i0 = E->nitems;
+        int ccx = xcur + st->bw[3] + st->p[3];
+        int ccy = y + st->bw[0] + st->p[0];
+        int ccw = w - st->bw[3] - st->bw[1] - st->p[3] - st->p[1];
+        if (ccw < 8) ccw = 8;
+        int cl = cn->link >= 0 ? cn->link : link;
+        int bot = lay_flow(c, ccx, ccw, ccy, cl, cbg);
+        int content_h = bot - ccy;
+        if (content_h < 0) content_h = 0;
+        if (st->height > content_h) content_h = st->height;
+        int bbh = st->bw[0] + st->p[0] + content_h + st->p[2] + st->bw[2];
+        tc->i1 = E->nitems;
+        tc->h = bbh;
+        if (bbh > row_h) row_h = bbh;
+        xcur += w + spacing;
+        cc += span;
+    }
+    if (nc == 0) {
+        if (row_bg_i >= 0) E->items[row_bg_i].h = row_h;
+        return y + row_h;
+    }
+    if (row_bg_i >= 0) E->items[row_bg_i].h = row_h;
+    for (int k = 0; k < nc; k++) {
+        struct tcell_info *tc = &cells[k];
+        struct cstyle *st = &E->nodes[tc->node].st;
+        if (tc->bg_i >= 0) E->items[tc->bg_i].h = row_h;
+        uint8_t va = st->valign ? st->valign : rn->st.valign;
+        if (va && row_h > tc->h) {
+            int off = (va == 1) ? (row_h - tc->h) / 2 : row_h - tc->h;
+            for (int i2 = tc->i0; i2 < tc->i1; i2++)
+                E->items[i2].y += off;
+        }
+        if (st->bw[0]) emit_rect(tc->x, y, tc->w, st->bw[0], st->border_col);
+        if (st->bw[2]) emit_rect(tc->x, y + row_h - st->bw[2], tc->w,
+                                 st->bw[2], st->border_col);
+        if (st->bw[3]) emit_rect(tc->x, y, st->bw[3], row_h, st->border_col);
+        if (st->bw[1]) emit_rect(tc->x + tc->w - st->bw[1], y, st->bw[1],
+                                 row_h, st->border_col);
+    }
+    g_nflts = flt0;                /* floats do not escape their row */
+    return y + row_h;
+}
+
+/* The grid: captions, two passes over the rows (measure, lay). */
+static int lay_table_grid(int ti, int cx, int avail_w, int y, int link,
+                          uint32_t inbg) {
+    struct dnode *tn = &E->nodes[ti];
+    struct cstyle *tst = &tn->st;
+
+    int spacing = 2;
+    int cs = node_attr_int(tn, "cellspacing", -1);
+    if (cs >= 0 && cs <= 100) spacing = cs;
+    if (tst->fl & SF_BCOLLAPSE) spacing = 0;
+
+    /* caption(s) above the grid (caption-side: top only) */
+    for (int c = tn->first; c >= 0; c = E->nodes[c].next)
+        if (E->nodes[c].tag != T_TEXT && E->nodes[c].st.disp == D_CAPTION)
+            y = lay_block(c, cx, avail_w, y, link, inbg);
+
+    /* pass 1: column min/pref widths over all rows */
+    int col_min[TBL_COL_MAX], col_pref[TBL_COL_MAX], col_pct[TBL_COL_MAX];
+    for (int i2 = 0; i2 < TBL_COL_MAX; i2++)
+        col_min[i2] = col_pref[i2] = col_pct[i2] = 0;
+    int ncols = 0;
+    for (int g = tn->first; g >= 0; g = E->nodes[g].next) {
+        struct dnode *gn = &E->nodes[g];
+        if (gn->tag == T_TEXT || gn->st.disp == D_NONE) continue;
+        if (gn->st.disp == D_TROW)
+            tbl_measure_row(g, col_min, col_pref, col_pct, &ncols, link, inbg);
+        else if (gn->st.disp == D_TSEC)
+            for (int r = gn->first; r >= 0; r = E->nodes[r].next)
+                if (E->nodes[r].tag != T_TEXT &&
+                    E->nodes[r].st.disp == D_TROW)
+                    tbl_measure_row(r, col_min, col_pref, col_pct, &ncols,
+                                    link, inbg);
+    }
+    if (ncols == 0) { g_tbl_used_w = 0; return y; }
+
+    /* distribute the available width over the columns */
+    int sum_min = 0, sum_pref = 0;
+    for (int i2 = 0; i2 < ncols; i2++) {
+        sum_min += col_min[i2];
+        sum_pref += col_pref[i2];
+    }
+    int chrome = spacing * (ncols + 1);
+    int W;
+    if (tst->width >= 0) W = avail_w;   /* resolved by lay_block */
+    else {
+        W = sum_pref + chrome;          /* shrink-to-fit */
+        if (W > avail_w) W = avail_w;
+    }
+    int Wc = W - chrome;
+    if (Wc < ncols * 8) { Wc = ncols * 8; W = Wc + chrome; }
+
+    /* percent columns claim their share first */
+    for (int i2 = 0; i2 < ncols; i2++)
+        if (col_pct[i2] > 0) {
+            int want = (int)((long)Wc * col_pct[i2] / 100);
+            if (want > col_pref[i2]) col_pref[i2] = want;
+            if (col_pref[i2] < col_min[i2]) col_pref[i2] = col_min[i2];
+        }
+    sum_pref = 0;
+    for (int i2 = 0; i2 < ncols; i2++) sum_pref += col_pref[i2];
+
+    int colw[TBL_COL_MAX];
+    if (sum_pref <= Wc) {
+        int extra = Wc - sum_pref;
+        for (int i2 = 0; i2 < ncols; i2++) {
+            colw[i2] = col_pref[i2];
+            if (tst->width >= 0 && extra > 0)
+                colw[i2] += (int)((long)extra *
+                                  (col_pref[i2] ? col_pref[i2] : 1) /
+                                  (sum_pref ? sum_pref : ncols));
+        }
+        if (tst->width < 0) { Wc = sum_pref; W = Wc + chrome; }
+    } else if (sum_min < Wc) {
+        /* between min and pref: interpolate proportionally */
+        long num = Wc - sum_min, den = sum_pref - sum_min;
+        for (int i2 = 0; i2 < ncols; i2++)
+            colw[i2] = col_min[i2] +
+                (int)((long)(col_pref[i2] - col_min[i2]) * num /
+                      (den > 0 ? den : 1));
+    } else {
+        /* doesn't fit even at min: scale the mins down (no h-scroll) */
+        for (int i2 = 0; i2 < ncols; i2++)
+            colw[i2] = (int)((long)col_min[i2] * Wc /
+                             (sum_min > 0 ? sum_min : 1));
+    }
+
+    /* pass 2: lay the rows */
+    for (int g = tn->first; g >= 0; g = E->nodes[g].next) {
+        struct dnode *gn = &E->nodes[g];
+        if (gn->tag == T_TEXT || gn->st.disp == D_NONE) continue;
+        if (gn->st.disp == D_TROW) {
+            y += spacing;
+            y = tbl_lay_row(g, cx, y, colw, ncols, spacing, W, link, inbg);
+        } else if (gn->st.disp == D_TSEC) {
+            for (int r = gn->first; r >= 0; r = E->nodes[r].next)
+                if (E->nodes[r].tag != T_TEXT &&
+                    E->nodes[r].st.disp == D_TROW) {
+                    y += spacing;
+                    y = tbl_lay_row(r, cx, y, colw, ncols, spacing, W,
+                                    link, inbg);
+                }
+        }
+    }
+    y += spacing;
+    g_tbl_used_w = W;
+    return y;
+}
+
+static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
+    struct dnode *nd = &E->nodes[ni];
+    struct cstyle *st = &nd->st;
+    if (st->disp == D_NONE) return y;
+    if (nd->link >= 0) link = nd->link;
+    uint32_t curbg = (st->bg >> 24) ? st->bg : inbg;
+
+    int ml = st->m[3] == M_AUTO ? 0 : st->m[3];
+    int mr = st->m[1] == M_AUTO ? 0 : st->m[1];
+    int bwt = st->bw[0], bwr = st->bw[1], bwb = st->bw[2], bwl = st->bw[3];
+    int pt = st->p[0], pr = st->p[1], pb = st->p[2], pl = st->p[3];
+
+    int avail = cw - ml - mr - bwl - bwr - pl - pr;
+    if (avail < 8) avail = 8;
+    int content_w = avail;
+    if (st->width >= 0) {
+        content_w = (st->fl & SF_WPCT) ? (int)((long)avail * st->width / 100)
+                                       : st->width;
+        if (content_w > avail) content_w = avail;
+        if (content_w < 8) content_w = 8;
+    }
+    if (st->max_w >= 0 && content_w > st->max_w) content_w = st->max_w;
+    if (g_flt_freeze) {
+        /* measure pass: auto-margin centering against the provisional
+         * width would inflate the measured extents */
+    } else if (content_w < avail && st->m[3] == M_AUTO && st->m[1] == M_AUTO)
+        ml += (avail - content_w) / 2;    /* margin: 0 auto centering */
+    else if (content_w < avail && st->m[3] == M_AUTO)
+        ml += avail - content_w;
+
+    int bx = x + ml;                      /* border-box left */
+    int by = y;
+    int cx = bx + bwl + pl;
+    int cy = by + bwt + pt;
+    int bbw = bwl + pl + content_w + pr + bwr;
+
+    int bg_i = -1;
+    if (st->bg >> 24) {
+        bg_i = emit_rect(bx, by, bbw, 0, st->bg);   /* height patched below */
+        if (bg_i >= 0) E->items[bg_i].node = ni;    /* clicks on the box */
+    }
+
+    if (st->disp == D_LISTITEM && !(st->fl & SF_NOBULLET)) {
+        struct ditem *bu = item_new(DI_BULLET);
+        if (bu) {
+            bu->x = cx - 14;
+            bu->y = cy + st_line_h(st) / 2 - 4;
+            bu->w = 5;
+            bu->h = 5;
+            bu->fg = st->color;
+        }
+    }
+
+    /* children: table grid, or block flow with anonymous inline runs */
+    if (st->disp == D_TABLE)
+        cy = lay_table_grid(ni, cx, content_w, cy, link, curbg);
+    else
+        cy = lay_flow(ni, cx, content_w, cy, link, curbg);
+
+    /* auto-width tables shrink-to-fit their grid: pull the border box
+     * (and its already-emitted background) in to the used grid width */
+    if (st->disp == D_TABLE && st->width < 0) {
+        int used = g_tbl_used_w;
+        if (used < 8) used = 8;
+        if (used < content_w) {
+            content_w = used;
+            bbw = bwl + pl + content_w + pr + bwr;
+            if (bg_i >= 0) E->items[bg_i].w = bbw;
+        }
+    }
 
     int content_h = cy - (by + bwt + pt);
     if (content_h < 0) content_h = 0;

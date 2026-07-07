@@ -169,6 +169,12 @@ aiming straight at it:
    form-less inputs.
 5. Progressively harder real sites… Gmail is the summit, likely requiring
    most of Phase 11 too.
+   Stage 12A (branch `http-chunked-keepalive`): chunked + keep-alive +
+   512 K caps — google/wikipedia decode chunked+gzip end-to-end
+   (`browser-stage12a-transport.md`). Stage 12B (branch
+   `browser-tables`): real CSS table layout — LIVE Hacker News renders
+   in its grid, Wikipedia infoboxes are right-floated tables
+   (`browser-stage12b-tables.md`).
 
 ## PLATFORM CONSTRAINTS (do not fight these blind)
 - **Freestanding userspace, no full libc**: the browser links **libtoby**
