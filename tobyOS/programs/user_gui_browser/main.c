@@ -186,6 +186,49 @@ static inline long sys_http_finish(long h) {
         : "rcx", "r11", "memory");
     return r;
 }
+
+/* File syscalls (stage 12E: persistent localStorage). */
+#define SYS_READ   2
+#define SYS_CLOSE  4
+#define SYS_OPEN  35
+#define SYS_MKDIR 42
+#define O_RDONLY  0x0
+#define O_WRONLY  0x1
+#define O_CREAT   0x040
+#define O_TRUNC   0x200
+
+static inline long sys_open(const char *path, int flags, int mode) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_OPEN), "D"(path), "S"((long)flags), "d"((long)mode)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_read(int fd, void *buf, unsigned long len) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_READ), "D"((long)fd), "S"(buf), "d"(len)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_close(int fd) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_CLOSE), "D"((long)fd)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_mkdir(const char *path, int mode) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_MKDIR), "D"(path), "S"((long)mode)
+        : "rcx", "r11", "memory");
+    return r;
+}
 #define SYS_GUI_SET_TITLE  76
 static inline void sys_gui_set_title(int fd, const char *t) {
     long r;
@@ -464,6 +507,8 @@ struct cstyle {
     uint8_t  flt;                /* float: 0 none, 1 left, 2 right */
     uint8_t  clr;                /* clear mask: 1 left, 2 right, 3 both */
     uint8_t  valign;             /* cells: 0 top/baseline, 1 middle, 2 bottom */
+    uint8_t  pos;                /* 0 static, 1 relative, 2 absolute, 3 fixed */
+    int16_t  po[4];              /* top/right/bottom/left offsets; M_AUTO */
     /* flexbox (containers: fdir/fwrap/fjust/falign/gap; items: f*) */
     uint8_t  fdir;               /* 0 row, 1 column */
     uint8_t  fwrap;              /* flex-wrap: wrap */
@@ -548,6 +593,7 @@ enum {
     CP_VALIGN, CP_BCOLLAPSE,
     CP_FLEXDIR, CP_FLEXWRAP, CP_FLEXFLOW, CP_JUSTC, CP_ALITEMS,
     CP_FLEX, CP_FGROW, CP_FSHRINK, CP_FBASIS, CP_GAP,
+    CP_POSITION, CP_TOP, CP_RIGHT, CP_BOTTOM, CP_LEFT,
     CP__N
 };
 
@@ -565,6 +611,8 @@ enum {
 #define IF_MONO    0x04
 #define IF_INPUT   0x08          /* field: text input box */
 #define IF_SUBMITB 0x10          /* field: submit button */
+#define IF_FIXED   0x20          /* position:fixed -- viewport coords,
+                                    painted/hit-tested without scroll */
 
 struct ditem {
     int32_t x, y, w, h;          /* doc coords */
@@ -687,6 +735,12 @@ struct tab {
     char   url[URL_MAX + 1];   int url_len;
     char   title[TITLE_MAX + 1];
     char   history[HISTORY_MAX][URL_MAX + 1]; int hist_pos, hist_count;
+    /* stage 12E: same-document history (pushState/popstate). doc_gen
+     * bumps on every real render; entries carry the generation they
+     * belong to, so back/forward can tell "fire popstate" from
+     * "refetch". */
+    int    doc_gen;
+    int    hist_gen[HISTORY_MAX];
     int    doc_h, scroll_y, layout_w, find_run;
     int    focus_url, loading;
     int    find_mode; char find_buf[FIND_MAX + 1]; int find_len;
@@ -1554,6 +1608,8 @@ static int prop_lookup(const char *s, int len) {
         {"flex-grow",CP_FGROW},{"flex-shrink",CP_FSHRINK},
         {"flex-basis",CP_FBASIS},{"gap",CP_GAP},{"column-gap",CP_GAP},
         {"row-gap",CP_GAP},
+        {"position",CP_POSITION},{"top",CP_TOP},{"right",CP_RIGHT},
+        {"bottom",CP_BOTTOM},{"left",CP_LEFT},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -1956,6 +2012,8 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->flt = 0;
     st->clr = 0;
     st->valign = 0;
+    st->pos = 0;
+    for (int i = 0; i < 4; i++) st->po[i] = M_AUTO;
     st->fdir = 0;
     st->fwrap = 0;
     st->fjust = 0;
@@ -2404,6 +2462,25 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
                 st->gap = (int16_t)(px > 500 ? 500 : px);
         }
         break;
+    case CP_POSITION:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "relative") || tok_is(&t, "sticky"))
+                st->pos = 1;                  /* sticky degrades */
+            else if (tok_is(&t, "absolute")) st->pos = 2;
+            else if (tok_is(&t, "fixed")) st->pos = 3;
+            else st->pos = 0;                 /* static */
+        }
+        break;
+    case CP_TOP: case CP_RIGHT: case CP_BOTTOM: case CP_LEFT: {
+        int side = d->prop - CP_TOP;          /* T R B L, contiguous enum */
+        if (vtok_next(v, n, &pos, &t)) {
+            int px;
+            if (tok_is(&t, "auto")) st->po[side] = M_AUTO;
+            else if (css_len_tok(t.s, t.len, st->px, &px) == LK_PX)
+                st->po[side] = clamp_m(px);
+        }
+        break;
+    }
     default:
         break;
     }
@@ -2896,6 +2973,8 @@ static void inl_text_pre(struct ictx *ic, const char *t, int tl, const struct is
     }
 }
 
+static void absq_add(int ni, int sx, int sy);
+
 static void inl_walk(struct ictx *ic, int ni, const struct istyle *is) {
     struct dnode *nd = &E->nodes[ni];
     if (nd->tag == T_TEXT) {
@@ -2905,6 +2984,10 @@ static void inl_walk(struct ictx *ic, int ni, const struct istyle *is) {
     }
     const struct cstyle *st = &nd->st;
     if (st->disp == D_NONE) return;
+    if (st->pos >= 2) {                     /* absolute/fixed leaves flow */
+        absq_add(ni, ic->x, ic->y);
+        return;
+    }
     if (nd->tag == T_BR) { ic_break(ic, is->lh); return; }
 
     struct istyle cs;
@@ -3123,6 +3206,45 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
     }
 }
 
+/* ---- position: absolute/fixed (stage 12E) --------------------------- *
+ * Out-of-flow boxes are QUEUED during normal flow (with a snapshot of
+ * their containing block -- the nearest positioned ancestor's border
+ * box, or the viewport for fixed) and laid AFTER the whole in-flow
+ * pass, so they paint on top and never disturb flow. Fixed items get
+ * IF_FIXED: the painter and hit-test use viewport coords for them.
+ * v1 limits: `bottom` anchoring only for fixed (viewport height is
+ * known; a positioned ancestor's height is not), static-position
+ * fallback is the flow cursor, z-index ignored. */
+
+#define ABS_MAX 64
+struct absq {
+    int     node;
+    int     cb_x, cb_y, cb_w;    /* containing block (border box) */
+    int     sx, sy;              /* static-position fallback */
+    uint8_t fixed;
+};
+static struct absq g_absq[ABS_MAX];
+static int g_nabsq;
+
+/* Current positioned containing block (set by positioned ancestors in
+ * lay_block; initialized to the document by layout()). */
+static int g_cb_x, g_cb_y, g_cb_w;
+static int g_vp_w;               /* viewport content width at layout() */
+
+static void absq_add(int ni, int sx, int sy) {
+    if (g_flt_freeze || g_nabsq >= ABS_MAX) return;   /* measure: ignore */
+    struct absq *q = &g_absq[g_nabsq++];
+    q->node = ni;
+    q->fixed = (E->nodes[ni].st.pos == 3);
+    if (q->fixed) {
+        q->cb_x = 0; q->cb_y = 0; q->cb_w = g_vp_w;
+        q->sx = sx; q->sy = 0;
+    } else {
+        q->cb_x = g_cb_x; q->cb_y = g_cb_y; q->cb_w = g_cb_w;
+        q->sx = sx; q->sy = sy;
+    }
+}
+
 /* ---- Block flow child loop (shared by blocks and table cells) ------- *
  * Lays ni's children into the content box (cx, cy, content_w): floats
  * leave the flow, inline-level runs go through the inline formatting
@@ -3135,6 +3257,12 @@ static int lay_flow(int ni, int cx, int content_w, int cy, int link,
     int prev_mb = 0;
     while (c >= 0) {
         struct dnode *cn = &E->nodes[c];
+        if (cn->tag != T_TEXT && cn->st.disp != D_NONE &&
+            cn->st.pos >= 2) {               /* absolute/fixed: out of flow */
+            absq_add(c, cx, cy);
+            c = cn->next;
+            continue;
+        }
         if (cn->tag != T_TEXT && cn->st.disp != D_NONE && cn->st.flt) {
             lay_float(c, cx, content_w, cy, link, curbg);
             c = cn->next;
@@ -3610,6 +3738,7 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     struct dnode *nd = &E->nodes[ni];
     struct cstyle *st = &nd->st;
     if (st->disp == D_NONE) return y;
+    int items0 = E->nitems;                /* for the relative shift */
     if (nd->link >= 0) link = nd->link;
     uint32_t curbg = (st->bg >> 24) ? st->bg : inbg;
 
@@ -3641,6 +3770,15 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     int cx = bx + bwl + pl;
     int cy = by + bwt + pt;
     int bbw = bwl + pl + content_w + pr + bwr;
+
+    /* A positioned element is the containing block for its absolute
+     * descendants (queued with a snapshot of these coords). */
+    int save_cbx = g_cb_x, save_cby = g_cb_y, save_cbw = g_cb_w;
+    if (st->pos != 0 && !g_flt_freeze) {
+        g_cb_x = bx;
+        g_cb_y = by;
+        g_cb_w = bbw;
+    }
 
     int bg_i = -1;
     if (st->bg >> 24) {
@@ -3690,7 +3828,94 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     if (bwl) emit_rect(bx, by, bwl, bbh, st->border_col);
     if (bwr) emit_rect(bx + bbw - bwr, by, bwr, bbh, st->border_col);
 
+    g_cb_x = save_cbx; g_cb_y = save_cby; g_cb_w = save_cbw;
+
+    /* position: relative -- shift the whole element (its flow slot is
+     * untouched: the parent keeps advancing as if unshifted). */
+    if (st->pos == 1 && !g_flt_freeze) {
+        int dx = st->po[3] != M_AUTO ? st->po[3]
+               : (st->po[1] != M_AUTO ? -st->po[1] : 0);
+        int dyy = st->po[0] != M_AUTO ? st->po[0]
+                : (st->po[2] != M_AUTO ? -st->po[2] : 0);
+        if (dx || dyy)
+            for (int i2 = items0; i2 < E->nitems; i2++) {
+                E->items[i2].x += dx;
+                E->items[i2].y += dyy;
+            }
+    }
+
     return by + bbh;
+}
+
+/* Lay one queued absolute/fixed box: lay it in provisional space
+ * (shrink-to-fit when width is auto), resolve the position from the
+ * containing-block snapshot + top/right/bottom/left, shift the items
+ * into place. Entries queued DURING this lay (nested absolutes) are
+ * shifted along and inherit fixed-ness. Returns the box bottom in doc
+ * coords (0 for fixed). */
+static int lay_abs(int qi) {
+    struct absq *q = &g_absq[qi];
+    struct dnode *nd = &E->nodes[q->node];
+    struct cstyle *st = &nd->st;
+    int prov = 3 << 20;                     /* own provisional band */
+    int i0 = E->nitems, f0 = g_nflts, q0 = g_nabsq;
+
+    int lay_cw;
+    if (st->width >= 0) {
+        lay_cw = q->cb_w;                   /* lay_block resolves width */
+    } else {
+        int mi = E->nitems, mrr = E->render_len, mf = g_nflts;
+        g_flt_freeze++;
+        lay_block(q->node, 0, 100000, prov, -1, 0);
+        g_flt_freeze--;
+        int pref = items_extent(mi) + st->p[1] + st->bw[1];
+        E->nitems = mi; E->render_len = mrr; g_nflts = mf;
+        lay_cw = pref + 2;
+        if (lay_cw > q->cb_w) lay_cw = q->cb_w;
+        if (lay_cw < 24) lay_cw = 24;
+    }
+
+    int bot = lay_block(q->node, 0, lay_cw, prov, -1, 0);
+    int bbh = bot - prov;
+
+    int w_used;
+    if (st->width >= 0 && !(st->fl & SF_WPCT))
+        w_used = st->width + st->bw[3] + st->bw[1] + st->p[3] + st->p[1];
+    else if (st->width >= 0)
+        w_used = (int)((long)q->cb_w * st->width / 100);
+    else
+        w_used = lay_cw;
+
+    int x;
+    if (st->po[3] != M_AUTO)      x = q->cb_x + st->po[3];
+    else if (st->po[1] != M_AUTO) x = q->cb_x + q->cb_w - st->po[1] - w_used;
+    else                          x = q->sx;
+    int y;
+    if (st->po[0] != M_AUTO)      y = q->cb_y + st->po[0];
+    else if (st->po[2] != M_AUTO && q->fixed)
+                                  y = g_content_h - st->po[2] - bbh;
+    else                          y = q->sy;   /* bottom on abs: v1 auto */
+
+    int dx = x - 0, dyy = y - prov;
+    for (int i2 = i0; i2 < E->nitems; i2++) {
+        E->items[i2].x += dx;
+        E->items[i2].y += dyy;
+        if (q->fixed) E->items[i2].fl |= IF_FIXED;
+    }
+    for (int i2 = f0; i2 < g_nflts; i2++) {
+        g_flts[i2].x0 += dx; g_flts[i2].x1 += dx;
+        g_flts[i2].y0 += dyy; g_flts[i2].y1 += dyy;
+    }
+    for (int k = q0; k < g_nabsq; k++) {    /* nested out-of-flow boxes */
+        g_absq[k].sx += dx;
+        g_absq[k].sy += dyy;
+        if (!g_absq[k].fixed) {
+            g_absq[k].cb_x += dx;
+            g_absq[k].cb_y += dyy;
+        }
+        if (q->fixed) g_absq[k].fixed = 1;
+    }
+    return q->fixed ? 0 : y + bbh;
 }
 
 /* Rebuild the display list from the styled DOM at `width`. */
@@ -3720,6 +3945,9 @@ static void layout(int width) {
     if (cw < 60) cw = 60;
     g_nflts = 0;
     g_flt_bottom = 0;
+    g_nabsq = 0;
+    g_vp_w = cw;
+    g_cb_x = 0; g_cb_y = 0; g_cb_w = cw;  /* initial containing block */
     struct cstyle *rst = &E->nodes[root].st;
     int y = rst->m[0] == M_AUTO ? 0 : rst->m[0];
     int end = lay_block(root, 0, cw, y, -1, 0);
@@ -3729,6 +3957,12 @@ static void layout(int width) {
         if (g_flts[i].y1 > g_flt_bottom) g_flt_bottom = g_flts[i].y1;
     if (g_flt_bottom + 10 > g_doc_h)
         g_doc_h = g_flt_bottom + 10;      /* floats may outgrow the flow */
+    /* out-of-flow boxes: laid after the whole flow so they paint on
+     * top; the queue grows as nested absolutes are discovered */
+    for (int qi = 0; qi < g_nabsq; qi++) {
+        int b = lay_abs(qi);
+        if (b + 10 > g_doc_h) g_doc_h = b + 10;
+    }
     E->render[E->render_len] = 0;
 }
 
@@ -3956,6 +4190,7 @@ static int  js_dispatch_event(int node, const char *type);
 static int  js_dispatch_key(int node, const char *type, const char *key);
 static void history_push(const char *url);
 static long do_navigate(const char *url);
+static void history_go(int delta);
 
 /* ---- DOM mutation helpers ------------------------------------------ */
 
@@ -4294,6 +4529,16 @@ static JSValue js_dom_pushstate(JSContext *cx, JSValueConst t, int argc, JSValue
     return JS_UNDEFINED;
 }
 
+/* history.back/forward/go: same-document traversal fires popstate
+ * synchronously (safe re-entrancy); cross-document refetches via the
+ * async nav path, so nothing tears down under the running script. */
+static JSValue js_dom_histgo(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int d = (argc >= 1) ? jsi(cx, argv[0]) : 0;
+    if (d) history_go(d);
+    return JS_UNDEFINED;
+}
+
 /* navigate(url): DEFERRED -- performed after JS unwinds (navigation
  * tears down the running runtime). */
 static JSValue js_dom_navigate(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
@@ -4534,6 +4779,73 @@ static JSValue js_dom_fetchstart(JSContext *cx, JSValueConst t, int argc, JSValu
     cur->js_fetches[slot].used = 1;
     cur->js_fetches[slot].handle = (int)h;
     cur->js_fetches[slot].cb = JS_DupValue(cx, argv[1]);
+    return JS_UNDEFINED;
+}
+
+/* ---- Persistent localStorage (stage 12E) ---------------------------- *
+ * One small file per origin host: /data/browser/<host>.ls, written
+ * whole on every mutation (storage blobs are tiny) and loaded when a
+ * page's JS world spins up. The blob is the prelude's serialization
+ * (0x1E between records, 0x1F between key and value). */
+
+#define STORE_CAP (16 * 1024)
+
+static void store_path_of(char *out, int cap) {
+    int p = 0;
+    const char *pre = "/data/browser/";
+    for (int i = 0; pre[i] && p < cap - 1; i++) out[p++] = pre[i];
+    const char *u = g_url;
+    int i = 0;
+    if (has_scheme(u)) {
+        while (u[i] && u[i] != ':') i++;
+        i += 3;                            /* past "://" */
+    }
+    int wrote = 0;
+    for (; u[i] && u[i] != '/' && u[i] != ':' && u[i] != '?' && p < cap - 4;
+         i++) {
+        char c = (char)lc(u[i]);
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '.' || c == '-'))
+            c = '_';
+        out[p++] = c;
+        wrote = 1;
+    }
+    if (!wrote) out[p++] = '_';
+    out[p++] = '.'; out[p++] = 'l'; out[p++] = 's';
+    out[p] = 0;
+}
+
+static JSValue js_dom_storeload(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t; (void)argc; (void)argv;
+    char path[600];
+    store_path_of(path, sizeof(path));
+    long fd = sys_open(path, O_RDONLY, 0);
+    if (fd < 0) return JS_NewString(cx, "");
+    char *buf = (char *)malloc(STORE_CAP + 1);
+    long n = buf ? sys_read((int)fd, buf, STORE_CAP) : -1;
+    sys_close((int)fd);
+    JSValue r = (n > 0) ? JS_NewStringLen(cx, buf, (size_t)n)
+                        : JS_NewString(cx, "");
+    if (buf) free(buf);
+    return r;
+}
+
+static JSValue js_dom_storesave(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_UNDEFINED;
+    size_t len = 0;
+    const char *s = JS_ToCStringLen(cx, &len, argv[0]);
+    if (!s) return JS_UNDEFINED;
+    if (len > STORE_CAP) len = STORE_CAP;
+    sys_mkdir("/data/browser", 0755);      /* idempotent */
+    char path[600];
+    store_path_of(path, sizeof(path));
+    long fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        sys_write((int)fd, s, len);
+        sys_close((int)fd);
+    }
+    JS_FreeCString(cx, s);
     return JS_UNDEFINED;
 }
 
@@ -4869,25 +5181,39 @@ static const char JS_PRELUDE[] =
 "  g.history = {\n"
 "    pushState: function(st, ti, u){ if (u) D.pushState(String(u)); },\n"
 "    replaceState: function(st, ti, u){ if (u) D.pushState(String(u)); },\n"
-"    back: function(){},\n"
-"    forward: function(){},\n"
+"    back: function(){ D.histGo(-1); },\n"
+"    forward: function(){ D.histGo(1); },\n"
+"    go: function(n){ if (n|0) D.histGo(n|0); },\n"
 "    state: null\n"
 "  };\n"
-"  function mkStorage(){\n"
+"  function mkStorage(persist){\n"
 "    var st = {};\n"
+"    if (persist){\n"
+"      var blob = D.storeLoad();\n"
+"      if (blob) blob.split('\\x1e').forEach(function(rec){\n"
+"        var i = rec.indexOf('\\x1f');\n"
+"        if (i > 0) st[rec.slice(0, i)] = rec.slice(i + 1);\n"
+"      });\n"
+"    }\n"
+"    function save(){\n"
+"      if (!persist) return;\n"
+"      D.storeSave(Object.keys(st).map(function(k){\n"
+"        return k + '\\x1f' + st[k];\n"
+"      }).join('\\x1e'));\n"
+"    }\n"
 "    var o = {\n"
 "      getItem: function(k){ return (k in st) ? st[k] : null; },\n"
-"      setItem: function(k, v){ st[String(k)] = String(v); },\n"
-"      removeItem: function(k){ delete st[k]; },\n"
-"      clear: function(){ st = {}; },\n"
+"      setItem: function(k, v){ st[String(k)] = String(v); save(); },\n"
+"      removeItem: function(k){ delete st[k]; save(); },\n"
+"      clear: function(){ st = {}; save(); },\n"
 "      key: function(i){ return Object.keys(st)[i] || null; }\n"
 "    };\n"
 "    Object.defineProperty(o, 'length',\n"
 "      { get: function(){ return Object.keys(st).length; } });\n"
 "    return o;\n"
 "  }\n"
-"  g.localStorage = mkStorage();\n"
-"  g.sessionStorage = mkStorage();\n"
+"  g.localStorage = mkStorage(true);\n"
+"  g.sessionStorage = mkStorage(false);\n"
 "})(globalThis);\n";
 
 /* ---- run every <script> at load -------------------------------------- */
@@ -4939,6 +5265,8 @@ static int js_ensure(void) {
             {"timer", js_dom_timer, 3},   {"untimer", js_dom_untimer, 1},
             {"fetchSync", js_dom_fetchsync, 1},
             {"fetchStart", js_dom_fetchstart, 2},
+            {"storeLoad", js_dom_storeload, 0},
+            {"storeSave", js_dom_storesave, 1},
             {"getValue", js_dom_getvalue, 1},
             {"setValue", js_dom_setvalue, 2},
             {"setDispatcher", js_dom_setdispatcher, 1},
@@ -4947,6 +5275,7 @@ static int js_ensure(void) {
             {"childNodes", js_dom_childnodes, 1},
             {"nextSib", js_dom_nextsib, 1},
             {"pushState", js_dom_pushstate, 1},
+            {"histGo", js_dom_histgo, 1},
             {"navigate", js_dom_navigate, 1},
             {"href", js_dom_href, 0},
         };
@@ -5217,6 +5546,7 @@ static int js_pump_all(void) {
 
 static void render_html(void) {
     if (!E) return;
+    cur->doc_gen++;                       /* new document (popstate gen) */
     js_teardown(cur);                     /* the old page's JS world dies */
     images_free();
     page_reset();
@@ -5243,6 +5573,7 @@ static void render_html(void) {
  * synthesize doc > body > pre > #text and run the normal pipeline. */
 static void render_mono_doc(void) {
     if (!E) return;
+    cur->doc_gen++;                       /* new document (popstate gen) */
     js_teardown(cur);
     images_free();
     page_reset();
@@ -5310,11 +5641,14 @@ static void history_push(const char *url) {
         return;
     g_hist_pos++;
     if (g_hist_pos >= HISTORY_MAX) {
-        for (int i = 0; i < HISTORY_MAX - 1; i++)
+        for (int i = 0; i < HISTORY_MAX - 1; i++) {
             str_copy(g_history[i], g_history[i + 1], URL_MAX);
+            cur->hist_gen[i] = cur->hist_gen[i + 1];
+        }
         g_hist_pos = HISTORY_MAX - 1;
     }
     str_copy(g_history[g_hist_pos], url, URL_MAX);
+    cur->hist_gen[g_hist_pos] = cur->doc_gen;
     g_hist_count = g_hist_pos + 1;
 }
 
@@ -5637,6 +5971,486 @@ static void images_free(void) { tab_images_free(cur); }
  * background tabs fill in too. (A single image's fetch still blocks
  * briefly since the kernel HTTP is synchronous; that's bounded to one
  * image, vs the old freeze-for-all-N.) Returns 1 if it did work. */
+/* ===================== Minimal SVG renderer (stage 12E) ============== *
+ * Enough for icons (Wikipedia chrome, favicons-as-svg): <rect>
+ * <circle> <ellipse> <polygon> <polyline> <path> with solid fills
+ * (fill= attribute or style="fill:.."), <g> fill inheritance,
+ * viewBox scaling, even-odd scanline filling of flattened outlines.
+ * No strokes, gradients, transforms, text, masks or clipping (defs/
+ * mask/gradient subtrees are skipped). Renders into a malloc'd
+ * ARGB8888 canvas with a transparent background; small icons render
+ * at 2x for a crisper nearest-neighbor blit. */
+
+extern double sin(double);
+extern double cos(double);
+
+#define SVG_MAX_PTS   1536
+#define SVG_MAX_SUBS  48
+#define SVG_MAX_DIM   512
+
+struct svgpoly {
+    float px[SVG_MAX_PTS], py[SVG_MAX_PTS];
+    int   sub0[SVG_MAX_SUBS];
+    int   nsubs, npts;
+};
+
+static void svgp_moveto(struct svgpoly *p, float x, float y) {
+    if (p->nsubs >= SVG_MAX_SUBS || p->npts >= SVG_MAX_PTS) return;
+    p->sub0[p->nsubs++] = p->npts;
+    p->px[p->npts] = x; p->py[p->npts] = y; p->npts++;
+}
+static void svgp_lineto(struct svgpoly *p, float x, float y) {
+    if (p->nsubs == 0) { svgp_moveto(p, x, y); return; }
+    if (p->npts >= SVG_MAX_PTS) return;
+    p->px[p->npts] = x; p->py[p->npts] = y; p->npts++;
+}
+
+/* Even-odd scanline fill across every (implicitly closed) subpath. */
+static void svg_fill_poly(uint32_t *canvas, int W, int H,
+                          const struct svgpoly *p, uint32_t argb) {
+    if (p->npts < 3) return;
+    float xs[64];
+    for (int y = 0; y < H; y++) {
+        float fy = (float)y + 0.5f;
+        int nx = 0;
+        for (int s = 0; s < p->nsubs; s++) {
+            int i0 = p->sub0[s];
+            int i1 = (s + 1 < p->nsubs) ? p->sub0[s + 1] : p->npts;
+            int cnt = i1 - i0;
+            if (cnt < 2) continue;
+            for (int i = 0; i < cnt; i++) {
+                float y1 = p->py[i0 + i];
+                float y2 = p->py[i0 + (i + 1) % cnt];
+                if ((y1 <= fy && y2 > fy) || (y2 <= fy && y1 > fy)) {
+                    float x1 = p->px[i0 + i];
+                    float x2 = p->px[i0 + (i + 1) % cnt];
+                    float t = (fy - y1) / (y2 - y1);
+                    if (nx < 64) xs[nx++] = x1 + t * (x2 - x1);
+                }
+            }
+        }
+        for (int i = 1; i < nx; i++) {          /* insertion sort */
+            float v = xs[i];
+            int j = i - 1;
+            while (j >= 0 && xs[j] > v) { xs[j + 1] = xs[j]; j--; }
+            xs[j + 1] = v;
+        }
+        for (int i = 0; i + 1 < nx; i += 2) {
+            int xa = (int)(xs[i] + 0.5f), xb = (int)(xs[i + 1] + 0.5f);
+            if (xa < 0) xa = 0;
+            if (xb > W) xb = W;
+            for (int x = xa; x < xb; x++) canvas[(long)y * W + x] = argb;
+        }
+    }
+}
+
+/* Number scanner: [ws,][-+]digits[.digits][eN]. */
+static float svg_num(const char *s, int n, int *pos) {
+    int i = *pos;
+    while (i < n && (s[i] == ' ' || s[i] == ',' || s[i] == '\t' ||
+                     s[i] == '\n' || s[i] == '\r')) i++;
+    float sign = 1.0f, v = 0.0f;
+    if (i < n && (s[i] == '-' || s[i] == '+')) {
+        if (s[i] == '-') sign = -1.0f;
+        i++;
+    }
+    while (i < n && s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; }
+    if (i < n && s[i] == '.') {
+        i++;
+        float f = 0.1f;
+        while (i < n && s[i] >= '0' && s[i] <= '9') { v += (s[i] - '0') * f; f *= 0.1f; i++; }
+    }
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        i++;
+        int es = 1, ev = 0;
+        if (i < n && (s[i] == '-' || s[i] == '+')) { if (s[i] == '-') es = -1; i++; }
+        while (i < n && s[i] >= '0' && s[i] <= '9') { ev = ev * 10 + (s[i] - '0'); i++; }
+        while (ev-- > 0) v = es > 0 ? v * 10.0f : v * 0.1f;
+    }
+    *pos = i;
+    return sign * v;
+}
+
+static long svg_tag_close(const char *s, long n, long i) {
+    while (i < n && s[i] != '>') i++;
+    return i;
+}
+
+/* attr="value" scan inside one tag's [i, end). */
+static int svg_attr(const char *s, long i, long end, const char *name,
+                    char *out, int cap) {
+    int nl = (int)str_len(name);
+    for (long k = i; k + nl + 1 < end; k++) {
+        if (str_ncasecmp(s + k, name, nl) != 0) continue;
+        if (k > i && s[k - 1] != ' ' && s[k - 1] != '\t' &&
+            s[k - 1] != '\n' && s[k - 1] != '\r') continue;
+        long q = k + nl;
+        while (q < end && (s[q] == ' ' || s[q] == '\t')) q++;
+        if (q >= end || s[q] != '=') continue;
+        q++;
+        while (q < end && (s[q] == ' ' || s[q] == '\t')) q++;
+        char quote = (q < end && (s[q] == '"' || s[q] == '\'')) ? s[q] : 0;
+        if (quote) q++;
+        int o = 0;
+        while (q < end && o < cap - 1 &&
+               (quote ? s[q] != quote : (s[q] != ' ' && s[q] != '>')))
+            out[o++] = s[q++];
+        out[o] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Effective fill for a shape tag: fill= attr, style="fill:..", else
+ * the inherited <g> fill. Sets *none for fill:none. */
+static void svg_fill_of(const char *s, long i, long end,
+                        uint32_t inherit, int inherit_none,
+                        uint32_t *out, int *none) {
+    char a[128];
+    *out = inherit;
+    *none = inherit_none;
+    if (svg_attr(s, i, end, "fill", a, sizeof(a))) {
+        if (str_eq(a, "none")) { *none = 1; return; }
+        uint32_t col;
+        if (css_color_tok(a, (int)str_len(a), &col)) {
+            *out = col | 0xFF000000u;
+            *none = 0;
+            return;
+        }
+    }
+    if (svg_attr(s, i, end, "style", a, sizeof(a))) {
+        int al = (int)str_len(a);
+        int fo = str_contains(a, al, "fill:", 5);
+        if (fo >= 0) {
+            int v0 = fo + 5;
+            while (v0 < al && a[v0] == ' ') v0++;
+            int v1 = v0;
+            while (v1 < al && a[v1] != ';') v1++;
+            if (v1 - v0 == 4 && str_ncasecmp(a + v0, "none", 4) == 0) {
+                *none = 1;
+                return;
+            }
+            uint32_t col;
+            if (css_color_tok(a + v0, v1 - v0, &col)) {
+                *out = col | 0xFF000000u;
+                *none = 0;
+            }
+        }
+    }
+}
+
+static void svg_flat_cubic(struct svgpoly *p, float x0, float y0,
+                           float x1, float y1, float x2, float y2,
+                           float x3, float y3) {
+    for (int k = 1; k <= 12; k++) {
+        float t = (float)k / 12.0f, u = 1.0f - t;
+        float x = u*u*u*x0 + 3*u*u*t*x1 + 3*u*t*t*x2 + t*t*t*x3;
+        float y = u*u*u*y0 + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y3;
+        svgp_lineto(p, x, y);
+    }
+}
+static void svg_flat_quad(struct svgpoly *p, float x0, float y0,
+                          float x1, float y1, float x2, float y2) {
+    for (int k = 1; k <= 8; k++) {
+        float t = (float)k / 8.0f, u = 1.0f - t;
+        float x = u*u*x0 + 2*u*t*x1 + t*t*x2;
+        float y = u*u*y0 + 2*u*t*y1 + t*t*y2;
+        svgp_lineto(p, x, y);
+    }
+}
+
+/* Path data -> flattened subpaths, mapped from user units into canvas
+ * pixels via (v - o) * s. Unsupported S/T degrade to lines toward the
+ * endpoint's control shape; A (arc) degrades to a line. */
+static void svg_path_d(const char *d, int n, struct svgpoly *p,
+                       float sxx, float syy, float ox, float oy) {
+    int i = 0;
+    float cx = 0, cy = 0, sx0 = 0, sy0 = 0;
+    char cmd = 0;
+    while (i < n) {
+        int before = i;
+        while (i < n && (d[i] == ' ' || d[i] == ',' || d[i] == '\n' ||
+                         d[i] == '\r' || d[i] == '\t')) i++;
+        if (i >= n) break;
+        char c = d[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) { cmd = c; i++; }
+        if (!cmd) break;
+        int rel = (cmd >= 'a');
+        char C = rel ? (char)(cmd - 32) : cmd;
+        switch (C) {
+        case 'M': {
+            float x = svg_num(d, n, &i), y = svg_num(d, n, &i);
+            if (rel) { x += cx; y += cy; }
+            cx = x; cy = y; sx0 = x; sy0 = y;
+            svgp_moveto(p, (x - ox) * sxx, (y - oy) * syy);
+            cmd = rel ? 'l' : 'L';
+            break;
+        }
+        case 'L': {
+            float x = svg_num(d, n, &i), y = svg_num(d, n, &i);
+            if (rel) { x += cx; y += cy; }
+            cx = x; cy = y;
+            svgp_lineto(p, (x - ox) * sxx, (y - oy) * syy);
+            break;
+        }
+        case 'H': {
+            float x = svg_num(d, n, &i);
+            if (rel) x += cx;
+            cx = x;
+            svgp_lineto(p, (x - ox) * sxx, (cy - oy) * syy);
+            break;
+        }
+        case 'V': {
+            float y = svg_num(d, n, &i);
+            if (rel) y += cy;
+            cy = y;
+            svgp_lineto(p, (cx - ox) * sxx, (y - oy) * syy);
+            break;
+        }
+        case 'C': case 'S': {
+            float x1, y1, x2, y2, x, y;
+            if (C == 'C') { x1 = svg_num(d, n, &i); y1 = svg_num(d, n, &i); }
+            else { x1 = cx; y1 = cy; }
+            x2 = svg_num(d, n, &i); y2 = svg_num(d, n, &i);
+            x  = svg_num(d, n, &i); y  = svg_num(d, n, &i);
+            if (rel) {
+                if (C == 'C') { x1 += cx; y1 += cy; }
+                x2 += cx; y2 += cy; x += cx; y += cy;
+            }
+            svg_flat_cubic(p, (cx-ox)*sxx, (cy-oy)*syy, (x1-ox)*sxx, (y1-oy)*syy,
+                           (x2-ox)*sxx, (y2-oy)*syy, (x-ox)*sxx, (y-oy)*syy);
+            cx = x; cy = y;
+            break;
+        }
+        case 'Q': {
+            float x1 = svg_num(d, n, &i), y1 = svg_num(d, n, &i);
+            float x  = svg_num(d, n, &i), y  = svg_num(d, n, &i);
+            if (rel) { x1 += cx; y1 += cy; x += cx; y += cy; }
+            svg_flat_quad(p, (cx-ox)*sxx, (cy-oy)*syy, (x1-ox)*sxx, (y1-oy)*syy,
+                          (x-ox)*sxx, (y-oy)*syy);
+            cx = x; cy = y;
+            break;
+        }
+        case 'T': {
+            float x = svg_num(d, n, &i), y = svg_num(d, n, &i);
+            if (rel) { x += cx; y += cy; }
+            cx = x; cy = y;
+            svgp_lineto(p, (x - ox) * sxx, (y - oy) * syy);
+            break;
+        }
+        case 'A': {
+            (void)svg_num(d, n, &i); (void)svg_num(d, n, &i);
+            (void)svg_num(d, n, &i); (void)svg_num(d, n, &i);
+            (void)svg_num(d, n, &i);
+            float x = svg_num(d, n, &i), y = svg_num(d, n, &i);
+            if (rel) { x += cx; y += cy; }
+            cx = x; cy = y;
+            svgp_lineto(p, (x - ox) * sxx, (y - oy) * syy);
+            break;
+        }
+        case 'Z':
+            cx = sx0; cy = sy0;            /* filler closes implicitly */
+            break;
+        default:
+            i++;
+            break;
+        }
+        if (i == before) i++;              /* safety: always advance */
+    }
+}
+
+static int svg_sniff(const uint8_t *b, long n) {
+    for (long i = 0; i + 4 < n && i < 512; i++)
+        if (b[i] == '<' && lc(b[i+1]) == 's' && lc(b[i+2]) == 'v' &&
+            lc(b[i+3]) == 'g')
+            return 1;
+    return 0;
+}
+
+/* Render an SVG buffer to a fresh ARGB canvas; NULL on anything we
+ * can't make sense of. */
+static uint32_t *svg_render(const uint8_t *bufu, long n, int *out_w, int *out_h) {
+    const char *s = (const char *)bufu;
+    long i = 0;
+    while (i + 4 < n && !(s[i] == '<' && lc(s[i+1]) == 's' &&
+                          lc(s[i+2]) == 'v' && lc(s[i+3]) == 'g')) i++;
+    if (i + 4 >= n) return NULL;
+    long at = i + 4;
+    long end = svg_tag_close(s, n, at);
+    char a[256];
+    float vbx = 0, vby = 0, vbw = 0, vbh = 0, aw = 0, ah = 0;
+    if (svg_attr(s, at, end, "viewBox", a, sizeof(a))) {
+        int p2 = 0, al = (int)str_len(a);
+        vbx = svg_num(a, al, &p2); vby = svg_num(a, al, &p2);
+        vbw = svg_num(a, al, &p2); vbh = svg_num(a, al, &p2);
+    }
+    if (svg_attr(s, at, end, "width", a, sizeof(a))) {
+        int p2 = 0;
+        aw = svg_num(a, (int)str_len(a), &p2);
+        if (str_contains(a, (int)str_len(a), "em", 2) >= 0) aw = 0;
+    }
+    if (svg_attr(s, at, end, "height", a, sizeof(a))) {
+        int p2 = 0;
+        ah = svg_num(a, (int)str_len(a), &p2);
+        if (str_contains(a, (int)str_len(a), "em", 2) >= 0) ah = 0;
+    }
+    if (vbw <= 0 || vbh <= 0) {
+        vbx = vby = 0;
+        vbw = aw > 0 ? aw : 24;
+        vbh = ah > 0 ? ah : vbw;
+    }
+    if (aw <= 0 && ah > 0) aw = ah * vbw / vbh;
+    if (ah <= 0 && aw > 0) ah = aw * vbh / vbw;
+    if (aw <= 0) { aw = vbw; ah = vbh; }
+    int W = (int)(aw + 0.5f), H = (int)(ah + 0.5f);
+    if (W < 1 || H < 1) return NULL;
+    if (W <= 64 && H <= 64) { W *= 2; H *= 2; }   /* crisper small icons */
+    if (W > SVG_MAX_DIM) { H = H * SVG_MAX_DIM / W; W = SVG_MAX_DIM; }
+    if (H > SVG_MAX_DIM) { W = W * SVG_MAX_DIM / H; H = SVG_MAX_DIM; }
+    if (W < 1 || H < 1) return NULL;
+    float sxx = (float)W / vbw, syy = (float)H / vbh;
+
+    uint32_t *canvas = (uint32_t *)malloc((size_t)W * H * 4);
+    struct svgpoly *poly = (struct svgpoly *)malloc(sizeof(struct svgpoly));
+    char *dbuf = (char *)malloc(8192);
+    if (!canvas || !poly || !dbuf) {
+        if (canvas) free(canvas);
+        if (poly) free(poly);
+        if (dbuf) free(dbuf);
+        return NULL;
+    }
+    for (long k = 0; k < (long)W * H; k++) canvas[k] = 0;
+
+    uint32_t gfill[8];
+    int gnone[8], gdepth = 0, skip_depth = 0;
+    gfill[0] = 0xFF000000u;
+    gnone[0] = 0;
+
+    i = end + 1;
+    while (i < n) {
+        while (i < n && s[i] != '<') i++;
+        if (i + 1 >= n) break;
+        if (s[i + 1] == '!' || s[i + 1] == '?') {         /* comment/PI */
+            i = svg_tag_close(s, n, i) + 1;
+            continue;
+        }
+        if (s[i + 1] == '/') {                            /* closing tag */
+            char nm[16];
+            long k = i + 2;
+            int o = 0;
+            while (k < n && s[k] != '>' && s[k] != ' ' && o < 15)
+                nm[o++] = (char)lc(s[k++]);
+            nm[o] = 0;
+            if (str_eq(nm, "svg")) break;
+            if (str_eq(nm, "g")) { if (gdepth > 0) gdepth--; }
+            else if (str_eq(nm, "defs") || str_eq(nm, "mask") ||
+                     str_eq(nm, "clippath") || str_eq(nm, "symbol") ||
+                     str_eq(nm, "pattern") || str_eq(nm, "lineargradient") ||
+                     str_eq(nm, "radialgradient")) {
+                if (skip_depth > 0) skip_depth--;
+            }
+            i = svg_tag_close(s, n, i) + 1;
+            continue;
+        }
+        char nm[16];
+        long k = i + 1;
+        int o = 0;
+        while (k < n && (is_alpha(s[k]) || (s[k] >= '0' && s[k] <= '9')) &&
+               o < 15)
+            nm[o++] = (char)lc(s[k++]);
+        nm[o] = 0;
+        long tend = svg_tag_close(s, n, k);
+        int selfclose = (tend > i && s[tend - 1] == '/');
+
+        if (str_eq(nm, "defs") || str_eq(nm, "mask") ||
+            str_eq(nm, "clippath") || str_eq(nm, "symbol") ||
+            str_eq(nm, "pattern") || str_eq(nm, "lineargradient") ||
+            str_eq(nm, "radialgradient")) {
+            if (!selfclose) skip_depth++;
+            i = tend + 1;
+            continue;
+        }
+        if (str_eq(nm, "g")) {
+            if (!selfclose && gdepth < 7) {
+                uint32_t f = gfill[gdepth];
+                int no = gnone[gdepth];
+                svg_fill_of(s, k, tend, f, no, &f, &no);
+                gdepth++;
+                gfill[gdepth] = f;
+                gnone[gdepth] = no;
+            }
+            i = tend + 1;
+            continue;
+        }
+        if (skip_depth == 0) {
+            uint32_t fill;
+            int none;
+            svg_fill_of(s, k, tend, gfill[gdepth], gnone[gdepth],
+                        &fill, &none);
+            poly->nsubs = 0;
+            poly->npts = 0;
+            if (!none && str_eq(nm, "rect")) {
+                float x = 0, y = 0, w = 0, h = 0;
+                int p2;
+                if (svg_attr(s, k, tend, "x", a, sizeof(a))) { p2 = 0; x = svg_num(a, (int)str_len(a), &p2); }
+                if (svg_attr(s, k, tend, "y", a, sizeof(a))) { p2 = 0; y = svg_num(a, (int)str_len(a), &p2); }
+                if (svg_attr(s, k, tend, "width", a, sizeof(a))) { p2 = 0; w = svg_num(a, (int)str_len(a), &p2); }
+                if (svg_attr(s, k, tend, "height", a, sizeof(a))) { p2 = 0; h = svg_num(a, (int)str_len(a), &p2); }
+                if (w > 0 && h > 0) {
+                    svgp_moveto(poly, (x-vbx)*sxx, (y-vby)*syy);
+                    svgp_lineto(poly, (x+w-vbx)*sxx, (y-vby)*syy);
+                    svgp_lineto(poly, (x+w-vbx)*sxx, (y+h-vby)*syy);
+                    svgp_lineto(poly, (x-vbx)*sxx, (y+h-vby)*syy);
+                    svg_fill_poly(canvas, W, H, poly, fill);
+                }
+            } else if (!none && (str_eq(nm, "circle") || str_eq(nm, "ellipse"))) {
+                float cx = 0, cy = 0, rx = 0, ry = 0;
+                int p2;
+                if (svg_attr(s, k, tend, "cx", a, sizeof(a))) { p2 = 0; cx = svg_num(a, (int)str_len(a), &p2); }
+                if (svg_attr(s, k, tend, "cy", a, sizeof(a))) { p2 = 0; cy = svg_num(a, (int)str_len(a), &p2); }
+                if (svg_attr(s, k, tend, "r", a, sizeof(a))) { p2 = 0; rx = ry = svg_num(a, (int)str_len(a), &p2); }
+                if (svg_attr(s, k, tend, "rx", a, sizeof(a))) { p2 = 0; rx = svg_num(a, (int)str_len(a), &p2); }
+                if (svg_attr(s, k, tend, "ry", a, sizeof(a))) { p2 = 0; ry = svg_num(a, (int)str_len(a), &p2); }
+                if (rx > 0 && ry > 0) {
+                    for (int seg = 0; seg < 40; seg++) {
+                        double th = 6.28318530718 * seg / 40.0;
+                        float x = cx + rx * (float)cos(th);
+                        float y = cy + ry * (float)sin(th);
+                        if (seg == 0) svgp_moveto(poly, (x-vbx)*sxx, (y-vby)*syy);
+                        else svgp_lineto(poly, (x-vbx)*sxx, (y-vby)*syy);
+                    }
+                    svg_fill_poly(canvas, W, H, poly, fill);
+                }
+            } else if (!none && (str_eq(nm, "polygon") || str_eq(nm, "polyline"))) {
+                if (svg_attr(s, k, tend, "points", dbuf, 8192)) {
+                    int p2 = 0, dn = (int)str_len(dbuf), first = 1;
+                    while (p2 < dn) {
+                        int save = p2;
+                        float x = svg_num(dbuf, dn, &p2);
+                        float y = svg_num(dbuf, dn, &p2);
+                        if (p2 == save) break;
+                        if (first) { svgp_moveto(poly, (x-vbx)*sxx, (y-vby)*syy); first = 0; }
+                        else svgp_lineto(poly, (x-vbx)*sxx, (y-vby)*syy);
+                    }
+                    svg_fill_poly(canvas, W, H, poly, fill);
+                }
+            } else if (!none && str_eq(nm, "path")) {
+                if (svg_attr(s, k, tend, "d", dbuf, 8192)) {
+                    svg_path_d(dbuf, (int)str_len(dbuf), poly, sxx, syy, vbx, vby);
+                    svg_fill_poly(canvas, W, H, poly, fill);
+                }
+            }
+        }
+        i = tend + 1;
+    }
+
+    free(poly);
+    free(dbuf);
+    *out_w = W;
+    *out_h = H;
+    return canvas;
+}
+
 static uint8_t *g_img_fetch_buf = NULL;
 
 /* Stage 12D: one image transfer in flight at a time, fully async --
@@ -5688,19 +6502,27 @@ static int load_one_pending_image(void) {
         struct img *im = &g_tabs[ti].images[ii];
         if (n <= 0) { im->state = -1; return 1; }
 
+        uint32_t *pix = NULL;
+        int iw = 0, ih = 0;
         toby_image_t *dec = toby_image_load(g_img_fetch_buf, (size_t)n);
-        if (!dec || dec->width <= 0 || dec->height <= 0 ||
-            dec->width > IMG_MAX_DIM || dec->height > IMG_MAX_DIM) {
-            if (dec) toby_image_free(dec);
+        if (dec && dec->width > 0 && dec->height > 0 &&
+            dec->width <= IMG_MAX_DIM && dec->height <= IMG_MAX_DIM) {
+            pix = dec->pixels;              /* steal the decoded buffer */
+            iw = dec->width;
+            ih = dec->height;
+            dec->pixels = NULL;
+        }
+        if (dec) toby_image_free(dec);
+        if (!pix && svg_sniff(g_img_fetch_buf, n))   /* stage 12E: icons */
+            pix = svg_render(g_img_fetch_buf, n, &iw, &ih);
+        if (!pix) {
             im->state = -1;
             return 1;
         }
-        im->pixels = dec->pixels;           /* steal the decoded buffer */
-        im->w = (int16_t)dec->width;
-        im->h = (int16_t)dec->height;
+        im->pixels = pix;
+        im->w = (int16_t)iw;
+        im->h = (int16_t)ih;
         im->state = 1;
-        dec->pixels = NULL;
-        toby_image_free(dec);
 
         /* Re-layout the affected tab. The layout shim addresses `cur`,
          * so temporarily point it at the affected tab (safe: single-
@@ -5817,6 +6639,38 @@ static long do_navigate(const char *url) {
 
     nav_begin(NAVK_NORMAL, target);
     return 0;
+}
+
+/* Focus handoff between form fields, with JS focus/blur events on the
+ * fields' DOM nodes (stage 12E). */
+static void set_focus_field(int fi) {
+    if (fi == g_focus_field) return;
+    int old = g_focus_field;
+    g_focus_field = fi;
+    if (!cur->js_cx) return;
+    if (old >= 0 && old < g_nfields && g_fields[old].node >= 0)
+        js_dispatch_event(g_fields[old].node, "blur");
+    if (fi >= 0 && fi < g_nfields && g_fields[fi].node >= 0)
+        js_dispatch_event(g_fields[fi].node, "focus");
+}
+
+/* Traverse history by delta. Entries created by pushState belong to
+ * the LIVE document: moving between same-generation entries fires a
+ * popstate event and updates the bar -- no refetch (SPA routers).
+ * Anything else refetches through the async nav path. */
+static void history_go(int delta) {
+    int npos = g_hist_pos + delta;
+    if (npos < 0 || npos >= g_hist_count) return;
+    g_hist_pos = npos;
+    str_copy(g_url, g_history[npos], URL_MAX);
+    g_url_len = (int)str_len(g_url);
+    if (cur->hist_gen[npos] == cur->doc_gen && cur->js_cx) {
+        js_dispatch_event(-1, "popstate");
+        update_title();
+        tk_redraw(&win);
+        return;
+    }
+    do_fetch_url(g_url);
 }
 
 /* GET-submit a form: resolve its action against the current page,
@@ -6306,8 +7160,14 @@ static void paint_all(void) {
 
         for (int ri = 0; ri < g_nitems; ri++) {
             struct ditem *r = &g_items[ri];
-            if (r->y + r->h <= vtop || r->y >= vbot) continue;
-            int sy = CONTENT_TOP + (r->y - vtop);
+            int sy;
+            if (r->fl & IF_FIXED) {         /* viewport coords, no scroll */
+                if (r->y + r->h <= 0 || r->y >= g_content_h) continue;
+                sy = CONTENT_TOP + r->y;
+            } else {
+                if (r->y + r->h <= vtop || r->y >= vbot) continue;
+                sy = CONTENT_TOP + (r->y - vtop);
+            }
 
             if (r->kind == DI_RECT) {
                 int y0 = sy, h = r->h;             /* clip to the viewport */
@@ -6483,12 +7343,14 @@ static void follow_link(int num) {
 static struct ditem *run_at(int mx, int my) {
     if (!E) return NULL;
     int dy = my - CONTENT_TOP + g_scroll_y;
+    int vy = my - CONTENT_TOP;             /* fixed items: viewport coords */
     for (int ri = 0; ri < g_nitems; ri++) {
         struct ditem *r = &g_items[ri];
         if (r->link < 0 && r->field < 0) continue;
         if (r->kind != DI_TEXT && r->kind != DI_IMG && r->kind != DI_FIELD)
             continue;
-        if (dy >= r->y && dy < r->y + r->h &&
+        int iy = (r->fl & IF_FIXED) ? vy : dy;
+        if (iy >= r->y && iy < r->y + r->h &&
             mx >= r->x && mx < r->x + r->w)
             return r;
     }
@@ -6528,27 +7390,13 @@ static void handle_mouse_down(int fd, int mx, int my) {
         if (mx < 20) {
             /* Back */
             if (can_go_back()) {
-                g_hist_pos--;
-                g_url_len = 0;
-                while (g_history[g_hist_pos][g_url_len]) {
-                    g_url[g_url_len] = g_history[g_hist_pos][g_url_len];
-                    g_url_len++;
-                }
-                g_url[g_url_len] = '\0';
-                do_fetch_url(g_url);
+                history_go(-1);
                 set_status("Back");
             }
         } else if (mx < 36) {
             /* Forward */
             if (can_go_forward()) {
-                g_hist_pos++;
-                g_url_len = 0;
-                while (g_history[g_hist_pos][g_url_len]) {
-                    g_url[g_url_len] = g_history[g_hist_pos][g_url_len];
-                    g_url_len++;
-                }
-                g_url[g_url_len] = '\0';
-                do_fetch_url(g_url);
+                history_go(1);
                 set_status("Forward");
             }
         } else if (mx < 52) {
@@ -6588,11 +7436,13 @@ static void handle_mouse_down(int fd, int mx, int my) {
          * link/submit action below. */
         if (cur->js_cx && cur->js_has_dispatch && E) {
             int dy2 = my - CONTENT_TOP + g_scroll_y;
+            int vy2 = my - CONTENT_TOP;    /* fixed items: viewport coords */
             int evn = -1;
             for (int ri = 0; ri < g_nitems; ri++) {
                 struct ditem *r2 = &g_items[ri];
                 if (r2->node < 0) continue;
-                if (dy2 >= r2->y && dy2 < r2->y + r2->h &&
+                int iy2 = (r2->fl & IF_FIXED) ? vy2 : dy2;
+                if (iy2 >= r2->y && iy2 < r2->y + r2->h &&
                     mx >= r2->x && mx < r2->x + r2->w)
                     evn = r2->node;        /* last match = topmost */
             }
@@ -6611,10 +7461,10 @@ static void handle_mouse_down(int fd, int mx, int my) {
         if (hit && hit->field >= 0) {
             g_focus_url = 0;
             if (hit->fl & IF_INPUT) {
-                g_focus_field = hit->field;
+                set_focus_field(hit->field);
                 set_status("Type into the field; Enter submits");
             } else {
-                g_focus_field = -1;
+                set_focus_field(-1);
                 submit_form(g_fields[hit->field].form);
             }
             redraw(fd);
@@ -6627,7 +7477,7 @@ static void handle_mouse_down(int fd, int mx, int my) {
         }
         /* Click in empty content unfocuses URL bar + fields */
         g_focus_url = 0;
-        g_focus_field = -1;
+        set_focus_field(-1);
         redraw(fd);
         return;
     }
@@ -6681,20 +7531,24 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
         if (cur->js_cx && f->node >= 0) {
             char one[2];
             const char *kn = js_key_name(key, one);
-            if (kn[0] && js_dispatch_key(f->node, "keydown", kn)) {
+            int prevented = kn[0] ? js_dispatch_key(f->node, "keydown", kn) : 0;
+            /* keyup is synthesized right after keydown: the key ABI
+             * has no break codes (stage 12E) */
+            if (kn[0]) js_dispatch_key(f->node, "keyup", kn);
+            if (prevented) {
                 js_do_pending_nav();
                 redraw(0);
                 return;
             }
         }
         if (key == 27) {
-            g_focus_field = -1;
+            set_focus_field(-1);
             set_status("Field unfocused");
             redraw(0);
             return;
         }
         if (key == 9) {
-            g_focus_field = -1;              /* fall through to Tab */
+            set_focus_field(-1);             /* fall through to Tab */
         } else if (key == 10 || key == 13) {
             submit_form(f->form);
             redraw(0);
@@ -6821,7 +7675,9 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
             if (cur->js_cx) {
                 char one[2];
                 const char *kn = js_key_name(key, one);
-                if (kn[0] && js_dispatch_key(-1, "keydown", kn)) {
+                int prevented = kn[0] ? js_dispatch_key(-1, "keydown", kn) : 0;
+                if (kn[0]) js_dispatch_key(-1, "keyup", kn);   /* 12E */
+                if (prevented) {
                     js_do_pending_nav();
                     redraw(0);
                     return;
@@ -6864,14 +7720,7 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
                 break;
             case '[':
                 if (can_go_back()) {
-                    g_hist_pos--;
-                    g_url_len = 0;
-                    while (g_history[g_hist_pos][g_url_len]) {
-                        g_url[g_url_len] = g_history[g_hist_pos][g_url_len];
-                        g_url_len++;
-                    }
-                    g_url[g_url_len] = '\0';
-                    do_fetch_url(g_url);
+                    history_go(-1);
                     set_status("Back");
                 } else {
                     set_status("No previous page");
@@ -6879,14 +7728,7 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
                 break;
             case ']':
                 if (can_go_forward()) {
-                    g_hist_pos++;
-                    g_url_len = 0;
-                    while (g_history[g_hist_pos][g_url_len]) {
-                        g_url[g_url_len] = g_history[g_hist_pos][g_url_len];
-                        g_url_len++;
-                    }
-                    g_url[g_url_len] = '\0';
-                    do_fetch_url(g_url);
+                    history_go(1);
                     set_status("Forward");
                 } else {
                     set_status("No next page");
@@ -6930,7 +7772,7 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
                     }
                 }
                 if (found < 0) { set_status("No text fields on this page"); break; }
-                g_focus_field = found;
+                set_focus_field(found);
                 g_focus_url = 0;
                 for (int ri = 0; ri < g_nitems; ri++) {
                     if (g_items[ri].field == found) {

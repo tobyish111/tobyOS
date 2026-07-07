@@ -176,7 +176,11 @@ aiming straight at it:
    in its grid, Wikipedia infoboxes are right-floated tables
    (`browser-stage12b-tables.md`). Stage 12C (branch `browser-flexbox`):
    flexbox v1 — 11 cases match Chrome, mojeek's flex header lays out
-   horizontally (`browser-stage12c-flexbox.md`).
+   horizontally (`browser-stage12c-flexbox.md`). Stage 12D (branch
+   `kernel-async-http`, merged): async HTTP ABI — the UI never freezes
+   during loads (`browser-stage12d-async-http.md`). Stage 12E (branch
+   `browser-reach`): position/SVG/localStorage/popstate/focus events
+   (`browser-stage12e-reach.md`).
 
 ## PLATFORM CONSTRAINTS (do not fight these blind)
 - **Freestanding userspace, no full libc**: the browser links **libtoby**
