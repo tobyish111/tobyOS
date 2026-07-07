@@ -518,6 +518,8 @@ struct cstyle {
     uint8_t  fshrink;            /* flex-shrink (integer part, default 1) */
     int16_t  gap;                /* gap between items/lines, px */
     int32_t  fbasis;             /* flex-basis px (content box), -1 auto */
+    int16_t  woff;               /* calc() px offset added after width% resolves */
+    int16_t  _pad1;
 };
 
 /* ---- DOM ---------------------------------------------------------- */
@@ -1540,8 +1542,139 @@ static int css_color_tok(const char *s, int len, uint32_t *out) {
 #define LK_AUTO 2
 #define LK_BAD  3
 
+/* ---- calc() evaluator (stage 13B) ---------------------------------- *
+ * Evaluates a calc(...) expression into an absolute px part + a
+ * percentage part, so a mixed `calc(100% - 250px)` is representable.
+ * Recursive descent: +,- (lowest) then *,/ then factor (number+unit or
+ * a parenthesized subexpression). One operand of * or / must be
+ * unitless. Units: px em rem pt ch vw vh %, and plain numbers. */
+
+struct calcval { double px, pct; int is_num; };
+struct calccur { const char *s; int i, n, own_px; };
+
+static void calc_ws(struct calccur *c) {
+    while (c->i < c->n && is_whitespace(c->s[c->i])) c->i++;
+}
+
+static int calc_expr(struct calccur *c, struct calcval *out);
+
+static int calc_factor(struct calccur *c, struct calcval *out) {
+    calc_ws(c);
+    if (c->i < c->n && c->s[c->i] == '(') {
+        c->i++;
+        if (!calc_expr(c, out)) return 0;
+        calc_ws(c);
+        if (c->i < c->n && c->s[c->i] == ')') c->i++;
+        return 1;
+    }
+    int neg = 0;
+    if (c->i < c->n && (c->s[c->i] == '-' || c->s[c->i] == '+')) {
+        neg = (c->s[c->i] == '-'); c->i++;
+    }
+    calc_ws(c);
+    int digits = 0;
+    double val = 0;
+    while (c->i < c->n && c->s[c->i] >= '0' && c->s[c->i] <= '9') {
+        val = val * 10 + (c->s[c->i] - '0'); c->i++; digits++;
+    }
+    if (c->i < c->n && c->s[c->i] == '.') {
+        c->i++;
+        double f = 0.1;
+        while (c->i < c->n && c->s[c->i] >= '0' && c->s[c->i] <= '9') {
+            val += (c->s[c->i] - '0') * f; f *= 0.1; c->i++; digits++;
+        }
+    }
+    if (!digits) return 0;
+    if (neg) val = -val;
+    out->px = 0; out->pct = 0; out->is_num = 0;
+    if (c->i < c->n && c->s[c->i] == '%') { out->pct = val; c->i++; return 1; }
+    int u = c->i, ue = u;
+    while (ue < c->n && lc(c->s[ue]) >= 'a' && lc(c->s[ue]) <= 'z') ue++;
+    int ul = ue - u;
+    const char *un = c->s + u;
+    if (ul == 0) { out->is_num = 1; out->px = val; return 1; }
+    if (ul == 2 && lc(un[0]) == 'p' && lc(un[1]) == 'x') out->px = val;
+    else if (ul == 2 && lc(un[0]) == 'e' && lc(un[1]) == 'm') out->px = val * c->own_px;
+    else if (ul == 3 && str_ncasecmp(un, "rem", 3) == 0) out->px = val * PX_BODY;
+    else if (ul == 2 && lc(un[0]) == 'p' && lc(un[1]) == 't') out->px = val * 4.0 / 3.0;
+    else if (ul == 2 && lc(un[0]) == 'c' && lc(un[1]) == 'h') out->px = val * (c->own_px / 2.0);
+    else if (ul == 2 && lc(un[0]) == 'v' && lc(un[1]) == 'w') out->px = val * g_win_w / 100.0;
+    else if (ul == 2 && lc(un[0]) == 'v' && lc(un[1]) == 'h') out->px = val * g_win_h / 100.0;
+    else return 0;
+    c->i = ue;
+    return 1;
+}
+
+static int calc_term(struct calccur *c, struct calcval *out) {
+    if (!calc_factor(c, out)) return 0;
+    for (;;) {
+        calc_ws(c);
+        if (c->i >= c->n) break;
+        char op = c->s[c->i];
+        if (op != '*' && op != '/') break;
+        c->i++;
+        struct calcval r;
+        if (!calc_factor(c, &r)) return 0;
+        if (op == '*') {
+            if (out->is_num) {
+                double k = out->px;
+                out->px = r.px * k; out->pct = r.pct * k; out->is_num = r.is_num;
+            } else if (r.is_num) {
+                out->px *= r.px; out->pct *= r.px;
+            } else return 0;              /* length * length is invalid */
+        } else {
+            if (!r.is_num || r.px == 0) return 0;
+            out->px /= r.px; out->pct /= r.px;
+        }
+    }
+    return 1;
+}
+
+static int calc_expr(struct calccur *c, struct calcval *out) {
+    if (!calc_term(c, out)) return 0;
+    for (;;) {
+        calc_ws(c);
+        if (c->i >= c->n) break;
+        char op = c->s[c->i];
+        if (op != '+' && op != '-') break;
+        c->i++;
+        struct calcval r;
+        if (!calc_term(c, &r)) return 0;
+        if (op == '+') { out->px += r.px; out->pct += r.pct; }
+        else           { out->px -= r.px; out->pct -= r.pct; }
+        out->is_num = out->is_num && r.is_num;
+    }
+    return 1;
+}
+
+/* If [s,len) is a calc(...) token, evaluate it. Returns 1 and fills the
+ * px + pct parts (rounded), else 0. */
+static int css_calc(const char *s, int len, int own_px, int *out_px, int *out_pct) {
+    if (len < 6 || str_ncasecmp(s, "calc(", 5) != 0) return 0;
+    struct calccur c = { s + 5, 0, len - 5, own_px };
+    struct calcval v;
+    if (!calc_expr(&c, &v)) return 0;
+    *out_px  = (int)(v.px  + (v.px  >= 0 ? 0.5 : -0.5));
+    *out_pct = (int)(v.pct + (v.pct >= 0 ? 0.5 : -0.5));
+    return 1;
+}
+
+/* px offset from the last mixed calc() parsed by css_len_tok; the
+ * width handler folds it into cstyle.woff (applied after % resolves). */
+static int g_calc_off_px;
+
 static int css_len_tok(const char *s, int len, int own_px, int *out) {
     if (len == 4 && str_ncasecmp(s, "auto", 4) == 0) return LK_AUTO;
+    g_calc_off_px = 0;
+    if (len >= 6 && (s[0] == 'c' || s[0] == 'C') &&
+        str_ncasecmp(s, "calc(", 5) == 0) {
+        int cpx, cpct;
+        if (css_calc(s, len, own_px, &cpx, &cpct)) {
+            if (cpct != 0) { *out = cpct; g_calc_off_px = cpx; return LK_PCT; }
+            *out = cpx; return LK_PX;
+        }
+        return LK_BAD;
+    }
     int i = 0, neg = 0;
     if (i < len && (s[i] == '-' || s[i] == '+')) { neg = (s[i] == '-'); i++; }
     long whole = 0;
@@ -2043,6 +2176,7 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->fshrink = 1;
     st->gap = 0;
     st->fbasis = -1;
+    st->woff = 0;
 }
 
 static int clamp_px(int v) {
@@ -2414,11 +2548,13 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         if (vtok_next(v, n, &pos, &t)) {
             int px;
             int k = css_len_tok(t.s, t.len, st->px, &px);
-            if (k == LK_AUTO) { st->width = -1; st->fl &= (uint8_t)~SF_WPCT; }
-            else if (k == LK_PX && px >= 0) { st->width = px; st->fl &= (uint8_t)~SF_WPCT; }
-            else if (k == LK_PCT && px > 0) {
+            if (k == LK_AUTO) { st->width = -1; st->fl &= (uint8_t)~SF_WPCT; st->woff = 0; }
+            else if (k == LK_PX && px >= 0) {
+                st->width = px; st->fl &= (uint8_t)~SF_WPCT; st->woff = 0;
+            } else if (k == LK_PCT && px > 0) {
                 st->width = px > 100 ? 100 : px;
                 st->fl |= SF_WPCT;
+                st->woff = (int16_t)g_calc_off_px;   /* calc(% - Npx) */
             }
         }
         break;
@@ -3323,6 +3459,7 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
             if (avail < 8) avail = 8;
             int cwid = (st->fl & SF_WPCT) ? (int)((long)avail * st->width / 100)
                                           : st->width;
+            if (st->fl & SF_WPCT) cwid += st->woff;   /* calc(% +/- Npx) */
             if (cwid > avail) cwid = avail;
             if (cwid < 8) cwid = 8;
             if (st->max_w >= 0 && cwid > st->max_w) cwid = st->max_w;
@@ -3912,6 +4049,7 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     if (st->width >= 0) {
         content_w = (st->fl & SF_WPCT) ? (int)((long)avail * st->width / 100)
                                        : st->width;
+        if (st->fl & SF_WPCT) content_w += st->woff;   /* calc(% +/- Npx) */
         if (content_w > avail) content_w = avail;
         if (content_w < 8) content_w = 8;
     }
