@@ -367,6 +367,7 @@ enum {
 #define D_TROW      7            /* table row                           */
 #define D_TCELL     8            /* td/th (block container in the grid) */
 #define D_CAPTION   9            /* caption: block above the grid       */
+#define D_FLEX      10           /* flex container (row/column layout)  */
 
 /* style flag bits */
 #define SF_BOLD     0x01
@@ -395,7 +396,15 @@ struct cstyle {
     uint8_t  flt;                /* float: 0 none, 1 left, 2 right */
     uint8_t  clr;                /* clear mask: 1 left, 2 right, 3 both */
     uint8_t  valign;             /* cells: 0 top/baseline, 1 middle, 2 bottom */
-    uint8_t  _pad0[3];
+    /* flexbox (containers: fdir/fwrap/fjust/falign/gap; items: f*) */
+    uint8_t  fdir;               /* 0 row, 1 column */
+    uint8_t  fwrap;              /* flex-wrap: wrap */
+    uint8_t  fjust;              /* 0 start, 1 end, 2 center, 3 between */
+    uint8_t  falign;             /* 0 stretch/top, 1 start, 2 center, 3 end */
+    uint8_t  fgrow;              /* flex-grow (integer part) */
+    uint8_t  fshrink;            /* flex-shrink (integer part, default 1) */
+    int16_t  gap;                /* gap between items/lines, px */
+    int32_t  fbasis;             /* flex-basis px (content box), -1 auto */
 };
 
 /* ---- DOM ---------------------------------------------------------- */
@@ -469,6 +478,8 @@ enum {
     CP_WIDTH, CP_HEIGHT, CP_MAXW, CP_VISIBILITY,
     CP_FLOAT, CP_CLEAR,
     CP_VALIGN, CP_BCOLLAPSE,
+    CP_FLEXDIR, CP_FLEXWRAP, CP_FLEXFLOW, CP_JUSTC, CP_ALITEMS,
+    CP_FLEX, CP_FGROW, CP_FSHRINK, CP_FBASIS, CP_GAP,
     CP__N
 };
 
@@ -1442,6 +1453,12 @@ static int prop_lookup(const char *s, int len) {
         {"visibility",CP_VISIBILITY},
         {"float",CP_FLOAT},{"clear",CP_CLEAR},
         {"vertical-align",CP_VALIGN},{"border-collapse",CP_BCOLLAPSE},
+        {"flex-direction",CP_FLEXDIR},{"flex-wrap",CP_FLEXWRAP},
+        {"flex-flow",CP_FLEXFLOW},{"justify-content",CP_JUSTC},
+        {"align-items",CP_ALITEMS},{"flex",CP_FLEX},
+        {"flex-grow",CP_FGROW},{"flex-shrink",CP_FSHRINK},
+        {"flex-basis",CP_FBASIS},{"gap",CP_GAP},{"column-gap",CP_GAP},
+        {"row-gap",CP_GAP},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -1844,6 +1861,14 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->flt = 0;
     st->clr = 0;
     st->valign = 0;
+    st->fdir = 0;
+    st->fwrap = 0;
+    st->fjust = 0;
+    st->falign = 0;
+    st->fgrow = 0;
+    st->fshrink = 1;
+    st->gap = 0;
+    st->fbasis = -1;
 }
 
 static int clamp_px(int v) {
@@ -2142,6 +2167,7 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
             else if (tok_is(&t, "inline")) st->disp = D_INLINE;
             else if (tok_is(&t, "inline-block") || tok_is(&t, "inline-flex"))
                 st->disp = D_INLBLOCK;
+            else if (tok_is(&t, "flex")) st->disp = D_FLEX;
             else if (tok_is(&t, "list-item")) st->disp = D_LISTITEM;
             else if (tok_is(&t, "table") || tok_is(&t, "inline-table"))
                 st->disp = D_TABLE;
@@ -2187,6 +2213,100 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         if (vtok_next(v, n, &pos, &t)) {
             if (tok_is(&t, "collapse")) st->fl |= SF_BCOLLAPSE;
             else st->fl &= (uint8_t)~SF_BCOLLAPSE;
+        }
+        break;
+    case CP_FLEXDIR:
+        if (vtok_next(v, n, &pos, &t))
+            st->fdir = (t.len >= 3 && lc(t.s[0]) == 'c') ? 1 : 0;
+        break;
+    case CP_FLEXWRAP:
+        if (vtok_next(v, n, &pos, &t))
+            st->fwrap = tok_is(&t, "nowrap") ? 0 : 1;
+        break;
+    case CP_FLEXFLOW:
+        while (vtok_next(v, n, &pos, &t)) {
+            if (lc(t.s[0]) == 'c' && t.len >= 3) st->fdir = 1;
+            else if (tok_is(&t, "row")) st->fdir = 0;
+            else if (tok_is(&t, "wrap") || tok_is(&t, "wrap-reverse"))
+                st->fwrap = 1;
+            else if (tok_is(&t, "nowrap")) st->fwrap = 0;
+        }
+        break;
+    case CP_JUSTC:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "flex-end") || tok_is(&t, "end") ||
+                tok_is(&t, "right")) st->fjust = 1;
+            else if (tok_is(&t, "center")) st->fjust = 2;
+            else if (tok_is(&t, "space-between") ||
+                     tok_is(&t, "space-around") ||
+                     tok_is(&t, "space-evenly")) st->fjust = 3;
+            else st->fjust = 0;
+        }
+        break;
+    case CP_ALITEMS:
+        if (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "center")) st->falign = 2;
+            else if (tok_is(&t, "flex-end") || tok_is(&t, "end"))
+                st->falign = 3;
+            else if (tok_is(&t, "flex-start") || tok_is(&t, "start") ||
+                     tok_is(&t, "baseline")) st->falign = 1;
+            else st->falign = 0;          /* stretch */
+        }
+        break;
+    case CP_FGROW:
+        if (vtok_next(v, n, &pos, &t) && t.s[0] >= '0' && t.s[0] <= '9')
+            st->fgrow = (uint8_t)(t.s[0] - '0');
+        break;
+    case CP_FSHRINK:
+        if (vtok_next(v, n, &pos, &t) && t.s[0] >= '0' && t.s[0] <= '9')
+            st->fshrink = (uint8_t)(t.s[0] - '0');
+        break;
+    case CP_FBASIS:
+        if (vtok_next(v, n, &pos, &t)) {
+            int px;
+            if (tok_is(&t, "auto") || tok_is(&t, "content"))
+                st->fbasis = -1;
+            else if (css_len_tok(t.s, t.len, st->px, &px) == LK_PX && px >= 0)
+                st->fbasis = px > 4000 ? 4000 : px;
+        }
+        break;
+    case CP_FLEX: {
+        /* shorthand: none | auto | <grow> [<shrink>] [<basis>] */
+        int nnum = 0;
+        while (vtok_next(v, n, &pos, &t)) {
+            if (tok_is(&t, "none")) {
+                st->fgrow = 0; st->fshrink = 0; st->fbasis = -1;
+            } else if (tok_is(&t, "auto")) {
+                st->fgrow = 1; st->fshrink = 1; st->fbasis = -1;
+            } else if (t.s[0] >= '0' && t.s[0] <= '9') {
+                /* bare digit(s): grow then shrink; "0%"/"10px" = basis */
+                int is_len = 0;
+                for (int q = 1; q < t.len; q++)
+                    if (!(t.s[q] >= '0' && t.s[q] <= '9') && t.s[q] != '.')
+                        { is_len = 1; break; }
+                int px;
+                if (is_len) {
+                    if (css_len_tok(t.s, t.len, st->px, &px) == LK_PX && px >= 0)
+                        st->fbasis = px > 4000 ? 4000 : px;
+                    else st->fbasis = 0;  /* 0% and friends */
+                } else if (nnum == 0) {
+                    st->fgrow = (uint8_t)(t.s[0] - '0');
+                    st->fshrink = 1;
+                    st->fbasis = 0;       /* flex:N => basis 0 */
+                    nnum++;
+                } else {
+                    st->fshrink = (uint8_t)(t.s[0] - '0');
+                    nnum++;
+                }
+            }
+        }
+        break;
+    }
+    case CP_GAP:
+        if (vtok_next(v, n, &pos, &t)) {
+            int px;
+            if (css_len_tok(t.s, t.len, st->px, &px) == LK_PX && px >= 0)
+                st->gap = (int16_t)(px > 500 ? 500 : px);
         }
         break;
     default:
@@ -3217,6 +3337,180 @@ static int lay_table_grid(int ti, int cx, int avail_w, int y, int link,
     return y;
 }
 
+/* ---- Flexbox (v1) ---------------------------------------------------- *
+ * display:flex row/column, flex-direction, justify-content (start/end/
+ * center/space-between), align-items (start/center/end; stretch lays
+ * top-aligned), flex-grow/shrink/basis, flex-wrap, gap. Items are
+ * block containers: hypothetical main sizes come from basis/width/the
+ * frozen measure pass, free space distributes by grow (or shrinks
+ * proportionally, floored at min-content), then each item is laid by
+ * lay_block at its resolved width (width imposed via a save/restore of
+ * the computed style). Grow and justify are suppressed in measure
+ * passes so a flex container's preferred width is the sum of its
+ * items. Reverse directions, order:, align-self, auto-margin space
+ * absorption and %-basis are out of scope for v1. */
+
+#define FLEX_MAX 48
+
+static int lay_flex(int ni, int cx, int content_w, int y, int link,
+                    uint32_t inbg) {
+    struct dnode *nd = &E->nodes[ni];
+    struct cstyle *st = &nd->st;
+    int gap = st->gap > 0 ? st->gap : 0;
+
+    int items[FLEX_MAX];
+    int n = 0;
+    for (int c = nd->first; c >= 0 && n < FLEX_MAX; c = E->nodes[c].next) {
+        struct dnode *cn = &E->nodes[c];
+        if (cn->tag == T_TEXT) continue;      /* bare text skipped (v1) */
+        if (cn->st.disp == D_NONE) continue;
+        items[n++] = c;
+    }
+    if (n == 0) return y;
+
+    if (st->fdir == 1) {
+        /* column: a block stack with gap; align-items shifts narrower
+         * items horizontally (stretch/start = full-width/left) */
+        int cy = y;
+        for (int k = 0; k < n; k++) {
+            struct dnode *cn = &E->nodes[items[k]];
+            if (k) cy += gap;
+            int mt = cn->st.m[0] == M_AUTO ? 0 : cn->st.m[0];
+            int mb = cn->st.m[2] == M_AUTO ? 0 : cn->st.m[2];
+            cy += mt;
+            int i0 = E->nitems;
+            int ny = lay_block(items[k], cx, content_w, cy, link, inbg);
+            if (st->falign >= 2 && !g_flt_freeze) {
+                int ext = cx;
+                for (int q = i0; q < E->nitems; q++) {
+                    int e = E->items[q].x + E->items[q].w;
+                    if (e > ext) ext = e;
+                }
+                int iw = ext - cx;
+                if (iw > 0 && iw < content_w) {
+                    int off = (st->falign == 2) ? (content_w - iw) / 2
+                                                : content_w - iw;
+                    for (int q = i0; q < E->nitems; q++)
+                        E->items[q].x += off;
+                }
+            }
+            cy = ny + mb;
+        }
+        return cy;
+    }
+
+    /* row: hypothetical outer (margin-box) main sizes + min floors */
+    int hyp[FLEX_MAX], mnw[FLEX_MAX];
+    for (int k = 0; k < n; k++) {
+        struct cstyle *cs = &E->nodes[items[k]].st;
+        int ml = cs->m[3] == M_AUTO ? 0 : cs->m[3];
+        int mr = cs->m[1] == M_AUTO ? 0 : cs->m[1];
+        int cmin, cpref;
+        tbl_measure_cell(items[k], link, inbg, &cmin, &cpref);
+        int basis;
+        if (cs->fbasis >= 0)
+            basis = cs->fbasis + cs->bw[3] + cs->bw[1] + cs->p[3] + cs->p[1];
+        else if (cs->width >= 0 && (cs->fl & SF_WPCT))
+            basis = (int)((long)content_w * cs->width / 100);
+        else
+            basis = cpref;    /* explicit px width already folded in */
+        hyp[k] = basis + ml + mr;
+        mnw[k] = cmin + ml + mr;
+        if (hyp[k] < 8) hyp[k] = 8;
+    }
+
+    int cy = y;
+    int k0 = 0;
+    while (k0 < n) {
+        int k1 = k0;
+        long used = 0;
+        while (k1 < n) {
+            long add = hyp[k1] + (k1 > k0 ? gap : 0);
+            if (st->fwrap && k1 > k0 && used + add > content_w) break;
+            used += add;
+            k1++;
+        }
+        int cnt = k1 - k0;
+        long freew = (long)content_w - used;
+        int w[FLEX_MAX];
+        long tg = 0;
+        for (int k = k0; k < k1; k++) tg += E->nodes[items[k]].st.fgrow;
+        if (freew > 0 && tg > 0 && !g_flt_freeze) {
+            for (int k = k0; k < k1; k++)
+                w[k - k0] = hyp[k] +
+                    (int)(freew * E->nodes[items[k]].st.fgrow / tg);
+        } else if (freew < 0) {
+            long tsw = 0;
+            for (int k = k0; k < k1; k++)
+                tsw += (long)E->nodes[items[k]].st.fshrink * hyp[k];
+            for (int k = k0; k < k1; k++) {
+                long red = tsw > 0
+                    ? (-freew) * E->nodes[items[k]].st.fshrink * hyp[k] / tsw
+                    : 0;
+                int ww = hyp[k] - (int)red;
+                if (ww < mnw[k]) ww = mnw[k];
+                if (ww < 8) ww = 8;
+                w[k - k0] = ww;
+            }
+        } else {
+            for (int k = k0; k < k1; k++) w[k - k0] = hyp[k];
+        }
+
+        /* justify-content: shift the whole line / spread the gaps */
+        long used2 = (long)gap * (cnt - 1);
+        for (int k = 0; k < cnt; k++) used2 += w[k];
+        long slack = content_w - used2;
+        if (slack < 0) slack = 0;
+        int x = cx, extra_gap = 0;
+        if (!g_flt_freeze) {
+            if (st->fjust == 1) x += (int)slack;
+            else if (st->fjust == 2) x += (int)(slack / 2);
+            else if (st->fjust == 3 && cnt > 1)
+                extra_gap = (int)(slack / (cnt - 1));
+        }
+
+        struct { int i0, i1, h; } L[FLEX_MAX];
+        int line_h = 0;
+        for (int k = k0; k < k1; k++) {
+            struct dnode *cn = &E->nodes[items[k]];
+            struct cstyle *cs = &cn->st;
+            int li = k - k0;
+            int ml = cs->m[3] == M_AUTO ? 0 : cs->m[3];
+            int mr = cs->m[1] == M_AUTO ? 0 : cs->m[1];
+            int mt = cs->m[0] == M_AUTO ? 0 : cs->m[0];
+            int mb = cs->m[2] == M_AUTO ? 0 : cs->m[2];
+            int32_t save_w = cs->width;
+            uint8_t save_fl = cs->fl;
+            cs->width = w[li] - ml - mr - cs->bw[3] - cs->bw[1] -
+                        cs->p[3] - cs->p[1];
+            if (cs->width < 8) cs->width = 8;
+            cs->fl &= (uint8_t)~SF_WPCT;
+            L[li].i0 = E->nitems;
+            int ny = lay_block(items[k], x, w[li], cy + mt, link, inbg);
+            L[li].i1 = E->nitems;
+            L[li].h = (ny - cy) + mb;
+            cs->width = save_w;
+            cs->fl = save_fl;
+            if (L[li].h > line_h) line_h = L[li].h;
+            x += w[li] + gap + extra_gap;
+        }
+        /* align-items center/end: shift the shorter items down */
+        if (st->falign >= 2 && !g_flt_freeze) {
+            for (int li = 0; li < cnt; li++) {
+                int off = line_h - L[li].h;
+                if (off <= 0) continue;
+                if (st->falign == 2) off /= 2;
+                for (int q = L[li].i0; q < L[li].i1; q++)
+                    E->items[q].y += off;
+            }
+        }
+        cy += line_h;
+        k0 = k1;
+        if (k0 < n) cy += gap;
+    }
+    return cy;
+}
+
 static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     struct dnode *nd = &E->nodes[ni];
     struct cstyle *st = &nd->st;
@@ -3270,9 +3564,11 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
         }
     }
 
-    /* children: table grid, or block flow with anonymous inline runs */
+    /* children: table grid, flex line(s), or normal block flow */
     if (st->disp == D_TABLE)
         cy = lay_table_grid(ni, cx, content_w, cy, link, curbg);
+    else if (st->disp == D_FLEX)
+        cy = lay_flex(ni, cx, content_w, cy, link, curbg);
     else
         cy = lay_flow(ni, cx, content_w, cy, link, curbg);
 

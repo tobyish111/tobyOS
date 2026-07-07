@@ -174,7 +174,9 @@ aiming straight at it:
    (`browser-stage12a-transport.md`). Stage 12B (branch
    `browser-tables`): real CSS table layout — LIVE Hacker News renders
    in its grid, Wikipedia infoboxes are right-floated tables
-   (`browser-stage12b-tables.md`).
+   (`browser-stage12b-tables.md`). Stage 12C (branch `browser-flexbox`):
+   flexbox v1 — 11 cases match Chrome, mojeek's flex header lays out
+   horizontally (`browser-stage12c-flexbox.md`).
 
 ## PLATFORM CONSTRAINTS (do not fight these blind)
 - **Freestanding userspace, no full libc**: the browser links **libtoby**
