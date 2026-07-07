@@ -561,10 +561,13 @@ struct cpart {                   /* one compound selector part */
 #define PART_MAX  24576
 
 struct cdecl {
-    uint8_t prop;                /* CP_* */
+    uint8_t prop;                /* CP_* (CP_VAR for --custom-property) */
     uint8_t imp;                 /* !important */
     int16_t vlen;
     int32_t voff;                /* raw value text in csspool */
+    int32_t noff;                /* CP_VAR: --name text in csspool */
+    int16_t nlen;                /* CP_VAR: name length */
+    int16_t _pad;
 };
 #define DECL_MAX  32768
 
@@ -594,6 +597,7 @@ enum {
     CP_FLEXDIR, CP_FLEXWRAP, CP_FLEXFLOW, CP_JUSTC, CP_ALITEMS,
     CP_FLEX, CP_FGROW, CP_FSHRINK, CP_FBASIS, CP_GAP,
     CP_POSITION, CP_TOP, CP_RIGHT, CP_BOTTOM, CP_LEFT,
+    CP_VAR,                      /* --custom-property (resolved via var()) */
     CP__N
 };
 
@@ -1632,8 +1636,17 @@ static void css_parse_decls(struct ccur *c) {
             while (c->i < c->n && c->s[c->i] != ';' && c->s[c->i] != '}') c->i++;
             continue;
         }
-        E->csspool_len = po;              /* name is transient */
-        int prop = prop_lookup(&E->csspool[po], pl);
+        /* --custom-property: keep the name (needed at var() resolve),
+         * everything else drops the name (transient, pool reused). */
+        int is_var = (pl >= 2 && E->csspool[po] == '-' && E->csspool[po + 1] == '-');
+        int var_noff = po, var_nlen = pl;
+        int prop;
+        if (is_var) {
+            prop = CP_VAR;                /* keep name bytes in the pool */
+        } else {
+            E->csspool_len = po;          /* name is transient */
+            prop = prop_lookup(&E->csspool[po], pl);
+        }
         css_ws(c);
         if (c->i >= c->n || c->s[c->i] != ':') {
             while (c->i < c->n && c->s[c->i] != ';' && c->s[c->i] != '}') c->i++;
@@ -1679,6 +1692,8 @@ static void css_parse_decls(struct ccur *c) {
             d->imp = (uint8_t)imp;
             d->voff = vo;
             d->vlen = (int16_t)(vl > 32767 ? 32767 : vl);
+            d->noff = is_var ? var_noff : 0;
+            d->nlen = is_var ? (int16_t)var_nlen : 0;
         }
         if (c->i < c->n && c->s[c->i] == ';') c->i++;
     }
@@ -1773,6 +1788,12 @@ static int css_parse_part(struct ccur *c, struct cpart *p,
             if ((l == 4 && str_ncasecmp(pp, "link", 4) == 0) ||
                 (l == 7 && str_ncasecmp(pp, "visited", 7) == 0)) {
                 p->pseudo_link = 1;
+                (*spec_cls)++;
+                got = 1;
+                continue;
+            }
+            if (l == 4 && str_ncasecmp(pp, "root", 4) == 0) {
+                p->tag = T_HTML;          /* :root == the html element */
                 (*spec_cls)++;
                 got = 1;
                 continue;
@@ -2073,13 +2094,116 @@ static void apply_border_shorthand(struct cstyle *st, const char *v, int n,
         st->bw[side] = (uint8_t)w;
 }
 
+/* ---- CSS custom properties + var() (stage 13) ---------------------- *
+ * Custom properties (--name) cascade + inherit like normal properties.
+ * They are collected into a scoped stack during style_node (an entry
+ * per definition, name+value copied into a stable pool so they survive
+ * the per-node csspool rollback), and var(--name[, fallback]) uses are
+ * substituted on the raw value string just before a normal declaration
+ * is parsed. Scoping is honored: a node pushes its vars, styles itself
+ * and its subtree, then pops -- so a var set on one subtree doesn't
+ * leak to siblings, and descendants inherit ancestor vars. */
+
+#define VARSCOPE_MAX 512
+#define VARPOOL_CAP  (64 * 1024)
+struct varent { int noff, nlen, voff, vlen; };    /* offsets into g_varpool */
+static struct varent g_varscope[VARSCOPE_MAX];
+static int  g_nvarscope;
+static char g_varpool[VARPOOL_CAP];
+static int  g_varpool_len;
+
+static void var_scope_reset(void) { g_nvarscope = 0; g_varpool_len = 0; }
+
+static void var_push(const char *name, int nlen, const char *val, int vlen) {
+    if (g_nvarscope >= VARSCOPE_MAX) return;
+    if (nlen < 0) nlen = 0;
+    if (vlen < 0) vlen = 0;
+    if (g_varpool_len + nlen + vlen > VARPOOL_CAP) return;
+    struct varent *e = &g_varscope[g_nvarscope++];
+    e->noff = g_varpool_len;
+    e->nlen = nlen;
+    for (int i = 0; i < nlen; i++) g_varpool[g_varpool_len++] = name[i];
+    e->voff = g_varpool_len;
+    e->vlen = vlen;
+    for (int i = 0; i < vlen; i++) g_varpool[g_varpool_len++] = val[i];
+}
+
+/* Most-recent (highest-priority / nearest-scope) definition wins. */
+static int var_lookup(const char *name, int nlen, const char **out, int *outlen) {
+    for (int i = g_nvarscope - 1; i >= 0; i--) {
+        struct varent *e = &g_varscope[i];
+        if (e->nlen != nlen) continue;
+        int k = 0;
+        while (k < nlen && g_varpool[e->noff + k] == name[k]) k++;
+        if (k == nlen) { *out = &g_varpool[e->voff]; *outlen = e->vlen; return 1; }
+    }
+    return 0;
+}
+
+static int var_subst(const char *v, int n, char *out, int cap, int depth);
+
+/* Expand every var(--name[, fallback]) in [v,v+n) into `out`. Returns
+ * the written length. Unknown vars with no fallback expand to empty.
+ * Recurses (depth-limited) so a var value may itself use var(). */
+static int var_subst(const char *v, int n, char *out, int cap, int depth) {
+    int o = 0, i = 0;
+    while (i < n && o < cap - 1) {
+        if (i + 4 <= n && v[i] == 'v' && v[i+1] == 'a' && v[i+2] == 'r' &&
+            v[i+3] == '(') {
+            i += 4;
+            while (i < n && is_whitespace(v[i])) i++;
+            int ns = i;
+            while (i < n && v[i] != ',' && v[i] != ')') i++;
+            int ne = i;
+            while (ne > ns && is_whitespace(v[ne - 1])) ne--;
+            int fb_s = -1, fb_e = -1;
+            if (i < n && v[i] == ',') {          /* fallback present */
+                i++;
+                while (i < n && is_whitespace(v[i])) i++;
+                fb_s = i;
+                int par = 0;
+                while (i < n && !(v[i] == ')' && par == 0)) {
+                    if (v[i] == '(') par++;
+                    else if (v[i] == ')') par--;
+                    i++;
+                }
+                fb_e = i;
+            }
+            if (i < n && v[i] == ')') i++;       /* consume ')' */
+            const char *rv; int rl;
+            if (depth < 16 && var_lookup(v + ns, ne - ns, &rv, &rl)) {
+                o += var_subst(rv, rl, out + o, cap - o, depth + 1);
+            } else if (fb_s >= 0 && depth < 16) {
+                o += var_subst(v + fb_s, fb_e - fb_s, out + o, cap - o, depth + 1);
+            }
+            continue;
+        }
+        out[o++] = v[i++];
+    }
+    out[o] = 0;
+    return o;
+}
+
+static int val_has_var(const char *v, int n) {
+    for (int i = 0; i + 4 <= n; i++)
+        if (v[i] == 'v' && v[i+1] == 'a' && v[i+2] == 'r' && v[i+3] == '(')
+            return 1;
+    return 0;
+}
+
 /* Apply one declaration to a computed style. Pass 0 applies only
  * font-size (so em elsewhere resolves against the final font); pass 1
  * applies everything else. */
 static void st_apply(struct cstyle *st, const struct cstyle *pst,
                      const struct cdecl *d, int pass) {
+    if (d->prop == CP_VAR) return;        /* collected separately */
     const char *v = &E->csspool[d->voff];
     int n = d->vlen;
+    char vbuf[1024];
+    if (val_has_var(v, n)) {              /* resolve var() before parsing */
+        n = var_subst(v, n, vbuf, sizeof(vbuf), 0);
+        v = vbuf;
+    }
     struct vtok t;
     int pos = 0;
 
@@ -2589,6 +2713,38 @@ static void style_node(int ni, const struct cstyle *pst) {
         css_parse_decls(&c);
     }
     int inlN = E->ndecls - inl0;
+    /* Custom properties first, in cascade order (lowest priority pushed
+     * first so the last-pushed wins on lookup): matched non-important,
+     * inline non-important, matched important, inline important. Copied
+     * into the stable var pool so they outlive the csspool rollback and
+     * this node's whole subtree can resolve them. */
+    int var_mark = g_nvarscope, varpool_mark = g_varpool_len;
+    for (int m = 0; m < nm; m++)
+        for (int d2 = 0; d2 < M[m].ndecl; d2++) {
+            struct cdecl *dv = &E->decls[M[m].decl0 + d2];
+            if (dv->prop == CP_VAR && !dv->imp)
+                var_push(&E->csspool[dv->noff], dv->nlen,
+                         &E->csspool[dv->voff], dv->vlen);
+        }
+    for (int d2 = 0; d2 < inlN; d2++) {
+        struct cdecl *dv = &E->decls[inl0 + d2];
+        if (dv->prop == CP_VAR && !dv->imp)
+            var_push(&E->csspool[dv->noff], dv->nlen,
+                     &E->csspool[dv->voff], dv->vlen);
+    }
+    for (int m = 0; m < nm; m++)
+        for (int d2 = 0; d2 < M[m].ndecl; d2++) {
+            struct cdecl *dv = &E->decls[M[m].decl0 + d2];
+            if (dv->prop == CP_VAR && dv->imp)
+                var_push(&E->csspool[dv->noff], dv->nlen,
+                         &E->csspool[dv->voff], dv->vlen);
+        }
+    for (int d2 = 0; d2 < inlN; d2++) {
+        struct cdecl *dv = &E->decls[inl0 + d2];
+        if (dv->prop == CP_VAR && dv->imp)
+            var_push(&E->csspool[dv->noff], dv->nlen,
+                     &E->csspool[dv->voff], dv->vlen);
+    }
     for (int pass = 0; pass < 2; pass++) {
         for (int m = 0; m < nm; m++)
             for (int d2 = 0; d2 < M[m].ndecl; d2++)
@@ -2626,6 +2782,9 @@ static void style_node(int ni, const struct cstyle *pst) {
     nd->st = st;
     for (int c = nd->first; c >= 0; c = E->nodes[c].next)
         style_node(c, &nd->st);
+    /* pop this node's custom properties as we leave its subtree */
+    g_nvarscope = var_mark;
+    g_varpool_len = varpool_mark;
 }
 
 /* ---- The user-agent stylesheet ------------------------------------- */
@@ -5390,6 +5549,7 @@ static void js_rerender(void) {
     struct cstyle base;
     st_init(&base, NULL);
     base.disp = D_BLOCK;
+    var_scope_reset();
     style_node(0, &base);
     layout(g_win_w);
     clamp_scroll();
@@ -5563,6 +5723,7 @@ static void render_html(void) {
     struct cstyle base;
     st_init(&base, NULL);
     base.disp = D_BLOCK;
+    var_scope_reset();
     style_node(0, &base);
 
     g_view_mode = VIEW_HTML;
@@ -5601,6 +5762,7 @@ static void render_mono_doc(void) {
     struct cstyle base;
     st_init(&base, NULL);
     base.disp = D_BLOCK;
+    var_scope_reset();
     style_node(0, &base);
     layout(g_win_w);
 }
