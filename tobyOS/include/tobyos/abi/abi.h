@@ -797,8 +797,47 @@ struct abi_http_fetch {
 #define ABI_HTTP_ENC_IDENTITY  0
 #define ABI_HTTP_ENC_GZIP      1
 
+/* ============================================================
+ *  Async HTTP (stage 12D: the browser never blocks on a fetch)
+ * ============================================================
+ * START queues a transfer and returns a handle immediately; a ring-0
+ * kernel worker drives it (DNS + TCP/TLS + redirects + dechunk +
+ * gunzip, same engine as ABI_SYS_HTTP_FETCH, truncate semantics).
+ * The app POLLs the handle from its main loop, READs the body once
+ * DONE, and FINISHes to free the slot. FINISH on a queued/running
+ * handle cancels it (the worker discards the result). Slots owned by
+ * exited processes are reaped lazily. */
+#define ABI_SYS_HTTP_START     172  /* (struct abi_http_start *) -> handle or -E */
+#define ABI_SYS_HTTP_POLL      173  /* (handle, struct abi_http_poll *) -> 0 or -E */
+#define ABI_SYS_HTTP_READ      174  /* (handle, buf, off_len: off<<32|len) -> bytes or -E */
+#define ABI_SYS_HTTP_FINISH    175  /* (handle) -> 0 or -E */
+
+struct abi_http_start {
+    uint64_t url;          /* in: const char * user VA, NUL-terminated */
+    uint32_t max_body;     /* in: body cap; kernel truncates past it */
+    uint32_t flags;        /* reserved, must be 0 */
+};
+
+/* abi_http_poll.state values. */
+#define ABI_HTTPA_QUEUED   0
+#define ABI_HTTPA_RUNNING  1
+#define ABI_HTTPA_DONE     2
+#define ABI_HTTPA_ERROR    3
+
+struct abi_http_poll {
+    int32_t  state;        /* ABI_HTTPA_* */
+    int32_t  err;          /* HTTP_ERR_* when state == ERROR */
+    int32_t  status;       /* HTTP status of the final response (DONE) */
+    uint32_t body_len;     /* bytes available to READ */
+    uint32_t body_total;   /* full body length before truncation */
+    uint8_t  content_encoding;
+    uint8_t  reserved0[3];
+    char     final_url[ABI_HTTP_FETCH_URL_MAX];   /* post-redirect URL */
+    char     content_type[ABI_HTTP_FETCH_CT_MAX];
+};
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          172
+#define ABI_SYS_NR_MAX          176
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

@@ -147,6 +147,13 @@ int http_get_opt(const char *url,
                  unsigned    flags,
                  struct http_response *out);
 
+/* http_get_opt + redirect following (up to 5, relative Locations
+ * resolved). cur_url is rewritten in place to the URL that produced
+ * the final response. timeout_ms is per-recv (0 = default). Lives in
+ * syscall.c; exported for the async-HTTP worker (http_async.c). */
+int http_get_follow(char cur_url[512], size_t max_body, unsigned flags,
+                    uint32_t timeout_ms, struct http_response *resp);
+
 /* Free an http_response. NULL-safe; idempotent (clears the struct
  * after free so a double-free becomes a no-op). */
 void http_free(struct http_response *r);

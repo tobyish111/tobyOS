@@ -8,6 +8,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/sched.h>   /* bkl_held/bkl_exit/bkl_enter for the wait loop */
+#include <tobyos/proc.h>    /* current_proc()->tcp_yield_wait (stage 12D) */
 
 /* 16: HTTP keep-alive (http.c) parks up to KEEP_MAX=4 idle conns on top
  * of the active fetch, listeners and TIME_WAIT remnants. */
@@ -797,7 +798,16 @@ static int tcp_poll_until(struct tcp_conn *c, uint64_t deadline,
         bool had_bkl = bkl_held();
         if (had_bkl) bkl_exit();
         sti();
-        hlt();
+        /* Stage 12D: the async-HTTP kernel worker opts into yielding
+         * its CPU to the scheduler instead of hlt-parking it, so a
+         * long transfer never monopolizes a core (and single-CPU
+         * systems keep running the UI). Everyone else keeps the
+         * hlt wait documented above. The BKL is already released. */
+        struct proc *curp = current_proc();
+        if (curp && curp->tcp_yield_wait)
+            sched_yield();
+        else
+            hlt();
         if (had_bkl) bkl_enter();
     }
 }

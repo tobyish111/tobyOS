@@ -187,10 +187,12 @@ aiming straight at it:
   heap map in `src/elf.c` (BSS is eagerly mapped; `USER_HALF_MAX` is the
   only ceiling).
 - **Kernel HTTP is synchronous** (`SYS_HTTP_FETCH` blocks). SPAs assume
-  async `fetch`. Either add an async/non-blocking kernel HTTP ABI, or run
-  fetches on a worker — but libtoby malloc is not thread-safe, so real
-  threads need a locking allocator first. This is a real blocker for
-  Phase 10; plan for it.
+  async `fetch`. **RESOLVED on branch `kernel-async-http`** (stage 12D,
+  `browser-stage12d-async-http.md`): SYS_HTTP_START/POLL/READ/FINISH +
+  a ring-0 kernel worker running the existing engine; the browser's
+  navigation, JS fetch() and image loads are poll-driven — timers tick
+  and tabs switch during multi-second loads. (Sheets/scripts inside
+  the render pipeline still fetch synchronously; short via keep-alive.)
 - **Memory**: tabs already cost ~1 MiB each (fixed array, 6 tabs ≈ 6 MiB
   BSS). A DOM+CSSOM+JS heap per tab is far larger; revisit the inline
   fixed-tab design (move to heap-allocated per-tab engines).

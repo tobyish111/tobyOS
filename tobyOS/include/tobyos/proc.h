@@ -258,6 +258,14 @@ struct proc {
     /* True for per-CPU idle procs (pid 0 on the BSP, ap_idle on APs). The
      * scheduler never steals an idle proc onto another CPU. */
     bool            is_idle;
+    /* Ring-0 worker created by proc_create_kernel(): user_entry is a
+     * kernel function pointer; proc_first_user_entry CALLs it instead
+     * of iret-ing to ring 3 (stage 12D async-HTTP worker). */
+    bool            is_kernel;
+    /* Opt-in: tcp_poll_until waits sched_yield() instead of hlt(), so
+     * a long transfer on a kernel worker shares its CPU instead of
+     * parking it. Only the async-HTTP worker sets this. */
+    bool            tcp_yield_wait;
     uint64_t        tls_base;
     /* B11: Linux pthread_join support. A user VA recorded via clone(
      * CLONE_CHILD_CLEARTID) or set_tid_address(): on this thread's exit the
@@ -392,6 +400,14 @@ void proc_init(void);
  * PROC_READY and enqueued on the scheduler -- it'll run the next time
  * the caller yields. */
 int proc_create_from_elf(const char *path, const char *name);
+
+/* Create a ring-0 kernel worker process: runs `entry()` on its own
+ * kernel stack in the kernel address space, scheduled like any other
+ * proc. `entry` must never return unless it intends to proc_exit(0);
+ * it must follow the BKL discipline (hold it while touching shared
+ * kernel state, release it around sched_yield / long waits). Returns
+ * the pid, or -1 on failure. (Stage 12D: the async-HTTP worker.) */
+int proc_create_kernel(void (*entry)(void), const char *name);
 
 /* Full-form spawn: explicit fds for stdin/stdout/stderr (NULL == default
  * to a fresh console-backed file), and an argv vector packed onto the

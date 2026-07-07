@@ -76,6 +76,7 @@
 #include <tobyos/usb_legacy.h>
 #include <tobyos/xhci.h>
 #include <tobyos/http.h>
+#include <tobyos/http_async.h>
 #include <tobyos/inotify.h>
 #include <tobyos/clipboard.h>
 #include <tobyos/smp.h>
@@ -708,12 +709,12 @@ static int http_resolve_location(const char *cur, const char *loc,
 /* GET cur_url following up to HTTP_MAX_REDIRECTS redirects. cur_url is
  * rewritten in place to the URL that produced the final response (so
  * callers can report the post-redirect address). On 0, *resp is live
- * and the caller must http_free() it. */
-static int http_get_follow(char cur_url[512], size_t max_body, unsigned flags,
-                           struct http_response *resp) {
+ * and the caller must http_free() it. timeout_ms is per-recv (0 =
+ * HTTP_DEFAULT_TIMEOUT_MS); the async worker passes a patient one. */
+int http_get_follow(char cur_url[512], size_t max_body, unsigned flags,
+                    uint32_t timeout_ms, struct http_response *resp) {
     for (int redir = 0; redir <= HTTP_MAX_REDIRECTS; redir++) {
-        int rc = http_get_opt(cur_url, max_body, HTTP_DEFAULT_TIMEOUT_MS,
-                              flags, resp);
+        int rc = http_get_opt(cur_url, max_body, timeout_ms, flags, resp);
         if (rc < 0) return rc;
 
         if (http_is_redirect(resp->status) && resp->location[0]) {
@@ -744,7 +745,7 @@ static long sys_http_get(const char *url, void *buf, uint32_t buf_sz) {
         return -ABI_EFAULT;
 
     struct http_response resp;
-    int rc = http_get_follow(cur_url, (size_t)cap, 0, &resp);
+    int rc = http_get_follow(cur_url, (size_t)cap, 0, 0, &resp);
     if (rc < 0) return (long)rc;
 
     size_t copy = resp.body_len < (size_t)cap ? resp.body_len : (size_t)cap;
@@ -784,7 +785,7 @@ static long sys_http_fetch(struct abi_http_fetch *ureq) {
     struct http_response resp;
     int rc = http_get_follow(cur_url, kmax,
                              HTTP_F_TRUNCATE | HTTP_F_GZIP | HTTP_F_KEEPALIVE,
-                             &resp);
+                             0, &resp);
     if (rc < 0) return (long)rc;
 
     size_t copy = resp.body_len < (size_t)req.buf_sz ? resp.body_len
@@ -812,6 +813,55 @@ static long sys_http_fetch(struct abi_http_fetch *ureq) {
 
     if (copy_to_user(ureq, &req, sizeof(req)) != 0) return -ABI_EFAULT;
     return (long)copy;
+}
+
+/* ---- Async HTTP (stage 12D; see http_async.c) -------------------- */
+
+static long sys_http_start(struct abi_http_start *ureq) {
+    if (!cap_check(current_proc(), CAP_NET, "sys_http_start")) return -ABI_EPERM;
+    if (!ureq) return -ABI_EINVAL;
+    struct abi_http_start req;
+    if (copy_from_user(&req, ureq, sizeof(req)) != 0) return -ABI_EFAULT;
+    if (req.flags != 0 || !req.url) return -ABI_EINVAL;
+    char kurl[512];
+    if (strncpy_from_user(kurl, (const char *)(uintptr_t)req.url,
+                          sizeof(kurl)) < 0)
+        return -ABI_EFAULT;
+    int h = httpa_start(kurl, req.max_body, current_proc()->pid);
+    return h >= 0 ? (long)h : -ABI_EAGAIN;
+}
+
+static long sys_http_poll(long h, struct abi_http_poll *uout) {
+    if (!uout) return -ABI_EINVAL;
+    struct abi_http_poll out;
+    if (httpa_poll((int)h, current_proc()->pid, &out) != 0)
+        return -ABI_EINVAL;
+    if (copy_to_user(uout, &out, sizeof(out)) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
+/* a3 packs off<<32 | len (keeps the 3-arg syscall shape). The body is
+ * bounced through a kernel buffer; transfers are capped at 1 MiB. */
+static long sys_http_read(long h, void *ubuf, uint64_t off_len) {
+    uint32_t off = (uint32_t)(off_len >> 32);
+    uint32_t len = (uint32_t)off_len;
+    if (!ubuf || len == 0) return -ABI_EINVAL;
+    if (len > (1u << 20)) len = 1u << 20;
+    if (!user_buf_ok((uint64_t)(uintptr_t)ubuf, len)) return -ABI_EFAULT;
+    void *kb = kmalloc(len);
+    if (!kb) return -ABI_ENOMEM;
+    long n = httpa_read((int)h, current_proc()->pid, kb, off, len);
+    if (n > 0 && copy_to_user(ubuf, kb, (size_t)n) != 0) {
+        kfree(kb);
+        return -ABI_EFAULT;
+    }
+    kfree(kb);
+    return n < 0 ? -ABI_EINVAL : n;
+}
+
+static long sys_http_finish(long h) {
+    if (httpa_finish((int)h, current_proc()->pid) != 0) return -ABI_EINVAL;
+    return 0;
 }
 
 /* ---- terminal session syscalls (milestone 13) ------------------ */
@@ -3243,6 +3293,14 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_http_get((const char *)a1, (void *)a2, (uint32_t)a3);
     case ABI_SYS_HTTP_FETCH:
         return sys_http_fetch((struct abi_http_fetch *)a1);
+    case ABI_SYS_HTTP_START:
+        return sys_http_start((struct abi_http_start *)a1);
+    case ABI_SYS_HTTP_POLL:
+        return sys_http_poll((long)a1, (struct abi_http_poll *)a2);
+    case ABI_SYS_HTTP_READ:
+        return sys_http_read((long)a1, (void *)a2, (uint64_t)a3);
+    case ABI_SYS_HTTP_FINISH:
+        return sys_http_finish((long)a1);
 
     /* ---- Advanced GUI drawing (Phase 1) ----------------------------- */
     case ABI_SYS_GUI_LINE: {

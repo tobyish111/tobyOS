@@ -957,6 +957,50 @@ int proc_create_from_elf(const char *path, const char *name) {
     return spawn_internal(path, name, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
+/* Ring-0 kernel worker: no user half, no ELF, no fds. Same PCB + fake
+ * initial frame as any proc; proc_first_user_entry sees is_kernel and
+ * CALLs user_entry (a kernel function) instead of iret-ing to ring 3.
+ * Runs on the kernel PML4. See proc.h. */
+int proc_create_kernel(void (*entry)(void), const char *name) {
+    if (!entry) return -1;
+
+    struct proc *p = alloc_slot();
+    if (!p) {
+        kprintf("[proc] cannot create kworker '%s': table full\n",
+                name ? name : "?");
+        return -1;
+    }
+    memset(p, 0, sizeof(*p));
+    p->pid        = (int)(p - g_proc);
+    p->state      = PROC_UNUSED;
+    p->wait_pid   = -1;
+    p->exit_code  = -1;
+    p->ppid       = 0;
+    p->tgid       = p->pid;
+    p->cr3        = vmm_kernel_pml4_phys();
+    p->owns_pml4  = false;
+    p->is_kernel  = true;
+    p->user_entry = (uint64_t)entry;      /* kernel fn, CALLed on entry */
+    p->cwd[0] = '/'; p->cwd[1] = '\0';
+    name_copy(p->name, name ? name : "kworker", PROC_NAME_MAX);
+    /* Kernel context: same ADMIN blanket as pid 0 / ap_idle so any
+     * kernel-invoked VFS/net path sails through cap_check. */
+    cap_grant_admin(p);
+    signal_init_proc(&p->sigstate);
+    p->created_ns = perf_now_ns();
+
+    if (!build_kstack(p)) {
+        p->state = PROC_UNUSED;
+        return -1;
+    }
+
+    p->state = PROC_READY;
+    sched_enqueue(p);
+    kprintf("[proc] created kworker pid=%d '%s' entry=%p kstack=%p\n",
+            p->pid, p->name, (void *)p->user_entry, p->kstack_top);
+    return p->pid;
+}
+
 int proc_spawn(const struct proc_spec *spec) {
     if (!spec) return -1;
     /* Milestone 19: span the whole spawn pipeline so `perf` can show
@@ -1011,6 +1055,13 @@ __attribute__((noreturn)) void proc_first_user_entry(void) {
      * switch that saved the PREVIOUS proc's state but couldn't restore ours
      * -- first-run procs never parked in sched_yield's restore). */
     fpu_restore(p->fpu_state);
+    /* Ring-0 worker (proc_create_kernel): user_entry is a kernel
+     * function -- CALL it in kernel mode; if it ever returns, exit. */
+    if (p->is_kernel) {
+        void (*kfn)(void) = (void (*)(void))p->user_entry;
+        kfn();
+        proc_exit(0);
+    }
     /* For threads, pass the thread arg in RDI and load TLS base */
     if (p->is_thread) {
         if (p->tls_base)

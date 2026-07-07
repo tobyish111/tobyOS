@@ -176,6 +176,7 @@ C_SRCS := src/kernel.c \
           src/ssh.c \
           src/ssh_crypto.c \
           src/http.c \
+          src/http_async.c \
           src/puff.c \
           src/socket.c \
           src/gfx.c \

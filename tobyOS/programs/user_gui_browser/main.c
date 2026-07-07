@@ -118,6 +118,74 @@ static inline long sys_http_fetch(struct http_fetch *req) {
         : "rcx", "r11", "memory");
     return r;
 }
+
+/* ---- Async HTTP (stage 12D): start/poll/read/finish -------------- *
+ * The kernel drives the transfer on a worker; the browser polls the
+ * handle from its main loop and NEVER blocks on the network. Structs
+ * mirror abi_http_start / abi_http_poll (ABI-frozen). */
+#define SYS_HTTP_START  172
+#define SYS_HTTP_POLL   173
+#define SYS_HTTP_READ   174
+#define SYS_HTTP_FINISH 175
+
+struct http_start {
+    unsigned long url;
+    uint32_t      max_body;
+    uint32_t      flags;
+};
+#define HTTPA_QUEUED  0
+#define HTTPA_RUNNING 1
+#define HTTPA_DONE    2
+#define HTTPA_ERROR   3
+struct http_poll {
+    int32_t  state;             /* HTTPA_* */
+    int32_t  err;               /* HTTP_ERR_* when state == ERROR */
+    int32_t  status;
+    uint32_t body_len;
+    uint32_t body_total;
+    uint8_t  content_encoding;
+    uint8_t  reserved0[3];
+    char     final_url[512];
+    char     content_type[64];
+};
+
+static inline long sys_http_start(const char *url, uint32_t max_body) {
+    struct http_start rq;
+    rq.url = (unsigned long)url;
+    rq.max_body = max_body;
+    rq.flags = 0;
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_HTTP_START), "D"(&rq)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_http_poll(long h, struct http_poll *out) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_HTTP_POLL), "D"(h), "S"(out)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_http_read(long h, void *buf, uint32_t off, uint32_t len) {
+    unsigned long off_len = ((unsigned long)off << 32) | (unsigned long)len;
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_HTTP_READ), "D"(h), "S"(buf), "d"(off_len)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_http_finish(long h) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_HTTP_FINISH), "D"(h)
+        : "rcx", "r11", "memory");
+    return r;
+}
 #define SYS_GUI_SET_TITLE  76
 static inline void sys_gui_set_title(int fd, const char *t) {
     long r;
@@ -573,6 +641,27 @@ struct jstimer {
     uint8_t  used;
 };
 
+/* Stage 12D: a pending JS fetch() -- the async-HTTP handle plus the
+ * JS callback that settles the Promise, called from the pump. */
+#define JS_FETCH_MAX 8
+struct jsfetch {
+    int      used;
+    int      handle;
+    JSValue  cb;
+};
+
+/* Stage 12D: async navigation continuations (what the pump does when
+ * the page fetch completes / fails). Mirrors the old synchronous
+ * chains: do_navigate, do_fetch_url, the DDG->Mojeek search fallback,
+ * and navigate_input's https/http/www bare-host ladder. */
+#define NAVK_NORMAL 0            /* render + history_push; error page + push */
+#define NAVK_PLAIN  1            /* back/forward/refresh: render; no push */
+#define NAVK_DDG    2            /* search leg 1: 202/error -> Mojeek */
+#define NAVK_HOST0  3            /* https://input */
+#define NAVK_HOST1  4            /* https://www.input (DNS retry) */
+#define NAVK_HOST2  5            /* http://www.input */
+#define NAVK_HOST3  6            /* http://input (https answered-but-failed) */
+
 struct tab {
     char   raw[RAW_CAP + 1];   long raw_len;
     struct eng *eng;           /* DOM/CSS/layout engine (heap, ~8 MiB) */
@@ -585,6 +674,12 @@ struct tab {
     struct jstimer js_timers[JS_TIMER_MAX];
     int        js_timer_seq;
     char       js_nav[URL_MAX + 1];   /* deferred location.href target */
+    struct jsfetch js_fetches[JS_FETCH_MAX];  /* pending fetch() calls */
+    /* stage 12D: async page navigation (poll-driven from the loop) */
+    int    nav_handle;                /* async-HTTP handle or -1 */
+    int    nav_kind;                  /* NAVK_* continuation */
+    char   nav_url[URL_MAX + 1];      /* current leg's target URL */
+    char   nav_input[256];            /* bare-host input / search query */
     struct form forms[FORM_MAX];    int nforms;
     struct field fields[FIELD_MAX]; int nfields; int focus_field;
     struct img  images[IMG_MAX];    int nimages;
@@ -4405,6 +4500,43 @@ static JSValue js_dom_fetchsync(JSContext *cx, JSValueConst t, int argc, JSValue
     return obj;
 }
 
+static void js_dump_error(JSContext *cx);
+
+/* Stage 12D: truly async fetch. fetchStart(url, cb) kicks off a
+ * kernel-side transfer and returns immediately; the pump calls
+ * cb({status, url, body}) -- or cb(null) on failure -- when it lands.
+ * Timers keep ticking and the UI stays live during the transfer. */
+static JSValue js_dom_fetchstart(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2 || !JS_IsFunction(cx, argv[1])) return JS_UNDEFINED;
+    char url[URL_MAX + 1];
+    url[0] = 0;
+    const char *u = JS_ToCString(cx, argv[0]);
+    if (u) {
+        resolve_relative_url(g_url, u, url, URL_MAX);
+        JS_FreeCString(cx, u);
+    }
+    long h = -1;
+    if (url[0] && has_scheme(url))
+        h = sys_http_start(url, JS_FETCH_CAP);
+    int slot = -1;
+    if (h >= 0)
+        for (int k = 0; k < JS_FETCH_MAX; k++)
+            if (!cur->js_fetches[k].used) { slot = k; break; }
+    if (h < 0 || slot < 0) {               /* fail the promise right away */
+        if (h >= 0) sys_http_finish(h);
+        JSValue nul = JS_NULL;
+        JSValue r = JS_Call(cx, argv[1], JS_UNDEFINED, 1, &nul);
+        if (JS_IsException(r)) js_dump_error(cx);
+        JS_FreeValue(cx, r);
+        return JS_UNDEFINED;
+    }
+    cur->js_fetches[slot].used = 1;
+    cur->js_fetches[slot].handle = (int)h;
+    cur->js_fetches[slot].cb = JS_DupValue(cx, argv[1]);
+    return JS_UNDEFINED;
+}
+
 static JSValue js_dom_getvalue(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t;
     int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
@@ -4445,6 +4577,12 @@ static void js_teardown(struct tab *t) {
         if (t->js_timers[k].used) {
             JS_FreeValue(cx, t->js_timers[k].fn);
             t->js_timers[k].used = 0;
+        }
+    for (int k = 0; k < JS_FETCH_MAX; k++)
+        if (t->js_fetches[k].used) {
+            sys_http_finish(t->js_fetches[k].handle);
+            JS_FreeValue(cx, t->js_fetches[k].cb);
+            t->js_fetches[k].used = 0;
         }
     if (t->js_has_dispatch) JS_FreeValue(cx, t->js_dispatch);
     t->js_has_dispatch = 0;
@@ -4679,14 +4817,15 @@ static const char JS_PRELUDE[] =
 "  };\n"
 "  g.fetch = function(u){\n"
 "    return new Promise(function(res, rej){\n"
-"      var r = D.fetchSync(String(u));\n"
-"      if (!r || r.status <= 0){ rej(new Error('fetch failed')); return; }\n"
-"      res({\n"
-"        ok: r.status >= 200 && r.status < 300,\n"
-"        status: r.status,\n"
-"        url: r.url,\n"
-"        text: function(){ return Promise.resolve(r.body); },\n"
-"        json: function(){ return Promise.resolve(JSON.parse(r.body)); }\n"
+"      D.fetchStart(String(u), function(r){\n"
+"        if (!r || r.status <= 0){ rej(new Error('fetch failed')); return; }\n"
+"        res({\n"
+"          ok: r.status >= 200 && r.status < 300,\n"
+"          status: r.status,\n"
+"          url: r.url,\n"
+"          text: function(){ return Promise.resolve(r.body); },\n"
+"          json: function(){ return Promise.resolve(JSON.parse(r.body)); }\n"
+"        });\n"
 "      });\n"
 "    });\n"
 "  };\n"
@@ -4799,6 +4938,7 @@ static int js_ensure(void) {
             {"body", js_dom_body, 0},     {"title", js_dom_title, 1},
             {"timer", js_dom_timer, 3},   {"untimer", js_dom_untimer, 1},
             {"fetchSync", js_dom_fetchsync, 1},
+            {"fetchStart", js_dom_fetchstart, 2},
             {"getValue", js_dom_getvalue, 1},
             {"setValue", js_dom_setvalue, 2},
             {"setDispatcher", js_dom_setdispatcher, 1},
@@ -5011,6 +5151,49 @@ static int js_pump_all(void) {
             if (JS_IsException(r)) js_dump_error(t->js_cx);
             JS_FreeValue(t->js_cx, r);
             JS_FreeValue(t->js_cx, fn);
+            work = 1;
+        }
+        /* Stage 12D: settle completed fetch() transfers. The slot is
+         * freed BEFORE the callback runs so the handler can fetch
+         * again; js_drain_jobs below runs the promise chain. */
+        for (int k = 0; k < JS_FETCH_MAX; k++) {
+            struct jsfetch *jf = &t->js_fetches[k];
+            if (!jf->used) continue;
+            struct http_poll pi;
+            long pr = sys_http_poll(jf->handle, &pi);
+            if (pr == 0 &&
+                (pi.state == HTTPA_QUEUED || pi.state == HTTPA_RUNNING))
+                continue;
+            JSValue arg = JS_NULL;
+            if (pr == 0 && pi.state == HTTPA_DONE) {
+                long n2 = 0;
+                char *buf = NULL;
+                if (pi.body_len > 0) {
+                    buf = (char *)malloc(pi.body_len + 1);
+                    n2 = buf ? sys_http_read(jf->handle, buf, 0,
+                                             pi.body_len) : -1;
+                }
+                if (n2 >= 0) {
+                    JSValue obj = JS_NewObject(t->js_cx);
+                    JS_SetPropertyStr(t->js_cx, obj, "status",
+                                      JS_NewInt32(t->js_cx, pi.status));
+                    JS_SetPropertyStr(t->js_cx, obj, "url",
+                                      JS_NewString(t->js_cx, pi.final_url));
+                    JS_SetPropertyStr(t->js_cx, obj, "body",
+                        JS_NewStringLen(t->js_cx, buf ? buf : "",
+                                        (size_t)n2));
+                    arg = obj;
+                }
+                if (buf) free(buf);
+            }
+            sys_http_finish(jf->handle);
+            JSValue cb = jf->cb;
+            jf->used = 0;
+            JSValue r = JS_Call(t->js_cx, cb, JS_UNDEFINED, 1, &arg);
+            if (JS_IsException(r)) js_dump_error(t->js_cx);
+            JS_FreeValue(t->js_cx, r);
+            JS_FreeValue(t->js_cx, cb);
+            JS_FreeValue(t->js_cx, arg);
             work = 1;
         }
         js_drain_jobs(t);
@@ -5327,6 +5510,7 @@ static void tab_reset(struct tab *t) {
     t->view_mode    = VIEW_HTML;
     t->find_run     = -1;
     t->focus_field  = -1;
+    t->nav_handle   = -1;
     t->used         = 1;
 }
 
@@ -5343,9 +5527,16 @@ static void tab_open(void) {
 
 /* Close tab `idx`; the last tab closing quits the app. Neighbours shift
  * down so g_tabs[0..g_ntabs) stays dense. */
+static void img_fetch_cancel(void);
+
 static void tab_close(int idx) {
     if (idx < 0 || idx >= g_ntabs) return;
     if (g_ntabs == 1) sys_exit(0);
+    if (g_tabs[idx].nav_handle >= 0) {       /* cancel an in-flight nav */
+        sys_http_finish(g_tabs[idx].nav_handle);
+        g_tabs[idx].nav_handle = -1;
+    }
+    img_fetch_cancel();                      /* tab indices shift below */
     tab_images_free(&g_tabs[idx]);
     js_teardown(&g_tabs[idx]);
     if (g_tabs[idx].eng) { free(g_tabs[idx].eng); g_tabs[idx].eng = NULL; }
@@ -5448,7 +5639,83 @@ static void images_free(void) { tab_images_free(cur); }
  * image, vs the old freeze-for-all-N.) Returns 1 if it did work. */
 static uint8_t *g_img_fetch_buf = NULL;
 
+/* Stage 12D: one image transfer in flight at a time, fully async --
+ * start it on one idle pass, poll it on the next ones, decode when
+ * DONE. Nothing blocks; image state 2 = "in flight". */
+static int g_imgf_handle = -1;
+static int g_imgf_ti = -1, g_imgf_ii = -1;
+
+/* Cancel the in-flight image fetch and clear every in-flight marker
+ * (called before tab indices shift, and when a tab's images go away). */
+static void img_fetch_cancel(void) {
+    if (g_imgf_handle >= 0) {
+        sys_http_finish(g_imgf_handle);
+        g_imgf_handle = -1;
+    }
+    for (int ti = 0; ti < g_ntabs; ti++)
+        for (int ii = 0; ii < g_tabs[ti].nimages; ii++)
+            if (g_tabs[ti].images[ii].state == 2)
+                g_tabs[ti].images[ii].state = 0;
+    g_imgf_ti = g_imgf_ii = -1;
+}
+
 static int load_one_pending_image(void) {
+    /* An image is in flight: poll it. */
+    if (g_imgf_handle >= 0) {
+        struct http_poll pi;
+        long pr = sys_http_poll(g_imgf_handle, &pi);
+        if (pr == 0 &&
+            (pi.state == HTTPA_QUEUED || pi.state == HTTPA_RUNNING))
+            return 0;                       /* still transferring */
+
+        int ti = g_imgf_ti, ii = g_imgf_ii;
+        long n = -1;
+        if (pr == 0 && pi.state == HTTPA_DONE) {
+            if (!g_img_fetch_buf)
+                g_img_fetch_buf = (uint8_t *)malloc(IMG_FETCH_CAP);
+            if (g_img_fetch_buf && pi.body_len > 0)
+                n = sys_http_read(g_imgf_handle, g_img_fetch_buf, 0,
+                                  IMG_FETCH_CAP);
+        }
+        sys_http_finish(g_imgf_handle);
+        g_imgf_handle = -1;
+        g_imgf_ti = g_imgf_ii = -1;
+
+        /* The tab may have navigated away or closed since the start. */
+        if (ti < 0 || ti >= g_ntabs || ii >= g_tabs[ti].nimages ||
+            g_tabs[ti].images[ii].state != 2)
+            return 1;
+        struct img *im = &g_tabs[ti].images[ii];
+        if (n <= 0) { im->state = -1; return 1; }
+
+        toby_image_t *dec = toby_image_load(g_img_fetch_buf, (size_t)n);
+        if (!dec || dec->width <= 0 || dec->height <= 0 ||
+            dec->width > IMG_MAX_DIM || dec->height > IMG_MAX_DIM) {
+            if (dec) toby_image_free(dec);
+            im->state = -1;
+            return 1;
+        }
+        im->pixels = dec->pixels;           /* steal the decoded buffer */
+        im->w = (int16_t)dec->width;
+        im->h = (int16_t)dec->height;
+        im->state = 1;
+        dec->pixels = NULL;
+        toby_image_free(dec);
+
+        /* Re-layout the affected tab. The layout shim addresses `cur`,
+         * so temporarily point it at the affected tab (safe: single-
+         * threaded, no events run here), restore + repaint. */
+        int save = g_active;
+        g_active = ti;
+        layout(g_win_w);
+        if (ti == save) clamp_scroll();
+        g_active = save;
+        tk_redraw(&win);
+        return 1;
+    }
+
+    /* Nothing in flight: start the next pending image (active tab
+     * first). Starting is instant -- the kernel worker transfers it. */
     int ti_sel = -1, ii_sel = -1;
     for (int pass = 0; pass < 2 && ti_sel < 0; pass++) {
         for (int ti = 0; ti < g_ntabs; ti++) {
@@ -5464,70 +5731,48 @@ static int load_one_pending_image(void) {
     }
     if (ti_sel < 0) return 0;
 
-    if (!g_img_fetch_buf) {
-        g_img_fetch_buf = (uint8_t *)malloc(IMG_FETCH_CAP);
-        if (!g_img_fetch_buf) return 0;
-    }
     struct img *im = &g_tabs[ti_sel].images[ii_sel];
-
-    struct http_fetch req;
-    mem_zero(&req, sizeof(req));
-    req.url    = (unsigned long)im->src;
-    req.buf    = (unsigned long)g_img_fetch_buf;
-    req.buf_sz = IMG_FETCH_CAP;
-    long n = sys_http_fetch(&req);          /* blocks (this image only) */
-    if (n <= 0) { im->state = -1; return 1; }
-
-    toby_image_t *dec = toby_image_load(g_img_fetch_buf, (size_t)n);
-    if (!dec || dec->width <= 0 || dec->height <= 0 ||
-        dec->width > IMG_MAX_DIM || dec->height > IMG_MAX_DIM) {
-        if (dec) toby_image_free(dec);
-        im->state = -1;
-        return 1;
-    }
-    im->pixels = dec->pixels;               /* steal the decoded buffer */
-    im->w = (int16_t)dec->width;
-    im->h = (int16_t)dec->height;
-    im->state = 1;
-    dec->pixels = NULL;
-    toby_image_free(dec);
-
-    /* Re-layout the affected tab. The layout shim addresses `cur`, so
-     * temporarily point it at the affected tab (safe: single-threaded,
-     * no events run here), then restore + request a repaint. */
-    int save = g_active;
-    g_active = ti_sel;
-    layout(g_win_w);
-    if (ti_sel == save) clamp_scroll();
-    g_active = save;
-    tk_redraw(&win);
-    return 1;
+    long h = sys_http_start(im->src, IMG_FETCH_CAP);
+    if (h < 0) return 0;                    /* slot table busy: retry later */
+    im->state = 2;
+    g_imgf_handle = (int)h;
+    g_imgf_ti = ti_sel;
+    g_imgf_ii = ii_sel;
+    return 0;
 }
 
-/* Transport-only fetch of `url` into g_raw via SYS_HTTP_FETCH (kernel
- * follows redirects). On success the address bar is updated to the
- * URL that actually served the page. Returns bytes (>= 0) or HTTP_ERR. */
-static long fetch_page(const char *url) {
+/* ---- Stage 12D: async page navigation ----------------------------- *
+ * nav_begin starts a kernel-side transfer for the CURRENT tab (cur)
+ * and returns immediately; nav_pump (main loop) polls every tab's
+ * handle and runs the completion continuation (NAVK_*). The UI keeps
+ * pumping events, timers and paints the whole time. */
+
+/* Terminal failure: error page (+ optional history entry). */
+static void nav_finish_error(const char *url, int err, int push) {
+    str_copy(g_url, url, URL_MAX);
+    g_url_len = (int)str_len(g_url);
+    show_error_page(url, err);
+    if (push) history_push(url);
+    g_focus_url = 0;
+}
+
+static void nav_begin(int kind, const char *url) {
+    if (cur->nav_handle >= 0) {              /* replaces an in-flight nav */
+        sys_http_finish(cur->nav_handle);
+        cur->nav_handle = -1;
+    }
+    str_copy(cur->nav_url, url, URL_MAX);
+    cur->nav_kind = kind;
+    long h = sys_http_start(cur->nav_url, RAW_CAP);
+    if (h < 0) {                             /* handle table exhausted */
+        g_loading = 0;
+        nav_finish_error(cur->nav_url, -8 /* out of memory */,
+                         kind != NAVK_PLAIN);
+        return;
+    }
+    cur->nav_handle = (int)h;
     g_loading = 1;
     set_status("Loading...");
-
-    struct http_fetch req;
-    mem_zero(&req, sizeof(req));
-    req.url    = (unsigned long)url;
-    req.buf    = (unsigned long)g_raw;
-    req.buf_sz = RAW_CAP;
-    long n = sys_http_fetch(&req);
-    g_loading = 0;
-    if (n < 0) return n;
-
-    g_last_status = req.status;
-    g_raw_len = n;
-    g_raw[g_raw_len] = '\0';
-    if (req.final_url[0]) {
-        str_copy(g_url, req.final_url, URL_MAX);
-        g_url_len = (int)str_len(g_url);
-    }
-    return n;
 }
 
 static void render_fetched(void) {
@@ -5553,16 +5798,16 @@ static void render_fetched(void) {
     /* Images (state=0 pending) stream in from the main idle loop. */
 }
 
-/* Fetch + render, error page on failure. Back/Forward/Refresh path. */
+/* Fetch + render, error page on failure. Back/Forward/Refresh path.
+ * Async: kicks off the transfer; nav_pump finishes the job. */
 static long do_fetch_url(const char *url) {
-    long n = fetch_page(url);
-    if (n < 0) show_error_page(url, (int)n);
-    else render_fetched();
-    return n;
+    nav_begin(NAVK_PLAIN, url);
+    return 0;
 }
 
 /* Navigate to a fully-formed URL (links, search, explicit schemes).
- * Returns the fetch result so callers can chain fallbacks. */
+ * Async: the address bar shows the target immediately, the page swaps
+ * in when the transfer completes. */
 static long do_navigate(const char *url) {
     char target[URL_MAX + 1];
     str_copy(target, url, URL_MAX);
@@ -5570,16 +5815,8 @@ static long do_navigate(const char *url) {
     str_copy(g_url, target, URL_MAX);
     g_url_len = (int)str_len(g_url);
 
-    long n = fetch_page(target);
-    if (n < 0) {
-        show_error_page(target, (int)n);
-        history_push(target);
-    } else {
-        render_fetched();
-        history_push(g_url);      /* the post-redirect URL */
-    }
-    g_focus_url = 0;
-    return n;
+    nav_begin(NAVK_NORMAL, target);
+    return 0;
 }
 
 /* GET-submit a form: resolve its action against the current page,
@@ -5620,18 +5857,27 @@ static void submit_form(int fi) {
 
 /* Run a web search: DuckDuckGo's HTML endpoint first; its 202
  * bot-challenge page (or a transport failure) falls back to Mojeek,
- * which serves plain HTML without a challenge wall. */
+ * which serves plain HTML without a challenge wall. Async: the
+ * fallback chains from the pump (NAVK_DDG). */
 static void navigate_search(const char *query) {
     char surl[URL_MAX + 1];
+    str_copy(cur->nav_input, query, sizeof(cur->nav_input));
     build_search_url("https://html.duckduckgo.com/html/?q=", query,
                      surl, URL_MAX);
-    long rc = do_navigate(surl);
-    if (rc < 0 || g_last_status == 202) {
-        set_status("Search challenged - trying Mojeek...");
-        build_search_url("https://www.mojeek.com/search?q=", query,
-                         surl, URL_MAX);
-        do_navigate(surl);
-    }
+    str_copy(g_url, surl, URL_MAX);
+    g_url_len = (int)str_len(g_url);
+    nav_begin(NAVK_DDG, surl);
+}
+
+/* Search fallback leg: Mojeek serves challenge-free plain HTML. */
+static void nav_search_mojeek(void) {
+    char surl[URL_MAX + 1];
+    set_status("Search challenged - trying Mojeek...");
+    build_search_url("https://www.mojeek.com/search?q=", cur->nav_input,
+                     surl, URL_MAX);
+    str_copy(g_url, surl, URL_MAX);
+    g_url_len = (int)str_len(g_url);
+    nav_begin(NAVK_NORMAL, surl);
 }
 
 /* ---- Omnibox input resolution (Chrome-style) --------------------- */
@@ -5670,19 +5916,12 @@ static void str_concat2(char *out, int max, const char *a, const char *b) {
     out[pos] = '\0';
 }
 
-static int nav_success(long rc) {
-    if (rc < 0) return 0;
-    render_fetched();
-    history_push(g_url);
-    g_focus_url = 0;
-    return 1;
-}
-
 /* The omnibox: what runs when Enter is pressed in the address bar.
  *   - explicit scheme        -> use as-is
  *   - non-URL text           -> DuckDuckGo HTML search
  *   - bare host[/path]       -> https:// first, http:// fallback,
- *                               www. retry when DNS says no such host */
+ *                               www. retry when DNS says no such host
+ * Async: the fallback ladder chains from the pump (NAVK_HOST*). */
 static void navigate_input(const char *input_raw) {
     char input[URL_MAX + 1];
     int s = 0;
@@ -5701,40 +5940,127 @@ static void navigate_input(const char *input_raw) {
     }
 
     char cand[URL_MAX + 1];
+    str_copy(cur->nav_input, input, sizeof(cur->nav_input));
     str_concat2(cand, URL_MAX, "https://", input);
     str_copy(g_url, cand, URL_MAX);
     g_url_len = (int)str_len(g_url);
-    long rc = fetch_page(cand);
-    if (nav_success(rc)) return;
+    nav_begin(NAVK_HOST0, cand);
+}
 
-    if (rc == HTTPE_DNS) {
-        /* Host didn't resolve: retry with a www. prefix (https, then
-         * http only if www. actually resolved). */
-        if (!(input[0] == 'w' && input[1] == 'w' && input[2] == 'w' &&
-              input[3] == '.')) {
-            char www[URL_MAX + 1];
-            str_concat2(www, URL_MAX, "https://www.", input);
-            rc = fetch_page(www);
-            if (nav_success(rc)) return;
-            if (rc != HTTPE_DNS) {
-                str_concat2(www, URL_MAX, "http://www.", input);
-                rc = fetch_page(www);
-                if (nav_success(rc)) return;
-            }
-            str_copy(cand, www, URL_MAX);
-        }
-    } else {
-        /* Resolved but HTTPS didn't answer: fall back to plain HTTP. */
-        str_concat2(cand, URL_MAX, "http://", input);
-        rc = fetch_page(cand);
-        if (nav_success(rc)) return;
+/* ---- Stage 12D: nav completion + the poll pump -------------------- */
+
+/* The transfer for the CURRENT tab (cur) finished cleanly: pull the
+ * body into g_raw, then run the continuation for the nav kind. */
+static void nav_complete_done(const struct http_poll *pi) {
+    long n = 0;
+    if (pi->body_len > 0)
+        n = sys_http_read(cur->nav_handle, g_raw, 0, RAW_CAP);
+    sys_http_finish(cur->nav_handle);
+    cur->nav_handle = -1;
+    g_loading = 0;
+    if (n < 0) n = 0;
+
+    g_last_status = pi->status;
+    g_raw_len = n;
+    g_raw[g_raw_len] = '\0';
+    if (pi->final_url[0]) {
+        str_copy(g_url, pi->final_url, URL_MAX);
+        g_url_len = (int)str_len(g_url);
     }
 
-    str_copy(g_url, cand, URL_MAX);
-    g_url_len = (int)str_len(g_url);
-    show_error_page(cand, (int)rc);
-    history_push(cand);
-    g_focus_url = 0;
+    int kind = cur->nav_kind;
+    if (kind == NAVK_DDG && g_last_status == 202) {
+        nav_search_mojeek();               /* bot wall: chain the fallback */
+        return;
+    }
+    render_fetched();
+    if (kind != NAVK_PLAIN) {
+        history_push(g_url);               /* the post-redirect URL */
+        g_focus_url = 0;
+    }
+}
+
+/* The transfer for the CURRENT tab failed: run the retry ladder the
+ * old synchronous chains used, or land on the error page. */
+static void nav_complete_error(int err) {
+    sys_http_finish(cur->nav_handle);
+    cur->nav_handle = -1;
+    g_loading = 0;
+
+    char inp[256];
+    str_copy(inp, cur->nav_input, sizeof(inp));
+    char urlbuf[URL_MAX + 1];
+    str_copy(urlbuf, cur->nav_url, URL_MAX);
+    char next[URL_MAX + 1];
+
+    switch (cur->nav_kind) {
+    case NAVK_DDG:
+        nav_search_mojeek();
+        return;
+    case NAVK_HOST0:
+        if (err == HTTPE_DNS) {
+            /* Host didn't resolve: retry with a www. prefix. */
+            if (!(inp[0] == 'w' && inp[1] == 'w' && inp[2] == 'w' &&
+                  inp[3] == '.')) {
+                str_concat2(next, URL_MAX, "https://www.", inp);
+                str_copy(g_url, next, URL_MAX);
+                g_url_len = (int)str_len(g_url);
+                nav_begin(NAVK_HOST1, next);
+                return;
+            }
+        } else {
+            /* Resolved but HTTPS didn't answer: plain HTTP. */
+            str_concat2(next, URL_MAX, "http://", inp);
+            nav_begin(NAVK_HOST3, next);
+            return;
+        }
+        break;
+    case NAVK_HOST1:
+        if (err != HTTPE_DNS) {            /* www. resolved: try http */
+            str_concat2(next, URL_MAX, "http://www.", inp);
+            nav_begin(NAVK_HOST2, next);
+            return;
+        }
+        break;
+    case NAVK_PLAIN:
+        show_error_page(urlbuf, err);      /* no history entry */
+        return;
+    default:
+        break;
+    }
+    nav_finish_error(urlbuf, err, 1);
+}
+
+/* Poll every tab's in-flight navigation; complete the finished ones.
+ * Runs with cur temporarily pointed at each loading tab (the whole
+ * g_* shim addresses the active tab). */
+static int nav_pump(void) {
+    int work = 0;
+    for (int ti = 0; ti < g_ntabs; ti++) {
+        if (g_tabs[ti].nav_handle < 0) continue;
+        int save = g_active;
+        g_active = ti;
+        struct http_poll pi;
+        long pr = sys_http_poll(cur->nav_handle, &pi);
+        if (pr < 0) {                      /* lost handle: connection err */
+            cur->nav_handle = -1;
+            g_loading = 0;
+            show_error_page(cur->nav_url, -9);
+            work = 1;
+        } else if (pi.state == HTTPA_DONE) {
+            nav_complete_done(&pi);
+            work = 1;
+        } else if (pi.state == HTTPA_ERROR) {
+            nav_complete_error(pi.err);
+            work = 1;
+        }
+        g_active = save;
+        if (work) {
+            update_title();
+            tk_redraw(&win);
+        }
+    }
+    return work;
 }
 
 /* ---- Scrolling (pixels) ----------------------------------------- */
@@ -6669,8 +6995,9 @@ int main(int argc, char **argv) {
     tk_redraw(&win);
     for (;;) {
         if (tk_pump(&win)) break;          /* events + repaint; 1 = quit */
-        int work = load_one_pending_image();
-        work |= js_pump_all();             /* timers + promise jobs */
+        int work = nav_pump();             /* async page loads (12D) */
+        work |= load_one_pending_image();
+        work |= js_pump_all();             /* timers + jobs + fetches */
         if (!work)
             sys_sleep_ms(15);              /* nothing pending -> idle */
     }
