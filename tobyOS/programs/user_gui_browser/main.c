@@ -578,6 +578,9 @@ struct cstyle {
 /* ---- DOM ---------------------------------------------------------- */
 
 #define DNF_STYLE_DONE 1     /* <style> content already parsed into rules */
+#define DNF_LAID_FIXED 2     /* laid rect is viewport coords (pos: fixed) */
+#define DNF_LAID_BLOCK 4     /* laid rect came from a block stamp (exact
+                                border box), not an item union */
 
 struct dnode {
     int32_t parent, first, last, next;   /* tree links (node idx, -1) */
@@ -587,6 +590,10 @@ struct dnode {
     int16_t tag;                 /* T_* */
     int16_t link, field, img;    /* interaction indices or -1 */
     int16_t flags;               /* DNF_* */
+    /* stage 13F: laid border box (doc coords; viewport coords when
+     * DNF_LAID_FIXED). Valid only while lgen == eng->lay_gen. */
+    int32_t lx, ly, lw, lh;
+    int32_t lgen;
     struct cstyle st;            /* computed by the style pass */
 };
 #define NODE_MAX  32768
@@ -708,6 +715,8 @@ struct eng {
     struct ditem items[ITEM_MAX];   int nitems;
     char   render[RENDER_CAP + 1];  int render_len;
     uint32_t page_bg;               /* body/html background */
+    int    lay_gen;                 /* bumped per layout(); validates
+                                       the nodes' laid rects (13F) */
 };
 
 #define LINK_MAX       128
@@ -762,6 +771,12 @@ struct jsfetch {
     JSValue  cb;
 };
 
+/* Stage 13F: DOM mutation log for MutationObserver delivery. Each JS
+ * mutation primitive records (node, kind); the pump hands the batch to
+ * the prelude's observer check. Kinds: 0 childList, 1 attributes,
+ * 2 characterData. */
+#define MUT_MAX 64
+
 /* Stage 12D: async navigation continuations (what the pump does when
  * the page fetch completes / fails). Mirrors the old synchronous
  * chains: do_navigate, do_fetch_url, the DDG->Mojeek search fallback,
@@ -787,6 +802,15 @@ struct tab {
     int        js_timer_seq;
     char       js_nav[URL_MAX + 1];   /* deferred location.href target */
     struct jsfetch js_fetches[JS_FETCH_MAX];  /* pending fetch() calls */
+    /* stage 13F: observers (Mutation/Intersection/Resize + scroll) */
+    JSValue    js_obs_check;   /* prelude observer-check callback */
+    int        js_has_obs_check;
+    int32_t    mut_node[MUT_MAX];
+    uint8_t    mut_kind[MUT_MAX];
+    int        mut_n;
+    uint8_t    obs_kick;       /* a JS observe() wants a check pass */
+    int        obs_gen;        /* eng->lay_gen at the last check */
+    int        obs_scroll;     /* scroll_y at the last check */
     /* stage 12D: async page navigation (poll-driven from the loop) */
     int    nav_handle;                /* async-HTTP handle or -1 */
     int    nav_kind;                  /* NAVK_* continuation */
@@ -3745,6 +3769,35 @@ static int items_extent(int i0) {
     return e;
 }
 
+/* ---- Laid-rect stamp journal (stage 13F) ---------------------------- *
+ * getComputedStyle / getBoundingClientRect / Intersection- and Resize-
+ * Observer need each element's final laid box. Blocks stamp their
+ * border box into this journal as they lay; every post-lay item shift
+ * (floats, valign, flex align, grid rows, relative, transform,
+ * absolute placement) mirrors onto the journal range it shifts. At
+ * the end of layout() the journal commits into the nodes (last write
+ * wins, so provisional passes are harmless), then inline elements
+ * pick up a union of their painted items. */
+#define NST_MAX 16384
+struct nstamp { int32_t node, x, y, w, h; uint8_t fixed; };
+static struct nstamp g_nst[NST_MAX];
+static int g_nnst;
+
+static void nstamp_add(int ni, int x, int y, int w, int h) {
+    if (g_flt_freeze || g_nnst >= NST_MAX) return;   /* measure: ignore */
+    struct nstamp *s = &g_nst[g_nnst++];
+    s->node = ni;
+    s->x = x; s->y = y; s->w = w; s->h = h;
+    s->fixed = 0;
+}
+
+static void nstamp_shift(int s0, int s1, int dx, int dy) {
+    for (int k = s0; k < s1; k++) {
+        g_nst[k].x += dx;
+        g_nst[k].y += dy;
+    }
+}
+
 /* Take a floated box out of flow: lay it (shrink-to-fit when width is
  * auto), slide it against the left/right line edge (dropping below
  * other floats when it doesn't fit), shift its items to the placed
@@ -3760,6 +3813,7 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
     int mb = st->m[2] == M_AUTO ? 0 : st->m[2];
 
     int i0 = E->nitems, f1;
+    int s0 = g_nnst;
     int by = cy + mt;                      /* real flow position (search start) */
     int laytop = by;                       /* where the content was laid */
     int bw2, bbh;                          /* border-box width incl. ml, height */
@@ -3845,6 +3899,7 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
         E->items[i].x += dx;
         E->items[i].y += dy;
     }
+    nstamp_shift(s0, g_nnst, dx, dy);
     for (int i = f1; i < g_nflts; i++) {   /* floats nested in this float */
         g_flts[i].x0 += dx; g_flts[i].x1 += dx;
         g_flts[i].y0 += dy; g_flts[i].y1 += dy;
@@ -4023,7 +4078,7 @@ static void tbl_measure_row(int ri, int col_min[], int col_pref[],
     }
 }
 
-struct tcell_info { int i0, i1, bg_i, x, w, h, node; };
+struct tcell_info { int i0, i1, s0, s1, bg_i, x, w, h, node; };
 
 /* Lay one row at y with resolved column widths. Returns the row
  * bottom. Cell backgrounds stretch to the row height, valign shifts
@@ -4064,6 +4119,7 @@ static int tbl_lay_row(int ri, int cx, int y, const int colw[], int ncols,
             if (tc->bg_i >= 0) E->items[tc->bg_i].node = c;
         }
         tc->i0 = E->nitems;
+        tc->s0 = g_nnst;
         int ccx = xcur + st->bw[3] + st->p[3];
         int ccy = y + st->bw[0] + st->p[0];
         int ccw = w - st->bw[3] - st->bw[1] - st->p[3] - st->p[1];
@@ -4075,6 +4131,7 @@ static int tbl_lay_row(int ri, int cx, int y, const int colw[], int ncols,
         if (st->height > content_h) content_h = st->height;
         int bbh = st->bw[0] + st->p[0] + content_h + st->p[2] + st->bw[2];
         tc->i1 = E->nitems;
+        tc->s1 = g_nnst;
         tc->h = bbh;
         if (bbh > row_h) row_h = bbh;
         xcur += w + spacing;
@@ -4094,7 +4151,9 @@ static int tbl_lay_row(int ri, int cx, int y, const int colw[], int ncols,
             int off = (va == 1) ? (row_h - tc->h) / 2 : row_h - tc->h;
             for (int i2 = tc->i0; i2 < tc->i1; i2++)
                 E->items[i2].y += off;
+            nstamp_shift(tc->s0, tc->s1, 0, off);
         }
+        nstamp_add(tc->node, tc->x, y, tc->w, row_h);
         if (st->bw[0]) emit_rect(tc->x, y, tc->w, st->bw[0], st->border_col);
         if (st->bw[2]) emit_rect(tc->x, y + row_h - st->bw[2], tc->w,
                                  st->bw[2], st->border_col);
@@ -4346,7 +4405,7 @@ static int lay_flex(int ni, int cx, int content_w, int y, int link,
                 extra_gap = (int)(slack / (cnt - 1));
         }
 
-        struct { int i0, i1, h; } L[FLEX_MAX];
+        struct { int i0, i1, s0, s1, h; } L[FLEX_MAX];
         int line_h = 0;
         for (int k = k0; k < k1; k++) {
             struct dnode *cn = &E->nodes[items[k]];
@@ -4363,8 +4422,10 @@ static int lay_flex(int ni, int cx, int content_w, int y, int link,
             if (cs->width < 8) cs->width = 8;
             cs->fl &= (uint8_t)~SF_WPCT;
             L[li].i0 = E->nitems;
+            L[li].s0 = g_nnst;
             int ny = lay_block(items[k], x, w[li], cy + mt, link, inbg);
             L[li].i1 = E->nitems;
+            L[li].s1 = g_nnst;
             L[li].h = (ny - cy) + mb;
             cs->width = save_w;
             cs->fl = save_fl;
@@ -4379,6 +4440,7 @@ static int lay_flex(int ni, int cx, int content_w, int y, int link,
                 if (st->falign == 2) off /= 2;
                 for (int q = L[li].i0; q < L[li].i1; q++)
                     E->items[q].y += off;
+                nstamp_shift(L[li].s0, L[li].s1, 0, off);
             }
         }
         cy += line_h;
@@ -4580,7 +4642,7 @@ static int lay_grid(int ni, int cx, int content_w, int y, int link,
      * per-row max height */
     int rowh[GRID_MAX_TRACKS];
     for (int r = 0; r < GRID_MAX_TRACKS && r < nrows; r++) rowh[r] = 0;
-    struct { int i0, i1, r, h; } placed[GRID_MAX_ITEMS];
+    struct { int i0, i1, s0, s1, r, h; } placed[GRID_MAX_ITEMS];
     int rowy[GRID_MAX_TRACKS + 1];
 
     /* first pass: lay items in provisional y to measure row heights */
@@ -4598,8 +4660,10 @@ static int lay_grid(int ni, int cx, int content_w, int y, int link,
         if (cs->width < 8) cs->width = 8;
         cs->fl &= (uint8_t)~SF_WPCT;
         placed[k].i0 = E->nitems;
+        placed[k].s0 = g_nnst;
         int bot = lay_block(c, ix, cwid, 0, link, inbg);   /* prov y=0 */
         placed[k].i1 = E->nitems;
+        placed[k].s1 = g_nnst;
         placed[k].r = it_row[k];
         placed[k].h = bot;                   /* height (laid from y=0) */
         cs->width = save_w;
@@ -4618,6 +4682,7 @@ static int lay_grid(int ni, int cx, int content_w, int y, int link,
         int dy = (r < GRID_MAX_TRACKS) ? rowy[r] : y;
         for (int q = placed[k].i0; q < placed[k].i1; q++)
             E->items[q].y += dy;
+        nstamp_shift(placed[k].s0, placed[k].s1, 0, dy);
     }
     int end = (nrows > 0 && nrows <= GRID_MAX_TRACKS) ? rowy[nrows] - gap : y;
     return end;
@@ -4628,6 +4693,7 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     struct cstyle *st = &nd->st;
     if (st->disp == D_NONE) return y;
     int items0 = E->nitems;                /* for the relative shift */
+    int nst0 = g_nnst;
     if (nd->link >= 0) link = nd->link;
     uint32_t curbg = (st->bg >> 24) ? st->bg : inbg;
 
@@ -4745,6 +4811,7 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     int bbh = bwt + pt + content_h + pb + bwb;
 
     if (bg_i >= 0) E->items[bg_i].h = bbh;
+    nstamp_add(ni, bx, by, bbw, bbh);
     if (bwt) emit_rect(bx, by, bbw, bwt, st->border_col);
     if (bwb) emit_rect(bx, by + bbh - bwb, bbw, bwb, st->border_col);
     if (bwl) emit_rect(bx, by, bwl, bbh, st->border_col);
@@ -4759,11 +4826,13 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
                : (st->po[1] != M_AUTO ? -st->po[1] : 0);
         int dyy = st->po[0] != M_AUTO ? st->po[0]
                 : (st->po[2] != M_AUTO ? -st->po[2] : 0);
-        if (dx || dyy)
+        if (dx || dyy) {
             for (int i2 = items0; i2 < E->nitems; i2++) {
                 E->items[i2].x += dx;
                 E->items[i2].y += dyy;
             }
+            nstamp_shift(nst0, g_nnst, dx, dyy);
+        }
     }
 
     /* transform: translate() -- shift the element's painted items after
@@ -4772,11 +4841,13 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     if (st->has_tf && !g_flt_freeze) {
         int dx = st->txpx + (st->txpct ? st->txpct * bbw / 100 : 0);
         int dyy = st->typx + (st->typct ? st->typct * bbh / 100 : 0);
-        if (dx || dyy)
+        if (dx || dyy) {
             for (int i2 = items0; i2 < E->nitems; i2++) {
                 E->items[i2].x += dx;
                 E->items[i2].y += dyy;
             }
+            nstamp_shift(nst0, g_nnst, dx, dyy);
+        }
     }
 
     return by + bbh;
@@ -4793,7 +4864,7 @@ static int lay_abs(int qi) {
     struct dnode *nd = &E->nodes[q->node];
     struct cstyle *st = &nd->st;
     int prov = 3 << 20;                     /* own provisional band */
-    int i0 = E->nitems, f0 = g_nflts, q0 = g_nabsq;
+    int i0 = E->nitems, f0 = g_nflts, q0 = g_nabsq, s0 = g_nnst;
 
     int lay_cw;
     if (st->width >= 0) {
@@ -4846,6 +4917,11 @@ static int lay_abs(int qi) {
         E->items[i2].y += dyy;
         if (q->fixed) E->items[i2].fl |= IF_FIXED;
     }
+    for (int k = s0; k < g_nnst; k++) {
+        g_nst[k].x += dx;
+        g_nst[k].y += dyy;
+        if (q->fixed) g_nst[k].fixed = 1;
+    }
     for (int i2 = f0; i2 < g_nflts; i2++) {
         g_flts[i2].x0 += dx; g_flts[i2].x1 += dx;
         g_flts[i2].y0 += dyy; g_flts[i2].y1 += dyy;
@@ -4890,6 +4966,7 @@ static void layout(int width) {
     g_nflts = 0;
     g_flt_bottom = 0;
     g_nabsq = 0;
+    g_nnst = 0;                           /* laid-rect stamp journal */
     g_nclips = 1;                         /* index 0 = no clip */
     g_cur_clip = 0;
     g_vp_w = cw;
@@ -4911,6 +4988,35 @@ static void layout(int width) {
         int b = lay_abs(qi);
         if (b + 10 > g_doc_h) g_doc_h = b + 10;
     }
+    /* Commit laid rects to the nodes (13F): journal stamps in order
+     * (last write wins, so any provisional lay is superseded), then
+     * inline elements take the union of their painted items. */
+    E->lay_gen++;
+    for (int k = 0; k < g_nnst; k++) {
+        struct nstamp *s = &g_nst[k];
+        struct dnode *n = &E->nodes[s->node];
+        n->lx = s->x; n->ly = s->y; n->lw = s->w; n->lh = s->h;
+        n->lgen = E->lay_gen;
+        n->flags = (int16_t)((n->flags & ~DNF_LAID_FIXED) | DNF_LAID_BLOCK |
+                             (s->fixed ? DNF_LAID_FIXED : 0));
+    }
+    for (int i = 0; i < E->nitems; i++) {
+        struct ditem *it = &E->items[i];
+        if (it->node < 0 || it->node >= E->nnodes) continue;
+        struct dnode *n = &E->nodes[it->node];
+        if (n->lgen == E->lay_gen && (n->flags & DNF_LAID_BLOCK)) continue;
+        if (n->lgen != E->lay_gen) {
+            n->lx = it->x; n->ly = it->y; n->lw = it->w; n->lh = it->h;
+            n->lgen = E->lay_gen;
+            n->flags = (int16_t)((n->flags & ~(DNF_LAID_BLOCK | DNF_LAID_FIXED))
+                                 | ((it->fl & IF_FIXED) ? DNF_LAID_FIXED : 0));
+        } else {
+            if (it->x < n->lx) { n->lw += n->lx - it->x; n->lx = it->x; }
+            if (it->y < n->ly) { n->lh += n->ly - it->y; n->ly = it->y; }
+            if (it->x + it->w > n->lx + n->lw) n->lw = it->x + it->w - n->lx;
+            if (it->y + it->h > n->ly + n->lh) n->lh = it->y + it->h - n->ly;
+        }
+    }
     E->render[E->render_len] = 0;
 }
 
@@ -4931,6 +5037,7 @@ static void eng_reset(void) {
     E->render_len = 0;
     E->render[0] = 0;
     E->page_bg = 0xFFFFFFFFu;
+    E->lay_gen = 0;
 }
 
 static void page_reset(void) {
@@ -5133,6 +5240,7 @@ static void collect_node(int ni) {
 static void set_status(const char *s);
 static void update_title(void);
 static int  msg_append(char *dst, int pos, int max, const char *s);
+static int  msg_append_int(char *dst, int pos, int max, int v);
 static void collect_node(int ni);
 static int  js_dispatch_event(int node, const char *type);
 static int  js_dispatch_key(int node, const char *type, const char *key);
@@ -5279,6 +5387,16 @@ static void dom_set_attr(int ni, const char *name, const char *val) {
 
 /* ---- __dom primitives (C side) -------------------------------------- */
 
+/* stage 13F: record a DOM mutation for MutationObserver delivery. On
+ * overflow the tail is dropped -- the batch is already non-empty, so
+ * observers still fire (records are best-effort v1 anyway). */
+static void mut_note(int ni, int kind) {
+    if (ni < 0 || cur->mut_n >= MUT_MAX) return;
+    cur->mut_node[cur->mut_n] = ni;
+    cur->mut_kind[cur->mut_n] = (uint8_t)kind;
+    cur->mut_n++;
+}
+
 static int jsi(JSContext *cx, JSValueConst v) {
     int32_t i;
     if (JS_ToInt32(cx, &i, v)) return -1;
@@ -5353,13 +5471,24 @@ static JSValue js_dom_text(JSContext *cx, JSValueConst t, int argc, JSValueConst
 
 static JSValue js_dom_append(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t;
-    if (argc >= 2) { dom_attach(jsi(cx, argv[0]), jsi(cx, argv[1])); g_js_dirty = 1; }
+    if (argc >= 2) {
+        int pa = jsi(cx, argv[0]);
+        dom_attach(pa, jsi(cx, argv[1]));
+        mut_note(pa, 0);
+        g_js_dirty = 1;
+    }
     return JS_UNDEFINED;
 }
 
 static JSValue js_dom_remove(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t;
-    if (argc >= 1) { dom_unlink(jsi(cx, argv[0])); g_js_dirty = 1; }
+    if (argc >= 1) {
+        int ch = jsi(cx, argv[0]);
+        int pa = (ch > 0) ? E->nodes[ch].parent : -1;
+        dom_unlink(ch);
+        mut_note(pa, 0);
+        g_js_dirty = 1;
+    }
     return JS_UNDEFINED;
 }
 
@@ -5370,6 +5499,7 @@ static JSValue js_dom_settext(JSContext *cx, JSValueConst t, int argc, JSValueCo
     const char *s = JS_ToCString(cx, argv[1]);
     if (ni > 0 && s) {
         g_js_dirty = 1;
+        mut_note(ni, 2);
         if (E->nodes[ni].tag == T_TEXT) {
             /* text node: rewrite its slice (Preact sets .data/.nodeValue) */
             E->nodes[ni].toff = E->tpool_len;
@@ -5398,6 +5528,7 @@ static JSValue js_dom_insbefore(JSContext *cx, JSValueConst t, int argc, JSValue
     if (pa < 0 || ch <= 0 || pa == ch) return JS_UNDEFINED;
     if (ref < 0 || E->nodes[ref].parent != pa) {
         dom_attach(pa, ch);
+        mut_note(pa, 0);
         g_js_dirty = 1;
         return JS_UNDEFINED;
     }
@@ -5411,6 +5542,7 @@ static JSValue js_dom_insbefore(JSContext *cx, JSValueConst t, int argc, JSValue
     E->nodes[ch].next = ref;
     if (prev < 0) p->first = ch;
     else E->nodes[prev].next = ch;
+    mut_note(pa, 0);
     g_js_dirty = 1;
     return JS_UNDEFINED;
 }
@@ -5435,6 +5567,7 @@ static JSValue js_dom_removeattr(JSContext *cx, JSValueConst t, int argc, JSValu
         }
         n->attr0 = new0;
         n->nattr = (int16_t)(E->nattrs - new0);
+        mut_note(ni, 1);
         g_js_dirty = 1;
     }
     if (name) JS_FreeCString(cx, name);
@@ -5524,6 +5657,7 @@ static JSValue js_dom_sethtml(JSContext *cx, JSValueConst t, int argc, JSValueCo
     const char *s = JS_ToCString(cx, argv[1]);
     if (ni > 0 && s) {
         g_js_dirty = 1;
+        mut_note(ni, 0);
         E->nodes[ni].first = E->nodes[ni].last = -1;
         dom_parse(s, (long)str_len(s), ni);
     }
@@ -5552,7 +5686,11 @@ static JSValue js_dom_setattr(JSContext *cx, JSValueConst t, int argc, JSValueCo
     int ni = jsi(cx, argv[0]);
     const char *name = JS_ToCString(cx, argv[1]);
     const char *val = JS_ToCString(cx, argv[2]);
-    if (ni > 0 && name && val) { dom_set_attr(ni, name, val); g_js_dirty = 1; }
+    if (ni > 0 && name && val) {
+        dom_set_attr(ni, name, val);
+        mut_note(ni, 1);
+        g_js_dirty = 1;
+    }
     if (name) JS_FreeCString(cx, name);
     if (val) JS_FreeCString(cx, val);
     return JS_UNDEFINED;
@@ -5829,6 +5967,161 @@ static JSValue js_dom_setdispatcher(JSContext *cx, JSValueConst t, int argc, JSV
     return JS_UNDEFINED;
 }
 
+/* ---- stage 13F: observers + getComputedStyle ----------------------- */
+
+/* Format an ARGB color the way getComputedStyle reports it: "rgb(r, g, b)"
+ * for opaque, "rgba(0, 0, 0, 0)" for the transparent sentinel. */
+static void css_color_str(uint32_t c, char *out) {
+    if ((c >> 24) == 0) {
+        const char *z = "rgba(0, 0, 0, 0)";
+        int p = 0; while (z[p]) { out[p] = z[p]; p++; } out[p] = 0;
+        return;
+    }
+    int p = 0;
+    out[p++]='r'; out[p++]='g'; out[p++]='b'; out[p++]='(';
+    unsigned ch[3] = { (c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF };
+    for (int k = 0; k < 3; k++) {
+        p = msg_append_int(out, p, 64, (int)ch[k]);
+        if (k < 2) { out[p++] = ','; out[p++] = ' '; }
+    }
+    out[p++] = ')'; out[p] = 0;
+}
+
+/* "Npx" from an int. */
+static void css_px_str(int v, char *out) {
+    int p = msg_append_int(out, 0, 32, v < 0 ? 0 : v);
+    out[p++] = 'p'; out[p++] = 'x'; out[p] = 0;
+}
+
+static void js_set_prop_str(JSContext *cx, JSValue o, const char *k, const char *v) {
+    JS_SetPropertyStr(cx, o, k, JS_NewString(cx, v));
+}
+
+/* __dom.computed(node): the node's computed style as a plain object keyed
+ * by kebab-case CSS property. Values are the used ones where a layout has
+ * run (width/height come from the laid content box); otherwise specified.
+ * The prelude adds camelCase aliases + getPropertyValue(). */
+static JSValue js_dom_computed(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    JSValue o = JS_NewObject(cx);
+    if (ni < 0) return o;
+    struct dnode *n = &E->nodes[ni];
+    struct cstyle *st = &n->st;
+    char buf[64];
+
+    static const char *disp_names[] = {
+        "inline", "block", "none", "list-item", "inline-block",
+        "table", "table-row-group", "table-row", "table-cell",
+        "table-caption", "flex", "grid"
+    };
+    js_set_prop_str(cx, o, "display",
+        st->disp < (int)(sizeof(disp_names)/sizeof(disp_names[0]))
+            ? disp_names[st->disp] : "block");
+
+    css_color_str(st->color, buf);           js_set_prop_str(cx, o, "color", buf);
+    css_color_str(st->bg, buf);              js_set_prop_str(cx, o, "background-color", buf);
+    css_px_str(st->px, buf);                 js_set_prop_str(cx, o, "font-size", buf);
+    js_set_prop_str(cx, o, "font-weight", (st->fl & SF_BOLD) ? "700" : "400");
+    js_set_prop_str(cx, o, "text-align",
+        st->talign == 1 ? "center" : st->talign == 2 ? "right" : "left");
+    js_set_prop_str(cx, o, "position",
+        st->pos == 1 ? "relative" : st->pos == 2 ? "absolute" :
+        st->pos == 3 ? "fixed" : "static");
+
+    /* used content-box width/height from the laid border box when fresh */
+    int cw = -1, chh = -1;
+    if (n->lgen == E->lay_gen) {
+        cw = n->lw - st->bw[3] - st->bw[1] - st->p[3] - st->p[1];
+        chh = n->lh - st->bw[0] - st->bw[2] - st->p[0] - st->p[2];
+        if (cw < 0) cw = 0;
+        if (chh < 0) chh = 0;
+    } else {
+        if (st->width >= 0 && !(st->fl & SF_WPCT)) cw = st->width;
+        if (st->height >= 0) chh = st->height;
+    }
+    if (cw >= 0) { css_px_str(cw, buf); js_set_prop_str(cx, o, "width", buf); }
+    else js_set_prop_str(cx, o, "width", "auto");
+    if (chh >= 0) { css_px_str(chh, buf); js_set_prop_str(cx, o, "height", buf); }
+    else js_set_prop_str(cx, o, "height", "auto");
+
+    static const char *mnames[4] = { "margin-top","margin-right","margin-bottom","margin-left" };
+    static const char *pnames[4] = { "padding-top","padding-right","padding-bottom","padding-left" };
+    for (int k = 0; k < 4; k++) {
+        css_px_str(st->m[k] == M_AUTO ? 0 : st->m[k], buf);
+        js_set_prop_str(cx, o, mnames[k], buf);
+        css_px_str(st->p[k], buf);
+        js_set_prop_str(cx, o, pnames[k], buf);
+    }
+    return o;
+}
+
+/* __dom.rect(node): laid border box [x, y, w, h, fixed] in DOC coords
+ * (viewport coords when fixed), or null when the node was not laid in
+ * the current generation (display:none / detached / pre-layout). */
+static JSValue js_dom_rect(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    if (ni < 0 || E->nodes[ni].lgen != E->lay_gen) return JS_NULL;
+    struct dnode *n = &E->nodes[ni];
+    JSValue a = JS_NewArray(cx);
+    JS_SetPropertyUint32(cx, a, 0, JS_NewInt32(cx, n->lx));
+    JS_SetPropertyUint32(cx, a, 1, JS_NewInt32(cx, n->ly));
+    JS_SetPropertyUint32(cx, a, 2, JS_NewInt32(cx, n->lw));
+    JS_SetPropertyUint32(cx, a, 3, JS_NewInt32(cx, n->lh));
+    JS_SetPropertyUint32(cx, a, 4,
+        JS_NewInt32(cx, (n->flags & DNF_LAID_FIXED) ? 1 : 0));
+    return a;
+}
+
+/* __dom.viewport(): [scrollY, contentHeight, contentWidth]. The content
+ * band is what IntersectionObserver treats as the root. */
+static JSValue js_dom_viewport(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t; (void)argc; (void)argv;
+    JSValue a = JS_NewArray(cx);
+    JS_SetPropertyUint32(cx, a, 0, JS_NewInt32(cx, g_scroll_y));
+    JS_SetPropertyUint32(cx, a, 1, JS_NewInt32(cx, g_content_h));
+    int vw = g_layout_w > 12 ? g_layout_w - 12 : g_layout_w;
+    JS_SetPropertyUint32(cx, a, 2, JS_NewInt32(cx, vw));
+    return a;
+}
+
+/* __dom.takeMutations(): the pending mutation batch as [{node, kind}],
+ * clearing it. kind: 0 childList, 1 attributes, 2 characterData. */
+static JSValue js_dom_take_mut(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t; (void)argc; (void)argv;
+    JSValue a = JS_NewArray(cx);
+    for (int k = 0; k < cur->mut_n; k++) {
+        JSValue o = JS_NewObject(cx);
+        JS_SetPropertyStr(cx, o, "node", JS_NewInt32(cx, cur->mut_node[k]));
+        JS_SetPropertyStr(cx, o, "kind", JS_NewInt32(cx, cur->mut_kind[k]));
+        JS_SetPropertyUint32(cx, a, (uint32_t)k, o);
+    }
+    cur->mut_n = 0;
+    return a;
+}
+
+/* __dom.setObsCheck(fn): register the prelude's observer-delivery pass;
+ * the pump calls it when the DOM mutates, the layout changes, the page
+ * scrolls, or observe() kicks it. */
+static JSValue js_dom_set_obscheck(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc >= 1 && JS_IsFunction(cx, argv[0])) {
+        if (cur->js_has_obs_check) JS_FreeValue(cx, cur->js_obs_check);
+        cur->js_obs_check = JS_DupValue(cx, argv[0]);
+        cur->js_has_obs_check = 1;
+    }
+    return JS_UNDEFINED;
+}
+
+/* __dom.obsKick(): force one observer-check pass (a fresh observe()
+ * must deliver the current state even without a mutation). */
+static JSValue js_dom_obskick(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t; (void)argc; (void)argv;
+    cur->obs_kick = 1;
+    return JS_UNDEFINED;
+}
+
 /* Free a tab's JS world (navigation away / tab close). */
 static void js_teardown(struct tab *t) {
     if (!t->js_cx) { t->js_rt = NULL; return; }
@@ -5846,6 +6139,12 @@ static void js_teardown(struct tab *t) {
         }
     if (t->js_has_dispatch) JS_FreeValue(cx, t->js_dispatch);
     t->js_has_dispatch = 0;
+    if (t->js_has_obs_check) JS_FreeValue(cx, t->js_obs_check);
+    t->js_has_obs_check = 0;
+    t->mut_n = 0;
+    t->obs_kick = 0;
+    t->obs_gen = 0;
+    t->obs_scroll = 0;
     JS_FreeContext(cx);
     JS_FreeRuntime(t->js_rt);
     t->js_cx = NULL;
@@ -6162,6 +6461,191 @@ static const char JS_PRELUDE[] =
 "  }\n"
 "  g.localStorage = mkStorage(true);\n"
 "  g.sessionStorage = mkStorage(false);\n"
+/* ---- stage 13F: getComputedStyle + laid-rect geometry ------------- */
+"  g.getComputedStyle = function(elm){\n"
+"    var o = (elm && elm.__i >= 0) ? D.computed(elm.__i) : {};\n"
+"    o.getPropertyValue = function(p){ return (p in this) ? String(this[p]) : ''; };\n"
+"    ['color','background-color','font-size','font-weight','text-align',\n"
+"     'display','position','width','height',\n"
+"     'margin-top','margin-right','margin-bottom','margin-left',\n"
+"     'padding-top','padding-right','padding-bottom','padding-left'\n"
+"    ].forEach(function(k){\n"
+"      var cc = k.replace(/-([a-z])/g, function(m, c){ return c.toUpperCase(); });\n"
+"      if (cc !== k && (k in o)) o[cc] = o[k];\n"
+"    });\n"
+"    return o;\n"
+"  };\n"
+"  function rectVP(i){\n"
+"    var r = D.rect(i);\n"
+"    if (!r) return null;\n"
+"    var vp = D.viewport();\n"
+"    var sy = r[4] ? 0 : vp[0];\n"          /* fixed: ignore scroll */
+"    var top = r[1] - sy, left = r[0];\n"
+"    return { x: left, y: top, left: left, top: top, width: r[2], height: r[3],\n"
+"             right: left + r[2], bottom: top + r[3] };\n"
+"  }\n"
+"  Element.prototype.getBoundingClientRect = function(){\n"
+"    return rectVP(this.__i) ||\n"
+"      { x:0, y:0, top:0, left:0, right:0, bottom:0, width:0, height:0 };\n"
+"  };\n"
+"  Element.prototype.getClientRects = function(){\n"
+"    var r = this.getBoundingClientRect(); return [r];\n"
+"  };\n"
+"  Object.defineProperties(Element.prototype, {\n"
+"    offsetWidth:  { get: function(){ var r = D.rect(this.__i); return r ? r[2] : 0; } },\n"
+"    offsetHeight: { get: function(){ var r = D.rect(this.__i); return r ? r[3] : 0; } },\n"
+"    offsetLeft:   { get: function(){ var r = D.rect(this.__i); return r ? r[0] : 0; } },\n"
+"    offsetTop:    { get: function(){ var r = D.rect(this.__i); return r ? r[1] : 0; } },\n"
+"    offsetParent: { get: function(){ return g.document.body; } },\n"
+"    clientWidth:  { get: function(){ var r = D.rect(this.__i); return r ? r[2] : 0; } },\n"
+"    clientHeight: { get: function(){ var r = D.rect(this.__i); return r ? r[3] : 0; } },\n"
+"    scrollWidth:  { get: function(){ var r = D.rect(this.__i); return r ? r[2] : 0; } },\n"
+"    scrollHeight: { get: function(){ var r = D.rect(this.__i); return r ? r[3] : 0; } },\n"
+"    scrollTop:    { get: function(){ return 0; }, set: function(v){} },\n"
+"    scrollLeft:   { get: function(){ return 0; }, set: function(v){} }\n"
+"  });\n"
+"  Object.defineProperties(g, {\n"
+"    scrollY:     { get: function(){ return D.viewport()[0]; } },\n"
+"    pageYOffset: { get: function(){ return D.viewport()[0]; } },\n"
+"    scrollX:     { get: function(){ return 0; } },\n"
+"    pageXOffset: { get: function(){ return 0; } },\n"
+"    innerHeight: { get: function(){ return D.viewport()[1]; } },\n"
+"    innerWidth:  { get: function(){ return D.viewport()[2]; } }\n"
+"  });\n"
+"  g.scrollTo = function(){}; g.scrollBy = function(){};\n"
+/* ---- stage 13F: Mutation / Intersection / Resize observers -------- */
+"  var mutObservers = [], interObservers = [], resizeObservers = [];\n"
+"  function isDescendant(node, anc){\n"
+"    var n = D.parent(node);\n"
+"    while (n >= 0){ if (n === anc) return true; n = D.parent(n); }\n"
+"    return false;\n"
+"  }\n"
+"  function MutationObserver(cb){ this.__cb = cb; this.__targets = []; }\n"
+"  MutationObserver.prototype.observe = function(elm, opts){\n"
+"    if (!elm) return;\n"
+"    this.__targets.push({ node: elm.__i, opts: opts || {} });\n"
+"    if (mutObservers.indexOf(this) < 0) mutObservers.push(this);\n"
+"  };\n"
+"  MutationObserver.prototype.disconnect = function(){\n"
+"    this.__targets = [];\n"
+"    var ix = mutObservers.indexOf(this); if (ix >= 0) mutObservers.splice(ix, 1);\n"
+"  };\n"
+"  MutationObserver.prototype.takeRecords = function(){ return []; };\n"
+"  function IntersectionObserver(cb, options){\n"
+"    this.__cb = cb; this.__targets = new Map();\n"
+"    this.root = (options && options.root) || null;\n"
+"    this.rootMargin = (options && options.rootMargin) || '0px';\n"
+"    var th = options && options.threshold;\n"
+"    this.thresholds = (th == null) ? [0] : (th.length ? th.slice() : [th]);\n"
+"  }\n"
+"  IntersectionObserver.prototype.observe = function(elm){\n"
+"    if (!elm) return;\n"
+"    this.__targets.set(elm.__i, { last: null });\n"
+"    if (interObservers.indexOf(this) < 0) interObservers.push(this);\n"
+"    D.obsKick();\n"
+"  };\n"
+"  IntersectionObserver.prototype.unobserve = function(elm){\n"
+"    if (elm) this.__targets.delete(elm.__i);\n"
+"  };\n"
+"  IntersectionObserver.prototype.disconnect = function(){\n"
+"    this.__targets = new Map();\n"
+"    var ix = interObservers.indexOf(this); if (ix >= 0) interObservers.splice(ix, 1);\n"
+"  };\n"
+"  IntersectionObserver.prototype.takeRecords = function(){ return []; };\n"
+"  function ResizeObserver(cb){ this.__cb = cb; this.__targets = new Map(); }\n"
+"  ResizeObserver.prototype.observe = function(elm){\n"
+"    if (!elm) return;\n"
+"    this.__targets.set(elm.__i, { w: -1, h: -1 });\n"
+"    if (resizeObservers.indexOf(this) < 0) resizeObservers.push(this);\n"
+"    D.obsKick();\n"
+"  };\n"
+"  ResizeObserver.prototype.unobserve = function(elm){\n"
+"    if (elm) this.__targets.delete(elm.__i);\n"
+"  };\n"
+"  ResizeObserver.prototype.disconnect = function(){\n"
+"    this.__targets = new Map();\n"
+"    var ix = resizeObservers.indexOf(this); if (ix >= 0) resizeObservers.splice(ix, 1);\n"
+"  };\n"
+"  g.MutationObserver = MutationObserver;\n"
+"  g.WebKitMutationObserver = MutationObserver;\n"
+"  g.IntersectionObserver = IntersectionObserver;\n"
+"  g.ResizeObserver = ResizeObserver;\n"
+"  function obsCheck(){\n"
+"    var muts = D.takeMutations();\n"
+"    if (muts.length && mutObservers.length){\n"
+"      for (var mo = 0; mo < mutObservers.length; mo++){\n"
+"        var obs = mutObservers[mo], records = [];\n"
+"        for (var ti = 0; ti < obs.__targets.length; ti++){\n"
+"          var tg = obs.__targets[ti];\n"
+"          for (var mi = 0; mi < muts.length; mi++){\n"
+"            var m = muts[mi], matched = (m.node === tg.node);\n"
+"            if (!matched && tg.opts.subtree) matched = isDescendant(m.node, tg.node);\n"
+"            if (!matched) continue;\n"
+"            var typ = m.kind === 1 ? 'attributes'\n"
+"                    : m.kind === 2 ? 'characterData' : 'childList';\n"
+"            if (typ === 'attributes' && tg.opts.attributes === false) continue;\n"
+"            if (typ === 'characterData' && tg.opts.characterData === false) continue;\n"
+"            if (typ === 'childList' && !tg.opts.childList && !tg.opts.subtree) continue;\n"
+"            records.push({ type: typ, target: el(m.node), addedNodes: [],\n"
+"                           removedNodes: [], attributeName: null,\n"
+"                           previousSibling: null, nextSibling: null,\n"
+"                           oldValue: null });\n"
+"          }\n"
+"        }\n"
+"        if (records.length){\n"
+"          try { obs.__cb.call(obs, records, obs); }\n"
+"          catch(e){ g.console.log('[obs-err]', e); }\n"
+"        }\n"
+"      }\n"
+"    }\n"
+"    for (var io = 0; io < interObservers.length; io++){\n"
+"      var iobs = interObservers[io], vp = D.viewport(), entries = [];\n"
+"      iobs.__targets.forEach(function(state, node){\n"
+"        var r = rectVP(node);\n"
+"        var vis = !!(r && r.bottom > 0 && r.top < vp[1] &&\n"
+"                     r.right > 0 && r.left < vp[2]);\n"
+"        if (state.last === vis) return;\n"
+"        state.last = vis;\n"
+"        var ratio = 0, ir = null;\n"
+"        if (r){\n"
+"          var iy0 = Math.max(0, r.top), iy1 = Math.min(vp[1], r.bottom);\n"
+"          var ih = Math.max(0, iy1 - iy0);\n"
+"          ratio = (r.height > 0) ? ih / r.height : (vis ? 1 : 0);\n"
+"          ir = { top: iy0, bottom: iy1, left: r.left, right: r.right,\n"
+"                 width: r.width, height: ih, x: r.left, y: iy0 };\n"
+"        }\n"
+"        entries.push({ target: el(node), isIntersecting: vis,\n"
+"          intersectionRatio: vis ? ratio : 0, boundingClientRect: r,\n"
+"          intersectionRect: ir, time: Date.now(),\n"
+"          rootBounds: { top: 0, left: 0, bottom: vp[1], right: vp[2],\n"
+"                        width: vp[2], height: vp[1] } });\n"
+"      });\n"
+"      if (entries.length){\n"
+"        try { iobs.__cb.call(iobs, entries, iobs); }\n"
+"        catch(e){ g.console.log('[obs-err]', e); }\n"
+"      }\n"
+"    }\n"
+"    for (var ro = 0; ro < resizeObservers.length; ro++){\n"
+"      var robs = resizeObservers[ro], rentries = [];\n"
+"      robs.__targets.forEach(function(state, node){\n"
+"        var r = D.rect(node);\n"
+"        if (!r) return;\n"
+"        var w = r[2], h = r[3];\n"
+"        if (state.w === w && state.h === h) return;\n"
+"        state.w = w; state.h = h;\n"
+"        rentries.push({ target: el(node),\n"
+"          contentRect: { x: 0, y: 0, width: w, height: h,\n"
+"                         top: 0, left: 0, right: w, bottom: h },\n"
+"          borderBoxSize: [{ inlineSize: w, blockSize: h }],\n"
+"          contentBoxSize: [{ inlineSize: w, blockSize: h }] });\n"
+"      });\n"
+"      if (rentries.length){\n"
+"        try { robs.__cb.call(robs, rentries, robs); }\n"
+"        catch(e){ g.console.log('[obs-err]', e); }\n"
+"      }\n"
+"    }\n"
+"  }\n"
+"  D.setObsCheck(obsCheck);\n"
 "})(globalThis);\n";
 
 /* ---- run every <script> at load -------------------------------------- */
@@ -6226,6 +6710,12 @@ static int js_ensure(void) {
             {"histGo", js_dom_histgo, 1},
             {"navigate", js_dom_navigate, 1},
             {"href", js_dom_href, 0},
+            {"computed", js_dom_computed, 1},
+            {"rect", js_dom_rect, 1},
+            {"viewport", js_dom_viewport, 0},
+            {"takeMutations", js_dom_take_mut, 0},
+            {"setObsCheck", js_dom_set_obscheck, 1},
+            {"obsKick", js_dom_obskick, 0},
         };
         for (unsigned k = 0; k < sizeof(B) / sizeof(B[0]); k++)
             JS_SetPropertyStr(cx, dom, B[k].n,
@@ -6481,6 +6971,29 @@ static int js_pump_all(void) {
             tk_redraw(&win);
             work = 1;
         }
+        /* stage 13F: deliver observer callbacks. Runs when the DOM
+         * mutated (MutationObserver), the layout changed or the page
+         * scrolled (Intersection/Resize), or a fresh observe() kicked
+         * it. Rects are fresh here (any g_js_dirty relayout just ran).
+         * Callbacks may mutate the DOM -> one more relayout below. */
+        if (t->js_has_obs_check &&
+            (t->obs_kick || t->mut_n > 0 ||
+             t->obs_gen != E->lay_gen || t->obs_scroll != g_scroll_y)) {
+            t->obs_kick = 0;
+            t->obs_gen = E->lay_gen;
+            t->obs_scroll = g_scroll_y;
+            JSValue r = JS_Call(t->js_cx, t->js_obs_check, JS_UNDEFINED, 0, NULL);
+            if (JS_IsException(r)) js_dump_error(t->js_cx);
+            JS_FreeValue(t->js_cx, r);
+            js_drain_jobs(t);
+            if (g_js_dirty) {
+                g_js_dirty = 0;
+                js_rerender();
+                tk_redraw(&win);
+                t->obs_gen = E->lay_gen;   /* our own relayout, not a change */
+            }
+            work = 1;
+        }
         if (cur->js_nav[0]) {             /* location.href assignment */
             js_do_pending_nav();
             tk_redraw(&win);
@@ -6532,10 +7045,6 @@ static void render_html(void) {
     page_reset();
 
     dom_build();
-    g_js_in_load = 1;                     /* pipeline restyles anyway */
-    run_scripts();                        /* phase 9/10: mutate, then style */
-    g_js_in_load = 0;
-    g_js_dirty = 0;
     css_parse_sheet(UA_SHEET, (long)sizeof(UA_SHEET) - 1, 0);
     g_form_open = -1;
     collect_node(0);
@@ -6548,7 +7057,20 @@ static void render_html(void) {
     style_node(0, &base);
 
     g_view_mode = VIEW_HTML;
-    layout(g_win_w);
+    layout(g_win_w);                      /* initial style+layout BEFORE
+                                             scripts so synchronous
+                                             getComputedStyle / rect reads
+                                             see real computed values (13F) */
+
+    /* phase 9/10: run scripts now that the DOM is styled + laid. Browsers
+     * force a style/layout flush for synchronous measurement; here it is
+     * already done. Scripts that mutate the DOM set g_js_dirty -> one
+     * re-collect/style/layout folds the changes in. */
+    g_js_in_load = 1;
+    run_scripts();
+    g_js_in_load = 0;
+    if (g_js_dirty) js_rerender();
+    g_js_dirty = 0;
 }
 
 /* Whole-buffer monospace document (plain text + source view):
@@ -6821,6 +7343,7 @@ static void tab_reset(struct tab *t) {
         e->render_len = 0;
         e->render[0] = 0;
         e->page_bg = 0xFFFFFFFFu;
+        e->lay_gen = 0;
     }
     t->hist_pos     = -1;
     t->focus_url    = 1;
