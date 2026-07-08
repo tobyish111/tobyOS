@@ -107,7 +107,7 @@ static struct kface {
     unsigned char  *data;
     size_t          size;
     stbtt_fontinfo  info;
-} g_faces[KFONT_NFACES];
+} g_faces[KFONT_TOTAL];
 
 struct gcache {
     int            face, cp, px;
@@ -147,10 +147,45 @@ static void kface_try_load(int face) {
     kprintf("[kfont] loaded %s (%lu bytes)\n", g_face_path[face], (unsigned long)sz);
 }
 
+/* Register a downloaded TTF/OTF blob as a web face (stage 13E). */
+int kfont_register(const unsigned char *ttf, size_t len) {
+    if (!ttf || len < 12) return -1;
+    int slot = -1;
+    for (int i = KFONT_WEB_BASE; i < KFONT_TOTAL; i++)
+        if (!g_faces[i].data) { slot = i; break; }
+    if (slot < 0) return -1;
+    unsigned char *copy = (unsigned char *)kmalloc(len);
+    if (!copy) return -1;
+    memcpy(copy, ttf, len);
+    struct kface *f = &g_faces[slot];
+    f->tried = true;
+    f->data = copy;
+    f->size = len;
+    kfpu_begin();
+    int ok = stbtt_InitFont(&f->info, f->data,
+                            stbtt_GetFontOffsetForIndex(f->data, 0));
+    kfpu_end();
+    if (!ok) {
+        kprintf("[kfont] web font register: stbtt_InitFont failed (%lu bytes)\n",
+                (unsigned long)len);
+        kfree(copy); f->data = 0; f->size = 0;
+        return -1;
+    }
+    f->ok = true;
+    kprintf("[kfont] registered web face %d (%lu bytes)\n", slot,
+            (unsigned long)len);
+    return slot;
+}
+
 /* Resolve a requested face to a loaded stbtt_fontinfo, falling back to Regular
  * when the requested weight/style isn't shipped. Returns NULL only if even
  * Regular is unavailable. */
 static stbtt_fontinfo *kface_info(int face) {
+    /* web faces: use if registered, else fall back to Regular */
+    if (face >= KFONT_WEB_BASE && face < KFONT_TOTAL) {
+        if (g_faces[face].ok) return &g_faces[face].info;
+        face = KFONT_REGULAR;
+    }
     if (face < 0 || face >= KFONT_NFACES) face = KFONT_REGULAR;
     kface_try_load(face);
     if (g_faces[face].ok) return &g_faces[face].info;

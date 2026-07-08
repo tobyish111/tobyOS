@@ -836,8 +836,14 @@ struct abi_http_poll {
     char     content_type[ABI_HTTP_FETCH_CT_MAX];
 };
 
+/* Register a downloaded TTF/OTF font blob with the kernel rasterizer
+ * (stage 13E web fonts). a1 = font bytes, a2 = length. Returns a face
+ * id (>= KFONT_WEB_BASE) usable as the face field of GUI_TEXT_TTF /
+ * GUI_TEXT_TTF_WIDTH, or -E on failure. */
+#define ABI_SYS_GUI_FONT_REGISTER  176
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          176
+#define ABI_SYS_NR_MAX          177
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

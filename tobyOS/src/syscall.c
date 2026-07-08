@@ -496,7 +496,7 @@ static long sys_gui_text_ttf(int fd, uint32_t xy, const char *s,
     int x    = (int)(int16_t)(xy & 0xFFFFu);
     int y    = (int)(int16_t)((xy >> 16) & 0xFFFFu);
     int px   = (int)(px_face & 0xFFFFu);
-    int face = (int)((px_face >> 16) & 0x3u);
+    int face = (int)((px_face >> 16) & 0xFFu);
     if (px <= 0)  px = 16;
     if (px > 256) px = 256;
     if (!kfont_available()) {
@@ -513,7 +513,7 @@ static long sys_gui_text_ttf_width(const char *s, uint32_t px_face) {
     long n = strncpy_from_user(buf, s, sizeof(buf));
     if (n < 0) return -1;
     int px   = (int)(px_face & 0xFFFFu);
-    int face = (int)((px_face >> 16) & 0x3u);
+    int face = (int)((px_face >> 16) & 0xFFu);
     if (px <= 0)  px = 16;
     if (px > 256) px = 256;
     if (!kfont_available()) {
@@ -521,6 +521,19 @@ static long sys_gui_text_ttf_width(const char *s, uint32_t px_face) {
         return (long)n * 8 * scale;
     }
     return kfont_text_width_f(buf, (int)n, px, face);
+}
+
+/* Register a downloaded TTF/OTF font blob (stage 13E web fonts).
+ * a1 = user font bytes, a2 = length. Returns a face id or -ABI_E*. */
+static long sys_gui_font_register(const void *ubuf, uint32_t len) {
+    if (!ubuf || len < 12 || len > (2u << 20)) return -ABI_EINVAL;
+    if (!user_buf_ok((uint64_t)(uintptr_t)ubuf, len)) return -ABI_EFAULT;
+    void *kb = kmalloc(len);
+    if (!kb) return -ABI_ENOMEM;
+    if (copy_from_user(kb, ubuf, len) != 0) { kfree(kb); return -ABI_EFAULT; }
+    int face = kfont_register((const unsigned char *)kb, len);
+    kfree(kb);                             /* kfont keeps its own copy */
+    return face >= 0 ? (long)face : -ABI_EINVAL;
 }
 
 static long sys_gui_text(int fd, uint32_t xy, const char *s,
@@ -3115,6 +3128,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
                                 (uint32_t)a4, (uint32_t)a5);
     case ABI_SYS_GUI_TEXT_TTF_WIDTH:
         return sys_gui_text_ttf_width((const char *)a1, (uint32_t)a2);
+    case ABI_SYS_GUI_FONT_REGISTER:
+        return sys_gui_font_register((const void *)a1, (uint32_t)a2);
     case SYS_GUI_TEXT:
         return sys_gui_text((int)a1, (uint32_t)a2, (const char *)a3,
                             (uint32_t)a4, (uint32_t)a5);

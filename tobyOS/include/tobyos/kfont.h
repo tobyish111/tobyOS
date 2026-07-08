@@ -28,6 +28,17 @@ enum {
     KFONT_NFACES     = 4,
 };
 
+/* Web fonts (stage 13E): a downloaded TTF/OTF blob is registered as an
+ * extra face beyond the 4 bundled ones. Face ids [KFONT_WEB_BASE,
+ * KFONT_TOTAL) index the registered slots. */
+#define KFONT_WEB_BASE  KFONT_NFACES
+#define KFONT_WEB_MAX   8
+#define KFONT_TOTAL     (KFONT_NFACES + KFONT_WEB_MAX)
+
+/* Register a downloaded TTF/OTF font blob (the kernel takes a private
+ * copy). Returns a face id >= KFONT_WEB_BASE, or -1 on failure / full. */
+int kfont_register(const unsigned char *ttf, size_t len);
+
 /* Lazy-load the bundled TTF (idempotent). Returns true once a font is ready. */
 bool kfont_available(void);
 

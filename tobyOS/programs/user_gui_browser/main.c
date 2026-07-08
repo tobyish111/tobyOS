@@ -229,6 +229,48 @@ static inline long sys_mkdir(const char *path, int mode) {
         : "rcx", "r11", "memory");
     return r;
 }
+
+/* ---- Web fonts (stage 13E): register + face-aware text ------------- */
+#define SYS_GUI_TEXT_TTF        94
+#define SYS_GUI_TEXT_TTF_WIDTH  95
+#define SYS_GUI_FONT_REGISTER  176
+
+/* Register a downloaded TTF/OTF blob; returns a kernel face id (>=4) or <0. */
+static inline long sys_gui_font_register(const void *buf, unsigned long len) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_GUI_FONT_REGISTER), "D"(buf), "S"(len)
+        : "rcx", "r11", "memory");
+    return r;
+}
+/* Draw TTF text with an explicit face (bundled 0-3 or a web face). */
+static inline int sys_text_ttf(int fd, int x, int y, const char *s,
+                               uint32_t fg, int px, int face) {
+    unsigned long xy = ((unsigned long)(x & 0xFFFF)) |
+                       ((unsigned long)(y & 0xFFFF) << 16);
+    unsigned long pf = ((unsigned long)(px & 0xFFFF)) |
+                       ((unsigned long)(face & 0xFF) << 16);
+    register long r10 __asm__("r10") = (long)fg;
+    register long r8  __asm__("r8")  = (long)pf;
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_GUI_TEXT_TTF), "D"((long)fd), "S"(xy),
+          "d"(s), "r"(r10), "r"(r8)
+        : "rcx", "r11", "memory");
+    return (int)r;
+}
+static inline int sys_text_ttf_width(const char *s, int px, int face) {
+    unsigned long pf = ((unsigned long)(px & 0xFFFF)) |
+                       ((unsigned long)(face & 0xFF) << 16);
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_GUI_TEXT_TTF_WIDTH), "D"(s), "S"(pf)
+        : "rcx", "r11", "memory");
+    return (int)r;
+}
 #define SYS_GUI_SET_TITLE  76
 static inline void sys_gui_set_title(int fd, const char *t) {
     long r;
@@ -427,8 +469,8 @@ struct img {
  * at a time via tk_text_width (the kernel rasterizer is advance-based,
  * so per-char sums equal string widths); afterwards all wrapping math
  * is userspace. Round-robin eviction; a page uses a handful of sizes. */
-#define ADV_SLOTS 14
-struct advtab { short adv[95]; short px; short bold; short used; };
+#define ADV_SLOTS 16
+struct advtab { short adv[95]; short px; short face; short used; };
 static struct advtab g_advc[ADV_SLOTS];
 static int g_advc_rr = 0;
 
@@ -530,6 +572,7 @@ struct cstyle {
     int16_t  txpx, typx;         /* transform translate px */
     int8_t   txpct, typct;       /* transform translate % (of own size) */
     uint8_t  po_pct;             /* top/right/bottom/left are % (bits T R B L) */
+    int8_t   webface;            /* @font-face kernel face id, -1 = none */
 };
 
 /* ---- DOM ---------------------------------------------------------- */
@@ -641,6 +684,8 @@ struct ditem {
     int16_t link, field, img;    /* interaction indices or -1 */
     uint8_t kind, px, fl;
     uint8_t clip;                /* index into g_clips (0 = no clip) */
+    uint8_t face;                /* kernel text face (web font / bold) */
+    uint8_t _pad3[3];
 };
 #define ITEM_MAX  49152
 
@@ -838,28 +883,36 @@ static int hex_digit(char c) {
 
 /* ---- Text measurement (dynamic advance cache) --------------------- */
 
-static const short *adv_for(int px, int bold) {
+#define KFONT_WEB_BASE 4       /* face ids >= this are registered web fonts */
+
+static const short *adv_for(int px, int face) {
     if (px < 8) px = 8;
     if (px > 40) px = 40;
-    bold = bold ? 1 : 0;
     for (int i = 0; i < ADV_SLOTS; i++)
-        if (g_advc[i].used && g_advc[i].px == px && g_advc[i].bold == bold)
+        if (g_advc[i].used && g_advc[i].px == px && g_advc[i].face == face)
             return g_advc[i].adv;
     struct advtab *t = &g_advc[g_advc_rr];
     g_advc_rr = (g_advc_rr + 1) % ADV_SLOTS;
     char one[2] = { 0, 0 };
     for (int c = 0; c < 95; c++) {
         one[0] = (char)(32 + c);
-        int w = tk_text_width(one, px, bold);
+        int w = (face >= KFONT_WEB_BASE) ? sys_text_ttf_width(one, px, face)
+                                         : tk_text_width(one, px, face ? 1 : 0);
         t->adv[c] = (short)(w > 0 ? w : px / 2);
     }
-    t->px = (short)px; t->bold = (short)bold; t->used = 1;
+    t->px = (short)px; t->face = (short)face; t->used = 1;
     return t->adv;
 }
 
-static int text_px_w(const char *s, int len, int px, int bold, int mono) {
+/* Resolved kernel face for a run: a web font wins; else bold/regular. */
+static int run_face(int webface, int bold) {
+    if (webface >= 0) return webface;
+    return bold ? 1 : 0;
+}
+
+static int text_px_w(const char *s, int len, int px, int face, int mono) {
     if (mono) return len * MONO_W;
-    const short *adv = adv_for(px, bold);
+    const short *adv = adv_for(px, face);
     int w = 0;
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)s[i];
@@ -2042,6 +2095,118 @@ static void css_parse_ruleset(struct ccur *c, int origin) {
     }
 }
 
+/* ---- Web fonts (@font-face, stage 13E) ----------------------------- *
+ * A session cache: each entry is a font family declared by @font-face
+ * with a downloadable src url and (once loaded) a kernel face id. The
+ * table persists across page loads (keyed by url) so re-visits reuse
+ * the registered kernel face instead of consuming a new slot. v1
+ * downloads raw TTF/OTF sources; WOFF/WOFF2 sources are skipped (they
+ * need decompression) and such a family falls back to the default. */
+#define WEBFONT_MAX 12
+struct webfont {
+    char    family[64];
+    char    url[URL_MAX + 1];
+    int     face;                /* kernel face id, -1 until registered */
+    uint8_t tried;               /* download attempted (success or fail) */
+    uint8_t used;
+};
+static struct webfont g_webfonts[WEBFONT_MAX];
+static int g_nwebfonts;
+
+/* Case-insensitive substring index or -1. */
+static int ci_find(const char *hay, int hl, const char *needle) {
+    int nl = (int)str_len(needle);
+    for (int i = 0; i + nl <= hl; i++) {
+        int k = 0;
+        while (k < nl && lc(hay[i + k]) == lc(needle[k])) k++;
+        if (k == nl) return i;
+    }
+    return -1;
+}
+
+/* Extract the first raw-TTF/OTF url from a `src:` value. Prefers a url
+ * whose format() is truetype/opentype or whose path ends .ttf/.otf;
+ * returns 0 if only compressed (woff/woff2) sources are present. */
+static int webfont_pick_url(const char *s, int n, char *out, int cap) {
+    int best = 0, i = 0;
+    while (i + 4 <= n) {
+        int u = ci_find(s + i, n - i, "url(");
+        if (u < 0) break;
+        int p = i + u + 4;
+        while (p < n && (s[p] == ' ' || s[p] == '"' || s[p] == '\'')) p++;
+        int e = p;
+        while (e < n && s[e] != ')' && s[e] != '"' && s[e] != '\'') e++;
+        int ulen = e - p;
+        /* look at the trailing format(...) or extension */
+        int after = e;
+        while (after < n && s[after] != ',' && s[after] != ';') after++;
+        int seg_len = after - e;
+        int is_ttf = 0;
+        if (ci_find(s + e, seg_len, "truetype") >= 0 ||
+            ci_find(s + e, seg_len, "opentype") >= 0) is_ttf = 1;
+        if (ulen >= 4 && (ci_find(s + p + ulen - 4, 4, ".ttf") >= 0 ||
+                          ci_find(s + p + ulen - 4, 4, ".otf") >= 0)) is_ttf = 1;
+        int is_woff = (ci_find(s + e, seg_len, "woff") >= 0) ||
+                      (ulen >= 5 && ci_find(s + p + ulen - 5, 5, ".woff") >= 0);
+        if (is_ttf && ulen > 0 && ulen < cap) {
+            memcpy(out, s + p, ulen); out[ulen] = 0;
+            return 1;
+        }
+        if (!is_woff && !best && ulen > 0 && ulen < cap) {
+            memcpy(out, s + p, ulen); out[ulen] = 0;
+            best = 1;                       /* unknown format: tentative */
+        }
+        i = after + 1;
+    }
+    return best;
+}
+
+/* Parse one @font-face block body: capture family + a usable src url. */
+static void webfont_parse_block(const char *s, int n) {
+    if (g_nwebfonts >= WEBFONT_MAX) return;
+    char family[64] = {0};
+    char url[URL_MAX + 1] = {0};
+    /* font-family: "Name"; */
+    int ff = ci_find(s, n, "font-family");
+    if (ff >= 0) {
+        int p = ff + 11;
+        while (p < n && (s[p] == ' ' || s[p] == ':')) p++;
+        while (p < n && (s[p] == '"' || s[p] == '\'')) p++;
+        int e = p, o = 0;
+        while (e < n && s[e] != ';' && s[e] != '"' && s[e] != '\'' &&
+               o < (int)sizeof(family) - 1)
+            family[o++] = (char)lc(s[e++]);
+        while (o > 0 && family[o - 1] == ' ') o--;
+        family[o] = 0;
+    }
+    /* src: ... */
+    int sr = ci_find(s, n, "src");
+    if (sr >= 0) {
+        int p = sr + 3;
+        int e = p;
+        while (e < n && s[e] != ';') e++;
+        webfont_pick_url(s + p, e - p, url, sizeof(url));
+    }
+    if (!family[0] || !url[0]) return;
+    for (int k = 0; k < g_nwebfonts; k++)   /* dedup by url */
+        if (str_eq(g_webfonts[k].url, url)) return;
+    struct webfont *w = &g_webfonts[g_nwebfonts++];
+    str_copy(w->family, family, sizeof(w->family));
+    str_copy(w->url, url, sizeof(w->url));
+    w->face = -1; w->tried = 0; w->used = 1;
+}
+
+/* Face id registered for a font-family, or -1. */
+static int webfont_face_for(const char *family, int flen) {
+    for (int k = 0; k < g_nwebfonts; k++) {
+        if (g_webfonts[k].face < 0) continue;
+        int fl = (int)str_len(g_webfonts[k].family);
+        if (fl == flen && ci_find(family, flen, g_webfonts[k].family) == 0)
+            return g_webfonts[k].face;
+    }
+    return -1;
+}
+
 /* Parse a whole stylesheet into E's rule pools. */
 static void css_parse_sheet(const char *s, long n, int origin) {
     struct ccur c = { s, 0, n };
@@ -2073,6 +2238,24 @@ static void css_parse_sheet(const char *s, long n, int origin) {
                     long b1 = depth ? c.i : c.i - 1;
                     css_parse_sheet(c.s + b0, b1 - b0, origin);
                 }
+                continue;
+            }
+            if (l == 9 && str_ncasecmp(&E->csspool[o], "font-face", 9) == 0) {
+                while (c.i < c.n && c.s[c.i] != '{' && c.s[c.i] != ';') c.i++;
+                if (c.i >= c.n || c.s[c.i] == ';') {
+                    if (c.i < c.n) c.i++;
+                    continue;
+                }
+                c.i++;
+                long b0 = c.i;
+                int depth = 1;
+                while (c.i < c.n && depth) {
+                    if (c.s[c.i] == '{') depth++;
+                    else if (c.s[c.i] == '}') depth--;
+                    c.i++;
+                }
+                long b1 = depth ? c.i : c.i - 1;
+                webfont_parse_block(c.s + b0, (int)(b1 - b0));
                 continue;
             }
             css_skip_block_or_semi(&c);
@@ -2205,6 +2388,7 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->txpx = st->typx = 0;
     st->txpct = st->typct = 0;
     st->po_pct = 0;
+    st->webface = pst ? pst->webface : -1;   /* font-family inherits */
 }
 
 static int clamp_px(int v) {
@@ -2466,6 +2650,21 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
             st->fl |= SF_MONO;
         else
             st->fl &= (uint8_t)~SF_MONO;
+        /* @font-face: first listed family that names a registered web
+         * font wins; else inherit/none. */
+        st->webface = -1;
+        {
+            int p2 = 0;
+            struct vtok ft;
+            while (vtok_next(v, n, &p2, &ft)) {
+                const char *fs = ft.s; int fl2 = ft.len;
+                while (fl2 > 0 && (*fs == '"' || *fs == '\'' || *fs == ' ')) { fs++; fl2--; }
+                while (fl2 > 0 && (fs[fl2-1] == '"' || fs[fl2-1] == '\'' ||
+                                   fs[fl2-1] == ' ' || fs[fl2-1] == ',')) fl2--;
+                int face = webfont_face_for(fs, fl2);
+                if (face >= 0) { st->webface = (int8_t)face; break; }
+            }
+        }
         break;
     case CP_FONT_STYLE:
         break;                            /* no italic face yet */
@@ -3231,6 +3430,7 @@ struct istyle {
     int link;
     int pre;
     int node;                    /* nearest element node (event target) */
+    int face;                    /* resolved kernel face (web font / bold) */
 };
 
 struct ictx {
@@ -3280,9 +3480,9 @@ static void ic_break(struct ictx *ic, int min_h) {
  * open text item when style + render-pool position allow. */
 static void ic_word(struct ictx *ic, const char *w, int wl, const struct istyle *is) {
     int mono = is->fl & IF_MONO;
-    int bold = is->fl & IF_BOLD;
-    int ww = text_px_w(w, wl, is->px, bold, mono);
-    int sw = ic->pend_sp ? text_px_w(" ", 1, is->px, bold, mono) : 0;
+    int face = is->face;
+    int ww = text_px_w(w, wl, is->px, face, mono);
+    int sw = ic->pend_sp ? text_px_w(" ", 1, is->px, face, mono) : 0;
     for (int guard = 0; guard < 64; guard++) {
         if (ic->x > ic->lx0 && ic->x + sw + ww > ic->lx1) {
             ic_break(ic, is->lh);      /* wrap within the line box */
@@ -3305,11 +3505,12 @@ static void ic_word(struct ictx *ic, const char *w, int wl, const struct istyle 
     }
     int sp = (ic->x > ic->lx0) ? ic->pend_sp : 0;
     ic->pend_sp = 0;
-    sw = sp ? text_px_w(" ", 1, is->px, bold, mono) : 0;
+    sw = sp ? text_px_w(" ", 1, is->px, face, mono) : 0;
     struct ditem *cu = (ic->citem >= 0) ? &E->items[ic->citem] : NULL;
     int same = cu && cu->kind == DI_TEXT && cu->px == is->px &&
                cu->fl == (uint8_t)is->fl && cu->fg == is->fg &&
                cu->bg == is->bg && cu->link == is->link &&
+               cu->face == (uint8_t)is->face &&
                cu->off + cu->len == E->render_len;
     if (!same) {
         if (sp) { ic->x += sw; sp = 0; sw = 0; }
@@ -3325,6 +3526,7 @@ static void ic_word(struct ictx *ic, const char *w, int wl, const struct istyle 
         it->len = 0;
         it->px = (uint8_t)is->px;
         it->fl = (uint8_t)is->fl;
+        it->face = (uint8_t)is->face;
         it->link = (int16_t)is->link;
         it->node = is->node;
         ic->citem = (int)(it - E->items);
@@ -3406,7 +3608,7 @@ static void inl_text_pre(struct ictx *ic, const char *t, int tl, const struct is
         int budget = ic->lx1 - ic->x;
         int w = 0, j = i;
         while (j < tl && t[j] != '\n') {
-            int cw2 = text_px_w(&t[j], 1, is->px, is->fl & IF_BOLD, is->fl & IF_MONO);
+            int cw2 = text_px_w(&t[j], 1, is->px, is->face, is->fl & IF_MONO);
             if (w + cw2 > budget && j > i) break;
             w += cw2;
             j++;
@@ -3450,6 +3652,7 @@ static void inl_walk(struct ictx *ic, int ni, const struct istyle *is) {
     cs.pre = (st->fl & SF_PRE) ? 1 : 0;
     cs.link = nd->link >= 0 ? nd->link : is->link;
     cs.node = ni;
+    cs.face = run_face(st->webface, st->fl & SF_BOLD);
 
     if (nd->img >= 0) {
         int dw, dh;
@@ -3517,6 +3720,7 @@ static int flush_inline(int first_child, int stop_child, int cx, int cw,
     is.pre = (bst->fl & SF_PRE) ? 1 : 0;
     is.link = link;
     is.node = bnode;
+    is.face = run_face(bst->webface, bst->fl & SF_BOLD);
     int n0 = E->nitems;
     for (int c = first_child; c >= 0 && c != stop_child; c = E->nodes[c].next)
         inl_walk(&ic, c, &is);
@@ -6289,6 +6493,37 @@ static int js_pump_all(void) {
 
 /* ---- The full pipeline: raw -> DOM -> CSSOM -> style -> layout ------ */
 
+/* Download each not-yet-loaded @font-face src and register it with the
+ * kernel rasterizer (stage 13E). Synchronous, once per font, at load
+ * time (like linked stylesheets). URLs resolve against the page. */
+#define WEBFONT_CAP (1u << 20)
+static void load_webfonts(void) {
+    for (int k = 0; k < g_nwebfonts; k++) {
+        struct webfont *w = &g_webfonts[k];
+        if (w->face >= 0 || w->tried) continue;
+        w->tried = 1;
+        char url[URL_MAX + 1];
+        resolve_relative_url(g_url, w->url, url, URL_MAX);
+        if (!has_scheme(url)) continue;
+        uint8_t *buf = (uint8_t *)malloc(WEBFONT_CAP);
+        if (!buf) continue;
+        struct http_fetch req;
+        mem_zero(&req, sizeof(req));
+        req.url = (unsigned long)url;
+        req.buf = (unsigned long)buf;
+        req.buf_sz = WEBFONT_CAP;
+        long nf = sys_http_fetch(&req);
+        if (nf > 12 && req.status >= 200 && req.status < 400) {
+            long face = sys_gui_font_register(buf, (unsigned long)nf);
+            if (face >= 0) {
+                w->face = (int)face;
+                sys_write(1, "[webfont] registered\n", 21);
+            }
+        }
+        free(buf);
+    }
+}
+
 static void render_html(void) {
     if (!E) return;
     cur->doc_gen++;                       /* new document (popstate gen) */
@@ -6304,6 +6539,7 @@ static void render_html(void) {
     css_parse_sheet(UA_SHEET, (long)sizeof(UA_SHEET) - 1, 0);
     g_form_open = -1;
     collect_node(0);
+    load_webfonts();                      /* @font-face -> download + register */
 
     struct cstyle base;
     st_init(&base, NULL);
@@ -8017,8 +8253,9 @@ static void paint_all(void) {
             int nat = r->px + r->px / 3;
             int ty = sy + (r->h - nat) / 2;
             if (ty < sy) ty = sy;
-            tk_draw_text(&win, r->x, ty, tb, fg, r->px,
-                         (r->fl & IF_BOLD) ? 1 : 0);
+            /* draw with the run's resolved face (web font or bold);
+             * win.fd, not the paint fd (0) the *_fill stubs ignore */
+            sys_text_ttf(win.fd, r->x, ty, tb, fg & 0xFFFFFF, r->px, r->face);
             if (r->fl & IF_UNDER)
                 sys_gui_fill(fd, r->x, ty + r->px + 2, r->w, 1, fg);
         }
