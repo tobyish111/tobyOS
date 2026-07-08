@@ -3302,7 +3302,8 @@ static const char UA_SHEET[] =
 "li{display:list-item}\n"
 "head,script,style,title,meta,link,noscript,template,option,base,param,"
 "track,source,area,col,colgroup,select,textarea,iframe,object,embed,"
-"video,audio,canvas,svg,map,picture{display:none}\n"
+"video,audio,svg,map,picture{display:none}\n"
+"canvas{display:inline-block}\n"      /* stage 13I: replaced element */
 "input[type=hidden]{display:none}\n"
 "body{margin:8px;color:#1b1b1b;background-color:#ffffff;font-size:15px;"
 "line-height:1.3}\n"
@@ -5106,6 +5107,33 @@ static void collect_node(int ni) {
         }
         break;
     }
+    case T_CANVAS: {
+        /* stage 13I: a <canvas> gets an ARGB backing store reusing the
+         * img record (so it lays out + paints as an image); JS draws into
+         * im->pixels. The store survives light re-collects (nd->img set)
+         * and is freed with the page's images. */
+        if (nd->img < 0 && g_nimages < IMG_MAX) {
+            char d[12];
+            int cw = node_attr_str(nd, "width",  d, sizeof d) ? atoi_simple(d) : 300;
+            int ch = node_attr_str(nd, "height", d, sizeof d) ? atoi_simple(d) : 150;
+            if (cw < 1)    cw = 300;
+            if (ch < 1)    ch = 150;
+            if (cw > 1600) cw = 1600;
+            if (ch > 1600) ch = 1600;
+            uint32_t *px = (uint32_t *)malloc((size_t)cw * (size_t)ch * 4);
+            if (px) {
+                mem_zero(px, (size_t)cw * (size_t)ch * 4);   /* transparent */
+                struct img *im = &g_images[g_nimages];
+                mem_zero(im, sizeof(*im));
+                im->w = (int16_t)cw;      im->h = (int16_t)ch;
+                im->attr_w = (int16_t)cw; im->attr_h = (int16_t)ch;
+                im->pixels = px;
+                im->state = 1;            /* "loaded" -> paints backing store */
+                nd->img = (int16_t)g_nimages++;
+            }
+        }
+        break;
+    }
     case T_IMG: {
         char src[512];
         if (nd->img < 0 && g_nimages < IMG_MAX &&
@@ -5957,6 +5985,232 @@ static JSValue js_dom_setvalue(JSContext *cx, JSValueConst t, int argc, JSValueC
     return JS_UNDEFINED;
 }
 
+/* ---- stage 13I: Canvas 2D --------------------------------------------
+ * A <canvas> owns an ARGB backing store (the img record created in
+ * collect_node). These primitives draw straight into im->pixels in
+ * userspace (no kernel calls); the display list paints the store as an
+ * image. The prelude wraps them in a CanvasRenderingContext2D. */
+#include "canvas_font.h"                 /* g_font8x8[95][8] */
+
+static int g_canvas_dirty;               /* a canvas op needs a repaint */
+
+static struct img *canvas_img(int ni) {
+    if (ni <= 0 || ni >= E->nnodes) return NULL;
+    int ii = E->nodes[ni].img;
+    if (ii < 0 || ii >= g_nimages) return NULL;
+    struct img *im = &g_images[ii];
+    if (im->state != 1 || !im->pixels || im->w <= 0 || im->h <= 0) return NULL;
+    return im;
+}
+
+/* source-over composite one pixel. */
+static void cv_px(struct img *im, int x, int y, uint32_t rgba) {
+    if ((unsigned)x >= (unsigned)im->w || (unsigned)y >= (unsigned)im->h) return;
+    unsigned sa = (rgba >> 24) & 0xFF;
+    if (sa == 0) return;
+    uint32_t *d = &im->pixels[(long)y * im->w + x];
+    if (sa == 255) { *d = rgba; return; }
+    unsigned sr = (rgba >> 16) & 0xFF, sg = (rgba >> 8) & 0xFF, sb = rgba & 0xFF;
+    uint32_t dv = *d;
+    unsigned da = (dv >> 24) & 0xFF, dr = (dv >> 16) & 0xFF,
+             dg = (dv >> 8) & 0xFF, db = dv & 0xFF;
+    unsigned na = sa + da * (255 - sa) / 255;
+    unsigned nr, ng, nb;
+    if (na == 0) { nr = ng = nb = 0; }
+    else {
+        nr = (sr * sa + dr * da * (255 - sa) / 255) / na;
+        ng = (sg * sa + dg * da * (255 - sa) / 255) / na;
+        nb = (sb * sa + db * da * (255 - sa) / 255) / na;
+    }
+    *d = (na << 24) | (nr << 16) | (ng << 8) | nb;
+}
+
+static void cv_fill_rect(struct img *im, int x, int y, int w, int h, uint32_t rgba) {
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++)
+            cv_px(im, x + i, y + j, rgba);
+}
+
+static void cv_clear_rect(struct img *im, int x, int y, int w, int h) {
+    for (int j = 0; j < h; j++) {
+        int yy = y + j; if ((unsigned)yy >= (unsigned)im->h) continue;
+        for (int i = 0; i < w; i++) {
+            int xx = x + i; if ((unsigned)xx >= (unsigned)im->w) continue;
+            im->pixels[(long)yy * im->w + xx] = 0;
+        }
+    }
+}
+
+static void cv_line(struct img *im, int x0, int y0, int x1, int y1,
+                    uint32_t rgba, int width) {
+    if (width < 1) width = 1;
+    int dx = x1 - x0, dy = y1 - y0;
+    int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    int sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1;
+    int err = adx - ady, hw = (width - 1) / 2;
+    for (;;) {
+        for (int j = -hw; j <= hw; j++)
+            for (int i = -hw; i <= hw; i++) cv_px(im, x0 + i, y0 + j, rgba);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 > -ady) { err -= ady; x0 += sx; }
+        if (e2 <  adx) { err += adx; y0 += sy; }
+    }
+}
+
+/* even-odd scanline polygon fill (path fill + filled arcs). */
+static void cv_fill_poly(struct img *im, const int *xs, const int *ys, int n,
+                         uint32_t rgba) {
+    if (n < 3) return;
+    int ymin = ys[0], ymax = ys[0];
+    for (int i = 1; i < n; i++) { if (ys[i] < ymin) ymin = ys[i];
+                                  if (ys[i] > ymax) ymax = ys[i]; }
+    if (ymin < 0) ymin = 0;
+    if (ymax >= im->h) ymax = im->h - 1;
+    for (int y = ymin; y <= ymax; y++) {
+        int xi[128], m = 0;
+        for (int i = 0; i < n && m < 128; i++) {
+            int j = (i + 1) % n;
+            int y0 = ys[i], y1 = ys[j], x0 = xs[i], x1 = xs[j];
+            if ((y0 <= y && y1 > y) || (y1 <= y && y0 > y))
+                xi[m++] = x0 + (int)((long)(y - y0) * (x1 - x0) / (y1 - y0));
+        }
+        for (int a = 0; a < m; a++)
+            for (int b = a + 1; b < m; b++)
+                if (xi[b] < xi[a]) { int t = xi[a]; xi[a] = xi[b]; xi[b] = t; }
+        for (int a = 0; a + 1 < m; a += 2) {
+            int xa = xi[a], xb = xi[a + 1];
+            if (xa < 0) xa = 0;
+            if (xb >= im->w) xb = im->w - 1;
+            for (int x = xa; x <= xb; x++) cv_px(im, x, y, rgba);
+        }
+    }
+}
+
+static void cv_text(struct img *im, int x, int y, const char *s,
+                    uint32_t rgba, int px) {
+    if (px < 6) px = 6;
+    int scale = px / 8; if (scale < 1) scale = 1;
+    int top = y - 8 * scale, adv = 8 * scale, cx = x;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c >= 0x20 && c <= 0x7E) {
+            const unsigned char *g = g_font8x8[c - 0x20];
+            for (int ry = 0; ry < 8; ry++) {
+                unsigned char row = g[ry];
+                for (int rx = 0; rx < 8; rx++)
+                    if (row & (1u << rx))
+                        for (int j = 0; j < scale; j++)
+                            for (int i = 0; i < scale; i++)
+                                cv_px(im, cx + rx * scale + i, top + ry * scale + j, rgba);
+            }
+        }
+        cx += adv;
+    }
+}
+
+static uint32_t js_u32(JSContext *cx, JSValueConst v) {
+    uint32_t r = 0; JS_ToUint32(cx, &r, v); return r;
+}
+static int js_i32(JSContext *cx, JSValueConst v) {
+    int32_t r = 0; JS_ToInt32(cx, &r, v); return r;
+}
+
+static JSValue js_cv_fillrect(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 6) return JS_UNDEFINED;
+    struct img *im = canvas_img(jsi(cx, argv[0]));
+    if (im) { cv_fill_rect(im, js_i32(cx, argv[1]), js_i32(cx, argv[2]),
+                           js_i32(cx, argv[3]), js_i32(cx, argv[4]),
+                           js_u32(cx, argv[5])); g_canvas_dirty = 1; }
+    return JS_UNDEFINED;
+}
+static JSValue js_cv_clearrect(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 5) return JS_UNDEFINED;
+    struct img *im = canvas_img(jsi(cx, argv[0]));
+    if (im) { cv_clear_rect(im, js_i32(cx, argv[1]), js_i32(cx, argv[2]),
+                            js_i32(cx, argv[3]), js_i32(cx, argv[4]));
+              g_canvas_dirty = 1; }
+    return JS_UNDEFINED;
+}
+static JSValue js_cv_line(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 7) return JS_UNDEFINED;
+    struct img *im = canvas_img(jsi(cx, argv[0]));
+    if (im) { cv_line(im, js_i32(cx, argv[1]), js_i32(cx, argv[2]),
+                      js_i32(cx, argv[3]), js_i32(cx, argv[4]),
+                      js_u32(cx, argv[5]), js_i32(cx, argv[6])); g_canvas_dirty = 1; }
+    return JS_UNDEFINED;
+}
+static JSValue js_cv_fillpoly(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_UNDEFINED;
+    struct img *im = canvas_img(jsi(cx, argv[0]));
+    if (!im) return JS_UNDEFINED;
+    JSValue arr = argv[1];
+    uint32_t len = 0;
+    JSValue lv = JS_GetPropertyStr(cx, arr, "length");
+    JS_ToUint32(cx, &len, lv); JS_FreeValue(cx, lv);
+    int npt = (int)(len / 2); if (npt > 256) npt = 256;
+    if (npt >= 3) {
+        static int xs[256], ys[256];
+        for (int i = 0; i < npt; i++) {
+            JSValue vx = JS_GetPropertyUint32(cx, arr, (uint32_t)(2 * i));
+            JSValue vy = JS_GetPropertyUint32(cx, arr, (uint32_t)(2 * i + 1));
+            xs[i] = js_i32(cx, vx); ys[i] = js_i32(cx, vy);
+            JS_FreeValue(cx, vx); JS_FreeValue(cx, vy);
+        }
+        cv_fill_poly(im, xs, ys, npt, js_u32(cx, argv[2]));
+        g_canvas_dirty = 1;
+    }
+    return JS_UNDEFINED;
+}
+static JSValue js_cv_text(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 6) return JS_UNDEFINED;
+    struct img *im = canvas_img(jsi(cx, argv[0]));
+    const char *s = JS_ToCString(cx, argv[3]);
+    if (im && s) { cv_text(im, js_i32(cx, argv[1]), js_i32(cx, argv[2]), s,
+                           js_u32(cx, argv[4]), js_i32(cx, argv[5])); g_canvas_dirty = 1; }
+    if (s) JS_FreeCString(cx, s);
+    return JS_UNDEFINED;
+}
+static JSValue js_cv_drawimg(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 6) return JS_UNDEFINED;
+    struct img *im = canvas_img(jsi(cx, argv[0]));
+    int sni = jsi(cx, argv[1]);
+    if (im && sni > 0 && sni < E->nnodes) {
+        int sii = E->nodes[sni].img;
+        if (sii >= 0 && sii < g_nimages) {
+            struct img *s = &g_images[sii];
+            if (s->state == 1 && s->pixels && s->w > 0 && s->h > 0) {
+                int dx = js_i32(cx, argv[2]), dy = js_i32(cx, argv[3]);
+                int dw = js_i32(cx, argv[4]), dh = js_i32(cx, argv[5]);
+                if (dw <= 0) dw = s->w; if (dh <= 0) dh = s->h;
+                for (int j = 0; j < dh; j++) {
+                    int sy = (int)((long)j * s->h / dh); if (sy >= s->h) sy = s->h - 1;
+                    for (int i = 0; i < dw; i++) {
+                        int sx = (int)((long)i * s->w / dw); if (sx >= s->w) sx = s->w - 1;
+                        cv_px(im, dx + i, dy + j, s->pixels[(long)sy * s->w + sx]);
+                    }
+                }
+                g_canvas_dirty = 1;
+            }
+        }
+    }
+    return JS_UNDEFINED;
+}
+static JSValue js_cv_size(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct img *im = (argc >= 1) ? canvas_img(jsi(cx, argv[0])) : NULL;
+    JSValue a = JS_NewArray(cx);
+    JS_SetPropertyUint32(cx, a, 0, JS_NewInt32(cx, im ? im->w : 0));
+    JS_SetPropertyUint32(cx, a, 1, JS_NewInt32(cx, im ? im->h : 0));
+    return a;
+}
+
 static JSValue js_dom_setdispatcher(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t;
     if (argc >= 1 && JS_IsFunction(cx, argv[0])) {
@@ -6513,6 +6767,103 @@ static const char JS_PRELUDE[] =
 "    innerWidth:  { get: function(){ return D.viewport()[2]; } }\n"
 "  });\n"
 "  g.scrollTo = function(){}; g.scrollBy = function(){};\n"
+/* ---- stage 13I: Canvas 2D ---------------------------------------- */
+"  function cvColor(s){\n"
+"    if (typeof s !== 'string') return 0xFF000000;\n"
+"    s = s.trim().toLowerCase();\n"
+"    var named = { black:'#000', white:'#fff', red:'#ff0000', green:'#008000',\n"
+"      blue:'#0000ff', gray:'#808080', grey:'#808080', orange:'#ffa500',\n"
+"      yellow:'#ffff00', purple:'#800080', lime:'#00ff00', navy:'#000080',\n"
+"      teal:'#008080', silver:'#c0c0c0', maroon:'#800000', cyan:'#00ffff',\n"
+"      magenta:'#ff00ff', transparent:'rgba(0,0,0,0)' };\n"
+"    if (named[s]) s = named[s];\n"
+"    if (s.charAt(0) === '#'){\n"
+"      var h = s.slice(1);\n"
+"      if (h.length === 3) h = h.charAt(0)+h.charAt(0)+h.charAt(1)+h.charAt(1)+h.charAt(2)+h.charAt(2);\n"
+"      if (h.length >= 6){\n"
+"        var r=parseInt(h.slice(0,2),16), gg=parseInt(h.slice(2,4),16), b=parseInt(h.slice(4,6),16);\n"
+"        return (0xFF000000 | (r<<16) | (gg<<8) | b) >>> 0;\n"
+"      }\n"
+"    }\n"
+"    if (s.indexOf('rgb') === 0){\n"
+"      var lp=s.indexOf('('), rp=s.indexOf(')');\n"
+"      var p=s.slice(lp+1, rp).split(',');\n"
+"      var cr=parseInt(p[0])|0, cg=parseInt(p[1])|0, cb=parseInt(p[2])|0;\n"
+"      var a=p.length>3 ? Math.round(parseFloat(p[3])*255) : 255;\n"
+"      return ((a<<24)|(cr<<16)|(cg<<8)|cb) >>> 0;\n"
+"    }\n"
+"    return 0xFF000000;\n"
+"  }\n"
+"  function makeCtx(node){\n"
+"    var i = node.__i;\n"
+"    var ctx = {\n"
+"      canvas: node, fillStyle:'#000000', strokeStyle:'#000000',\n"
+"      lineWidth:1, font:'10px sans-serif', textAlign:'left', globalAlpha:1,\n"
+"      __p: [],\n"
+"      fillRect: function(x,y,w,h){ D.cvFillRect(i,x|0,y|0,w|0,h|0,cvColor(this.fillStyle)); },\n"
+"      clearRect: function(x,y,w,h){ D.cvClearRect(i,x|0,y|0,w|0,h|0); },\n"
+"      strokeRect: function(x,y,w,h){\n"
+"        var c=cvColor(this.strokeStyle), lw=(this.lineWidth|0)||1;\n"
+"        D.cvLine(i,x|0,y|0,(x+w)|0,y|0,c,lw); D.cvLine(i,(x+w)|0,y|0,(x+w)|0,(y+h)|0,c,lw);\n"
+"        D.cvLine(i,(x+w)|0,(y+h)|0,x|0,(y+h)|0,c,lw); D.cvLine(i,x|0,(y+h)|0,x|0,y|0,c,lw);\n"
+"      },\n"
+"      beginPath: function(){ this.__p = []; },\n"
+"      moveTo: function(x,y){ this.__p.push([0,x,y]); },\n"
+"      lineTo: function(x,y){ this.__p.push([1,x,y]); },\n"
+"      closePath: function(){ this.__p.push([2]); },\n"
+"      rect: function(x,y,w,h){ this.moveTo(x,y); this.lineTo(x+w,y);\n"
+"        this.lineTo(x+w,y+h); this.lineTo(x,y+h); this.closePath(); },\n"
+"      arc: function(cx,cy,r,a0,a1){\n"
+"        var steps=Math.max(10, Math.floor(r));\n"
+"        for (var k=0;k<=steps;k++){ var a=a0+(a1-a0)*k/steps;\n"
+"          var x=cx+r*Math.cos(a), y=cy+r*Math.sin(a);\n"
+"          this.__p.push([k===0?0:1, x, y]); }\n"
+"      },\n"
+"      stroke: function(){\n"
+"        var c=cvColor(this.strokeStyle), lw=(this.lineWidth|0)||1;\n"
+"        var px=0, py=0, fx=0, fy=0, have=false;\n"
+"        for (var k=0;k<this.__p.length;k++){ var s=this.__p[k];\n"
+"          if (s[0]===0){ px=s[1]; py=s[2]; fx=px; fy=py; have=true; }\n"
+"          else if (s[0]===1){ D.cvLine(i,px|0,py|0,s[1]|0,s[2]|0,c,lw); px=s[1]; py=s[2]; }\n"
+"          else if (s[0]===2 && have){ D.cvLine(i,px|0,py|0,fx|0,fy|0,c,lw); px=fx; py=fy; } }\n"
+"      },\n"
+"      fill: function(){\n"
+"        var pts=[];\n"
+"        for (var k=0;k<this.__p.length;k++){ var s=this.__p[k];\n"
+"          if (s[0]===0||s[0]===1){ pts.push(s[1]|0); pts.push(s[2]|0); } }\n"
+"        if (pts.length>=6) D.cvFillPoly(i, pts, cvColor(this.fillStyle));\n"
+"      },\n"
+"      fillText: function(s,x,y){ var px=parseInt(this.font)||12;\n"
+"        D.cvText(i,x|0,y|0,String(s),cvColor(this.fillStyle),px); },\n"
+"      strokeText: function(s,x,y){ this.fillText(s,x,y); },\n"
+"      measureText: function(s){ var px=parseInt(this.font)||12;\n"
+"        return { width: String(s).length * (px|0) }; },\n"
+"      drawImage: function(img,dx,dy,dw,dh){\n"
+"        if (img && img.__i !== undefined)\n"
+"          D.cvDrawImg(i, img.__i, dx|0, dy|0, (dw||0)|0, (dh||0)|0); },\n"
+"      createLinearGradient: function(){ var self=this;\n"
+"        return { __c:'#888', addColorStop:function(o,c){ this.__c=c; } }; },\n"
+"      save: function(){}, restore: function(){}, translate: function(){},\n"
+"      scale: function(){}, rotate: function(){}, setTransform: function(){},\n"
+"      setLineDash: function(){}, clip: function(){}\n"
+"    };\n"
+"    return ctx;\n"
+"  }\n"
+"  Element.prototype.getContext = function(type){\n"
+"    if (String(type) !== '2d') return null;\n"
+"    if (!this.__ctx) this.__ctx = makeCtx(this);\n"
+"    return this.__ctx;\n"
+"  };\n"
+"  Object.defineProperties(Element.prototype, {\n"
+"    width: { get: function(){ var s=D.cvSize(this.__i);\n"
+"        if (s[0]) return s[0];\n"
+"        var a=D.getAttr(this.__i,'width'); return a?(parseInt(a)||0):0; },\n"
+"      set: function(v){ D.setAttr(this.__i,'width',String(v|0)); } },\n"
+"    height: { get: function(){ var s=D.cvSize(this.__i);\n"
+"        if (s[1]) return s[1];\n"
+"        var a=D.getAttr(this.__i,'height'); return a?(parseInt(a)||0):0; },\n"
+"      set: function(v){ D.setAttr(this.__i,'height',String(v|0)); } }\n"
+"  });\n"
 /* ---- stage 13F: Mutation / Intersection / Resize observers -------- */
 "  var mutObservers = [], interObservers = [], resizeObservers = [];\n"
 "  function isDescendant(node, anc){\n"
@@ -6716,6 +7067,13 @@ static int js_ensure(void) {
             {"takeMutations", js_dom_take_mut, 0},
             {"setObsCheck", js_dom_set_obscheck, 1},
             {"obsKick", js_dom_obskick, 0},
+            {"cvFillRect", js_cv_fillrect, 6},
+            {"cvClearRect", js_cv_clearrect, 5},
+            {"cvLine", js_cv_line, 7},
+            {"cvFillPoly", js_cv_fillpoly, 3},
+            {"cvText", js_cv_text, 6},
+            {"cvDrawImg", js_cv_drawimg, 6},
+            {"cvSize", js_cv_size, 1},
         };
         for (unsigned k = 0; k < sizeof(B) / sizeof(B[0]); k++)
             JS_SetPropertyStr(cx, dom, B[k].n,
@@ -6855,6 +7213,10 @@ static int js_dispatch_key(int node, const char *type, const char *key) {
         g_js_dirty = 0;
         js_rerender();
     }
+    if (g_canvas_dirty && !g_js_in_load) {
+        g_canvas_dirty = 0;
+        tk_redraw(&win);                  /* canvas draw from an event handler */
+    }
     return prevented;
 }
 
@@ -6968,6 +7330,13 @@ static int js_pump_all(void) {
         if (g_js_dirty) {
             g_js_dirty = 0;
             js_rerender();
+            tk_redraw(&win);
+            work = 1;
+        }
+        /* stage 13I: canvas draws don't touch the DOM/layout -- just
+         * repaint so the updated backing store shows (timers / rAF). */
+        if (g_canvas_dirty) {
+            g_canvas_dirty = 0;
             tk_redraw(&win);
             work = 1;
         }
