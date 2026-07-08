@@ -39,6 +39,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/puff.h>
+#include <tobyos/brotli.h>
 #include <tobyos/pit.h>
 
 /* Transport abstraction: either raw TCP or TLS-wrapped TCP. */
@@ -355,7 +356,7 @@ static long build_request(const struct http_url *u, char *buf, size_t cap,
     APPEND_LIT("Mozilla/5.0 (compatible; tobyOS 1.0; x86_64) tobyOS-Browser/3.0");
     APPEND_LIT("\r\nAccept: */*");
     if (flags & HTTP_F_GZIP)
-        APPEND_LIT("\r\nAccept-Encoding: gzip");
+        APPEND_LIT("\r\nAccept-Encoding: gzip, br");
     if (cookie_hdr && cookie_hdr[0]) {
         APPEND_LIT("\r\nCookie: ");
         APPEND_STR(cookie_hdr);
@@ -494,10 +495,19 @@ static int parse_headers(const char *base, size_t len,
             memcpy(out->location, base + v_off, cl);
             out->location[cl] = 0;
         } else if (colon == 16 && ascii_strncasecmp(base, "Content-Encoding", 16) == 0) {
-            for (size_t i = 0; i + 3 < v_len; i++)
-                if (ascii_strncasecmp(base + v_off + i, "gzip", 4) == 0) {
+            /* One transfer content-encoding (values are from a tiny closed
+             * set -- gzip/deflate/br/identity -- so a loose substring scan
+             * never false-matches). gzip checked first. */
+            for (size_t i = 0; i < v_len; i++) {
+                if (i + 4 <= v_len &&
+                    ascii_strncasecmp(base + v_off + i, "gzip", 4) == 0) {
                     out->encoding = HTTP_ENC_GZIP; break;
                 }
+                if (i + 2 <= v_len &&
+                    ascii_strncasecmp(base + v_off + i, "br", 2) == 0) {
+                    out->encoding = HTTP_ENC_BR; break;
+                }
+            }
         } else if (colon == 10 && ascii_strncasecmp(base, "Connection", 10) == 0) {
             for (size_t i = 0; i + 4 < v_len; i++)
                 if (ascii_strncasecmp(base + v_off + i, "close", 5) == 0) {
@@ -1183,25 +1193,39 @@ int http_get_opt(const char *url,
     kfree(buf);
     transport_close(&tr);              /* no-op when parked */
 
-    /* Inflate a gzip body kernel-side (transparent to the caller): the
-     * compressed body was read up to read_cap; decompress into a buffer
-     * capped at max_body_bytes, so the caller still sees at most its
-     * requested (decompressed) size. On failure keep the raw body. */
-    if (out->encoding == HTTP_ENC_GZIP && body_len > 0) {
+    /* Decompress a gzip or brotli body kernel-side (transparent to the
+     * caller): the compressed body was read up to read_cap; decompress
+     * into a buffer capped at max_body_bytes, so the caller still sees at
+     * most its requested (decompressed) size. On failure keep the raw
+     * body. Brotli (RFC 7932) is now more common than gzip on CDNs. */
+    if ((out->encoding == HTTP_ENC_GZIP || out->encoding == HTTP_ENC_BR) &&
+        body_len > 0) {
         unsigned long dlen = max_body_bytes;
         uint8_t *dbody = (uint8_t *)kmalloc(dlen > 0 ? dlen : 1);
         if (dbody) {
-            int pr = puff_gzip(dbody, &dlen, body, body_len);
-            if (pr == PUFF_OK || pr == PUFF_TRUNC) {
-                kprintf("[http] gunzip %lu -> %lu%s\n",
+            int ok, trunc;
+            const char *alg;
+            if (out->encoding == HTTP_ENC_BR) {
+                int pr = brotli_decompress(dbody, &dlen, body, body_len);
+                ok = (pr == BROTLI_OK || pr == BROTLI_TRUNC);
+                trunc = (pr == BROTLI_TRUNC);
+                alg = "unbrotli";
+            } else {
+                int pr = puff_gzip(dbody, &dlen, body, body_len);
+                ok = (pr == PUFF_OK || pr == PUFF_TRUNC);
+                trunc = (pr == PUFF_TRUNC);
+                alg = "gunzip";
+            }
+            if (ok) {
+                kprintf("[http] %s %lu -> %lu%s\n", alg,
                         (unsigned long)body_len, dlen,
-                        pr == PUFF_TRUNC ? " (truncated)" : "");
+                        trunc ? " (truncated)" : "");
                 kfree(body);
                 body = dbody; body_len = dlen;
                 out->encoding = HTTP_ENC_IDENTITY;
                 out->content_len = (long)dlen;
             } else {
-                kprintf("[http] gunzip FAILED (%d) -- keeping raw body\n", pr);
+                kprintf("[http] %s FAILED -- keeping raw body\n", alg);
                 kfree(dbody);
             }
         }

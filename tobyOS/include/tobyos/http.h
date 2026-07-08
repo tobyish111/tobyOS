@@ -88,6 +88,7 @@ struct http_response {
  * capability and reports what came back). */
 #define HTTP_ENC_IDENTITY 0
 #define HTTP_ENC_GZIP     1
+#define HTTP_ENC_BR       2   /* Content-Encoding: br (RFC 7932 brotli) */
 
 /* http_get_opt() flags. */
 #define HTTP_F_TRUNCATE  0x1u  /* body > max_body_bytes: stop reading at the

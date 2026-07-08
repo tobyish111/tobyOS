@@ -178,6 +178,7 @@ C_SRCS := src/kernel.c \
           src/http.c \
           src/http_async.c \
           src/puff.c \
+          src/brotli.c \
           src/socket.c \
           src/gfx.c \
           src/mouse.c \
@@ -597,6 +598,18 @@ src/kfont.o: src/kfont.c $(HEADERS) third_party/stb_truetype.h Makefile
 src/kmath.o: src/kmath.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -msse -msse2 -fno-math-errno \
 	      -Wno-unused-function -c $< -o $@
+
+# stage 13G: src/brotli.c amalgamates the vendored brotli v1.0.9 decoder
+# (third_party/brotli). It needs the brotli public headers (<brotli/...>)
+# and the freestanding <string.h>/<stdlib.h> shims on its include path.
+# The shim dir comes FIRST so its string.h/stdlib.h win over any hosted
+# headers. -Wno-* silence the vendored reference under -Wall -Wextra.
+BROTLI_INC := -Ithird_party/brotli/shim -Ithird_party/brotli/include
+src/brotli.o: src/brotli.c $(HEADERS) $(wildcard third_party/brotli/*/*.c) \
+              $(wildcard third_party/brotli/*/*.h) Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $(BROTLI_INC) \
+	      -Wno-unused-function -Wno-sign-compare -Wno-unused-parameter \
+	      -Wno-cast-align -c $< -o $@
 
 src/%.o: src/%.S $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
