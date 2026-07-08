@@ -138,7 +138,7 @@ long sys_tls_user_connect(uint32_t ip_be, uint16_t port_be, const char *hostname
     if (slot < 0) return -11;
 
     int err = 0;
-    struct tls_conn *tc = tls_connect(ip_be, port_be, hostname, 10000, &err);
+    struct tls_conn *tc = tls_connect(ip_be, port_be, hostname, 10000, 0, &err);
     if (!tc) {
         g_uconns[slot].type = CONN_NONE;
         return -5;

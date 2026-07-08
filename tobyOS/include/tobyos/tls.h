@@ -39,10 +39,16 @@ struct tls_conn;
 #define TLS_ERR_VERSION     -9   /* unsupported protocol version */
 
 /* Connect to a TLS server. Performs TCP connect + TLS 1.3 handshake.
+ * When offer_h2 is nonzero the ClientHello advertises ALPN
+ * ["h2","http/1.1"]; query the result with tls_alpn() (stage 13G).
  * Returns a tls_conn on success, NULL on failure (check *out_err). */
 struct tls_conn *tls_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
                              const char *hostname,
-                             uint32_t timeout_ms, int *out_err);
+                             uint32_t timeout_ms, int offer_h2, int *out_err);
+
+/* The ALPN protocol the server selected ("h2", "http/1.1"), or "" if
+ * none was offered/selected. Valid after a successful tls_connect. */
+const char *tls_alpn(struct tls_conn *c);
 
 /* Send application data. Returns bytes sent or negative error. */
 long tls_send(struct tls_conn *c, const void *buf, size_t len);

@@ -40,6 +40,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/puff.h>
 #include <tobyos/brotli.h>
+#include <tobyos/http2.h>
 #include <tobyos/pit.h>
 
 /* Transport abstraction: either raw TCP or TLS-wrapped TCP. */
@@ -897,6 +898,7 @@ int http_get_opt(const char *url,
     if (!buf) return HTTP_ERR_NOMEM;
     size_t buf_used = 0, header_end = 0;
     bool   peer_fin = false;
+    int    force_h1 = 0;               /* set after an h2 fetch falls back */
 
     for (int attempt = 0; ; attempt++) {
         buf_used = 0; header_end = 0; peer_fin = false;
@@ -924,13 +926,29 @@ int http_get_opt(const char *url,
             }
             if (u.tls) {
                 int tls_err;
+                int want_h2 = !force_h1;
                 tr.tls = tls_connect(ip_be, htons(u.port), u.host,
-                                     timeout_ms, &tls_err);
+                                     timeout_ms, want_h2, &tls_err);
                 if (!tr.tls) {
                     kprintf("[http] TLS connect to %s:%u failed: %s\n",
                             u.host, u.port, tls_strerror(tls_err));
                     kfree(buf);
                     return HTTP_ERR_CONNECT;
+                }
+                /* stage 13G: if the server chose HTTP/2 over ALPN, run the
+                 * whole request there and return. On any h2 failure, fall
+                 * back to a fresh HTTP/1.1 connection (GET is idempotent),
+                 * so the proven h1 path always remains the safety net. */
+                if (want_h2 && strcmp(tls_alpn(tr.tls), "h2") == 0) {
+                    int h2rc = http2_fetch(tr.tls, &u, flags, read_cap,
+                                           timeout_ms, out);
+                    tls_close(tr.tls);
+                    tr.tls = NULL;
+                    if (h2rc == 0) { kfree(buf); return 0; }
+                    kprintf("[http] h2 fetch failed (%d) -- retry over h1.1\n",
+                            h2rc);
+                    force_h1 = 1;
+                    continue;
                 }
             } else {
                 tr.tcp = tcp_connect(ip_be, htons(u.port), 3000);

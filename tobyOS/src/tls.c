@@ -50,6 +50,7 @@ static void random_bytes(uint8_t *buf, size_t n) {
 #define TLS_EXT_SNI                 0x0000
 #define TLS_EXT_SUPPORTED_GROUPS    0x000A
 #define TLS_EXT_SIGNATURE_ALGOS     0x000D
+#define TLS_EXT_ALPN                0x0010
 #define TLS_EXT_SUPPORTED_VERSIONS  0x002B
 #define TLS_EXT_KEY_SHARE           0x0033
 
@@ -82,6 +83,12 @@ struct tls_conn {
     /* State flags */
     int handshake_done;
     int closed;
+
+    /* ALPN (stage 13G): offer_h2 advertises ["h2","http/1.1"] in the
+     * ClientHello; alpn holds what the server selected in
+     * EncryptedExtensions ("" if none / not offered). */
+    int  offer_h2;
+    char alpn[16];
 
     /* Receive buffer for partial records */
     uint8_t  rx_buf[TLS_MAX_RECORD + 5];
@@ -400,7 +407,8 @@ static int tls_decrypt_record(struct tls_conn *c, uint8_t *data, size_t len,
 static size_t build_client_hello(uint8_t *buf, size_t cap,
                                  const uint8_t client_random[32],
                                  const uint8_t pubkey[32],
-                                 const char *hostname) {
+                                 const char *hostname,
+                                 int offer_h2) {
     size_t pos = 0;
     size_t hostname_len = 0;
     if (hostname) while (hostname[hostname_len]) hostname_len++;
@@ -483,6 +491,18 @@ static size_t build_client_hello(uint8_t *buf, size_t cap,
         buf[pos++] = 0;  /* host_name type */
         put_u16(buf + pos, (uint16_t)hostname_len); pos += 2;
         memcpy(buf + pos, hostname, hostname_len); pos += hostname_len;
+    }
+
+    /* Extension: ALPN (RFC 7301) -- advertise HTTP/2 then HTTP/1.1 so the
+     * server can pick h2. Only when the caller can speak h2 (offer_h2);
+     * otherwise the byte layout is identical to the proven h1.1 path. */
+    if (offer_h2) {
+        put_u16(buf + pos, TLS_EXT_ALPN); pos += 2;
+        put_u16(buf + pos, 14); pos += 2;   /* ext data length */
+        put_u16(buf + pos, 12); pos += 2;   /* ProtocolNameList length */
+        buf[pos++] = 2; buf[pos++] = 'h'; buf[pos++] = '2';
+        buf[pos++] = 8;
+        memcpy(buf + pos, "http/1.1", 8); pos += 8;
     }
 
     /* Patch extensions length */
@@ -653,7 +673,8 @@ static int tls_do_handshake(struct tls_conn *c, const char *hostname) {
     /* Build ClientHello */
     uint8_t ch_buf[512];
     size_t ch_len = build_client_hello(ch_buf, sizeof(ch_buf),
-                                       client_random, public_key, hostname);
+                                       client_random, public_key, hostname,
+                                       c->offer_h2);
 
     /* Initialize transcript with ClientHello */
     sha256_init(&c->transcript);
@@ -822,6 +843,35 @@ static int tls_do_handshake(struct tls_conn *c, const char *hostname) {
                 sha256_update(&c->transcript, plain + mpos, 4 + hs_len);
             }
 
+            /* EncryptedExtensions: pull out the server's ALPN choice.
+             * Body is a 2-byte extensions_length then ext(type,len,data);
+             * ALPN data is a 2-byte name-list length, then len-prefixed
+             * protocol strings (the server returns exactly one). */
+            if (hs_type == TLS_HS_ENCRYPTED_EXT && c->offer_h2) {
+                const uint8_t *ee = plain + mpos + 4;
+                if (hs_len >= 2) {
+                    size_t elist = get_u16(ee);
+                    size_t ep = 2, eend = 2 + elist;
+                    if (eend > hs_len) eend = hs_len;
+                    while (ep + 4 <= eend) {
+                        uint16_t et = (uint16_t)get_u16(ee + ep);
+                        uint16_t edl = (uint16_t)get_u16(ee + ep + 2);
+                        const uint8_t *ed = ee + ep + 4;
+                        if (ep + 4 + edl > eend) break;
+                        if (et == TLS_EXT_ALPN && edl >= 3) {
+                            size_t nlen = ed[2];   /* first (only) protocol */
+                            if (nlen > 0 && nlen < sizeof(c->alpn) &&
+                                3 + nlen <= edl) {
+                                memcpy(c->alpn, ed + 3, nlen);
+                                c->alpn[nlen] = 0;
+                                kprintf("[tls] ALPN selected: %s\n", c->alpn);
+                            }
+                        }
+                        ep += 4 + edl;
+                    }
+                }
+            }
+
             if (hs_type == TLS_HS_FINISHED) {
                 /* Verify server Finished */
                 uint8_t transcript_before_sf[32];
@@ -922,7 +972,7 @@ static int tls_do_handshake(struct tls_conn *c, const char *hostname) {
 
 struct tls_conn *tls_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
                              const char *hostname,
-                             uint32_t timeout_ms, int *out_err) {
+                             uint32_t timeout_ms, int offer_h2, int *out_err) {
     struct tcp_conn *tcp = tcp_connect(dst_ip_be, dst_port_be, timeout_ms);
     if (!tcp) {
         if (out_err) *out_err = TLS_ERR_CONNECT;
@@ -937,6 +987,7 @@ struct tls_conn *tls_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
     }
     memset(c, 0, sizeof(*c));
     c->tcp = tcp;
+    c->offer_h2 = offer_h2;
     c->timeout_ms = timeout_ms ? timeout_ms : 5000;
 
     int rc = tls_do_handshake(c, hostname);
@@ -1045,6 +1096,10 @@ long tls_recv(struct tls_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
 
         kfree(plain);
     }
+}
+
+const char *tls_alpn(struct tls_conn *c) {
+    return c ? c->alpn : "";
 }
 
 void tls_close(struct tls_conn *c) {

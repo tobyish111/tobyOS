@@ -1,15 +1,9 @@
-# Browser stage 13G — brotli decode (Content-Encoding: br)
+# Browser stage 13G — brotli decode + HTTP/2
 
-Branch `browser-brotli-h2`, stacked on `browser-observers` (13F). This is
-a **kernel-side transport** feature: it makes `Content-Encoding: br`
-bodies decode transparently, exactly like the existing gzip path. Brotli
-is now more common than gzip on CDNs (Cloudflare, Google, and most of the
-modern web serve `br` by default), so before this a large fraction of
-real responses arrived as unusable binary.
-
-The branch is named `-h2` because the tier pairs brotli with HTTP/2;
-**HTTP/2 is deferred to a follow-up** (see "Remaining" below). Brotli
-went first, as planned.
+Branch `browser-brotli-h2`, stacked on `browser-observers` (13F). Two
+**kernel-side transport** features: brotli `Content-Encoding: br` decode,
+and an HTTP/2 client (ALPN over TLS + HPACK). Both are transparent to the
+browser — the render engine is unchanged.
 
 ## What shipped
 - A real brotli (RFC 7932) decoder, kernel-side, via the **vendored
@@ -67,15 +61,38 @@ went first, as planned.
   Internet" hero headline, "Region: Earth"). Before this the same
   responses were unusable binary.
 
-## Remaining in 13G — HTTP/2
-`src/http2.c` is a 620-line stub: frame layer (SETTINGS / WINDOW_UPDATE /
-PING / DATA / HEADERS / GOAWAY / RST_STREAM), a *simplified* HPACK
-decoder (static table only — no Huffman, no dynamic table), and
-`http2_connect`/stream bookkeeping. To make it usable on the real web it
-needs: (1) **ALPN over TLS** — advertise `h2`, detect the server's
-selection, and route the fetch to h2 when chosen (real servers do not do
-cleartext h2c); (2) **full HPACK** — Huffman string decode + the dynamic
-table, so response headers (content-type/length/encoding) are actually
-read, not skipped; (3) DATA-frame body reassembly wired into
-`http_get_opt`/the async worker; (4) flow-control windows. This is the
-harder half and a session of its own.
+## HTTP/2 (the tier's other half)
+Nearly every major site is h2 (though they all fall back to h1.1, so this
+is a completeness/perf feature, not a blocker). Implemented as a
+self-contained single-request client with a bulletproof h1.1 fallback:
+
+- **ALPN over TLS** (`src/tls.c`): `tls_connect(..., offer_h2, ...)`
+  advertises ALPN `["h2","http/1.1"]` in the ClientHello (RFC 7301) only
+  when the caller can speak h2 — so the proven h1.1 ClientHello is
+  byte-identical when `offer_h2` is 0. The server's choice is parsed out
+  of EncryptedExtensions and exposed via `tls_alpn()`.
+- **`src/http2.c`** (rewritten): over an h2-selected TLS conn it sends the
+  connection preface + SETTINGS (push off, large initial window) + a big
+  connection WINDOW_UPDATE, then one HEADERS request on stream 1, and
+  reassembles the HEADERS(+CONTINUATION)/DATA response into a
+  `struct http_response`. **HPACK is complete**: static table, dynamic
+  table (insert / evict / size-update), and the RFC 7541 Huffman code
+  (table generated from the RFC, `src/hpack_huff_table.h`). Bodies are
+  gzip/brotli-decompressed here so the result matches the h1 path.
+- **`src/http.c`**: on a fresh HTTPS connect it offers h2; if the server
+  selected `h2` it runs `http2_fetch()` and returns. On **any** h2 failure
+  it sets a flag and re-enters the loop for a fresh HTTP/1.1 connection
+  (GET is idempotent) — so h1.1 is always the safety net and existing
+  sites can never regress. h2 connections are not parked in the h1
+  keep-alive cache (v1).
+
+Verified in QEMU: `https://www.google.com` and `https://http2.golang.org`
+render fully — serial shows `[tls] ALPN selected: h2`, HPACK-decoded
+headers (`[h2] 200; type="text/html; charset=UTF-8"`), gzip bodies
+decompressed (`[h2] gunzip 30099 -> 85323`), CSS/PNG assets over h2, and a
+302 redirect. The h1.1 path is unregressed (local plain-http still serves
+`[http] unbrotli 743 -> 1881`, no h2 markers).
+
+v1 limits: one request per h2 connection (no multiplexing / reuse), no
+server push (disabled + ignored), no h2 cookie-jar integration, no
+trailers.
