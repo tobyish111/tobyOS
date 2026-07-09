@@ -35,18 +35,35 @@
 #define STBI_ONLY_TGA
 #include "../../third_party/stb_image.h"
 
+/* WebP (stage 13): the vendored libwebp v1.4.0 decoder handles what
+ * stb_image can't -- lossy VP8, lossless VP8L, and alpha. */
+#include "../../third_party/libwebp/src/webp/decode.h"
+
+static int webp_sniff(const uint8_t *d, size_t n) {
+    return n >= 12 &&
+           d[0] == 'R' && d[1] == 'I' && d[2] == 'F' && d[3] == 'F' &&
+           d[8] == 'W' && d[9] == 'E' && d[10] == 'B' && d[11] == 'P';
+}
+
 toby_image_t *toby_image_load(const uint8_t *data, size_t len) {
     if (!data || len == 0) return NULL;
 
     int w, h, channels;
+    unsigned char *rgba = NULL;
+    int from_webp = 0;
+    if (webp_sniff(data, len)) {
+        rgba = WebPDecodeRGBA(data, len, &w, &h);
+        from_webp = (rgba != NULL);
+    }
     /* Request 4 channels (RGBA). */
-    unsigned char *rgba = stbi_load_from_memory(data, (int)len,
-                                                 &w, &h, &channels, 4);
+    if (!rgba)
+        rgba = stbi_load_from_memory(data, (int)len,
+                                     &w, &h, &channels, 4);
     if (!rgba) return NULL;
 
     toby_image_t *img = (toby_image_t *)malloc(sizeof(toby_image_t));
     if (!img) {
-        stbi_image_free(rgba);
+        if (from_webp) WebPFree(rgba); else stbi_image_free(rgba);
         return NULL;
     }
 
@@ -54,7 +71,7 @@ toby_image_t *toby_image_load(const uint8_t *data, size_t len) {
     img->height = h;
     img->pixels = (uint32_t *)malloc((size_t)w * (size_t)h * 4);
     if (!img->pixels) {
-        stbi_image_free(rgba);
+        if (from_webp) WebPFree(rgba); else stbi_image_free(rgba);
         free(img);
         return NULL;
     }
@@ -72,7 +89,7 @@ toby_image_t *toby_image_load(const uint8_t *data, size_t len) {
                           ((uint32_t)b);
     }
 
-    stbi_image_free(rgba);
+    if (from_webp) WebPFree(rgba); else stbi_image_free(rgba);
     return img;
 }
 

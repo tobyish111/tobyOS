@@ -928,6 +928,28 @@ $(LIBTOBY_SRC)/font.o: $(LIBTOBY_SRC)/font.c
 $(LIBTOBY_SRC)/image.o: $(LIBTOBY_SRC)/image.c
 	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -Wno-unused-function -Wno-sign-compare -c $< -o $@
 
+# WebP decode (stage 13 beyond-tier): the vendored libwebp v1.4.0
+# decode-only subset (src/dec + the decode-side src/dsp + src/utils),
+# compiled into libtoby so toby_image_load() decodes RIFF/WEBP like any
+# other format. The include path is rooted at the package dir (libwebp
+# uses "src/..."-rooted includes). SSE2 on, like stb_image's rule; the
+# *_sse41 variants compile to empty TUs without -msse4.1 and the
+# runtime dispatch never selects them. -w: vendored reference code
+# under -Wall -Wextra. WEBP_USE_THREAD stays undefined (sequential).
+LIBWEBP_DIR  := third_party/libwebp
+LIBWEBP_SRCS := $(wildcard $(LIBWEBP_DIR)/src/dec/*.c) \
+                $(wildcard $(LIBWEBP_DIR)/src/dsp/*.c) \
+                $(wildcard $(LIBWEBP_DIR)/src/utils/*.c)
+LIBWEBP_OBJS     := $(LIBWEBP_SRCS:.c=.o)
+LIBWEBP_PIC_OBJS := $(LIBWEBP_SRCS:.c=.pic.o)
+LIBTOBY_OBJS += $(LIBWEBP_OBJS)
+
+$(LIBWEBP_DIR)/%.o: $(LIBWEBP_DIR)/%.c Makefile
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -I $(LIBWEBP_DIR) -w -c $< -o $@
+
+$(LIBWEBP_DIR)/%.pic.o: $(LIBWEBP_DIR)/%.c Makefile
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -I $(LIBWEBP_DIR) -w -c $< -o $@
+
 $(LIBTOBY_CRT0): $(LIBTOBY_SRC)/crt0.S
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -966,6 +988,7 @@ LIBTOBY_SO          := $(LIBTOBY_DIR)/libtoby.so
 LIBTOBY_PIC_OBJS    := $(LIBTOBY_C_SRCS:.c=.pic.o)
 LIBTOBY_ASM_PIC_OBJS := $(LIBTOBY_ASM_SRCS:.S=.pic.o)
 LIBTOBY_PIC_OBJS    += $(LIBTOBY_ASM_PIC_OBJS)
+LIBTOBY_PIC_OBJS    += $(LIBWEBP_PIC_OBJS)
 LIBTOBY_PIC_CFLAGS  := $(LIBTOBY_BUILD_CFLAGS) -fPIC
 
 $(LIBTOBY_SRC)/%.pic.o: $(LIBTOBY_SRC)/%.c
