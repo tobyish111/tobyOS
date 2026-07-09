@@ -80,6 +80,11 @@ struct tcp_conn *tcp_accept(struct tcp_conn *listener, uint32_t timeout_ms);
 long tcp_send(struct tcp_conn *c, const void *buf, size_t len);
 long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms);
 void tcp_close(struct tcp_conn *c);
+/* Abortive close: send RST and free immediately -- no graceful FIN
+ * exchange, no TIME_WAIT linger. For tearing down a handshake rejected
+ * mid-flight (e.g. TLS cert validation) without the active-closer
+ * TIME_WAIT block that tcp_close would incur (stage 13H). */
+void tcp_abort(struct tcp_conn *c);
 void tcp_dump(void);
 /* Toggle per-segment rx trace lines (default off -- they saturate a
  * 38400-baud serial link during any large download). */

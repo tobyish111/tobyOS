@@ -818,6 +818,7 @@ static const char *err_strs[] = {
     [-HTTP_ERR_TIMEOUT]  = "timed out",
     [-HTTP_ERR_NOMEM]    = "out of memory",
     [-HTTP_ERR_RESET]    = "connection reset by peer",
+    [-HTTP_ERR_CERT]     = "TLS certificate validation failed",
 };
 
 const char *http_strerror(int err) {
@@ -933,7 +934,10 @@ int http_get_opt(const char *url,
                     kprintf("[http] TLS connect to %s:%u failed: %s\n",
                             u.host, u.port, tls_strerror(tls_err));
                     kfree(buf);
-                    return HTTP_ERR_CONNECT;
+                    /* stage 13H: a cert failure is a distinct, non-transient
+                     * error -- surface it so the browser can name it. */
+                    return (tls_err == TLS_ERR_CERT) ? HTTP_ERR_CERT
+                                                     : HTTP_ERR_CONNECT;
                 }
                 /* stage 13G: if the server chose HTTP/2 over ALPN, run the
                  * whole request there and return. On any h2 failure, fall

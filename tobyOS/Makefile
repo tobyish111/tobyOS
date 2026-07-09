@@ -217,6 +217,7 @@ C_SRCS := src/kernel.c \
           src/hwdb.c \
           src/m35selftest.c \
           src/tls.c \
+          src/tls_trust.c \
           src/procfs.c \
           src/tty.c \
           src/pty.c \
@@ -289,7 +290,68 @@ S_SRCS := src/isr_stubs.S \
           src/ap_trampoline.S \
           src/proc_switch.S
 
-OBJS := $(C_SRCS:.c=.o) $(S_SRCS:.S=.o)
+# stage 13H: BearSSL X.509 chain validation (RSA + ECDSA) for TLS cert
+# verification. The decode/verify-only subset of the vendored reference
+# (third_party/bearssl); trust anchors live in src/tls_trust.c.
+BEARSSL_SRCS := \
+          third_party/bearssl/src/codec/ccopy.c \
+          third_party/bearssl/src/codec/dec16be.c \
+          third_party/bearssl/src/codec/dec32be.c \
+          third_party/bearssl/src/codec/dec32le.c \
+          third_party/bearssl/src/codec/dec64be.c \
+          third_party/bearssl/src/codec/enc16be.c \
+          third_party/bearssl/src/codec/enc32be.c \
+          third_party/bearssl/src/codec/enc32le.c \
+          third_party/bearssl/src/codec/enc64be.c \
+          third_party/bearssl/src/codec/pemdec.c \
+          third_party/bearssl/src/hash/dig_oid.c \
+          third_party/bearssl/src/hash/dig_size.c \
+          third_party/bearssl/src/hash/md5.c \
+          third_party/bearssl/src/hash/multihash.c \
+          third_party/bearssl/src/hash/sha1.c \
+          third_party/bearssl/src/hash/sha2big.c \
+          third_party/bearssl/src/hash/sha2small.c \
+          third_party/bearssl/src/hash/ghash_ctmul.c \
+          third_party/bearssl/src/hash/mgf1.c \
+          third_party/bearssl/src/ec/ec_prime_i31.c \
+          third_party/bearssl/src/ec/ec_secp256r1.c \
+          third_party/bearssl/src/ec/ec_secp384r1.c \
+          third_party/bearssl/src/ec/ec_secp521r1.c \
+          third_party/bearssl/src/ec/ecdsa_atr.c \
+          third_party/bearssl/src/ec/ecdsa_i31_bits.c \
+          third_party/bearssl/src/ec/ecdsa_i31_vrfy_asn1.c \
+          third_party/bearssl/src/ec/ecdsa_i31_vrfy_raw.c \
+          third_party/bearssl/src/rsa/rsa_i31_pkcs1_vrfy.c \
+          third_party/bearssl/src/rsa/rsa_i31_pss_vrfy.c \
+          third_party/bearssl/src/rsa/rsa_i31_pub.c \
+          third_party/bearssl/src/rsa/rsa_pkcs1_sig_unpad.c \
+          third_party/bearssl/src/rsa/rsa_pss_sig_unpad.c \
+          third_party/bearssl/src/rsa/rsa_ssl_decrypt.c \
+          third_party/bearssl/src/int/i31_add.c \
+          third_party/bearssl/src/int/i31_bitlen.c \
+          third_party/bearssl/src/int/i31_decmod.c \
+          third_party/bearssl/src/int/i31_decode.c \
+          third_party/bearssl/src/int/i31_decred.c \
+          third_party/bearssl/src/int/i31_encode.c \
+          third_party/bearssl/src/int/i31_fmont.c \
+          third_party/bearssl/src/int/i31_iszero.c \
+          third_party/bearssl/src/int/i31_moddiv.c \
+          third_party/bearssl/src/int/i31_modpow.c \
+          third_party/bearssl/src/int/i31_modpow2.c \
+          third_party/bearssl/src/int/i31_montmul.c \
+          third_party/bearssl/src/int/i31_mulacc.c \
+          third_party/bearssl/src/int/i31_muladd.c \
+          third_party/bearssl/src/int/i31_ninv31.c \
+          third_party/bearssl/src/int/i31_reduce.c \
+          third_party/bearssl/src/int/i31_rshift.c \
+          third_party/bearssl/src/int/i31_sub.c \
+          third_party/bearssl/src/int/i31_tmont.c \
+          third_party/bearssl/src/int/i32_div32.c \
+          third_party/bearssl/src/x509/skey_decoder.c \
+          third_party/bearssl/src/x509/x509_decoder.c \
+          third_party/bearssl/src/x509/x509_minimal.c
+
+OBJS := $(C_SRCS:.c=.o) $(S_SRCS:.S=.o) $(BEARSSL_SRCS:.c=.o)
 
 HEADERS := $(wildcard include/tobyos/*.h)
 
@@ -619,6 +681,22 @@ third_party/monocypher-4.0.2/src/%.o: third_party/monocypher-4.0.2/src/%.c Makef
 
 third_party/monocypher-4.0.2/src/optional/%.o: third_party/monocypher-4.0.2/src/optional/%.c Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+
+# stage 13H: BearSSL X.509 objects. Needs its public headers + the
+# freestanding <string.h> shim (shim first); -w silences the vendored
+# reference under -Wall -Wextra.
+BEARSSL_INC := -Ithird_party/bearssl/shim -Ithird_party/bearssl/inc -Ithird_party/bearssl/src
+third_party/bearssl/src/%.o: third_party/bearssl/src/%.c Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $(BEARSSL_INC) -w -c $< -o $@
+
+# The trust-anchor array pulls in br_x509_trust_anchor from bearssl.h.
+src/tls_trust.o: src/tls_trust.c $(HEADERS) third_party/bearssl/trust_anchors.inc Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $(BEARSSL_INC) -w -c $< -o $@
+
+# tls.c calls the BearSSL X.509 API, so it needs the public headers +
+# the freestanding <string.h> shim they pull (shim first).
+src/tls.o: src/tls.c $(HEADERS) Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -Ithird_party/bearssl/shim -Ithird_party/bearssl/inc -c $< -o $@
 
 # ---------- Link ----------
 

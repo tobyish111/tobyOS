@@ -7774,11 +7774,12 @@ static const char *http_err_str(int err) {
         "OK", "Bad URL", "DNS lookup failed", "Connection failed",
         "Protocol error", "Chunked encoding (unsupported)",
         "Response too large", "Timed out", "Out of memory",
-        "Connection reset"
+        "Connection reset", "Certificate not trusted"     /* -10: 13H */
     };
     int idx = -err;
-    return (idx >= 1 && idx <= 9) ? errs[idx] : "Unknown error";
+    return (idx >= 1 && idx <= 10) ? errs[idx] : "Unknown error";
 }
+#define HTTPE_CERT (-10)
 #define HTTPE_DNS (-2)
 
 static int msg_append(char *dst, int pos, int max, const char *s) {
@@ -7805,6 +7806,37 @@ static void raw_append(const char *s) {
 static void show_error_page(const char *url, int err) {
     const char *emsg = http_err_str(err);
     set_status(emsg);
+
+    if (err == HTTPE_CERT) {
+        /* stage 13H: a TLS certificate failure is a security condition,
+         * not a plain connectivity error -- present it as such and offer
+         * no one-click bypass (fail closed). */
+        g_raw_len = 0;
+        raw_append("<html><head><title>Your connection is not private</title>"
+                   "<style>body{background-color:#ffffff;color:#202124}"
+                   ".box{max-width:540px;margin:24px auto;padding:8px 18px;"
+                   "border:1px solid #dadce0;background-color:#fef7f6}"
+                   "h1{font-size:21px;color:#c5221f}"
+                   ".url{font-family:monospace;color:#5f6368}</style>"
+                   "</head><body><div class=box>"
+                   "<h1>&#9888; Your connection is not private</h1>"
+                   "<p class=url>");
+        raw_append(url);
+        raw_append("</p><p>tobyOS could not verify this site's TLS "
+                   "certificate against its trusted root store. The "
+                   "certificate may be <b>expired</b>, <b>self-signed</b>, "
+                   "issued for a <b>different hostname</b>, or signed by an "
+                   "authority tobyOS does not trust.</p>"
+                   "<p>The connection was refused to protect you from a "
+                   "possible impostor. Error: <b>");
+        raw_append(emsg);
+        raw_append("</b></p><hr><p>Press <b>[</b> to go back.</p>"
+                   "</div></body></html>");
+        g_raw[g_raw_len] = '\0';
+        render_html();
+        update_title();
+        return;
+    }
 
     g_raw_len = 0;
     raw_append("<html><head><title>Problem loading page</title>"
@@ -8721,6 +8753,14 @@ static void nav_complete_error(int err) {
     char urlbuf[URL_MAX + 1];
     str_copy(urlbuf, cur->nav_url, URL_MAX);
     char next[URL_MAX + 1];
+
+    /* stage 13H: a TLS certificate failure is definitive -- the server is
+     * there and speaking TLS, its cert is just untrusted. Never downgrade
+     * to plain http or walk the www ladder; show the security page now. */
+    if (err == HTTPE_CERT) {
+        nav_finish_error(urlbuf, err, 1);
+        return;
+    }
 
     switch (cur->nav_kind) {
     case NAVK_DDG:

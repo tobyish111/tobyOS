@@ -60,6 +60,7 @@
 #define HTTP_ERR_TIMEOUT      -7   /* tcp_recv timed out mid-response      */
 #define HTTP_ERR_NOMEM        -8   /* kmalloc failed                       */
 #define HTTP_ERR_RESET        -9   /* peer RST mid-response                */
+#define HTTP_ERR_CERT        -10   /* TLS certificate validation failed (13H) */
 
 /* Parsed URL components. Strings are NUL-terminated. */
 struct http_url {

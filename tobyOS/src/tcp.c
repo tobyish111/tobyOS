@@ -1083,6 +1083,19 @@ void tcp_close(struct tcp_conn *c) {
     if (c->in_use) conn_free(c);
 }
 
+/* Abortive close (stage 13H): RST + immediate free. No FIN handshake and
+ * no TIME_WAIT linger, so it never blocks -- used to tear down a
+ * connection whose TLS handshake was rejected mid-flight (a bad cert),
+ * where tcp_close would make us the active closer and hang in TIME_WAIT
+ * for the full linger. */
+void tcp_abort(struct tcp_conn *c) {
+    if (!c || !c->in_use) return;
+    if (c->state != TCP_CLOSED && c->state != TCP_LISTEN &&
+        c->state != TCP_SYN_SENT)
+        (void)tcp_send_data_segment(c, TCP_FLAG_RST, NULL, 0);
+    conn_free(c);
+}
+
 /* ---- Congestion control -- CUBIC (RFC 8312) --------------------- */
 
 static uint32_t icbrt(uint32_t n) {

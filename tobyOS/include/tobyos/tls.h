@@ -37,6 +37,7 @@ struct tls_conn;
 #define TLS_ERR_ALERT       -7   /* peer sent a fatal alert */
 #define TLS_ERR_RECORD      -8   /* malformed record */
 #define TLS_ERR_VERSION     -9   /* unsupported protocol version */
+#define TLS_ERR_CERT        -10  /* certificate validation failed (13H) */
 
 /* Connect to a TLS server. Performs TCP connect + TLS 1.3 handshake.
  * When offer_h2 is nonzero the ClientHello advertises ALPN
