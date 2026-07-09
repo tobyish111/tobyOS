@@ -61,6 +61,17 @@ long tls_recv(struct tls_conn *c, void *buf, size_t cap, uint32_t timeout_ms);
 /* Close the TLS connection (sends close_notify, then TCP close). */
 void tls_close(struct tls_conn *c);
 
+/* Abortive close: close_notify (best effort), then TCP RST + free --
+ * never blocks in the FIN/TIME_WAIT linger that tls_close's tcp_close
+ * can incur as the active closer. For long-lived connection owners
+ * (the WebSocket worker) that must not stall. */
+void tls_abort(struct tls_conn *c);
+
+/* TCP_RDY_* readiness for the connection, including buffered decrypted
+ * data tls_recv would return without touching the wire. Side-effect-
+ * free; lets a poller avoid timed reads on an idle connection. */
+int tls_poll_flags(struct tls_conn *c);
+
 /* Human-readable error string. */
 const char *tls_strerror(int err);
 

@@ -177,6 +177,7 @@ C_SRCS := src/kernel.c \
           src/ssh_crypto.c \
           src/http.c \
           src/http_async.c \
+          src/ws.c \
           src/puff.c \
           src/brotli.c \
           src/woff2.c \
@@ -697,6 +698,11 @@ src/tls_trust.o: src/tls_trust.c $(HEADERS) third_party/bearssl/trust_anchors.in
 # tls.c calls the BearSSL X.509 API, so it needs the public headers +
 # the freestanding <string.h> shim they pull (shim first).
 src/tls.o: src/tls.c $(HEADERS) Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -Ithird_party/bearssl/shim -Ithird_party/bearssl/inc -c $< -o $@
+
+# ws.c uses BearSSL's SHA-1 for the Sec-WebSocket-Accept check, so it
+# needs the same headers + shim.
+src/ws.o: src/ws.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -Ithird_party/bearssl/shim -Ithird_party/bearssl/inc -c $< -o $@
 
 # ---------- Link ----------

@@ -77,6 +77,7 @@
 #include <tobyos/xhci.h>
 #include <tobyos/http.h>
 #include <tobyos/http_async.h>
+#include <tobyos/ws.h>
 #include <tobyos/inotify.h>
 #include <tobyos/clipboard.h>
 #include <tobyos/smp.h>
@@ -874,6 +875,72 @@ static long sys_http_read(long h, void *ubuf, uint64_t off_len) {
 
 static long sys_http_finish(long h) {
     if (httpa_finish((int)h, current_proc()->pid) != 0) return -ABI_EINVAL;
+    return 0;
+}
+
+/* ---- WebSocket client (stage 13; see ws.c) ------------------------ */
+
+static long sys_ws_open(struct abi_ws_open *ureq) {
+    if (!cap_check(current_proc(), CAP_NET, "sys_ws_open")) return -ABI_EPERM;
+    if (!ureq) return -ABI_EINVAL;
+    struct abi_ws_open req;
+    if (copy_from_user(&req, ureq, sizeof(req)) != 0) return -ABI_EFAULT;
+    if (req.flags != 0 || !req.url) return -ABI_EINVAL;
+    char kurl[512];
+    if (strncpy_from_user(kurl, (const char *)(uintptr_t)req.url,
+                          sizeof(kurl)) < 0)
+        return -ABI_EFAULT;
+    int h = ws_open(kurl, current_proc()->pid);
+    return h >= 0 ? (long)h : -ABI_EAGAIN;
+}
+
+static long sys_ws_poll(long h, struct abi_ws_poll *uout) {
+    if (!uout) return -ABI_EINVAL;
+    struct abi_ws_poll out;
+    if (ws_poll((int)h, current_proc()->pid, &out) != 0)
+        return -ABI_EINVAL;
+    if (copy_to_user(uout, &out, sizeof(out)) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
+static long sys_ws_recv(long h, void *ubuf, uint64_t cap) {
+    if (!ubuf || cap == 0) return -ABI_EINVAL;
+    if (cap > (1u << 20)) cap = 1u << 20;
+    if (!user_buf_ok((uint64_t)(uintptr_t)ubuf, cap)) return -ABI_EFAULT;
+    void *kb = kmalloc((size_t)cap);
+    if (!kb) return -ABI_ENOMEM;
+    long n = ws_recv((int)h, current_proc()->pid, kb, (uint32_t)cap);
+    if (n > 0 && copy_to_user(ubuf, kb, (size_t)n) != 0) {
+        kfree(kb);
+        return -ABI_EFAULT;
+    }
+    kfree(kb);
+    return n < 0 ? -ABI_EAGAIN : n;
+}
+
+/* a3 packs op<<32 | len (the 3-arg syscall shape, like SYS_HTTP_READ). */
+static long sys_ws_send(long h, const void *ubuf, uint64_t op_len) {
+    int op = (int)(op_len >> 32);
+    uint32_t len = (uint32_t)op_len;
+    if (len > (256u << 10)) return -ABI_EINVAL;
+    if (len && !ubuf) return -ABI_EINVAL;
+    void *kb = NULL;
+    if (len) {
+        kb = kmalloc(len);
+        if (!kb) return -ABI_ENOMEM;
+        if (copy_from_user(kb, ubuf, len) != 0) {
+            kfree(kb);
+            return -ABI_EFAULT;
+        }
+    }
+    int rc = ws_send((int)h, current_proc()->pid, kb, len, op);
+    if (kb) kfree(kb);
+    return rc == 0 ? 0 : -ABI_EINVAL;
+}
+
+static long sys_ws_close(long h, long code) {
+    if (ws_close((int)h, current_proc()->pid, (uint16_t)code) != 0)
+        return -ABI_EINVAL;
     return 0;
 }
 
@@ -3316,6 +3383,18 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_http_read((long)a1, (void *)a2, (uint64_t)a3);
     case ABI_SYS_HTTP_FINISH:
         return sys_http_finish((long)a1);
+
+    /* ---- WebSocket client (stage 13) -------------------------------- */
+    case ABI_SYS_WS_OPEN:
+        return sys_ws_open((struct abi_ws_open *)a1);
+    case ABI_SYS_WS_POLL:
+        return sys_ws_poll((long)a1, (struct abi_ws_poll *)a2);
+    case ABI_SYS_WS_RECV:
+        return sys_ws_recv((long)a1, (void *)a2, (uint64_t)a3);
+    case ABI_SYS_WS_SEND:
+        return sys_ws_send((long)a1, (const void *)a2, (uint64_t)a3);
+    case ABI_SYS_WS_CLOSE:
+        return sys_ws_close((long)a1, (long)a2);
 
     /* ---- Advanced GUI drawing (Phase 1) ----------------------------- */
     case ABI_SYS_GUI_LINE: {

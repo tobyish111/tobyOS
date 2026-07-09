@@ -187,6 +187,84 @@ static inline long sys_http_finish(long h) {
     return r;
 }
 
+/* ---- WebSocket (stage 13): open/poll/recv/send/close -------------- *
+ * Kernel-side RFC 6455 client on the async worker; the browser polls
+ * handles from the pump and never blocks. Structs mirror abi_ws_open /
+ * abi_ws_poll (ABI-frozen). */
+#define SYS_WS_OPEN   177
+#define SYS_WS_POLL   178
+#define SYS_WS_RECV   179
+#define SYS_WS_SEND   180
+#define SYS_WS_CLOSE  181
+
+#define WS_ST_CONNECTING 0
+#define WS_ST_OPEN       1
+#define WS_ST_CLOSING    2
+#define WS_ST_CLOSED     3
+
+struct ws_open_rq {
+    unsigned long url;
+    uint32_t      flags;
+    uint32_t      reserved;
+};
+struct ws_poll_info {
+    int32_t  state;             /* WS_ST_* */
+    int32_t  err;               /* 0 = clean */
+    uint32_t msg_avail;
+    uint32_t msg_len;
+    uint32_t msg_type;          /* 1 text, 2 binary */
+    uint32_t queued;
+    uint16_t close_code;
+    uint16_t reserved0;
+    uint32_t reserved1;
+};
+
+static inline long sys_ws_open(const char *url) {
+    struct ws_open_rq rq;
+    rq.url = (unsigned long)url;
+    rq.flags = 0;
+    rq.reserved = 0;
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_WS_OPEN), "D"(&rq)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_ws_poll(long h, struct ws_poll_info *out) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_WS_POLL), "D"(h), "S"(out)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_ws_recv(long h, void *buf, uint32_t cap) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_WS_RECV), "D"(h), "S"(buf), "d"((unsigned long)cap)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_ws_send(long h, const void *buf, uint32_t len, int op) {
+    unsigned long op_len = ((unsigned long)(unsigned)op << 32) | (unsigned long)len;
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_WS_SEND), "D"(h), "S"(buf), "d"(op_len)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_ws_close(long h, int code) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_WS_CLOSE), "D"(h), "S"((long)code)
+        : "rcx", "r11", "memory");
+    return r;
+}
+
 /* File syscalls (stage 12E: persistent localStorage). */
 #define SYS_READ   2
 #define SYS_CLOSE  4
@@ -771,6 +849,17 @@ struct jsfetch {
     JSValue  cb;
 };
 
+/* Stage 13: a live JS WebSocket -- the kernel handle plus the JS
+ * object whose __fire(type, ...) the pump calls for open / message /
+ * close / error events. */
+#define JS_WS_MAX 4
+struct jsws {
+    int      used;
+    int      handle;
+    int      last_state;         /* WS_ST_* seen by the pump */
+    JSValue  obj;
+};
+
 /* Stage 13F: DOM mutation log for MutationObserver delivery. Each JS
  * mutation primitive records (node, kind); the pump hands the batch to
  * the prelude's observer check. Kinds: 0 childList, 1 attributes,
@@ -802,6 +891,7 @@ struct tab {
     int        js_timer_seq;
     char       js_nav[URL_MAX + 1];   /* deferred location.href target */
     struct jsfetch js_fetches[JS_FETCH_MAX];  /* pending fetch() calls */
+    struct jsws js_ws[JS_WS_MAX];             /* live WebSocket objects */
     /* stage 13F: observers (Mutation/Intersection/Resize + scroll) */
     JSValue    js_obs_check;   /* prelude observer-check callback */
     int        js_has_obs_check;
@@ -5903,6 +5993,81 @@ static JSValue js_dom_fetchstart(JSContext *cx, JSValueConst t, int argc, JSValu
     return JS_UNDEFINED;
 }
 
+/* ---- WebSocket bindings (stage 13) ----------------------------------- *
+ * wsOpen(url, obj) starts a kernel-side RFC 6455 connection and pins
+ * the JS WebSocket object; the pump polls the handle and calls the
+ * object's __fire(type, a, b) as events land. wsSend/wsClose forward
+ * to the kernel; wsClose also unpins the object. */
+
+static JSValue js_ws_openprim(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2 || !JS_IsObject(argv[1])) return JS_NewInt32(cx, -1);
+    long h = -1;
+    const char *u = JS_ToCString(cx, argv[0]);
+    if (u) {
+        h = sys_ws_open(u);
+        JS_FreeCString(cx, u);
+    }
+    int slot = -1;
+    if (h >= 0)
+        for (int k = 0; k < JS_WS_MAX; k++)
+            if (!cur->js_ws[k].used) { slot = k; break; }
+    if (h < 0 || slot < 0) {
+        if (h >= 0) sys_ws_close(h, 0);
+        return JS_NewInt32(cx, -1);
+    }
+    cur->js_ws[slot].used = 1;
+    cur->js_ws[slot].handle = (int)h;
+    cur->js_ws[slot].last_state = WS_ST_CONNECTING;
+    cur->js_ws[slot].obj = JS_DupValue(cx, argv[1]);
+    return JS_NewInt32(cx, (int)h);
+}
+
+static JSValue js_ws_sendprim(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_UNDEFINED;
+    int32_t h = -1;
+    JS_ToInt32(cx, &h, argv[0]);
+    size_t len = 0;
+    const char *s = JS_ToCStringLen(cx, &len, argv[1]);
+    if (h >= 0 && s)
+        sys_ws_send(h, s, (uint32_t)len, 1 /* text */);
+    if (s) JS_FreeCString(cx, s);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_ws_closeprim(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_UNDEFINED;
+    int32_t h = -1, code = 1000;
+    JS_ToInt32(cx, &h, argv[0]);
+    if (argc >= 2) JS_ToInt32(cx, &code, argv[1]);
+    if (h < 0) return JS_UNDEFINED;
+    for (int k = 0; k < JS_WS_MAX; k++)
+        if (cur->js_ws[k].used && cur->js_ws[k].handle == (int)h) {
+            JS_FreeValue(cx, cur->js_ws[k].obj);
+            cur->js_ws[k].used = 0;
+        }
+    sys_ws_close(h, code);
+    return JS_UNDEFINED;
+}
+
+/* Call obj.__fire(type, a, b) from the pump. Consumes a and b. */
+static void js_ws_fire(JSContext *cx, JSValue obj, const char *type,
+                       JSValue a, JSValue b) {
+    JSValue fn = JS_GetPropertyStr(cx, obj, "__fire");
+    if (JS_IsFunction(cx, fn)) {
+        JSValue args[3] = { JS_NewString(cx, type), a, b };
+        JSValue r = JS_Call(cx, fn, obj, 3, args);
+        if (JS_IsException(r)) js_dump_error(cx);
+        JS_FreeValue(cx, r);
+        JS_FreeValue(cx, args[0]);
+    }
+    JS_FreeValue(cx, fn);
+    JS_FreeValue(cx, a);
+    JS_FreeValue(cx, b);
+}
+
 /* ---- Persistent localStorage (stage 12E) ---------------------------- *
  * One small file per origin host: /data/browser/<host>.ls, written
  * whole on every mutation (storage blobs are tiny) and loaded when a
@@ -6398,6 +6563,12 @@ static void js_teardown(struct tab *t) {
             JS_FreeValue(cx, t->js_fetches[k].cb);
             t->js_fetches[k].used = 0;
         }
+    for (int k = 0; k < JS_WS_MAX; k++)
+        if (t->js_ws[k].used) {
+            sys_ws_close(t->js_ws[k].handle, 1001 /* going away */);
+            JS_FreeValue(cx, t->js_ws[k].obj);
+            t->js_ws[k].used = 0;
+        }
     if (t->js_has_dispatch) JS_FreeValue(cx, t->js_dispatch);
     t->js_has_dispatch = 0;
     if (t->js_has_obs_check) JS_FreeValue(cx, t->js_obs_check);
@@ -6665,6 +6836,67 @@ static const char JS_PRELUDE[] =
 "      if (sf.onload) sf.onload();\n"
 "    }, 0);\n"
 "  };\n"
+/* ---- stage 13: WebSocket (RFC 6455) ------------------------------- */
+"  function WebSocket(url){\n"
+"    var self = this;\n"
+"    this.url = String(url);\n"
+"    this.readyState = 0;\n"
+"    this.bufferedAmount = 0; this.protocol = ''; this.extensions = '';\n"
+"    this.binaryType = 'blob';\n"
+"    this.onopen = null; this.onmessage = null;\n"
+"    this.onclose = null; this.onerror = null;\n"
+"    this.__ls = {};\n"
+"    this.__fire = function(type, a, b){\n"
+"      var e;\n"
+"      if (type === 'open'){ self.readyState = 1; e = { type: 'open' }; }\n"
+"      else if (type === 'message')\n"
+"        e = { type: 'message', data: a, origin: '', lastEventId: '' };\n"
+"      else if (type === 'close'){ self.readyState = 3;\n"
+"        e = { type: 'close', code: a|0, reason: '', wasClean: !!b }; }\n"
+"      else e = { type: 'error' };\n"
+"      e.target = self; e.currentTarget = self;\n"
+"      var h = self['on' + type];\n"
+"      if (typeof h === 'function'){\n"
+"        try { h.call(self, e); } catch(ex){ g.console.log('[ws-err]', ex); }\n"
+"      }\n"
+"      var ls = self.__ls[type] || [];\n"
+"      for (var k = 0; k < ls.length; k++){\n"
+"        try { ls[k].call(self, e); } catch(ex){ g.console.log('[ws-err]', ex); }\n"
+"      }\n"
+"    };\n"
+"    this.__h = D.wsOpen(this.url, this);\n"
+"    if (this.__h < 0) g.setTimeout(function(){\n"
+"      self.readyState = 3;\n"
+"      self.__fire('error'); self.__fire('close', 1006, false);\n"
+"    }, 0);\n"
+"  }\n"
+"  WebSocket.CONNECTING = WebSocket.prototype.CONNECTING = 0;\n"
+"  WebSocket.OPEN = WebSocket.prototype.OPEN = 1;\n"
+"  WebSocket.CLOSING = WebSocket.prototype.CLOSING = 2;\n"
+"  WebSocket.CLOSED = WebSocket.prototype.CLOSED = 3;\n"
+"  WebSocket.prototype.send = function(d){\n"
+"    if (this.readyState !== 1 || this.__h < 0)\n"
+"      throw new Error('InvalidStateError: WebSocket is not open');\n"
+"    D.wsSend(this.__h, String(d));\n"
+"  };\n"
+"  WebSocket.prototype.close = function(code){\n"
+"    if (this.readyState >= 2) return;\n"
+"    this.readyState = 2;\n"
+"    var self = this, h = this.__h, c = (code === undefined) ? 1000 : code|0;\n"
+"    this.__h = -1;\n"
+"    if (h >= 0) D.wsClose(h, c);\n"
+"    g.setTimeout(function(){ self.__fire('close', c, true); }, 0);\n"
+"  };\n"
+"  WebSocket.prototype.addEventListener = function(t, f){\n"
+"    t = String(t).toLowerCase();\n"
+"    (this.__ls[t] = this.__ls[t] || []).push(f);\n"
+"  };\n"
+"  WebSocket.prototype.removeEventListener = function(t, f){\n"
+"    var l = this.__ls[String(t).toLowerCase()];\n"
+"    if (!l) return;\n"
+"    var ix = l.indexOf(f); if (ix >= 0) l.splice(ix, 1);\n"
+"  };\n"
+"  g.WebSocket = WebSocket;\n"
 "  g.navigator = { userAgent: 'TobyOS/4.0 (tobyOS x86_64) QuickJS' };\n"
 "  function parseUrl(h){\n"
 "    var m = /^(https?:)\\/\\/([^\\/?#]*)([^?#]*)(\\??[^#]*)(#?.*)$/.exec(h) || [];\n"
@@ -7055,6 +7287,9 @@ static int js_ensure(void) {
             {"timer", js_dom_timer, 3},   {"untimer", js_dom_untimer, 1},
             {"fetchSync", js_dom_fetchsync, 1},
             {"fetchStart", js_dom_fetchstart, 2},
+            {"wsOpen", js_ws_openprim, 2},
+            {"wsSend", js_ws_sendprim, 2},
+            {"wsClose", js_ws_closeprim, 2},
             {"storeLoad", js_dom_storeload, 0},
             {"storeSave", js_dom_storesave, 1},
             {"getValue", js_dom_getvalue, 1},
@@ -7332,6 +7567,65 @@ static int js_pump_all(void) {
             JS_FreeValue(t->js_cx, cb);
             JS_FreeValue(t->js_cx, arg);
             work = 1;
+        }
+        /* Stage 13: WebSocket events. Every __fire may run user JS
+         * that closes the socket (freeing the slot via wsClose), so
+         * re-check w->used after each callback. Terminal events
+         * detach the slot BEFORE firing. */
+        for (int k = 0; k < JS_WS_MAX; k++) {
+            struct jsws *w = &t->js_ws[k];
+            if (!w->used) continue;
+            struct ws_poll_info pi;
+            if (sys_ws_poll(w->handle, &pi) != 0) {
+                /* kernel forgot the handle: surface an abnormal close */
+                JSValue obj = w->obj;
+                w->used = 0;
+                js_ws_fire(t->js_cx, obj, "error", JS_UNDEFINED, JS_UNDEFINED);
+                js_ws_fire(t->js_cx, obj, "close",
+                           JS_NewInt32(t->js_cx, 1006), JS_FALSE);
+                JS_FreeValue(t->js_cx, obj);
+                work = 1;
+                continue;
+            }
+            if (pi.state == WS_ST_OPEN && w->last_state == WS_ST_CONNECTING) {
+                w->last_state = WS_ST_OPEN;
+                JSValue obj = JS_DupValue(t->js_cx, w->obj);
+                js_ws_fire(t->js_cx, obj, "open", JS_UNDEFINED, JS_UNDEFINED);
+                JS_FreeValue(t->js_cx, obj);
+                work = 1;
+                if (!w->used) continue;
+            }
+            int guard = 16;                /* bound per-tick delivery */
+            while (w->used && pi.msg_avail && guard-- > 0) {
+                char *buf = (char *)malloc(pi.msg_len + 1);
+                if (!buf) break;
+                long n = sys_ws_recv(w->handle, buf,
+                                     pi.msg_len ? pi.msg_len : 1);
+                if (n < 0) { free(buf); break; }
+                JSValue data = JS_NewStringLen(t->js_cx, buf, (size_t)n);
+                free(buf);
+                JSValue obj = JS_DupValue(t->js_cx, w->obj);
+                js_ws_fire(t->js_cx, obj, "message", data, JS_UNDEFINED);
+                JS_FreeValue(t->js_cx, obj);
+                work = 1;
+                if (!w->used || sys_ws_poll(w->handle, &pi) != 0) break;
+            }
+            if (!w->used) continue;
+            if (pi.state == WS_ST_CLOSED && !pi.msg_avail) {
+                JSValue obj = w->obj;
+                int code = pi.close_code ? pi.close_code
+                                         : (pi.err ? 1006 : 1000);
+                sys_ws_close(w->handle, 0);      /* free the kernel slot */
+                w->used = 0;
+                if (pi.err)
+                    js_ws_fire(t->js_cx, obj, "error",
+                               JS_UNDEFINED, JS_UNDEFINED);
+                js_ws_fire(t->js_cx, obj, "close",
+                           JS_NewInt32(t->js_cx, code),
+                           pi.err ? JS_FALSE : JS_TRUE);
+                JS_FreeValue(t->js_cx, obj);
+                work = 1;
+            }
         }
         js_drain_jobs(t);
         if (g_js_dirty) {

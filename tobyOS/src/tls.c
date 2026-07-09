@@ -1289,6 +1289,24 @@ void tls_close(struct tls_conn *c) {
     kfree(c);
 }
 
+void tls_abort(struct tls_conn *c) {
+    if (!c) return;
+    if (!c->closed && c->handshake_done) {
+        uint8_t alert[2] = { 1, 0 };  /* warning, close_notify */
+        tls_send_encrypted(c, TLS_RT_ALERT, alert, 2);
+    }
+    tcp_abort(c->tcp);
+    kfree(c);
+}
+
+int tls_poll_flags(struct tls_conn *c) {
+    if (!c) return TCP_RDY_ERR;
+    int f = tcp_poll_flags(c->tcp);
+    if (c->app_len > c->app_off) f |= TCP_RDY_RECV;
+    if (c->closed) f |= TCP_RDY_HUP;
+    return f;
+}
+
 const char *tls_strerror(int err) {
     switch (err) {
     case TLS_OK:            return "ok";

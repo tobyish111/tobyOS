@@ -842,8 +842,58 @@ struct abi_http_poll {
  * GUI_TEXT_TTF_WIDTH, or -E on failure. */
 #define ABI_SYS_GUI_FONT_REGISTER  176
 
+/* ============================================================
+ *  WebSocket client (stage 13, RFC 6455)
+ * ============================================================
+ * Long-lived full-duplex connections, driven by the same ring-0
+ * worker model as async HTTP (the app never blocks): OPEN queues the
+ * connect + Upgrade handshake and returns a handle immediately; the
+ * worker owns the transport (TCP or TLS 1.3 for wss://), decodes
+ * frames into a per-handle message queue, answers pings, and drains
+ * a send queue. The app POLLs from its main loop, RECVs queued
+ * messages, SENDs text/binary, and CLOSEs to initiate the closing
+ * handshake and release the handle. */
+#define ABI_SYS_WS_OPEN        177  /* (struct abi_ws_open *) -> handle or -E */
+#define ABI_SYS_WS_POLL        178  /* (handle, struct abi_ws_poll *) -> 0 or -E */
+#define ABI_SYS_WS_RECV        179  /* (handle, buf, cap) -> bytes (pops msg) or -E */
+#define ABI_SYS_WS_SEND        180  /* (handle, buf, op_len: op<<32|len) -> 0 or -E */
+#define ABI_SYS_WS_CLOSE       181  /* (handle, close_code) -> 0 or -E */
+
+/* abi_ws_poll.state values -- deliberately equal to the DOM WebSocket
+ * readyState constants. */
+#define ABI_WS_CONNECTING  0
+#define ABI_WS_OPEN        1
+#define ABI_WS_CLOSING     2
+#define ABI_WS_CLOSED      3
+
+/* abi_ws_poll.err uses the HTTP_ERR_* numbering (URL/DNS/CONNECT/
+ * PROTOCOL/TIMEOUT/NOMEM/RESET/CERT) so callers share one error map;
+ * 0 = clean close. */
+
+struct abi_ws_open {
+    uint64_t url;          /* in: const char * user VA, ws:// or wss:// */
+    uint32_t flags;        /* reserved, must be 0 */
+    uint32_t reserved;
+};
+
+struct abi_ws_poll {
+    int32_t  state;        /* ABI_WS_* */
+    int32_t  err;          /* transport/handshake error, 0 = clean */
+    uint32_t msg_avail;    /* 1 if a message is queued for RECV */
+    uint32_t msg_len;      /* length of that message (may be 0) */
+    uint32_t msg_type;     /* 1 text, 2 binary (frame opcode) */
+    uint32_t queued;       /* total messages queued */
+    uint16_t close_code;   /* peer close code when CLOSED (0 if none) */
+    uint16_t reserved0;
+    uint32_t reserved1;
+};
+
+/* abi_ws_send opcodes (packed into a3's high half). */
+#define ABI_WS_OP_TEXT    1
+#define ABI_WS_OP_BINARY  2
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          177
+#define ABI_SYS_NR_MAX          182
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
