@@ -6135,6 +6135,73 @@ static JSValue js_dom_storesave(JSContext *cx, JSValueConst t, int argc, JSValue
     return JS_UNDEFINED;
 }
 
+/* ---- IndexedDB persistence (stage 13) ------------------------------- *
+ * One JSON blob per (origin, database): /data/browser/<host>.i_<db>.idb.
+ * The whole IndexedDB machinery lives in the JS prelude; these two
+ * primitives just load/save its serialization, exactly like the
+ * localStorage pair above (whole-file writes; databases are small). */
+
+#define IDB_CAP (64 * 1024)
+
+static void idb_path_of(char *out, int cap, const char *db) {
+    store_path_of(out, cap);               /* /data/browser/<host>.ls */
+    int p = (int)str_len(out) - 3;         /* strip the ".ls" suffix */
+    if (p < 0) p = 0;
+    if (p < cap - 4) {
+        out[p++] = '.'; out[p++] = 'i'; out[p++] = '_';
+        for (int i = 0; db[i] && p < cap - 5; i++) {
+            char c = (char)lc(db[i]);
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '.' || c == '-'))
+                c = '_';
+            out[p++] = c;
+        }
+        out[p++] = '.'; out[p++] = 'i'; out[p++] = 'd'; out[p++] = 'b';
+    }
+    out[p] = 0;
+}
+
+static JSValue js_dom_idbload(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_NewString(cx, "");
+    const char *db = JS_ToCString(cx, argv[0]);
+    if (!db) return JS_NewString(cx, "");
+    char path[600];
+    idb_path_of(path, sizeof(path), db);
+    JS_FreeCString(cx, db);
+    long fd = sys_open(path, O_RDONLY, 0);
+    if (fd < 0) return JS_NewString(cx, "");
+    char *buf = (char *)malloc(IDB_CAP + 1);
+    long n = buf ? sys_read((int)fd, buf, IDB_CAP) : -1;
+    sys_close((int)fd);
+    JSValue r = (n > 0) ? JS_NewStringLen(cx, buf, (size_t)n)
+                        : JS_NewString(cx, "");
+    if (buf) free(buf);
+    return r;
+}
+
+static JSValue js_dom_idbsave(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_UNDEFINED;
+    const char *db = JS_ToCString(cx, argv[0]);
+    size_t len = 0;
+    const char *s = db ? JS_ToCStringLen(cx, &len, argv[1]) : NULL;
+    if (db && s) {
+        if (len > IDB_CAP) len = IDB_CAP;
+        sys_mkdir("/data/browser", 0755);  /* idempotent */
+        char path[600];
+        idb_path_of(path, sizeof(path), db);
+        long fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            if (len) sys_write((int)fd, s, len);
+            sys_close((int)fd);
+        }
+    }
+    if (s) JS_FreeCString(cx, s);
+    if (db) JS_FreeCString(cx, db);
+    return JS_UNDEFINED;
+}
+
 static JSValue js_dom_getvalue(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t;
     int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
@@ -6954,6 +7021,210 @@ static const char JS_PRELUDE[] =
 "  }\n"
 "  g.localStorage = mkStorage(true);\n"
 "  g.sessionStorage = mkStorage(false);\n"
+/* ---- stage 13: IndexedDB (v1) ------------------------------------- */
+"  (function(){\n"
+"    var dbs = {};\n"
+"    function later(f){ g.setTimeout(f, 0); }\n"
+"    function mkReq(){\n"
+"      return { result: undefined, error: null, readyState: 'pending',\n"
+"               onsuccess: null, onerror: null, onupgradeneeded: null,\n"
+"               addEventListener: function(t, f){ this['on' + t] = f; },\n"
+"               removeEventListener: function(){} };\n"
+"    }\n"
+"    function fire(r, ok){\n"
+"      r.readyState = 'done';\n"
+"      var e = { target: r, type: ok ? 'success' : 'error' };\n"
+"      var h = ok ? r.onsuccess : r.onerror;\n"
+"      if (typeof h === 'function'){\n"
+"        try { h.call(r, e); } catch(ex){ g.console.log('[idb-err]', ex); }\n"
+"      }\n"
+"    }\n"
+"    function load(name){\n"
+"      if (dbs[name]) return dbs[name];\n"
+"      var raw = D.idbLoad(String(name)), d = null;\n"
+"      if (raw){ try { d = JSON.parse(raw); } catch(e){} }\n"
+"      if (!d || typeof d !== 'object' || !d.stores)\n"
+"        d = { version: 0, stores: {} };\n"
+"      dbs[name] = d;\n"
+"      return d;\n"
+"    }\n"
+"    function save(name){ D.idbSave(String(name), JSON.stringify(dbs[name])); }\n"
+"    function ks(k){ return (typeof k === 'number') ? 'n:' + k : 's:' + String(k); }\n"
+"    function sortedKeys(st){\n"
+"      var ns = [], ss = [];\n"
+"      for (var k in st.recs){\n"
+"        if (k.charAt(0) === 'n') ns.push({ raw: k, key: parseFloat(k.slice(2)) });\n"
+"        else ss.push({ raw: k, key: k.slice(2) });\n"
+"      }\n"
+"      ns.sort(function(a, b){ return a.key - b.key; });\n"
+"      ss.sort(function(a, b){ return a.key < b.key ? -1 : a.key > b.key ? 1 : 0; });\n"
+"      return ns.concat(ss);\n"
+"    }\n"
+"    function clone(v){ return (v === undefined) ? undefined : JSON.parse(JSON.stringify(v)); }\n"
+"    function txSettle(tx){\n"
+"      if (!tx) return;\n"
+"      tx.__pend--;\n"
+"      if (tx.__pend === 0) later(function(){\n"
+"        if (tx.__pend !== 0 || tx.__done) return;\n"
+"        tx.__done = true;\n"
+"        if (typeof tx.oncomplete === 'function'){\n"
+"          try { tx.oncomplete({ target: tx }); }\n"
+"          catch(ex){ g.console.log('[idb-err]', ex); }\n"
+"        }\n"
+"      });\n"
+"    }\n"
+"    function txReq(tx, work){\n"
+"      var r = mkReq();\n"
+"      if (tx) tx.__pend++;\n"
+"      later(function(){\n"
+"        var ok = true;\n"
+"        try { r.result = work(r); } catch(ex){ ok = false; r.error = ex; }\n"
+"        fire(r, ok);\n"
+"        txSettle(tx);\n"
+"      });\n"
+"      return r;\n"
+"    }\n"
+"    function mkStore(dbw, tx, sname){\n"
+"      var st = dbw.__d.stores[sname];\n"
+"      if (!st) throw new Error('NotFoundError: no object store ' + sname);\n"
+"      function keyFor(v, k, adding){\n"
+"        if (k === undefined && st.keyPath && v && typeof v === 'object'){\n"
+"          k = v[st.keyPath];\n"
+"          if (k === undefined && st.autoIncrement){\n"
+"            k = ++st.seq; v[st.keyPath] = k;\n"
+"          }\n"
+"        }\n"
+"        if (k === undefined && st.autoIncrement) k = ++st.seq;\n"
+"        if (k === undefined) throw new Error('DataError: no key');\n"
+"        if (adding && (ks(k) in st.recs)) throw new Error('ConstraintError');\n"
+"        if (typeof k === 'number' && k > st.seq) st.seq = Math.floor(k);\n"
+"        return k;\n"
+"      }\n"
+"      return {\n"
+"        name: sname, keyPath: st.keyPath || null,\n"
+"        autoIncrement: !!st.autoIncrement, transaction: tx,\n"
+"        put: function(v, k){ return txReq(tx, function(){\n"
+"          v = clone(v); var kk = keyFor(v, k, false);\n"
+"          st.recs[ks(kk)] = v; save(dbw.__name); return kk; }); },\n"
+"        add: function(v, k){ return txReq(tx, function(){\n"
+"          v = clone(v); var kk = keyFor(v, k, true);\n"
+"          st.recs[ks(kk)] = v; save(dbw.__name); return kk; }); },\n"
+"        get: function(k){ return txReq(tx, function(){\n"
+"          return clone(st.recs[ks(k)]); }); },\n"
+"        getAll: function(){ return txReq(tx, function(){\n"
+"          return sortedKeys(st).map(function(e){ return clone(st.recs[e.raw]); }); }); },\n"
+"        getAllKeys: function(){ return txReq(tx, function(){\n"
+"          return sortedKeys(st).map(function(e){ return e.key; }); }); },\n"
+"        count: function(){ return txReq(tx, function(){\n"
+"          return sortedKeys(st).length; }); },\n"
+"        'delete': function(k){ return txReq(tx, function(){\n"
+"          delete st.recs[ks(k)]; save(dbw.__name); return undefined; }); },\n"
+"        clear: function(){ return txReq(tx, function(){\n"
+"          st.recs = {}; save(dbw.__name); return undefined; }); },\n"
+"        openCursor: function(){\n"
+"          var keys = null, i = 0;\n"
+"          var r = mkReq();\n"
+"          function sched(){\n"
+"            if (tx) tx.__pend++;\n"
+"            later(function(){\n"
+"              if (!keys) keys = sortedKeys(st);\n"
+"              if (i < keys.length){\n"
+"                var e = keys[i++];\n"
+"                r.result = { key: e.key, primaryKey: e.key,\n"
+"                             value: clone(st.recs[e.raw]),\n"
+"                             continue: sched };\n"
+"              } else r.result = null;\n"
+"              fire(r, true);\n"
+"              txSettle(tx);\n"
+"            });\n"
+"          }\n"
+"          sched();\n"
+"          return r;\n"
+"        },\n"
+"        createIndex: function(){ return { get: function(){\n"
+"          return txReq(tx, function(){ return undefined; }); } }; },\n"
+"        index: function(){ throw new Error('NotFoundError: indexes not supported (v1)'); }\n"
+"      };\n"
+"    }\n"
+"    function mkTx(dbw, mode){\n"
+"      var tx = { mode: mode || 'readonly', db: dbw, error: null,\n"
+"                 oncomplete: null, onerror: null, onabort: null,\n"
+"                 __pend: 0, __done: false,\n"
+"                 abort: function(){},\n"
+"                 addEventListener: function(t, f){ this['on' + t] = f; } };\n"
+"      tx.objectStore = function(n){ return mkStore(dbw, tx, n); };\n"
+"      later(function(){ later(function(){\n"
+"        if (tx.__pend !== 0 || tx.__done) return;\n"
+"        tx.__done = true;\n"
+"        if (typeof tx.oncomplete === 'function'){\n"
+"          try { tx.oncomplete({ target: tx }); }\n"
+"          catch(ex){ g.console.log('[idb-err]', ex); }\n"
+"        }\n"
+"      }); });\n"
+"      return tx;\n"
+"    }\n"
+"    function mkDb(name, d){\n"
+"      var dbw = {\n"
+"        name: name, __d: d, __name: name,\n"
+"        objectStoreNames: {\n"
+"          contains: function(n){ return !!d.stores[n]; },\n"
+"          item: function(i){ return Object.keys(d.stores)[i] || null; }\n"
+"        },\n"
+"        createObjectStore: function(n, opts){\n"
+"          opts = opts || {};\n"
+"          d.stores[n] = { keyPath: opts.keyPath || null,\n"
+"                          autoIncrement: !!opts.autoIncrement,\n"
+"                          seq: 0, recs: {} };\n"
+"          save(name);\n"
+"          return mkStore(dbw, null, n);\n"
+"        },\n"
+"        deleteObjectStore: function(n){ delete d.stores[n]; save(name); },\n"
+"        transaction: function(names, mode){ return mkTx(dbw, mode); },\n"
+"        close: function(){},\n"
+"        onversionchange: null\n"
+"      };\n"
+"      Object.defineProperty(dbw, 'version',\n"
+"        { get: function(){ return d.version; } });\n"
+"      Object.defineProperty(dbw.objectStoreNames, 'length',\n"
+"        { get: function(){ return Object.keys(d.stores).length; } });\n"
+"      return dbw;\n"
+"    }\n"
+"    g.indexedDB = {\n"
+"      open: function(name, version){\n"
+"        var r = mkReq();\n"
+"        later(function(){\n"
+"          var d = load(name);\n"
+"          var dbw = mkDb(name, d);\n"
+"          var want = (version === undefined) ? (d.version || 1) : (version | 0);\n"
+"          if (want > d.version){\n"
+"            var oldv = d.version;\n"
+"            d.version = want;\n"
+"            r.result = dbw;\n"
+"            r.transaction = mkTx(dbw, 'versionchange');\n"
+"            if (typeof r.onupgradeneeded === 'function'){\n"
+"              try { r.onupgradeneeded({ target: r, oldVersion: oldv,\n"
+"                                        newVersion: want }); }\n"
+"              catch(ex){ g.console.log('[idb-err]', ex); }\n"
+"            }\n"
+"            save(name);\n"
+"          }\n"
+"          r.result = dbw;\n"
+"          fire(r, true);\n"
+"        });\n"
+"        return r;\n"
+"      },\n"
+"      deleteDatabase: function(name){\n"
+"        var r = mkReq();\n"
+"        later(function(){\n"
+"          delete dbs[name];\n"
+"          D.idbSave(String(name), '');\n"
+"          fire(r, true);\n"
+"        });\n"
+"        return r;\n"
+"      },\n"
+"      cmp: function(a, b){ return a < b ? -1 : a > b ? 1 : 0; }\n"
+"    };\n"
+"  })();\n"
 /* ---- stage 13F: getComputedStyle + laid-rect geometry ------------- */
 "  g.getComputedStyle = function(elm){\n"
 "    var o = (elm && elm.__i >= 0) ? D.computed(elm.__i) : {};\n"
@@ -7292,6 +7563,8 @@ static int js_ensure(void) {
             {"wsClose", js_ws_closeprim, 2},
             {"storeLoad", js_dom_storeload, 0},
             {"storeSave", js_dom_storesave, 1},
+            {"idbLoad", js_dom_idbload, 1},
+            {"idbSave", js_dom_idbsave, 2},
             {"getValue", js_dom_getvalue, 1},
             {"setValue", js_dom_setvalue, 2},
             {"setDispatcher", js_dom_setdispatcher, 1},
