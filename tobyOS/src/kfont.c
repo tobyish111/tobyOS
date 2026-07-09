@@ -18,6 +18,7 @@
 #include <tobyos/kfont.h>
 #include <tobyos/vfs.h>
 #include <tobyos/cpu.h>      /* fpu_save / fpu_restore (fxsave/fxrstor) */
+#include <tobyos/woff2.h>    /* WOFF2 -> sfnt decode for web fonts */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -147,16 +148,31 @@ static void kface_try_load(int face) {
     kprintf("[kfont] loaded %s (%lu bytes)\n", g_face_path[face], (unsigned long)sz);
 }
 
-/* Register a downloaded TTF/OTF blob as a web face (stage 13E). */
+/* Register a downloaded TTF/OTF/WOFF2 blob as a web face (stage 13E; WOFF2
+ * added post-13H). A WOFF2 blob is transparently decoded to an sfnt first
+ * (brotli + glyf/loca transform reversal), then handed to stb_truetype. */
 int kfont_register(const unsigned char *ttf, size_t len) {
     if (!ttf || len < 12) return -1;
+
+    /* WOFF2 -> sfnt: decode into an owned buffer that becomes f->data. */
+    unsigned char *decoded = 0;
+    if (woff2_is(ttf, len)) {
+        uint8_t *sfnt = 0; size_t sfnt_len = 0;
+        if (woff2_to_sfnt(ttf, len, &sfnt, &sfnt_len) != 0 || !sfnt) {
+            kprintf("[kfont] WOFF2 decode failed (%lu bytes)\n", (unsigned long)len);
+            return -1;
+        }
+        decoded = sfnt; ttf = sfnt; len = sfnt_len;
+    }
+
     int slot = -1;
     for (int i = KFONT_WEB_BASE; i < KFONT_TOTAL; i++)
         if (!g_faces[i].data) { slot = i; break; }
-    if (slot < 0) return -1;
+    if (slot < 0) { if (decoded) kfree(decoded); return -1; }
     unsigned char *copy = (unsigned char *)kmalloc(len);
-    if (!copy) return -1;
+    if (!copy) { if (decoded) kfree(decoded); return -1; }
     memcpy(copy, ttf, len);
+    if (decoded) kfree(decoded);
     struct kface *f = &g_faces[slot];
     f->tried = true;
     f->data = copy;

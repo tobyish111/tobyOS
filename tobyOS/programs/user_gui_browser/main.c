@@ -2170,13 +2170,20 @@ static int webfont_pick_url(const char *s, int n, char *out, int cap) {
             ci_find(s + e, seg_len, "opentype") >= 0) is_ttf = 1;
         if (ulen >= 4 && (ci_find(s + p + ulen - 4, 4, ".ttf") >= 0 ||
                           ci_find(s + p + ulen - 4, 4, ".otf") >= 0)) is_ttf = 1;
-        int is_woff = (ci_find(s + e, seg_len, "woff") >= 0) ||
-                      (ulen >= 5 && ci_find(s + p + ulen - 5, 5, ".woff") >= 0);
-        if (is_ttf && ulen > 0 && ulen < cap) {
+        /* WOFF2 is now decodable (kernel woff2.c); WOFF1 still isn't. */
+        int is_woff2 = (ci_find(s + e, seg_len, "woff2") >= 0) ||
+                       (ulen >= 6 && ci_find(s + p + ulen - 6, 6, ".woff2") >= 0);
+        int is_woff1 = !is_woff2 &&
+                       ((ci_find(s + e, seg_len, "woff") >= 0) ||
+                        (ulen >= 5 && ci_find(s + p + ulen - 5, 5, ".woff") >= 0));
+        if (is_ttf && ulen > 0 && ulen < cap) {   /* raw sfnt: best, use now */
             memcpy(out, s + p, ulen); out[ulen] = 0;
             return 1;
         }
-        if (!is_woff && !best && ulen > 0 && ulen < cap) {
+        if (is_woff2 && ulen > 0 && ulen < cap) {  /* decodable: strong pick */
+            memcpy(out, s + p, ulen); out[ulen] = 0;
+            best = 1;
+        } else if (!is_woff1 && !best && ulen > 0 && ulen < cap) {
             memcpy(out, s + p, ulen); out[ulen] = 0;
             best = 1;                       /* unknown format: tentative */
         }
@@ -7397,10 +7404,8 @@ static void load_webfonts(void) {
         long nf = sys_http_fetch(&req);
         if (nf > 12 && req.status >= 200 && req.status < 400) {
             long face = sys_gui_font_register(buf, (unsigned long)nf);
-            if (face >= 0) {
+            if (face >= 0)
                 w->face = (int)face;
-                sys_write(1, "[webfont] registered\n", 21);
-            }
         }
         free(buf);
     }

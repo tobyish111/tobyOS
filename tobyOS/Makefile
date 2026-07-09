@@ -179,6 +179,7 @@ C_SRCS := src/kernel.c \
           src/http_async.c \
           src/puff.c \
           src/brotli.c \
+          src/woff2.c \
           src/socket.c \
           src/gfx.c \
           src/mouse.c \
