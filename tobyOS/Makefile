@@ -928,6 +928,11 @@ $(LIBTOBY_SRC)/font.o: $(LIBTOBY_SRC)/font.c
 $(LIBTOBY_SRC)/image.o: $(LIBTOBY_SRC)/image.c
 	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -Wno-unused-function -Wno-sign-compare -c $< -o $@
 
+# mp3_decode.c embeds the real minimp3 implementation (float synthesis
+# + SSE2 intrinsics on x86-64), so it needs SSE like stb_image/stb_tt.
+$(LIBTOBY_SRC)/mp3_decode.o: $(LIBTOBY_SRC)/mp3_decode.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
+
 # WebP decode (stage 13 beyond-tier): the vendored libwebp v1.4.0
 # decode-only subset (src/dec + the decode-side src/dsp + src/utils),
 # compiled into libtoby so toby_image_load() decodes RIFF/WEBP like any
@@ -1014,6 +1019,9 @@ $(LIBTOBY_SRC)/font.pic.o: $(LIBTOBY_SRC)/font.c
 
 $(LIBTOBY_SRC)/image.pic.o: $(LIBTOBY_SRC)/image.c
 	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -Wno-unused-function -Wno-sign-compare -c $< -o $@
+
+$(LIBTOBY_SRC)/mp3_decode.pic.o: $(LIBTOBY_SRC)/mp3_decode.c
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
 
 $(LIBTOBY_SO): $(LIBTOBY_PIC_OBJS)
 	$(LD) -m elf_x86_64 -nostdlib -shared -soname libtoby.so \

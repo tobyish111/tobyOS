@@ -1,7 +1,9 @@
 /* mp3_decode.c -- MP3/AAC/Opus decode wrappers for tobyOS.
  *
- * MP3 decoding is backed by minimp3.h (third_party stub).
- * AAC and Opus init/decode/free are placeholder stubs that return -1.
+ * MP3 decoding is backed by the REAL minimp3 (lieff/minimp3, CC0) --
+ * the stage-13 media work swapped out the placeholder stub, so
+ * toby_mp3_decode_frame now yields actual PCM.
+ * AAC and Opus init/decode/free remain placeholder stubs (-1).
  */
 
 #include "libtoby_internal.h"
@@ -9,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MINIMP3_IMPLEMENTATION
 #include "../../third_party/minimp3.h"
 
 /* ---- MP3 ---- */

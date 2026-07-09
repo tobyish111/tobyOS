@@ -70,6 +70,7 @@ struct gui_event {
  * link and find logic is unchanged. */
 #include <toby/tk.h>
 #include <toby/image.h>     /* stb_image-backed ARGB decoder (libtoby) */
+#include <toby/audio_decode.h>  /* real minimp3 MP3 decode (stage 13 media) */
 /* QuickJS (third_party/quickjs, linked by the Makefile). Included this
  * early so its headers see none of the short macros defined below
  * (E, cur, g_raw, ...). Its inline helpers trip -Wextra; scoped off. */
@@ -261,6 +262,41 @@ static inline long sys_ws_close(long h, int code) {
     __asm__ volatile ("syscall"
         : "=a"(r)
         : "0"((long)SYS_WS_CLOSE), "D"(h), "S"((long)code)
+        : "rcx", "r11", "memory");
+    return r;
+}
+
+/* ---- Audio engine (stage 13 media): open/write/close --------------- *
+ * PCM16 stream into the kernel mixer (audio_engine.c). WRITE is a
+ * non-blocking ring write returning bytes accepted -- the media pump
+ * throttles on that. */
+#define SYS_AUDIO_OPEN  143
+#define SYS_AUDIO_WRITE 144
+#define SYS_AUDIO_CLOSE 145
+#define AUDIO_FMT_PCM16 1
+
+static inline long sys_audio_open(uint32_t rate, int channels, int fmt) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_AUDIO_OPEN), "D"((long)rate), "S"((long)channels),
+          "d"((long)fmt)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_audio_write(int fd, const void *samples, unsigned long bytes) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_AUDIO_WRITE), "D"((long)fd), "S"(samples), "d"(bytes)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_audio_close(int fd) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_AUDIO_CLOSE), "D"((long)fd)
         : "rcx", "r11", "memory");
     return r;
 }
@@ -860,6 +896,40 @@ struct jsws {
     JSValue  obj;
 };
 
+/* Stage 13: <video>/<audio> media elements. A <video> owns an ARGB
+ * backing store (the canvas/img pattern) that MJPEG-in-AVI frames
+ * decode into on a wall-clock schedule; an <audio> decodes MP3
+ * (real minimp3 via libtoby) into a kernel audio-engine stream.
+ * The whole file is fetched async (one in flight, like images). */
+#define MEDIA_MAX        2            /* media elements per tab */
+#define MEDIA_FETCH_CAP  (4u << 20)   /* per-file download cap */
+#define MEDIA_FRAMES_MAX 512
+#define MEDIA_PCM_CARRY  (1152 * 2)   /* int16s: one MP3 frame, stereo */
+
+struct media_el {
+    int      used;
+    int      node;                /* dnode index */
+    int      img;                 /* backing-store img index (video) */
+    int      is_video;
+    int      autoplay, loop;
+    int      state;               /* 0 pending, 2 in-flight, 1 ready, -1 failed */
+    int      playing;
+    char     src[512];
+    uint8_t *data;                /* the whole media file */
+    long     dlen;
+    /* video: MJPEG-in-AVI frame index */
+    long     frame_off[MEDIA_FRAMES_MAX];
+    int      frame_len[MEDIA_FRAMES_MAX];
+    int      nframes, cur_frame;
+    long     frame_ms, next_ms;
+    /* audio: MP3 (minimp3) -> kernel PCM16 stream */
+    void    *mp3;                 /* toby_mp3_decoder_t* */
+    int      audio_fd;
+    long     apos;                /* read offset into data */
+    int16_t  carry[MEDIA_PCM_CARRY];  /* decoded-but-unwritten PCM */
+    int      carry_off, carry_len;    /* bytes */
+};
+
 /* Stage 13F: DOM mutation log for MutationObserver delivery. Each JS
  * mutation primitive records (node, kind); the pump hands the batch to
  * the prelude's observer check. Kinds: 0 childList, 1 attributes,
@@ -892,6 +962,7 @@ struct tab {
     char       js_nav[URL_MAX + 1];   /* deferred location.href target */
     struct jsfetch js_fetches[JS_FETCH_MAX];  /* pending fetch() calls */
     struct jsws js_ws[JS_WS_MAX];             /* live WebSocket objects */
+    struct media_el media[MEDIA_MAX]; int nmedia;  /* <video>/<audio> */
     /* stage 13F: observers (Mutation/Intersection/Resize + scroll) */
     JSValue    js_obs_check;   /* prelude observer-check callback */
     int        js_has_obs_check;
@@ -3401,6 +3472,8 @@ static const char UA_SHEET[] =
 "track,source,area,col,colgroup,select,textarea,iframe,object,embed,"
 "video,audio,svg,map,picture{display:none}\n"
 "canvas{display:inline-block}\n"      /* stage 13I: replaced element */
+"video{display:inline-block}\n"       /* stage 13: media elements */
+"audio{display:none}\n"
 "input[type=hidden]{display:none}\n"
 "body{margin:8px;color:#1b1b1b;background-color:#ffffff;font-size:15px;"
 "line-height:1.3}\n"
@@ -5151,11 +5224,15 @@ static void page_reset(void) {
     g_focus_field = -1;
     /* NOTE: caller frees decoded pixels via images_free() before reset. */
     g_nimages = 0;
+    cur->nmedia = 0;              /* caller ran media_free() first */
 }
 
 static void resolve_relative_url(const char *base, const char *rel, char *out, int out_max);
 static void images_free(void);
 static void tab_images_free(struct tab *t);
+static void media_free(void);
+static void tab_media_free(struct tab *t);
+static void media_fetch_cancel(void);
 static void layout(int width);
 static void clamp_scroll(void);
 static int  has_scheme(const char *s);
@@ -5229,6 +5306,53 @@ static void collect_node(int ni) {
                 nd->img = (int16_t)g_nimages++;
             }
         }
+        break;
+    }
+    case T_VIDEO:
+    case T_AUDIO: {
+        /* stage 13: media elements. Register a media_el keyed by the
+         * node (stable across light re-collects); <video> also gets an
+         * ARGB backing store (canvas pattern) frames decode into. */
+        int found = -1;
+        for (int k = 0; k < cur->nmedia; k++)
+            if (cur->media[k].used && cur->media[k].node == ni) { found = k; break; }
+        if (found >= 0) break;
+        char src[512];
+        if (!(node_attr_str(nd, "src", src, sizeof(src)) && src[0])) break;
+        if (cur->nmedia >= MEDIA_MAX) break;
+        struct media_el *m = &cur->media[cur->nmedia];
+        mem_zero(m, sizeof(*m));
+        m->used = 1;
+        m->node = ni;
+        m->img = -1;
+        m->audio_fd = -1;
+        m->is_video = (nd->tag == T_VIDEO);
+        resolve_relative_url(g_url, src, m->src, sizeof(m->src));
+        char d[12];
+        m->autoplay = node_attr_str(nd, "autoplay", d, sizeof d) ? 1 : 0;
+        m->loop     = node_attr_str(nd, "loop", d, sizeof d) ? 1 : 0;
+        if (m->is_video && nd->img < 0 && g_nimages < IMG_MAX) {
+            int cw = node_attr_str(nd, "width",  d, sizeof d) ? atoi_simple(d) : 320;
+            int ch = node_attr_str(nd, "height", d, sizeof d) ? atoi_simple(d) : 240;
+            if (cw < 16)   cw = 320;
+            if (ch < 16)   ch = 240;
+            if (cw > 1280) cw = 1280;
+            if (ch > 960)  ch = 960;
+            uint32_t *px = (uint32_t *)malloc((size_t)cw * (size_t)ch * 4);
+            if (px) {
+                for (long i = 0; i < (long)cw * ch; i++)
+                    px[i] = 0xFF000000u;      /* opaque black until frames */
+                struct img *im = &g_images[g_nimages];
+                mem_zero(im, sizeof(*im));
+                im->w = (int16_t)cw;      im->h = (int16_t)ch;
+                im->attr_w = (int16_t)cw; im->attr_h = (int16_t)ch;
+                im->pixels = px;
+                im->state = 1;
+                m->img = g_nimages;
+                nd->img = (int16_t)g_nimages++;
+            }
+        }
+        cur->nmedia++;
         break;
     }
     case T_IMG: {
@@ -6050,6 +6174,32 @@ static JSValue js_ws_closeprim(JSContext *cx, JSValueConst t, int argc, JSValueC
         }
     sys_ws_close(h, code);
     return JS_UNDEFINED;
+}
+
+/* __dom.mediaCtl(node, play): play/pause the node's media element
+ * (stage 13). Returns true if the node had one. */
+static JSValue js_media_ctl(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_FALSE;
+    int ni = jsi(cx, argv[0]);
+    int32_t play = 0;
+    JS_ToInt32(cx, &play, argv[1]);
+    for (int k = 0; k < cur->nmedia; k++) {
+        struct media_el *m = &cur->media[k];
+        if (!m->used || m->node != ni) continue;
+        if (m->state == 1) {
+            m->playing = play ? 1 : 0;
+            if (m->playing) {
+                m->next_ms = js_now_ms();
+                if (m->is_video && m->cur_frame >= m->nframes)
+                    m->cur_frame = 0;      /* replay from the top */
+            }
+        } else if (m->state == 0 || m->state == 2) {
+            m->autoplay = play ? 1 : 0;    /* start once the fetch lands */
+        }
+        return JS_TRUE;
+    }
+    return JS_FALSE;
 }
 
 /* Call obj.__fire(type, a, b) from the pump. Consumes a and b. */
@@ -6964,6 +7114,12 @@ static const char JS_PRELUDE[] =
 "    var ix = l.indexOf(f); if (ix >= 0) l.splice(ix, 1);\n"
 "  };\n"
 "  g.WebSocket = WebSocket;\n"
+/* ---- stage 13: media element control ------------------------------ */
+"  Element.prototype.play = function(){\n"
+"    D.mediaCtl(this.__i, 1);\n"
+"    return Promise.resolve();\n"
+"  };\n"
+"  Element.prototype.pause = function(){ D.mediaCtl(this.__i, 0); };\n"
 "  g.navigator = { userAgent: 'TobyOS/4.0 (tobyOS x86_64) QuickJS' };\n"
 "  function parseUrl(h){\n"
 "    var m = /^(https?:)\\/\\/([^\\/?#]*)([^?#]*)(\\??[^#]*)(#?.*)$/.exec(h) || [];\n"
@@ -7561,6 +7717,7 @@ static int js_ensure(void) {
             {"wsOpen", js_ws_openprim, 2},
             {"wsSend", js_ws_sendprim, 2},
             {"wsClose", js_ws_closeprim, 2},
+            {"mediaCtl", js_media_ctl, 2},
             {"storeLoad", js_dom_storeload, 0},
             {"storeSave", js_dom_storesave, 1},
             {"idbLoad", js_dom_idbload, 1},
@@ -7983,6 +8140,7 @@ static void render_html(void) {
     cur->doc_gen++;                       /* new document (popstate gen) */
     js_teardown(cur);                     /* the old page's JS world dies */
     images_free();
+    media_free();
     page_reset();
 
     dom_build();
@@ -8021,6 +8179,7 @@ static void render_mono_doc(void) {
     cur->doc_gen++;                       /* new document (popstate gen) */
     js_teardown(cur);
     images_free();
+    media_free();
     page_reset();
 
     int root = dom_new(T_UNK, -1);
@@ -8318,7 +8477,9 @@ static void tab_close(int idx) {
         g_tabs[idx].nav_handle = -1;
     }
     img_fetch_cancel();                      /* tab indices shift below */
+    media_fetch_cancel();
     tab_images_free(&g_tabs[idx]);
+    tab_media_free(&g_tabs[idx]);
     js_teardown(&g_tabs[idx]);
     if (g_tabs[idx].eng) { free(g_tabs[idx].eng); g_tabs[idx].eng = NULL; }
     for (int i = idx; i < g_ntabs - 1; i++)
@@ -8442,6 +8603,23 @@ static void tab_images_free(struct tab *t) {
 }
 
 static void images_free(void) { tab_images_free(cur); }
+
+/* Free a tab's media elements: file data, MP3 decoder, audio stream.
+ * (The video backing store is an img record -- tab_images_free owns
+ * that.) Safe to call repeatedly. */
+static void tab_media_free(struct tab *t) {
+    for (int k = 0; k < t->nmedia; k++) {
+        struct media_el *m = &t->media[k];
+        if (!m->used) continue;
+        if (m->data) { free(m->data); m->data = NULL; }
+        if (m->mp3)  { toby_mp3_decode_free((toby_mp3_decoder_t *)m->mp3); m->mp3 = NULL; }
+        if (m->audio_fd >= 0) { sys_audio_close(m->audio_fd); m->audio_fd = -1; }
+        m->used = 0;
+        m->playing = 0;
+    }
+}
+
+static void media_free(void) { media_fetch_cancel(); tab_media_free(cur); }
 
 /* Cooperative (incremental) image loading. Images parse as state=0
  * "pending"; the main idle loop calls load_one_pending_image() which
@@ -9040,6 +9218,282 @@ static int load_one_pending_image(void) {
     g_imgf_ti = ti_sel;
     g_imgf_ii = ii_sel;
     return 0;
+}
+
+/* ===================== Media playback (stage 13) ====================== *
+ * <video> = MJPEG-in-AVI: demux the RIFF container once, then decode
+ * one JPEG frame per due tick (stb JPEG via toby_image_load) into the
+ * element's ARGB backing store and repaint -- no relayout. <audio> =
+ * MP3 via the real minimp3 (libtoby), decoded incrementally into the
+ * kernel audio engine's PCM16 stream, throttled by the ring. The file
+ * downloads async exactly like images (one transfer in flight). */
+
+static int g_medf_handle = -1;
+static int g_medf_ti = -1, g_medf_ii = -1;
+
+static void media_fetch_cancel(void) {
+    if (g_medf_handle >= 0) {
+        sys_http_finish(g_medf_handle);
+        g_medf_handle = -1;
+    }
+    for (int ti = 0; ti < g_ntabs; ti++)
+        for (int k = 0; k < g_tabs[ti].nmedia; k++)
+            if (g_tabs[ti].media[k].used && g_tabs[ti].media[k].state == 2)
+                g_tabs[ti].media[k].state = 0;
+    g_medf_ti = g_medf_ii = -1;
+}
+
+static int m4(const uint8_t *p, const char *s) {
+    return p[0] == (uint8_t)s[0] && p[1] == (uint8_t)s[1] &&
+           p[2] == (uint8_t)s[2] && p[3] == (uint8_t)s[3];
+}
+static uint32_t rd32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Index the '##dc'/'##db' video chunks of an MJPEG AVI and read the
+ * frame period from avih. Returns 0 with >= 1 frame, else -1. */
+static int media_demux_avi(struct media_el *m) {
+    const uint8_t *d = m->data;
+    long n = m->dlen;
+    if (n < 12 || !m4(d, "RIFF") || !m4(d + 8, "AVI ")) return -1;
+    m->frame_ms = 100;
+    m->nframes = 0;
+    long off = 12;
+    while (off + 8 <= n) {
+        const uint8_t *c = d + off;
+        uint32_t sz = rd32le(c + 4);
+        if ((long)sz > n - off - 8) sz = (uint32_t)(n - off - 8);
+        if (m4(c, "LIST") && off + 12 <= n) {
+            const uint8_t *lt = c + 8;
+            if (m4(lt, "hdrl")) {
+                const uint8_t *a = c + 12;   /* avih is the first subchunk */
+                if (a + 16 <= d + n && m4(a, "avih")) {
+                    uint32_t uspf = rd32le(a + 8);
+                    if (uspf >= 1000 && uspf <= 10000000)
+                        m->frame_ms = (long)(uspf / 1000);
+                }
+            } else if (m4(lt, "movi")) {
+                long p = off + 12, end = off + 8 + (long)sz;
+                if (end > n) end = n;
+                while (p + 8 <= end && m->nframes < MEDIA_FRAMES_MAX) {
+                    const uint8_t *k = d + p;
+                    uint32_t ksz = rd32le(k + 4);
+                    if ((long)ksz > end - p - 8) break;
+                    if (k[2] == 'd' && (k[3] == 'c' || k[3] == 'b') && ksz > 0) {
+                        m->frame_off[m->nframes] = p + 8;
+                        m->frame_len[m->nframes] = (int)ksz;
+                        m->nframes++;
+                    }
+                    p += 8 + (long)ksz + (ksz & 1);
+                }
+            }
+        }
+        off += 8 + (long)sz + (sz & 1);
+    }
+    return m->nframes > 0 ? 0 : -1;
+}
+
+/* MP3 sniff: ID3v2 tag or an MPEG audio sync word. */
+static int media_sniff_mp3(const uint8_t *d, long n) {
+    if (n < 4) return 0;
+    if (d[0] == 'I' && d[1] == 'D' && d[2] == '3') return 1;
+    return d[0] == 0xFF && (d[1] & 0xE0) == 0xE0;
+}
+
+/* Nearest-neighbour blit of a decoded frame into the backing store. */
+static void media_blit(struct img *dst, toby_image_t *src) {
+    if (!dst->pixels || !src->pixels || src->width <= 0 || src->height <= 0)
+        return;
+    for (int y = 0; y < dst->h; y++) {
+        int sy = (int)((long)y * src->height / dst->h);
+        uint32_t *drow = &dst->pixels[(long)y * dst->w];
+        const uint32_t *srow = &src->pixels[(long)sy * src->width];
+        for (int x = 0; x < dst->w; x++)
+            drow[x] = srow[(long)x * src->width / dst->w] | 0xFF000000u;
+    }
+}
+
+static void med_log(const char *what, int a, int b) {
+    char m[96];
+    int p = msg_append(m, 0, sizeof(m), "[med] ");
+    p = msg_append(m, p, sizeof(m), what);
+    p = msg_append(m, p, sizeof(m), " ");
+    p = msg_append_int(m, p, sizeof(m), a);
+    p = msg_append(m, p, sizeof(m), " ");
+    p = msg_append_int(m, p, sizeof(m), b);
+    p = msg_append(m, p, sizeof(m), "\n");
+    sys_write(1, m, (unsigned long)p);
+}
+
+/* Fetch completion: sniff the container and ready the element. */
+static void media_ready(struct media_el *m) {
+    if (m->is_video && media_demux_avi(m) == 0) {
+        med_log("video frames/period", m->nframes, (int)m->frame_ms);
+        m->state = 1;
+    } else if (!m->is_video && media_sniff_mp3(m->data, m->dlen)) {
+        m->mp3 = toby_mp3_decode_init();
+        if (!m->mp3) { m->state = -1; return; }
+        med_log("audio bytes", (int)m->dlen, 0);
+        m->apos = 0;
+        m->state = 1;
+    } else {
+        med_log("unsupported container", (int)m->dlen, m->is_video);
+        m->state = -1;
+        return;
+    }
+    if (m->autoplay) {
+        m->playing = 1;
+        m->next_ms = js_now_ms();
+    }
+}
+
+/* One async media transfer at a time (the image-loader pattern). */
+static int load_one_pending_media(void) {
+    if (g_medf_handle >= 0) {
+        struct http_poll pi;
+        long pr = sys_http_poll(g_medf_handle, &pi);
+        if (pr == 0 &&
+            (pi.state == HTTPA_QUEUED || pi.state == HTTPA_RUNNING))
+            return 0;
+        int ti = g_medf_ti, ii = g_medf_ii;
+        uint8_t *buf = NULL;
+        long n = -1;
+        if (pr == 0 && pi.state == HTTPA_DONE && pi.body_len > 0) {
+            buf = (uint8_t *)malloc(pi.body_len);
+            if (buf)
+                n = sys_http_read(g_medf_handle, buf, 0, pi.body_len);
+        }
+        sys_http_finish(g_medf_handle);
+        g_medf_handle = -1;
+        g_medf_ti = g_medf_ii = -1;
+
+        if (ti < 0 || ti >= g_ntabs || ii >= g_tabs[ti].nmedia ||
+            g_tabs[ti].media[ii].state != 2) {
+            if (buf) free(buf);
+            return 1;
+        }
+        struct media_el *m = &g_tabs[ti].media[ii];
+        if (n <= 0) {
+            if (buf) free(buf);
+            m->state = -1;
+            return 1;
+        }
+        m->data = buf;
+        m->dlen = n;
+        media_ready(m);
+        return 1;
+    }
+
+    int ti_sel = -1, ii_sel = -1;
+    for (int pass = 0; pass < 2 && ti_sel < 0; pass++) {
+        for (int ti = 0; ti < g_ntabs; ti++) {
+            if ((pass == 0) != (ti == g_active)) continue;   /* active first */
+            struct tab *t = &g_tabs[ti];
+            for (int k = 0; k < t->nmedia; k++)
+                if (t->media[k].used && t->media[k].state == 0 &&
+                    t->media[k].src[0]) {
+                    ti_sel = ti; ii_sel = k; break;
+                }
+            if (ti_sel >= 0) break;
+        }
+    }
+    if (ti_sel < 0) return 0;
+
+    struct media_el *m = &g_tabs[ti_sel].media[ii_sel];
+    long h = sys_http_start(m->src, MEDIA_FETCH_CAP);
+    if (h < 0) return 0;                    /* slot table busy: retry later */
+    m->state = 2;
+    g_medf_handle = (int)h;
+    g_medf_ti = ti_sel;
+    g_medf_ii = ii_sel;
+    return 0;
+}
+
+/* Keep the audio-engine ring fed: write leftover PCM first, then
+ * decode more MP3 frames until the ring pushes back. */
+static int media_audio_pump(struct media_el *m) {
+    if (!m->mp3) return 0;
+    int work = 0;
+    for (int guard = 0; guard < 24; guard++) {
+        if (m->carry_len > 0) {
+            if (m->audio_fd < 0) break;
+            long w = sys_audio_write(m->audio_fd,
+                                     (const uint8_t *)m->carry + m->carry_off,
+                                     (unsigned long)m->carry_len);
+            if (w <= 0) break;              /* ring full: next pass */
+            m->carry_off += (int)w;
+            m->carry_len -= (int)w;
+            work = 1;
+            if (m->carry_len > 0) break;
+            continue;
+        }
+        if (m->apos >= m->dlen) break;
+        int samples = 0, ch = 0, rate = 0;
+        int fb = toby_mp3_decode_frame((toby_mp3_decoder_t *)m->mp3,
+                                       m->data + m->apos,
+                                       (size_t)(m->dlen - m->apos),
+                                       m->carry, &samples, &ch, &rate);
+        if (fb <= 0) { m->apos = m->dlen; break; }
+        m->apos += fb;
+        if (samples > 0 && ch > 0 && ch <= 2) {
+            if (m->audio_fd < 0) {
+                m->audio_fd = (int)sys_audio_open((uint32_t)rate, ch,
+                                                  AUDIO_FMT_PCM16);
+                med_log("audio stream fd/rate",
+                        m->audio_fd, rate);
+                if (m->audio_fd < 0) { m->playing = 0; return work; }
+            }
+            m->carry_off = 0;
+            m->carry_len = samples * ch * 2;
+            work = 1;
+        }
+    }
+    if (m->apos >= m->dlen && m->carry_len == 0) {
+        if (m->loop) m->apos = 0;
+        else m->playing = 0;
+    }
+    return work;
+}
+
+/* Main-loop tick: advance the ACTIVE tab's playing media. */
+static int media_pump(void) {
+    int work = 0;
+    int repaint = 0;
+    long now = js_now_ms();
+    for (int k = 0; k < cur->nmedia; k++) {
+        struct media_el *m = &cur->media[k];
+        if (!m->used || m->state != 1 || !m->playing) continue;
+        if (m->is_video) {
+            if (m->nframes <= 0 || now < m->next_ms) continue;
+            struct img *im = (m->img >= 0 && m->img < g_nimages)
+                                 ? &g_images[m->img] : NULL;
+            if (im && im->pixels) {
+                toby_image_t *f = toby_image_load(
+                    m->data + m->frame_off[m->cur_frame],
+                    (size_t)m->frame_len[m->cur_frame]);
+                if (f) {
+                    media_blit(im, f);
+                    toby_image_free(f);
+                    repaint = 1;
+                }
+            }
+            m->cur_frame++;
+            if (m->cur_frame >= m->nframes) {
+                if (m->loop) m->cur_frame = 0;
+                else m->playing = 0;
+            }
+            long due = m->next_ms + m->frame_ms;
+            m->next_ms = (due > now - 4 * m->frame_ms) ? due
+                                                       : now + m->frame_ms;
+            work = 1;
+        } else {
+            work |= media_audio_pump(m);
+        }
+    }
+    if (repaint) tk_redraw(&win);
+    return work;
 }
 
 /* ---- Stage 12D: async page navigation ----------------------------- *
@@ -10345,6 +10799,8 @@ int main(int argc, char **argv) {
         if (tk_pump(&win)) break;          /* events + repaint; 1 = quit */
         int work = nav_pump();             /* async page loads (12D) */
         work |= load_one_pending_image();
+        work |= load_one_pending_media();  /* <video>/<audio> files */
+        work |= media_pump();              /* frame + PCM advance */
         work |= js_pump_all();             /* timers + jobs + fetches */
         if (!work)
             sys_sleep_ms(15);              /* nothing pending -> idle */
