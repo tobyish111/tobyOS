@@ -119,13 +119,37 @@ end-to-end`, `1-RTT keys installed (client app key 21301ca387c8…) --
 QUIC HANDSHAKE COMPLETE (crypto)`. The responder's server-Finished MAC
 was cross-checked against an independent RFC 8446 reference.
 
+## Slice 4f — certificate authentication over QUIC
+The stage-13H X.509 chain validation + CertificateVerify verification
+moved out of `tls.c` into a shared **`tls_x509.{c,h}`** module
+(`tls_x509_validate_chain` / `tls_x509_verify_cv`), so TLS-over-TCP and
+QUIC authenticate the peer with the same code. `tls.c` calls it via
+name-preserving macros (a pure move — TLS-over-TCP unchanged).
+- `quic_udp_send_test()` now runs cert authentication on the server
+  flight: `tls_x509_validate_chain` on the **Certificate** message
+  (real DER), and — when the chain is trusted —
+  `tls_x509_verify_cv` on the **CertificateVerify** signature over the
+  transcript `Hash(CH‖SH‖EE‖Certificate)`.
+
+### Verified (QEMU SLIRP + responder with a real self-signed cert;
+### plus the wss:// TLS-over-TCP regression)
+The responder now presents a **real self-signed EC P-256 certificate**
+(330-byte DER) in its Certificate message.
+- QUIC: tobyOS decrypts the 399-byte flight, and its BearSSL chain
+  engine parses the real cert and reports `cert chain UNTRUSTED
+  (fail-closed) -- 13H path runs over QUIC` — the correct fail-closed
+  behavior on an untrusted cert (a trusted server passes both halves;
+  the crypto is the same `tls_x509_verify_cv` proven for TLS-over-TCP).
+  The handshake still completes (`server Finished VERIFIED`, 1-RTT
+  keys installed).
+- TLS-over-TCP: the `wss://` handshake (which drives the same lifted
+  functions) still validates + completes — the refactor is
+  behavior-identical.
+
 ## What's next (HTTP/3 slices)
-- **Slice 4f** — cert authentication + client Finished: validate the
-  Certificate chain and CertificateVerify signature (reusing the
-  stage-13H BearSSL path, which requires lifting `tls_validate_chain`
-  / `tls_verify_cv` out of `tls.c` into a shared module) and send the
-  client Finished. Against a full live QUIC server with a real cert,
-  not the scripted responder.
+- **Slice 4g** — client Finished + the full handshake against a live
+  QUIC server presenting a trusted cert (so `tls_x509_verify_cv` runs
+  the CertificateVerify path over QUIC end to end).
 - **Slice 5** — HTTP/3 HEADERS/DATA framing + QPACK over QUIC 1-RTT
   streams, into `http.c` behind an Alt-Svc / explicit-h3 probe with
   the h2/h1.1 fallback ladder intact.

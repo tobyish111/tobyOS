@@ -223,6 +223,7 @@ C_SRCS := src/kernel.c \
           src/quic_crypto.c \
           src/quic_packet.c \
           src/quic_conn.c \
+          src/tls_x509.c \
           src/tls_trust.c \
           src/procfs.c \
           src/tty.c \
@@ -717,6 +718,14 @@ src/ws.o: src/ws.c $(HEADERS) Makefile
 # quic_crypto.c uses BearSSL AES-128-GCM (block/aead) for QUIC packet +
 # header protection, so it needs the BearSSL headers + <string.h> shim.
 src/quic_crypto.o: src/quic_crypto.c $(HEADERS) Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -Ithird_party/bearssl/shim -Ithird_party/bearssl/inc -c $< -o $@
+
+# tls_x509.c (shared cert validation) + quic_conn.c (which now calls it
+# for QUIC cert auth) use the BearSSL X.509 API -> same headers + shim.
+src/tls_x509.o: src/tls_x509.c $(HEADERS) Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -Ithird_party/bearssl/shim -Ithird_party/bearssl/inc -c $< -o $@
+
+src/quic_conn.o: src/quic_conn.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -Ithird_party/bearssl/shim -Ithird_party/bearssl/inc -c $< -o $@
 
 # ---------- Link ----------

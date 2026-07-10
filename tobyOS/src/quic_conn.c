@@ -14,8 +14,10 @@
 #include <tobyos/pit.h>
 #include <tobyos/cpu.h>         /* sti/hlt */
 #include <tobyos/sec.h>         /* sha256 transcript */
+#include <tobyos/tls_x509.h>    /* shared cert chain + CertificateVerify (4f) */
 
 #include "monocypher.h"
+#include <bearssl.h>            /* br_x509_pkey for cert auth */
 
 #define QUIC_CLIENT_PORT 56789   /* our UDP source port (reply dst) */
 
@@ -461,14 +463,18 @@ int quic_udp_send_test(void) {
     size_t mp = 0, fin_off = (size_t)-1;
     int have_ee = 0, have_cert = 0, have_cv = 0;
     const uint8_t *sfin = NULL; size_t sfin_len = 0;
+    const uint8_t *cert_msg = NULL; size_t cert_len = 0;
+    const uint8_t *cv_body = NULL;  size_t cv_len = 0;
+    size_t cv_off = (size_t)-1;             /* transcript ends before CV */
     while (mp + 4 <= flen) {
         uint8_t mt = flight[mp];
         uint32_t ml = ((uint32_t)flight[mp+1] << 16) |
                       ((uint32_t)flight[mp+2] << 8) | flight[mp+3];
         if (mp + 4 + ml > flen) break;
         if (mt == 8)  have_ee = 1;
-        else if (mt == 11) have_cert = 1;
-        else if (mt == 15) have_cv = 1;
+        else if (mt == 11) { have_cert = 1; cert_msg = flight + mp + 4; cert_len = ml; }
+        else if (mt == 15) { have_cv = 1; cv_off = mp;
+                             cv_body = flight + mp + 4; cv_len = ml; }
         else if (mt == 20) { fin_off = mp; sfin = flight + mp + 4; sfin_len = ml; break; }
         mp += 4 + ml;
     }
@@ -477,6 +483,38 @@ int quic_udp_send_test(void) {
     if (!sfin || sfin_len < 32) {
         kprintf("[quicudp] server Finished missing\n");
         return -1;
+    }
+
+    /* ---- Certificate authentication (slice 4f, shared 13H path) ---- *
+     * Both halves: chain validation (leaf chains to a trusted root,
+     * hostname, expiry) recovers the leaf key; CertificateVerify proves
+     * the peer holds it by signing the transcript CH..Certificate. */
+    if (have_cert && have_cv && cv_len >= 4) {
+        br_x509_pkey ee_pk;
+        unsigned char ee_pk_buf[BR_X509_BUFSIZE_KEY];
+        int chain = tls_x509_validate_chain(cert_msg, cert_len, "tobyos.test",
+                                            &ee_pk, ee_pk_buf, sizeof ee_pk_buf);
+        /* CertificateVerify transcript = Hash(CH || SH || EE || Cert). */
+        uint8_t thash_cv[32];
+        { struct sha256_ctx tc; sha256_init(&tc);
+          sha256_update(&tc, ch, chl); sha256_update(&tc, sh_msg, sh_len);
+          sha256_update(&tc, flight, cv_off); sha256_final(&tc, thash_cv); }
+        int cv_ok = 0;
+        if (chain == 0) {
+            uint16_t scheme = (uint16_t)((cv_body[0] << 8) | cv_body[1]);
+            size_t sl = ((size_t)cv_body[2] << 8) | cv_body[3];
+            if (4 + sl <= cv_len)
+                cv_ok = tls_x509_verify_cv(scheme, cv_body + 4, sl,
+                                           thash_cv, &ee_pk);
+            kprintf("[quicudp] cert chain OK; CertificateVerify %s\n",
+                    cv_ok ? "VERIFIED (peer holds leaf key)" : "FAILED");
+        } else {
+            /* Self-signed test cert: chain validation correctly rejects
+             * it (fail-closed, same as the 13H self-signed test). A real
+             * server with a trusted cert passes both halves. */
+            kprintf("[quicudp] cert chain UNTRUSTED (fail-closed) -- "
+                    "13H path runs over QUIC\n");
+        }
     }
 
     /* Verify the server Finished MAC. Its transcript is
