@@ -925,6 +925,9 @@ struct media_el {
     long     frame_ms, next_ms;
     void    *vdec;                /* video_decoder* when H.264 (else MJPEG) */
     int      vdec_errs;           /* consecutive chunk errors (leniency) */
+    int      is_mp4;              /* MP4 container (samples are H.264) */
+    uint8_t  vcfg[512];           /* SPS/PPS Annex-B from avcC (MP4) */
+    int      vcfg_len;
     /* audio: MP3 (minimp3) -> kernel PCM16 stream */
     void    *mp3;                 /* toby_mp3_decoder_t* */
     int      audio_fd;
@@ -9299,6 +9302,210 @@ static int media_demux_avi(struct media_el *m) {
     return m->nframes > 0 ? 0 : -1;
 }
 
+/* ---- MP4 (ISO base media file format) demux -> H.264 --------------- *
+ * Walk the box tree to the video track's sample table, pull the
+ * SPS/PPS out of avcC, reconstruct each sample's file offset+size from
+ * stsc/stco/stsz, and convert each sample's length-prefixed NALs to
+ * Annex-B in place (a 4-byte AVCC length overwrites cleanly with a
+ * 00000001 start code). The frame table + the existing H.264 pump path
+ * then play it exactly like H.264-in-AVI. */
+
+static uint32_t rd32be(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* Find a child box `type` directly inside [p, p+len). Returns its
+ * payload pointer + length via *out_len, or NULL. */
+static const uint8_t *mp4_find(const uint8_t *p, long len,
+                               const char *type, long *out_len) {
+    long o = 0;
+    while (o + 8 <= len) {
+        uint32_t bsz = rd32be(p + o);
+        long hdr = 8;
+        long real;
+        if (bsz == 1) {                    /* 64-bit largesize */
+            if (o + 16 > len) break;
+            real = (long)rd32be(p + o + 12);  /* low 32 bits (enough here) */
+            hdr = 16;
+        } else {
+            real = (long)bsz;
+        }
+        if (bsz == 0) real = len - o;      /* to end */
+        if (real < hdr || o + real > len) break;
+        if (m4(p + o + 4, type)) {
+            *out_len = real - hdr;
+            return p + o + hdr;
+        }
+        o += real;
+    }
+    return NULL;
+}
+
+/* Emit an Annex-B NAL (00000001 + data) into buf, bounded. */
+static int mp4_emit_nal(uint8_t *buf, int cap, int pos,
+                        const uint8_t *nal, int nlen) {
+    if (pos + 4 + nlen > cap) return pos;
+    buf[pos] = 0; buf[pos+1] = 0; buf[pos+2] = 0; buf[pos+3] = 1;
+    memcpy(buf + pos + 4, nal, nlen);
+    return pos + 4 + nlen;
+}
+
+static int media_demux_mp4(struct media_el *m) {
+    const uint8_t *d = m->data;
+    long n = m->dlen;
+    if (n < 16 || !m4(d + 4, "ftyp")) return -1;
+
+    long moov_len = 0;
+    const uint8_t *moov = mp4_find(d, n, "moov", &moov_len);
+    if (!moov) return -1;
+
+    /* Find the video trak: trak whose mdia/hdlr handler == 'vide'. */
+    const uint8_t *stbl = NULL; long stbl_len = 0;
+    uint32_t timescale = 0;
+    long o = 0;
+    while (o + 8 <= moov_len) {
+        long tl;
+        const uint8_t *trak = mp4_find(moov + o, moov_len - o, "trak", &tl);
+        if (!trak) break;
+        long ml;
+        const uint8_t *mdia = mp4_find(trak, tl, "mdia", &ml);
+        if (mdia) {
+            long hl, mdhl;
+            const uint8_t *hdlr = mp4_find(mdia, ml, "hdlr", &hl);
+            const uint8_t *mdhd = mp4_find(mdia, ml, "mdhd", &mdhl);
+            if (hdlr && hl >= 12 && m4(hdlr + 8, "vide")) {
+                if (mdhd && mdhl >= 20) timescale = rd32be(mdhd + 12);
+                long minfl;
+                const uint8_t *minf = mp4_find(mdia, ml, "minf", &minfl);
+                if (minf) stbl = mp4_find(minf, minfl, "stbl", &stbl_len);
+                if (stbl) break;
+            }
+        }
+        o = (trak - moov) + tl;            /* advance past this trak */
+    }
+    if (!stbl) return -1;
+
+    /* avcC (in stsd -> avc1) -> SPS/PPS as Annex-B into m->vcfg. */
+    long stsdl;
+    const uint8_t *stsd = mp4_find(stbl, stbl_len, "stsd", &stsdl);
+    if (!stsd || stsdl < 8) return -1;
+    /* stsd: version(4) + entry_count(4) + entries; first entry = sample
+     * entry box. Search it (and its children) for avcC. */
+    long avccl;
+    const uint8_t *entries = stsd + 8;
+    const uint8_t *avcc = mp4_find(entries, stsdl - 8, "avcC", &avccl);
+    if (!avcc) {
+        /* avc1 sample entry: 78-byte VisualSampleEntry header, then avcC. */
+        long avc1l;
+        const uint8_t *avc1 = mp4_find(entries, stsdl - 8, "avc1", &avc1l);
+        if (!avc1) avc1 = mp4_find(entries, stsdl - 8, "avc3", &avc1l);
+        if (avc1 && avc1l > 78)
+            avcc = mp4_find(avc1 + 78, avc1l - 78, "avcC", &avccl);
+    }
+    if (!avcc || avccl < 7) return -1;
+    /* AVCDecoderConfigurationRecord: [0]=1 [1..3]=profile/compat/level
+     * [4]=lengthSizeMinusOne (low 2 bits) [5]=numSPS(low 5 bits), then
+     * SPS entries (u16 len + data), then numPPS + PPS entries. */
+    if ((avcc[4] & 0x03) != 3) return -1;  /* only 4-byte NAL lengths (v1) */
+    m->vcfg_len = 0;
+    long ap = 5;
+    int nsps = avcc[ap++] & 0x1f;
+    for (int i = 0; i < nsps && ap + 2 <= avccl; i++) {
+        int sl = (avcc[ap] << 8) | avcc[ap + 1]; ap += 2;
+        if (ap + sl > avccl) break;
+        m->vcfg_len = mp4_emit_nal(m->vcfg, sizeof m->vcfg, m->vcfg_len,
+                                   avcc + ap, sl);
+        ap += sl;
+    }
+    if (ap >= avccl) return -1;
+    int npps = avcc[ap++];
+    for (int i = 0; i < npps && ap + 2 <= avccl; i++) {
+        int pl = (avcc[ap] << 8) | avcc[ap + 1]; ap += 2;
+        if (ap + pl > avccl) break;
+        m->vcfg_len = mp4_emit_nal(m->vcfg, sizeof m->vcfg, m->vcfg_len,
+                                   avcc + ap, pl);
+        ap += pl;
+    }
+
+    /* Sample sizes (stsz), chunk offsets (stco/co64), sample-to-chunk
+     * (stsc), and timing (stts). */
+    long stszl, stscl, stcol, sttsl;
+    const uint8_t *stsz = mp4_find(stbl, stbl_len, "stsz", &stszl);
+    const uint8_t *stsc = mp4_find(stbl, stbl_len, "stsc", &stscl);
+    const uint8_t *stco = mp4_find(stbl, stbl_len, "stco", &stcol);
+    int co64 = 0;
+    if (!stco) { stco = mp4_find(stbl, stbl_len, "co64", &stcol); co64 = 1; }
+    const uint8_t *stts = mp4_find(stbl, stbl_len, "stts", &sttsl);
+    if (!stsz || !stsc || !stco || stszl < 12 || stscl < 8 || stcol < 8)
+        return -1;
+
+    uint32_t samp_size0 = rd32be(stsz + 4);   /* nonzero = all same size */
+    uint32_t nsamp = rd32be(stsz + 8);
+    uint32_t nchunks = rd32be(stco + 4);
+    uint32_t nsc = rd32be(stsc + 4);
+
+    /* Frame period from the first stts entry (constant-fps assumption). */
+    m->frame_ms = 40;
+    if (stts && sttsl >= 16 && timescale > 0) {
+        uint32_t delta = rd32be(stts + 12);
+        if (delta > 0) {
+            long ms = 1000L * (long)delta / (long)timescale;
+            if (ms >= 10 && ms <= 2000) m->frame_ms = ms;
+        }
+    }
+
+    /* Walk samples via stsc (which chunk each sample lands in) + stco
+     * (chunk file offset) + stsz (per-sample size), converting each to
+     * Annex-B in place. */
+    m->nframes = 0;
+    uint32_t sc_idx = 0;                    /* current stsc run */
+    uint32_t chunk = 1;
+    uint32_t samp_in_chunk = 0;
+    uint32_t spc = (nsc > 0) ? rd32be(stsc + 8 + 4) : 1;  /* samples/chunk */
+    long sample_off = 0;
+    uint32_t stsz_p = 12;
+    for (uint32_t s = 0; s < nsamp && m->nframes < MEDIA_FRAMES_MAX; s++) {
+        /* Advance stsc run when we pass its first_chunk boundary. */
+        while (sc_idx + 1 < nsc) {
+            uint32_t next_first = rd32be(stsc + 8 + (sc_idx + 1) * 12);
+            if (chunk >= next_first) {
+                sc_idx++;
+                spc = rd32be(stsc + 8 + sc_idx * 12 + 4);
+            } else break;
+        }
+        if (samp_in_chunk == 0) {          /* first sample of a chunk */
+            if (chunk > nchunks) break;
+            if (co64)
+                sample_off = (long)rd32be(stco + 8 + (chunk - 1) * 8 + 4);
+            else
+                sample_off = (long)rd32be(stco + 8 + (chunk - 1) * 4);
+        }
+        uint32_t ssz = samp_size0 ? samp_size0 : rd32be(stsz + stsz_p);
+        stsz_p += samp_size0 ? 0 : 4;
+        if (sample_off < 0 || sample_off + (long)ssz > n) break;
+
+        /* Convert this sample's 4-byte-length NALs to Annex-B in place. */
+        long q = sample_off, sample_end = sample_off + (long)ssz;
+        while (q + 4 <= sample_end) {
+            uint32_t nlen = rd32be(d + q);
+            if (q + 4 + (long)nlen > sample_end) break;
+            uint8_t *w = m->data + q;      /* overwrite length with start code */
+            w[0] = 0; w[1] = 0; w[2] = 0; w[3] = 1;
+            q += 4 + (long)nlen;
+        }
+        m->frame_off[m->nframes] = sample_off;
+        m->frame_len[m->nframes] = (int)ssz;
+        m->nframes++;
+
+        sample_off += (long)ssz;
+        samp_in_chunk++;
+        if (samp_in_chunk >= spc) { samp_in_chunk = 0; chunk++; }
+    }
+    m->is_mp4 = 1;
+    return m->nframes > 0 ? 0 : -1;
+}
+
 /* MP3 sniff: ID3v2 tag or an MPEG audio sync word. */
 static int media_sniff_mp3(const uint8_t *d, long n) {
     if (n < 4) return 0;
@@ -9337,7 +9544,20 @@ static void med_log(const char *what, int a, int b) {
 
 /* Fetch completion: sniff the container and ready the element. */
 static void media_ready(struct media_el *m) {
-    if (m->is_video && media_demux_avi(m) == 0) {
+    /* MP4 (H.264) first: ftyp box at offset 4. */
+    if (m->is_video && m->dlen > 12 && m4(m->data + 4, "ftyp") &&
+        media_demux_mp4(m) == 0) {
+        m->vdec = video_decoder_create(VIDEO_CODEC_H264);
+        if (!m->vdec) { m->state = -1; return; }
+        /* Prime the decoder with the avcC SPS/PPS (no picture yet). */
+        if (m->vcfg_len > 0) {
+            struct video_frame vf;
+            video_decoder_decode((struct video_decoder *)m->vdec,
+                                 m->vcfg, (size_t)m->vcfg_len, &vf);
+        }
+        med_log("mp4/h264 frames/period", m->nframes, (int)m->frame_ms);
+        m->state = 1;
+    } else if (m->is_video && media_demux_avi(m) == 0) {
         /* Codec sniff on the first frame chunk: an Annex-B start code
          * (00 00 [00] 01) means H.264 (stage 13: real h264bsd);
          * FF D8 means MJPEG (stb JPEG per frame). */
