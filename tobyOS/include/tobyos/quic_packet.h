@@ -42,6 +42,20 @@ size_t quic_frame_parse(const uint8_t *p, size_t cap, struct quic_frame *f);
 
 /* ---- Initial packets (long header, RFC 9001) -------------------- */
 
+/* Build a protected long-header packet. type_bits selects the packet
+ * type (0x00 Initial, 0x20 Handshake); an Initial carries a token
+ * field, a Handshake does not (has_token). key/iv/hp are the keys for
+ * this encryption level. Returns total protected bytes, or 0. */
+size_t quic_build_long(uint8_t *out, size_t cap, unsigned type_bits,
+                       const uint8_t *dcid, size_t dcid_len,
+                       const uint8_t *scid, size_t scid_len,
+                       int has_token,
+                       const uint8_t *token, size_t token_len,
+                       uint64_t pkt_num, unsigned pn_len,
+                       const uint8_t *payload, size_t payload_len,
+                       const uint8_t key[16], const uint8_t iv[12],
+                       const uint8_t hp[16]);
+
 /* Build a protected Initial packet into out (>= payload_len + 64).
  * key/iv/hp are the AES-128-GCM Initial keys for this side
  * (quic_initial_keys). pn_len is 1..4. Returns total protected bytes,

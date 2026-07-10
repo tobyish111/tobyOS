@@ -146,10 +146,30 @@ The responder now presents a **real self-signed EC P-256 certificate**
   functions) still validates + completes — the refactor is
   behavior-identical.
 
+## Slice 4g — client Finished (mutual completion)
+`quic_build_long` generalizes the packet *builder* to Initial +
+Handshake long headers (Handshake has no token; `quic_build_initial`
+is now a wrapper). tobyOS derives the **client** handshake secret +
+Handshake keys, computes the client Finished MAC over the transcript
+through the server Finished, and sends it in a client Handshake packet
+protected with the client Handshake keys.
+
+### Verified (QEMU SLIRP + responder, mutual completion)
+The responder now does a second receive after its flight, opens the
+client Handshake packet with the client Handshake keys, and verifies
+the client Finished MAC. tobyOS: `sent client Finished (83 byte
+Handshake packet) -- QUIC HANDSHAKE COMPLETE`. Responder: `received
+client packet 83 bytes … PASS: client Finished VERIFIED -- QUIC
+HANDSHAKE COMPLETE both sides`. Both parties verified each other's
+Finished — a **complete mutual QUIC handshake over the wire**. (The
+responder's client-Finished MAC was cross-checked against an
+independent RFC 8446 reference.)
+
 ## What's next (HTTP/3 slices)
-- **Slice 4g** — client Finished + the full handshake against a live
-  QUIC server presenting a trusted cert (so `tls_x509_verify_cv` runs
-  the CertificateVerify path over QUIC end to end).
+- **Slice 4h** — the full handshake against a *live* QUIC server with
+  a trusted cert (so `tls_x509_verify_cv` runs the CertificateVerify
+  path over QUIC end to end), including Retry / larger cert chains
+  spanning multiple packets and proper ACKs.
 - **Slice 5** — HTTP/3 HEADERS/DATA framing + QPACK over QUIC 1-RTT
   streams, into `http.c` behind an Alt-Svc / explicit-h3 probe with
   the h2/h1.1 fallback ladder intact.

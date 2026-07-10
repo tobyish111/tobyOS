@@ -553,6 +553,36 @@ int quic_udp_send_test(void) {
     hkdf_expand_label(c_ap, "quic hp", 7, NULL, 0, chp1, 16);
     kprintf("[quicudp] 1-RTT keys installed (client app key ");
     for (int i = 0; i < 6; i++) kprintf("%02x", ck1[i]);
-    kprintf(") -- QUIC HANDSHAKE COMPLETE (crypto)\n");
+    kprintf(")\n");
+
+    /* ---- Send the client Finished (slice 4g) ---- *
+     * client Finished MAC over the transcript through the server
+     * Finished (thash_af), keyed by the CLIENT handshake secret;
+     * carried in a Handshake packet protected with the client
+     * Handshake keys. Its receipt + verification by the peer completes
+     * the handshake in both directions. */
+    uint8_t c_hs[32];
+    derive_secret(hs_secret, "c hs traffic", 12, thash, c_hs);
+    uint8_t cfin[32];
+    compute_finished(c_hs, thash_af, cfin);
+    uint8_t cfin_msg[36];
+    cfin_msg[0] = 20; cfin_msg[1] = 0; cfin_msg[2] = 0; cfin_msg[3] = 32;
+    memcpy(cfin_msg + 4, cfin, 32);
+    uint8_t cframe[48];
+    size_t cfl = quic_frame_crypto(cframe, sizeof cframe, 0, cfin_msg, 36);
+    uint8_t chk[16], chiv[12], chhp[16];
+    hkdf_expand_label(c_hs, "quic key", 8, NULL, 0, chk, 16);
+    hkdf_expand_label(c_hs, "quic iv", 7, NULL, 0, chiv, 12);
+    hkdf_expand_label(c_hs, "quic hp", 7, NULL, 0, chhp, 16);
+    static uint8_t cpkt[256];
+    size_t cplen = quic_build_long(cpkt, sizeof cpkt, 0x20 /* Handshake */,
+                                   scid, sizeof scid, dcid, sizeof dcid,
+                                   0, NULL, 0, 0 /* pn */, 4,
+                                   cframe, cfl, chk, chiv, chhp);
+    if (cplen) {
+        (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433), cpkt, cplen);
+        kprintf("[quicudp] sent client Finished (%u byte Handshake packet) -- "
+                "QUIC HANDSHAKE COMPLETE\n", (unsigned)cplen);
+    }
     return 0;
 }

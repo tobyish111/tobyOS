@@ -60,21 +60,22 @@ size_t quic_frame_parse(const uint8_t *p, size_t cap, struct quic_frame *f) {
     return 0;                              /* unhandled frame type */
 }
 
-/* ---- Initial packets -------------------------------------------- */
+/* ---- Long-header packets ---------------------------------------- */
 
-size_t quic_build_initial(uint8_t *out, size_t cap,
-                          const uint8_t *dcid, size_t dcid_len,
-                          const uint8_t *scid, size_t scid_len,
-                          const uint8_t *token, size_t token_len,
-                          uint64_t pkt_num, unsigned pn_len,
-                          const uint8_t *payload, size_t payload_len,
-                          const uint8_t key[16], const uint8_t iv[12],
-                          const uint8_t hp[16]) {
+size_t quic_build_long(uint8_t *out, size_t cap, unsigned type_bits,
+                       const uint8_t *dcid, size_t dcid_len,
+                       const uint8_t *scid, size_t scid_len,
+                       int has_token,
+                       const uint8_t *token, size_t token_len,
+                       uint64_t pkt_num, unsigned pn_len,
+                       const uint8_t *payload, size_t payload_len,
+                       const uint8_t key[16], const uint8_t iv[12],
+                       const uint8_t hp[16]) {
     if (pn_len < 1 || pn_len > 4) return 0;
     size_t p = 0;
-    /* First byte: long(0x80) + fixed(0x40) + Initial(type 00) + pn_len-1. */
+    /* First byte: long(0x80) + fixed(0x40) + type_bits + pn_len-1. */
     if (p >= cap) return 0;
-    out[p++] = (uint8_t)(0xc0 | (pn_len - 1));
+    out[p++] = (uint8_t)(0xc0 | (type_bits & 0x30) | (pn_len - 1));
     /* version = 1 */
     if (p + 4 > cap) return 0;
     out[p++] = 0; out[p++] = 0; out[p++] = 0; out[p++] = 1;
@@ -86,12 +87,14 @@ size_t quic_build_initial(uint8_t *out, size_t cap,
     if (p + 1 + scid_len > cap) return 0;
     out[p++] = (uint8_t)scid_len;
     memcpy(out + p, scid, scid_len); p += scid_len;
-    /* token length (varint) + token */
-    uint8_t vt[8];
-    size_t nvt = quic_varint_encode(vt, token_len);
-    if (p + nvt + token_len > cap) return 0;
-    memcpy(out + p, vt, nvt); p += nvt;
-    if (token_len) { memcpy(out + p, token, token_len); p += token_len; }
+    /* token length (varint) + token -- Initial only */
+    if (has_token) {
+        uint8_t vt[8];
+        size_t nvt = quic_varint_encode(vt, token_len);
+        if (p + nvt + token_len > cap) return 0;
+        memcpy(out + p, vt, nvt); p += nvt;
+        if (token_len) { memcpy(out + p, token, token_len); p += token_len; }
+    }
     /* length (varint) = pn_len + payload_len + 16 tag */
     uint64_t length = pn_len + payload_len + 16;
     uint8_t vl[8];
@@ -122,6 +125,19 @@ size_t quic_build_initial(uint8_t *out, size_t cap,
     for (unsigned i = 0; i < pn_len; i++)
         out[pn_off + i] ^= mask[1 + i];
     return total;
+}
+
+size_t quic_build_initial(uint8_t *out, size_t cap,
+                          const uint8_t *dcid, size_t dcid_len,
+                          const uint8_t *scid, size_t scid_len,
+                          const uint8_t *token, size_t token_len,
+                          uint64_t pkt_num, unsigned pn_len,
+                          const uint8_t *payload, size_t payload_len,
+                          const uint8_t key[16], const uint8_t iv[12],
+                          const uint8_t hp[16]) {
+    return quic_build_long(out, cap, 0x00, dcid, dcid_len, scid, scid_len,
+                           1, token, token_len, pkt_num, pn_len,
+                           payload, payload_len, key, iv, hp);
 }
 
 long quic_open_long(uint8_t *pkt, size_t len, int is_initial,
