@@ -13,6 +13,7 @@
 #include <tobyos/net.h>         /* htons */
 #include <tobyos/pit.h>
 #include <tobyos/cpu.h>         /* sti/hlt */
+#include <tobyos/sec.h>         /* sha256 transcript */
 
 #include "monocypher.h"
 
@@ -358,12 +359,13 @@ int quic_udp_send_test(void) {
 
     /* Open the server Initial with the SERVER Initial keys (derived
      * from our original DCID), parse the ServerHello, derive the
-     * handshake shared secret. The reply may coalesce Initial +
-     * Handshake packets; we process the leading Initial. */
+     * handshake shared secret. The reply coalesces Initial + Handshake
+     * packets in one datagram; `consumed` locates the next one. */
     uint8_t skey[16], siv[12], shp[16];
     quic_initial_keys(dcid, sizeof dcid, 0 /* server */, skey, siv, shp);
-    const uint8_t *rpay; uint64_t rpn;
-    long rl = quic_open_initial(g_qrx, g_qrx_len, skey, siv, shp, &rpay, &rpn);
+    const uint8_t *rpay; uint64_t rpn; size_t consumed = 0;
+    long rl = quic_open_long(g_qrx, g_qrx_len, 1, skey, siv, shp,
+                             &rpay, &rpn, &consumed);
     if (rl <= 0) {
         kprintf("[quicudp] server Initial decrypt FAILED\n");
         return -1;
@@ -387,7 +389,11 @@ int quic_udp_send_test(void) {
     }
 
     uint8_t server_pub[32]; uint16_t cipher = 0;
-    if (quic_parse_server_hello(f.data, (size_t)f.len, server_pub, &cipher) != 0) {
+    /* Copy the ServerHello message out before we reuse g_qrx buffers. */
+    static uint8_t sh_msg[512];
+    size_t sh_len = f.len < sizeof sh_msg ? (size_t)f.len : sizeof sh_msg;
+    memcpy(sh_msg, f.data, sh_len);
+    if (quic_parse_server_hello(sh_msg, sh_len, server_pub, &cipher) != 0) {
         kprintf("[quicudp] ServerHello parse FAILED\n");
         return -1;
     }
@@ -396,6 +402,57 @@ int quic_udp_send_test(void) {
     kprintf("[quicudp] ServerHello OK: cipher=0x%04x, x25519 shared secret ",
             cipher);
     for (int i = 0; i < 8; i++) kprintf("%02x", shared[i]);
-    kprintf("... HANDSHAKE KEYS DERIVABLE\n");
-    return 0;
+    kprintf("\n");
+
+    /* ---- Handshake keys (RFC 8446 s7.1 schedule over QUIC) ---- *
+     * transcript = SHA-256(ClientHello || ServerHello). */
+    uint8_t thash[32];
+    { struct sha256_ctx tc; sha256_init(&tc);
+      sha256_update(&tc, ch, chl); sha256_update(&tc, sh_msg, sh_len);
+      sha256_final(&tc, thash); }
+    uint8_t zeros[32]; memset(zeros, 0, 32);
+    uint8_t empty_hash[32]; sha256_buf(NULL, 0, empty_hash);
+    uint8_t early[32]; hkdf_extract(NULL, 0, zeros, 32, early);
+    uint8_t derived[32]; derive_secret(early, "derived", 7, empty_hash, derived);
+    uint8_t hs_secret[32]; hkdf_extract(derived, 32, shared, 32, hs_secret);
+    uint8_t s_hs[32]; derive_secret(hs_secret, "s hs traffic", 12, thash, s_hs);
+    uint8_t hk[16], hiv[12], hhp[16];
+    hkdf_expand_label(s_hs, "quic key", 8, NULL, 0, hk, 16);
+    hkdf_expand_label(s_hs, "quic iv", 7, NULL, 0, hiv, 12);
+    hkdf_expand_label(s_hs, "quic hp", 7, NULL, 0, hhp, 16);
+    kprintf("[quicudp] derived server Handshake keys (key ");
+    for (int i = 0; i < 6; i++) kprintf("%02x", hk[i]);
+    kprintf(")\n");
+
+    /* ---- Decrypt the coalesced server Handshake packet ---- */
+    if (consumed >= g_qrx_len || consumed == 0) {
+        kprintf("[quicudp] no coalesced Handshake packet\n");
+        return 0;
+    }
+    uint8_t *hspkt = g_qrx + consumed;
+    size_t hsavail = g_qrx_len - consumed;
+    if ((hspkt[0] & 0x30) != 0x20) {        /* long-header type 2 = Handshake */
+        kprintf("[quicudp] next packet is not Handshake (0x%02x)\n", hspkt[0]);
+        return 0;
+    }
+    const uint8_t *hpay; uint64_t hpn;
+    long hl = quic_open_long(hspkt, hsavail, 0, hk, hiv, hhp, &hpay, &hpn, NULL);
+    if (hl <= 0) {
+        kprintf("[quicudp] Handshake packet decrypt FAILED\n");
+        return -1;
+    }
+    /* First handshake message in the CRYPTO frame. */
+    size_t hfp = 0; struct quic_frame hf; int hgot = 0;
+    while (hfp < (size_t)hl) {
+        size_t fn = quic_frame_parse(hpay + hfp, (size_t)hl - hfp, &hf);
+        if (fn == 0) break;
+        if (hf.type == QUIC_FRAME_CRYPTO) { hgot = 1; break; }
+        hfp += fn;
+    }
+    int msg_type = (hgot && hf.len >= 1) ? hf.data[0] : -1;
+    kprintf("[quicudp] Handshake packet DECRYPTED (pn=%u): first msg type=%d %s\n",
+            (unsigned)hpn, msg_type,
+            msg_type == 8 ? "(EncryptedExtensions) -- HANDSHAKE FLIGHT READABLE"
+                          : "");
+    return (msg_type == 8) ? 0 : -1;
 }

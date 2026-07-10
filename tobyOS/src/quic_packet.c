@@ -124,19 +124,22 @@ size_t quic_build_initial(uint8_t *out, size_t cap,
     return total;
 }
 
-long quic_open_initial(uint8_t *pkt, size_t len,
-                       const uint8_t key[16], const uint8_t iv[12],
-                       const uint8_t hp[16],
-                       const uint8_t **out_payload, uint64_t *out_pn) {
+long quic_open_long(uint8_t *pkt, size_t len, int is_initial,
+                    const uint8_t key[16], const uint8_t iv[12],
+                    const uint8_t hp[16],
+                    const uint8_t **out_payload, uint64_t *out_pn,
+                    size_t *consumed) {
     if (len < 7 || (pkt[0] & 0xc0) != 0xc0) return -1;   /* long header */
     size_t p = 5;                          /* first byte + version */
     if (p >= len) return -1;
     size_t dl = pkt[p++]; p += dl;         /* DCID */
     if (p >= len) return -1;
     size_t sl = pkt[p++]; p += sl;         /* SCID */
-    uint64_t tl; size_t n = quic_varint_decode(pkt + p, len - p, &tl);
-    if (!n) return -1; p += n + (size_t)tl;   /* token */
-    uint64_t length; n = quic_varint_decode(pkt + p, len - p, &length);
+    if (is_initial) {                       /* Initial has a token field */
+        uint64_t tl; size_t nt = quic_varint_decode(pkt + p, len - p, &tl);
+        if (!nt) return -1; p += nt + (size_t)tl;
+    }
+    uint64_t length; size_t n = quic_varint_decode(pkt + p, len - p, &length);
     if (!n) return -1; p += n;
     size_t pn_off = p;
     if (pn_off + 4 + 16 > len) return -1;
@@ -167,7 +170,15 @@ long quic_open_initial(uint8_t *pkt, size_t len,
         return -1;
     if (out_payload) *out_payload = pkt + header_len;
     if (out_pn) *out_pn = pn;
+    if (consumed) *consumed = pn_off + (size_t)length;
     return (long)body;
+}
+
+long quic_open_initial(uint8_t *pkt, size_t len,
+                       const uint8_t key[16], const uint8_t iv[12],
+                       const uint8_t hp[16],
+                       const uint8_t **out_payload, uint64_t *out_pn) {
+    return quic_open_long(pkt, len, 1, key, iv, hp, out_payload, out_pn, NULL);
 }
 
 /* ---- Self-test (vs aioquic reference) --------------------------- */

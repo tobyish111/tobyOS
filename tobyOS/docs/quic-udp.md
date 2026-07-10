@@ -64,19 +64,49 @@ key-agreement over the wire. tobyOS decrypted a packet it received,
 parsed the peer's ServerHello, and reached the same secret the peer
 computed.
 
+## Slice 4d — Handshake keys + decrypt the Handshake flight
+- **`quic_open_long()`** (`src/quic_packet.c`) generalizes packet-open
+  to Initial *and* Handshake long headers (Handshake has no token
+  field) and reports each packet's on-wire length, so the caller can
+  walk **coalesced** packets in one datagram (`quic_open_initial` is
+  now a thin wrapper).
+- After the shared secret, `quic_udp_send_test()` runs the RFC 8446
+  §7.1 key schedule over the transcript `SHA-256(ClientHello ||
+  ServerHello)` — early → derived → handshake secret → server
+  handshake traffic secret — then derives the **Handshake-level QUIC
+  keys** (`quic key`/`iv`/`hp`) via the `tls13` HKDF, opens the
+  coalesced server **Handshake** packet with them, and parses the
+  first handshake message out of its CRYPTO frame.
+
+### Verified (QEMU SLIRP + responder coalescing Initial + Handshake)
+The responder now replies with a coalesced datagram: server
+Initial(ServerHello) + Handshake(EncryptedExtensions), the Handshake
+packet protected with the handshake keys it derives from the shared
+secret + transcript.
+- tobyOS serial: `ServerHello OK … shared secret 452ccadfe1465a2a…`,
+  `derived server Handshake keys (key 5834913d6f62…)`, `Handshake
+  packet DECRYPTED (pn=0): first msg type=8 (EncryptedExtensions) --
+  HANDSHAKE FLIGHT READABLE`.
+- responder: `expected shared secret 452ccadfe1465a2a…`, `expected
+  server Handshake key 5834913d6f62…`.
+
+Both the shared secret **and** the Handshake keys match, and tobyOS
+decrypts a real Handshake-level packet and reads the EncryptedExtensions
+— the TLS 1.3 key schedule works across two QUIC encryption levels.
+
 ## What's next (HTTP/3 slices)
-- **Slice 4d** — the rest of the handshake: derive Handshake-level
-  QUIC keys from the shared secret, decrypt the server's Handshake
-  packets (EncryptedExtensions / Certificate / CertificateVerify /
-  Finished, reusing the stage-13H cert validation), send the client
-  Finished, install 1-RTT keys. This is where the TLS message layer
-  moves out of `tls.c` into a shared module.
+- **Slice 4e** — finish the handshake: process Certificate /
+  CertificateVerify / Finished from the Handshake flight (reusing the
+  stage-13H cert validation), send the client Finished, install 1-RTT
+  keys. This is where the TLS message layer moves out of `tls.c` into
+  a shared module, and where a full live QUIC server replaces the
+  scripted responder.
 - **Slice 5** — HTTP/3 HEADERS/DATA framing + QPACK over QUIC streams,
   into `http.c` behind an Alt-Svc / explicit-h3 probe with the h2/h1.1
   fallback ladder intact.
 
 ## v1 scope
-Send the client Initial + receive/process the server Initial through
-the shared-secret derivation. The encrypted Handshake flight
-(Certificate/Finished) and 1-RTT are slice 4d; triggered at boot under
-a build flag against a scripted responder (not yet a full live server).
+Send the client Initial; receive + process the server's coalesced
+Initial + Handshake through the EncryptedExtensions. Certificate /
+Finished / 1-RTT are slice 4e. Triggered at boot under a build flag
+against a scripted responder (not yet a full live server).

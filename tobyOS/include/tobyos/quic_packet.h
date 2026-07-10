@@ -55,10 +55,21 @@ size_t quic_build_initial(uint8_t *out, size_t cap,
                           const uint8_t key[16], const uint8_t iv[12],
                           const uint8_t hp[16]);
 
-/* Open (remove header + packet protection from) an Initial packet in
- * place. On success returns the decrypted payload length and sets
- * *out_payload to the frames region (inside `pkt`) and *out_pn to the
- * recovered packet number; returns -1 on a bad/undecryptable packet. */
+/* Open (remove header + packet protection from) a long-header packet
+ * in place. is_initial selects the Initial layout (which has a token
+ * field) vs the Handshake layout (which does not). On success returns
+ * the decrypted payload length, sets *out_payload to the frames region
+ * (inside `pkt`), *out_pn to the packet number, and *consumed (if not
+ * NULL) to the total on-wire length of this packet -- so the caller
+ * can find the next coalesced packet in the same datagram. Returns -1
+ * on a bad/undecryptable packet. */
+long quic_open_long(uint8_t *pkt, size_t len, int is_initial,
+                    const uint8_t key[16], const uint8_t iv[12],
+                    const uint8_t hp[16],
+                    const uint8_t **out_payload, uint64_t *out_pn,
+                    size_t *consumed);
+
+/* Initial-only wrapper (kept for the slice-3 API + self-test). */
 long quic_open_initial(uint8_t *pkt, size_t len,
                        const uint8_t key[16], const uint8_t iv[12],
                        const uint8_t hp[16],
