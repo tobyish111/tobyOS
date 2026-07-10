@@ -1,8 +1,12 @@
 /* toby/video_decode.h -- Video codec decode API for tobyOS userland.
  *
- * Provides a minimal H.264 NAL unit parser and decode interface.
- * VP9 is defined but stubbed out.  The actual decoder currently
- * generates solid-colour placeholder frames at the correct dimensions.
+ * H.264 baseline profile decodes for REAL via the vendored h264bsd
+ * (stage 13 media). Feed Annex-B byte-stream chunks (one access unit
+ * per call works well); video_decoder_decode returns 1 when *out
+ * holds a picture (ARGB8888, mb-aligned dimensions, buffer owned by
+ * the decoder until the next call), 0 when the chunk was consumed
+ * without completing a picture, -1 on a stream error.
+ * VP9 is not supported (create returns NULL).
  */
 
 #ifndef TOBY_VIDEO_DECODE_H

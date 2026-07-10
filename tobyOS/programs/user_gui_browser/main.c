@@ -71,6 +71,7 @@ struct gui_event {
 #include <toby/tk.h>
 #include <toby/image.h>     /* stb_image-backed ARGB decoder (libtoby) */
 #include <toby/audio_decode.h>  /* real minimp3 MP3 decode (stage 13 media) */
+#include <toby/video_decode.h>  /* real h264bsd H.264 decode (stage 13 media) */
 /* QuickJS (third_party/quickjs, linked by the Makefile). Included this
  * early so its headers see none of the short macros defined below
  * (E, cur, g_raw, ...). Its inline helpers trip -Wextra; scoped off. */
@@ -917,11 +918,13 @@ struct media_el {
     char     src[512];
     uint8_t *data;                /* the whole media file */
     long     dlen;
-    /* video: MJPEG-in-AVI frame index */
+    /* video: AVI frame index (MJPEG or H.264 Annex-B chunks) */
     long     frame_off[MEDIA_FRAMES_MAX];
     int      frame_len[MEDIA_FRAMES_MAX];
     int      nframes, cur_frame;
     long     frame_ms, next_ms;
+    void    *vdec;                /* video_decoder* when H.264 (else MJPEG) */
+    int      vdec_errs;           /* consecutive chunk errors (leniency) */
     /* audio: MP3 (minimp3) -> kernel PCM16 stream */
     void    *mp3;                 /* toby_mp3_decoder_t* */
     int      audio_fd;
@@ -8613,6 +8616,7 @@ static void tab_media_free(struct tab *t) {
         if (!m->used) continue;
         if (m->data) { free(m->data); m->data = NULL; }
         if (m->mp3)  { toby_mp3_decode_free((toby_mp3_decoder_t *)m->mp3); m->mp3 = NULL; }
+        if (m->vdec) { video_decoder_destroy((struct video_decoder *)m->vdec); m->vdec = NULL; }
         if (m->audio_fd >= 0) { sys_audio_close(m->audio_fd); m->audio_fd = -1; }
         m->used = 0;
         m->playing = 0;
@@ -9303,16 +9307,20 @@ static int media_sniff_mp3(const uint8_t *d, long n) {
 }
 
 /* Nearest-neighbour blit of a decoded frame into the backing store. */
-static void media_blit(struct img *dst, toby_image_t *src) {
-    if (!dst->pixels || !src->pixels || src->width <= 0 || src->height <= 0)
-        return;
+static void media_blit_raw(struct img *dst, const uint32_t *src,
+                           int sw, int sh) {
+    if (!dst->pixels || !src || sw <= 0 || sh <= 0) return;
     for (int y = 0; y < dst->h; y++) {
-        int sy = (int)((long)y * src->height / dst->h);
+        int sy = (int)((long)y * sh / dst->h);
         uint32_t *drow = &dst->pixels[(long)y * dst->w];
-        const uint32_t *srow = &src->pixels[(long)sy * src->width];
+        const uint32_t *srow = &src[(long)sy * sw];
         for (int x = 0; x < dst->w; x++)
-            drow[x] = srow[(long)x * src->width / dst->w] | 0xFF000000u;
+            drow[x] = srow[(long)x * sw / dst->w] | 0xFF000000u;
     }
+}
+
+static void media_blit(struct img *dst, toby_image_t *src) {
+    media_blit_raw(dst, src->pixels, src->width, src->height);
 }
 
 static void med_log(const char *what, int a, int b) {
@@ -9330,7 +9338,19 @@ static void med_log(const char *what, int a, int b) {
 /* Fetch completion: sniff the container and ready the element. */
 static void media_ready(struct media_el *m) {
     if (m->is_video && media_demux_avi(m) == 0) {
-        med_log("video frames/period", m->nframes, (int)m->frame_ms);
+        /* Codec sniff on the first frame chunk: an Annex-B start code
+         * (00 00 [00] 01) means H.264 (stage 13: real h264bsd);
+         * FF D8 means MJPEG (stb JPEG per frame). */
+        const uint8_t *f0 = m->data + m->frame_off[0];
+        int l0 = m->frame_len[0];
+        if (l0 >= 4 && f0[0] == 0 && f0[1] == 0 &&
+            (f0[2] == 1 || (f0[2] == 0 && f0[3] == 1))) {
+            m->vdec = video_decoder_create(VIDEO_CODEC_H264);
+            if (!m->vdec) { m->state = -1; return; }
+            med_log("h264 frames/period", m->nframes, (int)m->frame_ms);
+        } else {
+            med_log("video frames/period", m->nframes, (int)m->frame_ms);
+        }
         m->state = 1;
     } else if (!m->is_video && media_sniff_mp3(m->data, m->dlen)) {
         m->mp3 = toby_mp3_decode_init();
@@ -9470,16 +9490,48 @@ static int media_pump(void) {
             struct img *im = (m->img >= 0 && m->img < g_nimages)
                                  ? &g_images[m->img] : NULL;
             if (im && im->pixels) {
-                toby_image_t *f = toby_image_load(
-                    m->data + m->frame_off[m->cur_frame],
-                    (size_t)m->frame_len[m->cur_frame]);
-                if (f) {
-                    media_blit(im, f);
-                    toby_image_free(f);
-                    repaint = 1;
+                if (m->vdec) {
+                    /* H.264: chunks decode in stream order; parameter-
+                     * set chunks yield no picture, so feed until one
+                     * lands (bounded). Be LENIENT about per-NAL errors
+                     * (SEI variants etc.) -- skip the chunk and keep
+                     * going; only give up after a sustained run. */
+                    for (int fed = 0; fed < 4 && m->cur_frame < m->nframes;
+                         fed++) {
+                        struct video_frame vf;
+                        int rc = video_decoder_decode(
+                            (struct video_decoder *)m->vdec,
+                            m->data + m->frame_off[m->cur_frame],
+                            (size_t)m->frame_len[m->cur_frame], &vf);
+                        m->cur_frame++;
+                        if (rc > 0) {
+                            m->vdec_errs = 0;
+                            media_blit_raw(im, (const uint32_t *)vf.data,
+                                           vf.width, vf.height);
+                            repaint = 1;
+                            break;
+                        }
+                        if (rc < 0 && ++m->vdec_errs > 60) {
+                            med_log("h264 giving up after errs",
+                                    m->vdec_errs, m->cur_frame);
+                            m->playing = 0;
+                            break;
+                        }
+                    }
+                } else {
+                    toby_image_t *f = toby_image_load(
+                        m->data + m->frame_off[m->cur_frame],
+                        (size_t)m->frame_len[m->cur_frame]);
+                    if (f) {
+                        media_blit(im, f);
+                        toby_image_free(f);
+                        repaint = 1;
+                    }
+                    m->cur_frame++;
                 }
+            } else {
+                m->cur_frame++;
             }
-            m->cur_frame++;
             if (m->cur_frame >= m->nframes) {
                 if (m->loop) m->cur_frame = 0;
                 else m->playing = 0;

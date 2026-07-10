@@ -955,6 +955,21 @@ $(LIBWEBP_DIR)/%.o: $(LIBWEBP_DIR)/%.c Makefile
 $(LIBWEBP_DIR)/%.pic.o: $(LIBWEBP_DIR)/%.c Makefile
 	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -I $(LIBWEBP_DIR) -w -c $< -o $@
 
+# Real H.264 decode (stage 13 media): the vendored h264bsd baseline-
+# profile decoder (Android AOSP-derived, pure integer C) backing
+# libtoby's video_decoder API. -w: vendored reference code.
+H264BSD_DIR  := third_party/h264bsd
+H264BSD_SRCS := $(wildcard $(H264BSD_DIR)/*.c)
+H264BSD_OBJS     := $(H264BSD_SRCS:.c=.o)
+H264BSD_PIC_OBJS := $(H264BSD_SRCS:.c=.pic.o)
+LIBTOBY_OBJS += $(H264BSD_OBJS)
+
+$(H264BSD_DIR)/%.o: $(H264BSD_DIR)/%.c Makefile
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -I $(H264BSD_DIR) -w -c $< -o $@
+
+$(H264BSD_DIR)/%.pic.o: $(H264BSD_DIR)/%.c Makefile
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -I $(H264BSD_DIR) -w -c $< -o $@
+
 $(LIBTOBY_CRT0): $(LIBTOBY_SRC)/crt0.S
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -994,6 +1009,7 @@ LIBTOBY_PIC_OBJS    := $(LIBTOBY_C_SRCS:.c=.pic.o)
 LIBTOBY_ASM_PIC_OBJS := $(LIBTOBY_ASM_SRCS:.S=.pic.o)
 LIBTOBY_PIC_OBJS    += $(LIBTOBY_ASM_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBWEBP_PIC_OBJS)
+LIBTOBY_PIC_OBJS    += $(H264BSD_PIC_OBJS)
 LIBTOBY_PIC_CFLAGS  := $(LIBTOBY_BUILD_CFLAGS) -fPIC
 
 $(LIBTOBY_SRC)/%.pic.o: $(LIBTOBY_SRC)/%.c
