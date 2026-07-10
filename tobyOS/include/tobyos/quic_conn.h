@@ -44,4 +44,9 @@ size_t quic_build_client_initial(uint8_t *out, size_t cap,
 #define QUIC_CONN_SELFTEST_N 3
 int quic_conn_selftest(void);
 
+/* Slice 4b: build a random-CID client Initial (padded to 1200) and
+ * UDP-send it to a QUIC listener on the SLIRP host (10.0.2.2:4433).
+ * Returns 0 on send OK. Called at boot under -DQUIC_SEND_TEST. */
+int quic_udp_send_test(void);
+
 #endif /* TOBYOS_QUIC_CONN_H */

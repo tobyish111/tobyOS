@@ -3820,6 +3820,14 @@ void _start(void) {
             tcp_shell_init();
             ssh_init();
 
+#ifdef QUIC_SEND_TEST
+            /* HTTP/3 slice 4b: send a real QUIC client Initial over UDP
+             * to a listener on the SLIRP host, which validates it on
+             * the wire. Deterministic verification is the offline dump
+             * (slice 4a); this proves the outbound UDP path. */
+            { extern int quic_udp_send_test(void); quic_udp_send_test(); }
+#endif
+
             /* Static fallback is useful for a local shell, but keep DHCP
              * retrying from the idle service lane until a real lease lands. */
             if (!net_boot_used_dhcp()) {

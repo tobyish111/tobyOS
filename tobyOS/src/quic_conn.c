@@ -8,6 +8,9 @@
 #include <tobyos/tls13.h>       /* tls_put_u16/u24 wire helpers */
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
+#include <tobyos/rng.h>
+#include <tobyos/udp.h>
+#include <tobyos/net.h>         /* htons */
 
 #include "monocypher.h"
 
@@ -239,4 +242,39 @@ int quic_conn_selftest(void) {
     kprintf("[quicch] client-hello self-test: %d/%d %s\n", pass, QUIC_CONN_SELFTEST_N,
             pass == QUIC_CONN_SELFTEST_N ? "ALL PASS" : "FAILURES");
     return pass;
+}
+
+/* ---- On-the-wire send test (slice 4b) --------------------------- *
+ * Build a real, RANDOM-CID client Initial padded to 1200 bytes (the
+ * RFC 9000 anti-amplification minimum) and UDP-send it to a QUIC
+ * listener on the SLIRP host (10.0.2.2:4433), which decrypts + parses
+ * the ClientHello over the wire. Proves the outbound QUIC path end to
+ * end. Called from boot under -DQUIC_SEND_TEST once the network is up. */
+int quic_udp_send_test(void) {
+    uint8_t dcid[8], scid[8], priv[32], rnd[32], pub[32];
+    rng_fill(dcid, sizeof dcid);
+    rng_fill(scid, sizeof scid);
+    rng_fill(priv, sizeof priv);
+    rng_fill(rnd, sizeof rnd);
+    crypto_x25519_public_key(pub, priv);
+
+    uint8_t ch[512];
+    size_t chl = quic_build_client_hello(ch, sizeof ch, rnd, pub,
+                                         scid, sizeof scid, "tobyos.test");
+    if (!chl) { kprintf("[quicudp] ClientHello build failed\n"); return -1; }
+
+    static uint8_t pkt[1500];
+    size_t plen = quic_build_client_initial(pkt, sizeof pkt, dcid, sizeof dcid,
+                                            scid, sizeof scid, ch, chl,
+                                            1 /* pkt_num */, 1200 /* pad */);
+    if (!plen) { kprintf("[quicudp] Initial build failed\n"); return -1; }
+
+    uint8_t ipb[4] = { 10, 0, 2, 2 };
+    uint32_t dst_ip; memcpy(&dst_ip, ipb, 4);        /* network order */
+    bool ok = udp_send(htons(56789), dst_ip, htons(4433), pkt, plen);
+    kprintf("[quicudp] sent Initial %u bytes to 10.0.2.2:4433 (dcid ",
+            (unsigned)plen);
+    for (int i = 0; i < 8; i++) kprintf("%02x", dcid[i]);
+    kprintf(") %s\n", ok ? "OK" : "SEND-FAIL");
+    return ok ? 0 : -1;
 }
