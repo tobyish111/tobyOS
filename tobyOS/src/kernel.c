@@ -2791,9 +2791,11 @@ void _start(void) {
 #endif
 
 #ifdef QUIC_SELFTEST
-    /* HTTP/3 slice 2: verify the QUIC Initial crypto against the RFC 9001
-     * Appendix A test vectors (deterministic, no network). */
+    /* HTTP/3 slices 2+3: verify the QUIC Initial crypto (RFC 9001
+     * Appendix A vectors) and the packet layer (build/open vs the
+     * aioquic reference) deterministically, no network. */
     { extern int quic_crypto_selftest(void); quic_crypto_selftest(); }
+    { extern int quic_packet_selftest(void); quic_packet_selftest(); }
 #endif
 
     bcache_init();
