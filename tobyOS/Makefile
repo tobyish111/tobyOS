@@ -220,6 +220,7 @@ C_SRCS := src/kernel.c \
           src/m35selftest.c \
           src/tls.c \
           src/tls13.c \
+          src/quic_crypto.c \
           src/tls_trust.c \
           src/procfs.c \
           src/tty.c \
@@ -316,6 +317,10 @@ BEARSSL_SRCS := \
           third_party/bearssl/src/hash/sha2small.c \
           third_party/bearssl/src/hash/ghash_ctmul.c \
           third_party/bearssl/src/hash/mgf1.c \
+          third_party/bearssl/src/symcipher/aes_ct.c \
+          third_party/bearssl/src/symcipher/aes_ct_enc.c \
+          third_party/bearssl/src/symcipher/aes_ct_ctr.c \
+          third_party/bearssl/src/aead/gcm.c \
           third_party/bearssl/src/ec/ec_prime_i31.c \
           third_party/bearssl/src/ec/ec_secp256r1.c \
           third_party/bearssl/src/ec/ec_secp384r1.c \
@@ -705,6 +710,11 @@ src/tls.o: src/tls.c $(HEADERS) Makefile
 # ws.c uses BearSSL's SHA-1 for the Sec-WebSocket-Accept check, so it
 # needs the same headers + shim.
 src/ws.o: src/ws.c $(HEADERS) Makefile
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -Ithird_party/bearssl/shim -Ithird_party/bearssl/inc -c $< -o $@
+
+# quic_crypto.c uses BearSSL AES-128-GCM (block/aead) for QUIC packet +
+# header protection, so it needs the BearSSL headers + <string.h> shim.
+src/quic_crypto.o: src/quic_crypto.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -Ithird_party/bearssl/shim -Ithird_party/bearssl/inc -c $< -o $@
 
 # ---------- Link ----------

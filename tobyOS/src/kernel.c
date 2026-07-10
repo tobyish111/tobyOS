@@ -2790,6 +2790,12 @@ void _start(void) {
     m35f_selftest();
 #endif
 
+#ifdef QUIC_SELFTEST
+    /* HTTP/3 slice 2: verify the QUIC Initial crypto against the RFC 9001
+     * Appendix A test vectors (deterministic, no network). */
+    { extern int quic_crypto_selftest(void); quic_crypto_selftest(); }
+#endif
+
     bcache_init();
 
     /* Probe the IDE primary master and mount its tobyfs at /data. Two
