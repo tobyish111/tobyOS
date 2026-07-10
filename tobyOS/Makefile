@@ -379,6 +379,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_gui_clock/user_gui_clock.elf \
             programs/user_gui_widgets/user_gui_widgets.elf \
             programs/user_gui_about/user_gui_about.elf \
+            programs/user_cpptest/user_cpptest.elf \
             programs/user_gui_term/user_gui_term.elf \
             programs/user_gui_files/user_gui_files.elf \
             programs/user_gui_viewer/user_gui_viewer.elf \
@@ -933,6 +934,28 @@ $(LIBTOBY_SRC)/image.o: $(LIBTOBY_SRC)/image.c
 $(LIBTOBY_SRC)/mp3_decode.o: $(LIBTOBY_SRC)/mp3_decode.c
 	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
 
+# ---------- stage 13: freestanding C++ for tobyOS userland ----------
+# CXX is derived from CC (clang -> clang++), so the TMP='C:\t' wrapper
+# and any user override carry through. C++ TUs build with the same
+# freestanding base as C, minus -std=c11, plus the no-runtime-features
+# trio: no exceptions, no RTTI, no hosted C++ stdlib. What remains of
+# the language (classes, virtuals, templates, new/delete, static
+# ctors/dtors, local statics) is backed by libtoby/src/cxxrt.cpp and
+# the ctor walk in init.c.
+CXX := $(CC:clang=clang++)
+LIBTOBY_CXXFLAGS := $(filter-out -std=c11,$(LIBTOBY_BUILD_CFLAGS)) \
+                    -std=c++17 -fno-exceptions -fno-rtti -nostdinc++
+
+$(LIBTOBY_SRC)/cxxrt.o: $(LIBTOBY_SRC)/cxxrt.cpp $(LIBTOBY_INC)/new
+	$(CXX) $(LIBTOBY_CXXFLAGS) -c $< -o $@
+
+$(LIBTOBY_SRC)/cxxrt.pic.o: $(LIBTOBY_SRC)/cxxrt.cpp $(LIBTOBY_INC)/new
+	$(CXX) $(LIBTOBY_CXXFLAGS) -fPIC -c $< -o $@
+
+LIBTOBY_OBJS += $(LIBTOBY_SRC)/cxxrt.o
+# (the .pic.o append lives next to the other vendored PIC appends,
+# after LIBTOBY_PIC_OBJS is first assigned)
+
 # WebP decode (stage 13 beyond-tier): the vendored libwebp v1.4.0
 # decode-only subset (src/dec + the decode-side src/dsp + src/utils),
 # compiled into libtoby so toby_image_load() decodes RIFF/WEBP like any
@@ -1010,6 +1033,7 @@ LIBTOBY_ASM_PIC_OBJS := $(LIBTOBY_ASM_SRCS:.S=.pic.o)
 LIBTOBY_PIC_OBJS    += $(LIBTOBY_ASM_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBWEBP_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(H264BSD_PIC_OBJS)
+LIBTOBY_PIC_OBJS    += $(LIBTOBY_SRC)/cxxrt.pic.o
 LIBTOBY_PIC_CFLAGS  := $(LIBTOBY_BUILD_CFLAGS) -fPIC
 
 $(LIBTOBY_SRC)/%.pic.o: $(LIBTOBY_SRC)/%.c
@@ -1143,6 +1167,25 @@ programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
 	$$(LD) $$(PROG_LDFLAGS) -T programs/$(1)/program.ld -o $$@ \
 	      $(LIBTOBY_CRT0) programs/$(1)/$(2).o $(LIBTOBY_AR)
 endef
+
+# C++ variant (stage 13): main.cpp compiled with CXX + the freestanding
+# C++ flags; links the same crt0 + libtoby.a (which carries cxxrt.o).
+# The program's own program.ld must define the .init_array/.fini_array
+# bounds for static constructors (see programs/user_cpptest/program.ld).
+define LIBTOBY_CPP_PROGRAM_RULES
+programs/$(1)/$(2).o: programs/$(1)/main.cpp $(LIBTOBY_AR)
+	$$(CXX) $$(filter-out -std=c11,$$(LIBTOBY_CFLAGS)) \
+	      -std=c++17 -fno-exceptions -fno-rtti -nostdinc++ -c $$< -o $$@
+
+programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
+                        $(LIBTOBY_CRT0) \
+                        $(LIBTOBY_AR) \
+                        programs/$(1)/program.ld
+	$$(LD) $$(PROG_LDFLAGS) -T programs/$(1)/program.ld -o $$@ \
+	      $(LIBTOBY_CRT0) programs/$(1)/$(2).o $(LIBTOBY_AR)
+endef
+
+$(eval $(call LIBTOBY_CPP_PROGRAM_RULES,user_cpptest,user_cpptest))
 
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_hello,c_hello))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_args,c_args))
@@ -2170,6 +2213,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_gui_clock/user_gui_clock.elf $(INITRD_STAGE)/bin/gui_clock
 	cp programs/user_gui_widgets/user_gui_widgets.elf $(INITRD_STAGE)/bin/gui_widgets
 	cp programs/user_gui_about/user_gui_about.elf     $(INITRD_STAGE)/bin/gui_about
+	cp programs/user_cpptest/user_cpptest.elf         $(INITRD_STAGE)/bin/cpptest
 	cp programs/user_gui_term/user_gui_term.elf       $(INITRD_STAGE)/bin/gui_term
 	cp programs/user_gui_files/user_gui_files.elf     $(INITRD_STAGE)/bin/gui_files
 	cp programs/user_gui_viewer/user_gui_viewer.elf   $(INITRD_STAGE)/bin/gui_viewer
@@ -2616,6 +2660,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
+	    bin/cpptest                                                                 \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
 	    bin/gui_calc bin/gui_taskmgr bin/gui_edit bin/gui_browser         \
 	    bin/login bin/gui_settings bin/abi_test                           \

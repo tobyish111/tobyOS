@@ -1,0 +1,32 @@
+/* <new> -- placement/nothrow operator new declarations for tobyOS
+ * C++ programs (stage 13 C++ runtime). The allocating operators are
+ * defined in libtoby/src/cxxrt.cpp; placement new is inline here. */
+#ifndef _LIBTOBY_NEW
+#define _LIBTOBY_NEW
+
+#include <stddef.h>
+
+namespace std {
+    struct nothrow_t { explicit nothrow_t() = default; };
+    extern const nothrow_t nothrow;
+    typedef void (*new_handler)();
+}
+
+void *operator new(size_t n);
+void *operator new[](size_t n);
+void operator delete(void *p) noexcept;
+void operator delete[](void *p) noexcept;
+void operator delete(void *p, size_t) noexcept;
+void operator delete[](void *p, size_t) noexcept;
+void *operator new(size_t n, const std::nothrow_t &) noexcept;
+void *operator new[](size_t n, const std::nothrow_t &) noexcept;
+void operator delete(void *p, const std::nothrow_t &) noexcept;
+void operator delete[](void *p, const std::nothrow_t &) noexcept;
+
+/* Placement forms: no allocation, no runtime. */
+inline void *operator new(size_t, void *p) noexcept { return p; }
+inline void *operator new[](size_t, void *p) noexcept { return p; }
+inline void operator delete(void *, void *) noexcept {}
+inline void operator delete[](void *, void *) noexcept {}
+
+#endif /* _LIBTOBY_NEW */
