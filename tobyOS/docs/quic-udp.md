@@ -1,10 +1,12 @@
-# QUIC on the wire — UDP send (HTTP/3 slice 4b)
+# QUIC on the wire — UDP send + receive (HTTP/3 slices 4b + 4c)
 
 Branch `quic-udp`, stacked on main (post the 3rd stage-13 merge).
-tobyOS now sends a real QUIC client Initial packet **over the network**
-— a live QUIC validator on the host decrypts and parses it. This turns
-the slice-4a offline interop proof into an on-the-wire one, exercising
-the whole outbound path (crypto → packet → frames → ClientHello → UDP).
+tobyOS now completes a QUIC key-agreement exchange over the network:
+it **sends** a real client Initial (4b) and **receives + processes**
+the server's Initial (4c) — decrypting it, parsing the ServerHello,
+and computing the same X25519 shared secret the server did. This
+exercises the whole path (crypto → packet → frames → ClientHello →
+UDP → server Initial → ServerHello → shared secret).
 
 ## What shipped
 - **`quic_udp_send_test()`** (`src/quic_conn.c`): builds a client
@@ -35,20 +37,46 @@ the datagram that actually crossed the virtual wire. The DCID matches
 end to end (`44ee0374b676b8d2`), and the datagram is exactly 1200+
 bytes as required.
 
+## Slice 4c — receive + ServerHello + shared secret
+- **`quic_recv_hook()`** (`src/quic_conn.c`, registered in `udp.c` for
+  the client's reply port under `-DQUIC_SEND_TEST`) captures the
+  server's reply datagram into a buffer; `quic_udp_send_test()` polls
+  for it with the DNS-style `rx_drain` + deadline loop after sending.
+- On arrival it opens the server Initial with the **server** Initial
+  keys (derived from the client's original DCID, `is_client=0`), walks
+  the frames to the CRYPTO frame carrying the **ServerHello**, parses
+  it (`quic_parse_server_hello` — server random, negotiated cipher,
+  X25519 `key_share`), and computes the **X25519 shared secret** from
+  which the handshake keys derive.
+
+### Verified (QEMU SLIRP + host responder)
+`quic_udp_responder.py` receives tobyOS's Initial, reads the client's
+`key_share`, and replies with a real server Initial carrying a
+ServerHello (its own X25519 key_share, cipher `TLS_AES_128_GCM_SHA256`)
+protected with the server Initial keys.
+- tobyOS serial: `received 140 bytes … server Initial decrypted (pn=0,
+  94 payload bytes) … ServerHello OK: cipher=0x1301, x25519 shared
+  secret 1b1a8c5ac83d88bf… HANDSHAKE KEYS DERIVABLE`.
+- responder: `expected x25519 shared secret 1b1a8c5ac83d88bf…`.
+
+The shared secrets **match exactly** — a genuine bidirectional QUIC
+key-agreement over the wire. tobyOS decrypted a packet it received,
+parsed the peer's ServerHello, and reached the same secret the peer
+computed.
+
 ## What's next (HTTP/3 slices)
-- **Slice 4c** — receive: a `udp_recv` hook + poll to capture the
-  server's Initial/Handshake datagrams in response, then the handshake
-  state machine — parse ServerHello (Initial keys), derive Handshake
-  keys, process EncryptedExtensions / Certificate / CertificateVerify
-  / Finished (reusing the stage-13H cert validation) from Handshake
-  packets, send the client Finished, install 1-RTT keys. This is where
-  the TLS message builders/parsers move out of `tls.c` into a shared
-  layer both TCP-TLS and QUIC drive.
+- **Slice 4d** — the rest of the handshake: derive Handshake-level
+  QUIC keys from the shared secret, decrypt the server's Handshake
+  packets (EncryptedExtensions / Certificate / CertificateVerify /
+  Finished, reusing the stage-13H cert validation), send the client
+  Finished, install 1-RTT keys. This is where the TLS message layer
+  moves out of `tls.c` into a shared module.
 - **Slice 5** — HTTP/3 HEADERS/DATA framing + QPACK over QUIC streams,
-  into `http.c` behind an Alt-Svc / explicit-h3 probe with the
-  h2/h1.1 fallback ladder intact.
+  into `http.c` behind an Alt-Svc / explicit-h3 probe with the h2/h1.1
+  fallback ladder intact.
 
 ## v1 scope
-Send only: a single Initial to a fixed host/port, triggered at boot
-under a build flag. Receiving and processing the server's response —
-i.e. an actual handshake — is slice 4c.
+Send the client Initial + receive/process the server Initial through
+the shared-secret derivation. The encrypted Handshake flight
+(Certificate/Finished) and 1-RTT are slice 4d; triggered at boot under
+a build flag against a scripted responder (not yet a full live server).

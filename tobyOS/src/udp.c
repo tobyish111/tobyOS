@@ -108,6 +108,15 @@ void udp_recv(uint32_t src_ip_be, const void *udp_packet, size_t len) {
         dns_recv_hook(src_ip_be, udp_packet, udp_n);
         return;
     }
+#ifdef QUIC_SEND_TEST
+    /* HTTP/3 slice 4c: the QUIC client's reply port. */
+    if (h->dst_port == htons(56789)) {
+        extern void quic_recv_hook(uint32_t src_ip_be,
+                                   const void *udp_packet, size_t len);
+        quic_recv_hook(src_ip_be, udp_packet, udp_n);
+        return;
+    }
+#endif
 
     struct sock *s = sock_lookup_by_port(h->dst_port);
     if (!s) return;                       /* no listener: silent drop */

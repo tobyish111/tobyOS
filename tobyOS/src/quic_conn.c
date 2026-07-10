@@ -11,8 +11,12 @@
 #include <tobyos/rng.h>
 #include <tobyos/udp.h>
 #include <tobyos/net.h>         /* htons */
+#include <tobyos/pit.h>
+#include <tobyos/cpu.h>         /* sti/hlt */
 
 #include "monocypher.h"
+
+#define QUIC_CLIENT_PORT 56789   /* our UDP source port (reply dst) */
 
 /* TLS 1.3 / QUIC constants (mirrors tls.c's set). */
 #define TLS_VERSION_12  0x0303
@@ -244,6 +248,65 @@ int quic_conn_selftest(void) {
     return pass;
 }
 
+/* ---- Receive path (slice 4c) ------------------------------------ *
+ * A UDP recv hook (registered in udp.c for QUIC_CLIENT_PORT) captures
+ * the server's reply datagram (the QUIC packet after the UDP header)
+ * into a static buffer. quic_udp_send_test polls for it and processes
+ * the server Initial: open it with the SERVER Initial keys (derived
+ * from the client's original DCID), parse the ServerHello out of the
+ * CRYPTO frame, and derive the handshake shared secret. */
+
+static uint8_t  g_qrx[2048];
+static size_t   g_qrx_len;
+static volatile int g_qrx_ready;
+
+void quic_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
+    (void)src_ip_be;
+    if (g_qrx_ready) return;                 /* keep the first datagram */
+    if (len <= 8) return;
+    size_t n = len - 8;                      /* strip the 8-byte UDP header */
+    if (n > sizeof g_qrx) n = sizeof g_qrx;
+    memcpy(g_qrx, (const uint8_t *)udp_packet + 8, n);
+    g_qrx_len = n;
+    g_qrx_ready = 1;
+}
+
+/* Minimal ServerHello parser: pull the server random + the X25519
+ * key_share. Returns 0 on success. (QUIC carries the same TLS 1.3
+ * ServerHello as TLS-over-TCP, just inside a CRYPTO frame.) */
+static int quic_parse_server_hello(const uint8_t *d, size_t len,
+                                   uint8_t server_pub[32], uint16_t *cipher) {
+    if (len < 40 || d[0] != 2) return -1;    /* handshake type 2 = SH */
+    size_t p = 4;                            /* skip hs header */
+    p += 2;                                  /* legacy_version */
+    p += 32;                                 /* random */
+    if (p >= len) return -1;
+    uint8_t sid = d[p++]; p += sid;          /* session_id echo */
+    if (p + 3 > len) return -1;
+    *cipher = tls_get_u16(d + p); p += 2;
+    p += 1;                                  /* compression */
+    if (p + 2 > len) return -1;
+    uint16_t ext_total = tls_get_u16(d + p); p += 2;
+    size_t ext_end = p + ext_total; if (ext_end > len) ext_end = len;
+    int have_ks = 0;
+    while (p + 4 <= ext_end) {
+        uint16_t et = tls_get_u16(d + p);
+        uint16_t el = tls_get_u16(d + p + 2);
+        p += 4;
+        if (p + el > ext_end) break;
+        if (et == 0x0033 && el >= 36) {       /* key_share */
+            uint16_t grp = tls_get_u16(d + p);
+            uint16_t kl = tls_get_u16(d + p + 2);
+            if (grp == 0x001d && kl == 32) {
+                memcpy(server_pub, d + p + 4, 32);
+                have_ks = 1;
+            }
+        }
+        p += el;
+    }
+    return have_ks ? 0 : -1;
+}
+
 /* ---- On-the-wire send test (slice 4b) --------------------------- *
  * Build a real, RANDOM-CID client Initial padded to 1200 bytes (the
  * RFC 9000 anti-amplification minimum) and UDP-send it to a QUIC
@@ -271,10 +334,68 @@ int quic_udp_send_test(void) {
 
     uint8_t ipb[4] = { 10, 0, 2, 2 };
     uint32_t dst_ip; memcpy(&dst_ip, ipb, 4);        /* network order */
-    bool ok = udp_send(htons(56789), dst_ip, htons(4433), pkt, plen);
-    kprintf("[quicudp] sent Initial %u bytes to 10.0.2.2:4433 (dcid ",
-            (unsigned)plen);
+    g_qrx_ready = 0;
+    bool ok = udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433), pkt, plen);
+    kprintf("[quicudp] sent Initial %u bytes to 10.0.2.2:4433 (dcid=", (unsigned)plen);
     for (int i = 0; i < 8; i++) kprintf("%02x", dcid[i]);
     kprintf(") %s\n", ok ? "OK" : "SEND-FAIL");
-    return ok ? 0 : -1;
+    if (!ok) return -1;
+
+    /* ---- slice 4c: wait for the server's reply datagram ---- */
+    uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
+    uint64_t deadline = pit_ticks() + hz * 3;        /* ~3 s */
+    struct net_dev *nd = net_default();
+    while (pit_ticks() < deadline && !g_qrx_ready) {
+        if (nd && nd->rx_drain) nd->rx_drain(nd);
+        sti();
+        hlt();
+    }
+    if (!g_qrx_ready) {
+        kprintf("[quicudp] no server reply within 3s\n");
+        return 0;                                    /* send still succeeded */
+    }
+    kprintf("[quicudp] received %u bytes from server\n", (unsigned)g_qrx_len);
+
+    /* Open the server Initial with the SERVER Initial keys (derived
+     * from our original DCID), parse the ServerHello, derive the
+     * handshake shared secret. The reply may coalesce Initial +
+     * Handshake packets; we process the leading Initial. */
+    uint8_t skey[16], siv[12], shp[16];
+    quic_initial_keys(dcid, sizeof dcid, 0 /* server */, skey, siv, shp);
+    const uint8_t *rpay; uint64_t rpn;
+    long rl = quic_open_initial(g_qrx, g_qrx_len, skey, siv, shp, &rpay, &rpn);
+    if (rl <= 0) {
+        kprintf("[quicudp] server Initial decrypt FAILED\n");
+        return -1;
+    }
+    kprintf("[quicudp] server Initial decrypted (pn=%u, %ld payload bytes)\n",
+            (unsigned)rpn, rl);
+
+    /* Find the CRYPTO frame (ServerHello) among the reply's frames. */
+    size_t fp = 0; struct quic_frame f; int found = 0;
+    while (fp < (size_t)rl) {
+        size_t fn = quic_frame_parse(rpay + fp, (size_t)rl - fp, &f);
+        if (fn == 0) break;
+        if (f.type == QUIC_FRAME_CRYPTO && f.len >= 4 && f.data[0] == 2) {
+            found = 1; break;
+        }
+        fp += fn;
+    }
+    if (!found) {
+        kprintf("[quicudp] no ServerHello CRYPTO frame in reply\n");
+        return -1;
+    }
+
+    uint8_t server_pub[32]; uint16_t cipher = 0;
+    if (quic_parse_server_hello(f.data, (size_t)f.len, server_pub, &cipher) != 0) {
+        kprintf("[quicudp] ServerHello parse FAILED\n");
+        return -1;
+    }
+    uint8_t shared[32];
+    crypto_x25519(shared, priv, server_pub);
+    kprintf("[quicudp] ServerHello OK: cipher=0x%04x, x25519 shared secret ",
+            cipher);
+    for (int i = 0; i < 8; i++) kprintf("%02x", shared[i]);
+    kprintf("... HANDSHAKE KEYS DERIVABLE\n");
+    return 0;
 }
