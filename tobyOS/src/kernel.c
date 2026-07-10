@@ -2796,6 +2796,7 @@ void _start(void) {
      * aioquic reference) deterministically, no network. */
     { extern int quic_crypto_selftest(void); quic_crypto_selftest(); }
     { extern int quic_packet_selftest(void); quic_packet_selftest(); }
+    { extern int quic_conn_selftest(void); quic_conn_selftest(); }
 #endif
 
     bcache_init();
