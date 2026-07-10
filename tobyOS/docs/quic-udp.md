@@ -94,19 +94,46 @@ Both the shared secret **and** the Handshake keys match, and tobyOS
 decrypts a real Handshake-level packet and reads the EncryptedExtensions
 — the TLS 1.3 key schedule works across two QUIC encryption levels.
 
+## Slice 4e — handshake completion (server Finished + 1-RTT)
+- `quic_udp_send_test()` now reassembles the server's Handshake flight
+  from the CRYPTO frame, walks its messages
+  (**EncryptedExtensions / Certificate / CertificateVerify /
+  Finished**), continues the transcript hash through
+  EE+Cert+CertVerify, and **verifies the server Finished MAC**:
+  `HMAC(finished_key, SHA-256(CH‖SH‖EE‖Cert‖CertVerify))`, with
+  `finished_key = Expand-Label(server handshake secret, "finished")`.
+  Matching this proves both sides agree on the *entire* handshake
+  transcript and key schedule.
+- It then derives + **installs the 1-RTT (application) keys**: master
+  secret → client application traffic secret → the `quic key/iv/hp`
+  used to protect 1-RTT packets.
+
+### Verified (QEMU SLIRP + responder full flight)
+The responder replies with server Initial(ServerHello) coalesced with
+Handshake(EE + Certificate + CertificateVerify + Finished), the server
+Finished computed over the correct transcript. tobyOS serial:
+`shared secret a4029dd573fa0f28…`, `derived server Handshake keys (key
+fb0e20ac07cd…)`, `flight: EE=1 Certificate=1 CertVerify=1 Finished=1`,
+`server Finished VERIFIED -- transcript + key schedule agree
+end-to-end`, `1-RTT keys installed (client app key 21301ca387c8…) --
+QUIC HANDSHAKE COMPLETE (crypto)`. The responder's server-Finished MAC
+was cross-checked against an independent RFC 8446 reference.
+
 ## What's next (HTTP/3 slices)
-- **Slice 4e** — finish the handshake: process Certificate /
-  CertificateVerify / Finished from the Handshake flight (reusing the
-  stage-13H cert validation), send the client Finished, install 1-RTT
-  keys. This is where the TLS message layer moves out of `tls.c` into
-  a shared module, and where a full live QUIC server replaces the
-  scripted responder.
-- **Slice 5** — HTTP/3 HEADERS/DATA framing + QPACK over QUIC streams,
-  into `http.c` behind an Alt-Svc / explicit-h3 probe with the h2/h1.1
-  fallback ladder intact.
+- **Slice 4f** — cert authentication + client Finished: validate the
+  Certificate chain and CertificateVerify signature (reusing the
+  stage-13H BearSSL path, which requires lifting `tls_validate_chain`
+  / `tls_verify_cv` out of `tls.c` into a shared module) and send the
+  client Finished. Against a full live QUIC server with a real cert,
+  not the scripted responder.
+- **Slice 5** — HTTP/3 HEADERS/DATA framing + QPACK over QUIC 1-RTT
+  streams, into `http.c` behind an Alt-Svc / explicit-h3 probe with
+  the h2/h1.1 fallback ladder intact.
 
 ## v1 scope
-Send the client Initial; receive + process the server's coalesced
-Initial + Handshake through the EncryptedExtensions. Certificate /
-Finished / 1-RTT are slice 4e. Triggered at boot under a build flag
-against a scripted responder (not yet a full live server).
+Completes the QUIC handshake *cryptographically* — key agreement,
+Handshake keys, server Finished verification, and 1-RTT key install —
+against a scripted responder. Certificate *authentication* (chain +
+CertVerify signature) and the client Finished send are slice 4f; a full
+live QUIC server is where that gets exercised. Triggered at boot under
+a build flag.

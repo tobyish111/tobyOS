@@ -441,7 +441,8 @@ int quic_udp_send_test(void) {
         kprintf("[quicudp] Handshake packet decrypt FAILED\n");
         return -1;
     }
-    /* First handshake message in the CRYPTO frame. */
+    /* The Handshake CRYPTO frame carries the whole server flight:
+     * EncryptedExtensions / Certificate / CertificateVerify / Finished. */
     size_t hfp = 0; struct quic_frame hf; int hgot = 0;
     while (hfp < (size_t)hl) {
         size_t fn = quic_frame_parse(hpay + hfp, (size_t)hl - hfp, &hf);
@@ -449,10 +450,71 @@ int quic_udp_send_test(void) {
         if (hf.type == QUIC_FRAME_CRYPTO) { hgot = 1; break; }
         hfp += fn;
     }
-    int msg_type = (hgot && hf.len >= 1) ? hf.data[0] : -1;
-    kprintf("[quicudp] Handshake packet DECRYPTED (pn=%u): first msg type=%d %s\n",
-            (unsigned)hpn, msg_type,
-            msg_type == 8 ? "(EncryptedExtensions) -- HANDSHAKE FLIGHT READABLE"
-                          : "");
-    return (msg_type == 8) ? 0 : -1;
+    if (!hgot) { kprintf("[quicudp] no Handshake CRYPTO frame\n"); return -1; }
+    kprintf("[quicudp] Handshake packet DECRYPTED (pn=%u, %ld flight bytes)\n",
+            (unsigned)hpn, (long)hf.len);
+
+    /* Copy the flight out (g_qrx is reused below) and walk its messages. */
+    static uint8_t flight[2048];
+    size_t flen = hf.len < sizeof flight ? (size_t)hf.len : sizeof flight;
+    memcpy(flight, hf.data, flen);
+    size_t mp = 0, fin_off = (size_t)-1;
+    int have_ee = 0, have_cert = 0, have_cv = 0;
+    const uint8_t *sfin = NULL; size_t sfin_len = 0;
+    while (mp + 4 <= flen) {
+        uint8_t mt = flight[mp];
+        uint32_t ml = ((uint32_t)flight[mp+1] << 16) |
+                      ((uint32_t)flight[mp+2] << 8) | flight[mp+3];
+        if (mp + 4 + ml > flen) break;
+        if (mt == 8)  have_ee = 1;
+        else if (mt == 11) have_cert = 1;
+        else if (mt == 15) have_cv = 1;
+        else if (mt == 20) { fin_off = mp; sfin = flight + mp + 4; sfin_len = ml; break; }
+        mp += 4 + ml;
+    }
+    kprintf("[quicudp] flight: EE=%d Certificate=%d CertVerify=%d Finished=%d\n",
+            have_ee, have_cert, have_cv, sfin != NULL);
+    if (!sfin || sfin_len < 32) {
+        kprintf("[quicudp] server Finished missing\n");
+        return -1;
+    }
+
+    /* Verify the server Finished MAC. Its transcript is
+     * Hash(ClientHello || ServerHello || EE || Cert || CertVerify) --
+     * everything up to (not including) the Finished. Matching this
+     * proves both sides agree on the ENTIRE handshake transcript and
+     * the key schedule end to end. */
+    uint8_t thash_sf[32];
+    { struct sha256_ctx tc; sha256_init(&tc);
+      sha256_update(&tc, ch, chl); sha256_update(&tc, sh_msg, sh_len);
+      sha256_update(&tc, flight, fin_off);          /* EE+Cert+CertVerify */
+      sha256_final(&tc, thash_sf); }
+    uint8_t expect_fin[32];
+    compute_finished(s_hs, thash_sf, expect_fin);
+    if (memcmp(expect_fin, sfin, 32) != 0) {
+        kprintf("[quicudp] server Finished MAC MISMATCH\n");
+        return -1;
+    }
+    kprintf("[quicudp] server Finished VERIFIED -- transcript + key schedule "
+            "agree end-to-end\n");
+
+    /* Install 1-RTT (application) keys. Transcript now includes the
+     * server Finished. master_secret = Extract(Derive-Secret(hs, derived),
+     * 0); client 1-RTT key = quic key from c ap traffic. */
+    uint8_t thash_af[32];
+    { struct sha256_ctx tc; sha256_init(&tc);
+      sha256_update(&tc, ch, chl); sha256_update(&tc, sh_msg, sh_len);
+      sha256_update(&tc, flight, fin_off + 4 + sfin_len);
+      sha256_final(&tc, thash_af); }
+    uint8_t derived2[32]; derive_secret(hs_secret, "derived", 7, empty_hash, derived2);
+    uint8_t master[32]; hkdf_extract(derived2, 32, zeros, 32, master);
+    uint8_t c_ap[32]; derive_secret(master, "c ap traffic", 12, thash_af, c_ap);
+    uint8_t ck1[16], civ1[12], chp1[16];
+    hkdf_expand_label(c_ap, "quic key", 8, NULL, 0, ck1, 16);
+    hkdf_expand_label(c_ap, "quic iv", 7, NULL, 0, civ1, 12);
+    hkdf_expand_label(c_ap, "quic hp", 7, NULL, 0, chp1, 16);
+    kprintf("[quicudp] 1-RTT keys installed (client app key ");
+    for (int i = 0; i < 6; i++) kprintf("%02x", ck1[i]);
+    kprintf(") -- QUIC HANDSHAKE COMPLETE (crypto)\n");
+    return 0;
 }
