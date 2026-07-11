@@ -391,6 +391,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_gui_about/user_gui_about.elf \
             programs/user_cpptest/user_cpptest.elf \
             programs/user_oh264test/user_oh264test.elf \
+            programs/user_bsdroute/user_bsdroute.elf \
             programs/user_gui_term/user_gui_term.elf \
             programs/user_gui_files/user_gui_files.elf \
             programs/user_gui_viewer/user_gui_viewer.elf \
@@ -979,7 +980,17 @@ $(LIBTOBY_SRC)/cxxrt.o: $(LIBTOBY_SRC)/cxxrt.cpp $(LIBTOBY_INC)/new
 $(LIBTOBY_SRC)/cxxrt.pic.o: $(LIBTOBY_SRC)/cxxrt.cpp $(LIBTOBY_INC)/new
 	$(CXX) $(LIBTOBY_CXXFLAGS) -fPIC -c $< -o $@
 
-LIBTOBY_OBJS += $(LIBTOBY_SRC)/cxxrt.o
+# oh264_glue.cpp (media slice 3): C-linkage bridge from the C
+# video_decoder to the openh264 C++ ISVCDecoder + I420->ARGB. Needs the
+# openh264 public API header. Only pulled from libtoby.a by a program
+# that actually decodes Main/High-profile H.264 (via video_decoder).
+$(LIBTOBY_SRC)/oh264_glue.o: $(LIBTOBY_SRC)/oh264_glue.cpp
+	$(CXX) $(LIBTOBY_CXXFLAGS) -I third_party/openh264/api -c $< -o $@
+
+$(LIBTOBY_SRC)/oh264_glue.pic.o: $(LIBTOBY_SRC)/oh264_glue.cpp
+	$(CXX) $(LIBTOBY_CXXFLAGS) -fPIC -I third_party/openh264/api -c $< -o $@
+
+LIBTOBY_OBJS += $(LIBTOBY_SRC)/cxxrt.o $(LIBTOBY_SRC)/oh264_glue.o
 # (the .pic.o append lives next to the other vendored PIC appends,
 # after LIBTOBY_PIC_OBJS is first assigned)
 
@@ -1091,7 +1102,7 @@ LIBTOBY_PIC_OBJS    += $(LIBTOBY_ASM_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBWEBP_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(H264BSD_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(OPENH264_PIC_OBJS)
-LIBTOBY_PIC_OBJS    += $(LIBTOBY_SRC)/cxxrt.pic.o
+LIBTOBY_PIC_OBJS    += $(LIBTOBY_SRC)/cxxrt.pic.o $(LIBTOBY_SRC)/oh264_glue.pic.o
 LIBTOBY_PIC_CFLAGS  := $(LIBTOBY_BUILD_CFLAGS) -fPIC
 
 $(LIBTOBY_SRC)/%.pic.o: $(LIBTOBY_SRC)/%.c
@@ -1244,6 +1255,7 @@ programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
 endef
 
 $(eval $(call LIBTOBY_CPP_PROGRAM_RULES,user_cpptest,user_cpptest))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_bsdroute,user_bsdroute))
 
 # /bin/oh264test (media slice 2): C++ decode-correctness test that links
 # the vendored openh264 ISVCDecoder out of libtoby.a. Same C++ program
@@ -2289,6 +2301,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_gui_about/user_gui_about.elf     $(INITRD_STAGE)/bin/gui_about
 	cp programs/user_cpptest/user_cpptest.elf         $(INITRD_STAGE)/bin/cpptest
 	cp programs/user_oh264test/user_oh264test.elf     $(INITRD_STAGE)/bin/oh264test
+	cp programs/user_bsdroute/user_bsdroute.elf       $(INITRD_STAGE)/bin/bsdroute
 	cp programs/user_gui_term/user_gui_term.elf       $(INITRD_STAGE)/bin/gui_term
 	cp programs/user_gui_files/user_gui_files.elf     $(INITRD_STAGE)/bin/gui_files
 	cp programs/user_gui_viewer/user_gui_viewer.elf   $(INITRD_STAGE)/bin/gui_viewer
@@ -2735,7 +2748,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
-	    bin/cpptest bin/oh264test                                                   \
+	    bin/cpptest bin/oh264test bin/bsdroute                                      \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
 	    bin/gui_calc bin/gui_taskmgr bin/gui_edit bin/gui_browser         \
 	    bin/login bin/gui_settings bin/abi_test                           \

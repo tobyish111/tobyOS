@@ -1,8 +1,10 @@
-/* oh264_clip.h -- GENERATED High-profile H.264 test vector (media slice 2).
+/* oh264_clip.h -- GENERATED High-profile H.264 test vector (media slice 2/3).
  * A 64x64 8-frame clip encoded by x264 -profile:v high (CABAC + 8x8
- * transform -- the features baseline h264bsd cannot decode). The per-frame
- * FNV-1a checksums are of the tight YUV420 planes from ffmpeg's decode;
- * H.264 decode is bit-exact by spec, so openh264 must match exactly. */
+ * transform -- the features baseline h264bsd cannot decode). Per-frame
+ * checksums: oh_frame_csum = tight YUV420 planes (direct ISVCDecoder,
+ * slice 2); oh_argb_csum = ARGB8888 after the oh264_glue.cpp BT.601
+ * conversion (via video_decoder, slice 3). Both from ffmpeg's decode of
+ * the same stream; H.264 decode is bit-exact by spec. Do not hand-edit. */
 #ifndef OH264_CLIP_H
 #define OH264_CLIP_H
 #define OH_W 64
@@ -397,5 +399,8 @@ static const unsigned char oh_clip[OH_CLIP_LEN] = {
 };
 static const unsigned int oh_frame_csum[OH_NFRAMES] = {
     0xdd94d850u, 0xd0fa30a8u, 0x29105747u, 0x89e827dcu, 0x9f593027u, 0xdacca1b0u, 0x4f17bdfdu, 0xc74ded73u
+};
+static const unsigned int oh_argb_csum[OH_NFRAMES] = {
+    0x054ac2b8u, 0x858c7482u, 0xfc8278f4u, 0xd503e85du, 0x2eab868au, 0xee63bb55u, 0xa9e04edfu, 0x06fa6d67u
 };
 #endif

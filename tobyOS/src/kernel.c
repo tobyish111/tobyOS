@@ -4313,6 +4313,18 @@ void _start(void) {
                 kprintf("[boot] OPENH264: oh264test (pid=%d) exit=%d (%s)\n",
                         ohpid, ohrc, ohrc == 0 ? "PASS" : "FAIL");
             }
+            /* /bin/bsdroute (a C program, like the browser) confirms the
+             * baseline path still routes to h264bsd + decodes. */
+            char *bv[] = { (char *)"bsdroute", 0 };
+            struct proc_spec bs = { .path = "/bin/bsdroute",
+                .name = "bsdroute", .argc = 1, .argv = bv,
+                .envc = 1, .envp = ohe };
+            int bpid = proc_spawn(&bs);
+            if (bpid >= 0) {
+                int brc = proc_wait(bpid);
+                kprintf("[boot] OPENH264: bsdroute (pid=%d) exit=%d (%s)\n",
+                        bpid, brc, brc == 0 ? "PASS" : "FAIL");
+            }
         }
 #endif
 #ifndef QUICK_BOOT

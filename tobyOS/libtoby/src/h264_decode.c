@@ -1,26 +1,50 @@
 /* h264_decode.c -- REAL H.264 decode for tobyOS userland (stage 13).
  *
- * Backed by the vendored h264bsd baseline-profile decoder (Android
- * AOSP-derived, pure integer C) -- this replaced the solid-colour
- * placeholder. Feed Annex-B byte-stream chunks (e.g. one AVI '##dc'
- * chunk = one access unit per call); when a picture completes it
- * comes back as ARGB8888 (h264bsd's "BGRA" u32 packing --
- * 0xFF<<24|r<<16|g<<8|b -- IS the tobyOS pixel format), valid until
- * the next decode call.
+ * The video_decoder API decodes every H.264 profile through the vendored
+ * openh264 (Cisco, BSD-2) via the C-linkage glue (oh264_glue.cpp).
+ * openh264 handles baseline, Main and High -- CABAC, the 8x8 transform
+ * and B-frames included -- so it is the single decode backend; baseline
+ * is simply the subset of the bitstream it already understands. (An
+ * earlier build routed baseline to the lighter h264bsd, but h264bsd
+ * faulted when co-linked with openh264, so the whole codec now runs on
+ * openh264, which is the more robust production decoder anyway.)
+ *
+ * A completed picture comes back as ARGB8888 (the tobyOS pixel format),
+ * valid until the next decode call. Feed Annex-B byte-stream chunks (one
+ * access unit per call works well). A call with nal_len == 0 flushes the
+ * frame the decoder holds after the last AU (High profile has output
+ * delay, so the final picture is drained this way).
  */
 
 #include "libtoby_internal.h"
 #include <toby/video_decode.h>
+#include <toby/oh264_glue.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "../../third_party/h264bsd/h264bsd_decoder.h"
-
 struct video_decoder {
-    int        codec;
-    storage_t *storage;
-    u32        pic_seq;
+    int   codec;
+    void *oh;        /* oh264_glue session, created on first decode */
 };
+
+/* Scan an Annex-B buffer for the first SPS NAL (type 7) and return its
+ * profile_idc (the byte right after the 1-byte NAL header), or -1 if no
+ * SPS is present in this buffer. Purely informational now. */
+static int peek_profile_idc(const uint8_t *p, size_t n) {
+    for (size_t i = 0; i + 4 < n; i++) {
+        size_t off;
+        if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1)
+            off = i + 3;
+        else if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 0 && p[i + 3] == 1)
+            off = i + 4;
+        else
+            continue;
+        if (off < n && (p[off] & 0x1f) == 7 && off + 1 < n)
+            return p[off + 1];              /* profile_idc */
+    }
+    return -1;
+}
 
 struct video_decoder *video_decoder_create(int codec)
 {
@@ -30,69 +54,44 @@ struct video_decoder *video_decoder_create(int codec)
     if (!dec) return NULL;
     memset(dec, 0, sizeof(*dec));
     dec->codec = codec;
-    dec->storage = h264bsdAlloc();
-    if (!dec->storage) { free(dec); return NULL; }
-    if (h264bsdInit(dec->storage, 1 /* no output reordering */) != 0) {
-        h264bsdFree(dec->storage);
-        free(dec);
-        return NULL;
-    }
-    return dec;
+    return dec;                                   /* openh264 opened lazily */
 }
 
-/* Decode one Annex-B chunk. Returns 1 when *out holds a picture
- * (mb-aligned dimensions; the buffer is the decoder's, valid until
- * the next call), 0 when the chunk was consumed without completing a
- * picture (parameter sets, partial data), -1 on a stream error. */
+/* Decode one Annex-B chunk. Returns 1 when *out holds a picture (ARGB,
+ * the buffer is the decoder's, valid until the next call), 0 when the
+ * chunk was consumed without completing a picture, -1 on a stream error.
+ * Pass nal_len == 0 to flush a held frame. */
 int video_decoder_decode(struct video_decoder *dec,
                          const uint8_t *nal, size_t nal_len,
                          struct video_frame *out)
 {
-    if (!dec || !dec->storage || !nal || nal_len == 0) return -1;
-    u8 *p = (u8 *)nal;
-    u32 left = (u32)nal_len;
-    int got = 0, err = 0, zero_streak = 0;
-    /* h264bsd's calling protocol: some returns (HDRS_RDY, the two-
-     * phase paths) deliberately report readBytes == 0 and expect the
-     * SAME buffer again -- the decoder resumes internally via
-     * prevBytesConsumed. So a zero read is "call again", not "stuck";
-     * the streak counter and iteration guard bound the loop. */
-    for (int guard = 0; left > 0 && guard < 512; guard++) {
-        u32 read_bytes = 0;
-        u32 rc = h264bsdDecode(dec->storage, p, left, dec->pic_seq,
-                               &read_bytes);
-        if (read_bytes > left) break;
-        p += read_bytes;
-        left -= read_bytes;
-        zero_streak = read_bytes ? 0 : zero_streak + 1;
-        if (rc == H264BSD_PIC_RDY) {
-            dec->pic_seq++;
-            u32 pic_id = 0, is_idr = 0, err_mbs = 0;
-            u32 *argb = h264bsdNextOutputPictureBGRA(dec->storage, &pic_id,
-                                                     &is_idr, &err_mbs);
-            if (argb && out) {
-                out->data   = (uint8_t *)argb;
-                out->width  = (int)(h264bsdPicWidth(dec->storage) * 16);
-                out->height = (int)(h264bsdPicHeight(dec->storage) * 16);
-                out->pts_ms = 0;
-                got = 1;
-            }
-        } else if (rc == H264BSD_ERROR || rc == H264BSD_PARAM_SET_ERROR ||
-                   rc == H264BSD_MEMALLOC_ERROR) {
-            err = 1;
-            if (read_bytes == 0) break;   /* can't step past the bad NAL */
-        }
-        if (zero_streak > 3) break;        /* resume states get re-calls */
+    if (!dec) return -1;
+
+    if (!dec->oh) {
+        if (!nal || nal_len == 0) return -1;   /* need the first AU to start */
+        int prof = peek_profile_idc(nal, nal_len);
+        dec->oh = oh264_open();
+        if (!dec->oh) return -1;
+        printf("[vdec] profile_idc=%d -> openh264\n", prof);
     }
-    return got ? 1 : (err ? -1 : 0);
+
+    uint32_t *argb = NULL; int w = 0, h = 0;
+    int r = (nal && nal_len)
+                ? oh264_decode(dec->oh, nal, (int)nal_len, &argb, &w, &h)
+                : oh264_flush(dec->oh, &argb, &w, &h);
+    if (r == 1 && out) {
+        out->data   = (uint8_t *)argb;
+        out->width  = w;
+        out->height = h;
+        out->pts_ms = 0;
+        return 1;
+    }
+    return r < 0 ? -1 : 0;
 }
 
 void video_decoder_destroy(struct video_decoder *dec)
 {
     if (!dec) return;
-    if (dec->storage) {
-        h264bsdShutdown(dec->storage);
-        h264bsdFree(dec->storage);
-    }
+    if (dec->oh) oh264_close(dec->oh);
     free(dec);
 }
