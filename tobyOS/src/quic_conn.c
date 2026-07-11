@@ -61,8 +61,8 @@ static size_t quic_build_transport_params(uint8_t *out,
     n += tp_put(out + n, 0x0f, scid, scid_len);         /* initial_source_connection_id */
     n += tp_put_int(out + n, 0x01, 30000);              /* max_idle_timeout (ms) */
     n += tp_put_int(out + n, 0x03, 1472);               /* max_udp_payload_size */
-    n += tp_put_int(out + n, 0x04, 1048576);            /* initial_max_data */
-    n += tp_put_int(out + n, 0x05, 262144);             /* stream_data_bidi_local */
+    n += tp_put_int(out + n, 0x04, 2097152);            /* initial_max_data (2 MiB) */
+    n += tp_put_int(out + n, 0x05, 1048576);            /* stream_data_bidi_local (1 MiB) */
     n += tp_put_int(out + n, 0x06, 262144);             /* stream_data_bidi_remote */
     n += tp_put_int(out + n, 0x07, 262144);             /* stream_data_uni */
     n += tp_put_int(out + n, 0x08, 100);                /* initial_max_streams_bidi */
@@ -262,7 +262,7 @@ int quic_conn_selftest(void) {
  * only the first one (the 4c..4g scripted-responder behavior) drops
  * everything past the first. quic_udp_send_test polls + dequeues. */
 
-#define QRX_SLOTS 8
+#define QRX_SLOTS 64             /* absorb a large-response burst before we drain */
 #define QRX_MAX   2048
 static uint8_t  g_qq[QRX_SLOTS][QRX_MAX];
 static uint16_t g_qq_len[QRX_SLOTS];
@@ -337,6 +337,7 @@ struct qrsm {
     uint8_t *buf;
     uint8_t *bits;                /* coverage bitmap, cap/8 bytes */
     uint32_t cap;
+    uint32_t contig;              /* contiguous prefix length (monotone) */
 };
 
 static void qrsm_add(struct qrsm *r, uint64_t off, const uint8_t *d, uint64_t n) {
@@ -345,13 +346,16 @@ static void qrsm_add(struct qrsm *r, uint64_t off, const uint8_t *d, uint64_t n)
     memcpy(r->buf + off, d, n);
     for (uint64_t i = off; i < off + n; i++)
         r->bits[i >> 3] |= (uint8_t)(1u << (i & 7));
+    /* Advance the contiguous frontier past whatever this fill connected.
+     * contig only moves forward, so total work is O(cap) over the whole
+     * transfer -- not O(cap) per datagram (which is O(n^2) for a big
+     * multi-megabyte response). */
+    while (r->contig < r->cap &&
+           (r->bits[r->contig >> 3] & (1u << (r->contig & 7))))
+        r->contig++;
 }
 
-static uint32_t qrsm_contig(const struct qrsm *r) {
-    uint32_t i = 0;
-    while (i < r->cap && (r->bits[i >> 3] & (1u << (i & 7)))) i++;
-    return i;
-}
+static uint32_t qrsm_contig(const struct qrsm *r) { return r->contig; }
 
 /* ---- Received-packet-number tracking (for the ACKs we send) ------ */
 
@@ -466,10 +470,11 @@ static void h3_hdr_to_resp(void *ud, const char *name, const char *value) {
 }
 
 /* Response-stream reassembly cap: matches the initial_max_stream_data
- * we advertise (262144), so flow control never blocks inside it. A
- * larger response returns HTTP_ERR_TOOBIG -> the http.c ladder falls
- * back to h2/h1.1. */
-#define H3_RESP_MAX 262144u
+ * we advertise (1 MiB, quic_build_transport_params), so a server can
+ * send a whole ordinary page before flow control would block. A larger
+ * response returns HTTP_ERR_TOOBIG -> the http.c ladder falls back to
+ * h2/h1.1. */
+#define H3_RESP_MAX (1024u * 1024u)
 
 /* ---- http3_fetch: a reusable HTTP/3 GET transport (slices 4b..5b) - *
  * Run a full QUIC v1 handshake to `ip_be`:`port` (network-order IP),
@@ -541,14 +546,14 @@ int http3_fetch(uint32_t ip_be, uint16_t port, const char *host,
 
     /* CRYPTO reassembly (Initial + Handshake levels) + the response
      * stream (1-RTT stream 0, reassembled the same way) */
-    static uint8_t ibuf[1024],  ibits[1024 / 8];
-    static uint8_t hbuf[8192],  hbits[8192 / 8];
+    static uint8_t ibuf[2048],  ibits[2048 / 8];
+    static uint8_t hbuf[16384], hbits[16384 / 8];   /* real cert chains span >8K */
     static uint8_t s0buf[H3_RESP_MAX], s0bits[H3_RESP_MAX / 8];
     memset(ibits, 0, sizeof ibits); memset(hbits, 0, sizeof hbits);
     memset(s0bits, 0, sizeof s0bits);
-    struct qrsm irsm = { ibuf, ibits, sizeof ibuf };
-    struct qrsm hrsm = { hbuf, hbits, sizeof hbuf };
-    struct qrsm s0rsm = { s0buf, s0bits, sizeof s0buf };
+    struct qrsm irsm = { ibuf, ibits, sizeof ibuf, 0 };
+    struct qrsm hrsm = { hbuf, hbits, sizeof hbuf, 0 };
+    struct qrsm s0rsm = { s0buf, s0bits, sizeof s0buf, 0 };
 
     g_qq_head = g_qq_tail = 0;
 
@@ -1225,15 +1230,45 @@ int quic_udp_send_test(void) {
         return rc;
     }
 
+    /* Large response over the integrated path: /big serves ~900 KiB,
+     * exercising flow control (1 MiB advertised window), offset
+     * reassembly of a multi-hundred-packet stream, and the recv ring. */
     struct http_response r2;
-    int rc2 = http_get_opt("https://tobyos.test:4433/", 65536, 15000,
+    int rc2 = http_get_opt("https://tobyos.test:4433/big", H3_RESP_MAX, 20000,
                            HTTP_F_TRY_H3 | HTTP_F_TRUNCATE, &r2);
     if (rc2 == 0) {
-        kprintf("[quich3] http_get_opt over h3 OK: status=%d body=%u bytes "
-                "-- HTTP/3 WIRED INTO http.c\n", r2.status, (unsigned)r2.body_len);
+        kprintf("[quich3] http_get_opt /big over h3 OK: status=%d body=%u "
+                "bytes -- LARGE RESPONSE OVER HTTP/3\n",
+                r2.status, (unsigned)r2.body_len);
         http_free(&r2);
     } else {
-        kprintf("[quich3] http_get_opt over h3 FAILED rc=%d\n", rc2);
+        kprintf("[quich3] http_get_opt /big over h3 FAILED rc=%d\n", rc2);
     }
+
+#ifdef QUIC_REALWORLD
+    /* A REAL public HTTP/3 endpoint over the open internet (SLIRP NAT):
+     * real DNS, a real certificate chaining to a Mozilla root (13H
+     * store, always compiled), a real server flight. gzip so the page
+     * fits the cap; we report status + size, the browser would inflate.
+     * (Real DNS still works with -DTLS_TEST_CA: the test seam only
+     * intercepts tobyos.test.) */
+    {
+        struct http_response r3;
+        const char *url = "https://cloudflare-quic.com/";
+        kprintf("[quich3] REAL-WORLD: GET %s over HTTP/3...\n", url);
+        int rc3 = http_get_opt(url, H3_RESP_MAX, 25000,
+                               HTTP_F_TRY_H3 | HTTP_F_GZIP | HTTP_F_TRUNCATE, &r3);
+        if (rc3 == 0) {
+            kprintf("[quich3] REAL-WORLD OK: %s status=%d type='%s' enc=%d "
+                    "body=%u bytes -- LIVE PAGE FROM THE INTERNET OVER HTTP/3\n",
+                    url, r3.status, r3.content_type, r3.encoding,
+                    (unsigned)r3.body_len);
+            http_free(&r3);
+        } else {
+            kprintf("[quich3] REAL-WORLD FAILED rc=%d (%s)\n",
+                    rc3, http_strerror(rc3));
+        }
+    }
+#endif
     return rc2;
 }
