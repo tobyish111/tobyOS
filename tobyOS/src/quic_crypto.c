@@ -129,6 +129,36 @@ int quic_aead_decrypt(const uint8_t key[16], const uint8_t nonce[12],
     return br_gcm_check_tag(&gc, tag) == 1 ? 0 : -1;
 }
 
+/* ---- Retry integrity (RFC 9001 s5.8) ----------------------------- */
+
+/* Fixed v1 Retry integrity key + nonce (RFC 9001 s5.8; cross-checked
+ * against the aioquic reference RETRY_AEAD_{KEY,NONCE}_VERSION_1). */
+static const uint8_t QUIC_V1_RETRY_KEY[16] = {
+    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
+    0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e
+};
+static const uint8_t QUIC_V1_RETRY_NONCE[12] = {
+    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
+    0x23, 0x98, 0x25, 0xbb
+};
+
+int quic_retry_tag_verify(const uint8_t *pkt, size_t len,
+                          const uint8_t *odcid, size_t odcid_len) {
+    if (len < 16 || odcid_len > 20) return -1;
+    /* pseudo-packet = odcid_len(1) || odcid || pkt-without-tag
+     * (body budget covers a ~256-byte RSA-encrypted retry token) */
+    uint8_t pseudo[1 + 20 + 512];
+    size_t body = len - 16;
+    if (1 + odcid_len + body > sizeof pseudo) return -1;
+    pseudo[0] = (uint8_t)odcid_len;
+    memcpy(pseudo + 1, odcid, odcid_len);
+    memcpy(pseudo + 1 + odcid_len, pkt, body);
+    uint8_t tag[16];
+    quic_aead_encrypt(QUIC_V1_RETRY_KEY, QUIC_V1_RETRY_NONCE,
+                      pseudo, 1 + odcid_len + body, NULL, 0, tag);
+    return memcmp(tag, pkt + body, 16) == 0 ? 0 : -1;
+}
+
 /* ---- Self-test (RFC 9001 Appendix A + AES-128-GCM KAT) ---------- */
 
 static int eq(const char *what, const uint8_t *got, const uint8_t *exp, size_t n) {

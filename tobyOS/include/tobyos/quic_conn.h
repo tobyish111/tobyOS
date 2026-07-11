@@ -44,9 +44,17 @@ size_t quic_build_client_initial(uint8_t *out, size_t cap,
 #define QUIC_CONN_SELFTEST_N 3
 int quic_conn_selftest(void);
 
-/* Slice 4b: build a random-CID client Initial (padded to 1200) and
- * UDP-send it to a QUIC listener on the SLIRP host (10.0.2.2:4433).
- * Returns 0 on send OK. Called at boot under -DQUIC_SEND_TEST. */
+/* Slices 4b..4h: run a full live QUIC client handshake against a real
+ * server on the SLIRP host (10.0.2.2:4433) -- client Initial (padded
+ * to 1200) -> Version Negotiation / Retry (integrity-checked) ->
+ * server Initial (ServerHello, shared secret) -> Handshake flight
+ * (CRYPTO reassembled by offset across packets/datagrams) with
+ * REQUIRED certificate chain + CertificateVerify validation (13H
+ * path) -> server Finished verify -> ACKs at every level -> client
+ * Finished -> server's 1-RTT HANDSHAKE_DONE confirms completion.
+ * Returns 0 once HANDSHAKE_DONE is decrypted, -1 on any failure.
+ * Called at boot under -DQUIC_SEND_TEST (trust the test CA with
+ * -DTLS_TEST_CA). */
 int quic_udp_send_test(void);
 
 #endif /* TOBYOS_QUIC_CONN_H */

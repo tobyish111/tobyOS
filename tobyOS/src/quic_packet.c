@@ -26,6 +26,20 @@ size_t quic_frame_crypto(uint8_t *out, size_t cap,
     return total;
 }
 
+size_t quic_frame_ack(uint8_t *out, size_t cap,
+                      uint64_t largest, uint64_t first_range) {
+    uint8_t buf[1 + 8 * 4];
+    size_t p = 0;
+    buf[p++] = QUIC_FRAME_ACK;
+    p += quic_varint_encode(buf + p, largest);
+    p += quic_varint_encode(buf + p, 0);           /* ack delay */
+    p += quic_varint_encode(buf + p, 0);           /* range count */
+    p += quic_varint_encode(buf + p, first_range); /* first ack range */
+    if (p > cap) return 0;
+    memcpy(out, buf, p);
+    return p;
+}
+
 size_t quic_frame_parse(const uint8_t *p, size_t cap, struct quic_frame *f) {
     if (cap < 1) return 0;
     memset(f, 0, sizeof *f);
@@ -35,16 +49,19 @@ size_t quic_frame_parse(const uint8_t *p, size_t cap, struct quic_frame *f) {
         while (n < cap && p[n] == QUIC_FRAME_PADDING) n++;
         return n;                          /* collapse the PADDING run */
     }
-    if (p[0] == QUIC_FRAME_PING) return 1;
-    if (p[0] == QUIC_FRAME_CRYPTO) {
+    if (p[0] == QUIC_FRAME_PING || p[0] == QUIC_FRAME_HANDSHAKE_DONE)
+        return 1;
+    if (p[0] == QUIC_FRAME_CRYPTO || p[0] == QUIC_FRAME_NEW_TOKEN) {
         size_t o = 1, n;
-        n = quic_varint_decode(p + o, cap - o, &f->offset); if (!n) return 0; o += n;
+        if (p[0] == QUIC_FRAME_CRYPTO) {
+            n = quic_varint_decode(p + o, cap - o, &f->offset); if (!n) return 0; o += n;
+        }
         n = quic_varint_decode(p + o, cap - o, &f->len);    if (!n) return 0; o += n;
         if (o + f->len > cap) return 0;
         f->data = p + o;
         return o + (size_t)f->len;
     }
-    if (p[0] == QUIC_FRAME_ACK) {
+    if (p[0] == QUIC_FRAME_ACK || p[0] == QUIC_FRAME_ACK_ECN) {
         size_t o = 1, n; uint64_t delay, rc, first;
         n = quic_varint_decode(p + o, cap - o, &f->largest); if (!n) return 0; o += n;
         n = quic_varint_decode(p + o, cap - o, &delay);      if (!n) return 0; o += n;
@@ -55,7 +72,39 @@ size_t quic_frame_parse(const uint8_t *p, size_t cap, struct quic_frame *f) {
             n = quic_varint_decode(p + o, cap - o, &g); if (!n) return 0; o += n;
             n = quic_varint_decode(p + o, cap - o, &r); if (!n) return 0; o += n;
         }
+        if (p[0] == QUIC_FRAME_ACK_ECN) {                    /* 3 ECN counts */
+            for (int i = 0; i < 3; i++) {
+                uint64_t c;
+                n = quic_varint_decode(p + o, cap - o, &c); if (!n) return 0; o += n;
+            }
+        }
         return o;
+    }
+    if (p[0] == QUIC_FRAME_NEW_CID) {
+        size_t o = 1, n; uint64_t seq, retire;
+        n = quic_varint_decode(p + o, cap - o, &seq);    if (!n) return 0; o += n;
+        n = quic_varint_decode(p + o, cap - o, &retire); if (!n) return 0; o += n;
+        if (o >= cap) return 0;
+        size_t cl = p[o++];                                  /* CID length */
+        if (o + cl + 16 > cap) return 0;                     /* CID + reset token */
+        return o + cl + 16;
+    }
+    if (p[0] == QUIC_FRAME_RETIRE_CID) {
+        size_t o = 1, n; uint64_t seq;
+        n = quic_varint_decode(p + o, cap - o, &seq); if (!n) return 0; o += n;
+        return o;
+    }
+    if (p[0] == QUIC_FRAME_CONN_CLOSE || p[0] == QUIC_FRAME_CONN_CLOSE_APP) {
+        size_t o = 1, n;
+        n = quic_varint_decode(p + o, cap - o, &f->err_code); if (!n) return 0; o += n;
+        if (p[0] == QUIC_FRAME_CONN_CLOSE) {                 /* frame type */
+            uint64_t ft;
+            n = quic_varint_decode(p + o, cap - o, &ft); if (!n) return 0; o += n;
+        }
+        n = quic_varint_decode(p + o, cap - o, &f->len);     if (!n) return 0; o += n;
+        if (o + f->len > cap) return 0;
+        f->data = p + o;                                     /* reason phrase */
+        return o + (size_t)f->len;
     }
     return 0;                              /* unhandled frame type */
 }
@@ -195,6 +244,100 @@ long quic_open_initial(uint8_t *pkt, size_t len,
                        const uint8_t hp[16],
                        const uint8_t **out_payload, uint64_t *out_pn) {
     return quic_open_long(pkt, len, 1, key, iv, hp, out_payload, out_pn, NULL);
+}
+
+/* ---- Short-header (1-RTT) packets -------------------------------- */
+
+size_t quic_build_short(uint8_t *out, size_t cap,
+                        const uint8_t *dcid, size_t dcid_len,
+                        uint64_t pkt_num, unsigned pn_len,
+                        const uint8_t *payload, size_t payload_len,
+                        const uint8_t key[16], const uint8_t iv[12],
+                        const uint8_t hp[16]) {
+    if (pn_len < 1 || pn_len > 4) return 0;
+    size_t p = 0;
+    /* Flags: fixed(0x40) + spin 0 + key phase 0 + pn_len-1. */
+    if (1 + dcid_len + pn_len + payload_len + 16 > cap) return 0;
+    out[p++] = (uint8_t)(0x40 | (pn_len - 1));
+    memcpy(out + p, dcid, dcid_len); p += dcid_len;
+    size_t pn_off = p;
+    for (unsigned i = 0; i < pn_len; i++)
+        out[p++] = (uint8_t)(pkt_num >> (8 * (pn_len - 1 - i)));
+    size_t header_len = p;
+    memcpy(out + p, payload, payload_len);
+
+    uint8_t nonce[12];
+    quic_packet_nonce(iv, pkt_num, nonce);
+    quic_aead_encrypt(key, nonce, out, header_len,
+                      out + header_len, payload_len, out + header_len + payload_len);
+    size_t total = header_len + payload_len + 16;
+
+    /* The HP sample needs pn_off + 4 + 16 <= total; a 1-RTT packet
+     * whose payload is too short must pad (caller's job -- ACK-only
+     * payloads here are >= 4 bytes with pn_len 4, so total works). */
+    if (pn_off + 4 + 16 > total) return 0;
+    uint8_t mask[5];
+    quic_hp_mask(hp, out + pn_off + 4, mask);
+    out[0] ^= mask[0] & 0x1f;              /* short header: low 5 bits */
+    for (unsigned i = 0; i < pn_len; i++)
+        out[pn_off + i] ^= mask[1 + i];
+    return total;
+}
+
+long quic_open_short(uint8_t *pkt, size_t len, size_t dcid_len,
+                     const uint8_t key[16], const uint8_t iv[12],
+                     const uint8_t hp[16],
+                     const uint8_t **out_payload, uint64_t *out_pn) {
+    if (len < 1 + dcid_len + 4 + 16 + 4) return -1;
+    if (pkt[0] & 0x80) return -1;          /* not a short header */
+    size_t pn_off = 1 + dcid_len;
+
+    uint8_t mask[5];
+    quic_hp_mask(hp, pkt + pn_off + 4, mask);
+    uint8_t first = pkt[0] ^ (mask[0] & 0x1f);
+    unsigned pn_len = (first & 0x03) + 1;
+    uint64_t pn = 0;
+    for (unsigned i = 0; i < pn_len; i++) {
+        uint8_t b = pkt[pn_off + i] ^ mask[1 + i];
+        pn = (pn << 8) | b;
+    }
+    pkt[0] = first;
+    for (unsigned i = 0; i < pn_len; i++) pkt[pn_off + i] ^= mask[1 + i];
+
+    size_t header_len = pn_off + pn_len;
+    if (header_len + 16 > len) return -1;
+    size_t body = len - header_len - 16;   /* extends to datagram end */
+
+    uint8_t nonce[12];
+    quic_packet_nonce(iv, pn, nonce);
+    if (quic_aead_decrypt(key, nonce, pkt, header_len,
+                          pkt + header_len, body,
+                          pkt + header_len + body) != 0)
+        return -1;
+    if (out_payload) *out_payload = pkt + header_len;
+    if (out_pn) *out_pn = pn;
+    return (long)body;
+}
+
+/* ---- Retry packets ------------------------------------------------ */
+
+int quic_parse_retry(const uint8_t *pkt, size_t len,
+                     const uint8_t **out_scid, size_t *out_scid_len,
+                     const uint8_t **out_token, size_t *out_token_len) {
+    if (len < 7 + 16 || (pkt[0] & 0xf0) != 0xf0) return -1;  /* long + type 3 */
+    size_t p = 5;                          /* first byte + version */
+    if (p >= len) return -1;
+    size_t dl = pkt[p++];                  /* DCID (ours; ignored) */
+    if (p + dl >= len) return -1;
+    p += dl;
+    size_t sl = pkt[p++];                  /* SCID = our next DCID */
+    if (p + sl + 16 > len) return -1;
+    *out_scid = pkt + p; *out_scid_len = sl;
+    p += sl;
+    /* Everything up to the final 16-byte integrity tag is the token. */
+    *out_token = pkt + p;
+    *out_token_len = len - 16 - p;
+    return 0;
 }
 
 /* ---- Self-test (vs aioquic reference) --------------------------- */

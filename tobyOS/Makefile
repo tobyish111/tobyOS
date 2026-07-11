@@ -702,7 +702,10 @@ third_party/bearssl/src/%.o: third_party/bearssl/src/%.c Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $(BEARSSL_INC) -w -c $< -o $@
 
 # The trust-anchor array pulls in br_x509_trust_anchor from bearssl.h.
-src/tls_trust.o: src/tls_trust.c $(HEADERS) third_party/bearssl/trust_anchors.inc Makefile
+# test_ca_anchor.inc (the tobyOS test CA, tests/quic-ca/) is only
+# compiled in under -DTLS_TEST_CA; it's a prerequisite so regenerating
+# it rebuilds either way.
+src/tls_trust.o: src/tls_trust.c $(HEADERS) third_party/bearssl/trust_anchors.inc third_party/bearssl/test_ca_anchor.inc Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $(BEARSSL_INC) -w -c $< -o $@
 
 # tls.c calls the BearSSL X.509 API, so it needs the public headers +

@@ -64,6 +64,17 @@ int quic_aead_decrypt(const uint8_t key[16], const uint8_t nonce[12],
                       const uint8_t *aad, size_t aad_len,
                       uint8_t *payload, size_t len, const uint8_t tag[16]);
 
+/* ---- Retry integrity (RFC 9001 s5.8) ----------------------------- */
+
+/* Verify a Retry packet's 16-byte integrity tag: AES-128-GCM with the
+ * fixed v1 key/nonce over the "Retry pseudo-packet" (1-byte ODCID
+ * length + ODCID + the Retry packet minus its final 16 tag bytes) as
+ * AAD, empty plaintext. `pkt`/`len` is the whole received Retry packet
+ * (tag included); odcid is the DCID of the client's first Initial.
+ * Returns 0 if the tag verifies, -1 otherwise. */
+int quic_retry_tag_verify(const uint8_t *pkt, size_t len,
+                          const uint8_t *odcid, size_t odcid_len);
+
 /* ---- Self-test -------------------------------------------------- */
 
 /* Verify the whole Initial-crypto path against the RFC 9001 Appendix A

@@ -251,27 +251,40 @@ int quic_conn_selftest(void) {
     return pass;
 }
 
-/* ---- Receive path (slice 4c) ------------------------------------ *
- * A UDP recv hook (registered in udp.c for QUIC_CLIENT_PORT) captures
- * the server's reply datagram (the QUIC packet after the UDP header)
- * into a static buffer. quic_udp_send_test polls for it and processes
- * the server Initial: open it with the SERVER Initial keys (derived
- * from the client's original DCID), parse the ServerHello out of the
- * CRYPTO frame, and derive the handshake shared secret. */
+/* ---- Receive path (slices 4c..4h) -------------------------------- *
+ * A UDP recv hook (registered in udp.c for QUIC_CLIENT_PORT) queues
+ * the server's reply datagrams (the QUIC packet after the UDP header)
+ * into a small ring -- a live server sends its flights across SEVERAL
+ * datagrams (Initial + multiple Handshake packets + 1-RTT), so keeping
+ * only the first one (the 4c..4g scripted-responder behavior) drops
+ * everything past the first. quic_udp_send_test polls + dequeues. */
 
-static uint8_t  g_qrx[2048];
-static size_t   g_qrx_len;
-static volatile int g_qrx_ready;
+#define QRX_SLOTS 8
+#define QRX_MAX   2048
+static uint8_t  g_qq[QRX_SLOTS][QRX_MAX];
+static uint16_t g_qq_len[QRX_SLOTS];
+static volatile uint32_t g_qq_head, g_qq_tail;   /* head=write, tail=read */
 
 void quic_recv_hook(uint32_t src_ip_be, const void *udp_packet, size_t len) {
     (void)src_ip_be;
-    if (g_qrx_ready) return;                 /* keep the first datagram */
     if (len <= 8) return;
-    size_t n = len - 8;                      /* strip the 8-byte UDP header */
-    if (n > sizeof g_qrx) n = sizeof g_qrx;
-    memcpy(g_qrx, (const uint8_t *)udp_packet + 8, n);
-    g_qrx_len = n;
-    g_qrx_ready = 1;
+    uint32_t h = g_qq_head;
+    if (h - g_qq_tail >= QRX_SLOTS) return;       /* full: drop (peer resends) */
+    size_t n = len - 8;                           /* strip the 8-byte UDP header */
+    if (n > QRX_MAX) n = QRX_MAX;
+    memcpy(g_qq[h % QRX_SLOTS], (const uint8_t *)udp_packet + 8, n);
+    g_qq_len[h % QRX_SLOTS] = (uint16_t)n;
+    g_qq_head = h + 1;
+}
+
+static int qrx_pop(uint8_t *dst, size_t cap) {
+    if (g_qq_tail == g_qq_head) return -1;
+    uint32_t t = g_qq_tail;
+    size_t n = g_qq_len[t % QRX_SLOTS];
+    if (n > cap) n = cap;
+    memcpy(dst, g_qq[t % QRX_SLOTS], n);
+    g_qq_tail = t + 1;
+    return (int)n;
 }
 
 /* Minimal ServerHello parser: pull the server random + the X25519
@@ -310,279 +323,639 @@ static int quic_parse_server_hello(const uint8_t *d, size_t len,
     return have_ks ? 0 : -1;
 }
 
-/* ---- On-the-wire send test (slice 4b) --------------------------- *
- * Build a real, RANDOM-CID client Initial padded to 1200 bytes (the
- * RFC 9000 anti-amplification minimum) and UDP-send it to a QUIC
- * listener on the SLIRP host (10.0.2.2:4433), which decrypts + parses
- * the ClientHello over the wire. Proves the outbound QUIC path end to
- * end. Called from boot under -DQUIC_SEND_TEST once the network is up. */
+/* ---- CRYPTO-stream reassembly (slice 4h) ------------------------- *
+ * A live server's Certificate chain spans multiple CRYPTO frames
+ * across multiple Handshake packets (and datagrams), possibly
+ * retransmitted -- so CRYPTO data is copied in at its stream offset
+ * with per-byte coverage bits, and the flight is only consumed once
+ * the prefix is contiguous. */
+
+struct qrsm {
+    uint8_t *buf;
+    uint8_t *bits;                /* coverage bitmap, cap/8 bytes */
+    uint32_t cap;
+};
+
+static void qrsm_add(struct qrsm *r, uint64_t off, const uint8_t *d, uint64_t n) {
+    if (off >= r->cap) return;
+    if (off + n > r->cap) n = r->cap - off;
+    memcpy(r->buf + off, d, n);
+    for (uint64_t i = off; i < off + n; i++)
+        r->bits[i >> 3] |= (uint8_t)(1u << (i & 7));
+}
+
+static uint32_t qrsm_contig(const struct qrsm *r) {
+    uint32_t i = 0;
+    while (i < r->cap && (r->bits[i >> 3] & (1u << (i & 7)))) i++;
+    return i;
+}
+
+/* ---- Received-packet-number tracking (for the ACKs we send) ------ */
+
+struct qack {
+    uint64_t largest;
+    uint64_t seen;                /* bitmap of pns 0..63 */
+    int any;                      /* any packet received in this space */
+    int elicited;                 /* an ACK-eliciting packet needs acking */
+};
+
+static void qack_note(struct qack *a, uint64_t pn, int elicit) {
+    if (pn < 64) a->seen |= 1ULL << pn;
+    if (!a->any || pn > a->largest) a->largest = pn;
+    a->any = 1;
+    if (elicit) a->elicited = 1;
+}
+
+static uint64_t qack_first_range(const struct qack *a) {
+    uint64_t r = 0, pn = a->largest;
+    while (pn > 0 && pn - 1 < 64 && (a->seen & (1ULL << (pn - 1)))) { r++; pn--; }
+    return r;
+}
+
+/* Structural long-header parse: total on-wire length of the packet at
+ * pkt (so coalesced packets can be walked even when one can't be
+ * opened -- the length field is not protected). 0 = malformed. */
+static size_t long_pkt_wire_len(const uint8_t *pkt, size_t len) {
+    if (len < 7) return 0;
+    size_t p = 5;
+    size_t dl = pkt[p++]; p += dl;
+    if (p >= len) return 0;
+    size_t sl = pkt[p++]; p += sl;
+    if (p > len) return 0;
+    unsigned type = pkt[0] & 0x30;
+    if (type == 0x30) return len;              /* Retry: rest of datagram */
+    if (type == 0x00) {                        /* Initial: token field */
+        uint64_t tl; size_t n = quic_varint_decode(pkt + p, len - p, &tl);
+        if (!n) return 0;
+        p += n + (size_t)tl;
+    }
+    uint64_t length; size_t n = quic_varint_decode(pkt + p, len - p, &length);
+    if (!n) return 0;
+    p += n;
+    if (p + length > len) return 0;
+    return p + (size_t)length;
+}
+
+/* Build a client Initial datagram: the given frames + PADDING to the
+ * RFC 9000 s14.1 1200-byte minimum (every client datagram carrying an
+ * Initial must be padded, ACK-only ones included). Keys derive from
+ * key_dcid (the original -- or post-Retry -- DCID); hdr_dcid is what
+ * goes in the header (the server's chosen SCID once known). */
+static size_t build_initial_1200(uint8_t *out, size_t cap,
+                                 const uint8_t *key_dcid, size_t key_dcid_len,
+                                 const uint8_t *hdr_dcid, size_t hdr_dcid_len,
+                                 const uint8_t *scid, size_t scid_len,
+                                 const uint8_t *token, size_t token_len,
+                                 uint64_t pkt_num,
+                                 const uint8_t *frames, size_t flen) {
+    static uint8_t payload[1400];
+    if (flen > sizeof payload) return 0;
+    memcpy(payload, frames, flen);
+    size_t pl = flen;
+    uint8_t vt[8];
+    size_t tvn = quic_varint_encode(vt, token_len);
+    /* header: 1 + ver 4 + (1+dcid) + (1+scid) + token + len(2) + pn(4) */
+    size_t overhead = 7 + hdr_dcid_len + scid_len + tvn + token_len + 2 + 4 + 16;
+    while (pl + overhead < 1200 && pl < sizeof payload)
+        payload[pl++] = QUIC_FRAME_PADDING;
+    uint8_t key[16], iv[12], hp[16];
+    quic_initial_keys(key_dcid, key_dcid_len, 1, key, iv, hp);
+    return quic_build_initial(out, cap, hdr_dcid, hdr_dcid_len, scid, scid_len,
+                              token, token_len, pkt_num, 4, payload, pl,
+                              key, iv, hp);
+}
+
+/* ---- On-the-wire handshake test (slices 4b..4h) ------------------ *
+ * A live QUIC client handshake against a REAL server at
+ * 10.0.2.2:4433 (SLIRP host): send the Initial (padded to 1200),
+ * process the server's datagrams (coalesced packets, Version
+ * Negotiation, Retry with integrity check, CRYPTO reassembly across
+ * packets), ACK at every encryption level, REQUIRE certificate chain +
+ * CertificateVerify to pass (the 13H path -- a live server presents a
+ * cert chaining to a trusted root), verify the server Finished, send
+ * the client Finished, and confirm completion by decrypting the
+ * server's 1-RTT HANDSHAKE_DONE (which it only sends after verifying
+ * OUR Finished). Called from boot under -DQUIC_SEND_TEST. */
 int quic_udp_send_test(void) {
-    uint8_t dcid[8], scid[8], priv[32], rnd[32], pub[32];
-    rng_fill(dcid, sizeof dcid);
+    /* --- connection identity --- */
+    uint8_t odcid[8], scid[8], priv[32], rnd[32], pub[32];
+    rng_fill(odcid, sizeof odcid);
     rng_fill(scid, sizeof scid);
     rng_fill(priv, sizeof priv);
     rng_fill(rnd, sizeof rnd);
     crypto_x25519_public_key(pub, priv);
 
-    uint8_t ch[512];
+    static uint8_t ch[512];
     size_t chl = quic_build_client_hello(ch, sizeof ch, rnd, pub,
                                          scid, sizeof scid, "tobyos.test");
     if (!chl) { kprintf("[quicudp] ClientHello build failed\n"); return -1; }
 
-    static uint8_t pkt[1500];
-    size_t plen = quic_build_client_initial(pkt, sizeof pkt, dcid, sizeof dcid,
-                                            scid, sizeof scid, ch, chl,
-                                            1 /* pkt_num */, 1200 /* pad */);
-    if (!plen) { kprintf("[quicudp] Initial build failed\n"); return -1; }
+    /* --- connection state --- */
+    uint8_t key_dcid[20]; size_t key_dcid_len = sizeof odcid;
+    memcpy(key_dcid, odcid, sizeof odcid);       /* replaced by Retry SCID */
+    uint8_t server_cid[20]; size_t server_cid_len = key_dcid_len;
+    memcpy(server_cid, key_dcid, key_dcid_len);  /* -> server's SCID once known */
+    static uint8_t token[512]; size_t token_len = 0;
+    uint64_t next_ipn = 1, next_hpn = 0;
+    struct qack iack, hack;
+    memset(&iack, 0, sizeof iack); memset(&hack, 0, sizeof hack);
+    int got_retry = 0, got_initial = 0, have_scid = 0;
+    int sh_parsed = 0, flight_done = 0, fin_sent = 0;
+
+    /* server Initial keys (for opening its Initials; re-derived on Retry) */
+    uint8_t sikey[16], siiv[12], sihp[16];
+    quic_initial_keys(key_dcid, key_dcid_len, 0, sikey, siiv, sihp);
+
+    /* handshake + 1-RTT keys/secrets (filled as the handshake advances) */
+    uint8_t hs_secret[32], s_hs[32], c_hs[32];
+    uint8_t shk[16], shiv[12], shhp[16];         /* server Handshake */
+    uint8_t chk[16], chiv[12], chhp[16];         /* client Handshake */
+    uint8_t sak[16], saiv[12], sahp[16];         /* server 1-RTT */
+    uint8_t cak[16], caiv[12], cahp[16];         /* client 1-RTT */
+    static uint8_t sh_msg[512]; size_t sh_len = 0;
+    uint8_t zeros[32]; memset(zeros, 0, 32);
+    uint8_t empty_hash[32]; sha256_buf(NULL, 0, empty_hash);
+    uint8_t thash_af[32];                        /* transcript incl server Fin */
+
+    /* CRYPTO reassembly, Initial + Handshake levels */
+    static uint8_t ibuf[1024],  ibits[1024 / 8];
+    static uint8_t hbuf[8192],  hbits[8192 / 8];
+    memset(ibits, 0, sizeof ibits); memset(hbits, 0, sizeof hbits);
+    struct qrsm irsm = { ibuf, ibits, sizeof ibuf };
+    struct qrsm hrsm = { hbuf, hbits, sizeof hbuf };
+
+    g_qq_head = g_qq_tail = 0;
 
     uint8_t ipb[4] = { 10, 0, 2, 2 };
-    uint32_t dst_ip; memcpy(&dst_ip, ipb, 4);        /* network order */
-    g_qrx_ready = 0;
-    bool ok = udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433), pkt, plen);
-    kprintf("[quicudp] sent Initial %u bytes to 10.0.2.2:4433 (dcid=", (unsigned)plen);
-    for (int i = 0; i < 8; i++) kprintf("%02x", dcid[i]);
+    uint32_t dst_ip; memcpy(&dst_ip, ipb, 4);    /* network order */
+
+    /* --- send the client Initial (CRYPTO(ClientHello), padded 1200) --- */
+    static uint8_t out[1500];
+    static uint8_t frames[1400];
+    size_t fl = quic_frame_crypto(frames, sizeof frames, 0, ch, chl);
+    size_t plen = build_initial_1200(out, sizeof out, key_dcid, key_dcid_len,
+                                     server_cid, server_cid_len,
+                                     scid, sizeof scid, NULL, 0,
+                                     next_ipn++, frames, fl);
+    if (!plen) { kprintf("[quicudp] Initial build failed\n"); return -1; }
+    bool ok = udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433), out, plen);
+    kprintf("[quicudp] sent Initial %u bytes to 10.0.2.2:4433 (dcid=",
+            (unsigned)plen);
+    for (size_t i = 0; i < key_dcid_len; i++) kprintf("%02x", key_dcid[i]);
     kprintf(") %s\n", ok ? "OK" : "SEND-FAIL");
     if (!ok) return -1;
 
-    /* ---- slice 4c: wait for the server's reply datagram ---- */
+    /* --- receive loop --- */
     uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
-    uint64_t deadline = pit_ticks() + hz * 3;        /* ~3 s */
+    uint64_t deadline = pit_ticks() + hz * 15;
     struct net_dev *nd = net_default();
-    while (pit_ticks() < deadline && !g_qrx_ready) {
-        if (nd && nd->rx_drain) nd->rx_drain(nd);
-        sti();
-        hlt();
-    }
-    if (!g_qrx_ready) {
-        kprintf("[quicudp] no server reply within 3s\n");
-        return 0;                                    /* send still succeeded */
-    }
-    kprintf("[quicudp] received %u bytes from server\n", (unsigned)g_qrx_len);
+    static uint8_t dg[QRX_MAX];
 
-    /* Open the server Initial with the SERVER Initial keys (derived
-     * from our original DCID), parse the ServerHello, derive the
-     * handshake shared secret. The reply coalesces Initial + Handshake
-     * packets in one datagram; `consumed` locates the next one. */
-    uint8_t skey[16], siv[12], shp[16];
-    quic_initial_keys(dcid, sizeof dcid, 0 /* server */, skey, siv, shp);
-    const uint8_t *rpay; uint64_t rpn; size_t consumed = 0;
-    long rl = quic_open_long(g_qrx, g_qrx_len, 1, skey, siv, shp,
-                             &rpay, &rpn, &consumed);
-    if (rl <= 0) {
-        kprintf("[quicudp] server Initial decrypt FAILED\n");
-        return -1;
-    }
-    kprintf("[quicudp] server Initial decrypted (pn=%u, %ld payload bytes)\n",
-            (unsigned)rpn, rl);
-
-    /* Find the CRYPTO frame (ServerHello) among the reply's frames. */
-    size_t fp = 0; struct quic_frame f; int found = 0;
-    while (fp < (size_t)rl) {
-        size_t fn = quic_frame_parse(rpay + fp, (size_t)rl - fp, &f);
-        if (fn == 0) break;
-        if (f.type == QUIC_FRAME_CRYPTO && f.len >= 4 && f.data[0] == 2) {
-            found = 1; break;
+    while (pit_ticks() < deadline) {
+        int dn = qrx_pop(dg, sizeof dg);
+        if (dn < 0) {
+            if (nd && nd->rx_drain) nd->rx_drain(nd);
+            sti();
+            hlt();
+            continue;
         }
-        fp += fn;
-    }
-    if (!found) {
-        kprintf("[quicudp] no ServerHello CRYPTO frame in reply\n");
-        return -1;
-    }
 
-    uint8_t server_pub[32]; uint16_t cipher = 0;
-    /* Copy the ServerHello message out before we reuse g_qrx buffers. */
-    static uint8_t sh_msg[512];
-    size_t sh_len = f.len < sizeof sh_msg ? (size_t)f.len : sizeof sh_msg;
-    memcpy(sh_msg, f.data, sh_len);
-    if (quic_parse_server_hello(sh_msg, sh_len, server_pub, &cipher) != 0) {
-        kprintf("[quicudp] ServerHello parse FAILED\n");
-        return -1;
-    }
-    uint8_t shared[32];
-    crypto_x25519(shared, priv, server_pub);
-    kprintf("[quicudp] ServerHello OK: cipher=0x%04x, x25519 shared secret ",
-            cipher);
-    for (int i = 0; i < 8; i++) kprintf("%02x", shared[i]);
-    kprintf("\n");
+        /* ---- walk the datagram's coalesced packets ---- */
+        size_t off = 0;
+        while (off < (size_t)dn) {
+            uint8_t *pk = dg + off;
+            size_t avail = (size_t)dn - off;
 
-    /* ---- Handshake keys (RFC 8446 s7.1 schedule over QUIC) ---- *
-     * transcript = SHA-256(ClientHello || ServerHello). */
-    uint8_t thash[32];
-    { struct sha256_ctx tc; sha256_init(&tc);
-      sha256_update(&tc, ch, chl); sha256_update(&tc, sh_msg, sh_len);
-      sha256_final(&tc, thash); }
-    uint8_t zeros[32]; memset(zeros, 0, 32);
-    uint8_t empty_hash[32]; sha256_buf(NULL, 0, empty_hash);
-    uint8_t early[32]; hkdf_extract(NULL, 0, zeros, 32, early);
-    uint8_t derived[32]; derive_secret(early, "derived", 7, empty_hash, derived);
-    uint8_t hs_secret[32]; hkdf_extract(derived, 32, shared, 32, hs_secret);
-    uint8_t s_hs[32]; derive_secret(hs_secret, "s hs traffic", 12, thash, s_hs);
-    uint8_t hk[16], hiv[12], hhp[16];
-    hkdf_expand_label(s_hs, "quic key", 8, NULL, 0, hk, 16);
-    hkdf_expand_label(s_hs, "quic iv", 7, NULL, 0, hiv, 12);
-    hkdf_expand_label(s_hs, "quic hp", 7, NULL, 0, hhp, 16);
-    kprintf("[quicudp] derived server Handshake keys (key ");
-    for (int i = 0; i < 6; i++) kprintf("%02x", hk[i]);
-    kprintf(")\n");
+            if (!(pk[0] & 0x80)) {
+                /* Short header (1-RTT): always the last packet in the
+                 * datagram (no length field). Needs the server app keys. */
+                if (fin_sent) {
+                    const uint8_t *pay; uint64_t pn;
+                    long pl = quic_open_short(pk, avail, sizeof scid,
+                                              sak, saiv, sahp, &pay, &pn);
+                    if (pl > 0) {
+                        size_t fp = 0; struct quic_frame f;
+                        int done = 0;
+                        while (fp < (size_t)pl) {
+                            size_t fn = quic_frame_parse(pay + fp,
+                                                         (size_t)pl - fp, &f);
+                            if (!fn) break;
+                            if (f.type == QUIC_FRAME_HANDSHAKE_DONE) done = 1;
+                            if (f.type == QUIC_FRAME_CONN_CLOSE ||
+                                f.type == QUIC_FRAME_CONN_CLOSE_APP) {
+                                char rsn[64]; size_t rl = f.len < 63 ? (size_t)f.len : 63;
+                                memcpy(rsn, f.data, rl); rsn[rl] = 0;
+                                kprintf("[quicudp] CONNECTION_CLOSE err=%u "
+                                        "reason='%s'\n", (unsigned)f.err_code, rsn);
+                            }
+                            fp += fn;
+                        }
+                        if (done) {
+                            /* ACK the 1-RTT packet, then declare victory. */
+                            uint8_t af[16];
+                            size_t al = quic_frame_ack(af, sizeof af, pn, 0);
+                            static uint8_t apkt[128];
+                            size_t apl = quic_build_short(apkt, sizeof apkt,
+                                                          server_cid, server_cid_len,
+                                                          0, 4, af, al,
+                                                          cak, caiv, cahp);
+                            if (apl)
+                                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip,
+                                               htons(4433), apkt, apl);
+                            kprintf("[quicudp] 1-RTT HANDSHAKE_DONE received -- "
+                                    "LIVE QUIC HANDSHAKE COMPLETE "
+                                    "(server confirmed our Finished)\n");
+                            return 0;
+                        }
+                    }
+                }
+                break;                       /* short header ends the datagram */
+            }
 
-    /* ---- Decrypt the coalesced server Handshake packet ---- */
-    if (consumed >= g_qrx_len || consumed == 0) {
-        kprintf("[quicudp] no coalesced Handshake packet\n");
-        return 0;
-    }
-    uint8_t *hspkt = g_qrx + consumed;
-    size_t hsavail = g_qrx_len - consumed;
-    if ((hspkt[0] & 0x30) != 0x20) {        /* long-header type 2 = Handshake */
-        kprintf("[quicudp] next packet is not Handshake (0x%02x)\n", hspkt[0]);
-        return 0;
-    }
-    const uint8_t *hpay; uint64_t hpn;
-    long hl = quic_open_long(hspkt, hsavail, 0, hk, hiv, hhp, &hpay, &hpn, NULL);
-    if (hl <= 0) {
-        kprintf("[quicudp] Handshake packet decrypt FAILED\n");
-        return -1;
-    }
-    /* The Handshake CRYPTO frame carries the whole server flight:
-     * EncryptedExtensions / Certificate / CertificateVerify / Finished. */
-    size_t hfp = 0; struct quic_frame hf; int hgot = 0;
-    while (hfp < (size_t)hl) {
-        size_t fn = quic_frame_parse(hpay + hfp, (size_t)hl - hfp, &hf);
-        if (fn == 0) break;
-        if (hf.type == QUIC_FRAME_CRYPTO) { hgot = 1; break; }
-        hfp += fn;
-    }
-    if (!hgot) { kprintf("[quicudp] no Handshake CRYPTO frame\n"); return -1; }
-    kprintf("[quicudp] Handshake packet DECRYPTED (pn=%u, %ld flight bytes)\n",
-            (unsigned)hpn, (long)hf.len);
+            uint32_t ver = ((uint32_t)pk[1] << 24) | ((uint32_t)pk[2] << 16) |
+                           ((uint32_t)pk[3] << 8)  |  (uint32_t)pk[4];
+            if (ver == 0) {
+                /* Version Negotiation: our version (1) is unsupported.
+                 * List what the server offers, then fail closed. */
+                size_t p = 5;
+                size_t dl = (p < avail) ? pk[p++] : 0; p += dl;
+                size_t sl = (p < avail) ? pk[p++] : 0; p += sl;
+                unsigned nver = 0;
+                kprintf("[quicudp] Version Negotiation received; server offers:");
+                while (p + 4 <= avail && nver < 8) {
+                    uint32_t v = ((uint32_t)pk[p] << 24) | ((uint32_t)pk[p+1] << 16) |
+                                 ((uint32_t)pk[p+2] << 8) | (uint32_t)pk[p+3];
+                    kprintf(" 0x%08x", v);
+                    p += 4; nver++;
+                }
+                kprintf("\n[quicudp] v1 not supported by server -- aborting "
+                        "(fail closed)\n");
+                return -1;
+            }
 
-    /* Copy the flight out (g_qrx is reused below) and walk its messages. */
-    static uint8_t flight[2048];
-    size_t flen = hf.len < sizeof flight ? (size_t)hf.len : sizeof flight;
-    memcpy(flight, hf.data, flen);
-    size_t mp = 0, fin_off = (size_t)-1;
-    int have_ee = 0, have_cert = 0, have_cv = 0;
-    const uint8_t *sfin = NULL; size_t sfin_len = 0;
-    const uint8_t *cert_msg = NULL; size_t cert_len = 0;
-    const uint8_t *cv_body = NULL;  size_t cv_len = 0;
-    size_t cv_off = (size_t)-1;             /* transcript ends before CV */
-    while (mp + 4 <= flen) {
-        uint8_t mt = flight[mp];
-        uint32_t ml = ((uint32_t)flight[mp+1] << 16) |
-                      ((uint32_t)flight[mp+2] << 8) | flight[mp+3];
-        if (mp + 4 + ml > flen) break;
-        if (mt == 8)  have_ee = 1;
-        else if (mt == 11) { have_cert = 1; cert_msg = flight + mp + 4; cert_len = ml; }
-        else if (mt == 15) { have_cv = 1; cv_off = mp;
-                             cv_body = flight + mp + 4; cv_len = ml; }
-        else if (mt == 20) { fin_off = mp; sfin = flight + mp + 4; sfin_len = ml; break; }
-        mp += 4 + ml;
-    }
-    kprintf("[quicudp] flight: EE=%d Certificate=%d CertVerify=%d Finished=%d\n",
-            have_ee, have_cert, have_cv, sfin != NULL);
-    if (!sfin || sfin_len < 32) {
-        kprintf("[quicudp] server Finished missing\n");
-        return -1;
-    }
+            size_t wire = long_pkt_wire_len(pk, avail);
+            if (!wire) break;                /* malformed: drop rest */
+            unsigned type = pk[0] & 0x30;
 
-    /* ---- Certificate authentication (slice 4f, shared 13H path) ---- *
-     * Both halves: chain validation (leaf chains to a trusted root,
-     * hostname, expiry) recovers the leaf key; CertificateVerify proves
-     * the peer holds it by signing the transcript CH..Certificate. */
-    if (have_cert && have_cv && cv_len >= 4) {
-        br_x509_pkey ee_pk;
-        unsigned char ee_pk_buf[BR_X509_BUFSIZE_KEY];
-        int chain = tls_x509_validate_chain(cert_msg, cert_len, "tobyos.test",
-                                            &ee_pk, ee_pk_buf, sizeof ee_pk_buf);
-        /* CertificateVerify transcript = Hash(CH || SH || EE || Cert). */
-        uint8_t thash_cv[32];
-        { struct sha256_ctx tc; sha256_init(&tc);
-          sha256_update(&tc, ch, chl); sha256_update(&tc, sh_msg, sh_len);
-          sha256_update(&tc, flight, cv_off); sha256_final(&tc, thash_cv); }
-        int cv_ok = 0;
-        if (chain == 0) {
-            uint16_t scheme = (uint16_t)((cv_body[0] << 8) | cv_body[1]);
-            size_t sl = ((size_t)cv_body[2] << 8) | cv_body[3];
-            if (4 + sl <= cv_len)
-                cv_ok = tls_x509_verify_cv(scheme, cv_body + 4, sl,
-                                           thash_cv, &ee_pk);
-            kprintf("[quicudp] cert chain OK; CertificateVerify %s\n",
-                    cv_ok ? "VERIFIED (peer holds leaf key)" : "FAILED");
-        } else {
-            /* Self-signed test cert: chain validation correctly rejects
-             * it (fail-closed, same as the 13H self-signed test). A real
-             * server with a trusted cert passes both halves. */
-            kprintf("[quicudp] cert chain UNTRUSTED (fail-closed) -- "
-                    "13H path runs over QUIC\n");
+            if (type == 0x30) {
+                /* Retry (RFC 9000 s17.2.5): adopt the server's new CID +
+                 * token, re-derive Initial keys, resend the SAME
+                 * ClientHello. Ignored after a processed Initial or a
+                 * previous Retry (per spec). */
+                if (!got_initial && !got_retry) {
+                    const uint8_t *nscid; size_t nscid_len;
+                    const uint8_t *tok; size_t tl;
+                    if (quic_parse_retry(pk, avail, &nscid, &nscid_len,
+                                         &tok, &tl) == 0 && nscid_len <= 20 &&
+                        tl <= sizeof token) {
+                        if (quic_retry_tag_verify(pk, avail, key_dcid,
+                                                  key_dcid_len) != 0) {
+                            kprintf("[quicudp] Retry integrity tag BAD -- "
+                                    "ignoring packet\n");
+                        } else {
+                            memcpy(key_dcid, nscid, nscid_len);
+                            key_dcid_len = nscid_len;
+                            memcpy(server_cid, nscid, nscid_len);
+                            server_cid_len = nscid_len;
+                            memcpy(token, tok, tl); token_len = tl;
+                            quic_initial_keys(key_dcid, key_dcid_len, 0,
+                                              sikey, siiv, sihp);
+                            got_retry = 1;
+                            kprintf("[quicudp] Retry: integrity tag OK, new dcid=");
+                            for (size_t i = 0; i < key_dcid_len; i++)
+                                kprintf("%02x", key_dcid[i]);
+                            kprintf(", token %u bytes -- resending Initial\n",
+                                    (unsigned)token_len);
+                            size_t f2 = quic_frame_crypto(frames, sizeof frames,
+                                                          0, ch, chl);
+                            size_t p2 = build_initial_1200(out, sizeof out,
+                                            key_dcid, key_dcid_len,
+                                            server_cid, server_cid_len,
+                                            scid, sizeof scid,
+                                            token, token_len,
+                                            next_ipn++, frames, f2);
+                            if (p2)
+                                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip,
+                                               htons(4433), out, p2);
+                        }
+                    }
+                }
+                off += wire;
+                continue;
+            }
+
+            if (type == 0x00) {
+                /* Server Initial. */
+                const uint8_t *pay; uint64_t pn; size_t consumed = 0;
+                long pl = quic_open_long(pk, avail, 1, sikey, siiv, sihp,
+                                         &pay, &pn, &consumed);
+                if (pl > 0) {
+                    if (!have_scid) {
+                        /* Adopt the server's SCID as our DCID from now on
+                         * (a real server routes by it). */
+                        size_t p2 = 5, dl2 = pk[p2]; p2 += 1 + dl2;
+                        size_t sl2 = pk[p2]; p2 += 1;
+                        if (sl2 <= 20) {
+                            memcpy(server_cid, pk + p2, sl2);
+                            server_cid_len = sl2;
+                            have_scid = 1;
+                        }
+                    }
+                    got_initial = 1;
+                    int elicit = 0;
+                    size_t fp = 0; struct quic_frame f;
+                    while (fp < (size_t)pl) {
+                        size_t fn = quic_frame_parse(pay + fp, (size_t)pl - fp, &f);
+                        if (!fn) break;
+                        if (f.type == QUIC_FRAME_CRYPTO) {
+                            qrsm_add(&irsm, f.offset, f.data, f.len);
+                            elicit = 1;
+                        } else if (f.type == QUIC_FRAME_PING) {
+                            elicit = 1;
+                        } else if (f.type == QUIC_FRAME_CONN_CLOSE ||
+                                   f.type == QUIC_FRAME_CONN_CLOSE_APP) {
+                            char rsn[64]; size_t rl = f.len < 63 ? (size_t)f.len : 63;
+                            memcpy(rsn, f.data, rl); rsn[rl] = 0;
+                            kprintf("[quicudp] CONNECTION_CLOSE err=%u "
+                                    "reason='%s' -- aborting\n",
+                                    (unsigned)f.err_code, rsn);
+                            return -1;
+                        }
+                        fp += fn;
+                    }
+                    qack_note(&iack, pn, elicit);
+                }
+                off += wire;
+            } else if (type == 0x20) {
+                /* Server Handshake -- needs the handshake keys. */
+                if (sh_parsed) {
+                    const uint8_t *pay; uint64_t pn;
+                    long pl = quic_open_long(pk, avail, 0, shk, shiv, shhp,
+                                             &pay, &pn, NULL);
+                    if (pl > 0) {
+                        int elicit = 0;
+                        size_t fp = 0; struct quic_frame f;
+                        while (fp < (size_t)pl) {
+                            size_t fn = quic_frame_parse(pay + fp,
+                                                         (size_t)pl - fp, &f);
+                            if (!fn) break;
+                            if (f.type == QUIC_FRAME_CRYPTO) {
+                                qrsm_add(&hrsm, f.offset, f.data, f.len);
+                                elicit = 1;
+                            } else if (f.type == QUIC_FRAME_PING) {
+                                elicit = 1;
+                            } else if (f.type == QUIC_FRAME_CONN_CLOSE ||
+                                       f.type == QUIC_FRAME_CONN_CLOSE_APP) {
+                                char rsn[64]; size_t rl = f.len < 63 ? (size_t)f.len : 63;
+                                memcpy(rsn, f.data, rl); rsn[rl] = 0;
+                                kprintf("[quicudp] CONNECTION_CLOSE err=%u "
+                                        "reason='%s' -- aborting\n",
+                                        (unsigned)f.err_code, rsn);
+                                return -1;
+                            }
+                            fp += fn;
+                        }
+                        qack_note(&hack, pn, elicit);
+                    }
+                }
+                off += wire;
+            } else {
+                off += wire;                 /* 0-RTT etc: skip */
+            }
+
+            /* ---- ServerHello: parse once the Initial CRYPTO prefix
+             * completes a message; derive the Handshake keys so
+             * coalesced Handshake packets in this SAME datagram open. */
+            if (!sh_parsed) {
+                uint32_t ic = qrsm_contig(&irsm);
+                if (ic >= 4) {
+                    uint32_t ml = ((uint32_t)ibuf[1] << 16) |
+                                  ((uint32_t)ibuf[2] << 8) | ibuf[3];
+                    if (ibuf[0] == 2 && ic >= 4 + ml && 4 + ml <= sizeof sh_msg) {
+                        sh_len = 4 + ml;
+                        memcpy(sh_msg, ibuf, sh_len);
+                        uint8_t server_pub[32]; uint16_t cipher = 0;
+                        if (quic_parse_server_hello(sh_msg, sh_len,
+                                                    server_pub, &cipher) != 0) {
+                            kprintf("[quicudp] ServerHello parse FAILED\n");
+                            return -1;
+                        }
+                        if (cipher != 0x1301) {
+                            kprintf("[quicudp] server picked cipher 0x%04x "
+                                    "(only AES-128-GCM QUIC keys wired) -- "
+                                    "aborting\n", cipher);
+                            return -1;
+                        }
+                        uint8_t shared[32];
+                        crypto_x25519(shared, priv, server_pub);
+                        kprintf("[quicudp] ServerHello OK: cipher=0x%04x, "
+                                "x25519 shared secret ", cipher);
+                        for (int i = 0; i < 8; i++) kprintf("%02x", shared[i]);
+                        kprintf("\n");
+
+                        /* RFC 8446 s7.1: transcript = SHA-256(CH||SH). */
+                        uint8_t thash[32];
+                        { struct sha256_ctx tc; sha256_init(&tc);
+                          sha256_update(&tc, ch, chl);
+                          sha256_update(&tc, sh_msg, sh_len);
+                          sha256_final(&tc, thash); }
+                        uint8_t early[32];
+                        hkdf_extract(NULL, 0, zeros, 32, early);
+                        uint8_t derived[32];
+                        derive_secret(early, "derived", 7, empty_hash, derived);
+                        hkdf_extract(derived, 32, shared, 32, hs_secret);
+                        derive_secret(hs_secret, "s hs traffic", 12, thash, s_hs);
+                        derive_secret(hs_secret, "c hs traffic", 12, thash, c_hs);
+                        hkdf_expand_label(s_hs, "quic key", 8, NULL, 0, shk, 16);
+                        hkdf_expand_label(s_hs, "quic iv",  7, NULL, 0, shiv, 12);
+                        hkdf_expand_label(s_hs, "quic hp",  7, NULL, 0, shhp, 16);
+                        hkdf_expand_label(c_hs, "quic key", 8, NULL, 0, chk, 16);
+                        hkdf_expand_label(c_hs, "quic iv",  7, NULL, 0, chiv, 12);
+                        hkdf_expand_label(c_hs, "quic hp",  7, NULL, 0, chhp, 16);
+                        kprintf("[quicudp] derived Handshake keys "
+                                "(server key ");
+                        for (int i = 0; i < 6; i++) kprintf("%02x", shk[i]);
+                        kprintf(")\n");
+                        sh_parsed = 1;
+                    }
+                }
+            }
+        }
+
+        /* ---- ACK what we received (per encryption level) ---- */
+        if (iack.elicited) {
+            uint8_t af[16];
+            size_t al = quic_frame_ack(af, sizeof af, iack.largest,
+                                       qack_first_range(&iack));
+            size_t p2 = build_initial_1200(out, sizeof out,
+                                           key_dcid, key_dcid_len,
+                                           server_cid, server_cid_len,
+                                           scid, sizeof scid,
+                                           token, token_len,
+                                           next_ipn++, af, al);
+            if (p2)
+                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+                               out, p2);
+            iack.elicited = 0;
+        }
+        if (hack.elicited && sh_parsed && !fin_sent) {
+            uint8_t af[16];
+            size_t al = quic_frame_ack(af, sizeof af, hack.largest,
+                                       qack_first_range(&hack));
+            static uint8_t hpkt[128];
+            size_t hl = quic_build_long(hpkt, sizeof hpkt, 0x20,
+                                        server_cid, server_cid_len,
+                                        scid, sizeof scid,
+                                        0, NULL, 0, next_hpn++, 4,
+                                        af, al, chk, chiv, chhp);
+            if (hl)
+                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+                               hpkt, hl);
+            hack.elicited = 0;
+        }
+
+        /* ---- consume the Handshake flight once contiguous ---- */
+        if (sh_parsed && !flight_done) {
+            uint32_t hc = qrsm_contig(&hrsm);
+            size_t mp = 0, fin_off = (size_t)-1, cv_off = (size_t)-1;
+            const uint8_t *sfin = NULL; size_t sfin_len = 0;
+            const uint8_t *cert_msg = NULL; size_t cert_len = 0;
+            const uint8_t *cv_body = NULL;  size_t cv_len = 0;
+            int have_ee = 0;
+            while (mp + 4 <= hc) {
+                uint8_t mt = hbuf[mp];
+                uint32_t ml = ((uint32_t)hbuf[mp+1] << 16) |
+                              ((uint32_t)hbuf[mp+2] << 8) | hbuf[mp+3];
+                if (mp + 4 + ml > hc) break;
+                if (mt == 8)  have_ee = 1;
+                else if (mt == 11) { cert_msg = hbuf + mp + 4; cert_len = ml; }
+                else if (mt == 15) { cv_off = mp;
+                                     cv_body = hbuf + mp + 4; cv_len = ml; }
+                else if (mt == 20) { fin_off = mp;
+                                     sfin = hbuf + mp + 4; sfin_len = ml; break; }
+                mp += 4 + ml;
+            }
+            if (sfin && sfin_len >= 32) {
+                flight_done = 1;
+                kprintf("[quicudp] Handshake flight complete (%u bytes "
+                        "reassembled): EE=%d Certificate=%u CertVerify=%u "
+                        "Finished=1\n", (unsigned)(fin_off + 4 + sfin_len),
+                        have_ee, (unsigned)cert_len, (unsigned)cv_len);
+
+                /* ---- certificate authentication: REQUIRED (slice 4h).
+                 * A live server must present a chain to a trusted root
+                 * AND prove key possession via CertificateVerify. */
+                if (!cert_msg || !cv_body || cv_len < 4) {
+                    kprintf("[quicudp] server flight lacks Certificate/"
+                            "CertificateVerify -- aborting\n");
+                    return -1;
+                }
+                br_x509_pkey ee_pk;
+                unsigned char ee_pk_buf[BR_X509_BUFSIZE_KEY];
+                int chain = tls_x509_validate_chain(cert_msg, cert_len,
+                                                    "tobyos.test", &ee_pk,
+                                                    ee_pk_buf, sizeof ee_pk_buf);
+                if (chain != 0) {
+                    kprintf("[quicudp] cert chain UNTRUSTED -- aborting "
+                            "(fail closed)\n");
+                    return -1;
+                }
+                uint8_t thash_cv[32];
+                { struct sha256_ctx tc; sha256_init(&tc);
+                  sha256_update(&tc, ch, chl);
+                  sha256_update(&tc, sh_msg, sh_len);
+                  sha256_update(&tc, hbuf, cv_off);
+                  sha256_final(&tc, thash_cv); }
+                uint16_t scheme = (uint16_t)((cv_body[0] << 8) | cv_body[1]);
+                size_t sl = ((size_t)cv_body[2] << 8) | cv_body[3];
+                int cv_ok = 0;
+                if (4 + sl <= cv_len)
+                    cv_ok = tls_x509_verify_cv(scheme, cv_body + 4, sl,
+                                               thash_cv, &ee_pk);
+                if (!cv_ok) {
+                    kprintf("[quicudp] CertificateVerify FAILED (scheme "
+                            "0x%04x) -- aborting\n", scheme);
+                    return -1;
+                }
+                kprintf("[quicudp] cert chain OK (trusted root); "
+                        "CertificateVerify VERIFIED (scheme 0x%04x, peer "
+                        "holds leaf key)\n", scheme);
+
+                /* ---- server Finished over Hash(CH..CertVerify) ---- */
+                uint8_t thash_sf[32];
+                { struct sha256_ctx tc; sha256_init(&tc);
+                  sha256_update(&tc, ch, chl);
+                  sha256_update(&tc, sh_msg, sh_len);
+                  sha256_update(&tc, hbuf, fin_off);
+                  sha256_final(&tc, thash_sf); }
+                uint8_t expect_fin[32];
+                compute_finished(s_hs, thash_sf, expect_fin);
+                if (memcmp(expect_fin, sfin, 32) != 0) {
+                    kprintf("[quicudp] server Finished MAC MISMATCH -- "
+                            "aborting\n");
+                    return -1;
+                }
+                kprintf("[quicudp] server Finished VERIFIED\n");
+
+                /* ---- 1-RTT keys (both directions) ---- */
+                { struct sha256_ctx tc; sha256_init(&tc);
+                  sha256_update(&tc, ch, chl);
+                  sha256_update(&tc, sh_msg, sh_len);
+                  sha256_update(&tc, hbuf, fin_off + 4 + sfin_len);
+                  sha256_final(&tc, thash_af); }
+                uint8_t derived2[32];
+                derive_secret(hs_secret, "derived", 7, empty_hash, derived2);
+                uint8_t master[32];
+                hkdf_extract(derived2, 32, zeros, 32, master);
+                uint8_t c_ap[32], s_ap[32];
+                derive_secret(master, "c ap traffic", 12, thash_af, c_ap);
+                derive_secret(master, "s ap traffic", 12, thash_af, s_ap);
+                hkdf_expand_label(c_ap, "quic key", 8, NULL, 0, cak, 16);
+                hkdf_expand_label(c_ap, "quic iv",  7, NULL, 0, caiv, 12);
+                hkdf_expand_label(c_ap, "quic hp",  7, NULL, 0, cahp, 16);
+                hkdf_expand_label(s_ap, "quic key", 8, NULL, 0, sak, 16);
+                hkdf_expand_label(s_ap, "quic iv",  7, NULL, 0, saiv, 12);
+                hkdf_expand_label(s_ap, "quic hp",  7, NULL, 0, sahp, 16);
+                kprintf("[quicudp] 1-RTT keys installed (client app key ");
+                for (int i = 0; i < 6; i++) kprintf("%02x", cak[i]);
+                kprintf(")\n");
+
+                /* ---- client Finished (+ Handshake ACK piggybacked) ---- */
+                uint8_t cfin[32];
+                compute_finished(c_hs, thash_af, cfin);
+                uint8_t cfin_msg[36];
+                cfin_msg[0] = 20; cfin_msg[1] = 0; cfin_msg[2] = 0;
+                cfin_msg[3] = 32;
+                memcpy(cfin_msg + 4, cfin, 32);
+                uint8_t fr[80]; size_t frl = 0;
+                frl += quic_frame_ack(fr + frl, sizeof fr - frl, hack.largest,
+                                      qack_first_range(&hack));
+                frl += quic_frame_crypto(fr + frl, sizeof fr - frl, 0,
+                                         cfin_msg, 36);
+                hack.elicited = 0;
+                static uint8_t cpkt[256];
+                size_t cplen = quic_build_long(cpkt, sizeof cpkt, 0x20,
+                                               server_cid, server_cid_len,
+                                               scid, sizeof scid,
+                                               0, NULL, 0, next_hpn++, 4,
+                                               fr, frl, chk, chiv, chhp);
+                if (!cplen) {
+                    kprintf("[quicudp] client Finished build failed\n");
+                    return -1;
+                }
+                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+                               cpkt, cplen);
+                fin_sent = 1;
+                kprintf("[quicudp] sent client Finished (%u byte Handshake "
+                        "packet); waiting for HANDSHAKE_DONE\n",
+                        (unsigned)cplen);
+            }
         }
     }
 
-    /* Verify the server Finished MAC. Its transcript is
-     * Hash(ClientHello || ServerHello || EE || Cert || CertVerify) --
-     * everything up to (not including) the Finished. Matching this
-     * proves both sides agree on the ENTIRE handshake transcript and
-     * the key schedule end to end. */
-    uint8_t thash_sf[32];
-    { struct sha256_ctx tc; sha256_init(&tc);
-      sha256_update(&tc, ch, chl); sha256_update(&tc, sh_msg, sh_len);
-      sha256_update(&tc, flight, fin_off);          /* EE+Cert+CertVerify */
-      sha256_final(&tc, thash_sf); }
-    uint8_t expect_fin[32];
-    compute_finished(s_hs, thash_sf, expect_fin);
-    if (memcmp(expect_fin, sfin, 32) != 0) {
-        kprintf("[quicudp] server Finished MAC MISMATCH\n");
-        return -1;
-    }
-    kprintf("[quicudp] server Finished VERIFIED -- transcript + key schedule "
-            "agree end-to-end\n");
-
-    /* Install 1-RTT (application) keys. Transcript now includes the
-     * server Finished. master_secret = Extract(Derive-Secret(hs, derived),
-     * 0); client 1-RTT key = quic key from c ap traffic. */
-    uint8_t thash_af[32];
-    { struct sha256_ctx tc; sha256_init(&tc);
-      sha256_update(&tc, ch, chl); sha256_update(&tc, sh_msg, sh_len);
-      sha256_update(&tc, flight, fin_off + 4 + sfin_len);
-      sha256_final(&tc, thash_af); }
-    uint8_t derived2[32]; derive_secret(hs_secret, "derived", 7, empty_hash, derived2);
-    uint8_t master[32]; hkdf_extract(derived2, 32, zeros, 32, master);
-    uint8_t c_ap[32]; derive_secret(master, "c ap traffic", 12, thash_af, c_ap);
-    uint8_t ck1[16], civ1[12], chp1[16];
-    hkdf_expand_label(c_ap, "quic key", 8, NULL, 0, ck1, 16);
-    hkdf_expand_label(c_ap, "quic iv", 7, NULL, 0, civ1, 12);
-    hkdf_expand_label(c_ap, "quic hp", 7, NULL, 0, chp1, 16);
-    kprintf("[quicudp] 1-RTT keys installed (client app key ");
-    for (int i = 0; i < 6; i++) kprintf("%02x", ck1[i]);
-    kprintf(")\n");
-
-    /* ---- Send the client Finished (slice 4g) ---- *
-     * client Finished MAC over the transcript through the server
-     * Finished (thash_af), keyed by the CLIENT handshake secret;
-     * carried in a Handshake packet protected with the client
-     * Handshake keys. Its receipt + verification by the peer completes
-     * the handshake in both directions. */
-    uint8_t c_hs[32];
-    derive_secret(hs_secret, "c hs traffic", 12, thash, c_hs);
-    uint8_t cfin[32];
-    compute_finished(c_hs, thash_af, cfin);
-    uint8_t cfin_msg[36];
-    cfin_msg[0] = 20; cfin_msg[1] = 0; cfin_msg[2] = 0; cfin_msg[3] = 32;
-    memcpy(cfin_msg + 4, cfin, 32);
-    uint8_t cframe[48];
-    size_t cfl = quic_frame_crypto(cframe, sizeof cframe, 0, cfin_msg, 36);
-    uint8_t chk[16], chiv[12], chhp[16];
-    hkdf_expand_label(c_hs, "quic key", 8, NULL, 0, chk, 16);
-    hkdf_expand_label(c_hs, "quic iv", 7, NULL, 0, chiv, 12);
-    hkdf_expand_label(c_hs, "quic hp", 7, NULL, 0, chhp, 16);
-    static uint8_t cpkt[256];
-    size_t cplen = quic_build_long(cpkt, sizeof cpkt, 0x20 /* Handshake */,
-                                   scid, sizeof scid, dcid, sizeof dcid,
-                                   0, NULL, 0, 0 /* pn */, 4,
-                                   cframe, cfl, chk, chiv, chhp);
-    if (cplen) {
-        (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433), cpkt, cplen);
-        kprintf("[quicudp] sent client Finished (%u byte Handshake packet) -- "
-                "QUIC HANDSHAKE COMPLETE\n", (unsigned)cplen);
-    }
-    return 0;
+    kprintf("[quicudp] TIMEOUT: handshake incomplete (initial=%d sh=%d "
+            "flight=%d fin_sent=%d hs_contig=%u)\n",
+            got_initial, sh_parsed, flight_done, fin_sent,
+            (unsigned)qrsm_contig(&hrsm));
+    return -1;
 }
