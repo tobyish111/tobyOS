@@ -223,6 +223,7 @@ C_SRCS := src/kernel.c \
           src/quic_crypto.c \
           src/quic_packet.c \
           src/quic_conn.c \
+          src/http3.c \
           src/tls_x509.c \
           src/tls_trust.c \
           src/procfs.c \

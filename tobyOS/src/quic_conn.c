@@ -15,6 +15,7 @@
 #include <tobyos/cpu.h>         /* sti/hlt */
 #include <tobyos/sec.h>         /* sha256 transcript */
 #include <tobyos/tls_x509.h>    /* shared cert chain + CertificateVerify (4f) */
+#include <tobyos/http3.h>       /* H3 frames + QPACK (slice 5) */
 
 #include "monocypher.h"
 #include <bearssl.h>            /* br_x509_pkey for cert auth */
@@ -425,6 +426,21 @@ static size_t build_initial_1200(uint8_t *out, size_t cap,
                               key, iv, hp);
 }
 
+/* ---- HTTP/3 response headers (slice 5) ---------------------------- */
+
+struct h3_resp_info { int status; int nhdr; };
+
+static void h3_hdr_print(void *ud, const char *name, const char *value) {
+    struct h3_resp_info *ri = ud;
+    ri->nhdr++;
+    if (strcmp(name, ":status") == 0) {
+        ri->status = 0;
+        for (const char *c = value; *c >= '0' && *c <= '9'; c++)
+            ri->status = ri->status * 10 + (*c - '0');
+    }
+    kprintf("[quich3]   %s: %s\n", name, value);
+}
+
 /* ---- On-the-wire handshake test (slices 4b..4h) ------------------ *
  * A live QUIC client handshake against a REAL server at
  * 10.0.2.2:4433 (SLIRP host): send the Initial (padded to 1200),
@@ -456,11 +472,14 @@ int quic_udp_send_test(void) {
     uint8_t server_cid[20]; size_t server_cid_len = key_dcid_len;
     memcpy(server_cid, key_dcid, key_dcid_len);  /* -> server's SCID once known */
     static uint8_t token[512]; size_t token_len = 0;
-    uint64_t next_ipn = 1, next_hpn = 0;
-    struct qack iack, hack;
+    uint64_t next_ipn = 1, next_hpn = 0, next_apn = 0;
+    struct qack iack, hack, aack;
     memset(&iack, 0, sizeof iack); memset(&hack, 0, sizeof hack);
+    memset(&aack, 0, sizeof aack);
     int got_retry = 0, got_initial = 0, have_scid = 0;
     int sh_parsed = 0, flight_done = 0, fin_sent = 0;
+    int hs_done = 0, req_sent = 0;
+    uint64_t s0_fin = (uint64_t)-1;          /* response stream end offset */
 
     /* server Initial keys (for opening its Initials; re-derived on Retry) */
     uint8_t sikey[16], siiv[12], sihp[16];
@@ -477,12 +496,16 @@ int quic_udp_send_test(void) {
     uint8_t empty_hash[32]; sha256_buf(NULL, 0, empty_hash);
     uint8_t thash_af[32];                        /* transcript incl server Fin */
 
-    /* CRYPTO reassembly, Initial + Handshake levels */
+    /* CRYPTO reassembly (Initial + Handshake levels) + the response
+     * stream (1-RTT stream 0, reassembled the same way) */
     static uint8_t ibuf[1024],  ibits[1024 / 8];
     static uint8_t hbuf[8192],  hbits[8192 / 8];
+    static uint8_t s0buf[8192], s0bits[8192 / 8];
     memset(ibits, 0, sizeof ibits); memset(hbits, 0, sizeof hbits);
+    memset(s0bits, 0, sizeof s0bits);
     struct qrsm irsm = { ibuf, ibits, sizeof ibuf };
     struct qrsm hrsm = { hbuf, hbits, sizeof hbuf };
+    struct qrsm s0rsm = { s0buf, s0bits, sizeof s0buf };
 
     g_qq_head = g_qq_tail = 0;
 
@@ -534,39 +557,54 @@ int quic_udp_send_test(void) {
                     long pl = quic_open_short(pk, avail, sizeof scid,
                                               sak, saiv, sahp, &pay, &pn);
                     if (pl > 0) {
+                        int elicit = 0;
                         size_t fp = 0; struct quic_frame f;
-                        int done = 0;
                         while (fp < (size_t)pl) {
                             size_t fn = quic_frame_parse(pay + fp,
                                                          (size_t)pl - fp, &f);
                             if (!fn) break;
-                            if (f.type == QUIC_FRAME_HANDSHAKE_DONE) done = 1;
-                            if (f.type == QUIC_FRAME_CONN_CLOSE ||
-                                f.type == QUIC_FRAME_CONN_CLOSE_APP) {
+                            switch (f.type) {
+                            case QUIC_FRAME_HANDSHAKE_DONE:
+                                if (!hs_done) {
+                                    hs_done = 1;
+                                    kprintf("[quicudp] 1-RTT HANDSHAKE_DONE "
+                                            "received -- LIVE QUIC HANDSHAKE "
+                                            "COMPLETE (server confirmed our "
+                                            "Finished)\n");
+                                }
+                                elicit = 1;
+                                break;
+                            case QUIC_FRAME_STREAM:
+                                /* Stream 0 = our request's response;
+                                 * server uni streams (control/QPACK)
+                                 * are ignored. */
+                                if (f.stream_id == 0) {
+                                    qrsm_add(&s0rsm, f.offset, f.data, f.len);
+                                    if (f.fin)
+                                        s0_fin = f.offset + f.len;
+                                }
+                                elicit = 1;
+                                break;
+                            case QUIC_FRAME_CONN_CLOSE:
+                            case QUIC_FRAME_CONN_CLOSE_APP: {
                                 char rsn[64]; size_t rl = f.len < 63 ? (size_t)f.len : 63;
                                 memcpy(rsn, f.data, rl); rsn[rl] = 0;
                                 kprintf("[quicudp] CONNECTION_CLOSE err=%u "
-                                        "reason='%s'\n", (unsigned)f.err_code, rsn);
+                                        "reason='%s' -- aborting\n",
+                                        (unsigned)f.err_code, rsn);
+                                return -1;
+                            }
+                            case QUIC_FRAME_ACK:
+                            case QUIC_FRAME_ACK_ECN:
+                            case QUIC_FRAME_PADDING:
+                                break;
+                            default:
+                                elicit = 1;   /* CRYPTO(tickets)/NEW_CID/... */
+                                break;
                             }
                             fp += fn;
                         }
-                        if (done) {
-                            /* ACK the 1-RTT packet, then declare victory. */
-                            uint8_t af[16];
-                            size_t al = quic_frame_ack(af, sizeof af, pn, 0);
-                            static uint8_t apkt[128];
-                            size_t apl = quic_build_short(apkt, sizeof apkt,
-                                                          server_cid, server_cid_len,
-                                                          0, 4, af, al,
-                                                          cak, caiv, cahp);
-                            if (apl)
-                                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip,
-                                               htons(4433), apkt, apl);
-                            kprintf("[quicudp] 1-RTT HANDSHAKE_DONE received -- "
-                                    "LIVE QUIC HANDSHAKE COMPLETE "
-                                    "(server confirmed our Finished)\n");
-                            return 0;
-                        }
+                        qack_note(&aack, pn, elicit);
                     }
                 }
                 break;                       /* short header ends the datagram */
@@ -812,6 +850,119 @@ int quic_udp_send_test(void) {
                 (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
                                hpkt, hl);
             hack.elicited = 0;
+        }
+
+        /* ---- HTTP/3 (slice 5): send the GET once the handshake is
+         * confirmed -- one 1-RTT packet carrying the ACK, our control
+         * stream (SETTINGS; no QPACK dynamic table advertised) and the
+         * request stream (QPACK HEADERS, FIN). ---- */
+        if (hs_done && !req_sent) {
+            uint8_t fs[512]; size_t fl2 = 0;
+            fl2 += quic_frame_ack(fs + fl2, sizeof fs - fl2, aack.largest,
+                                  qack_first_range(&aack));
+            aack.elicited = 0;
+            /* control stream (client-uni id 2): type 0x00 + empty SETTINGS */
+            static const uint8_t ctrl[] = { H3_STREAM_CONTROL,
+                                            H3_FRAME_SETTINGS, 0x00 };
+            fl2 += quic_frame_stream(fs + fl2, sizeof fs - fl2, 2, 0,
+                                     ctrl, sizeof ctrl, 0);
+            /* request stream (client-bidi id 0): HEADERS frame, FIN */
+            uint8_t sec[256];
+            size_t sl2 = h3_qpack_encode_request(sec, sizeof sec,
+                                                 "tobyos.test", "/");
+            uint8_t req[300]; size_t rl2 = 0;
+            rl2 += h3_frame_hdr(req, sizeof req, H3_FRAME_HEADERS, sl2);
+            memcpy(req + rl2, sec, sl2); rl2 += sl2;
+            fl2 += quic_frame_stream(fs + fl2, sizeof fs - fl2, 0, 0,
+                                     req, rl2, 1);
+            static uint8_t qpkt[600];
+            size_t ql = quic_build_short(qpkt, sizeof qpkt,
+                                         server_cid, server_cid_len,
+                                         next_apn++, 4, fs, fl2,
+                                         cak, caiv, cahp);
+            if (!ql) {
+                kprintf("[quich3] request packet build failed\n");
+                return -1;
+            }
+            (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+                           qpkt, ql);
+            req_sent = 1;
+            deadline = pit_ticks() + hz * 10;
+            kprintf("[quich3] sent GET https://tobyos.test/ over HTTP/3 "
+                    "(SETTINGS + QPACK HEADERS, %u byte 1-RTT packet)\n",
+                    (unsigned)ql);
+        } else if (aack.elicited && req_sent) {
+            uint8_t af[16];
+            size_t al = quic_frame_ack(af, sizeof af, aack.largest,
+                                       qack_first_range(&aack));
+            static uint8_t apkt[128];
+            size_t apl = quic_build_short(apkt, sizeof apkt,
+                                          server_cid, server_cid_len,
+                                          next_apn++, 4, af, al,
+                                          cak, caiv, cahp);
+            if (apl)
+                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+                               apkt, apl);
+            aack.elicited = 0;
+        }
+
+        /* ---- consume the response once stream 0 is complete ---- */
+        if (req_sent && s0_fin != (uint64_t)-1 &&
+            qrsm_contig(&s0rsm) >= s0_fin) {
+            struct h3_resp_info ri = { -1, 0 };
+            size_t body_total = 0;
+            char body1[161]; body1[0] = 0;
+            size_t o2 = 0;
+            int bad = 0;
+            while (o2 < s0_fin && !bad) {
+                uint64_t ftype, flen2;
+                size_t c = quic_varint_decode(s0buf + o2, s0_fin - o2, &ftype);
+                if (!c) { bad = 1; break; }
+                o2 += c;
+                c = quic_varint_decode(s0buf + o2, s0_fin - o2, &flen2);
+                if (!c || o2 + c + flen2 > s0_fin) { bad = 1; break; }
+                o2 += c;
+                if (ftype == H3_FRAME_HEADERS) {
+                    kprintf("[quich3] response HEADERS (%u byte QPACK "
+                            "section):\n", (unsigned)flen2);
+                    if (h3_qpack_decode(s0buf + o2, (size_t)flen2,
+                                        h3_hdr_print, &ri) != 0) {
+                        kprintf("[quich3] QPACK decode FAILED\n");
+                        bad = 1;
+                    }
+                } else if (ftype == H3_FRAME_DATA) {
+                    if (body_total < sizeof body1 - 1) {
+                        size_t k = sizeof body1 - 1 - body_total;
+                        if (k > flen2) k = (size_t)flen2;
+                        memcpy(body1 + body_total, s0buf + o2, k);
+                        body1[body_total + k] = 0;
+                    }
+                    body_total += (size_t)flen2;
+                }
+                o2 += (size_t)flen2;
+            }
+            if (bad || ri.status < 0) {
+                kprintf("[quich3] response parse FAILED\n");
+                return -1;
+            }
+            kprintf("[quich3] body (%u bytes): %s\n",
+                    (unsigned)body_total, body1);
+            kprintf("[quich3] HTTP/3 GET COMPLETE: status=%d, %d headers, "
+                    "%u body bytes -- FIRST PAGE FETCHED OVER HTTP/3\n",
+                    ri.status, ri.nhdr, (unsigned)body_total);
+            /* final ACK so the server doesn't retransmit at us */
+            uint8_t af[16];
+            size_t al = quic_frame_ack(af, sizeof af, aack.largest,
+                                       qack_first_range(&aack));
+            static uint8_t apkt2[128];
+            size_t apl = quic_build_short(apkt2, sizeof apkt2,
+                                          server_cid, server_cid_len,
+                                          next_apn++, 4, af, al,
+                                          cak, caiv, cahp);
+            if (apl)
+                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+                               apkt2, apl);
+            return 0;
         }
 
         /* ---- consume the Handshake flight once contiguous ---- */

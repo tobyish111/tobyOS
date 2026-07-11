@@ -19,8 +19,11 @@
 #define QUIC_FRAME_PING           0x01
 #define QUIC_FRAME_ACK            0x02
 #define QUIC_FRAME_ACK_ECN        0x03
+#define QUIC_FRAME_RESET_STREAM   0x04
+#define QUIC_FRAME_STOP_SENDING   0x05
 #define QUIC_FRAME_CRYPTO         0x06
 #define QUIC_FRAME_NEW_TOKEN      0x07
+#define QUIC_FRAME_STREAM         0x08   /* 0x08..0x0f: OFF 4 / LEN 2 / FIN 1 */
 #define QUIC_FRAME_NEW_CID        0x18
 #define QUIC_FRAME_RETIRE_CID     0x19
 #define QUIC_FRAME_CONN_CLOSE     0x1c   /* transport error */
@@ -38,23 +41,34 @@ size_t quic_frame_crypto(uint8_t *out, size_t cap,
 size_t quic_frame_ack(uint8_t *out, size_t cap,
                       uint64_t largest, uint64_t first_range);
 
-/* One parsed frame. For CRYPTO: off/len/data point into the input.
- * For ACK: largest filled (ranges skipped). For CONNECTION_CLOSE:
- * err_code + data/len = the reason phrase (into input). */
+/* Write a STREAM frame (type 0x08 | OFF | LEN | FIN if fin) with an
+ * explicit offset and length. Returns bytes written, or 0 on
+ * overflow. */
+size_t quic_frame_stream(uint8_t *out, size_t cap,
+                         uint64_t stream_id, uint64_t offset,
+                         const uint8_t *data, size_t len, int fin);
+
+/* One parsed frame. For CRYPTO/STREAM: offset/len/data point into the
+ * input (STREAM also fills stream_id + fin). For ACK: largest filled
+ * (ranges skipped). For CONNECTION_CLOSE: err_code + data/len = the
+ * reason phrase (into input). */
 struct quic_frame {
-    uint8_t  type;
-    uint64_t offset;              /* CRYPTO */
-    uint64_t len;                 /* CRYPTO data / CLOSE reason length */
-    const uint8_t *data;          /* CRYPTO payload / CLOSE reason */
+    uint8_t  type;                /* STREAM types normalized to 0x08 */
+    uint64_t offset;              /* CRYPTO / STREAM */
+    uint64_t len;                 /* CRYPTO/STREAM data / CLOSE reason len */
+    const uint8_t *data;          /* CRYPTO/STREAM payload / CLOSE reason */
     uint64_t largest;             /* ACK largest acknowledged */
     uint64_t err_code;            /* CONNECTION_CLOSE error code */
+    uint64_t stream_id;           /* STREAM */
+    int      fin;                 /* STREAM FIN bit */
 };
 
 /* Parse the next frame at p (cap bytes). Fills *f, returns bytes
  * consumed, or 0 on malformed input. PADDING runs collapse to one
- * PADDING frame. Handled: PADDING/PING/ACK(+ECN)/CRYPTO/NEW_TOKEN/
- * NEW_CONNECTION_ID/RETIRE_CONNECTION_ID/CONNECTION_CLOSE/
- * HANDSHAKE_DONE. */
+ * PADDING frame. Handled: PADDING/PING/ACK(+ECN)/RESET_STREAM/
+ * STOP_SENDING/CRYPTO/NEW_TOKEN/STREAM(all 8 forms)/flow-control
+ * (MAX_DATA..STREAMS_BLOCKED, skipped)/NEW_CONNECTION_ID/
+ * RETIRE_CONNECTION_ID/CONNECTION_CLOSE/HANDSHAKE_DONE. */
 size_t quic_frame_parse(const uint8_t *p, size_t cap, struct quic_frame *f);
 
 /* ---- Initial packets (long header, RFC 9001) -------------------- */

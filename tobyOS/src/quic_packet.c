@@ -40,6 +40,22 @@ size_t quic_frame_ack(uint8_t *out, size_t cap,
     return p;
 }
 
+size_t quic_frame_stream(uint8_t *out, size_t cap,
+                         uint64_t stream_id, uint64_t offset,
+                         const uint8_t *data, size_t len, int fin) {
+    uint8_t hdr[1 + 8 * 3];
+    size_t p = 0;
+    hdr[p++] = (uint8_t)(QUIC_FRAME_STREAM | 0x04 /* OFF */ | 0x02 /* LEN */ |
+                         (fin ? 0x01 : 0));
+    p += quic_varint_encode(hdr + p, stream_id);
+    p += quic_varint_encode(hdr + p, offset);
+    p += quic_varint_encode(hdr + p, len);
+    if (p + len > cap) return 0;
+    memcpy(out, hdr, p);
+    if (len) memcpy(out + p, data, len);
+    return p + len;
+}
+
 size_t quic_frame_parse(const uint8_t *p, size_t cap, struct quic_frame *f) {
     if (cap < 1) return 0;
     memset(f, 0, sizeof *f);
@@ -51,6 +67,47 @@ size_t quic_frame_parse(const uint8_t *p, size_t cap, struct quic_frame *f) {
     }
     if (p[0] == QUIC_FRAME_PING || p[0] == QUIC_FRAME_HANDSHAKE_DONE)
         return 1;
+    if ((p[0] & 0xf8) == QUIC_FRAME_STREAM) {
+        /* STREAM: id, then offset iff OFF (0x04), length iff LEN (0x02)
+         * (else the data extends to the end), FIN in 0x01. */
+        uint8_t t = p[0];
+        size_t o = 1, n;
+        n = quic_varint_decode(p + o, cap - o, &f->stream_id); if (!n) return 0; o += n;
+        if (t & 0x04) {
+            n = quic_varint_decode(p + o, cap - o, &f->offset); if (!n) return 0; o += n;
+        }
+        if (t & 0x02) {
+            n = quic_varint_decode(p + o, cap - o, &f->len);    if (!n) return 0; o += n;
+            if (o + f->len > cap) return 0;
+        } else {
+            f->len = cap - o;
+        }
+        f->data = p + o;
+        f->fin = (t & 0x01) != 0;
+        f->type = QUIC_FRAME_STREAM;       /* normalize the 8 forms */
+        return o + (size_t)f->len;
+    }
+    if (p[0] == QUIC_FRAME_RESET_STREAM || p[0] == QUIC_FRAME_STOP_SENDING) {
+        size_t o = 1, n;
+        int nvar = (p[0] == QUIC_FRAME_RESET_STREAM) ? 3 : 2;
+        for (int i = 0; i < nvar; i++) {
+            uint64_t v;
+            n = quic_varint_decode(p + o, cap - o, &v); if (!n) return 0; o += n;
+        }
+        return o;
+    }
+    if (p[0] >= 0x10 && p[0] <= 0x17) {
+        /* Flow control: MAX_DATA(1 varint) / MAX_STREAM_DATA(2) /
+         * MAX_STREAMS(1) / DATA_BLOCKED(1) / STREAM_DATA_BLOCKED(2) /
+         * STREAMS_BLOCKED(1) -- parsed and skipped. */
+        size_t o = 1, n;
+        int nvar = (p[0] == 0x11 || p[0] == 0x15) ? 2 : 1;
+        for (int i = 0; i < nvar; i++) {
+            uint64_t v;
+            n = quic_varint_decode(p + o, cap - o, &v); if (!n) return 0; o += n;
+        }
+        return o;
+    }
     if (p[0] == QUIC_FRAME_CRYPTO || p[0] == QUIC_FRAME_NEW_TOKEN) {
         size_t o = 1, n;
         if (p[0] == QUIC_FRAME_CRYPTO) {
