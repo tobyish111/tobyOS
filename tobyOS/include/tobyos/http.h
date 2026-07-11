@@ -181,6 +181,16 @@ void http_keepalive_stats(unsigned *out_reused, unsigned *out_handshakes);
 /* Render a HTTP_ERR_* code into a static string for logging. */
 const char *http_strerror(int err);
 
+/* Record an Alt-Svc (RFC 7838) header value for `host` (used by the h2
+ * and h3 response paths, which bypass the h1.1 header parser). If it
+ * advertises h3, the next same-origin https fetch upgrades to HTTP/3. */
+void http_altsvc_note(const char *host, const char *altsvc_value);
+
+/* Deterministic self-test for the Alt-Svc (RFC 7838) parser + cache
+ * used to auto-upgrade a same-origin fetch to HTTP/3. Prints
+ * "[altsvc] ..." and returns the PASS count (5 = all pass). */
+int http_altsvc_selftest(void);
+
 /* Boot-time self-test for milestone 24D. Drives the full
  *   httpget → pkg_install_url → pkg_remove
  * cycle against an HTTP server expected to be running on the SLIRP

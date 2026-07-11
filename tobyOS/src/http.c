@@ -430,6 +430,127 @@ static int parse_status_line(const char *line, size_t len,
     return 0;
 }
 
+/* ---- Alt-Svc cache (RFC 7838): remember which origins advertised
+ * HTTP/3, so the next same-origin https fetch upgrades to h3. In-memory
+ * and per-session; no ma/expiry accounting for v1. ---- */
+
+#define ALTSVC_MAX 32
+struct altsvc_ent { char host[HTTP_MAX_HOST_LEN]; uint16_t h3_port; bool used; };
+static struct altsvc_ent g_altsvc[ALTSVC_MAX];
+
+static void altsvc_remove(const char *host) {
+    for (int i = 0; i < ALTSVC_MAX; i++)
+        if (g_altsvc[i].used && ascii_strncasecmp(g_altsvc[i].host, host,
+                                                  strlen(host) + 1) == 0)
+            g_altsvc[i].used = false;
+}
+
+static void altsvc_record(const char *host, uint16_t h3_port) {
+    int free_slot = -1;
+    for (int i = 0; i < ALTSVC_MAX; i++) {
+        if (g_altsvc[i].used) {
+            if (ascii_strncasecmp(g_altsvc[i].host, host, strlen(host) + 1) == 0) {
+                g_altsvc[i].h3_port = h3_port;   /* refresh */
+                return;
+            }
+        } else if (free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (free_slot < 0) free_slot = 0;            /* full: evict slot 0 */
+    size_t hl = strlen(host);
+    if (hl >= sizeof g_altsvc[0].host) return;
+    memcpy(g_altsvc[free_slot].host, host, hl + 1);
+    g_altsvc[free_slot].h3_port = h3_port;
+    g_altsvc[free_slot].used = true;
+}
+
+static bool altsvc_lookup(const char *host, uint16_t *h3_port) {
+    for (int i = 0; i < ALTSVC_MAX; i++)
+        if (g_altsvc[i].used && ascii_strncasecmp(g_altsvc[i].host, host,
+                                                  strlen(host) + 1) == 0) {
+            if (h3_port) *h3_port = g_altsvc[i].h3_port;
+            return true;
+        }
+    return false;
+}
+
+/* Parse an Alt-Svc value (RFC 7838). If it advertises HTTP/3
+ * (protocol id "h3" or a draft "h3-XX"), record host -> the quoted
+ * authority's port. The literal value "clear" removes any record.
+ * klibc has no strstr, so this scans by hand. */
+static void altsvc_parse(const char *host, const char *val, size_t vlen) {
+    if (vlen == 5 && ascii_strncasecmp(val, "clear", 5) == 0) {
+        altsvc_remove(host);
+        return;
+    }
+    for (size_t i = 0; i + 3 < vlen; i++) {
+        int boundary = (i == 0 || val[i-1] == ',' || val[i-1] == ' ');
+        if (!boundary) continue;
+        if ((val[i] == 'h' || val[i] == 'H') && val[i+1] == '3') {
+            /* skip to '=' (tolerating a "-draft" suffix); bail on a
+             * separator, meaning this token isn't "h3[...]=authority". */
+            size_t j = i + 2;
+            while (j < vlen && val[j] != '=' && val[j] != ',' && val[j] != ';')
+                j++;
+            if (j >= vlen || val[j] != '=') continue;
+            size_t k = j + 1;
+            if (k >= vlen || val[k] != '"') continue;   /* authority is quoted */
+            k++;
+            size_t astart = k;
+            while (k < vlen && val[k] != '"') k++;
+            long colon = -1;
+            for (size_t m = astart; m < k; m++) if (val[m] == ':') colon = (long)m;
+            if (colon < 0) continue;
+            uint32_t port = 0; int any = 0;
+            for (size_t m = (size_t)colon + 1; m < k && val[m] >= '0' && val[m] <= '9';
+                 m++) { port = port * 10 + (uint32_t)(val[m] - '0'); any = 1; }
+            if (any && port > 0 && port < 65536) {
+                altsvc_record(host, (uint16_t)port);
+                return;
+            }
+        }
+    }
+}
+
+/* Public recorder so the h2 (http2.c) and h3 (quic_conn.c) response
+ * paths -- which don't go through parse_headers -- can note an Alt-Svc
+ * header too. */
+void http_altsvc_note(const char *host, const char *altsvc_value) {
+    if (host && *host && altsvc_value)
+        altsvc_parse(host, altsvc_value, strlen(altsvc_value));
+}
+
+/* Deterministic self-test for the Alt-Svc parser (no network). */
+int http_altsvc_selftest(void) {
+    int pass = 0;
+    uint16_t port = 0;
+    for (int i = 0; i < ALTSVC_MAX; i++) g_altsvc[i].used = false;
+
+    altsvc_parse("a.test", "h3=\":443\"; ma=86400", 19);
+    if (altsvc_lookup("a.test", &port) && port == 443) pass++;
+
+    const char *v2 = "h2=\":443\", h3=\":8443\"; ma=3600";
+    altsvc_parse("b.test", v2, strlen(v2));
+    if (altsvc_lookup("b.test", &port) && port == 8443) pass++;
+
+    const char *v3 = "h3-29=\":443\"; ma=86400";
+    altsvc_parse("c.test", v3, strlen(v3));
+    if (altsvc_lookup("c.test", &port) && port == 443) pass++;
+
+    altsvc_parse("a.test", "clear", 5);
+    if (!altsvc_lookup("a.test", &port)) pass++;
+
+    const char *v5 = "h2=\":443\"";
+    altsvc_parse("d.test", v5, strlen(v5));
+    if (!altsvc_lookup("d.test", &port)) pass++;
+
+    for (int i = 0; i < ALTSVC_MAX; i++) g_altsvc[i].used = false;
+    kprintf("[altsvc] self-test: %d/5 %s\n", pass,
+            pass == 5 ? "ALL PASS" : "FAILURES");
+    return pass;
+}
+
 /* Parse headers. `base` points just past the status line's \r\n.
  * `len` is the remaining length up to the \r\n\r\n terminator
  * (inclusive of the final empty line's \r\n).
@@ -522,6 +643,11 @@ static int parse_headers(const char *base, size_t len,
             if (cl >= sizeof(sv)) cl = sizeof(sv) - 1;
             memcpy(sv, base + v_off, cl); sv[cl] = 0;
             cookie_store(host, sv);
+        } else if (colon == 7 && ascii_strncasecmp(base, "Alt-Svc", 7) == 0 &&
+                   host) {
+            /* RFC 7838: remember an h3 advertisement for this origin so
+             * the next same-origin fetch upgrades to HTTP/3. */
+            altsvc_parse(host, base + v_off, v_len);
         }
 
         size_t advance = (size_t)((eol + 2) - base);
@@ -881,6 +1007,14 @@ int http_get_opt(const char *url,
 
     bool want_ka = (flags & HTTP_F_KEEPALIVE) != 0;
 
+    /* Decide whether to probe HTTP/3 first: the caller opted in
+     * (HTTP_F_TRY_H3) OR this origin previously advertised h3 via
+     * Alt-Svc (RFC 7838). altsvc_lookup fills h3_port with the
+     * advertised port; otherwise it stays the URL's port. */
+    uint16_t h3_port = u.port;
+    bool altsvc_h3 = u.tls && altsvc_lookup(u.host, &h3_port);
+    bool try_h3 = u.tls && ((flags & HTTP_F_TRY_H3) || altsvc_h3);
+
     /* 2. Resolve lazily: a keep-alive hit skips DNS entirely. */
     uint32_t ip_be = 0;
     bool have_ip = parse_dotted_quad(u.host, &ip_be);
@@ -905,7 +1039,11 @@ int http_get_opt(const char *url,
 
     for (int attempt = 0; ; attempt++) {
         buf_used = 0; header_end = 0; peer_fin = false;
-        bool reused = want_ka && attempt == 0 && keep_take(&u, &tr);
+        /* Don't reuse a parked TCP connection on the attempt where we
+         * still intend to probe h3 -- try QUIC first, TCP is the
+         * fallback. */
+        bool reused = want_ka && attempt == 0 && !(try_h3 && !tried_h3) &&
+                      keep_take(&u, &tr);
 
         if (reused) {
             g_ka_reused++;
@@ -927,15 +1065,19 @@ int http_get_opt(const char *url,
                 kprintf("[http] %s -> %u.%u.%u.%u:%u%s\n",
                         u.host, ip[0], ip[1], ip[2], ip[3], u.port, u.path);
             }
-            /* stage 13 slice 5b: for https, probe HTTP/3 first when the
-             * caller opts in (HTTP_F_TRY_H3). http3_fetch runs the whole
-             * QUIC handshake + GET; on ANY failure fall through to the
-             * proven TLS h2/h1.1 ladder (GET is idempotent), so h3 can
-             * never regress a fetch. Only on a fresh attempt (not a
-             * keep-alive reuse, not after an h2->h1 downgrade). */
-            if (u.tls && (flags & HTTP_F_TRY_H3) && !force_h1 && !tried_h3) {
+            /* stage 13 slice 5b/5d: for https, probe HTTP/3 first when
+             * the caller opts in (HTTP_F_TRY_H3) OR the origin advertised
+             * h3 via Alt-Svc (try_h3). http3_fetch runs the whole QUIC
+             * handshake + GET; on ANY failure fall through to the proven
+             * TLS h2/h1.1 ladder (GET is idempotent), so h3 can never
+             * regress a fetch. Only on a fresh attempt (not a keep-alive
+             * reuse, not after an h2->h1 downgrade). */
+            if (try_h3 && !force_h1 && !tried_h3) {
                 tried_h3 = 1;
-                int h3rc = http3_fetch(ip_be, u.port, u.host, u.path, flags,
+                if (altsvc_h3 && !(flags & HTTP_F_TRY_H3))
+                    kprintf("[http] Alt-Svc: %s advertises h3 on :%u -- "
+                            "upgrading to HTTP/3\n", u.host, h3_port);
+                int h3rc = http3_fetch(ip_be, h3_port, u.host, u.path, flags,
                                        read_cap, timeout_ms, out);
                 if (h3rc == 0) { kfree(buf); return 0; }
                 kprintf("[http] h3 fetch failed (%d) -- falling back to "

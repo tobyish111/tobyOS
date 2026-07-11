@@ -440,12 +440,17 @@ static void cpy_field(char *dst, size_t cap, const char *src) {
     dst[i] = 0;
 }
 
-struct h3_resp_build { struct http_response *out; int status_seen; int nhdr; };
+struct h3_resp_build { struct http_response *out; int status_seen; int nhdr;
+                       const char *host; };
 
 static void h3_hdr_to_resp(void *ud, const char *name, const char *value) {
     struct h3_resp_build *b = ud;
     struct http_response *o = b->out;
     b->nhdr++;
+    if (strcmp(name, "alt-svc") == 0) {
+        http_altsvc_note(b->host, value);      /* RFC 7838 discovery over h3 */
+        return;
+    }
     if (strcmp(name, ":status") == 0) {
         int s = 0;
         for (const char *c = value; *c >= '0' && *c <= '9'; c++)
@@ -491,9 +496,9 @@ static void h3_hdr_to_resp(void *ud, const char *name, const char *value) {
  * HTTP_ERR_* otherwise. Synchronous, one fetch at a time (fixed UDP
  * source port). AES-128-GCM only; a ChaCha20 server is refused at
  * ServerHello. */
-int http3_fetch(uint32_t ip_be, uint16_t port, const char *host,
-                const char *path, unsigned flags, size_t max_body,
-                uint32_t timeout_ms, struct http_response *out) {
+static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
+                            const char *path, unsigned flags, size_t max_body,
+                            uint32_t timeout_ms, struct http_response *out) {
     if (!host) host = "";
     if (!path || !*path) path = "/";
     if (out) { memset(out, 0, sizeof *out); out->content_len = -1; }
@@ -971,7 +976,7 @@ int http3_fetch(uint32_t ip_be, uint16_t port, const char *host,
             qrsm_contig(&s0rsm) >= s0_fin) {
             /* First pass: decode headers (fills status/type/len/encoding)
              * and total the DATA payload. */
-            struct h3_resp_build rb = { out, 0, 0 };
+            struct h3_resp_build rb = { out, 0, 0, host };
             size_t body_total = 0;
             size_t o2 = 0;
             int bad = 0;
@@ -1201,6 +1206,27 @@ int http3_fetch(uint32_t ip_be, uint16_t port, const char *host,
     return HTTP_ERR_TIMEOUT;
 }
 
+/* Public entry: serialise fetches. The transport uses a fixed UDP
+ * source port (56789) and single static reassembly buffers, so only
+ * one h3 fetch can be in flight. A concurrent caller (e.g. the browser
+ * firing parallel fetches) gets HTTP_ERR_CONNECT and falls back to the
+ * h2/h1.1 ladder rather than corrupting the in-flight fetch. */
+static volatile int g_h3_busy;
+
+int http3_fetch(uint32_t ip_be, uint16_t port, const char *host,
+                const char *path, unsigned flags, size_t max_body,
+                uint32_t timeout_ms, struct http_response *out) {
+    if (g_h3_busy) {
+        if (out) { memset(out, 0, sizeof *out); out->content_len = -1; }
+        return HTTP_ERR_CONNECT;             /* one h3 fetch at a time */
+    }
+    g_h3_busy = 1;
+    int rc = http3_fetch_core(ip_be, port, host, path, flags, max_body,
+                              timeout_ms, out);
+    g_h3_busy = 0;
+    return rc;
+}
+
 /* Boot-time on-the-wire test (slices 4b..5b). Two proofs against the
  * aioquic server on the SLIRP host (10.0.2.2:4433, cert for
  * tobyos.test), both under -DQUIC_SEND_TEST (with -DTLS_TEST_CA to
@@ -1245,28 +1271,60 @@ int quic_udp_send_test(void) {
         kprintf("[quich3] http_get_opt /big over h3 FAILED rc=%d\n", rc2);
     }
 
-#ifdef QUIC_REALWORLD
-    /* A REAL public HTTP/3 endpoint over the open internet (SLIRP NAT):
-     * real DNS, a real certificate chaining to a Mozilla root (13H
-     * store, always compiled), a real server flight. gzip so the page
-     * fits the cap; we report status + size, the browser would inflate.
-     * (Real DNS still works with -DTLS_TEST_CA: the test seam only
-     * intercepts tobyos.test.) */
+#ifdef QUIC_ALTSVC
+    /* Alt-Svc auto-upgrade (RFC 7838), local + deterministic. The
+     * aioquic server carries `alt-svc: h3=":4433"` in its response;
+     * fetch #1 (explicit h3) records it, and fetch #2 -- with NO h3
+     * flag -- auto-upgrades to HTTP/3 from the cache (watch for
+     * "[http] Alt-Svc ... upgrading" + the [quich3] lines). */
     {
-        struct http_response r3;
+        struct http_response a1, a2;
+        int r1 = http_get_opt("https://tobyos.test:4433/", 65536, 15000,
+                              HTTP_F_TRY_H3 | HTTP_F_TRUNCATE, &a1);
+        kprintf("[altsvc] fetch1 (explicit h3) rc=%d status=%d -- records "
+                "Alt-Svc\n", r1, r1 == 0 ? a1.status : 0);
+        if (r1 == 0) http_free(&a1);
+        int r2 = http_get_opt("https://tobyos.test:4433/", 65536, 15000,
+                              HTTP_F_TRUNCATE /* no h3 flag */, &a2);
+        if (r2 == 0) {
+            kprintf("[altsvc] fetch2 (no flag) rc=0 status=%d -- AUTO-UPGRADED "
+                    "TO HTTP/3 VIA ALT-SVC\n", a2.status);
+            http_free(&a2);
+        } else {
+            kprintf("[altsvc] fetch2 (no flag) rc=%d\n", r2);
+        }
+    }
+#endif
+
+#ifdef QUIC_REALWORLD
+    /* A REAL public endpoint over the open internet (SLIRP NAT) with
+     * authentic Alt-Svc discovery: fetch #1 has NO h3 flag, so it goes
+     * over h2/h1.1 (TCP) and records the origin's `alt-svc: h3=...`;
+     * fetch #2 auto-upgrades to HTTP/3. Real DNS + a real cert chain to
+     * a Mozilla root. (The test seam only intercepts tobyos.test, so
+     * real DNS still works with -DTLS_TEST_CA.) */
+    {
+        struct http_response r3, r4;
         const char *url = "https://cloudflare-quic.com/";
-        kprintf("[quich3] REAL-WORLD: GET %s over HTTP/3...\n", url);
+        kprintf("[quich3] REAL-WORLD fetch1 (h2/h1.1, discover Alt-Svc): %s\n",
+                url);
         int rc3 = http_get_opt(url, H3_RESP_MAX, 25000,
-                               HTTP_F_TRY_H3 | HTTP_F_GZIP | HTTP_F_TRUNCATE, &r3);
-        if (rc3 == 0) {
+                               HTTP_F_GZIP | HTTP_F_TRUNCATE, &r3);
+        kprintf("[quich3] REAL-WORLD fetch1 rc=%d status=%d\n",
+                rc3, rc3 == 0 ? r3.status : 0);
+        if (rc3 == 0) http_free(&r3);
+        kprintf("[quich3] REAL-WORLD fetch2 (auto-upgrade): %s\n", url);
+        int rc4 = http_get_opt(url, H3_RESP_MAX, 25000,
+                               HTTP_F_GZIP | HTTP_F_TRUNCATE, &r4);
+        if (rc4 == 0) {
             kprintf("[quich3] REAL-WORLD OK: %s status=%d type='%s' enc=%d "
                     "body=%u bytes -- LIVE PAGE FROM THE INTERNET OVER HTTP/3\n",
-                    url, r3.status, r3.content_type, r3.encoding,
-                    (unsigned)r3.body_len);
-            http_free(&r3);
+                    url, r4.status, r4.content_type, r4.encoding,
+                    (unsigned)r4.body_len);
+            http_free(&r4);
         } else {
-            kprintf("[quich3] REAL-WORLD FAILED rc=%d (%s)\n",
-                    rc3, http_strerror(rc3));
+            kprintf("[quich3] REAL-WORLD fetch2 rc=%d (%s)\n",
+                    rc4, http_strerror(rc4));
         }
     }
 #endif

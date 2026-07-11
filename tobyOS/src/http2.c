@@ -251,6 +251,7 @@ struct h2_resp {
     char     location[256];
     uint8_t  encoding;             /* HTTP_ENC_* */
     long     content_len;
+    const char *host;              /* for Alt-Svc discovery (RFC 7838) */
 };
 
 static int str_has(const char *hay, const char *needle) {
@@ -295,6 +296,8 @@ static void on_header(struct h2_resp *r, const char *name, const char *value) {
         long v = 0; for (const char *p = value; *p >= '0' && *p <= '9'; p++)
                         v = v * 10 + (*p - '0');
         r->content_len = v;
+    } else if (ci_eq(name, "alt-svc")) {
+        http_altsvc_note(r->host, value);    /* RFC 7838 discovery over h2 */
     }
 }
 
@@ -464,6 +467,7 @@ int http2_fetch(struct tls_conn *tls, const struct http_url *u,
     struct h2_resp r;
     memset(&r, 0, sizeof(r));
     r.content_len = -1;
+    r.host = u ? u->host : NULL;
 
     uint8_t *fpay = (uint8_t *)kmalloc(H2_MAX_FRAME + 1);
     uint8_t *hdrblock = (uint8_t *)kmalloc(HTTP2_HEADER_CAP);

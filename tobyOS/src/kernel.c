@@ -2798,6 +2798,7 @@ void _start(void) {
     { extern int quic_packet_selftest(void); quic_packet_selftest(); }
     { extern int quic_conn_selftest(void); quic_conn_selftest(); }
     { extern int h3_selftest(void); h3_selftest(); }
+    { extern int http_altsvc_selftest(void); http_altsvc_selftest(); }
 #endif
 
     bcache_init();
