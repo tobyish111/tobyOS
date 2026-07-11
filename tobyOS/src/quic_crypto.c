@@ -8,6 +8,7 @@
 #include <tobyos/printk.h>
 
 #include <bearssl.h>
+#include "monocypher.h"        /* crypto_chacha20_ietf for ChaCha20 HP */
 
 /* QUIC v1 Initial salt (RFC 9001 s5.2):
  * 0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a. */
@@ -90,6 +91,19 @@ void quic_hp_mask(const uint8_t hp[16], const uint8_t sample[16],
     memset(block, 0, sizeof block);
     br_aes_ct_ctr_run(&bc, sample, cc, block, 16);   /* iv = sample[0..11] */
     memcpy(mask, block, 5);
+}
+
+/* ChaCha20 header protection (RFC 9001 s5.4.4): counter = sample[0..4]
+ * (little-endian, the ChaCha20 block-counter word), nonce =
+ * sample[4..16]; mask = ChaCha20(hp, counter, nonce) over 5 zero
+ * bytes. */
+void quic_hp_mask_chacha(const uint8_t hp[32], const uint8_t sample[16],
+                         uint8_t mask[5]) {
+    uint32_t ctr = (uint32_t)sample[0] | ((uint32_t)sample[1] << 8) |
+                   ((uint32_t)sample[2] << 16) | ((uint32_t)sample[3] << 24);
+    uint8_t zeros[5] = { 0 }, out[5];
+    crypto_chacha20_ietf(out, zeros, 5, hp, sample + 4, ctr);
+    memcpy(mask, out, 5);
 }
 
 /* ---- Packet protection AEAD (RFC 9001 s5.3) --------------------- */

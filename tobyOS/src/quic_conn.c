@@ -538,12 +538,16 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
     uint8_t sikey[16], siiv[12], sihp[16];
     quic_initial_keys(key_dcid, key_dcid_len, 0, sikey, siiv, sihp);
 
-    /* handshake + 1-RTT keys/secrets (filled as the handshake advances) */
+    /* handshake + 1-RTT keys/secrets (filled as the handshake advances).
+     * key/hp are 16 bytes for AES-128-GCM, 32 for ChaCha20 -- aead + the
+     * derived lengths are set once the ServerHello names the suite. */
+    int aead = QUIC_AEAD_AES128GCM;
+    size_t klen = 16, hplen = 16;
     uint8_t hs_secret[32], s_hs[32], c_hs[32];
-    uint8_t shk[16], shiv[12], shhp[16];         /* server Handshake */
-    uint8_t chk[16], chiv[12], chhp[16];         /* client Handshake */
-    uint8_t sak[16], saiv[12], sahp[16];         /* server 1-RTT */
-    uint8_t cak[16], caiv[12], cahp[16];         /* client 1-RTT */
+    uint8_t shk[32], shiv[12], shhp[32];         /* server Handshake */
+    uint8_t chk[32], chiv[12], chhp[32];         /* client Handshake */
+    uint8_t sak[32], saiv[12], sahp[32];         /* server 1-RTT */
+    uint8_t cak[32], caiv[12], cahp[32];         /* client 1-RTT */
     static uint8_t sh_msg[512]; size_t sh_len = 0;
     uint8_t zeros[32]; memset(zeros, 0, 32);
     uint8_t empty_hash[32]; sha256_buf(NULL, 0, empty_hash);
@@ -611,7 +615,7 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
                 if (fin_sent) {
                     const uint8_t *pay; uint64_t pn;
                     long pl = quic_open_short(pk, avail, sizeof scid,
-                                              sak, saiv, sahp, &pay, &pn);
+                                              aead, sak, saiv, sahp, &pay, &pn);
                     if (pl > 0) {
                         int elicit = 0;
                         size_t fp = 0; struct quic_frame f;
@@ -741,8 +745,8 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
             if (type == 0x00) {
                 /* Server Initial. */
                 const uint8_t *pay; uint64_t pn; size_t consumed = 0;
-                long pl = quic_open_long(pk, avail, 1, sikey, siiv, sihp,
-                                         &pay, &pn, &consumed);
+                long pl = quic_open_long(pk, avail, 1, QUIC_AEAD_AES128GCM,
+                                         sikey, siiv, sihp, &pay, &pn, &consumed);
                 if (pl > 0) {
                     if (!have_scid) {
                         /* Adopt the server's SCID as our DCID from now on
@@ -784,7 +788,7 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
                 /* Server Handshake -- needs the handshake keys. */
                 if (sh_parsed) {
                     const uint8_t *pay; uint64_t pn;
-                    long pl = quic_open_long(pk, avail, 0, shk, shiv, shhp,
+                    long pl = quic_open_long(pk, avail, 0, aead, shk, shiv, shhp,
                                              &pay, &pn, NULL);
                     if (pl > 0) {
                         int elicit = 0;
@@ -834,9 +838,13 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
                             kprintf("[quicudp] ServerHello parse FAILED\n");
                             return HTTP_ERR_PROTOCOL;
                         }
-                        if (cipher != 0x1301) {
+                        if (cipher == 0x1301) {
+                            aead = QUIC_AEAD_AES128GCM; klen = 16; hplen = 16;
+                        } else if (cipher == 0x1303) {
+                            aead = QUIC_AEAD_CHACHA20;  klen = 32; hplen = 32;
+                        } else {
                             kprintf("[quicudp] server picked cipher 0x%04x "
-                                    "(only AES-128-GCM QUIC keys wired) -- "
+                                    "(only AES-128-GCM / ChaCha20 wired) -- "
                                     "aborting\n", cipher);
                             return HTTP_ERR_CONNECT;
                         }
@@ -860,14 +868,14 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
                         hkdf_extract(derived, 32, shared, 32, hs_secret);
                         derive_secret(hs_secret, "s hs traffic", 12, thash, s_hs);
                         derive_secret(hs_secret, "c hs traffic", 12, thash, c_hs);
-                        hkdf_expand_label(s_hs, "quic key", 8, NULL, 0, shk, 16);
+                        hkdf_expand_label(s_hs, "quic key", 8, NULL, 0, shk, klen);
                         hkdf_expand_label(s_hs, "quic iv",  7, NULL, 0, shiv, 12);
-                        hkdf_expand_label(s_hs, "quic hp",  7, NULL, 0, shhp, 16);
-                        hkdf_expand_label(c_hs, "quic key", 8, NULL, 0, chk, 16);
+                        hkdf_expand_label(s_hs, "quic hp",  7, NULL, 0, shhp, hplen);
+                        hkdf_expand_label(c_hs, "quic key", 8, NULL, 0, chk, klen);
                         hkdf_expand_label(c_hs, "quic iv",  7, NULL, 0, chiv, 12);
-                        hkdf_expand_label(c_hs, "quic hp",  7, NULL, 0, chhp, 16);
+                        hkdf_expand_label(c_hs, "quic hp",  7, NULL, 0, chhp, hplen);
                         kprintf("[quicudp] derived Handshake keys "
-                                "(server key ");
+                                "(suite=0x%04x, server key ", cipher);
                         for (int i = 0; i < 6; i++) kprintf("%02x", shk[i]);
                         kprintf(")\n");
                         sh_parsed = 1;
@@ -901,7 +909,7 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
                                         server_cid, server_cid_len,
                                         scid, sizeof scid,
                                         0, NULL, 0, next_hpn++, 4,
-                                        af, al, chk, chiv, chhp);
+                                        af, al, aead, chk, chiv, chhp);
             if (hl)
                 (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(port),
                                hpkt, hl);
@@ -935,7 +943,7 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
             size_t ql = quic_build_short(qpkt, sizeof qpkt,
                                          server_cid, server_cid_len,
                                          next_apn++, 4, fs, fl2,
-                                         cak, caiv, cahp);
+                                         aead, cak, caiv, cahp);
             if (!ql) {
                 kprintf("[quich3] request packet build failed\n");
                 return HTTP_ERR_PROTOCOL;
@@ -955,7 +963,7 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
             size_t apl = quic_build_short(apkt, sizeof apkt,
                                           server_cid, server_cid_len,
                                           next_apn++, 4, af, al,
-                                          cak, caiv, cahp);
+                                          aead, cak, caiv, cahp);
             if (apl)
                 (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(port),
                                apkt, apl);
@@ -1049,7 +1057,7 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
             size_t apl = quic_build_short(apkt2, sizeof apkt2,
                                           server_cid, server_cid_len,
                                           next_apn++, 4, af, al,
-                                          cak, caiv, cahp);
+                                          aead, cak, caiv, cahp);
             if (apl)
                 (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(port),
                                apkt2, apl);
@@ -1156,12 +1164,12 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
                 uint8_t c_ap[32], s_ap[32];
                 derive_secret(master, "c ap traffic", 12, thash_af, c_ap);
                 derive_secret(master, "s ap traffic", 12, thash_af, s_ap);
-                hkdf_expand_label(c_ap, "quic key", 8, NULL, 0, cak, 16);
+                hkdf_expand_label(c_ap, "quic key", 8, NULL, 0, cak, klen);
                 hkdf_expand_label(c_ap, "quic iv",  7, NULL, 0, caiv, 12);
-                hkdf_expand_label(c_ap, "quic hp",  7, NULL, 0, cahp, 16);
-                hkdf_expand_label(s_ap, "quic key", 8, NULL, 0, sak, 16);
+                hkdf_expand_label(c_ap, "quic hp",  7, NULL, 0, cahp, hplen);
+                hkdf_expand_label(s_ap, "quic key", 8, NULL, 0, sak, klen);
                 hkdf_expand_label(s_ap, "quic iv",  7, NULL, 0, saiv, 12);
-                hkdf_expand_label(s_ap, "quic hp",  7, NULL, 0, sahp, 16);
+                hkdf_expand_label(s_ap, "quic hp",  7, NULL, 0, sahp, hplen);
                 kprintf("[quicudp] 1-RTT keys installed (client app key ");
                 for (int i = 0; i < 6; i++) kprintf("%02x", cak[i]);
                 kprintf(")\n");
@@ -1184,7 +1192,7 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
                                                server_cid, server_cid_len,
                                                scid, sizeof scid,
                                                0, NULL, 0, next_hpn++, 4,
-                                               fr, frl, chk, chiv, chhp);
+                                               fr, frl, aead, chk, chiv, chhp);
                 if (!cplen) {
                     kprintf("[quicudp] client Finished build failed\n");
                     return HTTP_ERR_PROTOCOL;

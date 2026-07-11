@@ -75,8 +75,9 @@ size_t quic_frame_parse(const uint8_t *p, size_t cap, struct quic_frame *f);
 
 /* Build a protected long-header packet. type_bits selects the packet
  * type (0x00 Initial, 0x20 Handshake); an Initial carries a token
- * field, a Handshake does not (has_token). key/iv/hp are the keys for
- * this encryption level. Returns total protected bytes, or 0. */
+ * field, a Handshake does not (has_token). aead is QUIC_AEAD_*; key/hp
+ * are 16 bytes for AES, 32 for ChaCha20. Returns total protected
+ * bytes, or 0. */
 size_t quic_build_long(uint8_t *out, size_t cap, unsigned type_bits,
                        const uint8_t *dcid, size_t dcid_len,
                        const uint8_t *scid, size_t scid_len,
@@ -84,8 +85,8 @@ size_t quic_build_long(uint8_t *out, size_t cap, unsigned type_bits,
                        const uint8_t *token, size_t token_len,
                        uint64_t pkt_num, unsigned pn_len,
                        const uint8_t *payload, size_t payload_len,
-                       const uint8_t key[16], const uint8_t iv[12],
-                       const uint8_t hp[16]);
+                       int aead, const uint8_t *key, const uint8_t iv[12],
+                       const uint8_t *hp);
 
 /* Build a protected Initial packet into out (>= payload_len + 64).
  * key/iv/hp are the AES-128-GCM Initial keys for this side
@@ -109,8 +110,8 @@ size_t quic_build_initial(uint8_t *out, size_t cap,
  * can find the next coalesced packet in the same datagram. Returns -1
  * on a bad/undecryptable packet. */
 long quic_open_long(uint8_t *pkt, size_t len, int is_initial,
-                    const uint8_t key[16], const uint8_t iv[12],
-                    const uint8_t hp[16],
+                    int aead, const uint8_t *key, const uint8_t iv[12],
+                    const uint8_t *hp,
                     const uint8_t **out_payload, uint64_t *out_pn,
                     size_t *consumed);
 
@@ -130,8 +131,8 @@ size_t quic_build_short(uint8_t *out, size_t cap,
                         const uint8_t *dcid, size_t dcid_len,
                         uint64_t pkt_num, unsigned pn_len,
                         const uint8_t *payload, size_t payload_len,
-                        const uint8_t key[16], const uint8_t iv[12],
-                        const uint8_t hp[16]);
+                        int aead, const uint8_t *key, const uint8_t iv[12],
+                        const uint8_t *hp);
 
 /* Open a 1-RTT short-header packet in place. The short header has no
  * length field -- the packet extends to the end of the datagram, so it
@@ -140,8 +141,8 @@ size_t quic_build_short(uint8_t *out, size_t cap,
  * Small packet numbers are taken at face value (no reconstruction
  * window yet). Returns payload length, or -1. */
 long quic_open_short(uint8_t *pkt, size_t len, size_t dcid_len,
-                     const uint8_t key[16], const uint8_t iv[12],
-                     const uint8_t hp[16],
+                     int aead, const uint8_t *key, const uint8_t iv[12],
+                     const uint8_t *hp,
                      const uint8_t **out_payload, uint64_t *out_pn);
 
 /* ---- Retry packets (RFC 9000 s17.2.5) ---------------------------- */
@@ -161,7 +162,7 @@ int quic_parse_retry(const uint8_t *pkt, size_t len,
  * (via SHA-256) against the aioquic reference; then open it back and
  * verify the recovered payload + parsed CRYPTO frame. Prints
  * "[quicpkt] ..." and returns the PASS count. */
-#define QUIC_PACKET_SELFTEST_N 4
+#define QUIC_PACKET_SELFTEST_N 6
 int quic_packet_selftest(void);
 
 #endif /* TOBYOS_QUIC_PACKET_H */

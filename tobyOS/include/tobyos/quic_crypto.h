@@ -37,6 +37,14 @@ size_t quic_varint_encode(uint8_t *out, uint64_t v);
 void quic_initial_keys(const uint8_t *dcid, size_t dcid_len, int is_client,
                        uint8_t key[16], uint8_t iv[12], uint8_t hp[16]);
 
+/* ---- AEAD selection --------------------------------------------- */
+
+/* Which AEAD protects a packet. Initial is ALWAYS AES-128-GCM; the
+ * Handshake and 1-RTT levels use whichever suite the TLS handshake
+ * negotiated (0x1301 -> AES, 0x1303 -> ChaCha20). */
+#define QUIC_AEAD_AES128GCM  0
+#define QUIC_AEAD_CHACHA20   1
+
 /* ---- Header protection (RFC 9001 s5.4) -------------------------- */
 
 /* AES-based header-protection mask: mask = AES-ECB(hp_key, sample).
@@ -44,6 +52,13 @@ void quic_initial_keys(const uint8_t *dcid, size_t dcid_len, int is_client,
  * the packet number). Writes 5 bytes to mask. */
 void quic_hp_mask(const uint8_t hp[16], const uint8_t sample[16],
                   uint8_t mask[5]);
+
+/* ChaCha20-based header-protection mask (RFC 9001 s5.4.4): the first 4
+ * bytes of the sample are the ChaCha20 block counter and the remaining
+ * 12 the nonce; the mask is ChaCha20 applied to 5 zero bytes. hp is a
+ * 32-byte key. Writes 5 bytes to mask. */
+void quic_hp_mask_chacha(const uint8_t hp[32], const uint8_t sample[16],
+                         uint8_t mask[5]);
 
 /* ---- Packet protection AEAD (RFC 9001 s5.3, AES-128-GCM) --------- */
 

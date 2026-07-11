@@ -4,9 +4,38 @@
 
 #include <tobyos/quic_packet.h>
 #include <tobyos/quic_crypto.h>
+#include <tobyos/tls13.h>       /* tls_aead_* for the ChaCha20 path */
 #include <tobyos/sec.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
+
+/* ---- AEAD + header-protection dispatch (AES-128-GCM / ChaCha20) --- */
+
+static void pkt_seal(int aead, const uint8_t *key, const uint8_t nonce[12],
+                     const uint8_t *aad, size_t aad_len,
+                     uint8_t *payload, size_t len, uint8_t *tag) {
+    if (aead == QUIC_AEAD_CHACHA20)
+        tls_aead_encrypt(payload, tag, key, nonce, aad, aad_len, payload, len);
+    else
+        quic_aead_encrypt(key, nonce, aad, aad_len, payload, len, tag);
+}
+
+static int pkt_open(int aead, const uint8_t *key, const uint8_t nonce[12],
+                    const uint8_t *aad, size_t aad_len,
+                    uint8_t *payload, size_t len, const uint8_t *tag) {
+    if (aead == QUIC_AEAD_CHACHA20)
+        return tls_aead_decrypt(payload, tag, key, nonce, aad, aad_len,
+                                payload, len);
+    return quic_aead_decrypt(key, nonce, aad, aad_len, payload, len, tag);
+}
+
+static void pkt_hp(int aead, const uint8_t *hp, const uint8_t sample[16],
+                   uint8_t mask[5]) {
+    if (aead == QUIC_AEAD_CHACHA20)
+        quic_hp_mask_chacha(hp, sample, mask);
+    else
+        quic_hp_mask(hp, sample, mask);
+}
 
 /* ---- Frames ----------------------------------------------------- */
 
@@ -175,8 +204,8 @@ size_t quic_build_long(uint8_t *out, size_t cap, unsigned type_bits,
                        const uint8_t *token, size_t token_len,
                        uint64_t pkt_num, unsigned pn_len,
                        const uint8_t *payload, size_t payload_len,
-                       const uint8_t key[16], const uint8_t iv[12],
-                       const uint8_t hp[16]) {
+                       int aead, const uint8_t *key, const uint8_t iv[12],
+                       const uint8_t *hp) {
     if (pn_len < 1 || pn_len > 4) return 0;
     size_t p = 0;
     /* First byte: long(0x80) + fixed(0x40) + type_bits + pn_len-1. */
@@ -220,13 +249,13 @@ size_t quic_build_long(uint8_t *out, size_t cap, unsigned type_bits,
     /* Packet protection: AEAD over header (AAD) + payload, tag after. */
     uint8_t nonce[12];
     quic_packet_nonce(iv, pkt_num, nonce);
-    quic_aead_encrypt(key, nonce, out, header_len,
-                      out + header_len, payload_len, out + header_len + payload_len);
+    pkt_seal(aead, key, nonce, out, header_len,
+             out + header_len, payload_len, out + header_len + payload_len);
     size_t total = header_len + payload_len + 16;
 
     /* Header protection: sample 16 bytes at pn_off + 4. */
     uint8_t mask[5];
-    quic_hp_mask(hp, out + pn_off + 4, mask);
+    pkt_hp(aead, hp, out + pn_off + 4, mask);
     out[0] ^= mask[0] & 0x0f;              /* long header: low 4 bits */
     for (unsigned i = 0; i < pn_len; i++)
         out[pn_off + i] ^= mask[1 + i];
@@ -241,14 +270,16 @@ size_t quic_build_initial(uint8_t *out, size_t cap,
                           const uint8_t *payload, size_t payload_len,
                           const uint8_t key[16], const uint8_t iv[12],
                           const uint8_t hp[16]) {
+    /* Initial packets are always AES-128-GCM (RFC 9001 s5.2). */
     return quic_build_long(out, cap, 0x00, dcid, dcid_len, scid, scid_len,
                            1, token, token_len, pkt_num, pn_len,
-                           payload, payload_len, key, iv, hp);
+                           payload, payload_len, QUIC_AEAD_AES128GCM,
+                           key, iv, hp);
 }
 
 long quic_open_long(uint8_t *pkt, size_t len, int is_initial,
-                    const uint8_t key[16], const uint8_t iv[12],
-                    const uint8_t hp[16],
+                    int aead, const uint8_t *key, const uint8_t iv[12],
+                    const uint8_t *hp,
                     const uint8_t **out_payload, uint64_t *out_pn,
                     size_t *consumed) {
     if (len < 7 || (pkt[0] & 0xc0) != 0xc0) return -1;   /* long header */
@@ -268,7 +299,7 @@ long quic_open_long(uint8_t *pkt, size_t len, int is_initial,
 
     /* Remove header protection using the sample at pn_off + 4. */
     uint8_t mask[5];
-    quic_hp_mask(hp, pkt + pn_off + 4, mask);
+    pkt_hp(aead, hp, pkt + pn_off + 4, mask);
     uint8_t first = pkt[0] ^ (mask[0] & 0x0f);
     unsigned pn_len = (first & 0x03) + 1;
     uint64_t pn = 0;
@@ -286,9 +317,9 @@ long quic_open_long(uint8_t *pkt, size_t len, int is_initial,
 
     uint8_t nonce[12];
     quic_packet_nonce(iv, pn, nonce);
-    if (quic_aead_decrypt(key, nonce, pkt, header_len,
-                          pkt + header_len, body,
-                          pkt + header_len + body) != 0)
+    if (pkt_open(aead, key, nonce, pkt, header_len,
+                 pkt + header_len, body,
+                 pkt + header_len + body) != 0)
         return -1;
     if (out_payload) *out_payload = pkt + header_len;
     if (out_pn) *out_pn = pn;
@@ -300,7 +331,8 @@ long quic_open_initial(uint8_t *pkt, size_t len,
                        const uint8_t key[16], const uint8_t iv[12],
                        const uint8_t hp[16],
                        const uint8_t **out_payload, uint64_t *out_pn) {
-    return quic_open_long(pkt, len, 1, key, iv, hp, out_payload, out_pn, NULL);
+    return quic_open_long(pkt, len, 1, QUIC_AEAD_AES128GCM, key, iv, hp,
+                          out_payload, out_pn, NULL);
 }
 
 /* ---- Short-header (1-RTT) packets -------------------------------- */
@@ -309,8 +341,8 @@ size_t quic_build_short(uint8_t *out, size_t cap,
                         const uint8_t *dcid, size_t dcid_len,
                         uint64_t pkt_num, unsigned pn_len,
                         const uint8_t *payload, size_t payload_len,
-                        const uint8_t key[16], const uint8_t iv[12],
-                        const uint8_t hp[16]) {
+                        int aead, const uint8_t *key, const uint8_t iv[12],
+                        const uint8_t *hp) {
     if (pn_len < 1 || pn_len > 4) return 0;
     size_t p = 0;
     /* Flags: fixed(0x40) + spin 0 + key phase 0 + pn_len-1. */
@@ -325,8 +357,8 @@ size_t quic_build_short(uint8_t *out, size_t cap,
 
     uint8_t nonce[12];
     quic_packet_nonce(iv, pkt_num, nonce);
-    quic_aead_encrypt(key, nonce, out, header_len,
-                      out + header_len, payload_len, out + header_len + payload_len);
+    pkt_seal(aead, key, nonce, out, header_len,
+             out + header_len, payload_len, out + header_len + payload_len);
     size_t total = header_len + payload_len + 16;
 
     /* The HP sample needs pn_off + 4 + 16 <= total; a 1-RTT packet
@@ -334,7 +366,7 @@ size_t quic_build_short(uint8_t *out, size_t cap,
      * payloads here are >= 4 bytes with pn_len 4, so total works). */
     if (pn_off + 4 + 16 > total) return 0;
     uint8_t mask[5];
-    quic_hp_mask(hp, out + pn_off + 4, mask);
+    pkt_hp(aead, hp, out + pn_off + 4, mask);
     out[0] ^= mask[0] & 0x1f;              /* short header: low 5 bits */
     for (unsigned i = 0; i < pn_len; i++)
         out[pn_off + i] ^= mask[1 + i];
@@ -342,15 +374,15 @@ size_t quic_build_short(uint8_t *out, size_t cap,
 }
 
 long quic_open_short(uint8_t *pkt, size_t len, size_t dcid_len,
-                     const uint8_t key[16], const uint8_t iv[12],
-                     const uint8_t hp[16],
+                     int aead, const uint8_t *key, const uint8_t iv[12],
+                     const uint8_t *hp,
                      const uint8_t **out_payload, uint64_t *out_pn) {
     if (len < 1 + dcid_len + 4 + 16 + 4) return -1;
     if (pkt[0] & 0x80) return -1;          /* not a short header */
     size_t pn_off = 1 + dcid_len;
 
     uint8_t mask[5];
-    quic_hp_mask(hp, pkt + pn_off + 4, mask);
+    pkt_hp(aead, hp, pkt + pn_off + 4, mask);
     uint8_t first = pkt[0] ^ (mask[0] & 0x1f);
     unsigned pn_len = (first & 0x03) + 1;
     uint64_t pn = 0;
@@ -367,9 +399,9 @@ long quic_open_short(uint8_t *pkt, size_t len, size_t dcid_len,
 
     uint8_t nonce[12];
     quic_packet_nonce(iv, pn, nonce);
-    if (quic_aead_decrypt(key, nonce, pkt, header_len,
-                          pkt + header_len, body,
-                          pkt + header_len + body) != 0)
+    if (pkt_open(aead, key, nonce, pkt, header_len,
+                 pkt + header_len, body,
+                 pkt + header_len + body) != 0)
         return -1;
     if (out_payload) *out_payload = pkt + header_len;
     if (out_pn) *out_pn = pn;
@@ -445,6 +477,45 @@ int quic_packet_selftest(void) {
                     f.len == 32 && memcmp(f.data, data, 32) == 0);
     kprintf("[quicpkt] CRYPTO frame parse        %s\n", frame_ok ? "OK" : "FAIL");
     pass += frame_ok;
+
+    /* ChaCha20 1-RTT short-header packet vs the Python `cryptography`
+     * reference (ChaCha20-Poly1305 body + ChaCha20 header protection).
+     * Fixed key/iv/hp/dcid/pn/payload; the whole protected packet's
+     * SHA-256 must match, then it must round-trip through open. */
+    {
+        uint8_t cckey[32], cciv[12], cchp[32], ccdcid[8];
+        for (int i = 0; i < 32; i++) cckey[i] = (uint8_t)(i + 1);
+        for (int i = 0; i < 12; i++) cciv[i]  = (uint8_t)(0xa0 + i);
+        for (int i = 0; i < 32; i++) cchp[i]  = (uint8_t)(0x40 + i);
+        static const uint8_t d0[8] =
+            { 0xde,0xad,0xbe,0xef,0x01,0x02,0x03,0x04 };
+        memcpy(ccdcid, d0, 8);
+        uint8_t ccpl[20];
+        for (int i = 0; i < 20; i++) ccpl[i] = (uint8_t)(0x30 + i);
+
+        uint8_t cpkt[128];
+        size_t cclen = quic_build_short(cpkt, sizeof cpkt, ccdcid, 8, 10, 4,
+                                        ccpl, sizeof ccpl,
+                                        QUIC_AEAD_CHACHA20, cckey, cciv, cchp);
+        static const uint8_t cc_sha[32] = {
+            0xa4,0x1f,0x9f,0xe7,0xe3,0x64,0x20,0x7f,0x5a,0x3c,0x9d,0x4f,0x37,0x58,0xe1,0x01,
+            0xbf,0xb7,0x1f,0x02,0xde,0x97,0xbc,0x29,0x0e,0x6b,0xb3,0xe3,0x6e,0x42,0x45,0x66 };
+        uint8_t ccgot[32];
+        sha256_buf(cpkt, cclen, ccgot);
+        int cc_build_ok = (cclen == 49 && memcmp(ccgot, cc_sha, 32) == 0);
+        kprintf("[quicpkt] ChaCha20 short == cryptography %s\n",
+                cc_build_ok ? "OK" : "FAIL");
+        pass += cc_build_ok;
+
+        const uint8_t *cpay; uint64_t cpn;
+        long ccrl = quic_open_short(cpkt, cclen, 8, QUIC_AEAD_CHACHA20,
+                                    cckey, cciv, cchp, &cpay, &cpn);
+        int cc_open_ok = (ccrl == 20 && cpn == 10 &&
+                          memcmp(cpay, ccpl, 20) == 0);
+        kprintf("[quicpkt] ChaCha20 short open round-trip %s\n",
+                cc_open_ok ? "OK" : "FAIL");
+        pass += cc_open_ok;
+    }
 
     kprintf("[quicpkt] packet self-test: %d/%d %s\n", pass, QUIC_PACKET_SELFTEST_N,
             pass == QUIC_PACKET_SELFTEST_N ? "ALL PASS" : "FAILURES");
