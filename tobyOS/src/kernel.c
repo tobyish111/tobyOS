@@ -4291,6 +4291,30 @@ void _start(void) {
 #ifdef POSIX_SHELL_SELFTEST
         posix_shell_selftest();
 #endif
+#ifdef OPENH264_SELFTEST
+        /* media slice 2: spawn /bin/oh264test, which decodes an embedded
+         * High-profile H.264 clip through the vendored openh264 decoder
+         * and checks each frame's YUV checksum against ffmpeg's
+         * reference. stdout ([oh264] markers) is on serial; exit 0 =
+         * ALL PASS. This is the first program to pull openh264 out of
+         * libtoby.a, so it also proves the decoder links. */
+        {
+            char *ohv[] = { (char *)"oh264test", 0 };
+            char *ohe[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec ohs = { .path = "/bin/oh264test",
+                .name = "oh264test", .argc = 1, .argv = ohv,
+                .envc = 1, .envp = ohe };
+            int ohpid = proc_spawn(&ohs);
+            if (ohpid < 0) {
+                kprintf("[boot] OPENH264: /bin/oh264test not spawned (rc=%d)\n",
+                        ohpid);
+            } else {
+                int ohrc = proc_wait(ohpid);
+                kprintf("[boot] OPENH264: oh264test (pid=%d) exit=%d (%s)\n",
+                        ohpid, ohrc, ohrc == 0 ? "PASS" : "FAIL");
+            }
+        }
+#endif
 #ifndef QUICK_BOOT
         /* Milestone 25C: drive the shell over a few synthetic command
          * lines BEFORE the idle loop starts polling the keyboard. This

@@ -43,6 +43,8 @@ extern int errno;
 #define EAGAIN          11
 #define ESRCH            3
 #define EDEADLK         35
+#define EBUSY           16
+#define ETIMEDOUT      110
 
 /* GNU-flavoured strerror_r returns the message pointer. */
 const char *strerror(int err);

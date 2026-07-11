@@ -390,6 +390,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_gui_widgets/user_gui_widgets.elf \
             programs/user_gui_about/user_gui_about.elf \
             programs/user_cpptest/user_cpptest.elf \
+            programs/user_oh264test/user_oh264test.elf \
             programs/user_gui_term/user_gui_term.elf \
             programs/user_gui_files/user_gui_files.elf \
             programs/user_gui_viewer/user_gui_viewer.elf \
@@ -1021,18 +1022,18 @@ $(H264BSD_DIR)/%.pic.o: $(H264BSD_DIR)/%.c Makefile
 
 # High-profile H.264 decode (stage 13 media): the vendored openh264
 # decoder (Cisco, BSD-2), C++ built freestanding via the cpp-runtime.
-# Single-threaded decode subset -- the 4 multi-threaded files are
-# excluded (they carry a global ctor + are unused at threadCount 0);
-# threading/OS gaps are filled by third_party/openh264/shim. Archive
-# semantics mean a program that never calls the H.264 decoder does not
-# pull these objects, so this is inert until video_decode.c routes to
-# it. -w: vendored reference code.
+# Single-threaded decode -- only WelsThreadPool + WelsTaskThread are
+# excluded (the pool carries a global ctor and both are used only at
+# threadCount > 1); WelsThread + wels_decoder_thread stay in because the
+# decode core references their Sem*/Event*/GetCPUCount helpers even
+# single-threaded. Threading/OS gaps are filled by
+# third_party/openh264/shim. Archive semantics mean a program that never
+# calls the H.264 decoder does not pull these objects, so this is inert
+# until video_decode.c routes to it. -w: vendored reference code.
 OPENH264_DIR  := third_party/openh264
 OPENH264_SRCS := $(filter-out \
     $(OPENH264_DIR)/common/src/WelsThreadPool.cpp \
-    $(OPENH264_DIR)/common/src/WelsTaskThread.cpp \
-    $(OPENH264_DIR)/common/src/WelsThread.cpp \
-    $(OPENH264_DIR)/decoder/core/src/wels_decoder_thread.cpp, \
+    $(OPENH264_DIR)/common/src/WelsTaskThread.cpp, \
     $(wildcard $(OPENH264_DIR)/common/src/*.cpp) \
     $(wildcard $(OPENH264_DIR)/decoder/core/src/*.cpp) \
     $(wildcard $(OPENH264_DIR)/decoder/plus/src/*.cpp))
@@ -1243,6 +1244,22 @@ programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
 endef
 
 $(eval $(call LIBTOBY_CPP_PROGRAM_RULES,user_cpptest,user_cpptest))
+
+# /bin/oh264test (media slice 2): C++ decode-correctness test that links
+# the vendored openh264 ISVCDecoder out of libtoby.a. Same C++ program
+# shape as cpptest, plus the openh264 public API include for codec_api.h.
+programs/user_oh264test/user_oh264test.o: programs/user_oh264test/main.cpp \
+                                          programs/user_oh264test/oh264_clip.h \
+                                          $(LIBTOBY_AR)
+	$(CXX) $(filter-out -std=c11,$(LIBTOBY_CFLAGS)) \
+	      -I third_party/openh264/api -std=c++17 -fno-exceptions -fno-rtti \
+	      -nostdinc++ -c $< -o $@
+
+programs/user_oh264test/user_oh264test.elf: programs/user_oh264test/user_oh264test.o \
+                                            $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                                            programs/user_oh264test/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_oh264test/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/user_oh264test/user_oh264test.o $(LIBTOBY_AR)
 
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_hello,c_hello))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_args,c_args))
@@ -2271,6 +2288,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_gui_widgets/user_gui_widgets.elf $(INITRD_STAGE)/bin/gui_widgets
 	cp programs/user_gui_about/user_gui_about.elf     $(INITRD_STAGE)/bin/gui_about
 	cp programs/user_cpptest/user_cpptest.elf         $(INITRD_STAGE)/bin/cpptest
+	cp programs/user_oh264test/user_oh264test.elf     $(INITRD_STAGE)/bin/oh264test
 	cp programs/user_gui_term/user_gui_term.elf       $(INITRD_STAGE)/bin/gui_term
 	cp programs/user_gui_files/user_gui_files.elf     $(INITRD_STAGE)/bin/gui_files
 	cp programs/user_gui_viewer/user_gui_viewer.elf   $(INITRD_STAGE)/bin/gui_viewer
@@ -2717,7 +2735,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
-	    bin/cpptest                                                                 \
+	    bin/cpptest bin/oh264test                                                   \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
 	    bin/gui_calc bin/gui_taskmgr bin/gui_edit bin/gui_browser         \
 	    bin/login bin/gui_settings bin/abi_test                           \
