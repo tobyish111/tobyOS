@@ -1019,6 +1019,36 @@ $(H264BSD_DIR)/%.o: $(H264BSD_DIR)/%.c Makefile
 $(H264BSD_DIR)/%.pic.o: $(H264BSD_DIR)/%.c Makefile
 	$(CC) $(LIBTOBY_PIC_CFLAGS) -I $(H264BSD_DIR) -w -c $< -o $@
 
+# High-profile H.264 decode (stage 13 media): the vendored openh264
+# decoder (Cisco, BSD-2), C++ built freestanding via the cpp-runtime.
+# Single-threaded decode subset -- the 4 multi-threaded files are
+# excluded (they carry a global ctor + are unused at threadCount 0);
+# threading/OS gaps are filled by third_party/openh264/shim. Archive
+# semantics mean a program that never calls the H.264 decoder does not
+# pull these objects, so this is inert until video_decode.c routes to
+# it. -w: vendored reference code.
+OPENH264_DIR  := third_party/openh264
+OPENH264_SRCS := $(filter-out \
+    $(OPENH264_DIR)/common/src/WelsThreadPool.cpp \
+    $(OPENH264_DIR)/common/src/WelsTaskThread.cpp \
+    $(OPENH264_DIR)/common/src/WelsThread.cpp \
+    $(OPENH264_DIR)/decoder/core/src/wels_decoder_thread.cpp, \
+    $(wildcard $(OPENH264_DIR)/common/src/*.cpp) \
+    $(wildcard $(OPENH264_DIR)/decoder/core/src/*.cpp) \
+    $(wildcard $(OPENH264_DIR)/decoder/plus/src/*.cpp))
+OPENH264_OBJS     := $(OPENH264_SRCS:.cpp=.o)
+OPENH264_PIC_OBJS := $(OPENH264_SRCS:.cpp=.pic.o)
+OPENH264_INC := -I $(OPENH264_DIR)/shim -I $(OPENH264_DIR)/api \
+    -I $(OPENH264_DIR)/common/inc -I $(OPENH264_DIR)/decoder/core/inc \
+    -I $(OPENH264_DIR)/decoder/plus/inc
+LIBTOBY_OBJS += $(OPENH264_OBJS)
+
+$(OPENH264_DIR)/%.o: $(OPENH264_DIR)/%.cpp Makefile
+	$(CXX) $(OPENH264_INC) $(LIBTOBY_CXXFLAGS) -msse -msse2 -w -c $< -o $@
+
+$(OPENH264_DIR)/%.pic.o: $(OPENH264_DIR)/%.cpp Makefile
+	$(CXX) $(OPENH264_INC) $(LIBTOBY_CXXFLAGS) -fPIC -msse -msse2 -w -c $< -o $@
+
 $(LIBTOBY_CRT0): $(LIBTOBY_SRC)/crt0.S
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -1059,6 +1089,7 @@ LIBTOBY_ASM_PIC_OBJS := $(LIBTOBY_ASM_SRCS:.S=.pic.o)
 LIBTOBY_PIC_OBJS    += $(LIBTOBY_ASM_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBWEBP_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(H264BSD_PIC_OBJS)
+LIBTOBY_PIC_OBJS    += $(OPENH264_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBTOBY_SRC)/cxxrt.pic.o
 LIBTOBY_PIC_CFLAGS  := $(LIBTOBY_BUILD_CFLAGS) -fPIC
 
