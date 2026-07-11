@@ -108,6 +108,12 @@ struct http_response {
                                 * the response framing allows it. Off =>
                                 * HTTP/1.0 + Connection: close (the exact
                                 * wget/pkg download contract). */
+#define HTTP_F_TRY_H3    0x8u  /* for https, probe HTTP/3 (QUIC) first;
+                                * on any h3 failure fall back to the
+                                * h2/h1.1 ladder (GET is idempotent). Off
+                                * => never attempt QUIC. v1 h3 caps the
+                                * response at 256 KiB and speaks
+                                * AES-128-GCM only, so this is an opt-in. */
 
 /* Parse a URL string into `out`. Accepts:
  *   http://host

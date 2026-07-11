@@ -41,6 +41,7 @@
 #include <tobyos/puff.h>
 #include <tobyos/brotli.h>
 #include <tobyos/http2.h>
+#include <tobyos/quic_conn.h>   /* http3_fetch (slice 5b HTTP/3 probe) */
 #include <tobyos/pit.h>
 
 /* Transport abstraction: either raw TCP or TLS-wrapped TCP. */
@@ -900,6 +901,7 @@ int http_get_opt(const char *url,
     size_t buf_used = 0, header_end = 0;
     bool   peer_fin = false;
     int    force_h1 = 0;               /* set after an h2 fetch falls back */
+    int    tried_h3 = 0;              /* set after the one-shot h3 probe */
 
     for (int attempt = 0; ; attempt++) {
         buf_used = 0; header_end = 0; peer_fin = false;
@@ -924,6 +926,25 @@ int http_get_opt(const char *url,
                 uint8_t *ip = (uint8_t *)&ip_be;
                 kprintf("[http] %s -> %u.%u.%u.%u:%u%s\n",
                         u.host, ip[0], ip[1], ip[2], ip[3], u.port, u.path);
+            }
+            /* stage 13 slice 5b: for https, probe HTTP/3 first when the
+             * caller opts in (HTTP_F_TRY_H3). http3_fetch runs the whole
+             * QUIC handshake + GET; on ANY failure fall through to the
+             * proven TLS h2/h1.1 ladder (GET is idempotent), so h3 can
+             * never regress a fetch. Only on a fresh attempt (not a
+             * keep-alive reuse, not after an h2->h1 downgrade). */
+            if (u.tls && (flags & HTTP_F_TRY_H3) && !force_h1 && !tried_h3) {
+                tried_h3 = 1;
+                int h3rc = http3_fetch(ip_be, u.port, u.host, u.path, flags,
+                                       read_cap, timeout_ms, out);
+                if (h3rc == 0) { kfree(buf); return 0; }
+                kprintf("[http] h3 fetch failed (%d) -- falling back to "
+                        "h2/h1.1\n", h3rc);
+                /* a definitive cert failure is not transient: surface it
+                 * rather than retrying the same cert over TCP. */
+                if (h3rc == HTTP_ERR_CERT) { kfree(buf); return HTTP_ERR_CERT; }
+                memset(out, 0, sizeof *out);
+                out->content_len = -1;
             }
             if (u.tls) {
                 int tls_err;

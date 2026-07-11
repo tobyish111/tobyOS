@@ -136,7 +136,8 @@ static size_t qp_put_hdr(uint8_t *out, size_t cap,
 }
 
 size_t h3_qpack_encode_request(uint8_t *out, size_t cap,
-                               const char *authority, const char *path) {
+                               const char *authority, const char *path,
+                               int want_gzip) {
     if (cap < 8) return 0;
     /* Encoded field section prefix: Required Insert Count 0 (no
      * dynamic table) + Base 0. */
@@ -150,6 +151,13 @@ size_t h3_qpack_encode_request(uint8_t *out, size_t cap,
     o += c;
     if (!(c = qp_put_hdr(out + o, cap - o, ":authority", authority))) return 0;
     o += c;
+    if (!(c = qp_put_hdr(out + o, cap - o, "user-agent", "tobyOS"))) return 0;
+    o += c;
+    if (want_gzip) {
+        if (!(c = qp_put_hdr(out + o, cap - o, "accept-encoding", "gzip, br")))
+            return 0;
+        o += c;
+    }
     return o;
 }
 
@@ -261,7 +269,7 @@ int h3_selftest(void) {
     /* 2: encode a request section; sanity + hex dump for offline
      * pylsqpack validation (the 4a pattern). */
     uint8_t req[256];
-    size_t rl = h3_qpack_encode_request(req, sizeof req, "tobyos.test", "/");
+    size_t rl = h3_qpack_encode_request(req, sizeof req, "tobyos.test", "/", 0);
     int enc_ok = (rl > 4 && req[0] == 0 && req[1] == 0);
     kprintf("[h3] QPACK request encode           %s (%u bytes)\n",
             enc_ok ? "OK" : "FAIL", (unsigned)rl);

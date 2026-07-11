@@ -16,6 +16,8 @@
 #include <tobyos/sec.h>         /* sha256 transcript */
 #include <tobyos/tls_x509.h>    /* shared cert chain + CertificateVerify (4f) */
 #include <tobyos/http3.h>       /* H3 frames + QPACK (slice 5) */
+#include <tobyos/http.h>        /* http_response + HTTP_ERR/HTTP_F flags (slice 5b) */
+#include <tobyos/heap.h>        /* kmalloc/kfree for the response body (5b) */
 
 #include "monocypher.h"
 #include <bearssl.h>            /* br_x509_pkey for cert auth */
@@ -426,33 +428,74 @@ static size_t build_initial_1200(uint8_t *out, size_t cap,
                               key, iv, hp);
 }
 
-/* ---- HTTP/3 response headers (slice 5) ---------------------------- */
+/* ---- HTTP/3 response headers -> http_response (slices 5 + 5b) ------ */
 
-struct h3_resp_info { int status; int nhdr; };
+static void cpy_field(char *dst, size_t cap, const char *src) {
+    size_t i = 0;
+    for (; src[i] && i + 1 < cap; i++) dst[i] = src[i];
+    dst[i] = 0;
+}
 
-static void h3_hdr_print(void *ud, const char *name, const char *value) {
-    struct h3_resp_info *ri = ud;
-    ri->nhdr++;
+struct h3_resp_build { struct http_response *out; int status_seen; int nhdr; };
+
+static void h3_hdr_to_resp(void *ud, const char *name, const char *value) {
+    struct h3_resp_build *b = ud;
+    struct http_response *o = b->out;
+    b->nhdr++;
     if (strcmp(name, ":status") == 0) {
-        ri->status = 0;
+        int s = 0;
         for (const char *c = value; *c >= '0' && *c <= '9'; c++)
-            ri->status = ri->status * 10 + (*c - '0');
+            s = s * 10 + (*c - '0');
+        o->status = s;
+        b->status_seen = 1;
+    } else if (strcmp(name, "content-type") == 0) {
+        cpy_field(o->content_type, sizeof o->content_type, value);
+    } else if (strcmp(name, "location") == 0) {
+        cpy_field(o->location, sizeof o->location, value);
+    } else if (strcmp(name, "content-length") == 0) {
+        long n = 0; int any = 0;
+        for (const char *c = value; *c >= '0' && *c <= '9'; c++) {
+            n = n * 10 + (*c - '0'); any = 1;
+        }
+        if (any) o->content_len = n;
+    } else if (strcmp(name, "content-encoding") == 0) {
+        if (strcmp(value, "gzip") == 0)      o->encoding = HTTP_ENC_GZIP;
+        else if (strcmp(value, "br") == 0)   o->encoding = HTTP_ENC_BR;
     }
     kprintf("[quich3]   %s: %s\n", name, value);
 }
 
-/* ---- On-the-wire handshake test (slices 4b..4h) ------------------ *
- * A live QUIC client handshake against a REAL server at
- * 10.0.2.2:4433 (SLIRP host): send the Initial (padded to 1200),
- * process the server's datagrams (coalesced packets, Version
- * Negotiation, Retry with integrity check, CRYPTO reassembly across
- * packets), ACK at every encryption level, REQUIRE certificate chain +
- * CertificateVerify to pass (the 13H path -- a live server presents a
- * cert chaining to a trusted root), verify the server Finished, send
- * the client Finished, and confirm completion by decrypting the
- * server's 1-RTT HANDSHAKE_DONE (which it only sends after verifying
- * OUR Finished). Called from boot under -DQUIC_SEND_TEST. */
-int quic_udp_send_test(void) {
+/* Response-stream reassembly cap: matches the initial_max_stream_data
+ * we advertise (262144), so flow control never blocks inside it. A
+ * larger response returns HTTP_ERR_TOOBIG -> the http.c ladder falls
+ * back to h2/h1.1. */
+#define H3_RESP_MAX 262144u
+
+/* ---- http3_fetch: a reusable HTTP/3 GET transport (slices 4b..5b) - *
+ * Run a full QUIC v1 handshake to `ip_be`:`port` (network-order IP),
+ * then GET `path` as HTTP/3 and fill `out`. The handshake processes
+ * the server's datagrams (coalesced packets, Version Negotiation,
+ * Retry with integrity check, CRYPTO reassembly across packets), ACKs
+ * at every encryption level, REQUIRES the certificate chain +
+ * CertificateVerify to validate against `host` (the 13H path over
+ * QUIC), verifies the server Finished, sends the client Finished, and
+ * -- once the server's HANDSHAKE_DONE lands -- opens the request
+ * (bidi stream 0: QPACK HEADERS, FIN) and reassembles the response
+ * stream into `out` (status / content-type / content-length /
+ * content-encoding / body). Returns 0 on success, a negative
+ * HTTP_ERR_* otherwise. Synchronous, one fetch at a time (fixed UDP
+ * source port). AES-128-GCM only; a ChaCha20 server is refused at
+ * ServerHello. */
+int http3_fetch(uint32_t ip_be, uint16_t port, const char *host,
+                const char *path, unsigned flags, size_t max_body,
+                uint32_t timeout_ms, struct http_response *out) {
+    if (!host) host = "";
+    if (!path || !*path) path = "/";
+    if (out) { memset(out, 0, sizeof *out); out->content_len = -1; }
+    if (max_body == 0 || max_body > H3_RESP_MAX) max_body = H3_RESP_MAX;
+    if (timeout_ms == 0) timeout_ms = 15000;
+    int want_gzip = (flags & HTTP_F_GZIP) != 0;
+
     /* --- connection identity --- */
     uint8_t odcid[8], scid[8], priv[32], rnd[32], pub[32];
     rng_fill(odcid, sizeof odcid);
@@ -463,8 +506,8 @@ int quic_udp_send_test(void) {
 
     static uint8_t ch[512];
     size_t chl = quic_build_client_hello(ch, sizeof ch, rnd, pub,
-                                         scid, sizeof scid, "tobyos.test");
-    if (!chl) { kprintf("[quicudp] ClientHello build failed\n"); return -1; }
+                                         scid, sizeof scid, host);
+    if (!chl) { kprintf("[quich3] ClientHello build failed\n"); return HTTP_ERR_CONNECT; }
 
     /* --- connection state --- */
     uint8_t key_dcid[20]; size_t key_dcid_len = sizeof odcid;
@@ -500,7 +543,7 @@ int quic_udp_send_test(void) {
      * stream (1-RTT stream 0, reassembled the same way) */
     static uint8_t ibuf[1024],  ibits[1024 / 8];
     static uint8_t hbuf[8192],  hbits[8192 / 8];
-    static uint8_t s0buf[8192], s0bits[8192 / 8];
+    static uint8_t s0buf[H3_RESP_MAX], s0bits[H3_RESP_MAX / 8];
     memset(ibits, 0, sizeof ibits); memset(hbits, 0, sizeof hbits);
     memset(s0bits, 0, sizeof s0bits);
     struct qrsm irsm = { ibuf, ibits, sizeof ibuf };
@@ -509,28 +552,31 @@ int quic_udp_send_test(void) {
 
     g_qq_head = g_qq_tail = 0;
 
-    uint8_t ipb[4] = { 10, 0, 2, 2 };
-    uint32_t dst_ip; memcpy(&dst_ip, ipb, 4);    /* network order */
+    uint32_t dst_ip = ip_be;                     /* network order */
 
     /* --- send the client Initial (CRYPTO(ClientHello), padded 1200) --- */
-    static uint8_t out[1500];
+    static uint8_t pktbuf[1500];
     static uint8_t frames[1400];
     size_t fl = quic_frame_crypto(frames, sizeof frames, 0, ch, chl);
-    size_t plen = build_initial_1200(out, sizeof out, key_dcid, key_dcid_len,
+    size_t plen = build_initial_1200(pktbuf, sizeof pktbuf, key_dcid, key_dcid_len,
                                      server_cid, server_cid_len,
                                      scid, sizeof scid, NULL, 0,
                                      next_ipn++, frames, fl);
-    if (!plen) { kprintf("[quicudp] Initial build failed\n"); return -1; }
-    bool ok = udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433), out, plen);
-    kprintf("[quicudp] sent Initial %u bytes to 10.0.2.2:4433 (dcid=",
-            (unsigned)plen);
-    for (size_t i = 0; i < key_dcid_len; i++) kprintf("%02x", key_dcid[i]);
-    kprintf(") %s\n", ok ? "OK" : "SEND-FAIL");
-    if (!ok) return -1;
+    if (!plen) { kprintf("[quich3] Initial build failed\n"); return HTTP_ERR_CONNECT; }
+    bool ok = udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(port), pktbuf, plen);
+    {
+        uint8_t *ipp = (uint8_t *)&ip_be;
+        kprintf("[quich3] QUIC connect %u.%u.%u.%u:%u (host %s) -- sent Initial "
+                "%u bytes %s\n", ipp[0], ipp[1], ipp[2], ipp[3], port, host,
+                (unsigned)plen, ok ? "OK" : "SEND-FAIL");
+    }
+    if (!ok) return HTTP_ERR_CONNECT;
 
     /* --- receive loop --- */
     uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
-    uint64_t deadline = pit_ticks() + hz * 15;
+    uint64_t tmo_ticks = (uint64_t)hz * timeout_ms / 1000;
+    if (tmo_ticks < hz) tmo_ticks = hz;
+    uint64_t deadline = pit_ticks() + tmo_ticks;
     struct net_dev *nd = net_default();
     static uint8_t dg[QRX_MAX];
 
@@ -592,7 +638,7 @@ int quic_udp_send_test(void) {
                                 kprintf("[quicudp] CONNECTION_CLOSE err=%u "
                                         "reason='%s' -- aborting\n",
                                         (unsigned)f.err_code, rsn);
-                                return -1;
+                                return HTTP_ERR_RESET;
                             }
                             case QUIC_FRAME_ACK:
                             case QUIC_FRAME_ACK_ECN:
@@ -628,7 +674,7 @@ int quic_udp_send_test(void) {
                 }
                 kprintf("\n[quicudp] v1 not supported by server -- aborting "
                         "(fail closed)\n");
-                return -1;
+                return HTTP_ERR_CONNECT;
             }
 
             size_t wire = long_pkt_wire_len(pk, avail);
@@ -666,7 +712,7 @@ int quic_udp_send_test(void) {
                                     (unsigned)token_len);
                             size_t f2 = quic_frame_crypto(frames, sizeof frames,
                                                           0, ch, chl);
-                            size_t p2 = build_initial_1200(out, sizeof out,
+                            size_t p2 = build_initial_1200(pktbuf, sizeof pktbuf,
                                             key_dcid, key_dcid_len,
                                             server_cid, server_cid_len,
                                             scid, sizeof scid,
@@ -674,7 +720,7 @@ int quic_udp_send_test(void) {
                                             next_ipn++, frames, f2);
                             if (p2)
                                 (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip,
-                                               htons(4433), out, p2);
+                                               htons(port), pktbuf, p2);
                         }
                     }
                 }
@@ -717,7 +763,7 @@ int quic_udp_send_test(void) {
                             kprintf("[quicudp] CONNECTION_CLOSE err=%u "
                                     "reason='%s' -- aborting\n",
                                     (unsigned)f.err_code, rsn);
-                            return -1;
+                            return HTTP_ERR_RESET;
                         }
                         fp += fn;
                     }
@@ -749,7 +795,7 @@ int quic_udp_send_test(void) {
                                 kprintf("[quicudp] CONNECTION_CLOSE err=%u "
                                         "reason='%s' -- aborting\n",
                                         (unsigned)f.err_code, rsn);
-                                return -1;
+                                return HTTP_ERR_RESET;
                             }
                             fp += fn;
                         }
@@ -776,13 +822,13 @@ int quic_udp_send_test(void) {
                         if (quic_parse_server_hello(sh_msg, sh_len,
                                                     server_pub, &cipher) != 0) {
                             kprintf("[quicudp] ServerHello parse FAILED\n");
-                            return -1;
+                            return HTTP_ERR_PROTOCOL;
                         }
                         if (cipher != 0x1301) {
                             kprintf("[quicudp] server picked cipher 0x%04x "
                                     "(only AES-128-GCM QUIC keys wired) -- "
                                     "aborting\n", cipher);
-                            return -1;
+                            return HTTP_ERR_CONNECT;
                         }
                         uint8_t shared[32];
                         crypto_x25519(shared, priv, server_pub);
@@ -825,15 +871,15 @@ int quic_udp_send_test(void) {
             uint8_t af[16];
             size_t al = quic_frame_ack(af, sizeof af, iack.largest,
                                        qack_first_range(&iack));
-            size_t p2 = build_initial_1200(out, sizeof out,
+            size_t p2 = build_initial_1200(pktbuf, sizeof pktbuf,
                                            key_dcid, key_dcid_len,
                                            server_cid, server_cid_len,
                                            scid, sizeof scid,
                                            token, token_len,
                                            next_ipn++, af, al);
             if (p2)
-                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
-                               out, p2);
+                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(port),
+                               pktbuf, p2);
             iack.elicited = 0;
         }
         if (hack.elicited && sh_parsed && !fin_sent) {
@@ -847,7 +893,7 @@ int quic_udp_send_test(void) {
                                         0, NULL, 0, next_hpn++, 4,
                                         af, al, chk, chiv, chhp);
             if (hl)
-                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(port),
                                hpkt, hl);
             hack.elicited = 0;
         }
@@ -867,30 +913,30 @@ int quic_udp_send_test(void) {
             fl2 += quic_frame_stream(fs + fl2, sizeof fs - fl2, 2, 0,
                                      ctrl, sizeof ctrl, 0);
             /* request stream (client-bidi id 0): HEADERS frame, FIN */
-            uint8_t sec[256];
+            uint8_t sec[512];
             size_t sl2 = h3_qpack_encode_request(sec, sizeof sec,
-                                                 "tobyos.test", "/");
-            uint8_t req[300]; size_t rl2 = 0;
+                                                 host, path, want_gzip);
+            uint8_t req[560]; size_t rl2 = 0;
             rl2 += h3_frame_hdr(req, sizeof req, H3_FRAME_HEADERS, sl2);
             memcpy(req + rl2, sec, sl2); rl2 += sl2;
             fl2 += quic_frame_stream(fs + fl2, sizeof fs - fl2, 0, 0,
                                      req, rl2, 1);
-            static uint8_t qpkt[600];
+            static uint8_t qpkt[900];
             size_t ql = quic_build_short(qpkt, sizeof qpkt,
                                          server_cid, server_cid_len,
                                          next_apn++, 4, fs, fl2,
                                          cak, caiv, cahp);
             if (!ql) {
                 kprintf("[quich3] request packet build failed\n");
-                return -1;
+                return HTTP_ERR_PROTOCOL;
             }
-            (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+            (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(port),
                            qpkt, ql);
             req_sent = 1;
-            deadline = pit_ticks() + hz * 10;
-            kprintf("[quich3] sent GET https://tobyos.test/ over HTTP/3 "
+            deadline = pit_ticks() + tmo_ticks;
+            kprintf("[quich3] sent GET https://%s%s over HTTP/3 "
                     "(SETTINGS + QPACK HEADERS, %u byte 1-RTT packet)\n",
-                    (unsigned)ql);
+                    host, path, (unsigned)ql);
         } else if (aack.elicited && req_sent) {
             uint8_t af[16];
             size_t al = quic_frame_ack(af, sizeof af, aack.largest,
@@ -901,17 +947,27 @@ int quic_udp_send_test(void) {
                                           next_apn++, 4, af, al,
                                           cak, caiv, cahp);
             if (apl)
-                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(port),
                                apkt, apl);
             aack.elicited = 0;
+        }
+
+        /* ---- a stream 0 FIN whose end exceeds our buffer: too big for
+         * the h3 path -> let the http.c ladder fall back to h2/h1.1. ---- */
+        if (req_sent && s0_fin != (uint64_t)-1 && s0_fin > (uint64_t)sizeof s0buf) {
+            kprintf("[quich3] response %llu bytes exceeds the %u cap -- "
+                    "HTTP_ERR_TOOBIG (fall back)\n",
+                    (unsigned long long)s0_fin, (unsigned)sizeof s0buf);
+            return HTTP_ERR_TOOBIG;
         }
 
         /* ---- consume the response once stream 0 is complete ---- */
         if (req_sent && s0_fin != (uint64_t)-1 &&
             qrsm_contig(&s0rsm) >= s0_fin) {
-            struct h3_resp_info ri = { -1, 0 };
+            /* First pass: decode headers (fills status/type/len/encoding)
+             * and total the DATA payload. */
+            struct h3_resp_build rb = { out, 0, 0 };
             size_t body_total = 0;
-            char body1[161]; body1[0] = 0;
             size_t o2 = 0;
             int bad = 0;
             while (o2 < s0_fin && !bad) {
@@ -923,33 +979,58 @@ int quic_udp_send_test(void) {
                 if (!c || o2 + c + flen2 > s0_fin) { bad = 1; break; }
                 o2 += c;
                 if (ftype == H3_FRAME_HEADERS) {
-                    kprintf("[quich3] response HEADERS (%u byte QPACK "
-                            "section):\n", (unsigned)flen2);
+                    kprintf("[quich3] response HEADERS (%u byte QPACK section):\n",
+                            (unsigned)flen2);
                     if (h3_qpack_decode(s0buf + o2, (size_t)flen2,
-                                        h3_hdr_print, &ri) != 0) {
+                                        h3_hdr_to_resp, &rb) != 0) {
                         kprintf("[quich3] QPACK decode FAILED\n");
                         bad = 1;
                     }
                 } else if (ftype == H3_FRAME_DATA) {
-                    if (body_total < sizeof body1 - 1) {
-                        size_t k = sizeof body1 - 1 - body_total;
-                        if (k > flen2) k = (size_t)flen2;
-                        memcpy(body1 + body_total, s0buf + o2, k);
-                        body1[body_total + k] = 0;
-                    }
                     body_total += (size_t)flen2;
                 }
                 o2 += (size_t)flen2;
             }
-            if (bad || ri.status < 0) {
+            if (bad || !rb.status_seen) {
                 kprintf("[quich3] response parse FAILED\n");
-                return -1;
+                return HTTP_ERR_PROTOCOL;
             }
-            kprintf("[quich3] body (%u bytes): %s\n",
-                    (unsigned)body_total, body1);
-            kprintf("[quich3] HTTP/3 GET COMPLETE: status=%d, %d headers, "
-                    "%u body bytes -- FIRST PAGE FETCHED OVER HTTP/3\n",
-                    ri.status, ri.nhdr, (unsigned)body_total);
+
+            /* Second pass: copy the DATA bytes into a kmalloc'd body,
+             * honouring max_body (truncate when HTTP_F_TRUNCATE). */
+            int truncated = 0;
+            size_t body_cap = body_total;
+            if (body_cap > max_body) {
+                if (!(flags & HTTP_F_TRUNCATE)) {
+                    kprintf("[quich3] body %u > cap %u -- HTTP_ERR_TOOBIG\n",
+                            (unsigned)body_total, (unsigned)max_body);
+                    return HTTP_ERR_TOOBIG;
+                }
+                body_cap = max_body;
+                truncated = 1;
+            }
+            uint8_t *body = body_cap ? (uint8_t *)kmalloc(body_cap) : NULL;
+            if (body_cap && !body) return HTTP_ERR_NOMEM;
+            size_t body_len = 0;
+            o2 = 0;
+            while (o2 < s0_fin) {
+                uint64_t ftype, flen2;
+                size_t c = quic_varint_decode(s0buf + o2, s0_fin - o2, &ftype);
+                if (!c) break; o2 += c;
+                c = quic_varint_decode(s0buf + o2, s0_fin - o2, &flen2);
+                if (!c) break; o2 += c;
+                if (ftype == H3_FRAME_DATA && body) {
+                    size_t k = (size_t)flen2;
+                    if (body_len + k > body_cap) k = body_cap - body_len;
+                    memcpy(body + body_len, s0buf + o2, k);
+                    body_len += k;
+                }
+                o2 += (size_t)flen2;
+            }
+            out->body = body;
+            out->body_len = body_len;
+            if (out->content_len < 0) out->content_len = (long)body_total;
+
             /* final ACK so the server doesn't retransmit at us */
             uint8_t af[16];
             size_t al = quic_frame_ack(af, sizeof af, aack.largest,
@@ -960,8 +1041,12 @@ int quic_udp_send_test(void) {
                                           next_apn++, 4, af, al,
                                           cak, caiv, cahp);
             if (apl)
-                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(port),
                                apkt2, apl);
+            kprintf("[quich3] HTTP/3 GET COMPLETE: status=%d, %d headers, "
+                    "%u body bytes%s -- PAGE FETCHED OVER HTTP/3\n",
+                    out->status, rb.nhdr, (unsigned)body_len,
+                    truncated ? " (truncated)" : "");
             return 0;
         }
 
@@ -999,17 +1084,17 @@ int quic_udp_send_test(void) {
                 if (!cert_msg || !cv_body || cv_len < 4) {
                     kprintf("[quicudp] server flight lacks Certificate/"
                             "CertificateVerify -- aborting\n");
-                    return -1;
+                    return HTTP_ERR_CERT;
                 }
                 br_x509_pkey ee_pk;
                 unsigned char ee_pk_buf[BR_X509_BUFSIZE_KEY];
                 int chain = tls_x509_validate_chain(cert_msg, cert_len,
-                                                    "tobyos.test", &ee_pk,
+                                                    host, &ee_pk,
                                                     ee_pk_buf, sizeof ee_pk_buf);
                 if (chain != 0) {
                     kprintf("[quicudp] cert chain UNTRUSTED -- aborting "
                             "(fail closed)\n");
-                    return -1;
+                    return HTTP_ERR_CERT;
                 }
                 uint8_t thash_cv[32];
                 { struct sha256_ctx tc; sha256_init(&tc);
@@ -1026,7 +1111,7 @@ int quic_udp_send_test(void) {
                 if (!cv_ok) {
                     kprintf("[quicudp] CertificateVerify FAILED (scheme "
                             "0x%04x) -- aborting\n", scheme);
-                    return -1;
+                    return HTTP_ERR_CERT;
                 }
                 kprintf("[quicudp] cert chain OK (trusted root); "
                         "CertificateVerify VERIFIED (scheme 0x%04x, peer "
@@ -1044,7 +1129,7 @@ int quic_udp_send_test(void) {
                 if (memcmp(expect_fin, sfin, 32) != 0) {
                     kprintf("[quicudp] server Finished MAC MISMATCH -- "
                             "aborting\n");
-                    return -1;
+                    return HTTP_ERR_PROTOCOL;
                 }
                 kprintf("[quicudp] server Finished VERIFIED\n");
 
@@ -1092,9 +1177,9 @@ int quic_udp_send_test(void) {
                                                fr, frl, chk, chiv, chhp);
                 if (!cplen) {
                     kprintf("[quicudp] client Finished build failed\n");
-                    return -1;
+                    return HTTP_ERR_PROTOCOL;
                 }
-                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(4433),
+                (void)udp_send(htons(QUIC_CLIENT_PORT), dst_ip, htons(port),
                                cpkt, cplen);
                 fin_sent = 1;
                 kprintf("[quicudp] sent client Finished (%u byte Handshake "
@@ -1108,5 +1193,47 @@ int quic_udp_send_test(void) {
             "flight=%d fin_sent=%d hs_contig=%u)\n",
             got_initial, sh_parsed, flight_done, fin_sent,
             (unsigned)qrsm_contig(&hrsm));
-    return -1;
+    return HTTP_ERR_TIMEOUT;
+}
+
+/* Boot-time on-the-wire test (slices 4b..5b). Two proofs against the
+ * aioquic server on the SLIRP host (10.0.2.2:4433, cert for
+ * tobyos.test), both under -DQUIC_SEND_TEST (with -DTLS_TEST_CA to
+ * trust the test CA + resolve tobyos.test):
+ *   1. http3_fetch directly -- the reusable transport in isolation.
+ *   2. http_get_opt("https://tobyos.test:4433/", HTTP_F_TRY_H3) -- the
+ *      browser-shaped path: URL parse -> DNS (test seam) -> h3 probe ->
+ *      http3_fetch -> http_response. */
+int quic_udp_send_test(void) {
+    uint8_t ipb[4] = { 10, 0, 2, 2 };
+    uint32_t ip_be; memcpy(&ip_be, ipb, 4);         /* network order */
+
+    struct http_response resp;
+    int rc = http3_fetch(ip_be, 4433, "tobyos.test", "/",
+                         HTTP_F_TRUNCATE, H3_RESP_MAX, 15000, &resp);
+    if (rc == 0) {
+        char preview[121];
+        size_t k = resp.body_len < sizeof preview - 1 ? resp.body_len
+                                                      : sizeof preview - 1;
+        if (resp.body && k) memcpy(preview, resp.body, k);
+        preview[k] = 0;
+        kprintf("[quich3] transport OK: status=%d type='%s' body=%u bytes: %s\n",
+                resp.status, resp.content_type, (unsigned)resp.body_len, preview);
+        http_free(&resp);
+    } else {
+        kprintf("[quich3] transport FAILED rc=%d\n", rc);
+        return rc;
+    }
+
+    struct http_response r2;
+    int rc2 = http_get_opt("https://tobyos.test:4433/", 65536, 15000,
+                           HTTP_F_TRY_H3 | HTTP_F_TRUNCATE, &r2);
+    if (rc2 == 0) {
+        kprintf("[quich3] http_get_opt over h3 OK: status=%d body=%u bytes "
+                "-- HTTP/3 WIRED INTO http.c\n", r2.status, (unsigned)r2.body_len);
+        http_free(&r2);
+    } else {
+        kprintf("[quich3] http_get_opt over h3 FAILED rc=%d\n", rc2);
+    }
+    return rc2;
 }

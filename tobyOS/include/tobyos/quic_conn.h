@@ -44,17 +44,24 @@ size_t quic_build_client_initial(uint8_t *out, size_t cap,
 #define QUIC_CONN_SELFTEST_N 3
 int quic_conn_selftest(void);
 
-/* Slices 4b..4h: run a full live QUIC client handshake against a real
- * server on the SLIRP host (10.0.2.2:4433) -- client Initial (padded
- * to 1200) -> Version Negotiation / Retry (integrity-checked) ->
- * server Initial (ServerHello, shared secret) -> Handshake flight
- * (CRYPTO reassembled by offset across packets/datagrams) with
- * REQUIRED certificate chain + CertificateVerify validation (13H
- * path) -> server Finished verify -> ACKs at every level -> client
- * Finished -> server's 1-RTT HANDSHAKE_DONE confirms completion.
- * Returns 0 once HANDSHAKE_DONE is decrypted, -1 on any failure.
- * Called at boot under -DQUIC_SEND_TEST (trust the test CA with
- * -DTLS_TEST_CA). */
+/* Slices 4b..5b: a reusable HTTP/3 GET over QUIC v1. Runs the full
+ * handshake to ip_be:port (Version Negotiation / Retry / coalesced
+ * packets / CRYPTO reassembly / ACKs), REQUIRES the cert chain +
+ * CertificateVerify to validate against `host` (the 13H path), then
+ * GETs `path` as HTTP/3 (QPACK HEADERS on bidi stream 0) and fills
+ * `out` (status / content-type / content-length / content-encoding /
+ * kmalloc'd body -- free with http_free). flags takes HTTP_F_* (GZIP
+ * advertises accept-encoding; TRUNCATE caps the body at max_body).
+ * Returns 0 on success, a negative HTTP_ERR_* otherwise. Synchronous,
+ * one fetch at a time (fixed UDP source port). */
+struct http_response;
+int http3_fetch(uint32_t ip_be, uint16_t port, const char *host,
+                const char *path, unsigned flags, size_t max_body,
+                uint32_t timeout_ms, struct http_response *out);
+
+/* Boot-time on-the-wire test: http3_fetch against the aioquic server
+ * on the SLIRP host (10.0.2.2:4433, tobyos.test). Called at boot under
+ * -DQUIC_SEND_TEST (trust the test CA with -DTLS_TEST_CA). */
 int quic_udp_send_test(void);
 
 #endif /* TOBYOS_QUIC_CONN_H */

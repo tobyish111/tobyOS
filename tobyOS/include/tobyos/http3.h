@@ -24,10 +24,12 @@
 #define H3_STREAM_CONTROL 0x00
 
 /* Encode a GET request field section (QPACK, static/literal only):
- * :method GET, :scheme https, :path, :authority. Returns bytes
- * written, or 0 on overflow. */
+ * :method GET, :scheme https, :path, :authority, a user-agent, and --
+ * when want_gzip -- accept-encoding: gzip, br. Returns bytes written,
+ * or 0 on overflow. */
 size_t h3_qpack_encode_request(uint8_t *out, size_t cap,
-                               const char *authority, const char *path);
+                               const char *authority, const char *path,
+                               int want_gzip);
 
 /* Decode a field section encoded against an empty dynamic table (what
  * a peer sends when we advertise QPACK_MAX_TABLE_CAPACITY 0 -- our

@@ -218,6 +218,17 @@ static uint16_t dns_make_id(void) {
 bool dns_resolve(const char *name, uint32_t timeout_ms, struct dns_result *out) {
     if (!out)              return false;
     if (!name || !*name)   return false;
+#ifdef TLS_TEST_CA
+    /* Test-only /etc/hosts entry: tobyos.test -> 10.0.2.2 (the SLIRP
+     * host), so the HTTP/3 slice-4h/5 aioquic server is reachable by
+     * name (its cert's SAN is tobyos.test). Compiled in only under the
+     * same flag that trusts the test CA; production never sees it. */
+    if (strcmp(name, "tobyos.test") == 0) {
+        uint8_t ip[4] = { 10, 0, 2, 2 };
+        memcpy(&out->ip_be, ip, 4);
+        return true;
+    }
+#endif
     if (g_my_dns_be == 0) {
         kprintf("[dns] no DNS server (DHCP did not provide one)\n");
         return false;

@@ -108,15 +108,17 @@ void udp_recv(uint32_t src_ip_be, const void *udp_packet, size_t len) {
         dns_recv_hook(src_ip_be, udp_packet, udp_n);
         return;
     }
-#ifdef QUIC_SEND_TEST
-    /* HTTP/3 slice 4c: the QUIC client's reply port. */
+    /* HTTP/3 (slices 4c/5b): the QUIC client's reply port. Always
+     * routed -- http3_fetch() is a real transport now (http.c's h3
+     * probe), not just the -DQUIC_SEND_TEST boot test. The hook only
+     * queues bytes into a ring the active fetch drains + resets, so a
+     * stray datagram when no fetch is in flight is harmless. */
     if (h->dst_port == htons(56789)) {
         extern void quic_recv_hook(uint32_t src_ip_be,
                                    const void *udp_packet, size_t len);
         quic_recv_hook(src_ip_be, udp_packet, udp_n);
         return;
     }
-#endif
 
     struct sock *s = sock_lookup_by_port(h->dst_port);
     if (!s) return;                       /* no listener: silent drop */
