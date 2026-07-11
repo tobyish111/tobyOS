@@ -54,15 +54,23 @@ static size_t tp_put_int(uint8_t *p, uint64_t id, uint64_t v) {
 }
 
 /* Build the transport-parameters block. initial_source_connection_id
- * (0x0f) carries our SCID; the rest are sane client defaults. */
+ * (0x0f) carries our SCID; the response flow-control limits are sized
+ * to fc_window (the caller's response buffer), so the server can send a
+ * whole response within the initial window without a MAX_STREAM_DATA
+ * update. */
 static size_t quic_build_transport_params(uint8_t *out,
-                                          const uint8_t *scid, size_t scid_len) {
+                                          const uint8_t *scid, size_t scid_len,
+                                          uint32_t fc_window) {
     size_t n = 0;
     n += tp_put(out + n, 0x0f, scid, scid_len);         /* initial_source_connection_id */
     n += tp_put_int(out + n, 0x01, 30000);              /* max_idle_timeout (ms) */
     n += tp_put_int(out + n, 0x03, 1472);               /* max_udp_payload_size */
-    n += tp_put_int(out + n, 0x04, 2097152);            /* initial_max_data (2 MiB) */
-    n += tp_put_int(out + n, 0x05, 1048576);            /* stream_data_bidi_local (1 MiB) */
+    /* Connection window gets headroom above the stream window so the
+     * server's own uni-streams (control / QPACK) don't eat into stream
+     * 0's allowance -- stream 0 can then use its full stream_data, which
+     * makes the "window full, no FIN" oversized check deterministic. */
+    n += tp_put_int(out + n, 0x04, fc_window + 65536);  /* initial_max_data */
+    n += tp_put_int(out + n, 0x05, fc_window);          /* stream_data_bidi_local */
     n += tp_put_int(out + n, 0x06, 262144);             /* stream_data_bidi_remote */
     n += tp_put_int(out + n, 0x07, 262144);             /* stream_data_uni */
     n += tp_put_int(out + n, 0x08, 100);                /* initial_max_streams_bidi */
@@ -76,7 +84,7 @@ size_t quic_build_client_hello(uint8_t *out, size_t cap,
                                const uint8_t random[32],
                                const uint8_t pubkey[32],
                                const uint8_t *scid, size_t scid_len,
-                               const char *hostname) {
+                               const char *hostname, uint32_t fc_window) {
     size_t hostname_len = 0;
     if (hostname) while (hostname[hostname_len]) hostname_len++;
 
@@ -144,7 +152,7 @@ size_t quic_build_client_hello(uint8_t *out, size_t cap,
     /* quic_transport_parameters */
     {
         uint8_t tp[128];
-        size_t tpl = quic_build_transport_params(tp, scid, scid_len);
+        size_t tpl = quic_build_transport_params(tp, scid, scid_len, fc_window);
         tls_put_u16(out + pos, TLS_EXT_QUIC_TP); pos += 2;
         tls_put_u16(out + pos, (uint16_t)tpl); pos += 2;
         memcpy(out + pos, tp, tpl); pos += tpl;
@@ -214,7 +222,7 @@ int quic_conn_selftest(void) {
 
     uint8_t ch[512];
     size_t chl = quic_build_client_hello(ch, sizeof ch, rnd, pub,
-                                         scid, sizeof scid, "example.org");
+                                         scid, sizeof scid, "example.org", 262144);
     int ch_ok = (chl > 40 && ch[0] == TLS_HS_CLIENT_HELLO);
     kprintf("[quicch] ClientHello build          %s (%u bytes)\n",
             ch_ok ? "OK" : "FAIL", (unsigned)chl);
@@ -474,12 +482,11 @@ static void h3_hdr_to_resp(void *ud, const char *name, const char *value) {
     kprintf("[quich3]   %s: %s\n", name, value);
 }
 
-/* Response-stream reassembly cap: matches the initial_max_stream_data
- * we advertise (1 MiB, quic_build_transport_params), so a server can
- * send a whole ordinary page before flow control would block. A larger
- * response returns HTTP_ERR_TOOBIG -> the http.c ladder falls back to
- * h2/h1.1. */
-#define H3_RESP_MAX (1024u * 1024u)
+/* Hard ceiling on an h3 response: the per-fetch buffer + advertised
+ * flow-control window are sized to the caller's max_body (below), but
+ * never above this. A response larger than the window returns
+ * HTTP_ERR_TOOBIG and the http.c ladder falls back to h2/h1.1. */
+#define H3_RESP_MAX (4u * 1024u * 1024u)
 
 /* ---- http3_fetch: a reusable HTTP/3 GET transport (slices 4b..5b) - *
  * Run a full QUIC v1 handshake to `ip_be`:`port` (network-order IP),
@@ -498,11 +505,11 @@ static void h3_hdr_to_resp(void *ud, const char *name, const char *value) {
  * ServerHello. */
 static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
                             const char *path, unsigned flags, size_t max_body,
-                            uint32_t timeout_ms, struct http_response *out) {
+                            uint32_t timeout_ms, struct http_response *out,
+                            uint8_t *s0buf, uint8_t *s0bits, uint32_t s0cap) {
     if (!host) host = "";
     if (!path || !*path) path = "/";
     if (out) { memset(out, 0, sizeof *out); out->content_len = -1; }
-    if (max_body == 0 || max_body > H3_RESP_MAX) max_body = H3_RESP_MAX;
     if (timeout_ms == 0) timeout_ms = 15000;
     int want_gzip = (flags & HTTP_F_GZIP) != 0;
 
@@ -515,8 +522,10 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
     crypto_x25519_public_key(pub, priv);
 
     static uint8_t ch[512];
+    /* Advertise the response buffer as the flow-control window so the
+     * server can send a whole response within the initial window. */
     size_t chl = quic_build_client_hello(ch, sizeof ch, rnd, pub,
-                                         scid, sizeof scid, host);
+                                         scid, sizeof scid, host, s0cap);
     if (!chl) { kprintf("[quich3] ClientHello build failed\n"); return HTTP_ERR_CONNECT; }
 
     /* --- connection state --- */
@@ -553,16 +562,16 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
     uint8_t empty_hash[32]; sha256_buf(NULL, 0, empty_hash);
     uint8_t thash_af[32];                        /* transcript incl server Fin */
 
-    /* CRYPTO reassembly (Initial + Handshake levels) + the response
-     * stream (1-RTT stream 0, reassembled the same way) */
+    /* CRYPTO reassembly (Initial + Handshake levels) stay small + static;
+     * the response stream (1-RTT stream 0) uses the caller-sized buffer
+     * passed in (== the advertised flow-control window). */
     static uint8_t ibuf[2048],  ibits[2048 / 8];
     static uint8_t hbuf[16384], hbits[16384 / 8];   /* real cert chains span >8K */
-    static uint8_t s0buf[H3_RESP_MAX], s0bits[H3_RESP_MAX / 8];
     memset(ibits, 0, sizeof ibits); memset(hbits, 0, sizeof hbits);
-    memset(s0bits, 0, sizeof s0bits);
+    memset(s0bits, 0, (s0cap + 7) / 8);
     struct qrsm irsm = { ibuf, ibits, sizeof ibuf, 0 };
     struct qrsm hrsm = { hbuf, hbits, sizeof hbuf, 0 };
-    struct qrsm s0rsm = { s0buf, s0bits, sizeof s0buf, 0 };
+    struct qrsm s0rsm = { s0buf, s0bits, s0cap, 0 };
 
     g_qq_head = g_qq_tail = 0;
 
@@ -970,12 +979,20 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
             aack.elicited = 0;
         }
 
-        /* ---- a stream 0 FIN whose end exceeds our buffer: too big for
-         * the h3 path -> let the http.c ladder fall back to h2/h1.1. ---- */
-        if (req_sent && s0_fin != (uint64_t)-1 && s0_fin > (uint64_t)sizeof s0buf) {
+        /* ---- too big for the h3 buffer -> fall back to h2/h1.1. Two
+         * ways to know: a FIN past the buffer, OR the flow-control
+         * window (== the buffer) filled with no FIN yet, so the server
+         * is blocked waiting for a MAX_STREAM_DATA we won't send.
+         * Detecting the second case fails fast instead of timing out. */
+        if (req_sent && s0_fin != (uint64_t)-1 && s0_fin > (uint64_t)s0cap) {
             kprintf("[quich3] response %llu bytes exceeds the %u cap -- "
                     "HTTP_ERR_TOOBIG (fall back)\n",
-                    (unsigned long long)s0_fin, (unsigned)sizeof s0buf);
+                    (unsigned long long)s0_fin, (unsigned)s0cap);
+            return HTTP_ERR_TOOBIG;
+        }
+        if (req_sent && s0_fin == (uint64_t)-1 && qrsm_contig(&s0rsm) >= s0cap) {
+            kprintf("[quich3] response filled the %u-byte window with no FIN "
+                    "-- HTTP_ERR_TOOBIG (fall back)\n", (unsigned)s0cap);
             return HTTP_ERR_TOOBIG;
         }
 
@@ -1224,14 +1241,31 @@ static volatile int g_h3_busy;
 int http3_fetch(uint32_t ip_be, uint16_t port, const char *host,
                 const char *path, unsigned flags, size_t max_body,
                 uint32_t timeout_ms, struct http_response *out) {
-    if (g_h3_busy) {
-        if (out) { memset(out, 0, sizeof *out); out->content_len = -1; }
+    if (out) { memset(out, 0, sizeof *out); out->content_len = -1; }
+    if (g_h3_busy)
         return HTTP_ERR_CONNECT;             /* one h3 fetch at a time */
+
+    /* Size the response buffer (== the flow-control window we advertise)
+     * to the caller's cap, plus H3-framing headroom, bounded by a hard
+     * ceiling. Allocated here so the core's many exit paths don't each
+     * have to free it. */
+    if (max_body == 0) max_body = 1u << 20;
+    if (max_body > H3_RESP_MAX) max_body = H3_RESP_MAX;
+    uint32_t s0cap = (uint32_t)max_body + 4096;      /* HEADERS + frame hdrs */
+    uint8_t *s0buf  = (uint8_t *)kmalloc(s0cap);
+    uint8_t *s0bits = (uint8_t *)kmalloc((s0cap + 7) / 8);
+    if (!s0buf || !s0bits) {
+        if (s0buf) kfree(s0buf);
+        if (s0bits) kfree(s0bits);
+        return HTTP_ERR_NOMEM;
     }
+
     g_h3_busy = 1;
     int rc = http3_fetch_core(ip_be, port, host, path, flags, max_body,
-                              timeout_ms, out);
+                              timeout_ms, out, s0buf, s0bits, s0cap);
     g_h3_busy = 0;
+    kfree(s0buf);
+    kfree(s0bits);
     return rc;
 }
 
@@ -1264,11 +1298,12 @@ int quic_udp_send_test(void) {
         return rc;
     }
 
-    /* Large response over the integrated path: /big serves ~900 KiB,
-     * exercising flow control (1 MiB advertised window), offset
-     * reassembly of a multi-hundred-packet stream, and the recv ring. */
+    /* Large response over the integrated path: /big serves ~1.7 MiB
+     * (above the old 1 MiB cap), exercising the per-fetch flow-control
+     * window sized to max_body, offset reassembly of a multi-thousand-
+     * packet stream, and the recv ring. */
     struct http_response r2;
-    int rc2 = http_get_opt("https://tobyos.test:4433/big", H3_RESP_MAX, 20000,
+    int rc2 = http_get_opt("https://tobyos.test:4433/big", H3_RESP_MAX, 25000,
                            HTTP_F_TRY_H3 | HTTP_F_TRUNCATE, &r2);
     if (rc2 == 0) {
         kprintf("[quich3] http_get_opt /big over h3 OK: status=%d body=%u "
@@ -1277,6 +1312,24 @@ int quic_udp_send_test(void) {
         http_free(&r2);
     } else {
         kprintf("[quich3] http_get_opt /big over h3 FAILED rc=%d\n", rc2);
+    }
+
+    /* Oversized fast-fallback: fetch the ~1.7 MiB /big with a SMALL cap
+     * (200 KB). The server fills our 200 KB window and blocks with no
+     * FIN, so http3_fetch must fail FAST with HTTP_ERR_TOOBIG (-6)
+     * rather than time out -> the http.c ladder would then use h2/h1.1. */
+    {
+        struct http_response r5;
+        uint64_t t0 = pit_ticks();
+        int rc5 = http3_fetch(ip_be, 4433, "tobyos.test", "/big",
+                              HTTP_F_TRUNCATE, 200000, 15000, &r5);
+        uint32_t hz5 = pit_hz(); if (!hz5) hz5 = 100;
+        unsigned secs = (unsigned)((pit_ticks() - t0) / hz5);
+        kprintf("[quich3] small-cap /big rc=%d (%s) in ~%us -- %s\n",
+                rc5, http_strerror(rc5), secs,
+                rc5 == HTTP_ERR_TOOBIG ? "FAST OVERSIZED-FALLBACK OK"
+                                       : "unexpected");
+        if (rc5 == 0) http_free(&r5);
     }
 
 #ifdef QUIC_ALTSVC

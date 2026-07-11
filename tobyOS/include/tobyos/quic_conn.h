@@ -18,13 +18,14 @@
 /* Build a TLS 1.3 ClientHello for QUIC into out (>= ~512 bytes).
  * random[32] + the X25519 public key are the caller's; scid is echoed
  * in the transport parameters (initial_source_connection_id). hostname
- * may be NULL. Returns the ClientHello length (including its 4-byte
- * handshake header), or 0 on overflow. */
+ * may be NULL. fc_window sizes the response flow-control limits
+ * (initial_max_data / stream_data_bidi_local). Returns the ClientHello
+ * length (including its 4-byte handshake header), or 0 on overflow. */
 size_t quic_build_client_hello(uint8_t *out, size_t cap,
                                const uint8_t random[32],
                                const uint8_t pubkey[32],
                                const uint8_t *scid, size_t scid_len,
-                               const char *hostname);
+                               const char *hostname, uint32_t fc_window);
 
 /* Build a complete, protected client Initial packet carrying `ch`
  * (a ClientHello) in a CRYPTO frame, padded to `pad_to` bytes (0 = no
