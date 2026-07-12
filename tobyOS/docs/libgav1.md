@@ -77,7 +77,30 @@ The whole AV1 decode core — OBU parse, tile/symbol (CABAC) decode,
 transforms, intra/inter prediction, loop filter, CDEF, loop restoration,
 the C dsp — runs bit-exact single-threaded on the tobyOS STL.
 
-## Next slices
-- **Slice 3** — wire AVIF into `toby_image_load` (ISO-BMFF `.avif`
-  demux → libgav1 → RGBA), next to WebP.
-- **Slice 4** — a browser `<img src=...avif>` renders on screen.
+## Slice 3 — AVIF wired into the image loader (DONE, bit-exact)
+AVIF now decodes through libtoby's `toby_image_load`, next to WebP/stb —
+so every libtoby app (the browser included) gets `<img>` AVIF for free.
+- **`libtoby/src/avif_decode.cpp`** + **`toby/avif_decode.h`** — a
+  C-linkage bridge: a minimal HEIF/ISO-BMFF box parser (`meta` → `pitm`
+  primary item → `iloc` extent → `iprp/ipco/av1C` config OBUs) pulls the
+  primary AV1 item's coded data (prepending the `av1C` sequence-header
+  OBUs when the box carries any), decodes it with `libgav1::Decoder`
+  (threads=1), and converts the YUV to RGBA8888 (BT.601 limited; 4:2:0/
+  4:2:2/4:4:4 + monochrome). `avif_sniff` checks for an `avif`/`avis`
+  brand in `ftyp`.
+- **`image.c`** — sniffs AVIF (after WebP, before stb) and calls the
+  bridge; the result frees with `free()`. The RGBA→ARGB path is unchanged.
+- v1 scope: primary item only, 8-bit, no alpha auxiliary item (opaque),
+  BT.601 (the `colr`/nclx matrix isn't read yet).
+
+Verified `-DLIBGAV1_SELFTEST` (`/bin/av1test` phase 2, the real path):
+```
+[av1] AVIF via toby_image_load: 96x96 ARGB csum=0x984df17b exp=0x984df17b MATCH
+[av1] decode self-test: raw-OBU OK, AVIF OK -- ALL PASS
+```
+The reference is ffmpeg's `.avif` decode run through the same BT.601, so
+the whole container→decode→ARGB chain is checked bit-for-bit.
+
+## Next slice
+- **Slice 4** — a browser `<img src=...avif>` renders on screen (the
+  visible payoff; the loader path is already proven).

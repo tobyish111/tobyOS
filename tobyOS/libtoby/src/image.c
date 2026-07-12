@@ -39,6 +39,9 @@
  * stb_image can't -- lossy VP8, lossless VP8L, and alpha. */
 #include "../../third_party/libwebp/src/webp/decode.h"
 
+/* AVIF (AV1 still image): the vendored libgav1 decoder via a bridge. */
+#include <toby/avif_decode.h>
+
 static int webp_sniff(const uint8_t *d, size_t n) {
     return n >= 12 &&
            d[0] == 'R' && d[1] == 'I' && d[2] == 'F' && d[3] == 'F' &&
@@ -50,10 +53,14 @@ toby_image_t *toby_image_load(const uint8_t *data, size_t len) {
 
     int w, h, channels;
     unsigned char *rgba = NULL;
-    int from_webp = 0;
+    int from_webp = 0, from_avif = 0;
     if (webp_sniff(data, len)) {
         rgba = WebPDecodeRGBA(data, len, &w, &h);
         from_webp = (rgba != NULL);
+    }
+    if (!rgba && avif_sniff(data, len)) {
+        rgba = avif_decode_rgba(data, len, &w, &h);   /* malloc'd RGBA */
+        from_avif = (rgba != NULL);
     }
     /* Request 4 channels (RGBA). */
     if (!rgba)
@@ -63,7 +70,7 @@ toby_image_t *toby_image_load(const uint8_t *data, size_t len) {
 
     toby_image_t *img = (toby_image_t *)malloc(sizeof(toby_image_t));
     if (!img) {
-        if (from_webp) WebPFree(rgba); else stbi_image_free(rgba);
+        if (from_webp) WebPFree(rgba); else if (from_avif) free(rgba); else stbi_image_free(rgba);
         return NULL;
     }
 
@@ -71,7 +78,7 @@ toby_image_t *toby_image_load(const uint8_t *data, size_t len) {
     img->height = h;
     img->pixels = (uint32_t *)malloc((size_t)w * (size_t)h * 4);
     if (!img->pixels) {
-        if (from_webp) WebPFree(rgba); else stbi_image_free(rgba);
+        if (from_webp) WebPFree(rgba); else if (from_avif) free(rgba); else stbi_image_free(rgba);
         free(img);
         return NULL;
     }
@@ -89,7 +96,7 @@ toby_image_t *toby_image_load(const uint8_t *data, size_t len) {
                           ((uint32_t)b);
     }
 
-    if (from_webp) WebPFree(rgba); else stbi_image_free(rgba);
+    if (from_webp) WebPFree(rgba); else if (from_avif) free(rgba); else stbi_image_free(rgba);
     return img;
 }
 

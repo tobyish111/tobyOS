@@ -1091,6 +1091,17 @@ $(LIBGAV1_DIR)/%.o: $(LIBGAV1_DIR)/%.cc Makefile
 $(LIBGAV1_DIR)/%.pic.o: $(LIBGAV1_DIR)/%.cc Makefile
 	$(CXX) $(LIBGAV1_INC) $(LIBGAV1_CFG) $(LIBTOBY_CXXFLAGS) -fPIC -msse -msse2 -w -c $< -o $@
 
+# avif_decode.cpp: C-linkage bridge from the image loader to libgav1
+# (HEIF box parse -> AV1 decode -> RGBA). Needs the libgav1 include roots.
+# Only pulled from libtoby.a by a program that decodes an AVIF.
+$(LIBTOBY_SRC)/avif_decode.o: $(LIBTOBY_SRC)/avif_decode.cpp
+	$(CXX) $(LIBGAV1_INC) $(LIBGAV1_CFG) $(LIBTOBY_CXXFLAGS) -msse -msse2 -c $< -o $@
+
+$(LIBTOBY_SRC)/avif_decode.pic.o: $(LIBTOBY_SRC)/avif_decode.cpp
+	$(CXX) $(LIBGAV1_INC) $(LIBGAV1_CFG) $(LIBTOBY_CXXFLAGS) -fPIC -msse -msse2 -c $< -o $@
+
+LIBTOBY_OBJS += $(LIBTOBY_SRC)/avif_decode.o
+
 $(LIBTOBY_CRT0): $(LIBTOBY_SRC)/crt0.S
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -1133,6 +1144,7 @@ LIBTOBY_PIC_OBJS    += $(LIBWEBP_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(H264BSD_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(OPENH264_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBGAV1_PIC_OBJS)
+LIBTOBY_PIC_OBJS    += $(LIBTOBY_SRC)/avif_decode.pic.o
 LIBTOBY_PIC_OBJS    += $(LIBTOBY_SRC)/cxxrt.pic.o $(LIBTOBY_SRC)/oh264_glue.pic.o
 LIBTOBY_PIC_CFLAGS  := $(LIBTOBY_BUILD_CFLAGS) -fPIC
 
@@ -1308,7 +1320,8 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_mp4play,user_mp4play))
 # libgav1's Decoder out of libtoby.a. Needs the libgav1 include roots +
 # config, and SSE (codec ABI).
 programs/user_av1test/user_av1test.o: programs/user_av1test/main.cpp \
-                                      programs/user_av1test/av1_clip.h $(LIBTOBY_AR)
+                                      programs/user_av1test/av1_clip.h \
+                                      programs/user_av1test/avif_clip.h $(LIBTOBY_AR)
 	$(CXX) $(filter-out -std=c11,$(LIBTOBY_CFLAGS)) $(LIBGAV1_INC) $(LIBGAV1_CFG) \
 	      -msse -msse2 -std=c++17 -fno-exceptions -fno-rtti -nostdinc++ -c $< -o $@
 

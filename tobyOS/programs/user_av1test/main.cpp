@@ -13,11 +13,31 @@
 #include <cstddef>
 
 #include "gav1/decoder.h"
+#include <toby/image.h>
 #include "av1_clip.h"
+#include "avif_clip.h"
 
 static unsigned fnv1a_upd(unsigned h, const unsigned char *p, int n) {
     for (int i = 0; i < n; i++) { h ^= p[i]; h *= 0x01000193u; }
     return h;
+}
+
+/* Phase 2: the AVIF path the browser <img> uses -- toby_image_load sniffs
+ * AVIF, runs avif_decode (HEIF parse -> libgav1 -> ARGB). Returns 1 on
+ * pass. */
+static int test_avif(void) {
+    toby_image_t *im = toby_image_load(avif_file, AVIF_FILE_LEN);
+    if (!im) { std::printf("[av1] AVIF: toby_image_load returned NULL\n"); return 0; }
+    int dims_ok = (im->width == AVIF_W && im->height == AVIF_H && im->pixels != 0);
+    unsigned csum = 0x811c9dc5u;
+    if (im->pixels)
+        csum = fnv1a_upd(csum, (const unsigned char *)im->pixels, im->width * im->height * 4);
+    int ok = dims_ok && (csum == AVIF_ARGB_CSUM);
+    std::printf("[av1] AVIF via toby_image_load: %dx%d ARGB csum=0x%08x exp=0x%08x %s\n",
+                im->width, im->height, csum, AVIF_ARGB_CSUM,
+                ok ? "MATCH" : "MISMATCH");
+    toby_image_free(im);
+    return ok;
 }
 
 extern "C" int main(void) {
@@ -76,8 +96,14 @@ extern "C" int main(void) {
                 ok_dims ? "OK" : "BAD");
 
     decoder.SignalEOS();
+    int p1 = ok_dims && ok_csum;
 
-    int ok = ok_dims && ok_csum;
-    std::printf("[av1] decode self-test: %s\n", ok ? "ALL PASS" : "FAILURES");
+    /* Phase 2: the full AVIF image path (container -> libgav1 -> ARGB). */
+    int p2 = test_avif();
+
+    int ok = p1 && p2;
+    std::printf("[av1] decode self-test: raw-OBU %s, AVIF %s -- %s\n",
+                p1 ? "OK" : "FAIL", p2 ? "OK" : "FAIL",
+                ok ? "ALL PASS" : "FAILURES");
     return ok ? 0 : 1;
 }
