@@ -48,6 +48,18 @@ void     perf_init(void);
 /* Raw TSC read, re-exported so callers don't need <tobyos/cpu.h>. */
 static inline uint64_t perf_rdtsc(void) { return rdtsc(); }
 
+/* Recalibrate the TSC rate against the ACPI PM timer (FADT PM_TMR_BLK
+ * I/O port; ext32 = FADT TMR_VAL_EXT). perf_init counts cycles across
+ * PIT *interrupts*, which under loaded QEMU TCG can arrive many times
+ * late and inflate the measured rate by the same factor -- after which
+ * every perf_now_ns consumer (SYS_CLOCK_MS, nanosleep, heartbeats, JS
+ * timers) runs slow by that factor for the whole session. The PM timer
+ * is a free-running counter needing no IRQs, so it measures wall time
+ * honestly under any load. Call once ACPI has parsed the FADT; keeps
+ * the perf_now_ns timeline continuous across the rate change. No-op if
+ * port is 0, perf_init hasn't run, or the counter looks dead. */
+void     perf_recalibrate_pmt(uint32_t io_port, bool ext32);
+
 /* Nanoseconds since boot. Uses the calibrated TSC rate -- before
  * perf_init() completes, returns 0. */
 uint64_t perf_now_ns(void);

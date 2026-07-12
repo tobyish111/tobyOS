@@ -17,6 +17,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/proc.h>
 #include <tobyos/klibc.h>
+#include <tobyos/cpu.h>      /* inl -- PM-timer recalibration */
 
 /* ==== 1. TIMING ================================================== */
 
@@ -83,6 +84,60 @@ void perf_init(void) {
     kprintf("[perf] TSC calibrated: %u MHz (%lu cycles in %lu ns)\n",
             (unsigned)(g_tsc_khz / 1000),
             (unsigned long)cycles, (unsigned long)ns_elap);
+}
+
+/* PM-timer recalibration (see perf.h). The boot calibration above
+ * trusts that N PIT interrupts == N ms of wall time; under loaded
+ * QEMU TCG the IRQs arrive late (observed 15x during a TKAPP boot),
+ * inflating g_tsc_khz and slowing the entire OS clock by that factor.
+ * The ACPI PM timer is a free-running 3.579545 MHz counter read by
+ * port I/O -- no interrupt delivery involved -- so a TSC-vs-PMT window
+ * measures the true rate under any load. */
+#define ACPI_PMT_HZ 3579545u
+
+void perf_recalibrate_pmt(uint32_t io_port, bool ext32) {
+    if (io_port == 0 || io_port > 0xFFFF || g_tsc_khz == 0) return;
+
+    uint32_t mask = ext32 ? 0xFFFFFFFFu : 0x00FFFFFFu;
+    uint32_t prev = inl((uint16_t)io_port) & mask;
+    if (prev == mask) return;        /* floating port reads all-ones */
+
+    const uint64_t want = ACPI_PMT_HZ / 20;      /* 50 ms window */
+    uint64_t tsc0 = rdtsc();
+    uint64_t acc  = 0;
+    /* Bound the poll so a stuck counter can't hang boot; 50 ms of
+     * inl() round-trips is far below this everywhere. The wrap-safe
+     * delta handles the 24-bit counter rolling over mid-window. */
+    for (long guard = 10000000L; acc < want && guard > 0; guard--) {
+        uint32_t cur = inl((uint16_t)io_port) & mask;
+        acc += (cur - prev) & mask;
+        prev = cur;
+    }
+    uint64_t tsc1 = rdtsc();
+    if (acc < want) {
+        kprintf("[perf] PM-timer recalibration skipped (counter stuck)\n");
+        return;
+    }
+
+    /* khz = cycles / ms, with ms = acc * 1000 / PMT_HZ. */
+    uint64_t khz = (tsc1 - tsc0) * ACPI_PMT_HZ / acc / 1000ull;
+    if (khz < 1000 || khz > 100000000ull) {
+        kprintf("[perf] PM-timer recalibration rejected (%lu kHz)\n",
+                (unsigned long)khz);
+        return;
+    }
+
+    /* Rebase g_boot_tsc so perf_now_ns is continuous: same "now",
+     * new rate from here on. */
+    uint64_t now_ns = perf_now_ns();
+    uint32_t old    = g_tsc_khz;
+    g_tsc_khz  = (uint32_t)khz;
+    g_boot_tsc = tsc1 - (now_ns * khz) / 1000000ull;
+
+    kprintf("[perf] TSC recalibrated vs ACPI PM timer: %u -> %u MHz "
+            "(PIT-based estimate was %lu%% of true rate)\n",
+            (unsigned)(old / 1000), (unsigned)(g_tsc_khz / 1000),
+            (unsigned long)(old * 100ull / khz));
 }
 
 /* ==== 2. INSTRUMENTATION ZONES =================================== */

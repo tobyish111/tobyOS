@@ -210,6 +210,7 @@ struct acpi_fadt {
 } __attribute__((packed));
 
 /* FADT::FLAGS bits we care about (ACPI 6.x table 5-10). */
+#define FADT_FLAG_TMR_VAL_EXT     (1u << 8)
 #define FADT_FLAG_RESET_REG_SUP   (1u << 10)
 
 /* PM1_CNT bits (ACPI 6.x table 4-13). */
@@ -510,6 +511,16 @@ static void parse_fadt(const struct acpi_fadt *f) {
     } else {
         g_info.pm1b_cnt = f->pm1b_cnt_blk;
     }
+
+    /* PM timer block, same X-GAS-then-legacy preference as PM1. */
+    if (f->h.length >= 0xD0 + sizeof(struct acpi_gas) &&
+        f->x_pm_tmr_blk.address != 0 &&
+        f->x_pm_tmr_blk.address_space == ACPI_GAS_AS_IO) {
+        g_info.pm_tmr = (uint32_t)f->x_pm_tmr_blk.address;
+    } else {
+        g_info.pm_tmr = f->pm_tmr_blk;
+    }
+    g_info.pm_tmr_ext32 = (f->flags & FADT_FLAG_TMR_VAL_EXT) != 0;
 
     /* Reset register: only valid if FADT::FLAGS bit 10 is set AND the
      * FADT is large enough to actually contain the GAS. We accept

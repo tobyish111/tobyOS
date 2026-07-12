@@ -4800,20 +4800,6 @@ static void reap_tracked(void) {
     }
 }
 
-/* True if any tracked desktop-launched app is still alive. The idle
- * loop never calls sched_yield itself (the kernel is cooperative);
- * if we have live apps, gui_tick yields once per call so they get
- * CPU time without us having to run them in the foreground. */
-static bool any_tracked_alive(void) {
-    for (int i = 0; i < TRACKED_PIDS_MAX; i++) {
-        int pid = g.tracked_pids[i];
-        if (pid == 0) continue;
-        struct proc *p = proc_lookup(pid);
-        if (p && p->state != PROC_TERMINATED) return true;
-    }
-    return false;
-}
-
 /* Set by idle_loop around its gui_tick() call. idle_loop IS pid 0 and holds
  * the BKL, so this is the authoritative "running as the pid-0 compositor
  * driver" signal -- used because current_proc() (gs-relative per-CPU current)
@@ -5004,21 +4990,27 @@ void gui_tick(void) {
 
     /* Cooperative scheduling.
      *
-     * pid 0 path: hand the CPU to any tracked desktop app that still
-     *             wants to run. Done AFTER compositor_pass so the app
-     *             sees a freshly-painted screen and a clean event queue.
+     * pid 0 path: hand the CPU to ANY runnable proc. Done AFTER
+     *             compositor_pass so the app sees a freshly-painted
+     *             screen and a clean event queue. This used to be
+     *             gated on any_tracked_alive() ("a tracked desktop
+     *             app is still alive") -- but procs spawned outside
+     *             the desktop launcher (TKAPP-harness session apps,
+     *             kernel workers like the async-HTTP 'httpa') are not
+     *             in tracked_pids, so the moment the last tracked
+     *             proc died (login, once its service restarts ended),
+     *             pid 0 stopped yielding FOREVER and every runnable
+     *             proc starved READY-on-queue -- an intermittent
+     *             full-app freeze. sched_yield's fast path returns in
+     *             ~25 cycles when this CPU's ready queue is empty, so
+     *             yielding unconditionally costs nothing when idle.
      * app path:   yield to pid 0 when either:
      *             (a) this syscall dirtied the compositor (app flipped)
      *             (b) there's pending input that pid 0 needs to boost
      *             Either way, getting pid 0 on CPU fast keeps the
      *             compositor responsive and input latency minimal. */
     if (on_pid0) {
-        if (any_tracked_alive()) {
-            if (g_trace >= GUI_TRACE_VERBOSE) {
-                gui_trace_logf("gui_tick: pid0 yielding to tracked app");
-            }
-            sched_yield();
-        }
+        sched_yield();
     } else if (g.dirty || g.input_boost_pid > 0) {
         if (g_trace >= GUI_TRACE_VERBOSE) {
             gui_trace_logf("gui_tick: app yielding to pid0 (dirty=%d boost=%d)",

@@ -2,9 +2,9 @@
 
 Branch `browser-css-anim`, off `main`. Adds CSS animation to the engine —
 the last of the "feels modern" visual gaps. This arc is sliced:
-1. **`@keyframes` animations** (this slice) — driving the *cheap*
+1. **`@keyframes` animations** (DONE) — driving the *cheap*
    properties that work in the immediate-mode painter.
-2. CSS transitions (change-detection on restyle).
+2. **CSS transitions** (DONE) — change-detection on restyle.
 3. `transform: scale`/`rotate` (needs compositing-layer work).
 
 ## Slice 1 — `@keyframes` animations (DONE)
@@ -51,34 +51,104 @@ yet (the events are registered in the prelude; wiring the dispatch is a
 follow-up). Per-frame full reflow is fine for a few animated elements but
 not free — a display-list-only fast path is a later optimization.
 
-## Slice 2 — CSS transitions (IMPLEMENTED, verification BLOCKED)
-The engine side is written and compiles: `transition` shorthand +
-longhands parse into non-inherited `cstyle` fields (`trans_mask`/
-`trans_dur`/`trans_delay`/`trans_flags`); a per-node `g_trans[]` runtime
-holds from/to/current per transitionable property (color, background-color,
-transform: translate); `trans_apply` runs after `anim_apply` and before
-layout, detects when a freshly-cascaded value differs from its target, and
-eases from the current displayed value to the new one (shared `css_ease`
-smoothstep), overriding `st` and keeping `g_anim_active` set while running.
+## Slice 2 — CSS transitions (DONE, on-screen verified)
+The engine side: `transition` shorthand + longhands parse into
+non-inherited `cstyle` fields (`trans_mask`/`trans_dur`/`trans_delay`/
+`trans_flags`); a per-node `g_trans[]` runtime holds from/to/current per
+transitionable property (color, background-color, transform: translate);
+`trans_apply` runs after `anim_apply` and before layout, detects when a
+freshly-cascaded value differs from its target, and eases from the current
+displayed value to the new one (shared `css_ease` smoothstep), overriding
+`st` and keeping `g_anim_active` set while running.
 
-**Could not verify on screen.** The mechanism is a straight extension of
-the working `@keyframes` path, but the headless test can't demonstrate it:
-- A page's `setInterval` never fires while the page is otherwise idle
-  (the JS callback that would change a transitioned value doesn't run).
-- Triggering the change via a **keydown** (which the SPA proves dispatches)
-  *does* run the handler and change the style — but the render loop then
-  **freezes** (frame counter stuck, 0 fps): the transition starts but
-  never advances on screen.
-- Underlying both: the browser process is heavily **starved** in the
-  headless harness — `@keyframes` (slice 1) visibly ran but at ~15% real
-  time (a `2s` slide covered ~1/4 of its range in 3 s).
+### Verified
+Host page with `transition: background-color 2s linear, transform 2s
+linear` whose inline style is toggled by a `setInterval(fn, 6000)` — JS
+sets `backgroundColor` `#ee3333`↔`#3399ff` and `transform`
+`translateX(0)`↔`translateX(190px)`. 32 QMP screenshots 2 s apart across
+~5 toggle cycles show the box **easing**: e.g. idle `x=5 #ee3333` →
+mid-transition `x=107 #896aa1` (the exact 50% linear lerp of the two
+colors) → settled `x=195 #3399ff`, then back through `#4192f0`/`#c34a61`.
+Serial instrumentation confirmed the whole chain: `setInterval` fires
+every 6 s of guest time while the page is idle, `trans_apply` starts the
+per-node transitions on each toggle, and `anim_pump` renders ~30 fps
+(32 ms throttle) while `g_anim_active`, dropping back to 0 frames when the
+transition completes.
 
-This is an event-loop / scheduling interaction, not obviously a bug in the
-transition interpolation itself, and needs focused follow-up (serial
-instrumentation in the render loop; and understanding why a JS-triggered
-`g_anim_active` doesn't sustain the pump the way an initial-render one
-does). Until then slice 2 is **unverified** and should not be treated as
-working.
+### The earlier "verification BLOCKED" was a harness artifact, not a bug
+A previous attempt concluded idle `setInterval` never fires, and that a
+keydown-triggered transition freezes the render loop. Instrumenting the
+main loop disproved all of it — the loop iterates ~65×/guest-second when
+idle, timers fire on schedule, and JS-triggered transitions sustain
+`anim_pump` exactly like initial-render `@keyframes`. The real causes:
+1. **The test page bound the toggle handler twice** —
+   `document.addEventListener('keydown', ...)` *and* `window.onkeydown`.
+   Keydown bubbles to both (spec-correct), so one keypress toggled twice
+   and the 1 s transition instantly reversed back to its start color:
+   the screen "never changed" because the test canceled itself.
+2. **The rig's wall-clock window was too short.** `TKA_PUMP` deadlines
+   run on PIT ticks, and under heavy TCG load PIT interrupt delivery lags
+   ~10× behind the TSC/wall clock (userland `js_now_ms` → `SYS_CLOCK_MS`
+   → `perf_now_ns` is TSC-based and tracks wall time). The TKAPP
+   typing/hold phases therefore consumed nearly the whole driver window,
+   and the run ended before a 1 s interval timer was ever observed.
+3. The "0 fps freeze / ~15% real speed starvation" was the same skew plus
+   full-desktop composites costing seconds of wall time under TCG —
+   sparse frames, not a starved process or a stuck loop.
+
+Harness rules that came out of this (used by the verifying rig
+`drive_trans3.py`/`websrv_trans3.py`): make the page self-driving via
+`setInterval` (≥6 s period so a 2 s transition completes between
+toggles), give the driver a long GET deadline (240 s) and a long
+screenshot window (32 shots × 2 s), and never bind the same test handler
+at two bubble levels.
+
+### Kernel fix that fell out: TSC calibration vs a lagging PIT
+Three later clean-build runs looked **wedged** (serial + repaints stopped
+seconds after boot; heartbeat printed once and never again) — QMP
+`info registers` on the "wedged" guest showed it was alive and healthy
+(browser parked in `sys_nanosleep`, kernel in the yield path) but
+`perf_now_ns` values in the registers advanced at **6.4% of wall time**,
+with `g_tsc_khz` ≈ 67 GHz on a ~4.3 GHz host. Root cause: `perf_init()`
+calibrates the TSC by counting cycles across 5 **PIT interrupts**; under
+loaded QEMU TCG those IRQs arrive many times late, so the measured rate
+is inflated by the same factor and the ENTIRE OS clock (`SYS_CLOCK_MS` →
+`js_now_ms`, `sys_nanosleep`, heartbeats, service timers) runs slow by
+that factor for the whole session. Run-to-run variance of that boot-time
+lag is exactly the long-standing "TKAPP boot intermittently stalls"
+flake, and it produced every timing symptom above.
+
+Fix (this branch): `perf_recalibrate_pmt()` in `src/perf.c` re-measures
+the TSC rate against the ACPI PM timer — a free-running 3.579545 MHz
+counter read by port I/O, immune to IRQ delivery — across a 50 ms
+window, then rebases `g_boot_tsc` so the `perf_now_ns` timeline stays
+continuous. `parse_fadt` now captures `PM_TMR_BLK` (X-GAS preferred,
+`TMR_VAL_EXT` for 24- vs 32-bit width), and `smp_init_bsp` calls the
+recalibration right after `acpi_init` — before `apic_init_bsp`, so the
+LAPIC timer calibration (`pit_sleep_ms` → `perf_now_ns`) also inherits
+the honest rate. The boot log prints the correction factor
+(`[perf] TSC recalibrated vs ACPI PM timer: ...`).
+
+### Kernel fix #2: pid 0 stopped scheduling untracked procs
+With the clock honest, transitions rendered on screen (eased frames in
+the screenshots) — but the browser then froze mid-transition, minutes
+in, at random. Heartbeat diagnostics showed browser + the `httpa`
+kernel worker READY **on** cpu 0's ready queue with cpu-time/syscall
+counters frozen for 40+ s while pid 0 idled in HLT: nothing was popping
+the queue. Root cause: `gui_tick`'s pid-0 cooperative yield was gated
+on `any_tracked_alive()` — "is a *desktop-launcher-tracked* app still
+alive" — but TKAPP-harness session apps (`winpe_spawn_session_app` →
+`proc_spawn`, no `track_pid`) and kernel workers are not in
+`tracked_pids`. The only tracked proc was login; when its service
+restarts ended, pid 0 stopped yielding permanently and every runnable
+proc starved. The stall never bit inside TKA_PUMP holds (that pump
+calls `sched_yield` unconditionally), which is why all previous
+short-window TKAPP rigs passed — and it is very likely the real
+identity of the long-standing "TKAPP boot intermittently stalls" flake.
+Fix: `gui_tick` pid-0 path now calls `sched_yield()` unconditionally
+(the scheduler's fast path returns in ~25 cycles when the ready queue
+is empty, so the tracked-alive gate saved nothing); the dead
+`any_tracked_alive()` helper is removed.
 
 ## Next slices
 - **Slice 3** — `transform: scale`/`rotate` (+ `opacity`): per-element

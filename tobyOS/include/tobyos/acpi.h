@@ -141,6 +141,14 @@ struct acpi_info {
     struct acpi_gas reset_reg;
     uint8_t   reset_value;
 
+    /* ACPI PM timer (FADT PM_TMR_BLK): a free-running 3.579545 MHz
+     * counter read by port I/O -- ticks honestly regardless of IRQ
+     * delivery, so perf.c uses it to recalibrate the TSC rate.
+     * pm_tmr == 0 means no PM timer on this platform. pm_tmr_ext32 is
+     * FADT::FLAGS bit 8 (TMR_VAL_EXT): counter is 32-bit, else 24. */
+    uint32_t  pm_tmr;
+    bool      pm_tmr_ext32;
+
     /* DSDT _S5_ package: the SLP_TYPa / SLP_TYPb values we need to
      * write to PM1a_CNT / PM1b_CNT to enter the soft-off (S5) state.
      * s5_ok = false if we couldn't grep _S5_ out of the DSDT. */

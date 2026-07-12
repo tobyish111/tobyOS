@@ -568,6 +568,14 @@ static void smp_init_bsp(void) {
                      ? normalise_rsdp_pointer(rsdp_req.response->address)
                      : 0;
     acpi_init(rsdp);
+    /* Recalibrate the TSC rate against the FADT's PM timer now that we
+     * know its port. perf_init's PIT-IRQ-based estimate can be inflated
+     * many-fold under loaded QEMU TCG (observed 15x: the whole OS clock
+     * -- SYS_CLOCK_MS, nanosleep, JS timers, heartbeats -- then runs at
+     * 1/15 speed and the desktop looks wedged). Must happen BEFORE
+     * apic_init_bsp so the LAPIC timer calibration (pit_sleep_ms ->
+     * perf_now_ns) measures against the honest rate. */
+    perf_recalibrate_pmt(acpi_get()->pm_tmr, acpi_get()->pm_tmr_ext32);
     if (!apic_init_bsp()) {
         kprintf("[boot] WARNING: BSP LAPIC init failed -- staying on PIC\n");
         return;
