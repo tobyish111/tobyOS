@@ -71,7 +71,7 @@ struct gui_event {
 #include <toby/tk.h>
 #include <toby/image.h>     /* stb_image-backed ARGB decoder (libtoby) */
 #include <toby/audio_decode.h>  /* real minimp3 MP3 decode (stage 13 media) */
-#include <toby/video_decode.h>  /* real h264bsd H.264 decode (stage 13 media) */
+#include <toby/video_decode.h>  /* real openh264 H.264 decode (stage 13 media) */
 /* QuickJS (third_party/quickjs, linked by the Makefile). Included this
  * early so its headers see none of the short macros defined below
  * (E, cur, g_raw, ...). Its inline helpers trip -Wextra; scoped off. */
@@ -9559,7 +9559,7 @@ static void media_ready(struct media_el *m) {
         m->state = 1;
     } else if (m->is_video && media_demux_avi(m) == 0) {
         /* Codec sniff on the first frame chunk: an Annex-B start code
-         * (00 00 [00] 01) means H.264 (stage 13: real h264bsd);
+         * (00 00 [00] 01) means H.264 (real openh264, all profiles);
          * FF D8 means MJPEG (stb JPEG per frame). */
         const uint8_t *f0 = m->data + m->frame_off[0];
         int l0 = m->frame_len[0];
@@ -9709,52 +9709,66 @@ static int media_pump(void) {
             if (m->nframes <= 0 || now < m->next_ms) continue;
             struct img *im = (m->img >= 0 && m->img < g_nimages)
                                  ? &g_images[m->img] : NULL;
-            if (im && im->pixels) {
-                if (m->vdec) {
-                    /* H.264: chunks decode in stream order; parameter-
-                     * set chunks yield no picture, so feed until one
-                     * lands (bounded). Be LENIENT about per-NAL errors
-                     * (SEI variants etc.) -- skip the chunk and keep
-                     * going; only give up after a sustained run. */
-                    for (int fed = 0; fed < 4 && m->cur_frame < m->nframes;
-                         fed++) {
-                        struct video_frame vf;
-                        int rc = video_decoder_decode(
+            if (!im || !im->pixels) {
+                m->cur_frame++;
+                if (m->cur_frame >= m->nframes) {
+                    if (m->loop) m->cur_frame = 0;
+                    else m->playing = 0;
+                }
+            } else if (m->vdec) {
+                /* H.264 via openh264. Feed samples in stream order until
+                 * a picture lands (parameter-set / reorder-held AUs yield
+                 * none). openh264 has a ~1-frame output delay, so once
+                 * the samples run out we FLUSH (nal_len == 0) to drain
+                 * the held picture(s) -- the last frame shows and the
+                 * loop boundary stays clean -- and only then wrap or
+                 * stop. Lenient on per-NAL errors (SEI variants etc.). */
+                struct video_frame vf;
+                for (int fed = 0; fed < 8; fed++) {
+                    int rc;
+                    if (m->cur_frame < m->nframes) {
+                        rc = video_decoder_decode(
                             (struct video_decoder *)m->vdec,
                             m->data + m->frame_off[m->cur_frame],
                             (size_t)m->frame_len[m->cur_frame], &vf);
                         m->cur_frame++;
-                        if (rc > 0) {
-                            m->vdec_errs = 0;
-                            media_blit_raw(im, (const uint32_t *)vf.data,
-                                           vf.width, vf.height);
-                            repaint = 1;
-                            break;
-                        }
-                        if (rc < 0 && ++m->vdec_errs > 60) {
-                            med_log("h264 giving up after errs",
-                                    m->vdec_errs, m->cur_frame);
-                            m->playing = 0;
+                    } else {
+                        rc = video_decoder_decode(
+                            (struct video_decoder *)m->vdec, NULL, 0, &vf);
+                        if (rc <= 0) {          /* decoder fully drained */
+                            if (m->loop) m->cur_frame = 0;
+                            else m->playing = 0;
                             break;
                         }
                     }
-                } else {
-                    toby_image_t *f = toby_image_load(
-                        m->data + m->frame_off[m->cur_frame],
-                        (size_t)m->frame_len[m->cur_frame]);
-                    if (f) {
-                        media_blit(im, f);
-                        toby_image_free(f);
+                    if (rc > 0) {
+                        m->vdec_errs = 0;
+                        media_blit_raw(im, (const uint32_t *)vf.data,
+                                       vf.width, vf.height);
                         repaint = 1;
+                        break;
                     }
-                    m->cur_frame++;
+                    if (rc < 0 && ++m->vdec_errs > 60) {
+                        med_log("h264 giving up after errs",
+                                m->vdec_errs, m->cur_frame);
+                        m->playing = 0;
+                        break;
+                    }
                 }
             } else {
+                toby_image_t *f = toby_image_load(
+                    m->data + m->frame_off[m->cur_frame],
+                    (size_t)m->frame_len[m->cur_frame]);
+                if (f) {
+                    media_blit(im, f);
+                    toby_image_free(f);
+                    repaint = 1;
+                }
                 m->cur_frame++;
-            }
-            if (m->cur_frame >= m->nframes) {
-                if (m->loop) m->cur_frame = 0;
-                else m->playing = 0;
+                if (m->cur_frame >= m->nframes) {
+                    if (m->loop) m->cur_frame = 0;
+                    else m->playing = 0;
+                }
             }
             long due = m->next_ms + m->frame_ms;
             m->next_ms = (due > now - 4 * m->frame_ms) ? due

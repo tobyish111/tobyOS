@@ -392,6 +392,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_cpptest/user_cpptest.elf \
             programs/user_oh264test/user_oh264test.elf \
             programs/user_bsdroute/user_bsdroute.elf \
+            programs/user_mp4play/user_mp4play.elf \
             programs/user_gui_term/user_gui_term.elf \
             programs/user_gui_files/user_gui_files.elf \
             programs/user_gui_viewer/user_gui_viewer.elf \
@@ -1256,6 +1257,7 @@ endef
 
 $(eval $(call LIBTOBY_CPP_PROGRAM_RULES,user_cpptest,user_cpptest))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_bsdroute,user_bsdroute))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_mp4play,user_mp4play))
 
 # /bin/oh264test (media slice 2): C++ decode-correctness test that links
 # the vendored openh264 ISVCDecoder out of libtoby.a. Same C++ program
@@ -2302,6 +2304,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_cpptest/user_cpptest.elf         $(INITRD_STAGE)/bin/cpptest
 	cp programs/user_oh264test/user_oh264test.elf     $(INITRD_STAGE)/bin/oh264test
 	cp programs/user_bsdroute/user_bsdroute.elf       $(INITRD_STAGE)/bin/bsdroute
+	cp programs/user_mp4play/user_mp4play.elf         $(INITRD_STAGE)/bin/mp4play
 	cp programs/user_gui_term/user_gui_term.elf       $(INITRD_STAGE)/bin/gui_term
 	cp programs/user_gui_files/user_gui_files.elf     $(INITRD_STAGE)/bin/gui_files
 	cp programs/user_gui_viewer/user_gui_viewer.elf   $(INITRD_STAGE)/bin/gui_viewer
@@ -2748,7 +2751,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
-	    bin/cpptest bin/oh264test bin/bsdroute                                      \
+	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play                          \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
 	    bin/gui_calc bin/gui_taskmgr bin/gui_edit bin/gui_browser         \
 	    bin/login bin/gui_settings bin/abi_test                           \

@@ -4313,8 +4313,8 @@ void _start(void) {
                 kprintf("[boot] OPENH264: oh264test (pid=%d) exit=%d (%s)\n",
                         ohpid, ohrc, ohrc == 0 ? "PASS" : "FAIL");
             }
-            /* /bin/bsdroute (a C program, like the browser) confirms the
-             * baseline path still routes to h264bsd + decodes. */
+            /* /bin/bsdroute (a C program, like the browser) confirms a
+             * baseline clip decodes through video_decoder (openh264). */
             char *bv[] = { (char *)"bsdroute", 0 };
             struct proc_spec bs = { .path = "/bin/bsdroute",
                 .name = "bsdroute", .argc = 1, .argv = bv,
@@ -4324,6 +4324,20 @@ void _start(void) {
                 int brc = proc_wait(bpid);
                 kprintf("[boot] OPENH264: bsdroute (pid=%d) exit=%d (%s)\n",
                         bpid, brc, brc == 0 ? "PASS" : "FAIL");
+            }
+            /* media slice 4: /bin/mp4play runs the browser's end-to-end
+             * <video> path -- MP4 demux -> video_decoder (openh264) ->
+             * ARGB -- on an embedded High-profile B-frame clip, matching
+             * every decoded frame to the ffmpeg reference. */
+            char *mv[] = { (char *)"mp4play", 0 };
+            struct proc_spec ms = { .path = "/bin/mp4play",
+                .name = "mp4play", .argc = 1, .argv = mv,
+                .envc = 1, .envp = ohe };
+            int mpid = proc_spawn(&ms);
+            if (mpid >= 0) {
+                int mrc = proc_wait(mpid);
+                kprintf("[boot] OPENH264: mp4play (pid=%d) exit=%d (%s)\n",
+                        mpid, mrc, mrc == 0 ? "PASS" : "FAIL");
             }
         }
 #endif
