@@ -4,8 +4,29 @@
 #define _LIBTOBY_MUTEX
 
 #include <pthread.h>
+#include <atomic>
+#include <utility>
 
 namespace std {
+
+/* ---- once_flag / call_once ---- */
+struct once_flag {
+    atomic<int> __state_;   /* 0 not-run, 1 running, 2 done */
+    constexpr once_flag() noexcept : __state_(0) {}
+    once_flag(const once_flag&) = delete;
+    once_flag& operator=(const once_flag&) = delete;
+};
+
+template <class _F, class... _A>
+void call_once(once_flag& __flag, _F&& __f, _A&&... __a) {
+    int __expected = 0;
+    if (__flag.__state_.compare_exchange_strong(__expected, 1)) {
+        static_cast<_F&&>(__f)(static_cast<_A&&>(__a)...);
+        __flag.__state_.store(2);
+    } else {
+        while (__flag.__state_.load() != 2) { /* another thread is running it */ }
+    }
+}
 
 class mutex {
     pthread_mutex_t __m_;

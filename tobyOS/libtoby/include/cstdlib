@@ -8,5 +8,10 @@ using ::malloc; using ::calloc; using ::realloc; using ::free;
 using ::abs;    using ::labs;
 using ::atoi;   using ::atol;   using ::strtol; using ::strtoul; using ::strtod;
 using ::qsort;  using ::exit;   using ::abort;  using ::rand;    using ::srand;
+
+/* C++ integer std::abs overloads (C's abs is int-only; without these a
+ * long/long long argument is ambiguous against the <cmath> float abs). */
+inline long abs(long __x) { return __x < 0 ? -__x : __x; }
+inline long long abs(long long __x) { return __x < 0 ? -__x : __x; }
 }
 #endif

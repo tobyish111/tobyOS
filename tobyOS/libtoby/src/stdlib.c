@@ -468,6 +468,18 @@ void *malloc(size_t n) {
     return malloc(n);
 }
 
+/* POSIX aligned allocation. malloc already hands out 16-byte-aligned
+ * payloads; alignments beyond that are only needed for SIMD (disabled in
+ * the codec builds), so this is malloc-backed and the pointer is a normal
+ * free()-able allocation. */
+int posix_memalign(void **memptr, size_t alignment, size_t size) {
+    (void)alignment;
+    if (!memptr) return EINVAL;
+    void *p = malloc(size);
+    *memptr = p;
+    return p ? 0 : ENOMEM;
+}
+
 void *calloc(size_t nmemb, size_t sz) {
     /* Overflow guard: refuse n*sz that would wrap. */
     if (sz != 0 && nmemb > ((size_t)-1) / sz) {

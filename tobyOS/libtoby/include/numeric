@@ -1,0 +1,43 @@
+/* <numeric> -- freestanding subset for tobyOS C++ (libgav1 support):
+ * accumulate, inner_product, iota, partial_sum. */
+#ifndef _LIBTOBY_NUMERIC
+#define _LIBTOBY_NUMERIC
+
+#include <cstddef>
+
+namespace std {
+
+template <class _It, class _T>
+constexpr _T accumulate(_It __f, _It __l, _T __init) {
+    for (; __f != __l; ++__f) __init = __init + *__f;
+    return __init;
+}
+template <class _It, class _T, class _Op>
+constexpr _T accumulate(_It __f, _It __l, _T __init, _Op __op) {
+    for (; __f != __l; ++__f) __init = __op(__init, *__f);
+    return __init;
+}
+
+template <class _A, class _B, class _T>
+constexpr _T inner_product(_A __f, _A __l, _B __f2, _T __init) {
+    for (; __f != __l; ++__f, ++__f2) __init = __init + (*__f) * (*__f2);
+    return __init;
+}
+
+template <class _It, class _T>
+constexpr void iota(_It __f, _It __l, _T __v) {
+    for (; __f != __l; ++__f, ++__v) *__f = __v;
+}
+
+template <class _In, class _Out>
+constexpr _Out partial_sum(_In __f, _In __l, _Out __d) {
+    if (__f == __l) return __d;
+    auto __sum = *__f;
+    *__d = __sum; ++__d;
+    for (++__f; __f != __l; ++__f, ++__d) { __sum = __sum + *__f; *__d = __sum; }
+    return __d;
+}
+
+}  // namespace std
+
+#endif /* _LIBTOBY_NUMERIC */

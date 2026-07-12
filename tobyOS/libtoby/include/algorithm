@@ -215,6 +215,25 @@ constexpr void sort(_It __f, _It __l) {
     });
 }
 
+/* partial_sort: put the smallest (middle-first) elements, sorted, into
+ * [first, middle) -- a selection sort selecting from [i, last). */
+template <class _It, class _Cmp>
+constexpr void partial_sort(_It __f, _It __m, _It __l, _Cmp __c) {
+    for (_It __i = __f; __i != __m; ++__i) {
+        _It __sel = __i;
+        for (_It __j = __i; __j != __l; ++__j) if (__c(*__j, *__sel)) __sel = __j;
+        if (__sel != __i) swap(*__i, *__sel);
+    }
+}
+template <class _It>
+constexpr void partial_sort(_It __f, _It __m, _It __l) {
+    partial_sort(__f, __m, __l,
+                 [](const typename iterator_traits<_It>::value_type& __a,
+                    const typename iterator_traits<_It>::value_type& __b) {
+                     return __a < __b;
+                 });
+}
+
 }  // namespace std
 
 #endif /* _LIBTOBY_ALGORITHM */

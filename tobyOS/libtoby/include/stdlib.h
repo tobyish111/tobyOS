@@ -22,6 +22,11 @@ void  *malloc (size_t n);
 void  *calloc (size_t nmemb, size_t sz);
 void  *realloc(void *p, size_t n);
 void   free   (void *p);
+/* POSIX aligned allocation. libtoby's malloc already returns 16-byte
+ * aligned memory; larger alignments are only needed for SIMD (which the
+ * codecs disable), so this is malloc-backed and the result frees with
+ * free(). */
+int    posix_memalign(void **memptr, size_t alignment, size_t size);
 
 void   exit   (int code) __attribute__((noreturn));
 void   abort  (void)     __attribute__((noreturn));

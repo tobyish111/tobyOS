@@ -55,6 +55,24 @@ void *operator new[](size_t n, const std::nothrow_t &) noexcept {
 void operator delete(void *p, const std::nothrow_t &) noexcept { free(p); }
 void operator delete[](void *p, const std::nothrow_t &) noexcept { free(p); }
 
+/* Over-aligned variants (C++17, declared in <new>). libtoby's malloc is
+ * 16-byte aligned and larger alignments matter only for SIMD (disabled in
+ * the codec builds), so alignment is honored on a best-effort basis. */
+void *operator new(size_t n, std::align_val_t) { return operator new(n); }
+void *operator new[](size_t n, std::align_val_t) { return operator new(n); }
+void operator delete(void *p, std::align_val_t) noexcept { free(p); }
+void operator delete[](void *p, std::align_val_t) noexcept { free(p); }
+void operator delete(void *p, size_t, std::align_val_t) noexcept { free(p); }
+void operator delete[](void *p, size_t, std::align_val_t) noexcept { free(p); }
+void *operator new(size_t n, std::align_val_t, const std::nothrow_t &) noexcept {
+    return malloc(n ? n : 1);
+}
+void *operator new[](size_t n, std::align_val_t, const std::nothrow_t &) noexcept {
+    return malloc(n ? n : 1);
+}
+void operator delete(void *p, std::align_val_t, const std::nothrow_t &) noexcept { free(p); }
+void operator delete[](void *p, std::align_val_t, const std::nothrow_t &) noexcept { free(p); }
+
 /* ---- Itanium C++ ABI hooks --------------------------------------- */
 
 extern "C" {

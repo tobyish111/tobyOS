@@ -1063,6 +1063,32 @@ $(OPENH264_DIR)/%.o: $(OPENH264_DIR)/%.cpp Makefile
 $(OPENH264_DIR)/%.pic.o: $(OPENH264_DIR)/%.cpp Makefile
 	$(CXX) $(OPENH264_INC) $(LIBTOBY_CXXFLAGS) -fPIC -msse -msse2 -w -c $< -o $@
 
+# libgav1 (Google AV1 decoder, BSD-3) -- decode subset for AVIF, built
+# freestanding on the tobyOS C++ STL. No arch SIMD (LIBGAV1_ENABLE_*=0 ->
+# C fallbacks); the thread pool uses the STL's std::mutex/condition_variable
+# (LIBGAV1_THREADPOOL_USE_STD_MUTEX=1) so no abseil is pulled. malloc.h is
+# shimmed for posix_memalign. Archive semantics keep this inert until the
+# image loader routes to it. -w: vendored reference code.
+LIBGAV1_DIR  := third_party/libgav1
+LIBGAV1_SRCS := $(wildcard $(LIBGAV1_DIR)/src/*.cc) \
+    $(wildcard $(LIBGAV1_DIR)/src/dsp/*.cc) \
+    $(wildcard $(LIBGAV1_DIR)/src/tile/*.cc) \
+    $(wildcard $(LIBGAV1_DIR)/src/utils/*.cc) \
+    $(wildcard $(LIBGAV1_DIR)/src/post_filter/*.cc)
+LIBGAV1_OBJS     := $(LIBGAV1_SRCS:.cc=.o)
+LIBGAV1_PIC_OBJS := $(LIBGAV1_SRCS:.cc=.pic.o)
+LIBGAV1_INC := -I $(LIBGAV1_DIR)/shim -I $(LIBGAV1_DIR) -I $(LIBGAV1_DIR)/src
+LIBGAV1_CFG := -DLIBGAV1_MAX_BITDEPTH=8 -DLIBGAV1_THREADPOOL_USE_STD_MUTEX=1 \
+    -DLIBGAV1_ENABLE_NEON=0 -DLIBGAV1_ENABLE_SSE4_1=0 -DLIBGAV1_ENABLE_AVX2=0 \
+    -DLIBGAV1_ENABLE_LOGGING=0
+LIBTOBY_OBJS += $(LIBGAV1_OBJS)
+
+$(LIBGAV1_DIR)/%.o: $(LIBGAV1_DIR)/%.cc Makefile
+	$(CXX) $(LIBGAV1_INC) $(LIBGAV1_CFG) $(LIBTOBY_CXXFLAGS) -msse -msse2 -w -c $< -o $@
+
+$(LIBGAV1_DIR)/%.pic.o: $(LIBGAV1_DIR)/%.cc Makefile
+	$(CXX) $(LIBGAV1_INC) $(LIBGAV1_CFG) $(LIBTOBY_CXXFLAGS) -fPIC -msse -msse2 -w -c $< -o $@
+
 $(LIBTOBY_CRT0): $(LIBTOBY_SRC)/crt0.S
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -1104,6 +1130,7 @@ LIBTOBY_PIC_OBJS    += $(LIBTOBY_ASM_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBWEBP_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(H264BSD_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(OPENH264_PIC_OBJS)
+LIBTOBY_PIC_OBJS    += $(LIBGAV1_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBTOBY_SRC)/cxxrt.pic.o $(LIBTOBY_SRC)/oh264_glue.pic.o
 LIBTOBY_PIC_CFLAGS  := $(LIBTOBY_BUILD_CFLAGS) -fPIC
 

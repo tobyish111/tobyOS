@@ -8,6 +8,7 @@
 #include <type_traits>
 #include <utility>
 #include <new>
+#include <atomic>
 
 namespace std {
 
@@ -166,6 +167,167 @@ template <class _T, class _U>
 constexpr bool operator==(const allocator<_T>&, const allocator<_U>&) noexcept { return true; }
 template <class _T, class _U>
 constexpr bool operator!=(const allocator<_T>&, const allocator<_U>&) noexcept { return false; }
+
+/* ---- shared_ptr / weak_ptr (atomic-refcounted control block) ---- */
+class __sp_cb {
+public:
+    atomic<long> __use_;
+    atomic<long> __weak_;
+    __sp_cb() noexcept : __use_(1), __weak_(1) {}
+    virtual ~__sp_cb() {}
+    virtual void __destroy() noexcept = 0;
+
+    void __incref() noexcept { __use_.fetch_add(1, memory_order_relaxed); }
+    bool __incref_nz() noexcept {
+        long __c = __use_.load(memory_order_relaxed);
+        while (__c != 0) {
+            if (__use_.compare_exchange_weak(__c, __c + 1, memory_order_relaxed)) return true;
+        }
+        return false;
+    }
+    void __incwref() noexcept { __weak_.fetch_add(1, memory_order_relaxed); }
+    void __decref() noexcept {
+        if (__use_.fetch_sub(1, memory_order_acq_rel) == 1) { __destroy(); __decwref(); }
+    }
+    void __decwref() noexcept {
+        if (__weak_.fetch_sub(1, memory_order_acq_rel) == 1) delete this;
+    }
+    long __count() const noexcept { return __use_.load(memory_order_relaxed); }
+};
+
+template <class _T, class _D>
+class __sp_cb_ptr : public __sp_cb {
+    _T* __p_; _D __d_;
+public:
+    __sp_cb_ptr(_T* __p, _D __d) : __p_(__p), __d_(static_cast<_D&&>(__d)) {}
+    void __destroy() noexcept override { __d_(__p_); }
+};
+
+template <class _T>
+class __sp_cb_obj : public __sp_cb {
+    typename aligned_storage<sizeof(_T), alignof(_T)>::type __buf_;
+public:
+    template <class... _A> explicit __sp_cb_obj(_A&&... __a) {
+        ::new ((void*)&__buf_) _T(static_cast<_A&&>(__a)...);
+    }
+    _T* __get() noexcept { return reinterpret_cast<_T*>(&__buf_); }
+    void __destroy() noexcept override { __get()->~_T(); }
+};
+
+template <class _T> class weak_ptr;
+
+template <class _T>
+class shared_ptr {
+    _T*      __p_ = nullptr;
+    __sp_cb* __cb_ = nullptr;
+    template <class> friend class shared_ptr;
+    template <class> friend class weak_ptr;
+    shared_ptr(_T* __p, __sp_cb* __cb) noexcept : __p_(__p), __cb_(__cb) {}  /* adopt */
+public:
+    typedef _T element_type;
+    constexpr shared_ptr() noexcept {}
+    constexpr shared_ptr(decltype(nullptr)) noexcept {}
+    template <class _Y> explicit shared_ptr(_Y* __p)
+        : __p_(__p), __cb_(new __sp_cb_ptr<_Y, default_delete<_Y> >(__p, default_delete<_Y>())) {}
+    template <class _Y, class _D> shared_ptr(_Y* __p, _D __d)
+        : __p_(__p), __cb_(new __sp_cb_ptr<_Y, _D>(__p, static_cast<_D&&>(__d))) {}
+
+    shared_ptr(const shared_ptr& __o) noexcept : __p_(__o.__p_), __cb_(__o.__cb_) {
+        if (__cb_) __cb_->__incref();
+    }
+    template <class _Y> shared_ptr(const shared_ptr<_Y>& __o) noexcept
+        : __p_(__o.__p_), __cb_(__o.__cb_) { if (__cb_) __cb_->__incref(); }
+    shared_ptr(shared_ptr&& __o) noexcept : __p_(__o.__p_), __cb_(__o.__cb_) {
+        __o.__p_ = nullptr; __o.__cb_ = nullptr;
+    }
+    template <class _Y> shared_ptr(shared_ptr<_Y>&& __o) noexcept
+        : __p_(__o.__p_), __cb_(__o.__cb_) { __o.__p_ = nullptr; __o.__cb_ = nullptr; }
+    template <class _Y> shared_ptr(const shared_ptr<_Y>& __o, _T* __p) noexcept
+        : __p_(__p), __cb_(__o.__cb_) { if (__cb_) __cb_->__incref(); }   /* aliasing */
+
+    ~shared_ptr() { if (__cb_) __cb_->__decref(); }
+
+    shared_ptr& operator=(const shared_ptr& __o) noexcept { shared_ptr(__o).swap(*this); return *this; }
+    template <class _Y> shared_ptr& operator=(const shared_ptr<_Y>& __o) noexcept {
+        shared_ptr(__o).swap(*this); return *this;
+    }
+    shared_ptr& operator=(shared_ptr&& __o) noexcept {
+        shared_ptr(static_cast<shared_ptr&&>(__o)).swap(*this); return *this;
+    }
+    shared_ptr& operator=(decltype(nullptr)) noexcept { reset(); return *this; }
+
+    void reset() noexcept { shared_ptr().swap(*this); }
+    template <class _Y> void reset(_Y* __p) { shared_ptr(__p).swap(*this); }
+    void swap(shared_ptr& __o) noexcept {
+        _T* __tp = __p_; __p_ = __o.__p_; __o.__p_ = __tp;
+        __sp_cb* __tc = __cb_; __cb_ = __o.__cb_; __o.__cb_ = __tc;
+    }
+    _T* get() const noexcept { return __p_; }
+    _T& operator*() const noexcept { return *__p_; }
+    _T* operator->() const noexcept { return __p_; }
+    long use_count() const noexcept { return __cb_ ? __cb_->__count() : 0; }
+    bool unique() const noexcept { return use_count() == 1; }
+    explicit operator bool() const noexcept { return __p_ != nullptr; }
+
+    template <class _U, class... _A> friend shared_ptr<_U> make_shared(_A&&...);
+};
+
+template <class _T>
+class weak_ptr {
+    _T*      __p_ = nullptr;
+    __sp_cb* __cb_ = nullptr;
+    template <class> friend class shared_ptr;
+    template <class> friend class weak_ptr;
+public:
+    typedef _T element_type;
+    constexpr weak_ptr() noexcept {}
+    weak_ptr(const weak_ptr& __o) noexcept : __p_(__o.__p_), __cb_(__o.__cb_) {
+        if (__cb_) __cb_->__incwref();
+    }
+    template <class _Y> weak_ptr(const shared_ptr<_Y>& __o) noexcept
+        : __p_(__o.__p_), __cb_(__o.__cb_) { if (__cb_) __cb_->__incwref(); }
+    template <class _Y> weak_ptr(const weak_ptr<_Y>& __o) noexcept
+        : __p_(__o.__p_), __cb_(__o.__cb_) { if (__cb_) __cb_->__incwref(); }
+    weak_ptr(weak_ptr&& __o) noexcept : __p_(__o.__p_), __cb_(__o.__cb_) {
+        __o.__p_ = nullptr; __o.__cb_ = nullptr;
+    }
+    ~weak_ptr() { if (__cb_) __cb_->__decwref(); }
+
+    weak_ptr& operator=(const weak_ptr& __o) noexcept { weak_ptr(__o).swap(*this); return *this; }
+    template <class _Y> weak_ptr& operator=(const shared_ptr<_Y>& __o) noexcept {
+        weak_ptr(__o).swap(*this); return *this;
+    }
+    weak_ptr& operator=(weak_ptr&& __o) noexcept {
+        weak_ptr(static_cast<weak_ptr&&>(__o)).swap(*this); return *this;
+    }
+    void swap(weak_ptr& __o) noexcept {
+        _T* __tp = __p_; __p_ = __o.__p_; __o.__p_ = __tp;
+        __sp_cb* __tc = __cb_; __cb_ = __o.__cb_; __o.__cb_ = __tc;
+    }
+    void reset() noexcept { weak_ptr().swap(*this); }
+    long use_count() const noexcept { return __cb_ ? __cb_->__count() : 0; }
+    bool expired() const noexcept { return use_count() == 0; }
+    shared_ptr<_T> lock() const noexcept {
+        if (__cb_ && __cb_->__incref_nz()) return shared_ptr<_T>(__p_, __cb_);
+        return shared_ptr<_T>();
+    }
+};
+
+template <class _T, class... _A>
+shared_ptr<_T> make_shared(_A&&... __a) {
+    __sp_cb_obj<_T>* __cb = new __sp_cb_obj<_T>(static_cast<_A&&>(__a)...);
+    return shared_ptr<_T>(__cb->__get(), __cb);
+}
+
+template <class _T> void swap(shared_ptr<_T>& __a, shared_ptr<_T>& __b) noexcept { __a.swap(__b); }
+template <class _T, class _U>
+bool operator==(const shared_ptr<_T>& __a, const shared_ptr<_U>& __b) noexcept { return __a.get() == __b.get(); }
+template <class _T, class _U>
+bool operator!=(const shared_ptr<_T>& __a, const shared_ptr<_U>& __b) noexcept { return __a.get() != __b.get(); }
+template <class _T>
+bool operator==(const shared_ptr<_T>& __a, decltype(nullptr)) noexcept { return !__a; }
+template <class _T>
+bool operator!=(const shared_ptr<_T>& __a, decltype(nullptr)) noexcept { return (bool)__a; }
 
 template <class _A> struct allocator_traits {
     typedef _A allocator_type;
