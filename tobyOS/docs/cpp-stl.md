@@ -77,8 +77,27 @@ The header base everything else builds on:
   `==`, `std::get`, and the tuple protocol (`tuple_size`/`tuple_element`
   for structured bindings).
 
-## Next slices
-- **Slice 3** -- `<vector>`, `<string>`, `<tuple>`, `<functional>`.
+## Slice 3 -- vector, string, tuple, functional (DONE, 103/103)
+- **`<vector>`** -- a move-aware dynamic array over raw storage
+  (`::operator new` + placement new; no exceptions, so growth just
+  allocates/moves/frees). Full modifier set (push_back/emplace_back/
+  pop_back/insert/erase/resize/reserve/assign/clear), element access,
+  iterators, `==`, and correct handling of heap-owning element types
+  (`vector<string>` copies deep and moves on grow).
+- **`<string>`** -- heap-backed `basic_string<char>` (no SSO): ctors,
+  `size`/`capacity`/`reserve`/`resize`, `[]`/`at`/`front`/`back`/`c_str`/
+  `data`, `append`/`+=`/`push_back`, `operator+`, `compare`/`==`/`<`,
+  `substr`, `find`, iterators, plus `std::to_string`.
+- **`<tuple>`** -- recursive head/tail composition with `get<I>`,
+  `make_tuple`/`tie` (+ `std::ignore`, via an element-wise assignment that
+  writes through reference members)/`forward_as_tuple`, and
+  `tuple_size`/`tuple_element`.
+- **`<functional>`** -- `std::function` (type-erased, heap-backed;
+  virtual dispatch works fine without RTTI), `reference_wrapper` +
+  `ref`/`cref`, and the common function objects (`less`/`greater`/
+  `equal_to`/`plus`/`minus`, incl. the transparent `<void>` forms).
+
+## Next slice
 - **Slice 4** -- `<atomic>`, `<mutex>`/`<condition_variable>`/`<thread>`
   (over libtoby pthreads, or single-threaded stubs), `<chrono>`, and
   minimal `<ostream>`/`<sstream>`.

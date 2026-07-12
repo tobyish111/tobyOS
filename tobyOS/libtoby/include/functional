@@ -1,0 +1,106 @@
+/* <functional> -- freestanding subset for tobyOS C++ (STL slice 3):
+ * std::function (type-erased, heap-backed; virtual dispatch works without
+ * RTTI), reference_wrapper + ref/cref, and the common function objects. */
+#ifndef _LIBTOBY_FUNCTIONAL
+#define _LIBTOBY_FUNCTIONAL
+
+#include <cstddef>
+#include <new>
+#include <type_traits>
+#include <utility>
+
+namespace std {
+
+/* ---- function objects ---- */
+template <class _T = void> struct less {
+    constexpr bool operator()(const _T& __a, const _T& __b) const { return __a < __b; }
+};
+template <> struct less<void> {
+    template <class _A, class _B> constexpr auto operator()(_A&& __a, _B&& __b) const
+        { return static_cast<_A&&>(__a) < static_cast<_B&&>(__b); }
+};
+template <class _T = void> struct greater {
+    constexpr bool operator()(const _T& __a, const _T& __b) const { return __a > __b; }
+};
+template <> struct greater<void> {
+    template <class _A, class _B> constexpr auto operator()(_A&& __a, _B&& __b) const
+        { return static_cast<_A&&>(__a) > static_cast<_B&&>(__b); }
+};
+template <class _T = void> struct equal_to {
+    constexpr bool operator()(const _T& __a, const _T& __b) const { return __a == __b; }
+};
+template <class _T = void> struct plus {
+    constexpr _T operator()(const _T& __a, const _T& __b) const { return __a + __b; }
+};
+template <class _T = void> struct minus {
+    constexpr _T operator()(const _T& __a, const _T& __b) const { return __a - __b; }
+};
+
+/* ---- reference_wrapper ---- */
+template <class _T> class reference_wrapper {
+    _T* __p_;
+public:
+    typedef _T type;
+    reference_wrapper(_T& __r) noexcept : __p_(addressof(__r)) {}
+    reference_wrapper(const reference_wrapper&) noexcept = default;
+    operator _T&() const noexcept { return *__p_; }
+    _T& get() const noexcept { return *__p_; }
+    template <class... _A> auto operator()(_A&&... __a) const
+        { return (*__p_)(static_cast<_A&&>(__a)...); }
+};
+template <class _T> reference_wrapper<_T> ref(_T& __t) noexcept { return reference_wrapper<_T>(__t); }
+template <class _T> reference_wrapper<const _T> cref(const _T& __t) noexcept { return reference_wrapper<const _T>(__t); }
+
+/* ---- function ---- */
+template <class> class function;
+
+template <class _R, class... _A>
+class function<_R(_A...)> {
+    struct __base {
+        virtual _R    __call(_A...) = 0;
+        virtual __base* __clone() const = 0;
+        virtual ~__base() {}
+    };
+    template <class _F> struct __impl : __base {
+        _F __f_;
+        explicit __impl(const _F& __f) : __f_(__f) {}
+        explicit __impl(_F&& __f) : __f_(static_cast<_F&&>(__f)) {}
+        _R __call(_A... __a) override { return __f_(static_cast<_A&&>(__a)...); }
+        __base* __clone() const override { return new __impl(__f_); }
+    };
+    __base* __p_ = nullptr;
+public:
+    function() noexcept {}
+    function(decltype(nullptr)) noexcept {}
+    template <class _F> function(_F __f) : __p_(new __impl<_F>(static_cast<_F&&>(__f))) {}
+    function(const function& __o) : __p_(__o.__p_ ? __o.__p_->__clone() : nullptr) {}
+    function(function&& __o) noexcept : __p_(__o.__p_) { __o.__p_ = nullptr; }
+    ~function() { delete __p_; }
+
+    function& operator=(const function& __o) {
+        if (this != &__o) { delete __p_; __p_ = __o.__p_ ? __o.__p_->__clone() : nullptr; }
+        return *this;
+    }
+    function& operator=(function&& __o) noexcept {
+        if (this != &__o) { delete __p_; __p_ = __o.__p_; __o.__p_ = nullptr; }
+        return *this;
+    }
+    template <class _F> function& operator=(_F&& __f) {
+        delete __p_; __p_ = new __impl<typename decay<_F>::type>(static_cast<_F&&>(__f));
+        return *this;
+    }
+    function& operator=(decltype(nullptr)) noexcept { delete __p_; __p_ = nullptr; return *this; }
+
+    _R operator()(_A... __a) const { return __p_->__call(static_cast<_A&&>(__a)...); }
+    explicit operator bool() const noexcept { return __p_ != nullptr; }
+    void swap(function& __o) noexcept { __base* __t = __p_; __p_ = __o.__p_; __o.__p_ = __t; }
+};
+
+template <class _S>
+inline bool operator==(const function<_S>& __f, decltype(nullptr)) noexcept { return !__f; }
+template <class _S>
+inline bool operator!=(const function<_S>& __f, decltype(nullptr)) noexcept { return (bool)__f; }
+
+}  // namespace std
+
+#endif /* _LIBTOBY_FUNCTIONAL */

@@ -1,0 +1,101 @@
+/* <tuple> -- freestanding std::tuple for tobyOS C++ (STL slice 3).
+ * Recursive head/tail composition with get<I>, make_tuple, tie, and the
+ * tuple_size/tuple_element protocol. */
+#ifndef _LIBTOBY_TUPLE
+#define _LIBTOBY_TUPLE
+
+#include <cstddef>
+#include <type_traits>
+#include <utility>
+
+namespace std {
+
+template <class... _T> struct tuple;
+template <> struct tuple<> {};
+
+template <class _H, class... _T>
+struct tuple<_H, _T...> {
+    _H          __head_;
+    tuple<_T...> __tail_;
+
+    constexpr tuple() : __head_(), __tail_() {}
+    constexpr explicit tuple(const _H& __h, const _T&... __t)
+        : __head_(__h), __tail_(__t...) {}
+    template <class _UH, class... _UT>
+    constexpr tuple(_UH&& __h, _UT&&... __t)
+        : __head_(static_cast<_UH&&>(__h)), __tail_(static_cast<_UT&&>(__t)...) {}
+
+    tuple(const tuple&) = default;
+    tuple(tuple&&) = default;
+    tuple& operator=(const tuple&) = default;
+    tuple& operator=(tuple&&) = default;
+
+    /* element-wise assignment from another tuple -- assigns THROUGH any
+     * reference members (this is what std::tie relies on). */
+    template <class _UH, class... _UT>
+    tuple& operator=(const tuple<_UH, _UT...>& __o) {
+        __head_ = __o.__head_;
+        __tail_ = __o.__tail_;
+        return *this;
+    }
+};
+
+/* ---- size / element ---- */
+template <class _T> struct tuple_size;
+template <class... _T> struct tuple_size<tuple<_T...> >
+    : integral_constant<size_t, sizeof...(_T)> {};
+
+template <size_t _I, class _T> struct tuple_element;
+template <size_t _I, class _H, class... _T>
+struct tuple_element<_I, tuple<_H, _T...> > : tuple_element<_I - 1, tuple<_T...> > {};
+template <class _H, class... _T>
+struct tuple_element<0, tuple<_H, _T...> > { typedef _H type; };
+
+/* ---- get<I> ---- */
+template <size_t _I> struct __tuple_at {
+    template <class _H, class... _T>
+    static constexpr auto& get(tuple<_H, _T...>& __t) { return __tuple_at<_I - 1>::get(__t.__tail_); }
+    template <class _H, class... _T>
+    static constexpr const auto& get(const tuple<_H, _T...>& __t) { return __tuple_at<_I - 1>::get(__t.__tail_); }
+};
+template <> struct __tuple_at<0> {
+    template <class _H, class... _T>
+    static constexpr _H& get(tuple<_H, _T...>& __t) { return __t.__head_; }
+    template <class _H, class... _T>
+    static constexpr const _H& get(const tuple<_H, _T...>& __t) { return __t.__head_; }
+};
+
+template <size_t _I, class... _T>
+constexpr typename tuple_element<_I, tuple<_T...> >::type& get(tuple<_T...>& __t) {
+    return __tuple_at<_I>::get(__t);
+}
+template <size_t _I, class... _T>
+constexpr const typename tuple_element<_I, tuple<_T...> >::type& get(const tuple<_T...>& __t) {
+    return __tuple_at<_I>::get(__t);
+}
+template <size_t _I, class... _T>
+constexpr typename tuple_element<_I, tuple<_T...> >::type&& get(tuple<_T...>&& __t) {
+    typedef typename tuple_element<_I, tuple<_T...> >::type _E;
+    return static_cast<_E&&>(__tuple_at<_I>::get(__t));
+}
+
+/* ---- make_tuple / tie / forward_as_tuple ---- */
+template <class... _T>
+constexpr tuple<typename decay<_T>::type...> make_tuple(_T&&... __t) {
+    return tuple<typename decay<_T>::type...>(static_cast<_T&&>(__t)...);
+}
+struct __ignore_t {
+    template <class _T> constexpr const __ignore_t& operator=(_T&&) const { return *this; }
+};
+inline constexpr __ignore_t ignore{};
+
+template <class... _T>
+constexpr tuple<_T&...> tie(_T&... __t) noexcept { return tuple<_T&...>(__t...); }
+template <class... _T>
+constexpr tuple<_T&&...> forward_as_tuple(_T&&... __t) noexcept {
+    return tuple<_T&&...>(static_cast<_T&&>(__t)...);
+}
+
+}  // namespace std
+
+#endif /* _LIBTOBY_TUPLE */

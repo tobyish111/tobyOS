@@ -18,6 +18,10 @@
 #include <algorithm>
 #include <memory>
 #include <array>
+#include <vector>
+#include <string>
+#include <tuple>
+#include <functional>
 
 static int g_pass = 0, g_fail = 0;
 static void check(const char *what, bool ok) {
@@ -211,6 +215,89 @@ static void test_array() {
     check("array tuple_size", std::tuple_size<std::array<int, 4>>::value == 4);
 }
 
+/* ---- vector (slice 3) ---- */
+static void test_vector() {
+    std::vector<int> v;
+    for (int i = 0; i < 10; ++i) v.push_back(i * i);
+    check("vector push_back/size", v.size() == 10 && v[3] == 9 && v[9] == 81);
+    check("vector capacity grew", v.capacity() >= 10);
+    int sum = 0; for (int x : v) sum += x;
+    check("vector range-for", sum == 285);
+    v.resize(3);
+    check("vector shrink", v.size() == 3 && v.back() == 4);
+    v.resize(6, 7);
+    check("vector grow+fill", v.size() == 6 && v[5] == 7);
+    std::vector<int> w = v;                         /* copy */
+    check("vector copy ==", w == v);
+    std::vector<int> u = std::move(v);              /* move */
+    check("vector move", u.size() == 6 && v.size() == 0);
+    u.erase(u.begin() + 1);
+    check("vector erase", u.size() == 5 && u[1] == 4);
+    u.insert(u.begin(), 99);
+    check("vector insert front", u[0] == 99 && u.size() == 6);
+    u.emplace_back(123);
+    check("vector emplace_back", u.back() == 123);
+
+    /* vector of a non-trivial (heap-owning) type */
+    std::vector<std::string> vs;
+    vs.push_back("alpha");
+    vs.push_back("beta");
+    vs.emplace_back("gamma");
+    check("vector<string>", vs.size() == 3 && vs[2] == "gamma");
+    std::vector<std::string> vs2 = vs;              /* deep copy + grow moves */
+    check("vector<string> copy", vs2[0] == "alpha");
+}
+
+/* ---- string (slice 3) ---- */
+static void test_string() {
+    std::string s = "hello";
+    check("string size", s.size() == 5 && s[0] == 'h');
+    s += ", ";
+    s += "world";
+    check("string +=", s == "hello, world" && std::strcmp(s.c_str(), "hello, world") == 0);
+    std::string t = s + "!";
+    check("string +", t == "hello, world!");
+    check("string substr", s.substr(7) == "world");
+    check("string substr(pos,n)", s.substr(0, 5) == "hello");
+    check("string find", s.find("world") == 7 && s.find('z') == std::string::npos);
+    check("to_string(int)", std::to_string(-4096) == "-4096");
+    check("to_string(unsigned)", std::to_string(3000000000u) == "3000000000");
+    std::string big(100, 'x');
+    check("string(n,c)", big.size() == 100 && big[99] == 'x');
+}
+
+/* ---- tuple (slice 3) ---- */
+static void test_tuple() {
+    auto t = std::make_tuple(1, 2.5, 'z');
+    check("tuple get<0>", std::get<0>(t) == 1);
+    check("tuple get<2>", std::get<2>(t) == 'z');
+    check("tuple_size", std::tuple_size<decltype(t)>::value == 3);
+    std::get<0>(t) = 42;
+    check("tuple mutate", std::get<0>(t) == 42);
+    int a = 0; char b = 0;
+    std::tie(a, std::ignore, b) = std::make_tuple(7, 0.0, 'q');
+    check("tie unpack", a == 7 && b == 'q');
+}
+
+/* ---- functional (slice 3) ---- */
+static void test_functional() {
+    std::function<int(int, int)> add = [](int x, int y){ return x + y; };
+    check("function lambda", add(3, 4) == 7);
+    int base = 100;
+    std::function<int(int)> addbase = [base](int x){ return x + base; };
+    check("function capture", addbase(5) == 105);
+    std::function<int(int)> copy = addbase;         /* clone */
+    check("function copy", copy(1) == 101);
+    check("function bool", (bool)add && !std::function<void()>());
+    check("less<int>", std::less<int>()(2, 3) && !std::less<int>()(3, 2));
+    check("greater<int>", std::greater<int>()(3, 2));
+    int val = 55;
+    auto rw = std::ref(val);
+    check("reference_wrapper", rw.get() == 55);
+    val = 66;
+    check("reference_wrapper live", rw.get() == 66);
+}
+
 extern "C" int main(void) {
     test_type_traits();
     test_utility();
@@ -220,6 +307,10 @@ extern "C" int main(void) {
     test_algorithm();
     test_memory();
     test_array();
+    test_vector();
+    test_string();
+    test_tuple();
+    test_functional();
     std::printf("[stl] foundation self-test: %d/%d %s\n", g_pass, g_pass + g_fail,
                 g_fail == 0 ? "ALL PASS" : "FAILURES");
     return g_fail == 0 ? 0 : 1;

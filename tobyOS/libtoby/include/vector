@@ -1,0 +1,181 @@
+/* <vector> -- freestanding std::vector for tobyOS C++ (STL slice 3).
+ * A move-aware dynamic array over raw storage (::operator new + placement
+ * new); no exceptions (-fno-exceptions), so growth just allocates, moves,
+ * and frees. Enough of the interface for the STL and libgav1. */
+#ifndef _LIBTOBY_VECTOR
+#define _LIBTOBY_VECTOR
+
+#include <cstddef>
+#include <new>
+#include <type_traits>
+#include <utility>
+#include <initializer_list>
+#include <iterator>
+
+namespace std {
+
+template <class _T, class _Alloc = void>
+class vector {
+public:
+    typedef _T           value_type;
+    typedef _T*          pointer;
+    typedef const _T*    const_pointer;
+    typedef _T&          reference;
+    typedef const _T&    const_reference;
+    typedef _T*          iterator;
+    typedef const _T*    const_iterator;
+    typedef size_t       size_type;
+    typedef ptrdiff_t    difference_type;
+    typedef std::reverse_iterator<iterator>       reverse_iterator;
+    typedef std::reverse_iterator<const_iterator> const_reverse_iterator;
+
+    vector() noexcept : __b_(nullptr), __e_(nullptr), __z_(nullptr) {}
+    explicit vector(size_t __n) : vector() { resize(__n); }
+    vector(size_t __n, const _T& __v) : vector() {
+        __reserve_exact(__n);
+        for (size_t __i = 0; __i < __n; ++__i) __construct(__e_++, __v);
+    }
+    template <class _It>
+    vector(_It __f, _It __l) : vector() { for (; __f != __l; ++__f) push_back(*__f); }
+    vector(initializer_list<_T> __l) : vector() {
+        __reserve_exact(__l.size());
+        for (const _T& __v : __l) __construct(__e_++, __v);
+    }
+    vector(const vector& __o) : vector() {
+        __reserve_exact(__o.size());
+        for (const _T* __p = __o.__b_; __p != __o.__e_; ++__p) __construct(__e_++, *__p);
+    }
+    vector(vector&& __o) noexcept : __b_(__o.__b_), __e_(__o.__e_), __z_(__o.__z_) {
+        __o.__b_ = __o.__e_ = __o.__z_ = nullptr;
+    }
+    ~vector() { __destroy_all(); __free(__b_); }
+
+    vector& operator=(const vector& __o) {
+        if (this != &__o) { clear(); __reserve_exact(__o.size());
+            for (const _T* __p = __o.__b_; __p != __o.__e_; ++__p) __construct(__e_++, *__p); }
+        return *this;
+    }
+    vector& operator=(vector&& __o) noexcept {
+        if (this != &__o) { __destroy_all(); __free(__b_);
+            __b_ = __o.__b_; __e_ = __o.__e_; __z_ = __o.__z_;
+            __o.__b_ = __o.__e_ = __o.__z_ = nullptr; }
+        return *this;
+    }
+    vector& operator=(initializer_list<_T> __l) {
+        clear(); __reserve_exact(__l.size());
+        for (const _T& __v : __l) __construct(__e_++, __v);
+        return *this;
+    }
+    void assign(size_t __n, const _T& __v) {
+        clear(); __reserve_exact(__n);
+        for (size_t __i = 0; __i < __n; ++__i) __construct(__e_++, __v);
+    }
+    template <class _It> void assign(_It __f, _It __l) {
+        clear(); for (; __f != __l; ++__f) push_back(*__f);
+    }
+
+    /* element access */
+    reference operator[](size_t __i) { return __b_[__i]; }
+    const_reference operator[](size_t __i) const { return __b_[__i]; }
+    reference at(size_t __i) { return __b_[__i]; }
+    const_reference at(size_t __i) const { return __b_[__i]; }
+    reference front() { return *__b_; }
+    const_reference front() const { return *__b_; }
+    reference back() { return *(__e_ - 1); }
+    const_reference back() const { return *(__e_ - 1); }
+    _T* data() noexcept { return __b_; }
+    const _T* data() const noexcept { return __b_; }
+
+    /* iterators */
+    iterator begin() noexcept { return __b_; }
+    const_iterator begin() const noexcept { return __b_; }
+    const_iterator cbegin() const noexcept { return __b_; }
+    iterator end() noexcept { return __e_; }
+    const_iterator end() const noexcept { return __e_; }
+    const_iterator cend() const noexcept { return __e_; }
+    reverse_iterator rbegin() noexcept { return reverse_iterator(__e_); }
+    reverse_iterator rend() noexcept { return reverse_iterator(__b_); }
+
+    /* capacity */
+    bool empty() const noexcept { return __b_ == __e_; }
+    size_t size() const noexcept { return (size_t)(__e_ - __b_); }
+    size_t capacity() const noexcept { return (size_t)(__z_ - __b_); }
+    void reserve(size_t __n) { if (__n > capacity()) __regrow(__n); }
+    void shrink_to_fit() {}
+
+    /* modifiers */
+    void clear() noexcept { __destroy_all(); __e_ = __b_; }
+    void push_back(const _T& __v) { if (__e_ == __z_) __grow(); __construct(__e_++, __v); }
+    void push_back(_T&& __v) { if (__e_ == __z_) __grow(); __construct(__e_++, static_cast<_T&&>(__v)); }
+    template <class... _A> reference emplace_back(_A&&... __a) {
+        if (__e_ == __z_) __grow();
+        __construct(__e_, static_cast<_A&&>(__a)...);
+        return *__e_++;
+    }
+    void pop_back() { --__e_; __e_->~_T(); }
+    void resize(size_t __n) {
+        if (__n < size()) { while (size() > __n) pop_back(); }
+        else { reserve(__n); while (size() < __n) __construct(__e_++); }
+    }
+    void resize(size_t __n, const _T& __v) {
+        if (__n < size()) { while (size() > __n) pop_back(); }
+        else { reserve(__n); while (size() < __n) __construct(__e_++, __v); }
+    }
+    iterator erase(iterator __pos) {
+        for (iterator __p = __pos; __p + 1 != __e_; ++__p) *__p = static_cast<_T&&>(*(__p + 1));
+        pop_back(); return __pos;
+    }
+    iterator insert(iterator __pos, const _T& __v) {
+        size_t __off = (size_t)(__pos - __b_);
+        if (__e_ == __z_) __grow();
+        iterator __p = __b_ + __off;
+        if (__p != __e_) { __construct(__e_, static_cast<_T&&>(*(__e_ - 1)));
+            for (iterator __q = __e_ - 1; __q != __p; --__q) *__q = static_cast<_T&&>(*(__q - 1));
+            *__p = __v; ++__e_; }
+        else __construct(__e_++, __v);
+        return __p;
+    }
+    void swap(vector& __o) noexcept {
+        std::swap(__b_, __o.__b_); std::swap(__e_, __o.__e_); std::swap(__z_, __o.__z_);
+    }
+
+private:
+    _T* __b_; _T* __e_; _T* __z_;
+
+    static _T* __alloc(size_t __n) {
+        return __n ? static_cast<_T*>(::operator new(__n * sizeof(_T))) : nullptr;
+    }
+    static void __free(_T* __p) { ::operator delete(__p); }
+    template <class... _A> static void __construct(_T* __p, _A&&... __a) {
+        ::new ((void*)__p) _T(static_cast<_A&&>(__a)...);
+    }
+    void __destroy_all() noexcept { for (_T* __p = __b_; __p != __e_; ++__p) __p->~_T(); }
+
+    void __regrow(size_t __newcap) {
+        _T* __nb = __alloc(__newcap);
+        _T* __ne = __nb;
+        for (_T* __p = __b_; __p != __e_; ++__p, ++__ne) { __construct(__ne, static_cast<_T&&>(*__p)); __p->~_T(); }
+        __free(__b_);
+        __b_ = __nb; __e_ = __ne; __z_ = __nb + __newcap;
+    }
+    void __reserve_exact(size_t __n) { if (__n > capacity()) __regrow(__n); }
+    void __grow() {
+        size_t __cap = capacity();
+        __regrow(__cap ? __cap * 2 : 4);
+    }
+};
+
+template <class _T, class _A>
+void swap(vector<_T, _A>& __a, vector<_T, _A>& __b) noexcept { __a.swap(__b); }
+template <class _T, class _A>
+bool operator==(const vector<_T, _A>& __a, const vector<_T, _A>& __b) {
+    if (__a.size() != __b.size()) return false;
+    for (size_t __i = 0; __i < __a.size(); ++__i) if (!(__a[__i] == __b[__i])) return false;
+    return true;
+}
+template <class _T, class _A>
+bool operator!=(const vector<_T, _A>& __a, const vector<_T, _A>& __b) { return !(__a == __b); }
+
+}  // namespace std
+
+#endif /* _LIBTOBY_VECTOR */
