@@ -1,0 +1,131 @@
+/* <iterator> -- freestanding subset for tobyOS C++ (STL slice 2):
+ * iterator tags/traits, distance/advance/next/prev, reverse_iterator,
+ * back_inserter, and the free begin/end/size/data. */
+#ifndef _LIBTOBY_ITERATOR
+#define _LIBTOBY_ITERATOR
+
+#include <cstddef>
+#include <type_traits>
+
+namespace std {
+
+struct input_iterator_tag {};
+struct output_iterator_tag {};
+struct forward_iterator_tag : input_iterator_tag {};
+struct bidirectional_iterator_tag : forward_iterator_tag {};
+struct random_access_iterator_tag : bidirectional_iterator_tag {};
+
+template <class _It> struct iterator_traits {
+    typedef typename _It::difference_type   difference_type;
+    typedef typename _It::value_type        value_type;
+    typedef typename _It::pointer           pointer;
+    typedef typename _It::reference         reference;
+    typedef typename _It::iterator_category iterator_category;
+};
+template <class _T> struct iterator_traits<_T*> {
+    typedef ptrdiff_t                       difference_type;
+    typedef typename remove_cv<_T>::type    value_type;
+    typedef _T*                             pointer;
+    typedef _T&                             reference;
+    typedef random_access_iterator_tag      iterator_category;
+};
+
+template <class _It>
+constexpr typename iterator_traits<_It>::difference_type
+distance(_It __f, _It __l) {
+    typename iterator_traits<_It>::difference_type __n = 0;
+    for (; __f != __l; ++__f) ++__n;
+    return __n;
+}
+template <class _T>
+constexpr ptrdiff_t distance(_T* __f, _T* __l) { return __l - __f; }
+
+template <class _It, class _D>
+constexpr void advance(_It& __i, _D __n) {
+    for (; __n > 0; --__n) ++__i;
+    for (; __n < 0; ++__n) --__i;
+}
+template <class _It>
+constexpr _It next(_It __i, typename iterator_traits<_It>::difference_type __n = 1) {
+    advance(__i, __n); return __i;
+}
+template <class _It>
+constexpr _It prev(_It __i, typename iterator_traits<_It>::difference_type __n = 1) {
+    advance(__i, -__n); return __i;
+}
+
+/* ---- reverse_iterator ---- */
+template <class _It>
+class reverse_iterator {
+    _It __cur_;
+public:
+    typedef _It iterator_type;
+    typedef typename iterator_traits<_It>::value_type      value_type;
+    typedef typename iterator_traits<_It>::difference_type difference_type;
+    typedef typename iterator_traits<_It>::reference       reference;
+    typedef typename iterator_traits<_It>::pointer         pointer;
+
+    constexpr reverse_iterator() : __cur_() {}
+    constexpr explicit reverse_iterator(_It __x) : __cur_(__x) {}
+    constexpr _It base() const { return __cur_; }
+    constexpr reference operator*() const { _It __t = __cur_; return *--__t; }
+    constexpr pointer operator->() const { _It __t = __cur_; --__t; return &*__t; }
+    constexpr reverse_iterator& operator++() { --__cur_; return *this; }
+    constexpr reverse_iterator& operator--() { ++__cur_; return *this; }
+    constexpr reverse_iterator operator++(int) { reverse_iterator __t = *this; --__cur_; return __t; }
+    constexpr reverse_iterator operator--(int) { reverse_iterator __t = *this; ++__cur_; return __t; }
+    constexpr reference operator[](difference_type __n) const { return *(*this + __n); }
+    constexpr reverse_iterator operator+(difference_type __n) const { return reverse_iterator(__cur_ - __n); }
+    constexpr reverse_iterator operator-(difference_type __n) const { return reverse_iterator(__cur_ + __n); }
+};
+template <class _It>
+constexpr bool operator==(const reverse_iterator<_It>& __a, const reverse_iterator<_It>& __b) {
+    return __a.base() == __b.base();
+}
+template <class _It>
+constexpr bool operator!=(const reverse_iterator<_It>& __a, const reverse_iterator<_It>& __b) {
+    return __a.base() != __b.base();
+}
+template <class _It>
+constexpr reverse_iterator<_It> make_reverse_iterator(_It __i) {
+    return reverse_iterator<_It>(__i);
+}
+
+/* ---- back_insert_iterator ---- */
+template <class _C>
+class back_insert_iterator {
+    _C* __c_;
+public:
+    typedef output_iterator_tag iterator_category;
+    typedef void value_type; typedef void difference_type;
+    typedef void pointer; typedef void reference;
+    typedef _C container_type;
+    explicit back_insert_iterator(_C& __c) : __c_(&__c) {}
+    back_insert_iterator& operator=(const typename _C::value_type& __v) {
+        __c_->push_back(__v); return *this;
+    }
+    back_insert_iterator& operator=(typename _C::value_type&& __v) {
+        __c_->push_back(static_cast<typename _C::value_type&&>(__v)); return *this;
+    }
+    back_insert_iterator& operator*() { return *this; }
+    back_insert_iterator& operator++() { return *this; }
+    back_insert_iterator operator++(int) { return *this; }
+};
+template <class _C>
+back_insert_iterator<_C> back_inserter(_C& __c) { return back_insert_iterator<_C>(__c); }
+
+/* ---- free begin/end/size/data (arrays + containers) ---- */
+template <class _C> constexpr auto begin(_C& __c) -> decltype(__c.begin()) { return __c.begin(); }
+template <class _C> constexpr auto begin(const _C& __c) -> decltype(__c.begin()) { return __c.begin(); }
+template <class _C> constexpr auto end(_C& __c) -> decltype(__c.end()) { return __c.end(); }
+template <class _C> constexpr auto end(const _C& __c) -> decltype(__c.end()) { return __c.end(); }
+template <class _T, size_t _N> constexpr _T* begin(_T (&__a)[_N]) { return __a; }
+template <class _T, size_t _N> constexpr _T* end(_T (&__a)[_N]) { return __a + _N; }
+template <class _C> constexpr auto size(const _C& __c) -> decltype(__c.size()) { return __c.size(); }
+template <class _T, size_t _N> constexpr size_t size(const _T (&)[_N]) { return _N; }
+template <class _C> constexpr auto data(_C& __c) -> decltype(__c.data()) { return __c.data(); }
+template <class _T, size_t _N> constexpr _T* data(_T (&__a)[_N]) { return __a; }
+
+}  // namespace std
+
+#endif /* _LIBTOBY_ITERATOR */

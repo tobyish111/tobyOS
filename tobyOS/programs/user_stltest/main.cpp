@@ -14,6 +14,10 @@
 #include <utility>
 #include <limits>
 #include <initializer_list>
+#include <iterator>
+#include <algorithm>
+#include <memory>
+#include <array>
 
 static int g_pass = 0, g_fail = 0;
 static void check(const char *what, bool ok) {
@@ -130,12 +134,92 @@ static void test_ccompat() {
     check("uint64 literal width", sizeof(std::uint64_t) == 8);
 }
 
+/* ---- algorithm (slice 2) ---- */
+static void test_algorithm() {
+    check("min/max", std::min(3, 7) == 3 && std::max(3, 7) == 7);
+    check("min/max init-list",
+          std::min({5, 2, 9, 1}) == 1 && std::max({5, 2, 9, 1}) == 9);
+    check("clamp", std::clamp(15, 0, 10) == 10 && std::clamp(-4, 0, 10) == 0);
+    int v[] = {4, 8, 15, 16, 23, 42};
+    check("find", std::find(v, v + 6, 16) == v + 3);
+    check("find_if even",
+          *std::find_if(v, v + 6, [](int x){ return x % 2 == 0 && x > 5; }) == 8);
+    check("count_if", std::count_if(v, v + 6, [](int x){ return x > 10; }) == 4);
+    check("all_of/any_of",
+          std::all_of(v, v + 6, [](int x){ return x > 0; }) &&
+          std::any_of(v, v + 6, [](int x){ return x == 42; }));
+    check("max_element", *std::max_element(v, v + 6) == 42);
+    int d[6]; std::copy(v, v + 6, d);
+    check("copy", d[4] == 23);
+    std::fill(d, d + 6, 7);
+    check("fill", d[0] == 7 && d[5] == 7);
+    int s[] = {5, 3, 8, 1, 9, 2};
+    std::sort(s, s + 6);
+    check("sort", s[0] == 1 && s[5] == 9 &&
+                  std::binary_search(s, s + 6, 8));
+    check("lower_bound", std::lower_bound(s, s + 6, 8) - s == 4);
+    std::reverse(s, s + 6);
+    check("reverse", s[0] == 9 && s[5] == 1);
+}
+
+/* ---- memory (slice 2) ---- */
+static int g_del = 0;
+struct Counted { ~Counted() { g_del++; } int x = 11; };
+static void test_memory() {
+    {
+        std::unique_ptr<int> p(new int(42));
+        check("unique_ptr deref", *p == 42);
+        int* raw = p.get();
+        std::unique_ptr<int> q = std::move(p);
+        check("unique_ptr move", p.get() == nullptr && q.get() == raw);
+        q.reset();
+        check("unique_ptr reset", q.get() == nullptr && !q);
+    }
+    {
+        auto mp = std::make_unique<int>(7);
+        check("make_unique", *mp == 7);
+        auto arr = std::make_unique<int[]>(4);
+        arr[0] = 1; arr[3] = 4;
+        check("make_unique array", arr[0] == 1 && arr[3] == 4);
+    }
+    g_del = 0;
+    { std::unique_ptr<Counted> c(new Counted()); check("uptr holds obj", c->x == 11); }
+    check("unique_ptr deletes on scope-exit", g_del == 1);
+    {
+        std::allocator<int> a;
+        int* buf = a.allocate(8);
+        a.construct(buf + 2, 55);
+        check("allocator allocate/construct", buf[2] == 55);
+        a.destroy(buf + 2);
+        a.deallocate(buf, 8);
+        check("allocator deallocate", true);
+    }
+}
+
+/* ---- array (slice 2) ---- */
+static void test_array() {
+    std::array<int, 4> a = {10, 20, 30, 40};
+    check("array [] + size", a[2] == 30 && a.size() == 4);
+    check("array front/back", a.front() == 10 && a.back() == 40);
+    int sum = 0; for (int x : a) sum += x;
+    check("array iterate", sum == 100);
+    check("array get<>", std::get<1>(a) == 20);
+    std::array<int, 4> b = a;
+    check("array ==", a == b);
+    a.fill(9);
+    check("array fill", a[0] == 9 && a[3] == 9 && !(a == b));
+    check("array tuple_size", std::tuple_size<std::array<int, 4>>::value == 4);
+}
+
 extern "C" int main(void) {
     test_type_traits();
     test_utility();
     test_limits();
     test_initializer_list();
     test_ccompat();
+    test_algorithm();
+    test_memory();
+    test_array();
     std::printf("[stl] foundation self-test: %d/%d %s\n", g_pass, g_pass + g_fail,
                 g_fail == 0 ? "ALL PASS" : "FAILURES");
     return g_fail == 0 ? 0 : 1;

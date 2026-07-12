@@ -1,0 +1,85 @@
+/* <array> -- freestanding std::array for tobyOS C++ (STL slice 2). An
+ * aggregate wrapping T[N] with the container interface + std::get and the
+ * tuple protocol (for structured bindings). */
+#ifndef _LIBTOBY_ARRAY
+#define _LIBTOBY_ARRAY
+
+#include <cstddef>
+#include <type_traits>
+#include <utility>
+#include <iterator>
+#include <algorithm>
+
+namespace std {
+
+template <class _T, size_t _N>
+struct array {
+    _T __elems_[_N];
+
+    typedef _T                 value_type;
+    typedef _T*                iterator;
+    typedef const _T*          const_iterator;
+    typedef _T&                reference;
+    typedef const _T&          const_reference;
+    typedef size_t             size_type;
+    typedef ptrdiff_t          difference_type;
+    typedef reverse_iterator<iterator>       reverse_iterator;
+    typedef std::reverse_iterator<const_iterator> const_reverse_iterator;
+
+    constexpr reference operator[](size_t __i) { return __elems_[__i]; }
+    constexpr const_reference operator[](size_t __i) const { return __elems_[__i]; }
+    constexpr reference at(size_t __i) { return __elems_[__i]; }
+    constexpr const_reference at(size_t __i) const { return __elems_[__i]; }
+    constexpr reference front() { return __elems_[0]; }
+    constexpr const_reference front() const { return __elems_[0]; }
+    constexpr reference back() { return __elems_[_N - 1]; }
+    constexpr const_reference back() const { return __elems_[_N - 1]; }
+    constexpr _T* data() noexcept { return __elems_; }
+    constexpr const _T* data() const noexcept { return __elems_; }
+
+    constexpr iterator begin() noexcept { return __elems_; }
+    constexpr const_iterator begin() const noexcept { return __elems_; }
+    constexpr const_iterator cbegin() const noexcept { return __elems_; }
+    constexpr iterator end() noexcept { return __elems_ + _N; }
+    constexpr const_iterator end() const noexcept { return __elems_ + _N; }
+    constexpr const_iterator cend() const noexcept { return __elems_ + _N; }
+
+    constexpr bool empty() const noexcept { return _N == 0; }
+    constexpr size_t size() const noexcept { return _N; }
+    constexpr size_t max_size() const noexcept { return _N; }
+
+    void fill(const _T& __v) { for (size_t __i = 0; __i < _N; ++__i) __elems_[__i] = __v; }
+    void swap(array& __o) { for (size_t __i = 0; __i < _N; ++__i) std::swap(__elems_[__i], __o.__elems_[__i]); }
+};
+
+template <class _T, size_t _N>
+constexpr bool operator==(const array<_T, _N>& __a, const array<_T, _N>& __b) {
+    for (size_t __i = 0; __i < _N; ++__i) if (!(__a[__i] == __b[__i])) return false;
+    return true;
+}
+template <class _T, size_t _N>
+constexpr bool operator!=(const array<_T, _N>& __a, const array<_T, _N>& __b) {
+    return !(__a == __b);
+}
+template <class _T, size_t _N>
+void swap(array<_T, _N>& __a, array<_T, _N>& __b) { __a.swap(__b); }
+
+/* ---- tuple protocol + std::get ---- */
+template <class _T> struct tuple_size;
+template <class _T, size_t _N> struct tuple_size<array<_T, _N> >
+    : integral_constant<size_t, _N> {};
+template <size_t _I, class _T> struct tuple_element;
+template <size_t _I, class _T, size_t _N> struct tuple_element<_I, array<_T, _N> > {
+    typedef _T type;
+};
+
+template <size_t _I, class _T, size_t _N>
+constexpr _T& get(array<_T, _N>& __a) noexcept { return __a.__elems_[_I]; }
+template <size_t _I, class _T, size_t _N>
+constexpr const _T& get(const array<_T, _N>& __a) noexcept { return __a.__elems_[_I]; }
+template <size_t _I, class _T, size_t _N>
+constexpr _T&& get(array<_T, _N>&& __a) noexcept { return static_cast<_T&&>(__a.__elems_[_I]); }
+
+}  // namespace std
+
+#endif /* _LIBTOBY_ARRAY */

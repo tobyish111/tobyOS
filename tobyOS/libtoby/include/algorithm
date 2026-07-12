@@ -1,0 +1,220 @@
+/* <algorithm> -- freestanding subset for tobyOS C++ (STL slice 2):
+ * the non-modifying + basic mutating sequence operations the STL and
+ * libgav1 use (min/max, find/count, copy/move/fill, sort, bounds, ...). */
+#ifndef _LIBTOBY_ALGORITHM
+#define _LIBTOBY_ALGORITHM
+
+#include <cstddef>
+#include <initializer_list>
+#include <utility>        /* std::swap, std::move */
+#include <iterator>
+
+namespace std {
+
+/* ---- min / max ---- */
+template <class _T> constexpr const _T& min(const _T& __a, const _T& __b) {
+    return __b < __a ? __b : __a;
+}
+template <class _T, class _Cmp>
+constexpr const _T& min(const _T& __a, const _T& __b, _Cmp __c) {
+    return __c(__b, __a) ? __b : __a;
+}
+template <class _T> constexpr const _T& max(const _T& __a, const _T& __b) {
+    return __a < __b ? __b : __a;
+}
+template <class _T, class _Cmp>
+constexpr const _T& max(const _T& __a, const _T& __b, _Cmp __c) {
+    return __c(__a, __b) ? __b : __a;
+}
+template <class _T> constexpr _T min(initializer_list<_T> __l) {
+    _T __m = *__l.begin();
+    for (const _T& __v : __l) if (__v < __m) __m = __v;
+    return __m;
+}
+template <class _T> constexpr _T max(initializer_list<_T> __l) {
+    _T __m = *__l.begin();
+    for (const _T& __v : __l) if (__m < __v) __m = __v;
+    return __m;
+}
+template <class _T> constexpr const _T& clamp(const _T& __v, const _T& __lo, const _T& __hi) {
+    return __v < __lo ? __lo : (__hi < __v ? __hi : __v);
+}
+
+template <class _It>
+constexpr _It min_element(_It __f, _It __l) {
+    if (__f == __l) return __l;
+    _It __m = __f;
+    for (++__f; __f != __l; ++__f) if (*__f < *__m) __m = __f;
+    return __m;
+}
+template <class _It, class _Cmp>
+constexpr _It min_element(_It __f, _It __l, _Cmp __c) {
+    if (__f == __l) return __l;
+    _It __m = __f;
+    for (++__f; __f != __l; ++__f) if (__c(*__f, *__m)) __m = __f;
+    return __m;
+}
+template <class _It>
+constexpr _It max_element(_It __f, _It __l) {
+    if (__f == __l) return __l;
+    _It __m = __f;
+    for (++__f; __f != __l; ++__f) if (*__m < *__f) __m = __f;
+    return __m;
+}
+template <class _It, class _Cmp>
+constexpr _It max_element(_It __f, _It __l, _Cmp __c) {
+    if (__f == __l) return __l;
+    _It __m = __f;
+    for (++__f; __f != __l; ++__f) if (__c(*__m, *__f)) __m = __f;
+    return __m;
+}
+
+/* ---- non-modifying ---- */
+template <class _It, class _T>
+constexpr _It find(_It __f, _It __l, const _T& __v) {
+    for (; __f != __l; ++__f) if (*__f == __v) return __f;
+    return __l;
+}
+template <class _It, class _P>
+constexpr _It find_if(_It __f, _It __l, _P __p) {
+    for (; __f != __l; ++__f) if (__p(*__f)) return __f;
+    return __l;
+}
+template <class _It, class _P>
+constexpr _It find_if_not(_It __f, _It __l, _P __p) {
+    for (; __f != __l; ++__f) if (!__p(*__f)) return __f;
+    return __l;
+}
+template <class _It, class _T>
+constexpr typename iterator_traits<_It>::difference_type
+count(_It __f, _It __l, const _T& __v) {
+    typename iterator_traits<_It>::difference_type __n = 0;
+    for (; __f != __l; ++__f) if (*__f == __v) ++__n;
+    return __n;
+}
+template <class _It, class _P>
+constexpr typename iterator_traits<_It>::difference_type
+count_if(_It __f, _It __l, _P __p) {
+    typename iterator_traits<_It>::difference_type __n = 0;
+    for (; __f != __l; ++__f) if (__p(*__f)) ++__n;
+    return __n;
+}
+template <class _It, class _P> constexpr bool all_of(_It __f, _It __l, _P __p) {
+    for (; __f != __l; ++__f) if (!__p(*__f)) return false; return true;
+}
+template <class _It, class _P> constexpr bool any_of(_It __f, _It __l, _P __p) {
+    for (; __f != __l; ++__f) if (__p(*__f)) return true; return false;
+}
+template <class _It, class _P> constexpr bool none_of(_It __f, _It __l, _P __p) {
+    for (; __f != __l; ++__f) if (__p(*__f)) return false; return true;
+}
+template <class _It, class _F> constexpr _F for_each(_It __f, _It __l, _F __fn) {
+    for (; __f != __l; ++__f) __fn(*__f); return __fn;
+}
+template <class _A, class _B>
+constexpr bool equal(_A __f, _A __l, _B __f2) {
+    for (; __f != __l; ++__f, ++__f2) if (!(*__f == *__f2)) return false;
+    return true;
+}
+
+/* ---- modifying ---- */
+template <class _In, class _Out>
+constexpr _Out copy(_In __f, _In __l, _Out __d) {
+    for (; __f != __l; ++__f, ++__d) *__d = *__f; return __d;
+}
+template <class _In, class _Sz, class _Out>
+constexpr _Out copy_n(_In __f, _Sz __n, _Out __d) {
+    for (; __n > 0; --__n, ++__f, ++__d) *__d = *__f; return __d;
+}
+template <class _In, class _Out>
+constexpr _Out copy_backward(_In __f, _In __l, _Out __d) {
+    while (__l != __f) *--__d = *--__l; return __d;
+}
+template <class _In, class _Out>
+constexpr _Out move(_In __f, _In __l, _Out __d) {
+    for (; __f != __l; ++__f, ++__d) *__d = std::move(*__f); return __d;
+}
+template <class _In, class _Out>
+constexpr _Out move_backward(_In __f, _In __l, _Out __d) {
+    while (__l != __f) *--__d = std::move(*--__l); return __d;
+}
+template <class _It, class _T>
+constexpr void fill(_It __f, _It __l, const _T& __v) {
+    for (; __f != __l; ++__f) *__f = __v;
+}
+template <class _It, class _Sz, class _T>
+constexpr _It fill_n(_It __f, _Sz __n, const _T& __v) {
+    for (; __n > 0; --__n, ++__f) *__f = __v; return __f;
+}
+template <class _In, class _Out, class _F>
+constexpr _Out transform(_In __f, _In __l, _Out __d, _F __fn) {
+    for (; __f != __l; ++__f, ++__d) *__d = __fn(*__f); return __d;
+}
+template <class _A, class _B>
+constexpr _B swap_ranges(_A __f, _A __l, _B __f2) {
+    for (; __f != __l; ++__f, ++__f2) swap(*__f, *__f2); return __f2;
+}
+template <class _It>
+constexpr void reverse(_It __f, _It __l) {
+    for (; __f != __l && __f != --__l; ++__f) swap(*__f, *__l);
+}
+template <class _It, class _T>
+constexpr _It remove(_It __f, _It __l, const _T& __v) {
+    _It __d = __f;
+    for (; __f != __l; ++__f) if (!(*__f == __v)) { *__d = std::move(*__f); ++__d; }
+    return __d;
+}
+template <class _It, class _P>
+constexpr _It remove_if(_It __f, _It __l, _P __p) {
+    _It __d = __f;
+    for (; __f != __l; ++__f) if (!__p(*__f)) { *__d = std::move(*__f); ++__d; }
+    return __d;
+}
+
+/* ---- sorted-range ops (comparisons default to operator<) ---- */
+template <class _It, class _T>
+constexpr _It lower_bound(_It __f, _It __l, const _T& __v) {
+    typename iterator_traits<_It>::difference_type __n = distance(__f, __l);
+    while (__n > 0) {
+        typename iterator_traits<_It>::difference_type __h = __n / 2;
+        _It __m = __f; advance(__m, __h);
+        if (*__m < __v) { __f = ++__m; __n -= __h + 1; } else __n = __h;
+    }
+    return __f;
+}
+template <class _It, class _T>
+constexpr _It upper_bound(_It __f, _It __l, const _T& __v) {
+    typename iterator_traits<_It>::difference_type __n = distance(__f, __l);
+    while (__n > 0) {
+        typename iterator_traits<_It>::difference_type __h = __n / 2;
+        _It __m = __f; advance(__m, __h);
+        if (!(__v < *__m)) { __f = ++__m; __n -= __h + 1; } else __n = __h;
+    }
+    return __f;
+}
+template <class _It, class _T>
+constexpr bool binary_search(_It __f, _It __l, const _T& __v) {
+    __f = lower_bound(__f, __l, __v);
+    return __f != __l && !(__v < *__f);
+}
+
+/* ---- sort: insertion sort (small n, stable enough for our use) ---- */
+template <class _It, class _Cmp>
+constexpr void sort(_It __f, _It __l, _Cmp __c) {
+    for (_It __i = __f; __i != __l; ++__i)
+        for (_It __j = __i; __j != __f;) {
+            _It __k = __j; --__k;
+            if (__c(*__j, *__k)) { swap(*__j, *__k); __j = __k; } else break;
+        }
+}
+template <class _It>
+constexpr void sort(_It __f, _It __l) {
+    sort(__f, __l, [](const typename iterator_traits<_It>::value_type& __a,
+                      const typename iterator_traits<_It>::value_type& __b) {
+        return __a < __b;
+    });
+}
+
+}  // namespace std
+
+#endif /* _LIBTOBY_ALGORITHM */

@@ -55,10 +55,29 @@ The header base everything else builds on:
   custom Makefile rule adding those so it can exercise `<cmath>` and
   `numeric_limits<float>`. libgav1 will build the same way.
 
+## Slice 2 -- iterators, algorithms, memory, array (DONE, 69/69)
+- **`<iterator>`** -- the tag hierarchy, `iterator_traits` (+ the pointer
+  specialisation), `distance`/`advance`/`next`/`prev`, `reverse_iterator`,
+  `back_insert_iterator`/`back_inserter`, and the free
+  `begin`/`end`/`size`/`data` (containers + C arrays).
+- **`<algorithm>`** -- `min`/`max` (2-arg, comparator, initializer_list),
+  `clamp`, `min_element`/`max_element`, `find`/`find_if`/`find_if_not`,
+  `count`/`count_if`, `all_of`/`any_of`/`none_of`, `for_each`, `equal`,
+  `copy`/`copy_n`/`copy_backward`, `move`/`move_backward`, `fill`/`fill_n`,
+  `transform`, `swap_ranges`, `reverse`, `remove`/`remove_if`,
+  `lower_bound`/`upper_bound`/`binary_search`, and `sort` (insertion sort,
+  with and without a comparator).
+- **`<memory>`** -- `default_delete` (+ array form), `unique_ptr` (single
+  and `T[]`, move-only, `release`/`reset`/`get`/`swap`/deleter),
+  `make_unique` (single + array, `[N]` deleted), `addressof`, `allocator`
+  (`allocate`/`deallocate`/`construct`/`destroy`/`rebind`), and a minimal
+  `allocator_traits`.
+- **`<array>`** -- `std::array<T,N>` aggregate with the container
+  interface (`[]`/`at`/`front`/`back`/`data`/iterators/`fill`/`swap`),
+  `==`, `std::get`, and the tuple protocol (`tuple_size`/`tuple_element`
+  for structured bindings).
+
 ## Next slices
-- **Slice 2** -- `<memory>` (`unique_ptr`/`make_unique`/`allocator`),
-  `<array>`, `<algorithm>` (min/max/swap/copy/fill/find_if/...),
-  `<iterator>`.
 - **Slice 3** -- `<vector>`, `<string>`, `<tuple>`, `<functional>`.
 - **Slice 4** -- `<atomic>`, `<mutex>`/`<condition_variable>`/`<thread>`
   (over libtoby pthreads, or single-threaded stubs), `<chrono>`, and
