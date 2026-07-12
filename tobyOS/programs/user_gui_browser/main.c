@@ -688,6 +688,12 @@ struct cstyle {
     int8_t   txpct, typct;       /* transform translate % (of own size) */
     uint8_t  po_pct;             /* top/right/bottom/left are % (bits T R B L) */
     int8_t   webface;            /* @font-face kernel face id, -1 = none */
+    /* CSS animations: @keyframes-driven overrides (not inherited). */
+    int16_t  anim_kf;            /* @keyframes index, -1 = none */
+    uint16_t anim_dur;           /* animation-duration ms (0 = none) */
+    uint16_t anim_delay;         /* animation-delay ms */
+    uint8_t  anim_iter;          /* iteration count, 0 = infinite */
+    uint8_t  anim_flags;         /* bit0 alternate, bit1 ease-in-out */
 };
 
 /* ---- DOM ---------------------------------------------------------- */
@@ -777,6 +783,8 @@ enum {
     CP_VAR,                      /* --custom-property (resolved via var()) */
     CP_GRID_TC, CP_GRID_TR, CP_GRID_COL, CP_GRID_ROW,
     CP_OVERFLOW, CP_OVERFLOWX, CP_OVERFLOWY, CP_TRANSFORM,
+    CP_ANIMATION, CP_ANIM_NAME, CP_ANIM_DUR, CP_ANIM_ITER,
+    CP_ANIM_DELAY, CP_ANIM_DIR, CP_ANIM_TIMING,
     CP__N
 };
 
@@ -2009,6 +2017,10 @@ static int prop_lookup(const char *s, int len) {
         {"grid-column",CP_GRID_COL},{"grid-row",CP_GRID_ROW},
         {"overflow",CP_OVERFLOW},{"overflow-x",CP_OVERFLOWX},
         {"overflow-y",CP_OVERFLOWY},{"transform",CP_TRANSFORM},
+        {"animation",CP_ANIMATION},{"animation-name",CP_ANIM_NAME},
+        {"animation-duration",CP_ANIM_DUR},{"animation-iteration-count",CP_ANIM_ITER},
+        {"animation-delay",CP_ANIM_DELAY},{"animation-direction",CP_ANIM_DIR},
+        {"animation-timing-function",CP_ANIM_TIMING},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -2406,6 +2418,158 @@ static int webfont_face_for(const char *family, int flen) {
 }
 
 /* Parse a whole stylesheet into E's rule pools. */
+/* ---- CSS @keyframes animations (v1: translate + color + background) --- *
+ * A small registry of named keyframe sets; each stop carries the animated
+ * subset (translate px, color, background-color). The animation clock
+ * (anim_apply) interpolates between stops and overrides computed style
+ * before layout, driving the existing reflow loop. */
+#define KF_MAX   24
+#define KF_STOPS 8
+struct kf_stop { uint8_t pct, has; int16_t txpx, typx; uint32_t color, bg; };
+struct kf_anim { char name[28]; int nstops; struct kf_stop stops[KF_STOPS]; };
+static struct kf_anim g_kf[KF_MAX];
+static int      g_nkf;
+static int      g_anim_active;          /* >=1 while any element animates */
+static int32_t  g_anim_t0[NODE_MAX];    /* per-node animation start ms, -1 */
+
+/* Parse a px integer out of [s, s+n) (leading ws/sign, digits; ignores
+ * the unit). *out set, returns end index. */
+static int kf_num(const char *s, int n, int *out) {
+    int i = 0, neg = 0, v = 0;
+    while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+    if (i < n && s[i] == '-') { neg = 1; i++; }
+    while (i < n && s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; }
+    *out = neg ? -v : v;
+    return i;
+}
+
+/* Extract the animatable declarations from one keyframe stop block. */
+static void kf_parse_stop_decls(const char *s, int n, struct kf_stop *st) {
+    int i = 0;
+    while (i < n) {
+        while (i < n && (s[i] == ' ' || s[i] == ';' || s[i] == '\n' ||
+                         s[i] == '\t' || s[i] == '\r')) i++;
+        int p0 = i;
+        while (i < n && s[i] != ':' && s[i] != '}') i++;
+        if (i >= n || s[i] != ':') break;
+        int pn = i - p0; i++;
+        int v0 = i;
+        while (i < n && s[i] != ';' && s[i] != '}') i++;
+        int vn = i - v0;
+        while (pn > 0 && s[p0 + pn - 1] == ' ') pn--;
+        const char *vv = s + v0;
+        while (vn > 0 && (*vv == ' ' || *vv == '\t')) { vv++; vn--; }
+        while (vn > 0 && (vv[vn - 1] == ' ' || vv[vn - 1] == ';')) vn--;
+        if (pn == 9 && str_ncasecmp(s + p0, "transform", 9) == 0) {
+            int fo = str_contains(vv, vn, "translate", 9);
+            if (fo >= 0) {
+                int isx = (fo + 9 < vn && lc(vv[fo + 9]) == 'x');
+                int isy = (fo + 9 < vn && lc(vv[fo + 9]) == 'y');
+                int q = fo + 9;
+                while (q < vn && vv[q] != '(') q++;
+                if (q < vn) q++;
+                int a = 0, b = 0;
+                q += kf_num(vv + q, vn - q, &a);
+                while (q < vn && vv[q] != ',' && vv[q] != ')') q++;
+                if (q < vn && vv[q] == ',') { q++; kf_num(vv + q, vn - q, &b); }
+                st->has |= 1;
+                if (isy) { st->txpx = 0; st->typx = (int16_t)a; }
+                else if (isx) { st->txpx = (int16_t)a; st->typx = 0; }
+                else { st->txpx = (int16_t)a; st->typx = (int16_t)b; }
+            }
+        } else if (pn == 5 && str_ncasecmp(s + p0, "color", 5) == 0) {
+            uint32_t c; if (css_color_tok(vv, vn, &c)) { st->color = c; st->has |= 2; }
+        } else if ((pn == 16 && str_ncasecmp(s + p0, "background-color", 16) == 0) ||
+                   (pn == 10 && str_ncasecmp(s + p0, "background", 10) == 0)) {
+            uint32_t c; if (css_color_tok(vv, vn, &c)) { st->bg = c; st->has |= 4; }
+        }
+    }
+}
+
+/* Parse one @keyframes block (cursor is just past the "keyframes" ident). */
+static void kf_parse(struct ccur *c) {
+    css_ws(c);
+    int no, nl; css_ident(c, &no, &nl);
+    char name[28];
+    int nn = nl < (int)sizeof(name) - 1 ? nl : (int)sizeof(name) - 1;
+    for (int k = 0; k < nn; k++) name[k] = lc(E->csspool[no + k]);
+    name[nn] = 0;
+    css_ws(c);
+    if (c->i >= c->n || c->s[c->i] != '{') return;
+    c->i++;
+    struct kf_anim *a = (g_nkf < KF_MAX) ? &g_kf[g_nkf] : NULL;
+    if (a) { str_copy(a->name, name, sizeof(a->name)); a->nstops = 0; }
+    while (c->i < c->n && c->s[c->i] != '}') {
+        css_ws(c);
+        if (c->i >= c->n || c->s[c->i] == '}') break;
+        int sel0 = c->i;
+        while (c->i < c->n && c->s[c->i] != '{' && c->s[c->i] != '}') c->i++;
+        if (c->i >= c->n || c->s[c->i] != '{') break;
+        int seln = c->i - sel0; c->i++;
+        int b0 = c->i;
+        while (c->i < c->n && c->s[c->i] != '}') c->i++;
+        int bn = c->i - b0;
+        if (c->i < c->n) c->i++;
+        if (!a) continue;
+        int p = sel0, end = sel0 + seln;
+        while (p < end && a->nstops < KF_STOPS) {
+            while (p < end && (c->s[p] == ' ' || c->s[p] == ',' || c->s[p] == '\n' ||
+                               c->s[p] == '\t' || c->s[p] == '\r')) p++;
+            int t0 = p;
+            while (p < end && c->s[p] != ',') p++;
+            int tn = p - t0;
+            while (tn > 0 && c->s[t0 + tn - 1] == ' ') tn--;
+            int pct = -1;
+            if (tn >= 4 && str_ncasecmp(c->s + t0, "from", 4) == 0) pct = 0;
+            else if (tn >= 2 && str_ncasecmp(c->s + t0, "to", 2) == 0) pct = 100;
+            else if (tn > 0) { int v = 0;
+                for (int k = 0; k < tn && c->s[t0 + k] >= '0' && c->s[t0 + k] <= '9'; k++)
+                    v = v * 10 + (c->s[t0 + k] - '0');
+                pct = v; }
+            if (pct >= 0 && pct <= 100) {
+                struct kf_stop *s = &a->stops[a->nstops++];
+                s->pct = (uint8_t)pct; s->has = 0; s->txpx = s->typx = 0;
+                s->color = 0; s->bg = 0;
+                kf_parse_stop_decls(c->s + b0, bn, s);
+            }
+            if (p < end && c->s[p] == ',') p++;
+        }
+    }
+    if (c->i < c->n && c->s[c->i] == '}') c->i++;
+    if (a) {
+        for (int i = 1; i < a->nstops; i++) {   /* stable sort by pct */
+            struct kf_stop t = a->stops[i]; int j = i - 1;
+            while (j >= 0 && a->stops[j].pct > t.pct) { a->stops[j + 1] = a->stops[j]; j--; }
+            a->stops[j + 1] = t;
+        }
+        g_nkf++;
+    }
+}
+
+/* Find a registered @keyframes set by (trimmed) name; -1 if none. */
+static int kf_find(const char *s, int n) {
+    while (n > 0 && (*s == ' ' || *s == '\t')) { s++; n--; }
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
+    for (int i = 0; i < g_nkf; i++) {
+        int L = (int)str_len(g_kf[i].name);
+        if (L == n && str_ncasecmp(s, g_kf[i].name, n) == 0) return i;
+    }
+    return -1;
+}
+
+/* Parse a CSS <time> ("1s", "1.5s", "300ms") to milliseconds. */
+static int css_time_ms(const char *s, int n) {
+    int i = 0, whole = 0, frac = 0, fdiv = 1;
+    while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+    while (i < n && s[i] >= '0' && s[i] <= '9') { whole = whole * 10 + (s[i] - '0'); i++; }
+    if (i < n && s[i] == '.') { i++;
+        while (i < n && s[i] >= '0' && s[i] <= '9') {
+            frac = frac * 10 + (s[i] - '0'); fdiv *= 10; i++; } }
+    if (i + 1 <= n && i < n && lc(s[i]) == 'm')     /* "ms" */
+        return whole + frac / fdiv;
+    return whole * 1000 + frac * 1000 / fdiv;       /* seconds (default) */
+}
+
 static void css_parse_sheet(const char *s, long n, int origin) {
     struct ccur c = { s, 0, n };
     while (c.i < c.n) {
@@ -2454,6 +2618,11 @@ static void css_parse_sheet(const char *s, long n, int origin) {
                 }
                 long b1 = depth ? c.i : c.i - 1;
                 webfont_parse_block(c.s + b0, (int)(b1 - b0));
+                continue;
+            }
+            if ((l == 9 && str_ncasecmp(&E->csspool[o], "keyframes", 9) == 0) ||
+                (l == 17 && str_ncasecmp(&E->csspool[o], "-webkit-keyframes", 17) == 0)) {
+                kf_parse(&c);
                 continue;
             }
             css_skip_block_or_semi(&c);
@@ -2587,6 +2756,9 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->txpct = st->typct = 0;
     st->po_pct = 0;
     st->webface = pst ? pst->webface : -1;   /* font-family inherits */
+    st->anim_kf = -1;                        /* animation does not inherit */
+    st->anim_dur = 0; st->anim_delay = 0;
+    st->anim_iter = 0; st->anim_flags = 0;
 }
 
 static int clamp_px(int v) {
@@ -3259,6 +3431,60 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         }
         break;
     }
+    case CP_ANIMATION: {
+        /* animation: <name> <duration> [timing] [delay] [iter] [direction] */
+        st->anim_kf = -1; st->anim_dur = 0; st->anim_delay = 0;
+        st->anim_iter = 1; st->anim_flags = 0;
+        int timeseen = 0, i = 0;
+        while (i < n) {
+            while (i < n && (v[i] == ' ' || v[i] == '\t' || v[i] == ',')) i++;
+            int t0 = i;
+            while (i < n && v[i] != ' ' && v[i] != '\t' && v[i] != ',') i++;
+            int tl = i - t0;
+            if (tl <= 0) break;
+            const char *tk = v + t0;
+            if (tk[0] >= '0' && tk[0] <= '9') {
+                if (tl >= 2 && lc(tk[tl - 1]) == 's') {           /* <time> */
+                    int ms = css_time_ms(tk, tl);
+                    if (!timeseen) { st->anim_dur = (uint16_t)ms; timeseen = 1; }
+                    else st->anim_delay = (uint16_t)ms;
+                } else {                                          /* iteration */
+                    int x = 0;
+                    for (int k = 0; k < tl && tk[k] >= '0' && tk[k] <= '9'; k++)
+                        x = x * 10 + (tk[k] - '0');
+                    st->anim_iter = (uint8_t)x;
+                }
+            } else if (tl == 8 && str_ncasecmp(tk, "infinite", 8) == 0) {
+                st->anim_iter = 0;
+            } else if (tl == 9 && str_ncasecmp(tk, "alternate", 9) == 0) {
+                st->anim_flags |= 1;
+            } else if (tl >= 4 && str_ncasecmp(tk, "ease", 4) == 0) {
+                st->anim_flags |= 2;
+            } else if ((tl == 6 && str_ncasecmp(tk, "linear", 6) == 0) ||
+                       (tl == 6 && str_ncasecmp(tk, "normal", 6) == 0)) {
+                /* linear timing / normal direction: nothing to set */
+            } else {
+                int kf = kf_find(tk, tl);
+                if (kf >= 0) st->anim_kf = (int16_t)kf;
+            }
+        }
+        break;
+    }
+    case CP_ANIM_NAME:   st->anim_kf = (int16_t)kf_find(v, n); break;
+    case CP_ANIM_DUR:    st->anim_dur = (uint16_t)css_time_ms(v, n); break;
+    case CP_ANIM_DELAY:  st->anim_delay = (uint16_t)css_time_ms(v, n); break;
+    case CP_ANIM_ITER:
+        if (str_contains(v, n, "infinite", 8) >= 0) st->anim_iter = 0;
+        else { int x = 0, k = 0; while (k < n && (v[k] < '0' || v[k] > '9')) k++;
+               for (; k < n && v[k] >= '0' && v[k] <= '9'; k++) x = x * 10 + (v[k] - '0');
+               st->anim_iter = (uint8_t)x; }
+        break;
+    case CP_ANIM_DIR:
+        if (str_contains(v, n, "alternate", 9) >= 0) st->anim_flags |= 1;
+        break;
+    case CP_ANIM_TIMING:
+        if (str_contains(v, n, "ease", 4) >= 0) st->anim_flags |= 2;
+        break;
     case CP_POSITION:
         if (vtok_next(v, n, &pos, &t)) {
             if (tok_is(&t, "relative") || tok_is(&t, "sticky"))
@@ -5231,6 +5457,9 @@ static void page_reset(void) {
     /* NOTE: caller frees decoded pixels via images_free() before reset. */
     g_nimages = 0;
     cur->nmedia = 0;              /* caller ran media_free() first */
+    g_nkf = 0;
+    g_anim_active = 0;
+    for (int i = 0; i < NODE_MAX; i++) g_anim_t0[i] = -1;
 }
 
 static void resolve_relative_url(const char *base, const char *rel, char *out, int out_max);
@@ -7856,6 +8085,64 @@ static void js_drain_jobs(struct tab *t) {
 /* JS mutated the DOM: register new links/images (light collect),
  * re-cascade (class/style attribute changes), re-layout. The CSSOM is
  * NOT rebuilt: stylesheets added by scripts after load are ignored. */
+static int css_lerp_i(int a, int b, int num, int den) {
+    return a + (b - a) * num / den;
+}
+static uint32_t css_col_lerp(uint32_t a, uint32_t b, int num, int den) {
+    return ((uint32_t)css_lerp_i((a >> 24) & 255, (b >> 24) & 255, num, den) << 24) |
+           ((uint32_t)css_lerp_i((a >> 16) & 255, (b >> 16) & 255, num, den) << 16) |
+           ((uint32_t)css_lerp_i((a >> 8) & 255, (b >> 8) & 255, num, den) << 8) |
+           (uint32_t)css_lerp_i(a & 255, b & 255, num, den);
+}
+
+/* CSS animation clock: interpolate @keyframes overrides onto computed
+ * styles for the active engine's nodes, just before layout. Sets
+ * g_anim_active so the main loop keeps ticking while anything runs. */
+static void anim_apply(void) {
+    long now = js_now_ms();
+    int active = 0;
+    for (int ni = 0; ni < E->nnodes; ni++) {
+        struct cstyle *st = &E->nodes[ni].st;
+        if (st->anim_kf < 0 || st->anim_kf >= g_nkf || st->anim_dur == 0) continue;
+        struct kf_anim *kf = &g_kf[st->anim_kf];
+        if (kf->nstops < 1) continue;
+        if (g_anim_t0[ni] < 0) g_anim_t0[ni] = (int32_t)now;
+        long el = now - g_anim_t0[ni] - (long)st->anim_delay;
+        if (el < 0) el = 0;
+        long dur = st->anim_dur;
+        long cyc = el / dur;
+        int done = (st->anim_iter && cyc >= st->anim_iter);
+        long inms = done ? dur : (el % dur);
+        int fr = (int)(inms * 1000 / dur);                 /* 0..1000 (t*1000) */
+        if ((st->anim_flags & 1) && (cyc & 1)) fr = 1000 - fr;   /* alternate */
+        if (st->anim_flags & 2) {                            /* ease-in-out */
+            long f = fr;
+            fr = (int)(3 * f * f / 1000 - 2 * f * f * f / 1000000);  /* smoothstep */
+            if (fr < 0) fr = 0;
+            if (fr > 1000) fr = 1000;
+        }
+        int pct = fr / 10;
+        struct kf_stop *lo = &kf->stops[0], *hi = &kf->stops[kf->nstops - 1];
+        for (int s = 0; s < kf->nstops; s++)
+            if (kf->stops[s].pct <= pct) lo = &kf->stops[s];
+        for (int s = kf->nstops - 1; s >= 0; s--)
+            if (kf->stops[s].pct >= pct) hi = &kf->stops[s];
+        int span = hi->pct - lo->pct;
+        int num = span ? (pct - lo->pct) : 0, den = span ? span : 1;
+        if (lo->has & 1) {
+            st->has_tf = 1; st->txpct = st->typct = 0;
+            st->txpx = (hi->has & 1) ? (int16_t)css_lerp_i(lo->txpx, hi->txpx, num, den) : lo->txpx;
+            st->typx = (hi->has & 1) ? (int16_t)css_lerp_i(lo->typx, hi->typx, num, den) : lo->typx;
+        }
+        if (lo->has & 2)
+            st->color = (hi->has & 2) ? css_col_lerp(lo->color, hi->color, num, den) : lo->color;
+        if (lo->has & 4)
+            st->bg = (hi->has & 4) ? css_col_lerp(lo->bg, hi->bg, num, den) : lo->bg;
+        if (!done) active = 1;
+    }
+    g_anim_active = active;
+}
+
 static void js_rerender(void) {
     g_collect_light = 1;
     g_form_open = -1;
@@ -7866,8 +8153,23 @@ static void js_rerender(void) {
     base.disp = D_BLOCK;
     var_scope_reset();
     style_node(0, &base);
+    anim_apply();                /* overlay CSS animation keyframes */
     layout(g_win_w);
     clamp_scroll();
+}
+
+/* Main-loop tick: advance CSS @keyframes animations on the active tab,
+ * throttled to ~30 fps. A full restyle+relayout+repaint per frame (the
+ * same reflow path JS uses), since transforms/colors bake at layout. */
+static int anim_pump(void) {
+    if (!g_anim_active) return 0;
+    static long last_ms = 0;
+    long now = js_now_ms();
+    if (now - last_ms < 32) return 0;      /* throttle; loop idles briefly */
+    last_ms = now;
+    js_rerender();
+    tk_redraw(&win);
+    return 1;
 }
 
 /* Call the prelude dispatcher: bubble `type` from `node` (or document
@@ -8160,6 +8462,7 @@ static void render_html(void) {
     base.disp = D_BLOCK;
     var_scope_reset();
     style_node(0, &base);
+    anim_apply();                         /* start CSS animations at t0 */
 
     g_view_mode = VIEW_HTML;
     layout(g_win_w);                      /* initial style+layout BEFORE
@@ -11088,6 +11391,7 @@ int main(int argc, char **argv) {
         work |= load_one_pending_media();  /* <video>/<audio> files */
         work |= media_pump();              /* frame + PCM advance */
         work |= js_pump_all();             /* timers + jobs + fetches */
+        work |= anim_pump();               /* CSS @keyframes animations */
         if (!work)
             sys_sleep_ms(15);              /* nothing pending -> idle */
     }
