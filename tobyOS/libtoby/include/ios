@@ -1,0 +1,18 @@
+/* <ios> -- minimal ios_base for tobyOS C++ (STL slice 4). */
+#ifndef _LIBTOBY_IOS
+#define _LIBTOBY_IOS
+#include <cstddef>
+namespace std {
+class ios_base {
+public:
+    typedef unsigned fmtflags;
+    static constexpr fmtflags dec = 1, hex = 2, oct = 4, boolalpha = 8, showbase = 16;
+    fmtflags flags() const { return __fl_; }
+    fmtflags flags(fmtflags __f) { fmtflags __o = __fl_; __fl_ = __f; return __o; }
+    fmtflags setf(fmtflags __f) { fmtflags __o = __fl_; __fl_ |= __f; return __o; }
+    void unsetf(fmtflags __f) { __fl_ &= ~__f; }
+protected:
+    fmtflags __fl_ = dec;
+};
+}
+#endif

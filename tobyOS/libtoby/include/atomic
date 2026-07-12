@@ -1,0 +1,114 @@
+/* <atomic> -- freestanding std::atomic for tobyOS C++ (STL slice 4),
+ * implemented over the clang __atomic builtins. */
+#ifndef _LIBTOBY_ATOMIC
+#define _LIBTOBY_ATOMIC
+
+#include <cstddef>
+#include <cstdint>
+
+namespace std {
+
+enum memory_order {
+    memory_order_relaxed = __ATOMIC_RELAXED,
+    memory_order_consume = __ATOMIC_CONSUME,
+    memory_order_acquire = __ATOMIC_ACQUIRE,
+    memory_order_release = __ATOMIC_RELEASE,
+    memory_order_acq_rel = __ATOMIC_ACQ_REL,
+    memory_order_seq_cst = __ATOMIC_SEQ_CST
+};
+
+inline void atomic_thread_fence(memory_order __o) noexcept { __atomic_thread_fence((int)__o); }
+
+template <class _T>
+struct atomic {
+    _T __v_;
+
+    atomic() noexcept = default;
+    constexpr atomic(_T __d) noexcept : __v_(__d) {}
+    atomic(const atomic&) = delete;
+    atomic& operator=(const atomic&) = delete;
+    atomic& operator=(const atomic&) volatile = delete;
+
+    bool is_lock_free() const noexcept { return __atomic_is_lock_free(sizeof(_T), &__v_); }
+
+    void store(_T __d, memory_order __o = memory_order_seq_cst) noexcept {
+        __atomic_store_n(&__v_, __d, (int)__o);
+    }
+    _T load(memory_order __o = memory_order_seq_cst) const noexcept {
+        return __atomic_load_n(&__v_, (int)__o);
+    }
+    operator _T() const noexcept { return load(); }
+    _T operator=(_T __d) noexcept { store(__d); return __d; }
+
+    _T exchange(_T __d, memory_order __o = memory_order_seq_cst) noexcept {
+        return __atomic_exchange_n(&__v_, __d, (int)__o);
+    }
+    bool compare_exchange_strong(_T& __e, _T __d,
+                                 memory_order __o = memory_order_seq_cst) noexcept {
+        return __atomic_compare_exchange_n(&__v_, &__e, __d, false, (int)__o, (int)__o);
+    }
+    bool compare_exchange_weak(_T& __e, _T __d,
+                               memory_order __o = memory_order_seq_cst) noexcept {
+        return __atomic_compare_exchange_n(&__v_, &__e, __d, true, (int)__o, (int)__o);
+    }
+    bool compare_exchange_strong(_T& __e, _T __d, memory_order __s, memory_order __f) noexcept {
+        return __atomic_compare_exchange_n(&__v_, &__e, __d, false, (int)__s, (int)__f);
+    }
+    bool compare_exchange_weak(_T& __e, _T __d, memory_order __s, memory_order __f) noexcept {
+        return __atomic_compare_exchange_n(&__v_, &__e, __d, true, (int)__s, (int)__f);
+    }
+
+    _T fetch_add(_T __d, memory_order __o = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_add(&__v_, __d, (int)__o);
+    }
+    _T fetch_sub(_T __d, memory_order __o = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_sub(&__v_, __d, (int)__o);
+    }
+    _T fetch_and(_T __d, memory_order __o = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_and(&__v_, __d, (int)__o);
+    }
+    _T fetch_or(_T __d, memory_order __o = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_or(&__v_, __d, (int)__o);
+    }
+    _T fetch_xor(_T __d, memory_order __o = memory_order_seq_cst) noexcept {
+        return __atomic_fetch_xor(&__v_, __d, (int)__o);
+    }
+
+    _T operator++() noexcept { return __atomic_add_fetch(&__v_, 1, __ATOMIC_SEQ_CST); }
+    _T operator++(int) noexcept { return fetch_add(1); }
+    _T operator--() noexcept { return __atomic_sub_fetch(&__v_, 1, __ATOMIC_SEQ_CST); }
+    _T operator--(int) noexcept { return fetch_sub(1); }
+    _T operator+=(_T __d) noexcept { return __atomic_add_fetch(&__v_, __d, __ATOMIC_SEQ_CST); }
+    _T operator-=(_T __d) noexcept { return __atomic_sub_fetch(&__v_, __d, __ATOMIC_SEQ_CST); }
+};
+
+typedef atomic<bool>               atomic_bool;
+typedef atomic<char>               atomic_char;
+typedef atomic<int>                atomic_int;
+typedef atomic<unsigned>           atomic_uint;
+typedef atomic<long>               atomic_long;
+typedef atomic<unsigned long>      atomic_ulong;
+typedef atomic<long long>          atomic_llong;
+typedef atomic<unsigned long long> atomic_ullong;
+typedef atomic<size_t>             atomic_size_t;
+typedef atomic<int32_t>            atomic_int32_t;
+typedef atomic<uint32_t>           atomic_uint32_t;
+typedef atomic<int64_t>            atomic_int64_t;
+typedef atomic<uint64_t>           atomic_uint64_t;
+
+/* atomic_flag */
+struct atomic_flag {
+    unsigned char __f_;
+    atomic_flag() noexcept : __f_(0) {}
+    atomic_flag(const atomic_flag&) = delete;
+    bool test_and_set(memory_order __o = memory_order_seq_cst) noexcept {
+        return __atomic_test_and_set(&__f_, (int)__o);
+    }
+    void clear(memory_order __o = memory_order_seq_cst) noexcept {
+        __atomic_clear(&__f_, (int)__o);
+    }
+};
+
+}  // namespace std
+
+#endif /* _LIBTOBY_ATOMIC */

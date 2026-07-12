@@ -1,0 +1,26 @@
+/* <sstream> -- minimal std::ostringstream for tobyOS C++ (STL slice 4):
+ * an ostream that accumulates into a std::string. */
+#ifndef _LIBTOBY_SSTREAM
+#define _LIBTOBY_SSTREAM
+
+#include <ostream>
+#include <string>
+
+namespace std {
+
+class ostringstream : public ostream {
+    string __buf_;
+public:
+    ostringstream() : ostream(&__buf_) { __sink_ = &__buf_; }
+    explicit ostringstream(const string& __s) : ostream(&__buf_), __buf_(__s) { __sink_ = &__buf_; }
+    ostringstream(const ostringstream&) = delete;
+
+    string str() const { return __buf_; }
+    void str(const string& __s) { __buf_ = __s; __sink_ = &__buf_; }
+};
+
+typedef ostringstream stringstream;  /* output-only here */
+
+}  // namespace std
+
+#endif /* _LIBTOBY_SSTREAM */

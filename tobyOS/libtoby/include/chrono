@@ -1,0 +1,118 @@
+/* <chrono> -- freestanding subset for tobyOS C++ (STL slice 4):
+ * ratio, duration (+ the standard typedefs + duration_cast), time_point,
+ * and steady/system clocks over clock_gettime. */
+#ifndef _LIBTOBY_CHRONO
+#define _LIBTOBY_CHRONO
+
+#include <cstdint>
+#include <time.h>
+#include <type_traits>
+
+namespace std {
+
+template <intmax_t _N, intmax_t _D = 1> struct ratio {
+    static constexpr intmax_t num = _N;
+    static constexpr intmax_t den = _D;
+    typedef ratio<_N, _D> type;
+};
+typedef ratio<1, 1000000000> nano;
+typedef ratio<1, 1000000>    micro;
+typedef ratio<1, 1000>       milli;
+typedef ratio<1, 1>          _ratio_one;
+
+namespace chrono {
+
+template <class _Rep, class _Period = ratio<1> >
+class duration {
+    _Rep __r_;
+public:
+    typedef _Rep    rep;
+    typedef _Period period;
+
+    constexpr duration() : __r_(0) {}
+    template <class _R2>
+    constexpr explicit duration(const _R2& __r) : __r_(static_cast<_Rep>(__r)) {}
+    template <class _R2, class _P2>
+    constexpr duration(const duration<_R2, _P2>& __d)
+        : __r_(static_cast<_Rep>(__d.count() * _P2::num / _P2::den * _Period::den / _Period::num)) {}
+
+    constexpr _Rep count() const { return __r_; }
+
+    constexpr duration operator+(const duration& __o) const { return duration(__r_ + __o.__r_); }
+    constexpr duration operator-(const duration& __o) const { return duration(__r_ - __o.__r_); }
+    duration& operator+=(const duration& __o) { __r_ += __o.__r_; return *this; }
+    duration& operator-=(const duration& __o) { __r_ -= __o.__r_; return *this; }
+    constexpr bool operator==(const duration& __o) const { return __r_ == __o.__r_; }
+    constexpr bool operator!=(const duration& __o) const { return __r_ != __o.__r_; }
+    constexpr bool operator<(const duration& __o) const { return __r_ < __o.__r_; }
+    constexpr bool operator>(const duration& __o) const { return __r_ > __o.__r_; }
+    constexpr bool operator<=(const duration& __o) const { return __r_ <= __o.__r_; }
+    constexpr bool operator>=(const duration& __o) const { return __r_ >= __o.__r_; }
+};
+
+typedef duration<int64_t, nano>          nanoseconds;
+typedef duration<int64_t, micro>         microseconds;
+typedef duration<int64_t, milli>         milliseconds;
+typedef duration<int64_t>                seconds;
+typedef duration<int64_t, ratio<60> >    minutes;
+typedef duration<int64_t, ratio<3600> >  hours;
+
+template <class _To, class _Rep, class _Period>
+constexpr _To duration_cast(const duration<_Rep, _Period>& __d) {
+    /* value * (from_period / to_period) */
+    long long __ticks = (long long)__d.count() * _Period::num * _To::period::den
+                        / (_Period::den * _To::period::num);
+    return _To(__ticks);
+}
+
+template <class _Clock, class _Dur = typename _Clock::duration>
+class time_point {
+    _Dur __d_;
+public:
+    typedef _Clock clock;
+    typedef _Dur   duration;
+    constexpr time_point() : __d_() {}
+    constexpr explicit time_point(const _Dur& __d) : __d_(__d) {}
+    constexpr _Dur time_since_epoch() const { return __d_; }
+    time_point& operator+=(const _Dur& __d) { __d_ += __d; return *this; }
+    constexpr duration operator-(const time_point& __o) const { return __d_ - __o.__d_; }
+
+    constexpr bool operator==(const time_point& __o) const { return __d_ == __o.__d_; }
+    constexpr bool operator!=(const time_point& __o) const { return __d_ != __o.__d_; }
+    constexpr bool operator<(const time_point& __o) const { return __d_ < __o.__d_; }
+    constexpr bool operator>(const time_point& __o) const { return __d_ > __o.__d_; }
+    constexpr bool operator<=(const time_point& __o) const { return __d_ <= __o.__d_; }
+    constexpr bool operator>=(const time_point& __o) const { return __d_ >= __o.__d_; }
+};
+
+struct steady_clock {
+    typedef nanoseconds                       duration;
+    typedef duration::rep                     rep;
+    typedef duration::period                  period;
+    typedef chrono::time_point<steady_clock>  time_point;
+    static constexpr bool is_steady = true;
+    static time_point now() noexcept {
+        struct timespec __ts; clock_gettime(CLOCK_MONOTONIC, &__ts);
+        return time_point(nanoseconds((int64_t)__ts.tv_sec * 1000000000LL + __ts.tv_nsec));
+    }
+};
+
+struct system_clock {
+    typedef nanoseconds                        duration;
+    typedef duration::rep                      rep;
+    typedef duration::period                   period;
+    typedef chrono::time_point<system_clock>   time_point;
+    static constexpr bool is_steady = false;
+    static time_point now() noexcept {
+        struct timespec __ts; clock_gettime(CLOCK_REALTIME, &__ts);
+        return time_point(nanoseconds((int64_t)__ts.tv_sec * 1000000000LL + __ts.tv_nsec));
+    }
+};
+
+typedef steady_clock high_resolution_clock;
+
+}  // namespace chrono
+
+}  // namespace std
+
+#endif /* _LIBTOBY_CHRONO */

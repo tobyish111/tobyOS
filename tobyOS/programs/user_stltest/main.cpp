@@ -22,6 +22,12 @@
 #include <string>
 #include <tuple>
 #include <functional>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <chrono>
+#include <sstream>
 
 static int g_pass = 0, g_fail = 0;
 static void check(const char *what, bool ok) {
@@ -298,6 +304,96 @@ static void test_functional() {
     check("reference_wrapper live", rw.get() == 66);
 }
 
+/* ---- atomic (slice 4) ---- */
+static void test_atomic() {
+    std::atomic<int> a(0);
+    a.store(5);
+    check("atomic store/load", a.load() == 5);
+    check("atomic fetch_add", a.fetch_add(3) == 5 && a.load() == 8);
+    check("atomic exchange", a.exchange(20) == 8 && a.load() == 20);
+    int expect = 20;
+    check("atomic cas success", a.compare_exchange_strong(expect, 99) && a.load() == 99);
+    check("atomic cas fail", !a.compare_exchange_strong(expect, 0));  /* expect now 99 */
+    check("atomic ++", (++a) == 100);
+    std::atomic_flag f;
+    check("atomic_flag first t&s false", !f.test_and_set());
+    check("atomic_flag second t&s true", f.test_and_set());
+    f.clear();
+    check("atomic_flag clear", !f.test_and_set());
+}
+
+/* ---- threads + mutex + atomic (slice 4) ---- */
+static std::atomic<long> g_acount(0);
+static long g_mcount = 0;
+static std::mutex g_mx;
+static void worker(int iters) {
+    for (int i = 0; i < iters; ++i) {
+        g_acount.fetch_add(1);
+        std::lock_guard<std::mutex> lk(g_mx);
+        ++g_mcount;
+    }
+}
+struct MemberWorker {
+    int hits = 0;
+    void run(int n) { for (int i = 0; i < n; ++i) ++hits; }
+};
+static void test_thread() {
+    g_acount.store(0); g_mcount = 0;
+    std::thread t1(worker, 2000);
+    std::thread t2(worker, 3000);
+    check("thread joinable", t1.joinable() && t2.joinable());
+    t1.join(); t2.join();
+    check("atomic across threads", g_acount.load() == 5000);
+    check("mutex-guarded across threads", g_mcount == 5000);
+
+    MemberWorker mw;
+    std::thread t3(&MemberWorker::run, &mw, 1234);   /* pointer-to-member path */
+    t3.join();
+    check("thread member-fn (invoke pmf)", mw.hits == 1234);
+}
+
+/* ---- condition_variable (slice 4) ---- */
+static void test_condvar() {
+    std::mutex m;
+    std::condition_variable cv;
+    bool ready = false;
+    int payload = 0;
+    std::thread producer([&]{
+        std::lock_guard<std::mutex> lk(m);
+        payload = 777; ready = true;
+        cv.notify_one();
+    });
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&]{ return ready; });
+    }
+    producer.join();
+    check("condition_variable handoff", ready && payload == 777);
+}
+
+/* ---- chrono (slice 4) ---- */
+static void test_chrono() {
+    auto t0 = std::chrono::steady_clock::now();
+    auto t1 = std::chrono::steady_clock::now();
+    check("steady_clock monotonic", t1 >= t0);
+    std::chrono::seconds s(2);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(s);
+    check("duration_cast s->ms", ms.count() == 2000);
+    std::chrono::milliseconds a(1500);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(a);
+    check("duration_cast ms->us", us.count() == 1500000);
+}
+
+/* ---- ostringstream (slice 4) ---- */
+static void test_sstream() {
+    std::ostringstream os;
+    os << "x=" << 42 << " s=" << std::string("hi") << " b=" << true;
+    check("ostringstream compose", os.str() == "x=42 s=hi b=true");
+    std::ostringstream oh;
+    oh << std::hex << 255u;
+    check("ostringstream hex", oh.str() == "ff");
+}
+
 extern "C" int main(void) {
     test_type_traits();
     test_utility();
@@ -311,6 +407,11 @@ extern "C" int main(void) {
     test_string();
     test_tuple();
     test_functional();
+    test_atomic();
+    test_thread();
+    test_condvar();
+    test_chrono();
+    test_sstream();
     std::printf("[stl] foundation self-test: %d/%d %s\n", g_pass, g_pass + g_fail,
                 g_fail == 0 ? "ALL PASS" : "FAILURES");
     return g_fail == 0 ? 0 : 1;

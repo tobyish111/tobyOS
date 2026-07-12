@@ -1,0 +1,100 @@
+/* <mutex> -- freestanding std::mutex + lock helpers for tobyOS C++
+ * (STL slice 4), over libtoby's pthreads. */
+#ifndef _LIBTOBY_MUTEX
+#define _LIBTOBY_MUTEX
+
+#include <pthread.h>
+
+namespace std {
+
+class mutex {
+    pthread_mutex_t __m_;
+public:
+    mutex() noexcept { pthread_mutex_init(&__m_, nullptr); }
+    ~mutex() { pthread_mutex_destroy(&__m_); }
+    mutex(const mutex&) = delete;
+    mutex& operator=(const mutex&) = delete;
+
+    void lock() { pthread_mutex_lock(&__m_); }
+    bool try_lock() { return pthread_mutex_trylock(&__m_) == 0; }
+    void unlock() { pthread_mutex_unlock(&__m_); }
+    typedef pthread_mutex_t* native_handle_type;
+    native_handle_type native_handle() { return &__m_; }
+};
+
+/* recursive_mutex: libtoby has no recursive pthread mutex attr wired, so
+ * this is a plain mutex (sufficient for our single-locking use). */
+class recursive_mutex {
+    pthread_mutex_t __m_;
+public:
+    recursive_mutex() { pthread_mutex_init(&__m_, nullptr); }
+    ~recursive_mutex() { pthread_mutex_destroy(&__m_); }
+    recursive_mutex(const recursive_mutex&) = delete;
+    void lock() { pthread_mutex_lock(&__m_); }
+    bool try_lock() { return pthread_mutex_trylock(&__m_) == 0; }
+    void unlock() { pthread_mutex_unlock(&__m_); }
+    pthread_mutex_t* native_handle() { return &__m_; }
+};
+
+struct defer_lock_t { explicit defer_lock_t() = default; };
+struct try_to_lock_t { explicit try_to_lock_t() = default; };
+struct adopt_lock_t { explicit adopt_lock_t() = default; };
+inline constexpr defer_lock_t defer_lock{};
+inline constexpr try_to_lock_t try_to_lock{};
+inline constexpr adopt_lock_t adopt_lock{};
+
+template <class _M>
+class lock_guard {
+    _M& __m_;
+public:
+    typedef _M mutex_type;
+    explicit lock_guard(_M& __m) : __m_(__m) { __m_.lock(); }
+    lock_guard(_M& __m, adopt_lock_t) : __m_(__m) {}
+    ~lock_guard() { __m_.unlock(); }
+    lock_guard(const lock_guard&) = delete;
+    lock_guard& operator=(const lock_guard&) = delete;
+};
+
+template <class _M>
+class unique_lock {
+    _M*  __m_;
+    bool __owns_;
+public:
+    typedef _M mutex_type;
+    unique_lock() noexcept : __m_(nullptr), __owns_(false) {}
+    explicit unique_lock(_M& __m) : __m_(&__m), __owns_(true) { __m_->lock(); }
+    unique_lock(_M& __m, defer_lock_t) noexcept : __m_(&__m), __owns_(false) {}
+    unique_lock(_M& __m, try_to_lock_t) : __m_(&__m), __owns_(__m.try_lock()) {}
+    unique_lock(_M& __m, adopt_lock_t) : __m_(&__m), __owns_(true) {}
+    ~unique_lock() { if (__owns_ && __m_) __m_->unlock(); }
+
+    unique_lock(const unique_lock&) = delete;
+    unique_lock& operator=(const unique_lock&) = delete;
+    unique_lock(unique_lock&& __o) noexcept : __m_(__o.__m_), __owns_(__o.__owns_) {
+        __o.__m_ = nullptr; __o.__owns_ = false;
+    }
+    unique_lock& operator=(unique_lock&& __o) noexcept {
+        if (this != &__o) {
+            if (__owns_ && __m_) __m_->unlock();
+            __m_ = __o.__m_; __owns_ = __o.__owns_;
+            __o.__m_ = nullptr; __o.__owns_ = false;
+        }
+        return *this;
+    }
+
+    void lock() { __m_->lock(); __owns_ = true; }
+    bool try_lock() { __owns_ = __m_->try_lock(); return __owns_; }
+    void unlock() { __m_->unlock(); __owns_ = false; }
+    _M* release() noexcept { _M* __r = __m_; __m_ = nullptr; __owns_ = false; return __r; }
+    _M* mutex() const noexcept { return __m_; }
+    bool owns_lock() const noexcept { return __owns_; }
+    explicit operator bool() const noexcept { return __owns_; }
+    void swap(unique_lock& __o) noexcept {
+        _M* __tm = __m_; __m_ = __o.__m_; __o.__m_ = __tm;
+        bool __to = __owns_; __owns_ = __o.__owns_; __o.__owns_ = __to;
+    }
+};
+
+}  // namespace std
+
+#endif /* _LIBTOBY_MUTEX */

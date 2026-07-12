@@ -1,0 +1,68 @@
+/* <ostream> -- minimal std::ostream for tobyOS C++ (STL slice 4). Writes
+ * either into a std::string sink (ostringstream) or a FILE*; supports the
+ * fundamental inserters + string + manipulators. Enough for libgav1's
+ * logging/operator<< paths (it never runs a hosted iostream). */
+#ifndef _LIBTOBY_OSTREAM
+#define _LIBTOBY_OSTREAM
+
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <ios>
+#include <string>
+
+namespace std {
+
+class ostream : public ios_base {
+protected:
+    string* __sink_;   /* non-null -> append here (stringstream) */
+    FILE*   __file_;   /* else write here */
+public:
+    explicit ostream(FILE* __f) : __sink_(nullptr), __file_(__f) {}
+    explicit ostream(string* __s) : __sink_(__s), __file_(nullptr) {}
+
+    void write(const char* __p, size_t __n) {
+        if (__sink_) __sink_->append(__p, __n);
+        else if (__file_) fwrite(__p, 1, __n, __file_);
+    }
+    ostream& put(char __c) { write(&__c, 1); return *this; }
+    ostream& flush() { if (__file_) fflush(__file_); return *this; }
+
+    ostream& operator<<(const char* __s) { write(__s, __s ? strlen(__s) : 0); return *this; }
+    ostream& operator<<(char __c) { return put(__c); }
+    ostream& operator<<(bool __b) { return *this << (__b ? "true" : "false"); }
+    ostream& operator<<(const string& __s) { write(__s.data(), __s.size()); return *this; }
+    ostream& operator<<(int __v) { return __num("%d", __v); }
+    ostream& operator<<(unsigned __v) {
+        return (__fl_ & hex) ? __num("%x", __v) : __num("%u", __v);
+    }
+    ostream& operator<<(long __v) { return __num("%ld", __v); }
+    ostream& operator<<(unsigned long __v) {
+        return (__fl_ & hex) ? __num("%lx", __v) : __num("%lu", __v);
+    }
+    ostream& operator<<(long long __v) { return __num("%lld", __v); }
+    ostream& operator<<(unsigned long long __v) {
+        return (__fl_ & hex) ? __num("%llx", __v) : __num("%llu", __v);
+    }
+    ostream& operator<<(double __v) { return __num("%g", __v); }
+    ostream& operator<<(const void* __p) { return __num("%p", __p); }
+
+    ostream& operator<<(ostream& (*__m)(ostream&)) { return __m(*this); }
+    ostream& operator<<(ios_base& (*__m)(ios_base&)) { __m(*this); return *this; }
+
+private:
+    template <class _V> ostream& __num(const char* __fmt, _V __v) {
+        char __b[32]; int __n = snprintf(__b, sizeof __b, __fmt, __v);
+        if (__n > 0) write(__b, (size_t)__n);
+        return *this;
+    }
+};
+
+inline ostream& endl(ostream& __o) { __o.put('\n'); __o.flush(); return __o; }
+inline ostream& flush(ostream& __o) { return __o.flush(); }
+inline ios_base& hex(ios_base& __b) { __b.setf(ios_base::hex); __b.unsetf(ios_base::dec); return __b; }
+inline ios_base& dec(ios_base& __b) { __b.setf(ios_base::dec); __b.unsetf(ios_base::hex); return __b; }
+
+}  // namespace std
+
+#endif /* _LIBTOBY_OSTREAM */

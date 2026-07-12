@@ -1,0 +1,112 @@
+/* <thread> -- freestanding std::thread for tobyOS C++ (STL slice 4),
+ * over libtoby's pthreads. Supports a callable plus bound arguments,
+ * including pointer-to-member-function (the thread-pool pattern), via a
+ * small invoke + a heap-stored argument tuple applied on the new thread.
+ * this_thread::yield/sleep_for round it out. */
+#ifndef _LIBTOBY_THREAD
+#define _LIBTOBY_THREAD
+
+#include <cstddef>
+#include <pthread.h>
+#include <time.h>
+#include <utility>
+#include <tuple>
+#include <type_traits>
+#include <chrono>
+
+namespace std {
+
+/* ---- minimal invoke: plain callables + pointer-to-member-function ---- */
+template <class _F, class... _A>
+inline auto __th_invoke(_F&& __f, _A&&... __a)
+    -> decltype(static_cast<_F&&>(__f)(static_cast<_A&&>(__a)...)) {
+    return static_cast<_F&&>(__f)(static_cast<_A&&>(__a)...);
+}
+template <class _R, class _C, class _Obj, class... _A>
+inline _R __th_invoke(_R (_C::*__pmf)(_A...), _Obj&& __o, _A&&... __a) {
+    return (static_cast<_Obj&&>(__o)->*__pmf)(static_cast<_A&&>(__a)...);
+}
+
+class thread {
+    pthread_t __t_;
+    bool      __joinable_;
+
+    template <class _Tup, size_t... _I>
+    static void __apply(_Tup& __tp, index_sequence<_I...>) {
+        __th_invoke(std::move(std::get<_I>(__tp))...);
+    }
+    template <class _Tup>
+    static void* __run(void* __p) {
+        _Tup* __tp = static_cast<_Tup*>(__p);
+        __apply(*__tp, make_index_sequence<tuple_size<_Tup>::value>());
+        delete __tp;
+        return nullptr;
+    }
+
+public:
+    typedef pthread_t native_handle_type;
+    class id {
+        pthread_t __v_; bool __set_;
+    public:
+        id() noexcept : __v_(), __set_(false) {}
+        explicit id(pthread_t __v) : __v_(__v), __set_(true) {}
+        bool operator==(const id& __o) const {
+            if (__set_ != __o.__set_) return false;
+            if (!__set_) return true;
+            return __builtin_memcmp(&__v_, &__o.__v_, sizeof(pthread_t)) == 0;
+        }
+        bool operator!=(const id& __o) const { return !(*this == __o); }
+    };
+
+    thread() noexcept : __joinable_(false) {}
+    thread(const thread&) = delete;
+    thread& operator=(const thread&) = delete;
+
+    template <class _F, class... _A>
+    explicit thread(_F&& __f, _A&&... __a) : __joinable_(true) {
+        typedef tuple<typename decay<_F>::type, typename decay<_A>::type...> _Tup;
+        _Tup* __tp = new _Tup(static_cast<_F&&>(__f), static_cast<_A&&>(__a)...);
+        if (pthread_create(&__t_, nullptr, &__run<_Tup>, __tp) != 0) {
+            delete __tp; __joinable_ = false;
+        }
+    }
+
+    thread(thread&& __o) noexcept : __t_(__o.__t_), __joinable_(__o.__joinable_) {
+        __o.__joinable_ = false;
+    }
+    thread& operator=(thread&& __o) noexcept {
+        if (__joinable_) pthread_detach(__t_);
+        __t_ = __o.__t_; __joinable_ = __o.__joinable_; __o.__joinable_ = false;
+        return *this;
+    }
+    ~thread() { if (__joinable_) pthread_detach(__t_); }
+
+    bool joinable() const noexcept { return __joinable_; }
+    void join() { if (__joinable_) { pthread_join(__t_, nullptr); __joinable_ = false; } }
+    void detach() { if (__joinable_) { pthread_detach(__t_); __joinable_ = false; } }
+    id get_id() const noexcept { return __joinable_ ? id(__t_) : id(); }
+    native_handle_type native_handle() { return __t_; }
+    void swap(thread& __o) noexcept {
+        pthread_t __tt = __t_; __t_ = __o.__t_; __o.__t_ = __tt;
+        bool __tj = __joinable_; __joinable_ = __o.__joinable_; __o.__joinable_ = __tj;
+    }
+
+    static unsigned hardware_concurrency() noexcept { return 1; }
+};
+
+namespace this_thread {
+    inline void yield() noexcept { struct timespec __t = {0, 0}; nanosleep(&__t, nullptr); }
+    inline thread::id get_id() noexcept { return thread::id(pthread_self()); }
+    template <class _Rep, class _Period>
+    inline void sleep_for(const chrono::duration<_Rep, _Period>& __d) {
+        long long __n = (long long)__d.count() * _Period::num * 1000000000LL / _Period::den;
+        struct timespec __ts;
+        __ts.tv_sec = (long)(__n / 1000000000LL);
+        __ts.tv_nsec = (long)(__n % 1000000000LL);
+        nanosleep(&__ts, nullptr);
+    }
+}
+
+}  // namespace std
+
+#endif /* _LIBTOBY_THREAD */

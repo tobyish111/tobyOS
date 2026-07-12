@@ -97,8 +97,34 @@ The header base everything else builds on:
   `ref`/`cref`, and the common function objects (`less`/`greater`/
   `equal_to`/`plus`/`minus`, incl. the transparent `<void>` forms).
 
-## Next slice
-- **Slice 4** -- `<atomic>`, `<mutex>`/`<condition_variable>`/`<thread>`
-  (over libtoby pthreads, or single-threaded stubs), `<chrono>`, and
-  minimal `<ostream>`/`<sstream>`.
-Then libgav1 vendors on top of this for AVIF.
+## Slice 4 -- atomics, threading, chrono, streams (DONE, 122/122)
+- **`<atomic>`** -- `std::atomic<T>` over the clang `__atomic_*` builtins
+  (load/store/exchange/compare_exchange/fetch_*/++/--, `memory_order`,
+  `atomic_thread_fence`, the integer typedefs, and `atomic_flag`).
+- **`<mutex>`** -- `mutex`/`recursive_mutex` over pthreads, plus
+  `lock_guard`, `unique_lock` (defer/try/adopt, move, `owns_lock`), and
+  the lock tag objects.
+- **`<condition_variable>`** -- over pthreads: `wait`/`wait(pred)`/
+  `notify_one`/`notify_all`.
+- **`<thread>`** -- `std::thread` over pthreads with a callable **plus
+  bound arguments**, including pointer-to-member-function (the thread-pool
+  pattern) via a small `__invoke` + a heap argument tuple applied on the
+  new thread; `join`/`detach`/`joinable`/`get_id`/move, and
+  `this_thread::yield`/`sleep_for`.
+- **`<chrono>`** -- `ratio`, `duration` (+ the standard typedefs,
+  comparisons, `duration_cast`), `time_point` (+ comparisons), and
+  `steady_clock`/`system_clock` over `clock_gettime`.
+- **`<ios>`/`<ostream>`/`<sstream>`** -- a minimal `ostream` (writes to a
+  `string` sink or a `FILE*`; the fundamental inserters + `string` +
+  `endl`/`flush`/`hex`/`dec`) and `ostringstream` -- enough for libgav1's
+  `operator<<`/logging paths (it never runs a hosted iostream).
+
+**Real threads work:** two `std::thread`s incrementing a shared
+`atomic<long>` and a `mutex`-guarded counter land at exactly 5000 each,
+and a `thread(&T::method, &obj, args)` runs on tobyOS's pthreads.
+
+## Status
+The STL bring-up (slices 1-4) is **complete** -- `/bin/stltest` 122/122.
+This is the foundation libgav1 (AVIF) vendors on top of; that is the next
+arc (vendor decode subset -> freestanding build -> decode correctness ->
+wire into the image loader -> browser `<img>`).
