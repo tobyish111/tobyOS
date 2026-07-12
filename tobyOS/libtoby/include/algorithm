@@ -234,6 +234,39 @@ constexpr void partial_sort(_It __f, _It __m, _It __l) {
                  });
 }
 
+/* merge two sorted ranges into __d */
+template <class _A, class _B, class _Out>
+constexpr _Out merge(_A __f1, _A __l1, _B __f2, _B __l2, _Out __d) {
+    while (__f1 != __l1 && __f2 != __l2) {
+        if (*__f2 < *__f1) { *__d = *__f2; ++__f2; } else { *__d = *__f1; ++__f1; }
+        ++__d;
+    }
+    while (__f1 != __l1) { *__d = *__f1; ++__f1; ++__d; }
+    while (__f2 != __l2) { *__d = *__f2; ++__f2; ++__d; }
+    return __d;
+}
+
+/* drop consecutive duplicates; returns the new logical end */
+template <class _It>
+constexpr _It unique(_It __f, _It __l) {
+    if (__f == __l) return __l;
+    _It __r = __f;
+    for (_It __i = __f; ++__i != __l;)
+        if (!(*__r == *__i)) { ++__r; *__r = std::move(*__i); }
+    return ++__r;
+}
+
+/* merge two consecutive sorted runs [f,m) and [m,l) in place (insertion
+ * merge -- fine for the small ranges libgav1 uses, e.g. palettes) */
+template <class _It>
+constexpr void inplace_merge(_It __f, _It __m, _It __l) {
+    for (_It __i = __m; __i != __l; ++__i)
+        for (_It __j = __i; __j != __f;) {
+            _It __k = __j; --__k;
+            if (*__j < *__k) { swap(*__j, *__k); __j = __k; } else break;
+        }
+}
+
 }  // namespace std
 
 #endif /* _LIBTOBY_ALGORITHM */

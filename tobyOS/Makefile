@@ -394,6 +394,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_bsdroute/user_bsdroute.elf \
             programs/user_mp4play/user_mp4play.elf \
             programs/user_stltest/user_stltest.elf \
+            programs/user_av1test/user_av1test.elf \
             programs/user_gui_term/user_gui_term.elf \
             programs/user_gui_files/user_gui_files.elf \
             programs/user_gui_viewer/user_gui_viewer.elf \
@@ -1073,6 +1074,7 @@ LIBGAV1_DIR  := third_party/libgav1
 LIBGAV1_SRCS := $(wildcard $(LIBGAV1_DIR)/src/*.cc) \
     $(wildcard $(LIBGAV1_DIR)/src/dsp/*.cc) \
     $(wildcard $(LIBGAV1_DIR)/src/tile/*.cc) \
+    $(wildcard $(LIBGAV1_DIR)/src/tile/bitstream/*.cc) \
     $(wildcard $(LIBGAV1_DIR)/src/utils/*.cc) \
     $(wildcard $(LIBGAV1_DIR)/src/post_filter/*.cc)
 LIBGAV1_OBJS     := $(LIBGAV1_SRCS:.cc=.o)
@@ -1301,6 +1303,20 @@ programs/user_stltest/user_stltest.elf: programs/user_stltest/user_stltest.o \
 
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_bsdroute,user_bsdroute))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_mp4play,user_mp4play))
+
+# /bin/av1test (libgav1 slice 2): C++ decode-correctness test that links
+# libgav1's Decoder out of libtoby.a. Needs the libgav1 include roots +
+# config, and SSE (codec ABI).
+programs/user_av1test/user_av1test.o: programs/user_av1test/main.cpp \
+                                      programs/user_av1test/av1_clip.h $(LIBTOBY_AR)
+	$(CXX) $(filter-out -std=c11,$(LIBTOBY_CFLAGS)) $(LIBGAV1_INC) $(LIBGAV1_CFG) \
+	      -msse -msse2 -std=c++17 -fno-exceptions -fno-rtti -nostdinc++ -c $< -o $@
+
+programs/user_av1test/user_av1test.elf: programs/user_av1test/user_av1test.o \
+                                        $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                                        programs/user_av1test/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_av1test/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/user_av1test/user_av1test.o $(LIBTOBY_AR)
 
 # /bin/oh264test (media slice 2): C++ decode-correctness test that links
 # the vendored openh264 ISVCDecoder out of libtoby.a. Same C++ program
@@ -2349,6 +2365,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_bsdroute/user_bsdroute.elf       $(INITRD_STAGE)/bin/bsdroute
 	cp programs/user_mp4play/user_mp4play.elf         $(INITRD_STAGE)/bin/mp4play
 	cp programs/user_stltest/user_stltest.elf         $(INITRD_STAGE)/bin/stltest
+	cp programs/user_av1test/user_av1test.elf         $(INITRD_STAGE)/bin/av1test
 	cp programs/user_gui_term/user_gui_term.elf       $(INITRD_STAGE)/bin/gui_term
 	cp programs/user_gui_files/user_gui_files.elf     $(INITRD_STAGE)/bin/gui_files
 	cp programs/user_gui_viewer/user_gui_viewer.elf   $(INITRD_STAGE)/bin/gui_viewer
@@ -2795,7 +2812,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
-	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest              \
+	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest bin/av1test  \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
 	    bin/gui_calc bin/gui_taskmgr bin/gui_edit bin/gui_browser         \
 	    bin/login bin/gui_settings bin/abi_test                           \

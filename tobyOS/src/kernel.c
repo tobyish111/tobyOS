@@ -4291,6 +4291,27 @@ void _start(void) {
 #ifdef POSIX_SHELL_SELFTEST
         posix_shell_selftest();
 #endif
+#ifdef LIBGAV1_SELFTEST
+        /* libgav1 slice 2: spawn /bin/av1test, which decodes an embedded
+         * AV1 keyframe through the vendored libgav1 and checks its YUV
+         * against ffmpeg's reference. First program to pull libgav1 out
+         * of libtoby.a. [av1] stdout on serial. */
+        {
+            char *av[] = { (char *)"av1test", 0 };
+            char *ae[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec as = { .path = "/bin/av1test",
+                .name = "av1test", .argc = 1, .argv = av,
+                .envc = 1, .envp = ae };
+            int apid = proc_spawn(&as);
+            if (apid < 0) {
+                kprintf("[boot] LIBGAV1: /bin/av1test not spawned (rc=%d)\n", apid);
+            } else {
+                int arc = proc_wait(apid);
+                kprintf("[boot] LIBGAV1: av1test (pid=%d) exit=%d (%s)\n",
+                        apid, arc, arc == 0 ? "PASS" : "FAIL");
+            }
+        }
+#endif
 #ifdef CPPSTL_SELFTEST
         /* C++ STL bring-up: spawn /bin/stltest, which exercises the
          * freestanding STL headers (type_traits/utility/limits/... this

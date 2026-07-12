@@ -47,11 +47,37 @@ libgav1 exercised more of the standard library than existed; added:
 kernel and all programs still link, and the ISO is produced — libgav1 is
 compiled but not yet called.
 
+## Slice 2 — decode correctness (DONE, bit-exact)
+`/bin/av1test` (`programs/user_av1test/`) links libgav1's `libgav1::Decoder`
+out of `libtoby.a`, decodes an embedded AV1 keyframe, and matches its
+YUV against ffmpeg's reference. AV1 reconstruction is deterministic by
+spec, so the FNV-1a in `av1_clip.h` is a strict oracle.
+- Flow: `Init` (`threads=1`, `frame_parallel=false`, `blocking_dequeue=true`)
+  → `EnqueueFrame(obu, len, 0, nullptr)` → `DequeueFrame(&buffer)` →
+  read `buffer->plane[]/stride[]/displayed_width/height/bitdepth`, tighten
+  Y+U+V (strip stride), FNV-1a.
+- Test vector: a 96×96 AV1 keyframe encoded with ffmpeg `libaom-av1`, the
+  raw OBU temporal unit extracted from the IVF (32-byte file header, then
+  a 12-byte frame header + the OBU payload), and the reference checksum
+  from `ffmpeg -f rawvideo -pix_fmt yuv420p`. Generated in the scratchpad.
+- The vendored subset was completed here: `src/tile/bitstream/` (4 files —
+  `mode_info`/`palette`/`partition`/`transform_size`, missed by the
+  slice-1 `-maxdepth 1` copy) added, so 65/65 non-SIMD `.cc` now build.
+- More STL shaken out: `std::merge`/`unique`/`inplace_merge` (`<algorithm>`),
+  used by the palette decoder.
+
+Verified `-DLIBGAV1_SELFTEST` headless (first try):
+```
+[av1] decoder up; max bitdepth=8; OBU 856 bytes
+[av1] decoded frame 96x96, bitdepth=8, planes=3, fmt=0
+[av1] YUV csum=0x1b8a3deb exp=0x1b8a3deb MATCH; dims OK
+[av1] decode self-test: ALL PASS
+```
+The whole AV1 decode core — OBU parse, tile/symbol (CABAC) decode,
+transforms, intra/inter prediction, loop filter, CDEF, loop restoration,
+the C dsp — runs bit-exact single-threaded on the tobyOS STL.
+
 ## Next slices
-- **Slice 2** — decode correctness: a program links libgav1's `Decoder`,
-  decodes an embedded AV1/AVIF frame, and checks the output against a
-  reference (bit-exact, the AV1 spec is deterministic). This is where the
-  decode core, thread pool (run threads=1), and the C dsp shake out.
 - **Slice 3** — wire AVIF into `toby_image_load` (ISO-BMFF `.avif`
   demux → libgav1 → RGBA), next to WebP.
 - **Slice 4** — a browser `<img src=...avif>` renders on screen.
