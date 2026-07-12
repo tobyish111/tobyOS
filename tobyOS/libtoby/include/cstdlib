@@ -1,0 +1,12 @@
+/* <cstdlib> -- C++ names for C general utilities (STL slice 1). */
+#ifndef _LIBTOBY_CSTDLIB
+#define _LIBTOBY_CSTDLIB
+#include <stdlib.h>
+namespace std {
+using ::size_t;
+using ::malloc; using ::calloc; using ::realloc; using ::free;
+using ::abs;    using ::labs;
+using ::atoi;   using ::atol;   using ::strtol; using ::strtoul; using ::strtod;
+using ::qsort;  using ::exit;   using ::abort;  using ::rand;    using ::srand;
+}
+#endif

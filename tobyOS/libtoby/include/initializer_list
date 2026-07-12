@@ -1,0 +1,48 @@
+/* <initializer_list> -- freestanding std::initializer_list for tobyOS
+ * C++ (STL slice 1). The layout (const E* + size_t, private (ptr,size)
+ * ctor) is the one clang emits calls against for brace-init lists, so
+ * this must not be reordered. */
+#ifndef _LIBTOBY_INITIALIZER_LIST
+#define _LIBTOBY_INITIALIZER_LIST
+
+#include <stddef.h>
+
+namespace std {
+
+template <class _E>
+class initializer_list {
+public:
+    typedef _E        value_type;
+    typedef const _E& reference;
+    typedef const _E& const_reference;
+    typedef size_t    size_type;
+    typedef const _E* iterator;
+    typedef const _E* const_iterator;
+
+    constexpr initializer_list() noexcept : __begin_(nullptr), __size_(0) {}
+
+    constexpr size_t size() const noexcept { return __size_; }
+    constexpr const _E* begin() const noexcept { return __begin_; }
+    constexpr const _E* end() const noexcept { return __begin_ + __size_; }
+
+private:
+    const _E* __begin_;
+    size_t    __size_;
+
+    /* The compiler calls this ctor to build a list from a brace-init. */
+    constexpr initializer_list(const _E* __b, size_t __s) noexcept
+        : __begin_(__b), __size_(__s) {}
+};
+
+template <class _E>
+constexpr const _E* begin(initializer_list<_E> __il) noexcept {
+    return __il.begin();
+}
+template <class _E>
+constexpr const _E* end(initializer_list<_E> __il) noexcept {
+    return __il.end();
+}
+
+}  // namespace std
+
+#endif /* _LIBTOBY_INITIALIZER_LIST */

@@ -1,0 +1,29 @@
+/* <cstddef> -- size_t/ptrdiff_t/nullptr_t/byte (STL slice 1). */
+#ifndef _LIBTOBY_CSTDDEF
+#define _LIBTOBY_CSTDDEF
+#include <stddef.h>
+namespace std {
+using ::size_t;
+using ::ptrdiff_t;
+typedef decltype(nullptr) nullptr_t;
+using ::max_align_t;
+
+enum class byte : unsigned char {};
+constexpr byte operator|(byte __a, byte __b) noexcept {
+    return byte((unsigned char)((unsigned)__a | (unsigned)__b));
+}
+constexpr byte operator&(byte __a, byte __b) noexcept {
+    return byte((unsigned char)((unsigned)__a & (unsigned)__b));
+}
+constexpr byte operator^(byte __a, byte __b) noexcept {
+    return byte((unsigned char)((unsigned)__a ^ (unsigned)__b));
+}
+template <class _I> constexpr byte operator<<(byte __b, _I __s) noexcept {
+    return byte((unsigned char)((unsigned)__b << __s));
+}
+template <class _I> constexpr byte operator>>(byte __b, _I __s) noexcept {
+    return byte((unsigned char)((unsigned)__b >> __s));
+}
+template <class _I> constexpr _I to_integer(byte __b) noexcept { return _I((unsigned)__b); }
+}
+#endif

@@ -1,0 +1,102 @@
+/* <utility> -- freestanding subset for tobyOS C++ (STL slice 1):
+ * move/forward/swap/exchange, pair, and index/integer sequences. */
+#ifndef _LIBTOBY_UTILITY
+#define _LIBTOBY_UTILITY
+
+#include <stddef.h>
+#include <type_traits>
+
+namespace std {
+
+template <class _T>
+constexpr typename remove_reference<_T>::type&& move(_T&& __t) noexcept {
+    return static_cast<typename remove_reference<_T>::type&&>(__t);
+}
+
+template <class _T>
+constexpr _T&& forward(typename remove_reference<_T>::type& __t) noexcept {
+    return static_cast<_T&&>(__t);
+}
+template <class _T>
+constexpr _T&& forward(typename remove_reference<_T>::type&& __t) noexcept {
+    return static_cast<_T&&>(__t);
+}
+
+template <class _T>
+constexpr void swap(_T& __a, _T& __b) noexcept {
+    _T __tmp = static_cast<_T&&>(__a);
+    __a = static_cast<_T&&>(__b);
+    __b = static_cast<_T&&>(__tmp);
+}
+template <class _T, size_t _N>
+constexpr void swap(_T (&__a)[_N], _T (&__b)[_N]) noexcept {
+    for (size_t __i = 0; __i < _N; ++__i) swap(__a[__i], __b[__i]);
+}
+
+template <class _T, class _U = _T>
+constexpr _T exchange(_T& __obj, _U&& __new) {
+    _T __old = static_cast<_T&&>(__obj);
+    __obj = static_cast<_U&&>(__new);
+    return __old;
+}
+
+template <class _T>
+constexpr const _T& as_const(_T& __t) noexcept { return __t; }
+
+/* ---- pair ---- */
+template <class _T1, class _T2>
+struct pair {
+    typedef _T1 first_type;
+    typedef _T2 second_type;
+    _T1 first;
+    _T2 second;
+
+    constexpr pair() : first(), second() {}
+    constexpr pair(const _T1& __a, const _T2& __b) : first(__a), second(__b) {}
+    template <class _U1, class _U2>
+    constexpr pair(_U1&& __a, _U2&& __b)
+        : first(static_cast<_U1&&>(__a)), second(static_cast<_U2&&>(__b)) {}
+    pair(const pair&) = default;
+    pair(pair&&) = default;
+    pair& operator=(const pair&) = default;
+    pair& operator=(pair&&) = default;
+
+    void swap(pair& __o) {
+        std::swap(first, __o.first);
+        std::swap(second, __o.second);
+    }
+};
+
+template <class _T1, class _T2>
+constexpr pair<typename decay<_T1>::type, typename decay<_T2>::type>
+make_pair(_T1&& __a, _T2&& __b) {
+    return pair<typename decay<_T1>::type, typename decay<_T2>::type>(
+        static_cast<_T1&&>(__a), static_cast<_T2&&>(__b));
+}
+
+template <class _T1, class _T2>
+constexpr bool operator==(const pair<_T1, _T2>& __a, const pair<_T1, _T2>& __b) {
+    return __a.first == __b.first && __a.second == __b.second;
+}
+template <class _T1, class _T2>
+constexpr bool operator!=(const pair<_T1, _T2>& __a, const pair<_T1, _T2>& __b) {
+    return !(__a == __b);
+}
+
+/* ---- integer_sequence / index_sequence ---- */
+template <class _T, _T... _I> struct integer_sequence {
+    typedef _T value_type;
+    static constexpr size_t size() noexcept { return sizeof...(_I); }
+};
+template <size_t... _I> using index_sequence = integer_sequence<size_t, _I...>;
+
+/* clang builtin avoids the O(N) recursion and the dependent-non-type
+ * partial-specialization pitfall of a hand-rolled generator. */
+template <class _T, _T _N>
+using make_integer_sequence = __make_integer_seq<integer_sequence, _T, _N>;
+template <size_t _N> using make_index_sequence = make_integer_sequence<size_t, _N>;
+template <class... _T> using index_sequence_for = make_index_sequence<sizeof...(_T)>;
+
+}  // namespace std
+
+#endif /* _LIBTOBY_UTILITY */

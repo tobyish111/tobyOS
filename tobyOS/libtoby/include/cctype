@@ -1,0 +1,10 @@
+/* <cctype> -- character classification (STL slice 1). */
+#ifndef _LIBTOBY_CCTYPE
+#define _LIBTOBY_CCTYPE
+#include <ctype.h>
+namespace std {
+using ::isdigit; using ::isalpha; using ::isalnum; using ::isspace; using ::isxdigit;
+using ::isprint; using ::iscntrl; using ::ispunct; using ::isupper; using ::islower;
+using ::tolower; using ::toupper;
+}
+#endif

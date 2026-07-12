@@ -1,0 +1,11 @@
+/* <cstring> -- C++ names for the C string/memory functions (STL slice 1). */
+#ifndef _LIBTOBY_CSTRING
+#define _LIBTOBY_CSTRING
+#include <string.h>
+namespace std {
+using ::size_t;
+using ::memcpy;  using ::memmove; using ::memset; using ::memcmp; using ::memchr;
+using ::strlen;  using ::strcmp;  using ::strncmp; using ::strcpy; using ::strncpy;
+using ::strcat;  using ::strncat; using ::strchr;  using ::strrchr; using ::strstr;
+}
+#endif

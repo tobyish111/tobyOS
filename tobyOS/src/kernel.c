@@ -4291,6 +4291,27 @@ void _start(void) {
 #ifdef POSIX_SHELL_SELFTEST
         posix_shell_selftest();
 #endif
+#ifdef CPPSTL_SELFTEST
+        /* C++ STL bring-up: spawn /bin/stltest, which exercises the
+         * freestanding STL headers (type_traits/utility/limits/... this
+         * slice; containers later) and exits 0 iff every case passes.
+         * [stl] stdout is on serial. */
+        {
+            char *sv[] = { (char *)"stltest", 0 };
+            char *se[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec ss = { .path = "/bin/stltest",
+                .name = "stltest", .argc = 1, .argv = sv,
+                .envc = 1, .envp = se };
+            int spid = proc_spawn(&ss);
+            if (spid < 0) {
+                kprintf("[boot] CPPSTL: /bin/stltest not spawned (rc=%d)\n", spid);
+            } else {
+                int src = proc_wait(spid);
+                kprintf("[boot] CPPSTL: stltest (pid=%d) exit=%d (%s)\n",
+                        spid, src, src == 0 ? "PASS" : "FAIL");
+            }
+        }
+#endif
 #ifdef OPENH264_SELFTEST
         /* media slice 2: spawn /bin/oh264test, which decodes an embedded
          * High-profile H.264 clip through the vendored openh264 decoder

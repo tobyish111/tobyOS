@@ -1,0 +1,2 @@
+/* <cassert> -- assert() macro (STL slice 1). */
+#include <assert.h>

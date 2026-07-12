@@ -1,0 +1,5 @@
+/* <cfloat> -- floating limit macros (STL slice 1). */
+#ifndef _LIBTOBY_CFLOAT
+#define _LIBTOBY_CFLOAT
+#include <float.h>
+#endif

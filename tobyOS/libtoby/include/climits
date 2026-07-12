@@ -1,0 +1,5 @@
+/* <climits> -- integer limit macros (STL slice 1). */
+#ifndef _LIBTOBY_CLIMITS
+#define _LIBTOBY_CLIMITS
+#include <limits.h>
+#endif

@@ -1,0 +1,79 @@
+/* <limits> -- freestanding std::numeric_limits for tobyOS C++
+ * (STL slice 1). Specialised for the arithmetic types the STL and
+ * libgav1 query (min/max/lowest/digits/is_signed/epsilon). */
+#ifndef _LIBTOBY_LIMITS
+#define _LIBTOBY_LIMITS
+
+namespace std {
+
+enum float_round_style { round_toward_zero = 0, round_to_nearest = 1 };
+
+template <class _T> struct numeric_limits {
+    static constexpr bool is_specialized = false;
+    static constexpr _T min() noexcept { return _T(); }
+    static constexpr _T max() noexcept { return _T(); }
+    static constexpr _T lowest() noexcept { return _T(); }
+    static constexpr bool is_signed = false;
+    static constexpr bool is_integer = false;
+    static constexpr int  digits = 0;
+};
+
+#define _LIBTOBY_INT_LIMITS(T, MIN, MAX, SIGNED, DIGITS)                   \
+    template <> struct numeric_limits<T> {                                \
+        static constexpr bool is_specialized = true;                      \
+        static constexpr T min() noexcept { return MIN; }                 \
+        static constexpr T max() noexcept { return MAX; }                 \
+        static constexpr T lowest() noexcept { return MIN; }              \
+        static constexpr bool is_signed = SIGNED;                         \
+        static constexpr bool is_integer = true;                          \
+        static constexpr bool is_exact = true;                            \
+        static constexpr int  digits = DIGITS;                            \
+        static constexpr T epsilon() noexcept { return 0; }               \
+    }
+
+_LIBTOBY_INT_LIMITS(bool, false, true, false, 1);
+_LIBTOBY_INT_LIMITS(char, (-__SCHAR_MAX__ - 1), __SCHAR_MAX__, true, 7);
+_LIBTOBY_INT_LIMITS(signed char, (-__SCHAR_MAX__ - 1), __SCHAR_MAX__, true, 7);
+_LIBTOBY_INT_LIMITS(unsigned char, 0, (unsigned char)(__SCHAR_MAX__ * 2 + 1), false, 8);
+_LIBTOBY_INT_LIMITS(short, (-__SHRT_MAX__ - 1), __SHRT_MAX__, true, 15);
+_LIBTOBY_INT_LIMITS(unsigned short, 0, (unsigned short)(__SHRT_MAX__ * 2 + 1), false, 16);
+_LIBTOBY_INT_LIMITS(int, (-__INT_MAX__ - 1), __INT_MAX__, true, 31);
+_LIBTOBY_INT_LIMITS(unsigned int, 0u, (unsigned int)(__INT_MAX__ * 2u + 1u), false, 32);
+_LIBTOBY_INT_LIMITS(long, (-__LONG_MAX__ - 1L), __LONG_MAX__, true, 63);
+_LIBTOBY_INT_LIMITS(unsigned long, 0ul, (unsigned long)(__LONG_MAX__ * 2ul + 1ul), false, 64);
+_LIBTOBY_INT_LIMITS(long long, (-__LONG_LONG_MAX__ - 1LL), __LONG_LONG_MAX__, true, 63);
+_LIBTOBY_INT_LIMITS(unsigned long long, 0ull,
+                    (unsigned long long)(__LONG_LONG_MAX__ * 2ull + 1ull), false, 64);
+
+#undef _LIBTOBY_INT_LIMITS
+
+template <> struct numeric_limits<float> {
+    static constexpr bool is_specialized = true;
+    static constexpr float min() noexcept { return __FLT_MIN__; }
+    static constexpr float max() noexcept { return __FLT_MAX__; }
+    static constexpr float lowest() noexcept { return -__FLT_MAX__; }
+    static constexpr float epsilon() noexcept { return __FLT_EPSILON__; }
+    static constexpr float infinity() noexcept { return __builtin_huge_valf(); }
+    static constexpr float quiet_NaN() noexcept { return __builtin_nanf(""); }
+    static constexpr bool is_signed = true;
+    static constexpr bool is_integer = false;
+    static constexpr bool is_exact = false;
+    static constexpr int  digits = __FLT_MANT_DIG__;
+};
+template <> struct numeric_limits<double> {
+    static constexpr bool is_specialized = true;
+    static constexpr double min() noexcept { return __DBL_MIN__; }
+    static constexpr double max() noexcept { return __DBL_MAX__; }
+    static constexpr double lowest() noexcept { return -__DBL_MAX__; }
+    static constexpr double epsilon() noexcept { return __DBL_EPSILON__; }
+    static constexpr double infinity() noexcept { return __builtin_huge_val(); }
+    static constexpr double quiet_NaN() noexcept { return __builtin_nan(""); }
+    static constexpr bool is_signed = true;
+    static constexpr bool is_integer = false;
+    static constexpr bool is_exact = false;
+    static constexpr int  digits = __DBL_MANT_DIG__;
+};
+
+}  // namespace std
+
+#endif /* _LIBTOBY_LIMITS */

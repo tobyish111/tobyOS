@@ -1,0 +1,12 @@
+/* <cstdio> -- C++ names for C stdio (STL slice 1). */
+#ifndef _LIBTOBY_CSTDIO
+#define _LIBTOBY_CSTDIO
+#include <stdio.h>
+namespace std {
+using ::size_t;  using ::FILE;
+using ::printf;  using ::fprintf; using ::snprintf; using ::sprintf;
+using ::vsnprintf; using ::vprintf;
+using ::fputs;   using ::fputc;   using ::puts;    using ::putchar;
+using ::fwrite;  using ::fread;   using ::fopen;   using ::fclose; using ::fflush;
+}
+#endif

@@ -1,0 +1,6 @@
+/* <cinttypes> -- PRIx.. format macros + imaxabs (STL slice 1). */
+#ifndef _LIBTOBY_CINTTYPES
+#define _LIBTOBY_CINTTYPES
+#include <inttypes.h>
+#include <cstdint>
+#endif

@@ -1,0 +1,5 @@
+/* <cerrno> -- errno + E* macros (STL slice 1). */
+#ifndef _LIBTOBY_CERRNO
+#define _LIBTOBY_CERRNO
+#include <errno.h>
+#endif

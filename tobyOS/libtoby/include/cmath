@@ -1,0 +1,22 @@
+/* <cmath> -- C++ names for C math + the std::abs floating overloads
+ * (STL slice 1). Integer std::abs comes from <cstdlib>. */
+#ifndef _LIBTOBY_CMATH
+#define _LIBTOBY_CMATH
+#include <math.h>
+namespace std {
+using ::fabs;  using ::fabsf;
+using ::sqrt;  using ::sqrtf;  using ::pow; using ::powf;
+using ::floor; using ::floorf; using ::ceil; using ::ceilf;
+using ::round; using ::roundf; using ::fmod;
+using ::sin;   using ::cos;    using ::tan; using ::exp; using ::log; using ::log2;
+using ::fmax;  using ::fmin;
+
+inline float       abs(float __x)       { return __builtin_fabsf(__x); }
+inline double      abs(double __x)      { return __builtin_fabs(__x); }
+inline long double abs(long double __x) { return __builtin_fabsl(__x); }
+
+inline bool isnan(double __x)  { return __builtin_isnan(__x); }
+inline bool isinf(double __x)  { return __builtin_isinf(__x); }
+inline bool isfinite(double __x) { return __builtin_isfinite(__x); }
+}
+#endif

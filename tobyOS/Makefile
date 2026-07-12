@@ -393,6 +393,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_oh264test/user_oh264test.elf \
             programs/user_bsdroute/user_bsdroute.elf \
             programs/user_mp4play/user_mp4play.elf \
+            programs/user_stltest/user_stltest.elf \
             programs/user_gui_term/user_gui_term.elf \
             programs/user_gui_files/user_gui_files.elf \
             programs/user_gui_viewer/user_gui_viewer.elf \
@@ -1256,6 +1257,21 @@ programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
 endef
 
 $(eval $(call LIBTOBY_CPP_PROGRAM_RULES,user_cpptest,user_cpptest))
+
+# /bin/stltest exercises floating point (numeric_limits<float>, <cmath>),
+# so it is built with SSE enabled -- like other FP user code and the
+# codec libraries (openh264, and libgav1 next). Otherwise a double/float
+# return hits "SSE register return with SSE disabled".
+programs/user_stltest/user_stltest.o: programs/user_stltest/main.cpp $(LIBTOBY_AR)
+	$(CXX) $(filter-out -std=c11,$(LIBTOBY_CFLAGS)) -msse -msse2 \
+	      -std=c++17 -fno-exceptions -fno-rtti -nostdinc++ -c $< -o $@
+
+programs/user_stltest/user_stltest.elf: programs/user_stltest/user_stltest.o \
+                                        $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                                        programs/user_stltest/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_stltest/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/user_stltest/user_stltest.o $(LIBTOBY_AR)
+
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_bsdroute,user_bsdroute))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_mp4play,user_mp4play))
 
@@ -2305,6 +2321,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_oh264test/user_oh264test.elf     $(INITRD_STAGE)/bin/oh264test
 	cp programs/user_bsdroute/user_bsdroute.elf       $(INITRD_STAGE)/bin/bsdroute
 	cp programs/user_mp4play/user_mp4play.elf         $(INITRD_STAGE)/bin/mp4play
+	cp programs/user_stltest/user_stltest.elf         $(INITRD_STAGE)/bin/stltest
 	cp programs/user_gui_term/user_gui_term.elf       $(INITRD_STAGE)/bin/gui_term
 	cp programs/user_gui_files/user_gui_files.elf     $(INITRD_STAGE)/bin/gui_files
 	cp programs/user_gui_viewer/user_gui_viewer.elf   $(INITRD_STAGE)/bin/gui_viewer
@@ -2751,7 +2768,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
-	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play                          \
+	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest              \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
 	    bin/gui_calc bin/gui_taskmgr bin/gui_edit bin/gui_browser         \
 	    bin/login bin/gui_settings bin/abi_test                           \

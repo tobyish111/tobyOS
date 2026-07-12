@@ -1,0 +1,6 @@
+/* <cstdarg> -- variadic macros/va_list (STL slice 1). */
+#ifndef _LIBTOBY_CSTDARG
+#define _LIBTOBY_CSTDARG
+#include <stdarg.h>
+namespace std { using ::va_list; }
+#endif
