@@ -101,6 +101,25 @@ Verified `-DLIBGAV1_SELFTEST` (`/bin/av1test` phase 2, the real path):
 The reference is ffmpeg's `.avif` decode run through the same BT.601, so
 the whole container→decode→ARGB chain is checked bit-for-bit.
 
-## Next slice
-- **Slice 4** — a browser `<img src=...avif>` renders on screen (the
-  visible payoff; the loader path is already proven).
+## Slice 4 — AVIF `<img>` on screen in the browser (DONE)
+Captured live: the browser fetched a host page over SLIRP
+(`http://10.0.2.2:8099/`) with `<img src="/pic.avif">` (a 256×160 AVIF),
+and the image decodes + renders on screen. Serial confirms the real
+path — `[http] 200 OK ... type="image/avif"` (3696 bytes) — and the
+screenshot shows the decoded picture (gradient + circles + "AVIF" text)
+composited in the page. No browser code was needed: `image.c` gained AVIF
+in slice 3, so `<img>` renders it like any other format.
+
+Reproduce: host web server serving the page + `.avif` on
+`127.0.0.1:8099`; build the browser with `-DTKAPP_BOOT -DTKAPP_MP4VIDEO`
+(the boot selector types the URL); QEMU user networking + QMP; wait for
+the guest to GET `/pic.avif`, then screendump. (`-smp 1` steadies the
+intermittently-flaky headless desktop bring-up — re-run a couple of times
+for a clean composite.)
+
+## Status
+The libgav1 / AVIF arc (slices 1–4) is **complete**: vendored + freestanding
+build, bit-exact AV1 decode, AVIF wired into the image loader, and an AVIF
+`<img>` rendering on screen. Follow-ups: alpha auxiliary items, the
+`colr`/nclx color matrix (currently BT.601), 10-bit, and AV1 `<video>`
+(animated/AVIS) reuse the same decoder.
