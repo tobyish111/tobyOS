@@ -7927,6 +7927,15 @@ void _start(void) {
     #define TKAPP_PATH "/bin/cpptest"
     #define TKAPP_NAME "cpptest"
     #endif
+    /* media slice 4 on-screen proof: launch the browser and type the URL
+     * of the host test page (SLIRP maps 10.0.2.2 -> host loopback) that
+     * embeds a High-profile H.264 <video>. The URL is baked in-source so
+     * MSYS doesn't path-mangle a command-line -DTKAPP_KEYS with slashes. */
+    #ifdef TKAPP_MP4VIDEO
+    #define TKAPP_PATH "/bin/gui_browser"
+    #define TKAPP_NAME "gui_browser"
+    #define TKAPP_KEYS "http://10.0.2.2:8099/\r"
+    #endif
     #ifndef TKAPP_PATH
     #define TKAPP_PATH "/bin/gui_about"
     #endif

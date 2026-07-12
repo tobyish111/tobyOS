@@ -62,9 +62,25 @@ clip therefore uses `-bf 0`; it still exercises the defining High-profile
 tools (CABAC, 8x8 transform) plus inter-prediction. Bit-exact B-frame
 decode is a future item (a different decoder, or an openh264 fix).
 
+## On-screen proof (the visible payoff)
+Captured live: the browser fetched a host test page over SLIRP
+(`http://10.0.2.2:8099/`) with a `<video src="/rig.mp4">` (a 240x160,
+40-frame High-profile clip), and the frames decode + play on screen.
+Serial confirms the real browser path -- `[http] 200 OK ... type="video/
+mp4"`, `[vdec] profile_idc=100 -> openh264`, `[med] mp4/h264 frames/period
+40` -- and two screenshots ~15 s apart show different decoded frames
+(frame 10 then frame 22, the burned-in counter advancing), i.e. the clip
+is playing, not a still.
+
+Reproduce: a host web server serves the page + mp4 on `127.0.0.1:8099`;
+build with `-DTKAPP_BOOT -DTKAPP_MP4VIDEO` (a boot selector in `kernel.c`
+that launches `/bin/gui_browser` and types the URL -- baked in-source so
+MSYS doesn't path-mangle the slashes); boot QEMU with user networking and
+QMP, wait for the guest to GET `/rig.mp4`, then screendump. (The headless
+TKAPP desktop bring-up is intermittently flaky -- re-run a couple of times
+for a clean composite; `-smp 1` is steadier.)
+
 ## What's next
-- The visible payoff over the network -- a `<video>` element on a fetched
-  page playing on screen -- reuses this same path plus the already-proven
-  compositor; a browser screenshot rig can capture it when wanted.
 - libgav1 / AVIF (the next codec on the list), then persisted Alt-Svc and
   the EliteDesk pass.
+- Bit-exact B-frame decode (see the limitation above).
