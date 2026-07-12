@@ -59,4 +59,12 @@ int  kfont_draw_window(struct window *w, int x, int y, const char *s, int len,
 int  kfont_draw_window_f(struct window *w, int x, int y, const char *s, int len,
                          uint32_t xrgb, int px, int face);
 
+/* Rasterize `s` into a caller-provided coverage buffer (1 byte/pixel,
+ * row-major w*h, saturating max where glyphs overlap). (x,y) is the
+ * top-left of the text box inside the buffer, like kfont_draw_window.
+ * The buffer is NOT cleared first (callers can accumulate runs).
+ * Returns the advance width in px, 0 when no face is loaded. */
+int  kfont_raster_cov(uint8_t *cov, int w, int h, int x, int y,
+                      const char *s, int len, int px, int face);
+
 #endif /* TOBYOS_KFONT_H */

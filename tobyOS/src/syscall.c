@@ -576,6 +576,41 @@ static long sys_gui_flip_rect(int fd, long a2, long a3) {
     return gui_window_flip_rect(f->win, x, y, w, h);
 }
 
+/* Rasterize a text run into a user coverage buffer via the kernel TTF
+ * rasterizer (css-anim slice 3: browser compositing layers need
+ * pixel-identical offscreen text). Renders into a kernel scratch, then
+ * one copy_to_user. Buffer capped so a bad request can't kmalloc the
+ * world. */
+#define TTF_RASTER_MAX (512 * 1024)
+static long sys_gui_text_ttf_raster(struct abi_ttf_raster *ureq) {
+    if (!cap_check(current_proc(), CAP_GUI, "sys_gui_text_ttf_raster"))
+        return -ABI_EPERM;
+    if (!ureq) return -ABI_EINVAL;
+    struct abi_ttf_raster req;
+    if (copy_from_user(&req, ureq, sizeof(req)) != 0) return -ABI_EFAULT;
+    if (!req.cov || !req.s || req.w <= 0 || req.h <= 0) return -ABI_EINVAL;
+    if ((long)req.w * req.h > TTF_RASTER_MAX) return -ABI_EINVAL;
+    int px = req.px;
+    if (px <= 0)  px = 16;
+    if (px > 256) px = 256;
+    char buf[256];
+    long n = strncpy_from_user(buf, (const char *)(uintptr_t)req.s,
+                               sizeof(buf));
+    if (n < 0) return -ABI_EFAULT;
+    if (req.len >= 0 && req.len < n) n = req.len;
+    size_t sz = (size_t)req.w * (size_t)req.h;
+    uint8_t *scratch = kmalloc(sz);
+    if (!scratch) return -ABI_ENOMEM;
+    memset(scratch, 0, sz);
+    int adv = kfont_raster_cov(scratch, req.w, req.h, req.x, req.y,
+                               buf, (int)n, px, req.face);
+    long rc = adv;
+    if (copy_to_user((void *)(uintptr_t)req.cov, scratch, sz) != 0)
+        rc = -ABI_EFAULT;
+    kfree(scratch);
+    return rc;
+}
+
 static long sys_gui_poll_event(int fd, struct gui_event *out) {
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
@@ -3195,6 +3230,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
                                 (uint32_t)a4, (uint32_t)a5);
     case ABI_SYS_GUI_TEXT_TTF_WIDTH:
         return sys_gui_text_ttf_width((const char *)a1, (uint32_t)a2);
+    case ABI_SYS_GUI_TEXT_TTF_RASTER:
+        return sys_gui_text_ttf_raster((struct abi_ttf_raster *)a1);
     case ABI_SYS_GUI_FONT_REGISTER:
         return sys_gui_font_register((const void *)a1, (uint32_t)a2);
     case SYS_GUI_TEXT:

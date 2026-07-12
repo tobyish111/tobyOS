@@ -189,6 +189,31 @@ static inline long sys_http_finish(long h) {
     return r;
 }
 
+/* ---- TTF -> coverage raster (css-anim slice 3 compositing) -------- *
+ * The kernel rasterizes a text run as 0..255 coverage bytes into a
+ * user buffer (same glyph cache as on-window TTF text, so layer text
+ * is pixel-identical). Struct mirrors abi_ttf_raster (ABI-frozen). */
+#define SYS_GUI_TEXT_TTF_RASTER 182
+struct ttf_raster_rq {
+    unsigned long cov;
+    int32_t w, h;
+    unsigned long s;
+    int32_t len, x, y, px, face;
+};
+static inline long sys_ttf_raster(uint8_t *cov, int w, int h, int x, int y,
+                                  const char *s, int len, int px, int face) {
+    struct ttf_raster_rq rq;
+    rq.cov = (unsigned long)cov; rq.w = w; rq.h = h;
+    rq.s = (unsigned long)s; rq.len = len; rq.x = x; rq.y = y;
+    rq.px = px; rq.face = face;
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_GUI_TEXT_TTF_RASTER), "D"(&rq)
+        : "rcx", "r11", "memory");
+    return r;
+}
+
 /* ---- WebSocket (stage 13): open/poll/recv/send/close -------------- *
  * Kernel-side RFC 6455 client on the async worker; the browser polls
  * handles from the pump and never blocks. Structs mirror abi_ws_open /
@@ -686,6 +711,11 @@ struct cstyle {
     uint8_t  has_tf;             /* transform: translate present */
     int16_t  txpx, typx;         /* transform translate px */
     int8_t   txpct, typct;       /* transform translate % (of own size) */
+    /* transform scale/rotate + opacity (slice 3): painted through a
+     * per-element compositing layer, not baked at layout. */
+    uint16_t scx, scy;           /* scale, per-mille (1000 = 1x) */
+    int16_t  rot;                /* rotate, degrees */
+    uint8_t  opa;                /* opacity 0..255 (255 = opaque) */
     uint8_t  po_pct;             /* top/right/bottom/left are % (bits T R B L) */
     int8_t   webface;            /* @font-face kernel face id, -1 = none */
     /* CSS animations: @keyframes-driven overrides (not inherited). */
@@ -791,6 +821,7 @@ enum {
     CP_ANIMATION, CP_ANIM_NAME, CP_ANIM_DUR, CP_ANIM_ITER,
     CP_ANIM_DELAY, CP_ANIM_DIR, CP_ANIM_TIMING,
     CP_TRANSITION, CP_TRANS_PROP, CP_TRANS_DUR, CP_TRANS_DELAY, CP_TRANS_TIMING,
+    CP_OPACITY,
     CP__N
 };
 
@@ -2030,6 +2061,7 @@ static int prop_lookup(const char *s, int len) {
         {"transition",CP_TRANSITION},{"transition-property",CP_TRANS_PROP},
         {"transition-duration",CP_TRANS_DUR},{"transition-delay",CP_TRANS_DELAY},
         {"transition-timing-function",CP_TRANS_TIMING},
+        {"opacity",CP_OPACITY},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -2434,7 +2466,9 @@ static int webfont_face_for(const char *family, int flen) {
  * before layout, driving the existing reflow loop. */
 #define KF_MAX   24
 #define KF_STOPS 8
-struct kf_stop { uint8_t pct, has; int16_t txpx, typx; uint32_t color, bg; };
+/* has bits: 1 translate, 2 color, 4 bg, 8 scale, 16 rotate, 32 opacity */
+struct kf_stop { uint8_t pct, has; int16_t txpx, typx; uint32_t color, bg;
+                 uint16_t scx, scy; int16_t rot; uint8_t opa; };
 struct kf_anim { char name[28]; int nstops; struct kf_stop stops[KF_STOPS]; };
 static struct kf_anim g_kf[KF_MAX];
 static int      g_nkf;
@@ -2445,23 +2479,160 @@ static int32_t  g_anim_t0[NODE_MAX];    /* per-node animation start ms, -1 */
  * from/to/cur are the interpolation endpoints + current displayed value;
  * a transition (re)starts when the newly computed target differs. */
 struct trans_state {
-    uint8_t  seen, active;              /* bit0 color, bit1 bg, bit2 transform */
+    uint8_t  seen, active;              /* bit0 color, bit1 bg, bit2 transform,
+                                           bit3 opacity */
     uint32_t from_color, to_color, cur_color;
     uint32_t from_bg, to_bg, cur_bg;
     int16_t  from_tx, to_tx, cur_tx, from_ty, to_ty, cur_ty;
-    int32_t  t0_color, t0_bg, t0_tf;
+    /* transform scale/rotate ride the same bit-2 channel/t0 as translate
+     * (CSS transitions animate the whole `transform` value as one). */
+    uint16_t from_sx, to_sx, cur_sx, from_sy, to_sy, cur_sy;
+    int16_t  from_rot, to_rot, cur_rot;
+    uint8_t  from_opa, to_opa, cur_opa;
+    int32_t  t0_color, t0_bg, t0_tf, t0_opa;
 };
 static struct trans_state g_trans[NODE_MAX];
 
-/* Parse a px integer out of [s, s+n) (leading ws/sign, digits; ignores
- * the unit). *out set, returns end index. */
-static int kf_num(const char *s, int n, int *out) {
-    int i = 0, neg = 0, v = 0;
+/* ---- Compositing layers (css-anim slice 3) ------------------------- *
+ * An element with transform: scale/rotate or opacity < 1 paints through
+ * a layer: its display items [i0, i1) -- contiguous, because lay_block
+ * emits a node's subtree in one run -- are rendered into an offscreen
+ * ARGB buffer, then affine-blitted (scale+rotate about the layer's
+ * center, alpha scaled by opacity) via tk_draw_blit_blend. Registered
+ * at layout (skipping measure passes), reset per layout(); the bbox is
+ * computed at PAINT time from the live item rects so later ancestor
+ * shifts (relative/translate/abs placement) need no bookkeeping. */
+struct clayer {
+    int32_t  node, i0, i1;
+    uint16_t scx, scy;           /* per-mille */
+    int16_t  rot;                /* degrees */
+    uint8_t  opa;                /* 0..255 */
+};
+#define LAYER_MAX 32
+static struct clayer g_layer_tab[LAYER_MAX];
+static int g_nlayer;
+
+/* Parse a CSS <number> or <percentage> to per-mille: "1.5" -> 1500,
+ * "0.35" -> 350, "50%" -> 500. Clamps to +-32000. */
+static int css_frac_1000(const char *s, int n) {
+    int i = 0, neg = 0;
+    long whole = 0, frac = 0, fdiv = 1;
     while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
     if (i < n && s[i] == '-') { neg = 1; i++; }
-    while (i < n && s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; }
-    *out = neg ? -v : v;
-    return i;
+    while (i < n && s[i] >= '0' && s[i] <= '9') { whole = whole * 10 + (s[i] - '0'); i++; }
+    if (i < n && s[i] == '.') { i++;
+        while (i < n && s[i] >= '0' && s[i] <= '9' && fdiv < 1000000) {
+            frac = frac * 10 + (s[i] - '0'); fdiv *= 10; i++; } }
+    long v = whole * 1000 + frac * 1000 / fdiv;
+    while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+    if (i < n && s[i] == '%') v /= 100;
+    if (neg) v = -v;
+    /* wide clamp: angles reach 360000 ("360deg"); scale/opacity apply
+     * their own tighter clamps at the call sites */
+    if (v > 2000000) v = 2000000;
+    if (v < -2000000) v = -2000000;
+    return (int)v;
+}
+
+/* Parse a CSS <angle> ("45deg", "-30deg", "0.25turn") to whole degrees. */
+static int css_rot_deg(const char *s, int n) {
+    int v1000 = css_frac_1000(s, n);
+    if (str_contains(s, n, "turn", 4) >= 0)
+        return (int)((long)v1000 * 360 / 1000);
+    return v1000 / 1000;
+}
+
+/* Scan one transform function list: translate()/translateX/Y (px/%),
+ * scale()/scaleX/scaleY (number), rotate (deg/turn). Shared by the
+ * cascade (CP_TRANSFORM) and @keyframes stop parsing. Out-params may
+ * be NULL when a caller only wants a subset. */
+static void css_parse_transform(const char *v, int n, int fontpx,
+                                uint8_t *has_tf,
+                                int16_t *txpx, int16_t *typx,
+                                int8_t *txpct, int8_t *typct,
+                                uint16_t *scx, uint16_t *scy, int16_t *rot,
+                                uint8_t *has_sc, uint8_t *has_rot) {
+    int q = 0;
+    while (q < n) {
+        while (q < n && !((v[q] >= 'a' && v[q] <= 'z') ||
+                          (v[q] >= 'A' && v[q] <= 'Z'))) q++;
+        int f0 = q;
+        while (q < n && ((v[q] >= 'a' && v[q] <= 'z') ||
+                         (v[q] >= 'A' && v[q] <= 'Z'))) q++;
+        int fl2 = q - f0;
+        while (q < n && v[q] != '(') q++;
+        if (q >= n) break;
+        int a0 = ++q;
+        while (q < n && v[q] != ')') q++;
+        int an = q - a0;
+        if (q < n) q++;
+        const char *fn = v + f0, *ar = v + a0;
+        if (fl2 >= 9 && str_ncasecmp(fn, "translate", 9) == 0 && txpx) {
+            int isx = (fl2 == 10 && lc(fn[9]) == 'x');
+            int isy = (fl2 == 10 && lc(fn[9]) == 'y');
+            int comp = 0, cs = 0;
+            for (int p2 = 0; p2 <= an && comp < 2; p2++) {
+                if (p2 == an || ar[p2] == ',') {
+                    int cb = cs, cl = p2 - cs;
+                    while (cl > 0 && is_whitespace(ar[cb])) { cb++; cl--; }
+                    while (cl > 0 && is_whitespace(ar[cb + cl - 1])) cl--;
+                    if (cl > 0) {
+                        int pct = (ar[cb + cl - 1] == '%');
+                        int px = 0;
+                        if (pct) {
+                            int num = 0, neg = 0, k = cb;
+                            if (ar[k] == '-') { neg = 1; k++; }
+                            for (; k < cb + cl - 1 && ar[k] >= '0' && ar[k] <= '9'; k++)
+                                num = num * 10 + (ar[k] - '0');
+                            px = neg ? -num : num;
+                        } else {
+                            css_len_tok(ar + cb, cl, fontpx, &px);
+                        }
+                        int axis = isy ? 1 : (isx ? 0 : comp);
+                        if (axis == 0) {
+                            if (pct) { if (txpct) *txpct = (int8_t)px; }
+                            else *txpx = (int16_t)px;
+                        } else {
+                            if (pct) { if (typct) *typct = (int8_t)px; }
+                            else *typx = (int16_t)px;
+                        }
+                        if (has_tf) *has_tf = 1;
+                    }
+                    cs = p2 + 1;
+                    comp++;
+                }
+            }
+        } else if (fl2 >= 5 && str_ncasecmp(fn, "scale", 5) == 0 && scx) {
+            int isx = (fl2 == 6 && lc(fn[5]) == 'x');
+            int isy = (fl2 == 6 && lc(fn[5]) == 'y');
+            int ci = 0; while (ci < an && ar[ci] != ',') ci++;
+            int sa = css_frac_1000(ar, ci);
+            if (sa < 0) sa = 0;
+            if (sa > 16000) sa = 16000;
+            if (isx)      *scx = (uint16_t)sa;
+            else if (isy) { if (scy) *scy = (uint16_t)sa; }
+            else {
+                *scx = (uint16_t)sa;
+                int sb = sa;
+                if (ci < an) {
+                    sb = css_frac_1000(ar + ci + 1, an - ci - 1);
+                    if (sb < 0) sb = 0;
+                    if (sb > 16000) sb = 16000;
+                }
+                if (scy) *scy = (uint16_t)sb;
+            }
+            if (has_sc) *has_sc = 1;
+        } else if (fl2 == 6 && str_ncasecmp(fn, "rotate", 6) == 0 && rot) {
+            /* keep the raw degree count (e.g. "360deg" endpoints in a
+             * spinner keyframe must NOT collapse to 0); the painter's
+             * sin table normalizes. int16 covers +-32767 degrees. */
+            int d = css_rot_deg(ar, an);
+            if (d > 32000) d = 32000;
+            if (d < -32000) d = -32000;
+            *rot = (int16_t)d;
+            if (has_rot) *has_rot = 1;
+        }
+    }
 }
 
 /* Extract the animatable declarations from one keyframe stop block. */
@@ -2482,22 +2653,20 @@ static void kf_parse_stop_decls(const char *s, int n, struct kf_stop *st) {
         while (vn > 0 && (*vv == ' ' || *vv == '\t')) { vv++; vn--; }
         while (vn > 0 && (vv[vn - 1] == ' ' || vv[vn - 1] == ';')) vn--;
         if (pn == 9 && str_ncasecmp(s + p0, "transform", 9) == 0) {
-            int fo = str_contains(vv, vn, "translate", 9);
-            if (fo >= 0) {
-                int isx = (fo + 9 < vn && lc(vv[fo + 9]) == 'x');
-                int isy = (fo + 9 < vn && lc(vv[fo + 9]) == 'y');
-                int q = fo + 9;
-                while (q < vn && vv[q] != '(') q++;
-                if (q < vn) q++;
-                int a = 0, b = 0;
-                q += kf_num(vv + q, vn - q, &a);
-                while (q < vn && vv[q] != ',' && vv[q] != ')') q++;
-                if (q < vn && vv[q] == ',') { q++; kf_num(vv + q, vn - q, &b); }
-                st->has |= 1;
-                if (isy) { st->txpx = 0; st->typx = (int16_t)a; }
-                else if (isx) { st->txpx = (int16_t)a; st->typx = 0; }
-                else { st->txpx = (int16_t)a; st->typx = (int16_t)b; }
-            }
+            uint8_t htf = 0, hsc = 0, hrot = 0;
+            int16_t tx = 0, ty = 0, rot = 0;
+            uint16_t sx = 1000, sy = 1000;
+            css_parse_transform(vv, vn, 16, &htf, &tx, &ty, NULL, NULL,
+                                &sx, &sy, &rot, &hsc, &hrot);
+            if (htf)  { st->has |= 1;  st->txpx = tx; st->typx = ty; }
+            if (hsc)  { st->has |= 8;  st->scx = sx; st->scy = sy; }
+            if (hrot) { st->has |= 16; st->rot = rot; }
+        } else if (pn == 7 && str_ncasecmp(s + p0, "opacity", 7) == 0) {
+            int m = css_frac_1000(vv, vn);
+            if (m < 0) m = 0;
+            if (m > 1000) m = 1000;
+            st->opa = (uint8_t)(m * 255 / 1000);
+            st->has |= 32;
         } else if (pn == 5 && str_ncasecmp(s + p0, "color", 5) == 0) {
             uint32_t c; if (css_color_tok(vv, vn, &c)) { st->color = c; st->has |= 2; }
         } else if ((pn == 16 && str_ncasecmp(s + p0, "background-color", 16) == 0) ||
@@ -2551,6 +2720,7 @@ static void kf_parse(struct ccur *c) {
                 struct kf_stop *s = &a->stops[a->nstops++];
                 s->pct = (uint8_t)pct; s->has = 0; s->txpx = s->typx = 0;
                 s->color = 0; s->bg = 0;
+                s->scx = s->scy = 1000; s->rot = 0; s->opa = 255;
                 kf_parse_stop_decls(c->s + b0, bn, s);
             }
             if (p < end && c->s[p] == ',') p++;
@@ -2592,13 +2762,15 @@ static int css_time_ms(const char *s, int n) {
 }
 
 /* Map a transition-property name to a transitionable-property bit
- * (bit0 color, bit1 background-color, bit2 transform; "all" = all). */
+ * (bit0 color, bit1 background-color, bit2 transform, bit3 opacity;
+ * "all" = all). */
 static uint8_t trans_prop_bit(const char *s, int n) {
-    if (n == 3 && str_ncasecmp(s, "all", 3) == 0) return 7;
+    if (n == 3 && str_ncasecmp(s, "all", 3) == 0) return 15;
     if (n == 5 && str_ncasecmp(s, "color", 5) == 0) return 1;
     if ((n == 16 && str_ncasecmp(s, "background-color", 16) == 0) ||
         (n == 10 && str_ncasecmp(s, "background", 10) == 0)) return 2;
     if (n == 9 && str_ncasecmp(s, "transform", 9) == 0) return 4;
+    if (n == 7 && str_ncasecmp(s, "opacity", 7) == 0) return 8;
     return 0;
 }
 
@@ -2786,6 +2958,9 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->has_tf = 0;
     st->txpx = st->typx = 0;
     st->txpct = st->typct = 0;
+    st->scx = st->scy = 1000;                /* transform does not inherit */
+    st->rot = 0;
+    st->opa = 255;                           /* opacity does not inherit */
     st->po_pct = 0;
     st->webface = pst ? pst->webface : -1;   /* font-family inherits */
     st->anim_kf = -1;                        /* animation does not inherit */
@@ -3416,53 +3591,23 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         }
         break;
     case CP_TRANSFORM: {
-        /* v1: translate()/translateX()/translateY(); px or % of own size.
-         * scale/rotate/matrix are ignored (no wrong result, just no-op). */
+        /* translate()/translateX/Y (px or %), scale()/scaleX/scaleY,
+         * rotate(deg|turn) -- every function in the list is scanned.
+         * Translate bakes at layout; scale/rotate (+ opacity) paint
+         * through a compositing layer (slice 3). matrix()/skew() are
+         * ignored (no wrong result, just no-op). */
         st->has_tf = 0; st->txpx = 0; st->typx = 0; st->txpct = 0; st->typct = 0;
-        int fo = str_contains(v, n, "translate", 9);
-        if (fo >= 0) {
-            int isx = (fo + 9 < n && lc(v[fo + 9]) == 'x');
-            int isy = (fo + 9 < n && lc(v[fo + 9]) == 'y');
-            int p2 = fo + 9;
-            while (p2 < n && v[p2] != '(') p2++;
-            if (p2 < n) p2++;
-            int e2 = p2;
-            while (e2 < n && v[e2] != ')') e2++;
-            /* parse up to two comma-separated components */
-            int comp = 0;
-            int cs = p2;
-            for (int q = p2; q <= e2 && comp < 2; q++) {
-                if (q == e2 || v[q] == ',') {
-                    int cl = q - cs;
-                    while (cl > 0 && is_whitespace(v[cs])) { cs++; cl--; }
-                    int ce = cs + cl;
-                    while (ce > cs && is_whitespace(v[ce - 1])) ce--;
-                    cl = ce - cs;
-                    if (cl > 0) {
-                        int pct = (v[cs + cl - 1] == '%');
-                        int px = 0;
-                        if (pct) {
-                            int num = 0, neg = 0, k = cs;
-                            if (v[k] == '-') { neg = 1; k++; }
-                            for (; k < cs + cl - 1 && v[k] >= '0' && v[k] <= '9'; k++)
-                                num = num * 10 + (v[k] - '0');
-                            px = neg ? -num : num;
-                        } else {
-                            css_len_tok(v + cs, cl, st->px, &px);
-                        }
-                        int axis = isy ? 1 : (isx ? 0 : comp);
-                        if (axis == 0) {
-                            if (pct) st->txpct = (int8_t)px; else st->txpx = (int16_t)px;
-                        } else {
-                            if (pct) st->typct = (int8_t)px; else st->typx = (int16_t)px;
-                        }
-                        st->has_tf = 1;
-                    }
-                    cs = q + 1;
-                    comp++;
-                }
-            }
-        }
+        st->scx = st->scy = 1000; st->rot = 0;
+        css_parse_transform(v, n, st->px, &st->has_tf,
+                            &st->txpx, &st->typx, &st->txpct, &st->typct,
+                            &st->scx, &st->scy, &st->rot, NULL, NULL);
+        break;
+    }
+    case CP_OPACITY: {
+        int m = css_frac_1000(v, n);
+        if (m < 0) m = 0;
+        if (m > 1000) m = 1000;
+        st->opa = (uint8_t)(m * 255 / 1000);
         break;
     }
     case CP_ANIMATION: {
@@ -3544,7 +3689,7 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
                 st->trans_mask |= trans_prop_bit(tk, tl);
             }
         }
-        if (st->trans_mask == 0 && st->trans_dur > 0) st->trans_mask = 7;  /* bare time -> all */
+        if (st->trans_mask == 0 && st->trans_dur > 0) st->trans_mask = 15; /* bare time -> all */
         break;
     }
     case CP_TRANS_PROP: {
@@ -3560,7 +3705,7 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
     }
     case CP_TRANS_DUR:
         st->trans_dur = (uint16_t)css_time_ms(v, n);
-        if (!st->trans_mask) st->trans_mask = 7;
+        if (!st->trans_mask) st->trans_mask = 15;
         break;
     case CP_TRANS_DELAY:
         st->trans_delay = (uint16_t)css_time_ms(v, n);
@@ -5305,6 +5450,19 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
 
     g_cb_x = save_cbx; g_cb_y = save_cby; g_cb_w = save_cbw; g_cb_h = save_cbh;
 
+    /* Compositing layer (slice 3): scale/rotate/opacity paint the whole
+     * subtree [items0, nitems) through an offscreen buffer at paint
+     * time. Registered BEFORE the relative/translate shifts below so
+     * the paint-time item-union bbox self-tracks every later shift.
+     * Measure passes (g_flt_freeze) discard their items, so skip. */
+    if (!g_flt_freeze && E->nitems > items0 && g_nlayer < LAYER_MAX &&
+        (st->scx != 1000 || st->scy != 1000 || st->rot != 0 || st->opa != 255)) {
+        struct clayer *L = &g_layer_tab[g_nlayer++];
+        L->node = ni; L->i0 = items0; L->i1 = E->nitems;
+        L->scx = st->scx; L->scy = st->scy;
+        L->rot = st->rot; L->opa = st->opa;
+    }
+
     /* position: relative -- shift the whole element (its flow slot is
      * untouched: the parent keeps advancing as if unshifted). */
     if (st->pos == 1 && !g_flt_freeze) {
@@ -5430,6 +5588,7 @@ static void layout(int width) {
     E->nitems = 0;
     E->render_len = 0;
     g_find_run = -1;
+    g_nlayer = 0;                /* compositing layers rebuild per layout */
     g_layout_w = width;
     if (E->nnodes == 0) { g_doc_h = 0; E->render[0] = 0; return; }
 
@@ -8222,6 +8381,18 @@ static void anim_apply(void) {
             st->color = (hi->has & 2) ? css_col_lerp(lo->color, hi->color, num, den) : lo->color;
         if (lo->has & 4)
             st->bg = (hi->has & 4) ? css_col_lerp(lo->bg, hi->bg, num, den) : lo->bg;
+        if (lo->has & 8) {
+            st->scx = (uint16_t)css_lerp_i(lo->scx,
+                          (hi->has & 8) ? hi->scx : lo->scx, num, den);
+            st->scy = (uint16_t)css_lerp_i(lo->scy,
+                          (hi->has & 8) ? hi->scy : lo->scy, num, den);
+        }
+        if (lo->has & 16)
+            st->rot = (int16_t)css_lerp_i(lo->rot,
+                          (hi->has & 16) ? hi->rot : lo->rot, num, den);
+        if (lo->has & 32)
+            st->opa = (uint8_t)css_lerp_i(lo->opa,
+                          (hi->has & 32) ? hi->opa : lo->opa, num, den);
         if (!done) active = 1;
     }
     g_anim_active = active;
@@ -8283,25 +8454,65 @@ static void trans_apply(void) {
             } else ts->cur_bg = target;
             st->bg = ts->cur_bg;
         } else ts->seen &= ~2;
-        if (mask & 4) {                                     /* transform translate */
-            int16_t tx = st->has_tf ? st->txpx : 0, ty = st->has_tf ? st->typx : 0;
+        if (mask & 4) {              /* transform: translate + scale + rotate */
+            int16_t  tx = st->has_tf ? st->txpx : 0, ty = st->has_tf ? st->typx : 0;
+            uint16_t sx = st->scx, sy = st->scy;
+            int16_t  ro = st->rot;
             if (!(ts->seen & 4)) {
-                ts->cur_tx = ts->to_tx = tx; ts->cur_ty = ts->to_ty = ty; ts->seen |= 4;
-            } else if (tx != ts->to_tx || ty != ts->to_ty) {
-                ts->from_tx = ts->cur_tx; ts->from_ty = ts->cur_ty;
-                ts->to_tx = tx; ts->to_ty = ty; ts->t0_tf = (int32_t)now; ts->active |= 4;
+                ts->cur_tx = ts->to_tx = tx; ts->cur_ty = ts->to_ty = ty;
+                ts->cur_sx = ts->to_sx = sx; ts->cur_sy = ts->to_sy = sy;
+                ts->cur_rot = ts->to_rot = ro;
+                ts->seen |= 4;
+            } else if (tx != ts->to_tx || ty != ts->to_ty ||
+                       sx != ts->to_sx || sy != ts->to_sy || ro != ts->to_rot) {
+                ts->from_tx = ts->cur_tx;  ts->from_ty = ts->cur_ty;
+                ts->from_sx = ts->cur_sx;  ts->from_sy = ts->cur_sy;
+                ts->from_rot = ts->cur_rot;
+                ts->to_tx = tx; ts->to_ty = ty;
+                ts->to_sx = sx; ts->to_sy = sy; ts->to_rot = ro;
+                ts->t0_tf = (int32_t)now; ts->active |= 4;
             }
             if (ts->active & 4) {
                 long el = now - ts->t0_tf - delay;
-                if (dur <= 0 || el >= dur) { ts->cur_tx = ts->to_tx; ts->cur_ty = ts->to_ty; ts->active &= ~4; }
-                else if (el < 0) { ts->cur_tx = ts->from_tx; ts->cur_ty = ts->from_ty; }
-                else { int fr = css_ease((int)(el * 1000 / dur), st->trans_flags);
+                if (dur <= 0 || el >= dur) {
+                    ts->cur_tx = ts->to_tx; ts->cur_ty = ts->to_ty;
+                    ts->cur_sx = ts->to_sx; ts->cur_sy = ts->to_sy;
+                    ts->cur_rot = ts->to_rot;
+                    ts->active &= ~4;
+                } else if (el < 0) {
+                    ts->cur_tx = ts->from_tx; ts->cur_ty = ts->from_ty;
+                    ts->cur_sx = ts->from_sx; ts->cur_sy = ts->from_sy;
+                    ts->cur_rot = ts->from_rot;
+                } else { int fr = css_ease((int)(el * 1000 / dur), st->trans_flags);
                     ts->cur_tx = (int16_t)css_lerp_i(ts->from_tx, ts->to_tx, fr, 1000);
-                    ts->cur_ty = (int16_t)css_lerp_i(ts->from_ty, ts->to_ty, fr, 1000); }
-            } else { ts->cur_tx = tx; ts->cur_ty = ty; }
+                    ts->cur_ty = (int16_t)css_lerp_i(ts->from_ty, ts->to_ty, fr, 1000);
+                    ts->cur_sx = (uint16_t)css_lerp_i(ts->from_sx, ts->to_sx, fr, 1000);
+                    ts->cur_sy = (uint16_t)css_lerp_i(ts->from_sy, ts->to_sy, fr, 1000);
+                    ts->cur_rot = (int16_t)css_lerp_i(ts->from_rot, ts->to_rot, fr, 1000); }
+            } else {
+                ts->cur_tx = tx; ts->cur_ty = ty;
+                ts->cur_sx = sx; ts->cur_sy = sy; ts->cur_rot = ro;
+            }
             st->has_tf = 1; st->txpct = st->typct = 0;
             st->txpx = ts->cur_tx; st->typx = ts->cur_ty;
+            st->scx = ts->cur_sx; st->scy = ts->cur_sy; st->rot = ts->cur_rot;
         } else ts->seen &= ~4;
+        if (mask & 8) {                                     /* opacity */
+            uint8_t target = st->opa;
+            if (!(ts->seen & 8)) { ts->cur_opa = ts->to_opa = target; ts->seen |= 8; }
+            else if (target != ts->to_opa) {
+                ts->from_opa = ts->cur_opa; ts->to_opa = target;
+                ts->t0_opa = (int32_t)now; ts->active |= 8;
+            }
+            if (ts->active & 8) {
+                long el = now - ts->t0_opa - delay;
+                if (dur <= 0 || el >= dur) { ts->cur_opa = ts->to_opa; ts->active &= ~8; }
+                else if (el < 0) ts->cur_opa = ts->from_opa;
+                else ts->cur_opa = (uint8_t)css_lerp_i(ts->from_opa, ts->to_opa,
+                                       css_ease((int)(el * 1000 / dur), st->trans_flags), 1000);
+            } else ts->cur_opa = target;
+            st->opa = ts->cur_opa;
+        } else ts->seen &= ~8;
         if (ts->active) g_anim_active = 1;
     }
 }
@@ -10687,6 +10898,276 @@ static void draw_hline(int fd, int x, int y, int w, uint32_t color) {
     sys_gui_fill(fd, x, y, w, 1, color);
 }
 
+/* ---- Compositing-layer painter (css-anim slice 3) ------------------ *
+ * transform: scale/rotate and opacity cannot bake at layout like
+ * translate/color do -- they need pixels. A registered layer's items
+ * are rendered into an offscreen ARGB buffer (userland replicas of the
+ * item painters; text via the kernel TTF->coverage syscall, so glyphs
+ * are pixel-identical), then the buffer is affine-blitted to the
+ * window row by row: inverse-map each destination pixel through
+ * S(1/s)*R(-a) about the layer center, nearest-sample, scale alpha by
+ * opacity, tk_draw_blit_blend. All integer math (sin table * 10000,
+ * doubled coords for exact half-pixel centers). */
+
+static const int16_t g_sin10k_tab[91] = {
+        0,  175,  349,  523,  698,  872, 1045, 1219, 1392, 1564,
+     1736, 1908, 2079, 2250, 2419, 2588, 2756, 2924, 3090, 3256,
+     3420, 3584, 3746, 3907, 4067, 4226, 4384, 4540, 4695, 4848,
+     5000, 5150, 5299, 5446, 5592, 5736, 5878, 6018, 6157, 6293,
+     6428, 6561, 6691, 6820, 6947, 7071, 7193, 7314, 7431, 7547,
+     7660, 7771, 7880, 7986, 8090, 8192, 8290, 8387, 8480, 8572,
+     8660, 8746, 8829, 8910, 8988, 9063, 9135, 9205, 9272, 9336,
+     9397, 9455, 9511, 9563, 9613, 9659, 9703, 9744, 9781, 9816,
+     9848, 9877, 9903, 9925, 9945, 9962, 9976, 9986, 9994, 9998,
+    10000
+};
+static int sin10k(int deg) {
+    deg %= 360; if (deg < 0) deg += 360;
+    int s = 1;
+    if (deg >= 180) { deg -= 180; s = -1; }
+    if (deg > 90) deg = 180 - deg;
+    return s * g_sin10k_tab[deg];
+}
+static int cos10k(int deg) { return sin10k(deg + 90); }
+
+#define LAYER_BUF_W_MAX 1024
+#define LAYER_BUF_PX (512 * 512)
+static uint32_t g_layer_buf[LAYER_BUF_PX];       /* 1 MiB offscreen ARGB */
+#define LAYER_COV_CAP (96 * 1024)
+static uint8_t  g_layer_cov[LAYER_COV_CAP];      /* per-text-run coverage */
+static uint32_t g_layer_row[2048];               /* one transformed row */
+
+/* Straight-alpha source-over of src onto dst. */
+static uint32_t argb_over(uint32_t dst, uint32_t src) {
+    uint32_t sa = src >> 24;
+    if (sa == 0) return dst;
+    if (sa == 255) return src;
+    uint32_t da = dst >> 24;
+    uint32_t rest = da * (255 - sa) / 255;
+    uint32_t oa = sa + rest;
+    if (oa == 0) return 0;
+    uint32_t r = (((src >> 16) & 255) * sa + ((dst >> 16) & 255) * rest) / oa;
+    uint32_t g = (((src >>  8) & 255) * sa + ((dst >>  8) & 255) * rest) / oa;
+    uint32_t b = ((src & 255) * sa + (dst & 255) * rest) / oa;
+    return (oa << 24) | (r << 16) | (g << 8) | b;
+}
+
+static void layer_fill(uint32_t *buf, int lw, int lh,
+                       int x, int y, int w, int h, uint32_t rgb) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > lw) w = lw - x;
+    if (y + h > lh) h = lh - y;
+    uint32_t px = 0xFF000000u | (rgb & 0xFFFFFF);
+    for (int r = 0; r < h; r++) {
+        uint32_t *row = buf + (long)(y + r) * lw + x;
+        for (int c = 0; c < w; c++) row[c] = px;
+    }
+}
+
+/* TTF run into the layer: kernel rasters coverage, we blend fg. The
+ * coverage box is padded left/top so glyph overhang (negative xoff)
+ * isn't clipped. */
+static void layer_text_ttf(uint32_t *buf, int lw, int lh, int x, int y,
+                           const char *s, int len, uint32_t fg,
+                           int px, int face, int runw, int runh) {
+    int pad = px / 4 + 2;
+    int cw = runw + pad + px;
+    int ch = runh + pad;
+    if (cw > 2048) cw = 2048;
+    if ((long)cw * ch > LAYER_COV_CAP) return;
+    for (long i = 0; i < (long)cw * ch; i++) g_layer_cov[i] = 0;
+    if (sys_ttf_raster(g_layer_cov, cw, ch, pad, 0, s, len, px, face) < 0)
+        return;
+    uint32_t rgb = fg & 0xFFFFFF;
+    for (int r = 0; r < ch; r++) {
+        int dy = y + r;
+        if (dy < 0 || dy >= lh) continue;
+        const uint8_t *cov = g_layer_cov + (long)r * cw;
+        uint32_t *dst = buf + (long)dy * lw;
+        for (int c = 0; c < cw; c++) {
+            int dx = x - pad + c;
+            if (dx < 0 || dx >= lw || !cov[c]) continue;
+            dst[dx] = argb_over(dst[dx], ((uint32_t)cov[c] << 24) | rgb);
+        }
+    }
+}
+
+/* 8x8 monospace run into the layer (mono <pre>/<code> inside layers;
+ * canvas bitmap font, close to the kernel console face). */
+static void layer_text_mono(uint32_t *buf, int lw, int lh, int x, int y,
+                            const char *s, int len, uint32_t fg) {
+    uint32_t px = 0xFF000000u | (fg & 0xFFFFFF);
+    for (int i = 0; i < len; i++) {
+        unsigned ch = (unsigned char)s[i];
+        if (ch < 0x20 || ch > 0x7E) ch = ' ';
+        const unsigned char *gl = g_font8x8[ch - 0x20];
+        for (int r = 0; r < 8; r++) {
+            int dy = y + r;
+            if (dy < 0 || dy >= lh) continue;
+            uint32_t *dst = buf + (long)dy * lw;
+            for (int c = 0; c < 8; c++) {
+                if (!(gl[r] & (1 << c))) continue;
+                int dx = x + i * CELL_W + c;
+                if (dx >= 0 && dx < lw) dst[dx] = px;
+            }
+        }
+    }
+}
+
+/* Render layer L's items into g_layer_buf. Returns 1 and the union
+ * bbox (doc coords) on success; 0 when the layer is empty or exceeds
+ * the buffer budget (caller falls back to untransformed painting). */
+static int layer_render(const struct clayer *L,
+                        int *out_x0, int *out_y0, int *out_w, int *out_h) {
+    static char tb[512];
+    int x0 = 1 << 28, y0 = 1 << 28, x1 = -(1 << 28), y1 = -(1 << 28);
+    for (int i = L->i0; i < L->i1 && i < g_nitems; i++) {
+        struct ditem *r = &g_items[i];
+        if (r->x < x0) x0 = r->x;
+        if (r->y < y0) y0 = r->y;
+        if (r->x + r->w > x1) x1 = r->x + r->w;
+        if (r->y + r->h > y1) y1 = r->y + r->h;
+    }
+    if (x1 <= x0 || y1 <= y0) return 0;
+    x0 -= 2; y0 -= 2; x1 += 2; y1 += 2;   /* glyph-overhang slop */
+    int lw = x1 - x0, lh = y1 - y0;
+    if (lw > LAYER_BUF_W_MAX || (long)lw * lh > LAYER_BUF_PX) return 0;
+    for (long i = 0; i < (long)lw * lh; i++) g_layer_buf[i] = 0;
+
+    for (int ri = L->i0; ri < L->i1 && ri < g_nitems; ri++) {
+        struct ditem *r = &g_items[ri];
+        int rx = r->x - x0, ry = r->y - y0;
+        if (r->kind == DI_RECT || r->kind == DI_BULLET) {
+            layer_fill(g_layer_buf, lw, lh, rx, ry, r->w, r->h, r->fg);
+            continue;
+        }
+        if (r->kind == DI_IMG) {
+            struct img *im = &g_images[r->img];
+            if (im->state == 1 && im->pixels && im->w > 0 && im->h > 0) {
+                for (int dy = 0; dy < r->h; dy++) {
+                    int by2 = ry + dy;
+                    if (by2 < 0 || by2 >= lh) continue;
+                    int syy = (int)((long)dy * im->h / r->h);
+                    if (syy >= im->h) syy = im->h - 1;
+                    const uint32_t *srow = im->pixels + (long)syy * im->w;
+                    uint32_t *drow = g_layer_buf + (long)by2 * lw;
+                    for (int dx = 0; dx < r->w; dx++) {
+                        int bx2 = rx + dx;
+                        if (bx2 < 0 || bx2 >= lw) continue;
+                        int sxx = (int)((long)dx * im->w / r->w);
+                        if (sxx >= im->w) sxx = im->w - 1;
+                        drow[bx2] = argb_over(drow[bx2], srow[sxx]);
+                    }
+                }
+            } else {
+                layer_fill(g_layer_buf, lw, lh, rx, ry, r->w, r->h, 0x00F1F3F4u);
+            }
+            continue;
+        }
+        if (r->kind == DI_FIELD) {
+            /* v1: box + border only (form text inside layers is rare) */
+            layer_fill(g_layer_buf, lw, lh, rx, ry, r->w, FIELD_H, 0x00FFFFFFu);
+            layer_fill(g_layer_buf, lw, lh, rx, ry, r->w, 1, 0x009AA0A6u);
+            layer_fill(g_layer_buf, lw, lh, rx, ry + FIELD_H - 1, r->w, 1, 0x009AA0A6u);
+            layer_fill(g_layer_buf, lw, lh, rx, ry, 1, FIELD_H, 0x009AA0A6u);
+            layer_fill(g_layer_buf, lw, lh, rx + r->w - 1, ry, 1, FIELD_H, 0x009AA0A6u);
+            continue;
+        }
+        /* DI_TEXT */
+        if (r->len <= 0) continue;
+        int n = r->len < (int)sizeof(tb) - 1 ? r->len : (int)sizeof(tb) - 1;
+        for (int k = 0; k < n; k++) {
+            char ch = g_render[r->off + k];
+            tb[k] = ((unsigned char)ch < 0x20 || (unsigned char)ch > 0x7E)
+                        ? ' ' : ch;
+        }
+        tb[n] = '\0';
+        uint32_t fg = r->fg & 0xFFFFFF;
+        if (r->fl & IF_MONO) {
+            if (r->bg >> 24)
+                layer_fill(g_layer_buf, lw, lh, rx - 2, ry, r->w + 4, r->h,
+                           r->bg & 0xFFFFFF);
+            int ty = ry + (r->h - 8) / 2;
+            layer_text_mono(g_layer_buf, lw, lh, rx, ty, tb, n, fg);
+        } else {
+            if (r->bg >> 24)
+                layer_fill(g_layer_buf, lw, lh, rx - 1, ry, r->w + 2, r->h,
+                           r->bg & 0xFFFFFF);
+            int nat = r->px + r->px / 3;
+            int ty = ry + (r->h - nat) / 2;
+            if (ty < ry) ty = ry;
+            layer_text_ttf(g_layer_buf, lw, lh, rx, ty, tb, n, fg,
+                           r->px, r->face, r->w, r->h);
+            if (r->fl & IF_UNDER)
+                layer_fill(g_layer_buf, lw, lh, rx, ty + r->px + 2, r->w, 1, fg);
+        }
+    }
+    *out_x0 = x0; *out_y0 = y0; *out_w = lw; *out_h = lh;
+    return 1;
+}
+
+/* Paint layer li: offscreen render + affine blit. Returns 1 when the
+ * layer was handled (painted or invisible), 0 = fall back to normal
+ * untransformed item painting. */
+static int paint_layer(int li, int vtop) {
+    struct clayer *L = &g_layer_tab[li];
+    int x0, y0, lw, lh;
+    if (!layer_render(L, &x0, &y0, &lw, &lh)) return 0;
+    if (L->opa == 0) return 1;                  /* invisible, but handled */
+    int fixed = (g_items[L->i0].fl & IF_FIXED) != 0;
+
+    /* doubled coords keep exact half-pixel centers in integer math */
+    long cx2 = 2L * x0 + lw, cy2 = 2L * y0 + lh;
+    int c10 = cos10k(L->rot), s10 = sin10k(L->rot);
+    long sx = L->scx ? L->scx : 1, sy = L->scy ? L->scy : 1;
+
+    /* destination bbox: forward-transform the 4 corners (scale, rotate) */
+    long dx0 = 1 << 28, dy0 = 1 << 28, dx1 = -(1 << 28), dy1 = -(1 << 28);
+    for (int k = 0; k < 4; k++) {
+        long rx2 = ((k & 1) ? (long)lw : -(long)lw);   /* corner rel *2 */
+        long ry2 = ((k & 2) ? (long)lh : -(long)lh);
+        long xs = rx2 * sx / 1000, ys = ry2 * sy / 1000;
+        long xr = (xs * c10 - ys * s10) / 10000;
+        long yr = (xs * s10 + ys * c10) / 10000;
+        long px2 = cx2 + xr, py2 = cy2 + yr;
+        if (px2 < dx0) dx0 = px2;
+        if (px2 > dx1) dx1 = px2;
+        if (py2 < dy0) dy0 = py2;
+        if (py2 > dy1) dy1 = py2;
+    }
+    int bx0 = (int)(dx0 / 2) - 1, bx1 = (int)(dx1 / 2) + 2;
+    int by0 = (int)(dy0 / 2) - 1, by1 = (int)(dy1 / 2) + 2;
+    if (bx0 < 0) bx0 = 0;
+    if (bx1 > g_win_w) bx1 = g_win_w;
+    if (bx1 <= bx0) return 1;
+
+    int vy0 = CONTENT_TOP, vy1 = CONTENT_TOP + g_content_h;
+    for (int yD = by0; yD < by1; yD++) {
+        int ys2 = fixed ? (CONTENT_TOP + yD) : (CONTENT_TOP + (yD - vtop));
+        if (ys2 < vy0 || ys2 >= vy1) continue;
+        long ry2 = 2L * yD + 1 - cy2;
+        int cnt = bx1 - bx0;
+        for (int i = 0; i < cnt; i++) {
+            long rx2 = 2L * (bx0 + i) + 1 - cx2;
+            /* inverse: rotate by -a, then unscale */
+            long ur = ( (long)c10 * rx2 + (long)s10 * ry2) / 10000;
+            long vr = (-(long)s10 * rx2 + (long)c10 * ry2) / 10000;
+            long us2 = ur * 1000 / sx, vs2 = vr * 1000 / sy;
+            long u = (us2 + cx2) / 2 - x0, v = (vs2 + cy2) / 2 - y0;
+            uint32_t px = 0;
+            if (u >= 0 && u < lw && v >= 0 && v < lh) {
+                px = g_layer_buf[v * lw + u];
+                if (L->opa != 255)
+                    px = ((((px >> 24) * L->opa) / 255) << 24) | (px & 0xFFFFFF);
+            }
+            g_layer_row[i] = px;
+        }
+        tk_draw_blit_blend(&win, bx0, ys2, cnt, 1, g_layer_row, cnt);
+    }
+    return 1;
+}
+
 /* paint_all() draws the whole window (called from the canvas on_paint);
  * redraw() just requests a repaint and is what the event handlers call. */
 /* Paint one image run at screen-y `sy`. Loaded images nearest-neighbor
@@ -10854,6 +11335,19 @@ static void paint_all(void) {
         int vy0 = CONTENT_TOP, vy1 = CONTENT_TOP + g_content_h;
 
         for (int ri = 0; ri < g_nitems; ri++) {
+            /* compositing layer starting here? (outermost = widest range
+             * wins; nested transforms flatten into it, v1) */
+            if (g_nlayer) {
+                int li = -1;
+                for (int k = 0; k < g_nlayer; k++)
+                    if (g_layer_tab[k].i0 == ri &&
+                        (li < 0 || g_layer_tab[k].i1 > g_layer_tab[li].i1))
+                        li = k;
+                if (li >= 0 && paint_layer(li, vtop)) {
+                    ri = g_layer_tab[li].i1 - 1;
+                    continue;
+                }
+            }
             struct ditem *r = &g_items[ri];
             int sy;
             if (r->fl & IF_FIXED) {         /* viewport coords, no scroll */

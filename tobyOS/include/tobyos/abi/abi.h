@@ -892,8 +892,28 @@ struct abi_ws_poll {
 #define ABI_WS_OP_TEXT    1
 #define ABI_WS_OP_BINARY  2
 
+/* Rasterize a text run into a caller-provided COVERAGE buffer (1 byte
+ * per pixel, 0..255 alpha, row-major w*h) using the kernel TTF
+ * rasterizer -- same glyph cache as GUI_TEXT_TTF, so offscreen text is
+ * pixel-identical to window text. The caller blends fg*coverage into
+ * its own surface (browser compositing layers, canvas). a1 = struct
+ * pointer. Returns advance width in px, or -E. */
+#define ABI_SYS_GUI_TEXT_TTF_RASTER  182
+
+struct abi_ttf_raster {
+    uint64_t cov;          /* in: uint8_t * user VA, w*h bytes (out) */
+    int32_t  w, h;         /* buffer dimensions (also row stride = w) */
+    uint64_t s;            /* in: const char * user VA */
+    int32_t  len;          /* string length (-1 = NUL-terminated) */
+    int32_t  x, y;         /* pen top-left inside the buffer (like
+                              GUI_TEXT_TTF: y is the line top, the
+                              kernel adds the face ascent) */
+    int32_t  px;           /* pixel height */
+    int32_t  face;         /* kernel face id (0 regular / web faces) */
+};
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          182
+#define ABI_SYS_NR_MAX          183
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

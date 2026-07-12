@@ -311,3 +311,29 @@ int kfont_draw_window(struct window *w, int x, int y, const char *s, int len,
                       uint32_t xrgb, int px) {
     return kfont_draw_window_f(w, x, y, s, len, xrgb, px, KFONT_REGULAR);
 }
+
+int kfont_raster_cov(uint8_t *cov, int w, int h, int x, int y,
+                     const char *s, int len, int px, int face) {
+    if (!cov || w <= 0 || h <= 0 || !s || !kface_info(face)) return 0;
+    int baseline = y + kfont_ascent_px(face, px);
+    int x0 = x, n = 0;
+    for (const char *p = s; *p && (len < 0 || n < len); p++, n++) {
+        struct gcache *g = kfont_glyph(face, (unsigned char)*p, px);
+        if (g && g->bmp && g->w > 0 && g->h > 0) {
+            int gx = x + g->xoff, gy = baseline + g->yoff;
+            for (int r = 0; r < g->h; r++) {
+                int dy = gy + r;
+                if (dy < 0 || dy >= h) continue;
+                const uint8_t *src = g->bmp + (long)r * g->w;
+                uint8_t *dst = cov + (long)dy * w;
+                for (int c = 0; c < g->w; c++) {
+                    int dx = gx + c;
+                    if (dx < 0 || dx >= w) continue;
+                    if (src[c] > dst[dx]) dst[dx] = src[c];
+                }
+            }
+        }
+        x += g ? g->advance : px / 2;
+    }
+    return x - x0;
+}

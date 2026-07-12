@@ -5,7 +5,8 @@ the last of the "feels modern" visual gaps. This arc is sliced:
 1. **`@keyframes` animations** (DONE) — driving the *cheap*
    properties that work in the immediate-mode painter.
 2. **CSS transitions** (DONE) — change-detection on restyle.
-3. `transform: scale`/`rotate` (needs compositing-layer work).
+3. **`transform: scale`/`rotate` + `opacity`** (DONE) — per-element
+   compositing layers.
 
 ## Slice 1 — `@keyframes` animations (DONE)
 An element with `animation:` runs autonomously on an animation clock; no
@@ -150,8 +151,58 @@ Fix: `gui_tick` pid-0 path now calls `sched_yield()` unconditionally
 is empty, so the tracked-alive gate saved nothing); the dead
 `any_tracked_alive()` helper is removed.
 
-## Next slices
-- **Slice 3** — `transform: scale`/`rotate` (+ `opacity`): per-element
-  compositing so a transformed subtree renders to an offscreen buffer that
-  is transform-blitted. The hardest part; the painter is immediate-mode
-  today.
+## Slice 3 — `transform: scale`/`rotate` + `opacity` (DONE, on-screen verified)
+Scale/rotate/opacity can't bake at layout the way translate/color do —
+they need pixels. Slice 3 adds **per-element compositing layers** to the
+immediate-mode painter:
+
+- **Kernel: `ABI_SYS_GUI_TEXT_TTF_RASTER` (182)** — rasterize a text run
+  as 0..255 coverage bytes into a user buffer (`kfont_raster_cov`, same
+  glyph cache as on-window TTF), so offscreen layer text is
+  pixel-identical to normal text. `struct abi_ttf_raster`; kernel
+  renders into a capped scratch then one `copy_to_user`.
+- **CSS**: `css_parse_transform` scans every function in a transform
+  list — translate/translateX/Y (px/%), scale/scaleX/scaleY (fractions,
+  per-mille in `cstyle.scx/scy`), rotate (deg/turn, raw degree count in
+  `cstyle.rot` so `rotate(360deg)` keyframe endpoints don't collapse to
+  0). New `opacity` property → `cstyle.opa` 0..255. All non-inherited.
+- **Animation/transitions**: `@keyframes` stops carry scale/rotate/
+  opacity (`kf_stop.has` bits 8/16/32); scale/rotate ride the existing
+  bit-2 `transform` transition channel (CSS transitions animate the
+  whole transform as one value), opacity gets its own bit-3 channel.
+- **Layers**: `lay_block` registers a `struct clayer {node, i0, i1,
+  scx, scy, rot, opa}` when the styled node needs one (skipped in
+  measure passes; the item range [i0,i1) is contiguous because a
+  node's subtree is emitted in one run). The paint-time bbox is the
+  live union of the item rects, so ancestor shifts need no bookkeeping.
+- **Paint**: `paint_layer` renders the items into a 1 MiB offscreen
+  ARGB buffer (userland replicas of the item painters; text via the
+  raster syscall + source-over blend), then affine-blits row by row:
+  each destination pixel inverse-maps through S(1/s)·R(−θ) about the
+  layer center (integer math: sin table ×10000, doubled coords for
+  exact half-pixel centers), nearest-samples the buffer, scales alpha
+  by opacity, and pushes rows with `tk_draw_blit_blend`.
+
+### Verified
+Host page with a red 150×70 box running `animation: spin 16s linear
+infinite` (`rotate(0)` → `rotate(360deg)`) and a blue box whose
+`setInterval` toggles `scale(1.6) rotate(25deg)` + `opacity 0.35` under
+`transition: transform 2.5s linear, opacity 2.5s linear`. 32 shots 2 s
+apart: the red box spins continuously (AABB cycles 152×76 → 148×158 →
+86×156 → 158×148 at 45°/shot) **with its TTF text rotating in the
+layer** (upside-down "SPIN" at 180°); the blue box shows simultaneous
+scale+rotate+fade (pale semi-transparent blue over the white page,
+text visible through it) and settles back to a crisp opaque unrotated
+box when the transition returns home. 11 interval ticks, no faults,
+~30 fps in the GUI monitor.
+
+### v1 limits
+transform-origin is the layer-bbox center (≈ 50% 50%); compose order is
+fixed (scale·rotate about the center + separately-baked translate —
+matches CSS for uniform scale; differs for non-uniform scale combined
+with rotate); nearest-neighbor sampling (edges are unsmoothed); hit
+testing and getBoundingClientRect stay untransformed; nested transformed
+descendants flatten into the outermost layer; layers beyond the 1 MiB /
+1024-px-wide budget fall back to untransformed painting; overflow-clip
+ancestors are not intersected inside layers; form-field text inside
+layers is skipped (box chrome only); mono runs use the 8×8 canvas font.
