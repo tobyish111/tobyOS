@@ -694,6 +694,11 @@ struct cstyle {
     uint16_t anim_delay;         /* animation-delay ms */
     uint8_t  anim_iter;          /* iteration count, 0 = infinite */
     uint8_t  anim_flags;         /* bit0 alternate, bit1 ease-in-out */
+    /* CSS transitions: interpolate on computed-value change (not inherited). */
+    uint8_t  trans_mask;         /* bit0 color, bit1 bg, bit2 transform */
+    uint8_t  trans_flags;        /* bit1 ease-in-out */
+    uint16_t trans_dur;          /* transition-duration ms (0 = none) */
+    uint16_t trans_delay;        /* transition-delay ms */
 };
 
 /* ---- DOM ---------------------------------------------------------- */
@@ -785,6 +790,7 @@ enum {
     CP_OVERFLOW, CP_OVERFLOWX, CP_OVERFLOWY, CP_TRANSFORM,
     CP_ANIMATION, CP_ANIM_NAME, CP_ANIM_DUR, CP_ANIM_ITER,
     CP_ANIM_DELAY, CP_ANIM_DIR, CP_ANIM_TIMING,
+    CP_TRANSITION, CP_TRANS_PROP, CP_TRANS_DUR, CP_TRANS_DELAY, CP_TRANS_TIMING,
     CP__N
 };
 
@@ -2021,6 +2027,9 @@ static int prop_lookup(const char *s, int len) {
         {"animation-duration",CP_ANIM_DUR},{"animation-iteration-count",CP_ANIM_ITER},
         {"animation-delay",CP_ANIM_DELAY},{"animation-direction",CP_ANIM_DIR},
         {"animation-timing-function",CP_ANIM_TIMING},
+        {"transition",CP_TRANSITION},{"transition-property",CP_TRANS_PROP},
+        {"transition-duration",CP_TRANS_DUR},{"transition-delay",CP_TRANS_DELAY},
+        {"transition-timing-function",CP_TRANS_TIMING},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -2432,6 +2441,18 @@ static int      g_nkf;
 static int      g_anim_active;          /* >=1 while any element animates */
 static int32_t  g_anim_t0[NODE_MAX];    /* per-node animation start ms, -1 */
 
+/* CSS transitions: per-node runtime for the transitionable properties.
+ * from/to/cur are the interpolation endpoints + current displayed value;
+ * a transition (re)starts when the newly computed target differs. */
+struct trans_state {
+    uint8_t  seen, active;              /* bit0 color, bit1 bg, bit2 transform */
+    uint32_t from_color, to_color, cur_color;
+    uint32_t from_bg, to_bg, cur_bg;
+    int16_t  from_tx, to_tx, cur_tx, from_ty, to_ty, cur_ty;
+    int32_t  t0_color, t0_bg, t0_tf;
+};
+static struct trans_state g_trans[NODE_MAX];
+
 /* Parse a px integer out of [s, s+n) (leading ws/sign, digits; ignores
  * the unit). *out set, returns end index. */
 static int kf_num(const char *s, int n, int *out) {
@@ -2568,6 +2589,17 @@ static int css_time_ms(const char *s, int n) {
     if (i + 1 <= n && i < n && lc(s[i]) == 'm')     /* "ms" */
         return whole + frac / fdiv;
     return whole * 1000 + frac * 1000 / fdiv;       /* seconds (default) */
+}
+
+/* Map a transition-property name to a transitionable-property bit
+ * (bit0 color, bit1 background-color, bit2 transform; "all" = all). */
+static uint8_t trans_prop_bit(const char *s, int n) {
+    if (n == 3 && str_ncasecmp(s, "all", 3) == 0) return 7;
+    if (n == 5 && str_ncasecmp(s, "color", 5) == 0) return 1;
+    if ((n == 16 && str_ncasecmp(s, "background-color", 16) == 0) ||
+        (n == 10 && str_ncasecmp(s, "background", 10) == 0)) return 2;
+    if (n == 9 && str_ncasecmp(s, "transform", 9) == 0) return 4;
+    return 0;
 }
 
 static void css_parse_sheet(const char *s, long n, int origin) {
@@ -2759,6 +2791,8 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->anim_kf = -1;                        /* animation does not inherit */
     st->anim_dur = 0; st->anim_delay = 0;
     st->anim_iter = 0; st->anim_flags = 0;
+    st->trans_mask = 0; st->trans_flags = 0; /* transition does not inherit */
+    st->trans_dur = 0; st->trans_delay = 0;
 }
 
 static int clamp_px(int v) {
@@ -3484,6 +3518,55 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         break;
     case CP_ANIM_TIMING:
         if (str_contains(v, n, "ease", 4) >= 0) st->anim_flags |= 2;
+        break;
+    case CP_TRANSITION: {
+        /* transition: <property> <duration> [timing] [delay] (comma lists;
+         * v1 folds all entries into one mask + one dur/delay/timing). */
+        st->trans_mask = 0; st->trans_dur = 0; st->trans_delay = 0; st->trans_flags = 0;
+        int timeseen = 0, i = 0;
+        while (i < n) {
+            while (i < n && (v[i] == ' ' || v[i] == '\t' || v[i] == ',')) i++;
+            int t0 = i;
+            while (i < n && v[i] != ' ' && v[i] != '\t' && v[i] != ',') i++;
+            int tl = i - t0;
+            if (tl <= 0) break;
+            const char *tk = v + t0;
+            if (tk[0] >= '0' && tk[0] <= '9' && tl >= 2 && lc(tk[tl - 1]) == 's') {
+                int ms = css_time_ms(tk, tl);
+                if (!timeseen) { st->trans_dur = (uint16_t)ms; timeseen = 1; }
+                else st->trans_delay = (uint16_t)ms;
+            } else if (tl >= 4 && str_ncasecmp(tk, "ease", 4) == 0) {
+                st->trans_flags |= 2;
+            } else if ((tl == 6 && str_ncasecmp(tk, "linear", 6) == 0) ||
+                       (tl == 4 && str_ncasecmp(tk, "none", 4) == 0)) {
+                /* linear timing / no property */
+            } else {
+                st->trans_mask |= trans_prop_bit(tk, tl);
+            }
+        }
+        if (st->trans_mask == 0 && st->trans_dur > 0) st->trans_mask = 7;  /* bare time -> all */
+        break;
+    }
+    case CP_TRANS_PROP: {
+        st->trans_mask = 0;
+        int i = 0;
+        while (i < n) {
+            while (i < n && (v[i] == ' ' || v[i] == ',')) i++;
+            int t0 = i;
+            while (i < n && v[i] != ' ' && v[i] != ',') i++;
+            if (i > t0) st->trans_mask |= trans_prop_bit(v + t0, i - t0);
+        }
+        break;
+    }
+    case CP_TRANS_DUR:
+        st->trans_dur = (uint16_t)css_time_ms(v, n);
+        if (!st->trans_mask) st->trans_mask = 7;
+        break;
+    case CP_TRANS_DELAY:
+        st->trans_delay = (uint16_t)css_time_ms(v, n);
+        break;
+    case CP_TRANS_TIMING:
+        if (str_contains(v, n, "ease", 4) >= 0) st->trans_flags |= 2;
         break;
     case CP_POSITION:
         if (vtok_next(v, n, &pos, &t)) {
@@ -5460,6 +5543,7 @@ static void page_reset(void) {
     g_nkf = 0;
     g_anim_active = 0;
     for (int i = 0; i < NODE_MAX; i++) g_anim_t0[i] = -1;
+    mem_zero(g_trans, sizeof g_trans);
 }
 
 static void resolve_relative_url(const char *base, const char *rel, char *out, int out_max);
@@ -8143,6 +8227,85 @@ static void anim_apply(void) {
     g_anim_active = active;
 }
 
+/* Easing (0..1000 -> 0..1000): smoothstep for ease*, linear otherwise. */
+static int css_ease(int fr, uint8_t flags) {
+    if (flags & 2) {
+        long f = fr;
+        fr = (int)(3 * f * f / 1000 - 2 * f * f * f / 1000000);
+        if (fr < 0) fr = 0;
+        if (fr > 1000) fr = 1000;
+    }
+    return fr;
+}
+
+/* CSS transitions: when a transitioned property's freshly-cascaded value
+ * differs from its target, ease from the current displayed value to the
+ * new one over the duration. Runs after anim_apply (animation wins) and
+ * before layout. Overrides st with the interpolated value. */
+static void trans_apply(void) {
+    long now = js_now_ms();
+    for (int ni = 0; ni < E->nnodes; ni++) {
+        struct cstyle *st = &E->nodes[ni].st;
+        struct trans_state *ts = &g_trans[ni];
+        if (st->anim_kf >= 0) { ts->seen = 0; ts->active = 0; continue; }  /* anim wins */
+        uint8_t mask = st->trans_mask;
+        if (!mask && !ts->seen) continue;
+        long dur = st->trans_dur, delay = st->trans_delay;
+        if (mask & 1) {                                     /* color */
+            uint32_t target = st->color;
+            if (!(ts->seen & 1)) { ts->cur_color = ts->to_color = target; ts->seen |= 1; }
+            else if (target != ts->to_color) {
+                ts->from_color = ts->cur_color; ts->to_color = target;
+                ts->t0_color = (int32_t)now; ts->active |= 1;
+            }
+            if (ts->active & 1) {
+                long el = now - ts->t0_color - delay;
+                if (dur <= 0 || el >= dur) { ts->cur_color = ts->to_color; ts->active &= ~1; }
+                else if (el < 0) ts->cur_color = ts->from_color;
+                else ts->cur_color = css_col_lerp(ts->from_color, ts->to_color,
+                                                  css_ease((int)(el * 1000 / dur), st->trans_flags), 1000);
+            } else ts->cur_color = target;
+            st->color = ts->cur_color;
+        } else ts->seen &= ~1;
+        if (mask & 2) {                                     /* background-color */
+            uint32_t target = st->bg;
+            if (!(ts->seen & 2)) { ts->cur_bg = ts->to_bg = target; ts->seen |= 2; }
+            else if (target != ts->to_bg) {
+                ts->from_bg = ts->cur_bg; ts->to_bg = target;
+                ts->t0_bg = (int32_t)now; ts->active |= 2;
+            }
+            if (ts->active & 2) {
+                long el = now - ts->t0_bg - delay;
+                if (dur <= 0 || el >= dur) { ts->cur_bg = ts->to_bg; ts->active &= ~2; }
+                else if (el < 0) ts->cur_bg = ts->from_bg;
+                else ts->cur_bg = css_col_lerp(ts->from_bg, ts->to_bg,
+                                               css_ease((int)(el * 1000 / dur), st->trans_flags), 1000);
+            } else ts->cur_bg = target;
+            st->bg = ts->cur_bg;
+        } else ts->seen &= ~2;
+        if (mask & 4) {                                     /* transform translate */
+            int16_t tx = st->has_tf ? st->txpx : 0, ty = st->has_tf ? st->typx : 0;
+            if (!(ts->seen & 4)) {
+                ts->cur_tx = ts->to_tx = tx; ts->cur_ty = ts->to_ty = ty; ts->seen |= 4;
+            } else if (tx != ts->to_tx || ty != ts->to_ty) {
+                ts->from_tx = ts->cur_tx; ts->from_ty = ts->cur_ty;
+                ts->to_tx = tx; ts->to_ty = ty; ts->t0_tf = (int32_t)now; ts->active |= 4;
+            }
+            if (ts->active & 4) {
+                long el = now - ts->t0_tf - delay;
+                if (dur <= 0 || el >= dur) { ts->cur_tx = ts->to_tx; ts->cur_ty = ts->to_ty; ts->active &= ~4; }
+                else if (el < 0) { ts->cur_tx = ts->from_tx; ts->cur_ty = ts->from_ty; }
+                else { int fr = css_ease((int)(el * 1000 / dur), st->trans_flags);
+                    ts->cur_tx = (int16_t)css_lerp_i(ts->from_tx, ts->to_tx, fr, 1000);
+                    ts->cur_ty = (int16_t)css_lerp_i(ts->from_ty, ts->to_ty, fr, 1000); }
+            } else { ts->cur_tx = tx; ts->cur_ty = ty; }
+            st->has_tf = 1; st->txpct = st->typct = 0;
+            st->txpx = ts->cur_tx; st->typx = ts->cur_ty;
+        } else ts->seen &= ~4;
+        if (ts->active) g_anim_active = 1;
+    }
+}
+
 static void js_rerender(void) {
     g_collect_light = 1;
     g_form_open = -1;
@@ -8154,6 +8317,7 @@ static void js_rerender(void) {
     var_scope_reset();
     style_node(0, &base);
     anim_apply();                /* overlay CSS animation keyframes */
+    trans_apply();               /* overlay CSS transitions */
     layout(g_win_w);
     clamp_scroll();
 }
@@ -8463,6 +8627,7 @@ static void render_html(void) {
     var_scope_reset();
     style_node(0, &base);
     anim_apply();                         /* start CSS animations at t0 */
+    trans_apply();                        /* seed transition current values */
 
     g_view_mode = VIEW_HTML;
     layout(g_win_w);                      /* initial style+layout BEFORE

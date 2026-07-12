@@ -51,9 +51,36 @@ yet (the events are registered in the prelude; wiring the dispatch is a
 follow-up). Per-frame full reflow is fine for a few animated elements but
 not free — a display-list-only fast path is a later optimization.
 
+## Slice 2 — CSS transitions (IMPLEMENTED, verification BLOCKED)
+The engine side is written and compiles: `transition` shorthand +
+longhands parse into non-inherited `cstyle` fields (`trans_mask`/
+`trans_dur`/`trans_delay`/`trans_flags`); a per-node `g_trans[]` runtime
+holds from/to/current per transitionable property (color, background-color,
+transform: translate); `trans_apply` runs after `anim_apply` and before
+layout, detects when a freshly-cascaded value differs from its target, and
+eases from the current displayed value to the new one (shared `css_ease`
+smoothstep), overriding `st` and keeping `g_anim_active` set while running.
+
+**Could not verify on screen.** The mechanism is a straight extension of
+the working `@keyframes` path, but the headless test can't demonstrate it:
+- A page's `setInterval` never fires while the page is otherwise idle
+  (the JS callback that would change a transitioned value doesn't run).
+- Triggering the change via a **keydown** (which the SPA proves dispatches)
+  *does* run the handler and change the style — but the render loop then
+  **freezes** (frame counter stuck, 0 fps): the transition starts but
+  never advances on screen.
+- Underlying both: the browser process is heavily **starved** in the
+  headless harness — `@keyframes` (slice 1) visibly ran but at ~15% real
+  time (a `2s` slide covered ~1/4 of its range in 3 s).
+
+This is an event-loop / scheduling interaction, not obviously a bug in the
+transition interpolation itself, and needs focused follow-up (serial
+instrumentation in the render loop; and understanding why a JS-triggered
+`g_anim_active` doesn't sustain the pump the way an initial-render one
+does). Until then slice 2 is **unverified** and should not be treated as
+working.
+
 ## Next slices
-- **Slice 2** — CSS transitions: snapshot computed values on restyle, diff
-  the transitioned properties, interpolate on change; fire `transitionend`.
 - **Slice 3** — `transform: scale`/`rotate` (+ `opacity`): per-element
   compositing so a transformed subtree renders to an offscreen buffer that
   is transform-blitted. The hardest part; the painter is immediate-mode
