@@ -36,6 +36,7 @@ int    atoi   (const char *s);
 long   atol   (const char *s);
 long   strtol (const char *s, char **endp, int base);
 unsigned long strtoul(const char *s, char **endp, int base);
+unsigned long long strtoull(const char *s, char **endp, int base);
 
 char  *getenv  (const char *name);
 int    setenv  (const char *name, const char *value, int overwrite);

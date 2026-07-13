@@ -110,11 +110,30 @@ long strtol(const char *s, char **endp, int base) {
     return sign * v;
 }
 
+unsigned long long strtoull(const char *s, char **endp, int base) {
+    while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+    if (*s == '+') s++;
+    else if (*s == '-') s++;      /* C allows a sign; result wraps mod 2^64 */
+    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2; base = 16;
+    } else if (base == 0 && s[0] == '0') {
+        s++; base = 8;
+    } else if (base == 0) {
+        base = 10;
+    }
+    unsigned long long v = 0;
+    while (*s) {
+        int d = hexval(*s);
+        if (d < 0 || d >= base) break;
+        v = v * (unsigned)base + (unsigned)d;
+        s++;
+    }
+    if (endp) *endp = (char *)s;
+    return v;
+}
+
 unsigned long strtoul(const char *s, char **endp, int base) {
-    /* For our needs strtol's body works -- callers that care about the
-     * full unsigned range use strtoull (not provided). */
-    long v = strtol(s, endp, base);
-    return (unsigned long)v;
+    return (unsigned long)strtoull(s, endp, base);
 }
 
 /* ---- environment ---------------------------------------------------

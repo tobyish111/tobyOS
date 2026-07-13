@@ -325,6 +325,8 @@ float fmodf(float x, float y) { return (float)fmod((double)x, (double)y); }
 float powf(float x, float y)  { return (float)pow((double)x, (double)y); }
 float expf(float x)   { return (float)exp((double)x); }
 float logf(float x)   { return (float)log((double)x); }
+float copysignf(float x, float y) { return (float)copysign((double)x, (double)y); }
+float rintf(float x)  { return (float)rint((double)x); }
 
 /* ---- hyperbolics + friends (M-JS: QuickJS Math object) ------------- */
 

@@ -100,6 +100,8 @@ float  fmodf(float x, float y);
 float  powf(float x, float y);
 float  expf(float x);
 float  logf(float x);
+float  copysignf(float x, float y);
+float  rintf(float x);
 
 #ifdef __cplusplus
 }

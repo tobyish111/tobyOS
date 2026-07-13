@@ -4341,6 +4341,28 @@ void _start(void) {
             }
         }
 #endif
+#ifdef WASM_SELFTEST
+        /* WebAssembly (app-platform parity): spawn /bin/wasmtest, which
+         * runs a small module on the vendored wasm3 interpreter --
+         * i32/f32 ops, linear-memory load/store, and a C host import --
+         * and exits 0 iff every export returns the expected value.
+         * [wasm] stdout on serial. */
+        {
+            char *wv[] = { (char *)"wasmtest", 0 };
+            char *we[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec ws = { .path = "/bin/wasmtest",
+                .name = "wasmtest", .argc = 1, .argv = wv,
+                .envc = 1, .envp = we };
+            int wpid = proc_spawn(&ws);
+            if (wpid < 0) {
+                kprintf("[boot] WASM: /bin/wasmtest not spawned (rc=%d)\n", wpid);
+            } else {
+                int wrc = proc_wait(wpid);
+                kprintf("[boot] WASM: wasmtest (pid=%d) exit=%d (%s)\n",
+                        wpid, wrc, wrc == 0 ? "PASS" : "FAIL");
+            }
+        }
+#endif
 #ifdef CPPSTL_SELFTEST
         /* C++ STL bring-up: spawn /bin/stltest, which exercises the
          * freestanding STL headers (type_traits/utility/limits/... this

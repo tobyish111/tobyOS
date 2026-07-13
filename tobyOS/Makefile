@@ -396,6 +396,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_stltest/user_stltest.elf \
             programs/user_av1test/user_av1test.elf \
             programs/user_aactest/user_aactest.elf \
+            programs/user_wasmtest/user_wasmtest.elf \
             programs/user_gui_term/user_gui_term.elf \
             programs/user_gui_files/user_gui_files.elf \
             programs/user_gui_viewer/user_gui_viewer.elf \
@@ -1050,6 +1051,23 @@ $(HELIXAAC_DIR)/%.o: $(HELIXAAC_DIR)/%.c Makefile
 $(HELIXAAC_DIR)/%.pic.o: $(HELIXAAC_DIR)/%.c Makefile
 	$(CC) $(LIBTOBY_PIC_CFLAGS) -I $(HELIXAAC_DIR) -w -c $< -o $@
 
+# WebAssembly runtime (app-platform parity): the vendored wasm3 0.5.2
+# interpreter (MIT), pure portable C, freestanding on tobyOS. Only the
+# core parse/compile/exec engine is vendored -- the WASI/uvwasi/tracer
+# host-API files are excluded (we expose imports/exports through the JS
+# WebAssembly bridge instead of WASI). -w: vendored reference code.
+WASM3_DIR  := third_party/wasm3
+WASM3_SRCS := $(wildcard $(WASM3_DIR)/*.c)
+WASM3_OBJS     := $(WASM3_SRCS:.c=.o)
+WASM3_PIC_OBJS := $(WASM3_SRCS:.c=.pic.o)
+LIBTOBY_OBJS += $(WASM3_OBJS)
+
+$(WASM3_DIR)/%.o: $(WASM3_DIR)/%.c Makefile
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -I $(WASM3_DIR) -w -c $< -o $@
+
+$(WASM3_DIR)/%.pic.o: $(WASM3_DIR)/%.c Makefile
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -I $(WASM3_DIR) -w -c $< -o $@
+
 # High-profile H.264 decode (stage 13 media): the vendored openh264
 # decoder (Cisco, BSD-2), C++ built freestanding via the cpp-runtime.
 # Single-threaded decode -- only WelsThreadPool + WelsTaskThread are
@@ -1129,7 +1147,7 @@ $(LIBTOBY_AR): $(LIBTOBY_OBJS)
 # public POSIX-shape headers under libtoby/include only -- not the
 # kernel tree. Users wanting raw syscalls can still #include
 # <tobyos/abi/abi.h> by adding `-I ../../include` themselves.
-LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC)
+LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC) -isystem third_party/wasm3
 
 # ---------- Milestone 25D: libtoby.so (shared variant) ----------
 #
@@ -1159,6 +1177,7 @@ LIBTOBY_PIC_OBJS    += $(LIBTOBY_ASM_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBWEBP_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(H264BSD_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(HELIXAAC_PIC_OBJS)
+LIBTOBY_PIC_OBJS    += $(WASM3_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(OPENH264_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBGAV1_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBTOBY_SRC)/avif_decode.pic.o
@@ -1334,6 +1353,13 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_bsdroute,user_bsdroute))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_mp4play,user_mp4play))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_aactest,user_aactest))
 programs/user_aactest/user_aactest.o: programs/user_aactest/aac_clip.h
+
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_wasmtest,user_wasmtest))
+programs/user_wasmtest/user_wasmtest.o: programs/user_wasmtest/wasm_clip.h
+# wasm3 is built -msse -msse2; this program marshals f32 args/results
+# across the m3_CallV/m3_GetResultsV variadic boundary, which requires
+# the SSE calling convention (floats in XMM) on the caller side too.
+programs/user_wasmtest/user_wasmtest.o: LIBTOBY_CFLAGS += -msse -msse2
 
 # /bin/av1test (libgav1 slice 2): C++ decode-correctness test that links
 # libgav1's Decoder out of libtoby.a. Needs the libgav1 include roots +
@@ -2400,6 +2426,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_stltest/user_stltest.elf         $(INITRD_STAGE)/bin/stltest
 	cp programs/user_av1test/user_av1test.elf         $(INITRD_STAGE)/bin/av1test
 	cp programs/user_aactest/user_aactest.elf         $(INITRD_STAGE)/bin/aactest
+	cp programs/user_wasmtest/user_wasmtest.elf       $(INITRD_STAGE)/bin/wasmtest
 	cp programs/user_gui_term/user_gui_term.elf       $(INITRD_STAGE)/bin/gui_term
 	cp programs/user_gui_files/user_gui_files.elf     $(INITRD_STAGE)/bin/gui_files
 	cp programs/user_gui_viewer/user_gui_viewer.elf   $(INITRD_STAGE)/bin/gui_viewer
@@ -2846,7 +2873,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
-	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest bin/av1test bin/aactest \
+	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest bin/av1test bin/aactest bin/wasmtest \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
 	    bin/gui_calc bin/gui_taskmgr bin/gui_edit bin/gui_browser         \
 	    bin/login bin/gui_settings bin/abi_test                           \
