@@ -902,6 +902,7 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/poll.c \
                    $(LIBTOBY_SRC)/mman.c \
                    $(LIBTOBY_SRC)/config.c \
+                   $(LIBTOBY_SRC)/wasm_bridge.c \
                    $(LIBTOBY_SRC)/tk.c
 # M29B SYS_DRVMATCH ships in libtoby/src/hwinfo.c -- no new translation
 # unit. The list above is intentionally non-exhaustive of headers; the
@@ -966,6 +967,11 @@ $(LIBTOBY_SRC)/image.o: $(LIBTOBY_SRC)/image.c
 # + SSE2 intrinsics on x86-64), so it needs SSE like stb_image/stb_tt.
 $(LIBTOBY_SRC)/mp3_decode.o: $(LIBTOBY_SRC)/mp3_decode.c
 	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
+
+# wasm_bridge.c reaches into wasm3's private headers (M3Module layout),
+# so it needs the wasm3 include path; -msse -msse2 to match the engine.
+$(LIBTOBY_SRC)/wasm_bridge.o: $(LIBTOBY_SRC)/wasm_bridge.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -I third_party/wasm3 -w -c $< -o $@
 
 # ---------- stage 13: freestanding C++ for tobyOS userland ----------
 # CXX is derived from CC (clang -> clang++), so the TMP='C:\t' wrapper
@@ -1210,6 +1216,9 @@ $(LIBTOBY_SRC)/image.pic.o: $(LIBTOBY_SRC)/image.c
 
 $(LIBTOBY_SRC)/mp3_decode.pic.o: $(LIBTOBY_SRC)/mp3_decode.c
 	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
+
+$(LIBTOBY_SRC)/wasm_bridge.pic.o: $(LIBTOBY_SRC)/wasm_bridge.c
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -I third_party/wasm3 -w -c $< -o $@
 
 $(LIBTOBY_SO): $(LIBTOBY_PIC_OBJS)
 	$(LD) -m elf_x86_64 -nostdlib -shared -soname libtoby.so \
@@ -2256,7 +2265,7 @@ $(QJS_DIR)/%.o: $(QJS_DIR)/%.c $(LIBTOBY_AR)
 # Web browser -- TobyTK shell + DOM/CSS engine + QuickJS. main.c builds
 # -msse (it exchanges doubles with QuickJS) and sees the QuickJS API.
 programs/user_gui_browser/user_gui_browser.o: programs/user_gui_browser/main.c $(LIBTOBY_AR)
-	$(CC) $(LIBTOBY_CFLAGS) -msse -msse2 -I $(QJS_DIR) -c $< -o $@
+	$(CC) $(LIBTOBY_CFLAGS) -msse -msse2 -I $(QJS_DIR) $(BROWSER_EXTRA) -c $< -o $@
 
 programs/user_gui_browser/user_gui_browser.elf: programs/user_gui_browser/user_gui_browser.o \
                         $(QJS_OBJS) \

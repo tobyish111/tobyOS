@@ -80,6 +80,13 @@ struct gui_event {
 #pragma clang diagnostic ignored "-Wcast-function-type-mismatch"
 #include "quickjs.h"
 #pragma clang diagnostic pop
+
+/* wasm3 WebAssembly engine (third_party/wasm3, linked via libtoby). The
+ * public API only; import metadata comes through toby/wasm_bridge.h so
+ * wasm3's private u8/u32 typedefs never enter this TU. */
+#include "wasm3.h"
+#include "toby/wasm_bridge.h"
+
 static struct tk_window win;
 
 /* libtoby heap (stdlib.c over sbrk); the image path allocates fetch +
@@ -7948,6 +7955,294 @@ static JSValue js_dom_setdispatcher(JSContext *cx, JSValueConst t, int argc, JSV
     return JS_UNDEFINED;
 }
 
+/* ---- WebAssembly (wasm3) ------------------------------------------------
+ *
+ * The native half of the browser's WebAssembly JS API. wasm3 runs the
+ * module; the prelude (WASM_PRELUDE) wraps these primitives into the
+ * WebAssembly.{Module,Instance,Memory,instantiate,compile} surface.
+ *
+ * A module's imported functions are resolved by calling a JS resolver
+ * (module,field)->fn during instantiate; each is linked to a single C
+ * trampoline (wasm_import_tramp) that marshals wasm values <-> JSValues
+ * and calls back into JS. Exports are called via wasmCall; exported
+ * linear memory is exposed as a live ArrayBuffer aliasing wasm memory. */
+
+#define WASM_MAX_INSTANCES 8
+#define WASM_MAX_IMPORTS   96
+#define WASM_MAX_ARGS      16
+/* value types mirror M3ValueType: 1 i32, 2 i64, 3 f32, 4 f64 */
+
+struct wasm_import {
+    JSContext *cx;
+    JSValue    fn;             /* JS function to invoke (may be undefined) */
+    int        has_fn;
+    uint16_t   nargs, nrets;
+    uint8_t    argt[WASM_MAX_ARGS];
+    uint8_t    rett;
+};
+
+struct wasm_inst {
+    int             used;
+    JSContext      *cx;        /* owning tab context (for teardown) */
+    IM3Environment  env;
+    IM3Runtime      rt;
+    IM3Module       mod;
+    unsigned char  *bytes;     /* owned copy; m3 references it for life */
+    unsigned long   nbytes;
+    int             nimports;
+    struct wasm_import imports[WASM_MAX_IMPORTS];
+};
+
+static struct wasm_inst g_wasm[WASM_MAX_INSTANCES];
+
+/* Single trampoline linked for every JS-resolved function import. sp holds
+ * result slots first (nrets), then argument slots (nargs); each is 64-bit. */
+static const void *wasm_import_tramp(IM3Runtime rt, IM3ImportContext ctx,
+                                     uint64_t *sp, void *mem) {
+    (void)rt; (void)mem;
+    struct wasm_import *wi = (struct wasm_import *)ctx->userdata;
+    if (!wi || !wi->has_fn || !JS_IsFunction(wi->cx, wi->fn))
+        return "unresolved wasm import";
+    JSContext *cx = wi->cx;
+
+    JSValue av[WASM_MAX_ARGS];
+    int n = wi->nargs; if (n > WASM_MAX_ARGS) n = WASM_MAX_ARGS;
+    for (int k = 0; k < n; k++) {
+        uint64_t raw = sp[wi->nrets + k];
+        switch (wi->argt[k]) {
+        case 1: av[k] = JS_NewInt32(cx, (int32_t)(uint32_t)raw); break;
+        case 2: av[k] = JS_NewInt64(cx, (int64_t)raw); break;
+        case 3: { float f; __builtin_memcpy(&f, &raw, 4);
+                  av[k] = JS_NewFloat64(cx, (double)f); break; }
+        case 4: { double d; __builtin_memcpy(&d, &raw, 8);
+                  av[k] = JS_NewFloat64(cx, d); break; }
+        default: av[k] = JS_UNDEFINED; break;
+        }
+    }
+    JSValue r = JS_Call(cx, wi->fn, JS_UNDEFINED, n, av);
+    for (int k = 0; k < n; k++) JS_FreeValue(cx, av[k]);
+    if (JS_IsException(r)) { JS_FreeValue(cx, r); return "wasm import threw"; }
+
+    if (wi->nrets >= 1) {
+        switch (wi->rett) {
+        case 1: { int32_t v = 0; JS_ToInt32(cx, &v, r);
+                  sp[0] = (uint64_t)(uint32_t)v; break; }
+        case 2: { int64_t v = 0; JS_ToInt64(cx, &v, r);
+                  sp[0] = (uint64_t)v; break; }
+        case 3: { double d = 0; JS_ToFloat64(cx, &d, r); float f = (float)d;
+                  uint32_t u; __builtin_memcpy(&u, &f, 4); sp[0] = u; break; }
+        case 4: { double d = 0; JS_ToFloat64(cx, &d, r);
+                  __builtin_memcpy(&sp[0], &d, 8); break; }
+        default: sp[0] = 0; break;
+        }
+    }
+    JS_FreeValue(cx, r);
+    return m3Err_none;      /* NULL: success */
+}
+
+static void wasm_type_char(int t, char *out) {
+    switch (t) { case 1: *out='i'; break; case 2: *out='I'; break;
+                 case 3: *out='f'; break; case 4: *out='F'; break;
+                 default: *out='v'; break; }
+}
+
+static void wasm_inst_free(struct wasm_inst *w) {
+    if (!w->used) return;
+    for (int i = 0; i < w->nimports; i++)
+        if (w->imports[i].has_fn) JS_FreeValue(w->imports[i].cx, w->imports[i].fn);
+    if (w->rt)  m3_FreeRuntime(w->rt);     /* also frees the loaded module */
+    if (w->env) m3_FreeEnvironment(w->env);
+    if (w->bytes) free(w->bytes);
+    __builtin_memset(w, 0, sizeof(*w));
+}
+
+/* Free every instance owned by a tab context (called at JS teardown). */
+static void wasm_free_for_context(JSContext *cx) {
+    for (int i = 0; i < WASM_MAX_INSTANCES; i++)
+        if (g_wasm[i].used && g_wasm[i].cx == cx) wasm_inst_free(&g_wasm[i]);
+}
+
+/* wasmInstantiate(bytesArrayBuffer, resolverFn) -> instanceId | throws.
+ * resolverFn(moduleName, fieldName) returns the JS function for a function
+ * import (or undefined). */
+static JSValue js_wasm_instantiate(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 1) return JS_ThrowTypeError(cx, "wasmInstantiate: bytes required");
+    size_t blen = 0;
+    uint8_t *bsrc = JS_GetArrayBuffer(cx, &blen, argv[0]);
+    if (!bsrc || blen < 8)
+        return JS_ThrowTypeError(cx, "wasmInstantiate: expected wasm ArrayBuffer");
+
+    int id = -1;
+    for (int i = 0; i < WASM_MAX_INSTANCES; i++)
+        if (!g_wasm[i].used) { id = i; break; }
+    if (id < 0) return JS_ThrowInternalError(cx, "wasm: too many instances");
+    struct wasm_inst *w = &g_wasm[id];
+    __builtin_memset(w, 0, sizeof(*w));
+
+    /* Own a copy: wasm3 references the bytes for the module's lifetime. */
+    w->bytes = (unsigned char *)malloc(blen);
+    if (!w->bytes) return JS_ThrowOutOfMemory(cx);
+    __builtin_memcpy(w->bytes, bsrc, blen);
+    w->nbytes = blen;
+
+    w->env = m3_NewEnvironment();
+    w->rt  = w->env ? m3_NewRuntime(w->env, 256 * 1024, NULL) : NULL;
+    if (!w->env || !w->rt) { wasm_inst_free(w);
+        return JS_ThrowOutOfMemory(cx); }
+
+    M3Result r = m3_ParseModule(w->env, &w->mod, w->bytes, (uint32_t)blen);
+    if (r) { wasm_inst_free(w);
+        return JS_ThrowTypeError(cx, "wasm parse: %s", r); }
+    r = m3_LoadModule(w->rt, w->mod);      /* runtime now owns the module */
+    if (r) { wasm_inst_free(w);
+        return JS_ThrowTypeError(cx, "wasm load: %s", r); }
+
+    /* Resolve + link function imports. */
+    int nimp = toby_wasm_num_func_imports(w->mod);
+    if (nimp > WASM_MAX_IMPORTS) nimp = WASM_MAX_IMPORTS;
+    w->cx = cx;
+    w->nimports = nimp;
+    int have_resolver = (argc >= 2 && JS_IsFunction(cx, argv[1]));
+    for (int i = 0; i < nimp; i++) {
+        const char *mod = toby_wasm_import_module(w->mod, i);
+        const char *fld = toby_wasm_import_field(w->mod, i);
+        struct wasm_import *wi = &w->imports[i];
+        wi->cx = cx;
+        wi->nargs = (uint16_t)toby_wasm_import_num_args(w->mod, i);
+        wi->nrets = (uint16_t)toby_wasm_import_num_rets(w->mod, i);
+        if (wi->nargs > WASM_MAX_ARGS) wi->nargs = WASM_MAX_ARGS;
+        for (int a = 0; a < wi->nargs; a++)
+            wi->argt[a] = (uint8_t)toby_wasm_import_arg_type(w->mod, i, a);
+        wi->rett = (uint8_t)(wi->nrets ? toby_wasm_import_ret_type(w->mod, i, 0) : 0);
+
+        if (have_resolver && mod && fld) {
+            JSValue ma = JS_NewString(cx, mod), fa = JS_NewString(cx, fld);
+            JSValue ar[2] = { ma, fa };
+            JSValue fn = JS_Call(cx, argv[1], JS_UNDEFINED, 2, ar);
+            JS_FreeValue(cx, ma); JS_FreeValue(cx, fa);
+            if (JS_IsFunction(cx, fn)) { wi->fn = fn; wi->has_fn = 1; }
+            else JS_FreeValue(cx, fn);
+        }
+
+        /* signature: <ret>(<args>) */
+        char sig[WASM_MAX_ARGS + 4]; int sp = 0;
+        wasm_type_char(wi->nrets ? wi->rett : 0, &sig[sp]); sp++;
+        sig[sp++] = '(';
+        for (int a = 0; a < wi->nargs; a++) wasm_type_char(wi->argt[a], &sig[sp++]);
+        sig[sp++] = ')'; sig[sp] = 0;
+
+        if (mod && fld)
+            m3_LinkRawFunctionEx(w->mod, mod, fld, sig, &wasm_import_tramp, wi);
+    }
+
+    w->used = 1;
+    return JS_NewInt32(cx, id);
+}
+
+static struct wasm_inst *wasm_get(int id) {
+    if (id < 0 || id >= WASM_MAX_INSTANCES || !g_wasm[id].used) return NULL;
+    return &g_wasm[id];
+}
+
+/* wasmExportNames(id) -> [names...] of exported functions. */
+static JSValue js_wasm_exports(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    JSValue a = JS_NewArray(cx);
+    if (!w) return a;
+    int nf = toby_wasm_num_functions(w->mod), n = 0;
+    for (int i = 0; i < nf; i++) {
+        const char *nm = toby_wasm_func_export_name(w->mod, i);
+        if (nm && nm[0])
+            JS_SetPropertyUint32(cx, a, n++, JS_NewString(cx, nm));
+    }
+    return a;
+}
+
+/* wasmMemName(id) -> exported-memory name or "" (empty => no exported mem) */
+static JSValue js_wasm_memname(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    const char *nm = w ? toby_wasm_memory_export_name(w->mod) : NULL;
+    return JS_NewString(cx, nm ? nm : "");
+}
+
+/* wasmCall(id, name, argsArray) -> result number | undefined | throws. */
+static JSValue js_wasm_call(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    if (!w) return JS_ThrowTypeError(cx, "wasmCall: bad instance");
+    const char *name = JS_ToCString(cx, argv[1]);
+    if (!name) return JS_ThrowTypeError(cx, "wasmCall: bad name");
+
+    IM3Function f = NULL;
+    M3Result r = m3_FindFunction(&f, w->rt, name);
+    if (r || !f) { JS_FreeCString(cx, name);
+        return JS_ThrowTypeError(cx, "wasm export not found"); }
+    JS_FreeCString(cx, name);
+
+    uint32_t na = m3_GetArgCount(f);
+    if (na > WASM_MAX_ARGS) na = WASM_MAX_ARGS;
+    static uint64_t slots[WASM_MAX_ARGS];
+    const void *aptr[WASM_MAX_ARGS];
+    for (uint32_t k = 0; k < na; k++) {
+        JSValue e = (argc >= 3) ? JS_GetPropertyUint32(cx, argv[2], k) : JS_UNDEFINED;
+        slots[k] = 0;
+        switch (m3_GetArgType(f, k)) {
+        case c_m3Type_i32: { int32_t v = 0; JS_ToInt32(cx, &v, e);
+                             slots[k] = (uint64_t)(uint32_t)v; break; }
+        case c_m3Type_i64: { int64_t v = 0; JS_ToInt64(cx, &v, e);
+                             slots[k] = (uint64_t)v; break; }
+        case c_m3Type_f32: { double d = 0; JS_ToFloat64(cx, &d, e); float ff = (float)d;
+                             uint32_t u; __builtin_memcpy(&u, &ff, 4); slots[k] = u; break; }
+        case c_m3Type_f64: { double d = 0; JS_ToFloat64(cx, &d, e);
+                             __builtin_memcpy(&slots[k], &d, 8); break; }
+        default: break;
+        }
+        JS_FreeValue(cx, e);
+        aptr[k] = &slots[k];
+    }
+
+    r = m3_Call(f, na, aptr);
+    if (r) return JS_ThrowInternalError(cx, "wasm trap: %s", r);
+
+    if (m3_GetRetCount(f) < 1) return JS_UNDEFINED;
+    uint64_t ret = 0; const void *rptr[1] = { &ret };
+    if (m3_GetResults(f, 1, rptr)) return JS_UNDEFINED;
+    switch (m3_GetRetType(f, 0)) {
+    case c_m3Type_i32: return JS_NewInt32(cx, (int32_t)(uint32_t)ret);
+    case c_m3Type_i64: return JS_NewInt64(cx, (int64_t)ret);
+    case c_m3Type_f32: { float ff; __builtin_memcpy(&ff, &ret, 4);
+                         return JS_NewFloat64(cx, (double)ff); }
+    case c_m3Type_f64: { double d; __builtin_memcpy(&d, &ret, 8);
+                         return JS_NewFloat64(cx, d); }
+    default: return JS_UNDEFINED;
+    }
+}
+
+/* wasmMemBuffer(id) -> ArrayBuffer aliasing the module's linear memory
+ * (writes reflect into wasm). Valid until the memory grows (unsupported). */
+static JSValue js_wasm_membuffer(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    if (!w) return JS_NULL;
+    uint32_t sz = 0;
+    uint8_t *mp = m3_GetMemory(w->rt, &sz, 0);
+    if (!mp || !sz) return JS_NULL;
+    /* free_func NULL: the buffer aliases wasm-owned memory; QuickJS must
+     * not free it. */
+    return JS_NewArrayBuffer(cx, mp, sz, NULL, NULL, 0);
+}
+
+/* wasmFree(id): release an instance (prelude calls this if a page drops it). */
+static JSValue js_wasm_free(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)cx; (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    if (w) wasm_inst_free(w);
+    return JS_UNDEFINED;
+}
+
 /* ---- stage 13F: observers + getComputedStyle ----------------------- */
 
 /* Format an ARGB color the way getComputedStyle reports it: "rgb(r, g, b)"
@@ -8111,6 +8406,7 @@ static void js_teardown(struct tab *t) {
     if (!t->js_cx) { t->js_rt = NULL; return; }
     JSContext *cx = t->js_cx;
     workers_free_for(cx);          /* reap this page's Web Workers */
+    wasm_free_for_context(cx);     /* reap this page's WebAssembly instances */
     for (int k = 0; k < JS_TIMER_MAX; k++)
         if (t->js_timers[k].used) {
             JS_FreeValue(cx, t->js_timers[k].fn);
@@ -9235,6 +9531,82 @@ static const char JS_PRELUDE[] =
 "    }\n"
 "  }\n"
 "  D.setObsCheck(obsCheck);\n"
+/* ---- WebAssembly JS API (wasm3 backend) --------------------------- */
+"  (function(){\n"
+"    function toAB(src){\n"
+"      if (src instanceof ArrayBuffer) return src;\n"
+"      if (src && src.buffer instanceof ArrayBuffer)\n"
+"        return src.buffer.slice(src.byteOffset||0, (src.byteOffset||0)+(src.byteLength||0));\n"
+"      var u = new Uint8Array((src && src.length)||0);\n"
+"      for (var i=0;i<u.length;i++) u[i]=src[i]&255;\n"
+"      return u.buffer;\n"
+"    }\n"
+"    function mkResolver(imp){\n"
+"      return function(mod, field){\n"
+"        var m = imp && imp[mod];\n"
+"        if (m && typeof m[field] === 'function') return m[field];\n"
+"        return undefined;\n"
+"      };\n"
+"    }\n"
+"    function buildInstance(id){\n"
+"      var ex = {};\n"
+"      var names = D.wasmExportNames(id);\n"
+"      for (var i=0;i<names.length;i++){\n"
+"        (function(nm){ ex[nm] = function(){\n"
+"          return D.wasmCall(id, nm, Array.prototype.slice.call(arguments)); }; })(names[i]);\n"
+"      }\n"
+"      var mn = D.wasmMemName(id);\n"
+"      if (mn){\n"
+/* buffer is a getter: wasm3 allocates linear memory lazily, so fetch the
+ * live aliasing ArrayBuffer on access (valid until the memory grows). */
+"        ex[mn] = {};\n"
+"        Object.defineProperty(ex[mn], 'buffer',\n"
+"          { get: function(){ return D.wasmMemBuffer(id) || new ArrayBuffer(0); } });\n"
+"      }\n"
+"      return { exports: ex, __id: id };\n"
+"    }\n"
+"    function Module(bytes){ this.__bytes = toAB(bytes); }\n"
+"    function Instance(mod, imp){\n"
+"      var id = D.wasmInstantiate(mod.__bytes, mkResolver(imp));\n"
+"      var bi = buildInstance(id); this.exports = bi.exports; this.__id = id;\n"
+"    }\n"
+"    function Memory(desc){\n"
+"      var n = (desc && desc.initial) ? desc.initial : 1;\n"
+"      this.buffer = new ArrayBuffer(n*65536);\n"
+"    }\n"
+"    function Table(desc){ this.length = (desc && desc.initial)||0; }\n"
+"    function instantiate(src, imp){\n"
+"      try {\n"
+"        if (src instanceof Module)\n"
+"          return Promise.resolve(buildInstance(D.wasmInstantiate(src.__bytes, mkResolver(imp))));\n"
+"        var ab = toAB(src);\n"
+"        var id = D.wasmInstantiate(ab, mkResolver(imp));\n"
+"        return Promise.resolve({ module: new Module(ab), instance: buildInstance(id) });\n"
+"      } catch(e){ return Promise.reject(e); }\n"
+"    }\n"
+"    function compile(bytes){ try { return Promise.resolve(new Module(bytes)); }\n"
+"      catch(e){ return Promise.reject(e); } }\n"
+"    function instantiateStreaming(resp, imp){\n"
+"      return Promise.resolve(resp).then(function(r){\n"
+"        var src = (r && r.arrayBuffer) ? r.arrayBuffer() : r;\n"
+"        return Promise.resolve(src).then(function(ab){ return instantiate(ab, imp); });\n"
+"      });\n"
+"    }\n"
+"    function compileStreaming(resp){\n"
+"      return Promise.resolve(resp).then(function(r){\n"
+"        var src = (r && r.arrayBuffer) ? r.arrayBuffer() : r;\n"
+"        return Promise.resolve(src).then(function(ab){ return compile(ab); });\n"
+"      });\n"
+"    }\n"
+"    function CompileError(m){ this.message=m; this.name='CompileError'; }\n"
+"    function RuntimeError(m){ this.message=m; this.name='RuntimeError'; }\n"
+"    function LinkError(m){ this.message=m; this.name='LinkError'; }\n"
+"    g.WebAssembly = { Module: Module, Instance: Instance, Memory: Memory,\n"
+"      Table: Table, instantiate: instantiate, compile: compile,\n"
+"      instantiateStreaming: instantiateStreaming, compileStreaming: compileStreaming,\n"
+"      validate: function(b){ try { new Module(b); return true; } catch(e){ return false; } },\n"
+"      CompileError: CompileError, RuntimeError: RuntimeError, LinkError: LinkError };\n"
+"  })();\n"
 "})(globalThis);\n";
 
 /* Worker global scope (runs in the worker's own context). `self`/
@@ -9351,6 +9723,12 @@ static int js_ensure(void) {
             {"cvText", js_cv_text, 6},
             {"cvDrawImg", js_cv_drawimg, 6},
             {"cvSize", js_cv_size, 1},
+            {"wasmInstantiate", js_wasm_instantiate, 2},
+            {"wasmExportNames", js_wasm_exports, 1},
+            {"wasmMemName", js_wasm_memname, 1},
+            {"wasmCall", js_wasm_call, 3},
+            {"wasmMemBuffer", js_wasm_membuffer, 1},
+            {"wasmFree", js_wasm_free, 1},
         };
         for (unsigned k = 0; k < sizeof(B) / sizeof(B[0]); k++)
             JS_SetPropertyStr(cx, dom, B[k].n,
@@ -10241,6 +10619,45 @@ static void set_home_page(void) {
         "<p class=foot>TobyOS Browser v4.0 - DOM + CSS engine on the "
         "tobyOS kernel HTTP/HTTPS stack.</p>"
         "</body></html>";
+
+#ifdef WASM_BROWSER_TEST
+    /* On-screen WebAssembly test home page: instantiate an inline wasm
+     * module (the /bin/wasmtest module) via the WebAssembly JS API with a
+     * JS host import, call every export, and read exported linear memory.
+     * console.log lines (marked [wasmjs]) reach the serial log. */
+    html =
+        "<html><head><title>WASM test</title>"
+        "<style>body{background:#fff;color:#202124;font-size:15px}"
+        "#big{font-size:30px;color:#1a73e8;margin:12px 0}"
+        "#out{font-family:monospace;font-size:15px;color:#111}</style>"
+        "</head><body>"
+        "<h1 id=big>WASM: running...</h1>"
+        "<div id=out></div>"
+        "<script>"
+        "var B=[0,97,115,109,1,0,0,0,1,13,2,96,2,127,127,1,127,96,2,125,125,1,125,"
+        "2,16,1,3,101,110,118,8,104,111,115,116,95,109,117,108,0,0,3,5,4,0,1,0,0,"
+        "5,3,1,0,1,7,42,5,3,97,100,100,0,1,4,102,109,117,108,0,2,7,109,101,109,95,"
+        "115,117,109,0,3,9,99,97,108,108,95,104,111,115,116,0,4,3,109,101,109,2,0,"
+        "10,57,4,7,0,32,0,32,1,106,11,7,0,32,0,32,1,148,11,27,0,65,0,32,0,54,2,0,"
+        "65,4,32,1,54,2,0,65,0,40,2,0,65,4,40,2,0,106,11,11,0,32,0,32,1,16,0,65,2,108,11];"
+        "function L(s){console.log('[wasmjs] '+s);"
+        "var d=document.getElementById('out');if(d)d.innerHTML+=s+'<br>';}"
+        "var imp={env:{host_mul:function(a,b){return (a*b)|0;}}};"
+        "try{WebAssembly.instantiate(new Uint8Array(B),imp).then(function(res){"
+        "var e=res.instance.exports,ok=true;"
+        "var a=e.add(7,35);L('add(7,35)='+a);if(a!==42)ok=false;"
+        "var m=e.mem_sum(20,22);L('mem_sum(20,22)='+m);if(m!==42)ok=false;"
+        "var c=e.call_host(6,7);L('call_host(6,7)='+c);if(c!==84)ok=false;"
+        "var f=e.fmul(1.5,2.0);L('fmul(1.5,2.0)='+f);if(Math.abs(f-3.0)>0.01)ok=false;"
+        "var u=new Uint8Array(e.mem.buffer);L('mem[0]='+u[0]+' (buflen='+e.mem.buffer.byteLength+')');"
+        "if(u[0]!==20)ok=false;"
+        "L(ok?'RESULT: ALL PASS':'RESULT: FAIL');"
+        "var h=document.getElementById('big');if(h)h.textContent=ok?'WASM: ALL PASS':'WASM: FAIL';"
+        "L('ALL DONE');},function(err){L('instantiate rejected: '+err);L('ALL DONE');});"
+        "}catch(ex){L('threw: '+ex);L('ALL DONE');}"
+        "</script>"
+        "</body></html>";
+#endif
 
     g_raw_len = 0;
     while (html[g_raw_len]) { g_raw[g_raw_len] = html[g_raw_len]; g_raw_len++; }
