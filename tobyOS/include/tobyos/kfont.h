@@ -33,7 +33,12 @@ enum {
  * KFONT_TOTAL) index the registered slots. */
 #define KFONT_WEB_BASE  KFONT_NFACES
 #define KFONT_WEB_MAX   8
-#define KFONT_TOTAL     (KFONT_NFACES + KFONT_WEB_MAX)
+/* Fallback face: GNU Unifont (OFL), covering the whole Unicode BMP
+ * (CJK, Cyrillic, Greek, symbols, ...). Any codepoint the primary face
+ * lacks is drawn from here instead of a tofu box. Loaded lazily from
+ * /etc/fallback.otf. */
+#define KFONT_FALLBACK  (KFONT_WEB_BASE + KFONT_WEB_MAX)
+#define KFONT_TOTAL     (KFONT_NFACES + KFONT_WEB_MAX + 1)
 
 /* Register a downloaded TTF/OTF font blob (the kernel takes a private
  * copy). Returns a face id >= KFONT_WEB_BASE, or -1 on failure / full. */

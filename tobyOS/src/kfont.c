@@ -102,6 +102,8 @@ static const char *const g_face_path[KFONT_NFACES] = {
     [KFONT_ITALIC]     = "/etc/Lato-Italic.ttf",
     [KFONT_BOLDITALIC] = "/etc/Lato-BoldItalic.ttf",
 };
+/* Broad-coverage fallback (GNU Unifont, whole BMP). */
+static const char *const g_fallback_path = "/etc/fallback.otf";
 
 static struct kface {
     bool            tried, ok;
@@ -123,13 +125,18 @@ static void kface_try_load(int face) {
     struct kface *f = &g_faces[face];
     if (f->tried) return;
     f->tried = true;
+    const char *path = (face == KFONT_FALLBACK) ? g_fallback_path
+                     : (face < KFONT_NFACES)     ? g_face_path[face]
+                     : NULL;
+    if (!path) return;                 /* web faces load via kfont_register */
     void  *buf = 0; size_t sz = 0;
-    if (vfs_read_all(g_face_path[face], &buf, &sz) != 0 || !buf || sz < 12) {
+    if (vfs_read_all(path, &buf, &sz) != 0 || !buf || sz < 12) {
         if (face == KFONT_REGULAR)
-            kprintf("[kfont] no font at %s -- falling back to bitmap font\n",
-                    g_face_path[face]);
+            kprintf("[kfont] no font at %s -- falling back to bitmap font\n", path);
+        else if (face == KFONT_FALLBACK)
+            kprintf("[kfont] no fallback font at %s -- missing glyphs -> tofu\n", path);
         else
-            kprintf("[kfont] no %s -- falling back to Regular\n", g_face_path[face]);
+            kprintf("[kfont] no %s -- falling back to Regular\n", path);
         return;
     }
     f->data = (unsigned char *)buf;
@@ -140,12 +147,12 @@ static void kface_try_load(int face) {
     kfpu_end();
     if (!ok) {
         kprintf("[kfont] stbtt_InitFont failed for %s (%lu bytes)\n",
-                g_face_path[face], (unsigned long)sz);
+                path, (unsigned long)sz);
         kfree(buf); f->data = 0;
         return;
     }
     f->ok = true;
-    kprintf("[kfont] loaded %s (%lu bytes)\n", g_face_path[face], (unsigned long)sz);
+    kprintf("[kfont] loaded %s (%lu bytes)\n", path, (unsigned long)sz);
 }
 
 /* Register a downloaded TTF/OTF/WOFF2 blob as a web face (stage 13E; WOFF2
@@ -166,8 +173,8 @@ int kfont_register(const unsigned char *ttf, size_t len) {
     }
 
     int slot = -1;
-    for (int i = KFONT_WEB_BASE; i < KFONT_TOTAL; i++)
-        if (!g_faces[i].data) { slot = i; break; }
+    for (int i = KFONT_WEB_BASE; i < KFONT_WEB_BASE + KFONT_WEB_MAX; i++)
+        if (!g_faces[i].data) { slot = i; break; }   /* not the fallback slot */
     if (slot < 0) { if (decoded) kfree(decoded); return -1; }
     unsigned char *copy = (unsigned char *)kmalloc(len);
     if (!copy) { if (decoded) kfree(decoded); return -1; }
@@ -197,8 +204,14 @@ int kfont_register(const unsigned char *ttf, size_t len) {
  * when the requested weight/style isn't shipped. Returns NULL only if even
  * Regular is unavailable. */
 static stbtt_fontinfo *kface_info(int face) {
+    /* fallback face (Unifont): lazy-load; NULL if it's not present so
+     * the caller can draw a tofu box instead. */
+    if (face == KFONT_FALLBACK) {
+        kface_try_load(KFONT_FALLBACK);
+        return g_faces[KFONT_FALLBACK].ok ? &g_faces[KFONT_FALLBACK].info : NULL;
+    }
     /* web faces: use if registered, else fall back to Regular */
-    if (face >= KFONT_WEB_BASE && face < KFONT_TOTAL) {
+    if (face >= KFONT_WEB_BASE && face < KFONT_WEB_BASE + KFONT_WEB_MAX) {
         if (g_faces[face].ok) return &g_faces[face].info;
         face = KFONT_REGULAR;
     }
@@ -268,7 +281,27 @@ static struct gcache *kfont_glyph(int face, int cp, int px) {
     kfpu_begin();
     float scale = stbtt_ScaleForPixelHeight(info, (float)px);
     int gi = stbtt_FindGlyphIndex(info, cp);
-    if (gi == 0 && cp > 0x20) {                     /* missing: tofu box */
+    /* Font fallback: a codepoint the primary face lacks (CJK, symbols,
+     * ...) is drawn from the broad-coverage fallback face (Unifont)
+     * instead of a tofu box. The fallback's own metrics/scale are used
+     * so the glyph is proportioned correctly. */
+    if (gi == 0 && cp > 0x20 && face != KFONT_FALLBACK) {
+        stbtt_fontinfo *fb = kface_info(KFONT_FALLBACK);
+        if (fb) {
+            int fgi = stbtt_FindGlyphIndex(fb, cp);
+            if (fgi != 0) {
+                float fscale = stbtt_ScaleForPixelHeight(fb, (float)px);
+                int adv = 0, lsb = 0;
+                stbtt_GetGlyphHMetrics(fb, fgi, &adv, &lsb);
+                g->advance = (int)(adv * fscale + 0.5f);
+                g->bmp = stbtt_GetGlyphBitmap(fb, 0, fscale, fgi,
+                                              &g->w, &g->h, &g->xoff, &g->yoff);
+                kfpu_end();
+                return g;
+            }
+        }
+    }
+    if (gi == 0 && cp > 0x20) {                     /* still missing: tofu box */
         int bw = px * 11 / 20, bh = px * 7 / 10;
         if (bw < 4) bw = 4;
         if (bh < 5) bh = 5;
