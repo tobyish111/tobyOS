@@ -2654,6 +2654,14 @@ struct clayer {
 static struct clayer g_layer_tab[LAYER_MAX];
 static int g_nlayer;
 
+/* position: sticky (scroll-pinned). Recorded at layout; the paint loop
+ * pins each group's items to the viewport top once the page scrolls
+ * past its threshold, within its containing block. */
+struct sticky { int32_t i0, i1, top, bot, top_off, cb_bot; };
+#define STICKY_MAX 16
+static struct sticky g_sticky[STICKY_MAX];
+static int g_nsticky;
+
 /* Parse a CSS <number> or <percentage> to per-mille: "1.5" -> 1500,
  * "0.35" -> 350, "50%" -> 500. Clamps to +-32000. */
 static int css_frac_1000(const char *s, int n) {
@@ -3297,8 +3305,13 @@ static struct deco *deco_of(struct cstyle *st) {
  * into `d`. Returns 1 on success. Angles snap to the nearest axis
  * (v1: axis-aligned gradients). */
 static int parse_linear_gradient(const char *v, int n, struct deco *d) {
+    int radial = 0;
     int lg = str_contains(v, n, "linear-gradient", 15);
-    if (lg < 0) return 0;
+    if (lg < 0) {
+        lg = str_contains(v, n, "radial-gradient", 15);
+        if (lg < 0) return 0;
+        radial = 1;
+    }
     int i = lg + 15;
     while (i < n && v[i] != '(') i++;
     if (i >= n) return 0;
@@ -3306,7 +3319,7 @@ static int parse_linear_gradient(const char *v, int n, struct deco *d) {
     int e = i;
     int depth = 1;
     while (e < n && depth) { if (v[e] == '(') depth++; else if (v[e] == ')') depth--; if (depth) e++; }
-    d->grad_dir = 0;             /* default: to bottom (top->bottom) */
+    d->grad_dir = radial ? 4 : 0;   /* 4 = radial; else default to-bottom */
     d->grad_n = 0;
     /* split on top-level commas */
     int seg0 = i;
@@ -3320,6 +3333,20 @@ static int parse_linear_gradient(const char *v, int n, struct deco *d) {
             while (sl > 0 && (s[sl-1] == ' ' || s[sl-1] == '\t')) sl--;
             if (first) {
                 first = 0;
+                if (radial) {
+                    /* skip a shape/size/position prefix (circle, ellipse,
+                     * "at center", closest/farthest-corner/side) -- it's
+                     * not a color stop. */
+                    if (str_contains(s, sl, "circle", 6) >= 0 ||
+                        str_contains(s, sl, "ellipse", 7) >= 0 ||
+                        (sl >= 2 && str_ncasecmp(s, "at", 2) == 0) ||
+                        str_contains(s, sl, "closest", 7) >= 0 ||
+                        str_contains(s, sl, "farthest", 8) >= 0) {
+                        seg0 = p + 1;
+                        continue;
+                    }
+                    /* else it's the first color stop: fall through */
+                }
                 if (sl >= 2 && str_ncasecmp(s, "to", 2) == 0) {
                     if (str_contains(s, sl, "right", 5) >= 0) d->grad_dir = 1;
                     else if (str_contains(s, sl, "top", 3) >= 0) d->grad_dir = 2;
@@ -3422,7 +3449,8 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
     }
     case CP_BGCOLOR:
     case CP_BG: {
-        if (str_contains(v, n, "linear-gradient", 15) >= 0) {
+        if (str_contains(v, n, "linear-gradient", 15) >= 0 ||
+            str_contains(v, n, "radial-gradient", 15) >= 0) {
             struct deco *dc = deco_of(st);
             if (dc && parse_linear_gradient(v, n, dc)) {
                 /* fallback solid = first stop (also the color used when
@@ -4002,10 +4030,10 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         break;
     case CP_POSITION:
         if (vtok_next(v, n, &pos, &t)) {
-            if (tok_is(&t, "relative") || tok_is(&t, "sticky"))
-                st->pos = 1;                  /* sticky degrades */
+            if (tok_is(&t, "relative")) st->pos = 1;
             else if (tok_is(&t, "absolute")) st->pos = 2;
             else if (tok_is(&t, "fixed")) st->pos = 3;
+            else if (tok_is(&t, "sticky")) st->pos = 4;   /* scroll-pinned */
             else st->pos = 0;                 /* static */
         }
         break;
@@ -4615,7 +4643,8 @@ static void inl_walk(struct ictx *ic, int ni, const struct istyle *is) {
     }
     const struct cstyle *st = &nd->st;
     if (st->disp == D_NONE) return;
-    if (st->pos >= 2) {                     /* absolute/fixed leaves flow */
+    if (st->pos == 2 || st->pos == 3) {     /* absolute/fixed leaves flow
+                                               (sticky=4 stays in flow) */
         absq_add(ni, ic->x, ic->y);
         return;
     }
@@ -4924,7 +4953,8 @@ static int lay_flow(int ni, int cx, int content_w, int cy, int link,
     while (c >= 0) {
         struct dnode *cn = &E->nodes[c];
         if (cn->tag != T_TEXT && cn->st.disp != D_NONE &&
-            cn->st.pos >= 2) {               /* absolute/fixed: out of flow */
+            (cn->st.pos == 2 || cn->st.pos == 3)) {  /* abs/fixed out of flow
+                                                        (sticky stays in flow) */
             absq_add(c, cx, cy);
             c = cn->next;
             continue;
@@ -5805,6 +5835,20 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
         L->rot = st->rot; L->opa = st->opa;
     }
 
+    /* position: sticky -- record the item range + geometry; the paint
+     * loop pins it once scroll passes the threshold (no relayout on
+     * scroll). Containing block bottom is approximated by the document
+     * height (clamped at paint), which is right for page-level sticky
+     * headers/nav. */
+    if (st->pos == 4 && !g_flt_freeze && E->nitems > items0 &&
+        g_nsticky < STICKY_MAX) {
+        struct sticky *sk = &g_sticky[g_nsticky++];
+        sk->i0 = items0; sk->i1 = E->nitems;
+        sk->top = by; sk->bot = by + bbh;
+        sk->top_off = (st->po[0] != M_AUTO) ? st->po[0] : 0;
+        sk->cb_bot = 1 << 30;                /* clamped to doc height at paint */
+    }
+
     /* position: relative -- shift the whole element (its flow slot is
      * untouched: the parent keeps advancing as if unshifted). */
     if (st->pos == 1 && !g_flt_freeze) {
@@ -5931,6 +5975,7 @@ static void layout(int width) {
     E->render_len = 0;
     g_find_run = -1;
     g_nlayer = 0;                /* compositing layers rebuild per layout */
+    g_nsticky = 0;               /* sticky groups rebuild per layout */
     g_layout_w = width;
     if (E->nnodes == 0) { g_doc_h = 0; E->render[0] = 0; return; }
 
@@ -12300,6 +12345,14 @@ static uint32_t grad_color(const struct deco *dc, int lx, int ly, int w, int h) 
     case 1: t = w > 1 ? lx * 100 / (w - 1) : 0; break;             /* to right */
     case 3: t = w > 1 ? (w - 1 - lx) * 100 / (w - 1) : 0; break;   /* to left */
     case 2: t = h > 1 ? (h - 1 - ly) * 100 / (h - 1) : 0; break;   /* to top */
+    case 4: {                                            /* radial (center out) */
+        long dx = 2L * lx - w, dy = 2L * ly - h;         /* 2*(offset from center) */
+        long d2 = dx * dx + dy * dy;                     /* (2*dist)^2 */
+        long r2 = (long)w * w + (long)h * h;             /* (2*corner_dist)^2 */
+        t = r2 ? isqrt32((uint32_t)(d2 * 10000 / r2)) : 0;  /* sqrt(d2/r2)*100 */
+        if (t > 100) t = 100;
+        break;
+    }
     default: t = h > 1 ? ly * 100 / (h - 1) : 0; break;           /* to bottom */
     }
     if (t < 0) t = 0; if (t > 100) t = 100;
@@ -12437,6 +12490,124 @@ static int tab_cell_w(void) {
 }
 static int tab_x(int i) { return i * tab_cell_w(); }
 
+/* Paint one content display item at scroll offset, with an optional
+ * sticky pin shift (sksh, doc-space). Factored out so sticky groups can
+ * be repainted on top in a final pass (correct z-order). */
+static void paint_content_item(int ri, int sksh, int vtop, int vbot,
+                               int vy0, int vy1, uint32_t page_bg) {
+    int fd = 0;
+    static char tb[512];
+    struct ditem *r = &g_items[ri];
+    int sy;
+    if (r->fl & IF_FIXED) {             /* viewport coords, no scroll */
+        if (r->y + r->h <= 0 || r->y >= g_content_h) return;
+        sy = CONTENT_TOP + r->y;
+    } else {
+        int ry = r->y + sksh;
+        if (ry + r->h <= vtop || ry >= vbot) return;
+        sy = CONTENT_TOP + (ry - vtop);
+    }
+    int cx0 = 0, cx1 = g_win_w, cyy0 = vy0, cyy1 = vy1;
+    if (r->clip) {
+        struct cliprect *cl = &g_clips[r->clip];
+        int csy = (r->fl & IF_FIXED) ? (CONTENT_TOP + cl->y)
+                                     : (CONTENT_TOP + cl->y - vtop);
+        if (cl->x > cx0) cx0 = cl->x;
+        if (cl->x + cl->w < cx1) cx1 = cl->x + cl->w;
+        if (csy > cyy0) cyy0 = csy;
+        if (csy + cl->h < cyy1) cyy1 = csy + cl->h;
+    }
+    if (r->x >= cx1 || r->x + r->w <= cx0 || sy >= cyy1 || sy + r->h <= cyy0)
+        return;
+
+    if (r->kind == DI_SHADOW) {
+        paint_deco_shadow(r->x, sy, r->w, r->h, r->radius, r->deco,
+                          cx0, cx1, cyy0, cyy1);
+        return;
+    }
+    if (r->kind == DI_RECT) {
+        if (r->radius > 0 || r->deco >= 0) {
+            paint_deco_rect(r->x, sy, r->w, r->h, r->radius, r->deco,
+                            r->fg, cx0, cx1, cyy0, cyy1);
+            return;
+        }
+        int x0 = r->x, w = r->w, y0 = sy, h = r->h;
+        if (x0 < cx0) { w -= cx0 - x0; x0 = cx0; }
+        if (x0 + w > cx1) w = cx1 - x0;
+        if (y0 < cyy0) { h -= cyy0 - y0; y0 = cyy0; }
+        if (y0 + h > cyy1) h = cyy1 - y0;
+        if (h > 0 && w > 0)
+            sys_gui_fill(fd, x0, y0, w, h, r->fg & 0xFFFFFF);
+        return;
+    }
+    if (r->kind == DI_BULLET) {
+        sys_gui_fill(fd, r->x, sy, r->w, r->h, r->fg & 0xFFFFFF);
+        return;
+    }
+    if (r->kind == DI_IMG) { paint_image(r, sy); return; }
+    if (r->kind == DI_FIELD) {
+        struct field *ff = &g_fields[r->field];
+        if (r->fl & IF_INPUT) {
+            uint32_t bd = (r->field == g_focus_field) ? 0x001A73E8u : 0x009AA0A6u;
+            sys_gui_fill(fd, r->x, sy, r->w, FIELD_H, 0x00FFFFFFu);
+            sys_gui_fill(fd, r->x, sy, r->w, 1, bd);
+            sys_gui_fill(fd, r->x, sy + FIELD_H - 1, r->w, 1, bd);
+            sys_gui_fill(fd, r->x, sy, 1, FIELD_H, bd);
+            sys_gui_fill(fd, r->x + r->w - 1, sy, 1, FIELD_H, bd);
+            const char *v = ff->value;
+            int vl = (int)str_len(v);
+            int avail = r->w - 14;
+            while (vl > 0) { if (text_px_w(v, vl, PX_BODY, 0, 0) <= avail) break; v++; vl--; }
+            if (vl > 0)
+                tk_draw_text(&win, r->x + 6, sy + 5, v, 0x00202124u, PX_BODY, 0);
+            if (r->field == g_focus_field) {
+                int cx = r->x + 6 + text_px_w(v, vl, PX_BODY, 0, 0);
+                if (cx > r->x + r->w - 4) cx = r->x + r->w - 4;
+                sys_gui_fill(fd, cx, sy + 3, 2, FIELD_H - 6, 0x001A73E8u);
+            }
+        } else {
+            sys_gui_fill(fd, r->x, sy, r->w, FIELD_H, 0x00F1F3F4u);
+            sys_gui_fill(fd, r->x, sy, r->w, 1, 0x00DADCE0u);
+            sys_gui_fill(fd, r->x, sy + FIELD_H - 1, r->w, 1, 0x00DADCE0u);
+            sys_gui_fill(fd, r->x, sy, 1, FIELD_H, 0x00DADCE0u);
+            sys_gui_fill(fd, r->x + r->w - 1, sy, 1, FIELD_H, 0x00DADCE0u);
+            tk_draw_text(&win, r->x + 14, sy + 5, ff->value, 0x00202124u, PX_BODY, 0);
+        }
+        return;
+    }
+    /* DI_TEXT */
+    if (r->len <= 0) return;
+    int n = r->len < (int)sizeof(tb) - 1 ? r->len : (int)sizeof(tb) - 1;
+    {
+        int mono_run = (r->fl & IF_MONO) != 0;
+        for (int k = 0; k < n; k++) {
+            unsigned char ch = (unsigned char)g_render[r->off + k];
+            tb[k] = (ch < 0x20) ? ' ' : (mono_run && ch > 0x7E) ? '?' : (char)ch;
+        }
+    }
+    tb[n] = '\0';
+    if (ri == g_find_run)
+        sys_gui_fill(fd, r->x - 2, sy, r->w + 4, r->h, 0x00FFE49Cu);
+    uint32_t fg = r->fg & 0xFFFFFF;
+    if (r->fl & IF_MONO) {
+        uint32_t mbg = (r->bg >> 24) ? (r->bg & 0xFFFFFF) : page_bg;
+        int ty = sy + (r->h - MONO_H) / 2;
+        if ((r->bg >> 24) && ri != g_find_run)
+            sys_gui_fill(fd, r->x - 2, sy, r->w + 4, r->h, mbg);
+        sys_gui_text(fd, r->x, ty < sy ? sy : ty, tb, fg,
+                     (ri == g_find_run) ? 0x00FFE49Cu : mbg);
+        return;
+    }
+    if ((r->bg >> 24) && ri != g_find_run)
+        sys_gui_fill(fd, r->x - 1, sy, r->w + 2, r->h, r->bg & 0xFFFFFF);
+    int nat = r->px + r->px / 3;
+    int ty = sy + (r->h - nat) / 2;
+    if (ty < sy) ty = sy;
+    sys_text_ttf(win.fd, r->x, ty, tb, fg & 0xFFFFFF, r->px, r->face);
+    if (r->fl & IF_UNDER)
+        sys_gui_fill(fd, r->x, ty + r->px + 2, r->w, 1, fg);
+}
+
 static void redraw(int fd) { (void)fd; tk_redraw(&win); }
 static void paint_all(void) {
     int fd = 0; (void)fd;
@@ -12544,6 +12715,21 @@ static void paint_all(void) {
         int vbot = g_scroll_y + g_content_h;
         int vy0 = CONTENT_TOP, vy1 = CONTENT_TOP + g_content_h;
 
+        /* position: sticky -- per-group downward pin shift for this
+         * scroll offset. shift > 0 once the page scrolls past the
+         * threshold, clamped so the element stays inside its container. */
+        int sk_shift[STICKY_MAX];
+        for (int k = 0; k < g_nsticky; k++) {
+            struct sticky *sk = &g_sticky[k];
+            int cb_bot = sk->cb_bot < g_doc_h ? sk->cb_bot : g_doc_h;
+            int shift = g_scroll_y + sk->top_off - sk->top;
+            if (shift < 0) shift = 0;
+            int maxs = cb_bot - sk->bot;         /* don't leave the container */
+            if (maxs < 0) maxs = 0;
+            if (shift > maxs) shift = maxs;
+            sk_shift[k] = shift;
+        }
+
         for (int ri = 0; ri < g_nitems; ri++) {
             /* compositing layer starting here? (outermost = widest range
              * wins; nested transforms flatten into it, v1) */
@@ -12558,137 +12744,19 @@ static void paint_all(void) {
                     continue;
                 }
             }
-            struct ditem *r = &g_items[ri];
-            int sy;
-            if (r->fl & IF_FIXED) {         /* viewport coords, no scroll */
-                if (r->y + r->h <= 0 || r->y >= g_content_h) continue;
-                sy = CONTENT_TOP + r->y;
-            } else {
-                if (r->y + r->h <= vtop || r->y >= vbot) continue;
-                sy = CONTENT_TOP + (r->y - vtop);
-            }
-
-            /* effective clip = viewport intersected with any overflow
-             * clip ancestor (stage 13D), translated to screen coords. */
-            int cx0 = 0, cx1 = g_win_w, cyy0 = vy0, cyy1 = vy1;
-            if (r->clip) {
-                struct cliprect *cl = &g_clips[r->clip];
-                int csy = (r->fl & IF_FIXED) ? (CONTENT_TOP + cl->y)
-                                             : (CONTENT_TOP + cl->y - vtop);
-                if (cl->x > cx0) cx0 = cl->x;
-                if (cl->x + cl->w < cx1) cx1 = cl->x + cl->w;
-                if (csy > cyy0) cyy0 = csy;
-                if (csy + cl->h < cyy1) cyy1 = csy + cl->h;
-            }
-            /* cull anything fully outside the effective clip */
-            if (r->x >= cx1 || r->x + r->w <= cx0 ||
-                sy >= cyy1 || sy + r->h <= cyy0) continue;
-
-            if (r->kind == DI_SHADOW) {
-                paint_deco_shadow(r->x, sy, r->w, r->h, r->radius, r->deco,
-                                  cx0, cx1, cyy0, cyy1);
-                continue;
-            }
-            if (r->kind == DI_RECT) {
-                if (r->radius > 0 || r->deco >= 0) {   /* rounded / gradient */
-                    paint_deco_rect(r->x, sy, r->w, r->h, r->radius, r->deco,
-                                    r->fg, cx0, cx1, cyy0, cyy1);
-                    continue;
-                }
-                int x0 = r->x, w = r->w, y0 = sy, h = r->h;
-                if (x0 < cx0) { w -= cx0 - x0; x0 = cx0; }
-                if (x0 + w > cx1) w = cx1 - x0;
-                if (y0 < cyy0) { h -= cyy0 - y0; y0 = cyy0; }
-                if (y0 + h > cyy1) h = cyy1 - y0;
-                if (h > 0 && w > 0)
-                    sys_gui_fill(fd, x0, y0, w, h, r->fg & 0xFFFFFF);
-                continue;
-            }
-            if (r->kind == DI_BULLET) {
-                sys_gui_fill(fd, r->x, sy, r->w, r->h, r->fg & 0xFFFFFF);
-                continue;
-            }
-            if (r->kind == DI_IMG) {
-                paint_image(r, sy);
-                continue;
-            }
-            if (r->kind == DI_FIELD) {
-                struct field *ff = &g_fields[r->field];
-                if (r->fl & IF_INPUT) {
-                    uint32_t bd = (r->field == g_focus_field)
-                                      ? 0x001A73E8u : 0x009AA0A6u;
-                    sys_gui_fill(fd, r->x, sy, r->w, FIELD_H, 0x00FFFFFFu);
-                    sys_gui_fill(fd, r->x, sy, r->w, 1, bd);
-                    sys_gui_fill(fd, r->x, sy + FIELD_H - 1, r->w, 1, bd);
-                    sys_gui_fill(fd, r->x, sy, 1, FIELD_H, bd);
-                    sys_gui_fill(fd, r->x + r->w - 1, sy, 1, FIELD_H, bd);
-                    /* show the tail of the value if it overflows */
-                    const char *v = ff->value;
-                    int vl = (int)str_len(v);
-                    int avail = r->w - 14;
-                    while (vl > 0) {
-                        if (text_px_w(v, vl, PX_BODY, 0, 0) <= avail) break;
-                        v++; vl--;
-                    }
-                    if (vl > 0)
-                        tk_draw_text(&win, r->x + 6, sy + 5, v, 0x00202124u,
-                                     PX_BODY, 0);
-                    if (r->field == g_focus_field) {
-                        int cx = r->x + 6 + text_px_w(v, vl, PX_BODY, 0, 0);
-                        if (cx > r->x + r->w - 4) cx = r->x + r->w - 4;
-                        sys_gui_fill(fd, cx, sy + 3, 2, FIELD_H - 6, 0x001A73E8u);
-                    }
-                } else {
-                    /* submit button */
-                    sys_gui_fill(fd, r->x, sy, r->w, FIELD_H, 0x00F1F3F4u);
-                    sys_gui_fill(fd, r->x, sy, r->w, 1, 0x00DADCE0u);
-                    sys_gui_fill(fd, r->x, sy + FIELD_H - 1, r->w, 1, 0x00DADCE0u);
-                    sys_gui_fill(fd, r->x, sy, 1, FIELD_H, 0x00DADCE0u);
-                    sys_gui_fill(fd, r->x + r->w - 1, sy, 1, FIELD_H, 0x00DADCE0u);
-                    tk_draw_text(&win, r->x + 14, sy + 5, ff->value,
-                                 0x00202124u, PX_BODY, 0);
-                }
-                continue;
-            }
-            /* DI_TEXT */
-            if (r->len <= 0) continue;
-
-            int n = r->len < (int)sizeof(tb) - 1 ? r->len : (int)sizeof(tb) - 1;
-            {   /* UTF-8 passes through to the kernel TTF path; the 8x8
-                 * mono face is ASCII-only so mono runs show '?'. */
-                int mono_run = (r->fl & IF_MONO) != 0;
-                for (int k = 0; k < n; k++) {
-                    unsigned char ch = (unsigned char)g_render[r->off + k];
-                    tb[k] = (ch < 0x20) ? ' '
-                          : (mono_run && ch > 0x7E) ? '?' : (char)ch;
-                }
-            }
-            tb[n] = '\0';
-
-            if (ri == g_find_run)
-                sys_gui_fill(fd, r->x - 2, sy, r->w + 4, r->h, 0x00FFE49Cu);
-
-            uint32_t fg = r->fg & 0xFFFFFF;
-            if (r->fl & IF_MONO) {
-                uint32_t mbg = (r->bg >> 24) ? (r->bg & 0xFFFFFF) : page_bg;
-                int ty = sy + (r->h - MONO_H) / 2;
-                if ((r->bg >> 24) && ri != g_find_run)
-                    sys_gui_fill(fd, r->x - 2, sy, r->w + 4, r->h, mbg);
-                sys_gui_text(fd, r->x, ty < sy ? sy : ty, tb, fg,
-                             (ri == g_find_run) ? 0x00FFE49Cu : mbg);
-                continue;
-            }
-            if ((r->bg >> 24) && ri != g_find_run)
-                sys_gui_fill(fd, r->x - 1, sy, r->w + 2, r->h, r->bg & 0xFFFFFF);
-            int nat = r->px + r->px / 3;
-            int ty = sy + (r->h - nat) / 2;
-            if (ty < sy) ty = sy;
-            /* draw with the run's resolved face (web font or bold);
-             * win.fd, not the paint fd (0) the *_fill stubs ignore */
-            sys_text_ttf(win.fd, r->x, ty, tb, fg & 0xFFFFFF, r->px, r->face);
-            if (r->fl & IF_UNDER)
-                sys_gui_fill(fd, r->x, ty + r->px + 2, r->w, 1, fg);
+            /* sticky items are deferred to a final on-top pass (correct
+             * z-order: they overlap content that scrolls under them). */
+            int is_sticky = 0;
+            for (int k = 0; k < g_nsticky; k++)
+                if (ri >= g_sticky[k].i0 && ri < g_sticky[k].i1) { is_sticky = 1; break; }
+            if (is_sticky) continue;
+            paint_content_item(ri, 0, vtop, vbot, vy0, vy1, page_bg);
         }
+        /* final pass: sticky groups pinned, painted on top. */
+        for (int k = 0; k < g_nsticky; k++)
+            for (int ri = g_sticky[k].i0; ri < g_sticky[k].i1 && ri < g_nitems; ri++)
+                paint_content_item(ri, sk_shift[k], vtop, vbot, vy0, vy1, page_bg);
+
     }
 
     /* Scrollbar (pixel-proportional) */
