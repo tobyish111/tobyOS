@@ -781,6 +781,34 @@ int http_get_follow(char cur_url[512], size_t max_body, unsigned flags,
     return HTTP_ERR_PROTOCOL;                /* redirect loop */
 }
 
+/* Like http_get_follow but with fetch()/XHR request parameters. Only
+ * GET/HEAD follow redirects transparently (safe, idempotent); other
+ * methods return the 3xx so the caller (fetch) can decide. */
+int http_request_follow(char cur_url[512], size_t max_body, unsigned flags,
+                        uint32_t timeout_ms,
+                        const struct http_request_ext *ext,
+                        struct http_response *resp) {
+    int is_get = !ext || !ext->method || !ext->method[0] ||
+                 strcmp(ext->method, "GET") == 0 ||
+                 strcmp(ext->method, "HEAD") == 0;
+    for (int redir = 0; redir <= HTTP_MAX_REDIRECTS; redir++) {
+        int rc = http_get_ext(cur_url, max_body, timeout_ms, flags, ext, resp);
+        if (rc < 0) return rc;
+        if (is_get && http_is_redirect(resp->status) && resp->location[0]) {
+            char next[512];
+            if (http_resolve_location(cur_url, resp->location,
+                                      next, sizeof(next)) == 0) {
+                kprintf("[http] %d redirect -> %s\n", resp->status, next);
+                memcpy(cur_url, next, strlen(next) + 1);
+                http_free(resp);
+                continue;
+            }
+        }
+        return 0;
+    }
+    return HTTP_ERR_PROTOCOL;
+}
+
 static long sys_http_get(const char *url, void *buf, uint32_t buf_sz) {
     if (!cap_check(current_proc(), CAP_NET, "sys_http_get")) return -ABI_EPERM;
     if (!url || !buf || buf_sz == 0) return -ABI_EINVAL;
@@ -878,6 +906,57 @@ static long sys_http_start(struct abi_http_start *ureq) {
         return -ABI_EFAULT;
     int h = httpa_start(kurl, req.max_body, current_proc()->pid);
     return h >= 0 ? (long)h : -ABI_EAGAIN;
+}
+
+static long sys_http_start2(struct abi_http_start2 *ureq) {
+    if (!cap_check(current_proc(), CAP_NET, "sys_http_start2")) return -ABI_EPERM;
+    if (!ureq) return -ABI_EINVAL;
+    struct abi_http_start2 req;
+    if (copy_from_user(&req, ureq, sizeof(req)) != 0) return -ABI_EFAULT;
+    if (!req.url) return -ABI_EINVAL;
+    char kurl[512], kmethod[32], khdrs[1024];
+    kmethod[0] = 0; khdrs[0] = 0;
+    if (strncpy_from_user(kurl, (const char *)(uintptr_t)req.url,
+                          sizeof(kurl)) < 0)
+        return -ABI_EFAULT;
+    if (req.method && strncpy_from_user(kmethod, (const char *)(uintptr_t)req.method,
+                                        sizeof(kmethod)) < 0)
+        return -ABI_EFAULT;
+    if (req.headers && strncpy_from_user(khdrs, (const char *)(uintptr_t)req.headers,
+                                         sizeof(khdrs)) < 0)
+        return -ABI_EFAULT;
+    uint8_t *kbody = NULL;
+    uint32_t blen = req.body_len;
+    if (req.body && blen) {
+        if (blen > (256u * 1024)) return -ABI_EINVAL;
+        if (!user_buf_ok(req.body, blen)) return -ABI_EFAULT;
+        kbody = kmalloc(blen);
+        if (!kbody) return -ABI_ENOMEM;
+        if (copy_from_user(kbody, (const void *)(uintptr_t)req.body, blen) != 0) {
+            kfree(kbody);
+            return -ABI_EFAULT;
+        }
+    }
+    /* only HTTP_F_NO_COOKIES honored from userland; other flags kernel-set */
+    unsigned f = (req.flags & ABI_HTTP_F_NO_COOKIES) ? HTTP_F_NO_COOKIES : 0;
+    int h = httpa_start2(kurl, kmethod, khdrs, kbody, blen,
+                         req.max_body, f, current_proc()->pid);
+    if (kbody) kfree(kbody);
+    return h >= 0 ? (long)h : -ABI_EAGAIN;
+}
+
+static long sys_http_hdrs(long h, void *ubuf, uint64_t off_len) {
+    uint32_t off = (uint32_t)(off_len >> 32);
+    uint32_t len = (uint32_t)off_len;
+    if (!ubuf || len == 0) return -ABI_EINVAL;
+    if (len > 4096) len = 4096;
+    if (!user_buf_ok((uint64_t)(uintptr_t)ubuf, len)) return -ABI_EFAULT;
+    void *kb = kmalloc(len);
+    if (!kb) return -ABI_ENOMEM;
+    long n = httpa_hdrs((int)h, current_proc()->pid, kb, off, len);
+    if (n > 0 && copy_to_user(ubuf, kb, (size_t)n) != 0) { kfree(kb); return -ABI_EFAULT; }
+    kfree(kb);
+    return n < 0 ? -ABI_EINVAL : n;
 }
 
 static long sys_http_poll(long h, struct abi_http_poll *uout) {
@@ -3420,6 +3499,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_http_read((long)a1, (void *)a2, (uint64_t)a3);
     case ABI_SYS_HTTP_FINISH:
         return sys_http_finish((long)a1);
+    case ABI_SYS_HTTP_START2:
+        return sys_http_start2((struct abi_http_start2 *)a1);
+    case ABI_SYS_HTTP_HDRS:
+        return sys_http_hdrs((long)a1, (void *)a2, (uint64_t)a3);
 
     /* ---- WebSocket client (stage 13) -------------------------------- */
     case ABI_SYS_WS_OPEN:

@@ -189,6 +189,32 @@ static inline long sys_http_finish(long h) {
     return r;
 }
 
+/* fetch()/XHR: async request with method/headers/body (ABI 183/184). */
+#define SYS_HTTP_START2 183
+#define SYS_HTTP_HDRS   184
+#define HTTP_F_NO_COOKIES 0x10u
+struct http_start2 {
+    unsigned long url, method, headers, body;
+    uint32_t body_len, max_body, flags, reserved;
+};
+static inline long sys_http_start2(struct http_start2 *rq) {
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_HTTP_START2), "D"(rq)
+        : "rcx", "r11", "memory");
+    return r;
+}
+static inline long sys_http_hdrs(long h, void *buf, uint32_t off, uint32_t len) {
+    unsigned long off_len = ((unsigned long)off << 32) | (unsigned long)len;
+    long r;
+    __asm__ volatile ("syscall"
+        : "=a"(r)
+        : "0"((long)SYS_HTTP_HDRS), "D"(h), "S"(buf), "d"(off_len)
+        : "rcx", "r11", "memory");
+    return r;
+}
+
 /* ---- TTF -> coverage raster (css-anim slice 3 compositing) -------- *
  * The kernel rasterizes a text run as 0..255 coverage bytes into a
  * user buffer (same glyph cache as on-window TTF text, so layer text
@@ -6873,6 +6899,60 @@ static JSValue js_dom_fetchstart(JSContext *cx, JSValueConst t, int argc, JSValu
     return JS_UNDEFINED;
 }
 
+/* fetchStart2(url, cb, method, headers, body, noCookies): the extended
+ * fetch primitive (method/headers/body + credentials-less cross-origin
+ * mode). Same async cb({status,url,body,headers}) contract; cb(null)
+ * on failure. The prelude fetch() wrapper computes CORS + credentials
+ * and calls this. */
+static JSValue js_dom_fetchstart2(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2 || !JS_IsFunction(cx, argv[1])) return JS_UNDEFINED;
+    char url[URL_MAX + 1];
+    url[0] = 0;
+    const char *u = JS_ToCString(cx, argv[0]);
+    if (u) { resolve_relative_url(g_url, u, url, URL_MAX); JS_FreeCString(cx, u); }
+
+    const char *method = (argc > 2 && JS_IsString(argv[2])) ? JS_ToCString(cx, argv[2]) : NULL;
+    const char *headers = (argc > 3 && JS_IsString(argv[3])) ? JS_ToCString(cx, argv[3]) : NULL;
+    size_t blen = 0;
+    const char *body = (argc > 4 && JS_IsString(argv[4])) ? JS_ToCStringLen(cx, &blen, argv[4]) : NULL;
+    int no_cookies = (argc > 5) && JS_ToBool(cx, argv[5]);
+
+    long h = -1;
+    if (url[0] && has_scheme(url)) {
+        struct http_start2 rq;
+        mem_zero(&rq, sizeof(rq));
+        rq.url = (unsigned long)url;
+        rq.method = (unsigned long)method;
+        rq.headers = (unsigned long)headers;
+        rq.body = (unsigned long)body;
+        rq.body_len = (uint32_t)blen;
+        rq.max_body = JS_FETCH_CAP;
+        rq.flags = no_cookies ? HTTP_F_NO_COOKIES : 0;
+        h = sys_http_start2(&rq);
+    }
+    if (method) JS_FreeCString(cx, method);
+    if (headers) JS_FreeCString(cx, headers);
+    if (body) JS_FreeCString(cx, body);
+
+    int slot = -1;
+    if (h >= 0)
+        for (int k = 0; k < JS_FETCH_MAX; k++)
+            if (!cur->js_fetches[k].used) { slot = k; break; }
+    if (h < 0 || slot < 0) {
+        if (h >= 0) sys_http_finish(h);
+        JSValue nul = JS_NULL;
+        JSValue r = JS_Call(cx, argv[1], JS_UNDEFINED, 1, &nul);
+        if (JS_IsException(r)) js_dump_error(cx);
+        JS_FreeValue(cx, r);
+        return JS_UNDEFINED;
+    }
+    cur->js_fetches[slot].used = 1;
+    cur->js_fetches[slot].handle = (int)h;
+    cur->js_fetches[slot].cb = JS_DupValue(cx, argv[1]);
+    return JS_UNDEFINED;
+}
+
 /* ---- WebSocket bindings (stage 13) ----------------------------------- *
  * wsOpen(url, obj) starts a kernel-side RFC 6455 connection and pins
  * the JS WebSocket object; the pump polls the handle and calls the
@@ -7885,35 +7965,135 @@ static const char JS_PRELUDE[] =
 "  g.requestAnimationFrame = function(f){\n"
 "    return g.setTimeout(function(){ f(0); }, 16);\n"
 "  };\n"
-"  g.fetch = function(u){\n"
+"  /* ---- fetch()/XHR: real methods+headers+body + CORS (parity) ---- */\n"
+"  function __origin(u){\n"                /* scheme://host[:port] of a URL */
+"    var m = /^([a-z]+:\\/\\/[^\\/?#]*)/i.exec(String(u));\n"
+"    return m ? m[1].toLowerCase() : '';\n"
+"  }\n"
+"  function __pageOrigin(){ return __origin(g.location ? g.location.href : ''); }\n"
+"  function __parseHeaders(raw){\n"        /* raw block -> lowercased map */
+"    var h = {};\n"
+"    if (!raw) return h;\n"
+"    var lines = String(raw).split(/\\r?\\n/);\n"
+"    for (var i = 1; i < lines.length; i++){\n"  /* skip status line */
+"      var c = lines[i].indexOf(':');\n"
+"      if (c < 0) continue;\n"
+"      var k = lines[i].slice(0, c).trim().toLowerCase();\n"
+"      var v = lines[i].slice(c + 1).trim();\n"
+"      if (k) h[k] = h[k] ? (h[k] + ', ' + v) : v;\n"
+"    }\n"
+"    return h;\n"
+"  }\n"
+"  function Headers(map){ this.__m = map || {}; }\n"
+"  Headers.prototype.get = function(k){\n"
+"    var v = this.__m[String(k).toLowerCase()];\n"
+"    return (v === undefined) ? null : v;\n"
+"  };\n"
+"  Headers.prototype.has = function(k){ return this.__m[String(k).toLowerCase()] !== undefined; };\n"
+"  Headers.prototype.forEach = function(cb){\n"
+"    for (var k in this.__m) cb(this.__m[k], k, this);\n"
+"  };\n"
+"  var __simpleReqH = {'accept':1,'accept-language':1,'content-language':1,'content-type':1};\n"
+"  function __corsAllows(reqOrigin, respMap, method, reqHeaderNames){\n"
+"    var ao = respMap['access-control-allow-origin'];\n"
+"    if (ao !== '*' && ao !== reqOrigin) return false;\n"
+"    return true;\n"           /* v1: origin check (preflight is separate) */
+"  }\n"
+"  g.Headers = Headers;\n"
+"  g.fetch = function(u, opt){\n"
+"    opt = opt || {};\n"
+"    var url = String(u);\n"
+"    var abs = /^[a-z]+:\\/\\//i.test(url) ? url\n"
+"            : (/^\\//.test(url) ? __pageOrigin() + url : url);\n"
+"    var target = __origin(abs);\n"
+"    var pageO = __pageOrigin();\n"
+"    var cross = target && pageO && target !== pageO;\n"
+"    var method = (opt.method ? String(opt.method) : 'GET').toUpperCase();\n"
+"    var hdrArr = [], hdrNames = [];\n"
+"    if (opt.headers){\n"
+"      var hh = opt.headers;\n"
+"      if (hh instanceof Headers) hh = hh.__m;\n"
+"      for (var k in hh){ hdrArr.push(k + ': ' + hh[k]); hdrNames.push(String(k).toLowerCase()); }\n"
+"    }\n"
+"    var body = (opt.body !== undefined && opt.body !== null) ? String(opt.body) : null;\n"
+"    if (body && hdrNames.indexOf('content-type') < 0){\n"
+"      hdrArr.push('Content-Type: text/plain;charset=UTF-8');\n"
+"    }\n"
+"    /* credentials: same-origin default -> cookies only same-origin. */\n"
+"    var creds = opt.credentials || 'same-origin';\n"
+"    var noCookies = cross ? (creds !== 'include') : (creds === 'omit');\n"
 "    return new Promise(function(res, rej){\n"
-"      D.fetchStart(String(u), function(r){\n"
+"      D.fetchStart2(abs, function(r){\n"
 "        if (!r || r.status <= 0){ rej(new Error('fetch failed')); return; }\n"
+"        var map = __parseHeaders(r.headers);\n"
+"        if (cross && !__corsAllows(pageO, map, method, hdrNames)){\n"
+"          rej(new TypeError('Failed to fetch: CORS blocked (' + target + ')'));\n"
+"          return;\n"
+"        }\n"
+"        var used = false;\n"
+"        function once(){ if (used) throw new TypeError('body used'); used = true; }\n"
 "        res({\n"
 "          ok: r.status >= 200 && r.status < 300,\n"
-"          status: r.status,\n"
-"          url: r.url,\n"
-"          text: function(){ return Promise.resolve(r.body); },\n"
-"          json: function(){ return Promise.resolve(JSON.parse(r.body)); }\n"
+"          status: r.status, statusText: '', redirected: r.url !== abs,\n"
+"          url: r.url, type: cross ? 'cors' : 'basic',\n"
+"          headers: new Headers(map),\n"
+"          text: function(){ once(); return Promise.resolve(r.body); },\n"
+"          json: function(){ once(); return Promise.resolve(JSON.parse(r.body)); },\n"
+"          clone: function(){ return this; }\n"
 "        });\n"
-"      });\n"
+"      }, method, hdrArr.join('\\r\\n'), body, noCookies);\n"
 "    });\n"
 "  };\n"
 "  g.XMLHttpRequest = function(){\n"
-"    this.readyState = 0; this.status = 0; this.responseText = '';\n"
+"    this.readyState = 0; this.status = 0; this.statusText = '';\n"
+"    this.responseText = ''; this.response = ''; this.responseType = '';\n"
+"    this.__hdr = []; this.__hn = []; this.__rh = {};\n"
+"    this.onreadystatechange = null; this.onload = null; this.onerror = null;\n"
 "  };\n"
-"  g.XMLHttpRequest.prototype.open = function(m, u){ this.__u = u; this.readyState = 1; };\n"
-"  g.XMLHttpRequest.prototype.setRequestHeader = function(){};\n"
-"  g.XMLHttpRequest.prototype.send = function(){\n"
-"    var r = D.fetchSync(String(this.__u));\n"
-"    this.status = r ? r.status : 0;\n"
-"    this.responseText = r ? r.body : '';\n"
-"    this.readyState = 4;\n"
-"    var sf = this;\n"
-"    g.setTimeout(function(){\n"
-"      if (sf.onreadystatechange) sf.onreadystatechange();\n"
-"      if (sf.onload) sf.onload();\n"
-"    }, 0);\n"
+"  g.XMLHttpRequest.prototype.open = function(m, u){\n"
+"    this.__m = String(m || 'GET').toUpperCase(); this.__u = String(u);\n"
+"    this.readyState = 1;\n"
+"    if (this.onreadystatechange) this.onreadystatechange();\n"
+"  };\n"
+"  g.XMLHttpRequest.prototype.setRequestHeader = function(n, v){\n"
+"    this.__hdr.push(n + ': ' + v); this.__hn.push(String(n).toLowerCase());\n"
+"  };\n"
+"  g.XMLHttpRequest.prototype.getResponseHeader = function(n){\n"
+"    var v = this.__rh[String(n).toLowerCase()]; return v === undefined ? null : v;\n"
+"  };\n"
+"  g.XMLHttpRequest.prototype.getAllResponseHeaders = function(){\n"
+"    var s = ''; for (var k in this.__rh) s += k + ': ' + this.__rh[k] + '\\r\\n'; return s;\n"
+"  };\n"
+"  g.XMLHttpRequest.prototype.send = function(bodyArg){\n"
+"    var self = this;\n"
+"    var abs = /^[a-z]+:\\/\\//i.test(this.__u) ? this.__u\n"
+"            : (/^\\//.test(this.__u) ? __pageOrigin() + this.__u : this.__u);\n"
+"    var cross = __origin(abs) && __pageOrigin() && __origin(abs) !== __pageOrigin();\n"
+"    var body = (bodyArg !== undefined && bodyArg !== null) ? String(bodyArg) : null;\n"
+"    D.fetchStart2(abs, function(r){\n"
+"      if (!r || r.status <= 0){\n"
+"        self.status = 0; self.readyState = 4;\n"
+"        if (self.onerror) self.onerror();\n"
+"        if (self.onreadystatechange) self.onreadystatechange();\n"
+"        return;\n"
+"      }\n"
+"      self.__rh = __parseHeaders(r.headers);\n"
+"      if (cross){\n"
+"        var ao = self.__rh['access-control-allow-origin'];\n"
+"        if (ao !== '*' && ao !== __pageOrigin()){\n"
+"          self.status = 0; self.readyState = 4;\n"
+"          if (self.onerror) self.onerror();\n"
+"          if (self.onreadystatechange) self.onreadystatechange();\n"
+"          return;\n"
+"        }\n"
+"      }\n"
+"      self.status = r.status; self.statusText = '';\n"
+"      self.responseText = r.body; self.response = r.body;\n"
+"      self.readyState = 4;\n"
+"      if (self.onreadystatechange) self.onreadystatechange();\n"
+"      if (self.onload) self.onload();\n"
+"    }, this.__m, this.__hdr.join('\\r\\n'), body,\n"
+"       cross ? !this.withCredentials : false);\n"
 "  };\n"
 /* ---- stage 13: WebSocket (RFC 6455) ------------------------------- */
 "  function WebSocket(url){\n"
@@ -8578,6 +8758,7 @@ static int js_ensure(void) {
             {"timer", js_dom_timer, 3},   {"untimer", js_dom_untimer, 1},
             {"fetchSync", js_dom_fetchsync, 1},
             {"fetchStart", js_dom_fetchstart, 2},
+            {"fetchStart2", js_dom_fetchstart2, 6},
             {"wsOpen", js_ws_openprim, 2},
             {"wsSend", js_ws_sendprim, 2},
             {"wsClose", js_ws_closeprim, 2},
@@ -9054,6 +9235,13 @@ static int js_pump_all(void) {
                     JS_SetPropertyStr(t->js_cx, obj, "body",
                         JS_NewStringLen(t->js_cx, buf ? buf : "",
                                         (size_t)n2));
+                    /* raw response headers (fetch()/XHR read them; the
+                     * prelude parses them + enforces CORS). Empty on the
+                     * plain-GET path (no capture). */
+                    char hb[4096];
+                    long hn = sys_http_hdrs(jf->handle, hb, 0, sizeof(hb) - 1);
+                    JS_SetPropertyStr(t->js_cx, obj, "headers",
+                        JS_NewStringLen(t->js_cx, hb, hn > 0 ? (size_t)hn : 0));
                     arg = obj;
                 }
                 if (buf) free(buf);

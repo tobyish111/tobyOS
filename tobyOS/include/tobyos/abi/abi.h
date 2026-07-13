@@ -900,6 +900,31 @@ struct abi_ws_poll {
  * pointer. Returns advance width in px, or -E. */
 #define ABI_SYS_GUI_TEXT_TTF_RASTER  182
 
+/* fetch()/XHR: start an async HTTP request with a method, extra request
+ * headers, and an optional request body (the plain HTTP_START is
+ * GET-only). a1 = struct abi_http_start2 *. Returns a handle usable
+ * with the existing HTTP_POLL/READ/FINISH, or -E. The response header
+ * block is retrievable via HTTP_HDRS once the transfer is DONE. */
+#define ABI_SYS_HTTP_START2    183
+/* Copy the raw response header block (status line .. blank line) of a
+ * DONE handle into a user buffer. a1 = handle, a2 = buf, a3 =
+ * (off<<32)|len. Returns bytes copied, or -E. */
+#define ABI_SYS_HTTP_HDRS      184
+
+struct abi_http_start2 {
+    uint64_t url;          /* in: const char * user VA, NUL-terminated */
+    uint64_t method;       /* in: const char * (e.g. "POST") or 0 = GET */
+    uint64_t headers;      /* in: const char * CRLF-joined lines, or 0  */
+    uint64_t body;         /* in: const uint8_t * request body, or 0    */
+    uint32_t body_len;
+    uint32_t max_body;     /* response body cap                          */
+    uint32_t flags;        /* HTTP_F_NO_COOKIES etc. (ABI mirror below)  */
+    uint32_t reserved;
+};
+
+/* ABI mirror of HTTP_F_NO_COOKIES (kernel tobyos/http.h). */
+#define ABI_HTTP_F_NO_COOKIES  0x10u
+
 struct abi_ttf_raster {
     uint64_t cov;          /* in: uint8_t * user VA, w*h bytes (out) */
     int32_t  w, h;         /* buffer dimensions (also row stride = w) */
@@ -913,7 +938,7 @@ struct abi_ttf_raster {
 };
 
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          183
+#define ABI_SYS_NR_MAX          185
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

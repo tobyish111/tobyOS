@@ -24,6 +24,17 @@
  * reaping slots owned by exited procs). Spawns the worker lazily. */
 int  httpa_start(const char *url, uint32_t max_body, int owner_pid);
 
+/* Extended queue for fetch()/XHR: method / extra headers / body / flags
+ * (all kernel copies; method<32B, headers<1KB, body<256KB). Same handle
+ * semantics as httpa_start. NULL method == GET. */
+int  httpa_start2(const char *url, const char *method, const char *headers,
+                  const uint8_t *body, uint32_t body_len,
+                  uint32_t max_body, unsigned flags, int owner_pid);
+
+/* Copy the raw response header block of a DONE handle into `dst`.
+ * Returns bytes copied (0 at/after end), or -1 on bad/foreign/undone. */
+long httpa_hdrs(int h, int owner_pid, void *dst, uint32_t off, uint32_t len);
+
 /* Fill *out with the handle's state. Returns 0, or -1 on a bad/foreign
  * handle. */
 int  httpa_poll(int h, int owner_pid, struct abi_http_poll *out);

@@ -305,7 +305,8 @@ static size_t cookie_header(const char *host, char *out, size_t cap) {
 /* Construct the request into `buf`. Returns the number of bytes
  * written (excluding NUL), or -1 if it didn't fit. */
 static long build_request(const struct http_url *u, char *buf, size_t cap,
-                          unsigned flags, const char *cookie_hdr) {
+                          unsigned flags, const char *cookie_hdr,
+                          const struct http_request_ext *ext) {
     /* "GET <path> HTTP/1.0\r\nHost: <host>:<port>\r\n..." */
     static const char ua[] =
         "Mozilla/5.0 (compatible; tobyOS 1.0; x86_64) tobyOS-Browser/3.0";
@@ -315,7 +316,9 @@ static long build_request(const struct http_url *u, char *buf, size_t cap,
      * http_parse_url(); add fixed overhead. */
     size_t hostlen = strlen(u->host);
     size_t pathlen = strlen(u->path);
-    need = pathlen + hostlen + sizeof(ua) + 96;
+    need = pathlen + hostlen + sizeof(ua) + 128;
+    if (ext && ext->headers) need += strlen(ext->headers) + 4;
+    if (ext && ext->method)  need += strlen(ext->method);
     if (need > cap) return -1;
 
     size_t pos = 0;
@@ -330,7 +333,9 @@ static long build_request(const struct http_url *u, char *buf, size_t cap,
         memcpy(buf + pos, (s), l); pos += l;                    \
     } while (0)
 
-    APPEND_LIT("GET ");
+    if (ext && ext->method && ext->method[0]) APPEND_STR(ext->method);
+    else                                      APPEND_LIT("GET");
+    APPEND_LIT(" ");
     APPEND_STR(u->path);
     if (flags & HTTP_F_KEEPALIVE) APPEND_LIT(" HTTP/1.1\r\nHost: ");
     else                          APPEND_LIT(" HTTP/1.0\r\nHost: ");
@@ -359,9 +364,24 @@ static long build_request(const struct http_url *u, char *buf, size_t cap,
     APPEND_LIT("\r\nAccept: */*");
     if (flags & HTTP_F_GZIP)
         APPEND_LIT("\r\nAccept-Encoding: gzip, br");
-    if (cookie_hdr && cookie_hdr[0]) {
+    if (cookie_hdr && cookie_hdr[0] && !(flags & HTTP_F_NO_COOKIES)) {
         APPEND_LIT("\r\nCookie: ");
         APPEND_STR(cookie_hdr);
+    }
+    if (ext && ext->headers && ext->headers[0]) {   /* fetch()/XHR extras */
+        APPEND_LIT("\r\n");
+        APPEND_STR(ext->headers);
+    }
+    if (ext && ext->body && ext->body_len) {        /* "Content-Length: N" */
+        APPEND_LIT("\r\nContent-Length: ");
+        char tmp[12]; int ti = 0;
+        uint32_t v = ext->body_len;
+        char rev[12]; int ri = 0;
+        if (v == 0) rev[ri++] = '0';
+        while (v > 0) { rev[ri++] = (char)('0' + (v % 10)); v /= 10; }
+        while (ri > 0) tmp[ti++] = rev[--ri];
+        if (pos + (size_t)ti > cap) return -1;
+        memcpy(buf + pos, tmp, (size_t)ti); pos += (size_t)ti;
     }
     if (flags & HTTP_F_KEEPALIVE) APPEND_LIT("\r\nConnection: keep-alive\r\n\r\n");
     else                          APPEND_LIT("\r\nConnection: close\r\n\r\n");
@@ -958,6 +978,8 @@ const char *http_strerror(int err) {
 void http_free(struct http_response *r) {
     if (!r) return;
     if (r->body) { kfree(r->body); r->body = NULL; }
+    if (r->raw_hdrs) { kfree(r->raw_hdrs); r->raw_hdrs = NULL; }
+    r->raw_hdrs_len = 0;
     r->body_len = 0;
     r->status = 0;
     r->reason[0] = 0;
@@ -979,9 +1001,28 @@ int http_get_opt(const char *url,
                  unsigned    flags,
                  struct http_response *out)
 {
+    return http_get_ext(url, max_body_bytes, timeout_ms, flags, NULL, out);
+}
+
+int http_get_ext(const char *url,
+                 size_t      max_body_bytes,
+                 uint32_t    timeout_ms,
+                 unsigned    flags,
+                 const struct http_request_ext *ext,
+                 struct http_response *out)
+{
     if (!url || !out) return HTTP_ERR_URL;
     memset(out, 0, sizeof(*out));
     out->content_len = -1;
+
+    /* fetch()/XHR extended requests always ride the proven HTTP/1.x
+     * path (h3/h2 are GET-only v1); a request with a body never reuses
+     * a parked connection (no unsafe replays). */
+    int ext_active = ext && ((ext->method && ext->method[0] &&
+                              strcmp(ext->method, "GET") != 0) ||
+                             (ext->headers && ext->headers[0]) ||
+                             (ext->body && ext->body_len));
+    int has_body = ext && ext->body && ext->body_len;
 
     if (timeout_ms == 0)    timeout_ms = HTTP_DEFAULT_TIMEOUT_MS;
     if (max_body_bytes == 0) max_body_bytes = 1u << 20; /* 1 MiB default */
@@ -1013,7 +1054,8 @@ int http_get_opt(const char *url,
      * advertised port; otherwise it stays the URL's port. */
     uint16_t h3_port = u.port;
     bool altsvc_h3 = u.tls && altsvc_lookup(u.host, &h3_port);
-    bool try_h3 = u.tls && ((flags & HTTP_F_TRY_H3) || altsvc_h3);
+    bool try_h3 = u.tls && !ext_active &&
+                  ((flags & HTTP_F_TRY_H3) || altsvc_h3);
 
     /* 2. Resolve lazily: a keep-alive hit skips DNS entirely. */
     uint32_t ip_be = 0;
@@ -1042,8 +1084,8 @@ int http_get_opt(const char *url,
         /* Don't reuse a parked TCP connection on the attempt where we
          * still intend to probe h3 -- try QUIC first, TCP is the
          * fallback. */
-        bool reused = want_ka && attempt == 0 && !(try_h3 && !tried_h3) &&
-                      keep_take(&u, &tr);
+        bool reused = want_ka && !has_body && attempt == 0 &&
+                      !(try_h3 && !tried_h3) && keep_take(&u, &tr);
 
         if (reused) {
             g_ka_reused++;
@@ -1090,7 +1132,7 @@ int http_get_opt(const char *url,
             }
             if (u.tls) {
                 int tls_err;
-                int want_h2 = !force_h1;
+                int want_h2 = !force_h1 && !ext_active;
                 tr.tls = tls_connect(ip_be, htons(u.port), u.host,
                                      timeout_ms, want_h2, &tls_err);
                 if (!tr.tls) {
@@ -1129,7 +1171,8 @@ int http_get_opt(const char *url,
         }
 
         char reqbuf[2048];
-        long reqlen = build_request(&u, reqbuf, sizeof(reqbuf), flags, cookiebuf);
+        long reqlen = build_request(&u, reqbuf, sizeof(reqbuf), flags,
+                                    cookiebuf, ext);
         if (reqlen <= 0) {
             transport_close(&tr);
             kfree(buf);
@@ -1145,6 +1188,18 @@ int http_get_opt(const char *url,
             kprintf("[http] send returned %ld (wanted %ld)\n", sent, reqlen);
             kfree(buf);
             return HTTP_ERR_RESET;
+        }
+        if (has_body) {                     /* fetch()/XHR request body */
+            long bs = transport_send(&tr, (const char *)ext->body,
+                                     ext->body_len);
+            if (bs != (long)ext->body_len) {
+                transport_close(&tr);
+                if (reused) continue;       /* stale keep-alive: reconnect */
+                kprintf("[http] body send returned %ld (wanted %u)\n",
+                        bs, ext->body_len);
+                kfree(buf);
+                return HTTP_ERR_RESET;
+            }
         }
 
         int hrc = recv_header_block(&tr, &buf, &hdr_cap, &buf_used,
@@ -1374,6 +1429,15 @@ int http_get_opt(const char *url,
         (tr.tcp || tr.tls)) {
         kprintf("[http] keep-alive: parked %s:%u\n", u.host, u.port);
         keep_park(&u, &tr);            /* moves the conn; clears tr */
+    }
+    if (ext && header_end > 0) {       /* raw response headers (CORS reads) */
+        size_t cl2 = header_end > 2048 ? 2048 : header_end;
+        out->raw_hdrs = (char *)kmalloc(cl2 + 1);
+        if (out->raw_hdrs) {
+            memcpy(out->raw_hdrs, buf, cl2);
+            out->raw_hdrs[cl2] = 0;
+            out->raw_hdrs_len = (uint32_t)cl2;
+        }
     }
     kfree(buf);
     transport_close(&tr);              /* no-op when parked */

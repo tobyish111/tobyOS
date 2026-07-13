@@ -82,6 +82,24 @@ struct http_response {
     uint8_t   *body;                    /* kmalloc'd; may be NULL on err */
     long       content_len;             /* Content-Length header, -1 if absent */
     uint8_t    encoding;                /* HTTP_ENC_* Content-Encoding    */
+    /* Raw response header block (status line through the blank line),
+     * kmalloc'd + NUL-terminated, capped at 2 KiB. NULL on the h2/h3
+     * paths (v1). Lets fetch()/XHR expose response headers (CORS). */
+    char      *raw_hdrs;
+    uint32_t   raw_hdrs_len;
+};
+
+/* Extended request parameters for http_get_ext (fetch()/XHR): a method
+ * other than GET, extra CRLF-joined header lines (no trailing CRLF),
+ * and an optional request body (Content-Length added automatically).
+ * Any field may be NULL/0. Extended requests always use HTTP/1.x (the
+ * h3/h2 fast paths are GET-only v1) and never reuse parked
+ * connections when a body is present (no unsafe replays). */
+struct http_request_ext {
+    const char    *method;              /* "POST", "PUT", ... NULL = GET */
+    const char    *headers;             /* "A: b\r\nC: d" or NULL        */
+    const uint8_t *body;                /* request body or NULL          */
+    uint32_t       body_len;
 };
 
 /* Content-Encoding of the body (the client is responsible for inflating
@@ -108,6 +126,9 @@ struct http_response {
                                 * the response framing allows it. Off =>
                                 * HTTP/1.0 + Connection: close (the exact
                                 * wget/pkg download contract). */
+#define HTTP_F_NO_COOKIES 0x10u /* don't attach the cookie jar (CORS:
+                                   cross-origin fetch defaults to
+                                   credentials-less requests) */
 #define HTTP_F_TRY_H3    0x8u  /* for https, probe HTTP/3 (QUIC) first;
                                 * on any h3 failure fall back to the
                                 * h2/h1.1 ladder (GET is idempotent). Off
@@ -154,6 +175,23 @@ int http_get_opt(const char *url,
                  uint32_t    timeout_ms,
                  unsigned    flags,
                  struct http_response *out);
+
+/* http_get_opt + extended request parameters (method/headers/body).
+ * ext == NULL behaves exactly like http_get_opt. */
+int http_get_ext(const char *url,
+                 size_t      max_body_bytes,
+                 uint32_t    timeout_ms,
+                 unsigned    flags,
+                 const struct http_request_ext *ext,
+                 struct http_response *out);
+
+/* http_get_ext + redirect following for GET/HEAD (non-GET methods
+ * return the 3xx to the caller -- fetch handles it). Lives in
+ * syscall.c next to http_get_follow. */
+int http_request_follow(char cur_url[512], size_t max_body, unsigned flags,
+                        uint32_t timeout_ms,
+                        const struct http_request_ext *ext,
+                        struct http_response *resp);
 
 /* http_get_opt + redirect following (up to 5, relative Locations
  * resolved). cur_url is rewritten in place to the URL that produced

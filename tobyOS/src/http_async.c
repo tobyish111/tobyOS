@@ -36,6 +36,14 @@ struct ha_slot {
     int      err;               /* HTTP_ERR_* when state == ERROR */
     uint32_t max_body;
     char     url[512];          /* rewritten to the final URL when DONE */
+    /* fetch()/XHR extended request (all NUL-terminated kernel copies;
+     * ext_active gates whether they're passed to http_request_follow). */
+    bool     ext_active;
+    unsigned flags;
+    char     method[32];
+    char     headers[1024];
+    uint8_t *body;              /* kmalloc'd request body, or NULL */
+    uint32_t body_len;
     struct http_response resp;  /* body kmalloc'd; freed on finish */
 };
 
@@ -80,12 +88,26 @@ static void httpa_worker(void) {
          * can always FINISH-cancel). The sync 5 s default is for
          * blocking callers that freeze their caller. */
         struct http_response resp;
-        int rc = http_get_follow(s->url, kmax,
+        int rc;
+        if (s->ext_active) {
+            struct http_request_ext ext = {
+                .method   = s->method[0] ? s->method : NULL,
+                .headers  = s->headers[0] ? s->headers : NULL,
+                .body     = s->body,
+                .body_len = s->body_len,
+            };
+            unsigned f = HTTP_F_TRUNCATE | HTTP_F_GZIP |
+                         HTTP_F_KEEPALIVE | s->flags;
+            rc = http_request_follow(s->url, kmax, f, 30000, &ext, &resp);
+        } else {
+            rc = http_get_follow(s->url, kmax,
                                  HTTP_F_TRUNCATE | HTTP_F_GZIP |
                                  HTTP_F_KEEPALIVE, 30000, &resp);
+        }
 
         if (s->cancel) {
             if (rc >= 0) http_free(&resp);
+            if (s->body) { kfree(s->body); s->body = NULL; }
             s->used = false;
             s->cancel = false;
             continue;
@@ -110,6 +132,7 @@ static void slot_release(struct ha_slot *s) {
         return;
     }
     if (s->state == ABI_HTTPA_DONE) http_free(&s->resp);
+    if (s->body) { kfree(s->body); s->body = NULL; }
     s->used = false;
     s->cancel = false;
 }
@@ -159,6 +182,43 @@ int httpa_start(const char *url, uint32_t max_body, int owner_pid) {
     s->url[l] = 0;
     s->state = ABI_HTTPA_QUEUED;
     return (int)(s - g_ha);
+}
+
+int httpa_start2(const char *url, const char *method, const char *headers,
+                 const uint8_t *body, uint32_t body_len,
+                 uint32_t max_body, unsigned flags, int owner_pid) {
+    int h = httpa_start(url, max_body, owner_pid);
+    if (h < 0) return h;
+    struct ha_slot *s = &g_ha[h];
+    s->ext_active = true;
+    s->flags = flags;
+    if (method && method[0]) {
+        size_t l = strlen(method);
+        if (l >= sizeof(s->method)) l = sizeof(s->method) - 1;
+        memcpy(s->method, method, l); s->method[l] = 0;
+    }
+    if (headers && headers[0]) {
+        size_t l = strlen(headers);
+        if (l >= sizeof(s->headers)) l = sizeof(s->headers) - 1;
+        memcpy(s->headers, headers, l); s->headers[l] = 0;
+    }
+    if (body && body_len) {
+        s->body = (uint8_t *)kmalloc(body_len);
+        if (!s->body) { slot_release(s); return -1; }
+        memcpy(s->body, body, body_len);
+        s->body_len = body_len;
+    }
+    return h;
+}
+
+long httpa_hdrs(int h, int owner_pid, void *dst, uint32_t off, uint32_t len) {
+    struct ha_slot *s = slot_of(h, owner_pid);
+    if (!s || s->state != ABI_HTTPA_DONE || !dst) return -1;
+    if (!s->resp.raw_hdrs || off >= s->resp.raw_hdrs_len) return 0;
+    size_t avail = s->resp.raw_hdrs_len - off;
+    if (len < avail) avail = len;
+    memcpy(dst, s->resp.raw_hdrs + off, avail);
+    return (long)avail;
 }
 
 int httpa_poll(int h, int owner_pid, struct abi_http_poll *out) {
