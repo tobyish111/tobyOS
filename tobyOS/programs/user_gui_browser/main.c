@@ -645,6 +645,7 @@ enum {
     T_FIGURE, T_FIGCAPTION, T_ADDRESS, T_DETAILS, T_SUMMARY,
     T_IFRAME, T_OBJECT, T_EMBED, T_VIDEO, T_AUDIO, T_CANVAS, T_SVG,
     T_AREA, T_BASE, T_SOURCE, T_TRACK, T_WBR, T_PARAM, T_MAPE, T_PICTURE,
+    T_SLOT,
     T_NTAGS
 };
 
@@ -740,6 +741,7 @@ struct cstyle {
 
 struct dnode {
     int32_t parent, first, last, next;   /* tree links (node idx, -1) */
+    int32_t shadow;              /* shadow root child idx, -1 (slice 2) */
     int32_t toff, tlen;          /* T_TEXT: tpool slice (decoded) */
     int32_t attr0;               /* first attr in attr pool */
     int16_t nattr;
@@ -795,9 +797,18 @@ struct crule {
     int32_t decl0; int16_t ndecl;
     uint16_t spec;               /* specificity: 100*id + 10*(cls/attr) + type */
     int32_t order;               /* source order for cascade ties */
+    int32_t scope;               /* shadow root node the sheet lives in,
+                                    -1 = document (shadow-dom arc) */
 };
 #define RULE_MAX    8192
 #define CSSPOOL_CAP (320 * 1024)
+
+/* Shadow-DOM style scoping: the shadow-root node whose subtree we are
+ * currently collecting (sheet parse) / styling (rule match); -1 =
+ * document scope. Maintained as a stack via save/restore around the
+ * tree recursions. */
+static int g_css_scope = -1;      /* collect-time: stamps crule.scope */
+static int g_style_scope = -1;    /* style-time: gates rule matching  */
 
 /* property ids */
 enum {
@@ -1330,6 +1341,7 @@ static const char * const g_tag_names[T_NTAGS] = {
     "figure","figcaption","address","details","summary",
     "iframe","object","embed","video","audio","canvas","svg",
     "area","base","source","track","wbr","param","map","picture",
+    "slot",
 };
 
 static int tag_lookup(const char *s, int len) {
@@ -1383,6 +1395,7 @@ static int dom_new(int tag, int parent) {
     mem_zero(n, sizeof(*n));
     n->parent = parent;
     n->first = n->last = n->next = -1;
+    n->shadow = -1;
     n->tag = (int16_t)tag;
     n->link = n->field = n->img = -1;
     if (parent >= 0) {
@@ -1468,6 +1481,25 @@ static long parse_attrs(const char *s, long i, long n,
 
 /* Parse HTML [s, s+n) appending under `root` (the tree-constructor
  * core; also reused for JS innerHTML fragments). */
+static void dom_set_attr(int ni, const char *name, const char *val);
+
+/* Custom elements (shadow-dom arc): dnode tags are a fixed enum, so a
+ * source tag like <x-counter> maps to T_UNK and its NAME would be lost.
+ * Stash the lowercased name as a synthetic "__tag" attribute when it
+ * looks like a custom element (contains '-'); D.tag()/customElements
+ * read it back. */
+static void dom_stash_custom_tag(int ni, const char *s, long len) {
+    if (ni < 0 || len <= 0 || len > 48) return;
+    char nm[49];
+    int dash = 0;
+    for (long q = 0; q < len; q++) {
+        nm[q] = (char)lc(s[q]);
+        if (nm[q] == '-') dash = 1;
+    }
+    nm[len] = 0;
+    if (dash) dom_set_attr(ni, "__tag", nm);
+}
+
 static void dom_parse(const char *s, long n, int root) {
     int stack[DOM_STACK_MAX];
     int sp = 0;
@@ -1517,6 +1549,7 @@ static void dom_parse(const char *s, long n, int root) {
             if (ni < 0) break;
             E->nodes[ni].attr0 = attr0;
             E->nodes[ni].nattr = (int16_t)nattr;
+            if (t == T_UNK) dom_stash_custom_tag(ni, s + k0, k - k0);
             if (t == T_BODY && E->body < 0) E->body = ni;
             if (t == T_SCRIPT || t == T_STYLE || t == T_TITLE || t == T_TEXTAREA) {
                 /* raw-text element: capture verbatim to the end tag */
@@ -2336,6 +2369,7 @@ static void css_parse_ruleset(struct ccur *c, int origin) {
         r->spec = sel_spec[k];
         r->origin = (int16_t)origin;
         r->order = E->css_order++;
+        r->scope = g_css_scope;      /* -1 unless inside a shadow tree */
     }
 }
 
@@ -3748,8 +3782,15 @@ static void style_node(int ni, const struct cstyle *pst) {
     struct dnode *nd = &E->nodes[ni];
     if (nd->tag == T_TEXT) {
         nd->st = *pst;                    /* text renders in parent style */
+        /* light-DOM text of a shadow host is not in the composed tree */
+        if (nd->parent >= 0 && E->nodes[nd->parent].shadow >= 0)
+            nd->st.disp = D_NONE;
         return;
     }
+    /* entering a shadow root: its subtree styles in its own scope */
+    int save_scope = g_style_scope;
+    if (nd->parent >= 0 && E->nodes[nd->parent].shadow == ni)
+        g_style_scope = ni;
     struct cstyle st;
     st_init(&st, pst);
     /* Tables reset inherited text-align: <center> (and align=center
@@ -3757,6 +3798,17 @@ static void style_node(int ni, const struct cstyle *pst) {
      * inside its cells (HN's whole page sits in <center>). Explicit
      * CSS/attrs on the table or its cells still apply below. */
     if (nd->tag == T_TABLE) st.talign = 0;
+    /* Custom elements (T_UNK with a stashed name) default to
+     * display:block. Spec says inline, but this engine has no
+     * block-in-inline splitting and virtually every real component's
+     * first style line is :host{display:block} anyway. Pre-cascade:
+     * author CSS still overrides. */
+    if (nd->tag == T_UNK) {
+        char cet[49];
+        if (node_attr_str(nd, "__tag", cet, sizeof(cet))) st.disp = D_BLOCK;
+    }
+    /* <slot> hosts projected block content; same deviation. */
+    if (nd->tag == T_SLOT) st.disp = D_BLOCK;
     /* presentational hint: legacy align= on images/tables floats them
      * (lowest priority; any CSS float overrides) */
     if (nd->tag == T_IMG || nd->tag == T_TABLE) {
@@ -3818,6 +3870,10 @@ static void style_node(int ni, const struct cstyle *pst) {
     int nm = 0;
     for (int r = 0; r < E->nrules; r++) {
         struct crule *ru = &E->rules[r];
+        /* shadow scoping: author rules only match inside the tree that
+         * declared them (document rules stop at shadow boundaries, a
+         * shadow tree's rules stay inside it). UA rules apply anywhere. */
+        if (ru->origin && ru->scope != g_style_scope) continue;
         if (!sel_match_rule(ru, ni)) continue;
         if (nm >= MATCH_MAX) break;
         uint32_t key = ((uint32_t)ru->origin << 16) | ru->spec;
@@ -3907,12 +3963,28 @@ static void style_node(int ni, const struct cstyle *pst) {
                 for (int s2 = 0; s2 < 4; s2++) st.p[s2] = (int16_t)v;
         }
     }
+    /* Web components (shadow-dom arc): <template> content is inert --
+     * never rendered until cloned out. display:none makes layout skip
+     * the whole subtree. */
+    if (nd->tag == T_TEMPLATE) st.disp = D_NONE;
+    /* Shadow host's light children are not in the composed tree: only
+     * the shadow root renders (slots project them back in slice 3). */
+    if (nd->parent >= 0 && E->nodes[nd->parent].shadow >= 0 &&
+        E->nodes[nd->parent].shadow != ni)
+        st.disp = D_NONE;
     nd->st = st;
+    if (nd->tag == T_TEMPLATE) {          /* inert: children keep no style */
+        g_nvarscope = var_mark;
+        g_varpool_len = varpool_mark;
+        g_style_scope = save_scope;
+        return;
+    }
     for (int c = nd->first; c >= 0; c = E->nodes[c].next)
         style_node(c, &nd->st);
     /* pop this node's custom properties as we leave its subtree */
     g_nvarscope = var_mark;
     g_varpool_len = varpool_mark;
+    g_style_scope = save_scope;
 }
 
 /* ---- The user-agent stylesheet ------------------------------------- */
@@ -5731,7 +5803,9 @@ static int g_js_in_load;         /* inside render_html: defer rerender */
 static int g_collect_light;      /* collect pass: skip styles/forms,
                                     register only unregistered nodes */
 
-static void collect_node(int ni) {
+static void collect_node(int ni);
+
+static void collect_node_inner(int ni) {
     struct dnode *nd = &E->nodes[ni];
     int save_form = g_form_open;
     switch (nd->tag) {
@@ -5948,12 +6022,29 @@ static void collect_node(int ni) {
     case T_SCRIPT:
         g_form_open = save_form;
         return;
+    case T_TEMPLATE:
+        /* Web components: template content is inert -- no link/media/
+         * canvas/style collection until it is cloned into the live tree. */
+        g_form_open = save_form;
+        return;
     default:
         break;
     }
     for (int c = nd->first; c >= 0; c = E->nodes[c].next)
         collect_node(c);
     g_form_open = save_form;
+}
+
+/* Scope-tracking wrapper: entering a shadow root switches the CSS
+ * collect scope so a shadow tree's <style> rules stamp crule.scope =
+ * that root (shadow-dom arc). */
+static void collect_node(int ni) {
+    struct dnode *nd = &E->nodes[ni];
+    int save_scope = g_css_scope;
+    if (nd->parent >= 0 && E->nodes[nd->parent].shadow == ni)
+        g_css_scope = ni;
+    collect_node_inner(ni);
+    g_css_scope = save_scope;
 }
 
 /* =================== JavaScript: QuickJS + DOM bindings ===============
@@ -6003,6 +6094,60 @@ static void dom_attach(int parent, int child) {
     if (p->last >= 0) E->nodes[p->last].next = child;
     else p->first = child;
     p->last = child;
+}
+
+/* ---- <slot> distribution (shadow-dom arc, slice 3) ------------------ *
+ * Physical projection: each shadow host's light children move under the
+ * matching <slot> in its shadow tree (name attr vs slot attr; unnamed
+ * slot takes unslotted children). Runs before every style pass and is
+ * idempotent (moved children are no longer light children). Unassigned
+ * light DOM stays hidden; a slot with no assignment keeps its fallback
+ * children. v1 deviations (documented): distributed nodes' parentNode
+ * becomes the slot, they style in the shadow scope, and there is no
+ * un-distribution when slots change. */
+static int slot_find_rec(int ni, const char *name) {
+    struct dnode *nd = &E->nodes[ni];
+    if (nd->tag == T_SLOT) {
+        char sn[49];
+        int has = node_attr_str(nd, "name", sn, sizeof(sn));
+        if ((!has && !name[0]) || (has && str_ncasecmp(sn, name, 49) == 0))
+            return ni;
+    }
+    for (int c = nd->first; c >= 0; c = E->nodes[c].next) {
+        int r = slot_find_rec(c, name);
+        if (r >= 0) return r;
+    }
+    return -1;
+}
+
+static void distribute_slots(void) {
+    for (int host = 1; host < E->nnodes; host++) {
+        int sr = E->nodes[host].shadow;
+        if (sr < 0) continue;
+        int kids[32], nkids = 0;
+        for (int c = E->nodes[host].first; c >= 0 && nkids < 32;
+             c = E->nodes[c].next)
+            if (c != sr) kids[nkids++] = c;
+        for (int k = 0; k < nkids; k++) {
+            struct dnode *cn = &E->nodes[kids[k]];
+            char sl[49];
+            sl[0] = 0;
+            if (cn->tag != T_TEXT)
+                node_attr_str(cn, "slot", sl, sizeof(sl));
+            int slot = slot_find_rec(sr, sl);
+            if (slot >= 0) {
+                /* first assignment ever: drop the slot's fallback
+                 * children (v1 has no un-distribution anyway) */
+                char f[4];
+                if (!node_attr_str(&E->nodes[slot], "__filled", f, sizeof(f))) {
+                    while (E->nodes[slot].first >= 0)
+                        dom_unlink(E->nodes[slot].first);
+                    dom_set_attr(slot, "__filled", "1");
+                }
+                dom_attach(slot, kids[k]);
+            }
+        }
+    }
 }
 
 static int dom_find_by_id(const char *id) {
@@ -6175,6 +6320,7 @@ static JSValue js_dom_create(JSContext *cx, JSValueConst t, int argc, JSValueCon
     if (s) {
         int tag = tag_lookup(s, (int)str_len(s));
         r = dom_new(tag, -1);
+        if (tag == T_UNK) dom_stash_custom_tag(r, s, (long)str_len(s));
         JS_FreeCString(cx, s);
     }
     return JS_NewInt32(cx, r);
@@ -6426,7 +6572,81 @@ static JSValue js_dom_setattr(JSContext *cx, JSValueConst t, int argc, JSValueCo
 static JSValue js_dom_tag(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t;
     int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    if (ni >= 0 && E->nodes[ni].tag == T_UNK) {
+        /* custom element: report the stashed source name */
+        char nm[49];
+        if (node_attr_str(&E->nodes[ni], "__tag", nm, sizeof(nm)) && nm[0])
+            return JS_NewString(cx, nm);
+    }
     return JS_NewString(cx, ni >= 0 ? g_tag_names[E->nodes[ni].tag] : "");
+}
+
+/* Deep-clone a subtree (template stamping). Text/attr slices point into
+ * the immutable tpool, so clones share them; a later dom_set_attr on the
+ * clone rewrites its own attr block (copy-on-write). Returns the new
+ * root (parent -1). */
+static int dom_clone_rec(int src, int parent) {
+    struct dnode *sn = &E->nodes[src];
+    int ni = dom_new(sn->tag, parent);
+    if (ni < 0) return -1;
+    struct dnode *dn = &E->nodes[ni];
+    dn->toff = sn->toff; dn->tlen = sn->tlen;
+    dn->attr0 = sn->attr0; dn->nattr = sn->nattr;
+    for (int c = E->nodes[src].first; c >= 0; c = E->nodes[c].next)
+        if (dom_clone_rec(c, ni) < 0) break;
+    return ni;
+}
+
+static JSValue js_dom_clone(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    if (ni < 0) return JS_NewInt32(cx, -1);
+    return JS_NewInt32(cx, dom_clone_rec(ni, -1));
+}
+
+/* Attach (or return the existing) shadow root of a node: a fresh block
+ * container child recorded in dnode.shadow. The style pass renders it
+ * INSTEAD of the host's light children (composed tree); its <style>
+ * rules scope to the shadow tree. */
+static JSValue js_dom_attachshadow(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int ni = (argc >= 1) ? jsi(cx, argv[0]) : -1;
+    if (ni < 0) return JS_NewInt32(cx, -1);
+    if (E->nodes[ni].shadow >= 0)
+        return JS_NewInt32(cx, E->nodes[ni].shadow);
+    int sr = dom_new(T_DIV, ni);
+    if (sr < 0) return JS_NewInt32(cx, -1);
+    E->nodes[ni].shadow = sr;
+    mut_note(ni, 0);
+    g_js_dirty = 1;
+    return JS_NewInt32(cx, sr);
+}
+
+/* Next node index >= from whose tag name equals `name` (custom "__tag"
+ * names included); -1 when exhausted. Drives customElements upgrades. */
+static JSValue js_dom_bytagfrom(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_NewInt32(cx, -1);
+    const char *s = JS_ToCString(cx, argv[0]);
+    int32_t from = 0;
+    JS_ToInt32(cx, &from, argv[1]);
+    if (!s) return JS_NewInt32(cx, -1);
+    int want = tag_lookup(s, (int)str_len(s));
+    int found = -1;
+    for (int ni = from < 1 ? 1 : from; ni < E->nnodes; ni++) {
+        struct dnode *nd = &E->nodes[ni];
+        if (nd->tag != want) continue;
+        if (want == T_UNK) {
+            char nm[49];
+            if (!node_attr_str(nd, "__tag", nm, sizeof(nm)) ||
+                str_ncasecmp(nm, s, (int)str_len(s) + 1) != 0)
+                continue;
+        }
+        found = ni;
+        break;
+    }
+    JS_FreeCString(cx, s);
+    return JS_NewInt32(cx, found);
 }
 
 static JSValue js_dom_parent(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
@@ -7286,7 +7506,9 @@ static const char JS_PRELUDE[] =
 "(function(g){\n"
 "  var D = g.__dom;\n"
 "  var wrap = new Map();\n"
+"  var __upg = [];\n"          /* custom-element upgrade stack */
 "  function Element(i){\n"
+"    if (i === undefined && __upg.length) i = __upg.pop();\n"
 "    this.__i = i;\n"
 "    var self = this;\n"
 "    this.style = new Proxy({}, {\n"
@@ -7335,7 +7557,7 @@ static const char JS_PRELUDE[] =
 "    },\n"
 "    innerHTML: {\n"
 "      get: function(){ return ''; },\n"
-"      set: function(v){ D.setHTML(this.__i, String(v)); }\n"
+"      set: function(v){ D.setHTML(this.__i, String(v)); __upgradeUnder(this.__i); }\n"
 "    },\n"
 "    id: {\n"
 "      get: function(){ return D.getAttr(this.__i, 'id') || ''; },\n"
@@ -7381,16 +7603,115 @@ static const char JS_PRELUDE[] =
 "        contains: function(c){ return toks().indexOf(c) >= 0; }\n"
 "      };\n"
 "    } },\n"
-"    ownerDocument: { get: function(){ return g.document; } }\n"
+"    ownerDocument: { get: function(){ return g.document; } },\n"
+"    content: { get: function(){\n"          /* <template>.content */
+"      if (D.tag(this.__i) !== 'template') return null;\n"
+"      var ti = this.__i;\n"
+"      return { __tplFrag: ti,\n"
+"               cloneNode: function(){ return { __tplFrag: ti }; } };\n"
+"    } }\n"
 "  });\n"
-"  Element.prototype.appendChild = function(c){ D.append(this.__i, c.__i); return c; };\n"
-"  Element.prototype.removeChild = function(c){ D.remove(c.__i); return c; };\n"
+"  Element.prototype.cloneNode = function(deep){ return el(D.clone(this.__i)); };\n"
+"  Element.prototype.attachShadow = function(o){\n"
+"    var sr = el(D.attachShadow(this.__i));\n"
+"    if (sr){\n"
+"      var self = this;\n"
+"      try { Object.defineProperty(sr, 'host', { get: function(){ return self; } }); } catch(e){}\n"
+"    }\n"
+"    this.__sr = sr;\n"
+"    return sr;\n"
+"  };\n"
+"  Object.defineProperty(Element.prototype, 'shadowRoot', {\n"
+"    get: function(){ return this.__sr || null; }\n"
+"  });\n"
+"  /* ---- Web components: custom elements registry + upgrades ---- */\n"
+"  g.HTMLElement = Element;\n"
+"  var __ce = {};\n"
+"  function __isConn(i){\n"
+"    var b = D.body();\n"
+"    for (var n2 = i; n2 >= 0; n2 = D.parent(n2)) if (n2 === b) return true;\n"
+"    return false;\n"
+"  }\n"
+"  function __mkCustom(name, i){\n"
+"    var C = __ce[name];\n"
+"    __upg.push(i);\n"
+"    var inst;\n"
+"    try { inst = new C(); } catch(e){ g.console.log('[ce-err]', e); inst = null; }\n"
+"    if (!inst || inst.__i !== i){ __upg.length = 0; inst = inst || new Element(i); inst.__i = i; }\n"
+"    wrap.set(i, inst);\n"
+"    return inst;\n"
+"  }\n"
+"  function __fireConn(inst){\n"
+"    if (inst.__ceConn) return;\n"
+"    inst.__ceConn = true;\n"
+"    if (typeof inst.connectedCallback === 'function'){\n"
+"      try { inst.connectedCallback(); } catch(e){ g.console.log('[ce-err]', e); }\n"
+"    }\n"
+"  }\n"
+"  function __upgradeUnder(root){\n"
+"    for (var name in __ce){\n"
+"      var i = 0;\n"
+"      while ((i = D.byTagFrom(name, i + 1)) >= 0){\n"
+"        if (root >= 0){\n"
+"          var ok = false;\n"
+"          for (var n2 = i; n2 >= 0; n2 = D.parent(n2)) if (n2 === root){ ok = true; break; }\n"
+"          if (!ok) continue;\n"
+"        }\n"
+"        var w = wrap.get(i);\n"
+"        var inst = (w && w instanceof __ce[name]) ? w : __mkCustom(name, i);\n"
+"        if (__isConn(i)) __fireConn(inst);\n"
+"      }\n"
+"    }\n"
+"  }\n"
+"  g.customElements = {\n"
+"    define: function(name, C){\n"
+"      name = String(name).toLowerCase();\n"
+"      __ce[name] = C;\n"
+"      __upgradeUnder(-1);\n"
+"    },\n"
+"    get: function(name){ return __ce[String(name).toLowerCase()]; },\n"
+"    whenDefined: function(){ return Promise.resolve(); }\n"
+"  };\n"
+"  Element.prototype.appendChild = function(c){\n"
+"    if (c && c.__tplFrag !== undefined){\n"
+"      var kids = D.childNodes(c.__tplFrag);\n"
+"      for (var k = 0; k < kids.length; k++)\n"
+"        D.append(this.__i, D.clone(kids[k]));\n"
+"      __upgradeUnder(this.__i);\n"
+"      return c;\n"
+"    }\n"
+"    D.append(this.__i, c.__i);\n"
+"    __upgradeUnder(c.__i);\n"
+"    return c;\n"
+"  };\n"
+"  Element.prototype.removeChild = function(c){\n"
+"    D.remove(c.__i);\n"
+"    var w = wrap.get(c.__i);\n"
+"    if (w && w.__ceConn){\n"
+"      w.__ceConn = false;\n"
+"      if (typeof w.disconnectedCallback === 'function'){\n"
+"        try { w.disconnectedCallback(); } catch(e){}\n"
+"      }\n"
+"    }\n"
+"    return c;\n"
+"  };\n"
 "  Element.prototype.remove = function(){ D.remove(this.__i); };\n"
-"  Element.prototype.setAttribute = function(n, v){ D.setAttr(this.__i, String(n), String(v)); };\n"
+"  Element.prototype.setAttribute = function(n, v){\n"
+"    n = String(n); v = String(v);\n"
+"    var old = D.getAttr(this.__i, n);\n"
+"    D.setAttr(this.__i, n, v);\n"
+"    var C2 = this.constructor;\n"
+"    if (C2 && C2.observedAttributes && C2.observedAttributes.indexOf(n) >= 0 &&\n"
+"        typeof this.attributeChangedCallback === 'function'){\n"
+"      try { this.attributeChangedCallback(n, old, v); }\n"
+"      catch(e){ g.console.log('[ce-err]', e); }\n"
+"    }\n"
+"  };\n"
 "  Element.prototype.getAttribute = function(n){ return D.getAttr(this.__i, String(n)); };\n"
 "  Element.prototype.querySelector = function(s){ return el(D.query(String(s))); };\n"
 "  Element.prototype.insertBefore = function(c, ref){\n"
 "    D.insBefore(this.__i, c.__i, ref ? ref.__i : -1);\n"
+"    __upgradeUnder(c.__i);\n"
 "    return c;\n"
 "  };\n"
 "  Element.prototype.replaceChild = function(nc, oc){\n"
@@ -7474,7 +7795,12 @@ static const char JS_PRELUDE[] =
 "  g.document = {\n"
 "    getElementById: function(id){ return el(D.byId(String(id))); },\n"
 "    querySelector: function(s){ return el(D.query(String(s))); },\n"
-"    createElement: function(t){ return el(D.create(String(t))); },\n"
+"    createElement: function(t){\n"
+"      t = String(t).toLowerCase();\n"
+"      var i = D.create(t);\n"
+"      if (__ce[t]) return __mkCustom(t, i);\n"
+"      return el(i);\n"
+"    },\n"
 "    createTextNode: function(t){ return el(D.text(String(t))); },\n"
 "    addEventListener: function(t, f){\n"
 "      (docListeners[t] = docListeners[t] || []).push(f);\n"
@@ -8183,6 +8509,8 @@ static int js_ensure(void) {
         static const struct { const char *n; JSCFunction *f; int na; } B[] = {
             {"byId", js_dom_byid, 1},     {"query", js_dom_query, 1},
             {"create", js_dom_create, 1}, {"text", js_dom_text, 1},
+            {"clone", js_dom_clone, 1},   {"byTagFrom", js_dom_bytagfrom, 2},
+            {"attachShadow", js_dom_attachshadow, 1},
             {"append", js_dom_append, 2}, {"remove", js_dom_remove, 1},
             {"setText", js_dom_settext, 2},{"getText", js_dom_gettext, 1},
             {"setHTML", js_dom_sethtml, 2},{"getAttr", js_dom_getattr, 2},
@@ -8522,6 +8850,7 @@ static void js_rerender(void) {
     g_form_open = -1;
     collect_node(0);
     g_collect_light = 0;
+    distribute_slots();          /* project light DOM into shadow slots */
     struct cstyle base;
     st_init(&base, NULL);
     base.disp = D_BLOCK;
@@ -8832,6 +9161,7 @@ static void render_html(void) {
     collect_node(0);
     load_webfonts();                      /* @font-face -> download + register */
 
+    distribute_slots();                   /* project light DOM into slots */
     struct cstyle base;
     st_init(&base, NULL);
     base.disp = D_BLOCK;
