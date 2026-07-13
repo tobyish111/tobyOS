@@ -1157,13 +1157,75 @@ static int run_face(int webface, int bold) {
     return bold ? 1 : 0;
 }
 
+/* Per-codepoint advance cache for non-ASCII text (utf8-text arc). Keyed
+ * exactly by (cp, clamped px, face mod 32); one kernel width query per
+ * unique key, then all wrapping math stays in userspace like ASCII. */
+#define CPW_SLOTS 1024
+static struct { uint32_t key; short adv; } g_cpw[CPW_SLOTS];
+
+static int cp_adv(unsigned cp, int px, int face) {
+    if (px < 8) px = 8;
+    if (px > 40) px = 40;
+    uint32_t key = (cp & 0x1FFFFF) | ((uint32_t)(px & 0x3F) << 21) |
+                   ((uint32_t)(face & 0x1F) << 27);
+    if (!key) key = 1;
+    int h = (int)((key * 2654435761u) & (CPW_SLOTS - 1));
+    int idx = -1;
+    for (int probe = 0; probe < 8; probe++) {
+        int k = (h + probe) & (CPW_SLOTS - 1);
+        if (g_cpw[k].key == key) return g_cpw[k].adv;
+        if (g_cpw[k].key == 0 && idx < 0) idx = k;
+    }
+    char u8[5];
+    int n = 0;
+    if (cp < 0x800) {
+        u8[n++] = (char)(0xC0 | (cp >> 6));
+        u8[n++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        u8[n++] = (char)(0xE0 | (cp >> 12));
+        u8[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        u8[n++] = (char)(0x80 | (cp & 0x3F));
+    } else {
+        u8[n++] = (char)(0xF0 | (cp >> 18));
+        u8[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        u8[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        u8[n++] = (char)(0x80 | (cp & 0x3F));
+    }
+    u8[n] = 0;
+    int w = (face >= KFONT_WEB_BASE) ? sys_text_ttf_width(u8, px, face)
+                                     : tk_text_width(u8, px, face ? 1 : 0);
+    if (w <= 0) w = px * 3 / 5 + 3;              /* tofu-box advance */
+    if (idx >= 0) { g_cpw[idx].key = key; g_cpw[idx].adv = (short)w; }
+    return w;
+}
+
 static int text_px_w(const char *s, int len, int px, int face, int mono) {
-    if (mono) return len * MONO_W;
+    if (mono) return len * MONO_W;   /* mono stays byte-based ('?' cells) */
     const short *adv = adv_for(px, face);
     int w = 0;
-    for (int i = 0; i < len; i++) {
+    for (int i = 0; i < len; ) {
         unsigned char c = (unsigned char)s[i];
-        w += adv[(c >= 32 && c <= 126) ? c - 32 : '?' - 32];
+        if (c < 0x80) {
+            w += adv[(c >= 32 && c <= 126) ? c - 32 : '?' - 32];
+            i++;
+            continue;
+        }
+        unsigned cp;
+        int extra;
+        if ((c & 0xE0) == 0xC0)      { cp = c & 0x1F; extra = 1; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
+        else { w += adv['?' - 32]; i++; continue; }
+        if (i + extra >= len) { w += adv['?' - 32]; i++; continue; }
+        int ok = 1;
+        for (int k = 1; k <= extra; k++) {
+            unsigned char cc = (unsigned char)s[i + k];
+            if ((cc & 0xC0) != 0x80) { ok = 0; break; }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (!ok) { w += adv['?' - 32]; i++; continue; }
+        w += cp_adv(cp, px, face);
+        i += extra + 1;
     }
     return w;
 }
@@ -1186,35 +1248,31 @@ static void tp_putc(char c) {
 }
 static void tp_puts(const char *s) { while (*s) tp_putc(*s++); }
 
-/* Transliterate a Unicode codepoint to ASCII into the tpool (the
- * kernel TTF paint path is ASCII-only). */
+/* Append a Unicode codepoint to the tpool as UTF-8 (utf8-text arc: the
+ * whole pipeline -- measurement, wrapping, paint, the kernel TTF
+ * rasterizer -- is codepoint-aware now; missing glyphs draw as tofu
+ * boxes in the kernel). Zero-width characters are dropped; NBSP becomes
+ * a normal space (the wrapper has no no-break support yet). */
 static void tp_put_cp(unsigned int cp) {
     if (cp == 0xA0) { tp_putc(' '); return; }
     if (cp == '\t') { tp_putc(' '); tp_putc(' '); return; }
     if (cp < 0x20) { if (cp == '\n') tp_putc('\n'); return; }
-    if (cp < 0x7F) { tp_putc((char)cp); return; }
-    if (cp >= 0xC0 && cp <= 0xFF) {          /* Latin-1 letters */
-        static const char l1[65] =
-            "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPsaaaaaaaceeeeiiiidnooooo/ouuuuypy";
-        tp_putc(l1[cp - 0xC0]);
-        return;
-    }
-    switch (cp) {
-    case 0x2018: case 0x2019: case 0x201A: tp_putc('\''); return;
-    case 0x201C: case 0x201D: case 0x201E: tp_putc('"');  return;
-    case 0x2013: case 0x2014: case 0x2212: tp_putc('-');  return;
-    case 0x2026: tp_puts("...");  return;
-    case 0x2022: case 0xB7: tp_putc('*'); return;
-    case 0xA9:   tp_puts("(c)");  return;
-    case 0xAE:   tp_puts("(R)");  return;
-    case 0x2122: tp_puts("(TM)"); return;
-    case 0xD7:   tp_putc('x');  return;
-    case 0xAB:   tp_puts("<<"); return;
-    case 0xBB:   tp_puts(">>"); return;
-    case 0x2192: tp_puts("->"); return;
-    case 0x2190: tp_puts("<-"); return;
-    case 0x200B: case 0x200C: case 0x200D: case 0xFEFF: case 0xAD: return;
-    default:     tp_putc('?');  return;
+    if (cp < 0x80) { tp_putc((char)cp); return; }
+    if (cp == 0x200B || cp == 0x200C || cp == 0x200D ||
+        cp == 0xFEFF || cp == 0xAD) return;         /* zero-width */
+    if (cp > 0x10FFFF) cp = 0xFFFD;
+    if (cp < 0x800) {
+        tp_putc((char)(0xC0 | (cp >> 6)));
+        tp_putc((char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        tp_putc((char)(0xE0 | (cp >> 12)));
+        tp_putc((char)(0x80 | ((cp >> 6) & 0x3F)));
+        tp_putc((char)(0x80 | (cp & 0x3F)));
+    } else {
+        tp_putc((char)(0xF0 | (cp >> 18)));
+        tp_putc((char)(0x80 | ((cp >> 12) & 0x3F)));
+        tp_putc((char)(0x80 | ((cp >> 6) & 0x3F)));
+        tp_putc((char)(0x80 | (cp & 0x3F)));
     }
 }
 
@@ -11407,10 +11465,13 @@ static int layer_render(const struct clayer *L,
         /* DI_TEXT */
         if (r->len <= 0) continue;
         int n = r->len < (int)sizeof(tb) - 1 ? r->len : (int)sizeof(tb) - 1;
-        for (int k = 0; k < n; k++) {
-            char ch = g_render[r->off + k];
-            tb[k] = ((unsigned char)ch < 0x20 || (unsigned char)ch > 0x7E)
-                        ? ' ' : ch;
+        {   /* same UTF-8 pass-through as the window paint path */
+            int mono_run = (r->fl & IF_MONO) != 0;
+            for (int k = 0; k < n; k++) {
+                unsigned char ch = (unsigned char)g_render[r->off + k];
+                tb[k] = (ch < 0x20) ? ' '
+                      : (mono_run && ch > 0x7E) ? '?' : (char)ch;
+            }
         }
         tb[n] = '\0';
         uint32_t fg = r->fg & 0xFFFFFF;
@@ -11764,10 +11825,14 @@ static void paint_all(void) {
             if (r->len <= 0) continue;
 
             int n = r->len < (int)sizeof(tb) - 1 ? r->len : (int)sizeof(tb) - 1;
-            for (int k = 0; k < n; k++) {
-                char ch = g_render[r->off + k];
-                tb[k] = ((unsigned char)ch < 0x20 || (unsigned char)ch > 0x7E)
-                            ? ' ' : ch;
+            {   /* UTF-8 passes through to the kernel TTF path; the 8x8
+                 * mono face is ASCII-only so mono runs show '?'. */
+                int mono_run = (r->fl & IF_MONO) != 0;
+                for (int k = 0; k < n; k++) {
+                    unsigned char ch = (unsigned char)g_render[r->off + k];
+                    tb[k] = (ch < 0x20) ? ' '
+                          : (mono_run && ch > 0x7E) ? '?' : (char)ch;
+                }
             }
             tb[n] = '\0';
 

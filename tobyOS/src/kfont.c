@@ -221,7 +221,33 @@ bool kfont_available(void) {
     return kface_info(KFONT_REGULAR) != NULL;
 }
 
-/* Find or rasterize the (face,cp,px) glyph. FP-guarded on a cache miss. */
+/* Decode one UTF-8 sequence at *ps (bounded by `end` when non-NULL);
+ * returns the codepoint and advances *ps. Invalid bytes decode as '?'
+ * one byte at a time so rendering keeps moving. Makes every kfont
+ * entry point (draw/width/raster) Unicode-aware: callers keep passing
+ * byte buffers + byte lengths. */
+static unsigned kf_utf8_next(const char **ps, const char *end) {
+    const unsigned char *p = (const unsigned char *)*ps;
+    unsigned c = *p, cp;
+    int extra;
+    if (c < 0x80) { (*ps)++; return c; }
+    if ((c & 0xE0) == 0xC0)      { cp = c & 0x1F; extra = 1; }
+    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
+    else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
+    else { (*ps)++; return '?'; }
+    if (end && (const char *)p + extra >= end) { (*ps)++; return '?'; }
+    for (int k = 1; k <= extra; k++) {
+        if ((p[k] & 0xC0) != 0x80) { (*ps)++; return '?'; }
+        cp = (cp << 6) | (p[k] & 0x3F);
+    }
+    *ps += extra + 1;
+    return cp;
+}
+
+/* Find or rasterize the (face,cp,px) glyph. FP-guarded on a cache miss.
+ * A codepoint the face doesn't cover renders as a hollow "tofu" box
+ * (synthesized coverage bitmap, so the draw/width/raster paths need no
+ * special-casing). */
 static struct gcache *kfont_glyph(int face, int cp, int px) {
     if (px < KFONT_PX_MIN) px = KFONT_PX_MIN;
     if (px > KFONT_PX_MAX) px = KFONT_PX_MAX;
@@ -241,11 +267,30 @@ static struct gcache *kfont_glyph(int face, int cp, int px) {
 
     kfpu_begin();
     float scale = stbtt_ScaleForPixelHeight(info, (float)px);
+    int gi = stbtt_FindGlyphIndex(info, cp);
+    if (gi == 0 && cp > 0x20) {                     /* missing: tofu box */
+        int bw = px * 11 / 20, bh = px * 7 / 10;
+        if (bw < 4) bw = 4;
+        if (bh < 5) bh = 5;
+        unsigned char *bm = (unsigned char *)kmalloc((size_t)bw * bh);
+        if (bm) {
+            int t = px >= 20 ? 2 : 1;
+            for (int y = 0; y < bh; y++)
+                for (int x = 0; x < bw; x++)
+                    bm[y * bw + x] =
+                        (y < t || y >= bh - t || x < t || x >= bw - t) ? 190 : 0;
+        }
+        g->bmp = bm; g->w = bm ? bw : 0; g->h = bm ? bh : 0;
+        g->xoff = 1; g->yoff = -bh;
+        g->advance = bw + 3;
+        kfpu_end();
+        return g;
+    }
     int adv = 0, lsb = 0;
-    stbtt_GetCodepointHMetrics(info, cp, &adv, &lsb);
+    stbtt_GetGlyphHMetrics(info, gi, &adv, &lsb);
     g->advance = (int)(adv * scale + 0.5f);
-    g->bmp = stbtt_GetCodepointBitmap(info, 0, scale, cp,
-                                      &g->w, &g->h, &g->xoff, &g->yoff);
+    g->bmp = stbtt_GetGlyphBitmap(info, 0, scale, gi,
+                                  &g->w, &g->h, &g->xoff, &g->yoff);
     kfpu_end();
     return g;
 }
@@ -282,9 +327,11 @@ void kfont_vmetrics(int px, int *ascent, int *descent, int *line_height) {
 
 int kfont_text_width_f(const char *s, int len, int px, int face) {
     if (!s || !kface_info(face)) return 0;
-    int w = 0, n = 0;
-    for (const char *p = s; *p && (len < 0 || n < len); p++, n++) {
-        struct gcache *g = kfont_glyph(face, (unsigned char)*p, px);
+    const char *end = len >= 0 ? s + len : 0;
+    int w = 0;
+    while (*s && (!end || s < end)) {
+        unsigned cp = kf_utf8_next(&s, end);
+        struct gcache *g = kfont_glyph(face, (int)cp, px);
         w += g ? g->advance : px / 2;
     }
     return w;
@@ -297,9 +344,11 @@ int kfont_draw_window_f(struct window *w, int x, int y, const char *s, int len,
                         uint32_t xrgb, int px, int face) {
     if (!w || !s || !kface_info(face)) return 0;
     int baseline = y + kfont_ascent_px(face, px);
-    int x0 = x, n = 0;
-    for (const char *p = s; *p && (len < 0 || n < len); p++, n++) {
-        struct gcache *g = kfont_glyph(face, (unsigned char)*p, px);
+    int x0 = x;
+    const char *end = len >= 0 ? s + len : 0;
+    while (*s && (!end || s < end)) {
+        unsigned cp = kf_utf8_next(&s, end);
+        struct gcache *g = kfont_glyph(face, (int)cp, px);
         if (g && g->bmp && g->w > 0 && g->h > 0)
             gui_window_blend_coverage(w, x + g->xoff, baseline + g->yoff,
                                       g->bmp, g->w, g->h, xrgb);
@@ -316,9 +365,11 @@ int kfont_raster_cov(uint8_t *cov, int w, int h, int x, int y,
                      const char *s, int len, int px, int face) {
     if (!cov || w <= 0 || h <= 0 || !s || !kface_info(face)) return 0;
     int baseline = y + kfont_ascent_px(face, px);
-    int x0 = x, n = 0;
-    for (const char *p = s; *p && (len < 0 || n < len); p++, n++) {
-        struct gcache *g = kfont_glyph(face, (unsigned char)*p, px);
+    int x0 = x;
+    const char *end = len >= 0 ? s + len : 0;
+    while (*s && (!end || s < end)) {
+        unsigned cp = kf_utf8_next(&s, end);
+        struct gcache *g = kfont_glyph(face, (int)cp, px);
         if (g && g->bmp && g->w > 0 && g->h > 0) {
             int gx = x + g->xoff, gy = baseline + g->yoff;
             for (int r = 0; r < g->h; r++) {
