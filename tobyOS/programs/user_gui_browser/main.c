@@ -6953,6 +6953,277 @@ static JSValue js_dom_fetchstart2(JSContext *cx, JSValueConst t, int argc, JSVal
     return JS_UNDEFINED;
 }
 
+/* ---- Web Workers (chrome-parity) ------------------------------------- *
+ * A Worker is a second JSContext on its own JSRuntime, pumped
+ * cooperatively from the main loop (the engine is single-threaded, so
+ * this is concurrency by interleaving, not parallelism -- correct
+ * semantics without a JIT/threads). Messages cross contexts as JSON
+ * strings (structured-clone approximation); all serialize/parse stays
+ * in JS via each side's __deliver(json) method, so C only shuttles
+ * opaque strings. Workers have no DOM access. */
+#define WORKER_MAX 4
+#define WMSG_MAX   64
+struct jsworker {
+    int        used, terminated;
+    JSRuntime *rt;
+    JSContext *cx;             /* the worker's context */
+    JSContext *main_cx;        /* owning tab's context (delivery target) */
+    JSValue    main_obj;       /* main-side Worker object (dup'd) */
+    char      *to_worker[WMSG_MAX]; int twh, twt;
+    char      *to_main[WMSG_MAX];   int tmh, tmt;
+    struct jstimer timers[JS_TIMER_MAX];
+    int        timer_seq;
+};
+static struct jsworker g_workers[WORKER_MAX];
+static int g_cur_worker = -1;             /* index while running worker code */
+
+static char *wstrdup(const char *s, size_t n) {
+    char *p = (char *)malloc(n + 1);
+    if (p) { for (size_t i = 0; i < n; i++) p[i] = s[i]; p[n] = 0; }
+    return p;
+}
+static int wq_push(char **q, int *tail, int head, char *s) {
+    int nx = (*tail + 1) % WMSG_MAX;
+    if (nx == head) { free(s); return 0; }   /* full: drop */
+    q[*tail] = s; *tail = nx; return 1;
+}
+
+static const char WORKER_PRELUDE[];       /* defined below JS_PRELUDE */
+
+/* Fetch a script synchronously (worker load + importScripts). Returns a
+ * malloc'd NUL-terminated body or NULL. */
+static char *worker_fetch_script(const char *rel) {
+    char url[URL_MAX + 1];
+    resolve_relative_url(g_url, rel, url, URL_MAX);
+    if (!has_scheme(url)) return NULL;
+    char *buf = (char *)malloc(JS_FETCH_CAP + 1);
+    if (!buf) return NULL;
+    struct http_fetch req;
+    mem_zero(&req, sizeof(req));
+    req.url = (unsigned long)url;
+    req.buf = (unsigned long)buf;
+    req.buf_sz = JS_FETCH_CAP;
+    long r = sys_http_fetch(&req);
+    if (r < 0 || req.status < 200 || req.status >= 400) { free(buf); return NULL; }
+    buf[r] = 0;
+    return buf;
+}
+
+static void js_dump_error(JSContext *cx);
+
+/* __w.postMain(json): worker -> main queue (runs in worker context). */
+static JSValue js_w_postmain(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (g_cur_worker < 0 || argc < 1) return JS_UNDEFINED;
+    struct jsworker *w = &g_workers[g_cur_worker];
+    size_t n = 0;
+    const char *s = JS_ToCStringLen(cx, &n, argv[0]);
+    if (s) { char *d = wstrdup(s, n);
+             if (d) wq_push(w->to_main, &w->tmt, w->tmh, d);
+             JS_FreeCString(cx, s); }
+    return JS_UNDEFINED;
+}
+
+/* __w.timer(fn, ms, rep) / untimer(id): worker-local timers. */
+static JSValue js_w_timer(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (g_cur_worker < 0 || argc < 2 || !JS_IsFunction(cx, argv[0])) return JS_NewInt32(cx, 0);
+    struct jsworker *w = &g_workers[g_cur_worker];
+    int32_t ms = 0, rep = 0;
+    JS_ToInt32(cx, &ms, argv[1]);
+    if (argc >= 3) JS_ToInt32(cx, &rep, argv[2]);
+    if (ms < 0) ms = 0;
+    for (int k = 0; k < JS_TIMER_MAX; k++) {
+        struct jstimer *tm = &w->timers[k];
+        if (tm->used) continue;
+        tm->used = 1; tm->id = w->timer_seq++;
+        tm->due_ms = js_now_ms() + ms;
+        tm->interval_ms = rep ? (ms > 0 ? ms : 10) : 0;
+        tm->fn = JS_DupValue(cx, argv[0]);
+        return JS_NewInt32(cx, tm->id);
+    }
+    return JS_NewInt32(cx, 0);
+}
+static JSValue js_w_untimer(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (g_cur_worker < 0 || argc < 1) return JS_UNDEFINED;
+    struct jsworker *w = &g_workers[g_cur_worker];
+    int32_t id = 0; JS_ToInt32(cx, &id, argv[0]);
+    for (int k = 0; k < JS_TIMER_MAX; k++)
+        if (w->timers[k].used && w->timers[k].id == id) {
+            JS_FreeValue(cx, w->timers[k].fn); w->timers[k].used = 0; break;
+        }
+    return JS_UNDEFINED;
+}
+
+/* importScripts(url...): synchronous fetch + eval in the worker. */
+static JSValue js_w_import(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    for (int i = 0; i < argc; i++) {
+        const char *u = JS_ToCString(cx, argv[i]);
+        if (!u) continue;
+        char *src = worker_fetch_script(u);
+        JS_FreeCString(cx, u);
+        if (!src) continue;
+        JSValue r = JS_Eval(cx, src, str_len(src), "importScripts", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(r)) js_dump_error(cx);
+        JS_FreeValue(cx, r);
+        free(src);
+    }
+    return JS_UNDEFINED;
+}
+
+/* Install the worker global bindings + prelude, eval the script. */
+static int worker_boot(struct jsworker *w, const char *script) {
+    JSValue g = JS_GetGlobalObject(w->cx);
+    JSValue wd = JS_NewObject(w->cx);
+    JS_SetPropertyStr(w->cx, wd, "postMain", JS_NewCFunction(w->cx, js_w_postmain, "postMain", 1));
+    JS_SetPropertyStr(w->cx, wd, "timer",    JS_NewCFunction(w->cx, js_w_timer, "timer", 3));
+    JS_SetPropertyStr(w->cx, wd, "untimer",  JS_NewCFunction(w->cx, js_w_untimer, "untimer", 1));
+    JS_SetPropertyStr(w->cx, wd, "import",    JS_NewCFunction(w->cx, js_w_import, "import", 1));
+    JS_SetPropertyStr(w->cx, g, "__w", wd);
+    JSValue cons = JS_NewObject(w->cx);
+    JS_SetPropertyStr(w->cx, cons, "log",   JS_NewCFunction(w->cx, js_console_log, "log", 1));
+    JS_SetPropertyStr(w->cx, cons, "warn",  JS_NewCFunction(w->cx, js_console_log, "warn", 1));
+    JS_SetPropertyStr(w->cx, cons, "error", JS_NewCFunction(w->cx, js_console_log, "error", 1));
+    JS_SetPropertyStr(w->cx, g, "console", cons);
+    JS_FreeValue(w->cx, g);
+    JSValue pr = JS_Eval(w->cx, WORKER_PRELUDE, str_len(WORKER_PRELUDE),
+                         "<worker-prelude>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(pr)) js_dump_error(w->cx);
+    JS_FreeValue(w->cx, pr);
+    JSValue r = JS_Eval(w->cx, script, str_len(script), "worker", JS_EVAL_TYPE_GLOBAL);
+    int ok = !JS_IsException(r);
+    if (!ok) js_dump_error(w->cx);
+    JS_FreeValue(w->cx, r);
+    return ok;
+}
+
+static void worker_free(struct jsworker *w) {
+    if (!w->used) return;
+    for (int k = 0; k < JS_TIMER_MAX; k++)
+        if (w->timers[k].used) { JS_FreeValue(w->cx, w->timers[k].fn); w->timers[k].used = 0; }
+    while (w->twh != w->twt) { free(w->to_worker[w->twh]); w->twh = (w->twh + 1) % WMSG_MAX; }
+    while (w->tmh != w->tmt) { free(w->to_main[w->tmh]); w->tmh = (w->tmh + 1) % WMSG_MAX; }
+    if (w->main_cx && !JS_IsUndefined(w->main_obj)) JS_FreeValue(w->main_cx, w->main_obj);
+    if (w->cx) JS_FreeContext(w->cx);
+    if (w->rt) JS_FreeRuntime(w->rt);
+    mem_zero(w, sizeof(*w));
+}
+
+/* new Worker(url, obj): main-context primitive. Returns handle or -1. */
+static JSValue js_worker_new(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_NewInt32(cx, -1);
+    int slot = -1;
+    for (int i = 0; i < WORKER_MAX; i++) if (!g_workers[i].used) { slot = i; break; }
+    if (slot < 0) return JS_NewInt32(cx, -1);
+    const char *u = JS_ToCString(cx, argv[0]);
+    char *src = u ? worker_fetch_script(u) : NULL;
+    if (u) JS_FreeCString(cx, u);
+    if (!src) return JS_NewInt32(cx, -1);
+    struct jsworker *w = &g_workers[slot];
+    mem_zero(w, sizeof(*w));
+    w->rt = JS_NewRuntime();
+    if (w->rt) { JS_SetMemoryLimit(w->rt, 24u * 1024 * 1024);
+                 JS_SetMaxStackSize(w->rt, 192 * 1024);
+                 w->cx = JS_NewContext(w->rt); }
+    if (!w->cx) { if (w->rt) JS_FreeRuntime(w->rt); free(src); return JS_NewInt32(cx, -1); }
+    w->used = 1;
+    w->main_cx = cx;
+    w->main_obj = JS_DupValue(cx, argv[1]);
+    w->timer_seq = 1;
+    g_cur_worker = slot;
+    int ok = worker_boot(w, src);
+    g_cur_worker = -1;
+    free(src);
+    (void)ok;
+    return JS_NewInt32(cx, slot);
+}
+
+/* workerPost(handle, json): main -> worker queue. */
+static JSValue js_worker_post(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    if (argc < 2) return JS_UNDEFINED;
+    int32_t h = -1; JS_ToInt32(cx, &h, argv[0]);
+    if (h < 0 || h >= WORKER_MAX || !g_workers[h].used) return JS_UNDEFINED;
+    size_t n = 0;
+    const char *s = JS_ToCStringLen(cx, &n, argv[1]);
+    if (s) { char *d = wstrdup(s, n);
+             if (d) wq_push(g_workers[h].to_worker, &g_workers[h].twt, g_workers[h].twh, d);
+             JS_FreeCString(cx, s); }
+    return JS_UNDEFINED;
+}
+static JSValue js_worker_terminate(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    int32_t h = -1; if (argc >= 1) JS_ToInt32(cx, &h, argv[0]);
+    if (h >= 0 && h < WORKER_MAX && g_workers[h].used) worker_free(&g_workers[h]);
+    return JS_UNDEFINED;
+}
+
+/* Deliver `json` to a context's global __deliver(json) (worker side) or
+ * an object's __deliver (main side). */
+static void worker_deliver(JSContext *cx, JSValueConst target, const char *json) {
+    JSValue fn = JS_GetPropertyStr(cx, target, "__deliver");
+    if (JS_IsFunction(cx, fn)) {
+        JSValue arg = JS_NewString(cx, json);
+        JSValue r = JS_Call(cx, fn, target, 1, &arg);
+        if (JS_IsException(r)) js_dump_error(cx);
+        JS_FreeValue(cx, r);
+        JS_FreeValue(cx, arg);
+    }
+    JS_FreeValue(cx, fn);
+}
+
+/* Pump all workers once: deliver queued messages both directions, run
+ * worker timers + pending jobs. Returns 1 if any work happened. */
+static int worker_pump(void) {
+    int work = 0;
+    for (int i = 0; i < WORKER_MAX; i++) {
+        struct jsworker *w = &g_workers[i];
+        if (!w->used) continue;
+        g_cur_worker = i;
+        /* main -> worker */
+        while (w->twh != w->twt) {
+            char *json = w->to_worker[w->twh]; w->twh = (w->twh + 1) % WMSG_MAX;
+            JSValue g = JS_GetGlobalObject(w->cx);
+            worker_deliver(w->cx, g, json);
+            JS_FreeValue(w->cx, g);
+            free(json); work = 1;
+        }
+        /* worker timers */
+        long now = js_now_ms();
+        for (int k = 0; k < JS_TIMER_MAX; k++) {
+            struct jstimer *tm = &w->timers[k];
+            if (!tm->used || now < tm->due_ms) continue;
+            JSValue fn = JS_DupValue(w->cx, tm->fn);
+            if (tm->interval_ms > 0) tm->due_ms = now + tm->interval_ms;
+            else { JS_FreeValue(w->cx, tm->fn); tm->used = 0; }
+            JSValue r = JS_Call(w->cx, fn, JS_UNDEFINED, 0, NULL);
+            if (JS_IsException(r)) js_dump_error(w->cx);
+            JS_FreeValue(w->cx, r); JS_FreeValue(w->cx, fn); work = 1;
+        }
+        /* worker pending jobs (promises) */
+        JSContext *pc;
+        while (JS_ExecutePendingJob(w->rt, &pc) > 0) work = 1;
+        g_cur_worker = -1;
+        /* worker -> main */
+        while (w->tmh != w->tmt) {
+            char *json = w->to_main[w->tmh]; w->tmh = (w->tmh + 1) % WMSG_MAX;
+            worker_deliver(w->main_cx, w->main_obj, json);
+            free(json); work = 1;
+        }
+    }
+    return work;
+}
+
+/* Free all workers owned by a tab teardown (main_cx match). */
+static void workers_free_for(JSContext *main_cx) {
+    for (int i = 0; i < WORKER_MAX; i++)
+        if (g_workers[i].used && g_workers[i].main_cx == main_cx)
+            worker_free(&g_workers[i]);
+}
+
 /* ---- WebSocket bindings (stage 13) ----------------------------------- *
  * wsOpen(url, obj) starts a kernel-side RFC 6455 connection and pins
  * the JS WebSocket object; the pump polls the handle and calls the
@@ -7602,9 +7873,13 @@ static JSValue js_dom_obskick(JSContext *cx, JSValueConst t, int argc, JSValueCo
 }
 
 /* Free a tab's JS world (navigation away / tab close). */
+static int worker_pump(void);
+static void workers_free_for(JSContext *main_cx);
+
 static void js_teardown(struct tab *t) {
     if (!t->js_cx) { t->js_rt = NULL; return; }
     JSContext *cx = t->js_cx;
+    workers_free_for(cx);          /* reap this page's Web Workers */
     for (int k = 0; k < JS_TIMER_MAX; k++)
         if (t->js_timers[k].used) {
             JS_FreeValue(cx, t->js_timers[k].fn);
@@ -8095,6 +8370,30 @@ static const char JS_PRELUDE[] =
 "    }, this.__m, this.__hdr.join('\\r\\n'), body,\n"
 "       cross ? !this.withCredentials : false);\n"
 "  };\n"
+/* ---- Web Workers (chrome-parity) --------------------------------- */
+"  function Worker(url){\n"
+"    this.onmessage = null; this.onerror = null;\n"
+"    this.__h = D.workerNew(String(url), this);\n"
+"    if (this.__h < 0) throw new Error('Worker: failed to load ' + url);\n"
+"  }\n"
+"  Worker.prototype.postMessage = function(msg){\n"
+"    if (this.__h >= 0) D.workerPost(this.__h, JSON.stringify(msg === undefined ? null : msg));\n"
+"  };\n"
+"  Worker.prototype.terminate = function(){\n"
+"    if (this.__h >= 0){ D.workerTerminate(this.__h); this.__h = -1; }\n"
+"  };\n"
+"  Worker.prototype.addEventListener = function(t, f){\n"
+"    if (String(t) === 'message') this.onmessage = f;\n"
+"    else if (String(t) === 'error') this.onerror = f;\n"
+"  };\n"
+"  Worker.prototype.removeEventListener = function(){};\n"
+"  Worker.prototype.__deliver = function(json){\n"    /* C calls this */
+"    if (this.onmessage){\n"
+"      try { this.onmessage({ data: JSON.parse(json) }); }\n"
+"      catch(e){ g.console.log('[worker-msg-err]', e); }\n"
+"    }\n"
+"  };\n"
+"  g.Worker = Worker;\n"
 /* ---- stage 13: WebSocket (RFC 6455) ------------------------------- */
 "  function WebSocket(url){\n"
 "    var self = this;\n"
@@ -8707,6 +9006,33 @@ static const char JS_PRELUDE[] =
 "  D.setObsCheck(obsCheck);\n"
 "})(globalThis);\n";
 
+/* Worker global scope (runs in the worker's own context). `self`/
+ * `globalThis` are the worker global; postMessage/onmessage cross to
+ * the main thread; timers + importScripts + a Promise microtask hook
+ * mirror the page environment (minus DOM). __deliver(json) is invoked
+ * by the C pump to deliver a message. */
+static const char WORKER_PRELUDE[] =
+"(function(g){\n"
+"  var W = g.__w;\n"
+"  g.self = g; g.globalThis = g;\n"
+"  g.onmessage = null; g.onerror = null;\n"
+"  g.postMessage = function(m){ W.postMain(JSON.stringify(m === undefined ? null : m)); };\n"
+"  g.__deliver = function(json){\n"
+"    if (g.onmessage){\n"
+"      try { g.onmessage({ data: JSON.parse(json) }); }\n"
+"      catch(e){ g.console.log('[worker-onmsg-err]', e); }\n"
+"    }\n"
+"  };\n"
+"  g.addEventListener = function(t, f){ if (String(t) === 'message') g.onmessage = f; };\n"
+"  g.removeEventListener = function(){};\n"
+"  g.close = function(){};\n"     /* pump reaps on terminate() from main */
+"  g.importScripts = function(){ W['import'].apply(null, arguments); };\n"
+"  g.setTimeout = function(f, ms){ return (typeof f==='function') ? W.timer(f, ms|0, 0) : 0; };\n"
+"  g.setInterval = function(f, ms){ return (typeof f==='function') ? W.timer(f, (ms|0)||10, 1) : 0; };\n"
+"  g.clearTimeout = g.clearInterval = function(id){ W.untimer(id|0); };\n"
+"  g.queueMicrotask = function(f){ Promise.resolve().then(f); };\n"
+"})(globalThis);\n";
+
 /* ---- run every <script> at load -------------------------------------- */
 
 #define JS_SRC_CAP (384 * 1024)
@@ -8759,6 +9085,9 @@ static int js_ensure(void) {
             {"fetchSync", js_dom_fetchsync, 1},
             {"fetchStart", js_dom_fetchstart, 2},
             {"fetchStart2", js_dom_fetchstart2, 6},
+            {"workerNew", js_worker_new, 2},
+            {"workerPost", js_worker_post, 2},
+            {"workerTerminate", js_worker_terminate, 1},
             {"wsOpen", js_ws_openprim, 2},
             {"wsSend", js_ws_sendprim, 2},
             {"wsClose", js_ws_closeprim, 2},
@@ -12633,6 +12962,7 @@ int main(int argc, char **argv) {
         work |= load_one_pending_media();  /* <video>/<audio> files */
         work |= media_pump();              /* frame + PCM advance */
         work |= js_pump_all();             /* timers + jobs + fetches */
+        work |= worker_pump();             /* Web Worker messages + timers */
         work |= anim_pump();               /* CSS @keyframes animations */
         if (!work)
             sys_sleep_ms(15);              /* nothing pending -> idle */
