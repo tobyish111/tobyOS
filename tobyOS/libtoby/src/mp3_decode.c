@@ -57,34 +57,86 @@ void toby_mp3_decode_free(toby_mp3_decoder_t *dec)
     free(dec);
 }
 
-/* ---- AAC (stub) ---- */
+/* ---- AAC-LC / HE-AAC via the vendored Helix decoder ---- */
 
-struct toby_aac_decoder { int dummy; };
+#include "../../third_party/libhelix-aac/aacdec.h"
+
+struct toby_aac_decoder {
+    HAACDecoder h;
+    int raw_configured;      /* AACSetRawBlockParams done for raw (MP4) input */
+};
 
 toby_aac_decoder_t *toby_aac_decode_init(void)
 {
     toby_aac_decoder_t *d = (toby_aac_decoder_t *)malloc(sizeof(*d));
     if (!d) return NULL;
     memset(d, 0, sizeof(*d));
+    d->h = AACInitDecoder();
+    if (!d->h) { free(d); return NULL; }
     return d;
 }
 
+/* Decode one AAC frame. Input may be ADTS-framed (self-describing sync)
+ * or raw AAC access units. For ADTS we let AACDecode find the sync; for
+ * raw input (MP4 mp4a) the caller must first set params via
+ * toby_aac_decode_set_raw(). PCM is 16-bit interleaved in pcm_out
+ * (needs >= 1024*channels shorts). Returns 0 on success. */
 int toby_aac_decode_frame(toby_aac_decoder_t *dec,
                           const uint8_t *aac_data, size_t aac_len,
                           int16_t *pcm_out,
                           int *out_samples, int *out_channels,
                           int *out_sample_rate)
 {
-    (void)dec; (void)aac_data; (void)aac_len; (void)pcm_out;
     if (out_samples)    *out_samples    = 0;
     if (out_channels)   *out_channels   = 0;
     if (out_sample_rate)*out_sample_rate = 0;
-    return -1;
+    if (!dec || !dec->h || !aac_data || !aac_len || !pcm_out) return -1;
+
+    unsigned char *inbuf = (unsigned char *)aac_data;
+    int bytesLeft = (int)aac_len;
+
+    /* ADTS input: skip to the next sync word so a partial buffer still
+     * lands on a frame boundary. Raw input already starts at an AU. */
+    if (!dec->raw_configured) {
+        int off = AACFindSyncWord(inbuf, bytesLeft);
+        if (off >= 0) { inbuf += off; bytesLeft -= off; }
+    }
+
+    int err = AACDecode(dec->h, &inbuf, &bytesLeft, (short *)pcm_out);
+    if (err) return -1;
+
+    AACFrameInfo fi;
+    memset(&fi, 0, sizeof(fi));
+    AACGetLastFrameInfo(dec->h, &fi);
+    if (fi.nChans <= 0 || fi.outputSamps <= 0) return -1;
+
+    if (out_channels)    *out_channels    = fi.nChans;
+    if (out_sample_rate) *out_sample_rate = fi.sampRateOut;
+    if (out_samples)     *out_samples     = fi.outputSamps / fi.nChans;
+    /* bytes consumed from the input, so callers can advance a stream. */
+    return (int)aac_len - bytesLeft;
+}
+
+/* Configure the decoder for raw (ADTS-less) AAC, as carried in MP4:
+ * profile (1=Main,2=LC,3=SSR..; the AudioSpecificConfig audioObjectType),
+ * sampRateCore Hz, nChans. Call once before decoding raw AUs. */
+int toby_aac_decode_set_raw(toby_aac_decoder_t *dec,
+                            int profile, int sample_rate, int channels)
+{
+    if (!dec || !dec->h) return -1;
+    AACFrameInfo fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.nChans      = channels;
+    fi.sampRateCore = sample_rate;
+    fi.profile     = profile > 0 ? profile - 1 : 1;   /* Helix: 0=Main,1=LC */
+    if (AACSetRawBlockParams(dec->h, 0, &fi) != 0) return -1;
+    dec->raw_configured = 1;
+    return 0;
 }
 
 void toby_aac_decode_free(toby_aac_decoder_t *dec)
 {
-    free(dec);
+    if (dec) { if (dec->h) AACFreeDecoder(dec->h); free(dec); }
 }
 
 /* ---- Opus (stub) ---- */

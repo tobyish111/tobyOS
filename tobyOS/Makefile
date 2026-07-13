@@ -395,6 +395,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_mp4play/user_mp4play.elf \
             programs/user_stltest/user_stltest.elf \
             programs/user_av1test/user_av1test.elf \
+            programs/user_aactest/user_aactest.elf \
             programs/user_gui_term/user_gui_term.elf \
             programs/user_gui_files/user_gui_files.elf \
             programs/user_gui_viewer/user_gui_viewer.elf \
@@ -1034,6 +1035,21 @@ $(H264BSD_DIR)/%.o: $(H264BSD_DIR)/%.c Makefile
 $(H264BSD_DIR)/%.pic.o: $(H264BSD_DIR)/%.c Makefile
 	$(CC) $(LIBTOBY_PIC_CFLAGS) -I $(H264BSD_DIR) -w -c $< -o $@
 
+# AAC-LC audio decode (media parity): the vendored Helix fixed-point
+# AAC decoder (RealNetworks RPSL), pure integer, freestanding on the
+# x86-64 portable-C path in assembly.h.
+HELIXAAC_DIR  := third_party/libhelix-aac
+HELIXAAC_SRCS := $(wildcard $(HELIXAAC_DIR)/*.c)
+HELIXAAC_OBJS     := $(HELIXAAC_SRCS:.c=.o)
+HELIXAAC_PIC_OBJS := $(HELIXAAC_SRCS:.c=.pic.o)
+LIBTOBY_OBJS += $(HELIXAAC_OBJS)
+
+$(HELIXAAC_DIR)/%.o: $(HELIXAAC_DIR)/%.c Makefile
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -I $(HELIXAAC_DIR) -w -c $< -o $@
+
+$(HELIXAAC_DIR)/%.pic.o: $(HELIXAAC_DIR)/%.c Makefile
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -I $(HELIXAAC_DIR) -w -c $< -o $@
+
 # High-profile H.264 decode (stage 13 media): the vendored openh264
 # decoder (Cisco, BSD-2), C++ built freestanding via the cpp-runtime.
 # Single-threaded decode -- only WelsThreadPool + WelsTaskThread are
@@ -1142,6 +1158,7 @@ LIBTOBY_ASM_PIC_OBJS := $(LIBTOBY_ASM_SRCS:.S=.pic.o)
 LIBTOBY_PIC_OBJS    += $(LIBTOBY_ASM_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBWEBP_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(H264BSD_PIC_OBJS)
+LIBTOBY_PIC_OBJS    += $(HELIXAAC_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(OPENH264_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBGAV1_PIC_OBJS)
 LIBTOBY_PIC_OBJS    += $(LIBTOBY_SRC)/avif_decode.pic.o
@@ -1315,6 +1332,8 @@ programs/user_stltest/user_stltest.elf: programs/user_stltest/user_stltest.o \
 
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_bsdroute,user_bsdroute))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_mp4play,user_mp4play))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_aactest,user_aactest))
+programs/user_aactest/user_aactest.o: programs/user_aactest/aac_clip.h
 
 # /bin/av1test (libgav1 slice 2): C++ decode-correctness test that links
 # libgav1's Decoder out of libtoby.a. Needs the libgav1 include roots +
@@ -2380,6 +2399,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_mp4play/user_mp4play.elf         $(INITRD_STAGE)/bin/mp4play
 	cp programs/user_stltest/user_stltest.elf         $(INITRD_STAGE)/bin/stltest
 	cp programs/user_av1test/user_av1test.elf         $(INITRD_STAGE)/bin/av1test
+	cp programs/user_aactest/user_aactest.elf         $(INITRD_STAGE)/bin/aactest
 	cp programs/user_gui_term/user_gui_term.elf       $(INITRD_STAGE)/bin/gui_term
 	cp programs/user_gui_files/user_gui_files.elf     $(INITRD_STAGE)/bin/gui_files
 	cp programs/user_gui_viewer/user_gui_viewer.elf   $(INITRD_STAGE)/bin/gui_viewer
@@ -2826,7 +2846,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
-	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest bin/av1test  \
+	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest bin/av1test bin/aactest \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
 	    bin/gui_calc bin/gui_taskmgr bin/gui_edit bin/gui_browser         \
 	    bin/login bin/gui_settings bin/abi_test                           \

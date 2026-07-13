@@ -34,11 +34,19 @@ void toby_mp3_decode_free(toby_mp3_decoder_t *dec);
 typedef struct toby_aac_decoder toby_aac_decoder_t;
 
 toby_aac_decoder_t *toby_aac_decode_init(void);
+/* Decode one AAC frame. Returns the number of input bytes consumed
+ * (>0) so a caller can advance a stream, or -1 on error. pcm_out needs
+ * room for 1024*channels 16-bit samples. */
 int  toby_aac_decode_frame(toby_aac_decoder_t *dec,
                            const uint8_t *aac_data, size_t aac_len,
                            int16_t *pcm_out,
                            int *out_samples, int *out_channels,
                            int *out_sample_rate);
+/* Configure for raw (ADTS-less) AAC as carried in MP4 mp4a: profile is
+ * the AudioSpecificConfig audioObjectType (2 = AAC-LC), plus the core
+ * sample rate and channel count. Call once before decoding raw AUs. */
+int  toby_aac_decode_set_raw(toby_aac_decoder_t *dec,
+                             int profile, int sample_rate, int channels);
 void toby_aac_decode_free(toby_aac_decoder_t *dec);
 
 /* ---- Opus decoder (stub) ---- */

@@ -4320,6 +4320,27 @@ void _start(void) {
             }
         }
 #endif
+#ifdef AAC_SELFTEST
+        /* AAC audio (media parity): spawn /bin/aactest, which decodes an
+         * embedded ADTS AAC-LC clip through the vendored Helix decoder
+         * (wired to toby_aac_decode) and checks the PCM is a plausible
+         * 440Hz tone. [aac] stdout on serial. */
+        {
+            char *av[] = { (char *)"aactest", 0 };
+            char *ae[] = { (char *)"PATH=/bin", 0 };
+            struct proc_spec as = { .path = "/bin/aactest",
+                .name = "aactest", .argc = 1, .argv = av,
+                .envc = 1, .envp = ae };
+            int apid = proc_spawn(&as);
+            if (apid < 0) {
+                kprintf("[boot] AAC: /bin/aactest not spawned (rc=%d)\n", apid);
+            } else {
+                int arc = proc_wait(apid);
+                kprintf("[boot] AAC: aactest (pid=%d) exit=%d (%s)\n",
+                        apid, arc, arc == 0 ? "PASS" : "FAIL");
+            }
+        }
+#endif
 #ifdef CPPSTL_SELFTEST
         /* C++ STL bring-up: spawn /bin/stltest, which exercises the
          * freestanding STL headers (type_traits/utility/limits/... this

@@ -18,6 +18,7 @@
 #define CONTAINER_MP4      2
 #define CONTAINER_WEBM     3
 #define CONTAINER_OGG      4
+#define CONTAINER_AAC      5      /* ADTS-framed AAC (audio/aac) */
 
 #define MEDIA_BUF_SIZE     (256 * 1024)
 
@@ -32,6 +33,7 @@ struct media_player {
 
     /* Decoders */
     toby_mp3_decoder_t *mp3_dec;
+    toby_aac_decoder_t *aac_dec;
     struct video_decoder *video_dec;
 
     /* Playback position tracking */
@@ -55,9 +57,11 @@ static int detect_container(const uint8_t *data, size_t len,
         if (strstr(content_type, "audio/mpeg") ||
             strstr(content_type, "audio/mp3"))
             return CONTAINER_MP3;
+        if (strstr(content_type, "audio/aac") ||
+            strstr(content_type, "audio/aacp"))
+            return CONTAINER_AAC;          /* ADTS stream (not MP4) */
         if (strstr(content_type, "video/mp4") ||
-            strstr(content_type, "audio/mp4") ||
-            strstr(content_type, "audio/aac"))
+            strstr(content_type, "audio/mp4"))
             return CONTAINER_MP4;
         if (strstr(content_type, "video/webm") ||
             strstr(content_type, "audio/webm"))
@@ -68,9 +72,13 @@ static int detect_container(const uint8_t *data, size_t len,
     }
 
     if (len >= 4) {
-        /* MP3: ID3 tag or sync word */
+        /* MP3: ID3 tag */
         if (data[0] == 'I' && data[1] == 'D' && data[2] == '3')
             return CONTAINER_MP3;
+        /* ADTS AAC syncword 0xFFF + layer 00: 0xFF 0xF0/0xF1/0xF8/0xF9.
+         * Check before the looser MP3 sync (both start 0xFF). */
+        if (data[0] == 0xFF && (data[1] & 0xF6) == 0xF0)
+            return CONTAINER_AAC;
         if ((data[0] == 0xFF) && ((data[1] & 0xE0) == 0xE0))
             return CONTAINER_MP3;
 
@@ -147,6 +155,45 @@ static void decode_mp3_audio(struct media_player *mp)
         mp->duration_ms = (int64_t)total_samples * 1000 / mp->audio_rate;
 }
 
+/* Decode ADTS-framed AAC (audio/aac) to PCM and send to audio output.
+ * The Helix decoder self-syncs on the ADTS header, so we just feed the
+ * stream frame by frame. (MP4-embedded raw AAC needs the container
+ * demux to extract AUs first -- a separate integration.) */
+static void decode_aac_audio(struct media_player *mp)
+{
+    if (!mp->aac_dec || !mp->buf || mp->buf_len == 0) return;
+
+    int16_t pcm[2048];                 /* one AAC frame: <=1024 * 2ch */
+    size_t offset = 0;
+    int total_samples = 0;
+
+    while (offset < mp->buf_len) {
+        int samples = 0, channels = 0, rate = 0;
+        int consumed = toby_aac_decode_frame(mp->aac_dec,
+                                             mp->buf + offset,
+                                             mp->buf_len - offset,
+                                             pcm,
+                                             &samples, &channels, &rate);
+        if (consumed <= 0) break;
+        offset += (size_t)consumed;
+
+        if (samples > 0 && channels > 0 && rate > 0) {
+            if (mp->audio_fd < 0) {
+                mp->audio_fd = (int)toby_sc3(ABI_SYS_AUDIO_OPEN,
+                                             (long)rate, (long)channels, 0);
+                mp->audio_channels = channels;
+                mp->audio_rate     = rate;
+            }
+            if (mp->audio_fd >= 0)
+                toby_sc3(ABI_SYS_AUDIO_WRITE, (long)mp->audio_fd,
+                         (long)(uintptr_t)pcm, (long)(samples * channels));
+            total_samples += samples;
+        }
+    }
+    if (mp->audio_rate > 0 && total_samples > 0)
+        mp->duration_ms = (int64_t)total_samples * 1000 / mp->audio_rate;
+}
+
 struct media_player *media_player_create(void)
 {
     struct media_player *mp = (struct media_player *)malloc(sizeof(*mp));
@@ -163,6 +210,7 @@ int media_player_open(struct media_player *mp, const char *url)
 
     /* Reset previous state */
     if (mp->mp3_dec)   { toby_mp3_decode_free(mp->mp3_dec);     mp->mp3_dec   = NULL; }
+    if (mp->aac_dec)   { toby_aac_decode_free(mp->aac_dec);     mp->aac_dec   = NULL; }
     if (mp->video_dec) { video_decoder_destroy(mp->video_dec);  mp->video_dec = NULL; }
     if (mp->audio_fd >= 0) {
         toby_sc1(ABI_SYS_AUDIO_CLOSE, (long)mp->audio_fd);
@@ -211,9 +259,12 @@ int media_player_open(struct media_player *mp, const char *url)
     case CONTAINER_MP3:
         mp->mp3_dec = toby_mp3_decode_init();
         break;
+    case CONTAINER_AAC:
+        mp->aac_dec = toby_aac_decode_init();
+        break;
     case CONTAINER_MP4:
         mp->video_dec = video_decoder_create(VIDEO_CODEC_H264);
-        mp->mp3_dec   = toby_mp3_decode_init();  /* AAC audio track */
+        mp->aac_dec   = toby_aac_decode_init();   /* mp4a AAC audio track */
         break;
     case CONTAINER_WEBM:
         mp->video_dec = video_decoder_create(VIDEO_CODEC_VP9);
@@ -234,6 +285,8 @@ void media_player_play(struct media_player *mp)
 
     if (mp->mp3_dec && mp->container == CONTAINER_MP3)
         decode_mp3_audio(mp);
+    else if (mp->aac_dec && mp->container == CONTAINER_AAC)
+        decode_aac_audio(mp);       /* MP4-embedded AAC needs demux first */
 }
 
 void media_player_pause(struct media_player *mp)
