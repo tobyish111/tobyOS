@@ -117,9 +117,44 @@ the guest to GET `/pic.avif`, then screendump. (`-smp 1` steadies the
 intermittently-flaky headless desktop bring-up — re-run a couple of times
 for a clean composite.)
 
+## Slice 5 — "finish AVIF properly": nclx + alpha + 10-bit (DONE)
+`avif_decode.cpp` v2 replaces the v1 minimal parser:
+
+- **Item-property associations**: `ipco` is parsed into an indexed
+  property list and `ipma` is walked per item, so each item's own
+  `av1C`/`colr`/`auxC` are used (v1 grabbed the first `av1C` in the
+  file, which breaks the moment an alpha item adds a second one).
+- **nclx color**: the `colr`/nclx `matrix_coefficients` +
+  `full_range_flag` select integer YUV->RGB coefficients — BT.601,
+  BT.709, BT.2020 (limited and full range each), identity/GBR (MC=0);
+  no `colr` box falls back to the AV1 bitstream CICP that libgav1
+  reports in its DecoderBuffer. Unknown matrices default to BT.601.
+- **Alpha auxiliary item**: `iref`/`auxl` finds the aux item referencing
+  the primary, `auxC` must name `...:alpha`; the aux image is decoded
+  with its own libgav1 instance and its Y plane becomes A
+  (limited-range alpha expanded to full; nearest-scaled on dimension
+  mismatch). RGBA alpha flows through image.c -> ARGB -> the browser's
+  alpha-blended blits unchanged.
+- **10/12-bit**: libgav1 is now built with `LIBGAV1_MAX_BITDEPTH=10`;
+  high-bitdepth planes are uint16 and every sample is downshifted with
+  rounding to 8-bit at conversion time.
+- **Multi-extent `iloc`** items are concatenated (up to 8 extents).
+
+Verified in the browser (websrv_avif/drive_avif rig): a page with three
+ffmpeg/libaom-encoded AVIFs — BT.709-tagged quadrants, an alpha disc
+over a dark-green page, 10-bit quadrants — renders all three; sampled
+screen colors sit d<=3 from ffmpeg's reference decode, and the BT.709
+image is provably decoded with 709 (chroma quadrants land 11-27 away
+from a deliberate wrong-601 reference decode). The alpha corners show
+the page background exactly (d=0) and a 50% band blends within d=1.
+
+Still simple: `prem` (premultiplied alpha) is ignored, ICC profiles
+(`rICC`/`prof`) are ignored, grid/derived items unsupported, HDR
+transfer functions are not tone-mapped (10-bit is rendered SDR-style).
+
 ## Status
-The libgav1 / AVIF arc (slices 1–4) is **complete**: vendored + freestanding
-build, bit-exact AV1 decode, AVIF wired into the image loader, and an AVIF
-`<img>` rendering on screen. Follow-ups: alpha auxiliary items, the
-`colr`/nclx color matrix (currently BT.601), 10-bit, and AV1 `<video>`
-(animated/AVIS) reuse the same decoder.
+The libgav1 / AVIF arc (slices 1-5) is **complete**: vendored +
+freestanding build, bit-exact AV1 decode, AVIF wired into the image
+loader, AVIF `<img>` on screen, and proper color/alpha/bitdepth
+handling. Follow-ups: AV1 `<video>` (animated/AVIS) reuse of the same
+decoder, `prem`, ICC.
