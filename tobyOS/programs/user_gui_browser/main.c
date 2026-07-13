@@ -712,6 +712,8 @@ struct cstyle {
     uint8_t  disp;               /* D_* */
     uint8_t  px;                 /* font size */
     uint8_t  fl;                 /* SF_* */
+    uint8_t  radius;             /* border-radius px (0 = square corners) */
+    int16_t  deco;               /* index into g_deco (gradient/shadow), -1 */
     uint8_t  talign;             /* 0 left, 1 center, 2 right */
     int16_t  line_h;             /* >0 px; <0 scale*-100; 0 auto */
     uint8_t  flt;                /* float: 0 none, 1 left, 2 right */
@@ -859,6 +861,7 @@ enum {
     CP_ANIM_DELAY, CP_ANIM_DIR, CP_ANIM_TIMING,
     CP_TRANSITION, CP_TRANS_PROP, CP_TRANS_DUR, CP_TRANS_DELAY, CP_TRANS_TIMING,
     CP_OPACITY,
+    CP_BORDER_RADIUS, CP_BOX_SHADOW,
     CP__N
 };
 
@@ -889,8 +892,28 @@ struct ditem {
     uint8_t kind, px, fl;
     uint8_t clip;                /* index into g_clips (0 = no clip) */
     uint8_t face;                /* kernel text face (web font / bold) */
-    uint8_t _pad3[3];
+    uint8_t radius;              /* rect corner radius px (decoration) */
+    int16_t deco;                /* g_deco index (gradient/shadow), -1 */
 };
+#define DI_SHADOW 6              /* box-shadow (soft rounded rect behind) */
+
+/* Per-node CSS decoration (border-radius already lives in cstyle/ditem;
+ * this holds the bulkier gradient + box-shadow params, referenced by an
+ * index so cstyle stays lean). Pool reset each style pass. */
+struct deco {
+    uint8_t  has_grad;
+    uint8_t  grad_dir;           /* 0 to-bottom, 1 to-right, 2 to-top, 3 to-left */
+    uint8_t  grad_n;             /* number of stops (2..4) */
+    uint32_t grad_col[4];
+    uint8_t  grad_pos[4];        /* 0..100 percent along the axis */
+    uint8_t  has_shadow;
+    int16_t  sh_dx, sh_dy, sh_spread;
+    uint8_t  sh_blur;
+    uint32_t sh_col;             /* ARGB (alpha = shadow strength) */
+};
+#define DECO_MAX 512
+static struct deco g_deco[DECO_MAX];
+static int g_ndeco;
 #define ITEM_MAX  49152
 
 /* ---- The per-tab engine (heap-allocated, ~8 MiB) ------------------- */
@@ -2179,6 +2202,7 @@ static int prop_lookup(const char *s, int len) {
         {"transition-duration",CP_TRANS_DUR},{"transition-delay",CP_TRANS_DELAY},
         {"transition-timing-function",CP_TRANS_TIMING},
         {"opacity",CP_OPACITY},
+        {"border-radius",CP_BORDER_RADIUS},{"box-shadow",CP_BOX_SHADOW},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -3073,6 +3097,8 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->grow_span = 1;
     /* grid template offsets are only read when gtc_len/gtr_len > 0 */
     st->ovf = 0;
+    st->radius = 0;                          /* decoration does not inherit */
+    st->deco = -1;
     st->has_tf = 0;
     st->txpx = st->typx = 0;
     st->txpct = st->typct = 0;
@@ -3255,6 +3281,84 @@ static int val_has_var(const char *v, int n) {
 /* Apply one declaration to a computed style. Pass 0 applies only
  * font-size (so em elsewhere resolves against the final font); pass 1
  * applies everything else. */
+/* Find-or-allocate this style's decoration slot (gradient/shadow). All
+ * of a node's decls apply to the same `st`, so lazy alloc keyed off
+ * st->deco groups them. Returns NULL when the pool is full. */
+static struct deco *deco_of(struct cstyle *st) {
+    if (st->deco >= 0 && st->deco < g_ndeco) return &g_deco[st->deco];
+    if (g_ndeco >= DECO_MAX) return NULL;
+    struct deco *d = &g_deco[g_ndeco];
+    mem_zero(d, sizeof(*d));
+    st->deco = (int16_t)g_ndeco++;
+    return d;
+}
+
+/* Parse "linear-gradient([to <dir> | <deg>,] c0 [p0], c1 [p1], ...)"
+ * into `d`. Returns 1 on success. Angles snap to the nearest axis
+ * (v1: axis-aligned gradients). */
+static int parse_linear_gradient(const char *v, int n, struct deco *d) {
+    int lg = str_contains(v, n, "linear-gradient", 15);
+    if (lg < 0) return 0;
+    int i = lg + 15;
+    while (i < n && v[i] != '(') i++;
+    if (i >= n) return 0;
+    i++;
+    int e = i;
+    int depth = 1;
+    while (e < n && depth) { if (v[e] == '(') depth++; else if (v[e] == ')') depth--; if (depth) e++; }
+    d->grad_dir = 0;             /* default: to bottom (top->bottom) */
+    d->grad_n = 0;
+    /* split on top-level commas */
+    int seg0 = i;
+    int di = i;
+    int first = 1;
+    for (int p = i; p <= e && d->grad_n < 4; p++) {
+        if (p < e && v[p] == '(') { int dp = 1; p++; while (p < e && dp) { if (v[p]=='(') dp++; else if (v[p]==')') dp--; p++; } p--; continue; }
+        if (p == e || v[p] == ',') {
+            const char *s = v + seg0; int sl = p - seg0;
+            while (sl > 0 && (*s == ' ' || *s == '\t')) { s++; sl--; }
+            while (sl > 0 && (s[sl-1] == ' ' || s[sl-1] == '\t')) sl--;
+            if (first) {
+                first = 0;
+                if (sl >= 2 && str_ncasecmp(s, "to", 2) == 0) {
+                    if (str_contains(s, sl, "right", 5) >= 0) d->grad_dir = 1;
+                    else if (str_contains(s, sl, "top", 3) >= 0) d->grad_dir = 2;
+                    else if (str_contains(s, sl, "left", 4) >= 0) d->grad_dir = 3;
+                    else d->grad_dir = 0;
+                    seg0 = p + 1;
+                    continue;                /* direction consumed */
+                }
+                if (sl > 0 && (s[sl-1] == 'g' /* deg */ )) {
+                    int deg = atoi_simple(s);
+                    deg = ((deg % 360) + 360) % 360;
+                    d->grad_dir = (deg >= 315 || deg < 45) ? 2 :   /* up */
+                                  (deg < 135) ? 1 : (deg < 225) ? 0 : 3;
+                    seg0 = p + 1;
+                    continue;
+                }
+                /* no direction: this seg is the first color, fall through */
+            }
+            /* color [percent] */
+            uint32_t c;
+            int cl = sl;
+            /* strip trailing percent token */
+            int pct = -1;
+            int sp = sl;
+            while (sp > 0 && s[sp-1] != ' ') sp--;
+            if (sp > 0 && sl - sp > 0 && s[sl-1] == '%') { pct = atoi_simple(s + sp); cl = sp; while (cl>0 && s[cl-1]==' ') cl--; }
+            if (css_color_tok(s, cl, &c)) {
+                int k = d->grad_n++;
+                d->grad_col[k] = c | 0xFF000000u;
+                d->grad_pos[k] = (pct >= 0 && pct <= 100) ? (uint8_t)pct
+                                 : (uint8_t)(d->grad_n == 1 ? 0 : 100);
+            }
+            seg0 = p + 1;
+        }
+    }
+    if (d->grad_n >= 2) { d->has_grad = 1; return 1; }
+    return 0;
+}
+
 static void st_apply(struct cstyle *st, const struct cstyle *pst,
                      const struct cdecl *d, int pass) {
     if (d->prop == CP_VAR) return;        /* collected separately */
@@ -3318,13 +3422,78 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
     }
     case CP_BGCOLOR:
     case CP_BG: {
+        if (str_contains(v, n, "linear-gradient", 15) >= 0) {
+            struct deco *dc = deco_of(st);
+            if (dc && parse_linear_gradient(v, n, dc)) {
+                /* fallback solid = first stop (also the color used when
+                 * the gradient can't paint) */
+                st->bg = dc->grad_col[0] | 0xFF000000u;
+                break;
+            }
+        }
         uint32_t c;
         while (vtok_next(v, n, &pos, &t)) {
             if (tok_is(&t, "none")) { st->bg = 0; break; }
             if (css_color_tok(t.s, t.len, &c)) {
                 st->bg = ((c >> 24) >= 128) ? (c | 0xFF000000u) : 0;
+                /* a solid color clears any prior gradient on this node */
+                if (st->deco >= 0) g_deco[st->deco].has_grad = 0;
                 break;
             }
+        }
+        break;
+    }
+    case CP_BORDER_RADIUS: {
+        /* first value only (v1: uniform radius). LK_PX == 0, so test the
+         * return code explicitly. 255 = sentinel "half the shorter side"
+         * so border-radius:50% renders pills/circles. */
+        struct vtok rt;
+        int rp = 0;
+        if (vtok_next(v, n, &rp, &rt)) {
+            int r = 0;
+            int k = css_len_tok(rt.s, rt.len, st->px, &r);
+            if (k == LK_PCT) st->radius = 255;
+            else if (k == LK_PX) {
+                if (r < 0) r = 0;
+                if (r > 250) r = 250;
+                st->radius = (uint8_t)r;
+            }
+        }
+        break;
+    }
+    case CP_BOX_SHADOW: {
+        if (str_contains(v, n, "none", 4) >= 0 && n <= 6) break;
+        struct deco *dc = deco_of(st);
+        if (!dc) break;
+        /* "[inset] <dx> <dy> [blur] [spread] <color>" -- inset ignored */
+        int nums[4], nn = 0;
+        int p2 = 0;
+        uint32_t col = 0x40000000u;           /* default ~25% black */
+        int have_col = 0;
+        struct vtok tk;
+        while (vtok_next(v, n, &p2, &tk) && nn < 4) {
+            if (tok_is(&tk, "inset")) continue;
+            uint32_t c;
+            int px2, k;
+            if (css_color_tok(tk.s, tk.len, &c)) { col = c; have_col = 1; }
+            else if ((k = css_len_tok(tk.s, tk.len, st->px, &px2)) == LK_PX)
+                nums[nn++] = px2;         /* LK_PX == 0: test explicitly */
+        }
+        /* a trailing color after numbers */
+        if (!have_col) {
+            int p3 = 0; struct vtok t3; uint32_t c;
+            while (vtok_next(v, n, &p3, &t3))
+                if (css_color_tok(t3.s, t3.len, &c)) { col = c; break; }
+        }
+        if (nn >= 2) {
+            dc->has_shadow = 1;
+            dc->sh_dx = (int16_t)nums[0];
+            dc->sh_dy = (int16_t)nums[1];
+            dc->sh_blur = (uint8_t)(nn >= 3 ? (nums[2] < 0 ? 0 : nums[2] > 80 ? 80 : nums[2]) : 0);
+            dc->sh_spread = (int16_t)(nn >= 4 ? nums[3] : 0);
+            /* ensure a visible alpha even if the color was opaque-looking */
+            if ((col >> 24) == 0) col |= 0x40000000u;
+            dc->sh_col = col;
         }
         break;
     }
@@ -4171,6 +4340,7 @@ static struct ditem *item_new(int kind) {
     it->kind = (uint8_t)kind;
     it->link = it->field = it->img = -1;
     it->node = -1;
+    it->deco = -1;                         /* no gradient/shadow by default */
     it->clip = (uint8_t)g_cur_clip;        /* overflow clip in force */
     return it;
 }
@@ -5525,10 +5695,25 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
         g_cb_h = (st->height >= 0) ? bwt + pt + st->height + pb + bwb : -1;
     }
 
+    /* box-shadow paints BEHIND the box, so emit it first (h patched
+     * below alongside the bg). */
+    int sh_i = -1;
+    if (st->deco >= 0 && g_deco[st->deco].has_shadow) {
+        struct ditem *sh = item_new(DI_SHADOW);
+        if (sh) { sh->x = bx; sh->y = by; sh->w = bbw; sh->h = 0;
+                  sh->radius = st->radius; sh->deco = st->deco;
+                  sh_i = (int)(sh - E->items); }
+    }
     int bg_i = -1;
-    if (st->bg >> 24) {
+    if ((st->bg >> 24) || st->radius ||
+        (st->deco >= 0 && g_deco[st->deco].has_grad)) {
         bg_i = emit_rect(bx, by, bbw, 0, st->bg);   /* height patched below */
-        if (bg_i >= 0) E->items[bg_i].node = ni;    /* clicks on the box */
+        if (bg_i >= 0) {
+            E->items[bg_i].node = ni;               /* clicks on the box */
+            E->items[bg_i].radius = st->radius;
+            E->items[bg_i].deco = (st->deco >= 0 && g_deco[st->deco].has_grad)
+                                      ? st->deco : -1;
+        }
     }
 
     if (st->disp == D_LISTITEM && !(st->fl & SF_NOBULLET)) {
@@ -5598,6 +5783,7 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     int bbh = bwt + pt + content_h + pb + bwb;
 
     if (bg_i >= 0) E->items[bg_i].h = bbh;
+    if (sh_i >= 0) E->items[sh_i].h = bbh;
     nstamp_add(ni, bx, by, bbw, bbh);
     if (bwt) emit_rect(bx, by, bbw, bwt, st->border_col);
     if (bwb) emit_rect(bx, by + bbh - bwb, bbw, bwb, st->border_col);
@@ -9423,6 +9609,7 @@ static void js_rerender(void) {
     st_init(&base, NULL);
     base.disp = D_BLOCK;
     var_scope_reset();
+    g_ndeco = 0;                 /* decoration pool: per style pass */
     style_node(0, &base);
     anim_apply();                /* overlay CSS animation keyframes */
     trans_apply();               /* overlay CSS transitions */
@@ -9741,6 +9928,7 @@ static void render_html(void) {
     st_init(&base, NULL);
     base.disp = D_BLOCK;
     var_scope_reset();
+    g_ndeco = 0;                 /* decoration pool: per style pass */
     style_node(0, &base);
     anim_apply();                         /* start CSS animations at t0 */
     trans_apply();                        /* seed transition current values */
@@ -9796,6 +9984,7 @@ static void render_mono_doc(void) {
     st_init(&base, NULL);
     base.disp = D_BLOCK;
     var_scope_reset();
+    g_ndeco = 0;                 /* decoration pool: per style pass */
     style_node(0, &base);
     layout(g_win_w);
 }
@@ -12078,6 +12267,119 @@ static int paint_layer(int li, int vtop) {
 
 /* paint_all() draws the whole window (called from the canvas on_paint);
  * redraw() just requests a repaint and is what the event handlers call. */
+/* ---- CSS decoration paint: rounded corners + gradients + shadow ----- *
+ * All three composite over what's already painted (containers paint
+ * before content), so rounded corners and soft shadows blend correctly
+ * against the real backdrop. Rows are built in g_layer_row and pushed
+ * with tk_draw_blit_blend, like the compositing layer. */
+
+static int isqrt32(uint32_t v) {
+    uint32_t r = 0, b = 1u << 30;
+    while (b > v) b >>= 2;
+    while (b) { if (v >= r + b) { v -= r + b; r = (r >> 1) + b; } else r >>= 1; b >>= 2; }
+    return (int)r;
+}
+
+/* Signed distance into an axis-aligned rounded rect (w x h, corner r) at
+ * local point (px,py): <0 inside, 0 on the boundary, >0 outside. */
+static int rbox_sdf(int px, int py, int w, int h, int r) {
+    int ax = (2 * px - w); ax = (ax < 0 ? -ax : ax) / 2;    /* |px - w/2| */
+    int ay = (2 * py - h); ay = (ay < 0 ? -ay : ay) / 2;
+    int qx = ax - (w / 2 - r);
+    int qy = ay - (h / 2 - r);
+    int mx = qx > 0 ? qx : 0, my = qy > 0 ? qy : 0;
+    int outside = isqrt32((uint32_t)(mx * mx + my * my));
+    int inside = (qx > qy ? qx : qy); if (inside > 0) inside = 0;
+    return outside + inside - r;
+}
+
+/* Gradient color at local (lx,ly) within a w x h box (ARGB, opaque). */
+static uint32_t grad_color(const struct deco *dc, int lx, int ly, int w, int h) {
+    int t;
+    switch (dc->grad_dir) {
+    case 1: t = w > 1 ? lx * 100 / (w - 1) : 0; break;             /* to right */
+    case 3: t = w > 1 ? (w - 1 - lx) * 100 / (w - 1) : 0; break;   /* to left */
+    case 2: t = h > 1 ? (h - 1 - ly) * 100 / (h - 1) : 0; break;   /* to top */
+    default: t = h > 1 ? ly * 100 / (h - 1) : 0; break;           /* to bottom */
+    }
+    if (t < 0) t = 0; if (t > 100) t = 100;
+    int i = 0;
+    while (i + 1 < dc->grad_n && dc->grad_pos[i + 1] < t) i++;
+    int j = (i + 1 < dc->grad_n) ? i + 1 : i;
+    int span = dc->grad_pos[j] - dc->grad_pos[i];
+    int num = span ? (t - dc->grad_pos[i]) : 0, den = span ? span : 1;
+    return css_col_lerp(dc->grad_col[i], dc->grad_col[j], num, den) | 0xFF000000u;
+}
+
+/* Paint a (possibly rounded, possibly gradient) rect at screen (sx,sy),
+ * clipped to [cx0,cx1)x[cyy0,cyy1). solid used when no gradient. */
+static void paint_deco_rect(int sx, int sy, int w, int h, int radius, int deco,
+                            uint32_t solid, int cx0, int cx1, int cyy0, int cyy1) {
+    if (w <= 0 || h <= 0) return;
+    const struct deco *dc = (deco >= 0) ? &g_deco[deco] : 0;
+    int r = (radius == 255) ? (w < h ? w : h) / 2 : radius;  /* 255 = 50% */
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    if (r < 0) r = 0;
+    uint32_t sc = 0xFF000000u | (solid & 0xFFFFFF);
+    for (int yy = 0; yy < h; yy++) {
+        int py = sy + yy;
+        if (py < cyy0 || py >= cyy1) continue;
+        int x0 = sx, x1 = sx + w;
+        if (x0 < cx0) x0 = cx0;
+        if (x1 > cx1) x1 = cx1;
+        int cnt = x1 - x0;
+        if (cnt <= 0 || cnt > 2048) { if (cnt > 2048) cnt = 2048; else continue; }
+        for (int i = 0; i < cnt; i++) {
+            int px = x0 + i;
+            uint32_t col = (dc && dc->has_grad) ? grad_color(dc, px - sx, yy, w, h) : sc;
+            int cov = 256;
+            if (r > 0) { int s = rbox_sdf(px - sx, yy, w, h, r);
+                         cov = 128 - s * 256; if (cov < 0) cov = 0; if (cov > 256) cov = 256; }
+            uint32_t a = ((col >> 24) * (uint32_t)cov) / 256;
+            g_layer_row[i] = (a << 24) | (col & 0xFFFFFF);
+        }
+        tk_draw_blit_blend(&win, x0, py, cnt, 1, g_layer_row, cnt);
+    }
+}
+
+/* Paint a box-shadow (soft rounded rect) for a box at screen (sx,sy). */
+static void paint_deco_shadow(int sx, int sy, int w, int h, int radius, int deco,
+                              int cx0, int cx1, int cyy0, int cyy1) {
+    if (deco < 0) return;
+    const struct deco *dc = &g_deco[deco];
+    int blur = dc->sh_blur; if (blur < 1) blur = 1;
+    int spread = dc->sh_spread;
+    int iw = w + 2 * spread, ih = h + 2 * spread;      /* pre-blur shape */
+    if (iw <= 0 || ih <= 0) return;
+    int rad = (radius == 255) ? (w < h ? w : h) / 2 : radius;   /* 50% */
+    int r = rad + spread; if (r < 0) r = 0;
+    int ox = sx + dc->sh_dx - spread - blur;
+    int oy = sy + dc->sh_dy - spread - blur;
+    int ow = iw + 2 * blur, oh = ih + 2 * blur;
+    uint32_t scol = dc->sh_col & 0xFFFFFF;
+    int salpha = (int)(dc->sh_col >> 24);
+    for (int yy = 0; yy < oh; yy++) {
+        int py = oy + yy;
+        if (py < cyy0 || py >= cyy1) continue;
+        int x0 = ox, x1 = ox + ow;
+        if (x0 < cx0) x0 = cx0;
+        if (x1 > cx1) x1 = cx1;
+        int cnt = x1 - x0;
+        if (cnt <= 0) continue;
+        if (cnt > 2048) cnt = 2048;
+        for (int i = 0; i < cnt; i++) {
+            int px = x0 + i;
+            int lx = px - ox - blur, ly = yy - blur;
+            int s = rbox_sdf(lx, ly, iw, ih, r);
+            int cov = s <= 0 ? 256 : (s >= blur ? 0 : 256 - s * 256 / blur);
+            uint32_t a = (uint32_t)(salpha * cov) / 256;
+            g_layer_row[i] = (a << 24) | scol;
+        }
+        tk_draw_blit_blend(&win, x0, py, cnt, 1, g_layer_row, cnt);
+    }
+}
+
 /* Paint one image run at screen-y `sy`. Loaded images nearest-neighbor
  * scale-blit row-by-row (alpha-composited) into the run rect; pending
  * and failed images draw a placeholder box with a label. Clipped
@@ -12282,7 +12584,17 @@ static void paint_all(void) {
             if (r->x >= cx1 || r->x + r->w <= cx0 ||
                 sy >= cyy1 || sy + r->h <= cyy0) continue;
 
+            if (r->kind == DI_SHADOW) {
+                paint_deco_shadow(r->x, sy, r->w, r->h, r->radius, r->deco,
+                                  cx0, cx1, cyy0, cyy1);
+                continue;
+            }
             if (r->kind == DI_RECT) {
+                if (r->radius > 0 || r->deco >= 0) {   /* rounded / gradient */
+                    paint_deco_rect(r->x, sy, r->w, r->h, r->radius, r->deco,
+                                    r->fg, cx0, cx1, cyy0, cyy1);
+                    continue;
+                }
                 int x0 = r->x, w = r->w, y0 = sy, h = r->h;
                 if (x0 < cx0) { w -= cx0 - x0; x0 = cx0; }
                 if (x0 + w > cx1) w = cx1 - x0;
