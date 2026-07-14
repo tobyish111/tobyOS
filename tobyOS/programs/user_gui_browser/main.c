@@ -4649,6 +4649,7 @@ static void inl_text_pre(struct ictx *ic, const char *t, int tl, const struct is
 }
 
 static void absq_add(int ni, int sx, int sy);
+static void ic_inline_block(struct ictx *ic, int ni, const struct istyle *is);
 
 static void inl_walk(struct ictx *ic, int ni, const struct istyle *is) {
     struct dnode *nd = &E->nodes[ni];
@@ -4699,6 +4700,10 @@ static void inl_walk(struct ictx *ic, int ni, const struct istyle *is) {
         int fl2 = (f->type == FT_TEXT) ? IF_INPUT : IF_SUBMITB;
         ic_atomic(ic, DI_FIELD, field_w(f, (uint8_t)fl2), FIELD_H,
                   -1, nd->field, -1, fl2, ni);
+        return;
+    }
+    if (st->disp == D_INLBLOCK) {          /* atomic block box on the line */
+        ic_inline_block(ic, ni, &cs);
         return;
     }
     /* inline container (block-in-inline degrades to inline flow) */
@@ -4914,6 +4919,76 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
         f->y1 = fy + bbh + mb;
         f->side = st->flt;
     }
+}
+
+/* display:inline-block -- an atomic block box that flows on the inline
+ * line. Shrink-to-fit width when `width` is auto (measured with floats
+ * frozen, like lay_float); otherwise the explicit width. Lay the box at a
+ * provisional origin far below real content (so its interior line layout
+ * never consults real floats), then shift the item range onto the line at
+ * the inline cursor. Top-aligned (no baseline shift). Establishes its own
+ * BFC: interior floats are contained (not registered with the parent). */
+static void ic_inline_block(struct ictx *ic, int ni, const struct istyle *is) {
+    struct dnode *nd = &E->nodes[ni];
+    struct cstyle *st = &nd->st;
+    int ml = st->m[3] == M_AUTO ? 0 : st->m[3];
+    int mr = st->m[1] == M_AUTO ? 0 : st->m[1];
+    int mt = st->m[0] == M_AUTO ? 0 : st->m[0];
+    int mb = st->m[2] == M_AUTO ? 0 : st->m[2];
+    int bwl = st->bw[3], bwr = st->bw[1];
+    int pl = st->p[3], pr = st->p[1];
+    int maxcw = ic->cw;
+    int avail = maxcw - ml - mr - bwl - bwr - pl - pr;
+    if (avail < 8) avail = 8;
+
+    int i0 = E->nitems, s0 = g_nnst, f0 = g_nflts;
+    int prov = (1 << 20) + ic->y;
+
+    int content_w;
+    if (st->width >= 0) {
+        content_w = (st->fl & SF_WPCT) ? (int)((long)avail * st->width / 100)
+                                       : st->width;
+        if (st->fl & SF_WPCT) content_w += st->woff;
+        if (content_w > avail) content_w = avail;
+        if (content_w < 8) content_w = 8;
+        if (st->max_w >= 0 && content_w > st->max_w) content_w = st->max_w;
+    } else {
+        /* shrink-to-fit: measure the preferred (unwrapped) content width */
+        int mi = E->nitems, mrr = E->render_len, mf = g_nflts;
+        g_flt_freeze++;
+        lay_block(ni, 0, 100000, prov, is->link, is->bg);
+        g_flt_freeze--;
+        content_w = items_extent(mi) + pr + bwr;
+        E->nitems = mi; E->render_len = mrr; g_nflts = mf;
+        if (content_w > avail) content_w = avail;
+        if (content_w < 8) content_w = 8;
+        if (st->max_w >= 0 && content_w > st->max_w) content_w = st->max_w;
+    }
+
+    /* Lay the real box: pass a container width that reproduces content_w. */
+    int lay_cw = ml + mr + bwl + bwr + pl + pr + content_w;
+    int bot = lay_block(ni, 0, lay_cw, prov, is->link, is->bg);
+    int bbh = bot - prov;                       /* border-box height */
+    int bw  = ml + bwl + pl + content_w + pr + bwr;   /* incl. left margin */
+    int adv = bw + mr;
+
+    /* Line-break if the margin box doesn't fit the remaining line. */
+    if (ic->x > ic->lx0 && ic->x + adv > ic->lx1)
+        ic_break(ic, ic->line_h > 0 ? ic->line_h : is->lh);
+
+    /* At prov the border-box left = ml, top = prov. Move it so the left
+     * margin edge sits at ic->x and the top margin edge at ic->y. */
+    int dx = ic->x;
+    int dy = (ic->y + mt) - prov;
+    for (int i = i0; i < E->nitems; i++) { E->items[i].x += dx; E->items[i].y += dy; }
+    nstamp_shift(s0, g_nnst, dx, dy);
+    g_nflts = f0;                               /* contain interior floats */
+
+    ic->x += adv;
+    int line_need = mt + bbh + mb + 2;
+    if (line_need > ic->line_h) ic->line_h = line_need;
+    ic->citem = -1;
+    ic->pend_sp = 0;
 }
 
 /* ---- position: absolute/fixed (stage 12E) --------------------------- *
@@ -11242,6 +11317,31 @@ static void set_home_page(void) {
         "L('page-side caches match='+t);if(t!=='PAGE_CACHED')ok=false;"
         "fin();}).catch(function(e){L('sw error: '+e);ok=false;fin();});"
         "</script></body></html>";
+#endif
+#ifdef CSSVIS_TEST
+    /* Visual CSS test: inline-block flow, conic gradients, per-corner
+     * border-radius. Verified by screenshot. */
+    html =
+        "<html><head><title>CSS visual</title><style>"
+        "body{background:#fff;color:#111;font-family:sans-serif;margin:10px}"
+        "h2{color:#1a73e8;font-size:18px;margin:12px 0 6px}"
+        ".ib{display:inline-block;width:90px;height:60px;margin:4px;"
+        "padding:6px;color:#fff;text-align:center;vertical-align:top}"
+        ".a{background:#e5484d}.b{background:#2a7e3b}.c{background:#1a73e8}"
+        ".auto{display:inline-block;background:#7c3aed;color:#fff;padding:8px 14px;margin:4px}"
+        ".conic{width:120px;height:120px;margin:6px;display:inline-block;"
+        "background:conic-gradient(#e5484d,#f5a623,#2a7e3b,#1a73e8,#7c3aed,#e5484d);"
+        "border-radius:50%}"
+        ".corners{width:140px;height:80px;margin:6px;display:inline-block;"
+        "background:#0f766e;color:#fff;text-align:center;line-height:80px;"
+        "border-radius:4px 24px 4px 24px}"
+        "</style></head><body>"
+        "<h2>inline-block (three boxes should sit side by side)</h2>"
+        "<div class='ib a'>A</div><div class='ib b'>B</div><div class='ib c'>C</div>"
+        "<div class='auto'>auto-width</div><div class='auto'>shrinks to fit</div>"
+        "<h2>conic-gradient + per-corner radius</h2>"
+        "<div class='conic'></div><div class='corners'>4/24/4/24</div>"
+        "</body></html>";
 #endif
 
     g_raw_len = 0;
