@@ -63,6 +63,16 @@ int         toby_wasm_memory_max_pages(IM3Module m);    /* 0 = unbounded */
  * allocated memory even when there are zero data segments. Returns 0/-1. */
 int         toby_wasm_mem_setup(IM3Runtime rt, int init_pages, int max_pages);
 
+/* Exported globals: enumerate by index; export name is NULL if the global
+ * at that index isn't exported. Read/write via m3_FindGlobal by name. */
+int         toby_wasm_num_globals(IM3Module m);
+const char *toby_wasm_global_export_name(IM3Module m, int i);
+
+/* Exported table (wasm3 supports a single table): its export name (NULL if
+ * not exported) and size in entries. */
+const char *toby_wasm_table_export_name(IM3Module m);
+int         toby_wasm_table_size(IM3Module m);
+
 #ifdef __cplusplus
 }
 #endif

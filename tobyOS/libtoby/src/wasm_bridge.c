@@ -138,3 +138,24 @@ int toby_wasm_mem_setup(IM3Runtime rt, int init_pages, int max_pages)
     M3Result r = ResizeMemory(rt, (u32)(init_pages > 0 ? init_pages : 0));
     return r ? -1 : 0;
 }
+
+int toby_wasm_num_globals(IM3Module m)
+{
+    return m ? (int)m->numGlobals : 0;
+}
+
+const char *toby_wasm_global_export_name(IM3Module m, int i)
+{
+    if (!m || i < 0 || (u32)i >= m->numGlobals) return 0;
+    return m->globals[i].name;      /* NULL unless exported */
+}
+
+const char *toby_wasm_table_export_name(IM3Module m)
+{
+    return m ? m->table0ExportName : 0;
+}
+
+int toby_wasm_table_size(IM3Module m)
+{
+    return m ? (int)m->table0Size : 0;
+}

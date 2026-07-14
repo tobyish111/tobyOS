@@ -139,13 +139,38 @@ on-screen ("WASM: ALL PASS") and on the serial console:
   flags (both `-msse -msse2 -I third_party/wasm3`), since the bridge reads
   wasm3's private structs.
 
+## Globals + tables
+
+Exported **globals** are `WebAssembly.Global`-shaped objects on
+`instance.exports`: `.value` reads the live global (`m3_GetGlobal`) and,
+for a mutable global, writes it (`m3_SetGlobal`, throwing on an immutable
+set). `WebAssembly.Global` also exists as a standalone holder. Types
+marshal like call args (i32 number, i64 BigInt, f32/f64 number).
+
+Exported **tables** are on `instance.exports` too: `.length` and
+`.get(i)` returns a callable that does a JS-driven `call_indirect` through
+slot `i` (`m3_GetTableFunction` + the shared `wasm_invoke`). Internal
+`call_indirect` (C++ function pointers / vtables) already works inside the
+engine regardless.
+
 ## Known limits
 
 - `instantiateStreaming`/`compileStreaming` best-effort via `Response`;
-  binary-safe network fetch of `.wasm` is a separate transport concern.
+  binary-safe network fetch of `.wasm` is a separate transport concern
+  (tracked with the streaming/binary-fetch work).
 - `WebAssembly.validate` is best-effort (container check, not a full
   bytecode validation pass).
-- No WASM tables/`call_indirect` from JS, globals, or SIMD.
+- **Tables** are read/call only from JS — no `table.set`/`grow` or
+  imported tables (wasm3's public API exposes only `m3_GetTableFunction`).
+  Imported globals aren't linked either (like tables, wasm3 has no host
+  hook); exported globals and a module's own globals work.
+- **No SIMD (`v128`).** wasm3 0.5.2 doesn't implement the SIMD opcodes, so
+  a module *compiled with* SIMD won't run. SIMD is opt-in at compile time,
+  so most modules are unaffected. This is an interpreter limitation, not a
+  wiring gap.
+- **Interpreter, not a JIT.** Execution is wasm3's fast interpreter;
+  there's no native-code tier. Correct and fine for small/medium modules;
+  a heavy compute kernel runs slower than a JIT'd browser.
 
 ## On-screen browser test
 

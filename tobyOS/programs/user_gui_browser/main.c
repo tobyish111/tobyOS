@@ -8208,26 +8208,17 @@ static JSValue js_wasm_memname(JSContext *cx, JSValueConst t, int argc, JSValueC
     return JS_NewString(cx, nm ? nm : "");
 }
 
-/* wasmCall(id, name, argsArray) -> result number | undefined | throws. */
-static JSValue js_wasm_call(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
-    (void)t;
-    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
-    if (!w) return JS_ThrowTypeError(cx, "wasmCall: bad instance");
-    const char *name = JS_ToCString(cx, argv[1]);
-    if (!name) return JS_ThrowTypeError(cx, "wasmCall: bad name");
-
-    IM3Function f = NULL;
-    M3Result r = m3_FindFunction(&f, w->rt, name);
-    if (r || !f) { JS_FreeCString(cx, name);
-        return JS_ThrowTypeError(cx, "wasm export not found"); }
-    JS_FreeCString(cx, name);
-
+/* Marshal a JS args array into f's signature, call it, and return the
+ * result as a JSValue (or throws). args may be JS_UNDEFINED for none. */
+static JSValue wasm_invoke(JSContext *cx, struct wasm_inst *w,
+                           IM3Function f, JSValueConst args) {
     uint32_t na = m3_GetArgCount(f);
     if (na > WASM_MAX_ARGS) na = WASM_MAX_ARGS;
-    static uint64_t slots[WASM_MAX_ARGS];
+    uint64_t slots[WASM_MAX_ARGS];
     const void *aptr[WASM_MAX_ARGS];
     for (uint32_t k = 0; k < na; k++) {
-        JSValue e = (argc >= 3) ? JS_GetPropertyUint32(cx, argv[2], k) : JS_UNDEFINED;
+        JSValue e = JS_IsUndefined(args) ? JS_UNDEFINED
+                                         : JS_GetPropertyUint32(cx, args, k);
         slots[k] = 0;
         switch (m3_GetArgType(f, k)) {
         case c_m3Type_i32: { int32_t v = 0; JS_ToInt32(cx, &v, e);
@@ -8246,7 +8237,7 @@ static JSValue js_wasm_call(JSContext *cx, JSValueConst t, int argc, JSValueCons
         aptr[k] = &slots[k];
     }
 
-    r = m3_Call(f, na, aptr);
+    M3Result r = m3_Call(f, na, aptr);
     if (r) return JS_ThrowInternalError(cx, "wasm trap: %s", r);
     /* the call may have grown memory internally (memory.grow), moving the
      * base -- detach the stale cached buffer so a re-read issues a fresh one. */
@@ -8264,6 +8255,108 @@ static JSValue js_wasm_call(JSContext *cx, JSValueConst t, int argc, JSValueCons
                          return JS_NewFloat64(cx, d); }
     default: return JS_UNDEFINED;
     }
+}
+
+/* wasmCall(id, name, argsArray) -> result | undefined | throws. */
+static JSValue js_wasm_call(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    if (!w) return JS_ThrowTypeError(cx, "wasmCall: bad instance");
+    const char *name = JS_ToCString(cx, argv[1]);
+    if (!name) return JS_ThrowTypeError(cx, "wasmCall: bad name");
+    IM3Function f = NULL;
+    M3Result r = m3_FindFunction(&f, w->rt, name);
+    JS_FreeCString(cx, name);
+    if (r || !f) return JS_ThrowTypeError(cx, "wasm export not found");
+    return wasm_invoke(cx, w, f, (argc >= 3) ? argv[2] : JS_UNDEFINED);
+}
+
+/* wasmTableLen(id) -> number of entries in the exported table. */
+static JSValue js_wasm_tablelen(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    return JS_NewInt32(cx, w ? toby_wasm_table_size(w->mod) : 0);
+}
+
+/* wasmTableName(id) -> exported-table name or "". */
+static JSValue js_wasm_tablename(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    const char *nm = w ? toby_wasm_table_export_name(w->mod) : NULL;
+    return JS_NewString(cx, nm ? nm : "");
+}
+
+/* wasmTableCall(id, index, argsArray) -> result | undefined | throws.
+ * call_indirect from JS: resolve the function at a table slot and call it. */
+static JSValue js_wasm_tablecall(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    if (!w) return JS_ThrowTypeError(cx, "wasmTableCall: bad instance");
+    uint32_t idx = (argc >= 2) ? (uint32_t)jsi(cx, argv[1]) : 0;
+    IM3Function f = NULL;
+    M3Result r = m3_GetTableFunction(&f, w->mod, idx);
+    if (r || !f) return JS_ThrowTypeError(cx, "wasm table entry not callable");
+    return wasm_invoke(cx, w, f, (argc >= 3) ? argv[2] : JS_UNDEFINED);
+}
+
+/* wasmGlobalNames(id) -> [names...] of exported globals. */
+static JSValue js_wasm_globalnames(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    JSValue a = JS_NewArray(cx);
+    if (!w) return a;
+    int ng = toby_wasm_num_globals(w->mod), n = 0;
+    for (int i = 0; i < ng; i++) {
+        const char *nm = toby_wasm_global_export_name(w->mod, i);
+        if (nm && nm[0]) JS_SetPropertyUint32(cx, a, n++, JS_NewString(cx, nm));
+    }
+    return a;
+}
+
+/* wasmGlobalGet(id, name) -> the global's current value (by type). */
+static JSValue js_wasm_globalget(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    if (!w) return JS_UNDEFINED;
+    const char *name = JS_ToCString(cx, argv[1]);
+    if (!name) return JS_UNDEFINED;
+    IM3Global g = m3_FindGlobal(w->mod, name);
+    JS_FreeCString(cx, name);
+    if (!g) return JS_UNDEFINED;
+    M3TaggedValue tv;
+    if (m3_GetGlobal(g, &tv)) return JS_UNDEFINED;
+    switch (tv.type) {
+    case c_m3Type_i32: return JS_NewInt32(cx, (int32_t)tv.value.i32);
+    case c_m3Type_i64: return JS_NewBigInt64(cx, (int64_t)tv.value.i64);
+    case c_m3Type_f32: return JS_NewFloat64(cx, (double)tv.value.f32);
+    case c_m3Type_f64: return JS_NewFloat64(cx, tv.value.f64);
+    default: return JS_UNDEFINED;
+    }
+}
+
+/* wasmGlobalSet(id, name, value): set a mutable global (throws if not). */
+static JSValue js_wasm_globalset(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    if (!w) return JS_ThrowTypeError(cx, "wasmGlobalSet: bad instance");
+    const char *name = JS_ToCString(cx, argv[1]);
+    if (!name) return JS_ThrowTypeError(cx, "wasmGlobalSet: bad name");
+    IM3Global g = m3_FindGlobal(w->mod, name);
+    if (!g) { JS_FreeCString(cx, name); return JS_ThrowTypeError(cx, "no such global"); }
+    JS_FreeCString(cx, name);
+    JSValueConst v = (argc >= 3) ? argv[2] : JS_UNDEFINED;
+    M3TaggedValue tv; tv.type = m3_GetGlobalType(g);
+    switch (tv.type) {
+    case c_m3Type_i32: { int32_t x = 0; JS_ToInt32(cx, &x, v); tv.value.i32 = (uint32_t)x; break; }
+    case c_m3Type_i64: { int64_t x = 0; if (JS_IsBigInt(cx, v)) JS_ToBigInt64(cx, &x, v);
+                         else JS_ToInt64(cx, &x, v); tv.value.i64 = (uint64_t)x; break; }
+    case c_m3Type_f32: { double d = 0; JS_ToFloat64(cx, &d, v); tv.value.f32 = (float)d; break; }
+    case c_m3Type_f64: { double d = 0; JS_ToFloat64(cx, &d, v); tv.value.f64 = d; break; }
+    default: break;
+    }
+    M3Result r = m3_SetGlobal(g, &tv);
+    if (r) return JS_ThrowTypeError(cx, "wasm global set: %s", r);
+    return JS_UNDEFINED;
 }
 
 /* If the memory base has moved since the cached buffer was issued (a grow
@@ -9655,7 +9748,28 @@ static const char JS_PRELUDE[] =
 "      }\n"
 "      var mn = D.wasmMemName(id);\n"
 "      if (mn) ex[mn] = mkMemory(id);\n"
+"      var gns = D.wasmGlobalNames(id);\n"
+"      for (var gi=0;gi<gns.length;gi++) ex[gns[gi]] = mkGlobal(id, gns[gi]);\n"
+"      var tn = D.wasmTableName(id);\n"
+"      if (tn) ex[tn] = mkTable(id);\n"
 "      return { exports: ex, __id: id };\n"
+"    }\n"
+/* WebAssembly.Global bound to an exported global: .value reads/writes the
+ * live global (throws on an immutable set); valueOf for coercion. */
+"    function mkGlobal(id, name){\n"
+"      var o = { valueOf: function(){ return D.wasmGlobalGet(id, name); } };\n"
+"      Object.defineProperty(o, 'value', {\n"
+"        get: function(){ return D.wasmGlobalGet(id, name); },\n"
+"        set: function(v){ D.wasmGlobalSet(id, name, v); } });\n"
+"      return o;\n"
+"    }\n"
+/* WebAssembly.Table bound to an exported table: length + get(i) returns a
+ * callable that does a JS-driven call_indirect through slot i. */
+"    function mkTable(id){\n"
+"      var o = { get: function(i){\n"
+"        return function(){ return D.wasmTableCall(id, i|0, Array.prototype.slice.call(arguments)); }; } };\n"
+"      Object.defineProperty(o, 'length', { get: function(){ return D.wasmTableLen(id); } });\n"
+"      return o;\n"
 "    }\n"
 "    function Module(bytes){ this.__bytes = toAB(bytes); }\n"
 "    function Instance(mod, imp){\n"
@@ -9680,6 +9794,16 @@ static const char JS_PRELUDE[] =
 "      };\n"
 "    }\n"
 "    function Table(desc){ this.length = (desc && desc.initial)||0; }\n"
+/* Standalone WebAssembly.Global (not linked to an instance; holds a value
+ * with a .value getter/setter honoring mutability). */
+"    function Global(desc, init){\n"
+"      this._val = (init !== undefined) ? init : 0;\n"
+"      this._mutable = !!(desc && desc.mutable);\n"
+"    }\n"
+"    Object.defineProperty(Global.prototype, 'value', {\n"
+"      get: function(){ return this._val; },\n"
+"      set: function(v){ if(!this._mutable) throw new TypeError('immutable global'); this._val = v; } });\n"
+"    Global.prototype.valueOf = function(){ return this._val; };\n"
 /* find the WebAssembly.Memory an importObject supplies (any namespace) */
 "    function findImportMem(imp){\n"
 "      if (!imp) return null;\n"
@@ -9736,7 +9860,7 @@ static const char JS_PRELUDE[] =
 "    function RuntimeError(m){ this.message=m; this.name='RuntimeError'; }\n"
 "    function LinkError(m){ this.message=m; this.name='LinkError'; }\n"
 "    g.WebAssembly = { Module: Module, Instance: Instance, Memory: Memory,\n"
-"      Table: Table, instantiate: instantiate, compile: compile,\n"
+"      Table: Table, Global: Global, instantiate: instantiate, compile: compile,\n"
 "      instantiateStreaming: instantiateStreaming, compileStreaming: compileStreaming,\n"
 "      validate: function(b){ try { new Module(b); return true; } catch(e){ return false; } },\n"
 "      CompileError: CompileError, RuntimeError: RuntimeError, LinkError: LinkError };\n"
@@ -9864,6 +9988,12 @@ static int js_ensure(void) {
             {"wasmMemBuffer", js_wasm_membuffer, 1},
             {"wasmMemPages", js_wasm_mempages, 1},
             {"wasmMemGrow", js_wasm_memgrow, 2},
+            {"wasmGlobalNames", js_wasm_globalnames, 1},
+            {"wasmGlobalGet", js_wasm_globalget, 2},
+            {"wasmGlobalSet", js_wasm_globalset, 3},
+            {"wasmTableLen", js_wasm_tablelen, 1},
+            {"wasmTableName", js_wasm_tablename, 1},
+            {"wasmTableCall", js_wasm_tablecall, 3},
             {"wasmFree", js_wasm_free, 1},
         };
         for (unsigned k = 0; k < sizeof(B) / sizeof(B[0]); k++)
@@ -10822,7 +10952,19 @@ static void set_home_page(void) {
         "u[12]=0x61;u[13]=0x1e;u[14]=0;u[15]=0;"
         "L('imp JS->wasm peek(12)='+e3.peek(12));if(e3.peek(12)!==7777)ok=false;"
         "var op=mem.grow(1);L('imp mem.grow(1) old='+op+' size='+e3.size());if(e3.size()!==2)ok=false;"
+        /* fourth module: exported global + table (call_indirect from JS) */
+        "var B4=[0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,3,2,0,0,4,4,1,112,0,2,6,7,"
+        "1,127,1,65,228,0,11,7,21,4,2,102,49,0,0,2,102,50,0,1,1,103,3,0,3,116,98,108,"
+        "1,0,9,8,1,0,65,0,11,2,0,1,10,13,2,5,0,65,239,0,11,5,0,65,222,1,11];"
+        "WebAssembly.instantiate(new Uint8Array(B4),{}).then(function(r4){"
+        "var e4=r4.instance.exports;"
+        "L('global g.value='+e4.g.value);if(e4.g.value!==100)ok=false;"
+        "e4.g.value=250;L('after set g.value='+e4.g.value);if(e4.g.value!==250)ok=false;"
+        "L('table length='+e4.tbl.length);if(e4.tbl.length!==2)ok=false;"
+        "var t0=e4.tbl.get(0)(),t1=e4.tbl.get(1)();"
+        "L('tbl[0]()='+t0+' tbl[1]()='+t1);if(t0!==111||t1!==222)ok=false;"
         "finish();"
+        "},function(er){L('gt inst rejected: '+er);ok=false;finish();});"
         "},function(er){L('imp inst rejected: '+er);ok=false;finish();});"
         "},function(er){L('i64 inst rejected: '+er);ok=false;finish();});"
         "},function(err){L('instantiate rejected: '+err);L('ALL DONE');});"
