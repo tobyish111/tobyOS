@@ -7091,6 +7091,8 @@ static JSValue js_dom_fetchsync(JSContext *cx, JSValueConst t, int argc, JSValue
                         status = req.status;
                         JS_SetPropertyStr(cx, obj, "body",
                             JS_NewStringLen(cx, buf, (size_t)r));
+                        JS_SetPropertyStr(cx, obj, "bodyBytes",
+                            JS_NewArrayBufferCopy(cx, (const uint8_t *)buf, (size_t)r));
                         JS_SetPropertyStr(cx, obj, "url",
                             JS_NewString(cx, req.final_url[0] ? req.final_url : url));
                         have_body = 1;
@@ -9026,6 +9028,11 @@ static const char JS_PRELUDE[] =
 "          headers: new Headers(map),\n"
 "          text: function(){ once(); return Promise.resolve(r.body); },\n"
 "          json: function(){ once(); return Promise.resolve(JSON.parse(r.body)); },\n"
+"          arrayBuffer: function(){ once();\n"
+"            return Promise.resolve(r.bodyBytes ? r.bodyBytes.slice(0) : new ArrayBuffer(0)); },\n"
+"          blob: function(){ once();\n"
+"            return Promise.resolve(new Blob([r.bodyBytes || new ArrayBuffer(0)])); },\n"
+"          get body(){ return __mkBodyStream(r.bodyBytes); },\n"
 "          clone: function(){ return this; }\n"
 "        });\n"
 "      }, method, hdrArr.join('\\r\\n'), body, noCookies);\n"
@@ -9716,6 +9723,82 @@ static const char JS_PRELUDE[] =
 "    }\n"
 "  }\n"
 "  D.setObsCheck(obsCheck);\n"
+/* ---- Encoding + Streams (fetch bodies, binary) -------------------- */
+"  if (!g.TextEncoder){\n"
+"    g.TextEncoder = function(){ this.encoding='utf-8'; };\n"
+"    g.TextEncoder.prototype.encode = function(str){\n"
+"      str = String(str === undefined ? '' : str); var out = [];\n"
+"      for (var i=0;i<str.length;i++){ var c = str.charCodeAt(i);\n"
+"        if (c < 0x80) out.push(c);\n"
+"        else if (c < 0x800) out.push(0xC0|(c>>6), 0x80|(c&0x3F));\n"
+"        else if (c >= 0xD800 && c <= 0xDBFF){ var c2 = str.charCodeAt(++i);\n"
+"          var cp = 0x10000 + ((c&0x3FF)<<10) + (c2&0x3FF);\n"
+"          out.push(0xF0|(cp>>18),0x80|((cp>>12)&0x3F),0x80|((cp>>6)&0x3F),0x80|(cp&0x3F)); }\n"
+"        else out.push(0xE0|(c>>12),0x80|((c>>6)&0x3F),0x80|(c&0x3F)); }\n"
+"      return new Uint8Array(out); };\n"
+"  }\n"
+"  if (!g.TextDecoder){\n"
+"    g.TextDecoder = function(){ this.encoding='utf-8'; };\n"
+"    g.TextDecoder.prototype.decode = function(buf){\n"
+"      if (!buf) return '';\n"
+"      var u = (buf instanceof Uint8Array) ? buf\n"
+"            : (buf.buffer ? new Uint8Array(buf.buffer, buf.byteOffset||0, buf.byteLength)\n"
+"                          : new Uint8Array(buf));\n"
+"      var s = '', i = 0;\n"
+"      while (i < u.length){ var c = u[i++];\n"
+"        if (c < 0x80) s += String.fromCharCode(c);\n"
+"        else if (c >= 0xF0){ var cp = ((c&0x07)<<18)|((u[i++]&0x3F)<<12)|((u[i++]&0x3F)<<6)|(u[i++]&0x3F);\n"
+"          cp -= 0x10000; s += String.fromCharCode(0xD800+(cp>>10),0xDC00+(cp&0x3FF)); }\n"
+"        else if (c >= 0xE0) s += String.fromCharCode(((c&0x0F)<<12)|((u[i++]&0x3F)<<6)|(u[i++]&0x3F));\n"
+"        else s += String.fromCharCode(((c&0x1F)<<6)|(u[i++]&0x3F)); }\n"
+"      return s; };\n"
+"  }\n"
+"  function ReadableStream(src){\n"
+"    var self = this; this._q = []; this._closed = false; this._err = null;\n"
+"    this._src = src || {}; this._started = false;\n"
+"    this._ctl = { enqueue: function(c){ self._q.push(c); },\n"
+"      close: function(){ self._closed = true; },\n"
+"      error: function(e){ self._err = e; self._closed = true; } };\n"
+"  }\n"
+"  ReadableStream.prototype._start = function(){\n"
+"    if (this._started) return; this._started = true;\n"
+"    try { if (typeof this._src.start === 'function') this._src.start(this._ctl); }\n"
+"    catch(e){ this._err = e; this._closed = true; }\n"
+"  };\n"
+"  ReadableStream.prototype.getReader = function(){\n"
+"    var self = this;\n"
+"    return { read: function(){ self._start();\n"
+"        if (!self._q.length && !self._closed && typeof self._src.pull === 'function'){\n"
+"          try { self._src.pull(self._ctl); } catch(e){ self._err=e; self._closed=true; } }\n"
+"        if (self._err) return Promise.reject(self._err);\n"
+"        if (self._q.length) return Promise.resolve({ value: self._q.shift(), done: false });\n"
+"        return Promise.resolve({ value: undefined, done: true }); },\n"
+"      releaseLock: function(){},\n"
+"      cancel: function(){ self._closed = true; return Promise.resolve(); } };\n"
+"  };\n"
+"  ReadableStream.prototype.cancel = function(){ this._closed = true; return Promise.resolve(); };\n"
+"  g.ReadableStream = ReadableStream;\n"
+"  function __mkBodyStream(ab){\n"
+"    var bytes = ab ? new Uint8Array(ab.slice(0)) : new Uint8Array(0);\n"
+"    return new ReadableStream({ start: function(c){\n"
+"      if (bytes.length) c.enqueue(bytes); c.close(); } });\n"
+"  }\n"
+"  if (!g.Blob){\n"
+"    g.Blob = function(parts, opts){ this._parts = parts || [];\n"
+"      this.type = (opts && opts.type) || ''; var sz = 0;\n"
+"      for (var i=0;i<this._parts.length;i++){ var p=this._parts[i];\n"
+"        sz += (p && p.byteLength!==undefined) ? p.byteLength : String(p).length; }\n"
+"      this.size = sz; };\n"
+"    g.Blob.prototype.arrayBuffer = function(){\n"
+"      var u = new Uint8Array(this.size), o = 0;\n"
+"      for (var i=0;i<this._parts.length;i++){ var p=this._parts[i];\n"
+"        if (p instanceof ArrayBuffer){ u.set(new Uint8Array(p), o); o+=p.byteLength; }\n"
+"        else if (p && p.buffer){ u.set(new Uint8Array(p.buffer, p.byteOffset||0, p.byteLength), o); o+=p.byteLength; }\n"
+"        else { var s=String(p); for (var j=0;j<s.length;j++) u[o++]=s.charCodeAt(j)&0xFF; } }\n"
+"      return Promise.resolve(u.buffer); };\n"
+"    g.Blob.prototype.text = function(){ return this.arrayBuffer().then(function(ab){\n"
+"      return new TextDecoder().decode(ab); }); };\n"
+"  }\n"
 /* ---- WebAssembly JS API (wasm3 backend) --------------------------- */
 "  (function(){\n"
 "    function toAB(src){\n"
@@ -10449,6 +10532,11 @@ static int js_pump_all(void) {
                     JS_SetPropertyStr(t->js_cx, obj, "body",
                         JS_NewStringLen(t->js_cx, buf ? buf : "",
                                         (size_t)n2));
+                    /* binary-safe view of the same bytes: text/json read
+                     * `body` (UTF-8), arrayBuffer()/streams read this. */
+                    JS_SetPropertyStr(t->js_cx, obj, "bodyBytes",
+                        JS_NewArrayBufferCopy(t->js_cx,
+                            (const uint8_t *)(buf ? buf : ""), (size_t)n2));
                     /* raw response headers (fetch()/XHR read them; the
                      * prelude parses them + enforces CORS). Empty on the
                      * plain-GET path (no capture). */
@@ -10992,6 +11080,41 @@ static void set_home_page(void) {
         "<p>Autoplay AAC-in-MP4 &mdash; check serial for [med] mp4/aac.</p>"
         "<audio src='http://10.0.2.2:8099/a.m4a' autoplay loop></audio>"
         "</body></html>";
+#endif
+#ifdef STREAM_TEST
+    /* On-screen Streams/binary test: binary-safe arrayBuffer(), a
+     * ReadableStream reader loop over a fetched .wasm, TextEncoder/
+     * Decoder round-trip, and WebAssembly.instantiateStreaming. Serves
+     * add.wasm from the host (10.0.2.2:8099). [strm] lines on serial. */
+    html =
+        "<html><head><title>Streams</title>"
+        "<style>body{background:#fff;color:#111;font-family:monospace}"
+        "#big{font-size:28px;color:#1a73e8}</style></head><body>"
+        "<h1 id=big>Streams: running...</h1><div id=out></div>"
+        "<script>"
+        "function L(s){console.log('[strm] '+s);var d=document.getElementById('out');"
+        "if(d)d.innerHTML+=s+'<br>';}"
+        "var ok=true;var imp={env:{host_mul:function(a,b){return (a*b)|0;}}};"
+        "function fin(){var h=document.getElementById('big');"
+        "if(h)h.textContent=ok?'Streams: ALL PASS':'Streams: FAIL';"
+        "L(ok?'RESULT: ALL PASS':'RESULT: FAIL');L('ALL DONE');}"
+        "var U='http://10.0.2.2:8099/add.wasm';"
+        "fetch(U).then(function(r){return r.arrayBuffer();}).then(function(ab){"
+        "L('arrayBuffer bytes='+ab.byteLength);if(ab.byteLength!==156)ok=false;"
+        "return WebAssembly.instantiate(ab,imp);}).then(function(res){"
+        "var a=res.instance.exports.add(7,35);L('fetched-wasm add(7,35)='+a);if(a!==42)ok=false;"
+        "return fetch(U);}).then(function(r){"
+        "var rd=r.body.getReader();var tot=0;"
+        "function pump(){return rd.read().then(function(x){"
+        "if(x.done){L('reader total bytes='+tot);if(tot!==156)ok=false;return;}"
+        "tot+=x.value.length;return pump();});}return pump();}).then(function(){"
+        "var s='h\\u00e9llo \\u20ac';var e=new TextEncoder().encode(s);"
+        "var d=new TextDecoder().decode(e);L('textcodec len='+e.length+' roundtrip='+(d===s));"
+        "if(d!==s)ok=false;"
+        "return WebAssembly.instantiateStreaming(fetch(U),imp);}).then(function(res){"
+        "var a=res.instance.exports.add(10,20);L('instantiateStreaming add(10,20)='+a);if(a!==30)ok=false;"
+        "fin();}).catch(function(e){L('stream error: '+e);ok=false;fin();});"
+        "</script></body></html>";
 #endif
 
     g_raw_len = 0;
