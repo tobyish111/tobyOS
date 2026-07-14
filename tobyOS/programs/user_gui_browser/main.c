@@ -907,16 +907,20 @@ struct ditem {
 /* Per-node CSS decoration (border-radius already lives in cstyle/ditem;
  * this holds the bulkier gradient + box-shadow params, referenced by an
  * index so cstyle stays lean). Pool reset each style pass. */
+#define GRAD_STOPS 8
 struct deco {
     uint8_t  has_grad;
-    uint8_t  grad_dir;           /* 0 to-bottom, 1 to-right, 2 to-top, 3 to-left */
-    uint8_t  grad_n;             /* number of stops (2..4) */
-    uint32_t grad_col[4];
-    uint8_t  grad_pos[4];        /* 0..100 percent along the axis */
+    uint8_t  grad_dir;           /* 0 to-bottom,1 to-right,2 to-top,3 to-left,
+                                    4 radial, 5 conic */
+    uint8_t  grad_n;             /* number of stops (2..GRAD_STOPS) */
+    uint32_t grad_col[GRAD_STOPS];
+    uint8_t  grad_pos[GRAD_STOPS];  /* 0..100 percent along the axis / turn */
     uint8_t  has_shadow;
     int16_t  sh_dx, sh_dy, sh_spread;
     uint8_t  sh_blur;
     uint32_t sh_col;             /* ARGB (alpha = shadow strength) */
+    uint8_t  has_r4;             /* per-corner border-radius present */
+    uint8_t  r4[4];              /* radius px: TL, TR, BR, BL (255 = 50%) */
 };
 #define DECO_MAX 512
 static struct deco g_deco[DECO_MAX];
@@ -3321,27 +3325,29 @@ static struct deco *deco_of(struct cstyle *st) {
  * into `d`. Returns 1 on success. Angles snap to the nearest axis
  * (v1: axis-aligned gradients). */
 static int parse_linear_gradient(const char *v, int n, struct deco *d) {
-    int radial = 0;
+    int radial = 0, conic = 0, hdr = 15;
     int lg = str_contains(v, n, "linear-gradient", 15);
     if (lg < 0) {
         lg = str_contains(v, n, "radial-gradient", 15);
-        if (lg < 0) return 0;
-        radial = 1;
+        if (lg >= 0) radial = 1;
+        else { lg = str_contains(v, n, "conic-gradient", 14);
+               if (lg < 0) return 0; conic = 1; hdr = 14; }
     }
-    int i = lg + 15;
+    int i = lg + hdr;
     while (i < n && v[i] != '(') i++;
     if (i >= n) return 0;
     i++;
     int e = i;
     int depth = 1;
     while (e < n && depth) { if (v[e] == '(') depth++; else if (v[e] == ')') depth--; if (depth) e++; }
-    d->grad_dir = radial ? 4 : 0;   /* 4 = radial; else default to-bottom */
+    d->grad_dir = radial ? 4 : conic ? 5 : 0;   /* 4 radial, 5 conic */
     d->grad_n = 0;
+    int any_pos = 0;
     /* split on top-level commas */
     int seg0 = i;
     int di = i;
     int first = 1;
-    for (int p = i; p <= e && d->grad_n < 4; p++) {
+    for (int p = i; p <= e && d->grad_n < GRAD_STOPS; p++) {
         if (p < e && v[p] == '(') { int dp = 1; p++; while (p < e && dp) { if (v[p]=='(') dp++; else if (v[p]==')') dp--; p++; } p--; continue; }
         if (p == e || v[p] == ',') {
             const char *s = v + seg0; int sl = p - seg0;
@@ -3363,6 +3369,15 @@ static int parse_linear_gradient(const char *v, int n, struct deco *d) {
                     }
                     /* else it's the first color stop: fall through */
                 }
+                if (conic) {
+                    /* skip a "from <angle>" / "at <position>" prefix. */
+                    if ((sl >= 4 && str_ncasecmp(s, "from", 4) == 0) ||
+                        (sl >= 2 && str_ncasecmp(s, "at", 2) == 0)) {
+                        seg0 = p + 1;
+                        continue;
+                    }
+                    /* else the first color stop: fall through */
+                }
                 if (sl >= 2 && str_ncasecmp(s, "to", 2) == 0) {
                     if (str_contains(s, sl, "right", 5) >= 0) d->grad_dir = 1;
                     else if (str_contains(s, sl, "top", 3) >= 0) d->grad_dir = 2;
@@ -3381,23 +3396,34 @@ static int parse_linear_gradient(const char *v, int n, struct deco *d) {
                 }
                 /* no direction: this seg is the first color, fall through */
             }
-            /* color [percent] */
+            /* color [position]  (position: <pct>% or, for conic, <deg>deg) */
             uint32_t c;
             int cl = sl;
-            /* strip trailing percent token */
             int pct = -1;
             int sp = sl;
             while (sp > 0 && s[sp-1] != ' ') sp--;
-            if (sp > 0 && sl - sp > 0 && s[sl-1] == '%') { pct = atoi_simple(s + sp); cl = sp; while (cl>0 && s[cl-1]==' ') cl--; }
+            if (sp > 0 && sl - sp > 0) {
+                if (s[sl-1] == '%') { pct = atoi_simple(s + sp); }
+                else if (sl - sp >= 4 && str_ncasecmp(s + sl - 3, "deg", 3) == 0) {
+                    int deg = atoi_simple(s + sp);
+                    deg = ((deg % 360) + 360) % 360;
+                    pct = deg * 100 / 360;      /* angle -> fraction of turn */
+                }
+                if (pct >= 0) { cl = sp; while (cl > 0 && s[cl-1] == ' ') cl--; }
+            }
             if (css_color_tok(s, cl, &c)) {
                 int k = d->grad_n++;
                 d->grad_col[k] = c | 0xFF000000u;
-                d->grad_pos[k] = (pct >= 0 && pct <= 100) ? (uint8_t)pct
-                                 : (uint8_t)(d->grad_n == 1 ? 0 : 100);
+                if (pct >= 0 && pct <= 100) { d->grad_pos[k] = (uint8_t)pct; any_pos = 1; }
+                else d->grad_pos[k] = (uint8_t)(d->grad_n == 1 ? 0 : 100);
             }
             seg0 = p + 1;
         }
     }
+    /* No explicit positions: distribute stops evenly (0..100). */
+    if (!any_pos && d->grad_n >= 2)
+        for (int k = 0; k < d->grad_n; k++)
+            d->grad_pos[k] = (uint8_t)(k * 100 / (d->grad_n - 1));
     if (d->grad_n >= 2) { d->has_grad = 1; return 1; }
     return 0;
 }
@@ -3466,7 +3492,8 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
     case CP_BGCOLOR:
     case CP_BG: {
         if (str_contains(v, n, "linear-gradient", 15) >= 0 ||
-            str_contains(v, n, "radial-gradient", 15) >= 0) {
+            str_contains(v, n, "radial-gradient", 15) >= 0 ||
+            str_contains(v, n, "conic-gradient", 14) >= 0) {
             struct deco *dc = deco_of(st);
             if (dc && parse_linear_gradient(v, n, dc)) {
                 /* fallback solid = first stop (also the color used when
@@ -3488,20 +3515,28 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         break;
     }
     case CP_BORDER_RADIUS: {
-        /* first value only (v1: uniform radius). LK_PX == 0, so test the
-         * return code explicitly. 255 = sentinel "half the shorter side"
-         * so border-radius:50% renders pills/circles. */
-        struct vtok rt;
-        int rp = 0;
-        if (vtok_next(v, n, &rp, &rt)) {
+        /* 1-4 space-separated values: TL [TR [BR [BL]]] (CSS fill order).
+         * LK_PX == 0, so test the return code explicitly. 255 = sentinel
+         * "half the shorter side" so border-radius:50% renders circles. */
+        uint8_t rv[4]; int rn = 0;
+        struct vtok rt; int rp = 0;
+        while (rn < 4 && vtok_next(v, n, &rp, &rt)) {
             int r = 0;
             int k = css_len_tok(rt.s, rt.len, st->px, &r);
-            if (k == LK_PCT) st->radius = 255;
-            else if (k == LK_PX) {
-                if (r < 0) r = 0;
-                if (r > 250) r = 250;
-                st->radius = (uint8_t)r;
-            }
+            if (k == LK_PCT) rv[rn++] = 255;
+            else if (k == LK_PX) { if (r < 0) r = 0; if (r > 250) r = 250; rv[rn++] = (uint8_t)r; }
+            else break;
+        }
+        if (rn == 0) break;
+        /* CSS fill: 1->all, 2->(TL/BR, TR/BL), 3->(TL, TR/BL, BR). */
+        uint8_t tl=rv[0], tr=rv[0], br=rv[0], bl=rv[0];
+        if (rn == 2) { tr = bl = rv[1]; }
+        else if (rn == 3) { tr = bl = rv[1]; br = rv[2]; }
+        else if (rn == 4) { tr = rv[1]; br = rv[2]; bl = rv[3]; }
+        st->radius = tl;                          /* uniform-path fallback */
+        if (rn >= 2 && !(tl == tr && tr == br && br == bl)) {
+            struct deco *dc = deco_of(st);
+            if (dc) { dc->has_r4 = 1; dc->r4[0]=tl; dc->r4[1]=tr; dc->r4[2]=br; dc->r4[3]=bl; }
         }
         break;
     }
@@ -5826,14 +5861,14 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
                   sh_i = (int)(sh - E->items); }
     }
     int bg_i = -1;
-    if ((st->bg >> 24) || st->radius ||
-        (st->deco >= 0 && g_deco[st->deco].has_grad)) {
+    int has_deco_paint = (st->deco >= 0 &&
+                          (g_deco[st->deco].has_grad || g_deco[st->deco].has_r4));
+    if ((st->bg >> 24) || st->radius || has_deco_paint) {
         bg_i = emit_rect(bx, by, bbw, 0, st->bg);   /* height patched below */
         if (bg_i >= 0) {
             E->items[bg_i].node = ni;               /* clicks on the box */
             E->items[bg_i].radius = st->radius;
-            E->items[bg_i].deco = (st->deco >= 0 && g_deco[st->deco].has_grad)
-                                      ? st->deco : -1;
+            E->items[bg_i].deco = has_deco_paint ? st->deco : -1;
         }
     }
 
@@ -13672,6 +13707,26 @@ static int rbox_sdf(int px, int py, int w, int h, int r) {
     return outside + inside - r;
 }
 
+/* Per-corner rounded-rect SDF: pick the radius of the corner quadrant the
+ * pixel falls in (r4 = TL, TR, BR, BL). */
+static int rbox_sdf4(int px, int py, int w, int h, const int *r4) {
+    int left = (px < w / 2), top = (py < h / 2);
+    int r = top ? (left ? r4[0] : r4[1]) : (left ? r4[3] : r4[2]);
+    return rbox_sdf(px, py, w, h, r);
+}
+
+/* Integer atan2 -> degrees [0,360). Linear per-octant approximation
+ * (a few degrees of error, plenty for a gradient). */
+static int iatan2_deg(long y, long x) {
+    if (x == 0 && y == 0) return 0;
+    long ax = x < 0 ? -x : x, ay = y < 0 ? -y : y;
+    int a = (ax >= ay) ? (int)(45 * ay / ax) : 90 - (int)(45 * ax / ay);
+    if (x >= 0 && y >= 0) return a;             /* Q1 */
+    if (x <  0 && y >= 0) return 180 - a;       /* Q2 */
+    if (x <  0 && y <  0) return 180 + a;       /* Q3 */
+    return 360 - a;                             /* Q4 */
+}
+
 /* Gradient color at local (lx,ly) within a w x h box (ARGB, opaque). */
 static uint32_t grad_color(const struct deco *dc, int lx, int ly, int w, int h) {
     int t;
@@ -13685,6 +13740,12 @@ static uint32_t grad_color(const struct deco *dc, int lx, int ly, int w, int h) 
         long r2 = (long)w * w + (long)h * h;             /* (2*corner_dist)^2 */
         t = r2 ? isqrt32((uint32_t)(d2 * 10000 / r2)) : 0;  /* sqrt(d2/r2)*100 */
         if (t > 100) t = 100;
+        break;
+    }
+    case 5: {                                            /* conic (from top, CW) */
+        long dx = 2L * lx - w, dy = 2L * ly - h;
+        int deg = iatan2_deg(dx, -dy);                   /* 0 at top, CW */
+        t = deg * 100 / 360;
         break;
     }
     default: t = h > 1 ? ly * 100 / (h - 1) : 0; break;           /* to bottom */
@@ -13708,6 +13769,16 @@ static void paint_deco_rect(int sx, int sy, int w, int h, int radius, int deco,
     if (r > w / 2) r = w / 2;
     if (r > h / 2) r = h / 2;
     if (r < 0) r = 0;
+    /* per-corner radii (resolve 255=50%, clamp to half-extent) */
+    int r4[4]; int use_r4 = (dc && dc->has_r4);
+    if (use_r4) {
+        int hw = w / 2, hh = h / 2;
+        for (int k = 0; k < 4; k++) {
+            int v = (dc->r4[k] == 255) ? (w < h ? w : h) / 2 : dc->r4[k];
+            if (v > hw) v = hw; if (v > hh) v = hh; if (v < 0) v = 0;
+            r4[k] = v;
+        }
+    }
     uint32_t sc = 0xFF000000u | (solid & 0xFFFFFF);
     for (int yy = 0; yy < h; yy++) {
         int py = sy + yy;
@@ -13721,7 +13792,9 @@ static void paint_deco_rect(int sx, int sy, int w, int h, int radius, int deco,
             int px = x0 + i;
             uint32_t col = (dc && dc->has_grad) ? grad_color(dc, px - sx, yy, w, h) : sc;
             int cov = 256;
-            if (r > 0) { int s = rbox_sdf(px - sx, yy, w, h, r);
+            if (use_r4) { int s = rbox_sdf4(px - sx, yy, w, h, r4);
+                          cov = 128 - s * 256; if (cov < 0) cov = 0; if (cov > 256) cov = 256; }
+            else if (r > 0) { int s = rbox_sdf(px - sx, yy, w, h, r);
                          cov = 128 - s * 256; if (cov < 0) cov = 0; if (cov > 256) cov = 256; }
             uint32_t a = ((col >> 24) * (uint32_t)cov) / 256;
             g_layer_row[i] = (a << 24) | (col & 0xFFFFFF);
