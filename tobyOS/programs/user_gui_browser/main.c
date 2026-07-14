@@ -1017,7 +1017,8 @@ struct jsws {
 #define MEDIA_MAX        2            /* media elements per tab */
 #define MEDIA_FETCH_CAP  (4u << 20)   /* per-file download cap */
 #define MEDIA_FRAMES_MAX 512
-#define MEDIA_PCM_CARRY  (1152 * 2)   /* int16s: one MP3 frame, stereo */
+#define MEDIA_PCM_CARRY  (2048 * 2)   /* int16s: one MP3/AAC frame, stereo
+                                       * (AAC-LC 1024, SBR/HE-AAC 2048) */
 
 struct media_el {
     int      used;
@@ -1046,6 +1047,14 @@ struct media_el {
     long     apos;                /* read offset into data */
     int16_t  carry[MEDIA_PCM_CARRY];  /* decoded-but-unwritten PCM */
     int      carry_off, carry_len;    /* bytes */
+    /* audio: AAC-LC from an MP4 mp4a track (raw AUs, not ADTS). The AU
+     * table indexes into `data`; the decoder is configured from the esds
+     * AudioSpecificConfig. */
+    void    *aac;                 /* toby_aac_decoder_t* */
+    long    *aud_off;             /* per-AU file offset (heap) */
+    int     *aud_len;             /* per-AU byte length (heap) */
+    int      naud, aud_cur;
+    int      aac_rate, aac_ch;
 };
 
 /* Stage 13F: DOM mutation log for MutationObserver delivery. Each JS
@@ -10972,6 +10981,18 @@ static void set_home_page(void) {
         "</script>"
         "</body></html>";
 #endif
+#ifdef MP4AUDIO_TEST
+    /* On-screen MP4 audio test: an autoplay <audio> pointing at an AAC
+     * M4A served from the host (10.0.2.2:8099). The browser fetches it,
+     * demuxes the mp4a track, decodes the AAC AUs (Helix), and opens a
+     * kernel audio stream -- watch serial for "[med] mp4/aac ..." lines. */
+    html =
+        "<html><head><title>MP4 audio</title></head><body>"
+        "<h1 style='color:#1a73e8;font-size:28px'>MP4 audio test</h1>"
+        "<p>Autoplay AAC-in-MP4 &mdash; check serial for [med] mp4/aac.</p>"
+        "<audio src='http://10.0.2.2:8099/a.m4a' autoplay loop></audio>"
+        "</body></html>";
+#endif
 
     g_raw_len = 0;
     while (html[g_raw_len]) { g_raw[g_raw_len] = html[g_raw_len]; g_raw_len++; }
@@ -11168,6 +11189,10 @@ static void tab_media_free(struct tab *t) {
         if (!m->used) continue;
         if (m->data) { free(m->data); m->data = NULL; }
         if (m->mp3)  { toby_mp3_decode_free((toby_mp3_decoder_t *)m->mp3); m->mp3 = NULL; }
+        if (m->aac)  { toby_aac_decode_free((toby_aac_decoder_t *)m->aac); m->aac = NULL; }
+        if (m->aud_off) { free(m->aud_off); m->aud_off = NULL; }
+        if (m->aud_len) { free(m->aud_len); m->aud_len = NULL; }
+        m->naud = 0; m->aud_cur = 0;
         if (m->vdec) { video_decoder_destroy((struct video_decoder *)m->vdec); m->vdec = NULL; }
         if (m->audio_fd >= 0) { sys_audio_close(m->audio_fd); m->audio_fd = -1; }
         m->used = 0;
@@ -12055,6 +12080,147 @@ static int media_demux_mp4(struct media_el *m) {
     return m->nframes > 0 ? 0 : -1;
 }
 
+/* ---- MP4 audio (mp4a / AAC-LC) demux ------------------------------- *
+ * Walk the box tree to the 'soun' track's sample table, pull the
+ * AudioSpecificConfig out of stsd->mp4a->esds (audioObjectType +
+ * samplingFrequencyIndex + channelConfiguration), and build a table of
+ * raw AAC access units (file offset + length) from stsc/stco/stsz. The
+ * AAC pump feeds each AU to the vendored Helix decoder (raw mode). */
+
+static const uint32_t g_aac_freq[16] = {
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+    16000, 12000, 11025,  8000,  7350,     0,     0,     0
+};
+
+/* Find the DecoderSpecificInfo (tag 0x05) payload inside an esds box.
+ * esds = version/flags(4) then a descriptor tree: ES_Descriptor(0x03) ->
+ * DecoderConfigDescriptor(0x04) -> DecSpecificInfo(0x05). Each descriptor
+ * is tag(1) + length(1-4 bytes, 7 bits each, high bit = continue). */
+static const uint8_t *esds_find_dsi(const uint8_t *p, long len, long *out_len) {
+    long o = 4;                                /* skip version + flags */
+    while (o < len) {
+        uint8_t tag = p[o++];
+        long sz = 0; int b, cnt = 0;
+        do { if (o >= len) return NULL; b = p[o++]; sz = (sz << 7) | (b & 0x7f); }
+        while ((b & 0x80) && ++cnt < 4);
+        if (tag == 0x05) {                     /* DecSpecificInfo = the ASC */
+            if (o + sz > len) sz = len - o;
+            *out_len = sz;
+            return p + o;
+        }
+        if (tag == 0x03) o += 3;               /* ES_Descriptor: ES_ID(2)+flags(1) */
+        else if (tag == 0x04) o += 13;         /* DecoderConfig: object/stream/bufs */
+        /* else: descend by falling through to the next tag */
+    }
+    return NULL;
+}
+
+static int media_demux_mp4_audio(struct media_el *m) {
+    const uint8_t *d = m->data;
+    long n = m->dlen;
+    if (n < 16 || !m4(d + 4, "ftyp")) return -1;
+    long moov_len = 0;
+    const uint8_t *moov = mp4_find(d, n, "moov", &moov_len);
+    if (!moov) return -1;
+
+    /* Find the audio trak (mdia/hdlr handler == 'soun'). */
+    const uint8_t *stbl = NULL; long stbl_len = 0;
+    long o = 0;
+    while (o + 8 <= moov_len) {
+        long tl;
+        const uint8_t *trak = mp4_find(moov + o, moov_len - o, "trak", &tl);
+        if (!trak) break;
+        long ml;
+        const uint8_t *mdia = mp4_find(trak, tl, "mdia", &ml);
+        if (mdia) {
+            long hl;
+            const uint8_t *hdlr = mp4_find(mdia, ml, "hdlr", &hl);
+            if (hdlr && hl >= 12 && m4(hdlr + 8, "soun")) {
+                long minfl;
+                const uint8_t *minf = mp4_find(mdia, ml, "minf", &minfl);
+                if (minf) stbl = mp4_find(minf, minfl, "stbl", &stbl_len);
+                if (stbl) break;
+            }
+        }
+        o = (trak - moov) + tl;
+    }
+    if (!stbl) return -1;
+
+    /* stsd -> mp4a sample entry -> esds -> AudioSpecificConfig. */
+    long stsdl;
+    const uint8_t *stsd = mp4_find(stbl, stbl_len, "stsd", &stsdl);
+    if (!stsd || stsdl < 8) return -1;
+    const uint8_t *entries = stsd + 8;
+    long mp4al;
+    const uint8_t *mp4a = mp4_find(entries, stsdl - 8, "mp4a", &mp4al);
+    if (!mp4a || mp4al < 28) return -1;
+    /* AudioSampleEntry: 28-byte header (incl. channelcount/samplerate),
+     * then child boxes -- esds among them. */
+    long esdsl;
+    const uint8_t *esds = mp4_find(mp4a + 28, mp4al - 28, "esds", &esdsl);
+    if (!esds || esdsl < 5) return -1;
+    long ascl;
+    const uint8_t *asc = esds_find_dsi(esds, esdsl, &ascl);
+    if (!asc || ascl < 2) return -1;
+    /* ASC: aot(5) freqIdx(4) chanCfg(4). */
+    int aot     = (asc[0] >> 3) & 0x1f;
+    int freqIdx = ((asc[0] & 0x07) << 1) | (asc[1] >> 7);
+    int chan    = (asc[1] >> 3) & 0x0f;
+    if (aot != 2) return -1;                   /* AAC-LC only */
+    m->aac_rate = (freqIdx < 16) ? (int)g_aac_freq[freqIdx] : 0;
+    m->aac_ch   = chan;
+    if (m->aac_rate <= 0 || m->aac_ch <= 0 || m->aac_ch > 2) return -1;
+
+    /* Build the AU table from stsc/stco/stsz (same walk as the video
+     * demux, minus the NAL rewriting -- audio samples are raw AUs). */
+    long stszl, stscl, stcol;
+    const uint8_t *stsz = mp4_find(stbl, stbl_len, "stsz", &stszl);
+    const uint8_t *stsc = mp4_find(stbl, stbl_len, "stsc", &stscl);
+    const uint8_t *stco = mp4_find(stbl, stbl_len, "stco", &stcol);
+    int co64 = 0;
+    if (!stco) { stco = mp4_find(stbl, stbl_len, "co64", &stcol); co64 = 1; }
+    if (!stsz || !stsc || !stco || stszl < 12 || stscl < 8 || stcol < 8)
+        return -1;
+
+    uint32_t samp_size0 = rd32be(stsz + 4);
+    uint32_t nsamp = rd32be(stsz + 8);
+    uint32_t nchunks = rd32be(stco + 4);
+    uint32_t nsc = rd32be(stsc + 4);
+    if (nsamp == 0 || nsamp > 200000) return -1;
+
+    m->aud_off = (long *)malloc((unsigned long)nsamp * sizeof(long));
+    m->aud_len = (int  *)malloc((unsigned long)nsamp * sizeof(int));
+    if (!m->aud_off || !m->aud_len) return -1;
+    m->naud = 0; m->aud_cur = 0;
+
+    uint32_t sc_idx = 0, chunk = 1, samp_in_chunk = 0;
+    uint32_t spc = (nsc > 0) ? rd32be(stsc + 8 + 4) : 1;
+    long sample_off = 0;
+    uint32_t stsz_p = 12;
+    for (uint32_t s = 0; s < nsamp; s++) {
+        while (sc_idx + 1 < nsc) {
+            uint32_t next_first = rd32be(stsc + 8 + (sc_idx + 1) * 12);
+            if (chunk >= next_first) { sc_idx++; spc = rd32be(stsc + 8 + sc_idx * 12 + 4); }
+            else break;
+        }
+        if (samp_in_chunk == 0) {
+            if (chunk > nchunks) break;
+            sample_off = co64 ? (long)rd32be(stco + 8 + (chunk - 1) * 8 + 4)
+                              : (long)rd32be(stco + 8 + (chunk - 1) * 4);
+        }
+        uint32_t ssz = samp_size0 ? samp_size0 : rd32be(stsz + stsz_p);
+        stsz_p += samp_size0 ? 0 : 4;
+        if (sample_off < 0 || sample_off + (long)ssz > n) break;
+        m->aud_off[m->naud] = sample_off;
+        m->aud_len[m->naud] = (int)ssz;
+        m->naud++;
+        sample_off += (long)ssz;
+        samp_in_chunk++;
+        if (samp_in_chunk >= spc) { samp_in_chunk = 0; chunk++; }
+    }
+    return m->naud > 0 ? 0 : -1;
+}
+
 /* MP3 sniff: ID3v2 tag or an MPEG audio sync word. */
 static int media_sniff_mp3(const uint8_t *d, long n) {
     if (n < 4) return 0;
@@ -12091,6 +12257,33 @@ static void med_log(const char *what, int a, int b) {
     sys_write(1, m, (unsigned long)p);
 }
 
+/* Init the AAC decoder for an already-demuxed MP4 audio track (raw AUs). */
+static int media_init_mp4_audio_dec(struct media_el *m) {
+    m->aac = toby_aac_decode_init();
+    if (!m->aac) return -1;
+    /* profile 2 = AAC-LC (verified by the demux); raw block params. */
+    if (toby_aac_decode_set_raw((toby_aac_decoder_t *)m->aac, 2,
+                                m->aac_rate, m->aac_ch) != 0) {
+        toby_aac_decode_free((toby_aac_decoder_t *)m->aac);
+        m->aac = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+/* Best-effort: attach the MP4's AAC audio track alongside its video. A
+ * missing/unsupported audio track just leaves the video silent. */
+static void media_init_mp4_audio(struct media_el *m) {
+    if (media_demux_mp4_audio(m) != 0) return;
+    if (media_init_mp4_audio_dec(m) != 0) {
+        if (m->aud_off) { free(m->aud_off); m->aud_off = NULL; }
+        if (m->aud_len) { free(m->aud_len); m->aud_len = NULL; }
+        m->naud = 0;
+        return;
+    }
+    med_log("mp4/aac track AUs rate", m->naud, m->aac_rate);
+}
+
 /* Fetch completion: sniff the container and ready the element. */
 static void media_ready(struct media_el *m) {
     /* MP4 (H.264) first: ftyp box at offset 4. */
@@ -12105,6 +12298,13 @@ static void media_ready(struct media_el *m) {
                                  m->vcfg, (size_t)m->vcfg_len, &vf);
         }
         med_log("mp4/h264 frames/period", m->nframes, (int)m->frame_ms);
+        media_init_mp4_audio(m);       /* + AAC track if the MP4 has one */
+        m->state = 1;
+    } else if (!m->is_video && m->dlen > 12 && m4(m->data + 4, "ftyp") &&
+               media_demux_mp4_audio(m) == 0) {
+        /* Audio-only MP4/M4A: AAC track, no video. */
+        if (media_init_mp4_audio_dec(m) != 0) { m->state = -1; return; }
+        med_log("mp4/aac AUs rate", m->naud, m->aac_rate);
         m->state = 1;
     } else if (m->is_video && media_demux_avi(m) == 0) {
         /* Codec sniff on the first frame chunk: an Annex-B start code
@@ -12246,6 +12446,54 @@ static int media_audio_pump(struct media_el *m) {
     return work;
 }
 
+/* AAC (MP4 mp4a) analogue of media_audio_pump: write leftover PCM, then
+ * decode raw AUs from the sample table until the ring pushes back. For a
+ * <video> this runs alongside the H.264 pump so audio + video play
+ * together; the ring's own pacing keeps them roughly in sync. */
+static int media_aac_pump(struct media_el *m) {
+    if (!m->aac || !m->aud_off) return 0;
+    int work = 0;
+    for (int guard = 0; guard < 24; guard++) {
+        if (m->carry_len > 0) {
+            if (m->audio_fd < 0) break;
+            long w = sys_audio_write(m->audio_fd,
+                                     (const uint8_t *)m->carry + m->carry_off,
+                                     (unsigned long)m->carry_len);
+            if (w <= 0) break;                 /* ring full: next pass */
+            m->carry_off += (int)w;
+            m->carry_len -= (int)w;
+            work = 1;
+            if (m->carry_len > 0) break;
+            continue;
+        }
+        if (m->aud_cur >= m->naud) break;
+        int samples = 0, ch = 0, rate = 0;
+        toby_aac_decode_frame((toby_aac_decoder_t *)m->aac,
+                              m->data + m->aud_off[m->aud_cur],
+                              (size_t)m->aud_len[m->aud_cur],
+                              m->carry, &samples, &ch, &rate);
+        m->aud_cur++;                          /* one AU per table entry */
+        if (samples > 0 && ch > 0 && ch <= 2) {
+            if (m->audio_fd < 0) {
+                if (rate <= 0) rate = m->aac_rate;
+                m->audio_fd = (int)sys_audio_open((uint32_t)rate, ch,
+                                                  AUDIO_FMT_PCM16);
+                med_log("mp4/aac stream fd/rate", m->audio_fd, rate);
+                if (m->audio_fd < 0) { m->playing = 0; return work; }
+            }
+            m->carry_off = 0;
+            m->carry_len = samples * ch * 2;
+            work = 1;
+        }
+    }
+    if (m->aud_cur >= m->naud && m->carry_len == 0) {
+        if (m->loop) m->aud_cur = 0;
+        /* else: let the video pump decide when playback ends. */
+        else if (!m->is_video) m->playing = 0;
+    }
+    return work;
+}
+
 /* Main-loop tick: advance the ACTIVE tab's playing media. */
 static int media_pump(void) {
     int work = 0;
@@ -12255,6 +12503,9 @@ static int media_pump(void) {
         struct media_el *m = &cur->media[k];
         if (!m->used || m->state != 1 || !m->playing) continue;
         if (m->is_video) {
+            /* Feed audio every tick (independent of the video frame
+             * clock), else it would starve between frames. */
+            if (m->aac) work |= media_aac_pump(m);
             if (m->nframes <= 0 || now < m->next_ms) continue;
             struct img *im = (m->img >= 0 && m->img < g_nimages)
                                  ? &g_images[m->img] : NULL;
@@ -12323,8 +12574,10 @@ static int media_pump(void) {
             m->next_ms = (due > now - 4 * m->frame_ms) ? due
                                                        : now + m->frame_ms;
             work = 1;
+        } else if (m->aac) {
+            work |= media_aac_pump(m);         /* audio-only MP4/M4A */
         } else {
-            work |= media_audio_pump(m);
+            work |= media_audio_pump(m);       /* MP3 */
         }
     }
     if (repaint) tk_redraw(&win);
