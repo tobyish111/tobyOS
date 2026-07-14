@@ -34,7 +34,11 @@ on-screen ("WASM: ALL PASS") and on the serial console:
 [wasmjs] mem_sum(20,22)=42
 [wasmjs] call_host(6,7)=84       ; wasm called back into a JS function
 [wasmjs] fmul(1.5,2.0)=3
-[wasmjs] mem[0]=20 (buflen=65536); JS read wasm linear memory
+[wasmjs] mem.grow(2) old pages=1 ; JS grows wasm linear memory
+[wasmjs] old buffer detached? byteLength=0
+[wasmjs] post-grow buflen=196608 ; 1 -> 3 pages
+[wasmjs] mem[0] survived grow=20 ; data preserved across the realloc
+[wasmjs] grown region [100000]=77; new region writable, reflects into wasm
 [wasmjs] RESULT: ALL PASS
 ```
 
@@ -93,6 +97,18 @@ on-screen ("WASM: ALL PASS") and on the serial console:
   access (after an export has run), rather than snapshotting at
   instantiate time.
 
+- **`memory.grow` (JS + wasm-internal).** wasm3's `memory.grow` opcode and
+  `WebAssembly.Memory.prototype.grow(n)` both drive the same
+  `ResizeMemory` (a realloc that preserves contents but *moves the base*).
+  The native side caches the aliasing `ArrayBuffer` per instance keyed on
+  its base pointer: `.buffer` keeps a stable identity between grows, and a
+  grow **detaches** the old buffer (via `JS_DetachArrayBuffer`) so stale JS
+  views fault instead of reading freed memory. A wasm-internal grow during
+  `wasmCall` is caught by re-checking the base after the call
+  (`wasm_sync_membuf`), so the required "re-read `mem.buffer` after a grow"
+  pattern is safe. Standalone `new WebAssembly.Memory(...)` (used for
+  imported memory, not yet linked) grows a plain copied `ArrayBuffer`.
+
 - **Import layout in the trampoline.** wasm3's raw-call `sp[]` holds the
   result slots first (`nrets`), then the argument slots (`nargs`); each is
   a 64-bit slot with f32 in the low 32 bits.
@@ -103,7 +119,10 @@ on-screen ("WASM: ALL PASS") and on the serial console:
 
 ## Known limits
 
-- No `memory.grow()` — the aliasing `ArrayBuffer` assumes a stable base.
+- **Imported memory not linked.** A module that *imports* its memory
+  (`(import "env" "memory" ...)`, some Emscripten builds) isn't yet fed a
+  JS-created `WebAssembly.Memory`. Modules that *export* their own memory
+  (the common case, incl. `ALLOW_MEMORY_GROWTH`) work, grow included.
 - `instantiateStreaming`/`compileStreaming` best-effort via `Response`;
   binary-safe network fetch of `.wasm` is a separate transport concern.
 - `i64` marshals through JS numbers (no BigInt yet).

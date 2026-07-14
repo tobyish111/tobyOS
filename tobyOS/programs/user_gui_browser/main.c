@@ -7991,6 +7991,13 @@ struct wasm_inst {
     unsigned long   nbytes;
     int             nimports;
     struct wasm_import imports[WASM_MAX_IMPORTS];
+    /* the last aliasing ArrayBuffer handed to JS + the memory base it was
+     * issued over; when the base moves (memory.grow reallocs), the old
+     * buffer is detached so stale JS views throw instead of reading freed
+     * memory -- matching the WebAssembly.Memory grow semantics. */
+    JSValue         mem_buf;
+    int             has_mem_buf;
+    uint8_t        *mem_base;
 };
 
 static struct wasm_inst g_wasm[WASM_MAX_INSTANCES];
@@ -8046,8 +8053,21 @@ static void wasm_type_char(int t, char *out) {
                  default: *out='v'; break; }
 }
 
+/* Drop the cached aliasing ArrayBuffer (detaching it in JS if requested,
+ * so any live JS view over the old memory base throws on access). */
+static void wasm_drop_membuf(struct wasm_inst *w, int detach) {
+    if (!w->has_mem_buf) return;
+    if (detach) JS_DetachArrayBuffer(w->cx, w->mem_buf);
+    JS_FreeValue(w->cx, w->mem_buf);
+    w->has_mem_buf = 0;
+    w->mem_base = NULL;
+}
+
+static void wasm_sync_membuf(struct wasm_inst *w);   /* defined below */
+
 static void wasm_inst_free(struct wasm_inst *w) {
     if (!w->used) return;
+    wasm_drop_membuf(w, 0);
     for (int i = 0; i < w->nimports; i++)
         if (w->imports[i].has_fn) JS_FreeValue(w->imports[i].cx, w->imports[i].fn);
     if (w->rt)  m3_FreeRuntime(w->rt);     /* also frees the loaded module */
@@ -8206,6 +8226,9 @@ static JSValue js_wasm_call(JSContext *cx, JSValueConst t, int argc, JSValueCons
 
     r = m3_Call(f, na, aptr);
     if (r) return JS_ThrowInternalError(cx, "wasm trap: %s", r);
+    /* the call may have grown memory internally (memory.grow), moving the
+     * base -- detach the stale cached buffer so a re-read issues a fresh one. */
+    wasm_sync_membuf(w);
 
     if (m3_GetRetCount(f) < 1) return JS_UNDEFINED;
     uint64_t ret = 0; const void *rptr[1] = { &ret };
@@ -8221,8 +8244,19 @@ static JSValue js_wasm_call(JSContext *cx, JSValueConst t, int argc, JSValueCons
     }
 }
 
+/* If the memory base has moved since the cached buffer was issued (a grow
+ * reallocated it), detach the stale buffer so JS views over it fault. */
+static void wasm_sync_membuf(struct wasm_inst *w) {
+    if (!w || !w->has_mem_buf) return;
+    uint32_t sz = 0;
+    uint8_t *mp = m3_GetMemory(w->rt, &sz, 0);
+    if (mp != w->mem_base) wasm_drop_membuf(w, 1);
+}
+
 /* wasmMemBuffer(id) -> ArrayBuffer aliasing the module's linear memory
- * (writes reflect into wasm). Valid until the memory grows (unsupported). */
+ * (writes reflect into wasm). Cached so its identity is stable between
+ * grows; a grow detaches it and the next call issues a fresh one over the
+ * new base. */
 static JSValue js_wasm_membuffer(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
     (void)t;
     struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
@@ -8230,9 +8264,36 @@ static JSValue js_wasm_membuffer(JSContext *cx, JSValueConst t, int argc, JSValu
     uint32_t sz = 0;
     uint8_t *mp = m3_GetMemory(w->rt, &sz, 0);
     if (!mp || !sz) return JS_NULL;
+    if (w->has_mem_buf) {
+        if (w->mem_base == mp) return JS_DupValue(cx, w->mem_buf);
+        wasm_drop_membuf(w, 1);            /* memory moved: detach the old */
+    }
     /* free_func NULL: the buffer aliases wasm-owned memory; QuickJS must
      * not free it. */
-    return JS_NewArrayBuffer(cx, mp, sz, NULL, NULL, 0);
+    JSValue buf = JS_NewArrayBuffer(cx, mp, sz, NULL, NULL, 0);
+    w->mem_buf = JS_DupValue(cx, buf);
+    w->has_mem_buf = 1;
+    w->mem_base = mp;
+    return buf;
+}
+
+/* wasmMemPages(id) -> current linear-memory size in 64 KiB pages. */
+static JSValue js_wasm_mempages(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    return JS_NewInt32(cx, w ? toby_wasm_mem_pages(w->rt) : 0);
+}
+
+/* wasmMemGrow(id, deltaPages) -> previous page count, or -1 if it can't
+ * grow. Detaches the cached ArrayBuffer (the realloc moves the base). */
+static JSValue js_wasm_memgrow(JSContext *cx, JSValueConst t, int argc, JSValueConst *argv) {
+    (void)t;
+    struct wasm_inst *w = wasm_get(argc >= 1 ? jsi(cx, argv[0]) : -1);
+    if (!w) return JS_NewInt32(cx, -1);
+    int delta = (argc >= 2) ? jsi(cx, argv[1]) : 0;
+    int old = toby_wasm_mem_grow(w->rt, delta);
+    if (old >= 0) wasm_drop_membuf(w, 1);
+    return JS_NewInt32(cx, old);
 }
 
 /* wasmFree(id): release an instance (prelude calls this if a page drops it). */
@@ -9548,6 +9609,21 @@ static const char JS_PRELUDE[] =
 "        return undefined;\n"
 "      };\n"
 "    }\n"
+/* A WebAssembly.Memory bound to instance id: buffer aliases wasm linear
+ * memory (getter, so a grow's new base is picked up on re-read); grow(n)
+ * resizes and returns the previous size in pages. */
+"    function mkMemory(id){\n"
+"      var m = {\n"
+"        grow: function(delta){\n"
+"          var old = D.wasmMemGrow(id, delta|0);\n"
+"          if (old < 0) throw new RangeError('wasm memory grow failed');\n"
+"          return old;\n"
+"        }\n"
+"      };\n"
+"      Object.defineProperty(m, 'buffer',\n"
+"        { get: function(){ return D.wasmMemBuffer(id) || new ArrayBuffer(0); } });\n"
+"      return m;\n"
+"    }\n"
 "    function buildInstance(id){\n"
 "      var ex = {};\n"
 "      var names = D.wasmExportNames(id);\n"
@@ -9556,13 +9632,7 @@ static const char JS_PRELUDE[] =
 "          return D.wasmCall(id, nm, Array.prototype.slice.call(arguments)); }; })(names[i]);\n"
 "      }\n"
 "      var mn = D.wasmMemName(id);\n"
-"      if (mn){\n"
-/* buffer is a getter: wasm3 allocates linear memory lazily, so fetch the
- * live aliasing ArrayBuffer on access (valid until the memory grows). */
-"        ex[mn] = {};\n"
-"        Object.defineProperty(ex[mn], 'buffer',\n"
-"          { get: function(){ return D.wasmMemBuffer(id) || new ArrayBuffer(0); } });\n"
-"      }\n"
+"      if (mn) ex[mn] = mkMemory(id);\n"
 "      return { exports: ex, __id: id };\n"
 "    }\n"
 "    function Module(bytes){ this.__bytes = toAB(bytes); }\n"
@@ -9570,9 +9640,22 @@ static const char JS_PRELUDE[] =
 "      var id = D.wasmInstantiate(mod.__bytes, mkResolver(imp));\n"
 "      var bi = buildInstance(id); this.exports = bi.exports; this.__id = id;\n"
 "    }\n"
+/* Standalone WebAssembly.Memory (not yet bound to an instance; imported
+ * memory linking is a follow-up). Backed by a plain ArrayBuffer that grow
+ * rebuilds + copies, so the JS-facing API works even unlinked. */
 "    function Memory(desc){\n"
-"      var n = (desc && desc.initial) ? desc.initial : 1;\n"
-"      this.buffer = new ArrayBuffer(n*65536);\n"
+"      this._pages = (desc && desc.initial) ? (desc.initial|0) : 0;\n"
+"      this._max = (desc && desc.maximum) ? (desc.maximum|0) : 65536;\n"
+"      this.buffer = new ArrayBuffer(this._pages*65536);\n"
+"      this.grow = function(delta){\n"
+"        var old = this._pages;\n"
+"        if (old + (delta|0) > this._max) throw new RangeError('wasm memory grow failed');\n"
+"        this._pages += (delta|0);\n"
+"        var nb = new ArrayBuffer(this._pages*65536);\n"
+"        new Uint8Array(nb).set(new Uint8Array(this.buffer));\n"
+"        this.buffer = nb;\n"
+"        return old;\n"
+"      };\n"
 "    }\n"
 "    function Table(desc){ this.length = (desc && desc.initial)||0; }\n"
 "    function instantiate(src, imp){\n"
@@ -9728,6 +9811,8 @@ static int js_ensure(void) {
             {"wasmMemName", js_wasm_memname, 1},
             {"wasmCall", js_wasm_call, 3},
             {"wasmMemBuffer", js_wasm_membuffer, 1},
+            {"wasmMemPages", js_wasm_mempages, 1},
+            {"wasmMemGrow", js_wasm_memgrow, 2},
             {"wasmFree", js_wasm_free, 1},
         };
         for (unsigned k = 0; k < sizeof(B) / sizeof(B[0]); k++)
@@ -10649,8 +10734,14 @@ static void set_home_page(void) {
         "var m=e.mem_sum(20,22);L('mem_sum(20,22)='+m);if(m!==42)ok=false;"
         "var c=e.call_host(6,7);L('call_host(6,7)='+c);if(c!==84)ok=false;"
         "var f=e.fmul(1.5,2.0);L('fmul(1.5,2.0)='+f);if(Math.abs(f-3.0)>0.01)ok=false;"
-        "var u=new Uint8Array(e.mem.buffer);L('mem[0]='+u[0]+' (buflen='+e.mem.buffer.byteLength+')');"
-        "if(u[0]!==20)ok=false;"
+        "var pre=e.mem.buffer;L('pre-grow buflen='+pre.byteLength);"
+        "if(new Uint8Array(pre)[0]!==20)ok=false;"
+        "var old=e.mem.grow(2);L('mem.grow(2) old pages='+old);if(old!==1)ok=false;"
+        "L('old buffer detached? byteLength='+pre.byteLength);if(pre.byteLength!==0)ok=false;"
+        "var post=e.mem.buffer;L('post-grow buflen='+post.byteLength);if(post.byteLength!==196608)ok=false;"
+        "var u=new Uint8Array(post);L('mem[0] survived grow='+u[0]);if(u[0]!==20)ok=false;"
+        "u[100000]=77;L('grown region [100000]='+new Uint8Array(e.mem.buffer)[100000]);"
+        "if(new Uint8Array(e.mem.buffer)[100000]!==77)ok=false;"
         "L(ok?'RESULT: ALL PASS':'RESULT: FAIL');"
         "var h=document.getElementById('big');if(h)h.textContent=ok?'WASM: ALL PASS':'WASM: FAIL';"
         "L('ALL DONE');},function(err){L('instantiate rejected: '+err);L('ALL DONE');});"

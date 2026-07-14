@@ -41,6 +41,13 @@ const char *toby_wasm_func_export_name(IM3Module m, int idx);
  * is not exported (or the module has none). */
 const char *toby_wasm_memory_export_name(IM3Module m);
 
+/* Linear-memory size/limits + growth, driving wasm3's ResizeMemory.
+ * Pages are 64 KiB. toby_wasm_mem_grow grows by delta_pages and returns
+ * the PREVIOUS page count, or -1 if it can't grow (exceeds max). */
+int         toby_wasm_mem_pages(IM3Runtime rt);
+int         toby_wasm_mem_maxpages(IM3Runtime rt);
+int         toby_wasm_mem_grow(IM3Runtime rt, int delta_pages);
+
 #ifdef __cplusplus
 }
 #endif

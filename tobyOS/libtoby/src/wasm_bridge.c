@@ -80,3 +80,25 @@ const char *toby_wasm_memory_export_name(IM3Module m)
 {
     return m ? m->memoryExportName : 0;
 }
+
+int toby_wasm_mem_pages(IM3Runtime rt)
+{
+    return rt ? (int)rt->memory.numPages : 0;
+}
+
+int toby_wasm_mem_maxpages(IM3Runtime rt)
+{
+    return rt ? (int)rt->memory.maxPages : 0;
+}
+
+int toby_wasm_mem_grow(IM3Runtime rt, int delta_pages)
+{
+    if (!rt || delta_pages < 0) return -1;
+    u32 old = rt->memory.numPages;
+    /* ResizeMemory reallocs (moving the base but preserving contents) up
+     * to the module's declared max; the memory.grow opcode uses the same
+     * path, so JS- and wasm-initiated growth are identical. */
+    M3Result r = ResizeMemory(rt, old + (u32)delta_pages);
+    if (r) return -1;
+    return (int)old;
+}
