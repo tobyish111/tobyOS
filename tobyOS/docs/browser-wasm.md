@@ -113,6 +113,12 @@ on-screen ("WASM: ALL PASS") and on the serial console:
   result slots first (`nrets`), then the argument slots (`nargs`); each is
   a 64-bit slot with f32 in the low 32 bits.
 
+- **`i64` ⇄ BigInt.** i64 values cross the JS boundary as `BigInt`
+  (`JS_NewBigInt64` out, `JS_ToBigInt64` in), so values past 2^53 stay
+  exact — both directions of the export call and the import trampoline.
+  A plain Number is still accepted as an i64 argument (leniency), but a
+  returned i64 is always a BigInt.
+
 - The engine and the bridge must be compiled with identical struct-layout
   flags (both `-msse -msse2 -I third_party/wasm3`), since the bridge reads
   wasm3's private structs.
@@ -125,7 +131,6 @@ on-screen ("WASM: ALL PASS") and on the serial console:
   (the common case, incl. `ALLOW_MEMORY_GROWTH`) work, grow included.
 - `instantiateStreaming`/`compileStreaming` best-effort via `Response`;
   binary-safe network fetch of `.wasm` is a separate transport concern.
-- `i64` marshals through JS numbers (no BigInt yet).
 - `WebAssembly.validate` is best-effort (container check, not a full
   bytecode validation pass).
 - No WASM tables/`call_indirect` from JS, globals, or SIMD.

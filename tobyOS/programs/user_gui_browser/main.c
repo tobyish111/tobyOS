@@ -8018,7 +8018,7 @@ static const void *wasm_import_tramp(IM3Runtime rt, IM3ImportContext ctx,
         uint64_t raw = sp[wi->nrets + k];
         switch (wi->argt[k]) {
         case 1: av[k] = JS_NewInt32(cx, (int32_t)(uint32_t)raw); break;
-        case 2: av[k] = JS_NewInt64(cx, (int64_t)raw); break;
+        case 2: av[k] = JS_NewBigInt64(cx, (int64_t)raw); break;  /* i64 -> BigInt */
         case 3: { float f; __builtin_memcpy(&f, &raw, 4);
                   av[k] = JS_NewFloat64(cx, (double)f); break; }
         case 4: { double d; __builtin_memcpy(&d, &raw, 8);
@@ -8034,7 +8034,9 @@ static const void *wasm_import_tramp(IM3Runtime rt, IM3ImportContext ctx,
         switch (wi->rett) {
         case 1: { int32_t v = 0; JS_ToInt32(cx, &v, r);
                   sp[0] = (uint64_t)(uint32_t)v; break; }
-        case 2: { int64_t v = 0; JS_ToInt64(cx, &v, r);
+        case 2: { int64_t v = 0;               /* accept BigInt or Number */
+                  if (JS_IsBigInt(cx, r)) JS_ToBigInt64(cx, &v, r);
+                  else JS_ToInt64(cx, &v, r);
                   sp[0] = (uint64_t)v; break; }
         case 3: { double d = 0; JS_ToFloat64(cx, &d, r); float f = (float)d;
                   uint32_t u; __builtin_memcpy(&u, &f, 4); sp[0] = u; break; }
@@ -8212,7 +8214,9 @@ static JSValue js_wasm_call(JSContext *cx, JSValueConst t, int argc, JSValueCons
         switch (m3_GetArgType(f, k)) {
         case c_m3Type_i32: { int32_t v = 0; JS_ToInt32(cx, &v, e);
                              slots[k] = (uint64_t)(uint32_t)v; break; }
-        case c_m3Type_i64: { int64_t v = 0; JS_ToInt64(cx, &v, e);
+        case c_m3Type_i64: { int64_t v = 0;   /* accept BigInt or Number */
+                             if (JS_IsBigInt(cx, e)) JS_ToBigInt64(cx, &v, e);
+                             else JS_ToInt64(cx, &v, e);
                              slots[k] = (uint64_t)v; break; }
         case c_m3Type_f32: { double d = 0; JS_ToFloat64(cx, &d, e); float ff = (float)d;
                              uint32_t u; __builtin_memcpy(&u, &ff, 4); slots[k] = u; break; }
@@ -8235,7 +8239,7 @@ static JSValue js_wasm_call(JSContext *cx, JSValueConst t, int argc, JSValueCons
     if (m3_GetResults(f, 1, rptr)) return JS_UNDEFINED;
     switch (m3_GetRetType(f, 0)) {
     case c_m3Type_i32: return JS_NewInt32(cx, (int32_t)(uint32_t)ret);
-    case c_m3Type_i64: return JS_NewInt64(cx, (int64_t)ret);
+    case c_m3Type_i64: return JS_NewBigInt64(cx, (int64_t)ret);  /* i64 -> BigInt */
     case c_m3Type_f32: { float ff; __builtin_memcpy(&ff, &ret, 4);
                          return JS_NewFloat64(cx, (double)ff); }
     case c_m3Type_f64: { double d; __builtin_memcpy(&d, &ret, 8);
@@ -10742,9 +10746,21 @@ static void set_home_page(void) {
         "var u=new Uint8Array(post);L('mem[0] survived grow='+u[0]);if(u[0]!==20)ok=false;"
         "u[100000]=77;L('grown region [100000]='+new Uint8Array(e.mem.buffer)[100000]);"
         "if(new Uint8Array(e.mem.buffer)[100000]!==77)ok=false;"
-        "L(ok?'RESULT: ALL PASS':'RESULT: FAIL');"
+        "function finish(){L(ok?'RESULT: ALL PASS':'RESULT: FAIL');"
         "var h=document.getElementById('big');if(h)h.textContent=ok?'WASM: ALL PASS':'WASM: FAIL';"
-        "L('ALL DONE');},function(err){L('instantiate rejected: '+err);L('ALL DONE');});"
+        "L('ALL DONE');}"
+        /* second module: i64 ops marshalled as BigInt (exact past 2^53) */
+        "var B2=[0,97,115,109,1,0,0,0,1,7,1,96,2,126,126,1,126,3,3,2,0,0,7,21,2,"
+        "7,105,54,52,95,115,104,108,0,0,7,105,54,52,95,97,100,100,0,1,10,17,2,7,0,"
+        "32,0,32,1,134,11,7,0,32,0,32,1,124,11];"
+        "WebAssembly.instantiate(new Uint8Array(B2),{}).then(function(r2){"
+        "var e2=r2.instance.exports;"
+        "var s=e2.i64_shl(1n,62n);L('i64_shl(1,62)='+s+' ('+(typeof s)+')');"
+        "if(typeof s!=='bigint'||s!==4611686018427387904n)ok=false;"
+        "var ad=e2.i64_add(9007199254740993n,5n);L('i64_add(2^53+1,5)='+ad);"
+        "if(ad!==9007199254740998n)ok=false;finish();"
+        "},function(er){L('i64 inst rejected: '+er);ok=false;finish();});"
+        "},function(err){L('instantiate rejected: '+err);L('ALL DONE');});"
         "}catch(ex){L('threw: '+ex);L('ALL DONE');}"
         "</script>"
         "</body></html>";
