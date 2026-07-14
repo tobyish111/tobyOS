@@ -50,12 +50,29 @@ New globals (guarded with `if (!g.X)` so a host-provided one wins):
 through `response.arrayBuffer()`; now that it's binary-safe they work
 against a real network fetch.
 
+## Stream plumbing
+
+`ReadableStream` is an **async queue**: `read()` returns a pending promise
+when no chunk is buffered yet, resolved by a later `enqueue`/`close`, so
+async producers work (not just fully-buffered body streams). On top of
+that:
+
+- `WritableStream(sink)` — `start`/`write`/`close`/`abort`, `getWriter()`.
+- `ReadableStream.pipeTo(writable)` — read loop into a writable, closing
+  at end; `pipeThrough(transform)` returns the transform's readable.
+- `TransformStream(transformer)` — a `writable` feeding
+  `transformer.transform(chunk, controller)` and a `readable` of the
+  results (`enqueue`/`terminate`).
+- `ReadableStream.tee()` — two readables that each get every chunk.
+
+Verified (STREAM_TEST): `pipeTo` from an async-producing source collects
+`abc`; a `pipeThrough` upcase transform yields `XY`; `tee` gives both
+branches `12`.
+
 ## Known limits
 
-- `ReadableStream` is a synchronous queue — no backpressure/highWaterMark,
-  no async `pull` awaiting, no `pipeThrough`/`pipeTo`/`tee`, no
-  `WritableStream`/`TransformStream`. Covers reader loops and body
-  streams, not full stream plumbing.
+- No backpressure / `highWaterMark` / queuing strategies; `pull` is called
+  but not awaited. `tee` buffers the source fully.
 - The body is buffered fully before delivery (the kernel fetch reads the
   whole body), so `response.body` streams an already-complete buffer
   rather than incremental network chunks.
