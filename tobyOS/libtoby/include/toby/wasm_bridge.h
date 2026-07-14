@@ -48,6 +48,21 @@ int         toby_wasm_mem_pages(IM3Runtime rt);
 int         toby_wasm_mem_maxpages(IM3Runtime rt);
 int         toby_wasm_mem_grow(IM3Runtime rt, int delta_pages);
 
+/* Imported memory: a module that imports (rather than defines) its
+ * linear memory. wasm3 leaves runtime memory unallocated in that case,
+ * so the host must set it up. */
+int         toby_wasm_memory_imported(IM3Module m);
+const char *toby_wasm_memory_import_module(IM3Module m);
+const char *toby_wasm_memory_import_field(IM3Module m);
+int         toby_wasm_memory_init_pages(IM3Module m);   /* declared minimum */
+int         toby_wasm_memory_max_pages(IM3Module m);    /* 0 = unbounded */
+
+/* Allocate the runtime's linear memory (init_pages, capped at max_pages)
+ * for an imported-memory module. MUST be called after m3_ParseModule and
+ * BEFORE m3_LoadModule -- LoadModule's InitDataSegments requires an
+ * allocated memory even when there are zero data segments. Returns 0/-1. */
+int         toby_wasm_mem_setup(IM3Runtime rt, int init_pages, int max_pages);
+
 #ifdef __cplusplus
 }
 #endif

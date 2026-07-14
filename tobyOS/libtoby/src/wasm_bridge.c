@@ -102,3 +102,39 @@ int toby_wasm_mem_grow(IM3Runtime rt, int delta_pages)
     if (r) return -1;
     return (int)old;
 }
+
+int toby_wasm_memory_imported(IM3Module m)
+{
+    return (m && m->memoryImported) ? 1 : 0;
+}
+
+const char *toby_wasm_memory_import_module(IM3Module m)
+{
+    return (m && m->memoryImported) ? m->memoryImport.moduleUtf8 : 0;
+}
+
+const char *toby_wasm_memory_import_field(IM3Module m)
+{
+    return (m && m->memoryImported) ? m->memoryImport.fieldUtf8 : 0;
+}
+
+int toby_wasm_memory_init_pages(IM3Module m)
+{
+    return m ? (int)m->memoryInfo.initPages : 0;
+}
+
+int toby_wasm_memory_max_pages(IM3Module m)
+{
+    return m ? (int)m->memoryInfo.maxPages : 0;
+}
+
+int toby_wasm_mem_setup(IM3Runtime rt, int init_pages, int max_pages)
+{
+    if (!rt) return -1;
+    rt->memory.maxPages = (max_pages > 0) ? (u32)max_pages : 65536;
+    rt->memory.pageSize = 65536;
+    /* Even 0 pages allocates the M3MemoryHeader, which is what
+     * InitDataSegments checks for. */
+    M3Result r = ResizeMemory(rt, (u32)(init_pages > 0 ? init_pages : 0));
+    return r ? -1 : 0;
+}

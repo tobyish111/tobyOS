@@ -7998,6 +7998,7 @@ struct wasm_inst {
     JSValue         mem_buf;
     int             has_mem_buf;
     uint8_t        *mem_base;
+    int             mem_imported;      /* memory came from an import */
 };
 
 static struct wasm_inst g_wasm[WASM_MAX_INSTANCES];
@@ -8116,6 +8117,23 @@ static JSValue js_wasm_instantiate(JSContext *cx, JSValueConst t, int argc, JSVa
     M3Result r = m3_ParseModule(w->env, &w->mod, w->bytes, (uint32_t)blen);
     if (r) { wasm_inst_free(w);
         return JS_ThrowTypeError(cx, "wasm parse: %s", r); }
+
+    /* Imported memory: wasm3 leaves the runtime's linear memory
+     * unallocated for a module that imports it, and LoadModule then trips
+     * on the unallocated memory -- so set it up here, between parse and
+     * load. Size = the JS Memory's requested pages (argv[2]) if given,
+     * else the module's declared minimum; capped at the declared max. */
+    if (toby_wasm_memory_imported(w->mod)) {
+        int want = (argc >= 3) ? jsi(cx, argv[2]) : 0;
+        int minp = toby_wasm_memory_init_pages(w->mod);
+        if (want < minp) want = minp;
+        if (toby_wasm_mem_setup(w->rt, want, toby_wasm_memory_max_pages(w->mod)) != 0) {
+            wasm_inst_free(w);
+            return JS_ThrowInternalError(cx, "wasm: imported memory setup failed");
+        }
+        w->mem_imported = 1;
+    }
+
     r = m3_LoadModule(w->rt, w->mod);      /* runtime now owns the module */
     if (r) { wasm_inst_free(w);
         return JS_ThrowTypeError(cx, "wasm load: %s", r); }
@@ -9641,8 +9659,8 @@ static const char JS_PRELUDE[] =
 "    }\n"
 "    function Module(bytes){ this.__bytes = toAB(bytes); }\n"
 "    function Instance(mod, imp){\n"
-"      var id = D.wasmInstantiate(mod.__bytes, mkResolver(imp));\n"
-"      var bi = buildInstance(id); this.exports = bi.exports; this.__id = id;\n"
+"      var bi = instantiateBytes(mod.__bytes, imp);\n"
+"      this.exports = bi.exports; this.__id = bi.__id;\n"
 "    }\n"
 /* Standalone WebAssembly.Memory (not yet bound to an instance; imported
  * memory linking is a follow-up). Backed by a plain ArrayBuffer that grow
@@ -9662,13 +9680,42 @@ static const char JS_PRELUDE[] =
 "      };\n"
 "    }\n"
 "    function Table(desc){ this.length = (desc && desc.initial)||0; }\n"
+/* find the WebAssembly.Memory an importObject supplies (any namespace) */
+"    function findImportMem(imp){\n"
+"      if (!imp) return null;\n"
+"      for (var k in imp){ var ns = imp[k];\n"
+"        if (ns && typeof ns === 'object') for (var f in ns)\n"
+"          if (ns[f] instanceof Memory) return ns[f];\n"
+"      }\n"
+"      return null;\n"
+"    }\n"
+/* bind a standalone Memory to an instance: copy any pre-instantiate bytes
+ * into the instance's linear memory, then re-point .buffer/.grow at it so
+ * the same object now aliases wasm memory (shared both ways). */
+"    function bindImportedMemory(mem, id){\n"
+"      try {\n"
+"        var dab = D.wasmMemBuffer(id);\n"
+"        if (dab){ var src = new Uint8Array(mem.buffer), dst = new Uint8Array(dab);\n"
+"          var n = Math.min(src.length, dst.length); if (n) dst.set(src.subarray(0,n)); }\n"
+"      } catch(e){}\n"
+"      Object.defineProperty(mem, 'buffer', { configurable:true,\n"
+"        get: function(){ return D.wasmMemBuffer(id) || new ArrayBuffer(0); } });\n"
+"      mem.grow = function(delta){ var old = D.wasmMemGrow(id, delta|0);\n"
+"        if (old < 0) throw new RangeError('wasm memory grow failed'); return old; };\n"
+"      mem.__id = id;\n"
+"    }\n"
+"    function instantiateBytes(ab, imp){\n"
+"      var im = findImportMem(imp);\n"
+"      var id = D.wasmInstantiate(ab, mkResolver(imp), im ? (im._pages||0) : 0);\n"
+"      if (im) bindImportedMemory(im, id);\n"
+"      return buildInstance(id);\n"
+"    }\n"
 "    function instantiate(src, imp){\n"
 "      try {\n"
 "        if (src instanceof Module)\n"
-"          return Promise.resolve(buildInstance(D.wasmInstantiate(src.__bytes, mkResolver(imp))));\n"
+"          return Promise.resolve(instantiateBytes(src.__bytes, imp));\n"
 "        var ab = toAB(src);\n"
-"        var id = D.wasmInstantiate(ab, mkResolver(imp));\n"
-"        return Promise.resolve({ module: new Module(ab), instance: buildInstance(id) });\n"
+"        return Promise.resolve({ module: new Module(ab), instance: instantiateBytes(ab, imp) });\n"
 "      } catch(e){ return Promise.reject(e); }\n"
 "    }\n"
 "    function compile(bytes){ try { return Promise.resolve(new Module(bytes)); }\n"
@@ -9810,7 +9857,7 @@ static int js_ensure(void) {
             {"cvText", js_cv_text, 6},
             {"cvDrawImg", js_cv_drawimg, 6},
             {"cvSize", js_cv_size, 1},
-            {"wasmInstantiate", js_wasm_instantiate, 2},
+            {"wasmInstantiate", js_wasm_instantiate, 3},
             {"wasmExportNames", js_wasm_exports, 1},
             {"wasmMemName", js_wasm_memname, 1},
             {"wasmCall", js_wasm_call, 3},
@@ -10758,7 +10805,25 @@ static void set_home_page(void) {
         "var s=e2.i64_shl(1n,62n);L('i64_shl(1,62)='+s+' ('+(typeof s)+')');"
         "if(typeof s!=='bigint'||s!==4611686018427387904n)ok=false;"
         "var ad=e2.i64_add(9007199254740993n,5n);L('i64_add(2^53+1,5)='+ad);"
-        "if(ad!==9007199254740998n)ok=false;finish();"
+        "if(ad!==9007199254740998n)ok=false;"
+        /* third module: imports env.memory from a JS-created WebAssembly.Memory */
+        "var mem=new WebAssembly.Memory({initial:1,maximum:10});"
+        "new Uint8Array(mem.buffer)[16]=55;"
+        "var B3=[0,97,115,109,1,0,0,0,1,15,3,96,2,127,127,0,96,1,127,1,127,96,0,1,"
+        "127,2,16,1,3,101,110,118,6,109,101,109,111,114,121,2,1,1,10,3,4,3,0,1,2,7,"
+        "22,3,4,112,111,107,101,0,0,4,112,101,101,107,0,1,4,115,105,122,101,0,2,10,"
+        "24,3,9,0,32,0,32,1,54,2,0,11,7,0,32,0,40,2,0,11,4,0,63,0,11];"
+        "WebAssembly.instantiate(new Uint8Array(B3),{env:{memory:mem}}).then(function(r3){"
+        "var e3=r3.instance.exports;"
+        "L('imp pre-init byte='+new Uint8Array(mem.buffer)[16]);if(new Uint8Array(mem.buffer)[16]!==55)ok=false;"
+        "e3.poke(8,4242);var u=new Uint8Array(mem.buffer);"
+        "var wv=u[8]|(u[9]<<8)|(u[10]<<16)|(u[11]<<24);"
+        "L('imp wasm->JS [8]='+wv);if(wv!==4242)ok=false;"
+        "u[12]=0x61;u[13]=0x1e;u[14]=0;u[15]=0;"
+        "L('imp JS->wasm peek(12)='+e3.peek(12));if(e3.peek(12)!==7777)ok=false;"
+        "var op=mem.grow(1);L('imp mem.grow(1) old='+op+' size='+e3.size());if(e3.size()!==2)ok=false;"
+        "finish();"
+        "},function(er){L('imp inst rejected: '+er);ok=false;finish();});"
         "},function(er){L('i64 inst rejected: '+er);ok=false;finish();});"
         "},function(err){L('instantiate rejected: '+err);L('ALL DONE');});"
         "}catch(ex){L('threw: '+ex);L('ALL DONE');}"

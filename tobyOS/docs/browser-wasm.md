@@ -39,6 +39,9 @@ on-screen ("WASM: ALL PASS") and on the serial console:
 [wasmjs] post-grow buflen=196608 ; 1 -> 3 pages
 [wasmjs] mem[0] survived grow=20 ; data preserved across the realloc
 [wasmjs] grown region [100000]=77; new region writable, reflects into wasm
+[wasmjs] i64_shl(1,62)=4611686018427387904 (bigint)   ; i64 exact past 2^53
+[wasmjs] imp wasm->JS [8]=4242    ; module imports a JS-created Memory
+[wasmjs] imp JS->wasm peek(12)=7777; shared both ways, grow works
 [wasmjs] RESULT: ALL PASS
 ```
 
@@ -119,16 +122,25 @@ on-screen ("WASM: ALL PASS") and on the serial console:
   A plain Number is still accepted as an i64 argument (leniency), but a
   returned i64 is always a BigInt.
 
+- **Imported memory.** wasm3 has one linear memory per *runtime* and
+  leaves it unallocated for a module that *imports* its memory
+  (`(import "env" "memory" ...)`), which then makes `m3_LoadModule` trip
+  (its `InitDataSegments` requires an allocated memory even with zero data
+  segments). So `wasmInstantiate` allocates `runtime->memory` from the
+  import's declared limits (or the JS `Memory`'s requested size)
+  **between** `m3_ParseModule` and `m3_LoadModule` — `InitMemory` then
+  skips it (imported) and leaves the allocation intact. The prelude finds
+  the `WebAssembly.Memory` in the import object, copies any
+  pre-instantiate bytes into the runtime memory, and re-points that same
+  object's `.buffer`/`.grow` at the instance — so it aliases wasm memory,
+  shared both ways, grow included.
+
 - The engine and the bridge must be compiled with identical struct-layout
   flags (both `-msse -msse2 -I third_party/wasm3`), since the bridge reads
   wasm3's private structs.
 
 ## Known limits
 
-- **Imported memory not linked.** A module that *imports* its memory
-  (`(import "env" "memory" ...)`, some Emscripten builds) isn't yet fed a
-  JS-created `WebAssembly.Memory`. Modules that *export* their own memory
-  (the common case, incl. `ALLOW_MEMORY_GROWTH`) work, grow included.
 - `instantiateStreaming`/`compileStreaming` best-effort via `Response`;
   binary-safe network fetch of `.wasm` is a separate transport concern.
 - `WebAssembly.validate` is best-effort (container check, not a full
