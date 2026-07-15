@@ -677,8 +677,11 @@ static long sys_clip_paste(char *buf, uint32_t max) {
 #define HTTP_SYSCALL_MAX_BODY  65536u  /* 64KB cap for userspace fetches */
 #define HTTP_MAX_REDIRECTS     5
 /* SYS_HTTP_FETCH downloads the whole body kernel-side (transient
- * kmalloc), then truncates to the caller's buffer. */
-#define HTTP_FETCH_KERNEL_MAX  (1u << 20)
+ * kmalloc), then truncates to the caller's buffer. 8 MiB: a single
+ * modern stylesheet bundle is routinely megabytes (youtube.com ships
+ * 3.4 MiB of CSS in one file) and this ceiling silently overrode the
+ * caller's larger buf_sz, truncating scripts/sheets into garbage. */
+#define HTTP_FETCH_KERNEL_MAX  (8u << 20)
 
 static int http_is_redirect(int status) {
     return status == 301 || status == 302 || status == 303 ||
