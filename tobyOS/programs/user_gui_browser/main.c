@@ -87,6 +87,9 @@ struct gui_event {
 #include "wasm3.h"
 #include "toby/wasm_bridge.h"
 
+/* Color emoji (COLR/CPAL via libtoby). */
+#include "toby/emoji.h"
+
 static struct tk_window win;
 
 /* libtoby heap (stdlib.c over sbrk); the image path allocates fetch +
@@ -903,6 +906,7 @@ struct ditem {
     int16_t deco;                /* g_deco index (gradient/shadow), -1 */
 };
 #define DI_SHADOW 6              /* box-shadow (soft rounded rect behind) */
+#define DI_EMOJI  7              /* color emoji glyph (off = codepoint) */
 
 /* Per-node CSS decoration (border-radius already lives in cstyle/ditem;
  * this holds the bulkier gradient + box-shadow params, referenced by an
@@ -1451,6 +1455,100 @@ static int tp_put_utf8(const char *s, long n) {
         if (ok) { tp_put_cp(cp); i += extra; }
     }
     return E->tpool_len - start;
+}
+
+/* ---- Color emoji (COLR/CPAL via libtoby) -------------------------- *
+ * The emoji font (/etc/emoji.ttf, Twemoji Mozilla) is loaded lazily; a
+ * small LRU caches rendered ARGB glyphs by (codepoint, px). Inline text
+ * splits out emoji codepoints as atomic DI_EMOJI items painted here. */
+
+static toby_emoji_t *g_emoji;
+static int g_emoji_tried;
+static uint8_t *g_emoji_ttf;
+
+static toby_emoji_t *emoji_font(void) {
+    if (g_emoji_tried) return g_emoji;
+    g_emoji_tried = 1;
+    long fd = sys_open("/etc/emoji.ttf", O_RDONLY, 0);
+    if (fd < 0) return NULL;
+    /* read the whole font into a growable buffer */
+    unsigned long cap = 2u << 20, len = 0;
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    if (!buf) { sys_close((int)fd); return NULL; }
+    for (;;) {
+        if (len + 65536 > cap) {
+            unsigned long ncap = cap * 2;
+            uint8_t *nb = (uint8_t *)malloc(ncap);
+            if (!nb) break;
+            memcpy(nb, buf, len); free(buf); buf = nb; cap = ncap;
+        }
+        long r = sys_read((int)fd, buf + len, 65536);
+        if (r <= 0) break;
+        len += (unsigned long)r;
+    }
+    sys_close((int)fd);
+    if (len < 16) { free(buf); return NULL; }
+    g_emoji_ttf = buf;                       /* must outlive the handle */
+    g_emoji = toby_emoji_load(buf, len);
+    return g_emoji;
+}
+
+static int emoji_is(unsigned int cp) {
+    if (cp < 0x2000) return 0;               /* ASCII/Latin: never emoji */
+    toby_emoji_t *e = emoji_font();
+    return e && toby_emoji_has(e, (int)cp);
+}
+
+/* Decode one UTF-8 codepoint from [s, s+n); *adv = bytes consumed. */
+static unsigned int emoji_next_cp(const char *s, int n, int *adv) {
+    unsigned char c = (unsigned char)s[0];
+    if (c < 0x80) { *adv = 1; return c; }
+    unsigned int cp; int extra;
+    if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; extra = 1; }
+    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
+    else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
+    else { *adv = 1; return c; }
+    if (extra >= n) { *adv = 1; return c; }
+    for (int k = 1; k <= extra; k++) {
+        unsigned char cc = (unsigned char)s[k];
+        if ((cc & 0xC0) != 0x80) { *adv = 1; return (unsigned char)s[0]; }
+        cp = (cp << 6) | (cc & 0x3F);
+    }
+    *adv = extra + 1;
+    return cp;
+}
+
+#define EMOJI_CACHE 24
+static struct emoji_glyph {
+    int cp, px, w, h, adv, lru;
+    uint32_t *rgba;
+} g_emoji_cache[EMOJI_CACHE];
+static int g_emoji_lru;
+
+static struct emoji_glyph *emoji_get(int cp, int px) {
+    if (px < 6) px = 6; if (px > 128) px = 128;
+    for (int i = 0; i < EMOJI_CACHE; i++)
+        if (g_emoji_cache[i].rgba && g_emoji_cache[i].cp == cp &&
+            g_emoji_cache[i].px == px) {
+            g_emoji_cache[i].lru = ++g_emoji_lru;
+            return &g_emoji_cache[i];
+        }
+    toby_emoji_t *e = emoji_font();
+    if (!e) return NULL;
+    int w = 0, h = 0, adv = 0;
+    uint32_t *rgba = toby_emoji_render(e, cp, px, &w, &h, &adv);
+    if (!rgba) return NULL;
+    /* evict the LRU slot */
+    int slot = 0, best = g_emoji_cache[0].lru;
+    for (int i = 1; i < EMOJI_CACHE; i++)
+        if (!g_emoji_cache[i].rgba) { slot = i; break; }
+        else if (g_emoji_cache[i].lru < best) { best = g_emoji_cache[i].lru; slot = i; }
+    if (g_emoji_cache[slot].rgba) free(g_emoji_cache[slot].rgba);
+    g_emoji_cache[slot].cp = cp; g_emoji_cache[slot].px = px;
+    g_emoji_cache[slot].w = w; g_emoji_cache[slot].h = h;
+    g_emoji_cache[slot].adv = adv; g_emoji_cache[slot].rgba = rgba;
+    g_emoji_cache[slot].lru = ++g_emoji_lru;
+    return &g_emoji_cache[slot];
 }
 
 /* ---- Tag table ---------------------------------------------------- */
@@ -4543,7 +4641,59 @@ static void ic_break(struct ictx *ic, int min_h) {
 
 /* Append one word to the line, wrapping as needed; coalesces into the
  * open text item when style + render-pool position allow. */
+/* Place one color emoji as an atomic box on the inline line (its own
+ * DI_EMOJI item; the codepoint rides in `off`). Sized ~1em, advance from
+ * the rendered glyph. */
+static void ic_emoji(struct ictx *ic, int cp, const struct istyle *is) {
+    int px = is->px;
+    struct emoji_glyph *g = emoji_get(cp, px);
+    int h = px, w = px;
+    if (g) { h = g->h; w = g->adv; }
+    for (int guard = 0; guard < 64; guard++) {
+        if (ic->x > ic->lx0 && ic->x + w > ic->lx1) { ic_break(ic, is->lh); continue; }
+        break;
+    }
+    ic->pend_sp = 0;
+    struct ditem *it = item_new(DI_EMOJI);
+    if (!it) return;
+    it->x = ic->x;
+    it->y = ic->y;
+    it->w = w;
+    it->h = h;
+    it->off = cp;                     /* codepoint (repurposed field) */
+    it->px = (uint8_t)px;
+    it->link = (int16_t)is->link;
+    it->node = is->node;
+    it->face = 0;
+    ic->x += w;
+    if (h + 2 > ic->line_h) ic->line_h = h + 2;
+    ic->citem = -1;
+}
+
 static void ic_word(struct ictx *ic, const char *w, int wl, const struct istyle *is) {
+    /* Split out color-emoji codepoints as atomic glyphs (the surrounding
+     * text lays out normally). Cheap for ASCII-heavy text: emoji_is gates
+     * on cp >= 0x2000 before touching the font. */
+    for (int k = 0; k < wl; ) {
+        int adv = 1;
+        unsigned int cp = emoji_next_cp(w + k, wl - k, &adv);
+        if (cp >= 0x2000 && emoji_is(cp)) {
+            if (k > 0) ic_word(ic, w, k, is);          /* text before */
+            ic_emoji(ic, (int)cp, is);
+            int after = k + adv;
+            /* swallow a trailing variation selector (U+FE0E/FE0F) or ZWJ
+             * (U+200D)+next so they don't render as tofu next to the emoji. */
+            while (after < wl) {
+                int a2 = 1;
+                unsigned int c2 = emoji_next_cp(w + after, wl - after, &a2);
+                if (c2 == 0xFE0F || c2 == 0xFE0E) { after += a2; }
+                else break;
+            }
+            if (after < wl) ic_word(ic, w + after, wl - after, is);
+            return;
+        }
+        k += adv;
+    }
     int mono = is->fl & IF_MONO;
     int face = is->face;
     int ww = text_px_w(w, wl, is->px, face, mono);
@@ -11490,6 +11640,21 @@ static void set_home_page(void) {
         "fin();}).catch(function(e){L('cache error: '+e);ok=false;fin();});"
         "</script></body></html>";
 #endif
+#ifdef EMOJI_TEST
+    /* Color emoji test: emoji codepoints inline with text should render as
+     * color glyphs (Twemoji via COLR/CPAL), not monochrome tofu. */
+    html =
+        "<html><head><title>Emoji</title>"
+        "<style>body{background:#fff;color:#111;font-family:sans-serif;margin:16px}"
+        "h1{color:#1a73e8}p{font-size:22px}.big{font-size:40px}</style></head><body>"
+        "<h1>Color emoji \xF0\x9F\x8E\x89</h1>"
+        "<p>Hello \xF0\x9F\x98\x80 world \xF0\x9F\x91\x8D! I \xE2\x9D\xA4\xEF\xB8\x8F tobyOS "
+        "\xF0\x9F\x9A\x80 \xF0\x9F\x8C\x88</p>"
+        "<p class=big>\xF0\x9F\x98\x80 \xF0\x9F\x98\x8E \xF0\x9F\x98\x82 \xF0\x9F\x91\x8D "
+        "\xE2\x9D\xA4\xEF\xB8\x8F \xF0\x9F\x8E\x89 \xF0\x9F\x9A\x80 \xF0\x9F\x8C\x88 "
+        "\xF0\x9F\x94\xA5 \xF0\x9F\x8C\x9F</p>"
+        "</body></html>";
+#endif
 #ifdef CSSVIS_TEST
     /* Visual CSS test: inline-block flow, conic gradients, per-corner
      * border-radius. Verified by screenshot. */
@@ -14116,6 +14281,22 @@ static void paint_content_item(int ri, int sksh, int vtop, int vbot,
         return;
     }
     if (r->kind == DI_IMG) { paint_image(r, sy); return; }
+    if (r->kind == DI_EMOJI) {
+        struct emoji_glyph *g = emoji_get((int)r->off, r->px);
+        if (g && g->rgba) {
+            for (int yy = 0; yy < g->h; yy++) {
+                int py = sy + yy;
+                if (py < cyy0 || py >= cyy1) continue;
+                int x0 = r->x, x1 = r->x + g->w;
+                if (x0 < cx0) x0 = cx0;
+                if (x1 > cx1) x1 = cx1;
+                if (x1 <= x0) continue;
+                const uint32_t *row = &g->rgba[(long)yy * g->w + (x0 - r->x)];
+                tk_draw_blit_blend(&win, x0, py, x1 - x0, 1, row, x1 - x0);
+            }
+        }
+        return;
+    }
     if (r->kind == DI_FIELD) {
         struct field *ff = &g_fields[r->field];
         if (r->fl & IF_INPUT) {

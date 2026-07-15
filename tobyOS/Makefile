@@ -878,6 +878,7 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/gl_raster.c \
                    $(LIBTOBY_SRC)/pthread.c \
                    $(LIBTOBY_SRC)/font.c \
+                   $(LIBTOBY_SRC)/emoji.c \
                    $(LIBTOBY_SRC)/posix_compat.c \
                    $(LIBTOBY_SRC)/signal.c \
                    $(LIBTOBY_SRC)/dlfcn.c \
@@ -957,6 +958,10 @@ $(LIBTOBY_SRC)/time.o: $(LIBTOBY_SRC)/time.c
 
 # font.c needs SSE for floating-point math in stb_truetype
 $(LIBTOBY_SRC)/font.o: $(LIBTOBY_SRC)/font.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
+
+# emoji.c calls stb_truetype (float scale) -> needs SSE like font.c
+$(LIBTOBY_SRC)/emoji.o: $(LIBTOBY_SRC)/emoji.c
 	$(CC) $(LIBTOBY_BUILD_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
 
 # image.c needs SSE for stb_image SIMD paths
@@ -1209,6 +1214,9 @@ $(LIBTOBY_SRC)/time.pic.o: $(LIBTOBY_SRC)/time.c
 	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -c $< -o $@
 
 $(LIBTOBY_SRC)/font.pic.o: $(LIBTOBY_SRC)/font.c
+	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
+
+$(LIBTOBY_SRC)/emoji.pic.o: $(LIBTOBY_SRC)/emoji.c
 	$(CC) $(LIBTOBY_PIC_CFLAGS) -msse -msse2 -Wno-unused-function -c $< -o $@
 
 $(LIBTOBY_SRC)/image.pic.o: $(LIBTOBY_SRC)/image.c
@@ -2392,6 +2400,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
                initrd/etc/Lato-BoldItalic.ttf initrd/etc/fallback.otf \
+               initrd/etc/emoji.ttf \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua initrd/etc/resolv.conf \
                $(HELLOAPP_TPKG) $(HELLOAPP_TPKG_V2) $(SDK_SAMPLE_TPKGS) \
@@ -2412,6 +2421,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/Lato-Italic.ttf            $(INITRD_STAGE)/etc/Lato-Italic.ttf
 	cp initrd/etc/Lato-BoldItalic.ttf        $(INITRD_STAGE)/etc/Lato-BoldItalic.ttf
 	cp initrd/etc/fallback.otf               $(INITRD_STAGE)/etc/fallback.otf
+	cp initrd/etc/emoji.ttf                  $(INITRD_STAGE)/etc/emoji.ttf
 	cp initrd/etc/drvmatch.conf              $(INITRD_STAGE)/etc/drvmatch.conf
 	cp initrd/etc/drvmatch.conf.test         $(INITRD_STAGE)/etc/drvmatch.conf.test
 	cp initrd/etc/lua_selftest.lua           $(INITRD_STAGE)/etc/lua_selftest.lua
@@ -2914,7 +2924,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
 	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
 	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
-	    etc/Lato-BoldItalic.ttf etc/fallback.otf                      \
+	    etc/Lato-BoldItalic.ttf etc/fallback.otf etc/emoji.ttf        \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
