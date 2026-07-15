@@ -587,15 +587,15 @@ static int g_content_h = WIN_H - TOOLBAR_H - STATUS_H;
 
 /* ---- Content buffer -------------------------------------------- */
 
-/* 512 KiB of page HTML: enough for every full Wikipedia article body
- * (kernel SYS_HTTP_FETCH truncates past this). raw[] lives inline in
- * struct tab -> TAB_MAX * 512K = 3 MiB BSS; the eng pools below scale
- * with it (heap, per open tab). */
-#define RAW_CAP       (512 * 1024)
+/* 1.5 MiB of page HTML: covers heavy modern SPAs (e.g. youtube.com is
+ * ~777 KiB of mostly-inline JS) without truncating a <script> mid-string
+ * (which yields spurious SyntaxErrors). raw[] lives inline in struct tab
+ * -> TAB_MAX * 1.5M = 9 MiB BSS; the eng pools below scale with it. */
+#define RAW_CAP       (1536 * 1024)
 
 /* Visible-text pool: must exceed RAW_CAP so view-source of a max-size
  * page keeps every character (source view flows raw through a pre). */
-#define RENDER_CAP    (576 * 1024)
+#define RENDER_CAP    (1600 * 1024)
 
 /* Body font size (px); code/pre use the fixed 8x16 mono font. */
 #define PX_BODY   15
@@ -800,7 +800,7 @@ struct dattr {                   /* name/value slices in tpool */
     int16_t _pad;
 };
 #define ATTR_MAX  32768
-#define TPOOL_CAP (768 * 1024)
+#define TPOOL_CAP (2048 * 1024)   /* text nodes incl. large inline <script> bodies */
 
 /* ---- CSSOM -------------------------------------------------------- */
 
@@ -7385,7 +7385,7 @@ static JSValue js_dom_untimer(JSContext *cx, JSValueConst t, int argc, JSValueCo
     return JS_UNDEFINED;
 }
 
-#define JS_FETCH_CAP (256 * 1024)
+#define JS_FETCH_CAP (4 * 1024 * 1024)  /* XHR/fetch() bodies (SPA data payloads can be large) */
 
 /* Synchronous fetch over the kernel HTTP/TLS stack (SPAs assume async;
  * the Promise-shaped wrapper lives in the prelude -- honest blocking
@@ -9514,6 +9514,24 @@ static const char JS_PRELUDE[] =
 "  };\n"
 "  Element.prototype.pause = function(){ D.mediaCtl(this.__i, 0); };\n"
 "  g.navigator = { userAgent: 'TobyOS/4.0 (tobyOS x86_64) QuickJS' };\n"
+/* ---- Image(): preloaders, tracking pixels and lazy-loaders build
+ *      detached <img> via `new Image()`. Fire load synchronously on
+ *      src-set so waiters progress instead of hanging. ------------- */
+"  g.Image = function(w,h){\n"
+"    var self = { tagName:'IMG', nodeName:'IMG', width:w||0, height:h||0,\n"
+"      naturalWidth:0, naturalHeight:0, complete:false, __ls:{}, style:{},\n"
+"      addEventListener:function(t,f){ (this.__ls[t]=this.__ls[t]||[]).push(f); },\n"
+"      removeEventListener:function(t,f){ var l=this.__ls[t]; if(l){var i=l.indexOf(f); if(i>=0)l.splice(i,1);} },\n"
+"      setAttribute:function(k,v){ this[k]=v; if(k==='src') this.src=v; },\n"
+"      getAttribute:function(k){ return this[k]; } };\n"
+"    Object.defineProperty(self,'src',{ configurable:true,\n"
+"      get:function(){ return this.__src||''; },\n"
+"      set:function(v){ this.__src=v; this.complete=true;\n"
+"        var s=this, ev={type:'load',target:s};\n"
+"        if(typeof s.onload==='function'){ try{ s.onload(ev); }catch(e){} }\n"
+"        var l=s.__ls['load']; if(l) for(var i=0;i<l.length;i++){ try{ l[i](ev); }catch(e){} } } });\n"
+"    return self;\n"
+"  };\n"
 "  function parseUrl(h){\n"
 "    var m = /^(https?:)\\/\\/([^\\/?#]*)([^?#]*)(\\??[^#]*)(#?.*)$/.exec(h) || [];\n"
 "    return { protocol: m[1] || '', host: m[2] || '', pathname: m[3] || '/',\n"
@@ -10505,7 +10523,7 @@ static const char WORKER_PRELUDE[] =
 
 /* ---- run every <script> at load -------------------------------------- */
 
-#define JS_SRC_CAP (384 * 1024)
+#define JS_SRC_CAP (4 * 1024 * 1024)  /* external framework bundles (YT base.js ~2-3 MiB) */
 
 static void js_dump_error(JSContext *cx) {
     JSValue e = JS_GetException(cx);
@@ -15201,6 +15219,9 @@ int main(int argc, char **argv) {
      * needs the window fd. */
     set_home_page();
     set_status("Ready - Press Tab to focus address bar");
+#ifdef YT_TEST
+    do_navigate("https://www.youtube.com/");
+#endif
 
     /* Cooperative loop: pump events + repaint, then fetch ONE pending
      * image per idle pass (keeps the UI live during image loading and
