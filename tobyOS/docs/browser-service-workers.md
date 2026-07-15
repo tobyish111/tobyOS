@@ -64,7 +64,14 @@ which is the whole point (offline capability).
   for the page session and is torn down at navigation; there's no
   cross-navigation persistence, no waking on push, no `updatefound`
   round-trips, no multiple clients.
-- **Cache is in-memory**, not persisted to storage across sessions.
+- **Cache persists to disk.** Cache contents are serialized (bodies as a
+  Latin-1 string that round-trips losslessly through the UTF-8 file I/O)
+  and written to `/data/browser/__httpcache` via the same `idbSave` path
+  as IndexedDB/localStorage on every mutation, and restored at startup.
+  Verified: arbitrary binary bytes round-trip through the serializer and a
+  binary body is stored + replayed intact. (Cross-reboot survival then
+  depends on tobyfs flushing `/data` on shutdown — the same for all
+  `/data` state, not cache-specific.)
 - No `push`/`sync`/`periodicsync`/`notification` events, no `Clients`
   focus/navigation, no `importScripts` in the SW, no navigation preload.
 

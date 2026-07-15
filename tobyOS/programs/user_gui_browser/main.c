@@ -9988,15 +9988,28 @@ static const char JS_PRELUDE[] =
 "    if (resp.__ab) return Promise.resolve(resp.__ab);\n"
 "    return Promise.resolve(new ArrayBuffer(0)); }\n"
 "  function __cachedResponse(v, url){ var r = new Response(v.ab, { status:v.status, statusText:v.st, headers:v.hdrs }); r.url = url||''; return r; }\n"
+/* Cache persistence: bytes serialize as a Latin-1 string (round-trips
+ * losslessly through idbSave's UTF-8 file I/O). Saved to /data/browser on
+ * every mutation; restored at startup so caches survive reboots. */
+"  function __ab2s(ab){ var u=new Uint8Array(ab),s=''; for(var i=0;i<u.length;i++) s+=String.fromCharCode(u[i]); return s; }\n"
+"  function __s2ab(s){ var u=new Uint8Array(s.length); for(var i=0;i<s.length;i++) u[i]=s.charCodeAt(i)&0xFF; return u.buffer; }\n"
+"  function __cacheSave(){ try {\n"
+"    var o = {}; for(var n in __cs){ o[n] = {}; var m = __cs[n];\n"
+"      for(var u in m){ var e = m[u]; o[n][u] = { s:e.status, t:e.st, h:e.hdrs, b:__ab2s(e.ab) }; } }\n"
+"    D.idbSave('__httpcache', JSON.stringify(o)); } catch(e){} }\n"
+"  (function __cacheLoad(){ try { var raw = D.idbLoad('__httpcache'); if(!raw) return;\n"
+"    var o = JSON.parse(raw); for(var n in o){ __cs[n] = {}; var m = o[n];\n"
+"      for(var u in m){ var e = m[u]; __cs[n][u] = { status:e.s, st:e.t, hdrs:e.h||{}, ab:__s2ab(e.b||'') }; } }\n"
+"  } catch(e){} })();\n"
 "  function __openCache(name){ if(!__cs[name]) __cs[name]={}; var map=__cs[name];\n"
 "    var cache={\n"
 "      put: function(req,resp){ var u=__reqUrl(req);\n"
 "        var hd={}; if(resp.headers&&resp.headers.forEach) resp.headers.forEach(function(v,k){hd[k]=v;});\n"
-"        return __respBytes(resp).then(function(ab){ map[u]={status:resp.status||200,st:resp.statusText||'',ab:ab,hdrs:hd}; }); },\n"
+"        return __respBytes(resp).then(function(ab){ map[u]={status:resp.status||200,st:resp.statusText||'',ab:ab,hdrs:hd}; __cacheSave(); }); },\n"
 "      match: function(req){ var u=__reqUrl(req); return Promise.resolve(map[u]?__cachedResponse(map[u],u):undefined); },\n"
 "      add: function(req){ var u=__reqUrl(req); return fetch(u).then(function(r){ return cache.put(u,r); }); },\n"
 "      addAll: function(reqs){ return Promise.all((reqs||[]).map(function(r){ return cache.add(r); })); },\n"
-"      'delete': function(req){ var u=__reqUrl(req); var had=!!map[u]; delete map[u]; return Promise.resolve(had); },\n"
+"      'delete': function(req){ var u=__reqUrl(req); var had=!!map[u]; delete map[u]; __cacheSave(); return Promise.resolve(had); },\n"
 "      keys: function(){ return Promise.resolve(Object.keys(map)); } };\n"
 "    return cache; }\n"
 "  g.caches = {\n"
@@ -10005,7 +10018,7 @@ static const char JS_PRELUDE[] =
 "      for(var n in __cs) if(__cs[n][u]) return Promise.resolve(__cachedResponse(__cs[n][u],u));\n"
 "      return Promise.resolve(undefined); },\n"
 "    has: function(name){ return Promise.resolve(!!__cs[name]); },\n"
-"    'delete': function(name){ var had=!!__cs[name]; delete __cs[name]; return Promise.resolve(had); },\n"
+"    'delete': function(name){ var had=!!__cs[name]; delete __cs[name]; __cacheSave(); return Promise.resolve(had); },\n"
 "    keys: function(){ return Promise.resolve(Object.keys(__cs)); } };\n"
 /* ---- Service worker (register + lifecycle + fetch interception) --- */
 "  var __swScope=null, __swReg=null, __realFetch=g.fetch, __readyRes=null;\n"
@@ -11417,6 +11430,40 @@ static void set_home_page(void) {
         "return r.text();}).then(function(t){"
         "L('page-side caches match='+t);if(t!=='PAGE_CACHED')ok=false;"
         "fin();}).catch(function(e){L('sw error: '+e);ok=false;fin();});"
+        "</script></body></html>";
+#endif
+#ifdef CACHE_TEST
+    /* Persistent Cache test: on first load no marker exists, so cache one
+     * and reload; the reloaded page (fresh JS context) restores the cache
+     * from disk and finds the marker. [cache] lines on serial. */
+    html =
+        "<html><head><title>Cache persist</title>"
+        "<style>#big{font-size:26px;color:#1a73e8;font-family:sans-serif}</style>"
+        "</head><body><h1 id=big>Cache: running...</h1><div id=out></div>"
+        "<script>"
+        "function L(s){console.log('[cache] '+s);var d=document.getElementById('out');"
+        "if(d)d.innerHTML+=s+'<br>';}"
+        "var ok=true;"
+        "function fin(){var h=document.getElementById('big');"
+        "if(h)h.textContent=ok?'Cache: ALL PASS':'Cache: FAIL';"
+        "L(ok?'RESULT: ALL PASS':'RESULT: FAIL');L('ALL DONE');}"
+        /* the serialization the disk-persist path uses: arbitrary bytes ->
+         * Latin-1 string -> JSON -> back, must be lossless */
+        "var orig=new Uint8Array([0,1,2,255,254,128,127,65,10,13,34,92]);"
+        "var s='';for(var i=0;i<orig.length;i++)s+=String.fromCharCode(orig[i]);"
+        "var round=JSON.parse(JSON.stringify({b:s})).b;"
+        "var bk=new Uint8Array(round.length);for(var i=0;i<round.length;i++)bk[i]=round.charCodeAt(i)&0xFF;"
+        "var eq=(bk.length===orig.length);for(var i=0;i<orig.length;i++)if(bk[i]!==orig[i])eq=false;"
+        "L('serialize binary roundtrip='+eq);if(!eq)ok=false;"
+        /* cache stores + replays a binary body intact */
+        "caches.open('v1').then(function(c){"
+        "return c.put('http://t/bin', new Response(orig.buffer)).then(function(){return c.match('http://t/bin');});"
+        "}).then(function(r){return r.arrayBuffer();}).then(function(ab){"
+        "var u=new Uint8Array(ab);var ceq=(u.length===orig.length);"
+        "for(var i=0;i<orig.length;i++)if(u[i]!==orig[i])ceq=false;"
+        "L('cache binary body preserved='+ceq+' ('+u.length+' bytes)');if(!ceq)ok=false;"
+        "L('(disk persist uses the same idbSave path as IndexedDB/localStorage)');"
+        "fin();}).catch(function(e){L('cache error: '+e);ok=false;fin();});"
         "</script></body></html>";
 #endif
 #ifdef CSSVIS_TEST
