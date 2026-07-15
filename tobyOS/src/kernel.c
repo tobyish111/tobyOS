@@ -634,6 +634,21 @@ static void serial_heartbeat(void) {
 }
 #endif
 
+/* Periodic writeback: flush dirty block-cache pages to stable media every
+ * few seconds so filesystem state (e.g. /data: localStorage, IndexedDB,
+ * the browser HTTP cache) survives an unclean reboot -- the way a real
+ * OS's periodic sync (Linux dirty_writeback) does, rather than only on
+ * eviction or clean unmount. Called from pid 0's idle loop under the BKL,
+ * a safe blocking-I/O context. Cheap when nothing is dirty. */
+static void periodic_writeback(void) {
+    uint64_t now_ns = perf_now_ns();
+    if (now_ns == 0) return;
+    static uint64_t last_ns = 0;
+    if (last_ns != 0 && now_ns - last_ns < 3ull * 1000000000ull) return;
+    last_ns = now_ns;
+    bcache_sync(NULL);          /* all dirty blocks + per-device flush */
+}
+
 static __attribute__((noreturn)) void idle_loop(void) {
     uint32_t hz = pit_hz();
     if (hz == 0) hz = 1;
@@ -690,6 +705,12 @@ static __attribute__((noreturn)) void idle_loop(void) {
         bkl_enter();
         net_service_tick();
         SERVICE_INPUT();
+        bkl_exit();
+
+        /* Periodic filesystem writeback so /data survives an unclean
+         * reboot (throttled internally to every few seconds). */
+        bkl_enter();
+        periodic_writeback();
         bkl_exit();
 
         /*

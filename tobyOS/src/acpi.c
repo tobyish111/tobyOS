@@ -34,6 +34,7 @@
 #include <tobyos/vmm.h>
 #include <tobyos/cpu.h>
 #include <tobyos/pit.h>
+#include <tobyos/bcache.h>
 
 /* ---- ACPI structures (packed, just the fields we use) ---- */
 
@@ -830,6 +831,11 @@ static void enter_acpi_mode(void) {
 }
 
 void acpi_shutdown(void) {
+    /* Commit any dirty filesystem blocks to stable media before the rails
+     * drop, so a clean power-off doesn't lose /data. (Periodic writeback
+     * covers unclean resets; this covers the graceful path.) */
+    bcache_sync(NULL);
+
     if (!g_info.pm_ok || !g_info.s5_ok) {
         kprintf("[acpi] shutdown unavailable: pm_ok=%d s5_ok=%d -- "
                 "halting CPU instead\n",
