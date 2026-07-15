@@ -816,7 +816,10 @@ struct cpart {                   /* one compound selector part */
     int32_t an_off;   int16_t an_len;    /* [name] / [name=value] */
     int32_t av_off;   int16_t av_len;    /* 0 len = presence test */
 };
-#define PART_MAX  24576
+/* Sized for real modern stylesheets: youtube.com ships a single 3.4 MiB
+ * bundle with ~21k selectors / ~66k declarations / ~18.5k rule blocks.
+ * These pools live in the heap-allocated per-tab struct eng. */
+#define PART_MAX  65536
 
 struct cdecl {
     uint8_t prop;                /* CP_* (CP_VAR for --custom-property) */
@@ -827,7 +830,7 @@ struct cdecl {
     int16_t nlen;                /* CP_VAR: name length */
     int16_t _pad;
 };
-#define DECL_MAX  32768
+#define DECL_MAX  131072
 
 struct crule {
     int32_t part0; int16_t nparts;
@@ -838,8 +841,10 @@ struct crule {
     int32_t scope;               /* shadow root node the sheet lives in,
                                     -1 = document (shadow-dom arc) */
 };
-#define RULE_MAX    8192
-#define CSSPOOL_CAP (320 * 1024)
+#define RULE_MAX    32768
+#define CSSPOOL_CAP (4096 * 1024)
+#define RIDX_BUCKETS 1024            /* cascade rule index; power of two */
+#define RIDX_MIN_RULES 256           /* below this the linear scan is faster */
 
 /* Shadow-DOM style scoping: the shadow-root node whose subtree we are
  * currently collecting (sheet parse) / styling (rule match); -1 =
@@ -944,6 +949,15 @@ struct eng {
     struct cdecl decls[DECL_MAX];   int ndecls;
     struct crule rules[RULE_MAX];   int nrules;
     char   csspool[CSSPOOL_CAP];    int csspool_len;
+    /* cascade rule index: rule chains bucketed by the rightmost
+     * compound selector's key (see rule_index_build). idx_nrules is the
+     * rule count the index was built for; -1 forces a rebuild. */
+    int32_t idx_id[RIDX_BUCKETS];
+    int32_t idx_cls[RIDX_BUCKETS];
+    int32_t idx_tag[T_NTAGS];
+    int32_t idx_uni;
+    int32_t idx_next[RULE_MAX];
+    int     idx_nrules;
     int    css_order;               /* running decl-order counter */
     int    nsheets;                 /* fetched <link> sheets so far */
     /* display list + collapsed visible text (find-in-page) */
@@ -4240,6 +4254,170 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
 
 struct smatch { uint32_t key; int32_t order; int32_t decl0; int16_t ndecl; };
 
+/* ---- Cascade rule index --------------------------------------------
+ * The cascade used to test EVERY rule against EVERY node: O(nodes x
+ * rules). That is fine for a hand-written page and hopeless for a real
+ * one -- youtube.com ships a 3.4 MiB sheet (~10k rules), so one style
+ * pass ran millions of selector matches (750 ms measured, every pass).
+ *
+ * A rule can only match a node if its RIGHTMOST compound selector
+ * matches it, and that compound nearly always demands a specific id,
+ * class or tag. So bucket each rule under that key; a node then tests
+ * only the rules that could possibly match it (what Blink does).
+ * Selectors with no usable key ("*", "[attr]") land in a small
+ * universal bucket that every node walks.
+ *
+ * This only ever skips rules that CANNOT match -- sel_match_rule still
+ * runs on every candidate, and M[] is sorted by (key, order) which is
+ * unique per rule, so the resulting match set is identical to the
+ * linear scan's. -DCSS_VERIFY cross-checks that on every node. */
+static uint32_t ridx_hash(const char *s, int len) {
+    /* FNV-1a over lowercased text: part_match compares id/class
+     * case-insensitively (csspool text is already lowercased), so the
+     * index has to agree or lookups miss. */
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < len; i++) {
+        h ^= (unsigned char)lc(s[i]);
+        h *= 16777619u;
+    }
+    return h & (RIDX_BUCKETS - 1);
+}
+
+static void rule_index_build(void) {
+    for (int i = 0; i < RIDX_BUCKETS; i++) {
+        E->idx_id[i] = -1;
+        E->idx_cls[i] = -1;
+    }
+    for (int i = 0; i < T_NTAGS; i++) E->idx_tag[i] = -1;
+    E->idx_uni = -1;
+    /* walk backwards + prepend so each chain comes out in ascending
+     * rule order (matches the old scan's iteration order) */
+    for (int r = E->nrules - 1; r >= 0; r--) {
+        const struct crule *ru = &E->rules[r];
+        int32_t *head = &E->idx_uni;
+        if (ru->nparts > 0) {
+            const struct cpart *last = &E->parts[ru->part0 + ru->nparts - 1];
+            if (last->id_len > 0)
+                head = &E->idx_id[ridx_hash(&E->csspool[last->id_off],
+                                            last->id_len)];
+            else if (last->nclass > 0)
+                head = &E->idx_cls[ridx_hash(&E->csspool[last->cls_off[0]],
+                                             last->cls_len[0])];
+            else if (last->tag >= 0 && last->tag < T_NTAGS)
+                head = &E->idx_tag[last->tag];
+        }
+        E->idx_next[r] = *head;
+        *head = (int32_t)r;
+    }
+    E->idx_nrules = E->nrules;
+}
+
+static void rule_index_ensure(void) {
+    if (E->idx_nrules != E->nrules) rule_index_build();
+}
+
+/* Test one candidate and keep M[] sorted by (origin, specificity,
+ * source order). Extracted so the index and the -DCSS_VERIFY linear
+ * scan share identical semantics, including the MATCH_MAX cutoff. */
+static void style_try_rule(int r, int ni, struct smatch *M, int *nm) {
+    const struct crule *ru = &E->rules[r];
+    /* shadow scoping: author rules only match inside the tree that
+     * declared them (document rules stop at shadow boundaries, a
+     * shadow tree's rules stay inside it). UA rules apply anywhere. */
+    if (ru->origin && ru->scope != g_style_scope) return;
+    if (!sel_match_rule(ru, ni)) return;
+    if (*nm >= MATCH_MAX) return;
+    uint32_t key = ((uint32_t)ru->origin << 16) | ru->spec;
+    int k = (*nm)++;
+    while (k > 0 && (M[k - 1].key > key ||
+           (M[k - 1].key == key && M[k - 1].order > ru->order))) {
+        M[k] = M[k - 1];
+        k--;
+    }
+    M[k].key = key;
+    M[k].order = ru->order;
+    M[k].decl0 = ru->decl0;
+    M[k].ndecl = ru->ndecl;
+}
+
+/* The pre-index behaviour: walk every rule in source order. */
+static int style_collect_linear(int ni, struct smatch *M) {
+    int nm = 0;
+    for (int r = 0; r < E->nrules; r++) style_try_rule(r, ni, M, &nm);
+    return nm;
+}
+
+/* Gather every rule that could match `ni`: universal + its tag bucket +
+ * its id bucket + one bucket per class. */
+static int style_collect(int ni, struct smatch *M) {
+    /* Below a few hundred rules the linear scan actually wins: rules[]
+     * is a tight sequential array that sits in cache, while the index
+     * hashes the node's id/class and then chases pointers through a
+     * 128 KiB next[]. Measured on the built-in home page (118 rules):
+     * 43 ms linear vs 79 ms indexed. The index is for real sheets --
+     * youtube.com (10.7k rules): 750 ms linear vs 31 ms indexed. */
+    if (E->nrules < RIDX_MIN_RULES) return style_collect_linear(ni, M);
+
+    int nm = 0;
+    const struct dnode *nd = &E->nodes[ni];
+    for (int r = E->idx_uni; r >= 0; r = E->idx_next[r])
+        style_try_rule(r, ni, M, &nm);
+    if (nd->tag >= 0 && nd->tag < T_NTAGS)
+        for (int r = E->idx_tag[nd->tag]; r >= 0; r = E->idx_next[r])
+            style_try_rule(r, ni, M, &nm);
+    int vlen;
+    const char *v = node_attr(nd, "id", &vlen);
+    if (v && vlen > 0)
+        for (int r = E->idx_id[ridx_hash(v, vlen)]; r >= 0; r = E->idx_next[r])
+            style_try_rule(r, ni, M, &nm);
+    v = node_attr(nd, "class", &vlen);
+    if (v && vlen > 0) {
+        /* Two classes can hash to the SAME bucket; walking it twice
+         * would add its rules twice, so remember which we've done. */
+        uint16_t seen[32];
+        int nseen = 0, i = 0;
+        while (i < vlen) {
+            while (i < vlen && is_whitespace(v[i])) i++;
+            int w0 = i;
+            while (i < vlen && !is_whitespace(v[i])) i++;
+            if (i == w0) break;
+            uint32_t b = ridx_hash(&v[w0], i - w0);
+            int dup = 0;
+            for (int k = 0; k < nseen; k++)
+                if (seen[k] == (uint16_t)b) { dup = 1; break; }
+            if (dup) continue;
+            if (nseen < 32) seen[nseen++] = (uint16_t)b;
+            for (int r = E->idx_cls[b]; r >= 0; r = E->idx_next[r])
+                style_try_rule(r, ni, M, &nm);
+        }
+    }
+    return nm;
+}
+
+#ifdef CSS_VERIFY
+static int msg_append(char *dst, int pos, int max, const char *s);
+static int msg_append_int(char *dst, int pos, int max, int v);
+
+static void style_verify(int ni, const struct smatch *M, int nm) {
+    struct smatch L[MATCH_MAX];
+    int nl = style_collect_linear(ni, L);
+    int bad = (nl != nm);
+    for (int k = 0; !bad && k < nl; k++)
+        if (L[k].order != M[k].order || L[k].key != M[k].key) bad = 1;
+    if (bad) {
+        char m[128]; int p = 0;
+        p = msg_append(m, p, sizeof(m), "[cssverify] MISMATCH node=");
+        p = msg_append_int(m, p, sizeof(m), ni);
+        p = msg_append(m, p, sizeof(m), " idx=");
+        p = msg_append_int(m, p, sizeof(m), nm);
+        p = msg_append(m, p, sizeof(m), " linear=");
+        p = msg_append_int(m, p, sizeof(m), nl);
+        p = msg_append(m, p, sizeof(m), "\n");
+        sys_write(1, m, p);
+    }
+}
+#endif
+
 static void style_node(int ni, const struct cstyle *pst) {
     struct dnode *nd = &E->nodes[ni];
     if (nd->tag == T_TEXT) {
@@ -4329,27 +4507,10 @@ static void style_node(int ni, const struct cstyle *pst) {
         }
     }
     struct smatch M[MATCH_MAX];
-    int nm = 0;
-    for (int r = 0; r < E->nrules; r++) {
-        struct crule *ru = &E->rules[r];
-        /* shadow scoping: author rules only match inside the tree that
-         * declared them (document rules stop at shadow boundaries, a
-         * shadow tree's rules stay inside it). UA rules apply anywhere. */
-        if (ru->origin && ru->scope != g_style_scope) continue;
-        if (!sel_match_rule(ru, ni)) continue;
-        if (nm >= MATCH_MAX) break;
-        uint32_t key = ((uint32_t)ru->origin << 16) | ru->spec;
-        int k = nm++;
-        while (k > 0 && (M[k - 1].key > key ||
-               (M[k - 1].key == key && M[k - 1].order > ru->order))) {
-            M[k] = M[k - 1];
-            k--;
-        }
-        M[k].key = key;
-        M[k].order = ru->order;
-        M[k].decl0 = ru->decl0;
-        M[k].ndecl = ru->ndecl;
-    }
+    int nm = style_collect(ni, M);
+#ifdef CSS_VERIFY
+    style_verify(ni, M, nm);
+#endif
     /* inline style="" -> transient decls (rolled back afterwards) */
     int inl0 = E->ndecls, cp0 = E->csspool_len;
     int vlen;
@@ -6400,6 +6561,7 @@ static void eng_reset(void) {
     E->nparts = 0;
     E->ndecls = 0;
     E->nrules = 0;
+    E->idx_nrules = -1;      /* invalidate the cascade rule index */
     E->csspool_len = 0;
     E->css_order = 0;
     E->nsheets = 0;
@@ -6447,8 +6609,8 @@ static void js_teardown(struct tab *t);
  * unchanged), parsing <style> blocks, and fetching + parsing
  * <link rel=stylesheet> sheets. */
 
-#define SHEET_MAX       6
-#define SHEET_FETCH_CAP (256 * 1024)
+#define SHEET_MAX       16
+#define SHEET_FETCH_CAP (4096 * 1024)
 
 static int g_form_open;          /* collect-walk state: innermost form */
 static int g_js_dirty;           /* a JS primitive mutated the DOM */
@@ -11056,6 +11218,29 @@ static void trans_apply(void) {
     }
 }
 
+/* -DCSS_PERF: time the style pass. The cascade tests every rule against
+ * every node, so this is the number that decides whether a site's
+ * stylesheet is merely large or actually unusable. */
+#ifdef CSS_PERF
+static long g_style_t0;
+#define STYLE_PERF_BEGIN() (g_style_t0 = js_now_ms())
+static void style_perf_end(void) {
+    char m[128]; int p = 0;
+    p = msg_append(m, p, sizeof(m), "[cssperf] style pass ");
+    p = msg_append_int(m, p, sizeof(m), (int)(js_now_ms() - g_style_t0));
+    p = msg_append(m, p, sizeof(m), " ms, rules=");
+    p = msg_append_int(m, p, sizeof(m), E->nrules);
+    p = msg_append(m, p, sizeof(m), " nodes=");
+    p = msg_append_int(m, p, sizeof(m), E->nnodes);
+    p = msg_append(m, p, sizeof(m), "\n");
+    sys_write(1, m, p);
+}
+#define STYLE_PERF_END() style_perf_end()
+#else
+#define STYLE_PERF_BEGIN() ((void)0)
+#define STYLE_PERF_END()   ((void)0)
+#endif
+
 static void js_rerender(void) {
     g_collect_light = 1;
     g_form_open = -1;
@@ -11067,7 +11252,10 @@ static void js_rerender(void) {
     base.disp = D_BLOCK;
     var_scope_reset();
     g_ndeco = 0;                 /* decoration pool: per style pass */
+    rule_index_ensure();
+    STYLE_PERF_BEGIN();
     style_node(0, &base);
+    STYLE_PERF_END();
     anim_apply();                /* overlay CSS animation keyframes */
     trans_apply();               /* overlay CSS transitions */
     layout(g_win_w);
@@ -11391,7 +11579,10 @@ static void render_html(void) {
     base.disp = D_BLOCK;
     var_scope_reset();
     g_ndeco = 0;                 /* decoration pool: per style pass */
+    rule_index_ensure();
+    STYLE_PERF_BEGIN();
     style_node(0, &base);
+    STYLE_PERF_END();
     anim_apply();                         /* start CSS animations at t0 */
     trans_apply();                        /* seed transition current values */
 

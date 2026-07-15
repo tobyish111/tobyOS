@@ -26,7 +26,10 @@
 #include <tobyos/klibc.h>
 
 #define HTTPA_MAX         8
-#define HTTPA_KERNEL_MAX  (1u << 20)   /* per-transfer kernel body cap */
+/* Per-transfer kernel body cap. 8 MiB: this silently overrode the
+ * caller's max_body, so the browser's page cap was really 1 MiB no
+ * matter what it asked for. */
+#define HTTPA_KERNEL_MAX  (8u << 20)
 
 struct ha_slot {
     bool     used;
