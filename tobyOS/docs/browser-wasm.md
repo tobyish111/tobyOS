@@ -164,13 +164,19 @@ engine regardless.
   imported tables (wasm3's public API exposes only `m3_GetTableFunction`).
   Imported globals aren't linked either (like tables, wasm3 has no host
   hook); exported globals and a module's own globals work.
-- **No SIMD (`v128`).** wasm3 0.5.2 doesn't implement the SIMD opcodes, so
-  a module *compiled with* SIMD won't run. SIMD is opt-in at compile time,
-  so most modules are unaffected. This is an interpreter limitation, not a
-  wiring gap.
+- **No SIMD (`v128`) — graceful reject.** wasm3 0.5.2 doesn't implement
+  the `0xFD`-prefixed SIMD opcodes, and adding them is not a wiring gap: it
+  needs the ~236 v128 operations *plus* widening the interpreter's value
+  stack from 64-bit slots to 128 bits — which is why wasm3 upstream never
+  did it. A module that *uses* SIMD still parses/instantiates; the first
+  call into a SIMD function fails cleanly with `unknown opcode` (a
+  catchable `WebAssembly`/`TypeError` on the JS side, no crash), so pages
+  that feature-detect and fall back keep working. SIMD is opt-in at
+  compile time, so most `.wasm` is unaffected.
 - **Interpreter, not a JIT.** Execution is wasm3's fast interpreter;
-  there's no native-code tier. Correct and fine for small/medium modules;
-  a heavy compute kernel runs slower than a JIT'd browser.
+  there is no native-code tier (a JIT would be a whole codegen backend —
+  a separate project, not a patch). Correct and fine for small/medium
+  modules; a heavy compute kernel runs slower than a JIT'd browser.
 
 ## On-screen browser test
 
