@@ -1336,8 +1336,10 @@ static void tp_put_cp(unsigned int cp) {
     if (cp == '\t') { tp_putc(' '); tp_putc(' '); return; }
     if (cp < 0x20) { if (cp == '\n') tp_putc('\n'); return; }
     if (cp < 0x80) { tp_putc((char)cp); return; }
-    if (cp == 0x200B || cp == 0x200C || cp == 0x200D ||
+    if (cp == 0x200B || cp == 0x200C ||
         cp == 0xFEFF || cp == 0xAD) return;         /* zero-width */
+    /* U+200D ZWJ is kept: it glues emoji ZWJ sequences (the inline layout
+     * consumes it into a ligature, or drops a standalone one). */
     if (cp > 0x10FFFF) cp = 0xFFFD;
     if (cp < 0x800) {
         tp_putc((char)(0xC0 | (cp >> 6)));
@@ -1519,36 +1521,61 @@ static unsigned int emoji_next_cp(const char *s, int n, int *adv) {
 }
 
 #define EMOJI_CACHE 24
+#define EMOJI_SEQ_CPS 8
 static struct emoji_glyph {
-    int cp, px, w, h, adv, lru;
+    int cps[EMOJI_SEQ_CPS], n, px, w, h, adv, lru;
     uint32_t *rgba;
 } g_emoji_cache[EMOJI_CACHE];
 static int g_emoji_lru;
 
-static struct emoji_glyph *emoji_get(int cp, int px) {
+static int emoji_seq_eq(const struct emoji_glyph *g, const int *cps, int n, int px) {
+    if (g->px != px || g->n != n) return 0;
+    for (int i = 0; i < n; i++) if (g->cps[i] != cps[i]) return 0;
+    return 1;
+}
+
+/* Render+cache the color glyph for a codepoint sequence (n==1 = a plain
+ * emoji; n>1 = a ZWJ ligature). */
+static struct emoji_glyph *emoji_get(const int *cps, int n, int px) {
     if (px < 6) px = 6; if (px > 128) px = 128;
+    if (n > EMOJI_SEQ_CPS) n = EMOJI_SEQ_CPS;
     for (int i = 0; i < EMOJI_CACHE; i++)
-        if (g_emoji_cache[i].rgba && g_emoji_cache[i].cp == cp &&
-            g_emoji_cache[i].px == px) {
+        if (g_emoji_cache[i].rgba && emoji_seq_eq(&g_emoji_cache[i], cps, n, px)) {
             g_emoji_cache[i].lru = ++g_emoji_lru;
             return &g_emoji_cache[i];
         }
     toby_emoji_t *e = emoji_font();
     if (!e) return NULL;
     int w = 0, h = 0, adv = 0;
-    uint32_t *rgba = toby_emoji_render(e, cp, px, &w, &h, &adv);
+    uint32_t *rgba = toby_emoji_render_seq(e, cps, n, px, &w, &h, &adv);
     if (!rgba) return NULL;
-    /* evict the LRU slot */
     int slot = 0, best = g_emoji_cache[0].lru;
     for (int i = 1; i < EMOJI_CACHE; i++)
         if (!g_emoji_cache[i].rgba) { slot = i; break; }
         else if (g_emoji_cache[i].lru < best) { best = g_emoji_cache[i].lru; slot = i; }
     if (g_emoji_cache[slot].rgba) free(g_emoji_cache[slot].rgba);
-    g_emoji_cache[slot].cp = cp; g_emoji_cache[slot].px = px;
+    for (int i = 0; i < n; i++) g_emoji_cache[slot].cps[i] = cps[i];
+    g_emoji_cache[slot].n = n; g_emoji_cache[slot].px = px;
     g_emoji_cache[slot].w = w; g_emoji_cache[slot].h = h;
     g_emoji_cache[slot].adv = adv; g_emoji_cache[slot].rgba = rgba;
     g_emoji_cache[slot].lru = ++g_emoji_lru;
     return &g_emoji_cache[slot];
+}
+
+/* Per-layout pool of emoji codepoint sequences (a DI_EMOJI item's `off`
+ * indexes it). Reset each layout pass. */
+#define EMOJI_SEQ_MAX 512
+static int g_eseq[EMOJI_SEQ_MAX][EMOJI_SEQ_CPS];
+static int g_eseq_n[EMOJI_SEQ_MAX];
+static int g_neseq;
+
+static int emoji_seq_add(const int *cps, int n) {
+    if (g_neseq >= EMOJI_SEQ_MAX) return -1;
+    if (n > EMOJI_SEQ_CPS) n = EMOJI_SEQ_CPS;
+    int idx = g_neseq++;
+    for (int i = 0; i < n; i++) g_eseq[idx][i] = cps[i];
+    g_eseq_n[idx] = n;
+    return idx;
 }
 
 /* ---- Tag table ---------------------------------------------------- */
@@ -4641,12 +4668,13 @@ static void ic_break(struct ictx *ic, int min_h) {
 
 /* Append one word to the line, wrapping as needed; coalesces into the
  * open text item when style + render-pool position allow. */
-/* Place one color emoji as an atomic box on the inline line (its own
- * DI_EMOJI item; the codepoint rides in `off`). Sized ~1em, advance from
- * the rendered glyph. */
-static void ic_emoji(struct ictx *ic, int cp, const struct istyle *is) {
+/* Place one color emoji (a codepoint sequence -- a single emoji or a ZWJ
+ * ligature) as an atomic box on the inline line. Its DI_EMOJI item's `off`
+ * indexes the per-layout sequence pool. Sized ~1em, advance from the
+ * rendered glyph. */
+static void ic_emoji(struct ictx *ic, const int *cps, int n, const struct istyle *is) {
     int px = is->px;
-    struct emoji_glyph *g = emoji_get(cp, px);
+    struct emoji_glyph *g = emoji_get(cps, n, px);
     int h = px, w = px;
     if (g) { h = g->h; w = g->adv; }
     for (int guard = 0; guard < 64; guard++) {
@@ -4654,13 +4682,15 @@ static void ic_emoji(struct ictx *ic, int cp, const struct istyle *is) {
         break;
     }
     ic->pend_sp = 0;
+    int si = emoji_seq_add(cps, n);
+    if (si < 0) return;
     struct ditem *it = item_new(DI_EMOJI);
     if (!it) return;
     it->x = ic->x;
     it->y = ic->y;
     it->w = w;
     it->h = h;
-    it->off = cp;                     /* codepoint (repurposed field) */
+    it->off = si;                     /* index into the emoji sequence pool */
     it->px = (uint8_t)px;
     it->link = (int16_t)is->link;
     it->node = is->node;
@@ -4679,17 +4709,43 @@ static void ic_word(struct ictx *ic, const char *w, int wl, const struct istyle 
         unsigned int cp = emoji_next_cp(w + k, wl - k, &adv);
         if (cp >= 0x2000 && emoji_is(cp)) {
             if (k > 0) ic_word(ic, w, k, is);          /* text before */
-            ic_emoji(ic, (int)cp, is);
-            int after = k + adv;
-            /* swallow a trailing variation selector (U+FE0E/FE0F) or ZWJ
-             * (U+200D)+next so they don't render as tofu next to the emoji. */
-            while (after < wl) {
+            /* Gather the run of codepoints from here (emoji + ZWJ + VS)
+             * and let the font's GSUB tell us the longest ZWJ ligature. */
+            int cps[EMOJI_SEQ_CPS]; int ncp = 0, blen[EMOJI_SEQ_CPS];
+            int p = k;
+            while (p < wl && ncp < EMOJI_SEQ_CPS) {
                 int a2 = 1;
-                unsigned int c2 = emoji_next_cp(w + after, wl - after, &a2);
-                if (c2 == 0xFE0F || c2 == 0xFE0E) { after += a2; }
-                else break;
+                unsigned int c2 = emoji_next_cp(w + p, wl - p, &a2);
+                /* keep emoji, ZWJ, and variation selectors in the run */
+                if (!(emoji_is(c2) || c2 == 0x200D || c2 == 0xFE0F || c2 == 0xFE0E))
+                    break;
+                cps[ncp] = (int)c2; blen[ncp] = a2; ncp++;
+                p += a2;
+            }
+            toby_emoji_t *ef = emoji_font();
+            int seqn = ef ? toby_emoji_seq_len(ef, cps, ncp) : 0;
+            int after;
+            if (seqn >= 2) {                            /* a ZWJ ligature */
+                ic_emoji(ic, cps, seqn, is);
+                after = k; for (int i = 0; i < seqn; i++) after += blen[i];
+            } else {                                    /* a single emoji */
+                int one[1] = { (int)cp };
+                ic_emoji(ic, one, 1, is);
+                after = k + adv;
+                /* swallow a trailing variation selector */
+                while (after < wl) {
+                    int a3 = 1;
+                    unsigned int c3 = emoji_next_cp(w + after, wl - after, &a3);
+                    if (c3 == 0xFE0F || c3 == 0xFE0E) after += a3; else break;
+                }
             }
             if (after < wl) ic_word(ic, w + after, wl - after, is);
+            return;
+        }
+        if (cp == 0x200D || cp == 0xFE0F || cp == 0xFE0E) {
+            /* standalone joiner/variation selector: zero-width, drop it */
+            if (k > 0) ic_word(ic, w, k, is);
+            if (k + adv < wl) ic_word(ic, w + k + adv, wl - k - adv, is);
             return;
         }
         k += adv;
@@ -6257,6 +6313,7 @@ static void layout(int width) {
     g_find_run = -1;
     g_nlayer = 0;                /* compositing layers rebuild per layout */
     g_nsticky = 0;               /* sticky groups rebuild per layout */
+    g_neseq = 0;                 /* emoji sequence pool rebuilds per layout */
     g_layout_w = width;
     if (E->nnodes == 0) { g_doc_h = 0; E->render[0] = 0; return; }
 
@@ -11698,7 +11755,12 @@ static void set_home_page(void) {
         "<p class=big>\xF0\x9F\x98\x80 \xF0\x9F\x98\x8E \xF0\x9F\x98\x82 \xF0\x9F\x91\x8D "
         "\xE2\x9D\xA4\xEF\xB8\x8F \xF0\x9F\x8E\x89 \xF0\x9F\x9A\x80 \xF0\x9F\x8C\x88 "
         "\xF0\x9F\x94\xA5 \xF0\x9F\x8C\x9F</p>"
-        "</body></html>";
+        "<h1>ZWJ sequences</h1>"
+        "<p class=big>"
+        "\xF0\x9F\x8F\xB3\xEF\xB8\x8F\xE2\x80\x8D\xF0\x9F\x8C\x88 "        /* rainbow flag */
+        "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7 " /* family MWG */
+        "\xF0\x9F\x91\xA9\xE2\x80\x8D\xE2\x9D\xA4\xEF\xB8\x8F\xE2\x80\x8D\xF0\x9F\x91\xA8" /* couple WHM */
+        "</p></body></html>";
 #endif
 #ifdef CSSVIS_TEST
     /* Visual CSS test: inline-block flow, conic gradients, per-corner
@@ -14327,7 +14389,9 @@ static void paint_content_item(int ri, int sksh, int vtop, int vbot,
     }
     if (r->kind == DI_IMG) { paint_image(r, sy); return; }
     if (r->kind == DI_EMOJI) {
-        struct emoji_glyph *g = emoji_get((int)r->off, r->px);
+        int si = r->off;
+        struct emoji_glyph *g = (si >= 0 && si < g_neseq)
+            ? emoji_get(g_eseq[si], g_eseq_n[si], r->px) : NULL;
         if (g && g->rgba) {
             for (int yy = 0; yy < g->h; yy++) {
                 int py = sy + yy;

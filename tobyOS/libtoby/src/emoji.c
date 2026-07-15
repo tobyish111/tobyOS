@@ -53,7 +53,30 @@ struct toby_emoji {
     const uint8_t *layer_recs;   /* (gid,paletteIndex) u16 */
     const uint8_t *pal0;         /* CPAL palette-0 color records (BGRA) */
     uint16_t       npal_entries;
+    /* GSUB ligature substitution subtables (LigatureSubstFormat1), used to
+     * fold a ZWJ emoji sequence into one ligature glyph. */
+    const uint8_t *lig_sub[128];
+    int            n_lig;
 };
+
+/* Coverage table -> index of `gid`, or -1. Formats 1 (glyph list) and 2
+ * (range records). */
+static int coverage_index(const uint8_t *cov, int gid) {
+    uint16_t fmt = be16(cov);
+    if (fmt == 1) {
+        uint16_t n = be16(cov + 2);
+        for (uint16_t i = 0; i < n; i++)
+            if (be16(cov + 4 + i * 2) == gid) return i;
+    } else if (fmt == 2) {
+        uint16_t n = be16(cov + 2);
+        for (uint16_t i = 0; i < n; i++) {
+            const uint8_t *r = cov + 4 + i * 6;
+            int start = be16(r), end = be16(r + 2), sci = be16(r + 4);
+            if (gid >= start && gid <= end) return sci + (gid - start);
+        }
+    }
+    return -1;
+}
 
 toby_emoji_t *toby_emoji_load(const uint8_t *ttf, size_t len) {
     if (!ttf || len < 12) return NULL;
@@ -82,6 +105,24 @@ toby_emoji_t *toby_emoji_load(const uint8_t *ttf, size_t len) {
     uint32_t cr_off = be32(cpal + 8);
     uint16_t idx0   = be16(cpal + 12);
     e->pal0 = cpal + cr_off + (uint32_t)idx0 * 4;
+
+    /* GSUB: collect ligature-substitution (lookup type 4) subtables so a
+     * ZWJ emoji sequence can be folded into one glyph. */
+    uint32_t gsub_len = 0;
+    const uint8_t *gsub = find_table(ttf, (uint32_t)len, "GSUB", &gsub_len);
+    if (gsub && gsub_len >= 10) {
+        const uint8_t *ll = gsub + be16(gsub + 8);      /* LookupList */
+        uint16_t nlook = be16(ll);
+        for (uint16_t i = 0; i < nlook && e->n_lig < 128; i++) {
+            const uint8_t *lk = ll + be16(ll + 2 + i * 2);
+            if (be16(lk) != 4) continue;                /* ligature subst */
+            uint16_t nsub = be16(lk + 4);
+            for (uint16_t s = 0; s < nsub && e->n_lig < 128; s++) {
+                const uint8_t *st = lk + be16(lk + 6 + s * 2);
+                if (be16(st) == 1) e->lig_sub[e->n_lig++] = st;  /* format 1 */
+            }
+        }
+    }
     return e;
 }
 
@@ -108,11 +149,37 @@ int toby_emoji_has(toby_emoji_t *e, int cp) {
     return find_base(e, gid, &first, &num);
 }
 
-uint32_t *toby_emoji_render(toby_emoji_t *e, int cp, int px,
+/* Fold a glyph sequence into one ligature glyph via GSUB (matches ZWJ
+ * emoji sequences). Returns the ligature glyph, or 0 if none applies. The
+ * match starts at gids[0] and must consume all n glyphs. */
+static int resolve_ligature(toby_emoji_t *e, const int *gids, int n) {
+    if (n < 2) return 0;
+    for (int s = 0; s < e->n_lig; s++) {
+        const uint8_t *st = e->lig_sub[s];              /* LigatureSubstFormat1 */
+        const uint8_t *cov = st + be16(st + 2);
+        int ci = coverage_index(cov, gids[0]);
+        if (ci < 0) continue;
+        uint16_t nset = be16(st + 4);
+        if (ci >= nset) continue;
+        const uint8_t *ligset = st + be16(st + 6 + ci * 2);
+        uint16_t nlig = be16(ligset);
+        for (uint16_t l = 0; l < nlig; l++) {
+            const uint8_t *lig = ligset + be16(ligset + 2 + l * 2);
+            int lig_glyph = be16(lig);
+            int comp_count = be16(lig + 2);             /* incl. first (cov) */
+            if (comp_count != n) continue;              /* must consume all */
+            int ok = 1;
+            for (int c = 1; c < comp_count; c++)
+                if (be16(lig + 2 + c * 2) != gids[c]) { ok = 0; break; }
+            if (ok) return lig_glyph;
+        }
+    }
+    return 0;
+}
+
+/* Composite a COLR base glyph's layers into a fresh px*px ARGB buffer. */
+static uint32_t *render_gid(toby_emoji_t *e, int gid, int px,
                             int *ow, int *oh, int *oadv) {
-    if (!e || px <= 0 || px > 512) return NULL;
-    int gid = stbtt_FindGlyphIndex(&e->info, cp);
-    if (!gid) return NULL;
     uint16_t first, num;
     if (!find_base(e, gid, &first, &num) || num == 0) return NULL;
 
@@ -177,6 +244,48 @@ uint32_t *toby_emoji_render(toby_emoji_t *e, int cp, int px,
     if (oh) *oh = H;
     if (oadv) *oadv = advpx;
     return out;
+}
+
+uint32_t *toby_emoji_render(toby_emoji_t *e, int cp, int px,
+                            int *ow, int *oh, int *oadv) {
+    if (!e || px <= 0 || px > 512) return NULL;
+    int gid = stbtt_FindGlyphIndex(&e->info, cp);
+    if (!gid) return NULL;
+    return render_gid(e, gid, px, ow, oh, oadv);
+}
+
+/* Map a codepoint sequence -> glyph ids, fold via GSUB ligatures, render
+ * the resulting color glyph. For a plain single codepoint this is the
+ * same as toby_emoji_render. Returns NULL if the (folded) glyph has no
+ * color layers. */
+uint32_t *toby_emoji_render_seq(toby_emoji_t *e, const int *cps, int n, int px,
+                                int *ow, int *oh, int *oadv) {
+    if (!e || n <= 0 || px <= 0 || px > 512) return NULL;
+    int gids[32];
+    if (n > 32) n = 32;
+    for (int i = 0; i < n; i++) {
+        gids[i] = stbtt_FindGlyphIndex(&e->info, cps[i]);
+        if (!gids[i]) return NULL;
+    }
+    int gid = (n == 1) ? gids[0] : resolve_ligature(e, gids, n);
+    if (!gid) return NULL;
+    return render_gid(e, gid, px, ow, oh, oadv);
+}
+
+/* Longest ZWJ emoji sequence starting at cps[0] the font has a ligature
+ * for (>=1). cps holds codepoints; returns the number consumed. */
+int toby_emoji_seq_len(toby_emoji_t *e, const int *cps, int n) {
+    if (!e || n <= 0) return 0;
+    int gids[32];
+    if (n > 32) n = 32;
+    for (int i = 0; i < n; i++) {
+        gids[i] = stbtt_FindGlyphIndex(&e->info, cps[i]);
+        if (!gids[i]) { n = i; break; }
+    }
+    /* try the longest prefix that resolves to a ligature */
+    for (int k = n; k >= 2; k--)
+        if (resolve_ligature(e, gids, k)) return k;
+    return 0;                                   /* no multi-cp ligature */
 }
 
 void toby_emoji_free(toby_emoji_t *e) { if (e) free(e); }

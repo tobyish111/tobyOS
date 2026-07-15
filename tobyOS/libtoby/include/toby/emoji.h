@@ -32,6 +32,15 @@ int  toby_emoji_has(toby_emoji_t *e, int cp);
 uint32_t *toby_emoji_render(toby_emoji_t *e, int cp, int px,
                             int *w, int *h, int *advance);
 
+/* Render a codepoint sequence, folding ZWJ sequences (e.g. 👨‍👩‍👧,
+ * 🏳️‍🌈) into their single ligature glyph via GSUB. n=1 == toby_emoji_render. */
+uint32_t *toby_emoji_render_seq(toby_emoji_t *e, const int *cps, int n, int px,
+                                int *w, int *h, int *advance);
+
+/* Length (>=2) of the longest ZWJ ligature sequence starting at cps[0],
+ * or 0 if cps[0] doesn't begin a multi-codepoint ligature. */
+int  toby_emoji_seq_len(toby_emoji_t *e, const int *cps, int n);
+
 void toby_emoji_free(toby_emoji_t *e);
 
 #ifdef __cplusplus

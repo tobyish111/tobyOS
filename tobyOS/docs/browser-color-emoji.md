@@ -36,12 +36,25 @@ content.
   LRU cache (`emoji_get`, keyed by codepoint+px) and blits the ARGB glyph
   with `tk_draw_blit_blend`.
 
+## ZWJ sequences
+
+Emoji ZWJ sequences (🏳️‍🌈, 👨‍👩‍👧, 👩‍❤️‍👨, …) fold into their single
+ligature glyph via the font's **GSUB** ligature-substitution table:
+`toby_emoji_seq_len` maps the codepoint run (emoji + U+200D ZWJ +
+variation selectors) to glyph ids and finds the longest ligature;
+`toby_emoji_render_seq` renders the resulting glyph via COLR. In the
+browser, `ic_word` gathers the run and emits one `DI_EMOJI` over a
+per-layout sequence pool (the item's `off` indexes it). Note: `tp_put_cp`
+keeps U+200D (previously dropped as zero-width) so the joiner reaches the
+layout; a standalone ZWJ/variation-selector not part of a sequence is
+still dropped.
+
 ## Known limits
 
 - **COLR v0 only** — layered solid-color glyphs (Twemoji). No COLR v1
   gradients, no CBDT/CBLC (bitmap) or sbix or OT-SVG color formats.
-- **Single codepoints** — no ZWJ emoji sequences (👨‍👩‍👧, 🏳️‍🌈), skin-tone
-  modifiers, or flag pairs; each base codepoint renders as its own glyph.
+- Skin-tone-modifier and flag-pair (regional indicator) sequences render
+  per component unless the font defines a direct ligature for them.
 - Emoji are top/line-aligned atomics, not baseline-shifted; hit-testing
   treats them as non-interactive inline boxes.
 - The color path is browser-side only (userspace libtoby); the kernel
