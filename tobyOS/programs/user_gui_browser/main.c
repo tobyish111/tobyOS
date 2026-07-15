@@ -1038,8 +1038,13 @@ struct media_el {
     /* video: AVI frame index (MJPEG or H.264 Annex-B chunks) */
     long     frame_off[MEDIA_FRAMES_MAX];
     int      frame_len[MEDIA_FRAMES_MAX];
+    int      frame_pts[MEDIA_FRAMES_MAX];  /* presentation time (ms) from stts */
     int      nframes, cur_frame;
     long     frame_ms, next_ms;
+    long     play_start;                   /* wall clock (ms) at play start;
+                                            * video presents against it as
+                                            * the master (audio) clock */
+    int      have_pts;                     /* frame_pts populated (MP4) */
     void    *vdec;                /* video_decoder* when H.264 (else MJPEG) */
     int      vdec_errs;           /* consecutive chunk errors (leniency) */
     int      is_mp4;              /* MP4 container (samples are H.264) */
@@ -7657,8 +7662,14 @@ static JSValue js_media_ctl(JSContext *cx, JSValueConst t, int argc, JSValueCons
             m->playing = play ? 1 : 0;
             if (m->playing) {
                 m->next_ms = js_now_ms();
+                /* anchor the master clock so frame_pts[cur] is relative to
+                 * now (rewind the anchor by the current frame's PTS). */
+                m->play_start = js_now_ms() -
+                    (m->have_pts && m->cur_frame < m->nframes
+                         ? m->frame_pts[m->cur_frame]
+                         : (long)m->cur_frame * m->frame_ms);
                 if (m->is_video && m->cur_frame >= m->nframes)
-                    m->cur_frame = 0;      /* replay from the top */
+                    { m->cur_frame = 0; m->play_start = js_now_ms(); }
             }
         } else if (m->state == 0 || m->state == 2) {
             m->autoplay = play ? 1 : 0;    /* start once the fetch lands */
@@ -11349,6 +11360,19 @@ static void set_home_page(void) {
         "<audio src='http://10.0.2.2:8099/a.m4a' autoplay loop></audio>"
         "</body></html>";
 #endif
+#ifdef AVSYNC_TEST
+    /* MP4 video+audio A/V-sync test: autoplay <video> with an H.264 +
+     * AAC MP4 from the host. Watch serial for "[med] mp4/h264 ...",
+     * "mp4 pts[0..1] ..." (0 ~40), and "mp4/aac ..." -- both tracks
+     * demux, video presents against the audio master clock. */
+    html =
+        "<html><head><title>A/V sync</title></head><body>"
+        "<h1 style='color:#1a73e8;font-size:24px'>A/V sync test</h1>"
+        "<p>H.264 + AAC MP4 &mdash; check serial for [med] pts + aac.</p>"
+        "<video src='http://10.0.2.2:8099/av.mp4' autoplay loop "
+        "width='160' height='120'></video>"
+        "</body></html>";
+#endif
 #ifdef STREAM_TEST
     /* On-screen Streams/binary test: binary-safe arrayBuffer(), a
      * ReadableStream reader loop over a fetched .wasm, TextEncoder/
@@ -12537,6 +12561,11 @@ static int media_demux_mp4(struct media_el *m) {
     uint32_t spc = (nsc > 0) ? rd32be(stsc + 8 + 4) : 1;  /* samples/chunk */
     long sample_off = 0;
     uint32_t stsz_p = 12;
+    /* stts cursor for per-frame PTS (cumulative decode time -> ms). */
+    uint32_t stts_ent = (stts && sttsl >= 8) ? rd32be(stts + 4) : 0;
+    uint32_t stts_i = 0, stts_rem = 0, stts_delta = 0;
+    long pts_ticks = 0;
+    m->have_pts = (stts_ent > 0 && timescale > 0);
     for (uint32_t s = 0; s < nsamp && m->nframes < MEDIA_FRAMES_MAX; s++) {
         /* Advance stsc run when we pass its first_chunk boundary. */
         while (sc_idx + 1 < nsc) {
@@ -12568,6 +12597,17 @@ static int media_demux_mp4(struct media_el *m) {
         }
         m->frame_off[m->nframes] = sample_off;
         m->frame_len[m->nframes] = (int)ssz;
+        if (m->have_pts) {
+            m->frame_pts[m->nframes] =
+                (int)(pts_ticks * 1000 / (long)timescale);
+            /* advance to the next sample's cumulative decode time */
+            if (stts_rem == 0 && stts_i < stts_ent) {
+                stts_delta = rd32be(stts + 8 + stts_i * 8 + 4);
+                stts_rem   = rd32be(stts + 8 + stts_i * 8);
+                stts_i++;
+            }
+            if (stts_rem > 0) { pts_ticks += stts_delta; stts_rem--; }
+        }
         m->nframes++;
 
         sample_off += (long)ssz;
@@ -12796,6 +12836,9 @@ static void media_ready(struct media_el *m) {
                                  m->vcfg, (size_t)m->vcfg_len, &vf);
         }
         med_log("mp4/h264 frames/period", m->nframes, (int)m->frame_ms);
+        med_log("mp4 pts[0..1] (have_pts=1)",
+                m->nframes > 0 ? m->frame_pts[0] : -1,
+                m->nframes > 1 ? m->frame_pts[1] : -1);
         media_init_mp4_audio(m);       /* + AAC track if the MP4 has one */
         m->state = 1;
     } else if (!m->is_video && m->dlen > 12 && m4(m->data + 4, "ftyp") &&
@@ -12833,6 +12876,7 @@ static void media_ready(struct media_el *m) {
     if (m->autoplay) {
         m->playing = 1;
         m->next_ms = js_now_ms();
+        m->play_start = js_now_ms();     /* master-clock anchor (PTS 0 = now) */
     }
 }
 
@@ -13004,13 +13048,23 @@ static int media_pump(void) {
             /* Feed audio every tick (independent of the video frame
              * clock), else it would starve between frames. */
             if (m->aac) work |= media_aac_pump(m);
-            if (m->nframes <= 0 || now < m->next_ms) continue;
+            if (m->nframes <= 0) continue;
+            /* Present against the master clock (wall time since play
+             * start; audio self-paces to real time via its ring, so this
+             * keeps video locked to audio). Each frame shows when its PTS
+             * is due; under slow decode video lags but audio never
+             * stutters. */
+            long master = now - m->play_start;
+            long due_pts = (m->have_pts && m->cur_frame < m->nframes)
+                         ? (long)m->frame_pts[m->cur_frame]
+                         : (long)m->cur_frame * m->frame_ms;
+            if (m->cur_frame < m->nframes && master < due_pts) continue;
             struct img *im = (m->img >= 0 && m->img < g_nimages)
                                  ? &g_images[m->img] : NULL;
             if (!im || !im->pixels) {
                 m->cur_frame++;
                 if (m->cur_frame >= m->nframes) {
-                    if (m->loop) m->cur_frame = 0;
+                    if (m->loop) { m->cur_frame = 0; m->play_start = now; }
                     else m->playing = 0;
                 }
             } else if (m->vdec) {
@@ -13034,7 +13088,7 @@ static int media_pump(void) {
                         rc = video_decoder_decode(
                             (struct video_decoder *)m->vdec, NULL, 0, &vf);
                         if (rc <= 0) {          /* decoder fully drained */
-                            if (m->loop) m->cur_frame = 0;
+                            if (m->loop) { m->cur_frame = 0; m->play_start = now; }
                             else m->playing = 0;
                             break;
                         }
@@ -13068,9 +13122,6 @@ static int media_pump(void) {
                     else m->playing = 0;
                 }
             }
-            long due = m->next_ms + m->frame_ms;
-            m->next_ms = (due > now - 4 * m->frame_ms) ? due
-                                                       : now + m->frame_ms;
             work = 1;
         } else if (m->aac) {
             work |= media_aac_pump(m);         /* audio-only MP4/M4A */
