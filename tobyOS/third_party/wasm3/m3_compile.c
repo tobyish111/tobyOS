@@ -123,6 +123,7 @@ void * ReservePointer (IM3Compilation o)
 #define i_64    c_m3Type_i64
 #define f_32    c_m3Type_f32
 #define f_64    c_m3Type_f64
+#define v_128   c_m3Type_v128
 #define none    c_m3Type_none
 #define any     (u8)-1
 
@@ -2277,6 +2278,155 @@ M3Result  CompileRawFunction  (IM3Module io_module,  IM3Function io_function, co
 #define d_commutativeBinOpList(TYPE, NAME)  { op_##TYPE##_##NAME##_rs,  NULL,                       op_##TYPE##_##NAME##_ss,    NULL }
 #define d_convertOpList(OP)                 { op_##OP##_r_r,            op_##OP##_r_s,              op_##OP##_s_r,              op_##OP##_s_s }
 
+//---------------------------------------------------------------------------------------------------------------------
+// SIMD (v128) compilers. v128 is slot-only; scalar operands are forced to
+// slots first (PreserveRegisters) since our v128 ops only read slot offsets.
+// The op function is carried in operations[0]; the compiler emits it plus
+// the operand/result slot offsets (and any immediates) in the order the op
+// reads them. See the m3_exec.h v128 ops for the matching read order.
+//---------------------------------------------------------------------------------------------------------------------
+
+#define d_v128op(OP)  { op_##OP, NULL, NULL, NULL }
+
+static M3Result  Compile_SIMD_Const  (IM3Compilation o, m3opcode_t i_opcode)
+{
+_try {
+    (void) i_opcode;
+_   (EmitOp (o, op_v128_Const));
+    u8 b[16];
+    for (int i = 0; i < 16; i++) _(Read_u8 (& b[i], & o->wasm, o->wasmEnd));
+    if (o->page) { u64 w0, w1; memcpy (&w0, b, 8); memcpy (&w1, b + 8, 8);
+                   EmitWord64 (o->page, w0); EmitWord64 (o->page, w1); }
+_   (PushAllocatedSlotAndEmit (o, c_m3Type_v128));
+} _catch: return result;
+}
+
+static M3Result  Compile_SIMD_Splat  (IM3Compilation o, m3opcode_t i_opcode)
+{
+_try {
+    IM3OpInfo info = GetOpInfo (i_opcode);
+_   (PreserveRegisters (o));
+_   (EmitOp (o, info->operations[0]));
+_   (EmitSlotNumOfStackTopAndPop (o));                  // scalar operand
+_   (PushAllocatedSlotAndEmit (o, c_m3Type_v128));
+} _catch: return result;
+}
+
+static M3Result  Compile_SIMD_Unop  (IM3Compilation o, m3opcode_t i_opcode)
+{
+_try {
+    IM3OpInfo info = GetOpInfo (i_opcode);
+_   (PreserveRegisters (o));
+_   (EmitOp (o, info->operations[0]));
+_   (EmitSlotNumOfStackTopAndPop (o));                  // v128 operand
+_   (PushAllocatedSlotAndEmit (o, c_m3Type_v128));
+} _catch: return result;
+}
+
+static M3Result  Compile_SIMD_Binop  (IM3Compilation o, m3opcode_t i_opcode)
+{
+_try {
+    IM3OpInfo info = GetOpInfo (i_opcode);
+_   (PreserveRegisters (o));
+_   (EmitOp (o, info->operations[0]));
+_   (EmitSlotNumOfStackTopAndPop (o));                  // b (top)
+_   (EmitSlotNumOfStackTopAndPop (o));                  // a
+_   (PushAllocatedSlotAndEmit (o, c_m3Type_v128));
+} _catch: return result;
+}
+
+static M3Result  Compile_SIMD_Extract  (IM3Compilation o, m3opcode_t i_opcode)
+{
+_try {
+    IM3OpInfo info = GetOpInfo (i_opcode);
+_   (PreserveRegisters (o));
+_   (EmitOp (o, info->operations[0]));
+    u8 lane; _(Read_u8 (& lane, & o->wasm, o->wasmEnd));
+    EmitConstant32 (o, lane);
+_   (EmitSlotNumOfStackTopAndPop (o));                  // v128 operand
+_   (PushAllocatedSlotAndEmit (o, info->type));          // scalar result
+} _catch: return result;
+}
+
+static M3Result  Compile_SIMD_Replace  (IM3Compilation o, m3opcode_t i_opcode)
+{
+_try {
+    IM3OpInfo info = GetOpInfo (i_opcode);
+_   (PreserveRegisters (o));
+_   (EmitOp (o, info->operations[0]));
+    u8 lane; _(Read_u8 (& lane, & o->wasm, o->wasmEnd));
+    EmitConstant32 (o, lane);
+_   (EmitSlotNumOfStackTopAndPop (o));                  // scalar (top)
+_   (EmitSlotNumOfStackTopAndPop (o));                  // v128
+_   (PushAllocatedSlotAndEmit (o, c_m3Type_v128));
+} _catch: return result;
+}
+
+static M3Result  Compile_SIMD_Shuffle  (IM3Compilation o, m3opcode_t i_opcode)
+{
+_try {
+    (void) i_opcode;
+_   (PreserveRegisters (o));
+_   (EmitOp (o, op_i8x16_Shuffle));
+    u8 idx[16];
+    for (int i = 0; i < 16; i++) _(Read_u8 (& idx[i], & o->wasm, o->wasmEnd));
+    if (o->page) { u64 w0, w1; memcpy (&w0, idx, 8); memcpy (&w1, idx + 8, 8);
+                   EmitWord64 (o->page, w0); EmitWord64 (o->page, w1); }
+_   (EmitSlotNumOfStackTopAndPop (o));                  // b (top)
+_   (EmitSlotNumOfStackTopAndPop (o));                  // a
+_   (PushAllocatedSlotAndEmit (o, c_m3Type_v128));
+} _catch: return result;
+}
+
+static M3Result  Compile_SIMD_Load  (IM3Compilation o, m3opcode_t i_opcode)
+{
+_try {
+    (void) i_opcode;
+_   (PreserveRegisters (o));
+_   (EmitOp (o, op_v128_Load));
+    u32 align, offset;
+_   (ReadLEB_u32 (& align, & o->wasm, o->wasmEnd));
+_   (ReadLEB_u32 (& offset, & o->wasm, o->wasmEnd));
+_   (EmitSlotNumOfStackTopAndPop (o));                  // address (i32)
+    EmitConstant32 (o, offset);
+_   (PushAllocatedSlotAndEmit (o, c_m3Type_v128));
+} _catch: return result;
+}
+
+static M3Result  Compile_SIMD_Store  (IM3Compilation o, m3opcode_t i_opcode)
+{
+_try {
+    (void) i_opcode;
+_   (PreserveRegisters (o));
+_   (EmitOp (o, op_v128_Store));
+    u32 align, offset;
+_   (ReadLEB_u32 (& align, & o->wasm, o->wasmEnd));
+_   (ReadLEB_u32 (& offset, & o->wasm, o->wasmEnd));
+_   (EmitSlotNumOfStackTopAndPop (o));                  // value (v128, top)
+_   (EmitSlotNumOfStackTopAndPop (o));                  // address (i32)
+    EmitConstant32 (o, offset);
+} _catch: return result;
+}
+
+extern const M3OpInfo c_operationsFD [];
+
+/* 0xFD SIMD prefix: read the LEB sub-opcode and dispatch to its compiler. */
+static M3Result  Compile_SIMD  (IM3Compilation o, m3opcode_t i_opcode)
+{
+_try {
+    (void) i_opcode;
+    u32 subop;
+_   (ReadLEB_u32 (& subop, & o->wasm, o->wasmEnd));
+    _throwif (m3Err_unknownOpcode, subop > 0xFF);
+    m3opcode_t op = (m3opcode_t) ((c_waOp_simd << 8) | subop);
+    IM3OpInfo info = GetOpInfo (op);
+    _throwif (m3Err_unknownOpcode, not info);
+    M3Compiler compiler = info->compiler;
+    _throwif (m3Err_noCompiler, not compiler);
+_   ((* compiler) (o, op));
+    o->previousOpcode = op;
+} _catch: return result;
+}
 
 const M3OpInfo c_operations [] =
 {
@@ -2538,6 +2688,7 @@ const M3OpInfo c_operations [] =
 
 # if d_m3CascadedOpcodes
     [c_waOp_extended] = M3OP( "0xFC", 0, c_m3Type_unknown,   d_emptyOpList,  Compile_ExtendedOpcode ),
+    [c_waOp_simd]     = M3OP( "0xFD", 0, c_m3Type_unknown,   d_emptyOpList,  Compile_SIMD ),
 # endif
 
 # ifdef DEBUG
@@ -2567,6 +2718,78 @@ const M3OpInfo c_operationsFC [] =
 # endif
 };
 
+// SIMD (0xFD prefix) sub-opcodes. Unlisted indices are zero (NULL compiler)
+// -> a graceful "no compiler" reject. See the m3_exec.h v128 ops.
+const M3OpInfo c_operationsFD [] =
+{
+    [0x00] = M3OP( "v128.load",           0, v_128, d_v128op(v128_Load),     Compile_SIMD_Load ),
+    [0x0B] = M3OP( "v128.store",         -2, none,  d_v128op(v128_Store),    Compile_SIMD_Store ),
+    [0x0C] = M3OP( "v128.const",          1, v_128, d_emptyOpList,           Compile_SIMD_Const ),
+    [0x0D] = M3OP( "i8x16.shuffle",      -1, v_128, d_emptyOpList,           Compile_SIMD_Shuffle ),
+    [0x0F] = M3OP( "i8x16.splat",         0, v_128, d_v128op(i8x16_Splat),   Compile_SIMD_Splat ),
+    [0x10] = M3OP( "i16x8.splat",         0, v_128, d_v128op(i16x8_Splat),   Compile_SIMD_Splat ),
+    [0x11] = M3OP( "i32x4.splat",         0, v_128, d_v128op(i32x4_Splat),   Compile_SIMD_Splat ),
+    [0x12] = M3OP( "i64x2.splat",         0, v_128, d_v128op(i64x2_Splat),   Compile_SIMD_Splat ),
+    [0x13] = M3OP( "f32x4.splat",         0, v_128, d_v128op(f32x4_Splat),   Compile_SIMD_Splat ),
+    [0x14] = M3OP( "f64x2.splat",         0, v_128, d_v128op(f64x2_Splat),   Compile_SIMD_Splat ),
+    [0x15] = M3OP( "i8x16.extract_s",     0, i_32,  d_v128op(i8x16_ExtractLane_s), Compile_SIMD_Extract ),
+    [0x16] = M3OP( "i8x16.extract_u",     0, i_32,  d_v128op(i8x16_ExtractLane_u), Compile_SIMD_Extract ),
+    [0x17] = M3OP( "i8x16.replace",       0, v_128, d_v128op(i8x16_ReplaceLane),   Compile_SIMD_Replace ),
+    [0x18] = M3OP( "i16x8.extract_s",     0, i_32,  d_v128op(i16x8_ExtractLane_s), Compile_SIMD_Extract ),
+    [0x19] = M3OP( "i16x8.extract_u",     0, i_32,  d_v128op(i16x8_ExtractLane_u), Compile_SIMD_Extract ),
+    [0x1A] = M3OP( "i16x8.replace",       0, v_128, d_v128op(i16x8_ReplaceLane),   Compile_SIMD_Replace ),
+    [0x1B] = M3OP( "i32x4.extract",       0, i_32,  d_v128op(i32x4_ExtractLane),   Compile_SIMD_Extract ),
+    [0x1C] = M3OP( "i32x4.replace",       0, v_128, d_v128op(i32x4_ReplaceLane),   Compile_SIMD_Replace ),
+    [0x1D] = M3OP( "i64x2.extract",       0, i_64,  d_v128op(i64x2_ExtractLane),   Compile_SIMD_Extract ),
+    [0x1E] = M3OP( "i64x2.replace",       0, v_128, d_v128op(i64x2_ReplaceLane),   Compile_SIMD_Replace ),
+    [0x1F] = M3OP( "f32x4.extract",       0, f_32,  d_v128op(f32x4_ExtractLane),   Compile_SIMD_Extract ),
+    [0x20] = M3OP( "f32x4.replace",       0, v_128, d_v128op(f32x4_ReplaceLane),   Compile_SIMD_Replace ),
+    [0x21] = M3OP( "f64x2.extract",       0, f_64,  d_v128op(f64x2_ExtractLane),   Compile_SIMD_Extract ),
+    [0x22] = M3OP( "f64x2.replace",       0, v_128, d_v128op(f64x2_ReplaceLane),   Compile_SIMD_Replace ),
+    [0x37] = M3OP( "i32x4.eq",           -1, v_128, d_v128op(i32x4_Eq),      Compile_SIMD_Binop ),
+    [0x38] = M3OP( "i32x4.ne",           -1, v_128, d_v128op(i32x4_Ne),      Compile_SIMD_Binop ),
+    [0x39] = M3OP( "i32x4.lt_s",         -1, v_128, d_v128op(i32x4_LtS),     Compile_SIMD_Binop ),
+    [0x3B] = M3OP( "i32x4.gt_s",         -1, v_128, d_v128op(i32x4_GtS),     Compile_SIMD_Binop ),
+    [0x41] = M3OP( "f32x4.eq",           -1, v_128, d_v128op(f32x4_Eq),      Compile_SIMD_Binop ),
+    [0x43] = M3OP( "f32x4.lt",           -1, v_128, d_v128op(f32x4_Lt),      Compile_SIMD_Binop ),
+    [0x45] = M3OP( "f32x4.gt",           -1, v_128, d_v128op(f32x4_Gt),      Compile_SIMD_Binop ),
+    [0x4D] = M3OP( "v128.not",            0, v_128, d_v128op(v128_Not),      Compile_SIMD_Unop ),
+    [0x4E] = M3OP( "v128.and",           -1, v_128, d_v128op(v128_And),      Compile_SIMD_Binop ),
+    [0x4F] = M3OP( "v128.andnot",        -1, v_128, d_v128op(v128_Andnot),   Compile_SIMD_Binop ),
+    [0x50] = M3OP( "v128.or",            -1, v_128, d_v128op(v128_Or),       Compile_SIMD_Binop ),
+    [0x51] = M3OP( "v128.xor",           -1, v_128, d_v128op(v128_Xor),      Compile_SIMD_Binop ),
+    [0x61] = M3OP( "i8x16.neg",           0, v_128, d_v128op(i8x16_Neg),     Compile_SIMD_Unop ),
+    [0x6E] = M3OP( "i8x16.add",          -1, v_128, d_v128op(i8x16_Add),     Compile_SIMD_Binop ),
+    [0x71] = M3OP( "i8x16.sub",          -1, v_128, d_v128op(i8x16_Sub),     Compile_SIMD_Binop ),
+    [0x81] = M3OP( "i16x8.neg",           0, v_128, d_v128op(i16x8_Neg),     Compile_SIMD_Unop ),
+    [0x8E] = M3OP( "i16x8.add",          -1, v_128, d_v128op(i16x8_Add),     Compile_SIMD_Binop ),
+    [0x91] = M3OP( "i16x8.sub",          -1, v_128, d_v128op(i16x8_Sub),     Compile_SIMD_Binop ),
+    [0x95] = M3OP( "i16x8.mul",          -1, v_128, d_v128op(i16x8_Mul),     Compile_SIMD_Binop ),
+    [0xA1] = M3OP( "i32x4.neg",           0, v_128, d_v128op(i32x4_Neg),     Compile_SIMD_Unop ),
+    [0xAE] = M3OP( "i32x4.add",          -1, v_128, d_v128op(i32x4_Add),     Compile_SIMD_Binop ),
+    [0xB1] = M3OP( "i32x4.sub",          -1, v_128, d_v128op(i32x4_Sub),     Compile_SIMD_Binop ),
+    [0xB5] = M3OP( "i32x4.mul",          -1, v_128, d_v128op(i32x4_Mul),     Compile_SIMD_Binop ),
+    [0xB6] = M3OP( "i32x4.min_s",        -1, v_128, d_v128op(i32x4_MinS),    Compile_SIMD_Binop ),
+    [0xB8] = M3OP( "i32x4.max_s",        -1, v_128, d_v128op(i32x4_MaxS),    Compile_SIMD_Binop ),
+    [0xC1] = M3OP( "i64x2.neg",           0, v_128, d_v128op(i64x2_Neg),     Compile_SIMD_Unop ),
+    [0xCE] = M3OP( "i64x2.add",          -1, v_128, d_v128op(i64x2_Add),     Compile_SIMD_Binop ),
+    [0xD1] = M3OP( "i64x2.sub",          -1, v_128, d_v128op(i64x2_Sub),     Compile_SIMD_Binop ),
+    [0xD5] = M3OP( "i64x2.mul",          -1, v_128, d_v128op(i64x2_Mul),     Compile_SIMD_Binop ),
+    [0xE0] = M3OP( "f32x4.abs",           0, v_128, d_v128op(f32x4_Abs),     Compile_SIMD_Unop ),
+    [0xE1] = M3OP( "f32x4.neg",           0, v_128, d_v128op(f32x4_Neg),     Compile_SIMD_Unop ),
+    [0xE4] = M3OP( "f32x4.add",          -1, v_128, d_v128op(f32x4_Add),     Compile_SIMD_Binop ),
+    [0xE5] = M3OP( "f32x4.sub",          -1, v_128, d_v128op(f32x4_Sub),     Compile_SIMD_Binop ),
+    [0xE6] = M3OP( "f32x4.mul",          -1, v_128, d_v128op(f32x4_Mul),     Compile_SIMD_Binop ),
+    [0xE7] = M3OP( "f32x4.div",          -1, v_128, d_v128op(f32x4_Div),     Compile_SIMD_Binop ),
+    [0xE8] = M3OP( "f32x4.min",          -1, v_128, d_v128op(f32x4_Min),     Compile_SIMD_Binop ),
+    [0xE9] = M3OP( "f32x4.max",          -1, v_128, d_v128op(f32x4_Max),     Compile_SIMD_Binop ),
+    [0xF4] = M3OP( "f64x2.add",          -1, v_128, d_v128op(f64x2_Add),     Compile_SIMD_Binop ),
+    [0xF5] = M3OP( "f64x2.sub",          -1, v_128, d_v128op(f64x2_Sub),     Compile_SIMD_Binop ),
+    [0xF6] = M3OP( "f64x2.mul",          -1, v_128, d_v128op(f64x2_Mul),     Compile_SIMD_Binop ),
+    [0xF7] = M3OP( "f64x2.div",          -1, v_128, d_v128op(f64x2_Div),     Compile_SIMD_Binop ),
+    [0xF8] = M3OP_RESERVED,   /* pad table length */
+};
+
 
 IM3OpInfo  GetOpInfo  (m3opcode_t opcode)
 {
@@ -2580,6 +2803,12 @@ IM3OpInfo  GetOpInfo  (m3opcode_t opcode)
         opcode &= 0xFF;
         if (M3_LIKELY(opcode < M3_COUNT_OF(c_operationsFC))) {
             return &c_operationsFC[opcode];
+        }
+        break;
+    case c_waOp_simd:
+        opcode &= 0xFF;
+        if (M3_LIKELY(opcode < M3_COUNT_OF(c_operationsFD))) {
+            return &c_operationsFD[opcode];
         }
         break;
     }

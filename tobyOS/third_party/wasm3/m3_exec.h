@@ -1492,6 +1492,171 @@ d_m3Store_i (i64, i16)
 d_m3Store_i (i64, i32)
 d_m3Store_i (i64, i64)
 
+//---------------------------------------------------------------------------------------------------------------------
+// SIMD (v128, fixed-width 128-bit). v128 never occupies a register, so every
+// operand and result is a stack slot; access via slot pointers + memcpy
+// (slots are only 4-byte aligned, so no aligned SSE loads). The code stream
+// is void*-word based, so a v128.const's 16 immediate bytes read as two words.
+//---------------------------------------------------------------------------------------------------------------------
+
+typedef union { uint8_t u8[16]; int8_t i8[16]; uint16_t u16[8]; int16_t i16[8];
+                uint32_t u32[4]; int32_t i32[4]; uint64_t u64[2]; int64_t i64[2];
+                float f32[4]; double f64[2]; } m3v128;
+
+d_m3Op (v128_Const)
+{
+    m3v128 v; memcpy (&v, _pc, 16); _pc += 16 / sizeof (code_t);
+    void * r = slot_ptr (void); memcpy (r, &v, 16);
+    nextOp ();
+}
+
+/* splat: broadcast a scalar (from a slot) to all lanes. */
+#define d_m3SimdSplat(NAME, STYPE, LANE, N)                 \
+d_m3Op (NAME) {                                             \
+    STYPE x = slot (STYPE);                                 \
+    void * r = slot_ptr (void); m3v128 v;                  \
+    for (int _i = 0; _i < N; _i++) v.LANE[_i] = x;          \
+    memcpy (r, &v, 16); nextOp ();                          \
+}
+d_m3SimdSplat (i8x16_Splat,  i32, i8,  16)
+d_m3SimdSplat (i16x8_Splat,  i32, i16, 8)
+d_m3SimdSplat (i32x4_Splat,  i32, i32, 4)
+d_m3SimdSplat (i64x2_Splat,  i64, i64, 2)
+d_m3SimdSplat (f32x4_Splat,  f32, f32, 4)
+d_m3SimdSplat (f64x2_Splat,  f64, f64, 2)
+
+/* extract_lane: v128 slot + lane immediate -> scalar result slot. */
+#define d_m3SimdExtract(NAME, STYPE, LANE, MASK)            \
+d_m3Op (NAME) {                                             \
+    u32 lane = immediate (u32);                            \
+    void * pv = slot_ptr (void); m3v128 v; memcpy (&v, pv, 16); \
+    STYPE * r = slot_ptr (STYPE); * r = (STYPE) v.LANE[lane & MASK]; \
+    nextOp ();                                             \
+}
+d_m3SimdExtract (i8x16_ExtractLane_s,  i32, i8,  15)
+d_m3SimdExtract (i8x16_ExtractLane_u,  i32, u8,  15)
+d_m3SimdExtract (i16x8_ExtractLane_s,  i32, i16, 7)
+d_m3SimdExtract (i16x8_ExtractLane_u,  i32, u16, 7)
+d_m3SimdExtract (i32x4_ExtractLane,    i32, i32, 3)
+d_m3SimdExtract (i64x2_ExtractLane,    i64, i64, 1)
+d_m3SimdExtract (f32x4_ExtractLane,    f32, f32, 3)
+d_m3SimdExtract (f64x2_ExtractLane,    f64, f64, 1)
+
+/* replace_lane: v128 slot + scalar slot + lane immediate -> v128 slot. */
+#define d_m3SimdReplace(NAME, STYPE, LANE, MASK)            \
+d_m3Op (NAME) {                                             \
+    u32 lane = immediate (u32);                            \
+    STYPE x = slot (STYPE);                                 \
+    void * pv = slot_ptr (void); m3v128 v; memcpy (&v, pv, 16); \
+    void * r = slot_ptr (void); v.LANE[lane & MASK] = (STYPE) x;  \
+    memcpy (r, &v, 16); nextOp ();                          \
+}
+d_m3SimdReplace (i8x16_ReplaceLane, i32, i8,  15)
+d_m3SimdReplace (i16x8_ReplaceLane, i32, i16, 7)
+d_m3SimdReplace (i32x4_ReplaceLane, i32, i32, 3)
+d_m3SimdReplace (i64x2_ReplaceLane, i64, i64, 1)
+d_m3SimdReplace (f32x4_ReplaceLane, f32, f32, 3)
+d_m3SimdReplace (f64x2_ReplaceLane, f64, f64, 1)
+
+/* binary lane-wise op: two v128 slots -> v128 slot. EXPR uses a[_i], b[_i]. */
+#define d_m3SimdBinop(NAME, LANE, N, EXPR)                  \
+d_m3Op (NAME) {                                             \
+    void * pb = slot_ptr (void); void * pa = slot_ptr (void); \
+    void * pr = slot_ptr (void); m3v128 a, b, r;           \
+    memcpy (&b, pb, 16); memcpy (&a, pa, 16);              \
+    for (int _i = 0; _i < N; _i++) r.LANE[_i] = (EXPR);     \
+    memcpy (pr, &r, 16); nextOp ();                         \
+}
+d_m3SimdBinop (i8x16_Add, i8,  16, a.i8[_i]  + b.i8[_i])
+d_m3SimdBinop (i8x16_Sub, i8,  16, a.i8[_i]  - b.i8[_i])
+d_m3SimdBinop (i16x8_Add, i16, 8,  a.i16[_i] + b.i16[_i])
+d_m3SimdBinop (i16x8_Sub, i16, 8,  a.i16[_i] - b.i16[_i])
+d_m3SimdBinop (i16x8_Mul, i16, 8,  a.i16[_i] * b.i16[_i])
+d_m3SimdBinop (i32x4_Add, i32, 4,  a.i32[_i] + b.i32[_i])
+d_m3SimdBinop (i32x4_Sub, i32, 4,  a.i32[_i] - b.i32[_i])
+d_m3SimdBinop (i32x4_Mul, i32, 4,  a.i32[_i] * b.i32[_i])
+d_m3SimdBinop (i64x2_Add, i64, 2,  a.i64[_i] + b.i64[_i])
+d_m3SimdBinop (i64x2_Sub, i64, 2,  a.i64[_i] - b.i64[_i])
+d_m3SimdBinop (i64x2_Mul, i64, 2,  a.i64[_i] * b.i64[_i])
+d_m3SimdBinop (f32x4_Add, f32, 4,  a.f32[_i] + b.f32[_i])
+d_m3SimdBinop (f32x4_Sub, f32, 4,  a.f32[_i] - b.f32[_i])
+d_m3SimdBinop (f32x4_Mul, f32, 4,  a.f32[_i] * b.f32[_i])
+d_m3SimdBinop (f32x4_Div, f32, 4,  a.f32[_i] / b.f32[_i])
+d_m3SimdBinop (f64x2_Add, f64, 2,  a.f64[_i] + b.f64[_i])
+d_m3SimdBinop (f64x2_Sub, f64, 2,  a.f64[_i] - b.f64[_i])
+d_m3SimdBinop (f64x2_Mul, f64, 2,  a.f64[_i] * b.f64[_i])
+d_m3SimdBinop (f64x2_Div, f64, 2,  a.f64[_i] / b.f64[_i])
+d_m3SimdBinop (v128_And,  u64, 2,  a.u64[_i] & b.u64[_i])
+d_m3SimdBinop (v128_Or,   u64, 2,  a.u64[_i] | b.u64[_i])
+d_m3SimdBinop (v128_Xor,  u64, 2,  a.u64[_i] ^ b.u64[_i])
+d_m3SimdBinop (v128_Andnot, u64, 2, a.u64[_i] & ~b.u64[_i])
+/* integer min/max */
+d_m3SimdBinop (i32x4_MinS, i32, 4, a.i32[_i] < b.i32[_i] ? a.i32[_i] : b.i32[_i])
+d_m3SimdBinop (i32x4_MaxS, i32, 4, a.i32[_i] > b.i32[_i] ? a.i32[_i] : b.i32[_i])
+d_m3SimdBinop (f32x4_Min,  f32, 4, a.f32[_i] < b.f32[_i] ? a.f32[_i] : b.f32[_i])
+d_m3SimdBinop (f32x4_Max,  f32, 4, a.f32[_i] > b.f32[_i] ? a.f32[_i] : b.f32[_i])
+/* lane comparisons: all-ones / zero result per lane */
+d_m3SimdBinop (i32x4_Eq,  i32, 4, a.i32[_i] == b.i32[_i] ? -1 : 0)
+d_m3SimdBinop (i32x4_Ne,  i32, 4, a.i32[_i] != b.i32[_i] ? -1 : 0)
+d_m3SimdBinop (i32x4_LtS, i32, 4, a.i32[_i] <  b.i32[_i] ? -1 : 0)
+d_m3SimdBinop (i32x4_GtS, i32, 4, a.i32[_i] >  b.i32[_i] ? -1 : 0)
+d_m3SimdBinop (f32x4_Eq,  i32, 4, a.f32[_i] == b.f32[_i] ? -1 : 0)
+d_m3SimdBinop (f32x4_Lt,  i32, 4, a.f32[_i] <  b.f32[_i] ? -1 : 0)
+d_m3SimdBinop (f32x4_Gt,  i32, 4, a.f32[_i] >  b.f32[_i] ? -1 : 0)
+
+/* unary lane-wise op: one v128 slot -> v128 slot. */
+#define d_m3SimdUnop(NAME, LANE, N, EXPR)                   \
+d_m3Op (NAME) {                                             \
+    void * pa = slot_ptr (void); void * pr = slot_ptr (void); \
+    m3v128 a, r; memcpy (&a, pa, 16);                      \
+    for (int _i = 0; _i < N; _i++) r.LANE[_i] = (EXPR);     \
+    memcpy (pr, &r, 16); nextOp ();                         \
+}
+d_m3SimdUnop (i8x16_Neg, i8,  16, -a.i8[_i])
+d_m3SimdUnop (i16x8_Neg, i16, 8,  -a.i16[_i])
+d_m3SimdUnop (i32x4_Neg, i32, 4,  -a.i32[_i])
+d_m3SimdUnop (i64x2_Neg, i64, 2,  -a.i64[_i])
+d_m3SimdUnop (f32x4_Neg, f32, 4,  -a.f32[_i])
+d_m3SimdUnop (f32x4_Abs, f32, 4,  a.f32[_i] < 0 ? -a.f32[_i] : a.f32[_i])
+
+d_m3Op (v128_Not)
+{
+    void * pa = slot_ptr (void); void * pr = slot_ptr (void);
+    m3v128 a; memcpy (&a, pa, 16);
+    a.u64[0] = ~a.u64[0]; a.u64[1] = ~a.u64[1];
+    memcpy (pr, &a, 16); nextOp ();
+}
+
+/* i8x16.shuffle: 16 lane-index immediates select bytes from a||b. */
+d_m3Op (i8x16_Shuffle)
+{
+    const u8 * idx = (const u8 *) _pc; _pc += 16 / sizeof (code_t);
+    void * pb = slot_ptr (void); void * pa = slot_ptr (void);
+    void * pr = slot_ptr (void); m3v128 a, b, r;
+    memcpy (&b, pb, 16); memcpy (&a, pa, 16);
+    for (int _i = 0; _i < 16; _i++) { int s = idx[_i];
+        r.u8[_i] = (s < 16) ? a.u8[s] : b.u8[s - 16]; }
+    memcpy (pr, &r, 16); nextOp ();
+}
+
+/* v128.load / v128.store: linear-memory <-> v128 slot. */
+d_m3Op (v128_Load)
+{
+    u64 operand = slot (u32); u32 offset = immediate (u32); operand += offset;
+    void * r = slot_ptr (void);
+    if (M3_LIKELY (operand + 16 <= _mem->length)) {
+        memcpy (r, m3MemData (_mem) + operand, 16); nextOp ();
+    } else d_outOfBounds;
+}
+d_m3Op (v128_Store)
+{
+    void * pv = slot_ptr (void); u64 operand = slot (u32);
+    u32 offset = immediate (u32); operand += offset;
+    if (M3_LIKELY (operand + 16 <= _mem->length)) {
+        memcpy (m3MemData (_mem) + operand, pv, 16); nextOp ();
+    } else d_outOfBounds;
+}
+
 #undef m3MemCheck
 
 

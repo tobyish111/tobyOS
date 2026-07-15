@@ -40,6 +40,7 @@ enum
     c_waOp_f64_const            = 0x44,
 
     c_waOp_extended             = 0xfc,
+    c_waOp_simd                 = 0xfd,   /* SIMD (v128) prefix */
 
     c_waOp_memoryCopy           = 0xfc0a,
     c_waOp_memoryFill           = 0xfc0b

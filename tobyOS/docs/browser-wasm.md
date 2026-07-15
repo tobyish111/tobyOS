@@ -116,6 +116,22 @@ on-screen ("WASM: ALL PASS") and on the serial console:
   result slots first (`nrets`), then the argument slots (`nargs`); each is
   a 64-bit slot with f32 in the low 32 bits.
 
+- **SIMD (`v128`).** wasm3 0.5.2 shipped no SIMD, so it's added here (the
+  `0xFD` prefix): `m3_compile.c` decodes the SIMD sub-opcode (LEB) and
+  dispatches to per-shape compilers; `m3_exec.h` implements the ops. v128
+  is a slot-only type (16 bytes = 4 of wasm3's 32-bit slots; it never uses
+  the 64-bit register), so operands/results are read via slot pointers +
+  `memcpy` (slots are 4-byte aligned — no aligned SSE loads), and scalar
+  operands are forced to slots first (`PreserveRegisters`). Implemented:
+  `v128.const`/`load`/`store`, `i8x16.shuffle`, splat / extract_lane /
+  replace_lane for all shapes, integer + float add/sub/mul(/div), min/max,
+  neg/abs, `v128.and`/`or`/`xor`/`andnot`/`not`, and i32x4/f32x4
+  comparisons. Verified host-side (splat+add+extract, v128.const,
+  f32x4.mul, memory load/store, shuffle) and end-to-end through the
+  browser JS API. Not all 236 SIMD opcodes are present (e.g. widening/dot,
+  saturating, conversions, bitmask, relaxed-SIMD); an unimplemented
+  sub-opcode compiles to a clean "no compiler" reject rather than a crash.
+
 - **`i64` ⇄ BigInt.** i64 values cross the JS boundary as `BigInt`
   (`JS_NewBigInt64` out, `JS_ToBigInt64` in), so values past 2^53 stay
   exact — both directions of the export call and the import trampoline.
@@ -164,15 +180,6 @@ engine regardless.
   imported tables (wasm3's public API exposes only `m3_GetTableFunction`).
   Imported globals aren't linked either (like tables, wasm3 has no host
   hook); exported globals and a module's own globals work.
-- **No SIMD (`v128`) — graceful reject.** wasm3 0.5.2 doesn't implement
-  the `0xFD`-prefixed SIMD opcodes, and adding them is not a wiring gap: it
-  needs the ~236 v128 operations *plus* widening the interpreter's value
-  stack from 64-bit slots to 128 bits — which is why wasm3 upstream never
-  did it. A module that *uses* SIMD still parses/instantiates; the first
-  call into a SIMD function fails cleanly with `unknown opcode` (a
-  catchable `WebAssembly`/`TypeError` on the JS side, no crash), so pages
-  that feature-detect and fall back keep working. SIMD is opt-in at
-  compile time, so most `.wasm` is unaffected.
 - **Interpreter, not a JIT.** Execution is wasm3's fast interpreter;
   there is no native-code tier (a JIT would be a whole codegen backend —
   a separate project, not a patch). Correct and fine for small/medium
