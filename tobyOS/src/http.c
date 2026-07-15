@@ -975,6 +975,53 @@ const char *http_strerror(int err) {
     return err_strs[idx] ? err_strs[idx] : "unknown";
 }
 
+/* Decompress a gzip or brotli body kernel-side (transparent to the
+ * caller): the compressed body was read up to the transport's read cap;
+ * decompress into a buffer capped at max_out, so the caller still sees
+ * at most its requested (decompressed) size. On failure keep the raw
+ * body. Brotli (RFC 7932) is now more common than gzip on CDNs.
+ *
+ * EVERY transport that advertises Accept-Encoding must call this. The
+ * HTTP/3 path historically did not, so it silently handed compressed
+ * bytes to callers -- scripts/CSS fetched over h3 arrived as binary. */
+void http_body_decompress(struct http_response *out, uint8_t **pbody,
+                          size_t *pbody_len, unsigned long max_out,
+                          const char *tag) {
+    uint8_t *body = *pbody;
+    size_t body_len = *pbody_len;
+    if (!out || !body || body_len == 0) return;
+    if (out->encoding != HTTP_ENC_GZIP && out->encoding != HTTP_ENC_BR) return;
+
+    unsigned long dlen = max_out;
+    uint8_t *dbody = (uint8_t *)kmalloc(dlen > 0 ? dlen : 1);
+    if (!dbody) return;
+    int ok, trunc;
+    const char *alg;
+    if (out->encoding == HTTP_ENC_BR) {
+        int pr = brotli_decompress(dbody, &dlen, body, body_len);
+        ok = (pr == BROTLI_OK || pr == BROTLI_TRUNC);
+        trunc = (pr == BROTLI_TRUNC);
+        alg = "unbrotli";
+    } else {
+        int pr = puff_gzip(dbody, &dlen, body, body_len);
+        ok = (pr == PUFF_OK || pr == PUFF_TRUNC);
+        trunc = (pr == PUFF_TRUNC);
+        alg = "gunzip";
+    }
+    if (ok) {
+        kprintf("[%s] %s %lu -> %lu%s\n", tag, alg,
+                (unsigned long)body_len, dlen, trunc ? " (truncated)" : "");
+        kfree(body);
+        *pbody = dbody;
+        *pbody_len = (size_t)dlen;
+        out->encoding = HTTP_ENC_IDENTITY;
+        out->content_len = (long)dlen;
+    } else {
+        kprintf("[%s] %s FAILED -- keeping raw body\n", tag, alg);
+        kfree(dbody);
+    }
+}
+
 void http_free(struct http_response *r) {
     if (!r) return;
     if (r->body) { kfree(r->body); r->body = NULL; }
@@ -1442,43 +1489,7 @@ int http_get_ext(const char *url,
     kfree(buf);
     transport_close(&tr);              /* no-op when parked */
 
-    /* Decompress a gzip or brotli body kernel-side (transparent to the
-     * caller): the compressed body was read up to read_cap; decompress
-     * into a buffer capped at max_body_bytes, so the caller still sees at
-     * most its requested (decompressed) size. On failure keep the raw
-     * body. Brotli (RFC 7932) is now more common than gzip on CDNs. */
-    if ((out->encoding == HTTP_ENC_GZIP || out->encoding == HTTP_ENC_BR) &&
-        body_len > 0) {
-        unsigned long dlen = max_body_bytes;
-        uint8_t *dbody = (uint8_t *)kmalloc(dlen > 0 ? dlen : 1);
-        if (dbody) {
-            int ok, trunc;
-            const char *alg;
-            if (out->encoding == HTTP_ENC_BR) {
-                int pr = brotli_decompress(dbody, &dlen, body, body_len);
-                ok = (pr == BROTLI_OK || pr == BROTLI_TRUNC);
-                trunc = (pr == BROTLI_TRUNC);
-                alg = "unbrotli";
-            } else {
-                int pr = puff_gzip(dbody, &dlen, body, body_len);
-                ok = (pr == PUFF_OK || pr == PUFF_TRUNC);
-                trunc = (pr == PUFF_TRUNC);
-                alg = "gunzip";
-            }
-            if (ok) {
-                kprintf("[http] %s %lu -> %lu%s\n", alg,
-                        (unsigned long)body_len, dlen,
-                        trunc ? " (truncated)" : "");
-                kfree(body);
-                body = dbody; body_len = dlen;
-                out->encoding = HTTP_ENC_IDENTITY;
-                out->content_len = (long)dlen;
-            } else {
-                kprintf("[http] %s FAILED -- keeping raw body\n", alg);
-                kfree(dbody);
-            }
-        }
-    }
+    http_body_decompress(out, &body, &body_len, max_body_bytes, "http");
 
     out->body     = body;
     out->body_len = body_len;
