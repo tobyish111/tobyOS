@@ -6609,7 +6609,10 @@ static void js_teardown(struct tab *t);
  * unchanged), parsing <style> blocks, and fetching + parsing
  * <link rel=stylesheet> sheets. */
 
-#define SHEET_MAX       16
+/* Real sites split CSS into many small module chunks: github.com ships
+ * 40 <link rel=stylesheet> on one page, so a cap of 16 silently dropped
+ * more than half its styling. */
+#define SHEET_MAX       64
 #define SHEET_FETCH_CAP (4096 * 1024)
 
 static int g_form_open;          /* collect-walk state: innermost form */
@@ -9676,6 +9679,21 @@ static const char JS_PRELUDE[] =
 "  };\n"
 "  Element.prototype.pause = function(){ D.mediaCtl(this.__i, 0); };\n"
 "  g.navigator = { userAgent: 'TobyOS/4.0 (tobyOS x86_64) QuickJS' };\n"
+/* ---- performance: real sites instrument themselves constantly
+ *      (github.com threw 63 ReferenceErrors without this). now() is
+ *      ms since page start; the mark/measure entry log is a stub. --- */
+"  var __perfT0 = Date.now();\n"
+"  g.performance = {\n"
+"    timeOrigin: __perfT0,\n"
+"    now: function(){ return Date.now() - __perfT0; },\n"
+"    mark: function(){}, measure: function(){},\n"
+"    clearMarks: function(){}, clearMeasures: function(){},\n"
+"    getEntries: function(){ return []; },\n"
+"    getEntriesByName: function(){ return []; },\n"
+"    getEntriesByType: function(){ return []; },\n"
+"    setResourceTimingBufferSize: function(){},\n"
+"    toJSON: function(){ return {}; }\n"
+"  };\n"
 /* ---- Image(): preloaders, tracking pixels and lazy-loaders build
  *      detached <img> via `new Image()`. Fire load synchronously on
  *      src-set so waiters progress instead of hanging. ------------- */
@@ -11236,9 +11254,26 @@ static void style_perf_end(void) {
     sys_write(1, m, p);
 }
 #define STYLE_PERF_END() style_perf_end()
+
+/* Per-phase render timing: which part of a page load actually costs. */
+static long g_phase_t0;
+#define PHASE_PERF_BEGIN() (g_phase_t0 = js_now_ms())
+static void phase_perf(const char *name) {
+    char m[128]; int p = 0;
+    p = msg_append(m, p, sizeof(m), "[cssperf] phase ");
+    p = msg_append(m, p, sizeof(m), name);
+    p = msg_append(m, p, sizeof(m), " ");
+    p = msg_append_int(m, p, sizeof(m), (int)(js_now_ms() - g_phase_t0));
+    p = msg_append(m, p, sizeof(m), " ms\n");
+    sys_write(1, m, p);
+    g_phase_t0 = js_now_ms();
+}
+#define PHASE_PERF(n) phase_perf(n)
 #else
 #define STYLE_PERF_BEGIN() ((void)0)
 #define STYLE_PERF_END()   ((void)0)
+#define PHASE_PERF_BEGIN() ((void)0)
+#define PHASE_PERF(n)      ((void)0)
 #endif
 
 static void js_rerender(void) {
@@ -11567,11 +11602,16 @@ static void render_html(void) {
     media_free();
     page_reset();
 
+    PHASE_PERF_BEGIN();
     dom_build();
+    PHASE_PERF("dom_build");
     css_parse_sheet(UA_SHEET, (long)sizeof(UA_SHEET) - 1, 0);
+    PHASE_PERF("ua_sheet");
     g_form_open = -1;
-    collect_node(0);
+    collect_node(0);                      /* also fetches <link> sheets */
+    PHASE_PERF("collect+sheets");
     load_webfonts();                      /* @font-face -> download + register */
+    PHASE_PERF("webfonts");
 
     distribute_slots();                   /* project light DOM into slots */
     struct cstyle base;
@@ -15645,6 +15685,11 @@ int main(int argc, char **argv) {
     set_status("Ready - Press Tab to focus address bar");
 #ifdef YT_TEST
     do_navigate("https://www.youtube.com/");
+#endif
+/* -DNAV_URL="https://example.com/": auto-navigate at startup. Handy for
+ * driving a real site headlessly (pair with -DCSS_PERF). */
+#ifdef NAV_URL
+    do_navigate(NAV_URL);
 #endif
 
     /* Cooperative loop: pump events + repaint, then fetch ONE pending
