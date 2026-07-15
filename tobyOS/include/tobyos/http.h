@@ -204,6 +204,15 @@ int http_get_follow(char cur_url[512], size_t max_body, unsigned flags,
  * after free so a double-free becomes a no-op). */
 void http_free(struct http_response *r);
 
+/* Decompress a gzip/br body into an owned buffer capped at max_out,
+ * swapping *pbody/*pbody_len and resetting out->encoding to identity;
+ * keeps the raw body on failure. Every transport advertising
+ * Accept-Encoding must call this before handing the body to a caller.
+ * `tag` prefixes the log line ("http", "quich3"). */
+void http_body_decompress(struct http_response *out, uint8_t **pbody,
+                          size_t *pbody_len, unsigned long max_out,
+                          const char *tag);
+
 /* Cookie jar (RFC 6265-lite): session cookies kept in memory, keyed by
  * host, sent back on same-host requests. No Domain/Path/Expiry/Secure
  * semantics yet -- enough for login/session continuity within a site.

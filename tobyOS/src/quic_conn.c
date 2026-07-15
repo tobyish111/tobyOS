@@ -1062,9 +1062,15 @@ static int http3_fetch_core(uint32_t ip_be, uint16_t port, const char *host,
                 }
                 o2 += (size_t)flen2;
             }
+            /* We advertised Accept-Encoding, so the body is very likely
+             * br/gzip: inflate it here exactly like the h1/h2 path does.
+             * Without this the caller gets compressed bytes, which is
+             * invisible for an <img> (decoders sniff) but fatal for a
+             * <script> -- JS_Eval chokes on "unexpected character". */
+            if (out->content_len < 0) out->content_len = (long)body_total;
+            http_body_decompress(out, &body, &body_len, max_body, "quich3");
             out->body = body;
             out->body_len = body_len;
-            if (out->content_len < 0) out->content_len = (long)body_total;
 
             /* final ACK so the server doesn't retransmit at us */
             uint8_t af[16];

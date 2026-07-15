@@ -10543,6 +10543,11 @@ static void js_dump_error(JSContext *cx) {
 }
 
 /* Create the tab's persistent JS world (bindings + prelude). */
+static char *js_module_normalize(JSContext *cx, const char *base,
+                                 const char *name, void *opaque);
+static JSModuleDef *js_module_loader(JSContext *cx, const char *name,
+                                     void *opaque);
+
 static int js_ensure(void) {
     if (cur->js_cx) return 1;
     JSRuntime *rt = JS_NewRuntime();
@@ -10554,6 +10559,7 @@ static int js_ensure(void) {
     cur->js_rt = rt;
     cur->js_cx = cx;
     cur->js_timer_seq = 1;
+    JS_SetModuleLoaderFunc(rt, js_module_normalize, js_module_loader, NULL);
 
     {
         JSValue g = JS_GetGlobalObject(cx);
@@ -10646,6 +10652,113 @@ static int js_ensure(void) {
     return 1;
 }
 
+/* ---- ES modules ----------------------------------------------------
+ * <script type="module">, static import/export and dynamic import().
+ * QuickJS walks a module graph through two hooks: `normalize` turns a
+ * specifier plus the importer's name into an absolute name, and `load`
+ * turns that name into a compiled module. We name modules by absolute
+ * URL and fetch them synchronously (mirroring the classic external-
+ * script path); QuickJS caches by name, so each URL loads at most once
+ * and import cycles terminate. ------------------------------------- */
+
+/* Report an error value that never became a live exception (a rejected
+ * module promise), through the same channel as js_dump_error. */
+static void js_report_val(JSContext *cx, JSValueConst v) {
+    const char *s = JS_ToCString(cx, v);
+    if (!s) return;
+    char m[120];
+    int p = msg_append(m, 0, sizeof(m), "JS error: ");
+    p = msg_append(m, p, sizeof(m), s);
+    set_status(m);
+    sys_write(1, "[js] ERROR: ", 12);
+    sys_write(1, s, str_len(s));
+    sys_write(1, "\n", 1);
+    JS_FreeCString(cx, s);
+}
+
+/* import.meta.url: modules resolve their own asset/dynamic-import URLs
+ * from it, so it must be the module's absolute URL. */
+static void js_module_set_meta(JSContext *cx, JSValueConst fv) {
+    JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(fv);
+    JSAtom na = JS_GetModuleName(cx, m);
+    const char *nm = JS_AtomToCString(cx, na);
+    JS_FreeAtom(cx, na);
+    JSValue meta = JS_GetImportMeta(cx, m);
+    if (!JS_IsException(meta)) {
+        JS_DefinePropertyValueStr(cx, meta, "url",
+                                  JS_NewString(cx, nm ? nm : ""),
+                                  JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(cx, meta, "main", JS_FALSE, JS_PROP_C_W_E);
+        JS_FreeValue(cx, meta);
+    }
+    if (nm) JS_FreeCString(cx, nm);
+}
+
+static char *js_module_normalize(JSContext *cx, const char *base,
+                                 const char *name, void *opaque) {
+    (void)opaque;
+    char abs[URL_MAX + 1];
+    /* Bare specifiers ("react") are meaningless without an import map;
+     * resolving them as a relative path yields an honest module-load
+     * error rather than a silent hang. */
+    resolve_relative_url(base, name, abs, URL_MAX);
+    int n = (int)str_len(abs);
+    char *out = (char *)js_malloc(cx, (size_t)n + 1);
+    if (!out) return NULL;
+    for (int i = 0; i <= n; i++) out[i] = abs[i];
+    return out;
+}
+
+static JSModuleDef *js_module_loader(JSContext *cx, const char *name,
+                                     void *opaque) {
+    (void)opaque;
+    if (!has_scheme(name)) {
+        JS_ThrowReferenceError(cx, "module '%s' is not a resolvable URL", name);
+        return NULL;
+    }
+    char *buf = (char *)malloc(JS_SRC_CAP + 1);
+    if (!buf) { JS_ThrowOutOfMemory(cx); return NULL; }
+    struct http_fetch req;
+    mem_zero(&req, sizeof(req));
+    req.url = (unsigned long)name;
+    req.buf = (unsigned long)buf;
+    req.buf_sz = JS_SRC_CAP;
+    long r = sys_http_fetch(&req);
+    if (r <= 0 || req.status <= 0 || req.status >= 400) {
+        free(buf);
+        JS_ThrowReferenceError(cx, "failed to load module '%s'", name);
+        return NULL;
+    }
+    buf[r] = '\0';
+    JSValue fv = JS_Eval(cx, buf, (size_t)r, name,
+                         JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    free(buf);
+    if (JS_IsException(fv)) return NULL;
+    js_module_set_meta(cx, fv);
+    JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(fv);
+    JS_FreeValue(cx, fv);
+    return m;
+}
+
+/* Compile+evaluate one module script. Module bodies may top-level-await,
+ * so evaluation yields a promise: it can still be pending here and reject
+ * later, which is why run_scripts re-checks after draining jobs. Returns
+ * that promise (JS_UNDEFINED if it never got that far). */
+static JSValue js_eval_module(JSContext *cx, const char *src, long len,
+                              const char *name) {
+    JSValue fv = JS_Eval(cx, src, (size_t)len, name,
+                         JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(fv)) { js_dump_error(cx); return JS_UNDEFINED; }
+    js_module_set_meta(cx, fv);
+    JSValue r = JS_EvalFunction(cx, fv);        /* consumes fv */
+    if (JS_IsException(r)) {
+        js_dump_error(cx);
+        JS_FreeValue(cx, r);
+        return JS_UNDEFINED;
+    }
+    return r;
+}
+
 static void run_scripts(void) {
     int scripts[64];
     int ns = 0;
@@ -10654,22 +10767,33 @@ static void run_scripts(void) {
     if (!ns) return;
     if (!js_ensure()) return;
     JSContext *cx = cur->js_cx;
+    JSValue modp[64];          /* module eval promises (top-level await) */
+    int nmodp = 0;
 
     for (int k = 0; k < ns; k++) {
         struct dnode *nd = &E->nodes[scripts[k]];
         char ty[40];
-        if (node_attr_str(nd, "type", ty, sizeof(ty)) && ty[0] &&
-            str_contains(ty, (int)str_len(ty), "javascript", 10) < 0 &&
-            str_contains(ty, (int)str_len(ty), "module", 6) < 0)
-            continue;                     /* JSON/templates/etc. */
+        int is_mod = 0;
+        if (node_attr_str(nd, "type", ty, sizeof(ty)) && ty[0]) {
+            is_mod = str_contains(ty, (int)str_len(ty), "module", 6) >= 0;
+            if (!is_mod &&
+                str_contains(ty, (int)str_len(ty), "javascript", 10) < 0)
+                continue;                 /* JSON/templates/etc. */
+        }
         /* JS_Eval requires a NUL-terminated buffer (the lexer relies on
          * the sentinel), so scripts always run from an owned copy. */
         char *fbuf = NULL;
         long slen = 0;
         char surl[URL_MAX + 1];
+        /* A module's name is its own absolute URL, so its relative
+         * imports resolve against it; an inline module resolves against
+         * the document (its src-less name is the page URL). */
+        char mname[URL_MAX + 1];
+        str_copy(mname, g_url, URL_MAX);
         if (node_attr_str(nd, "src", surl, sizeof(surl)) && surl[0]) {
             char url[URL_MAX + 1];
             resolve_relative_url(g_url, surl, url, URL_MAX);
+            str_copy(mname, url, URL_MAX);
             if (has_scheme(url)) {
                 fbuf = (char *)malloc(JS_SRC_CAP + 1);
                 if (fbuf) {
@@ -10694,10 +10818,16 @@ static void run_scripts(void) {
         }
         if (fbuf && slen > 0) {
             fbuf[slen] = '\0';
-            JSValue r = JS_Eval(cx, fbuf, (size_t)slen, "script",
-                                JS_EVAL_TYPE_GLOBAL);
-            if (JS_IsException(r)) js_dump_error(cx);
-            JS_FreeValue(cx, r);
+            if (is_mod) {
+                JSValue p = js_eval_module(cx, fbuf, slen, mname);
+                if (JS_IsUndefined(p) || nmodp >= 64) JS_FreeValue(cx, p);
+                else modp[nmodp++] = p;
+            } else {
+                JSValue r = JS_Eval(cx, fbuf, (size_t)slen, "script",
+                                    JS_EVAL_TYPE_GLOBAL);
+                if (JS_IsException(r)) js_dump_error(cx);
+                JS_FreeValue(cx, r);
+            }
         }
         if (fbuf) free(fbuf);
     }
@@ -10705,6 +10835,17 @@ static void run_scripts(void) {
     /* microtasks queued during load, then the document lifecycle
      * events (the runtime stays alive: phase 10) */
     js_drain_jobs(cur);
+
+    /* A module body that top-level-awaited settles only once the jobs
+     * above run; surface a rejection instead of losing it. */
+    for (int k = 0; k < nmodp; k++) {
+        if (JS_PromiseState(cx, modp[k]) == JS_PROMISE_REJECTED) {
+            JSValue e = JS_PromiseResult(cx, modp[k]);
+            js_report_val(cx, e);
+            JS_FreeValue(cx, e);
+        }
+        JS_FreeValue(cx, modp[k]);
+    }
     js_dispatch_event(-1, "DOMContentLoaded");
     js_dispatch_event(-1, "load");
 }
@@ -11381,6 +11522,52 @@ static void update_title(void) {
 
 static long do_navigate(const char *url);
 
+/* Collapse "." and ".." path segments in place (RFC 3986
+ * remove_dot_segments). Relative ES-module specifiers are nearly always
+ * "./x.js" or "../y.js", so resolution MUST fold them or every import
+ * resolves to a 404 path. Query/fragment ride along untouched. */
+static void url_norm_dots(char *url, int out_max) {
+    int origin_end = 0, slashes = 0;
+    for (int i = 0; url[i]; i++)
+        if (url[i] == '/' && ++slashes == 3) { origin_end = i; break; }
+    if (!origin_end) return;                  /* no path to normalize */
+
+    int n = (int)str_len(url), plen = n;
+    for (int i = origin_end; i < n; i++)
+        if (url[i] == '?' || url[i] == '#') { plen = i; break; }
+    if (origin_end >= plen) return;
+
+    char out[URL_MAX + 2];
+    int w = 0;
+    for (int i = 0; i < origin_end; i++) out[w++] = url[i];
+
+    int i = origin_end, trail = 0;
+    while (i < plen) {
+        if (url[i] == '/') { i++; continue; }
+        int seg0 = i;
+        while (i < plen && url[i] != '/') i++;
+        int slen = i - seg0;
+        if (slen == 1 && url[seg0] == '.') {
+            trail = 1;                        /* "." -> drop */
+        } else if (slen == 2 && url[seg0] == '.' && url[seg0 + 1] == '.') {
+            while (w > origin_end && out[w - 1] != '/') w--;   /* pop seg */
+            if (w > origin_end) w--;                           /* and its '/' */
+            trail = 1;
+        } else {
+            if (w < URL_MAX) out[w++] = '/';
+            for (int q = seg0; q < i && w < URL_MAX; q++) out[w++] = url[q];
+            trail = (i < plen);               /* a '/' followed this segment */
+        }
+    }
+    if ((w == origin_end || trail) && w < URL_MAX && out[w - 1] != '/')
+        out[w++] = '/';
+    for (int q = plen; q < n && w < URL_MAX; q++) out[w++] = url[q];
+    out[w] = 0;
+    /* out_max is the CALLER's capacity: several callers hand us 512-byte
+     * src[] fields, so copying URL_MAX+1 here smashes their buffer. */
+    str_copy(url, out, (size_t)out_max);
+}
+
 static void resolve_relative_url(const char *base, const char *rel, char *out, int out_max) {
     if (rel[0] == 'h' && rel[1] == 't' && rel[2] == 't' && rel[3] == 'p') {
         str_copy(out, rel, out_max);
@@ -11396,6 +11583,23 @@ static void resolve_relative_url(const char *base, const char *rel, char *out, i
         }
     }
     if (origin_end == 0) origin_end = (int)str_len(base);
+
+    /* protocol-relative "//host/path": inherit the base's scheme. Real
+     * sites emit these constantly; treating them as root-relative built
+     * a bogus "https://host//other/path". */
+    if (rel[0] == '/' && rel[1] == '/') {
+        int scheme_end = 0;
+        while (base[scheme_end] && base[scheme_end] != ':') scheme_end++;
+        int pos = 0;
+        for (int i = 0; i < scheme_end && pos < out_max - 1; i++)
+            out[pos++] = base[i];
+        if (pos < out_max - 1) out[pos++] = ':';
+        for (int i = 0; rel[i] && pos < out_max - 1; i++)
+            out[pos++] = rel[i];
+        out[pos] = 0;
+        url_norm_dots(out, out_max);
+        return;
+    }
 
     if (rel[0] == '/') {
         int pos = 0;
@@ -11416,6 +11620,7 @@ static void resolve_relative_url(const char *base, const char *rel, char *out, i
             out[pos++] = rel[i];
         out[pos] = 0;
     }
+    url_norm_dots(out, out_max);
 }
 /* Append `s` to out[*pos] percent-encoded (form/query component). */
 static void url_encode_append(const char *s, char *out, int *pos, int out_max) {
@@ -11639,6 +11844,34 @@ static void set_home_page(void) {
         "<p>H.264 + AAC MP4 &mdash; check serial for [med] pts + aac.</p>"
         "<video src='http://10.0.2.2:8099/av.mp4' autoplay loop "
         "width='160' height='120'></video>"
+        "</body></html>";
+#endif
+#ifdef ESM_TEST
+    /* On-screen ES-module test: an inline <script type="module"> imports
+     * a module over HTTP which itself uses './' and '../' specifiers,
+     * plus named/default/namespace imports, import.meta.url, live
+     * bindings and dynamic import(). Serves esm/*.mjs from the host
+     * (10.0.2.2:8099). [esm] lines on serial. */
+    html =
+        "<html><head><title>ES Modules</title>"
+        "<style>body{background:#fff;color:#111;font-family:monospace}"
+        "#big{font-size:28px;color:#1a73e8}</style></head><body>"
+        "<h1 id=big>ESM: running...</h1><div id=out></div>"
+        "<script type='module'>"
+        "import { run, MAIN } from 'http://10.0.2.2:8099/esm/main.mjs';\n"
+        "function L(s){console.log('[esm] '+s);"
+        "var d=document.getElementById('out');if(d)d.innerHTML+=s+'<br>';}\n"
+        "function fin(ok){var h=document.getElementById('big');"
+        "if(h)h.textContent=ok?'ESM: ALL PASS':'ESM: FAIL';"
+        "L(ok?'RESULT: ALL PASS':'RESULT: FAIL');L('ALL DONE');}\n"
+        "var ok = run(L);\n"
+        "L('re-export MAIN: '+(MAIN==='main'?'ok':'FAIL'));"
+        "if(MAIN!=='main')ok=false;\n"
+        "import('http://10.0.2.2:8099/esm/dyn.mjs').then(function(m){"
+        "var d=(m.dyn==='DYN_OK');L('dynamic import(): '+(d?'ok':'FAIL'));"
+        "fin(ok&&d);}).catch(function(e){L('dynamic import(): FAIL '+e);"
+        "fin(false);});\n"
+        "</script>"
         "</body></html>";
 #endif
 #ifdef STREAM_TEST

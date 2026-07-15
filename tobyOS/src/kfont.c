@@ -142,8 +142,12 @@ static void kface_try_load(int face) {
     f->data = (unsigned char *)buf;
     f->size = sz;
     kfpu_begin();
-    int ok = stbtt_InitFont(&f->info, f->data,
-                            stbtt_GetFontOffsetForIndex(f->data, 0));
+    /* GetFontOffsetForIndex returns -1 for unrecognized data; stb_truetype
+     * would then read at data + (unsigned)-1. Gate on a valid in-bounds
+     * offset (see kfont_register for why this must never be skipped). */
+    int off = stbtt_GetFontOffsetForIndex(f->data, 0);
+    int ok = (off >= 0 && (size_t)off < sz) &&
+             stbtt_InitFont(&f->info, f->data, off);
     kfpu_end();
     if (!ok) {
         kprintf("[kfont] stbtt_InitFont failed for %s (%lu bytes)\n",
@@ -185,8 +189,15 @@ int kfont_register(const unsigned char *ttf, size_t len) {
     f->data = copy;
     f->size = len;
     kfpu_begin();
-    int ok = stbtt_InitFont(&f->info, f->data,
-                            stbtt_GetFontOffsetForIndex(f->data, 0));
+    /* This blob is WEB-SUPPLIED: any site can hand us a truncated or
+     * non-font body (an error page, a redirect, a format we don't grok).
+     * GetFontOffsetForIndex answers -1 for those, and passing that on as
+     * an offset made stb_truetype dereference data + (unsigned)-1 ==
+     * data + 4 GiB -> ring-0 page fault. A remote font must never be
+     * able to panic the kernel. */
+    int off = stbtt_GetFontOffsetForIndex(f->data, 0);
+    int ok = (off >= 0 && (size_t)off < len) &&
+             stbtt_InitFont(&f->info, f->data, off);
     kfpu_end();
     if (!ok) {
         kprintf("[kfont] web font register: stbtt_InitFont failed (%lu bytes)\n",
