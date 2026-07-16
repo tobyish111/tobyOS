@@ -857,8 +857,13 @@ static struct keep_conn g_keep[KEEP_MAX];
 static unsigned g_ka_reused, g_ka_handshakes;
 
 static void keep_entry_close(struct keep_conn *k) {
-    if (k->tlsc)     tls_close(k->tlsc);
-    else if (k->tcp) tcp_close(k->tcp);
+    /* A parked connection is idle and being discarded, so there is
+     * nothing to flush: a graceful close would make us the active
+     * closer and block the CALLER (who only wanted a cache slot) for
+     * the 5 s FIN wait + TIME_WAIT linger. Abort instead -- never
+     * blocks, frees the slot immediately. */
+    if (k->tlsc)     tls_abort(k->tlsc);
+    else if (k->tcp) tcp_abort(k->tcp);
     k->tlsc = NULL; k->tcp = NULL; k->used = false;
 }
 
@@ -1198,7 +1203,16 @@ int http_get_ext(const char *url,
                 if (want_h2 && strcmp(tls_alpn(tr.tls), "h2") == 0) {
                     int h2rc = http2_fetch(tr.tls, &u, flags, read_cap,
                                            timeout_ms, out);
-                    tls_close(tr.tls);
+                    /* The response is already fully in hand and this
+                     * connection is being discarded, so a graceful close
+                     * buys nothing and costs everything: tcp_close makes
+                     * us the ACTIVE closer, which blocks the caller for
+                     * up to 5 s waiting out the FIN handshake and then
+                     * lingers TCP_TW_MSL_MS in TIME_WAIT. That was ~7 s
+                     * of dead wait on EVERY h2 fetch -- measured 7.3 s to
+                     * pull a 6 KiB stylesheet. Abort (RST + immediate
+                     * free) instead: never blocks, frees the slot now. */
+                    tls_abort(tr.tls);
                     tr.tls = NULL;
                     if (h2rc == 0) { kfree(buf); return 0; }
                     kprintf("[http] h2 fetch failed (%d) -- retry over h1.1\n",
