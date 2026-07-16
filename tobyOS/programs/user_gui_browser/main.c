@@ -790,6 +790,14 @@ struct dnode {
      * DNF_LAID_FIXED). Valid only while lgen == eng->lay_gen. */
     int32_t lx, ly, lw, lh;
     int32_t lgen;
+    /* bloom of this node's + all ancestors' keys (tag/id/class);
+     * set top-down in style_node, read by sel_match_rule's fast
+     * reject to skip hopeless ancestor walks. */
+    uint64_t bloom;
+    /* cached class-attribute span in tpool: style_node fills it so the
+     * matcher stops re-finding "class" (a linear node_attr scan) on
+     * every candidate. cgen == g_cls_gen means it is valid this pass. */
+    int32_t  cls_voff; int16_t cls_vlen; int32_t cgen;
     struct cstyle st;            /* computed by the style pass */
 };
 #define NODE_MAX  32768
@@ -840,6 +848,10 @@ struct crule {
     int32_t order;               /* source order for cascade ties */
     int32_t scope;               /* shadow root node the sheet lives in,
                                     -1 = document (shadow-dom arc) */
+    /* bloom bits every NON-rightmost part demands: if a node's
+     * parent bloom lacks any, no ancestor can match. 0 = no usable
+     * key (e.g. '*'), so no reject is possible. */
+    uint64_t anc_bloom;
 };
 #define RULE_MAX    32768
 #define CSSPOOL_CAP (4096 * 1024)
@@ -3154,10 +3166,113 @@ static void css_parse_sheet(const char *s, long n, int origin) {
 
 /* =================== Selector matching + cascade =================== */
 
-static int class_attr_contains(const struct dnode *nd, const char *cls, int clen) {
+/* -DSTYLE_PROF: where the style pass actually spends its time. rdtsc
+ * (~20 cycles) rather than gettimeofday, which would dominate at
+ * per-node granularity. */
+#ifdef STYLE_PROF
+static inline unsigned long long sp_tsc(void) {
+    unsigned int a, d;
+    __asm__ volatile ("rdtsc" : "=a"(a), "=d"(d));
+    return ((unsigned long long)d << 32) | a;
+}
+static unsigned long long g_sp_pres, g_sp_match, g_sp_inline,
+                          g_sp_var, g_sp_apply;
+static long g_sp_nodes, g_sp_matches, g_sp_decls;
+static long g_sp_cand;          /* rules actually tested (bucket walk) */
+static long g_sp_uni;           /* rules stuck in the universal bucket */
+static long g_sp_partm;         /* part_match calls (ancestor hops) */
+static long g_sp_clook;         /* class_attr_contains calls */
+#define SP_T0(v)      unsigned long long v = sp_tsc()
+#define SP_T1(acc, v) do { (acc) += sp_tsc() - (v); } while (0)
+#define SP_N(c, n)    do { (c) += (n); } while (0)
+#else
+#define SP_T0(v)      do {} while (0)
+#define SP_T1(acc, v) do {} while (0)
+#define SP_N(c, n)    do {} while (0)
+#endif
+
+static uint32_t ridx_hash32(const char *s, int len) {
+    /* FNV-1a over lowercased text: part_match compares id/class
+     * case-insensitively (csspool text is already lowercased), so the
+     * index has to agree or lookups miss. */
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < len; i++) {
+        h ^= (unsigned char)lc(s[i]);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static uint32_t ridx_hash(const char *s, int len) {
+    return ridx_hash32(s, len) & (RIDX_BUCKETS - 1);
+}
+
+/* ---- Ancestor bloom (Blink's "fast reject") ------------------------
+ * Matching a descendant selector means walking every ancestor and
+ * re-testing -- measured on wikipedia: 10 part_match calls and ~7 class
+ * re-parses per candidate, which was 85% of the whole style pass.
+ *
+ * Each node carries a 64-bit bloom of the keys (tag / id / class) of
+ * ITSELF AND ALL ITS ANCESTORS, and each rule precomputes the bits its
+ * NON-rightmost parts demand. If the node's parent bloom lacks any of
+ * them, no ancestor can satisfy the selector and the walk is skipped.
+ *
+ * Correctness: a bloom only ever yields false POSITIVES (we then walk
+ * and match properly), never false negatives -- a real ancestor's key is
+ * always OR'd in. So the match set is unchanged; -DCSS_VERIFY proves it. */
+static inline uint64_t bloom_bit(uint32_t h) {
+    return (1ull << (h & 63)) | (1ull << ((h >> 8) & 63));
+}
+static inline uint32_t bloom_tag_hash(int tag) {
+    return 0x9E3779B9u ^ (uint32_t)(tag * 2654435761u);
+}
+
+/* The single key this compound demands, as bloom bits (0 = none). */
+static uint64_t part_key_bits(const struct cpart *p) {
+    if (p->id_len > 0)
+        return bloom_bit(ridx_hash32(&E->csspool[p->id_off], p->id_len));
+    if (p->nclass > 0)
+        return bloom_bit(ridx_hash32(&E->csspool[p->cls_off[0]], p->cls_len[0]));
+    if (p->tag >= 0)
+        return bloom_bit(bloom_tag_hash(p->tag));
+    return 0;
+}
+
+/* Keys of a node itself: tag + id + every class. */
+static uint64_t node_self_bits(int ni) {
+    const struct dnode *nd = &E->nodes[ni];
+    uint64_t b = 0;
+    if (nd->tag >= 0) b |= bloom_bit(bloom_tag_hash(nd->tag));
     int vlen;
-    const char *v = node_attr(nd, "class", &vlen);
-    if (!v) return 0;
+    const char *v = node_attr(nd, "id", &vlen);
+    if (v && vlen > 0) b |= bloom_bit(ridx_hash32(v, vlen));
+    v = node_attr(nd, "class", &vlen);
+    if (v && vlen > 0) {
+        int i = 0;
+        while (i < vlen) {
+            while (i < vlen && is_whitespace(v[i])) i++;
+            int w0 = i;
+            while (i < vlen && !is_whitespace(v[i])) i++;
+            if (i > w0) b |= bloom_bit(ridx_hash32(&v[w0], i - w0));
+        }
+    }
+    return b;
+}
+
+static int32_t g_cls_gen;   /* bumped once per style pass (rule_index_ensure) */
+
+static int class_attr_contains(const struct dnode *nd, const char *cls, int clen) {
+    SP_N(g_sp_clook, 1);
+    int vlen;
+    const char *v;
+    if (nd->cgen == g_cls_gen) {           /* cached span, valid this pass */
+        if (nd->cls_vlen <= 0) return 0;
+        v = &E->tpool[nd->cls_voff];
+        vlen = nd->cls_vlen;
+    } else {
+        v = node_attr(nd, "class", &vlen);
+        if (!v) return 0;
+    }
     int i = 0;
     while (i < vlen) {
         while (i < vlen && is_whitespace(v[i])) i++;
@@ -3173,6 +3288,7 @@ static int class_attr_contains(const struct dnode *nd, const char *cls, int clen
 }
 
 static int part_match(const struct cpart *p, int ni) {
+    SP_N(g_sp_partm, 1);
     const struct dnode *nd = &E->nodes[ni];
     if (nd->tag == T_TEXT) return 0;
     if (p->tag >= 0 && p->tag != nd->tag) return 0;
@@ -3224,6 +3340,16 @@ static int sel_match_rule(const struct crule *ru, int ni) {
     const struct cpart *parts = &E->parts[ru->part0];
     const struct cpart *last = &parts[ru->nparts - 1];
     if (last->tag >= 0 && last->tag != E->nodes[ni].tag) return 0;
+    /* Fast reject: every non-rightmost part must match SOME ancestor, so
+     * if the ancestors' bloom is missing any of their keys the whole
+     * upward walk is hopeless. This is what makes descendant selectors
+     * affordable -- without it each candidate cost ~10 part_match calls
+     * and ~7 class re-parses. */
+    if (ru->anc_bloom) {
+        int par = E->nodes[ni].parent;
+        if (par < 0) return 0;                 /* needs an ancestor, has none */
+        if ((E->nodes[par].bloom & ru->anc_bloom) != ru->anc_bloom) return 0;
+    }
     return match_upward(parts, ru->nparts - 1, ni);
 }
 
@@ -4255,6 +4381,8 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
 
 struct smatch { uint32_t key; int32_t order; int32_t decl0; int16_t ndecl; };
 
+
+
 /* ---- Cascade rule index --------------------------------------------
  * The cascade used to test EVERY rule against EVERY node: O(nodes x
  * rules). That is fine for a hand-written page and hopeless for a real
@@ -4272,18 +4400,6 @@ struct smatch { uint32_t key; int32_t order; int32_t decl0; int16_t ndecl; };
  * runs on every candidate, and M[] is sorted by (key, order) which is
  * unique per rule, so the resulting match set is identical to the
  * linear scan's. -DCSS_VERIFY cross-checks that on every node. */
-static uint32_t ridx_hash(const char *s, int len) {
-    /* FNV-1a over lowercased text: part_match compares id/class
-     * case-insensitively (csspool text is already lowercased), so the
-     * index has to agree or lookups miss. */
-    uint32_t h = 2166136261u;
-    for (int i = 0; i < len; i++) {
-        h ^= (unsigned char)lc(s[i]);
-        h *= 16777619u;
-    }
-    return h & (RIDX_BUCKETS - 1);
-}
-
 static void rule_index_build(void) {
     for (int i = 0; i < RIDX_BUCKETS; i++) {
         E->idx_id[i] = -1;
@@ -4294,7 +4410,11 @@ static void rule_index_build(void) {
     /* walk backwards + prepend so each chain comes out in ascending
      * rule order (matches the old scan's iteration order) */
     for (int r = E->nrules - 1; r >= 0; r--) {
-        const struct crule *ru = &E->rules[r];
+        struct crule *ru = &E->rules[r];
+        /* bits the ancestors must carry (all parts but the rightmost) */
+        ru->anc_bloom = 0;
+        for (int k = 0; k < ru->nparts - 1; k++)
+            ru->anc_bloom |= part_key_bits(&E->parts[ru->part0 + k]);
         int32_t *head = &E->idx_uni;
         if (ru->nparts > 0) {
             const struct cpart *last = &E->parts[ru->part0 + ru->nparts - 1];
@@ -4309,18 +4429,25 @@ static void rule_index_build(void) {
         }
         E->idx_next[r] = *head;
         *head = (int32_t)r;
+#ifdef STYLE_PROF
+        if (head == &E->idx_uni) g_sp_uni++;   /* every node walks these */
+#endif
     }
     E->idx_nrules = E->nrules;
 }
 
 static void rule_index_ensure(void) {
     if (E->idx_nrules != E->nrules) rule_index_build();
+    /* New style pass: invalidate every node's cached class span. A bump
+     * (not per-node clears) so it is O(1); a stale cgen simply misses. */
+    g_cls_gen++;
 }
 
 /* Test one candidate and keep M[] sorted by (origin, specificity,
  * source order). Extracted so the index and the -DCSS_VERIFY linear
  * scan share identical semantics, including the MATCH_MAX cutoff. */
 static void style_try_rule(int r, int ni, struct smatch *M, int *nm) {
+    SP_N(g_sp_cand, 1);
     const struct crule *ru = &E->rules[r];
     /* shadow scoping: author rules only match inside the tree that
      * declared them (document rules stop at shadow boundaries, a
@@ -4432,6 +4559,18 @@ static void style_node(int ni, const struct cstyle *pst) {
     int save_scope = g_style_scope;
     if (nd->parent >= 0 && E->nodes[nd->parent].shadow == ni)
         g_style_scope = ni;
+    SP_T0(t_pres);
+    /* self+ancestor bloom for the fast reject. Top-down, so the
+     * parent's is already final. Also cache the class span here so the
+     * matcher stops re-finding it on every candidate. */
+    {
+        int cvl; const char *cv = node_attr(nd, "class", &cvl);
+        nd->cls_voff = cv ? (int32_t)(cv - E->tpool) : 0;
+        nd->cls_vlen = cv ? (int16_t)cvl : 0;
+        nd->cgen = g_cls_gen;
+    }
+    nd->bloom = (nd->parent >= 0 ? E->nodes[nd->parent].bloom : 0) |
+                node_self_bits(ni);
     struct cstyle st;
     st_init(&st, pst);
     /* Tables reset inherited text-align: <center> (and align=center
@@ -4508,11 +4647,16 @@ static void style_node(int ni, const struct cstyle *pst) {
         }
     }
     struct smatch M[MATCH_MAX];
+    SP_T1(g_sp_pres, t_pres);
+    SP_T0(t_match);
     int nm = style_collect(ni, M);
+    SP_T1(g_sp_match, t_match);
+    SP_N(g_sp_nodes, 1); SP_N(g_sp_matches, nm);
 #ifdef CSS_VERIFY
     style_verify(ni, M, nm);
 #endif
     /* inline style="" -> transient decls (rolled back afterwards) */
+    SP_T0(t_inline);
     int inl0 = E->ndecls, cp0 = E->csspool_len;
     int vlen;
     const char *sv = node_attr(nd, "style", &vlen);
@@ -4521,6 +4665,8 @@ static void style_node(int ni, const struct cstyle *pst) {
         css_parse_decls(&c);
     }
     int inlN = E->ndecls - inl0;
+    SP_T1(g_sp_inline, t_inline);
+    SP_T0(t_var);
     /* Custom properties first, in cascade order (lowest priority pushed
      * first so the last-pushed wins on lookup): matched non-important,
      * inline non-important, matched important, inline important. Copied
@@ -4553,6 +4699,9 @@ static void style_node(int ni, const struct cstyle *pst) {
             var_push(&E->csspool[dv->noff], dv->nlen,
                      &E->csspool[dv->voff], dv->vlen);
     }
+    SP_T1(g_sp_var, t_var);
+    SP_T0(t_apply);
+    for (int m = 0; m < nm; m++) SP_N(g_sp_decls, M[m].ndecl);
     for (int pass = 0; pass < 2; pass++) {
         for (int m = 0; m < nm; m++)
             for (int d2 = 0; d2 < M[m].ndecl; d2++)
@@ -4569,6 +4718,7 @@ static void style_node(int ni, const struct cstyle *pst) {
             if (E->decls[inl0 + d2].imp)
                 st_apply(&st, pst, &E->decls[inl0 + d2], pass);
     }
+    SP_T1(g_sp_apply, t_apply);
     E->ndecls = inl0;
     E->csspool_len = cp0;
     /* cellpadding= hint: applies only when the cascade left the UA
@@ -11286,7 +11436,7 @@ static void style_perf_end(void) {
     p = msg_append(m, p, sizeof(m), "\n");
     sys_write(1, m, p);
 }
-#define STYLE_PERF_END() style_perf_end()
+#define STYLE_PERF_END() do { style_perf_end(); STYLE_PROF_DUMP(); } while (0)
 
 /* Per-phase render timing: which part of a page load actually costs. */
 static long g_phase_t0;
@@ -11303,11 +11453,51 @@ static void phase_perf(const char *name) {
 }
 #define PHASE_PERF(n) phase_perf(n)
 
+#ifdef STYLE_PROF
+/* Sub-phase breakdown of the style pass, in millions of TSC cycles. */
+static void style_prof_dump(void) {
+    char m[224]; int p = 0;
+    p = msg_append(m, p, sizeof(m), "[styleprof] Mtsc pres=");
+    p = msg_append_int(m, p, sizeof(m), (int)(g_sp_pres / 1000000ull));
+    p = msg_append(m, p, sizeof(m), " match=");
+    p = msg_append_int(m, p, sizeof(m), (int)(g_sp_match / 1000000ull));
+    p = msg_append(m, p, sizeof(m), " inline=");
+    p = msg_append_int(m, p, sizeof(m), (int)(g_sp_inline / 1000000ull));
+    p = msg_append(m, p, sizeof(m), " var=");
+    p = msg_append_int(m, p, sizeof(m), (int)(g_sp_var / 1000000ull));
+    p = msg_append(m, p, sizeof(m), " apply=");
+    p = msg_append_int(m, p, sizeof(m), (int)(g_sp_apply / 1000000ull));
+    p = msg_append(m, p, sizeof(m), " | nodes=");
+    p = msg_append_int(m, p, sizeof(m), (int)g_sp_nodes);
+    p = msg_append(m, p, sizeof(m), " matches=");
+    p = msg_append_int(m, p, sizeof(m), (int)g_sp_matches);
+    p = msg_append(m, p, sizeof(m), " decls=");
+    p = msg_append_int(m, p, sizeof(m), (int)g_sp_decls);
+    p = msg_append(m, p, sizeof(m), " cand=");
+    p = msg_append_int(m, p, sizeof(m), (int)g_sp_cand);
+    p = msg_append(m, p, sizeof(m), " partm=");
+    p = msg_append_int(m, p, sizeof(m), (int)g_sp_partm);
+    p = msg_append(m, p, sizeof(m), " clook=");
+    p = msg_append_int(m, p, sizeof(m), (int)g_sp_clook);
+    p = msg_append(m, p, sizeof(m), " uni_bucket=");
+    p = msg_append_int(m, p, sizeof(m), (int)g_sp_uni);
+    p = msg_append(m, p, sizeof(m), "\n");
+    sys_write(1, m, p);
+    g_sp_pres = g_sp_match = g_sp_inline = g_sp_var = g_sp_apply = 0;
+    g_sp_nodes = g_sp_matches = g_sp_decls = g_sp_cand = 0;
+    g_sp_partm = g_sp_clook = 0;
+}
+#define STYLE_PROF_DUMP() style_prof_dump()
+#else
+#define STYLE_PROF_DUMP() ((void)0)
+#endif
+
 #else
 #define STYLE_PERF_BEGIN() ((void)0)
 #define STYLE_PERF_END()   ((void)0)
 #define PHASE_PERF_BEGIN() ((void)0)
 #define PHASE_PERF(n)      ((void)0)
+#define STYLE_PROF_DUMP()  ((void)0)
 #endif
 
 static void js_rerender(void) {
@@ -11661,7 +11851,9 @@ static void render_html(void) {
     trans_apply();                        /* seed transition current values */
 
     g_view_mode = VIEW_HTML;
-    layout(g_win_w);                      /* initial style+layout BEFORE
+    PHASE_PERF_BEGIN();
+    layout(g_win_w);
+    PHASE_PERF("layout");                      /* initial style+layout BEFORE
                                              scripts so synchronous
                                              getComputedStyle / rect reads
                                              see real computed values (13F) */
