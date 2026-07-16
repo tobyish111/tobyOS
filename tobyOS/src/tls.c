@@ -967,6 +967,19 @@ void tls_close(struct tls_conn *c) {
     kfree(c);
 }
 
+/* Graceful TLS close that never blocks the caller: close_notify, then a
+ * non-blocking TCP FIN whose handshake/TIME_WAIT the net service tick
+ * runs out in the background. */
+void tls_close_nowait(struct tls_conn *c) {
+    if (!c) return;
+    if (!c->closed && c->handshake_done) {
+        uint8_t alert[2] = { 1, 0 };  /* warning, close_notify */
+        tls_send_encrypted(c, TLS_RT_ALERT, alert, 2);
+    }
+    tcp_close_nowait(c->tcp);
+    kfree(c);
+}
+
 void tls_abort(struct tls_conn *c) {
     if (!c) return;
     if (!c->closed && c->handshake_done) {

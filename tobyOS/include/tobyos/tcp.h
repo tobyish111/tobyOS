@@ -84,6 +84,16 @@ void tcp_close(struct tcp_conn *c);
  * exchange, no TIME_WAIT linger. For tearing down a handshake rejected
  * mid-flight (e.g. TLS cert validation) without the active-closer
  * TIME_WAIT block that tcp_close would incur (stage 13H). */
+/* Graceful close that does NOT block: sends FIN and detaches, leaving
+ * tcp_service_tick() to run out the handshake + TIME_WAIT and recycle
+ * the slot. The conn pointer is dead the moment this returns. Prefer
+ * over tcp_abort() where an RST would be rude. */
+void tcp_close_nowait(struct tcp_conn *c);
+
+/* Background timer service: retransmits + reaps detached conns whose
+ * TIME_WAIT has expired. Driven from net_service_tick(). */
+void tcp_service_tick(void);
+
 void tcp_abort(struct tcp_conn *c);
 void tcp_dump(void);
 /* Toggle per-segment rx trace lines (default off -- they saturate a

@@ -126,6 +126,17 @@ struct http_request_ext {
                                 * the response framing allows it. Off =>
                                 * HTTP/1.0 + Connection: close (the exact
                                 * wget/pkg download contract). */
+#define HTTP_F_ALTSVC_AUTO 0x20u /* honour a cached Alt-Svc h3 advert and
+                                   * auto-upgrade to HTTP/3. OFF by default:
+                                   * our h3 client opens a fresh QUIC
+                                   * connection per request while h2 parks
+                                   * and reuses one, so auto-upgrading a
+                                   * multi-resource page load is a net loss
+                                   * (measured: github 84 h3 fetches = 84
+                                   * QUIC handshakes / ~3.0 s of sheets, vs
+                                   * 523 ms over a reused h2 connection).
+                                   * Re-enable by default once h3
+                                   * connections are parked+reused. */
 #define HTTP_F_NO_COOKIES 0x10u /* don't attach the cookie jar (CORS:
                                    cross-origin fetch defaults to
                                    credentials-less requests) */
@@ -205,7 +216,8 @@ int http_get_follow(char cur_url[512], size_t max_body, unsigned flags,
 void http_free(struct http_response *r);
 
 /* Decompress a gzip/br body into an owned buffer capped at max_out,
- * swapping *pbody/*pbody_len and resetting out->encoding to identity;
+ * swapping the caller's body pointer + length and resetting
+ * out->encoding to identity;
  * keeps the raw body on failure. Every transport advertising
  * Accept-Encoding must call this before handing the body to a caller.
  * `tag` prefixes the log line ("http", "quich3"). */

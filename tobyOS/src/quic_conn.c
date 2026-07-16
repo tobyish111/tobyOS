@@ -1351,10 +1351,13 @@ int quic_udp_send_test(void) {
         kprintf("[altsvc] fetch1 (explicit h3) rc=%d status=%d -- records "
                 "Alt-Svc\n", r1, r1 == 0 ? a1.status : 0);
         if (r1 == 0) http_free(&a1);
+        /* No TRY_H3 flag: the upgrade must come from the cached Alt-Svc
+         * advert alone. ALTSVC_AUTO opts into that (it is off by default
+         * for page loads, where reused h2 beats per-request QUIC). */
         int r2 = http_get_opt("https://tobyos.test:4433/", 65536, 15000,
-                              HTTP_F_TRUNCATE /* no h3 flag */, &a2);
+                              HTTP_F_TRUNCATE | HTTP_F_ALTSVC_AUTO, &a2);
         if (r2 == 0) {
-            kprintf("[altsvc] fetch2 (no flag) rc=0 status=%d -- AUTO-UPGRADED "
+            kprintf("[altsvc] fetch2 (no h3 flag) rc=0 status=%d -- AUTO-UPGRADED "
                     "TO HTTP/3 VIA ALT-SVC\n", a2.status);
             http_free(&a2);
         } else {
@@ -1382,7 +1385,8 @@ int quic_udp_send_test(void) {
         if (rc3 == 0) http_free(&r3);
         kprintf("[quich3] REAL-WORLD fetch2 (auto-upgrade): %s\n", url);
         int rc4 = http_get_opt(url, H3_RESP_MAX, 25000,
-                               HTTP_F_GZIP | HTTP_F_TRUNCATE, &r4);
+                               HTTP_F_GZIP | HTTP_F_TRUNCATE |
+                               HTTP_F_ALTSVC_AUTO, &r4);
         if (rc4 == 0) {
             kprintf("[quich3] REAL-WORLD OK: %s status=%d type='%s' enc=%d "
                     "body=%u bytes -- LIVE PAGE FROM THE INTERNET OVER HTTP/3\n",

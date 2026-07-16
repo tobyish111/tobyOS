@@ -460,6 +460,9 @@ void net_poll(void) {
     }
     tcp_echo_poll();
     tcp_shell_poll();
+    /* Drive TCP timers in the background so a closing connection no
+     * longer needs its owner to sit and poll it (see tcp_close_nowait). */
+    tcp_service_tick();
 }
 
 void net_service_tick(void) {

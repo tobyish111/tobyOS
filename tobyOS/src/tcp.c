@@ -91,6 +91,11 @@ struct tcp_conn {
     int8_t       acc_q[TCP_LISTEN_BACKLOG];
     int8_t       parent_lsn;
     uint64_t     tw_deadline_tick;
+    /* Owner has abandoned this conn (tcp_close_nowait): it is only
+     * running out its FIN handshake / TIME_WAIT timer, and
+     * tcp_service_tick may recycle the slot. Never set while a caller
+     * still holds the pointer. */
+    bool         detached;
 };
 
 static struct tcp_conn g_conns[TCP_MAX_CONNS];
@@ -450,6 +455,27 @@ static void tcp_tick_all(void) {
             c->state = TCP_CLOSED;
             pend_clear(c);
         }
+    }
+}
+
+/* Background service tick: drive retransmit timers and REAP connections
+ * that are only waiting out a timer (TIME_WAIT linger, or a finished
+ * close). Called from net_service_tick() in the kernel idle loop.
+ *
+ * Without this nothing advances a closing connection unless some caller
+ * is actively polling it -- which is exactly why tcp_close() had to
+ * block. With it, tcp_close_nowait() can send FIN and return, and the
+ * slot is recycled here a couple of ticks later. */
+void tcp_service_tick(void) {
+    tcp_tick_all();
+    uint64_t now = pit_ticks();
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn *c = &g_conns[i];
+        if (!c->in_use || !c->detached) continue;   /* only orphaned conns */
+        if (c->state == TCP_TIME_WAIT && now >= c->tw_deadline_tick)
+            conn_free(c);
+        else if (c->state == TCP_CLOSED)
+            conn_free(c);
     }
 }
 
@@ -1081,6 +1107,37 @@ void tcp_close(struct tcp_conn *c) {
         }
     }
     if (c->in_use) conn_free(c);
+}
+
+/* Graceful close that does NOT block the caller: send FIN, detach, and
+ * let tcp_service_tick() (kernel idle loop) run out the handshake and
+ * the TIME_WAIT linger in the background, recycling the slot when the
+ * timer expires.
+ *
+ * This is what tcp_close() should have been for a client that is simply
+ * done with a connection: tcp_close() waits up to 5 s for the peer's FIN
+ * and then lingers TCP_TW_MSL_MS, which cost ~7 s on every fetch. Prefer
+ * this over tcp_abort() where an RST would be rude (a completed HTTP/1
+ * response, a finished download): the peer still gets a proper FIN.
+ *
+ * The conn is untouchable after this returns -- the slot may be recycled
+ * at any tick. */
+void tcp_close_nowait(struct tcp_conn *c) {
+    if (!c || !c->in_use) return;
+
+    if (c->state == TCP_LISTEN || c->state == TCP_CLOSED ||
+        c->state == TCP_SYN_SENT) {
+        tcp_close(c);                  /* these paths never block */
+        return;
+    }
+    if (c->state == TCP_ESTABLISHED) {
+        if (tcp_send_data_segment(c, TCP_FLAG_FIN, NULL, 0))
+            c->state = TCP_FIN_WAIT_1;
+    } else if (c->state == TCP_CLOSE_WAIT) {
+        if (tcp_send_data_segment(c, TCP_FLAG_FIN, NULL, 0))
+            c->state = TCP_LAST_ACK;
+    }
+    c->detached = true;                /* tcp_service_tick owns it now */
 }
 
 /* Abortive close (stage 13H): RST + immediate free. No FIN handshake and
