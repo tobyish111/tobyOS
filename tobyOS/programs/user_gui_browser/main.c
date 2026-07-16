@@ -11974,6 +11974,40 @@ static void render_html(void) {
     g_view_mode = VIEW_HTML;
     PHASE_PERF_BEGIN();
     layout(g_win_w);
+#ifdef DL_TRACE
+    /* Dump header-region display items: what IS each painted box? */
+    for (int di = 0; di < g_nitems; di++) {
+        struct ditem *it = &g_items[di];
+        if (it->y > 200 || it->w < 8 || it->h < 8) continue;
+        if (it->kind != DI_RECT && it->kind != DI_IMG) continue;
+        char m[400]; int p = 0;
+        p = msg_append(m, p, sizeof(m), "[dl] ");
+        p = msg_append(m, p, sizeof(m), it->kind == DI_RECT ? "RECT" : "IMG");
+        p = msg_append(m, p, sizeof(m), " x=");
+        p = msg_append_int(m, p, sizeof(m), it->x);
+        p = msg_append(m, p, sizeof(m), " y=");
+        p = msg_append_int(m, p, sizeof(m), it->y);
+        p = msg_append(m, p, sizeof(m), " w=");
+        p = msg_append_int(m, p, sizeof(m), it->w);
+        p = msg_append(m, p, sizeof(m), " h=");
+        p = msg_append_int(m, p, sizeof(m), it->h);
+        p = msg_append(m, p, sizeof(m), " fg=");
+        p = msg_append_int(m, p, sizeof(m), (int)(it->fg & 0xFFFFFF));
+        p = msg_append(m, p, sizeof(m), " img=");
+        p = msg_append_int(m, p, sizeof(m), it->img);
+        if (it->node >= 0 && it->node < E->nnodes) {
+            int cl; const char *cv = node_attr(&E->nodes[it->node], "class", &cl);
+            if (cv) {
+                p = msg_append(m, p, sizeof(m), " class=\"");
+                for (int q = 0; q < cl && q < 60 && p < (int)sizeof(m) - 2; q++)
+                    m[p++] = cv[q];
+                p = msg_append(m, p, sizeof(m), "\"");
+            }
+        }
+        p = msg_append(m, p, sizeof(m), "\n");
+        sys_write(1, m, p);
+    }
+#endif
     PHASE_PERF("layout");                      /* initial style+layout BEFORE
                                              scripts so synchronous
                                              getComputedStyle / rect reads
@@ -12882,8 +12916,11 @@ static void media_free(void) { media_fetch_cancel(); tab_media_free(cur); }
 extern double sin(double);
 extern double cos(double);
 
-#define SVG_MAX_PTS   1536
-#define SVG_MAX_SUBS  48
+/* Real logos are heavy: enwiki-25.svg's longest single <path d="..">
+ * is 19,230 chars and flattens to thousands of points. svgpoly is
+ * heap-allocated, so these caps cost one ~70 KiB transient. */
+#define SVG_MAX_PTS   8192
+#define SVG_MAX_SUBS  256
 #define SVG_MAX_DIM   512
 
 struct svgpoly {
@@ -12999,6 +13036,180 @@ static int svg_attr(const char *s, long i, long end, const char *name,
     return 0;
 }
 
+/* ---- Gradient paint servers (v1: average stop color) --------------- *
+ * <defs> gradients are parsed in a pre-pass into a small id table; a
+ * fill="url(#id)" then paints the AVERAGE of the gradient's stop colors
+ * as a solid -- shapes get the right hue and geometry without a
+ * per-pixel gradient rasterizer. href/xlink:href stop inheritance
+ * (Inkscape-style shared defs) is resolved after the pass. */
+#define SVG_GRAD_MAX 128
+struct svggrad {
+    char     id[48];
+    char     ref[48];            /* href="#other" stop inheritance */
+    uint32_t sr, sg, sb;         /* opacity-weighted channel sums */
+    uint32_t swt;                /* total weight (0..255 per stop) */
+    uint32_t avg;                /* resolved average (ARGB) */
+    uint8_t  resolved;
+};
+static struct svggrad g_svg_grads[SVG_GRAD_MAX];
+static int g_svg_ngrads;
+
+static struct svggrad *svg_grad_find(const char *id, int len) {
+    if (len <= 0) return NULL;
+    for (int k = 0; k < g_svg_ngrads; k++) {
+        const char *gid = g_svg_grads[k].id;
+        int i = 0;
+        while (i < len && gid[i] == id[i]) i++;
+        if (i == len && gid[i] == 0) return &g_svg_grads[k];
+    }
+    return NULL;
+}
+
+/* Accumulate one <stop> tag's color into the open gradient entry. */
+static void svg_grad_stop(struct svggrad *g, const char *s, long i, long end) {
+    char a[128];
+    uint32_t col = 0;
+    int have = 0;
+    if (svg_attr(s, i, end, "stop-color", a, sizeof(a)) &&
+        css_color_tok(a, (int)str_len(a), &col))
+        have = 1;
+    int wt = 255;
+    if (svg_attr(s, i, end, "stop-opacity", a, sizeof(a))) {
+        int p = 0;
+        float o = svg_num(a, (int)str_len(a), &p);
+        if (o < 0) o = 0;
+        if (o > 1) o = 1;
+        wt = (int)(o * 255.0f + 0.5f);
+    }
+    if (svg_attr(s, i, end, "style", a, sizeof(a))) {
+        int al = (int)str_len(a);
+        int fo = str_contains(a, al, "stop-color:", 11);
+        if (fo >= 0) {
+            int v0 = fo + 11;
+            while (v0 < al && a[v0] == ' ') v0++;
+            int v1 = v0;
+            while (v1 < al && a[v1] != ';') v1++;
+            if (css_color_tok(a + v0, v1 - v0, &col)) have = 1;
+        }
+    }
+    if (!have || wt == 0) return;
+    g->sr += ((col >> 16) & 0xFF) * (uint32_t)wt;
+    g->sg += ((col >> 8) & 0xFF) * (uint32_t)wt;
+    g->sb += (col & 0xFF) * (uint32_t)wt;
+    g->swt += (uint32_t)wt;
+}
+
+/* Pre-pass over the whole document: every <linearGradient>/
+ * <radialGradient> id -> averaged stop color. */
+static void svg_collect_gradients(const char *s, long n) {
+    g_svg_ngrads = 0;
+    struct svggrad *open_g = NULL;
+    long i = 0;
+    while (i < n) {
+        while (i < n && s[i] != '<') i++;
+        if (i + 1 >= n) break;
+        if (s[i + 1] == '!' || s[i + 1] == '?') {
+            i = svg_tag_close(s, n, i) + 1;
+            continue;
+        }
+        if (s[i + 1] == '/') {                        /* closing tag */
+            char nm[20];
+            long k = i + 2;
+            int o = 0;
+            while (k < n && s[k] != '>' && s[k] != ' ' && o < 19)
+                nm[o++] = (char)lc(s[k++]);
+            nm[o] = 0;
+            if (str_eq(nm, "lineargradient") || str_eq(nm, "radialgradient"))
+                open_g = NULL;
+            i = svg_tag_close(s, n, i) + 1;
+            continue;
+        }
+        char nm[20];
+        long k = i + 1;
+        int o = 0;
+        while (k < n && (is_alpha(s[k]) || (s[k] >= '0' && s[k] <= '9')) &&
+               o < 19)
+            nm[o++] = (char)lc(s[k++]);
+        nm[o] = 0;
+        long tend = svg_tag_close(s, n, k);
+        int selfclose = (tend > i && s[tend - 1] == '/');
+        if (str_eq(nm, "lineargradient") || str_eq(nm, "radialgradient")) {
+            open_g = NULL;
+            char a[96];
+            if (svg_attr(s, k, tend, "id", a, sizeof(a)) &&
+                g_svg_ngrads < SVG_GRAD_MAX) {
+                struct svggrad *g = &g_svg_grads[g_svg_ngrads++];
+                mem_zero(g, sizeof(*g));
+                str_copy(g->id, a, sizeof(g->id));
+                /* svg_attr requires whitespace before the name, so a
+                 * plain "href" scan cannot false-match "xlink:href" */
+                if (svg_attr(s, k, tend, "href", a, sizeof(a)) ||
+                    svg_attr(s, k, tend, "xlink:href", a, sizeof(a))) {
+                    const char *r = a[0] == '#' ? a + 1 : a;
+                    str_copy(g->ref, r, sizeof(g->ref));
+                }
+                if (!selfclose) open_g = g;
+            }
+            i = tend + 1;
+            continue;
+        }
+        if (open_g && str_eq(nm, "stop"))
+            svg_grad_stop(open_g, s, k, tend);
+        i = tend + 1;
+    }
+    /* Resolve averages; stop-less gradients inherit through href chains. */
+    for (int k2 = 0; k2 < g_svg_ngrads; k2++) {
+        struct svggrad *g = &g_svg_grads[k2];
+        struct svggrad *src = g;
+        for (int hop = 0; hop < 4 && src && src->swt == 0 && src->ref[0]; hop++)
+            src = svg_grad_find(src->ref, (int)str_len(src->ref));
+        if (src && src->swt > 0) {
+            g->avg = 0xFF000000u |
+                     ((src->sr / src->swt) << 16) |
+                     ((src->sg / src->swt) << 8) |
+                     (src->sb / src->swt);
+            g->resolved = 1;
+        }
+    }
+}
+
+/* fill="url(#id) [fallback]" -> gradient average, else the spec'd
+ * fallback color, else none (per SVG, a broken paint-server reference
+ * paints NOTHING -- the old behavior fell through to opaque black).
+ * Returns 1 when the value was a url() form (out/none are set). */
+static int svg_url_fill(const char *v, int vl, uint32_t *out, int *none) {
+    int u = str_contains(v, vl, "url(", 4);
+    if (u < 0) return 0;
+    int p = u + 4;
+    while (p < vl && (v[p] == ' ' || v[p] == '"' || v[p] == '\'')) p++;
+    if (p < vl && v[p] == '#') {
+        p++;
+        int e = p;
+        while (e < vl && v[e] != ')' && v[e] != '"' && v[e] != '\'' &&
+               v[e] != ' ')
+            e++;
+        struct svggrad *g = svg_grad_find(v + p, e - p);
+        if (g && g->resolved) {
+            *out = g->avg;
+            *none = 0;
+            return 1;
+        }
+    }
+    /* unresolved reference: honor "url(#x) <color>" fallback */
+    int q = u;
+    while (q < vl && v[q] != ')') q++;
+    if (q < vl) q++;
+    while (q < vl && v[q] == ' ') q++;
+    uint32_t col;
+    if (q < vl && css_color_tok(v + q, vl - q, &col)) {
+        *out = col | 0xFF000000u;
+        *none = 0;
+        return 1;
+    }
+    *none = 1;
+    return 1;
+}
+
 /* Effective fill for a shape tag: fill= attr, style="fill:..", else
  * the inherited <g> fill. Sets *none for fill:none. */
 static void svg_fill_of(const char *s, long i, long end,
@@ -13009,6 +13220,7 @@ static void svg_fill_of(const char *s, long i, long end,
     *none = inherit_none;
     if (svg_attr(s, i, end, "fill", a, sizeof(a))) {
         if (str_eq(a, "none")) { *none = 1; return; }
+        if (svg_url_fill(a, (int)str_len(a), out, none)) return;
         uint32_t col;
         if (css_color_tok(a, (int)str_len(a), &col)) {
             *out = col | 0xFF000000u;
@@ -13028,6 +13240,7 @@ static void svg_fill_of(const char *s, long i, long end,
                 *none = 1;
                 return;
             }
+            if (svg_url_fill(a + v0, v1 - v0, out, none)) return;
             uint32_t col;
             if (css_color_tok(a + v0, v1 - v0, &col)) {
                 *out = col | 0xFF000000u;
@@ -13208,9 +13421,17 @@ static uint32_t *svg_render(const uint8_t *bufu, long n, int *out_w, int *out_h)
     if (W < 1 || H < 1) return NULL;
     float sxx = (float)W / vbw, syy = (float)H / vbh;
 
+    svg_collect_gradients(s, n);   /* defs can precede OR follow shapes */
+
+    /* Path/points data buffer: sized from the document (a single attr
+     * value cannot exceed it) -- the old fixed 8 KiB truncated real
+     * logos' 19 KiB+ path data mid-path. */
+    long dcap = n + 1;
+    if (dcap < 8192) dcap = 8192;
+    if (dcap > 262144) dcap = 262144;
     uint32_t *canvas = (uint32_t *)malloc((size_t)W * H * 4);
     struct svgpoly *poly = (struct svgpoly *)malloc(sizeof(struct svgpoly));
-    char *dbuf = (char *)malloc(8192);
+    char *dbuf = (char *)malloc((size_t)dcap);
     if (!canvas || !poly || !dbuf) {
         if (canvas) free(canvas);
         if (poly) free(poly);
@@ -13320,7 +13541,7 @@ static uint32_t *svg_render(const uint8_t *bufu, long n, int *out_w, int *out_h)
                     svg_fill_poly(canvas, W, H, poly, fill);
                 }
             } else if (!none && (str_eq(nm, "polygon") || str_eq(nm, "polyline"))) {
-                if (svg_attr(s, k, tend, "points", dbuf, 8192)) {
+                if (svg_attr(s, k, tend, "points", dbuf, (int)dcap)) {
                     int p2 = 0, dn = (int)str_len(dbuf), first = 1;
                     while (p2 < dn) {
                         int save = p2;
@@ -13333,7 +13554,7 @@ static uint32_t *svg_render(const uint8_t *bufu, long n, int *out_w, int *out_h)
                     svg_fill_poly(canvas, W, H, poly, fill);
                 }
             } else if (!none && str_eq(nm, "path")) {
-                if (svg_attr(s, k, tend, "d", dbuf, 8192)) {
+                if (svg_attr(s, k, tend, "d", dbuf, (int)dcap)) {
                     svg_path_d(dbuf, (int)str_len(dbuf), poly, sxx, syy, vbx, vby);
                     svg_fill_poly(canvas, W, H, poly, fill);
                 }
@@ -13486,6 +13707,44 @@ static int load_one_pending_image(void) {
 
         int iw = 0, ih = 0;
         uint32_t *pix = img_decode_bytes(g_img_fetch_buf, n, &iw, &ih);
+#ifdef IMG_PROF
+        {   /* decode outcome + opacity profile (black-blob hunting) */
+            long opq = 0;
+            unsigned long long sr = 0, sg = 0, sb = 0;
+            if (pix)
+                for (long q2 = 0; q2 < (long)iw * ih; q2++)
+                    if ((pix[q2] >> 24) >= 128) {
+                        opq++;
+                        sr += (pix[q2] >> 16) & 0xFF;
+                        sg += (pix[q2] >> 8) & 0xFF;
+                        sb += pix[q2] & 0xFF;
+                    }
+            char m[320]; int p2 = 0;
+            p2 = msg_append(m, p2, sizeof(m), "[imgprof] ");
+            p2 = msg_append(m, p2, sizeof(m), pix ? "ok " : "FAIL ");
+            p2 = msg_append_int(m, p2, sizeof(m), iw);
+            p2 = msg_append(m, p2, sizeof(m), "x");
+            p2 = msg_append_int(m, p2, sizeof(m), ih);
+            p2 = msg_append(m, p2, sizeof(m), " bytes=");
+            p2 = msg_append_int(m, p2, sizeof(m), (int)n);
+            p2 = msg_append(m, p2, sizeof(m), " opq%=");
+            p2 = msg_append_int(m, p2, sizeof(m),
+                (pix && iw > 0 && ih > 0)
+                    ? (int)(opq * 100 / ((long)iw * ih)) : 0);
+            p2 = msg_append(m, p2, sizeof(m), " avg=");
+            p2 = msg_append_int(m, p2, sizeof(m), opq ? (int)(sr / opq) : 0);
+            p2 = msg_append(m, p2, sizeof(m), ",");
+            p2 = msg_append_int(m, p2, sizeof(m), opq ? (int)(sg / opq) : 0);
+            p2 = msg_append(m, p2, sizeof(m), ",");
+            p2 = msg_append_int(m, p2, sizeof(m), opq ? (int)(sb / opq) : 0);
+            p2 = msg_append(m, p2, sizeof(m), " grads=");
+            p2 = msg_append_int(m, p2, sizeof(m), g_svg_ngrads);
+            p2 = msg_append(m, p2, sizeof(m), " src=");
+            p2 = msg_append(m, p2, sizeof(m), im->src);
+            p2 = msg_append(m, p2, sizeof(m), "\n");
+            sys_write(1, m, p2);
+        }
+#endif
         if (!pix) {
             im->state = -1;
             return 1;
@@ -15154,7 +15413,13 @@ static void paint_deco_rect(int sx, int sy, int w, int h, int radius, int deco,
             r4[k] = v;
         }
     }
-    uint32_t sc = 0xFF000000u | (solid & 0xFFFFFF);
+    /* Honor the solid's alpha: a radius/deco rect is emitted even for a
+     * TRANSPARENT background (the item carries the gradient/shadow), and
+     * forcing alpha here painted transparent rounded buttons as opaque
+     * black boxes (wikipedia header). bg is opaque-or-zero by st_apply. */
+    uint32_t sc = solid;
+    if ((!dc || !dc->has_grad) && (solid >> 24) == 0)
+        return;                            /* nothing to fill */
     for (int yy = 0; yy < h; yy++) {
         int py = sy + yy;
         if (py < cyy0 || py >= cyy1) continue;
