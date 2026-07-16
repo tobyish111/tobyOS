@@ -812,6 +812,13 @@ struct dattr {                   /* name/value slices in tpool */
 
 /* ---- CSSOM -------------------------------------------------------- */
 
+/* Classes stored per compound. Codex/BEM state selectors chain up to 5
+ * (.cdx-button.cdx-button--fake-button--enabled.cdx-button--weight-primary
+ *  .cdx-button--action-destructive.cdx-button--is-active); a compound
+ * with MORE than the cap makes the whole selector invalid (drop the
+ * rule) -- silently keeping a prefix over-matched: every state-variant
+ * rule applied to every button (wikipedia's salmon boxes). */
+#define PART_CLS_MAX 6
 struct cpart {                   /* one compound selector part */
     int16_t tag;                 /* T_* or -1 = any */
     uint8_t comb;                /* combinator to the LEFT: 0 none/first,
@@ -820,7 +827,7 @@ struct cpart {                   /* one compound selector part */
     uint8_t pseudo_link;         /* :link / :visited present */
     uint8_t has_attr;
     int32_t id_off;   int16_t id_len;
-    int32_t cls_off[2]; int16_t cls_len[2];
+    int32_t cls_off[PART_CLS_MAX]; int16_t cls_len[PART_CLS_MAX];
     int32_t an_off;   int16_t an_len;    /* [name] / [name=value] */
     int32_t av_off;   int16_t av_len;    /* 0 len = presence test */
 };
@@ -2483,11 +2490,12 @@ static int css_parse_part(struct ccur *c, struct cpart *p,
             c->i++;
             int off, l;
             if (!css_ident(c, &off, &l)) return 0;
-            if (p->nclass < 2) {
-                p->cls_off[p->nclass] = off;
-                p->cls_len[p->nclass] = (int16_t)l;
-                p->nclass++;
-            }
+            if (p->nclass >= PART_CLS_MAX) return 0;   /* fail closed: a
+                 * kept prefix would over-match (apply state-variant rules
+                 * to every element carrying the base classes) */
+            p->cls_off[p->nclass] = off;
+            p->cls_len[p->nclass] = (int16_t)l;
+            p->nclass++;
             (*spec_cls)++;
             got = 1;
             continue;
@@ -2496,6 +2504,7 @@ static int css_parse_part(struct ccur *c, struct cpart *p,
             c->i++;
             int off, l;
             if (!css_ident(c, &off, &l)) return 0;
+            if (p->id_len) return 0;      /* fail closed, as for classes */
             p->id_off = off;
             p->id_len = (int16_t)l;
             (*spec_id)++;
@@ -2507,6 +2516,7 @@ static int css_parse_part(struct ccur *c, struct cpart *p,
             css_ws(c);
             int off, l;
             if (!css_ident(c, &off, &l)) return 0;
+            if (p->has_attr) return 0;    /* one attr matcher per compound */
             p->an_off = off;
             p->an_len = (int16_t)l;
             css_ws(c);
@@ -3472,13 +3482,40 @@ static void apply_border_shorthand(struct cstyle *st, const char *v, int n,
  * and its subtree, then pops -- so a var set on one subtree doesn't
  * leak to siblings, and descendants inherit ancestor vars. */
 
-#define VARSCOPE_MAX 512
-#define VARPOOL_CAP  (64 * 1024)
+/* Sized for design-token sheets: wikipedia's Codex peaks at 381 live
+ * entries / 14 KiB (measured with -DVAR_PROF), youtube ships ~13k
+ * custom-property declarations. Overflow drops definitions silently ->
+ * every var() referencing them takes its fallback. */
+#define VARSCOPE_MAX 4096
+#define VARPOOL_CAP  (512 * 1024)
 struct varent { int noff, nlen, voff, vlen; };    /* offsets into g_varpool */
 static struct varent g_varscope[VARSCOPE_MAX];
 static int  g_nvarscope;
 static char g_varpool[VARPOOL_CAP];
 static int  g_varpool_len;
+
+#ifdef VAR_PROF
+/* Per-style-pass custom-property accounting: drops (definitions lost to
+ * a full scope table / pool), lookup hit/miss, high-water marks, and the
+ * first few distinct names that missed (i.e. fell back). */
+static int g_vp_drop_scope, g_vp_drop_pool, g_vp_hit, g_vp_miss;
+static int g_vp_hwm_scope, g_vp_hwm_pool;
+#define VP_MISSNAMES 12
+static char g_vp_missname[VP_MISSNAMES][64];
+static int  g_vp_nmissname;
+static void vp_record_miss(const char *name, int nlen) {
+    if (nlen > 63) nlen = 63;
+    for (int i = 0; i < g_vp_nmissname; i++) {
+        int k = 0;
+        while (k < nlen && g_vp_missname[i][k] == name[k]) k++;
+        if (k == nlen && g_vp_missname[i][k] == 0) return;
+    }
+    if (g_vp_nmissname >= VP_MISSNAMES) return;
+    for (int i = 0; i < nlen; i++) g_vp_missname[g_vp_nmissname][i] = name[i];
+    g_vp_missname[g_vp_nmissname][nlen] = 0;
+    g_vp_nmissname++;
+}
+#endif
 
 /* Grid templates are variable-length text; kept in a stable pool per
  * style pass (cstyle stores offset+len) so lay_grid can parse them at
@@ -3501,10 +3538,25 @@ static void var_scope_reset(void) {
 }
 
 static void var_push(const char *name, int nlen, const char *val, int vlen) {
-    if (g_nvarscope >= VARSCOPE_MAX) return;
+    if (g_nvarscope >= VARSCOPE_MAX) {
+#ifdef VAR_PROF
+        g_vp_drop_scope++;
+#endif
+        return;
+    }
     if (nlen < 0) nlen = 0;
     if (vlen < 0) vlen = 0;
-    if (g_varpool_len + nlen + vlen > VARPOOL_CAP) return;
+    if (g_varpool_len + nlen + vlen > VARPOOL_CAP) {
+#ifdef VAR_PROF
+        g_vp_drop_pool++;
+#endif
+        return;
+    }
+#ifdef VAR_PROF
+    if (g_nvarscope + 1 > g_vp_hwm_scope) g_vp_hwm_scope = g_nvarscope + 1;
+    if (g_varpool_len + nlen + vlen > g_vp_hwm_pool)
+        g_vp_hwm_pool = g_varpool_len + nlen + vlen;
+#endif
     struct varent *e = &g_varscope[g_nvarscope++];
     e->noff = g_varpool_len;
     e->nlen = nlen;
@@ -3521,8 +3573,17 @@ static int var_lookup(const char *name, int nlen, const char **out, int *outlen)
         if (e->nlen != nlen) continue;
         int k = 0;
         while (k < nlen && g_varpool[e->noff + k] == name[k]) k++;
-        if (k == nlen) { *out = &g_varpool[e->voff]; *outlen = e->vlen; return 1; }
+        if (k == nlen) {
+#ifdef VAR_PROF
+            g_vp_hit++;
+#endif
+            *out = &g_varpool[e->voff]; *outlen = e->vlen; return 1;
+        }
     }
+#ifdef VAR_PROF
+    g_vp_miss++;
+    vp_record_miss(name, nlen);
+#endif
     return 0;
 }
 
@@ -11500,6 +11561,44 @@ static void style_prof_dump(void) {
 #define STYLE_PROF_DUMP()  ((void)0)
 #endif
 
+#ifdef VAR_PROF
+/* Custom-property accounting for the style pass that just finished. */
+static void var_prof_dump(void) {
+    char m[512]; int p = 0;
+    p = msg_append(m, p, sizeof(m), "[varprof] hwm_scope=");
+    p = msg_append_int(m, p, sizeof(m), g_vp_hwm_scope);
+    p = msg_append(m, p, sizeof(m), "/");
+    p = msg_append_int(m, p, sizeof(m), VARSCOPE_MAX);
+    p = msg_append(m, p, sizeof(m), " hwm_pool=");
+    p = msg_append_int(m, p, sizeof(m), g_vp_hwm_pool);
+    p = msg_append(m, p, sizeof(m), "/");
+    p = msg_append_int(m, p, sizeof(m), VARPOOL_CAP);
+    p = msg_append(m, p, sizeof(m), " drop_scope=");
+    p = msg_append_int(m, p, sizeof(m), g_vp_drop_scope);
+    p = msg_append(m, p, sizeof(m), " drop_pool=");
+    p = msg_append_int(m, p, sizeof(m), g_vp_drop_pool);
+    p = msg_append(m, p, sizeof(m), " hit=");
+    p = msg_append_int(m, p, sizeof(m), g_vp_hit);
+    p = msg_append(m, p, sizeof(m), " miss=");
+    p = msg_append_int(m, p, sizeof(m), g_vp_miss);
+    p = msg_append(m, p, sizeof(m), "\n");
+    sys_write(1, m, p);
+    for (int i = 0; i < g_vp_nmissname; i++) {
+        p = 0;
+        p = msg_append(m, p, sizeof(m), "[varprof] missed: ");
+        p = msg_append(m, p, sizeof(m), g_vp_missname[i]);
+        p = msg_append(m, p, sizeof(m), "\n");
+        sys_write(1, m, p);
+    }
+    g_vp_drop_scope = g_vp_drop_pool = g_vp_hit = g_vp_miss = 0;
+    g_vp_hwm_scope = g_vp_hwm_pool = 0;
+    g_vp_nmissname = 0;
+}
+#define VAR_PROF_DUMP() var_prof_dump()
+#else
+#define VAR_PROF_DUMP() ((void)0)
+#endif
+
 static void js_rerender(void) {
     g_collect_light = 1;
     g_form_open = -1;
@@ -11515,6 +11614,7 @@ static void js_rerender(void) {
     STYLE_PERF_BEGIN();
     style_node(0, &base);
     STYLE_PERF_END();
+    VAR_PROF_DUMP();
     anim_apply();                /* overlay CSS animation keyframes */
     trans_apply();               /* overlay CSS transitions */
     layout(g_win_w);
@@ -11847,6 +11947,7 @@ static void render_html(void) {
     STYLE_PERF_BEGIN();
     style_node(0, &base);
     STYLE_PERF_END();
+    VAR_PROF_DUMP();
     anim_apply();                         /* start CSS animations at t0 */
     trans_apply();                        /* seed transition current values */
 
