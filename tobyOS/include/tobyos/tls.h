@@ -65,6 +65,7 @@ void tls_close(struct tls_conn *c);
  * never blocks in the FIN/TIME_WAIT linger that tls_close's tcp_close
  * can incur as the active closer. For long-lived connection owners
  * (the WebSocket worker) that must not stall. */
+void tls_close_nowait(struct tls_conn *c);
 void tls_abort(struct tls_conn *c);
 
 /* TCP_RDY_* readiness for the connection, including buffered decrypted

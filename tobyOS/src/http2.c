@@ -161,10 +161,17 @@ struct h2 {
     /* transport read buffer */
     uint8_t  rbuf[H2_MAX_FRAME + 64];
     size_t   rlen, roff;
-    /* HPACK dynamic table (newest at index 0) */
+    /* HPACK dynamic table (newest at index 0). This is CONNECTION state:
+     * the server indexes into it across requests, so it must survive for
+     * as long as the connection is reused -- which is the whole reason
+     * this struct is now parked with the connection rather than freed
+     * per fetch. */
     struct h2_dyn dyn[H2_DYN_MAX];
     int      dyn_count;
     uint32_t dyn_size, dyn_max;
+    /* connection reuse */
+    int      started;            /* preface + SETTINGS already sent */
+    uint32_t next_sid;           /* next client stream id (odd, +2) */
 };
 
 static void dyn_evict_to(struct h2 *h, uint32_t target) {
@@ -412,33 +419,37 @@ static size_t hpack_encode_req(uint8_t *buf, size_t cap,
 }
 
 /* ---- the fetch ----------------------------------------------------- */
-int http2_fetch(struct tls_conn *tls, const struct http_url *u,
-                unsigned flags, size_t max_body, uint32_t timeout_ms,
-                struct http_response *out) {
-    struct h2 *h = (struct h2 *)kmalloc(sizeof(struct h2));
-    if (!h) return HTTP_ERR_NOMEM;
-    memset(h, 0, sizeof(*h));
+/* One request on connection state `h`. Never allocates or frees h --
+ * the caller owns it so the connection can be parked and reused. */
+static int h2_run(struct h2 *h, struct tls_conn *tls, const struct http_url *u,
+                  unsigned flags, size_t max_body, uint32_t timeout_ms,
+                  struct http_response *out) {
     h->tls = tls;
     h->timeout_ms = timeout_ms ? timeout_ms : 15000;
-    h->dyn_max = 4096;                          /* HPACK default */
+    uint32_t my_sid = h->next_sid;
+    h->next_sid += 2;                           /* client streams are odd */
+    uint64_t data_seen = 0;                     /* bytes to hand back below */
 
     /* Preface + our SETTINGS (initial window + push disabled) + a big
      * connection WINDOW_UPDATE so the server may stream the whole body. */
-    if (h2_send(h, H2_PREFACE, H2_PREFACE_LEN) < 0) { kfree(h); return HTTP_ERR_RESET; }
+    if (!h->started) {
+    if (h2_send(h, H2_PREFACE, H2_PREFACE_LEN) < 0) { return HTTP_ERR_RESET; }
     {
         uint8_t s[12];
         s[0] = 0; s[1] = H2_SETTINGS_ENABLE_PUSH;   s[2]=0;s[3]=0;s[4]=0;s[5]=0;
         s[6] = 0; s[7] = H2_SETTINGS_INITIAL_WINDOW_SIZE;
         s[8] = (uint8_t)(H2_MY_WINDOW >> 24); s[9] = (uint8_t)(H2_MY_WINDOW >> 16);
         s[10] = (uint8_t)(H2_MY_WINDOW >> 8); s[11] = (uint8_t)(H2_MY_WINDOW);
-        if (h2_send_frame(h, H2_SETTINGS, 0, 0, s, 12) < 0) { kfree(h); return HTTP_ERR_RESET; }
+        if (h2_send_frame(h, H2_SETTINGS, 0, 0, s, 12) < 0) { return HTTP_ERR_RESET; }
     }
     {
         uint32_t inc = htonl(H2_MY_WINDOW);
         h2_send_frame(h, H2_WINDOW_UPDATE, 0, 0, &inc, 4);
     }
+    h->started = 1;
+    }
 
-    /* HEADERS on stream 1: pseudo-headers + accept-encoding + UA. */
+    /* HEADERS on our stream id: pseudo-headers + accept-encoding + UA. */
     {
         uint8_t hb[1024];
         size_t o = 0;
@@ -456,12 +467,12 @@ int http2_fetch(struct tls_conn *tls, const struct http_url *u,
                               "tobyOS-Browser/3.0");
         if (h2_send_frame(h, H2_HEADERS,
                           H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
-                          1, hb, o) < 0) { kfree(h); return HTTP_ERR_RESET; }
+                          my_sid, hb, o) < 0) { return HTTP_ERR_RESET; }
     }
 
     /* Response body buffer (raw / possibly compressed). */
     uint8_t *body = (uint8_t *)kmalloc(max_body ? max_body : 1);
-    if (!body) { dyn_free_all(h); kfree(h); return HTTP_ERR_NOMEM; }
+    if (!body) { return HTTP_ERR_NOMEM; }
     size_t body_len = 0;
 
     struct h2_resp r;
@@ -475,7 +486,7 @@ int http2_fetch(struct tls_conn *tls, const struct http_url *u,
     int collecting_headers = 0;
     if (!fpay || !hdrblock) {
         if (fpay) kfree(fpay); if (hdrblock) kfree(hdrblock);
-        kfree(body); dyn_free_all(h); kfree(h);
+        kfree(body);
         return HTTP_ERR_NOMEM;
     }
 
@@ -503,7 +514,7 @@ int http2_fetch(struct tls_conn *tls, const struct http_url *u,
             done = 1;                          /* stop; keep what we have */
             break;
         case H2_RST_STREAM:
-            if (sid == 1) { rc = body_len ? 0 : HTTP_ERR_RESET; done = 1; }
+            if (sid == my_sid) { rc = body_len ? 0 : HTTP_ERR_RESET; done = 1; }
             break;
         case H2_PUSH_PROMISE:
             /* refuse pushes (we set ENABLE_PUSH=0 anyway) */
@@ -534,22 +545,25 @@ int http2_fetch(struct tls_conn *tls, const struct http_url *u,
                 hpack_decode_block(h, hdrblock, hdrblock_len, &r);
                 collecting_headers = 0;
             }
-            if ((fflags & H2_FLAG_END_STREAM) && sid == 1) done = 1;
+            if ((fflags & H2_FLAG_END_STREAM) && sid == my_sid) done = 1;
             break;
         }
         case H2_DATA: {
             const uint8_t *dp = fpay; size_t dlen = flen;
+            /* Flow control counts the WHOLE payload, padding included
+             * (RFC 7540 6.9.1), so account before de-padding. */
+            data_seen += flen;
             if (fflags & H2_FLAG_PADDED) {
                 if (dlen < 1) break;
                 uint8_t pad = dp[0]; dp++; dlen--;
                 if (pad > dlen) break; dlen -= pad;
             }
-            if (sid == 1 && dlen) {
+            if (sid == my_sid && dlen) {
                 size_t room = max_body - body_len;
                 size_t take = dlen < room ? dlen : room;
                 if (take) { memcpy(body + body_len, dp, take); body_len += take; }
             }
-            if ((fflags & H2_FLAG_END_STREAM) && sid == 1) done = 1;
+            if ((fflags & H2_FLAG_END_STREAM) && sid == my_sid) done = 1;
             break;
         }
         default:
@@ -558,7 +572,14 @@ int http2_fetch(struct tls_conn *tls, const struct http_url *u,
     }
 
     kfree(fpay); kfree(hdrblock);
-    dyn_free_all(h); kfree(h);
+
+    /* Hand the consumed DATA bytes back to the CONNECTION flow-control
+     * window. The initial grant is one-shot; without this a reused
+     * connection would stall once its cumulative bodies exhausted it. */
+    if (data_seen) {
+        uint32_t inc = htonl((uint32_t)(data_seen & 0x7FFFFFFF));
+        h2_send_frame(h, H2_WINDOW_UPDATE, 0, 0, &inc, 4);
+    }
 
     if (rc != 0 && body_len == 0) { kfree(body); return rc; }
 
@@ -601,4 +622,46 @@ int http2_fetch(struct tls_conn *tls, const struct http_url *u,
             out->status, (unsigned long)body_len,
             out->content_type[0] ? out->content_type : "(none)");
     return 0;
+}
+
+/* ---- public entry points ------------------------------------------- */
+
+void http2_state_free(struct h2 *h) {
+    if (!h) return;
+    dyn_free_all(h);
+    kfree(h);
+}
+
+/* Run a GET, carrying connection state across calls so the TLS
+ * connection can be reused. *ph == NULL starts a fresh connection; on
+ * success *ph holds state the caller may park alongside the tls_conn.
+ * On ANY failure the state is freed and *ph set to NULL: a half-failed
+ * h2 connection has indeterminate HPACK/stream state and must not be
+ * reused. */
+int http2_fetch_on(struct h2 **ph, struct tls_conn *tls,
+                   const struct http_url *u, unsigned flags, size_t max_body,
+                   uint32_t timeout_ms, struct http_response *out) {
+    if (!ph) return HTTP_ERR_PROTOCOL;
+    struct h2 *h = *ph;
+    if (!h) {
+        h = (struct h2 *)kmalloc(sizeof(struct h2));
+        if (!h) return HTTP_ERR_NOMEM;
+        memset(h, 0, sizeof(*h));
+        h->dyn_max  = 4096;                     /* HPACK default */
+        h->next_sid = 1;                        /* client streams are odd */
+    }
+    *ph = h;
+    int rc = h2_run(h, tls, u, flags, max_body, timeout_ms, out);
+    if (rc != 0) { http2_state_free(h); *ph = NULL; }
+    return rc;
+}
+
+/* One-shot: fresh connection state, discarded afterwards. */
+int http2_fetch(struct tls_conn *tls, const struct http_url *u,
+                unsigned flags, size_t max_body, uint32_t timeout_ms,
+                struct http_response *out) {
+    struct h2 *h = NULL;
+    int rc = http2_fetch_on(&h, tls, u, flags, max_body, timeout_ms, out);
+    http2_state_free(h);
+    return rc;
 }

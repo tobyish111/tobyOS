@@ -48,6 +48,7 @@
 struct http_transport {
     struct tcp_conn *tcp;      /* non-NULL for plain HTTP */
     struct tls_conn *tls;      /* non-NULL for HTTPS */
+    struct h2      *h2;        /* h2 connection state, when reusing h2 */
     uint32_t timeout_ms;
 };
 
@@ -67,9 +68,14 @@ static long transport_recv(struct http_transport *t, void *buf, size_t cap) {
     return tcp_recv(t->tcp, buf, cap, t->timeout_ms);
 }
 
+/* We are done with this connection and never wait on its teardown: the
+ * blocking tcp_close() cost the caller up to 5 s (FIN handshake) plus
+ * TCP_TW_MSL_MS of TIME_WAIT linger -- ~7 s on every non-keepalive fetch
+ * and every error path. Send FIN and let tcp_service_tick() finish it. */
 static void transport_close(struct http_transport *t) {
-    if (t->tls) { tls_close(t->tls); t->tls = NULL; }
-    else if (t->tcp) { tcp_close(t->tcp); t->tcp = NULL; }
+    if (t->h2)  { http2_state_free(t->h2); t->h2 = NULL; }
+    if (t->tls) { tls_close_nowait(t->tls); t->tls = NULL; }
+    else if (t->tcp) { tcp_close_nowait(t->tcp); t->tcp = NULL; }
 }
 
 /* ---- tiny ASCII helpers (kept local; klibc.h is intentionally small) - */
@@ -851,6 +857,7 @@ struct keep_conn {
     bool             used;
     struct tcp_conn *tcp;        /* plain-HTTP connection  */
     struct tls_conn *tlsc;       /* HTTPS connection       */
+    struct h2       *h2;         /* h2 state (HPACK table + stream ids) */
     uint64_t         parked_at;  /* pit_ticks() ms at park */
 };
 static struct keep_conn g_keep[KEEP_MAX];
@@ -862,6 +869,7 @@ static void keep_entry_close(struct keep_conn *k) {
      * closer and block the CALLER (who only wanted a cache slot) for
      * the 5 s FIN wait + TIME_WAIT linger. Abort instead -- never
      * blocks, frees the slot immediately. */
+    if (k->h2)       { http2_state_free(k->h2); k->h2 = NULL; }
     if (k->tlsc)     tls_abort(k->tlsc);
     else if (k->tcp) tcp_abort(k->tcp);
     k->tlsc = NULL; k->tcp = NULL; k->used = false;
@@ -896,8 +904,8 @@ static bool keep_take(const struct http_url *u, struct http_transport *tr) {
         if (hit) continue;
         if (k->tls != u->tls || k->port != u->port) continue;
         if (ascii_strncasecmp(k->host, u->host, sizeof(k->host)) != 0) continue;
-        tr->tcp = k->tcp; tr->tls = k->tlsc;
-        k->tcp = NULL; k->tlsc = NULL; k->used = false;
+        tr->tcp = k->tcp; tr->tls = k->tlsc; tr->h2 = k->h2;
+        k->tcp = NULL; k->tlsc = NULL; k->h2 = NULL; k->used = false;
         hit = true;
     }
     return hit;
@@ -922,9 +930,10 @@ static void keep_park(const struct http_url *u, struct http_transport *tr) {
     k->tls  = u->tls;
     k->tcp  = tr->tcp;
     k->tlsc = tr->tls;
+    k->h2   = tr->h2;
     k->parked_at = pit_ticks();
     k->used = true;
-    tr->tcp = NULL; tr->tls = NULL;
+    tr->tcp = NULL; tr->tls = NULL; tr->h2 = NULL;
 }
 
 /* ---- header-block receive -------------------------------------------- */
@@ -1106,8 +1115,19 @@ int http_get_ext(const char *url,
      * advertised port; otherwise it stays the URL's port. */
     uint16_t h3_port = u.port;
     bool altsvc_h3 = u.tls && altsvc_lookup(u.host, &h3_port);
+    /* The Alt-Svc AUTO-upgrade is off while our h3 client cannot reuse a
+     * connection. h2 now parks and reuses (one handshake per origin per
+     * page); h3 pays a full QUIC handshake for EVERY request. Measured on
+     * github.com: 84 h3 fetches => 84 QUIC handshakes, and its sheets
+     * cost ~3.0 s -- versus 94 ms for wikipedia's over one reused h2
+     * connection. Auto-upgrading a multi-resource page load to h3 is
+     * therefore a pessimisation today. HTTP_F_TRY_H3 still opts in
+     * explicitly (the h3 self-test and any single-shot caller), so the
+     * QUIC path stays live; re-enable the auto-upgrade once h3 connections
+     * are parked+reused like h2. */
     bool try_h3 = u.tls && !ext_active &&
-                  ((flags & HTTP_F_TRY_H3) || altsvc_h3);
+                  ((flags & HTTP_F_TRY_H3) ||
+                   ((flags & HTTP_F_ALTSVC_AUTO) && altsvc_h3));
 
     /* 2. Resolve lazily: a keep-alive hit skips DNS entirely. */
     uint32_t ip_be = 0;
@@ -1196,30 +1216,6 @@ int http_get_ext(const char *url,
                     return (tls_err == TLS_ERR_CERT) ? HTTP_ERR_CERT
                                                      : HTTP_ERR_CONNECT;
                 }
-                /* stage 13G: if the server chose HTTP/2 over ALPN, run the
-                 * whole request there and return. On any h2 failure, fall
-                 * back to a fresh HTTP/1.1 connection (GET is idempotent),
-                 * so the proven h1 path always remains the safety net. */
-                if (want_h2 && strcmp(tls_alpn(tr.tls), "h2") == 0) {
-                    int h2rc = http2_fetch(tr.tls, &u, flags, read_cap,
-                                           timeout_ms, out);
-                    /* The response is already fully in hand and this
-                     * connection is being discarded, so a graceful close
-                     * buys nothing and costs everything: tcp_close makes
-                     * us the ACTIVE closer, which blocks the caller for
-                     * up to 5 s waiting out the FIN handshake and then
-                     * lingers TCP_TW_MSL_MS in TIME_WAIT. That was ~7 s
-                     * of dead wait on EVERY h2 fetch -- measured 7.3 s to
-                     * pull a 6 KiB stylesheet. Abort (RST + immediate
-                     * free) instead: never blocks, frees the slot now. */
-                    tls_abort(tr.tls);
-                    tr.tls = NULL;
-                    if (h2rc == 0) { kfree(buf); return 0; }
-                    kprintf("[http] h2 fetch failed (%d) -- retry over h1.1\n",
-                            h2rc);
-                    force_h1 = 1;
-                    continue;
-                }
             } else {
                 tr.tcp = tcp_connect(ip_be, htons(u.port), 3000);
                 if (!tr.tcp) {
@@ -1230,6 +1226,48 @@ int http_get_ext(const char *url,
             }
             g_ka_handshakes++;
         }
+
+        /* stage 13G: if this connection speaks h2 -- freshly negotiated
+         * over ALPN, or taken from the cache carrying its h2 state -- run
+         * the whole request there. This deliberately sits AFTER the
+         * reuse/connect split: a PARKED h2 connection must never fall
+         * through to the h1 request builder below, which would write
+         * HTTP/1.1 bytes onto an h2 connection. On any h2 failure we drop
+         * back to a fresh HTTP/1.1 connection (GET is idempotent), so the
+         * proven h1 path stays the safety net. */
+        if (tr.tls && !force_h1 && !ext_active &&
+            (tr.h2 || strcmp(tls_alpn(tr.tls), "h2") == 0)) {
+            int h2rc = http2_fetch_on(&tr.h2, tr.tls, &u, flags,
+                                      read_cap, timeout_ms, out);
+            if (h2rc == 0) {
+                /* Park the connection AND its h2 state (HPACK table +
+                 * stream ids) so the next fetch skips the TLS handshake
+                 * and the preface entirely -- that was ~140 ms per
+                 * subresource, x22 stylesheets on a real page. */
+                if (want_ka) keep_park(&u, &tr);
+                else {
+                    http2_state_free(tr.h2); tr.h2 = NULL;
+                    tls_abort(tr.tls); tr.tls = NULL;
+                }
+                kfree(buf);
+                return 0;
+            }
+            /* http2_fetch_on already freed the state; this connection's
+             * stream/HPACK state is now indeterminate, so drop it. A
+             * graceful close would block us ~7 s (active closer: 5 s FIN
+             * wait + TIME_WAIT linger), so abort. */
+            tr.h2 = NULL;
+            tls_abort(tr.tls);
+            tr.tls = NULL;
+            if (reused) {                  /* the parked conn went stale */
+                kprintf("[http] stale h2 keep-alive -- reconnecting\n");
+                continue;
+            }
+            kprintf("[http] h2 fetch failed (%d) -- retry over h1.1\n", h2rc);
+            force_h1 = 1;
+            continue;
+        }
+
 
         char reqbuf[2048];
         long reqlen = build_request(&u, reqbuf, sizeof(reqbuf), flags,
