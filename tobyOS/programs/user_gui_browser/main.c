@@ -6808,6 +6808,7 @@ static void resolve_relative_url(const char *base, const char *rel, char *out, i
 static void images_free(void);
 static void tab_images_free(struct tab *t);
 static void media_free(void);
+static uint32_t *data_uri_decode_image(const char *s, int n, int *ow, int *oh);
 static void tab_media_free(struct tab *t);
 static void media_fetch_cancel(void);
 static void layout(int width);
@@ -6966,19 +6967,38 @@ static void collect_node_inner(int ni) {
     case T_IMG: {
         char src[512];
         if (nd->img < 0 && g_nimages < IMG_MAX &&
-            node_attr_str(nd, "src", src, sizeof(src)) && src[0] &&
-            /* skip data: URIs cheaply */
-            !(src[0] == 'd' && src[1] == 'a' && src[2] == 't' &&
-              src[3] == 'a' && src[4] == ':')) {
+            node_attr_str(nd, "src", src, sizeof(src)) && src[0]) {
             struct img *im = &g_images[g_nimages];
             mem_zero(im, sizeof(*im));
-            resolve_relative_url(g_url, src, im->src, sizeof(im->src));
             char d[8];
             im->attr_w = node_attr_str(nd, "width", d, sizeof(d))
                              ? (int16_t)atoi_simple(d) : 0;
             im->attr_h = node_attr_str(nd, "height", d, sizeof(d))
                              ? (int16_t)atoi_simple(d) : 0;
-            im->state = 0;
+            if (str_ncasecmp(src, "data:", 5) == 0) {
+                /* data: URI: decode inline, nothing to fetch. The full
+                 * URI usually exceeds src[512] (the whole image is in
+                 * the attribute), so read it from the attr pool. */
+                int slen;
+                const char *sv = node_attr(nd, "src", &slen);
+                str_copy(im->src, "data:", sizeof(im->src)); /* marker;
+                                     never fetched (state never stays 0) */
+                int iw = 0, ih = 0;
+                uint32_t *pix = sv ? data_uri_decode_image(sv, slen, &iw, &ih)
+                                   : NULL;
+                if (pix && iw > 0 && ih > 0) {
+                    im->pixels = pix;
+                    im->w = (int16_t)iw;
+                    im->h = (int16_t)ih;
+                    im->state = 1;
+                } else {
+                    if (pix) free(pix);
+                    im->state = -1;
+                }
+            } else {
+                resolve_relative_url(g_url, src, im->src, sizeof(im->src));
+                im->state = 0;
+            }
             nd->img = (int16_t)g_nimages++;
         }
         break;
@@ -12499,6 +12519,31 @@ static void set_home_page(void) {
         "}).catch(function(e){L('stream error: '+e);ok=false;fin();});"
         "</script></body></html>";
 #endif
+#ifdef DATAURI_TEST
+    /* On-screen data: URI test: a base64 PNG (4 colored quadrants), a
+     * percent-encoded SVG (purple square, yellow dot), and a malformed
+     * URI that must fail cleanly (broken image, no crash). */
+    html =
+        "<html><head><title>data: URIs</title>"
+        "<style>body{background:#fff;color:#111;font-family:monospace}"
+        "img{border:1px solid #888;margin:8px}</style></head><body>"
+        "<h1 style='color:#1a73e8'>data: URI images</h1>"
+        "<p>1. base64 PNG (red/green/blue/yellow quadrants):</p>"
+        "<img src=\"data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAAAf0lEQVR4nN3QQQ3DMADF"
+        "UM8ahIAImEArnIIYiIHpvedItfoAWF//85+THdYxtnQkRmIkRmIkRmIkRmIkRmIkRmIk"
+        "RmIkRmIkRmIkRmIkRmIk5rvmuSX0G+udD0mMxEiMxEiMxEiMxEiMxEiMxEiMxEiMxEiM"
+        "xEiMxEiMTw+4uwATYwTKV/3g+wAAAABJRU5ErkJggg==\">"
+        "<p>2. percent-encoded SVG (purple square, yellow dot):</p>"
+        "<img src=\"data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org"
+        "/2000/svg%22%20width%3D%2248%22%20height%3D%2248%22%3E%3Crect%20width"
+        "%3D%2248%22%20height%3D%2248%22%20fill%3D%22%237b2ff7%22/%3E%3Ccircle"
+        "%20cx%3D%2224%22%20cy%3D%2224%22%20r%3D%2214%22%20fill%3D%22%23ffd400"
+        "%22/%3E%3C/svg%3E\">"
+        "<p>3. malformed (no comma; must show broken, not crash):</p>"
+        "<img src=\"data:image/png;base64\" width=32 height=32>"
+        "</body></html>";
+#endif
 #ifdef SW_TEST
     /* On-screen service-worker test: register a SW from the host, which on
      * install populates a cache and on fetch serves cached + synthesized
@@ -13304,6 +13349,90 @@ static uint32_t *svg_render(const uint8_t *bufu, long n, int *out_w, int *out_h)
     return canvas;
 }
 
+/* Decode raw image bytes (any raster format via libtoby, else SVG) to
+ * a fresh ARGB canvas. Shared by the network fetch path and data: URIs. */
+static uint32_t *img_decode_bytes(const uint8_t *buf, long n, int *ow, int *oh) {
+    uint32_t *pix = NULL;
+    *ow = *oh = 0;
+    toby_image_t *dec = toby_image_load(buf, (size_t)n);
+    if (dec && dec->width > 0 && dec->height > 0 &&
+        dec->width <= IMG_MAX_DIM && dec->height <= IMG_MAX_DIM) {
+        pix = dec->pixels;                  /* steal the decoded buffer */
+        *ow = dec->width;
+        *oh = dec->height;
+        dec->pixels = NULL;
+    }
+    if (dec) toby_image_free(dec);
+    if (!pix && svg_sniff(buf, n))          /* stage 12E: icons */
+        pix = svg_render(buf, n, ow, oh);
+    return pix;
+}
+
+/* ---- data: image URIs ---------------------------------------------- *
+ * "data:[<mediatype>][;base64],<payload>" decodes straight into the
+ * raster path above -- no fetch. The payload is base64 or percent-
+ * encoded text (e.g. data:image/svg+xml,%3Csvg...). */
+
+static int b64_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;                              /* ws / '=' padding / junk */
+}
+
+static long b64_decode_buf(const char *s, long n, uint8_t *out) {
+    long o = 0;
+    int acc = 0, nbits = 0;
+    for (long i = 0; i < n; i++) {
+        int v = b64_val(s[i]);
+        if (v < 0) continue;
+        acc = (acc << 6) | v;
+        nbits += 6;
+        if (nbits >= 8) { nbits -= 8; out[o++] = (uint8_t)(acc >> nbits); }
+    }
+    return o;
+}
+
+static long pct_decode_buf(const char *s, long n, uint8_t *out) {
+    long o = 0;
+    for (long i = 0; i < n; i++) {
+        if (s[i] == '%' && i + 2 < n) {
+            int h = hex_digit(s[i + 1]), l = hex_digit(s[i + 2]);
+            if (h >= 0 && l >= 0) {
+                out[o++] = (uint8_t)((h << 4) | l);
+                i += 2;
+                continue;
+            }
+        }
+        out[o++] = (uint8_t)s[i];
+    }
+    return o;
+}
+
+static uint32_t *data_uri_decode_image(const char *s, int n, int *ow, int *oh) {
+    *ow = *oh = 0;
+    if (n < 7 || str_ncasecmp(s, "data:", 5) != 0) return NULL;
+    long comma = -1;
+    for (long i = 5; i < n; i++)
+        if (s[i] == ',') { comma = i; break; }
+    if (comma < 0) return NULL;
+    int is_b64 = ci_find(s + 5, (int)(comma - 5), ";base64") >= 0;
+    const char *pl = s + comma + 1;
+    long pn = n - comma - 1;
+    if (pn <= 0) return NULL;
+    long cap = is_b64 ? (pn / 4 + 1) * 3 : pn;
+    if (cap > (long)IMG_FETCH_CAP) return NULL; /* mirror the fetch cap */
+    uint8_t *buf = (uint8_t *)malloc((size_t)cap + 1);
+    if (!buf) return NULL;
+    long bn = is_b64 ? b64_decode_buf(pl, pn, buf)
+                     : pct_decode_buf(pl, pn, buf);
+    uint32_t *pix = bn > 0 ? img_decode_bytes(buf, bn, ow, oh) : NULL;
+    free(buf);
+    return pix;
+}
+
 static uint8_t *g_img_fetch_buf = NULL;
 
 /* Stage 12D: one image transfer in flight at a time, fully async --
@@ -13355,19 +13484,8 @@ static int load_one_pending_image(void) {
         struct img *im = &g_tabs[ti].images[ii];
         if (n <= 0) { im->state = -1; return 1; }
 
-        uint32_t *pix = NULL;
         int iw = 0, ih = 0;
-        toby_image_t *dec = toby_image_load(g_img_fetch_buf, (size_t)n);
-        if (dec && dec->width > 0 && dec->height > 0 &&
-            dec->width <= IMG_MAX_DIM && dec->height <= IMG_MAX_DIM) {
-            pix = dec->pixels;              /* steal the decoded buffer */
-            iw = dec->width;
-            ih = dec->height;
-            dec->pixels = NULL;
-        }
-        if (dec) toby_image_free(dec);
-        if (!pix && svg_sniff(g_img_fetch_buf, n))   /* stage 12E: icons */
-            pix = svg_render(g_img_fetch_buf, n, &iw, &ih);
+        uint32_t *pix = img_decode_bytes(g_img_fetch_buf, n, &iw, &ih);
         if (!pix) {
             im->state = -1;
             return 1;
