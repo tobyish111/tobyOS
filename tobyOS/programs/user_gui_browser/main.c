@@ -2579,6 +2579,7 @@ static int css_parse_part(struct ccur *c, struct cpart *p,
  * center...) silently rendered INLINE -- on HN, whose whole page sits
  * inside <center>, that degraded the table grid to inline flow. */
 #define SEL_GROUP_MAX 64
+
 static void css_parse_ruleset(struct ccur *c, int origin) {
     int sel_part0[SEL_GROUP_MAX], sel_nparts[SEL_GROUP_MAX];
     uint16_t sel_spec[SEL_GROUP_MAX];
@@ -6612,6 +6613,32 @@ static void js_teardown(struct tab *t);
 /* Real sites split CSS into many small module chunks: github.com ships
  * 40 <link rel=stylesheet> on one page, so a cap of 16 silently dropped
  * more than half its styling. */
+#ifdef CSS_PERF
+static int msg_append(char *dst, int pos, int max, const char *s);
+static int msg_append_int(char *dst, int pos, int max, int v);
+static long js_now_ms(void);
+#define SHEET_T(v) long v = js_now_ms()
+static void sheet_report(long t0, long t1, long t2, long t3, long t4, long r) {
+    char m[176]; int p = 0;
+    p = msg_append(m, p, sizeof(m), "[cssperf] sheet malloc=");
+    p = msg_append_int(m, p, sizeof(m), (int)(t1 - t0));
+    p = msg_append(m, p, sizeof(m), " fetch=");
+    p = msg_append_int(m, p, sizeof(m), (int)(t2 - t1));
+    p = msg_append(m, p, sizeof(m), " parse=");
+    p = msg_append_int(m, p, sizeof(m), (int)(t3 - t2));
+    p = msg_append(m, p, sizeof(m), " free=");
+    p = msg_append_int(m, p, sizeof(m), (int)(t4 - t3));
+    p = msg_append(m, p, sizeof(m), " ms bytes=");
+    p = msg_append_int(m, p, sizeof(m), (int)r);
+    p = msg_append(m, p, sizeof(m), "\n");
+    sys_write(1, m, p);
+}
+#define SHEET_REPORT(a,b,c,e,f,g) sheet_report(a,b,c,e,f,g)
+#else
+#define SHEET_T(v)                do {} while (0)
+#define SHEET_REPORT(a,b,c,e,f,g) do {} while (0)
+#endif
+
 #define SHEET_MAX       64
 #define SHEET_FETCH_CAP (4096 * 1024)
 
@@ -6818,7 +6845,9 @@ static void collect_node_inner(int ni) {
                 char url[URL_MAX + 1];
                 resolve_relative_url(g_url, href, url, URL_MAX);
                 if (has_scheme(url)) {
+                    SHEET_T(t0);
                     char *buf = (char *)malloc(SHEET_FETCH_CAP);
+                    SHEET_T(t1);
                     if (buf) {
                         struct http_fetch req;
                         mem_zero(&req, sizeof(req));
@@ -6826,11 +6855,15 @@ static void collect_node_inner(int ni) {
                         req.buf = (unsigned long)buf;
                         req.buf_sz = SHEET_FETCH_CAP;
                         long r = sys_http_fetch(&req);
+                        SHEET_T(t2);
                         if (r > 0 && req.status > 0 && req.status < 400) {
                             E->nsheets++;
                             css_parse_sheet(buf, r, 1);
                         }
+                        SHEET_T(t3);
                         free(buf);
+                        SHEET_T(t4);
+                        SHEET_REPORT(t0, t1, t2, t3, t4, r);
                     }
                 }
             }
@@ -11269,6 +11302,7 @@ static void phase_perf(const char *name) {
     g_phase_t0 = js_now_ms();
 }
 #define PHASE_PERF(n) phase_perf(n)
+
 #else
 #define STYLE_PERF_BEGIN() ((void)0)
 #define STYLE_PERF_END()   ((void)0)
