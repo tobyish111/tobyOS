@@ -419,6 +419,31 @@ static size_t hpack_encode_req(uint8_t *buf, size_t cap,
 }
 
 /* ---- the fetch ----------------------------------------------------- */
+/* Ensure *pbody holds at least `need` bytes (never more than max_body).
+ * First growth uses the content-length hint when the server gave one, so
+ * the common case is a single exact allocation; otherwise it doubles
+ * from 16 KiB. Returns 0 on OOM (leaving the old buffer intact). */
+static int body_reserve(uint8_t **pbody, size_t *pcap, size_t need,
+                        size_t max_body, long content_len) {
+    if (need <= *pcap) return 1;
+    size_t want;
+    if (*pcap == 0 && content_len > 0 && (size_t)content_len <= max_body)
+        want = (size_t)content_len;             /* exact: one allocation */
+    else {
+        want = *pcap ? *pcap * 2 : (16u * 1024);
+        while (want < need) want *= 2;
+    }
+    if (want < need)     want = need;
+    if (want > max_body) want = max_body;
+    if (want < need) return 0;                  /* caller already capped */
+    uint8_t *nb = (uint8_t *)kmalloc(want);
+    if (!nb) return 0;
+    if (*pbody) { memcpy(nb, *pbody, *pcap); kfree(*pbody); }
+    *pbody = nb;
+    *pcap  = want;
+    return 1;
+}
+
 /* One request on connection state `h`. Never allocates or frees h --
  * the caller owns it so the connection can be parked and reused. */
 static int h2_run(struct h2 *h, struct tls_conn *tls, const struct http_url *u,
@@ -470,10 +495,13 @@ static int h2_run(struct h2 *h, struct tls_conn *tls, const struct http_url *u,
                           my_sid, hb, o) < 0) { return HTTP_ERR_RESET; }
     }
 
-    /* Response body buffer (raw / possibly compressed). */
-    uint8_t *body = (uint8_t *)kmalloc(max_body ? max_body : 1);
-    if (!body) { return HTTP_ERR_NOMEM; }
-    size_t body_len = 0;
+    /* Response body buffer (raw / possibly compressed), grown on demand.
+     * This used to kmalloc max_body (the caller's read cap: 4-8 MiB) for
+     * EVERY response, so a 6 KiB stylesheet reserved megabytes. We now
+     * size from content-length once the HEADERS land, and otherwise
+     * double from a small start, capped at max_body. */
+    uint8_t *body = NULL;
+    size_t body_cap = 0, body_len = 0;
 
     struct h2_resp r;
     memset(&r, 0, sizeof(r));
@@ -561,6 +589,9 @@ static int h2_run(struct h2 *h, struct tls_conn *tls, const struct http_url *u,
             if (sid == my_sid && dlen) {
                 size_t room = max_body - body_len;
                 size_t take = dlen < room ? dlen : room;
+                if (take && !body_reserve(&body, &body_cap, body_len + take,
+                                          max_body, r.content_len))
+                    { rc = HTTP_ERR_NOMEM; done = 1; break; }
                 if (take) { memcpy(body + body_len, dp, take); body_len += take; }
             }
             if ((fflags & H2_FLAG_END_STREAM) && sid == my_sid) done = 1;
@@ -583,6 +614,15 @@ static int h2_run(struct h2 *h, struct tls_conn *tls, const struct http_url *u,
 
     if (rc != 0 && body_len == 0) { kfree(body); return rc; }
 
+    /* A 204/304/empty 200 never hit body_reserve. The h1 path always
+     * hands back a non-NULL body, so match it rather than make every
+     * caller special-case NULL. */
+    if (!body) {
+        body = (uint8_t *)kmalloc(1);
+        if (!body) return HTTP_ERR_NOMEM;
+        body[0] = 0;
+    }
+
     /* Populate the response; decompress like the h1 path. */
     memset(out, 0, sizeof(*out));
     out->status = r.status ? r.status : 200;
@@ -591,29 +631,9 @@ static int h2_run(struct h2 *h, struct tls_conn *tls, const struct http_url *u,
     out->encoding = r.encoding;
     out->content_len = r.content_len;
 
-    if ((r.encoding == HTTP_ENC_GZIP || r.encoding == HTTP_ENC_BR) && body_len) {
-        unsigned long dlen = max_body ? max_body : 1;
-        uint8_t *d = (uint8_t *)kmalloc(dlen);
-        if (d) {
-            int ok;
-            if (r.encoding == HTTP_ENC_BR) {
-                int pr = brotli_decompress(d, &dlen, body, body_len);
-                ok = (pr == BROTLI_OK || pr == BROTLI_TRUNC);
-            } else {
-                int pr = puff_gzip(d, &dlen, body, body_len);
-                ok = (pr == PUFF_OK || pr == PUFF_TRUNC);
-            }
-            if (ok) {
-                kprintf("[h2] %s %lu -> %lu\n",
-                        r.encoding == HTTP_ENC_BR ? "unbrotli" : "gunzip",
-                        (unsigned long)body_len, dlen);
-                kfree(body); body = d; body_len = dlen;
-                out->encoding = HTTP_ENC_IDENTITY;
-            } else {
-                kfree(d);
-            }
-        }
-    }
+    /* Shared with the h1/h3 paths: sizes the inflate buffer from the
+     * compressed length rather than reserving the whole read cap. */
+    http_body_decompress(out, &body, &body_len, max_body, "h2");
 
     out->body = body;
     out->body_len = body_len;

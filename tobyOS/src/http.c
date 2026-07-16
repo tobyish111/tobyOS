@@ -1006,21 +1006,46 @@ void http_body_decompress(struct http_response *out, uint8_t **pbody,
     if (!out || !body || body_len == 0) return;
     if (out->encoding != HTTP_ENC_GZIP && out->encoding != HTTP_ENC_BR) return;
 
-    unsigned long dlen = max_out;
-    uint8_t *dbody = (uint8_t *)kmalloc(dlen > 0 ? dlen : 1);
-    if (!dbody) return;
-    int ok, trunc;
-    const char *alg;
-    if (out->encoding == HTTP_ENC_BR) {
-        int pr = brotli_decompress(dbody, &dlen, body, body_len);
-        ok = (pr == BROTLI_OK || pr == BROTLI_TRUNC);
-        trunc = (pr == BROTLI_TRUNC);
-        alg = "unbrotli";
-    } else {
-        int pr = puff_gzip(dbody, &dlen, body, body_len);
-        ok = (pr == PUFF_OK || pr == PUFF_TRUNC);
-        trunc = (pr == PUFF_TRUNC);
-        alg = "gunzip";
+    /* Guess the inflated size from the compressed size (text runs ~4-8x)
+     * instead of reserving max_out -- that meant kmalloc'ing the caller's
+     * whole 4-8 MiB read cap to inflate a 6 KiB stylesheet. If the guess
+     * is short we retry bigger; only a TRUNC at max_out is real
+     * truncation. */
+    unsigned long cap = max_out ? max_out : 1;
+    /* 16x: measured ratios are ~8x for gzip and ~12x for brotli on real
+     * pages (wikipedia css 24889->207748, github js 6512->76753), and an
+     * undersized guess costs a full re-decompress. 16x with a 64 KiB
+     * floor covered every response observed, and is still bounded by cap. */
+    unsigned long guess = (unsigned long)body_len * 16;
+    if (guess < 64u * 1024) guess = 64u * 1024;
+    if (guess > cap) guess = cap;
+
+    uint8_t *dbody = NULL;
+    unsigned long dlen = 0;
+    int ok = 0, trunc = 0;
+    const char *alg = "";
+    for (;;) {
+        dlen = guess;
+        dbody = (uint8_t *)kmalloc(guess);
+        if (!dbody) return;
+        if (out->encoding == HTTP_ENC_BR) {
+            int pr = brotli_decompress(dbody, &dlen, body, body_len);
+            ok = (pr == BROTLI_OK || pr == BROTLI_TRUNC);
+            trunc = (pr == BROTLI_TRUNC);
+            alg = "unbrotli";
+        } else {
+            int pr = puff_gzip(dbody, &dlen, body, body_len);
+            ok = (pr == PUFF_OK || pr == PUFF_TRUNC);
+            trunc = (pr == PUFF_TRUNC);
+            alg = "gunzip";
+        }
+        /* Truncated only because our guess was small: grow and redo. */
+        if (ok && trunc && guess < cap) {
+            kfree(dbody);
+            guess = (guess > cap / 4) ? cap : guess * 4;
+            continue;
+        }
+        break;
     }
     if (ok) {
         kprintf("[%s] %s %lu -> %lu%s\n", tag, alg,
