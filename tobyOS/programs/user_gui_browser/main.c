@@ -1019,7 +1019,11 @@ struct eng {
                                        the nodes' laid rects (13F) */
 };
 
-#define LINK_MAX       128
+/* Real pages blow well past 128 (wikipedia saturated the old cap dead-on
+ * "Done - 128 links"; hn fronts ~200): links past the cap were both
+ * unstyled (a:link never matched) and UNCLICKABLE. 512x256B x tabs is
+ * cheap. */
+#define LINK_MAX       512
 #define LINK_URL_MAX   256
 
 #define URL_MAX        1024
@@ -12903,9 +12907,18 @@ static void resolve_relative_url(const char *base, const char *rel, char *out, i
         for (int i = origin_end; base[i]; i++)
             if (base[i] == '/') last_slash = i;
 
+        /* Pathless base ("https://host", no slash after the origin):
+         * last_slash == origin_end == strlen(base), and the inclusive
+         * copy below used to embed base's NUL -- every relative URL
+         * resolved to the bare origin (hn's news.css fetch returned the
+         * HTML page again; logo/links broke the same way on any
+         * bare-origin navigation). Copy what exists, then guarantee the
+         * root slash. */
         int pos = 0;
-        for (int i = 0; i <= last_slash && pos < out_max - 1; i++)
+        for (int i = 0; i <= last_slash && base[i] && pos < out_max - 1; i++)
             out[pos++] = base[i];
+        if (pos > 0 && out[pos - 1] != '/' && pos < out_max - 1)
+            out[pos++] = '/';
         for (int i = 0; rel[i] && pos < out_max - 1; i++)
             out[pos++] = rel[i];
         out[pos] = 0;
