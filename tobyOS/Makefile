@@ -2889,6 +2889,16 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "(static musl, brandelf EI_OSABI=Linux) -- OPT-IN";         \
 	    EXTRA_FILES="$$EXTRA_FILES bin/curl-real";                        \
 	fi;                                                                   \
+	if [ -f programs/chromium/chrome-headless-shell-linux64/chrome-headless-shell ]; then \
+	    mkdir -p $(INITRD_STAGE)/opt; \
+	    cp -r programs/chromium/chrome-headless-shell-linux64 $(INITRD_STAGE)/opt/chrome; \
+	    if [ -d programs/chromium/sysroot ]; then \
+	        cp -r programs/chromium/sysroot $(INITRD_STAGE)/opt/chrome/sysroot; \
+	    fi; \
+	    printf '\003' | dd of=$(INITRD_STAGE)/opt/chrome/chrome-headless-shell bs=1 seek=7 count=1 conv=notrunc 2>/dev/null; \
+	    echo "[initrd] chromium: staging chrome-headless-shell +sysroot under /opt/chrome -- OPT-IN M0"; \
+	    EXTRA_FILES="$$EXTRA_FILES opt/chrome"; \
+	fi; \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \

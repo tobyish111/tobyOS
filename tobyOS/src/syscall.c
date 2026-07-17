@@ -5087,7 +5087,88 @@ static long lx_faccess(const char *upath) {
     return (vfs_stat(kpath, &vs) == VFS_OK) ? 0 : -ABI_ENOENT;
 }
 
+/* ------------------------------------------------------------------ *
+ * Linux syscall gap-list instrument (the permanent measure-first tool)
+ *
+ * Every unhandled Linux syscall self-identifies here. The Chromium
+ * bring-up (docs/chromium-bringup-*.md) drives the whole effort off
+ * this log: run a real Linux binary, grep `-a` the serial log for
+ * "[linux] UNHANDLED", and the deduped set IS the ranked gap list.
+ *
+ * lx_scname() names the common x86-64 numbers so the log reads without
+ * a syscall table to hand; unknown numbers just print numerically.
+ *
+ * The default case dedups on the number (a 512-entry seen[] bitmap +
+ * hit counter) so a program that spins on an unimplemented syscall
+ * (Chromium loops on epoll/futex variants) prints ONE detailed line,
+ * not a flood down the slow serial line -- while still counting hits
+ * and re-announcing every 100000th so hot loops stay visible.
+ *
+ * -DLINUX_SYSCALL_TRACE additionally logs EVERY Linux syscall entry
+ * (number+name+args+comm) -- the "log everything" firehose for deep
+ * ABI debugging; OFF by default (kept in-tree, like -DDL_TRACE). ------ */
+static const char *lx_scname(long n) {
+    switch (n) {
+    case 0: return "read"; case 1: return "write"; case 2: return "open";
+    case 3: return "close"; case 4: return "stat"; case 5: return "fstat";
+    case 6: return "lstat"; case 7: return "poll"; case 8: return "lseek";
+    case 9: return "mmap"; case 10: return "mprotect"; case 11: return "munmap";
+    case 12: return "brk"; case 13: return "rt_sigaction"; case 14: return "rt_sigprocmask";
+    case 16: return "ioctl"; case 17: return "pread64"; case 18: return "pwrite64";
+    case 19: return "readv"; case 20: return "writev"; case 21: return "access";
+    case 22: return "pipe"; case 23: return "select"; case 24: return "sched_yield";
+    case 25: return "mremap"; case 28: return "madvise"; case 32: return "dup";
+    case 33: return "dup2"; case 34: return "pause"; case 35: return "nanosleep";
+    case 39: return "getpid"; case 40: return "sendfile"; case 41: return "socket";
+    case 42: return "connect"; case 43: return "accept"; case 44: return "sendto";
+    case 45: return "recvfrom"; case 46: return "sendmsg"; case 47: return "recvmsg";
+    case 48: return "shutdown"; case 49: return "bind"; case 50: return "listen";
+    case 51: return "getsockname"; case 52: return "getpeername"; case 54: return "setsockopt";
+    case 55: return "getsockopt"; case 56: return "clone"; case 57: return "fork";
+    case 59: return "execve"; case 60: return "exit"; case 61: return "wait4";
+    case 62: return "kill"; case 63: return "uname"; case 72: return "fcntl";
+    case 73: return "flock"; case 74: return "fsync"; case 75: return "fdatasync";
+    case 79: return "getcwd"; case 82: return "rename"; case 83: return "mkdir";
+    case 87: return "unlink"; case 89: return "readlink"; case 96: return "gettimeofday";
+    case 97: return "getrlimit"; case 98: return "getrusage"; case 99: return "sysinfo";
+    case 102: return "getuid"; case 104: return "getgid"; case 107: return "geteuid";
+    case 110: return "getppid"; case 115: return "getgroups"; case 116: return "setgroups";
+    case 131: return "sigaltstack"; case 137: return "statfs"; case 138: return "fstatfs";
+    case 157: return "prctl"; case 158: return "arch_prctl"; case 160: return "setrlimit";
+    case 186: return "gettid"; case 200: return "tkill"; case 201: return "time";
+    case 202: return "futex"; case 203: return "sched_setaffinity";
+    case 204: return "sched_getaffinity"; case 213: return "epoll_create";
+    case 217: return "getdents64"; case 218: return "set_tid_address";
+    case 221: return "fadvise64"; case 228: return "clock_gettime";
+    case 230: return "clock_nanosleep"; case 231: return "exit_group";
+    case 232: return "epoll_wait"; case 233: return "epoll_ctl"; case 234: return "tgkill";
+    case 257: return "openat"; case 258: return "mkdirat"; case 262: return "newfstatat";
+    case 263: return "unlinkat"; case 267: return "readlinkat"; case 269: return "faccessat";
+    case 270: return "pselect6"; case 271: return "ppoll"; case 273: return "set_robust_list";
+    case 280: return "utimensat"; case 281: return "epoll_pwait"; case 282: return "signalfd";
+    case 283: return "timerfd_create"; case 284: return "eventfd";
+    case 285: return "fallocate"; case 286: return "timerfd_settime";
+    case 288: return "accept4"; case 289: return "signalfd4"; case 290: return "eventfd2";
+    case 291: return "epoll_create1"; case 292: return "dup3"; case 293: return "pipe2";
+    case 294: return "inotify_init1"; case 302: return "prlimit64";
+    case 305: return "syncfs"; case 309: return "getcpu"; case 316: return "renameat2";
+    case 318: return "getrandom"; case 319: return "memfd_create"; case 321: return "bpf";
+    case 322: return "execveat"; case 324: return "membarrier"; case 325: return "mlock2";
+    case 332: return "statx"; case 334: return "rseq"; case 424: return "pidfd_send_signal";
+    case 425: return "io_uring_setup"; case 435: return "clone3";
+    case 439: return "faccessat2"; case 441: return "epoll_pwait2";
+    case 450: return "set_mempolicy_home_node"; case 451: return "cachestat";
+    default: return "?";
+    }
+}
+
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
+#ifdef LINUX_SYSCALL_TRACE
+    kprintf("[lxtrace] %s[%ld] n=%ld(%s) a=%lx,%lx,%lx,%lx,%lx\n",
+            current_proc()->name, (long)current_proc()->pid, n, lx_scname(n),
+            (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
+            (unsigned long)a4, (unsigned long)a5);
+#endif
     switch (n) {
     /* ---- exits ---- */
     case LX_exit:
@@ -5711,11 +5792,36 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_fcntl:              /* F_SETFD/CLOEXEC etc -- best-effort no-op */
         return (n == LX_fcntl) ? 0 : -ABI_ENOSYS;
 
-    default:
-        kprintf("[linux] unhandled syscall %ld (a1=0x%lx a2=0x%lx) -> -ENOSYS "
-                "(implement in linux_syscall, milestone B2)\n",
-                n, (unsigned long)a1, (unsigned long)a2);
+    default: {
+        /* First-hit-detailed, deduped gap-list logger (see lx_scname note).
+         * seen[]/hits[] index by number for n<512 (covers all real Linux
+         * x86-64 numbers); anything larger always prints. */
+        static uint8_t  g_lx_seen[512];
+        static uint32_t g_lx_hits[512];
+        if (n >= 0 && n < 512) {
+            uint32_t c = ++g_lx_hits[n];
+            if (!g_lx_seen[n]) {
+                g_lx_seen[n] = 1;
+                kprintf("[linux] UNHANDLED syscall %ld (%s) "
+                        "a=%lx,%lx,%lx,%lx,%lx comm=%s -> -ENOSYS\n",
+                        n, lx_scname(n),
+                        (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
+                        (unsigned long)a4, (unsigned long)a5,
+                        current_proc()->name);
+            } else if ((c % 100000u) == 0) {
+                kprintf("[linux] UNHANDLED syscall %ld (%s) still spinning "
+                        "(%u hits)\n", n, lx_scname(n), c);
+            }
+        } else {
+            kprintf("[linux] UNHANDLED syscall %ld (%s) "
+                    "a=%lx,%lx,%lx,%lx,%lx comm=%s -> -ENOSYS\n",
+                    n, lx_scname(n),
+                    (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
+                    (unsigned long)a4, (unsigned long)a5,
+                    current_proc()->name);
+        }
         return -ABI_ENOSYS;
+    }
     }
 }
 
