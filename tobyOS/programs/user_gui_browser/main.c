@@ -3569,6 +3569,18 @@ static void var_push(const char *name, int nlen, const char *val, int vlen) {
     }
     if (nlen < 0) nlen = 0;
     if (vlen < 0) vlen = 0;
+    /* `--x: initial` = guaranteed-invalid (css-variables-1): the
+     * property counts as NOT set, and it SHADOWS outer definitions --
+     * var(--x, fb) must take the fallback. The csstools light-dark()
+     * polyfill (mdn et al) leans on exactly this to switch themes;
+     * substituting the literal text "initial" leaked the dark branch
+     * of every token. Stored as a vlen<0 sentinel. */
+    const char *tv = val;
+    int tn = vlen;
+    while (tn > 0 && is_whitespace(tv[0])) { tv++; tn--; }
+    while (tn > 0 && is_whitespace(tv[tn - 1])) tn--;
+    int ginvalid = (tn == 7 && str_ncasecmp(tv, "initial", 7) == 0);
+    if (ginvalid) vlen = 0;
     if (g_varpool_len + nlen + vlen > VARPOOL_CAP) {
 #ifdef VAR_PROF
         g_vp_drop_pool++;
@@ -3585,7 +3597,7 @@ static void var_push(const char *name, int nlen, const char *val, int vlen) {
     e->nlen = nlen;
     for (int i = 0; i < nlen; i++) g_varpool[g_varpool_len++] = name[i];
     e->voff = g_varpool_len;
-    e->vlen = vlen;
+    e->vlen = ginvalid ? -1 : vlen;
     for (int i = 0; i < vlen; i++) g_varpool[g_varpool_len++] = val[i];
 }
 
@@ -3597,6 +3609,8 @@ static int var_lookup(const char *name, int nlen, const char **out, int *outlen)
         int k = 0;
         while (k < nlen && g_varpool[e->noff + k] == name[k]) k++;
         if (k == nlen) {
+            if (e->vlen < 0) break;    /* guaranteed-invalid: counts as
+                                          unset AND shadows outer defs */
 #ifdef VAR_PROF
             g_vp_hit++;
 #endif
@@ -3610,12 +3624,24 @@ static int var_lookup(const char *name, int nlen, const char **out, int *outlen)
     return 0;
 }
 
-static int var_subst(const char *v, int n, char *out, int cap, int depth);
+static int var_subst(const char *v, int n, char *out, int cap, int depth,
+                     int *poison);
 
 /* Expand every var(--name[, fallback]) in [v,v+n) into `out`. Returns
- * the written length. Unknown vars with no fallback expand to empty.
- * Recurses (depth-limited) so a var value may itself use var(). */
-static int var_subst(const char *v, int n, char *out, int cap, int depth) {
+ * the written length. Recurses (depth-limited) so a var value may
+ * itself use var().
+ *
+ * Invalid-at-computed-value-time (css-variables-1 §3): var() of an
+ * UNSET (or guaranteed-invalid) property with NO fallback poisons the
+ * whole containing value -- it does NOT expand to empty. A referenced
+ * property whose own value poisons counts as invalid too, so the
+ * REFERRER's fallback is taken. The csstools light-dark() polyfill is
+ * built on exactly this: `--toggle: var(--scheme-light) <darkval>`
+ * must collapse to invalid in light mode (--scheme-light: initial) so
+ * that `var(--toggle, <lightval>)` yields the light value; expanding
+ * to empty instead leaked <darkval> = mdn's black page. */
+static int var_subst(const char *v, int n, char *out, int cap, int depth,
+                     int *poison) {
     int o = 0, i = 0;
     while (i < n && o < cap - 1) {
         if (i + 4 <= n && v[i] == 'v' && v[i+1] == 'a' && v[i+2] == 'r' &&
@@ -3641,10 +3667,24 @@ static int var_subst(const char *v, int n, char *out, int cap, int depth) {
             }
             if (i < n && v[i] == ')') i++;       /* consume ')' */
             const char *rv; int rl;
+            int sub = 0;
             if (depth < 16 && var_lookup(v + ns, ne - ns, &rv, &rl)) {
-                o += var_subst(rv, rl, out + o, cap - o, depth + 1);
-            } else if (fb_s >= 0 && depth < 16) {
-                o += var_subst(v + fb_s, fb_e - fb_s, out + o, cap - o, depth + 1);
+                int wrote = var_subst(rv, rl, out + o, cap - o, depth + 1,
+                                      &sub);
+                if (!sub) {
+                    o += wrote;               /* clean expansion */
+                    continue;
+                }
+                /* referenced value invalid: fall through to fallback
+                 * (the partial bytes at out+o get overwritten) */
+            }
+            if (fb_s >= 0 && depth < 16) {
+                sub = 0;
+                o += var_subst(v + fb_s, fb_e - fb_s, out + o, cap - o,
+                               depth + 1, &sub);
+                if (sub) *poison = 1;         /* fallback itself invalid */
+            } else {
+                *poison = 1;                  /* unset + no fallback */
             }
             continue;
         }
@@ -3659,6 +3699,44 @@ static int val_has_var(const char *v, int n) {
         if (v[i] == 'v' && v[i+1] == 'a' && v[i+2] == 'r' && v[i+3] == '(')
             return 1;
     return 0;
+}
+
+/* CSS light-dark(A, B): this engine renders the light scheme only, so
+ * every occurrence collapses to A. Runs on the declaration value AFTER
+ * var() substitution (either arm usually comes from custom props).
+ * Paren-aware, so nested functions survive. */
+static int val_has_lightdark(const char *v, int n) {
+    return str_contains(v, n, "light-dark(", 11) >= 0;
+}
+
+static int lightdark_subst(const char *v, int n, char *out, int cap) {
+    int o = 0, i = 0;
+    while (i < n && o < cap - 1) {
+        if (n - i >= 11 && str_ncasecmp(v + i, "light-dark(", 11) == 0) {
+            i += 11;
+            int par = 0;
+            while (i < n && !(par == 0 && (v[i] == ',' || v[i] == ')'))) {
+                if (v[i] == '(') par++;
+                else if (v[i] == ')') par--;
+                if (o < cap - 1) out[o++] = v[i];
+                i++;
+            }
+            if (i < n && v[i] == ',') {          /* skip the dark arm */
+                i++;
+                par = 0;
+                while (i < n && !(par == 0 && v[i] == ')')) {
+                    if (v[i] == '(') par++;
+                    else if (v[i] == ')') par--;
+                    i++;
+                }
+            }
+            if (i < n && v[i] == ')') i++;
+            continue;
+        }
+        out[o++] = v[i++];
+    }
+    out[o] = 0;
+    return o;
 }
 
 /* Apply one declaration to a computed style. Pass 0 applies only
@@ -3808,8 +3886,16 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
     int n = d->vlen;
     char vbuf[1024];
     if (val_has_var(v, n)) {              /* resolve var() before parsing */
-        n = var_subst(v, n, vbuf, sizeof(vbuf), 0);
+        int poison = 0;
+        n = var_subst(v, n, vbuf, sizeof(vbuf), 0, &poison);
+        if (poison) return;   /* invalid at computed-value time: the
+                                 declaration does not apply at all */
         v = vbuf;
+    }
+    char ldbuf[1024];
+    if (val_has_lightdark(v, n)) {        /* light-dark(A,B) -> A */
+        n = lightdark_subst(v, n, ldbuf, sizeof(ldbuf));
+        v = ldbuf;
     }
     struct vtok t;
     int pos = 0;
