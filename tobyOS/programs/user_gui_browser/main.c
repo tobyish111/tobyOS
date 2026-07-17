@@ -5850,7 +5850,13 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
         fy = ny;
     }
     float_bounds(fy, bbh > 0 ? bbh : 1, cx, cw, &lx0, &lx1);
-    int dx = (st->flt == 1) ? lx0 : lx1 - mbw;
+    /* Measure passes place right floats at the LEFT: intrinsic width is
+     * direction-agnostic (a float contributes its width, not its
+     * position), and lx1-mbw against the provisional 100000px width put
+     * items at x~100000 -> items_extent exploded -> any container with
+     * a float:right child measured "infinitely" wide and wrapped its
+     * whole flex line (wikipedia's header stacked on .search-toggle). */
+    int dx = (st->flt == 1 || g_flt_freeze) ? lx0 : lx1 - mbw;
     if (dx < cx) dx = cx;
     int dy = fy - laytop;
     for (int i = i0; i < E->nitems; i++) {
@@ -6319,6 +6325,11 @@ static int lay_table_grid(int ti, int cx, int avail_w, int y, int link,
 
 #define FLEX_MAX 48
 
+#ifdef FLEXDBG
+static int msg_append(char *dst, int pos, int max, const char *s);
+static int msg_append_int(char *dst, int pos, int max, int v);
+#endif
+
 static int lay_flex(int ni, int cx, int content_w, int y, int link,
                     uint32_t inbg) {
     struct dnode *nd = &E->nodes[ni];
@@ -6385,6 +6396,38 @@ static int lay_flex(int ni, int cx, int content_w, int y, int link,
         mnw[k] = cmin + ml + mr;
         if (hyp[k] < 8) hyp[k] = 8;
     }
+
+#ifdef FLEXDBG
+    if (!g_flt_freeze) {
+        char m[400]; int p = 0;
+        p = msg_append(m, p, sizeof(m), "[flex] node=");
+        p = msg_append_int(m, p, sizeof(m), ni);
+        p = msg_append(m, p, sizeof(m), " cw=");
+        p = msg_append_int(m, p, sizeof(m), content_w);
+        p = msg_append(m, p, sizeof(m), " wrap=");
+        p = msg_append_int(m, p, sizeof(m), st->fwrap);
+        {
+            int cl; const char *cv = node_attr(nd, "class", &cl);
+            if (cv) {
+                p = msg_append(m, p, sizeof(m), " class=\"");
+                for (int q = 0; q < cl && q < 40 && p < (int)sizeof(m) - 2; q++)
+                    m[p++] = cv[q];
+                p = msg_append(m, p, sizeof(m), "\"");
+            }
+        }
+        p = msg_append(m, p, sizeof(m), " items:");
+        for (int k = 0; k < n && p < (int)sizeof(m) - 24; k++) {
+            p = msg_append(m, p, sizeof(m), " ");
+            p = msg_append_int(m, p, sizeof(m), items[k]);
+            p = msg_append(m, p, sizeof(m), "=h");
+            p = msg_append_int(m, p, sizeof(m), hyp[k]);
+            p = msg_append(m, p, sizeof(m), "/m");
+            p = msg_append_int(m, p, sizeof(m), mnw[k]);
+        }
+        p = msg_append(m, p, sizeof(m), "\n");
+        sys_write(1, m, p);
+    }
+#endif
 
     int cy = y;
     int k0 = 0;
