@@ -717,6 +717,7 @@ struct cstyle {
     uint32_t border_col;
     int32_t  width, height;      /* px (-1 auto; width may be % per SF_WPCT) */
     int32_t  max_w;              /* px, -1 none */
+    int32_t  min_w, min_h;       /* px, -1 none (min-width/min-height) */
     int16_t  m[4], p[4];         /* margin/padding: T R B L */
     uint8_t  bw[4];              /* border widths:  T R B L */
     uint8_t  disp;               /* D_* */
@@ -883,7 +884,7 @@ enum {
     CP_PADDING, CP_PT, CP_PR, CP_PB, CP_PL,
     CP_BORDER, CP_BTOP, CP_BRIGHT, CP_BBOTTOM, CP_BLEFT,
     CP_BWIDTH, CP_BCOLOR,
-    CP_WIDTH, CP_HEIGHT, CP_MAXW, CP_VISIBILITY,
+    CP_WIDTH, CP_HEIGHT, CP_MAXW, CP_MINW, CP_MINH, CP_VISIBILITY,
     CP_FLOAT, CP_CLEAR,
     CP_VALIGN, CP_BCOLLAPSE,
     CP_FLEXDIR, CP_FLEXWRAP, CP_FLEXFLOW, CP_JUSTC, CP_ALITEMS,
@@ -2378,6 +2379,7 @@ static int prop_lookup(const char *s, int len) {
         {"border-left",CP_BLEFT},{"border-width",CP_BWIDTH},
         {"border-color",CP_BCOLOR},
         {"width",CP_WIDTH},{"height",CP_HEIGHT},{"max-width",CP_MAXW},
+        {"min-width",CP_MINW},{"min-height",CP_MINH},
         {"visibility",CP_VISIBILITY},
         {"float",CP_FLOAT},{"clear",CP_CLEAR},
         {"vertical-align",CP_VALIGN},{"border-collapse",CP_BCOLLAPSE},
@@ -3402,6 +3404,8 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->width = -1;
     st->height = -1;
     st->max_w = -1;
+    st->min_w = -1;
+    st->min_h = -1;
     for (int i = 0; i < 4; i++) { st->m[i] = 0; st->p[i] = 0; st->bw[i] = 0; }
     st->disp = D_INLINE;
     st->flt = 0;
@@ -4169,6 +4173,22 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
             int k = css_len_tok(t.s, t.len, st->px, &px);
             if (k == LK_PX && px > 0) st->max_w = px;
             else if (tok_is(&t, "none")) st->max_w = -1;
+        }
+        break;
+    case CP_MINW:
+        if (vtok_next(v, n, &pos, &t)) {
+            int px;
+            int k = css_len_tok(t.s, t.len, st->px, &px);
+            if (k == LK_PX && px >= 0) st->min_w = px;
+            else if (tok_is(&t, "auto") || tok_is(&t, "none")) st->min_w = -1;
+        }
+        break;
+    case CP_MINH:
+        if (vtok_next(v, n, &pos, &t)) {
+            int px;
+            int k = css_len_tok(t.s, t.len, st->px, &px);
+            if (k == LK_PX && px >= 0) st->min_h = px;
+            else if (tok_is(&t, "auto") || tok_is(&t, "none")) st->min_h = -1;
         }
         break;
     case CP_DISPLAY:
@@ -5011,6 +5031,7 @@ static int emit_rect(int x, int y, int w, int h, uint32_t col) {
     return (int)(it - E->items);
 }
 
+
 /* ---- Floats --------------------------------------------------------- *
  * Out-of-flow boxes in doc coordinates, reset per layout() pass. Only
  * LINE boxes avoid them (block boxes extend under floats, per CSS);
@@ -5576,6 +5597,7 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
             if (cwid > avail) cwid = avail;
             if (cwid < 8) cwid = 8;
             if (st->max_w >= 0 && cwid > st->max_w) cwid = st->max_w;
+            if (st->min_w >= 0 && cwid < st->min_w) cwid = st->min_w;
             bw2 = ml + st->bw[3] + st->p[3] + cwid + st->p[1] + st->bw[1];
         } else {
             bw2 = items_extent(i0) + st->p[1] + st->bw[1];
@@ -5647,6 +5669,7 @@ static void ic_inline_block(struct ictx *ic, int ni, const struct istyle *is) {
         if (content_w > avail) content_w = avail;
         if (content_w < 8) content_w = 8;
         if (st->max_w >= 0 && content_w > st->max_w) content_w = st->max_w;
+        if (st->min_w >= 0 && content_w < st->min_w) content_w = st->min_w;
     } else {
         /* shrink-to-fit: measure the preferred (unwrapped) content width */
         int mi = E->nitems, mrr = E->render_len, mf = g_nflts;
@@ -5658,6 +5681,7 @@ static void ic_inline_block(struct ictx *ic, int ni, const struct istyle *is) {
         if (content_w > avail) content_w = avail;
         if (content_w < 8) content_w = 8;
         if (st->max_w >= 0 && content_w > st->max_w) content_w = st->max_w;
+        if (st->min_w >= 0 && content_w < st->min_w) content_w = st->min_w;
     }
 
     /* Lay the real box: pass a container width that reproduces content_w. */
@@ -6486,6 +6510,7 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
         if (content_w < 8) content_w = 8;
     }
     if (st->max_w >= 0 && content_w > st->max_w) content_w = st->max_w;
+    if (st->min_w >= 0 && content_w < st->min_w) content_w = st->min_w;
     if (g_flt_freeze) {
         /* measure pass: auto-margin centering against the provisional
          * width would inflate the measured extents */
@@ -6594,6 +6619,7 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     int content_h = cy - (by + bwt + pt);
     if (content_h < 0) content_h = 0;
     if (st->height >= 0 && st->height > content_h) content_h = st->height;
+    if (st->min_h >= 0 && content_h < st->min_h) content_h = st->min_h;
     /* overflow-clip with an explicit height: the box is EXACTLY that
      * height (content past it is clipped), not grown to fit. */
     if (st->ovf && st->height >= 0) content_h = st->height;
@@ -12618,9 +12644,17 @@ static void set_home_page(void) {
         "%3Csvg%20viewBox='0%200%2024%2024'%3E"
         "%3Crect%20x='3'%20y='3'%20width='18'%20height='18'%20fill='%23000'/%3E%3C/svg%3E)}"
         ".r{background:#cc0000}.b{background:#1a73e8}"
+        ".cir{display:inline-block;width:48px;height:48px;background:#0a0;"
+        "-webkit-mask-image:url(data:image/svg+xml,"
+        "%3Csvg%20viewBox='0%200%2024%2024'%3E"
+        "%3Ccircle%20cx='12'%20cy='12'%20r='10'%20fill='%23000'/%3E%3C/svg%3E);"
+        "mask-image:url(data:image/svg+xml,"
+        "%3Csvg%20viewBox='0%200%2024%2024'%3E"
+        "%3Ccircle%20cx='12'%20cy='12'%20r='10'%20fill='%23000'/%3E%3C/svg%3E)}"
         "</style></head><body>"
         "<h1 style='color:#111'>mask-image test</h1>"
         "<span class='ico r'></span><span class='ico b'></span>"
+        "<span class='cir'></span>"
         "</body></html>";
 #endif
 #ifdef ESM_TEST
