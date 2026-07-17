@@ -7233,6 +7233,66 @@ void _start(void) {
     }
 #endif
 
+#ifdef CHROMIUM_BOOT
+    /* Track B M0: spawn a REAL, UNMODIFIED, off-the-shelf headless Chromium
+     * (chrome-headless-shell from Chrome-for-Testing -- the actual V8 + Blink
+     * engine, not a re-implementation; bundles SwiftShader for software GL).
+     * This is NOT a pass/fail proof: the DELIVERABLE is the gap list. Chromium
+     * is a glibc-dynamic PIE (interp /lib64/ld-linux-x86-64.so.2 -- glibc
+     * already runs, see the realtool/realtools/realbash/realpython milestones)
+     * that NEEDs ~28 shared objects and a large Linux syscall surface. We run it
+     * headless, --no-sandbox --single-process --no-zygote, and let it hit walls.
+     * Every gap self-identifies in the serial log:
+     *   - missing shared library  -> ld.so "cannot open shared object" (DSO tier)
+     *   - missing syscall          -> "[linux] UNHANDLED syscall N (name) ..."
+     * Collect with: grep -aE '\[linux\] UNHANDLED|cannot open shared|error while'
+     * See docs/chromium-bringup-m0.md and logs/chromium-m0.sh. */
+    {
+        char *argv[] = {
+            (char *)"chrome-headless-shell",
+            (char *)"--no-sandbox",
+            (char *)"--no-zygote",
+            (char *)"--single-process",
+            (char *)"--disable-gpu",
+            (char *)"--disable-dev-shm-usage",
+            (char *)"--disable-crash-reporter",
+            (char *)"--no-first-run",
+            (char *)"--enable-logging=stderr",
+            (char *)"--user-data-dir=/data/cr",
+            (char *)"--dump-dom",
+            (char *)"data:text/html,<h1>tobyOS</h1>",
+            0,
+        };
+        char *envp[] = {
+            (char *)"HOME=/data",
+            (char *)"TMPDIR=/data",
+            (char *)"PATH=/bin",
+            (char *)"LD_LIBRARY_PATH=/opt/chrome:/opt/chrome/sysroot",
+            (char *)"LANG=C",
+            0,
+        };
+        struct proc_spec spec = {
+            .path = "/opt/chrome/chrome-headless-shell",
+            .name = "chrome",
+            .argc = 12, .argv = argv, .envc = 5, .envp = envp,
+        };
+        kprintf("[boot] CHROMIUM: spawning REAL headless Chromium "
+                "(chrome-headless-shell --dump-dom); the DELIVERABLE is the "
+                "gap list -- grep '[linux] UNHANDLED' + ld.so errors\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] CHROMIUM: /opt/chrome/chrome-headless-shell not "
+                    "present -- SKIPPED (run programs/chromium/build.sh)\n");
+            kprintf("[CHROMIUM] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] CHROMIUM: chrome (pid=%d) exit=%d\n", pid, rc);
+            kprintf("[CHROMIUM] M0 gap-list run complete: chrome exit=%d -- "
+                    "the gap list is the '[linux] UNHANDLED' set above\n", rc);
+        }
+    }
+#endif
+
 #ifdef VIRGL_BOOT
     /* Track C -- VirGL 3D capability + 3D-context bring-up over virtio-gpu.
      * Build EXTRA_CFLAGS+=-DVIRGL_BOOT. The VirGL command path (CTX_CREATE/

@@ -1,0 +1,6 @@
+# Opt-in Chromium payload -- ~262 MB, fetched by build.sh, never committed.
+chrome-headless-shell-linux64/
+chrome-headless-shell-linux64.zip
+sysroot/
+*.deb
+.deb-cache/
