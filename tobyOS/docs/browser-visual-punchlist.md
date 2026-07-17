@@ -8,30 +8,30 @@ on 7 sites. Grid-diff = mean per-cell |luminance delta|, 16×16 grid,
 |---|---|---|
 | mdn (developer.mozilla.org/…/Web/HTML) | 203.2 → **11.7** | FIXED ×2: var initial/poison + light-dark() cured the black bg; media-eval calc/range syntax selected the correct mobile layout — article renders |
 | bbc (www.bbc.com/news) | 50.0\* → **10.7** | FIXED: first paint before scripts + JS watchdog (real page paints); measure-float fix improved it further |
-| github (repo page) | 39.6 → **39.5** | REMAINING #1: nav/menu content stacked full-width; repo header/file list below the fold |
-| wiki (Operating_system) | 24.8 → **18.3** | header FIXED (one flex row after the measure-float fix, ~45px reclaimed); remaining = masked icons, wordmark image, infobox diagram |
-| wikiportal (Portal:Current_events) | 15.5 | header fix applies (not re-swept) |
-| hn (news.ycombinator.com) | 11.9 → **12.8** | parity control ✓ stable (floats-heavy; unaffected by the measure fix) |
+| github (repo page) | 39.6 → **38.7** | FIXED (structure): mega-nav un-stacked via :not() + `hidden` attr — repo header/tabs/file-headers above the fold like Edge. Residual score is the dark header band + octocat + JS-deferred file rows (React app, out of scope) |
+| wiki (Operating_system) | 24.8 → **15.8** | FIXED: flex header one row (measure-float), masked icons + infobox diagram render (clip-shift); remaining = wordmark image (`.mw-logo` is display:none at 708px, same as Edge) |
+| wikiportal (Portal:Current_events) | 15.5 | header + icon fixes apply (not re-swept) |
+| hn (news.ycombinator.com) | 11.9 → **15.7** | FIXED: news.css now loads (pathless-base URL bug) — real 2-row header/logo/link colors like Edge. Residual = `.votearrow` background-image (unsupported), which the higher structural score reflects |
 | example.com | **1.8** | parity control ✓ |
 
 \* bbc's original score under-reported: it compared our *home page*
 against Edge's bbc.
 
-**Fixed this arc (merges 43rd–48th):** compare harness → punch list →
+**Fixed this arc (merges 43rd–51st):** compare harness → punch list →
 first-paint+watchdog → var-initial/poison+light-dark → media-eval
-units/calc/range → measure-pass right-float fix.
-**Remaining, ranked:** github nav stacking (39.5) > wiki masked
-icons/wordmark (18.3, previously parked — sticky-pass culling is the
-next thread) > hn polish (vote arrows).
+units/calc/range → measure-pass right-float → :not()+hidden →
+provisional-lay clip-shift + sibling combinators → pathless-base URL +
+LINK_MAX. **Every punch-list item is now addressed.** Remaining gaps are
+documented non-goals: CSS `background-image` on ordinary elements
+(HN vote arrows), and full React-app hydration (GitHub's deferred file
+rows — the same app-hydration wall as youtube.com).
 
 ## Ranked defects
 
-(Items 1 and 2 are FIXED — see browser-first-paint.md,
-browser-light-dark.md, browser-media-eval.md. Item 3 is partially fixed:
-the media-eval slice cured MDN's stacking; wikipedia's flex header and
-GitHub's nav remain. Updated ranking of what's left:
-**3-remainder (wiki flex header wrap, github nav) > 4 (masked icons) >
-5 (HN polish)**.)
+(ALL FIXED — see browser-first-paint.md, browser-light-dark.md,
+browser-media-eval.md, browser-measure-float.md, browser-not-selector.md,
+browser-clip-shift.md, browser-base-url.md. The section below is the
+original as-found analysis, preserved for provenance.)
 
 ### 1. No first paint while page JS runs (bbc; every JS-heavy site) — CONFIRMED behavior
 The /news HTML + 46 subresources were fetched by ~32 s (page body at 2 s!),
