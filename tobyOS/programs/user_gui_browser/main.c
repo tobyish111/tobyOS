@@ -11160,12 +11160,35 @@ static char *js_module_normalize(JSContext *cx, const char *base,
 static JSModuleDef *js_module_loader(JSContext *cx, const char *name,
                                      void *opaque);
 
+/* ---- JS watchdog ---------------------------------------------------- *
+ * Page scripts run synchronously on the UI thread; a heavy framework
+ * bundle (bbc's React boot grinds for minutes on the interpreter) must
+ * not hold the tab hostage. QuickJS polls the interrupt handler from
+ * the interpreter loop; past the deadline the current eval aborts with
+ * an exception and the page degrades to its server-rendered content --
+ * like browsing with JS off, not a hung "Loading...". 0 = unlimited.
+ * Entry points save/restore the deadline, so nesting is safe. */
+static long g_js_deadline;
+static int  g_js_interrupted;
+#define JS_LOAD_BUDGET_MS 20000        /* all page-load scripts, total */
+#define JS_TICK_BUDGET_MS 3000         /* one timer/job/event entry */
+
+static int js_interrupt_cb(JSRuntime *rt, void *opaque) {
+    (void)rt; (void)opaque;
+    if (g_js_deadline && js_now_ms() > g_js_deadline) {
+        g_js_interrupted = 1;
+        return 1;
+    }
+    return 0;
+}
+
 static int js_ensure(void) {
     if (cur->js_cx) return 1;
     JSRuntime *rt = JS_NewRuntime();
     if (!rt) return 0;
     JS_SetMemoryLimit(rt, 32u * 1024 * 1024);
     JS_SetMaxStackSize(rt, 192 * 1024);
+    JS_SetInterruptHandler(rt, js_interrupt_cb, NULL);
     JSContext *cx = JS_NewContext(rt);
     if (!cx) { JS_FreeRuntime(rt); return 0; }
     cur->js_rt = rt;
@@ -11381,6 +11404,9 @@ static void run_scripts(void) {
     JSContext *cx = cur->js_cx;
     JSValue modp[64];          /* module eval promises (top-level await) */
     int nmodp = 0;
+    long save_dl = g_js_deadline;
+    g_js_interrupted = 0;
+    g_js_deadline = js_now_ms() + JS_LOAD_BUDGET_MS;
 
     for (int k = 0; k < ns; k++) {
         struct dnode *nd = &E->nodes[scripts[k]];
@@ -11458,6 +11484,15 @@ static void run_scripts(void) {
         }
         JS_FreeValue(cx, modp[k]);
     }
+    if (g_js_interrupted) {
+        char m[96]; int p = 0;
+        p = msg_append(m, p, sizeof(m),
+                       "[js] page-script budget exhausted after ");
+        p = msg_append_int(m, p, sizeof(m), JS_LOAD_BUDGET_MS);
+        p = msg_append(m, p, sizeof(m), " ms; page continues without JS\n");
+        sys_write(1, m, p);
+    }
+    g_js_deadline = save_dl;
     js_dispatch_event(-1, "DOMContentLoaded");
     js_dispatch_event(-1, "load");
 }
@@ -11829,17 +11864,19 @@ static int anim_pump(void) {
 static int js_dispatch_key(int node, const char *type, const char *key) {
     if (!cur->js_cx || !cur->js_has_dispatch) return 0;
     JSContext *cx = cur->js_cx;
+    long save_dl = g_js_deadline;
+    g_js_deadline = js_now_ms() + JS_TICK_BUDGET_MS;
     JSValue args[3] = { JS_NewInt32(cx, node), JS_NewString(cx, type),
                         JS_NewString(cx, key ? key : "") };
     JSValue r = JS_Call(cx, cur->js_dispatch, JS_UNDEFINED, 3, args);
     int prevented = 0;
     if (JS_IsException(r)) js_dump_error(cx);
     else prevented = JS_ToBool(cx, r);
-    JS_FreeValue(cx, r);
     JS_FreeValue(cx, args[0]);
     JS_FreeValue(cx, args[1]);
     JS_FreeValue(cx, args[2]);
     js_drain_jobs(cur);
+    g_js_deadline = save_dl;
     if (g_js_dirty && !g_js_in_load) {
         g_js_dirty = 0;
         js_rerender();
@@ -11892,6 +11929,8 @@ static void js_do_pending_nav(void) {
  * primitives address the right engine). Returns 1 if work was done. */
 static int js_pump_all(void) {
     int work = 0;
+    long save_dl = g_js_deadline;
+    g_js_deadline = js_now_ms() + JS_TICK_BUDGET_MS;
     for (int ti = 0; ti < g_ntabs; ti++) {
         struct tab *t = &g_tabs[ti];
         if (!t->js_cx) continue;
@@ -12072,6 +12111,7 @@ static int js_pump_all(void) {
         }
         g_active = save;
     }
+    g_js_deadline = save_dl;
     return work;
 }
 
@@ -12181,6 +12221,14 @@ static void render_html(void) {
                                              scripts so synchronous
                                              getComputedStyle / rect reads
                                              see real computed values (13F) */
+
+    /* FIRST PAINT: the server-rendered page is fully styled and laid
+     * out -- show it before scripts run. A heavy framework bundle can
+     * grind for its whole watchdog budget; Edge paints server HTML
+     * immediately and so should we. Scripts that mutate the DOM set
+     * g_js_dirty -> the re-render below repaints. */
+    update_title();
+    tk_redraw(&win);
 
     /* phase 9/10: run scripts now that the DOM is styled + laid. Browsers
      * force a style/layout flush for synchronous measurement; here it is
