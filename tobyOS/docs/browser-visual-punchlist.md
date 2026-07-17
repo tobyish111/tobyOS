@@ -4,18 +4,25 @@ Produced with `tools/compare/compare.sh` (see browser-compare-harness.md)
 on 7 sites. Grid-diff = mean per-cell |luminance delta|, 16×16 grid,
 0–255; a *ranking* signal, not a correctness metric.
 
-| site | grid-diff | one-line verdict |
+| site | grid-diff (start → now) | one-line verdict |
 |---|---|---|
-| mdn (developer.mozilla.org/…/Web/HTML) | ~~203.2~~ → **11.7** | FIXED (2 slices): var initial/poison + light-dark() cured the black bg (→17.5); media-eval calc/range syntax selected the correct mobile layout — article renders (→11.7) |
-| bbc (www.bbc.com/news) | ~~50.0\*~~ → **34.0** | FIXED (first paint before scripts + JS watchdog): real page paints; remaining delta = top nav icons + hero centering |
-| github (repo page) | **39.6** | nav/menu content stacked full-width; repo header/file list pushed below the fold |
-| wiki (Operating_system) | ~~24.8~~ → **18.0** | header still burns viewport (flex header-end wraps); earlier score included Edge's fundraising banner |
-| wikiportal (Portal:Current_events) | **15.5** | same header explosion; body content itself close to Edge |
-| hn (news.ycombinator.com) | **11.9** | near-parity control ✓ (minor: vote arrows, topbar link colors) |
+| mdn (developer.mozilla.org/…/Web/HTML) | 203.2 → **11.7** | FIXED ×2: var initial/poison + light-dark() cured the black bg; media-eval calc/range syntax selected the correct mobile layout — article renders |
+| bbc (www.bbc.com/news) | 50.0\* → **10.7** | FIXED: first paint before scripts + JS watchdog (real page paints); measure-float fix improved it further |
+| github (repo page) | 39.6 → **39.5** | REMAINING #1: nav/menu content stacked full-width; repo header/file list below the fold |
+| wiki (Operating_system) | 24.8 → **18.3** | header FIXED (one flex row after the measure-float fix, ~45px reclaimed); remaining = masked icons, wordmark image, infobox diagram |
+| wikiportal (Portal:Current_events) | 15.5 | header fix applies (not re-swept) |
+| hn (news.ycombinator.com) | 11.9 → **12.8** | parity control ✓ stable (floats-heavy; unaffected by the measure fix) |
 | example.com | **1.8** | parity control ✓ |
 
 \* bbc's original score under-reported: it compared our *home page*
 against Edge's bbc.
+
+**Fixed this arc (merges 43rd–48th):** compare harness → punch list →
+first-paint+watchdog → var-initial/poison+light-dark → media-eval
+units/calc/range → measure-pass right-float fix.
+**Remaining, ranked:** github nav stacking (39.5) > wiki masked
+icons/wordmark (18.3, previously parked — sticky-pass culling is the
+next thread) > hn polish (vote arrows).
 
 ## Ranked defects
 
