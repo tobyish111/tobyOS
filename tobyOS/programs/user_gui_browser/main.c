@@ -821,6 +821,16 @@ struct dattr {                   /* name/value slices in tpool */
  * rule) -- silently keeping a prefix over-matched: every state-variant
  * rule applied to every button (wikipedia's salmon boxes). */
 #define PART_CLS_MAX 6
+/* :not(<simple>) negations per compound. Real sheets chain them
+ * (wikipedia: table:not(.infobox):not(.navbox-inner):not(.navbox));
+ * github hides its whole mobile menu behind
+ * `.header-logged-out:not(.open) .HeaderMenu`. Arguments beyond one
+ * simple selector (combinators, commas, nested :not) fail closed. */
+#define PART_NOT_MAX 4
+#define NOT_CLASS 0
+#define NOT_ID    1
+#define NOT_TAG   2
+#define NOT_ATTR  3              /* presence only: :not([attr]) */
 struct cpart {                   /* one compound selector part */
     int16_t tag;                 /* T_* or -1 = any */
     uint8_t comb;                /* combinator to the LEFT: 0 none/first,
@@ -828,10 +838,14 @@ struct cpart {                   /* one compound selector part */
     uint8_t nclass;
     uint8_t pseudo_link;         /* :link / :visited present */
     uint8_t has_attr;
+    uint8_t nnot;
+    uint8_t not_kind[PART_NOT_MAX];
     int32_t id_off;   int16_t id_len;
     int32_t cls_off[PART_CLS_MAX]; int16_t cls_len[PART_CLS_MAX];
     int32_t an_off;   int16_t an_len;    /* [name] / [name=value] */
     int32_t av_off;   int16_t av_len;    /* 0 len = presence test */
+    int32_t not_off[PART_NOT_MAX];       /* csspool text (tag: T_* id) */
+    int16_t not_len[PART_NOT_MAX];
 };
 /* Sized for real modern stylesheets: youtube.com ships a single 3.4 MiB
  * bundle with ~21k selectors / ~66k declarations / ~18.5k rule blocks.
@@ -2646,6 +2660,7 @@ static int css_parse_part(struct ccur *c, struct cpart *p,
     p->nclass = 0;
     p->pseudo_link = 0;
     p->has_attr = 0;
+    p->nnot = 0;
     p->id_len = 0;
     p->an_len = 0;
     p->av_len = 0;
@@ -2741,7 +2756,61 @@ static int css_parse_part(struct ccur *c, struct cpart *p,
                 got = 1;
                 continue;
             }
-            return 0;                     /* :hover, :not(...), etc. */
+            if (l == 3 && str_ncasecmp(pp, "not", 3) == 0 &&
+                c->i < c->n && c->s[c->i] == '(') {
+                c->i++;
+                css_ws(c);
+                if (p->nnot >= PART_NOT_MAX) return 0;   /* fail closed */
+                char ch2 = (c->i < c->n) ? c->s[c->i] : 0;
+                int koff, kl, kind;
+                if (ch2 == '.') {
+                    c->i++;
+                    if (!css_ident(c, &koff, &kl)) return 0;
+                    kind = NOT_CLASS;
+                    (*spec_cls)++;
+                } else if (ch2 == '#') {
+                    c->i++;
+                    if (!css_ident(c, &koff, &kl)) return 0;
+                    kind = NOT_ID;
+                    (*spec_id)++;
+                } else if (ch2 == '[') {
+                    c->i++;
+                    css_ws(c);
+                    if (!css_ident(c, &koff, &kl)) return 0;
+                    css_ws(c);
+                    if (c->i >= c->n || c->s[c->i] != ']') return 0;
+                    c->i++;               /* presence only; [a=v] unsupported */
+                    kind = NOT_ATTR;
+                    (*spec_cls)++;
+                } else if (is_alpha(ch2)) {
+                    long t0 = c->i;
+                    while (c->i < c->n) {
+                        char cc = c->s[c->i];
+                        if (is_alpha(cc) || (cc >= '0' && cc <= '9') ||
+                            cc == '-' || cc == '_')
+                            c->i++;
+                        else break;
+                    }
+                    int tg = tag_lookup(c->s + t0, (int)(c->i - t0));
+                    if (tg == T_UNK) return 0;   /* unknown tag: can't test */
+                    koff = tg;            /* kind TAG: off = tag id, len 0 */
+                    kl = 0;
+                    kind = NOT_TAG;
+                    (*spec_type)++;
+                } else {
+                    return 0;             /* complex :not() arg: fail closed */
+                }
+                css_ws(c);
+                if (c->i >= c->n || c->s[c->i] != ')') return 0;
+                c->i++;
+                p->not_kind[p->nnot] = (uint8_t)kind;
+                p->not_off[p->nnot] = koff;
+                p->not_len[p->nnot] = (int16_t)kl;
+                p->nnot++;
+                got = 1;
+                continue;
+            }
+            return 0;                     /* :hover, :is(...), etc. */
         }
         if (is_alpha(ch)) {
             long t0 = c->i;
@@ -3494,6 +3563,39 @@ static int part_match(const struct cpart *p, int ni) {
             for (int k = 0; k < vlen; k++)
                 if (lc(v[k]) != E->csspool[p->av_off + k]) return 0;
         }
+    }
+    for (int q = 0; q < p->nnot; q++) {    /* :not(<simple>) negations */
+        int hit = 0;
+        switch (p->not_kind[q]) {
+        case NOT_CLASS:
+            hit = class_attr_contains(nd, &E->csspool[p->not_off[q]],
+                                      p->not_len[q]);
+            break;
+        case NOT_ID: {
+            int vlen;
+            const char *v = node_attr(nd, "id", &vlen);
+            if (v && vlen == p->not_len[q]) {
+                int k = 0;
+                while (k < vlen && lc(v[k]) == E->csspool[p->not_off[q] + k])
+                    k++;
+                hit = (k == vlen);
+            }
+            break;
+        }
+        case NOT_TAG:
+            hit = (nd->tag == p->not_off[q]);
+            break;
+        case NOT_ATTR: {
+            char an[64];
+            int l = p->not_len[q] < 63 ? p->not_len[q] : 63;
+            for (int k = 0; k < l; k++) an[k] = E->csspool[p->not_off[q] + k];
+            an[l] = 0;
+            int vlen;
+            hit = node_attr(nd, an, &vlen) != NULL;
+            break;
+        }
+        }
+        if (hit) return 0;
     }
     return 1;
 }
@@ -4979,6 +5081,13 @@ static void style_node(int ni, const struct cstyle *pst) {
     }
     /* <slot> hosts projected block content; same deviation. */
     if (nd->tag == T_SLOT) st.disp = D_BLOCK;
+    /* Global `hidden` attribute = UA display:none (github alone ships
+     * 25 of them -- session flashes, template stashes). Pre-cascade, so
+     * an author display: rule still overrides, matching real UAs. */
+    {
+        int hl;
+        if (node_attr(nd, "hidden", &hl)) st.disp = D_NONE;
+    }
     /* presentational hint: legacy align= on images/tables floats them
      * (lowest priority; any CSS float overrides) */
     if (nd->tag == T_IMG || nd->tag == T_TABLE) {

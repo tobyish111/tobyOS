@@ -96,15 +96,14 @@ def boot_and_shot(iso, out_png, serial_log, wait_s, port):
             kill_qemu()
 
 
-def edge_shot(url, out_png):
+def edge_shot(url, out_png, profile_dir):
     if os.path.exists(out_png):
         os.remove(out_png)
-    # A stray headless msedge from an earlier (timed-out) run blocks new
-    # --screenshot invocations silently; sweep them first.
-    subprocess.run(["taskkill", "/IM", "msedge.exe", "/F"],
-                   capture_output=True)
-    time.sleep(1)
+    # A dedicated profile keeps headless runs from colliding with the
+    # user's real Edge session (a shared profile makes --screenshot
+    # silently no-op when any other Edge instance holds it).
     subprocess.run([EDGE, "--headless", "--disable-gpu",
+                    "--user-data-dir=" + profile_dir,
                     "--screenshot=" + out_png,
                     "--window-size=%d,%d" % (VIEW_W, VIEW_H),
                     "--hide-scrollbars", url],
@@ -178,7 +177,8 @@ def main():
         Image.open(toby_full).crop(CROP).save(toby_png)
 
     print("edge shot ...", flush=True)
-    if not edge_shot(args.url, edge_png):
+    profile_dir = os.path.join(args.out, "edge_profile")
+    if not edge_shot(args.url, edge_png, profile_dir):
         sys.exit("edge screenshot failed")
 
     toby = Image.open(toby_png).convert("RGB")
