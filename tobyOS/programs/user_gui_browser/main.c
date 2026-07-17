@@ -724,6 +724,7 @@ struct cstyle {
     uint8_t  fl;                 /* SF_* */
     uint8_t  radius;             /* border-radius px (0 = square corners) */
     int16_t  deco;               /* index into g_deco (gradient/shadow), -1 */
+    int16_t  mask;               /* index into g_masks (mask-image), -1 none */
     uint8_t  talign;             /* 0 left, 1 center, 2 right */
     int16_t  line_h;             /* >0 px; <0 scale*-100; 0 auto */
     uint8_t  flt;                /* float: 0 none, 1 left, 2 right */
@@ -896,6 +897,7 @@ enum {
     CP_TRANSITION, CP_TRANS_PROP, CP_TRANS_DUR, CP_TRANS_DELAY, CP_TRANS_TIMING,
     CP_OPACITY,
     CP_BORDER_RADIUS, CP_BOX_SHADOW,
+    CP_MASK,                     /* mask-image / -webkit-mask-image url() */
     CP__N
 };
 
@@ -928,6 +930,7 @@ struct ditem {
     uint8_t face;                /* kernel text face (web font / bold) */
     uint8_t radius;              /* rect corner radius px (decoration) */
     int16_t deco;                /* g_deco index (gradient/shadow), -1 */
+    int16_t mask;                /* g_masks index (mask-image), -1 none */
 };
 #define DI_SHADOW 6              /* box-shadow (soft rounded rect behind) */
 #define DI_EMOJI  7              /* color emoji glyph (off = codepoint) */
@@ -953,6 +956,20 @@ struct deco {
 #define DECO_MAX 512
 static struct deco g_deco[DECO_MAX];
 static int g_ndeco;
+
+/* mask-image registry (CSS masks): interned by URL and shared across
+ * every element that references the same icon, so each unique mask
+ * fetches+decodes once. The decoded alpha is the stencil; the element's
+ * own color fills it. Reset per page. */
+#define MASK_MAX 128
+struct maskimg {
+    char     url[512];
+    uint8_t *alpha;              /* w*h coverage, 0..255; NULL until loaded */
+    int16_t  w, h;
+    int8_t   state;              /* 0 pending, 1 loaded, -1 failed, 2 in flight */
+};
+static struct maskimg g_masks[MASK_MAX];
+static int g_nmasks;
 #define ITEM_MAX  49152
 
 /* ---- The per-tab engine (heap-allocated, ~8 MiB) ------------------- */
@@ -2386,6 +2403,7 @@ static int prop_lookup(const char *s, int len) {
         {"transition-timing-function",CP_TRANS_TIMING},
         {"opacity",CP_OPACITY},
         {"border-radius",CP_BORDER_RADIUS},{"box-shadow",CP_BOX_SHADOW},
+        {"mask-image",CP_MASK},{"-webkit-mask-image",CP_MASK},
     };
     for (unsigned k = 0; k < sizeof(P) / sizeof(P[0]); k++) {
         const char *n = P[k].n;
@@ -3408,6 +3426,7 @@ static void st_init(struct cstyle *st, const struct cstyle *pst) {
     st->ovf = 0;
     st->radius = 0;                          /* decoration does not inherit */
     st->deco = -1;
+    st->mask = -1;               /* mask-image is not inherited */
     st->has_tf = 0;
     st->txpx = st->typx = 0;
     st->txpct = st->typct = 0;
@@ -3653,6 +3672,24 @@ static struct deco *deco_of(struct cstyle *st) {
     return d;
 }
 
+/* Intern a mask-image URL (raw CSS value; resolved at fetch time).
+ * Returns its g_masks index, deduped by exact URL so shared icons load
+ * once. -1 if unstorable/full. */
+static int mask_intern(const char *url, int len) {
+    if (len <= 0 || len >= (int)sizeof(g_masks[0].url)) return -1;
+    for (int i = 0; i < g_nmasks; i++) {
+        if ((int)str_len(g_masks[i].url) != len) continue;
+        int k = 0; while (k < len && g_masks[i].url[k] == url[k]) k++;
+        if (k == len) return i;
+    }
+    if (g_nmasks >= MASK_MAX) return -1;
+    struct maskimg *m = &g_masks[g_nmasks];
+    for (int k = 0; k < len; k++) m->url[k] = url[k];
+    m->url[len] = 0;
+    m->alpha = NULL; m->w = m->h = 0; m->state = 0;
+    return g_nmasks++;
+}
+
 /* Parse "linear-gradient([to <dir> | <deg>,] c0 [p0], c1 [p1], ...)"
  * into `d`. Returns 1 on success. Angles snap to the nearest axis
  * (v1: axis-aligned gradients). */
@@ -3837,6 +3874,15 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
         uint32_t c;
         while (vtok_next(v, n, &pos, &t)) {
             if (tok_is(&t, "none")) { st->bg = 0; break; }
+            /* currentColor: the element's own text color (Codex icons do
+             * `background-color: currentColor` so the icon takes the text
+             * color). Resolve against st->color, already applied for this
+             * node in the first cascade pass. */
+            if (tok_is(&t, "currentcolor")) {
+                st->bg = st->color | 0xFF000000u;
+                if (st->deco >= 0) g_deco[st->deco].has_grad = 0;
+                break;
+            }
             if (css_color_tok(t.s, t.len, &c)) {
                 st->bg = ((c >> 24) >= 128) ? (c | 0xFF000000u) : 0;
                 /* a solid color clears any prior gradient on this node */
@@ -3905,6 +3951,35 @@ static void st_apply(struct cstyle *st, const struct cstyle *pst,
             /* ensure a visible alpha even if the color was opaque-looking */
             if ((col >> 24) == 0) col |= 0x40000000u;
             dc->sh_col = col;
+        }
+        break;
+    }
+    case CP_MASK: {
+        /* mask-image / -webkit-mask-image: url(<icon.svg>) | none.
+         * Codex/Primer render UI icons as an SVG mask over a colored box;
+         * we intern the URL and stencil-fill at paint time. Only url() is
+         * handled (gradient masks / mask-mode:luminance are out of
+         * scope). "none" clears any inherited mask. */
+        if (str_contains(v, n, "none", 4) >= 0 && n <= 6) { st->mask = -1; break; }
+        int u = str_contains(v, n, "url(", 4);
+        if (u < 0) break;
+        int a = u + 4;
+        while (a < n && v[a] == ' ') a++;
+        /* If the url() content is quoted, read to the MATCHING quote --
+         * a data: URI legitimately contains internal quotes (SVG attrs),
+         * so we must not stop at those. Unquoted: read to ')'. */
+        int b;
+        if (a < n && (v[a] == '"' || v[a] == '\'')) {
+            char q = v[a++];
+            b = a;
+            while (b < n && v[b] != q) b++;
+        } else {
+            b = a;
+            while (b < n && v[b] != ')' && v[b] != ' ') b++;
+        }
+        if (b > a) {
+            int mi = mask_intern(v + a, b - a);
+            if (mi >= 0) st->mask = (int16_t)mi;
         }
         break;
     }
@@ -4923,6 +4998,7 @@ static struct ditem *item_new(int kind) {
     it->link = it->field = it->img = -1;
     it->node = -1;
     it->deco = -1;                         /* no gradient/shadow by default */
+    it->mask = -1;
     it->clip = (uint8_t)g_cur_clip;        /* overflow clip in force */
     return it;
 }
@@ -6447,12 +6523,13 @@ static int lay_block(int ni, int x, int cw, int y, int link, uint32_t inbg) {
     int bg_i = -1;
     int has_deco_paint = (st->deco >= 0 &&
                           (g_deco[st->deco].has_grad || g_deco[st->deco].has_r4));
-    if ((st->bg >> 24) || st->radius || has_deco_paint) {
+    if ((st->bg >> 24) || st->radius || has_deco_paint || st->mask >= 0) {
         bg_i = emit_rect(bx, by, bbw, 0, st->bg);   /* height patched below */
         if (bg_i >= 0) {
             E->items[bg_i].node = ni;               /* clicks on the box */
             E->items[bg_i].radius = st->radius;
             E->items[bg_i].deco = has_deco_paint ? st->deco : -1;
+            E->items[bg_i].mask = st->mask;         /* mask-image stencil */
         }
     }
 
@@ -6807,6 +6884,7 @@ static void page_reset(void) {
 static void resolve_relative_url(const char *base, const char *rel, char *out, int out_max);
 static void images_free(void);
 static void tab_images_free(struct tab *t);
+static void masks_free(void);
 static void media_free(void);
 static uint32_t *data_uri_decode_image(const char *s, int n, int *ow, int *oh);
 static void tab_media_free(struct tab *t);
@@ -12007,6 +12085,7 @@ static void render_html(void) {
     cur->doc_gen++;                       /* new document (popstate gen) */
     js_teardown(cur);                     /* the old page's JS world dies */
     images_free();
+    masks_free();
     media_free();
     page_reset();
 
@@ -12095,6 +12174,7 @@ static void render_mono_doc(void) {
     cur->doc_gen++;                       /* new document (popstate gen) */
     js_teardown(cur);
     images_free();
+    masks_free();
     media_free();
     page_reset();
 
@@ -12522,6 +12602,27 @@ static void set_home_page(void) {
         "width='160' height='120'></video>"
         "</body></html>";
 #endif
+#ifdef MASKTEST
+    /* Controlled mask-image test: a data: SVG circle used as a mask over
+     * solid-color boxes -- validates the mask pipeline (intern/decode/
+     * currentColor/stencil-fill) without any site's layout quirks. Two
+     * boxes should show a red circle and a blue circle. */
+    html =
+        "<html><head><title>mask-image</title>"
+        "<style>body{background:#fff}"
+        ".ico{display:inline-block;width:48px;height:48px;"
+        "-webkit-mask-image:url(data:image/svg+xml,"
+        "%3Csvg%20viewBox='0%200%2024%2024'%3E"
+        "%3Crect%20x='3'%20y='3'%20width='18'%20height='18'%20fill='%23000'/%3E%3C/svg%3E);"
+        "mask-image:url(data:image/svg+xml,"
+        "%3Csvg%20viewBox='0%200%2024%2024'%3E"
+        "%3Crect%20x='3'%20y='3'%20width='18'%20height='18'%20fill='%23000'/%3E%3C/svg%3E)}"
+        ".r{background:#cc0000}.b{background:#1a73e8}"
+        "</style></head><body>"
+        "<h1 style='color:#111'>mask-image test</h1>"
+        "<span class='ico r'></span><span class='ico b'></span>"
+        "</body></html>";
+#endif
 #ifdef ESM_TEST
     /* On-screen ES-module test: an inline <script type="module"> imports
      * a module over HTTP which itself uses './' and '../' specifiers,
@@ -12937,6 +13038,15 @@ static void tab_images_free(struct tab *t) {
 }
 
 static void images_free(void) { tab_images_free(cur); }
+
+/* Free the (page-global) mask registry: called on each page load. Masks
+ * survive across style passes (async-fetched, referenced by re-renders),
+ * so they reset per document, not per style pass. */
+static void masks_free(void) {
+    for (int i = 0; i < g_nmasks; i++)
+        if (g_masks[i].alpha) { free(g_masks[i].alpha); g_masks[i].alpha = NULL; }
+    g_nmasks = 0;
+}
 
 /* Free a tab's media elements: file data, MP3 decoder, audio stream.
  * (The video backing store is an img record -- tab_images_free owns
@@ -13725,6 +13835,9 @@ static uint8_t *g_img_fetch_buf = NULL;
  * DONE. Nothing blocks; image state 2 = "in flight". */
 static int g_imgf_handle = -1;
 static int g_imgf_ti = -1, g_imgf_ii = -1;
+/* mask-image fetch: one in flight at a time, indexed into g_masks. */
+static int g_maskf_handle = -1;
+static int g_maskf_idx = -1;
 
 /* Cancel the in-flight image fetch and clear every in-flight marker
  * (called before tab indices shift, and when a tab's images go away). */
@@ -13732,6 +13845,10 @@ static void img_fetch_cancel(void) {
     if (g_imgf_handle >= 0) {
         sys_http_finish(g_imgf_handle);
         g_imgf_handle = -1;
+    }
+    if (g_maskf_handle >= 0) {
+        sys_http_finish(g_maskf_handle);
+        g_maskf_handle = -1; g_maskf_idx = -1;
     }
     for (int ti = 0; ti < g_ntabs; ti++)
         for (int ii = 0; ii < g_tabs[ti].nimages; ii++)
@@ -13854,6 +13971,78 @@ static int load_one_pending_image(void) {
     g_imgf_handle = (int)h;
     g_imgf_ti = ti_sel;
     g_imgf_ii = ii_sel;
+    return 0;
+}
+
+/* Turn a decoded ARGB image into a mask's alpha stencil. For the solid
+ * icon SVGs used by design systems the shape is opaque and the ground
+ * transparent, so the alpha channel is exactly the coverage we want. */
+static void mask_store_alpha(int idx, uint32_t *pix, int w, int h) {
+    if (!pix || w <= 0 || h <= 0 || w > IMG_MAX_DIM || h > IMG_MAX_DIM) {
+        g_masks[idx].state = -1; return;
+    }
+    uint8_t *a = (uint8_t *)malloc((long)w * h);
+    if (!a) { g_masks[idx].state = -1; return; }
+    for (long i = 0; i < (long)w * h; i++) a[i] = (uint8_t)(pix[i] >> 24);
+    g_masks[idx].alpha = a;
+    g_masks[idx].w = (int16_t)w;
+    g_masks[idx].h = (int16_t)h;
+    g_masks[idx].state = 1;
+}
+
+/* Fetch+decode one pending mask-image, async, mirroring the image
+ * loader. Masks are page-global (shared by URL), so no per-tab index.
+ * A finished mask only repaints -- it never changes layout (the icon box
+ * has its CSS size regardless), so no re-layout is needed. */
+static int load_one_pending_mask(void) {
+    if (g_maskf_handle >= 0) {
+        struct http_poll pi;
+        long pr = sys_http_poll(g_maskf_handle, &pi);
+        if (pr == 0 && (pi.state == HTTPA_QUEUED || pi.state == HTTPA_RUNNING))
+            return 0;
+        int idx = g_maskf_idx;
+        long n = -1;
+        if (pr == 0 && pi.state == HTTPA_DONE) {
+            if (!g_img_fetch_buf)
+                g_img_fetch_buf = (uint8_t *)malloc(IMG_FETCH_CAP);
+            if (g_img_fetch_buf && pi.body_len > 0)
+                n = sys_http_read(g_maskf_handle, g_img_fetch_buf, 0, IMG_FETCH_CAP);
+        }
+        sys_http_finish(g_maskf_handle);
+        g_maskf_handle = -1; g_maskf_idx = -1;
+        if (idx < 0 || idx >= g_nmasks || g_masks[idx].state != 2)
+            return 1;                         /* navigated away meanwhile */
+        if (n <= 0) { g_masks[idx].state = -1; return 1; }
+        int w = 0, ht = 0;
+        uint32_t *pix = img_decode_bytes(g_img_fetch_buf, n, &w, &ht);
+        mask_store_alpha(idx, pix, w, ht);
+        if (pix) free(pix);
+        tk_redraw(&win);
+        return 1;
+    }
+
+    for (int i = 0; i < g_nmasks; i++) {
+        if (g_masks[i].state != 0 || !g_masks[i].url[0]) continue;
+        /* data: mask -> decode inline, nothing to fetch. */
+        if (str_ncasecmp(g_masks[i].url, "data:", 5) == 0) {
+            int w = 0, ht = 0;
+            uint32_t *pix = data_uri_decode_image(g_masks[i].url,
+                                (int)str_len(g_masks[i].url), &w, &ht);
+            mask_store_alpha(i, pix, w, ht);
+            if (pix) free(pix);
+            tk_redraw(&win);
+            return 1;
+        }
+        char url[URL_MAX + 1];
+        resolve_relative_url(g_url, g_masks[i].url, url, URL_MAX);
+        if (!has_scheme(url)) { g_masks[i].state = -1; continue; }
+        long h2 = sys_http_start(url, IMG_FETCH_CAP);
+        if (h2 < 0) return 0;                 /* slot table busy: retry */
+        g_masks[i].state = 2;
+        g_maskf_handle = (int)h2;
+        g_maskf_idx = i;
+        return 0;
+    }
     return 0;
 }
 
@@ -15637,6 +15826,51 @@ static void paint_content_item(int ri, int sksh, int vtop, int vbot,
         return;
     }
     if (r->kind == DI_RECT) {
+        /* mask-image: fill the box with its color (r->fg) shaped by the
+         * mask's alpha (mask-size: contain, centered). Pending/failed
+         * masks paint NOTHING -- a bare colored square would look worse
+         * than a momentarily-absent icon. */
+        if (r->mask >= 0) {
+            struct maskimg *mk = (r->mask < g_nmasks) ? &g_masks[r->mask] : NULL;
+            if (mk && mk->state == 1 && mk->alpha) {
+                int rw = r->w, rh = r->h, mw = mk->w, mh = mk->h;
+                if (rw > 0 && rh > 0 && mw > 0 && mh > 0) {
+                    int sw, sh;
+                    if ((long)mw * rh <= (long)mh * rw) {
+                        sh = rh; sw = (int)((long)mw * rh / mh);
+                    } else { sw = rw; sh = (int)((long)mh * rw / mw); }
+                    if (sw < 1) sw = 1;
+                    if (sh < 1) sh = 1;
+                    int ox = r->x + (rw - sw) / 2, oy = sy + (rh - sh) / 2;
+                    uint32_t fg = r->fg;
+                    int fa = (fg >> 24) ? (int)(fg >> 24) : 255;
+                    uint32_t rgb = fg & 0xFFFFFFu;
+                    for (int dy = 0; dy < sh; dy++) {
+                        int py = oy + dy;
+                        if (py < cyy0 || py >= cyy1) continue;
+                        int my = (int)((long)dy * mh / sh);
+                        if (my >= mh) my = mh - 1;
+                        const uint8_t *mrow = mk->alpha + (long)my * mw;
+                        int x0 = ox, x1 = ox + sw;
+                        if (x0 < cx0) x0 = cx0;
+                        if (x1 > cx1) x1 = cx1;
+                        if (x1 > x0 + IMG_ROW_MAX) x1 = x0 + IMG_ROW_MAX;
+                        int cnt = x1 - x0;
+                        if (cnt <= 0) continue;
+                        for (int k = 0; k < cnt; k++) {
+                            int dx = x0 + k - ox;
+                            int mx = (int)((long)dx * mw / sw);
+                            if (mx < 0) mx = 0;
+                            if (mx >= mw) mx = mw - 1;
+                            uint32_t a = (uint32_t)(fa * mrow[mx]) / 255u;
+                            g_img_row[k] = (a << 24) | rgb;
+                        }
+                        tk_draw_blit_blend(&win, x0, py, cnt, 1, g_img_row, cnt);
+                    }
+                }
+            }
+            return;
+        }
         if (r->radius > 0 || r->deco >= 0) {
             paint_deco_rect(r->x, sy, r->w, r->h, r->radius, r->deco,
                             r->fg, cx0, cx1, cyy0, cyy1);
@@ -16476,6 +16710,7 @@ int main(int argc, char **argv) {
         if (tk_pump(&win)) break;          /* events + repaint; 1 = quit */
         int work = nav_pump();             /* async page loads (12D) */
         work |= load_one_pending_image();
+        work |= load_one_pending_mask();   /* CSS mask-image icons */
         work |= load_one_pending_media();  /* <video>/<audio> files */
         work |= media_pump();              /* frame + PCM advance */
         work |= js_pump_all();             /* timers + jobs + fetches */
