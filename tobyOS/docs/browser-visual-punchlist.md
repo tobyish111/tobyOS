@@ -6,17 +6,25 @@ on 7 sites. Grid-diff = mean per-cell |luminance delta|, 16×16 grid,
 
 | site | grid-diff | one-line verdict |
 |---|---|---|
-| mdn (developer.mozilla.org/…/Web/HTML) | **203.2** | dark/black page bg (Edge: white); article content missing, only sidebar links |
-| bbc (www.bbc.com/news) | **50.0**\* | page fetched at 2 s but **never painted** — home page still shown at 70 s, "Loading…", CPU busy, memory draining |
+| mdn (developer.mozilla.org/…/Web/HTML) | ~~203.2~~ → **11.7** | FIXED (2 slices): var initial/poison + light-dark() cured the black bg (→17.5); media-eval calc/range syntax selected the correct mobile layout — article renders (→11.7) |
+| bbc (www.bbc.com/news) | ~~50.0\*~~ → **34.0** | FIXED (first paint before scripts + JS watchdog): real page paints; remaining delta = top nav icons + hero centering |
 | github (repo page) | **39.6** | nav/menu content stacked full-width; repo header/file list pushed below the fold |
-| wiki (Operating_system) | **24.8** | header burns ~50% of the viewport (whitespace + empty icon boxes) before the H1 |
+| wiki (Operating_system) | ~~24.8~~ → **18.0** | header still burns viewport (flex header-end wraps); earlier score included Edge's fundraising banner |
 | wikiportal (Portal:Current_events) | **15.5** | same header explosion; body content itself close to Edge |
 | hn (news.ycombinator.com) | **11.9** | near-parity control ✓ (minor: vote arrows, topbar link colors) |
 | example.com | **1.8** | parity control ✓ |
 
-\* bbc's score under-reports: it compares our *home page* against Edge's bbc.
+\* bbc's original score under-reported: it compared our *home page*
+against Edge's bbc.
 
 ## Ranked defects
+
+(Items 1 and 2 are FIXED — see browser-first-paint.md,
+browser-light-dark.md, browser-media-eval.md. Item 3 is partially fixed:
+the media-eval slice cured MDN's stacking; wikipedia's flex header and
+GitHub's nav remain. Updated ranking of what's left:
+**3-remainder (wiki flex header wrap, github nav) > 4 (masked icons) >
+5 (HN polish)**.)
 
 ### 1. No first paint while page JS runs (bbc; every JS-heavy site) — CONFIRMED behavior
 The /news HTML + 46 subresources were fetched by ~32 s (page body at 2 s!),

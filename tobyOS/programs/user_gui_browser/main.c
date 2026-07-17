@@ -1976,6 +1976,175 @@ static void css_skip_block_or_semi(struct ccur *c) {
     }
 }
 
+/* ---- Media query evaluation ----------------------------------------- *
+ * Real mobile-first sheets gate their layouts on forms the old integer
+ * parser could not read -- em/rem lengths, calc() arithmetic (wikipedia:
+ * max-width:calc(640px - 1px)), and level-4 range syntax (mdn:
+ * (width < calc(1rem*2 + 15rem + 2rem + 31rem))). Failing those queries
+ * silently selected the WRONG layout (mdn rendered its desktop grid at
+ * a 719px viewport and stacked it). Unknown features still fail. */
+
+/* calc()-capable length -> px (float). expr := term {(+|-) term};
+ * term := factor {(*|/) factor}; factor := number[unit] | (expr).
+ * Returns 0 on parse failure (*ok cleared). */
+static float med_expr(const char *s, int n, int *pos, int *ok);
+
+static float med_factor(const char *s, int n, int *pos, int *ok) {
+    int i = *pos;
+    while (i < n && is_whitespace(s[i])) i++;
+    if (i < n && s[i] == '(') {
+        i++;
+        float v = med_expr(s, n, &i, ok);
+        while (i < n && is_whitespace(s[i])) i++;
+        if (i < n && s[i] == ')') i++;
+        else *ok = 0;
+        *pos = i;
+        return v;
+    }
+    if (i + 5 <= n && str_ncasecmp(s + i, "calc(", 5) == 0) {
+        i += 5;
+        float v = med_expr(s, n, &i, ok);
+        while (i < n && is_whitespace(s[i])) i++;
+        if (i < n && s[i] == ')') i++;
+        else *ok = 0;
+        *pos = i;
+        return v;
+    }
+    int neg = 0;
+    if (i < n && (s[i] == '-' || s[i] == '+')) { neg = (s[i] == '-'); i++; }
+    if (i >= n || !((s[i] >= '0' && s[i] <= '9') || s[i] == '.')) {
+        *ok = 0;
+        *pos = i;
+        return 0;
+    }
+    float v = 0;
+    while (i < n && s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; }
+    if (i < n && s[i] == '.') {
+        i++;
+        float f = 0.1f;
+        while (i < n && s[i] >= '0' && s[i] <= '9') { v += (s[i] - '0') * f; f *= 0.1f; i++; }
+    }
+    if (neg) v = -v;
+    /* unit (default px; 1em/1rem = 16px in media queries) */
+    if (i + 2 <= n && (str_ncasecmp(s + i, "em", 2) == 0)) { v *= 16; i += 2; }
+    else if (i + 3 <= n && str_ncasecmp(s + i, "rem", 3) == 0) { v *= 16; i += 3; }
+    else if (i + 2 <= n && str_ncasecmp(s + i, "px", 2) == 0) i += 2;
+    else if (i + 2 <= n && str_ncasecmp(s + i, "vw", 2) == 0) { v = v * g_win_w / 100; i += 2; }
+    else if (i + 2 <= n && str_ncasecmp(s + i, "vh", 2) == 0) { v = v * g_win_h / 100; i += 2; }
+    *pos = i;
+    return v;
+}
+
+static float med_expr(const char *s, int n, int *pos, int *ok) {
+    float v = med_factor(s, n, pos, ok);
+    for (;;) {
+        int i = *pos;
+        while (i < n && is_whitespace(s[i])) i++;
+        if (i < n && (s[i] == '*' || s[i] == '/')) {
+            char op = s[i];
+            i++;
+            *pos = i;
+            float r = med_factor(s, n, pos, ok);
+            if (op == '*') v *= r;
+            else v = (r != 0) ? v / r : 0;
+            continue;
+        }
+        if (i < n && (s[i] == '+' || s[i] == '-') &&
+            i + 1 < n && (is_whitespace(s[i + 1]) || s[i + 1] == '(' ||
+                          (s[i + 1] >= '0' && s[i + 1] <= '9') || s[i + 1] == '.')) {
+            char op = s[i];
+            i++;
+            *pos = i;
+            float r = med_factor(s, n, pos, ok);
+            if (op == '+') v += r;
+            else v -= r;
+            continue;
+        }
+        break;
+    }
+    return v;
+}
+
+static int med_len_px(const char *s, int n, float *out) {
+    int pos = 0, ok = 1;
+    float v = med_expr(s, n, &pos, &ok);
+    while (pos < n && is_whitespace(s[pos])) pos++;
+    if (!ok || pos < n) return 0;         /* trailing junk = unparseable */
+    *out = v;
+    return 1;
+}
+
+/* One (feature) -- text between the feature's own parens, which may
+ * contain nested parens (calc). name:value, bare presence, or level-4
+ * range comparisons with width/height on either side. */
+static int media_feature(const char *s, int n) {
+    while (n > 0 && is_whitespace(s[0])) { s++; n--; }
+    while (n > 0 && is_whitespace(s[n - 1])) n--;
+    if (n <= 0) return 0;
+    /* find a top-level ':' or comparison op */
+    int par = 0, colon = -1, cmp0 = -1;
+    char c1 = 0, c2 = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '(') par++;
+        else if (s[i] == ')') par--;
+        else if (par == 0 && s[i] == ':' && colon < 0) colon = i;
+        else if (par == 0 && cmp0 < 0 && (s[i] == '<' || s[i] == '>')) {
+            cmp0 = i;
+            c1 = s[i];
+            c2 = (i + 1 < n && s[i + 1] == '=') ? '=' : 0;
+        }
+    }
+    if (cmp0 >= 0) {                       /* range syntax */
+        int a0 = 0, a1 = cmp0;
+        int b0 = cmp0 + (c2 ? 2 : 1), b1 = n;
+        while (a1 > a0 && is_whitespace(s[a1 - 1])) a1--;
+        while (b0 < b1 && is_whitespace(s[b0])) b0++;
+        /* which side is the feature keyword? */
+        int fa = (a1 - a0 == 5 && str_ncasecmp(s + a0, "width", 5) == 0) ? 1
+               : (a1 - a0 == 6 && str_ncasecmp(s + a0, "height", 6) == 0) ? 2 : 0;
+        int fb = (b1 - b0 == 5 && str_ncasecmp(s + b0, "width", 5) == 0) ? 1
+               : (b1 - b0 == 6 && str_ncasecmp(s + b0, "height", 6) == 0) ? 2 : 0;
+        float lim;
+        if (fa && !fb) {                   /* width < expr */
+            if (!med_len_px(s + b0, b1 - b0, &lim)) return 0;
+            float w = (fa == 1) ? (float)g_win_w : (float)g_win_h;
+            if (c1 == '<') return c2 ? w <= lim : w < lim;
+            return c2 ? w >= lim : w > lim;
+        }
+        if (fb && !fa) {                   /* expr < width */
+            if (!med_len_px(s + a0, a1 - a0, &lim)) return 0;
+            float w = (fb == 1) ? (float)g_win_w : (float)g_win_h;
+            if (c1 == '<') return c2 ? lim <= w : lim < w;
+            return c2 ? lim >= w : lim > w;
+        }
+        return 0;                          /* A < width < B etc: not yet */
+    }
+    int flen = (colon >= 0) ? colon : n;
+    while (flen > 0 && is_whitespace(s[flen - 1])) flen--;
+    const char *vv = (colon >= 0) ? s + colon + 1 : NULL;
+    int vn = (colon >= 0) ? n - colon - 1 : 0;
+    while (vn > 0 && is_whitespace(vv[0])) { vv++; vn--; }
+    float px;
+    if (flen == 9 && str_ncasecmp(s, "min-width", 9) == 0)
+        return vv && med_len_px(vv, vn, &px) && g_win_w >= px;
+    if (flen == 9 && str_ncasecmp(s, "max-width", 9) == 0)
+        return vv && med_len_px(vv, vn, &px) && g_win_w <= px;
+    if (flen == 5 && str_ncasecmp(s, "width", 5) == 0)
+        return vv && med_len_px(vv, vn, &px) && g_win_w == (int)px;
+    if (flen == 10 && str_ncasecmp(s, "min-height", 10) == 0)
+        return vv && med_len_px(vv, vn, &px) && g_win_h >= px;
+    if (flen == 10 && str_ncasecmp(s, "max-height", 10) == 0)
+        return vv && med_len_px(vv, vn, &px) && g_win_h <= px;
+    if (flen == 6 && str_ncasecmp(s, "height", 6) == 0)
+        return vv && med_len_px(vv, vn, &px) && g_win_h == (int)px;
+    if (flen == 11 && str_ncasecmp(s, "orientation", 11) == 0)
+        return (vn > 0 && lc(vv[0]) == 'l') ? (g_win_w >= g_win_h)
+                                            : (g_win_w < g_win_h);
+    if (flen == 20 && str_ncasecmp(s, "prefers-color-scheme", 20) == 0)
+        return vn > 0 && lc(vv[0]) == 'l';
+    return 0;                              /* unknown feature fails */
+}
+
 /* Evaluate a media query list against the viewport ("screen and
  * (min-width: 600px)", comma = OR). Unknown features fail their query. */
 static int media_matches(const char *s, int len) {
@@ -1989,37 +2158,16 @@ static int media_matches(const char *s, int len) {
         while (i < len && s[i] != ',') {
             if (is_whitespace(s[i])) { i++; continue; }
             if (s[i] == '(') {
-                int f0 = ++i;
-                while (i < len && s[i] != ':' && s[i] != ')') i++;
-                int flen = i - f0;
-                while (flen > 0 && is_whitespace(s[f0 + flen - 1])) flen--;
-                int vv0 = 0, vvn = 0;
-                if (i < len && s[i] == ':') {
+                /* capture to the MATCHING ')' -- calc() nests parens */
+                int f0 = ++i, par = 0;
+                while (i < len && !(par == 0 && s[i] == ')')) {
+                    if (s[i] == '(') par++;
+                    else if (s[i] == ')') par--;
                     i++;
-                    while (i < len && is_whitespace(s[i])) i++;
-                    vv0 = i;
-                    while (i < len && s[i] != ')') i++;
-                    vvn = i - vv0;
                 }
+                int fend = i;
                 if (i < len) i++;         /* ')' */
-                int px = 0;
-                for (int k = vv0; k < vv0 + vvn && s[k] >= '0' && s[k] <= '9'; k++)
-                    px = px * 10 + (s[k] - '0');
-                int val;
-                if (flen == 9 && str_ncasecmp(s + f0, "min-width", 9) == 0)
-                    val = g_win_w >= px;
-                else if (flen == 9 && str_ncasecmp(s + f0, "max-width", 9) == 0)
-                    val = g_win_w <= px;
-                else if (flen == 5 && str_ncasecmp(s + f0, "width", 5) == 0)
-                    val = g_win_w == px;
-                else if (flen == 11 && str_ncasecmp(s + f0, "orientation", 11) == 0)
-                    val = (vvn > 0 && lc(s[vv0]) == 'l') ? (g_win_w >= g_win_h)
-                                                         : (g_win_w < g_win_h);
-                else if (flen == 20 && str_ncasecmp(s + f0, "prefers-color-scheme", 20) == 0)
-                    val = vvn > 0 && lc(s[vv0]) == 'l';
-                else
-                    val = 0;
-                if (!val) ok = 0;
+                if (!media_feature(s + f0, fend - f0)) ok = 0;
                 continue;
             }
             int w0 = i;
