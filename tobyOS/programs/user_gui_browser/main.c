@@ -2872,7 +2872,8 @@ static void css_parse_ruleset(struct ccur *c, int origin) {
             continue;
         }
         if (ch == '>') { pending_comb = 2; c->i++; continue; }
-        if (ch == '+' || ch == '~') { cur_valid = 0; c->i++; continue; }
+        if (ch == '+') { pending_comb = 3; c->i++; continue; }
+        if (ch == '~') { pending_comb = 4; c->i++; continue; }
         if (!cur_valid) { c->i++; continue; }
         struct cpart tmp;
         long before = c->i;
@@ -3600,11 +3601,33 @@ static int part_match(const struct cpart *p, int ni) {
     return 1;
 }
 
-/* Right-to-left matching with ancestor backtracking. */
+/* Previous ELEMENT sibling of ni (text nodes skipped), -1 if none. */
+static int prev_elem_sibling(int ni) {
+    int parent = E->nodes[ni].parent;
+    if (parent < 0) return -1;
+    int prev = -1;
+    for (int c = E->nodes[parent].first; c >= 0; c = E->nodes[c].next) {
+        if (c == ni) return prev;
+        if (E->nodes[c].tag != T_TEXT) prev = c;
+    }
+    return -1;
+}
+
+/* Right-to-left matching with ancestor backtracking. comb: 1 descendant,
+ * 2 child, 3 adjacent sibling (+), 4 general sibling (~). */
 static int match_upward(const struct cpart *parts, int pi, int ni) {
     if (!part_match(&parts[pi], ni)) return 0;
     if (pi == 0) return 1;
     int comb = parts[pi].comb;
+    if (comb == 3) {
+        int s = prev_elem_sibling(ni);
+        return s >= 0 && match_upward(parts, pi - 1, s);
+    }
+    if (comb == 4) {
+        for (int s = prev_elem_sibling(ni); s >= 0; s = prev_elem_sibling(s))
+            if (match_upward(parts, pi - 1, s)) return 1;
+        return 0;
+    }
     int a = E->nodes[ni].parent;
     if (comb == 2)
         return a >= 0 && match_upward(parts, pi - 1, a);
@@ -4903,10 +4926,17 @@ static void rule_index_build(void) {
      * rule order (matches the old scan's iteration order) */
     for (int r = E->nrules - 1; r >= 0; r--) {
         struct crule *ru = &E->rules[r];
-        /* bits the ancestors must carry (all parts but the rightmost) */
+        /* bits the ancestors must carry (all parts but the rightmost).
+         * A part joined through a SIBLING combinator (+/~) is NOT an
+         * ancestor -- once one appears (right-to-left), stop demanding
+         * bits: the bloom must stay false-positive-only. */
         ru->anc_bloom = 0;
-        for (int k = 0; k < ru->nparts - 1; k++)
-            ru->anc_bloom |= part_key_bits(&E->parts[ru->part0 + k]);
+        int pure_anc = 1;
+        for (int k = ru->nparts - 1; k >= 1; k--) {
+            if (E->parts[ru->part0 + k].comb >= 3) pure_anc = 0;
+            if (pure_anc)
+                ru->anc_bloom |= part_key_bits(&E->parts[ru->part0 + k - 1]);
+        }
         int32_t *head = &E->idx_uni;
         if (ru->nparts > 0) {
             const struct cpart *last = &E->parts[ru->part0 + ru->nparts - 1];
@@ -5352,6 +5382,30 @@ struct cliprect { int32_t x, y, w, h; };
 static struct cliprect g_clips[CLIP_MAX];
 static int g_nclips;       /* index 0 reserved as "no clip" */
 static int g_cur_clip;
+
+/* Provisionally-laid subtrees (inline-blocks, floats) shift their items
+ * into place afterwards -- clips created inside MUST shift with them or
+ * they stay at the provisional origin (y ~ 1<<20) and cull everything
+ * they clip (wikipedia's masked icons: .cdx-button{overflow:hidden} is
+ * an inline-flex whose interior clip never moved). The interior is laid
+ * with g_cur_clip = 0, so after the shift each new clip re-intersects
+ * the outer clip here, in REAL coordinates. */
+static void clips_shift(int c0, int dx, int dy, int outer) {
+    for (int c = c0; c < g_nclips; c++) {
+        struct cliprect *cl = &g_clips[c];
+        cl->x += dx;
+        cl->y += dy;
+        if (outer > 0) {
+            const struct cliprect *oc = &g_clips[outer];
+            if (oc->x > cl->x) { cl->w -= oc->x - cl->x; cl->x = oc->x; }
+            if (cl->x + cl->w > oc->x + oc->w) cl->w = oc->x + oc->w - cl->x;
+            if (oc->y > cl->y) { cl->h -= oc->y - cl->y; cl->y = oc->y; }
+            if (cl->y + cl->h > oc->y + oc->h) cl->h = oc->y + oc->h - cl->y;
+            if (cl->w < 0) cl->w = 0;
+            if (cl->h < 0) cl->h = 0;
+        }
+    }
+}
 
 static struct ditem *item_new(int kind) {
     if (E->nitems >= ITEM_MAX) return NULL;
@@ -5880,6 +5934,7 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
 
     int i0 = E->nitems, f1;
     int s0 = g_nnst;
+    int fc0 = g_nclips, fsave_cc = g_cur_clip;
     int by = cy + mt;                      /* real flow position (search start) */
     int laytop = by;                       /* where the content was laid */
     int bw2, bbh;                          /* border-box width incl. ml, height */
@@ -5928,7 +5983,12 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
             if (lay_cw < 24) lay_cw = 24;
         }
         f1 = g_nflts;
+        fc0 = g_nclips;                    /* interior clips: no outer in
+                                              force, re-intersect post-shift */
+        fsave_cc = g_cur_clip;
+        g_cur_clip = 0;
         int bot = lay_block(ni, 0, lay_cw, prov, link, inbg);
+        g_cur_clip = fsave_cc;
         bbh = bot - prov;
         laytop = prov;
         if (st->width >= 0) {
@@ -5971,8 +6031,11 @@ static void lay_float(int ni, int cx, int cw, int cy, int link, uint32_t inbg) {
     for (int i = i0; i < E->nitems; i++) {
         E->items[i].x += dx;
         E->items[i].y += dy;
+        if (fsave_cc && E->items[i].clip == 0)  /* re-attach the outer clip */
+            E->items[i].clip = (uint8_t)fsave_cc;
     }
     nstamp_shift(s0, g_nnst, dx, dy);
+    clips_shift(fc0, dx, dy, fsave_cc);
     for (int i = f1; i < g_nflts; i++) {   /* floats nested in this float */
         g_flts[i].x0 += dx; g_flts[i].x1 += dx;
         g_flts[i].y0 += dy; g_flts[i].y1 += dy;
@@ -6033,9 +6096,14 @@ static void ic_inline_block(struct ictx *ic, int ni, const struct istyle *is) {
         if (st->min_w >= 0 && content_w < st->min_w) content_w = st->min_w;
     }
 
-    /* Lay the real box: pass a container width that reproduces content_w. */
+    /* Lay the real box: pass a container width that reproduces content_w.
+     * Interior clips are created in provisional coordinates, so lay with
+     * no outer clip in force and re-intersect after the shift. */
     int lay_cw = ml + mr + bwl + bwr + pl + pr + content_w;
+    int c0 = g_nclips, save_cc = g_cur_clip;
+    g_cur_clip = 0;
     int bot = lay_block(ni, 0, lay_cw, prov, is->link, is->bg);
+    g_cur_clip = save_cc;
     int bbh = bot - prov;                       /* border-box height */
     int bw  = ml + bwl + pl + content_w + pr + bwr;   /* incl. left margin */
     int adv = bw + mr;
@@ -6048,8 +6116,14 @@ static void ic_inline_block(struct ictx *ic, int ni, const struct istyle *is) {
      * margin edge sits at ic->x and the top margin edge at ic->y. */
     int dx = ic->x;
     int dy = (ic->y + mt) - prov;
-    for (int i = i0; i < E->nitems; i++) { E->items[i].x += dx; E->items[i].y += dy; }
+    for (int i = i0; i < E->nitems; i++) {
+        E->items[i].x += dx;
+        E->items[i].y += dy;
+        if (save_cc && E->items[i].clip == 0)   /* re-attach the outer clip */
+            E->items[i].clip = (uint8_t)save_cc;
+    }
     nstamp_shift(s0, g_nnst, dx, dy);
+    clips_shift(c0, dx, dy, save_cc);
     g_nflts = f0;                               /* contain interior floats */
 
     ic->x += adv;
@@ -16266,6 +16340,47 @@ static void paint_content_item(int ri, int sksh, int vtop, int vbot,
     int fd = 0;
     static char tb[512];
     struct ditem *r = &g_items[ri];
+#ifdef MASKDBG
+    if (r->mask >= 0) {
+        struct maskimg *mk = (r->mask < g_nmasks) ? &g_masks[r->mask] : NULL;
+        int ry2 = (r->fl & IF_FIXED) ? r->y : r->y + sksh;
+        int culled = (r->fl & IF_FIXED)
+            ? (r->y + r->h <= 0 || r->y >= g_content_h)
+            : (ry2 + r->h <= vtop || ry2 >= vbot);
+        char m[240]; int p = 0;
+        p = msg_append(m, p, sizeof(m), "[maskdbg] ri=");
+        p = msg_append_int(m, p, sizeof(m), ri);
+        p = msg_append(m, p, sizeof(m), " xy=");
+        p = msg_append_int(m, p, sizeof(m), r->x);
+        p = msg_append(m, p, sizeof(m), ",");
+        p = msg_append_int(m, p, sizeof(m), r->y);
+        p = msg_append(m, p, sizeof(m), " wh=");
+        p = msg_append_int(m, p, sizeof(m), r->w);
+        p = msg_append(m, p, sizeof(m), "x");
+        p = msg_append_int(m, p, sizeof(m), r->h);
+        p = msg_append(m, p, sizeof(m), " sksh=");
+        p = msg_append_int(m, p, sizeof(m), sksh);
+        p = msg_append(m, p, sizeof(m), " clip=");
+        p = msg_append_int(m, p, sizeof(m), r->clip);
+        if (r->clip) {
+            struct cliprect *cl2 = &g_clips[r->clip];
+            p = msg_append(m, p, sizeof(m), "[");
+            p = msg_append_int(m, p, sizeof(m), cl2->x);
+            p = msg_append(m, p, sizeof(m), ",");
+            p = msg_append_int(m, p, sizeof(m), cl2->y);
+            p = msg_append(m, p, sizeof(m), " ");
+            p = msg_append_int(m, p, sizeof(m), cl2->w);
+            p = msg_append(m, p, sizeof(m), "x");
+            p = msg_append_int(m, p, sizeof(m), cl2->h);
+            p = msg_append(m, p, sizeof(m), "]");
+        }
+        p = msg_append(m, p, sizeof(m), " mstate=");
+        p = msg_append_int(m, p, sizeof(m), mk ? mk->state : -9);
+        p = msg_append(m, p, sizeof(m), culled ? " CULL-VIEW" : " paint");
+        p = msg_append(m, p, sizeof(m), "\n");
+        sys_write(1, m, p);
+    }
+#endif
     int sy;
     if (r->fl & IF_FIXED) {             /* viewport coords, no scroll */
         if (r->y + r->h <= 0 || r->y >= g_content_h) return;
