@@ -99,6 +99,11 @@ def boot_and_shot(iso, out_png, serial_log, wait_s, port):
 def edge_shot(url, out_png):
     if os.path.exists(out_png):
         os.remove(out_png)
+    # A stray headless msedge from an earlier (timed-out) run blocks new
+    # --screenshot invocations silently; sweep them first.
+    subprocess.run(["taskkill", "/IM", "msedge.exe", "/F"],
+                   capture_output=True)
+    time.sleep(1)
     subprocess.run([EDGE, "--headless", "--disable-gpu",
                     "--screenshot=" + out_png,
                     "--window-size=%d,%d" % (VIEW_W, VIEW_H),
