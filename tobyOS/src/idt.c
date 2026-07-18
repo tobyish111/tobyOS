@@ -73,6 +73,18 @@ void idt_init(void) {
         set_gate(i, isr_stub_table[i], 0x8E);
     }
 
+    /* Vectors 3 (#BP / int3) and 4 (#OF / into) must be reachable from CPL 3:
+     * they are the only exceptions a user program invokes ON PURPOSE. Chromium's
+     * IMMEDIATE_CRASH()/CHECK()/DCHECK() macros emit `int3` as their trap, and
+     * debuggers set software breakpoints the same way. With the default DPL-0
+     * gate a user `int3` raises #GP (err=IDT[3]) instead of #BP, which the ABI
+     * then cannot turn into SIGTRAP. Raise their DPL to 3 (0xEE = present, DPL 3,
+     * interrupt gate) so the trap reaches the normal exception path, where
+     * default_exception() delivers SIGTRAP/SIGSEGV to the process. All other
+     * vectors stay DPL 0 (a user `int $N` for them still #GPs, as on Linux). */
+    set_gate(3, isr_stub_table[3], 0xEE);   /* #BP -> SIGTRAP */
+    set_gate(4, isr_stub_table[4], 0xEE);   /* #OF -> SIGSEGV */
+
     g_idtr.limit = (uint16_t)(sizeof(g_idt) - 1);
     g_idtr.base  = (uint64_t)&g_idt[0];
 

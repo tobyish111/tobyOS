@@ -33,8 +33,12 @@ rm -f build/initrd.tar build/base.iso tobyOS.iso
 # Carry a Windows-native TMP prefix ON $(CC)/$(HOST_CC): exporting TMP gets
 # mangled crossing MSYS make->sh, which breaks the .S integrated-assembler
 # temp file (tobyos-build-env memory). This inline form survives.
+# TRACE=1 adds the -DLINUX_SYSCALL_TRACE firehose (every Linux syscall entry) --
+# used to see what chrome was doing right before a fault. Verbose + slower.
+CF="-DFAST_BOOT -DQUICK_BOOT -DCHROMIUM_BOOT"
+[ "${TRACE:-0}" = "1" ] && CF="$CF -DLINUX_SYSCALL_TRACE"
 make "CC=TMP='C:\\t' TEMP='C:\\t' clang" "HOST_CC=TMP='C:\\t' TEMP='C:\\t' gcc" \
-     iso EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DCHROMIUM_BOOT" >"$BUILDLOG" 2>&1
+     iso EXTRA_CFLAGS="$CF" >"$BUILDLOG" 2>&1
 if [ ! -f tobyOS.iso ]; then echo "ISO BUILD FAILED -- tail:"; tail -50 "$BUILDLOG"; exit 1; fi
 tail -3 "$BUILDLOG"
 grep -aE 'chromium:|initrd' "$BUILDLOG" | head

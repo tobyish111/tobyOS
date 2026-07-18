@@ -168,6 +168,18 @@ static void pfloop_note_resolved(struct regs *r, uint64_t fault_addr) {
 static void default_exception(struct regs *r) {
     bool from_user = (r->cs & 3) == 3;
 
+    /* Vector 3 (#BP / int3). A KERNEL-mode int3 is a deliberate debug-marker
+     * breakpoint: log it and continue (this was a separately-registered
+     * breakpoint_handler before). A USER-mode int3 is a program's own trap --
+     * Chromium's IMMEDIATE_CRASH()/CHECK()/DCHECK() emit it -- and must be
+     * delivered as SIGTRAP (handled by the from_user signal switch below), never
+     * silently resumed. (IDT[3] is DPL 3 so this path is reached at all.) */
+    if (r->vector == 3 && !from_user) {
+        kprintf("[isr] breakpoint hit at rip=%p (rflags=0x%lx)\n",
+                (void *)r->rip, r->rflags);
+        return;
+    }
+
     /* Phase 1 M1.2: demand paging for page faults (vector 14).
      * Try to handle the fault via the VMA/mmap system before killing. */
     if (r->vector == 14) {
@@ -213,6 +225,8 @@ static void default_exception(struct regs *r) {
         uint64_t addr = 0;
         switch (r->vector) {
         case 0:  sig = SIGFPE;  code = FPE_INTDIV; break;   /* #DE */
+        case 3:  sig = SIGTRAP; code = TRAP_BRKPT; break;   /* #BP (int3) */
+        case 4:  sig = SIGSEGV; code = SEGV_MAPERR; break;  /* #OF (into) */
         case 6:  sig = SIGILL;  code = ILL_ILLOPC; break;   /* #UD */
         case 13: sig = SIGSEGV; code = SEGV_ACCERR; break;  /* #GP */
         case 14:                                            /* #PF */
