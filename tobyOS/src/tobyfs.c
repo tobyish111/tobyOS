@@ -655,6 +655,8 @@ static int tobyfs_open(void *mnt, const char *path, struct vfs_file *out) {
     out->uid  = node.uid;
     out->gid  = node.gid;
     out->mode = node.mode;
+    out->ino  = ino;    /* stable per-file inode: two opens of the same path
+                         * report the same st_ino (chrome shm inode-match check) */
     return VFS_OK;
 }
 

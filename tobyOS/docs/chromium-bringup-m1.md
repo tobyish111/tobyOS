@@ -435,17 +435,36 @@ build required** (`logs/chromium-m0-clean.sh`); an incremental build boot-hung
 early until a clean rebuild. Permanent instrument kept: the one-line `[xsrv]
 setup` on first handshake.
 
-## Slice 14 — shared-memory inode identity (OPEN, current front)
+## Slice 14 — shared-memory inode identity (DONE)
 
-Past GL, chrome now dies ~0.2s later at
-`platform_shared_memory_region_posix.cc:259: Writable and read-only inodes don't
-match; bailing` → the same NULL-dispatch crash downstream. With
-`--disable-dev-shm-usage`, chrome creates a temp file under `TMPDIR=/data`, opens
-it **twice** (O_RDWR then O_RDONLY by the same path), `fstat`s both and requires
-`st_dev`+`st_ino` to match. tobyOS reports `st_dev=1` (matches) but `st_ino =
-hash(vfs_file.priv)` (`lx_fd_ino`), and two opens of the same tobyfs path get
-distinct `priv` nodes → mismatched inodes. Fix options: expose a real per-file
-inode number through `vfs_stat` (correct, but plumbs an `ino` field through every
-fs driver), or derive `st_ino` from the file's canonical path (localized, but must
-not regress ld.so's node-pointer dedup for symlinked libs). Then `--dump-dom`
-should finally print `<h1>tobyOS</h1>`.
+Past GL, chrome died ~0.2s later at `platform_shared_memory_region_posix.cc:259:
+Writable and read-only inodes don't match; bailing`. With `--disable-dev-shm-usage`
+chrome creates a temp file under `TMPDIR=/data` (`/data/.org.chromium.Chromium.*`),
+opens it **twice** (O_RDWR then O_RDONLY by the same path), `fstat`s both and
+requires `st_dev`+`st_ino` to match. tobyOS reported `st_dev=1` (ok) but
+`st_ino = hash(vfs_file.priv)` (`lx_fd_ino`) and two opens got distinct `priv`
+nodes → mismatch.
+
+**Fix:** a stable per-file `ino` on the handle. Added `uint64_t ino` to
+`struct vfs_file` (`include/tobyos/vfs.h`), zeroed in `vfs_open`, set by
+`tobyfs_open` to the real tobyfs inode number; `lx_fd_ino` prefers it (hashed
+`i:<ino>`) and falls back to the node-pointer hash when 0 — so ramfs et al.
+(ld.so dedup) are unchanged, only tobyfs files get a stable inode. Verified with
+an open-path trace: both fds of `/data/.org.chromium.Chromium.aaaaaa` report
+`ino=39` (matched); the shm error is gone. **Chrome ran 8s → 47s**, past shm and
+deep into profile/storage init. `struct vfs_file` grew → clean build.
+
+## Slice 15 — storage/fs syscall gaps (OPEN, current front) — NOTE: render bug is SOLVED
+
+**The handoff's subject — headless GL/SwANGLE — is solved** (slices 12-14).
+Chrome now reaches its full profile/storage bring-up and stalls there: leveldb +
+SQLite (`Code Cache`, `Local Storage`, `GPUCache`, `DawnCache`, `Shared Dictionary`,
+`DIPS`, `shared_proto_db`) fail because `rename(82)`, `fdatasync(75)`,
+`unlinkat(263)` (and `143`/`145`/`93`) are `-ENOSYS`. Chrome retry-loops on the
+leveldb metadata open (~every 2s) then a worker thread NULL-dispatch crashes at
+~45s (pid=28 'chrome+T', `last_fault_rip=0x2054415`). For `--dump-dom` of a
+`data:` URL none of this profile storage is actually needed. Two paths: (a)
+implement the fs syscalls so leveldb/SQLite succeed (`rename` is the high-value
+one — atomic-rename is core to both); (b) shrink chrome's storage footprint via
+flags (`--incognito` / feature disables) so it skips these subsystems and goes
+straight to navigation + DOM dump. This is a NEW ABI phase beyond the render bug.
