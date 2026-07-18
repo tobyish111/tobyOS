@@ -393,7 +393,7 @@ static void futex_free_entry(struct futex_entry *e) {
     g_futex_free = e;
 }
 
-long futex(uint32_t *uaddr, int op, uint32_t val) {
+long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
     struct proc *caller = current_proc();
     if (!caller) return -1;
 
@@ -401,18 +401,35 @@ long futex(uint32_t *uaddr, int op, uint32_t val) {
     uint64_t cr3  = caller->cr3;
     if (!user_range_ok(addr, sizeof(uint32_t))) return -14; /* EFAULT */
 
+    int cmd = op & 0x7f;   /* strip FUTEX_PRIVATE_FLAG(128)/CLOCK_REALTIME(256) */
+
     /* Pre-touch the futex word OUTSIDE the spinlock so any CoW/demand #PF
      * resolves with IRQs on; the locked re-read below then can't fault
      * (per-copy uaccess: each read opens its own stac window). */
     uint32_t cur_val;
     if (copy_from_user(&cur_val, uaddr, sizeof(cur_val)) != 0) return -14;
 
-    if (op == FUTEX_WAIT) {
-        /* Atomically: if *uaddr == val, block. Otherwise return -EAGAIN. */
-        uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+    if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
+        /* Compute the wake deadline (monotonic ns). NULL => infinite. FUTEX_WAIT
+         * takes a RELATIVE timeout; FUTEX_WAIT_BITSET (glibc's pthread_cond_
+         * timedwait / mutex_timedlock) takes an ABSOLUTE one -- and tobyOS's
+         * clock_gettime/gettimeofday are all perf_now_ns-based, so a chrome
+         * absolute deadline is directly comparable to perf_now_ns(). Honouring
+         * the timeout is essential: without it, every timed wait blocked FOREVER
+         * -> worker threads hung -> Chromium's deadline CHECKs fired (int3). */
+        uint64_t deadline_ns = 0;
+        if (utimeout) {
+            struct { int64_t sec; int64_t nsec; } ts;
+            if (copy_from_user(&ts, utimeout, sizeof ts) == 0) {
+                uint64_t t = (uint64_t)ts.sec * 1000000000ull + (uint64_t)ts.nsec;
+                deadline_ns = (cmd == FUTEX_WAIT_BITSET) ? t
+                                                         : perf_now_ns() + t;
+                if (deadline_ns == 0) deadline_ns = 1;   /* nonzero => "timed" */
+            }
+        }
 
-        /* Re-read the user value under the lock -- we're in the caller's
-         * address space and the page is present (pre-touched above). */
+        /* Atomically: if *uaddr == val, wait. Otherwise return -EAGAIN. */
+        uint64_t flags = spin_lock_irqsave(&g_futex_lock);
         unsigned long uw = uaccess_begin();
         cur_val = *(volatile uint32_t *)uaddr;
         uaccess_end(uw);
@@ -421,24 +438,40 @@ long futex(uint32_t *uaddr, int op, uint32_t val) {
             return -11; /* -EAGAIN */
         }
 
-        struct futex_entry *e = futex_find_or_create(cr3, addr);
-        if (!e) {
+        if (deadline_ns == 0) {
+            /* Untimed: efficient block, woken by FUTEX_WAKE. */
+            struct futex_entry *e = futex_find_or_create(cr3, addr);
+            if (!e) {
+                spin_unlock_irqrestore(&g_futex_lock, flags);
+                return -12; /* -ENOMEM */
+            }
+            caller->state = PROC_BLOCKED;
+            caller->next_wait = e->waiters;
+            e->waiters = caller;
             spin_unlock_irqrestore(&g_futex_lock, flags);
-            return -12; /* -ENOMEM */
+            sched_yield();
+            return 0;
         }
 
-        /* Add caller to wait list */
-        caller->state = PROC_BLOCKED;
-        caller->next_wait = e->waiters;
-        e->waiters = caller;
-
+        /* Timed: poll-with-idle against the deadline (the waiter is NOT on the
+         * wait list -- the waker changes *uaddr before FUTEX_WAKE, which we
+         * detect on recheck; glibc tolerates the resulting spurious wakeups). */
         spin_unlock_irqrestore(&g_futex_lock, flags);
-        sched_yield();
-
-        return 0;
+        for (;;) {
+            uint32_t v;
+            if (copy_from_user(&v, uaddr, sizeof v) != 0) return -14;
+            if (v != val)                    return 0;    /* woken */
+            if (caller->pending_signals)     return -4;   /* -EINTR */
+            if (perf_now_ns() >= deadline_ns) return -110;/* -ETIMEDOUT */
+            bool had = bkl_held();
+            if (had) bkl_exit();
+            sti();
+            hlt();
+            if (had) bkl_enter();
+        }
     }
 
-    if (op == FUTEX_WAKE) {
+    if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
         uint64_t flags = spin_lock_irqsave(&g_futex_lock);
 
         uint32_t idx = futex_hash(cr3, addr);

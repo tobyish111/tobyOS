@@ -3719,7 +3719,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return thread_detach((int)a1);
 
     case ABI_SYS_FUTEX:
-        return futex((uint32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3);
+        return futex((uint32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3,
+                     (const void *)(uintptr_t)a4);
 
     case ABI_SYS_SET_TLS:
         thread_set_tls((uint64_t)a1);
@@ -6062,8 +6063,9 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     /* Futex: forward only the FUTEX_WAIT/WAKE low ops; private flag and
      * timeouts are ignored for now (single-threaded statics don't block
      * here). */
-    case LX_futex:
-        return futex((uint32_t *)(uintptr_t)a1, (int)(a2 & 0x7f), (uint32_t)a3);
+    case LX_futex:   /* (uaddr, op, val, timeout, ...); op decoded inside */
+        return futex((uint32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3,
+                     (const void *)(uintptr_t)a4);
 
     case LX_access:                 /* (path, mode) */
         return lx_faccess((const char *)a1);

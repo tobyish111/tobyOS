@@ -128,20 +128,50 @@ degrades the platform bits tobyOS lacks (all non-fatal `ERROR`s, chrome falls
 back): D-Bus connect (no named/`connect`-by-path AF_UNIX), `AF_NETLINK` socket,
 `/proc/sys/fs/inotify/max_user_watches`, SwANGLE `eglInitialize` (no GL).
 
-## Slice 7 — the remaining wall: a message-less `int3` `CHECK` (open, deep)
+## Slice 7 — futex timeouts (`FUTEX_WAIT_BITSET`) (DONE, verified)
 
-Chrome now dies on a single `int3` (`EXCEPTION 3`) with **no `Check failed:`
-message** — a `DCHECK`/`NOTREACHED`/`IMMEDIATE_CRASH`. The crash point is
-**timing-dependent** (34k–270k syscalls across runs), and the recent-syscall ring
-shows a thread spinning on `futex` near the end — pointing at a synchronization
-race or a fired watchdog. This is past the "grep the gap and fill it" regime; it
-needs `rip` symbolization against chrome's binary (compute the module load base,
-disassemble the caller) and/or deeper futex/threading instrumentation. It is the
-current burn-down front.
+The int3 was symbolized (chrome's main PIE loads at `0x500000`; `objdump` at
+`rip-0x500000` showed `int3; ud2` = `base::ImmediateCrash()`). It was **not** the
+futex — but symbolizing led to the real futex bug: the kernel `futex()` handled
+only `FUTEX_WAIT(0)`/`FUTEX_WAKE(1)` and **dropped the timeout arg (`a4`)**.
+glibc's `pthread_cond_timedwait`/`mutex_timedlock` use **`FUTEX_WAIT_BITSET(9)`
+with an absolute timeout** — which the old code returned `-EINVAL` for, so
+chrome's timed waits **busy-looped on EINVAL** (34k syscalls in 7.5 s).
 
-Cumulative arc (this session, 7 slices): chrome went from *can't load
-`libpthread`* → **270k syscalls, 17 threads, Mojo + fontconfig + graceful
-platform degradation** — real multi-threaded engine bring-up.
+**Fix (`src/thread.c` + `proc.h` + call sites):** `futex()` now takes the
+timeout pointer and handles `FUTEX_WAIT`/`FUTEX_WAIT_BITSET` (+ `WAKE`/
+`WAKE_BITSET`). Untimed waits keep the efficient block+wake; **timed** waits
+poll-with-idle (`hlt`) against a deadline (relative for `WAIT`, absolute for
+`WAIT_BITSET` — and tobyOS's clocks are all `perf_now_ns`-based, so a chrome
+absolute deadline is directly comparable). Returns `0`/`-EAGAIN`/`-ETIMEDOUT`/
+`-EINTR`.
+
+**Verified:** chrome's timed waits now block correctly instead of busy-looping;
+it runs its **full concurrency stack** and now legitimately *waits* (1135
+syscalls across **85 s** — mostly idle on real timeouts) rather than spinning.
+
+## Slice 8 — the render/navigation wall: `IMMEDIATE_CRASH` (open, deep)
+
+With concurrency correct, chrome waits ~85 s (a navigation/render timeout) then
+hits `base::ImmediateCrash()` on the main thread — a message-less
+`NOTREACHED`/`CHECK` deep in a stripped function (`posix_memalign+0x3d8xx`,
+allocator/base). No DOM was dumped, so **navigation never completes**: the
+in-process renderer can't finish a frame — SwANGLE `eglInitialize` failed (no
+GL), so the compositor/paint path likely stalls, and a watchdog fires. Getting
+past this is the **rendering-pipeline** tier (software compositing / GL fallback
+/ whatever blocks the renderer) — genuinely M2-class work, not another syscall
+fill. Next diagnostic step: stack-walk the main thread at the crash + trace what
+the renderer thread is blocked on.
+
+## Cumulative arc (this session, 8 slices)
+
+Chrome went from *can't load `libpthread`* → **runs its full multi-threaded
+engine**: glibc dynamic + V8 memory cage + Mojo IPC (AF_UNIX socketpair) + a
+17-thread ThreadPool with correct fd sharing, fd/proc limits, and **working
+futex timeouts** + fontconfig + graceful degradation of the platform bits tobyOS
+lacks. It now reaches — and stalls in — the actual **render pipeline**. Several
+fixes were real kernel bugs beyond chrome (int3→SIGTRAP, the demand-paging
+editor-root, `CLONE_FILES` fd sharing, futex timeouts).
 
 ## Slice 2 — V8's virtual-memory cage (DONE, verified)
 
