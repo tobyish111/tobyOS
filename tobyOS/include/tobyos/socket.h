@@ -77,6 +77,15 @@ struct sock {
     uint8_t         tail;
     uint8_t         count;
     uint16_t        dropped;
+    uint16_t        tail_off;          /* AF_UNIX stream: bytes already consumed
+                                        * from the head dgram (partial reads leave
+                                        * the remainder queued, vs SEQPACKET which
+                                        * would drop it) -- X11 is a byte stream. */
+    uint8_t         x_server;          /* 1 = in-kernel fake-X-server loopback:
+                                        * writes are fed to the X handshake
+                                        * responder, which enqueues replies back
+                                        * into THIS sock's own rx ring. */
+    uint8_t         x_setup_done;      /* X11 connection-setup reply delivered. */
 
     /* TCP: wrapped kernel connection. */
     struct tcp_conn *tcp;
@@ -109,6 +118,13 @@ long sock_unix_send(struct sock *self, const void *kbuf, size_t n);
 long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms);
 void sock_unix_peer_close(struct sock *self);
 int  sock_unix_pair(struct sock **out_a, struct sock **out_b);
+
+/* connect(2) on an AF_UNIX stream socket to a named/abstract address. Only the
+ * X server socket (/tmp/.X11-unix/X0, filesystem or abstract) is recognised: it
+ * turns `s` into an in-kernel fake-X-server endpoint (see x_server above) so
+ * ANGLE's DisplayVkXcb xcb_connect() succeeds headless. Returns 0 on success,
+ * a negative -errno (e.g. -ECONNREFUSED) for any other address. */
+int  sock_unix_connect_named(struct sock *s, const char *name, bool abstract);
 
 /* Bind a socket to a local port (network byte order). */
 int sock_bind(struct sock *s, uint16_t port_be);

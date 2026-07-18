@@ -188,8 +188,11 @@ static void unix_enqueue(struct sock *s, const void *payload, size_t len) {
     wq_wake_all(&s->wq_recv);
 }
 
+static long xserver_handle(struct sock *self, const void *buf, size_t n);
+
 long sock_unix_send(struct sock *self, const void *kbuf, size_t n) {
     if (!self || !self->in_use || self->kind != SOCK_KIND_UNIX) return -1;
+    if (self->x_server) return xserver_handle(self, kbuf, n);  /* fake X server */
     if (self->peer_ip == 0) return -32;          /* -EPIPE: peer closed */
     struct sock *peer = sock_by_fd((int)self->peer_ip - 1);
     if (!peer || !peer->in_use || peer->kind != SOCK_KIND_UNIX) {
@@ -213,7 +216,8 @@ long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms
         struct proc *me = current_proc();
         if (me->pending_signals) return EINTR_RET;
         if (!self->in_use)       return -1;
-        if (self->peer_ip == 0)  return 0;       /* peer closed + drained -> EOF */
+        if (self->peer_ip == 0 && !self->x_server)
+            return 0;                            /* peer closed + drained -> EOF */
         if (deadline && pit_ticks() >= deadline) return 0;   /* timed out */
         /* Cooperative wait: drop the BKL so the peer thread can run + deliver
          * (unix_enqueue wakes wq_recv), idle, then re-check. */
@@ -225,16 +229,27 @@ long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms
     }
 
     struct sock_dgram *d = &self->dgrams[self->tail];
-    size_t copy = d->len < n ? d->len : n;       /* SEQPACKET: one msg per read */
-    if (copy && d->payload) memcpy(kbuf, d->payload, copy);
-    if (d->payload) { kfree(d->payload); d->payload = 0; }
-    self->tail = (uint8_t)((self->tail + 1) % SOCK_RX_DGRAMS);
-    self->count--;
+    /* Stream semantics: a short read consumes from tail_off and leaves the rest
+     * of this dgram queued (X11 is a byte stream; xcb reads the 8-byte setup
+     * prefix then the length*4 body in two reads). For a message-boundary
+     * (SEQPACKET) reader whose buffer >= the message, tail_off goes 0->len in
+     * one call, so behaviour is unchanged (Mojo reads whole messages). */
+    size_t avail = (size_t)(d->len - self->tail_off);
+    size_t copy  = avail < n ? avail : n;
+    if (copy && d->payload) memcpy(kbuf, d->payload + self->tail_off, copy);
+    self->tail_off = (uint16_t)(self->tail_off + copy);
+    if (self->tail_off >= d->len) {              /* fully consumed -> advance */
+        if (d->payload) { kfree(d->payload); d->payload = 0; }
+        self->tail = (uint8_t)((self->tail + 1) % SOCK_RX_DGRAMS);
+        self->count--;
+        self->tail_off = 0;
+    }
     return (long)copy;
 }
 
 void sock_unix_peer_close(struct sock *self) {
     if (!self || self->kind != SOCK_KIND_UNIX) return;
+    if (self->x_server) return;                  /* no peer proc -- kernel side */
     if (self->peer_ip) {
         struct sock *peer = sock_by_fd((int)self->peer_ip - 1);
         if (peer && peer->in_use) {
@@ -243,6 +258,128 @@ void sock_unix_peer_close(struct sock *self) {
         }
         self->peer_ip = 0;
     }
+}
+
+/* ---- in-kernel fake X server (headless xcb_connect) ---------------- *
+ * ANGLE's Vulkan backend picks DisplayVkXcb on Linux and, after passing the WSI
+ * extension check, calls xcb_connect(). Headless tobyOS has no X server, so
+ * xcb_connect() fails (XCB_CONN_ERROR) -> ANGLE Display::initialize fails ->
+ * eglInitialize fails -> chrome calls a NULL GL dispatch and crashes. We do NOT
+ * need a real X server: chrome is --dump-dom / headless and never opens a
+ * window -- we only need the xcb_connect() HANDSHAKE to succeed. So a socket
+ * that connects to the X server address becomes an `x_server` loopback: when
+ * the client writes its xConnClientPrefix we reply with an xConnSetupSuccess
+ * advertising one 24-bit TrueColor screen/visual, which is all xcb_connect +
+ * DisplayVkXcb::initialize need (they then read the cached setup, no further
+ * round-trips). Anything the client writes afterwards is absorbed. */
+
+static inline void xput16(uint8_t *p, uint16_t v){ p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); }
+static inline void xput32(uint8_t *p, uint32_t v){
+    p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24);
+}
+
+#define XSRV_ROOT_ID    0x0000002bu
+#define XSRV_CMAP_ID    0x00000020u
+#define XSRV_VISUAL_ID  0x00000021u
+
+/* Build an X11 connection-setup "Success" reply (little-endian; chrome is x86,
+ * byteOrder 'l'). Returns the total byte length written, or 0 if it won't fit. */
+static size_t xserver_build_setup(uint8_t *o, size_t cap) {
+    const uint8_t nformats = 1, nscreens = 1, ndepths = 1, nvisuals = 1;
+    size_t body  = 32 + 8u*nformats + 40u*nscreens + 8u*ndepths + 24u*nvisuals;
+    size_t total = 8 + body;
+    if (total > cap) return 0;
+    memset(o, 0, total);
+    size_t i = 0;
+    /* xConnSetupPrefix (8) */
+    o[i++] = 1;                              /* success */
+    o[i++] = 0;                              /* lengthReason */
+    xput16(o+i, 11); i += 2;                 /* protocol-major-version */
+    xput16(o+i, 0);  i += 2;                 /* protocol-minor-version */
+    xput16(o+i, (uint16_t)(body/4)); i += 2; /* length of the data below, in 4-byte units */
+    /* xConnSetup (32) */
+    xput32(o+i, 0);            i += 4;        /* release-number */
+    xput32(o+i, XSRV_ROOT_ID+1); i += 4;     /* resource-id-base */
+    xput32(o+i, 0x001fffff);  i += 4;        /* resource-id-mask */
+    xput32(o+i, 0);           i += 4;        /* motion-buffer-size */
+    xput16(o+i, 0);           i += 2;        /* length of vendor (none) */
+    xput16(o+i, 0xffff);      i += 2;        /* maximum-request-length */
+    o[i++] = nscreens;                       /* number of SCREENs in roots */
+    o[i++] = nformats;                       /* number of pixmap FORMATs */
+    o[i++] = 0;                              /* image-byte-order = LSBFirst */
+    o[i++] = 0;                              /* bitmap-format-bit-order = LeastSignificant */
+    o[i++] = 32;                             /* bitmap-format-scanline-unit */
+    o[i++] = 32;                             /* bitmap-format-scanline-pad */
+    o[i++] = 8;                              /* min-keycode (must be >= 8) */
+    o[i++] = 255;                            /* max-keycode */
+    xput32(o+i, 0); i += 4;                  /* pad */
+    /* pixmap FORMAT (8): 24-bit depth, 32 bpp */
+    o[i++] = 24; o[i++] = 32; o[i++] = 32;   /* depth, bits-per-pixel, scanline-pad */
+    i += 5;                                  /* pad[5] */
+    /* SCREEN (40) */
+    xput32(o+i, XSRV_ROOT_ID);  i += 4;      /* root window */
+    xput32(o+i, XSRV_CMAP_ID);  i += 4;      /* default-colormap */
+    xput32(o+i, 0x00ffffff);    i += 4;      /* white-pixel */
+    xput32(o+i, 0x00000000);    i += 4;      /* black-pixel */
+    xput32(o+i, 0);             i += 4;      /* current-input-masks */
+    xput16(o+i, 1024); i += 2;               /* width-in-pixels */
+    xput16(o+i, 768);  i += 2;               /* height-in-pixels */
+    xput16(o+i, 270);  i += 2;               /* width-in-millimeters */
+    xput16(o+i, 203);  i += 2;               /* height-in-millimeters */
+    xput16(o+i, 1);    i += 2;               /* min-installed-maps */
+    xput16(o+i, 1);    i += 2;               /* max-installed-maps */
+    xput32(o+i, XSRV_VISUAL_ID); i += 4;     /* root-visual */
+    o[i++] = 0;                              /* backing-stores = Never */
+    o[i++] = 0;                              /* save-unders = False */
+    o[i++] = 24;                             /* root-depth */
+    o[i++] = ndepths;                        /* number of DEPTHs in allowed-depths */
+    /* DEPTH (8) */
+    o[i++] = 24;                             /* depth */
+    o[i++] = 0;                              /* pad */
+    xput16(o+i, nvisuals); i += 2;           /* number of VISUALTYPEs */
+    i += 4;                                  /* pad */
+    /* VISUALTYPE (24): TrueColor, 24-bit */
+    xput32(o+i, XSRV_VISUAL_ID); i += 4;     /* visual-id */
+    o[i++] = 4;                              /* class = TrueColor */
+    o[i++] = 8;                              /* bits-per-rgb-value */
+    xput16(o+i, 256); i += 2;                /* colormap-entries */
+    xput32(o+i, 0x00ff0000); i += 4;         /* red-mask */
+    xput32(o+i, 0x0000ff00); i += 4;         /* green-mask */
+    xput32(o+i, 0x000000ff); i += 4;         /* blue-mask */
+    i += 4;                                  /* pad */
+    return i;                                /* == total */
+}
+
+/* Client -> X server bytes. The only exchange we service is the initial
+ * connection setup; reply once, then absorb everything (headless ANGLE issues
+ * no further X requests before --dump-dom fires). */
+static long xserver_handle(struct sock *self, const void *buf, size_t n) {
+    (void)buf;
+    if (!self->x_setup_done) {
+        if (n < 12) return (long)n;          /* await the full xConnClientPrefix */
+        uint8_t reply[160];
+        size_t rlen = xserver_build_setup(reply, sizeof reply);
+        if (rlen) unix_enqueue(self, reply, rlen);   /* into our own rx ring */
+        self->x_setup_done = 1;
+        kprintf("[xsrv] setup: client sent %d bytes, replied %d bytes\n",
+                (int)n, (int)rlen);
+    }
+    return (long)n;                          /* absorb all client bytes */
+}
+
+/* Is `name` the X display :0 socket (filesystem or abstract)? */
+static bool is_x0_socket(const char *name) {
+    return name && strcmp(name, "/tmp/.X11-unix/X0") == 0;
+}
+
+int sock_unix_connect_named(struct sock *s, const char *name, bool abstract) {
+    (void)abstract;                          /* abstract + filesystem share a name */
+    if (!s || s->kind != SOCK_KIND_UNIX) return -22;   /* -EINVAL */
+    if (!is_x0_socket(name)) return -111;    /* -ECONNREFUSED: only the X socket */
+    s->x_server     = 1;
+    s->x_setup_done = 0;
+    s->peer_ip      = 0;                      /* no real peer; x_server gates I/O */
+    return 0;
 }
 
 /* Allocate a connected pair of AF_UNIX endpoints (socketpair(2)). Returns 0 and
