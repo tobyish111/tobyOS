@@ -351,13 +351,18 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     memcpy(child->name, tg->name, nlen);
     child->name[nlen] = '+'; child->name[nlen + 1] = 'T'; child->name[nlen + 2] = '\0';
 
-    /* Clone the fd handles (shares the underlying open descriptions). */
+    /* CLONE_FILES: a thread SHARES the thread-group leader's fd table -- it does
+     * NOT get its own copy. All runtime fd access routes through proc_fds()
+     * (syscall.c), which returns the leader's fds[] for a thread. Leave the
+     * child's own fds[] EMPTY (the memcpy above copied the parent's pointers --
+     * clear them) so the thread's exit never closes the shared open
+     * descriptions, and so an fd created on any thread is visible to all.
+     * (Copying, as fork does, made chrome's IO-thread epoll/socket fds invisible
+     * to worker threads -> NULL handle -> a timing-dependent NULL-pointer call.) */
     for (int i = 0; i < PROC_NFDS; i++)
-        child->fds[i] = parent->fds[i] ? file_clone(parent->fds[i]) : NULL;
+        child->fds[i] = NULL;
 
     if (!build_fork_kstack(child)) {
-        for (int i = 0; i < PROC_NFDS; i++)
-            if (child->fds[i]) file_close(child->fds[i]);
         memset(child, 0, sizeof(*child));
         child->state = PROC_UNUSED;
         return -ABI_ENOMEM;

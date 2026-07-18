@@ -246,6 +246,18 @@ static void default_exception(struct regs *r) {
             from_user ? "  (in user mode)" : "");
     dump_regs(r);
 
+    /* Chromium bring-up: on a fatal USER fault in a Linux-personality process,
+     * dump the recent-syscall ring (src/syscall.c) -- cheap crash context vs the
+     * full -DLINUX_SYSCALL_TRACE firehose when a program has already made 20k+
+     * calls. Shows what the faulting thread was doing right before it died. */
+    if (from_user) {
+        struct proc *cp = current_proc();
+        if (cp && cp->personality == 1 /* ABI_PERS_LINUX */) {
+            extern void lx_dump_recent_syscalls(void);
+            lx_dump_recent_syscalls();
+        }
+    }
+
     /* SMEP diagnostic: a supervisor-mode #PF with the instruction-fetch bit
      * set (err bit 4) on a present user page means the kernel jumped INTO a
      * user-mapped page. This is the AP-first-run / argc>=1 / SMAP bug. Surface
