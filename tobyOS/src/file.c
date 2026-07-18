@@ -240,6 +240,8 @@ void file_close(struct file *f) {
         }
         break;
     case FILE_KIND_SOCKET:
+        if (f->sock && f->sock->kind == SOCK_KIND_UNIX)
+            sock_unix_peer_close(f->sock);   /* wake peer's blocked recv -> EOF */
         sock_close(f->sock);
         break;
     case FILE_KIND_WINDOW:
@@ -299,6 +301,11 @@ long file_read(struct file *f, void *buf, size_t n) {
                                       f->sock->recv_timeout_ms);
             return (r == EINTR_RET) ? -1 : (r < 0 ? 0 : r);
         }
+        if (f->sock && f->sock->kind == SOCK_KIND_UNIX) {
+            /* AF_UNIX socketpair: block for one message (0 = EOF/peer closed). */
+            long r = sock_unix_recv(f->sock, buf, n, 0);
+            return (r == EINTR_RET) ? -1 : r;
+        }
         return -2;
     case FILE_KIND_WINDOW:
         /* Windows are drawn via SYS_GUI_FILL/TEXT and event-polled via
@@ -344,6 +351,10 @@ long file_write(struct file *f, const void *buf, size_t n) {
             long w = sock_sendto(f->sock, buf, n,
                                  f->sock->peer_ip, f->sock->peer_port);
             return (w < 0) ? -1 : w;
+        }
+        if (f->sock && f->sock->kind == SOCK_KIND_UNIX) {
+            /* AF_UNIX socketpair: deliver one message to the peer. */
+            return sock_unix_send(f->sock, buf, n);
         }
         return -2;
     case FILE_KIND_WINDOW:

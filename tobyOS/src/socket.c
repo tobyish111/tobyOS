@@ -64,7 +64,8 @@ static struct sock *sock_by_fd(int fd) {
 }
 
 struct sock *sock_alloc(int kind) {
-    if (kind != SOCK_KIND_UDP && kind != SOCK_KIND_TCP) return 0;
+    if (kind != SOCK_KIND_UDP && kind != SOCK_KIND_TCP &&
+        kind != SOCK_KIND_UNIX) return 0;
     for (int i = 0; i < SOCK_MAX; i++) {
         if (!g_socks[i].in_use) {
             memset(&g_socks[i], 0, sizeof(g_socks[i]));
@@ -159,6 +160,103 @@ void sock_deliver(struct sock *s,
     s->count++;
 
     wq_wake_all(&s->wq_recv);
+}
+
+/* ---- AF_UNIX socketpair (Chromium Mojo IPC) -------------------- *
+ * Two SOCK_KIND_UNIX endpoints cross-linked via `peer_ip` (= peer pool index
+ * + 1; 0 = peer closed). A write enqueues ONE message into the peer's dgram
+ * ring (SEQPACKET: message boundaries preserved), a read dequeues one from our
+ * own. Purely in-memory -- no NIC, no CAP_NET. kbuf is a KERNEL buffer (sys_
+ * read/write bounce user data first). Messages cap at 65535 (dgram len is a
+ * uint16_t); Mojo's control frames are far smaller. No SCM_RIGHTS yet. */
+static void unix_enqueue(struct sock *s, const void *payload, size_t len) {
+    if (!s || !s->in_use) return;
+    if (len > 65535) len = 65535;
+    if (s->count == SOCK_RX_DGRAMS) {            /* ring full: drop oldest */
+        struct sock_dgram *old = &s->dgrams[s->tail];
+        if (old->payload) { kfree(old->payload); old->payload = 0; }
+        s->tail = (uint8_t)((s->tail + 1) % SOCK_RX_DGRAMS);
+        s->count--; s->dropped++;
+    }
+    uint8_t *copy = (uint8_t *)kmalloc(len ? len : 1);
+    if (!copy) return;
+    if (len) memcpy(copy, payload, len);
+    struct sock_dgram *d = &s->dgrams[s->head];
+    d->src_ip = 0; d->src_port = 0; d->len = (uint16_t)len; d->payload = copy;
+    s->head = (uint8_t)((s->head + 1) % SOCK_RX_DGRAMS);
+    s->count++;
+    wq_wake_all(&s->wq_recv);
+}
+
+long sock_unix_send(struct sock *self, const void *kbuf, size_t n) {
+    if (!self || !self->in_use || self->kind != SOCK_KIND_UNIX) return -1;
+    if (self->peer_ip == 0) return -32;          /* -EPIPE: peer closed */
+    struct sock *peer = sock_by_fd((int)self->peer_ip - 1);
+    if (!peer || !peer->in_use || peer->kind != SOCK_KIND_UNIX) {
+        self->peer_ip = 0;
+        return -32;                              /* -EPIPE */
+    }
+    unix_enqueue(peer, kbuf, n);
+    return (long)n;
+}
+
+long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms) {
+    if (!self || !self->in_use || self->kind != SOCK_KIND_UNIX) return -1;
+    if (!kbuf && n) return -1;
+
+    uint64_t deadline = 0;
+    if (timeout_ms) {
+        uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
+        deadline = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
+    }
+    while (self->count == 0) {
+        struct proc *me = current_proc();
+        if (me->pending_signals) return EINTR_RET;
+        if (!self->in_use)       return -1;
+        if (self->peer_ip == 0)  return 0;       /* peer closed + drained -> EOF */
+        if (deadline && pit_ticks() >= deadline) return 0;   /* timed out */
+        /* Cooperative wait: drop the BKL so the peer thread can run + deliver
+         * (unix_enqueue wakes wq_recv), idle, then re-check. */
+        bool had_bkl = bkl_held();
+        if (had_bkl) bkl_exit();
+        sti();
+        hlt();
+        if (had_bkl) bkl_enter();
+    }
+
+    struct sock_dgram *d = &self->dgrams[self->tail];
+    size_t copy = d->len < n ? d->len : n;       /* SEQPACKET: one msg per read */
+    if (copy && d->payload) memcpy(kbuf, d->payload, copy);
+    if (d->payload) { kfree(d->payload); d->payload = 0; }
+    self->tail = (uint8_t)((self->tail + 1) % SOCK_RX_DGRAMS);
+    self->count--;
+    return (long)copy;
+}
+
+void sock_unix_peer_close(struct sock *self) {
+    if (!self || self->kind != SOCK_KIND_UNIX) return;
+    if (self->peer_ip) {
+        struct sock *peer = sock_by_fd((int)self->peer_ip - 1);
+        if (peer && peer->in_use) {
+            peer->peer_ip = 0;                   /* our slot is going away */
+            wq_wake_all(&peer->wq_recv);         /* wake its blocked recv -> EOF */
+        }
+        self->peer_ip = 0;
+    }
+}
+
+/* Allocate a connected pair of AF_UNIX endpoints (socketpair(2)). Returns 0 and
+ * sets *out_a/*out_b, or -1 if the pool is exhausted. */
+int sock_unix_pair(struct sock **out_a, struct sock **out_b) {
+    struct sock *a = sock_alloc(SOCK_KIND_UNIX);
+    if (!a) return -1;
+    struct sock *b = sock_alloc(SOCK_KIND_UNIX);
+    if (!b) { sock_close(a); return -1; }
+    a->peer_ip = (uint32_t)(sock_index(b) + 1);
+    b->peer_ip = (uint32_t)(sock_index(a) + 1);
+    *out_a = a;
+    *out_b = b;
+    return 0;
 }
 
 /* ---- UDP syscall surface --------------------------------------- */
