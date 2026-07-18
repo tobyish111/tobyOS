@@ -4053,6 +4053,7 @@ enum {
     LX_uname = 63, LX_fcntl = 72, LX_getcwd = 79, LX_chdir = 80,
     LX_mkdir = 83, LX_unlink = 87, LX_getuid = 102, LX_getgid = 104,
     LX_geteuid = 107, LX_getegid = 108, LX_getppid = 110,
+    LX_prctl = 157,
     LX_arch_prctl = 158, LX_gettid = 186, LX_tkill = 200, LX_futex = 202,
     LX_getdents64 = 217, LX_set_tid_address = 218, LX_clock_gettime = 228,
     LX_exit_group = 231, LX_tgkill = 234, LX_openat = 257,
@@ -5498,6 +5499,31 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         }
         return total;
     }
+
+    /* prctl(2): per-thread/-process knobs. We don't model most of them, but the
+     * common SET options are safe accept-and-ignore no-ops (return 0). Notably
+     * PR_SET_VMA (0x53564d41, anon-VMA naming for /proc/maps) -- Chromium/V8 name
+     * every cage/arena region; PR_SET_NAME (thread name), PR_SET_PDEATHSIG,
+     * PR_SET_DUMPABLE, PR_SET_PTRACER, PR_SET_KEEPCAPS, PR_SET_TIMERSLACK,
+     * PR_SET_NO_NEW_PRIVS, PR_SET_CHILD_SUBREAPER. Unknown options fall through
+     * to the named -ENOSYS log so real gaps still surface. */
+    case LX_prctl:
+        switch ((unsigned long)a1) {
+        case 0x53564d41:   /* PR_SET_VMA (name an anonymous VMA) */
+        case 1:            /* PR_SET_PDEATHSIG */
+        case 4:            /* PR_SET_DUMPABLE */
+        case 8:            /* PR_SET_KEEPCAPS */
+        case 15:           /* PR_SET_NAME */
+        case 29:           /* PR_SET_TIMERSLACK */
+        case 36:           /* PR_SET_CHILD_SUBREAPER */
+        case 38:           /* PR_SET_NO_NEW_PRIVS */
+        case 0x59616d61:   /* PR_SET_PTRACER (Yama) */
+            return 0;
+        default:
+            kprintf("[linux] UNHANDLED prctl option 0x%lx comm=%s -> -ENOSYS\n",
+                    (unsigned long)a1, current_proc()->name);
+            return -ABI_ENOSYS;
+        }
 
     /* ---- TLS setup: Linux libc startup calls arch_prctl(ARCH_SET_FS) ---- */
     case LX_arch_prctl:

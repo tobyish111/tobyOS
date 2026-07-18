@@ -26,7 +26,47 @@ macros emit `asm("int3")`; tobyOS wired all IDT vectors DPL 0, so a user-mode
 (chrome installs no SIGTRAP handler this early, so the default action terminates
 it — correct POSIX behaviour). No boot regression, no panic.
 
-## Slice 2 — the next measured wall: **V8's virtual-memory cage** (open)
+## Slice 2 — V8's virtual-memory cage (DONE, verified)
+
+**Two fixes in `src/mmap.c` (+ `prctl` in syscall.c):**
+
+1. **`sys_mmap` skips the eager-commit loop for `PROT_NONE` anon** — a PROT_NONE
+   mapping is an address-space *reservation*, not usable memory. V8's cage
+   reserves e.g. 32 GiB `PROT_NONE`; eager-committing = 8.3M `pmm_alloc_page` →
+   instant OOM. Now it records the VMA and commits nothing; `mmap_handle_page_
+   fault` demand-zero-fills after an `mprotect` raises the perm.
+2. **`mmap_handle_page_fault` now sets the editor root to `p->cr3`** before its
+   `vmm_map`/`vmm_unmap`/`vmm_translate`. `vmm_map` edits the *global*
+   `g_pml4_phys`, which between syscalls is the **kernel** PML4 — so the demand
+   page for a cage slice landed in the wrong address space and the process
+   re-faulted forever → SIGSEGV. `page_fault.c`'s COW/demand path already did
+   this; `mmap_handle_page_fault` didn't. **Latent kernel bug**, never hit until
+   a Linux process first demand-paged through this path (chrome's cage:
+   reserve huge PROT_NONE → mprotect a 4 KB slice RW → touch it).
+3. `prctl(2)` — accept-and-ignore the common SET options (incl. `PR_SET_VMA`
+   0x53564d41, which V8 uses to name every cage/arena region for `/proc/maps`);
+   unknown options still self-identify.
+
+**Verified:** the cage `EXCEPTION 14` is gone (count 0); chrome now runs **753
+syscalls** (was 557), through V8's entire `VirtualMemoryCage`/PartitionAlloc
+setup (reserve 64 GiB → trim to align → 16 GiB cage → mprotect slices RW →
+touch). The trace shows the reserve/mprotect/touch dance now succeeding.
+
+## Slice 3 — the next wall: **AF_UNIX `socketpair` (Mojo IPC)** (open)
+
+Chrome now int3s right after `socketpair(AF_UNIX, SOCK_SEQPACKET)` (syscall 53)
+returns `-ENOSYS`. Chromium's **Mojo IPC** builds its message pipes on AF_UNIX
+`socketpair`s; the `CHECK` on that failing is the current fatal wall. Also
+non-fatal-but-worth-filling now that chrome reaches them: `gettimeofday(96)`,
+`statfs(137)`/`fstatfs(138)`, `prctl` reads `PR_CAPBSET_READ(23)`/
+`PR_GET_DUMPABLE(3)`.
+
+The meat is **AF_UNIX domain sockets**: a bidirectional in-process channel (two
+ring buffers, crossed) as a new `FILE_KIND`, wired into read/write/close/poll.
+Watch for whether Mojo then needs **SCM_RIGHTS** (fd passing over the socket) —
+`--single-process` may avoid most of it; measure before building it.
+
+## Original analysis (superseded by slices above)
 
 With `int3` fixed, chrome runs **557 syscalls / ~2.5 s CPU**, then the
 `-DLINUX_SYSCALL_TRACE` firehose shows the last syscalls before the trap:

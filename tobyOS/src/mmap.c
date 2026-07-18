@@ -185,8 +185,16 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
     v->fd     = fd;
     v->offset = offset;
 
-    /* For anonymous: allocate immediately (compatible with existing code) */
-    if (flags & VMA_FLAG_ANON) {
+    /* For anonymous: eager-commit every page (compatible with existing code) --
+     * EXCEPT a PROT_NONE mapping, which is an address-space RESERVATION, not
+     * usable memory. V8's VirtualMemoryCage / PartitionAlloc reserve huge
+     * PROT_NONE regions (e.g. 32 GiB) up front and commit sub-ranges later via
+     * mprotect; eager-committing those pages instantly OOMs (8.3M pmm_alloc_page
+     * for 32 GiB). Leave a PROT_NONE anon region UNCOMMITTED: the VMA is
+     * recorded here, and mmap_handle_page_fault() demand-zero-fills on first
+     * touch AFTER an mprotect has raised v->prot to a usable permission (a touch
+     * while still PROT_NONE correctly can't be satisfied -> SIGSEGV). */
+    if ((flags & VMA_FLAG_ANON) && prot != VMA_PROT_NONE) {
         uint32_t vmm_f = prot_to_vmm_flags(prot);
         uint64_t saved_root = vmm_set_editor_root(p->cr3);
         for (uint64_t a = base; a < base + len; a += PAGE_SIZE) {
@@ -424,15 +432,23 @@ bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     struct mmap_vma *v = vma_find_internal(vt, fault_addr);
     if (!v) return false;
 
+    /* vmm_map/vmm_unmap/vmm_translate edit the GLOBAL editor root (g_pml4_phys),
+     * which between syscalls is the kernel PML4 -- NOT the faulting process. We
+     * MUST retarget it to p->cr3 so the demand page lands in THIS process's
+     * address space (page_fault.c's COW/demand path does exactly this). Without
+     * it the page maps into the wrong PML4 and the process re-faults forever ->
+     * SIGSEGV. Latent until a Linux process first demand-paged through here (V8's
+     * PROT_NONE cage: reserve huge, mprotect a slice RW, touch it). */
     bool is_write = (error_code & 0x2) != 0;
     if (is_write && !(v->prot & VMA_PROT_WRITE)) {
         if (v->flags & VMA_FLAG_COW) {
             uint64_t page_va = page_align_down(fault_addr);
+            uint64_t saved_root = vmm_set_editor_root(p->cr3);
             uint64_t old_phys = vmm_translate(page_va);
-            if (!old_phys) return false;
+            if (!old_phys) { vmm_set_editor_root(saved_root); return false; }
 
             uint64_t new_phys = pmm_alloc_page();
-            if (!new_phys) return false;
+            if (!new_phys) { vmm_set_editor_root(saved_root); return false; }
 
             memcpy((void *)(new_phys + vmm_hhdm_offset()),
                    (void *)(old_phys + vmm_hhdm_offset()),
@@ -441,6 +457,7 @@ bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
             uint32_t vmm_f = prot_to_vmm_flags(v->prot | VMA_PROT_WRITE);
             vmm_unmap(page_va, PAGE_SIZE);
             vmm_map(page_va, new_phys, PAGE_SIZE, vmm_f);
+            vmm_set_editor_root(saved_root);
 
             v->flags &= ~VMA_FLAG_COW;
             v->prot |= VMA_PROT_WRITE;
@@ -457,7 +474,9 @@ bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     memset((void *)(phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
 
     uint32_t vmm_f = prot_to_vmm_flags(v->prot);
+    uint64_t saved_root = vmm_set_editor_root(p->cr3);
     vmm_map(page_va, phys, PAGE_SIZE, vmm_f);
+    vmm_set_editor_root(saved_root);
     return true;
 }
 
