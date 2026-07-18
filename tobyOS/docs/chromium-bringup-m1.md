@@ -398,15 +398,54 @@ same gap makes D-Bus fail earlier (`Failed to open socket: Invalid argument`).
 The harness now commits the loader route (`--use-gl=angle --use-angle=vulkan
 --enable-unsafe-swiftshader` + `VK_ICD_FILENAMES` + `DISPLAY=:0`).
 
-## Slice 13 — minimal fake X server over named AF_UNIX (OPEN, current front)
+## Slice 13 — in-kernel fake X server over AF_UNIX → GL INITIALIZES (DONE)
 
-The remaining blocker is now concrete and NOT the "surfaceless ANGLE / headless
-ICD" the slice-11 deep-dive imagined: ANGLE's `DisplayVkXcb::initialize` needs a
-live `xcb_connect()`. Plan: (1) named/abstract AF_UNIX (`bind`/`listen`/`accept`/
-`connect` on `sockaddr_un`, reusing `src/socket.c`'s `SOCK_KIND_UNIX` rings) —
-this also unblocks D-Bus; (2) a minimal fake X server answering the X11
-connection-setup handshake (`xConnClientPrefix` → `xConnSetupSuccess` with ≥1
-screen/depth/visual) at `/tmp/.X11-unix/X0` so `xcb_connect` succeeds. Chrome is
-headless (`--dump-dom`), so it never opens a real window — the handshake + a
-couple of local setup queries should suffice. Then `--dump-dom` should print
-`<h1>tobyOS</h1>`; then switch to `--screenshot` and host-diff.
+The blocker was concrete (not the imagined "surfaceless ANGLE"): ANGLE's
+`DisplayVkXcb::initialize` needs a live `xcb_connect()`, and tobyOS AF_UNIX was
+**socketpair-only**. Built the client + a fake server, entirely in-kernel:
+
+- **AF_UNIX `socket()` + `connect()`** (`src/syscall.c`): `lx_socket` now accepts
+  `AF_UNIX` (stream/dgram/seqpacket) → a `SOCK_KIND_UNIX` endpoint (this alone was
+  D-Bus's "Failed to open socket: Invalid argument"). `lx_connect` parses
+  `sockaddr_un` (filesystem **and** abstract, `sun_path[0]=='\0'`).
+- **In-kernel fake X server** (`src/socket.c`): connecting to `/tmp/.X11-unix/X0`
+  flags the socket `x_server`; when the client writes its `xConnClientPrefix`, the
+  kernel replies with a valid `xConnSetupSuccess` (one 24-bit TrueColor
+  screen/depth/visual) into the socket's own rx ring. Headless chrome never opens
+  a window, so the handshake is enough. Reuses the `SOCK_KIND_UNIX` dgram ring; no
+  separate process/scheduling.
+- **Stream (partial-consume) recv** (`src/socket.c`): X11 is a byte stream — xcb
+  reads the 8-byte setup prefix then the `length*4` body in two reads. The old
+  SEQPACKET recv discarded a dgram's unread tail; added `tail_off` so a short read
+  leaves the remainder queued. (Behaviour is unchanged for Mojo, which reads whole
+  messages.)
+- **`recvmsg`/`recvfrom`/`recv` on AF_UNIX** (`src/syscall.c`): the actual wall
+  after connect — `lx_recvmsg`/`lx_recv` returned `ENOTSOCK` for `SOCK_KIND_UNIX`,
+  so xcb (which reads via `recvmsg`, and the setup via `read`/`recv`) never saw the
+  reply → `xcb_connect()` reported `XCB_CONN_ERROR`. Instrument-first pinned it: a
+  per-recv trace showed the reply was **written but never read**. Routed all three
+  read paths (+ `sendmsg`) through `sock_unix_send`/`_recv`.
+
+**Result (measured):** `[xsrv] setup: client sent 12 bytes, replied 120 bytes` →
+xcb reads `8` then `112` → **`xcb_connect()` succeeds, `eglInitialize` succeeds,
+every GL/EGL/ANGLE/Vulkan error is GONE** (was many). SwiftShader's Vulkan device
+initializes through the fake X server — the entire GL-init wall from slices 9-12
+is cleared. **GOTCHA: struct sock grew (tail_off/x_server/x_setup_done) → clean
+build required** (`logs/chromium-m0-clean.sh`); an incremental build boot-hung
+early until a clean rebuild. Permanent instrument kept: the one-line `[xsrv]
+setup` on first handshake.
+
+## Slice 14 — shared-memory inode identity (OPEN, current front)
+
+Past GL, chrome now dies ~0.2s later at
+`platform_shared_memory_region_posix.cc:259: Writable and read-only inodes don't
+match; bailing` → the same NULL-dispatch crash downstream. With
+`--disable-dev-shm-usage`, chrome creates a temp file under `TMPDIR=/data`, opens
+it **twice** (O_RDWR then O_RDONLY by the same path), `fstat`s both and requires
+`st_dev`+`st_ino` to match. tobyOS reports `st_dev=1` (matches) but `st_ino =
+hash(vfs_file.priv)` (`lx_fd_ino`), and two opens of the same tobyfs path get
+distinct `priv` nodes → mismatched inodes. Fix options: expose a real per-file
+inode number through `vfs_stat` (correct, but plumbs an `ino` field through every
+fs driver), or derive `st_ino` from the file's canonical path (localized, but must
+not regress ld.so's node-pointer dedup for symlinked libs). Then `--dump-dom`
+should finally print `<h1>tobyOS</h1>`.

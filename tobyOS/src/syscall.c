@@ -4487,9 +4487,11 @@ static short file_poll_ready(struct file *f) {
             r |= LXP_POLLOUT;                    /* UDP/UNIX: assume sendable */
             if (f->sock && f->sock->count > 0) r |= LXP_POLLIN;  /* rx queued */
             /* AF_UNIX socketpair: a closed peer makes us readable (EOF) + HUP,
-             * so Mojo's epoll loop detects disconnect. */
+             * so Mojo's epoll loop detects disconnect. The fake-X-server loopback
+             * has no peer proc (peer_ip==0 by design) -- it is readable only when
+             * it has actually queued a reply, never HUP. */
             if (f->sock && f->sock->kind == SOCK_KIND_UNIX &&
-                f->sock->peer_ip == 0)
+                f->sock->peer_ip == 0 && !f->sock->x_server)
                 r |= LXP_POLLIN | LXP_POLLHUP;
         }
         break;
@@ -4752,6 +4754,21 @@ static long lx_eventfd(unsigned int initval, unsigned int flags) {
 
 static long lx_socket(int domain, int type, int proto) {
     (void)proto;
+    /* AF_UNIX stream/seqpacket/dgram: an in-memory IPC endpoint (SOCK_KIND_UNIX),
+     * NOT networking -> no CAP_NET. Left unconnected until connect() (named X
+     * socket) or handed to socketpair(). Chrome opens these for Mojo, D-Bus, and
+     * ANGLE's xcb_connect(); returning EINVAL here was exactly D-Bus's "Failed to
+     * open socket: Invalid argument" and blocked xcb from even trying. */
+    if (domain == AF_UNIX) {
+        int ut = type & 0xff;
+        if (ut != SOCK_STREAM && ut != SOCK_DGRAM && ut != SOCK_SEQPACKET)
+            return -ABI_EINVAL;
+        struct sock *us = sock_alloc(SOCK_KIND_UNIX);
+        if (!us) return -ABI_EMFILE;
+        int ufd = lx_sock_install(us);
+        if (ufd < 0) { sock_close(us); return -ABI_EMFILE; }
+        return ufd;
+    }
     /* We only implement IPv4. musl's getaddrinfo opens an AF_INET6 DNS socket
      * first and falls back to AF_INET *only* on EAFNOSUPPORT -- returning
      * EINVAL there made the fallback never happen (wget: "bad address"). */
@@ -4848,9 +4865,40 @@ static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen) {
 static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
+    if (!uaddr || alen < 2) return -ABI_EFAULT;
+
+    uint16_t fam = 0;
+    if (copy_from_user(&fam, (const void *)(uintptr_t)uaddr, sizeof fam) != 0)
+        return -ABI_EFAULT;
+
+    /* AF_UNIX: connect to a named/abstract path. sockaddr_un = { u16 family;
+     * char sun_path[108]; }. Abstract sockets have sun_path[0]=='\0' and the
+     * name is the following (non-NUL-terminated) bytes; xcb tries the abstract
+     * "@/tmp/.X11-unix/X0" first, then the filesystem path. Only the X socket is
+     * served (as an in-kernel fake X server, see sock_unix_connect_named). */
+    if (fam == AF_UNIX) {
+        if (s->kind != SOCK_KIND_UNIX) return -ABI_EINVAL;
+        uint8_t ua[112];
+        uint32_t rd = alen > sizeof(ua) ? (uint32_t)sizeof(ua) : alen;
+        memset(ua, 0, sizeof ua);
+        if (copy_from_user(ua, (const void *)(uintptr_t)uaddr, rd) != 0)
+            return -ABI_EFAULT;
+        const char *sun = (const char *)ua + 2;
+        uint32_t pathlen = rd > 2 ? rd - 2 : 0;
+        bool abstract = (pathlen > 0 && sun[0] == '\0');
+        char name[109];
+        uint32_t nlen = abstract ? (pathlen - 1) : pathlen;
+        const char *src = abstract ? sun + 1 : sun;
+        if (nlen > sizeof(name) - 1) nlen = sizeof(name) - 1;
+        memcpy(name, src, nlen);
+        name[nlen] = '\0';                        /* strcmp stops at any embedded NUL */
+        int rc = sock_unix_connect_named(s, name, abstract);
+        return rc == 0 ? 0 : -LXE_ECONNREFUSED;
+    }
+
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
-    if (alen < 8 || !uaddr ||
+    if (alen < 8 ||
         copy_from_user(&sa, (const void *)(uintptr_t)uaddr, sizeof sa) != 0)
         return -ABI_EFAULT;
     if (sa.sin_family != AF_INET) return -ABI_EINVAL;
@@ -4955,6 +5003,23 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr, uint64_t 
             if (ualen) { uint32_t al = (uint32_t)sizeof sa;
                          (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
         }
+        return rv;
+    }
+
+    if (s->kind == SOCK_KIND_UNIX) {
+        /* AF_UNIX stream recv()/recvfrom(): libxcb reads the X setup this way on
+         * some builds. Block like read() (xcb polls readable first). */
+        if (len == 0) return 0;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k = kmalloc(len);
+        if (!k) return -ABI_ENOMEM;
+        long n = sock_unix_recv(s, k, len, 0);
+        long rv;
+        if (n == EINTR_RET) rv = -LXE_EINTR;
+        else if (n < 0)     rv = -LXE_EAGAIN;
+        else if (copy_to_user((void *)(uintptr_t)ubuf, k, (size_t)n) != 0) rv = -ABI_EFAULT;
+        else rv = n;
+        kfree(k);
         return rv;
     }
 
@@ -5130,6 +5195,11 @@ static long lx_sendmsg(int fd, uint64_t umsg, int flags) {
     } else if (s->kind == SOCK_KIND_TCP && s->tcp) {
         long n = total ? tcp_send(s->tcp, k, total) : 0;
         rv = (n < 0) ? -ABI_EPIPE : n;
+    } else if (s->kind == SOCK_KIND_UNIX) {
+        /* AF_UNIX stream: libxcb + D-Bus write via sendmsg (not just writev).
+         * Ancillary data (SCM_RIGHTS) is not delivered -- no fd passing yet. */
+        long n = sock_unix_send(s, k, total);
+        rv = (n < 0) ? -ABI_EPIPE : n;
     } else {
         rv = -LXE_ENOTSOCK;
     }
@@ -5165,6 +5235,16 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
         n = tcp_recv(s->tcp, k, total, to);
         if (n == -1)      n = 0;                 /* peer closed -> EOF */
         else if (n < 0)   { kfree(k); return -LXE_ECONNREFUSED; }
+    } else if (s->kind == SOCK_KIND_UNIX) {
+        /* AF_UNIX stream: libxcb reads the X setup + events via recvmsg (this was
+         * the wall -- ENOTSOCK here made xcb_connect() report XCB_CONN_ERROR even
+         * though the writev'd request + our fake-X reply were fine). MSG_DONTWAIT
+         * (0x40) -> non-blocking poll; otherwise block like read(). */
+        uint32_t to = (flags & 0x40) ? 1u : 0u;
+        n = sock_unix_recv(s, k, total, to);
+        if (n == EINTR_RET)            { kfree(k); return -LXE_EINTR; }
+        if (n < 0)                     { kfree(k); return -LXE_EAGAIN; }
+        if (n == 0 && (flags & 0x40))  { kfree(k); return -LXE_EAGAIN; }
     } else {
         kfree(k);
         return -LXE_ENOTSOCK;
