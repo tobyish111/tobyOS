@@ -4068,8 +4068,10 @@ enum {
     LX_socket = 41, LX_connect = 42, LX_accept = 43, LX_sendto = 44,
     LX_recvfrom = 45, LX_sendmsg = 46, LX_recvmsg = 47,
     LX_shutdown = 48, LX_bind = 49, LX_listen = 50,
-    LX_getsockname = 51, LX_getpeername = 52, LX_setsockopt = 54,
+    LX_getsockname = 51, LX_getpeername = 52, LX_socketpair = 53,
+    LX_setsockopt = 54,
     LX_getsockopt = 55, LX_accept4 = 288,
+    LX_gettimeofday = 96, LX_statfs = 137, LX_fstatfs = 138,
     /* B17: real busybox network clients arm an alarm-timeout (setitimer) around
      * each network op and ftruncate the wget output file. */
     LX_ftruncate = 77, LX_getitimer = 36, LX_setitimer = 38,
@@ -4389,8 +4391,13 @@ static short file_poll_ready(struct file *f) {
                 if (tf & TCP_RDY_ERR)  r |= LXP_POLLERR;
             }
         } else {
-            r |= LXP_POLLOUT;                    /* UDP: assume sendable */
+            r |= LXP_POLLOUT;                    /* UDP/UNIX: assume sendable */
             if (f->sock && f->sock->count > 0) r |= LXP_POLLIN;  /* rx queued */
+            /* AF_UNIX socketpair: a closed peer makes us readable (EOF) + HUP,
+             * so Mojo's epoll loop detects disconnect. */
+            if (f->sock && f->sock->kind == SOCK_KIND_UNIX &&
+                f->sock->peer_ip == 0)
+                r |= LXP_POLLIN | LXP_POLLHUP;
         }
         break;
     case FILE_KIND_CONSOLE:                  /* B22: real TTY input readiness */
@@ -4668,6 +4675,32 @@ static long lx_socket(int domain, int type, int proto) {
     int fd = lx_sock_install(s);
     if (fd < 0) { sock_close(s); return -ABI_EMFILE; }
     return fd;
+}
+
+/* socketpair(2): AF_UNIX only. Chromium's Mojo IPC builds its message pipes on
+ * AF_UNIX socketpairs (SOCK_SEQPACKET on Linux). This is in-process IPC, not
+ * networking -- NO CAP_NET. Creates a connected pair of in-memory message
+ * endpoints (see sock_unix_* in socket.c) and writes the two fds to sv[2].
+ * SOCK_STREAM/DGRAM/SEQPACKET are all treated as message channels; the
+ * SOCK_CLOEXEC/NONBLOCK type bits are ignored. No SCM_RIGHTS (fd passing) yet. */
+static long lx_socketpair(int domain, int type, int proto, uint64_t usv) {
+    (void)proto;
+    if (domain != AF_UNIX) return -LXE_EAFNOSUPPORT;
+    int t = type & 0xff;
+    if (t != SOCK_STREAM && t != SOCK_DGRAM && t != SOCK_SEQPACKET)
+        return -ABI_EINVAL;
+
+    struct sock *a = 0, *b = 0;
+    if (sock_unix_pair(&a, &b) != 0) return -ABI_EMFILE;   /* pool exhausted */
+
+    int fd0 = lx_sock_install(a);
+    if (fd0 < 0) { sock_close(a); sock_close(b); return -ABI_EMFILE; }
+    int fd1 = lx_sock_install(b);
+    if (fd1 < 0) { sock_close(b); return -ABI_EMFILE; }    /* fd0/a leak on rare OOM */
+
+    int fds[2] = { fd0, fd1 };
+    if (copy_to_user((void *)usv, fds, sizeof fds) != 0) return -ABI_EFAULT;
+    return 0;
 }
 
 static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
@@ -5241,7 +5274,19 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_getsockopt:  return lx_getsockopt((int)a1, (int)a2, (int)a3, (uint64_t)a4, (uint64_t)a5);
     case LX_getsockname: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
     case LX_getpeername: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
+    case LX_socketpair:  return lx_socketpair((int)a1, (int)a2, (int)a3, (uint64_t)a4);
     case LX_shutdown:    return 0;       /* half-close not modelled; close() tears down */
+
+    /* gettimeofday(2): fill timeval from the monotonic clock (no RTC epoch; the
+     * value increases, which is what chrome's timestamp deltas need). tz ign. */
+    case LX_gettimeofday:
+        if (a1) {
+            uint64_t ns = perf_now_ns();
+            long tv[2] = { (long)(ns / 1000000000ull),
+                           (long)((ns / 1000ull) % 1000000ull) };
+            if (copy_to_user((void *)a1, tv, sizeof tv) != 0) return -ABI_EFAULT;
+        }
+        return 0;
 
     /* ---- B13: poll / select / epoll (readiness multiplexing) ---- */
     case LX_poll:                  /* poll(fds, nfds, timeout_ms) */
@@ -5519,6 +5564,9 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         case 38:           /* PR_SET_NO_NEW_PRIVS */
         case 0x59616d61:   /* PR_SET_PTRACER (Yama) */
             return 0;
+        case 3:            /* PR_GET_DUMPABLE -> dumpable */
+        case 23:           /* PR_CAPBSET_READ -> cap present (we boot as root) */
+            return 1;
         default:
             kprintf("[linux] UNHANDLED prctl option 0x%lx comm=%s -> -ENOSYS\n",
                     (unsigned long)a1, current_proc()->name);

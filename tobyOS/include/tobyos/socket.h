@@ -14,17 +14,26 @@
 #include <tobyos/types.h>
 #include <tobyos/net.h>
 
-#define SOCK_MAX               16
-#define SOCK_RX_DGRAMS         8       /* per-socket UDP ring depth */
+#define SOCK_MAX               128     /* pool depth (chrome/Mojo makes many pairs) */
+#define SOCK_RX_DGRAMS         8       /* per-socket UDP/UNIX ring depth */
 
 #define SOCK_KIND_UDP          1
 #define SOCK_KIND_TCP          2
+#define SOCK_KIND_UNIX         3       /* AF_UNIX socketpair endpoint (Track B) */
 
 /* User-visible "domain"/"type" constants. */
+#define AF_UNIX                1
 #define AF_INET                2
 #define AF_INET6               10      /* not implemented; lx_socket -> EAFNOSUPPORT */
 #define SOCK_STREAM            1       /* TCP */
 #define SOCK_DGRAM             2       /* UDP */
+#define SOCK_SEQPACKET         5       /* AF_UNIX message socket (Mojo uses this) */
+
+/* AF_UNIX socketpair endpoints (Track B, Chromium Mojo IPC): a bidirectional
+ * in-memory message channel. Two SOCK_KIND_UNIX socks are cross-linked; each
+ * reuses `peer_ip` to hold the PEER's pool index + 1 (0 = peer closed). write
+ * enqueues one message into the peer's dgram ring, read dequeues one from our
+ * own (SEQPACKET: message boundaries preserved). Decls live below struct sock. */
 
 /* setsockopt/getsockopt levels + options (Linux x86-64 numeric values). */
 #define SOL_SOCKET             1
@@ -94,6 +103,12 @@ struct sock *sock_alloc(int kind);
 
 /* Free a socket. */
 void sock_close(struct sock *s);
+
+/* AF_UNIX socketpair (Chromium Mojo IPC) -- see the note above struct sock. */
+long sock_unix_send(struct sock *self, const void *kbuf, size_t n);
+long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms);
+void sock_unix_peer_close(struct sock *self);
+int  sock_unix_pair(struct sock **out_a, struct sock **out_b);
 
 /* Bind a socket to a local port (network byte order). */
 int sock_bind(struct sock *s, uint16_t port_be);

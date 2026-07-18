@@ -52,7 +52,37 @@ syscalls** (was 557), through V8's entire `VirtualMemoryCage`/PartitionAlloc
 setup (reserve 64 GiB → trim to align → 16 GiB cage → mprotect slices RW →
 touch). The trace shows the reserve/mprotect/touch dance now succeeding.
 
-## Slice 3 — the next wall: **AF_UNIX `socketpair` (Mojo IPC)** (open)
+## Slice 3 — AF_UNIX socketpair / Mojo IPC (DONE, verified)
+
+Implemented AF_UNIX `socketpair(2)` as a new socket kind (`SOCK_KIND_UNIX`): a
+bidirectional in-memory **message** channel (SEQPACKET). Two socks are
+cross-linked (each reuses `peer_ip` as the peer's pool index + 1); `write`
+enqueues one message into the peer's datagram ring, `read` dequeues one from its
+own; `poll` reports POLLIN/POLLOUT/POLLHUP; close wakes the peer to EOF.
+Reuses the existing `struct sock` datagram ring + `wq_recv` (no struct-layout
+change; bumped `SOCK_MAX` 16→128 for chrome's many pairs). Files:
+`socket.h`/`socket.c` (channel), `file.c` (read/write/close), `syscall.c`
+(`file_poll_ready` + `lx_socketpair` + `gettimeofday` + `prctl` reads). No
+`SCM_RIGHTS` (fd passing) yet — deferred until measured.
+
+**Verified — a huge leap:** chrome went **753 → 5,193 syscalls**, created the
+socketpairs, and **spawned 9+ threads** (shared-VM tgid=2), running deep into
+multi-threaded Mojo/`ThreadPool` bring-up.
+
+## Slice 4 — thread-pool/init syscall fills + a NULL-deref (open)
+
+Chrome now runs so far it needs a batch of small syscalls it didn't reach
+before, then a thread NULL-derefs (`EXCEPTION 14, cr2=0`). The prime suspects
+are the sizing syscalls returning `-ENOSYS`:
+- **`sched_getaffinity(204)`** — chrome sizes its `ThreadPool` from the CPU
+  affinity mask; an error here can yield 0 workers → NULL deref.
+- **`sysinfo(99)`** — total/free RAM for allocator sizing.
+- Trivial accepts: `setpriority(141)`/`getpriority(140)`, `getresuid(118)`/
+  `getresgid(120)`, `clock_getres(229)`, `statfs(137)`/`fstatfs(138)`,
+  `prctl PR_GET_NAME(16)`. `landlock_*(444…)` correctly stays `-ENOSYS`
+  (optional sandbox; chrome falls back).
+
+## Slice 2 — V8's virtual-memory cage (DONE, verified)
 
 Chrome now int3s right after `socketpair(AF_UNIX, SOCK_SEQPACKET)` (syscall 53)
 returns `-ENOSYS`. Chromium's **Mojo IPC** builds its message pipes on AF_UNIX
