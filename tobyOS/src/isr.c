@@ -17,6 +17,7 @@
 #include <tobyos/smp.h>
 #include <tobyos/percpu.h>   /* MAX_CPUS */
 #include <tobyos/signal.h>
+#include <tobyos/uaccess.h>  /* get_user_u64 -- SMAP-safe user stack read */
 
 /* During pid-0 bring-up, demand-map HHDM mirror gaps (UEFI memmap
  * holes, GOP framebuffer tagged RESERVED, freshly PMM'd pages). */
@@ -255,6 +256,32 @@ static void default_exception(struct regs *r) {
         if (cp && cp->personality == 1 /* ABI_PERS_LINUX */) {
             extern void lx_dump_recent_syscalls(void);
             lx_dump_recent_syscalls();
+
+            /* Chromium bring-up: dump the top of the user stack so the CALLER
+             * chain can be symbolized offline. Chrome is built
+             * -fomit-frame-pointer, so an rbp frame-walk is impossible; instead
+             * we raw-scan the stack and flag qwords that fall in the main PIE's
+             * runtime range [MAIN_BASE, MAIN_BASE+filesz] as candidate return
+             * addresses (symbolize with: objdump -d --start-address=<val-
+             * MAIN_BASE> chrome-headless-shell). MAIN_BASE=0x500000 is the
+             * confirmed load base (see docs/chromium-bringup-m1.md). The near-
+             * rsp stack is mapped (the thread just ran there), so the reads are
+             * safe; a genuinely unreadable slot stops the scan. */
+            enum { MAIN_BASE = 0x500000, MAIN_END = 0x0d000000, NSLOTS = 64 };
+            kprintf("[isr] user-stack dump (rsp=%p, MAIN_BASE=0x%x):\n",
+                    (void *)r->rsp, (unsigned)MAIN_BASE);
+            for (int i = 0; i < NSLOTS; i++) {
+                uint64_t a = r->rsp + (uint64_t)i * 8, v = 0;
+                if (get_user_u64(&v, (const void *)a) != 0) {
+                    kprintf("  [rsp+0x%03x] <unreadable> -- stop\n", i * 8);
+                    break;
+                }
+                if (v >= (uint64_t)MAIN_BASE && v < (uint64_t)MAIN_END)
+                    kprintf("  [rsp+0x%03x] %016lx  CODE main+0x%lx\n",
+                            i * 8, v, v - (uint64_t)MAIN_BASE);
+                else
+                    kprintf("  [rsp+0x%03x] %016lx\n", i * 8, v);
+            }
         }
     }
 
@@ -299,9 +326,20 @@ static void default_exception(struct regs *r) {
          * us TERMINATED, wakes the parent, and yields to the next
          * ready proc; the trap frame on this kstack is abandoned and
          * freed when the parent reaps. */
-        kprintf("[isr] user-mode fault -- terminating user process "
-                "pid=%d (rsp,rip both came from CPL=3)\n",
-                current_proc()->pid);
+        {
+            struct proc *fp = current_proc();
+            /* Chromium bring-up: surface this thread's cumulative page-fault
+             * count + last fault rip. The ~60s pre-crash "freeze" makes NO
+             * Linux syscalls yet burns little CPU -- if it is a demand-paging
+             * storm (faults go through isr.c, invisible to the syscall
+             * firehose), fault_count is huge here; if it is small, the freeze
+             * is an IPC/lock wait, not paging. */
+            kprintf("[isr] user-mode fault -- terminating user process "
+                    "pid=%d (rsp,rip both came from CPL=3) "
+                    "fault_count=%lu last_fault_rip=%p\n",
+                    fp->pid, (unsigned long)fp->fault_count,
+                    (void *)fp->last_fault_rip);
+        }
         proc_exit(-1);
         /* unreachable */
     }
