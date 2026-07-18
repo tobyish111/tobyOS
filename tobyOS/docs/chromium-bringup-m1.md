@@ -112,16 +112,36 @@ correctly sharing one table, chrome+Mojo exhaust it. Raised `PROC_NFDS` 16→**1
 **20,014 → 270,253 syscalls** — into real engine/rendering territory (fontconfig,
 SwANGLE GL init, dozens of threads).
 
-## Slice 6 — thread/proc table limit + init fills (open)
+## Slice 6 — thread/proc table limit + init fills (DONE, verified)
 
-Chrome now dies on `pthread_create: Resource temporarily unavailable (11)`
-(EAGAIN) — it wants ~30-50 threads but `PROC_MAX` is **64** (minus the boot
-procs), so `clone` runs out of proc slots → a NULL thread handle → NULL call.
-Raise `PROC_MAX`. Plus trivial fills chrome now reaches: `time(201)`,
-`fallocate(285)`, `statx(332)`, `inotify_add_watch(253)`. Also noted (non-fatal):
-fontconfig can't find its config file (text-shaping degraded, fine for
-`--dump-dom`), and SwANGLE `eglInitialize` fails (GL unavailable; headless DOM
-dump doesn't need it).
+- `PROC_MAX` 64→**256**: chrome spawns ~17+ threads (each a proc slot); 64 minus
+  the boot procs ran out → `clone` ENOMEM → `pthread_create` EAGAIN → NULL thread
+  handle. Raising it cleared the EAGAIN completely.
+- Fills: `statx(332)` (real, 256-byte struct from `vfs_stat` — glibc prefers it
+  over `newfstatat`), `time(201)`, `fallocate(285)` (accept), `inotify_add_watch
+  (253)`/`rm_watch(254)` (fake watch descriptors so callers proceed).
+
+**Verified:** `pthread_create` EAGAIN gone (0), the only remaining unhandled
+syscall is `landlock(444)` (correctly `-ENOSYS`). Chrome runs its full early
+platform bring-up — Mojo, `ThreadPool` (17 threads), fontconfig, and *gracefully*
+degrades the platform bits tobyOS lacks (all non-fatal `ERROR`s, chrome falls
+back): D-Bus connect (no named/`connect`-by-path AF_UNIX), `AF_NETLINK` socket,
+`/proc/sys/fs/inotify/max_user_watches`, SwANGLE `eglInitialize` (no GL).
+
+## Slice 7 — the remaining wall: a message-less `int3` `CHECK` (open, deep)
+
+Chrome now dies on a single `int3` (`EXCEPTION 3`) with **no `Check failed:`
+message** — a `DCHECK`/`NOTREACHED`/`IMMEDIATE_CRASH`. The crash point is
+**timing-dependent** (34k–270k syscalls across runs), and the recent-syscall ring
+shows a thread spinning on `futex` near the end — pointing at a synchronization
+race or a fired watchdog. This is past the "grep the gap and fill it" regime; it
+needs `rip` symbolization against chrome's binary (compute the module load base,
+disassemble the caller) and/or deeper futex/threading instrumentation. It is the
+current burn-down front.
+
+Cumulative arc (this session, 7 slices): chrome went from *can't load
+`libpthread`* → **270k syscalls, 17 threads, Mojo + fontconfig + graceful
+platform degradation** — real multi-threaded engine bring-up.
 
 ## Slice 2 — V8's virtual-memory cage (DONE, verified)
 

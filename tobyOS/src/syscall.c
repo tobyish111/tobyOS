@@ -4098,6 +4098,8 @@ enum {
     LX_getpriority = 140, LX_setpriority = 141,
     LX_sched_setaffinity = 203, LX_sched_getaffinity = 204,
     LX_clock_getres = 229,
+    LX_time = 201, LX_inotify_add_watch = 253, LX_inotify_rm_watch = 254,
+    LX_fallocate = 285, LX_statx = 332,
     /* B17: real busybox network clients arm an alarm-timeout (setitimer) around
      * each network op and ftruncate the wget output file. */
     LX_ftruncate = 77, LX_getitimer = 36, LX_setitimer = 38,
@@ -4192,6 +4194,38 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
     st.st_blksize = 512;
     st.st_blocks  = (int64_t)((vs->size + 511) / 512);
     if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
+/* statx(2): fill the modern struct statx (256-byte Linux x86-64 layout) from a
+ * vfs_stat. We report STATX_BASIC_STATS (mode/size/ino/nlink/uid/gid/blocks);
+ * timestamps are zero (no RTC epoch). glibc's stat() prefers statx now, so
+ * filling it (vs -ENOSYS + a newfstatat fallback) cuts a syscall per stat. */
+static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf) {
+    struct lx_statx_ts { int64_t sec; uint32_t nsec; int32_t pad; };
+    struct lx_statx {
+        uint32_t mask, blksize; uint64_t attributes;
+        uint32_t nlink, uid, gid; uint16_t mode, spare0;
+        uint64_t ino, size, blocks, attributes_mask;
+        struct lx_statx_ts atime, btime, ctime, mtime;
+        uint32_t rdev_major, rdev_minor, dev_major, dev_minor;
+        uint64_t mnt_id, spare2; uint64_t spare3[12];
+    } sx;
+    memset(&sx, 0, sizeof sx);
+    uint32_t typ  = (vs->type == VFS_TYPE_DIR) ? 0x4000u : 0x8000u;
+    uint32_t perm = vs->mode & 0xFFFu;
+    if (perm == 0) perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
+    sx.mask      = 0x000007ffu;              /* STATX_BASIC_STATS */
+    sx.blksize   = 512;
+    sx.nlink     = 1;
+    sx.uid       = vs->uid;
+    sx.gid       = vs->gid;
+    sx.mode      = (uint16_t)(typ | perm);
+    sx.ino       = ino ? ino : 1;
+    sx.size      = vs->size;
+    sx.blocks    = (vs->size + 511) / 512;
+    sx.dev_minor = 1;
+    if (copy_to_user(ubuf, &sx, sizeof sx) != 0) return -ABI_EFAULT;
     return 0;
 }
 
@@ -5913,6 +5947,44 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
             return -ABI_EFAULT;
         return 0;
     }
+
+    case LX_statx: {                   /* (dirfd, path, flags, mask, statxbuf) */
+        const char *upath = (const char *)a2;
+        char probe[2] = {0, 0};
+        if (upath) (void)strncpy_from_user(probe, upath, sizeof probe);
+        if (!upath || probe[0] == '\0') {      /* AT_EMPTY_PATH: statx the fd */
+            struct file *f = fd_lookup((int)a1);
+            if (!f) return -ABI_EBADF;
+            struct vfs_stat vs = { .type = VFS_TYPE_FILE, .size = f->vfs.size,
+                                   .uid = f->vfs.uid, .gid = f->vfs.gid,
+                                   .mode = f->vfs.mode };
+            if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
+            return linux_emit_statx(&vs, lx_fd_ino(f, (int)a1), (void *)a5);
+        }
+        char kpath[ABI_PATH_MAX];
+        int rr = resolve_user_path(upath, kpath, sizeof kpath);
+        if (rr) return rr;
+        struct vfs_stat vs;
+        int sr = vfs_stat(kpath, &vs);
+        if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
+        if (sr != VFS_OK)        return -ABI_EACCES;
+        return linux_emit_statx(&vs, lx_ino_hash(kpath), (void *)a5);
+    }
+
+    case LX_time: {                    /* time_t time(time_t *tloc) */
+        long secs = (long)(perf_now_ns() / 1000000000ull);
+        if (a1 && copy_to_user((void *)a1, &secs, sizeof secs) != 0)
+            return -ABI_EFAULT;
+        return secs;
+    }
+    case LX_fallocate:  return 0;      /* best-effort; tobyfs grows on write */
+    case LX_inotify_add_watch: {
+        /* No real file-change events, but hand back a monotonic watch descriptor
+         * so callers (fontconfig, dir watching) proceed rather than erroring. */
+        static int g_lx_inotify_wd;
+        return ++g_lx_inotify_wd;
+    }
+    case LX_inotify_rm_watch:  return 0;
 
     /* ---- misc ---- */
     case LX_uname: {
