@@ -308,3 +308,35 @@ a GL/EGL dispatch pointer left NULL by the failed `eglInitialize`. This is the
 render-pipeline / GL tier (M2-class). Next: identify the .so (correlate the
 caller addr with ld.so library load addresses) + what pointer is NULL → decide
 shim vs. making SwANGLE actually initialize. `rename` also wants filling.
+
+### Slice 11 GL deep-dive (findings; NOT cracked — the hard tier)
+
+Multiple instrument-first experiments pinned the render wall precisely; the fix
+is genuine ANGLE-internals work, not config. Findings (all reverted to committed
+flags — none dumped the DOM):
+
+- **ANGLE (`libGLESv2.so`) dlopens SwiftShader's ICD (`libvk_swiftshader.so`)
+  DIRECTLY** (its DT_NEEDED is only libc/libpthread/libgcc_s/ld — Vulkan is
+  dlopen'd at runtime), **bypassing `libvulkan.so.1` — the loader that implements
+  the WSI instance extensions.** So `VK_KHR_surface` + `VK_KHR_xcb_surface` (which
+  ANGLE's `vk_renderer.cpp` `VerifyExtensionsPresent` REQUIRES) are absent →
+  `eglInitialize` fails → a NULL GL dispatch is called downstream.
+- **`--use-angle=vulkan` + env `VK_ICD_FILENAMES=/opt/chrome/vk_swiftshader_icd.json`
+  routes ANGLE through the real loader → `VK_KHR_surface` RESOLVES** (progress!).
+  Only `VK_KHR_xcb_surface` then remains.
+- The bundled `libvulkan.so.1` IS built with xcb WSI and `libxcb.so.1`
+  (+ its deps `libXau.so.6`, `libXdmcp.so.6`) are in the sysroot, **but the loader
+  correctly FILTERS OUT `VK_KHR_xcb_surface` because there is no functional X
+  server** (`xcb_connect` has no `DISPLAY`). ANGLE hard-requires it anyway.
+- **`VK_LOADER_DISABLE_INST_EXT_FILTER=1` REGRESSED it** (both surface extensions
+  failed again) — not the override it appeared to be.
+
+**Conclusion:** the real fix is making ANGLE use a SURFACELESS/headless Vulkan
+path (no X11 window surface) — not reachable via the chrome flags / loader env
+tried (`--ozone-platform=headless`, `--disable-features=Vulkan`,
+`--use-angle=vulkan`, the loader filter override). Realistic next options, all
+substantial: (a) a minimal headless X server / `xcb_connect` shim so the loader
+advertises `VK_KHR_xcb_surface`; (b) patch/configure ANGLE for
+`VK_EXT_headless_surface` / surfaceless; (c) provide a headless Vulkan ICD that
+advertises what ANGLE demands. **Track B kernel ABI is proven sufficient — this
+is entirely chrome's own GL stack in a headless environment.**
