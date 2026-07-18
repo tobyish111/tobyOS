@@ -463,6 +463,16 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
             if (v != val)                    return 0;    /* woken */
             if (caller->pending_signals)     return -4;   /* -EINTR */
             if (perf_now_ns() >= deadline_ns) return -110;/* -ETIMEDOUT */
+            /* Slice 8 fix (Chromium ~60s startup freeze): YIELD so READY peers
+             * run while we poll toward the deadline. The old loop only hlt'd
+             * THIS cpu -- it never serviced the ready queue -- so a timed-futex
+             * waiter (glibc pthread_cond_timedwait / sem_timedwait, pervasive in
+             * chrome's thread pool) stayed "current" (state RUNNING, never
+             * PROC_BLOCKED, and kernel-mode is NOT preempted by sched_tick) and
+             * starved every runnable peer, including the browser main thread, for
+             * the entire wait. sched_yield runs a peer if any; the hlt below then
+             * idles ~1 tick so we don't busy-spin the deadline when alone. */
+            sched_yield();
             bool had = bkl_held();
             if (had) bkl_exit();
             sti();
