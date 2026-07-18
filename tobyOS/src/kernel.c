@@ -7248,17 +7248,27 @@ void _start(void) {
             (char *)"--no-sandbox",
             (char *)"--no-zygote",
             (char *)"--single-process",
-            (char *)"--disable-gpu",
-            /* M1 slice 8 (flags-first): force a PURE-SOFTWARE render path so
-             * navigation can COMPLETE without a working GL display. SwANGLE's
-             * eglInitialize fails on tobyOS (no GL); these route compositing +
-             * raster through the software SkiaRenderer instead, permit
-             * SwiftShader where any GL context is still demanded, and force the
-             * compositor to run all stages + advance virtual time so --dump-dom
-             * fires deterministically. If the DOM still doesn't dump, the block
-             * is NOT GL selection -> go instrument-first (stack-walk the crash). */
-            (char *)"--disable-gpu-compositing",
+            /* M1 render slice 12: route ANGLE's Vulkan backend through the REAL
+             * Khronos loader (libvulkan.so.1) instead of dlopen'ing SwiftShader's
+             * ICD directly. --use-angle=vulkan + VK_ICD_FILENAMES (env below) make
+             * the loader discover + load the SwiftShader ICD; the loader then
+             * supplies the WSI instance extensions (VK_KHR_surface + the platform
+             * VK_KHR_xcb_surface, which it implements) so ANGLE's
+             * VerifyExtensionsPresent PASSES and vkCreateInstance SUCCEEDS
+             * (SwiftShader physical device enumerates). This works ONLY with the
+             * slice-12 path-normalization fix (resolve_user_path/path_lexical_clean
+             * in syscall.c): the ICD manifest's relative library_path made the
+             * loader dlopen "/opt/chrome/./libvk_swiftshader.so", whose interior
+             * "." component tobyOS was NOT collapsing -> ENOENT -> "Found no
+             * drivers". WALL NOW: ANGLE's DisplayVkXcb::initialize xcb_connect()s
+             * to the (absent) X server at DISPLAY=:0 and fails -> eglInitialize
+             * fails -> NULL GL-dispatch crash. Next slice = a minimal fake X
+             * server over named AF_UNIX so xcb_connect succeeds. (Set
+             * VK_LOADER_DEBUG=all in envp to re-narrate loader discovery.) */
+            (char *)"--use-gl=angle",
+            (char *)"--use-angle=vulkan",
             (char *)"--enable-unsafe-swiftshader",
+            (char *)"--disable-gpu-compositing",
             (char *)"--run-all-compositor-stages-before-draw",
             (char *)"--virtual-time-budget=10000",
             (char *)"--disable-dev-shm-usage",
@@ -7276,12 +7286,19 @@ void _start(void) {
             (char *)"PATH=/bin",
             (char *)"LD_LIBRARY_PATH=/opt/chrome:/opt/chrome/sysroot",
             (char *)"LANG=C",
+            /* Route ANGLE-Vulkan through the loader (see argv note): the loader
+             * finds the SwiftShader ICD via VK_ICD_FILENAMES and supplies WSI.
+             * DISPLAY names the X server ANGLE's DisplayVkXcb will connect to
+             * (a fake one, next slice). Add VK_LOADER_DEBUG=all here to have the
+             * loader narrate ICD/layer/extension discovery when debugging. */
+            (char *)"VK_ICD_FILENAMES=/opt/chrome/vk_swiftshader_icd.json",
+            (char *)"DISPLAY=:0",
             0,
         };
         struct proc_spec spec = {
             .path = "/opt/chrome/chrome-headless-shell",
             .name = "chrome",
-            .argc = 16, .argv = argv, .envc = 5, .envp = envp,
+            .argc = 17, .argv = argv, .envc = 7, .envp = envp,
         };
         kprintf("[boot] CHROMIUM: spawning REAL headless Chromium "
                 "(chrome-headless-shell --dump-dom); the DELIVERABLE is the "
