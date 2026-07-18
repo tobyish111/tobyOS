@@ -4071,7 +4071,11 @@ enum {
     LX_getsockname = 51, LX_getpeername = 52, LX_socketpair = 53,
     LX_setsockopt = 54,
     LX_getsockopt = 55, LX_accept4 = 288,
-    LX_gettimeofday = 96, LX_statfs = 137, LX_fstatfs = 138,
+    LX_gettimeofday = 96, LX_sysinfo = 99, LX_getresuid = 118,
+    LX_getresgid = 120, LX_statfs = 137, LX_fstatfs = 138,
+    LX_getpriority = 140, LX_setpriority = 141,
+    LX_sched_setaffinity = 203, LX_sched_getaffinity = 204,
+    LX_clock_getres = 229,
     /* B17: real busybox network clients arm an alarm-timeout (setitimer) around
      * each network op and ftruncate the wget output file. */
     LX_ftruncate = 77, LX_getitimer = 36, LX_setitimer = 38,
@@ -5567,6 +5571,14 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         case 3:            /* PR_GET_DUMPABLE -> dumpable */
         case 23:           /* PR_CAPBSET_READ -> cap present (we boot as root) */
             return 1;
+        case 16: {         /* PR_GET_NAME: copy the 16-byte thread name to arg2 */
+            char nm[16];
+            memset(nm, 0, sizeof nm);
+            const char *pn = current_proc()->name;
+            for (int i = 0; i < 15 && pn[i]; i++) nm[i] = pn[i];
+            if (a2) copy_to_user((void *)a2, nm, sizeof nm);
+            return 0;
+        }
         default:
             kprintf("[linux] UNHANDLED prctl option 0x%lx comm=%s -> -ENOSYS\n",
                     (unsigned long)a1, current_proc()->name);
@@ -5771,6 +5783,86 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         if (ms < 0) ms = 0;
         struct lx_timespec ts = { ms / 1000, (ms % 1000) * 1000000 };
         if (a2 && copy_to_user((void *)a2, &ts, sizeof ts) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
+
+    case LX_clock_getres: {
+        struct lx_timespec ts = { 0, 1 };    /* 1 ns resolution */
+        if (a2 && copy_to_user((void *)a2, &ts, sizeof ts) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
+
+    /* ---- thread-pool / process-info fills (Chromium multi-threaded init) ---- */
+    case LX_sched_setaffinity:
+        return 0;                            /* accept; we don't pin threads */
+
+    case LX_sched_getaffinity: {
+        /* (pid, cpusetsize, mask): report all online CPUs so chrome's
+         * ThreadPool sizes itself. Return #bytes written (the raw-syscall ABI). */
+        uint32_t n = smp_cpu_count();
+        if (n == 0) n = 1;
+        uint64_t mask = (n >= 64) ? ~0ull : ((1ull << n) - 1);
+        size_t len = (size_t)a2;
+        if (len == 0) return -ABI_EINVAL;
+        if (len > 8) len = 8;
+        if (a3 && copy_to_user((void *)a3, &mask, len) != 0)
+            return -ABI_EFAULT;
+        return (long)len;
+    }
+
+    case LX_getpriority:  return 20;         /* nice 0 (kernel returns 20-nice) */
+    case LX_setpriority:  return 0;          /* accept */
+
+    case LX_getresuid:                       /* (ruid*, euid*, suid*) -> root */
+    case LX_getresgid: {
+        unsigned int z = 0;
+        if ((a1 && copy_to_user((void *)a1, &z, 4) != 0) ||
+            (a2 && copy_to_user((void *)a2, &z, 4) != 0) ||
+            (a3 && copy_to_user((void *)a3, &z, 4) != 0))
+            return -ABI_EFAULT;
+        return 0;
+    }
+
+    case LX_sysinfo: {
+        struct lx_sysinfo {
+            long uptime; unsigned long loads[3];
+            unsigned long totalram, freeram, sharedram, bufferram;
+            unsigned long totalswap, freeswap;
+            unsigned short procs, pad;
+            unsigned long totalhigh, freehigh;
+            unsigned int mem_unit;
+        } si;
+        memset(&si, 0, sizeof si);
+        long ms = do_syscall(ABI_SYS_CLOCK_MS, 0, 0, 0, 0, 0);
+        si.uptime   = (ms > 0) ? ms / 1000 : 0;
+        si.totalram = pmm_total_pages();     /* counts are in mem_unit (page) */
+        si.freeram  = pmm_free_pages();
+        si.procs    = 1;
+        si.mem_unit = 4096;
+        if (a1 && copy_to_user((void *)a1, &si, sizeof si) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
+
+    case LX_statfs:                          /* (path, buf) */
+    case LX_fstatfs: {                        /* (fd, buf) -- buf is a2 in both */
+        struct lx_statfs {
+            long f_type, f_bsize, f_blocks, f_bfree, f_bavail;
+            long f_files, f_ffree; unsigned long f_fsid;
+            long f_namelen, f_frsize, f_flags, f_spare[4];
+        } sf;
+        memset(&sf, 0, sizeof sf);
+        sf.f_type    = 0x01021994;           /* TMPFS_MAGIC */
+        sf.f_bsize   = 4096;
+        sf.f_frsize  = 4096;
+        sf.f_blocks  = 1L << 20;             /* 4 GiB of 4 KiB blocks */
+        sf.f_bfree   = sf.f_bavail = 3L << 18;
+        sf.f_files   = 1L << 20;
+        sf.f_ffree   = 1L << 19;
+        sf.f_namelen = 255;
+        if (a2 && copy_to_user((void *)a2, &sf, sizeof sf) != 0)
             return -ABI_EFAULT;
         return 0;
     }

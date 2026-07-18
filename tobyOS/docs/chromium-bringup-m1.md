@@ -69,18 +69,37 @@ change; bumped `SOCK_MAX` 16→128 for chrome's many pairs). Files:
 socketpairs, and **spawned 9+ threads** (shared-VM tgid=2), running deep into
 multi-threaded Mojo/`ThreadPool` bring-up.
 
-## Slice 4 — thread-pool/init syscall fills + a NULL-deref (open)
+## Slice 4 — thread-pool/init syscall fills (DONE, verified)
 
-Chrome now runs so far it needs a batch of small syscalls it didn't reach
-before, then a thread NULL-derefs (`EXCEPTION 14, cr2=0`). The prime suspects
-are the sizing syscalls returning `-ENOSYS`:
-- **`sched_getaffinity(204)`** — chrome sizes its `ThreadPool` from the CPU
-  affinity mask; an error here can yield 0 workers → NULL deref.
-- **`sysinfo(99)`** — total/free RAM for allocator sizing.
-- Trivial accepts: `setpriority(141)`/`getpriority(140)`, `getresuid(118)`/
-  `getresgid(120)`, `clock_getres(229)`, `statfs(137)`/`fstatfs(138)`,
-  `prctl PR_GET_NAME(16)`. `landlock_*(444…)` correctly stays `-ENOSYS`
-  (optional sandbox; chrome falls back).
+Filled the batch chrome reaches once its `ThreadPool` is up:
+`sched_getaffinity(204)` (reports all online CPUs so the pool sizes itself) +
+`sched_setaffinity(203)`, `sysinfo(99)` (RAM from the PMM), `getpriority(140)`/
+`setpriority(141)`, `getresuid(118)`/`getresgid(120)` (root), `clock_getres(229)`,
+`statfs(137)`/`fstatfs(138)` (a tmpfs-shaped answer), `prctl PR_GET_NAME(16)`.
+`landlock_*(444)` intentionally stays `-ENOSYS` (optional sandbox; chrome falls
+back).
+
+**Verified — another leap:** chrome went **5,193 → 20,014 syscalls**. The
+syscall surface is now essentially complete for chrome startup — the *only*
+remaining unhandled syscall is `landlock(444)`, correctly rejected.
+
+## Slice 5 — the remaining wall: a thread NULL-deref (open, needs deep diag)
+
+Chrome now crashes on a genuine **NULL dereference** (`EXCEPTION 14`,
+`cr2=0x0`, user-mode write) in one of its worker threads — *not* a missing
+syscall. This needs the `TRACE=1` firehose + `rip` symbolization to localize.
+Leading hypotheses, in order:
+- **`SCM_RIGHTS`** — Mojo passes fds over the socketpair via `sendmsg`/`recvmsg`
+  ancillary data; the current `lx_sendmsg`/`lx_recvmsg` don't handle
+  `SOCK_KIND_UNIX` or ancillary, so an fd handoff could yield a NULL handle →
+  deref. (First thing to check in the trace: `sendmsg`/`recvmsg` on the UNIX
+  fds before the fault.)
+- A syscall returning a shape chrome doesn't expect (e.g. one of the new fills'
+  struct layouts), leaving a NULL where chrome assumes non-NULL.
+- A genuinely missing platform surface (a `/proc`, `/sys`, or `/dev` node chrome
+  opens and then derefs the result of).
+
+This is the current burn-down front and the natural next slice.
 
 ## Slice 2 — V8's virtual-memory cage (DONE, verified)
 
