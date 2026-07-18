@@ -97,6 +97,8 @@ struct sigaction {
 #define FPE_INTDIV  1      /* integer divide by zero */
 #define FPE_FLTDIV  3      /* floating-point divide by zero */
 #define ILL_ILLOPC  1      /* illegal opcode */
+#define TRAP_BRKPT  1      /* process breakpoint (int3 / #BP)          */
+#define TRAP_TRACE  2      /* process trace trap (single-step / #DB)   */
 
 typedef struct {
     int          si_signo;   /* signal number                       */

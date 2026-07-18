@@ -792,17 +792,12 @@ static __attribute__((noreturn)) void idle_loop(void) {
 
     #undef SERVICE_INPUT
 }
-/* Smoke-test handler for vector 3 (#BP). Demonstrates that the IDT
- * dispatch reaches C and that we can iretq cleanly back to the caller.
- * Without this, the default exception handler would panic on int3. */
-static void breakpoint_handler(struct regs *r) {
-    kprintf("[isr] breakpoint hit at rip=%p (rflags=0x%lx)\n",
-            (void *)r->rip, r->rflags);
-}
-
 static void int_smoke_test(void) {
+    /* Fire a kernel-mode int3 to exercise the IDT round-trip. Vector 3 is now
+     * a DPL-3 gate handled by default_exception (isr.c): a kernel #BP logs
+     * "[isr] breakpoint hit ..." and iretq's back here cleanly. (User-mode int3
+     * takes the same gate but is delivered as SIGTRAP -- see idt.c/isr.c.) */
     kprintf("[boot] firing int3 to exercise IDT round-trip...\n");
-    isr_register(3, breakpoint_handler);
     __asm__ volatile ("int $3");
     kprintf("[boot] int3 returned cleanly, IDT round-trip OK\n");
 }
