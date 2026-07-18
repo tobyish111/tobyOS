@@ -83,23 +83,45 @@ back).
 syscall surface is now essentially complete for chrome startup — the *only*
 remaining unhandled syscall is `landlock(444)`, correctly rejected.
 
-## Slice 5 — the remaining wall: a thread NULL-deref (open, needs deep diag)
+## Slice 5 — thread fd-table sharing (`CLONE_FILES`) + fd limit (DONE, verified)
 
-Chrome now crashes on a genuine **NULL dereference** (`EXCEPTION 14`,
-`cr2=0x0`, user-mode write) in one of its worker threads — *not* a missing
-syscall. This needs the `TRACE=1` firehose + `rip` symbolization to localize.
-Leading hypotheses, in order:
-- **`SCM_RIGHTS`** — Mojo passes fds over the socketpair via `sendmsg`/`recvmsg`
-  ancillary data; the current `lx_sendmsg`/`lx_recvmsg` don't handle
-  `SOCK_KIND_UNIX` or ancillary, so an fd handoff could yield a NULL handle →
-  deref. (First thing to check in the trace: `sendmsg`/`recvmsg` on the UNIX
-  fds before the fault.)
-- A syscall returning a shape chrome doesn't expect (e.g. one of the new fills'
-  struct layouts), leaving a NULL where chrome assumes non-NULL.
-- A genuinely missing platform surface (a `/proc`, `/sys`, or `/dev` node chrome
-  opens and then derefs the result of).
+The thread NULL-call was **not** a missing syscall — it was a real kernel bug.
+Diagnosed with a new cheap instrument: a **recent-syscall ring** (`src/syscall.c`)
+dumped by `src/isr.c` on any fatal user fault (far cheaper than the full trace at
+20k+ calls). It showed the crash was **timing-dependent** across freshly-spawned
+threads (one victim spinning on `futex`, another right after `epoll_create1`) →
+a threading race, not a deterministic gap.
 
-This is the current burn-down front and the natural next slice.
+**Root cause:** `struct proc` holds an inline `fds[PROC_NFDS]`, and
+`sys_clone_thread` **copied** it (`file_clone` per fd) — that's *fork* semantics,
+not thread (`CLONE_FILES`). So an epoll/socket fd created on one thread was
+invisible to the others → cross-thread `fd_lookup` returned NULL → NULL handle →
+the process **called a NULL function pointer** (`rip=0`, `cr2=0`, instruction
+fetch). Breaks *every* multi-threaded Linux program.
+
+**Fix:** a `proc_fds(p)` accessor returns the thread-group **leader's** fd table
+for threads (own table for non-threads); all runtime fd accessors
+(`fd_lookup`/`fd_alloc_into`/close/dup2/pipe/spawn-inherit) route through it, and
+`sys_clone_thread` leaves the child's own `fds[]` **empty** (so its exit never
+closes the shared descriptions). Then the *next* wall: chrome hit **`EMFILE`**
+(`message_pump_epoll` `CHECK`) because `PROC_NFDS` was **16** — with threads now
+correctly sharing one table, chrome+Mojo exhaust it. Raised `PROC_NFDS` 16→**1024**
+(matching the reported `RLIMIT_NOFILE`).
+
+**Verified — a giant leap:** `EXCEPTION 14` gone, EMFILE gone, chrome runs
+**20,014 → 270,253 syscalls** — into real engine/rendering territory (fontconfig,
+SwANGLE GL init, dozens of threads).
+
+## Slice 6 — thread/proc table limit + init fills (open)
+
+Chrome now dies on `pthread_create: Resource temporarily unavailable (11)`
+(EAGAIN) — it wants ~30-50 threads but `PROC_MAX` is **64** (minus the boot
+procs), so `clone` runs out of proc slots → a NULL thread handle → NULL call.
+Raise `PROC_MAX`. Plus trivial fills chrome now reaches: `time(201)`,
+`fallocate(285)`, `statx(332)`, `inotify_add_watch(253)`. Also noted (non-fatal):
+fontconfig can't find its config file (text-shaping degraded, fine for
+`--dump-dom`), and SwANGLE `eglInitialize` fails (GL unavailable; headless DOM
+dump doesn't need it).
 
 ## Slice 2 — V8's virtual-memory cage (DONE, verified)
 

@@ -198,15 +198,34 @@ static void *bounce_in(const void *ubuf, size_t len) {
     return k;
 }
 
+/* CLONE_FILES: a thread SHARES the thread-group leader's fd table, so an fd
+ * created on one thread is visible to all threads. Non-threads use their own.
+ * Without this, Chromium's IO thread creates the epoll/socket fds and worker
+ * threads can't see them -> fd_lookup returns NULL -> NULL handle -> the process
+ * calls through a NULL pointer and dies (a timing-dependent crash). RUNTIME fd
+ * accessors route through here; lifecycle paths (spawn init, exit cleanup, fork)
+ * stay per-proc, and a clone-thread's own fds[] is left empty (see
+ * sys_clone_thread) so its exit never closes the shared open descriptions. */
+struct file **proc_fds(struct proc *p) {
+    if (p && p->is_thread) {
+        struct proc *ld = proc_lookup(p->tgid);
+        if (ld) return ld->fds;
+    }
+    return p ? p->fds : 0;
+}
+
 static struct file *fd_lookup(int fd) {
     if (fd < 0 || fd >= PROC_NFDS) return 0;
-    return current_proc()->fds[fd];
+    struct file **t = proc_fds(current_proc());
+    return t ? t[fd] : 0;
 }
 
 static int fd_alloc_into(struct proc *p, struct file *f) {
+    struct file **t = proc_fds(p);
+    if (!t) return -1;
     for (int i = 0; i < PROC_NFDS; i++) {
-        if (!p->fds[i]) {
-            p->fds[i] = f;
+        if (!t[i]) {
+            t[i] = f;
             return i;
         }
     }
@@ -293,14 +312,15 @@ static long sys_pipe(int *user_fds_out) {
     if (pipe_create(&r, &w) != 0) return -1;
 
     struct proc *p = current_proc();
+    struct file **t = proc_fds(p);
     int fd_r = fd_alloc_into(p, r);
     if (fd_r < 0) { file_close(r); file_close(w); return -1; }
     int fd_w = fd_alloc_into(p, w);
-    if (fd_w < 0) { p->fds[fd_r] = 0; file_close(r); file_close(w); return -1; }
+    if (fd_w < 0) { t[fd_r] = 0; file_close(r); file_close(w); return -1; }
 
     int fds[2] = { fd_r, fd_w };
     if (copy_to_user(user_fds_out, fds, sizeof(fds)) != 0) {
-        p->fds[fd_r] = 0; p->fds[fd_w] = 0;
+        t[fd_r] = 0; t[fd_w] = 0;
         file_close(r); file_close(w);
         return -ABI_EFAULT;
     }
@@ -309,10 +329,10 @@ static long sys_pipe(int *user_fds_out) {
 
 static long sys_close(int fd) {
     if (fd < 0 || fd >= PROC_NFDS) return -1;
-    struct proc *p = current_proc();
-    if (!p->fds[fd]) return -1;
-    file_close(p->fds[fd]);
-    p->fds[fd] = 0;
+    struct file **t = proc_fds(current_proc());
+    if (!t || !t[fd]) return -1;
+    file_close(t[fd]);
+    t[fd] = 0;
     return 0;
 }
 
@@ -2175,12 +2195,13 @@ static long sys_dup2(int oldfd, int newfd) {
     if (!f) return -ABI_EBADF;
     struct file *cl = file_clone(f);
     if (!cl) return -ABI_ENOMEM;
-    struct proc *p = current_proc();
-    if (p->fds[newfd]) {
-        file_close(p->fds[newfd]);
-        p->fds[newfd] = 0;
+    struct file **t = proc_fds(current_proc());
+    if (!t) { file_close(cl); return -ABI_EBADF; }
+    if (t[newfd]) {
+        file_close(t[newfd]);
+        t[newfd] = 0;
     }
-    p->fds[newfd] = cl;
+    t[newfd] = cl;
     return newfd;
 }
 
@@ -2406,6 +2427,7 @@ static long sys_spawn(const struct abi_spawn_req *req) {
      * caller passed an explicit fd (so the parent's copy is independent
      * of the child's). */
     struct proc *parent = current_proc();
+    struct file **ptab  = proc_fds(parent);   /* thread -> leader's shared table */
     struct file *f0 = 0, *f1 = 0, *f2 = 0;
     int fds[3]      = { kreq.fd0, kreq.fd1, kreq.fd2 };
     struct file **out[3] = { &f0, &f1, &f2 };
@@ -2419,10 +2441,10 @@ static long sys_spawn(const struct abi_spawn_req *req) {
         if (v == ABI_SPAWN_FD_INHERIT) {
             v = i;                   /* inherit parent's same-numbered fd */
         }
-        if (v < 0 || v >= PROC_NFDS || !parent->fds[v]) {
+        if (v < 0 || v >= PROC_NFDS || !ptab || !ptab[v]) {
             failed = true; break;
         }
-        struct file *cl = file_clone(parent->fds[v]);
+        struct file *cl = file_clone(ptab[v]);
         if (!cl) { failed = true; break; }
         *out[i] = cl;
     }
@@ -5200,7 +5222,32 @@ static const char *lx_scname(long n) {
     }
 }
 
+/* Small ring of recent Linux syscalls (number + caller tid) for crash
+ * diagnostics: isr.c dumps it on a fatal user fault, which is far cheaper than
+ * the full -DLINUX_SYSCALL_TRACE firehose when a program has already made tens
+ * of thousands of calls (e.g. Chromium at 20k+). */
+#define LX_RECENT 48
+static long     g_lx_recent_n[LX_RECENT];
+static int      g_lx_recent_tid[LX_RECENT];
+static uint32_t g_lx_recent_i;
+
+void lx_dump_recent_syscalls(void) {
+    kprintf("[lx-recent] last %d Linux syscalls (oldest first, tid in []):\n",
+            LX_RECENT);
+    for (uint32_t k = 0; k < LX_RECENT; k++) {
+        uint32_t idx = (g_lx_recent_i + k) % LX_RECENT;
+        long nn = g_lx_recent_n[idx];
+        if (nn == 0 && g_lx_recent_tid[idx] == 0) continue;   /* unused slot */
+        kprintf("  [%d] %ld(%s)\n", g_lx_recent_tid[idx], nn, lx_scname(nn));
+    }
+}
+
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
+    {
+        uint32_t i = g_lx_recent_i++ % LX_RECENT;
+        g_lx_recent_n[i]   = n;
+        g_lx_recent_tid[i] = (int)current_proc()->pid;
+    }
 #ifdef LINUX_SYSCALL_TRACE
     kprintf("[lxtrace] %s[%ld] n=%ld(%s) a=%lx,%lx,%lx,%lx,%lx\n",
             current_proc()->name, (long)current_proc()->pid, n, lx_scname(n),
@@ -5636,7 +5683,7 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
             rl.max = ~0ULL;                 /* RLIM64_INFINITY */
             switch (resource) {
             case 3:  rl.cur = 0x800000ULL; break;          /* RLIMIT_STACK 8 MiB */
-            case 7:  rl.cur = 1024; rl.max = 4096; break;  /* RLIMIT_NOFILE      */
+            case 7:  rl.cur = PROC_NFDS; rl.max = PROC_NFDS; break; /* RLIMIT_NOFILE (== fd table) */
             default: rl.cur = ~0ULL; break;                /* AS/DATA/...: inf   */
             }
             if (copy_to_user((void *)(uintptr_t)oldp, &rl, sizeof rl) != 0)

@@ -51,7 +51,13 @@
 #define PROC_MAX        64
 #define PROC_NAME_MAX   32
 #define PROC_KSTACK_SZ  (32 * 1024)   /* per-process kernel stack: 32 KiB */
-#define PROC_NFDS       16            /* per-proc file descriptor table size */
+#define PROC_NFDS       1024          /* per-proc file descriptor table size.
+                                       * Must match the RLIMIT_NOFILE we report
+                                       * (syscall.c) -- Chromium+Mojo+threads
+                                       * share ONE table (CLONE_FILES) and open
+                                       * many fds (epoll/socketpairs/timerfds);
+                                       * 16 exhausted instantly -> EMFILE ->
+                                       * message_pump_epoll CHECK. */
 #define PROC_SANDBOX_MAX 128          /* max length of sandbox path prefix */
 
 /* Thread-group fields. A "thread" is a lightweight proc sharing
