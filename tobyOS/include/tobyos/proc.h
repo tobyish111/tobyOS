@@ -48,7 +48,11 @@
 #include <tobyos/abi/abi.h>
 #include <tobyos/signal.h>
 
-#define PROC_MAX        64
+#define PROC_MAX        256           /* proc/thread slots. Chromium single-
+                                       * process spawns ~30-50 threads (each a
+                                       * proc slot); 64 (minus boot procs) ran
+                                       * out -> clone ENOMEM -> pthread_create
+                                       * EAGAIN -> NULL thread handle. */
 #define PROC_NAME_MAX   32
 #define PROC_KSTACK_SZ  (32 * 1024)   /* per-process kernel stack: 32 KiB */
 #define PROC_NFDS       1024          /* per-proc file descriptor table size.
