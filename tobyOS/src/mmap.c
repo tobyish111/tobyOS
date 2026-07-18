@@ -29,7 +29,17 @@
 
 /* ---- VMA definitions ---- */
 
-#define VMA_MAX_PER_PROC  256
+/* Chromium bring-up (slice 8): raised 256 -> 4096. Real chrome maps ~60 shared
+ * libraries (each: a whole-file MAP_PRIVATE reservation + several MAP_FIXED
+ * segment mappings), plus V8's cage arenas, ~17 thread stacks, and shared-memory
+ * regions -- well over 256 live VMAs. At the 256 cap `vma_alloc` failed, mmap
+ * returned -ENOMEM, and chrome CHECK-failed -> base::ImmediateCrash mid-startup
+ * (the invariant "shared-memory" crash was really this: an mmap failing on a full
+ * VMA table). Linux's default vm.max_map_count is 65530. This is a static array
+ * per proc slot (~40 B/entry x PROC_MAX), so 4096 = ~42 MiB BSS. A future refactor
+ * could make the table per-proc heap-allocated + have MAP_FIXED replace overlapped
+ * VMAs (ld.so's segment maps currently each add an entry). */
+#define VMA_MAX_PER_PROC  4096
 
 #define VMA_PROT_READ   0x01
 #define VMA_PROT_WRITE  0x02

@@ -2083,6 +2083,7 @@ static long sys_open(const char *path, int flags, int mode) {
     /* Reject write attempts on a read-only access mode early -- we
      * still let the file_write path enforce mount-level RO. */
     (void)access;
+    f->o_accmode = flags & 3;    /* O_ACCMODE: O_RDONLY/O_WRONLY/O_RDWR for F_GETFL */
 
     struct proc *p = current_proc();
     int fd = fd_alloc_into(p, f);
@@ -5779,8 +5780,20 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         if (a2) { struct { long it[4]; } z; for (int i=0;i<4;i++) z.it[i]=0;
                   (void)copy_to_user((void *)(uintptr_t)a2, &z, sizeof z); }
         return 0;
-    case LX_ftruncate:
+    case LX_ftruncate: {
+        /* Chromium bring-up (slice 8): make ftruncate actually record the file
+         * SIZE (was a plain no-op). Chrome's shared-memory Create ftruncates the
+         * temp region to N and then relies on fstat reporting N; the no-op left
+         * size 0 -> a base/PartitionAlloc CHECK failed -> ImmediateCrash. sys_fstat
+         * reports f->vfs.size, which is in-memory and so survives the subsequent
+         * unlink. The MAP_SHARED mmap of the region is sized by the mmap len and
+         * zero-filled, so no on-disk blocks are needed here. Non-VFS fds keep the
+         * old accept-as-success behaviour (wget's alarm-timeout ftruncate). */
+        struct file *tf = fd_lookup((int)a1);
+        if (tf && tf->kind == FILE_KIND_VFS && (long)a2 >= 0)
+            tf->vfs.size = (size_t)a2;
         return 0;
+    }
 
     /* Track B/B21: ioctl on the console is a real TTY now. TCGETS/TCSETS
      * (termios), TIOCGWINSZ (size), TIOCGPGRP/TIOCSPGRP (foreground group),
@@ -5858,6 +5871,24 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         if (copy_from_user(&ts, (const void *)a1, sizeof ts) != 0)
             return -ABI_EFAULT;
         uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        return do_syscall(SYS_NANOSLEEP, (long)ns, 0, 0, 0, 0);
+    }
+    case 230: {   /* clock_nanosleep(clockid, flags, *req, *rem) */
+        /* Chromium bring-up (slice 8 gap-fill): route to nanosleep. Chrome
+         * reaches this once past the VMA wall (was -ENOSYS). flags bit0 =
+         * TIMER_ABSTIME -> sleep until the absolute deadline; tobyOS clocks are
+         * perf_now_ns-based so chrome's absolute time compares directly. clockid
+         * (a1) is ignored (MONOTONIC/REALTIME both map to perf_now_ns). */
+        struct lx_timespec ts;
+        if (!a3) return -ABI_EINVAL;
+        if (copy_from_user(&ts, (const void *)a3, sizeof ts) != 0)
+            return -ABI_EFAULT;
+        uint64_t t = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        uint64_t ns = t;
+        if ((int)a2 & 1) {                 /* TIMER_ABSTIME */
+            uint64_t now = perf_now_ns();
+            ns = (t > now) ? (t - now) : 0;
+        }
         return do_syscall(SYS_NANOSLEEP, (long)ns, 0, 0, 0, 0);
     }
     case LX_clock_gettime: {
@@ -6075,9 +6106,23 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
 
     /* Known-optional: libc/busybox probe these and fall back cleanly on
      * -ENOSYS. Handled explicitly (quietly) so they don't spam the log. */
+    case LX_fcntl: {            /* (fd, cmd, arg) */
+        if ((int)a2 == 3 /* F_GETFL */) {
+            /* Return the fd's access mode. Chromium's shared-memory
+             * PlatformSharedMemoryRegion::Create dups the region fd and CHECKs
+             * fcntl(F_GETFL) reports the expected mode (O_RDWR for a writable
+             * region); the old blanket-0 made every fd look O_RDONLY, so the
+             * writable-region check failed -> base::ImmediateCrash. Status flags
+             * (O_APPEND/O_NONBLOCK) aren't tracked; the access mode is what the
+             * check reads. */
+            struct file *ff = fd_lookup((int)a1);
+            if (!ff) return -ABI_EBADF;
+            return ff->o_accmode;
+        }
+        return 0;               /* F_GETFD/F_SETFD/F_SETFL/CLOEXEC: best-effort no-op */
+    }
     case LX_sendfile:           /* cat/cp fall back to a read/write loop */
-    case LX_fcntl:              /* F_SETFD/CLOEXEC etc -- best-effort no-op */
-        return (n == LX_fcntl) ? 0 : -ABI_ENOSYS;
+        return -ABI_ENOSYS;
 
     default: {
         /* First-hit-detailed, deduped gap-list logger (see lx_scname note).

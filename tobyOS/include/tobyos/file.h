@@ -123,6 +123,12 @@ struct file {
     struct pty *pty;
     /* For FILE_KIND_EVENTFD (Track C): the shared counter object. */
     struct eventfd *efd;
+    /* Open access mode (O_RDONLY=0 / O_WRONLY=1 / O_RDWR=2), captured at
+     * open time and returned by fcntl(F_GETFL). Chromium's shared-memory
+     * PlatformSharedMemoryRegion CHECKs that a writable region's fd reports
+     * O_RDWR via F_GETFL -- a blanket-0 fcntl made it look read-only and
+     * ImmediateCrash'd. Copied across dup() in file_clone. */
+    int o_accmode;
 };
 
 /* eventfd flags (Linux ABI) */
