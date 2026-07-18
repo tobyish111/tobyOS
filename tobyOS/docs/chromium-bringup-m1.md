@@ -460,11 +460,23 @@ deep into profile/storage init. `struct vfs_file` grew → clean build.
 Chrome now reaches its full profile/storage bring-up and stalls there: leveldb +
 SQLite (`Code Cache`, `Local Storage`, `GPUCache`, `DawnCache`, `Shared Dictionary`,
 `DIPS`, `shared_proto_db`) fail because `rename(82)`, `fdatasync(75)`,
-`unlinkat(263)` (and `143`/`145`/`93`) are `-ENOSYS`. Chrome retry-loops on the
-leveldb metadata open (~every 2s) then a worker thread NULL-dispatch crashes at
-~45s (pid=28 'chrome+T', `last_fault_rip=0x2054415`). For `--dump-dom` of a
-`data:` URL none of this profile storage is actually needed. Two paths: (a)
-implement the fs syscalls so leveldb/SQLite succeed (`rename` is the high-value
-one — atomic-rename is core to both); (b) shrink chrome's storage footprint via
-flags (`--incognito` / feature disables) so it skips these subsystems and goes
-straight to navigation + DOM dump. This is a NEW ABI phase beyond the render bug.
+`unlinkat(263)` (and `93`=fchown / `143`=sched_getparam / `145`=sched_getscheduler)
+are `-ENOSYS`. Chrome retry-loops on the leveldb metadata open (~every 2s) then a
+worker thread NULL-dispatches (`chrome+T`) — and because that thread dies holding a
+lock, the remaining threads deadlock (BLOCKED forever).
+
+**`--incognito` does NOT help (measured, reverted):** `shared_proto_db` (and other
+browser-global leveldb stores) are opened regardless of the OTR profile, so the
+same retry loop fires; worse, chrome then HANGS ~5 min (309s, threads BLOCKED
+behind the dead thread's lock) instead of exiting. So the storage must actually
+work — flags can't route around it.
+
+**This is a distinct, multi-slice storage-ABI milestone (M2-class), NOT the render
+bug (which is solved).** The first batch: `fdatasync(75)` (trivial — flush/no-op);
+`unlinkat(263)` (wire to the EXISTING `tobyfs_unlink`/`vfs_unlink`); `rename(82)`
+(a NEW vfs op — `tobyfs` has no `.rename`; needs `tobyfs_rename` moving a dir
+entry atomically via the journal + `lx_rename`/`vfs_rename`). leveldb/SQLite will
+then likely also need file locking (`flock`/`fcntl F_SETLK` on the `LOCK` files) and
+directory `fsync`. Once storage init completes, the `data:` URL should navigate and
+`--dump-dom` should finally print `<h1>tobyOS</h1>` — then `--screenshot` + host-diff.
+Harness stays on the committed slice-14 loader route (no `--incognito`).
