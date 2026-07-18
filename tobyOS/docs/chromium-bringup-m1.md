@@ -232,3 +232,111 @@ a bounded but multi-cycle slice. It is the current burn-down front.
 **Reproduce the trace:**
 `TRACE=1 bash logs/chromium-m0.sh` then
 `grep -aE 'lxtrace\] chrome|EXCEPTION 3' logs/chromium-m0.log | tail`.
+
+## Slice 9 — the "render wall" was SCHEDULER STARVATION, not GL (DONE, verified)
+
+The slice-8 wall (chrome waits ~85s then `base::ImmediateCrash`, no DOM) was
+handed down as a GL/SwANGLE problem. **Instrument-first disproved that and four
+more hypotheses, each by measuring:**
+
+- **GL is not the gate.** Added software-render boot flags
+  (`--disable-gpu-compositing --enable-unsafe-swiftshader
+  --run-all-compositor-stages-before-draw --virtual-time-budget=10000` in the
+  `CHROMIUM_BOOT` harness) — the `eglInitialize SwANGLE failed` error vanished
+  yet the crash was byte-identical. GL selection does not gate it.
+- **Not demand-paging.** Surfaced the kernel's per-proc `fault_count` at the
+  fatal-fault dump (`isr.c`): only ~170 faults over the whole run.
+- **Not `sendmsg`/`recvmsg`-on-AF_UNIX, not AF_UNIX ring drops.** Instrumented
+  both; zero hits — Mojo uses plain read/write on the socketpair.
+
+**Real cause (measured with a `sched_tick` heartbeat that dumps every Linux
+proc's scheduler state):** the browser **main thread sits `READY` at max
+effective priority for the whole ~60s but is never scheduled**, while a pool
+thread stays `RUNNING` continuously. That pool thread is in a **timed futex
+wait** (`FUTEX_WAIT_BITSET` with a deadline — glibc `pthread_cond_timedwait` /
+`sem_timedwait`) whose kernel loop (`src/thread.c`) did `hlt` **without ever
+calling the scheduler**: it idles its CPU but never services the ready queue,
+keeps `state == RUNNING` (never `PROC_BLOCKED`), and — since kernel-mode is not
+preempted by `sched_tick` — monopolises "current", starving every runnable
+peer. **A real kernel bug affecting any heavily-multithreaded Linux program.**
+
+**Fix (`src/thread.c`):** add `sched_yield()` to the timed-futex poll loop so
+`READY` peers run while it waits toward the deadline (mirrors the untimed path
+above it, which already blocks correctly). **Verified: 77–85s hang → chrome
+runs to ~4.3s** (an ~18x collapse); the heartbeat shows the main thread
+scheduling normally.
+
+**New permanent instruments (kept):** `isr.c` user-stack dump (raw-scans the
+faulting stack, flags main-PIE-range qwords `[0x500000,0x0d000000)` as candidate
+return addresses to symbolize with `objdump --start-address=<val-0x500000>`) +
+`fault_count`/`last_fault_rip` in the terminate dump; the `#ifdef CHROMIUM_BOOT`
+`sched.c` heartbeat (per-proc state/prio/io_boost/enq/eff/onq every ~3s).
+
+## Slice 10 — VMA cap + ABI fills → chrome reaches the render pipeline (DONE)
+
+With the freeze gone, chrome crashed fast (~4.3s) on an *invariant*
+`ImmediateCrash` that three trial fixes (ftruncate, fcntl) did NOT move — the
+tell was in the raw log: **`[mmap] WARN: VMA table FULL (256 entries)`**. The
+per-proc VMA cap (`VMA_MAX_PER_PROC` in `src/mmap.c`) was **256**; chrome maps
+~60 shared libraries (each a whole-file `MAP_PRIVATE` reservation + several
+`MAP_FIXED` segment maps) + V8's cage + ~17 thread stacks + shm — well over 256.
+`vma_alloc` failed → `mmap` `-ENOMEM` → chrome CHECK-crashed. **The entire
+"shared-memory" investigation was a red herring; the invariant crash was always
+an mmap failing on a full VMA table.**
+
+- **`src/mmap.c`: `VMA_MAX_PER_PROC` 256 → 4096** (file-local struct, ~40 B/entry
+  x PROC_MAX ≈ 42 MiB BSS; Linux default `vm.max_map_count` is 65530). Follow-up
+  noted: `MAP_FIXED` should *replace* overlapped VMAs (ld.so's segment maps each
+  add an entry today) + the table could be per-proc heap-allocated.
+- **ABI fills landed alongside** (real bugs regardless): `fcntl(F_GETFL)` returns
+  the fd's access mode (new `struct file.o_accmode`, set in `sys_open`, copied by
+  `file_clone`) instead of a blanket 0 — chrome's shm `CheckPlatformHandle...`
+  reads it; real `ftruncate` (records `f->vfs.size`, was a no-op); `clock_nanosleep`
+  (routes to `nanosleep`, honours `TIMER_ABSTIME`).
+
+**Result: chrome runs 4.3s → ~7–9s, into the render/GL pipeline** (SwANGLE
+`eglInitialize` fails: SwiftShader Vulkan "requested extension not supported",
+non-fatal). New gaps reached: `rename(82)` still `-ENOSYS`.
+
+## Slice 11 — render pipeline: NULL GL-dispatch call (OPEN, current front)
+
+Chrome now dies at ~7–9s with **`EXCEPTION 14` at `rip=0` (err=0x14, user
+instruction-fetch)** — a **call through a NULL function pointer** on the main
+thread, from inside a shared library (return addr `~0x100000b02a80` in the .so
+map region), ~3–5s *after* the non-fatal SwANGLE GL-init errors. Almost certainly
+a GL/EGL dispatch pointer left NULL by the failed `eglInitialize`. This is the
+render-pipeline / GL tier (M2-class). Next: identify the .so (correlate the
+caller addr with ld.so library load addresses) + what pointer is NULL → decide
+shim vs. making SwANGLE actually initialize. `rename` also wants filling.
+
+### Slice 11 GL deep-dive (findings; NOT cracked — the hard tier)
+
+Multiple instrument-first experiments pinned the render wall precisely; the fix
+is genuine ANGLE-internals work, not config. Findings (all reverted to committed
+flags — none dumped the DOM):
+
+- **ANGLE (`libGLESv2.so`) dlopens SwiftShader's ICD (`libvk_swiftshader.so`)
+  DIRECTLY** (its DT_NEEDED is only libc/libpthread/libgcc_s/ld — Vulkan is
+  dlopen'd at runtime), **bypassing `libvulkan.so.1` — the loader that implements
+  the WSI instance extensions.** So `VK_KHR_surface` + `VK_KHR_xcb_surface` (which
+  ANGLE's `vk_renderer.cpp` `VerifyExtensionsPresent` REQUIRES) are absent →
+  `eglInitialize` fails → a NULL GL dispatch is called downstream.
+- **`--use-angle=vulkan` + env `VK_ICD_FILENAMES=/opt/chrome/vk_swiftshader_icd.json`
+  routes ANGLE through the real loader → `VK_KHR_surface` RESOLVES** (progress!).
+  Only `VK_KHR_xcb_surface` then remains.
+- The bundled `libvulkan.so.1` IS built with xcb WSI and `libxcb.so.1`
+  (+ its deps `libXau.so.6`, `libXdmcp.so.6`) are in the sysroot, **but the loader
+  correctly FILTERS OUT `VK_KHR_xcb_surface` because there is no functional X
+  server** (`xcb_connect` has no `DISPLAY`). ANGLE hard-requires it anyway.
+- **`VK_LOADER_DISABLE_INST_EXT_FILTER=1` REGRESSED it** (both surface extensions
+  failed again) — not the override it appeared to be.
+
+**Conclusion:** the real fix is making ANGLE use a SURFACELESS/headless Vulkan
+path (no X11 window surface) — not reachable via the chrome flags / loader env
+tried (`--ozone-platform=headless`, `--disable-features=Vulkan`,
+`--use-angle=vulkan`, the loader filter override). Realistic next options, all
+substantial: (a) a minimal headless X server / `xcb_connect` shim so the loader
+advertises `VK_KHR_xcb_surface`; (b) patch/configure ANGLE for
+`VK_EXT_headless_surface` / surfaceless; (c) provide a headless Vulkan ICD that
+advertises what ANGLE demands. **Track B kernel ABI is proven sufficient — this
+is entirely chrome's own GL stack in a headless environment.**

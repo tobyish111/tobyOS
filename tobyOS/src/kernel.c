@@ -7249,6 +7249,18 @@ void _start(void) {
             (char *)"--no-zygote",
             (char *)"--single-process",
             (char *)"--disable-gpu",
+            /* M1 slice 8 (flags-first): force a PURE-SOFTWARE render path so
+             * navigation can COMPLETE without a working GL display. SwANGLE's
+             * eglInitialize fails on tobyOS (no GL); these route compositing +
+             * raster through the software SkiaRenderer instead, permit
+             * SwiftShader where any GL context is still demanded, and force the
+             * compositor to run all stages + advance virtual time so --dump-dom
+             * fires deterministically. If the DOM still doesn't dump, the block
+             * is NOT GL selection -> go instrument-first (stack-walk the crash). */
+            (char *)"--disable-gpu-compositing",
+            (char *)"--enable-unsafe-swiftshader",
+            (char *)"--run-all-compositor-stages-before-draw",
+            (char *)"--virtual-time-budget=10000",
             (char *)"--disable-dev-shm-usage",
             (char *)"--disable-crash-reporter",
             (char *)"--no-first-run",
@@ -7269,7 +7281,7 @@ void _start(void) {
         struct proc_spec spec = {
             .path = "/opt/chrome/chrome-headless-shell",
             .name = "chrome",
-            .argc = 12, .argv = argv, .envc = 5, .envp = envp,
+            .argc = 16, .argv = argv, .envc = 5, .envp = envp,
         };
         kprintf("[boot] CHROMIUM: spawning REAL headless Chromium "
                 "(chrome-headless-shell --dump-dom); the DELIVERABLE is the "

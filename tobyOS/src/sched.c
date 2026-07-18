@@ -596,6 +596,37 @@ void sched_tick(struct regs *r) {
     /* M28C: count scheduler-tick events as heartbeats too. */
     wdog_kick_sched();
 
+#ifdef CHROMIUM_BOOT
+    /* Chromium bring-up (slice 8): every ~3s, dump every Linux (personality==1)
+     * proc's scheduler state to catch WHAT the main thread is stuck on during
+     * the ~60s freeze (it makes no syscalls, burns little CPU, isn't paging).
+     * Placed BEFORE the ring-3-only early-return below so it fires even when the
+     * tick interrupts kernel code (the freeze case). BSP-only + throttled so the
+     * serial output stays sparse. Diagnostic read of g_proc without a lock is
+     * fine for a heartbeat (worst case a garbled line). */
+    if (me && me->cpu_idx == 0) {
+        static uint64_t last_hb;
+        uint64_t now = perf_now_ns();
+        if (now - last_hb > 3000000000ull) {
+            last_hb = now;
+            extern struct proc g_proc[];
+            uint64_t nt = pit_ticks();
+            kprintf("[hb %lu ms] chrome thread states (pit=%lu):\n",
+                    now / 1000000ull, nt);
+            for (int i = 0; i < PROC_MAX; i++) {
+                struct proc *p = &g_proc[i];
+                if (p->state == PROC_UNUSED || p->personality != 1) continue;
+                uint64_t waited = (nt > p->enq_tick) ? (nt - p->enq_tick) : 0;
+                kprintf("  pid=%d %-8s prio=%d io=%d enq=%lu wait=%lu eff=%d "
+                        "onq=%d rsp=%p\n",
+                        p->pid, proc_state_name(p->state), p->prio,
+                        p->io_boost, p->enq_tick, waited, eff_prio(p, nt),
+                        p->next_ready ? 1 : 0, (void *)p->saved_rsp);
+            }
+        }
+    }
+#endif
+
     /* ---- Fair timeslicing (preemptive) ---------------------------------
      *
      * Only ever preempt when the timer interrupted ring-3 USER code. There the

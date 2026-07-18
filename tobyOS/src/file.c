@@ -162,6 +162,7 @@ struct file *file_clone(struct file *src) {
         }
         f->vfs      = src->vfs;
         f->vfs_refs = src->vfs_refs;
+        f->o_accmode = src->o_accmode;   /* dup'd fd keeps the access mode (F_GETFL) */
         (*f->vfs_refs)++;
         break;
     case FILE_KIND_SOCKET:
