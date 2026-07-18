@@ -4271,15 +4271,32 @@ static uint64_t lx_fd_ino(struct file *f, int fd) {
     if (f) {
         if (f->kind == FILE_KIND_DIR && f->dirpath)
             return lx_ino_hash(f->dirpath);
-        if (f->kind == FILE_KIND_VFS && f->vfs.priv) {
-            uintptr_t p = (uintptr_t)f->vfs.priv;
-            char buf[2 + 16 + 1];
-            const char *hex = "0123456789abcdef";
-            buf[0] = 'n'; buf[1] = ':';
-            for (int i = 0; i < 16; i++)
-                buf[2 + i] = hex[(p >> ((15 - i) * 4)) & 0xf];
-            buf[18] = '\0';
-            return lx_ino_hash(buf);
+        if (f->kind == FILE_KIND_VFS) {
+            /* Prefer the fs-assigned inode: two opens of the same file share it,
+             * so the writable + read-only fds of chrome's shm temp file report
+             * matching st_ino ("Writable and read-only inodes don't match"). */
+            if (f->vfs.ino) {
+                char buf[2 + 16 + 1];
+                const char *hex = "0123456789abcdef";
+                buf[0] = 'i'; buf[1] = ':';
+                for (int i = 0; i < 16; i++)
+                    buf[2 + i] = hex[(f->vfs.ino >> ((15 - i) * 4)) & 0xf];
+                buf[18] = '\0';
+                return lx_ino_hash(buf);
+            }
+            /* Fallback: hash the backing node pointer -- distinct files => distinct
+             * nodes, and (in ramfs) two handles onto the same file share a node, so
+             * ld.so's (st_dev,st_ino) dedup still works. */
+            if (f->vfs.priv) {
+                uintptr_t p = (uintptr_t)f->vfs.priv;
+                char buf[2 + 16 + 1];
+                const char *hex = "0123456789abcdef";
+                buf[0] = 'n'; buf[1] = ':';
+                for (int i = 0; i < 16; i++)
+                    buf[2 + i] = hex[(p >> ((15 - i) * 4)) & 0xf];
+                buf[18] = '\0';
+                return lx_ino_hash(buf);
+            }
         }
     }
     return lx_ino_hash("fd-fallback") + (uint64_t)(uint32_t)fd + 3;

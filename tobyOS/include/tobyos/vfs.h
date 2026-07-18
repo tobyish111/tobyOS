@@ -155,6 +155,15 @@ struct vfs_file {
     uint32_t              uid;
     uint32_t              gid;
     uint32_t              mode;
+    /* Stable per-file inode number, assigned by the fs driver's open hook
+     * (0 = unknown -> fstat falls back to a per-handle synthetic inode). Two
+     * opens of the SAME file must report the same value: Chromium's shm
+     * PlatformSharedMemoryRegion::Create opens a temp file O_RDWR then O_RDONLY
+     * by the same path and CHECKs both fds' fstat st_ino match ("Writable and
+     * read-only inodes don't match; bailing"). Only fs with real inode numbers
+     * (tobyfs) set this; ramfs et al. leave 0 and keep the node-pointer hash
+     * (which is already stable per file there, so ld.so dedup is unaffected). */
+    uint64_t              ino;
     /* Milestone 34E: set by vfs_open if the path matched a sysprot
      * protected prefix. vfs_write consults it so a sandboxed proc
      * can't write through a read-opened handle to a protected file

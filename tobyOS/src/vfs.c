@@ -277,6 +277,7 @@ int vfs_open(const char *path, struct vfs_file *out) {
     out->uid     = 0;
     out->gid     = 0;
     out->mode    = 0;
+    out->ino     = 0;    /* driver open hook may set a stable inode number */
     /* Milestone 34E: stamp protected-prefix bit on the handle so
      * vfs_write can re-check WITHOUT having to remember the path. */
     out->sysprot = sysprot_is_protected(path);
