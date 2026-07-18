@@ -1105,7 +1105,7 @@ __attribute__((noreturn)) void proc_exit(int code) {
         uint32_t zero = 0;
         (void)copy_to_user((void *)(uintptr_t)p->clear_child_tid,
                            &zero, sizeof(zero));
-        (void)futex((uint32_t *)(uintptr_t)p->clear_child_tid, FUTEX_WAKE, 1);
+        (void)futex((uint32_t *)(uintptr_t)p->clear_child_tid, FUTEX_WAKE, 1, 0);
         p->clear_child_tid = 0;
     }
 

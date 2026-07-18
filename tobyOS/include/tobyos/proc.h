@@ -520,9 +520,13 @@ int thread_detach(int tid);
  *   op=0 (FUTEX_WAIT): if *uaddr == expected, block until woken.
  *   op=1 (FUTEX_WAKE): wake up to `val` waiters on uaddr.
  * Returns number of waiters woken (WAKE) or 0/-EAGAIN (WAIT). */
-#define FUTEX_WAIT  0
-#define FUTEX_WAKE  1
-long futex(uint32_t *uaddr, int op, uint32_t val);
+#define FUTEX_WAIT         0
+#define FUTEX_WAKE         1
+#define FUTEX_WAIT_BITSET  9   /* like WAIT but ABSOLUTE timeout (glibc timedwait) */
+#define FUTEX_WAKE_BITSET  10
+/* utimeout: user pointer to a struct timespec, or NULL for an infinite wait.
+ * For FUTEX_WAIT it is a RELATIVE timeout; for FUTEX_WAIT_BITSET, ABSOLUTE. */
+long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout);
 
 /* Initialize the futex hash table. Call once during boot. */
 void futex_init(void);
