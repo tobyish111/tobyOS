@@ -1450,47 +1450,78 @@ static long sys_getpriority(int pid) {
  * size `cap`). Returns 0 on success, -ABI_E* on failure. Absolute paths
  * copy verbatim; relative paths get prefixed with cwd + '/'. The user
  * pointer is consumed HERE (per-copy uaccess) -- callers never touch it. */
+/* Lexically clean an ABSOLUTE path in-place into `out`: collapse runs of '/',
+ * drop "." components, and resolve ".." by popping the previous component
+ * (never above root). Purely lexical (no symlink following -- callers do that
+ * separately via vfs_resolve_path). Returns 0, or -ABI_ENAMETOOLONG if it
+ * doesn't fit. `in` must start with '/'.
+ *
+ * Without this, interior dot-components leak straight through to the fs layer,
+ * whose lookups are a strcmp against normalized entry names (ramfs) or reject
+ * "."/".." outright (tobyfs) -- so e.g. the Vulkan loader dlopen'ing an ICD at
+ * "/opt/chrome/./libvk_swiftshader.so" (built from a relative library_path in
+ * the ICD manifest) got ENOENT even though the file exists. */
+static int path_lexical_clean(const char *in, char *out, size_t cap) {
+    if (cap < 2) return -ABI_ENAMETOOLONG;
+    size_t o = 0;
+    out[o++] = '/';                       /* result is always rooted */
+    const char *s = in;
+    while (*s == '/') s++;                 /* skip leading slashes */
+    while (*s) {
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        size_t clen = (size_t)(e - s);
+        if (clen == 1 && s[0] == '.') {
+            /* "." -- drop */
+        } else if (clen == 2 && s[0] == '.' && s[1] == '.') {
+            /* ".." -- pop the last component, but never above root */
+            while (o > 1 && out[o - 1] != '/') o--;
+            if (o > 1) o--;                /* also drop its leading '/' */
+        } else if (clen > 0) {
+            if (o > 1) {                   /* separator, unless right after root */
+                if (o + 1 >= cap) return -ABI_ENAMETOOLONG;
+                out[o++] = '/';
+            }
+            if (o + clen >= cap) return -ABI_ENAMETOOLONG;
+            memcpy(out + o, s, clen);
+            o += clen;
+        }
+        s = e;
+        while (*s == '/') s++;
+    }
+    out[o] = '\0';
+    return 0;
+}
+
 static int resolve_user_path(const char *user_path, char *out, size_t cap) {
     char up[ABI_PATH_MAX];
     long plen = strncpy_from_user(up, user_path, sizeof(up));
     if (plen < 0) return -ABI_EFAULT;
     if ((size_t)plen >= sizeof(up) - 1) return -ABI_ENAMETOOLONG;
     if (plen == 0 || cap == 0) return -ABI_EINVAL;
-    /* Absolute? */
+
+    /* Build the absolute (still un-normalized) path in `full`, then lexically
+     * clean it into `out`. Interior "/./", "/../", and "//" are all resolved by
+     * path_lexical_clean, so a bare "." / "./foo" cwd-relative path Just Works
+     * (e.g. `busybox ls .` -> opendir(".") -> the cwd) without a special case. */
+    char full[ABI_PATH_MAX];
     if (up[0] == '/') {
-        if ((size_t)plen + 1 > cap) return -ABI_ENAMETOOLONG;
-        memcpy(out, up, (size_t)plen);
-        out[plen] = '\0';
-        return 0;
+        memcpy(full, up, (size_t)plen);
+        full[plen] = '\0';
+    } else {
+        struct proc *p = current_proc();
+        const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
+        size_t clen = strlen(cwd);
+        bool need_slash = (clen == 0 || cwd[clen - 1] != '/');
+        size_t need = clen + (need_slash ? 1 : 0) + (size_t)plen + 1;
+        if (need > sizeof(full)) return -ABI_ENAMETOOLONG;
+        memcpy(full, cwd, clen);
+        size_t o = clen;
+        if (need_slash) full[o++] = '/';
+        memcpy(full + o, up, (size_t)plen);
+        full[o + plen] = '\0';
     }
-    struct proc *p = current_proc();
-    const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
-    size_t clen = strlen(cwd);
-
-    /* Strip a leading "." / "./" so a cwd-relative path resolves against
-     * the cwd rather than producing a bogus "/." -- e.g. `busybox ls .`
-     * (no path arg -> opendir(".")). A bare "." becomes the cwd itself.
-     * Only leading dot-components are collapsed (enough for the common
-     * cases); interior "/./" and ".." are left alone. */
-    char  *rel  = up;
-    size_t rlen = (size_t)plen;
-    while (rlen >= 1 && rel[0] == '.' && (rlen == 1 || rel[1] == '/')) {
-        size_t skip = (rlen == 1) ? 1 : 2;
-        rel += skip; rlen -= skip;
-        while (rlen && rel[0] == '/') { rel++; rlen--; }
-    }
-
-    /* Need cwd + '/' + path + NUL, but skip the slash if cwd already ends
-     * with one (e.g. cwd == "/") or there's no trailing component left. */
-    bool need_slash = rlen > 0 && (clen == 0 || cwd[clen - 1] != '/');
-    size_t need = clen + (need_slash ? 1 : 0) + rlen + 1;
-    if (need > cap) return -ABI_ENAMETOOLONG;
-    memcpy(out, cwd, clen);
-    size_t o = clen;
-    if (need_slash) out[o++] = '/';
-    memcpy(out + o, rel, rlen);
-    out[o + rlen] = '\0';
-    return 0;
+    return path_lexical_clean(full, out, cap);
 }
 
 /* ---- Track B graphics: the Linux framebuffer device /dev/fb0 -----------

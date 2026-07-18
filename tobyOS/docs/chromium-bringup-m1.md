@@ -340,3 +340,73 @@ advertises `VK_KHR_xcb_surface`; (b) patch/configure ANGLE for
 `VK_EXT_headless_surface` / surfaceless; (c) provide a headless Vulkan ICD that
 advertises what ANGLE demands. **Track B kernel ABI is proven sufficient — this
 is entirely chrome's own GL stack in a headless environment.**
+
+## Slice 12 — the extension wall was a tobyOS path bug; wall moves to `xcb_connect` (DONE)
+
+The slice-11 deep-dive concluded `VK_KHR_xcb_surface` was "filtered out because
+there is no X server" and that the fix needed a surfaceless ANGLE / headless
+Vulkan ICD. **Two instrument-first measurements disproved that and found the real
+cause, which is much smaller.** (Both were free — static analysis of the bundled
+`.so`s + a `VK_LOADER_DEBUG=all` boot.)
+
+- **`--use-angle=null` does NOT dodge GL** (two takes). With `--disable-gpu` the
+  null backend is ignored (chrome forces SwANGLE, "all (1) EGL display types
+  failed"); dropping `--disable-gpu` gets null accepted but as "0 EGL display
+  types" — either way the **same NULL GL-dispatch crash** fires. Chrome calls a
+  NULL dispatch whenever GL init yields no usable display, independent of *why*.
+- **The loader does NOT probe an X server.** `libvulkan.so.1`'s `DT_NEEDED` is
+  only libc/libdl/libgcc_s/libpthread — it never links or calls libxcb; it *does*
+  implement `vkCreateXcbSurfaceKHR` + `vkGetPhysicalDeviceXcbPresentationSupportKHR`
+  (built with xcb WSI). So its `VK_KHR_xcb_surface` advertising is compile-time and
+  unconditional — the "filtered because no DISPLAY" theory was wrong. This chrome's
+  ANGLE compiles only `DisplayVkXcb` + `DisplayVkWayland` (no surfaceless class),
+  so ANGLE genuinely requires an X11 (or wayland) WSI — there is no headless ANGLE
+  path to configure.
+- **`VK_LOADER_DEBUG=all` caught the real bug.** Routed through the loader
+  (`--use-angle=vulkan` + `VK_ICD_FILENAMES`), the loader found the ICD manifest
+  but then: `Searching for ICD drivers named ./libvk_swiftshader.so` →
+  `/opt/chrome/./libvk_swiftshader.so: cannot open shared object file: No such
+  file` → `vkCreateInstance: Found no drivers!`. The file **exists** (ANGLE loads
+  it directly in the default run); the interior `.` component in the loader-built
+  path was the problem. **`src/syscall.c resolve_user_path` copied absolute paths
+  verbatim and only collapsed *leading* dot-components of relative paths** —
+  interior `/./`, `/../`, and `//` leaked straight to the fs layer, whose lookups
+  are a `strcmp` against normalized entry names (ramfs) or reject `.`/`..` outright
+  (tobyfs). A real ABI gap any Linux program can hit.
+
+**Fix (`src/syscall.c`): a `path_lexical_clean()` pass** (collapse `//`, drop
+`.`, resolve `..` by popping a component, never above root) applied to the final
+absolute path for every syscall that takes a path. Host-unit-tested across the
+tricky cases (`/a/b/../../../c`→`/c`, `/..`→`/`, dotted filenames like `/....`
+and `/a/..b/c` preserved). It subsumes the old leading-`./` special case.
+
+**Result (measured, `bash logs/chromium-m0.sh`):** the ICD now loads, the loader
+enumerates **"SwiftShader Device (Subzero)"**, `vkCreateInstance` succeeds, and
+**every `VerifyExtensionsPresent` / `VK_KHR_xcb_surface` error is GONE (0 hits)** —
+the entire Vulkan instance + extension wall is passed. Chrome now advances ~1s
+further and dies at the *next*, precisely-identified wall:
+
+```
+DisplayVkXcb.cpp:62 (initialize): xcb_connect() failed, error 1
+Display.cpp:1128 (initialize): ANGLE Display::initialize error 0: Not initialized.
+eglInitialize Vulkan failed with error EGL_NOT_INITIALIZED
+```
+
+`xcb_connect()` (XCB_CONN_ERROR) fails because there is no X server at `DISPLAY=:0`
+and tobyOS AF_UNIX is **socketpair-only** (no named/abstract bind/connect). The
+same gap makes D-Bus fail earlier (`Failed to open socket: Invalid argument`).
+The harness now commits the loader route (`--use-gl=angle --use-angle=vulkan
+--enable-unsafe-swiftshader` + `VK_ICD_FILENAMES` + `DISPLAY=:0`).
+
+## Slice 13 — minimal fake X server over named AF_UNIX (OPEN, current front)
+
+The remaining blocker is now concrete and NOT the "surfaceless ANGLE / headless
+ICD" the slice-11 deep-dive imagined: ANGLE's `DisplayVkXcb::initialize` needs a
+live `xcb_connect()`. Plan: (1) named/abstract AF_UNIX (`bind`/`listen`/`accept`/
+`connect` on `sockaddr_un`, reusing `src/socket.c`'s `SOCK_KIND_UNIX` rings) —
+this also unblocks D-Bus; (2) a minimal fake X server answering the X11
+connection-setup handshake (`xConnClientPrefix` → `xConnSetupSuccess` with ≥1
+screen/depth/visual) at `/tmp/.X11-unix/X0` so `xcb_connect` succeeds. Chrome is
+headless (`--dump-dom`), so it never opens a real window — the handshake + a
+couple of local setup queries should suffice. Then `--dump-dom` should print
+`<h1>tobyOS</h1>`; then switch to `--screenshot` and host-diff.
