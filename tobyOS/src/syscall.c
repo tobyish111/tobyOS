@@ -23,6 +23,7 @@
 #include <tobyos/kmath.h>      /* C20: kernel libm for the float-return shims */
 #include <tobyos/proc.h>
 #include <tobyos/file.h>
+#include <tobyos/mmap.h>   /* memfd_* (memfd_create) */
 #include <tobyos/pipe.h>
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
@@ -4820,6 +4821,28 @@ static long lx_eventfd(unsigned int initval, unsigned int flags) {
     return fd;
 }
 
+/* memfd_create(name, flags) (slice 20): an anonymous, page-backed,
+ * mmap-COHERENT shared-memory fd. Chrome's compositor / base::*SharedMemoryRegion
+ * memfd_create()s, ftruncate()s, then mmap()s it (often twice: a writable and a
+ * read-only view) and relies on writes through one mapping being visible through
+ * the other -- which tobyOS's copy-based file mmap can't do, but a memfd (mapping
+ * the SAME physical pages) does. `name` is advisory (ignored); flags
+ * (MFD_CLOEXEC/MFD_ALLOW_SEALING) are accepted but not tracked. */
+static long lx_memfd_create(const char *uname, unsigned int flags) {
+    (void)uname; (void)flags;
+    struct memfd *mf = memfd_new();
+    if (!mf) return -ABI_ENOMEM;
+    struct file *f = (struct file *)kmalloc(sizeof *f);
+    if (!f) { memfd_unref(mf); return -ABI_ENOMEM; }
+    memset(f, 0, sizeof *f);
+    f->kind      = FILE_KIND_MEMFD;
+    f->memfd     = mf;
+    f->o_accmode = 2;                 /* O_RDWR: a memfd is always read+write */
+    int fd = fd_alloc_into(current_proc(), f);
+    if (fd < 0) { file_close(f); return -ABI_EMFILE; }
+    return fd;
+}
+
 static long lx_socket(int domain, int type, int proto) {
     (void)proto;
     /* AF_UNIX stream/seqpacket/dgram: an in-memory IPC endpoint (SOCK_KIND_UNIX),
@@ -5484,7 +5507,21 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_pwrite64:
         return sys_pwrite64((int)a1, (const void *)a2, (size_t)a3, (int64_t)a4);
     case LX_close:  return do_syscall(SYS_CLOSE, a1, 0, 0, 0, 0);
-    case LX_lseek:  return do_syscall(SYS_LSEEK, a1, a2, a3, 0, 0);
+    case LX_lseek: {
+        struct file *lf = fd_lookup((int)a1);
+        if (lf && lf->kind == FILE_KIND_MEMFD) {   /* cursor lives in vfs.pos */
+            int64_t off = (int64_t)a2; int whence = (int)a3;
+            int64_t base = (whence == 0) ? 0
+                         : (whence == 1) ? (int64_t)lf->vfs.pos
+                         : (whence == 2) ? (int64_t)memfd_size(lf->memfd) : -1;
+            if (base < 0) return -ABI_EINVAL;
+            int64_t np = base + off;
+            if (np < 0) return -ABI_EINVAL;
+            lf->vfs.pos = (size_t)np;
+            return np;
+        }
+        return do_syscall(SYS_LSEEK, a1, a2, a3, 0, 0);
+    }
     case LX_open: {                    /* (path, flags, mode) */
         /* Opening a directory yields a getdents64-capable dir fd; files
          * fall through to the normal VFS open. */
@@ -5524,6 +5561,8 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Track C: eventfd/eventfd2 (libcurl multi-handle wakeup fd) ---- */
     case LX_eventfd:   return lx_eventfd((unsigned int)a1, 0);
     case LX_eventfd2:  return lx_eventfd((unsigned int)a1, (unsigned int)a2);
+    case 319:          /* memfd_create(name, flags) */
+        return lx_memfd_create((const char *)a1, (unsigned int)a2);
 
     /* ---- B14: BSD sockets (FILE_KIND_SOCKET fds; poll/epoll-ready) ---- */
     case LX_socket:      return lx_socket((int)a1, (int)a2, (int)a3);
@@ -5738,6 +5777,11 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
             vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
                                     .uid = f->vfs.uid, .gid = f->vfs.gid,
                                     .mode = f->vfs.mode };
+        } else if (f->kind == FILE_KIND_MEMFD) {
+            /* Chrome fstats the memfd to size its mapping + CHECK st_size. */
+            vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
+                                    .size = (size_t)memfd_size(f->memfd),
+                                    .mode = 0777 };
         } else {
             /* console/pipe/socket: report a minimal regular-file stat. */
             vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = 0,
@@ -5989,6 +6033,8 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
          * zero-filled, so no on-disk blocks are needed here. Non-VFS fds keep the
          * old accept-as-success behaviour (wget's alarm-timeout ftruncate). */
         struct file *tf = fd_lookup((int)a1);
+        if (tf && tf->kind == FILE_KIND_MEMFD && (long)a2 >= 0)
+            return memfd_ftruncate(tf->memfd, (uint64_t)a2);   /* allocates pages */
         if (tf && tf->kind == FILE_KIND_VFS && (long)a2 >= 0)
             tf->vfs.size = (size_t)a2;
         return 0;
@@ -6041,6 +6087,9 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         struct file *mf = (fd >= 0) ? fd_lookup(fd) : NULL;
         if (mf && mf->kind == FILE_KIND_FB)          /* /dev/fb0 shadow scanout */
             ret = fbdev_mmap((uint64_t)a2);
+        else if (mf && mf->kind == FILE_KIND_MEMFD)  /* coherent shared memory */
+            ret = memfd_map((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
+                            lx_mmap_flags(lf), mf->memfd, lx_mmap_offset());
         else if ((lf & LXMAP_ANONYMOUS) || fd < 0)   /* anonymous (malloc/TLS) */
             ret = sys_mmap((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
                            lx_mmap_flags(lf), -1, 0);
@@ -6317,6 +6366,19 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
             struct file *ff = fd_lookup((int)a1);
             if (!ff) return -ABI_EBADF;
             return ff->o_accmode;
+        }
+        if ((int)a2 == 1033 /* F_ADD_SEALS */) {
+            /* Chrome's Mojo shared-memory channel (channel_linux.cc) seals its
+             * memfd then CHECKs F_GET_SEALS reports them -- returning 0 there is
+             * a FATAL "Check failed". Store the seals on the memfd. */
+            struct file *ff = fd_lookup((int)a1);
+            if (!ff || ff->kind != FILE_KIND_MEMFD) return -ABI_EINVAL;
+            return memfd_add_seals(ff->memfd, (unsigned int)a3);
+        }
+        if ((int)a2 == 1034 /* F_GET_SEALS */) {
+            struct file *ff = fd_lookup((int)a1);
+            if (!ff || ff->kind != FILE_KIND_MEMFD) return -ABI_EINVAL;
+            return memfd_get_seals(ff->memfd);
         }
         return 0;               /* F_GETFD/F_SETFD/F_SETFL/CLOEXEC: best-effort no-op */
     }

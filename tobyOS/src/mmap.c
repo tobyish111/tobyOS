@@ -51,6 +51,9 @@
 #define VMA_FLAG_PRIVATE   0x04
 #define VMA_FLAG_FIXED     0x08
 #define VMA_FLAG_COW       0x10
+/* The VMA's physical pages are owned by something else (a memfd) -- munmap must
+ * unmap them but MUST NOT pmm_free them (the memfd frees them at close). */
+#define VMA_FLAG_NOFREE    0x20
 
 struct mmap_vma {
     uint64_t start;
@@ -338,11 +341,12 @@ long sys_munmap(uint64_t addr, uint64_t len) {
         uint64_t start = (addr > v->start) ? addr : v->start;
         uint64_t end   = ((addr + len) < v->end) ? (addr + len) : v->end;
 
+        bool nofree = (v->flags & VMA_FLAG_NOFREE) != 0;   /* memfd-backed pages */
         for (uint64_t a = start; a < end; a += PAGE_SIZE) {
             uint64_t phys = vmm_translate(a);
             if (phys) {
                 vmm_unmap(a, PAGE_SIZE);
-                pmm_free_page(phys & PAGE_MASK);
+                if (!nofree) pmm_free_page(phys & PAGE_MASK);
             }
         }
         vmm_set_editor_root(saved_root);
@@ -607,4 +611,162 @@ uint64_t mmap2_mapped_bytes(int pid) {
         total += vt->entries[i].end - vt->entries[i].start;
     }
     return total;
+}
+
+/* ==================================================================
+ * memfd -- anonymous, page-backed, mmap-COHERENT shared memory.
+ * The memfd owns a growable list of physical pages; every mmap of the memfd
+ * maps those SAME pages (real sharing), and read/write() touch them too. Pages
+ * are freed only at the last close (memfd_unref); munmap leaves them
+ * (VMA_FLAG_NOFREE). This is what chrome's compositor / *SharedMemoryRegion
+ * needs -- file-backed mmap (linux_mmap_file) only copies, breaking sharing.
+ * ================================================================== */
+
+struct memfd {
+    uint64_t *pages;    /* physical page addrs (PMM); index i == file page i */
+    size_t    npages;   /* number of allocated pages (high-water) */
+    size_t    cap;      /* capacity of pages[] */
+    uint64_t  size;     /* logical size (ftruncate/write) */
+    int       refs;     /* fd-level refcount (dup/clone) */
+    unsigned  seals;    /* F_ADD_SEALS bits (accepted, informational) */
+};
+
+struct memfd *memfd_new(void) {
+    struct memfd *mf = (struct memfd *)kmalloc(sizeof *mf);
+    if (!mf) return 0;
+    mf->pages = 0; mf->npages = 0; mf->cap = 0;
+    mf->size = 0; mf->refs = 1; mf->seals = 0;
+    return mf;
+}
+
+void memfd_ref(struct memfd *mf) { if (mf) mf->refs++; }
+
+void memfd_unref(struct memfd *mf) {
+    if (!mf) return;
+    if (--mf->refs > 0) return;
+    for (size_t i = 0; i < mf->npages; i++)
+        if (mf->pages[i]) pmm_free_page(mf->pages[i]);
+    if (mf->pages) kfree(mf->pages);
+    kfree(mf);
+}
+
+/* Ensure the memfd owns at least `want` allocated (zero-filled) physical pages. */
+static int memfd_ensure_pages(struct memfd *mf, size_t want) {
+    if (want <= mf->npages) return 0;
+    if (want > mf->cap) {
+        size_t ncap = mf->cap ? mf->cap : 8;
+        while (ncap < want) ncap *= 2;
+        uint64_t *np = (uint64_t *)kmalloc(ncap * sizeof(uint64_t));
+        if (!np) return -1;
+        for (size_t i = 0; i < mf->npages; i++) np[i] = mf->pages[i];
+        for (size_t i = mf->npages; i < ncap; i++) np[i] = 0;
+        if (mf->pages) kfree(mf->pages);
+        mf->pages = np; mf->cap = ncap;
+    }
+    for (size_t i = mf->npages; i < want; i++) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) return -1;
+        memset((char *)(phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
+        mf->pages[i] = phys;
+    }
+    mf->npages = want;
+    return 0;
+}
+
+/* Linux file-seal bits (fcntl F_ADD_SEALS). */
+#define MFD_SEAL_SEAL         0x0001u
+#define MFD_SEAL_SHRINK       0x0002u
+#define MFD_SEAL_GROW         0x0004u
+#define MFD_SEAL_WRITE        0x0008u
+#define MFD_SEAL_FUTURE_WRITE 0x0010u
+
+long memfd_ftruncate(struct memfd *mf, uint64_t size) {
+    if (!mf) return -1;
+    if ((mf->seals & MFD_SEAL_SHRINK) && size < mf->size) return -1;  /* -EPERM */
+    if ((mf->seals & MFD_SEAL_GROW)   && size > mf->size) return -1;
+    size_t want = (size_t)((size + PAGE_SIZE - 1) / PAGE_SIZE);
+    if (memfd_ensure_pages(mf, want) < 0) return -12;   /* -ENOMEM */
+    mf->size = size;
+    return 0;
+}
+
+uint64_t memfd_size(struct memfd *mf) { return mf ? mf->size : 0; }
+
+/* fcntl(F_ADD_SEALS): OR in the requested seals. Once F_SEAL_SEAL is set no
+ * further seals may be added (-EPERM). */
+long memfd_add_seals(struct memfd *mf, unsigned int seals) {
+    if (!mf) return -1;
+    if (mf->seals & MFD_SEAL_SEAL) return -1;   /* -EPERM: sealed against sealing */
+    mf->seals |= seals;
+    return 0;
+}
+long memfd_get_seals(struct memfd *mf) { return mf ? (long)mf->seals : 0; }
+
+long memfd_read(struct memfd *mf, uint64_t pos, void *dst, size_t n) {
+    if (!mf || !dst) return -1;
+    if (pos >= mf->size) return 0;
+    if (pos + n > mf->size) n = (size_t)(mf->size - pos);
+    size_t done = 0;
+    char *out = (char *)dst;
+    while (done < n) {
+        size_t pi = (size_t)((pos + done) / PAGE_SIZE);
+        size_t po = (size_t)((pos + done) % PAGE_SIZE);
+        size_t chunk = PAGE_SIZE - po;
+        if (chunk > n - done) chunk = n - done;
+        uint64_t phys = (pi < mf->npages) ? mf->pages[pi] : 0;
+        if (phys) memcpy(out + done, (char *)(phys + vmm_hhdm_offset()) + po, chunk);
+        else      memset(out + done, 0, chunk);     /* sparse hole -> zero */
+        done += chunk;
+    }
+    return (long)done;
+}
+
+long memfd_write(struct memfd *mf, uint64_t pos, const void *src, size_t n) {
+    if (!mf || !src) return -1;
+    if (n == 0) return 0;
+    size_t want = (size_t)((pos + n + PAGE_SIZE - 1) / PAGE_SIZE);
+    if (memfd_ensure_pages(mf, want) < 0) return -12;
+    size_t done = 0;
+    const char *in = (const char *)src;
+    while (done < n) {
+        size_t pi = (size_t)((pos + done) / PAGE_SIZE);
+        size_t po = (size_t)((pos + done) % PAGE_SIZE);
+        size_t chunk = PAGE_SIZE - po;
+        if (chunk > n - done) chunk = n - done;
+        memcpy((char *)(mf->pages[pi] + vmm_hhdm_offset()) + po, in + done, chunk);
+        done += chunk;
+    }
+    if (pos + n > mf->size) mf->size = pos + n;
+    return (long)done;
+}
+
+long memfd_map(uint64_t addr, uint64_t len, uint32_t prot, uint32_t flags,
+               struct memfd *mf, uint64_t offset) {
+    struct proc *p = current_proc();
+    if (!p || !mf) return -1;
+    int pid = p->is_thread ? p->tgid : p->pid;
+    struct vma_table *vt = &g_vma_tables[pid];
+    if (len == 0) return -22;
+    len = page_align_up(len);
+    offset = page_align_down(offset);
+    size_t page_off = (size_t)(offset / PAGE_SIZE);
+    size_t np = (size_t)(len / PAGE_SIZE);
+    if (memfd_ensure_pages(mf, page_off + np) < 0) return -12;
+
+    uint64_t base;
+    if ((flags & VMA_FLAG_FIXED) && addr) base = page_align_down(addr);
+    else { base = find_free_region(vt, len); if (!base) return -12; }
+
+    struct mmap_vma *v = vma_alloc(vt);
+    if (!v) return -12;
+    v->start = base; v->end = base + len; v->prot = prot;
+    v->flags = (flags | VMA_FLAG_NOFREE) & ~(uint32_t)VMA_FLAG_ANON;
+    v->fd = -1; v->offset = offset;
+
+    uint32_t vmm_f = prot_to_vmm_flags(prot);
+    uint64_t saved = vmm_set_editor_root(p->cr3);
+    for (size_t i = 0; i < np; i++)
+        vmm_map(base + i * PAGE_SIZE, mf->pages[page_off + i], PAGE_SIZE, vmm_f);
+    vmm_set_editor_root(saved);
+    return (long)base;
 }

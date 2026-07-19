@@ -27,6 +27,7 @@
 #include <tobyos/signal.h>
 #include <tobyos/tty.h>
 #include <tobyos/pty.h>
+#include <tobyos/mmap.h>   /* memfd_* (FILE_KIND_MEMFD) */
 #include <tobyos/klibc.h>
 #include <tobyos/cpu.h>
 #include <tobyos/sched.h>
@@ -195,6 +196,12 @@ struct file *file_clone(struct file *src) {
         f->efd = src->efd;
         if (f->efd) f->efd->refs++;
         break;
+    case FILE_KIND_MEMFD:
+        /* dup/dup2/fork share the SAME page-backed object; bump its refcount.
+         * The per-fd cursor (vfs.pos) starts fresh at 0 for the new fd. */
+        f->memfd = src->memfd;
+        memfd_ref(f->memfd);
+        break;
     case FILE_KIND_DIR:
         /* Deep-copy the directory path so each clone owns its own buffer
          * (avoids a double-free on close); resume offset carries over. */
@@ -264,6 +271,9 @@ void file_close(struct file *f) {
     case FILE_KIND_EVENTFD:
         if (f->efd && --f->efd->refs == 0) kfree(f->efd);
         break;
+    case FILE_KIND_MEMFD:
+        memfd_unref(f->memfd);   /* frees pages+object at the last ref */
+        break;
     case FILE_KIND_CONSOLE:
     case FILE_KIND_NULL:
         break;
@@ -283,6 +293,11 @@ long file_read(struct file *f, void *buf, size_t n) {
         return pty_slave_read(f, buf, n);
     case FILE_KIND_EVENTFD:
         return eventfd_read(f, buf, n);
+    case FILE_KIND_MEMFD: {
+        long r = memfd_read(f->memfd, f->vfs.pos, buf, n);
+        if (r > 0) f->vfs.pos += (size_t)r;
+        return r;
+    }
     case FILE_KIND_PIPE_R:
         return pipe_read(f->pipe, buf, n);
     case FILE_KIND_VFS:
@@ -335,6 +350,11 @@ long file_write(struct file *f, const void *buf, size_t n) {
         return pty_slave_write(f, buf, n);
     case FILE_KIND_EVENTFD:
         return eventfd_write(f, buf, n);
+    case FILE_KIND_MEMFD: {
+        long w = memfd_write(f->memfd, f->vfs.pos, buf, n);
+        if (w > 0) f->vfs.pos += (size_t)w;
+        return w;
+    }
     case FILE_KIND_PIPE_W:
         return pipe_write(f->pipe, buf, n);
     case FILE_KIND_VFS:
