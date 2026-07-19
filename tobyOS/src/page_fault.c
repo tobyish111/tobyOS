@@ -288,13 +288,25 @@ int uaccess_prepare_write(uint64_t addr, uint64_t len) {
                       ((pte && (*pte & PTE_PRESENT)) ? PF_ERR_PRESENT : 0);
         if (page_fault_handler(va, ec, p))   continue;  /* demand/COW resolved */
         if (mmap_handle_page_fault(va, ec))  continue;
-        {   /* slice 18 diagnostic: which syscall aimed at a read-only user buf */
+        {   /* Diagnostic: a syscall aimed copy_to_user at a read-only/unmapped
+             * user page. NOTE (slice 19): the recurring hit here on chrome is
+             * BENIGN and correct -- Chromium's base::ProtectedMemory verifies its
+             * function-pointer table is read-only by issuing a SYSCALL write
+             * (prlimit64 old_limit=&protected) and expecting EFAULT (a CPU write
+             * would SIGSEGV; a syscall write cleanly returns -EFAULT). Returning
+             * -EFAULT here is the correct Linux behaviour, not a bug to fix.
+             * Dump the raw PTE to distinguish present-read-only from unmapped. */
             static int logged = 0;
             if (logged < 8) {
                 logged++;
-                kprintf("[uaccess] copy_to_user -> EFAULT: read-only/unmapped "
-                        "user addr=0x%lx (page 0x%lx)\n",
-                        (unsigned long)addr, (unsigned long)va);
+                uint64_t praw = pte ? *pte : 0;
+                kprintf("[uaccess] copy_to_user -> EFAULT: addr=0x%lx page=0x%lx "
+                        "pte=0x%lx [%s%s%s]\n",
+                        (unsigned long)addr, (unsigned long)va,
+                        (unsigned long)praw,
+                        (praw & PTE_PRESENT)  ? "P" : "-",
+                        (praw & PTE_WRITABLE) ? "W" : "r",
+                        (praw & PTE_USER)     ? "U" : "k");
                 if (logged == 1) {
                     extern void lx_dump_recent_syscalls(void);
                     lx_dump_recent_syscalls();

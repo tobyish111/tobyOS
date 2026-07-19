@@ -569,3 +569,83 @@ panic (slice 18). Kernel/ABI gains that outlive chrome: interior-dot
 path normalization, named/abstract AF_UNIX + recvmsg/recvfrom on UNIX, stable
 per-file inodes, tobyfs `rename`/`fsync`/`unlinkat`/`flock`, and the SA_RESETHAND
 one-shot-signal fix.
+
+## Slice 20 — slice 19 was a MISDIAGNOSIS; the real front is the render tier (2026-07-19)
+
+**Slice 19 ("read() into a read-only page") is a NON-BUG.** Instrument-first (an
+mprot-lo watch in `sys_mprotect`, a PTE-flag dump in the uaccess EFAULT path, and
+an lx-cur current-syscall capture) proved:
+
+- The address `0xc0da000`–`0xc0dc000` is chrome's own ELF section
+  **`protected_memory`** (`base::ProtectedMemory`; `objdump -h` shows
+  `protected_memory` vaddr `0xbbda000` size `0x101a` → runtime
+  `[0xc0da000,0xc0db01a)`; `gc_info_section` sits just below).
+- **Chrome itself `mprotect`s it `PROT_READ`** after init (a read-only
+  function-pointer table).
+- The recurring `copy_to_user` EFAULT is chrome **verifying** the section is
+  read-only: it issues a **syscall write** —
+  `prlimit64(0, RLIMIT_NPROC, NULL, old_limit=0xc0db000)` into the protected page —
+  and expects `-EFAULT` (a CPU write would `SIGSEGV`; a syscall write returns
+  `-EFAULT` cleanly). Confirmed: the *same thread* does `mprotect(RO)` then the
+  `prlimit64` into it.
+- ⇒ tobyOS's slice-18 fix (`copy_to_user` returns `-EFAULT` instead of panicking)
+  is **exactly correct** and makes chrome's protection check pass. Nothing to fix
+  here. The old "downstream NULL deref at 0x210" is a *separate*, non-deterministic
+  teardown crash (`mov 0x210(%r14)`, `r14 = *(%fs:0-0x278)` = a NULL TLS pointer).
+
+**The real remaining wall = the render tier, two intertwined problems:**
+
+1. **A flaky (timing-dependent) crash.** When it fires it is *deterministically* at
+   **`memcpy+0x35d` in `libc.so.6`** (rip `0x100000b6e34d`, identical across runs;
+   `.so` base `0x100000ac3000` + `0xab34d`, in libc's RX segment) — a **write** fault
+   to `0x102d0735f940`, which is **covered by a VMA but `prot=0x0` (PROT_NONE) — a
+   thread-stack GUARD page** (tid 11's clone stack `0x102d0735d8c0`, guard
+   `[0x102d0735f000,0x102d07360000)` above it). So the memcpy **destination is a wild
+   pointer landing in a guard page — NOT a stack-size bug** (there is plenty of stack
+   below `rsp`); confirmed **memory corruption** during SwiftShader **Vulkan
+   device/extension enumeration** (the thread's stack is
+   full of `VK_EXT_swapchain_maintenance1` / `graphics_pipeline_library` /
+   `descriptor…` strings; the thread was doing `socket`/`connect`/`getpeername`/
+   `fcntl`/`poll` = `xcb_connect` to the in-kernel fake X server). Chrome's crash
+   reporter then double-faults in ld.so (`0x400128a4`, `cr2=-16`) → exit `code=1`.
+   This is the **same memory-corruption family** as the original-log ld.so crash:
+   `check_match+0xd1` reading libvulkan's `link_map->l_versyms` = **garbage**
+   (`0x102d0ab69808`, a pointer into a `PROT_NONE` cage hole; off by exactly
+   `0x1495000`, page-aligned, from the correct value — while the *same* link_map's
+   `l_symtab` is correct). One corruption root ⇒ garbage lengths/pointers/link_map
+   fields.
+2. **Even when GL init *succeeds* (no crash — e.g. runs where SwiftShader is chosen
+   cleanly), chrome still never navigates / dumps the DOM.** It runs its full
+   engine, does ~5.7k main-thread syscalls (the main thread idle-spins on
+   `gettimeofday` = the message loop waiting), then exits `code=0` with **no DOM**.
+   Classic render/navigation stall.
+
+**Constraints learned (save the next agent time):**
+
+- **VLOG is compiled OUT of official `chrome-headless-shell`** — `--vmodule` /
+  `--v=1` produce **zero** output. Cannot trace navigation via chrome's own logs.
+- fds 0/1/2 are all `console_file_make()` → serial (chrome's `ERROR:` stderr lines
+  appear), so `--dump-dom`'s stdout (fd 1) **would** show if produced. It doesn't ⇒
+  chrome genuinely never dumps.
+- Dropping the screenshot-oriented flags
+  (`--run-all-compositor-stages-before-draw` / `--virtual-time-budget` /
+  `--disable-gpu-compositing`) did **not** yield the DOM (reverted).
+- The gap syscalls every run (`memfd_create` 319, `landlock` 444, `fchown` 93 — all
+  `-ENOSYS`) are **not** the blocker (chrome degrades / falls back).
+
+**Committable diagnostics added this slice (CHROMIUM_BOOT, no behaviour change,
+regression-free):** the uaccess EFAULT path now dumps PTE flags `[P/r/W/U]`
+(present-RO vs unmapped) with a corrected comment (the protected_memory EFAULT is
+benign/correct); `linux_mmap_file` logs a **lib load map**
+`[libmap] base len prot off fd ino` (.so's pack from `0x100000000000`; `off=0` lines
+are each `.so` base — correlate a *same-run* `.so`-region crash rip → base+off →
+`objdump` the `.so`).
+
+**Next (root-cause the ONE memory-corruption root — it gates both the crash and
+likely the no-navigation):** poison/track ld.so `link_map` writes; look for an
+allocator/address collision (ld.so link_maps vs the V8 cage / PartitionAlloc /
+thread stacks — both the garbage `l_versyms` and the `memcpy` dest point into the
+`0x102d0…` reservation/stack region); or a syscall filling a struct slightly wrong
+that SwiftShader/xcb reads as a length. Separately, since VLOG is stripped, probe
+*why* `--dump-dom` doesn't fire on load a different way (syscall-trace the renderer
+thread, or switch the harness to a DevTools-pipe DOM dump).

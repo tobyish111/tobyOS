@@ -17,6 +17,36 @@ subject of the *original* handoff is DONE; this is the tail past it.
 
 ---
 
+## ⚠️ CORRECTION (2026-07-19, slice 20) — READ THIS BEFORE "The current wall (slice 19)" BELOW
+
+**Slice 19 as written below is a MISDIAGNOSIS. The "`read()` into a read-only page"
+is a NON-BUG — do NOT chase it.** Measured (see `docs/chromium-bringup-m1.md`
+"Slice 20" + memory `chromium-bringup.md` SLICE 20):
+
+- `0xc0da000`–`0xc0dc000` is chrome's own ELF section **`protected_memory`**
+  (`base::ProtectedMemory`, a RO-after-init function-pointer table; `objdump -h`).
+  **Chrome itself `mprotect`s it `PROT_READ`**, then *verifies* it's read-only by
+  issuing a **syscall write** — `prlimit64(0,RLIMIT_NPROC,NULL,old_limit=0xc0db000)` —
+  and **expecting `-EFAULT`**. Slice-18's `copy_to_user → -EFAULT` is therefore
+  **exactly correct**; chrome's check passes. There is nothing to fix here.
+- The "downstream NULL deref at 0x210" is a *separate*, non-deterministic teardown
+  crash, not caused by the EFAULT.
+
+**The REAL front is the render tier** (not a loader/RELRO bug): (1) a flaky,
+timing-dependent crash that when it fires is *deterministically* `memcpy+0x35d` in
+`libc.so.6` (a **stack overflow from a corrupt/too-large length** during SwiftShader
+Vulkan extension enumeration) — the **same memory-corruption family** as the ld.so
+`check_match` crash reading libvulkan's `link_map->l_versyms = garbage`; and (2)
+even when GL init *succeeds*, chrome never navigates/dumps the DOM (idle-exits
+`code=0`). **VLOG is compiled out of official chrome** (`--vmodule`/`-v=1` = zero
+output). A **lib load map** (`[libmap]` in `linux_mmap_file`) and a PTE-flag dump in
+the uaccess path are now in-tree (CHROMIUM_BOOT). **NEXT = root-cause the single
+memory-corruption root** (ld.so link_map vs V8-cage/stack allocator collision?) — it
+gates both the crash and probably the no-navigation. Ignore the "slice 19" section
+below except as historical context.
+
+---
+
 ## THE PRIME DIRECTIVE: instrument-first, reuse what exists, add the smallest shim
 
 Every win in this arc came from **measuring, not guessing** — and repeatedly
