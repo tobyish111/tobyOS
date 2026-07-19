@@ -649,3 +649,48 @@ thread stacks — both the garbage `l_versyms` and the `memcpy` dest point into 
 that SwiftShader/xcb reads as a length. Separately, since VLOG is stripped, probe
 *why* `--dump-dom` doesn't fire on load a different way (syscall-trace the renderer
 thread, or switch the harness to a DevTools-pipe DOM dump).
+
+## Slice 20 deep-dive — the crash and the no-DOM are SEPARATE blockers (2026-07-19, runs 23-26)
+
+Followed the render-tier finding with a set of cheap black-box experiments (the
+crash is non-deterministic, so several reboots of the same/rebuilt ISO):
+
+- **`--disable-gpu` + `--disable-software-rasterizer` routes AROUND the GL/Vulkan
+  (SwiftShader) path entirely** — 0 crashes, chrome runs CLEAN — **but still no DOM.**
+  So the flaky Vulkan crash and the missing-DOM are *independent* problems. The
+  harness now commits `--disable-gpu` for the `--dump-dom` milestone (a clean,
+  crash-free baseline that isolates the real blocker; the ANGLE/Vulkan/fake-X work
+  from slices 12-14 stays in-tree and in history for the later `--screenshot` tier).
+- **A fd-1 (stdout) write instrument (`sys_write`) shows chrome writes NOTHING to
+  stdout** (only the boot smoke-test program's two writes). So chrome never reaches
+  the `--dump-dom` output — this is **not** a stdio-buffering loss (fds 0/1/2 are all
+  `console_file_make()` → serial, and chrome's stderr `ERROR:` lines do appear).
+- **`about:blank` behaves IDENTICALLY** (no DOM, ~the same 4736 syscalls). So the
+  stall is **fundamental — not the `data:` URL, not URL parsing.** Chrome never
+  navigates *any* URL.
+- **Not an SMP/memory-ordering race:** rebooting the same ISO with `-smp 1` still
+  crashed at the *identical* rip `0x100000b6e34d`. The corruption is a
+  timing-dependent logic bug, not true multi-core parallelism.
+- **At the stall chrome is NOT idle-blocked — it's a distributed busy livelock.** A
+  recent-syscall-ring dump piggybacked on the `sched.c` heartbeat shows: ~20 threads
+  READY/cycling, **pid 27 churning `mmap`/`munmap` (97× in the rings)**, **pid 28
+  burning 6490 ms CPU in *user* code between `epoll_wait`s**, and the IO threads
+  (8, 21) `epoll_wait`ing with no events ever arriving — until the
+  `--virtual-time-budget` fires and chrome exits `code=0`. This looks like the
+  compositor/viz (allocator + a hot worker) churning while the browser never
+  reaches `OnBrowserStart`/navigate.
+
+**Net:** the primary blocker for `--dump-dom` is the **navigation/`OnBrowserStart`
+stall**, now cleanly isolated (no crash) under `--disable-gpu`. Concrete next steps:
+(1) **`memfd_create(319)` is `-ENOSYS`** — chrome's shared-memory / compositor
+(discardable) buffers use `memfd` on Linux; implement it as an anonymous, growable
+file whose `mmap` maps the *same* backing pages (coherent shared memory — NOT
+`linux_mmap_file`'s copy), plus `ftruncate` and the slice-14 map-twice-same-inode
+shape; a strong candidate unblock. (2) Since VLOG is compiled out of official chrome,
+get its internal state another way — drive the **DevTools protocol over
+`--remote-debugging-pipe`** (fds 3/4) from the harness (`Page.navigate` +
+`Runtime.evaluate` `outerHTML`), or trace pid 27/28's user code. (3) Determine which
+Mojo pipe the `epoll_wait` IO threads block on that never gets written.
+
+Diagnostics added this slice (all `CHROMIUM_BOOT`, behaviour-neutral): the `sys_write`
+fd-1 logger and the heartbeat recent-syscall-ring dump.

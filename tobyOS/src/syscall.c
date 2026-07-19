@@ -241,6 +241,21 @@ static long sys_write(int fd, const void *buf, size_t len) {
     if (!f) return -1;
     void *k = bounce_in(buf, len);
     if (!k) return -ABI_EFAULT;
+#ifdef CHROMIUM_BOOT
+    /* slice 20: does chrome ever write the --dump-dom output to stdout (fd 1)?
+     * If yes we should see "<html.../<h1>tobyOS"; if there are no [stdout] lines
+     * at all, chrome never reaches the DOM dump (navigation never completes). */
+    if (fd == 1) {
+        static int w1 = 0;
+        if (w1 < 80) { w1++;
+            char pre[49]; size_t n = len < 48 ? len : 48;
+            memcpy(pre, k, n); pre[n] = '\0';
+            for (size_t i = 0; i < n; i++)
+                if (pre[i] == '\n' || pre[i] == '\r') pre[i] = ' ';
+            kprintf("[stdout] len=%lu: %s\n", (unsigned long)len, pre);
+        }
+    }
+#endif
     long rv = file_write(f, k, len);
     kfree(k);
     return rv;

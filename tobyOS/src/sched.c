@@ -623,6 +623,11 @@ void sched_tick(struct regs *r) {
                         p->io_boost, p->enq_tick, waited, eff_prio(p, nt),
                         p->next_ready ? 1 : 0, (void *)p->saved_rsp);
             }
+            /* slice 20: chrome busy-churns (pid burning CPU) but never navigates.
+             * Dump the recent-syscall ring so we can see WHAT the hot threads
+             * loop on at the stall (the livelock, not a blocking wait). */
+            extern void lx_dump_recent_syscalls(void);
+            lx_dump_recent_syscalls();
         }
     }
 #endif
