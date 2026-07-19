@@ -488,8 +488,31 @@ with **no preceding error** — the actual render/compositor path. The only mess
 left are benign (`vulkan_icd ChoosePhysicalDevice: using default physicalDevice`
 = SwiftShader chosen; no VA-API). The caller is in a `.so` (stack rsp in the
 `0x102d…` thread-stack region); the `isr.c` heuristic only symbolizes main-PIE
-addresses and flagged a false positive (a `mov` inside `calloc`). **Next: build a
-library load map** (log each `.so` path→base at ld.so mmap time) to symbolize the
-`.so` caller, then identify the NULL pointer (likely a GL/Skia/cc dispatch used on
-a raster/compositor worker). Only one syscall is still unhandled (`landlock(444)`,
-correctly rejected), so this is not a missing-syscall gap.
+addresses and flagged a false positive (a `mov` inside `calloc`). Only one syscall
+is still unhandled (`landlock(444)`, correctly rejected) — this is not a
+missing-syscall gap.
+
+**Tried + inconclusive: software-raster flags** (`--disable-gpu-rasterization`
+`--disable-accelerated-2d-canvas`, reverted). The crash moved/changed (later, at
+~64–68s, different worker pids) but the DOM still didn't dump — and that run reused
+a `disk.img` whose `/data/cr` profile was corrupt from earlier crashed runs, so the
+read is muddy. **Recommendations for the next attempt:** (1) start from a FRESH
+`disk.img` (delete it so provisioning re-creates a clean `/data`) so leveldb/SQLite
+recovery doesn't confound the render path; (2) build the library load map (log each
+`.so` path→base at ld.so mmap; `linux_mmap_file` has the fd+base, correlate with a
+`.so`-open log by fd) and extend the `isr.c` stack dump to flag `.so`-region
+qwords, then `objdump` the caller; (3) then identify the NULL dispatch (likely a
+GL/Skia/cc entrypoint SwiftShader/ANGLE doesn't provide, called on a raster or
+compositor worker). This is genuine M2 render-tier internals.
+
+## Status summary (for the next agent)
+
+The handoff's job — **make SwANGLE/`eglInitialize` succeed headless so chrome
+renders** — is **DONE** (slices 12–14): GL initializes on SwiftShader's Vulkan via
+the in-kernel fake X server. The user then chose to push toward `--dump-dom`, so
+slice 15 cleared the storage-ABI wall (leveldb/SQLite work). Chrome now runs clean
+for 18–84s with GL + storage functioning; the ONLY remaining blocker to
+`--dump-dom` printing is the slice-16 render-worker NULL dispatch above. Kernel/ABI
+gains that outlive chrome: interior-dot path normalization, named/abstract AF_UNIX
++ recvmsg/recvfrom on UNIX, stable per-file inodes, and tobyfs `rename` + `fsync`/
+`unlinkat`/`flock`.
