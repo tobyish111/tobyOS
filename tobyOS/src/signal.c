@@ -431,12 +431,17 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     newmask &= ~(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
     p->sigstate.mask = newmask;
 
+    /* Capture the handler entry BEFORE the SA_RESETHAND reset below -- we still
+     * have to ENTER it this once. (Reading sa->sa_handler AFTER the reset gave
+     * rip=SIG_DFL=0, so a one-shot handler -- e.g. chrome/V8's SA_RESETHAND
+     * SIGSEGV trap handler -- was "delivered" straight to address 0.) */
+    void (*entry)(int) = sa->sa_handler;
     if (sa->sa_flags & SA_RESETHAND) sa->sa_handler = SIG_DFL;
 
     /* Redirect the return-to-user: RIP -> handler, RSP -> frame, RDI -> sig.
      * For SA_SIGINFO the handler is void(int, siginfo_t*, void*), so also
      * pass &info in RSI and &uctx in RDX (SysV arg regs 2 and 3). */
-    regs->rcx      = (uint64_t)(uintptr_t)sa->sa_handler;
+    regs->rcx      = (uint64_t)(uintptr_t)entry;
     regs->user_rsp = frame;
     regs->rdi      = (uint64_t)sig;
     if (siginfo) {
@@ -586,10 +591,14 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
     newmask &= ~(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
     p->sigstate.mask = newmask;
 
+    /* Capture the handler BEFORE the SA_RESETHAND reset zeroes it (else rip
+     * becomes SIG_DFL=0 -- the bug that crashed chrome/V8's one-shot SIGSEGV
+     * trap handler at address 0 on a worker thread ~14s into the render path). */
+    void (*entry)(int) = sa->sa_handler;
     if (sa->sa_flags & SA_RESETHAND) sa->sa_handler = SIG_DFL;
 
     /* Rewrite the iret frame: enter the handler with the SysV arg registers. */
-    r->rip = (uint64_t)(uintptr_t)sa->sa_handler;
+    r->rip = (uint64_t)(uintptr_t)entry;
     r->rsp = frame;
     r->rdi = (uint64_t)sig;
     if (siginfo) {
