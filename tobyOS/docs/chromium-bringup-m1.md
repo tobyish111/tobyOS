@@ -526,7 +526,7 @@ fine-grained `mprotect` (V8, PartitionAlloc, JITs) needs.
 **Verified:** the `0x12af…` write faults are GONE (0), and **chrome advances 14s →
 16.5s** past the V8-heap wall.
 
-## Slice 18 — kernel `copy_to_user` faults on a read-only user page → panic (OPEN, current front)
+## Slice 18 — kernel `copy_to_user` on a read-only user page → panic (FIXED)
 
 Past the V8 heap, chrome (24 threads) reaches ~16.5s and the **KERNEL** faults
 (`cs=0x8`, `rip` in `memcpy`, `cr2=0x0c0db000`, `err=0x3` = present+write) → a
@@ -538,6 +538,25 @@ is read-only when a syscall writes to it (instrument the kernel-fault path to lo
 mis-split VMA, or a legit read-only buffer chrome passed as an output?); (2)
 robustness — `copy_to_user` should return `-EFAULT` on a uaccess fault, not panic
 (tobyOS calls `memcpy` with no exception-table recovery for the uaccess region).
+
+**Fix (slice 18, committed 22ae599):** `copy_to_user`/`clear_user` must return
+`-EFAULT`, never panic. New `uaccess_prepare_write()` (`page_fault.c`) walks the
+destination pages before the memcpy, making each present+writable
+(demand-page/COW) and returning -1 for a genuine read-only/unmapped page.
+Verified: 0 kernel panics; chrome advances 16.5s → 22.5s.
+
+## Slice 19 — why a `read()` targets a read-only page; downstream NULL deref (OPEN, current front)
+
+The `[uaccess]` diagnostic + recent-syscall ring show the culprit: `read()` (tid 8)
+writing into read-only `0xc0db000`/`0xc0da000` (chrome's low ELF region, not an
+mmap-VMA — so likely a rodata/RELRO segment, or a page tobyOS's ELF loader/RELRO
+mapped read-only that should be writable). With `copy_to_user` now returning
+`-EFAULT`, the panic is gone but the `read()` fails and chrome trips a downstream
+`SIGSEGV` (NULL deref at `0x210`) — it never expected that buffer to be
+unwritable. Next: determine whether `0xc0db000` *should* be writable (dump the
+ELF PT_LOAD flags / RELRO range vs. what the loader mapped; if a RW segment was
+mapped read-only, fix the loader — that's the real bug) or whether chrome is
+genuinely handing `read()` a read-only buffer (then trace the fd/call site).
 
 ## Status summary (for the next agent)
 
