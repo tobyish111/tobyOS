@@ -7265,11 +7265,20 @@ void _start(void) {
              * fails -> NULL GL-dispatch crash. Next slice = a minimal fake X
              * server over named AF_UNIX so xcb_connect succeeds. (Set
              * VK_LOADER_DEBUG=all in envp to re-narrate loader discovery.) */
-            (char *)"--use-gl=angle",
-            (char *)"--use-angle=vulkan",
-            (char *)"--enable-unsafe-swiftshader",
+            /* slice 20: for the --dump-dom milestone we route AROUND GL entirely
+             * (--disable-gpu + --disable-software-rasterizer) instead of forcing
+             * the ANGLE/Vulkan/SwiftShader stack. Rationale: --dump-dom needs the
+             * parsed DOM, NOT rendering, and the Vulkan/SwiftShader path trips a
+             * FLAKY memory-corruption crash (deterministically memcpy+0x35d in libc
+             * during Vulkan extension enumeration -- see docs/chromium-bringup-m1.md
+             * slice 20). --disable-gpu runs CLEAN (0 crashes) and isolates the REAL
+             * remaining blocker: chrome still never navigates/dumps the DOM (a
+             * distributed init/compositor-readiness stall, independent of GL). The
+             * ANGLE/Vulkan/fake-X-server work (slices 12-14) is intact in-tree and
+             * git history; re-enable those flags for the later --screenshot tier. */
+            (char *)"--disable-gpu",
+            (char *)"--disable-software-rasterizer",
             (char *)"--disable-gpu-compositing",
-            (char *)"--run-all-compositor-stages-before-draw",
             (char *)"--virtual-time-budget=10000",
             (char *)"--disable-dev-shm-usage",
             (char *)"--disable-crash-reporter",
@@ -7298,7 +7307,7 @@ void _start(void) {
         struct proc_spec spec = {
             .path = "/opt/chrome/chrome-headless-shell",
             .name = "chrome",
-            .argc = 17, .argv = argv, .envc = 7, .envp = envp,
+            .argc = 15, .argv = argv, .envc = 7, .envp = envp,
         };
         kprintf("[boot] CHROMIUM: spawning REAL headless Chromium "
                 "(chrome-headless-shell --dump-dom); the DELIVERABLE is the "

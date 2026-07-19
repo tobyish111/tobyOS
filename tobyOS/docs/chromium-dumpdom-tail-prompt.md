@@ -40,10 +40,27 @@ Vulkan extension enumeration) — the **same memory-corruption family** as the l
 even when GL init *succeeds*, chrome never navigates/dumps the DOM (idle-exits
 `code=0`). **VLOG is compiled out of official chrome** (`--vmodule`/`-v=1` = zero
 output). A **lib load map** (`[libmap]` in `linux_mmap_file`) and a PTE-flag dump in
-the uaccess path are now in-tree (CHROMIUM_BOOT). **NEXT = root-cause the single
-memory-corruption root** (ld.so link_map vs V8-cage/stack allocator collision?) — it
-gates both the crash and probably the no-navigation. Ignore the "slice 19" section
-below except as historical context.
+the uaccess path are now in-tree (CHROMIUM_BOOT).
+
+**Deep-dive update (runs 23-26): the crash and the no-DOM are TWO SEPARATE
+blockers.** `--disable-gpu --disable-software-rasterizer` routes around the GL/Vulkan
+path → **0 crashes, chrome runs CLEAN, but STILL no DOM** (the harness now commits
+`--disable-gpu` for `--dump-dom`). A fd-1 write instrument shows chrome writes
+**nothing** to stdout → it never reaches the dump (not a buffering loss). `about:blank`
+is identical → the stall is fundamental, not the URL. `-smp 1` still crashes at the
+same rip → the Vulkan corruption is NOT an SMP race. At the stall chrome busy-livelocks
+(pid 27 mmap/munmap churn, pid 28 CPU-burn, IO threads epoll_wait idle) — the
+compositor/viz never reaches navigate.
+
+**NEXT — work the navigation stall first (it's the PRIMARY blocker for `--dump-dom`,
+now isolated with no crash under `--disable-gpu`):** (1) implement **`memfd_create`
+(319, currently `-ENOSYS`)** as coherent anonymous shared memory (mmap maps the SAME
+backing pages, not `linux_mmap_file`'s copy) — candidate compositor unblock; (2) since
+VLOG is stripped, drive the **DevTools protocol over `--remote-debugging-pipe`** to get
+chrome's internal state / do the DOM dump; (3) find which Mojo pipe the `epoll_wait` IO
+threads block on. The flaky Vulkan crash (ld.so link_map `l_versyms` / libc `memcpy`
+corruption) is SECONDARY — it only gates the later `--screenshot`/GL tier. Ignore the
+"slice 19" section below except as historical context.
 
 ---
 
