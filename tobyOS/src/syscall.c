@@ -4368,6 +4368,20 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
                          tflags, -1, 0);
     if (base < 0) return base;
 
+#ifdef CHROMIUM_BOOT
+    /* Lib load map: every file-backed segment ld.so maps for a .so. Correlate a
+     * .so-region crash rip (isr flags LIB?) with a base+offset to symbolize it
+     * (objdump the .so at rip-base+seg_off). off==0 lines are each .so's base. */
+    {
+        static int lm = 0;
+        if (lm < 160) { lm++;
+            kprintf("[libmap] base=0x%lx len=0x%lx prot=0x%x off=0x%lx fd=%d "
+                    "ino=%lu\n", (unsigned long)base, (unsigned long)len, prot,
+                    (unsigned long)offset, fd, (unsigned long)f->vfs.ino);
+        }
+    }
+#endif
+
     uint8_t *kbuf = (uint8_t *)kmalloc(4096);
     if (!kbuf) { sys_munmap((uint64_t)base, len); return -ABI_ENOMEM; }
 
