@@ -1083,6 +1083,79 @@ static int tobyfs_unlink(void *mnt, const char *path) {
     return journal_commit(fs);
 }
 
+/* Atomically re-link oldpath -> newpath. Source must exist; an existing dest is
+ * replaced (its inode freed). Journalled so a crash leaves either the old or the
+ * new name, never both/neither. leveldb/SQLite (chrome's profile stores) rename
+ * a temp file over a live one (CURRENT / MANIFEST / journal) constantly. */
+static int tobyfs_rename(void *mnt, const char *oldpath, const char *newpath) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    char op_par[VFS_PATH_MAX], op_leaf[TFS_NAME_MAX + 1];
+    char np_par[VFS_PATH_MAX], np_leaf[TFS_NAME_MAX + 1];
+    int rc = split_parent_leaf(oldpath, op_par, op_leaf);
+    if (rc != VFS_OK) return rc;
+    rc = split_parent_leaf(newpath, np_par, np_leaf);
+    if (rc != VFS_OK) return rc;
+
+    uint32_t old_pino, new_pino;
+    struct tfs_inode_disk old_pnode, new_pnode;
+    rc = path_walk(fs, op_par, &old_pino, &old_pnode);
+    if (rc != VFS_OK) return rc;
+    if (old_pnode.type != TFS_TYPE_DIR) return VFS_ERR_NOTDIR;
+    rc = path_walk(fs, np_par, &new_pino, &new_pnode);
+    if (rc != VFS_OK) return rc;
+    if (new_pnode.type != TFS_TYPE_DIR) return VFS_ERR_NOTDIR;
+
+    bool same_parent = (old_pino == new_pino);
+    /* When both names live in the same directory the in-memory dir node must be
+     * a SINGLE copy -- dir_insert/dir_remove each mutate + persist it, so two
+     * independent copies would clobber one another. Alias old onto new. */
+    struct tfs_inode_disk *opn = same_parent ? &new_pnode : &old_pnode;
+
+    /* Source must exist. */
+    uint32_t src_ino;
+    rc = dir_lookup(fs, opn, op_leaf, &src_ino);
+    if (rc != VFS_OK) return rc;
+
+    /* Does the destination already exist? */
+    uint32_t dst_ino = 0;
+    int drc = dir_lookup(fs, &new_pnode, np_leaf, &dst_ino);
+    if (drc == VFS_OK) {
+        if (dst_ino == src_ino) return VFS_OK;   /* same file -- rename is a no-op */
+        struct tfs_inode_disk dnode;
+        rc = read_inode(fs, dst_ino, &dnode);
+        if (rc != VFS_OK) return rc;
+        /* Refuse to clobber a non-empty directory (no recursive rm here). */
+        if (dnode.type == TFS_TYPE_DIR && !dir_is_empty(fs, &dnode))
+            return VFS_ERR_INVAL;
+    } else if (drc != VFS_ERR_NOENT) {
+        return drc;
+    }
+
+    journal_begin(fs);
+
+    /* Replace: free the old destination inode + drop its dirent. */
+    if (drc == VFS_OK) {
+        struct tfs_inode_disk dnode;
+        if (read_inode(fs, dst_ino, &dnode) == VFS_OK) {
+            inode_free_blocks(fs, &dnode);
+            dnode.type = TFS_TYPE_FREE; dnode.size = 0;
+            (void)write_inode(fs, dst_ino, &dnode);
+            (void)free_inode(fs, dst_ino);
+        }
+        rc = dir_remove(fs, new_pino, &new_pnode, np_leaf);
+        if (rc != VFS_OK && rc != VFS_ERR_NOENT) { journal_abort(fs); return rc; }
+    }
+
+    /* Link the source inode under the new name, then unlink the old name. */
+    rc = dir_insert(fs, new_pino, &new_pnode, src_ino, np_leaf);
+    if (rc != VFS_OK) { journal_abort(fs); return rc; }
+
+    rc = dir_remove(fs, old_pino, opn, op_leaf);
+    if (rc != VFS_OK) { journal_abort(fs); return rc; }
+
+    return journal_commit(fs);
+}
+
 /* -------- directory iteration --------
  *
  * opendir() snapshots the directory's dirents into a heap array; readdir
@@ -1174,6 +1247,7 @@ static const struct vfs_ops tobyfs_ops = {
     .write    = tobyfs_write,
     .create   = tobyfs_create,
     .unlink   = tobyfs_unlink,
+    .rename   = tobyfs_rename,
     .mkdir    = tobyfs_mkdir,
     .opendir  = tobyfs_opendir,
     .closedir = tobyfs_closedir,

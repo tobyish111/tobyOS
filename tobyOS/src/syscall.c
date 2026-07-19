@@ -2251,6 +2251,26 @@ static long sys_unlink(const char *path) {
     }
 }
 
+static long sys_rename(const char *oldp, const char *newp) {
+    char ko[ABI_PATH_MAX], kn[ABI_PATH_MAX];
+    int rr = resolve_user_path(oldp, ko, sizeof(ko));
+    if (rr) return rr;
+    rr = resolve_user_path(newp, kn, sizeof(kn));
+    if (rr) return rr;
+    int rc = vfs_rename(ko, kn);
+    switch (rc) {
+    case VFS_OK:        return 0;
+    case VFS_ERR_NOENT: return -ABI_ENOENT;
+    case VFS_ERR_NOTDIR:return -ABI_ENOTDIR;
+    case VFS_ERR_EXIST: return -ABI_EEXIST;
+    case VFS_ERR_NOSPC: return -ABI_ENOSPC;
+    case VFS_ERR_ROFS:  return -ABI_EROFS;
+    case VFS_ERR_PERM:  return -ABI_EACCES;
+    case VFS_ERR_INVAL: return -ABI_EINVAL;
+    default:            return -ABI_EIO;
+    }
+}
+
 static long sys_mkdir(const char *path, int mode) {
     (void)mode;     /* M25A: not honoured yet -- new dirs use proc owner */
     char kpath[ABI_PATH_MAX];
@@ -4106,6 +4126,8 @@ enum {
     LX_kill = 62, LX_setpgid = 109, LX_getpgrp = 111, LX_setsid = 112,
     LX_getpgid = 121, LX_setfsuid = 122, LX_setfsgid = 123,
     LX_uname = 63, LX_fcntl = 72, LX_getcwd = 79, LX_chdir = 80,
+    LX_flock = 73, LX_fsync = 74, LX_fdatasync = 75, LX_rename = 82,
+    LX_unlinkat = 263, LX_renameat = 264, LX_renameat2 = 316,
     LX_mkdir = 83, LX_unlink = 87, LX_getuid = 102, LX_getgid = 104,
     LX_geteuid = 107, LX_getegid = 108, LX_getppid = 110,
     LX_prctl = 157,
@@ -5548,6 +5570,26 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
     case LX_unlink: return do_syscall(SYS_UNLINK, a1, 0, 0, 0, 0);
+
+    /* ---- fs mutations chrome's profile stores (leveldb/SQLite) require ---- */
+    case LX_rename:                 /* (oldpath, newpath) */
+        return sys_rename((const char *)a1, (const char *)a2);
+    case LX_renameat:               /* (olddirfd, oldpath, newdirfd, newpath) */
+    case LX_renameat2:              /* (..., flags) -- AT_FDCWD + flags ignored */
+        return sys_rename((const char *)a2, (const char *)a4);
+    case LX_unlinkat:               /* (dirfd, path, flags) -- AT_FDCWD; tobyfs
+                                     * unlink removes files AND empty dirs, so it
+                                     * serves AT_REMOVEDIR too. */
+        return do_syscall(SYS_UNLINK, a2, 0, 0, 0, 0);
+    case LX_fsync:                  /* tobyfs writes are journalled + write-through
+                                     * (bcache flushes on commit), so a successful
+                                     * write is already durable -- report success. */
+    case LX_fdatasync:
+        return 0;
+    case LX_flock:                  /* single-process chrome: advisory locks are a
+                                     * no-op that must SUCCEED (leveldb/SQLite hold
+                                     * a LOCK file and bail if locking errors). */
+        return 0;
 
     /* ---- process control (B8): the shell forks, execs, and waits ---- */
     case LX_fork:

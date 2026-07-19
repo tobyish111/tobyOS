@@ -455,6 +455,26 @@ int vfs_unlink(const char *path) {
     return m->ops->unlink(m->data, rel);
 }
 
+int vfs_rename(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return VFS_ERR_INVAL;
+    const char *orel; struct vfs_mount *om = resolve(oldpath, &orel);
+    const char *nrel; struct vfs_mount *nm = resolve(newpath, &nrel);
+    if (!om || !nm) return VFS_ERR_NOMOUNT;
+    if (om != nm)   return VFS_ERR_INVAL;    /* cross-mount rename (EXDEV) -- n/s */
+    if (!om->ops->rename) return VFS_ERR_ROFS;
+    /* Need write on both old and new (source is unlinked, dest is created). */
+    if (!cap_check_path(current_proc(), oldpath, CAP_FILE_WRITE, "vfs_rename") ||
+        !cap_check_path(current_proc(), newpath, CAP_FILE_WRITE, "vfs_rename"))
+        return VFS_ERR_PERM;
+    {
+        int sp = sysprot_check_write(current_proc(), oldpath, "vfs_rename");
+        if (sp != VFS_OK) return sp;
+        sp = sysprot_check_write(current_proc(), newpath, "vfs_rename");
+        if (sp != VFS_OK) return sp;
+    }
+    return om->ops->rename(om->data, orel, nrel);
+}
+
 int vfs_mkdir(const char *path) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
