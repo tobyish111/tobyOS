@@ -46,4 +46,31 @@ int mmap2_cow_clone(int parent_pid, int child_pid);
 /* Query: return total mapped bytes for a process. */
 uint64_t mmap2_mapped_bytes(int pid);
 
+/* ---- memfd (memfd_create) -- anonymous, page-backed, mmap-COHERENT shared
+ * memory. Unlike file-backed mmap (which copies file bytes into private anon
+ * pages), a memfd owns a list of physical pages; every mmap of the memfd maps
+ * those SAME pages, so writes through one mapping (or read/write()) are visible
+ * through every other mapping -- the sharing semantics chrome's compositor /
+ * base::*SharedMemoryRegion needs. Backing pages are freed only when the last
+ * fd (refcount) closes; munmap of a memfd VMA (VMA_FLAG_NOFREE) leaves them. */
+struct memfd;
+struct memfd *memfd_new(void);              /* refcount 1; NULL on OOM */
+void  memfd_ref(struct memfd *mf);
+void  memfd_unref(struct memfd *mf);        /* frees pages+struct at 0 */
+long  memfd_ftruncate(struct memfd *mf, uint64_t size);
+long  memfd_read (struct memfd *mf, uint64_t pos, void *dst, size_t n);
+long  memfd_write(struct memfd *mf, uint64_t pos, const void *src, size_t n);
+uint64_t memfd_size(struct memfd *mf);
+/* Map [offset,offset+len) of the memfd into the current proc (growing the memfd
+ * if needed). `flags` uses the internal VMA_FLAG_* set; returns the base vaddr
+ * or a negative errno. */
+long  memfd_map(uint64_t addr, uint64_t len, uint32_t prot, uint32_t flags,
+                struct memfd *mf, uint64_t offset);
+/* File sealing (fcntl F_ADD_SEALS/F_GET_SEALS). Chrome's Mojo shared-memory
+ * channel (mojo/core/channel_linux.cc) seals its memfd (F_SEAL_SHRINK/GROW) and
+ * then CHECKs F_GET_SEALS reports them back -- returning 0 there is a FATAL
+ * "Check failed". add_seals returns 0 on success or a negative errno. */
+long  memfd_add_seals(struct memfd *mf, unsigned int seals);
+long  memfd_get_seals(struct memfd *mf);
+
 #endif /* TOBYOS_MMAP_H */

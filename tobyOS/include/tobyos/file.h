@@ -90,9 +90,16 @@ enum file_kind {
      * (or returns EAGAIN when O_NONBLOCK). The event ring lives in a global
      * evdev context (syscall.c); close just frees the struct file. */
     FILE_KIND_EVDEV      = 14,
+    /* Chromium bring-up (slice 20): a Linux memfd_create() object -- anonymous,
+     * page-backed, mmap-COHERENT shared memory. Backed by a kmalloc'd struct
+     * memfd (a physical-page list + logical size), shared across dup/clone via a
+     * refcount. read/write/lseek/ftruncate/fstat/mmap all route to it; every
+     * mmap maps the SAME physical pages (real sharing). See mmap.c + file.c. */
+    FILE_KIND_MEMFD      = 15,
 };
 
 struct eventfd;
+struct memfd;
 
 struct file {
     enum file_kind  kind;
@@ -123,6 +130,9 @@ struct file {
     struct pty *pty;
     /* For FILE_KIND_EVENTFD (Track C): the shared counter object. */
     struct eventfd *efd;
+    /* For FILE_KIND_MEMFD (slice 20): the shared page-backed memory object.
+     * The per-fd read/write cursor lives in vfs.pos (unused for memfd otherwise). */
+    struct memfd *memfd;
     /* Open access mode (O_RDONLY=0 / O_WRONLY=1 / O_RDWR=2), captured at
      * open time and returned by fcntl(F_GETFL). Chromium's shared-memory
      * PlatformSharedMemoryRegion CHECKs that a writable region's fd reports
