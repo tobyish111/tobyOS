@@ -114,6 +114,35 @@ static struct mmap_vma *vma_find_internal(struct vma_table *vt, uint64_t addr) {
     return NULL;
 }
 
+/* Chromium slice 17: on a fatal user #PF, report whether the mmap VMA table
+ * covers the fault address (+ its prot/flags) and, if not, the nearest mappings.
+ * Distinguishes "no VMA at all" (wild pointer / cage reservation gap) from
+ * "VMA present but PROT_NONE / not writable" (an mprotect/commit not reflected
+ * here). Uses the tgid table so a worker thread sees the process's mappings. */
+void mmap_debug_fault_vma(uint64_t addr) {
+    struct proc *p = current_proc();
+    if (!p) return;
+    int pid = p->is_thread ? p->tgid : p->pid;
+    struct vma_table *vt = &g_vma_tables[pid];
+    struct mmap_vma *v = vma_find_internal(vt, addr);
+    if (v) {
+        kprintf("[pf] addr=0x%lx COVERED by mmap-VMA [0x%lx,0x%lx) prot=0x%x flags=0x%x\n",
+                (unsigned long)addr, (unsigned long)v->start,
+                (unsigned long)v->end, v->prot, v->flags);
+        return;
+    }
+    kprintf("[pf] addr=0x%lx NOT covered by any mmap-VMA (%d total); nearest within 64GB:\n",
+            (unsigned long)addr, vt->count);
+    for (int i = 0; i < vt->count; i++) {
+        uint64_t s = vt->entries[i].start, e = vt->entries[i].end;
+        uint64_t d = (addr > s) ? (addr - s) : (s - addr);
+        if (d < 0x1000000000ULL)
+            kprintf("   [0x%lx,0x%lx) prot=0x%x flags=0x%x\n",
+                    (unsigned long)s, (unsigned long)e,
+                    vt->entries[i].prot, vt->entries[i].flags);
+    }
+}
+
 static struct mmap_vma *vma_alloc(struct vma_table *vt) {
     if (vt->count >= VMA_MAX_PER_PROC) {
         kprintf("[mmap] WARN: VMA table FULL (%d entries) -- mmap will fail\n",
@@ -358,11 +387,50 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
     if (len == 0) return -22;
     addr = page_align_down(addr);
     len  = page_align_up(len);
+    uint64_t rstart = addr, rend = addr + len;
 
-    for (int i = 0; i < vt->count; i++) {
+    /* Apply `prot` ONLY to the [rstart,rend) sub-range, SPLITTING any VMA it
+     * partially covers. The demand-page handler reads the VMA's prot for a
+     * not-yet-present page, so without splitting an mprotect of a sub-range
+     * (e.g. V8 making part of its 64MB heap read-only for W^X / a read-only
+     * space) clobbered the WHOLE VMA's prot -- and a later WRITE to a different,
+     * still-RW sub-range then demand-paged read-only and SIGSEGV'd. Iterate only
+     * the pre-existing entries (n); the split tails we append keep their own
+     * (correct) prot and don't need re-visiting. */
+    int n = vt->count;
+    for (int i = 0; i < n; i++) {
         struct mmap_vma *v = &vt->entries[i];
-        if (addr >= v->end || (addr + len) <= v->start) continue;
-        v->prot = prot;
+        if (rstart >= v->end || rend <= v->start) continue;   /* no overlap */
+        uint64_t vs = v->start, ve = v->end;
+        uint32_t oldprot = v->prot;
+
+        if (rstart <= vs && rend >= ve) {
+            v->prot = prot;                       /* fully covered */
+        } else if (rstart <= vs) {                /* covers the left part */
+            struct mmap_vma *tail = vma_alloc(vt);
+            if (!tail) { v->prot = prot; continue; }   /* table full: degrade */
+            v = &vt->entries[i];
+            tail->start = rend; tail->end = ve; tail->prot = oldprot;
+            tail->flags = v->flags; tail->fd = v->fd; tail->offset = v->offset;
+            v->end = rend; v->prot = prot;
+        } else if (rend >= ve) {                  /* covers the right part */
+            struct mmap_vma *tail = vma_alloc(vt);
+            if (!tail) { v->prot = prot; continue; }
+            v = &vt->entries[i];
+            tail->start = rstart; tail->end = ve; tail->prot = prot;
+            tail->flags = v->flags; tail->fd = v->fd; tail->offset = v->offset;
+            v->end = rstart;                      /* v keeps oldprot */
+        } else {                                  /* covers a middle sub-range */
+            struct mmap_vma *mid  = vma_alloc(vt);
+            struct mmap_vma *tail = vma_alloc(vt);
+            if (!mid || !tail) { v->prot = prot; continue; }
+            v = &vt->entries[i];
+            mid->start  = rstart; mid->end  = rend; mid->prot  = prot;
+            mid->flags  = v->flags; mid->fd = v->fd; mid->offset = v->offset;
+            tail->start = rend;  tail->end  = ve;   tail->prot = oldprot;
+            tail->flags = v->flags; tail->fd = v->fd; tail->offset = v->offset;
+            v->end = rstart;                      /* v keeps oldprot */
+        }
     }
 
     uint32_t vmm_f = prot_to_vmm_flags(prot);

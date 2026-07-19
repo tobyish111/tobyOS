@@ -503,29 +503,50 @@ occurrences, was the invariant render-tier crash), and chrome now correctly runs
 its SIGSEGV handler: `Received signal 11 SEGV_MAPERR …` + a stack trace. The bug
 had been **masking the real fault** all along.
 
-## Slice 17 — the real (unmasked) crash: SEGV_MAPERR in V8's heap region (OPEN, current front)
+## Slice 17 — V8-heap SEGV was `mprotect` with NO VMA SPLITTING (DONE)
 
-With signal delivery fixed, chrome's actual fault is exposed: a genuine
-**`SIGSEGV / SEGV_MAPERR`** (address not mapped — no VMA) at `~0x12af6fa38000`,
-inside V8's pointer-compression heap / cage region (matches `r12=0x12ac01000039`).
-Chrome's crash handler now reports it (`Received signal 11 SEGV_MAPERR`), dumps a
-short stack, then a second thread faults and the process deadlocks. So the render-
-tier crash was ALWAYS this real SEGV; the SA_RESETHAND bug just hid it behind
-`rip=0`. Next: instrument the VMA/mmap layer (log the VMA set around the fault
-address; the `[mmap]`/`vm_space` machinery from slice 9-10) to see whether V8's
-cage reservation actually covers `0x12a…` or a sub-range mmap/mprotect left a hole
-— i.e. a V8-memory ABI gap (cf. slice 3b's cage work), or whether chrome derives a
-genuinely wild pointer from some other wrong syscall result. SEGV_MAPERR = no VMA
-(not a PROT_NONE permission fault), so the address is outside every mapping.
+With signals fixed, chrome's real fault surfaced: `SIGSEGV` at `~0x12af6fa38000` in
+V8's heap region. A `[pf]` diagnostic in the `#PF` path (`isr.c` +
+`mmap_debug_fault_vma` in `mmap.c`, dumping the VMA covering a high-region fault)
+pinned it: the fault was a **WRITE** (`err=0x6`: W=1, page-not-present) to a page
+that **was covered by an mmap-VMA `[0x12af6f238000, 0x12af73238000)` but recorded
+`prot=0x1` (PROT_READ only)**. So chrome had mprotected part of that 64MB V8 heap
+region to writable, but the VMA said read-only → the demand-page handler
+(`mmap_handle_page_fault`, which reads `v->prot` for a not-present page) mapped it
+read-only and rejected the write.
+
+Root cause (`src/mmap.c sys_mprotect`): it set `v->prot = prot` for the WHOLE
+overlapping VMA with **no sub-range splitting**. So V8 making one sub-range
+read-only (W^X / a read-only heap space) clobbered the entire region's prot, and a
+later write to a different, still-RW sub-range faulted. **Fix:** `sys_mprotect` now
+**splits** VMAs (left/right/middle, modelled on the munmap split) so `prot` applies
+only to `[addr,addr+len)`. A fundamental VM-correctness fix any app doing
+fine-grained `mprotect` (V8, PartitionAlloc, JITs) needs.
+
+**Verified:** the `0x12af…` write faults are GONE (0), and **chrome advances 14s →
+16.5s** past the V8-heap wall.
+
+## Slice 18 — kernel `copy_to_user` faults on a read-only user page → panic (OPEN, current front)
+
+Past the V8 heap, chrome (24 threads) reaches ~16.5s and the **KERNEL** faults
+(`cs=0x8`, `rip` in `memcpy`, `cr2=0x0c0db000`, `err=0x3` = present+write) → a
+`copy_to_user` writing to a read-only present user page, unhandled → KERNEL PANIC.
+This is new territory (past the old 14s crash), not a regression (the mprotect fix
+makes *fewer* pages read-only). Two things to resolve: (1) WHY the destination page
+is read-only when a syscall writes to it (instrument the kernel-fault path to log
+`cr2` + its VMA prot + the current syscall number — is it chrome's rodata, a
+mis-split VMA, or a legit read-only buffer chrome passed as an output?); (2)
+robustness — `copy_to_user` should return `-EFAULT` on a uaccess fault, not panic
+(tobyOS calls `memcpy` with no exception-table recovery for the uaccess region).
 
 ## Status summary (for the next agent)
 
 The handoff's job — **make SwANGLE/`eglInitialize` succeed headless** — is **DONE**
-(slices 12–14). The user chose to push toward `--dump-dom`: slice 15 cleared the
-storage-ABI wall (leveldb/SQLite), and slice 16 fixed a kernel SA_RESETHAND signal
-bug that had masked the true render-tier fault. Chrome now runs GL + storage +
-signals correctly; the remaining blocker to `--dump-dom` is a real SEGV_MAPERR in
-V8's heap region (slice 17). Kernel/ABI gains that outlive chrome: interior-dot
+(slices 12–14). Pushing toward `--dump-dom`: slice 15 (storage/leveldb+SQLite),
+slice 16 (SA_RESETHAND signal fix, unmasking the real fault), slice 17 (mprotect
+VMA-splitting → V8 heap works). Chrome now runs GL + storage + signals + V8 memory
+and advances to ~16.5s; the current blocker is a kernel `copy_to_user`-to-read-only
+panic (slice 18). Kernel/ABI gains that outlive chrome: interior-dot
 path normalization, named/abstract AF_UNIX + recvmsg/recvfrom on UNIX, stable
 per-file inodes, tobyfs `rename`/`fsync`/`unlinkat`/`flock`, and the SA_RESETHAND
 one-shot-signal fix.
