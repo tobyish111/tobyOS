@@ -598,9 +598,12 @@ an lx-cur current-syscall capture) proved:
 1. **A flaky (timing-dependent) crash.** When it fires it is *deterministically* at
    **`memcpy+0x35d` in `libc.so.6`** (rip `0x100000b6e34d`, identical across runs;
    `.so` base `0x100000ac3000` + `0xab34d`, in libc's RX segment) — a **write** fault
-   to `0x102d0735f940` (`err=0x6`, ~18 KB above the faulting thread's `rsp`) = a
-   **stack-buffer overflow from a corrupt / too-large length handed to `memcpy`**,
-   during SwiftShader **Vulkan device/extension enumeration** (the thread's stack is
+   to `0x102d0735f940`, which is **covered by a VMA but `prot=0x0` (PROT_NONE) — a
+   thread-stack GUARD page** (tid 11's clone stack `0x102d0735d8c0`, guard
+   `[0x102d0735f000,0x102d07360000)` above it). So the memcpy **destination is a wild
+   pointer landing in a guard page — NOT a stack-size bug** (there is plenty of stack
+   below `rsp`); confirmed **memory corruption** during SwiftShader **Vulkan
+   device/extension enumeration** (the thread's stack is
    full of `VK_EXT_swapchain_maintenance1` / `graphics_pipeline_library` /
    `descriptor…` strings; the thread was doing `socket`/`connect`/`getpeername`/
    `fcntl`/`poll` = `xcb_connect` to the in-kernel fake X server). Chrome's crash
