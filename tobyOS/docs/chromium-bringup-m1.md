@@ -480,39 +480,52 @@ tmp→CURRENT works), `unlinkat(263)` (→ existing `tobyfs_unlink`), `fsync(74)
 single-process). **Result: every leveldb/SQLite error is GONE** (was a ~2s retry
 loop) and chrome runs clean to 18–84s.
 
-## Slice 16 — render-path worker-thread NULL dispatch (OPEN, current front)
+## Slice 16 — the "render-worker NULL dispatch" was a SA_RESETHAND signal bug (DONE)
 
-With GL + storage both working, chrome now dies at a **NULL function-pointer call
-(`EXCEPTION 14`, `rip=0`, `err=0x14`) on a worker thread** (`chrome+T`, ~18s),
-with **no preceding error** — the actual render/compositor path. The only messages
-left are benign (`vulkan_icd ChoosePhysicalDevice: using default physicalDevice`
-= SwiftShader chosen; no VA-API). The caller is in a `.so` (stack rsp in the
-`0x102d…` thread-stack region); the `isr.c` heuristic only symbolizes main-PIE
-addresses and flagged a false positive (a `mov` inside `calloc`). Only one syscall
-is still unhandled (`landlock(444)`, correctly rejected) — this is not a
-missing-syscall gap.
+The `EXCEPTION 14 rip=0` crash was NOT a GL/render dispatch — it was a **kernel
+signal-delivery bug**. A library load map (log `.so` open fd→path + executable
+`mmap` base, correlate by fd) + `isr.c` flagging `.so`-region stack qwords
+symbolized the crash's return address (top of stack) to **libc's `__restore_rt`
+signal-return trampoline**, and the crash registers were `rip=0, rdi=0x0b (=11
+SIGSEGV), rsi=siginfo, rdx=ucontext` — i.e. the kernel delivered SIGSEGV to a
+handler at address **0**.
 
-**Tried + inconclusive: software-raster flags** (`--disable-gpu-rasterization`
-`--disable-accelerated-2d-canvas`, reverted). The crash moved/changed (later, at
-~64–68s, different worker pids) but the DOM still didn't dump — and that run reused
-a `disk.img` whose `/data/cr` profile was corrupt from earlier crashed runs, so the
-read is muddy. **Recommendations for the next attempt:** (1) start from a FRESH
-`disk.img` (delete it so provisioning re-creates a clean `/data`) so leveldb/SQLite
-recovery doesn't confound the render path; (2) build the library load map (log each
-`.so` path→base at ld.so mmap; `linux_mmap_file` has the fd+base, correlate with a
-`.so`-open log by fd) and extend the `isr.c` stack dump to flag `.so`-region
-qwords, then `objdump` the caller; (3) then identify the NULL dispatch (likely a
-GL/Skia/cc entrypoint SwiftShader/ANGLE doesn't provide, called on a raster or
-compositor worker). This is genuine M2 render-tier internals.
+Root cause (`src/signal.c`, both delivery paths — `signal_deliver_fault` and
+`signal_setup_user_frame`): `if (sa->sa_flags & SA_RESETHAND) sa->sa_handler =
+SIG_DFL;` ran **before** `rip` was read from `sa->sa_handler`, so a **one-shot**
+handler was reset to `SIG_DFL (0)` and then "entered" at 0. Chrome/V8 install their
+SIGSEGV trap/crash handler with **SA_RESETHAND**, so the very first SIGSEGV jumped
+to 0. **Fix:** capture the handler entry into a local BEFORE the reset, use that for
+`rip`/`rcx`. A real kernel bug for any app using one-shot handlers.
+
+**Verified (fresh `disk.img` + clean build):** the `rip=0` crash is GONE (0
+occurrences, was the invariant render-tier crash), and chrome now correctly runs
+its SIGSEGV handler: `Received signal 11 SEGV_MAPERR …` + a stack trace. The bug
+had been **masking the real fault** all along.
+
+## Slice 17 — the real (unmasked) crash: SEGV_MAPERR in V8's heap region (OPEN, current front)
+
+With signal delivery fixed, chrome's actual fault is exposed: a genuine
+**`SIGSEGV / SEGV_MAPERR`** (address not mapped — no VMA) at `~0x12af6fa38000`,
+inside V8's pointer-compression heap / cage region (matches `r12=0x12ac01000039`).
+Chrome's crash handler now reports it (`Received signal 11 SEGV_MAPERR`), dumps a
+short stack, then a second thread faults and the process deadlocks. So the render-
+tier crash was ALWAYS this real SEGV; the SA_RESETHAND bug just hid it behind
+`rip=0`. Next: instrument the VMA/mmap layer (log the VMA set around the fault
+address; the `[mmap]`/`vm_space` machinery from slice 9-10) to see whether V8's
+cage reservation actually covers `0x12a…` or a sub-range mmap/mprotect left a hole
+— i.e. a V8-memory ABI gap (cf. slice 3b's cage work), or whether chrome derives a
+genuinely wild pointer from some other wrong syscall result. SEGV_MAPERR = no VMA
+(not a PROT_NONE permission fault), so the address is outside every mapping.
 
 ## Status summary (for the next agent)
 
-The handoff's job — **make SwANGLE/`eglInitialize` succeed headless so chrome
-renders** — is **DONE** (slices 12–14): GL initializes on SwiftShader's Vulkan via
-the in-kernel fake X server. The user then chose to push toward `--dump-dom`, so
-slice 15 cleared the storage-ABI wall (leveldb/SQLite work). Chrome now runs clean
-for 18–84s with GL + storage functioning; the ONLY remaining blocker to
-`--dump-dom` printing is the slice-16 render-worker NULL dispatch above. Kernel/ABI
-gains that outlive chrome: interior-dot path normalization, named/abstract AF_UNIX
-+ recvmsg/recvfrom on UNIX, stable per-file inodes, and tobyfs `rename` + `fsync`/
-`unlinkat`/`flock`.
+The handoff's job — **make SwANGLE/`eglInitialize` succeed headless** — is **DONE**
+(slices 12–14). The user chose to push toward `--dump-dom`: slice 15 cleared the
+storage-ABI wall (leveldb/SQLite), and slice 16 fixed a kernel SA_RESETHAND signal
+bug that had masked the true render-tier fault. Chrome now runs GL + storage +
+signals correctly; the remaining blocker to `--dump-dom` is a real SEGV_MAPERR in
+V8's heap region (slice 17). Kernel/ABI gains that outlive chrome: interior-dot
+path normalization, named/abstract AF_UNIX + recvmsg/recvfrom on UNIX, stable
+per-file inodes, tobyfs `rename`/`fsync`/`unlinkat`/`flock`, and the SA_RESETHAND
+one-shot-signal fix.

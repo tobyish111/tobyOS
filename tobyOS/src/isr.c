@@ -267,7 +267,13 @@ static void default_exception(struct regs *r) {
              * confirmed load base (see docs/chromium-bringup-m1.md). The near-
              * rsp stack is mapped (the thread just ran there), so the reads are
              * safe; a genuinely unreadable slot stops the scan. */
-            enum { MAIN_BASE = 0x500000, MAIN_END = 0x0d000000, NSLOTS = 64 };
+            enum { MAIN_BASE = 0x500000, MAIN_END = 0x0d000000, NSLOTS = 128 };
+            /* Shared libraries (and thread stacks) live in the high mmap region
+             * ~0x1000_0000_0000+. A qword there MAY be a return address into a
+             * .so (cross-reference the [libmap] base=.. lines: objdump the .so at
+             * <val - so_base>) or just a stack pointer -- flag both as LIB? so the
+             * .so caller of a NULL dispatch can be found. */
+            enum { LIB_BASE = 0x100000000000ULL, LIB_END = 0x110000000000ULL };
             kprintf("[isr] user-stack dump (rsp=%p, MAIN_BASE=0x%x):\n",
                     (void *)r->rsp, (unsigned)MAIN_BASE);
             for (int i = 0; i < NSLOTS; i++) {
@@ -279,6 +285,8 @@ static void default_exception(struct regs *r) {
                 if (v >= (uint64_t)MAIN_BASE && v < (uint64_t)MAIN_END)
                     kprintf("  [rsp+0x%03x] %016lx  CODE main+0x%lx\n",
                             i * 8, v, v - (uint64_t)MAIN_BASE);
+                else if (v >= (uint64_t)LIB_BASE && v < (uint64_t)LIB_END)
+                    kprintf("  [rsp+0x%03x] %016lx  LIB?\n", i * 8, v);
                 else
                     kprintf("  [rsp+0x%03x] %016lx\n", i * 8, v);
             }
