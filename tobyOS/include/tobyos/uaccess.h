@@ -99,9 +99,15 @@ static inline int copy_from_user(void *dst, const void *user_src, size_t n) {
     return 0;
 }
 
+/* Make [addr,addr+len) present + writable (demand-page/COW) or report failure;
+ * defined in page_fault.c. Lets the write accessors return -EFAULT on a read-only
+ * or unmapped user buffer instead of the kernel #PF'ing mid-copy (-> panic). */
+int uaccess_prepare_write(uint64_t addr, uint64_t len);
+
 static inline int copy_to_user(void *user_dst, const void *src, size_t n) {
     if (!user_range_ok((uint64_t)(uintptr_t)user_dst, n)) return -1;
     if (n == 0) return 0;
+    if (uaccess_prepare_write((uint64_t)(uintptr_t)user_dst, n) != 0) return -1;
     unsigned long f = uaccess_begin();
     memcpy(user_dst, src, n);
     uaccess_end(f);
@@ -111,6 +117,7 @@ static inline int copy_to_user(void *user_dst, const void *src, size_t n) {
 static inline int clear_user(void *user_dst, size_t n) {
     if (!user_range_ok((uint64_t)(uintptr_t)user_dst, n)) return -1;
     if (n == 0) return 0;
+    if (uaccess_prepare_write((uint64_t)(uintptr_t)user_dst, n) != 0) return -1;
     unsigned long f = uaccess_begin();
     memset(user_dst, 0, n);
     uaccess_end(f);

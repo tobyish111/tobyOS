@@ -209,6 +209,15 @@ static void default_exception(struct regs *r) {
                     return;
                 if (mmap_handle_page_fault(fault_addr, r->error_code))
                     return;
+                /* Chromium slice 18: a KERNEL write to user memory neither handler
+                 * could resolve (e.g. copy_to_user to a read-only page) is about to
+                 * be fatal -- dump the page's VMA prot to see WHY it's not writable
+                 * (the recent-syscall ring below names the syscall). */
+                extern void mmap_debug_fault_vma(uint64_t addr);
+                kprintf("[kpf] KERNEL fault at user addr=0x%lx err=0x%lx rip=0x%lx\n",
+                        (unsigned long)fault_addr, (unsigned long)r->error_code,
+                        (unsigned long)r->rip);
+                mmap_debug_fault_vma(fault_addr);
             }
             if (kernel_boot_demand_map(fault_addr))
                 return;

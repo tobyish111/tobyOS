@@ -267,6 +267,45 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
     return false;
 }
 
+/* Ensure [addr,addr+len) is present + WRITABLE in the current proc before the
+ * kernel memcpy's into it (copy_to_user), demand-paging not-present pages and
+ * resolving COW via the normal handlers. Returns 0 if the whole range is now
+ * writable, -1 if any page is a genuine read-only / unmapped user page. Without
+ * this, copy_to_user's memcpy #PF'd on a read-only user page (e.g. a syscall
+ * out-pointer landing in chrome's rodata / RELRO) and, being unresolvable inside
+ * the SMAP uaccess window, took the fatal kernel-fault path -> KERNEL PANIC.
+ * Now copy_to_user returns -EFAULT instead, exactly like Linux's uaccess. */
+int uaccess_prepare_write(uint64_t addr, uint64_t len) {
+    struct proc *p = current_proc();
+    if (!p || len == 0) return 0;
+    uint64_t va  = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t end = addr + len;
+    for (; va < end; va += PAGE_SIZE) {
+        uint64_t *pte = get_pte(p->cr3, va);
+        if (pte && (*pte & PTE_PRESENT) && (*pte & PTE_WRITABLE))
+            continue;                                   /* already writable */
+        uint64_t ec = PF_ERR_WRITE | PF_ERR_USER |
+                      ((pte && (*pte & PTE_PRESENT)) ? PF_ERR_PRESENT : 0);
+        if (page_fault_handler(va, ec, p))   continue;  /* demand/COW resolved */
+        if (mmap_handle_page_fault(va, ec))  continue;
+        {   /* slice 18 diagnostic: which syscall aimed at a read-only user buf */
+            static int logged = 0;
+            if (logged < 8) {
+                logged++;
+                kprintf("[uaccess] copy_to_user -> EFAULT: read-only/unmapped "
+                        "user addr=0x%lx (page 0x%lx)\n",
+                        (unsigned long)addr, (unsigned long)va);
+                if (logged == 1) {
+                    extern void lx_dump_recent_syscalls(void);
+                    lx_dump_recent_syscalls();
+                }
+            }
+        }
+        return -1;                                      /* read-only / unmapped */
+    }
+    return 0;
+}
+
 /* ---- COW fork: mark both parent and child as copy-on-write ---- */
 
 #define USER_HALF_END 0x0000800000000000ULL
