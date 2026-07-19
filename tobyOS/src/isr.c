@@ -238,6 +238,18 @@ static void default_exception(struct regs *r) {
         case 16: case 19: sig = SIGFPE; code = FPE_FLTDIV; break; /* #MF/#XM */
         default: break;
         }
+        /* Chromium slice 17: report the VMA situation for a #PF in the high mmap
+         * region (V8 cage / .so area, 0x1000_0000_0000+) so a SEGV_MAPERR there
+         * (chrome's V8-heap fault) can be diagnosed as no-VMA vs PROT_NONE. */
+        if (r->vector == 14 && addr >= 0x100000000000ULL) {
+            extern void mmap_debug_fault_vma(uint64_t addr);
+            kprintf("[pf] user #PF addr=0x%lx err=0x%lx (P=%lu W=%lu I=%lu) sig=%d code=%d\n",
+                    (unsigned long)addr, (unsigned long)r->error_code,
+                    (unsigned long)(r->error_code & 1),
+                    (unsigned long)((r->error_code >> 1) & 1),
+                    (unsigned long)((r->error_code >> 4) & 1), sig, code);
+            mmap_debug_fault_vma(addr);
+        }
         if (sig && signal_deliver_fault(r, sig, code, addr))
             return;   /* iretq lands in the user handler */
     }
