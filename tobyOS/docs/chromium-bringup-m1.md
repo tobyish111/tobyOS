@@ -472,11 +472,24 @@ behind the dead thread's lock) instead of exiting. So the storage must actually
 work — flags can't route around it.
 
 **This is a distinct, multi-slice storage-ABI milestone (M2-class), NOT the render
-bug (which is solved).** The first batch: `fdatasync(75)` (trivial — flush/no-op);
-`unlinkat(263)` (wire to the EXISTING `tobyfs_unlink`/`vfs_unlink`); `rename(82)`
-(a NEW vfs op — `tobyfs` has no `.rename`; needs `tobyfs_rename` moving a dir
-entry atomically via the journal + `lx_rename`/`vfs_rename`). leveldb/SQLite will
-then likely also need file locking (`flock`/`fcntl F_SETLK` on the `LOCK` files) and
-directory `fsync`. Once storage init completes, the `data:` URL should navigate and
-`--dump-dom` should finally print `<h1>tobyOS</h1>` — then `--screenshot` + host-diff.
-Harness stays on the committed slice-14 loader route (no `--incognito`).
+bug (which is solved).** Batch 1 landed: `rename(82)`/`renameat(264)`/`renameat2(316)`
+(a NEW vfs op — `tobyfs` had no `.rename`; `tobyfs_rename` re-links a dir entry
+atomically via the journal, handling the same-parent alias so leveldb's rename
+tmp→CURRENT works), `unlinkat(263)` (→ existing `tobyfs_unlink`), `fsync(74)`/
+`fdatasync(75)` (→ 0; tobyfs writes are journalled/write-through), `flock(73)` (→ 0;
+single-process). **Result: every leveldb/SQLite error is GONE** (was a ~2s retry
+loop) and chrome runs clean to 18–84s.
+
+## Slice 16 — render-path worker-thread NULL dispatch (OPEN, current front)
+
+With GL + storage both working, chrome now dies at a **NULL function-pointer call
+(`EXCEPTION 14`, `rip=0`, `err=0x14`) on a worker thread** (`chrome+T`, ~18s),
+with **no preceding error** — the actual render/compositor path. The only messages
+left are benign (`vulkan_icd ChoosePhysicalDevice: using default physicalDevice`
+= SwiftShader chosen; no VA-API). The caller is in a `.so` (stack rsp in the
+`0x102d…` thread-stack region); the `isr.c` heuristic only symbolizes main-PIE
+addresses and flagged a false positive (a `mov` inside `calloc`). **Next: build a
+library load map** (log each `.so` path→base at ld.so mmap time) to symbolize the
+`.so` caller, then identify the NULL pointer (likely a GL/Skia/cc dispatch used on
+a raster/compositor worker). Only one syscall is still unhandled (`landlock(444)`,
+correctly rejected), so this is not a missing-syscall gap.

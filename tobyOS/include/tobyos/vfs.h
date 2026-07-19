@@ -118,6 +118,10 @@ struct vfs_ops {
     int  (*create)  (void *mnt, const char *path,
                      uint32_t uid, uint32_t gid, uint32_t mode);
     int  (*unlink)  (void *mnt, const char *path);
+    /* Optional. Atomically re-link `oldpath` -> `newpath` within this mount,
+     * replacing an existing `newpath`. If NULL, vfs_rename returns VFS_ERR_ROFS.
+     * leveldb/SQLite (chrome's profile stores) depend on atomic rename. */
+    int  (*rename)  (void *mnt, const char *oldpath, const char *newpath);
     int  (*mkdir)   (void *mnt, const char *path,
                      uint32_t uid, uint32_t gid, uint32_t mode);
     int  (*opendir) (void *mnt, const char *path, struct vfs_dir *out);
@@ -222,6 +226,7 @@ long vfs_read    (struct vfs_file *f, void *buf, size_t n);
 long vfs_write   (struct vfs_file *f, const void *buf, size_t n);
 int  vfs_create  (const char *path);
 int  vfs_unlink  (const char *path);
+int  vfs_rename  (const char *oldpath, const char *newpath);
 int  vfs_mkdir   (const char *path);
 int  vfs_opendir (const char *path, struct vfs_dir *out);
 int  vfs_closedir(struct vfs_dir *d);
