@@ -90,9 +90,39 @@ static inline bool user_range_ok(uint64_t addr, size_t len) {
     return true;
 }
 
+/* Make [addr,addr+len) present for reading (demand-page/COW) or report failure;
+ * defined in page_fault.c. Without this a valid-half pointer into a region with
+ * NO VMA faults inside the stac window with no fixup to catch it -- an
+ * unhandled kernel #PF, i.e. a panic any process can trigger with a bad
+ * pointer. Probing lets the read accessors return -EFAULT like Linux. */
+int uaccess_prepare_read(uint64_t addr, uint64_t len);
+
+/* Residency probe that never invokes the fault handlers (page_fault.c). */
+int uaccess_probe_resident(uint64_t addr, uint64_t len);
+
+/* Read user memory WITHOUT trying to fault anything in: fails if the range is
+ * not already resident. Use this anywhere resolving a fault would be re-entrant
+ * or fatal -- notably crash diagnostics running inside exception handling.
+ * Mirrors Linux's copy_from_user_nofault(). */
+static inline int copy_from_user_nofault(void *dst, const void *user_src,
+                                         size_t n) {
+    if (!user_range_ok((uint64_t)(uintptr_t)user_src, n)) return -1;
+    if (n == 0) return 0;
+    if (uaccess_probe_resident((uint64_t)(uintptr_t)user_src, n) != 0) return -1;
+    unsigned long f = uaccess_begin();
+    memcpy(dst, user_src, n);
+    uaccess_end(f);
+    return 0;
+}
+
+static inline int get_user_u64_nofault(uint64_t *out, const void *user_src) {
+    return copy_from_user_nofault(out, user_src, sizeof(*out));
+}
+
 static inline int copy_from_user(void *dst, const void *user_src, size_t n) {
     if (!user_range_ok((uint64_t)(uintptr_t)user_src, n)) return -1;
     if (n == 0) return 0;
+    if (uaccess_prepare_read((uint64_t)(uintptr_t)user_src, n) != 0) return -1;
     unsigned long f = uaccess_begin();
     memcpy(dst, user_src, n);
     uaccess_end(f);
@@ -135,6 +165,13 @@ static inline long strncpy_from_user(char *dst, const void *user_src,
     size_t max = cap - 1;
     uint64_t room = UACCESS_USER_END - ua;       /* bytes until user-half end */
     if (max > room) max = (size_t)room;
+    /* Probe the FIRST page before touching it: a wholly-bogus pointer would
+     * otherwise #PF inside the window with no fixup and panic the kernel (see
+     * uaccess_prepare_read). NOTE: a string that STARTS in a mapped page and
+     * runs into an unmapped one is still a hole -- closing it needs per-page
+     * probing inside the loop, which is a bigger change to a hot path. */
+    if (uaccess_prepare_read(ua, 1) != 0) { dst[0] = '\0'; return -1; }
+
     const char *s = (const char *)user_src;
     size_t i = 0;
     unsigned long f = uaccess_begin();

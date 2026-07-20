@@ -71,6 +71,7 @@ struct sock *sock_alloc(int kind) {
         if (!g_socks[i].in_use) {
             memset(&g_socks[i], 0, sizeof(g_socks[i]));
             g_socks[i].in_use = true;
+            g_socks[i].refs   = 1;
             g_socks[i].kind   = kind;
             g_socks[i].recv_timeout_ms = 30000;
             g_socks[i].send_timeout_ms = 30000;
@@ -91,8 +92,24 @@ static void dgram_release_fds(struct sock_dgram *d) {
     d->nfds = 0;
 }
 
+void sock_ref(struct sock *s) {
+    if (!s || !s->in_use) return;
+    s->refs++;
+}
+
+/* Drop one fd reference. Linux fd inheritance duplicates the DESCRIPTOR, not the
+ * endpoint: a socket stays alive (and its AF_UNIX peer sees no EOF) until the
+ * last fd across every process that inherited it is closed -- exactly the rule
+ * pipes already follow via reader/writer counts. */
 void sock_close(struct sock *s) {
-    if (!s) return;
+    if (!s || !s->in_use) return;        /* already torn down -- double-close guard */
+    if (--s->refs > 0) return;           /* another fd still holds this endpoint */
+
+    /* Last reference: tell an AF_UNIX peer we are gone (wakes its blocked recv
+     * as EOF) BEFORE clearing our slot, since it reads our peer_ip. No-op for
+     * non-UNIX kinds and for the in-kernel fake-X endpoint. */
+    sock_unix_peer_close(s);
+
     s->in_use = false;
     wq_wake_all(&s->wq_recv);
 

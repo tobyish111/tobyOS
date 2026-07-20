@@ -263,6 +263,43 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
         return true;
     }
 
+    /* Case N: grow-down stack expansion.
+     *
+     * execve maps only USER_STACK_PAGES (8 pages = 32 KiB) eagerly and nothing
+     * grew it, so any process needing a deeper stack simply ran off the bottom
+     * into unmapped space and took a fatal #PF. Real Linux maps the stack
+     * grow-down and expands it on a fault below the current base, up to
+     * RLIMIT_STACK (8 MiB by default). Chrome's child processes blow well past
+     * 32 KiB -- they faulted at exactly stack_top-0x7f48 with "NOT covered by
+     * any mmap-VMA" -- so every one of them died.
+     *
+     * Expand lazily instead of eagerly reserving 8 MiB per process: chrome runs
+     * many processes and most touch only a few pages. Guard tightly -- the
+     * address must sit below the current stack base, within the growth limit,
+     * and be a USER access -- so this can never resurrect an unrelated wild
+     * pointer as "stack". */
+    if ((error_code & PF_ERR_USER) && p->user_stack_base &&
+        page_va <  p->user_stack_base &&
+        page_va >= USER_STACK_FLOOR_VA) {
+
+        uint64_t new_phys = pmm_alloc_page();
+        if (!new_phys) return false;
+        memset((void *)(new_phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
+
+        uint64_t saved = vmm_set_editor_root(p->cr3);
+        bool mapped = vmm_map(page_va, new_phys, PAGE_SIZE,
+                              VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER);
+        vmm_set_editor_root(saved);
+        if (!mapped) { pmm_free_page(new_phys); return false; }
+
+        page_ref_inc(new_phys);
+        /* The stack now reaches at least this far down. */
+        p->user_stack_base = page_va;
+        p->user_stack_pages++;
+        invlpg(page_va);
+        return true;
+    }
+
     /* No VMA, no valid PTE -- segfault */
     return false;
 }
@@ -275,6 +312,50 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
  * out-pointer landing in chrome's rodata / RELRO) and, being unresolvable inside
  * the SMAP uaccess window, took the fatal kernel-fault path -> KERNEL PANIC.
  * Now copy_to_user returns -EFAULT instead, exactly like Linux's uaccess. */
+/* Read-side twin of uaccess_prepare_write. copy_from_user used to do only a
+ * RANGE check and rely on faults inside the stac window being resolved by the
+ * demand/COW handler -- which is true for a lazily-backed page, but NOT for an
+ * address covered by no VMA at all. There is no exception-fixup table, so such
+ * a fault is an unhandled kernel #PF: an instant PANIC that any user process
+ * can trigger with a bad pointer. (Found via isr.c's own user-stack dump, which
+ * get_user_u64's its way along a faulting thread's rsp -- when that rsp was
+ * unmapped, the crash DIAGNOSTIC killed the kernel.) Probe first and let the
+ * caller return -EFAULT instead, which is what Linux does. */
+/* Pure residency probe: is every page of [addr,addr+len) ALREADY present?
+ * Unlike uaccess_prepare_read this never calls the fault handlers, so it is
+ * safe in contexts where resolving a fault would be re-entrant or fatal --
+ * above all inside exception handling itself, where isr.c dumps a faulting
+ * thread's user stack. (Resolving from there re-enters the fault machinery
+ * during a fault; that is how the crash DIAGNOSTIC came to panic the kernel.)
+ * This is Linux's copy_from_user_nofault distinction. */
+int uaccess_probe_resident(uint64_t addr, uint64_t len) {
+    struct proc *p = current_proc();
+    if (!p || len == 0) return 0;
+    uint64_t va  = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t end = addr + len;
+    for (; va < end; va += PAGE_SIZE) {
+        uint64_t *pte = get_pte(p->cr3, va);
+        if (!pte || !(*pte & PTE_PRESENT)) return -1;
+    }
+    return 0;
+}
+
+int uaccess_prepare_read(uint64_t addr, uint64_t len) {
+    struct proc *p = current_proc();
+    if (!p || len == 0) return 0;
+    uint64_t va  = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t end = addr + len;
+    for (; va < end; va += PAGE_SIZE) {
+        uint64_t *pte = get_pte(p->cr3, va);
+        if (pte && (*pte & PTE_PRESENT)) continue;      /* readable already */
+        uint64_t ec = PF_ERR_USER;                      /* read, not-present */
+        if (page_fault_handler(va, ec, p))   continue;  /* demand/COW resolved */
+        if (mmap_handle_page_fault(va, ec))  continue;
+        return -1;                                      /* unmapped -> EFAULT */
+    }
+    return 0;
+}
+
 int uaccess_prepare_write(uint64_t addr, uint64_t len) {
     struct proc *p = current_proc();
     if (!p || len == 0) return 0;

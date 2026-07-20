@@ -167,11 +167,18 @@ struct file *file_clone(struct file *src) {
         (*f->vfs_refs)++;
         break;
     case FILE_KIND_SOCKET:
-        /* Sockets aren't dup'd via inheritance: a child shouldn't
-         * silently share a parent socket. Refuse so the caller can
-         * substitute a console fd if needed. */
-        kfree(f);
-        return 0;
+        /* dup()/dup2()/fork inheritance share the SAME endpoint -- POSIX
+         * duplicates the descriptor, not the socket. (This used to refuse the
+         * clone, reasoning that a child shouldn't silently share a parent
+         * socket; that is simply not what Linux fork() does, and it left the
+         * child with NULL for every socket fd. Chrome's launcher fork()s and
+         * then dup2()s the inherited Mojo socketpair fd into the child, so the
+         * refusal made every child _exit(127) and the GPU process never came
+         * up.) The refcount keeps the pool slot alive, and the AF_UNIX peer
+         * only sees EOF once the last holder closes. */
+        f->sock = src->sock;
+        sock_ref(f->sock);
+        break;
     case FILE_KIND_WINDOW:
         /* GUI windows are exclusively owned by their creator; cloning
          * a window across fork would leave two processes racing to
@@ -248,8 +255,9 @@ void file_close(struct file *f) {
         }
         break;
     case FILE_KIND_SOCKET:
-        if (f->sock && f->sock->kind == SOCK_KIND_UNIX)
-            sock_unix_peer_close(f->sock);   /* wake peer's blocked recv -> EOF */
+        /* Drops one reference. The AF_UNIX peer-EOF wake now happens INSIDE
+         * sock_close at the last reference -- doing it here would signal EOF
+         * as soon as any one inheritor closed its copy. */
         sock_close(f->sock);
         break;
     case FILE_KIND_WINDOW:

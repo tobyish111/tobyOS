@@ -174,6 +174,12 @@ static inline size_t pt_idx  (uint64_t v) { return (v >> 12) & 0x1ff; }
 
 /* ---- map paths ---- */
 
+/* Count of 4K remaps over an already-present PTE (see map_4k). Legal, but a
+ * runaway count means something is re-mapping the same range in a loop. */
+static unsigned long g_map4k_remaps;
+
+unsigned long vmm_remap_count(void) { return g_map4k_remaps; }
+
 static bool map_4k(uint64_t virt, uint64_t phys, uint32_t flags) {
     pte_t *pdpt = next_table(g_pml4, pml4_idx(virt), flags, true);
     if (!pdpt) return false;
@@ -184,8 +190,19 @@ static bool map_4k(uint64_t virt, uint64_t phys, uint32_t flags) {
 
     size_t i = pt_idx(virt);
     if (pt[i] & PTE_P) {
-        kprintf("[vmm] WARN: map_4k: virt %p already mapped (entry=0x%lx)\n",
-                (void *)virt, pt[i]);
+        /* Remapping an existing 4K page is legal (the entry is overwritten
+         * below) -- this is a diagnostic, not an error. Rate-limited because a
+         * multi-process chrome run produced ~165k of these in one boot, which
+         * drowned every other line in the serial log and cost real time (serial
+         * writes are slow). Keep the first few, then count silently. */
+        if (g_map4k_remaps < 16) {
+            kprintf("[vmm] WARN: map_4k: virt %p already mapped (entry=0x%lx)\n",
+                    (void *)virt, pt[i]);
+        } else if (g_map4k_remaps == 16) {
+            kprintf("[vmm] WARN: map_4k: further 'already mapped' warnings "
+                    "suppressed (total reported via vmm_remap_count())\n");
+        }
+        g_map4k_remaps++;
     }
     uint64_t leaf = flags_to_leaf(flags);
     if (flags & VMM_WC) leaf |= PTE_PAT_4K;   /* PCD=PWT=0 + PAT => slot 4 (WC) */

@@ -7247,15 +7247,14 @@ void _start(void) {
             (char *)"chrome-headless-shell",
             (char *)"--no-sandbox",
             (char *)"--no-zygote",
-            /* Kept --single-process for now: multi-process is the model chrome
-             * really uses, and dropping this flag DID make chrome spawn real
-             * children -- but they all _exit(127) because fork() cannot hand a
-             * socket to the child (file_clone refuses FILE_KIND_SOCKET), so the
-             * launcher's dup2 of the inherited Mojo socketpair fd fails and the
-             * GPU process never starts ("GPU process isn't usable. Goodbye.").
-             * Re-drop this flag once fork inherits sockets (needs a refcount on
-             * struct sock). See docs/chromium-bringup-m1.md slice 20. */
-            (char *)"--single-process",
+            /* --single-process is GONE as of slice 21: fork() now inherits
+             * socket fds (refcount on struct sock; file_clone shares the
+             * endpoint), so the launcher's dup2 of the inherited Mojo
+             * socketpair fd succeeds and children no longer _exit(127).
+             * Multi-process is the model chrome really uses -- and the page
+             * that must load first is a WebUI page, which has strict process
+             * requirements that legacy --single-process may never satisfy.
+             * See docs/chromium-bringup-m1.md slice 21. */
             /* M1 render slice 12: route ANGLE's Vulkan backend through the REAL
              * Khronos loader (libvulkan.so.1) instead of dlopen'ing SwiftShader's
              * ICD directly. --use-angle=vulkan + VK_ICD_FILENAMES (env below) make
@@ -7327,7 +7326,12 @@ void _start(void) {
         struct proc_spec spec = {
             .path = "/opt/chrome/chrome-headless-shell",
             .name = "chrome",
-            .argc = 15, .argv = argv, .envc = 7, .envp = envp,
+            /* argc is HARDCODED and must match the argv[] above exactly (the
+             * trailing 0 is not counted). Dropping --single-process in slice 21
+             * took this 15 -> 14; leaving it at 15 made proc_spawn read past the
+             * terminator and fail, which the arm below misreports as "binary not
+             * present". Re-count whenever you touch argv. */
+            .argc = 14, .argv = argv, .envc = 7, .envp = envp,
         };
         kprintf("[boot] CHROMIUM: spawning REAL headless Chromium "
                 "(chrome-headless-shell --dump-dom); the DELIVERABLE is the "

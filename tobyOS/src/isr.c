@@ -299,7 +299,11 @@ static void default_exception(struct regs *r) {
                     (void *)r->rsp, (unsigned)MAIN_BASE);
             for (int i = 0; i < NSLOTS; i++) {
                 uint64_t a = r->rsp + (uint64_t)i * 8, v = 0;
-                if (get_user_u64(&v, (const void *)a) != 0) {
+                /* _nofault: we are INSIDE exception handling. Resolving a fault
+                 * here would re-enter the fault machinery mid-fault, which
+                 * panicked the kernel from this very diagnostic. Only read what
+                 * is already resident; an unreadable slot just ends the dump. */
+                if (get_user_u64_nofault(&v, (const void *)a) != 0) {
                     kprintf("  [rsp+0x%03x] <unreadable> -- stop\n", i * 8);
                     break;
                 }

@@ -260,6 +260,12 @@ int  vfs_symlink (const char *path, const char *target);
 int  vfs_readlink(const char *path, char *buf, size_t bufsz);
 int  vfs_resolve_path(const char *path, char *resolved, size_t resolved_sz);
 
+/* Resolve `path` through any SYMLINKS (including dynamically-synthesised ones
+ * like procfs's /proc/self/exe, which vfs_resolve_path's static table cannot
+ * see) and write the final target to `out`. Bounded hop count. Returns VFS_OK,
+ * or the stat/readlink error. A non-symlink path is copied through unchanged. */
+int  vfs_follow_link(const char *path, char *out, size_t outsz);
+
 /* Pretty name for an error code (for diagnostics). */
 const char *vfs_strerror(int err);
 
