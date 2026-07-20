@@ -4813,7 +4813,15 @@ static struct sock *lx_sock_of(int fd) {
  * uses one (EFD_CLOEXEC|EFD_NONBLOCK) as its wakeup descriptor; without it
  * curl_multi_handle() fails and curl_easy_perform() returns CURLE_OUT_OF_MEMORY.
  * The fd is read/write/poll-capable (see file.c) and pollable in poll/epoll. */
+/* Linux rejects unknown eventfd2 flag bits with -EINVAL, and chrome DEPENDS on
+ * it: mojo/core/channel_linux.cc EventFDNotifier::KernelSupported() probes with
+ * syscall(__NR_eventfd2, 0, ~0) and PCHECKs the call FAILS with EINVAL/ENOSYS/
+ * EPERM (line 192). Accepting every flag handed it a valid fd -> FATAL. Same
+ * probe idiom as memfd_create (channel_linux.cc:946). */
+#define LX_EFD_KNOWN_FLAGS (EFD_SEMAPHORE | EFD_CLOEXEC | EFD_NONBLOCK)
+
 static long lx_eventfd(unsigned int initval, unsigned int flags) {
+    if (flags & ~LX_EFD_KNOWN_FLAGS) return -ABI_EINVAL;
     struct file *f = eventfd_file_make(initval, flags);
     if (!f) return -ABI_ENOMEM;
     int fd = fd_alloc_into(current_proc(), f);
