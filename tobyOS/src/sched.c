@@ -670,6 +670,7 @@ void sched_tick(struct regs *r) {
             extern void lx_dump_recent_syscalls(void);
             lx_dump_recent_syscalls();
             prof_dump_and_reset();   /* hottest user rips this interval */
+            { extern void waitt_dump(void); waitt_dump(); }  /* who blocks on what */
         }
     }
 #endif
