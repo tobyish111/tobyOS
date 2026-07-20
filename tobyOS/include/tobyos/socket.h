@@ -55,12 +55,23 @@ struct sockaddr_in {
     uint32_t sin_addr;         /* network byte order */
 };
 
-/* One queued datagram (UDP). payload is heap-allocated, len bytes. */
+/* Max fds carried by one SCM_RIGHTS ancillary message (Linux allows 253; Mojo
+ * passes 1-2). Bounds the per-dgram fd array. */
+#define SOCK_SCM_MAX_FDS       4
+
+struct file;
+
+/* One queued datagram (UDP/AF_UNIX). payload is heap-allocated, len bytes.
+ * fds[] carries SCM_RIGHTS-passed open descriptions (already file_clone'd by the
+ * sender, so they hold their own reference); recvmsg installs them into the
+ * receiver's fd table, and a dropped/closed dgram file_close()s them. */
 struct sock_dgram {
     uint32_t  src_ip;          /* network byte order */
     uint16_t  src_port;        /* network byte order */
     uint16_t  len;
     uint8_t  *payload;         /* kmalloc'd; freed on dequeue */
+    struct file *fds[SOCK_SCM_MAX_FDS];
+    uint8_t   nfds;
 };
 
 struct proc;
@@ -117,6 +128,17 @@ void sock_close(struct sock *s);
 long sock_unix_send(struct sock *self, const void *kbuf, size_t n);
 long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms);
 void sock_unix_peer_close(struct sock *self);
+
+/* SCM_RIGHTS fd passing (Track B, slice 20). sendmsg hands over `nfiles` ALREADY
+ * file_clone'd descriptions, which ride with the message; recvmsg returns the ones
+ * attached to the message it consumed (at most max_out; *out_n is set) and the
+ * caller installs them into its fd table. Chrome's Mojo shared-memory channel
+ * (mojo/core/channel_linux.cc) passes its memfd this way. */
+long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
+                        struct file **files, int nfiles);
+long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
+                        uint32_t timeout_ms,
+                        struct file **out_files, int max_out, int *out_n);
 int  sock_unix_pair(struct sock **out_a, struct sock **out_b);
 
 /* connect(2) on an AF_UNIX stream socket to a named/abstract address. Only the

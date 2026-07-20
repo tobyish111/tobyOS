@@ -4828,8 +4828,26 @@ static long lx_eventfd(unsigned int initval, unsigned int flags) {
  * the other -- which tobyOS's copy-based file mmap can't do, but a memfd (mapping
  * the SAME physical pages) does. `name` is advisory (ignored); flags
  * (MFD_CLOEXEC/MFD_ALLOW_SEALING) are accepted but not tracked. */
+#define LX_MFD_CLOEXEC       0x0001u
+#define LX_MFD_ALLOW_SEALING 0x0002u
+#define LX_MFD_HUGETLB       0x0004u
+#define LX_MFD_NOEXEC_SEAL   0x0008u
+#define LX_MFD_EXEC          0x0010u
+#define LX_MFD_KNOWN_FLAGS  (LX_MFD_CLOEXEC | LX_MFD_ALLOW_SEALING | \
+                             LX_MFD_HUGETLB | LX_MFD_NOEXEC_SEAL | LX_MFD_EXEC)
+
 static long lx_memfd_create(const char *uname, unsigned int flags) {
-    (void)uname; (void)flags;
+    (void)uname;
+    /* Linux REJECTS unknown flag bits with -EINVAL, and callers rely on it:
+     * chrome's Mojo channel PROBES support by calling memfd_create(name, ~0u)
+     * and expecting -EINVAL. Accepting everything (the old `(void)flags`) handed
+     * it a valid fd, so it concluded the kernel was broken and hit the FATAL
+     * Check at mojo/core/channel_linux.cc:947. Validate like Linux does. */
+#ifdef CHROMIUM_BOOT
+    { static int c=0; if(c<24){c++; kprintf("[memfd] create req flags=0x%x%s\n",
+        flags, (flags & ~LX_MFD_KNOWN_FLAGS) ? " -> EINVAL(unknown bits)" : " -> ok"); } }
+#endif
+    if (flags & ~LX_MFD_KNOWN_FLAGS) return -ABI_EINVAL;
     struct memfd *mf = memfd_new();
     if (!mf) return -ABI_ENOMEM;
     struct file *f = (struct file *)kmalloc(sizeof *f);
@@ -4840,6 +4858,9 @@ static long lx_memfd_create(const char *uname, unsigned int flags) {
     f->o_accmode = 2;                 /* O_RDWR: a memfd is always read+write */
     int fd = fd_alloc_into(current_proc(), f);
     if (fd < 0) { file_close(f); return -ABI_EMFILE; }
+#ifdef CHROMIUM_BOOT
+    { static int c = 0; if (c < 24) { c++; kprintf("[memfd] create -> fd=%d\n", fd); } }
+#endif
     return fd;
 }
 
@@ -5251,6 +5272,103 @@ static long lx_read_msghdr(uint64_t umsg, struct lx_msghdr *mh,
     return (long)n;
 }
 
+/* ---- SCM_RIGHTS fd passing over AF_UNIX (slice 20) --------------------------
+ * struct cmsghdr (x86-64 Linux): 0:cmsg_len(size_t) 8:cmsg_level 12:cmsg_type,
+ * payload follows, each cmsg padded to an 8-byte boundary.
+ * Chrome's Mojo shared-memory channel (mojo/core/channel_linux.cc) passes its
+ * memfd this way; without it that channel FATALs. In --single-process the peer
+ * thread SHARES our fd table, but Mojo still expects a distinct received fd, so
+ * we file_clone() the description on send (it rides with the message) and
+ * fd_alloc_into() it on receive -- exactly Linux's "dup into the receiver". */
+struct lx_cmsghdr {
+    uint64_t cmsg_len;
+    int32_t  cmsg_level;
+    int32_t  cmsg_type;
+};
+#define LX_SOL_SOCKET    1
+#define LX_SCM_RIGHTS    1
+#define LX_MSG_CTRUNC    0x8
+#define LX_CMSG_ALIGN(n) (((uint64_t)(n) + 7ull) & ~7ull)
+#define LX_CMSG_CTLMAX   1024u      /* bound the control buffer we copy in */
+
+/* Collect SCM_RIGHTS fds from a sendmsg control buffer, cloning each open
+ * description. Returns how many were placed in files[]. */
+static int lx_scm_send_collect(const struct lx_msghdr *mh,
+                               struct file **files, int max) {
+    int nf = 0;
+    if (!mh->msg_control || mh->msg_controllen < sizeof(struct lx_cmsghdr))
+        return 0;
+    uint64_t clen = mh->msg_controllen;
+    if (clen > LX_CMSG_CTLMAX) clen = LX_CMSG_CTLMAX;
+    uint8_t *cbuf = (uint8_t *)kmalloc((size_t)clen);
+    if (!cbuf) return 0;
+    if (copy_from_user(cbuf, (const void *)(uintptr_t)mh->msg_control,
+                       (size_t)clen) != 0) { kfree(cbuf); return 0; }
+    uint64_t off = 0;
+    while (off + sizeof(struct lx_cmsghdr) <= clen) {
+        struct lx_cmsghdr *cm = (struct lx_cmsghdr *)(cbuf + off);
+        if (cm->cmsg_len < sizeof(struct lx_cmsghdr)) break;
+        if (off + cm->cmsg_len > clen) break;
+        if (cm->cmsg_level == LX_SOL_SOCKET && cm->cmsg_type == LX_SCM_RIGHTS) {
+            uint64_t dlen = cm->cmsg_len - sizeof(struct lx_cmsghdr);
+            int cnt = (int)(dlen / sizeof(int32_t));
+            int32_t *ufds = (int32_t *)(cbuf + off + sizeof(struct lx_cmsghdr));
+            for (int i = 0; i < cnt && nf < max; i++) {
+                struct file *src = fd_lookup(ufds[i]);
+                if (!src) continue;                  /* bad fd: skip (Linux EBADF) */
+                struct file *cl = file_clone(src);
+                if (cl) files[nf++] = cl;
+            }
+        }
+        off += LX_CMSG_ALIGN(cm->cmsg_len);
+    }
+    kfree(cbuf);
+#ifdef CHROMIUM_BOOT
+    if (nf) { static int c=0; if(c<24){c++; kprintf("[scm] sendmsg passing %d fd(s)\n", nf);} }
+#endif
+    return nf;
+}
+
+/* Install received descriptions into our fd table and emit one SCM_RIGHTS cmsg
+ * into the caller's control buffer. Writes msg_controllen + msg_flags back. */
+static void lx_scm_recv_emit(uint64_t umsg, const struct lx_msghdr *mh,
+                             struct file **files, int nf) {
+    uint64_t ctl_len = 0;
+    int32_t  flags   = 0;
+    if (nf > 0) {
+        uint64_t need = sizeof(struct lx_cmsghdr) + LX_CMSG_ALIGN(nf * 4);
+        if (!mh->msg_control || mh->msg_controllen < need) {
+            for (int i = 0; i < nf; i++) file_close(files[i]);   /* no room */
+            flags = LX_MSG_CTRUNC;
+        } else {
+            int32_t fdnums[SOCK_SCM_MAX_FDS];
+            int got = 0;
+            for (int i = 0; i < nf; i++) {
+                int nfd = fd_alloc_into(current_proc(), files[i]);
+                if (nfd < 0) { file_close(files[i]); continue; }
+                fdnums[got++] = nfd;
+            }
+            if (got > 0) {
+                uint64_t dlen = (uint64_t)got * 4;
+                uint64_t clen = sizeof(struct lx_cmsghdr) + dlen;
+                uint8_t buf[sizeof(struct lx_cmsghdr) + SOCK_SCM_MAX_FDS * 4];
+                struct lx_cmsghdr *cm = (struct lx_cmsghdr *)buf;
+                cm->cmsg_len = clen; cm->cmsg_level = LX_SOL_SOCKET;
+                cm->cmsg_type = LX_SCM_RIGHTS;
+                memcpy(buf + sizeof(*cm), fdnums, (size_t)dlen);
+                if (copy_to_user((void *)(uintptr_t)mh->msg_control, buf,
+                                 (size_t)clen) == 0)
+                    ctl_len = clen;
+            }
+        }
+    }
+#ifdef CHROMIUM_BOOT
+    if (nf) { static int c=0; if(c<24){c++; kprintf("[scm] recvmsg got %d fd(s) ctl_len=%lu flags=0x%x\n", nf,(unsigned long)ctl_len,(unsigned)flags);} }
+#endif
+    (void)copy_to_user((void *)(uintptr_t)(umsg + 40), &ctl_len, 8);
+    (void)copy_to_user((void *)(uintptr_t)(umsg + 48), &flags, 4);
+}
+
 static long lx_sendmsg(int fd, uint64_t umsg, int flags) {
     (void)flags;
     struct sock *s = lx_sock_of(fd);
@@ -5287,9 +5405,12 @@ static long lx_sendmsg(int fd, uint64_t umsg, int flags) {
         long n = total ? tcp_send(s->tcp, k, total) : 0;
         rv = (n < 0) ? -ABI_EPIPE : n;
     } else if (s->kind == SOCK_KIND_UNIX) {
-        /* AF_UNIX stream: libxcb + D-Bus write via sendmsg (not just writev).
-         * Ancillary data (SCM_RIGHTS) is not delivered -- no fd passing yet. */
-        long n = sock_unix_send(s, k, total);
+        /* AF_UNIX: libxcb + D-Bus write via sendmsg (not just writev), and Mojo
+         * passes fds (its memfd) as SCM_RIGHTS ancillary data -- collect + clone
+         * those so they ride with the message to the peer. */
+        struct file *scm[SOCK_SCM_MAX_FDS];
+        int nscm = lx_scm_send_collect(&mh, scm, SOCK_SCM_MAX_FDS);
+        long n = sock_unix_send_fds(s, k, total, scm, nscm);
         rv = (n < 0) ? -ABI_EPIPE : n;
     } else {
         rv = -LXE_ENOTSOCK;
@@ -5303,6 +5424,8 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
 
+    struct file *scm_files[SOCK_SCM_MAX_FDS];   /* SCM_RIGHTS handed to us */
+    int          scm_n = 0;
     struct lx_msghdr mh;
     struct lx_iovec  iov[LX_MSG_IOV_MAX];
     size_t total = 0;
@@ -5332,7 +5455,8 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
          * though the writev'd request + our fake-X reply were fine). MSG_DONTWAIT
          * (0x40) -> non-blocking poll; otherwise block like read(). */
         uint32_t to = (flags & 0x40) ? 1u : 0u;
-        n = sock_unix_recv(s, k, total, to);
+        n = sock_unix_recv_fds(s, k, total, to, scm_files, SOCK_SCM_MAX_FDS,
+                               &scm_n);
         if (n == EINTR_RET)            { kfree(k); return -LXE_EINTR; }
         if (n < 0)                     { kfree(k); return -LXE_EAGAIN; }
         if (n == 0 && (flags & 0x40))  { kfree(k); return -LXE_EAGAIN; }
@@ -5349,6 +5473,7 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
         if (l && copy_to_user((void *)(uintptr_t)iov[i].iov_base,
                               (const uint8_t *)k + off, l) != 0) {
             kfree(k);
+            for (int j = 0; j < scm_n; j++) file_close(scm_files[j]);
             return -ABI_EFAULT;
         }
         off += l;
@@ -5361,11 +5486,11 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
         sa.sin_family = AF_INET; sa.sin_addr = sip; sa.sin_port = sport;
         (void)copy_to_user((void *)(uintptr_t)mh.msg_name, &sa, sizeof sa);
     }
-    {   /* msg_namelen, msg_controllen, msg_flags written back into the msghdr */
+    {   /* msg_namelen written back; msg_controllen/msg_flags are set by the
+         * SCM_RIGHTS emitter (which also installs any received fds). */
         uint32_t nl = (mh.msg_name) ? (uint32_t)sizeof(struct sockaddr_in) : 0;
         (void)copy_to_user((void *)(uintptr_t)(umsg + 8),  &nl, 4);
-        uint64_t cl = 0; (void)copy_to_user((void *)(uintptr_t)(umsg + 40), &cl, 8);
-        int32_t  fl = 0; (void)copy_to_user((void *)(uintptr_t)(umsg + 48), &fl, 4);
+        lx_scm_recv_emit(umsg, &mh, scm_files, scm_n);
     }
     return n;
 }
@@ -5464,7 +5589,8 @@ static const char *lx_scname(long n) {
  * diagnostics: isr.c dumps it on a fatal user fault, which is far cheaper than
  * the full -DLINUX_SYSCALL_TRACE firehose when a program has already made tens
  * of thousands of calls (e.g. Chromium at 20k+). */
-#define LX_RECENT 48
+#define LX_RECENT 384   /* slice 20: 48 was flooded by busy threads, hiding the
+                         * sequence that precedes chrome's FATAL CHECK */
 static long     g_lx_recent_n[LX_RECENT];
 static int      g_lx_recent_tid[LX_RECENT];
 static uint32_t g_lx_recent_i;
@@ -6033,8 +6159,12 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
          * zero-filled, so no on-disk blocks are needed here. Non-VFS fds keep the
          * old accept-as-success behaviour (wget's alarm-timeout ftruncate). */
         struct file *tf = fd_lookup((int)a1);
-        if (tf && tf->kind == FILE_KIND_MEMFD && (long)a2 >= 0)
+        if (tf && tf->kind == FILE_KIND_MEMFD && (long)a2 >= 0) {
+#ifdef CHROMIUM_BOOT
+            { static int c=0; if(c<24){c++; kprintf("[memfd] ftruncate fd=%d size=%lu\n",(int)a1,(unsigned long)a2);} }
+#endif
             return memfd_ftruncate(tf->memfd, (uint64_t)a2);   /* allocates pages */
+        }
         if (tf && tf->kind == FILE_KIND_VFS && (long)a2 >= 0)
             tf->vfs.size = (size_t)a2;
         return 0;
@@ -6087,9 +6217,13 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         struct file *mf = (fd >= 0) ? fd_lookup(fd) : NULL;
         if (mf && mf->kind == FILE_KIND_FB)          /* /dev/fb0 shadow scanout */
             ret = fbdev_mmap((uint64_t)a2);
-        else if (mf && mf->kind == FILE_KIND_MEMFD)  /* coherent shared memory */
+        else if (mf && mf->kind == FILE_KIND_MEMFD) { /* coherent shared memory */
             ret = memfd_map((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
                             lx_mmap_flags(lf), mf->memfd, lx_mmap_offset());
+#ifdef CHROMIUM_BOOT
+            { static int c=0; if(c<24){c++; kprintf("[memfd] mmap fd=%d len=0x%lx prot=0x%x -> 0x%lx\n",fd,(unsigned long)a2,(unsigned)a3,(unsigned long)ret);} }
+#endif
+        }
         else if ((lf & LXMAP_ANONYMOUS) || fd < 0)   /* anonymous (malloc/TLS) */
             ret = sys_mmap((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
                            lx_mmap_flags(lf), -1, 0);
@@ -6373,11 +6507,17 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
              * a FATAL "Check failed". Store the seals on the memfd. */
             struct file *ff = fd_lookup((int)a1);
             if (!ff || ff->kind != FILE_KIND_MEMFD) return -ABI_EINVAL;
+#ifdef CHROMIUM_BOOT
+            { static int c=0; if(c<24){c++; kprintf("[memfd] ADD_SEALS fd=%d seals=0x%x\n",(int)a1,(unsigned)a3);} }
+#endif
             return memfd_add_seals(ff->memfd, (unsigned int)a3);
         }
         if ((int)a2 == 1034 /* F_GET_SEALS */) {
             struct file *ff = fd_lookup((int)a1);
             if (!ff || ff->kind != FILE_KIND_MEMFD) return -ABI_EINVAL;
+#ifdef CHROMIUM_BOOT
+            { static int c=0; if(c<24){c++; kprintf("[memfd] GET_SEALS fd=%d -> 0x%lx\n",(int)a1,(unsigned long)memfd_get_seals(ff->memfd));} }
+#endif
             return memfd_get_seals(ff->memfd);
         }
         return 0;               /* F_GETFD/F_SETFD/F_SETFL/CLOEXEC: best-effort no-op */
