@@ -81,6 +81,13 @@ enum vfs_type {
 
 struct vfs_stat {
     enum vfs_type type;
+    /* Hard-link count. 0 = "unset", so stat emitters substitute the usual
+     * default (1 for files, 2 for directories). Only filesystems with a real
+     * answer set it -- procfs reports 2 + one-per-thread for /proc/<pid>/task/,
+     * because chrome's sandbox asserts mono-threadedness by stat'ing that
+     * directory and testing st_nlink == 3 (".", "..", one thread). See
+     * sandbox/linux/services/thread_helpers.cc:41. */
+    uint32_t      nlink;
     size_t        size;        /* 0 for directories */
     /* Owner identity + permission bits (milestone 15). mode == 0 (no
      * VFS_MODE_VALID bit) means "this fs/inode has no permission

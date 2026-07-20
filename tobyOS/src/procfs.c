@@ -575,6 +575,59 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
             }
             return VFS_ERR_NOENT;
         }
+        /* /proc/<pid>/task (dir) and /proc/<pid>/task/<tid> (dir).
+         *
+         * chrome's sandbox decides whether the process is mono-threaded by
+         * stat'ing this directory and testing st_nlink == 3 -- ".", ".." and
+         * one subdirectory per thread (sandbox/linux/services/thread_helpers.cc:41,
+         * `PCHECK(0 == fstatat(proc_fd, "self/task/", ...))` then
+         * `CHECK_LE(3UL, st_nlink)`). Without it the browser took the PCHECK
+         * and died. Note the trailing slash chrome passes -- accept it. */
+        if (*s == '/' && (strncmp(s + 1, "task", 4) == 0) &&
+            (s[5] == '\0' || s[5] == '/')) {
+            int pid = parse_int(rel);
+            struct proc *p = proc_lookup(pid);
+            if (!p) return VFS_ERR_NOENT;
+            int tgid = p->is_thread ? p->tgid : p->pid;
+
+            const char *after = s + 5;             /* "" or "/..." */
+            if (*after == '/') after++;            /* skip the slash */
+            if (*after == '\0') {                  /* the task directory */
+                /* 2 (self + parent) + one entry per live thread in the group. */
+                /* Count only LIVE threads. A TERMINATED-but-unreaped thread
+                 * must not appear: chrome stops a thread and then polls until
+                 * its task/<tid> entry returns ENOENT, giving up with
+                 * "Stopped thread does not disappear in /proc" if it lingers
+                 * (thread_helpers.cc:104). */
+                uint32_t nthreads = 0;
+                for (int i = 0; i < PROC_MAX; i++) {
+                    if (g_proc[i].state == PROC_UNUSED ||
+                        g_proc[i].state == PROC_TERMINATED) continue;
+                    int qtg = g_proc[i].is_thread ? g_proc[i].tgid
+                                                  : g_proc[i].pid;
+                    if (qtg == tgid) nthreads++;
+                }
+                out->type = VFS_TYPE_DIR;
+                out->nlink = 2u + (nthreads ? nthreads : 1u);
+                out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+                return VFS_OK;
+            }
+            /* /proc/<pid>/task/<tid> -- a per-thread directory. */
+            int tid = parse_int(after);
+            struct proc *t = proc_lookup(tid);
+            if (!t) return VFS_ERR_NOENT;
+            /* A stopped/exited thread must READ AS GONE, not merely idle --
+             * chrome polls this path waiting for ENOENT after joining a thread
+             * (thread_helpers.cc:104). proc_lookup still returns TERMINATED
+             * entries that have not been reaped yet, so filter them here. */
+            if (t->state == PROC_TERMINATED) return VFS_ERR_NOENT;
+            if ((t->is_thread ? t->tgid : t->pid) != tgid) return VFS_ERR_NOENT;
+            out->type = VFS_TYPE_DIR;
+            out->nlink = 2;
+            out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+            return VFS_OK;
+        }
+
         /* /proc/<pid>/fd (dir) and /proc/<pid>/fd/<n> (symlink) */
         if (*s == '/' && (strcmp(s + 1, "fd") == 0 ||
                           (s[1]=='f' && s[2]=='d' && s[3]=='/'))) {

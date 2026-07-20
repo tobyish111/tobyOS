@@ -770,3 +770,140 @@ long memfd_map(uint64_t addr, uint64_t len, uint32_t prot, uint32_t flags,
     vmm_set_editor_root(saved);
     return (long)base;
 }
+
+/* ==================================================================
+ * MAP_SHARED file-backed page cache (slice 22).
+ *
+ * POSIX MAP_SHARED means every mapping of the same file region sees the SAME
+ * memory. linux_mmap_file historically reserved ANONYMOUS pages and filled
+ * them by reading the file, so two processes mapping one file each got a
+ * PRIVATE COPY -- writes were invisible to the other side. That silently broke
+ * every cross-process shared-memory user, and it is what stalled Chromium's
+ * Mojo bootstrap: base/memory/platform_shared_memory_region_posix.cc creates
+ * its regions as temp FILES (this build has no memfd path for them), so the
+ * browser wrote into its copy and the child waited forever on its own.
+ *
+ * Fix: one page list per INODE, shared by every MAP_SHARED mapping of that
+ * file -- structurally the same trick struct memfd already uses, keyed by
+ * vfs_file.ino (stable per file, slice 14) instead of by fd. Keying on the
+ * inode rather than the path is what makes it survive unlink(), which matters
+ * because chrome unlinks its regions immediately after creating them.
+ *
+ * MAP_PRIVATE is untouched and still copies, which is correct.
+ *
+ * LIMITATION (deliberate, documented): entries are never reclaimed and there is
+ * no writeback to disk -- the cache IS the file's contents for anyone who maps
+ * it, but a later read() sees the on-disk bytes. Chrome's regions are anonymous
+ * scratch that nobody read()s, so this is sound for the bring-up; a general
+ * implementation needs msync/close writeback and eviction.
+ * ================================================================== */
+
+#define SHMCACHE_MAX 32
+
+struct shm_cache {
+    bool      used;
+    uint64_t  ino;          /* stable file identity (vfs_file.ino) */
+    uint64_t *pages;        /* physical page addrs; index i == file page i */
+    size_t    npages;
+    size_t    cap;
+};
+
+static struct shm_cache g_shm[SHMCACHE_MAX];
+
+struct shm_cache *shm_cache_for_ino(uint64_t ino, bool *created) {
+    if (created) *created = false;
+    if (ino == 0) return 0;                      /* no stable identity */
+    for (int i = 0; i < SHMCACHE_MAX; i++)
+        if (g_shm[i].used && g_shm[i].ino == ino) return &g_shm[i];
+    for (int i = 0; i < SHMCACHE_MAX; i++) {
+        if (!g_shm[i].used) {
+            g_shm[i].used = true;
+            g_shm[i].ino  = ino;
+            g_shm[i].pages = 0; g_shm[i].npages = 0; g_shm[i].cap = 0;
+            if (created) *created = true;
+            return &g_shm[i];
+        }
+    }
+    return 0;                                    /* table full -> caller copies */
+}
+
+int shm_cache_ensure(struct shm_cache *sc, size_t want) {
+    if (!sc) return -1;
+    if (want <= sc->npages) return 0;
+    if (want > sc->cap) {
+        size_t ncap = sc->cap ? sc->cap : 8;
+        while (ncap < want) ncap *= 2;
+        uint64_t *np = (uint64_t *)kmalloc(ncap * sizeof(uint64_t));
+        if (!np) return -1;
+        for (size_t i = 0; i < sc->npages; i++) np[i] = sc->pages[i];
+        for (size_t i = sc->npages; i < ncap; i++) np[i] = 0;
+        if (sc->pages) kfree(sc->pages);
+        sc->pages = np; sc->cap = ncap;
+    }
+    for (size_t i = sc->npages; i < want; i++) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) return -1;
+        memset((char *)(phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
+        /* The CACHE itself holds one reference, so the page survives every
+         * mapper exiting. Without this the refcount sat at 0 and
+         * free_subtree() (vmm.c) freed the frame on the FIRST address-space
+         * teardown -- then again for every other mapper: "[pmm] WARN: double
+         * free of page", with the frame handed back out while live processes
+         * were still writing through it. */
+        page_ref_inc(phys);
+        sc->pages[i] = phys;
+    }
+    sc->npages = want;
+    return 0;
+}
+
+/* High-water page count, so a caller can tell which pages a given
+ * shm_cache_ensure() call NEWLY allocated and populate exactly those. */
+size_t shm_cache_npages(struct shm_cache *sc) { return sc ? sc->npages : 0; }
+
+/* Kernel-virtual address of file page `idx`, for populating it from the file. */
+void *shm_cache_page_ptr(struct shm_cache *sc, size_t idx) {
+    if (!sc || idx >= sc->npages || !sc->pages[idx]) return 0;
+    return (void *)(sc->pages[idx] + vmm_hhdm_offset());
+}
+
+/* Map [offset,offset+len) of the cache into the caller. Mirrors memfd_mmap:
+ * the SAME physical pages are installed in every mapper's address space, which
+ * is what makes writes mutually visible. VMA_FLAG_NOFREE so munmap unmaps but
+ * never frees pages the cache owns. */
+long shm_cache_mmap(struct shm_cache *sc, uint64_t addr, uint64_t len,
+                    uint32_t prot, uint32_t flags, uint64_t offset) {
+    struct proc *p = current_proc();
+    if (!p || !sc) return -1;
+    int pid = p->is_thread ? p->tgid : p->pid;
+    struct vma_table *vt = &g_vma_tables[pid];
+    if (len == 0) return -22;
+    len = page_align_up(len);
+    offset = page_align_down(offset);
+    size_t page_off = (size_t)(offset / PAGE_SIZE);
+    size_t np = (size_t)(len / PAGE_SIZE);
+    if (shm_cache_ensure(sc, page_off + np) < 0) return -12;
+
+    uint64_t base;
+    if ((flags & VMA_FLAG_FIXED) && addr) base = page_align_down(addr);
+    else { base = find_free_region(vt, len); if (!base) return -12; }
+
+    struct mmap_vma *v = vma_alloc(vt);
+    if (!v) return -12;
+    v->start = base; v->end = base + len; v->prot = prot;
+    v->flags = (flags | VMA_FLAG_NOFREE) & ~(uint32_t)VMA_FLAG_ANON;
+    v->fd = -1; v->offset = offset;
+
+    uint32_t vmm_f = prot_to_vmm_flags(prot);
+    uint64_t saved = vmm_set_editor_root(p->cr3);
+    for (size_t i = 0; i < np; i++) {
+        /* One reference per ADDRESS SPACE the page is mapped into, so this
+         * process's teardown only drops its own (free_subtree decrements when
+         * refs > 1 and frees only at the last). Paired with the cache's own
+         * reference from shm_cache_ensure. */
+        page_ref_inc(sc->pages[page_off + i]);
+        vmm_map(base + i * PAGE_SIZE, sc->pages[page_off + i], PAGE_SIZE, vmm_f);
+    }
+    vmm_set_editor_root(saved);
+    return (long)base;
+}
