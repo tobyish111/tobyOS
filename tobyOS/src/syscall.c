@@ -5645,6 +5645,39 @@ void lx_dump_recent_syscalls(void) {
     }
 }
 
+#ifdef CHROMIUM_BOOT
+/* slice 20 wait-graph: which threads are blocked in a BLOCKING syscall, on what,
+ * and for how long. chrome's renderer never completes a document load and is
+ * almost always in-kernel (per the ring-3 profiler), so the question is who is
+ * waiting on whom. Recorded at the syscall boundary, so an entry persists for
+ * exactly as long as the thread is blocked inside the call. */
+#define WAITT_MAX 64
+static struct { int pid; long nr; uint64_t arg; uint64_t since_ns; uint8_t busy; }
+        g_waitt[WAITT_MAX];
+
+static void waitt_enter(long nr, uint64_t arg) {
+    struct proc *p = current_proc(); if (!p) return;
+    for (int i = 0; i < WAITT_MAX; i++) if (!g_waitt[i].busy) {
+        g_waitt[i].pid = p->pid; g_waitt[i].nr = nr; g_waitt[i].arg = arg;
+        g_waitt[i].since_ns = perf_now_ns(); g_waitt[i].busy = 1; return; }
+}
+static void waitt_exit(void) {
+    struct proc *p = current_proc(); if (!p) return;
+    for (int i = 0; i < WAITT_MAX; i++)
+        if (g_waitt[i].busy && g_waitt[i].pid == p->pid) { g_waitt[i].busy = 0; return; }
+}
+void waitt_dump(void) {
+    uint64_t now = perf_now_ns(); int n = 0;
+    for (int i = 0; i < WAITT_MAX; i++) if (g_waitt[i].busy) n++;
+    if (!n) return;
+    kprintf("[wait] %d thread(s) blocked in a syscall:\n", n);
+    for (int i = 0; i < WAITT_MAX; i++) if (g_waitt[i].busy)
+        kprintf("  pid=%d %s(0x%lx) for %lu ms\n", g_waitt[i].pid,
+                lx_scname(g_waitt[i].nr), (unsigned long)g_waitt[i].arg,
+                (unsigned long)((now - g_waitt[i].since_ns) / 1000000ull));
+}
+#endif
+
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     {
         uint32_t i = g_lx_recent_i++ % LX_RECENT;
@@ -5797,8 +5830,16 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     case LX_epoll_ctl:             /* epoll_ctl(epfd, op, fd, *event) */
         return lx_epoll_ctl((int)a1, (int)a2, (int)a3, (uint64_t)a4);
     case LX_epoll_wait:            /* epoll_wait(epfd, *events, maxevents, timeout) */
-    case LX_epoll_pwait:           /* epoll_pwait(... , *sigmask) -- sigmask ignored */
-        return lx_epoll_wait((int)a1, (uint64_t)a2, (int)a3, (long)(int)a4);
+    case LX_epoll_pwait: {         /* epoll_pwait(... , *sigmask) -- sigmask ignored */
+#ifdef CHROMIUM_BOOT
+        waitt_enter(n, (uint64_t)(int)a1);      /* arg = the epoll fd */
+#endif
+        long er = lx_epoll_wait((int)a1, (uint64_t)a2, (int)a3, (long)(int)a4);
+#ifdef CHROMIUM_BOOT
+        waitt_exit();
+#endif
+        return er;
+    }
     case LX_getcwd: return do_syscall(SYS_GETCWD, a1, a2, 0, 0, 0);
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
@@ -6515,9 +6556,17 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     /* Futex: forward only the FUTEX_WAIT/WAKE low ops; private flag and
      * timeouts are ignored for now (single-threaded statics don't block
      * here). */
-    case LX_futex:   /* (uaddr, op, val, timeout, ...); op decoded inside */
-        return futex((uint32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3,
-                     (const void *)(uintptr_t)a4);
+    case LX_futex: { /* (uaddr, op, val, timeout, ...); op decoded inside */
+#ifdef CHROMIUM_BOOT
+        waitt_enter(n, (uint64_t)a1);
+#endif
+        long fr = futex((uint32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3,
+                        (const void *)(uintptr_t)a4);
+#ifdef CHROMIUM_BOOT
+        waitt_exit();
+#endif
+        return fr;
+    }
 
     case LX_access:                 /* (path, mode) */
         return lx_faccess((const char *)a1);
