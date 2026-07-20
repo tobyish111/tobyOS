@@ -1509,12 +1509,32 @@ static int path_lexical_clean(const char *in, char *out, size_t cap) {
     return 0;
 }
 
+/* Tiny substring test (klibc has no strstr) for the CHROMIUM_BOOT path tracer. */
+static int lx_path_has(const char *h, const char *n) {
+    for (; *h; h++) {
+        const char *a = h, *b = n;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
 static int resolve_user_path(const char *user_path, char *out, size_t cap) {
     char up[ABI_PATH_MAX];
     long plen = strncpy_from_user(up, user_path, sizeof(up));
     if (plen < 0) return -ABI_EFAULT;
     if ((size_t)plen >= sizeof(up) - 1) return -ABI_ENAMETOOLONG;
     if (plen == 0 || cap == 0) return -ABI_EINVAL;
+#ifdef CHROMIUM_BOOT
+    /* slice 20: chrome's --dump-dom loads headless_command_resources.pak from
+     * DIR_ASSETS (resolved via /proc/self/exe) to serve
+     * chrome://headless/headless_command.html, whose executeCommands() JS
+     * actually performs the dump. Trace those lookups. (klibc has no strstr.) */
+    { static int c = 0;
+      if (c < 40 && (lx_path_has(up, "headless") || lx_path_has(up, ".pak") ||
+                     lx_path_has(up, "self/exe"))) {
+          c++; kprintf("[path] %s\n", up); } }
+#endif
 
     /* Build the absolute (still un-normalized) path in `full`, then lexically
      * clean it into `out`. Interior "/./", "/../", and "//" are all resolved by

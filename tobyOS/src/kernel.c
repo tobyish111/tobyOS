@@ -7279,12 +7279,24 @@ void _start(void) {
             (char *)"--disable-gpu",
             (char *)"--disable-software-rasterizer",
             (char *)"--disable-gpu-compositing",
-            (char *)"--virtual-time-budget=10000",
+            /* slice 20: NO --virtual-time-budget. headless_command.js does
+             * `await dp.Emulation.onceVirtualTimeBudgetExpired()` when this
+             * switch is present, and virtual time only advances once the
+             * renderer goes idle -- ours busy-churns, so the event never
+             * fires, Runtime.evaluate never returns and the DOM dump is
+             * never reached (chrome then exits 0 with no output, no error).
+             * Without the switch the JS goes straight to handleCommands(). */
             (char *)"--disable-dev-shm-usage",
             (char *)"--disable-crash-reporter",
             (char *)"--no-first-run",
             (char *)"--enable-logging=stderr",
             (char *)"--user-data-dir=/data/cr",
+            /* slice 20: --timeout races the page load in headless_command.js
+             * and, crucially, it STILL calls handleCommands() afterwards -- so
+             * the DOM is dumped even if the load never completes, and
+             * "Page load timed out." is logged when no content arrived. That
+             * both unblocks the hang and tells us whether the JS runs at all. */
+            (char *)"--timeout=5000",
             (char *)"--dump-dom",
             (char *)"data:text/html,<h1>tobyOS</h1>",
             0,
