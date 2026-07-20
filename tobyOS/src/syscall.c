@@ -1991,6 +1991,20 @@ static long sys_open(const char *path, int flags, int mode) {
     if (kpath[0] == '/' && kpath[1] == 'd' && kpath[2] == 'e' &&
         kpath[3] == 'v' && kpath[4] == '/') {
         const char *dev = kpath + 5;
+        /* /dev/null and /dev/zero. base::LaunchProcess opens /dev/null to
+         * remap a child's stdio before execve; without it chrome's children
+         * bailed with _exit(127) ("GPU process exited unexpectedly:
+         * exit_code=32512"). Ubiquitous in Unix programs generally. */
+        if (strcmp(dev, "null") == 0 || strcmp(dev, "zero") == 0) {
+            struct file *f = (struct file *)kmalloc(sizeof(*f));
+            if (!f) return -ABI_ENOMEM;
+            memset(f, 0, sizeof(*f));
+            f->kind = (dev[0] == 'n') ? FILE_KIND_DEVNULL : FILE_KIND_DEVZERO;
+            f->o_accmode = 2;                       /* O_RDWR */
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            return fd;
+        }
         if (strcmp(dev, "ptmx") == 0) {
             struct file *f = pty_open_master();
             if (!f) return -ABI_ENOMEM;

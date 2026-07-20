@@ -483,6 +483,20 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                     len = gen_pid_maps(pid, buf, sizeof(buf));
                 else if (strcmp(sub, "stat") == 0)
                     len = gen_pid_stat(pid, buf, sizeof(buf));
+                else if (strcmp(sub, "exe") == 0) {
+                    /* Opening /proc/<pid>/exe FOLLOWS the symlink, as Linux does:
+                     * hand back a handle to the real executable. stat/readlink
+                     * already reported it as a symlink, but there was no open
+                     * path, so open() returned ENOENT. Chromium's child-process
+                     * launcher opens /proc/self/exe to re-exec itself, so every
+                     * renderer/GPU/network child died with _exit(127) ("GPU
+                     * process exited unexpectedly: exit_code=32512"). Many Linux
+                     * programs re-exec this way, so this is a general gap. */
+                    struct proc *ep = proc_lookup(pid);
+                    if (ep && ep->exe_path[0])
+                        return vfs_open(ep->exe_path, out);
+                    return VFS_ERR_NOENT;
+                }
             }
         }
     }
