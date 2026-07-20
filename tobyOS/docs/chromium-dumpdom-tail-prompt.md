@@ -1,195 +1,309 @@
 # Task: get real headless Chromium to `--dump-dom` `<h1>tobyOS</h1>` on tobyOS
 
-You are picking up a **deep, live, successful Chromium bring-up**. Real, unmodified
-`chrome-headless-shell` 151.0.7922.34 (V8 + Blink + SwiftShader) runs on tobyOS's
-Linux ABI. Its GL init, storage, signals, V8 memory **and its whole Mojo IPC fast
-path** now work. It still does not print the DOM. **The blocker is now localized
-to one sentence, and the recommended next step is a concrete, bounded kernel fix.**
+You are picking up a **deep, live, successful Chromium bring-up**. Real,
+unmodified `chrome-headless-shell` 151.0.7922.34 (V8 + Blink + SwiftShader)
+runs on tobyOS's Linux ABI as a **full multi-process tree** — browser, GPU,
+network/utility and renderer children — with **zero FATALs, zero crashes, and
+every process exiting cleanly**.
 
-Everything below was *measured*. Where I guessed instead of measuring, I have said
-so — those are the traps to avoid.
+**It still does not print the DOM.** That is the unmet goal. Two concrete,
+named blockers remain (below). Everything here was *measured*; where I guessed
+and was wrong, I have said so, because those are the traps.
 
 ---
 
 ## THE PRIME DIRECTIVE: measure, then READ CHROME'S SOURCE. Do not infer.
 
-Two fixes were wasted this arc inferring from a symptom that turned out to be
-meaningless (see LESSONS). The winning move every time was:
+Every wall this arc fell to the same move, and every wasted cycle came from
+skipping it:
 
-1. Reproduce, and use the **in-tree instruments** (below) to see what the kernel sees.
+1. Reproduce, and use the **in-tree instruments** (below) to see what the
+   kernel sees.
 2. When chrome complains, **fetch the actual chromium source line**:
    ```bash
    curl -sS "https://chromium.googlesource.com/chromium/src/+/refs/tags/151.0.7922.34/<path>?format=TEXT" \
-     | base64 -d > /tmp/f.cc
+     | base64 -d > /c/t/f.cc
    ```
-   Exact line numbers. **Do not** use the WebFetch summarizer for line attribution —
-   it mis-attributes lines. That one command cracked two walls in a row.
+   Exact line numbers. **Do not** use the WebFetch summarizer for line
+   attribution — it mis-attributes. This single command cracked *five* walls.
 3. Fix the smallest real thing. Re-measure.
 
----
-
-## Where the DOM actually comes from (READ THIS FIRST — it is not what it looks like)
-
-`--dump-dom` is **not** "navigate to the URL and print". From
-`components/headless/command_handler/headless_command_handler.cc`:
-
-- chrome navigates the web contents to an **internal WebUI page**,
-  `chrome://headless/headless_command.html`, served from
-  `headless_command_resources.pak` beside the binary (found via `DIR_ASSETS` →
-  `/proc/self/exe`).
-- **Only when THAT page finishes loading** does
-  `DocumentOnLoadCompletedInPrimaryMainFrame()` fire →
-  `Target.exposeDevToolsProtocol` → `Runtime.evaluate("executeCommands(...)")`.
-- That injected JS (extract it from the .pak, snippet below) creates a **second**
-  target, navigates *it* to your real URL, dumps the DOM, and `OnCommandsResult`
-  prints it with `std::cout`.
-
-**Measured: `executeCommands()` never runs.** Decisive proof: with `--timeout=5000`
-the JS *races* the load and **still calls `handleCommands()` afterwards**, so it
-would have dumped the DOM anyway *and* logged `"Page load timed out."` — neither
-appeared. So `DocumentOnLoadCompletedInPrimaryMainFrame` never fires: **the
-renderer completes no document load, not even chrome's own 229-byte internal page.**
-
-Already verified working, so do **not** re-chase: `/proc/self/exe`, the `.pak`
-lookup, DIR_ASSETS, the JS itself, virtual time, the `data:` URL, the target page,
-the Mojo channel, GL.
+**AND: verify the instrument before trusting what it says.** Three times this
+session an instrument nearly produced a false finding (see LESSONS). This is
+the single most expensive failure mode on this codebase.
 
 ---
 
-## CURRENT FRONT (slice 21, 2026-07-20): cross-process Mojo never connects
+## CURRENT STATE (end of slice 22, 2026-07-20)
 
-`--single-process` is **GONE**. Chrome runs a real multi-process tree: browser +
-gpu + network/utility children, ~14 processes alive at once, all healthy in
-`epoll_wait`/`futex`. Five kernel bugs were fixed to get here (commit `5b4e530`,
-detail below). **Children no longer die** — instead each one starts, waits, and
-self-terminates:
+Commits: `5b4e530` (slice 21), `f088295` + `931f4b1` (slice 22), on branch
+`slice21-fork-inherits-sockets`. Nine kernel bugs fixed — see "What was fixed".
+
+A clean run now looks like:
 
 ```
-[INFO:content/child/child_thread_impl.cc:908]
-Terminating current process after 15 seconds with no connection.
+FATAL:                 0
+crashes (exit -1):     0
+process exits:         all 0 (85 = the unrelated hello-boot harness task)
+KERNEL PANIC:          0
+[pmm] double free:     0
+"no connection":       1        <-- BLOCKER A
+"Corruption detected": 3        <-- BLOCKER B
+DOM:                   0        <-- the goal
 ```
 
-**Verified working, do NOT re-chase:** the child inherits the Mojo socketpair at
-the RIGHT fd — `kMojoIPCChannel(2) + kBaseDescriptor(3) = fd 5`, confirmed
-`FILE_KIND_SOCKET` in the `[execve-fds]` dump — and every other descriptor lines
-up too (`kFieldTrialDescriptor(3)→fd 6`, `kPseudonymizationSalt(7)→fd 10`).
-SCM_RIGHTS works **cross-process** (`[scm] sendmsg passing 1 fd(s)` in one
-process, `recvmsg got 1 fd(s)` in another). So the plumbing is right and the
-failure is in the handshake TRAFFIC over that socket.
+### BLOCKER A — Mojo: children get the invitation and never reply
 
-### ROOT-CAUSED (slice 22): `MAP_SHARED` file-backed mmap does not SHARE
-
-Measured, not inferred. The AF_UNIX trace (`[unix] pair/send/recv`) shows the
-socket layer is **fine**:
+Measured, with the `[unix]` and `[scm]` traces:
 
 ```
 [unix] pair pid=16 a=4 b=5
-[unix] send pid=16 sock=4 -> peer=5 len=184 nfds=1 peer_count=1   <- browser sends
-[unix] recv pid=26 sock=5 peer=4 queued=1 want=4096               <- child consumes
+[unix] send pid=16 sock=4 -> peer=5 len=184 nfds=1 peer_count=1  <- browser sends ONCE
+[unix] recv pid=27 sock=5 peer=4 queued=1 want=4096              <- child consumes it
+[scm]  recvmsg pid=27 nf=1: kind=2                               <- and gets the fd
 ```
 
-The child gets the Mojo invitation and its SCM_RIGHTS fd, then epoll_waits
-forever and never replies. The `[scm] recvmsg pid=N nf=1: kind=2` trace names
-the passed fd: **`kind=2` = `FILE_KIND_VFS`, a regular FILE** — chrome's
-shared-memory region.
+Every child receives the 184-byte Mojo invitation **and** its SCM_RIGHTS fd
+(`ctl_len=20 flags=0x0`, clean). Then it goes into `epoll_wait` and **never
+sends anything and never reads again**. The browser sends once and waits. It is
+a mutual stall. After ~15 s the child logs
+`child_thread_impl.cc:908 Terminating current process after 15 seconds with no
+connection` and exits 0.
 
-`base/memory/platform_shared_memory_region_posix.cc:209` calls
-`CreateAndOpenFdForTemporaryFileInDir` **unconditionally** — this build has NO
-memfd path for shared memory, so no flag routes around it (`--disable-dev-shm-usage`
-only picks the directory). Meanwhile `linux_mmap_file` (`syscall.c:4409`)
-reserves **anonymous** pages (`VMA_FLAG_ANON`) and fills them by reading the
-file, ignoring `MAP_SHARED` entirely. `mmap.c:622` already admits this:
-*"file-backed mmap (linux_mmap_file) only copies, breaking sharing."*
+**Ruled out** (don't re-chase):
+- The socket layer. Send and receive both demonstrably work cross-process.
+- fd inheritance. The child has the channel at the RIGHT fd:
+  `kMojoIPCChannel(2) + kBaseDescriptor(3) = fd 5`, confirmed `FILE_KIND_SOCKET`
+  in `[execve-fds]`. Same math checks out for `kFieldTrialDescriptor(3)→fd 6`
+  and `kPseudonymizationSaltDescriptor(7)→fd 10`.
+- SCM_RIGHTS cross-process. Verified live, both directions.
+- The shared-memory eventfd upgrade: `mojo/core/embedder/features.cc` shows
+  `kMojoUseEventFd` is `FEATURE_DISABLED_BY_DEFAULT` on Linux. This is the
+  PLAIN SOCKET channel. (The handoff's earlier slices describe chrome taking
+  the shared-memory path — that must have been a different flag combination.)
+- `fd_alloc_into` — already routes through `proc_fds()` correctly.
+- MAP_SHARED sharing itself — works, verified (one inode CREATED by one pid and
+  attached by several others, 36 mappings in a run).
 
-**So both processes mmap the same file and get PRIVATE COPIES. Nothing the
-browser writes is ever visible to the child — hence "no connection".**
+**Note `kMojoIpcz` is `FEATURE_ENABLED_BY_DEFAULT`** on this build. ipcz is the
+newer transport and may expect more than the legacy node channel. That is an
+unexplored lead.
 
-**THE FIX:** real `MAP_SHARED` file-backed sharing. Every `MAP_SHARED` mapping
-of the same file must map the SAME physical pages. Shape: a per-inode shared
-page-cache object (the `struct memfd` page-list machinery in `mmap.c` is
-already exactly this — a growable list of physical pages that every mmap maps
-rather than copies; reuse it keyed by inode instead of by fd), populated from
-the file on first fault, with `MAP_PRIVATE` keeping today's copy behaviour and
-writeback on msync/close. Chrome's regions live in `TMPDIR=/data` and are often
-unlinked immediately after creation, so the cache must be keyed by inode
-identity and survive unlink — tobyfs already has stable per-file inodes
-(slice 14).
+**Next measurements:**
+1. Instrument syscall **ARGS** for `read`/`write`/`sendmsg`/`recvmsg` on the
+   child (the ring logs names only). Does the child ever `write()` to fd 5 and
+   get an error? Does it read a *partial* message and stall waiting for the
+   rest? tobyOS's AF_UNIX is message-queued with a `tail_off` partial-read
+   path — Mojo's channel framing may want byte-stream semantics it isn't
+   getting.
+2. Check what the child does with the received fd. It is `kind=2` (a FILE) —
+   chrome's shared-memory region. Does it `mmap` it? (Use the `[shm]` trace —
+   **cap now 200, but check you aren't hitting it**.)
+3. Read `mojo/core/node_channel.cc` / the ipcz driver for what the child is
+   supposed to send back after `ACCEPT_INVITEE`, then look for that syscall.
 
-This is a genuine POSIX gap that outlives chrome: today ANY two processes
-sharing a file mapping silently get private copies.
+### BLOCKER B — "Corruption detected in shared-memory segment" ×3
 
-## SUPERSEDED FRONT (kept for context): make `fork()` inherit sockets
+`base/metrics/persistent_memory_allocator.cc:890`. **Unexplained.** Non-fatal
+(chrome continues) but it is in the metrics allocator, which rides the shared
+memory I just implemented, and it may well be starving the field-trial
+handshake children need.
 
-`--single-process` is a legacy mode chrome barely supports, and the page that must
-load first is a **WebUI** page (strict process requirements). That is the leading
-explanation for the silent non-commit — and it also explains why `about:blank`
-behaved identically (the WebUI page is always first, whatever your target URL).
+**Two hypotheses tried and DISPROVEN:**
+- *Stale/zero pages on cache growth.* I made population cover newly-allocated
+  pages on every mapping, not just creation. Corruption unchanged at 3.
+- *The page double-free.* Real and serious (fixed), but corruption stayed at 3
+  after it was gone. **Not the cause.**
 
-**Dropping `--single-process` made chrome use its real multi-process model and
-actually spawn children.** They currently all `_exit(127)`
-(`exit_code=32512 == 127<<8`, chrome's launcher's "child setup failed"), ending in
-`FATAL … GPU process isn't usable. Goodbye.`
-
-Two gaps on that path are already fixed (merged `d644e6c`), each of which pushed the
-child further — children went from **6 → 25 syscalls**:
-
-- **`/dev/null` + `/dev/zero` did not exist.** `base::LaunchProcess` opens
-  `/dev/null` to remap a child's stdio before `execve`. Added
-  `FILE_KIND_DEVNULL`/`DEVZERO`.
-- **`open("/proc/<pid>/exe")` returned ENOENT** — `stat` said symlink and `readlink`
-  worked, but `procfs_open` had no case. It now follows the symlink to the real
-  executable.
-
-### → YOUR NEXT FIX (measured, not guessed)
-
-Children still `_exit(127)`, now after a **second `dup2`**. Cause:
-
-> `fork()` clones the fd table via `file_clone()` (`src/file.c`), which
-> **deliberately refuses `FILE_KIND_SOCKET`** ("a child shouldn't silently share a
-> parent socket"). The child therefore gets `NULL` for every socket fd, and the
-> launcher's `dup2` of the **inherited Mojo socketpair fd** fails.
-
-Linux `fork()` inherits **all** fds. Fix: let `file_clone` share the `struct sock`
-across fork, which needs a **refcount on `struct sock`** (a struct change ⇒ **clean
-build**), with `sock_close`/`file_close` only tearing down at zero. Mind the
-existing `sock_unix_peer_close()` semantics.
-
-After that, expect further multi-process walls (cross-process Mojo, fd passing).
-Note: the **SCM_RIGHTS implementation already handles real processes** — it
-`file_clone`s on send and `fd_alloc_into`s into `current_proc()` at recvmsg time,
-which is the receiver either way.
-
-**Why this path:** multi-process is chrome's real model, and every step so far has
-been a genuine POSIX-correctness fix that outlives chrome. Fighting legacy
-`--single-process` may not be winnable at all.
+**Next:** fetch `persistent_memory_allocator.cc` and read the exact predicate at
+line 890 — I never did this, and per the prime directive it should have been
+step one. It likely checks a header magic/version/size field, which would say
+precisely which bytes disagree.
 
 ---
 
-## Instruments already in-tree — USE THEM IN THIS ORDER
+## What was fixed (do NOT redo) — nine bugs
 
-All `CHROMIUM_BOOT`-gated and behaviour-neutral. Using them out of order cost me
-several wrong turns.
+### Slice 21 (`5b4e530`) — multi-process
+1. **`fork()` copied the WRONG fd table.** `fork.c` read `parent->fds` directly,
+   but a CLONE_FILES thread's own `fds[]` is deliberately EMPTY (the real table
+   is the thread-group leader's, behind `proc_fds()`), and **chrome launches
+   children from a dedicated launcher THREAD** — so every child got ZERO
+   descriptors and died at its first `dup2` with `_exit(127)`. The handoff's
+   then-recommended front ("make fork inherit sockets") was a correct but
+   *insufficient* diagnosis; this was the real blocker.
+2. **`file_clone` refused `FILE_KIND_SOCKET`.** Added a refcount to
+   `struct sock` (`in_use` stays a pure liveness flag — the pool scans test
+   THAT), and moved the AF_UNIX peer-EOF wake into `sock_close`'s LAST-reference
+   branch, so an inheritor closing its copy no longer signals EOF to the peer.
+3. **`execve` recorded the LITERAL path**, so `/proc/self/exe` was
+   self-referential → `DIR_ASSETS` became `/proc/self` → every child died on
+   `Invalid file descriptor to ICU data received`. Resolve symlinks up front.
+   Also `vfs_read_all` now follows symlinks (`vfs_follow_link`).
+4. **User stack was 8 eager pages (32 KiB) with NO grow-down** → demand
+   grow-down to an 8 MiB floor (Linux's default `RLIMIT_STACK`).
+5. **`copy_from_user` did only a RANGE check** → any process could PANIC the
+   kernel with a bad pointer to any read-taking syscall. Added
+   `uaccess_prepare_read`, plus `copy_from_user_nofault`/`uaccess_probe_resident`
+   for exception context (isr.c's crash diagnostic was panicking the kernel
+   from *inside* fault handling).
 
-1. **Ring-3 sampling profiler** (`src/sched.c`, `prof_dump_and_reset`) — samples the
-   user `rip` on every ring-3 timer tick. **Run this FIRST**: it separates "spinning
-   in user code" from "blocked in kernel" in one run. (It immediately disproved my
-   "busy livelock" reading of thread states.)
-2. **Wait-graph tracker** (`src/syscall.c`, `waitt_*`) — which thread is blocked in
-   `futex`/`epoll_wait`, on what address/fd, and for how long. A true wait graph
-   (entries live exactly as long as the block).
-3. **Recent-syscall ring** (`LX_RECENT = 384`) — dumped at the heartbeat and on any
-   fatal user fault. 48 was too small; it hid the spin that cracked the last bug.
-4. **`[libmap]`** (`linux_mmap_file`) — `.so` load map; correlate a `.so`-region rip
-   → base+offset → `objdump`.
-5. **`[path]`** — traces `headless` / `.pak` / `self/exe` lookups.
-6. **`[memfd]` / `[scm]`** — memfd create/ftruncate/seals/mmap and SCM_RIGHTS
-   send/recv.
-7. **uaccess PTE dump** — present-RO vs unmapped on a `copy_to_user` EFAULT.
+### Slice 22 (`f088295`) — Mojo + sandbox
+6. **`MAP_SHARED` file-backed mmap did not SHARE.** `linux_mmap_file` reserved
+   ANONYMOUS pages and filled them by reading the file, so two processes
+   mapping one file each got a PRIVATE COPY. `mmap.c` had documented this gap
+   for ages; it turned out to be the blocker.
+   `base/memory/platform_shared_memory_region_posix.cc:209` calls
+   `CreateAndOpenFdForTemporaryFileInDir` **unconditionally** — there is NO
+   memfd path in this build, so no flag routes around it
+   (`--disable-dev-shm-usage` only picks the directory). Added a **per-INODE**
+   page cache (`struct shm_cache`), keyed by `vfs_file.ino` not path so it
+   survives the `unlink()` chrome does immediately. `MAP_PRIVATE` still copies.
+7. **`/proc/<pid>/task/` did not exist** — chrome's sandbox asserts
+   mono-threadedness by stat'ing it and testing `st_nlink == 3`
+   (`thread_helpers.cc:41`). Added it plus per-thread `task/<tid>`.
+   **TERMINATED-but-unreaped threads must read as GONE**, or
+   `thread_helpers.cc:104` ("Stopped thread does not disappear in /proc") fails
+   after 30 polls. `nlink` and directory presence must agree on "live" or the
+   FATAL just alternates between :41 and :104.
+8. **`st_nlink` was hardcoded to 1** in both stat emitters.
+9. **`*at()` syscalls ignored a real dirfd for RELATIVE paths.** chrome opens
+   `/proc` as a dirfd and reaches through it for `"self/task/"` (:41) and
+   `"self/fd/"` (`proc_util.cc:79`). Added `resolve_user_path_at()`, used by
+   `newfstatat` + `openat`.
 
-Symbolize: main PIE @ `0x500000`, ld.so @ `0x40000000`, `.so`s @ `0x100000000000+`
-(via `[libmap]`). Tools: `C:/msys64/ucrt64/bin/{objdump,nm}.exe`.
+---
 
-Extract the headless JS from the local .pak (v5 resource pack, gzip blobs):
+## Instruments in-tree — ALL `CHROMIUM_BOOT`-gated, behaviour-neutral
+
+**Use in this order.** Getting the order wrong cost me several wrong turns.
+
+1. **Ring-3 sampling profiler** (`sched.c`, `prof_dump_and_reset`) — separates
+   "spinning in user code" from "blocked in kernel" in ONE run.
+2. **Wait-graph tracker** (`syscall.c`, `waitt_*`) — who is blocked in
+   `futex`/`epoll_wait`, on what, for how long. This is what showed the
+   14-process tree sitting idle rather than livelocking.
+3. **Recent-syscall ring** (`LX_RECENT = 384`) — dumped at the heartbeat and on
+   any fatal user fault. Names only, **no args** (the main gap — see Blocker A).
+4. **`[execve-argv]` / `[execve-fds]`** (`fork.c`) — the child's full argv AND
+   its actual open fd table at exec, with `FILE_KIND` per fd. This pair is what
+   identified the ICU failure. Read them side by side.
+5. **`[unix] pair/send/recv`** (`socket.c`) — AF_UNIX socketpair creation and
+   every enqueue/dequeue, with **pool indices** (NOT fds) and peer. Reads as a
+   conversation. Cap 40.
+6. **`[scm]`** (`syscall.c`) — SCM_RIGHTS send/recv, logging the **KIND** of
+   each passed fd (and for sockets, whether its peer still exists). Emitted
+   BEFORE the install/CTRUNC paths, which may `file_close()` those pointers —
+   logging after would be a use-after-free.
+7. **`[shm] MAP_SHARED`** (`syscall.c`) — inode, page range, and
+   CREATED/attached. This is how you prove cross-process sharing. **Cap 200.**
+8. **`[libmap]`** — `.so` load map; correlate a `.so`-region rip → base+offset
+   → `objdump`.
+9. **`[path]`** — traces `headless` / `.pak` / `self/exe` lookups.
+10. **uaccess PTE dump** — present-RO vs unmapped on a `copy_to_user` EFAULT.
+11. **`vmm_remap_count()`** — `map_4k` "already mapped" is rate-limited to 16
+    (one run emitted ~165k, drowning the log); the counter keeps the signal.
+
+Symbolize: main PIE @ `0x500000`, ld.so @ `0x40000000`, `.so`s @
+`0x100000000000+` (via `[libmap]`). Tools:
+`C:/msys64/ucrt64/bin/{objdump,nm}.exe`. Note `nm` + `awk strtonum` gave wrong
+bracketing symbols for me — grep the address neighbourhood instead.
+
+Useful one-liners:
+```bash
+grep -ac "tobyOS</h1>" logs/chromium-m0.log        # the goal
+grep -aoE "exit code=[-0-9]+" logs/chromium-m0.log | sort | uniq -c
+grep -a "FATAL\|Check failed" logs/chromium-m0.log
+grep -a "\[unix\]\|\[scm\]\|\[shm\]" logs/chromium-m0.log
+grep -ac "double free\|KERNEL PANIC\|with no connection\|Corruption detected" logs/chromium-m0.log
+```
+
+---
+
+## LESSONS — every one of these cost real time
+
+- **VERIFY THE INSTRUMENT BEFORE TRUSTING IT.** Three near-misses:
+  - The `[shm]` trace capped at 16 and the run produced **exactly 16**, making
+    it look like children never mapped shared memory. Pure artifact. I caught it
+    only by counting lines. **Check whether a trace hit its cap.**
+  - The harness prints `/opt/chrome/chrome-headless-shell not present --
+    SKIPPED` for **ANY** `proc_spawn` failure. It said "no binary" while the two
+    lines above showed the binary's ELF loading fine. Real cause: **`.argc = 15`
+    is HARDCODED** next to a NULL-terminated `argv[]` I had shortened to 14.
+    **Re-count `.argc` whenever you touch that argv** (`kernel.c`).
+  - `fault_count` / `last_fault_rip` in the "terminating user process" line are
+    **cumulative page-fault stats, NOT the cause of death**. The real exception
+    is printed separately (`EXCEPTION 3: Breakpoint` = chrome's own CHECK;
+    `EXCEPTION 14` = a real #PF). I disassembled `last_fault_rip` for an int3
+    death — a dead end.
+- **The errno in chrome's `Check failed: . : <errno>` is STALE/incidental.** It
+  does not name the failing predicate (which is stripped from official builds).
+  Fetch the source line.
+- **Chrome probes kernel features with deliberately-INVALID flags expecting
+  `-EINVAL`.** tobyOS syscalls must VALIDATE unknown flag bits. There are
+  probably more latent instances.
+- **A "verified working" entry is only verified for the PATH that exercised
+  it.** `/proc/self/exe` was on the do-not-re-chase list — true for the browser
+  (spawned with a real path), false the moment a process `execve`s the symlink.
+  Same for the `.pak` lookup; both hang off `DIR_ASSETS`. Scope such claims.
+- **`resolve_user_path()` prepends the cwd**, so an *at()* relativity test must
+  be made on the RAW user string. Testing after it is dead code — exactly what
+  my first attempt did.
+- **Anything reading user memory inside exception handling must use
+  `copy_from_user_nofault`.** The normal accessors RESOLVE faults, which is
+  re-entrant if you are already handling one — that turned the crash diagnostic
+  into a kernel panic.
+- **Shared physical pages need `page_ref_inc` per address space.**
+  `free_subtree` (`vmm.c`) frees a leaf only at `page_ref <= 1`. Miss it and
+  every teardown frees the frame — `[pmm] WARN: double free`, frames recycled
+  under live processes.
+- **The stale-log trap.** The boot truncates `logs/chromium-m0.log`, so while a
+  build runs you are reading the PREVIOUS run's log. Always check the log's
+  mtime is NEWER than `tobyOS.iso` before believing anything.
+- **A short run can fake a fix.** I reported "no connection → 0" as a win; the
+  browser had crashed at 16.8 s, before children starting at ~7 s could reach
+  their 15 s deadline. Check the run actually lasted long enough.
+- **VLOG is compiled OUT** of official chrome (`--vmodule`/`-v=1` = nothing).
+- fds 0/1/2 → serial, so `--dump-dom`'s stdout **would** appear if produced.
+- `clang -c`, not `-fsyntax-only`. **klibc has no `strstr`.**
+- Don't `2>&1` native exes in PowerShell; `grep -c` returning 0 exits 1 and
+  will abort a `&&` chain.
+
+---
+
+## Known gaps left OPEN (deliberate, documented in-code)
+
+- **`memfd_map` has the IDENTICAL double-free bug** as the shm cache did — it
+  maps `mf->pages[]` with no `page_ref_inc`. Not fixed because `memfd_unref`
+  frees pages directly and reconciling the two ownership models needs its own
+  pass. **If double-frees reappear, this is the source.**
+- `strncpy_from_user` probes only its FIRST page; a string crossing into an
+  unmapped page can still panic. Needs per-page probing inside the copy loop.
+- procfs `/proc/<pid>/fd/<n>` reads `p->fds` directly — the same
+  thread-empty-table bug as fixed in `fork`. Diagnostic-only.
+- `openat` only opens by resolved kernel path in its DIRECTORY arm; a
+  dirfd-relative open of a non-directory is still cwd-relative.
+- The shm cache has **no writeback and no reclaim**, and 32 entries. The cache
+  IS the file's contents for mappers, but a later `read()` sees on-disk bytes.
+- **NOT re-validated against the non-chrome boot/test harness.** The `uaccess`
+  change touches every syscall in the kernel. This is owed before trusting any
+  of it beyond the chromium path.
+
+---
+
+## Where the DOM actually comes from (READ THIS — it is not what it looks like)
+
+`--dump-dom` is **not** "navigate and print". From
+`components/headless/command_handler/headless_command_handler.cc`: chrome
+navigates to an INTERNAL WebUI page `chrome://headless/headless_command.html`
+(served from `headless_command_resources.pak` beside the binary, found via
+`DIR_ASSETS` → `/proc/self/exe`), and only when THAT page finishes loading does
+`DocumentOnLoadCompletedInPrimaryMainFrame()` fire →
+`Target.exposeDevToolsProtocol` → `Runtime.evaluate("executeCommands(...)")`.
+That injected JS creates a SECOND target, navigates it to your real URL, dumps
+the DOM, and `OnCommandsResult` prints it with `std::cout`.
+
+Extract the JS from the local .pak (v5 resource pack, gzip blobs):
 ```python
 import struct, gzip
 d=open('programs/chromium/chrome-headless-shell-linux64/headless_command_resources.pak','rb').read()
@@ -199,113 +313,56 @@ for i in range(cnt):
     print(gzip.decompress(d[e[i][1]:e[i+1][1]]).decode('utf-8','replace'))
 ```
 
----
-
-## LESSONS — do not repeat these
-
-- **Chrome's `Check failed: . : <errno>` — the errno is STALE/incidental.** It is
-  whatever `errno` happened to be left over. It flipped `Success (0)` →
-  `Invalid argument (22)` purely because an unrelated probe changed. It does **not**
-  name the failing predicate (which is stripped from official builds). **Fetch the
-  source line.** Two fixes were wasted before I did.
-- **Chrome probes kernel features with deliberately-INVALID flags, expecting
-  `-EINVAL`.** `memfd_create("", ~0)` and `eventfd2(0, ~0)` are both
-  `PCHECK(ret < 0 && (errno == EINVAL || ENOSYS || EPERM))`. tobyOS accepted every
-  flag and handed back valid fds ⇒ FATAL. **tobyOS syscalls must VALIDATE unknown
-  flag bits, not ignore them — there are probably more latent instances.**
-- **Pre-check kernel sources with `clang -c`, not `-fsyntax-only`** — the latter
-  missed an implicit-declaration error that failed the real build. **`klibc` has no
-  `strstr`.**
-- **VLOG is compiled OUT of official chrome** — `--vmodule` / `-v=1` produce zero
-  output. Don't plan around chrome's own logging.
-- **The stale-log trap.** The boot truncates `logs/chromium-m0.log`, so *while a
-  build runs you are reading the PREVIOUS run's log*. Wait for `boot in QEMU` in the
-  run's `.out` **and** a fresh low timestamp before believing anything. This burned
-  me twice.
-- fds 0/1/2 are all console → serial, so `--dump-dom`'s stdout **would** appear if
-  produced.
-- **A "verified working" entry is only verified for the path that exercised it.**
-  `/proc/self/exe` was on this doc's do-not-re-chase list — true for the BROWSER
-  (spawned with a real path), false the moment a process `execve`s the symlink
-  itself. Same for the `.pak` lookup: both hang off `DIR_ASSETS`. Scope every
-  such claim to the code path that proved it.
-- **A failure message can name a cause it never checked.** The harness prints
-  `/opt/chrome/chrome-headless-shell not present -- SKIPPED` whenever
-  `proc_spawn` returns < 0, for ANY reason. It said "no binary" while the two
-  lines above showed the binary's ELF and interpreter loading fine. The real
-  cause was `.argc = 15` hardcoded next to a NULL-terminated `argv[]` I had
-  shortened to 14. **Re-count `.argc` whenever you touch that argv.**
-- **`fault_count`/`last_fault_rip` in the terminate line are CUMULATIVE page-fault
-  stats, not the cause of death.** The actual exception is printed separately
-  (`EXCEPTION 3: Breakpoint` = chrome's own CHECK; `EXCEPTION 14` = a real #PF).
-  Disassembling `last_fault_rip` for an int3 death is a dead end.
-- **Anything reading user memory inside exception handling must use
-  `copy_from_user_nofault`.** The normal accessors now RESOLVE faults (demand/COW),
-  which is re-entrant if you are already handling a fault — that turned the
-  crash diagnostic itself into a kernel panic.
+**`--timeout=5000` is a decisive probe:** it makes the JS race the load and call
+`handleCommands()` anyway, so the DOM is dumped even if the load never
+completes, plus a "Page load timed out." log. If NEITHER appears,
+`executeCommands()` never ran.
 
 ---
 
 ## Build / verify
 
-- `bash logs/chromium-m0.sh` (incremental) · `bash logs/chromium-m0-clean.sh`
-  (**required after any struct-layout change**).
+- `bash logs/chromium-m0.sh` (incremental) ·
+  `bash logs/chromium-m0-clean.sh` (**required after any struct-layout change**).
+- `BOOTSECS=90` keeps a run short; the browser does not exit on its own, so the
+  default 1200 s just idles after chrome stalls.
 - Fresh `disk.img` per run: `dd if=/dev/zero of=disk.img bs=1M count=16`.
-- Do **not** put `&` inside a `run_in_background` call — it tracks only the launch.
-- Verify: `--dump-dom` must print `<h1>tobyOS</h1>` (self-verifying in the serial
-  log). Then switch to `--screenshot` and host-diff the PNG.
+- Do **not** put `&` inside a `run_in_background` call.
+- Verify: `--dump-dom` must print `<h1>tobyOS</h1>` (self-verifying in the
+  serial log). Then switch to `--screenshot` and host-diff the PNG.
 - Never `taskkill msedge` (the user's real browser).
-- One coherent slice per branch off `main`; extend `docs/chromium-bringup-m1.md` +
-  a `MEMORY.md` line each slice; trailer
+- One coherent slice per branch off `main`; extend `docs/chromium-bringup-m1.md`
+  + a `MEMORY.md` line each slice; trailer
   `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`; merge `--no-ff`.
 
 ---
 
-## Done already (do NOT redo) — slices 12–20, all merged
+## Non-issues / secondary
 
-interior-dot path normalization · in-kernel fake X server + named AF_UNIX ·
-stable per-file inodes · tobyfs `rename`/`fsync`/`unlinkat`/`flock` · SA_RESETHAND ·
-`mprotect` VMA splitting · `copy_to_user` `-EFAULT` · **memfd_create** (page-backed,
-mmap-coherent shared memory) · **SCM_RIGHTS** fd-passing over AF_UNIX ·
-**memfd_create + eventfd2 flag validation** (cleared the
-`mojo/core/channel_linux.cc` FATAL; the Mojo shared-memory channel now negotiates
-end-to-end, SCM_RIGHTS verified live) · **AF_UNIX epoll/recvmsg EOF-vs-EAGAIN spin
-fix** · **/dev/null + /dev/zero** · **open(/proc/<pid>/exe) follows the symlink**.
-
-**Slice 21 (commit `5b4e530`)** — the five fixes that unlocked multi-process:
-`fork()` sourcing its fd table from `proc_fds()` (a thread's own `fds[]` is
-EMPTY by design, and chrome forks from a launcher THREAD — this, not the socket
-refusal, was why children had no descriptors) · socket refcount so fd
-inheritance shares the endpoint, with peer-EOF moved to the LAST reference ·
-`execve` resolving symlinks so `/proc/self/exe` and therefore `DIR_ASSETS` are
-real (fixed the ICU death) · `vfs_follow_link` + symlink-following
-`vfs_read_all` · demand grow-down user stack to 8 MiB (was 8 eager pages =
-32 KiB, no growth) · `uaccess_prepare_read` + `copy_from_user_nofault` (a bad
-pointer to any read-taking syscall could PANIC the kernel).
-
-Known gaps left open: `strncpy_from_user` probes only its first page; procfs
-`/proc/<pid>/fd/<n>` still reads `p->fds` directly (same thread-empty-table bug,
-diagnostic-only); and slice 21 has NOT been re-validated against the non-chrome
-boot/test harness, which the uaccess change touches globally.
-
-Known non-issues / secondary:
 - **Slice 19 was a MISDIAGNOSIS.** The "read-only page" is chrome's own
-  `protected_memory` section, which chrome mprotects RO and then *verifies* with a
-  syscall write expecting `-EFAULT`. Returning `-EFAULT` is CORRECT. Not a bug.
-- **Flaky Vulkan crash** (deterministically `memcpy+0x35d` in libc during SwiftShader
-  extension enumeration; same corruption family as ld.so `check_match` reading a
-  garbage `link_map->l_versyms`). Only gates `--screenshot`; `--disable-gpu` avoids
-  it entirely. Not on the `--dump-dom` path.
-- Ruled out for the renderer stall: CPU spin (profiler), futex deadlock (wait graph —
-  the browser main thread cycles healthily at 124–268 ms).
+  `protected_memory` section, which chrome mprotects RO and then *verifies* with
+  a syscall write expecting `-EFAULT`. Returning `-EFAULT` is CORRECT.
+- **Flaky Vulkan crash** (`memcpy+0x35d` during SwiftShader extension
+  enumeration; same corruption family as ld.so `check_match` reading a garbage
+  `link_map->l_versyms`). Only gates `--screenshot`; `--disable-gpu` avoids it.
+  Not on the `--dump-dom` path.
+- Ruled out for the renderer stall: CPU spin (profiler), futex deadlock (wait
+  graph).
 
 ---
 
 ## Scope honesty
 
-The hard, uncertain tiers (GL, V8 memory, signals, storage, Mojo IPC) are **done**.
-What remains is a layer-by-layer tail, but it is no longer mysterious: you have one
-named blocker (`fork()` must inherit sockets), a working method (measure → read
-chrome's source → smallest fix), and instruments that answer "spinning or blocked?"
-and "who waits on whom?" in a single run. Expect each fix to reveal the next — every
-one so far has been a real, bounded kernel bug, and most outlive chrome entirely.
+The hard, uncertain tiers — GL, V8 memory, signals, storage, Mojo transport,
+multi-process launch, the sandbox `/proc` probes — are **done**. Chrome runs
+clean. What remains is two named blockers with concrete next measurements, a
+working method (measure → read chrome's source → smallest fix), and instruments
+that answer "spinning or blocked?", "who talks to whom?" and "is this memory
+actually shared?" in a single run.
+
+But be clear-eyed: **the multi-process theory has never been proven.** It has
+cleared nine real blockers without yet producing a document load. If Blockers A
+and B fall and there is STILL no DOM, that is the strong signal — it would mean
+the renderer's failure to complete a document load was never about the process
+model, and the front becomes "renderer completes a document load" attacked
+directly with the profiler and wait-graph.
