@@ -5487,7 +5487,18 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
                                &scm_n);
         if (n == EINTR_RET)            { kfree(k); return -LXE_EINTR; }
         if (n < 0)                     { kfree(k); return -LXE_EAGAIN; }
-        if (n == 0 && (flags & 0x40))  { kfree(k); return -LXE_EAGAIN; }
+        /* n == 0 means EITHER "nothing queued yet" OR "EOF: peer is gone". Only
+         * the first may become EAGAIN. Reporting EAGAIN at EOF made recvmsg
+         * disagree with file_poll_ready(), which flags a peer-less UNIX socket
+         * POLLIN|POLLHUP -- so epoll_wait said "readable" forever while recvmsg
+         * said "try again", and chrome's Mojo IO thread spun epoll_wait/recvmsg
+         * endlessly instead of pumping messages (the renderer then never
+         * completed a document load). Linux returns 0 at EOF even for
+         * MSG_DONTWAIT; match the poll predicate exactly. */
+        if (n == 0 && (flags & 0x40)) {
+            bool at_eof = (s->peer_ip == 0 && s->count == 0 && !s->x_server);
+            if (!at_eof) { kfree(k); return -LXE_EAGAIN; }
+        }
     } else {
         kfree(k);
         return -LXE_ENOTSOCK;
