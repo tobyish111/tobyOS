@@ -582,6 +582,47 @@ void sched_idle(void) {
 
 /* ---------- LAPIC timer tick ---------- */
 
+#ifdef CHROMIUM_BOOT
+/* Poor-man's sampling profiler (slice 20). chrome's renderer busy-churns without
+ * ever completing a document load, and it has no VLOG, so sample the USER rip on
+ * every ring-3 timer tick and report the hottest addresses per interval. Combined
+ * with the [libmap] bases (main PIE @0x500000, ld.so @0x40000000) that says WHERE
+ * it is spinning; symbolize with objdump --start-address=<rip-base>. */
+#define PROF_SLOTS 64
+static struct { uint64_t rip; uint32_t hits; int pid; } g_prof[PROF_SLOTS];
+static uint32_t g_prof_total;
+
+static void prof_sample(int pid, uint64_t rip) {
+    g_prof_total++;
+    for (int i = 0; i < PROF_SLOTS; i++)
+        if (g_prof[i].hits && g_prof[i].rip == rip) { g_prof[i].hits++; return; }
+    for (int i = 0; i < PROF_SLOTS; i++)
+        if (!g_prof[i].hits) { g_prof[i].rip = rip; g_prof[i].hits = 1;
+                               g_prof[i].pid = pid; return; }
+    int w = 0;                              /* table full: evict the coldest */
+    for (int i = 1; i < PROF_SLOTS; i++)
+        if (g_prof[i].hits < g_prof[w].hits) w = i;
+    g_prof[w].rip = rip; g_prof[w].hits = 1; g_prof[w].pid = pid;
+}
+
+void prof_dump_and_reset(void) {
+    if (!g_prof_total) return;
+    kprintf("[prof] %u ring-3 samples this interval; hottest user rips:\n",
+            g_prof_total);
+    for (int n = 0; n < 10; n++) {          /* selection-sort the top 10 */
+        int b = -1;
+        for (int i = 0; i < PROF_SLOTS; i++)
+            if (g_prof[i].hits && (b < 0 || g_prof[i].hits > g_prof[b].hits)) b = i;
+        if (b < 0) break;
+        kprintf("  rip=0x%lx hits=%u pid=%d\n", (unsigned long)g_prof[b].rip,
+                g_prof[b].hits, g_prof[b].pid);
+        g_prof[b].hits = 0;
+    }
+    for (int i = 0; i < PROF_SLOTS; i++) g_prof[i].hits = 0;
+    g_prof_total = 0;
+}
+#endif
+
 void sched_tick(struct regs *r) {
     struct percpu *me = smp_this_cpu();
     if (me) {
@@ -628,6 +669,7 @@ void sched_tick(struct regs *r) {
              * loop on at the stall (the livelock, not a blocking wait). */
             extern void lx_dump_recent_syscalls(void);
             lx_dump_recent_syscalls();
+            prof_dump_and_reset();   /* hottest user rips this interval */
         }
     }
 #endif
@@ -651,6 +693,11 @@ void sched_tick(struct regs *r) {
 
     struct proc *cur = current_proc();
     if (!cur || cur->is_idle) return;        /* never preempt pid 0 / ap_idle */
+
+#ifdef CHROMIUM_BOOT
+    /* We interrupted ring 3, so r->rip is this Linux proc's user pc: sample it. */
+    if (cur->personality == 1) prof_sample(cur->pid, r->rip);
+#endif
 
     /* Asynchronous-signal point for CPU-bound user code on THIS cpu. The
      * PIT only fires on the BSP, so before this a spinning proc running on
