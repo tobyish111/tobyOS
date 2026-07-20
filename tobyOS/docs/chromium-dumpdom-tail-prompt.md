@@ -1,234 +1,214 @@
-# Task: get real headless Chromium to `--dump-dom` `<h1>tobyOS</h1>` on tobyOS — grind the remaining ABI tail
+# Task: get real headless Chromium to `--dump-dom` `<h1>tobyOS</h1>` on tobyOS
 
-You are picking up a **live, deep, successful Chromium bring-up**. A prior agent
-took real, unmodified `chrome-headless-shell` (V8 + Blink + SwiftShader, on
-tobyOS's Linux ABI / Track B) from **crashing at GL init** all the way to
-**running its full engine — GL, storage, signals, and V8 memory all working — for
-~22.5 s**, by fixing **eight genuine kernel/ABI bugs** (slices 12–18, all merged).
-Chrome no longer crashes at GL, no longer panics the OS, and drives its whole
-startup. **Exactly one class of wall remains between you and the deliverable: a
-sequence of downstream ABI gaps that chrome hits as it finishes bring-up and tries
-to navigate.** Each fix reveals the next — this is normal for a program of Chrome's
-size — but every one so far has been a real, bounded kernel bug, not a rewrite.
+You are picking up a **deep, live, successful Chromium bring-up**. Real, unmodified
+`chrome-headless-shell` 151.0.7922.34 (V8 + Blink + SwiftShader) runs on tobyOS's
+Linux ABI. Its GL init, storage, signals, V8 memory **and its whole Mojo IPC fast
+path** now work. It still does not print the DOM. **The blocker is now localized
+to one sentence, and the recommended next step is a concrete, bounded kernel fix.**
 
-**Your job: close the remaining gaps until `--dump-dom` prints `<h1>tobyOS</h1>`,
-then switch the harness to `--screenshot` and host-diff the PNG.** The GL/render
-subject of the *original* handoff is DONE; this is the tail past it.
+Everything below was *measured*. Where I guessed instead of measuring, I have said
+so — those are the traps to avoid.
 
 ---
 
-## ⚠️ CORRECTION (2026-07-19, slice 20) — READ THIS BEFORE "The current wall (slice 19)" BELOW
+## THE PRIME DIRECTIVE: measure, then READ CHROME'S SOURCE. Do not infer.
 
-**Slice 19 as written below is a MISDIAGNOSIS. The "`read()` into a read-only page"
-is a NON-BUG — do NOT chase it.** Measured (see `docs/chromium-bringup-m1.md`
-"Slice 20" + memory `chromium-bringup.md` SLICE 20):
+Two fixes were wasted this arc inferring from a symptom that turned out to be
+meaningless (see LESSONS). The winning move every time was:
 
-- `0xc0da000`–`0xc0dc000` is chrome's own ELF section **`protected_memory`**
-  (`base::ProtectedMemory`, a RO-after-init function-pointer table; `objdump -h`).
-  **Chrome itself `mprotect`s it `PROT_READ`**, then *verifies* it's read-only by
-  issuing a **syscall write** — `prlimit64(0,RLIMIT_NPROC,NULL,old_limit=0xc0db000)` —
-  and **expecting `-EFAULT`**. Slice-18's `copy_to_user → -EFAULT` is therefore
-  **exactly correct**; chrome's check passes. There is nothing to fix here.
-- The "downstream NULL deref at 0x210" is a *separate*, non-deterministic teardown
-  crash, not caused by the EFAULT.
-
-**The REAL front is the render tier** (not a loader/RELRO bug): (1) a flaky,
-timing-dependent crash that when it fires is *deterministically* `memcpy+0x35d` in
-`libc.so.6` (a **stack overflow from a corrupt/too-large length** during SwiftShader
-Vulkan extension enumeration) — the **same memory-corruption family** as the ld.so
-`check_match` crash reading libvulkan's `link_map->l_versyms = garbage`; and (2)
-even when GL init *succeeds*, chrome never navigates/dumps the DOM (idle-exits
-`code=0`). **VLOG is compiled out of official chrome** (`--vmodule`/`-v=1` = zero
-output). A **lib load map** (`[libmap]` in `linux_mmap_file`) and a PTE-flag dump in
-the uaccess path are now in-tree (CHROMIUM_BOOT).
-
-**Deep-dive update (runs 23-26): the crash and the no-DOM are TWO SEPARATE
-blockers.** `--disable-gpu --disable-software-rasterizer` routes around the GL/Vulkan
-path → **0 crashes, chrome runs CLEAN, but STILL no DOM** (the harness now commits
-`--disable-gpu` for `--dump-dom`). A fd-1 write instrument shows chrome writes
-**nothing** to stdout → it never reaches the dump (not a buffering loss). `about:blank`
-is identical → the stall is fundamental, not the URL. `-smp 1` still crashes at the
-same rip → the Vulkan corruption is NOT an SMP race. At the stall chrome busy-livelocks
-(pid 27 mmap/munmap churn, pid 28 CPU-burn, IO threads epoll_wait idle) — the
-compositor/viz never reaches navigate.
-
-**NEXT — work the navigation stall first (it's the PRIMARY blocker for `--dump-dom`,
-now isolated with no crash under `--disable-gpu`):** (1) implement **`memfd_create`
-(319, currently `-ENOSYS`)** as coherent anonymous shared memory (mmap maps the SAME
-backing pages, not `linux_mmap_file`'s copy) — candidate compositor unblock; (2) since
-VLOG is stripped, drive the **DevTools protocol over `--remote-debugging-pipe`** to get
-chrome's internal state / do the DOM dump; (3) find which Mojo pipe the `epoll_wait` IO
-threads block on. The flaky Vulkan crash (ld.so link_map `l_versyms` / libc `memcpy`
-corruption) is SECONDARY — it only gates the later `--screenshot`/GL tier. Ignore the
-"slice 19" section below except as historical context.
+1. Reproduce, and use the **in-tree instruments** (below) to see what the kernel sees.
+2. When chrome complains, **fetch the actual chromium source line**:
+   ```bash
+   curl -sS "https://chromium.googlesource.com/chromium/src/+/refs/tags/151.0.7922.34/<path>?format=TEXT" \
+     | base64 -d > /tmp/f.cc
+   ```
+   Exact line numbers. **Do not** use the WebFetch summarizer for line attribution —
+   it mis-attributes lines. That one command cracked two walls in a row.
+3. Fix the smallest real thing. Re-measure.
 
 ---
 
-## THE PRIME DIRECTIVE: instrument-first, reuse what exists, add the smallest shim
+## Where the DOM actually comes from (READ THIS FIRST — it is not what it looks like)
 
-Every win in this arc came from **measuring, not guessing** — and repeatedly
-disproving handed-down hypotheses (the "render NULL dispatch" was a signal bug; the
-"V8 SEGV" was an mprotect bug; the "needs a surfaceless ANGLE" was a `./` path
-bug). Before writing anything: reproduce, read the serial log, symbolize the fault,
-and confirm the mechanism. Then fix the actual bug with the smallest change.
+`--dump-dom` is **not** "navigate to the URL and print". From
+`components/headless/command_handler/headless_command_handler.cc`:
 
-Instruments already in the tree (keep them; extend as needed):
-- **`src/isr.c`** on a fatal user fault: register dump + a **user-stack scan** that
-  flags main-PIE qwords (`[0x500000,0x0d000000)` → `CODE main+…`) AND
-  `.so`-region qwords (`0x1000_0000_0000+` → `LIB?`), plus `fault_count` /
-  `last_fault_rip`. For a **kernel** fault on a user address it also prints
-  `[kpf] KERNEL fault at user addr=… err=… rip=…` + the VMA (see below).
-- **`src/mmap.c` `mmap_debug_fault_vma(addr)`** — dumps whether an address is
-  covered by an mmap-VMA (and its `prot`/`flags`) or the nearest mappings. This is
-  how the V8-heap prot bug and the read-only-page bug were both pinned.
-- **`src/page_fault.c` `uaccess_prepare_write`** logs `[uaccess] copy_to_user ->
-  EFAULT: … addr=0x…` + the recent-syscall ring (first hit) when a syscall writes
-  to a read-only user buffer.
-- **`src/syscall.c`** `[linux] UNHANDLED syscall N (name)` first-hit logger + the
-  recent-syscall ring (dumped by isr on a fatal fault). `TRACE=1 bash
-  logs/chromium-m0.sh` = the full firehose.
-- **Symbolization recipe (proven).** Main PIE loads at `0x500000`: `objdump -d
-  --start-address=<rip-0x500000> programs/chromium/chrome-headless-shell-linux64/
-  chrome-headless-shell`. A `.so` return address needs the **library load map**:
-  temporarily log each executable file-backed `mmap` base + the `.so` open path by
-  fd (this arc's `[dlopen]`/`[libmap]` pattern — reintroduce from git history of
-  `src/syscall.c` if needed) and `objdump` the `.so` at `retaddr - so_base + off`.
+- chrome navigates the web contents to an **internal WebUI page**,
+  `chrome://headless/headless_command.html`, served from
+  `headless_command_resources.pak` beside the binary (found via `DIR_ASSETS` →
+  `/proc/self/exe`).
+- **Only when THAT page finishes loading** does
+  `DocumentOnLoadCompletedInPrimaryMainFrame()` fire →
+  `Target.exposeDevToolsProtocol` → `Runtime.evaluate("executeCommands(...)")`.
+- That injected JS (extract it from the .pak, snippet below) creates a **second**
+  target, navigates *it* to your real URL, dumps the DOM, and `OnCommandsResult`
+  prints it with `std::cout`.
 
-If something is genuinely missing, add the smallest shim that lets chrome's
-existing code path work — the way this arc added `rename`, a fake X server, VMA
-splitting, and `copy_to_user` fault-safety rather than reimplementing subsystems.
+**Measured: `executeCommands()` never runs.** Decisive proof: with `--timeout=5000`
+the JS *races* the load and **still calls `handleCommands()` afterwards**, so it
+would have dumped the DOM anyway *and* logged `"Page load timed out."` — neither
+appeared. So `DocumentOnLoadCompletedInPrimaryMainFrame` never fires: **the
+renderer completes no document load, not even chrome's own 229-byte internal page.**
+
+Already verified working, so do **not** re-chase: `/proc/self/exe`, the `.pak`
+lookup, DIR_ASSETS, the JS itself, virtual time, the `data:` URL, the target page,
+the Mojo channel, GL.
 
 ---
 
-## What is DONE (measured; do NOT redo) — slices 12–18, all merged to `main`
+## RECOMMENDED FRONT: make `fork()` inherit sockets, and go multi-process
 
-The render-GL wall the ORIGINAL handoff (`docs/chromium-render-gl-bug-prompt.md`)
-was about is **solved**. On top of it, the storage + engine tiers are solved too:
+`--single-process` is a legacy mode chrome barely supports, and the page that must
+load first is a **WebUI** page (strict process requirements). That is the leading
+explanation for the silent non-commit — and it also explains why `about:blank`
+behaved identically (the WebUI page is always first, whatever your target URL).
 
-| Slice | Fix (all merged) | Effect |
-|---|---|---|
-| 12 `2f2525a` | `resolve_user_path` collapses interior `.`/`..` (`path_lexical_clean`) | Vulkan loader loads the SwiftShader ICD → WSI-extension wall passed (the deep-dive's "surfaceless ANGLE" theory was WRONG — it was `/opt/chrome/./libvk…`) |
-| 13 `ef4ffb3` | AF_UNIX `socket`/`connect` + **in-kernel fake X server** at `/tmp/.X11-unix/X0` + `recvmsg`/`recvfrom`/`sendmsg` on UNIX (were `ENOTSOCK`) + stream partial-consume | **`xcb_connect` + `eglInitialize` SUCCEED — SwiftShader Vulkan initializes headless** |
-| 14 `cd5ad9f` | stable per-file inode (`vfs_file.ino` from tobyfs; `lx_fd_ino` prefers it) | chrome's shm inode-match passes (8s→47s) |
-| 15 `04b940b` | tobyfs `rename` (new vfs op) + `fsync`/`fdatasync`/`unlinkat`/`flock` | leveldb + SQLite profile stores work |
-| 16 `a3fbada` | **SA_RESETHAND** one-shot handler was zeroed *before* `rip` read it (`signal.c`, both paths) | the "render NULL dispatch" was **SIGSEGV delivered to a NULL handler** — fixed, unmasking the real fault |
-| 17 `16f6c4f` | **`sys_mprotect` now SPLITS VMAs** (was clobbering the whole region's prot) | V8 W^X sub-range mprotects work → V8-heap writes work (14s→16.5s) |
-| 18 `22ae599` | **`copy_to_user`/`clear_user` return `-EFAULT`, never panic** (`uaccess_prepare_write` pre-validates writability) | kernel no longer panics on a bad user out-pointer (16.5s→22.5s) |
+**Dropping `--single-process` made chrome use its real multi-process model and
+actually spawn children.** They currently all `_exit(127)`
+(`exit_code=32512 == 127<<8`, chrome's launcher's "child setup failed"), ending in
+`FATAL … GPU process isn't usable. Goodbye.`
 
-**Verify state before starting:** `dd if=/dev/zero of=disk.img bs=1M count=16`
-(fresh `/data`) then `bash logs/chromium-m0-clean.sh`. Expect: 0 GL/EGL/Vulkan
-errors, 0 KERNEL PANIC, leveldb/SQLite quiet, chrome ~22 s, no DOM yet.
+Two gaps on that path are already fixed (merged `d644e6c`), each of which pushed the
+child further — children went from **6 → 25 syscalls**:
 
----
+- **`/dev/null` + `/dev/zero` did not exist.** `base::LaunchProcess` opens
+  `/dev/null` to remap a child's stdio before `execve`. Added
+  `FILE_KIND_DEVNULL`/`DEVZERO`.
+- **`open("/proc/<pid>/exe")` returned ENOENT** — `stat` said symlink and `readlink`
+  worked, but `procfs_open` had no case. It now follows the symlink to the real
+  executable.
 
-## The current wall (slice 19) — measured, do not re-derive
+### → YOUR NEXT FIX (measured, not guessed)
 
-Chrome does a **`read()` (tid 8) into a page that is present + READ-ONLY**
-(`0xc0db000`/`0xc0da000`, in chrome's LOW ELF-loaded region — NOT any mmap-VMA, so
-almost certainly a **rodata / `GNU_RELRO`** segment or a RW segment the ELF loader
-mapped read-only). With slice 18 in, `copy_to_user` now returns `-EFAULT` (no
-panic), but the `read()` then fails and chrome trips a **downstream `SIGSEGV`
-(NULL deref at `0x210`)** — it never expected that buffer to be unwritable.
+Children still `_exit(127)`, now after a **second `dup2`**. Cause:
 
-The decision to make first (instrument, don't guess):
+> `fork()` clones the fd table via `file_clone()` (`src/file.c`), which
+> **deliberately refuses `FILE_KIND_SOCKET`** ("a child shouldn't silently share a
+> parent socket"). The child therefore gets `NULL` for every socket fd, and the
+> launcher's `dup2` of the **inherited Mojo socketpair fd** fails.
 
-1. **Is `0xc0db000` SUPPOSED to be writable?** Dump chrome's ELF `PT_LOAD`
-   flags + the `PT_GNU_RELRO` range and compare to what the loader (`src/elf.c`)
-   and ld.so actually mapped. If a **RW segment was mapped read-only** (or RELRO
-   was applied to a page that should stay writable), that's the real bug — fix the
-   loader / the RELRO mprotect. Chrome writes to `.data`/`.bss` fine for 22 s, so
-   the read-only region is specific — pin which segment `0xc0db000` is in.
-2. **Or is chrome genuinely handing `read()` a read-only buffer?** Then trace the
-   fd + call site (which fd is tid 8 reading? what's the buffer's provenance?). A
-   read-only read() target usually means a wrong pointer upstream (a prior syscall
-   returned bad data, or a struct field the kernel filled wrong) — follow that.
+Linux `fork()` inherits **all** fds. Fix: let `file_clone` share the `struct sock`
+across fork, which needs a **refcount on `struct sock`** (a struct change ⇒ **clean
+build**), with `sock_close`/`file_close` only tearing down at zero. Mind the
+existing `sock_unix_peer_close()` semantics.
 
-Then the downstream NULL deref at `0x210` should vanish once the `read()` succeeds
-(it's a consequence of the `-EFAULT`). If it persists, symbolize it (main-PIE
-`objdump`; it's a `<something>->field` at offset `0x210` off a NULL base).
+After that, expect further multi-process walls (cross-process Mojo, fd passing).
+Note: the **SCM_RIGHTS implementation already handles real processes** — it
+`file_clone`s on send and `fd_alloc_into`s into `current_proc()` at recvmsg time,
+which is the receiver either way.
+
+**Why this path:** multi-process is chrome's real model, and every step so far has
+been a genuine POSIX-correctness fix that outlives chrome. Fighting legacy
+`--single-process` may not be winnable at all.
 
 ---
 
-## Reusable kernel/ABI wins so far (context — these are general, not chrome hacks)
+## Instruments already in-tree — USE THEM IN THIS ORDER
 
-interior-dot path normalization · named/abstract AF_UNIX + `recvmsg`/`recvfrom` on
-UNIX · stable per-file inodes · tobyfs `rename`/`fsync`/`unlinkat`/`flock` ·
-**SA_RESETHAND** one-shot signal delivery · **`mprotect` VMA splitting** ·
-**`copy_to_user` `-EFAULT` robustness**. Expect the tail to keep surfacing bugs of
-this flavor (VM/mmap edge cases, ELF/RELRO, a syscall filling a struct slightly
-wrong, thread/signal interactions) — each bounded, each found by instrumenting.
+All `CHROMIUM_BOOT`-gated and behaviour-neutral. Using them out of order cost me
+several wrong turns.
 
----
+1. **Ring-3 sampling profiler** (`src/sched.c`, `prof_dump_and_reset`) — samples the
+   user `rip` on every ring-3 timer tick. **Run this FIRST**: it separates "spinning
+   in user code" from "blocked in kernel" in one run. (It immediately disproved my
+   "busy livelock" reading of thread states.)
+2. **Wait-graph tracker** (`src/syscall.c`, `waitt_*`) — which thread is blocked in
+   `futex`/`epoll_wait`, on what address/fd, and for how long. A true wait graph
+   (entries live exactly as long as the block).
+3. **Recent-syscall ring** (`LX_RECENT = 384`) — dumped at the heartbeat and on any
+   fatal user fault. 48 was too small; it hid the spin that cracked the last bug.
+4. **`[libmap]`** (`linux_mmap_file`) — `.so` load map; correlate a `.so`-region rip
+   → base+offset → `objdump`.
+5. **`[path]`** — traces `headless` / `.pak` / `self/exe` lookups.
+6. **`[memfd]` / `[scm]`** — memfd create/ftruncate/seals/mmap and SCM_RIGHTS
+   send/recv.
+7. **uaccess PTE dump** — present-RO vs unmapped on a `copy_to_user` EFAULT.
 
-## Read first
+Symbolize: main PIE @ `0x500000`, ld.so @ `0x40000000`, `.so`s @ `0x100000000000+`
+(via `[libmap]`). Tools: `C:/msys64/ucrt64/bin/{objdump,nm}.exe`.
 
-- **`docs/chromium-bringup-m1.md`** — the full burn-down. **Slices 15–19** at the
-  end are this tail; read them (esp. the exact fault addresses + diagnostics).
-- **Memory** (`C:\Users\tdude\.claude\projects\c--CustomOS\memory\`):
-  `chromium-bringup.md` (read the "SLICES 17-19" entry FIRST, then 12–16),
-  `linux-abi-compat-b1.md`, `tobyos-build-env.md`.
-- `docs/chromium-render-gl-bug-prompt.md` — the ORIGINAL handoff (GL subject, now
-  solved) for methodology + the symbolization/build conventions.
-
----
-
-## Environment, build, verify (match the project exactly)
-
-- **Build/run:** MSYS2/UCRT64 clang (`tobyos-build-env.md`). Reproduce:
-  `bash logs/chromium-m0.sh` (incremental) — **but see the gotcha below**;
-  `bash logs/chromium-m0-clean.sh` for a full clean rebuild. `TRACE=1` adds the
-  firehose. Carry the `TMP` fix on `$(CC)`/`$(HOST_CC)` (the scripts already do it).
-- **CLEAN BUILDS ONLY right now.** After the struct changes in this arc (`struct
-  sock`, `struct vfs_file`, `struct vma_table`), **incremental builds boot-hang at
-  Limine module-load** (symptom: ~1280-byte log stuck at `Loading module
-  install.img`, QEMU exits ~35 s). Always `logs/chromium-m0-clean.sh`. Root cause
-  of the incremental hang was never chased — a `make` dependency issue; if you fix
-  it, incremental is ~5 min vs ~15.
-- **FRESH `disk.img` per investigation:** `dd if=/dev/zero of=disk.img bs=1M
-  count=16`. A `disk.img` with a `/data/cr` profile corrupted by an earlier
-  crashed run makes chrome spin on leveldb recovery and confounds the read.
-- **BUILD/BOOT LAUNCH GOTCHA:** `nohup … &` (or a trailing `&`) inside a
-  `run_in_background` Bash call only tracks the *launch*, not the build — you get a
-  premature "done". Run `bash logs/chromium-m0-clean.sh` **directly** with
-  `run_in_background: true` (no `&`), or attach a poller that greps `run.out` for
-  `=== [4/4] GAP LIST ===`.
-- **Symbolization:** main PIE at `0x500000`; kernel at `0xffffffff80000000`
-  (`objdump -d tobyos.bin`). `.so`'s need the library load map (see prime
-  directive). Serial logs are binary-ish — always `grep -a`.
-- **Verify:** `--dump-dom` must print `<h1>tobyOS</h1>` (self-verifying in the
-  serial log). Then switch the `#ifdef CHROMIUM_BOOT` harness in `src/kernel.c` to
-  `--screenshot=/data/shot.png` and get the PNG out (dump it over serial as base64
-  from the harness after chrome exits, or parse `/data` from `disk.img`), then diff
-  vs the SAME chrome build on the host. **Never** `taskkill msedge` (the user's
-  real browser). The harness is on the committed loader route (`--use-gl=angle
-  --use-angle=vulkan --enable-unsafe-swiftshader` + `VK_ICD_FILENAMES` + `DISPLAY=:0`).
-- **One coherent slice per branch off `main`; extend `docs/chromium-bringup-m1.md`
-  + a `MEMORY.md` line each slice; commit trailer
-  `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`; merge `--no-ff`.**
+Extract the headless JS from the local .pak (v5 resource pack, gzip blobs):
+```python
+import struct, gzip
+d=open('programs/chromium/chrome-headless-shell-linux64/headless_command_resources.pak','rb').read()
+cnt,_=struct.unpack_from('<HH',d,8)
+e=[struct.unpack_from('<HI',d,12+i*6) for i in range(cnt+1)]
+for i in range(cnt):
+    print(gzip.decompress(d[e[i][1]:e[i+1][1]]).decode('utf-8','replace'))
+```
 
 ---
 
-## Walls / non-goals (know them; don't rediscover)
+## LESSONS — do not repeat these
 
-- **`--incognito` does NOT skip the storage/profile tier** (measured, slice 15):
-  `shared_proto_db` is browser-global; chrome then HANGS ~5 min. Flags can't route
-  around storage or the render tier — the ABI has to actually work.
-- **Software-raster flags** (`--disable-gpu-rasterization` etc.) were inconclusive
-  (slice 16) — don't re-chase them as a shortcut.
-- **GPU-accelerated GL is a much later tier**; stay on SwiftShader (software).
-- Sandbox stays off (`--no-sandbox --single-process --no-zygote`, already set).
-- Once `--dump-dom` + `--screenshot` land, the next milestones are M2 (a real
-  JS/React SPA) and M3 (WINDOWED via the tobyOS compositor — see
-  `docs/chromium-bringup-render-prompt.md`).
+- **Chrome's `Check failed: . : <errno>` — the errno is STALE/incidental.** It is
+  whatever `errno` happened to be left over. It flipped `Success (0)` →
+  `Invalid argument (22)` purely because an unrelated probe changed. It does **not**
+  name the failing predicate (which is stripped from official builds). **Fetch the
+  source line.** Two fixes were wasted before I did.
+- **Chrome probes kernel features with deliberately-INVALID flags, expecting
+  `-EINVAL`.** `memfd_create("", ~0)` and `eventfd2(0, ~0)` are both
+  `PCHECK(ret < 0 && (errno == EINVAL || ENOSYS || EPERM))`. tobyOS accepted every
+  flag and handed back valid fds ⇒ FATAL. **tobyOS syscalls must VALIDATE unknown
+  flag bits, not ignore them — there are probably more latent instances.**
+- **Pre-check kernel sources with `clang -c`, not `-fsyntax-only`** — the latter
+  missed an implicit-declaration error that failed the real build. **`klibc` has no
+  `strstr`.**
+- **VLOG is compiled OUT of official chrome** — `--vmodule` / `-v=1` produce zero
+  output. Don't plan around chrome's own logging.
+- **The stale-log trap.** The boot truncates `logs/chromium-m0.log`, so *while a
+  build runs you are reading the PREVIOUS run's log*. Wait for `boot in QEMU` in the
+  run's `.out` **and** a fresh low timestamp before believing anything. This burned
+  me twice.
+- fds 0/1/2 are all console → serial, so `--dump-dom`'s stdout **would** appear if
+  produced.
+
+---
+
+## Build / verify
+
+- `bash logs/chromium-m0.sh` (incremental) · `bash logs/chromium-m0-clean.sh`
+  (**required after any struct-layout change**).
+- Fresh `disk.img` per run: `dd if=/dev/zero of=disk.img bs=1M count=16`.
+- Do **not** put `&` inside a `run_in_background` call — it tracks only the launch.
+- Verify: `--dump-dom` must print `<h1>tobyOS</h1>` (self-verifying in the serial
+  log). Then switch to `--screenshot` and host-diff the PNG.
+- Never `taskkill msedge` (the user's real browser).
+- One coherent slice per branch off `main`; extend `docs/chromium-bringup-m1.md` +
+  a `MEMORY.md` line each slice; trailer
+  `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`; merge `--no-ff`.
+
+---
+
+## Done already (do NOT redo) — slices 12–20, all merged
+
+interior-dot path normalization · in-kernel fake X server + named AF_UNIX ·
+stable per-file inodes · tobyfs `rename`/`fsync`/`unlinkat`/`flock` · SA_RESETHAND ·
+`mprotect` VMA splitting · `copy_to_user` `-EFAULT` · **memfd_create** (page-backed,
+mmap-coherent shared memory) · **SCM_RIGHTS** fd-passing over AF_UNIX ·
+**memfd_create + eventfd2 flag validation** (cleared the
+`mojo/core/channel_linux.cc` FATAL; the Mojo shared-memory channel now negotiates
+end-to-end, SCM_RIGHTS verified live) · **AF_UNIX epoll/recvmsg EOF-vs-EAGAIN spin
+fix** · **/dev/null + /dev/zero** · **open(/proc/<pid>/exe) follows the symlink**.
+
+Known non-issues / secondary:
+- **Slice 19 was a MISDIAGNOSIS.** The "read-only page" is chrome's own
+  `protected_memory` section, which chrome mprotects RO and then *verifies* with a
+  syscall write expecting `-EFAULT`. Returning `-EFAULT` is CORRECT. Not a bug.
+- **Flaky Vulkan crash** (deterministically `memcpy+0x35d` in libc during SwiftShader
+  extension enumeration; same corruption family as ld.so `check_match` reading a
+  garbage `link_map->l_versyms`). Only gates `--screenshot`; `--disable-gpu` avoids
+  it entirely. Not on the `--dump-dom` path.
+- Ruled out for the renderer stall: CPU spin (profiler), futex deadlock (wait graph —
+  the browser main thread cycles healthily at 124–268 ms).
 
 ---
 
 ## Scope honesty
 
-This is a **long, layer-by-layer tail** — Chrome is one of the largest programs in
-existence and the last mile to a painted/DOM'd page crosses many small ABI gaps.
-But the hard, uncertain parts (GL bring-up, V8 memory, signals, storage) are
-**done**; what remains has been, so far, a steady sequence of bounded, real kernel
-bugs each cracked by instrumenting first. Reproduce, symbolize the current fault,
-fix the smallest thing, re-measure. Chrome is already running its full engine —
-you are closing the gap between "runs" and "renders."
+The hard, uncertain tiers (GL, V8 memory, signals, storage, Mojo IPC) are **done**.
+What remains is a layer-by-layer tail, but it is no longer mysterious: you have one
+named blocker (`fork()` must inherit sockets), a working method (measure → read
+chrome's source → smallest fix), and instruments that answer "spinning or blocked?"
+and "who waits on whom?" in a single run. Expect each fix to reveal the next — every
+one so far has been a real, bounded kernel bug, and most outlive chrome entirely.
