@@ -77,13 +77,46 @@ SCM_RIGHTS works **cross-process** (`[scm] sendmsg passing 1 fd(s)` in one
 process, `recvmsg got 1 fd(s)` in another). So the plumbing is right and the
 failure is in the handshake TRAFFIC over that socket.
 
-**Next step:** instrument syscall ARGS (the ring logs names only). Log
-`sendmsg`/`recvmsg`/`read`/`write` fd + byte counts per pid, gated on
-`CHROMIUM_BOOT`, and answer: does the browser ever write the Mojo invitation to
-its end, and does the child ever read fd 5? That splits the problem in one run
-— browser-never-sends vs child-never-receives vs delivered-but-malformed.
-Suspect the AF_UNIX stream semantics under cross-process use (partial reads,
-`tail_off`, EOF-vs-EAGAIN) before suspecting chrome.
+### ROOT-CAUSED (slice 22): `MAP_SHARED` file-backed mmap does not SHARE
+
+Measured, not inferred. The AF_UNIX trace (`[unix] pair/send/recv`) shows the
+socket layer is **fine**:
+
+```
+[unix] pair pid=16 a=4 b=5
+[unix] send pid=16 sock=4 -> peer=5 len=184 nfds=1 peer_count=1   <- browser sends
+[unix] recv pid=26 sock=5 peer=4 queued=1 want=4096               <- child consumes
+```
+
+The child gets the Mojo invitation and its SCM_RIGHTS fd, then epoll_waits
+forever and never replies. The `[scm] recvmsg pid=N nf=1: kind=2` trace names
+the passed fd: **`kind=2` = `FILE_KIND_VFS`, a regular FILE** — chrome's
+shared-memory region.
+
+`base/memory/platform_shared_memory_region_posix.cc:209` calls
+`CreateAndOpenFdForTemporaryFileInDir` **unconditionally** — this build has NO
+memfd path for shared memory, so no flag routes around it (`--disable-dev-shm-usage`
+only picks the directory). Meanwhile `linux_mmap_file` (`syscall.c:4409`)
+reserves **anonymous** pages (`VMA_FLAG_ANON`) and fills them by reading the
+file, ignoring `MAP_SHARED` entirely. `mmap.c:622` already admits this:
+*"file-backed mmap (linux_mmap_file) only copies, breaking sharing."*
+
+**So both processes mmap the same file and get PRIVATE COPIES. Nothing the
+browser writes is ever visible to the child — hence "no connection".**
+
+**THE FIX:** real `MAP_SHARED` file-backed sharing. Every `MAP_SHARED` mapping
+of the same file must map the SAME physical pages. Shape: a per-inode shared
+page-cache object (the `struct memfd` page-list machinery in `mmap.c` is
+already exactly this — a growable list of physical pages that every mmap maps
+rather than copies; reuse it keyed by inode instead of by fd), populated from
+the file on first fault, with `MAP_PRIVATE` keeping today's copy behaviour and
+writeback on msync/close. Chrome's regions live in `TMPDIR=/data` and are often
+unlinked immediately after creation, so the cache must be keyed by inode
+identity and survive unlink — tobyfs already has stable per-file inodes
+(slice 14).
+
+This is a genuine POSIX gap that outlives chrome: today ANY two processes
+sharing a file mapping silently get private copies.
 
 ## SUPERSEDED FRONT (kept for context): make `fork()` inherit sockets
 

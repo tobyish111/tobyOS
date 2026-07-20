@@ -5377,6 +5377,23 @@ static void lx_scm_recv_emit(uint64_t umsg, const struct lx_msghdr *mh,
                              struct file **files, int nf) {
     uint64_t ctl_len = 0;
     int32_t  flags   = 0;
+#ifdef CHROMIUM_BOOT
+    /* Log WHAT arrived, not just how many. Mojo's invitation hands the child a
+     * channel; whether that is a socket -- and if so whether its peer still
+     * exists -- decides what the child can do next. Logged HERE, before the
+     * install/CTRUNC paths below may file_close() these pointers. */
+    if (nf > 0) { static int c=0; if(c<24){c++;
+        struct proc *me = current_proc();
+        kprintf("[scm] recvmsg pid=%d nf=%d:", me ? me->pid : -1, nf);
+        for (int i = 0; i < nf; i++) {
+            if (!files[i]) { kprintf(" <null>"); continue; }
+            kprintf(" kind=%d", (int)files[i]->kind);
+            if (files[i]->kind == FILE_KIND_SOCKET && files[i]->sock)
+                kprintf("(peer=%d)", files[i]->sock->peer_ip
+                                     ? (int)files[i]->sock->peer_ip - 1 : -1);
+        }
+        kprintf("\n"); } }
+#endif
     if (nf > 0) {
         uint64_t need = sizeof(struct lx_cmsghdr) + LX_CMSG_ALIGN(nf * 4);
         if (!mh->msg_control || mh->msg_controllen < need) {
@@ -5405,7 +5422,7 @@ static void lx_scm_recv_emit(uint64_t umsg, const struct lx_msghdr *mh,
         }
     }
 #ifdef CHROMIUM_BOOT
-    if (nf) { static int c=0; if(c<24){c++; kprintf("[scm] recvmsg got %d fd(s) ctl_len=%lu flags=0x%x\n", nf,(unsigned long)ctl_len,(unsigned)flags);} }
+    if (nf) { static int c=0; if(c<24){c++; kprintf("[scm] recvmsg emitted %d fd(s) ctl_len=%lu flags=0x%x\n", nf,(unsigned long)ctl_len,(unsigned)flags);} }
 #endif
     (void)copy_to_user((void *)(uintptr_t)(umsg + 40), &ctl_len, 8);
     (void)copy_to_user((void *)(uintptr_t)(umsg + 48), &flags, 4);

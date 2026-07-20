@@ -256,6 +256,23 @@ long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
         return -32;                              /* -EPIPE */
     }
     unix_enqueue_fds(peer, kbuf, n, files, nfiles);
+#ifdef CHROMIUM_BOOT
+    /* Slice 22 instrument: who is actually talking over the Mojo socketpair.
+     * Chrome's children inherit fd 5 and then time out "with no connection",
+     * so the question is whether the browser ever ENQUEUES to their end.
+     * Bounded so a chatty channel can't drown the log. */
+    {
+        static int sent_logged;
+        if (sent_logged < 40) {
+            sent_logged++;
+            struct proc *me = current_proc();
+            kprintf("[unix] send pid=%d sock=%d -> peer=%d len=%u nfds=%d "
+                    "peer_count=%u\n",
+                    me ? me->pid : -1, sock_index(self), sock_index(peer),
+                    (unsigned)n, nfiles, (unsigned)peer->count);
+        }
+    }
+#endif
     return (long)n;
 }
 
@@ -273,6 +290,24 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
     if (out_n) *out_n = 0;
     if (!self || !self->in_use || self->kind != SOCK_KIND_UNIX) return -1;
     if (!kbuf && n) return -1;
+
+#ifdef CHROMIUM_BOOT
+    /* Slice 22 instrument: the receiving side of the same question. Tells
+     * "child never called recv" from "called recv on a socket whose peer is
+     * gone" (peer=-1 => the EOF arm below fires) from "called recv and nothing
+     * was queued". */
+    {
+        static int recv_logged;
+        if (recv_logged < 40) {
+            recv_logged++;
+            struct proc *me = current_proc();
+            kprintf("[unix] recv pid=%d sock=%d peer=%d queued=%u want=%u\n",
+                    me ? me->pid : -1, sock_index(self),
+                    self->peer_ip ? (int)self->peer_ip - 1 : -1,
+                    (unsigned)self->count, (unsigned)n);
+        }
+    }
+#endif
 
     uint64_t deadline = 0;
     if (timeout_ms) {
@@ -472,6 +507,14 @@ int sock_unix_pair(struct sock **out_a, struct sock **out_b) {
     if (!b) { sock_close(a); return -1; }
     a->peer_ip = (uint32_t)(sock_index(b) + 1);
     b->peer_ip = (uint32_t)(sock_index(a) + 1);
+#ifdef CHROMIUM_BOOT
+    {   /* Slice 22 instrument: map pool indices to channels, so the send/recv
+         * traces above can be read as a conversation. */
+        struct proc *me = current_proc();
+        kprintf("[unix] pair pid=%d a=%d b=%d\n",
+                me ? me->pid : -1, sock_index(a), sock_index(b));
+    }
+#endif
     *out_a = a;
     *out_b = b;
     return 0;
