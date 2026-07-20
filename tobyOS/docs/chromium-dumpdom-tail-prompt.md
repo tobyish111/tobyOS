@@ -56,7 +56,36 @@ the Mojo channel, GL.
 
 ---
 
-## RECOMMENDED FRONT: make `fork()` inherit sockets, and go multi-process
+## CURRENT FRONT (slice 21, 2026-07-20): cross-process Mojo never connects
+
+`--single-process` is **GONE**. Chrome runs a real multi-process tree: browser +
+gpu + network/utility children, ~14 processes alive at once, all healthy in
+`epoll_wait`/`futex`. Five kernel bugs were fixed to get here (commit `5b4e530`,
+detail below). **Children no longer die** — instead each one starts, waits, and
+self-terminates:
+
+```
+[INFO:content/child/child_thread_impl.cc:908]
+Terminating current process after 15 seconds with no connection.
+```
+
+**Verified working, do NOT re-chase:** the child inherits the Mojo socketpair at
+the RIGHT fd — `kMojoIPCChannel(2) + kBaseDescriptor(3) = fd 5`, confirmed
+`FILE_KIND_SOCKET` in the `[execve-fds]` dump — and every other descriptor lines
+up too (`kFieldTrialDescriptor(3)→fd 6`, `kPseudonymizationSalt(7)→fd 10`).
+SCM_RIGHTS works **cross-process** (`[scm] sendmsg passing 1 fd(s)` in one
+process, `recvmsg got 1 fd(s)` in another). So the plumbing is right and the
+failure is in the handshake TRAFFIC over that socket.
+
+**Next step:** instrument syscall ARGS (the ring logs names only). Log
+`sendmsg`/`recvmsg`/`read`/`write` fd + byte counts per pid, gated on
+`CHROMIUM_BOOT`, and answer: does the browser ever write the Mojo invitation to
+its end, and does the child ever read fd 5? That splits the problem in one run
+— browser-never-sends vs child-never-receives vs delivered-but-malformed.
+Suspect the AF_UNIX stream semantics under cross-process use (partial reads,
+`tail_off`, EOF-vs-EAGAIN) before suspecting chrome.
+
+## SUPERSEDED FRONT (kept for context): make `fork()` inherit sockets
 
 `--single-process` is a legacy mode chrome barely supports, and the page that must
 load first is a **WebUI** page (strict process requirements). That is the leading
@@ -162,6 +191,25 @@ for i in range(cnt):
   me twice.
 - fds 0/1/2 are all console → serial, so `--dump-dom`'s stdout **would** appear if
   produced.
+- **A "verified working" entry is only verified for the path that exercised it.**
+  `/proc/self/exe` was on this doc's do-not-re-chase list — true for the BROWSER
+  (spawned with a real path), false the moment a process `execve`s the symlink
+  itself. Same for the `.pak` lookup: both hang off `DIR_ASSETS`. Scope every
+  such claim to the code path that proved it.
+- **A failure message can name a cause it never checked.** The harness prints
+  `/opt/chrome/chrome-headless-shell not present -- SKIPPED` whenever
+  `proc_spawn` returns < 0, for ANY reason. It said "no binary" while the two
+  lines above showed the binary's ELF and interpreter loading fine. The real
+  cause was `.argc = 15` hardcoded next to a NULL-terminated `argv[]` I had
+  shortened to 14. **Re-count `.argc` whenever you touch that argv.**
+- **`fault_count`/`last_fault_rip` in the terminate line are CUMULATIVE page-fault
+  stats, not the cause of death.** The actual exception is printed separately
+  (`EXCEPTION 3: Breakpoint` = chrome's own CHECK; `EXCEPTION 14` = a real #PF).
+  Disassembling `last_fault_rip` for an int3 death is a dead end.
+- **Anything reading user memory inside exception handling must use
+  `copy_from_user_nofault`.** The normal accessors now RESOLVE faults (demand/COW),
+  which is re-entrant if you are already handling a fault — that turned the
+  crash diagnostic itself into a kernel panic.
 
 ---
 
@@ -190,6 +238,22 @@ mmap-coherent shared memory) · **SCM_RIGHTS** fd-passing over AF_UNIX ·
 `mojo/core/channel_linux.cc` FATAL; the Mojo shared-memory channel now negotiates
 end-to-end, SCM_RIGHTS verified live) · **AF_UNIX epoll/recvmsg EOF-vs-EAGAIN spin
 fix** · **/dev/null + /dev/zero** · **open(/proc/<pid>/exe) follows the symlink**.
+
+**Slice 21 (commit `5b4e530`)** — the five fixes that unlocked multi-process:
+`fork()` sourcing its fd table from `proc_fds()` (a thread's own `fds[]` is
+EMPTY by design, and chrome forks from a launcher THREAD — this, not the socket
+refusal, was why children had no descriptors) · socket refcount so fd
+inheritance shares the endpoint, with peer-EOF moved to the LAST reference ·
+`execve` resolving symlinks so `/proc/self/exe` and therefore `DIR_ASSETS` are
+real (fixed the ICU death) · `vfs_follow_link` + symlink-following
+`vfs_read_all` · demand grow-down user stack to 8 MiB (was 8 eager pages =
+32 KiB, no growth) · `uaccess_prepare_read` + `copy_from_user_nofault` (a bad
+pointer to any read-taking syscall could PANIC the kernel).
+
+Known gaps left open: `strncpy_from_user` probes only its first page; procfs
+`/proc/<pid>/fd/<n>` still reads `p->fds` directly (same thread-empty-table bug,
+diagnostic-only); and slice 21 has NOT been re-validated against the non-chrome
+boot/test harness, which the uaccess change touches globally.
 
 Known non-issues / secondary:
 - **Slice 19 was a MISDIAGNOSIS.** The "read-only page" is chrome's own
