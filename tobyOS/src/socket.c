@@ -15,6 +15,7 @@
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/heap.h>
+#include <tobyos/file.h>   /* file_close for SCM_RIGHTS-attached descriptions */
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/cpu.h>
@@ -79,6 +80,17 @@ struct sock *sock_alloc(int kind) {
     return 0;
 }
 
+/* Drop any SCM_RIGHTS descriptions still riding on a dgram (message dropped from
+ * a full ring, or socket closed before the peer recvmsg'd them). Each was
+ * file_clone'd by the sender, so it owns a reference that must be released. */
+static void dgram_release_fds(struct sock_dgram *d) {
+    if (!d) return;
+    for (int i = 0; i < d->nfds; i++) {
+        if (d->fds[i]) { file_close(d->fds[i]); d->fds[i] = 0; }
+    }
+    d->nfds = 0;
+}
+
 void sock_close(struct sock *s) {
     if (!s) return;
     s->in_use = false;
@@ -94,6 +106,7 @@ void sock_close(struct sock *s) {
             kfree(s->dgrams[i].payload);
             s->dgrams[i].payload = 0;
         }
+        dgram_release_fds(&s->dgrams[i]);   /* undelivered SCM_RIGHTS fds */
     }
     memset(s, 0, sizeof(*s));
 }
@@ -169,41 +182,78 @@ void sock_deliver(struct sock *s,
  * own. Purely in-memory -- no NIC, no CAP_NET. kbuf is a KERNEL buffer (sys_
  * read/write bounce user data first). Messages cap at 65535 (dgram len is a
  * uint16_t); Mojo's control frames are far smaller. No SCM_RIGHTS yet. */
-static void unix_enqueue(struct sock *s, const void *payload, size_t len) {
-    if (!s || !s->in_use) return;
+/* Enqueue one AF_UNIX message, optionally carrying SCM_RIGHTS descriptions.
+ * `files` (already file_clone'd by the caller) are handed to the message; on
+ * failure they are released here so the caller never has to unwind. */
+static void unix_enqueue_fds(struct sock *s, const void *payload, size_t len,
+                             struct file **files, int nfiles) {
+    if (!s || !s->in_use) {
+        for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
+        return;
+    }
     if (len > 65535) len = 65535;
+    if (nfiles > SOCK_SCM_MAX_FDS) nfiles = SOCK_SCM_MAX_FDS;
     if (s->count == SOCK_RX_DGRAMS) {            /* ring full: drop oldest */
         struct sock_dgram *old = &s->dgrams[s->tail];
         if (old->payload) { kfree(old->payload); old->payload = 0; }
+        dgram_release_fds(old);
         s->tail = (uint8_t)((s->tail + 1) % SOCK_RX_DGRAMS);
         s->count--; s->dropped++;
     }
     uint8_t *copy = (uint8_t *)kmalloc(len ? len : 1);
-    if (!copy) return;
+    if (!copy) {
+        for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
+        return;
+    }
     if (len) memcpy(copy, payload, len);
     struct sock_dgram *d = &s->dgrams[s->head];
     d->src_ip = 0; d->src_port = 0; d->len = (uint16_t)len; d->payload = copy;
+    d->nfds = 0;
+    for (int i = 0; i < nfiles; i++) d->fds[d->nfds++] = files[i];
     s->head = (uint8_t)((s->head + 1) % SOCK_RX_DGRAMS);
     s->count++;
     wq_wake_all(&s->wq_recv);
 }
 
+static void unix_enqueue(struct sock *s, const void *payload, size_t len) {
+    unix_enqueue_fds(s, payload, len, 0, 0);
+}
+
 static long xserver_handle(struct sock *self, const void *buf, size_t n);
 
-long sock_unix_send(struct sock *self, const void *kbuf, size_t n) {
-    if (!self || !self->in_use || self->kind != SOCK_KIND_UNIX) return -1;
-    if (self->x_server) return xserver_handle(self, kbuf, n);  /* fake X server */
-    if (self->peer_ip == 0) return -32;          /* -EPIPE: peer closed */
-    struct sock *peer = sock_by_fd((int)self->peer_ip - 1);
+long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
+                        struct file **files, int nfiles) {
+    if (!self || !self->in_use || self->kind != SOCK_KIND_UNIX) {
+        for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
+        return -1;
+    }
+    if (self->x_server) {                        /* fake X server: no fd passing */
+        for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
+        return xserver_handle(self, kbuf, n);
+    }
+    struct sock *peer = (self->peer_ip == 0) ? 0
+                      : sock_by_fd((int)self->peer_ip - 1);
     if (!peer || !peer->in_use || peer->kind != SOCK_KIND_UNIX) {
         self->peer_ip = 0;
+        for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
         return -32;                              /* -EPIPE */
     }
-    unix_enqueue(peer, kbuf, n);
+    unix_enqueue_fds(peer, kbuf, n, files, nfiles);
     return (long)n;
 }
 
+long sock_unix_send(struct sock *self, const void *kbuf, size_t n) {
+    return sock_unix_send_fds(self, kbuf, n, 0, 0);
+}
+
 long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms) {
+    return sock_unix_recv_fds(self, kbuf, n, timeout_ms, 0, 0, 0);
+}
+
+long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
+                        uint32_t timeout_ms,
+                        struct file **out_files, int max_out, int *out_n) {
+    if (out_n) *out_n = 0;
     if (!self || !self->in_use || self->kind != SOCK_KIND_UNIX) return -1;
     if (!kbuf && n) return -1;
 
@@ -234,6 +284,20 @@ long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms
      * prefix then the length*4 body in two reads). For a message-boundary
      * (SEQPACKET) reader whose buffer >= the message, tail_off goes 0->len in
      * one call, so behaviour is unchanged (Mojo reads whole messages). */
+    /* SCM_RIGHTS: hand the message's descriptions over on the FIRST read that
+     * touches it (tail_off == 0), matching Linux where ancillary data arrives
+     * with the first byte of its message. A reader with no control buffer
+     * (plain read(), or out_files == NULL) DISCARDS them, as Linux does. */
+    if (self->tail_off == 0 && d->nfds) {
+        int give = 0;
+        for (int i = 0; i < d->nfds; i++) {
+            if (out_files && give < max_out) out_files[give++] = d->fds[i];
+            else if (d->fds[i])             file_close(d->fds[i]);
+            d->fds[i] = 0;
+        }
+        d->nfds = 0;
+        if (out_n) *out_n = give;
+    }
     size_t avail = (size_t)(d->len - self->tail_off);
     size_t copy  = avail < n ? avail : n;
     if (copy && d->payload) memcpy(kbuf, d->payload + self->tail_off, copy);
