@@ -96,6 +96,13 @@ enum file_kind {
      * refcount. read/write/lseek/ftruncate/fstat/mmap all route to it; every
      * mmap maps the SAME physical pages (real sharing). See mmap.c + file.c. */
     FILE_KIND_MEMFD      = 15,
+    /* The classic bit-bucket devices. /dev/null reads EOF and swallows writes;
+     * /dev/zero reads endless zeroes and swallows writes. Both are always
+     * poll-ready. Chromium's base::LaunchProcess opens /dev/null to remap a
+     * child's stdio before execve -- without it every renderer/GPU/network
+     * child died with _exit(127) -- and virtually every Unix program uses it. */
+    FILE_KIND_DEVNULL    = 16,
+    FILE_KIND_DEVZERO    = 17,
 };
 
 struct eventfd;

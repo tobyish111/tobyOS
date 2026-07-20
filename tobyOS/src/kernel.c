@@ -7247,6 +7247,14 @@ void _start(void) {
             (char *)"chrome-headless-shell",
             (char *)"--no-sandbox",
             (char *)"--no-zygote",
+            /* Kept --single-process for now: multi-process is the model chrome
+             * really uses, and dropping this flag DID make chrome spawn real
+             * children -- but they all _exit(127) because fork() cannot hand a
+             * socket to the child (file_clone refuses FILE_KIND_SOCKET), so the
+             * launcher's dup2 of the inherited Mojo socketpair fd fails and the
+             * GPU process never starts ("GPU process isn't usable. Goodbye.").
+             * Re-drop this flag once fork inherits sockets (needs a refcount on
+             * struct sock). See docs/chromium-bringup-m1.md slice 20. */
             (char *)"--single-process",
             /* M1 render slice 12: route ANGLE's Vulkan backend through the REAL
              * Khronos loader (libvulkan.so.1) instead of dlopen'ing SwiftShader's

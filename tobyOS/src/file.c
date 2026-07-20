@@ -298,6 +298,11 @@ long file_read(struct file *f, void *buf, size_t n) {
         if (r > 0) f->vfs.pos += (size_t)r;
         return r;
     }
+    case FILE_KIND_DEVNULL:
+        return 0;                                  /* always EOF */
+    case FILE_KIND_DEVZERO:
+        memset(buf, 0, n);
+        return (long)n;                            /* endless zeroes */
     case FILE_KIND_PIPE_R:
         return pipe_read(f->pipe, buf, n);
     case FILE_KIND_VFS:
@@ -355,6 +360,9 @@ long file_write(struct file *f, const void *buf, size_t n) {
         if (w > 0) f->vfs.pos += (size_t)w;
         return w;
     }
+    case FILE_KIND_DEVNULL:
+    case FILE_KIND_DEVZERO:
+        return (long)n;                            /* swallow everything */
     case FILE_KIND_PIPE_W:
         return pipe_write(f->pipe, buf, n);
     case FILE_KIND_VFS:
