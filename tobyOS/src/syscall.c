@@ -4491,7 +4491,7 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
                                         lx_mmap_flags(lflags), aoff);
 #ifdef CHROMIUM_BOOT
                 {   static int c = 0;
-                    if (c < 16) { c++;
+                    if (c < 200) { c++;
                         struct proc *me = current_proc();
                         kprintf("[shm] MAP_SHARED pid=%d ino=%lu off=%lu np=%lu "
                                 "%s -> 0x%lx\n",
