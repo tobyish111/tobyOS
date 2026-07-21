@@ -129,6 +129,25 @@ void signal_send(struct proc *p, int sig) {
     if (p->pid == 0) return;
     if (p->state == PROC_UNUSED || p->state == PROC_TERMINATED) return;
 
+#ifdef CHROMIUM_BOOT
+    /* [sig] Who kills whom. signal_send is the ONLY way a signal becomes
+     * pending, so every fatal signal passes here. chrome's GPU process dies of
+     * an untraced SIGKILL mid-Mojo-conversation and the sender is unknown --
+     * a kill()/tgkill() from another process stamps that process, while a
+     * kernel-internal kill shows sender == target (or the interrupted proc). */
+    if (sig == SIGKILL || sig == SIGTERM || sig == SIGABRT || sig == SIGSEGV) {
+        static int sc = 0;
+        if (sc < 120) {
+            sc++;
+            struct proc *snd = current_proc();
+            kprintf("[sig] sig=%d -> pid=%d '%s' FROM pid=%d '%s'%s\n",
+                    sig, p->pid, p->name ? p->name : "?",
+                    snd ? snd->pid : -1, (snd && snd->name) ? snd->name : "?",
+                    (snd == p) ? " (SELF/kernel)" : "");
+        }
+    }
+#endif
+
     /* Job control (POSIX): SIGCONT resumes a stopped proc even when SIGCONT
      * itself is ignored or blocked -- the resume happens at SEND time, not
      * delivery. Generating SIGCONT also discards pending stop signals, and

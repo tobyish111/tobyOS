@@ -82,13 +82,36 @@ After the fix: every -88 gone, and the channel round-trips —
 11 -> 234. `with no connection` is 0 *by mechanism* (a conversing child cannot
 time out), not merely absent.
 
-**NEW FRONT: the GPU process is SIGKILLed at ~13.6 s**
-(`gpu_process_host.cc:1035 GPU process exited unexpectedly: exit_code=35072`,
-i.e. 137<<8 = SIGKILL). pid 18 was a healthy Mojo child mid-conversation when it
-died. **No `kill`/`tgkill` syscall was traced, so the sender is unidentified** —
-find it first (instrument signal_send / the kill syscalls with the SENDER pid).
-The guest now powers off on its own at ~13.6 s because of this, which is also
-why runs no longer reach 15 s. STILL NO DOM.
+**The GPU-process SIGKILL is NOT a tobyOS bug — chrome does it to itself.**
+Identified with the `[sig]` instrument (signal_send is the only way a signal
+becomes pending, so every fatal signal passes through it):
+
+```
+[sig] sig=9 -> pid=16 'chrome-headless-shell' FROM pid=2 'chrome'
+```
+
+pid 2 is the BROWSER. `GpuProcessHost` decides the GPU child is hung and kills
+it, then respawns — the tail shows `reaped pid=16` immediately followed by
+`fork parent pid=15 -> child pid=16`, i.e. a **respawn loop**. Under TCG the
+guest runs at ~3-4% real-time, so SwiftShader init cannot meet chrome's timeout.
+This is chrome's designed recovery path (it logs WARNING "has crashed 1 time(s)"
+and continues), so treat it as an emulation-speed artifact, NOT a correctness
+bug to chase. Note the harness DOES pass `--disable-gpu` +
+`--disable-gpu-compositing` (kernel.c:7286) and chrome spawns a GPU process
+anyway; the swiftshader flags visible in `[execve-argv]` belong to a UTILITY
+child, not the browser. Don't misread those as the browser's flags.
+
+Throughout the respawn loop the Mojo channel stays healthy: 230 `[chan]` ops,
+zero -88, zero "no connection". So the transport is fine and the GPU churn is
+not blocking IPC.
+
+**THE FRONT IS NOW EXACTLY WHAT THIS DOC PREDICTED IT WOULD BE.** Blockers A and
+B have both fallen and there is STILL NO DOM. Per the scope-honesty section, that
+is the strong signal: the renderer's failure to complete a document load was
+never about the process model. Attack "renderer completes a document load"
+directly — Blink loader/parser — using the profiler and wait-graph, and re-run
+the `--timeout=5000` probe (if neither the DOM nor "Page load timed out." appears,
+`executeCommands()` still never runs).
 
 Caution on run length changed meaning: chrome now does so much more work that
 emulation runs at ~4% real-time, so guest time advances slowly. Do not read a
