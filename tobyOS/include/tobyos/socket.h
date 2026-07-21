@@ -79,6 +79,13 @@ struct tcp_conn;
 
 struct sock {
     bool            in_use;
+    int             refs;              /* open fds referencing this endpoint.
+                                        * sock_alloc mints 1; file_clone (dup/
+                                        * dup2/fork inheritance) bumps it; each
+                                        * sock_close drops one and only the last
+                                        * tears the endpoint down. `in_use` stays
+                                        * a pure liveness flag -- the pool scans
+                                        * (bind/poll/deliver) test THAT, not this. */
     int             kind;
     uint16_t        local_port;        /* network byte order; 0 = unbound */
 
@@ -128,6 +135,10 @@ void sock_close(struct sock *s);
 long sock_unix_send(struct sock *self, const void *kbuf, size_t n);
 long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms);
 void sock_unix_peer_close(struct sock *self);
+
+/* Take an extra reference on an endpoint (fd inheritance via file_clone).
+ * Balanced by sock_close(), which only tears down at the last reference. */
+void sock_ref(struct sock *s);
 
 /* SCM_RIGHTS fd passing (Track B, slice 20). sendmsg hands over `nfiles` ALREADY
  * file_clone'd descriptions, which ride with the message; recvmsg returns the ones

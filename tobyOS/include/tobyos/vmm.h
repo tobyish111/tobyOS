@@ -41,6 +41,10 @@ struct limine_memmap_response;
  * holes (e.g. 12 GiB at 0xfd00000000) that would waste PD pages. */
 void vmm_init(struct limine_memmap_response *memmap);
 
+/* How many times map_4k overwrote an already-present PTE. Remapping is legal,
+ * so this is a diagnostic counter (the per-event warning is rate-limited). */
+unsigned long vmm_remap_count(void);
+
 /* Convenience wrapper that runs vmm_init and exercises the API. Mirrors
  * pmm_init_and_test / heap_init_and_test in style. */
 void vmm_init_and_test(struct limine_memmap_response *memmap);

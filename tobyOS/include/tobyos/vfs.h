@@ -81,6 +81,13 @@ enum vfs_type {
 
 struct vfs_stat {
     enum vfs_type type;
+    /* Hard-link count. 0 = "unset", so stat emitters substitute the usual
+     * default (1 for files, 2 for directories). Only filesystems with a real
+     * answer set it -- procfs reports 2 + one-per-thread for /proc/<pid>/task/,
+     * because chrome's sandbox asserts mono-threadedness by stat'ing that
+     * directory and testing st_nlink == 3 (".", "..", one thread). See
+     * sandbox/linux/services/thread_helpers.cc:41. */
+    uint32_t      nlink;
     size_t        size;        /* 0 for directories */
     /* Owner identity + permission bits (milestone 15). mode == 0 (no
      * VFS_MODE_VALID bit) means "this fs/inode has no permission
@@ -168,6 +175,16 @@ struct vfs_file {
      * (tobyfs) set this; ramfs et al. leave 0 and keep the node-pointer hash
      * (which is already stable per file there, so ld.so dedup is unaffected). */
     uint64_t              ino;
+    /* Slice 23: which INCARNATION of `ino` this handle refers to. An inode
+     * NUMBER is only an identity while the file is linked -- tobyfs reissues
+     * the lowest free number immediately, so a number alone cannot tell two
+     * successive files apart. The fs driver bumps a per-number counter in
+     * alloc_inode and stamps it here at open, making (ino, ino_gen) a durable
+     * identity for the file's lifetime. MAP_SHARED keys its page cache on the
+     * pair: two opens of the same live file share (chrome opens each shm region
+     * O_RDWR then O_RDONLY), while a later file that inherits the number does
+     * NOT. 0 = fs without inode identity (ramfs et al.). */
+    uint64_t              ino_gen;
     /* Milestone 34E: set by vfs_open if the path matched a sysprot
      * protected prefix. vfs_write consults it so a sandboxed proc
      * can't write through a read-opened handle to a protected file
@@ -259,6 +276,12 @@ int  vfs_write_all(const char *path, const void *buf, size_t n);
 int  vfs_symlink (const char *path, const char *target);
 int  vfs_readlink(const char *path, char *buf, size_t bufsz);
 int  vfs_resolve_path(const char *path, char *resolved, size_t resolved_sz);
+
+/* Resolve `path` through any SYMLINKS (including dynamically-synthesised ones
+ * like procfs's /proc/self/exe, which vfs_resolve_path's static table cannot
+ * see) and write the final target to `out`. Bounded hop count. Returns VFS_OK,
+ * or the stat/readlink error. A non-symlink path is copied through unchanged. */
+int  vfs_follow_link(const char *path, char *out, size_t outsz);
 
 /* Pretty name for an error code (for diagnostics). */
 const char *vfs_strerror(int err);

@@ -31,6 +31,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/pit.h>
 #include <tobyos/slog.h>     /* M28E: emit fscheck verdicts via slog */
+#include <tobyos/mmap.h>     /* slice 23: shm_cache_detach_ino on inode reuse */
 
 _Static_assert(sizeof(struct tfs_inode_disk)  == TFS_INODE_SIZE,  "tobyfs inode size");
 _Static_assert(sizeof(struct tfs_dirent_disk) == TFS_DIRENT_SIZE, "tobyfs dirent size");
@@ -56,6 +57,11 @@ struct tobyfs {
     uint32_t               ibitmap_blk;      /* on-disk start block */
     uint32_t               dbitmap_blk;
     uint32_t               usable_blocks;    /* journal_start or total_blocks */
+    /* Bumped by alloc_inode each time a number is issued; stamped into
+     * vfs_file.ino_gen at open so (ino, ino_gen) identifies a FILE rather than
+     * a reusable number. In-memory, per-mount. NULL = alloc failed, in which
+     * case gen stays 0 and shared mappings fall back to fd-only identity. */
+    uint32_t              *ino_gen;
 
     /* Write-ahead journal state.  journal_start == 0 means the
      * image was formatted without a journal (pre-journal disk). */
@@ -353,6 +359,14 @@ static int alloc_inode(struct tobyfs *fs, uint32_t *out_ino) {
             int rc = flush_bitmap_bit(fs, fs->ibitmap, fs->ibitmap_blk, i);
             if (rc != 0) { bit_clear(fs->ibitmap, i); return VFS_ERR_IO; }
             *out_ino = i;
+            /* New incarnation of this number: anything still keyed on the
+             * previous one (a live shared mapping) must not match it. */
+            if (fs->ino_gen) fs->ino_gen[i]++;
+#ifdef CHROMIUM_BOOT
+            {   static int c = 0;
+                if (c < 120) { c++; kprintf("[ino] alloc ino=%u gen=%u\n",
+                                            i, fs->ino_gen ? fs->ino_gen[i] : 0); } }
+#endif
             return VFS_OK;
         }
     }
@@ -361,6 +375,13 @@ static int alloc_inode(struct tobyfs *fs, uint32_t *out_ino) {
 
 static int free_inode(struct tobyfs *fs, uint32_t ino) {
     if (ino == 0 || ino >= fs->sb.inode_count) return VFS_ERR_INVAL;
+#ifdef CHROMIUM_BOOT
+    {   static int c = 0;
+        if (c < 120) { c++; kprintf("[ino] free  ino=%u\n", ino); } }
+#endif
+    /* No shared-mapping bookkeeping needed here: the number is about to become
+     * reusable, but alloc_inode bumps its incarnation counter, so the next file
+     * to receive it keys a DIFFERENT shared region than this one's mappers. */
     bit_clear(fs->ibitmap, ino);
     return flush_bitmap_bit(fs, fs->ibitmap, fs->ibitmap_blk, ino)
            == 0 ? VFS_OK : VFS_ERR_IO;
@@ -657,6 +678,10 @@ static int tobyfs_open(void *mnt, const char *path, struct vfs_file *out) {
     out->mode = node.mode;
     out->ino  = ino;    /* stable per-file inode: two opens of the same path
                          * report the same st_ino (chrome shm inode-match check) */
+    /* Both of those opens land on the same incarnation, so they share a
+     * MAP_SHARED region; a later file that inherits the number does not. */
+    out->ino_gen = (fs->ino_gen && ino < fs->sb.inode_count)
+                       ? (uint64_t)fs->ino_gen[ino] : 0;
     return VFS_OK;
 }
 
@@ -1338,6 +1363,12 @@ int tobyfs_mount(const char *mount_point, struct blk_dev *dev) {
     /* Allocate the cached bitmaps (multi-block for large volumes). */
     fs->ibitmap = kmalloc((size_t)fs->ibitmap_blocks * TFS_BLOCK_SIZE);
     fs->dbitmap = kmalloc((size_t)fs->dbitmap_blocks * TFS_BLOCK_SIZE);
+    /* Per-inode-number incarnation counters (see vfs_file.ino_gen). In-memory
+     * only: they exist to tell successive users of a recycled number apart
+     * within one boot, which is exactly the window a shared mapping lives in. */
+    fs->ino_gen = (uint32_t *)kmalloc((size_t)fs->sb.inode_count * sizeof(uint32_t));
+    if (fs->ino_gen)
+        memset(fs->ino_gen, 0, (size_t)fs->sb.inode_count * sizeof(uint32_t));
     if (!fs->ibitmap || !fs->dbitmap) {
         kprintf("[tobyfs] bitmap alloc failed (ibm=%u dbm=%u blocks)\n",
                 fs->ibitmap_blocks, fs->dbitmap_blocks);
@@ -1365,7 +1396,7 @@ int tobyfs_mount(const char *mount_point, struct blk_dev *dev) {
                            fs->dbitmap + (size_t)s * TFS_BLOCK_SIZE);
     if (berr) {
         kprintf("[tobyfs] bitmap read failed\n");
-        kfree(fs->ibitmap); kfree(fs->dbitmap); kfree(fs);
+        kfree(fs->ibitmap); kfree(fs->dbitmap); if (fs->ino_gen) kfree(fs->ino_gen); kfree(fs);
         return VFS_ERR_IO;
     }
 
@@ -1396,7 +1427,7 @@ int tobyfs_mount(const char *mount_point, struct blk_dev *dev) {
                            mount_point,
                            chk.detail[0] ? chk.detail : "fscheck fatal");
             }
-            kfree(fs->ibitmap); kfree(fs->dbitmap); kfree(fs);
+            kfree(fs->ibitmap); kfree(fs->dbitmap); if (fs->ino_gen) kfree(fs->ino_gen); kfree(fs);
             return VFS_ERR_INVAL;
         }
         if (crc == 0 && chk.severity == TFS_CHECK_WARN) {
@@ -1433,7 +1464,7 @@ int tobyfs_mount(const char *mount_point, struct blk_dev *dev) {
     int rc = vfs_mount(mount_point, &tobyfs_ops, fs);
     if (rc != VFS_OK) {
         kprintf("[tobyfs] vfs_mount('%s') failed: %d\n", mount_point, rc);
-        kfree(fs->ibitmap); kfree(fs->dbitmap); kfree(fs);
+        kfree(fs->ibitmap); kfree(fs->dbitmap); if (fs->ino_gen) kfree(fs->ino_gen); kfree(fs);
         return rc;
     }
 

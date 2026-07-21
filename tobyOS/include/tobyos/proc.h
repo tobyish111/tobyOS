@@ -477,8 +477,25 @@ __attribute__((noreturn)) void proc_exit(int code);
  * tries to wait on itself. */
 int proc_wait(int pid);
 
+/* User stack geometry. The stack always TOPS OUT at the end of the user half
+ * (both the ELF and PE execve arms anchor there) and grows DOWN on demand; the
+ * fault handler expands it a page at a time (page_fault.c) as far as
+ * USER_STACK_FLOOR_VA, which mirrors Linux's 8 MiB default RLIMIT_STACK.
+ * execve maps only a few pages eagerly -- everything below is demand-grown, so
+ * a process that never recurses deeply never pays for 8 MiB. */
+#define USER_STACK_TOP_LIMIT_VA  0x0000800000000000ULL
+#define USER_STACK_MAX_BYTES     (8ULL * 1024ULL * 1024ULL)
+#define USER_STACK_FLOOR_VA      (USER_STACK_TOP_LIMIT_VA - USER_STACK_MAX_BYTES)
+
 /* Look up a PCB by PID. Returns NULL if not found or slot is UNUSED. */
 struct proc *proc_lookup(int pid);
+
+/* The fd table that `p` actually USES. For a CLONE_FILES thread this is the
+ * thread-group leader's table, because a thread's own fds[] is deliberately left
+ * empty (see sys_clone_thread). Anything that reads a process's descriptors must
+ * go through here rather than touching p->fds directly -- reading p->fds on a
+ * thread silently yields an EMPTY table. Defined in syscall.c. */
+struct file **proc_fds(struct proc *p);
 
 /* Find a child of `ppid` (for Linux wait4(-1)); prefers a TERMINATED child.
  * Returns the child pid, or -1 if there are no children. */

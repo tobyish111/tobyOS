@@ -544,13 +544,48 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
 
 /* -------- helpers -------- */
 
+int vfs_follow_link(const char *path, char *out, size_t outsz) {
+    if (!path || !out || outsz == 0) return VFS_ERR_INVAL;
+
+    char scratch[2][VFS_PATH_MAX];
+    const char *cur = path;
+
+    for (int depth = 0; ; depth++) {
+        struct vfs_stat st;
+        int rc = vfs_stat(cur, &st);
+        if (rc != VFS_OK) return rc;
+        if (st.type != VFS_TYPE_SYMLINK) break;
+        if (depth >= 8) return VFS_ERR_INVAL;       /* symlink loop / too deep */
+        char *next = scratch[depth & 1];            /* never readlink into `cur` */
+        rc = vfs_readlink(cur, next, VFS_PATH_MAX);
+        if (rc != VFS_OK) return rc;
+        cur = next;
+    }
+
+    size_t n = strlen(cur);
+    if (n >= outsz) return VFS_ERR_NAMETOOLONG;
+    memcpy(out, cur, n + 1);
+    return VFS_OK;
+}
+
 int vfs_read_all(const char *path, void **out_buf, size_t *out_size) {
     if (out_buf)  *out_buf  = 0;
     if (out_size) *out_size = 0;
     if (!path || !out_buf || !out_size) return VFS_ERR_INVAL;
 
+    /* Follow symlinks. POSIX read/exec paths are symlink-transparent (only
+     * O_NOFOLLOW/lstat see the link itself), but this helper used to reject
+     * anything that wasn't VFS_TYPE_FILE outright. That broke execve of
+     * /proc/self/exe -- which procfs correctly reports as a SYMLINK -- with
+     * VFS_ERR_ISDIR (-3). Chrome re-execs itself that way to spawn every typed
+     * child process (gpu, renderer, utility), so all of them died _exit(127). */
+    char realpath_buf[VFS_PATH_MAX];
+    int rc = vfs_follow_link(path, realpath_buf, sizeof(realpath_buf));
+    if (rc != VFS_OK) return rc;
+    path = realpath_buf;
+
     struct vfs_stat st;
-    int rc = vfs_stat(path, &st);
+    rc = vfs_stat(path, &st);
     if (rc != VFS_OK) return rc;
     if (st.type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
 

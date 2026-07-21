@@ -250,10 +250,20 @@ long sys_fork(void) {
     }
     mmap_cow_clone(parent->pid, child_pid);
 
-    /* Clone file descriptors. */
+    /* Clone file descriptors from the table the parent actually USES.
+     *
+     * This MUST go through proc_fds(): if the parent is a CLONE_FILES thread its
+     * own fds[] is deliberately empty (the real table belongs to the
+     * thread-group leader -- see sys_clone_thread), so reading parent->fds
+     * directly hands the child an ENTIRELY EMPTY fd table. That is not a corner
+     * case: chrome launches its child processes from a dedicated launcher
+     * THREAD, so every forked child came out with no descriptors at all and
+     * died on the first dup2 of its Mojo socket with _exit(127) ("GPU process
+     * isn't usable. Goodbye."). POSIX fork() inherits the whole table. */
+    struct file **ptab = proc_fds(parent);
     for (int i = 0; i < PROC_NFDS; i++) {
-        if (parent->fds[i]) {
-            child->fds[i] = file_clone(parent->fds[i]);
+        if (ptab && ptab[i]) {
+            child->fds[i] = file_clone(ptab[i]);
         } else {
             child->fds[i] = NULL;
         }
@@ -565,6 +575,28 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     if (plen < 0) return -ABI_EFAULT;
     if (plen == 0) return -ABI_EINVAL;
 
+    /* Resolve symlinks NOW, so everything downstream -- the ELF read, p->name
+     * and above all p->exe_path -- refers to the REAL binary. Linux execve does
+     * this: after exec'ing a symlink, /proc/self/exe names the target, not the
+     * link. Chrome depends on it twice over: it re-execs /proc/self/exe for
+     * every child process, and it derives DIR_ASSETS (where icudtl.dat, the
+     * .pak files and the v8 snapshot live) from readlink("/proc/self/exe").
+     * Recording the literal "/proc/self/exe" made that self-referential, so
+     * DIR_ASSETS became "/proc/self", every child failed to find icudtl.dat,
+     * and each one died on `Invalid file descriptor to ICU data received.`
+     * Best-effort: if the path isn't a symlink this is a straight copy, and on
+     * any resolve error we keep the original and let the ELF read report it. */
+    {
+        char realpath_buf[VFS_PATH_MAX];
+        if (vfs_follow_link(kpath, realpath_buf, sizeof(realpath_buf)) == VFS_OK) {
+            size_t rn = strlen(realpath_buf);
+            if (rn > 0 && rn < sizeof(kpath)) {
+                memcpy(kpath, realpath_buf, rn + 1);
+                plen = (long)rn;
+            }
+        }
+    }
+
     /* Copy argv into kernel buffers. Each user pointer-array slot and
      * each string is read through an accessor; a bad slot just ends the
      * vector (matching the old tolerant behaviour). */
@@ -584,6 +616,26 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
             kargc++;
         }
     }
+
+#ifdef CHROMIUM_BOOT
+    /* Slice 21 instrument: chrome re-execs /proc/self/exe for every typed child
+     * process and hands it inherited fds (ICU data, Mojo channel) via dup2 into
+     * fixed slots, naming them on the command line. Print BOTH the argv and the
+     * fd table the child actually has at exec time -- the pair tells you at a
+     * glance whether an fd chrome expects is simply absent. Behaviour-neutral. */
+    {
+        kprintf("[execve-argv] pid=%d argc=%d:", p->pid, kargc);
+        for (int i = 0; i < kargc; i++) kprintf(" %s", kargv_buf[i]);
+        kprintf("\n");
+        struct file **tab = proc_fds(p);
+        kprintf("[execve-fds] pid=%d open:", p->pid);
+        if (tab) {
+            for (int i = 0; i < PROC_NFDS; i++)
+                if (tab[i]) kprintf(" %d(k%d)", i, (int)tab[i]->kind);
+        }
+        kprintf("\n");
+    }
+#endif
 
     /* Copy envp into kernel buffers. */
     int kenvc = 0;

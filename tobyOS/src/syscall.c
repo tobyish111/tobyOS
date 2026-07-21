@@ -1560,6 +1560,37 @@ static int resolve_user_path(const char *user_path, char *out, size_t cap) {
     return path_lexical_clean(full, out, cap);
 }
 
+/* Resolve a (dirfd, user path) pair the way the *at() syscalls require: a
+ * RELATIVE path resolves against DIRFD, not the cwd. Absolute paths, AT_FDCWD,
+ * and a dirfd that is not an open directory all fall back to resolve_user_path
+ * (cwd-relative), i.e. the long-standing behaviour.
+ *
+ * Chrome sandbox depends on this in two places: it opens /proc as a dirfd and
+ * then reaches through it for "self/task/" (thread_helpers.cc:41) and
+ * "self/fd/" (proc_util.cc:79). Both were fatal PCHECKs while we resolved
+ * against the cwd. NOTE: resolve_user_path() prepends the cwd, so the
+ * relativity test MUST be made on the RAW user string, before that happens. */
+static int resolve_user_path_at(int dirfd, const char *upath,
+                                char *out, size_t cap) {
+    char rawp[ABI_PATH_MAX];
+    long rl = strncpy_from_user(rawp, upath, sizeof rawp);
+    if (rl < 0) return -ABI_EFAULT;
+    if (rl > 0 && rawp[0] != '/' && dirfd >= 0) {
+        struct file *df = fd_lookup(dirfd);
+        if (df && df->kind == FILE_KIND_DIR && df->dirpath) {
+            char joined[ABI_PATH_MAX];
+            size_t dl = strlen(df->dirpath);
+            if (dl + 1 + (size_t)rl < sizeof(joined)) {
+                memcpy(joined, df->dirpath, dl);
+                if (dl && joined[dl - 1] != '/') joined[dl++] = '/';
+                memcpy(joined + dl, rawp, (size_t)rl + 1);
+                return path_lexical_clean(joined, out, cap);
+            }
+        }
+    }
+    return resolve_user_path(upath, out, cap);
+}
+
 /* ---- Track B graphics: the Linux framebuffer device /dev/fb0 -----------
  *
  * A genuine Linux fbdev: open("/dev/fb0") -> FILE_KIND_FB; FBIOGET_VSCREENINFO
@@ -4292,7 +4323,10 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
     st.st_mode    = typ | perm;
     st.st_dev     = 1;
     st.st_ino     = ino ? ino : 1;
-    st.st_nlink   = 1;
+    /* 0 = unset -> the usual default (dirs 2, files 1). procfs sets a real
+     * count for /proc/<pid>/task/, which chrome's sandbox tests. */
+    st.st_nlink   = vs->nlink ? vs->nlink
+                              : (vs->type == VFS_TYPE_DIR ? 2u : 1u);
     st.st_uid     = vs->uid;
     st.st_gid     = vs->gid;
     st.st_size    = (int64_t)vs->size;
@@ -4322,7 +4356,8 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
     if (perm == 0) perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
     sx.mask      = 0x000007ffu;              /* STATX_BASIC_STATS */
     sx.blksize   = 512;
-    sx.nlink     = 1;
+    sx.nlink     = vs->nlink ? vs->nlink
+                              : (vs->type == VFS_TYPE_DIR ? 2u : 1u);
     sx.uid       = vs->uid;
     sx.gid       = vs->gid;
     sx.mode      = (uint16_t)(typ | perm);
@@ -4411,6 +4446,85 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
     if (len == 0) return -ABI_EINVAL;
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_VFS) return -ABI_EBADF;
+
+    /* MAP_SHARED must actually SHARE. The copying path below gives every mapper
+     * a private copy, which silently breaks cross-process shared memory --
+     * chrome's Mojo bootstrap stalls on exactly this, because its
+     * PlatformSharedMemoryRegion is a temp FILE, so the browser wrote into its
+     * copy while the child waited on its own. Route MAP_SHARED through the
+     * per-inode page cache so all mappers get the SAME physical pages.
+     * Needs a stable inode (tobyfs supplies one; ino==0 means "no identity",
+     * where sharing cannot be established and copying is the honest fallback).
+     * Any failure falls through to the old path rather than failing the mmap. */
+    if (lflags & LXMAP_SHARED) {
+        bool created = false;
+        /* Identity order matters. A region already mapped through THIS open file
+         * (or an inherited/dup'd/SCM_RIGHTS copy of it) is found via the file
+         * itself -- the only identity that survives the unlink() chrome does
+         * immediately after creating a region. Otherwise fall back to
+         * (inode, incarnation), which lets two SEPARATE opens of the same live
+         * file share as POSIX requires -- chrome opens every shm region O_RDWR
+         * and then O_RDONLY by path, and passes the read-only fd to children --
+         * while a later file that merely inherits the recycled inode NUMBER
+         * keys a different region. */
+        struct shm_cache *sc = f->shm;
+        if (!sc) sc = shm_cache_for_ino(f->vfs.ino, f->vfs.ino_gen, &created);
+        /* No inode identity (ramfs et al.) -> fall through to the copying path,
+         * as before this slice. Routing those through an anonymous region would
+         * be more POSIX-correct in principle, but measured: every such mapping
+         * here is a per-process mapping of chrome's .pak/ICU payload -- up to
+         * 2656 pages EACH, CREATED by every process and attached by none. Cache
+         * entries are permanent (no reclaim yet), so that traded a per-process
+         * copy that is freed at teardown for one that is never freed. */
+        if (sc) {
+            f->shm = sc;                 /* pin for this fd and its clones */
+            uint64_t alen = (len + 0xfffULL) & ~0xfffULL;
+            uint64_t aoff = offset & ~0xfffULL;
+            size_t page_off = (size_t)(aoff / PAGE_SIZE);
+            size_t np       = (size_t)(alen / PAGE_SIZE);
+            /* Sample the high-water mark BEFORE growing, so we can populate
+             * exactly the pages this call newly allocated. Populating only on
+             * `created` was wrong: a later, LARGER mapping of the same file
+             * grows the cache, and those fresh pages would stay zero-filled
+             * even though the file has content there -- which is what chrome's
+             * persistent_memory_allocator reported as "Corruption detected in
+             * shared-memory segment". Pages that already existed are NEVER
+             * re-read: they are live shared memory by then and the on-disk
+             * bytes are stale, so re-reading would clobber the peer's writes. */
+            size_t before = shm_cache_npages(sc);
+            if (shm_cache_ensure(sc, page_off + np) == 0) {
+                size_t fill_from = before > page_off ? before : page_off;
+                size_t fill_to   = page_off + np;
+                if (fill_from < fill_to) {
+                    size_t save_pos = f->vfs.pos;
+                    f->vfs.pos = fill_from * PAGE_SIZE;
+                    for (size_t i = fill_from; i < fill_to; i++) {
+                        void *dst = shm_cache_page_ptr(sc, i);
+                        if (!dst) break;
+                        if (file_read(f, dst, PAGE_SIZE) <= 0) break; /* EOF: stays zero */
+                    }
+                    f->vfs.pos = save_pos;
+                }
+                long b = shm_cache_mmap(sc, addr, alen, prot,
+                                        lx_mmap_flags(lflags), aoff);
+#ifdef CHROMIUM_BOOT
+                {   static int c = 0;
+                    if (c < 200) { c++;
+                        struct proc *me = current_proc();
+                        kprintf("[shm] MAP_SHARED pid=%d ino=%lu/%lu off=%lu np=%lu "
+                                "%s -> 0x%lx\n",
+                                me ? me->pid : -1, (unsigned long)f->vfs.ino,
+                                (unsigned long)f->vfs.ino_gen,
+                                (unsigned long)page_off, (unsigned long)np,
+                                created ? "CREATED" : "attached",
+                                (unsigned long)b);
+                    } }
+#endif
+                if (b >= 0) return b;
+            }
+        }
+        /* fall through: table full / OOM / no base -- copy, as before */
+    }
 
     /* Reserve + map writable anon pages so we can fill them. */
     uint32_t tflags = lx_mmap_flags(lflags) | 0x01u /* VMA_FLAG_ANON */;
@@ -5377,6 +5491,23 @@ static void lx_scm_recv_emit(uint64_t umsg, const struct lx_msghdr *mh,
                              struct file **files, int nf) {
     uint64_t ctl_len = 0;
     int32_t  flags   = 0;
+#ifdef CHROMIUM_BOOT
+    /* Log WHAT arrived, not just how many. Mojo's invitation hands the child a
+     * channel; whether that is a socket -- and if so whether its peer still
+     * exists -- decides what the child can do next. Logged HERE, before the
+     * install/CTRUNC paths below may file_close() these pointers. */
+    if (nf > 0) { static int c=0; if(c<24){c++;
+        struct proc *me = current_proc();
+        kprintf("[scm] recvmsg pid=%d nf=%d:", me ? me->pid : -1, nf);
+        for (int i = 0; i < nf; i++) {
+            if (!files[i]) { kprintf(" <null>"); continue; }
+            kprintf(" kind=%d", (int)files[i]->kind);
+            if (files[i]->kind == FILE_KIND_SOCKET && files[i]->sock)
+                kprintf("(peer=%d)", files[i]->sock->peer_ip
+                                     ? (int)files[i]->sock->peer_ip - 1 : -1);
+        }
+        kprintf("\n"); } }
+#endif
     if (nf > 0) {
         uint64_t need = sizeof(struct lx_cmsghdr) + LX_CMSG_ALIGN(nf * 4);
         if (!mh->msg_control || mh->msg_controllen < need) {
@@ -5405,7 +5536,7 @@ static void lx_scm_recv_emit(uint64_t umsg, const struct lx_msghdr *mh,
         }
     }
 #ifdef CHROMIUM_BOOT
-    if (nf) { static int c=0; if(c<24){c++; kprintf("[scm] recvmsg got %d fd(s) ctl_len=%lu flags=0x%x\n", nf,(unsigned long)ctl_len,(unsigned)flags);} }
+    if (nf) { static int c=0; if(c<24){c++; kprintf("[scm] recvmsg emitted %d fd(s) ctl_len=%lu flags=0x%x\n", nf,(unsigned long)ctl_len,(unsigned)flags);} }
 #endif
     (void)copy_to_user((void *)(uintptr_t)(umsg + 40), &ctl_len, 8);
     (void)copy_to_user((void *)(uintptr_t)(umsg + 48), &flags, 4);
@@ -5746,10 +5877,18 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         return do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);
     }
     case LX_openat: {                  /* (dirfd, path, flags, mode) */
-        /* AT_FDCWD / absolute paths only (busybox uses these); a real
-         * dirfd-relative open is out of scope for B3. */
+        /* Resolves against DIRFD for relative paths (see
+         * resolve_user_path_at). chrome's sandbox does
+         * openat(proc_fd, "self/fd/", O_DIRECTORY|...) -- proc_util.cc:79 --
+         * and PCHECKs the result, which was fatal while we resolved against
+         * the cwd.
+         * LIMITATION: only the DIRECTORY arm below opens by resolved kernel
+         * path. A dirfd-relative open of a non-directory still falls through
+         * to SYS_OPEN with the raw user pointer, i.e. cwd-relative. Nothing
+         * exercised needs it; wire a by-kpath file open when something does. */
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a2, kpath, sizeof kpath) == 0) {
+        if (resolve_user_path_at((int)a1, (const char *)a2,
+                                 kpath, sizeof kpath) == 0) {
             struct vfs_stat vs;
             if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR)
                 return linux_open_dir(kpath);
@@ -5977,8 +6116,10 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
             if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
             return linux_emit_stat(&vs, lx_fd_ino(f, (int)a1), (void *)a3);
         }
+        /* Relative paths resolve against DIRFD -- chrome's sandbox stats
+         * "self/task/" through a /proc dirfd (thread_helpers.cc:41). */
         char kpath[ABI_PATH_MAX];
-        int rr = resolve_user_path(upath, kpath, sizeof kpath);
+        int rr = resolve_user_path_at((int)a1, upath, kpath, sizeof kpath);
         if (rr) return rr;
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
