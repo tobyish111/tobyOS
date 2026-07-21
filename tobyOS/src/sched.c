@@ -38,6 +38,7 @@
 #include <tobyos/tss.h>
 #include <tobyos/cpu.h>
 #include <tobyos/printk.h>
+#include <tobyos/serial.h>   /* serial_dropped -- log-loss accounting */
 #include <tobyos/gui.h>
 #include <tobyos/perf.h>
 #include <tobyos/percpu.h>
@@ -211,6 +212,10 @@ static inline int eff_prio(const struct proc *p, uint64_t now) {
 }
 
 static void queue_push_locked(struct percpu *cpu, struct proc *p) {
+    /* Defensive: never link a proc that is already queued. Doing so with
+     * p == cpu->ready_tail produced p->next_ready = p, a self-cycle that hung
+     * queue_pop_locked's walk (and therefore the entire system) forever. */
+    if (p->on_rq) return;
     p->next_ready = 0;
     p->enq_tick   = pit_ticks();       /* start the aging clock for this wait */
     if (cpu->ready_tail) {
@@ -219,6 +224,7 @@ static void queue_push_locked(struct percpu *cpu, struct proc *p) {
     } else {
         cpu->ready_head = cpu->ready_tail = p;
     }
+    p->on_rq = true;
 }
 
 static void queue_push_front_locked(struct percpu *cpu, struct proc *p) {
@@ -249,6 +255,7 @@ static struct proc *queue_pop_locked(struct percpu *cpu) {
     else           cpu->ready_head       = best->next_ready;
     if (cpu->ready_tail == best) cpu->ready_tail = best_prev;
     best->next_ready = 0;
+    best->on_rq      = false;
     return best;
 }
 
@@ -258,6 +265,7 @@ static bool queue_remove_locked(struct percpu *cpu, struct proc *p) {
         cpu->ready_head = p->next_ready;
         if (cpu->ready_tail == p) cpu->ready_tail = 0;
         p->next_ready = 0;
+        p->on_rq      = false;
         return true;
     }
 
@@ -270,6 +278,7 @@ static bool queue_remove_locked(struct percpu *cpu, struct proc *p) {
     prev->next_ready = p->next_ready;
     if (cpu->ready_tail == p) cpu->ready_tail = prev;
     p->next_ready = 0;
+    p->on_rq      = false;
     return true;
 }
 
@@ -294,6 +303,7 @@ static struct proc *queue_steal_locked(struct percpu *cpu) {
     else           cpu->ready_head       = best->next_ready;
     if (cpu->ready_tail == best) cpu->ready_tail = best_prev;
     best->next_ready = 0;
+    best->on_rq      = false;
     return best;
 }
 
@@ -396,13 +406,48 @@ static uint32_t enq_target_for(struct proc *p) {
     return 0;
 }
 
+/* Is `p` actually LINKED into some CPU's ready queue right now?
+ *
+ * Walks the lists rather than trusting a flag, so it can be used to audit the
+ * flag itself. Bounded so a corrupt (cyclic) list cannot hang the auditor --
+ * if we ever exceed PROC_MAX hops the list has a cycle, which is itself the
+ * answer. Returns the owning CPU index in *cpu_out, or -1. */
+int sched_debug_find_queued(struct proc *p, int *cpu_out, bool *cycle_out) {
+    if (cpu_out) *cpu_out = -1;
+    if (cycle_out) *cycle_out = false;
+    if (!p) return 0;
+    uint32_t n = smp_cpu_count();
+    if (n == 0) n = 1;
+    for (uint32_t c = 0; c < n; c++) {
+        struct percpu *cpu = smp_cpu_mut(c);
+        if (!cpu) continue;
+        uint64_t flags = spin_lock_irqsave(&cpu->ready_lock);
+        int hops = 0;
+        bool found = false, cyc = false;
+        for (struct proc *q = cpu->ready_head; q; q = q->next_ready) {
+            if (q == p) found = true;
+            if (++hops > PROC_MAX) { cyc = true; break; }
+        }
+        spin_unlock_irqrestore(&cpu->ready_lock, flags);
+        if (cyc) { if (cycle_out) *cycle_out = true; if (cpu_out) *cpu_out = (int)c; return 1; }
+        if (found) { if (cpu_out) *cpu_out = (int)c; return 1; }
+    }
+    return 0;
+}
+
 void sched_enqueue(struct proc *p) {
-    if (!p || p->next_ready) return;
+    if (!p) return;
     uint32_t target = enq_target_for(p);
     struct percpu *cpu = smp_cpu_mut(target);
     if (!cpu) cpu = smp_cpu_mut(0);             /* should never happen */
+    /* The "already queued?" test MUST be on on_rq and MUST be inside the lock.
+     * It used to be `p->next_ready != NULL` evaluated BEFORE taking the lock:
+     * wrong on both counts. The tail of the queue has next_ready == NULL, so
+     * re-enqueuing the current tail sailed past the guard and self-cycled it
+     * (ready_tail->next_ready = p with ready_tail == p), wedging the scheduler
+     * for every process; and testing outside the lock races another CPU. */
     uint64_t flags = spin_lock_irqsave(&cpu->ready_lock);
-    queue_push_locked(cpu, p);
+    queue_push_locked(cpu, p);                  /* no-ops if already on_rq */
     spin_unlock_irqrestore(&cpu->ready_lock, flags);
 }
 
@@ -652,8 +697,8 @@ void sched_tick(struct regs *r) {
             last_hb = now;
             extern struct proc g_proc[];
             uint64_t nt = pit_ticks();
-            kprintf("[hb %lu ms] chrome thread states (pit=%lu):\n",
-                    now / 1000000ull, nt);
+            kprintf("[hb %lu ms] chrome thread states (pit=%lu) logdrop=%lu:\n",
+                    now / 1000000ull, nt, (unsigned long)serial_dropped());
             for (int i = 0; i < PROC_MAX; i++) {
                 struct proc *p = &g_proc[i];
                 if (p->state == PROC_UNUSED || p->personality != 1) continue;
@@ -662,7 +707,9 @@ void sched_tick(struct regs *r) {
                         "onq=%d rsp=%p\n",
                         p->pid, proc_state_name(p->state), p->prio,
                         p->io_boost, p->enq_tick, waited, eff_prio(p, nt),
-                        p->next_ready ? 1 : 0, (void *)p->saved_rsp);
+                        /* was `next_ready ? 1 : 0` -- which reports 0 for the
+                         * queue TAIL, so this column used to lie. */
+                        p->on_rq ? 1 : 0, (void *)p->saved_rsp);
             }
             /* slice 20: chrome busy-churns (pid burning CPU) but never navigates.
              * Dump the recent-syscall ring so we can see WHAT the hot threads

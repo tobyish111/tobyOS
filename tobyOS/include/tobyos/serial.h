@@ -20,6 +20,10 @@ void serial_puts(const char *s);
  * the IRQ facade is up (post irq_switch_to_ioapic). Until then, and after
  * serial_set_sync_mode(), serial_putc() uses a bounded spin. */
 void serial_enable_tx_irq(void);
+/* Log bytes silently discarded because the TX ring was full. Non-zero means the
+ * serial log is INCOMPLETE -- in particular, "the log stops here" is then NOT
+ * evidence that the system stopped there. */
+uint64_t serial_dropped(void);
 
 /* Drain the TX ring into the UART FIFO without spinning. Pump from the
  * pid-0 idle loop so output flows even if the THRE IRQ never routes. */

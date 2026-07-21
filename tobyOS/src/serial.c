@@ -68,12 +68,26 @@ static bool s_serial_ready = false;
 /* TX ring. Power-of-two size so head/tail wrap with a mask. Guarded by
  * g_tx_lock (irqsave): serial_putc enqueues, the THRE IRQ + pump dequeue.
  * Sized so a burst of trace lines fits without dropping under normal use. */
-#define TXR_SIZE 8192u
+/* 8 KiB was too small once a workload keeps every CPU busy. The ring drains
+ * from the THRE IRQ and from a safety-net drain in pid 0's IDLE loop -- and
+ * chrome keeps ~20 threads runnable, so pid 0 effectively never idles. Output
+ * then outruns the drain, the ring fills, and bytes are dropped SILENTLY. That
+ * reads exactly like the machine froze: the log (heartbeat included) simply
+ * stops mid-line while the system is still running. It also explains why the
+ * apparent "hang" moved EARLIER as more tracing was added -- more bytes fill
+ * the ring sooner. */
+#define TXR_SIZE 262144u
 #define TXR_MASK (TXR_SIZE - 1u)
 static char              g_txr[TXR_SIZE];
 static volatile uint32_t g_txr_head;   /* producer */
 static volatile uint32_t g_txr_tail;   /* consumer */
+static volatile uint64_t g_txr_dropped;/* bytes lost to a full ring */
 static spinlock_t        g_tx_lock = SPINLOCK_INIT;
+
+/* How many log bytes have been silently discarded. Non-zero means the serial
+ * log is INCOMPLETE and any "it stopped here" conclusion drawn from it is
+ * unsafe. */
+uint64_t serial_dropped(void) { return g_txr_dropped; }
 
 /* false = bounded-spin sync mode (default, early boot, panic);
  * true  = async ring mode (after serial_enable_tx_irq). */
@@ -152,6 +166,7 @@ void serial_putc(char c) {
          * dropped byte only loses log fidelity, never correctness. */
         tx_drain_fifo_locked();
         if (txr_full()) {
+            g_txr_dropped++;      /* SILENT loss -- see serial_dropped() */
             spin_unlock_irqrestore(&g_tx_lock, flags);
             return;
         }

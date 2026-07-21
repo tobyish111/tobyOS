@@ -165,8 +165,22 @@ struct proc {
     /* Wait-for-child book-keeping. */
     int             wait_pid;       /* pid we're blocked on, or -1 */
 
-    /* Singly-linked ready-queue node (NULL when not on the queue). */
+    /* Singly-linked ready-queue node. NOTE: this is NOT a reliable "am I
+     * queued?" test -- the TAIL of the queue always has next_ready == NULL, so
+     * it is indistinguishable from an unqueued proc. Use on_rq for that. */
     struct proc    *next_ready;
+
+    /* True while this proc is linked into some CPU's ready queue. Maintained
+     * under that queue's ready_lock by queue_push/pop/remove_locked.
+     *
+     * sched_enqueue used to guard against double-enqueue with `next_ready !=
+     * NULL`, which silently fails for the tail: enqueuing the current tail
+     * again ran `cpu->ready_tail->next_ready = p` with ready_tail == p, i.e.
+     * p->next_ready = p -- a SELF-CYCLE. queue_pop_locked then walked the list
+     * forever and the whole system froze with no crash and no panic (the
+     * heartbeat simply stopped). Chrome's GPU-process respawn loop churns
+     * fork/reap fast enough to hit it reliably. */
+    bool            on_rq;
 
     /* Generic per-proc wait-queue link. A blocked proc lives on at most
      * ONE such queue (e.g. a pipe's wq_read). The queue owner walks the
