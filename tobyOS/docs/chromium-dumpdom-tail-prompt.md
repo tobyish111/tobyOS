@@ -47,10 +47,16 @@ crashes (exit -1):     0
 process exits:         all 0 (85 = the unrelated hello-boot harness task)
 KERNEL PANIC:          0
 [pmm] double free:     0
-"no connection":       1        <-- BLOCKER A
-"Corruption detected": 3        <-- BLOCKER B
+"no connection":       1-2      <-- BLOCKER A (count varies by RUN LENGTH, see below)
+"Corruption detected": 0        <-- BLOCKER B, CLOSED in slice 23
 DOM:                   0        <-- the goal
 ```
+
+**Read the run length before comparing counts.** `with no connection` is 1 or 2
+purely as a function of how long the run lasted: children invited at ~7.5 s hit
+their 15 s deadline only once the run passes ~22.5 s. Check the last kernel
+`[N ms]` timestamp (`grep -ao '^\[[0-9]* ms\]' LOG | tail -1`) before reading
+anything into a difference.
 
 ### BLOCKER A — Mojo: children get the invitation and never reply
 
@@ -82,8 +88,10 @@ connection` and exits 0.
   PLAIN SOCKET channel. (The handoff's earlier slices describe chrome taking
   the shared-memory path — that must have been a different flag combination.)
 - `fd_alloc_into` — already routes through `proc_fds()` correctly.
-- MAP_SHARED sharing itself — works, verified (one inode CREATED by one pid and
-  attached by several others, 36 mappings in a run).
+- MAP_SHARED sharing itself — **now genuinely verified** (slice 23). Note the
+  pre-slice-23 version of this bullet was WRONG in the way that matters: the
+  trace said "attached", but those attaches were *aliasing* onto recycled inode
+  numbers. It is correct now, and the stall did not move.
 
 **Note `kMojoIpcz` is `FEATURE_ENABLED_BY_DEFAULT`** on this build. ipcz is the
 newer transport and may expect more than the legacy node channel. That is an
@@ -102,23 +110,31 @@ unexplored lead.
 3. Read `mojo/core/node_channel.cc` / the ipcz driver for what the child is
    supposed to send back after `ACCEPT_INVITEE`, then look for that syscall.
 
-### BLOCKER B — "Corruption detected in shared-memory segment" ×3
+### BLOCKER B — CLOSED (slice 23, commit `30a2d21`). Do not re-chase.
 
-`base/metrics/persistent_memory_allocator.cc:890`. **Unexplained.** Non-fatal
-(chrome continues) but it is in the metrics allocator, which rides the shared
-memory I just implemented, and it may well be starving the field-trial
-handshake children need.
+Was: `Corruption detected in shared-memory segment` ×3
+(`persistent_memory_allocator.cc:890`). **Cause: the slice-22 shm page cache
+aliased unrelated regions onto one page set**, because it was keyed on the raw
+inode NUMBER — and a number is only an identity while the file is LINKED.
+tobyfs reissues the lowest free number on the very next create, and chrome
+creates every shared-memory region as a temp file it unlinks IMMEDIATELY.
+Measured: **inode 9 allocated 6× in one boot**, six processes "attaching" to it
+at four different sizes. Fixed by keying on **(inode, incarnation)** plus a
+`struct file`-pinned region that rides fork/dup/SCM_RIGHTS. Corruption is now 0
+and children verifiably attach to the exact incarnations the browser created.
+Full write-up: `docs/chromium-bringup-m1.md` slice 23.
 
-**Two hypotheses tried and DISPROVEN:**
-- *Stale/zero pages on cache growth.* I made population cover newly-allocated
-  pages on every mapping, not just creation. Corruption unchanged at 3.
-- *The page double-free.* Real and serious (fixed), but corruption stayed at 3
-  after it was gone. **Not the cause.**
+**What this rules out for Blocker A: shared memory itself.** It is now correct
+and verified cross-process, and the Mojo stall survived the fix completely
+unchanged. So the stall is NOT about the browser and child seeing different
+bytes. Attack the channel protocol, not the memory.
 
-**Next:** fetch `persistent_memory_allocator.cc` and read the exact predicate at
-line 890 — I never did this, and per the prime directive it should have been
-step one. It likely checks a header magic/version/size field, which would say
-precisely which bytes disagree.
+Two notes worth keeping from the hunt:
+- `SetCorrupt()` at :890 is only the **reporter**; the real predicates are its
+  ~10 call sites. The constructor has two — cookie mismatch on a non-kReadWrite
+  attach (:383), and an inconsistent header on an existing segment (:443).
+- The `[shm]` trace printing **"attached"** reads like success but actually meant
+  **aliased**. The tell was inconsistent `np` on a single key.
 
 ---
 
@@ -283,11 +299,17 @@ grep -ac "double free\|KERNEL PANIC\|with no connection\|Corruption detected" lo
   thread-empty-table bug as fixed in `fork`. Diagnostic-only.
 - `openat` only opens by resolved kernel path in its DIRECTORY arm; a
   dirfd-relative open of a non-directory is still cwd-relative.
-- The shm cache has **no writeback and no reclaim**, and 32 entries. The cache
+- The shm cache has **no writeback and no reclaim** (now 256 entries; slice 23
+  needs more because regions no longer wrongly collapse onto one key). The cache
   IS the file's contents for mappers, but a later `read()` sees on-disk bytes.
-- **NOT re-validated against the non-chrome boot/test harness.** The `uaccess`
-  change touches every syscall in the kernel. This is owed before trusting any
-  of it beyond the chromium path.
+  Entries are permanent, which is also why a file with no inode identity
+  (`ino_gen == 0`, ramfs) deliberately falls back to copying — see the call site
+  in `linux_mmap_file`.
+- ~~NOT re-validated against the non-chrome boot/test harness.~~ **PAID in slice
+  23**: `bash logs/defboot.sh` (stock ISO, no chrome harness — the heaviest
+  native-ELF path) boots to login + GUI, tobyfs formats/journals/mounts clean,
+  0 hard faults. That covers slice 21's `uaccess` change and slice 23's
+  `vfs_file`/`struct file` layout growth. Re-run it after any struct change.
 
 ---
 
