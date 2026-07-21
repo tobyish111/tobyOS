@@ -105,7 +105,38 @@ Corollary for future work: **a silent stop with QEMU exiting rc=0 under
 one run to produce the exact faulting instruction after a long detour through
 scheduler, futex and serial theories.
 
-### Open: which CR3, and why is it dead
+### RESOLVED — the triple fault was a reaped proc left in the run queue
+
+Two root causes in the same family, both fixed:
+
+- **PML4 use-after-free** (commit f1883bb): `proc_reap` destroyed a thread
+  group's address space while a member was still alive. Fixed by handing PML4
+  ownership to a surviving member; the last one reaped tears it down.
+- **Reaped-slot-still-in-runqueue** (commit 91f43a9): the thread-group-exit
+  loop and `proc_reap` freed a proc's kernel stack and recycled its slot
+  WITHOUT unlinking it from the ready queue. The scheduler then popped it and
+  switched in with `kstack_top == NULL` → triple fault in `syscall_entry`.
+  Fixed with `sched_dequeue()` before every teardown.
+
+**Result: the ~14 s triple fault is gone. Chrome runs 571 s of guest time
+(40×), 190 heartbeats, zero faults, and settles into a stable ~31-process tree
+idling in epoll_wait/futex.** The GPU respawn loop stopped (1 crash, not
+endless). Guards kept permanently: `vmm_pml4_is_live` + kstack validation at the
+switch, so this whole class can never again present as a silent death.
+
+### New front (chrome now runs deep enough to show real IPC errors)
+
+Still no DOM, but the failures are now specific and downstream:
+- `VALIDATION_ERROR_MESSAGE_HEADER_INVALID_FLAGS`
+  (`mojo/public/cpp/bindings/lib/validation_errors.cc:136`) — a Mojo message
+  arrived with a malformed header. Data-integrity bug in the IPC path.
+- `Network service crashed or was terminated, restarting service.`
+
+Only syscalls 93 (fchown, benign) and 444 (landlock, a probe) are unhandled, so
+neither is a missing syscall. Next: chase the Mojo header validation — decode
+what flags chrome expects vs what the peer received.
+
+### (historical) Open: which CR3, and why is it dead
 
 Prime suspect is a **PML4 use-after-free**. `proc_reap` calls
 `vmm_destroy_user_pml4(p->cr3)` when `owns_pml4 && !is_thread`. If any THREAD of
