@@ -113,6 +113,20 @@ static void dump_regs(struct regs *r) {
             r->r10, r->r11, r->r12);
     kprintf("  r13=0x%016lx  r14=0x%016lx  r15=0x%016lx\n",
             r->r13, r->r14, r->r15);
+    /* A #GP whose faulting rip IS the iretq in common_isr means the CPU
+     * rejected the RETURN frame, not the code. rsp then points straight at that
+     * frame, so dump it -- the selector in the error code says WHICH field the
+     * CPU refused, and this shows the actual values. Real VT-x (WHPX) enforces
+     * iret's SS/CS privilege checks that TCG lets slide, so this only fires
+     * under hardware virtualisation / real HW. */
+    if (r->vector == 13 && r->error_code != 0) {
+        const uint64_t *f = (const uint64_t *)r->rsp;
+        if (r->rsp >= 0xffff800000000000ULL) {
+            kprintf("  [iret-frame] rip=0x%016lx cs=0x%lx rflags=0x%lx "
+                    "rsp=0x%016lx ss=0x%lx\n",
+                    f[0], f[1], f[2], f[3], f[4]);
+        }
+    }
     kprintf("  cr2=%p  cr3=%p  cr0=0x%lx  cr4=0x%lx\n",
             (void *)read_cr2(), (void *)read_cr3(),
             read_cr0(), read_cr4());

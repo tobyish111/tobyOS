@@ -14058,8 +14058,20 @@ static void syscall_program_msrs(void) {
     uint64_t efer = rdmsr(IA32_EFER);
     wrmsr(IA32_EFER, efer | EFER_SCE);
 
+    /* STAR[63:48] is the SYSRET selector BASE: the CPU forms
+     *   CS = base + 16   and   SS = base + 8.
+     * It forces CS.RPL = 3, but it does NOT force SS.RPL -- SS keeps whatever
+     * RPL the base carries. The base must therefore already have RPL 3 in it:
+     *   0x13 + 8  = 0x1B = GDT_USER_DS  (RPL 3)
+     *   0x13 + 16 = 0x23 = GDT_USER_CS  (RPL 3)
+     * This was 0x10, which produced a correct CS (0x23, RPL forced) but
+     * SS = 0x18 -- the user data segment with RPL 0. A privilege-changing
+     * iretq requires SS.RPL == CS.RPL, so after the first syscall EVERY return
+     * to ring 3 was riding an illegal frame. TCG does not check this, which is
+     * why plain QEMU never complained; real VT-x (WHPX) and real hardware
+     * enforce it and #GP(0x18) on the iretq in common_isr. */
     uint64_t star = ((uint64_t)GDT_KERNEL_CS << 32) |
-                    ((uint64_t)0x10          << 48);
+                    ((uint64_t)SYSRET_SEL_BASE << 48);
     wrmsr(IA32_STAR, star);
 
     wrmsr(IA32_LSTAR, (uint64_t)&syscall_entry);
@@ -14076,8 +14088,10 @@ void syscall_init_ap(void) {
 void syscall_init(void) {
     syscall_program_msrs();
 
+    /* Recomputed only for the boot log below -- keep it in step with the value
+     * syscall_program_msrs() actually wrote, or the log misreports it. */
     uint64_t star = ((uint64_t)GDT_KERNEL_CS << 32) |
-                    ((uint64_t)0x10          << 48);
+                    ((uint64_t)SYSRET_SEL_BASE << 48);
 
     /* Per-CPU SYSCALL stack via GS base. GS base points at this CPU's
      * struct percpu; syscall_entry.S reads gs:[0] (syscall_rsp) / gs:[8]

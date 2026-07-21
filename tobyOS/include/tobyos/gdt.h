@@ -9,8 +9,11 @@
  *   index 0  selector 0x00  null
  *   index 1  selector 0x08  kernel code (L=1, DPL=0)   STAR[47:32]
  *   index 2  selector 0x10  kernel data (DPL=0)        = STAR[47:32]+8
- *   index 3  selector 0x1B  user   data (DPL=3)        STAR[63:48]+8 | 3
- *   index 4  selector 0x23  user   code (L=1, DPL=3)   STAR[63:48]+16| 3
+ *   index 3  selector 0x1B  user   data (DPL=3)        STAR[63:48]+8
+ *   index 4  selector 0x23  user   code (L=1, DPL=3)   STAR[63:48]+16
+ *
+ * NOTE the "+8 / +16" are EXACT, not "| 3": SYSRET forces RPL 3 on CS only,
+ * never on SS, so STAR[63:48] must itself carry RPL 3 (see SYSRET_SEL_BASE).
  *   index 5  selector 0x28  TSS lo (16 bytes total: takes slots 5+6)
  *   index 6  ----           TSS hi  (upper 8 bytes of the system desc)
  *
@@ -32,6 +35,14 @@
 #define GDT_USER_DS   0x1B
 #define GDT_USER_CS   0x23
 #define GDT_TSS_SEL   0x28
+
+/* STAR[63:48] -- the base SYSRET derives its selectors from:
+ *   SS = SYSRET_SEL_BASE + 8   CS = SYSRET_SEL_BASE + 16
+ * The RPL-3 bits must be IN THE BASE. SYSRET forces CS.RPL = 3 but leaves
+ * SS.RPL alone, so a base of 0x10 yields SS = 0x18 (RPL 0) against CS = 0x23
+ * (RPL 3) -- and a privilege-changing iretq requires SS.RPL == CS.RPL. Real
+ * VT-x / real hardware #GP on that frame; TCG does not check it. */
+#define SYSRET_SEL_BASE 0x13
 
 void gdt_init(void);
 
