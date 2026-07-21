@@ -84,7 +84,9 @@ long  memfd_get_seals(struct memfd *mf);
 struct shm_cache;
 /* Find or create the cache for `ino` (0 = no stable identity -> NULL, caller
  * falls back to copying). *created tells the caller it must populate. */
-struct shm_cache *shm_cache_for_ino(uint64_t ino, bool *created);
+/* Keyed on (inode, incarnation) -- a bare inode number is reissued the moment
+ * a file is unlinked and would alias unrelated regions together. */
+struct shm_cache *shm_cache_for_ino(uint64_t ino, uint64_t gen, bool *created);
 int   shm_cache_ensure(struct shm_cache *sc, size_t want_pages);
 /* High-water page count. Sample BEFORE shm_cache_ensure() to learn which pages
  * that call newly allocated, so exactly those get populated from the file. */

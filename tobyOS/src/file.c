@@ -164,6 +164,12 @@ struct file *file_clone(struct file *src) {
         f->vfs      = src->vfs;
         f->vfs_refs = src->vfs_refs;
         f->o_accmode = src->o_accmode;   /* dup'd fd keeps the access mode (F_GETFL) */
+        /* Carry the shared-mapping region across dup/fork/SCM_RIGHTS. This is
+         * what actually makes cross-process shared memory work once the file is
+         * unlinked: the inode number is gone (and reused), so the descriptor is
+         * the only thing tying the sharers together. Entries are permanent for
+         * now, so there is no refcount to bump here. */
+        f->shm      = src->shm;
         (*f->vfs_refs)++;
         break;
     case FILE_KIND_SOCKET:

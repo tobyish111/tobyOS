@@ -694,3 +694,77 @@ Mojo pipe the `epoll_wait` IO threads block on that never gets written.
 
 Diagnostics added this slice (all `CHROMIUM_BOOT`, behaviour-neutral): the `sys_write`
 fd-1 logger and the heartbeat recent-syscall-ring dump.
+
+---
+
+## Slice 23 — the shm page cache aliased unrelated regions (recycled inode numbers)
+
+**Result: `Corruption detected in shared-memory segment` 3 -> 0, and cross-process
+shared memory verified genuinely correct for the first time.** `--dump-dom` still
+does not print (blocker A, the Mojo reply, survives this and is therefore
+independent of shared memory).
+
+### The bug
+
+Slice 22 keyed the `MAP_SHARED` page cache on `vfs_file.ino`, deliberately, "so it
+survives the `unlink()` chrome does immediately". That reasoning was half right: the
+entry must survive the unlink, but **an inode NUMBER is only an identity while the
+file is LINKED**. `tobyfs`'s `alloc_inode` returns the *lowest free* number and
+`free_inode` clears the bit immediately, so the number is typically reissued on the
+very next create.
+
+Chrome's `PlatformSharedMemoryRegion::Create` does exactly: create temp file ->
+open O_RDWR -> open O_RDONLY -> **unlink** -> ftruncate -> mmap. So every region
+recycled the same low inode number, and `shm_cache_for_ino` handed each new region
+the *previous* region's physical pages.
+
+Measured, with a one-boot `[ino] alloc/free` trace: **inode 9 was allocated 6 times
+in a single run**, and the `[shm]` trace showed six processes "attaching" to ino 9
+at *four different sizes* (np = 64, 1, 32, 64) — a single region has one size, so
+those were six unrelated files sharing one page set. Each new region therefore came
+up holding a previous tenant's bytes; `persistent_memory_allocator.cc` found a valid
+`kGlobalCookie` with an inconsistent header and took the "existing segment" branch
+at :443, logging the corruption at :890.
+
+### The fix — key on (inode, incarnation)
+
+`alloc_inode` bumps a per-number counter (`fs->ino_gen[]`, in-memory, per-mount);
+`tobyfs_open` stamps it into the new `vfs_file.ino_gen`; the cache keys on the
+**pair**. This is what makes both required cases work at once:
+
+- chrome opens each region **O_RDWR and then O_RDONLY by path** (and passes the
+  read-only fd to children) — both opens predate the unlink, land on the same
+  incarnation, and share. Pure fd-keyed identity would have broken this.
+- a later file that merely inherits the recycled number has a higher incarnation and
+  keys a **different** region.
+
+`struct file` also gains `shm`, pinned at first `MAP_SHARED` and carried by
+`file_clone`, so a region stays reachable through fork/dup/**SCM_RIGHTS** after the
+inode identity is gone. Verified live: children now attach to `ino=9/3`, `12/1`,
+`50/1` — the exact incarnations the browser created, at matching sizes.
+
+Files with **no** inode identity (`gen == 0`, ramfs et al.) deliberately fall back to
+the copying path, as before this slice. Routing them through an anonymous region is
+more POSIX-correct in principle but measured strictly worse here: each was a
+per-process mapping of chrome's `.pak`/ICU payload, up to **2656 pages each**,
+CREATED by every process and attached by none — and cache entries are permanent
+(no reclaim yet), so it traded a copy freed at teardown for one never freed.
+Dropping it took the run from 54 shared regions to 36.
+
+### Verified
+
+24.7 s run (past every window — a shorter run hides both symptoms): corruption 0,
+FATAL 0, double-free 0, KERNEL PANIC 0. `with no connection` reads 1 or 2 purely as
+a function of run length (children invited at ~7.5 s hit their 15 s deadline only
+after ~22.5 s) — not a regression. Also re-ran the **non-chrome** `defboot.sh` stock
+boot, which slice 21/22 owed: boots to login + GUI, tobyfs formats/journals/mounts
+clean, 0 hard faults. That covers the `vfs_file`/`struct file` layout growth here.
+
+### Lesson
+
+The slice-22 note "keyed by INODE not fd so it survives unlink" *documented* the bug
+as if it were the fix. Unlink is precisely the moment a number stops being an
+identity. When a key must outlive the thing that names it, the key needs a
+generation — and "verify the instrument" extends to verifying an identity: the
+`[shm]` trace said "attached", which reads like success, when it actually meant
+*aliased*. Inconsistent `np` on one key was the tell.

@@ -175,6 +175,16 @@ struct vfs_file {
      * (tobyfs) set this; ramfs et al. leave 0 and keep the node-pointer hash
      * (which is already stable per file there, so ld.so dedup is unaffected). */
     uint64_t              ino;
+    /* Slice 23: which INCARNATION of `ino` this handle refers to. An inode
+     * NUMBER is only an identity while the file is linked -- tobyfs reissues
+     * the lowest free number immediately, so a number alone cannot tell two
+     * successive files apart. The fs driver bumps a per-number counter in
+     * alloc_inode and stamps it here at open, making (ino, ino_gen) a durable
+     * identity for the file's lifetime. MAP_SHARED keys its page cache on the
+     * pair: two opens of the same live file share (chrome opens each shm region
+     * O_RDWR then O_RDONLY), while a later file that inherits the number does
+     * NOT. 0 = fs without inode identity (ramfs et al.). */
+    uint64_t              ino_gen;
     /* Milestone 34E: set by vfs_open if the path matched a sysprot
      * protected prefix. vfs_write consults it so a sandboxed proc
      * can't write through a read-opened handle to a protected file

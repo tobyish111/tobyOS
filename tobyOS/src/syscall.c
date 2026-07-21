@@ -4456,10 +4456,28 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
      * Needs a stable inode (tobyfs supplies one; ino==0 means "no identity",
      * where sharing cannot be established and copying is the honest fallback).
      * Any failure falls through to the old path rather than failing the mmap. */
-    if ((lflags & LXMAP_SHARED) && f->vfs.ino) {
+    if (lflags & LXMAP_SHARED) {
         bool created = false;
-        struct shm_cache *sc = shm_cache_for_ino(f->vfs.ino, &created);
+        /* Identity order matters. A region already mapped through THIS open file
+         * (or an inherited/dup'd/SCM_RIGHTS copy of it) is found via the file
+         * itself -- the only identity that survives the unlink() chrome does
+         * immediately after creating a region. Otherwise fall back to
+         * (inode, incarnation), which lets two SEPARATE opens of the same live
+         * file share as POSIX requires -- chrome opens every shm region O_RDWR
+         * and then O_RDONLY by path, and passes the read-only fd to children --
+         * while a later file that merely inherits the recycled inode NUMBER
+         * keys a different region. */
+        struct shm_cache *sc = f->shm;
+        if (!sc) sc = shm_cache_for_ino(f->vfs.ino, f->vfs.ino_gen, &created);
+        /* No inode identity (ramfs et al.) -> fall through to the copying path,
+         * as before this slice. Routing those through an anonymous region would
+         * be more POSIX-correct in principle, but measured: every such mapping
+         * here is a per-process mapping of chrome's .pak/ICU payload -- up to
+         * 2656 pages EACH, CREATED by every process and attached by none. Cache
+         * entries are permanent (no reclaim yet), so that traded a per-process
+         * copy that is freed at teardown for one that is never freed. */
         if (sc) {
+            f->shm = sc;                 /* pin for this fd and its clones */
             uint64_t alen = (len + 0xfffULL) & ~0xfffULL;
             uint64_t aoff = offset & ~0xfffULL;
             size_t page_off = (size_t)(aoff / PAGE_SIZE);
@@ -4493,9 +4511,10 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
                 {   static int c = 0;
                     if (c < 200) { c++;
                         struct proc *me = current_proc();
-                        kprintf("[shm] MAP_SHARED pid=%d ino=%lu off=%lu np=%lu "
+                        kprintf("[shm] MAP_SHARED pid=%d ino=%lu/%lu off=%lu np=%lu "
                                 "%s -> 0x%lx\n",
                                 me ? me->pid : -1, (unsigned long)f->vfs.ino,
+                                (unsigned long)f->vfs.ino_gen,
                                 (unsigned long)page_off, (unsigned long)np,
                                 created ? "CREATED" : "attached",
                                 (unsigned long)b);

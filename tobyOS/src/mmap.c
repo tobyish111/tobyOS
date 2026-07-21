@@ -798,11 +798,15 @@ long memfd_map(uint64_t addr, uint64_t len, uint32_t prot, uint32_t flags,
  * implementation needs msync/close writeback and eviction.
  * ================================================================== */
 
-#define SHMCACHE_MAX 32
+/* One entry per SHARED-MAPPED FILE, not per inode NUMBER. Chrome creates ~40
+ * regions in a run and each needs its own entry now that they no longer
+ * (wrongly) collapse onto a recycled inode number -- see shm_cache_detach_ino. */
+#define SHMCACHE_MAX 256
 
 struct shm_cache {
     bool      used;
-    uint64_t  ino;          /* stable file identity (vfs_file.ino) */
+    uint64_t  ino;          /* inode number, 0 == not keyed (fd-identity only) */
+    uint64_t  gen;          /* which INCARNATION of that number (vfs_file.ino_gen) */
     uint64_t *pages;        /* physical page addrs; index i == file page i */
     size_t    npages;
     size_t    cap;
@@ -810,22 +814,47 @@ struct shm_cache {
 
 static struct shm_cache g_shm[SHMCACHE_MAX];
 
-struct shm_cache *shm_cache_for_ino(uint64_t ino, bool *created) {
-    if (created) *created = false;
-    if (ino == 0) return 0;                      /* no stable identity */
-    for (int i = 0; i < SHMCACHE_MAX; i++)
-        if (g_shm[i].used && g_shm[i].ino == ino) return &g_shm[i];
+static struct shm_cache *shm_slot_alloc(uint64_t ino, uint64_t gen) {
     for (int i = 0; i < SHMCACHE_MAX; i++) {
         if (!g_shm[i].used) {
             g_shm[i].used = true;
             g_shm[i].ino  = ino;
+            g_shm[i].gen  = gen;
             g_shm[i].pages = 0; g_shm[i].npages = 0; g_shm[i].cap = 0;
-            if (created) *created = true;
             return &g_shm[i];
         }
     }
     return 0;                                    /* table full -> caller copies */
 }
+
+/* Look up (or create) the shared page set for one FILE.
+ *
+ * The key is (ino, gen), never the inode NUMBER alone. tobyfs's alloc_inode
+ * hands back the LOWEST free number, so a number is typically reissued on the
+ * very next create -- and chrome creates each shared-memory region as a temp
+ * file that it unlinks IMMEDIATELY, keeping only the fd. Keying on the bare
+ * number therefore aliased six unrelated chrome regions onto ONE set of
+ * physical pages (measured: ino 9 allocated 6x in a single boot and mapped at
+ * four different sizes). Each new region then came up holding a previous
+ * tenant's bytes: chrome's persistent_memory_allocator found a valid cookie
+ * with an inconsistent header and logged "Corruption detected in shared-memory
+ * segment", and the Mojo/field-trial regions handed children data the browser
+ * had never written.
+ *
+ * gen==0 means the fs has no inode identity (ramfs et al.), so fall back to
+ * fd-only identity -- the caller pins the result on the struct file. */
+struct shm_cache *shm_cache_for_ino(uint64_t ino, uint64_t gen, bool *created) {
+    if (created) *created = false;
+    if (ino == 0 || gen == 0) return 0;
+    for (int i = 0; i < SHMCACHE_MAX; i++)
+        if (g_shm[i].used && g_shm[i].ino == ino && g_shm[i].gen == gen)
+            return &g_shm[i];
+    if (created) *created = true;
+    return shm_slot_alloc(ino, gen);
+}
+
+/* NB: a file with no inode identity (gen==0) gets no region at all -- the mmap
+ * path falls back to copying. See the call site in linux_mmap_file. */
 
 int shm_cache_ensure(struct shm_cache *sc, size_t want) {
     if (!sc) return -1;

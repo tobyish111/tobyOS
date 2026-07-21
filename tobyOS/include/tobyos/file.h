@@ -107,6 +107,7 @@ enum file_kind {
 
 struct eventfd;
 struct memfd;
+struct shm_cache;
 
 struct file {
     enum file_kind  kind;
@@ -140,6 +141,14 @@ struct file {
     /* For FILE_KIND_MEMFD (slice 20): the shared page-backed memory object.
      * The per-fd read/write cursor lives in vfs.pos (unused for memfd otherwise). */
     struct memfd *memfd;
+    /* For FILE_KIND_VFS mapped MAP_SHARED (slice 23): the region's shared page
+     * set. Pinned on the OPEN FILE because that is the only identity that
+     * survives unlink() -- chrome unlinks a shared-memory region immediately and
+     * passes the bare fd to its children over SCM_RIGHTS, and an inode NUMBER is
+     * recycled the moment it is freed (see shm_cache_detach_ino). fork/dup/
+     * SCM_RIGHTS clone this pointer, so exactly the processes that legitimately
+     * share the descriptor share the pages. NULL until first MAP_SHARED. */
+    struct shm_cache *shm;
     /* Open access mode (O_RDONLY=0 / O_WRONLY=1 / O_RDWR=2), captured at
      * open time and returned by fcntl(F_GETFL). Chromium's shared-memory
      * PlatformSharedMemoryRegion CHECKs that a writable region's fd reports
