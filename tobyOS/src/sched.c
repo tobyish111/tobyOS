@@ -484,6 +484,25 @@ void sched_enqueue(struct proc *p) {
     spin_unlock_irqrestore(&cpu->ready_lock, flags);
 }
 
+/* Remove `p` from whatever ready queue it is on, if any. Safe to call on a proc
+ * that is not queued. Scans every CPU because a proc can be enqueued on any of
+ * them. Must be called before freeing a proc's kernel stack or marking its slot
+ * UNUSED: a proc left linked in a ready queue after teardown gets popped and
+ * switched into with a NULL kstack_top -> triple fault. */
+void sched_dequeue(struct proc *p) {
+    if (!p) return;
+    uint32_t n = smp_cpu_count();
+    if (n == 0) n = 1;
+    for (uint32_t c = 0; c < n; c++) {
+        struct percpu *cpu = smp_cpu_mut(c);
+        if (!cpu) continue;
+        uint64_t flags = spin_lock_irqsave(&cpu->ready_lock);
+        bool removed = queue_remove_locked(cpu, p);
+        spin_unlock_irqrestore(&cpu->ready_lock, flags);
+        if (removed) return;      /* on at most one queue */
+    }
+}
+
 void sched_boost_pid(int pid) {
     if (pid <= 0) return;
     struct proc *p = proc_lookup(pid);

@@ -73,6 +73,14 @@ void sched_init(void);
  * scheduler does not change p->state itself. Idempotent: if p is
  * already on a queue, this is a no-op. */
 void sched_enqueue(struct proc *p);
+/* Remove `p` from any ready queue. MUST be called before freeing a proc's
+ * kernel stack or recycling its slot -- a proc left linked in a ready queue is
+ * still reachable by the scheduler and will be switched into with freed state. */
+void sched_dequeue(struct proc *p);
+/* Diagnostic: walk every CPU's ready list looking for `p`. Returns 1 if it is
+ * still linked (or the list is cyclic -- *cycle_out), 0 if not. Walks rather
+ * than trusting on_rq, so it can audit the flag. */
+int  sched_debug_find_queued(struct proc *p, int *cpu_out, bool *cycle_out);
 
 /* Move a READY process to the front of the BSP ready queue. Used for
  * latency-sensitive GUI input so the focused app consumes key events

@@ -1139,6 +1139,14 @@ __attribute__((noreturn)) void proc_exit(int code) {
                     w = nxt;
                 }
                 q->join_waiters = 0;
+                /* Remove it from the ready queue BEFORE freeing its stack. A
+                 * force-terminated sibling that was PROC_READY is still linked
+                 * in a run queue; freeing its kstack and marking the slot
+                 * UNUSED without unlinking leaves the scheduler able to pop it
+                 * and switch in with kstack_top == NULL -> triple fault in
+                 * syscall_entry. (Measured: pid=27 is_thread=1 tgid=17,
+                 * kstack_top=0x0.) */
+                sched_dequeue(q);
                 /* Free the thread's kernel stack */
                 if (q->kstack_base) kfree(q->kstack_base);
                 q->kstack_base = 0;
@@ -1185,6 +1193,10 @@ __attribute__((noreturn)) void proc_exit(int code) {
 /* Free everything owned by a TERMINATED process and recycle the slot. */
 static void proc_reap(struct proc *p) {
     if (!p || p->state != PROC_TERMINATED) return;
+
+    /* Unlink from any ready queue before we free its stack and zero the slot.
+     * The same reachable-after-teardown hazard the thread-group-exit path had. */
+    sched_dequeue(p);
 
     /* Tear down the address space only when NOBODY else is still in it.
      *
