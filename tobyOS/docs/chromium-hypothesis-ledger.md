@@ -90,11 +90,34 @@ content grid, no video — matching the documented architectural ceiling.
 | D9 | Missed futex wakeup | LARGELY DISPROVEN | Address-matched `[futex]` instrument: 75 WAIT / 181 WAKE, and the waits observed around the stop **return 0** (i.e. they were woken). Note the instrument's blind spot: it logs *after* the call, so a permanently-blocked wait is invisible to it — but nothing points to one. Long 6–9 s waits are chrome's idle thread-pool workers parking on purpose. |
 | D10 | Serial TX ring fills → output dropped, so the "wedge" is log loss not a hang | DISPROVEN | Added a drop counter and grew the ring 8 KiB → 256 KiB: **`logdrop=0`**, run still stops at ~13.9 s with 4 heartbeats. Not one byte was ever lost. **Also retracted the reasoning:** the "more tracing → earlier stop" trend was confounded — the early 22–24 s runs predate the `sendto` fix, when chrome stalled instead of respawning GPU processes. Different workload, not different log volume. |
 
-### Still open
+| D11 | The guest HALTS rather than hangs | CONFIRMED (and it is worse than a halt) | `timeout 400` returned **rc=0**: QEMU exited on its own. A hung guest keeps QEMU alive. With `-no-reboot` a **triple fault** makes QEMU exit — which is what it is. |
+| D12 | **`proc_context_switch` loads a CR3 that does not map the kernel** | **CONFIRMED — root cause of the "wedge"** | `-d int,cpu_reset` caught the chain: `v=0e e=0018 cpl=0 IP=ffffffff80151154 CR2=ffffffff80151154` (page fault where **CR2 == IP**, instruction-fetch, present-bit clear) → `v=08` (#DF) → `Triple fault`. Symbolized: `0x...151154` is the instruction **immediately after `mov %rdx,%cr3`** in `proc_context_switch`. Switching into a dead address space unmaps the kernel, so the next fetch faults and no handler can run. |
 
-The system stops emitting at ~14 s — heartbeat included — on **both** TCG and WHPX,
-with no crash, no panic, no dropped log bytes, and no progress across 20+ minutes
-of wall time. The scheduler itself appears to stop. Not yet explained.
+### Why every earlier reading was wrong
+
+There was never a hang, a scheduler cycle, a futex deadlock, or log loss. The
+machine **triple-faults and dies instantly**. No panic could ever print, because
+the panic handler was unmapped along with the rest of the kernel. Everything
+that looked like a "wedge" was simply the machine being gone.
+
+Corollary for future work: **a silent stop with QEMU exiting rc=0 under
+`-no-reboot` means a triple fault.** Reach for `-d int,cpu_reset` FIRST; it took
+one run to produce the exact faulting instruction after a long detour through
+scheduler, futex and serial theories.
+
+### Open: which CR3, and why is it dead
+
+Prime suspect is a **PML4 use-after-free**. `proc_reap` calls
+`vmm_destroy_user_pml4(p->cr3)` when `owns_pml4 && !is_thread`. If any THREAD of
+that group is still alive (threads share the leader's `cr3` and have
+`owns_pml4 == false`), destroying the leader's tables leaves those threads
+pointing at freed page tables — and the first switch into one triple-faults.
+Chrome's GPU respawn loop (SIGKILL the process, reap it, immediately fork a
+replacement into the same slot) is exactly the churn that would expose it.
+
+Next step: assert in `proc_context_switch`'s caller that the target `cr3` is
+live, and in `proc_reap` that no other proc shares the `cr3` about to be
+destroyed.
 
 ### What is established about the wedge
 
