@@ -39,6 +39,8 @@
 #include <tobyos/cpu.h>
 #include <tobyos/printk.h>
 #include <tobyos/serial.h>   /* serial_dropped -- log-loss accounting */
+#include <tobyos/vmm.h>      /* vmm_pml4_is_live -- dead-CR3 guard */
+#include <tobyos/panic.h>
 #include <tobyos/gui.h>
 #include <tobyos/perf.h>
 #include <tobyos/percpu.h>
@@ -386,6 +388,21 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
           to->gs_base ? to->gs_base : (uint64_t)me);
 
     fpu_save(from->fpu_state);
+#ifdef CHROMIUM_BOOT
+    /* Validate the address space BEFORE entering it. Loading a CR3 whose kernel
+     * half is gone unmaps the kernel underneath us, so the instruction fetch
+     * immediately after `mov %rdx,%cr3` faults, the handler cannot run either,
+     * and the box triple-faults with no panic and no log line. Panicking here
+     * instead turns that silent death into a diagnosable message naming both
+     * procs. vmm_pml4_is_live() checks the frame is still allocated and its
+     * kernel-half entry is present. */
+    if (!vmm_pml4_is_live(to->cr3)) {
+        kpanic("sched: switching to pid=%d with DEAD cr3=0x%lx "
+               "(is_thread=%d tgid=%d owns_pml4=%d) from pid=%d",
+               to->pid, (unsigned long)to->cr3, (int)to->is_thread,
+               to->tgid, (int)to->owns_pml4, from->pid);
+    }
+#endif
     proc_context_switch(&from->saved_rsp, to->saved_rsp, to->cr3);
     /* --- `from` resumes here when some later switch picks it again --- */
     if (reacquire_bkl) bkl_enter();

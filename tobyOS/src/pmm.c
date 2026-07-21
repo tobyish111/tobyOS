@@ -49,6 +49,17 @@ static inline void bm_clr(size_t i) {
     g_bitmap[i / 8] &= (uint8_t)~(1u << (i & 7));
 }
 
+/* Is this frame currently allocated (or reserved)? Bit set == in use; the
+ * bitmap starts all-1s and usable regions are cleared at init. Used to catch
+ * use-after-free of page tables: a freed PML4 keeps working until its frame is
+ * handed out and overwritten, which is what made that failure timing-dependent
+ * and made it present as an unpredictable silent death. */
+bool pmm_is_allocated(uint64_t phys) {
+    size_t i = (size_t)(phys / PAGE_SIZE);
+    if (!g_bitmap || i >= g_total_pages) return false;
+    return bm_get(i);
+}
+
 void *pmm_phys_to_virt(uint64_t phys) {
     return (void *)(phys + g_hhdm);
 }

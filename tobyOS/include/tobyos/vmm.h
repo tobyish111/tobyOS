@@ -118,6 +118,10 @@ void vmm_dump(uint64_t virt);
  * stomp it back to the kernel root once the caller restores. */
 uint64_t vmm_create_user_pml4(void);
 void     vmm_destroy_user_pml4(uint64_t pml4_phys);
+/* True if this PML4 is safe to load into CR3: the frame is still allocated AND
+ * its kernel half is present. Loading a dead one unmaps the kernel and
+ * triple-faults instantly -- no panic, no log, machine gone. */
+bool     vmm_pml4_is_live(uint64_t pml4_phys);
 uint64_t vmm_set_active_root(uint64_t pml4_phys);
 uint64_t vmm_set_editor_root(uint64_t pml4_phys);
 

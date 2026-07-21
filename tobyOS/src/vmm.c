@@ -576,6 +576,33 @@ static void free_subtree(uint64_t table_phys, int level) {
     }
 }
 
+/* Is this PML4 safe to load into CR3?
+ *
+ * Two ways it can be dead: the frame was freed back to the PMM (use-after-free
+ * of the page tables), or its kernel half is gone. Either way, loading it
+ * unmaps the kernel under our feet -- the instruction fetch right after
+ * `mov %rdx,%cr3` faults, the fault handler is unmapped too, and the machine
+ * triple-faults with no panic and no log output. Checking first turns a silent
+ * death into a diagnosable one. Entry 256 is the first kernel-half slot and is
+ * mirrored into every address space. */
+bool vmm_pml4_is_live(uint64_t pml4_phys) {
+    if (pml4_phys == 0) return false;
+    if (!pmm_is_allocated(pml4_phys)) return false;   /* freed frame */
+    pte_t *root = phys_to_table(pml4_phys);
+    if (!root) return false;
+    /* "Kernel half present" is NOT enough. A freed PML4 frame gets REISSUED to
+     * something else, so pmm_is_allocated() says true again and whatever data
+     * now occupies it can have bit 0 set at slot 256 purely by chance -- the
+     * check passes and we still load a CR3 that does not map the kernel.
+     * The kernel half is installed by COPYING the kernel PML4's entries, so a
+     * genuinely live address space must match it EXACTLY. */
+    pte_t *kroot = phys_to_table(vmm_kernel_pml4_phys());
+    if (!kroot) return false;
+    for (size_t i = 256; i < 512; i++)
+        if (root[i] != kroot[i]) return false;
+    return true;
+}
+
 void vmm_destroy_user_pml4(uint64_t pml4_phys) {
     if (pml4_phys == 0) return;
     pte_t *root = phys_to_table(pml4_phys);

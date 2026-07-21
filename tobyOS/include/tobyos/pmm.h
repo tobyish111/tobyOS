@@ -62,6 +62,9 @@ uint64_t pmm_hhdm_offset(void);
  * the last managed page). vmm_init uses this as the upper bound when
  * mirroring HHDM into its fresh PML4. */
 uint64_t pmm_highest_phys(void);
+/* True if `phys` is currently allocated/reserved. Catches use-after-free of
+ * page tables -- a freed PML4 keeps working until its frame is reissued. */
+bool pmm_is_allocated(uint64_t phys);
 
 /* Counters in pages. total = managed pages (covered by bitmap). */
 size_t pmm_total_pages(void);

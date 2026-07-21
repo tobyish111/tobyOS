@@ -1186,15 +1186,63 @@ __attribute__((noreturn)) void proc_exit(int code) {
 static void proc_reap(struct proc *p) {
     if (!p || p->state != PROC_TERMINATED) return;
 
-    /* Only the leader owns the PML4; threads share it */
-    if (p->owns_pml4 && p->cr3 && !p->is_thread) {
-        vmm_destroy_user_pml4(p->cr3);
+    /* Tear down the address space only when NOBODY else is still in it.
+     *
+     * Threads share their leader's cr3 with owns_pml4 == false, and a thread
+     * can outlive its leader -- chrome's GPU process is SIGKILLed, the leader
+     * is reaped, and its threads are still in the table. Destroying the tables
+     * there left those threads pointing at freed memory, and the next context
+     * switch into one loaded a CR3 that no longer mapped the kernel: the
+     * instruction fetch right after `mov %rdx,%cr3` faulted, the fault handler
+     * was unmapped too, and the machine triple-faulted instantly -- no panic,
+     * no log, just gone. (Measured: "switching to pid=21 with DEAD
+     * cr3=0x1ce38000 (is_thread=1 tgid=16 owns_pml4=0)".)
+     *
+     * So: hand ownership to a surviving member instead of freeing. Every reap
+     * re-runs this, so whoever is reaped LAST finds no heir and does the
+     * teardown -- exactly once, and never while anyone can still run in it.
+     * Note the old guard also required !is_thread; ownership can now land on a
+     * thread, so owns_pml4 alone is authoritative. */
+    if (p->owns_pml4 && p->cr3) {
+        struct proc *heir = 0;
+        for (int i = 0; i < PROC_MAX; i++) {
+            struct proc *q = &g_proc[i];
+            if (q == p || q->state == PROC_UNUSED) continue;
+            if (q->cr3 != p->cr3) continue;
+            /* Prefer a still-runnable member; a TERMINATED-but-unreaped one is
+             * an acceptable heir too, since it will run this same check. */
+            heir = q;
+            if (q->state != PROC_TERMINATED) break;
+        }
+        if (heir) {
+            heir->owns_pml4 = true;
+            p->owns_pml4    = false;
+        } else {
+            vmm_destroy_user_pml4(p->cr3);
+        }
     }
     if (p->kstack_base) {
         kfree(p->kstack_base);
     }
 
     int pid = p->pid;
+#ifdef CHROMIUM_BOOT
+    /* AUDIT BEFORE THE memset. Zeroing a struct that some list still points at
+     * corrupts that list -- and the system wedges silently (no crash, no panic,
+     * heartbeat simply stops) immediately after a slot is reaped and instantly
+     * re-forked. Check whether this slot is still linked into a ready queue,
+     * still flagged on_rq, or still on a wait queue at the moment we free it. */
+    {
+        int qcpu = -1; bool cyc = false;
+        int queued = sched_debug_find_queued(p, &qcpu, &cyc);
+        if (queued || p->on_rq || p->next_wait || p->wait_head) {
+            kprintf("[reap!] pid=%d STILL LINKED: rq=%d(cpu=%d,cycle=%d) "
+                    "on_rq=%d next_wait=%p wait_head=%p state=%d\n",
+                    pid, queued, qcpu, (int)cyc, (int)p->on_rq,
+                    (void *)p->next_wait, (void *)p->wait_head, (int)p->state);
+        }
+    }
+#endif
     memset(p, 0, sizeof(*p));
     p->state = PROC_UNUSED;
     kprintf("[proc] reaped pid=%d, slot recycled\n", pid);
