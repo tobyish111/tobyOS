@@ -58,7 +58,44 @@ their 15 s deadline only once the run passes ~22.5 s. Check the last kernel
 `[N ms]` timestamp (`grep -ao '^\[[0-9]* ms\]' LOG | tail -1`) before reading
 anything into a difference.
 
-### BLOCKER A — Mojo: children get the invitation and never reply
+### BLOCKER A — RESOLVED (slice 24, commit `a59d3c7`). Read this before the history below.
+
+**Cause: `sendto()` on AF_UNIX was never implemented.** `lx_send` handled only
+UDP and TCP, so an AF_UNIX socket fell through to the TCP check and returned
+`-ENOTSOCK` (-88). `recvfrom` and `sendmsg` BOTH had an AF_UNIX arm; `sendto`
+did not, and that asymmetry is what hid it for three slices. The browser sends
+its invitation with `sendmsg` (it needs SCM_RIGHTS), so that path always worked
+— which is exactly why every trace showed the invitation arriving intact. The
+child answers with a plain 80-byte `sendto`, the one path with the hole.
+
+So the framing "browser never sends vs child never receives" was wrong on both
+counts: **the child replied to every invitation and the kernel rejected the
+call.** Both sides then waited on each other until the 15 s deadline.
+
+Found by tracing socket-fd syscall **args AND return values** — the recent-
+syscall ring logs names only and structurally cannot show a failing return.
+That instrument is committed as `[chan]` (see the instrument list).
+
+After the fix: every -88 gone, and the channel round-trips —
+`pid=37 sendto fd=5 232 -> 232` immediately followed by
+`pid=8 recvmsg fd=53 -> 232`, repeatedly, in both directions. Channel ops
+11 -> 234. `with no connection` is 0 *by mechanism* (a conversing child cannot
+time out), not merely absent.
+
+**NEW FRONT: the GPU process is SIGKILLed at ~13.6 s**
+(`gpu_process_host.cc:1035 GPU process exited unexpectedly: exit_code=35072`,
+i.e. 137<<8 = SIGKILL). pid 18 was a healthy Mojo child mid-conversation when it
+died. **No `kill`/`tgkill` syscall was traced, so the sender is unidentified** —
+find it first (instrument signal_send / the kill syscalls with the SENDER pid).
+The guest now powers off on its own at ~13.6 s because of this, which is also
+why runs no longer reach 15 s. STILL NO DOM.
+
+Caution on run length changed meaning: chrome now does so much more work that
+emulation runs at ~4% real-time, so guest time advances slowly. Do not read a
+0 count for anything that fires on a deadline without checking the last
+`[N ms]`.
+
+### (historical) BLOCKER A — Mojo: children get the invitation and never reply
 
 Measured, with the `[unix]` and `[scm]` traces:
 
