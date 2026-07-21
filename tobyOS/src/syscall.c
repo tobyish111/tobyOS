@@ -5229,6 +5229,33 @@ static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
         return rv;
     }
 
+    if (s->kind == SOCK_KIND_UNIX) {
+        /* AF_UNIX send()/sendto(). This arm was MISSING while recvfrom() (below)
+         * and sendmsg() both had one, and that asymmetry alone was the Mojo
+         * stall: the browser sends its invitation with sendmsg (it needs
+         * SCM_RIGHTS), but the child replies to it with a plain 80-byte
+         * sendto -- which fell through to the TCP check and came back
+         * ENOTSOCK. So the child DID answer every invitation; we refused the
+         * call, and both sides then waited on each other until the child hit
+         * its 15s "no connection" deadline. sendto carries no ancillary data,
+         * so this is sock_unix_send with no fds; a destination address is
+         * meaningless on a connected pair and is ignored, as on Linux. */
+        (void)uaddr;
+        if (len == 0) return 0;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *uk = kmalloc(len);
+        if (!uk) return -ABI_ENOMEM;
+        long urv;
+        if (copy_from_user(uk, (const void *)(uintptr_t)ubuf, len) != 0)
+            urv = -ABI_EFAULT;
+        else {
+            long n = sock_unix_send(s, uk, len);
+            urv = (n < 0) ? -ABI_EPIPE : n;
+        }
+        kfree(uk);
+        return urv;
+    }
+
     if (s->kind != SOCK_KIND_TCP || !s->tcp) return -LXE_ENOTSOCK;
     (void)uaddr;
     if (len == 0) return 0;
@@ -5823,7 +5850,46 @@ void waitt_dump(void) {
 }
 #endif
 
+static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long a5);
+
+/* [chan] -- every socket-fd I/O call with its ARGS *and its RESULT*.
+ *
+ * The recent-syscall ring records names only, which cannot answer the two
+ * questions that decide the Mojo stall: does the child ever WRITE to its
+ * channel fd (and with what error), and does a read come back PARTIAL --
+ * tobyOS's AF_UNIX is message-queued with a tail_off path, while Mojo's
+ * channel framing expects SOCK_STREAM byte semantics. Logged AFTER the call so
+ * the return value is real; blocking calls therefore appear at wake time. */
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
+#ifdef CHROMIUM_BOOT
+    int chan_fd = -1;
+    switch (n) {
+    case LX_read: case LX_write: case LX_readv: case LX_writev:
+    case LX_sendmsg: case LX_recvmsg: case LX_sendto: case LX_recvfrom: {
+        struct file *cf = fd_lookup((int)a1);
+        if (cf && cf->kind == FILE_KIND_SOCKET) chan_fd = (int)a1;
+        break;
+    }
+    default: break;
+    }
+#endif
+    long r = linux_syscall_impl(n, a1, a2, a3, a4, a5);
+#ifdef CHROMIUM_BOOT
+    if (chan_fd >= 0) {
+        static int chan_c = 0;
+        if (chan_c < 500) {
+            chan_c++;
+            struct proc *me = current_proc();
+            kprintf("[chan] pid=%d %s fd=%d a2=0x%lx a3=%lu -> %ld\n",
+                    me ? me->pid : -1, lx_scname(n), chan_fd,
+                    (unsigned long)a2, (unsigned long)a3, r);
+        }
+    }
+#endif
+    return r;
+}
+
+static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long a5) {
     {
         uint32_t i = g_lx_recent_i++ % LX_RECENT;
         g_lx_recent_n[i]   = n;
