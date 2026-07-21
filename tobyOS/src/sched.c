@@ -402,6 +402,22 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
                to->pid, (unsigned long)to->cr3, (int)to->is_thread,
                to->tgid, (int)to->owns_pml4, from->pid);
     }
+    /* The kernel stack must be real BEFORE we publish it as this CPU's syscall
+     * stack. percpu->syscall_rsp is loaded straight into RSP by syscall_entry
+     * (`mov %gs:0x0,%rsp`), so a NULL here means the next syscall from ring 3
+     * pushes at address -8 with no stack to fault on: #PF -> #DF -> triple
+     * fault, again with no panic possible. Observed as
+     * `v=0e e=0002 IP=syscall_entry+0x15 SP=0 CR2=fffffffffffffff8`. */
+    /* pid 0 is exempt BY DESIGN: the boot/idle context runs on the
+     * bootloader-provided stack and legitimately has kstack_base/top == NULL
+     * (see proc.h). It never enters ring 3, so it never uses syscall_rsp. */
+    if (to->pid != 0 &&
+        (!to->kstack_top || !to->saved_rsp || to->state == PROC_UNUSED)) {
+        kpanic("sched: switching to pid=%d with BAD kstack: top=%p rsp=0x%lx "
+               "state=%d is_thread=%d tgid=%d from pid=%d",
+               to->pid, to->kstack_top, (unsigned long)to->saved_rsp,
+               (int)to->state, (int)to->is_thread, to->tgid, from->pid);
+    }
 #endif
     proc_context_switch(&from->saved_rsp, to->saved_rsp, to->cr3);
     /* --- `from` resumes here when some later switch picks it again --- */
