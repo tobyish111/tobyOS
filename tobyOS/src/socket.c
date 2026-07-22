@@ -202,25 +202,27 @@ void sock_deliver(struct sock *s,
 /* Enqueue one AF_UNIX message, optionally carrying SCM_RIGHTS descriptions.
  * `files` (already file_clone'd by the caller) are handed to the message; on
  * failure they are released here so the caller never has to unwind. */
-static void unix_enqueue_fds(struct sock *s, const void *payload, size_t len,
-                             struct file **files, int nfiles) {
+static int unix_enqueue_fds(struct sock *s, const void *payload, size_t len,
+                            struct file **files, int nfiles) {
     if (!s || !s->in_use) {
         for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
-        return;
+        return -1;
     }
     if (len > 65535) len = 65535;
     if (nfiles > SOCK_SCM_MAX_FDS) nfiles = SOCK_SCM_MAX_FDS;
-    if (s->count == SOCK_RX_DGRAMS) {            /* ring full: drop oldest */
-        struct sock_dgram *old = &s->dgrams[s->tail];
-        if (old->payload) { kfree(old->payload); old->payload = 0; }
-        dgram_release_fds(old);
-        s->tail = (uint8_t)((s->tail + 1) % SOCK_RX_DGRAMS);
-        s->count--; s->dropped++;
+    if (s->count == SOCK_RX_DGRAMS) {
+        /* Ring full: NEVER drop -- this is a reliable stream (Mojo). Signal
+         * backpressure so the sender retries once the receiver drains. The
+         * passed SCM_RIGHTS fds belong to the unsent message; release them so
+         * the retry re-clones cleanly (no leak, no premature consumption). */
+        for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
+        s->dropped++;      /* now a backpressure counter, not lost data */
+        return SOCK_ERR_AGAIN;
     }
     uint8_t *copy = (uint8_t *)kmalloc(len ? len : 1);
     if (!copy) {
         for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
-        return;
+        return -1;
     }
     if (len) memcpy(copy, payload, len);
     struct sock_dgram *d = &s->dgrams[s->head];
@@ -230,6 +232,7 @@ static void unix_enqueue_fds(struct sock *s, const void *payload, size_t len,
     s->head = (uint8_t)((s->head + 1) % SOCK_RX_DGRAMS);
     s->count++;
     wq_wake_all(&s->wq_recv);
+    return 0;
 }
 
 static void unix_enqueue(struct sock *s, const void *payload, size_t len) {
@@ -255,7 +258,9 @@ long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
         for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
         return -32;                              /* -EPIPE */
     }
-    unix_enqueue_fds(peer, kbuf, n, files, nfiles);
+    int erc = unix_enqueue_fds(peer, kbuf, n, files, nfiles);
+    if (erc == SOCK_ERR_AGAIN) return SOCK_ERR_AGAIN;   /* backpressure -> EAGAIN */
+    if (erc < 0) return -32;                            /* other failure -> EPIPE */
 #ifdef CHROMIUM_BOOT
     /* Slice 22 instrument: who is actually talking over the Mojo socketpair.
      * Chrome's children inherit fd 5 and then time out "with no connection",
@@ -278,6 +283,15 @@ long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
 
 long sock_unix_send(struct sock *self, const void *kbuf, size_t n) {
     return sock_unix_send_fds(self, kbuf, n, 0, 0);
+}
+
+/* Would a send on `self` right now hit backpressure (peer RX ring full)?
+ * file_poll_ready uses this so POLLOUT reflects real writability -- returning
+ * POLLOUT while the peer ring is full is what let chrome overrun it. */
+bool sock_unix_send_would_block(struct sock *self) {
+    if (!self || self->kind != SOCK_KIND_UNIX || !self->peer_ip) return false;
+    struct sock *peer = sock_by_fd((int)self->peer_ip - 1);
+    return peer && peer->in_use && peer->count >= SOCK_RX_DGRAMS;
 }
 
 long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms) {

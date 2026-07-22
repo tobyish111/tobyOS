@@ -15,7 +15,16 @@
 #include <tobyos/net.h>
 
 #define SOCK_MAX               128     /* pool depth (chrome/Mojo makes many pairs) */
-#define SOCK_RX_DGRAMS         8       /* per-socket UDP/UNIX ring depth */
+#define SOCK_RX_DGRAMS         64      /* per-socket UDP/UNIX ring depth. Was 8,
+                                        * which chrome's Mojo bursts overflowed --
+                                        * and a full ring DROPPED the oldest
+                                        * message, breaking the reliable stream
+                                        * (measured: 80+ drops/run -> the
+                                        * flags&3==3 header corruption + lost
+                                        * navigation). The ring never drops now
+                                        * (EAGAIN backpressure); the larger depth
+                                        * just makes backpressure rare. */
+#define SOCK_ERR_AGAIN         (-11)   /* enqueue would overflow: caller retries */
 
 #define SOCK_KIND_UDP          1
 #define SOCK_KIND_TCP          2
@@ -133,6 +142,9 @@ void sock_close(struct sock *s);
 
 /* AF_UNIX socketpair (Chromium Mojo IPC) -- see the note above struct sock. */
 long sock_unix_send(struct sock *self, const void *kbuf, size_t n);
+/* True if a send would hit backpressure now (peer RX ring full). Lets
+ * file_poll_ready report POLLOUT only when the peer can actually accept data. */
+bool sock_unix_send_would_block(struct sock *self);
 long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms);
 void sock_unix_peer_close(struct sock *self);
 

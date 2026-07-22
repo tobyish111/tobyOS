@@ -4701,7 +4701,13 @@ static short file_poll_ready(struct file *f) {
                 if (tf & TCP_RDY_ERR)  r |= LXP_POLLERR;
             }
         } else {
-            r |= LXP_POLLOUT;                    /* UDP/UNIX: assume sendable */
+            /* Writable only while the peer's RX ring has room. Reporting POLLOUT
+             * unconditionally is what let chrome keep writing into a full ring
+             * (which then dropped messages). Now a full peer ring reads as
+             * not-writable, so chrome waits for POLLOUT and retries after EAGAIN
+             * -- real backpressure, no loss. */
+            if (!(f->sock && sock_unix_send_would_block(f->sock)))
+                r |= LXP_POLLOUT;                    /* UDP (no peer) or room */
             if (f->sock && f->sock->count > 0) r |= LXP_POLLIN;  /* rx queued */
             /* AF_UNIX socketpair: a closed peer makes us readable (EOF) + HUP,
              * so Mojo's epoll loop detects disconnect. The fake-X-server loopback
@@ -5283,7 +5289,10 @@ static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
             urv = -ABI_EFAULT;
         else {
             long n = sock_unix_send(s, uk, len);
-            urv = (n < 0) ? -ABI_EPIPE : n;
+            /* SOCK_ERR_AGAIN = ring full -> tell the sender to retry (EAGAIN),
+             * NOT EPIPE. Dropping the message here was corrupting Mojo's stream. */
+            urv = (n == SOCK_ERR_AGAIN) ? -LXE_EAGAIN
+                : (n < 0)               ? -ABI_EPIPE : n;
         }
         kfree(uk);
         return urv;
@@ -5646,7 +5655,10 @@ static long lx_sendmsg(int fd, uint64_t umsg, int flags) {
         struct file *scm[SOCK_SCM_MAX_FDS];
         int nscm = lx_scm_send_collect(&mh, scm, SOCK_SCM_MAX_FDS);
         long n = sock_unix_send_fds(s, k, total, scm, nscm);
-        rv = (n < 0) ? -ABI_EPIPE : n;
+        /* Ring full -> EAGAIN (retry), never EPIPE. sock_unix_send_fds already
+         * released the SCM_RIGHTS clones on backpressure, so the retry re-clones. */
+        rv = (n == SOCK_ERR_AGAIN) ? -LXE_EAGAIN
+           : (n < 0)               ? -ABI_EPIPE : n;
     } else {
         rv = -LXE_ENOTSOCK;
     }
