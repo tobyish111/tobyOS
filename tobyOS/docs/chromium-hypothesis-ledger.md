@@ -136,6 +136,65 @@ Only syscalls 93 (fchown, benign) and 444 (landlock, a probe) are unhandled, so
 neither is a missing syscall. Next: chase the Mojo header validation — decode
 what flags chrome expects vs what the peer received.
 
+### DOM front — what a full 571 s run now shows (measured, machine survives)
+
+| Fact | Value |
+|---|---|
+| renderer spawns in 571 s | **exactly 1** (pid 33) |
+| renderer threads created | 5 (was 0 when the box died at 14 s) |
+| renderer CPU before death | 6.7 s — real work, past early init |
+| renderer fate | **SIGKILLed by the browser (pid 2) at 23 s, never respawned** |
+| browser after 23 s | alive but idle to 571 s; never retries a renderer |
+| "no connection" children | 1 (pid 18, clean exit 0) |
+
+Because `--dump-dom` needs the FIRST renderer to finish loading
+`chrome://headless/headless_command.html` before `executeCommands()` ever runs,
+that renderer dying at 23 s is the prime DOM suspect.
+
+Source read (`mojo/public/cpp/bindings/lib/message_header_validator.cc:65`): the
+`INVALID_FLAGS` error means a header arrived with **both** `kFlagExpectsResponse`
+and `kFlagIsResponse` set (`flags & 3 == 3`) — mutually exclusive. That is
+**data corruption of a single message**, not a logic error.
+
+| # | Hypothesis | Status | Evidence |
+|---|---|---|---|
+| M1 | AF_UNIX delivers datagram/message boundaries where Mojo's channel expects a BYTE STREAM, so the reader's framing drifts and it misreads the next header's flags | OPEN — prime lead | Handoff flagged it: "tobyOS's AF_UNIX is message-queued with a tail_off partial-read path — Mojo's channel framing may want byte-stream semantics." `flags & 3 == 3` is exactly what reading a header at the wrong offset looks like. |
+| M2 | Browser kills the renderer because of a bad Mojo message on the renderer pipe (`bad_message`) | OPEN | Validation error and renderer SIGKILL both cluster at ~23 s; not yet causally linked. |
+| M3 | Renderer is killed for hanging (never completes chrome://headless load), unrelated to the Mojo corruption | LIKELY (mechanism found) | See the traced chain below. |
+
+### The renderer chain, fully traced (logs/amap.log)
+
+Now that the machine survives, the renderer's whole life is visible for the
+first time:
+
+1. Renderer (pid 33) spawns, does V8-cage setup — a **bounded** burst of huge
+   32 GiB (`0x800000000`) mmap/munmap reserve-and-trim pairs (align-by-
+   over-allocate; our mmap is only 4 KiB-granular). **Completes** by ~13 s.
+   *(This retires the "mmap/munmap churn is the blocker" reading from slice 20 —
+   it is expensive but it finishes.)*
+2. Renderer sends ONE 80-byte accept on its primary channel (`sendto fd=5 -> 80`
+   at 13.577 s). The browser thread (pid 8) **receives it** (`recvmsg -> 80`)
+   and immediately **floods setup replies back** — dozens of messages
+   (312/1120/10488 B …).
+3. **The renderer never reads any of them.** Its channel shows exactly one send
+   and zero receives for its entire life. In its final ~5 s it is **spinning in
+   user code** (profiler: 54 then 37 ring-3 samples/interval vs 1–4 when idle),
+   syscalls dominated by a tight `gettid()` loop.
+4. Browser SIGKILLs the unresponsive renderer at ~18–23 s. Never respawns.
+
+| # | Hypothesis | Status | Evidence |
+|---|---|---|---|
+| R1 | The `gettid()` loop is a single stuck spinlock in the renderer | DISPROVEN | Profiler hot rips are VARIED (6 distinct addresses, hits=1) and gettid is heavy across MANY pids (33,18,2,16). Not one lock — the renderer executes varied code (progressing), calling gettid constantly. |
+| R2 | `gettid` returns a wrong/colliding value, breaking a lock | DISPROVEN (for the obvious form) | Each tobyOS thread is its own proc with a unique slot pid; `gettid = current_proc()->pid` is unique + stable per thread. |
+| R3 | **`PlatformThread::CurrentId()`'s thread-local cache is defeated**, so every process syscalls gettid constantly; combined with ~4–18% emulation speed the renderer can't finish init before the browser's kill timeout | OPEN — prime lead | gettid is called heavily in EVERY chrome process, which only happens if the TLS-cached CurrentId misses. Would explain chrome-wide slowness + the renderer missing a fixed browser-side deadline. |
+| R4 | Renderer init is genuinely stuck (not just slow) somewhere before the Mojo message loop | OPEN | Varied rips = progress, but it never reaches "read my channel." Distinguish from R3 by extending/removing the browser's renderer-kill timeout: if the renderer then finishes and reads its channel, it was slow (R3); if it still never reads, it is stuck (R4). |
+
+**Next concrete step:** determine slow-vs-stuck. Either extend the browser's
+renderer deadline (a chrome flag) so a healthy-but-slow renderer can finish, or
+verify TLS/`set_tid_address` + arch_prctl FS-base are correct so CurrentId can
+cache. If gettid caching is fixed and the renderer still never reads its channel,
+the front moves inside Blink/V8 renderer init.
+
 ### (historical) Open: which CR3, and why is it dead
 
 Prime suspect is a **PML4 use-after-free**. `proc_reap` calls

@@ -4737,6 +4737,24 @@ struct lx_pollfd { int fd; short events; short revents; };  /* 8 bytes, Linux AB
 #define LX_POLL_MAXFDS 256
 
 /* Core poll loop shared by poll/ppoll. timeout_ms < 0 == infinite. */
+/* Wall-clock nanoseconds, given the current monotonic reading.
+ *
+ * The RTC only has 1-second granularity, so sampling it per call would make
+ * CLOCK_REALTIME jump in whole seconds and stand still in between -- the same
+ * "time isn't moving" hazard we are fixing. Instead anchor ONCE (epoch minus
+ * the monotonic reading at that instant) and thereafter drive realtime from the
+ * calibrated TSC, so it advances smoothly at nanosecond resolution and never
+ * runs backwards. */
+static uint64_t lx_realtime_ns(uint64_t mono_ns) {
+    static uint64_t s_epoch_base_ns = 0;   /* unix_ns - mono_ns at anchor time */
+    if (s_epoch_base_ns == 0) {
+        uint64_t secs = rtc_unix_time();
+        if (secs == 0) return mono_ns;     /* no RTC: monotonic is all we have */
+        s_epoch_base_ns = secs * 1000000000ull - mono_ns;
+    }
+    return s_epoch_base_ns + mono_ns;
+}
+
 static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
     if (nfds > LX_POLL_MAXFDS) return -ABI_EINVAL;
     struct lx_pollfd fds[LX_POLL_MAXFDS];
@@ -6003,7 +6021,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * value increases, which is what chrome's timestamp deltas need). tz ign. */
     case LX_gettimeofday:
         if (a1) {
-            uint64_t ns = perf_now_ns();
+            /* Was time since BOOT presented as the Unix epoch -- so userspace
+             * believed it was Jan 1 1970 plus a few seconds. Anchor to the RTC. */
+            uint64_t ns = lx_realtime_ns(perf_now_ns());
             long tv[2] = { (long)(ns / 1000000000ull),
                            (long)((ns / 1000ull) % 1000000ull) };
             if (copy_to_user((void *)a1, tv, sizeof tv) != 0) return -ABI_EFAULT;
@@ -6086,8 +6106,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 
     /* ---- process control (B8): the shell forks, execs, and waits ---- */
     case LX_fork:
-    case LX_vfork:
-        return do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+    case LX_vfork: {
+        long fr = do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+#ifdef CHROMIUM_BOOT
+        /* The [fork] line inside sys_fork proves fork COMPLETED; this proves
+         * the PARENT got the value back and is on its way out of the syscall.
+         * If [fork] appears and this does not, we die between the two; if both
+         * appear and the world still stops, the parent reached here and
+         * something else halts the machine. */
+        {   static int pf = 0;
+            if (pf < 200) { pf++;
+                struct proc *me = current_proc();
+                kprintf("[fork] parent pid=%d returning %ld\n",
+                        me ? me->pid : -1, fr); } }
+#endif
+        return fr;
+    }
     case LX_clone:
         /* clone(flags, stack, ptid, ctid, tls). CLONE_VM (0x100) => a thread
          * that shares the address space (pthread_create); otherwise it's a
@@ -6095,7 +6129,20 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if ((uint64_t)a1 & 0x100u /* CLONE_VM */)
             return sys_clone_thread((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
                                     (uint64_t)a4, (uint64_t)a5);
-        return do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+        {
+            long cr = do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+#ifdef CHROMIUM_BOOT
+            /* THIS is the path chrome forks through (glibc fork() routes via
+             * clone), not LX_fork -- instrumenting LX_fork alone showed 4 forks
+             * completed and 0 returns purely because nothing came through it. */
+            {   static int cf = 0;
+                if (cf < 200) { cf++;
+                    struct proc *me = current_proc();
+                    kprintf("[fork] parent pid=%d clone-returning %ld\n",
+                            me ? me->pid : -1, cr); } }
+#endif
+            return cr;
+        }
     case LX_sched_yield:
         return do_syscall(SYS_YIELD, 0, 0, 0, 0, 0);
     case LX_execve:                    /* (path, argv, envp) -- same as Linux */
@@ -6525,9 +6572,23 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             { static int c=0; if(c<24){c++; kprintf("[memfd] mmap fd=%d len=0x%lx prot=0x%x -> 0x%lx\n",fd,(unsigned long)a2,(unsigned)a3,(unsigned long)ret);} }
 #endif
         }
-        else if ((lf & LXMAP_ANONYMOUS) || fd < 0)   /* anonymous (malloc/TLS) */
+        else if ((lf & LXMAP_ANONYMOUS) || fd < 0) { /* anonymous (malloc/TLS) */
             ret = sys_mmap((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
                            lx_mmap_flags(lf), -1, 0);
+#ifdef CHROMIUM_BOOT
+            /* [amap] anonymous mmap args+result. Chrome's renderer spins in a
+             * tight mmap/munmap loop; this shows what it wants. A hint (a1!=0)
+             * that we ignore, or a length whose natural alignment (e.g. 2 MiB
+             * PartitionAlloc super-pages) our 4 KiB-granular allocator doesn't
+             * satisfy, makes an allocator over-allocate/trim or retry forever. */
+            {   static int am = 0;
+                if (am < 300) { am++;
+                    struct proc *me = current_proc();
+                    kprintf("[amap] pid=%d mmap hint=0x%lx len=0x%lx fl=0x%x -> 0x%lx\n",
+                            me ? me->pid : -1, (unsigned long)a1,
+                            (unsigned long)a2, (unsigned)lf, (unsigned long)ret); } }
+#endif
+        }
         else
             ret = linux_mmap_file((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
                                   lf, fd, lx_mmap_offset());  /* file-backed */
@@ -6539,8 +6600,18 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 #endif
         return ret;
     }
-    case LX_munmap:
-        return do_syscall(ABI_SYS_MUNMAP, a1, a2, 0, 0, 0);
+    case LX_munmap: {
+        long mr = do_syscall(ABI_SYS_MUNMAP, a1, a2, 0, 0, 0);
+#ifdef CHROMIUM_BOOT
+        {   static int um = 0;
+            if (um < 300) { um++;
+                struct proc *me = current_proc();
+                kprintf("[amap] pid=%d munmap  addr=0x%lx len=0x%lx -> %ld\n",
+                        me ? me->pid : -1, (unsigned long)a1,
+                        (unsigned long)a2, mr); } }
+#endif
+        return mr;
+    }
     case LX_mprotect:
         return do_syscall(ABI_SYS_MPROTECT, a1, a2, a3, 0, 0);
     case LX_mremap:                 /* (old, old_sz, new_sz, flags, new_addr) */
@@ -6575,9 +6646,44 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return do_syscall(SYS_NANOSLEEP, (long)ns, 0, 0, 0, 0);
     }
     case LX_clock_gettime: {
-        long ms = do_syscall(ABI_SYS_CLOCK_MS, 0, 0, 0, 0, 0);
-        if (ms < 0) ms = 0;
-        struct lx_timespec ts = { ms / 1000, (ms % 1000) * 1000000 };
+        /* This used to IGNORE the clock id and return whole MILLISECONDS since
+         * boot for every clock. Two bugs in one:
+         *   - CLOCK_REALTIME read as ~13 seconds past the epoch, which is why
+         *     every chrome log line was stamped "0101/0000ss" (Jan 1 1970), and
+         *     why TimeTicks and Time were indistinguishable to it.
+         *   - 1 ms granularity while clock_getres advertises 1 ns, so code that
+         *     measures sub-millisecond intervals saw ZERO elapsed time between
+         *     successive calls. A monotonic clock that reports no progress is a
+         *     textbook way to make a deadline loop spin forever -- and
+         *     clock_gettime was ~50% of all syscalls in the ring, with chrome's
+         *     renderer among the hottest callers.
+         * Now: dispatch on the id and use the calibrated-TSC nanosecond source. */
+        uint64_t mono = perf_now_ns();
+        uint64_t val;
+        switch ((int)a1) {
+        case 0:  /* CLOCK_REALTIME       */
+        case 5:  /* CLOCK_REALTIME_COARSE */
+        case 8:  /* CLOCK_REALTIME_ALARM  */
+            val = lx_realtime_ns(mono);
+            break;
+        case 2:  /* CLOCK_PROCESS_CPUTIME_ID */
+        case 3:  /* CLOCK_THREAD_CPUTIME_ID  */
+            /* Not per-task CPU accounting, but it must still be a clock that
+             * only ever moves forward; monotonic is the honest approximation. */
+            val = mono;
+            break;
+        case 1:  /* CLOCK_MONOTONIC       */
+        case 4:  /* CLOCK_MONOTONIC_RAW   */
+        case 6:  /* CLOCK_MONOTONIC_COARSE*/
+        case 7:  /* CLOCK_BOOTTIME        */
+        case 9:  /* CLOCK_BOOTTIME_ALARM  */
+            val = mono;
+            break;
+        default:
+            return -ABI_EINVAL;   /* unknown clock: fail, don't invent a time */
+        }
+        struct lx_timespec ts = { (long)(val / 1000000000ull),
+                                  (long)(val % 1000000000ull) };
         if (a2 && copy_to_user((void *)a2, &ts, sizeof ts) != 0)
             return -ABI_EFAULT;
         return 0;
@@ -6785,6 +6891,23 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                         (const void *)(uintptr_t)a4);
 #ifdef CHROMIUM_BOOT
         waitt_exit();
+        /* [futex] WAIT/WAKE with ADDRESS and RESULT, so waits can be matched to
+         * wakes rather than inferred from durations. Long futex waits alone
+         * prove nothing -- chrome parks idle thread-pool workers for many
+         * seconds on purpose. The question is whether a WAIT on some address
+         * ever receives a WAKE on that SAME address (per-process: these are
+         * private futexes, so addresses are only comparable within a pid).
+         * op low bits: 0=WAIT 1=WAKE 9=WAIT_BITSET 10=WAKE_BITSET. */
+        {   static int fx = 0;
+            int op = (int)a2 & 0x7f;      /* strip PRIVATE(128)/CLOCK_REALTIME */
+            if (fx < 400 && (op == 0 || op == 1 || op == 9 || op == 10)) {
+                fx++;
+                struct proc *me = current_proc();
+                kprintf("[futex] pid=%d %s addr=0x%lx val=%u -> %ld\n",
+                        me ? me->pid : -1,
+                        (op == 0 || op == 9) ? "WAIT" : "WAKE",
+                        (unsigned long)a1, (unsigned)a3, fr);
+            } }
 #endif
         return fr;
     }
