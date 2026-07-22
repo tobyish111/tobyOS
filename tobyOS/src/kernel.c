@@ -7253,6 +7253,28 @@ void _start(void) {
         }
     }
 
+    /* Eventfd/epoll wakeup test (the remaining DOM blocker): does epoll_wait on
+     * an eventfd wake when another thread writes it? PASS=3, FAIL=1, ERROR=2. */
+    {
+        const char *path = "/bin/linux-eventfd";
+        char *argv[] = { (char *)"linux-eventfd", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-eventfd",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] EFDTEST: spawning %s\n", path);
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[EFDTEST] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[EFDTEST] VERDICT: %s exit=%d (3=PASS epoll_wait woken by "
+                    "cross-thread eventfd write; 1=FAIL lost wakeup; 2=ERROR)\n",
+                    rc == 3 ? "PASS" : "FAIL", rc);
+        }
+    }
+
     /* Track B M0: spawn a REAL, UNMODIFIED, off-the-shelf headless Chromium
      * (chrome-headless-shell from Chrome-for-Testing -- the actual V8 + Blink
      * engine, not a re-implementation; bundles SwiftShader for software GL).

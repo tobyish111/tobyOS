@@ -1781,6 +1781,14 @@ programs/linux-futex/linux-futex.elf: programs/linux-futex/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# Eventfd/epoll unit test: epoll_wait on an eventfd must wake when another thread
+# writes it (the renderer's efd-14 case). Static Linux ELF, branded via dd.
+programs/linux-eventfd/linux-eventfd.elf: programs/linux-eventfd/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 # B25: the REAL glibc 2.41 static proof (programs/linux-glibc) is deliberately
 # NOT built here -- it must link against an actual glibc sysroot, which the
 # freestanding in-tree clang cannot supply. Build it out-of-tree with
@@ -2357,6 +2365,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-msgsock/linux-msgsock.elf \
                programs/linux-static-auto/linux-static-auto.elf \
                programs/linux-futex/linux-futex.elf \
+               programs/linux-eventfd/linux-eventfd.elf \
                programs/linux-procfs/linux-procfs.elf \
                programs/linux-tty/linux-tty.elf \
                programs/linux-pty/linux-pty.elf \
@@ -2485,6 +2494,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-static-auto/linux-static-auto.elf $(INITRD_STAGE)/bin/linux-static-auto
 	cp programs/linux-procfs/linux-procfs.elf         $(INITRD_STAGE)/bin/linux-procfs
 	cp programs/linux-futex/linux-futex.elf           $(INITRD_STAGE)/bin/linux-futex
+	cp programs/linux-eventfd/linux-eventfd.elf       $(INITRD_STAGE)/bin/linux-eventfd
 	cp programs/linux-tty/linux-tty.elf               $(INITRD_STAGE)/bin/linux-tty
 	cp programs/linux-pty/linux-pty.elf               $(INITRD_STAGE)/bin/linux-pty
 	cp programs/linux-procfs2/linux-procfs2.elf       $(INITRD_STAGE)/bin/linux-procfs2
@@ -2923,7 +2933,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-fbwin bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
-	    bin/linux-futex \
+	    bin/linux-futex bin/linux-eventfd \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
