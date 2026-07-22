@@ -554,3 +554,44 @@ clock_gettime clock-id/ns; AF_UNIX message-drop -> backpressure; timed
 FUTEX_WAIT wakeable by FUTEX_WAKE. ~11 real kernel bugs. Chrome went from
 triple-faulting at 14 s to running its full multi-process engine 270 s+ clean
 with working Mojo. DOM remains blocked on the eventfd path above.
+
+---
+
+## SLICE 31 — eventfd primitive PROVEN correct; futex ops complete; deadlock is chrome-internal
+
+Per the ledger's own prescription, tested the two suspect primitives in ISOLATION
+before trusting chrome:
+
+- **`/bin/linux-eventfd` (committed be3dff2): PASS.** Thread A parks in epoll_wait
+  on an eventfd; another thread writes it; A wakes promptly with EPOLLIN. So the
+  tobyOS eventfd/epoll wakeup is CORRECT -- the renderer's efd-14 park is NOT a
+  tobyOS bug; efd 14 is simply never *written* by chrome.
+- **Futex ops: complete for chrome.** A `[futexop]` trace on the -EINVAL path saw
+  **0** unhandled ops -- chrome uses only WAIT/WAKE/WAIT_BITSET/WAKE_BITSET, all
+  handled. Missing CMP_REQUEUE/WAKE_OP/PI is NOT the blocker.
+
+**So both wakeup primitives are correct, and chrome uses no unhandled futex op --
+yet the renderer still deadlocks** (post-futex-fix run: main thread + workers
+futex-blocked 200-270 s, then the browser SIGKILLs the renderer). The remaining
+deadlock is therefore a chrome-internal CIRCULAR WAIT: thread A waits a
+FUTEX_WAKE that thread B should issue, but B is itself blocked -- a cycle. Chrome
+does not deadlock on real Linux, so some subtler tobyOS behaviour steers its
+threads into the cycle, but it is NOT a broken WAIT/WAKE/eventfd primitive.
+
+### Honest position on the DOM
+
+Every concretely-identifiable, independently-validatable tobyOS bug on the path
+has been found and fixed (~11). The residual blocker is a chrome-internal thread
+deadlock with no broken primitive under it -- exactly the tier where kernel
+traces localize but cannot name the cause, and chrome's own logging is compiled
+out. Cracking it likely needs chrome-side visibility (a logging-enabled
+chrome-headless-shell build, or driving DevTools over --remote-debugging-pipe to
+see which IPC the renderer is stuck awaiting), NOT more kernel archaeology.
+
+**Method that worked and should continue:** prove each primitive in isolation
+with a tiny FAIL/PASS unit test (linux-futex, linux-eventfd) before ever
+attributing a chrome hang to it. Every multi-hour detour this arc was a
+chrome-only inference a 5-second unit test would have settled. The next suspect
+primitive to unit-test if pursued: the exact glibc condvar wait/signal SEQUENCE
+(a 3-thread cond_wait/cond_signal test), since a subtle ordering gap there could
+produce the observed circular wait even with WAIT/WAKE individually correct.

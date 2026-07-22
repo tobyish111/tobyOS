@@ -502,6 +502,9 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
         return woken;
     }
 
+    /* NOTE (verified via a [futexop] trace during bring-up): chrome uses ONLY
+     * FUTEX_WAIT/WAKE/WAIT_BITSET/WAKE_BITSET -- 0 hits on any other op -- so
+     * missing CMP_REQUEUE/WAKE_OP/PI is NOT a chrome blocker here. */
     return -22; /* -EINVAL */
 }
 
