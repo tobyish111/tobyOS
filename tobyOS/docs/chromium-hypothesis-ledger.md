@@ -498,3 +498,59 @@ trusting it under chrome; (3) keep `futex_forget_proc` in teardown regardless,
 it is a real latent-bug fix. Do NOT ship a futex change without a green
 defboot AND a targeted wake test AND a chrome run that shows the renderer
 progressing past the ~17 s deadlock.
+
+---
+
+## SLICE 30 — DL2 FIXED and validated: timed FUTEX_WAIT now wakeable by FUTEX_WAKE
+
+**Committed 7da9d16.** The confirmed DL2 bug (timed FUTEX_WAIT polled *uaddr and
+was not on the wait list, so FUTEX_WAKE was silently lost) is fixed: both timed
+and untimed waiters block ON the list; FUTEX_WAKE wakes them; a deadline sweep
+(`futex_expire_timeouts`) handles genuine timeouts; `futex_forget_proc` unlinks
+exiting threads.
+
+**Test-driven (as the ledger required).** Added `/bin/linux-futex` -- clones a
+thread, does a TIMED FUTEX_WAIT (10 s deadline) on an UNCHANGED word, then
+FUTEX_WAKEs it. Boot harness prints `[FUTEXTEST] VERDICT`. Rigorous FAIL->PASS:
+**old code = FAIL (exit 1, lost wakeup); fixed code = PASS (exit 3, woken by
+FUTEX_WAKE).** Keep this test green for any future futex change.
+
+Two traps recorded:
+- The test harness itself had a bug: `clone` saved the thread-entry fn in **r11,
+  which `syscall` clobbers**, so the child jumped to garbage and never ran --
+  which looked like the futex FAILing. Use a callee-saved reg (r12) for anything
+  that must survive a syscall. (This is why an earlier "reproduced in isolation"
+  was a false positive.)
+- The deadline sweep MUST NOT run in the timer IRQ (`sched_tick`): it faulted
+  `current_proc()`/`smp_this_cpu()` under chrome (2 kernel panics). Moving it to
+  `sched_yield`'s slow path (normal kernel context) removed the panics entirely.
+
+Validation: unit test PASS; defboot clean to login+GUI; **chrome runs 276 s with
+0 panics / 0 DEAD-cr3.**
+
+### STILL NO DOM -- the remaining blocker is the eventfd, not the futex
+
+The futex fix did NOT produce the DOM. The renderer still deadlocks, now clearly
+on the SEPARATE **intra-renderer eventfd** path already documented (slice 27):
+`efd 14` is created by a renderer thread, registered in its own epoll, **never
+SCM-passed and written by NO ONE**, so the IO thread parked in `epoll_wait` on it
+never wakes. A sibling thread that SHOULD signal efd 14 does not -- and now that
+the futex lost-wakeup is fixed, THAT sibling's failure to signal is the live
+lead, not a futex artifact.
+
+**Next front (for whoever picks this up):** apply the SAME test-driven method to
+the eventfd/epoll path. Build a `/bin/linux-eventfd` unit test: thread A parks in
+`epoll_wait` on an eventfd; thread B writes the eventfd; assert A wakes. If it
+FAILs in isolation, that is the DOM bug and it is tobyOS-fixable. If it PASSes,
+the renderer's efd-14 signal genuinely never happens in chrome's logic and the
+front moves inside Blink. Either way: **prove the primitive in isolation before
+trusting a chrome run** -- this session's biggest time sinks were all chrome-only
+inferences that a 5 s unit test would have settled.
+
+### Session tally of shipped, validated fixes (all merged path or committed)
+shm inode-incarnation aliasing; AF_UNIX sendto; SYSRET STAR base; initrd RAM;
+PML4 use-after-free; reaped-slot-in-runqueue triple fault; NULL-kstack guard;
+clock_gettime clock-id/ns; AF_UNIX message-drop -> backpressure; timed
+FUTEX_WAIT wakeable by FUTEX_WAKE. ~11 real kernel bugs. Chrome went from
+triple-faulting at 14 s to running its full multi-process engine 270 s+ clean
+with working Mojo. DOM remains blocked on the eventfd path above.
