@@ -297,6 +297,45 @@ is fully healthy through Mojo bootstrap and Blink/V8 init, and stalls only at th
 eventfd wakeup of the shared-memory message transport. Committable `[epreg]`
 instrument added.
 
+### CORRECTION (slice 27) — eventfd cross-process signaling mostly WORKS; V1 is too broad
+
+Stamped each `struct eventfd` with a unique id and traced create / SCM-pass /
+write / poll across processes (`[efd]` + `[scm]` id + `[epreg]` id). Tracing the
+five eventfds the renderer group polls:
+
+| efd_id | created by | written by | result |
+|---|---|---|---|
+| 27 | renderer | **pid 17 (cross-process)** | works |
+| 12 | renderer | **pid 17 (cross-process)** | works |
+| 13 | renderer | renderer's own group | works |
+| 15 | renderer | renderer's own group | works |
+| **14** | **pid 36 (renderer)** | **NOBODY, 0 writes** | **hangs** |
+
+So **V1 ("browser never writes the notification eventfd") is DISPROVEN as a
+blanket claim** — cross-process eventfd signaling demonstrably works (pid 17
+signals efd 27 & 12; earlier run pid 27 signaled efd 23). The failure is narrow
+and specific: **efd 14 is created and polled by the renderer but signaled by no
+one.** None of these were SCM-passed, so they are INTRA-renderer notifications —
+efd 13 & 15 get signaled by sibling threads, efd 14 never does. That means a
+renderer thread that *should* write efd 14 is itself blocked. This is threads
+inside the renderer waiting on each other, not a kernel eventfd transport bug.
+
+**Honest reassessment:** 4 of the renderer's 5 polled eventfds DO get signaled,
+so the renderer is NOT globally stalled on eventfd delivery — it makes progress
+on most channels. Whether the single orphaned efd 14 is the load-blocking one, or
+a side effect of the main thread being busy elsewhere, is NOT established. The
+kernel-trace approach has localized the transport (eventfd) and proven it mostly
+works, but the remaining fault is an intra-renderer thread dependency inside
+stripped Blink/V8 code, where kernel traces can localize but not name the cause.
+
+**Method note for next agent:** this front needs chrome-side visibility, not more
+kernel archaeology. Options: (a) read `RenderProcessHostImpl` source for the
+exact browser-side renderer-kill trigger (prime-directive move, under-used this
+session); (b) a build of `chrome-headless-shell` with logging, or a lighter
+headless target; (c) accept the renderer/Blink tier as the documented frontier
+and bank the ~10 kernel bugs fixed this session. Instruments `[efd]`/`[epreg]`
+committed.
+
 ### (historical) Open: which CR3, and why is it dead
 
 Prime suspect is a **PML4 use-after-free**. `proc_reap` calls

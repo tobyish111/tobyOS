@@ -31,6 +31,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/cpu.h>
 #include <tobyos/sched.h>
+#include <tobyos/proc.h>   /* current_proc -- [efd] Mojo-notification trace */
 #include <tobyos/abi/abi.h>
 
 static long console_read(void *buf, size_t n) {
@@ -74,19 +75,32 @@ struct eventfd {
     uint64_t count;
     uint32_t flags;
     int      refs;
+    uint32_t id;     /* stable object identity, so a write in one process can be
+                      * matched to the poll/read in another (Mojo notification). */
 };
+
+int eventfd_id(struct file *f) { return (f && f->efd) ? (int)f->efd->id : -1; }
 
 struct file *eventfd_file_make(unsigned int initval, unsigned int flags) {
     struct eventfd *e = (struct eventfd *)kmalloc(sizeof(*e));
     if (!e) return 0;
+    static uint32_t s_efd_id = 1;
     e->count = (uint64_t)initval;
     e->flags = flags;
     e->refs  = 1;
+    e->id    = s_efd_id++;
     struct file *f = (struct file *)kmalloc(sizeof(*f));
     if (!f) { kfree(e); return 0; }
     memset(f, 0, sizeof(*f));
     f->kind = FILE_KIND_EVENTFD;
     f->efd  = e;
+#ifdef CHROMIUM_BOOT
+    {   static int ec = 0;
+        if (ec < 200) { ec++;
+            struct proc *me = current_proc();
+            kprintf("[efd] pid=%d CREATE efd_id=%u flags=0x%x\n",
+                    me ? me->pid : -1, e->id, flags); } }
+#endif
     return f;
 }
 
@@ -121,6 +135,17 @@ static long eventfd_write(struct file *f, const void *buf, size_t n) {
         sched_yield();                 /* cooperative wait for a reader */
     }
     e->count += add;
+#ifdef CHROMIUM_BOOT
+    /* [efd] who signals which eventfd OBJECT. Correlate the id here with the id
+     * in [epreg] to see whether the browser ever signals the eventfd the
+     * renderer's IO thread polls (V1) and whether they are the SAME object (V2). */
+    {   static int ew = 0;
+        if (ew < 300) { ew++;
+            struct proc *me = current_proc();
+            kprintf("[efd] pid=%d WRITE efd_id=%u +%lu -> count=%lu\n",
+                    me ? me->pid : -1, e->id, (unsigned long)add,
+                    (unsigned long)e->count); } }
+#endif
     return 8;
 }
 

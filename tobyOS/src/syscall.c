@@ -4893,9 +4893,10 @@ static long lx_epoll_ctl(int epfd, int op, int fd, uint64_t uevent) {
             if (er < 200) { er++;
                 struct file *rf = fd_lookup(fd);
                 struct proc *me = current_proc();
-                kprintf("[epreg] pid=%d epfd=%d ADD fd=%d kind=%d events=0x%x\n",
+                int eid = (rf && rf->kind == FILE_KIND_EVENTFD) ? eventfd_id(rf) : -1;
+                kprintf("[epreg] pid=%d epfd=%d ADD fd=%d kind=%d efd_id=%d events=0x%x\n",
                         me ? me->pid : -1, epfd, fd,
-                        rf ? (int)rf->kind : -1, (unsigned)ev.events); } }
+                        rf ? (int)rf->kind : -1, eid, (unsigned)ev.events); } }
 #endif
         return 0;
     }
@@ -5564,6 +5565,8 @@ static void lx_scm_recv_emit(uint64_t umsg, const struct lx_msghdr *mh,
             if (files[i]->kind == FILE_KIND_SOCKET && files[i]->sock)
                 kprintf("(peer=%d)", files[i]->sock->peer_ip
                                      ? (int)files[i]->sock->peer_ip - 1 : -1);
+            if (files[i]->kind == FILE_KIND_EVENTFD)
+                kprintf("(efd_id=%d)", eventfd_id(files[i]));  /* trace Mojo notify efd across procs */
         }
         kprintf("\n"); } }
 #endif

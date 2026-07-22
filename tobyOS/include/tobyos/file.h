@@ -166,6 +166,8 @@ struct file {
  * value and flags (EFD_SEMAPHORE / EFD_NONBLOCK honoured). Returns NULL on
  * OOM. */
 struct file *eventfd_file_make(unsigned int initval, unsigned int flags);
+/* Stable per-object eventfd id (for cross-process Mojo-notification tracing). */
+int eventfd_id(struct file *f);
 
 /* Poll readiness helper: nonzero if the eventfd counter is > 0 (POLLIN). */
 int eventfd_pollin(struct file *f);
