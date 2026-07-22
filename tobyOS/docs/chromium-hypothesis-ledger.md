@@ -414,3 +414,44 @@ Silent: no crash, no panic, no exception. Reproducible on **both** TCG and WHPX.
   (`with no connection` fires at 15 s) are meaningless without the last
   `[N ms]`. Chrome now runs at ~4 % real-time under TCG.
 - **A "verified working" claim is only verified for the path that exercised it.**
+
+---
+
+## SLICE 28 — a real transport bug fixed; renderer now deadlocks on an intra-renderer wakeup
+
+**FOUND & FIXED (commit f10e66b): the AF_UNIX ring DROPPED messages.** The
+`[unixdrop]` trace confirmed the 8-deep socket ring dropped the oldest message on
+overflow -- 80+ drops/run on every Mojo socketpair. On a reliable stream a
+dropped message breaks framing -> the `flags&3==3` corruption + non-deterministic
+renderer kills. Fix: ring 8->64, full ring returns EAGAIN (backpressure) instead
+of dropping, and `file_poll_ready` reports POLLOUT only when the peer ring has
+room. Measured: **drops 80 -> 0; channel ops 230 -> 401; the RENDERER now
+SURVIVES (was killed); the error moved from INVALID_FLAGS on the renderer to a
+later ILLEGAL_MEMORY_RANGE on the network service.** defboot still clean.
+
+**The socket is byte-perfect now.** A per-dgram FNV checksum (`[sockchk]`),
+stamped at enqueue and verified at dequeue: **0 mismatches**. So the residual
+ILLEGAL_MEMORY_RANGE is NOT socket corruption -- it is above the socket (ipcz
+shared-memory message data, uncovered by the checksum) or chrome-internal, and it
+is on the network service, which the internal chrome://headless page does NOT
+need.
+
+**Current DOM blocker = the renderer DEADLOCKS.** With the drop fix the renderer
+survives, runs ~75 channel ops until ~17 s, then EVERY thread blocks for the rest
+of the run (wait-graph at 225 s): main thread pid 33 in **futex 216 s**; IO thread
+pid 37 in **epoll_wait 135 s on efd_id=14**; pid 36 in epoll_wait on efd 13 (13 IS
+signaled, 14 is NOT); others futex 208-216 s.
+
+**efd 14 is created by renderer thread pid 37, registered in its own epoll, NEVER
+SCM-passed, and written by NO ONE.** An intra-renderer wakeup a sibling thread
+should post and doesn't. With the main thread's 216 s futex wait this is a
+circular deadlock inside the renderer's threading.
+
+| # | Hypothesis | Status | Next |
+|---|---|---|---|
+| DL1 | Chrome-internal deadlock (waker legitimately blocked, no wake issued) | OPEN | plausible |
+| DL2 | **tobyOS futex/eventfd WAKE-DELIVERY bug** (a wake IS issued but never reaches the waiter) | OPEN -- NOT ruled out | the `[futex]` trace capped (400 lines / 24.8 s) while the deadlock runs to 225 s, so wake-after-block is unobservable. Need an UNCAPPED instrument keyed on pid 33's futex addr + efd 14, full run. |
+
+**Decisive next fork:** DL2 would be a tobyOS-fixable wakeup-delivery bug and
+likely THE DOM blocker; DL1 puts the front inside chrome's renderer threading.
+Distinguish with an uncapped wake-targeting-the-stuck-addresses trace.

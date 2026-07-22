@@ -228,6 +228,11 @@ static int unix_enqueue_fds(struct sock *s, const void *payload, size_t len,
     struct sock_dgram *d = &s->dgrams[s->head];
     d->src_ip = 0; d->src_port = 0; d->len = (uint16_t)len; d->payload = copy;
     d->nfds = 0;
+#ifdef CHROMIUM_BOOT
+    {   uint32_t h = 2166136261u;                 /* FNV-1a over the copied bytes */
+        for (size_t i = 0; i < len; i++) { h ^= copy[i]; h *= 16777619u; }
+        d->chksum = h; }
+#endif
     for (int i = 0; i < nfiles; i++) d->fds[d->nfds++] = files[i];
     s->head = (uint8_t)((s->head + 1) % SOCK_RX_DGRAMS);
     s->count++;
@@ -345,6 +350,24 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
     }
 
     struct sock_dgram *d = &self->dgrams[self->tail];
+#ifdef CHROMIUM_BOOT
+    /* Prove the transport delivers EXACT bytes: recompute the payload hash on
+     * first touch and compare to the value stamped at enqueue. A mismatch means
+     * the queued buffer was corrupted in the kernel (aliasing / a stray write /
+     * heap reuse); a match means the socket is byte-perfect and the
+     * ILLEGAL_MEMORY_RANGE corruption is ABOVE it (shared memory or chrome). */
+    if (self->tail_off == 0 && d->payload && d->len) {
+        uint32_t h = 2166136261u;
+        for (uint16_t i = 0; i < d->len; i++) { h ^= d->payload[i]; h *= 16777619u; }
+        if (h != d->chksum) {
+            static int cm = 0;
+            if (cm < 40) { cm++;
+                kprintf("[sockchk] CORRUPT sock=%d len=%u enq=0x%x deq=0x%x\n",
+                        sock_index(self), (unsigned)d->len,
+                        (unsigned)d->chksum, (unsigned)h); }
+        }
+    }
+#endif
     /* Stream semantics: a short read consumes from tail_off and leaves the rest
      * of this dgram queued (X11 is a byte stream; xcb reads the 8-byte setup
      * prefix then the length*4 body in two reads). For a message-boundary

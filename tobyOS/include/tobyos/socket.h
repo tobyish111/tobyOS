@@ -81,6 +81,10 @@ struct sock_dgram {
     uint8_t  *payload;         /* kmalloc'd; freed on dequeue */
     struct file *fds[SOCK_SCM_MAX_FDS];
     uint8_t   nfds;
+#ifdef CHROMIUM_BOOT
+    uint32_t  chksum;          /* FNV of payload at enqueue; verified at dequeue
+                                * to prove the transport delivers exact bytes. */
+#endif
 };
 
 struct proc;
