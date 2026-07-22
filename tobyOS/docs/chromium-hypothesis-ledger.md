@@ -336,6 +336,44 @@ headless target; (c) accept the renderer/Blink tier as the documented frontier
 and bank the ~10 kernel bugs fixed this session. Instruments `[efd]`/`[epreg]`
 committed.
 
+### SOURCE READ (slice 27) — the renderer kill is `ShutdownForBadMessage`, and the run is NON-DETERMINISTIC
+
+Read `content/browser/renderer_host/render_process_host_impl.cc`
+(151.0.7922.34). The forceful renderer SIGKILL path is
+`RenderProcessHostImpl::ShutdownForBadMessage()` →
+`Shutdown(RESULT_CODE_KILLED_BAD_MESSAGE)` → `child_process_launcher_->Terminate`
+— fired when the browser receives an **illegal Mojo message** from the renderer.
+It is gated only by `--disable-kill-after-bad-ipc`, NOT by `--disable-hang-monitor`
+or `--timeout`, which is exactly why the ~18 s kill was robust to both.
+
+This ties back to the `VALIDATION_ERROR_MESSAGE_HEADER_INVALID_FLAGS`
+(`flags & 3 == 3`, mutually-exclusive request/response bits both set) seen early:
+a message arriving with a corrupt header IS an illegal message → bad-message kill.
+
+**But the behaviour is NON-DETERMINISTIC across runs — the decisive new fact:**
+
+| run | renderer killed? | validation error? | DOM |
+|---|---|---|---|
+| amap.log | YES (pid 33) | 0 | no |
+| dq.log | YES (pid 33) | 1 | no |
+| efd3.log | **NO** (pid 32 survived; only GPU-type pids 17/19 killed) | 0 | no |
+
+So: (1) the renderer is NOT always killed; (2) when it survives, there is STILL
+no DOM. The bad-message kill is therefore ONE manifestation, not the whole story
+— there is an underlying "renderer never completes the chrome://headless load"
+that persists even when the renderer lives, plus an OCCASIONAL, timing-dependent
+Mojo message corruption that sometimes trips the bad-message kill.
+
+**Net root-cause shape:** a race/timing-dependent data-integrity issue in the
+Mojo transport (socket framing or shared-memory coherence) that corrupts a
+message header intermittently, layered on a renderer that is slow/incomplete in
+Blink/V8 init. Both live where kernel traces can localize but not name. The
+`flags & 3 == 3` corruption is the single most concrete, reproducible-in-1-of-N
+artifact; the next productive instrument is a Mojo-header integrity check at the
+socket boundary (log sender-side flags vs receiver-side flags for channel
+messages) to prove transport corruption vs higher-layer, but it needs the node-
+channel framing decoded first.
+
 ### (historical) Open: which CR3, and why is it dead
 
 Prime suspect is a **PML4 use-after-free**. `proc_reap` calls
