@@ -186,6 +186,14 @@ struct proc {
      * ONE such queue (e.g. a pipe's wq_read). The queue owner walks the
      * chain via this field on wakeup. */
     struct proc    *next_wait;
+    /* Futex: absolute monotonic-ns deadline for a TIMED FUTEX_WAIT (0 = none/
+     * infinite). Timed waiters now block ON the wait list (so FUTEX_WAKE can
+     * wake them -- the old poll-only timed path could only be woken by a *uaddr
+     * value change, so glibc condvar/mutex FUTEX_WAKE wakeups were silently
+     * lost). A periodic sweep (futex_expire_timeouts) wakes waiters past their
+     * deadline and sets futex_timed_out so the return is -ETIMEDOUT. */
+    uint64_t        futex_deadline_ns;
+    bool            futex_timed_out;
     /* Back-pointer to the wait-queue HEAD this proc is currently parked
      * on (NULL when not blocked on any queue). signal_send() uses it to
      * splice the proc out of the queue when it forcibly wakes up a

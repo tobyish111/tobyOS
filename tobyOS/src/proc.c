@@ -1147,6 +1147,7 @@ __attribute__((noreturn)) void proc_exit(int code) {
                  * syscall_entry. (Measured: pid=27 is_thread=1 tgid=17,
                  * kstack_top=0x0.) */
                 sched_dequeue(q);
+                { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
                 /* Free the thread's kernel stack */
                 if (q->kstack_base) kfree(q->kstack_base);
                 q->kstack_base = 0;
@@ -1197,6 +1198,7 @@ static void proc_reap(struct proc *p) {
     /* Unlink from any ready queue before we free its stack and zero the slot.
      * The same reachable-after-teardown hazard the thread-group-exit path had. */
     sched_dequeue(p);
+    { extern void futex_forget_proc(struct proc *); futex_forget_proc(p); }
 
     /* Tear down the address space only when NOBODY else is still in it.
      *

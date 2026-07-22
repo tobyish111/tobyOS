@@ -7229,6 +7229,30 @@ void _start(void) {
 #endif
 
 #ifdef CHROMIUM_BOOT
+    /* Futex unit test (ledger DL2): prove a TIMED FUTEX_WAIT is wakeable by
+     * FUTEX_WAKE, in ISOLATION, before the noisy chrome run. Runs first so its
+     * verdict prints early; a quick boot can read it without waiting for chrome.
+     * PASS=3, FAIL=1 (lost wakeup), ERROR=2. */
+    {
+        const char *path = "/bin/linux-futex";
+        char *argv[] = { (char *)"linux-futex", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-futex",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] FUTEXTEST: spawning %s\n", path);
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[FUTEXTEST] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[FUTEXTEST] VERDICT: %s exit=%d (3=PASS timed-wait woken by "
+                    "FUTEX_WAKE; 1=FAIL lost wakeup; 2=ERROR)\n",
+                    rc == 3 ? "PASS" : "FAIL", rc);
+        }
+    }
+
     /* Track B M0: spawn a REAL, UNMODIFIED, off-the-shelf headless Chromium
      * (chrome-headless-shell from Chrome-for-Testing -- the actual V8 + Blink
      * engine, not a re-implementation; bundles SwiftShader for software GL).

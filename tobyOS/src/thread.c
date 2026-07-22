@@ -438,47 +438,35 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
             return -11; /* -EAGAIN */
         }
 
-        if (deadline_ns == 0) {
-            /* Untimed: efficient block, woken by FUTEX_WAKE. */
-            struct futex_entry *e = futex_find_or_create(cr3, addr);
-            if (!e) {
-                spin_unlock_irqrestore(&g_futex_lock, flags);
-                return -12; /* -ENOMEM */
-            }
-            caller->state = PROC_BLOCKED;
-            caller->next_wait = e->waiters;
-            e->waiters = caller;
+        /* Block ON the wait list, whether timed or not. This is the DL2 fix:
+         * the old code gave TIMED waits a SEPARATE poll-only path that watched
+         * *uaddr and was NOT on the wait list, so FUTEX_WAKE could not wake them
+         * -- only a *uaddr change could. glibc's pthread_cond_timedwait /
+         * mutex_timedlock (pervasive in chrome) are woken by FUTEX_WAKE and do
+         * NOT always change the word the waiter parked on, so those wakeups were
+         * silently lost and chrome's renderer deadlocked. Now both timed and
+         * untimed waiters register on the list; FUTEX_WAKE wakes them, and the
+         * periodic futex_expire_timeouts() sweep wakes any past its deadline.
+         * Validated in isolation by /bin/linux-futex (FAIL -> PASS). */
+        if (deadline_ns && perf_now_ns() >= deadline_ns) {
             spin_unlock_irqrestore(&g_futex_lock, flags);
-            sched_yield();
-            return 0;
+            return -110; /* -ETIMEDOUT: deadline already in the past */
         }
-
-        /* Timed: poll-with-idle against the deadline (the waiter is NOT on the
-         * wait list -- the waker changes *uaddr before FUTEX_WAKE, which we
-         * detect on recheck; glibc tolerates the resulting spurious wakeups). */
+        struct futex_entry *e = futex_find_or_create(cr3, addr);
+        if (!e) {
+            spin_unlock_irqrestore(&g_futex_lock, flags);
+            return -12; /* -ENOMEM */
+        }
+        caller->state             = PROC_BLOCKED;
+        caller->futex_deadline_ns = deadline_ns;   /* 0 = infinite */
+        caller->futex_timed_out   = false;
+        caller->next_wait = e->waiters;
+        e->waiters = caller;
         spin_unlock_irqrestore(&g_futex_lock, flags);
-        for (;;) {
-            uint32_t v;
-            if (copy_from_user(&v, uaddr, sizeof v) != 0) return -14;
-            if (v != val)                    return 0;    /* woken */
-            if (caller->pending_signals)     return -4;   /* -EINTR */
-            if (perf_now_ns() >= deadline_ns) return -110;/* -ETIMEDOUT */
-            /* Slice 8 fix (Chromium ~60s startup freeze): YIELD so READY peers
-             * run while we poll toward the deadline. The old loop only hlt'd
-             * THIS cpu -- it never serviced the ready queue -- so a timed-futex
-             * waiter (glibc pthread_cond_timedwait / sem_timedwait, pervasive in
-             * chrome's thread pool) stayed "current" (state RUNNING, never
-             * PROC_BLOCKED, and kernel-mode is NOT preempted by sched_tick) and
-             * starved every runnable peer, including the browser main thread, for
-             * the entire wait. sched_yield runs a peer if any; the hlt below then
-             * idles ~1 tick so we don't busy-spin the deadline when alone. */
-            sched_yield();
-            bool had = bkl_held();
-            if (had) bkl_exit();
-            sti();
-            hlt();
-            if (had) bkl_enter();
-        }
+        sched_yield();     /* woken by FUTEX_WAKE or the timeout sweep */
+        caller->futex_deadline_ns = 0;
+        if (caller->futex_timed_out) { caller->futex_timed_out = false; return -110; }
+        return 0;          /* woken; glibc re-checks its condition + own clock */
     }
 
     if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
@@ -501,6 +489,7 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
             struct proc *w = e->waiters;
             e->waiters = w->next_wait;
             w->next_wait = 0;
+            w->futex_deadline_ns = 0;     /* woken by wake, not timeout */
             w->state = PROC_READY;
             sched_enqueue(w);
             woken++;
@@ -514,4 +503,60 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
     }
 
     return -22; /* -EINVAL */
+}
+
+/* Remove `p` from any futex wait list it is parked on. MUST be called when a
+ * thread is terminated/reaped: a thread can exit while blocked on a futex (now
+ * common, since timed waits block on the list too), and a later FUTEX_WAKE or
+ * the timeout sweep would otherwise wake a DEAD proc -> enqueue it -> the
+ * scheduler switches into a freed address space. Mirrors sched_dequeue. */
+void futex_forget_proc(struct proc *p) {
+    if (!p) return;
+    uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+    for (int b = 0; b < FUTEX_HASH_SIZE; b++) {
+        struct futex_entry *e = g_futex_hash[b];
+        while (e) {
+            struct futex_entry *enext = e->next;
+            struct proc **pp = &e->waiters;
+            while (*pp) {
+                if (*pp == p) { *pp = p->next_wait; p->next_wait = 0; }
+                else          pp = &(*pp)->next_wait;
+            }
+            if (!e->waiters) futex_free_entry(e);
+            e = enext;
+        }
+    }
+    p->futex_deadline_ns = 0;
+    spin_unlock_irqrestore(&g_futex_lock, flags);
+}
+
+/* Wake any list-registered futex waiter whose deadline has passed. Called
+ * periodically (rate-limited) from the scheduler tick so a TIMED FUTEX_WAIT that
+ * is never FUTEX_WAKEd still returns -ETIMEDOUT. Cheap: <=256 entries, low rate. */
+void futex_expire_timeouts(void) {
+    uint64_t now = perf_now_ns();
+    uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+    for (int b = 0; b < FUTEX_HASH_SIZE; b++) {
+        struct futex_entry *e = g_futex_hash[b];
+        while (e) {
+            struct futex_entry *enext = e->next;
+            struct proc **pp = &e->waiters;
+            while (*pp) {
+                struct proc *w = *pp;
+                if (w->futex_deadline_ns && now >= w->futex_deadline_ns) {
+                    *pp = w->next_wait;          /* unlink */
+                    w->next_wait = 0;
+                    w->futex_deadline_ns = 0;
+                    w->futex_timed_out = true;
+                    w->state = PROC_READY;
+                    sched_enqueue(w);
+                } else {
+                    pp = &w->next_wait;
+                }
+            }
+            if (!e->waiters) futex_free_entry(e);
+            e = enext;
+        }
+    }
+    spin_unlock_irqrestore(&g_futex_lock, flags);
 }

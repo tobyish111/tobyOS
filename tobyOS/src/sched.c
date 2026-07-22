@@ -577,6 +577,22 @@ void sched_yield(void) {
      * (YIELD_RETURN) or resumes after a switch (do_switch's reacquire flag).
      * The scheduling work below only touches per-CPU queues (own ready_lock)
      * and per-proc fields, so it's safe without the BKL. */
+    /* Honour TIMED futex deadlines HERE, in normal kernel context (full stack,
+     * valid GS) rather than in the timer IRQ. Running the sweep from sched_tick
+     * (IRQ context) faulted in current_proc()/smp_this_cpu() under chrome's
+     * heavy threading; the slow path of sched_yield runs constantly under load,
+     * so timeouts still fire promptly. BSP-only + rate-limited. sched_enqueue
+     * (taken by the sweep) does not call sched_yield, so no recursion. */
+    if (me && me->cpu_idx == 0) {
+        static uint64_t last_futex_sweep;
+        uint64_t nowns = perf_now_ns();
+        if (nowns - last_futex_sweep >= 10000000ull) {   /* 10 ms */
+            last_futex_sweep = nowns;
+            extern void futex_expire_timeouts(void);
+            futex_expire_timeouts();
+        }
+    }
+
     bool had_bkl = me->holds_bkl;
     if (had_bkl) bkl_exit();
 #define YIELD_RETURN() do { if (had_bkl) bkl_enter(); return; } while (0)
@@ -733,6 +749,10 @@ void sched_tick(struct regs *r) {
     }
     /* M28C: count scheduler-tick events as heartbeats too. */
     wdog_kick_sched();
+
+    /* (Futex deadline sweep moved OUT of this IRQ context into sched_yield's
+     * slow path -- running it here faulted current_proc/smp_this_cpu under
+     * chrome.) */
 
 #ifdef CHROMIUM_BOOT
     /* Chromium bring-up (slice 8): every ~3s, dump every Linux (personality==1)
