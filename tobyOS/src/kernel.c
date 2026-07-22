@@ -7303,6 +7303,12 @@ void _start(void) {
              * the DOM is dumped even if the load never completes, and
              * "Page load timed out." is logged when no content arrived. That
              * both unblocks the hang and tells us whether the JS runs at all. */
+            /* SLOW-vs-STUCK probe (slice 25) settled: the renderer is STUCK, not
+             * slow. Neither --timeout=600000 nor --disable-hang-monitor saved it
+             * under TCG (still killed at ~18s, one send / zero recv), so it is
+             * NOT merely killed too early -- it never completes the Mojo
+             * bootstrap handshake no matter how long it lives. Reverted to the
+             * clean baseline. */
             (char *)"--timeout=5000",
             (char *)"--dump-dom",
             (char *)"data:text/html,<h1>tobyOS</h1>",

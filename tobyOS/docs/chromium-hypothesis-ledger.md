@@ -195,6 +195,35 @@ verify TLS/`set_tid_address` + arch_prctl FS-base are correct so CurrentId can
 cache. If gettid caching is fixed and the renderer still never reads its channel,
 the front moves inside Blink/V8 renderer init.
 
+### SLOW-vs-STUCK — ANSWERED: STUCK (slice 25)
+
+Probe: `--timeout=600000` + `--disable-hang-monitor`, run under both WHPX and TCG.
+
+| # | Hypothesis | Status | Evidence |
+|---|---|---|---|
+| R3 | Renderer is merely SLOW; the browser kills it too early | DISPROVEN | Under TCG the renderer is STILL SIGKILLed at ~18 s WITH `--disable-hang-monitor`, and STILL sends 1 / receives 0. More time (10-min timeout) and more speed (WHPX) never let it complete the handshake. |
+| R4 | **Renderer is genuinely STUCK in user-space init between "bootstrap accept sent" and "message loop entered"** | **CONFIRMED** | It sends its one 80-byte accept, the browser floods setup replies, the renderer never reads them, spins in user code, and no amount of time/speed/kill-suppression changes that. The browser kills it after ~15 s of an incomplete Mojo bootstrap. |
+
+Two traps avoided this slice:
+- WHPX showed the renderer exiting **clean (code 0)** with NO SIGKILL and a
+  7×-repeating "no connection" + network-service-crash loop. That was a **WHPX
+  artifact** (its `MSI ... lost` interrupt drops), NOT the flag effect — TCG with
+  identical flags shows the SIGKILL and only 1× no-connection. Don't draw
+  behavioural conclusions from WHPX where it diverges from TCG.
+- The `copy_to_user -> EFAULT` burst before the WHPX exit looked like a CoW bug,
+  but reading the code first showed the path already calls the CoW fault handler,
+  and slice-19 documents these exact EFAULTs as **benign** (chrome's
+  `base::ProtectedMemory` writes a RO page via syscall *expecting* EFAULT). Not a
+  bug. 0 occurrences under TCG.
+
+**The front is now firmly INSIDE the renderer's user-space init** (Blink/V8/base),
+between sending the Mojo bootstrap accept and entering the IPC message loop. This
+is the outcome the tail-prompt predicted: with the process model cleared, the
+renderer's failure to complete a load is its own problem. Prime lead remains the
+gettid storm → `PlatformThread::CurrentId()` TLS cache / FS-base: verify the
+renderer's thread-local storage is correct, since broken TLS would both explain
+constant gettid syscalls AND could hang thread-local-dependent init.
+
 ### (historical) Open: which CR3, and why is it dead
 
 Prime suspect is a **PML4 use-after-free**. `proc_reap` calls
