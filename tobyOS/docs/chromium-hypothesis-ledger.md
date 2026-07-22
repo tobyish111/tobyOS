@@ -224,6 +224,79 @@ gettid storm → `PlatformThread::CurrentId()` TLS cache / FS-base: verify the
 renderer's thread-local storage is correct, since broken TLS would both explain
 constant gettid syscalls AND could hang thread-local-dependent init.
 
+### CORRECTION (slice 26) — the renderer's Mojo WORKS; the IO threads stall in epoll_wait
+
+I made several wrong sub-conclusions before the WAIT-GRAPH (not the syscall ring)
+gave the true picture. Recording them so they are not repeated:
+
+- WRONG: "renderer sends 1, receives 0, never talks Mojo." That was only the
+  MAIN thread (pid 33). The renderer's **bootstrap IO thread (tid 37) has a full
+  healthy bidirectional Mojo conversation** — ~40 ops, correct byte counts both
+  ways, 13.5–15.9 s.
+- WRONG: "main thread stuck in a tight spinlock." Its hot rips span ~29 MB of
+  code + libraries + ld.so — genuine heavy V8/Blink work, progressing.
+- WRONG: "no renderer thread uses epoll." The syscall RING only shows COMPLETED
+  syscalls; a thread BLOCKED in epoll_wait never returns, so it is invisible
+  there. The **wait-graph** shows it.
+
+**The actual chain:**
+1. Renderer bootstraps Mojo via tid 37 (blocking `recvmsg` on fd 5) — healthy
+   two-way conversation until 15.9 s.
+2. tid 37 finishes and **exits normally** at 16 s (clean, clear_child_tid wake).
+3. The persistent IO threads take over with **epoll**: at death, **tid 34 is in
+   `epoll_wait(0x6)` for 4.2 s and tid 35 in `epoll_wait(0xb)` for 4.6 s** —
+   blocked, never waking.
+4. So after 16 s nothing services the renderer's channel; the browser's messages
+   go unanswered and the browser SIGKILLs the "hung" renderer at ~18.6 s
+   (robust to `--disable-hang-monitor` + `--timeout=600000`).
+
+`file_poll_ready` DOES report an AF_UNIX socket readable on `sock->count > 0`,
+and `lx_epoll_wait` pumps `net_poll()` and re-scans — so the readiness logic
+looks right in isolation. The open question is why tids 34/35 never wake:
+
+| # | Hypothesis | Status | Test |
+|---|---|---|---|
+| E1 | The channel fd (5) is not registered in the epoll instance (0x6/0xb) those threads wait on | OPEN | Instrument epoll_wait to dump its registered fds + each fd's poll-readiness when blocked > N ms. |
+| E2 | The browser's post-16 s messages never arrive at the renderer's fd-5 socket (count stays 0) — they go to a different pipe/transport | OPEN | Same instrument: is any registered socket's `count > 0` while epoll_wait sits blocked? Cross-check with `[unix]` peer trace of pid 2's sends. |
+| E3 | epoll_wait wakes but `file_poll_ready` misreports the specific fd, so it re-sleeps | LESS LIKELY | The AF_UNIX arm returns POLLIN on count>0; would need count>0 AND no POLLIN. |
+
+**Next step:** the epoll_wait blocked-fd dump (E1/E2 discriminator). This is the
+first concrete, tobyOS-side, fixable locus for the DOM since the process-model
+work — the renderer is healthy right up to an epoll readiness/registration gap.
+
+### LOCALIZED (slice 26 cont.) — the IO threads wait on an EVENTFD that never fires
+
+`[epreg]` (epoll_ctl registration trace) shows what chrome's IO threads poll on:
+**32 registrations are kind=12 EVENTFD, 20 are kind=5 SOCKET.** The renderer's
+hanging IO threads specifically:
+- tid 34 → `epoll_wait(epfd=6)`, and epfd 6 has ONLY `fd=10 kind=12` (eventfd).
+- tid 35 → `epoll_wait(epfd=11)`, epfd 11 has ONLY `fd=12 kind=12` (eventfd).
+
+(That the hanging epolls contain no socket is also why the earlier `saw_sock`
+dump got 0 hits — those threads never take the socket-pump path.)
+
+**So the post-bootstrap Mojo transport is shared-memory + EVENTFD notification:**
+the bootstrap socket handshake works (tid 37), then chrome moves the live channel
+to shared memory and signals "message ready" by writing an eventfd the peer
+epolls. The renderer's IO threads block on that eventfd and **it is never
+signaled from the browser side**, so they never wake, never service the channel,
+and the browser kills the renderer at ~18 s.
+
+`struct eventfd` IS shared across fork AND SCM_RIGHTS (`file_clone` shares the
+same struct, refcounted), so a cross-process write *should* be visible — which
+means the bug is specific, not "eventfd isn't shared at all". Candidates:
+
+| # | Hypothesis | Status | Test |
+|---|---|---|---|
+| V1 | The browser never WRITES the notification eventfd (its signal path uses something tobyOS routes elsewhere) | OPEN — prime | Trace eventfd_write: does pid 2 ever write an eventfd the renderer polls? |
+| V2 | Browser writes ITS eventfd but the renderer polls a DIFFERENT (non-shared) instance — the SCM_RIGHTS/fork pairing is crossed | OPEN | Correlate the eventfd object identity (struct pointer / a stamped id) across the two processes. |
+| V3 | Write propagates (count>0) but epoll_wait doesn't re-check that eventfd / eventfd_pollin misreads | LESS LIKELY | `file_poll_ready` EVENTFD arm calls `eventfd_pollin`; unit-check count>0 ⇒ POLLIN. |
+
+This is the tightest, most concrete DOM locus reached all session: the renderer
+is fully healthy through Mojo bootstrap and Blink/V8 init, and stalls only at the
+eventfd wakeup of the shared-memory message transport. Committable `[epreg]`
+instrument added.
+
 ### (historical) Open: which CR3, and why is it dead
 
 Prime suspect is a **PML4 use-after-free**. `proc_reap` calls

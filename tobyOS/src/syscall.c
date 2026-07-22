@@ -4883,6 +4883,20 @@ static long lx_epoll_ctl(int epfd, int op, int fd, uint64_t uevent) {
         }
         if (free_slot < 0) return -ABI_ENOMEM;
         ei->e[free_slot] = (struct epoll_entry){ fd, ev.events, ev.data, true };
+#ifdef CHROMIUM_BOOT
+        /* [epreg] what chrome's IO threads actually poll on. The renderer's
+         * IO threads block in epoll_wait forever after the bootstrap thread
+         * exits; this shows whether they registered the channel SOCKET (kind 3)
+         * or an EVENTFD (kind 12 -- the Mojo shared-memory notification), which
+         * is the transport that must wake them and evidently does not. */
+        {   static int er = 0;
+            if (er < 200) { er++;
+                struct file *rf = fd_lookup(fd);
+                struct proc *me = current_proc();
+                kprintf("[epreg] pid=%d epfd=%d ADD fd=%d kind=%d events=0x%x\n",
+                        me ? me->pid : -1, epfd, fd,
+                        rf ? (int)rf->kind : -1, (unsigned)ev.events); } }
+#endif
         return 0;
     }
     for (int i = 0; i < EPOLL_MAX; i++) {
