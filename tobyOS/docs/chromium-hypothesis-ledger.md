@@ -455,3 +455,46 @@ circular deadlock inside the renderer's threading.
 **Decisive next fork:** DL2 would be a tobyOS-fixable wakeup-delivery bug and
 likely THE DOM blocker; DL1 puts the front inside chrome's renderer threading.
 Distinguish with an uncapped wake-targeting-the-stuck-addresses trace.
+
+---
+
+## SLICE 29 — DL2 CONFIRMED: timed FUTEX_WAIT can't be woken by FUTEX_WAKE (fix reverted, unvalidated)
+
+Built an uncapped, per-address FUTEX_WAKE tracker (count + last-wake timestamp +
+"is the waiter on the futex list") and dumped it in the wait-graph. **Decisive:**
+threads showed `wake_after_block_ms >= 0` with `onlist=0` -- a FUTEX_WAKE landed
+on their address AFTER they blocked, yet they stayed blocked 140-220 s. So **DL2
+is real: a wake was issued and not delivered.**
+
+Root cause READ FROM THE CODE: `futex()` had two wait paths. UNTIMED
+(`deadline==0`) registered on the wait list, so FUTEX_WAKE could wake it. TIMED
+(`deadline!=0`, i.e. glibc `pthread_cond_timedwait`/`mutex_timedlock`, which
+chrome uses pervasively) did **poll-with-idle**: it watched `*uaddr` for a value
+change and was **NOT on the wait list** -- so **FUTEX_WAKE could not wake it at
+all**, only a `*uaddr` change could. glibc wakes condvar/mutex waiters with
+FUTEX_WAKE and does not always change the word the waiter parked on, so those
+wakeups were silently lost -> the renderer's threads deadlocked. The in-code
+comment even stated the flawed assumption ("the waker changes *uaddr before
+FUTEX_WAKE, which we detect on recheck").
+
+**Fix attempted and REVERTED (not shipped):** made timed waits also block on the
+wait list, added a 10 ms `futex_expire_timeouts()` sweep for deadlines, and
+`futex_forget_proc()` to unlink an exiting thread from futex lists (the last was
+necessary and correct -- without it the sweep woke a reaped proc and my
+DEAD-cr3 guard fired, exactly as designed). Result: defboot clean, no panic,
+BUT **no DOM, the renderer froze even earlier (~9.6 s vs ~17 s), and the stuck
+waiters still read `onlist=0`** -- meaning the fix did not put them on the list
+as intended, or the instrument mis-reports. Rather than ship an unvalidated,
+possibly-regressing change to a CORE primitive every threaded program depends on,
+I reverted to the last validated commit.
+
+**Status:** the DIAGNOSIS is solid and confirmed (timed futex waits are not
+wakeable by FUTEX_WAKE -- a genuine tobyOS bug and a real contributor to the
+renderer deadlock). The FIX needs a careful, separately-validated
+implementation: (1) understand why the list-registration read back as
+`onlist=0` (bug in the merge, or in `futex_num_waiters`); (2) confirm timed
+waiters are woken by a matching FUTEX_WAKE with a targeted unit test before
+trusting it under chrome; (3) keep `futex_forget_proc` in teardown regardless,
+it is a real latent-bug fix. Do NOT ship a futex change without a green
+defboot AND a targeted wake test AND a chrome run that shows the renderer
+progressing past the ~17 s deadlock.
