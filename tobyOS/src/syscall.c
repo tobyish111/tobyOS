@@ -51,6 +51,7 @@
 #include <tobyos/elf.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
+#include <tobyos/page_fault.h>   /* get_pte / PTE_* -- deadlocked-thread stack walk */
 #include <tobyos/devtest.h>
 #include <tobyos/blk.h>
 #include <tobyos/provision.h>
@@ -5894,6 +5895,58 @@ void waitt_dump(void) {
         kprintf("  pid=%d %s(0x%lx) for %lu ms\n", g_waitt[i].pid,
                 lx_scname(g_waitt[i].nr), (unsigned long)g_waitt[i].arg,
                 (unsigned long)((now - g_waitt[i].since_ns) / 1000000ull));
+}
+
+/* Read one u64 from proc `p`'s user address space (via its cr3), for reading a
+ * BLOCKED thread's stack from an unrelated context. Returns false if unmapped. */
+static bool read_u64_of(struct proc *p, uint64_t va, uint64_t *out) {
+    extern uint64_t *get_pte(uint64_t cr3, uint64_t virt_addr);
+    uint64_t *pte = get_pte(p->cr3, va & ~0xfffULL);
+    if (!pte || !(*pte & PTE_PRESENT)) return false;
+    uint64_t phys = (*pte & PTE_ADDR_MASK) | (va & 0xfffULL);
+    *out = *(volatile uint64_t *)pmm_phys_to_virt(phys);
+    return true;
+}
+
+/* CHROME-SIDE VISIBILITY: dump a deadlocked renderer thread's USER call chain.
+ * chrome is -fomit-frame-pointer, so scan the stack for return-address-looking
+ * qwords (in the 0x1000_0000_0000+ code region where ld.so mmaps the main
+ * binary + every .so). Symbolize offline: find the [libmap] base each addr
+ * falls under, then `objdump -d --start-address=<addr-base> <that .so>`. The
+ * saved user rsp/rip live in the syscall_regs frame at kstack_top. */
+void waitt_dump_stacks(void) {
+    static int done = 0;
+    if (done) return;
+    /* With --disable-kill-after-bad-ipc the deadlocked renderer stays alive, so
+     * dump once the deadlock is well established. */
+    if (perf_now_ns() < 40ull * 1000000000ull) return;
+    done = 1;
+    kprintf("[bt] ===== deadlocked-thread user call chains (symbolize offline) =====\n");
+    /* Iterate the blocked-in-a-syscall table (what the wait-graph shows), not a
+     * transient PROC_BLOCKED scan -- a futex/epoll waiter may momentarily not be
+     * PROC_BLOCKED. Each entry's saved user context lives in the syscall_regs
+     * frame at that proc's kstack_top. */
+    for (int i = 0; i < WAITT_MAX; i++) {
+        if (!g_waitt[i].busy) continue;
+        struct proc *p = proc_lookup(g_waitt[i].pid);
+        if (!p || !p->kstack_top) continue;
+        struct syscall_regs *sr =
+            (struct syscall_regs *)((uint8_t *)p->kstack_top - sizeof(*sr));
+        uint64_t urip = sr->rcx, ursp = sr->user_rsp;
+        kprintf("[bt] pid=%d %s(0x%lx) urip=0x%lx ursp=0x%lx\n",
+                p->pid, lx_scname(g_waitt[i].nr),
+                (unsigned long)g_waitt[i].arg, urip, ursp);
+        int printed = 0;
+        for (int s = 0; s < 768 && printed < 24; s++) {
+            uint64_t v;
+            if (!read_u64_of(p, ursp + (uint64_t)s * 8, &v)) break;
+            if (v >= 0x100000000000ULL && v < 0x110000000000ULL) {  /* code region */
+                kprintf("[bt]   +0x%03x 0x%lx\n", s * 8, v);
+                printed++;
+            }
+        }
+    }
+    kprintf("[bt] ===== end =====\n");
 }
 #endif
 

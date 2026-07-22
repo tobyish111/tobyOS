@@ -595,3 +595,51 @@ chrome-only inference a 5-second unit test would have settled. The next suspect
 primitive to unit-test if pursued: the exact glibc condvar wait/signal SEQUENCE
 (a 3-thread cond_wait/cond_signal test), since a subtle ordering gap there could
 produce the observed circular wait even with WAIT/WAKE individually correct.
+
+---
+
+## SLICE 32 — chrome-side visibility attempt: kernel user-stack walk of deadlocked threads
+
+Built `waitt_dump_stacks()` (syscall.c): for each thread in the blocked-in-a-
+syscall table, read its saved user context from the `syscall_regs` frame at
+`kstack_top`, then walk its USER stack via `get_pte(p->cr3, ...)` + HHDM (reads
+ANOTHER proc's memory from an unrelated context) and print return-address-looking
+qwords in the code region `0x1000_0000_0000+`. Chrome is `-fomit-frame-pointer`,
+so this raw-scans rather than frame-walks. Committable, CHROMIUM_BOOT-gated,
+behaviour-neutral.
+
+**It works** -- it produced real call chains for live threads (browser + IO
+threads in epoll_wait; a futex-blocked worker). But it did NOT crack the DOM, for
+two concrete barriers, both recorded so the next agent doesn't rediscover them:
+
+1. **The renderer is SIGKILLed (~11 s) before the deadlock can be dumped.** The
+   kill is `ShutdownForBadMessage`. Adding `--disable-kill-after-bad-ipc` did NOT
+   keep it alive (a renderer thread was still killed -- a DIFFERENT teardown
+   path, unidentified), so catching the renderer's own deadlocked main thread is
+   unreliable. Threads that ARE dumpable at 40 s are browser/utility IO threads
+   in NORMAL epoll/futex waits, not the deadlock.
+2. **Stripped-chrome symbolization is the wall.** Return addresses land in
+   `0x1000_0000_0000+`, but `[libmap]` records only base+len (fd=3, ino=0) -- NO
+   file path -- so you cannot tell which `.so` a base is to `objdump` it, and the
+   main chrome binary is stripped anyway (no symbol names). To make the stack
+   walk actionable you must FIRST teach `[libmap]` (linux_mmap_file) to log the
+   opened FILE PATH per mapping, then objdump the matching library at
+   `addr - base`; even then only libc/ld.so have usable symbols.
+
+### Honest standing of the DOM (end of this arc)
+
+Both wakeup primitives are proven correct in isolation (linux-futex,
+linux-eventfd), chrome uses no unhandled futex op, and ~11 real kernel bugs are
+fixed and validated. The residual blocker is a chrome-internal circular wait with
+no broken tobyOS primitive under it. The two viable ways forward, both real
+projects rather than another kernel fix:
+  (a) make the stack walk actionable: `[libmap]` file paths + keep the renderer
+      alive (find/neutralize the non-bad-ipc kill path), then symbolize the
+      renderer's futex caller against libc/ld.so to see what chrome awaits;
+  (b) a logging-enabled `chrome-headless-shell` build, or driving DevTools over
+      `--remote-debugging-pipe`, to ask chrome directly.
+
+The kernel-bug tier is essentially exhausted; the remaining work is chrome-symbol
+archaeology, which is a different discipline. This is a clean, well-documented
+stopping point: green tree, two permanent unit tests, a stack-walk tool, and the
+exact next infrastructure step named.
