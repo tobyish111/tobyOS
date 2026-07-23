@@ -7430,6 +7430,13 @@ void _start(void) {
              * EXACT net_error for the https failure after chrome exits (official
              * builds strip the stderr error). Scanned below. */
             (char *)"--log-net-log=/data/netlog.json",
+            /* slice 37: --screenshot is intentionally NOT passed. It forces the
+             * GPU/viz compositor which loads SwiftShader and hits a
+             * deterministic NULL deref (libc+0x8d70d reads NULL+0x308) during GL
+             * init -- the documented render-tier wall (docs/chromium-render-gl-
+             * bug-prompt.md), unchanged by the slice-34 CoW fix. The
+             * [screenshot] check below still fires (reports "absent"), and the
+             * PNG-verify path is kept for when the GL wall is solved. */
             (char *)"--dump-dom",
             /* Slice 35: a REAL network URL, not a data: URL -- chrome resolves,
              * connects, fetches and parses a live page (see the networking
@@ -7490,6 +7497,28 @@ void _start(void) {
              * -213=SSL_OBSOLETE_VERSION, -107=SSL_PROTOCOL_ERROR, -200=COMMON_
              * NAME_INVALID, -148=SSL_CLIENT_AUTH... Print every distinct
              * negative net_error so the failing one names itself. */
+            /* Slice 37: did CPU raster produce a screenshot PNG? Report its
+             * size + verify the PNG magic so we know real pixels came out, not
+             * an empty/garbage file. */
+            {
+                struct vfs_stat sst;
+                if (vfs_stat("/data/shot.png", &sst) == VFS_OK && sst.size > 0) {
+                    void *png = 0; size_t pn = 0;
+                    bool magic = false;
+                    if (vfs_read_all("/data/shot.png", &png, &pn) == VFS_OK && png
+                        && pn >= 8) {
+                        const uint8_t *m = (const uint8_t *)png;
+                        magic = (m[0]==0x89 && m[1]=='P' && m[2]=='N' && m[3]=='G');
+                    }
+                    kprintf("[screenshot] /data/shot.png = %lu bytes, PNG magic %s "
+                            "-- RENDER TIER PRODUCED PIXELS\n",
+                            (unsigned long)sst.size, magic ? "OK" : "MISSING");
+                    if (png) kfree(png);
+                } else {
+                    kprintf("[screenshot] /data/shot.png absent -- no pixels "
+                            "produced (CPU raster did not write a screenshot)\n");
+                }
+            }
             void  *nl = 0; size_t nlsz = 0;
             if (vfs_read_all("/data/netlog.json", &nl, &nlsz) == VFS_OK && nl) {
                 kprintf("[netlog] read %lu bytes; distinct negative net_errors:\n",

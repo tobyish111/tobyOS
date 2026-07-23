@@ -1265,3 +1265,49 @@ http:// navigation works and is the harness assertion. https:// to real
 (post-quantum-enabled) servers -- i.e. Google/YouTube/Cloudflare/most of the web
 in 2026 -- is blocked by the ML-KEM wall until BoringSSL's ML-KEM works on
 tobyOS. tobyOS's own HTTPS stack is unaffected and fully functional.
+
+---
+
+## SLICE 37 (2026-07-23) — render tier: --screenshot attempted, blocked by the documented GL NULL-deref
+
+Goal: get a rendered PNG out of chrome (`--screenshot`), the prerequisite for
+any on-screen / windowed chrome. Two approaches tried, both blocked by the same
+wall:
+
+1. **CPU software raster** (`--disable-gpu`, KEEP software rasterizer,
+   `--screenshot`): chrome STILL loads `libvk_swiftshader.so` -- `--screenshot`
+   forces the GPU/viz compositor, which wants a GL context even under
+   `--disable-gpu`. The gpu thread (pid 16) page-faults ~5 s in; chrome then
+   hangs past the 400 s harness timeout (never produces a bitmap).
+2. **Proper SwiftShader/ANGLE** (`--use-angle=swiftshader --use-gl=angle`,
+   the slice 12-14 target config, WSI via the in-kernel fake X server): the
+   **IDENTICAL** fault, same rip, same address. So it is NOT a misconfiguration
+   -- it is a real, deterministic crash in SwiftShader GL init.
+
+**The fault (localized):** `cr2=0x0000000000000308`, `err=0x4` (user READ of a
+not-present page) = a **NULL-pointer dereference reading field +0x308**. The
+faulting rip `0x100000b5270d` sits in **libc** (base `0x100000ac5000` from
+`[libmap]`, so `libc+0x8d70d` -- a DIFFERENT libc function than slice 20's
+`memcpy+0xab34d`). A NULL propagated from a failed SwiftShader/Vulkan init into a
+libc call. (`last_fault_rip=0x7a4bb69` in the isr line is the STALE cumulative
+latch, not this fault -- use the register-dump rip.)
+
+This is the same class as the render-gl-bug-prompt.md wall (SwiftShader init
+fails -> NULL GL-dispatch deref) and is **unchanged by the slice-34 MAP_SHARED
+CoW fix** -- confirming (again) the GL crash is independent of the CoW bug.
+Fixing it is the documented multi-slice render effort (SwiftShader Vulkan ICD
+init / WSI), not a quick shim.
+
+**Harness reverted** to the working `--disable-gpu` + `--dump-dom` +
+`http://example.com/` config (no `--screenshot`). The `[screenshot]` PNG-verify
+instrument is kept (reports "absent" until the GL wall falls). Pixels -- and
+therefore the window/interactive tier -- remain blocked on this crash.
+
+### Where the three "visit any page" fronts stand after this session
+- **HTTP navigation:** WORKS (real live page, exit 0). Committed.
+- **HTTPS:** root-caused to chrome's post-quantum X25519MLKEM768 ML-KEM (slice
+  36). Deep; no headless-shell disable lever.
+- **Pixels/render:** blocked by this deterministic SwiftShader GL NULL-deref.
+  Deep.
+- **Window + input:** not started; blocked on pixels.
+All three are independent, deep, multi-slice fronts.
