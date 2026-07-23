@@ -96,7 +96,8 @@ struct tcp_conn {
     uint64_t     dbg_rx_total;    /* payload bytes delivered in-order */
     uint64_t     dbg_rx_popped;   /* payload bytes the app actually read out */
     uint32_t     dbg_ooo;         /* out-of-order segments dropped */
-    uint32_t     dbg_seg_logged;  /* rate-limit for the [tls] segment trace */
+    uint32_t     dbg_seg_logged;  /* rate-limit for the [tls] rx segment trace */
+    uint32_t     dbg_txseg_logged;/* rate-limit for the [tls] tx segment trace */
     uint32_t     dbg_retx;        /* retransmissions we issued */
 #endif
     uint8_t      acc_head, acc_tail, acc_count, backlog_cap;
@@ -407,6 +408,18 @@ static bool tcp_send_data_segment(struct tcp_conn *c, uint8_t xf,
     if (!tcp_emit(c, flags, payload, plen)) return false;
 #ifdef CHROMIUM_BOOT
     c->dbg_tx_total += plen;
+    /* Slice 35: log outbound TLS record headers on port 443. This is the
+     * decisive datum for the https stall -- what, if anything, does the client
+     * emit AFTER the ClientHello? 0x15=alert (BoringSSL rejected the flight),
+     * 0x16/0x17=handshake/Finished (handshake progressing), nothing=parked in
+     * the async cert-verify callback. */
+    if (ntohs(c->remote_port_be) == 443 && plen >= 5 && c->dbg_txseg_logged < 8) {
+        const uint8_t *d = (const uint8_t *)payload;
+        c->dbg_txseg_logged++;
+        kprintf("[tls] TX tcp[%d] len=%u type=0x%02x ver=%02x%02x reclen=%u\n",
+                conn_index(c), (unsigned)plen, d[0], d[1], d[2],
+                (unsigned)((d[3] << 8) | d[4]));
+    }
 #endif
 
     struct tx_pend *p = &c->pend[pi];
@@ -942,6 +955,16 @@ static struct tcp_conn *tcp_syn_out(uint32_t dst_ip_be, uint16_t dst_port_be) {
     c->remote_ip_be   = dst_ip_be;
     c->remote_port_be = dst_port_be;
     c->state          = TCP_SYN_SENT;
+#ifdef CHROMIUM_BOOT
+    /* Slice 35: every active open, so a cert-verification side fetch (AIA to
+     * pull an intermediate, OCSP/CRL for revocation) shows up as a NEW
+     * connection to a different host during the TLS stall. Silence here means
+     * verification is NOT doing network I/O. */
+    kprintf("[tcp] connect tcp[%d] -> %u.%u.%u.%u:%u\n", conn_index(c),
+            (unsigned)(dst_ip_be & 0xff), (unsigned)((dst_ip_be >> 8) & 0xff),
+            (unsigned)((dst_ip_be >> 16) & 0xff), (unsigned)((dst_ip_be >> 24) & 0xff),
+            (unsigned)ntohs(dst_port_be));
+#endif
 
     uint64_t mix = (uint64_t)pit_ticks() * 0x9E3779B97F4A7C15ull;
     mix ^= ((uint64_t)g_my_mac[3] << 16) | ((uint64_t)g_my_mac[5]);

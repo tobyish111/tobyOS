@@ -2929,6 +2929,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    printf '\003' | dd of=$(INITRD_STAGE)/opt/chrome/chrome-headless-shell bs=1 seek=7 count=1 conv=notrunc 2>/dev/null; \
 	    echo "[initrd] chromium: staging chrome-headless-shell +sysroot under /opt/chrome -- OPT-IN M0"; \
 	    EXTRA_FILES="$$EXTRA_FILES opt/chrome"; \
+	    for pd in etc/opt/chrome/policies/managed etc/chromium/policies/managed etc/opt/chrome_for_testing/policies/managed; do \
+	        mkdir -p $(INITRD_STAGE)/$$pd; \
+	        printf '{ "PostQuantumKeyAgreementEnabled": false }\n' > $(INITRD_STAGE)/$$pd/tobyos.json; \
+	        EXTRA_FILES="$$EXTRA_FILES $$pd/tobyos.json"; \
+	    done; \
+	    echo "[initrd] chromium: staged managed policy PostQuantumKeyAgreementEnabled=false (disable X25519MLKEM768 PQ KEX -- tobyOS ML-KEM wall)"; \
 	fi; \
 	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \

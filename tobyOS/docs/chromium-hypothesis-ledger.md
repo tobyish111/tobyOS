@@ -1192,3 +1192,76 @@ remains its own front. Harness reverted to the validated `--disable-gpu`
 configuration. (Note the faulting rip differs from slice 20's `memcpy+0x35d`,
 but so does the load layout -- correlate via `[libmap]` before concluding they
 are different bugs.)
+
+---
+
+## SLICE 36 (2026-07-23) — https ROOT-CAUSED: chrome's post-quantum ML-KEM key exchange
+
+**The https failure is chrome negotiating the post-quantum hybrid key exchange
+`X25519MLKEM768` (TLS group 0x11EC = 4588), whose ML-KEM path fails on tobyOS.**
+Found by pulling chrome's OWN NetLog off the guest and reading the negotiated
+group + the exact error. NOT transport, NOT cert (date/trust/CT), NOT the AEAD
+cipher, NOT the TLS version, NOT the crypto implementation (asm vs C).
+
+### The decisive evidence chain (each experiment killed a hypothesis)
+
+| Probe | Result | Kills |
+|---|---|---|
+| `[tcp] WIRE` byte accounting | tx=1847 rx=4776 **read=4776 ooo=0 retx=0** | transport / my socket code |
+| native tobyOS TLS 1.3 to same URL | **SUCCESS 200** (validates the REAL cert vs the REAL 2026-07-23 clock via BearSSL: chain+hostname+notAfter) | cert date, cert trust, kernel, route, crypto-in-C |
+| decode outbound TLS records | ClientHello -> CCS -> **19-byte encrypted record = 2-byte alert** | "hang" (it aborts, ~30 s not 120 s) |
+| `--ignore-certificate-errors` | unchanged | cert policy (it's not a cert error) |
+| force TLS 1.2 (`--ssl-version-max`) | fails identically | TLS-1.3-specific |
+| force ChaCha20 (`--cipher-suite-denylist`) | fails identically | the AEAD cipher |
+| `OPENSSL_ia32cap=0` (pure-C crypto) | fails identically | SIMD-asm crypto path |
+| **chrome NetLog** (`--log-net-log`, kernel `vfs_read_all` + scan) | `net_error:-107` ERR_SSL_PROTOCOL_ERROR; `ssl_error:1` at `s3_pkt.cc`; **`exchange_group:4588`**; cipher 4867 (ChaCha) | names the group = X25519MLKEM768 |
+
+### Why only ML-KEM fails while X25519 + the record cipher work
+
+ML-KEM decapsulation ends in the Fujisaki-Okamoto re-encryption **equality
+check**: decrypt -> re-encrypt -> compare to the received ciphertext; a mismatch
+silently returns a *pseudo-random* shared secret (implicit rejection). So **any
+single-bit error anywhere in the thousands of mod-3329 / NTT / Keccak operations
+-> total key mismatch -> the record layer can't decrypt the server flight ->
+`bad_record_mac` -> SSL_ERROR_SSL in s3_pkt.cc**. X25519 (one tolerant scalar
+mult) and the AEAD (once keys are right) do not amplify a tiny error this way.
+That is exactly why tobyOS's plain-X25519 native TLS succeeds against the same
+server while chrome's ML-KEM path does not.
+
+### Fix status — OPEN. The external disable-levers are NOT honored by headless-shell
+
+- `--disable-features=X25519MLKEM768,PostQuantumKyber,X25519Kyber768Draft00`:
+  no-op, group stays 4588. (The flag reaches the browser process; TLS runs in
+  the network-service child, which only received the field-trial-forced
+  `--disable-features=PaintHolding` -- my override did not propagate, and in a
+  2026 build the feature is likely always-on / removed.)
+- Managed policy `PostQuantumKeyAgreementEnabled:false` staged in all three
+  candidate dirs (`/etc/opt/chrome`, `/etc/chromium`,
+  `/etc/opt/chrome_for_testing` `/policies/managed/`): **also no-op** --
+  chrome-headless-shell does not include the enterprise-policy machinery.
+  (Left staged anyway: it is correct and a full chrome would honor it.)
+
+So the fix requires making BoringSSL's ML-KEM produce a correct result on
+tobyOS. RULED OUT as the cause (cheap checks): RNG (getrandom fixed, and a weak
+seed can't cause a *wrong* KEM result -- keygen is self-consistent); unzeroed
+memory (anonymous demand pages ARE memset-0 in page_fault.c:252); SIMD asm
+(ia32cap=0 unchanged); stack overflow (would SIGSEGV; chrome exits 0). Remaining
+candidates are a TCG instruction subtlety hit only by ML-KEM's code, or a
+memory-corruption specific to its allocation pattern -- both need chrome-internal
+instrumentation that an off-the-shelf binary does not allow. This is a genuinely
+deep front.
+
+### Permanent artifacts added this slice (all CHROMIUM_BOOT-gated)
+- `[https-probe]`: kernel-side native TLS 1.3 GET of https://example.com before
+  chrome spawns -- a standing regression guard that the tobyOS network+crypto
+  stack is sound (SUCCESS 200 = kernel is not the differ).
+- `[tcp] WIRE` / `[tls] rx` / `[tls] TX` / `[tcp] connect` wire+record tracing.
+- `[netlog]`: after chrome exits, the kernel `vfs_read_all`s
+  /data/netlog.json and scans it for the exact net_error + SSL reason context.
+  Reusable for any future chrome network-layer wall.
+
+### Standing
+http:// navigation works and is the harness assertion. https:// to real
+(post-quantum-enabled) servers -- i.e. Google/YouTube/Cloudflare/most of the web
+in 2026 -- is blocked by the ML-KEM wall until BoringSSL's ML-KEM works on
+tobyOS. tobyOS's own HTTPS stack is unaffected and fully functional.

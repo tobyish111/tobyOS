@@ -7304,6 +7304,30 @@ void _start(void) {
         }
     }
 
+    /* Slice 35 bisection: does tobyOS's OWN TLS 1.3 client complete an HTTPS
+     * handshake to the same server, in this exact boot config? chrome's
+     * BoringSSL derives handshake keys, decrypts example.com's server flight,
+     * then rejects it with an encrypted alert (a crypto-verification failure,
+     * not cert trust -- --ignore-certificate-errors does not help). This probe
+     * shares the socket/TCP/kernel path with chrome but uses tobyOS's own
+     * ChaCha20-Poly1305/X25519 code: if it SUCCEEDS, the kernel + crypto path
+     * is sound and the bug is specific to chrome's crypto execution; if it
+     * FAILS the same way, the fault is shared (kernel/regression). */
+    {
+        kprintf("[https-probe] >>> native TLS 1.3 GET https://example.com/\n");
+        struct http_response hr;
+        int rc = http_get("https://example.com/", 64u * 1024u, 8000, &hr);
+        if (rc == 0) {
+            kprintf("[https-probe] SUCCESS status=%d body=%lu bytes -- native "
+                    "TLS+crypto WORKS; chrome's BoringSSL is the differ\n",
+                    hr.status, (unsigned long)hr.body_len);
+            http_free(&hr);
+        } else {
+            kprintf("[https-probe] FAIL rc=%d -- native TLS also fails; the "
+                    "fault is shared (kernel/socket), not chrome-specific\n", rc);
+        }
+    }
+
     /* Track B M0: spawn a REAL, UNMODIFIED, off-the-shelf headless Chromium
      * (chrome-headless-shell from Chrome-for-Testing -- the actual V8 + Blink
      * engine, not a re-implementation; bundles SwiftShader for software GL).
@@ -7402,12 +7426,21 @@ void _start(void) {
              * renderer only spawns ~12 s in and was SIGKILLed mid-startup,
              * healthy, parked in its message loops. Give it room. */
             (char *)"--timeout=120000",
+            /* slice 35: capture chrome's own NetLog so the kernel can read the
+             * EXACT net_error for the https failure after chrome exits (official
+             * builds strip the stderr error). Scanned below. */
+            (char *)"--log-net-log=/data/netlog.json",
             (char *)"--dump-dom",
-            /* Slice 35: a REAL network URL, not a data: URL -- chrome now
-             * resolves, connects, fetches and parses a live page (see the
-             * networking fixes in socket.c/syscall.c/tcp.c). https:// still
-             * fails at the transport tier and is the next front; keep this on
-             * http:// so the harness asserts something that actually works. */
+            /* Slice 35: a REAL network URL, not a data: URL -- chrome resolves,
+             * connects, fetches and parses a live page (see the networking
+             * fixes in socket.c/syscall.c/tcp.c). Kept on http:// because that
+             * WORKS end-to-end; https:// is blocked by chrome's post-quantum
+             * X25519MLKEM768 key exchange (group 4588), whose ML-KEM path fails
+             * on tobyOS -- root-caused via NetLog, but not disable-able from
+             * chrome-headless-shell (neither --disable-features nor the managed
+             * PostQuantumKeyAgreementEnabled policy are honored by the headless
+             * shell). tobyOS's OWN TLS 1.3 (plain X25519) fetches the same
+             * https URL fine -- see the [https-probe] above. Ledger slice 35. */
             (char *)"http://example.com/",
             0,
         };
@@ -7434,7 +7467,7 @@ void _start(void) {
              * took this 15 -> 14; leaving it at 15 made proc_spawn read past the
              * terminator and fail, which the arm below misreports as "binary not
              * present". Re-count whenever you touch argv. */
-            .argc = 16, .argv = argv, .envc = 7, .envp = envp,
+            .argc = 17, .argv = argv, .envc = 7, .envp = envp,
         };
         kprintf("[boot] CHROMIUM: spawning REAL headless Chromium "
                 "(chrome-headless-shell --dump-dom); the DELIVERABLE is the "
@@ -7449,6 +7482,54 @@ void _start(void) {
             kprintf("[boot] CHROMIUM: chrome (pid=%d) exit=%d\n", pid, rc);
             kprintf("[CHROMIUM] M0 gap-list run complete: chrome exit=%d -- "
                     "the gap list is the '[linux] UNHANDLED' set above\n", rc);
+
+            /* Slice 35: scan chrome's own NetLog for the EXACT net_error of the
+             * https failure. Official builds strip the stderr error line, but
+             * the NetLog JSON records `"net_error":-NNN`; -201=DATE_INVALID,
+             * -202=AUTHORITY_INVALID, -214=CERTIFICATE_TRANSPARENCY_REQUIRED,
+             * -213=SSL_OBSOLETE_VERSION, -107=SSL_PROTOCOL_ERROR, -200=COMMON_
+             * NAME_INVALID, -148=SSL_CLIENT_AUTH... Print every distinct
+             * negative net_error so the failing one names itself. */
+            void  *nl = 0; size_t nlsz = 0;
+            if (vfs_read_all("/data/netlog.json", &nl, &nlsz) == VFS_OK && nl) {
+                kprintf("[netlog] read %lu bytes; distinct negative net_errors:\n",
+                        (unsigned long)nlsz);
+                const char *s = (const char *)nl;
+                /* Scan for high-signal SSL substrings and print a short raw
+                 * context window around each -- BoringSSL's SPECIFIC reason
+                 * (decrypt_error / bad_signature / unexpected_message / an
+                 * alert description) is far more diagnostic than the generic
+                 * -107. Dedup by only printing the first few of each. */
+                static const char *keys[] = {
+                    "ssl_error", "cert_verify", "verify_result", "alert",
+                    "handshake_fail", "decrypt", "bad_", "unexpected",
+                    "illegal_", "protocol", "cipher", "signature", 0 };
+                for (int ki = 0; keys[ki]; ki++) {
+                    const char *kw = keys[ki];
+                    size_t kl = strlen(kw);
+                    int hits = 0;
+                    for (size_t i = 0; i + kl < nlsz && hits < 2; i++) {
+                        bool m = true;
+                        for (size_t c = 0; c < kl; c++)
+                            if (s[i+c] != kw[c]) { m = false; break; }
+                        if (!m) continue;
+                        hits++;
+                        size_t a = i > 40 ? i - 40 : 0;
+                        size_t b = (i + 70 < nlsz) ? i + 70 : nlsz;
+                        char win[128]; size_t w = 0;
+                        for (size_t j = a; j < b && w < sizeof(win)-1; j++) {
+                            char ch = s[j];
+                            win[w++] = (ch >= 32 && ch < 127) ? ch : '.';
+                        }
+                        win[w] = 0;
+                        kprintf("[netlog] <%s> ..%s..\n", kw, win);
+                    }
+                }
+                kfree(nl);
+            } else {
+                kprintf("[netlog] /data/netlog.json not present (chrome may not "
+                        "have flushed it)\n");
+            }
         }
     }
 #endif
