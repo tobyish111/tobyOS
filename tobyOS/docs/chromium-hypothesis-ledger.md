@@ -1168,3 +1168,27 @@ thread is parked on; NSS init is now clean, so the DB is no longer the cause.
 CAVEAT on the instrument: `[tls] rx` prints the first 5 bytes of each TCP
 SEGMENT, but only the first segment starts on a record boundary -- middle lines
 are mid-record continuation bytes and must NOT be read as record headers.
+
+### Render tier re-tested in slice 35 -- STILL BROKEN (a hypothesis, refuted)
+
+It looked plausible that slice-34's MAP_SHARED CoW fix had also cured the
+SwiftShader "memory corruption" of slice 20, since the recorded symptoms (a
+`link_map->l_versyms` wrong by a page-aligned `0x1495000`, a memcpy destination
+landing in a guard page) are exactly what CoW-diverged shared pages look like,
+and all of that analysis predated the fix. **Tested and FALSE.** Swapping
+`--disable-gpu --disable-software-rasterizer` for
+`--use-angle=swiftshader --use-gl=angle` (plus `--screenshot`/`--window-size`):
+
+```
+[4316 ms] [lopen] pid=15 fd=27 /opt/chrome/libvk_swiftshader.so
+*** EXCEPTION 14: Page Fault  (in user mode) ***
+[5048 ms] [isr] user-mode fault -- terminating pid=15 fault_count=344
+                last_fault_rip=0x0000000007a4bb73
+```
+
+Dies ~5 s in, right after loading the SwiftShader ICD, and never reaches a DOM
+or a screenshot. So the GL/Vulkan crash is INDEPENDENT of the CoW bug and
+remains its own front. Harness reverted to the validated `--disable-gpu`
+configuration. (Note the faulting rip differs from slice 20's `memcpy+0x35d`,
+but so does the load layout -- correlate via `[libmap]` before concluding they
+are different bugs.)
