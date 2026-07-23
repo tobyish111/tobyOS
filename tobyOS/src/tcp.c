@@ -87,6 +87,18 @@ struct tcp_conn {
     uint8_t      rcv_wnd_shift;   /* our window scale factor (advertised) */
     bool         wscale_ok;       /* both sides support window scaling */
 
+#ifdef CHROMIUM_BOOT
+    /* Slice 35 diagnostic: per-connection wire accounting, so a failed TLS
+     * exchange can be told apart from one that never started. dbg_ooo counts
+     * segments dropped for arriving out of order -- the documented limit of
+     * this stack and the leading suspect for a multi-segment cert chain. */
+    uint64_t     dbg_tx_total;    /* payload bytes handed to the wire */
+    uint64_t     dbg_rx_total;    /* payload bytes delivered in-order */
+    uint64_t     dbg_rx_popped;   /* payload bytes the app actually read out */
+    uint32_t     dbg_ooo;         /* out-of-order segments dropped */
+    uint32_t     dbg_seg_logged;  /* rate-limit for the [tls] segment trace */
+    uint32_t     dbg_retx;        /* retransmissions we issued */
+#endif
     uint8_t      acc_head, acc_tail, acc_count, backlog_cap;
     int8_t       acc_q[TCP_LISTEN_BACKLOG];
     int8_t       parent_lsn;
@@ -205,6 +217,20 @@ static uint16_t alloc_ephemeral_port(void) {
 }
 
 static void rx_push(struct tcp_conn *c, const uint8_t *data, size_t n) {
+#ifdef CHROMIUM_BOOT
+    c->dbg_rx_total += n;                 /* bytes DELIVERED in-order to the app */
+    /* Slice 35 diagnostic: on a TLS port, log the leading bytes of each inbound
+     * segment. A TLS record header is [type][ver_hi][ver_lo][len_hi][len_lo],
+     * where type 0x16=handshake, 0x15=ALERT, 0x14=CCS, 0x17=app-data. Seeing an
+     * alert here would mean the SERVER rejected us; seeing only handshake
+     * records means the server said its piece and the client went quiet. */
+    if (ntohs(c->remote_port_be) == 443 && c->dbg_seg_logged < 8 && n >= 5) {
+        c->dbg_seg_logged++;
+        kprintf("[tls] rx tcp[%d] seg=%u type=0x%02x ver=%02x%02x reclen=%u\n",
+                conn_index(c), (unsigned)n, data[0], data[1], data[2],
+                (unsigned)((data[3] << 8) | data[4]));
+    }
+#endif
     while (n > 0 && c->rx_count < TCP_RX_BUF_BYTES) {
         c->rx_buf[c->rx_head] = *data++;
         c->rx_head = (c->rx_head + 1) % TCP_RX_BUF_BYTES;
@@ -220,6 +246,9 @@ static size_t rx_pop(struct tcp_conn *c, uint8_t *buf, size_t cap) {
         c->rx_tail = (c->rx_tail + 1) % TCP_RX_BUF_BYTES;
         c->rx_count--;
     }
+#ifdef CHROMIUM_BOOT
+    c->dbg_rx_popped += got;              /* bytes the APP actually consumed */
+#endif
     return got;
 }
 
@@ -376,6 +405,9 @@ static bool tcp_send_data_segment(struct tcp_conn *c, uint8_t xf,
     if (plen > 0) flags |= TCP_FLAG_PSH;
 
     if (!tcp_emit(c, flags, payload, plen)) return false;
+#ifdef CHROMIUM_BOOT
+    c->dbg_tx_total += plen;
+#endif
 
     struct tx_pend *p = &c->pend[pi];
     p->used    = true;
@@ -411,6 +443,9 @@ static bool tcp_retransmit_slot(struct tcp_conn *c, int pi) {
         p->sent_at = pit_ticks();
         p->retries++;
         c->retransmit_count++;
+#ifdef CHROMIUM_BOOT
+        c->dbg_retx++;
+#endif
         /* Exponential backoff on the RTO. */
         if (c->rto_ms < TCP_MAX_RTO_MS / 2u)
             c->rto_ms *= 2u;
@@ -708,6 +743,9 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
             need_ack = true;
         }
     } else if (plen > 0 && seq != c->rcv_nxt) {
+#ifdef CHROMIUM_BOOT
+        c->dbg_ooo++;
+#endif
         if (g_tcp_trace)
             kprintf("[tcp] out-of-order payload tcp[%d] len=%u seq=%u expected=%u\n",
                     conn_index(c),
@@ -726,6 +764,18 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
                 conn_index(c),
                 tcp_state_name(c->state),
                 (unsigned)seq);
+#ifdef CHROMIUM_BOOT
+            /* Slice 35: wire accounting at the moment the peer hangs up. For a
+             * TLS connection this says immediately whether the ClientHello went
+             * out (tx>0) and how much of the ServerHello/Certificate came back
+             * (rx), and whether we dropped anything for arriving out of order. */
+            kprintf("[tcp] WIRE tcp[%d] port=%u tx=%lu rx=%lu read=%lu "
+                    "ooo=%u retx=%u\n",
+                conn_index(c), (unsigned)ntohs(c->remote_port_be),
+                (unsigned long)c->dbg_tx_total, (unsigned long)c->dbg_rx_total,
+                (unsigned long)c->dbg_rx_popped,
+                (unsigned)c->dbg_ooo, (unsigned)c->dbg_retx);
+#endif
             switch (c->state) {
                 case TCP_ESTABLISHED:
                     /*

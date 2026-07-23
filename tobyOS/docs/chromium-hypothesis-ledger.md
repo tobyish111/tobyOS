@@ -1129,8 +1129,42 @@ verification** -- the leading hypothesis is eliminated. What is known:
 - the same kernel fetches `http://example.com/` perfectly, so DNS/TCP/epoll are fine.
 
 => The failure is in the TLS exchange itself, above connect and below cert checking.
-NEXT: instrument bytes-on-the-wire for `tcp[2]` (does the ClientHello go out? how much of
-the ServerHello/Certificate comes back before the FIN?). Prime suspect is tcp.c's
-documented limit -- *"out-of-order data beyond one segment is not reassembled"* plus no
-window scaling/SACK -- against a ~4 KB certificate chain arriving as several segments;
-`tcp_send_nb`'s short-write path is the other candidate to rule out.
+
+### MEASURED (same slice): the transport is CLEAN -- the stated suspect was WRONG
+
+Added CHROMIUM_BOOT-gated per-connection wire accounting (`[tcp] WIRE`) + a TLS
+record-type trace (`[tls] rx`). Result on `https://example.com/`:
+
+```
+[tls] rx tcp[2] seg=1440 type=0x16 ver=0303 reclen=1210     <- well-formed ServerHello
+[tls] rx tcp[2] seg=512  type=0x17 ver=0303 reclen=445      <- TLS 1.3 application_data
+[tcp] WIRE tcp[2] port=443 tx=1911 rx=4776 read=4776 ooo=0 retx=0
+```
+
+**This DISPROVES the out-of-order-reassembly hypothesis written above** (kept
+deliberately, as the record of a wrong call): `ooo=0, retx=0`. Note also that
+tcp.h's header comment claiming "no window scaling" is STALE -- tcp.c implements
+RFC 7323 scaling and CUBIC. Established facts now:
+
+- the client sends a complete padded ClientHello (tx=1911) and NOTHING afterwards;
+- the server returns a complete, well-formed TLS 1.3 flight (rx=4776: a 0x16
+  ServerHello then 0x17 application_data records);
+- **chrome CONSUMES every byte (read=4776 == rx)**, so this is not a kernel
+  read/readiness bug -- the bytes reach the application;
+- chrome then sends **no TLS Finished AND no alert**. A client that REJECTS a
+  handshake sends an alert first; total silence means it is STUCK, not refusing;
+- ~0.5 s later chrome execve's a fresh renderer (pid 50) = the error-page commit,
+  and dumps an empty body at ~31 s.
+
+LEADING HYPOTHESIS (untested): the stall is in chrome's CERT VERIFICATION, which
+runs off the TLS thread. Note `--ignore-certificate-errors` does NOT skip the
+verifier -- it ignores its *result* -- so that flag failing to help is consistent
+with a verifier that never RETURNS. Candidates: a verifier/thread-pool task that
+never gets scheduled, or the verifier blocking on something absent (CRLSet/CT
+data, an OCSP fetch). NEXT: dump the network-service thread stacks at the stall
+with the existing `bt_dump_group` instrument (slice 33) and see what the verifier
+thread is parked on; NSS init is now clean, so the DB is no longer the cause.
+
+CAVEAT on the instrument: `[tls] rx` prints the first 5 bytes of each TCP
+SEGMENT, but only the first segment starts on a record boundary -- middle lines
+are mid-record continuation bytes and must NOT be read as record headers.
