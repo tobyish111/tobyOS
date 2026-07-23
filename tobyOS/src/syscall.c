@@ -38,6 +38,7 @@
 #include <tobyos/vfs.h>
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
+#include <tobyos/rng.h>   /* getrandom + /dev/urandom entropy */
 #include <tobyos/gdt.h>
 #include <tobyos/tss.h>
 #include <tobyos/printk.h>
@@ -2033,6 +2034,22 @@ static long sys_open(const char *path, int flags, int mode) {
             memset(f, 0, sizeof(*f));
             f->kind = (dev[0] == 'n') ? FILE_KIND_DEVNULL : FILE_KIND_DEVZERO;
             f->o_accmode = 2;                       /* O_RDWR */
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            return fd;
+        }
+        /* /dev/urandom and /dev/random: the kernel CSPRNG as a readable file.
+         * getrandom(2) is the modern path, but plenty of code still opens these
+         * -- NSS's freebl falls back to /dev/urandom when the syscall is
+         * unavailable, and openssl/glibc/python do the same. Both nodes are the
+         * same non-blocking source (as on modern Linux, where /dev/random no
+         * longer blocks once the pool is initialised). */
+        if (strcmp(dev, "urandom") == 0 || strcmp(dev, "random") == 0) {
+            struct file *f = (struct file *)kmalloc(sizeof(*f));
+            if (!f) return -ABI_ENOMEM;
+            memset(f, 0, sizeof(*f));
+            f->kind = FILE_KIND_DEVRANDOM;
+            f->o_accmode = 2;                       /* O_RDWR: writes are mixed in */
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { kfree(f); return -ABI_EMFILE; }
             return fd;
@@ -4210,7 +4227,8 @@ enum {
     LX_uname = 63, LX_fcntl = 72, LX_getcwd = 79, LX_chdir = 80,
     LX_flock = 73, LX_fsync = 74, LX_fdatasync = 75, LX_rename = 82,
     LX_unlinkat = 263, LX_renameat = 264, LX_renameat2 = 316,
-    LX_mkdir = 83, LX_unlink = 87, LX_getuid = 102, LX_getgid = 104,
+    LX_mkdir = 83, LX_unlink = 87, LX_chmod = 90, LX_fchmod = 91,
+    LX_fchmodat = 268, LX_getuid = 102, LX_getgid = 104,
     LX_geteuid = 107, LX_getegid = 108, LX_getppid = 110,
     LX_prctl = 157,
     LX_arch_prctl = 158, LX_gettid = 186, LX_tkill = 200, LX_futex = 202,
@@ -4660,6 +4678,10 @@ static long linux_open_dir(const char *kpath) {
  * side isn't peekable here) -- a documented limit, not exercised by the proof.
  * =================================================================== */
 
+/* Defined with the socket syscalls below; file_poll_ready needs it to resolve
+ * an in-flight non-blocking connect into a readiness edge. */
+static int lx_conn_progress(struct sock *s);
+
 #define LXP_POLLIN   0x001
 #define LXP_POLLPRI  0x002
 #define LXP_POLLOUT  0x004
@@ -4689,11 +4711,24 @@ static short file_poll_ready(struct file *f) {
         }
         break;
     case FILE_KIND_SOCKET:
-        if (f->sock && f->sock->kind == SOCK_KIND_TCP) {
+        if (f->sock && f->sock->kind == SOCK_KIND_NETLINK) {
+            r |= LXP_POLLOUT;                          /* requests always accepted */
+            if (f->sock->count > 0) r |= LXP_POLLIN;   /* a dump reply is queued */
+        } else if (f->sock && f->sock->kind == SOCK_KIND_TCP) {
             /* B14: real TCP readiness. A listening socket is "readable" when a
              * handshake has completed (accept won't block); a connected socket
              * reports recv/send/hup/err from the live connection state. */
             struct tcp_conn *c = f->sock->tcp;
+            if (f->sock->connecting) {
+                /* A connect() still in flight. Linux signals completion by
+                 * making the fd WRITABLE (success) or writable+error (failure)
+                 * -- this is the edge chrome waits on, so it must be reported
+                 * here or a non-blocking connect never resolves. */
+                int pr = lx_conn_progress(f->sock);
+                if (pr == 1)      r |= LXP_POLLOUT;
+                else if (pr < 0)  r |= LXP_POLLOUT | LXP_POLLERR;
+                break;                                 /* still connecting: no events */
+            }
             if (f->sock->tcp_listening) {
                 if (tcp_can_accept(c)) r |= LXP_POLLIN;
             } else if (c) {
@@ -4720,6 +4755,11 @@ static short file_poll_ready(struct file *f) {
                 f->sock->peer_ip == 0 && !f->sock->x_server)
                 r |= LXP_POLLIN | LXP_POLLHUP;
         }
+        break;
+    case FILE_KIND_DEVNULL:                  /* bit-bucket + entropy devices: */
+    case FILE_KIND_DEVZERO:                  /* never block in either direction */
+    case FILE_KIND_DEVRANDOM:
+        r |= LXP_POLLIN | LXP_POLLOUT;
         break;
     case FILE_KIND_CONSOLE:                  /* B22: real TTY input readiness */
         r |= LXP_POLLOUT;                    /* always writable */
@@ -4977,6 +5017,13 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
 #define LXE_EOPNOTSUPP    95
 #define LXE_ECONNREFUSED 111
 #define LXE_ENOTCONN     107
+#define LXE_EINPROGRESS  115
+#define LXE_ETIMEDOUT    110
+#define LXE_EALREADY     114
+#define LXE_EISCONN      106
+
+#define LX_MSG_DONTWAIT  0x40         /* recv/send flag: never block this call */
+#define LX_MSG_PEEK      0x02         /* recv flag: read without dequeuing */
 
 #define LX_SOCK_DEF_ACCEPT_MS  3000   /* fallback accept() wait (cooperative) */
 #define LX_SOCK_DEF_CONNECT_MS 5000   /* fallback connect() wait */
@@ -5075,9 +5122,26 @@ static long lx_socket(int domain, int type, int proto) {
             return -ABI_EINVAL;
         struct sock *us = sock_alloc(SOCK_KIND_UNIX);
         if (!us) return -ABI_EMFILE;
+        us->nonblock = (type & SOCK_NONBLOCK) != 0;
         int ufd = lx_sock_install(us);
         if (ufd < 0) { sock_close(us); return -ABI_EMFILE; }
         return ufd;
+    }
+    /* AF_NETLINK/NETLINK_ROUTE: chrome's net::AddressTrackerLinux opens one to
+     * enumerate interfaces and watch for link changes. Refusing it (the old
+     * EINVAL) is the "Could not create NETLINK socket" error every run logged,
+     * which leaves NetworkChangeNotifier unable to tell whether the machine is
+     * online at all. See sock_netlink_send for the protocol we answer. */
+    if (domain == AF_NETLINK) {
+        if ((type & 0xff) != SOCK_RAW && (type & 0xff) != SOCK_DGRAM)
+            return -ABI_EINVAL;
+        if (proto != NETLINK_ROUTE) return -ABI_EINVAL;
+        struct sock *ns = sock_alloc(SOCK_KIND_NETLINK);
+        if (!ns) return -ABI_EMFILE;
+        ns->nonblock = (type & SOCK_NONBLOCK) != 0;
+        int nfd = lx_sock_install(ns);
+        if (nfd < 0) { sock_close(ns); return -ABI_EMFILE; }
+        return nfd;
     }
     /* We only implement IPv4. musl's getaddrinfo opens an AF_INET6 DNS socket
      * first and falls back to AF_INET *only* on EAFNOSUPPORT -- returning
@@ -5092,6 +5156,10 @@ static long lx_socket(int domain, int type, int proto) {
     if (!cap_check(current_proc(), CAP_NET, "lx_socket")) return -ABI_EACCES;
     struct sock *s = sock_alloc(kind);
     if (!s) return -ABI_EMFILE;
+    /* Honour SOCK_NONBLOCK. This bit used to be stripped and discarded, so a
+     * socket chrome created non-blocking still blocked its IO thread on the
+     * first empty recv. */
+    s->nonblock = (type & SOCK_NONBLOCK) != 0;
     int fd = lx_sock_install(s);
     if (fd < 0) { sock_close(s); return -ABI_EMFILE; }
     return fd;
@@ -5126,6 +5194,21 @@ static long lx_socketpair(int domain, int type, int proto, uint64_t usv) {
 static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
+    /* AF_NETLINK: bind(sockaddr_nl) selects the multicast groups to listen on.
+     * We deliver no unsolicited notifications, so the groups are recorded and
+     * otherwise unused; what matters is that bind SUCCEEDS, since chrome
+     * PCHECKs it. nl_pid 0 means "kernel assigns one" -- use the pool index+1
+     * so each socket gets a distinct, stable id, as Linux does per-socket. */
+    if (s->kind == SOCK_KIND_NETLINK) {
+        struct { uint16_t fam, pad; uint32_t pid, groups; } nl;
+        memset(&nl, 0, sizeof nl);
+        if (alen < sizeof nl || !uaddr ||
+            copy_from_user(&nl, (const void *)(uintptr_t)uaddr, sizeof nl) != 0)
+            return -ABI_EFAULT;
+        if (nl.fam != AF_NETLINK) return -ABI_EINVAL;
+        s->nl_pid = nl.pid ? nl.pid : (uint32_t)(current_proc()->pid);
+        return 0;
+    }
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     if (alen < 8 || !uaddr ||
@@ -5133,6 +5216,43 @@ static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
         return -ABI_EFAULT;
     if (sa.sin_family != AF_INET) return -ABI_EINVAL;
     return sock_bind(s, sa.sin_port) == 0 ? 0 : -LXE_EADDRINUSE;
+}
+
+/* ---- Non-blocking connect bookkeeping --------------------------------
+ *
+ * A non-blocking connect() returns EINPROGRESS with the SYN on the wire; the
+ * caller then waits for the socket to become writable and reads SO_ERROR to
+ * learn the outcome. This resolves that state machine. Returns:
+ *    0  still connecting
+ *    1  connected (s->connecting cleared)
+ *   <0  negative errno; also latched into s->so_error for getsockopt
+ *
+ * The deadline matters: a handshake that draws no answer at all leaves the
+ * connection in SYN_SENT indefinitely, and without a timeout poll() would stay
+ * silent forever and the caller would hang with no error to report. */
+static int lx_conn_progress(struct sock *s) {
+    if (!s || !s->connecting) return 1;
+    if (!s->tcp) { s->connecting = 0; s->so_error = LXE_ECONNREFUSED;
+                   return -LXE_ECONNREFUSED; }
+
+    tcp_state_t st = tcp_state(s->tcp);
+    if (st == TCP_ESTABLISHED) {
+        s->connecting = 0;
+        s->so_error   = 0;
+        return 1;
+    }
+    int flags = tcp_poll_flags(s->tcp);
+    if ((flags & TCP_RDY_ERR) || st == TCP_CLOSED) {
+        s->connecting = 0;
+        s->so_error   = LXE_ECONNREFUSED;
+        return -LXE_ECONNREFUSED;
+    }
+    if (s->conn_deadline && pit_ticks() >= s->conn_deadline) {
+        s->connecting = 0;
+        s->so_error   = LXE_ETIMEDOUT;
+        return -LXE_ETIMEDOUT;
+    }
+    return 0;                                   /* still in the handshake */
 }
 
 static long lx_listen(int fd, int backlog) {
@@ -5147,11 +5267,14 @@ static long lx_listen(int fd, int backlog) {
     return 0;
 }
 
-static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen) {
+static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen, int flags) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
     if (s->kind != SOCK_KIND_TCP || !s->tcp_listening || !s->tcp)
         return -ABI_EINVAL;
+    /* Non-blocking listener: report EAGAIN rather than sitting in tcp_accept
+     * for the whole timeout when no handshake is queued. */
+    if (s->nonblock && !tcp_can_accept(s->tcp)) return -LXE_EAGAIN;
     uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : LX_SOCK_DEF_ACCEPT_MS;
     struct tcp_conn *child = tcp_accept(s->tcp, to);
     if (!child) return -LXE_EAGAIN;
@@ -5159,6 +5282,7 @@ static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen) {
     if (!ns) { tcp_close(child); return -ABI_EMFILE; }
     ns->tcp = child;
     ns->local_port = s->local_port;
+    ns->nonblock   = (flags & SOCK_NONBLOCK) != 0;
     int nfd = lx_sock_install(ns);
     if (nfd < 0) { tcp_close(child); sock_close(ns); return -ABI_EMFILE; }
     if (uaddr) {
@@ -5223,6 +5347,29 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
     }
 
     uint32_t to = s->send_timeout_ms ? s->send_timeout_ms : LX_SOCK_DEF_CONNECT_MS;
+
+    /* Non-blocking connect: put the SYN on the wire and return EINPROGRESS at
+     * once. Chrome's TCPSocketPosix does exactly this and then waits for the
+     * fd to become writable -- blocking here instead parked its IO thread for
+     * a whole round trip on every connection. A repeat connect() while one is
+     * in flight is EALREADY, as on Linux. */
+    if (s->nonblock) {
+        if (s->connecting) {
+            int pr = lx_conn_progress(s);
+            if (pr == 1) return 0;                    /* finished in the gap */
+            return pr < 0 ? pr : -LXE_EALREADY;
+        }
+        if (s->tcp) return -LXE_EISCONN;
+        struct tcp_conn *nc = tcp_connect_nb(sa.sin_addr, sa.sin_port);
+        if (!nc) return -LXE_ECONNREFUSED;
+        s->tcp        = nc;
+        s->connecting = 1;
+        s->so_error   = 0;
+        uint32_t hz = pit_hz(); if (!hz) hz = 100;
+        s->conn_deadline = pit_ticks() + ((uint64_t)hz * to) / 1000u;
+        return -LXE_EINPROGRESS;
+    }
+
     struct tcp_conn *c = tcp_connect(sa.sin_addr, sa.sin_port, to);
     if (!c) return -LXE_ECONNREFUSED;
     s->tcp = c;
@@ -5301,15 +5448,46 @@ static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
         return urv;
     }
 
+    /* AF_NETLINK: the request is answered synchronously into our own rx ring
+     * (see sock_netlink_send), so the reply is already readable when this
+     * returns -- which is what makes chrome's blocking-then-MSG_DONTWAIT read
+     * loop terminate correctly. */
+    if (s->kind == SOCK_KIND_NETLINK) {
+        (void)uaddr;
+        if (len == 0) return 0;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *nk = kmalloc(len);
+        if (!nk) return -ABI_ENOMEM;
+        long nrv;
+        if (copy_from_user(nk, (const void *)(uintptr_t)ubuf, len) != 0)
+            nrv = -ABI_EFAULT;
+        else
+            nrv = sock_netlink_send(s, nk, len);
+        kfree(nk);
+        return nrv < 0 ? -ABI_EINVAL : nrv;
+    }
+
     if (s->kind != SOCK_KIND_TCP || !s->tcp) return -LXE_ENOTSOCK;
     (void)uaddr;
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+    /* A send on a socket whose non-blocking connect has not finished is
+     * EAGAIN, not a broken pipe. */
+    if (s->connecting) {
+        int pr = lx_conn_progress(s);
+        if (pr == 0) return -LXE_EAGAIN;
+        if (pr < 0)  return pr;
+    }
     void *k = kmalloc(len);
     if (!k) return -ABI_ENOMEM;
     long rv;
     if (copy_from_user(k, (const void *)(uintptr_t)ubuf, len) != 0) rv = -ABI_EFAULT;
-    else {
+    else if (s->nonblock) {
+        /* Never wait for ACKs: queue what the window allows and report the
+         * short count (0 -> EAGAIN, and the caller waits for POLLOUT). */
+        long n = tcp_send_nb(s->tcp, k, len);
+        rv = (n < 0) ? -ABI_EPIPE : (n == 0 ? -LXE_EAGAIN : n);
+    } else {
         long n = tcp_send(s->tcp, k, len);
         rv = (n < 0) ? -ABI_EPIPE : n;
     }
@@ -5317,9 +5495,50 @@ static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
     return rv;
 }
 
-static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr, uint64_t ualen) {
+static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
+                    uint64_t ualen, int flags) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
+
+    /* This call must not block if the socket is in non-blocking mode OR the
+     * caller passed MSG_DONTWAIT for this one call. Both matter here: chrome's
+     * AddressTrackerLinux keeps its netlink socket BLOCKING and drives the
+     * dump-drain loop entirely with MSG_DONTWAIT. */
+    bool nowait = s->nonblock || (flags & LX_MSG_DONTWAIT) != 0;
+
+    /* A recv on a socket still completing a non-blocking connect. */
+    if (s->connecting) {
+        int pr = lx_conn_progress(s);
+        if (pr == 0) return nowait ? -LXE_EAGAIN : 0;
+        if (pr < 0)  return pr;
+    }
+
+    if (s->kind == SOCK_KIND_NETLINK) {
+        if (len == 0) return 0;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *nk = kmalloc(len);
+        if (!nk) return -ABI_ENOMEM;
+        long n = sock_netlink_recv_peek(s, nk, len, (flags & LX_MSG_PEEK) != 0);
+        long nrv;
+        if (n == SOCK_ERR_AGAIN)  nrv = -LXE_EAGAIN;   /* dump fully drained */
+        else if (n < 0)           nrv = -LXE_ENOTSOCK;
+        else if (copy_to_user((void *)(uintptr_t)ubuf, nk, (size_t)n) != 0)
+            nrv = -ABI_EFAULT;
+        else                      nrv = n;
+        kfree(nk);
+        return nrv;
+    }
+
+    /* Non-blocking and nothing to read: EAGAIN rather than parking. Pump the
+     * NIC once first, so a reply that has physically arrived but not yet been
+     * demultiplexed is seen now instead of costing the caller another epoll
+     * round trip. */
+    if (nowait && !sock_recv_ready(s)) {
+        struct net_dev *nd = net_default();
+        if (nd && nd->rx_drain) nd->rx_drain(nd);
+        net_poll();
+        if (!sock_recv_ready(s)) return -LXE_EAGAIN;
+    }
 
     if (s->kind == SOCK_KIND_UDP) {
         if (len == 0) return 0;
@@ -5400,17 +5619,70 @@ static long lx_setsockopt(int fd, int level, int optname, uint64_t uval, uint32_
     return 0;                            /* SO_REUSEADDR etc.: no-op success */
 }
 
-static long lx_getsockname(int fd, uint64_t uaddr, uint64_t ualen) {
-    struct sock *s = lx_sock_of(fd);
+/* getsockname(2) / getpeername(2).
+ *
+ * The local ADDRESS used to be left at 0.0.0.0 -- only the family and port were
+ * filled. That is not a cosmetic gap: glibc's getaddrinfo implements RFC 3484
+ * destination sorting by connect()ing a UDP socket to each candidate and
+ * calling getsockname() to discover which source address the route picks. A
+ * reply of 0.0.0.0 reads as "no route to this destination", which is why every
+ * resolution retried on a 3-second cadence. We have exactly one interface, so
+ * the answer is always g_my_ip.
+ *
+ * getpeername used to be aliased to getsockname, which answered with the LOCAL
+ * address -- wrong for every caller that asks who it is talking to. */
+static long lx_sockaddr_out(struct sock *s, uint64_t uaddr, uint64_t ualen,
+                            bool peer) {
     if (!s || !uaddr) return -LXE_ENOTSOCK;
+
+    /* AF_NETLINK: answer with a sockaddr_nl carrying our assigned nl_pid. */
+    if (s->kind == SOCK_KIND_NETLINK) {
+        struct { uint16_t fam, pad; uint32_t pid, groups; } nl;
+        memset(&nl, 0, sizeof nl);
+        nl.fam = AF_NETLINK;
+        nl.pid = peer ? 0 : s->nl_pid;        /* peer of a netlink socket = kernel (0) */
+        if (copy_to_user((void *)(uintptr_t)uaddr, &nl, sizeof nl) != 0)
+            return -ABI_EFAULT;
+        if (ualen) { uint32_t al = (uint32_t)sizeof nl;
+                     (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
+        return 0;
+    }
+
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    sa.sin_port = s->local_port;
+
+    if (peer) {
+        if (s->kind == SOCK_KIND_TCP) {
+            if (!s->tcp) return -LXE_ENOTCONN;
+            sa.sin_addr = tcp_remote_ip_be(s->tcp);
+            sa.sin_port = tcp_remote_port_be(s->tcp);
+        } else {
+            if (!s->peer_port) return -LXE_ENOTCONN;
+            sa.sin_addr = s->peer_ip;
+            sa.sin_port = s->peer_port;
+        }
+    } else {
+        sa.sin_addr = g_my_ip;                /* our only interface */
+        /* A TCP socket's real local port lives on the connection (the
+         * ephemeral one picked at connect time), not in sock->local_port. */
+        sa.sin_port = (s->kind == SOCK_KIND_TCP && s->tcp && !s->tcp_listening)
+                        ? tcp_local_port_be(s->tcp)
+                        : s->local_port;
+    }
+
     if (copy_to_user((void *)(uintptr_t)uaddr, &sa, sizeof sa) != 0) return -ABI_EFAULT;
     if (ualen) { uint32_t al = (uint32_t)sizeof sa;
                  (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
     return 0;
+}
+
+static long lx_getsockname(int fd, uint64_t uaddr, uint64_t ualen) {
+    return lx_sockaddr_out(lx_sock_of(fd), uaddr, ualen, false);
+}
+
+static long lx_getpeername(int fd, uint64_t uaddr, uint64_t ualen) {
+    return lx_sockaddr_out(lx_sock_of(fd), uaddr, ualen, true);
 }
 
 /* B18: a REAL getsockopt(SOL_SOCKET, …). Before this it was an accept-and-ignore
@@ -5443,7 +5715,15 @@ static long lx_getsockopt(int fd, int level, int optname,
     /* Everything else is a 4-byte int. */
     int32_t v;
     switch (optname) {
-    case SO_ERROR:      v = 0;                                       break;
+    case SO_ERROR:
+        /* This is how a poller learns whether a non-blocking connect actually
+         * succeeded: it waits for writability, then reads SO_ERROR (0 = up).
+         * Resolve the handshake first, then report and CLEAR the latched error,
+         * as Linux does -- SO_ERROR is read-once. */
+        (void)lx_conn_progress(s);
+        v = s->so_error;
+        s->so_error = 0;
+        break;
     case SO_TYPE:       v = (s->kind == SOCK_KIND_TCP) ? SOCK_STREAM
                                                        : SOCK_DGRAM; break;
     case SO_ACCEPTCONN: v = s->tcp_listening ? 1 : 0;                break;
@@ -5642,15 +5922,23 @@ static long lx_sendmsg(int fd, uint64_t umsg, int flags) {
     }
 
     long rv;
-    if (s->kind == SOCK_KIND_UDP) {
+    if (s->kind == SOCK_KIND_NETLINK) {
+        /* Dump request via sendmsg (glibc's check_pf uses sendto, chrome's
+         * AddressTrackerLinux uses sendto too, but netlink users legitimately
+         * use either -- answer both). */
+        long n = total ? sock_netlink_send(s, k, total) : 0;
+        rv = (n < 0) ? -ABI_EINVAL : n;
+    } else if (s->kind == SOCK_KIND_UDP) {
         uint32_t dip; uint16_t dport;
         uint64_t naddr = (mh.msg_namelen >= 8) ? mh.msg_name : 0;
         if (!lx_udp_dest(s, naddr, &dip, &dport)) { if (k) kfree(k); return -ABI_EINVAL; }
         long n = sock_sendto(s, k, total, dip, dport);
         rv = (n < 0) ? -LXE_EAGAIN : n;
     } else if (s->kind == SOCK_KIND_TCP && s->tcp) {
-        long n = total ? tcp_send(s->tcp, k, total) : 0;
-        rv = (n < 0) ? -ABI_EPIPE : n;
+        long n = total ? (s->nonblock ? tcp_send_nb(s->tcp, k, total)
+                                      : tcp_send(s->tcp, k, total)) : 0;
+        rv = (n < 0) ? -ABI_EPIPE
+           : (n == 0 && total && s->nonblock) ? -LXE_EAGAIN : n;
     } else if (s->kind == SOCK_KIND_UNIX) {
         /* AF_UNIX: libxcb + D-Bus write via sendmsg (not just writev), and Mojo
          * passes fds (its memfd) as SCM_RIGHTS ancillary data -- collect + clone
@@ -5688,7 +5976,19 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
 
     long n;
     uint32_t sip = 0; uint16_t sport = 0;
-    if (s->kind == SOCK_KIND_UDP) {
+    if (s->kind == SOCK_KIND_NETLINK) {
+        /* glibc reads netlink with recvmsg, NOT recv: __check_pf/getifaddrs
+         * (sysdeps/unix/sysv/linux/check_pf.c make_request) is the caller, and
+         * getaddrinfo runs it for RFC 3484 sorting on every resolution. Missing
+         * this arm returned ENOTSOCK and printed glibc's "Unexpected error 88 on
+         * netlink descriptor N (address family 16)" -- and, worse, it BROKE
+         * name resolution outright, because a netlink socket that opens and then
+         * fails is worse than one that never opens: the EINVAL from socket() is
+         * what used to send glibc down its fallback path. */
+        n = sock_netlink_recv_peek(s, k, total, (flags & LX_MSG_PEEK) != 0);
+        if (n == SOCK_ERR_AGAIN)   { kfree(k); return -LXE_EAGAIN; }
+        if (n < 0)                 { kfree(k); return -LXE_ENOTSOCK; }
+    } else if (s->kind == SOCK_KIND_UDP) {
         uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
         n = sock_recvfrom_to(s, k, total, &sip, &sport, to);
         if (n == EINTR_RET)        { kfree(k); return -LXE_EINTR; }
@@ -5742,14 +6042,27 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
     kfree(k);
 
     /* Fill the sender address (UDP) / family (TCP) and clear ancillary. */
-    if (mh.msg_name && mh.msg_namelen >= sizeof(struct sockaddr_in)) {
+    size_t namelen_out = 0;
+    if (s->kind == SOCK_KIND_NETLINK) {
+        /* The source of a dump reply is the KERNEL, which netlink identifies as
+         * nl_pid == 0. glibc's make_request explicitly skips any message whose
+         * nl_pid is non-zero ("not from the kernel"), so getting this wrong
+         * makes it silently discard every answer we send. */
+        struct { uint16_t fam, pad; uint32_t pid, groups; } nla;
+        memset(&nla, 0, sizeof nla);
+        nla.fam = AF_NETLINK;
+        namelen_out = sizeof nla;
+        if (mh.msg_name && mh.msg_namelen >= sizeof nla)
+            (void)copy_to_user((void *)(uintptr_t)mh.msg_name, &nla, sizeof nla);
+    } else if (mh.msg_name && mh.msg_namelen >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET; sa.sin_addr = sip; sa.sin_port = sport;
         (void)copy_to_user((void *)(uintptr_t)mh.msg_name, &sa, sizeof sa);
+        namelen_out = sizeof sa;
     }
     {   /* msg_namelen written back; msg_controllen/msg_flags are set by the
          * SCM_RIGHTS emitter (which also installs any received fds). */
-        uint32_t nl = (mh.msg_name) ? (uint32_t)sizeof(struct sockaddr_in) : 0;
+        uint32_t nl = (mh.msg_name) ? (uint32_t)namelen_out : 0;
         (void)copy_to_user((void *)(uintptr_t)(umsg + 8),  &nl, 4);
         lx_scm_recv_emit(umsg, &mh, scm_files, scm_n);
     }
@@ -6201,17 +6514,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_socket:      return lx_socket((int)a1, (int)a2, (int)a3);
     case LX_bind:        return lx_bind((int)a1, (uint64_t)a2, (uint32_t)a3);
     case LX_listen:      return lx_listen((int)a1, (int)a2);
-    case LX_accept:      return lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3);
-    case LX_accept4:     return lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3);
+    case LX_accept:      return lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3, 0);
+    /* accept4's 4th arg carries SOCK_NONBLOCK/SOCK_CLOEXEC for the NEW fd
+     * (they are not inherited from the listener). */
+    case LX_accept4:     return lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3, (int)a4);
     case LX_connect:     return lx_connect((int)a1, (uint64_t)a2, (uint32_t)a3);
     case LX_sendto:      return lx_send((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5);
-    case LX_recvfrom:    return lx_recv((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5, 0);
+    /* recvfrom(fd, buf, len, flags, src_addr, addrlen). a4 is FLAGS and was
+     * being dropped -- so MSG_DONTWAIT was silently ignored and every such
+     * "poll me" read blocked instead. */
+    case LX_recvfrom:    return lx_recv((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5, 0, (int)a4);
     case LX_sendmsg:     return lx_sendmsg((int)a1, (uint64_t)a2, (int)a3);
     case LX_recvmsg:     return lx_recvmsg((int)a1, (uint64_t)a2, (int)a3);
     case LX_setsockopt:  return lx_setsockopt((int)a1, (int)a2, (int)a3, (uint64_t)a4, (uint32_t)a5);
     case LX_getsockopt:  return lx_getsockopt((int)a1, (int)a2, (int)a3, (uint64_t)a4, (uint64_t)a5);
     case LX_getsockname: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
-    case LX_getpeername: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
+    case LX_getpeername: return lx_getpeername((int)a1, (uint64_t)a2, (uint64_t)a3);
     case LX_socketpair:  return lx_socketpair((int)a1, (int)a2, (int)a3, (uint64_t)a4);
     case LX_shutdown:    return 0;       /* half-close not modelled; close() tears down */
 
@@ -6280,6 +6598,23 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_getcwd: return do_syscall(SYS_GETCWD, a1, a2, 0, 0, 0);
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
+
+    /* chmod/fchmod/fchmodat: tobyOS's VFS does not model Unix permission bits,
+     * so these succeed without storing anything. Reporting ENOSYS is worse than
+     * a no-op for the callers that matter: NSS creates its key database and
+     * then chmod()s it to 0600, treating failure as "the database is not
+     * secure" and refusing to use it (SEC_ERROR_BAD_DATABASE). Anything that
+     * writes a file and tightens its mode afterwards hits the same wall.
+     * We validate the path so a bogus one still reports ENOENT. */
+    case LX_chmod: case LX_fchmodat: {
+        const char *up = (const char *)(LX_chmod == n ? a1 : a2);
+        char kpath[ABI_PATH_MAX];
+        if (resolve_user_path(up, kpath, sizeof kpath) != 0) return -ABI_EFAULT;
+        struct vfs_stat vs;
+        return (vfs_stat(kpath, &vs) == VFS_OK) ? 0 : -ABI_ENOENT;
+    }
+    case LX_fchmod:
+        return fd_lookup((int)a1) ? 0 : -ABI_EBADF;
     case LX_unlink: return do_syscall(SYS_UNLINK, a1, 0, 0, 0, 0);
 
     /* ---- fs mutations chrome's profile stores (leveldb/SQLite) require ---- */
@@ -7046,13 +7381,35 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return 0;
     }
     case LX_getrandom: {
-        /* Best-effort: zero-fill (deterministic). Real entropy is B2. */
-        size_t len = (size_t)a2;
-        if (len > 256) len = 256;
-        char z[256]; memset(z, 0, len);
-        if (a1 && len && copy_to_user((void *)a1, z, len) != 0)
-            return -ABI_EFAULT;
-        return (long)len;
+        /* Real entropy from the kernel CSPRNG (RDRAND/device-seeded, see
+         * rng.h). This used to ZERO-FILL, which is not merely weak -- it is
+         * actively detectable: NSS's freebl seeds its RNG here, runs a
+         * continuous health check, sees a constant stream and fails softoken
+         * init with CKR_DEVICE_ERROR. That surfaced as chrome's
+         * "[FATAL:crypto/nss_util.cc:146] nss_error=-8023" and made every
+         * https:// navigation abort before the handshake. Anything doing real
+         * crypto (TLS, key generation, ASLR, hash seeds) has the same
+         * requirement, so this is a correctness fix well beyond chrome.
+         *
+         * The 256-byte cap is gone too: Linux getrandom fills the whole
+         * request (up to 32 MiB for urandom), and silently returning a short
+         * count leaves callers that do not loop with uninitialised tail bytes.
+         * We chunk through a stack buffer to bound stack use. */
+        uint64_t ubuf = a1;
+        size_t   len  = (size_t)a2;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        if (!ubuf || len == 0) return 0;
+        uint8_t chunk[256];
+        size_t done = 0;
+        while (done < len) {
+            size_t take = len - done;
+            if (take > sizeof chunk) take = sizeof chunk;
+            rng_fill(chunk, take);
+            if (copy_to_user((void *)(uintptr_t)(ubuf + done), chunk, take) != 0)
+                return done ? (long)done : -ABI_EFAULT;
+            done += take;
+        }
+        return (long)done;
     }
 
     /* ---- signals (B4 + B15): translate the Linux signal ABI onto the native
@@ -7154,7 +7511,20 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * check reads. */
             struct file *ff = fd_lookup((int)a1);
             if (!ff) return -ABI_EBADF;
+            /* O_NONBLOCK IS tracked for sockets now, and it must read back:
+             * the standard way to go non-blocking is F_GETFL, OR the bit in,
+             * F_SETFL -- if F_GETFL never reports it, code that checks its own
+             * work (or re-derives flags later) sees a blocking socket. */
+            if (ff->kind == FILE_KIND_SOCKET && ff->sock && ff->sock->nonblock)
+                return ff->o_accmode | SOCK_NONBLOCK;
             return ff->o_accmode;
+        }
+        if ((int)a2 == 4 /* F_SETFL */) {
+            struct file *ff = fd_lookup((int)a1);
+            if (!ff) return -ABI_EBADF;
+            if (ff->kind == FILE_KIND_SOCKET && ff->sock)
+                ff->sock->nonblock = ((unsigned long)a3 & SOCK_NONBLOCK) != 0;
+            return 0;
         }
         if ((int)a2 == 1033 /* F_ADD_SEALS */) {
             /* Chrome's Mojo shared-memory channel (channel_linux.cc) seals its

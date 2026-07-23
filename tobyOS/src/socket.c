@@ -66,7 +66,7 @@ static struct sock *sock_by_fd(int fd) {
 
 struct sock *sock_alloc(int kind) {
     if (kind != SOCK_KIND_UDP && kind != SOCK_KIND_TCP &&
-        kind != SOCK_KIND_UNIX) return 0;
+        kind != SOCK_KIND_UNIX && kind != SOCK_KIND_NETLINK) return 0;
     for (int i = 0; i < SOCK_MAX; i++) {
         if (!g_socks[i].in_use) {
             memset(&g_socks[i], 0, sizeof(g_socks[i]));
@@ -632,6 +632,263 @@ long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
     s->tail = (uint8_t)((s->tail + 1) % SOCK_RX_DGRAMS);
     s->count--;
 
+    return (long)copy;
+}
+
+/* True when a recv would complete immediately. Non-blocking callers use this to
+ * decide EAGAIN; blocking ones ignore it and park as before. TCP defers to the
+ * connection's own readiness (buffered data, EOF, or error all count -- each
+ * makes recv return without blocking). */
+bool sock_recv_ready(struct sock *s) {
+    if (!s || !s->in_use) return true;         /* dead socket: recv returns at once */
+    if (s->kind == SOCK_KIND_TCP) {
+        if (!s->tcp) return true;              /* unconnected -> immediate error */
+        return (tcp_poll_flags(s->tcp) & (TCP_RDY_RECV | TCP_RDY_ERR)) != 0;
+    }
+    /* Data queued, or the peer is gone (recv returns EOF immediately). The
+     * x_server exclusion mirrors file_poll_ready EXACTLY: the in-kernel fake-X
+     * endpoint has no peer proc by design (peer_ip == 0 always), so without it
+     * this would call an X socket permanently readable. These two predicates
+     * disagreeing is precisely what once made epoll say "readable" forever
+     * while recvmsg said EAGAIN -- keep them in lockstep. */
+    if (s->kind == SOCK_KIND_UNIX)
+        return s->count > 0 || (s->peer_ip == 0 && !s->x_server);
+    return s->count > 0;                       /* UDP / netlink: queued datagram */
+}
+
+/* ---- AF_NETLINK / NETLINK_ROUTE ---------------------------------------
+ *
+ * Enough of rtnetlink for net::AddressTrackerLinux (chrome's network-change
+ * notifier). Verified against the real source rather than guessed:
+ *   socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)   -- note: NOT non-blocking
+ *   bind(nl_groups = RTMGRP_IPV4_IFADDR|RTMGRP_IPV6_IFADDR|RTMGRP_NOTIFY|RTMGRP_LINK)
+ *   sendto(RTM_GETADDR, NLM_F_REQUEST|NLM_F_DUMP) ; read until NLMSG_DONE
+ *   sendto(RTM_GETLINK, NLM_F_REQUEST|NLM_F_DUMP) ; read until NLMSG_DONE
+ * Its read loop does the FIRST recv blocking and the rest with MSG_DONTWAIT,
+ * ending on NLMSG_DONE or EAGAIN. We answer each dump SYNCHRONOUSLY inside
+ * send -- the reply is already queued when sendto returns -- so both the
+ * blocking and the MSG_DONTWAIT reads behave correctly with no timing window.
+ *
+ * A link that is online must report IFF_UP|IFF_LOWER_UP|IFF_RUNNING and must
+ * NOT be IFF_LOOPBACK, or AddressTrackerLinux leaves online_links_ empty and
+ * chrome concludes CONNECTION_NONE -- i.e. "this machine is offline".
+ *
+ * We never send unsolicited notifications: tobyOS's link comes up before chrome
+ * starts and never changes, which is exactly the steady state the tracker
+ * expects after its initial dump. */
+
+#define NL_NLMSG_DONE      3
+#define NL_RTM_NEWLINK    16
+#define NL_RTM_GETLINK    18
+#define NL_RTM_NEWADDR    20
+#define NL_RTM_GETADDR    22
+#define NL_NLM_F_MULTI  0x002
+
+#define NL_IFA_ADDRESS     1
+#define NL_IFA_LOCAL       2
+#define NL_IFA_LABEL       3
+#define NL_IFLA_ADDRESS    1
+#define NL_IFLA_IFNAME     3
+
+#define NL_IFF_UP        0x0001
+#define NL_IFF_BROADCAST 0x0002
+#define NL_IFF_LOOPBACK  0x0008
+#define NL_IFF_RUNNING   0x0040
+#define NL_IFF_MULTICAST 0x1000
+#define NL_IFF_LOWER_UP  0x10000
+
+#define NL_ARPHRD_ETHER      1
+#define NL_ARPHRD_LOOPBACK 772
+
+#define NL_ALIGN(n)  (((n) + 3u) & ~3u)
+
+struct nl_msghdr {                 /* struct nlmsghdr */
+    uint32_t len;
+    uint16_t type;
+    uint16_t flags;
+    uint32_t seq;
+    uint32_t pid;
+};
+
+/* Append one netlink message header + payload + attributes into buf. */
+struct nl_build {
+    uint8_t *buf;
+    size_t   cap;
+    size_t   off;
+    /* Offset of the message header currently being built, so its length can be
+     * patched once every attribute has been appended. */
+    size_t   msg_start;
+    /* Set once anything did not fit. Every later append is then a no-op --
+     * without this a truncated begin() would leave msg_start pointing at the
+     * PREVIOUS message and end() would overwrite its length, corrupting a
+     * message that was already complete. Netlink has no partial messages. */
+    bool     full;
+};
+
+static void nlb_msg_begin(struct nl_build *b, uint16_t type, uint16_t flags,
+                          uint32_t seq, uint32_t pid,
+                          const void *body, size_t body_len) {
+    if (b->full) return;
+    if (b->off + sizeof(struct nl_msghdr) + NL_ALIGN(body_len) > b->cap) {
+        b->full = true;
+        return;
+    }
+    b->msg_start = b->off;
+    struct nl_msghdr h = { 0 };
+    h.type = type; h.flags = flags; h.seq = seq; h.pid = pid;
+    memcpy(b->buf + b->off, &h, sizeof h);
+    b->off += sizeof h;
+    if (body_len) memcpy(b->buf + b->off, body, body_len);
+    /* Pad the fixed body out to a 4-byte boundary; attributes start aligned. */
+    memset(b->buf + b->off + body_len, 0, NL_ALIGN(body_len) - body_len);
+    b->off += NL_ALIGN(body_len);
+}
+
+static void nlb_attr(struct nl_build *b, uint16_t type,
+                     const void *val, size_t len) {
+    if (b->full) return;
+    size_t need = 4u + NL_ALIGN(len);
+    if (b->off + need > b->cap) { b->full = true; return; }
+    uint16_t rta_len = (uint16_t)(4u + len);          /* excludes the padding */
+    memcpy(b->buf + b->off,     &rta_len, 2);
+    memcpy(b->buf + b->off + 2, &type,    2);
+    if (len) memcpy(b->buf + b->off + 4, val, len);
+    memset(b->buf + b->off + 4 + len, 0, NL_ALIGN(len) - len);
+    b->off += need;
+}
+
+static void nlb_msg_end(struct nl_build *b) {
+    if (b->full) return;
+    if (b->msg_start + sizeof(struct nl_msghdr) > b->cap) return;
+    uint32_t total = (uint32_t)(b->off - b->msg_start);
+    memcpy(b->buf + b->msg_start, &total, 4);         /* patch nlmsg_len */
+}
+
+/* struct ifaddrmsg (8 bytes) */
+struct nl_ifaddrmsg {
+    uint8_t  family, prefixlen, flags, scope;
+    uint32_t index;
+};
+/* struct ifinfomsg (16 bytes) */
+struct nl_ifinfomsg {
+    uint8_t  family, pad;
+    uint16_t type;
+    int32_t  index;
+    uint32_t flags, change;
+};
+
+/* Number of leading 1-bits in a network-order netmask (e.g. 255.255.255.0 -> 24). */
+static uint8_t nl_prefix_len(uint32_t mask_be) {
+    uint32_t m = ntohl(mask_be);
+    uint8_t n = 0;
+    while (m & 0x80000000u) { n++; m <<= 1; }
+    return n;
+}
+
+long sock_netlink_send(struct sock *s, const void *kbuf, size_t n) {
+    if (!s || !s->in_use) return -1;
+    if (n < sizeof(struct nl_msghdr)) return -1;
+
+    /* Auto-bind an unbound socket to the caller's pid, exactly as Linux does on
+     * the first send. This is NOT cosmetic: glibc's check_pf (which getaddrinfo
+     * runs on EVERY resolution) never calls bind, and then discards any reply
+     * whose nlmsg_pid != getpid():
+     *     if (nladdr.nl_pid != 0 || nlmh->nlmsg_pid != pid
+     *         || nlmh->nlmsg_seq != req.nlh.nlmsg_seq) continue;
+     * A discarded dump leaves seen_ipv4 = false, and getaddrinfo then filters
+     * out every IPv4 answer -- so name resolution returns nothing at all. Note
+     * the asymmetry that makes this sharp: when the netlink socket FAILS to
+     * open, glibc assumes both families exist and carries on; it is a netlink
+     * that succeeds and answers unusably that breaks DNS outright. */
+    if (s->nl_pid == 0) {
+        struct proc *cp = current_proc();
+        if (cp) s->nl_pid = (uint32_t)cp->pid;
+    }
+
+    /* One 1 KiB reply datagram is ample: two links + one address with their
+     * attributes come to a few hundred bytes, and chrome reads into 4 KiB. */
+    uint8_t *out = (uint8_t *)kmalloc(1024);
+    if (!out) return -1;
+    struct nl_build b = { out, 1024, 0, 0, false };
+
+    /* Walk every request in the caller's buffer (chrome sends one at a time). */
+    size_t off = 0;
+    while (off + sizeof(struct nl_msghdr) <= n) {
+        struct nl_msghdr rq;
+        memcpy(&rq, (const uint8_t *)kbuf + off, sizeof rq);
+        if (rq.len < sizeof(struct nl_msghdr) || off + rq.len > n) break;
+
+        if (rq.type == NL_RTM_GETADDR) {
+            /* One IPv4 address on eth0 (index 2). Loopback is deliberately
+             * omitted: the tracker discards loopback/unspecified addresses. */
+            if (g_my_ip) {
+                struct nl_ifaddrmsg ia = { 0 };
+                ia.family    = 2;                     /* AF_INET */
+                ia.prefixlen = nl_prefix_len(g_my_netmask);
+                ia.scope     = 0;                     /* RT_SCOPE_UNIVERSE */
+                ia.index     = 2;
+                nlb_msg_begin(&b, NL_RTM_NEWADDR, NL_NLM_F_MULTI,
+                              rq.seq, s->nl_pid, &ia, sizeof ia);
+                nlb_attr(&b, NL_IFA_ADDRESS, &g_my_ip, 4);
+                nlb_attr(&b, NL_IFA_LOCAL,   &g_my_ip, 4);
+                nlb_attr(&b, NL_IFA_LABEL,   "eth0", 5);
+                nlb_msg_end(&b);
+            }
+        } else if (rq.type == NL_RTM_GETLINK) {
+            struct nl_ifinfomsg lo = { 0 };
+            lo.type  = NL_ARPHRD_LOOPBACK;
+            lo.index = 1;
+            lo.flags = NL_IFF_UP | NL_IFF_LOOPBACK | NL_IFF_RUNNING |
+                       NL_IFF_LOWER_UP;
+            nlb_msg_begin(&b, NL_RTM_NEWLINK, NL_NLM_F_MULTI,
+                          rq.seq, s->nl_pid, &lo, sizeof lo);
+            nlb_attr(&b, NL_IFLA_IFNAME, "lo", 3);
+            nlb_msg_end(&b);
+
+            /* eth0 -- the one that must read as ONLINE. */
+            struct nl_ifinfomsg eth = { 0 };
+            eth.type  = NL_ARPHRD_ETHER;
+            eth.index = 2;
+            eth.flags = NL_IFF_UP | NL_IFF_BROADCAST | NL_IFF_MULTICAST |
+                        (net_is_up() ? (NL_IFF_RUNNING | NL_IFF_LOWER_UP) : 0);
+            nlb_msg_begin(&b, NL_RTM_NEWLINK, NL_NLM_F_MULTI,
+                          rq.seq, s->nl_pid, &eth, sizeof eth);
+            nlb_attr(&b, NL_IFLA_IFNAME,  "eth0", 5);
+            nlb_attr(&b, NL_IFLA_ADDRESS, g_my_mac, ETH_ADDR_LEN);
+            nlb_msg_end(&b);
+        }
+        /* Anything else (RTM_GETROUTE, RTM_GETNEIGH, ...): no entries, just
+         * the DONE below. A dump that returns nothing is a valid answer. */
+
+        /* Every dump terminates with NLMSG_DONE; its body is an int error
+         * code, which for a successful dump is 0. */
+        int32_t done = 0;
+        nlb_msg_begin(&b, NL_NLMSG_DONE, NL_NLM_F_MULTI,
+                      rq.seq, s->nl_pid, &done, sizeof done);
+        nlb_msg_end(&b);
+
+        off += NL_ALIGN(rq.len);
+    }
+
+    if (b.off) sock_deliver(s, 0, 0, out, b.off);
+    kfree(out);
+    return (long)n;                    /* the request itself was fully consumed */
+}
+
+long sock_netlink_recv(struct sock *s, void *kbuf, size_t n) {
+    return sock_netlink_recv_peek(s, kbuf, n, false);
+}
+
+long sock_netlink_recv_peek(struct sock *s, void *kbuf, size_t n, bool peek) {
+    if (!s || !s->in_use) return -1;
+    if (s->count == 0) return SOCK_ERR_AGAIN;
+    struct sock_dgram *d = &s->dgrams[s->tail];
+    size_t copy = d->len < n ? d->len : n;
+    if (copy && d->payload) memcpy(kbuf, d->payload, copy);
+    if (peek) return (long)copy;              /* MSG_PEEK: leave it queued */
+    if (d->payload) { kfree(d->payload); d->payload = 0; }
+    s->tail = (uint8_t)((s->tail + 1) % SOCK_RX_DGRAMS);
+    s->count--;
     return (long)copy;
 }
 

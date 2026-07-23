@@ -876,8 +876,10 @@ static int pred_est(const struct tcp_conn *c) {
     return 0;
 }
 
-struct tcp_conn *tcp_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
-                             uint32_t timeout_ms) {
+/* Allocate a connection, pick an ephemeral port and put the SYN on the wire.
+ * Shared by the blocking and non-blocking active opens -- the ONLY difference
+ * between them is whether we then wait for the handshake. */
+static struct tcp_conn *tcp_syn_out(uint32_t dst_ip_be, uint16_t dst_port_be) {
     if (dst_ip_be == 0 || g_my_ip == 0) return NULL;
     struct tcp_conn *c = conn_alloc();
     if (!c) return NULL;
@@ -899,6 +901,13 @@ struct tcp_conn *tcp_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
         conn_free(c);
         return NULL;
     }
+    return c;
+}
+
+struct tcp_conn *tcp_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
+                             uint32_t timeout_ms) {
+    struct tcp_conn *c = tcp_syn_out(dst_ip_be, dst_port_be);
+    if (!c) return NULL;
 
     uint32_t hz = pit_hz();
     if (hz == 0) hz = 100;
@@ -908,6 +917,20 @@ struct tcp_conn *tcp_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
         return NULL;
     }
     return c;
+}
+
+struct tcp_conn *tcp_connect_nb(uint32_t dst_ip_be, uint16_t dst_port_be) {
+    return tcp_syn_out(dst_ip_be, dst_port_be);
+}
+
+uint16_t tcp_local_port_be(const struct tcp_conn *c) {
+    return (c && c->in_use) ? c->local_port_be : 0;
+}
+uint32_t tcp_remote_ip_be(const struct tcp_conn *c) {
+    return (c && c->in_use) ? c->remote_ip_be : 0;
+}
+uint16_t tcp_remote_port_be(const struct tcp_conn *c) {
+    return (c && c->in_use) ? c->remote_port_be : 0;
 }
 
 struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog) {
@@ -1019,6 +1042,45 @@ long tcp_send(struct tcp_conn *c, const void *buf, size_t len) {
         return -3;
     }
     return (long)len;
+}
+
+/* Non-blocking send: push whatever the current congestion/receive window has
+ * room for and return immediately, WITHOUT waiting for the ACKs. Returns the
+ * number of bytes accepted (a short write is normal and the caller must loop),
+ * 0 if the window is currently full (EAGAIN), or <0 on a dead connection.
+ *
+ * tcp_send's block-until-fully-acknowledged contract is right for a
+ * synchronous client but wrong for an epoll-driven one: chrome writes from its
+ * IO thread and expects the kernel to buffer-or-refuse, never to park. */
+long tcp_send_nb(struct tcp_conn *c, const void *buf, size_t len) {
+    if (!c || !c->in_use) return -1;
+    if (c->remote_rst_seen) return -2;
+    if (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT) return -1;
+    if (len == 0) return 0;
+
+    const uint8_t *p         = (const uint8_t *)buf;
+    size_t         remaining = len;
+
+    while (remaining > 0) {
+        size_t flight = pend_flight_bytes(c);
+        /* Room left in the smaller of the congestion and receive windows. */
+        size_t wnd = c->cwnd_bytes < (size_t)c->snd_wnd
+                       ? c->cwnd_bytes : (size_t)c->snd_wnd;
+        if (flight >= wnd) break;                 /* window full -> short/EAGAIN */
+        size_t room = wnd - flight;
+
+        size_t chunk = remaining;
+        if (chunk > TCP_DEFAULT_MSS) chunk = TCP_DEFAULT_MSS;
+        if (chunk > room)            chunk = room;
+        if (chunk == 0) break;
+
+        if (!tcp_send_data_segment(c, 0, p, chunk)) break;  /* no pending slot */
+        p         += chunk;
+        remaining -= chunk;
+    }
+
+    size_t sent = len - remaining;
+    return (long)sent;                            /* 0 == would block */
 }
 
 static int pred_recv(const struct tcp_conn *c) {

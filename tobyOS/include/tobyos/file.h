@@ -103,6 +103,9 @@ enum file_kind {
      * child died with _exit(127) -- and virtually every Unix program uses it. */
     FILE_KIND_DEVNULL    = 16,
     FILE_KIND_DEVZERO    = 17,
+    /* /dev/urandom + /dev/random: reads draw from the kernel CSPRNG (rng.h),
+     * writes are mixed back into the pool (as on Linux). Always poll-ready. */
+    FILE_KIND_DEVRANDOM  = 18,
 };
 
 struct eventfd;

@@ -7403,7 +7403,12 @@ void _start(void) {
              * healthy, parked in its message loops. Give it room. */
             (char *)"--timeout=120000",
             (char *)"--dump-dom",
-            (char *)"data:text/html,<h1>tobyOS</h1>",
+            /* Slice 35: a REAL network URL, not a data: URL -- chrome now
+             * resolves, connects, fetches and parses a live page (see the
+             * networking fixes in socket.c/syscall.c/tcp.c). https:// still
+             * fails at the transport tier and is the next front; keep this on
+             * http:// so the harness asserts something that actually works. */
+            (char *)"http://example.com/",
             0,
         };
         char *envp[] = {

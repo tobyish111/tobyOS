@@ -29,14 +29,24 @@
 #define SOCK_KIND_UDP          1
 #define SOCK_KIND_TCP          2
 #define SOCK_KIND_UNIX         3       /* AF_UNIX socketpair endpoint (Track B) */
+#define SOCK_KIND_NETLINK      4       /* AF_NETLINK/NETLINK_ROUTE (Track B) */
 
 /* User-visible "domain"/"type" constants. */
 #define AF_UNIX                1
 #define AF_INET                2
 #define AF_INET6               10      /* not implemented; lx_socket -> EAFNOSUPPORT */
+#define AF_NETLINK             16      /* rtnetlink (chrome's NetworkChangeNotifier) */
+#define NETLINK_ROUTE          0
 #define SOCK_STREAM            1       /* TCP */
 #define SOCK_DGRAM             2       /* UDP */
+#define SOCK_RAW               3       /* AF_NETLINK uses this */
 #define SOCK_SEQPACKET         5       /* AF_UNIX message socket (Mojo uses this) */
+
+/* Type-flag bits OR'd into socket()/accept4()'s `type` argument. Chrome's
+ * network service creates EVERY socket with SOCK_NONBLOCK and drives it from
+ * epoll; a blocking recv on its IO thread stalls the whole message pump. */
+#define SOCK_NONBLOCK          0x800   /* == O_NONBLOCK */
+#define SOCK_CLOEXEC           0x80000
 
 /* AF_UNIX socketpair endpoints (Track B, Chromium Mojo IPC): a bidirectional
  * in-memory message channel. Two SOCK_KIND_UNIX socks are cross-linked; each
@@ -131,9 +141,46 @@ struct sock {
     uint32_t         peer_ip;
     uint16_t         peer_port;
 
+    /* ---- Non-blocking mode (O_NONBLOCK) ------------------------------
+     * Set by SOCK_NONBLOCK at socket()/accept4() time or fcntl(F_SETFL).
+     * Until this existed the flag was parsed and THROWN AWAY, so every
+     * recv on an empty socket blocked the caller instead of returning
+     * EAGAIN -- fine for the wget-shaped clients this stack grew up with,
+     * fatal for an epoll-driven one like chrome's network service. */
+    bool             nonblock;
+
+    /* ---- Non-blocking connect state ----------------------------------
+     * connecting=1 between a connect() that returned EINPROGRESS and the
+     * handshake resolving. so_error holds the result for getsockopt(SO_ERROR)
+     * (0 = connected), which is how a poller learns the outcome; it is
+     * read-and-cleared, as on Linux. conn_deadline bounds a handshake that
+     * draws no reply at all (no RST, no SYN-ACK), which would otherwise sit
+     * in SYN_SENT forever and make poll() silent for good. */
+    uint8_t          connecting;
+    int              so_error;         /* pending errno; 0 = none */
+    uint64_t         conn_deadline;    /* pit ticks; 0 = no deadline */
+
+    /* AF_NETLINK: the nl_pid this socket bound to (unique per socket, as on
+     * Linux, where an unbound sendmsg auto-binds to the tid). */
+    uint32_t         nl_pid;
+
     /* Wait queue of procs blocked in recvfrom / recv. */
     struct proc    *wq_recv;
 };
+
+/* True when a recv on this socket would return data/EOF immediately (i.e.
+ * would NOT block). Used to decide EAGAIN on a non-blocking socket. */
+bool sock_recv_ready(struct sock *s);
+
+/* AF_NETLINK (NETLINK_ROUTE). Chrome's net::AddressTrackerLinux opens one to
+ * learn the interface/address list and to watch for changes; without it
+ * NetworkChangeNotifier has no idea whether the machine is online. We answer
+ * the dump requests it makes and stay silent afterwards (our link never
+ * changes), which is exactly the steady state it expects. */
+long sock_netlink_send(struct sock *s, const void *kbuf, size_t n);
+long sock_netlink_recv(struct sock *s, void *kbuf, size_t n);
+/* As sock_netlink_recv, but `peek` (MSG_PEEK) leaves the message queued. */
+long sock_netlink_recv_peek(struct sock *s, void *kbuf, size_t n, bool peek);
 
 /* Initialise the socket pool. Called from net_init. */
 void sock_init(void);

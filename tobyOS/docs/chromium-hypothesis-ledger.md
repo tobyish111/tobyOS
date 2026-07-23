@@ -964,3 +964,173 @@ the topological one (two mappers, one file).
 - chrome: `ILLEGAL_MEMORY_RANGE` 0 across all post-fix runs; renderer no longer
   crashes; `--dump-dom` prints the real DOM; exit 0.
 - defboot: clean (see logs/defboot.log).
+
+---
+
+## SLICE 34 (2026-07-22) — ***THE DOM PRINTS.*** Goal achieved; and a CORRECTION to slice 33
+
+```
+[23861 ms] [stdout] <html><head></head><body><h1>tobyOS</h1></body></html>
+[24388 ms] [proc] pid=2 'chrome' exit code=0 (0x0) cpu=2394 ms syscalls=13570
+[24394 ms] [boot] CHROMIUM: chrome (pid=2) exit=0
+```
+
+Real, unmodified `chrome-headless-shell` 151.0.7922.34 loads `data:text/html,<h1>tobyOS</h1>`
+and prints the parsed DOM via `--dump-dom`, exiting **0**. **REPRODUCED on two consecutive
+runs.** Same run: FUTEXTEST / EFDTEST / MAPTEST all PASS, `ILLEGAL_MEMORY_RANGE` = **0**,
+GPU "isn't usable" FATAL = **0**, `[sockchk]` corruption = 0. (A `SIGKILL victim group`
+line still appears, but AFTER the DOM prints and after `sys_exit code=0` -- that is normal
+renderer teardown during clean shutdown, not a failure.)
+
+### CORRECTION: slice 33's "semantic ipcz wall" conclusion was WRONG
+
+Slice 33 concluded the residual blocker was a SEMANTIC ipcz decode mismatch
+(`VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE` on a fragment-resident network.mojom parcel) and
+that the next tier had to be ipcz-source archaeology. **That was a phantom.** It is now 0
+occurrences per run with no ipcz work whatsoever. The error -- and very likely the
+"renderer killed at ~15.3 s with no connection" and the deterministic login livelock that
+followed -- were ARTIFACTS of **stale-object kernel corruption**.
+
+Root cause of the phantom: slice 33 added a field (`is_renderer`) to `struct proc`, which
+changes the struct's layout. Incremental `make` does NOT reliably recompile every .c that
+embeds `struct proc`, so different objects disagreed on field offsets. The resulting
+corruption did not announce itself as a crash -- it produced **convincing, stable, false
+symptoms** at the application layer: a Mojo message that failed validation, a renderer that
+never completed its connection, and (later) a boot that hung right after `login` 4/4 times
+and even under `-smp 1`. Every one of those vanished after removing all kernel .o and
+rebuilding. Cost: a large amount of this session, plus a wrong documented conclusion that
+would have sent the next agent into ipcz internals for nothing.
+
+**HARD RULE (this bit us TWICE in one session -- treat it as non-negotiable):** after ANY
+change to `struct proc` (or any widely-embedded struct/header), delete all kernel objects
+and rebuild before trusting a single observation:
+```
+find . -maxdepth 3 -name '*.o' | grep -vE 'programs/|libtoby|sdk' | xargs rm -f
+```
+Corollary, and the real lesson: when a *userspace* symptom is exotic and stable (a protocol
+validator rejecting a well-formed message; bytes that are provably byte-perfect on the wire
+yet "malformed" on arrival), suspect YOUR OWN BUILD before you suspect the application's
+protocol. A clean rebuild is minutes; protocol archaeology is days.
+
+### What is actually required for the DOM (attribution -- one part still OPEN)
+
+Two changes were in place when it first worked:
+1. **`--in-process-gpu`** (kernel.c, argc 16). This one is independently evidenced: the
+   browser was observed LOG(FATAL)-ing "GPU process isn't usable. Goodbye."
+   (gpu_data_manager_impl_private.cc:417) and exiting at ~20 s after its watchdog SIGKILLed
+   the hung gpu-process 3x. Running GPU on a browser thread removes that chain entirely.
+2. **A clean kernel rebuild** (eliminating the stale-object corruption above).
+
+**OPEN:** it has NOT been isolated whether `--in-process-gpu` is still NECESSARY once the
+build is clean, or whether the clean build alone suffices. The one clean build that predates
+the DOM run (bt25) was killed right after the unit tests, so it never reached the dump. To
+settle it: clean-build with `--in-process-gpu` removed and see whether the DOM still prints.
+Do NOT assume either change is load-bearing until that test runs.
+
+### Standing
+
+The Track B / Chromium `--dump-dom` milestone is **MET**: a real, unmodified, off-the-shelf
+Chromium runs its full multi-process engine on tobyOS (browser + gpu-in-process + network +
+utility + renderer, Mojo/ipcz, cross-process shared memory, SCM_RIGHTS, futex/eventfd
+wakeups) and produces a correct parsed DOM. Three permanent unit tests (linux-futex,
+linux-eventfd, linux-mapshare) guard the primitives underneath it. Remaining chrome work
+(screenshot/render tier, the flaky Vulkan/SwiftShader path) is unchanged and out of scope
+for this milestone.
+
+---
+
+## SLICE 35 (2026-07-23) — ***REAL NETWORK NAVIGATION.*** chrome fetches and parses a live page
+
+```
+[23463 ms] [stdout] <!DOCTYPE html>
+<html lang="en"><head><title>Example Domain</title>...<h1>Example Domain</h1>
+<p>This domain is for use in documentation examples without needing permission...
+[31056 ms] [boot] CHROMIUM: chrome (pid=2) exit=0
+```
+
+Real `chrome-headless-shell` resolves `example.com` over DNS, opens TCP, fetches over
+HTTP/1.1, Blink parses it, `--dump-dom` prints the live page. **exit=0, ~23 s.**
+FUTEXTEST / EFDTEST / MAPTEST all still PASS in the same run. The harness URL is now a
+real `http://` URL rather than a `data:` URL, so the boot asserts the whole path.
+
+### The five fixes, and why each mattered
+
+| # | Fix | Evidence it was load-bearing |
+|---|---|---|
+| S35-1 | **`getsockname` never filled `sin_addr`** (only family+port, i.e. always 0.0.0.0) | glibc's getaddrinfo implements RFC 3484 destination sorting by `connect()`ing a UDP socket per candidate and reading `getsockname()` for the source address. 0.0.0.0 reads as "no route", which is why every resolution retried on an exact **3-second cadence, 5 times** (measured: 7 socket + 7 connect + 5 sendto + 2 recvfrom per burst). `getpeername` was also aliased to `getsockname` -- it answered with the LOCAL address for every caller asking who it was talking to. |
+| S35-2 | **`SOCK_NONBLOCK`/`O_NONBLOCK` parsed and thrown away** | `lx_socket` did `type & 0xff` with the comment "strip SOCK_NONBLOCK" and never stored it. Chrome's network service creates every socket non-blocking and drives it from epoll; a blocking `recv` parks its IO thread. Now tracked on `struct sock`, honoured at socket/accept4/fcntl(F_SETFL), and read back by F_GETFL. |
+| S35-3 | **`recvfrom`'s `flags` argument was DROPPED at the dispatch** (`lx_recv(..., a5, 0)` -- a4 never passed) | So `MSG_DONTWAIT` was silently ignored and every "poll me" read blocked. This is what chrome's netlink drain loop is built on. |
+| S35-4 | **blocking-only connect/send** | `connect()` waited out the handshake (no EINPROGRESS); `tcp_send` blocked until every byte was ACKed. Added `tcp_connect_nb()` + `tcp_send_nb()` (queue what the window allows, short-write, 0 = EAGAIN), EINPROGRESS + poll-writable completion + read-and-clear `SO_ERROR`, and a deadline so a handshake drawing NO reply cannot leave poll silent forever. |
+| S35-5 | **no `AF_NETLINK` at all** | `ERROR:net/base/address_tracker_linux.cc:224 Could not create NETLINK socket` every run. Implemented NETLINK_ROUTE answering RTM_GETADDR/RTM_GETLINK dumps (lo + eth0) terminated by NLMSG_DONE. |
+
+### TRAP: a half-implemented AF_NETLINK is WORSE than none (cost a full run)
+
+Making `socket(AF_NETLINK)` succeed without a working `recvmsg` **broke DNS outright** --
+a strict regression from the EINVAL that preceded it. glibc's `__check_pf` (which
+getaddrinfo runs on EVERY resolution) has this asymmetry:
+
+- netlink **fails to open** -> glibc assumes both families exist and carries on;
+- netlink **opens but answers unusably** -> `seen_ipv4 = false` -> getaddrinfo filters
+  out every IPv4 result -> no resolution at all.
+
+Two independent bugs produced "answers unusably", and the SECOND would never have been
+guessed from the symptom:
+
+1. `__check_pf` reads with **`recvmsg`**, not `recv` -- the netlink arm existed only in
+   `recvfrom`/`read`. Symptom: glibc's own
+   `Unexpected error 88 on netlink descriptor N (address family 16)` (88 = ENOTSOCK).
+2. glibc **never calls `bind()`**, then discards any reply failing
+   `nladdr.nl_pid != 0 || nlmh->nlmsg_pid != pid || nlmh->nlmsg_seq != req.seq`.
+   Linux auto-binds an unbound netlink socket to the caller's pid on first send and
+   echoes that in replies; without that auto-bind every reply is dropped SILENTLY even
+   once recvmsg works.
+
+**LESSON (a sharper form of the slice-34 lesson): when adding a capability that
+userspace probes for, the fallback path you are removing may be the one that WORKS.
+Either implement it completely enough to be believed, or keep failing the probe
+cleanly.** Both facts above came from READING THE REAL SOURCE (`address_tracker_linux.cc`
+and glibc `check_pf.c`), which also corrected two things that would have been wrong by
+assumption: chrome's netlink socket is **NOT** created non-blocking (it drives the drain
+purely with MSG_DONTWAIT), and a link only counts as ONLINE with
+`IFF_UP|IFF_LOWER_UP|IFF_RUNNING` -- miss `IFF_LOWER_UP` and chrome still concludes
+CONNECTION_NONE.
+
+### https:// -- NOT working. Two real bugs fixed behind it; the wall is transport-tier
+
+`https://example.com/` still dumps an empty body (`chrome exit=0`, ~31 s). Two genuine
+bugs were found and fixed on the way, both far bigger than chrome:
+
+- **`getrandom(2)` ZERO-FILLED** (`/* Best-effort: zero-fill (deterministic) */`).
+  NSS's freebl seeds its RNG from it, runs a continuous health check, sees a constant
+  stream and fails softoken init with CKR_DEVICE_ERROR -> `SEC_ERROR_PKCS11_DEVICE_ERROR`
+  (-8023) -> `[FATAL:crypto/nss_util.cc:146]`, aborting every https navigation before the
+  handshake. tobyOS already had an RDRAND-seeded CSPRNG (`rng.h`) that TLS uses -- the
+  syscall was simply never wired to it. Also removed the silent 256-byte truncation
+  (Linux fills the whole request; a short count leaves non-looping callers with
+  uninitialised tail bytes). **This is a system-wide correctness fix: any TLS, key
+  generation, ASLR or hash seeding on tobyOS was drawing zeros.**
+- **no `/dev/urandom` or `/dev/random`** -- added as `FILE_KIND_DEVRANDOM` (reads from
+  the CSPRNG, writes mix back in). NSS falls back to these when the syscall is absent, as
+  do OpenSSL/Python/glibc. While there: `/dev/zero` was never reported readable by poll
+  (it fell to the `default:` arm, POLLOUT only) -- fixed.
+- **`chmod`/`fchmod`/`fchmodat` were ENOSYS** -- NSS creates its key DB then chmods it
+  0600 and treats failure as "not secure", giving `SEC_ERROR_BAD_DATABASE` (-8174).
+  Now a validated no-op (the VFS has no mode bits).
+
+After all three, NSS initializes cleanly (zero nss_util errors) and the https run is
+quiet -- but the DOM is still empty.
+
+**DECISIVE NEGATIVE RESULT: `--ignore-certificate-errors` changes NOTHING.** The body is
+still empty with identical timing. So the https blocker is **NOT certificate
+verification** -- the leading hypothesis is eliminated. What is known:
+- exactly ONE client TCP connection is made (`tcp[2]`), it reaches ESTABLISHED, and the
+  peer sends **FIN at ~22.9 s**; chrome then exits at ~31 s with an empty document and
+  NO "Page load timed out" (so it committed something, it did not hang).
+- the same kernel fetches `http://example.com/` perfectly, so DNS/TCP/epoll are fine.
+
+=> The failure is in the TLS exchange itself, above connect and below cert checking.
+NEXT: instrument bytes-on-the-wire for `tcp[2]` (does the ClientHello go out? how much of
+the ServerHello/Certificate comes back before the FIN?). Prime suspect is tcp.c's
+documented limit -- *"out-of-order data beyond one segment is not reassembled"* plus no
+window scaling/SACK -- against a ~4 KB certificate chain arriving as several segments;
+`tcp_send_nb`'s short-write path is the other candidate to rule out.

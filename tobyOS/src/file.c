@@ -29,6 +29,7 @@
 #include <tobyos/pty.h>
 #include <tobyos/mmap.h>   /* memfd_* (FILE_KIND_MEMFD) */
 #include <tobyos/klibc.h>
+#include <tobyos/rng.h>   /* getrandom + /dev/urandom entropy */
 #include <tobyos/cpu.h>
 #include <tobyos/sched.h>
 #include <tobyos/proc.h>   /* current_proc -- [efd] Mojo-notification trace */
@@ -342,12 +343,22 @@ long file_read(struct file *f, void *buf, size_t n) {
     case FILE_KIND_DEVZERO:
         memset(buf, 0, n);
         return (long)n;                            /* endless zeroes */
+    case FILE_KIND_DEVRANDOM:
+        rng_fill(buf, n);
+        return (long)n;                            /* never short, never blocks */
     case FILE_KIND_PIPE_R:
         return pipe_read(f->pipe, buf, n);
     case FILE_KIND_VFS:
         if (!f->vfs.ops || !f->vfs.ops->read) return -1;
         return f->vfs.ops->read(&f->vfs, buf, n);
     case FILE_KIND_SOCKET:
+        /* Non-blocking socket with nothing to read: EAGAIN, never park. Chrome
+         * reads its TCP sockets with plain read() (not recv), so the check has
+         * to live here as well as in the recv path -- and an optimistic read
+         * before the data arrives is the COMMON case in an epoll-driven client,
+         * not an edge case. */
+        if (f->sock && f->sock->nonblock && !sock_recv_ready(f->sock))
+            return SOCK_ERR_AGAIN;                     /* == -EAGAIN */
         /* A CONNECTED TCP socket is a byte stream: read() == recv(). A
          * connect()-ed UDP socket reads the next datagram. */
         if (f->sock && f->sock->kind == SOCK_KIND_TCP && f->sock->tcp &&
@@ -355,6 +366,10 @@ long file_read(struct file *f, void *buf, size_t n) {
             long r = tcp_recv(f->sock->tcp, buf, n,
                               f->sock->recv_timeout_ms);
             return (r == -1) ? 0 : r;    /* peer FIN -> EOF */
+        }
+        if (f->sock && f->sock->kind == SOCK_KIND_NETLINK) {
+            long r = sock_netlink_recv(f->sock, buf, n);
+            return r;                    /* SOCK_ERR_AGAIN == -EAGAIN */
         }
         if (f->sock && f->sock->kind == SOCK_KIND_UDP) {
             long r = sock_recvfrom_to(f->sock, buf, n, 0, 0,
@@ -402,6 +417,9 @@ long file_write(struct file *f, const void *buf, size_t n) {
     case FILE_KIND_DEVNULL:
     case FILE_KIND_DEVZERO:
         return (long)n;                            /* swallow everything */
+    case FILE_KIND_DEVRANDOM:
+        rng_mix(buf, n);                           /* writes seed the pool */
+        return (long)n;
     case FILE_KIND_PIPE_W:
         return pipe_write(f->pipe, buf, n);
     case FILE_KIND_VFS:
@@ -412,9 +430,18 @@ long file_write(struct file *f, const void *buf, size_t n) {
          * socket sends a datagram to its peer. */
         if (f->sock && f->sock->kind == SOCK_KIND_TCP && f->sock->tcp &&
             !f->sock->tcp_listening) {
+            /* Non-blocking: queue what the window allows and return the short
+             * count instead of waiting for every byte to be acknowledged. */
+            if (f->sock->nonblock) {
+                long w = tcp_send_nb(f->sock->tcp, buf, n);
+                if (w < 0) return -1;
+                return (w == 0) ? SOCK_ERR_AGAIN : w;
+            }
             long w = tcp_send(f->sock->tcp, buf, n);
             return (w < 0) ? -1 : w;
         }
+        if (f->sock && f->sock->kind == SOCK_KIND_NETLINK)
+            return sock_netlink_send(f->sock, buf, n);
         if (f->sock && f->sock->kind == SOCK_KIND_UDP && f->sock->peer_port) {
             long w = sock_sendto(f->sock, buf, n,
                                  f->sock->peer_ip, f->sock->peer_port);

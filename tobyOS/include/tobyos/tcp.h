@@ -68,6 +68,25 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len);
 struct tcp_conn *tcp_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
                              uint32_t timeout_ms);
 
+/* Active open that does NOT wait for the handshake: sends the SYN and returns
+ * the connection in SYN_SENT. The caller polls tcp_state()/tcp_poll_flags()
+ * for completion -- this is what a non-blocking connect() (EINPROGRESS) needs.
+ * Returns NULL only if a slot/port could not be allocated or the SYN failed
+ * to go out. */
+struct tcp_conn *tcp_connect_nb(uint32_t dst_ip_be, uint16_t dst_port_be);
+
+/* Send without waiting for ACKs: queues as much as the congestion/receive
+ * window allows right now and returns the byte count accepted (0 means the
+ * window is full -- the caller reports EAGAIN). tcp_send by contrast blocks
+ * until everything is acknowledged, which stalls an epoll-driven caller. */
+long tcp_send_nb(struct tcp_conn *c, const void *buf, size_t len);
+
+/* Local/remote endpoint of a connection (network byte order), for
+ * getsockname/getpeername. */
+uint16_t tcp_local_port_be(const struct tcp_conn *c);
+uint32_t tcp_remote_ip_be(const struct tcp_conn *c);
+uint16_t tcp_remote_port_be(const struct tcp_conn *c);
+
 /* Passive open: bind local port (network byte order). backlog is capped
  * internally (see TCP_LISTEN_BACKLOG in tcp.c). Returns NULL if the port
  * is busy or no slot is free. */
