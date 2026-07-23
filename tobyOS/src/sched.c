@@ -790,7 +790,8 @@ void sched_tick(struct regs *r) {
             lx_dump_recent_syscalls();
             prof_dump_and_reset();   /* hottest user rips this interval */
             { extern void waitt_dump(void); waitt_dump(); }  /* who blocks on what */
-            { extern void waitt_dump_stacks(void); waitt_dump_stacks(); }  /* user call chains, once */
+            /* (deadlocked-stack dump now fires from signal_send at the renderer's
+             * SIGKILL -- the only reliable moment; see bt_dump_group.) */
         }
     }
 #endif

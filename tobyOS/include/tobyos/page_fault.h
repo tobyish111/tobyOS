@@ -24,6 +24,20 @@ struct proc;
 #define PTE_COW       (1ULL << 9)   /* software: copy-on-write */
 #define PTE_DEMAND    (1ULL << 10)  /* software: demand-zero page */
 #define PTE_SWAPPED   (1ULL << 11)  /* software: page is in swap */
+#define PTE_SHARED    (1ULL << 52)  /* software: MAP_SHARED page -- NEVER CoW.
+                                     * Bits 52..62 are hardware-ignored on
+                                     * present PTEs (we don't use protection
+                                     * keys); bits 9..11 are all taken above.
+                                     * Set at map time by vmm_map(VMM_SHARED)
+                                     * for shm-cache/memfd pages; vmm_cow_fork
+                                     * copies these PTEs as-is (still writable)
+                                     * so parent+child keep writing the SAME
+                                     * frame -- POSIX MAP_SHARED across fork.
+                                     * (Slice 34: fork used to write-protect
+                                     * them; the browser's first post-fork
+                                     * parcel write then CoW-diverged its ipcz
+                                     * NodeLinkMemory -> children decoded stale
+                                     * fragments -> ILLEGAL_MEMORY_RANGE.) */
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
 /* x86_64 error code bits pushed by CPU on #PF */

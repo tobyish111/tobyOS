@@ -162,19 +162,40 @@ static void vma_remove(struct vma_table *vt, int idx) {
         vt->entries[idx] = vt->entries[vt->count];
 }
 
+/* Natural alignment for a fresh mapping of `len` bytes. Linux mmap gives no
+ * alignment guarantee beyond the page, but chrome's allocators DEMAND more
+ * and probe for it: PartitionAlloc requires 2 MiB-aligned super-pages and
+ * V8's pointer-compression cage a 4 GiB-aligned ~4 GiB reservation. Both
+ * allocate, CHECK the result's alignment, munmap and retry on failure -- and
+ * a bump allocator whose results are 4 KiB-aligned with a non-power-of-2
+ * stride essentially NEVER passes the check, so the renderer looped
+ * alloc/free-4GiB forever (slice 34: each giant munmap walked its pages
+ * under the BKL, starving every other process -- observed as a full wedge
+ * with the browser's own --timeout never firing). Aligning big requests
+ * naturally costs a little VA in a 96 TiB window and makes the first probe
+ * succeed. */
+static uint64_t align_for_len(uint64_t len) {
+    if (len >= 0x100000000ULL) return 0x100000000ULL;   /* >=4G: V8 cage    */
+    if (len >= 0x200000ULL)    return 0x200000ULL;      /* >=2M: PA superpage */
+    return PAGE_SIZE;
+}
+
 static uint64_t find_free_region(struct vma_table *vt, uint64_t len) {
+    uint64_t align = align_for_len(len);
     uint64_t addr = vt->mmap_hint;
     if (addr < MMAP_REGION_BASE) addr = MMAP_REGION_BASE;
+    addr = (addr + align - 1) & ~(align - 1);
 
     for (int iter = 0; iter < 1000; iter++) {
         if (addr + len > MMAP_REGION_END) {
-            addr = MMAP_REGION_BASE;
+            addr = (MMAP_REGION_BASE + align - 1) & ~(align - 1);
             continue;
         }
         bool conflict = false;
         for (int i = 0; i < vt->count; i++) {
             if (addr < vt->entries[i].end && (addr + len) > vt->entries[i].start) {
-                addr = page_align_up(vt->entries[i].end);
+                addr = (page_align_up(vt->entries[i].end) + align - 1) &
+                       ~(align - 1);
                 conflict = true;
                 break;
             }
@@ -556,6 +577,12 @@ bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     memset((void *)(phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
 
     uint32_t vmm_f = prot_to_vmm_flags(v->prot);
+    /* A page inside a MAP_SHARED VMA must never be CoW'd at fork: whoever
+     * shares the frame at fork time keeps sharing it. (Anon-shared pages the
+     * parent faults in AFTER the fork are still per-process -- full anon
+     * MAP_SHARED needs backing storage like the shm cache -- but pages that
+     * exist at fork time now behave.) */
+    if (v->flags & VMA_FLAG_SHARED) vmm_f |= VMM_SHARED;
     uint64_t saved_root = vmm_set_editor_root(p->cr3);
     vmm_map(page_va, phys, PAGE_SIZE, vmm_f);
     vmm_set_editor_root(saved_root);
@@ -572,6 +599,10 @@ int mmap_cow_clone(int parent_pid, int child_pid) {
 
     for (int i = 0; i < child_vt->count; i++) {
         struct mmap_vma *v = &child_vt->entries[i];
+        /* MAP_SHARED (and NOFREE cache/memfd-backed) regions must NEVER be
+         * marked CoW: fork shares them for real -- both sides keep writing
+         * the same frames (see PTE_SHARED in vmm_cow_fork). */
+        if (v->flags & (VMA_FLAG_SHARED | VMA_FLAG_NOFREE)) continue;
         if (v->prot & VMA_PROT_WRITE) {
             v->flags |= VMA_FLAG_COW;
             if (i < parent_vt->count) {
@@ -763,7 +794,10 @@ long memfd_map(uint64_t addr, uint64_t len, uint32_t prot, uint32_t flags,
     v->flags = (flags | VMA_FLAG_NOFREE) & ~(uint32_t)VMA_FLAG_ANON;
     v->fd = -1; v->offset = offset;
 
-    uint32_t vmm_f = prot_to_vmm_flags(prot);
+    /* VMM_SHARED: stamp PTE_SHARED so fork never write-protects these pages
+     * for CoW -- every mapper (incl. a post-fork parent) must keep writing
+     * the SAME physical frame. */
+    uint32_t vmm_f = prot_to_vmm_flags(prot) | VMM_SHARED;
     uint64_t saved = vmm_set_editor_root(p->cr3);
     for (size_t i = 0; i < np; i++)
         vmm_map(base + i * PAGE_SIZE, mf->pages[page_off + i], PAGE_SIZE, vmm_f);
@@ -923,7 +957,14 @@ long shm_cache_mmap(struct shm_cache *sc, uint64_t addr, uint64_t len,
     v->flags = (flags | VMA_FLAG_NOFREE) & ~(uint32_t)VMA_FLAG_ANON;
     v->fd = -1; v->offset = offset;
 
-    uint32_t vmm_f = prot_to_vmm_flags(prot);
+    /* VMM_SHARED: stamp PTE_SHARED so fork never write-protects these pages
+     * for CoW. Without it, the FIRST post-fork write through a pre-fork
+     * mapping faulted, saw refs>1 (the cache's own ref guarantees that), and
+     * silently diverted the writer onto a PRIVATE copy -- chrome's browser
+     * process CoW-diverged its live ipcz NodeLinkMemory the moment it forked
+     * a child and kept "writing" parcels nobody else could see (slice 34,
+     * VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE). */
+    uint32_t vmm_f = prot_to_vmm_flags(prot) | VMM_SHARED;
     uint64_t saved = vmm_set_editor_root(p->cr3);
     for (size_t i = 0; i < np; i++) {
         /* One reference per ADDRESS SPACE the page is mapped into, so this

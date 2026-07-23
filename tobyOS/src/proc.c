@@ -1092,6 +1092,17 @@ extern void fbdev_proc_exit(int pid);
 __attribute__((noreturn)) void proc_exit(int code) {
     struct proc *p = current_proc();
 
+#ifdef CHROMIUM_BOOT
+    /* If the renderer is terminating itself (e.g. the Mojo "no connection"
+     * watchdog after 15 s) rather than being SIGKILL'd, capture its group's
+     * user call chains here -- the exit path is the last moment its threads'
+     * blocked stacks are still mapped. One-shot inside bt_dump_group. */
+    if (p && p->is_renderer) {
+        extern void bt_dump_group(int tgid);
+        bt_dump_group(p->is_thread ? p->tgid : p->pid);
+    }
+#endif
+
     /* Track B graphics: flush a Linux /dev/fb0 mmap to the display while this
      * process's pages are still mapped (before cli()/teardown below). */
     if (p) fbdev_proc_exit(p->is_thread ? p->tgid : p->pid);

@@ -7275,6 +7275,35 @@ void _start(void) {
         }
     }
 
+    /* MAP_SHARED cross-process coherence test (slice 33/34 DOM blocker): two
+     * processes independently mmap the SAME unlinked file MAP_SHARED and must be
+     * coherent both directions -- the ipcz NodeLinkMemory-fragment case --
+     * INCLUDING writes the parent makes AFTER fork() through its pre-fork
+     * mapping (slice 34: vmm_cow_fork used to write-protect MAP_SHARED pages
+     * for CoW, so the browser's post-fork parcel writes silently diverged into
+     * a private copy -- the ILLEGAL_MEMORY_RANGE corruption).
+     * PASS=3, FAIL fwd=1, FAIL rev=4, FAIL post-fork=6/7, ERR=2. */
+    {
+        const char *path = "/bin/linux-mapshare";
+        char *argv[] = { (char *)"linux-mapshare", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-mapshare",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] MAPTEST: spawning %s\n", path);
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[MAPTEST] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[MAPTEST] VERDICT: %s exit=%d (3=PASS both-dir coherent incl. "
+                    "post-fork writes; 1=FAIL fwd; 4=FAIL rev; 6=FAIL post-fork "
+                    "CoW divergence; 7=FAIL parent on diverged copy; 2=ERROR)\n",
+                    rc == 3 ? "PASS" : "FAIL", rc);
+        }
+    }
+
     /* Track B M0: spawn a REAL, UNMODIFIED, off-the-shelf headless Chromium
      * (chrome-headless-shell from Chrome-for-Testing -- the actual V8 + Blink
      * engine, not a re-implementation; bundles SwiftShader for software GL).
@@ -7332,6 +7361,18 @@ void _start(void) {
             (char *)"--disable-gpu",
             (char *)"--disable-software-rasterizer",
             (char *)"--disable-gpu-compositing",
+            /* slice 33: the browser DIES at ~20s from FATAL "GPU process isn't
+             * usable. Goodbye." (gpu_data_manager_impl_private.cc:417) after the
+             * separate GPU process hangs in Mojo bootstrap and its watchdog
+             * SIGKILLs it 3x. Run the GPU on a browser-process THREAD instead:
+             * no separate process => no watchdog kill => no browser FATAL, so the
+             * browser survives long enough for the renderer to complete the DOM
+             * load. (Isolates the GPU-crash chain from the renderer's own path.)
+             * See docs/chromium-hypothesis-ledger.md slice 33. */
+            (char *)"--in-process-gpu",
+            /* DIAGNOSTIC: keep a deadlocked renderer alive longer for the stack
+             * walk (blocks the ShutdownForBadMessage SIGKILL). */
+            (char *)"--disable-kill-after-bad-ipc",
             /* slice 20: NO --virtual-time-budget. headless_command.js does
              * `await dp.Emulation.onceVirtualTimeBudgetExpired()` when this
              * switch is present, and virtual time only advances once the
@@ -7355,7 +7396,12 @@ void _start(void) {
              * NOT merely killed too early -- it never completes the Mojo
              * bootstrap handshake no matter how long it lives. Reverted to the
              * clean baseline. */
-            (char *)"--timeout=5000",
+            /* Slice 34: 5000 was calibrated for the STUCK-vs-slow probe. Now
+             * that the pipeline actually works (CoW/MAP_SHARED fix + aligned
+             * mmap), the load is merely SLOW under TCG: the data: URL's own
+             * renderer only spawns ~12 s in and was SIGKILLed mid-startup,
+             * healthy, parked in its message loops. Give it room. */
+            (char *)"--timeout=120000",
             (char *)"--dump-dom",
             (char *)"data:text/html,<h1>tobyOS</h1>",
             0,
@@ -7383,7 +7429,7 @@ void _start(void) {
              * took this 15 -> 14; leaving it at 15 made proc_spawn read past the
              * terminator and fail, which the arm below misreports as "binary not
              * present". Re-count whenever you touch argv. */
-            .argc = 14, .argv = argv, .envc = 7, .envp = envp,
+            .argc = 16, .argv = argv, .envc = 7, .envp = envp,
         };
         kprintf("[boot] CHROMIUM: spawning REAL headless Chromium "
                 "(chrome-headless-shell --dump-dom); the DELIVERABLE is the "

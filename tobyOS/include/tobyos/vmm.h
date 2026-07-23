@@ -28,6 +28,10 @@
 #define VMM_HUGE_2M  (1u << 5)   /* request a 2 MiB leaf (virt+phys must be 2M-aligned) */
 #define VMM_WC       (1u << 6)   /* write-combining (PAT slot 4) -- for the linear framebuffer.
                                   * Mutually exclusive with VMM_NOCACHE; needs vmm_pat_init(). */
+#define VMM_SHARED   (1u << 7)   /* MAP_SHARED leaf: stamps the PTE_SHARED software
+                                  * bit so vmm_cow_fork never write-protects it
+                                  * (fork must NOT CoW shared memory). Used by the
+                                  * shm-cache and memfd map paths (src/mmap.c). */
 
 struct limine_memmap_response;
 

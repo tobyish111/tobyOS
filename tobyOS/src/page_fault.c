@@ -282,21 +282,41 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
         page_va <  p->user_stack_base &&
         page_va >= USER_STACK_FLOOR_VA) {
 
-        uint64_t new_phys = pmm_alloc_page();
-        if (!new_phys) return false;
-        memset((void *)(new_phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
-
+        /* Map EVERY page from the fault up to the current base -- like
+         * Linux's expand_stack, which extends the VMA to COVER the fault,
+         * not just the one page. Mapping only page_va and dropping base to
+         * it left HOLES: a function prologue that drops RSP by more than a
+         * page (chrome's renderer has multi-KiB frames) faults on its
+         * LOWEST touch first, base moved below the untouched pages in
+         * between, and the very next write to one of them was "above base"
+         * -- unresolvable -> SIGSEGV at stack_top-0xDFF0 with 8 mapped
+         * pages above it (slice 34, first post-shm-fix renderer crash). */
         uint64_t saved = vmm_set_editor_root(p->cr3);
-        bool mapped = vmm_map(page_va, new_phys, PAGE_SIZE,
-                              VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER);
-        vmm_set_editor_root(saved);
-        if (!mapped) { pmm_free_page(new_phys); return false; }
+        bool ok = true;
+        for (uint64_t va = page_va; va < p->user_stack_base; va += PAGE_SIZE) {
+            /* Defensive: skip anything already present (shouldn't happen --
+             * everything below base is by construction unmapped). */
+            uint64_t *epte = get_pte(p->cr3, va);
+            if (epte && (*epte & PTE_PRESENT)) continue;
 
-        page_ref_inc(new_phys);
-        /* The stack now reaches at least this far down. */
+            uint64_t new_phys = pmm_alloc_page();
+            if (!new_phys) { ok = false; break; }
+            memset((void *)(new_phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
+            if (!vmm_map(va, new_phys, PAGE_SIZE,
+                         VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
+                pmm_free_page(new_phys);
+                ok = false;
+                break;
+            }
+            page_ref_inc(new_phys);
+            p->user_stack_pages++;
+            invlpg(va);
+        }
+        vmm_set_editor_root(saved);
+        if (!ok) return false;
+
+        /* The stack now reaches this far down, with no holes above. */
         p->user_stack_base = page_va;
-        p->user_stack_pages++;
-        invlpg(page_va);
         return true;
     }
 
@@ -459,7 +479,24 @@ int vmm_cow_fork(uint64_t parent_cr3, uint64_t child_cr3) {
                     uint64_t pte_val = parent_pt[i1];
                     uint64_t phys = pte_val & PTE_ADDR_MASK;
 
-                    if (pte_val & PTE_WRITABLE) {
+                    if (pte_val & PTE_SHARED) {
+                        /* MAP_SHARED page (shm cache / memfd): NEVER CoW.
+                         * POSIX: fork children share these mappings for
+                         * real -- parent and child keep writing the SAME
+                         * frame and see each other's writes. Write-
+                         * protecting it here made the parent's FIRST
+                         * post-fork write CoW-copy the page (refs>1 is
+                         * guaranteed -- the shm cache itself holds a ref),
+                         * silently diverging the browser's live ipcz
+                         * NodeLinkMemory from every child: parcels the
+                         * browser "sent" after the first fork landed in a
+                         * private copy nobody else could see, children
+                         * decoded stale fragment bytes, and Mojo killed
+                         * the connection with ILLEGAL_MEMORY_RANGE (the
+                         * slice-33/34 DOM blocker). Keep it writable in
+                         * BOTH parent and child. */
+                        child_pt[i1] = pte_val;
+                    } else if (pte_val & PTE_WRITABLE) {
                         /* Clear writable, set COW in parent */
                         parent_pt[i1] = (pte_val & ~PTE_WRITABLE) | PTE_COW;
                         /* Child gets same: not writable, COW set */

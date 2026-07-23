@@ -145,6 +145,15 @@ void signal_send(struct proc *p, int sig) {
                     snd ? snd->pid : -1, (snd && snd->name) ? snd->name : "?",
                     (snd == p) ? " (SELF/kernel)" : "");
         }
+        /* Capture the RENDERER thread group's user call chains BEFORE it dies
+         * -- this is how we finally see the deadlocked renderer's stack. Only
+         * the renderer (not gpu/utility): it's the process that must complete a
+         * document load for --dump-dom, and it's SIGKILL'd/exits in a window the
+         * timer heartbeat can't hit. One-shot inside bt_dump_group. */
+        if (sig == SIGKILL && p->is_renderer) {
+            extern void bt_dump_group(int tgid);
+            bt_dump_group(p->tgid ? p->tgid : p->pid);
+        }
     }
 #endif
 

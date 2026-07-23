@@ -122,6 +122,7 @@ int thread_create(uint64_t entry, uint64_t arg,
     /* Thread-group fields */
     t->tgid        = tg_leader->pid;
     t->is_thread   = true;
+    t->is_renderer = tg_leader->is_renderer;   /* inherit so exit-hook fires on any thread */
     t->detached    = false;
     t->tls_base    = tls_base;
     t->join_waiters = 0;

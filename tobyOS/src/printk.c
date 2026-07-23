@@ -126,6 +126,7 @@ static uint64_t g_ts_offset_ms = 0;
 static bool     g_ts_offset_set = false;
 
 /* Returns ms-since-boot, or UINT64_MAX if no clock is available yet. */
+uint64_t klog_ms(void);   /* public: same clock as the [N ms] log prefix */
 static uint64_t now_log_ms(void) {
     uint64_t ns = perf_now_ns();
     if (ns) {
@@ -142,6 +143,8 @@ static uint64_t now_log_ms(void) {
     if (hz == 0) return (uint64_t)-1;
     return (pit_ticks() * 1000ull) / (uint64_t)hz;
 }
+
+uint64_t klog_ms(void) { return now_log_ms(); }
 
 static void emit_ts_prefix(void) {
     if (g_sink_suppress) return;

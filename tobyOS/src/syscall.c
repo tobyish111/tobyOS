@@ -4539,9 +4539,11 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
      * (objdump the .so at rip-base+seg_off). off==0 lines are each .so's base. */
     {
         static int lm = 0;
-        if (lm < 160) { lm++;
-            kprintf("[libmap] base=0x%lx len=0x%lx prot=0x%x off=0x%lx fd=%d "
-                    "ino=%lu\n", (unsigned long)base, (unsigned long)len, prot,
+        if (lm < 400) { lm++;
+            struct proc *me = current_proc();
+            kprintf("[libmap] pid=%d base=0x%lx len=0x%lx prot=0x%x off=0x%lx fd=%d "
+                    "ino=%lu\n", me ? me->pid : -1,
+                    (unsigned long)base, (unsigned long)len, prot,
                     (unsigned long)offset, fd, (unsigned long)f->vfs.ino);
         }
     }
@@ -5914,39 +5916,68 @@ static bool read_u64_of(struct proc *p, uint64_t va, uint64_t *out) {
  * binary + every .so). Symbolize offline: find the [libmap] base each addr
  * falls under, then `objdump -d --start-address=<addr-base> <that .so>`. The
  * saved user rsp/rip live in the syscall_regs frame at kstack_top. */
-void waitt_dump_stacks(void) {
-    static int done = 0;
-    if (done) return;
-    /* With --disable-kill-after-bad-ipc the deadlocked renderer stays alive, so
-     * dump once the deadlock is well established. */
-    if (perf_now_ns() < 40ull * 1000000000ull) return;
-    done = 1;
-    kprintf("[bt] ===== deadlocked-thread user call chains (symbolize offline) =====\n");
-    /* Iterate the blocked-in-a-syscall table (what the wait-graph shows), not a
-     * transient PROC_BLOCKED scan -- a futex/epoll waiter may momentarily not be
-     * PROC_BLOCKED. Each entry's saved user context lives in the syscall_regs
-     * frame at that proc's kstack_top. */
-    for (int i = 0; i < WAITT_MAX; i++) {
-        if (!g_waitt[i].busy) continue;
-        struct proc *p = proc_lookup(g_waitt[i].pid);
-        if (!p || !p->kstack_top) continue;
-        struct syscall_regs *sr =
-            (struct syscall_regs *)((uint8_t *)p->kstack_top - sizeof(*sr));
-        uint64_t urip = sr->rcx, ursp = sr->user_rsp;
-        kprintf("[bt] pid=%d %s(0x%lx) urip=0x%lx ursp=0x%lx\n",
-                p->pid, lx_scname(g_waitt[i].nr),
-                (unsigned long)g_waitt[i].arg, urip, ursp);
-        int printed = 0;
-        for (int s = 0; s < 768 && printed < 24; s++) {
-            uint64_t v;
-            if (!read_u64_of(p, ursp + (uint64_t)s * 8, &v)) break;
-            if (v >= 0x100000000000ULL && v < 0x110000000000ULL) {  /* code region */
-                kprintf("[bt]   +0x%03x 0x%lx\n", s * 8, v);
-                printed++;
-            }
+/* Walk one proc's saved user stack, printing code-region return addresses.
+ * `label` names the blocking syscall (or the kill). See region notes below. */
+static void bt_dump_one(struct proc *p, const char *label, uint64_t arg) {
+    if (!p || !p->kstack_top) return;
+    struct syscall_regs *sr =
+        (struct syscall_regs *)((uint8_t *)p->kstack_top - sizeof(*sr));
+    uint64_t urip = sr->rcx, ursp = sr->user_rsp;
+    kprintf("[bt] pid=%d %s(0x%lx) urip=0x%lx ursp=0x%lx\n",
+            p->pid, label, (unsigned long)arg, urip, ursp);
+    int printed = 0;
+    for (int s = 0; s < 1024 && printed < 32; s++) {
+        uint64_t v;
+        if (!read_u64_of(p, ursp + (uint64_t)s * 8, &v)) break;
+        /* Code regions: MAIN chrome PIE at 0x500000 (shows WHAT chrome awaits),
+         * ld.so at 0x40000000, .so's at 0x1000_0000_0000+. 0x1024../0x102d.. are
+         * thread stacks / shm (data), skipped. */
+        bool code = (v >= 0x500000ULL       && v < 0x0d000000ULL)
+                 || (v >= 0x40000000ULL     && v < 0x41000000ULL)
+                 || (v >= 0x100000000000ULL && v < 0x100002000000ULL);
+        if (code) {
+            const char *reg = (v < 0x0d000000ULL) ? "MAIN"
+                            : (v < 0x41000000ULL) ? "ldso" : "lib";
+            kprintf("[bt]   +0x%03x 0x%lx %s\n", s * 8, v, reg);
+            printed++;
         }
     }
+}
+
+/* Dump the user call chains of an ENTIRE thread group (tgid). Called from
+ * signal_send the instant a renderer is SIGKILLed, so its deadlocked stack is
+ * captured at the exact moment before death -- the only reliable way to catch
+ * it (the browser kills it in a narrow window the timer heartbeat steps over,
+ * and the guest clocks diverge under SMP). */
+void bt_dump_group(int tgid) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    extern struct proc g_proc[];
+    kprintf("[bt] ===== SIGKILL victim group tgid=%d call chains =====\n", tgid);
+    for (int i = 1; i < PROC_MAX; i++) {
+        struct proc *p = &g_proc[i];
+        if (p->state == PROC_UNUSED) continue;
+        if (p->pid != tgid && p->tgid != tgid) continue;
+        /* Find its blocking-syscall label from the waitt table, if any. */
+        const char *lbl = "(running)"; uint64_t arg = 0;
+        for (int w = 0; w < WAITT_MAX; w++)
+            if (g_waitt[w].busy && g_waitt[w].pid == p->pid) {
+                lbl = lx_scname(g_waitt[w].nr); arg = g_waitt[w].arg; break;
+            }
+        bt_dump_one(p, lbl, arg);
+    }
     kprintf("[bt] ===== end =====\n");
+}
+
+/* Dump the CALLER's own user call chain from inside one of its syscalls --
+ * used by the clock_gettime spin detector (slice 34) to identify a user-space
+ * Now() busy-loop. Safe: own context, own CR3, saved regs at kstack_top are
+ * exactly this syscall's. */
+void bt_dump_self(const char *why) {
+    struct proc *me = current_proc();
+    if (!me) return;
+    bt_dump_one(me, why, 0);
 }
 #endif
 
@@ -5980,9 +6011,68 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         if (chan_c < 500) {
             chan_c++;
             struct proc *me = current_proc();
-            kprintf("[chan] pid=%d %s fd=%d a2=0x%lx a3=%lu -> %ld\n",
-                    me ? me->pid : -1, lx_scname(n), chan_fd,
-                    (unsigned long)a2, (unsigned long)a3, r);
+            /* For a RECEIVE that returned data, decode the FRONT of the received
+             * bytes. MEASURED (slice 33) channel-frame layout on this build:
+             *   off 0: u16 num_header_bytes (=16)  | u16 version (0/1)
+             *   off 4: u32 num_bytes  == the TOTAL message size
+             * so w1 (off 4) is the declared size and it MATCHES the delivered
+             * byte count r for every fully-delivered message -- framing is
+             * size-consistent, NOT truncated. (w1 > r only when a message is
+             * bigger than the read buffer, e.g. 8504 into 4096: normal multi-read
+             * reassembly, expected.) The VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE is
+             * therefore a NESTED pointer inside a correctly-framed message -- to
+             * chase it, decode the mojom body past the 16-byte channel header.
+             * Walk the iovec for recvmsg/readv; use the buffer directly
+             * otherwise. copy_from_user_nofault so a bad ptr can't fault us. */
+            uint32_t hd[16]; int have_hdr = 0;   /* first 64 bytes of the payload */
+            for (int i = 0; i < 16; i++) hd[i] = 0;
+            if (r >= 8 && (n == LX_recvmsg || n == LX_recvfrom ||
+                           n == LX_read    || n == LX_readv)) {
+                uint64_t bufp = 0;
+                if (n == LX_recvmsg) {
+                    uint64_t iov = 0;               /* msghdr.msg_iov @ +16 */
+                    if (copy_from_user_nofault(&iov, (void *)(uintptr_t)(a2 + 16),
+                                               sizeof(iov)) == 0 && iov)
+                        (void)copy_from_user_nofault(&bufp,
+                                (void *)(uintptr_t)iov, sizeof(bufp)); /* iov[0].base */
+                } else if (n == LX_readv) {
+                    (void)copy_from_user_nofault(&bufp,
+                            (void *)(uintptr_t)a2, sizeof(bufp));      /* iov[0].base */
+                } else {
+                    bufp = (uint64_t)a2;                                /* raw buffer */
+                }
+                if (bufp) {
+                    size_t want = (r < 64) ? (size_t)r : 64;
+                    if (copy_from_user_nofault(hd, (void *)(uintptr_t)bufp,
+                                               want) == 0)
+                        have_hdr = 1;
+                }
+            }
+            if (have_hdr) {
+                /* Channel frame: off0 = u16 num_header_bytes | u16 version;
+                 *                off4 = u32 total size (== r).
+                 * At off `num_header_bytes` (=16) begins an IPCZ message (NOT a
+                 * mojom message: chrome uses ipcz, so the mojom parcel is
+                 * reassembled from ipcz parcels/shared-memory fragments and is
+                 * NOT at a fixed socket offset). The words below are ipcz
+                 * transport-header fields; `seq` increments per message. Kept as
+                 * structural visibility only -- do NOT read a mojom num_bytes
+                 * here (an earlier pass did and saw phantom 65560/1310744
+                 * "overruns"; those are ipcz header bytes, not a size). */
+                uint16_t chdr_hb = (uint16_t)(hd[0] & 0xffff);
+                uint16_t chdr_v  = (uint16_t)(hd[0] >> 16);
+                uint32_t csize   = hd[1];
+                uint32_t iw0     = hd[4];   /* ipcz hdr word @ off16 */
+                uint32_t iseq    = hd[6];   /* ipcz sequence no. @ off24 (increments) */
+                kprintf("[chan] pid=%d %s fd=%d -> %ld  chan[hb=%u v=%u sz=%u] "
+                        "ipcz[w0=0x%x seq=%u]\n",
+                        me ? me->pid : -1, lx_scname(n), chan_fd, r,
+                        chdr_hb, chdr_v, csize, iw0, iseq);
+            } else {
+                kprintf("[chan] pid=%d %s fd=%d a2=0x%lx a3=%lu -> %ld\n",
+                        me ? me->pid : -1, lx_scname(n), chan_fd,
+                        (unsigned long)a2, (unsigned long)a3, r);
+            }
         }
     }
 #endif
@@ -6035,12 +6125,27 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         /* Opening a directory yields a getdents64-capable dir fd; files
          * fall through to the normal VFS open. */
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, kpath, sizeof kpath) == 0) {
+        bool got_kp = (resolve_user_path((const char *)a1, kpath, sizeof kpath) == 0);
+        if (got_kp) {
             struct vfs_stat vs;
             if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR)
                 return linux_open_dir(kpath);
         }
-        return do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);
+        long ofd = do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);
+#ifdef CHROMIUM_BOOT
+        /* [lopen] path->fd, so [libmap]'s per-mapping fd can be resolved to a
+         * FILE PATH offline (match a [libmap] fd=N line to the most recent
+         * [lopen] fd=N). Enables symbolizing a stack rip: base<-libmap, path<-
+         * this, then objdump that .so at rip-base. */
+        if (ofd >= 0 && got_kp) {
+            static int lo = 0;
+            if (lo < 300) { lo++;
+                struct proc *me = current_proc();
+                kprintf("[lopen] pid=%d fd=%ld %s\n", me ? me->pid : -1, ofd, kpath);
+            }
+        }
+#endif
+        return ofd;
     }
     case LX_openat: {                  /* (dirfd, path, flags, mode) */
         /* Resolves against DIRFD for relative paths (see
@@ -6053,13 +6158,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * to SYS_OPEN with the raw user pointer, i.e. cwd-relative. Nothing
          * exercised needs it; wire a by-kpath file open when something does. */
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path_at((int)a1, (const char *)a2,
-                                 kpath, sizeof kpath) == 0) {
+        bool got_kp = (resolve_user_path_at((int)a1, (const char *)a2,
+                                            kpath, sizeof kpath) == 0);
+        if (got_kp) {
             struct vfs_stat vs;
             if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR)
                 return linux_open_dir(kpath);
         }
-        return do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
+        long ofd = do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
+#ifdef CHROMIUM_BOOT
+        if (ofd >= 0 && got_kp) {
+            static int lo = 0;
+            if (lo < 300) { lo++;
+                struct proc *me = current_proc();
+                kprintf("[lopen] pid=%d fd=%ld %s\n", me ? me->pid : -1, ofd, kpath);
+            }
+        }
+#endif
+        return ofd;
     }
     case LX_dup:    return do_syscall(SYS_DUP, a1, 0, 0, 0, 0);
     /* B12: shell pipelines wire stage fds with dup2/dup3 and create the pipe
@@ -6662,13 +6778,18 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * tight mmap/munmap loop; this shows what it wants. A hint (a1!=0)
              * that we ignore, or a length whose natural alignment (e.g. 2 MiB
              * PartitionAlloc super-pages) our 4 KiB-granular allocator doesn't
-             * satisfy, makes an allocator over-allocate/trim or retry forever. */
-            {   static int am = 0;
-                if (am < 300) { am++;
-                    struct proc *me = current_proc();
-                    kprintf("[amap] pid=%d mmap hint=0x%lx len=0x%lx fl=0x%x -> 0x%lx\n",
+             * satisfy, makes an allocator over-allocate/trim or retry forever.
+             * Budget is PER PROCESS (slice 34): one global cap was exhausted
+             * by the browser before the RENDERER -- the process that actually
+             * spins -- ever ran. */
+            {   static unsigned char am[PROC_MAX];
+                struct proc *me = current_proc();
+                int mp = me ? (me->is_thread ? me->tgid : me->pid) : 0;
+                if (mp >= 0 && mp < PROC_MAX && am[mp] < 80) { am[mp]++;
+                    kprintf("[amap] pid=%d mmap hint=0x%lx len=0x%lx prot=0x%x fl=0x%x -> 0x%lx\n",
                             me ? me->pid : -1, (unsigned long)a1,
-                            (unsigned long)a2, (unsigned)lf, (unsigned long)ret); } }
+                            (unsigned long)a2, (unsigned)a3,
+                            (unsigned)lf, (unsigned long)ret); } }
 #endif
         }
         else
@@ -6685,9 +6806,10 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_munmap: {
         long mr = do_syscall(ABI_SYS_MUNMAP, a1, a2, 0, 0, 0);
 #ifdef CHROMIUM_BOOT
-        {   static int um = 0;
-            if (um < 300) { um++;
-                struct proc *me = current_proc();
+        {   static unsigned char um[PROC_MAX];
+            struct proc *me = current_proc();
+            int mp = me ? (me->is_thread ? me->tgid : me->pid) : 0;
+            if (mp >= 0 && mp < PROC_MAX && um[mp] < 80) { um[mp]++;
                 kprintf("[amap] pid=%d munmap  addr=0x%lx len=0x%lx -> %ld\n",
                         me ? me->pid : -1, (unsigned long)a1,
                         (unsigned long)a2, mr); } }
@@ -6728,6 +6850,25 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return do_syscall(SYS_NANOSLEEP, (long)ns, 0, 0, 0, 0);
     }
     case LX_clock_gettime: {
+#ifdef CHROMIUM_BOOT
+        /* Spin detector (slice 34): the browser main thread was seen calling
+         * clock_gettime tens of thousands of times while every other thread
+         * blocked -- a user-space Now() loop we could not identify from the
+         * syscall ring alone. One-shot per THREAD: after an absurd number of
+         * calls, dump the caller's user stack right here in its own context
+         * (safe: own CR3, not IRQ). Threshold high enough that normal
+         * time-heavy phases never trip it. */
+        {   static uint32_t cgt_count[PROC_MAX];
+            static uint8_t  cgt_dumped[PROC_MAX];
+            struct proc *me = current_proc();
+            if (me && me->pid > 0 && me->pid < PROC_MAX &&
+                !cgt_dumped[me->pid] && ++cgt_count[me->pid] > 150000) {
+                cgt_dumped[me->pid] = 1;
+                extern void bt_dump_self(const char *why);
+                bt_dump_self("clock_gettime-storm");
+            }
+        }
+#endif
         /* This used to IGNORE the clock id and return whole MILLISECONDS since
          * boot for every clock. Two bugs in one:
          *   - CLOCK_REALTIME read as ~13 seconds past the epoch, which is why

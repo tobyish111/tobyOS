@@ -194,6 +194,11 @@ struct proc {
      * deadline and sets futex_timed_out so the return is -ETIMEDOUT. */
     uint64_t        futex_deadline_ns;
     bool            futex_timed_out;
+    /* CHROMIUM_BOOT diagnostic: latched at execve when argv carries
+     * "--type=renderer", so the SIGKILL/exit stack-dump hook can fire on the
+     * renderer (the process that must complete a document load for --dump-dom)
+     * and skip the gpu/utility children. Behaviour-neutral. */
+    bool            is_renderer;
     /* Back-pointer to the wait-queue HEAD this proc is currently parked
      * on (NULL when not blocked on any queue). signal_send() uses it to
      * splice the proc out of the queue when it forcibly wakes up a

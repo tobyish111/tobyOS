@@ -643,3 +643,324 @@ The kernel-bug tier is essentially exhausted; the remaining work is chrome-symbo
 archaeology, which is a different discipline. This is a clean, well-documented
 stopping point: green tree, two permanent unit tests, a stack-walk tool, and the
 exact next infrastructure step named.
+
+---
+
+## Slice 33 (2026-07-22) — Reliable renderer-stack capture, the GPU-FATAL browser death, and the semantic-Mojo wall
+
+This slice picked up the two barriers slice 32 named and cleared BOTH, then used
+the resulting visibility to find the actual chain that kills the DOM.
+
+### Barrier 1 cleared: reliable renderer stack capture (hook the kill, not a timer)
+
+The timer-heartbeat approach (dump all blocked threads at a fixed guest time)
+could never reliably hit the renderer's ~1 s deadlock window, and worse, the
+gating clock was unreliable: under `-smp 4` the per-CPU TSCs are unsynchronised,
+so `perf_now_ns()`/`klog_ms()` read on the BSP in `sched_tick` diverged from the
+`[N ms]` log prefix — a gate of `klog_ms() >= 10500` fired at printed `[3044 ms]`.
+Abandoned timer gating entirely.
+
+**The robust trigger is the KILL itself.** `bt_dump_group(tgid)` (src/syscall.c)
+walks every proc in a thread group and prints its user call chain; it is invoked
+from TWO chokepoints:
+  - `signal_send()` (src/signal.c) the instant a `SIGKILL` targets a proc with
+    `p->is_renderer` — captures the renderer's stacks at the exact moment the
+    browser kills it;
+  - `proc_exit()` (src/proc.c, CHROMIUM_BOOT) if the renderer self-terminates
+    (the Mojo "no connection" watchdog) instead of being SIGKILLed.
+One-shot inside `bt_dump_group`. `p->is_renderer` is latched in fork.c's execve
+path when argv carries `--type=renderer`, and inherited by clone threads
+(thread.c) so an `exit_group` from any thread still fires it. The stack-walk
+region filter was also fixed to include the MAIN chrome PIE at load base
+`0x500000` (`.text` runtime `0x1fc7000..0xba33e70`) — the prior filter only had
+the `.so` region `0x1000_0000_0000+`, so every chrome-code frame was invisible.
+
+Result: we now capture the renderer group's full call chains deterministically.
+The renderer's own main-thread frame is often garbage (`urip=0x10202 ursp=0x1b`)
+because it is mid-context-switch at kill time, but its worker/IO threads dump
+cleanly (futex + epoll_wait waiters, plus one actively-running worker with a deep
+live chrome stack — the renderer IS doing real work, not uniformly deadlocked).
+
+### Barrier 2 (stripped symbolization) — partially cleared, still the wall
+
+`[lopen] pid fd path` traces added to LX_open/openat map library paths to fds;
+libraries load deterministically (e.g. libc.so.6 base `0x100000ac3000`, verified
+`urip 0x100000b9b7bf -> libc.so.6+0xd87bf`). But the MAIN binary is stripped
+(BuildID present, debug info is in a separate `headless_shell.debug` we do NOT
+have) and its `.dynsym` (2784 syms) covers only imports/exports, not the base::/
+mojo::/blink:: internals we need. So MAIN frames give addresses, not names. This
+stayed a wall — but the NEXT finding made symbolization unnecessary.
+
+### THE CHAIN THAT KILLS THE DOM (found via chrome's own stderr, not stacks)
+
+Target URL is `data:text/html,<h1>tobyOS</h1>` — a data: URL that needs NO network
+fetch. Yet the browser reliably DIES at guest ~20 s:
+
+```
+FATAL:content/browser/gpu/gpu_data_manager_impl_private.cc:417]
+      GPU process isn't usable. Goodbye.
+[proc] pid=2 'chrome' exit code=-1        <-- THE BROWSER ITSELF EXITS
+```
+
+Even with `--disable-gpu`, chrome still spawns a separate `--type=gpu-process`
+for GpuDataManager info collection. That GPU process HANGS in its Mojo bootstrap
+(futex-blocked), the browser's GPU watchdog SIGKILLs it (exit 137 = signal 9),
+counts a crash, and after 3 crashes the browser LOG(FATAL)s "GPU process isn't
+usable. Goodbye." and the whole browser exits — long before the renderer can dump
+a DOM. The network-service `ILLEGAL_MEMORY_RANGE` crash-loop is a PARALLEL
+symptom, not the cause (a data: URL needs no network service).
+
+**Fix applied: `--in-process-gpu`.** Runs the GPU implementation on a browser-
+process thread — no separate GPU process to hang, no watchdog kill, no FATAL.
+Result (measured):
+  - Browser now SURVIVES to 39 s+ (was: dead at 20 s), idle in `poll()`.
+  - No `--type=gpu-process` spawned at all; the GPU-FATAL is gone.
+  - Renderer (pid 26) now runs 9 s / 6.8 s CPU / 2207 syscalls — the DEEPEST
+    chrome has ever gotten — before the browser SIGKILLs it at ~15.3 s for never
+    completing its Mojo connection.
+This is a keepable config change, not a hack: for `--dump-dom` (no rendering)
+running GPU in-process is exactly right. Committed in kernel.c (argc 15->16).
+
+### The residual blocker, now precisely localized: SEMANTIC Mojo/ipcz malformation
+
+With the browser alive, the renderer still never commits a document (zero
+navigate/DidCommit markers) and is killed at ~15.3 s "with no connection." The
+one deterministic error, identical every run:
+
+```
+mojo/public/cpp/bindings/lib/validation_errors.cc:136]
+      Invalid message: VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE
+network.mojom.NetworkServiceMessageHeaderValidator
+```
+
+Everything BELOW Mojo is proven correct, so the corruption is SEMANTIC (a decoded
+message's internal offset/length runs past its valid payload), NOT byte-level:
+  - **Socket transport byte-perfect**: the `[sockchk]` FNV hash (stamped at
+    enqueue, re-checked at dequeue) reports 0 corruptions across the whole run.
+  - **Byte counts match end-to-end**: `[chan]` trace shows browser
+    `sendmsg -> 264` then `sendto -> 232`; renderer `recvmsg -> 264` then
+    `recvmsg -> 232` (note: the a3 in `[chan]` is the flags word — 0x40
+    MSG_DONTWAIT / 0x4000 MSG_NOSIGNAL — NOT a length). Framing preserved, not
+    coalesced across message/fd boundaries.
+  - **MAP_SHARED shared memory coherent**: per-inode shm cache (syscall.c
+    linux_mmap_file) maps the SAME physical pages for all mappers; `[shm]` traces
+    show CREATED-then-`attached` for the same inode across processes.
+  - **SCM_RIGHTS fd passing works**: the failing 264-byte message carries 1 fd,
+    delivered as `kind=2` (FILE_KIND_VFS = chrome's temp-file shared-memory
+    region, since `--disable-dev-shm-usage` avoids memfd).
+
+So the wall is now entirely ABOVE the kernel primitives: an ipcz/Mojo protocol-
+level mismatch where a well-formed-on-the-wire message decodes to an illegal
+range. Leading suspects for the NEXT agent, in order:
+  1. **ipcz driver-object / handle-count encoding**: the message carries 1 fd
+     (kind=2). If the ipcz message's driver-object array count or the data-vs-
+     handle section boundary is off by the handle accounting, a data pointer
+     computed relative to it lands out of range. Instrument the ipcz message
+     header (num_bytes, num_handles, first-object offset) at the failing recv.
+  2. **NodeLinkMemory fragment coherence**: ipcz places most message data in a
+     shared-memory "fragment" and sends only a descriptor (buffer_id, offset,
+     size) over the socket. Verify the receiver's mapping of that buffer_id is
+     the SAME region+size as the sender's — a resized (ftruncate-after-map) or
+     off-by-a-page region would give exactly ILLEGAL_MEMORY_RANGE with perfect
+     socket bytes. Our per-inode cache populates newly-grown pages from the file
+     but may not track a post-map ftruncate growth.
+  3. The message is `network.mojom` — but the SAME failure kills the renderer's
+     bootstrap, so it is a GENERIC ipcz issue, not network-specific.
+
+### Standing of the DOM (end of slice 33)
+
+New, higher-water state: browser survives, renderer runs 9 s of real work. The
+kernel-primitive tier remains exhausted and now DOUBLY confirmed clean (socket
+hash, byte counts, shm coherence, fd kind all verified at the failing message).
+The single remaining blocker is a semantic ipcz decode mismatch —
+`VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE` — that must be attacked at the ipcz
+message layer (instrument num_bytes/num_handles/fragment-descriptor at the
+failing recv), NOT with another socket/shm/futex fix. Diagnostic tooling landed:
+`bt_dump_group` (kill-hook renderer stack capture), `is_renderer` tagging,
+`[lopen]` path traces, MAIN-region stack filter, `[chan]` size trace.
+
+### Slice 33 addendum — channel framing is size-consistent (message-header decode)
+
+Enhanced `[chan]` (syscall.c linux_syscall) to decode the front of each received
+channel message. MEASURED frame layout on chrome-headless-shell 151:
+```
+off 0: u16 num_header_bytes (=16)   |  u16 version (0 or 1)   -> printed chdr=0x...
+off 4: u32 num_bytes  == TOTAL message size                   -> printed num_bytes=
+```
+The offset-4 `num_bytes` EQUALS the delivered byte count `r` for every fully-
+delivered message (184, 168, 288, 232 ... all match). The only case where
+num_bytes > r is a message larger than the reader's buffer (e.g. 8504 into a 4096
+read) — normal multi-read stream reassembly, expected and correct.
+
+=> The AF_UNIX channel is size-consistent end to end; there is NO truncation and
+NO mis-framing at the channel level. (An earlier pass mis-read offset 0 as the
+size and flagged a phantom "num_bytes=65552 mismatch" — 65552 = 0x10010 is just
+`num_header_bytes=16 | version=1`, NOT a size. Ignore that; the size is at
+offset 4.)
+
+Therefore `VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE` is a NESTED pointer/offset
+inside a correctly-framed, fully-delivered message that runs past the message's
+own payload. The next concrete step is to decode the MOJOM message body that
+begins at offset `num_header_bytes` (16) within the channel payload: read its
+`internal::MessageHeader` (StructHeader{num_bytes, version}, interface_id, name,
+flags, and — for V2 — the payload + payload_interface_ids pointers) and find
+which field's (offset, size) exceeds the mojom payload. That is the field chrome's
+MessageHeaderValidator rejects. Since the same failure also stalls the renderer's
+own bootstrap (not just network.mojom), it is a GENERIC ipcz encoding mismatch;
+the strongest remaining suspect is the ipcz driver-object (handle) accounting —
+the failing message carries 1 SCM_RIGHTS fd (kind=2), and if the data-vs-handle
+section boundary is computed differently on the receive side, an out-of-line
+pointer computed relative to it lands out of range.
+
+### Slice 33 addendum 2 — the mojom message is ipcz-wrapped; socket-byte tier exhausted
+
+Widened `[chan]` to read 64 bytes and tried to decode a mojom internal::MessageHeader
+at channel-payload offset 16. It flagged 132 "MOJOM-HDR-OVERRUN" with absurd sizes
+(nb=65560, 1310744, 2228248) and a field at off24 that INCREMENTS per message
+(16,17,18...). That is NOT a mojom header — it is an **ipcz transport-message
+header with a per-message sequence number**. CORRECTED the instrument (the fields
+are relabelled `ipcz[w0 seq]`, no overrun flag). Lesson: do NOT read a mojom
+num_bytes at socket offset 16.
+
+**Why this matters:** chrome-headless-shell 151 uses **ipcz** (MojoIpcz). The socket
+does NOT carry the mojom message at a fixed offset — it carries ipcz control
+messages, and the actual `network.mojom` parcel is reassembled by chrome from ipcz
+parcels, which for anything non-trivial live in **shared-memory fragments**
+(NodeLinkMemory), not on the socket. So the failing message that trips
+`VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE` is NOT visible in the socket bytes. Socket-
+byte instrumentation is therefore EXHAUSTED for finding it.
+
+**Shared-memory coherence RE-VERIFIED clean (negative result):** analysed the
+`[shm]` map log for the renderer's run:
+  - ZERO gen==0 (ramfs) copy-fallback regions — every shm region has a real
+    tobyfs inode and goes through the coherent per-inode page cache.
+  - The renderer ATTACHES to the shared NodeLinkMemory (e.g. pid29 attaches
+    ino=13/1 np=64 + ino=13/2, created by its browser-side peer) — same physical
+    pages, coherent.
+  - The "created-by-one, attached-by-none" regions (e.g. pid28 ino 33..49) have
+    real inodes and are legitimately single-process (V8 snapshot / code cache),
+    not shared buffers that failed to attach.
+So the primary + secondary NodeLinkMemory the renderer uses IS coherent. The
+blocker is NOT a kernel shm bug.
+
+**Net:** every tobyOS-side primitive under Mojo is now proven clean at the failing
+point (socket bytes, channel framing sizes, shm coherence incl. no copy-fallback,
+SCM_RIGHTS fd delivery). The residual `ILLEGAL_MEMORY_RANGE` is an ipcz protocol-
+level decode mismatch inside a message that is NOT socket-resident. The next tier
+is a DIFFERENT discipline than kernel fixes or socket tracing:
+  (a) decode the ipcz wire format from source (fetch ipcz `src/ipcz/message.h`,
+      `node_messages.h`, and the fragment/BufferPool code via
+      chromium.googlesource.com ?format=TEXT|base64 -d) to interpret the traces
+      and find which parcel/fragment field is out of range; OR
+  (b) a logging-enabled chrome-headless-shell build, or driving DevTools over
+      `--remote-debugging-pipe`, to have chrome report the failing interface/method
+      directly (official builds compile VLOG out, so stderr won't).
+Caveat for the next agent: it is entirely possible the tobyOS side is fully correct
+and the mismatch is an ipcz expectation we haven't found yet (e.g. an mmap/fragment
+size rounding, or a driver-object handle-index convention) — budget for the
+possibility that this needs ipcz-source archaeology, not another primitive fix.
+
+### Slice 33 addendum 3 — MAP_SHARED coherence PROVEN in isolation; kernel shm exonerated
+
+Added a third permanent unit test, **programs/linux-mapshare** (`/bin/linux-mapshare`,
+spawned at boot as MAPTEST alongside FUTEXTEST/EFDTEST). It reproduces chrome's exact
+shared-memory shape in ISOLATION:
+  parent: openat(O_RDWR|O_CREAT) temp file -> ftruncate(8192) -> mmap#1 MAP_SHARED
+          -> write MAGIC1 -> UNLINK the path (chrome unlinks immediately) -> fork();
+  child : INDEPENDENT mmap#2 MAP_SHARED of the same inherited fd
+          -> read must see parent's MAGIC1 (forward), write MAGIC2 (reverse), exit;
+  parent: wait, then read mmap#1 must see child's MAGIC2.
+Exit 3=PASS (both directions coherent), 1=FAIL fwd, 4=FAIL rev, 2=ERROR.
+
+**RESULT: MAPTEST VERDICT: PASS exit=3.** Two independent MAP_SHARED mappings of an
+unlinked file in two processes are coherent BOTH directions. The kernel shared-memory
+layer is therefore DIRECTLY proven correct (not merely inferred from "attached" logs),
+and the DOM blocker is NOT a kernel shm bug.
+
+IMPORTANT PROCESS NOTE: the first MAPTEST run HUNG the kernel and FUTEXTEST spuriously
+FAILED. Root cause was NOT a real bug -- it was STALE OBJECT FILES. This slice added a
+field to `struct proc` (`is_renderer`), which changes the struct layout; incremental
+`make` does not reliably recompile every .c that embeds struct proc, so objects
+disagreed on the layout -> corruption. Fix: remove ALL kernel .o (not programs/libtoby)
+and rebuild. After the clean rebuild, FUTEXTEST/EFDTEST/MAPTEST all PASS. LESSON (already
+in MEMORY, re-confirmed the hard way): after growing struct proc, force a clean kernel
+rebuild before trusting ANY run.
+
+### Where slice 33 leaves the DOM (final)
+
+Three isolated primitive tests now pass — futex wakeup, eventfd/epoll wakeup, and
+cross-process MAP_SHARED coherence — so EVERY tobyOS primitive under Mojo is proven
+correct in isolation, and additionally proven clean at the live failing point (socket
+bytes byte-perfect, channel framing size-consistent, shm attaches coherent, SCM_RIGHTS
+fd delivered). The browser now survives (--in-process-gpu) and the renderer runs ~9 s of
+real work. The single residual blocker is a SEMANTIC ipcz decode:
+`VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE` on a network.mojom parcel that is
+FRAGMENT-RESIDENT (the network service maps NodeLinkMemory at ~14.9 s, then gets the bad
+message at ~15.8 s), hence NOT visible in socket bytes and NOT attributable to any broken
+kernel primitive.
+
+The kernel-primitive tier is now EXHAUSTED and TRIPLY confirmed. The only ways forward
+are a different discipline:
+  (a) ipcz-source archaeology: fetch third_party/ipcz message/parcel/fragment code +
+      the mojo MessageHeaderValidator, then instrument the RECEIVER'S SHARED-MEMORY read
+      of the failing parcel (dump the NodeLinkMemory fragment content the network service
+      reads at ~15.8 s) to find which encoded (offset,size) overruns the parcel. This is
+      the only way to SEE the failing message, since it never touches the socket.
+  (b) a logging-enabled chrome-headless-shell build or DevTools over
+      --remote-debugging-pipe, to have chrome name the failing interface/method directly
+      (official builds compile VLOG out).
+Realistic caveat: it is possible tobyOS is fully correct and the mismatch is an ipcz
+convention we implement subtly differently (a fragment size rounding, a driver-object
+handle-index base, a BufferPool block-size assumption). Budget for that; this is no
+longer a "find the broken syscall" problem.
+
+---
+
+## Slice 34 — THE DOM. fork() was CoW-ing MAP_SHARED; three more walls behind it
+
+**RESULT: `--dump-dom` prints `<html><head></head><body><h1>tobyOS</h1></body></html>`,
+chrome exit=0.** The data: URL loads, the renderer commits the navigation, Blink
+builds the DOM, the browser dumps it. Four distinct kernel walls fell in this slice.
+
+| # | Hypothesis | Status | Evidence |
+|---|---|---|---|
+| S34-1 | **`vmm_cow_fork` write-protects MAP_SHARED pages, so the browser's POST-FORK writes into live ipcz NodeLinkMemory CoW-diverge into a private copy** | **CONFIRMED** | Extended MAPTEST with a post-fork phase (parent writes MAGIC3 through its PRE-fork mapping AFTER fork; child polls): **FAIL exit=6 on the old kernel, PASS exit=3 after the fix**. Chrome: `ILLEGAL_MEMORY_RANGE` count went to **0** and never returned. |
+| S34-2 | Grow-down stack expansion leaves HOLES above the new base | **CONFIRMED** | Renderer SEGV_MAPERR at stack_top-0xDFF0 with err=P0/W1: a multi-KiB prologue faults on its LOWEST touch first, the old code mapped ONE page and moved base below untouched pages; the next write hit an "above-base" hole = unresolvable. Fix: map every page from the fault up to the old base (Linux expand_stack shape). SEGV gone. |
+| S34-3 | Renderer spins forever re-trying mmap for ALIGNMENT | **CONFIRMED** | Per-pid `[amap]`: V8's pointer-compression cage wants a ~4 GiB reservation 4 GiB-ALIGNED (PartitionAlloc wants 2 MiB super-pages); the 4 KiB bump allocator virtually never satisfies the probe, so the renderer burned its whole --timeout in an alloc/free-4GiB storm (each giant munmap walks pages under the BKL = everything starves). Fix: `find_free_region` returns naturally-aligned bases (>=4G requests 4G-aligned, >=2M requests 2M-aligned). First probe now succeeds. |
+| S34-4 | Honor non-FIXED mmap HINTS (Linux semantics) | **REAL-BUT-REVERTED** | Correct per Linux, but empirically WEDGED the whole system at ~14 s (browser main thread in a clock_gettime storm, all IPC quiet, --timeout never fired) in two consecutive runs; reverting it (keeping S34-3) restored the healthy shape. Root cause unidentified -- likely some chrome allocator invariant around hint placement vs its own reservations. NOT needed for the DOM; left OUT. A one-shot clock_gettime-storm backtrace dump (`bt_dump_self`) is now armed in the syscall if it ever recurs. |
+| S34-5 | After all four: load is merely SLOW under TCG, not stuck | **CONFIRMED** | The data: URL's own renderer (2nd renderer, site isolation) spawns ~12-15 s in and was SIGKILLed MID-STARTUP, healthy, threads parked in epoll_wait message loops. `--timeout=5000` -> `--timeout=120000`: **DOM dumped at ~23 s, exit 0.** |
+
+### The S34-1 mechanism (the actual multi-slice DOM blocker)
+
+`vmm_cow_fork` stripped PTE_WRITABLE from EVERY writable user page -- including
+MAP_SHARED shm-cache/memfd pages. The parent's FIRST post-fork write through a
+pre-fork mapping then faulted; the CoW handler saw refcount>1 (guaranteed: the shm
+cache itself holds a ref on every page) and silently copied -- from that instant the
+browser wrote its ipcz parcels into a PRIVATE page while children kept reading the
+stale SHARED one. That is precisely an ipcz "protocol-level decode mismatch in
+fragment-resident data": children decode stale/half-old fragment headers whose
+(offset,size) no longer match -> `VALIDATION_ERROR_ILLEGAL_MEMORY_RANGE` on the
+network service, mojo kills the connection, navigation never commits.
+
+Fix: a `PTE_SHARED` software PTE bit (bit 52), stamped by `vmm_map(VMM_SHARED)`
+from `shm_cache_mmap`/`memfd_map`/shared demand-fills; `vmm_cow_fork` copies such
+PTEs as-is (both sides keep writing the SAME frame); `vmm_protect` preserves the
+bit across mprotect; `mmap_cow_clone` never marks SHARED/NOFREE VMAs CoW.
+
+### Why 33 slices of instrumentation missed it
+
+Slice 33's MAPTEST proved forward+reverse coherence -- but both its writes happened
+either BEFORE fork or through a FRESH post-fork mapping. The one shape chrome
+actually depends on (write AFTER fork through a PRE-fork mapping) was the exact
+blind spot. The socket traces were byte-perfect because the corruption never
+touched the socket; the `[shm]` traces said "attached" because attachment WAS
+correct -- the pages silently diverged only when the browser forked its next child.
+LESSON: a coherence test must cover the TEMPORAL shape (write-after-fork), not just
+the topological one (two mappers, one file).
+
+### Validation
+- MAPTEST: FAIL exit=6 pre-fix (proved the test sees the bug), PASS exit=3 post-fix.
+- FUTEXTEST / EFDTEST: still PASS.
+- chrome: `ILLEGAL_MEMORY_RANGE` 0 across all post-fix runs; renderer no longer
+  crashes; `--dump-dom` prints the real DOM; exit 0.
+- defboot: clean (see logs/defboot.log).

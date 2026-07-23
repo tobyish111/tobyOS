@@ -625,7 +625,10 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
      * glance whether an fd chrome expects is simply absent. Behaviour-neutral. */
     {
         kprintf("[execve-argv] pid=%d argc=%d:", p->pid, kargc);
-        for (int i = 0; i < kargc; i++) kprintf(" %s", kargv_buf[i]);
+        for (int i = 0; i < kargc; i++) {
+            kprintf(" %s", kargv_buf[i]);
+            if (strcmp(kargv_buf[i], "--type=renderer") == 0) p->is_renderer = true;
+        }
         kprintf("\n");
         struct file **tab = proc_fds(p);
         kprintf("[execve-fds] pid=%d open:", p->pid);

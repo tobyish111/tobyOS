@@ -56,6 +56,9 @@
 #define PTE_PS   (1ULL << 7)
 #define PTE_G    (1ULL << 8)
 #define PTE_NX   (1ULL << 63)
+/* Software MAP_SHARED marker -- MUST equal PTE_SHARED in tobyos/page_fault.h
+ * (this file keeps its own architectural defines). Hardware-ignored bit. */
+#define PTE_SHARED_SW (1ULL << 52)
 
 /* PAT-select bit. Its position depends on the leaf size: bit 7 in a 4 KiB
  * PT entry, but bit 12 in a 2 MiB PD leaf (bit 7 there is PS). Combined
@@ -144,6 +147,7 @@ static uint64_t flags_to_leaf(uint32_t f) {
     if (f & VMM_USER)    v |= PTE_US;
     if (f & VMM_NOCACHE) v |= PTE_PCD | PTE_PWT;
     if (f & VMM_NX)      v |= PTE_NX;
+    if (f & VMM_SHARED)  v |= PTE_SHARED_SW;
     return v;
 }
 
@@ -362,7 +366,11 @@ bool vmm_protect(uint64_t virt, size_t bytes, uint32_t flags) {
         pte_t *pt = phys_to_table(pde & PTE_ADDR_MASK);
         size_t i  = pt_idx(v);
         if (!(pt[i] & PTE_P)) { ok = false; continue; }
-        pt[i] = (pt[i] & PTE_ADDR_MASK) | leaf_flags;
+        /* Preserve the MAP_SHARED software marker: mprotect callers rebuild
+         * flags from prot bits alone and know nothing about sharing, but the
+         * no-CoW-at-fork guarantee must survive any mprotect (chrome
+         * mprotects inside live shared regions). */
+        pt[i] = (pt[i] & (PTE_ADDR_MASK | PTE_SHARED_SW)) | leaf_flags;
         invlpg(v);
     }
     spin_unlock_irqrestore(&g_vmm_lock, saved);
