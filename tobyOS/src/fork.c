@@ -149,6 +149,10 @@ extern __attribute__((noreturn)) void fork_child_return_asm(uint64_t frame_rsp);
  * and checked resume semantics until the SA_RESTART sigtest did. */
 static __attribute__((noreturn)) void fork_child_entry(void) {
     struct proc *p = current_proc();
+    /* Slice 39: first entry via proc_context_switch bypasses do_switch's
+     * post-switch line -- release the proc this CPU switched away from
+     * (see sched_finish_switch), or it stays on_cpu/unschedulable. */
+    sched_finish_switch();
     /* Load the child's FPU/SSE state (copied from the parent at fork time)
      * -- the switch that landed us here restored the previous proc's state. */
     fpu_restore(p->fpu_state);
@@ -212,6 +216,14 @@ long sys_fork(void) {
     child->wait_pid  = -1;
     child->exit_code = -1;
     child->next_ready = NULL;
+    /* Slice 39: the memcpy above copied the parent's LIVE scheduler linkage
+     * -- on_cpu is 1 (the parent is running RIGHT NOW) and on_rq may be set.
+     * A child born with on_cpu=1 is skipped by every picker FOREVER (nothing
+     * ever clears it: the prev_proc handoff only fires for procs that were
+     * actually switched out), and stale on_rq makes sched_enqueue a no-op.
+     * Observed: fork returned but the child never executed one instruction. */
+    child->on_rq  = false;
+    child->on_cpu = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;
@@ -345,6 +357,10 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->wait_pid   = -1;
     child->exit_code  = -1;
     child->next_ready = NULL;
+    /* Slice 39: same reset as sys_fork -- the memcpy copied the parent's
+     * live on_cpu/on_rq, which would make this thread unschedulable. */
+    child->on_rq  = false;
+    child->on_cpu = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;

@@ -476,6 +476,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/bluescreen/bluescreen.elf \
             programs/lockscreen/lockscreen.elf \
             programs/mediaplayer/mediaplayer.elf \
+            programs/chromewin/chromewin.elf \
             programs/diskmgr/diskmgr.elf \
             programs/eventview/eventview.elf \
             programs/lua/lua.elf \
@@ -1576,6 +1577,8 @@ programs/bluescreen/bluescreen.elf: programs/bluescreen/bluescreen.o \
 # ---------- Milestones 4-5: Multi-User + System Applications ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,lockscreen,lockscreen))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,mediaplayer,mediaplayer))
+# Slice 39 FRONT C: chromium-in-a-window host (DevTools pipe + TobyTK blit)
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,chromewin,chromewin))
 
 # ---------- Phase 2-4: System Management + PnP + Security ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,diskmgr,diskmgr))
@@ -1796,6 +1799,34 @@ programs/linux-mapshare/linux-mapshare.elf: programs/linux-mapshare/main.c
 	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
 	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
 	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
+# Fake X server for the chromium render tier (slice 38): answers the X11
+# connection-setup handshake on /tmp/.X11-unix/X0 so xcb_connect succeeds and
+# the Vulkan loader advertises VK_KHR_xcb_surface to ANGLE. Static Linux ELF.
+programs/linux-xstub/linux-xstub.elf: programs/linux-xstub/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
+# ML-KEM/Kyber-768 computational-correctness test (slice 38): chrome's https
+# is blocked by BoringSSL's ML-KEM computing a wrong result on tobyOS. Three
+# concurrent processes run the kyber768 reference (NTT mod-3329 + Keccak + FO
+# decaps -- the exact error-amplifying shape) with deterministic seeds; the
+# checksums must match the host reference (programs/linux-mlkem/host_main.c).
+# Static freestanding Linux ELF; -I supplies the local <string.h> shim.
+MLKEM_SRCS := programs/linux-mlkem/main.c programs/linux-mlkem/selftest.c \
+              programs/linux-mlkem/kem.c programs/linux-mlkem/indcpa.c \
+              programs/linux-mlkem/polyvec.c programs/linux-mlkem/poly.c \
+              programs/linux-mlkem/ntt.c programs/linux-mlkem/reduce.c \
+              programs/linux-mlkem/cbd.c programs/linux-mlkem/symmetric-shake.c \
+              programs/linux-mlkem/fips202.c programs/linux-mlkem/verify.c
+programs/linux-mlkem/linux-mlkem.elf: $(MLKEM_SRCS)
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Iprograms/linux-mlkem \
+	      -Wl,-e,_start -o $@ $(MLKEM_SRCS)
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
 # B25: the REAL glibc 2.41 static proof (programs/linux-glibc) is deliberately
@@ -2376,6 +2407,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-futex/linux-futex.elf \
                programs/linux-eventfd/linux-eventfd.elf \
                programs/linux-mapshare/linux-mapshare.elf \
+               programs/linux-mlkem/linux-mlkem.elf \
+               programs/linux-xstub/linux-xstub.elf \
                programs/linux-procfs/linux-procfs.elf \
                programs/linux-tty/linux-tty.elf \
                programs/linux-pty/linux-pty.elf \
@@ -2431,6 +2464,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                initrd/etc/emoji.ttf \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua initrd/etc/resolv.conf \
+               initrd/etc/fonts.conf \
                $(HELLOAPP_TPKG) $(HELLOAPP_TPKG_V2) $(SDK_SAMPLE_TPKGS) \
                $(HELLOAPP_TPKG_CORRUPT) $(HELLOAPP_TPKG_BADHASH) \
                $(HELLOAPP_TPKG_NOHASH)  $(HELLOAPP_TPKG_BADFHASH) \
@@ -2454,6 +2488,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/drvmatch.conf.test         $(INITRD_STAGE)/etc/drvmatch.conf.test
 	cp initrd/etc/lua_selftest.lua           $(INITRD_STAGE)/etc/lua_selftest.lua
 	cp initrd/etc/resolv.conf                $(INITRD_STAGE)/etc/resolv.conf
+	mkdir -p $(INITRD_STAGE)/etc/fonts
+	cp initrd/etc/fonts.conf                 $(INITRD_STAGE)/etc/fonts/fonts.conf
 	cp initrd/readme.txt                     $(INITRD_STAGE)/readme.txt
 	cp programs/user_hello/user_hello.elf    $(INITRD_STAGE)/bin/hello
 	cp programs/user_bad/user_bad.elf        $(INITRD_STAGE)/bin/bad
@@ -2506,6 +2542,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-futex/linux-futex.elf           $(INITRD_STAGE)/bin/linux-futex
 	cp programs/linux-eventfd/linux-eventfd.elf       $(INITRD_STAGE)/bin/linux-eventfd
 	cp programs/linux-mapshare/linux-mapshare.elf     $(INITRD_STAGE)/bin/linux-mapshare
+	cp programs/linux-mlkem/linux-mlkem.elf           $(INITRD_STAGE)/bin/linux-mlkem
+	cp programs/linux-xstub/linux-xstub.elf           $(INITRD_STAGE)/bin/linux-xstub
 	cp programs/linux-tty/linux-tty.elf               $(INITRD_STAGE)/bin/linux-tty
 	cp programs/linux-pty/linux-pty.elf               $(INITRD_STAGE)/bin/linux-pty
 	cp programs/linux-procfs2/linux-procfs2.elf       $(INITRD_STAGE)/bin/linux-procfs2
@@ -2621,6 +2659,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/bluescreen/bluescreen.elf           $(INITRD_STAGE)/bin/bluescreen
 	cp programs/lockscreen/lockscreen.elf           $(INITRD_STAGE)/bin/lockscreen
 	cp programs/mediaplayer/mediaplayer.elf         $(INITRD_STAGE)/bin/mediaplayer
+	cp programs/chromewin/chromewin.elf             $(INITRD_STAGE)/bin/chromewin
 	cp programs/diskmgr/diskmgr.elf                 $(INITRD_STAGE)/bin/diskmgr
 	cp programs/eventview/eventview.elf             $(INITRD_STAGE)/bin/eventview
 	cp programs/lua/lua.elf                         $(INITRD_STAGE)/bin/lua
@@ -2944,13 +2983,14 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/gui_calc bin/gui_taskmgr bin/gui_edit bin/gui_browser         \
 	    bin/login bin/gui_settings bin/abi_test                           \
 	    bin/volctrl bin/wifipicker bin/appinstall bin/updater bin/lockscreen \
-	    bin/devmgr bin/diskmgr bin/eventview bin/mediaplayer \
+	    bin/devmgr bin/diskmgr bin/eventview bin/mediaplayer bin/chromewin \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-fbwin bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
-	    bin/linux-futex bin/linux-eventfd bin/linux-mapshare \
+	    bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-mlkem \
+	    bin/linux-xstub \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
@@ -2992,7 +3032,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    system/keys/trust.db                                              \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
 	    etc/motd etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
-	    etc/resolv.conf \
+	    etc/resolv.conf etc/fonts/fonts.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    readme.txt $$EXTRA_FILES
 

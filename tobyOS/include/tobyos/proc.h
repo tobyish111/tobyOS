@@ -182,6 +182,19 @@ struct proc {
      * fork/reap fast enough to hit it reliably. */
     bool            on_rq;
 
+    /* Slice 39: true from the moment do_switch commits to running this proc
+     * until the NEXT task on that CPU observes the switch completed (i.e.
+     * this proc's register context has been SAVED by proc_context_switch).
+     * Pick paths (queue_pop/steal) skip on_cpu procs: a waker on another CPU
+     * may legally sched_enqueue a proc that is still DESCENDING into its
+     * block (state already PROC_BLOCKED, context not yet saved) -- switching
+     * into it then would load a STALE saved_rsp, and the real context saved
+     * moments later would never be re-enqueued. Observed as chrome's
+     * pthread_create deadlock: FUTEX_WAKE returned 1 but the woken proc sat
+     * RUNNING/off-queue forever (ledger slice 39). Cleared with a RELEASE
+     * store by sched_finish_switch(); tested with ACQUIRE in the pickers. */
+    volatile uint8_t on_cpu;
+
     /* Generic per-proc wait-queue link. A blocked proc lives on at most
      * ONE such queue (e.g. a pipe's wq_read). The queue owner walks the
      * chain via this field on wakeup. */
@@ -460,6 +473,11 @@ struct proc_spec {
     struct file *fd0;           /* may be NULL -> console */
     struct file *fd1;
     struct file *fd2;
+    /* Slice 39: optional fd 3/4 preopens (NULL = not installed). Chrome's
+     * --remote-debugging-pipe convention: the browser reads DevTools JSON
+     * commands on fd 3 and writes responses/events on fd 4. */
+    struct file *fd3;
+    struct file *fd4;
     int          argc;
     char       **argv;          /* argc strings, each NUL-terminated */
     /* Milestone 25C: optional environment vector. NULL = inherit from

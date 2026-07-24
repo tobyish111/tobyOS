@@ -71,6 +71,13 @@ struct percpu {
      * runnable work off other CPUs. */
     struct proc    *idle;
 
+    /* Slice 39: the proc this CPU just switched AWAY from. The task that
+     * resumes on this CPU (do_switch's post-switch path, or a brand-new
+     * proc's first-entry trampoline) clears prev_proc->on_cpu -- the point
+     * at which the outgoing proc's context save is guaranteed complete and
+     * it becomes safe for other CPUs to pick it off a ready queue. */
+    struct proc    *prev_proc;
+
     /* This CPU's runnable queue. enqueue/dequeue must hold ready_lock.
      * For v1 the round-robin distributor pushes everything to BSP
      * (cpu 0) because user procs need a per-CPU TSS/syscall stack

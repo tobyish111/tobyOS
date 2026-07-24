@@ -94,6 +94,13 @@ void sched_boost_pid(int pid);
  * spins doing `sti; hlt` until an IRQ wakes someone up. */
 void sched_yield(void);
 
+/* Slice 39: clear the on_cpu latch of the proc this CPU last switched away
+ * from. Must be the FIRST scheduler-visible action of any code that starts
+ * running via proc_context_switch's resume path -- do_switch calls it after
+ * the switch; brand-new contexts (proc_first_user_entry, fork_child_entry)
+ * must call it themselves, else their predecessor stays unschedulable. */
+void sched_finish_switch(void);
+
 /* Big Kernel Lock: serializes kernel-mode execution across CPUs so user code
  * runs in parallel while not-yet-fine-grained-locked subsystems (VFS, GUI,
  * proc table) stay safe. bkl_enter at syscall entry / around pid 0's per-tick

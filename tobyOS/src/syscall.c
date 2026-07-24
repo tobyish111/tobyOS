@@ -3816,14 +3816,37 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
         int dx = (int)(int16_t)(a2 & 0xFFFF), dy = (int)(int16_t)(a2 >> 16);
         int w = (int)(int16_t)(a4 & 0xFFFF), h = (int)(int16_t)(a4 >> 16);
-        return gui_window_blit(f->win, dx, dy, w, h, (const uint32_t *)a3);
+        /* Slice 39: the blit reads the USER pixel buffer with a raw memcpy
+         * (gfx_surface_blit), which under SMAP (+smap runs) faults fatally
+         * with AC clear -- first hit by chromewin's frame blit (panic at
+         * gfx memcpy, err=0x1 P=1 kernel-read). Validate + fault-in the
+         * range, then bracket the whole copy in one uaccess window (same
+         * model as the ELF loader's segment writes). */
+        if (w > 0 && h > 0) {
+            size_t blen = (size_t)w * (size_t)h * 4;
+            if (!user_range_ok(a3, blen) ||
+                uaccess_prepare_read(a3, blen) != 0) return -1;
+        }
+        unsigned long uf = uaccess_begin();
+        long br = gui_window_blit(f->win, dx, dy, w, h, (const uint32_t *)a3);
+        uaccess_end(uf);
+        return br;
     }
     case ABI_SYS_GUI_BLIT_BLEND: {
         struct file *f = fd_lookup((int)a1);
         if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
         int dx = (int)(int16_t)(a2 & 0xFFFF), dy = (int)(int16_t)(a2 >> 16);
         int w = (int)(int16_t)(a4 & 0xFFFF), h = (int)(int16_t)(a4 >> 16);
-        return gui_window_blit_blend(f->win, dx, dy, w, h, (const uint32_t *)a3);
+        if (w > 0 && h > 0) {
+            size_t blen = (size_t)w * (size_t)h * 4;
+            if (!user_range_ok(a3, blen) ||
+                uaccess_prepare_read(a3, blen) != 0) return -1;
+        }
+        unsigned long uf = uaccess_begin();
+        long br = gui_window_blit_blend(f->win, dx, dy, w, h,
+                                        (const uint32_t *)a3);
+        uaccess_end(uf);
+        return br;
     }
     case ABI_SYS_GUI_GETPIXELS: {
         struct file *f = fd_lookup((int)a1);
@@ -4888,6 +4911,11 @@ static uint64_t lx_realtime_ns(uint64_t mono_ns) {
     return s_epoch_base_ns + mono_ns;
 }
 
+/* Slice 39 freeze triage: prove (or refute) that a poll(2) spinner is alive.
+ * Bumped once per lx_do_poll wait iteration; read by the sched.c heartbeat. */
+uint64_t g_lx_poll_iters;
+int      g_lx_poll_last_pid = -1;
+
 static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
     if (nfds > LX_POLL_MAXFDS) return -ABI_EINVAL;
     struct lx_pollfd fds[LX_POLL_MAXFDS];
@@ -4920,6 +4948,8 @@ static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
             return nready;
         }
         if (self && self->pending_signals) return -LX_EINTR;
+        g_lx_poll_iters++;
+        if (self) g_lx_poll_last_pid = self->pid;
         /* B14: drive RX so inbound TCP segments (handshakes completing on the
          * listener, data arriving on a conn, peer FIN) make a watched socket
          * ready while we cooperatively block -- the same pump tcp_accept uses. */
@@ -6557,8 +6587,41 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return 0;
 
     /* ---- plain byte I/O (tobyOS handlers already take user buffers) ---- */
-    case LX_read:   return sys_read((int)a1, (void *)a2, (size_t)a3);
-    case LX_write:  return sys_write((int)a1, (const void *)a2, (size_t)a3);
+    case LX_read:
+#ifdef CHROMIUM_BOOT
+        /* Slice 39: trace DevTools-pipe I/O (chrome reads commands on fd 3,
+         * writes responses on fd 4). Answers "does chrome service the pipe at
+         * all?" -- if this never fires, chrome never reached the pipe reader
+         * and the stall is upstream of DevTools; if it does, the CDP framing
+         * is the suspect. Only fd 3/4 + PIPE kind, so the log stays sparse. */
+        if (((int)a1 == 3 || (int)a1 == 4)) {
+            struct file *df = fd_lookup((int)a1);
+            if (df && (df->kind == FILE_KIND_PIPE_R || df->kind == FILE_KIND_PIPE_W)) {
+                struct proc *dp = current_proc();
+                long dr = sys_read((int)a1, (void *)a2, (size_t)a3);
+                kprintf("[devpipe] pid=%d read(fd=%d, %lu) -> %ld\n",
+                        dp ? dp->pid : -1, (int)a1,
+                        (unsigned long)a3, dr);
+                return dr;
+            }
+        }
+#endif
+        return sys_read((int)a1, (void *)a2, (size_t)a3);
+    case LX_write:
+#ifdef CHROMIUM_BOOT
+        if (((int)a1 == 3 || (int)a1 == 4)) {
+            struct file *df = fd_lookup((int)a1);
+            if (df && (df->kind == FILE_KIND_PIPE_R || df->kind == FILE_KIND_PIPE_W)) {
+                struct proc *dp = current_proc();
+                long dw = sys_write((int)a1, (const void *)a2, (size_t)a3);
+                kprintf("[devpipe] pid=%d write(fd=%d, %lu) -> %ld\n",
+                        dp ? dp->pid : -1, (int)a1,
+                        (unsigned long)a3, dw);
+                return dw;
+            }
+        }
+#endif
+        return sys_write((int)a1, (const void *)a2, (size_t)a3);
     case LX_pread64:
         return sys_pread64((int)a1, (void *)a2, (size_t)a3, (int64_t)a4);
     case LX_pwrite64:

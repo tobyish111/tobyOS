@@ -247,8 +247,14 @@ static struct proc *queue_pop_locked(struct percpu *cpu) {
     struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
     int best_eff = 0;
     while (p) {
-        int eff = eff_prio(p, now);
-        if (!best || eff > best_eff) { best = p; best_prev = prev; best_eff = eff; }
+        /* Slice 39: skip procs whose context save hasn't completed (still
+         * live on some CPU). They stay queued; the next pop after
+         * sched_finish_switch clears on_cpu gets them with a VALID context.
+         * ACQUIRE pairs with the RELEASE clear so saved_rsp is visible. */
+        if (!__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) {
+            int eff = eff_prio(p, now);
+            if (!best || eff > best_eff) { best = p; best_prev = prev; best_eff = eff; }
+        }
         prev = p;
         p = p->next_ready;
     }
@@ -293,7 +299,9 @@ static struct proc *queue_steal_locked(struct percpu *cpu) {
     struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
     int best_eff = 0;
     while (p) {
-        if (!p->is_idle) {
+        /* Skip idle procs (pinned) and on_cpu procs (context not yet saved
+         * -- see queue_pop_locked / ledger slice 39). */
+        if (!p->is_idle && !__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) {
             int eff = eff_prio(p, now);
             if (!best || eff > best_eff) { best = p; best_prev = prev; best_eff = eff; }
         }
@@ -374,6 +382,12 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
 
     to->state       = PROC_RUNNING;
     to->quantum_left = sched_quantum_for(to->prio);  /* fresh timeslice */
+    /* Slice 39: mark `to` live-on-CPU before it can possibly be re-enqueued,
+     * and remember `from` so the code that runs AFTER the register switch
+     * (post-switch line below, or a first-entry trampoline) can clear its
+     * on_cpu once its context save is complete. See sched_finish_switch. */
+    __atomic_store_n(&to->on_cpu, 1, __ATOMIC_RELAXED);
+    me->prev_proc   = from;
     g_current_proc  = to;
     me->current     = to;
     tss_set_rsp0((uint64_t)to->kstack_top);
@@ -421,11 +435,33 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
 #endif
     proc_context_switch(&from->saved_rsp, to->saved_rsp, to->cr3);
     /* --- `from` resumes here when some later switch picks it again --- */
+    /* Release the proc THIS cpu just switched away from (its saved_rsp is
+     * now valid) BEFORE anything that can block (bkl_enter spins): holding
+     * it on_cpu across a BKL wait would make it unschedulable meanwhile.
+     * NOTE: `from` may resume on a DIFFERENT cpu than it left, so consult
+     * smp_this_cpu() fresh rather than the stale `me` local. */
+    sched_finish_switch();
     if (reacquire_bkl) bkl_enter();
     fpu_restore(from->fpu_state);
 
     struct proc *r = current_proc();
     if (r) perf_proc_account_in(r, perf_rdtsc());
+}
+
+/* Clear the on_cpu latch of the proc the CURRENT cpu last switched away
+ * from. Called from every path that begins executing after a context
+ * switch: do_switch's post-switch line, proc_first_user_entry, and
+ * fork_child_entry. RELEASE pairs with the ACQUIRE test in the pickers so
+ * the outgoing proc's saved_rsp store (program-order earlier on this CPU,
+ * inside proc_context_switch) is visible before the proc becomes pickable. */
+void sched_finish_switch(void) {
+    struct percpu *cpu = smp_this_cpu();
+    if (!cpu) return;
+    struct proc *prev = cpu->prev_proc;
+    if (prev) {
+        cpu->prev_proc = 0;
+        __atomic_store_n(&prev->on_cpu, 0, __ATOMIC_RELEASE);
+    }
 }
 
 /* Return the cpu_idx that should receive a freshly-enqueued proc.
@@ -556,7 +592,19 @@ void sched_yield(void) {
      * tick, which is fine. */
     if (cur && cur->state == PROC_RUNNING &&
         __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE) == 0) {
-        return;     /* fast path: still running, nothing else here -- keep BKL */
+        /* Slice 39: do NOT keep the BKL across the fast path. An infinite
+         * in-syscall wait loop -- lx_do_poll(timeout=-1) spinning `check
+         * fds; sched_yield()` on an AP whose local queue is always empty
+         * (enq_target_for sends everything to the BSP) -- otherwise never
+         * releases it, and the ticket lock wedges EVERY other syscall on
+         * every CPU. Observed as chrome freezing at ~4s: the pipe-reader
+         * thread (tid 1) held the BKL forever on cpu3 at 650k poll
+         * iterations/s while the main thread spun at bkl_lock ticket 931
+         * on cpu0 with the whole Linux plane behind it (run39 [hb-x]).
+         * Dropping + retaking hands the fair ticket queue to any waiter;
+         * callers already tolerate this (the slow path below does it). */
+        if (me->holds_bkl) { bkl_exit(); bkl_enter(); }
+        return;     /* fast path: still running, nothing else here */
     }
 
     /* Interactivity credit (MLFQ "yield-before-slice-end stays high"): a proc
@@ -776,12 +824,36 @@ void sched_tick(struct regs *r) {
                 if (p->state == PROC_UNUSED || p->personality != 1) continue;
                 uint64_t waited = (nt > p->enq_tick) ? (nt - p->enq_tick) : 0;
                 kprintf("  pid=%d %-8s prio=%d io=%d enq=%lu wait=%lu eff=%d "
-                        "onq=%d rsp=%p\n",
+                        "onq=%d oncpu=%d rsp=%p\n",
                         p->pid, proc_state_name(p->state), p->prio,
                         p->io_boost, p->enq_tick, waited, eff_prio(p, nt),
                         /* was `next_ready ? 1 : 0` -- which reports 0 for the
                          * queue TAIL, so this column used to lie. */
-                        p->on_rq ? 1 : 0, (void *)p->saved_rsp);
+                        p->on_rq ? 1 : 0,
+                        (int)__atomic_load_n(&p->on_cpu, __ATOMIC_RELAXED),
+                        (void *)p->saved_rsp);
+            }
+            /* Slice 39 freeze triage: one line that discriminates the wedge
+             * classes seen in run39 (both chrome threads RUNNING/onq=0
+             * forever, ring frozen, no ring-3 samples):
+             *   - bkl next>serving frozen  -> a BKL ticket was leaked; every
+             *     later syscall spins in bkl_lock (ring-0, invisible).
+             *   - pollit climbing          -> lx_do_poll spinner is alive.
+             *   - percpu cur/tick          -> WHERE each thread is parked and
+             *     whether that CPU still takes LAPIC timer interrupts. */
+            {
+                extern uint64_t g_lx_poll_iters; extern int g_lx_poll_last_pid;
+                kprintf("  [hb-x] bkl next=%u serving=%u pollit=%lu lastpollpid=%d\n",
+                        (unsigned)g_bkl.next, (unsigned)g_bkl.serving,
+                        (unsigned long)g_lx_poll_iters, g_lx_poll_last_pid);
+                for (uint32_t ci = 0; ci < smp_cpu_count() && ci < MAX_CPUS; ci++) {
+                    const struct percpu *pc = smp_cpu(ci);
+                    if (!pc || !pc->online) continue;
+                    kprintf("  [hb-x] cpu%u cur=%d bkl=%d ticks=%lu\n",
+                            ci, pc->current ? pc->current->pid : -1,
+                            pc->holds_bkl ? 1 : 0,
+                            (unsigned long)pc->timer_ticks);
+                }
             }
             /* slice 20: chrome busy-churns (pid burning CPU) but never navigates.
              * Dump the recent-syscall ring so we can see WHAT the hot threads

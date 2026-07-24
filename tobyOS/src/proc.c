@@ -301,14 +301,22 @@ static void close_all_fds(struct proc *p) {
 static bool install_initial_fds(struct proc *p,
                                 struct file *fd0,
                                 struct file *fd1,
-                                struct file *fd2) {
-    struct file *src[3] = { fd0, fd1, fd2 };
-    for (int i = 0; i < 3; i++) {
+                                struct file *fd2,
+                                struct file *fd3,
+                                struct file *fd4) {
+    /* fd0..fd2 default to the console; fd3/fd4 are OPTIONAL preopens
+     * (slice 39: chrome's --remote-debugging-pipe reads DevTools JSON on
+     * fd 3 and writes it on fd 4 -- the browser-window host hands the
+     * pipe ends straight to the spawned browser). */
+    struct file *src[5] = { fd0, fd1, fd2, fd3, fd4 };
+    for (int i = 0; i < 5; i++) {
         struct file *nf;
         if (src[i]) {
             nf = file_clone(src[i]);
-        } else {
+        } else if (i < 3) {
             nf = console_file_make();
+        } else {
+            continue;                       /* fd3/fd4 absent unless given */
         }
         if (!nf) {
             close_all_fds(p);
@@ -567,6 +575,7 @@ static bool build_kstack(struct proc *p) {
  * without a copy-on-write story. */
 static int spawn_internal(const char *path, const char *name,
                           struct file *fd0, struct file *fd1, struct file *fd2,
+                          struct file *fd3, struct file *fd4,
                           int argc, char **argv,
                           int envc, char **envp,
                           const char *cwd_override) {
@@ -670,7 +679,7 @@ static int spawn_internal(const char *path, const char *name,
     }
 
     /* ---- 0. inherit fds (clone the explicit ones, default the rest) ---- */
-    if (!install_initial_fds(p, fd0, fd1, fd2)) {
+    if (!install_initial_fds(p, fd0, fd1, fd2, fd3, fd4)) {
         kprintf("[proc] '%s': OOM installing initial fds\n", path);
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
@@ -963,7 +972,7 @@ static int spawn_internal(const char *path, const char *name,
 
 int proc_create_from_elf(const char *path, const char *name) {
     /* Default: console for fd 0/1/2, no argv, no envp, inherit cwd. */
-    return spawn_internal(path, name, 0, 0, 0, 0, 0, 0, 0, 0);
+    return spawn_internal(path, name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 /* Ring-0 kernel worker: no user half, no ELF, no fds. Same PCB + fake
@@ -1017,6 +1026,7 @@ int proc_spawn(const struct proc_spec *spec) {
     uint64_t t_spawn = perf_rdtsc();
     int pid = spawn_internal(spec->path, spec->name,
                              spec->fd0, spec->fd1, spec->fd2,
+                             spec->fd3, spec->fd4,
                              spec->argc, spec->argv,
                              spec->envc, spec->envp,
                              spec->cwd);
@@ -1060,6 +1070,10 @@ int proc_spawn(const struct proc_spec *spec) {
  * point at our kstack_top. Drop to ring 3. */
 __attribute__((noreturn)) void proc_first_user_entry(void) {
     struct proc *p = current_proc();
+    /* Slice 39: we arrived via proc_context_switch but NOT through
+     * do_switch's post-switch line -- release the proc this CPU switched
+     * away from, or it stays on_cpu (unschedulable) forever. */
+    sched_finish_switch();
     /* Load this process's initial FPU/SSE state (we arrived via a context
      * switch that saved the PREVIOUS proc's state but couldn't restore ours
      * -- first-run procs never parked in sched_yield's restore). */

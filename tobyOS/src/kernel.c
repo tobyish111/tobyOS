@@ -7228,7 +7228,11 @@ void _start(void) {
     }
 #endif
 
-#ifdef CHROMIUM_BOOT
+#if defined(CHROMIUM_BOOT) && !defined(TKAPP_BOOT)
+    /* Slice 39: when TKAPP_BOOT is also defined we want ONLY the CHROMIUM
+     * instruments ([chan], bt_dump_group, waitt labels, pgj...) -- the
+     * console dump-dom harness below would fight the windowed chromewin run
+     * for /data/cr and burn minutes, so it is excluded. */
     /* Futex unit test (ledger DL2): prove a TIMED FUTEX_WAIT is wakeable by
      * FUTEX_WAKE, in ISOLATION, before the noisy chrome run. Runs first so its
      * verdict prints early; a quick boot can read it without waiting for chrome.
@@ -8533,6 +8537,15 @@ void _start(void) {
     #define TKAPP_PATH "/bin/cpptest"
     #define TKAPP_NAME "cpptest"
     #endif
+    /* Slice 39 FRONT C: real Chromium in a TobyTK window. chromewin spawns
+     * chrome-headless-shell over --remote-debugging-pipe (fork+dup2 3/4+raw
+     * execve) and blits Page.captureScreenshot frames. Chrome takes ~40-60 s
+     * to first frame under TCG, so hold much longer than the default 8 s. */
+    #ifdef TKAPP_CHROMEWIN
+    #define TKAPP_PATH "/bin/chromewin"
+    #define TKAPP_NAME "chromewin"
+    #define TKAPP_HOLD_MS 420000
+    #endif
     /* media slice 4 on-screen proof: launch the browser and type the URL
      * of the host test page (SLIRP maps 10.0.2.2 -> host loopback) that
      * embeds a High-profile H.264 <video>. The URL is baked in-source so
@@ -8550,6 +8563,9 @@ void _start(void) {
     #endif
     #ifndef TKAPP_KEYS
     #define TKAPP_KEYS ""       /* keys typed after launch; "" for none */
+    #endif
+    #ifndef TKAPP_HOLD_MS
+    #define TKAPP_HOLD_MS 8000  /* how long to keep pumping for the shot */
     #endif
     {
         #define TKA_PUMP(ms) do { \
@@ -8585,9 +8601,48 @@ void _start(void) {
         }
 
         struct proc *sp = proc_lookup(spid);
-        kprintf("[TKAPP] %s %s; holding ~8s for screenshot\n", TKAPP_NAME,
-                (sp && sp->state != PROC_TERMINATED) ? "ALIVE" : "EXITED");
-        TKA_PUMP(8000);
+        kprintf("[TKAPP] %s %s; holding ~%ds for screenshot\n", TKAPP_NAME,
+                (sp && sp->state != PROC_TERMINATED) ? "ALIVE" : "EXITED",
+                (int)(TKAPP_HOLD_MS / 1000));
+#if defined(TKAPP_CHROMEWIN) && defined(CHROMIUM_BOOT)
+        /* Slice 39: chrome under the FULL desktop is ~5x slower than the
+         * headless one-shot (the compositor + gui_tick steal most cores under
+         * TCG). The default TKA_PUMP spins gui_tick flat-out, starving chrome
+         * further. Here we composite at only ~30 fps and spend the rest of
+         * each frame in sched_yield so chrome's threads get the cores -- then
+         * hold long enough for chrome to reach its DevTools pipe reader. */
+        {
+            uint64_t hz = pit_hz(); if (!hz) hz = 1000;
+            uint64_t end = pit_ticks() + ((uint64_t)TKAPP_HOLD_MS * hz + 999) / 1000;
+            uint64_t next_tick = 0, next_hb = 0;
+            long secs = 0;
+            while (pit_ticks() < end) {
+                uint64_t now = pit_ticks();
+                if (now >= next_tick) {           /* ~30 fps compositor */
+                    mouse_flush_pending(); kbd_flush_pending(); gui_tick();
+                    next_tick = now + hz / 30;
+                }
+                /* give chrome the core for the rest of the frame */
+                for (int y = 0; y < 200; y++) sched_yield();
+                if (now >= next_hb) {
+                    next_hb = now + hz;           /* ~1 s */
+                    secs++;
+                    if ((secs % 15) == 0)
+                        kprintf("[TKAPP] chromewin hold %lds/%ds\n", secs,
+                                (int)(TKAPP_HOLD_MS / 1000));
+                }
+            }
+        }
+#else
+        /* chunked so each pump stays under its own guard cap; heartbeat so a
+         * long hold is visibly alive on serial */
+        for (long _held = 0; _held < (long)TKAPP_HOLD_MS; _held += 2000) {
+            TKA_PUMP(2000);
+            if ((_held % 30000) == 0 && _held)
+                kprintf("[TKAPP] hold %lds/%lds\n", _held / 1000,
+                        (long)(TKAPP_HOLD_MS / 1000));
+        }
+#endif
         #undef TKA_PUMP
     }
 #endif

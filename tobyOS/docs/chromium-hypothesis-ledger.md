@@ -1501,3 +1501,73 @@ harness (logs/run38fg.sh) is in place to catch it.
 - [mprot] mprotect/madvise/MAP_FIXED history ring.
 - [memfd] now logs SHARED/priv + offset per mmap.
 - [shotdump]/[shd] PNG-over-serial hex dump + logs/rebuild-shot.{sh,ps1}.
+
+## SLICE 40 (2026-07-24) — ***FRONT C LANDS.*** Real Chromium in a TobyTK window:
+## example.com rendered over the DevTools pipe, blitted live on the tobyOS desktop
+
+**Deliverable proven by QMP screendump (logs/shot39_final.png):** the desktop
+shows a native "Chromium" TobyTK window whose canvas is a live
+Page.captureScreenshot stream from a LONG-LIVED chrome-headless-shell driven
+over --remote-debugging-pipe (fds 3/4 wired by pipe+fork+dup2+execve in
+programs/chromewin/main.c). example.com is fully rendered: heading, body,
+link — https over X25519MLKEM768, SwiftShader-GLES pixels, fontconfig text.
+
+### The wall this slice fell over (and the 2 kernel bugs under it)
+
+Chrome froze at ~4s: BOTH threads state=RUNNING onq=0 forever, syscall ring
+frozen, zero ring-3 profiler samples, no exceptions. Diagnosis needed a new
+[hb-x] heartbeat line (BKL ticket next/serving, per-CPU cur/holds_bkl/ticks,
+lx_do_poll iteration counter). It showed: cpu3 cur=1 holds_bkl=1 at 650k poll
+iterations/s, BKL tickets frozen at next=932 serving=930, pid 3 parked at
+bkl_lock on cpu0.
+
+1. **sched_yield()'s Milestone-19 fast path kept the BKL (sched.c).** If the
+   current proc is RUNNING and the local queue is empty it returned
+   immediately — WITH the BKL. lx_do_poll(timeout=-1) waits by looping
+   `check fds; sched_yield()` inside ONE syscall body, and enq_target_for
+   sends all work to the BSP, so an AP's local queue is ALWAYS empty: chrome's
+   pipe-reader thread (the FIRST thing a --remote-debugging-pipe chrome parks)
+   spun the fast path forever holding the BKL and every other syscall on every
+   CPU wedged at bkl_lock. FIX: the fast path now does
+   `if (me->holds_bkl) { bkl_exit(); bkl_enter(); }` — the fair ticket queue
+   hands the lock to any waiter. This bug predates chrome; any Linux proc
+   doing an infinite poll/select on an AP could freeze the whole user plane.
+
+2. **ABI_SYS_GUI_BLIT/_BLEND dereferenced the user pixel buffer raw
+   (syscall.c).** First frame blit under -cpu +smap = kernel panic (P=1
+   kernel-read fault, AC clear, "NO VMA (0 total)"). The GUI syscalls were
+   never converted to the per-copy uaccess model (default QEMU CPU has no
+   SMAP, so TK apps never tripped it). FIX: user_range_ok +
+   uaccess_prepare_read + one uaccess_begin/end window around the blit.
+   (GUI_GETPIXELS was already staged through a kernel row buffer.)
+
+Also: **--no-sandbox was missing from chromewin's argv** — chrome exit(1)s at
+~4s ("Running as root without --no-sandbox"), which burned a full 440s run
+that looked like a hang (the repeating [3] exit_group in the hb ring was the
+corpse, not activity). And **the first https handshake exceeds the origin's
+timeout under TCG** (ServerHello to Finished took 15s; server FIN'd) — chromewin
+now re-navigates every 45s while the frame PNG size never changes; retry 2
+rode TLS session resumption and painted (2727 -> 11573 bytes, the exact
+console-run screenshot size).
+
+### chromewin host (programs/chromewin/main.c, /bin/chromewin, TKAPP_BOOT)
+- pipe()+fork(), dup2 via out-of-range temp fds onto 3/4, raw ABI_SYS_EXECVE.
+- CDP flat session: Target.createTarget(url) -> attachToTarget(flatten) ->
+  Page.enable -> Page.captureScreenshot @~2.5fps -> b64_decode ->
+  toby_image_load -> tk_draw_blit. 100+ frames/run, stable, no leaks observed.
+- Input.dispatchMouseEvent/KeyEvent wired from TK_EV_* (implemented, untested).
+- Nav-retry loop as above; ESC quits.
+
+### Instruments added (CHROMIUM_BOOT-gated, keep)
+- [hb-x]: BKL ticket state + per-CPU current/holds_bkl/timer_ticks +
+  lx_do_poll iteration counter in the 3s heartbeat — THE line that cracked
+  the freeze; cheap, leave it in.
+- [devpipe]: LX_read/LX_write traces on fds 3/4.
+- oncpu= column in the per-proc heartbeat line.
+
+### Parked / next
+- Input routing end-to-end test (QMP input-send-event -> TK -> CDP -> page).
+- First-handshake latency: warm the TLS session (early throwaway fetch) or
+  raise capture cadence only after first paint.
+- The slice-38 teardown flake (silent death ~4s after chrome exit) unseen
+  in ~8 slice-40 runs; keep -d cpu_reset in the harness.
