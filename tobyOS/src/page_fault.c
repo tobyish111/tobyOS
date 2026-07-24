@@ -16,13 +16,26 @@
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
 #include <tobyos/printk.h>
+#include <tobyos/panic.h>
 #include <tobyos/klibc.h>
 #include <tobyos/swap.h>
+#include <tobyos/apic.h>     /* tlb_shootdown_remote */
 
-/* Maximum physical pages we track refcounts for (256K pages = 1 GiB) */
-#define PAGE_REF_MAX  (256 * 1024)
-
-static uint16_t g_page_refcounts[PAGE_REF_MAX];
+/* One refcount slot per MANAGED physical frame, sized from the PMM at
+ * init. This used to be a fixed 256K-slot static array (1 GiB of
+ * coverage) whose indexer MASKED the frame number with (max-1): on the
+ * 4 GiB chromium guest every frame above 1 GiB silently SHARED a slot
+ * with three other frames. Fork and teardown then entangled unrelated
+ * frames' counts: an exiting process whose frame aliased a live CoW
+ * frame's slot stole that slot's references on teardown, so a LATER
+ * teardown of the CoW frame's first owner saw refs==1 and freed a
+ * frame the second owner still mapped. The PMM recycled it into the
+ * next allocation, which scribbled over live memory of an unrelated
+ * process -- flaky, load-dependent corruption that only chromium's
+ * multi-GiB fork-churn footprint ever triggered (slice 38: ICU locale
+ * strings appearing inside the browser's vulkan-loader heap). */
+static uint16_t *g_page_refcounts;
+static size_t    g_page_ref_slots;
 
 /* Per-process vm_space table, indexed by pid */
 static struct vm_space g_vm_spaces[PROC_MAX];
@@ -30,28 +43,37 @@ static struct vm_space g_vm_spaces[PROC_MAX];
 /* ---- Page reference counting ---- */
 
 void page_ref_init(void) {
-    memset(g_page_refcounts, 0, sizeof(g_page_refcounts));
-}
-
-static inline size_t phys_to_refidx(uint64_t phys) {
-    return (phys >> 12) & (PAGE_REF_MAX - 1);
+    size_t frames = pmm_total_pages();
+    size_t bytes  = frames * sizeof(uint16_t);
+    size_t pages  = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t phys = pmm_alloc_pages(pages);
+    if (!phys)
+        kpanic("page_ref_init: no memory for page refcount array");
+    g_page_refcounts = (uint16_t *)pmm_phys_to_virt(phys);
+    memset(g_page_refcounts, 0, pages * PAGE_SIZE);
+    g_page_ref_slots = frames;
+    kprintf("[cow] page refcounts: %lu frames tracked (%lu KiB array)\n",
+            (unsigned long)frames,
+            (unsigned long)((pages * PAGE_SIZE) / 1024));
 }
 
 void page_ref_inc(uint64_t phys) {
-    size_t idx = phys_to_refidx(phys);
-    if (idx < PAGE_REF_MAX && g_page_refcounts[idx] < 0xFFFF)
+    size_t idx = phys >> 12;
+    if (g_page_refcounts && idx < g_page_ref_slots &&
+        g_page_refcounts[idx] < 0xFFFF)
         g_page_refcounts[idx]++;
 }
 
 void page_ref_dec(uint64_t phys) {
-    size_t idx = phys_to_refidx(phys);
-    if (idx < PAGE_REF_MAX && g_page_refcounts[idx] > 0)
+    size_t idx = phys >> 12;
+    if (g_page_refcounts && idx < g_page_ref_slots &&
+        g_page_refcounts[idx] > 0)
         g_page_refcounts[idx]--;
 }
 
 int page_ref_get(uint64_t phys) {
-    size_t idx = phys_to_refidx(phys);
-    if (idx >= PAGE_REF_MAX) return 0;
+    size_t idx = phys >> 12;
+    if (!g_page_refcounts || idx >= g_page_ref_slots) return 0;
     return g_page_refcounts[idx];
 }
 
@@ -156,6 +178,10 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
         if (page_ref_get(old_phys) <= 1) {
             *pte = (*pte | PTE_WRITABLE) & ~PTE_COW;
             invlpg(page_va);
+#ifdef CHROMIUM_BOOT
+            { extern void pgj_note(uint8_t, uint64_t, uint64_t, uint64_t);
+              pgj_note(5, page_va, old_phys, 0); }
+#endif
             return true;
         }
 
@@ -164,6 +190,15 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
             return false; /* OOM during COW */
 
         invlpg(page_va);
+        /* Frame CHANGE: any other CPU with the old translation cached would
+         * keep reading/writing the pre-copy frame (now owned by the fork
+         * sibling, or freed). One of this process's ~30 sibling threads can
+         * be running that VA on another core right now. */
+        tlb_shootdown_remote();
+#ifdef CHROMIUM_BOOT
+        { extern void pgj_note(uint8_t, uint64_t, uint64_t, uint64_t);
+          pgj_note(6, page_va, *pte & PTE_ADDR_MASK, old_phys); }
+#endif
         return true;
     }
 
@@ -178,6 +213,10 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
         *pte = new_phys | PTE_PRESENT | PTE_USER | PTE_WRITABLE;
         page_ref_inc(new_phys);
         invlpg(page_va);
+#ifdef CHROMIUM_BOOT
+        { extern void pgj_note(uint8_t, uint64_t, uint64_t, uint64_t);
+          pgj_note(7, page_va, new_phys, 0); }
+#endif
         return true;
     }
 
@@ -216,6 +255,11 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
             if ((error_code & PF_ERR_WRITE) && (v->flags & VMA_WRITE)) {
                 *pte |= PTE_WRITABLE;
                 invlpg(page_va);
+#ifdef CHROMIUM_BOOT
+                { extern void pgj_note(uint8_t, uint64_t, uint64_t, uint64_t);
+                  pgj_note(8, page_va, *pte & PTE_ADDR_MASK,
+                           page_ref_get(*pte & PTE_ADDR_MASK)); }
+#endif
                 return true;
             }
             return false;   /* present + not a grantable write = real fault */
@@ -479,6 +523,12 @@ int vmm_cow_fork(uint64_t parent_cr3, uint64_t child_cr3) {
                     uint64_t pte_val = parent_pt[i1];
                     uint64_t phys = pte_val & PTE_ADDR_MASK;
 
+#ifdef CHROMIUM_BOOT
+                    uint64_t fork_va = ((uint64_t)i4 << 39) |
+                                       ((uint64_t)i3 << 30) |
+                                       ((uint64_t)i2 << 21) |
+                                       ((uint64_t)i1 << 12);
+#endif
                     if (pte_val & PTE_SHARED) {
                         /* MAP_SHARED page (shm cache / memfd): NEVER CoW.
                          * POSIX: fork children share these mappings for
@@ -502,8 +552,16 @@ int vmm_cow_fork(uint64_t parent_cr3, uint64_t child_cr3) {
                         /* Child gets same: not writable, COW set */
                         child_pt[i1] = (pte_val & ~PTE_WRITABLE) | PTE_COW;
                     } else {
-                        /* Read-only: copy PTE as-is */
-                        child_pt[i1] = pte_val;
+                        /* Read-only page: it is now SHARED (refs go up
+                         * below), so it too must be COW-marked. Without
+                         * the marker, a later mprotect(RW) on either side
+                         * write-enabled the shared frame in place (the
+                         * refcounted copy-out never ran) and the two
+                         * processes scribbled over each other. For pages
+                         * that stay read-only forever (text/RELRO) the
+                         * bit is inert. */
+                        parent_pt[i1] = pte_val | PTE_COW;
+                        child_pt[i1]  = pte_val | PTE_COW;
                     }
 
                     /* Account BOTH owners of the now-shared page. Pages
@@ -520,6 +578,12 @@ int vmm_cow_fork(uint64_t parent_cr3, uint64_t child_cr3) {
                     if (page_ref_get(phys) == 0)
                         page_ref_inc(phys);     /* parent's untracked ref */
                     page_ref_inc(phys);         /* child's new ref        */
+#ifdef CHROMIUM_BOOT
+                    { extern void pgj_note(uint8_t, uint64_t, uint64_t,
+                                           uint64_t);
+                      pgj_note(13, fork_va, phys,
+                               (uint64_t)page_ref_get(phys)); }
+#endif
                 }
             }
         }
@@ -544,6 +608,17 @@ int vmm_cow_fork(uint64_t parent_cr3, uint64_t child_cr3) {
         __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
         __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
     }
+
+    /* The comment above ("the parent runs on exactly one CPU") is FALSE for
+     * a multithreaded parent: chrome's browser process has ~30 threads, and
+     * any of them may be running on another CPU with WRITABLE translations
+     * to the pages we just write-protected hot in that CPU's TLB. Those
+     * threads then keep writing straight into frames shared with the child
+     * -- and worse, after a later CoW copy-out moves the PTE to a new frame,
+     * a still-stale CPU keeps hitting the GHOST frame: chrome's SwiftShader
+     * JIT thread lost 4 stack spills that way (slice 38 iter 24 page-journal
+     * autopsy) and read back pre-fork bytes. Flush everyone. */
+    tlb_shootdown_remote();
 
     return 0;
 }

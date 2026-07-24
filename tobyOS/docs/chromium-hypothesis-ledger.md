@@ -1311,3 +1311,193 @@ therefore the window/interactive tier -- remain blocked on this crash.
   Deep.
 - **Window + input:** not started; blocked on pixels.
 All three are independent, deep, multi-slice fronts.
+
+---
+
+## SLICE 38 (2026-07-23) — the "GL NULL-deref" wall FALLS: it was a dlclose→dlopen
+## use-after-free in ld.so's search scopes, poisoned by chrome's own allocator
+
+**CORRECTION to the slice-37 diagnosis (and to the handoff doc):** the canonical
+front-B crash signature `libc+0x8d70d reads NULL+0x308` was attributed to
+`__internal_syscall_cancel` reading a zeroed TCB. Symbolizing that offset against
+the sysroot libc's dynamic symbols places it in the **dlopen/dlerror wrapper
+cluster** (`dlopen@GLIBC_2.2.5` = 0x8d400, `dlerror` = 0x8ccd0; 0x8d70d is a
+static helper right after `__libc_alloca_cutoff`). Every front-B crash this
+slice — and, in hindsight, the flaky messenger-walk #GPs of earlier slices —
+is one bug family: **dlopen machinery reading memory freed during a prior
+dlclose.**
+
+### The capture (iterations 8-10, all in the browser process's GPU thread)
+
+Getting a *raw* fault instead of chrome's own crash handler required
+`--disable-in-process-stack-traces` (iter 6) plus two kernel instruments added
+this slice in `src/isr.c`:
+- full GP-register snapshot BEFORE `signal_deliver_fault` rewrites the
+  trapframe (the old log printed the *handler entry* as rip);
+- on the FATAL path: a 96-qword user-stack dump at rsp (return addresses
+  symbolize offline against `[libmap]`) + a dump of the memcpy source bytes.
+
+**Iteration 9 caught the scribbler in the act.** `EXCEPTION 14`, tid 15
+(GPU thread), guest t=5.78s:
+- rip = `libc+0xab380` = `__memcpy_sse2_unaligned_erms`, in the non-temporal
+  4K-interleaved loop (`movntdq` to `rdi` AND `rdi+0x1000` per iteration);
+- dst (rax) = a *stack local* at rsp+0x68 near the top of the thread's own
+  8MiB stack; loop counters implied an original length of **~15.8MB**;
+- the copy had already flooded [rax, stack_top) — including the first 0x280
+  bytes of the thread's OWN TCB at `fs_base = stack_top - 0x940`, i.e. the
+  `%fs:0x10` self-pointer — before the store crossed the top of the stack
+  VMA (cr2 = stack_top + 0x940) and faulted. **In runs where the next VMA sat
+  adjacent, this memcpy corrupted the NEIGHBOR thread's stack/TCB silently —
+  producing exactly the historical "TCB self-pointer is NULL" downstream
+  crashes.**
+
+**Iteration 10 named the killer.** Same thread, same guest second, one fault
+earlier in the cascade:
+```
+*** EXCEPTION 13: General Protection (in user mode) ***
+rip=0x4000a237 (ld.so do_lookup_x+0x107)   rax=0xbadbad00badbad00
+    a233: mov (%r14,%rax,8),%rax   ; scope->r_list[i]  (r14 = chrome heap)
+    a237: mov 0x28(%rax),%rbx      ; link_map field -> #GP, rax = POISON
+```
+`0xbadbad00` (x2) is **chrome's poison constant** — a 16-byte SSE fill pattern
+in chrome-headless-shell's rodata (4 hits at file offset 0x119f560; zero hits
+in ld.so/libc/libvulkan/swiftshader). ld.so's `malloc` resolves through
+chrome's allocator shim to PartitionAlloc, so ld.so's own scope arrays live in
+— and are poisoned by — chrome's heap.
+
+### The proven event chain (one [lopen]/[amap]/[libmap] trace, tid 15)
+1. 4971ms  dlopen `/opt/chrome/libvulkan.so.1` #1 → mapped 0x102f0ac01000
+2. 5003ms  dlopen `libvk_swiftshader.so` (the loader's ICD)
+3. 5060-5097ms  `vk_swiftshader_icd.json` re-read 4x (enumerate/create cycle;
+   first vkCreateInstance attempt fails headless)
+4. **5146ms  dlclose(ICD)   → munmap 0x102f0b800000**
+5. **5153ms  dlclose(vulkan #1) → munmap 0x102f0ac01000** — this free()s scope
+   arrays through PartitionAlloc, which poisons them
+6. 5652ms  chrome's second consumer calls dlopen("libvulkan.so.1") #2 → fresh
+   mmaps (legitimate — refcount hit 0) → relocation → `do_lookup_x` walks a
+   search-scope `r_list` that still references the freed array → #GP on the
+   poisoned link_map pointer → fault cascade (the iter-9 runaway memcpy is the
+   same walk consuming a poisoned string/size) → GPU thread dies → browser
+   wedges.
+
+### The fix (kernel.c, iter 10): pin the Vulkan libs
+`LD_PRELOAD=/opt/chrome/libvulkan.so.1:/opt/chrome/libvk_swiftshader.so`
+keeps both refcounts ≥ 1 for the process lifetime: dlclose becomes a pure
+refcount drop (no unload, no scope frees), the retry dlopen is a name-cache
+hit. **Result: the 5.7s GPU-thread death is GONE; the browser survived to
+--dump-dom (63s) and wrote /data/shot.png.** envc 7 → 8.
+
+Whether the stale scope reference is an upstream glibc bug (dlclose leaving a
+dangling r_list in a surviving scope) or is induced by something tobyOS does
+differently is UNRESOLVED — the preload sidesteps it either way. Do NOT remove
+the preload without re-testing the dlclose/dlopen cycle.
+
+### NEW wall exposed behind it: a 0xff000000 heap flood kills cert verification
+With the GPU thread alive, the https attempt got further and died differently
+(iter 10, tid 6 of the browser process, 200ms after the TLS server flight
+arrived on tcp[2]):
+- `EXCEPTION 13` rip = `libnspr4+0x240d0` — inside PR_Unlock's pending-notify
+  walk (static fn after `PR_DestroyCondVar`; frames in libnss3's
+  NSS_IsInitialized / trust-store neighborhood ⇒ this is chrome's
+  cert-verifier path);
+- the function copies the lock's heap-resident notify array to the stack via
+  `movaps xmm1..xmm6` then walks it; both the stack copy AND the source heap
+  region were flooded with `0xff000000ff000000` — **ARGB opaque-black pixel
+  pairs** — and the walk dereferenced one as a link pointer (non-canonical →
+  #GP);
+- a teardown echo killed tid 19 at 63s (rip in chrome's vulkan-pointer text
+  region, same 0xff000000 pattern in rax/rbx/rdi), which wedged browser exit.
+
+So NSS/NSPR is a *victim*: something sprays a pixel clear over PartitionAlloc
+heap. Suspect: SwiftShader's Vulkan JIT rasterizer clearing a surface through
+a stale/wrong pointer (in-process GPU shares the address space). pmm alloc- and
+free-side refcount tripwires stayed SILENT all run (no kernel-side premature
+frees observed in the refcounted paths).
+
+### Iteration 11 A/B (in flight when this entry was written)
+`--use-angle=vulkan` → `--use-angle=swiftshader` (ANGLE on SwiftShader-GLES;
+no Vulkan loader, no SwiftShader-Vulkan JIT). If the flood vanishes and https
+completes: pixels AND https unblock together, and the Vulkan-path flood parks
+as a follow-up.
+
+### Instruments added this slice (all CHROMIUM_BOOT-gated, keep)
+- `src/isr.c` fatal-path user-stack + memcpy-source dumps (`[ustk]`/`[usrc]`)
+- pre-`signal_deliver_fault` register snapshot in the `[sigfault]` log
+- `logs/sym38.sh` — offline symbolizer: [ustk] qwords → module+offset via the
+  run's own [libmap] table
+
+## SLICE 39 (2026-07-23) — ***PIXELS + HTTPS, TOGETHER.*** chrome renders
+## https://example.com and writes a REAL screenshot; ML-KEM works natively
+
+**VERDICT: fronts A (https) and B (pixels) are DONE, one root cause under
+both.** `--dump-dom --screenshot` run: DOM of https://example.com printed to
+stdout, `/data/shot.png` = 11573 bytes, PNG magic OK, and the reconstructed
+image (hex-dumped over serial via [shotdump], rebuilt host-side) shows the
+page RENDERED CORRECTLY: styled #eee background, laid-out heading, proper
+glyph rasterization, blue link. chrome exit=0. NetLog: h2 negotiated,
+cipher_suite=4867 (ChaCha20-Poly1305), key_exchange_group=4588 =
+**X25519MLKEM768 — the post-quantum exchange chrome's BoringSSL computes now
+WORKS on tobyOS; no fallback needed.** The slice-36 "ML-KEM math" theory is
+dead: the math was always right (linux-mlkem proved it); its INPUTS were
+being corrupted by the kernel bugs below.
+
+### The final root cause: memfd MAP_PRIVATE treated as MAP_SHARED
+SwiftShader's Reactor JIT (ExecutableMemory.cpp) keeps ONE memfd named
+'swiftshader_jit'; for EVERY compiled routine it ftruncates that fd to the
+routine size and mmaps it MAP_PRIVATE at OFFSET 0, writes the code, then
+mprotects R-X. Linux gives each such mapping private CoW pages. tobyOS's
+memfd_map gave every mapping the SAME physical frames (VMM_SHARED, the
+mmap-coherent design added for Mojo) — so compiling routine N overwrote the
+code of routines 1..N-1 in place.
+
+**The kill chain, captured end-to-end in one run:** DrawCall holds three
+routine slots {vertex,setup,pixel} at +0x40/+0x58/+0x70. All three JIT
+mmaps aliased file pages 0..3, so the vertex slot's entry (0x102f13614060)
+contained the LAST-compiled routine's bytes — the PIXEL routine. The caller
+(libvk_swiftshader+0x1220f9, `call *0x40(%rbx)`) passed vertex-call args
+(batch-index array on the stack in rdx) to code whose prologue consumes
+pixel-call args `(device, Primitive*, int count, int cluster, int
+clusterCount, DrawData*)` — it walked the Vertex output arena as a
+Primitive[] with stride 0x8710 (138 strides = exactly the 4.7MB object) and
+sailed into PartitionAlloc's PROT_NONE guard. The [pgj] page journal proved
+the walked pages were NEVER written (single demand-zero map each): nothing
+was "lost" — the walker itself was the wrong routine.
+
+Fix (src/mmap.c memfd_map): honor !MAP_SHARED with an EAGER private copy —
+fresh anon pages, file bytes copied at map time, plain private-anon VMA
+(normal munmap free, normal fork CoW). Deviation from lazy CoW is invisible
+to the JIT pattern (each mapping is touched by exactly one writer/reader).
+
+### The supporting bug family fixed en route (all real, all latent killers)
+1. **Cross-CPU editor-root race (vmm.c):** g_pml4/g_pml4_phys were GLOBALS;
+   concurrent mmap/munmap/mprotect on different CPUs edited the WRONG address
+   space (one process's munmap freed another's live frames → demand faults
+   later returned zero pages where data had lived). Now per-CPU
+   g_pml4_cpu[]/g_pml4_phys_cpu[] via vmm_ed_idx().
+2. **No TLB shootdown (apic.c, vector 0xFD):** PTE downgrades (mprotect,
+   munmap, madvise, brk-shrink, COW write-protect at fork) never IPI'd other
+   CPUs; stale TLB entries let threads write through freed/remapped frames.
+   tlb_shootdown_remote() now added at every downgrade site.
+3. **vmm_protect stripped software PTE bits:** mprotect on a COW page granted
+   RW in place (both fork sides then wrote one frame). Now preserves
+   COW/DEMAND/SWAP bits and defers the write grant to the fault handler.
+4. **fork left read-only pages non-COW:** later mprotect(RW) on either side
+   made in-place sharing writable. Now ALL non-shared pages are COW-marked.
+5. **munmap freed refcounted frames blindly** (slice-38 continuation): now
+   refcount-aware on the anon path.
+
+### Where front C starts (next slice)
+Chrome runs to completion headless. The window front is now pure integration:
+long-lived chrome on --remote-debugging-pipe, Page.captureScreenshot frames
+into a TobyTK window, DevTools Input.* events back. One flake to watch: one
+run died silently (no serial, qemu exit 1) ~4s AFTER chrome exit=0 during
+process teardown — an SMP teardown race still lives somewhere; -d cpu_reset
+harness (logs/run38fg.sh) is in place to catch it.
+
+### Instruments added this slice (all CHROMIUM_BOOT-gated, keep)
+- [pgj] page journal: every PTE mutation ring-logged (map/unmap/protect/COW/
+  demand), dumped at fatal faults; proved the never-written-pages fact.
+- [pfres] resolved-fault ring + fatal-path walk-probe.
+- [mprot] mprotect/madvise/MAP_FIXED history ring.
+- [memfd] now logs SHARED/priv + offset per mmap.
+- [shotdump]/[shd] PNG-over-serial hex dump + logs/rebuild-shot.{sh,ps1}.

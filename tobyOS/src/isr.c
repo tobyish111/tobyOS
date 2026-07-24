@@ -154,6 +154,60 @@ static void dump_regs(struct regs *r) {
 static struct { uint64_t rip, addr; uint32_t count; bool warned; }
     g_pfloop[MAX_CPUS];
 
+#ifdef CHROMIUM_BOOT
+/* Slice 38 iter 25: ring of RESOLVED user faults. The fatal-crash autopsy
+ * showed last_fault_rip == the fatal rip -- the dying instruction had
+ * faulted BEFORE and been "resolved". Which handler resolved it, for what
+ * address, and what happened in between is exactly the missing story. */
+struct pfres_ev {
+    uint32_t ms; int16_t pid; uint8_t how; uint8_t err;
+    uint64_t rip, cr2;
+};
+#define PFRES_RING 512
+static struct pfres_ev g_pfres[PFRES_RING];
+static uint32_t g_pfres_head;
+void pfres_note(struct regs *r, uint64_t fault_addr, uint8_t how) {
+    extern uint64_t klog_ms(void);
+    struct proc *cp = current_proc();
+    uint32_t idx = __atomic_fetch_add(&g_pfres_head, 1, __ATOMIC_RELAXED);
+    struct pfres_ev *e = &g_pfres[idx % PFRES_RING];
+    e->ms  = (uint32_t)klog_ms();
+    e->pid = cp ? (int16_t)cp->pid : -1;
+    e->how = how;                       /* 1=page_fault_handler 2=mmap */
+    e->err = (uint8_t)r->error_code;
+    e->rip = r->rip;
+    e->cr2 = fault_addr;
+}
+/* Last mmap-resolved (how=2) fault address for this pid -- at fatal time
+ * that's the previous step of whatever walk led to the crash, i.e. the
+ * best probe address for "what VMA/backing was the walk reading?". */
+uint64_t pfres_last_mmap_cr2(int pid) {
+    uint32_t n = g_pfres_head < PFRES_RING ? g_pfres_head : PFRES_RING;
+    for (uint32_t k = 0; k < n; k++) {
+        struct pfres_ev *e =
+            &g_pfres[(g_pfres_head - 1 - k) % PFRES_RING];
+        if (e->pid == pid && e->how == 2) return e->cr2;
+    }
+    return 0;
+}
+
+void pfres_dump(int pid_filter) {
+    uint32_t n = g_pfres_head < PFRES_RING ? g_pfres_head : PFRES_RING;
+    kprintf("[pfres] last resolved user faults (pid filter %d, %u total):\n",
+            pid_filter, (unsigned)g_pfres_head);
+    int shown = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        struct pfres_ev *e = &g_pfres[(g_pfres_head - n + k) % PFRES_RING];
+        if (pid_filter >= 0 && e->pid != pid_filter) continue;
+        kprintf("  [pfres] %ums pid=%d how=%u err=0x%x rip=%p cr2=%p\n",
+                (unsigned)e->ms, (int)e->pid, (unsigned)e->how,
+                (unsigned)e->err, (void *)e->rip, (void *)e->cr2);
+        if (++shown >= 48) { kprintf("  [pfres] (truncated)\n"); break; }
+    }
+    if (!shown) kprintf("  [pfres] (no events)\n");
+}
+#endif
+
 static void pfloop_note_resolved(struct regs *r, uint64_t fault_addr) {
     uint32_t ci = smp_current_cpu_idx();
     if (ci >= MAX_CPUS) return;
@@ -202,10 +256,16 @@ static void default_exception(struct regs *r) {
         if (from_user) {
             if (page_fault_handler(fault_addr, r->error_code, current_proc())) {
                 pfloop_note_resolved(r, fault_addr);
+#ifdef CHROMIUM_BOOT
+                pfres_note(r, fault_addr, 1);
+#endif
                 return; /* fault resolved via COW / demand-zero / swap-in */
             }
             if (mmap_handle_page_fault(fault_addr, r->error_code)) {
                 pfloop_note_resolved(r, fault_addr);
+#ifdef CHROMIUM_BOOT
+                pfres_note(r, fault_addr, 2);
+#endif
                 return; /* fault resolved via mmap demand paging */
             }
         } else {
@@ -273,8 +333,52 @@ static void default_exception(struct regs *r) {
                     (unsigned long)((r->error_code >> 4) & 1), sig, code);
             mmap_debug_fault_vma(addr);
         }
-        if (sig && signal_deliver_fault(r, sig, code, addr))
+#ifdef CHROMIUM_BOOT
+        /* Slice 38: chrome installs its own SEGV handler (stack-trace
+         * dumper), so a fault it "handles" used to vanish from the kernel
+         * log entirely. Log the TRUE faulting rip BEFORE delivery --
+         * signal_deliver_fault REWRITES r->rip to the handler entry, so a
+         * post-delivery log printed the handler thunk (0x4788b18) for
+         * every fault and hid the real crash site (iter-2/4 lesson). Also
+         * dump the VMA situation for the fault address so "stale pointer
+         * into an munmapped .so" cases self-identify. */
+        /* Snapshot the WHOLE register file, not just rip:
+         * signal_deliver_fault rewrites rip/rsp/rdi/rsi for the handler
+         * call, and the iter-5 #GP (libvulkan messenger-list walk,
+         * `cmpb $1,(%r14)`) is only diagnosable from the GPRs -- r14 IS
+         * the corrupt node pointer. */
+        struct regs pre = *r;
+        uint64_t true_rip = r->rip;
+        bool have_fault = (sig != 0);
+#endif
+        if (sig && signal_deliver_fault(r, sig, code, addr)) {
+#ifdef CHROMIUM_BOOT
+            if (have_fault) {
+                struct proc *fp = current_proc();
+                kprintf("[sigfault] pid=%d name=%s vec=%lu sig=%d code=%d "
+                        "rip=%p addr=%p -> user handler\n",
+                        fp ? fp->pid : -1, fp ? fp->name : "?",
+                        r->vector, sig, code,
+                        (void *)true_rip, (void *)addr);
+                kprintf("[sigfault]   rax=%p rbx=%p rcx=%p rdx=%p\n",
+                        (void *)pre.rax, (void *)pre.rbx,
+                        (void *)pre.rcx, (void *)pre.rdx);
+                kprintf("[sigfault]   rsi=%p rdi=%p rbp=%p rsp=%p\n",
+                        (void *)pre.rsi, (void *)pre.rdi,
+                        (void *)pre.rbp, (void *)pre.rsp);
+                kprintf("[sigfault]   r8=%p r9=%p r10=%p r11=%p\n",
+                        (void *)pre.r8, (void *)pre.r9,
+                        (void *)pre.r10, (void *)pre.r11);
+                kprintf("[sigfault]   r12=%p r13=%p r14=%p r15=%p\n",
+                        (void *)pre.r12, (void *)pre.r13,
+                        (void *)pre.r14, (void *)pre.r15);
+                extern void mmap_debug_fault_vma(uint64_t a);
+                if (addr) mmap_debug_fault_vma(addr);
+                if (true_rip) mmap_debug_fault_vma(true_rip);
+            }
+#endif
             return;   /* iretq lands in the user handler */
+        }
     }
 
     kprintf("\n*** EXCEPTION %lu: %s%s ***\n",
@@ -328,6 +432,129 @@ static void default_exception(struct regs *r) {
                     kprintf("  [rsp+0x%03x] %016lx  LIB?\n", i * 8, v);
                 else
                     kprintf("  [rsp+0x%03x] %016lx\n", i * 8, v);
+            }
+
+            /* Slice 38 iter 16: dump the CODE BYTES around the faulting rip.
+             * The iter-16 crash executed from a freshly-grown memfd JIT arena
+             * (rip inside a 16K fd-backed mapping created 77ms earlier) and
+             * read near-NULL. Two very different bugs produce that picture:
+             * (a) the kernel zero-clobbered live JIT code (memfd grow /
+             * madvise / MAP_FIXED interaction) -- then these bytes read as
+             * 00s or garbage; (b) the JIT emitted code against a NULL input
+             * pointer -- then these are well-formed instructions and the bug
+             * is data-side. One dump decides which rabbit hole is real. */
+            {
+                uint64_t rb = r->rip >= 96 ? r->rip - 96 : 0;
+                kprintf("[isr] code @ rip-96 (%p):\n", (void *)rb);
+                for (int i = 0; i < 20; i++) {
+                    uint64_t v = 0, a = rb + (uint64_t)i * 8;
+                    if (get_user_u64_nofault(&v, (const void *)a) != 0) {
+                        kprintf("  [code+0x%02x] <unreadable>\n", i * 8);
+                        break;
+                    }
+                    kprintf("  [code+0x%02x] %016lx%s\n", i * 8, v,
+                            (a <= r->rip && r->rip < a + 8) ? "  <-- rip" : "");
+                }
+            }
+
+            /* Iter 22: the SwiftShader-JIT routine's data blocks. The bad
+             * pointer is LOADED from memory (spill slot fed from an arg or a
+             * descriptor); rsi has been the SAME address every run (constants
+             * or descriptor-set block), rdi/rbx/r12 are per-run heap blocks.
+             * If the bad pointer appears among sane neighbors -> chrome wrote
+             * it (stale descriptor, chrome-side). If the block around it is
+             * zeroed/flooded/poisoned -> kernel memory corruption, and the
+             * pattern names the mechanism. */
+            {
+                struct { const char *nm; uint64_t base; } blks[4] = {
+                    { "rsi", r->rsi }, { "rdi", r->rdi },
+                    { "r12", r->r12 }, { "rbx", r->rbx },
+                };
+                for (int b = 0; b < 4; b++) {
+                    if (blks[b].base < 0x1000) continue;
+                    kprintf("[isr] data @ %s (%p):\n",
+                            blks[b].nm, (void *)blks[b].base);
+                    for (int i = 0; i < 8; i++) {
+                        uint64_t v[4]; int okrow = 1;
+                        for (int j = 0; j < 4; j++)
+                            if (get_user_u64_nofault(&v[j], (const void *)
+                                    (blks[b].base + (uint64_t)(i*4+j)*8)) != 0)
+                                { okrow = 0; break; }
+                        if (!okrow) {
+                            kprintf("  [%s+0x%03x] <unreadable>\n",
+                                    blks[b].nm, i * 32);
+                            break;
+                        }
+                        kprintf("  [%s+0x%03x] %016lx %016lx %016lx %016lx\n",
+                                blks[b].nm, i * 32, v[0], v[1], v[2], v[3]);
+                    }
+                }
+            }
+
+            /* Slice 38 (render tier): the slice-37 --screenshot crash decodes
+             * as glibc __internal_syscall_cancel loading the TCB self pointer
+             * (%fs:0x10) as NULL, then faulting reading self+0x308
+             * (cancelhandling). The %fs:0x10 load itself SUCCEEDED (else cr2
+             * would be fs_base+0x10, not 0x308), so fs_base points at MAPPED
+             * memory whose +0x10 qword is ZERO. Dump the faulting thread's
+             * fs_base, its first qwords, and the VMA covering it, to tell
+             * "TCB got zeroed/clobbered" from "fs_base points at the wrong
+             * (fresh) region". */
+            {
+                uint64_t fsb = rdmsr(0xC0000100);   /* MSR_FS_BASE (live) */
+                kprintf("[isr] TLS: fs_base=%p proc.tls_base=%p pid=%d tgid=%d "
+                        "is_thread=%d name=%s\n",
+                        (void *)fsb, (void *)cp->tls_base, cp->pid, cp->tgid,
+                        (int)cp->is_thread, cp->name);
+                for (int i = 0; i < 8; i++) {
+                    uint64_t v = 0, a = fsb + (uint64_t)i * 8;
+                    if (get_user_u64_nofault(&v, (const void *)a) != 0) {
+                        kprintf("  [fs+0x%02x] <unreadable>\n", i * 8);
+                        break;
+                    }
+                    kprintf("  [fs+0x%02x] %016lx\n", i * 8, v);
+                }
+                extern void mmap_debug_fault_vma(uint64_t addr);
+                mmap_debug_fault_vma(fsb);
+                /* Iter 18: also the VMA covering the FAULT address and the
+                 * one covering RIP -- the fatal dumps so far only showed the
+                 * TLS VMA, leaving "was cr2 even inside a VMA, and with what
+                 * prot?" unanswered for both deterministic crashes. */
+                if (r->vector == 14) {
+                    uint64_t fa = read_cr2();
+                    kprintf("[isr] VMA at cr2=%p:\n", (void *)fa);
+                    mmap_debug_fault_vma(fa);
+                    extern void mprotect_ring_dump(uint64_t);
+                    mprotect_ring_dump(fa);
+#ifdef CHROMIUM_BOOT
+                    /* Slice 38 iter 24: page-journal autopsy. The rsp page is
+                     * where the lost-store corruption lives; cr2 is where the
+                     * stale pointer led. Dump both timelines. */
+                    { extern void pgj_dump(uint64_t);
+                      pgj_dump(fa);
+                      if ((r->rsp >> 12) != (fa >> 12))
+                          pgj_dump(r->rsp); }
+                    /* Iter 25: what did this pid fault on (and get resolved)
+                     * before dying? last_fault_rip == fatal rip says the
+                     * dying instruction faulted before -- list the history. */
+                    { struct proc *dp = current_proc();
+                      int dpid = dp ? dp->pid : -1;
+                      pfres_dump(dpid);
+                      /* Iter 26: identify the region the pre-crash walk was
+                       * reading -- VMA + page journal of the last resolved
+                       * demand fault. "Fresh zero where chrome expected its
+                       * own data" points at the backing being wrong. */
+                      uint64_t wa = pfres_last_mmap_cr2(dpid);
+                      if (wa) {
+                          kprintf("[isr] walk-probe addr=%p:\n", (void *)wa);
+                          mmap_debug_fault_vma(wa);
+                          extern void pgj_dump(uint64_t);
+                          pgj_dump(wa);
+                      } }
+#endif
+                }
+                kprintf("[isr] VMA at rip=%p:\n", (void *)r->rip);
+                mmap_debug_fault_vma(r->rip);
             }
         }
     }
@@ -387,6 +614,46 @@ static void default_exception(struct regs *r) {
                     fp->pid, (unsigned long)fp->fault_count,
                     (void *)fp->last_fault_rip);
         }
+#ifdef CHROMIUM_BOOT
+        /* Slice 38 iter 9: the 5.78s fatal fault is a runaway glibc memcpy
+         * (dst = a caller's stack local at rsp+0x68, len ~16MB from heap)
+         * that blows through the top of the GPU thread's stack. The trap
+         * frame alone can't name the CALLER, so dump the user stack around
+         * rsp -- the qwords that land in [libmap]-logged code ranges are
+         * return addresses and symbolize offline. Also dump the copy SOURCE
+         * around rsi: if it reads as ASCII, the bogus length came from
+         * strlen() of an unterminated heap string (names the owner). */
+        {
+            kprintf("[ustk] rsp=%p dump:\n", (void *)r->rsp);
+            for (int i = 0; i < 96; i += 4) {
+                uint64_t v[4]; int ok = 1;
+                for (int j = 0; j < 4; j++)
+                    if (get_user_u64_nofault(&v[j],
+                            (const void *)(r->rsp + (uint64_t)(i + j) * 8)) != 0)
+                        { ok = 0; break; }
+                if (!ok) { kprintf("  [ustk] +0x%03x <unreadable>\n", i * 8); break; }
+                kprintf("  [ustk+0x%03x] %016lx %016lx %016lx %016lx\n",
+                        i * 8, v[0], v[1], v[2], v[3]);
+            }
+            /* Copy source: current rsi, plus the ORIGINAL source (rsi minus
+             * bytes already copied = rdi - rax for glibc memcpy frames). */
+            uint64_t srcs[2] = { r->rsi, 0 };
+            uint64_t delta = r->rdi - r->rax;
+            if (delta > 0 && delta < 0x1000000) srcs[1] = r->rsi - delta;
+            for (int s = 0; s < 2; s++) {
+                if (!srcs[s]) continue;
+                kprintf("[usrc] %s=%p bytes:\n", s ? "orig-src" : "rsi",
+                        (void *)srcs[s]);
+                for (int i = 0; i < 64; i += 8) {
+                    uint64_t v = 0;
+                    if (get_user_u64_nofault(&v,
+                            (const void *)(srcs[s] + (uint64_t)i)) != 0)
+                        { kprintf("  [usrc] +%d <unreadable>\n", i); break; }
+                    kprintf("  [usrc+%02d] %016lx\n", i, v);
+                }
+            }
+        }
+#endif
         proc_exit(-1);
         /* unreachable */
     }

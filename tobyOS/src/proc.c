@@ -50,6 +50,8 @@
 #include <tobyos/signal.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
+#include <tobyos/page_fault.h>   /* page_ref_* for CoW-aware brk shrink */
+#include <tobyos/apic.h>         /* tlb_shootdown_remote */
 #include <tobyos/heap.h>
 #include <tobyos/vfs.h>
 #include <tobyos/elf.h>
@@ -122,6 +124,13 @@ struct proc       *g_current_proc;
 struct proc *current_proc(void) {
     struct proc *p = smp_this_cpu()->current;
     return p ? p : g_current_proc;
+}
+
+/* Pid of the current task, or -1. For debug instrumentation in files that
+ * cannot include proc.h (vmm.c's page journal). */
+int proc_current_pid_dbg(void) {
+    struct proc *p = current_proc();
+    return p ? p->pid : -1;
 }
 
 /* Tiny strncpy substitute -- copies up to max-1 chars and always
@@ -1425,12 +1434,25 @@ uint64_t proc_brk(struct proc *p, uint64_t new_brk) {
             memset((void *)pmm_phys_to_virt(phys), 0, PAGE_SIZE);
         }
     } else if (new_aligned < old_aligned) {
-        /* Shrinking past at least one page boundary: free those pages. */
+        /* Shrinking past at least one page boundary: free those pages.
+         * CoW-aware: a fork sibling may still map the frame (refs > 1);
+         * drop only our reference and let the last owner free it. */
         for (uint64_t va = new_aligned; va < old_aligned; va += PAGE_SIZE) {
             uint64_t phys = vmm_translate(va) & ~((uint64_t)PAGE_SIZE - 1);
             vmm_unmap(va, PAGE_SIZE);
-            if (phys) pmm_free_page(phys);
+            if (phys) {
+                int refs = page_ref_get(phys);
+                if (refs > 1) {
+                    page_ref_dec(phys);
+                } else {
+                    if (refs == 1) page_ref_dec(phys);
+                    pmm_free_page(phys);
+                }
+            }
         }
+        /* Dropped translations must leave other CPUs' TLBs before the
+         * freed frames are reissued (see tlb_shootdown_remote). */
+        tlb_shootdown_remote();
     }
 
     p->brk_cur = new_brk;

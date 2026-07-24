@@ -26,6 +26,7 @@
 #include <tobyos/sched.h>
 #include <tobyos/mmap.h>
 #include <tobyos/page_fault.h>
+#include <tobyos/apic.h>     /* tlb_shootdown_remote */
 
 /* ---- VMA definitions ---- */
 
@@ -73,6 +74,11 @@ struct vma_table {
 };
 
 static struct vma_table g_vma_tables[PROC_MAX];
+
+#ifdef CHROMIUM_BOOT
+/* Permission-transition ring (defined above sys_madvise_dontneed). */
+void mprot_ring_note(uint64_t addr, uint64_t len, int pid, uint32_t prot);
+#endif
 
 /* ---- Helpers ---- */
 
@@ -127,13 +133,21 @@ void mmap_debug_fault_vma(uint64_t addr) {
     if (!p) return;
     int pid = p->is_thread ? p->tgid : p->pid;
     struct vma_table *vt = &g_vma_tables[pid];
-    struct mmap_vma *v = vma_find_internal(vt, addr);
-    if (v) {
-        kprintf("[pf] addr=0x%lx COVERED by mmap-VMA [0x%lx,0x%lx) prot=0x%x flags=0x%x\n",
-                (unsigned long)addr, (unsigned long)v->start,
+    /* Print EVERY covering entry, not just the first hit: overlapping VMAs
+     * (two entries claiming one address, fault handler resolving against
+     * whichever it scans first) are one of the candidate bug classes, and a
+     * first-match print renders them invisible. */
+    int hits = 0;
+    for (int i = 0; i < vt->count; i++) {
+        struct mmap_vma *v = &vt->entries[i];
+        if (addr < v->start || addr >= v->end) continue;
+        hits++;
+        kprintf("[pf] addr=0x%lx COVERED by mmap-VMA%s [0x%lx,0x%lx) prot=0x%x flags=0x%x\n",
+                (unsigned long)addr, hits > 1 ? " (OVERLAP!)" : "",
+                (unsigned long)v->start,
                 (unsigned long)v->end, v->prot, v->flags);
-        return;
     }
+    if (hits) return;
     kprintf("[pf] addr=0x%lx NOT covered by any mmap-VMA (%d total); nearest within 64GB:\n",
             (unsigned long)addr, vt->count);
     for (int i = 0; i < vt->count; i++) {
@@ -233,6 +247,22 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
     uint64_t base;
     if ((flags & VMA_FLAG_FIXED) && addr) {
         base = page_align_down(addr);
+        /* Linux MAP_FIXED atomically REPLACES whatever the range held.
+         * Skipping this left TWO VMAs claiming the range, and the demand
+         * fault handler resolves against whichever it scans first (the
+         * table order is scrambled by vma_remove's swap-with-last) -- a
+         * coin-flip between the live mapping's prot/backing and a stale
+         * one. ld.so maps every .so's segments MAP_FIXED inside a bigger
+         * reservation, so duplicates were the NORM, not a corner case. */
+        sys_munmap(base, len);
+#ifdef CHROMIUM_BOOT
+        /* Record FIXED map-overs in the mprotect ring: PartitionAlloc
+         * DECOMMITS slot spans by mmap(MAP_FIXED|PROT_NONE) over them (not
+         * mprotect), so without this the ring says "(none recorded)" for a
+         * range that was in fact committed and then map-over-decommitted.
+         * Tag: prot | 0x100 marks "mmap-fixed" vs plain mprotect. */
+        mprot_ring_note(base, len, pid, prot | 0x100u);
+#endif
     } else {
         base = find_free_region(vt, len);
         if (!base) return -12;
@@ -295,6 +325,10 @@ long sys_mmap2(uint64_t addr, size_t length, int prot, int flags,
     uint64_t base;
     if ((flags & MAP_FIXED) && addr) {
         base = page_align_down(addr);
+        sys_munmap(base, length);        /* MAP_FIXED replaces (see sys_mmap) */
+#ifdef CHROMIUM_BOOT
+        mprot_ring_note(base, length, pid, 0x100u);  /* see sys_mmap note */
+#endif
     } else {
         base = find_free_region(vt, length);
         if (!base) return -12;
@@ -323,17 +357,14 @@ long sys_mmap2(uint64_t addr, size_t length, int prot, int flags,
         v->fd = fd;
     }
 
-    /* Also register with page_fault vm_space for demand paging */
-    struct vm_space *vms = vm_space_for_proc(p);
-    if (vms) {
-        uint32_t vma_flags = 0;
-        if (prot & PROT_READ)  vma_flags |= VMA_READ;
-        if (prot & PROT_WRITE) vma_flags |= VMA_WRITE;
-        if (prot & PROT_EXEC)  vma_flags |= VMA_EXEC;
-        if (flags & MAP_ANONYMOUS) vma_flags |= VMA_ANON;
-        if (!(flags & MAP_ANONYMOUS)) vma_flags |= VMA_FILE;
-        vma_add(vms, base, base + length, vma_flags);
-    }
+    /* NOTE: this used to ALSO register the range in page_fault.c's per-pid
+     * vm_space (vma_add) -- a SECOND registry that munmap never trimmed and
+     * that is keyed by the calling THREAD's pid, not the tgid. Stale entries
+     * there could service a demand fault on a recycled address range with
+     * the OLD mapping's flags/backing (its VMA_FILE path maps a zero page
+     * without ever reading the file), silently zeroing live data. The
+     * g_vma_tables entry above is the single source of truth; the fault
+     * path reaches it via mmap_handle_page_fault. */
 
     /* Demand paging: DON'T allocate pages now. The page fault handler
      * will allocate zero-fill pages on first access. */
@@ -367,7 +398,29 @@ long sys_munmap(uint64_t addr, uint64_t len) {
             uint64_t phys = vmm_translate(a);
             if (phys) {
                 vmm_unmap(a, PAGE_SIZE);
-                if (!nofree) pmm_free_page(phys & PAGE_MASK);
+                phys &= PAGE_MASK;
+                if (nofree) {
+                    /* memfd/shm-cache owns the frame: drop only THIS
+                     * mapping's reference (taken at map time). The owner
+                     * frees it on last unref. Skipping the dec leaked one
+                     * count per munmap'd page forever. */
+                    page_ref_dec(phys);
+                } else {
+                    /* CoW-aware: after a fork this frame may still be
+                     * mapped by the other side (refs > 1). Blindly freeing
+                     * it here handed live frames back to the PMM -- the
+                     * next allocation scribbled over the fork sibling's
+                     * memory (slice 38: chrome's PartitionAlloc munmaps
+                     * constantly amid renderer fork churn; flaky heap
+                     * corruption in whichever process kept the frame). */
+                    int refs = page_ref_get(phys);
+                    if (refs > 1) {
+                        page_ref_dec(phys);
+                    } else {
+                        if (refs == 1) page_ref_dec(phys);
+                        pmm_free_page(phys);
+                    }
+                }
             }
         }
         vmm_set_editor_root(saved_root);
@@ -393,11 +446,125 @@ long sys_munmap(uint64_t addr, uint64_t len) {
         }
     }
 
+    /* The unmapped translations may be cached on other CPUs (sibling
+     * threads); the freed frames get reissued by the PMM, so a stale
+     * entry would read/write somebody else's new page. */
+    tlb_shootdown_remote();
+
     return 0;
 }
 
 long sys_munmap2(uint64_t addr, size_t length) {
     return sys_munmap(addr, (uint64_t)length);
+}
+
+/* madvise(MADV_DONTNEED) with REAL Linux semantics for private anon memory:
+ * drop the pages; the next touch demand-faults a FRESH ZERO page (the VMA
+ * stays). This is NOT advisory on Linux and callers depend on the zero-fill
+ * guarantee -- chrome's PartitionAlloc periodically discards free slot spans
+ * with MADV_DONTNEED and its zero-fill allocation path (calloc through the
+ * allocator shim) SKIPS memset for slots on "freshly committed from the OS"
+ * system pages. Treating DONTNEED as a success no-op left the old bytes in
+ * place, so "zeroed" allocations came back holding whatever died there
+ * before -- measured: retired SwiftShader framebuffer pixels
+ * (0xff000000ff000000 = two opaque-black ARGB texels) resurfacing inside
+ * NSPR's freshly calloc'd lock/cv structures, whose notify walk then #GP'd
+ * (slice 38 iters 10/12; the crash moved with allocator timing, which is why
+ * an identical binary crashed one boot and not the next).
+ *
+ * Only ranges inside private ANON VMAs are dropped. Shared/NOFREE (memfd,
+ * shm-cache) mappings keep their frames: for those DONTNEED means "reload
+ * from backing", and the backing IS the frame. Unknown ranges (brk heap,
+ * grow-down stacks) are left alone -- no VMA means the demand-refill
+ * contract can't be honored, so dropping would turn the next touch into a
+ * SIGSEGV. */
+#ifdef CHROMIUM_BOOT
+/* Slice 38 iter 19: ring of recent mprotect/madvise permission transitions.
+ * The deterministic SwiftShader-JIT crash reads a pointer into a PROT_NONE
+ * anon VMA (a hole in PartitionAlloc's reservation). Whether that range was
+ * NEVER committed (stale pointer, chrome-side) or was committed AND the
+ * transition got lost (kernel-side split/apply bug) is invisible post-mortem
+ * without history. Dumped by mprotect_ring_dump(addr) from the fatal-fault
+ * path. Sized so a pre-crash mprotect storm can't evict the answer (a 2048
+ * ring was flushed in <1s of SwiftShader JIT setup); madvise(DONTNEED)
+ * drops are tagged MPROT_MADV in the same timeline. */
+struct mprot_ev { uint64_t ms, addr, len; int pid; uint32_t prot; };
+#define MPROT_RING 16384
+#define MPROT_MADV 0xFFFFu
+static struct mprot_ev g_mprot_ring[MPROT_RING];
+static uint32_t g_mprot_head;
+extern uint64_t klog_ms(void);
+void mprot_ring_note(uint64_t addr, uint64_t len, int pid, uint32_t prot) {
+    struct mprot_ev *e = &g_mprot_ring[g_mprot_head % MPROT_RING];
+    g_mprot_head++;
+    e->ms = klog_ms(); e->pid = pid; e->addr = addr; e->len = len;
+    e->prot = prot;
+}
+void mprotect_ring_dump(uint64_t fault_addr) {
+    uint64_t oldest = 0, newest = 0;
+    uint32_t n = g_mprot_head < MPROT_RING ? g_mprot_head : MPROT_RING;
+    if (n) {
+        oldest = g_mprot_ring[(g_mprot_head - n) % MPROT_RING].ms;
+        newest = g_mprot_ring[(g_mprot_head - 1) % MPROT_RING].ms;
+    }
+    kprintf("[mprot] history covering %p (ring spans %lums..%lums, %u ev):\n",
+            (void *)fault_addr, (unsigned long)oldest, (unsigned long)newest,
+            (unsigned)g_mprot_head);
+    int shown = 0;
+    for (uint32_t k = 0; k < MPROT_RING; k++) {
+        struct mprot_ev *e = &g_mprot_ring[(g_mprot_head + k) % MPROT_RING];
+        if (!e->len) continue;
+        if (fault_addr < e->addr || fault_addr >= e->addr + e->len) continue;
+        kprintf("  [mprot] %lums pid=%d %s(%p, 0x%lx, prot=0x%x)\n",
+                (unsigned long)e->ms, e->pid,
+                e->prot == MPROT_MADV ? "madvise-dontneed" : "mprotect",
+                (void *)e->addr, (unsigned long)e->len, e->prot);
+        shown++;
+    }
+    if (!shown) kprintf("  [mprot] (none recorded)\n");
+}
+#endif
+
+long sys_madvise_dontneed(uint64_t addr, uint64_t len) {
+    struct proc *p = current_proc();
+    if (!p) return -1;
+    int pid = p->is_thread ? p->tgid : p->pid;
+    struct vma_table *vt = &g_vma_tables[pid];
+    if (len == 0) return 0;
+    addr = page_align_down(addr);
+    len  = page_align_up(len);
+#ifdef CHROMIUM_BOOT
+    mprot_ring_note(addr, len, pid, MPROT_MADV);
+#endif
+
+    for (int i = 0; i < vt->count; i++) {
+        struct mmap_vma *v = &vt->entries[i];
+        if (addr >= v->end || (addr + len) <= v->start) continue;
+        if (!(v->flags & VMA_FLAG_ANON)) continue;      /* file-backed: keep */
+        if (v->flags & (VMA_FLAG_SHARED | VMA_FLAG_NOFREE)) continue;
+
+        uint64_t start = (addr > v->start) ? addr : v->start;
+        uint64_t end   = ((addr + len) < v->end) ? (addr + len) : v->end;
+        uint64_t saved_root = vmm_set_editor_root(p->cr3);
+        for (uint64_t a = start; a < end; a += PAGE_SIZE) {
+            uint64_t phys = vmm_translate(a);
+            if (!phys) continue;                        /* already absent */
+            vmm_unmap(a, PAGE_SIZE);
+            phys &= PAGE_MASK;
+            int refs = page_ref_get(phys);
+            if (refs > 1) {
+                page_ref_dec(phys);                     /* fork sibling keeps it */
+            } else {
+                if (refs == 1) page_ref_dec(phys);
+                pmm_free_page(phys);
+            }
+        }
+        vmm_set_editor_root(saved_root);
+    }
+    /* Same as munmap: dropped translations must leave every CPU's TLB
+     * before the freed frames are reissued. */
+    tlb_shootdown_remote();
+    return 0;
 }
 
 /* ---- mprotect ---- */
@@ -413,6 +580,10 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
     addr = page_align_down(addr);
     len  = page_align_up(len);
     uint64_t rstart = addr, rend = addr + len;
+
+#ifdef CHROMIUM_BOOT
+    mprot_ring_note(addr, len, pid, prot);
+#endif
 
     /* Apply `prot` ONLY to the [rstart,rend) sub-range, SPLITTING any VMA it
      * partially covers. The demand-page handler reads the VMA's prot for a
@@ -462,6 +633,10 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
     uint64_t saved_root = vmm_set_editor_root(p->cr3);
     vmm_protect(addr, len, vmm_f);
     vmm_set_editor_root(saved_root);
+    /* Permission downgrade must reach every CPU's TLB, not just ours --
+     * another thread of this process may be running on another core with
+     * the old (more permissive) translation cached. */
+    tlb_shootdown_remote();
 
     return 0;
 }
@@ -514,10 +689,20 @@ long sys_brk2(uint64_t new_brk) {
             uint64_t phys = vmm_translate(a);
             if (phys) {
                 vmm_unmap(a, PAGE_SIZE);
-                pmm_free_page(phys & PAGE_MASK);
+                phys &= PAGE_MASK;
+                /* CoW-aware, same as munmap: a fork sibling may still map
+                 * this frame. */
+                int refs = page_ref_get(phys);
+                if (refs > 1) {
+                    page_ref_dec(phys);
+                } else {
+                    if (refs == 1) page_ref_dec(phys);
+                    pmm_free_page(phys);
+                }
             }
         }
         vmm_set_editor_root(saved_root);
+        tlb_shootdown_remote();
     }
 
     vt->brk_cur = new_brk;
@@ -533,7 +718,20 @@ bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     int pid = p->is_thread ? p->tgid : p->pid;
     struct vma_table *vt = &g_vma_tables[pid];
     struct mmap_vma *v = vma_find_internal(vt, fault_addr);
-    if (!v) return false;
+#ifdef CHROMIUM_BOOT
+    /* Slice 38 iter 18: two deterministic fatal faults (browser main thread
+     * movups-write to a non-present heap page; JIT read of a cage pointer)
+     * are REFUSALS from this function -- but the fatal dump can't tell WHICH
+     * return-false fired. Log each rejection with the VMA state. Rate-limited;
+     * refusals are normally rare (real SIGSEGVs). */
+    #define PF_REJECT(fmt, ...) do { static int _c; if (_c < 24) { _c++; \
+        kprintf("[pfrej] pid=%d addr=%p err=0x%lx " fmt "\n", \
+                pid, (void *)fault_addr, (unsigned long)error_code, \
+                ##__VA_ARGS__); } } while (0)
+#else
+    #define PF_REJECT(fmt, ...) do { } while (0)
+#endif
+    if (!v) { PF_REJECT("NO VMA"); return false; }
 
     /* vmm_map/vmm_unmap/vmm_translate edit the GLOBAL editor root (g_pml4_phys),
      * which between syscalls is the kernel PML4 -- NOT the faulting process. We
@@ -548,10 +746,14 @@ bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
             uint64_t page_va = page_align_down(fault_addr);
             uint64_t saved_root = vmm_set_editor_root(p->cr3);
             uint64_t old_phys = vmm_translate(page_va);
-            if (!old_phys) { vmm_set_editor_root(saved_root); return false; }
+            if (!old_phys) { vmm_set_editor_root(saved_root);
+                PF_REJECT("COW VMA [%p,%p) prot=0x%x but page NOT PRESENT",
+                          (void *)v->start, (void *)v->end, v->prot);
+                return false; }
 
             uint64_t new_phys = pmm_alloc_page();
-            if (!new_phys) { vmm_set_editor_root(saved_root); return false; }
+            if (!new_phys) { vmm_set_editor_root(saved_root);
+                PF_REJECT("COW copy OOM"); return false; }
 
             memcpy((void *)(new_phys + vmm_hhdm_offset()),
                    (void *)(old_phys + vmm_hhdm_offset()),
@@ -566,13 +768,61 @@ bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
             v->prot |= VMA_PROT_WRITE;
             return true;
         }
+        PF_REJECT("WRITE to non-writable VMA [%p,%p) prot=0x%x flags=0x%x",
+                  (void *)v->start, (void *)v->end, v->prot, v->flags);
+        return false;
+    }
+
+    /* A page that is ALREADY PRESENT must never be replaced by the
+     * demand-zero path below -- that clobbers live data with zeros and leaks
+     * the old frame. A present-page fault here is a pure PERMISSION fault
+     * (e.g. a write to a page mapped read-only while the VMA says RW, after
+     * an mprotect raced or a CoW bit was cleared): fix the PTE in place if
+     * the VMA allows it, else it's a real fault. (page_fault.c's Case 3 has
+     * carried this exact guard; this fallback path lacked it.) */
+    uint64_t page_va = page_align_down(fault_addr);
+    {
+        uint64_t saved_root = vmm_set_editor_root(p->cr3);
+        uint64_t cur = vmm_translate(page_va);
+        if (cur) {
+            bool ok = false;
+            if (is_write && (v->prot & VMA_PROT_WRITE)) {
+                vmm_protect(page_va, PAGE_SIZE,
+                            prot_to_vmm_flags(v->prot) |
+                            ((v->flags & VMA_FLAG_SHARED) ? VMM_SHARED : 0));
+                ok = true;
+            }
+            vmm_set_editor_root(saved_root);
+            if (!ok)
+                PF_REJECT("PRESENT page, unhandled combo: VMA [%p,%p) "
+                          "prot=0x%x flags=0x%x",
+                          (void *)v->start, (void *)v->end, v->prot, v->flags);
+            return ok;
+        }
+        vmm_set_editor_root(saved_root);
+    }
+
+    /* PROT_NONE (V8 cage guards / reservations): a touch is a REAL fault.
+     * Without this check the demand path below "serviced" it with a page
+     * whose PTE carries no user/rw bits, and the instant re-fault came back
+     * as an unhandled present-page combo -- same fatal outcome, wrong clue. */
+    if (v->prot == 0) {
+        PF_REJECT("touch on PROT_NONE VMA [%p,%p) flags=0x%x",
+                  (void *)v->start, (void *)v->end, v->flags);
         return false;
     }
 
     /* Demand paging: allocate a zero-filled physical page */
-    uint64_t page_va = page_align_down(fault_addr);
     uint64_t phys = pmm_alloc_page();
-    if (!phys) return false;
+    if (!phys) {
+        /* This failure path is a SILENT fatal SIGSEGV for the process --
+         * from the outside indistinguishable from a wild pointer. Name it. */
+        kprintf("[mmap] demand-page OOM at %p (VMA [%p,%p) prot=0x%x) "
+                "free=%lu pages\n",
+                (void *)fault_addr, (void *)v->start, (void *)v->end,
+                v->prot, (unsigned long)pmm_free_pages());
+        return false;
+    }
 
     memset((void *)(phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
 
@@ -676,7 +926,18 @@ void memfd_unref(struct memfd *mf) {
     if (!mf) return;
     if (--mf->refs > 0) return;
     for (size_t i = 0; i < mf->npages; i++)
-        if (mf->pages[i]) pmm_free_page(mf->pages[i]);
+        if (mf->pages[i]) {
+            /* Drop the memfd's OWN reference (memfd_ensure_pages). If a
+             * live mapping still holds one -- chrome passes memfd
+             * SharedMemoryRegions over sockets, and a mapper can outlive
+             * every fd -- that mapper's teardown frees the frame. Freeing
+             * unconditionally here (the pre-slice-38 code) recycled frames
+             * other processes were still writing through. */
+            uint64_t ph = mf->pages[i];
+            page_ref_dec(ph);
+            if (page_ref_get(ph) == 0)
+                pmm_free_page(ph);
+        }
     if (mf->pages) kfree(mf->pages);
     kfree(mf);
 }
@@ -698,6 +959,14 @@ static int memfd_ensure_pages(struct memfd *mf, size_t want) {
         uint64_t phys = pmm_alloc_page();
         if (!phys) return -1;
         memset((char *)(phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
+        /* The memfd itself holds one reference (mirrors shm_cache_ensure).
+         * Untracked (refs==0) memfd pages got entangled with fork's
+         * unconditional PTE refcounting: fork brought them to 2, the fork
+         * participants' teardowns dropped them to 0 and FREED a frame the
+         * memfd still listed in pages[] -- and that any OTHER mapper (which
+         * took no reference at all, see memfd_map) was still writing
+         * through. memfd_unref then freed it a second time. */
+        page_ref_inc(phys);
         mf->pages[i] = phys;
     }
     mf->npages = want;
@@ -784,9 +1053,54 @@ long memfd_map(uint64_t addr, uint64_t len, uint32_t prot, uint32_t flags,
     size_t np = (size_t)(len / PAGE_SIZE);
     if (memfd_ensure_pages(mf, page_off + np) < 0) return -12;
 
+    /* MAP_PRIVATE of a memfd is copy-on-write on Linux: each mapping gets its
+     * own pages, and writes never reach the file or other mappings.
+     * SwiftShader's Reactor JIT depends on that -- it keeps ONE
+     * 'swiftshader_jit' memfd and, for EVERY compiled routine, ftruncates it
+     * to the routine's size and maps it PRIVATE at offset 0, then writes the
+     * code through the new mapping (ExecutableMemory.cpp). Treating those
+     * mappings as coherent shared memory aliased them all to file pages 0..n:
+     * each newly compiled routine overwrote the previous routines' code in
+     * place (slice 38 crash: the DrawCall's vertex slot executed PIXEL
+     * routine code -- last one written -- which walked the Vertex array with
+     * the Primitive stride 0x8710 off the end into PartitionAlloc's guard).
+     * Honor PRIVATE with an EAGER copy into a plain private-anon VMA: exact
+     * for any writer, and the only deviation (stores through a later
+     * MAP_SHARED view not appearing here) is invisible to the JIT pattern,
+     * which touches each mapping alone. */
+    if (!(flags & VMA_FLAG_SHARED)) {
+        uint64_t base;
+        if ((flags & VMA_FLAG_FIXED) && addr) {
+            base = page_align_down(addr);
+            sys_munmap(base, len);
+        } else { base = find_free_region(vt, len); if (!base) return -12; }
+
+        struct mmap_vma *v = vma_alloc(vt);
+        if (!v) return -12;
+        v->start = base; v->end = base + len; v->prot = prot;
+        v->flags = (flags & ~(uint32_t)VMA_FLAG_SHARED)
+                 | VMA_FLAG_ANON | VMA_FLAG_PRIVATE;
+        v->fd = -1; v->offset = 0;
+
+        uint32_t vmm_f = prot_to_vmm_flags(prot);
+        uint64_t saved = vmm_set_editor_root(p->cr3);
+        for (size_t i = 0; i < np; i++) {
+            uint64_t phys = pmm_alloc_page();
+            if (!phys) { vmm_set_editor_root(saved); return -12; }
+            memcpy((void *)(phys + vmm_hhdm_offset()),
+                   (const void *)(mf->pages[page_off + i] + vmm_hhdm_offset()),
+                   PAGE_SIZE);
+            vmm_map(base + i * PAGE_SIZE, phys, PAGE_SIZE, vmm_f);
+        }
+        vmm_set_editor_root(saved);
+        return (long)base;
+    }
+
     uint64_t base;
-    if ((flags & VMA_FLAG_FIXED) && addr) base = page_align_down(addr);
-    else { base = find_free_region(vt, len); if (!base) return -12; }
+    if ((flags & VMA_FLAG_FIXED) && addr) {
+        base = page_align_down(addr);
+        sys_munmap(base, len);           /* MAP_FIXED replaces (see sys_mmap) */
+    } else { base = find_free_region(vt, len); if (!base) return -12; }
 
     struct mmap_vma *v = vma_alloc(vt);
     if (!v) return -12;
@@ -799,8 +1113,14 @@ long memfd_map(uint64_t addr, uint64_t len, uint32_t prot, uint32_t flags,
      * the SAME physical frame. */
     uint32_t vmm_f = prot_to_vmm_flags(prot) | VMM_SHARED;
     uint64_t saved = vmm_set_editor_root(p->cr3);
-    for (size_t i = 0; i < np; i++)
+    for (size_t i = 0; i < np; i++) {
+        /* One reference per address space mapping the page, so this
+         * process's teardown/munmap drops only its own (mirrors
+         * shm_cache_mmap). Paired with the memfd's own reference from
+         * memfd_ensure_pages. */
+        page_ref_inc(mf->pages[page_off + i]);
         vmm_map(base + i * PAGE_SIZE, mf->pages[page_off + i], PAGE_SIZE, vmm_f);
+    }
     vmm_set_editor_root(saved);
     return (long)base;
 }
@@ -948,8 +1268,10 @@ long shm_cache_mmap(struct shm_cache *sc, uint64_t addr, uint64_t len,
     if (shm_cache_ensure(sc, page_off + np) < 0) return -12;
 
     uint64_t base;
-    if ((flags & VMA_FLAG_FIXED) && addr) base = page_align_down(addr);
-    else { base = find_free_region(vt, len); if (!base) return -12; }
+    if ((flags & VMA_FLAG_FIXED) && addr) {
+        base = page_align_down(addr);
+        sys_munmap(base, len);           /* MAP_FIXED replaces (see sys_mmap) */
+    } else { base = find_free_region(vt, len); if (!base) return -12; }
 
     struct mmap_vma *v = vma_alloc(vt);
     if (!v) return -12;

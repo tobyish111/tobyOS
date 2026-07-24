@@ -26,6 +26,10 @@
 #define APIC_SPURIOUS_VECTOR  0xFFu
 /* Vector for LAPIC timer (set up but masked). */
 #define APIC_TIMER_VECTOR     0x40u
+/* Vector for the cross-CPU TLB shootdown IPI (slice 38: PTE downgrades
+ * and CoW frame changes must invalidate every CPU's TLB, not just the
+ * caller's -- see tlb_shootdown_remote). */
+#define TLB_SHOOTDOWN_VECTOR  0xFDu
 
 /* Map LAPIC MMIO + enable BSP's local APIC. Returns false on error
  * (e.g. ACPI didn't give us a sane lapic_phys). */
@@ -57,6 +61,13 @@ void apic_eoi(void);
 
 /* Did apic_init_bsp succeed? */
 bool apic_is_ready(void);
+
+/* Flush the TLB on every OTHER online CPU (full non-global flush via CR3
+ * reload) and wait -- bounded -- for each to acknowledge. Call after any
+ * PTE downgrade or frame change that another CPU may have cached:
+ * CoW write-protect at fork, CoW copy-out, mprotect, munmap/madvise
+ * page drops. No-op before SMP bring-up or on a single CPU. */
+void tlb_shootdown_remote(void);
 
 /* ---- Milestone 22 step 5: per-CPU periodic LAPIC timer -------- */
 /*

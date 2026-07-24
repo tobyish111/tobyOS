@@ -7304,6 +7304,44 @@ void _start(void) {
         }
     }
 
+    /* ML-KEM computational-correctness test (slice 38): chrome's https is
+     * blocked by BoringSSL's X25519MLKEM768 computing a WRONG result on
+     * tobyOS (ledger slice 36 -- the FO decapsulation amplifies any single-bit
+     * error into a wrong shared secret -> ERR_SSL_PROTOCOL_ERROR). Run the
+     * same computational shape (kyber768 reference: NTT mod-3329 + Keccak +
+     * FO decaps) in THREE CONCURRENT processes with deterministic seeds, so
+     * the computation is context-switched constantly like chrome's network
+     * service under TCG. Per-process checksums print as [mlkem] lines --
+     * compare against the HOST reference build (programs/linux-mlkem/
+     * host_main.c, same code, same seeds):
+     *   seed1=0xc740d9cdf8ec2d3a seed2=0x605d407dbd2ac85f
+     *   seed3=0x7320259b77fbd60d
+     * PASS but checksum MISMATCH = deterministic computational divergence
+     * (TCG instruction bug / kernel); self-consistency FAIL = transient
+     * corruption (context-switch / FPU-state / paging class -- chrome's
+     * exact failure shape). */
+    {
+        const char *path = "/bin/linux-mlkem";
+        char *argv[] = { (char *)"linux-mlkem", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-mlkem",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] MLKEMTEST: spawning %s\n", path);
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[MLKEMTEST] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[MLKEMTEST] VERDICT: %s exit=%d (3=PASS 3-proc concurrent "
+                    "kyber768 self-consistent -- compare [mlkem] checksums vs "
+                    "host; 1=FAIL decaps mismatch; 4=FAIL implicit-rejection; "
+                    "5=FAIL child; 2=ERROR)\n",
+                    rc == 3 ? "PASS" : "FAIL", rc);
+        }
+    }
+
     /* Slice 35 bisection: does tobyOS's OWN TLS 1.3 client complete an HTTPS
      * handshake to the same server, in this exact boot config? chrome's
      * BoringSSL derives handshake keys, decrypts example.com's server flight,
@@ -7327,6 +7365,16 @@ void _start(void) {
                     "fault is shared (kernel/socket), not chrome-specific\n", rc);
         }
     }
+
+    /* Slice 38 render-tier NOTE: a fake X server (programs/linux-xstub,
+     * staged at /bin/linux-xstub) was built for the documented
+     * VK_KHR_xcb_surface wall -- but iter 3 proved ANGLE-Vulkan-SwiftShader
+     * initializes OFFSCREEN (no X at all) once the VK_LOADER_DEBUG
+     * messenger-walk crash was removed: ChoosePhysicalDevice ran, the frame
+     * was captured, and only creat() ENOSYS blocked the PNG. Deliberately
+     * NOT spawned: a live X socket could make ANGLE pick DisplayVkXcb over
+     * the working offscreen path. Spawn it only if a future config brings
+     * the xcb wall back. */
 
     /* Track B M0: spawn a REAL, UNMODIFIED, off-the-shelf headless Chromium
      * (chrome-headless-shell from Chrome-for-Testing -- the actual V8 + Blink
@@ -7382,9 +7430,28 @@ void _start(void) {
              * distributed init/compositor-readiness stall, independent of GL). The
              * ANGLE/Vulkan/fake-X-server work (slices 12-14) is intact in-tree and
              * git history; re-enable those flags for the later --screenshot tier. */
-            (char *)"--disable-gpu",
-            (char *)"--disable-software-rasterizer",
-            (char *)"--disable-gpu-compositing",
+            /* Slice 38 (render tier ACTIVE): the GPU-off trio
+             * (--disable-gpu --disable-software-rasterizer
+             * --disable-gpu-compositing) is REPLACED by the ANGLE-Vulkan
+             * loader route (slice 12-14 target config) to reproduce the
+             * --screenshot SwiftShader crash WITH the new [isr] TLS + [tls]
+             * provenance instrumentation. Restore the trio for a clean
+             * dump-dom baseline. */
+            (char *)"--use-gl=angle",
+            /* Slice 38 iter 11 A/B: ANGLE on SwiftShader-GLES instead of
+             * ANGLE-on-Vulkan. Iter 10 (LD_PRELOAD pin) fixed the dlopen UAF
+             * but a heap FLOOD of 0xff000000ff000000 (ARGB opaque-black
+             * pixel pairs) then took out the browser's cert-verify thread
+             * inside NSPR's PR_Unlock notify walk at handshake time (tid 6,
+             * 24.8s; the lock's heap-resident notify array was pre-flooded),
+             * and a teardown echo killed tid 19 at 63s. Suspect: SwiftShader's
+             * Vulkan JIT rasterizer clearing a surface through a stale/wrong
+             * pointer into the PartitionAlloc heap. GLES SwiftShader avoids
+             * the Vulkan loader + SwiftShader-Vulkan entirely; if the flood
+             * vanishes, pixels AND https are unblocked and the Vulkan
+             * rasterizer flood is a parked follow-up. */
+            (char *)"--use-angle=swiftshader",
+            (char *)"--enable-unsafe-swiftshader",
             /* slice 33: the browser DIES at ~20s from FATAL "GPU process isn't
              * usable. Goodbye." (gpu_data_manager_impl_private.cc:417) after the
              * separate GPU process hangs in Mojo bootstrap and its watchdog
@@ -7406,6 +7473,16 @@ void _start(void) {
              * Without the switch the JS goes straight to handleCommands(). */
             (char *)"--disable-dev-shm-usage",
             (char *)"--disable-crash-reporter",
+            /* Slice 38 iter 6: chrome's in-process StackDumpSignalHandler has
+             * been HIDING every GPU fault: it catches the SEGV, prints one
+             * line, then its own stack-scan unwinder runs OFF THE TOP of the
+             * 8 MiB thread stack (iter-5: secondary #PF at stack_top+0 ==
+             * 0x102f09801000, misread for two iterations as a stale libvulkan
+             * base) and wedges the whole browser in futex/epoll forever.
+             * Without the handler the kernel's EXCEPTION dump fires at the
+             * TRUE rip with full registers, and the process dies instead of
+             * wedging, so the harness completes and dumps the netlog. */
+            (char *)"--disable-in-process-stack-traces",
             (char *)"--no-first-run",
             (char *)"--enable-logging=stderr",
             (char *)"--user-data-dir=/data/cr",
@@ -7430,25 +7507,27 @@ void _start(void) {
              * EXACT net_error for the https failure after chrome exits (official
              * builds strip the stderr error). Scanned below. */
             (char *)"--log-net-log=/data/netlog.json",
-            /* slice 37: --screenshot is intentionally NOT passed. It forces the
-             * GPU/viz compositor which loads SwiftShader and hits a
-             * deterministic NULL deref (libc+0x8d70d reads NULL+0x308) during GL
-             * init -- the documented render-tier wall (docs/chromium-render-gl-
-             * bug-prompt.md), unchanged by the slice-34 CoW fix. The
-             * [screenshot] check below still fires (reports "absent"), and the
-             * PNG-verify path is kept for when the GL wall is solved. */
+            /* Slice 38: --screenshot IS passed (render-tier front active).
+             * slice 37 diagnosed the deterministic crash it triggers: glibc
+             * __internal_syscall_cancel reads a NULL TCB self-pointer
+             * (fs:0x10 == 0) -> faults at 0x308. The [isr] TLS dump + [tls]
+             * traces in this build localize WHOSE thread pointer went bad. */
+            (char *)"--window-size=800,600",
+            (char *)"--screenshot=/data/shot.png",
             (char *)"--dump-dom",
-            /* Slice 35: a REAL network URL, not a data: URL -- chrome resolves,
-             * connects, fetches and parses a live page (see the networking
-             * fixes in socket.c/syscall.c/tcp.c). Kept on http:// because that
-             * WORKS end-to-end; https:// is blocked by chrome's post-quantum
-             * X25519MLKEM768 key exchange (group 4588), whose ML-KEM path fails
-             * on tobyOS -- root-caused via NetLog, but not disable-able from
-             * chrome-headless-shell (neither --disable-features nor the managed
-             * PostQuantumKeyAgreementEnabled policy are honored by the headless
-             * shell). tobyOS's OWN TLS 1.3 (plain X25519) fetches the same
-             * https URL fine -- see the [https-probe] above. Ledger slice 35. */
-            (char *)"http://example.com/",
+            /* Slice 35 kept this on http:// because https:// died with
+             * ERR_SSL_PROTOCOL_ERROR, attributed to the X25519MLKEM768 key
+             * exchange computing wrongly. Slice 38 REFUTED the math theory
+             * (linux-mlkem: kyber768 keygen/encaps/decaps checksums are
+             * bit-identical to the host, 3-proc concurrent) and found the
+             * REAL bug class: premature physical-frame frees (refcount-array
+             * wrap past 1 GiB + unrefcounted memfd pages + refcount-blind
+             * munmap/brk frees) that corrupt any big fork-churning process
+             * -- the network service's handshake state included. This run
+             * retests https WITH those fixes. --ignore-certificate-errors
+             * keeps cert-trust noise out of the handshake signal. */
+            (char *)"--ignore-certificate-errors",
+            (char *)"https://example.com/",
             0,
         };
         char *envp[] = {
@@ -7464,6 +7543,39 @@ void _start(void) {
              * loader narrate ICD/layer/extension discovery when debugging. */
             (char *)"VK_ICD_FILENAMES=/opt/chrome/vk_swiftshader_icd.json",
             (char *)"DISPLAY=:0",
+            /* Slice 38 iter 10: pin the Vulkan libs in memory for the process
+             * lifetime. Root cause of the GPU-thread death (and the original
+             * libc+0x8d70d "NULL+0x308" wall, which symbolizes to the
+             * dlopen/dlerror cluster, NOT __internal_syscall_cancel): ANGLE's
+             * first vkCreateInstance attempt fails, it dlcloses libvulkan +
+             * the SwiftShader ICD (munmaps @5146/5153ms), and chrome's second
+             * dlopen("libvulkan.so.1") @5652ms re-maps the lib; ld.so's
+             * do_lookup_x then walks a search-scope r_list array that the
+             * dlclose freed -- through chrome's allocator shim, so the freed
+             * memory carries PartitionAlloc's 0xbadbad00 poison -- and #GPs
+             * on the poisoned link_map pointer (caught in the act: EXCEPTION
+             * 13 rip=ld.so+0xa237 rax=0xbadbad00badbad00; a runaway ~16MB
+             * memcpy over the GPU thread's stack/TCB in the sibling run was
+             * the same walk reading a poisoned string pointer). Preloading
+             * both libs keeps their refcount >= 1 so dlclose never actually
+             * unloads or frees scope arrays: the retry path becomes a pure
+             * name-cache hit, sidestepping the use-after-free entirely. */
+            (char *)"LD_PRELOAD=/opt/chrome/libvulkan.so.1:/opt/chrome/libvk_swiftshader.so",
+            /* Slice 38 iter 14: fontconfig. Without a config it finds ZERO
+             * fonts and pages paint background-only (the #eee screenshot).
+             * The conf points at /etc, where the kernel's own Lato faces
+             * already live, and aliases system-ui/sans-serif to Lato. */
+            (char *)"FONTCONFIG_FILE=/etc/fonts/fonts.conf",
+            /* Slice 38 iter 3: VK_LOADER_DEBUG=all is GONE. It made the
+             * loader LOG during vkCreateInstance, and each log line walks
+             * the debug-utils messenger list and calls back into chrome's
+             * ANGLE messenger callback -- both iter-1 (libvulkan+0x3cdbf,
+             * r14=ICU-string garbage) and iter-2 (#GP via a chrome CFI
+             * thunk from the same util_SubmitDebugUtilsMessage walk,
+             * libvulkan vkCreateInstance+0x19b -> loader_log+0x1da)
+             * crashed INSIDE that dispatch. The instrumentation was the
+             * trigger; without it vkCreateInstance doesn't fire messenger
+             * callbacks and init proceeds to the real GL wall. */
             0,
         };
         struct proc_spec spec = {
@@ -7474,7 +7586,15 @@ void _start(void) {
              * took this 15 -> 14; leaving it at 15 made proc_spawn read past the
              * terminator and fail, which the arm below misreports as "binary not
              * present". Re-count whenever you touch argv. */
-            .argc = 17, .argv = argv, .envc = 7, .envp = envp,
+            /* slice 38 recount: 21 argv (added --use-gl/--use-angle/
+             * --enable-unsafe-swiftshader/--window-size/--screenshot/
+             * --ignore-certificate-errors, removed the --disable-gpu trio;
+             * iter 6 added --disable-in-process-stack-traces),
+             * 9 envp (VK_LOADER_DEBUG added in iter 2, dropped in iter 3 --
+             * it triggered the messenger-walk crash; iter 10 added
+             * LD_PRELOAD to pin the Vulkan libs against the dlclose/dlopen
+             * scope use-after-free; iter 14 added FONTCONFIG_FILE). */
+            .argc = 21, .argv = argv, .envc = 9, .envp = envp,
         };
         kprintf("[boot] CHROMIUM: spawning REAL headless Chromium "
                 "(chrome-headless-shell --dump-dom); the DELIVERABLE is the "
@@ -7513,6 +7633,27 @@ void _start(void) {
                     kprintf("[screenshot] /data/shot.png = %lu bytes, PNG magic %s "
                             "-- RENDER TIER PRODUCED PIXELS\n",
                             (unsigned long)sst.size, magic ? "OK" : "MISSING");
+                    /* Iter 7: dump the PNG as hex between markers so the host
+                     * can reconstruct and VIEW it (xxd -r -p). A blank-white
+                     * 800x600 and a real render of example.com are both
+                     * "valid PNGs"; only eyeballs tell them apart. */
+                    if (png && magic) {
+                        const uint8_t *pb = (const uint8_t *)png;
+                        static const char hx[] = "0123456789abcdef";
+                        kprintf("[shotdump] BEGIN %lu bytes\n",
+                                (unsigned long)pn);
+                        char hline[129];
+                        for (size_t off = 0; off < pn; off += 64) {
+                            size_t nb = pn - off > 64 ? 64 : pn - off;
+                            for (size_t j = 0; j < nb; j++) {
+                                hline[j*2]   = hx[pb[off+j] >> 4];
+                                hline[j*2+1] = hx[pb[off+j] & 0xf];
+                            }
+                            hline[nb*2] = 0;
+                            kprintf("[shd] %s\n", hline);
+                        }
+                        kprintf("[shotdump] END\n");
+                    }
                     if (png) kfree(png);
                 } else {
                     kprintf("[screenshot] /data/shot.png absent -- no pixels "
@@ -7554,6 +7695,27 @@ void _start(void) {
                         kprintf("[netlog] <%s> ..%s..\n", kw, win);
                     }
                 }
+                /* Slice 38 iter 4: the https handshake now COMPLETES
+                 * (exchange_group 4588 = X25519MLKEM768) but the dumped DOM
+                 * came back EMPTY -- the request/response story lives in the
+                 * URL_REQUEST / HTTP2 events. Dump the WHOLE netlog between
+                 * markers (serial is a file sink; ~100 KiB is fine) so the
+                 * post-handshake failure can be read offline. Non-printables
+                 * are dotted; chunked to respect kprintf's format buffer. */
+                kprintf("[netlogdump] BEGIN %lu bytes\n", (unsigned long)nlsz);
+                {
+                    char chunk[257];
+                    for (size_t off = 0; off < nlsz; off += 256) {
+                        size_t nchunk = nlsz - off > 256 ? 256 : nlsz - off;
+                        for (size_t j = 0; j < nchunk; j++) {
+                            char ch = s[off + j];
+                            chunk[j] = (ch >= 32 && ch < 127) ? ch : '.';
+                        }
+                        chunk[nchunk] = 0;
+                        kprintf("[nld] %s\n", chunk);
+                    }
+                }
+                kprintf("[netlogdump] END\n");
                 kfree(nl);
             } else {
                 kprintf("[netlog] /data/netlog.json not present (chrome may not "

@@ -43,6 +43,7 @@
 #include <tobyos/cpu.h>
 #include <tobyos/spinlock.h>
 #include <tobyos/page_fault.h>   /* page_ref_* for CoW-aware teardown */
+#include <tobyos/smp.h>          /* per-CPU editor root (see g_pml4_cpu) */
 
 /* ---- architectural PTE bits ---- */
 
@@ -59,6 +60,14 @@
 /* Software MAP_SHARED marker -- MUST equal PTE_SHARED in tobyos/page_fault.h
  * (this file keeps its own architectural defines). Hardware-ignored bit. */
 #define PTE_SHARED_SW (1ULL << 52)
+/* Software bits owned by page_fault.c (see include/tobyos/page_fault.h):
+ * CoW / demand-zero / swapped markers. vmm_protect must PRESERVE them --
+ * rebuilding a PTE from prot bits alone stripped PTE_COW from post-fork
+ * pages, and an mprotect(RW) then granted DIRECT write access to a frame
+ * still shared with the fork sibling (silent cross-process corruption). */
+#define PTE_COW_SW    (1ULL << 9)
+#define PTE_DEMAND_SW (1ULL << 10)
+#define PTE_SWAP_SW   (1ULL << 11)
 
 /* PAT-select bit. Its position depends on the leaf size: bit 7 in a 4 KiB
  * PT entry, but bit 12 in a 2 MiB PD leaf (bit 7 there is PS). Combined
@@ -96,8 +105,36 @@ typedef uint64_t pte_t;
  * Defaults to the kernel PML4 (set by vmm_init); milestone-5 process
  * setup temporarily swaps it via vmm_set_active_root. CR3 is unrelated;
  * see vmm_set_active_root for the rationale. */
-static pte_t   *g_pml4;
-static uint64_t g_pml4_phys;
+/* THE EDITOR ROOT IS PER-CPU (slice 38 iter 25). It was a single global,
+ * and every mapper does an UNLOCKED  saved = set_editor(p->cr3); ...edit...;
+ * set_editor(saved)  around its work. Two CPUs inside mmap/munmap/mprotect/
+ * demand-fault paths at once (chrome: browser threads + renderer + gpu all
+ * storm mmap concurrently) swapped the root out from under each other, so
+ * CPU A's vmm_map/vmm_unmap edited CPU B's process's page tables:
+ * committed pages landed in the wrong address space and -- far worse --
+ * munmap/madvise UNMAPPED AND FREED a victim process's live frames. The
+ * victim's next read of its own data demand-faulted to a fresh ZERO page:
+ * observed as SwiftShader walking a descriptor array chrome had fully
+ * written and finding 136 consecutive zero pages (pfres ring, iter 25),
+ * then marching off the end into a PROT_NONE guard.
+ *
+ * Per-CPU roots fix both directions: CPUs can't clobber each other, and
+ * same-CPU preemption is safe because set/restore pairs nest LIFO on one
+ * CPU (the preemptor saves the preempted thread's root and restores it
+ * before the preempted thread resumes). */
+static pte_t   *g_pml4_cpu[MAX_CPUS];
+static uint64_t g_pml4_phys_cpu[MAX_CPUS];
+
+static inline uint32_t vmm_ed_idx(void) {
+    struct percpu *pc = smp_this_cpu();       /* BSP slot before SMP init */
+    uint32_t i = pc ? pc->cpu_idx : 0;
+    return i < MAX_CPUS ? i : 0;
+}
+/* Keep every existing use site verbatim: g_pml4 / g_pml4_phys now name
+ * THIS CPU's editor root. vmm_init fills every slot with the kernel PML4
+ * so CPUs that never called set_editor walk the kernel root as before. */
+#define g_pml4      (g_pml4_cpu[vmm_ed_idx()])
+#define g_pml4_phys (g_pml4_phys_cpu[vmm_ed_idx()])
 /* Ground-truth kernel PML4 phys -- captured once at vmm_init and never
  * touched again. vmm_set_active_root(0) restores from this. */
 static uint64_t g_kernel_pml4_phys;
@@ -184,6 +221,74 @@ static unsigned long g_map4k_remaps;
 
 unsigned long vmm_remap_count(void) { return g_map4k_remaps; }
 
+#ifdef CHROMIUM_BOOT
+/* Slice 38 iter 24: PAGE JOURNAL. The deterministic SwiftShader-JIT crash is
+ * a store-then-load mismatch on ONE stack page (spilled rsi reads back a
+ * previous invocation's value; four of six spills vanish, on -smp 1 too).
+ * Every mechanism I can derive on paper survives scrutiny, so record every
+ * PTE mutation (map/remap/unmap/protect/CoW/demand/madvise) with timestamp,
+ * actor pid and frames, and dump the history of the crashing page at fatal
+ * fault time. 64K entries x 32B = 2MB BSS, covers several seconds of chrome
+ * churn -- the interesting window is <1s. */
+struct pgj_ev {
+    uint32_t ms;
+    uint8_t  kind;
+    int16_t  pid;
+    uint64_t va;                   /* page-aligned */
+    uint64_t phys;                 /* new frame (or old, per kind) */
+    uint64_t aux;                  /* kind-specific: old frame / flags */
+};
+#define PGJ_RING (1u << 18)   /* one fork WP-bursts ~100K events; keep 2+ */
+static struct pgj_ev g_pgj[PGJ_RING];
+static uint32_t g_pgj_head;
+static const char *pgj_kind_name(uint8_t k) {
+    switch (k) {
+    case 1:  return "map4k";
+    case 2:  return "map4k-REMAP";      /* over a present PTE: aux=old pte */
+    case 3:  return "unmap";
+    case 4:  return "protect";          /* aux=new leaf flags */
+    case 5:  return "cow-sole";         /* write-enable in place */
+    case 6:  return "cow-copy";         /* phys=new frame aux=old frame */
+    case 7:  return "demand-zero";      /* page_fault.c case 2 (PTE_DEMAND) */
+    case 8:  return "case3-grant";      /* stale-registry present write grant */
+    case 9:  return "case3-map";        /* stale-registry zero-page map */
+    case 10: return "mmap-demand";      /* mmap.c demand-zero fill */
+    case 11: return "madvise-drop";
+    case 12: return "stack-grow";
+    case 13: return "cow-fork-wp";      /* fork write-protected this page */
+    default: return "?";
+    }
+}
+extern uint64_t klog_ms(void);
+extern int proc_current_pid_dbg(void);
+void pgj_note(uint8_t kind, uint64_t va, uint64_t phys, uint64_t aux) {
+    uint32_t idx = __atomic_fetch_add(&g_pgj_head, 1, __ATOMIC_RELAXED);
+    struct pgj_ev *e = &g_pgj[idx % PGJ_RING];
+    e->ms   = (uint32_t)klog_ms();
+    e->kind = kind;
+    e->pid  = (int16_t)proc_current_pid_dbg();
+    e->va   = va & ~0xfffULL;
+    e->phys = phys;
+    e->aux  = aux;
+}
+void pgj_dump(uint64_t va) {
+    va &= ~0xfffULL;
+    uint32_t n = g_pgj_head < PGJ_RING ? g_pgj_head : PGJ_RING;
+    kprintf("[pgj] journal for page %p (%u events total):\n",
+            (void *)va, (unsigned)g_pgj_head);
+    int shown = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        struct pgj_ev *e = &g_pgj[(g_pgj_head - n + k) % PGJ_RING];
+        if (e->va != va) continue;
+        kprintf("  [pgj] %ums pid=%d %s phys=%p aux=%p\n",
+                (unsigned)e->ms, (int)e->pid, pgj_kind_name(e->kind),
+                (void *)e->phys, (void *)e->aux);
+        if (++shown >= 64) { kprintf("  [pgj] (truncated)\n"); break; }
+    }
+    if (!shown) kprintf("  [pgj] (no events)\n");
+}
+#endif
+
 static bool map_4k(uint64_t virt, uint64_t phys, uint32_t flags) {
     pte_t *pdpt = next_table(g_pml4, pml4_idx(virt), flags, true);
     if (!pdpt) return false;
@@ -193,7 +298,9 @@ static bool map_4k(uint64_t virt, uint64_t phys, uint32_t flags) {
     if (!pt)   return false;
 
     size_t i = pt_idx(virt);
-    if (pt[i] & PTE_P) {
+    bool was_present = (pt[i] & PTE_P) != 0;
+    uint64_t old_entry = pt[i];
+    if (was_present) {
         /* Remapping an existing 4K page is legal (the entry is overwritten
          * below) -- this is a diagnostic, not an error. Rate-limited because a
          * multi-process chrome run produced ~165k of these in one boot, which
@@ -212,6 +319,13 @@ static bool map_4k(uint64_t virt, uint64_t phys, uint32_t flags) {
     if (flags & VMM_WC) leaf |= PTE_PAT_4K;   /* PCD=PWT=0 + PAT => slot 4 (WC) */
     pt[i] = (phys & PTE_ADDR_MASK) | leaf;
     invlpg(virt);
+#ifdef CHROMIUM_BOOT
+    /* Only journal USER-half pages: kernel-half map churn (HHDM etc) would
+     * flood the ring without ever being the page we autopsy. */
+    if (virt < 0x0000800000000000ULL)
+        pgj_note(was_present ? 2 : 1, virt, phys & PTE_ADDR_MASK,
+                 was_present ? old_entry : leaf);
+#endif
     return true;
 }
 
@@ -297,6 +411,10 @@ static size_t unmap_one(uint64_t virt) {
     pte_t *pt = phys_to_table(pde & PTE_ADDR_MASK);
     size_t i  = pt_idx(virt);
     if (!(pt[i] & PTE_P)) return 0;
+#ifdef CHROMIUM_BOOT
+    if (virt < 0x0000800000000000ULL)
+        pgj_note(3, virt, pt[i] & PTE_ADDR_MASK, pt[i]);
+#endif
     pt[i] = 0;
     invlpg(virt);
     return PAGE_SIZE;
@@ -369,9 +487,21 @@ bool vmm_protect(uint64_t virt, size_t bytes, uint32_t flags) {
         /* Preserve the MAP_SHARED software marker: mprotect callers rebuild
          * flags from prot bits alone and know nothing about sharing, but the
          * no-CoW-at-fork guarantee must survive any mprotect (chrome
-         * mprotects inside live shared regions). */
-        pt[i] = (pt[i] & (PTE_ADDR_MASK | PTE_SHARED_SW)) | leaf_flags;
+         * mprotects inside live shared regions). Same for the CoW/demand/
+         * swap software bits -- and if the page is still CoW-shared, do NOT
+         * grant write here: the frame has other owners. Leave it read-only
+         * with PTE_COW intact; the first write faults into the CoW handler,
+         * which does the refcounted copy-out and THEN grants write. */
+        uint64_t prev = pt[i];
+        uint64_t nf = leaf_flags;
+        if (prev & PTE_COW_SW) nf &= ~PTE_RW;
+        pt[i] = (prev & (PTE_ADDR_MASK | PTE_SHARED_SW | PTE_COW_SW |
+                         PTE_DEMAND_SW | PTE_SWAP_SW)) | nf;
         invlpg(v);
+#ifdef CHROMIUM_BOOT
+        if (v < 0x0000800000000000ULL)
+            pgj_note(4, v, pt[i] & PTE_ADDR_MASK, prev);
+#endif
     }
     spin_unlock_irqrestore(&g_vmm_lock, saved);
     return ok;
@@ -480,9 +610,12 @@ uint64_t vmm_create_user_pml4(void) {
 
     /* Mirror the kernel half by entry-copy. Entries 256..511 reference
      * shared PDPT pages; their address+flags are identical between
-     * the kernel PML4 and every per-process PML4. */
+     * the kernel PML4 and every per-process PML4. Copy from the KERNEL
+     * PML4 explicitly -- the (per-CPU) editor root may be pointing at a
+     * user PML4 when this is called from fork/spawn. */
+    pte_t *kroot = phys_to_table(g_kernel_pml4_phys);
     for (size_t i = 256; i < 512; i++) {
-        new_pml4[i] = g_pml4[i];
+        new_pml4[i] = kroot[i];
     }
     return phys;
 }
@@ -702,9 +835,13 @@ void vmm_init(struct limine_memmap_response *memmap) {
 
     enable_nxe();
 
-    g_pml4_phys        = alloc_table();
-    g_kernel_pml4_phys = g_pml4_phys;
-    g_pml4             = phys_to_table(g_pml4_phys);
+    g_kernel_pml4_phys = alloc_table();
+    /* Every CPU's editor root starts at the kernel PML4 -- including CPUs
+     * not yet online (their first editor access must not walk NULL). */
+    for (uint32_t ci = 0; ci < MAX_CPUS; ci++) {
+        g_pml4_phys_cpu[ci] = g_kernel_pml4_phys;
+        g_pml4_cpu[ci]      = phys_to_table(g_kernel_pml4_phys);
+    }
 
     /* ---- 1. mirror HHDM in 2 MiB pages ----
      *

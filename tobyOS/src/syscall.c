@@ -266,6 +266,80 @@ static long sys_write(int fd, const void *buf, size_t len) {
 
 static long evdev_read(unsigned dev, uint64_t ubuf, size_t len); /* evdev dev, below */
 
+#ifdef CHROMIUM_BOOT
+/* Slice 38 iter 12 [rdchk]: the netlog proved chrome SENT the fatal
+ * protocol_version alert (SSL_ALERT_SENT 02 46) right after a 511-byte read,
+ * while the ring-exit framing tracker saw the SAME stream leave rx_pop with
+ * clean 17/0303 record headers. BoringSSL only sends alert 70 when a RECORD
+ * HEADER parses wrong, so the bytes must differ between the kernel bounce
+ * buffer and BoringSSL's parser. The one kernel step in between is
+ * copy_to_user into chrome's (demand-paged, PartitionAlloc-fresh) read
+ * buffer. Verify it: after every 443-socket read, copy the user buffer BACK
+ * and memcmp against the bounce buffer. A mismatch names the kernel
+ * (copy_to_user / demand-page / CoW frame swap); a clean compare exiles the
+ * corruption into chrome's address space. Also log every read's (cap, rv):
+ * the 511-vs-512 ledger discrepancy resolves here too. */
+static void rdchk_verify(struct tcp_conn *tc, int fd, const void *kbuf,
+                         uint64_t ubuf, long rv, size_t cap) {
+    static int rd_logs;
+    if (!tc) return;
+    uint16_t pbe = tcp_remote_port_be(tc);
+    uint16_t rp  = (uint16_t)((pbe >> 8) | (pbe << 8));
+    if (rp != 443) return;
+    if (rd_logs >= 96) return;
+    rd_logs++;
+    struct proc *me = current_proc();
+    if (rv <= 0) {
+        kprintf("[rdchk] pid=%d fd=%d cap=%lu rv=%ld\n",
+                me ? me->pid : -1, fd, (unsigned long)cap, rv);
+        return;
+    }
+    size_t vn = (size_t)rv;
+    if (vn > 4096) vn = 4096;
+    void *vb = kmalloc(vn);
+    if (!vb) return;
+    long bad = -1;
+    if (copy_from_user_nofault(vb, (const void *)(uintptr_t)ubuf, vn) != 0) {
+        bad = -2;                      /* user buffer unreadable?! */
+    } else {
+        for (size_t i = 0; i < vn; i++)
+            if (((const uint8_t *)vb)[i] != ((const uint8_t *)kbuf)[i]) {
+                bad = (long)i;
+                break;
+            }
+    }
+    if (bad == -1) {
+        kprintf("[rdchk] pid=%d fd=%d cap=%lu rv=%ld verify=OK\n",
+                me ? me->pid : -1, fd, (unsigned long)cap, rv);
+    } else if (bad == -2) {
+        kprintf("[rdchk] pid=%d fd=%d cap=%lu rv=%ld verify=UNREADABLE ubuf=%p\n",
+                me ? me->pid : -1, fd, (unsigned long)cap, rv,
+                (void *)(uintptr_t)ubuf);
+    } else {
+        kprintf("[rdchk] pid=%d fd=%d cap=%lu rv=%ld MISMATCH at +%ld ubuf=%p\n",
+                me ? me->pid : -1, fd, (unsigned long)cap, rv, bad,
+                (void *)(uintptr_t)ubuf);
+        size_t w0 = (bad >= 8) ? (size_t)bad - 8 : 0;
+        size_t wn = vn - w0 > 24 ? 24 : vn - w0;
+        char hx[49];
+        static const char hc[] = "0123456789abcdef";
+        for (size_t i = 0; i < wn; i++) {
+            hx[i*2]   = hc[((const uint8_t *)kbuf)[w0+i] >> 4];
+            hx[i*2+1] = hc[((const uint8_t *)kbuf)[w0+i] & 0xf];
+        }
+        hx[wn*2] = 0;
+        kprintf("[rdchk]   kernel+%lu: %s\n", (unsigned long)w0, hx);
+        for (size_t i = 0; i < wn; i++) {
+            hx[i*2]   = hc[((const uint8_t *)vb)[w0+i] >> 4];
+            hx[i*2+1] = hc[((const uint8_t *)vb)[w0+i] & 0xf];
+        }
+        hx[wn*2] = 0;
+        kprintf("[rdchk]   user  +%lu: %s\n", (unsigned long)w0, hx);
+    }
+    kfree(vb);
+}
+#endif
+
 static long sys_read(int fd, void *buf, size_t len) {
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
@@ -278,6 +352,11 @@ static long sys_read(int fd, void *buf, size_t len) {
     if (!k) return -ABI_ENOMEM;
     long rv = file_read(f, k, len);
     if (rv > 0 && copy_to_user(buf, k, (size_t)rv) != 0) rv = -ABI_EFAULT;
+#ifdef CHROMIUM_BOOT
+    if (f->kind == FILE_KIND_SOCKET && f->sock &&
+        f->sock->kind == SOCK_KIND_TCP && f->sock->tcp && !f->sock->tcp_listening)
+        rdchk_verify(f->sock->tcp, fd, k, (uint64_t)(uintptr_t)buf, rv, len);
+#endif
     kfree(k);
     return rv;
 }
@@ -4266,6 +4345,11 @@ enum {
     LX_faccessat = 269, LX_faccessat2 = 439,
     /* Track C: libcurl's multi handle creates an eventfd as its wakeup fd. */
     LX_eventfd = 284, LX_eventfd2 = 290,
+    /* Slice 38: chrome's headless screenshot writer (base::WriteFile ->
+     * base::File) creates the PNG with creat() and chowns it -- creat was
+     * the LAST blocker between a captured frame and /data/shot.png. */
+    LX_creat = 85, LX_fchown = 93,
+    LX_sched_getparam = 143, LX_sched_getscheduler = 145,
 };
 
 /* arch_prctl codes. */
@@ -5082,15 +5166,32 @@ static long lx_eventfd(unsigned int initval, unsigned int flags) {
                              LX_MFD_HUGETLB | LX_MFD_NOEXEC_SEAL | LX_MFD_EXEC)
 
 static long lx_memfd_create(const char *uname, unsigned int flags) {
-    (void)uname;
     /* Linux REJECTS unknown flag bits with -EINVAL, and callers rely on it:
      * chrome's Mojo channel PROBES support by calling memfd_create(name, ~0u)
      * and expecting -EINVAL. Accepting everything (the old `(void)flags`) handed
      * it a valid fd, so it concluded the kernel was broken and hit the FATAL
      * Check at mojo/core/channel_linux.cc:947. Validate like Linux does. */
 #ifdef CHROMIUM_BOOT
-    { static int c=0; if(c<24){c++; kprintf("[memfd] create req flags=0x%x%s\n",
-        flags, (flags & ~LX_MFD_KNOWN_FLAGS) ? " -> EINVAL(unknown bits)" : " -> ok"); } }
+    /* Iter 20: log the NAME -- it identifies the memfd's owner subsystem
+     * (V8 names its code memfds, Mojo its channels, etc). The JIT arena the
+     * browser thread crashes executing from is memfd-backed; the name says
+     * WHOSE JIT it is. */
+    { static int c=0; if(c<48){c++;
+        char nm[48]; int ni = 0;
+        /* byte-at-a-time: a bulk copy of the full buffer can cross into an
+         * unmapped page past a short name and spuriously fail */
+        while (uname && ni < (int)sizeof nm - 1) {
+            if (copy_from_user_nofault(&nm[ni], uname + ni, 1) != 0) break;
+            if (!nm[ni]) break;
+            ni++;
+        }
+        nm[ni] = 0;
+        struct proc *mp = current_proc();
+        kprintf("[memfd] pid=%d create name='%s' flags=0x%x%s\n",
+            mp ? mp->pid : -1, nm, flags,
+            (flags & ~LX_MFD_KNOWN_FLAGS) ? " -> EINVAL(unknown bits)" : " -> ok"); } }
+#else
+    (void)uname;
 #endif
     if (flags & ~LX_MFD_KNOWN_FLAGS) return -ABI_EINVAL;
     struct memfd *mf = memfd_new();
@@ -5585,6 +5686,33 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
     if (s->kind != SOCK_KIND_TCP || !s->tcp) return -LXE_ENOTSOCK;
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+
+    /* MSG_PEEK must NOT consume. Chrome's IsConnectedAndIdle() peeks one
+     * byte off sockets it hands to a new H2 session; consuming it shifted
+     * the TLS record stream by one byte and killed every HTTPS load with
+     * alert 70 / ERR_SSL_PROTOCOL_ERROR (see tcp_peek). */
+    if (flags & LX_MSG_PEEK) {
+        void *pk = kmalloc(len);
+        if (!pk) return -ABI_ENOMEM;
+        long pn = tcp_peek(s->tcp, pk, len);
+        long prv;
+        if (pn < 0)       prv = 0;                   /* peer closed -> EOF */
+        else if (pn == 0) prv = -LXE_EAGAIN;         /* nothing buffered yet */
+        else if (copy_to_user((void *)(uintptr_t)ubuf, pk, (size_t)pn) != 0)
+            prv = -ABI_EFAULT;
+        else prv = pn;
+#ifdef CHROMIUM_BOOT
+        {   static int pk_logs;
+            if (pk_logs < 16) { pk_logs++;
+                struct proc *me = current_proc();
+                kprintf("[rdchk] pid=%d fd=%d PEEK cap=%lu -> %ld\n",
+                        me ? me->pid : -1, fd, (unsigned long)len, prv);
+            } }
+#endif
+        kfree(pk);
+        return prv;
+    }
+
     void *k = kmalloc(len);
     if (!k) return -ABI_ENOMEM;
     uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
@@ -5594,6 +5722,9 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
     else if (n < 0) rv = -LXE_ECONNREFUSED;
     else if (copy_to_user((void *)(uintptr_t)ubuf, k, (size_t)n) != 0) rv = -ABI_EFAULT;
     else rv = n;
+#ifdef CHROMIUM_BOOT
+    rdchk_verify(s->tcp, fd, k, ubuf, rv, len);
+#endif
     kfree(k);
     if (rv >= 0 && uaddr) {              /* connected: report family only */
         struct sockaddr_in sa; memset(&sa, 0, sizeof sa); sa.sin_family = AF_INET;
@@ -5995,10 +6126,16 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
         if (n < 0)                 { kfree(k); return -LXE_EAGAIN; }
         if (n == 0 && to)          { kfree(k); return -LXE_EAGAIN; }
     } else if (s->kind == SOCK_KIND_TCP && s->tcp) {
+        if (flags & LX_MSG_PEEK) {               /* never consume (see lx_recv) */
+            n = tcp_peek(s->tcp, k, total);
+            if (n < 0)       n = 0;              /* peer closed -> EOF */
+            else if (n == 0) { kfree(k); return -LXE_EAGAIN; }
+        } else {
         uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
         n = tcp_recv(s->tcp, k, total, to);
         if (n == -1)      n = 0;                 /* peer closed -> EOF */
         else if (n < 0)   { kfree(k); return -LXE_ECONNREFUSED; }
+        }
     } else if (s->kind == SOCK_KIND_UNIX) {
         /* AF_UNIX stream: libxcb reads the X setup + events via recvmsg (this was
          * the wall -- ENOTSOCK here made xcb_connect() report XCB_CONN_ERROR even
@@ -6039,6 +6176,14 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
         }
         off += l;
     }
+#ifdef CHROMIUM_BOOT
+    /* Verify the first iovec only: chrome's TCP reads are single-iovec. */
+    if (s->kind == SOCK_KIND_TCP && s->tcp && n > 0 && nio > 0) {
+        size_t l0 = (size_t)iov[0].iov_len;
+        if (l0 > (size_t)n) l0 = (size_t)n;
+        rdchk_verify(s->tcp, fd, k, (uint64_t)iov[0].iov_base, (long)l0, total);
+    }
+#endif
     kfree(k);
 
     /* Fill the sender address (UDP) / family (TCP) and clear ancillary. */
@@ -6490,6 +6635,25 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 #endif
         return ofd;
     }
+    case LX_creat:                     /* (path, mode) */
+        /* creat(2) == open(path, O_WRONLY|O_CREAT|O_TRUNC, mode). Linux bits:
+         * O_WRONLY=1 O_CREAT=0x40 O_TRUNC=0x200. chrome's screenshot writer
+         * (headless_command_handler -> base::WriteFile) creates the PNG this
+         * way; ENOSYS here was the only thing between a successfully captured
+         * SwiftShader frame and /data/shot.png (slice 38 iter 3). */
+        return do_syscall(SYS_OPEN, a1, 0x241, a2, 0, 0);
+    case LX_fchown:                    /* (fd, owner, group) */
+        /* Single-user OS: ownership is a no-op; report success so file
+         * writers that chown their output don't error out. */
+        return 0;
+    case LX_sched_getparam: {          /* (pid, struct sched_param *) */
+        int zero = 0;
+        if (a2 && copy_to_user((void *)a2, &zero, sizeof zero) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
+    case LX_sched_getscheduler:        /* (pid) -> SCHED_OTHER */
+        return 0;
     case LX_dup:    return do_syscall(SYS_DUP, a1, 0, 0, 0, 0);
     /* B12: shell pipelines wire stage fds with dup2/dup3 and create the pipe
      * with pipe or pipe2. dup3's flags (O_CLOEXEC) and pipe2's flags
@@ -6952,9 +7116,17 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_rseq:
         return -ABI_ENOSYS;
 
-    /* madvise(): purely advisory; we don't reclaim on advice. Accept all and
-     * report success (a real kernel may also no-op MADV_DONTNEED etc.). */
+    /* madvise(): mostly advisory -- EXCEPT MADV_DONTNEED (4), which on Linux
+     * has hard semantics for private anon memory: the pages are dropped and
+     * the next touch reads ZEROS. Chrome's PartitionAlloc discards free slot
+     * spans with it and its zero-fill (calloc) path skips memset for slots on
+     * freshly-committed pages; no-opping DONTNEED handed those allocations
+     * back full of dead data (measured: retired SwiftShader framebuffer
+     * pixels 0xff000000... inside NSPR's calloc'd locks -> #GP in PR_Unlock,
+     * slice 38). MADV_FREE (8) stays a legal no-op (lazy semantics). */
     case LX_madvise:
+        if ((int)a3 == 4)                              /* MADV_DONTNEED */
+            return sys_madvise_dontneed((uint64_t)a1, (uint64_t)a2);
         return 0;
 
     /* prlimit64(pid, resource, *new, *old) and the legacy getrlimit/setrlimit.
@@ -7042,7 +7214,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         struct file *tf = fd_lookup((int)a1);
         if (tf && tf->kind == FILE_KIND_MEMFD && (long)a2 >= 0) {
 #ifdef CHROMIUM_BOOT
-            { static int c=0; if(c<24){c++; kprintf("[memfd] ftruncate fd=%d size=%lu\n",(int)a1,(unsigned long)a2);} }
+            { static int c=0; if(c<48){c++; struct proc *mp = current_proc();
+                kprintf("[memfd] pid=%d ftruncate fd=%d size=%lu\n",
+                        mp ? mp->pid : -1, (int)a1,(unsigned long)a2);} }
 #endif
             return memfd_ftruncate(tf->memfd, (uint64_t)a2);   /* allocates pages */
         }
@@ -7102,7 +7276,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             ret = memfd_map((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
                             lx_mmap_flags(lf), mf->memfd, lx_mmap_offset());
 #ifdef CHROMIUM_BOOT
-            { static int c=0; if(c<24){c++; kprintf("[memfd] mmap fd=%d len=0x%lx prot=0x%x -> 0x%lx\n",fd,(unsigned long)a2,(unsigned)a3,(unsigned long)ret);} }
+            { static int c=0; if(c<48){c++; struct proc *mp = current_proc();
+                kprintf("[memfd] pid=%d mmap fd=%d len=0x%lx prot=0x%x %s off=0x%lx -> 0x%lx\n",
+                        mp ? mp->pid : -1, fd,(unsigned long)a2,(unsigned)a3,
+                        (lf & LXMAP_SHARED) ? "SHARED" : "priv",
+                        (unsigned long)lx_mmap_offset(),(unsigned long)ret);} }
 #endif
         }
         else if ((lf & LXMAP_ANONYMOUS) || fd < 0) { /* anonymous (malloc/TLS) */

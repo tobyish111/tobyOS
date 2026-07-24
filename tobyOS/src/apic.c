@@ -39,6 +39,7 @@
 #include <tobyos/pit.h>
 #include <tobyos/isr.h>
 #include <tobyos/sched.h>
+#include <tobyos/smp.h>      /* tlb_shootdown_remote: percpu walk */
 
 /* Single virtual page mapped to LAPIC MMIO. Same kernel virt for every
  * CPU; the page resolves (in HW) to the per-CPU LAPIC. */
@@ -91,6 +92,75 @@ uint32_t apic_read_id(void) {
 
 void apic_eoi(void) {
     lapic_write(LAPIC_REG_EOI, 0);
+}
+
+/* ---- TLB shootdown (slice 38 iter 24) ------------------------------------
+ *
+ * The kernel had NO cross-CPU TLB invalidation. Any PTE downgrade (fork's
+ * CoW write-protect, mprotect, munmap, madvise-drop) or frame CHANGE (CoW
+ * copy-out) only flushed the CPU that executed it. Another CPU that had
+ * the old translation cached kept using it -- observed as chrome's
+ * SwiftShader JIT thread writing four spills through a stale WRITABLE
+ * entry into the pre-CoW-copy GHOST frame, then (after the entry was
+ * evicted mid-sequence) reading the real frame's pre-fork bytes back:
+ * a deterministic "lost store" crash 10.8s after the fork that
+ * write-protected the page (page-journal autopsy, run38 iter 24).
+ *
+ * Design: fixed-vector IPI; the handler reloads CR3 (flushes all
+ * non-global entries) and bumps its per-CPU generation counter. The
+ * sender snapshots every target's generation, sends the IPIs, and spins
+ * until each target's counter moves (or a bounded timeout -- a target
+ * parked with IRQs off can't ack; we warn instead of deadlocking). */
+static volatile uint32_t g_tlb_gen[MAX_CPUS];
+
+static void tlb_shootdown_isr(struct regs *r) {
+    (void)r;
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+    uint32_t idx = smp_this_cpu()->cpu_idx;
+    __atomic_fetch_add(&g_tlb_gen[idx], 1, __ATOMIC_SEQ_CST);
+    apic_eoi();
+}
+
+void tlb_shootdown_remote(void) {
+    if (!g_ready) return;
+    uint32_t n = smp_cpu_count();
+    if (n <= 1) return;
+
+    uint32_t me = smp_this_cpu()->cpu_idx;
+    uint32_t snap[MAX_CPUS];
+    bool     sent[MAX_CPUS] = { false };
+
+    for (uint32_t i = 0; i < n && i < MAX_CPUS; i++) {
+        if (i == me) continue;
+        const struct percpu *c = smp_cpu(i);
+        if (!c || !c->online) continue;
+        snap[i] = g_tlb_gen[i];
+        apic_send_ipi((uint8_t)c->apic_id,
+                      ICR_LEVEL_ASSERT | ICR_TRIGGER_EDGE |
+                      ICR_DEST_PHYSICAL | TLB_SHOOTDOWN_VECTOR);
+        sent[i] = true;
+    }
+
+    /* Bounded wait: a remote CPU spinning with IRQs masked cannot take the
+     * IPI until it re-enables them; it WILL flush before touching user
+     * translations again (the IPI stays pending). Don't deadlock on it. */
+    for (uint32_t i = 0; i < n && i < MAX_CPUS; i++) {
+        if (!sent[i]) continue;
+        uint32_t spins = 0;
+        while (g_tlb_gen[i] == snap[i]) {
+            __asm__ volatile("pause" ::: "memory");
+            if (++spins > 2000000u) {
+                static uint32_t warns;
+                if (warns < 8) {
+                    warns++;
+                    kprintf("[tlb] WARN: cpu%u shootdown ack timeout\n", i);
+                }
+                break;
+            }
+        }
+    }
 }
 
 void apic_send_ipi(uint8_t target_apic_id, uint32_t icr_low) {
@@ -258,5 +328,7 @@ bool apic_init_bsp(void) {
      * same kernel IDTR via the trampoline) so registering here once
      * covers BSP + every AP. */
     isr_register(APIC_TIMER_VECTOR, apic_timer_isr);
+    /* TLB shootdown IPI handler -- shared IDT, so once covers all CPUs. */
+    isr_register(TLB_SHOOTDOWN_VECTOR, tlb_shootdown_isr);
     return true;
 }
