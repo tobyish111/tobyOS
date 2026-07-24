@@ -4916,6 +4916,105 @@ static uint64_t lx_realtime_ns(uint64_t mono_ns) {
 uint64_t g_lx_poll_iters;
 int      g_lx_poll_last_pid = -1;
 
+#ifdef CHROMIUM_BOOT
+/* [clkchk] (slice 41): cross-check that CLOCK_MONOTONIC is actually monotonic
+ * and jump-free as chrome sees it. perf_now_ns() computes ns from ONE global
+ * boot-TSC, but each CPU has its own raw TSC; under WHPX (unlike TCG, which
+ * gives all vCPUs one virtual TSC) those can be unsynchronised, so a thread
+ * migrating CPUs would see the clock leap or run backwards. Chrome's TimeTicks
+ * MUST be monotonic; either pathology wrecks its deadline math and is a prime
+ * suspect for the WHPX clock_gettime storm / "timers fire 100s late". One
+ * shared last-value across all CPUs is intentional: interleaved reads from two
+ * CPUs whose TSCs disagree produce exactly the >250ms / negative delta we log
+ * (with a CPU-CHANGED tag). Threshold is far above any legit read interleave. */
+static void clkchk_probe(uint64_t mono) {
+    static uint64_t last_mono;
+    static int      last_cpu = -1;
+    static int      hits;
+    struct percpu *pc = smp_this_cpu();
+    int cpu = pc ? (int)pc->cpu_idx : -1;
+    uint64_t lm = last_mono;
+    if (lm) {
+        int64_t d = (int64_t)(mono - lm);
+        if ((d < 0 || d > 250000000ll) && hits < 40) {
+            hits++;
+            kprintf("[clkchk] cpu=%d(prev %d) mono=%lums last=%lums "
+                    "delta=%ldms%s\n",
+                    cpu, last_cpu,
+                    (unsigned long)(mono / 1000000ull),
+                    (unsigned long)(lm / 1000000ull),
+                    (long)(d / 1000000ll),
+                    (cpu != last_cpu) ? " [CPU-CHANGED]" : "");
+        }
+    }
+    last_mono = mono;
+    last_cpu  = cpu;
+}
+#endif
+
+/* Lock-free fast path for pure time-read syscalls (slice 41). These read only
+ * the monotonic TSC clock -- no mutable kernel state -- and write a tiny result
+ * to user memory, so when that buffer is ALREADY resident+writable we serve
+ * them WITHOUT the Big Kernel Lock. Under WHPX chrome's message pumps issue
+ * clock_gettime/gettimeofday tens of thousands of times a second; taking the
+ * BKL for each turns them into the system-wide throughput cap and starves the
+ * threads that must run to answer captureScreenshot. Returns 1 iff fully
+ * served (result in *out); 0 means "not handled here" -- the caller must fall
+ * through to the normal BKL path (unknown clock id, or a non-resident buffer
+ * that needs the fault/allocate path). No signals are pending (caller checked),
+ * so there is nothing else the syscall-return path had to do. */
+static int linux_fast_time_syscall(long num, long a1, long a2, long *out) {
+    switch (num) {
+    case LX_clock_gettime: {
+        uint64_t mono = perf_now_ns();
+#ifdef CHROMIUM_BOOT
+        clkchk_probe(mono);
+#endif
+        uint64_t val;
+        switch ((int)a1) {
+        case 0: case 5: case 8:                 /* CLOCK_REALTIME family */
+            val = lx_realtime_ns(mono); break;
+        case 2: case 3:                          /* PROCESS/THREAD_CPUTIME */
+        case 1: case 4: case 6: case 7: case 9:  /* MONOTONIC / BOOTTIME */
+            val = mono; break;
+        default:
+            return 0;                            /* unknown id: normal path -> EINVAL */
+        }
+        if (a2 == 0) { *out = 0; return 1; }
+        struct lx_timespec ts = { (int64_t)(val / 1000000000ull),
+                                  (int64_t)(val % 1000000000ull) };
+        if (copy_to_user_nofault((void *)a2, &ts, sizeof ts) != 0)
+            return 0;                            /* not resident: BKL path handles it */
+        *out = 0;
+        return 1;
+    }
+    case LX_gettimeofday: {
+        uint64_t mono = perf_now_ns();
+#ifdef CHROMIUM_BOOT
+        clkchk_probe(mono);
+#endif
+        if (a1 == 0) { *out = 0; return 1; }     /* tz (a2) ignored, matches slow path */
+        uint64_t ns = lx_realtime_ns(mono);
+        int64_t tv[2] = { (int64_t)(ns / 1000000000ull),
+                          (int64_t)((ns / 1000ull) % 1000000ull) };
+        if (copy_to_user_nofault((void *)a1, tv, sizeof tv) != 0)
+            return 0;
+        *out = 0;
+        return 1;
+    }
+    case LX_clock_getres: {
+        if (a2 == 0) { *out = 0; return 1; }
+        struct lx_timespec ts = { 0, 1 };        /* 1 ns resolution */
+        if (copy_to_user_nofault((void *)a2, &ts, sizeof ts) != 0)
+            return 0;
+        *out = 0;
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
 static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
     if (nfds > LX_POLL_MAXFDS) return -ABI_EINVAL;
     struct lx_pollfd fds[LX_POLL_MAXFDS];
@@ -14885,6 +14984,31 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * bus-driven device (USB MSC, future SATA, future audio) would
      * deadlock the box. */
     sti();
+
+    /* ---- Lock-free time-read fast path (slice 41; WHPX clock_gettime storm).
+     * Serve a handful of pure time-read syscalls WITHOUT the BKL when their
+     * result buffer is already resident+writable. Under WHPX chrome's message
+     * pumps issue clock_gettime/gettimeofday tens of thousands of times a
+     * second; taking the BKL for each makes it the system-wide throughput cap
+     * (see [hb-x]) and starves the compositor/network threads that must run to
+     * produce a frame. linux_fast_time_syscall() returns 0 (falls through to
+     * the normal BKL path) for anything it can't fully serve here -- an unknown
+     * clock id, or a non-resident buffer that needs the fault/allocate path. We
+     * only take it when no signal is pending, so the syscall-return signal-
+     * delivery step below has nothing to do. */
+    {
+        struct proc *ftp = current_proc();
+        if (ftp && ftp->personality == ABI_PERS_LINUX && !ftp->pending_signals) {
+            long frv;
+            if (linux_fast_time_syscall(num, a1, a2, &frv)) {
+                ftp->syscall_count++;
+                perf_inc_total_syscalls();
+                wdog_kick_proc(ftp->pid);
+                cli();      /* match the normal return: mask before the .S unwind */
+                return frv;
+            }
+        }
+    }
 
     /* Big Kernel Lock: serialize the whole syscall body across CPUs so user
      * code parallelizes while the kernel's coarse-locked subsystems stay safe.

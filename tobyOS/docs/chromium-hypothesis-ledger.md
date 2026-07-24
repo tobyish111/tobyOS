@@ -1571,3 +1571,70 @@ console-run screenshot size).
   raise capture cadence only after first paint.
 - The slice-38 teardown flake (silent death ~4s after chrome exit) unseen
   in ~8 slice-40 runs; keep -d cpu_reset in the harness.
+
+
+## SLICE 41 (2026-07-24) — ***WHPX FRAME PRODUCTION.*** example.com renders live
+## under hardware virtualization; the clock was a red herring, the BKL was the wall
+
+Picking up the WHPX handoff (Phase 1: "fix frame production under WHPX"). Prior
+probe: chrome bootstrapped in ~12s under WHPX but returned **ZERO** frames in
+250s, with a `clock_gettime` storm + ~100s network gaps. Two named suspects, in
+order: (1) `clock_gettime` calibration/resolution, (2) BKL contention. Handoff
+said probe the clock first (cheap insurance) — do NOT fix it blind.
+
+### Probe first: the clock is FINE under WHPX (suspect 1 DISPROVEN)
+Two CHROMIUM_BOOT probes added:
+- `[clkchk]` (syscall.c): flags any CLOCK_MONOTONIC read that goes backwards OR
+  jumps >250ms vs the previous read, tagging cross-CPU transitions.
+- per-CPU `g_cpu_mono_ns[]` sampled every timer tick, printed in `[hb-x]`.
+
+Result under WHPX `-smp 4`: the per-CPU mono columns AGREE — cpu0=246660,
+cpu1/2/3=246738, bsp-now=246750 ms; the ~80ms spread is pure sample-age (cpu0
+takes fewer ticks). Every `[clkchk]` hit is FORWARD and monotonic — the 300-570ms
+deltas are early-boot gaps where chrome simply didn't read the clock for that
+long, and the two `[CPU-CHANGED]` hits are forward too. **perf_now_ns() is
+already TSC-backed (nanosecond, calibrated vs the ACPI PM timer) and WHPX keeps
+the per-vCPU TSCs synchronised** — no calibration bug, no desync. The slice-33
+worry about unsynced per-CPU TSCs does NOT manifest under WHPX. Priority flipped
+exactly as the handoff predicted: clock fine ⇒ the BKL is the sole lever.
+
+### The fix: serve pure time reads WITHOUT the BKL
+Every syscall takes the BKL for its whole body (syscall_dispatch). WHPX raises
+the syscall rate ~100x, so chrome's message-pump clock storm (tens of
+thousands/sec of clock_gettime/gettimeofday) turned the BKL into the system-wide
+throughput cap and starved the compositor/network threads that must run to answer
+`Page.captureScreenshot` — hence zero frames.
+
+Those calls read only the monotonic TSC clock (no mutable kernel state) and write
+a tiny result. New lock-free fast path in syscall_dispatch, BEFORE `bkl_enter()`:
+- `linux_fast_time_syscall()` handles clock_gettime / gettimeofday / clock_getres:
+  compute from perf_now_ns(), copy with `copy_to_user_nofault()` — a new
+  write-side twin of copy_from_user_nofault built on `uaccess_probe_writable()`
+  (pure page-table read: present+writable, no fault, no allocation, no vmm
+  mutation ⇒ safe without the BKL and concurrently, same class as the demand
+  faults that already run BKL-free across CPUs since slice 39).
+- Taken ONLY for ABI_PERS_LINUX procs with no pending signal and an
+  already-resident+writable buffer. Anything else (unknown clock id, non-resident
+  buffer, native personality) returns 0 and falls through to the normal BKL path
+  unchanged. Native OS procs never hit it (personality gate).
+
+### Result: PHASE 1 MET
+Same WHPX run (300s): **~470 continuous Page.captureScreenshot frames** (~2fps,
+png=3174) vs the prior run's ZERO. QMP screendump (logs/shotwx_b.png) shows
+example.com FULLY RENDERED in the native Chromium TobyTK window — "Example
+Domain" heading, body copy, blue "Learn more" link on #eee — over HTTPS
+(X25519MLKEM768; tcp[2] -> 104.20.23.154:443, full TLS 1.3 flight), SwiftShader
+pixels, fontconfig text. First frame at guest ~12.5s (chrome start ~4.3s -> TLS
+11.2s -> paint 12.5s). BKL healthy (next-serving=3, never wedged). Base OS
+unregressed: clean-config build (no CHROMIUM_BOOT) + TCG defboot reaches
+login/desktop, ZERO faults.
+
+### Standing / next (Phase 2 = YouTube)
+- `pollit=344M`: poll/select/epoll are still cooperative BUSY-WAIT loops
+  (`scan fds; sched_yield()`), so idle waiters pin host cores at 100% under WHPX.
+  Fine for example.com (frames flow); likely the next bottleneck for YouTube's
+  much heavier V8/render load. Making poll/epoll BLOCK (sleep on fd readiness +
+  a timer deadline) instead of spin is the obvious follow-up.
+- Instruments kept (CHROMIUM_BOOT-gated): `[clkchk]`, per-CPU `mono=` in `[hb-x]`.
+- Committed run39whpx.py / run39shot.py / build39.sh (were on-disk only), per the
+  handoff, so this WHPX result is reproducible.

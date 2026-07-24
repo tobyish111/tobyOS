@@ -404,6 +404,26 @@ int uaccess_probe_resident(uint64_t addr, uint64_t len) {
     return 0;
 }
 
+/* Pure residency+writability probe: is every page of [addr,addr+len) ALREADY
+ * present AND writable? Like uaccess_probe_resident this NEVER calls the fault
+ * handlers and NEVER mutates the address space, so it is safe to call without
+ * the BKL and concurrently across CPUs -- it only reads page-table entries.
+ * Used by the lock-free time-syscall fast path (clock_gettime storm under
+ * WHPX): if the tiny result buffer is already writable we can copy it without
+ * taking the BKL at all; if not, the caller falls back to the normal, BKL-held
+ * copy_to_user path that is allowed to fault/allocate. */
+int uaccess_probe_writable(uint64_t addr, uint64_t len) {
+    struct proc *p = current_proc();
+    if (!p || len == 0) return 0;
+    uint64_t va  = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t end = addr + len;
+    for (; va < end; va += PAGE_SIZE) {
+        uint64_t *pte = get_pte(p->cr3, va);
+        if (!pte || !(*pte & PTE_PRESENT) || !(*pte & PTE_WRITABLE)) return -1;
+    }
+    return 0;
+}
+
 int uaccess_prepare_read(uint64_t addr, uint64_t len) {
     struct proc *p = current_proc();
     if (!p || len == 0) return 0;

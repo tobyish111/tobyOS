@@ -784,9 +784,21 @@ void prof_dump_and_reset(void) {
 }
 #endif
 
+#ifdef CHROMIUM_BOOT
+/* [clkchk] slice 41: each CPU stamps its own CLOCK_MONOTONIC reading here every
+ * timer tick; the BSP prints the whole array in the heartbeat. If the columns
+ * disagree by more than the ~1 tick of sampling skew, the per-CPU TSCs are
+ * unsynchronised (the WHPX-vs-TCG clock difference we are chasing) and
+ * perf_now_ns() is lying to any thread that migrates cores. */
+volatile uint64_t g_cpu_mono_ns[MAX_CPUS];
+#endif
+
 void sched_tick(struct regs *r) {
     struct percpu *me = smp_this_cpu();
     if (me) {
+#ifdef CHROMIUM_BOOT
+        if (me->cpu_idx < MAX_CPUS) g_cpu_mono_ns[me->cpu_idx] = perf_now_ns();
+#endif
         me->timer_ticks++;
         /* Per-core usage sampler: this tick caught the core doing real work
          * unless the interrupted proc was its idle task (pid 0 / ap_idle).
@@ -849,11 +861,16 @@ void sched_tick(struct regs *r) {
                 for (uint32_t ci = 0; ci < smp_cpu_count() && ci < MAX_CPUS; ci++) {
                     const struct percpu *pc = smp_cpu(ci);
                     if (!pc || !pc->online) continue;
-                    kprintf("  [hb-x] cpu%u cur=%d bkl=%d ticks=%lu\n",
+                    kprintf("  [hb-x] cpu%u cur=%d bkl=%d ticks=%lu mono=%lums\n",
                             ci, pc->current ? pc->current->pid : -1,
                             pc->holds_bkl ? 1 : 0,
-                            (unsigned long)pc->timer_ticks);
+                            (unsigned long)pc->timer_ticks,
+                            (unsigned long)(g_cpu_mono_ns[ci] / 1000000ull));
                 }
+                /* [clkchk] BSP's own reading right now, to compare against the
+                 * per-CPU mono columns above: a large spread == TSC desync. */
+                kprintf("  [hb-x] bsp mono-now=%lums\n",
+                        (unsigned long)(perf_now_ns() / 1000000ull));
             }
             /* slice 20: chrome busy-churns (pid burning CPU) but never navigates.
              * Dump the recent-syscall ring so we can see WHAT the hot threads

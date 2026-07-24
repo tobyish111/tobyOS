@@ -100,6 +100,10 @@ int uaccess_prepare_read(uint64_t addr, uint64_t len);
 /* Residency probe that never invokes the fault handlers (page_fault.c). */
 int uaccess_probe_resident(uint64_t addr, uint64_t len);
 
+/* Residency+writability probe -- never faults, never mutates the address
+ * space, safe without the BKL and concurrently (page_fault.c). */
+int uaccess_probe_writable(uint64_t addr, uint64_t len);
+
 /* Read user memory WITHOUT trying to fault anything in: fails if the range is
  * not already resident. Use this anywhere resolving a fault would be re-entrant
  * or fatal -- notably crash diagnostics running inside exception handling.
@@ -117,6 +121,23 @@ static inline int copy_from_user_nofault(void *dst, const void *user_src,
 
 static inline int get_user_u64_nofault(uint64_t *out, const void *user_src) {
     return copy_from_user_nofault(out, user_src, sizeof(*out));
+}
+
+/* Write to user memory WITHOUT trying to fault/allocate anything: succeeds
+ * only if the destination range is ALREADY resident and writable. Touches no
+ * mutable kernel state, so it is safe to call without the BKL and concurrently
+ * across CPUs. Mirror of copy_from_user_nofault for the write side; used by the
+ * lock-free time-syscall fast path. Returns 0 on success, -1 if not resident/
+ * writable (caller should fall back to the normal, BKL-held copy_to_user). */
+static inline int copy_to_user_nofault(void *user_dst, const void *src,
+                                       size_t n) {
+    if (!user_range_ok((uint64_t)(uintptr_t)user_dst, n)) return -1;
+    if (n == 0) return 0;
+    if (uaccess_probe_writable((uint64_t)(uintptr_t)user_dst, n) != 0) return -1;
+    unsigned long f = uaccess_begin();
+    memcpy(user_dst, src, n);
+    uaccess_end(f);
+    return 0;
 }
 
 static inline int copy_from_user(void *dst, const void *user_src, size_t n) {
