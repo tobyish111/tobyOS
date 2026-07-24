@@ -1638,3 +1638,66 @@ login/desktop, ZERO faults.
 - Instruments kept (CHROMIUM_BOOT-gated): `[clkchk]`, per-CPU `mono=` in `[hb-x]`.
 - Committed run39whpx.py / run39shot.py / build39.sh (were on-disk only), per the
   handoff, so this WHPX result is reproducible.
+
+
+## SLICE 42 (2026-07-24) — Phase 2 (YouTube) root-caused: no true blocking wait ⇒ busy-spin CPU starvation
+
+Flipped chromewin's START_URL to https://www.youtube.com/ and ran the fixed WHPX
+build (logs/run41yt.py: -m 6144, 360s). Chrome bootstraps and starts loading —
+but **produces ZERO frames** and the window stays on "connecting to chrome…".
+Reverted START_URL to example.com afterward (keep the verified-green default);
+the youtube runner (run41yt.py) is committed for the next session.
+
+### What the run shows (logs/run41yt.log, logs/ytwx_b.png)
+- CDP bootstrap completes fast (sessionId 8.5s, "bootstrap OK; polling
+  screenshots" 10.4s), then `Page.captureScreenshot` is NEVER answered in 350s.
+- First youtube TLS handshake is FAST, not slow: tcp[2] ClientHello 9.95s →
+  ServerHello 9.98s → app-data (0x17) by 10.4s → a little more to 13.1s. Then
+  **tcp[2] goes silent for ~96s** (next TX 109.7s). Same ~100s gaps recur
+  (connect bursts at ~110s, ~160s, ~210s). The network is not blocked — it
+  CRAWLS.
+- System monitor: **CPU pegged 100%**, RAM 3.1/7.1 GiB (no OOM, no faults, no
+  panic). `[hb-x] pollit` climbs 0 → **632,065,719** over the run (~2M poll
+  iterations/sec). Wait-graph: ~20 threads futex/epoll-blocked for 60–211s.
+
+### Root cause: tobyOS has NO true blocking wait — everything busy-spins
+poll / select / epoll_wait (syscall.c lx_do_poll/lx_do_select/lx_epoll_wait),
+nanosleep (sys_nanosleep), and timed-futex ALL implement "waiting" as a
+`scan; sched_yield(); pause` busy-loop. sys_nanosleep's own comment says why
+they refuse to `hlt`: "once every core is halted, headless QEMU/TCG stops
+delivering the timer interrupt that would wake us → silent stall." So the design
+trades true blocking for a spin that is merely SLOW under TCG.
+
+Under WHPX at hardware speed this collapses: chrome parks ~20 idle worker
+threads in epoll_wait(long/∞ timeout). Each stays `PROC_RUNNING` and busy-spins
+instead of leaving the run queue, so `sched_yield` round-robins the CPU across
+~25 runnable procs and the handful doing REAL work (V8 parsing YouTube's
+multi-MB JS, the network service, the compositor) each get ~1/25 of a core.
+Timers/delayed tasks therefore fire ~100s late (the thread that would run them
+rarely gets scheduled), the page never finishes loading, and the renderer never
+produces a frame for captureScreenshot. It is STARVATION, not deadlock — chrome
+crawls forward (connections at 10s, 110s, 160s, 210s). example.com renders under
+WHPX (slice 41) only because it is light enough that 1/25 of a core still
+finishes; YouTube is not.
+
+### The fix (next arc — deliberately NOT rushed here)
+Give idle waiters a way to LEAVE the run queue: convert poll/epoll/select (and
+ideally nanosleep + timed-futex) from busy-spin to true BLOCK — deschedule
+(`PROC_BLOCKED`), wake on (a) an fd-readiness event (socket rx / eventfd write /
+pipe write signalling a wait queue the poller registered on — a coarse global
+"poll wakeup" generation is an acceptable first cut given the single BKL) or
+(b) a timer deadline. The precondition the sys_nanosleep comment flags — a
+halted core must still be woken — is satisfiable with a reliable PER-CPU LAPIC
+periodic timer so every core wakes on its own tick even when all are idle;
+verify that under WHPX before trusting `hlt`. This touches the wait path EVERY
+Linux program uses (and the working example.com render + all linux-* tests), so
+it needs its own session with a targeted before/after (a `/bin/linux-poll`-style
+unit test: park a thread in epoll_wait, prove it wakes on write AND consumes ~0
+CPU while parked) and a full re-validation (example.com still renders, defboot
+clean, linux-futex/eventfd/mapshare green). Do NOT ship it without that.
+
+### Standing
+Phase 1 (WHPX frame production) is DONE and shipped (slice 41). Phase 2's wall is
+now root-caused to a single, well-scoped kernel deficiency. The `[hb-x] pollit`
+counter is the metric to watch: the blocking fix should drop it by orders of
+magnitude and let YouTube's real threads run.
