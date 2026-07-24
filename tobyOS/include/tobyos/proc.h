@@ -593,6 +593,17 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout);
 /* Initialize the futex hash table. Call once during boot. */
 void futex_init(void);
 
+/* Blocking wait for poll/select/epoll_wait (slice 43). poll_wait_block()
+ * parks the caller (leaves the ready queue) until poll_wake_all() requeues it;
+ * poll_tick() is a rate-limited wake-all driven from the scheduler yield slow
+ * path + pid 0's idle loop; poll_forget_proc() unlinks a dying thread in
+ * teardown. poll_init() sets up the wait list. */
+void poll_init(void);
+void poll_wait_block(void);
+void poll_wake_all(void);
+void poll_tick(void);
+void poll_forget_proc(struct proc *p);
+
 /* Set the calling thread's TLS base (loaded into FS.base). */
 void thread_set_tls(uint64_t base);
 

@@ -1701,3 +1701,80 @@ Phase 1 (WHPX frame production) is DONE and shipped (slice 41). Phase 2's wall i
 now root-caused to a single, well-scoped kernel deficiency. The `[hb-x] pollit`
 counter is the metric to watch: the blocking fix should drop it by orders of
 magnitude and let YouTube's real threads run.
+
+
+## SLICE 43 (2026-07-24) — ***YOUTUBE RENDERS.*** Blocking poll/epoll kills the busy-spin starvation; the futex-under-WHPX lost-wakeup is the next wall
+
+Slice 42 root-caused YouTube's stall to CPU starvation: poll/select/epoll_wait
+were cooperative BUSY-WAIT loops (`scan fds; sched_yield()`), so ~20 idle chrome
+worker threads stayed PROC_RUNNING on the ready queue and starved the V8/network/
+compositor threads to ~1/25 of a core. This slice makes those waiters truly
+BLOCK, and YouTube's web app now loads and renders.
+
+### The fix: true blocking poll/select/epoll_wait (thread.c)
+New `poll_wait_block()` parks the caller (PROC_BLOCKED, off the ready queue),
+mirroring pipe.c's wq_add: BKL-serialised, linked via `next_wait`, with
+`wait_head` set so signal_send()'s wait_queue_unlink can splice a signalled
+poller out (without that back-pointer it would dangle and a re-add would cycle
+the list). A rate-limited `poll_tick()` (~1 ms) requeues every parked poller to
+re-scan; each keeps its own deadline as a syscall local, so NO struct-proc field
+was added. `poll_forget_proc()` unlinks a dying thread in teardown (both proc.c
+sites, next to futex_forget_proc). lx_do_poll/lx_do_select/lx_epoll_wait now call
+poll_wait_block() instead of sched_yield().
+
+poll_tick() is driven from three BKL-holding contexts so a parked poller is
+always re-scanned even when EVERY user thread is blocked:
+  1. sched_yield's slow path (`if (me->holds_bkl)`) -- the under-load driver;
+  2. pid 0's idle_loop (desktop / console harness);
+  3. **the TKAPP_CHROMEWIN hold loop** -- added after a real freeze: that loop
+     (not idle_loop) is what runs while chrome is parked, and its sched_yield()s
+     do NOT hold the BKL, so the gated driver in (1) never fired. Result: the
+     first example.com run FROZE (bkl tickets + pollit stopped dead, zero
+     frames). A direct `bkl_enter(); poll_tick(); bkl_exit();` in the hold loop
+     fixed it. LESSON: a BKL-gated periodic must have a driver in whatever loop
+     the boot harness actually sits in.
+
+### Validation (before trusting a core wait-path change)
+- **EFDTEST PASS** (non-TKAPP CHROMIUM_BOOT under WHPX): epoll_wait parked on an
+  eventfd is woken by a cross-thread eventfd write -- proves blocking epoll wakes
+  correctly. (First time the linux-* tests ran under WHPX.)
+- **example.com regression PASS**: renders under WHPX with ~480 continuous
+  frames, and `pollit` fell from ~1.4M/s (slice-41 busy-spin) to ~3.4k/s -- a
+  ~450x drop in spin rate; idle CPU now reads 0%.
+- **Base OS PASS**: clean-config (no CHROMIUM_BOOT) build + TCG defboot reaches
+  login/desktop, zero faults. poll_tick early-outs when no Linux poller is
+  parked, so the base OS is unaffected.
+
+### RESULT: YouTube's page loads and renders
+`START_URL=https://www.youtube.com/` under WHPX (logs/run41yt.py, logs/ytwx_b.png
++ ytwx_c.png): the real YouTube **Kevlar desktop web app** loads
+(`youtube.com/s/_/ytmainappweb/.../kevlar_base...` JS fetched + executed, its
+console messages in the log) and RENDERS the homepage -- top nav (hamburger +
+avatar buttons), the video-grid layout, and the thumbnail loading skeleton.
+Before this slice it was a starved blank "connecting to chrome" at 100% CPU.
+chrome SURVIVES (no browser exit; exactly one isolated renderer EXCEPTION 14 +
+EXCEPTION 3 over the whole run, not a crash loop). RAM 3.7/7.1 GiB, no OOM.
+
+### The next wall, precisely evidenced: futex lost-wakeup under WHPX
+Content (thumbnails) does not fully populate, and ~100s network gaps persist
+(tcp[2] at 14s, next batch at 121s). The wait-graph names the cause: chrome
+threads stuck in `futex(0xc130ac0) for 197563 ms` and `146738 ms` -- a
+FUTEX_WAKE that was LOST and salvaged only by the deadline/uaddr-change fallback.
+This is the SAME failure the newly-WHPX-run **FUTEXTEST reports: FAIL exit=1
+(lost wakeup)** -- while linux-futex has always PASSed under TCG. So it is a real
+futex wake-DELIVERY race exposed by WHPX's true parallelism (TCG serialises vCPUs
+and hides it), latent since slice 30 and only now dominant because the poll fix
+let YouTube run far enough to stress futex hard. This is the #1 remaining wall
+for full YouTube content and the clear next arc: diagnose why a FUTEX_WAKE misses
+a FUTEX_WAIT_BITSET waiter under parallel execution (suspect the
+add-to-list/release-lock/sched_yield window vs the waker's enqueue, or a
+memory-ordering gap), fix it, and keep FUTEXTEST green under BOTH TCG and WHPX.
+Note: poll was PROVABLY inert during the futex test (pollit=0), so the FUTEXTEST
+FAIL is not caused by this slice.
+
+### Standing
+Phase 1 (WHPX frames, slice 41) and now Phase 2 (YouTube page renders, this
+slice) are shipped. The dominant remaining bottleneck is a single, isolated,
+reproducible core-primitive bug (futex-under-WHPX), with a permanent unit test
+(linux-futex) that already flags it. Instruments kept: blocking poll via
+poll_wait_block/poll_tick; `pollit` in `[hb-x]` is the spin-rate metric.

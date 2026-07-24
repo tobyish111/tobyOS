@@ -572,3 +572,93 @@ void futex_expire_timeouts(void) {
     }
     spin_unlock_irqrestore(&g_futex_lock, flags);
 }
+
+/* ---- Blocking wait for poll / select / epoll_wait (slice 43) ---------
+ *
+ * These used to BUSY-WAIT: `scan fds; sched_yield(); repeat`. That keeps an
+ * idle waiter PROC_RUNNING and on the ready queue, so under a heavy
+ * multi-threaded load (chrome under WHPX: ~20 idle worker threads each
+ * spinning) the few threads doing real work get only ~1/N of the CPU and the
+ * whole user plane crawls -- YouTube starved, pollit climbed to 632M (ledger
+ * slice 42).
+ *
+ * Now an idle waiter BLOCKS via poll_wait_block() -- it leaves the ready queue
+ * -- and a rate-limited poll_tick() requeues every blocked poller to re-scan.
+ * Each poller keeps its own deadline as a syscall local and re-checks it on the
+ * re-scan, so NO per-proc deadline field is needed. poll_tick() is driven from
+ * places that run even when every user thread is blocked (sched_yield's slow
+ * path under load; pid 0's idle_loop when idle), so a waiter is always
+ * re-scanned within the tick interval -- catching fd readiness (the re-scan
+ * itself pumps net_poll for sockets), a passed deadline, or a pending signal.
+ * Coarse (wake-all + re-scan) but correct, and it drops the spin rate ~1000x.
+ * Same block/wake/teardown pattern as the futex path above. */
+static struct proc *g_poll_waiters;      /* BKL-protected; linked via ->next_wait */
+
+void poll_init(void) { g_poll_waiters = 0; }
+
+/* Block the caller until poll_wake_all() requeues it; it re-scans on return.
+ * Mirrors pipe.c's wq_add + sched_yield: BKL-serialised (no IRQ handler touches
+ * this list, and the BKL serialises CPUs), with wait_head set so signal_send()
+ * can splice us out if a signal force-wakes us before poll_wake_all() does --
+ * without that back-pointer a signalled poller would dangle on the list and a
+ * later re-add would splice it into a cycle. */
+void poll_wait_block(void) {
+    struct proc *caller = current_proc();
+    if (!caller) { sched_yield(); return; }
+    caller->next_wait = g_poll_waiters;
+    caller->wait_head = &g_poll_waiters;
+    g_poll_waiters    = caller;
+    caller->state     = PROC_BLOCKED;
+    sched_yield();                 /* woken by poll_wake_all (tick/event) */
+    /* On return we've been spliced out (by poll_wake_all or signal_send). */
+}
+
+/* Requeue every blocked poller so it re-scans. BKL-held by every caller
+ * (poll_tick's sites), so no extra lock is needed -- same convention as
+ * pipe.c/socket.c wq_wake_all. The CURRENT proc is left parked: poll_tick runs
+ * inside a blocking poller's own sched_yield, and waking it here would make it
+ * re-scan immediately instead of sleeping (a non-current thread that wrote an
+ * eventfd/pipe is never itself on this list, so skipping current is a no-op
+ * for any future event-hook caller). */
+void poll_wake_all(void) {
+    struct proc *cur = current_proc();
+    struct proc *w = g_poll_waiters;
+    g_poll_waiters = 0;
+    while (w) {
+        struct proc *nx = w->next_wait;
+        if (w == cur) {                       /* keep the yielding caller parked */
+            w->next_wait = g_poll_waiters;
+            g_poll_waiters = w;
+            w = nx;
+            continue;
+        }
+        w->next_wait = 0;
+        w->wait_head = 0;
+        if (w->state == PROC_BLOCKED) { w->state = PROC_READY; sched_enqueue(w); }
+        w = nx;
+    }
+}
+
+/* Rate-limited wake-all. Driven from the scheduler yield slow path (under load)
+ * and pid 0's idle loop (when every user thread is blocked) so parked pollers
+ * are re-scanned every ~1 ms. Cheap early-out when nothing is parked. Callers
+ * MUST hold the BKL. */
+void poll_tick(void) {
+    static uint64_t last_ns;
+    if (!g_poll_waiters) return;
+    uint64_t now = perf_now_ns();
+    if (now - last_ns < 1000000ull) return;   /* >= ~1 ms since last wake */
+    last_ns = now;
+    poll_wake_all();
+}
+
+/* Teardown: unlink a dying thread from the poll wait list (mirror of
+ * futex_forget_proc); BKL-held at both proc.c call sites. */
+void poll_forget_proc(struct proc *p) {
+    if (!p) return;
+    struct proc **pp = &g_poll_waiters;
+    while (*pp) {
+        if (*pp == p) { *pp = p->next_wait; p->next_wait = 0; p->wait_head = 0; }
+        else          pp = &(*pp)->next_wait;
+    }
+}

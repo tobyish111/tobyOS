@@ -5053,7 +5053,7 @@ static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
          * listener, data arriving on a conn, peer FIN) make a watched socket
          * ready while we cooperatively block -- the same pump tcp_accept uses. */
         if (saw_sock) net_poll();
-        sched_yield();
+        poll_wait_block();   /* slice 43: BLOCK (leave run queue), don't busy-spin */
     }
 }
 
@@ -5101,7 +5101,7 @@ static long lx_do_select(int nfds, uint64_t urd, uint64_t uwr, uint64_t uex,
         }
         if (self && self->pending_signals) return -LX_EINTR;
         if (saw_sock) net_poll();              /* B14: pump RX (see lx_do_poll) */
-        sched_yield();
+        poll_wait_block();   /* slice 43: BLOCK, don't busy-spin */
     }
 }
 
@@ -5203,7 +5203,7 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
         /* B14: epoll over sockets must pump RX while blocked (a full scan
          * before yielding would otherwise never see the handshake complete). */
         if (saw_sock) net_poll();
-        sched_yield();
+        poll_wait_block();   /* slice 43: BLOCK (leave run queue), don't busy-spin */
     }
 }
 

@@ -705,6 +705,11 @@ static __attribute__((noreturn)) void idle_loop(void) {
         bkl_enter();
         net_service_tick();
         SERVICE_INPUT();
+        /* slice 43: with RX just drained, re-scan any blocked poll/epoll/select
+         * waiters. This is the driver that runs when EVERY user thread is
+         * blocked (the sched_yield-slow-path driver only fires while threads
+         * are yielding), so a parked poller always makes progress. */
+        poll_tick();
         bkl_exit();
 
         /* Periodic filesystem writeback so /data survives an unclean
@@ -3548,6 +3553,7 @@ void _start(void) {
     sched_init();
     signal_init();           /* milestone 8: SIGINT/SIGTERM + foreground tracking */
     futex_init();            /* Phase 1 M1.1: futex wait/wake hash table */
+    poll_init();             /* slice 43: blocking poll/select/epoll wait list */
     shm_init();              /* Phase 1 M1.4: shared memory */
     unix_socket_init();      /* Phase 1 M1.4: Unix domain sockets */
     sysfs_init();            /* Phase 1 M1.5: sysfs virtual filesystem */
@@ -8622,6 +8628,14 @@ void _start(void) {
                     mouse_flush_pending(); kbd_flush_pending(); gui_tick();
                     next_tick = now + hz / 30;
                 }
+                /* slice 43: THIS harness (not idle_loop) is the loop that runs
+                 * while chrome's threads are blocked in poll/epoll, and its
+                 * sched_yield()s below do NOT hold the BKL -- so the BKL-gated
+                 * poll_tick in sched_yield never fires here. Drive it directly
+                 * under the BKL (self rate-limited to ~1 ms) so parked pollers
+                 * are re-scanned; without this the whole user plane freezes the
+                 * moment every chrome thread parks (bkl+pollit stop dead). */
+                bkl_enter(); poll_tick(); bkl_exit();
                 /* give chrome the core for the rest of the frame */
                 for (int y = 0; y < 200; y++) sched_yield();
                 if (now >= next_hb) {

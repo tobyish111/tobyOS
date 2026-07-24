@@ -639,6 +639,14 @@ void sched_yield(void) {
             extern void futex_expire_timeouts(void);
             futex_expire_timeouts();
         }
+        /* slice 43: re-scan blocked poll/epoll/select waiters (self rate-
+         * limited to ~1 ms). This is the under-load driver; pid 0's idle_loop
+         * covers the all-blocked case. The poll wait list is BKL-serialised, so
+         * only touch it when THIS yield is holding the BKL (the common case: a
+         * user syscall yielding). BKL-less yields skip it -- idle_loop still
+         * covers them. Runs before the bkl_exit below, like the futex sweep. */
+        extern void poll_tick(void);
+        if (me->holds_bkl) poll_tick();
     }
 
     bool had_bkl = me->holds_bkl;
