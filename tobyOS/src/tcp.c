@@ -99,6 +99,26 @@ struct tcp_conn {
     uint32_t     dbg_seg_logged;  /* rate-limit for the [tls] rx segment trace */
     uint32_t     dbg_txseg_logged;/* rate-limit for the [tls] tx segment trace */
     uint32_t     dbg_retx;        /* retransmissions we issued */
+    /* Slice 38 iter 7: TLS record-FRAMING trackers. The iter-6 netlog proved
+     * the X25519MLKEM768 handshake COMPLETES and the failure is BoringSSL
+     * WRONG_VERSION_NUMBER (s3_pkt.cc:46) on the FIRST post-handshake read:
+     * the record STREAM goes bad, not the crypto. Record headers are
+     * plaintext even in TLS 1.3 -- [type 0x14..0x17][0x03][0x01..0x04]
+     * [len_hi][len_lo] -- so a state machine can walk the byte stream and
+     * pinpoint WHERE framing breaks. Two trackers bisect the RX path:
+     * fr_in walks bytes as TCP delivers them into the ring (rx_push);
+     * fr_out walks bytes as the app consumes them (rx_pop). fr_in bad =>
+     * segment-acceptance bug; fr_out bad alone => ring bug; both clean
+     * while chrome still errors => bug above the ring (syscall copy path
+     * or in-process). */
+    uint8_t      fr_in_hdr[5],  fr_in_hn,  fr_in_bad;
+    uint32_t     fr_in_rem;
+    uint64_t     fr_in_pos;
+    uint8_t      fr_out_hdr[5], fr_out_hn, fr_out_bad;
+    uint32_t     fr_out_rem;
+    uint64_t     fr_out_pos;
+    uint32_t     dbg_full_logged; /* rate-limit for the buffer-full trace */
+    uint32_t     dbg_rec_logged;  /* rate-limit for the record-header trace */
 #endif
     uint8_t      acc_head, acc_tail, acc_count, backlog_cap;
     int8_t       acc_q[TCP_LISTEN_BACKLOG];
@@ -217,9 +237,57 @@ static uint16_t alloc_ephemeral_port(void) {
     return 0;
 }
 
+#ifdef CHROMIUM_BOOT
+/* Walk `n` stream bytes through one TLS-record framing tracker (see the
+ * field comment in struct tcp_conn). Logs the first few violations with
+ * stream position and the offending header bytes, then goes quiet. */
+static void fr_track(struct tcp_conn *c, const char *side, const uint8_t *b,
+                     size_t n, uint8_t *hdr, uint8_t *hn, uint32_t *rem,
+                     uint64_t *pos, uint8_t *bad) {
+    if (ntohs(c->remote_port_be) != 443) return;
+    bool log_hdrs = (side[0] == 'P' && side[1] == 'O');   /* POP side only */
+    for (size_t i = 0; i < n; i++, (*pos)++) {
+        if (*rem) { (*rem)--; continue; }        /* inside a record body */
+        hdr[(*hn)++] = b[i];
+        if (*hn < 5) continue;
+        *hn = 0;
+        uint32_t len = ((uint32_t)hdr[3] << 8) | hdr[4];
+        bool ok = (hdr[0] >= 0x14 && hdr[0] <= 0x17) &&
+                  hdr[1] == 0x03 && hdr[2] <= 0x04 &&
+                  len <= 16640;                  /* 2^14 + 256 + header slack */
+        /* Iter 8: iter-7 proved framing stays PLAUSIBLE end-to-end (no BAD
+         * hits) yet BoringSSL still sent alert 70 -> its version check is
+         * `ver == 0x0303` EXACTLY once encryption starts, stricter than the
+         * plausibility test above. Log EVERY header the app consumes so the
+         * record BoringSSL rejected is directly visible in the serial log. */
+        if (ok && log_hdrs && c->dbg_rec_logged < 48) {
+            c->dbg_rec_logged++;
+            kprintf("[tlsfr] tcp[%d] rec@%lu type=%02x ver=%02x%02x len=%u\n",
+                    conn_index(c), (unsigned long)(*pos - 4),
+                    hdr[0], hdr[1], hdr[2], (unsigned)len);
+        }
+        if (ok) { *rem = len; continue; }
+        if (*bad < 4) {
+            (*bad)++;
+            kprintf("[tlsfr] tcp[%d] %s BAD record header at stream+%lu: "
+                    "%02x %02x %02x %02x %02x (in=%lu out=%lu)\n",
+                    conn_index(c), side,
+                    (unsigned long)(*pos - 4),
+                    hdr[0], hdr[1], hdr[2], hdr[3], hdr[4],
+                    (unsigned long)c->dbg_rx_total,
+                    (unsigned long)c->dbg_rx_popped);
+        }
+        /* Resync attempt: treat the bad header as body noise and keep
+         * scanning byte-by-byte so multiple corruptions still report. */
+    }
+}
+#endif
+
 static void rx_push(struct tcp_conn *c, const uint8_t *data, size_t n) {
 #ifdef CHROMIUM_BOOT
     c->dbg_rx_total += n;                 /* bytes DELIVERED in-order to the app */
+    fr_track(c, "PUSH", data, n, c->fr_in_hdr, &c->fr_in_hn,
+             &c->fr_in_rem, &c->fr_in_pos, &c->fr_in_bad);
     /* Slice 35 diagnostic: on a TLS port, log the leading bytes of each inbound
      * segment. A TLS record header is [type][ver_hi][ver_lo][len_hi][len_lo],
      * where type 0x16=handshake, 0x15=ALERT, 0x14=CCS, 0x17=app-data. Seeing an
@@ -249,8 +317,39 @@ static size_t rx_pop(struct tcp_conn *c, uint8_t *buf, size_t cap) {
     }
 #ifdef CHROMIUM_BOOT
     c->dbg_rx_popped += got;              /* bytes the APP actually consumed */
+    fr_track(c, "POP", buf, got, c->fr_out_hdr, &c->fr_out_hn,
+             &c->fr_out_rem, &c->fr_out_pos, &c->fr_out_bad);
 #endif
     return got;
+}
+
+/* MSG_PEEK: copy buffered bytes WITHOUT consuming them. Slice 38: chrome's
+ * TCPSocketPosix::IsConnectedAndIdle() health-checks a socket being handed to
+ * a new HTTP/2 session with recv(fd, &c, 1, MSG_PEEK). tobyOS's recv path
+ * ignored the flag and CONSUMED the byte -- the leading 0x17 of the server's
+ * first post-handshake TLS record. BoringSSL then read the remaining stream
+ * one byte out of phase, parsed ciphertext "03 03 ..." as a record header,
+ * and sent fatal alert 70 (WRONG_VERSION_NUMBER -> ERR_SSL_PROTOCOL_ERROR).
+ * Only bites when the server's session tickets have already arrived when the
+ * peek runs -- under TCG slowness, essentially always.
+ * Returns >0 bytes copied, 0 = nothing buffered (conn still open), -1 =
+ * nothing buffered and the peer is gone (EOF). */
+long tcp_peek(struct tcp_conn *c, void *buf, size_t cap) {
+    if (!c || !c->in_use || cap == 0) return -1;
+    if (c->rx_count == 0) {
+        if (c->remote_rst_seen || c->state == TCP_CLOSED ||
+            c->state == TCP_CLOSE_WAIT)
+            return -1;
+        return 0;
+    }
+    size_t n = c->rx_count < cap ? c->rx_count : cap;
+    size_t t = c->rx_tail;
+    uint8_t *out = (uint8_t *)buf;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = c->rx_buf[t];
+        t = (t + 1) % TCP_RX_BUF_BYTES;
+    }
+    return (long)n;
 }
 
 static inline int32_t seq_delta(uint32_t a, uint32_t b) {
@@ -748,11 +847,24 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
                         (unsigned)seq,
                         (unsigned)c->rcv_nxt);
         } else {
+#ifdef CHROMIUM_BOOT
+            /* Iter 7: log this UNCONDITIONALLY (rate-limited). A full ring
+             * right when chrome's first post-handshake read fails would tie
+             * the WRONG_VERSION_NUMBER to receiver-side flow control. */
+            if (c->dbg_full_logged < 8) {
+                c->dbg_full_logged++;
+                kprintf("[tcp] RX buffer FULL tcp[%d] plen=%u free=%u seq=%u "
+                        "(segment refused; peer must retransmit)\n",
+                        conn_index(c), (unsigned)plen, (unsigned)free_space,
+                        (unsigned)seq);
+            }
+#else
             if (g_tcp_trace)
                 kprintf("[tcp] RX buffer full tcp[%d] plen=%u free=%u\n",
                         conn_index(c),
                         (unsigned)plen,
                         (unsigned)free_space);
+#endif
             need_ack = true;
         }
     } else if (plen > 0 && seq != c->rcv_nxt) {

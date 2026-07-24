@@ -33,6 +33,9 @@ long sys_mmap2(uint64_t addr, size_t length, int prot, int flags,
                int fd, uint64_t offset);
 long sys_munmap2(uint64_t addr, size_t length);
 long sys_mprotect2(uint64_t addr, size_t length, int prot);
+/* MADV_DONTNEED with Linux semantics: drop private-anon pages in the range;
+ * the VMA stays and the next touch demand-faults a fresh zero page. */
+long sys_madvise_dontneed(uint64_t addr, uint64_t len);
 long sys_brk2(uint64_t new_brk);
 
 /* Process lifecycle hooks */

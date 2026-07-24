@@ -126,6 +126,9 @@ int thread_create(uint64_t entry, uint64_t arg,
     t->detached    = false;
     t->tls_base    = tls_base;
     t->join_waiters = 0;
+    /* NB: no kprintf here -- a clone-time trace in slice 38 perturbed
+     * thread-startup timing enough to flake FUTEXTEST's wake race. The
+     * [isr] TLS dump plus the arch_prctl trace below cover provenance. */
 
     /* Build the initial kernel stack frame. We replicate the pattern
      * from spawn_internal: push a fake frame so that when the scheduler
@@ -328,6 +331,11 @@ int thread_detach(int tid) {
 void thread_set_tls(uint64_t base) {
     struct proc *t = current_proc();
     if (t) t->tls_base = base;
+#ifdef CHROMIUM_BOOT
+    /* Slice 38: pairs with the [tls] clone trace (see thread_create). */
+    if (t && t->personality == 1 /* ABI_PERS_LINUX */)
+        kprintf("[tls] arch_prctl pid=%d fs=%p\n", t->pid, (void *)base);
+#endif
     /* Immediately update FS.base MSR for the calling thread */
     wrmsr(0xC0000100, base);  /* MSR_FS_BASE */
 }

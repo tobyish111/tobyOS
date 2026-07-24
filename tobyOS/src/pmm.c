@@ -215,6 +215,26 @@ uint64_t pmm_alloc_page(void) {
         }
     }
     spin_unlock_irqrestore(&g_pmm_lock, flags);
+
+    /* Corruption tripwire: a frame leaving the allocator must have no
+     * outstanding CoW/shared references. refs != 0 here means some path
+     * freed a frame another address space still maps -- whoever receives
+     * this frame will scribble over that live mapping (the slice-38
+     * flaky-heap-corruption class). page_ref_get is safe before
+     * page_fault_init: it returns 0 until the table exists. */
+    if (phys) {
+        extern int page_ref_get(uint64_t);
+        int refs = page_ref_get(phys);
+        if (refs != 0) {
+            static int ref_warns;
+            if (ref_warns < 16) {
+                ref_warns++;
+                kprintf("[pmm] BUG: alloc'd frame %p has refcount %d "
+                        "(premature free -- still mapped somewhere!)\n",
+                        (void *)phys, refs);
+            }
+        }
+    }
     return phys;  /* 0 == out of memory */
 }
 
@@ -308,6 +328,26 @@ void pmm_free_page(uint64_t phys) {
     if (i >= g_total_pages) {
         kprintf("[pmm] WARN: pmm_free_page(%p): out of range\n", (void *)phys);
         return;
+    }
+    /* Slice 38 tripwire (the complement of the alloc-side check): every
+     * refcount-aware free path decrements to ZERO before calling here, so a
+     * frame arriving with refs > 0 is a BLIND free of memory somebody still
+     * maps -- the exact bug class behind the flaky chrome heap scribbles
+     * (ICU strings over the Vulkan loader heap). Log the CALLER so the
+     * guilty path names itself instead of surfacing as corruption later. */
+    {
+        extern int page_ref_get(uint64_t);
+        int refs = page_ref_get(phys);
+        if (refs > 0) {
+            static int blind_warns;
+            if (blind_warns < 32) {
+                blind_warns++;
+                kprintf("[pmm] BUG: freeing frame %p with refcount %d "
+                        "(still mapped somewhere!) caller=%p\n",
+                        (void *)phys, refs,
+                        __builtin_return_address(0));
+            }
+        }
     }
     uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
     if (!bm_get(i)) {

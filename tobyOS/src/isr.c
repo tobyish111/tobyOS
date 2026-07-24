@@ -524,9 +524,9 @@ static void default_exception(struct regs *r) {
                     uint64_t fa = read_cr2();
                     kprintf("[isr] VMA at cr2=%p:\n", (void *)fa);
                     mmap_debug_fault_vma(fa);
-                    extern void mprotect_ring_dump(uint64_t);
-                    mprotect_ring_dump(fa);
 #ifdef CHROMIUM_BOOT
+                    { extern void mprotect_ring_dump(uint64_t);
+                      mprotect_ring_dump(fa); }
                     /* Slice 38 iter 24: page-journal autopsy. The rsp page is
                      * where the lost-store corruption lives; cr2 is where the
                      * stale pointer led. Dump both timelines. */

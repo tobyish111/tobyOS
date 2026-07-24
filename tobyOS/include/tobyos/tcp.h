@@ -98,6 +98,9 @@ struct tcp_conn *tcp_accept(struct tcp_conn *listener, uint32_t timeout_ms);
 
 long tcp_send(struct tcp_conn *c, const void *buf, size_t len);
 long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms);
+/* MSG_PEEK support: copy buffered rx bytes without consuming.
+ * >0 = bytes copied, 0 = nothing buffered, -1 = EOF/reset. */
+long tcp_peek(struct tcp_conn *c, void *buf, size_t cap);
 void tcp_close(struct tcp_conn *c);
 /* Abortive close: send RST and free immediately -- no graceful FIN
  * exchange, no TIME_WAIT linger. For tearing down a handshake rejected
