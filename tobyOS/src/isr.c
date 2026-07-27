@@ -533,7 +533,25 @@ static void default_exception(struct regs *r) {
                     { extern void pgj_dump(uint64_t);
                       pgj_dump(fa);
                       if ((r->rsp >> 12) != (fa >> 12))
-                          pgj_dump(r->rsp); }
+                          pgj_dump(r->rsp);
+                      /* Slice 50: the corrupted-POINTER autopsy. In the
+                       * 0x208c13a crashes the bad pointer (rbx) was LOADED
+                       * from the array rax points at -- rax's page is where
+                       * the corruption lives; cr2 (the tiny deref offset) has
+                       * no history. Dump the source page's journal + mprot
+                       * timeline so the mutation that zeroed/overwrote it is
+                       * on the record. */
+                      if (r->rax >= 0x10000 &&
+                          r->rax < 0x0000800000000000ULL &&
+                          (r->rax >> 12) != (fa >> 12) &&
+                          (r->rax >> 12) != (r->rsp >> 12)) {
+                          kprintf("[isr] pointer-source page (rax=%p):\n",
+                                  (void *)r->rax);
+                          mmap_debug_fault_vma(r->rax);
+                          pgj_dump(r->rax);
+                          extern void mprotect_ring_dump(uint64_t);
+                          mprotect_ring_dump(r->rax);
+                      } }
                     /* Iter 25: what did this pid fault on (and get resolved)
                      * before dying? last_fault_rip == fatal rip says the
                      * dying instruction faulted before -- list the history. */

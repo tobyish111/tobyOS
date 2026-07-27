@@ -394,9 +394,38 @@ long sys_mmap2(uint64_t addr, size_t length, int prot, int flags,
  * pages too. */
 #define MMAP_FREE_BATCH 256
 struct mmap_free_batch { uint64_t phys[MMAP_FREE_BATCH]; int n; };
+
+/* Quarantine for frames whose shootdown TIMED OUT (slice 50): under WHPX a
+ * vCPU can be host-descheduled past the bounded ack wait, so ~8 shootdowns
+ * per run return unacked -- and a frame freed then is reissuable while that
+ * CPU may still hold the stale translation (the exact corruption the batch
+ * exists to prevent, sneaking through the timeout path). Unacked frames park
+ * here and only drain after a LATER fully-acked shootdown proves every TLB
+ * has turned over. All users run under the BKL (munmap/madvise/brk/fault-
+ * retry are BKL-held syscall paths), so a bare static ring is safe. Ring
+ * full => deliberately LEAK (a page lost beats a page corrupted). */
+#define TLBQ_MAX 8192
+static uint64_t g_tlbq[TLBQ_MAX];
+static int      g_tlbq_n;
+static uint64_t g_tlbq_leaked;
+
+static void tlbq_drain_after_acked(void) {      /* call ONLY after acked==true */
+    for (int i = 0; i < g_tlbq_n; i++) pmm_free_page(g_tlbq[i]);
+    g_tlbq_n = 0;
+}
+static void tlbq_free_or_park(uint64_t phys, bool acked) {
+    if (acked) { pmm_free_page(phys); return; }
+    if (g_tlbq_n < TLBQ_MAX) { g_tlbq[g_tlbq_n++] = phys; return; }
+    g_tlbq_leaked++;
+    if (g_tlbq_leaked <= 8)
+        kprintf("[tlbq] WARN: quarantine full, leaking frame %p (total %lu)\n",
+                (void *)phys, (unsigned long)g_tlbq_leaked);
+}
+
 static void mmap_free_batch_flush(struct mmap_free_batch *b) {
-    tlb_shootdown_remote();                 /* stale TLBs gone BEFORE reuse */
-    for (int i = 0; i < b->n; i++) pmm_free_page(b->phys[i]);
+    bool acked = tlb_shootdown_remote_sync();   /* stale TLBs gone BEFORE reuse */
+    if (acked && g_tlbq_n) tlbq_drain_after_acked();
+    for (int i = 0; i < b->n; i++) tlbq_free_or_park(b->phys[i], acked);
     b->n = 0;
 }
 static void mmap_free_batch_push(struct mmap_free_batch *b, uint64_t phys) {
@@ -801,10 +830,37 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
                    (void *)(old_phys + vmm_hhdm_offset()),
                    PAGE_SIZE);
 
+            /* Slice 50: compare-and-remap, NOT unmap+map. This path is
+             * BKL-free, so a sibling thread's CoW fault on the SAME page can
+             * have already swapped in ITS copy -- blindly remapping ours on
+             * top would discard every write made through the sibling's copy
+             * since. Only install if the frame is still the one we copied. */
+            old_phys &= PAGE_MASK;
             uint32_t vmm_f = prot_to_vmm_flags(v->prot | VMA_PROT_WRITE);
-            vmm_unmap(page_va, PAGE_SIZE);
-            vmm_map(page_va, new_phys, PAGE_SIZE, vmm_f);
+            int ins = vmm_remap_page_if(page_va, old_phys, new_phys, vmm_f);
             vmm_set_editor_root(saved_root);
+            if (ins != 1) {
+                pmm_free_page(new_phys);        /* our copy was never visible */
+                if (ins < 0) { PF_REJECT("COW remap walk failed"); return false; }
+#ifdef CHROMIUM_BOOT
+                { static int _r; if (_r < 24) { _r++;
+                    kprintf("[pfrace] pid=%d COW lost race va=%p\n",
+                            pid, (void *)page_va); } }
+#endif
+                /* Winner already broke the CoW; if permissions still block
+                 * this access the hardware re-faults and we resolve then. */
+                return true;
+            }
+            /* old_phys is deliberately NOT freed or shot down here -- same
+             * leak the pre-slice-50 unmap+map code had. A first attempt that
+             * also dec/freed it (mirroring munmap) plus a per-page remote
+             * shootdown regressed boot ~16s and coincided with 3/3 no-paint
+             * runs (suspect: refcount protocol mismatch freeing live frames,
+             * and per-CoW IPI storms during fork churn). A leaked frame can
+             * still be written through a peer's stale TLB entry, but it is
+             * never REISSUED, so no other owner's memory can be corrupted --
+             * strictly the old behavior. Revisit with measured refcount
+             * semantics if the leak ever matters. */
 
             v->flags &= ~VMA_FLAG_COW;
             v->prot |= VMA_PROT_WRITE;
@@ -876,8 +932,29 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
      * exist at fork time now behave.) */
     if (v->flags & VMA_FLAG_SHARED) vmm_f |= VMM_SHARED;
     uint64_t saved_root = vmm_set_editor_root(p->cr3);
-    vmm_map(page_va, phys, PAGE_SIZE, vmm_f);
+    /* Slice 50: install-if-absent, NOT vmm_map. This path runs BKL-free, so
+     * two CPUs can demand-fault the same page: both saw it absent above, both
+     * allocated a zero frame. vmm_map's map_4k silently REPLACED the first
+     * install with the second (zeroed) frame -- discarding every byte the
+     * winning thread had written through it in between. Measured: chrome's
+     * renderer read NULL out of a live Vec-of-pointers (rip 0x208c13a) with
+     * "[vmm] already mapped" replaces logged 15ms before the fault. The loser
+     * now backs off and frees its own never-visible frame; the winner's frame
+     * (same VMA => same flags, also zero-filled) is the page. */
+    int ins = vmm_map_page_if_absent(page_va, phys, vmm_f);
     vmm_set_editor_root(saved_root);
+    if (ins != 1) {
+        pmm_free_page(phys);
+        if (ins < 0) {
+            kprintf("[mmap] demand-page table OOM at %p\n", (void *)fault_addr);
+            return false;
+        }
+#ifdef CHROMIUM_BOOT
+        { static int _r; if (_r < 24) { _r++;
+            kprintf("[pfrace] pid=%d demand-map lost race va=%p (winner keeps)\n",
+                    pid, (void *)page_va); } }
+#endif
+    }
     return true;
 }
 

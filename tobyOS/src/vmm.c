@@ -347,6 +347,84 @@ static bool map_2m(uint64_t virt, uint64_t phys, uint32_t flags) {
     return true;
 }
 
+/* ---- atomic single-page installers (slice 50 corruption fix) -------------
+ *
+ * The #PF resolvers run BKL-FREE (fault concurrency, slice 39), so two CPUs
+ * can demand-fault the SAME page concurrently: both see it absent via
+ * vmm_translate, both allocate+zero a frame, both call vmm_map -- and map_4k
+ * silently REPLACES the first install with the second (zeroed) frame,
+ * discarding every byte the first thread wrote in between. Measured as
+ * chrome's renderer reading NULL (or, via the divergent-TLB variant, stale
+ * JSON text) out of a Vec-of-pointers => the slice-50 0x208c13a crashes; the
+ * "[vmm] WARN: map_4k already mapped" lines fired within 15ms of the fault.
+ *
+ * These two primitives close the window by making the check+install ONE
+ * critical section under g_vmm_lock (which vmm_map/map_4k already take, so
+ * they serialize against every other mapper):
+ *   vmm_map_page_if_absent -- install only if no PRESENT entry; the loser
+ *     of a demand race backs off and frees its own frame.
+ *   vmm_remap_page_if      -- install only if the current frame is the one
+ *     the caller copied from (CoW); a lost race means another CPU already
+ *     broke the CoW and our copy is stale.
+ * Return: 1 = installed, 0 = lost race (nothing changed), -1 = table alloc
+ * failure. Both do only a LOCAL invlpg -- on a successful remap (frame
+ * CHANGE) the caller must tlb_shootdown_remote() OUTSIDE this lock. */
+int vmm_map_page_if_absent(uint64_t virt, uint64_t phys, uint32_t flags) {
+    uint64_t saved = spin_lock_irqsave(&g_vmm_lock);
+    int r = -1;
+    pte_t *pdpt = next_table(g_pml4, pml4_idx(virt), flags, true);
+    pte_t *pd   = pdpt ? next_table(pdpt, pdpt_idx(virt), flags, true) : NULL;
+    pte_t *pt   = pd   ? next_table(pd,   pd_idx(virt),   flags, true) : NULL;
+    if (pt) {
+        size_t i = pt_idx(virt);
+        if (pt[i] & PTE_P) {
+            r = 0;                          /* raced: keep the winner's frame */
+        } else {
+            uint64_t leaf = flags_to_leaf(flags);
+            if (flags & VMM_WC) leaf |= PTE_PAT_4K;
+            pt[i] = (phys & PTE_ADDR_MASK) | leaf;
+            invlpg(virt);
+            r = 1;
+        }
+    }
+    spin_unlock_irqrestore(&g_vmm_lock, saved);
+#ifdef CHROMIUM_BOOT
+    if (r == 1 && virt < 0x0000800000000000ULL)
+        pgj_note(1, virt, phys & PTE_ADDR_MASK, 0);
+#endif
+    return r;
+}
+
+int vmm_remap_page_if(uint64_t virt, uint64_t expected_phys,
+                      uint64_t new_phys, uint32_t flags) {
+    uint64_t saved = spin_lock_irqsave(&g_vmm_lock);
+    int r = -1;
+    pte_t *pdpt = next_table(g_pml4, pml4_idx(virt), 0, false);
+    pte_t *pd   = pdpt ? next_table(pdpt, pdpt_idx(virt), 0, false) : NULL;
+    pte_t *pt   = pd   ? next_table(pd,   pd_idx(virt),   0, false) : NULL;
+    uint64_t old_entry = 0;
+    if (pt) {
+        size_t i = pt_idx(virt);
+        old_entry = pt[i];
+        if (!(old_entry & PTE_P) ||
+            (old_entry & PTE_ADDR_MASK) != (expected_phys & PTE_ADDR_MASK)) {
+            r = 0;                          /* frame changed under us: stale copy */
+        } else {
+            uint64_t leaf = flags_to_leaf(flags);
+            if (flags & VMM_WC) leaf |= PTE_PAT_4K;
+            pt[i] = (new_phys & PTE_ADDR_MASK) | leaf;
+            invlpg(virt);
+            r = 1;
+        }
+    }
+    spin_unlock_irqrestore(&g_vmm_lock, saved);
+#ifdef CHROMIUM_BOOT
+    if (r == 1 && virt < 0x0000800000000000ULL)
+        pgj_note(2, virt, new_phys & PTE_ADDR_MASK, old_entry);
+#endif
+    return r;
+}
+
 bool vmm_map(uint64_t virt, uint64_t phys, size_t bytes, uint32_t flags) {
     if (bytes == 0) return true;
 

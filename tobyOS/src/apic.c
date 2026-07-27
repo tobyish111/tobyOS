@@ -123,10 +123,10 @@ static void tlb_shootdown_isr(struct regs *r) {
     apic_eoi();
 }
 
-void tlb_shootdown_remote(void) {
-    if (!g_ready) return;
+bool tlb_shootdown_remote_sync(void) {
+    if (!g_ready) return true;
     uint32_t n = smp_cpu_count();
-    if (n <= 1) return;
+    if (n <= 1) return true;
 
     uint32_t me = smp_this_cpu()->cpu_idx;
     uint32_t snap[MAX_CPUS];
@@ -145,7 +145,13 @@ void tlb_shootdown_remote(void) {
 
     /* Bounded wait: a remote CPU spinning with IRQs masked cannot take the
      * IPI until it re-enables them; it WILL flush before touching user
-     * translations again (the IPI stays pending). Don't deadlock on it. */
+     * translations again (the IPI stays pending). Don't deadlock on it --
+     * but REPORT it: a caller about to free unmapped frames must NOT hand
+     * them back to the PMM while any CPU could still hold the stale entry
+     * (slice 50: it quarantines them until a later fully-acked shootdown).
+     * Under WHPX a vCPU can be host-descheduled for >2M pauses, so timeouts
+     * here are routine, not exceptional. */
+    bool all_acked = true;
     for (uint32_t i = 0; i < n && i < MAX_CPUS; i++) {
         if (!sent[i]) continue;
         uint32_t spins = 0;
@@ -157,10 +163,16 @@ void tlb_shootdown_remote(void) {
                     warns++;
                     kprintf("[tlb] WARN: cpu%u shootdown ack timeout\n", i);
                 }
+                all_acked = false;
                 break;
             }
         }
     }
+    return all_acked;
+}
+
+void tlb_shootdown_remote(void) {
+    (void)tlb_shootdown_remote_sync();
 }
 
 void apic_send_ipi(uint8_t target_apic_id, uint32_t icr_low) {

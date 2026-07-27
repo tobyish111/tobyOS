@@ -63,7 +63,7 @@ static long sys_clock_ms(void) { return sc0(ABI_SYS_CLOCK_MS); }
  * embed player no longer crashes at rip 0x208c13a. Now retest the handoff's REAL
  * target -- the full WATCH page -- which hit that same corruption crash (~277s).
  * (Proven paths to flip back to: youtube.com/embed/<id> ; file:///opt/chrome/vid.webm ; example.com) */
-#define START_URL "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+#define START_URL "https://example.com/"
 
 static struct tk_window win;
 static toby_image_t *g_frame;        /* latest decoded screenshot */

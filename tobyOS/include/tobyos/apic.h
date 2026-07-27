@@ -68,6 +68,11 @@ bool apic_is_ready(void);
  * CoW write-protect at fork, CoW copy-out, mprotect, munmap/madvise
  * page drops. No-op before SMP bring-up or on a single CPU. */
 void tlb_shootdown_remote(void);
+/* Same, but reports whether EVERY online peer acked the flush within the
+ * bounded wait. false = at least one CPU may still hold stale user-half
+ * translations; a caller freeing unmapped frames must quarantine them until
+ * a later fully-acked shootdown (see mmap.c's free batch). */
+bool tlb_shootdown_remote_sync(void);
 
 /* ---- Milestone 22 step 5: per-CPU periodic LAPIC timer -------- */
 /*

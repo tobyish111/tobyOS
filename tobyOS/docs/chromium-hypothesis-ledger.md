@@ -2215,3 +2215,81 @@ logs/build39.sh` (full kernel rebuild — always after a kernel change), then
 `python logs/run_embed.py` (embed, 300s, `logs/emb_*.png`) or `logs/run_watch.py`
 (watch, 360s, `logs/wat_*.png`). The fix is in `sys_munmap` + `sys_madvise_dontneed`
 + the `mmap_free_batch` helper in `src/mmap.c`.
+
+
+## SLICE 50b (2026-07-27) — the RESIDUAL corruption window ROOT-CAUSED in code: map_4k silently REPLACES a present PTE, so two BKL-free demand faults on the same VA discard the winner's writes. Atomic install-if-absent + shootdown quarantine landed; crash-rate validation BLOCKED by a YouTube-side loading outage (proven environmental by A/B revert-test)
+
+### The residual window, found by re-reading the crash-adjacent evidence
+Slice 50 left "residual freed-page-reuse window open". Re-examining the ORIGINAL
+277s watch-page crash log (run41yt.log): THREE `[vmm] WARN: map_4k: virt ...
+already mapped` lines fired within 15ms of the fatal fault — one of them
+(0x10240d3a5000) two pages from the crashing Vec buffer (rax=0x10240d3a3800).
+`map_4k` (src/vmm.c) UNCONDITIONALLY overwrites a present PTE ("remapping is
+legal" per its own comment; ~165k replaces per chrome boot). Combined with the
+BKL-free fault path, that is a lost-write race needing NO free/TLB machinery at
+all:
+
+1. Threads A+B fault the same freshly-madvise-dropped VA concurrently (chrome
+   PartitionAlloc recommit does this constantly under WHPX's real parallelism).
+2. Both pass the `vmm_translate == absent` check (TOCTOU), both allocate + zero
+   a frame.
+3. A maps frame FA, returns; A's thread WRITES (e.g. a pointer) through it.
+4. B maps frame FB (zeroed) — map_4k silently REPLACES FA. A's write is GONE.
+5. A reader loads the pointer slot -> 0 -> `movzbl 0x6(%rbx)` with rbx=NULL ->
+   the exact 0x208c13a signature. (And the replace does only a LOCAL invlpg, so
+   A's CPU keeps a stale FA translation -> divergent views -> the ASCII variant.)
+
+### Fix landed (src/vmm.c + src/mmap.c + include/tobyos/vmm.h)
+- `vmm_map_page_if_absent(virt, phys, flags)` / `vmm_remap_page_if(virt,
+  expected_phys, new_phys, flags)`: single-page installers that do the
+  check+install as ONE critical section under `g_vmm_lock` (which all mappers
+  already take). Returns 1 installed / 0 lost-race / -1 walk-OOM.
+- `mmap_try_fault` demand path: install-if-absent; the LOSER frees its own
+  never-visible frame and returns resolved (`[pfrace]` logs it, CHROMIUM_BOOT).
+- `mmap_try_fault` CoW path: compare-and-remap (only install our copy if the
+  frame is still the one we copied from); loser frees its stale copy.
+  NOTE: old_phys is still LEAKED (pre-existing behavior kept) — a first attempt
+  that also dec/freed it with munmap's refcount recipe was REVERTED (refcount
+  provenance of VMA-CoW frames unverified; freeing a live frame is the exact
+  bug class being fixed).
+- Shootdown-timeout hole closed: `tlb_shootdown_remote_sync()` (apic.c) reports
+  whether every peer ACKED within the bounded wait. `mmap_free_batch_flush` now
+  QUARANTINES frames from un-acked flushes (`g_tlbq`, 8192 entries) and only
+  releases them after a later fully-acked shootdown; ring-full deliberately
+  LEAKS (a lost page beats a corrupted one). Under WHPX ack timeouts are
+  routine (host deschedules vCPUs), so this path is exercised for real.
+- isr.c fatal dump: `[isr] pointer-source page (rax=...)` — page journal +
+  mprot history for the page the corrupted POINTER was loaded from (rax = the
+  Vec buffer), not just cr2 (which is a useless tiny offset in these crashes).
+
+### Validation status — honest
+- **Local video (file:///opt/chrome/vid.webm): PLAYS on the new kernel** —
+  continuous frames the whole 190s run (~300 frames; the slice-50 chromewin
+  flow-control fix also holds: no more freeze-at-150). Fault paths + decode +
+  render healthy.
+- **defboot** (stock, non-CHROMIUM): CLEAN — login + session #1, ZERO faults,
+  with the full final fix set (if_absent/remap_if/tlbq are unconditional code).
+- **Corruption crash-rate on YouTube: BLOCKED, environmental.** After the fix,
+  4/4 YouTube runs (watch x2, embed x2) failed to LOAD (bootstrap OK, ONE tcp
+  connect, ~62KB HTML received, then chrome idle forever; historically 5/7
+  loaded same-day). A/B REVERT-TEST settled it: the PRE-change kernel (stash +
+  rebuild) shows the IDENTICAL no-load shape — so the outage is YouTube-side
+  (bot throttling after ~20 hits from this IP today, or a served-page change),
+  NOT the kernel. Guest boot milestones are byte-comparable pre/post (login
+  3.4s vs 3.5s), killing the "boot got slower" scare (host-cache variance).
+  The 0x208c13a crash-rate measurement therefore CANNOT run until YouTube
+  loads again — retry after the throttle decays; the race itself is now
+  structurally closed (check+install is atomic), and `[pfrace]` will count
+  real occurrences when load returns.
+
+### For the next session
+1. Re-run `logs/run_watch.py` / `run_embed.py` a few times (later, fresh IP or
+   after decay); watch for `[pfrace]` hits (the race firing + being absorbed)
+   and for ANY 0x208c13a recurrence (would falsify this fix too).
+2. The `[vmm] WARN map_4k already mapped` counter should now be near-ZERO from
+   the demand path; remaining replaces come from MAP_FIXED eager-commit in
+   sys_mmap (BKL-held, but replaces frames WITHOUT freeing the old frame or
+   remote shootdown — a known leak + potential corruption for MAP_FIXED-heavy
+   apps; unaudited, next candidate if 0x208c13a ever recurs).
+3. page_fault.c native Case-2 demand path writes `*pte` with NO lock — same
+   TOCTOU class for native multithreaded apps; unaudited.

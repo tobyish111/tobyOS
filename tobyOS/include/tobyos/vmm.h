@@ -62,6 +62,17 @@ uint64_t vmm_kernel_pml4_phys(void);
  * on misaligned input or PMM OOM while growing intermediate tables. */
 bool vmm_map(uint64_t virt, uint64_t phys, size_t bytes, uint32_t flags);
 
+/* Atomic single-page installers for the BKL-free fault resolvers (slice 50
+ * corruption fix): check+install as ONE critical section under the vmm lock,
+ * so two CPUs faulting the same page can't silently replace each other's
+ * frame (a replace discards every byte the winner already wrote through it).
+ * Return 1 = installed, 0 = lost the race (nothing changed; caller frees its
+ * own frame), -1 = table alloc failure. Local invlpg only -- after a
+ * successful REMAP (frame change) the caller must tlb_shootdown_remote(). */
+int vmm_map_page_if_absent(uint64_t virt, uint64_t phys, uint32_t flags);
+int vmm_remap_page_if(uint64_t virt, uint64_t expected_phys,
+                      uint64_t new_phys, uint32_t flags);
+
 /* Unmap [virt..virt+bytes). Tolerates already-unmapped pages (logs a
  * warning but keeps going). Issues invlpg per page. */
 bool vmm_unmap(uint64_t virt, size_t bytes);
