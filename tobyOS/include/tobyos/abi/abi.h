@@ -937,8 +937,15 @@ struct abi_ttf_raster {
     int32_t  face;         /* kernel face id (0 regular / web faces) */
 };
 
+/* Non-blocking read (slice 45): like ABI_SYS_READ but on an empty pipe with a
+ * live writer it returns -ABI_EAGAIN instead of blocking. Native apps have no
+ * fcntl(O_NONBLOCK)/poll for pipe fds; chromewin needs this to drain the CDP
+ * --remote-debugging-pipe (Page.screencastFrame push) without blocking its TK
+ * input loop. a1=fd, a2=buf, a3=len. Non-pipe fds fall back to blocking read. */
+#define ABI_SYS_READ_NB         185
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          185
+#define ABI_SYS_NR_MAX          186
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

@@ -115,6 +115,22 @@ static int json_has_id(const char *msg, int id) {
     return strstr(msg, pat) != NULL;
 }
 
+/* Find "key":<number> and return the int (the FIRST occurrence whose value is a
+ * digit -- so it picks the numeric screencast sessionId in a screencastFrame
+ * event's params, NOT the flat string "sessionId":"<hex>" top-level field).
+ * Returns -1 if not found. */
+static int json_int(const char *msg, const char *key) {
+    char pat[64];
+    snprintf(pat, sizeof pat, "\"%s\":", key);
+    const char *p = msg;
+    while ((p = strstr(p, pat)) != NULL) {
+        p += strlen(pat);
+        if (*p >= '0' && *p <= '9') return atoi(p);   /* numeric value */
+        p++;                                           /* was a string/obj: keep scanning */
+    }
+    return -1;
+}
+
 /* ---- CDP transport --------------------------------------------------- */
 
 static void cdp_write(const char *json) {
@@ -151,6 +167,41 @@ static int cdp_read_msg(void) {
     }
 }
 
+/* Non-blocking read of the CDP pipe (slice 45 ABI_SYS_READ_NB). Returns bytes
+ * read (>0), 0 on EOF, or -11 (-ABI_EAGAIN) when nothing is buffered yet. Lets
+ * the TK loop drain pushed screencast frames without a blocking read stalling
+ * input. */
+static long read_nb(int fd, void *buf, long len) {
+    return sc3(ABI_SYS_READ_NB, (long)fd, (long)(uintptr_t)buf, len);
+}
+
+/* Pull whatever bytes are available into g_rxbuf. 1 got data, 0 none-now
+ * (EAGAIN), -1 EOF/err. */
+static int cdp_fill_nb(void) {
+    if (g_rxlen >= MSG_MAX - 4096) {           /* runaway: drop the oldest half */
+        memmove(g_rxbuf, g_rxbuf + MSG_MAX / 2, g_rxlen - MSG_MAX / 2);
+        g_rxlen -= MSG_MAX / 2;
+    }
+    long r = read_nb(g_resp_fd, g_rxbuf + g_rxlen, (long)(MSG_MAX - g_rxlen));
+    if (r > 0)   { g_rxlen += (size_t)r; return 1; }
+    if (r == -11) return 0;                    /* EAGAIN: no data right now */
+    return -1;                                 /* 0 = EOF, other = error */
+}
+
+/* Extract one complete NUL-delimited message from g_rxbuf into g_msg. 1 if a
+ * full message was available, 0 if only a partial (left buffered). */
+static int cdp_take_msg(void) {
+    char *z = memchr(g_rxbuf, 0, g_rxlen);
+    if (!z) return 0;
+    size_t n = (size_t)(z - g_rxbuf);
+    if (n >= MSG_MAX) n = MSG_MAX - 1;
+    memcpy(g_msg, g_rxbuf, n); g_msg[n] = 0;
+    size_t rest = g_rxlen - (n + 1);
+    memmove(g_rxbuf, z + 1, rest);
+    g_rxlen = rest;
+    return 1;
+}
+
 /* Send a browser-level or session command; return its id. */
 static int cdp_send(const char *method, const char *params_json, int with_session) {
     static char buf[2048];
@@ -167,13 +218,63 @@ static int cdp_send(const char *method, const char *params_json, int with_sessio
     return id;
 }
 
-/* Read until the response for `id` arrives (events are skipped); the
- * response is left in g_msg. Returns 1 on success. */
+/* ---- screencast frame handling (slice 45) ---------------------------- *
+ * Page.startScreencast makes chrome PUSH a Page.screencastFrame event (base64
+ * JPEG + a numeric sessionId) on every damage, instead of us polling
+ * Page.captureScreenshot -- which queued behind a busy renderer and starved the
+ * frame rate (YouTube returned ~2 frames). Each frame MUST be acked with
+ * Page.screencastFrameAck{sessionId} or chrome stops sending. */
+
+static long g_last_frame_ms;
+
+static void handle_screencast_frame(void) {
+    int sid = json_int(g_msg, "sessionId");        /* numeric screencast session */
+    const char *p = strstr(g_msg, "\"data\":\"");
+    if (p) {
+        p += 8;
+        const char *e = strchr(p, '"');
+        if (e) {
+            long n = b64_decode_buf(p, e - p, g_png);
+            if (n > 8) {
+                toby_image_t *img = toby_image_load(g_png, (size_t)n);  /* JPEG */
+                if (img) {
+                    toby_image_t *old = g_frame;
+                    g_frame = img;
+                    if (old) toby_image_free(old);
+                    g_frames++;
+                    g_last_frame_ms = sys_clock_ms();
+                    if (g_frames == 1 || (g_frames % 30) == 0)
+                        printf("[chromewin] frame %d: %dx%d jpeg=%ld bytes\n",
+                               g_frames, img->width, img->height, n);
+                    tk_redraw(&win);
+                } else {
+                    logln("JPEG decode failed");
+                }
+            }
+        }
+    }
+    if (sid >= 0) {                                /* ack -> chrome sends the next */
+        char params[48];
+        snprintf(params, sizeof params, "{\"sessionId\":%d}", sid);
+        cdp_send("Page.screencastFrameAck", params, 1);
+    }
+}
+
+/* Dispatch one event message currently in g_msg. Only screencastFrame needs
+ * action; command responses and other events are ignored (fire-and-forget). */
+static void cdp_dispatch(void) {
+    if (strstr(g_msg, "\"method\":\"Page.screencastFrame\""))
+        handle_screencast_frame();
+}
+
+/* Read until the response for `id` arrives; events encountered while waiting
+ * are DISPATCHED (so a screencast frame pushed mid-bootstrap is drawn + acked,
+ * not lost). The response is left in g_msg. Returns 1 on success. */
 static int cdp_wait(int id) {
     while (!g_quit) {
         if (!cdp_read_msg()) return 0;
         if (json_has_id(g_msg, id)) return 1;
-        /* else: unsolicited event -- ignore for the MVP */
+        cdp_dispatch();
     }
     return 0;
 }
@@ -285,41 +386,23 @@ static int cdp_bootstrap(void) {
 
     id = cdp_send("Page.enable", "{}", 1);
     if (!cdp_wait(id)) return -1;
+
+    /* Slice 45: push frames instead of polling captureScreenshot. JPEG keeps
+     * each frame small (toby_image_load decodes it); everyNthFrame=1 = every
+     * damage; quality 60 balances size vs legibility at 800x600. */
+    id = cdp_send("Page.startScreencast",
+                  "{\"format\":\"jpeg\",\"quality\":60,"
+                  "\"maxWidth\":800,\"maxHeight\":600,\"everyNthFrame\":1}", 1);
+    if (!cdp_wait(id)) return -1;
+
     snprintf(g_status, sizeof g_status, "%s", START_URL);
     return 0;
 }
 
-/* ---- screenshot poll -------------------------------------------------- */
-
-static long g_png_n;              /* size of the newest decoded frame PNG */
-
-static void capture_frame(void) {
-    int id = cdp_send("Page.captureScreenshot", "{\"format\":\"png\"}", 1);
-    if (!cdp_wait(id)) return;
-
-    const char *p = strstr(g_msg, "\"data\":\"");
-    if (!p) return;                            /* error reply -- keep old frame */
-    p += 8;
-    const char *e = strchr(p, '"');
-    if (!e) return;
-
-    long n = b64_decode_buf(p, e - p, g_png);
-    if (n <= 8) return;
-    g_png_n = n;
-    toby_image_t *img = toby_image_load(g_png, (size_t)n);
-    if (!img) { logln("PNG decode failed"); return; }
-
-    toby_image_t *old = g_frame;
-    g_frame = img;
-    if (old) toby_image_free(old);
-    g_frames++;
-    if (g_frames == 1 || (g_frames % 10) == 0)
-        printf("[chromewin] frame %d: %dx%d png=%ld bytes\n",
-               g_frames, img->width, img->height, n);
-    tk_redraw(&win);
-}
-
-/* ---- input forwarding -------------------------------------------------- */
+/* ---- input forwarding -------------------------------------------------- *
+ * Input.* commands are FIRE-AND-FORGET: with the screencast pump, a blocking
+ * cdp_wait here would stall the loop (and drop pushed frames). The command
+ * responses just drain + get ignored in the main loop. */
 
 static const char *btn_name(uint8_t b) {
     if (b & TK_BTN_RIGHT)  return "right";
@@ -332,33 +415,29 @@ static void send_mouse(const char *type, int x, int y, uint8_t button, int click
     snprintf(params, sizeof params,
              "{\"type\":\"%s\",\"x\":%d,\"y\":%d,\"button\":\"%s\",\"clickCount\":%d}",
              type, x, y, clicks ? btn_name(button) : "none", clicks);
-    int id = cdp_send("Input.dispatchMouseEvent", params, 1);
-    cdp_wait(id);
+    cdp_send("Input.dispatchMouseEvent", params, 1);
 }
 
 static void send_key(uint8_t key) {
     char params[256];
     int id;
+    (void)id;
     if (key == TK_KEY_ENTER) {
-        id = cdp_send("Input.dispatchKeyEvent",
-                      "{\"type\":\"rawKeyDown\",\"windowsVirtualKeyCode\":13,"
-                      "\"key\":\"Enter\",\"text\":\"\\r\"}", 1);
-        cdp_wait(id);
-        id = cdp_send("Input.dispatchKeyEvent",
-                      "{\"type\":\"keyUp\",\"windowsVirtualKeyCode\":13,"
-                      "\"key\":\"Enter\"}", 1);
-        cdp_wait(id);
+        cdp_send("Input.dispatchKeyEvent",
+                 "{\"type\":\"rawKeyDown\",\"windowsVirtualKeyCode\":13,"
+                 "\"key\":\"Enter\",\"text\":\"\\r\"}", 1);
+        cdp_send("Input.dispatchKeyEvent",
+                 "{\"type\":\"keyUp\",\"windowsVirtualKeyCode\":13,"
+                 "\"key\":\"Enter\"}", 1);
         return;
     }
     if (key == TK_KEY_BACKSPACE) {
-        id = cdp_send("Input.dispatchKeyEvent",
-                      "{\"type\":\"rawKeyDown\",\"windowsVirtualKeyCode\":8,"
-                      "\"key\":\"Backspace\"}", 1);
-        cdp_wait(id);
-        id = cdp_send("Input.dispatchKeyEvent",
-                      "{\"type\":\"keyUp\",\"windowsVirtualKeyCode\":8,"
-                      "\"key\":\"Backspace\"}", 1);
-        cdp_wait(id);
+        cdp_send("Input.dispatchKeyEvent",
+                 "{\"type\":\"rawKeyDown\",\"windowsVirtualKeyCode\":8,"
+                 "\"key\":\"Backspace\"}", 1);
+        cdp_send("Input.dispatchKeyEvent",
+                 "{\"type\":\"keyUp\",\"windowsVirtualKeyCode\":8,"
+                 "\"key\":\"Backspace\"}", 1);
         return;
     }
     if (key < 0x20 || key >= 0x80) return;     /* arrows etc.: skip in MVP */
@@ -366,8 +445,7 @@ static void send_key(uint8_t key) {
     if (key == '"' || key == '\\') snprintf(esc, sizeof esc, "\\%c", key);
     else snprintf(esc, sizeof esc, "%c", key);
     snprintf(params, sizeof params, "{\"type\":\"char\",\"text\":\"%s\"}", esc);
-    id = cdp_send("Input.dispatchKeyEvent", params, 1);
-    cdp_wait(id);
+    cdp_send("Input.dispatchKeyEvent", params, 1);
 }
 
 /* ---- TobyTK glue -------------------------------------------------------- */
@@ -433,41 +511,39 @@ int main(void) {
         for (int i = 0; i < 400 && !tk_pump(&win); i++) usleep(50000);
         return 1;
     }
-    logln("bootstrap OK; polling screenshots");
+    logln("bootstrap OK; screencast started");
 
-    long last_cap = 0;
-    /* Navigation retry: the FIRST https handshake routinely exceeds the
-     * origin's timeout under TCG (run39: chrome took 15s from ServerHello
-     * to Finished; the server FIN'd at 15s and the page stayed blank).
-     * A re-navigate rides TLS session resumption, which skips most of the
-     * handshake crypto and completes in time. Retry while the frame PNG
-     * size never changes (blank page renders a byte-identical PNG). */
+    /* Event-driven main loop (slice 45): chrome PUSHES screencast frames; we
+     * drain the pipe non-blocking so TK input is never stalled behind a frame.
+     *   tk_pump -> forwards mouse/keys as Input.* (fire-and-forget)
+     *   drain   -> reads every buffered CDP message; screencastFrame -> blit+ack
+     * Nav-retry: the first https handshake can exceed the origin's timeout, so
+     * re-navigate only if the page has NEVER painted (g_frames==0) within 45s.
+     * A static page renders once then produces no further screencast frames
+     * (chrome pushes on damage), so "no frame lately" must NOT trigger re-nav. */
     long nav_ms = sys_clock_ms();
-    long nav_png_n = -1;                       /* g_png_n at last nav */
     int  navs = 0;
+    g_last_frame_ms = sys_clock_ms();
     while (!g_quit) {
-        if (tk_pump(&win)) break;              /* drains events -> Input.* */
+        if (tk_pump(&win)) break;              /* input -> Input.* */
+
+        for (;;) {                             /* drain all buffered CDP msgs */
+            int f = cdp_fill_nb();
+            if (f < 0) { g_quit = 1; break; }  /* pipe EOF: chrome gone */
+            int any = 0;
+            while (cdp_take_msg()) { cdp_dispatch(); any = 1; }
+            if (f == 0 && !any) break;         /* EAGAIN and nothing buffered */
+        }
+
         long now = sys_clock_ms();
-        if (now - last_cap > 400) {            /* ~2.5 fps target under TCG */
-            capture_frame();
-            last_cap = sys_clock_ms();
+        if (navs < 4 && g_frames == 0 && now - nav_ms > 45000) {
+            char params[192];
+            navs++; nav_ms = now;
+            snprintf(params, sizeof params, "{\"url\":\"%s\"}", START_URL);
+            cdp_send("Page.navigate", params, 1);   /* fire-and-forget */
+            printf("[chromewin] nav retry %d (no frame for 45s)\n", navs);
         }
-        if (navs < 4 && g_png_n > 0 && now - nav_ms > 45000) {
-            if (nav_png_n > 0 && g_png_n != nav_png_n) {
-                navs = 4;                      /* content painted: stop */
-            } else {
-                char params[192];
-                navs++;
-                nav_ms = now;
-                nav_png_n = g_png_n;
-                snprintf(params, sizeof params, "{\"url\":\"%s\"}", START_URL);
-                int id = cdp_send("Page.navigate", params, 1);
-                cdp_wait(id);
-                printf("[chromewin] nav retry %d (png stuck at %ld bytes)\n",
-                       navs, g_png_n);
-            }
-        }
-        usleep(30000);
+        usleep(15000);
     }
     printf("[chromewin] exiting; frames=%d\n", g_frames);
     return 0;

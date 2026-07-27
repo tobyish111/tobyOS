@@ -361,6 +361,27 @@ static long sys_read(int fd, void *buf, size_t len) {
     return rv;
 }
 
+/* Non-blocking read (slice 45, ABI_SYS_READ_NB): on a pipe, drains what is
+ * buffered and returns -ABI_EAGAIN instead of parking when momentarily empty.
+ * Native apps have no fcntl(O_NONBLOCK)/working poll on pipe fds; chromewin uses
+ * this to pump the CDP screencast pipe from its TK loop. Non-pipe fds fall back
+ * to the ordinary blocking read (chromewin only calls this on the pipe). */
+static long sys_read_nb(int fd, void *buf, size_t len) {
+    if (len == 0) return 0;
+    if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+    if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
+    struct file *f = fd_lookup(fd);
+    if (!f) return -1;
+    if (f->kind != FILE_KIND_PIPE_R)
+        return sys_read(fd, buf, len);           /* only pipes get the NB path */
+    void *k = kmalloc(len);
+    if (!k) return -ABI_ENOMEM;
+    long rv = pipe_tryread(f->pipe, k, len);     /* >0 / 0 EOF / -ABI_EAGAIN */
+    if (rv > 0 && copy_to_user(buf, k, (size_t)rv) != 0) rv = -ABI_EFAULT;
+    kfree(k);
+    return rv;
+}
+
 /* pread64/pwrite64: positioned I/O that does NOT disturb the file's current
  * offset. glibc's dynamic loader (dl-load.c open_verify) pread64()s the ELF
  * header + program headers of every shared object it maps, and real tools like
@@ -3531,6 +3552,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_write((int)a1, (const void *)a2, (size_t)a3);
     case SYS_READ:
         return sys_read((int)a1, (void *)a2, (size_t)a3);
+    case ABI_SYS_READ_NB:                        /* slice 45: non-blocking pipe read */
+        return sys_read_nb((int)a1, (void *)a2, (size_t)a3);
     case SYS_PIPE:
         return sys_pipe((int *)a1);
     case SYS_CLOSE:

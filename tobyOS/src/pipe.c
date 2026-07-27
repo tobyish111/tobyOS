@@ -148,6 +148,28 @@ long pipe_read(struct pipe *p, void *buf, size_t n) {
     return (long)got;
 }
 
+/* Non-blocking read (slice 45): never parks. Returns bytes copied (>0), 0 at
+ * EOF (no data AND no writers left), or -11 (-ABI_EAGAIN) when the pipe is
+ * momentarily empty but a writer is still alive. Lets a native app drain a pipe
+ * from an event loop without a blocking read stalling the loop (chromewin's CDP
+ * screencast pump). */
+long pipe_tryread(struct pipe *p, void *buf, size_t n) {
+    if (!p || !buf) return -1;
+    if (n == 0) return 0;
+    if (p->count == 0)
+        return (p->writers > 0) ? -11 /* -ABI_EAGAIN */ : 0 /* EOF */;
+
+    uint8_t *out = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < n && p->count > 0) {
+        out[got++] = p->buf[p->tail];
+        p->tail = (p->tail + 1) % PIPE_BUF_SZ;
+        p->count--;
+    }
+    if (p->wq_write) wq_wake_all(&p->wq_write);
+    return (long)got;
+}
+
 long pipe_write(struct pipe *p, const void *buf, size_t n) {
     if (!p || !buf) return -1;
     if (n == 0) return 0;

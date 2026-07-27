@@ -57,6 +57,7 @@ int pipe_create(struct file **out_r, struct file **out_w);
 /* Internal helpers used by file.c (kept in the header so file.c can
  * call them without a circular include via opaque pointers). */
 long pipe_read (struct pipe *p, void *buf, size_t n);
+long pipe_tryread(struct pipe *p, void *buf, size_t n);   /* non-blocking (slice 45) */
 long pipe_write(struct pipe *p, const void *buf, size_t n);
 void pipe_close_reader(struct pipe *p);
 void pipe_close_writer(struct pipe *p);

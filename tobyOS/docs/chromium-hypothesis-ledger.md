@@ -1831,3 +1831,42 @@ here. It COULD slow YouTube content-load, but it is not established as the
 bottleneck (the ~100s network gaps are far larger and may be chrome-internal).
 Not chased now. Next: Phase 3 (Page.startScreencast frame push, input routing,
 video playback) -- the stated goal, and independent of this.
+
+
+## SLICE 45 (2026-07-24) — Phase 3a: Page.startScreencast (push frames) replaces polled captureScreenshot; a non-blocking pipe read enables it
+
+Phase 3 groundwork. Polled `Page.captureScreenshot` sends a blocking request that
+queues behind a busy renderer -- YouTube returned only ~2 frames because the
+renderer never idled to answer it. `Page.startScreencast` instead makes chrome
+PUSH a `Page.screencastFrame` event (base64 JPEG + numeric sessionId) on every
+damage; each is acked with `Page.screencastFrameAck{sessionId}`.
+
+### The enabler: non-blocking pipe read (kernel)
+chromewin is a NATIVE app driving chrome's --remote-debugging-pipe. A push-frame
+event loop must drain that pipe WITHOUT a blocking read stalling TK input -- but
+tobyOS native apps have no fcntl(O_NONBLOCK) and no working generic poll on pipe
+fds (libtoby poll() falls back to sleep+mark-ready). Added a minimal primitive:
+- `ABI_SYS_READ_NB` (185) + `sys_read_nb` (syscall.c): like READ but on a pipe
+  returns -ABI_EAGAIN instead of parking when momentarily empty (writer alive).
+- `pipe_tryread` (pipe.c): the non-blocking pipe drain; EOF=0, empty=-EAGAIN.
+Purely additive -- pipe_read's blocking default is untouched, and only a caller
+that opts in (chromewin) sees non-blocking behavior.
+
+### chromewin: single-threaded event loop (programs/chromewin/main.c)
+Bootstrap now ends with Page.startScreencast (jpeg, q60, 800x600, everyNthFrame
+1). The main loop is event-driven: tk_pump forwards mouse/keys as Input.*
+(FIRE-AND-FORGET -- a blocking ack would drop frames); then a non-blocking drain
+(cdp_fill_nb + cdp_take_msg + cdp_dispatch) blits + acks every buffered
+screencastFrame. cdp_wait (bootstrap only) also dispatches frames so one pushed
+mid-bootstrap isn't lost. toby_image_load decodes the JPEG (stb_image). Nav-retry
+is keyed on g_frames==0 (page NEVER painted) -- a static page renders once then
+sends no more frames, so "no frame lately" must not re-navigate (an earlier
+version mis-fired 7 re-navs on static example.com).
+
+### Validated
+example.com renders under WHPX via pushed JPEG frames (logs/shotwx_b.png), 0
+spurious nav-retries, no faults. The full desktop + TobyTK boot and run the new
+syscall path cleanly (base OS exercised). Static-page frame count is ~1 by design
+(damage-driven). Next: flip to youtube + --autoplay-policy and test whether
+startScreencast delivers the continuous frames a loading/animating page (and
+video) produce -- the case polled captureScreenshot starved to ~2 frames.
