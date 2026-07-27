@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <tobyos/abi/abi.h>
 #include <toby/tk.h>
 #include <toby/image.h>
@@ -47,7 +48,22 @@ static long sys_clock_ms(void) { return sc0(ABI_SYS_CLOCK_MS); }
 #define WIN_W  PAGE_W
 #define WIN_H  (PAGE_H + BAR_H)
 
-#define START_URL "https://example.com/"
+/* Video-pipeline probe (slice 49): a minimal local autoplay <video> page with a
+ * tiny inline VP9 data: URI. Deterministic + fast (~10s vs YouTube's flaky 277s)
+ * -- splits "does any video decode+paint" from "does YouTube's heavy app get
+ * there". Flip LOCAL_HTML_FILE off (comment it) to use START_URL directly.
+ *
+ * NOTE: chrome served a file:///...vidtest.html over file:// as text/plain on
+ * tobyOS (the raw HTML rendered as literal text -- the <video> never parsed), so
+ * instead chromewin READS the local file at bootstrap and navigates to an
+ * unambiguous data:text/html;base64,... URL (no MIME sniffing, no file:// origin
+ * quirks). */
+/* #define LOCAL_HTML_FILE "/opt/chrome/vidtest.html" */  /* data:text/html path */
+/* Slice 50: with the TLB-shootdown-ordering fix (munmap/madvise free path) the
+ * embed player no longer crashes at rip 0x208c13a. Now retest the handoff's REAL
+ * target -- the full WATCH page -- which hit that same corruption crash (~277s).
+ * (Proven paths to flip back to: youtube.com/embed/<id> ; file:///opt/chrome/vid.webm ; example.com) */
+#define START_URL "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
 
 static struct tk_window win;
 static toby_image_t *g_frame;        /* latest decoded screenshot */
@@ -66,7 +82,14 @@ static long g_quit;
 static char    g_rxbuf[MSG_MAX];     /* accumulates raw pipe bytes */
 static size_t  g_rxlen;
 static char    g_msg[MSG_MAX];       /* one complete NUL-delimited message */
-static uint8_t g_png[MSG_MAX];       /* decoded PNG bytes */
+static uint8_t g_png[MSG_MAX];       /* decoded PNG bytes (also raw local-file buf) */
+
+/* Big buffers for a data:text/html;base64,... navigation URL built from a local
+ * HTML file (LOCAL_HTML_FILE). A ~60KB page base64s to ~80KB; the createTarget
+ * JSON wraps that, so cdp_send's 2KB buf is far too small -- built separately. */
+#define BIGURL_MAX (320 * 1024)
+static char    g_dataurl[BIGURL_MAX];
+static char    g_bigcmd[BIGURL_MAX + 256];
 
 static void logln(const char *s) { printf("[chromewin] %s\n", s); }
 
@@ -89,6 +112,55 @@ static long b64_decode_buf(const char *s, long n, uint8_t *out) {
     }
     return o;
 }
+
+/* base64 ENCODE (for the local-file -> data:text/html URL path). */
+static const char B64E[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static long b64_encode_buf(const uint8_t *in, long n, char *out) {
+    long o = 0, i = 0;
+    for (; i + 3 <= n; i += 3) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
+        out[o++] = B64E[(v >> 18) & 63]; out[o++] = B64E[(v >> 12) & 63];
+        out[o++] = B64E[(v >> 6) & 63];  out[o++] = B64E[v & 63];
+    }
+    long rem = n - i;
+    if (rem == 1) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        out[o++] = B64E[(v >> 18) & 63]; out[o++] = B64E[(v >> 12) & 63];
+        out[o++] = '='; out[o++] = '=';
+    } else if (rem == 2) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8);
+        out[o++] = B64E[(v >> 18) & 63]; out[o++] = B64E[(v >> 12) & 63];
+        out[o++] = B64E[(v >> 6) & 63];  out[o++] = '=';
+    }
+    out[o] = 0;
+    return o;
+}
+
+#ifdef LOCAL_HTML_FILE
+/* Read LOCAL_HTML_FILE and build a data:text/html;base64,<...> URL in g_dataurl.
+ * Returns the URL, or NULL on failure. */
+static const char *build_local_data_url(void) {
+    int fd = open(LOCAL_HTML_FILE, O_RDONLY, 0);
+    if (fd < 0) { logln("open(LOCAL_HTML_FILE) failed"); return NULL; }
+    long total = 0, r;
+    while (total < MSG_MAX &&
+           (r = read(fd, g_png + total, (long)(MSG_MAX - total))) > 0)
+        total += r;
+    close(fd);
+    if (total <= 0) { logln("read(LOCAL_HTML_FILE) empty"); return NULL; }
+    const char *pfx = "data:text/html;base64,";
+    long pl = (long)strlen(pfx);
+    if (pl + (total + 2) / 3 * 4 + 1 >= BIGURL_MAX) {
+        logln("local page too big for data URL"); return NULL;
+    }
+    memcpy(g_dataurl, pfx, pl);
+    long el = b64_encode_buf(g_png, total, g_dataurl + pl);
+    printf("[chromewin] local page %ld bytes -> data URL %ld bytes\n",
+           total, pl + el);
+    return g_dataurl;
+}
+#endif
 
 /* ---- tiny JSON field scanners (CDP replies are flat enough) --------- */
 
@@ -178,9 +250,19 @@ static long read_nb(int fd, void *buf, long len) {
 /* Pull whatever bytes are available into g_rxbuf. 1 got data, 0 none-now
  * (EAGAIN), -1 EOF/err. */
 static int cdp_fill_nb(void) {
-    if (g_rxlen >= MSG_MAX - 4096) {           /* runaway: drop the oldest half */
-        memmove(g_rxbuf, g_rxbuf + MSG_MAX / 2, g_rxlen - MSG_MAX / 2);
-        g_rxlen -= MSG_MAX / 2;
+    if (g_rxlen >= MSG_MAX - 4096) {
+        /* Behind on drain (a fast video floods faster than we decode): drop
+         * whole buffered messages up to the LAST NUL so we resync on a message
+         * BOUNDARY. Dropping a fixed half cut a frame mid-message -> a corrupt
+         * JPEG -> "decode failed" for that frame and, once perpetually behind,
+         * for every frame after. Keep only the trailing (incomplete) message. */
+        size_t cut = 0;
+        for (size_t i = g_rxlen; i > 0; i--) {
+            if (g_rxbuf[i - 1] == 0) { cut = i; break; }   /* i-1 = last NUL */
+        }
+        if (cut == 0) cut = g_rxlen;          /* one giant partial: drop it all */
+        memmove(g_rxbuf, g_rxbuf + cut, g_rxlen - cut);
+        g_rxlen -= cut;
     }
     long r = read_nb(g_resp_fd, g_rxbuf + g_rxlen, (long)(MSG_MAX - g_rxlen));
     if (r > 0)   { g_rxlen += (size_t)r; return 1; }
@@ -330,6 +412,7 @@ static int spawn_chrome(void) {
             (char *)"--user-data-dir=/data/cr",
             (char *)"--window-size=800,600",
             (char *)"--ignore-certificate-errors",
+            (char *)"--allow-file-access-from-files",
             (char *)"--autoplay-policy=no-user-gesture-required",
             0,
         };
@@ -358,6 +441,18 @@ static int spawn_chrome(void) {
     return 0;
 }
 
+/* Force the first <video> to play + loop (muted). A MediaDocument (direct
+ * navigation to a .webm) creates a <video controls> that does NOT autoplay even
+ * with --autoplay-policy; userGesture:true satisfies the gesture requirement.
+ * Fire-and-forget: the response drains in the main loop. Null-safe (no <video>
+ * -> no-op), so it is harmless on non-video pages. */
+static void kick_play(void) {
+    cdp_send("Runtime.evaluate",
+             "{\"expression\":\"var v=document.querySelector('video');"
+             "if(v){v.muted=true;v.loop=true;v.play&&v.play();}\","
+             "\"userGesture\":true}", 1);
+}
+
 /* ---- CDP bootstrap: tab + flat session ------------------------------- */
 
 static int cdp_bootstrap(void) {
@@ -366,9 +461,20 @@ static int cdp_bootstrap(void) {
     snprintf(g_status, sizeof g_status, "waiting for DevTools...");
     tk_redraw(&win); tk_pump(&win);
 
-    snprintf(params, sizeof params, "{\"url\":\"%s\"}", START_URL);
-    int id = cdp_send("Target.createTarget", params, 0);
-    printf("[chromewin] sent Target.createTarget id=%d; waiting for reply\n", id);
+    const char *navurl = START_URL;
+#ifdef LOCAL_HTML_FILE
+    const char *du = build_local_data_url();
+    if (du) navurl = du;
+#endif
+    /* createTarget with a possibly-huge (data:) URL: build in g_bigcmd, since
+     * cdp_send's 2KB static buffer can't hold an ~80KB base64 page. */
+    int id = g_next_id++;
+    snprintf(g_bigcmd, sizeof g_bigcmd,
+             "{\"id\":%d,\"method\":\"Target.createTarget\",\"params\":{\"url\":\"%s\"}}",
+             id, navurl);
+    cdp_write(g_bigcmd);
+    printf("[chromewin] sent Target.createTarget id=%d urllen=%lu; waiting for reply\n",
+           id, (unsigned long)strlen(navurl));
     if (!cdp_wait(id)) { logln("createTarget: pipe closed / no reply"); return -1; }
     logln("createTarget reply received");
     if (json_str(g_msg, "targetId", tid, sizeof tid) < 0) {
@@ -388,15 +494,25 @@ static int cdp_bootstrap(void) {
     id = cdp_send("Page.enable", "{}", 1);
     if (!cdp_wait(id)) return -1;
 
-    /* Slice 45: push frames instead of polling captureScreenshot. JPEG keeps
-     * each frame small (toby_image_load decodes it); everyNthFrame=1 = every
-     * damage; quality 60 balances size vs legibility at 800x600. */
+    /* Slice 45: push frames instead of polling captureScreenshot. Slice 50: a
+     * PLAYING video pushes ~30fps of 800x600 damage, which stb_image can't decode
+     * fast enough on tobyOS -> g_rxbuf backs up -> the overflow drop truncates
+     * frames -> all later frames corrupt (the "display freezes at ~frame 150 while
+     * chrome keeps streaming" symptom). Throttle the SOURCE so decode keeps up:
+     * everyNthFrame=3 (~10fps) at 640x480 (~1.6x fewer px) -- still clearly shows
+     * moving video. quality 60 balances size vs legibility. */
     id = cdp_send("Page.startScreencast",
                   "{\"format\":\"jpeg\",\"quality\":60,"
-                  "\"maxWidth\":800,\"maxHeight\":600,\"everyNthFrame\":1}", 1);
+                  "\"maxWidth\":640,\"maxHeight\":480,\"everyNthFrame\":3}", 1);
     if (!cdp_wait(id)) return -1;
 
+    kick_play();          /* start any <video> (a MediaDocument won't autoplay) */
+
+#ifdef LOCAL_HTML_FILE
+    snprintf(g_status, sizeof g_status, "%s", LOCAL_HTML_FILE);
+#else
     snprintf(g_status, sizeof g_status, "%s", START_URL);
+#endif
     return 0;
 }
 
@@ -523,6 +639,8 @@ int main(void) {
      * re-navigating only RESTARTS the load. Target.createTarget already
      * navigated; startScreencast delivers a frame when the page paints. */
     g_last_frame_ms = sys_clock_ms();
+    long t0 = sys_clock_ms();
+    int replays = 0;
     while (!g_quit) {
         if (tk_pump(&win)) break;              /* input -> Input.* */
 
@@ -532,6 +650,14 @@ int main(void) {
             int any = 0;
             while (cdp_take_msg()) { cdp_dispatch(); any = 1; }
             if (f == 0 && !any) break;         /* EAGAIN and nothing buffered */
+        }
+
+        /* Re-kick play() a few times over the first ~10s: a MediaDocument's
+         * <video> can appear slightly after bootstrap, and the first play()
+         * may land before the element exists. */
+        if (replays < 5 && sys_clock_ms() - t0 > (long)(replays + 1) * 2000) {
+            kick_play();
+            replays++;
         }
 
         usleep(15000);

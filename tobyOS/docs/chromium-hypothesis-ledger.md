@@ -2009,3 +2009,209 @@ to its slice-46 state).
 3a startScreencast (slice 45) + 3b input routing (this slice) are DONE. YouTube's
 homepage renders its real UI (slice 46). Video playback remains blocked one layer
 past the (now-fixed) VMA race, on a NULL-deref in a chrome worker (slice 47).
+
+
+## SLICE 49 (2026-07-27) — ***VIDEO DECODES + PLAYS.*** A minimal local VP9 clip paints MOVING frames; the YouTube crash is therefore app/MSE-level, not core decode
+
+Picked up the video handoff (`docs/chromium-video-handoff.md`). The prime move
+(handoff §5.C) was a fast, deterministic **minimal `<video>` repro** to split
+"does any video decode+paint" from "does YouTube's heavy app get there" — instead
+of chasing the flaky 277s YouTube NULL-deref cold. It paid off decisively.
+
+### Result: chrome decodes VP9 and paints MOVING video on tobyOS
+Navigated chromewin directly at a raw `file:///opt/chrome/vid.webm` (a 14KB VP9
+`testsrc2` clip, 128x96, generated with ffmpeg). Chrome renders it as a native
+MediaDocument `<video>` player; a CDP `Runtime.evaluate` "user gesture" kick
+(`document.querySelector('video').play()`, re-issued a few times) starts playback
+(a MediaDocument does NOT autoplay even with `--autoplay-policy`). Under WHPX:
+- **bootstrap OK, no crash** (0 EXCEPTION / exit=-1), chrome alive the whole run.
+- **Continuous frame production**: screencast pushed frames 1→30→60→90→120→150
+  over ~18s (~8 fps = the clip's rate, ~9 loops).
+- **Motion is visual + measured**: the testsrc2 burned-in timecode advanced across
+  screendumps (`vid_a`=00:00:00.500 frame 4; `vid_b`=00:00:00.125 frame 1) with the
+  player controls auto-hidden = playing. `logs/vid_a.png` shows the decoded color
+  bars + moving block through SwiftShader.
+
+So the **media pipeline (VP9 decode -> SwiftShader composite -> paint) WORKS.**
+The slice-47 YouTube renderer-worker NULL-deref (277s, ICU4X/interpreter Vec-walk)
+is **not** a broken decoder — it is higher up: MSE streaming (YouTube uses Media
+Source Extensions, not progressive `<video>`), YouTube's app JS, or i18n under
+memory pressure. This retires the "media pipeline returns NULL" hypothesis
+(handoff §5.B.1) as the direct cause.
+
+### Harness artifacts found + worked around (NOT the video bug; documented so the
+### next agent does not re-chase them)
+- **`file://` serves `.html` as `text/plain`** on tobyOS chrome (the raw HTML
+  rendered as literal text; `<video>` never parsed). A `.webm` file:// nav works
+  (content-sniffed to video/webm -> MediaDocument), so file:// I/O is fine; only
+  the HTML extension->MIME resolves wrong. chrome's `kPrimaryMappings` *should* map
+  html->text/html unconditionally, so this is an unexplained tobyOS-specific gap in
+  chrome's file:// MIME path. Sidestepped by the direct-webm nav. (A future clean
+  local-HTML test would need this fixed, or a small `data:text/html;base64` URL.)
+- **A large (~83KB) `data:text/html;base64` URL crashes the NetworkService.** To
+  render local HTML I first had chromewin read the page + navigate to a data: URL
+  (base64 encoder + big-URL path added to `programs/chromewin/main.c`). With the
+  full 62KB page that reproduced a **NetworkService (`--type=utility
+  network.mojom.NetworkService`, pid 26) CHECK-crash**: chrome logged
+  `VALIDATION_ERROR_UNEXPECTED_STRUCT_HEADER` / "Received bad user message" then
+  `int3;ud2` (base::ImmediateCrash). Small data: URLs (~20KB) did NOT crash the
+  network service (they stalled at Page.enable instead — likely WHPX
+  non-determinism). So a large data:-URL main-document navigation corrupts/oversizes
+  the Mojo message the browser hands the NetworkService. Interesting as a *possibly
+  real* shared-memory/Mojo-message issue (same error class as the memory file's
+  old "ipcz VALIDATION_ERROR" phantom), but it is a test-harness trigger here, not
+  the video path — PARKED, not chased.
+
+### chromewin display-decoder follow-up (secondary, does NOT affect the finding)
+After ~150 successfully-decoded frames the display FROZE while chrome kept
+streaming: `toby_image_load` (stb_image, chromewin's screencast JPEG decoder)
+began failing on the busier ~8KB frames (888 failures; the ~6KB frames decoded).
+`toby_image_free` is leak-free, so the "works-for-N-then-all-fail" shape points to
+**heap fragmentation from per-frame ~1.9MB (800x600x4) alloc/free churn** starving
+a contiguous alloc, mis-reported as "JPEG decode failed". This caps sustained
+high-frame-rate video DISPLAY (and could dim observation of any busy page), but is
+orthogonal to decode/compositing (which chrome does; the frames arrive fine).
+Follow-up options: reuse a fixed decode buffer, shrink the screencast size, or
+switch screencast format to PNG (also enabled in `libtoby/src/image.c`).
+
+### Repro / mechanics
+`programs/chromewin/main.c` `START_URL` -> `file:///opt/chrome/vid.webm` (+ the new
+`kick_play()` after startScreencast). Stage `vid.webm` into
+`programs/chromium/chrome-headless-shell-linux64/` (gitignored, copied to
+/opt/chrome). `bash logs/build_vid.sh` (chromewin + initrd + iso only, no kernel
+touch), `python logs/run_vid.py` (WHPX, screendumps `logs/vid_{a,b,c,d}.png`).
+Generate the clip: `ffmpeg -f lavfi -i testsrc2=size=128x96:rate=8:duration=2
+-c:v libvpx-vp9 -b:v 60k -pix_fmt yuv420p -an vid.webm`.
+
+### Next
+The media pipeline is proven, so the remaining YouTube goal is the app/MSE tier:
+either (a) a lighter real YouTube surface (`youtube.com/embed/<id>` — same MSE +
+player JS, far lighter shell) to reproduce the 277s crash faster, or (b) a local
+MSE `SourceBuffer.appendBuffer` test (needs the file:// HTML MIME fix or a small
+data:text/html page) to isolate MSE, or (c) instrument the slice-47 NULL-deref
+source directly (now knowing it is not decode).
+
+
+## SLICE 50 (2026-07-27) — ***YOUTUBE CRASH ROOT-CAUSED = MEMORY CORRUPTION (not a NULL-return); a principled free-before-shootdown fix REDUCES but does NOT fully eliminate it.*** The slice-47 "NULL-deref" is a stale-TLB/freed-page corruption
+
+**HONEST STATUS (corrected):** the ROOT CAUSE below (memory corruption, not a
+syscall returning NULL) is SOLID — proven by ASCII text in a pointer register. The
+FIX below (defer frees behind a TLB shootdown in munmap/madvise/brk) is a CORRECT
+improvement, but it is **NOT yet demonstrated to eliminate the crash**: after the
+fix, an embed run + a watch run were clean, but a SUBSEQUENT watch run **still
+crashed at the same rip 0x208c13a (rbx=NULL) at 234s**. So there is at least one
+RESIDUAL freed-page-reuse / stale-TLB window (or the shootdown-timeout path leaks),
+and the crash rate is not yet measured over enough runs. Do not treat this as a
+closed fix.
+
+Took slice-49's "next" step (a) — `youtube.com/embed/<id>` — and it paid off twice:
+it reproduced the crash **FASTER + more diagnostically**, and the diagnosis led
+straight to a real kernel bug with a principled fix.
+
+### The embed reproduced the crash at 65s with a decisive fingerprint
+Navigated chromewin at `youtube.com/embed/aqz-KE-bpKQ?autoplay=1&mute=1`. The embed
+player renders its REAL UI (bootstrap OK, frames flow), then a renderer WORKER
+thread (pid 49, tgid 34) faults at **65s** — much faster + more reliable than the
+watch page's 277s. The fault is at the **byte-identical instruction** as the
+slice-47 watch-page crash: **rip=0x208c13a** (`movzbl 0x6(%rbx),%eax; cmp $0x8f,%al;
+ja` — the ICU4X/Rust interpreter Vec-walk; `rbx` = a 24-byte Vec node's pointer
+field). But this time it is **EXCEPTION 13 #GP, not #14 #PF**, because:
+```
+rbx=0x726f687475617b7b   (little-endian ASCII "{{author")
+r14=0x646e615f = "_and"   r9=0x223a47482c22726f = 'or",HG:"'   stack: "network."
+```
+`rbx` holds **ASCII text where a pointer belongs** (non-canonical addr -> #GP). So
+the slice-47 "chrome dereferences a NULL" was really **MEMORY CORRUPTION**: string
+bytes overwrote a pointer in the parser's node array. NULL (watch page) and
+"{{author" (embed) are two faces of the SAME root cause at the SAME rip.
+
+### Root cause: freed physical frames reissued BEFORE the TLB shootdown
+The faulting group's recent syscalls are an `mprotect`+`madvise(MADV_DONTNEED)`
+storm. `sys_munmap` / `sys_madvise_dontneed` (src/mmap.c) did, per page:
+`vmm_unmap(PTE)` -> `pmm_free_page(frame)` **inside the loop**, then ONE
+`tlb_shootdown_remote()` **after** the loop. The window between freeing frame 1 and
+the end-of-range shootdown is the bug:
+- `pmm_free_page` returns a frame to the PMM immediately (own `g_pmm_lock`, no
+  quarantine) — reusable at once.
+- The **demand-fault** path `mmap_try_fault` calls `pmm_alloc_page` **BKL-FREE**
+  (before its BKL retry). So while a BKL-holding munmap/madvise walks a multi-page
+  range, a concurrent fault on another CPU can re-hand-out a just-freed frame,
+  zero+refill it (JSON/config **string** bytes), while a THIRD CPU still has the OLD
+  virtual->physical translation cached and reads that frame through its **stale TLB**
+  -> reads "{{author" where its own pointer used to be. (apic.c's own shootdown
+  comment already documented this class from slice 38's CoW ghost-frame corruption;
+  the free path just never closed it.)
+
+### Fix (src/mmap.c): shoot down BEFORE returning frames to the PMM
+Added `struct mmap_free_batch` (bounded on-stack, 256 frames). munmap/madvise now
+`vmm_unmap` + defer the frame into the batch; on a full batch (or at end)
+`mmap_free_batch_flush` does `tlb_shootdown_remote()` **then** `pmm_free_page` for
+each — so no frame is reissuable until a shootdown has followed its unmap. An empty
+batch still forces the final shootdown (preserves the old guarantee for
+refs>1/nofree unmaps). Amortized O(pages); correct regardless of any other
+corruption source.
+
+### Measured (partial — DO NOT overclaim)
+- **Before fix:** the ONE pre-fix embed run crashed at 65s (rip 0x208c13a, #GP,
+  rbx="{{author"). (n=1; the watch page was already non-deterministic pre-fix per
+  the handoff, so "deterministic" is a weak claim.)
+- **After fix:** embed run = clean 300s (0×0x208c13a); watch run #1 = clean 360s
+  (0×0x208c13a, rendered the real player); watch run #2 = **CRASHED at 234s, rip
+  0x208c13a, rbx=NULL** (6 occurrences). So the crash still happens. Sample too
+  small to claim a rate change. 8 benign `[tlb] shootdown ack timeout` warnings per
+  run (bounded-wait path; a parked-IRQ-off CPU takes the pending IPI before its next
+  user access — but WORTH AUDITING whether that guarantee truly holds, since a
+  timed-out shootdown that DID leave a stale writable TLB would reintroduce exactly
+  this corruption).
+- **Base OS clean:** `logs/defboot.sh` (stock non-CHROMIUM build, the fix is
+  unconditional) reaches login/session with **ZERO faults**. No regression from the
+  change itself.
+
+### Residual leads (the corruption is multi-window / not closed)
+1. Other user-frame free paths beyond munmap/madvise/brk (now all batched): **memfd
+   teardown** (mmap.c ~1011, refcount->0 free) and process **exit/exec teardown**.
+   fork.c:499/760 are error-cleanup of UNmapped just-alloc'd pages (safe). CoW
+   copy-out DOES shoot down (page_fault.c:197) — safe.
+2. The **shootdown-timeout** path (apic.c tlb_shootdown_remote bounded wait): if it
+   returns having NOT flushed a CPU that then reads/writes user memory before taking
+   the pending IPI, the freed frame is still reachable. Audit the IRET-to-user /
+   bkl_enter re-entry ordering.
+3. A stale-TLB **WRITE** (not just read): chrome writes a pointer to a VA whose old
+   writable TLB (post-madvise-drop-then-refault, or post-CoW) points at the wrong
+   frame -> the pointer lands in the wrong page -> a flushed CPU reads NULL. This is
+   the NULL variant; the fix should cover it IF shootdowns never leak.
+4. Re-verify the fix is actually reducing anything with a proper N-run crash-rate
+   measurement before/after (this slice's N is too small).
+
+### Note: YouTube embed "Error 153"
+The embed player shows "Error 153 — Video player configuration error". This is
+SEPARATE from the corruption crash (it persists after the fix, with chrome stable),
+i.e. a YouTube-side embed/config restriction for this URL, not a tobyOS fault.
+
+### Watch page (the handoff's real target) WITH the fix
+On a CLEAN run the watch page now **renders YouTube's real Kevlar video player**:
+the player rectangle with controls (a PAUSE glyph = playing state), a progress bar,
+volume, and a buffering SPINNER, plus the metadata skeleton. On the one clean run it
+survived the full 360s (was crashing ~277s). HOWEVER: in every observed run the
+player stayed at the **buffering spinner** — the MSE video never reached VISIBLE
+decoded frames (unlike the local .webm, which did). The ~30fps of damage chrome
+streamed after the spinner was likely the spinner animation + Kevlar UI, NOT
+confirmed video. And the corruption crash recurs (234s / 267s on two later runs),
+killing the renderer before buffering could resolve. So "YouTube video plays" is
+NOT achieved: the two open walls are (1) the residual corruption crash, and (2)
+whatever keeps the MSE stream stuck buffering (network under WHPX? an MSE/decode
+gap? or just the crash interrupting it — untestable until the crash is closed).
+Also, chromewin's stb-image JPEG decoder could not keep up with 30fps 800x600 and
+its `g_rxbuf` overflow-drop truncated frames -> the DISPLAY froze at ~frame 150
+while chrome kept streaming (NOT the media pipeline). Fixed the flow-control:
+startScreencast throttled to 640x480 / everyNthFrame=3 and the overflow-drop is now
+message-boundary aligned (drop whole buffered messages up to the last NUL, never
+mid-frame). With that, a clean run should SHOW the video actually playing — still to
+be confirmed on a run that doesn't hit the residual corruption crash.
+
+### Repro / mechanics
+`programs/chromewin/main.c` `START_URL` -> the embed or watch URL. `bash
+logs/build39.sh` (full kernel rebuild — always after a kernel change), then
+`python logs/run_embed.py` (embed, 300s, `logs/emb_*.png`) or `logs/run_watch.py`
+(watch, 360s, `logs/wat_*.png`). The fix is in `sys_munmap` + `sys_madvise_dontneed`
++ the `mmap_free_batch` helper in `src/mmap.c`.

@@ -372,6 +372,38 @@ long sys_mmap2(uint64_t addr, size_t length, int prot, int flags,
     return (long)base;
 }
 
+/* ---- deferred-free batch: shoot down TLBs BEFORE returning frames to the PMM ---
+ *
+ * munmap/madvise clear a PTE then free the physical frame. The frame becomes
+ * reusable the instant pmm_free_page() runs, but the OLD virtual->physical
+ * translation can still be cached in another CPU's TLB until a shootdown. The
+ * demand-fault path calls pmm_alloc_page() BKL-FREE (mmap_try_fault, before the
+ * BKL-retry), so while a BKL-holding munmap/madvise walks a multi-page range --
+ * frame 1 freed, frames 2..N still being freed, shootdown not yet issued -- a
+ * concurrent fault on another CPU can re-hand-out frame 1, zero+refill it (e.g.
+ * with JSON/string bytes), and a third CPU reading the OLD virtual address
+ * through its stale TLB reads that NEW content. Measured as chrome's YouTube
+ * renderer reading ASCII ("{{author", "network.") where a pointer belonged, then
+ * #GP/#PF'ing on it (same rip 0x208c13a, watch page + embed).
+ *
+ * Fix: never return a frame to the PMM until a shootdown has followed its unmap.
+ * Collect freed frames here; on a full batch (or at the end) shoot down FIRST,
+ * then free. A bounded on-stack batch keeps this O(pages) with amortized
+ * shootdowns; a partial batch at the end still forces one shootdown, preserving
+ * the old "always shoot down after unmapping" guarantee for refs>1 / no-free
+ * pages too. */
+#define MMAP_FREE_BATCH 256
+struct mmap_free_batch { uint64_t phys[MMAP_FREE_BATCH]; int n; };
+static void mmap_free_batch_flush(struct mmap_free_batch *b) {
+    tlb_shootdown_remote();                 /* stale TLBs gone BEFORE reuse */
+    for (int i = 0; i < b->n; i++) pmm_free_page(b->phys[i]);
+    b->n = 0;
+}
+static void mmap_free_batch_push(struct mmap_free_batch *b, uint64_t phys) {
+    if (b->n == MMAP_FREE_BATCH) mmap_free_batch_flush(b);
+    b->phys[b->n++] = phys;
+}
+
 /* ---- munmap ---- */
 
 long sys_munmap(uint64_t addr, uint64_t len) {
@@ -385,6 +417,7 @@ long sys_munmap(uint64_t addr, uint64_t len) {
     addr = page_align_down(addr);
     len  = page_align_up(len);
 
+    struct mmap_free_batch fb = { .n = 0 };
     for (int i = 0; i < vt->count; i++) {
         struct mmap_vma *v = &vt->entries[i];
         if (addr >= v->end || (addr + len) <= v->start) continue;
@@ -412,13 +445,15 @@ long sys_munmap(uint64_t addr, uint64_t len) {
                      * next allocation scribbled over the fork sibling's
                      * memory (slice 38: chrome's PartitionAlloc munmaps
                      * constantly amid renderer fork churn; flaky heap
-                     * corruption in whichever process kept the frame). */
+                     * corruption in whichever process kept the frame).
+                     * Freeing is DEFERRED to fb so a TLB shootdown precedes
+                     * reuse (see mmap_free_batch above). */
                     int refs = page_ref_get(phys);
                     if (refs > 1) {
                         page_ref_dec(phys);
                     } else {
                         if (refs == 1) page_ref_dec(phys);
-                        pmm_free_page(phys);
+                        mmap_free_batch_push(&fb, phys);
                     }
                 }
             }
@@ -448,8 +483,10 @@ long sys_munmap(uint64_t addr, uint64_t len) {
 
     /* The unmapped translations may be cached on other CPUs (sibling
      * threads); the freed frames get reissued by the PMM, so a stale
-     * entry would read/write somebody else's new page. */
-    tlb_shootdown_remote();
+     * entry would read/write somebody else's new page. Flush shoots down
+     * FIRST, then releases the deferred frames; an empty batch still forces
+     * a final shootdown for refs>1 / nofree unmaps. */
+    mmap_free_batch_flush(&fb);
 
     return 0;
 }
@@ -537,6 +574,7 @@ long sys_madvise_dontneed(uint64_t addr, uint64_t len) {
     mprot_ring_note(addr, len, pid, MPROT_MADV);
 #endif
 
+    struct mmap_free_batch fb = { .n = 0 };
     for (int i = 0; i < vt->count; i++) {
         struct mmap_vma *v = &vt->entries[i];
         if (addr >= v->end || (addr + len) <= v->start) continue;
@@ -556,14 +594,15 @@ long sys_madvise_dontneed(uint64_t addr, uint64_t len) {
                 page_ref_dec(phys);                     /* fork sibling keeps it */
             } else {
                 if (refs == 1) page_ref_dec(phys);
-                pmm_free_page(phys);
+                mmap_free_batch_push(&fb, phys);        /* freed AFTER shootdown */
             }
         }
         vmm_set_editor_root(saved_root);
     }
-    /* Same as munmap: dropped translations must leave every CPU's TLB
-     * before the freed frames are reissued. */
-    tlb_shootdown_remote();
+    /* Same as munmap: dropped translations must leave every CPU's TLB BEFORE the
+     * freed frames are reissued (else a reused frame is read through a stale
+     * entry -- the YouTube renderer corruption). Flush shoots down then frees. */
+    mmap_free_batch_flush(&fb);
     return 0;
 }
 
@@ -684,6 +723,7 @@ long sys_brk2(uint64_t new_brk) {
 
     /* Shrink: unmap pages between new brk and old brk */
     if (new_brk < vt->brk_cur) {
+        struct mmap_free_batch fb = { .n = 0 };
         uint64_t saved_root = vmm_set_editor_root(p->cr3);
         for (uint64_t a = new_brk; a < vt->brk_cur; a += PAGE_SIZE) {
             uint64_t phys = vmm_translate(a);
@@ -691,18 +731,20 @@ long sys_brk2(uint64_t new_brk) {
                 vmm_unmap(a, PAGE_SIZE);
                 phys &= PAGE_MASK;
                 /* CoW-aware, same as munmap: a fork sibling may still map
-                 * this frame. */
+                 * this frame. Freeing is DEFERRED behind a shootdown (see
+                 * mmap_free_batch) so a reused frame can't be read via a
+                 * stale TLB. */
                 int refs = page_ref_get(phys);
                 if (refs > 1) {
                     page_ref_dec(phys);
                 } else {
                     if (refs == 1) page_ref_dec(phys);
-                    pmm_free_page(phys);
+                    mmap_free_batch_push(&fb, phys);
                 }
             }
         }
         vmm_set_editor_root(saved_root);
-        tlb_shootdown_remote();
+        mmap_free_batch_flush(&fb);
     }
 
     vt->brk_cur = new_brk;
