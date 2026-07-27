@@ -1778,3 +1778,56 @@ slice) are shipped. The dominant remaining bottleneck is a single, isolated,
 reproducible core-primitive bug (futex-under-WHPX), with a permanent unit test
 (linux-futex) that already flags it. Instruments kept: blocking poll via
 poll_wait_block/poll_tick; `pollit` in `[hb-x]` is the spin-rate metric.
+
+
+## SLICE 44 (2026-07-24) — the "futex-under-WHPX lost-wakeup" is a TEST ARTIFACT: kernel futex works; FUTEXTEST hardened; a slice-43 claim corrected
+
+Took on the slice-43 "#1 wall": FUTEXTEST FAIL under WHPX, believed to be a
+futex wake-DELIVERY race blocking YouTube content. Instrumented the futex
+wait/wake path ([fx] trace) and reproduced under WHPX. The trace REFUTES the
+lost-wakeup theory:
+
+```
+[3696] [futextest] start
+[4901] [fx] pid=2 WAKE addr=2065f8 NO-WAITER        <- waker fires, NO waiter yet
+[5563] [fx] pid=3 WAIT block addr=2065f8 dl=15554   <- waiter parks 662ms LATER
+[7091] [futextest] FAIL ... lost wakeup
+[10936] [fx] pid=2 WAIT block addr=7ffffffff1f8 dl=0
+[10937] [fx] pid=3 WAKE addr=7ffffffff1f8 -> woke pid=2 on_cpu=0 on_rq=1 queued_cpu=0
+[10939] [fx] pid=2 WAIT woke after=3ms timed_out=0  <- wake DELIVERS in 3ms
+```
+
+**The kernel futex is CORRECT.** When a wait precedes its wake, delivery is 3ms
+(bottom). FUTEXTEST fails for a different reason: the waker's FUTEX_WAKE fired at
+4901ms with NO waiter on the list, because the waiter did not park until 5563ms.
+It is a **wake-before-wait** race: the waiter took ~862ms to get from setting its
+userspace ready-flag (`g_waiter_ready=1`, just before the futex syscall) to
+actually entering FUTEX_WAIT -- i.e. **scheduler latency** (preempted after the
+flag, rescheduled ~1s later). The test's handshake (ready-flag + a fixed 200ms
+sleep) is too weak for WHPX's true-parallel scheduling latency; TCG serialises
+the two threads and hides it, which is why linux-futex has always PASSed on TCG.
+
+### Correction to slice 43
+The claim "futex lost-wakeup is the #1 YouTube wall" was **OVER-ATTRIBUTED**.
+There is no kernel futex bug. The 147-200s YouTube futex waits are chrome's idle
+thread-pool workers parked on purpose (the same pattern the DOM-front notes
+flagged as normal), NOT lost wakeups. Fixing "futex" would not have unblocked
+YouTube content.
+
+### Fix: harden the test (programs/linux-futex/main.c)
+Retry FUTEX_WAKE until it reports it woke someone (`nwoken >= 1`) instead of a
+single fixed-delay wake. A WAKE returning 0 means the waiter is not on the list
+yet -> retry past the park. Once a WAKE returns >= 1 the waiter WAS on the list
+AND we woke it -- exactly what the DL2 test must prove. If the DL2 bug regressed
+(timed waiter never on the list) every WAKE returns 0, the loop exhausts, and the
+waiter escapes only at its 10s deadline -> ret != 0 -> FAIL. **Validated PASS
+under BOTH WHPX (~183ms) and TCG** -- the guard is now valid on both
+accelerators instead of red-for-the-wrong-reason under WHPX.
+
+### The one real (but UNCONFIRMED-as-bottleneck) lever, parked
+Scheduler latency: `enq_target_for()` returns 0, so every woken thread piles onto
+the BSP's ready queue and APs must work-steal; a ~862ms park latency was observed
+here. It COULD slow YouTube content-load, but it is not established as the
+bottleneck (the ~100s network gaps are far larger and may be chrome-internal).
+Not chased now. Next: Phase 3 (Page.startScreencast frame push, input routing,
+video playback) -- the stated goal, and independent of this.

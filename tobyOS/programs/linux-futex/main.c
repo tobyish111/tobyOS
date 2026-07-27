@@ -151,29 +151,41 @@ int main_c(void) {
                             CLONE_SIGHAND | CLONE_THREAD);
     if (tid < 0) { put("[futextest] clone FAILED\n"); return 2; }
 
-    /* Wait until the waiter is about to block, then a bit more so it is parked. */
+    /* Wait until the waiter has published its ready flag. */
     for (int i = 0; i < 200 && !g_waiter_ready; i++) msleep(5);
-    msleep(200);
 
     if (g_waiter_done) { put("[futextest] waiter returned BEFORE any wake?!\n"); return 2; }
 
-    /* THE TEST: FUTEX_WAKE without changing g_word. A correct futex wakes the
-     * timed waiter here; the broken poll-only path leaves it blocked to 10 s. */
+    /* THE TEST: a FUTEX_WAKE (without changing g_word) must wake the parked timed
+     * waiter -- the DL2 fix. RETRY the wake until it reports it woke someone
+     * (nwoken >= 1). A WAKE that returns 0 means the waiter has not reached the
+     * kernel wait list yet: g_waiter_ready is set in USERSPACE just BEFORE the
+     * futex syscall, and the waiter can be preempted for ~1 s between the two
+     * (observed under WHPX's true parallelism -- slice 44), so a single
+     * fixed-delay wake can race AHEAD of the park. That is a test-timing artifact,
+     * NOT a kernel bug: once a WAKE returns >= 1 the waiter WAS on the list AND we
+     * woke it, which is exactly what this test proves. If the DL2 bug were present
+     * (a timed waiter never on the list) every WAKE returns 0, the loop exhausts,
+     * and the waiter only escapes at its 10 s deadline -> g_waiter_ret != 0 ->
+     * FAIL. Robust under both TCG and WHPX. */
     u64 t0 = now_ns();
-    long nwoken = SC3(SYS_futex, &g_word, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1);
+    long nwoken = 0;
+    for (int i = 0; i < 1000 && !g_waiter_done && nwoken < 1; i++) {
+        nwoken = SC3(SYS_futex, &g_word, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1);
+        if (nwoken >= 1) break;
+        msleep(5);
+    }
 
-    /* Grace window: give the waiter up to ~2 s to wake. If the bug is present it
-     * will still be blocked (its real deadline is 10 s away). */
+    /* Grace window: let the woken waiter run and return. */
     for (int i = 0; i < 400 && !g_waiter_done; i++) msleep(5);
-    u64 dt_ms = (now_ns() - t0) / 1000000ull;
+    (void)t0;
 
-    if (g_waiter_done && g_waiter_ret == 0 && dt_ms < 3000) {
+    if (g_waiter_done && g_waiter_ret == 0 && nwoken >= 1) {
         put("[futextest] PASS: timed waiter woken by FUTEX_WAKE (word unchanged)\n");
         return 3;
     }
     if (!g_waiter_done) {
         put("[futextest] FAIL: timed waiter still blocked after FUTEX_WAKE (lost wakeup)\n");
-        (void)nwoken;
         return 1;
     }
     put("[futextest] FAIL: waiter returned but not cleanly woken\n");
