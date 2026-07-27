@@ -711,7 +711,7 @@ long sys_brk2(uint64_t new_brk) {
 
 /* ---- Page fault handler (original API) ---- */
 
-bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
+static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
     struct proc *p = current_proc();
     if (!p) return false;
 
@@ -837,6 +837,39 @@ bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     vmm_map(page_va, phys, PAGE_SIZE, vmm_f);
     vmm_set_editor_root(saved_root);
     return true;
+}
+
+/* Public entry: resolve a user page fault against the mmap VMA table.
+ *
+ * The resolver above runs BKL-FREE on the #PF path (fault concurrency, slice
+ * 39). But the VMA table is mutated by mmap/munmap/mprotect, which run UNDER
+ * the BKL -- so a fault on one CPU can read a VMA MID-SPLIT while a BKL-holding
+ * mprotect on another CPU is halfway through carving it. Slice 46 saw exactly
+ * this: a YouTube watch page drives chrome's W^X pattern (mprotect a 2MB span
+ * to PROT_NONE, then carve one page RW, ~27k times), and the lockless read
+ * caught the pre-split GIANT PROT_NONE cage VMA still covering an address that
+ * was really in the freshly-carved RW sub-page -> wrong "WRITE to non-writable
+ * VMA" -> SIGSEGV -> the browser died mid-video (EXCEPTION 14, err=0x6).
+ *
+ * Fix: try lockless first (fast, common path). Only if that REFUSES do we
+ * re-verify ONCE under the BKL, which serializes with every VMA mutator, so the
+ * table is guaranteed consistent (no split in flight). A genuine bad access
+ * still refuses; a transient-race refusal now resolves. IRQs are enabled around
+ * bkl_enter so its spin still ACKs the TLB-shootdown IPI that the very mprotect
+ * we are waiting on issues under the BKL (otherwise: deadlock). A fault from a
+ * syscall's copy_to/from_user already holds the BKL (consistent view), so it
+ * skips the retry. The refused first attempt is side-effect-free (every
+ * return-false path bails before mutating), so re-running is safe. */
+bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
+    if (mmap_try_fault(fault_addr, error_code)) return true;
+    if (bkl_held()) return false;          /* syscall-context fault: already serialized */
+    uint64_t rf = read_rflags();
+    sti();                                  /* let the spin ACK TLB-shootdown IPIs */
+    bkl_enter();
+    bool ok = mmap_try_fault(fault_addr, error_code);
+    bkl_exit();
+    if (!(rf & (1u << 9))) cli();           /* restore the #PF handler's IRQ-off state */
+    return ok;
 }
 
 /* ---- COW fork helper (original API) ---- */

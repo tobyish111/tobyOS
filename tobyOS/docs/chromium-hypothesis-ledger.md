@@ -1915,3 +1915,61 @@ frames; homepage renders its real UI). Input routing (Phase 3b) is still unteste
 (the homepage's feed is empty -> no thumbnail to click; the watch page crashed).
 Video playback is the open frontier, gated on the watch-page browser crash.
 example.com remains the green default and renders without the nav-retry.
+
+
+## SLICE 47 (2026-07-24) — the video-watch-page browser crash ROOT-CAUSED + FIXED: an unlocked VMA-table race under chrome's W^X mprotect storm
+
+Chased the slice-46 wall (chrome's browser process crashes on a YouTube watch
+page, EXCEPTION 14 err=0x6, ~247s). Symbolized it fully.
+
+### Root cause: fault handler reads a VMA MID-SPLIT during a concurrent mprotect
+The fault: `rip` in chrome's main .text, `err=0x6` (user WRITE, not-present),
+`cr2=0x102408e02020` in chrome's mmap region. The handler REFUSED it:
+```
+[pfrej] pid=3 addr=0x102408e02020 err=0x6 WRITE to non-writable VMA
+        [0x102401a02000, 0x102b01a04000) prot=0x0 flags=0xd
+```
+So `vma_find_internal` (first-match) found a GIANT ~27GB PROT_NONE VMA (V8's
+pointer-cage reservation) covering the address. But the isr diagnostic, running
+moments later on the SAME table, found a small 1-page RW VMA
+`[0x102408e02000,0x102408e03000)` with NO overlap. Same address, same table,
+different answer -> the table CHANGED between the two reads = a concurrent
+mutation.
+
+The `[mprot]` ring named it: chrome hammers a W^X pattern 27,498 times --
+`mprotect(0x102408e00000, 2MB, PROT_NONE)` then `mprotect(0x102408e02000, 1page,
+RW)`. mmap/munmap/mprotect run UNDER the BKL, but the #PF handler runs BKL-FREE
+(fault concurrency, slice 39). So a write-fault on one CPU read the giant cage
+VMA while a BKL-holding mprotect on another CPU was HALFWAY through carving the
+RW sub-page (the giant's `->end` not yet shrunk past cr2), and `vma_find_internal`
+returned the stale giant PROT_NONE -> "WRITE to non-writable VMA" -> SIGSEGV ->
+browser dies mid-video. A textbook unlocked read/write race on `g_vma_tables`.
+
+### Fix (src/mmap.c): re-verify a refusal under the BKL
+The resolver is now `mmap_try_fault()`, run LOCKLESS first (the fast, common
+path -- millions of demand-fills stay BKL-free). Only if it REFUSES does
+`mmap_handle_page_fault` re-verify ONCE under the BKL, which serializes with
+every VMA mutator, so the table is guaranteed split-free and consistent. A
+genuine bad access still refuses; a transient-race refusal now resolves. IRQs
+are enabled around `bkl_enter` so its spin still ACKs the TLB-shootdown IPI the
+waited-on mprotect issues under the BKL (else deadlock). A copy_to/from_user
+fault from a syscall already holds the BKL, so it skips the retry. Every
+return-false path is side-effect-free, so re-running is safe. This is a GENERAL
+fix -- any Linux program doing concurrent mprotect + touch on other threads
+could hit it; it is not YouTube-specific.
+
+### Validated
+The racy refusal is GONE: **0** "WRITE to non-writable VMA" across a full watch-
+page run (was the fatal one). chrome now survives ~30s FURTHER (247s -> 277s).
+example.com still renders under WHPX (no regression); base-OS defboot reaches
+desktop with zero faults.
+
+### The wall one layer deeper (new, separate)
+With the VMA race fixed, the watch page hits a DIFFERENT crash: a NULL-pointer
+READ -- `cr2=0x6, err=0x4, rdi=0x0` (offset 6 off a NULL base) at rip in chrome
+.text, in a chrome WORKER thread (pid 52 `+T`, exit=-1) ~277s -- and that run
+rendered 0 frames (the watch page is non-deterministic; a prior run pushed 156).
+Something returns NULL that chrome dereferences -- a separate, deeper bug (likely
+a tobyOS resource/syscall returning NULL under the media pipeline, or a genuine
+chrome fatal). Video playback remains blocked, now one layer in. Homepage render
++ startScreencast (slices 43/45/46) are unaffected and solid.
