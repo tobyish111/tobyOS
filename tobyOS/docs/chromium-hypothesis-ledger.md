@@ -1973,3 +1973,39 @@ Something returns NULL that chrome dereferences -- a separate, deeper bug (likel
 a tobyOS resource/syscall returning NULL under the media pipeline, or a genuine
 chrome fatal). Video playback remains blocked, now one layer in. Homepage render
 + startScreencast (slices 43/45/46) are unaffected and solid.
+
+
+## SLICE 48 (2026-07-24) — Phase 3b: input routing VALIDATED end-to-end (keyboard + mouse -> chrome)
+
+Verified chromewin forwards TobyTK input to chrome over CDP. QMP injects events
+into tobyOS's emulated PS/2 devices (logs/run47input.py); a temporary
+`[chromewin] input ...` probe in send_key/send_mouse confirmed the forward:
+
+- **Keyboard:** injected "hello" -> `[chromewin] input key=0x68/0x65/0x6c/0x6c/
+  0x6f -> chrome` -- each key went on_key -> send_key -> Input.dispatchKeyEvent.
+  Keys need no cursor positioning (they go to the FOCUSED window), so this is the
+  clean proof; it fires once g_session is set (~55s), independent of page paint.
+- **Mouse:** a click landed `[chromewin] input mousePressed x=595 y=368 ->
+  chrome` + mouseReleased -- on_event -> send_mouse -> Input.dispatchMouseEvent.
+
+So the full path works: QMP -> tobyOS PS/2 -> GUI -> chromewin on_key/on_event ->
+CDP Input.* -> chrome. The probe was removed after validation (chromewin is back
+to its slice-46 state).
+
+### Harness notes (for whoever automates input next)
+- `usb-tablet` (absolute pointer) is NOT claimed by tobyOS's HID driver ("no boot
+  HID driver claimed device") -- only boot-protocol PS/2 keyboard+mouse work. So
+  there is no absolute pointer; QMP `abs` events do nothing.
+- The PS/2 mouse applies ACCELERATION, so QMP `rel` deltas overshoot (a +290 unit
+  step lands ~1100px). Homing to a corner then small steps works but is
+  imprecise -- fine for "click somewhere on the page", not for hitting a small
+  link reliably. Absolute clicking would need a tobyOS usb-tablet/HID report
+  driver.
+- example.com's render under WHPX is NON-DETERMINISTIC (~half the runs paint by
+  ~60s, the rest sit on "connecting to chrome"); the keyboard proof sidesteps
+  this since it does not need a painted page.
+
+### Phase 3 standing
+3a startScreencast (slice 45) + 3b input routing (this slice) are DONE. YouTube's
+homepage renders its real UI (slice 46). Video playback remains blocked one layer
+past the (now-fixed) VMA race, on a NULL-deref in a chrome worker (slice 47).
