@@ -330,6 +330,7 @@ static int spawn_chrome(void) {
             (char *)"--user-data-dir=/data/cr",
             (char *)"--window-size=800,600",
             (char *)"--ignore-certificate-errors",
+            (char *)"--autoplay-policy=no-user-gesture-required",
             0,
         };
         char *envp[] = {
@@ -517,12 +518,10 @@ int main(void) {
      * drain the pipe non-blocking so TK input is never stalled behind a frame.
      *   tk_pump -> forwards mouse/keys as Input.* (fire-and-forget)
      *   drain   -> reads every buffered CDP message; screencastFrame -> blit+ack
-     * Nav-retry: the first https handshake can exceed the origin's timeout, so
-     * re-navigate only if the page has NEVER painted (g_frames==0) within 45s.
-     * A static page renders once then produces no further screencast frames
-     * (chrome pushes on damage), so "no frame lately" must NOT trigger re-nav. */
-    long nav_ms = sys_clock_ms();
-    int  navs = 0;
+     * No nav-retry: under WHPX the first navigation's TLS handshake is fast
+     * and heavy pages (youtube / a watch page) take >45s to first paint, so
+     * re-navigating only RESTARTS the load. Target.createTarget already
+     * navigated; startScreencast delivers a frame when the page paints. */
     g_last_frame_ms = sys_clock_ms();
     while (!g_quit) {
         if (tk_pump(&win)) break;              /* input -> Input.* */
@@ -535,14 +534,6 @@ int main(void) {
             if (f == 0 && !any) break;         /* EAGAIN and nothing buffered */
         }
 
-        long now = sys_clock_ms();
-        if (navs < 4 && g_frames == 0 && now - nav_ms > 45000) {
-            char params[192];
-            navs++; nav_ms = now;
-            snprintf(params, sizeof params, "{\"url\":\"%s\"}", START_URL);
-            cdp_send("Page.navigate", params, 1);   /* fire-and-forget */
-            printf("[chromewin] nav retry %d (no frame for 45s)\n", navs);
-        }
         usleep(15000);
     }
     printf("[chromewin] exiting; frames=%d\n", g_frames);

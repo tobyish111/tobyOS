@@ -1870,3 +1870,48 @@ syscall path cleanly (base OS exercised). Static-page frame count is ~1 by desig
 (damage-driven). Next: flip to youtube + --autoplay-policy and test whether
 startScreencast delivers the continuous frames a loading/animating page (and
 video) produce -- the case polled captureScreenshot starved to ~2 frames.
+
+
+## SLICE 46 (2026-07-24) — Phase 3: startScreencast pays off for YouTube (150+ frames, real homepage UI); video watch page crashes the browser
+
+Exercised slice-45's startScreencast against YouTube + a video watch page.
+
+### Win: startScreencast delivers for YouTube (the frame-delivery gap is closed)
+- youtube.com homepage: renders its REAL signed-out UI now -- the Search bar,
+  Sign in button, and the "Try searching to get started / Start watching videos
+  to help us build a feed" empty-feed card (logs/ytwx_c.png from the homepage
+  run). A proper Kevlar render, past the loading skeleton.
+- watch?v=... page: startScreencast pushed **156 frames** (frame 30/60/.../150
+  logged, ~7-8KB jpeg each) vs the **2** frames polled captureScreenshot got --
+  the "screenshot request stalls behind a busy renderer" starvation is gone.
+
+### chromewin fixes made here
+- Removed the nav-retry entirely. It re-navigated on g_frames==0 every 45s, but
+  YouTube legitimately takes >45s to first paint, so it just RESTARTED the heavy
+  load (4 re-navs observed, never finishing). Under WHPX the first navigation's
+  TLS handshake is already fast (slice 41); Target.createTarget(url) navigates
+  and startScreencast paints when ready -- no retry needed.
+- Added --autoplay-policy=no-user-gesture-required (for video autoplay; chrome
+  uses a null audio sink, and VP9/AV1+Opus are present).
+
+### Wall: video playback crashes the browser before the player paints
+The watch page navigates (URL correct in the window) but the page area stays
+WHITE and never shows the player. chrome's BROWSER process (pid 3) works hard --
+27.0s CPU, 273,689 syscalls -- then **crashes: EXCEPTION 14 (user page fault),
+pid 3 exit=-1 at ~247s**. chromewin handles it gracefully (sees the pipe EOF,
+exits clean, 156 frames delivered). No OOM (7 GiB RAM). So the watch page is the
+heaviest tier yet and chrome dies under its load (media pipeline + far more JS
+than the homepage) before painting a visible player.
+
+This is a fresh, deep frontier -- the same class as the earlier render/GL crash
+arcs (slices 37-39): symbolize the EXCEPTION 14 (rip/cr2 -> which .so, which
+chrome/tobyOS interaction), likely a tobyOS bug exposed only by the watch page's
+heavier mmap/thread/GPU pressure, or a chrome fatal under the media stack.
+Not chased this slice.
+
+### Standing
+Phase 3a (startScreencast) is DONE and clearly pays off for YouTube (156 vs 2
+frames; homepage renders its real UI). Input routing (Phase 3b) is still untested
+(the homepage's feed is empty -> no thumbnail to click; the watch page crashed).
+Video playback is the open frontier, gated on the watch-page browser crash.
+example.com remains the green default and renders without the nav-retry.
