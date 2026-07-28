@@ -2978,3 +2978,35 @@ different chrome-side events (requestWillBeSent vs responseReceived carry
 the URL independently). Identical-but-bogus = the URL was already wrong when
 chrome built it (renderer memory); differing = it mutated between the two,
 which localises the copy path. Both are one chromewin edit and one run.
+
+## Slice 58d: FULL RETRACTION -- there is NO URL corruption. It is YouTube's
+## own second (signature-gated) URL set, and playback works anyway.
+
+Evidence, all from run 1's existing log (no new run needed):
+- The "corrupt" URLs are NOT random: the same bogus expire (8054257608)
+  repeats across SIX requests while the sane one (1785301507) covers five.
+  Random memory corruption differs every time.
+- Their CDP messages are SMALL (mlen ~2200) and well-formed (head '{') --
+  no size boundary, no fragment.
+- They carry a DIFFERENT `ei=` session token (pbA-TxoC0nQnX vs ozVpaoX-Orj72).
+- **They target a DIFFERENT CDN HOST**: rr4---sn-5hne6nzk (6) vs
+  rr2---sn-vgqsrn6y (5).
+No bit-flip or copy-path bug can fabricate a coherent alternate hostname +
+session token + a repeated far-future expire. These are two genuine URL sets
+that YouTube itself served. Far-future `expire` values are normal for
+SIGNATURE-GATED urls (access controlled by the sig/n transform rather than
+by time); requests that do not carry the correctly transformed parameters
+get 403. That is the long-standing YouTube signature-cipher wall already on
+record as a documented non-goal -- NOT a tobyOS defect.
+
+RETRACTED: slice 58's "media URLs are being corrupted" and slice 58c's
+"URL corruption RE-ESTABLISHED". Both were pattern-matching on an impossible
+expire without checking the simplest alternative (different host => different
+URL set). The lesson for the ledger: before calling something corruption,
+check whether the "corrupt" bytes are internally COHERENT -- coherence means
+a different source, not a mutation.
+
+STATE: nothing left to fix here. tobyOS reaches HAVE_ENOUGH_DATA with 20-24s
+buffered in 3/3 runs and paints decoded frames; some segment fetches 403
+because YouTube signature-gates a fallback URL set, and the player simply
+uses the set that works. Kernel-side, this arc is DONE.
