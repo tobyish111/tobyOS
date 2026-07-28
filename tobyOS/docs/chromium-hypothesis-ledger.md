@@ -2818,3 +2818,59 @@ the watch-page renderer, probes keep answering past 40s, media b>0.
   independent wall is now DOUBTFUL: the one-byte shear on a non-fatal
   endpoint explains the runs-3/4 message-flow stops too. Re-test R2 only
   AFTER the corruption wall falls.
+
+## Slice 57 (2026-07-28): the wild-jump corruption class = TWO stacked bugs --
+## un-acked TLB shootdowns (proven by A/B) and VMA-table exhaustion
+
+### Autopsy instruments (run 11)
+The terse "rsp,rip both CPL=3" isr branch now dumps pgj/mprotect/pfres for
+the stack page + rax/rbx/rdi pointer-source pages. Run 11 escalated to FOUR
+crashes (browser included) at 21-23s: user-mode #GP with V8-poison pointers
+(r15=0xf0f0f0f0f0f0f0f1, non-canonical r14), every crash's last_fault_rip in
+one tight code range, an mprotect storm immediately prior, and a fork at
+15.6s followed by five seconds of CoW-fault storm ([pfres] how=1 err=0x7
+continuous, plus bursts of how=2 err=0x6 = live heap pages coming back as
+fresh zero pages).
+
+### Bug A: tlb_shootdown_remote dropped all_acked=false
+apic.c's bounded ack-wait times out ROUTINELY under WHPX (8-warn cap
+saturated by 5.4s of run 11) and the void wrapper discarded the result. The
+slice-50 quarantine covers only the FREE path; fork's write-protect sweep,
+CoW copy-out and mprotect all proceeded with laggard CPUs still holding
+stale WRITABLE translations -- parent threads kept writing into frames
+shared with fork children. FIX + PROOF: retry-until-all-acked => run 12 had
+ZERO crashes (4 -> 0) but broadcast retries were catastrophic under WHPX
+(bootstrap 267s: every round waits out host-descheduled vCPUs of OTHER
+processes). Refined to CR3-TARGETED shootdown (only CPUs currently in the
+target address space can hold its stale non-global user translations; a CPU
+that switched away flushed at CR3 load; both race directions err toward
+sending) => run 13: bootstrap back to 18.2s AND crashes 4 -> 1.
+
+### Bug B: VMA-table exhaustion (the residual crash + run-10's "wild jumps")
+Run 13's remaining crash at 29s printed "[mmap] WARN: VMA table FULL (4096
+entries)" at the same instant -- and in hindsight EVERY run-10 fatal fault
+line said "(4096 total)". Chrome's PartitionAlloc decommits + V8 W^X churn
+split VMAs indefinitely and nothing merged them: at the cap, mmap fails and
+mprotect SPLITS fail silently, leaving sub-ranges with NO VMA -- the next
+touch is a fatal "NOT covered by any mmap-VMA" fault at a perfectly valid
+address (the "wild jump to unmapped rip" illusion). FIX: cap 4096 -> 8192
+plus merge-on-pressure compaction (sort + merge adjacent same-prot/flags
+ANON fragments at >75% occupancy, hooked ONLY at the tops of
+mmap/munmap/mprotect under the BKL, before any entry pointers exist).
+
+### RUN 14 (both fixes + compaction): *** YOUTUBE VIDEO PLAYED ON TOBYOS ***
+- ZERO crashes in 360s (was 4/run at worst). [mmap] VMA compact pid=52
+  6144 -> 1196 entries -- the exhaustion class is dead (80% of the table was
+  mergeable same-prot anon fragments).
+- The probe delivered the handoff's definition-of-done line on the REAL
+  watch page (blen=839576): `vid=r4 n2 t0.8 d635 b20.0 e- p0 src=blob:`
+  -- HAVE_ENOUGH_DATA, 20.0s BUFFERED, currentTime advancing, duration 635s
+  (full Big Buck Bunny), no error, PLAYING. 142 media requests / 141
+  responses; ~200 screencast frames painted during the playing window.
+- Remaining rough edge (next slice, app-level): after ~10-20s of playback
+  the player RESET to r0/b- and idled (media counters freeze at ~80s;
+  fail=29 requests -- the googlevideo 403/URL-expiry class, likely YouTube's
+  n-parameter/ABR retry logic rather than a kernel fault; zero kernel
+  crashes, zero VMA/TLB incidents in the same window). Screendump timing
+  missed the playing window; add a frame-diff screenshot burst on r>=3 for
+  visual proof next run.

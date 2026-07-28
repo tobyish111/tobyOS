@@ -633,6 +633,41 @@ static void default_exception(struct regs *r) {
                     (void *)fp->last_fault_rip);
         }
 #ifdef CHROMIUM_BOOT
+        /* Slice 57: WILD-JUMP autopsy. The slice-56 run-10 crashes (rip at an
+         * unmapped low address, sane stack) took THIS terse branch and skipped
+         * every journal, leaving no paging history on record. For a wild jump
+         * the corrupted pointer was loaded from memory just before the call --
+         * dump the paging timeline of the pages it plausibly came from: the
+         * stack page (spilled pointers / return chain) and the objects rax/
+         * rbx/rdi point into, plus this pid's resolved-fault history. A recent
+         * munmap->remap or a reused frame in these journals = the slice-50
+         * corruption class caught in the act. */
+        if (r->vector == 14) {
+            uint64_t wfa = read_cr2();
+            extern void pgj_dump(uint64_t);
+            extern void mprotect_ring_dump(uint64_t);
+            extern void mmap_debug_fault_vma(uint64_t addr);
+            struct proc *wdp = current_proc();
+            kprintf("[isr] wild-jump autopsy: cr2=%p; rsp-page journal:\n",
+                    (void *)wfa);
+            pgj_dump(r->rsp);
+            mprotect_ring_dump(r->rsp);
+            uint64_t cands[3] = { r->rax, r->rbx, r->rdi };
+            static const char *cn[3] = { "rax", "rbx", "rdi" };
+            for (int ci = 0; ci < 3; ci++) {
+                uint64_t a = cands[ci];
+                if (a >= 0x10000 && a < 0x0000800000000000ULL &&
+                    (a >> 12) != (r->rsp >> 12) && (a >> 12) != (wfa >> 12)) {
+                    kprintf("[isr] pointer-source cand %s=%p:\n", cn[ci],
+                            (void *)a);
+                    mmap_debug_fault_vma(a);
+                    pgj_dump(a);
+                }
+            }
+            pfres_dump(wdp ? wdp->pid : -1);
+        }
+#endif
+#ifdef CHROMIUM_BOOT
         /* Slice 38 iter 9: the 5.78s fatal fault is a runaway glibc memcpy
          * (dst = a caller's stack local at rsp+0x68, len ~16MB from heap)
          * that blows through the top of the GPU thread's stack. The trap

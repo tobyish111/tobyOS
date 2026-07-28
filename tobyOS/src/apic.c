@@ -38,6 +38,8 @@
 #include <tobyos/cpu.h>
 #include <tobyos/pit.h>
 #include <tobyos/isr.h>
+#include <tobyos/proc.h>     /* slice 57: cr3-targeted shootdowns */
+#include <tobyos/percpu.h>
 #include <tobyos/sched.h>
 #include <tobyos/smp.h>      /* tlb_shootdown_remote: percpu walk */
 
@@ -123,7 +125,26 @@ static void tlb_shootdown_isr(struct regs *r) {
     apic_eoi();
 }
 
-bool tlb_shootdown_remote_sync(void) {
+/* Slice 57: cr3-filtered shootdown. cr3 == 0 -> broadcast (the historical
+ * behaviour). Otherwise skip CPUs whose CURRENT proc is in a different
+ * address space: user PTEs are non-global, and every context switch loads
+ * CR3 (no PCID), so a CPU that switched away has already flushed -- only
+ * CPUs running THIS space can hold its stale user translations. The racy
+ * read of another CPU's ->current is safe: proc structs live in the static
+ * pool, aligned 8-byte reads don't tear, and both race directions err
+ * toward SENDING (a CPU switching INTO the space loads CR3 = flush; one
+ * switching OUT gets a redundant IPI). ASSUMPTION (documented): kernel-side
+ * code never touches user memory of an address space other than current's
+ * (true today; the stage-12D HTTP worker predates chrome and is unused by
+ * it). */
+static bool cpu_may_hold_cr3(const struct percpu *c, uint64_t cr3) {
+    if (cr3 == 0) return true;
+    struct proc *p = c->current;
+    if (!p) return true;                  /* unknown -> conservative send */
+    return p->cr3 == cr3;
+}
+
+static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
     if (!g_ready) return true;
     uint32_t n = smp_cpu_count();
     if (n <= 1) return true;
@@ -136,6 +157,7 @@ bool tlb_shootdown_remote_sync(void) {
         if (i == me) continue;
         const struct percpu *c = smp_cpu(i);
         if (!c || !c->online) continue;
+        if (!cpu_may_hold_cr3(c, cr3)) continue;
         snap[i] = g_tlb_gen[i];
         apic_send_ipi((uint8_t)c->apic_id,
                       ICR_LEVEL_ASSERT | ICR_TRIGGER_EDGE |
@@ -171,8 +193,35 @@ bool tlb_shootdown_remote_sync(void) {
     return all_acked;
 }
 
+bool tlb_shootdown_remote_sync(void) {
+    return tlb_shootdown_sync_filtered(0);      /* broadcast, one round */
+}
+
 void tlb_shootdown_remote(void) {
-    (void)tlb_shootdown_remote_sync();
+    /* Slice 57: RETRY until every relevant CPU acks. The old fire-and-forget
+     * dropped all_acked=false on the floor -- tolerable for the FREE path
+     * (slice-50 quarantine holds the frames back) but NOT for permission
+     * tightening: fork's write-protect sweep, CoW copy-out and mprotect all
+     * continued with a laggard CPU still holding stale WRITABLE
+     * translations, so a parent thread on that CPU kept writing straight
+     * into frames now shared with the fork child. Measured: run-11's 8-warn
+     * cap saturated by 5.4s, then a fork at 15.6s + five seconds of CoW
+     * faults ended in four processes crashing on zeroed/poisoned pointers
+     * within 2s; with retry-until-acked (run 12) the crashes went to ZERO.
+     * The naive broadcast retry was however catastrophically slow under
+     * WHPX (bootstrap 267s: every round waits out host-descheduled vCPUs
+     * running OTHER processes). Hence the cr3 filter: only CPUs currently
+     * IN this address space can hold its stale user translations -- those
+     * are awake-and-working CPUs that ack in microseconds. */
+    struct proc *me = current_proc();
+    uint64_t cr3 = me ? me->cr3 : 0;
+    for (int round = 0; round < 16; round++)
+        if (tlb_shootdown_sync_filtered(cr3)) return;
+    static uint32_t hard_warns;
+    if (hard_warns < 8) {
+        hard_warns++;
+        kprintf("[tlb] ERROR: shootdown STILL un-acked after 16 rounds\n");
+    }
 }
 
 void apic_send_ipi(uint8_t target_apic_id, uint32_t icr_low) {

@@ -40,7 +40,15 @@
  * per proc slot (~40 B/entry x PROC_MAX), so 4096 = ~42 MiB BSS. A future refactor
  * could make the table per-proc heap-allocated + have MAP_FIXED replace overlapped
  * VMAs (ld.so's segment maps currently each add an entry). */
-#define VMA_MAX_PER_PROC  4096
+/* Slice 57: 4096 -> 8192, plus merge-on-pressure compaction (vma_compact_
+ * table below). Chrome's watch-page renderer SPLITS VMAs continuously
+ * (PartitionAlloc decommit + V8 W^X mprotect churn) and nothing ever merged
+ * them back: the table hit the 4096 cap ~29s into a YouTube watch run, after
+ * which mmap failed and -- worse -- mprotect SPLITS failed silently, leaving
+ * sub-ranges with no VMA; the next touch became a fatal "NOT covered by any
+ * mmap-VMA" fault at a perfectly valid address (this was the run-10 "wild
+ * jump" class: every such crash printed "(4096 total)"). */
+#define VMA_MAX_PER_PROC  8192
 
 #define VMA_PROT_READ   0x01
 #define VMA_PROT_WRITE  0x02
@@ -233,6 +241,51 @@ static uint32_t prot_to_vmm_flags(uint32_t prot) {
 
 /* ---- sys_mmap (original API from vmm.h) ---- */
 
+/* Slice 57: merge-on-pressure. When the table is >75% full, sort by start
+ * and merge strictly-compatible ANON neighbours (same prot, same flags,
+ * fd < 0, exactly adjacent). Chrome's mprotect/decommit churn generates
+ * thousands of same-prot fragments; merging them makes the cap a soft
+ * ceiling instead of a time bomb. Called ONLY at the top of the three
+ * VMA syscalls, BEFORE any entry lookup, because it moves entries --
+ * callers deeper in hold entry pointers across vma_alloc (split paths)
+ * and must never see the table shuffle under them. Insertion sort: the
+ * table is nearly sorted in practice, and this runs only under pressure. */
+static void vma_compact_table(struct vma_table *vt, int pid) {
+    if (vt->count < (VMA_MAX_PER_PROC * 3) / 4) return;
+    int before = vt->count;
+    for (int i = 1; i < vt->count; i++) {
+        struct mmap_vma key = vt->entries[i];
+        int j = i - 1;
+        while (j >= 0 && vt->entries[j].start > key.start) {
+            vt->entries[j + 1] = vt->entries[j];
+            j--;
+        }
+        vt->entries[j + 1] = key;
+    }
+    int w = 0;
+    for (int i = 0; i < vt->count; i++) {
+        struct mmap_vma *cur = &vt->entries[i];
+        if (w > 0) {
+            struct mmap_vma *prev = &vt->entries[w - 1];
+            if (prev->end == cur->start &&
+                prev->prot  == cur->prot &&
+                prev->flags == cur->flags &&
+                prev->fd < 0 && cur->fd < 0) {
+                prev->end = cur->end;
+                continue;
+            }
+        }
+        if (w != i) vt->entries[w] = *cur;
+        w++;
+    }
+    vt->count = w;
+    static int logs;
+    if (logs < 24) {
+        logs++;
+        kprintf("[mmap] VMA compact pid=%d %d -> %d entries\n", pid, before, w);
+    }
+}
+
 long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
               uint32_t flags, int fd, uint64_t offset) {
     struct proc *p = current_proc();
@@ -240,6 +293,7 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
 
     int pid = p->is_thread ? p->tgid : p->pid;
     struct vma_table *vt = &g_vma_tables[pid];
+    vma_compact_table(vt, pid);
 
     if (len == 0) return -22;
     len = page_align_up(len);
@@ -441,6 +495,8 @@ long sys_munmap(uint64_t addr, uint64_t len) {
 
     int pid = p->is_thread ? p->tgid : p->pid;
     struct vma_table *vt = &g_vma_tables[pid];
+    vma_compact_table(vt, pid);   /* slice 57: safe here -- no entry ptrs yet
+                                   * (incl. the sys_mmap MAP_FIXED caller) */
 
     if (len == 0) return -22;
     addr = page_align_down(addr);
@@ -643,6 +699,7 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
 
     int pid = p->is_thread ? p->tgid : p->pid;
     struct vma_table *vt = &g_vma_tables[pid];
+    vma_compact_table(vt, pid);   /* slice 57: before any entry lookup */
 
     if (len == 0) return -22;
     addr = page_align_down(addr);
