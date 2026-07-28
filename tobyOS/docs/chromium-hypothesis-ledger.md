@@ -2328,3 +2328,29 @@ sets were built back-to-back; build39 does touch src/*.c, so unlikely).
 NEXT SESSION: triage FIRST -- re-run 2-3x (any URL; the crash was pre-network),
 and if it recurs symbolize rip-0x40000000 offset against ld-linux-x86-64.so.2.
 Do NOT trust any YouTube crash-rate stats until this is resolved.
+
+### Triage results (continuation session): ld.so crash 0/3 recurrence; a NEW third signature appeared; YouTube still throttled
+- **ld.so strcmp-NULL crash: did NOT recur in 3 reruns** (same iso). Symbolized
+  from the sysroot binary: rip 0x400246da = ld.so `strcmp`+0x1a faulting on the
+  SECOND argument (rsi=NULL) -- very early (pre-TLS), i.e. a string pointer the
+  fresh execve stack should carry (env/auxv, e.g. AT_PLATFORM) read as NULL.
+  One occurrence total; PARKED as a rare-corruption data point. File-backed
+  audit CLOSED: the demand path zero-fills ALL VMA types (pre-50b behavior too),
+  and winner/loser frames are identical zero pages -- the 50b lost-race back-off
+  adds no new file-backed semantics.
+- **Run 3 hit a NEW, THIRD signature** (logs/run_watch_ebadf.log): renderer
+  worker pid 45 (tgid 39), EXCEPTION 14 err=0x6 WRITE to cr2=0xfffffffffffffff7
+  = rax = **-9 (-EBADF) used as a POINTER**, rip in a .so, rdi=0xf (fd 15),
+  rdx=0x10, preceded by a tight epoll_wait spin. Shape: an fd closed mid-use by
+  a sibling thread returned EBADF from a syscall chrome never expects to fail
+  that way -> raw return used as an address. This is the FD-LIFETIME class
+  (CLONE_FILES shared table), NOT the VM-corruption class. One occurrence;
+  PARKED with log preserved.
+- **0x208c13a: ZERO occurrences since the 50b fix** (5 post-fix watch runs) --
+  but YouTube still is not loading pages (throttle persists, ~7 TLS TX per
+  run), so the page-load-heavy crash path remains under-exercised. Crash-rate
+  claim still deferred.
+- Crash landscape reading: three DISTINCT one-off signatures in chrome workers
+  across this arc suggests residual low-rate instability (memory corruption
+  and/or fd races) that only heavy load exposes. The instruments to catch them
+  are all armed ([pfrace], pointer-source-page autopsy, tlbq, DEMRACETEST).
