@@ -63,7 +63,7 @@ static long sys_clock_ms(void) { return sc0(ABI_SYS_CLOCK_MS); }
  * embed player no longer crashes at rip 0x208c13a. Now retest the handoff's REAL
  * target -- the full WATCH page -- which hit that same corruption crash (~277s).
  * (Proven paths to flip back to: youtube.com/embed/<id> ; file:///opt/chrome/vid.webm ; example.com) */
-#define START_URL "https://example.com/"
+#define START_URL "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
 
 static struct tk_window win;
 static toby_image_t *g_frame;        /* latest decoded screenshot */
@@ -501,13 +501,28 @@ static void kick_play(void) {
  * body size / paint-relevant geometry. Fire-and-forget; cdp_dispatch logs any
  * reply carrying the tobyprobe marker. */
 static void probe_page(void) {
+    /* Slice 53: also interrogate the <video> element. For a YouTube watch page
+     * that renders its player but sits on the buffering spinner, the media
+     * element's own state says WHICH stage stalled:
+     *   n(etworkState) 0=EMPTY 1=IDLE 2=LOADING 3=NO_SOURCE
+     *   r(eadyState)   0=HAVE_NOTHING .. 4=HAVE_ENOUGH_DATA
+     *   b(uffered end) = how many seconds MSE actually appended
+     *   e(rror code)   1=ABORTED 2=NETWORK 3=DECODE 4=SRC_NOT_SUPPORTED
+     * b>0 with r>=2 means bytes ARE arriving and decoding; b='-' with n=2 means
+     * the MSE fetch never delivers. */
     cdp_send("Runtime.evaluate",
-             "{\"expression\":\"'tobyprobe rs='+document.readyState"
-             "+' url='+location.href.slice(0,48)"
-             "+' title='+document.title.slice(0,24)"
+             "{\"expression\":\"(function(){var v=document.querySelector('video');"
+             "return 'tobyprobe rs='+document.readyState"
+             "+' title='+document.title.slice(0,20)"
              "+' blen='+(document.body?document.body.innerHTML.length:-1)"
-             "+' bh='+(document.body?document.body.scrollHeight:-1)"
-             "+' vis='+document.visibilityState\",\"returnByValue\":true}", 1);
+             "+' vid='+(v?('r'+v.readyState+' n'+v.networkState"
+             "+' t'+v.currentTime.toFixed(1)"
+             "+' d'+((v.duration||0).toFixed(0))"
+             "+' b'+(v.buffered.length?v.buffered.end(0).toFixed(1):'-')"
+             "+' e'+(v.error?v.error.code:'-')"
+             "+' p'+(v.paused?1:0)"
+             "+' src'+(v.src?v.src.slice(0,12):'-')):'novideo');})()\","
+             "\"returnByValue\":true}", 1);
 }
 
 /* ---- CDP bootstrap: tab + flat session ------------------------------- */
