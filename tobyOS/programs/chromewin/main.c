@@ -309,32 +309,34 @@ static int cdp_send(const char *method, const char *params_json, int with_sessio
 
 static long g_last_frame_ms;
 
+/* Decode the base64 "data" field currently in g_msg and install it as the
+ * displayed frame. Shared by the pushed-screencast path and the polled
+ * captureScreenshot fallback. Returns 1 if a frame was installed. */
+static int install_b64_frame(void) {
+    const char *p = strstr(g_msg, "\"data\":\"");
+    if (!p) return 0;
+    p += 8;
+    const char *e = strchr(p, '"');
+    if (!e) return 0;
+    long n = b64_decode_buf(p, e - p, g_png);
+    if (n <= 8) return 0;
+    toby_image_t *img = toby_image_load(g_png, (size_t)n);   /* JPEG */
+    if (!img) { logln("JPEG decode failed"); return 0; }
+    toby_image_t *old = g_frame;
+    g_frame = img;
+    if (old) toby_image_free(old);
+    g_frames++;
+    g_last_frame_ms = sys_clock_ms();
+    if (g_frames == 1 || (g_frames % 30) == 0)
+        printf("[chromewin] frame %d: %dx%d jpeg=%ld bytes\n",
+               g_frames, img->width, img->height, n);
+    tk_redraw(&win);
+    return 1;
+}
+
 static void handle_screencast_frame(void) {
     int sid = json_int(g_msg, "sessionId");        /* numeric screencast session */
-    const char *p = strstr(g_msg, "\"data\":\"");
-    if (p) {
-        p += 8;
-        const char *e = strchr(p, '"');
-        if (e) {
-            long n = b64_decode_buf(p, e - p, g_png);
-            if (n > 8) {
-                toby_image_t *img = toby_image_load(g_png, (size_t)n);  /* JPEG */
-                if (img) {
-                    toby_image_t *old = g_frame;
-                    g_frame = img;
-                    if (old) toby_image_free(old);
-                    g_frames++;
-                    g_last_frame_ms = sys_clock_ms();
-                    if (g_frames == 1 || (g_frames % 30) == 0)
-                        printf("[chromewin] frame %d: %dx%d jpeg=%ld bytes\n",
-                               g_frames, img->width, img->height, n);
-                    tk_redraw(&win);
-                } else {
-                    logln("JPEG decode failed");
-                }
-            }
-        }
-    }
+    install_b64_frame();
     if (sid >= 0) {                                /* ack -> chrome sends the next */
         char params[48];
         snprintf(params, sizeof params, "{\"sessionId\":%d}", sid);
@@ -342,11 +344,45 @@ static void handle_screencast_frame(void) {
     }
 }
 
+/* Slice 52: POLLED-SCREENSHOT FALLBACK. Page.startScreencast only pushes when
+ * the page DAMAGES something. A fully-loaded STATIC page streams NOTHING --
+ * measured with the page-state probe: readyState=complete, real title, laid-out
+ * body, and frames=0 forever (example.com finishes painting before the
+ * screencast is even started). From outside that is indistinguishable from a
+ * network/renderer hang, and it cost this arc a wrong "response-body data pipe"
+ * conclusion. So when no pushed frame has arrived recently, ASK for one.
+ * Screencast still carries dynamic/video content at full rate; this fires only
+ * in the gaps, with at most one request outstanding. */
+static int g_shot_id;                              /* outstanding request, 0=none */
+
+static void request_screenshot(void) {
+    if (g_shot_id) return;
+    g_shot_id = cdp_send("Page.captureScreenshot",
+                         "{\"format\":\"jpeg\",\"quality\":60}", 1);
+}
+
 /* Dispatch one event message currently in g_msg. Only screencastFrame needs
  * action; command responses and other events are ignored (fire-and-forget). */
 static void cdp_dispatch(void) {
-    if (strstr(g_msg, "\"method\":\"Page.screencastFrame\""))
+    if (strstr(g_msg, "\"method\":\"Page.screencastFrame\"")) {
         handle_screencast_frame();
+        return;
+    }
+    if (g_shot_id && json_has_id(g_msg, g_shot_id)) {   /* polled screenshot reply */
+        g_shot_id = 0;
+        install_b64_frame();
+        return;
+    }
+    /* Slice 52: surface the page-state probe reply (and any CDP error) so the
+     * serial log shows what chrome thinks the page is. Truncated: a full
+     * Runtime.evaluate reply is small, but an error can carry a big stack. */
+    if (strstr(g_msg, "tobyprobe") || strstr(g_msg, "\"error\"")) {
+        char line[300];
+        size_t n = strlen(g_msg);
+        if (n > sizeof line - 1) n = sizeof line - 1;
+        memcpy(line, g_msg, n); line[n] = 0;
+        printf("[chromewin] CDP: %s\n", line);
+    }
 }
 
 /* Read until the response for `id` arrives; events encountered while waiting
@@ -409,7 +445,12 @@ static int spawn_chrome(void) {
             (char *)"--disable-in-process-stack-traces",
             (char *)"--no-first-run",
             (char *)"--enable-logging=stderr",
-            (char *)"--user-data-dir=/data/cr",
+            /* FRESH profile dir (was /data/cr): /data/cr persists on disk.img
+             * across runs, so corrupted/poisoned profile state (cookies,
+             * consent redirects, cache) reproduces "identical failure on both
+             * kernels" exactly like IP throttling would -- the A/B revert-test
+             * could not distinguish them. A fresh dir isolates the theory. */
+            (char *)"--user-data-dir=/data/cr2",
             (char *)"--window-size=800,600",
             (char *)"--ignore-certificate-errors",
             (char *)"--allow-file-access-from-files",
@@ -451,6 +492,22 @@ static void kick_play(void) {
              "{\"expression\":\"var v=document.querySelector('video');"
              "if(v){v.muted=true;v.loop=true;v.play&&v.play();}\","
              "\"userGesture\":true}", 1);
+}
+
+/* Slice 52: PAGE-STATE PROBE. Frames stopped arriving for every NETWORK page
+ * (local file:// pages still paint), while chrome stays busy and logs no error
+ * -- so "did the page even load?" and "did it load but never paint?" are
+ * indistinguishable from outside. Ask chrome itself: readyState / URL / title /
+ * body size / paint-relevant geometry. Fire-and-forget; cdp_dispatch logs any
+ * reply carrying the tobyprobe marker. */
+static void probe_page(void) {
+    cdp_send("Runtime.evaluate",
+             "{\"expression\":\"'tobyprobe rs='+document.readyState"
+             "+' url='+location.href.slice(0,48)"
+             "+' title='+document.title.slice(0,24)"
+             "+' blen='+(document.body?document.body.innerHTML.length:-1)"
+             "+' bh='+(document.body?document.body.scrollHeight:-1)"
+             "+' vis='+document.visibilityState\",\"returnByValue\":true}", 1);
 }
 
 /* ---- CDP bootstrap: tab + flat session ------------------------------- */
@@ -658,6 +715,23 @@ int main(void) {
         if (replays < 5 && sys_clock_ms() - t0 > (long)(replays + 1) * 2000) {
             kick_play();
             replays++;
+        }
+
+        /* Slice 52: no pushed frame for a while (static page, or a page that
+         * finished painting before the screencast started) -> pull one. */
+        if (sys_clock_ms() - g_last_frame_ms > 2000)
+            request_screenshot();
+
+        /* Slice 52: probe the page state every 10s (12 times) and report the
+         * frame count alongside, so a stalled run says WHY it is stalled. */
+        {
+            static int probes;
+            if (probes < 12 && sys_clock_ms() - t0 > (long)(probes + 1) * 10000) {
+                probes++;
+                printf("[chromewin] probe #%d at %lds: frames=%d\n",
+                       probes, (long)((sys_clock_ms() - t0) / 1000), g_frames);
+                probe_page();
+            }
         }
 
         usleep(15000);
