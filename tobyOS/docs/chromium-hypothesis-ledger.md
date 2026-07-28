@@ -2911,3 +2911,31 @@ policy artifact -- and it is silent (no crash, no fault) now that slice
   substitution / shifted byte in a string is exactly what a boundary bug in
   a copy path produces. Check the >=64KB paths and any remaining u16
   length/offset in the send direction.
+
+### Slice 58b (run 16, rid-paired probe): PARTIAL RETRACTION of the
+### "URL corruption" claim -- and the real remaining problem is VARIANCE
+Same kernel as run 15, only chromewin rebuilt. Result:
+- **No corrupt URLs and NO 403s.** Every videoplayback request/response
+  logged expire=1785300094 (sane) and status=200. The two BOGUS-EXPIRE hits
+  were my own probe's false positive: URLs with NO expire= param at all
+  (generate_204 etc.) parse as exp=0. Fix the detector before reusing it.
+- So the run-15 `expire=8922279409` observation is NOT reproducible on
+  demand. It was real in that log, but it is INTERMITTENT and its mechanism
+  is unproven -- possibly genuine memory corruption, possibly a fragment
+  parsed as a whole message by cdp_fill_nb's "one giant partial: drop it
+  all" path (identified but not yet instrumented). DOWNGRADE it from "the
+  cause of the reset" to "an unexplained intermittent observation".
+  The slice-58 commit message overstates it; this entry is the correction.
+- **The honest headline: playback is FLAKY run-to-run, not blocked.**
+  run 14 = r4/b20.0/playing; run 15 = r1/b4.0 then reset; run 16 = never
+  past r1 (and one probe caught the element torn down: r0 n3 d0). Same
+  kernel across 15/16. So what remains is not one deterministic wall but
+  RUN-TO-RUN VARIANCE in whether the player sustains its segment loop.
+- NEXT (do these in order, they are cheap):
+  1. Fix the expire detector (skip URLs with no expire=), then run the SAME
+     build 3x and tabulate: max buffered, #403s, #corrupt URLs per run.
+     Variance data first -- one run cannot characterise a flaky failure.
+  2. Instrument cdp_fill_nb's drop path (count drops + log when a message
+     is parsed whose head is not '{'): proves or kills the fragment theory
+     for the run-15 log, cheaply and independently of chrome.
+  3. Only then chase kernel-side corruption again.
