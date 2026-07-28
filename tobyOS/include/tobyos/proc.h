@@ -207,6 +207,16 @@ struct proc {
      * deadline and sets futex_timed_out so the return is -ETIMEDOUT. */
     uint64_t        futex_deadline_ns;
     bool            futex_timed_out;
+    /* Wake-latency instruments (slice 56): when this proc PARKED on a futex,
+     * when the wake was DELIVERED (state->READY, by FUTEX_WAKE or the timeout
+     * sweep), and which Linux syscall it is currently inside (cursys, -1 =
+     * none) since cursys_ns. Splits "wake delivered late" from "woken but not
+     * scheduled": act-vs-req overshoot with a small (now - fx_wake_ns) means
+     * the WAKE was late; a large one means the READY proc sat unscheduled. */
+    uint64_t        fx_park_ns;
+    uint64_t        fx_wake_ns;
+    int32_t         cursys;
+    uint64_t        cursys_ns;
     /* CHROMIUM_BOOT diagnostic: latched at execve when argv carries
      * "--type=renderer", so the SIGKILL/exit stack-dump hook can fire on the
      * renderer (the process that must complete a document load for --dump-dom)

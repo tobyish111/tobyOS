@@ -9,6 +9,8 @@
 #include <tobyos/klibc.h>
 #include <tobyos/sched.h>   /* bkl_held/bkl_exit/bkl_enter for the wait loop */
 #include <tobyos/proc.h>    /* current_proc()->tcp_yield_wait (stage 12D) */
+#include <tobyos/percpu.h>  /* slice 56: yield-if-ready in tcp_poll_until */
+#include <tobyos/smp.h>
 
 /* 16: HTTP keep-alive (http.c) parks up to KEEP_MAX=4 idle conns on top
  * of the active fetch, listeners and TIME_WAIT remnants. */
@@ -86,6 +88,18 @@ struct tcp_conn {
     uint8_t      snd_wnd_shift;   /* peer's window scale factor */
     uint8_t      rcv_wnd_shift;   /* our window scale factor (advertised) */
     bool         wscale_ok;       /* both sides support window scaling */
+
+    /* Receiver-side window updates (slice 56). adv_free_last = the free-space
+     * value carried in the LAST segment we sent = the peer's best knowledge of
+     * our window. After the app drains the ring, nothing else would ever tell
+     * the peer the window reopened (ACKs only flow while the peer sends), so a
+     * peer that ran the window down sat silent until ITS zero-window probe --
+     * tens of seconds. tcp_recv sends a window-update ACK when reality exceeds
+     * this by >= 2 MSS. rx_full_episode makes the FULL log once-per-episode
+     * instead of 8-per-connection-lifetime (absence of the capped log was
+     * mistaken for absence of the condition). */
+    uint32_t     adv_free_last;
+    bool         rx_full_episode;
 
 #ifdef CHROMIUM_BOOT
     /* Slice 35 diagnostic: per-connection wire accounting, so a failed TLS
@@ -487,7 +501,11 @@ static bool tcp_emit(struct tcp_conn *c, uint8_t flags,
     if (plen) memcpy(buf + hdr_len, payload, plen);
     h->checksum = net_l4_checksum(IP_PROTO_TCP, g_my_ip, c->remote_ip_be,
                                    buf, hdr_len + plen);
-    return ip_send(c->remote_ip_be, IP_PROTO_TCP, buf, hdr_len + plen);
+    bool sent = ip_send(c->remote_ip_be, IP_PROTO_TCP, buf, hdr_len + plen);
+    /* Slice 56: remember what the peer now believes our window is, so
+     * tcp_recv can send a window-update ACK when reality outgrows it. */
+    if (sent) c->adv_free_last = free_wnd;
+    return sent;
 }
 
 static void tcp_send_ack(struct tcp_conn *c) {
@@ -848,15 +866,16 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
                         (unsigned)c->rcv_nxt);
         } else {
 #ifdef CHROMIUM_BOOT
-            /* Iter 7: log this UNCONDITIONALLY (rate-limited). A full ring
-             * right when chrome's first post-handshake read fails would tie
-             * the WRONG_VERSION_NUMBER to receiver-side flow control. */
-            if (c->dbg_full_logged < 8) {
+            /* Slice 56: once per FULL EPISODE (re-armed when the ring drains
+             * to half), not 8-per-connection-lifetime -- the old cap made
+             * "the diagnostic didn't fire during the stall" unfalsifiable. */
+            if (!c->rx_full_episode) {
+                c->rx_full_episode = true;
                 c->dbg_full_logged++;
-                kprintf("[tcp] RX buffer FULL tcp[%d] plen=%u free=%u seq=%u "
-                        "(segment refused; peer must retransmit)\n",
-                        conn_index(c), (unsigned)plen, (unsigned)free_space,
-                        (unsigned)seq);
+                kprintf("[tcp] RX FULL episode#%u tcp[%d] plen=%u free=%u seq=%u "
+                        "(refused; peer stalls until win-update/probe)\n",
+                        c->dbg_full_logged, conn_index(c), (unsigned)plen,
+                        (unsigned)free_space, (unsigned)seq);
             }
 #else
             if (g_tcp_trace)
@@ -1007,8 +1026,17 @@ static int tcp_poll_until(struct tcp_conn *c, uint64_t deadline,
         struct proc *curp = current_proc();
         if (curp && curp->tcp_yield_wait)
             sched_yield();
-        else
-            hlt();
+        else {
+            /* Slice 56: same rule as sock_recvfrom_to -- never hlt-hog a CPU
+             * that has READY work (a blocking TCP wait landing on the BSP
+             * otherwise parks pid 0, the poll_tick/net-pump driver, for the
+             * whole wait; pid 0 is is_idle and unstealable). */
+            struct percpu *me = smp_this_cpu();
+            if (me && __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE))
+                sched_yield();
+            else
+                hlt();
+        }
         if (had_bkl) bkl_enter();
     }
 }
@@ -1284,15 +1312,41 @@ long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
     int r = tcp_poll_until(c, dl, pred_recv);
     if (r == -2) return -2;
     if (r == -1) {
+        /* Draining residue after the peer FIN'd (CLOSE_WAIT/CLOSED): no window
+         * update on purpose -- the peer sends no more data regardless. */
         if (c->rx_count > 0) return (long)rx_pop(c, buf, cap);
         return -1;
     }
     if (r == 0) return 0;
     size_t before = c->rx_count;
     long got = (long)rx_pop(c, buf, cap);
-    if (got > 0 && c->state == TCP_ESTABLISHED &&
-        before >= TCP_RX_BUF_BYTES / 2u)
-        tcp_send_ack(c);
+    /* Slice 56 receiver flow control, done right. The old rule (ACK only when
+     * the ring was >= half full BEFORE the pop) left the peer's view of our
+     * window STALE whenever the drain pattern skipped it (or the one update
+     * ACK was lost -- pure ACKs are not retransmitted). A peer that ran the
+     * window down then sat SILENT until its own zero-window probe, tens of
+     * seconds later -- while we sat idle waiting for data we had room for.
+     * New rule: whenever the actual free space exceeds the peer's last-told
+     * window (adv_free_last, stamped on every segment we send) by >= 2 MSS,
+     * tell it now. */
+    if (got > 0 && c->state == TCP_ESTABLISHED) {
+        uint32_t free_now = (uint32_t)(TCP_RX_BUF_BYTES - c->rx_count);
+        if (free_now > c->adv_free_last &&
+            free_now - c->adv_free_last >= 2u * TCP_DEFAULT_MSS) {
+#ifdef CHROMIUM_BOOT
+            {   static int wu = 0;
+                if (wu < 24) { wu++;
+                    kprintf("[tcp] WIN-UPDATE tcp[%d] free=%u peer-knew=%u\n",
+                            conn_index(c), free_now, c->adv_free_last);
+                } }
+#endif
+            tcp_send_ack(c);
+        }
+#ifdef CHROMIUM_BOOT
+        if (c->rx_full_episode && free_now >= TCP_RX_BUF_BYTES / 2u)
+            c->rx_full_episode = false;      /* episode over; re-arm the log */
+#endif
+    }
     return got;
 }
 

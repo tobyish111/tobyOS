@@ -314,6 +314,13 @@ static void e1000_read_mac(uint8_t out_mac[ETH_ADDR_LEN]) {
 
 /* ----- TX / RX (driver-side, called via the net_dev vtable) ------ */
 
+#ifdef CHROMIUM_BOOT
+/* Slice 56: TX at the WIRE. [tls] TX only counts TLS-layer writes, so raw SYNs,
+ * pure ACKs and UDP were invisible -- "bidirectional silence" was inferred, not
+ * measured. This counts every frame handed to the NIC. */
+static uint64_t g_dbg_tx_pkts;
+#endif
+
 static bool e1000_tx_op(struct net_dev *dev, const void *frame, size_t len) {
     (void)dev;
     if (len == 0 || len > BUF_SIZE) return false;
@@ -338,6 +345,9 @@ static bool e1000_tx_op(struct net_dev *dev, const void *frame, size_t len) {
     g_tx_tail = (uint16_t)((i + 1) % TX_DESC_COUNT);
     __asm__ volatile ("" ::: "memory");
     mmio_write32(E1000_TDT, g_tx_tail);
+#ifdef CHROMIUM_BOOT
+    g_dbg_tx_pkts++;
+#endif
     return true;
 }
 
@@ -428,9 +438,10 @@ static void e1000_rx_drain_op(struct net_dev *dev) {
         }
         if (now - g_dbg_report_ms >= 5000) {
             g_dbg_report_ms = now;
-            kprintf("[rxdbg] %lums drains=%lu pkts=%lu maxbatch=%u "
+            kprintf("[rxdbg] %lums drains=%lu pkts=%lu tx=%lu maxbatch=%u "
                     "quiet=%lums\n", (unsigned long)now,
                     (unsigned long)g_dbg_drains, (unsigned long)g_dbg_pkts,
+                    (unsigned long)g_dbg_tx_pkts,
                     (unsigned)g_dbg_max_batch,
                     (unsigned long)(g_dbg_last_pkt_ms ? now - g_dbg_last_pkt_ms : 0));
         }

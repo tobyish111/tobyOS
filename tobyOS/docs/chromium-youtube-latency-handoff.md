@@ -1,5 +1,20 @@
 # Handoff: make YouTube video actually PLAY on tobyOS Chromium (WHPX)
 
+> **STATUS (slice 56, 2026-07-28): the central question of this handoff is
+> ANSWERED and FIXED.** The ~55s bidirectional silences were `lx_recvmsg`'s
+> UDP arm ignoring O_NONBLOCK: chrome's speculative QUIC/DNS reads blocked in
+> an infinite in-kernel drain+hlt loop ON THE BSP, parking pid 0 (unstealable,
+> never tick-preempted in kernel mode) and with it poll_tick AND the futex
+> timeout sweep -- every timer and poller in the box froze until a stray
+> datagram arrived. Fixed along with: yield-if-ready in the blocking-wait
+> loops, any-CPU sweep/poll_tick drivers, FUTEX_CLOCK_REALTIME rebasing,
+> proactive TCP window updates, non-blocking socket close(2), and audio-off
+> chrome flags (no ALSA device; audio bring-up was killing the renderer).
+> The watch page now renders its real player with a healthy kernel. The
+> remaining wall is one layer up: browser->renderer Mojo delivery stops ~35s
+> in ([epset] instrument in place). See the slice-56 ledger entry -- read it
+> BEFORE this document; §3/§4/§6 below are the pre-slice-56 state.
+
 You are picking up a **working, interactive** Chromium bring-up on tobyOS at ONE
 remaining wall: **YouTube is ~50x too slow**. Real unmodified
 `chrome-headless-shell` 151 runs on tobyOS's Linux ABI under hardware

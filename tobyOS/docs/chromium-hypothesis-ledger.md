@@ -2589,3 +2589,110 @@ timed-futex/clock path), or a wakeup that is delivered late (poll_tick is
 pid 0's lane is delayed, every parked poller waits). Instrument the deadline and
 wake path for the specific threads blocked at that moment: dump, for the longest
 futex/epoll waiter, its requested timeout vs actual elapsed time.
+
+## Slice 56 (2026-07-28): the ~50s silences ROOT-CAUSED AND FIXED -- a blocking
+## recvmsg freezing the whole wake machinery; then two more serial walls peeled
+
+### Method: the handoff's missing instrument, built first
+Requested-vs-actual wait time for every blocked waiter, plus liveness counters
+for the wake machinery itself:
+- `[fxpark]/[fxlate]/[fxwake]` (thread.c): futex park/wake with requested vs
+  actual ms and a `rdy=` split (time from wake-DELIVERY to running -- separates
+  "wake came late" from "woken but not scheduled").
+- `[wait] ... to=` (syscall.c): every blocked syscall now shows its REQUESTED
+  timeout. `[cur]`: every non-blocked Linux thread's current syscall + time in
+  it. `[tick]`: futex-sweep/poll_tick counters + `nextdue` (soonest parked
+  timed-futex deadline; negative = overdue = the sweep is starving).
+- `[eplate]/[polate]`: finite-timeout epoll/poll overshoot. `[rxdbg] tx=`:
+  wire-level TX (the old "bidirectional silence" was inferred from [tls] TX
+  only). `[fxrt]`: counts FUTEX_CLOCK_REALTIME waits. RX-FULL log made
+  once-per-episode (the old 8-per-conn cap made absence unfalsifiable).
+
+### RUN 1 (instruments only): the stall named itself in one run
+During the silence window (129.5s -> 175s):
+- `[tick]` fxsweep/polltick counters FROZEN for 45+s; `nextdue` sank to -26s
+  (a timed futex 26 SECONDS overdue with the sweep simply not running).
+- `[eplate] to=4549ms act=49799ms`, `[fxlate] req=1518ms act=47290ms rdy=0ms`:
+  wake DELIVERY late by ~46s, scheduling instant once delivered.
+- `[cur] pid=39 RUNNING in recvmsg for 47s` with `[hb-x] cpu0 cur=39`.
+
+Mechanism (all links verified): `lx_recvmsg`'s UDP arm ignored O_NONBLOCK and
+MSG_DONTWAIT, so chrome's speculative QUIC/DNS reads (chrome reads UDP with
+recvmsg until EAGAIN) BLOCKED in sock_recvfrom_to's infinite drain+hlt loop --
+on the BSP. pid 0 is is_idle (work-stealing skips it; the tick never preempts
+kernel mode), so pid 0 sat READY behind the blocked thread for the whole wait:
+no poll_tick (pid 0's loop is its all-blocked driver) and no futex sweep (BSP
+yield slow path was its ONLY driver) => every timer and poller in the box
+frozen until a stray datagram arrived ~50s later. This also resolves the
+handoff's contradiction B: "RUNNING but no ring-3 samples" = inside ONE
+syscall's in-kernel hlt loop (the ~620/s drains during silences were that loop
+polling the NIC at IRQ rate; 119 syscalls/60s because each recvmsg lasted tens
+of seconds).
+
+### Fixes (defboot clean after each build)
+1. `lx_recvmsg` UDP arm honours nonblock/MSG_DONTWAIT (root cause).
+2. `sock_recvfrom_to` + `tcp_poll_until`: yield-if-ready instead of hlt when
+   THIS CPU has READY work (never park pid 0 behind a blocking wait again).
+3. futex sweep + poll_tick now run from ANY CPU's yield slow path (was
+   BSP-only = single point of failure).
+4. FUTEX_CLOCK_REALTIME absolute deadlines rebased realtime->monotonic
+   (glibc default-clock condvars/sem_timedwait; they were compared against
+   perf_now_ns and could never expire; chrome passes them 600+/run).
+5. tcp_recv proactive window updates: `adv_free_last` stamped on every sent
+   segment; ACK when reality exceeds the peer's known window by >=2 MSS.
+   ([tcp] WIN-UPDATE fires with peer-knew=0 cases -- a peer that ran our
+   window down was otherwise never told it reopened; pure ACKs are not
+   retransmitted, and slirp probes weakly.)
+6. `sock_close` -> `tcp_close_nowait`: POSIX close(2) on a socket must not
+   block; the old path did a synchronous 5s FIN-wait + TIME_WAIT linger
+   INSIDE close(2).
+
+### RUN 2 (fixes 1-5): kernel wake machinery healthy; next wall exposed
+- `[tick]` alive all run, `nextdue` ~-200ms, every parked wait within its
+  requested `to=`. 33 requests in the first 20s (was 17 in 120s); the real
+  `videoplayback` MEDIA REQ at ~26s (was ~100s). Zero faults.
+- NEW WALL: the watch-page renderer called exit(0) at 43.0s, ~1.1s after
+  AudioService spawn + `PcmOpen: default, No such file or directory` (tobyOS
+  has no ALSA device) + SyncReader timeouts. No crash, no respawn; the page,
+  its MSE fetches and all CDP evaluate replies died with it.
+
+### RUN 3 (--mute-audio + --disable-audio-output, probe cap 12->36)
+- Renderer SURVIVES the full 360s. The REAL watch page paints in the TobyTK
+  window: player frame, controls, progress bar, buffering spinner.
+- Media still absent. `[cur] pid=40 RUNNING in close for 4-7s` REPEATEDLY =
+  chrome's network IO thread serially closing ~8 page-load sockets, each a
+  synchronous 5s FIN-wait inside close(2) => event loop wedged 50-70s => no
+  h2 WINDOW_UPDATEs => media conns frozen at ~50KB with exactly 129 bytes
+  unread. Profiler: 1-3 ring-3 samples/interval -- the "renderer spinning at
+  100% CPU" reading was kernel wait-loops, NOT user code. Wire totals: 3.4MB
+  rx==read on the main youtube.com conn, retx=0 ooo=0 -- transport healthy.
+
+### RUN 4 (fix 6): close wedge GONE; current wall = Mojo delivery stops ~35s
+- Zero "RUNNING in close". All conns read==rx. Renderer survives. First frame
+  at ~31s. But: CDP evaluate replies stop entirely ~35s in, frames stop at 3,
+  net{} counters freeze, media still ~50KB.
+- The browser RECEIVES every probe ([devpipe] pid-1 reads 626B every 10s all
+  run) and browser MAIN (pid 3) pumps healthily (200-600ms futex/poll cycles,
+  USER time) -- but nothing downstream runs: renderer main sits in ONE
+  epoll_wait for 59+s (rescanned every ~1ms by poll_tick, never finds
+  anything ready). So messages stop flowing browser->renderer (Mojo channel
+  delivery), starving the renderer main AND the media data pipe.
+- `[epset]` instrument added for the next run: for any epoll_wait blocked
+  >10s, dump every watched fd's kind + file_poll_ready NOW. Splits "sender
+  never sent" from "data pending but waiter never woken".
+
+### Ruled OUT this slice (do not re-chase)
+- TSC desync / clock jumps: clkchk clean in every run (no negative deltas).
+- "Zero-window exonerated because RX-FULL didn't log": the cap was 8/conn AND
+  an honest peer exhausts the advertised window WITHOUT triggering refusals;
+  absence proved nothing. (The stale-window bug was real -- fix 5 -- though
+  not the primary stall.)
+- Renderer busy-spin: profiler shows ring 3 nearly idle during every stall.
+- MSE/decode/display: untouched, still proven (slice 54).
+
+### State at slice end
+YouTube watch page renders its real player in the native window with the
+kernel wake machinery verified healthy end-to-end. Remaining wall, precisely
+bounded: browser->renderer Mojo message delivery stops ~35s in (evaluates
+unanswered, media data pipe undrained, ~50KB of media fetched then nothing).
+Next measurement is already in place: `[epset]`.

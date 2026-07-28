@@ -555,6 +555,15 @@ static int spawn_chrome(void) {
             (char *)"--ignore-certificate-errors",
             (char *)"--allow-file-access-from-files",
             (char *)"--autoplay-policy=no-user-gesture-required",
+            /* Slice 56: tobyOS has no ALSA device. With audio enabled, the
+             * watch-page renderer initialised playback at ~42s (AudioService
+             * spawned, PcmOpen failed, SyncReader timed out, broken pipe) and
+             * the RENDERER exit(0)'d ~1s later -- taking the whole page (and
+             * all MSE fetches) with it, with no crash and no respawn. Disable
+             * audio output entirely (and mute as belt-and-braces) so playback
+             * runs video-only until an audio device exists. */
+            (char *)"--mute-audio",
+            (char *)"--disable-audio-output",
             0,
         };
         char *envp[] = {
@@ -886,11 +895,13 @@ int main(void) {
         }
 #endif
 
-        /* Slice 52: probe the page state every 10s (12 times) and report the
-         * frame count alongside, so a stalled run says WHY it is stalled. */
+        /* Slice 52: probe the page state every 10s and report the frame count
+         * alongside, so a stalled run says WHY it is stalled. (Slice 56: cap
+         * raised 12 -> 36; the 120s cutoff left the back half of every 360s
+         * run blind.) */
         {
             static int probes;
-            if (probes < 12 && sys_clock_ms() - t0 > (long)(probes + 1) * 10000) {
+            if (probes < 36 && sys_clock_ms() - t0 > (long)(probes + 1) * 10000) {
                 probes++;
                 printf("[chromewin] probe #%d at %lds: frames=%d "
                        "net{req=%d media=%d resp=%d fin=%d fail=%d}\n",

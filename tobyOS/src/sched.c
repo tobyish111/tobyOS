@@ -631,7 +631,17 @@ void sched_yield(void) {
      * heavy threading; the slow path of sched_yield runs constantly under load,
      * so timeouts still fire promptly. BSP-only + rate-limited. sched_enqueue
      * (taken by the sweep) does not call sched_yield, so no recursion. */
-    if (me && me->cpu_idx == 0) {
+    /* Slice 56: was BSP-only -- which made the whole wake machinery a single
+     * point of failure. When one thread sat inside a blocking syscall ON the
+     * BSP (hlt-looping, never yielding), pid 0 was parked behind it (is_idle:
+     * unstealable, and kernel mode is never tick-preempted), so NEITHER this
+     * sweep NOR poll_tick ran anywhere for the whole wait: every chrome timer
+     * and poller froze for ~50s at a time ([tick] counters flat, nextdue -26s).
+     * Any CPU's yield slow path may drive both: the sweep serialises on
+     * g_futex_lock, the poll list on the BKL (hence the holds_bkl gate); the
+     * rate-limit statics racing across CPUs just means an occasional extra
+     * sweep. */
+    if (me) {
         static uint64_t last_futex_sweep;
         uint64_t nowns = perf_now_ns();
         if (nowns - last_futex_sweep >= 10000000ull) {   /* 10 ms */

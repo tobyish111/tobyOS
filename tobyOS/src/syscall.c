@@ -4934,6 +4934,16 @@ static uint64_t lx_realtime_ns(uint64_t mono_ns) {
     return s_epoch_base_ns + mono_ns;
 }
 
+/* Slice 56: CLOCK_REALTIME minus CLOCK_MONOTONIC, for converting an absolute
+ * realtime deadline (glibc FUTEX_CLOCK_REALTIME waits: default-clock
+ * pthread_cond_timedwait / sem_timedwait) into the monotonic timebase every
+ * kernel deadline comparison uses. 0 when there is no RTC (realtime ==
+ * monotonic then, so the conversion is a no-op). */
+uint64_t lx_realtime_offset_ns(void) {
+    uint64_t mono = perf_now_ns();
+    return lx_realtime_ns(mono) - mono;
+}
+
 /* Slice 39 freeze triage: prove (or refute) that a poll(2) spinner is alive.
  * Bumped once per lx_do_poll wait iteration; read by the sched.c heartbeat. */
 uint64_t g_lx_poll_iters;
@@ -5046,8 +5056,9 @@ static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
         return -ABI_EFAULT;
     struct proc *self = current_proc();
     bool infinite = (timeout_ms < 0);
+    uint64_t po_start = perf_now_ns();
     uint64_t deadline = infinite ? 0
-                                 : perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+                                 : po_start + (uint64_t)timeout_ms * 1000000ull;
     for (;;) {
         int nready = 0;
         bool saw_sock = false;
@@ -5064,6 +5075,20 @@ static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
         }
         if (nready > 0 || timeout_ms == 0 ||
             (!infinite && perf_now_ns() >= deadline)) {
+#ifdef CHROMIUM_BOOT
+            /* Slice 56: finite-timeout poll(2) overshoot (see [eplate]). */
+            if (!infinite && timeout_ms > 0) {
+                uint64_t act = perf_now_ns() - po_start;
+                if (act > (uint64_t)timeout_ms * 1000000ull + 500000000ull) {
+                    static int pl = 0;
+                    if (pl < 48) { pl++;
+                        kprintf("[polate] pid=%d to=%ldms act=%lums n=%d\n",
+                                self ? self->pid : -1, timeout_ms,
+                                (unsigned long)(act / 1000000ull), nready);
+                    }
+                }
+            }
+#endif
             if (nfds && copy_to_user((void *)(uintptr_t)ufds, fds,
                                      nfds * sizeof(fds[0])) != 0)
                 return -ABI_EFAULT;
@@ -5200,8 +5225,9 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
     struct epoll_inst *ei = ef->epoll;
     struct proc *self = current_proc();
     bool infinite = (timeout_ms < 0);
+    uint64_t ep_start = perf_now_ns();
     uint64_t deadline = infinite ? 0
-                                 : perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+                                 : ep_start + (uint64_t)timeout_ms * 1000000ull;
     for (;;) {
         int n = 0;
         bool saw_sock = false;
@@ -5220,8 +5246,24 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
             n++;
         }
         if (n > 0 || timeout_ms == 0 ||
-            (!infinite && perf_now_ns() >= deadline))
+            (!infinite && perf_now_ns() >= deadline)) {
+#ifdef CHROMIUM_BOOT
+            /* Slice 56: a FINITE-timeout epoll_wait that returned far past its
+             * bound = the poll_tick re-scan machinery let it oversleep. */
+            if (!infinite && timeout_ms > 0) {
+                uint64_t act = perf_now_ns() - ep_start;
+                if (act > (uint64_t)timeout_ms * 1000000ull + 500000000ull) {
+                    static int el = 0;
+                    if (el < 48) { el++;
+                        kprintf("[eplate] pid=%d epfd=%d to=%ldms act=%lums n=%d\n",
+                                self ? self->pid : -1, epfd, timeout_ms,
+                                (unsigned long)(act / 1000000ull), n);
+                    }
+                }
+            }
+#endif
             return n;
+        }
         if (self && self->pending_signals) return -LX_EINTR;
         /* B14: epoll over sockets must pump RX while blocked (a full scan
          * before yielding would otherwise never see the handshake complete). */
@@ -6272,6 +6314,23 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
         if (n == SOCK_ERR_AGAIN)   { kfree(k); return -LXE_EAGAIN; }
         if (n < 0)                 { kfree(k); return -LXE_ENOTSOCK; }
     } else if (s->kind == SOCK_KIND_UDP) {
+        /* Slice 56 ROOT-CAUSE FIX for the ~50s system-wide silences: this arm
+         * ignored O_NONBLOCK/MSG_DONTWAIT, so chrome's non-blocking QUIC/DNS
+         * UDP reads (always recvmsg, read-until-EAGAIN) BLOCKED in
+         * sock_recvfrom_to's infinite drain+hlt loop -- on the BSP, where the
+         * blocked thread is never preempted in kernel mode and pid 0 (poll_tick
+         * + net pump + the only futex-sweep driver) is is_idle and unstealable.
+         * One empty speculative read therefore froze EVERY timer and poller in
+         * the box until a stray datagram arrived 45-55s later ([cur] pid=39
+         * RUNNING in recvmsg for 47s; [tick] fxsweep/polltick counters frozen;
+         * [eplate] epoll to=4549ms act=49799ms). Mirror lx_recv's nowait path. */
+        bool nowait = s->nonblock || (flags & LX_MSG_DONTWAIT) != 0;
+        if (nowait && !sock_recv_ready(s)) {
+            struct net_dev *nd = net_default();
+            if (nd && nd->rx_drain) nd->rx_drain(nd);
+            net_poll();
+            if (!sock_recv_ready(s)) { kfree(k); return -LXE_EAGAIN; }
+        }
         uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
         n = sock_recvfrom_to(s, k, total, &sip, &sport, to);
         if (n == EINTR_RET)        { kfree(k); return -LXE_EINTR; }
@@ -6484,13 +6543,19 @@ void lx_dump_recent_syscalls(void) {
  * waiting on whom. Recorded at the syscall boundary, so an entry persists for
  * exactly as long as the thread is blocked inside the call. */
 #define WAITT_MAX 64
-static struct { int pid; long nr; uint64_t arg; uint64_t since_ns; uint8_t busy; }
+static struct { int pid; long nr; uint64_t arg; long to_ms; uint64_t since_ns;
+                uint8_t busy; }
         g_waitt[WAITT_MAX];
 
-static void waitt_enter(long nr, uint64_t arg) {
+/* to_ms: the REQUESTED timeout in ms (-1 = infinite/none). Slice 56: this is
+ * the number the whole stall investigation was missing -- a thread blocked 40s
+ * on `futex to=50` is a kernel wake-latency bug; blocked 40s on `to=-1` is
+ * chrome idling by choice. */
+static void waitt_enter(long nr, uint64_t arg, long to_ms) {
     struct proc *p = current_proc(); if (!p) return;
     for (int i = 0; i < WAITT_MAX; i++) if (!g_waitt[i].busy) {
         g_waitt[i].pid = p->pid; g_waitt[i].nr = nr; g_waitt[i].arg = arg;
+        g_waitt[i].to_ms = to_ms;
         g_waitt[i].since_ns = perf_now_ns(); g_waitt[i].busy = 1; return; }
 }
 static void waitt_exit(void) {
@@ -6504,9 +6569,84 @@ void waitt_dump(void) {
     if (!n) return;
     kprintf("[wait] %d thread(s) blocked in a syscall:\n", n);
     for (int i = 0; i < WAITT_MAX; i++) if (g_waitt[i].busy)
-        kprintf("  pid=%d %s(0x%lx) for %lu ms\n", g_waitt[i].pid,
+        kprintf("  pid=%d %s(0x%lx to=%ld) for %lu ms\n", g_waitt[i].pid,
                 lx_scname(g_waitt[i].nr), (unsigned long)g_waitt[i].arg,
+                g_waitt[i].to_ms,
                 (unsigned long)((now - g_waitt[i].since_ns) / 1000000ull));
+    /* [cur] slice 56: what every NON-blocked Linux thread is doing right now --
+     * in-kernel inside which syscall (and for how long), or in userspace.
+     * Resolves the "heartbeat says RUNNING / profiler says not in ring 3"
+     * contradiction: a RUNNING thread sitting in one syscall for seconds is
+     * in an in-kernel wait/spin loop, and this names the loop. */
+    {
+        extern struct proc g_proc[];
+        for (int i = 0; i < PROC_MAX; i++) {
+            struct proc *p = &g_proc[i];
+            if (p->state == PROC_UNUSED || p->personality != 1) continue;
+            if (p->state != PROC_RUNNING && p->state != PROC_READY) continue;
+            if (p->cursys >= 0 && p->cursys_ns)
+                kprintf("  [cur] pid=%d %s in %s for %lu ms\n", p->pid,
+                        proc_state_name(p->state), lx_scname(p->cursys),
+                        (unsigned long)((now - p->cursys_ns) / 1000000ull));
+            else
+                kprintf("  [cur] pid=%d %s in USER\n", p->pid,
+                        proc_state_name(p->state));
+        }
+    }
+    /* [epset] slice 56 run-4 follow-up: for any epoll_wait blocked >10s, dump
+     * WHAT it is waiting on and whether any of it is ready RIGHT NOW. Splits
+     * "sender never sent" (all r0 -- the wedge is upstream of this thread)
+     * from "data pending but the waiter never woke" (kernel readiness/wake
+     * bug). kN = file kind, rN = file_poll_ready bits at dump time. */
+    {
+        for (int i = 0; i < WAITT_MAX; i++) {
+            if (!g_waitt[i].busy) continue;
+            if (g_waitt[i].nr != LX_epoll_wait &&
+                g_waitt[i].nr != LX_epoll_pwait) continue;
+            if (now - g_waitt[i].since_ns < 10000000000ull) continue;
+            struct proc *p = proc_lookup(g_waitt[i].pid);
+            if (!p) continue;
+            struct file **t = proc_fds(p);
+            if (!t) continue;
+            int epfd = (int)g_waitt[i].arg;
+            if (epfd < 0 || epfd >= PROC_NFDS) continue;
+            struct file *ef = t[epfd];
+            if (!ef || ef->kind != FILE_KIND_EPOLL || !ef->epoll) continue;
+            kprintf("  [epset] pid=%d epfd=%d:", g_waitt[i].pid, epfd);
+            for (int e = 0; e < EPOLL_MAX; e++) {
+                if (!ef->epoll->e[e].used) continue;
+                int wfd = ef->epoll->e[e].fd;
+                struct file *wf = (wfd >= 0 && wfd < PROC_NFDS) ? t[wfd] : 0;
+                kprintf(" %d(k%d r%x)", wfd, wf ? (int)wf->kind : -1,
+                        wf ? (unsigned)file_poll_ready(wf) : 0u);
+            }
+            kprintf("\n");
+        }
+    }
+    /* [tick] slice 56: is the wake machinery itself alive? fxsweep must climb
+     * ~100/s (10ms rate limit) whenever the BSP yield slow path runs; polltick
+     * must climb ~1000/s while any poller is parked. nextdue = the SOONEST
+     * timed-futex deadline still parked (negative = OVERDUE: the sweep is
+     * starving and every "50ms" wait in chrome is stretching). */
+    {
+        extern uint64_t g_fx_sweeps, g_fx_sweep_woken, g_poll_tick_wakes,
+                        g_fx_rt_flag_count;
+        extern struct proc g_proc[];
+        int timed = 0, minpid = -1; int64_t mind = 0; int have = 0;
+        for (int i = 0; i < PROC_MAX; i++) {
+            struct proc *p = &g_proc[i];
+            if (p->state != PROC_BLOCKED || !p->futex_deadline_ns) continue;
+            timed++;
+            int64_t d = (int64_t)p->futex_deadline_ns - (int64_t)now;
+            if (!have || d < mind) { mind = d; minpid = p->pid; have = 1; }
+        }
+        kprintf("  [tick] fxsweep=%lu woke=%lu polltick=%lu rtflag=%lu "
+                "timedfx=%d nextdue=%ldms pid=%d\n",
+                (unsigned long)g_fx_sweeps, (unsigned long)g_fx_sweep_woken,
+                (unsigned long)g_poll_tick_wakes,
+                (unsigned long)g_fx_rt_flag_count, timed,
+                have ? (long)(mind / 1000000ll) : 0, minpid);
+    }
 }
 
 /* Read one u64 from proc `p`'s user address space (via its cr3), for reading a
@@ -6613,9 +6753,14 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     }
     default: break;
     }
+    /* Slice 56: stamp which syscall this thread is inside (and since when) so
+     * the [cur] dump can say what a "RUNNING" thread is doing in-kernel. */
+    struct proc *curp = current_proc();
+    if (curp) { curp->cursys = (int32_t)n; curp->cursys_ns = perf_now_ns(); }
 #endif
     long r = linux_syscall_impl(n, a1, a2, a3, a4, a5);
 #ifdef CHROMIUM_BOOT
+    if (curp) curp->cursys = -1;
     if (chan_fd >= 0) {
         static int chan_c = 0;
         if (chan_c < 500) {
@@ -6936,7 +7081,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_epoll_wait:            /* epoll_wait(epfd, *events, maxevents, timeout) */
     case LX_epoll_pwait: {         /* epoll_pwait(... , *sigmask) -- sigmask ignored */
 #ifdef CHROMIUM_BOOT
-        waitt_enter(n, (uint64_t)(int)a1);      /* arg = the epoll fd */
+        waitt_enter(n, (uint64_t)(int)a1, (long)(int)a4);  /* arg = epoll fd */
 #endif
         long er = lx_epoll_wait((int)a1, (uint64_t)a2, (int)a3, (long)(int)a4);
 #ifdef CHROMIUM_BOOT
@@ -7828,7 +7973,29 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * here). */
     case LX_futex: { /* (uaddr, op, val, timeout, ...); op decoded inside */
 #ifdef CHROMIUM_BOOT
-        waitt_enter(n, (uint64_t)a1);
+        /* Slice 56: record the REQUESTED wait bound in ms for the [wait] dump.
+         * FUTEX_WAIT (op 0) takes a RELATIVE timespec; FUTEX_WAIT_BITSET (op 9)
+         * an ABSOLUTE monotonic one -- convert both to "ms from now". A
+         * ludicrous value here (minutes+) = the deadline is on the wrong clock. */
+        {
+            long fto = -1;
+            int fop = (int)a2 & 0x7f;
+            if ((fop == 0 || fop == 9) && a4) {
+                int64_t fts[2];
+                if (copy_from_user(fts, (const void *)(uintptr_t)a4,
+                                   sizeof fts) == 0) {
+                    uint64_t t = (uint64_t)fts[0] * 1000000000ull
+                               + (uint64_t)fts[1];
+                    if (fop == 9) {
+                        uint64_t fnow = perf_now_ns();
+                        fto = (t > fnow) ? (long)((t - fnow) / 1000000ull) : 0;
+                    } else {
+                        fto = (long)(t / 1000000ull);
+                    }
+                }
+            }
+            waitt_enter(n, (uint64_t)a1, fto);
+        }
 #endif
         long fr = futex((uint32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3,
                         (const void *)(uintptr_t)a4);

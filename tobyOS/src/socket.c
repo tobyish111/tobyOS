@@ -21,6 +21,8 @@
 #include <tobyos/cpu.h>
 #include <tobyos/cap.h>
 #include <tobyos/pit.h>
+#include <tobyos/percpu.h>   /* slice 56: yield-if-ready in the recv wait loop */
+#include <tobyos/smp.h>
 
 static struct sock g_socks[SOCK_MAX];
 static uint16_t    g_next_ephemeral = 33000;
@@ -114,7 +116,17 @@ void sock_close(struct sock *s) {
     wq_wake_all(&s->wq_recv);
 
     if (s->kind == SOCK_KIND_TCP && s->tcp) {
-        tcp_close(s->tcp);
+        /* Slice 56: NEVER the blocking close here. tcp_close() waits up to 5s
+         * for the peer's FIN and then lingers TIME_WAIT -- synchronously,
+         * inside the caller's close(2). POSIX close() on a socket returns
+         * immediately (SO_LINGER default off); chrome closes its ~8 page-load
+         * connections back-to-back on its network-service IO thread, so the
+         * blocking variant wedged that event loop for 50-70s ([cur] pid=40
+         * RUNNING in close for 7s, repeatedly) -- no h2 WINDOW_UPDATEs, no
+         * data-pipe drain, media never buffers, CDP probes unanswered.
+         * tcp_close_nowait sends the FIN and lets tcp_service_tick run out
+         * the handshake + TIME_WAIT in the background. */
+        tcp_close_nowait(s->tcp);
         s->tcp = NULL;
     }
 
@@ -617,7 +629,20 @@ long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
         bool had_bkl = bkl_held();
         if (had_bkl) bkl_exit();
         sti();
-        hlt();
+        /* Slice 56: if another proc is READY on THIS CPU, cede the core
+         * instead of hlt-hogging it. A blocking recv that lands on the BSP
+         * otherwise parks pid 0 (poll_tick / net pump / GUI) behind us for
+         * the whole wait -- pid 0 is is_idle so no other core can steal it,
+         * and the tick never preempts kernel mode -- which froze every
+         * timer and poller in the box for ~50s at a time (slice-56 stall).
+         * Empty queue keeps the old power-friendly hlt. */
+        {
+            struct percpu *me = smp_this_cpu();
+            if (me && __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE))
+                sched_yield();
+            else
+                hlt();
+        }
         if (had_bkl) bkl_enter();
     }
 

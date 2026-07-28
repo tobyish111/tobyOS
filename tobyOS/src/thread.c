@@ -431,11 +431,51 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
             struct { int64_t sec; int64_t nsec; } ts;
             if (copy_from_user(&ts, utimeout, sizeof ts) == 0) {
                 uint64_t t = (uint64_t)ts.sec * 1000000000ull + (uint64_t)ts.nsec;
-                deadline_ns = (cmd == FUTEX_WAIT_BITSET) ? t
-                                                         : perf_now_ns() + t;
+                if (cmd == FUTEX_WAIT_BITSET) {
+                    deadline_ns = t;                       /* absolute */
+                    if (op & 0x100) {
+                        /* FUTEX_CLOCK_REALTIME (slice 56): the deadline is
+                         * absolute UNIX-EPOCH ns (glibc default-clock condvars /
+                         * sem_timedwait). Comparing that against boot-relative
+                         * perf_now_ns() made the wait effectively INFINITE
+                         * (~1.7e18 vs ~1e11). Rebase into the monotonic clock. */
+                        extern uint64_t lx_realtime_offset_ns(void);
+                        uint64_t off = lx_realtime_offset_ns();
+                        deadline_ns = (t > off) ? t - off : 1;
+                    }
+                } else {
+                    deadline_ns = perf_now_ns() + t;       /* relative */
+                }
                 if (deadline_ns == 0) deadline_ns = 1;   /* nonzero => "timed" */
             }
         }
+#ifdef CHROMIUM_BOOT
+        /* Slice 56 wake-latency instrument, park side. A deadline more than
+         * 2 minutes out is almost certainly built on the WRONG CLOCK (e.g. an
+         * absolute CLOCK_REALTIME deadline -- unix-epoch ns -- compared against
+         * boot-relative perf_now_ns): chrome's real timers are ms..seconds. */
+        caller->fx_park_ns = perf_now_ns();
+        caller->fx_wake_ns = 0;
+        if (op & 0x100) {                    /* FUTEX_CLOCK_REALTIME requested */
+            extern uint64_t g_fx_rt_flag_count;
+            g_fx_rt_flag_count++;
+            static int rtl = 0;
+            if (rtl < 16) { rtl++;
+                kprintf("[fxrt] pid=%d futex op=0x%x CLOCK_REALTIME abs deadline"
+                        " (rebased to monotonic)\n", caller->pid, op);
+            }
+        }
+        if (deadline_ns && deadline_ns > caller->fx_park_ns &&
+            deadline_ns - caller->fx_park_ns > 120000000000ull) {
+            static int hp = 0;
+            if (hp < 32) { hp++;
+                kprintf("[fxpark] pid=%d addr=0x%lx deadline +%lums out (HUGE)\n",
+                        caller->pid, (unsigned long)addr,
+                        (unsigned long)((deadline_ns - caller->fx_park_ns)
+                                        / 1000000ull));
+            }
+        }
+#endif
 
         /* Atomically: if *uaddr == val, wait. Otherwise return -EAGAIN. */
         uint64_t flags = spin_lock_irqsave(&g_futex_lock);
@@ -473,6 +513,44 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
         e->waiters = caller;
         spin_unlock_irqrestore(&g_futex_lock, flags);
         sched_yield();     /* woken by FUTEX_WAKE or the timeout sweep */
+#ifdef CHROMIUM_BOOT
+        /* Slice 56 wake-latency instrument, wake side: requested vs actual.
+         * rdy = time between the wake being DELIVERED (state->READY) and this
+         * thread actually running again -- large rdy = scheduler latency, small
+         * rdy with a large act-vs-req overshoot = the wake itself came late. */
+        {
+            uint64_t wnow  = perf_now_ns();
+            uint64_t actns = wnow - caller->fx_park_ns;
+            uint64_t rdyms = caller->fx_wake_ns
+                             ? (wnow - caller->fx_wake_ns) / 1000000ull : 0;
+            if (deadline_ns) {
+                uint64_t reqns = (deadline_ns > caller->fx_park_ns)
+                                 ? deadline_ns - caller->fx_park_ns : 0;
+                if (actns > reqns + 300000000ull) {
+                    static int fl = 0;
+                    if (fl < 64) { fl++;
+                        kprintf("[fxlate] pid=%d addr=0x%lx req=%lums act=%lums "
+                                "rdy=%lums to=%d\n", caller->pid,
+                                (unsigned long)addr,
+                                (unsigned long)(reqns / 1000000ull),
+                                (unsigned long)(actns / 1000000ull),
+                                (unsigned long)rdyms,
+                                caller->futex_timed_out ? 1 : 0);
+                    }
+                }
+            } else if (actns > 15000000000ull) {
+                /* Untimed parks lasting >15s are normal for idle workers; log
+                 * the WAKE so the event that ENDS a silence window is named. */
+                static int fw = 0;
+                if (fw < 64) { fw++;
+                    kprintf("[fxwake] pid=%d addr=0x%lx untimed woke after %lums "
+                            "rdy=%lums\n", caller->pid, (unsigned long)addr,
+                            (unsigned long)(actns / 1000000ull),
+                            (unsigned long)rdyms);
+                }
+            }
+        }
+#endif
         caller->futex_deadline_ns = 0;
         if (caller->futex_timed_out) { caller->futex_timed_out = false; return -110; }
         return 0;          /* woken; glibc re-checks its condition + own clock */
@@ -499,6 +577,9 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
             e->waiters = w->next_wait;
             w->next_wait = 0;
             w->futex_deadline_ns = 0;     /* woken by wake, not timeout */
+#ifdef CHROMIUM_BOOT
+            w->fx_wake_ns = perf_now_ns();
+#endif
             w->state = PROC_READY;
             sched_enqueue(w);
             woken++;
@@ -542,11 +623,24 @@ void futex_forget_proc(struct proc *p) {
     spin_unlock_irqrestore(&g_futex_lock, flags);
 }
 
+#ifdef CHROMIUM_BOOT
+/* Slice 56 tick-liveness counters, dumped by waitt_dump()'s [tick] line: how
+ * often the futex timeout sweep actually RAN (it has no driver of its own --
+ * only sched_yield's BSP slow path calls it, which nothing takes when every
+ * ready queue is empty), how many waiters it expired, how often poll_tick
+ * re-woke parked pollers, and whether any futex wait ever asked for a
+ * CLOCK_REALTIME absolute deadline (which we compare against monotonic). */
+uint64_t g_fx_sweeps, g_fx_sweep_woken, g_poll_tick_wakes, g_fx_rt_flag_count;
+#endif
+
 /* Wake any list-registered futex waiter whose deadline has passed. Called
  * periodically (rate-limited) from the scheduler tick so a TIMED FUTEX_WAIT that
  * is never FUTEX_WAKEd still returns -ETIMEDOUT. Cheap: <=256 entries, low rate. */
 void futex_expire_timeouts(void) {
     uint64_t now = perf_now_ns();
+#ifdef CHROMIUM_BOOT
+    g_fx_sweeps++;
+#endif
     uint64_t flags = spin_lock_irqsave(&g_futex_lock);
     for (int b = 0; b < FUTEX_HASH_SIZE; b++) {
         struct futex_entry *e = g_futex_hash[b];
@@ -560,6 +654,10 @@ void futex_expire_timeouts(void) {
                     w->next_wait = 0;
                     w->futex_deadline_ns = 0;
                     w->futex_timed_out = true;
+#ifdef CHROMIUM_BOOT
+                    w->fx_wake_ns = now;
+                    g_fx_sweep_woken++;
+#endif
                     w->state = PROC_READY;
                     sched_enqueue(w);
                 } else {
@@ -649,6 +747,9 @@ void poll_tick(void) {
     uint64_t now = perf_now_ns();
     if (now - last_ns < 1000000ull) return;   /* >= ~1 ms since last wake */
     last_ns = now;
+#ifdef CHROMIUM_BOOT
+    g_poll_tick_wakes++;
+#endif
     poll_wake_all();
 }
 
