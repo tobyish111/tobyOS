@@ -7314,6 +7314,34 @@ void _start(void) {
         }
     }
 
+    /* Concurrent-demand-fault lost-write guard (slice 50b): 4 threads first-
+     * touch the same madvise(DONTNEED)-dropped pages in lock-step rounds. The
+     * old map_4k silently REPLACED a present PTE, so the second installer of
+     * a doubly-demand-faulted page discarded the first thread's writes -- the
+     * 0x208c13a YouTube renderer corruption (NULL / stale-text pointers).
+     * Needs real parallelism to bite: run under WHPX for a true verdict; TCG
+     * passes trivially. PASS=3, FAIL=1 (lost write), ERROR=2. */
+    {
+        const char *path = "/bin/linux-demrace";
+        char *argv[] = { (char *)"linux-demrace", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-demrace",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] DEMRACETEST: spawning %s\n", path);
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[DEMRACETEST] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[DEMRACETEST] VERDICT: %s exit=%d (3=PASS no lost writes "
+                    "across concurrent demand faults; 1=FAIL lost write "
+                    "(map_4k replace race); 2=ERROR)\n",
+                    rc == 3 ? "PASS" : "FAIL", rc);
+        }
+    }
+
     /* ML-KEM computational-correctness test (slice 38): chrome's https is
      * blocked by BoringSSL's X25519MLKEM768 computing a WRONG result on
      * tobyOS (ledger slice 36 -- the FO decapsulation amplifies any single-bit

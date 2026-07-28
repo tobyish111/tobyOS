@@ -2293,3 +2293,21 @@ all:
    apps; unaudited, next candidate if 0x208c13a ever recurs).
 3. page_fault.c native Case-2 demand path writes `*pte` with NO lock — same
    TOCTOU class for native multithreaded apps; unaudited.
+
+### Addendum: permanent guard test DEMRACETEST (landed with 50b)
+`programs/linux-demrace` + a `[DEMRACETEST]` boot verdict (kernel.c, next to
+FUTEXTEST/MAPTEST, console-harness builds only: `CHROMIUM_BOOT` without
+`TKAPP_BOOT`). 4 threads + main in lock-step rounds: madvise(DONTNEED) a page,
+barrier, all threads first-touch the SAME page concurrently (each writes its
+own slot), barrier, then each verifies its own AND a peer's slot (cross-check
+matters: a same-CPU read-back can be satisfied by the thread's own stale TLB
+entry for a replaced frame, masking the loss). PASS=3 / FAIL=1 / ERR=2.
+Status: **PASS under WHPX** (1500 rounds, ~3s), FUTEXTEST+MAPTEST unregressed.
+HONEST CAVEAT: `[pfrace]` = 0 across all runs — the ~1us
+translate→alloc→zero→install window was never actually collided (WHPX barrier
+-exit skew is ms-scale), so the test's power to DETECT the original bug is
+unproven; it guards against gross regressions today. To strengthen: falsify
+against the pre-50b kernel, and/or add a debug-define delay inside
+mmap_try_fault's window to widen it deterministically. Reproduce:
+`make iso EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DCHROMIUM_BOOT"` + a WHPX
+boot; verdict prints ~10s in (logs/demrace_whpx.log).

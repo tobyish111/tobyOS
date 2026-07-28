@@ -1792,6 +1792,15 @@ programs/linux-eventfd/linux-eventfd.elf: programs/linux-eventfd/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# Concurrent-demand-fault lost-write guard (slice 50b): N threads first-touch
+# the same madvise-dropped pages in lock-step rounds; a map_4k PTE replace
+# (the 0x208c13a YouTube corruption) loses the winner's writes. Static Linux ELF.
+programs/linux-demrace/linux-demrace.elf: programs/linux-demrace/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 # MAP_SHARED cross-process coherence test: two processes independently mmap the
 # same (unlinked) file MAP_SHARED and must be coherent both directions -- the
 # ipcz NodeLinkMemory-fragment case behind the DOM blocker. Static Linux ELF.
@@ -2407,6 +2416,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-futex/linux-futex.elf \
                programs/linux-eventfd/linux-eventfd.elf \
                programs/linux-mapshare/linux-mapshare.elf \
+               programs/linux-demrace/linux-demrace.elf \
                programs/linux-mlkem/linux-mlkem.elf \
                programs/linux-xstub/linux-xstub.elf \
                programs/linux-procfs/linux-procfs.elf \
@@ -2542,6 +2552,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-futex/linux-futex.elf           $(INITRD_STAGE)/bin/linux-futex
 	cp programs/linux-eventfd/linux-eventfd.elf       $(INITRD_STAGE)/bin/linux-eventfd
 	cp programs/linux-mapshare/linux-mapshare.elf     $(INITRD_STAGE)/bin/linux-mapshare
+	cp programs/linux-demrace/linux-demrace.elf       $(INITRD_STAGE)/bin/linux-demrace
 	cp programs/linux-mlkem/linux-mlkem.elf           $(INITRD_STAGE)/bin/linux-mlkem
 	cp programs/linux-xstub/linux-xstub.elf           $(INITRD_STAGE)/bin/linux-xstub
 	cp programs/linux-tty/linux-tty.elf               $(INITRD_STAGE)/bin/linux-tty
@@ -2989,7 +3000,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-fbwin bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
-	    bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-mlkem \
+	    bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
 	    bin/linux-xstub \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \
