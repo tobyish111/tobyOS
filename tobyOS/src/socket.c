@@ -418,6 +418,20 @@ void sock_unix_peer_close(struct sock *self) {
     if (self->peer_ip) {
         struct sock *peer = sock_by_fd((int)self->peer_ip - 1);
         if (peer && peer->in_use) {
+#ifdef CHROMIUM_BOOT
+            /* Slice 56 wall R1: every AF_UNIX peer-EOF, with who caused it.
+             * A renderer that cleanly exits after its browser channel EOFs
+             * would show a [uxclose] against its channel right before
+             * [rexit]; a [uxclose] we cannot attribute to a legit close is
+             * the kernel dropping a channel. */
+            static int uxc = 0;
+            if (uxc < 120) { uxc++;
+                struct proc *cp = current_proc();
+                kprintf("[uxclose] pid=%d closed unix sock slot=%d -> peer slot=%d sees EOF\n",
+                        cp ? cp->pid : -1, sock_index(self),
+                        (int)self->peer_ip - 1);
+            }
+#endif
             peer->peer_ip = 0;                   /* our slot is going away */
             wq_wake_all(&peer->wq_recv);         /* wake its blocked recv -> EOF */
         }

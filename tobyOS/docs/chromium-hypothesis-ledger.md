@@ -2724,3 +2724,41 @@ Next measurement is already in place: `[epset]`.
   all stay healthy (runs 3-4); media stops at ~50KB (h2 window starves when
   the data pipe is not drained). [chan] is capped at 500 by ~17s -- raise or
   time-window it to see the late channel traffic.
+
+### RUNS 6-7 (R1 instruments: [rexit]+[lx-recent] on renderer exit_group,
+### [uxclose] peer-EOF trace, [chan] raised/time-windowed): R1 is now DOMINANT
+- R1 fired in runs 5, 6 AND 7 (three consecutive): the watch-page renderer
+  (the ~27-29k-syscall one) calls exit_group(0) at 22-28s, shortly after the
+  normal renderer-#1 SIGTERM swap. No successor renderer is ever execve'd; the
+  page is dead for the rest of the run (probes unanswered, frames 0, media
+  frozen, fail=1). Runs 3-4 (where it survived) now look like the lucky runs.
+- What the new instruments established:
+  - No kernel fault, no failed spawn, no proc-table exhaustion, browser
+    healthy throughout. [uxclose] shows only the exiting process's OWN
+    teardown closes -- no premature channel EOF against the renderer from
+    outside (within the 120-line cap).
+  - Renderer #1's last recorded channel traffic (run 6) is normal ipcz
+    control chatter (64B messages, seq increasing) right up to its clean
+    browser-instructed exit -- the SHAPE of an instructed shutdown, and
+    renderer #2's exit looks the same from the outside.
+  - In run 6 the browser wrote ~5.6KB+4KB to the DevTools pipe (frame-sized)
+    BETWEEN the two exit_group calls -- the browser was mid-delivery when
+    the renderer died; correlation with chromewin's kick_play cadence is
+    suggestive in runs 6/7 but does NOT hold in run 2. Unproven.
+- Instrument shortfalls that blocked the verdict (fix next):
+  - [lx-recent] (global, 384 deep) was FLOODED by tid 20's sched_yield spam
+    (a busy-yield thread, likely the in-process-GPU compositor wait) -- the
+    renderer's actual prelude was pushed out. Make the exit dump per-process
+    or filter sched_yield from the ring.
+  - [chan] at ~200 msgs/s exhausts ANY fixed budget before the ~25s window
+    (500 by 17s, 1500 by 21.5s, 18s-gated 1200 by 24.0s). The right design
+    is a RING of the last ~200 channel ops per process, dumped at [rexit] --
+    then the browser's final message TO the dying renderer (the suspected
+    shutdown instruction, or the absence of one) is always on record.
+- NEXT for R1: the channel-op ring + per-process exit dump; plus log
+  RenderProcessHost-side intent from the browser if possible (chrome
+  --vmodule=render_process_host_impl=1 may name the shutdown reason on
+  stderr, cheaper than kernel work: try
+  --enable-logging=stderr --v=0 --vmodule=render_process_host*=2).
+- Separate note: tid 20 busy-yields (the lx-recent flood) -- the old yield
+  convoy still has one resident; worth a look once R1/R2 are closed.

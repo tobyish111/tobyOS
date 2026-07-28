@@ -6763,7 +6763,11 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     if (curp) curp->cursys = -1;
     if (chan_fd >= 0) {
         static int chan_c = 0;
-        if (chan_c < 500) {
+        /* Slice 56 R1/R2: any cap counted from boot exhausts during startup
+         * churn (500 by ~17s, 1500 by ~21.5s) and misses the window that
+         * matters -- the watch-page renderer's exit at ~25s and the ~35s
+         * message-flow stop. Log only from 18s on. */
+        if (perf_now_ns() >= 18000000000ull && chan_c < 1200) {
             chan_c++;
             struct proc *me = current_proc();
             /* For a RECEIVE that returned data, decode the FRONT of the received
@@ -6850,6 +6854,25 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     /* ---- exits ---- */
     case LX_exit:
     case LX_exit_group:
+#ifdef CHROMIUM_BOOT
+        /* Slice 56 wall R1: the watch-page RENDERER sometimes exits CLEANLY
+         * seconds after page handoff, killing the page (runs 2 + 5, with and
+         * without audio). Only fatal faults dumped the syscall ring before;
+         * dump it here too so the exit's prelude (channel EOF? shutdown
+         * message?) is on the record. Once, exit_group only (not per-thread). */
+        if (n == LX_exit_group) {
+            struct proc *xp = current_proc();
+            if (xp && xp->is_renderer) {
+                /* Dump for the first THREE renderer exit_groups: a once-latch
+                 * burned the dump on a discarded SPARE renderer (run 6) while
+                 * the watch-page renderer's prelude went unrecorded. */
+                static int rexit_dumped = 0;
+                kprintf("[rexit] RENDERER pid=%d exit_group(%ld)\n",
+                        xp->pid, (long)a1);
+                if (rexit_dumped < 3) { rexit_dumped++; lx_dump_recent_syscalls(); }
+            }
+        }
+#endif
         sys_exit((int)a1);          /* noreturn */
         return 0;
 
