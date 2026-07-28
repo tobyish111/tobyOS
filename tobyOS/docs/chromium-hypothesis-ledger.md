@@ -2354,3 +2354,47 @@ Do NOT trust any YouTube crash-rate stats until this is resolved.
   across this arc suggests residual low-rate instability (memory corruption
   and/or fd races) that only heavy load exposes. The instruments to catch them
   are all armed ([pfrace], pointer-source-page autopsy, tlbq, DEMRACETEST).
+
+## SLICE 51 (2026-07-27, continuation) — the "YouTube throttle" is DEAD: the load-stall is tobyOS-side, isolated to the Mojo response-BODY handoff; audits closed: exit-teardown, MAP_FIXED, channel shear (cosmetic)
+
+### The stall is NOT YouTube throttling
+example.com STALLS IDENTICALLY (logs/run_vid.log, START_URL=example.com): DNS ok,
+TCP connect (104.20.23.154 -- example.com now fronts through Cloudflare!), TLS
+handshake + request + full response DELIVERED (pid 40 rdchk rv=540 verify=OK
+then clean EAGAIN), Mojo channel traffic flows for ~300ms more, then the
+RENDERER (pid 49) sends one final 248-byte channel message at ~22.8s and NOTHING
+ever answers -- every thread parks permanently (epoll_waits 25-68s+), zero
+frames painted. 8 consecutive network-page stalls (watch x4, embed x2, example
+x1 +1 prior) vs local-file pages painting 2/2. The ~17:00 onset correlates with
+an EXTERNAL serving change (example.com moved behind Cloudflare = bigger cert
+chains/metadata), i.e. bigger responses now walk into a tobyOS bug that small
+early-day responses missed. Fresh chrome profile changed nothing (and /data is
+RAM-backED each boot -- nothing guest-side persists; profile/disk theories dead).
+
+### Audits CLOSED this slice
+- **Process-exit teardown: SAFE.** The heir mechanism (proc.c ~1256) already
+  guarantees vmm_destroy_user_pml4 runs only when the LAST member is reaped,
+  and any other CPU's stale user-TLB entries die at its next CR3 write
+  (context switch). No shootdown needed there.
+- **Runtime MAP_FIXED: LOW-RISK.** All 56 fl=0x32 mmaps in a full run are
+  ld.so load-phase .bss maps (single-threaded in that process, old frame
+  leaked not freed). No multi-thread runtime MAP_FIXED observed.
+- **Mojo channel "shear": COSMETIC.** A 9936-byte SEQPACKET message read as
+  4096 then 5840 (= exact remainder) -- the transport PRESERVES the tail like
+  a stream, chrome reassembles; the [chan] instrument merely mis-parses the
+  second read's bytes as a header. NOT data loss. (unix_enqueue caps at 65535,
+  ring-full = clean EAGAIN backpressure.)
+
+### Where the next session starts: the response-BODY data pipe
+The control channel works; the BODY travels a Mojo DATA PIPE (shared-memory
+ring + signaling). The renderer's final unanswered 248-byte message is almost
+certainly its body-read request. Prime suspects, in order: (1) the data-pipe
+shm buffer (memfd) producer->consumer visibility or its signal (an eventfd/
+channel message) being dropped/never sent for LARGER payloads; (2) a size-edge
+in the shm cache/memfd path (bodies over some threshold); (3) chrome-side wait
+on a certificate-verification or cache write that tobyOS leaves hanging. The
+[efd]/[shm]/[chan]/[wait] instruments plus one new probe -- log memfd
+write/read offsets per data-pipe -- should corner it in one run. Also NOTE the
+4th crash signature this arc: EXCEPTION 12 #SS, rbp=0x10060c4108070c57 (byte
+soup = data over a saved stack frame), pid 8 browser worker, 1x, parked --
+random-victim corruption may still be alive at low rate.
