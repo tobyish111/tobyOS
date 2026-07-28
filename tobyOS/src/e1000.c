@@ -120,7 +120,18 @@
 
 /* ----- ring sizing ------------------------------------------------ */
 
-#define RX_DESC_COUNT    32
+/* Slice 55: 32 -> 256. RX is drained from poll/idle paths with the NIC's IRQs
+ * masked (see the header note), so a burst that arrives while nothing polls has
+ * only the ring to land in. MEASURED on a YouTube watch page: 302 "LATE drain"
+ * events and repeated batch=32 drains -- i.e. the ring was found COMPLETELY
+ * FULL, which means the NIC had already started DROPPING packets. Each drop
+ * costs a TCP retransmit, and with no fast-retransmit on these streams recovery
+ * runs on RTO backoff -- exactly the 20-100s of total network silence that made
+ * the watch page take ~100s to issue its media request and never buffer video.
+ * 256 descriptors x 16 bytes = 4096 = still ONE page for the ring (a perfect
+ * fit, no allocator change; RDLEN stays 128-byte aligned as the chip requires);
+ * the cost is 256 RX buffers instead of 32. */
+#define RX_DESC_COUNT    256
 #define TX_DESC_COUNT    32
 #define BUF_SIZE         2048
 
@@ -330,8 +341,26 @@ static bool e1000_tx_op(struct net_dev *dev, const void *frame, size_t len) {
     return true;
 }
 
+#ifdef CHROMIUM_BOOT
+/* Slice 55: RX-SERVICING AUTOPSY. A YouTube watch page delivers data in bursts
+ * separated by 20-100s of TOTAL network silence, during which the box is idle
+ * (1-4 ring-3 samples/interval), chrome's threads are blocked, no TCP RX buffer
+ * ever fills and nothing retransmits. Two possibilities remain and they need
+ * opposite fixes: either packets ARE arriving and we are not DRAINING them
+ * (RX is drained from poll/idle paths, IRQs are masked -- see the header note),
+ * or the peer genuinely sends nothing. This counts drains, packets, the biggest
+ * batch found in one drain (a large batch == we were LATE), and the gap since
+ * the previous packet. Reported every ~5s and on any batch >= 8. */
+static uint64_t g_dbg_drains, g_dbg_pkts, g_dbg_last_pkt_ms, g_dbg_report_ms;
+static uint32_t g_dbg_max_batch;
+extern uint64_t klog_ms(void);
+#endif
+
 static void e1000_rx_drain_op(struct net_dev *dev) {
     (void)dev;
+#ifdef CHROMIUM_BOOT
+    uint32_t batch = 0;
+#endif
     uint64_t irqf = spin_lock_irqsave(&g_e1000_rx_lock);
     /* Walk forward from tail+1 (which is the first descriptor the NIC
      * is allowed to write next). For each descriptor that has DD set,
@@ -373,12 +402,40 @@ static void e1000_rx_drain_op(struct net_dev *dev) {
             }
         
             eth_recv(g_rx_bufs[i], len);
+#ifdef CHROMIUM_BOOT
+            batch++;
+#endif
         }
         g_rx_ring[i].status = 0;
         g_rx_tail = i;
         mmio_write32(E1000_RDT, g_rx_tail);
     }
     spin_unlock_irqrestore(&g_e1000_rx_lock, irqf);
+
+#ifdef CHROMIUM_BOOT
+    {
+        uint64_t now = klog_ms();
+        g_dbg_drains++;
+        if (batch) {
+            uint64_t gap = g_dbg_last_pkt_ms ? (now - g_dbg_last_pkt_ms) : 0;
+            g_dbg_pkts += batch;
+            g_dbg_last_pkt_ms = now;
+            if (batch > g_dbg_max_batch) g_dbg_max_batch = batch;
+            /* A big batch means packets had piled up while nobody drained. */
+            if (batch >= 8)
+                kprintf("[rxdbg] LATE drain: batch=%u pkts (gap=%lums since "
+                        "last packet)\n", (unsigned)batch, (unsigned long)gap);
+        }
+        if (now - g_dbg_report_ms >= 5000) {
+            g_dbg_report_ms = now;
+            kprintf("[rxdbg] %lums drains=%lu pkts=%lu maxbatch=%u "
+                    "quiet=%lums\n", (unsigned long)now,
+                    (unsigned long)g_dbg_drains, (unsigned long)g_dbg_pkts,
+                    (unsigned)g_dbg_max_batch,
+                    (unsigned long)(g_dbg_last_pkt_ms ? now - g_dbg_last_pkt_ms : 0));
+        }
+    }
+#endif
 }
 
 /* MSI handler. Reading ICR clears every cause bit it returns, so a

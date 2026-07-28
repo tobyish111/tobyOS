@@ -2518,3 +2518,74 @@ service actually opens after the player attaches MSE (googlevideo connections
 DO appear), and attack the starvation at `sched_yield`'s FAST PATH or
 `enq_target_for`'s BSP piling (NOT the io_boost credit -- that fix was tried and
 reverted in slice 53; spinners never reach it).
+
+## SLICE 55 (2026-07-28) — e1000 RX ring 32 -> 256 (measured packet DROPS eliminated); the YouTube stall is re-localised to a BIDIRECTIONAL chrome-side silence, not the network stack
+
+Chased "why do YouTube's media segments never arrive" with chrome's own Network
+domain plus new kernel RX instrumentation. Several theories died; one real bug
+was found and fixed.
+
+### chrome DOES request the segment -- everything is just ~50x too slow
+`Network.enable` in chromewin now logs requestWillBeSent / responseReceived /
+loadingFailed (media URLs individually, the rest counted). On a watch page:
+```
+[net] MEDIA REQ #2: https://rr5---sn-vgqsknde.googlevideo.com/videoplayback?expire=...
+probe #10 at 100s: net{req=21 media=1 resp=1 fin=15 fail=0}
+```
+So the videoplayback request IS issued, a response IS received, and there are
+**ZERO failures**. The problem is purely pace: ~21 requests in 120s, and the
+media request is not even issued until ~100s. Nothing is broken; everything
+crawls.
+
+### REAL BUG FOUND + FIXED: the RX ring was overrunning (packets dropped)
+New `[rxdbg]` instrumentation in src/e1000.c counts drains, packets, and the
+biggest batch found in one drain (a big batch == we were LATE). Measured with
+the old 32-descriptor ring: **302 "LATE drain" events with repeated batch=32**
+-- i.e. the ring was found COMPLETELY FULL, which means the NIC had already
+been dropping frames. RX is drained from poll/idle paths with the NIC's IRQs
+masked (header note in e1000.c), so any burst arriving while nothing polls has
+only the ring to land in.
+FIX: `RX_DESC_COUNT` 32 -> 256. 256 x 16B = 4096 = still exactly ONE page for
+the ring (no allocator change, RDLEN stays 128B-aligned as the chip requires);
+cost is 256 RX buffers instead of 32. VERIFIED: max batch is now 51 (was pinned
+at 32 = full ring), so the ring no longer overruns and those drops are gone.
+defboot clean. This is a general fix -- any burst-heavy workload was losing
+packets.
+
+### But that was NOT the stall: the silence is BIDIRECTIONAL and chrome-side
+With the bigger ring the stall persists, and the instrumentation now says
+exactly what it is NOT:
+- `[rxdbg]` shows `pkts` FROZEN at 151 for **53 seconds** while `drains` climbs
+  5,801 -> 655,474 = **~14,000 drains/second**. We are polling the NIC
+  furiously and NOTHING arrives. So RX servicing is not the problem.
+- **We also transmit NOTHING in that window** (`[tls] TX` count = 0 over
+  20-75s). The silence is BIDIRECTIONAL: chrome simply isn't writing.
+- During it: 47 threads BLOCKED (mostly futex), exactly ONE RUNNING (pid 39, a
+  network-service thread making only 119 syscalls in 60s), **nothing READY**,
+  and only 1-4 ring-3 profiler samples per interval -- the box is IDLE.
+So this is chrome waiting internally, not a tobyOS network fault.
+
+### Theories KILLED this slice (do not re-chase)
+- **Zero-window / RX-buffer-full stall**: the `[tcp] RX buffer FULL` diagnostic
+  did NOT fire during the stall (it does appear LATER in a run on tcp[8] with
+  `free=0`, which is a separate, real flow-control issue worth its own look).
+- **Retransmit storm / RTO backoff**: zero retransmits, zero out-of-order, zero
+  dup-acks during the stall; `[tcp] WIRE ... retx=0`.
+- **Userspace spin convoy**: profiler shows the CPUs are NOT in ring 3 during
+  the gap (1-4 samples/interval); the box is idle, not spinning.
+- **"~50 ready threads serialized on the BSP"**: FALSIFIED by the heartbeat --
+  the ready queues are EMPTY and only one thread is runnable. A fix built on
+  that model (a rate-limited steal probe in sched_yield's fast path, since
+  `enq_target_for()` does return 0 unconditionally) changed nothing measurable
+  and was REVERTED. The fast-path/enqueue-targeting observation is still true
+  and may matter under a different load -- but it is not this bug.
+
+### Next
+The question is now narrow: what is chrome WAITING for during a ~55s window in
+which it neither sends nor receives, with every thread blocked and the machine
+idle? Prime candidates: a timer/timeout whose deadline we compute wrong (the
+timed-futex/clock path), or a wakeup that is delivered late (poll_tick is
+1ms-rate-limited and pid 0 is its only driver when all threads are blocked -- if
+pid 0's lane is delayed, every parked poller waits). Instrument the deadline and
+wake path for the specific threads blocked at that moment: dump, for the longest
+futex/epoll waiter, its requested timeout vs actual elapsed time.

@@ -71,7 +71,7 @@ static long sys_clock_ms(void) { return sc0(ABI_SYS_CLOCK_MS); }
  * fine and YouTube's problem is the segment fetch; if it stalls at a named
  * step, that step IS the bug -- with a 10-second deterministic repro.
  * Comment out to go back to normal browsing. */
-#define MSE_TEST_JS "/opt/chrome/mse_test.js"
+/* #define MSE_TEST_JS "/opt/chrome/mse_test.js" */  /* slice 54: MSE PROVEN, off */
 /* #define IPC_SIZE_LADDER 1 */
 /* Slice 50: with the TLB-shootdown-ordering fix (munmap/madvise free path) the
  * embed player no longer crashes at rip 0x208c13a. Now retest the handoff's REAL
@@ -413,11 +413,60 @@ static void request_screenshot(void) {
 
 /* Dispatch one event message currently in g_msg. Only screencastFrame needs
  * action; command responses and other events are ignored (fire-and-forget). */
+/* Slice 55: NETWORK-DOMAIN INSTRUMENT. Decode (49), display (52) and MSE (54)
+ * are all proven working, so YouTube's remaining failure is that its media
+ * SEGMENTS never arrive. Rather than infer that from the kernel's TLS byte
+ * counts, have chrome report its OWN requests: Network.enable gives
+ * requestWillBeSent / responseReceived / loadingFinished / loadingFailed, which
+ * answers the three questions that matter -- are segment requests even ISSUED,
+ * do they FAIL (with chrome's own error text), or do they hang forever?
+ * Media URLs are the chatty part of a watch page, so only those are logged
+ * individually; everything else is counted. */
+static int g_req_total, g_req_media, g_resp_media, g_fail_total, g_fin_media;
+
+static void note_network_event(void) {
+    static char url[160], err[96];
+
+    if (strstr(g_msg, "\"Network.requestWillBeSent\"")) {
+        g_req_total++;
+        if (json_str(g_msg, "url", url, sizeof url) > 0 &&
+            (strstr(url, "videoplayback") || strstr(url, "googlevideo"))) {
+            g_req_media++;
+            if (g_req_media <= 12)
+                printf("[net] MEDIA REQ #%d: %.110s\n", g_req_media, url);
+        }
+        return;
+    }
+    if (strstr(g_msg, "\"Network.loadingFailed\"")) {
+        g_fail_total++;
+        err[0] = 0;
+        json_str(g_msg, "errorText", err, sizeof err);
+        if (g_fail_total <= 12)
+            printf("[net] FAILED #%d: %s\n", g_fail_total, err[0] ? err : "(no text)");
+        return;
+    }
+    if (strstr(g_msg, "\"Network.responseReceived\"")) {
+        if (json_str(g_msg, "url", url, sizeof url) > 0 &&
+            (strstr(url, "videoplayback") || strstr(url, "googlevideo"))) {
+            g_resp_media++;
+            if (g_resp_media <= 8)
+                printf("[net] MEDIA RESP #%d status=%d\n",
+                       g_resp_media, json_int(g_msg, "status"));
+        }
+        return;
+    }
+    if (strstr(g_msg, "\"Network.loadingFinished\"")) {
+        g_fin_media++;      /* not URL-tagged; a count is enough to see progress */
+        return;
+    }
+}
+
 static void cdp_dispatch(void) {
     if (strstr(g_msg, "\"method\":\"Page.screencastFrame\"")) {
         handle_screencast_frame();
         return;
     }
+    if (strstr(g_msg, "\"method\":\"Network.")) { note_network_event(); return; }
     if (g_shot_id && json_has_id(g_msg, g_shot_id)) {   /* polled screenshot reply */
         g_shot_id = 0;
         install_b64_frame();
@@ -614,6 +663,12 @@ static int cdp_bootstrap(void) {
         logln("no sessionId in attachToTarget reply"); return -1;
     }
     printf("[chromewin] sessionId=%s\n", g_session);
+
+    /* Slice 55: let chrome report its own request lifecycle (see
+     * note_network_event). maxPostDataSize 0 keeps the events small. */
+    id = cdp_send("Network.enable",
+                  "{\"maxTotalBufferSize\":1000000,\"maxResourceBufferSize\":100000}", 1);
+    if (!cdp_wait(id)) return -1;
 
     id = cdp_send("Page.enable", "{}", 1);
     if (!cdp_wait(id)) return -1;
@@ -837,8 +892,11 @@ int main(void) {
             static int probes;
             if (probes < 12 && sys_clock_ms() - t0 > (long)(probes + 1) * 10000) {
                 probes++;
-                printf("[chromewin] probe #%d at %lds: frames=%d\n",
-                       probes, (long)((sys_clock_ms() - t0) / 1000), g_frames);
+                printf("[chromewin] probe #%d at %lds: frames=%d "
+                       "net{req=%d media=%d resp=%d fin=%d fail=%d}\n",
+                       probes, (long)((sys_clock_ms() - t0) / 1000), g_frames,
+                       g_req_total, g_req_media, g_resp_media,
+                       g_fin_media, g_fail_total);
                 probe_page();
             }
         }
