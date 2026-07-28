@@ -2939,3 +2939,42 @@ Same kernel as run 15, only chromewin rebuilt. Result:
      is parsed whose head is not '{'): proves or kills the fragment theory
      for the run-15 log, cheaply and independently of chrome.
   3. Only then chase kernel-side corruption again.
+
+## Slice 58c (2026-07-28): 3x SAME-BUILD TABULATION -- playback is RELIABLE,
+## and the URL corruption is REAL (fragment theory killed by drops=0)
+
+Method: build once, run three times, keep each log, tabulate (prime
+directive 2 applied properly instead of reasoning from single runs).
+
+| run | maxbuf | best readyState | 403s | bogus URLs | crashes | cdp drops |
+|-----|--------|-----------------|------|------------|---------|-----------|
+| 1   | b20.0  | r4              | 5    | 6          | 0       | n=0 mid=0 |
+| 2   | b24.4  | r4              | 0    | 0          | 0       | n=0 mid=0 |
+| 3   | b20.0  | r4              | 0    | 0          | 0       | n=0 mid=0 |
+
+Conclusions, each following directly from the table:
+- **YouTube playback is RELIABLE, not flaky: 3/3 runs reached
+  HAVE_ENOUGH_DATA with 20-24s buffered and zero crashes.** Runs 15/16 were
+  the outliers, not the norm. `logs/x3_run3_c.png` is the visual proof that
+  was missing: a DECODED VIDEO FRAME (the Big Buck Bunny title card) painted
+  in the TobyTK window inside the real watch page (title, channel, 1.24M
+  subscribers, like/share/save, Sign in).
+- **The fragment theory is DEAD.** cdp_fill_nb dropped NOTHING in any run
+  (n=0, mid=0), so chromewin's reassembly cannot explain any logged URL.
+- **The URL corruption is REAL and reproducible at ~1 run in 3.** Run 1
+  produced 6 bogus-expire URLs with the FIXED detector (which now only flags
+  URLs that actually carry expire=) and YouTube 403'd 5 of them -- with zero
+  CDP drops and zero crashes. So slice 58b's downgrade was too pessimistic:
+  chrome really does emit URLs carrying impossible expire values. This
+  RE-ESTABLISHES the finding on much better evidence than run 15 had.
+- Note run 1 still reached b20.0 DESPITE the 403s: the corruption degrades
+  the segment loop, it does not stop playback outright.
+
+### Next (for the corruption, now the last known defect)
+It is intermittent, silent, in-chrome, and survives every fix so far. It is
+the same family as slice 56d's one-byte shear -- a string mutating in a copy
+path. Cheapest discriminator left: log the SAME requestId's URL twice from
+different chrome-side events (requestWillBeSent vs responseReceived carry
+the URL independently). Identical-but-bogus = the URL was already wrong when
+chrome built it (renderer memory); differing = it mutated between the two,
+which localises the copy path. Both are one chromewin edit and one run.

@@ -98,6 +98,8 @@ static long g_quit;
  * JSON. Static buffers; the pipe delivers in 4 KB chunks. */
 #define MSG_MAX (1024 * 1024)
 static char    g_rxbuf[MSG_MAX];     /* accumulates raw pipe bytes */
+/* Slice 58c: CDP receive-drop accounting (see cdp_fill_nb). */
+static long    g_drop_events, g_drop_midmsg;
 static size_t  g_rxlen;
 static char    g_msg[MSG_MAX];       /* one complete NUL-delimited message */
 static uint8_t g_png[MSG_MAX];       /* decoded PNG bytes (also raw local-file buf) */
@@ -278,7 +280,21 @@ static int cdp_fill_nb(void) {
         for (size_t i = g_rxlen; i > 0; i--) {
             if (g_rxbuf[i - 1] == 0) { cut = i; break; }   /* i-1 = last NUL */
         }
-        if (cut == 0) cut = g_rxlen;          /* one giant partial: drop it all */
+        /* Slice 58c: count drops and flag the dangerous variant. cut == 0
+         * means NO message boundary was buffered, so we discard the head of
+         * a message still in flight -- its TAIL then arrives, hits the next
+         * NUL, and parses as if it were a WHOLE message. That is the one way
+         * this program can fabricate a plausible-but-wrong field (e.g. the
+         * run-15 `expire=8922279409`) with no kernel bug involved. */
+        g_drop_events++;
+        if (cut == 0) {
+            g_drop_midmsg++;
+            cut = g_rxlen;                    /* one giant partial: drop it all */
+        }
+        printf("[cdp] rx drop #%ld (%s) rxlen=%u\n", g_drop_events,
+               g_drop_midmsg && cut == g_rxlen ? "MID-MESSAGE, next parse is a"
+                                                 " FRAGMENT" : "at boundary",
+               (unsigned)g_rxlen);
         memmove(g_rxbuf, g_rxbuf + cut, g_rxlen - cut);
         g_rxlen -= cut;
     }
@@ -432,8 +448,33 @@ static void note_network_event(void) {
         if (json_str(g_msg, "url", url, sizeof url) > 0 &&
             (strstr(url, "videoplayback") || strstr(url, "googlevideo"))) {
             g_req_media++;
-            if (g_req_media <= 12)
-                printf("[net] MEDIA REQ #%d: %.110s\n", g_req_media, url);
+            /* Slice 58b: is the URL WE LOG actually what chrome sent, or an
+             * artifact of our own CDP reassembly? A media URL's expire= is
+             * unix seconds ~now (1.7e9); run 15 logged 8922279409 (year 2252)
+             * on the requests YouTube 403'd. Two candidate causes: chrome's
+             * URL really is corrupt (kernel memory corruption in chrome's
+             * space), or cdp_fill_nb's overflow drop left a FRAGMENT that
+             * parsed as a whole message (our bug, log-only). Print the raw
+             * message length + whether it looks like a well-formed CDP frame
+             * ({"method":...} with a matching tail) so a fragment is
+             * self-evident, and tag the requestId so the 403 response can be
+             * paired to the exact URL that earned it. */
+            char rid[48]; rid[0] = 0;
+            json_str(g_msg, "requestId", rid, sizeof rid);
+            const char *ex = strstr(url, "expire=");
+            long exv = ex ? atol(ex + 7) : 0;
+            /* Slice 58c: only URLs that HAVE an expire= can have a bogus one.
+             * The previous form flagged every expire-less googlevideo URL
+             * (generate_204 etc.) as corrupt -- a false positive that made
+             * run 16 look like it had corruption when it did not. */
+            int bogus = ex && (exv < 1700000000L || exv > 2000000000L);
+            size_t mlen = strlen(g_msg);
+            if (g_req_media <= 12 || bogus)
+                printf("[net] MEDIA REQ #%d rid=%s exp=%ld%s mlen=%u "
+                       "head=%.24s: %.90s\n",
+                       g_req_media, rid[0] ? rid : "?", exv,
+                       bogus ? " BOGUS-EXPIRE" : "", (unsigned)mlen,
+                       g_msg, url);
         }
         return;
     }
@@ -449,9 +490,16 @@ static void note_network_event(void) {
         if (json_str(g_msg, "url", url, sizeof url) > 0 &&
             (strstr(url, "videoplayback") || strstr(url, "googlevideo"))) {
             g_resp_media++;
-            if (g_resp_media <= 8)
-                printf("[net] MEDIA RESP #%d status=%d\n",
-                       g_resp_media, json_int(g_msg, "status"));
+            /* Slice 58b: tag rid + the response's OWN expire so a 403 can be
+             * paired to the exact URL (and its expire) that earned it. */
+            char rid[48]; rid[0] = 0;
+            json_str(g_msg, "requestId", rid, sizeof rid);
+            const char *ex = strstr(url, "expire=");
+            long exv = ex ? atol(ex + 7) : 0;
+            int st = json_int(g_msg, "status");
+            if (g_resp_media <= 12 || st != 200)
+                printf("[net] MEDIA RESP #%d rid=%s status=%d exp=%ld\n",
+                       g_resp_media, rid[0] ? rid : "?", st, exv);
         }
         return;
     }
@@ -912,10 +960,12 @@ int main(void) {
             if (probes < 36 && sys_clock_ms() - t0 > (long)(probes + 1) * 10000) {
                 probes++;
                 printf("[chromewin] probe #%d at %lds: frames=%d "
-                       "net{req=%d media=%d resp=%d fin=%d fail=%d}\n",
+                       "net{req=%d media=%d resp=%d fin=%d fail=%d} "
+                       "cdpdrop{n=%ld mid=%ld}\n",
                        probes, (long)((sys_clock_ms() - t0) / 1000), g_frames,
                        g_req_total, g_req_media, g_resp_media,
-                       g_fin_media, g_fail_total);
+                       g_fin_media, g_fail_total,
+                       g_drop_events, g_drop_midmsg);
                 probe_page();
             }
         }
