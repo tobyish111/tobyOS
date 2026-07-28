@@ -2463,3 +2463,58 @@ is now isolated to: **the MSE segment fetch/append path never delivers bytes.**
 3. Whether the segment requests are even ISSUED is still unknown: instrument
    which URLs/hosts the network service opens after the player attaches MSE
    (googlevideo.com connections did appear: 173.194.x, 74.125.x).
+
+## SLICE 54 (2026-07-28) — ***MSE VIDEO PLAYBACK PROVEN ON tobyOS.*** MediaSource -> appendBuffer -> VP9 decode -> visible moving frames. The YouTube wall is therefore SEGMENT DELIVERY, not media
+
+Slice 53 pinned YouTube at MSE (player renders, MediaSource attached, ZERO bytes
+buffered) but could not say whether MSE itself works. Settled it with a
+self-contained test.
+
+### The test (permanent, `logs/gen_mse_test.py`)
+Generates a ONE-LINE JS file (single quotes only, no backslashes -> embeds
+straight into CDP JSON) containing a tiny VP9 clip as base64. chromewin
+navigates to `about:blank` and injects it via a big `Runtime.evaluate`
+(`MSE_TEST_JS` in programs/chromewin/main.c, g_bigcmd path). The script does the
+whole MSE dance with NO NETWORK AT ALL: atob -> Uint8Array -> `new MediaSource`
+-> `addSourceBuffer('video/webm;codecs=vp9')` -> `appendBuffer` -> `play()`,
+publishing each step to `window.__mse`, which the slice-53 probe reports.
+
+### RESULT: MSE WORKS, VIDEO PLAYS
+```
+tobyprobe rs=complete vid=r4 n2 t1.3 d2 b2.0 e- p0 src=blob: mse=updateend buf=2.00
+```
+`readyState=4` (HAVE_ENOUGH_DATA), **2.0s buffered**, no error, not paused, and
+`currentTime` ADVANCING across probes (1.3 -> 1.2 ...). **`logs/vid_c.png` shows
+the decoded VP9 frame painted at 640x480 with its burned-in timecode
+(00:00:01.200).** So on tobyOS: MediaSource + SourceBuffer + appendBuffer + VP9
+decode + composite + paint + playback clock ALL work end-to-end.
+Verified across clip shapes: 32x32/2f (1227B), 32x32/10f (1803B),
+96x64/2f (3788B), 96x64/10f (8333B) -- all buffer and play.
+
+### A FALSE LEAD I CAUGHT (record it so nobody re-chases it)
+A first run of the 96x64/10f test (12273-byte CDP message) left chrome ALIVE and
+still READING our commands but never writing again -- which looked exactly like
+"large IPC messages break". Two experiments killed that theory:
+1. **IPC size ladder** (`IPC_SIZE_LADDER` in chromewin): Runtime.evaluate padded
+   to 1K/2K/4K/6K/8K/10K/12K/16K/24K/32K/48K -- **every rung replied `ok`**,
+   including 12445 bytes, the same size as the "killer".
+2. **Control injection**: the identical 8333-byte payload in an identical-size
+   message, doing atob+checksum but NOT touching MediaSource, ran fine
+   (`ctrl-done len=8333 sum=65122`, 242 chrome replies after).
+3. Re-running the ORIGINAL failing case then **worked** (buf=2.00, playing).
+So it was a ONE-OFF FLAKE of the documented WHPX non-determinism, not a size
+threshold. LESSON (third time this arc): never conclude from a single run here.
+
+### Where YouTube actually stands now
+Everything media-side is exonerated: decode (slice 49, progressive), display
+(slice 52), MSE (this slice). The watch page renders its real player, and the
+remaining failure is that its media SEGMENTS never arrive: networkState=LOADING,
+no error, zero buffered, `document.readyState` stuck at `loading`, total RX only
+~309KB for the whole run. The live lead is delivery/scheduling, not media:
+network arrives in BURSTS with 20-80s gaps while ~4 chrome threads dominate the
+CPU in a `sched_yield` spin (12218 vs 275 futex), even though per-connection
+throughput is fine (41KB in 0.2s). Next: instrument which URLs the network
+service actually opens after the player attaches MSE (googlevideo connections
+DO appear), and attack the starvation at `sched_yield`'s FAST PATH or
+`enq_target_for`'s BSP piling (NOT the io_boost credit -- that fix was tried and
+reverted in slice 53; spinners never reach it).

@@ -59,11 +59,29 @@ static long sys_clock_ms(void) { return sc0(ABI_SYS_CLOCK_MS); }
  * unambiguous data:text/html;base64,... URL (no MIME sniffing, no file:// origin
  * quirks). */
 /* #define LOCAL_HTML_FILE "/opt/chrome/vidtest.html" */  /* data:text/html path */
+
+/* Slice 54: LOCAL MSE PROBE. Slice 53 pinned the YouTube wall at MSE (player
+ * renders, MediaSource attached, ZERO bytes ever buffered) but could not say
+ * WHETHER MSE itself works on tobyOS or whether only YouTube's segment FETCH
+ * fails. This injects a self-contained MSE test into about:blank: a tiny VP9
+ * clip is embedded as base64 IN THE SCRIPT (no network at all), decoded to a
+ * Uint8Array and appendBuffer'd into a SourceBuffer. window.__mse carries the
+ * state machine (start / has-MediaSource / sourceopen / sb-added / appending /
+ * updateend buf=N) and the probe reports it. If this buffers and plays, MSE is
+ * fine and YouTube's problem is the segment fetch; if it stalls at a named
+ * step, that step IS the bug -- with a 10-second deterministic repro.
+ * Comment out to go back to normal browsing. */
+#define MSE_TEST_JS "/opt/chrome/mse_test.js"
+/* #define IPC_SIZE_LADDER 1 */
 /* Slice 50: with the TLB-shootdown-ordering fix (munmap/madvise free path) the
  * embed player no longer crashes at rip 0x208c13a. Now retest the handoff's REAL
  * target -- the full WATCH page -- which hit that same corruption crash (~277s).
  * (Proven paths to flip back to: youtube.com/embed/<id> ; file:///opt/chrome/vid.webm ; example.com) */
+#ifdef MSE_TEST_JS
+#define START_URL "about:blank"        /* the MSE test needs no page at all */
+#else
 #define START_URL "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+#endif
 
 static struct tk_window win;
 static toby_image_t *g_frame;        /* latest decoded screenshot */
@@ -355,6 +373,38 @@ static void handle_screencast_frame(void) {
  * in the gaps, with at most one request outstanding. */
 static int g_shot_id;                              /* outstanding request, 0=none */
 
+/* Slice 54: IPC SIZE LADDER. A ~12KB Runtime.evaluate silently KILLS the CDP
+ * session (chrome keeps reading our commands but never writes another byte),
+ * while the same command at ~2.8KB works perfectly -- and an ~83KB data: URL
+ * previously crashed the NetworkService with VALIDATION_ERROR_UNEXPECTED_
+ * STRUCT_HEADER. That smells like one bug in large-message delivery, and it is
+ * the prime suspect for YouTube's media segments (hundreds of KB each) never
+ * arriving. This walks a ladder of message sizes and logs which ones chrome
+ * answers, giving the exact threshold in ONE run instead of a rebuild per
+ * guess. Each rung is a trivial script padded to size, so only the MESSAGE
+ * size varies. */
+#ifdef IPC_SIZE_LADDER
+static const int g_ladder[] = { 1024, 2048, 4096, 6144, 8192, 10240,
+                                12288, 16384, 24576, 32768, 49152, 65536, 0 };
+static int g_lad_i;
+
+static void send_ladder_probe(void) {
+    int n = g_ladder[g_lad_i];
+    if (!n) return;
+    int id = g_next_id++;
+    int off = snprintf(g_bigcmd, sizeof g_bigcmd,
+                       "{\"id\":%d,\"sessionId\":\"%s\",\"method\":\"Runtime.evaluate\","
+                       "\"params\":{\"expression\":\"var s='", id, g_session);
+    for (int i = 0; i < n; i++) g_bigcmd[off + i] = 'A';
+    off += n;
+    off += snprintf(g_bigcmd + off, sizeof g_bigcmd - (size_t)off,
+                    "';'ladder%d ok'\",\"returnByValue\":true}}", n);
+    printf("[chromewin] ladder SEND pad=%d id=%d msgbytes=%d\n", n, id, off);
+    cdp_write(g_bigcmd);
+    g_lad_i++;
+}
+#endif
+
 static void request_screenshot(void) {
     if (g_shot_id) return;
     g_shot_id = cdp_send("Page.captureScreenshot",
@@ -376,7 +426,8 @@ static void cdp_dispatch(void) {
     /* Slice 52: surface the page-state probe reply (and any CDP error) so the
      * serial log shows what chrome thinks the page is. Truncated: a full
      * Runtime.evaluate reply is small, but an error can carry a big stack. */
-    if (strstr(g_msg, "tobyprobe") || strstr(g_msg, "\"error\"")) {
+    if (strstr(g_msg, "tobyprobe") || strstr(g_msg, "ladder") ||
+        strstr(g_msg, "\"error\"")) {
         char line[300];
         size_t n = strlen(g_msg);
         if (n > sizeof line - 1) n = sizeof line - 1;
@@ -521,7 +572,8 @@ static void probe_page(void) {
              "+' b'+(v.buffered.length?v.buffered.end(0).toFixed(1):'-')"
              "+' e'+(v.error?v.error.code:'-')"
              "+' p'+(v.paused?1:0)"
-             "+' src'+(v.src?v.src.slice(0,12):'-')):'novideo');})()\","
+             "+' src'+(v.src?v.src.slice(0,12):'-')):'novideo')"
+             "+' mse='+(window.__mse||'-');})()\","
              "\"returnByValue\":true}", 1);
 }
 
@@ -579,6 +631,38 @@ static int cdp_bootstrap(void) {
     if (!cdp_wait(id)) return -1;
 
     kick_play();          /* start any <video> (a MediaDocument won't autoplay) */
+
+#ifdef MSE_TEST_JS
+    /* Inject the local MSE test (see MSE_TEST_JS above). The script is one
+     * line of single-quoted JS with an embedded base64 clip, so it drops
+     * straight into the CDP JSON; it is ~12KB, far past cdp_send's 2KB buffer,
+     * hence the g_bigcmd path. */
+    {
+        int fd = open(MSE_TEST_JS, O_RDONLY, 0);
+        if (fd < 0) {
+            logln("MSE test: open failed");
+        } else {
+            long total = 0, r;
+            while (total < (long)BIGURL_MAX - 1 &&
+                   (r = read(fd, g_dataurl + total, BIGURL_MAX - 1 - total)) > 0)
+                total += r;
+            close(fd);
+            g_dataurl[total > 0 ? total : 0] = 0;
+            if (total <= 0) {
+                logln("MSE test: empty script");
+            } else {
+                int mid = g_next_id++;
+                snprintf(g_bigcmd, sizeof g_bigcmd,
+                         "{\"id\":%d,\"sessionId\":\"%s\",\"method\":\"Runtime.evaluate\","
+                         "\"params\":{\"expression\":\"%s\",\"returnByValue\":true,"
+                         "\"userGesture\":true}}",
+                         mid, g_session, g_dataurl);
+                cdp_write(g_bigcmd);
+                printf("[chromewin] MSE test injected (%ld bytes of JS)\n", total);
+            }
+        }
+    }
+#endif
 
 #ifdef LOCAL_HTML_FILE
     snprintf(g_status, sizeof g_status, "%s", LOCAL_HTML_FILE);
@@ -736,6 +820,16 @@ int main(void) {
          * finished painting before the screencast started) -> pull one. */
         if (sys_clock_ms() - g_last_frame_ms > 2000)
             request_screenshot();
+
+#ifdef IPC_SIZE_LADDER
+        /* One rung every 3s, starting 5s in (after the MSE test settles). */
+        {
+            static long next_rung;
+            long now = sys_clock_ms();
+            if (next_rung == 0) next_rung = t0 + 5000;
+            if (now >= next_rung) { send_ladder_probe(); next_rung = now + 3000; }
+        }
+#endif
 
         /* Slice 52: probe the page state every 10s (12 times) and report the
          * frame count alongside, so a stalled run says WHY it is stalled. */
