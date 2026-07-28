@@ -9,11 +9,14 @@
 > datagram arrived. Fixed along with: yield-if-ready in the blocking-wait
 > loops, any-CPU sweep/poll_tick drivers, FUTEX_CLOCK_REALTIME rebasing,
 > proactive TCP window updates, non-blocking socket close(2), and audio-off
-> chrome flags (no ALSA device; audio bring-up was killing the renderer).
-> The watch page now renders its real player with a healthy kernel. The
-> remaining wall is one layer up: browser->renderer Mojo delivery stops ~35s
-> in ([epset] instrument in place). See the slice-56 ledger entry -- read it
-> BEFORE this document; §3/§4/§6 below are the pre-slice-56 state.
+> chrome flags (no ALSA device; NOTE: initially blamed for the renderer
+> death, RETRACTED after run 5 -- see the ledger). The watch page now renders
+> its real player with a healthy kernel (when the flaky renderer self-exit,
+> wall R1, doesn't fire). Remaining walls: R1 = watch-page renderer sometimes
+> cleanly exit(0)s seconds after page handoff; R2 = browser->renderer
+> CDP/Mojo flow stops ~35s in ([epset] proves waiters have nothing pending).
+> See the slice-56 ledger entry -- read it BEFORE this document; §3/§4/§6
+> below are the pre-slice-56 state.
 
 You are picking up a **working, interactive** Chromium bring-up on tobyOS at ONE
 remaining wall: **YouTube is ~50x too slow**. Real unmodified

@@ -2696,3 +2696,31 @@ kernel wake machinery verified healthy end-to-end. Remaining wall, precisely
 bounded: browser->renderer Mojo message delivery stops ~35s in (evaluates
 unanswered, media data pipe undrained, ~50KB of media fetched then nothing).
 Next measurement is already in place: `[epset]`.
+
+### RUN 5 (same build as run 4 + [epset]): RETRACTION + sharpened wall
+- **RETRACT the "audio killed the renderer" conclusion.** With audio fully
+  disabled, the watch-page renderer (pid 47, renderer-client-id=5 -- the same
+  role as run 2's pid 52) again called exit(0), this time at 22.3s, 6s after
+  execve. No crash, no respawn, page dead, frames=0 all run, fail=1. The run
+  2 -> 3 A/B was one run per arm -- exactly the trap prime directive 2 warns
+  about. Correct statement: the second (watch-page) renderer's clean
+  self-exit shortly after taking over the page is FLAKY -- observed with
+  audio (run 2, 43s) and without (run 5, 22.3s); absent in runs 3-4. The
+  audio-off flags stay (tobyOS has no ALSA device; the ALSA failure spam and
+  SyncReader churn are real), but they are NOT a renderer-death fix.
+- `[epset]` (its purpose this run) answered its question for the surviving
+  waiters: every >10s epoll waiter's watched fds show r0/r4-writable-only for
+  hundreds of seconds -- NOTHING pending that a wake was missed for. "Sender
+  never sent", not a kernel readiness/wake bug.
+- Remaining walls, now two and precisely bounded:
+  **R1 (flaky, fatal):** the watch-page renderer sometimes exits cleanly
+  seconds after page handoff (runs 2, 5). A clean exit(0) means its main loop
+  ended by request/channel-EOF -- suspect the browser->renderer channel
+  dropping (AF_UNIX/SCM_RIGHTS churn) or a browser-side shutdown decision.
+  Next instrument: log AF_UNIX peer-close/channel-EOF events with pid+fd, and
+  dump [lx-recent] for a RENDERER exit_group (today only faults dump it).
+  **R2 (consistent when R1 doesn't fire):** browser->renderer CDP/Mojo
+  message flow stops ~35s in while renderer, browser main, and pipe reader
+  all stay healthy (runs 3-4); media stops at ~50KB (h2 window starves when
+  the data pipe is not drained). [chan] is capped at 500 by ~17s -- raise or
+  time-window it to see the late channel traffic.
