@@ -564,6 +564,14 @@ static int spawn_chrome(void) {
              * runs video-only until an audio device exists. */
             (char *)"--mute-audio",
             (char *)"--disable-audio-output",
+            /* Slice 56d (wall R1): the watch-page renderer cleanly
+             * exit_group(0)s at ~22-28s in most runs with no successor -- the
+             * shape of a browser-INSTRUCTED shutdown. Before building kernel
+             * forensics, ask the browser directly: VLOG the RenderProcessHost
+             * and navigation machinery so the shutdown decision (and the
+             * navigation that triggered it) is named on stderr. */
+            (char *)"--vmodule=render_process_host*=2,render_frame_host*=2,"
+                    "navigation_request=2,navigator=2",
             0,
         };
         char *envp[] = {

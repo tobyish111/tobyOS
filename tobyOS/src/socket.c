@@ -196,7 +196,7 @@ void sock_deliver(struct sock *s,
     struct sock_dgram *d = &s->dgrams[s->head];
     d->src_ip   = src_ip_be;
     d->src_port = src_port_be;
-    d->len      = (uint16_t)len;
+    d->len      = (uint32_t)len;
     d->payload  = copy;
     s->head = (uint8_t)((s->head + 1) % SOCK_RX_DGRAMS);
     s->count++;
@@ -209,8 +209,9 @@ void sock_deliver(struct sock *s,
  * + 1; 0 = peer closed). A write enqueues ONE message into the peer's dgram
  * ring (SEQPACKET: message boundaries preserved), a read dequeues one from our
  * own. Purely in-memory -- no NIC, no CAP_NET. kbuf is a KERNEL buffer (sys_
- * read/write bounce user data first). Messages cap at 65535 (dgram len is a
- * uint16_t); Mojo's control frames are far smaller. No SCM_RIGHTS yet. */
+ * read/write bounce user data first). Messages carry a u32 length (slice 56d:
+ * the old u16 cap SILENTLY TRUNCATED >64KB Mojo messages -- see
+ * unix_enqueue_fds); loud 8MiB sanity cap only. */
 /* Enqueue one AF_UNIX message, optionally carrying SCM_RIGHTS descriptions.
  * `files` (already file_clone'd by the caller) are handed to the message; on
  * failure they are released here so the caller never has to unwind. */
@@ -220,7 +221,21 @@ static int unix_enqueue_fds(struct sock *s, const void *payload, size_t len,
         for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
         return -1;
     }
-    if (len > 65535) len = 65535;
+    /* Slice 56d ROOT-CAUSE FIX (wall R1): this line used to read
+     * `if (len > 65535) len = 65535;` -- SILENT truncation of any AF_UNIX
+     * message over 64KB, while sock_unix_send_fds returned the FULL n to the
+     * sender. Chrome's browser->renderer Mojo channel crosses 64KB right at
+     * player start; the receiver's byte stream sheared mid-message, ipcz
+     * validation failed, and the renderer cleanly exit(0)'d -- killing the
+     * page (measured: a 4096+61439=65535-byte read immediately preceding
+     * every renderer death). dgram.len is now u32; enqueue the WHOLE message.
+     * Keep a LOUD sanity cap far above any real channel message. */
+    if (len > (8u << 20)) {
+        kprintf("[unix] REFUSING oversized dgram len=%lu (>8MiB) -- sender bug?\n",
+                (unsigned long)len);
+        for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
+        return -1;
+    }
     if (nfiles > SOCK_SCM_MAX_FDS) nfiles = SOCK_SCM_MAX_FDS;
     if (s->count == SOCK_RX_DGRAMS) {
         /* Ring full: NEVER drop -- this is a reliable stream (Mojo). Signal
@@ -238,7 +253,7 @@ static int unix_enqueue_fds(struct sock *s, const void *payload, size_t len,
     }
     if (len) memcpy(copy, payload, len);
     struct sock_dgram *d = &s->dgrams[s->head];
-    d->src_ip = 0; d->src_port = 0; d->len = (uint16_t)len; d->payload = copy;
+    d->src_ip = 0; d->src_port = 0; d->len = (uint32_t)len; d->payload = copy;
     d->nfds = 0;
 #ifdef CHROMIUM_BOOT
     {   uint32_t h = 2166136261u;                 /* FNV-1a over the copied bytes */
@@ -370,7 +385,7 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
      * ILLEGAL_MEMORY_RANGE corruption is ABOVE it (shared memory or chrome). */
     if (self->tail_off == 0 && d->payload && d->len) {
         uint32_t h = 2166136261u;
-        for (uint16_t i = 0; i < d->len; i++) { h ^= d->payload[i]; h *= 16777619u; }
+        for (uint32_t i = 0; i < d->len; i++) { h ^= d->payload[i]; h *= 16777619u; }
         if (h != d->chksum) {
             static int cm = 0;
             if (cm < 40) { cm++;
@@ -402,7 +417,7 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
     size_t avail = (size_t)(d->len - self->tail_off);
     size_t copy  = avail < n ? avail : n;
     if (copy && d->payload) memcpy(kbuf, d->payload + self->tail_off, copy);
-    self->tail_off = (uint16_t)(self->tail_off + copy);
+    self->tail_off = (uint32_t)(self->tail_off + copy);
     if (self->tail_off >= d->len) {              /* fully consumed -> advance */
         if (d->payload) { kfree(d->payload); d->payload = 0; }
         self->tail = (uint8_t)((self->tail + 1) % SOCK_RX_DGRAMS);

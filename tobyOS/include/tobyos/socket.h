@@ -87,7 +87,14 @@ struct file;
 struct sock_dgram {
     uint32_t  src_ip;          /* network byte order */
     uint16_t  src_port;        /* network byte order */
-    uint16_t  len;
+    /* Slice 56d: uint16_t until 2026-07-28 -- and unix_enqueue_fds SILENTLY
+     * TRUNCATED any AF_UNIX message > 65535 bytes while telling the sender it
+     * all went out. Chrome's browser->renderer Mojo channel messages cross
+     * 64KB right at player start; the sheared byte stream failed ipcz
+     * validation and the renderer cleanly exit(0)'d (the slice-56 R1 wall;
+     * measured as a 4096+61439=65535-byte read immediately before every
+     * death). 32 bits + no truncation. */
+    uint32_t  len;
     uint8_t  *payload;         /* kmalloc'd; freed on dequeue */
     struct file *fds[SOCK_SCM_MAX_FDS];
     uint8_t   nfds;
@@ -118,10 +125,11 @@ struct sock {
     uint8_t         tail;
     uint8_t         count;
     uint16_t        dropped;
-    uint16_t        tail_off;          /* AF_UNIX stream: bytes already consumed
+    uint32_t        tail_off;          /* AF_UNIX stream: bytes already consumed
                                         * from the head dgram (partial reads leave
                                         * the remainder queued, vs SEQPACKET which
-                                        * would drop it) -- X11 is a byte stream. */
+                                        * would drop it) -- X11 is a byte stream.
+                                        * u32: must span sock_dgram.len (slice 56d). */
     uint8_t         x_server;          /* 1 = in-kernel fake-X-server loopback:
                                         * writes are fed to the X handshake
                                         * responder, which enqueues replies back

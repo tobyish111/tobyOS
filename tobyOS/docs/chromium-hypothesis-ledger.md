@@ -2762,3 +2762,59 @@ Next measurement is already in place: `[epset]`.
   --enable-logging=stderr --v=0 --vmodule=render_process_host*=2).
 - Separate note: tid 20 busy-yields (the lx-recent flood) -- the old yield
   convoy still has one resident; worth a look once R1/R2 are closed.
+
+## Slice 56d (2026-07-28): R1 ROOT-CAUSED -- a ONE-BYTE SHEAR in AF_UNIX for
+## >=64KB Mojo messages; renderer deaths explained mechanically
+
+### The chring instrument delivered in one run
+Run 9's [rexit] channel-ring dump for the dying watch-page renderer (tgid 50)
+ends with EXACTLY: recvmsg(fd=5) -> 4096, -> 61439, -> 1608, -> 192, then
+exit_group(0). 4096 + 61439 = 65535 = 0xFFFF -- a magic number, and the
+slice-53 "large IPC" size ladder only tested up to 48KB, BELOW this cliff.
+
+### The mechanism, found in code and matching the measurement bit-for-bit
+1. lx_read_msghdr caps a sendmsg total at SYS_MAX_RW = 65536 and returns the
+   short count -- HONEST (Mojo handles partial channel writes by queueing the
+   remainder).
+2. unix_enqueue_fds then did `if (len > 65535) len = 65535;` -- SILENT -- and
+   sock_unix_send_fds returned the full n. Net effect: for any >=64KB channel
+   message the receiver's byte stream is missing EXACTLY ONE BYTE (byte
+   65535), while the sender continues from offset 65536.
+3. One missing byte shears the Mojo/ipcz framing for every subsequent message
+   on that channel; validation fails; chrome's channel-error path shuts the
+   endpoint down. In the renderer that is a CLEAN exit_group(0) -- wall R1,
+   killing the page. On a non-fatal endpoint the channel just goes silent --
+   wall R2's exact shape (message flow stops while everyone looks healthy).
+4. Flakiness explained: it fires only when some browser<->renderer message
+   crosses 64KB, which happens (or not) around player start per run.
+
+### Fix (slice 56d)
+sock_dgram.len u16 -> u32, sock.tail_off u16 -> u32, enqueue the WHOLE
+message (no truncation), loud 8MiB sanity refusal instead of any silent cap.
+lx_read_msghdr's 64KB-per-call short read/write stays (honest, POSIX).
+Verification: run 10 pending at time of writing -- criteria: no [rexit] of
+the watch-page renderer, probes keep answering past 40s, media b>0.
+
+### RUN 10 (shear fix in): R1's clean-exit mode is GONE; media pipeline
+### UNLOCKED; next wall = the old wild-jump corruption class, further along
+- The watch-page renderer NO LONGER cleanly exits. It ran 62,935 syscalls
+  (2.3x the previous best), issued TEN media requests with TEN responses
+  (was 2/2) across multiple videoplayback range fetches, painted frames --
+  then died at 31.5s to a USER-MODE WILD JUMP (rip=0x258821d, unmapped low
+  address, sane-looking stack, fault_count=58754 resolved demand-faults
+  before it). A second chrome process (pid 44) crashed the same way at
+  30.2s. exit code -1, not exit(0): a DIFFERENT wall than R1.
+- Transport self-check: zero [sockchk] CORRUPT (the FNV dequeue check) --
+  the AF_UNIX layer is byte-perfect post-fix; zero oversized refusals.
+- Assessment: this is the 0x208c13a wild-jump class (slices 50/50b fixed two
+  structural causes: free-before-shootdown and the PTE install-if-absent
+  TOCTOU). The heavier faster IPC flow after slice 56's fixes now reaches a
+  third instance ~30s in. NEXT ARC: the slice-50 toolset ([pgj] page
+  journal, [pfres]/[pfrej] rings, g_tlbq quarantine) on rip 0x258821d /
+  0x228cc12; check whether the faulting VA was recently munmap'd/remapped
+  and whether an un-acked shootdown frame got reused.
+- NOTE for the next agent: probes/net counters freeze after the crash
+  because the page is gone -- that is R1-collateral shape, not R2. R2 as an
+  independent wall is now DOUBTFUL: the one-byte shear on a non-fatal
+  endpoint explains the runs-3/4 message-flow stops too. Re-test R2 only
+  AFTER the corruption wall falls.

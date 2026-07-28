@@ -6741,6 +6741,20 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
  * tobyOS's AF_UNIX is message-queued with a tail_off path, while Mojo's
  * channel framing expects SOCK_STREAM byte semantics. Logged AFTER the call so
  * the return value is real; blocking calls therefore appear at wake time. */
+#ifdef CHROMIUM_BOOT
+/* Slice 56d (wall R1): always-on RING of socket-channel ops -- any fixed
+ * kprintf budget exhausts before the ~25s renderer death (measured: 500 by
+ * 17s, 1500 by 21.5s, 18s-gated 1200 by 24s at ~200 msgs/s). The ring is
+ * silent and cheap; [rexit] dumps the dying thread-group's tail, which is
+ * the discriminator R1 needs: a channel recv returning 0 right before
+ * exit_group = the browser CLOSED the channel; a normal final message =
+ * instructed shutdown (decode it); no channel activity = internal choice. */
+#define CHRING_MAX 512
+static struct chring_ent { int tgid, pid; short nr, fd; long ret; uint32_t ms; }
+        g_chring[CHRING_MAX];
+static uint32_t g_chring_i;
+#endif
+
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
 #ifdef CHROMIUM_BOOT
     int chan_fd = -1;
@@ -6762,6 +6776,16 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
 #ifdef CHROMIUM_BOOT
     if (curp) curp->cursys = -1;
     if (chan_fd >= 0) {
+        /* Ring-record EVERY socket op (silent), whatever the kprintf caps do. */
+        {
+            uint32_t ci = g_chring_i++ % CHRING_MAX;
+            g_chring[ci].tgid = curp ? curp->tgid : -1;
+            g_chring[ci].pid  = curp ? curp->pid  : -1;
+            g_chring[ci].nr   = (short)n;
+            g_chring[ci].fd   = (short)chan_fd;
+            g_chring[ci].ret  = r;
+            g_chring[ci].ms   = (uint32_t)(perf_now_ns() / 1000000ull);
+        }
         static int chan_c = 0;
         /* Slice 56 R1/R2: any cap counted from boot exhausts during startup
          * churn (500 by ~17s, 1500 by ~21.5s) and misses the window that
@@ -6863,13 +6887,32 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (n == LX_exit_group) {
             struct proc *xp = current_proc();
             if (xp && xp->is_renderer) {
-                /* Dump for the first THREE renderer exit_groups: a once-latch
-                 * burned the dump on a discarded SPARE renderer (run 6) while
-                 * the watch-page renderer's prelude went unrecorded. */
-                static int rexit_dumped = 0;
-                kprintf("[rexit] RENDERER pid=%d exit_group(%ld)\n",
-                        xp->pid, (long)a1);
-                if (rexit_dumped < 3) { rexit_dumped++; lx_dump_recent_syscalls(); }
+                kprintf("[rexit] RENDERER pid=%d tgid=%d exit_group(%ld) -- "
+                        "last channel ops of this thread group:\n",
+                        xp->pid, xp->tgid, (long)a1);
+                /* Slice 56d: dump the dying thread-group's LAST <=48 channel
+                 * ops from the always-on ring (see g_chring above). This is
+                 * the R1 discriminator; the global syscall ring proved useless
+                 * (flooded by a sched_yield spinner). */
+                {
+                    int keep[48]; uint32_t ki = 0;
+                    for (uint32_t k = 0; k < CHRING_MAX; k++) {
+                        uint32_t idx = (g_chring_i + k) % CHRING_MAX;
+                        if (g_chring[idx].ms == 0) continue;      /* unused */
+                        if (g_chring[idx].tgid != xp->tgid) continue;
+                        keep[ki % 48] = (int)idx; ki++;
+                    }
+                    uint32_t start = (ki < 48) ? 0 : ki - 48;
+                    for (uint32_t k2 = start; k2 < ki; k2++) {
+                        struct chring_ent *e = &g_chring[keep[k2 % 48]];
+                        kprintf("  [chring] %ums [%d] %s(fd=%d) -> %ld\n",
+                                (unsigned)e->ms, e->pid, lx_scname(e->nr),
+                                (int)e->fd, (long)e->ret);
+                    }
+                    if (ki == 0)
+                        kprintf("  [chring] (no channel ops recorded for tgid %d)\n",
+                                xp->tgid);
+                }
             }
         }
 #endif
