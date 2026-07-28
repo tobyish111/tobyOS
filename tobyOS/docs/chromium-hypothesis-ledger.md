@@ -2398,3 +2398,68 @@ write/read offsets per data-pipe -- should corner it in one run. Also NOTE the
 4th crash signature this arc: EXCEPTION 12 #SS, rbp=0x10060c4108070c57 (byte
 soup = data over a saved stack frame), pid 8 browser worker, 1x, parked --
 random-victim corruption may still be alive at low rate.
+
+## SLICES 52-53 (2026-07-27) — ***CORRECTION: the "network page stall" was a DISPLAY-PATH gap, not a kernel bug.*** Web pages render again; the YouTube wall is now pinned precisely at MSE
+
+### SLICE 51 WAS WRONG — retract it
+Slice 51 concluded the stall was "the Mojo response-BODY data pipe". It was not.
+Slice 50's "YouTube throttling" was also wrong. Both were inferences from
+ABSENCE (no frames) without asking the one entity that knew: chrome itself.
+
+### What actually happened (measured, one probe, one run)
+Added a CDP page-state probe (Runtime.evaluate every 10s) to chromewin. On the
+"stalled" example.com run it reported, while frames=0:
+```
+tobyprobe rs=complete url=https://example.com/ title=Example Domain
+          blen=207 bh=118 vis=visible
+```
+The page was FULLY loaded, parsed, laid out and VISIBLE the entire time.
+Network, TLS, Mojo, the renderer and layout were all working perfectly.
+**`Page.startScreencast` only pushes a frame when the page DAMAGES something.**
+A static page finishes painting before the screencast is even started, so
+nothing ever streams -- indistinguishable from a hang from the outside. This
+also explains the "8/8 network-page stalls vs local files 2/2": the local .webm
+is a VIDEO (continuous damage), so it always streamed.
+
+### Fix (programs/chromewin/main.c, slice 52) -- VERIFIED
+Hybrid display path: screencast still carries dynamic/video content at full
+rate; when no pushed frame has arrived for 2s, chromewin PULLS one with
+`Page.captureScreenshot` (one outstanding at a time; decode/install factored
+into `install_b64_frame()` shared by both paths).
+- **example.com now renders its real page** (headline, body text, "Learn more"
+  link); screendumps 36KB -> 77KB.
+- **The YouTube WATCH page renders its real player** (controls, progress bar,
+  pause glyph, metadata skeleton), no crash, over a full 360s run.
+
+### Kernel EXONERATED for this symptom (A/B)
+Checked out the pre-slice-50 kernel (86bb0d8 src/+include/) and rebuilt:
+example.com fails to paint IDENTICALLY. So slices 50/50b did not cause it.
+
+### SLICE 53: the video wall is now pinned at MSE
+Extended the probe to the <video> element. Repeatable on the watch page:
+```
+tobyprobe rs=loading title=Big Buck Bunny 60fps blen=108307
+          vid=r0 n2 t0.0 d0 b- e- p0 src=blob:
+```
+Real page + player (108KB DOM, correct title), MediaSource ATTACHED (blob:),
+networkState=2 (LOADING), NO media error, but readyState=HAVE_NOTHING and
+**ZERO buffered ranges** -- MSE segments never deliver. `document.readyState`
+also stays `loading`, so the main HTML is still streaming late in the run.
+Combined with slice 49 (VP9 decode+paint PROVEN with a local .webm), the wall
+is now isolated to: **the MSE segment fetch/append path never delivers bytes.**
+
+### Also measured, unresolved (next leads, in order)
+1. **Userspace spin convoy.** Late in a watch run the syscall mix is dominated
+   by `sched_yield` (12218 vs 275 futex) from ~4 chrome threads = a
+   base::SpinLock/PartitionAlloc spin. Network arrives in BURSTS with 20-80s
+   gaps and the main document trickles (~4.6 KB/s), consistent with CPU
+   starvation. NOTE a tempting-but-WRONG fix was tried and REVERTED: penalising
+   yield-spinners in `sched_yield`'s interactivity credit did nothing, because
+   spinners take the FAST PATH (`state==RUNNING && ready_head==0 -> return`)
+   which never reaches the boost logic. Any real fix must act on the fast path
+   (or on enqueue targeting -- everything piles on the BSP via enq_target_for).
+2. **Per-connection throughput is FINE** (tcp[8]: 41KB in 0.2s), so this is not
+   a slow TCP stack -- it is scheduling gaps between bursts.
+3. Whether the segment requests are even ISSUED is still unknown: instrument
+   which URLs/hosts the network service opens after the player attaches MSE
+   (googlevideo.com connections did appear: 173.194.x, 74.125.x).
