@@ -3010,3 +3010,43 @@ STATE: nothing left to fix here. tobyOS reaches HAVE_ENOUGH_DATA with 20-24s
 buffered in 3/3 runs and paints decoded frames; some segment fetches 403
 because YouTube signature-gates a fallback URL set, and the player simply
 uses the set that works. Kernel-side, this arc is DONE.
+
+## Slice 59 (2026-07-28): desktop-UA + page-richness probe + scrolling.
+## HONEST STATUS: metadata works; 403s NOT reliably fixed; thumbnails/
+## comments still absent -- and full YouTube parity is its own arc.
+
+Changes: chrome now runs with an ordinary desktop Chrome user-agent (was
+"HeadlessChrome/151", which YouTube treats as a bot), --accept-lang, a
+page-RICHNESS probe (imgs=decoded/total, tiles=, cmt=, meta=viewcount) and
+user-like scrolling (YouTube lazy-loads sidebar thumbnails and does not even
+request comments until scrolled).
+
+Measured:
+| run | UA      | 403s | imgs      | tiles | cmt | meta      |
+|-----|---------|------|-----------|-------|-----|-----------|
+| 17  | desktop | 0    | 2/65      | 2     | 0   | 23M views |
+| 18  | desktop | 6    | 2/65      | 2     | 0   | 23M views |
+
+- **METADATA WORKS**: the real view count (23M views) populates from the
+  live page. Title/channel/subscriber/like chrome already rendered
+  (logs/x3_run3_c.png).
+- **403s are NOT eliminated.** Run 17 had none, run 18 had six on the same
+  build. So the UA changes the odds at best; do NOT claim it as the fix
+  (that would be the same single-run error this arc keeps making). Next:
+  run the UA build 3x via logs/run_x3.sh and tabulate 403s per run against
+  the pre-UA baseline (~1 run in 3) before drawing any conclusion.
+- **Thumbnails did NOT improve after scrolling** (still 2/65 decoded, 65
+  <img> tags present). So the earlier "it's just lazy-loading" explanation
+  is NOT sufficient. Two candidates, untested: the scroll never took effect
+  (YouTube may scroll an inner container, or the injected scrollBy raced the
+  app's own handlers), or thumbnail fetches/decodes genuinely fail. CHECK
+  FIRST, cheaply: probe window.scrollY after the scroll (proves the scroll
+  happened at all) and count i.ytimg.com requests in the Network events
+  (proves whether the fetches are even issued).
+- **Comments never rendered** (cmt=0), consistent with the scroll not taking
+  effect -- comments are fetched on scroll-to.
+
+SCOPE NOTE: "YouTube like a normal browser" (populated thumbnails, sidebar
+tiles, comments, click-through navigation) is a multi-slice arc, not a
+follow-on to the playback work. The playback arc is DONE and verified
+(3/3 runs HAVE_ENOUGH_DATA, 20-24s buffered, decoded frames painted).

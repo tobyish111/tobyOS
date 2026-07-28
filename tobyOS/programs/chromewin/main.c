@@ -612,6 +612,19 @@ static int spawn_chrome(void) {
              * runs video-only until an audio device exists. */
             (char *)"--mute-audio",
             (char *)"--disable-audio-output",
+            /* Slice 59: present as ordinary desktop Chrome. chrome-headless-
+             * shell otherwise advertises "HeadlessChrome/151...", which
+             * YouTube treats as a bot: it serves a proof-of-origin/signature
+             * -gated URL set (far-future expire=, different CDN host) that
+             * 403s without a PO token, and it degrades the page (skeleton
+             * metadata, fewer thumbnails, no comment fetch). A normal UA is
+             * what a "normal browser" run means here. Window size + a real
+             * Accept-Language round out the fingerprint. */
+            (char *)"--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/151.0.0.0 Safari/537.36",
+            (char *)"--lang=en-US",
+            (char *)"--accept-lang=en-US,en;q=0.9",
             /* Slice 56d (wall R1): the watch-page renderer cleanly
              * exit_group(0)s at ~22-28s in most runs with no successor -- the
              * shape of a browser-INSTRUCTED shutdown. Before building kernel
@@ -687,7 +700,22 @@ static void probe_page(void) {
              "+' e'+(v.error?v.error.code:'-')"
              "+' p'+(v.paused?1:0)"
              "+' src'+(v.src?v.src.slice(0,12):'-')):'novideo')"
-             "+' mse='+(window.__mse||'-');})()\","
+             "+' mse='+(window.__mse||'-')"
+             /* Slice 59: PAGE RICHNESS -- the "works like a normal browser"
+              * metrics. imgs=<img> that actually decoded (naturalWidth>0, so
+              * thumbnails really painted, not just tags present); vids=video
+              * tiles in the sidebar/grid (clickable targets); cmt=rendered
+              * comment threads; views/likes = whether metadata populated. */
+             "+' imgs='+[].filter.call(document.images,"
+                        "function(i){return i.naturalWidth>0;}).length"
+             "+'/'+document.images.length"
+             "+' tiles='+document.querySelectorAll("
+                        "'ytd-compact-video-renderer,ytd-video-renderer,"
+                        "a#thumbnail').length"
+             "+' cmt='+document.querySelectorAll("
+                        "'ytd-comment-thread-renderer,#content-text').length"
+             "+' meta='+((document.body.innerText.match("
+                        "/[0-9.,]+[KM]? views/)||['-'])[0]).slice(0,12);})()\","
              "\"returnByValue\":true}", 1);
 }
 
@@ -950,6 +978,27 @@ int main(void) {
             if (now >= next_rung) { send_ladder_probe(); next_rung = now + 3000; }
         }
 #endif
+
+        /* Slice 59: SCROLL like a user. YouTube lazy-loads: sidebar
+         * thumbnails only fetch when they near the viewport, and the comment
+         * section is not even requested until you scroll to it. Without this
+         * the page legitimately reports imgs=2/65 cmt=0 -- correct behaviour
+         * for an 800x600 viewport that never moved, and easily mistaken for
+         * broken image decoding. Scroll in steps from 25s (page settled),
+         * then return to the top so the player stays visible for screenshots. */
+        {
+            static int scrolls; static long next_scroll;
+            long nows = sys_clock_ms();
+            if (next_scroll == 0) next_scroll = t0 + 25000;
+            if (scrolls < 8 && nows >= next_scroll) {
+                scrolls++;
+                next_scroll = nows + 4000;
+                cdp_send("Runtime.evaluate",
+                         scrolls < 7
+                           ? "{\"expression\":\"window.scrollBy(0,700)\"}"
+                           : "{\"expression\":\"window.scrollTo(0,0)\"}", 1);
+            }
+        }
 
         /* Slice 52: probe the page state every 10s and report the frame count
          * alongside, so a stalled run says WHY it is stalled. (Slice 56: cap
