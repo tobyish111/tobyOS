@@ -14,7 +14,15 @@
 
 /* 16: HTTP keep-alive (http.c) parks up to KEEP_MAX=4 idle conns on top
  * of the active fetch, listeners and TIME_WAIT remnants. */
-#define TCP_MAX_CONNS         16
+/* Slice 58: 16 -> 64. A YouTube watch page alone opens ~13 TLS conns before
+ * the player fetches media, and slice-56's non-blocking close leaves closed
+ * conns running out their FIN/TIME_WAIT in the background, so at 16 slots
+ * conn_alloc ran dry ~44s in: chrome's socket() failed, the network service
+ * reported net::ERR_INSUFFICIENT_RESOURCES for every new segment fetch, and
+ * the Kevlar player RESET to r0/b- right after playback started (run 14).
+ * ~90KB/conn static, 64 x ~90KB = ~5.8 MiB BSS. conn_alloc also now recycles
+ * the oldest TIME_WAIT / detached-closing conn when the pool is full. */
+#define TCP_MAX_CONNS         64
 /* Per-conn receive buffer == our advertised window. 8 KiB forced a
  * stop-and-wait window refill every ~15 MSS-sized segments, which on a
  * real WAN link (EliteDesk, google.com ~300 KiB) collapsed throughput
@@ -168,30 +176,59 @@ bool tcp_init(void) {
     return true;
 }
 
+static void conn_free(struct tcp_conn *c);   /* fwd (recycle-on-full below) */
+
 static struct tcp_conn *conn_alloc(void) {
+    struct tcp_conn *c = NULL;
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
-        struct tcp_conn *c = &g_conns[i];
-        if (!c->in_use) {
-            memset(c, 0, sizeof(*c));
-            c->in_use        = true;
-            c->state         = TCP_CLOSED;
-            c->snd_wnd       = 65535u;
-            c->parent_lsn    = -1;
-            c->rto_ms        = 1000;
-            c->cwnd_bytes    = TCP_INIT_CWND_BYTES;
-            c->ssthresh      = TCP_MAX_CWND_BYTES;
-            c->in_slow_start = 1;
-            c->w_max         = 0;
-            c->epoch_start   = 0;
-            c->origin_point  = 0;
-            c->tcp_friendliness_cwnd = 0;
-            c->snd_wnd_shift = 0;
-            c->rcv_wnd_shift = 4;  /* advertise shift=4 => up to 1 MiB */
-            c->wscale_ok     = false;
-            return c;
+        if (!g_conns[i].in_use) { c = &g_conns[i]; break; }
+    }
+    if (!c) {
+        /* Slice 58: pool full -- recycle instead of failing. Preference:
+         * the TIME_WAIT conn closest to its deadline (it holds no data
+         * anyone will read), else a DETACHED conn still running out its
+         * close handshake (its owner already gave it up; the peer just
+         * loses the courtesy FIN). Failing socket() here surfaced to
+         * chrome as net::ERR_INSUFFICIENT_RESOURCES and reset the player. */
+        struct tcp_conn *tw = NULL, *det = NULL;
+        for (int i = 0; i < TCP_MAX_CONNS; i++) {
+            struct tcp_conn *v = &g_conns[i];
+            if (v->state == TCP_LISTEN) continue;
+            if (v->state == TCP_TIME_WAIT &&
+                (!tw || v->tw_deadline_tick < tw->tw_deadline_tick))
+                tw = v;
+            else if (v->detached && !det)
+                det = v;
+        }
+        c = tw ? tw : det;
+        if (c) {
+            static int rec = 0;
+            if (rec < 16) { rec++;
+                kprintf("[tcp] pool full: recycling tcp[%d] (state=%s%s)\n",
+                        conn_index(c), tcp_state_name(c->state),
+                        c->detached ? ", detached" : "");
+            }
+            conn_free(c);
         }
     }
-    return NULL;
+    if (!c) return NULL;
+    memset(c, 0, sizeof(*c));
+    c->in_use        = true;
+    c->state         = TCP_CLOSED;
+    c->snd_wnd       = 65535u;
+    c->parent_lsn    = -1;
+    c->rto_ms        = 1000;
+    c->cwnd_bytes    = TCP_INIT_CWND_BYTES;
+    c->ssthresh      = TCP_MAX_CWND_BYTES;
+    c->in_slow_start = 1;
+    c->w_max         = 0;
+    c->epoch_start   = 0;
+    c->origin_point  = 0;
+    c->tcp_friendliness_cwnd = 0;
+    c->snd_wnd_shift = 0;
+    c->rcv_wnd_shift = 4;  /* advertise shift=4 => up to 1 MiB */
+    c->wscale_ok     = false;
+    return c;
 }
 
 static void conn_free(struct tcp_conn *c) {

@@ -2874,3 +2874,40 @@ mmap/munmap/mprotect under the BKL, before any entry pointers exist).
   crashes, zero VMA/TLB incidents in the same window). Screendump timing
   missed the playing window; add a frame-diff screenshot burst on r>=3 for
   visual proof next run.
+
+## Slice 58 (2026-07-28): the player reset is URL CORRUPTION, not YouTube policy
+
+### Two findings, one fixed, one newly named
+**FIXED -- TCP conn-pool exhaustion.** Run 14's reset window was full of
+`net::ERR_INSUFFICIENT_RESOURCES`: a watch page opens ~13 TLS conns before
+media, and slice-56's non-blocking close leaves closed conns running out
+FIN/TIME_WAIT in the background, so the 16-slot pool ran dry ~44s in and
+chrome's socket() failed. Fix: TCP_MAX_CONNS 16 -> 64 plus recycle-on-full
+in conn_alloc (prefer the TIME_WAIT closest to its deadline, else a detached
+closing conn). Run 15: zero ERR_INSUFFICIENT_RESOURCES, zero pool-full
+recycles needed, zero crashes.
+
+**NEW WALL, precisely measured -- media URLs are being CORRUPTED.** Run 15's
+media requests carry TWO different `expire=` values for the SAME video:
+`expire=1785298981` (5 requests -- sane, ~now) and `expire=8922279409`
+(6 requests -- year 2252, IMPOSSIBLE). The corrupt-URL requests are exactly
+the ones YouTube answers **403**, which is why the player resets to r0/b-:
+the segment fetches are rejected. Run 13 showed a DIFFERENT bogus value
+(`expire=7639704651`), so this is random corruption, not a constant or a
+policy artifact -- and it is silent (no crash, no fault) now that slice
+57 fixed the crash sites.
+- Read: the slice-57 corruption class is NOT fully closed. It no longer
+  crashes, but it still mutates data in flight -- here, a URL query string
+  somewhere between the player's JS building it and the network service
+  issuing it.
+- NEXT MEASUREMENT (do this first, do not theorise): the query string is
+  plaintext in the TLS-layer send path. Hash/log the outgoing GET line for
+  googlevideo requests at the point tobyOS hands it to TLS, and compare with
+  chrome's own CDP requestWillBeSent URL for the same requestId. That splits
+  "chrome built a bad URL" (renderer/V8-side memory corruption) from "tobyOS
+  mangled the bytes in transit" (socket/TLS path). Both are in-house bugs;
+  the split says which half to instrument next.
+- Note the shape matches the ONE-BYTE-SHEAR family (slice 56d): a digit
+  substitution / shifted byte in a string is exactly what a boundary bug in
+  a copy path produces. Check the >=64KB paths and any remaining u16
+  length/offset in the send direction.

@@ -8,8 +8,11 @@ ISO = "tobyOS.iso"
 DISK = "disk.img"
 SERIAL = "logs/run_watch.log"
 PORT = 4464
-SHOTS = [(90, "logs/wat_a.png"), (170, "logs/wat_b.png"),
-         (250, "logs/wat_c.png"), (330, "logs/wat_d.png")]
+# Slice 58: shots moved into the PLAYING window (~30-60s guest = ~67-97s
+# runner; run-14's fixed times straddled it). Two shots 8s apart during
+# playback = moving-frame proof; one late shot for the end state.
+SHOTS = [(72, "logs/wat_a.png"), (80, "logs/wat_b.png"),
+         (88, "logs/wat_c.png"), (150, "logs/wat_d.png")]
 TOTAL = 360
 
 
