@@ -2311,3 +2311,20 @@ against the pre-50b kernel, and/or add a debug-define delay inside
 mmap_try_fault's window to widen it deterministically. Reproduce:
 `make iso EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DCHROMIUM_BOOT"` + a WHPX
 boot; verdict prints ~10s in (logs/demrace_whpx.log).
+
+### OPEN CONCERN (end of 50b session): one watch run crashed EARLY in ld.so + wedged
+Final watch run of the session (post-50b kernel + DEMRACETEST build via
+logs/build39.sh): chrome child pid 33 died at 15.4s guest -- EXCEPTION 14,
+rip=0x400246da (ld.so range), cr2=0x0, fs_base=0 (before TLS setup = very early
+dynamic-linker work), and the GUI then WEDGED (uniform-color screendumps, no
+sessionId/bootstrap, remaining threads parked 290s+). Evidence:
+logs/run_watch.log (this signature was never seen in any earlier run). Could be
+(a) a genuine 50b regression in early process setup (if_absent path during
+execve/ld.so demand-load -- audit whether the demand path's lost-race
+return-true is safe for a FILE-BACKED VMA where winner+loser must see the SAME
+eagerly-populated content, NOT a zero page), (b) another face of the known
+watch-page/WHPX non-determinism, or (c) a stale-build artifact (three define
+sets were built back-to-back; build39 does touch src/*.c, so unlikely).
+NEXT SESSION: triage FIRST -- re-run 2-3x (any URL; the crash was pre-network),
+and if it recurs symbolize rip-0x40000000 offset against ld-linux-x86-64.so.2.
+Do NOT trust any YouTube crash-rate stats until this is resolved.
