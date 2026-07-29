@@ -3194,3 +3194,41 @@ NEXT (measure what the DOM actually contains, do not theorise):
 3. Check the comments section's own state: ytd-comments + its continuation
    -- comments load via a SEPARATE continuation request that a client
    without the right context never issues.
+
+## Slice 59f: DOM census -- real numbers, and a probe FALSE POSITIVE to fix
+
+Census (stable across runs 24 + 25):
+    sec=4  cmt2=73(0 threads)  gate=1  ytd=3637-3704  tiles=2  imgs=2/68
+Consent cookies (CONSENT=YES+cb, SOCS=CAI on .youtube.com, set BEFORE
+navigation) changed NOTHING -- every field identical. Two readings, and the
+second is more likely:
+1. The cookies were rejected/ineffective, or
+2. **gate=1 is a FALSE POSITIVE of my own selector.** It matches
+   `tp-yt-paper-dialog`, which YouTube ships HIDDEN on every page. Presence
+   != displayed. This is the same mistake as the BOGUS-EXPIRE detector
+   (flagging URLs with no expire= at all). MUST re-measure with visibility:
+   offsetParent !== null / getComputedStyle(el).display !== 'none'.
+Keep the consent cookies regardless: they are what a real session carries and
+they cost nothing.
+
+### The honest, stable picture (what any next agent should start from)
+- ytd=3700 elements: the YouTube app DOES build itself fully.
+- sec=4: the sidebar container has children, but a populated desktop page has
+  ~20 tiles -- so content is PARTIALLY served/built, not absent.
+- cmt2=73 with ZERO comment threads: the comments component exists and is
+  empty -- comments are fetched by a separate continuation that never fires.
+- imgs=2/68 with thumbnail fetches ISSUED and /youtubei/next 200 OK.
+- Userspace ~0.06% busy: nothing is compute-starved.
+
+### Next steps, in order, all cheap
+1. Fix the gate detector (visibility, not presence) and re-run -- if gate
+   becomes 0, the consent theory dies (theory 6) and the field was noise.
+2. Ask chrome what it thinks is missing rather than inferring: dump
+   `document.querySelector('ytd-watch-next-secondary-results-renderer')
+   .innerText.slice(0,200)` and the ytd-comments innerText -- placeholder
+   text ("Comments are turned off", a spinner, an error) names the state
+   directly.
+3. Check whether the comment continuation request is ever ISSUED: count
+   /youtubei/v1/next continuations AFTER scroll (we count /next calls, but
+   not which are continuations). Zero after scrolling => the app decided not
+   to ask, which points back at client context (consent/session), not at us.

@@ -743,7 +743,32 @@ static void probe_page(void) {
               * is not always window (run 19 read sy=0 while the app scrolled
               * its own container), so take the max of both views. */
              "+' sy='+Math.max(window.scrollY,"
-                      "(document.scrollingElement||document.body).scrollTop);})()\","
+                      "(document.scrollingElement||document.body).scrollTop)"
+             /* Slice 59f: DOM CENSUS -- splits SERVED from RENDERED, which is
+              * the question five kernel-side theories failed to answer.
+              *   sec  = children of the sidebar container. 0 => YouTube sent
+              *          no secondary payload (nothing to render); >0 while
+              *          tiles=2 => a real rendering gap.
+              *   cmt2 = ytd-comments present? and its child count (comments
+              *          arrive via a SEPARATE continuation a limited client
+              *          may never request).
+              *   gate = a consent / sign-in / "before you continue"
+              *          interstitial in the DOM, which is how YouTube
+              *          withholds sidebar+comments from untrusted clients.
+              *   ytd  = total custom-element count, a coarse "did the app
+              *          actually build itself" number. */
+             "+' sec='+((document.querySelector("
+                      "'ytd-watch-next-secondary-results-renderer')||{})"
+                      ".childElementCount|0)"
+             "+' cmt2='+(document.querySelector('ytd-comments')?"
+                      "document.querySelector('ytd-comments')"
+                      ".querySelectorAll('*').length:-1)"
+             "+' gate='+(document.querySelectorAll("
+                      "'ytd-consent-bump-v2-lightbox,tp-yt-paper-dialog,"
+                      "form[action*=consent],[aria-label*=\\\"sign in\\\" i]')"
+                      ".length)"
+             "+' ytd='+document.querySelectorAll("
+                      "'[class*=ytd-],ytd-app *').length;})()\","
              "\"returnByValue\":true}", 1);
 }
 
@@ -807,6 +832,24 @@ static int cdp_bootstrap(void) {
      * SOFTWARE rasterization the renderer completes LESS of the page -- so
      * the narrow-layout theory is dead and this is a renderer THROUGHPUT
      * limit. Do not re-add a bigger viewport before raster gets faster. */
+
+    /* Slice 59f: DISMISS THE CONSENT GATE. The DOM census found gate=1 (a
+     * consent/sign-in interstitial) alongside sec=4 sidebar children and an
+     * EMPTY ytd-comments (cmt2=73 elements, zero threads): YouTube serves a
+     * deliberately reduced page until consent is recorded -- few tiles, no
+     * comments, few thumbnails. That is the whole "UI parity" gap, and it is
+     * a COOKIE, not a kernel or renderer defect. CONSENT=YES+ is the classic
+     * accepted-consent marker; SOCS=CAI is its modern replacement. Set both
+     * on .youtube.com BEFORE navigating so the first page build is complete.
+     * (Setting a consent cookie is exactly what clicking "Accept all" does.) */
+    id = cdp_send("Network.setCookie",
+                  "{\"name\":\"CONSENT\",\"value\":\"YES+cb\","
+                  "\"domain\":\".youtube.com\",\"path\":\"/\"}", 1);
+    cdp_wait(id);
+    id = cdp_send("Network.setCookie",
+                  "{\"name\":\"SOCS\",\"value\":\"CAI\","
+                  "\"domain\":\".youtube.com\",\"path\":\"/\"}", 1);
+    cdp_wait(id);
 
     id = cdp_send("Page.enable", "{}", 1);
     if (!cdp_wait(id)) return -1;
