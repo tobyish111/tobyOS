@@ -320,7 +320,7 @@ static int cdp_take_msg(void) {
 
 /* Send a browser-level or session command; return its id. */
 static int cdp_send(const char *method, const char *params_json, int with_session) {
-    static char buf[2048];
+    static char buf[16384];   /* slice 59h: 2048 truncated the grown probe JS into invalid JSON (-32700) */
     int id = g_next_id++;
     if (with_session && g_session[0])
         snprintf(buf, sizeof buf,
@@ -785,13 +785,28 @@ static void probe_page(void) {
              /* Delimit with <> not quotes: run 26's \" escaping terminated
               * the JSON string and truncated the whole field to `secTxt=\`.
               * Also strip any quote from the text itself for the same reason. */
-             "+' secTxt=<'+((document.querySelector("
+             /* Slice 59h THE SPLIT: innerText is LAYOUT-aware (empty for
+              * unrendered subtrees); textContent is not (returns the data
+              * regardless). tc non-empty + it empty => data present, layout
+              * missing (rendering side). BOTH empty => empty shells, payload
+              * never arrived (data side). Also report offsetHeight, which
+              * says outright whether the box has any laid-out geometry. */
+             "+' secIt=<'+((document.querySelector("
                       "'ytd-watch-next-secondary-results-renderer')||{})"
                       ".innerText||'-').replace(/[\\\\s\\\"]+/g,' ')"
-                      ".slice(0,60)+'>'"
-             "+' cmtTxt=<'+((document.querySelector('ytd-comments')||{})"
-                      ".innerText||'-').replace(/[\\\\s\\\"]+/g,' ')"
-                      ".slice(0,60)+'>'"
+                      ".slice(0,40)+'>'"
+             "+' secTc=<'+((document.querySelector("
+                      "'ytd-watch-next-secondary-results-renderer')||{})"
+                      ".textContent||'-').replace(/[\\\\s\\\"]+/g,' ')"
+                      ".slice(0,40)+'>'"
+             "+' secH='+((document.querySelector("
+                      "'ytd-watch-next-secondary-results-renderer')||{})"
+                      ".offsetHeight|0)"
+             "+' cmtTc=<'+((document.querySelector('ytd-comments')||{})"
+                      ".textContent||'-').replace(/[\\\\s\\\"]+/g,' ')"
+                      ".slice(0,40)+'>'"
+             "+' cmtH='+((document.querySelector('ytd-comments')||{})"
+                      ".offsetHeight|0)"
              "+' ytd='+document.querySelectorAll("
                       "'[class*=ytd-],ytd-app *').length;})()\","
              "\"returnByValue\":true}", 1);

@@ -3262,3 +3262,28 @@ throughput, futex requeue, consent gate) and TWO of them died because MY OWN
 PROBE was wrong (BOGUS-EXPIRE flagged URLs with no expire=; gate flagged
 hidden dialogs). Before trusting any new probe field, sanity-check it against
 a case where you KNOW the answer.
+
+## Slice 59h: cdp_send buffer bug fixed; the layout-vs-payload split is BUILT
+## but still UNMEASURED (run 29's page did not finish building)
+
+- **REAL BUG FIXED: cdp_send's `static char buf[2048]`.** The probe JS grew
+  past it, so snprintf TRUNCATED the command mid-string and chrome answered
+  `-32700 JSON: invalid token`. Run 28 produced ZERO probes for this reason
+  alone -- a tooling failure that looked like a page failure. Raised to
+  16384. NOTE this would silently corrupt ANY long CDP command (large
+  Runtime.evaluate, Input sequences, setCookie with big values), so it is a
+  fix on its own merits, not just for the probe.
+- The split probe (secIt / secTc / secH / cmtTc / cmtH) is now IN and
+  correct, but run 29's page only reached ytd=137 elements (a full build is
+  ~3700), so every sample shows the pre-build state. **No verdict yet.**
+
+### Exactly where to resume
+Run the current build until a run reaches ytd>3000, then read ONE line:
+    secIt=<..> secTc=<..> secH=N cmtTc=<..> cmtH=N
+- secTc non-empty + secIt empty + secH=0 => data present, NOT laid out
+  => rendering/layout side.
+- secTc empty + secH=0 => empty containers => payload never arrived
+  => data side (and note only cont=1 continuation was ever observed).
+Because the page build itself is variable, use logs/run_x3.sh (build once,
+run 3x, auto-tabulate) rather than judging from a single run -- that harness
+exists precisely for this.
