@@ -3164,3 +3164,33 @@ being wrong.
   3. Only if both look healthy, revisit IPC latency (the Mojo channel
      round-trip time under load) -- measurable by timestamping a CDP
      Runtime.evaluate round trip while the page is stalled vs idle.
+
+## Slice 59e: FUTEX_CMP_REQUEUE implemented (real ABI gap) but it was NOT the
+## bug -- and the reframe that follows: chrome thinks the page is DONE
+
+Measured: the renderer MAIN thread parked on futex(0xc130ac0, to=-1) for
+645 -> 8168 ms while userspace ran at ~0.06%. I read that as a lost
+broadcast (glibc pthread_cond_broadcast uses FUTEX_CMP_REQUEUE, which we
+returned -EINVAL for) and implemented REQUEUE/CMP_REQUEUE as wake-all.
+
+Run 23 verdict: **[fxrq] fired ZERO times and [fxop] logged no unsupported
+op** -- chrome never issues those ops, exactly as the bring-up note said.
+FIFTH dead theory. The requeue implementation is kept: it is a genuine Linux
+ABI gap that any other glibc program can hit, and it now cannot hide (an
+unsupported op logs [fxop] instead of silently returning EINVAL).
+
+**The reframe this forces:** an idle main thread on an infinite futex is a
+message loop with NOTHING TO DO. Combined with rs=complete, blen ~1.0 MB,
+meta=23M views and (this run) vid=r4 b20.0 playing, the honest reading is
+that chrome believes the page is FINISHED. tiles=2 / imgs=2-of-67 / cmt=0 is
+then not a renderer failure at all -- it is what this client was SERVED.
+
+NEXT (measure what the DOM actually contains, do not theorise):
+1. Dump the top-level ytd-* element census + whether a consent/sign-in gate
+   or "before you continue" interstitial is present in the DOM.
+2. Count ytd-watch-next-secondary-results-renderer children specifically:
+   0 children = YouTube sent no sidebar payload; >0 children with tiles=2 =
+   a rendering gap. That single number splits served-vs-rendered.
+3. Check the comments section's own state: ytd-comments + its continuation
+   -- comments load via a SEPARATE continuation request that a client
+   without the right context never issues.

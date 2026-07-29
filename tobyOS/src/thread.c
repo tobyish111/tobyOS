@@ -592,9 +592,60 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
         return woken;
     }
 
-    /* NOTE (verified via a [futexop] trace during bring-up): chrome uses ONLY
-     * FUTEX_WAIT/WAKE/WAIT_BITSET/WAKE_BITSET -- 0 hits on any other op -- so
-     * missing CMP_REQUEUE/WAKE_OP/PI is NOT a chrome blocker here. */
+    /* FUTEX_REQUEUE(3) / FUTEX_CMP_REQUEUE(4): glibc's pthread_cond_broadcast
+     * requeues waiters from the condvar word onto the mutex word. Returning
+     * -EINVAL (as this did until slice 59e) means a broadcast wakes NOBODY --
+     * every waiter parks forever on an INFINITE futex. Measured exactly that:
+     * the renderer's MAIN thread sat in futex(0xc130ac0, to=-1) for 8s and
+     * climbing while userspace was ~0.06% busy, so the page stopped building
+     * without any CPU cost. The bring-up-era note claiming chrome never uses
+     * these ops was taken from a trace of a much simpler page.
+     *
+     * Implementation: WAKE EVERY waiter on uaddr rather than moving them to
+     * uaddr2. Spurious wakeups are explicitly legal for futexes -- glibc
+     * re-checks its predicate and re-blocks on the mutex itself -- so this is
+     * correct, just less efficient than a true requeue (a thundering herd on
+     * broadcast). Correctness first; optimise only if it ever shows up. */
+    if (cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE) {
+        uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+        uint32_t idx = futex_hash(cr3, addr);
+        struct futex_entry *e = g_futex_hash[idx];
+        while (e) {
+            if (e->key_cr3 == cr3 && e->key_addr == addr) break;
+            e = e->next;
+        }
+        int woken = 0;
+        if (e) {
+            while (e->waiters) {
+                struct proc *w = e->waiters;
+                e->waiters = w->next_wait;
+                w->next_wait = 0;
+                w->futex_deadline_ns = 0;
+#ifdef CHROMIUM_BOOT
+                w->fx_wake_ns = perf_now_ns();
+#endif
+                w->state = PROC_READY;
+                sched_enqueue(w);
+                woken++;
+            }
+            futex_free_entry(e);
+        }
+        spin_unlock_irqrestore(&g_futex_lock, flags);
+#ifdef CHROMIUM_BOOT
+        { static int rq; if (rq < 24) { rq++;
+            kprintf("[fxrq] pid=%d REQUEUE op=%d addr=0x%lx -> woke %d\n",
+                    caller->pid, cmd, (unsigned long)addr, woken); } }
+#endif
+        return woken;
+    }
+
+#ifdef CHROMIUM_BOOT
+    /* Any op we still do not implement: SAY SO. Silent -EINVAL is how the
+     * above went unnoticed for the whole arc. */
+    { static int un; if (un < 24) { un++;
+        kprintf("[fxop] UNSUPPORTED futex op=%d (raw 0x%x) pid=%d addr=0x%lx\n",
+                cmd, op, caller->pid, (unsigned long)addr); } }
+#endif
     return -22; /* -EINVAL */
 }
 

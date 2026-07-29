@@ -594,6 +594,12 @@ int thread_detach(int tid);
  * Returns number of waiters woken (WAKE) or 0/-EAGAIN (WAIT). */
 #define FUTEX_WAIT         0
 #define FUTEX_WAKE         1
+/* Slice 59e: glibc's pthread_cond_broadcast requeues waiters from the condvar
+ * word to the mutex word with these. They used to fall through to -EINVAL, so
+ * a broadcast woke NOBODY and its waiters parked on an infinite futex forever
+ * (measured: the chrome renderer's main thread). See futex() in thread.c. */
+#define FUTEX_REQUEUE      3
+#define FUTEX_CMP_REQUEUE  4
 #define FUTEX_WAIT_BITSET  9   /* like WAIT but ABSOLUTE timeout (glibc timedwait) */
 #define FUTEX_WAKE_BITSET  10
 /* utimeout: user pointer to a struct timespec, or NULL for an infinite wait.
