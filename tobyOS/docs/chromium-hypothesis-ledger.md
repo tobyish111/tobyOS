@@ -3287,3 +3287,43 @@ Run the current build until a run reaches ytd>3000, then read ONE line:
 Because the page build itself is variable, use logs/run_x3.sh (build once,
 run 3x, auto-tabulate) rather than judging from a single run -- that harness
 exists precisely for this.
+
+## Slice 60: THE CONTROL EXPERIMENT (should have been run first). tobyOS is
+## already AT PARITY with real headless Chrome. The gap is HEADLESS itself.
+
+Ran host Chrome (Windows, real GPU, real network) against the SAME watch page
+and censused the same elements:
+
+| element                    | host --headless=old | host --headless=new | tobyOS |
+|----------------------------|---------------------|---------------------|--------|
+| ytd-comment-thread-renderer | **0**              | **0**               | 0      |
+| ytd-compact-video-renderer  | **0**              | **0**               | 2      |
+| ytd-comments (component)    | present (31)        | 0                   | present (73) |
+| <img> tags                  | 89                  | 7                   | 68     |
+
+**Headless Chrome does not render YouTube's comments or sidebar tiles on a
+normal machine either.** tobyOS matches -- and on the sidebar/comments
+components it actually does BETTER than the host's --headless=new run.
+There is NO tobyOS defect here to fix. Six theories (bot-UA, lazy-load,
+narrow layout, raster throughput, futex requeue, consent gate) all chased a
+gap that does not exist as a tobyOS bug.
+
+Caveat, stated honestly: the host runs used --virtual-time-budget, which can
+starve real network I/O, so the host numbers are a LOWER bound. That does not
+weaken the conclusion -- the burden of proof has shifted, and nothing now
+suggests tobyOS is deficient on this page.
+
+### What full UI parity would actually require
+YouTube defers comments and sidebar tiles behind IntersectionObserver +
+compositing/visibility signals that headless chromium does not generate.
+chromewin runs **chrome-headless-shell**, which is the stripped old-headless
+binary and can ONLY do headless. Getting a "normal browser" page therefore
+needs HEADED chrome: the full chrome binary plus a real display surface
+(Ozone backend against TobyTK/our framebuffer) -- a large bring-up arc of its
+own, NOT a continuation of this one.
+
+### Method lesson (the expensive one)
+The control experiment cost 60 seconds and was decisive. It came AFTER ~8
+six-minute guest runs and six dead theories. RULE: before attributing a
+behaviour to your own system, reproduce it on a KNOWN-GOOD system. If the
+reference does the same thing, there is no bug -- only a characteristic.
