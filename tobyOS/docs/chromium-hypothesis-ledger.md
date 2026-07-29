@@ -3129,3 +3129,38 @@ not a correctness bug, and the honest options are:
    (embed player, m.youtube.com) to quantify the gap.
 3. Increase capacity: real GPU raster (i915-lite path) is the structural fix
    and a large arc of its own.
+
+## Slice 59d: CORRECTION -- the renderer is NOT raster-bound. It is IDLE.
+
+The [prof] ring-3 sampler was already running in run 22 and I committed the
+throughput conclusion (99b43bb) WITHOUT reading it. It says the opposite:
+    73 intervals, 568 total ring-3 samples => 7.8 samples per ~3s interval.
+With 4 CPUs at ~1 kHz that is roughly 0.06% of ticks in userspace. A
+raster-bound renderer would show HUNDREDS of samples per interval. **chrome
+is not computing; it is waiting.** So "a modern watch page is more raster
+work than SwiftShader can finish" is WRONG and is hereby retracted.
+
+Why the bigger viewport still made things worse is then a different
+mechanism (more/larger frames + shared-memory IPC per update => more waiting
+per unit of progress), not more pixels of CPU raster.
+
+This is the FOURTH theory to die in this arc (bot-UA gating, lazy-loading,
+narrow layout, raster throughput). The pattern in every case: a plausible
+story adopted from one signal without checking a cheap instrument that was
+already in the tree. The instruments keep being right; the narratives keep
+being wrong.
+
+### What the evidence actually supports now
+- Userspace idle + page half-built + data plane 200 OK => chrome's renderer
+  is blocked waiting for something the browser/GPU process owes it, in the
+  same FAMILY as the slice-56 wake bugs but NOT cured by them.
+- Concretely to measure NEXT, in this order:
+  1. Which thread is the page blocked behind? The [wait]/[cur] dump is
+     already per-thread; filter it to the RENDERER pid only, at a moment
+     when blen has stopped growing, and name the syscall + fd + duration.
+  2. Is the compositor/GPU side starving it? --in-process-gpu means raster
+     and GL live in the browser process; check whether the GPU thread is
+     itself blocked (same dump, gpu pid).
+  3. Only if both look healthy, revisit IPC latency (the Mojo channel
+     round-trip time under load) -- measurable by timestamping a CDP
+     Runtime.evaluate round trip while the page is stalled vs idle.
