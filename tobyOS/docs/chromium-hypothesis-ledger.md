@@ -3050,3 +3050,41 @@ SCOPE NOTE: "YouTube like a normal browser" (populated thumbnails, sidebar
 tiles, comments, click-through navigation) is a multi-slice arc, not a
 follow-on to the playback work. The playback arc is DONE and verified
 (3/3 runs HAVE_ENOUGH_DATA, 20-24s buffered, decoded frames painted).
+
+## Slice 59b (2026-07-28): scroll FIXED (real wheel input), and that DISPROVES
+## the lazy-loading explanation: thumbnails/tiles/comments still do not render
+
+Run 19 discriminators (the split that was missing):
+- **sy=0 after 8 window.scrollBy calls** -- the injected JS scroll NEVER took
+  effect (YouTube's app owns the scroll). So slice 59's "scrolling did not
+  help" was measuring a scroll that never happened.
+- **thumb=18** -- i.ytimg.com thumbnail fetches ARE issued.
+- **api=3 ok=3 bad=0** -- /youtubei/v1/next (which supplies related-video
+  tiles AND comment data) SUCCEEDS every time.
+FIX: replaced injected JS with a real Input.dispatchMouseEvent mouseWheel
+(the same Input domain the window host already uses for user input), and the
+probe now reads max(window.scrollY, scrollingElement.scrollTop).
+
+Run 20 result -- the scroll WORKS (sy reached 1200 then 2357; the trailing
+sy=0 is by design, scrolling back up for screenshots). But at FULL scroll
+depth the page is still:
+    imgs=2/78 decoded   tiles=2   cmt=0   meta=23M views
+**So lazy-loading is NOT the explanation.** With fetches issued, the API
+answering 200, and the viewport actually moved, 76 of 78 images still never
+decode and the related/comment sections never render.
+
+Where that points (NOT yet measured -- do not guess further):
+1. Do the ytimg fetches COMPLETE? We count requests, not responses. Add
+   ytimg response-status + loadingFinished counting -- one edit. If they
+   never finish, it is a transport/connection-reuse problem; if they finish
+   200 and still do not decode, it is chrome's image decode/raster path
+   (SwiftShader software raster, --num-raster-threads=2) starving.
+2. tiles=2 with a 200 OK from /next is a RENDER gap, not a data gap: the
+   renderer is not turning the API response into DOM. Same suspect as (1):
+   renderer main-thread/raster starvation under this workload.
+Both point at the same next question -- is the renderer keeping up? -- which
+is measurable with the ring-3 profiler already in the tree.
+
+STATUS: video playback = DONE. YouTube UI parity = genuinely unfinished, now
+with the first two false explanations (bot-UA gating, lazy-loading) removed
+and the search narrowed to renderer throughput.

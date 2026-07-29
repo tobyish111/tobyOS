@@ -439,14 +439,26 @@ static void request_screenshot(void) {
  * Media URLs are the chatty part of a watch page, so only those are logged
  * individually; everything else is counted. */
 static int g_req_total, g_req_media, g_resp_media, g_fail_total, g_fin_media;
+/* Slice 59b: the page-richness data plane. thumb = i.ytimg.com fetches
+ * (thumbnail images -- are they even ISSUED?); api = /youtubei/ calls (the
+ * `next` API delivers related-video tiles AND comment metadata; if it never
+ * completes, tiles=2/cmt=0 is a DATA problem, not a rendering one). */
+static int g_req_thumb, g_req_api, g_resp_api_ok, g_resp_api_bad;
 
 static void note_network_event(void) {
     static char url[160], err[96];
 
     if (strstr(g_msg, "\"Network.requestWillBeSent\"")) {
         g_req_total++;
-        if (json_str(g_msg, "url", url, sizeof url) > 0 &&
-            (strstr(url, "videoplayback") || strstr(url, "googlevideo"))) {
+        if (json_str(g_msg, "url", url, sizeof url) <= 0) return;
+        if (strstr(url, "ytimg.com")) { g_req_thumb++; return; }
+        if (strstr(url, "/youtubei/")) {
+            g_req_api++;
+            if (g_req_api <= 8)
+                printf("[net] API REQ #%d: %.100s\n", g_req_api, url);
+            return;
+        }
+        if (strstr(url, "videoplayback") || strstr(url, "googlevideo")) {
             g_req_media++;
             /* Slice 58b: is the URL WE LOG actually what chrome sent, or an
              * artifact of our own CDP reassembly? A media URL's expire= is
@@ -487,8 +499,16 @@ static void note_network_event(void) {
         return;
     }
     if (strstr(g_msg, "\"Network.responseReceived\"")) {
-        if (json_str(g_msg, "url", url, sizeof url) > 0 &&
-            (strstr(url, "videoplayback") || strstr(url, "googlevideo"))) {
+        if (json_str(g_msg, "url", url, sizeof url) <= 0) return;
+        if (strstr(url, "/youtubei/")) {
+            int ast = json_int(g_msg, "status");
+            if (ast >= 200 && ast < 300) g_resp_api_ok++;
+            else                          g_resp_api_bad++;
+            if (g_resp_api_ok + g_resp_api_bad <= 8)
+                printf("[net] API RESP status=%d %.80s\n", ast, url);
+            return;
+        }
+        if (strstr(url, "videoplayback") || strstr(url, "googlevideo")) {
             g_resp_media++;
             /* Slice 58b: tag rid + the response's OWN expire so a 403 can be
              * paired to the exact URL (and its expire) that earned it. */
@@ -715,7 +735,15 @@ static void probe_page(void) {
              "+' cmt='+document.querySelectorAll("
                         "'ytd-comment-thread-renderer,#content-text').length"
              "+' meta='+((document.body.innerText.match("
-                        "/[0-9.,]+[KM]? views/)||['-'])[0]).slice(0,12);})()\","
+                        "/[0-9.,]+[KM]? views/)||['-'])[0]).slice(0,12)"
+             /* Slice 59b: sy proves whether our injected scroll ever took
+              * effect (YouTube may scroll an inner container; sy=0 after 8
+              * scrollBy calls = the scroll never happened at document level). */
+             /* Read the REAL scroll offset: on YouTube the scrolling element
+              * is not always window (run 19 read sy=0 while the app scrolled
+              * its own container), so take the max of both views. */
+             "+' sy='+Math.max(window.scrollY,"
+                      "(document.scrollingElement||document.body).scrollTop);})()\","
              "\"returnByValue\":true}", 1);
 }
 
@@ -993,10 +1021,20 @@ int main(void) {
             if (scrolls < 8 && nows >= next_scroll) {
                 scrolls++;
                 next_scroll = nows + 4000;
-                cdp_send("Runtime.evaluate",
-                         scrolls < 7
-                           ? "{\"expression\":\"window.scrollBy(0,700)\"}"
-                           : "{\"expression\":\"window.scrollTo(0,0)\"}", 1);
+                /* Slice 59b: REAL wheel input, not injected JS. Run 19 proved
+                 * the JS route did nothing (sy=0 after 8 window.scrollBy
+                 * calls) -- YouTube's app owns the scroll, so a synthetic
+                 * mouseWheel through the same Input domain the window host
+                 * already uses is both effective and faithful to "what a
+                 * normal browser does". Negative deltaY at the end scrolls
+                 * back up so the player is on screen for the screenshots. */
+                char sp[192];
+                snprintf(sp, sizeof sp,
+                         "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
+                         "\"deltaX\":0,\"deltaY\":%d,\"modifiers\":0}",
+                         PAGE_W / 2, PAGE_H / 2,
+                         scrolls < 7 ? 600 : -4200);
+                cdp_send("Input.dispatchMouseEvent", sp, 1);
             }
         }
 
@@ -1010,10 +1048,12 @@ int main(void) {
                 probes++;
                 printf("[chromewin] probe #%d at %lds: frames=%d "
                        "net{req=%d media=%d resp=%d fin=%d fail=%d} "
+                       "rich{thumb=%d api=%d ok=%d bad=%d} "
                        "cdpdrop{n=%ld mid=%ld}\n",
                        probes, (long)((sys_clock_ms() - t0) / 1000), g_frames,
                        g_req_total, g_req_media, g_resp_media,
                        g_fin_media, g_fail_total,
+                       g_req_thumb, g_req_api, g_resp_api_ok, g_resp_api_bad,
                        g_drop_events, g_drop_midmsg);
                 probe_page();
             }
