@@ -543,6 +543,7 @@ static void note_network_event(void) {
  * the whole scroll tour completed against a half-built page, ended back at
  * the top, and nothing ever lazy-loaded again). */
 static int  g_p_sy = -1, g_p_ytd = -1, g_p_sh = -1, g_p_th = -1;
+static int  g_p_thtop = -9999;           /* slice 61f: first thread's rect.top */
 static long g_p_seq;                     /* bumps on every parsed probe reply */
 
 static int probe_num(const char *key) {  /* " sy=" -> value, -1 if absent */
@@ -569,10 +570,11 @@ static void cdp_dispatch(void) {
     if (strstr(g_msg, "tobyprobe") || strstr(g_msg, "ladder") ||
         strstr(g_msg, "\"error\"")) {
         if (strstr(g_msg, "tobyprobe")) {
-            g_p_sy  = probe_num(" sy=");
-            g_p_ytd = probe_num(" ytd=");
-            g_p_sh  = probe_num(" sh=");
-            g_p_th  = probe_num(" th=");
+            g_p_sy    = probe_num(" sy=");
+            g_p_ytd   = probe_num(" ytd=");
+            g_p_sh    = probe_num(" sh=");
+            g_p_th    = probe_num(" th=");
+            g_p_thtop = probe_num(" thTop=");   /* negative values matter */
             g_p_seq++;
         }
         char line[800];
@@ -866,6 +868,15 @@ static void probe_page(void) {
              "+' cmTop='+(function(c){return c?"
                       "c.getBoundingClientRect().top|0:-9999})"
                       "(document.querySelector('ytd-comments'))"
+             /* Slice 61f: thTop = viewport-relative top of the FIRST
+              * rendered comment thread. ytd-comments has a ZERO rect even
+              * with 20 threads visible (host too), so it cannot be used for
+              * aiming; the thread element itself has real geometry. PARK
+              * uses this to bring the threads on screen for the visual
+              * capture. -9999 = no thread rendered yet. */
+             "+' thTop='+(function(t){return t?"
+                      "t.getBoundingClientRect().top|0:-9999})"
+                      "(document.querySelector('ytd-comment-thread-renderer'))"
              /* Slice 61b: MEASURE the rendering lifecycle instead of
               * inferring it. Run 1 of slice 61 sat at the true bottom of a
               * fully-built page (sy=2339/sh=2939, lk=20, cti=3, vis=1 foc=1,
@@ -1236,7 +1247,7 @@ int main(void) {
         {
             static int  phase;          /* 0 wait-build 1 down 2 dwell 3 cruise 4 done */
             static long next_act, dwell_until, seen_seq;
-            static int  last_sy = -2, wheels, poked;
+            static int  last_sy = -2, wheels, poked, stuck;
             long nowc = sys_clock_ms();
             char sp[160];
             switch (phase) {
@@ -1295,6 +1306,30 @@ int main(void) {
                 }
                 break;
             case 3:                     /* page grows as comments load: nudge on */
+                /* Slice 61f: the moment threads exist, stop touring and go
+                 * PARK them on screen -- the visual-capture phase. */
+                if (g_p_th > 0) {
+                    phase = 5; next_act = nowc;
+                    printf("[chromewin] scroll: th=%d thTop=%d -> PARK\n",
+                           g_p_th, g_p_thtop);
+                    break;
+                }
+                if (g_p_seq != seen_seq) {
+                    seen_seq = g_p_seq;
+                    /* Slice 61f: JIGGLE. The 61e batch's one th=0 run sat
+                     * pinned at the true bottom (sy unchanged probe after
+                     * probe) with the page never growing -- the trigger
+                     * simply never fired. Direction CHANGES generate fresh
+                     * IntersectionObserver deliveries and scroll-listener
+                     * work in a way same-direction wheels at a pinned
+                     * bottom cannot (they move nothing). So once stuck,
+                     * alternate up/down passes to sweep the trigger region
+                     * repeatedly instead of pressing uselessly into the
+                     * bottom stop. */
+                    if (g_p_sy > 0 && g_p_sy == last_sy) stuck++;
+                    else stuck = 0;
+                    last_sy = g_p_sy;
+                }
                 if (nowc >= next_act) {
                     /* Slice 61e: 900px/6s (was 600/8). Run-1-vs-run-2 of the
                      * 61d batch: the ONLY discriminator between th=0 and
@@ -1306,10 +1341,12 @@ int main(void) {
                      * banked earlier in the run, and a playing video layer
                      * re-starves the idle scheduler that builds comments. */
                     next_act = nowc + 6000;
+                    wheels++;
                     snprintf(sp, sizeof sp,
                              "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
-                             "\"deltaX\":0,\"deltaY\":900,\"modifiers\":0}",
-                             PAGE_W / 2, PAGE_H / 2);
+                             "\"deltaX\":0,\"deltaY\":%d,\"modifiers\":0}",
+                             PAGE_W / 2, PAGE_H / 2,
+                             (stuck > 0 && (wheels & 1)) ? -700 : 900);
                     cdp_send("Input.dispatchMouseEvent", sp, 1);
                     cdp_send("Runtime.evaluate",
                              "{\"expression\":\"var v=document."
@@ -1342,6 +1379,54 @@ int main(void) {
                              "\"userGesture\":true}", 1);
                     phase = 4;
                     printf("[chromewin] scroll: -> TOP (th=%d)\n", g_p_th);
+                }
+                break;
+            case 5:                     /* PARK: threads on screen, hold still */
+                /* Slice 61f: the visual-capture phase. Threads exist in the
+                 * DOM; bring the FIRST one to ~120px from the viewport top
+                 * and then hold. The page is static and the video paused, so
+                 * per-frame raster is cheap and the heartbeat's 100ms damage
+                 * keeps screencast frames flowing -- the display catches up
+                 * with the DOM within seconds instead of minutes, and the
+                 * runner's parked-window screendumps photograph real
+                 * comment threads. Re-aim at most once per probe (the page
+                 * can still grow above us and shift the threads); re-pause
+                 * the video each pass (an app-initiated resume would bring
+                 * the raster load right back). */
+                if (g_p_seq != seen_seq) {
+                    seen_seq = g_p_seq;
+                    /* Slice 61f2: HALVING controller, every probe. The first
+                     * park run measured wheel gain ~1.8x (asked -2909px,
+                     * moved ~5281) and the single full-delta aim overshot
+                     * past the threads; aiming half the measured error each
+                     * probe converges under any gain < 2 and rides out the
+                     * page growing/shifting underneath. */
+                    int dy = (g_p_thtop - 120) / 2;
+                    if (g_p_thtop != -9999 && (dy > 250 || dy < -250)) {
+                        if (dy >  4000) dy =  4000;
+                        if (dy < -4000) dy = -4000;
+                        snprintf(sp, sizeof sp,
+                                 "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
+                                 "\"deltaX\":0,\"deltaY\":%d,\"modifiers\":0}",
+                                 PAGE_W / 2, PAGE_H / 2, dy);
+                        cdp_send("Input.dispatchMouseEvent", sp, 1);
+                        printf("[chromewin] scroll: PARK re-aim dy=%d "
+                               "(thTop=%d)\n", dy, g_p_thtop);
+                    }
+                    cdp_send("Runtime.evaluate",
+                             "{\"expression\":\"var v=document."
+                             "querySelector('video');if(v&&!v.paused)"
+                             "v.pause();'tobyrepause'\"}", 1);
+                }
+                if (nowc > t0 + 300000) {           /* resume for the finale */
+                    cdp_send("Runtime.evaluate",
+                             "{\"expression\":\"var v=document."
+                             "querySelector('video');if(v){v.muted=true;"
+                             "v.play&&v.play();}'tobyresume'\","
+                             "\"userGesture\":true}", 1);
+                    phase = 4;
+                    printf("[chromewin] scroll: PARK done (th=%d) -> "
+                           "resume, hold position\n", g_p_th);
                 }
                 break;
             default: break;

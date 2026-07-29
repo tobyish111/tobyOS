@@ -561,8 +561,23 @@ long sys_munmap(uint64_t addr, uint64_t len) {
                 tail->flags  = v->flags;
                 tail->fd     = v->fd;
                 tail->offset = v->offset;
+                v->end = addr;
+            } else {
+                /* Slice 61f: table full mid-split. The old code shrank v
+                 * ANYWAY, silently dropping VMA coverage of [addr+len, end)
+                 * while its PTEs stayed present -- the exact "[pfrej] NO
+                 * VMA (present PTE)" wild-access signature of the slice-57
+                 * jumps and the 61d renderer-startup flake. Keep v spanning
+                 * the hole instead: the hole's frames are already freed, so
+                 * a later touch demand-faults a fresh zero page (harmless
+                 * for ANON) instead of the process losing a live range.
+                 * Loud on purpose -- this only fires under real VMA
+                 * pressure and must name itself in the serial log. */
+                kprintf("[mmap] WARN: munmap mid-split at FULL table -- "
+                        "keeping [0x%lx,0x%lx) spanned (hole 0x%lx+0x%lx)\n",
+                        (unsigned long)v->start, (unsigned long)v->end,
+                        (unsigned long)addr, (unsigned long)len);
             }
-            v->end = addr;
         }
     }
 
@@ -743,8 +758,16 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
             v->end = rstart;                      /* v keeps oldprot */
         } else {                                  /* covers a middle sub-range */
             struct mmap_vma *mid  = vma_alloc(vt);
-            struct mmap_vma *tail = vma_alloc(vt);
-            if (!mid || !tail) { v->prot = prot; continue; }
+            struct mmap_vma *tail = mid ? vma_alloc(vt) : NULL;
+            if (!mid || !tail) {
+                /* Slice 61f: roll back a half-done alloc pair. vma_alloc
+                 * bumps count and returns an UNINITIALIZED slot (stale
+                 * range from an earlier vma_remove swap); abandoning mid
+                 * here left that garbage entry LIVE in the table, able to
+                 * shadow arbitrary address ranges on later lookups. */
+                if (mid && !tail) vt->count--;
+                v->prot = prot; continue;
+            }
             v = &vt->entries[i];
             mid->start  = rstart; mid->end  = rend; mid->prot  = prot;
             mid->flags  = v->flags; mid->fd = v->fd; mid->offset = v->offset;

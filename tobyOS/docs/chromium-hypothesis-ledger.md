@@ -3510,3 +3510,47 @@ not a reproducible tobyOS defect class. Screencast frames lag the DOM by
 minutes at this raster rate: screenshots show the player UI (controls,
 scrubber, duration) but comment-region visual capture needs the pipeline to
 catch up while deep -- DOM census is the ground truth for this arc.
+
+## Slice 61f: the polish pass -- PARK visual capture, stuck-bottom jiggle,
+## and the VMA silent-drop bug that explains the startup flake.
+
+1. **PARK (visual capture) works.** New probe field thTop (first rendered
+   thread's rect.top -- ytd-comments has a zero rect even when 20 threads
+   are visible, host included, so it cannot aim). When CRUISE sees th>0 it
+   parks: aims the first thread toward the viewport, holds still, keeps the
+   video paused (re-pause each pass; app resumes re-starve the idle
+   scheduler). Validated live: `th=20 thTop=-2789 -> PARK`, re-aim fired,
+   threads stayed rendered (th=20 cti=19). Measured wheel gain ~1.8x
+   (asked -2909px, moved ~5281) overshot the single full-delta aim -- now a
+   HALVING controller (dy=(thTop-120)/2 per probe), which converges under
+   any gain < 2. First-ever DEEP-PAGE visual: related-video tiles rendered
+   on screen with full metadata (titles, channels, "24M views - 5 years
+   ago", duration badges) -- wat_f of the single validation run.
+2. **Jiggle**: once pinned at the bottom with th=0 (sy unchanged across
+   probes), CRUISE alternates -700/+900 wheels -- direction changes
+   re-fire IntersectionObserver deliveries; same-direction wheels at a
+   pinned bottom move nothing.
+3. **VMA silent-drop FIXED (the [pfrej] NO-VMA flake).** sys_munmap's
+   middle-split shrank v->end even when the tail vma_alloc FAILED --
+   silently dropping VMA coverage of [addr+len, old_end) while its PTEs
+   stayed present: exactly the "present PTE, NO VMA" wild-access signature
+   (slice-57 class; the 61d startup flake). Now the VMA is kept spanning
+   the hole (freed frames demand-fault back as zero pages -- harmless for
+   ANON) and it logs loudly. Also fixed: mprotect's middle-split abandoned
+   a half-allocated `mid` entry on tail-alloc failure, leaving an
+   UNINITIALIZED (stale-range) VMA live in the table; now rolled back.
+4. **Harness hardening after a stale-flavor incident**: defboot.sh
+   recompiles kernel.c STOCK and rewrites tobyOS.iso; a lingering QEMU held
+   the ISO lock, build_vid's make failed SILENTLY (tail-2'd output), and a
+   full 3-run batch executed on the stock ISO (pid1=hello-boot, zero
+   chromewin) before anything noticed. Now: build_vid fails loudly + checks
+   the ISO exists, run_x3 aborts on build failure, defboot re-touches
+   kernel.c and prints a STOCK-ISO warning.
+
+Context for the evening batches: YouTube service to this IP degraded after
+~15 runs (403s returned, buffered halved to b24, one run's ric frozen at 1
+until 270s despite the pause -- build barely started before the clock ran
+out). th-rate is currently gated by that variance, not by tobyOS: when the
+page builds, sidebar+tiles populate every time, and the one th>0 run
+parked+held exactly as designed. Re-measure fresh (different hour or
+alternate watch URL) before drawing any rate conclusions.

@@ -15,9 +15,13 @@ PORT = 4464
 # from ~guest 70s and only returns to the top at guest 280s, so mid-run shots
 # show the comments/sidebar region (the visual proof this arc needs) and the
 # final shot shows the player again after the return-to-top.
+# Slice 61f: g/h added inside the PARK window (chromewin parks the rendered
+# comment threads on screen from ~guest 170s and holds; runner time runs
+# ~35-40s ahead of guest). Four chances at a comments-visible frame.
 SHOTS = [(72, "logs/wat_a.png"), (80, "logs/wat_b.png"),
          (88, "logs/wat_c.png"), (150, "logs/wat_d.png"),
-         (240, "logs/wat_e.png"), (330, "logs/wat_f.png")]
+         (240, "logs/wat_e.png"), (270, "logs/wat_g.png"),
+         (305, "logs/wat_h.png"), (330, "logs/wat_f.png")]
 TOTAL = 360
 
 

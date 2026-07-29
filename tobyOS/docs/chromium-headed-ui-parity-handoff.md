@@ -133,17 +133,24 @@ thread text, sidebar `lk` populated (ALREADY TRUE), thumbnails decoding
 headless=old host control, which IS the correct reference (headed adds
 nothing without a real display).
 
-Status: **ACHIEVED at 2/3-of-batch level (slice 61e).** Sidebar done;
-volume + idle-starvation kernel/choreography causes fixed; comments render
-with real text on the majority of runs; video healthier than ever
-(b59.1 record, zero crashes/403s on the warm-profile batch). Remaining
-polish, in order of value: (a) the ~1/3 no-trigger variance (consider a
-second pause+deep-dwell cycle late in the run, or alternating watch URLs);
-(b) visual comment capture — screencast lags the DOM by minutes under
-raster load; a targeted captureScreenshot while parked deep (after th>0 is
-observed) would photograph the threads; (c) the renderer-startup flake
-([pfrej] NO-VMA writes → clean renderer exit, 2× in cold-profile runs only
-— possibly the slice-57 VMA class; it has not recurred warm); (d) raster
-throughput itself (~0.25 main-frames/s with video playing) — the real
-ceiling on everything visual; an i915/GPU path or SwiftShader tuning is the
-long-term lever.
+Status: **ACHIEVED at 2/3-of-batch level (slice 61e); polish landed (61f).**
+Sidebar done; volume + idle-starvation causes fixed; comments render with
+real text whenever YouTube serves a full page and the run reaches depth.
+Slice 61f landed all four polish items: (a) stuck-bottom JIGGLE (alternate
+-700/+900 wheels once pinned with th=0); (b) PARK — on th>0 the run stops
+touring, aims the first thread via the `thTop` probe field (HALVING
+controller, dy=(thTop-120)/2 per probe; measured wheel gain ~1.8x overshot
+a full-delta aim) and holds with the video paused; validated live (th=20
+held through PARK; first-ever deep-page visual: related tiles with full
+metadata on screen); (c) the [pfrej] NO-VMA startup flake's mechanism FOUND
+AND FIXED — sys_munmap's middle-split dropped VMA coverage silently when
+vma_alloc failed (now kept-spanned + loud), plus an mprotect stale-`mid`
+rollback; (d) raster throughput unchanged — still the ceiling, and the
+reason comment PIXELS haven't landed on a QMP screenshot yet (the screencast
+lags the DOM by minutes under load; parked frames show earlier regions).
+Harness hardening after a stale-flavor incident: build_vid fails loudly,
+run_x3 aborts on build failure, defboot warns + re-touches kernel.c (it
+rewrites tobyOS.iso STOCK — always rebuild flavored before a batch).
+Evening note: after ~15 runs/day YouTube degrades service to this IP (duds,
+403s, halved buffers, slow builds) — measure th-rates in the morning or on
+alternate watch URLs before concluding anything from a bad batch.
