@@ -443,7 +443,7 @@ static int g_req_total, g_req_media, g_resp_media, g_fail_total, g_fin_media;
  * (thumbnail images -- are they even ISSUED?); api = /youtubei/ calls (the
  * `next` API delivers related-video tiles AND comment metadata; if it never
  * completes, tiles=2/cmt=0 is a DATA problem, not a rendering one). */
-static int g_req_thumb, g_req_api, g_resp_api_ok, g_resp_api_bad;
+static int g_req_thumb, g_req_api, g_resp_api_ok, g_resp_api_bad, g_req_cont;
 
 static void note_network_event(void) {
     static char url[160], err[96];
@@ -454,8 +454,15 @@ static void note_network_event(void) {
         if (strstr(url, "ytimg.com")) { g_req_thumb++; return; }
         if (strstr(url, "/youtubei/")) {
             g_req_api++;
+            /* Slice 59g: is a COMMENT/sidebar CONTINUATION ever requested?
+             * Comments arrive via a continuation POST, not the initial /next.
+             * Zero continuations after scrolling => the app chose not to ask
+             * (client/session context), which is a different problem from
+             * "asked and got nothing". */
+            if (strstr(url, "continuation") || strstr(url, "/next")) g_req_cont++;
             if (g_req_api <= 8)
-                printf("[net] API REQ #%d: %.100s\n", g_req_api, url);
+                printf("[net] API REQ #%d cont=%d: %.90s\n",
+                       g_req_api, g_req_cont, url);
             return;
         }
         if (strstr(url, "videoplayback") || strstr(url, "googlevideo")) {
@@ -763,10 +770,28 @@ static void probe_page(void) {
              "+' cmt2='+(document.querySelector('ytd-comments')?"
                       "document.querySelector('ytd-comments')"
                       ".querySelectorAll('*').length:-1)"
-             "+' gate='+(document.querySelectorAll("
+             /* Slice 59g: VISIBILITY, not presence. The old form counted
+              * tp-yt-paper-dialog, which YouTube ships HIDDEN on every page,
+              * so gate=1 was a false positive that sent me chasing consent
+              * cookies. Only count elements actually laid out on screen. */
+             "+' gate='+[].filter.call(document.querySelectorAll("
                       "'ytd-consent-bump-v2-lightbox,tp-yt-paper-dialog,"
-                      "form[action*=consent],[aria-label*=\\\"sign in\\\" i]')"
-                      ".length)"
+                      "form[action*=consent]'),"
+                      "function(e){return e.offsetParent!==null&&"
+                      "e.getClientRects().length>0;}).length"
+             /* Let chrome SAY what these regions contain instead of me
+              * inferring it from counts: a spinner, a placeholder, an error
+              * or real text each name the state outright. */
+             /* Delimit with <> not quotes: run 26's \" escaping terminated
+              * the JSON string and truncated the whole field to `secTxt=\`.
+              * Also strip any quote from the text itself for the same reason. */
+             "+' secTxt=<'+((document.querySelector("
+                      "'ytd-watch-next-secondary-results-renderer')||{})"
+                      ".innerText||'-').replace(/[\\\\s\\\"]+/g,' ')"
+                      ".slice(0,60)+'>'"
+             "+' cmtTxt=<'+((document.querySelector('ytd-comments')||{})"
+                      ".innerText||'-').replace(/[\\\\s\\\"]+/g,' ')"
+                      ".slice(0,60)+'>'"
              "+' ytd='+document.querySelectorAll("
                       "'[class*=ytd-],ytd-app *').length;})()\","
              "\"returnByValue\":true}", 1);

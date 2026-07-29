@@ -3232,3 +3232,33 @@ they cost nothing.
    /youtubei/v1/next continuations AFTER scroll (we count /next calls, but
    not which are continuations). Zero after scrolling => the app decided not
    to ask, which points back at client context (consent/session), not at us.
+
+## Slice 59g: consent theory DEAD (gate=0), and the regions report EMPTY
+## innerText -- i.e. present in the DOM but NOT LAID OUT
+
+- **gate=0** once the detector tests VISIBILITY (offsetParent + client rects)
+  instead of presence. The earlier gate=1 was my own selector matching
+  `tp-yt-paper-dialog`, which YouTube ships hidden on every page. SIXTH dead
+  theory; the consent cookies are kept (a real session carries them) but they
+  fixed nothing.
+- **secTxt=<-> cmtTxt=<->**: both regions return EMPTY innerText while
+  sec=4 children and cmt2=73 descendants exist. innerText is LAYOUT-aware --
+  it returns '' for subtrees that are not rendered. So the sidebar and the
+  comments component are in the DOM but NOT LAID OUT.
+
+### The one measurement that splits this (do it first)
+`textContent` vs `innerText` on the same two elements:
+- textContent NON-EMPTY + innerText empty => the DATA IS THERE and only
+  layout/visibility is missing => a rendering/CSS/visibility problem on our
+  side (or YouTube deliberately hiding a collapsed region at this viewport).
+- BOTH empty => the containers are empty shells => the payload was never
+  filled => back to the data/continuation path (cont=1 was observed, so at
+  most one continuation ever fires).
+Add both to the probe; it is a two-line change and it decides the direction.
+
+### Process note for whoever continues
+Six theories have now died here (bot-UA, lazy-load, narrow layout, raster
+throughput, futex requeue, consent gate) and TWO of them died because MY OWN
+PROBE was wrong (BOGUS-EXPIRE flagged URLs with no expire=; gate flagged
+hidden dialogs). Before trusting any new probe field, sanity-check it against
+a case where you KNOW the answer.
