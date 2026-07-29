@@ -3327,3 +3327,129 @@ The control experiment cost 60 seconds and was decisive. It came AFTER ~8
 six-minute guest runs and six dead theories. RULE: before attributing a
 behaviour to your own system, reproduce it on a KNOWN-GOOD system. If the
 reference does the same thing, there is no bug -- only a characteristic.
+
+## Slice 61: RETRACT the slice-60 ceiling. Headless CAN render comments +
+## sidebar -- the slice-60 control was wrong in TWO measurable ways.
+
+Re-ran the host control the way §4.1 of the handoff demanded: NO
+--virtual-time-budget, ~60-90s real wall clock, real CDP mouseWheel input
+(the same Input.dispatchMouseEvent chromewin sends), probes via
+Runtime.evaluate instead of --dump-dom. Full matrix, same watch page
+(aqz-KE-bpKQ), host Chrome 15x on Windows:
+
+| mode                        | vis     | foc  | threads | lockup | imgs   | ytd  |
+|-----------------------------|---------|------|---------|--------|--------|------|
+| headless=old + wheel scroll | visible | 0->1 | **20**  | 20     | 37/92  | 8291 |
+| headless=new + wheel scroll | visible | 0->1 | **20**  | 20     | 34/83  | 7353 |
+| headless=old, JS poke only  | visible | 0    | 0       | 20     | 1/66   | 3773 |
+| headless=old, tobylike tour | visible | 0->1 | **20**  | 20     | 39/88  | 7378 |
+| headed, window HIDDEN       | hidden  | 1    | 0       | 3      | 1/30   | 2466 |
+
+Where slice 60 went wrong (both were MY measurement bugs, prime directive 3):
+1. **--virtual-time-budget starved the scroll-driven phase entirely** (and
+   slice 60 never scrolled). Comments are only REQUESTED after real scroll
+   input reaches the continuation region; virtual time expires the budget
+   before any of that can happen.
+2. **Counted OBSOLETE element names.** Modern YouTube renders sidebar tiles
+   as `yt-lockup-view-model` (host shows 20 while `ytd-compact-video-
+   renderer` shows 0 on a FULLY-WORKING page), and comment threads render
+   OUTSIDE the measured `ytd-comments` box (cmtH=0 with 20 threads visible).
+   The slice-59g "sidebar EMPTY innerText" reading suffers the same problem.
+
+What the matrix PROVES:
+- **Route B (headed chrome + Ozone X11) is NOT required.** headless=old --
+  the exact engine flavor tobyOS runs -- reaches full population. A headed
+  chrome whose window is hidden/occluded is THROTTLED BELOW headless (ytd
+  2466, wheel dispatches never even ack) -- headed would be a REGRESSION
+  without a real visible display.
+- **The §3A JS observer poke is dead**: scrollIntoView + synthetic scroll +
+  forced reflow, with ytd-comments AT viewport top (cmTop=0), renders zero
+  threads even on the host. Only REAL wheel input through the Input domain
+  triggers the continuation machinery (consistent with slice 59b).
+- **Focus emulation matters**: foc flips 0->1 on the first real wheel and
+  continuations fire only at foc=1 (poke mode stayed foc=0, got nothing).
+- **The r0 player reset reproduces ON THE HOST** after the -4200 up-scroll
+  (post-scroll probes read vid=r0 t0.0 p1 in old, new AND tobylike modes).
+  The slice-57 "player resets to r0" remainder is at least partly an
+  artifact of our own scroll choreography, not a tobyOS defect.
+
+Why tobyOS still showed cmt=0 (the actual remaining gap): run-27 probes show
+the SPA finishes building at ~40s guest time (ytd 137 at 30s -> ~3700 by
+40s), but the slice-59 scroll tour ran on a FIXED schedule at 25-53s -- it
+toured a half-built page, ended with the -4200 return-to-top, and never
+scrolled again; at sy=0 nothing below the fold can lazy-load, so the page
+froze at imgs=10/65 cmt=0 with only cont=1 (the initial /next) for 300s.
+The host 'tobylike' run does NOT freeze only because the host app is fully
+built BEFORE 25s -- the tour's at-depth window lands on live observers.
+
+### Slice 61 implementation (chromewin)
+- Probe grown with the CORRECT metrics: th (comment threads), lk (lockup
+  tiles), cti (continuation items), sh (scrollHeight), vis/foc, cmTop; CDP
+  print cap 300 -> 800 (the old cap was silently truncating the probe tail).
+- Probe replies are now PARSED (g_p_sy/ytd/sh/th) and drive a scroll state
+  machine: WAIT-BUILD (ytd>=1500) -> DOWN (600px/4s until sy plateaus) ->
+  DWELL 30s at bottom -> CRUISE (nudge 600px/8s as the page grows; one
+  late §3A poke at 180s as belt-and-braces) -> TOP at 280s for screenshots.
+- Emulation.setFocusEmulationEnabled at bootstrap.
+- run_watch.py: two extra screenshots (240s, 330s runner) to capture the
+  comments region while dwelling and the player after return-to-top;
+  run_x3.sh tabulates th/lk/cti/sy.
+
+## Slice 61b: the heartbeat experiment. Lifecycle starvation CONFIRMED, then
+## traced to a DETERMINISTIC freeze -- raf stops at exactly 705, both runs.
+
+Instrumented the rendering lifecycle directly (probe fields raf/io/hb) and
+injected a PRESENTATION HEARTBEAT: a 2x2 fixed div whose background toggles
+every 100ms via setInterval. Each toggle dirties style -> forces a real
+BeginMainFrame -> IntersectionObserver delivery, lazy image decode and
+YouTube's continuation trigger all get their delivery cycle. (First build of
+the probe had a missing close-paren -- the whole expression compiled to a
+SyntaxError, killing probe + state machine + heartbeat at once, and the run
+produced NOTHING. logs/check_probe.py now extracts the JS out of the C
+literals and node --checks it; run it after EVERY probe edit.)
+
+Result, identical across two runs:
+    raf = 0 -> 154 -> 440 -> 686 -> 705 -> FROZEN forever
+    io  = fired1 (observer delivery works while the lifecycle runs)
+    screencast frames freeze at the SAME probe as raf (14 in both runs)
+    network keeps flowing all along (req 305->310+ after the freeze)
+The lifecycle ran fine at ~25 rAF/s under the heartbeat, then the ENTIRE
+frame pipeline (main frames + compositor + captureScreenshot) stopped at
+raf=705 exactly, twice. Deterministic => resource exhaustion, not a race.
+
+## Slice 61c: ROOT CAUSE -- /data was a 4 MiB, 256-inode tobyfs. Chrome
+## filled it in ~20s; every create after that failed; the EACCES was a LIE.
+
+The chain, each link verified:
+1. disk.img was 16 MiB, but host mkfs_tobyfs stamps a FIXED 4 MiB / 256-inode
+   tobyfs (TFS_TOTAL_BLOCKS constants) -- /data was 4 MiB all along.
+2. chrome writes profile + HTTP cache (caching the very video segments it
+   plays) + POSIX shared-memory files (--disable-dev-shm-usage sends them to
+   TMPDIR=/data) into that 4 MiB. First failure at guest t=33s.
+3. tobyfs create fails with VFS_ERR_NOSPC -- but the lx open path mapped ANY
+   vfs_create failure to EACCES (syscall.c). Chrome logged 64,858 x
+   "Creating shared memory in /data/... failed: Permission denied (13)".
+   The errno was false: it was ENOSPC, not EACCES. Cost: the investigation
+   started toward permissions/sysprot/caps (all clean, all loud-logging).
+4. Frame transport allocates shm per CompositorFrame; once the pool drained
+   (705 main frames), production stopped -- the raf=705 freeze. Comments
+   never rendered because the continuation machinery needs lifecycle cycles
+   AND the shm-starved compositor could not produce them after ~55s.
+
+Fixes landed:
+- logs/mkdata_gpt.py: generates a GPT image with ONE BLANK tobyOS-data-typed
+  partition (1 GiB). The kernel's M23A provisioning path auto-formats it
+  DEVICE-SIZED on first boot -- verified: "[tobyfs] format: 261883 blocks
+  (1022 MiB), 4096 inodes" + "[boot] provisioned + mounted /data". disk.img
+  is now that image (old 16 MiB one kept as disk.img.16m).
+- syscall.c lx open: vfs_create failures now map VFS_ERR_NOSPC->ENOSPC and
+  VFS_ERR_NAMETOOLONG->ENAMETOOLONG instead of blanket EACCES. Errno
+  fidelity is diagnostic infrastructure.
+- chromewin: --disk-cache-size=64MB bounds cache growth.
+- run_watch.py: -drive snapshot=on -- every run boots a pristine full-size
+  /data; no cross-run profile/cache contamination.
+- logs/defboot.sh gate had TWO blind spots, both fixed: -m 512 OOM-panicked
+  the moment the chromium payload (~392 MB initrd) was staged (before any
+  boot marker), and the fault grep pattern 'KERNEL PANIC' missed the actual
+  'PANIC:' prefix -- so the gate reported CLEAN on a panicked boot. It has
+  been vacuous since the chromium payload arrived; -m 4096 + 'PANIC' fix it.

@@ -11,8 +11,13 @@ PORT = 4464
 # Slice 58: shots moved into the PLAYING window (~30-60s guest = ~67-97s
 # runner; run-14's fixed times straddled it). Two shots 8s apart during
 # playback = moving-frame proof; one late shot for the end state.
+# Slice 61: e/f added -- the new choreography DWELLS at the comment section
+# from ~guest 70s and only returns to the top at guest 280s, so mid-run shots
+# show the comments/sidebar region (the visual proof this arc needs) and the
+# final shot shows the player again after the return-to-top.
 SHOTS = [(72, "logs/wat_a.png"), (80, "logs/wat_b.png"),
-         (88, "logs/wat_c.png"), (150, "logs/wat_d.png")]
+         (88, "logs/wat_c.png"), (150, "logs/wat_d.png"),
+         (240, "logs/wat_e.png"), (330, "logs/wat_f.png")]
 TOTAL = 360
 
 
@@ -38,8 +43,12 @@ def main():
     if os.path.exists(SERIAL):
         os.remove(SERIAL)
 
+    # Slice 61c: snapshot=on -- disk.img is now a 1 GiB blank-partition GPT
+    # image the kernel auto-provisions at boot; the snapshot overlay discards
+    # all writes at exit, so EVERY run gets a pristine full-size /data (no
+    # cross-run profile/cache contamination, no volume-fill carryover).
     cmd = [QEMU, "-cdrom", ISO,
-           "-drive", "file=%s,format=raw,if=ide,index=0,media=disk,cache=writethrough" % DISK,
+           "-drive", "file=%s,format=raw,if=ide,index=0,media=disk,snapshot=on" % DISK,
            "-boot", "d",
            "-netdev", "user,id=net0",
            "-device", "e1000,netdev=net0,mac=52:54:00:12:34:56",

@@ -2269,7 +2269,15 @@ static long sys_open(const char *path, int flags, int mode) {
         if (sr == VFS_OK && want_excl) return -ABI_EEXIST;
         if (sr == VFS_ERR_NOENT) {
             int cr = vfs_create(kpath);
-            if (cr != VFS_OK) return -ABI_EACCES;
+            /* Slice 61c: map the REAL failure. The old blanket EACCES made
+             * a FULL /data volume report "Permission denied" -- chrome's
+             * shared-memory allocator logged 64k of those while the actual
+             * condition was ENOSPC (4 MiB tobyfs exhausted), which sent the
+             * frame-pipeline-freeze investigation toward permissions and
+             * cost a day. Errno fidelity is diagnostic infrastructure. */
+            if (cr == VFS_ERR_NOSPC)        return -ABI_ENOSPC;
+            if (cr == VFS_ERR_NAMETOOLONG)  return -ABI_ENAMETOOLONG;
+            if (cr != VFS_OK)               return -ABI_EACCES;
         }
     }
 

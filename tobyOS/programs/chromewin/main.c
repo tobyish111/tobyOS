@@ -536,6 +536,20 @@ static void note_network_event(void) {
     }
 }
 
+/* Slice 61: fields PARSED out of the last probe reply, so the scroll
+ * choreography can react to what the page says (sy plateau = bottom reached;
+ * ytd = has the SPA finished building; th = did comments render) instead of
+ * running a fixed 25s schedule that raced the app build (the run-27 freeze:
+ * the whole scroll tour completed against a half-built page, ended back at
+ * the top, and nothing ever lazy-loaded again). */
+static int  g_p_sy = -1, g_p_ytd = -1, g_p_sh = -1, g_p_th = -1;
+static long g_p_seq;                     /* bumps on every parsed probe reply */
+
+static int probe_num(const char *key) {  /* " sy=" -> value, -1 if absent */
+    const char *p = strstr(g_msg, key);
+    return p ? atoi(p + strlen(key)) : -1;
+}
+
 static void cdp_dispatch(void) {
     if (strstr(g_msg, "\"method\":\"Page.screencastFrame\"")) {
         handle_screencast_frame();
@@ -549,10 +563,19 @@ static void cdp_dispatch(void) {
     }
     /* Slice 52: surface the page-state probe reply (and any CDP error) so the
      * serial log shows what chrome thinks the page is. Truncated: a full
-     * Runtime.evaluate reply is small, but an error can carry a big stack. */
+     * Runtime.evaluate reply is small, but an error can carry a big stack.
+     * (Slice 61: cap raised 300 -> 800 -- the grown probe truncated at 300,
+     * which silently cut the ytd/sh/th tail out of the serial record.) */
     if (strstr(g_msg, "tobyprobe") || strstr(g_msg, "ladder") ||
         strstr(g_msg, "\"error\"")) {
-        char line[300];
+        if (strstr(g_msg, "tobyprobe")) {
+            g_p_sy  = probe_num(" sy=");
+            g_p_ytd = probe_num(" ytd=");
+            g_p_sh  = probe_num(" sh=");
+            g_p_th  = probe_num(" th=");
+            g_p_seq++;
+        }
+        char line[800];
         size_t n = strlen(g_msg);
         if (n > sizeof line - 1) n = sizeof line - 1;
         memcpy(line, g_msg, n); line[n] = 0;
@@ -626,6 +649,13 @@ static int spawn_chrome(void) {
              * kernels" exactly like IP throttling would -- the A/B revert-test
              * could not distinguish them. A fresh dir isolates the theory. */
             (char *)"--user-data-dir=/data/cr2",
+            /* Slice 61c: bound the HTTP cache. On the old 4 MiB /data the
+             * cache (buffering the very video segments being played) filled
+             * the volume ~33s in; every vfs_create then failed and the
+             * compositor froze once its shm pool drained (raf=705 stall).
+             * /data is now a 1 GiB auto-provisioned volume; the cap keeps
+             * cache growth bounded on top of that. */
+            (char *)"--disk-cache-size=67108864",
             (char *)"--window-size=800,600",
             (char *)"--ignore-certificate-errors",
             (char *)"--allow-file-access-from-files",
@@ -808,7 +838,82 @@ static void probe_page(void) {
              "+' cmtH='+((document.querySelector('ytd-comments')||{})"
                       ".offsetHeight|0)"
              "+' ytd='+document.querySelectorAll("
-                      "'[class*=ytd-],ytd-app *').length;})()\","
+                      "'[class*=ytd-],ytd-app *').length"
+             /* Slice 61: the HOST control (headless=old, real wall clock, real
+              * wheel scrolls, NO --virtual-time-budget) rendered comments +
+              * sidebar FULLY -- the slice-60 "headless can't" ceiling was an
+              * artifact of virtual time + counting OBSOLETE element names.
+              * Measure what the host control measured:
+              *   th  = ytd-comment-thread-renderer (real rendered threads)
+              *   lk  = yt-lockup-view-model (the MODERN sidebar tile; host
+              *         shows 20 while ytd-compact-video-renderer shows 0!)
+              *   cti = continuation items (the lazy-load triggers themselves)
+              *   sh  = scrollHeight (how tall the page really is; sy plateaus
+              *         at sh-600, which is how DOWN knows it hit bottom)
+              *   vis/foc = visibility + focus (host: foc flipped 0->1 on the
+              *         first wheel, and only then did continuations fire)
+              *   cmTop = where ytd-comments sits relative to the viewport. */
+             "+' sh='+((document.scrollingElement||document.body)"
+                      ".scrollHeight|0)"
+             "+' vis='+(document.visibilityState=='visible'?1:0)"
+             "+' foc='+(document.hasFocus()?1:0)"
+             "+' th='+document.querySelectorAll("
+                      "'ytd-comment-thread-renderer').length"
+             "+' lk='+document.querySelectorAll("
+                      "'yt-lockup-view-model').length"
+             "+' cti='+document.querySelectorAll("
+                      "'ytd-continuation-item-renderer').length"
+             "+' cmTop='+(function(c){return c?"
+                      "c.getBoundingClientRect().top|0:-9999})"
+                      "(document.querySelector('ytd-comments'))"
+             /* Slice 61b: MEASURE the rendering lifecycle instead of
+              * inferring it. Run 1 of slice 61 sat at the true bottom of a
+              * fully-built page (sy=2339/sh=2939, lk=20, cti=3, vis=1 foc=1,
+              * 30s dwell + 200s cruise) and STILL got th=0, no continuation
+              * POST, imgs frozen -- everything that hangs off
+              * IntersectionObserver. IO callbacks are delivered as part of
+              * the rendering lifecycle (BeginMainFrame); if the main thread
+              * never produces frames after the page settles, IO starves
+              * forever no matter how we scroll. raf counts rAF callbacks
+              * (frozen counter = starved lifecycle); io is an observer on
+              * document.body that MUST fire on the first delivery cycle.
+              * Both installs are idempotent (guarded on window.__*). */
+             "+' raf='+(window.__raf!==undefined?window.__raf:"
+                      "(window.__raf=0,function __r(){window.__raf++;"
+                      "requestAnimationFrame(__r)}(),0))"
+             /* Slice 61d: rIC = the IDLE channel. 61c proved rAF + IO alive
+              * (raf advances, io=fired1) yet the post-scroll build (+4400
+              * elements on the host) never runs: YouTube defers that work
+              * via idle-priority scheduling, and with SwiftShader raster
+              * backpressuring the compositor the renderer may compute ZERO
+              * idle periods forever. A frozen ric alongside a moving raf is
+              * that starvation, measured. */
+             "+' ric='+(window.__ric!==undefined?window.__ric:"
+                      "(window.__ric=0,function __q(){window.__ric++;"
+                      "requestIdleCallback(__q)}(),0))"
+             "+' io='+(window.__io||(document.body?(window.__io='init',"
+                      "new IntersectionObserver(function(e){"
+                      "window.__io='fired'+e.length}).observe("
+                      "document.body),'init'):'nobody'))"
+             /* Slice 61b: the PRESENTATION HEARTBEAT. A 2x2 fixed div whose
+              * background toggles every 100ms via setInterval (timers
+              * provably run -- media + probes do). Each toggle dirties
+              * style -> forces a real BeginMainFrame -> the rendering
+              * lifecycle runs -> IntersectionObserver callbacks, lazy image
+              * loads and YouTube's continuation trigger all get their
+              * delivery cycle. This is the headless equivalent of "the
+              * renderer believes its frames are presented" -- no headed
+              * chrome required. Installed from the probe so it (a) waits
+              * for document.body, (b) self-heals every 10s across
+              * navigations/renderer respawns. */
+             "+' hb='+(window.__hb||(document.body?(window.__hb=1,"
+                      "(function(){var d=document.createElement('div');"
+                      "d.style.cssText='position:fixed;left:0;top:0;"
+                      "width:2px;height:2px;z-index:2147483647;"
+                      "background:#000';document.body.appendChild(d);"
+                      "var f=0;setInterval(function(){f^=1;"
+                      "d.style.background=f?'#010101':'#000'},100)})(),1)"
+                      ":0));})()\","
              "\"returnByValue\":true}", 1);
 }
 
@@ -893,6 +998,14 @@ static int cdp_bootstrap(void) {
 
     id = cdp_send("Page.enable", "{}", 1);
     if (!cdp_wait(id)) return -1;
+
+    /* Slice 61: emulate focus. On the HOST control the page reported foc=0
+     * until the first real wheel event and the comment/sidebar continuations
+     * only fired at foc=1; a headed host chrome whose window stayed HIDDEN
+     * (vis=hidden foc=0) rendered LESS than headless and deferred Input acks
+     * indefinitely. Focus is cheap to grant and the probe now reports it. */
+    id = cdp_send("Emulation.setFocusEmulationEnabled", "{\"enabled\":true}", 1);
+    cdp_wait(id);
 
     /* Slice 45: push frames instead of polling captureScreenshot. Slice 50: a
      * PLAYING video pushes ~30fps of 800x600 damage, which stb_image can't decode
@@ -1107,34 +1220,118 @@ int main(void) {
         }
 #endif
 
-        /* Slice 59: SCROLL like a user. YouTube lazy-loads: sidebar
-         * thumbnails only fetch when they near the viewport, and the comment
-         * section is not even requested until you scroll to it. Without this
-         * the page legitimately reports imgs=2/65 cmt=0 -- correct behaviour
-         * for an 800x600 viewport that never moved, and easily mistaken for
-         * broken image decoding. Scroll in steps from 25s (page settled),
-         * then return to the top so the player stays visible for screenshots. */
+        /* Slice 61: SCROLL like a user WHO IS READING, not a fixed schedule.
+         * The slice-59 tour (7x600 down from t+25s, -4200 up at t+53s, then
+         * nothing) raced the app build on tobyOS: run 27 showed the SPA
+         * finished building ~40s (ytd 137 -> ~3700 between the 30s and 40s
+         * probes), so the tour ended back at the TOP of a barely-built page
+         * and no continuation was ever requested -- the page then froze at
+         * imgs=10/65 cmt=0 for 300s. The HOST control (same binary flavor,
+         * same wheel events) reached threads=20 by dwelling AT DEPTH on a
+         * built page. So: gate on the build, descend until the page says
+         * bottom, DWELL there while continuations fire and comments render,
+         * keep nudging down as the page grows, and only return to the top at
+         * the very end for the player screenshots. Driven by probe replies
+         * (g_p_*), not wall-clock guesses. */
         {
-            static int scrolls; static long next_scroll;
-            long nows = sys_clock_ms();
-            if (next_scroll == 0) next_scroll = t0 + 25000;
-            if (scrolls < 8 && nows >= next_scroll) {
-                scrolls++;
-                next_scroll = nows + 4000;
-                /* Slice 59b: REAL wheel input, not injected JS. Run 19 proved
-                 * the JS route did nothing (sy=0 after 8 window.scrollBy
-                 * calls) -- YouTube's app owns the scroll, so a synthetic
-                 * mouseWheel through the same Input domain the window host
-                 * already uses is both effective and faithful to "what a
-                 * normal browser does". Negative deltaY at the end scrolls
-                 * back up so the player is on screen for the screenshots. */
-                char sp[192];
-                snprintf(sp, sizeof sp,
-                         "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
-                         "\"deltaX\":0,\"deltaY\":%d,\"modifiers\":0}",
-                         PAGE_W / 2, PAGE_H / 2,
-                         scrolls < 7 ? 600 : -4200);
-                cdp_send("Input.dispatchMouseEvent", sp, 1);
+            static int  phase;          /* 0 wait-build 1 down 2 dwell 3 cruise 4 done */
+            static long next_act, dwell_until, seen_seq;
+            static int  last_sy = -2, wheels, poked;
+            long nowc = sys_clock_ms();
+            char sp[160];
+            switch (phase) {
+            case 0:                     /* wait for the SPA to actually exist */
+                if ((g_p_ytd >= 1500 && nowc > t0 + 30000) ||
+                    nowc > t0 + 90000) {
+                    phase = 1; next_act = nowc;
+                    printf("[chromewin] scroll: build done (ytd=%d) -> DOWN\n",
+                           g_p_ytd);
+                }
+                break;
+            case 1:                     /* descend 600px/4s until sy plateaus */
+                if (nowc >= next_act) {
+                    next_act = nowc + 4000;
+                    snprintf(sp, sizeof sp,
+                             "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
+                             "\"deltaX\":0,\"deltaY\":600,\"modifiers\":0}",
+                             PAGE_W / 2, PAGE_H / 2);
+                    cdp_send("Input.dispatchMouseEvent", sp, 1);
+                    wheels++;
+                }
+                if (g_p_seq != seen_seq) {          /* a fresh probe landed */
+                    seen_seq = g_p_seq;
+                    /* Slice 61b: "bottom" means NEAR sh, not merely "sy did
+                     * not change between two probes" -- run 3 stalled at
+                     * sy=600 when wheel events coalesced across one probe
+                     * gap and the two-equal rule fired at 20% depth. */
+                    if ((g_p_sy > 0 && g_p_sh > 0 && g_p_sy + 700 >= g_p_sh)
+                        || (g_p_sy > 0 && g_p_sy == last_sy && wheels >= 6)
+                        || wheels >= 15) {
+                        phase = 2; dwell_until = nowc + 60000;
+                        printf("[chromewin] scroll: bottom (sy=%d sh=%d "
+                               "wheels=%d) -> DWELL 60s (video paused)\n",
+                               g_p_sy, g_p_sh, wheels);
+                        /* Slice 61d: PAUSE the video for the dwell -- what a
+                         * user reading comments does, and on this stack the
+                         * point is structural: a playing video layer keeps
+                         * SwiftShader raster saturated (~0.25 main-frames/s
+                         * measured), so the renderer never has an idle
+                         * period and YouTube's idle-deferred comments build
+                         * never runs. Pausing collapses raster load; TOP
+                         * resumes playback for the final screenshots. */
+                        cdp_send("Runtime.evaluate",
+                                 "{\"expression\":\"var v=document."
+                                 "querySelector('video');if(v)v.pause();"
+                                 "'tobypause'\"}", 1);
+                    }
+                    last_sy = g_p_sy;
+                }
+                break;
+            case 2:                     /* sit still; let observers+fetch run */
+                if (nowc >= dwell_until) {
+                    phase = 3; next_act = nowc;
+                    printf("[chromewin] scroll: dwell over (th=%d) -> CRUISE\n",
+                           g_p_th);
+                }
+                break;
+            case 3:                     /* page grows as comments load: nudge on */
+                if (nowc >= next_act) {
+                    next_act = nowc + 8000;
+                    snprintf(sp, sizeof sp,
+                             "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
+                             "\"deltaX\":0,\"deltaY\":600,\"modifiers\":0}",
+                             PAGE_W / 2, PAGE_H / 2);
+                    cdp_send("Input.dispatchMouseEvent", sp, 1);
+                }
+                /* Belt-and-braces (handoff §3A): if threads still haven't
+                 * rendered late in the run, poke the observer directly. */
+                if (!poked && g_p_th == 0 && nowc > t0 + 180000) {
+                    poked = 1;
+                    cdp_send("Runtime.evaluate",
+                             "{\"expression\":\"var c=document.querySelector("
+                             "'ytd-comments');if(c){c.scrollIntoView();"
+                             "void c.offsetHeight;}window.dispatchEvent("
+                             "new Event('scroll'));'tobypoke sent'\","
+                             "\"returnByValue\":true}", 1);
+                    logln("scroll: th=0 at 180s -> observer POKE");
+                }
+                if (nowc > t0 + 280000) {           /* player back for shots */
+                    snprintf(sp, sizeof sp,
+                             "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
+                             "\"deltaX\":0,\"deltaY\":-30000,\"modifiers\":0}",
+                             PAGE_W / 2, PAGE_H / 2);
+                    cdp_send("Input.dispatchMouseEvent", sp, 1);
+                    /* Slice 61d: resume playback paused at DWELL. */
+                    cdp_send("Runtime.evaluate",
+                             "{\"expression\":\"var v=document."
+                             "querySelector('video');if(v){v.muted=true;"
+                             "v.play&&v.play();}'tobyresume'\","
+                             "\"userGesture\":true}", 1);
+                    phase = 4;
+                    printf("[chromewin] scroll: -> TOP (th=%d)\n", g_p_th);
+                }
+                break;
+            default: break;
             }
         }
 
