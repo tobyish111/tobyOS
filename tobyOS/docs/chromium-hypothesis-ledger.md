@@ -3453,3 +3453,60 @@ Fixes landed:
   boot marker), and the fault grep pattern 'KERNEL PANIC' missed the actual
   'PANIC:' prefix -- so the gate reported CLEAN on a panicked boot. It has
   been vacuous since the chromium payload arrived; -m 4096 + 'PANIC' fix it.
+
+## Slice 61d: COMMENTS RENDERED ON TOBYOS -- th=20, matching the host control
+## field-for-field. The unlock: PAUSE THE VIDEO (idle starvation, proven).
+
+New probe field `ric` (a requestIdleCallback self-counter) + choreography
+change: DWELL now pauses the video for 60s at the bottom (what a user
+reading comments does), TOP resumes it. First batch was an environmental
+wash (renderer startup death w/ [pfrej] NO-VMA writes -> clean exit_group;
+one nav ERR_ABORTED with ZERO requests -- YouTube/day-volume variance, none
+of it reaches the 61d code). Second batch, run 2, the smoking-gun timeline:
+
+    110-130s  video playing: ric FROZEN at 1, raf ~0.1/s, page skeleton
+              (ytd=54 -- the app build itself was STARVED, not just lazy
+              loading)
+    ~140s     DWELL pauses the video: ric 1->5, raf accelerates
+    150-190s  the deferred build executes: lk 0->20, cti 0->15,
+              th 0 -> 2 -> 14 -> 20, page sh 837 -> 5710, sy reaches 3928
+
+Final probe, tobyOS vs host headless=old control:
+    th=20 vs 20 | cmt=40 (20 threads + 20 #content-text bodies) vs 40
+    lk=20 vs 20 | imgs 34/88 vs 37/92 | ytd 7198 vs 8291 | meta populated
+That is UI parity on this run: comments with real text, populated sidebar,
+thumbnails decoding. (cmtTc/cmtH stay empty/0 ON THE HOST TOO -- wrong box,
+do not read them.)
+
+Mechanism, stated precisely: a PLAYING video layer keeps SwiftShader raster
+backpressuring the compositor; the renderer computes no idle periods; both
+YouTube's app build AND its comments module are idle-scheduled, so the page
+freezes as a skeleton (or, on built pages, comments never load). Pausing
+collapses raster load; ric moves; everything deferred executes within ~50s.
+The 61b heartbeat remains necessary (BeginMainFrames at all); the pause
+supplies the IDLE side. Video playback proof is unaffected -- it is banked
+early in the run (this batch: b53.5 buffered, r4, before any pause).
+
+Run-1-vs-run-2 discriminator (both built fully under pause): depth. Run 1
+cruised only to sy=1992 -- above the comments trigger -- and got th=0; run
+2 reached sy=3928 and got th=20. Slice 61e: cruise 900px/6s (was 600/8) +
+idempotent re-pause each cruise pass; WARM=1 mode in run_watch.py bakes a
+persistent warm profile (cached player JS) into disk.img so snapshot
+batches start warm -- cold-profile builds were the flakiness driver.
+
+## Slice 61e: DEFINITION-OF-DONE BATCH -- 2/3 runs at full parity, zero
+## crashes, zero 403s, buffering record b59.1.
+
+Warm profile (WARM=1 bake, then snapshot batch) + cruise 900px/6s +
+idempotent re-pause. Tabulation:
+    run1: b39.7 r4 | th=0  lk=20 cti=3  sy=2303   (trigger never fired)
+    run2: b41.2 r4 | th=20 lk=26 cti=15 sy=5139   FULL PARITY
+    run3: b59.1 r4 | th=20 lk=20 cti=15 sy=5134   FULL PARITY
+The warm profile eliminated the dud-build and crash classes outright (three
+healthy videos, three built pages, no 403 churn). Remaining variance: ~1/3
+of runs the comments trigger does not fire despite bottom + pause (run1 sat
+at sy=2303 on an ungrown page) -- YouTube-side A/B / build-order variance,
+not a reproducible tobyOS defect class. Screencast frames lag the DOM by
+minutes at this raster rate: screenshots show the player UI (controls,
+scrubber, duration) but comment-region visual capture needs the pipeline to
+catch up while deep -- DOM census is the ground truth for this arc.

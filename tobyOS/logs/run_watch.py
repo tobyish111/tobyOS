@@ -47,8 +47,14 @@ def main():
     # image the kernel auto-provisions at boot; the snapshot overlay discards
     # all writes at exit, so EVERY run gets a pristine full-size /data (no
     # cross-run profile/cache contamination, no volume-fill carryover).
+    # Slice 61d: WARM=1 disables the overlay for ONE run so chrome's profile
+    # + caches (player JS, service worker) PERSIST onto disk.img; subsequent
+    # snapshot runs then all start from that identical WARM image. A fully
+    # cold profile every boot made page builds slow/flaky (ytd=54 skeleton
+    # runs); a warm one is both faster and still deterministic across a batch.
+    snap = ",snapshot=on" if os.environ.get("WARM") != "1" else ""
     cmd = [QEMU, "-cdrom", ISO,
-           "-drive", "file=%s,format=raw,if=ide,index=0,media=disk,snapshot=on" % DISK,
+           "-drive", "file=%s,format=raw,if=ide,index=0,media=disk%s" % (DISK, snap),
            "-boot", "d",
            "-netdev", "user,id=net0",
            "-device", "e1000,netdev=net0,mac=52:54:00:12:34:56",

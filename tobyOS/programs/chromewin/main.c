@@ -1296,12 +1296,25 @@ int main(void) {
                 break;
             case 3:                     /* page grows as comments load: nudge on */
                 if (nowc >= next_act) {
-                    next_act = nowc + 8000;
+                    /* Slice 61e: 900px/6s (was 600/8). Run-1-vs-run-2 of the
+                     * 61d batch: the ONLY discriminator between th=0 and
+                     * th=20 was depth reached during cruise (sy 1992 vs
+                     * 3928 on a page that grows to sh~5700 as it builds) --
+                     * the comments trigger sits below the ~1650px sidebar
+                     * and must actually enter the viewport. Also re-pause
+                     * the video each pass (idempotent): playback proof is
+                     * banked earlier in the run, and a playing video layer
+                     * re-starves the idle scheduler that builds comments. */
+                    next_act = nowc + 6000;
                     snprintf(sp, sizeof sp,
                              "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
-                             "\"deltaX\":0,\"deltaY\":600,\"modifiers\":0}",
+                             "\"deltaX\":0,\"deltaY\":900,\"modifiers\":0}",
                              PAGE_W / 2, PAGE_H / 2);
                     cdp_send("Input.dispatchMouseEvent", sp, 1);
+                    cdp_send("Runtime.evaluate",
+                             "{\"expression\":\"var v=document."
+                             "querySelector('video');if(v&&!v.paused)"
+                             "v.pause();'tobyrepause'\"}", 1);
                 }
                 /* Belt-and-braces (handoff §3A): if threads still haven't
                  * rendered late in the run, poke the observer directly. */
