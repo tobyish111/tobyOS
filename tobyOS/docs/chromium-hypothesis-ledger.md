@@ -3088,3 +3088,44 @@ is measurable with the ring-3 profiler already in the tree.
 STATUS: video playback = DONE. YouTube UI parity = genuinely unfinished, now
 with the first two false explanations (bot-UA gating, lazy-loading) removed
 and the search narrowed to renderer throughput.
+
+## Slice 59c: desktop viewport TRIED and REVERTED -- it made the page WORSE,
+## which identifies the real constraint: RENDERER RASTER THROUGHPUT
+
+Hypothesis: at 800x600 YouTube uses its narrow responsive layout (secondary
+column collapsed), so tiles=2 / imgs=2-of-78 might be layout, not failure.
+Test: Emulation.setDeviceMetricsOverride 1280x900 (screencast still scales
+into the 800x600 window).
+
+Result -- the override APPLIED (no error) and every richness metric got
+WORSE:
+| metric | 800x600 | 1280x900 |
+|--------|---------|----------|
+| blen   | 1050742 | 587715   |
+| imgs   | 2/78    | 1/7      |
+| tiles  | 2       | 0        |
+| meta   | 23M views | -      |
+
+2.4x the pixels under SwiftShader SOFTWARE raster => the renderer completes
+LESS of the page. **The narrow-layout theory is dead, and the constraint is
+renderer/raster THROUGHPUT.** Reverted; do not re-add a larger viewport
+before rasterization gets faster.
+
+Process note: run 21 produced NO data because the override was written as
+`if (!cdp_wait(id)) return -1;` and killed the bootstrap. Enhancements in the
+bootstrap path must be non-fatal -- fixed.
+
+### The remaining work, stated plainly
+Everything upstream of rendering is healthy: thumbnail fetches issued,
+/youtubei/next 200 OK, metadata populating, scroll working, video playing.
+What is left is that a modern YouTube watch page is more raster/layout work
+than software SwiftShader can finish on this box. That is a PERFORMANCE arc,
+not a correctness bug, and the honest options are:
+1. Measure first: [prof] ring-3 sampling of the renderer + gpu processes
+   during a watch page, to confirm raster/paint dominates (and which stack).
+2. Reduce work: fewer raster threads is not the issue -- try
+   --disable-features=CanvasOopRasterization, --disable-smooth-scrolling,
+   --disable-2d-canvas-image-chromium, and YouTube's lighter surfaces
+   (embed player, m.youtube.com) to quantify the gap.
+3. Increase capacity: real GPU raster (i915-lite path) is the structural fix
+   and a large arc of its own.

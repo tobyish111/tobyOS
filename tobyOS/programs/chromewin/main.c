@@ -791,6 +791,23 @@ static int cdp_bootstrap(void) {
                   "{\"maxTotalBufferSize\":1000000,\"maxResourceBufferSize\":100000}", 1);
     if (!cdp_wait(id)) return -1;
 
+    /* Slice 59c: give chrome a DESKTOP-SIZED viewport. The TobyTK window is
+     * 800x600, and YouTube's responsive layout below ~1000px collapses the
+     * secondary column: the related-video sidebar disappears, far fewer tiles
+     * are laid out, and lazily-rendered sections stay unbuilt -- which is
+     * exactly the measured tiles=2 / imgs=2-of-78 with a healthy data plane
+     * (fetches issued, /youtubei/next 200 OK). Overriding the metrics gets
+     * the real desktop layout while the screencast still scales down into our
+     * 800x600 window, so nothing about the host window has to change. */
+    /* Slice 59c: a 1280x900 desktop viewport was TRIED and REVERTED. It
+     * applied cleanly (no error) but made the page WORSE, not better:
+     * blen 1050742 -> 587715, imgs 78 -> 7 tags, tiles 2 -> 0, and the view
+     * count stopped populating (meta=- where 800x600 reliably reads
+     * "23M views"). 1280x900 is 2.4x the pixels, and under SwiftShader
+     * SOFTWARE rasterization the renderer completes LESS of the page -- so
+     * the narrow-layout theory is dead and this is a renderer THROUGHPUT
+     * limit. Do not re-add a bigger viewport before raster gets faster. */
+
     id = cdp_send("Page.enable", "{}", 1);
     if (!cdp_wait(id)) return -1;
 
