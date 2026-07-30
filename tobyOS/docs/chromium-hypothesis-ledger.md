@@ -3638,3 +3638,12 @@ the slice-57 VMA compaction). Validation run: 750+ frames decoded (was
 
 Resize arc definition of done: MET. WM resize -> viewport override ->
 chrome relayout -> full-size frames decoded -> displayed 1:1.
+
+## Slice 62c (spot check): react.dev -- a modern React 19/Next.js site --
+## renders FULLY on chromewin. title=React, blen=266KB hydrated DOM,
+## imgs 43/43 (100%) decoded, 420+ frames at ~5fps sustained, zero decode
+## failures, zero crashes; screenshot shows photos, header chrome and
+## typography pixel-perfect with the page scrolled deep. Framework compat
+## is inherent (real V8+Blink); raster throughput is the only axis where
+## light sites (react.dev, 5fps) and heavy ones (YouTube, ~sub-1fps under
+## video) differ.
