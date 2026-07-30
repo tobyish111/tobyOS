@@ -4063,3 +4063,50 @@ mistake slices 59-60 made by not controlling first). If it runs there and
 CHECKs here, THEN diff the environment: the fork-without-exec child, the
 absent /proc entries chrome reads, or a syscall returning a plausible-but-
 wrong value. Only after that does instrumenting the trap site pay.
+
+## Slice 72: THE CONTROL EXISTS NOW (WSL2 Ubuntu 26.04). Verdict: the same
+## binary with the same flags runs FINE on known-good Linux -- so the
+## full-chrome CHECK is OURS. Two hypotheses already eliminated.
+
+Installed WSL2 Ubuntu 26.04 (user-approved) purely as a reference machine,
+and ran the EXACT chrome-linux64 binary with the EXACT flags chromewin
+passes. Scripts (reusable, keep them): logs/control_fullchrome.sh,
+logs/control_diff.sh, logs/control_policy.sh; output under logs/control/.
+
+RESULT -- healthy on Linux, three flag variants, none crash:
+    tobyflags (angle/swiftshader/in-process-gpu)  exit=124 (my 90s timeout)
+    disablegpu                                     exit=124
+    bare (no GL flags at all)                      exit=124
+    stderr 850-905 lines of normal startup; ZERO CHECK/FATAL/signal lines.
+On tobyOS the same binary emits 3 lines and INT3s. **So tobyOS is NOT
+exonerated -- the difference is ours.** (Note --dump-dom does not terminate
+the FULL browser the way it does chrome-headless-shell: it keeps running as
+a browser session, hence the timeout. Fine for this question.)
+
+DIFF AT THE DEATH POINT. tobyOS's last output is the 2nd
+GetCollectStatsConsent line; a healthy startup continues immediately with:
+config_dir_policy_loader -> policy_service_impl snapshot -> variations
+FieldTrialTestingConfig -> scheduler_loop_quarantine -> **dbus GetNameOwner
+org.freedesktop.login1** -> webrtc_event_log_manager -> proxy_config ->
+cdm_registration (Widevine) -> component_crx_cache stat. tobyOS reaches
+NONE of it, so the CHECK fires in that early window.
+
+ELIMINATED SO FAR (each by experiment, not argument):
+ 1. GL/Ozone flags -- swapping the whole set changed nothing on either side.
+ 2. The staged POLICY FILE. The initrd installs
+    etc/opt/chrome/policies/managed/tobyos.json (the ML-KEM workaround) and
+    Ubuntu had none, making it the most visible difference at exactly the
+    right moment. Reproduced it on the control: chrome logged "Found
+    mandatory policy file", parsed it, and ran on with no CHECK. NOT it.
+
+STILL OPEN, in the order worth testing (all now cheap, because the control
+can be degraded toward tobyOS one property at a time):
+ a. D-BUS: the healthy log shows chrome talking to a real bus
+    (GetNameOwner org.freedesktop.login1) seconds after the death point;
+    tobyOS has no bus at all. Test: point DBUS_SYSTEM/SESSION_BUS_ADDRESS
+    at a nonexistent socket on the control and see if it CHECKs.
+ b. /proc completeness -- chrome reads several entries during variations /
+    field-trial setup; a plausible-but-wrong value is exactly the class of
+    bug that produces a CHECK rather than an error return.
+ c. The fork-without-exec child (browser forks, child exits 0) -- identify
+    what that child is on the control (it will be there too) and compare.
