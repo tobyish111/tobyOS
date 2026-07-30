@@ -3816,3 +3816,36 @@ cache still creating/removing files -- now cheap per call, but frequent);
 NOTE: defboot.sh deliberately still boots /data over IDE -- it is the
 stock-config gate, and keeping it on the legacy path means the PIO driver
 stays covered.
+
+## Slice 66 (perf tier 2, step 4): net_poll coalescing TRIED and REVERTED.
+## The epoll cost is FUTILE RE-SCANS, not network pumping.
+
+Theory: every poll/select/epoll wait iteration that watches a socket calls
+net_poll() (the B14 RX pump) -- a full NIC drain + TCP timer service -- and
+with chrome's ~40 threads that is thousands of stack pumps per second under
+the BKL, which would explain epoll_wait becoming the top hold-time holder
+(50641 Mcyc/60s) once the disk was fixed.
+
+Test (instrument + fix in ONE build so a single run judges it): a 200us
+global coalescer, counting ran vs skipped.
+RESULT: ran=54987 skipped=57538 -- half the pumps eliminated -- and
+epoll_wait hold moved 50641 -> 48781 Mcyc, i.e. NOT the cost. Theory dead;
+change REVERTED (an unproven rate-limiter on network servicing is a latency
+risk with no measured payoff).
+
+What the numbers actually say. From [lx-top] epoll_wait ~= 14,785 calls per
+60s interval holding ~48,800 Mcyc => **~3.3 Mcyc (~0.77 ms) of BKL hold per
+epoll_wait call** -- far too much for scanning <=64 fds once. The wait loop
+re-scans EVERY time it is woken, and poll_tick wakes ALL blocked pollers
+periodically (~1ms) regardless of which fd became ready: N pollers x M fds x
+every tick, nearly all of it futile, all under the BKL. That is a thundering
+herd, and it is a DESIGN issue, not a tuning one.
+
+NEXT ARC (well-scoped, the real fix): event-driven poll wakeups. Attach
+waiters to the objects they watch (socket / pipe / eventfd wait queues) and
+wake only those whose fd actually became ready, instead of poll_tick's
+wake-everyone sweep. tobyOS already has per-object wait queues (pipe.c /
+socket.c wq_wake_all) and poll_wake_all's own comment anticipates an
+"event-hook caller" -- so the machinery to hang this on exists. Expected
+effect: epoll_wait's hold collapses toward the cost of ONE scan per real
+event, and with it the last big BKL consumer on the video workload.
