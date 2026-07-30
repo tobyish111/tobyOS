@@ -57,8 +57,23 @@ def main():
     # cold profile every boot made page builds slow/flaky (ytd=54 skeleton
     # runs); a warm one is both faster and still deterministic across a batch.
     snap = ",snapshot=on" if os.environ.get("WARM") != "1" else ""
-    cmd = [QEMU, "-cdrom", ISO,
-           "-drive", "file=%s,format=raw,if=ide,index=0,media=disk%s" % (DISK, snap),
+    # Slice 65: /data moves off ATA PIO onto virtio-blk. MEASURED (slice
+    # 64c): pwrite64+openat+unlink were ~90% of ALL BKL hold time and the
+    # lock was held 94% of wall clock -- because blk_ata.c is a PIO driver
+    # (rep outsw per sector) and under WHPX every port access is a VM EXIT,
+    # so one journalled write costs milliseconds with the global lock held.
+    # tobyOS already registers a modern virtio-blk-pci driver at boot
+    # (kernel.c virtio_blk_register) and the /data mount sweep finds the
+    # tobyOS-data GPT partition on ANY block device, so this is a pure
+    # transport swap: DMA rings instead of port-by-port PIO.
+    # IDE_DATA=1 restores the old attachment for A/B comparison.
+    if os.environ.get("IDE_DATA") == "1":
+        disk_args = ["-drive", "file=%s,format=raw,if=ide,index=0,media=disk%s"
+                     % (DISK, snap)]
+    else:
+        disk_args = ["-drive", "file=%s,format=raw,if=none,id=hd0%s" % (DISK, snap),
+                     "-device", "virtio-blk-pci,drive=hd0"]
+    cmd = [QEMU, "-cdrom", ISO] + disk_args + [
            "-boot", "d",
            "-netdev", "user,id=net0",
            "-device", "e1000,netdev=net0,mac=52:54:00:12:34:56",

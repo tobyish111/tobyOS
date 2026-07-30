@@ -3772,3 +3772,47 @@ NEXT ARC (tier 2 step 3, the real fix, kernel-side and well-scoped now):
 Either one should show up immediately in [lx-hold]/[bkl]: pwrite64's share
 collapses and cpu2/cpu3 wait time falls. The instrumentation to prove it is
 now in the tree ([bkl] per-CPU acq/waits/wait/held + [lx-hold] top-10).
+
+## Slice 65 (perf tier 2, step 3): /data was on ATA **PIO**. Moving it to
+## virtio-blk took the BKL from 94% held to 1.3%, and react.dev from
+## 630 -> 1050 frames. The kernel-refactor arc was NOT needed.
+
+Slice 64c said FS writes owned ~90% of BKL hold time. Before refactoring
+locking, ONE question: why does a single pwrite64 cost milliseconds? The
+answer was in the driver, not the filesystem: /data was attached
+`if=ide`, and blk_ata.c is a **PIO** driver -- `rep outsw`, 256 words per
+sector, through an I/O port. Under WHPX every port access is a VM EXIT, so
+a journalled write is thousands of exits with the global lock held.
+tobyOS already registers virtio-blk-pci at boot, and the /data mount sweep
+finds the tobyOS-data GPT partition on ANY block device, so the fix was a
+transport swap in the harness (run_watch.py; IDE_DATA=1 restores the old
+attachment for A/B):
+
+                        IDE PIO            virtio-blk       delta
+  BKL held (of wall)    ~94%               ~1.3%            ~70x less
+  pwrite64 hold         44k-131k Mcyc      (off the top-10) --
+  openat / unlink       62k-92k / 26k-91k  1156 / 954       ~60-90x less
+  cpu2/cpu3 wait        175k-217k Mcyc     65-1680 Mcyc     ~100x less
+  react.dev frames      630 (s63) / 660    **1050**         +67%
+  YouTube raf (60s)     89-108             **6104** (ric 3408)  ~60x
+  YouTube frames        ~12 by 240s        60+              ~5x
+
+Mount proof: `[virtio-blk] vblk0: capacity=2097152 sectors (1024 MiB)` +
+`[boot] mounted /data via GPT partition 'vblk0.p1'`. Zero code changes to
+the FS or the lock: the "per-inode locking / write-back page cache" arc
+that slice 64c scoped is DEFERRED, and may never be needed.
+
+THE BOTTLENECK HAS MOVED, and the instrument says where. On the VIDEO
+workload the BKL is contended again (~64% held) but the holders are now
+real IPC/work:
+    epoll_wait 50641 | recvmsg 17516 | openat 16507 | futex 14955 |
+    unlink 14312 | write 13837 | munmap 7880 | sendto 7350
+epoll_wait dominating means threads sleep-and-wake through the BKL'd wait
+path. NEXT LEVERS, in order: (1) BKL-free epoll/poll fast path for the
+common "already-ready" and short-timeout cases, mirroring slice 64's
+futex/yield treatment; (2) the remaining openat/unlink churn (chrome's
+cache still creating/removing files -- now cheap per call, but frequent);
+(3) then tier 2.5 (zero-copy frames, MIT-SHM) and tier 3 (GPU).
+NOTE: defboot.sh deliberately still boots /data over IDE -- it is the
+stock-config gate, and keeping it on the legacy path means the PIO driver
+stays covered.
