@@ -3554,3 +3554,46 @@ out). th-rate is currently gated by that variance, not by tobyOS: when the
 page builds, sidebar+tiles populate every time, and the one th>0 run
 parked+held exactly as designed. Re-measure fresh (different hour or
 alternate watch URL) before drawing any rate conclusions.
+
+## Slice 62: LIVE WINDOW RESIZE with real reflow -- the mechanism WORKS
+## (vw 800x600 -> 1278x697, 4/4 runs); post-resize frame DISPLAY still open.
+
+The ask: resize the browser window and have the page relayout like real
+chrome. Delivered mechanism, validated end-to-end on example.com (isolated
+from YouTube's evening flakiness):
+  tk_maximize / WM drag -> kernel window_do_maximize (backbuffer realloc +
+  GUI_EV_RESIZE) -> tk.c updates win.w/h -> chromewin's debounced resize
+  watcher -> Page.stopScreencast + Emulation.setDeviceMetricsOverride +
+  Page.startScreencast at the new size -> CHROME REFLOWS. Every run that
+  reached the resize reported the page's own viewport flip: vw=800x600
+  before, vw=1278x697 after (stable across 18-19 probes). The window
+  visually maximizes; paint() draws from live geometry and clears stale
+  margins; wheel/probe/PARK coordinates all track g_page_w/h.
+Also fixed en route:
+- Screencast is now 1:1 with the page (was maxWidth 640 on an 800px page:
+  pushed frames displayed at 0.8x while polled screenshots were 1:1, and
+  any click during a pushed frame was off by 25%).
+- Probe made body-null-safe (document.body.innerText threw on blank/dying
+  pages, blinding probes exactly when needed; 'Cannot read properties of
+  null' x4 diagnosed).
+- libtoby sbrk pool 16 -> 64 MiB (lazy mmap reservation): the 16 MiB pool
+  fragmented under 1.92 MiB frame churn and every 3.56 MiB post-resize
+  decode OOM'd (1006 silent "JPEG decode failed"s -- now the failure line
+  carries byte size + stbi's reason via new toby_image_error() + a live
+  malloc(4MB) test).
+
+OPEN (one item): post-resize frames still failed to decode on the one
+healthy-boot run WITH the 64 MiB pool (1035x, ~10-12KB JPEG files = the
+maximized mostly-blank page; decoded size 3.56 MiB). The diagnostic build
+(reason= + malloc4M=) never got a healthy boot to fire on -- three
+consecutive runs drew the FROZEN-LIFECYCLE boot class (raf pinned at 1,
+zero BeginFrames from t=0, zero frames, captureScreenshot never resolves so
+the polled fallback wedges on its one outstanding request). That frozen
+class predates slice 62 (it is the ric=1 shape from the 61d evening runs)
+and boot-alternates with healthy runs on the SAME binary. NEXT SESSION: one
+healthy diagnostic run answers allocator-vs-codec outright; also consider
+clearing g_shot_id on a timeout so a hung captureScreenshot cannot wedge
+the polled path forever.
+Note: the [pfrej] NO-VMA startup flake recurred (same 0xc0da000/0xc0db000
+addresses) WITHOUT the slice-61f munmap WARN firing -- a second mechanism
+produces the same VMA-less-present-PTE state; still open.

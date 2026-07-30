@@ -42,6 +42,10 @@
 /* AVIF (AV1 still image): the vendored libgav1 decoder via a bridge. */
 #include <toby/avif_decode.h>
 
+/* Slice 62: last decode-failure reason (stbi's static string, or 0). */
+static const char *g_last_error;
+const char *toby_image_error(void) { return g_last_error; }
+
 static int webp_sniff(const uint8_t *d, size_t n) {
     return n >= 12 &&
            d[0] == 'R' && d[1] == 'I' && d[2] == 'F' && d[3] == 'F' &&
@@ -66,7 +70,14 @@ toby_image_t *toby_image_load(const uint8_t *data, size_t len) {
     if (!rgba)
         rgba = stbi_load_from_memory(data, (int)len,
                                      &w, &h, &channels, 4);
-    if (!rgba) return NULL;
+    if (!rgba) {
+        /* Slice 62: surface WHY. A run produced 1035 bare decode failures
+         * and the cause (allocator vs codec vs data) was undiagnosable from
+         * the outside. stbi keeps a static reason string; hand it out. */
+        g_last_error = stbi_failure_reason();
+        return NULL;
+    }
+    g_last_error = 0;
 
     toby_image_t *img = (toby_image_t *)malloc(sizeof(toby_image_t));
     if (!img) {

@@ -24,6 +24,10 @@ typedef struct {
 /* Decode an image from a memory buffer. Returns NULL on failure. */
 toby_image_t *toby_image_load(const uint8_t *data, size_t len);
 
+/* Slice 62: reason string for the LAST toby_image_load failure (stbi's
+ * static message, e.g. "outofmem"), or NULL after a success. */
+const char *toby_image_error(void);
+
 /* Read a file from disk and decode it. Returns NULL on failure. */
 toby_image_t *toby_image_load_file(const char *path);
 

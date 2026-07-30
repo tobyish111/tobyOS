@@ -48,6 +48,27 @@ static long sys_clock_ms(void) { return sc0(ABI_SYS_CLOCK_MS); }
 #define WIN_W  PAGE_W
 #define WIN_H  (PAGE_H + BAR_H)
 
+/* Slice 62: LIVE RESIZE -> REAL REFLOW. The TobyTK WM resizes the window
+ * (drag / tk_maximize); tk.c updates win.w/win.h; the main loop watches for
+ * a settled size change and applies it to chrome via
+ * Emulation.setDeviceMetricsOverride + a screencast restart at the new
+ * dimensions -- the page RELAYOUTS exactly as in real chrome (YouTube flips
+ * to its 2-column layout past ~1000px width, etc). g_page_w/h is the CSS
+ * viewport chrome is emulating at any moment; everything that used the
+ * fixed PAGE_W/PAGE_H (blit clamp, wheel/probe coordinates) reads these.
+ * Caveat measured in slice 59c: MORE pixels = SwiftShader completes less
+ * per frame -- bigger windows trade page-build speed for size until the
+ * raster path gets faster. That is the same tradeoff a slow machine makes
+ * in real chrome. */
+static int g_page_w = PAGE_W, g_page_h = PAGE_H;
+
+/* Slice 62 validation hook: auto-tk_maximize once the page has settled so a
+ * headless harness run exercises resize end-to-end (WM -> TK_EV_RESIZE ->
+ * metrics override -> reflow) with zero interactive input. VALIDATED 4/4
+ * (vw 800x600 -> 1278x697 every run that reached it); off for normal use,
+ * like LOCAL_HTML_FILE / MSE_TEST_JS before it. */
+/* #define RESIZE_TEST 1 */
+
 /* Video-pipeline probe (slice 49): a minimal local autoplay <video> page with a
  * tiny inline VP9 data: URI. Deterministic + fast (~10s vs YouTube's flaky 277s)
  * -- splits "does any video decode+paint" from "does YouTube's heavy app get
@@ -80,6 +101,8 @@ static long sys_clock_ms(void) { return sc0(ABI_SYS_CLOCK_MS); }
 #ifdef MSE_TEST_JS
 #define START_URL "about:blank"        /* the MSE test needs no page at all */
 #else
+/* (Slice 62 used https://example.com to validate RESIZE in isolation from
+ * YouTube's evening-service flakiness -- flip to it for mechanism tests.) */
 #define START_URL "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
 #endif
 
@@ -355,7 +378,22 @@ static int install_b64_frame(void) {
     long n = b64_decode_buf(p, e - p, g_png);
     if (n <= 8) return 0;
     toby_image_t *img = toby_image_load(g_png, (size_t)n);   /* JPEG */
-    if (!img) { logln("JPEG decode failed"); return 0; }
+    if (!img) {
+        /* Slice 62: name the size, stbi's own reason, AND whether a big
+         * malloc works at this instant -- one run splits allocator-vs-codec
+         * conclusively (1006 bare "decode failed" lines could not). */
+        static int diag;
+        if (diag < 6) {
+            diag++;
+            void *t = malloc(4u << 20);
+            printf("[chromewin] JPEG decode failed (%ld bytes) reason=%s "
+                   "malloc4M=%s\n", n,
+                   toby_image_error() ? toby_image_error() : "?",
+                   t ? "ok" : "FAIL");
+            free(t);
+        }
+        return 0;
+    }
     toby_image_t *old = g_frame;
     g_frame = img;
     if (old) toby_image_free(old);
@@ -773,8 +811,12 @@ static void probe_page(void) {
                         "a#thumbnail').length"
              "+' cmt='+document.querySelectorAll("
                         "'ytd-comment-thread-renderer,#content-text').length"
-             "+' meta='+((document.body.innerText.match("
-                        "/[0-9.,]+[KM]? views/)||['-'])[0]).slice(0,12)"
+             /* Slice 62: body-null-safe. On a blank/dying page (renderer
+              * death, mid-navigation) document.body is NULL and this field
+              * threw 'Cannot read properties of null' -- killing the WHOLE
+              * probe exactly when a run needs eyes most. */
+             "+' meta='+(((document.body&&document.body.innerText||'')"
+                        ".match(/[0-9.,]+[KM]? views/)||['-'])[0]).slice(0,12)"
              /* Slice 59b: sy proves whether our injected scroll ever took
               * effect (YouTube may scroll an inner container; sy=0 after 8
               * scrollBy calls = the scroll never happened at document level). */
@@ -857,6 +899,10 @@ static void probe_page(void) {
               *   cmTop = where ytd-comments sits relative to the viewport. */
              "+' sh='+((document.scrollingElement||document.body)"
                       ".scrollHeight|0)"
+             /* Slice 62: the page's OWN idea of its viewport -- the direct
+              * evidence a resize reflowed (innerWidth crossing ~1000px also
+              * flips YouTube to its 2-column desktop layout). */
+             "+' vw='+window.innerWidth+'x'+window.innerHeight"
              "+' vis='+(document.visibilityState=='visible'?1:0)"
              "+' foc='+(document.hasFocus()?1:0)"
              "+' th='+document.querySelectorAll("
@@ -1023,11 +1069,21 @@ static int cdp_bootstrap(void) {
      * fast enough on tobyOS -> g_rxbuf backs up -> the overflow drop truncates
      * frames -> all later frames corrupt (the "display freezes at ~frame 150 while
      * chrome keeps streaming" symptom). Throttle the SOURCE so decode keeps up:
-     * everyNthFrame=3 (~10fps) at 640x480 (~1.6x fewer px) -- still clearly shows
-     * moving video. quality 60 balances size vs legibility. */
-    id = cdp_send("Page.startScreencast",
-                  "{\"format\":\"jpeg\",\"quality\":60,"
-                  "\"maxWidth\":640,\"maxHeight\":480,\"everyNthFrame\":3}", 1);
+     * everyNthFrame=3 (~10fps). quality 60 balances size vs legibility.
+     * Slice 62: capture at the PAGE size (1:1), not a fixed 640x480. The old
+     * cap made PUSHED frames 0.8x-scaled while the POLLED captureScreenshot
+     * fallback was 1:1 -- the display alternated between two scales and any
+     * click while a pushed frame was showing was off by 25% (window coords
+     * are sent as CSS coords, which is only correct at 1:1). Decode cost
+     * rises with window size; everyNthFrame absorbs it. */
+    {
+        char scp[128];
+        snprintf(scp, sizeof scp,
+                 "{\"format\":\"jpeg\",\"quality\":60,"
+                 "\"maxWidth\":%d,\"maxHeight\":%d,\"everyNthFrame\":3}",
+                 g_page_w, g_page_h);
+        id = cdp_send("Page.startScreencast", scp, 1);
+    }
     if (!cdp_wait(id)) return -1;
 
     kick_play();          /* start any <video> (a MediaDocument won't autoplay) */
@@ -1125,18 +1181,28 @@ static void send_key(uint8_t key) {
 
 static void paint(struct tk_window *w, struct tk_widget *cv) {
     (void)cv;
+    /* Slice 62: paint from LIVE window geometry (tk.c updates w->w/w->h on
+     * TK_EV_RESIZE), not the launch-time constants. */
+    int pw = w->w, ph = w->h - BAR_H;
+    if (pw < 64) pw = 64;
+    if (ph < 64) ph = 64;
     /* URL/status bar */
-    tk_draw_fill(w, 0, 0, WIN_W, BAR_H, 0x00202028u);
+    tk_draw_fill(w, 0, 0, pw, BAR_H, 0x00202028u);
     tk_draw_text(w, 8, 6, g_status, 0x00d0d0d8u, 14, 0);
     /* page area */
     if (g_frame) {
-        int fw = g_frame->width  < PAGE_W ? g_frame->width  : PAGE_W;
-        int fh = g_frame->height < PAGE_H ? g_frame->height : PAGE_H;
+        int fw = g_frame->width  < pw ? g_frame->width  : pw;
+        int fh = g_frame->height < ph ? g_frame->height : ph;
         tk_draw_blit(w, 0, BAR_H, fw, fh, g_frame->pixels, g_frame->width);
+        /* A just-resized window shows the old (smaller/larger) frame until
+         * chrome delivers one at the new size; clear the right/bottom
+         * margins so stale pixels never linger next to the live frame. */
+        if (fw < pw) tk_draw_fill(w, fw, BAR_H, pw - fw, ph, 0x00303038u);
+        if (fh < ph) tk_draw_fill(w, 0, BAR_H + fh, fw, ph - fh, 0x00303038u);
     } else {
-        tk_draw_fill(w, 0, BAR_H, PAGE_W, PAGE_H, 0x00303038u);
-        tk_draw_text(w, 300, BAR_H + 280, "connecting to chrome...",
-                     0x00a0a0b0u, 16, 1);
+        tk_draw_fill(w, 0, BAR_H, pw, ph, 0x00303038u);
+        tk_draw_text(w, pw / 2 - 100, BAR_H + ph / 2 - 20,
+                     "connecting to chrome...", 0x00a0a0b0u, 16, 1);
     }
 }
 
@@ -1208,6 +1274,63 @@ int main(void) {
             if (f == 0 && !any) break;         /* EAGAIN and nothing buffered */
         }
 
+        /* Slice 62: RESIZE WATCHER. tk.c updates win.w/h on TK_EV_RESIZE
+         * (WM drag or tk_maximize); when the size settles for 400ms, apply
+         * it to chrome: viewport override + screencast restart at the new
+         * dimensions. Chrome relayouts exactly as a real window resize --
+         * this is the same mechanism headed chrome uses internally (the
+         * renderer only ever sees "the viewport changed"). Debounced so a
+         * drag's event stream becomes one reflow. */
+        {
+            static int last_w, last_h, applied_w, applied_h;
+            static long settle_at;
+            if (!last_w) {                       /* first pass: adopt launch size */
+                last_w = applied_w = win.w;
+                last_h = applied_h = win.h;
+            }
+            if (win.w != last_w || win.h != last_h) {
+                last_w = win.w; last_h = win.h;
+                settle_at = sys_clock_ms() + 400;
+            }
+            if ((applied_w != last_w || applied_h != last_h) &&
+                sys_clock_ms() >= settle_at && g_session[0]) {
+                applied_w = last_w; applied_h = last_h;
+                g_page_w = last_w;
+                g_page_h = last_h - BAR_H;
+                if (g_page_w < 320) g_page_w = 320;
+                if (g_page_h < 240) g_page_h = 240;
+                char rp[192];
+                cdp_send("Page.stopScreencast", "{}", 1);
+                snprintf(rp, sizeof rp,
+                         "{\"width\":%d,\"height\":%d,"
+                         "\"deviceScaleFactor\":1,\"mobile\":false}",
+                         g_page_w, g_page_h);
+                cdp_send("Emulation.setDeviceMetricsOverride", rp, 1);
+                snprintf(rp, sizeof rp,
+                         "{\"format\":\"jpeg\",\"quality\":60,"
+                         "\"maxWidth\":%d,\"maxHeight\":%d,"
+                         "\"everyNthFrame\":3}", g_page_w, g_page_h);
+                cdp_send("Page.startScreencast", rp, 1);
+                request_screenshot();            /* fresh frame right away */
+                printf("[chromewin] RESIZE applied: win %dx%d -> page %dx%d\n",
+                       last_w, last_h, g_page_w, g_page_h);
+            }
+        }
+
+#ifdef RESIZE_TEST
+        /* Slice 62 validation: one automatic maximize after the page has
+         * settled. The WM answers with TK_EV_RESIZE; the watcher above does
+         * the rest. Proves the whole chain headlessly. */
+        {
+            static int rt;
+            if (!rt && sys_clock_ms() - t0 > 60000) {
+                rt = 1;
+                logln("RESIZE_TEST: tk_maximize");
+                tk_maximize(&win);
+            }
+        }
+#endif
+
         /* Re-kick play() a few times over the first ~10s: a MediaDocument's
          * <video> can appear slightly after bootstrap, and the first play()
          * may land before the element exists. */
@@ -1265,7 +1388,7 @@ int main(void) {
                     snprintf(sp, sizeof sp,
                              "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
                              "\"deltaX\":0,\"deltaY\":600,\"modifiers\":0}",
-                             PAGE_W / 2, PAGE_H / 2);
+                             g_page_w / 2, g_page_h / 2);
                     cdp_send("Input.dispatchMouseEvent", sp, 1);
                     wheels++;
                 }
@@ -1345,7 +1468,7 @@ int main(void) {
                     snprintf(sp, sizeof sp,
                              "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
                              "\"deltaX\":0,\"deltaY\":%d,\"modifiers\":0}",
-                             PAGE_W / 2, PAGE_H / 2,
+                             g_page_w / 2, g_page_h / 2,
                              (stuck > 0 && (wheels & 1)) ? -700 : 900);
                     cdp_send("Input.dispatchMouseEvent", sp, 1);
                     cdp_send("Runtime.evaluate",
@@ -1369,7 +1492,7 @@ int main(void) {
                     snprintf(sp, sizeof sp,
                              "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
                              "\"deltaX\":0,\"deltaY\":-30000,\"modifiers\":0}",
-                             PAGE_W / 2, PAGE_H / 2);
+                             g_page_w / 2, g_page_h / 2);
                     cdp_send("Input.dispatchMouseEvent", sp, 1);
                     /* Slice 61d: resume playback paused at DWELL. */
                     cdp_send("Runtime.evaluate",
@@ -1408,7 +1531,7 @@ int main(void) {
                         snprintf(sp, sizeof sp,
                                  "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
                                  "\"deltaX\":0,\"deltaY\":%d,\"modifiers\":0}",
-                                 PAGE_W / 2, PAGE_H / 2, dy);
+                                 g_page_w / 2, g_page_h / 2, dy);
                         cdp_send("Input.dispatchMouseEvent", sp, 1);
                         printf("[chromewin] scroll: PARK re-aim dy=%d "
                                "(thTop=%d)\n", dy, g_p_thtop);

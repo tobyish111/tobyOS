@@ -103,7 +103,14 @@ int mprotect(void *addr, unsigned long len, int prot) {
 /* Simple sbrk using mmap as backing */
 static char *g_brk_base = 0;
 static char *g_brk_current = 0;
-#define SBRK_POOL_SIZE (16 * 1024 * 1024)
+/* Slice 62: 16 MiB -> 64 MiB. chromewin's resizable display decodes
+ * full-window JPEG frames (a 1278x697 maximized frame is a 3.56 MiB RGBA
+ * plus stb temporaries, alongside the previous frame still held); the
+ * 16 MiB pool fragmented under frame churn and every post-resize decode
+ * failed with OOM -- 1006 silent "JPEG decode failed"s in one run. The
+ * pool is a lazy mmap reservation: untouched pages cost nothing, so the
+ * larger ceiling is free for every other libtoby program. */
+#define SBRK_POOL_SIZE (64 * 1024 * 1024)
 
 __attribute__((weak))
 void *sbrk(long increment) {
