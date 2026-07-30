@@ -715,6 +715,16 @@ static int spawn_chrome(void) {
              * compositor froze once its shm pool drained (raf=705 stall).
              * /data is now a 1 GiB auto-provisioned volume; the cap keeps
              * cache growth bounded on top of that. */
+            /* Slice 64c MEASURED: pwrite64+openat+unlink are ~90% of ALL
+             * BKL hold time -- file writes into the journalled tobyfs
+             * volume, holding the global lock across synchronous block
+             * I/O. TESTED and REJECTED: --disk-cache-size=1 +
+             * --media-cache-size=1 changed nothing (pwrite64 held 131k
+             * Mcyc vs 126k with the 64MB cache), so this is NOT
+             * discretionary cache traffic a flag can switch off -- the
+             * write PATH is the cost. The fix belongs in the kernel (FS
+             * I/O without the BKL, and/or a write-back tobyfs page cache),
+             * so keep the sane cache size meanwhile. */
             (char *)"--disk-cache-size=67108864",
             (char *)"--window-size=800,600",
             (char *)"--ignore-certificate-errors",

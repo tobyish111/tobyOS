@@ -3725,3 +3725,50 @@ saturates it. NEXT STEP: a per-syscall BKL HOLD-time histogram (same shape
 as [lx-top], but timing bkl_enter->bkl_exit) to name which syscalls hold it
 longest under video, then give those the same treatment. Suspects from the
 slow-path top-8: epoll_wait, recvmsg, mmap/mprotect, sendto.
+
+## Slice 64b/64c (perf tier 2, step 2): WHO holds the BKL. Answer:
+## FILESYSTEM WRITES -- pwrite64 + openat + unlink are ~90% of all hold
+## time, and the BKL is held ~94% of wall clock. Not IPC. Not scheduling.
+
+Instrument, and TWO wrong versions of it before the right one (both
+self-announced, which is the point of sanity-checking a probe against a
+value you can bound):
+ 1. Timing the syscall BODY reported futex=7.9M Mcyc -- 17x a CPU's entire
+    cycle budget for the interval. Wall time under a syscall is NOT hold
+    time: the scheduler DROPS the BKL around blocking switches.
+ 2. Timing bkl_enter->bkl_exit and reading proc->cursys at exit reported
+    "execve = 93% of hold time" on a run with ~20 execve calls.
+    linux_syscall clears cursys to -1 BEFORE the lock is released, so every
+    segment fell through to cursys_nat -- which for an exec'd process is
+    permanently 142, because execve never returns to clear its own stamp.
+ 3. Correct: a per-CPU bucket (g_bkl_sysno) stamped right after bkl_enter,
+    cleared at the syscall's final bkl_exit; buckets cover Linux syscalls
+    0..511, NATIVE syscalls 512+n (chromewin's GUI/blit path was invisible
+    before), idle(pid0) and kernel. Caveat: a segment after a blocking
+    switch can attribute to the syscall that re-stamped the CPU.
+
+MEASURED (YouTube watch page, three consecutive 60s intervals):
+    pwrite64  44k-131k Mcyc      openat  62k-92k      unlink  26k-91k
+    everything else              <= ~2k Mcyc (1000x smaller)
+    BKL held ~94% of wall clock; cpu2/cpu3 spend 80%+ of wall time WAITING
+    for it while holding almost none themselves (starved).
+So the video-case ceiling is chrome's file I/O into the journalled tobyfs
+volume, executed under the global lock: each pwrite64 costs milliseconds
+(journal begin/commit + synchronous block writes), and while it runs, every
+other CPU that needs a syscall stops.
+
+TESTED AND REJECTED (a flag cannot fix it): --disk-cache-size=1 +
+--media-cache-size=1 left pwrite64 at 131k Mcyc (vs 126k at 64MB). This is
+not discretionary cache traffic; the write PATH is the cost. Reverted to
+the sane 64MB cache.
+
+NEXT ARC (tier 2 step 3, the real fix, kernel-side and well-scoped now):
+ (a) take FS I/O out from under the BKL -- per-mount/per-inode locking for
+     the tobyfs write path, so a multi-ms journalled write blocks one
+     writer instead of the whole machine; and/or
+ (b) a write-back page cache for tobyfs (batch journal commits, coalesce
+     sector writes) so the common small-write case stops touching the disk
+     synchronously at all.
+Either one should show up immediately in [lx-hold]/[bkl]: pwrite64's share
+collapses and cpu2/cpu3 wait time falls. The instrumentation to prove it is
+now in the tree ([bkl] per-CPU acq/waits/wait/held + [lx-hold] top-10).

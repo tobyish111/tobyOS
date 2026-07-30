@@ -217,6 +217,11 @@ struct proc {
     uint64_t        fx_wake_ns;
     int32_t         cursys;
     uint64_t        cursys_ns;
+    /* Slice 64c: the NATIVE (tobyOS ABI) syscall this proc is inside, -1
+     * when none. chromewin's GUI/blit calls are native, and BKL hold-time
+     * attribution was blind to them (>99% of hold time landed in no
+     * bucket until this existed). */
+    int32_t         cursys_nat;
     /* CHROMIUM_BOOT diagnostic: latched at execve when argv carries
      * "--type=renderer", so the SIGKILL/exit stack-dump hook can fire on the
      * renderer (the process that must complete a document load for --dump-dom)

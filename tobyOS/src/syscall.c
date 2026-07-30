@@ -6771,6 +6771,63 @@ volatile uint64_t g_lx_fast_futex;
 volatile uint64_t g_lx_fast_time;             /* bumped in the time fast path */
 volatile uint64_t g_lx_fast_yield;            /* slice 64: BKL-free yields */
 static uint32_t g_lx_nrcount[512];
+/* Slice 64b: BKL HOLD time per syscall (TSC cycles between bkl_enter and
+ * the syscall's return), so "who holds the lock long" is a measurement
+ * rather than a suspicion. Sampled on the slow (BKL) path only. */
+/* Slice 64c: hold buckets -- 0..511 Linux syscall numbers, 512..767 native
+ * tobyOS syscall numbers, plus two catch-alls. */
+#define HOLD_SLOTS  770
+#define HOLD_IDLE   768
+#define HOLD_KERNEL 769
+static uint64_t g_lx_holdtsc[HOLD_SLOTS];
+
+static const char *hold_name(int i) {
+    static char nb[16];
+    if (i == HOLD_IDLE)   return "idle(pid0)";
+    if (i == HOLD_KERNEL) return "kernel";
+    if (i >= 512) {                      /* "nat:<n>" -- no snprintf in-kernel */
+        int v = i - 512, o = 0;
+        nb[o++] = 'n'; nb[o++] = 'a'; nb[o++] = 't'; nb[o++] = ':';
+        if (v >= 100) nb[o++] = (char)('0' + (v / 100) % 10);
+        if (v >= 10)  nb[o++] = (char)('0' + (v / 10) % 10);
+        nb[o++] = (char)('0' + v % 10);
+        nb[o] = 0;
+        return nb;
+    }
+    return lx_scname(i);
+}
+
+static inline uint64_t lx_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* Slice 64b: called from bkl_exit with the cycles this CPU actually HELD
+ * the BKL, attributed to the syscall the caller is inside (proc->cursys,
+ * stamped at linux_syscall entry). This is the number that matters: a
+ * blocking syscall's wall time is irrelevant because the scheduler drops
+ * the lock while blocked, so only these enter->exit segments block peers. */
+/* Slice 64c: which bucket the BKL segment on each CPU belongs to, stamped
+ * by the syscall entry right after bkl_enter(). Reading the proc's cursys
+ * at bkl_exit (the first attempt) CANNOT work: linux_syscall clears cursys
+ * to -1 before the lock is released, so every segment fell through to
+ * cursys_nat -- which for any exec'd process is permanently 142, because
+ * execve never returns to clear its own stamp. That misread reported
+ * "execve = 93% of all BKL hold time" for a run with ~20 execve calls.
+ * Caveat, stated: if a syscall BLOCKS, the scheduler drops the lock and
+ * another proc's syscall may stamp this CPU, so segments after a blocking
+ * switch can attribute to the wrong (still real) syscall. */
+int g_bkl_sysno[MAX_CPUS];
+
+void bkl_hold_account(uint64_t cyc) {
+    struct proc *p = current_proc();
+    uint32_t ci = smp_current_cpu_idx();
+    int slot = (ci < MAX_CPUS) ? g_bkl_sysno[ci] : -1;
+    if (slot >= 0 && slot < HOLD_SLOTS) { g_lx_holdtsc[slot] += cyc; return; }
+    if (p && p->pid == 0) { g_lx_holdtsc[HOLD_IDLE] += cyc; return; }
+    g_lx_holdtsc[HOLD_KERNEL] += cyc;
+}
 
 void lx_dump_syscall_top(void) {
     kprintf("[lx-top] fast: time=%lu futex=%lu yield=%lu | slow(BKL) top:",
@@ -6785,11 +6842,31 @@ void lx_dump_syscall_top(void) {
         g_lx_nrcount[bi] = 0;                 /* consume so next rank differs */
     }
     kprintf("\n");
+    /* Slice 64b: the same list ranked by BKL HOLD TIME (Mcycles) -- this is
+     * what actually blocks other CPUs, and it is a different ranking than
+     * call COUNT (a rare syscall that holds for ms hurts more than a
+     * frequent one that holds for ns). */
+    kprintf("[lx-hold] BKL hold Mcyc top:");
+    for (int rank = 0; rank < 10; rank++) {
+        uint64_t best = 0; int bi = -1;
+        for (int i = 0; i < HOLD_SLOTS; i++)
+            if (g_lx_holdtsc[i] > best) { best = g_lx_holdtsc[i]; bi = i; }
+        if (bi < 0 || best == 0) break;
+        kprintf(" %s=%lu", hold_name(bi), (unsigned long)(best >> 20));
+        g_lx_holdtsc[bi] = 0;
+    }
+    kprintf("\n");
     for (int i = 0; i < 512; i++) g_lx_nrcount[i] = 0;
+    for (int i = 0; i < HOLD_SLOTS; i++) g_lx_holdtsc[i] = 0;
 }
 
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     if (n >= 0 && n < 512) g_lx_nrcount[n]++;   /* slice 64: BKL-held count */
+    /* Slice 64b: measure how long this syscall keeps the BKL. Note the
+     * body may DROP the lock while blocking (the scheduler does that around
+     * blocking switches), so this is an upper bound on hold time -- read it
+     * as "wall time under the syscall", and pair it with [bkl] waits. */
+    uint64_t t_hold0 = lx_rdtsc();
 #ifdef CHROMIUM_BOOT
     int chan_fd = -1;
     switch (n) {
@@ -6807,6 +6884,9 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     if (curp) { curp->cursys = (int32_t)n; curp->cursys_ns = perf_now_ns(); }
 #endif
     long r = linux_syscall_impl(n, a1, a2, a3, a4, a5);
+    (void)t_hold0;   /* slice 64b: see bkl_hold_account -- wall time under a
+                      * syscall is NOT hold time (blocking drops the BKL);
+                      * the real accounting happens in bkl_exit. */
 #ifdef CHROMIUM_BOOT
     if (curp) curp->cursys = -1;
     if (chan_fd >= 0) {
@@ -15350,6 +15430,19 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * the body, and proc_exit's switch releases it for a dying proc. Held with
      * IRQs on (we just sti'd); IRQ handlers don't take the BKL. */
     bkl_enter();
+    /* Slice 64c: stamp the hold bucket for this CPU (see bkl_hold_account).
+     * Linux syscalls 0..511, native 512+n; cleared to -1 by the return path
+     * so post-syscall kernel work doesn't land on the last syscall. */
+    {
+        struct proc *hp = current_proc();
+        uint32_t hci = smp_current_cpu_idx();
+        extern int g_bkl_sysno[];
+        if (hci < MAX_CPUS)
+            g_bkl_sysno[hci] =
+                (hp && hp->personality == ABI_PERS_LINUX)
+                    ? ((num >= 0 && num < 512) ? (int)num : -1)
+                    : ((num >= 0 && num < 256) ? 512 + (int)num : -1);
+    }
 
 #ifdef SMP_DIAG
     /* DIAG: record the syscall this CPU is currently inside (by cpu_idx) so a
@@ -15400,8 +15493,13 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
         rv = linux_syscall(num, a1, a2, a3, a4, a5);
     else if (caller && caller->personality == ABI_PERS_WIN32)
         rv = win32_syscall(num, a1, a2, a3, a4, a5);
-    else
+    else {
+        /* Slice 64c: stamp the NATIVE syscall so BKL hold time attributes
+         * to it (chromewin's GUI/blit calls live here). */
+        if (caller) caller->cursys_nat = (int32_t)num;
         rv = do_syscall(num, a1, a2, a3, a4, a5);
+        if (caller) caller->cursys_nat = -1;
+    }
 
     perf_syscall_exit((int)num, t_sys);
     perf_zone_end(PERF_Z_SYSCALL, t_sys);
@@ -15442,6 +15540,11 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * body proc_exit'd or a signal killed us, the scheduler already released
      * it and we never got here; bkl_exit is idempotent regardless.) */
     bkl_exit();
+    {   /* slice 64c: this CPU is no longer inside a syscall */
+        uint32_t hci = smp_current_cpu_idx();
+        extern int g_bkl_sysno[];
+        if (hci < MAX_CPUS) g_bkl_sysno[hci] = -1;
+    }
 
 #ifdef SMP_DIAG
     g_cpu_syscall[smp_current_cpu_idx() & 31] = -1;   /* DIAG: syscall done */

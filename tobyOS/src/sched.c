@@ -95,6 +95,8 @@ static bkl_ticket_t g_bkl = { 0, 0 };
 uint64_t g_bkl_wait_tsc[MAX_CPUS];
 uint64_t g_bkl_waits[MAX_CPUS];
 uint64_t g_bkl_acqs[MAX_CPUS];
+static uint64_t g_bkl_t0[MAX_CPUS];    /* slice 64b: acquire stamp per CPU */
+uint64_t g_bkl_held_tsc[MAX_CPUS];     /* total cycles HELD this interval */
 
 static inline uint64_t bkl_rdtsc(void) {
     uint32_t lo, hi;
@@ -162,7 +164,10 @@ void bkl_enter(void) {
         return;
     }
     bkl_lock();
-    if (me->cpu_idx < MAX_CPUS) g_bkl_acqs[me->cpu_idx]++;   /* slice 64 */
+    if (me->cpu_idx < MAX_CPUS) {
+        g_bkl_acqs[me->cpu_idx]++;                           /* slice 64  */
+        g_bkl_t0[me->cpu_idx] = bkl_rdtsc();                 /* slice 64b */
+    }
     me->holds_bkl = true;
 #ifdef SMP_DIAG
     g_bkl_owner = (int)me->cpu_idx;
@@ -194,6 +199,18 @@ void bkl_exit(void) {
     }
     g_bkl_owner = -1;
 #endif
+    /* Slice 64b: attribute the cycles actually HELD to the syscall the
+     * caller is inside. Blocking paths drop the lock via this same exit, so
+     * every segment lands on the syscall that owned it -- unlike wall time
+     * under the syscall, which counts parked-and-lockless waiting too (the
+     * first attempt measured that and read futex=7.9M Mcyc, 17x a CPU's
+     * whole cycle budget, which is how the error announced itself). */
+    if (me->cpu_idx < MAX_CPUS) {
+        uint64_t d = bkl_rdtsc() - g_bkl_t0[me->cpu_idx];
+        g_bkl_held_tsc[me->cpu_idx] += d;
+        extern void bkl_hold_account(uint64_t);
+        bkl_hold_account(d);
+    }
     me->holds_bkl = false;
     bkl_unlock();
 }
@@ -977,11 +994,14 @@ void sched_tick(struct regs *r) {
              * data. wait is in raw Mcycles (divide by ~4300 for ms on this
              * host); acq = acquisitions this interval. */
             for (uint32_t ci = 0; ci < smp_cpu_count() && ci < MAX_CPUS; ci++) {
-                kprintf("  [bkl] cpu%u acq=%lu waits=%lu wait=%luMcyc\n", ci,
+                kprintf("  [bkl] cpu%u acq=%lu waits=%lu wait=%luMcyc "
+                        "held=%luMcyc\n", ci,
                         (unsigned long)g_bkl_acqs[ci],
                         (unsigned long)g_bkl_waits[ci],
-                        (unsigned long)(g_bkl_wait_tsc[ci] >> 20));
+                        (unsigned long)(g_bkl_wait_tsc[ci] >> 20),
+                        (unsigned long)(g_bkl_held_tsc[ci] >> 20));
                 g_bkl_acqs[ci] = g_bkl_waits[ci] = g_bkl_wait_tsc[ci] = 0;
+                g_bkl_held_tsc[ci] = 0;
             }
             { extern void lx_dump_syscall_top(void); lx_dump_syscall_top(); }
             /* (deadlocked-stack dump now fires from signal_send at the renderer's

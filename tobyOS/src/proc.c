@@ -591,6 +591,11 @@ static int spawn_internal(const char *path, const char *name,
     p->pid       = (int)(p - g_proc);
     p->state     = PROC_UNUSED;       /* upgraded to READY at the very end */
     p->wait_pid  = -1;
+    /* Slice 64c: "not inside a syscall" is -1, but memset leaves 0, which
+     * is a VALID syscall number -- BKL hold time would be misattributed to
+     * read()/native-0 for every proc that never made one. */
+    p->cursys     = -1;
+    p->cursys_nat = -1;
     p->exit_code = -1;
     /* Milestone 25A: parent-pid bookkeeping. The parent is whatever
      * proc was running when the spawn was issued. pid 0 (kernel) is
