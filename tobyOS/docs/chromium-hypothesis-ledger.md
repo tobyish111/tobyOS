@@ -3613,3 +3613,28 @@ instrument the heap (tip position + freelist total per N frames) and run
 the example.com + RESIZE_TEST harness -- it reproduces in one ~7 min run.
 toby_image_load/free audited leak-free (all rgba temporaries freed on
 every path; img->pixels/struct owned and freed by toby_image_free).
+
+## Slice 62b: the allocator bug FOUND AND FIXED -- resize now works fully,
+## display included (750+ frames at 1278x697, zero decode failures).
+
+Mechanism (confirmed by the fix): libtoby malloc was FIRST-fit over a LIFO
+free list. Each frame free()d its ~1.9 MiB pixel block onto the list HEAD;
+the next frame's SMALL stbi temporaries first-fit into that freshest big
+chunk and SPLIT it; the following 1.9 MiB request no longer fit the nibbled
+remainder, so heap_grow advanced the wilderness tip -- up to a frame-sized
+leak per cycle, order-dependent (hence ~180-frame survival, then
+exhaustion at 64 MiB with "outofmem" while small allocations still worked).
+Forward-only coalescing could not undo it across the interleaved live
+temporaries.
+
+Fix (stdlib.c): (1) BEST-fit -- small requests take small chunks, recycled
+big chunks stay whole for big requests; exact-fit short-circuits. (2)
+merge-on-pressure: coalesce_all() merges every address-adjacent free pair
+and the fit retries BEFORE heap_grow is ever considered (same pattern as
+the slice-57 VMA compaction). Validation run: 750+ frames decoded (was
+~180 then starvation), 0 "JPEG decode failed" (was 1006/1035), frames at
+1278x697 post-maximize, page rendered edge-to-edge with visible reflow
+(the example.com paragraph re-wraps at the wider measure). raf=13091.
+
+Resize arc definition of done: MET. WM resize -> viewport override ->
+chrome relayout -> full-size frames decoded -> displayed 1:1.

@@ -459,32 +459,67 @@ static void split(struct chunk *c, size_t payload_want) {
     c->size_with_flags = payload_want;
 }
 
+/* Slice 62b: merge EVERY address-adjacent free-chunk pair. Runs only when a
+ * fit failed (pressure), so the O(list^2)-ish cost is off the hot path.
+ * coalesce_forward() mutates the list, so restart the walk after each
+ * successful merge. Returns 1 if anything merged. */
+static int coalesce_all(void) {
+    int merged_any = 0, merged;
+    do {
+        merged = 0;
+        for (struct chunk *c = g_free_head; c; c = c->next_free) {
+            size_t before = chunk_payload(c);
+            coalesce_forward(c);
+            if (chunk_payload(c) != before) { merged = merged_any = 1; break; }
+        }
+    } while (merged);
+    return merged_any;
+}
+
+/* Slice 62b: BEST-fit. The old FIRST-fit over the LIFO free list leaked the
+ * heap under chromewin's frame churn: each frame free()s its ~1.9 MiB pixel
+ * block onto the list HEAD, the next frame's SMALL decode temporaries
+ * first-fit into that freshest big chunk and split it, and the following
+ * big request no longer fits the nibbled remainder -- so the wilderness tip
+ * grew by up to a whole frame per cycle until the 64 MiB pool was gone
+ * ("outofmem" while small allocations still succeeded). Best-fit sends
+ * small requests to small chunks and preserves recycled big chunks for
+ * big requests; the churn reaches a steady state. */
+static void *try_alloc(size_t n) {
+    struct chunk **link = &g_free_head, **best = 0;
+    while (*link) {
+        size_t pl = chunk_payload(*link);
+        if (pl >= n && (!best || pl < chunk_payload(*best))) {
+            best = link;
+            if (pl == n) break;                 /* exact fit: stop early */
+        }
+        link = &(*link)->next_free;
+    }
+    if (!best) return 0;
+    struct chunk *c = *best;
+    *best = c->next_free;                       /* remove from free list */
+    split(c, n);
+    c->size_with_flags = chunk_payload(c) | IN_USE_BIT;
+    c->next_free = (struct chunk *)MAGIC_USED;
+    return (void *)((char *)c + HDR_SIZE);
+}
+
 void *malloc(size_t n) {
     if (n == 0) n = 1;
     n = round_up(n, ALIGN);
 
-    /* First-fit walk over the free list. */
-    struct chunk **link = &g_free_head;
-    while (*link) {
-        struct chunk *c = *link;
-        if (chunk_payload(c) >= n) {
-            /* Remove from free list. */
-            *link = c->next_free;
-            split(c, n);
-            c->size_with_flags = chunk_payload(c) | IN_USE_BIT;
-            c->next_free = (struct chunk *)MAGIC_USED;
-            return (void *)((char *)c + HDR_SIZE);
+    for (;;) {
+        void *p = try_alloc(n);
+        if (p) return p;
+        /* No fit: merge adjacent free chunks and retry before growing --
+         * the merge either reduces the chunk count (finite, terminates)
+         * or reports nothing left to merge. */
+        if (coalesce_all()) continue;
+        if (heap_grow(n + HDR_SIZE) != 0) {
+            errno = ENOMEM;
+            return 0;
         }
-        link = &c->next_free;
     }
-
-    /* Free list empty / too fragmented: ask the kernel for more pages. */
-    if (heap_grow(n + HDR_SIZE) != 0) {
-        errno = ENOMEM;
-        return 0;
-    }
-    /* Retry from the freshly admitted chunk. */
-    return malloc(n);
 }
 
 /* POSIX aligned allocation. malloc already hands out 16-byte-aligned
