@@ -3678,3 +3678,50 @@ MEASURED, post-fix:
   remains the video-case lever. More samples wanted.
 - Whole-run health with the quiet kernel: full-parity YouTube run with
   comments + b52.1 on the first try of the evening.
+
+## Slice 64 (perf tier 2, step 1): sched_yield was the BKL serializer.
+## MEASURED, then FIXED: 25x fewer BKL acquisitions, 3-4x more syscall
+## throughput. The next wall is now visible and workload-dependent.
+
+INSTRUMENT FIRST (this is what made the fix obvious in one run): per-CPU
+BKL acq/waits/wait-cycles + a per-syscall top-8 histogram, both in the 60s
+deep dump ([bkl] / [lx-top]). The very first measurement named the culprit:
+
+    sched_yield = 401,443 calls / 60s  -- 100x the next syscall (futex 2969)
+
+and EVERY one took the BKL just to run sched_yield()'s fast path, whose
+whole body was `bkl_exit(); bkl_enter()` -- a full ticket-lock round trip
+(back of the fair queue, spin, re-acquire). cpu1/cpu2 each showed ~400-430k
+acquisitions with ~20k contended waits per interval. That is the
+system-wide serialization the tier-1 profile predicted, now named.
+
+FIX (sched.c sched_yield_fast + syscall.c pre-BKL hook): a yield by a
+still-RUNNING caller with an EMPTY local ready queue is semantically a
+no-op -- nothing can displace it -- so it is served entirely before
+bkl_enter(). Two things preserved from the old under-BKL path: the 10ms
+futex timeout sweep runs in the fast path (it serialises on g_futex_lock,
+never the BKL), and poll_tick (which needs the BKL) is kept alive by having
+the fast path DECLINE every ~2ms so that yield takes the normal path.
+Also landed: BKL-free futex fast paths (WAIT with stale value -> -EAGAIN;
+WAKE with no waiter list -> 0), which is chrome's dominant futex traffic;
+the no-lost-wakeup argument holds because a parking waiter re-checks *uaddr
+under g_futex_lock, which our WAKE path also takes for its lookup.
+
+MEASURED AFTER (same YouTube watch workload):
+    BKL acquisitions cpu1/cpu2:  430k/389k  ->  15k/15k   (~25x fewer)
+    syscall throughput (fast):   time 742k -> 2.9M, futex 6.4k -> 20.7k
+                                 (3-4x more work done per interval)
+    yields served lock-free:     2.16M per interval
+    health: th=20 lk=20 full parity, b43.4 buffered, zero crashes
+react.dev A/B (display-bound page): 630 -> 660 frames (+5%), and its BKL
+wait is <1% of wall time -- on light pages the limiter remains chrome's own
+frame production (SwiftShader raster), exactly as slice 63 said.
+
+THE NEXT WALL, honestly stated: on the VIDEO workload the remaining BKL
+holders now dominate -- some CPUs show 64-84% of wall time waiting on the
+BKL (wait-cycles ROSE even as acquisitions fell 25x, i.e. fewer but much
+longer holds). Yield churn used to "pump" the lock; with it gone, real work
+saturates it. NEXT STEP: a per-syscall BKL HOLD-time histogram (same shape
+as [lx-top], but timing bkl_enter->bkl_exit) to name which syscalls hold it
+longest under video, then give those the same treatment. Suspects from the
+slow-path top-8: epoll_wait, recvmsg, mmap/mprotect, sendto.

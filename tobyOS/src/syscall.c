@@ -6763,7 +6763,33 @@ static struct chring_ent { int tgid, pid; short nr, fd; long ret; uint32_t ms; }
 static uint32_t g_chring_i;
 #endif
 
+/* Slice 64 (tier 2): which Linux syscalls actually dominate, so BKL fast
+ * paths get aimed by data. Counted under the BKL (plain increments safe);
+ * the fast-path counters below are lock-free single-word adds. Dumped +
+ * reset by lx_dump_syscall_top() from the 60s deep dump. */
+volatile uint64_t g_lx_fast_futex;
+volatile uint64_t g_lx_fast_time;             /* bumped in the time fast path */
+volatile uint64_t g_lx_fast_yield;            /* slice 64: BKL-free yields */
+static uint32_t g_lx_nrcount[512];
+
+void lx_dump_syscall_top(void) {
+    kprintf("[lx-top] fast: time=%lu futex=%lu yield=%lu | slow(BKL) top:",
+            (unsigned long)g_lx_fast_time, (unsigned long)g_lx_fast_futex,
+            (unsigned long)g_lx_fast_yield);
+    for (int rank = 0; rank < 8; rank++) {
+        uint32_t best = 0; int bi = -1;
+        for (int i = 0; i < 512; i++)
+            if (g_lx_nrcount[i] > best) { best = g_lx_nrcount[i]; bi = i; }
+        if (bi < 0 || best == 0) break;
+        kprintf(" %s=%u", lx_scname(bi), best);
+        g_lx_nrcount[bi] = 0;                 /* consume so next rank differs */
+    }
+    kprintf("\n");
+    for (int i = 0; i < 512; i++) g_lx_nrcount[i] = 0;
+}
+
 static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
+    if (n >= 0 && n < 512) g_lx_nrcount[n]++;   /* slice 64: BKL-held count */
 #ifdef CHROMIUM_BOOT
     int chan_fd = -1;
     switch (n) {
@@ -15274,11 +15300,46 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
         if (ftp && ftp->personality == ABI_PERS_LINUX && !ftp->pending_signals) {
             long frv;
             if (linux_fast_time_syscall(num, a1, a2, &frv)) {
+                { extern volatile uint64_t g_lx_fast_time; g_lx_fast_time++; }
                 ftp->syscall_count++;
                 perf_inc_total_syscalls();
                 wdog_kick_proc(ftp->pid);
                 cli();      /* match the normal return: mask before the .S unwind */
                 return frv;
+            }
+            /* Slice 64 (tier 2): BKL-free futex fast paths -- WAIT with a
+             * stale expected value (-EAGAIN) and WAKE with no waiters (0)
+             * are chrome's dominant futex cases and touch only
+             * g_futex_lock-protected state; see futex_fast() in thread.c.
+             * Falls through to the BKL path for anything that parks/wakes. */
+            if (num == LX_futex) {
+                extern int futex_fast(uint32_t *, int, uint32_t, long *);
+                extern volatile uint64_t g_lx_fast_futex;
+                if (futex_fast((uint32_t *)(uintptr_t)a1, (int)a2,
+                               (uint32_t)a3, &frv)) {
+                    g_lx_fast_futex++;
+                    ftp->syscall_count++;
+                    perf_inc_total_syscalls();
+                    wdog_kick_proc(ftp->pid);
+                    cli();
+                    return frv;
+                }
+            }
+            /* Slice 64 (tier 2): sched_yield is chrome's #1 syscall by 100x
+             * (401k/60s measured) and every one took the BKL only to run a
+             * bkl_exit/bkl_enter round trip. A yield with an empty local
+             * queue is a no-op; serve it lock-free. See sched_yield_fast(). */
+            if (num == LX_sched_yield) {
+                extern int sched_yield_fast(void);
+                extern volatile uint64_t g_lx_fast_yield;
+                if (sched_yield_fast()) {
+                    g_lx_fast_yield++;
+                    ftp->syscall_count++;
+                    perf_inc_total_syscalls();
+                    wdog_kick_proc(ftp->pid);
+                    cli();
+                    return 0;
+                }
             }
         }
     }

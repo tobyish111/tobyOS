@@ -87,10 +87,32 @@ typedef struct {
 } bkl_ticket_t;
 static bkl_ticket_t g_bkl = { 0, 0 };
 
+/* Slice 64 (tier 2): BKL contention meter. rdtsc'd ONLY when the ticket
+ * isn't immediately ours, so the uncontended path is unchanged (the
+ * SMP_DIAG freeze-masking warning was about per-event ring LOGGING; plain
+ * accumulating stores were verified freeze-safe). Read+reset by the 60s
+ * deep dump. */
+uint64_t g_bkl_wait_tsc[MAX_CPUS];
+uint64_t g_bkl_waits[MAX_CPUS];
+uint64_t g_bkl_acqs[MAX_CPUS];
+
+static inline uint64_t bkl_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static inline void bkl_lock(void) {
     uint32_t my = __atomic_fetch_add(&g_bkl.next, 1u, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&g_bkl.serving, __ATOMIC_ACQUIRE) == my) return;
+    uint64_t t0 = bkl_rdtsc();
     while (__atomic_load_n(&g_bkl.serving, __ATOMIC_ACQUIRE) != my)
         __asm__ volatile ("pause" ::: "memory");
+    struct percpu *me = smp_this_cpu();
+    if (me && me->cpu_idx < MAX_CPUS) {
+        g_bkl_wait_tsc[me->cpu_idx] += bkl_rdtsc() - t0;
+        g_bkl_waits[me->cpu_idx]++;
+    }
 }
 static inline void bkl_unlock(void) {
     __atomic_store_n(&g_bkl.serving, g_bkl.serving + 1u, __ATOMIC_RELEASE);
@@ -140,6 +162,7 @@ void bkl_enter(void) {
         return;
     }
     bkl_lock();
+    if (me->cpu_idx < MAX_CPUS) g_bkl_acqs[me->cpu_idx]++;   /* slice 64 */
     me->holds_bkl = true;
 #ifdef SMP_DIAG
     g_bkl_owner = (int)me->cpu_idx;
@@ -571,6 +594,48 @@ int sched_get_prio(int pid) {
     return p ? p->prio : SCHED_PRIO_NONE;
 }
 
+/* ---- Slice 64 (perf tier 2): BKL-FREE sched_yield fast path ----------
+ *
+ * MEASURED (slice 64 [lx-top]): chrome issues ~401,000 sched_yield per 60s
+ * -- 100x the next syscall -- and EVERY one took the BKL just to reach
+ * sched_yield()'s fast path, whose entire body is `bkl_exit(); bkl_enter()`
+ * (a full ticket-lock round trip: go to the back of the fair queue, spin,
+ * re-acquire). That is the system-wide serialization point: cpu1/cpu2 each
+ * showed ~400k acquisitions with ~20k contended waits per interval.
+ *
+ * When the caller is still RUNNING with an empty local ready queue, a yield
+ * is semantically a NO-OP -- nothing can displace us -- so it needs no lock
+ * at all. Served entirely before bkl_enter().
+ *
+ * Two things the old path got FOR FREE from being under the BKL, preserved:
+ *   - the 10ms futex timeout sweep: driven here too (it serialises on
+ *     g_futex_lock, never the BKL, so it is safe lock-free).
+ *   - poll_tick(): needs the BKL, so instead of duplicating it we let the
+ *     fast path DECLINE roughly every 2ms; that yield falls through to the
+ *     normal BKL path and drives poll_tick exactly as before. 0.05% of
+ *     yields keep the wake machinery healthy; the rest never touch the BKL.
+ * Returns 1 if fully served (caller returns 0 to userspace). */
+int sched_yield_fast(void) {
+    struct proc   *cur = current_proc();
+    struct percpu *me  = smp_this_cpu();
+    if (!cur || !me) return 0;
+    if (cur->state != PROC_RUNNING) return 0;
+    if (__atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE) != 0) return 0;
+
+    uint64_t nowns = perf_now_ns();
+    static uint64_t last_slow;          /* let a yield through periodically */
+    if (nowns - last_slow >= 2000000ull) { last_slow = nowns; return 0; }
+
+    wdog_kick_sched();
+    static uint64_t last_sweep;         /* the 10ms futex timeout sweep */
+    if (nowns - last_sweep >= 10000000ull) {
+        last_sweep = nowns;
+        extern void futex_expire_timeouts(void);
+        futex_expire_timeouts();
+    }
+    return 1;
+}
+
 void sched_yield(void) {
     struct proc   *cur = current_proc();
     struct percpu *me  = smp_this_cpu();
@@ -908,6 +973,17 @@ void sched_tick(struct regs *r) {
             lx_dump_recent_syscalls();
             prof_dump_and_reset();   /* hottest user rips this interval */
             { extern void waitt_dump(void); waitt_dump(); }  /* who blocks on what */
+            /* Slice 64: BKL contention + syscall mix -- the tier-2 aiming
+             * data. wait is in raw Mcycles (divide by ~4300 for ms on this
+             * host); acq = acquisitions this interval. */
+            for (uint32_t ci = 0; ci < smp_cpu_count() && ci < MAX_CPUS; ci++) {
+                kprintf("  [bkl] cpu%u acq=%lu waits=%lu wait=%luMcyc\n", ci,
+                        (unsigned long)g_bkl_acqs[ci],
+                        (unsigned long)g_bkl_waits[ci],
+                        (unsigned long)(g_bkl_wait_tsc[ci] >> 20));
+                g_bkl_acqs[ci] = g_bkl_waits[ci] = g_bkl_wait_tsc[ci] = 0;
+            }
+            { extern void lx_dump_syscall_top(void); lx_dump_syscall_top(); }
             /* (deadlocked-stack dump now fires from signal_send at the renderer's
              * SIGKILL -- the only reliable moment; see bt_dump_group.) */
             }                        /* end 60s deep dump (slice 63c) */

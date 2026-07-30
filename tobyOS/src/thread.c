@@ -402,6 +402,52 @@ static void futex_free_entry(struct futex_entry *e) {
     g_futex_free = e;
 }
 
+/* ---- Slice 64 (perf tier 2): BKL-free futex fast paths ---------------
+ *
+ * The futex subsystem's state (hash, waiter lists, pool) is entirely
+ * g_futex_lock-protected -- the BKL wraps futex() only because the generic
+ * syscall entry takes it. Chrome's futex traffic is dominated by two cases
+ * that never touch the scheduler and can be served BEFORE bkl_enter:
+ *
+ *   WAIT with *uaddr != val  -> -EAGAIN   (caller re-checks; no park)
+ *   WAKE with no waiter list -> 0         (every uncontended unlock)
+ *
+ * Correctness: the no-lost-wakeup argument is unchanged from the slow
+ * path. A parking waiter holds g_futex_lock while re-checking *uaddr and
+ * enqueueing; our WAKE fast path takes the same lock for its lookup, so it
+ * either sees the fully-parked waiter (-> falls through to the BKL path to
+ * wake it) or the waiter has not re-checked yet -- and since the waker
+ * changed the futex word BEFORE calling WAKE (the futex protocol), that
+ * waiter's locked re-check will see the new value and EAGAIN out.
+ * Ordering: g_futex_lock -> per-CPU queue locks exists (wake/sweep); these
+ * fast paths take g_futex_lock alone, and nothing under it takes the BKL.
+ * Return 1 = fully served (*out set); 0 = fall through to the BKL path. */
+int futex_fast(uint32_t *uaddr, int op, uint32_t val, long *out) {
+    struct proc *caller = current_proc();
+    if (!caller) return 0;
+    uint64_t addr = (uint64_t)(uintptr_t)uaddr;
+    if (!user_range_ok(addr, sizeof(uint32_t))) { *out = -14; return 1; }
+    int cmd = op & 0x7f;
+
+    if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
+        uint32_t cur;
+        if (copy_from_user(&cur, uaddr, sizeof cur) != 0) { *out = -14; return 1; }
+        if (cur != val) { *out = -11; return 1; }          /* -EAGAIN */
+        return 0;                       /* would park: slow path under BKL */
+    }
+    if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
+        uint64_t cr3 = caller->cr3;
+        uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+        uint32_t idx = futex_hash(cr3, addr);
+        struct futex_entry *e = g_futex_hash[idx];
+        while (e && !(e->key_cr3 == cr3 && e->key_addr == addr)) e = e->next;
+        spin_unlock_irqrestore(&g_futex_lock, flags);
+        if (e) return 0;                /* waiters exist: wake under BKL path */
+        *out = 0; return 1;             /* nobody to wake */
+    }
+    return 0;
+}
+
 long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
     struct proc *caller = current_proc();
     if (!caller) return -1;
