@@ -47,6 +47,10 @@ static void wq_wake_all(struct proc **head) {
         }
         p = next;
     }
+    /* Slice 67: a wake here means this object became ready, which is
+     * exactly the event a parked poll/select/epoll waiter is waiting
+     * for -- tell them instead of letting the timer sweep find it. */
+    poll_event_notify();
 }
 
 /* ---- pipe lifecycle --------------------------------------------- */

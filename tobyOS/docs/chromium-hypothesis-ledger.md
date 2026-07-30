@@ -3849,3 +3849,44 @@ socket.c wq_wake_all) and poll_wake_all's own comment anticipates an
 "event-hook caller" -- so the machinery to hang this on exists. Expected
 effect: epoll_wait's hold collapses toward the cost of ONE scan per real
 event, and with it the last big BKL consumer on the video workload.
+
+## Slice 67 (perf tier 2, FINAL): event-driven poll wakeups. Per-call
+## epoll_wait BKL hold 3.3 -> 0.25 Mcyc (13x cheaper); chrome responded by
+## doing 12x more epoll_waits in the same wall time.
+
+Slice 66 named the structural problem: poll_tick woke EVERY parked poller
+every ~1 ms regardless of which fd became ready, and each one re-scanned all
+its fds under the BKL -- a thundering herd on a timer.
+
+Fix: producers announce readiness. poll_event_notify() (coalesced at 100us,
+BKL-held like poll_wake_all) is called from the paths that actually make an
+fd ready -- inside pipe.c's and socket.c's wq_wake_all (so every existing
+wake site is covered by construction), and at the AF_UNIX enqueue / accept /
+write-space / peer-close sites in unix_socket.c, which is where chrome's
+entire Mojo IPC lives. The unix_socket hooks are placed AFTER the
+spin_unlock (poll_wake_all takes run-queue locks). poll_tick survives as a
+SAFETY NET at 20 ms (was 1 ms) for any readiness source not yet hooked: a
+missing hook costs bounded latency, never a lost wakeup.
+
+MEASURED (video workload, valid run -- the first attempt drew the known
+frozen-lifecycle boot class and was discarded):
+  wakes             89% event-driven (pollevent 103,043 vs polltick 12,674)
+                    total wake rate ~1000/s -> ~385/s, and real events now
+                    wake pollers IMMEDIATELY instead of up to 1 ms later
+  epoll_wait calls  14,785 -> 176,929 per 60s interval   (12x more work)
+  epoll_wait hold   48,781 -> 44,153 Mcyc  (flat in total...)
+  per call          3.3 Mcyc (~0.77 ms) -> 0.25 Mcyc (~58 us)   **13x**
+  BKL held          ~65% -> ~49% of wall clock (94% at session start)
+  health            raf=2907 ric=849, frames 60+, b20.0, lk=20, no crashes
+The lock is no longer being burned on futile re-scans; it is now spread
+across an order of magnitude more real syscalls (recvmsg 173,923 and
+getsockname 126,423 per interval are the next-biggest callers -- both are
+cheap per call, so the remaining BKL cost is breadth, not depth).
+
+TIER 2 IS DONE. Cumulative across slices 64-67: sched_yield no longer
+serialises (25x fewer acquisitions), the disk left ATA PIO (94% -> 1.3%
+held on the UI path), and poll wakeups are event-driven (13x cheaper per
+epoll_wait). What remains on the BKL is many cheap syscalls rather than a
+few expensive ones -- the next structural step would be finer-grained
+locking per subsystem, which is NOT worth doing before the display and GPU
+tiers, because frame production is once again the ceiling.

@@ -728,6 +728,7 @@ void futex_forget_proc(struct proc *p) {
  * re-woke parked pollers, and whether any futex wait ever asked for a
  * CLOCK_REALTIME absolute deadline (which we compare against monotonic). */
 uint64_t g_fx_sweeps, g_fx_sweep_woken, g_poll_tick_wakes, g_fx_rt_flag_count;
+uint64_t g_poll_event_wakes;    /* slice 67: event-driven poller wakeups */
 #endif
 
 /* Wake any list-registered futex waiter whose deadline has passed. Called
@@ -834,15 +835,45 @@ void poll_wake_all(void) {
     }
 }
 
-/* Rate-limited wake-all. Driven from the scheduler yield slow path (under load)
- * and pid 0's idle loop (when every user thread is blocked) so parked pollers
- * are re-scanned every ~1 ms. Cheap early-out when nothing is parked. Callers
- * MUST hold the BKL. */
+/* ---- Slice 67 (perf tier 2, final step): EVENT-DRIVEN poll wakeups ----
+ *
+ * MEASURED (slice 66): epoll_wait held the BKL ~0.77 ms PER CALL --
+ * ~48,800 Mcyc across ~14,785 calls per 60s -- which is far more than one
+ * scan of <=64 fds can cost. The reason was structural: every parked
+ * poller was woken every ~1 ms by poll_tick REGARDLESS of whether any
+ * watched fd had become ready, and each one then re-scanned all its fds
+ * under the BKL. N pollers x M fds x 1000 times a second, almost all of it
+ * futile -- a thundering herd on a timer.
+ *
+ * Now the producers say when something happened: poll_event_notify() is
+ * called from the paths that actually make an fd readable/writable (pipe
+ * data + closes, socket receive enqueues + peer shutdown), and poll_tick
+ * degrades to a slow SAFETY NET for any readiness source not yet hooked
+ * (a missed hook costs latency, bounded by the net's period -- never a
+ * lost wakeup). Notifies are coalesced at 100us so a burst of arriving
+ * packets cannot turn into a wake storm of its own.
+ * Callers MUST hold the BKL (same convention as poll_wake_all). */
+void poll_event_notify(void) {
+    static uint64_t last_ns;
+    if (!g_poll_waiters) return;              /* nobody parked: free */
+    uint64_t now = perf_now_ns();
+    if (now - last_ns < 100000ull) return;    /* coalesce bursts (100us) */
+    last_ns = now;
+#ifdef CHROMIUM_BOOT
+    g_poll_event_wakes++;
+#endif
+    poll_wake_all();
+}
+
+/* Fallback sweep: covers readiness sources with no poll_event_notify hook
+ * yet (and timeouts). Driven from the scheduler yield slow path and pid 0's
+ * idle loop. Slice 67: 1 ms -> 20 ms now that real events wake pollers
+ * directly -- this is the belt, not the braces. Callers MUST hold the BKL. */
 void poll_tick(void) {
     static uint64_t last_ns;
     if (!g_poll_waiters) return;
     uint64_t now = perf_now_ns();
-    if (now - last_ns < 1000000ull) return;   /* >= ~1 ms since last wake */
+    if (now - last_ns < 20000000ull) return;  /* >= ~20 ms since last sweep */
     last_ns = now;
 #ifdef CHROMIUM_BOOT
     g_poll_tick_wakes++;

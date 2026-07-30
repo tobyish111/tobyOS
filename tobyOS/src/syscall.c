@@ -6648,10 +6648,12 @@ void waitt_dump(void) {
             int64_t d = (int64_t)p->futex_deadline_ns - (int64_t)now;
             if (!have || d < mind) { mind = d; minpid = p->pid; have = 1; }
         }
-        kprintf("  [tick] fxsweep=%lu woke=%lu polltick=%lu rtflag=%lu "
-                "timedfx=%d nextdue=%ldms pid=%d\n",
+        extern uint64_t g_poll_event_wakes;     /* slice 67 */
+        kprintf("  [tick] fxsweep=%lu woke=%lu polltick=%lu pollevent=%lu "
+                "rtflag=%lu timedfx=%d nextdue=%ldms pid=%d\n",
                 (unsigned long)g_fx_sweeps, (unsigned long)g_fx_sweep_woken,
                 (unsigned long)g_poll_tick_wakes,
+                (unsigned long)g_poll_event_wakes,
                 (unsigned long)g_fx_rt_flag_count, timed,
                 have ? (long)(mind / 1000000ll) : 0, minpid);
     }

@@ -154,6 +154,11 @@ long sys_unix_connect(int sockfd, const char *path) {
         sched_enqueue(w);
     }
     spin_unlock_irqrestore(&server->lock, f);
+    /* Slice 67: this AF_UNIX object just became ready (chrome runs its
+     * whole Mojo IPC over these), so wake parked poll/epoll waiters by
+     * EVENT rather than letting the fallback sweep find it. After the
+     * unlock: poll_wake_all takes run-queue locks. */
+    poll_event_notify();
 
     /* Wait for the server to accept (simplified: just connect immediately) */
     /* The accept call will link us */
@@ -248,6 +253,11 @@ long sys_unix_send(int sockfd, const void *buf, size_t len) {
     }
 
     spin_unlock_irqrestore(&peer->lock, f);
+    /* Slice 67: this AF_UNIX object just became ready (chrome runs its
+     * whole Mojo IPC over these), so wake parked poll/epoll waiters by
+     * EVENT rather than letting the fallback sweep find it. After the
+     * unlock: poll_wake_all takes run-queue locks. */
+    poll_event_notify();
     return (long)written;
 }
 
@@ -297,6 +307,11 @@ long sys_unix_recv(int sockfd, void *buf, size_t len) {
     }
 
     spin_unlock_irqrestore(&s->lock, f);
+    /* Slice 67: this AF_UNIX object just became ready (chrome runs its
+     * whole Mojo IPC over these), so wake parked poll/epoll waiters by
+     * EVENT rather than letting the fallback sweep find it. After the
+     * unlock: poll_wake_all takes run-queue locks. */
+    poll_event_notify();
     return (long)read;
 }
 
@@ -325,5 +340,8 @@ long sys_unix_close(int sockfd) {
 
     s->active   = false;
     s->peer_idx = -1;
+    /* Slice 67: closing this end makes the PEER readable (EOF) -- a poller
+     * watching it must learn that from the event, not the sweep. */
+    poll_event_notify();
     return 0;
 }

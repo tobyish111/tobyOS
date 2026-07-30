@@ -623,6 +623,10 @@ void poll_init(void);
 void poll_wait_block(void);
 void poll_wake_all(void);
 void poll_tick(void);
+/* Slice 67: called by paths that make an fd ready (pipe data/close, socket
+ * receive enqueue, peer shutdown) so parked poll/select/epoll waiters are
+ * woken by EVENTS instead of a 1ms timer sweep. BKL-held, coalesced. */
+void poll_event_notify(void);
 void poll_forget_proc(struct proc *p);
 
 /* Set the calling thread's TLS base (loaded into FS.base). */
