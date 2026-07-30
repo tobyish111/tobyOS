@@ -4023,3 +4023,43 @@ or a --type= child; (2) instrument the faulting VA against the VMA table at
 fault time to catch the second no-VMA mechanism with a live reproducer;
 (3) only then judge whether exit 191 is a consequence of the SIGSEGV or an
 independent decision.
+
+## Slice 71 (Route B m1 cont.): exit 191 IDENTIFIED as chrome's own CHECK
+## (INT3), deterministic and FLAG-INDEPENDENT. Symbolization is a dead end;
+## the next move is a control, not more guessing.
+
+Facts established this pass:
+ - `[sigfault] pid=3 name=chrome vec=3 sig=5 rip=0x624a118` -- vector 3 is
+   INT3, i.e. base::ImmediateCrash/CHECK. exit_group(191) is the AFTERMATH
+   of chrome deliberately aborting itself, not a kernel kill and not an ABI
+   rejection.
+ - DETERMINISTIC: identical rip across runs.
+ - FLAG-INDEPENDENT: replacing the whole GL flag set (--use-gl=angle
+   --use-angle=swiftshader --enable-unsafe-swiftshader --in-process-gpu ->
+   --disable-gpu, letting the full binary build its own stack) reproduced
+   the SAME rip and the SAME exit. So the GL/Ozone flags are exonerated;
+   reverted to one code path.
+ - The earlier "chrome relaunches itself" reading is CORRECTED: both
+   GetCollectStatsConsent lines carry the same `[3:3:` pid:tid, so one
+   browser process logs it twice. What actually happens is pid 3 FORKS
+   (no exec) a child that exits 0; the browser then CHECKs.
+ - The child's `[pfrej] NO VMA` fault sits just past the end of a giant
+   PROT_NONE reservation [0x102b00002000,0x102f00000000) -- the V8
+   pointer-compression cage / PartitionAlloc pattern. mmap's MAP_FIXED path
+   was audited and does honour the requested base, and the VMA table is
+   correctly keyed by tgid for threads, so neither is the explanation yet.
+ - Symbolization is impractical: chrome is a stripped PIE (only ChromeMain
+   exported). Loaded at base 0x500000, so rip -> vaddr 0x5d4a118, and the
+   INT3 byte is at rip-1 (the trap pushes the following address). Nearby
+   .rodata strings are unrelated neighbours, not the CHECK's own message --
+   and no CHECK text ever reached stderr even at --v=1, which is itself
+   odd (a LOG(FATAL) should print file:line first).
+
+NEXT MOVE -- run the CONTROL, per this project's own prime directive:
+execute THIS EXACT binary with THESE EXACT flags somewhere known-good
+(WSL/Linux box, or docker) and see whether it also CHECKs. If it does, the
+flags/environment are wrong and tobyOS is exonerated (this is precisely the
+mistake slices 59-60 made by not controlling first). If it runs there and
+CHECKs here, THEN diff the environment: the fork-without-exec child, the
+absent /proc entries chrome reads, or a syscall returning a plausible-but-
+wrong value. Only after that does instrumenting the trap site pay.
