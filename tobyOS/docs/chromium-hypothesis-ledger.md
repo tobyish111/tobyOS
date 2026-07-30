@@ -3890,3 +3890,45 @@ epoll_wait). What remains on the BKL is many cheap syscalls rather than a
 few expensive ones -- the next structural step would be finer-grained
 locking per subsystem, which is NOT worth doing before the display and GPU
 tiers, because frame production is once again the ceiling.
+
+## Slice 68 (perf tier 2.5): SIZING the zero-copy frame path before
+## building it. Frame rate is PAYLOAD-BOUND: a 6x cheaper frame is 2.3x
+## more frames. Zero-copy is therefore worth ~2.3x -- and needs the X11 arc.
+
+T1 proved OUR side of the display path is free (decode 1 ms, paint 0-3 ms).
+That leaves chrome's own JPEG ENCODE plus the base64/CDP transport as the
+per-frame cost. Measured it directly instead of assuming, by making frames
+cheaper and counting them (react.dev, identical 360 s runs):
+
+    quality 60, 1:1  (800x600)   ~21 KB/frame    1050 frames   (baseline)
+    quality 10, 1:1  (800x600)    9.8 KB/frame   1440 frames   (+37%)
+    quality 10, 1/2  (400x300)    3.5 KB/frame   2430 frames   (+131%)
+
+Frame rate tracks payload size, not scene complexity -- so the pipeline is
+bound by per-frame encode+transport, exactly what a shared-memory surface
+eliminates. **Zero-copy is worth up to ~2.3x at full fidelity**, which is
+now a measured justification rather than an assumption.
+
+BUT the cheap-frame configs are NOT shippable as-is: half resolution makes
+body text unreadable (a browser's whole job), and quality 10 visibly
+destroys text edges at full res. Reverted to quality 60 at 1:1 (fidelity +
+correct click mapping, slice 62).
+
+WHAT T2.5 ACTUALLY REQUIRES (and why it is not finished here): CDP can only
+hand over base64-encoded images -- there is no shared-memory frame API. A
+true zero-copy path means chrome must composite into memory we own, i.e.
+Ozone X11 + MIT-SHM against the in-kernel fake X server, which in turn needs
+the FULL chrome binary (chrome-headless-shell is headless-only). That is the
+Route-B arc -- refuted earlier as a FUNCTIONALITY requirement (slice 61
+proved headless renders everything), but it is exactly the right vehicle for
+PERFORMANCE. Scope: full chrome + its extra DSOs into the initrd, then grow
+src/socket.c's fake X server from handshake-only to CreateWindow / MapWindow
+/ GetGeometry / PutImage+MIT-SHM, then read pixels straight out of the
+shared segment. Big, but now demonstrably worth ~2.3x.
+
+INTERIM OPTION worth one experiment next session, cheaper than the X11 arc:
+Emulation.setDeviceMetricsOverride with deviceScaleFactor 0.5 renders (and
+encodes) a quarter of the pixels while keeping CSS geometry -- so input
+coordinates stay correct, unlike the maxWidth scaling that caused the
+slice-62 click skew. That trades sharpness for smoothness with correct
+input, and is a one-flag test.
