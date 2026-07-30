@@ -369,14 +369,23 @@ static long g_last_frame_ms;
 /* Decode the base64 "data" field currently in g_msg and install it as the
  * displayed frame. Shared by the pushed-screencast path and the polled
  * captureScreenshot fallback. Returns 1 if a frame was installed. */
+/* Slice 63a: the display-path profile. Aggregate per-stage milliseconds
+ * over each 30-frame window and print the averages -- every speedup claim
+ * in the perf arc gets a number from HERE, not from vibes. b64 = base64
+ * strip; dec = toby_image_load (JPEG decode + pixel swizzle); blt =
+ * tk_redraw (blit syscall + kernel window copy). */
+static long g_t_b64, g_t_dec, g_t_blt, g_t_n;
+
 static int install_b64_frame(void) {
     const char *p = strstr(g_msg, "\"data\":\"");
     if (!p) return 0;
     p += 8;
     const char *e = strchr(p, '"');
     if (!e) return 0;
+    long t0ms = sys_clock_ms();
     long n = b64_decode_buf(p, e - p, g_png);
     if (n <= 8) return 0;
+    long t1ms = sys_clock_ms();
     toby_image_t *img = toby_image_load(g_png, (size_t)n);   /* JPEG */
     if (!img) {
         /* Slice 62: name the size, stbi's own reason, AND whether a big
@@ -394,15 +403,26 @@ static int install_b64_frame(void) {
         }
         return 0;
     }
+    long t2ms = sys_clock_ms();
     toby_image_t *old = g_frame;
     g_frame = img;
     if (old) toby_image_free(old);
     g_frames++;
     g_last_frame_ms = sys_clock_ms();
-    if (g_frames == 1 || (g_frames % 30) == 0)
-        printf("[chromewin] frame %d: %dx%d jpeg=%ld bytes\n",
-               g_frames, img->width, img->height, n);
-    tk_redraw(&win);
+    tk_redraw(&win);                  /* marks dirty; paint() runs in tk_pump */
+    g_t_b64 += t1ms - t0ms;
+    g_t_dec += t2ms - t1ms;
+    g_t_n++;
+    if (g_frames == 1 || (g_frames % 30) == 0) {
+        extern long g_t_paint, g_n_paint;         /* accumulated in paint() */
+        printf("[chromewin] frame %d: %dx%d jpeg=%ld bytes | avg/%ld "
+               "b64=%ldms dec=%ldms paint=%ldms(x%ld)\n",
+               g_frames, img->width, img->height, n, g_t_n,
+               g_t_b64 / g_t_n, g_t_dec / g_t_n,
+               g_n_paint ? g_t_paint / g_n_paint : 0, g_n_paint);
+        g_t_b64 = g_t_dec = 0; g_t_n = 0;
+        g_t_paint = g_n_paint = 0;
+    }
     return 1;
 }
 
@@ -1179,8 +1199,13 @@ static void send_key(uint8_t key) {
 
 /* ---- TobyTK glue -------------------------------------------------------- */
 
+/* Slice 63a: blit-stage timing (paint is driven by tk_pump, not by the
+ * frame installer, so it keeps its own accumulator/counter pair). */
+long g_t_paint, g_n_paint;
+
 static void paint(struct tk_window *w, struct tk_widget *cv) {
     (void)cv;
+    long tp0 = sys_clock_ms();
     /* Slice 62: paint from LIVE window geometry (tk.c updates w->w/w->h on
      * TK_EV_RESIZE), not the launch-time constants. */
     int pw = w->w, ph = w->h - BAR_H;
@@ -1204,6 +1229,8 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
         tk_draw_text(w, pw / 2 - 100, BAR_H + ph / 2 - 20,
                      "connecting to chrome...", 0x00a0a0b0u, 16, 1);
     }
+    g_t_paint += sys_clock_ms() - tp0;
+    g_n_paint++;
 }
 
 static void on_event(struct tk_window *w, struct tk_widget *cv,

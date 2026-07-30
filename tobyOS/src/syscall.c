@@ -6940,9 +6940,15 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (df && (df->kind == FILE_KIND_PIPE_R || df->kind == FILE_KIND_PIPE_W)) {
                 struct proc *dp = current_proc();
                 long dr = sys_read((int)a1, (void *)a2, (size_t)a3);
-                kprintf("[devpipe] pid=%d read(fd=%d, %lu) -> %ld\n",
-                        dp ? dp->pid : -1, (int)a1,
-                        (unsigned long)a3, dr);
+                /* Slice 63c: was UNCAPPED (5k+ lines/run; serial bytes are
+                 * VM exits). First 64 keep bootstrap visibility; then 1 in
+                 * 128 keeps a liveness sample. */
+                static unsigned dprc;
+                if (dprc < 64 || (dprc & 127u) == 0)
+                    kprintf("[devpipe] pid=%d read(fd=%d, %lu) -> %ld #%u\n",
+                            dp ? dp->pid : -1, (int)a1,
+                            (unsigned long)a3, dr, dprc);
+                dprc++;
                 return dr;
             }
         }
@@ -6955,9 +6961,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (df && (df->kind == FILE_KIND_PIPE_R || df->kind == FILE_KIND_PIPE_W)) {
                 struct proc *dp = current_proc();
                 long dw = sys_write((int)a1, (const void *)a2, (size_t)a3);
-                kprintf("[devpipe] pid=%d write(fd=%d, %lu) -> %ld\n",
-                        dp ? dp->pid : -1, (int)a1,
-                        (unsigned long)a3, dw);
+                static unsigned dpwc;            /* slice 63c: cap, as read */
+                if (dpwc < 64 || (dpwc & 127u) == 0)
+                    kprintf("[devpipe] pid=%d write(fd=%d, %lu) -> %ld #%u\n",
+                            dp ? dp->pid : -1, (int)a1,
+                            (unsigned long)a3, dw, dpwc);
+                dpwc++;
                 return dw;
             }
         }

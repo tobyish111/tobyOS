@@ -87,15 +87,38 @@ toby_image_t *toby_image_load(const uint8_t *data, size_t len) {
 
     img->width  = w;
     img->height = h;
+
+    /* Convert RGBA -> ARGB8888 (stbi emits R,G,B,A bytes; tobyOS wants
+     * 0xAARRGGBB). Slice 63b: swizzle IN PLACE as u32 ops. The old path
+     * malloc'd a SECOND full-size buffer and converted byte-by-byte into
+     * it -- for chromewin's frame stream that was an extra 1.9-3.6 MiB
+     * allocation + free per frame (double the allocator churn that
+     * triggered the 62b malloc bug) plus a scalar pass clang cannot
+     * vectorize. As u32 loads (RGBA little-endian == 0xAABBGGRR) the
+     * transform is keep A+G, swap R<->B -- three ANDs, two shifts, two
+     * ORs -- which clang auto-vectorizes to 4-8 pixels per instruction
+     * under -msse2. stbi's buffer comes from OUR malloc (STBI_MALLOC), so
+     * adopting it as img->pixels is free()-compatible; WebP/AVIF buffers
+     * come from foreign allocators and keep the copy path. */
+    if (!from_webp && !from_avif) {
+        uint32_t *px = (uint32_t *)rgba;
+        size_t    npx = (size_t)w * (size_t)h;
+        for (size_t i = 0; i < npx; i++) {
+            uint32_t p = px[i];
+            px[i] = (p & 0xFF00FF00u)            /* A and G stay */
+                  | ((p & 0x00FF0000u) >> 16)    /* B down to low byte */
+                  | ((p & 0x000000FFu) << 16);   /* R up to bits 16-23 */
+        }
+        img->pixels = px;                        /* adopt stbi's buffer */
+        return img;
+    }
+
     img->pixels = (uint32_t *)malloc((size_t)w * (size_t)h * 4);
     if (!img->pixels) {
-        if (from_webp) WebPFree(rgba); else if (from_avif) free(rgba); else stbi_image_free(rgba);
+        if (from_webp) WebPFree(rgba); else free(rgba);
         free(img);
         return NULL;
     }
-
-    /* Convert RGBA -> ARGB8888. stbi outputs R,G,B,A bytes in order.
-     * tobyOS expects 0xAARRGGBB packed uint32_t. */
     for (int i = 0; i < w * h; i++) {
         uint8_t r = rgba[i * 4 + 0];
         uint8_t g = rgba[i * 4 + 1];
@@ -106,8 +129,7 @@ toby_image_t *toby_image_load(const uint8_t *data, size_t len) {
                           ((uint32_t)g << 8)  |
                           ((uint32_t)b);
     }
-
-    if (from_webp) WebPFree(rgba); else if (from_avif) free(rgba); else stbi_image_free(rgba);
+    if (from_webp) WebPFree(rgba); else free(rgba);
     return img;
 }
 

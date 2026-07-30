@@ -841,10 +841,21 @@ void sched_tick(struct regs *r) {
      * serial output stays sparse. Diagnostic read of g_proc without a lock is
      * fine for a heartbeat (worst case a garbled line). */
     if (me && me->cpu_idx == 0) {
-        static uint64_t last_hb;
+        static uint64_t last_hb, last_deep;
         uint64_t now = perf_now_ns();
         if (now - last_hb > 3000000000ull) {
             last_hb = now;
+            /* Slice 63c: the 3s cadence used to emit the FULL dump (proc
+             * table + BKL/per-CPU + 384-entry syscall ring + prof + waitt,
+             * ~450 lines) -- ~50k serial lines per 360s run, and every
+             * serial byte is a VM EXIT under WHPX, so the watchdog itself
+             * was a measurable drag on the thing it watched. Keep a 1-line
+             * heartbeat at 3s (liveness + logdrop signal for the wedge
+             * classes); run the deep dump every 60s. */
+            kprintf("[hb %lu ms] alive logdrop=%lu\n",
+                    now / 1000000ull, (unsigned long)serial_dropped());
+            if (now - last_deep > 60000000000ull) {
+            last_deep = now;
             extern struct proc g_proc[];
             uint64_t nt = pit_ticks();
             kprintf("[hb %lu ms] chrome thread states (pit=%lu) logdrop=%lu:\n",
@@ -899,6 +910,7 @@ void sched_tick(struct regs *r) {
             { extern void waitt_dump(void); waitt_dump(); }  /* who blocks on what */
             /* (deadlocked-stack dump now fires from signal_send at the renderer's
              * SIGKILL -- the only reliable moment; see bt_dump_group.) */
+            }                        /* end 60s deep dump (slice 63c) */
         }
     }
 #endif

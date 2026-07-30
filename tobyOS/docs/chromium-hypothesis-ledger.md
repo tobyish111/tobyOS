@@ -3647,3 +3647,34 @@ chrome relayout -> full-size frames decoded -> displayed 1:1.
 ## is inherent (real V8+Blink); raster throughput is the only axis where
 ## light sites (react.dev, 5fps) and heavy ones (YouTube, ~sub-1fps under
 ## video) differ.
+
+## Slice 63 (perf tier 1): instrumentation + display-path cleanup + the
+## serial firehose. RESULT: display path is now ~FREE; production is the
+## bottleneck -- the profile that aims tier 2.
+
+63a INSTRUMENT: per-stage frame timers in chromewin (b64 strip / decode+
+swizzle / paint), aggregated per 30-frame window, printed with each frame
+line. Every future perf claim reads from here.
+63b DISPLAY PATH: RGBA->ARGB now swizzles IN PLACE in stbi's own buffer as
+u32 ops (keep A+G, swap R<->B) -- clang vectorizes it under -msse2 -- and
+the buffer is ADOPTED as img->pixels (stbi allocates via our malloc). Kills
+a full-size second allocation + byte-wise convert pass per frame; halves
+the big-chunk churn that provoked the 62b allocator bug.
+63c SERIAL FIREHOSE: the CHROMIUM_BOOT watchdog dumped ~450 lines (proc
+table + BKL/per-CPU + 384-entry syscall ring + prof + waitt) EVERY 3s --
+~50k lines/360s run, and every guest serial byte is a WHPX VM EXIT, so the
+watchdog dragged on the system it watched. Now: 1-line [hb] at 3s
+(liveness + logdrop), deep dump at 60s. [devpipe] capped (first 64 then
+1-in-128; was 5k+/run uncapped). Log volume: 3-14 MB -> 0.7 MB (5-20x).
+
+MEASURED, post-fix:
+- react.dev, 630 frames: dec=1ms b64=0ms paint=0-3ms per frame. The
+  display path is ~free; frame rate (~2-5fps) is limited by PRODUCTION
+  (chrome compositor/SwiftShader/BeginFrame under the BKL'd syscall
+  layer). Tier 2 (BKL fast paths for futex/pipe/epoll) is the aimed lever.
+- YouTube watch (b52.1 buffered, th=20 lk=20 full parity on the same run):
+  the one video-frame sample decoded at ~90-120ms -- photographic content
+  is where stb hurts; libjpeg-turbo (or half-res capture during playback)
+  remains the video-case lever. More samples wanted.
+- Whole-run health with the quiet kernel: full-parity YouTube run with
+  comments + b52.1 on the first try of the evening.
