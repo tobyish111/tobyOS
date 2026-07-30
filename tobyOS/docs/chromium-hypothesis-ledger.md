@@ -3597,3 +3597,19 @@ the polled path forever.
 Note: the [pfrej] NO-VMA startup flake recurred (same 0xc0da000/0xc0db000
 addresses) WITHOUT the slice-61f munmap WARN firing -- a second mechanism
 produces the same VMA-less-present-PTE state; still open.
+
+## Slice 62 addendum: the post-resize display blocker is CONFIRMED heap
+## exhaustion -- and the numbers implicate libtoby's allocator, not sizing.
+
+A healthy-boot diagnostic run finally landed: post-resize decode failures
+report `reason=outofmem malloc4M=FAIL` -- at failure time even a bare
+malloc(4MB) fails while small allocations keep working. The pool is 64 MiB;
+steady-state frame churn (two ~1.9 MiB blocks per frame, freed each cycle)
+plus the resize transition should peak under ~10 MiB. ~180 successful
+frames before exhaustion does not add up for a healthy first-fit +
+forward-coalesce allocator: suspect chunks being LOST (freelist damage or
+failed coalescing under interleaved large/small churn) in stdlib.c. NEXT:
+instrument the heap (tip position + freelist total per N frames) and run
+the example.com + RESIZE_TEST harness -- it reproduces in one ~7 min run.
+toby_image_load/free audited leak-free (all rgba temporaries freed on
+every path; img->pixels/struct owned and freed by toby_image_free).
