@@ -3932,3 +3932,58 @@ encodes) a quarter of the pixels while keeping CSS geometry -- so input
 coordinates stay correct, unlike the maxWidth scaling that caused the
 slice-62 click skew. That trades sharpness for smoothness with correct
 input, and is a one-flag test.
+
+## Slice 69 (tier 2.5 continued): the dsf interim FAILED; Route B milestone
+## 1 (FULL chrome on tobyOS) got two real kernel/build gaps fixed and now
+## runs 10x further -- symlink(2) was missing, which is what killed it.
+
+PART A -- interim half-raster: TESTED AND REJECTED. Theory:
+Emulation.setDeviceMetricsOverride{deviceScaleFactor:0.5} would raster and
+encode a quarter of the pixels while CSS geometry (hence click mapping)
+stayed 1:1 -- the safe version of the resolution trick. Implemented with a
+2x nearest-neighbour upscale band-blit on our side. RESULT: 990 frames vs
+the 1050 baseline (WORSE), and frames still arrived 800x600 with a LARGER
+payload (23 KB vs 21 KB): Page.startScreencast captures at CSS size and
+ignores deviceScaleFactor<1. Reverted. So there is no cheap interim: the
+only ways to shrink the per-frame payload are quality (destroys text) or a
+real shared-memory surface.
+
+PART B -- Route B milestone 1: does the FULL chrome binary run at all?
+ - Fetched chrome 151.0.7922.71 (chrome-linux64, 389 MB extracted, 290 MB
+   binary vs the 262 MB headless-shell tree).
+ - DT_NEEDED diff vs headless-shell: only FOUR extra direct libs
+   (libcairo, libcups, libpango, libsmime3) -- far less than feared.
+ - Discovering the TRANSITIVE closure one guest boot at a time would cost
+   ~7 min per library (chrome's loader reports only the first failure), so
+   programs/chromium/closure.py walks DT_NEEDED across the binary + every
+   staged .so, subtracts glibc-provided names, maps sonames to Debian
+   packages, fetches and stages, and repeats until empty. CLOSED in 4
+   rounds / seconds: cups pulled in the whole GSSAPI/Kerberos + GnuTLS
+   chain (gssapi_krb5, krb5, k5crypto, com_err, krb5support, keyutils,
+   gnutls, tasn1, nettle, hogweed, gmp, p11-kit, idn2, unistring, ssl3).
+   186 libs staged; initrd 392 MB -> 550 MB, ISO 583 MB (RAM-loaded, needs
+   the existing -m 6144).
+ - Makefile: CHROME_FULL=1 stages chrome-linux64 as /opt/chrome instead of
+   the shell (they cannot both fit); logs/build_full.sh drives it.
+ - BUILD BUG FOUND: EXTRA_CFLAGS only reaches KERNEL objects, so
+   -DCHROME_FULL silently missed chromewin, which kept exec'ing the (now
+   unstaged) headless-shell path -- an exit-127 that looked exactly like a
+   loader failure. Added PROG_EXTRA_CFLAGS for user programs.
+ - KERNEL GAP FOUND AND FIXED: symlink(2)/symlinkat(2) were never wired to
+   the Linux personality even though vfs_symlink() existed. Full chrome's
+   ProcessSingleton ("one instance per profile" -- something
+   chrome-headless-shell does not have) creates a SingletonLock SYMLINK and
+   treats failure as FATAL (chrome_main_delegate.cc:520). With symlink
+   wired, that error is gone. This benefits every Linux app, not just
+   chrome.
+ - Diagnosis tooling: the CHROMIUM_BOOT stdout hook logged only fd 1;
+   chrome reports its fatal reasons on fd 2, so an exit_group(21) had no
+   explanation anywhere. Now both fds are echoed (120-char window) -- which
+   is how the ProcessSingleton message was found at all.
+
+STATUS: full chrome LOADS, links its whole DSO closure, and now runs 1,269
+syscalls (was 128) -- through getrandom/mkdir/stat/prctl/sendmsg (its Mojo
+handshake) -- before exit_group(191) with NO fatal message logged. That
+exit is the next thread to pull; it is an application-level decision, not a
+loader or ABI failure. NOTE the default (headless-shell) flavour is
+untouched and still the one build_vid.sh produces.

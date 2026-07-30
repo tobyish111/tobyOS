@@ -684,8 +684,21 @@ static int spawn_chrome(void) {
         /* argv/envp mirror the proven CHROMIUM_BOOT set (kernel.c slice 38),
          * minus one-shot --dump-dom/--screenshot/--timeout/--log-net-log,
          * plus --remote-debugging-pipe for the long-lived session. */
+        /* Slice 69 (Route B m1): CHROME_FULL builds stage the FULL chrome
+         * binary at /opt/chrome/chrome instead of the headless-only shell.
+         * Same flags work (full chrome accepts --headless=new); the point of
+         * the swap is that only the full binary has the Ozone backends, which
+         * is what the zero-copy frame path (T2.5) ultimately needs. */
+#ifdef CHROME_FULL
+        (void)0;
+#endif
         char *argv[] = {
+#ifdef CHROME_FULL
+            (char *)"/opt/chrome/chrome",
+            (char *)"--headless=new",
+#else
             (char *)"/opt/chrome/chrome-headless-shell",
+#endif
             /* MANDATORY: we run as root; chrome exit(1)s at ~4s with
              * "Running as root without --no-sandbox is not supported"
              * otherwise (zygote_host_impl_linux.cc:101).  This exact

@@ -1323,8 +1323,12 @@ endef
 # against libtoby.a + crt0.o the same way every other static program does.
 # Other programs continue to see ONLY libtoby/include headers.
 define LIBTOBY_KABI_PROGRAM_RULES
+# Slice 69: PROG_EXTRA_CFLAGS lets a flavour build pass defines to USER
+# programs. EXTRA_CFLAGS only reaches kernel objects, so -DCHROME_FULL
+# silently missed chromewin and it exec'd the (now unstaged) headless-shell
+# path -- an exit-127 that looked like a loader failure.
 programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR)
-	$$(CC) $$(LIBTOBY_CFLAGS) -I include -c $$< -o $$@
+	$$(CC) $$(LIBTOBY_CFLAGS) $$(PROG_EXTRA_CFLAGS) -I include -c $$< -o $$@
 
 programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
                         $(LIBTOBY_CRT0) \
@@ -2970,7 +2974,17 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "(static musl, brandelf EI_OSABI=Linux) -- OPT-IN";         \
 	    EXTRA_FILES="$$EXTRA_FILES bin/curl-real";                        \
 	fi;                                                                   \
-	if [ -f programs/chromium/chrome-headless-shell-linux64/chrome-headless-shell ]; then \
+	if [ "$(CHROME_FULL)" = "1" ] && [ -f programs/chromium/chrome-linux64/chrome ]; then \
+	    mkdir -p $(INITRD_STAGE)/opt; \
+	    cp -r programs/chromium/chrome-linux64 $(INITRD_STAGE)/opt/chrome; \
+	    if [ -d programs/chromium/sysroot ]; then \
+	        cp -r programs/chromium/sysroot $(INITRD_STAGE)/opt/chrome/sysroot; \
+	    fi; \
+	    printf '\003' | dd of=$(INITRD_STAGE)/opt/chrome/chrome bs=1 seek=7 count=1 conv=notrunc 2>/dev/null; \
+	    printf '\003' | dd of=$(INITRD_STAGE)/opt/chrome/chrome_crashpad_handler bs=1 seek=7 count=1 conv=notrunc 2>/dev/null; \
+	    echo "[initrd] chromium: staging FULL chrome (+sysroot) under /opt/chrome -- CHROME_FULL=1 (Route B: headed/Ozone arc)"; \
+	    EXTRA_FILES="$$EXTRA_FILES opt/chrome"; \
+	elif [ -f programs/chromium/chrome-headless-shell-linux64/chrome-headless-shell ]; then \
 	    mkdir -p $(INITRD_STAGE)/opt; \
 	    cp -r programs/chromium/chrome-headless-shell-linux64 $(INITRD_STAGE)/opt/chrome; \
 	    if [ -d programs/chromium/sysroot ]; then \

@@ -248,14 +248,19 @@ static long sys_write(int fd, const void *buf, size_t len) {
     /* slice 20: does chrome ever write the --dump-dom output to stdout (fd 1)?
      * If yes we should see "<html.../<h1>tobyOS"; if there are no [stdout] lines
      * at all, chrome never reaches the DOM dump (navigation never completes). */
-    if (fd == 1) {
+    /* Slice 69: fd 2 as well. chrome reports its OWN fatal reasons on
+     * STDERR ("error while loading shared libraries", sandbox/Ozone
+     * complaints, CHECK failures); logging only fd 1 left an exit_group(21)
+     * with no explanation anywhere. Wider window (120 chars) because those
+     * messages carry the useful detail at the end. */
+    if (fd == 1 || fd == 2) {
         static int w1 = 0;
-        if (w1 < 80) { w1++;
-            char pre[49]; size_t n = len < 48 ? len : 48;
+        if (w1 < 160) { w1++;
+            char pre[121]; size_t n = len < 120 ? len : 120;
             memcpy(pre, k, n); pre[n] = '\0';
             for (size_t i = 0; i < n; i++)
                 if (pre[i] == '\n' || pre[i] == '\r') pre[i] = ' ';
-            kprintf("[stdout] len=%lu: %s\n", (unsigned long)len, pre);
+            kprintf("[fd%d] len=%lu: %s\n", fd, (unsigned long)len, pre);
         }
     }
 #endif
@@ -4369,6 +4374,14 @@ enum {
     LX_exit_group = 231, LX_tgkill = 234, LX_openat = 257,
     LX_newfstatat = 262, LX_set_robust_list = 273, LX_getrandom = 318,
     LX_readlink = 89, LX_readlinkat = 267,  /* B20: /proc/self/exe etc. */
+    /* Slice 69: symlink(2)/symlinkat(2). vfs_symlink() has existed since the
+     * /proc work but was never reachable from Linux personality, so
+     * symlink() returned ENOSYS -- which is precisely why the FULL chrome
+     * binary died at startup: its ProcessSingleton ("one instance per
+     * profile", a thing chrome-headless-shell does not have) creates a
+     * SingletonLock SYMLINK in the profile dir and treats failure as fatal
+     * (chrome_main_delegate.cc:520). */
+    LX_symlink = 88, LX_symlinkat = 266,
     LX_dup3 = 292, LX_pipe2 = 293,   /* B12: shell pipelines (dup3/pipe2) */
     /* B13: readiness multiplexing. */
     LX_poll = 7, LX_select = 23, LX_epoll_create = 213, LX_epoll_wait = 232,
@@ -7417,6 +7430,31 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (n > bufsz) n = bufsz;          /* readlink does NOT NUL-terminate */
         if (copy_to_user(ubuf, ktmp, n) != 0) return -ABI_EFAULT;
         return (long)n;
+    }
+
+    /* Slice 69: symlink(target, linkpath) / symlinkat(target, dirfd,
+     * linkpath). Note the argument ORDER -- the TARGET comes first and is
+     * an opaque string (it need not exist), while the LINK path is the one
+     * that gets created; vfs_symlink takes them the other way round. */
+    case LX_symlink:                   /* (target, linkpath) */
+    case LX_symlinkat: {               /* (target, newdirfd, linkpath) */
+        int is_at = (n == LX_symlinkat);
+        const char *utarget = (const char *)a1;
+        const char *ulink   = is_at ? (const char *)a3 : (const char *)a2;
+        char ktarget[ABI_PATH_MAX], klink[ABI_PATH_MAX];
+        if (strncpy_from_user(ktarget, utarget, sizeof ktarget) < 0)
+            return -ABI_EFAULT;
+        int rr = resolve_user_path(ulink, klink, sizeof klink);
+        if (rr) return rr;
+        int rc = vfs_symlink(klink, ktarget);
+        switch (rc) {
+        case VFS_OK:               return 0;
+        case VFS_ERR_EXIST:        return -ABI_EEXIST;
+        case VFS_ERR_NAMETOOLONG:  return -ABI_ENAMETOOLONG;
+        case VFS_ERR_NOSPC:        return -ABI_ENOSPC;
+        case VFS_ERR_INVAL:        return -ABI_EINVAL;
+        default:                   return -ABI_EIO;
+        }
     }
 
     /* ---- stat family: translate tobyOS vfs_stat -> Linux struct stat ---- */
