@@ -222,6 +222,13 @@ struct proc {
      * attribution was blind to them (>99% of hold time landed in no
      * bucket until this existed). */
     int32_t         cursys_nat;
+    /* Slice 70: sigaltstack(2) state. Recorded and reported back honestly;
+     * signal delivery still runs handlers on the normal stack (see
+     * lx_sigaltstack), which is what returning -ENOSYS used to force
+     * anyway -- minus the error every crash handler logs. */
+    uint64_t        sas_sp;
+    uint64_t        sas_size;
+    int32_t         sas_flags;
     /* CHROMIUM_BOOT diagnostic: latched at execve when argv carries
      * "--type=renderer", so the SIGKILL/exit stack-dump hook can fire on the
      * renderer (the process that must complete a document load for --dump-dom)

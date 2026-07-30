@@ -255,8 +255,10 @@ static long sys_write(int fd, const void *buf, size_t len) {
      * messages carry the useful detail at the end. */
     if (fd == 1 || fd == 2) {
         static int w1 = 0;
-        if (w1 < 160) { w1++;
-            char pre[121]; size_t n = len < 120 ? len : 120;
+        /* Slice 70: 160 -> 600 lines, 120 -> 200 chars. With --v=1 the
+         * startup chatter is long and the interesting line is late. */
+        if (w1 < 600) { w1++;
+            char pre[201]; size_t n = len < 200 ? len : 200;
             memcpy(pre, k, n); pre[n] = '\0';
             for (size_t i = 0; i < n; i++)
                 if (pre[i] == '\n' || pre[i] == '\r') pre[i] = ' ';
@@ -7430,6 +7432,42 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (n > bufsz) n = bufsz;          /* readlink does NOT NUL-terminate */
         if (copy_to_user(ubuf, ktmp, n) != 0) return -ABI_EFAULT;
         return (long)n;
+    }
+
+    /* Slice 70: sigaltstack(2). Every crash handler on Linux -- crashpad in
+     * chrome's case -- installs an alternate signal stack so it can still
+     * run when the faulting thread's own stack is the problem, and logs an
+     * ERROR when the call fails. We record and report the registration
+     * faithfully (so getters see what was set, and SS_DISABLE works) but
+     * still deliver signals on the normal stack, which is exactly what
+     * -ENOSYS produced before -- minus the error and the risk that a caller
+     * treats the failure as fatal. Handlers that genuinely need the
+     * separate stack (deep-recursion / stack-overflow reporting) remain
+     * unserved; that is a scheduler/signal-delivery change, not an ABI one. */
+    case 131: {                        /* sigaltstack(const stack_t*, stack_t*) */
+        struct lx_stack { uint64_t ss_sp; int32_t ss_flags; uint32_t _pad;
+                          uint64_t ss_size; } cur, in;
+        struct proc *sp = current_proc();
+        if (!sp) return -ABI_EINVAL;
+        cur.ss_sp    = sp->sas_sp;
+        cur.ss_size  = sp->sas_size;
+        cur.ss_flags = sp->sas_sp ? sp->sas_flags : 2 /* SS_DISABLE */;
+        cur._pad     = 0;
+        if (a2 && copy_to_user((void *)a2, &cur, sizeof cur) != 0)
+            return -ABI_EFAULT;
+        if (a1) {
+            if (copy_from_user(&in, (const void *)a1, sizeof in) != 0)
+                return -ABI_EFAULT;
+            if (in.ss_flags & 2) {            /* SS_DISABLE */
+                sp->sas_sp = 0; sp->sas_size = 0; sp->sas_flags = 0;
+            } else {
+                if (in.ss_size < 2048) return -ABI_ENOMEM;   /* MINSIGSTKSZ */
+                sp->sas_sp    = in.ss_sp;
+                sp->sas_size  = in.ss_size;
+                sp->sas_flags = in.ss_flags;
+            }
+        }
+        return 0;
     }
 
     /* Slice 69: symlink(target, linkpath) / symlinkat(target, dirfd,

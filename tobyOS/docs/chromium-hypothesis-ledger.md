@@ -3987,3 +3987,39 @@ handshake) -- before exit_group(191) with NO fatal message logged. That
 exit is the next thread to pull; it is an application-level decision, not a
 loader or ABI failure. NOTE the default (headless-shell) flavour is
 untouched and still the one build_vid.sh produces.
+
+## Slice 70 (Route B m1 cont.): sigaltstack(2) implemented; full chrome's
+## exit 191 narrowed to a post-handshake, self-relaunch path + a NO-VMA
+## SIGSEGV in a child. Not yet closed -- state recorded for the next pass.
+
+- sigaltstack(2) was UNHANDLED (-ENOSYS). Every Linux crash handler --
+  crashpad here -- installs an alternate signal stack so it can still run
+  when the faulting thread's own stack is the problem, and logs an ERROR
+  when the call fails. Now recorded/reported faithfully (SS_DISABLE and the
+  getter work; MINSIGSTKSZ enforced), while signal delivery still uses the
+  normal stack -- identical behaviour to -ENOSYS, minus the error and the
+  risk of a caller treating it as fatal. The crashpad ERROR is gone.
+- Raised the fd1/fd2 echo to 600 lines x 200 chars and added --v=1 for
+  CHROME_FULL builds, since chrome names its own failures when asked.
+
+WHERE EXIT 191 STANDS (facts, no theory):
+ - chrome links its full DSO closure, passes ProcessSingleton (slice 69's
+   symlink fix), and reaches its Mojo handshake: 1,269 syscalls through
+   getrandom/mkdir/stat/prctl/sendmsg.
+ - With --v=1 it emits the crash-reporter consent line TWICE, from two
+   processes -- i.e. the browser re-runs its own startup (a relaunch or a
+   child of a type we have not identified). pid 1 exits 0; the other exits
+   191 (0xBF), a code that matches no small RESULT_CODE_* enum, so it is
+   probably not a plain chrome result code.
+ - In one run a chrome child took SIGSEGV on an UNMAPPED address
+   (`[pfrej] ... NO VMA`, 515 VMAs live, nearest mapping far away) -- the
+   same no-VMA class whose FIRST mechanism was fixed in slice 61f
+   (munmap middle-split) and whose SECOND mechanism is still open. Full
+   chrome exercises far more of the memory ABI than the headless shell, so
+   it may simply be a better reproducer for that known bug.
+NEXT PASS, cheapest first: (1) log the argv of EVERY chrome exec (we log
+only the first) to identify what the second process is -- zygote, relaunch,
+or a --type= child; (2) instrument the faulting VA against the VMA table at
+fault time to catch the second no-VMA mechanism with a live reproducer;
+(3) only then judge whether exit 191 is a consequence of the SIGSEGV or an
+independent decision.

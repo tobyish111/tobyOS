@@ -716,6 +716,13 @@ static int spawn_chrome(void) {
             (char *)"--disable-in-process-stack-traces",
             (char *)"--no-first-run",
             (char *)"--enable-logging=stderr",
+#ifdef CHROME_FULL
+            /* Slice 70: the full binary exits 191 after its Mojo handshake
+             * with nothing on stderr at the default level. Chrome names its
+             * own failures when asked (that is how ProcessSingleton was
+             * found in slice 69), so turn the browser-startup modules up. */
+            (char *)"--v=1",
+#endif
             /* FRESH profile dir (was /data/cr): /data/cr persists on disk.img
              * across runs, so corrupted/poisoned profile state (cookies,
              * consent redirects, cache) reproduces "identical failure on both
