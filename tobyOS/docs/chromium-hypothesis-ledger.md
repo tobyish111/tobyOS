@@ -4248,3 +4248,48 @@ slice 61f, and the crashpad child is now a REPRODUCER for it; (3) confirm
 whether /opt/chrome/chrome_crashpad_handler is staged and branded
 (EI_OSABI=Linux) in the CHROME_FULL initrd, since a failed exec of it would
 produce exactly this shape.
+
+## Slice 76: ROOT CAUSE FOUND AND FIXED -- clone() dispatched on CLONE_VM
+## instead of CLONE_THREAD, so vfork/posix_spawn children became THREADS.
+## The crashpad handshake now completes; chrome_crashpad_handler runs.
+
+Followed the crashpad child's own syscalls and it ended: getdents64, mmap,
+rt_sigprocmask, **clone3**, munmap, exit(0) -- with NO fork logged either way,
+so clone3 never reached the fork path. Logged its flags:
+
+    [clone3] pid=1 flags=0x100004100 -> (we said) THREAD   <- crashpad child
+    [clone3] pid=3 flags=0x3d0f00    -> THREAD             <- a real pthread
+
+Decoded: 0x100004100 = CLONE_VM|CLONE_VFORK|CLONE_INTO_CGROUP, with
+**CLONE_THREAD CLEAR** -- vfork/posix_spawn semantics, i.e. a separate
+PROCESS that shares the address space only until it execs. The real pthread
+next to it is 0x3d0f00 = VM|FS|FILES|SIGHAND|**THREAD**|SYSVSEM|SETTLS|
+PARENT_SETTID. Both LX_clone and LX_clone3 tested **CLONE_VM (0x100)** to
+decide "thread", which is simply the wrong bit: CLONE_VM only means "share
+the address space", and vfork sets it too.
+
+THE CHAIN, end to end: crashpad double-forks (first child spawns the
+grandchild that execs chrome_crashpad_handler, then _exit(0)s). We turned
+that spawn into a thread, so the grandchild NEVER EXISTED; the first child
+exited; its socketpair endpoint refs dropped; the browser's handshake
+sendmsg hit a dead peer -> EPIPE (slice 75's [uxmsg] line) -> crashpad
+treats it as fatal -> INT3 -> exit_group(191).
+
+FIX: dispatch on CLONE_THREAD (0x10000) in both LX_clone and LX_clone3.
+vfork-style children become plain forks, which is semantically safe because
+such a child only execs or _exits. defboot stayed clean.
+
+MEASURED AFTER (same run, all four previously-impossible things):
+    [clone3] pid=1 flags=0x100004100 -> FORK      (and 0x3d0f00 -> THREAD)
+    [fork]   parent pid=1 -> child pid=4          (the grandchild EXISTS)
+    execve-argv pid=4: /opt/chrome/chrome_crashpad_handler   (it EXECS)
+    [uxmsg]  pid=3 SEND fd=6 len=40 -> 40         (was -32 EPIPE)
+    [uxmsg]  pid=4 RECV fd=7 want=40 -> 40        (the handler RECEIVES it)
+This is a genuine Linux-ABI bug that affected far more than chrome: any
+program using posix_spawn or vfork+exec got a thread instead of a process.
+
+STILL exit 191, but now from a LATER stage: with the handler alive, the
+remaining trace shows `[uxmsg] pid=1 RECV fd=4 want=40 -> 0` (the first
+child reads 0 = EOF where Linux delivers the handler's reply carrying
+SCM_RIGHTS), and note every [uxmsg] line so far reports nscm=0 -- we are not
+carrying the ancillary fd. Next: make SCM_RIGHTS ride the socketpair reply.

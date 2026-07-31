@@ -7388,10 +7388,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return fr;
     }
     case LX_clone:
-        /* clone(flags, stack, ptid, ctid, tls). CLONE_VM (0x100) => a thread
-         * that shares the address space (pthread_create); otherwise it's a
-         * fork-equivalent (glibc/musl fork() may route through clone). */
-        if ((uint64_t)a1 & 0x100u /* CLONE_VM */)
+        /* clone(flags, stack, ptid, ctid, tls).
+         *
+         * Slice 76: dispatch on CLONE_THREAD (0x10000), NOT CLONE_VM (0x100).
+         * CLONE_VM alone only means "share the address space", which is ALSO
+         * what vfork/posix_spawn use for a child that shares memory just
+         * until it execs -- a separate PROCESS. Testing CLONE_VM turned
+         * those into threads. That is exactly how full chrome died:
+         * crashpad's handler child called clone3 with
+         * CLONE_VM|CLONE_VFORK|CLONE_INTO_CGROUP (0x100004100, CLONE_THREAD
+         * CLEAR) to spawn the grandchild that execs chrome_crashpad_handler;
+         * we made it a thread, no grandchild ever existed, the child exited,
+         * its socketpair endpoint was torn down, and the browser's handshake
+         * sendmsg came back EPIPE -> CHECK -> INT3 -> exit 191. A real
+         * pthread always sets CLONE_THREAD (measured alongside it:
+         * 0x3d0f00 = VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|PARENT_SETTID).
+         * The vfork case becomes a plain fork here: semantically safe,
+         * because such a child only execs or _exits. */
+        if ((uint64_t)a1 & 0x10000u /* CLONE_THREAD */)
             return sys_clone_thread((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
                                     (uint64_t)a4, (uint64_t)a5);
         {
@@ -7810,9 +7824,28 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         size_t want = (size_t)a2;
         if (want > sizeof ca) want = sizeof ca;
         for (size_t i = 0; i < sizeof ca; i++) ((uint8_t *)&ca)[i] = 0;
-        if (copy_from_user(&ca, (const void *)(uintptr_t)a1, want) != 0)
+        if (copy_from_user(&ca, (const void *)(uintptr_t)a1, want) != 0) {
+#ifdef CHROMIUM_BOOT
+            /* Slice 76: crashpad's handler child calls clone3 and then exits
+             * 0 with NO fork logged either way -- so clone3 bails before
+             * reaching the fork/thread split. Name which way it went. */
+            { struct proc *cp = current_proc();
+              kprintf("[clone3] pid=%d EFAULT reading cl_args=0x%lx size=%lu\n",
+                      cp ? cp->pid : -1, (unsigned long)a1,
+                      (unsigned long)a2); }
+#endif
             return -ABI_EFAULT;
-        if (ca.flags & 0x100u /* CLONE_VM => thread */) {
+        }
+#ifdef CHROMIUM_BOOT
+        { static int c3 = 0; if (c3 < 12) { c3++;
+            struct proc *cp = current_proc();
+            kprintf("[clone3] pid=%d flags=0x%lx size=%lu -> %s\n",
+                    cp ? cp->pid : -1, (unsigned long)ca.flags,
+                    (unsigned long)a2,
+                    (ca.flags & 0x10000u) ? "THREAD" : "FORK"); } }
+#endif
+        /* Slice 76: CLONE_THREAD, not CLONE_VM -- see the LX_clone case. */
+        if (ca.flags & 0x10000u /* CLONE_THREAD */) {
             uint64_t stack_top = ca.stack + ca.stack_size;
             return sys_clone_thread(ca.flags, stack_top, ca.parent_tid,
                                     ca.child_tid, ca.tls);

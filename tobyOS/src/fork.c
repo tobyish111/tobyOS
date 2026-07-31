@@ -204,7 +204,20 @@ long sys_fork(void) {
             break;
         }
     }
-    if (!child) return -ABI_ENOMEM;
+    if (!child) {
+#ifdef CHROMIUM_BOOT
+        /* Slice 76: fork FAILURES were never logged, only successes -- and
+         * crashpad's double-fork (first child forks the grandchild that
+         * execs chrome_crashpad_handler, then _exit(0)s) shows only ONE fork
+         * in our traces. If the second one is failing here, this names it. */
+        { int used = 0;
+          for (int i = 0; i < PROC_MAX; i++)
+              if (g_proc[i].state != PROC_UNUSED) used++;
+          kprintf("[fork] FAILED pid=%d: no free proc slot (%d/%d used)\n",
+                  parent->pid, used, PROC_MAX); }
+#endif
+        return -ABI_ENOMEM;
+    }
 
     /* Copy parent's proc struct as a starting point. */
     int child_pid = (int)(child - g_proc);
@@ -273,13 +286,33 @@ long sys_fork(void) {
      * died on the first dup2 of its Mojo socket with _exit(127) ("GPU process
      * isn't usable. Goodbye."). POSIX fork() inherits the whole table. */
     struct file **ptab = proc_fds(parent);
+    int cloned = 0, failed = 0;
     for (int i = 0; i < PROC_NFDS; i++) {
         if (ptab && ptab[i]) {
             child->fds[i] = file_clone(ptab[i]);
+#ifdef CHROMIUM_BOOT
+            /* Slice 76: a clone that FAILS leaves the child without that
+             * descriptor while the parent keeps its own -- for an AF_UNIX
+             * socketpair that means the child can never answer, and the
+             * parent's next send hits a dead peer (the crashpad EPIPE).
+             * Count both outcomes; name the failures. */
+            if (!child->fds[i]) {
+                failed++;
+                static int fl = 0; if (fl < 16) { fl++;
+                    kprintf("[forkfd] pid=%d->%d fd=%d CLONE FAILED kind=%d\n",
+                            parent->pid, child->pid, i, (int)ptab[i]->kind);
+                }
+            } else cloned++;
+#endif
         } else {
             child->fds[i] = NULL;
         }
     }
+#ifdef CHROMIUM_BOOT
+    { static int fk = 0; if (fk < 8) { fk++;
+        kprintf("[forkfd] pid=%d -> child pid=%d: %d fds cloned, %d failed\n",
+                parent->pid, child->pid, cloned, failed); } }
+#endif
 
     /* Build the child's kernel stack. */
     if (!build_fork_kstack(child)) {

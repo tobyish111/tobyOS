@@ -101,6 +101,19 @@ static void dgram_release_fds(struct sock_dgram *d) {
 void sock_ref(struct sock *s) {
     if (!s || !s->in_use) return;
     s->refs++;
+#ifdef CHROMIUM_BOOT
+    /* Slice 76: AF_UNIX endpoint lifecycle. The crashpad handshake sendmsg
+     * fails EPIPE (slice 75) because the peer endpoint is already gone, and
+     * refcounting LOOKS right by inspection -- so log the actual ref/close
+     * ordering across the fork instead of reasoning about it. */
+    if (s->kind == SOCK_KIND_UNIX) {
+        static int rl = 0; if (rl < 40) { rl++;
+            struct proc *p = current_proc();
+            kprintf("[uxref] pid=%d REF slot=%d -> refs=%d\n",
+                    p ? p->pid : -1, sock_index(s), s->refs);
+        }
+    }
+#endif
 }
 
 /* Drop one fd reference. Linux fd inheritance duplicates the DESCRIPTOR, not the
@@ -109,6 +122,16 @@ void sock_ref(struct sock *s) {
  * pipes already follow via reader/writer counts. */
 void sock_close(struct sock *s) {
     if (!s || !s->in_use) return;        /* already torn down -- double-close guard */
+#ifdef CHROMIUM_BOOT
+    if (s->kind == SOCK_KIND_UNIX) {     /* slice 76: see sock_ref */
+        static int cl = 0; if (cl < 40) { cl++;
+            struct proc *p = current_proc();
+            kprintf("[uxref] pid=%d CLOSE slot=%d refs=%d -> %s\n",
+                    p ? p->pid : -1, sock_index(s), s->refs,
+                    s->refs > 1 ? "survives" : "TEARDOWN (peer sees EOF)");
+        }
+    }
+#endif
     if (--s->refs > 0) return;           /* another fd still holds this endpoint */
 
     /* Last reference: tell an AF_UNIX peer we are gone (wakes its blocked recv
