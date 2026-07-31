@@ -819,6 +819,20 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
             if (tl >= bufsz) tl = bufsz - 1;
             memcpy(buf, tgt, tl);
             buf[tl] = '\0';
+#ifdef CHROMIUM_BOOT
+            /* Slice 73: chrome derives DIR_ASSETS (icudtl.dat, the .pak
+             * files, the v8 snapshot) from readlink("/proc/self/exe") and
+             * CHECKs with "Invalid file descriptor to ICU data received" if
+             * it lands in the wrong directory -- reproduced exactly on the
+             * Linux control by making /proc/self/exe point at the loader.
+             * The full-chrome INT3 has the same shape, so log what we hand
+             * back, and whether it came from exe_path or the p->name
+             * fallback (the fallback is NOT a path and would break ICU). */
+            { static int el = 0; if (el < 12) { el++;
+                kprintf("[procexe] pid=%d -> '%s' (%s)\n", pid, buf,
+                        p->exe_path[0] ? "exe_path" : "NAME FALLBACK");
+            } }
+#endif
             return VFS_OK;
         }
         /* /proc/<pid>/fd/<n> -> a description of the open file */

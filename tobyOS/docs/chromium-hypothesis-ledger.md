@@ -4110,3 +4110,56 @@ can be degraded toward tobyOS one property at a time):
     bug that produces a CHECK rather than an error return.
  c. The fork-without-exec child (browser forks, child exits 0) -- identify
     what that child is on the control (it will be there too) and compare.
+
+## Slice 73: environment bisection on the control. Libraries EXONERATED,
+## /proc/self/exe EXONERATED. The control's ICU crash was an artifact of the
+## explicit-loader invocation -- and proving that took one command.
+
+Bisected the environment chromewin hands chrome, one property at a time, on
+the WSL control (exit 124 = ran the full timeout = healthy):
+    baseline                                       124  healthy
+    + LD_PRELOAD (bundled vulkan/swiftshader)      124  healthy
+    + DISPLAY=:0                                   124  healthy
+    + HOME/TMPDIR/LANG=C                           124  healthy
+    + LD_LIBRARY_PATH=<chrome>:<our sysroot>       139  SIGSEGV, 0 stderr
+Two harness bugs found and fixed first (worth remembering): exporting the
+env into the subshell also applied it to wc/head/cut/mkdir, and `env VAR=..
+timeout` applies it to timeout itself -- in both cases OUR bookworm sysroot
+shadowed Ubuntu's glibc 2.43 and killed the harness, not chrome. Correct
+form: `timeout N env VAR=... ./chrome`.
+
+That sysroot result is NOT evidence against our libraries: on Ubuntu our
+sysroot shadows the system libc/libm (2.36-era vs 2.43), a mixing that
+cannot happen on tobyOS where our in-tree glibc is the only one. (The
+sysroot does contain libc/libm/ld.so, dated 07-17 -- pre-existing, NOT added
+by slice 69's closure.py, so the working headless flavour is unaffected.)
+
+To test the library set faithfully, ran chrome under OUR loader with
+--library-path (tobyOS's exact library world, real kernel):
+    exit=133 (SIGTRAP) + "ERROR:base/i18n/icu_util.cc:232] Invalid file
+    descriptor to ICU data received."
+which LOOKED like the answer -- same trap shape as tobyOS. It is not.
+Control for it: doing the same with UBUNTU's OWN loader fails identically.
+So the ICU failure is caused by invoking chrome through an explicit loader
+(/proc/self/exe then names ld.so, and chrome derives DIR_ASSETS from it),
+not by our libraries. **Libraries exonerated.**
+
+Then checked the same mechanism ON tobyOS with a new [procexe] probe:
+    [procexe] pid=3 -> '/opt/chrome/chrome' (exe_path)   x3
+Correct path, from exe_path, not the p->name fallback. **/proc/self/exe
+exonerated too** -- and note this is the very bug an earlier slice fixed for
+headless-shell (fork.c resolves symlinks so DIR_ASSETS is right), still
+holding.
+
+Also fixed: chromewin.o does not depend on the flavour define, so a
+KERNEL-only edit left make reusing the object built for the OTHER flavour --
+a CHROME_FULL initrd then shipped a chromewin that exec'd the absent
+headless-shell path and died with exit 127 (the same stale-object class as
+the hard rules). build_full.sh and build_vid.sh now delete it every build.
+
+RUNNING TALLY of what is NOT the cause of full chrome's INT3: GL/Ozone
+flags, the staged policy file, our library set, /proc/self/exe/DIR_ASSETS.
+STILL OPEN: D-Bus absence (chrome talks to a real bus seconds after our
+death point; tobyOS has none), /proc completeness beyond exe, and the
+fork-without-exec child. The control makes each of these a one-command test
+now -- degrade Ubuntu toward tobyOS rather than guessing across guest boots.

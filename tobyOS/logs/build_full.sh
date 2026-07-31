@@ -19,6 +19,11 @@ cd /c/CustomOS/tobyOS || exit 1
 taskkill //F //IM qemu-system-x86_64.exe >/dev/null 2>&1
 sleep 1
 rm -f build/initrd.tar build/base.iso tobyOS.iso
+# Slice 73: chromewin.o does NOT depend on the flavour define, so make keeps
+# a stale object when only the KERNEL changed -- a CHROME_FULL initrd then
+# ships a chromewin that execs the (absent) headless-shell path and dies
+# with exit 127. Force it every flavour build.
+rm -f programs/chromewin/chromewin.o programs/chromewin/chromewin.elf
 if ! make CHROME_FULL=1 PROG_EXTRA_CFLAGS=-DCHROME_FULL "CC=TMP='C:\\t' TEMP='C:\\t' clang" \
      "HOST_CC=TMP='C:\\t' TEMP='C:\\t' gcc" \
      iso EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DCHROMIUM_BOOT -DTKAPP_BOOT -DTKAPP_CHROMEWIN -DCHROME_FULL"; then
