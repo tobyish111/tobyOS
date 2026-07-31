@@ -475,7 +475,15 @@ int vfs_rename(const char *oldpath, const char *newpath) {
     return om->ops->rename(om->data, orel, nrel);
 }
 
-int vfs_mkdir(const char *path) {
+/* Slice 86: mkdir with the CALLER's mode. This used to hardcode 0755 for
+ * every directory ever created, which is not a cosmetic default -- callers
+ * that create a private directory and then verify it is private treat the
+ * mismatch as a security failure. Full chrome's ProcessSingleton does
+ *     CHECK(GetPosixFilePermissions(dir, &mode) && mode == 0700)
+ * immediately after mkdir(dir, 0700); reading back 0755 fails that CHECK
+ * and takes IMMEDIATE_CRASH() -- the int3/ud2 pair that had been showing
+ * up as an unexplained SIGTRAP and exit 191. */
+int vfs_mkdir_mode(const char *path, uint32_t mode) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
@@ -494,7 +502,11 @@ int vfs_mkdir(const char *path) {
     }
     return m->ops->mkdir(m->data, rel,
                          (uint32_t)current_uid(), (uint32_t)current_gid(),
-                         00755u | VFS_MODE_VALID);
+                         (mode & 07777u) | VFS_MODE_VALID);
+}
+
+int vfs_mkdir(const char *path) {
+    return vfs_mkdir_mode(path, 00755u);      /* historical default */
 }
 
 /* chmod / chown: only the owner or root may change ownership/perms. */

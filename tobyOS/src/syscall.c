@@ -2486,11 +2486,22 @@ static long sys_rename(const char *oldp, const char *newp) {
 }
 
 static long sys_mkdir(const char *path, int mode) {
-    (void)mode;     /* M25A: not honoured yet -- new dirs use proc owner */
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
-    int rc = vfs_mkdir(kpath);
+    /* Slice 86: honour the requested mode. A caller that asks for a private
+     * directory and then verifies it (chrome's ProcessSingleton CHECKs for
+     * exactly 0700) must not be told 0755. Mode 0 means "unspecified" from
+     * in-kernel callers, which keep the old default. */
+    uint32_t m = (uint32_t)mode & 07777u;
+    int rc = m ? vfs_mkdir_mode(kpath, m) : vfs_mkdir(kpath);
+#ifdef CHROMIUM_BOOT
+    { static int mk = 0; if (mk < 24) { mk++;
+        struct vfs_stat vs; int sr = vfs_stat(kpath, &vs);
+        /* kprintf has no %o -- modes printed as hex (0700 == 0x1c0). */
+        kprintf("[mkdir] '%s' mode=0x%x rc=%d -> readback 0x%x\n", kpath, m, rc,
+                sr == VFS_OK ? (vs.mode & 07777u) : 0); } }
+#endif
     switch (rc) {
     case VFS_OK:         return 0;
     case VFS_ERR_EXIST:  return -ABI_EEXIST;
@@ -4143,10 +4154,13 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
                          (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
         if (!buf || bufsz == 0) return -ABI_EFAULT;
         if (bufsz > sizeof(ktmp)) bufsz = sizeof(ktmp);
+        memset(ktmp, 0, sizeof ktmp);          /* slice 86: see LX_readlink */
         int rc = vfs_readlink(kpath, ktmp, bufsz);
         if (rc == VFS_OK) {
-            size_t n = strlen(ktmp);
-            if (copy_to_user(buf, ktmp, n + 1) != 0) return -ABI_EFAULT;
+            size_t n = 0;
+            while (n < bufsz && ktmp[n]) n++;
+            size_t w = n + 1 > bufsz ? bufsz : n + 1;   /* never past the buffer */
+            if (copy_to_user(buf, ktmp, w) != 0) return -ABI_EFAULT;
             return (long)n;
         }
         if (rc == VFS_ERR_NOENT) return -ABI_ENOENT;
@@ -4904,8 +4918,15 @@ static short file_poll_ready(struct file *f) {
              * so Mojo's epoll loop detects disconnect. The fake-X-server loopback
              * has no peer proc (peer_ip==0 by design) -- it is readable only when
              * it has actually queued a reply, never HUP. */
+            /* Slice 86: a bound LISTENER also has no peer, but it is not
+             * hung up -- it is readable exactly when a connect is queued.
+             * Without this exclusion the EOF rule above would report every
+             * listening socket as POLLHUP the moment it was created. */
             if (f->sock && f->sock->kind == SOCK_KIND_UNIX &&
-                f->sock->peer_ip == 0 && !f->sock->x_server)
+                sock_unix_bound_name(f->sock)) {
+                if (sock_unix_can_accept(f->sock)) r |= LXP_POLLIN;
+            } else if (f->sock && f->sock->kind == SOCK_KIND_UNIX &&
+                       f->sock->peer_ip == 0 && !f->sock->x_server)
                 r |= LXP_POLLIN | LXP_POLLHUP;
         }
         break;
@@ -5511,9 +5532,76 @@ static long lx_socketpair(int domain, int type, int proto, uint64_t usv) {
     return 0;
 }
 
+/* Slice 86: pull the name out of a user sockaddr_un. Layout is
+ * { u16 sun_family; char sun_path[108]; } == 110 bytes. An ABSTRACT socket
+ * has sun_path[0] == '\0' and the name is the following bytes, which are
+ * NOT NUL-terminated -- their length comes from addrlen, so the caller's
+ * length is load-bearing rather than advisory. Shared by bind and connect
+ * so the two cannot disagree about what a given address means. */
+static long lx_sun_parse(uint64_t uaddr, uint32_t alen, char *name,
+                         size_t namesz, bool *abstract) {
+    uint8_t ua[112];
+    uint32_t rd = alen > sizeof(ua) ? (uint32_t)sizeof(ua) : alen;
+    if (!uaddr || rd < 2) return -ABI_EFAULT;
+    memset(ua, 0, sizeof ua);
+    if (copy_from_user(ua, (const void *)(uintptr_t)uaddr, rd) != 0)
+        return -ABI_EFAULT;
+    const char *sun = (const char *)ua + 2;
+    uint32_t pathlen = rd - 2;
+    bool abs = (pathlen > 0 && sun[0] == '\0');
+    const char *src = abs ? sun + 1 : sun;
+    uint32_t nlen = abs ? (pathlen - 1) : pathlen;
+    /* A filesystem name is NUL-terminated inside the buffer; trust the NUL
+     * over addrlen, since callers routinely pass sizeof(sockaddr_un). */
+    if (!abs) { uint32_t k = 0; while (k < nlen && src[k]) k++; nlen = k; }
+    if (nlen > namesz - 1) nlen = (uint32_t)namesz - 1;
+    memcpy(name, src, nlen);
+    name[nlen] = '\0';
+    *abstract = abs;
+    return 0;
+}
+
+/* Slice 86: write a sockaddr back to user space with Linux's truncation
+ * rule -- copy at most *ualen bytes, then report the address's ACTUAL
+ * length (which may exceed the buffer, telling the caller it was cut).
+ *
+ * Every one of these sites previously wrote sizeof(struct sockaddr_in)
+ * unconditionally and ignored the caller's buffer size, so a caller that
+ * passed anything smaller had its stack quietly overwritten past the end
+ * of the object -- the classic way to trip -fstack-protector, which is
+ * exactly the failure being chased (an INT3 from __stack_chk_fail).
+ * getsockname alone runs ~126k times per interval under chrome. */
+static void lx_addr_writeback(uint64_t uaddr, uint64_t ualen,
+                              const void *src, uint32_t len) {
+    if (!uaddr) return;
+    uint32_t cap = 0;
+    if (ualen) {
+        if (copy_from_user(&cap, (const void *)(uintptr_t)ualen, 4) != 0) return;
+    } else {
+        cap = len;                         /* no length given: caller vouches */
+    }
+    uint32_t n = cap < len ? cap : len;
+    if (n) (void)copy_to_user((void *)(uintptr_t)uaddr, src, n);
+    if (ualen) (void)copy_to_user((void *)(uintptr_t)ualen, &len, 4);
+}
+
 static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
+
+    /* AF_UNIX: bind to a filesystem or abstract name. Before slice 86 this
+     * fell through to the sockaddr_in path below and answered EINVAL for
+     * every UNIX socket -- which is what full chrome's ProcessSingleton
+     * hits when it binds SingletonSocket with sizeof(sockaddr_un) == 110. */
+    if (s->kind == SOCK_KIND_UNIX) {
+        char nm[109]; bool abs = false;
+        long pr = lx_sun_parse(uaddr, alen, nm, sizeof nm, &abs);
+        if (pr) return pr;
+        if (!nm[0]) return -ABI_EINVAL;             /* autobind unsupported */
+        int rc = sock_unix_bind_name(s, nm, abs);
+        if (rc == -98) return -LXE_EADDRINUSE;
+        return rc == 0 ? 0 : -ABI_EINVAL;
+    }
     /* AF_NETLINK: bind(sockaddr_nl) selects the multicast groups to listen on.
      * We deliver no unsolicited notifications, so the groups are recorded and
      * otherwise unused; what matters is that bind SUCCEEDS, since chrome
@@ -5578,6 +5666,8 @@ static int lx_conn_progress(struct sock *s) {
 static long lx_listen(int fd, int backlog) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
+    if (s->kind == SOCK_KIND_UNIX)            /* slice 86 */
+        return sock_unix_listen(s) == 0 ? 0 : -ABI_EINVAL;
     if (s->kind != SOCK_KIND_TCP) return -LXE_EOPNOTSUPP;
     if (s->local_port == 0)       return -ABI_EINVAL;   /* must bind first */
     struct tcp_conn *lsn = tcp_listen(s->local_port, backlog);
@@ -5590,6 +5680,25 @@ static long lx_listen(int fd, int backlog) {
 static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen, int flags) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
+
+    /* AF_UNIX listener (slice 86): connect() already built the connected
+     * pair, so accept just hands over the server end. No handshake means
+     * nothing to block on -- an empty backlog is EAGAIN. */
+    if (s->kind == SOCK_KIND_UNIX) {
+        struct sock *ns = 0;
+        int rc = sock_unix_accept(s, &ns);
+        if (rc == -11) return -LXE_EAGAIN;
+        if (rc != 0 || !ns) return -ABI_EINVAL;
+        ns->nonblock = (flags & SOCK_NONBLOCK) != 0;
+        int nfd = lx_sock_install(ns);
+        if (nfd < 0) { sock_close(ns); return -ABI_EMFILE; }
+        struct { uint16_t fam; char path[108]; } sun;
+        memset(&sun, 0, sizeof sun);
+        sun.fam = AF_UNIX;                    /* an accepted end is unnamed */
+        lx_addr_writeback(uaddr, ualen, &sun, 2);
+        return nfd;
+    }
+
     if (s->kind != SOCK_KIND_TCP || !s->tcp_listening || !s->tcp)
         return -ABI_EINVAL;
     /* Non-blocking listener: report EAGAIN rather than sitting in tcp_accept
@@ -5605,13 +5714,11 @@ static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen, int flags) {
     ns->nonblock   = (flags & SOCK_NONBLOCK) != 0;
     int nfd = lx_sock_install(ns);
     if (nfd < 0) { tcp_close(child); sock_close(ns); return -ABI_EMFILE; }
-    if (uaddr) {
+    {
         struct sockaddr_in sa;
         memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET;        /* peer ip/port not exposed; family only */
-        (void)copy_to_user((void *)(uintptr_t)uaddr, &sa, sizeof sa);
-        if (ualen) { uint32_t al = (uint32_t)sizeof sa;
-                     (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
+        lx_addr_writeback(uaddr, ualen, &sa, (uint32_t)sizeof sa);
     }
     return nfd;
 }
@@ -5878,9 +5985,7 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
         if (rv >= 0 && uaddr) {        /* report the sender's ip/port */
             struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
             sa.sin_family = AF_INET; sa.sin_addr = sip; sa.sin_port = sport;
-            (void)copy_to_user((void *)(uintptr_t)uaddr, &sa, sizeof sa);
-            if (ualen) { uint32_t al = (uint32_t)sizeof sa;
-                         (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
+            lx_addr_writeback(uaddr, ualen, &sa, (uint32_t)sizeof sa);
         }
         return rv;
     }
@@ -5947,9 +6052,7 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
     kfree(k);
     if (rv >= 0 && uaddr) {              /* connected: report family only */
         struct sockaddr_in sa; memset(&sa, 0, sizeof sa); sa.sin_family = AF_INET;
-        (void)copy_to_user((void *)(uintptr_t)uaddr, &sa, sizeof sa);
-        if (ualen) { uint32_t al = (uint32_t)sizeof sa;
-                     (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
+        lx_addr_writeback(uaddr, ualen, &sa, (uint32_t)sizeof sa);
     }
     return rv;
 }
@@ -6001,10 +6104,28 @@ static long lx_sockaddr_out(struct sock *s, uint64_t uaddr, uint64_t ualen,
         memset(&nl, 0, sizeof nl);
         nl.fam = AF_NETLINK;
         nl.pid = peer ? 0 : s->nl_pid;        /* peer of a netlink socket = kernel (0) */
-        if (copy_to_user((void *)(uintptr_t)uaddr, &nl, sizeof nl) != 0)
-            return -ABI_EFAULT;
-        if (ualen) { uint32_t al = (uint32_t)sizeof nl;
-                     (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
+        lx_addr_writeback(uaddr, ualen, &nl, (uint32_t)sizeof nl);
+        return 0;
+    }
+
+    /* AF_UNIX: answer with a sockaddr_un, not the sockaddr_in this used to
+     * invent. Reporting family AF_INET for a UNIX socket is a lie any
+     * caller that switches on sa_family acts on. Unnamed endpoints (both
+     * ends of a socketpair, and an accepted server end) report just the
+     * 2-byte family, which is what Linux does. */
+    if (s->kind == SOCK_KIND_UNIX) {
+        struct { uint16_t fam; char path[108]; } sun;
+        memset(&sun, 0, sizeof sun);
+        sun.fam = AF_UNIX;
+        uint32_t len = 2;
+        const char *nm = peer ? 0 : sock_unix_bound_name(s);
+        if (nm && *nm) {
+            size_t n = strlen(nm);
+            if (n > sizeof(sun.path) - 1) n = sizeof(sun.path) - 1;
+            memcpy(sun.path, nm, n);
+            len = (uint32_t)(2 + n + 1);      /* family + path + NUL */
+        }
+        lx_addr_writeback(uaddr, ualen, &sun, len);
         return 0;
     }
 
@@ -6031,9 +6152,7 @@ static long lx_sockaddr_out(struct sock *s, uint64_t uaddr, uint64_t ualen,
                         : s->local_port;
     }
 
-    if (copy_to_user((void *)(uintptr_t)uaddr, &sa, sizeof sa) != 0) return -ABI_EFAULT;
-    if (ualen) { uint32_t al = (uint32_t)sizeof sa;
-                 (void)copy_to_user((void *)(uintptr_t)ualen, &al, sizeof al); }
+    lx_addr_writeback(uaddr, ualen, &sa, (uint32_t)sizeof sa);
     return 0;
 }
 
@@ -6653,7 +6772,10 @@ static const char *lx_scname(long n) {
                          * sequence that precedes chrome's FATAL CHECK */
 static long     g_lx_recent_n[LX_RECENT];
 static int      g_lx_recent_tid[LX_RECENT];
+static long     g_lx_recent_r[LX_RECENT];    /* slice 86: the RETURN value */
 static uint32_t g_lx_recent_i;
+#define LX_MAXCPU 16
+static uint32_t g_lx_slot_cpu[LX_MAXCPU];    /* slot this cpu is filling */
 
 void lx_dump_recent_syscalls(void) {
     kprintf("[lx-recent] last %d Linux syscalls (oldest first, tid in []):\n",
@@ -6662,7 +6784,13 @@ void lx_dump_recent_syscalls(void) {
         uint32_t idx = (g_lx_recent_i + k) % LX_RECENT;
         long nn = g_lx_recent_n[idx];
         if (nn == 0 && g_lx_recent_tid[idx] == 0) continue;   /* unused slot */
-        kprintf("  [%d] %ld(%s)\n", g_lx_recent_tid[idx], nn, lx_scname(nn));
+        /* Slice 86: print the RETURN too. The browser's abort follows a
+         * syscall whose result register reads 0x00000000fffff001 -- a -4095
+         * that is zero-extended rather than sign-extended -- and the number
+         * alone could never say which call produced it. */
+        kprintf("  [%d] %ld(%s) = %ld (0x%lx)\n", g_lx_recent_tid[idx], nn,
+                lx_scname(nn), g_lx_recent_r[idx],
+                (unsigned long)g_lx_recent_r[idx]);
     }
 }
 
@@ -7008,6 +7136,7 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
     if (curp) { curp->cursys = (int32_t)n; curp->cursys_ns = perf_now_ns(); }
 #endif
     long r = linux_syscall_impl(n, a1, a2, a3, a4, a5);
+    g_lx_recent_r[g_lx_slot_cpu[smp_current_cpu_idx() % LX_MAXCPU]] = r;
     (void)t_hold0;   /* slice 64b: see bkl_hold_account -- wall time under a
                       * syscall is NOT hold time (blocking drops the BKL);
                       * the real accounting happens in bkl_exit. */
@@ -7116,6 +7245,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         uint32_t i = g_lx_recent_i++ % LX_RECENT;
         g_lx_recent_n[i]   = n;
         g_lx_recent_tid[i] = (int)current_proc()->pid;
+        g_lx_recent_r[i]   = 0x5eed;         /* "did not return" sentinel */
+        /* Remember which slot this CPU is filling so the wrapper can stamp
+         * the result once the body returns. Per-CPU rather than a single
+         * global because syscalls run concurrently on every core. */
+        g_lx_slot_cpu[smp_current_cpu_idx() % LX_MAXCPU] = i;
     }
 #ifdef LINUX_SYSCALL_TRACE
     kprintf("[lxtrace] %s[%ld] n=%ld(%s) a=%lx,%lx,%lx,%lx,%lx\n",
@@ -7430,19 +7564,25 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
 
-    /* chmod/fchmod/fchmodat: tobyOS's VFS does not model Unix permission bits,
-     * so these succeed without storing anything. Reporting ENOSYS is worse than
-     * a no-op for the callers that matter: NSS creates its key database and
-     * then chmod()s it to 0600, treating failure as "the database is not
-     * secure" and refusing to use it (SEC_ERROR_BAD_DATABASE). Anything that
-     * writes a file and tightens its mode afterwards hits the same wall.
-     * We validate the path so a bogus one still reports ENOENT. */
+    /* chmod/fchmodat. Slice 86: these used to validate the path and then
+     * throw the mode away, on the belief that the VFS did not model
+     * permission bits -- but vfs_chmod() has stored them all along. The
+     * no-op was silently wrong for anything that tightens a mode and then
+     * reads it back: NSS chmods its key database to 0600 and refuses to use
+     * it if that does not stick, and chrome CHECKs its singleton directory
+     * for exactly 0700. Store the mode for real; a filesystem that cannot
+     * hold one (VFS_ERR_ROFS) still reports success rather than breaking
+     * callers that only care that the call did not fail. */
     case LX_chmod: case LX_fchmodat: {
         const char *up = (const char *)(LX_chmod == n ? a1 : a2);
+        uint32_t    md = (uint32_t)(LX_chmod == n ? a2 : a3) & 07777u;
         char kpath[ABI_PATH_MAX];
         if (resolve_user_path(up, kpath, sizeof kpath) != 0) return -ABI_EFAULT;
         struct vfs_stat vs;
-        return (vfs_stat(kpath, &vs) == VFS_OK) ? 0 : -ABI_ENOENT;
+        if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
+        int rc = vfs_chmod(kpath, md);
+        if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
+        return (rc == VFS_ERR_PERM) ? -ABI_EACCES : 0;
     }
     case LX_fchmod:
         return fd_lookup((int)a1) ? 0 : -ABI_EBADF;
@@ -7593,11 +7733,32 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (rr) return rr;
         if (!ubuf || bufsz == 0) return -ABI_EINVAL;
         size_t cap = bufsz < sizeof(ktmp) ? bufsz : sizeof(ktmp);
+        /* Slice 86: ktmp used to be left uninitialised and its length taken
+         * with a plain strlen(). vfs_readlink's static-table path always
+         * terminates, but the per-mount readlink op (procfs /proc/self/exe,
+         * and any filesystem-backed link) is free not to -- and then strlen
+         * ran off into whatever was on the kernel stack. That is both a
+         * kernel-memory disclosure and, worse for the caller, a readlink
+         * that returns a length it never actually wrote. A caller doing the
+         * near-universal
+         *     ssize_t n = readlink(p, buf, sizeof buf); buf[n] = '\0';
+         * then writes buf[sizeof buf] -- one byte past the array, which is
+         * exactly where -fstack-protector puts the canary. Zero the buffer
+         * and bound the length by what we actually have. */
+        memset(ktmp, 0, sizeof ktmp);
         int rc = vfs_readlink(kpath, ktmp, cap);
         if (rc == VFS_ERR_NOENT) return -ABI_ENOENT;
         if (rc != VFS_OK)        return -ABI_EINVAL;
-        size_t n = strlen(ktmp);
+        size_t n = 0;
+        while (n < cap && ktmp[n]) n++;    /* bounded: never scans past cap */
+        if (n == 0) return -ABI_EINVAL;    /* nothing resolved -> not a link */
         if (n > bufsz) n = bufsz;          /* readlink does NOT NUL-terminate */
+#ifdef CHROMIUM_BOOT
+        { static int rl = 0; if (rl < 40) { rl++;
+            kprintf("[rdlink] pid=%d '%s' -> n=%u bufsz=%u\n",
+                    current_proc() ? current_proc()->pid : -1, kpath,
+                    (unsigned)n, (unsigned)bufsz); } }
+#endif
         if (copy_to_user(ubuf, ktmp, n) != 0) return -ABI_EFAULT;
         return (long)n;
     }

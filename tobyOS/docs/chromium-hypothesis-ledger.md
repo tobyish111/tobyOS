@@ -4686,3 +4686,68 @@ NEXT (in order, both cheap):
     faulting frame and check CLONE_VFORK parent-suspension semantics.
 This is the closest the arc has been to a fix: the failure is now a
 two-line C bug class rather than an opaque browser decision.
+
+## Slice 86: *** FULL CHROME'S exit 191 IS FIXED *** -- mkdir(2) threw away
+## the caller's mode, so ProcessSingleton's CHECK(mode == 0700) failed.
+## Browser lifetime 7s -> full session.
+
+Slice 85's reading was WRONG and is retracted here. The trap is not
+__stack_chk_fail: dumping both sides of the canary at fault time showed
+fs:0x28 == 0 and [rbp-0x30] == 0, i.e. they MATCH and that branch is never
+taken. The `call __stack_chk_fail` seen next to the trap was a neighbouring
+code path; clang pads with int3, so an int3 near a noreturn call proves
+nothing. The real identification: the trap is `int3` followed by `ud2`,
+which is exactly Chromium's IMMEDIATE_CRASH() macro -- a deliberate
+CHECK/NOTREACHED abort, not memory corruption.
+
+Adding RETURN VALUES to the syscall ring settled the rest. The browser's
+last syscalls before the abort were all SUCCESSES:
+
+    socket=14  fcntl=0  fcntl=0  readlink=-2  readlink=-2  close=0
+    uname=0  symlink=0  getrandom=8  mkdir=0  stat=0   <-- then IMMEDIATE_CRASH
+
+No failing syscall precedes the crash, which rules out the entire "what did
+we return wrong" family the previous ten slices chased. That sequence is
+ProcessSingleton::Create, which immediately after making its temp directory
+does:
+
+    CHECK(base::GetPosixFilePermissions(dir, &mode) &&
+          mode == base::FILE_PERMISSION_USER_MASK)   // exactly 0700
+
+ROOT CAUSE: vfs_mkdir() hardcoded `00755u | VFS_MODE_VALID` for every
+directory ever created, and sys_mkdir explicitly discarded its mode
+argument ("M25A: not honoured yet"). chrome asks for 0700, reads back 0755,
+and CHECK-fails. chrome-headless-shell has no ProcessSingleton, which is
+exactly why the headless flavour never hit this in ~40 slices.
+
+FIXES
+ * vfs_mkdir_mode(path, mode) carries the caller's mode; vfs_mkdir() keeps
+   the 0755 default for the 8 in-kernel callers.
+ * sys_mkdir passes the requested mode through.
+ * chmod/fchmodat now really store the mode via vfs_chmod(), which existed
+   and worked all along -- the syscall had been a deliberate no-op on the
+   belief that "the VFS does not model permission bits". It does. This also
+   removes a latent NSS failure (it chmods its key DB to 0600 and refuses
+   the DB if that does not stick).
+
+ALSO IN THIS SLICE (real ABI gaps found while hunting, all correct
+independently of the above):
+ * Named AF_UNIX sockets: bind/listen/accept were rejected outright (bind
+   fell through to the sockaddr_in path -> EINVAL; listen -> EOPNOTSUPP).
+   Registry lives in socket.c so struct sock does not change size. A bound
+   listener is no longer reported POLLHUP by the "no peer == EOF" rule.
+ * Every sockaddr write-back (getsockname/getpeername/accept/recvfrom x2)
+   ignored the caller's *addrlen and wrote a fixed 16 bytes. Now clamped
+   with Linux truncation semantics via lx_addr_writeback().
+ * getsockname on an AF_UNIX socket claimed AF_INET; it now answers with a
+   real sockaddr_un.
+ * readlink took strlen() of an uninitialised kernel buffer (the per-mount
+   readlink op need not terminate) -- a kernel-memory disclosure that could
+   also return a length never written. Buffer zeroed, scan bounded.
+
+RESULT: browser pid 3 no longer dies at ~7s; it runs the whole session and
+gets as far as GPUPersistentCache / component_crx_cache / NativeMessagingHosts.
+NEXT WALL (new, much later): a CHILD process, pid=10 'chrome+T', takes a
+vec=13 GP fault and exits 191 at ~74s after 39.5s of real CPU. Registers
+carry ASCII-looking bytes (r10=0x74736f01, r15=0x0605010702020301), which by
+the standing rule means memory corruption rather than a bad return value.

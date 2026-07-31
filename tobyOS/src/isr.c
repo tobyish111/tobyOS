@@ -372,6 +372,25 @@ static void default_exception(struct regs *r) {
                 kprintf("[sigfault]   r12=%p r13=%p r14=%p r15=%p\n",
                         (void *)pre.r12, (void *)pre.r13,
                         (void *)pre.r14, (void *)pre.r15);
+                /* Slice 86: the trap sits right after a
+                 *     mov %fs:0x28,%rax ; cmp -0x30(%rbp),%rax ; jne ...
+                 * stack-protector epilogue, and the rax it reports is
+                 * 0x00000000fffff001 -- a zero-extended -4095, i.e. a
+                 * syscall error value, NOT a random 64-bit canary. So the
+                 * question is which side is wrong: the TLS slot we hand the
+                 * process, or the copy saved on its stack. Dump both, plus
+                 * the FS base they are read through. */
+                if (fp) {
+                    uint64_t tls = fp->tls_base, tcb = 0, onstk = 0;
+                    int e1 = copy_from_user_nofault(&tcb,
+                                (const void *)(uintptr_t)(tls + 0x28), 8);
+                    int e2 = copy_from_user_nofault(&onstk,
+                                (const void *)(uintptr_t)(pre.rbp - 0x30), 8);
+                    kprintf("[canary] fs_base=%p  fs:0x28=%p%s  "
+                            "[rbp-0x30]=%p%s\n",
+                            (void *)tls, (void *)tcb, e1 ? " (unreadable)" : "",
+                            (void *)onstk, e2 ? " (unreadable)" : "");
+                }
                 extern void mmap_debug_fault_vma(uint64_t a);
                 if (addr) mmap_debug_fault_vma(addr);
                 if (true_rip) mmap_debug_fault_vma(true_rip);

@@ -143,6 +143,7 @@ void sock_close(struct sock *s) {
      * as EOF) BEFORE clearing our slot, since it reads our peer_ip. No-op for
      * non-UNIX kinds and for the in-kernel fake-X endpoint. */
     sock_unix_peer_close(s);
+    sock_unix_unbind(s);                 /* slice 86: release any bound name */
 
     s->in_use = false;
     wq_wake_all(&s->wq_recv);
@@ -629,10 +630,154 @@ static bool is_x0_socket(const char *name) {
     return name && strcmp(name, "/tmp/.X11-unix/X0") == 0;
 }
 
+/* ---- Named AF_UNIX sockets: bind / listen / accept -------------------
+ *
+ * Slice 86. Until now bind(2) and listen(2) rejected every AF_UNIX socket
+ * (bind fell through to the sockaddr_in path and answered EINVAL; listen
+ * answered EOPNOTSUPP), so the only UNIX sockets that worked were
+ * socketpair(2) pairs and the fake X server. That was enough for Mojo --
+ * which is why chrome-headless-shell never noticed -- but NOT for full
+ * chrome: ProcessSingleton (the "is another instance of this profile
+ * already running?" lock) creates ~/.config/.../SingletonSocket, binds it
+ * with sizeof(struct sockaddr_un) == 110 and listens on it. That is the
+ * exact call shape at the crash site (bind with length 0x6e, then listen).
+ *
+ * The registry lives here rather than in struct sock so that no widely
+ * embedded struct changes size -- a rebuild trap this codebase has been
+ * bitten by twice. A bound name owns a pool index; a listening name also
+ * owns a small backlog of already-connected server-side endpoints, each
+ * cross-linked to its client the same way socketpair(2) does. */
+#define UNIX_BIND_MAX     32
+#define UNIX_BACKLOG_MAX   8
+
+struct unix_bind {
+    bool  in_use;
+    bool  listening;
+    bool  abstract;
+    char  name[109];
+    int   owner;                          /* sock pool index of the bound socket */
+    int   backlog[UNIX_BACKLOG_MAX];      /* server ends waiting to be accepted */
+    int   nq;
+};
+static struct unix_bind g_unix_binds[UNIX_BIND_MAX];
+
+static struct unix_bind *unix_bind_find(const char *name, bool abstract) {
+    if (!name) return 0;
+    for (int i = 0; i < UNIX_BIND_MAX; i++) {
+        struct unix_bind *b = &g_unix_binds[i];
+        if (b->in_use && b->abstract == abstract && strcmp(b->name, name) == 0)
+            return b;
+    }
+    return 0;
+}
+
+static struct unix_bind *unix_bind_of(const struct sock *s) {
+    if (!s) return 0;
+    int idx = sock_index(s);
+    for (int i = 0; i < UNIX_BIND_MAX; i++)
+        if (g_unix_binds[i].in_use && g_unix_binds[i].owner == idx)
+            return &g_unix_binds[i];
+    return 0;
+}
+
+int sock_unix_bind_name(struct sock *s, const char *name, bool abstract) {
+    if (!s || s->kind != SOCK_KIND_UNIX || !name || !*name) return -22; /* -EINVAL */
+    if (unix_bind_of(s))                 return -22;   /* already bound */
+    if (unix_bind_find(name, abstract))  return -98;   /* -EADDRINUSE */
+    for (int i = 0; i < UNIX_BIND_MAX; i++) {
+        struct unix_bind *b = &g_unix_binds[i];
+        if (b->in_use) continue;
+        memset(b, 0, sizeof *b);
+        b->in_use   = true;
+        b->abstract = abstract;
+        b->owner    = sock_index(s);
+        size_t n = strlen(name);
+        if (n > sizeof(b->name) - 1) n = sizeof(b->name) - 1;
+        memcpy(b->name, name, n);
+        b->name[n] = '\0';
+#ifdef CHROMIUM_BOOT
+        kprintf("[unixbind] pid=%d sock=%d %s'%s'\n",
+                current_proc() ? current_proc()->pid : -1, b->owner,
+                abstract ? "@" : "", b->name);
+#endif
+        return 0;
+    }
+    return -105;                                       /* -ENOBUFS */
+}
+
+/* The name this socket is bound to, or NULL if unnamed. Abstract names are
+ * returned without their leading NUL; getsockname's caller does not need
+ * the distinction here, since we keep one namespace. */
+const char *sock_unix_bound_name(const struct sock *s) {
+    struct unix_bind *b = unix_bind_of(s);
+    return b ? b->name : 0;
+}
+
+int sock_unix_listen(struct sock *s) {
+    struct unix_bind *b = unix_bind_of(s);
+    if (!b) return -22;                                /* not bound -> -EINVAL */
+    b->listening = true;
+    return 0;
+}
+
+bool sock_unix_can_accept(const struct sock *s) {
+    struct unix_bind *b = unix_bind_of(s);
+    return b && b->listening && b->nq > 0;
+}
+
+/* Pop one already-connected server endpoint. -EAGAIN when the backlog is
+ * empty: an AF_UNIX listener has no handshake to wait for, so there is
+ * nothing to block on beyond a pending connect. */
+int sock_unix_accept(struct sock *s, struct sock **out) {
+    struct unix_bind *b = unix_bind_of(s);
+    if (!b || !b->listening) return -22;
+    if (b->nq <= 0)          return -11;               /* -EAGAIN */
+    int idx = b->backlog[0];
+    for (int i = 1; i < b->nq; i++) b->backlog[i - 1] = b->backlog[i];
+    b->nq--;
+    struct sock *ns = sock_by_fd(idx);
+    if (!ns || !ns->in_use) return -11;
+    *out = ns;
+    return 0;
+}
+
+/* Release any binding owned by `s` (called from sock_close). A listener that
+ * goes away drops its queued-but-unaccepted endpoints, exactly as Linux
+ * does when the listening socket is closed. */
+void sock_unix_unbind(struct sock *s) {
+    struct unix_bind *b = unix_bind_of(s);
+    if (!b) return;
+    for (int i = 0; i < b->nq; i++) {
+        struct sock *q = sock_by_fd(b->backlog[i]);
+        if (q && q->in_use) sock_close(q);
+    }
+    memset(b, 0, sizeof *b);
+}
+
 int sock_unix_connect_named(struct sock *s, const char *name, bool abstract) {
-    (void)abstract;                          /* abstract + filesystem share a name */
     if (!s || s->kind != SOCK_KIND_UNIX) return -22;   /* -EINVAL */
-    if (!is_x0_socket(name)) return -111;    /* -ECONNREFUSED: only the X socket */
+
+    /* A real listener bound to this name wins over everything else. */
+    struct unix_bind *b = unix_bind_find(name, abstract);
+    if (!b) b = unix_bind_find(name, !abstract);  /* abstract/fs share a namespace here */
+    if (b && b->listening) {
+        if (b->nq >= UNIX_BACKLOG_MAX) return -111;    /* -ECONNREFUSED: backlog full */
+        struct sock *srv = sock_alloc(SOCK_KIND_UNIX);
+        if (!srv) return -111;
+        srv->sotype = s->sotype;
+        /* Cross-link client and server ends, as socketpair(2) does. */
+        srv->peer_ip = (uint32_t)(sock_index(s)   + 1);
+        s->peer_ip   = (uint32_t)(sock_index(srv) + 1);
+        b->backlog[b->nq++] = sock_index(srv);
+#ifdef CHROMIUM_BOOT
+        kprintf("[unixbind] connect pid=%d -> '%s' cli=%d srv=%d q=%d\n",
+                current_proc() ? current_proc()->pid : -1, b->name,
+                sock_index(s), sock_index(srv), b->nq);
+#endif
+        return 0;
+    }
+
+    if (!is_x0_socket(name)) return -111;    /* -ECONNREFUSED: nothing listening */
     s->x_server     = 1;
     s->x_setup_done = 0;
     s->peer_ip      = 0;                      /* no real peer; x_server gates I/O */

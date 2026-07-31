@@ -275,6 +275,9 @@ int  vfs_write_all(const char *path, const void *buf, size_t n);
 
 int  vfs_symlink (const char *path, const char *target);
 int  vfs_readlink(const char *path, char *buf, size_t bufsz);
+/* Slice 86: mkdir honouring the caller's mode. vfs_mkdir() keeps the old
+ * 0755 default so existing in-kernel callers are unchanged. */
+int  vfs_mkdir_mode(const char *path, uint32_t mode);
 int  vfs_resolve_path(const char *path, char *resolved, size_t resolved_sz);
 
 /* Resolve `path` through any SYMLINKS (including dynamically-synthesised ones

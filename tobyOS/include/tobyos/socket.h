@@ -257,6 +257,18 @@ int  sock_unix_pair(struct sock **out_a, struct sock **out_b);
  * a negative -errno (e.g. -ECONNREFUSED) for any other address. */
 int  sock_unix_connect_named(struct sock *s, const char *name, bool abstract);
 
+/* Slice 86: named AF_UNIX servers -- bind(2)/listen(2)/accept(2). Needed by
+ * full chrome's ProcessSingleton (SingletonSocket), which binds a
+ * sockaddr_un of length 110 and listens; chrome-headless-shell has no
+ * ProcessSingleton, which is why it never exercised this path. The binding
+ * registry lives in socket.c so struct sock does not change size. */
+int  sock_unix_bind_name(struct sock *s, const char *name, bool abstract);
+const char *sock_unix_bound_name(const struct sock *s);
+int  sock_unix_listen(struct sock *s);
+bool sock_unix_can_accept(const struct sock *s);
+int  sock_unix_accept(struct sock *s, struct sock **out);
+void sock_unix_unbind(struct sock *s);
+
 /* Bind a socket to a local port (network byte order). */
 int sock_bind(struct sock *s, uint16_t port_be);
 
