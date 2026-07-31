@@ -4484,3 +4484,33 @@ now that socket type and credentials are both correct:
     with no data for unknown options, which would hand it zeroed creds.
     SO_PEERCRED is the natural companion to the SO_PASSCRED work already
     landed, and is cheap to implement -- try it first.
+
+## Slice 81: SO_PEERCRED implemented (another real gap) -- and ELIMINATED as
+## a candidate by evidence: chrome never asks for it.
+
+SO_PEERCRED fell through getsockopt's `default: v = 0` and returned FOUR
+zero bytes with a reported length of 4, where Linux returns a 12-byte
+struct ucred -- structurally wrong, not merely empty. Implemented properly:
+struct sock latches its creator's {pid,uid,gid} at sock_alloc (Linux answers
+SO_PEERCRED from the values captured at socketpair()/connect() time, not
+from whoever holds the fd now -- which matters precisely because these
+endpoints are inherited across fork and exec), sock_peer_of() resolves the
+AF_UNIX peer, and the option returns the peer's latched credentials.
+
+RESULT: the [peercred] probe logged NOTHING -- chrome never queries
+SO_PEERCRED at all. So this is eliminated as a cause by direct evidence
+rather than by "the symptom didn't change", which is the stronger form.
+Kept as a correctness fix; do not re-test it.
+
+CANDIDATE LIST after this slice (unchanged failure, browser still never
+reads the reply):
+ (a) SO_PEERCRED -- ELIMINATED, never queried.
+ (b) **lx_sendmsg ignores its `flags` argument entirely ((void)flags on the
+     first line).** crashpad sends with MSG_NOSIGNAL; other callers use
+     MSG_DONTWAIT/MSG_MORE, and nothing distinguishes them today. This is
+     now the top remaining candidate -- and it is testable without chrome:
+     write a tiny Linux test binary that socketpairs, sendmsg's with
+     MSG_NOSIGNAL and recvmsg's, and run it under BOTH tobyOS and the WSL
+     control. That isolates the ABI difference from the browser entirely,
+     which is what should have been done for this whole class of question.
+ (c) msghdr OUT fields on the send path (low probability).

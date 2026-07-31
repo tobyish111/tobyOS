@@ -68,6 +68,7 @@
 #define SO_SNDTIMEO            21
 #define SO_ACCEPTCONN          30      /* getsockopt: 1 if listen()ing */
 #define SO_PASSCRED            16      /* slice 77: receive SCM_CREDENTIALS */
+#define SO_PEERCRED            17      /* slice 81: struct ucred of the peer */
 
 struct sockaddr_in {
     uint16_t sin_family;
@@ -175,6 +176,12 @@ struct sock {
      * reported SOCK_DGRAM, including the SOCK_SEQPACKET socketpairs Mojo and
      * crashpad use and then inspect. */
     uint8_t          sotype;
+    /* Slice 81: credentials captured when this endpoint was created. Linux
+     * answers SO_PEERCRED from the values latched at socketpair()/connect()
+     * time, NOT from whoever holds the fd now -- which matters here because
+     * these endpoints are inherited across fork and exec. */
+    int32_t          cr_pid;
+    uint32_t         cr_uid, cr_gid;
 
     /* ---- Non-blocking connect state ----------------------------------
      * connecting=1 between a connect() that returned EINPROGRESS and the
@@ -237,6 +244,7 @@ void sock_ref(struct sock *s);
  * (mojo/core/channel_linux.cc) passes its memfd this way. */
 long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
                         struct file **files, int nfiles);
+struct sock *sock_peer_of(struct sock *self);   /* slice 81: SO_PEERCRED */
 long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
                         uint32_t timeout_ms,
                         struct file **out_files, int max_out, int *out_n);

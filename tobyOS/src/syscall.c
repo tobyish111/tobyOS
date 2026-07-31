@@ -6090,6 +6090,31 @@ static long lx_getsockopt(int fd, int level, int optname,
     case SO_ACCEPTCONN: v = s->tcp_listening ? 1 : 0;                break;
     case SO_SNDBUF:
     case SO_RCVBUF:     v = 65536;                                   break;
+    case SO_PEERCRED: {
+        /* Slice 81: return the PEER endpoint's latched creator credentials
+         * as a 12-byte struct ucred. Everything unknown used to fall through
+         * to the 4-byte zero readback below, so a caller asking for peer
+         * credentials got 4 bytes of zeros AND a length of 4 -- structurally
+         * wrong, not merely empty. For a socketpair Linux reports the
+         * creating process for both ends, which is what the latched values
+         * give us. */
+        struct { int32_t pid; uint32_t uid, gid; } uc = { 0, 0, 0 };
+        struct sock *peer = 0;
+        if (s->kind == SOCK_KIND_UNIX && s->peer_ip)
+            peer = sock_peer_of(s);
+        const struct sock *src = peer ? peer : s;
+        uc.pid = src->cr_pid; uc.uid = src->cr_uid; uc.gid = src->cr_gid;
+        uint32_t want = ulen < sizeof uc ? ulen : (uint32_t)sizeof uc;
+        if (want && copy_to_user((void *)(uintptr_t)uval, &uc, want) != 0)
+            return -ABI_EFAULT;
+        (void)copy_to_user((void *)(uintptr_t)ulen_ptr, &want, 4);
+#ifdef CHROMIUM_BOOT
+        { static int pc = 0; if (pc < 12) { pc++;
+            kprintf("[peercred] fd=%d -> pid=%d uid=%u gid=%u len=%u\n",
+                    fd, uc.pid, uc.uid, uc.gid, want); } }
+#endif
+        return 0;
+    }
     default:            v = 0;  /* REUSEADDR/KEEPALIVE/BROADCAST/… readback */ break;
     }
     uint32_t n = ulen < 4 ? ulen : 4;

@@ -79,6 +79,11 @@ struct sock *sock_alloc(int kind) {
             g_socks[i].in_use = true;
             g_socks[i].refs   = 1;
             g_socks[i].kind   = kind;
+            {   /* slice 81: latch creator creds for SO_PEERCRED */
+                struct proc *cp = current_proc();
+                g_socks[i].cr_pid = cp ? cp->pid : 0;
+                g_socks[i].cr_uid = cp ? (uint32_t)cp->uid : 0;
+                g_socks[i].cr_gid = cp ? (uint32_t)cp->gid : 0; }
             g_socks[i].recv_timeout_ms = 30000;
             g_socks[i].send_timeout_ms = 30000;
             return &g_socks[i];
@@ -475,6 +480,14 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
         self->tail_off = 0;
     }
     return (long)copy;
+}
+
+/* Slice 81: the AF_UNIX peer endpoint, or NULL. peer_ip stores the peer's
+ * pool index + 1 (0 = no peer). Used by SO_PEERCRED. */
+struct sock *sock_peer_of(struct sock *self) {
+    if (!self || self->kind != SOCK_KIND_UNIX || !self->peer_ip) return 0;
+    struct sock *p = sock_by_fd((int)self->peer_ip - 1);
+    return (p && p->in_use) ? p : 0;
 }
 
 void sock_unix_peer_close(struct sock *self) {
