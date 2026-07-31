@@ -4293,3 +4293,33 @@ remaining trace shows `[uxmsg] pid=1 RECV fd=4 want=40 -> 0` (the first
 child reads 0 = EOF where Linux delivers the handler's reply carrying
 SCM_RIGHTS), and note every [uxmsg] line so far reports nscm=0 -- we are not
 carrying the ancillary fd. Next: make SCM_RIGHTS ride the socketpair reply.
+
+## Slice 76b: the LAST missing piece is named exactly -- SCM_CREDENTIALS.
+
+Decoded the handshake contract from the control's strace rather than
+guessing at our nscm=0:
+
+  browser -> handler:  sendmsg(4, iov_len=40, **msg_controllen=0**) = 40
+  handler -> browser:  recvmsg(4, iov_len=8,
+                         msg_control=[{cmsg_level=SOL_SOCKET,
+                                       cmsg_type=**SCM_CREDENTIALS**,
+                                       cmsg_data={pid=541,uid=0,gid=0}}]) = 8
+  browser:             prctl(PR_SET_PTRACER, **541**)   <- the pid FROM the creds
+
+Two consequences:
+ 1. `nscm=0` on our SEND is CORRECT -- that message genuinely carries no
+    ancillary data. It was never the bug; do not "fix" it.
+ 2. What chrome actually needs back is an 8-byte reply carrying
+    SCM_CREDENTIALS, and it uses the pid inside to set its ptracer. tobyOS
+    has no SCM_CREDENTIALS/SO_PASSCRED, so even now that the handler runs
+    and receives the request (slice 76), its reply cannot carry what the
+    browser requires -- which is why the browser still CHECKs, and why the
+    first child's read comes back 0.
+
+NEXT (well-scoped, the likely last step of this arc): implement
+SO_PASSCRED + SCM_CREDENTIALS on the AF_UNIX path -- synthesize the cmsg
+from the SENDING proc's pid/uid/gid at recvmsg time (the kernel already
+knows all three; nothing needs to be carried in the ring), and accept/ignore
+SO_PASSCRED in setsockopt. Then re-run: chrome should get its reply, call
+PR_SET_PTRACER, install the SA_ONSTACK handlers, and continue past crashpad
+into normal browser startup.
