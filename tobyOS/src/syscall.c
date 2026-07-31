@@ -5956,6 +5956,16 @@ static long lx_setsockopt(int fd, int level, int optname, uint64_t uval, uint32_
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
     if (level != SOL_SOCKET) return 0;   /* accept-and-ignore other levels */
+    /* Slice 77: SO_PASSCRED -- the receiver wants SCM_CREDENTIALS attached to
+     * every message. Record it; lx_scm_recv_emit does the work. chrome's
+     * crashpad client sets this on its handshake socket, and without it the
+     * handler's reply carries no pid for prctl(PR_SET_PTRACER). */
+    if (optname == SO_PASSCRED) {
+        uint32_t on = 0;
+        if (uval && olen >= 4) (void)copy_from_user(&on, (const void *)(uintptr_t)uval, 4);
+        s->passcred = (on != 0);
+        return 0;
+    }
     if ((optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) && uval && olen >= 16) {
         int64_t tv[2];                   /* struct timeval { sec; usec; } */
         if (copy_from_user(tv, (const void *)(uintptr_t)uval, sizeof tv) != 0)
@@ -6187,8 +6197,14 @@ static int lx_scm_send_collect(const struct lx_msghdr *mh,
 
 /* Install received descriptions into our fd table and emit one SCM_RIGHTS cmsg
  * into the caller's control buffer. Writes msg_controllen + msg_flags back. */
+/* Slice 77: SCM_CREDENTIALS payload -- Linux `struct ucred` is {pid,uid,gid},
+ * three 32-bit fields, so CMSG_LEN(12) == 28 (matching the cmsg_len=28 the
+ * control's strace shows on crashpad's reply). */
+struct lx_ucred { int32_t pid; uint32_t uid; uint32_t gid; };
+#define LX_SCM_CREDENTIALS 2
+
 static void lx_scm_recv_emit(uint64_t umsg, const struct lx_msghdr *mh,
-                             struct file **files, int nf) {
+                             struct file **files, int nf, bool pass_cred) {
     uint64_t ctl_len = 0;
     int32_t  flags   = 0;
 #ifdef CHROMIUM_BOOT
@@ -6235,6 +6251,41 @@ static void lx_scm_recv_emit(uint64_t umsg, const struct lx_msghdr *mh,
                                  (size_t)clen) == 0)
                     ctl_len = clen;
             }
+        }
+    }
+    /* Slice 77: SCM_CREDENTIALS. Linux delivers the SENDER's {pid,uid,gid}
+     * to a receiver that enabled SO_PASSCRED. chrome's crashpad handshake
+     * needs exactly this: the handler replies with 8 bytes + credentials and
+     * the browser feeds the pid into prctl(PR_SET_PTRACER, pid) -- without
+     * it the browser CHECKs and aborts (exit 191). Emitted only when no
+     * SCM_RIGHTS was written (one cmsg is all any caller here asks for) and
+     * only if the control buffer has room; the values come from the message
+     * that sock_unix_recv_fds just dequeued, captured at ENQUEUE time so a
+     * sender that has since exited still identifies itself correctly. */
+    if (ctl_len == 0 && pass_cred && mh->msg_control) {
+        uint64_t need = sizeof(struct lx_cmsghdr) + sizeof(struct lx_ucred);
+        if (mh->msg_controllen >= need) {
+            uint8_t buf[sizeof(struct lx_cmsghdr) + sizeof(struct lx_ucred)];
+            struct lx_cmsghdr *cm = (struct lx_cmsghdr *)buf;
+            struct lx_ucred   *uc = (struct lx_ucred *)(buf + sizeof(*cm));
+            cm->cmsg_len   = need;              /* == 28, as Linux reports */
+            cm->cmsg_level = LX_SOL_SOCKET;
+            cm->cmsg_type  = LX_SCM_CREDENTIALS;
+            extern int32_t  g_unix_last_cred_pid;
+            extern uint32_t g_unix_last_cred_uid, g_unix_last_cred_gid;
+            uc->pid = g_unix_last_cred_pid;
+            uc->uid = g_unix_last_cred_uid;
+            uc->gid = g_unix_last_cred_gid;
+            if (copy_to_user((void *)(uintptr_t)mh->msg_control, buf,
+                             sizeof buf) == 0)
+                ctl_len = need;
+#ifdef CHROMIUM_BOOT
+            { static int cc = 0; if (cc < 16) { cc++;
+                kprintf("[scmcred] emitted pid=%d uid=%u gid=%u ctl_len=%lu\n",
+                        uc->pid, uc->uid, uc->gid, (unsigned long)ctl_len); } }
+#endif
+        } else {
+            flags |= LX_MSG_CTRUNC;
         }
     }
 #ifdef CHROMIUM_BOOT
@@ -6464,7 +6515,8 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
          * SCM_RIGHTS emitter (which also installs any received fds). */
         uint32_t nl = (mh.msg_name) ? (uint32_t)namelen_out : 0;
         (void)copy_to_user((void *)(uintptr_t)(umsg + 8),  &nl, 4);
-        lx_scm_recv_emit(umsg, &mh, scm_files, scm_n);
+        lx_scm_recv_emit(umsg, &mh, scm_files, scm_n,
+                     s->kind == SOCK_KIND_UNIX && s->passcred);
     }
     return n;
 }

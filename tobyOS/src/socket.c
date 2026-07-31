@@ -282,6 +282,15 @@ static int unix_enqueue_fds(struct sock *s, const void *payload, size_t len,
     struct sock_dgram *d = &s->dgrams[s->head];
     d->src_ip = 0; d->src_port = 0; d->len = (uint32_t)len; d->payload = copy;
     d->nfds = 0;
+    /* Slice 77: stamp the SENDER's identity now -- SCM_CREDENTIALS is
+     * delivered at dequeue, by which time the sender may have exited (that
+     * is the normal case for crashpad's double-fork child). */
+    {
+        struct proc *sp = current_proc();
+        d->snd_pid = sp ? sp->pid : 0;
+        d->snd_uid = sp ? (uint32_t)sp->uid : 0;
+        d->snd_gid = sp ? (uint32_t)sp->gid : 0;
+    }
 #ifdef CHROMIUM_BOOT
     {   uint32_t h = 2166136261u;                 /* FNV-1a over the copied bytes */
         for (size_t i = 0; i < len; i++) { h ^= copy[i]; h *= 16777619u; }
@@ -357,6 +366,13 @@ long sock_unix_recv(struct sock *self, void *kbuf, size_t n, uint32_t timeout_ms
     return sock_unix_recv_fds(self, kbuf, n, timeout_ms, 0, 0, 0);
 }
 
+/* Slice 77: credentials of the message most recently dequeued by
+ * sock_unix_recv_fds, for lx_recvmsg to emit as SCM_CREDENTIALS. Valid
+ * only immediately after that call (single-threaded per syscall, BKL
+ * held), which is exactly how the SCM_RIGHTS hand-off already works. */
+int32_t  g_unix_last_cred_pid;
+uint32_t g_unix_last_cred_uid, g_unix_last_cred_gid;
+
 long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
                         uint32_t timeout_ms,
                         struct file **out_files, int max_out, int *out_n) {
@@ -431,6 +447,13 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
      * touches it (tail_off == 0), matching Linux where ancillary data arrives
      * with the first byte of its message. A reader with no control buffer
      * (plain read(), or out_files == NULL) DISCARDS them, as Linux does. */
+    /* Slice 77: publish the sender's credentials for this message alongside
+     * the fds -- same "first read of the message" rule. */
+    if (self->tail_off == 0) {
+        g_unix_last_cred_pid = d->snd_pid;
+        g_unix_last_cred_uid = d->snd_uid;
+        g_unix_last_cred_gid = d->snd_gid;
+    }
     if (self->tail_off == 0 && d->nfds) {
         int give = 0;
         for (int i = 0; i < d->nfds; i++) {

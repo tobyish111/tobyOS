@@ -4323,3 +4323,35 @@ knows all three; nothing needs to be carried in the ring), and accept/ignore
 SO_PASSCRED in setsockopt. Then re-run: chrome should get its reply, call
 PR_SET_PTRACER, install the SA_ONSTACK handlers, and continue past crashpad
 into normal browser startup.
+
+## Slice 77: SO_PASSCRED + SCM_CREDENTIALS implemented. Chrome advances to a
+## new, narrower failure: crashpad "incorrect payload size 0".
+
+Implemented what slice 76b specified:
+ - struct sock_dgram carries the SENDER's {pid,uid,gid}, stamped at ENQUEUE
+   (by dequeue the sender may be gone -- crashpad's first child exits by
+   design, which is exactly the case that matters here).
+ - sock_unix_recv_fds publishes them for the message it just dequeued, on
+   the same "first read of the message" rule the SCM_RIGHTS hand-off uses.
+ - SO_PASSCRED (16) recorded in setsockopt; lx_scm_recv_emit emits a
+   SOL_SOCKET/SCM_CREDENTIALS cmsg when the receiver asked for it and no
+   SCM_RIGHTS was written, with CTRUNC if the control buffer is too small.
+VERIFIED: `[scmcred] emitted pid=3 uid=0 gid=0 ctl_len=28` -- 28 bytes is
+exactly what the control's strace reports (CMSG_LEN(sizeof(struct ucred))).
+defboot clean.
+
+Chrome now gets PAST the dead-peer failure and reports something new and
+much more specific, from crashpad itself:
+    third_party/crashpad/crashpad/util/linux/socket.cc:182]
+        incorrect payload size 0
+with `[uxmsg] pid=4 RECV fd=7 want=40 -> 40` (the handler DOES receive the
+40-byte request) followed by reads returning 0. So the request now arrives
+intact and the credentials ride correctly; what is still missing is the
+handler's REPLY payload -- crashpad's UnixCredentialSocket expects a
+specific number of bytes and is seeing none.
+
+NEXT (narrow): trace the handler's own send after it receives the request --
+does chrome_crashpad_handler call sendmsg at all (no [uxmsg] SEND from pid 4
+appears in the captured window), and if so does our SEQPACKET path deliver
+its payload? The [uxmsg] probe already covers both sides; extend its cap and
+read the handler's half of the conversation.

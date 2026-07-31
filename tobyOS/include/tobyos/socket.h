@@ -67,6 +67,7 @@
 #define SO_RCVTIMEO            20
 #define SO_SNDTIMEO            21
 #define SO_ACCEPTCONN          30      /* getsockopt: 1 if listen()ing */
+#define SO_PASSCRED            16      /* slice 77: receive SCM_CREDENTIALS */
 
 struct sockaddr_in {
     uint16_t sin_family;
@@ -98,6 +99,15 @@ struct sock_dgram {
     uint8_t  *payload;         /* kmalloc'd; freed on dequeue */
     struct file *fds[SOCK_SCM_MAX_FDS];
     uint8_t   nfds;
+    /* Slice 77: SCM_CREDENTIALS. Linux tags every AF_UNIX message with the
+     * SENDER's identity and hands it to a receiver that set SO_PASSCRED.
+     * chrome's crashpad handshake depends on it: the handler replies with
+     * 8 bytes + SCM_CREDENTIALS, and the browser feeds the pid straight
+     * into prctl(PR_SET_PTRACER, pid). Captured at enqueue because by
+     * dequeue time the sender may be gone (crashpad's first child exits
+     * immediately by design). */
+    int32_t   snd_pid;
+    uint32_t  snd_uid, snd_gid;
 #ifdef CHROMIUM_BOOT
     uint32_t  chksum;          /* FNV of payload at enqueue; verified at dequeue
                                 * to prove the transport delivers exact bytes. */
@@ -156,6 +166,9 @@ struct sock {
      * EAGAIN -- fine for the wget-shaped clients this stack grew up with,
      * fatal for an epoll-driven one like chrome's network service. */
     bool             nonblock;
+    /* Slice 77: SO_PASSCRED -- receiver asked for SCM_CREDENTIALS on every
+     * message (chrome's crashpad client sets it on its handshake socket). */
+    bool             passcred;
 
     /* ---- Non-blocking connect state ----------------------------------
      * connecting=1 between a connect() that returned EINPROGRESS and the
