@@ -7623,6 +7623,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         cur._pad     = 0;
         if (a2 && copy_to_user((void *)a2, &cur, sizeof cur) != 0)
             return -ABI_EFAULT;
+#ifdef CHROMIUM_BOOT
+        { static int ss = 0; if (ss < 16) { ss++;
+            kprintf("[sigalt] pid=%d query=%s set=%s\n", sp->pid,
+                    a2 ? "yes" : "no", a1 ? "yes" : "no"); } }
+#endif
         if (a1) {
             if (copy_from_user(&in, (const void *)a1, sizeof in) != 0)
                 return -ABI_EFAULT;
@@ -8408,6 +8413,19 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             cur->sa_flags   = (int)na.sa_flags;
             if ((na.sa_flags & LX_SA_RESTORER) && na.sa_restorer)
                 p->sigstate.restorer = na.sa_restorer;
+#ifdef CHROMIUM_BOOT
+            /* Slice 84: the browser installs EIGHT handlers with
+             * SA_ONSTACK|SA_SIGINFO on Linux (SIGABRT/BUS/FPE/ILL/QUIT/
+             * SEGV/SYS/TRAP) after an sigaltstack; on tobyOS it installs ONE
+             * and aborts. Log signal + flags so the two sequences can be
+             * diffed line-for-line. 0x08000000=SA_ONSTACK, 4=SA_SIGINFO. */
+            { static int sa = 0; if (sa < 24) { sa++;
+                kprintf("[sigact] pid=%d sig=%d flags=0x%lx handler=%p%s%s\n",
+                        p->pid, sig, (unsigned long)na.sa_flags,
+                        (void *)(uintptr_t)na.sa_handler,
+                        (na.sa_flags & 0x08000000u) ? " SA_ONSTACK" : "",
+                        (na.sa_flags & 4u) ? " SA_SIGINFO" : ""); } }
+#endif
         }
         return 0;
     }

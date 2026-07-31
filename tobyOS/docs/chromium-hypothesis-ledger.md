@@ -4595,3 +4595,43 @@ and never calls sigaltstack (implemented in slice 70 -- verify chrome
 actually calls it and what it returns). Next probe: log rt_sigaction's
 signal number + flags and sigaltstack's arguments for the browser, and
 compare against the control's strace line-for-line.
+
+## Slice 84: CORRECTION -- crashpad setup COMPLETES. The browser installs
+## all eight handlers with SA_ONSTACK after a real sigaltstack. The INT3 is
+## a LATER, separate CHECK.
+
+Logged rt_sigaction's signal+flags and sigaltstack's usage instead of
+inferring from the ring's tail:
+
+    [sigalt] pid=3 query=yes set=no      <- reads the current alt stack
+    [sigalt] pid=3 query=no  set=yes     <- installs one
+    [sigact] pid=3 sig=6,7,8,4,3,11,31,5,24 flags=0xc000804
+             handler=0xfd71cc0 SA_ONSTACK SA_SIGINFO   (one line each)
+
+That is SIGABRT/BUS/FPE/ILL/QUIT/SEGV/SYS/TRAP(+XFSZ) with SA_ONSTACK|
+SA_SIGINFO -- the SAME set, flags and single shared handler the control's
+strace shows. So crashpad's signal setup SUCCEEDS on tobyOS.
+
+**This corrects slices 79-83.** "One rt_sigaction then abort" was an
+artifact of reading only the last 32 entries of a global ring shared by four
+processes; the full picture shows the browser getting substantially further
+than believed. The crashpad handshake is therefore NOT the blocker either --
+it is at worst a warning path -- and the INT3/exit 191 is a DIFFERENT,
+LATER CHECK.
+
+Note the ordering difference that misled me: the control's strace has
+sendmsg -> recvmsg -> prctl -> sigaltstack -> handlers as one block, while
+tobyOS reaches the sigaltstack+handlers block anyway. The missing recvmsg is
+real but evidently non-fatal.
+
+WHERE THIS LEAVES THE ARC: everything mechanical is eliminated (clone,
+credentials, socket type, peercred, the AF_UNIX transport via the standalone
+test, wait4/zombies) AND crashpad initialisation now demonstrably completes.
+The remaining task is simply to identify the CHECK -- and the one asset not
+yet used is chrome's own voice: no CHECK text ever reaches stderr even at
+--v=1, which is itself anomalous (a LOG(FATAL) prints file:line first).
+NEXT: find out why chrome's fatal logging produces nothing. Candidates: its
+log file destination (it may be writing to a file under the profile dir we
+never read back), stderr buffering lost at exit_group, or logging being
+initialised late. Reading that message is now worth more than any further
+syscall archaeology -- it names the CHECK outright.
