@@ -4204,3 +4204,47 @@ recvmsg on unix sockets with their RETURN VALUE and whether a cmsg was
 attached/delivered. That single line will say whether our sendmsg rejected
 the SCM_RIGHTS message, whether the handler child ever read it, or whether
 the reply was sent but never delivered.
+
+## Slice 75: THE FAILING CALL IS CAUGHT. crashpad's handshake sendmsg
+## returns EPIPE -- the peer endpoint is already gone because the forked
+## crashpad child dies before replying.
+
+New [uxmsg] probe on the AF_UNIX sendmsg/recvmsg path (the [chan] ring
+cannot see socketpairs -- it only records FILE_KIND_SOCKET fds, which is why
+slice 74's ungating showed nothing). One line says it all:
+
+    [uxmsg] pid=3 SEND fd=6 len=40 nscm=0 -> -32        (-32 = EPIPE)
+
+40 bytes is exactly the iov_len strace showed for crashpad's handshake
+message on Linux, so this IS that call. Two facts in one line: the send
+FAILS with EPIPE (our socket believes the peer is gone), and we collected
+nscm=0 SCM_RIGHTS descriptors where Linux's trace carries a cmsg -- though
+the EPIPE comes first and is the fatal part. Chrome's crashpad client treats
+that failure as unrecoverable -> INT3 -> exit_group(191). That is the whole
+chain, end to end.
+
+WHY the peer is gone (evidence, consistent across runs):
+ - `[unix] pair pid=3 a=0 b=1` then `[unix] pair pid=3 a=1 b=2` -- slot 1 was
+   FREED and reused, i.e. an endpoint was fully torn down between the two
+   socketpair() calls.
+ - `[uxclose] pid=3 closed unix sock slot=1 -> peer slot=0 sees EOF`.
+ - The browser forks a child that exits 0 almost immediately, and in one run
+   that child took `[pfrej] NO VMA` faults (addr 0x102f00c68xxx, just past
+   the V8/PartitionAlloc PROT_NONE reservation) before dying.
+Endpoint refcounting is NOT the bug: fork clones fds via file_clone, which
+does sock_ref for FILE_KIND_SOCKET, and sock_close only tears down at the
+last reference. The endpoint dies because the CHILD really does exit -- when
+it goes, its references drop and the parent's next send is EPIPE.
+
+So the remaining question is narrow and concrete: WHY does the forked
+crashpad child die instead of replying? On Linux crashpad DOUBLE-FORKS (the
+first child forks the grandchild that execs chrome_crashpad_handler, then
+_exit(0)s immediately to reparent it) -- and our execve-argv log shows only
+ONE exec for the whole run, so the grandchild's fork/exec never happened.
+NEXT PASS: (1) log fork/exec from inside the crashpad child (we currently
+only see `[fork] parent pid=3 -> child pid=1` and no second fork); (2) chase
+the child's NO-VMA fault -- it is the same second mechanism left open since
+slice 61f, and the crashpad child is now a REPRODUCER for it; (3) confirm
+whether /opt/chrome/chrome_crashpad_handler is staged and branded
+(EI_OSABI=Linux) in the CHROME_FULL initrd, since a failed exec of it would
+produce exactly this shape.

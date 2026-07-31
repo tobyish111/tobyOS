@@ -6298,6 +6298,18 @@ static long lx_sendmsg(int fd, uint64_t umsg, int flags) {
          * released the SCM_RIGHTS clones on backpressure, so the retry re-clones. */
         rv = (n == SOCK_ERR_AGAIN) ? -LXE_EAGAIN
            : (n < 0)               ? -ABI_EPIPE : n;
+#ifdef CHROMIUM_BOOT
+        /* Slice 75: the crashpad handshake probe. [chan] cannot see these --
+         * it only records FILE_KIND_SOCKET fds, and socketpairs are not
+         * that -- so AF_UNIX sendmsg/recvmsg were invisible exactly where
+         * full chrome dies (slice 74: it sends, then never receives). Log
+         * the fd, byte count, SCM_RIGHTS count and RESULT. */
+        { static int um = 0; if (um < 48) { um++;
+            struct proc *up = current_proc();
+            kprintf("[uxmsg] pid=%d SEND fd=%d len=%lu nscm=%d -> %ld\n",
+                    up ? up->pid : -1, fd, (unsigned long)total, nscm, rv);
+        } }
+#endif
     } else {
         rv = -LXE_ENOTSOCK;
     }
@@ -6392,6 +6404,15 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
             bool at_eof = (s->peer_ip == 0 && s->count == 0 && !s->x_server);
             if (!at_eof) { kfree(k); return -LXE_EAGAIN; }
         }
+#ifdef CHROMIUM_BOOT
+        /* Slice 75: the receive half of the crashpad-handshake probe. */
+        { static int um = 0; if (um < 48) { um++;
+            struct proc *up = current_proc();
+            kprintf("[uxmsg] pid=%d RECV fd=%d want=%lu flags=0x%x -> %ld "
+                    "nscm=%d\n", up ? up->pid : -1, fd, (unsigned long)total,
+                    (unsigned)flags, n, scm_n);
+        } }
+#endif
     } else {
         kfree(k);
         return -LXE_ENOTSOCK;
