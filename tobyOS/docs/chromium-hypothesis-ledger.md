@@ -4550,3 +4550,48 @@ itself -- rather than at the socket.
 The test is wired into the build permanently (Makefile + kernel spawn
 alongside FUTEXTEST, [SCMSGTEST] VERDICT in every CHROMIUM_BOOT boot), so
 this transport can never silently regress again.
+
+## Slice 83: wait4 EXONERATED too. The browser's full syscall tail is now on
+## the record and pins the divergence to one instruction boundary.
+
+Added an [xexit] hook: any NON-ZERO exit_group from a Linux process dumps
+the syscall ring. The browser aborts at ~7s, long before the 60s deep dump
+that used to be the only way to see the ring, so its final calls had never
+been recorded. Two things came out of it.
+
+1. crashpad's DoubleForkAndExec waits for its intermediate child and
+   REQUIRES waitpid(child)==child && WIFEXITED && WEXITSTATUS==0. Logged
+   exactly what it gets:
+       [wait4] pid=3 wait(1) -> 1 code=0 wstatus=0x0 (WIFEXITED=1 WEXITSTATUS=0)
+       [wait4] pid=4 wait(5) -> 5 code=0 wstatus=0x0 (WIFEXITED=1 WEXITSTATUS=0)
+   Correct on both levels of the double fork. **wait4 eliminated.** (Zombie
+   semantics were checked too: proc_reap runs ONLY from the wait path, so a
+   fast-exiting child cannot be auto-reaped out from under waitpid.)
+
+2. The browser's OWN tail, filtered to pid 3, versus the control's strace at
+   the same point:
+       Linux : sendmsg -> recvmsg -> prctl(PR_SET_PTRACER) -> sigaltstack
+               -> 8x rt_sigaction(SIGABRT/BUS/FPE/ILL/QUIT/SEGV/SYS/TRAP,
+                  SA_ONSTACK|SA_SIGINFO)
+       tobyOS: sendmsg -> rt_sigprocmask -> 1x rt_sigaction -> getpid
+               -> gettid -> exit_group(191)
+   So tobyOS's chrome skips recvmsg AND PR_SET_PTRACER AND the alt-stack
+   install, installs a SINGLE handler, and aborts. getpid+gettid immediately
+   before the exit is the shape of raise()/tgkill (chrome's abort path
+   computes both), and we already know an INT3 fires (sigfault vec=3 sig=5).
+
+RUNNING ELIMINATION LIST (all by direct test, not argument): clone
+semantics, SCM_CREDENTIALS/SO_PASSCRED, SO_TYPE, SO_PEERCRED (never
+queried), the whole AF_UNIX send/recv transport (slice 82's standalone test
+passes identically on both kernels), and now wait4/zombie semantics.
+
+WHERE THAT LEAVES IT: chrome makes its decision WITHOUT issuing the read --
+the ring is authoritative, there is no recvmsg, recvfrom or read from pid 3
+after the sendmsg. So the failing check consumes something chrome ALREADY
+HAS, not a syscall result we can watch. The single rt_sigaction before the
+abort is the strongest remaining thread: on Linux that block installs eight
+handlers with SA_ONSTACK and is preceded by sigaltstack; ours installs one
+and never calls sigaltstack (implemented in slice 70 -- verify chrome
+actually calls it and what it returns). Next probe: log rt_sigaction's
+signal number + flags and sigaltstack's arguments for the browser, and
+compare against the control's strace line-for-line.

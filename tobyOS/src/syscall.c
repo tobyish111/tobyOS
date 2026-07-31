@@ -7135,6 +7135,19 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * message?) is on the record. Once, exit_group only (not per-thread). */
         if (n == LX_exit_group) {
             struct proc *xp = current_proc();
+            /* Slice 83: ANY non-zero exit_group from a Linux process dumps
+             * the syscall ring. The browser aborts with 191 at ~7s -- long
+             * before the 60s deep dump that normally prints the ring -- so
+             * its final syscalls have never been on the record. We know the
+             * sequence ENDS sendmsg -> ... -> exit_group and that the reply
+             * read is missing; this shows every call in between, with the
+             * arguments and returns the name-only ring cannot give. */
+            if (xp && a1 != 0) {
+                kprintf("[xexit] pid=%d '%s' exit_group(%ld) -- syscall tail:\n",
+                        xp->pid, xp->name, (long)a1);
+                extern void lx_dump_recent_syscalls(void);
+                lx_dump_recent_syscalls();
+            }
             if (xp && xp->is_renderer) {
                 kprintf("[rexit] RENDERER pid=%d tgid=%d exit_group(%ld) -- "
                         "last channel ops of this thread group:\n",
@@ -7528,13 +7541,36 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (c->state != PROC_TERMINATED) return 0;
         }
         int code = proc_wait(pid);
-        if (code < 0) return -ABI_ECHILD;
+        if (code < 0) {
+#ifdef CHROMIUM_BOOT
+            /* Slice 83: crashpad's DoubleForkAndExec REQUIRES
+             * waitpid(child) == child AND WIFEXITED(status) &&
+             * WEXITSTATUS(status) == 0; anything else makes StartHandler
+             * return false, which is a fatal CHECK for the browser. Its
+             * wait4 is the last call before the abort, so log both outcomes
+             * with the values crashpad actually tests. */
+            { struct proc *wp = current_proc();
+              kprintf("[wait4] pid=%d wait(%d) -> ECHILD (proc_wait=%d)\n",
+                      wp ? wp->pid : -1, pid, code); }
+#endif
+            return -ABI_ECHILD;
+        }
         if (ustatus) {
             /* Linux wait status: normal exit -> (code & 0xff) << 8, with the
              * low 7 bits zero so WIFEXITED is true / WEXITSTATUS == code. */
             uint32_t wstatus = ((uint32_t)code & 0xff) << 8;
             if (put_user_u32(ustatus, wstatus) != 0) return -ABI_EFAULT;
         }
+#ifdef CHROMIUM_BOOT
+        { static int w4 = 0; if (w4 < 16) { w4++;
+            struct proc *wp = current_proc();
+            kprintf("[wait4] pid=%d wait(%d) -> %d code=%d wstatus=0x%x "
+                    "(WIFEXITED=%d WEXITSTATUS=%d)\n",
+                    wp ? wp->pid : -1, pid, pid, code,
+                    (unsigned)(((uint32_t)code & 0xff) << 8),
+                    ((((uint32_t)code & 0xff) << 8) & 0x7f) == 0 ? 1 : 0,
+                    (int)((((uint32_t)code & 0xff) << 8) >> 8) & 0xff); } }
+#endif
         return pid;
     }
     /* Job control: tobyOS has a single global foreground pid, not POSIX
