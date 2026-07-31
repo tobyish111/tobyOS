@@ -4396,3 +4396,52 @@ would alias a live channel onto a fresh one -- note sock_unix_pair reuses
 pool indices immediately, and peer_ip stores index+1 with no generation
 counter, so a recycled slot is indistinguishable from the original.
 Suspect (2) would also explain the run-to-run variability seen all along.
+
+## Slice 79: CORRECTION -- the handler's EOF is a CONSEQUENCE, not the
+## cause. The browser closes and exits 191 BEFORE the handler ever reads,
+## and it never attempts to read the handshake reply at all.
+
+Timestamped correlation of the whole conversation (one run, same log):
+
+    7277  [unix] send pid=3 sock=0 -> peer=1 len=40 peer_count=1   (queued OK)
+    7278  [uxmsg] pid=3 SEND fd=6 len=40 -> 40                     (success)
+    7297  [uxclose] pid=3 closed unix sock slot=0 -> peer slot=1 sees EOF
+    7301  [proc] pid=3 'chrome' exit code=191                      <-- ALREADY DEAD
+    7468  [unix] recv pid=4 sock=1 peer=-1 queued=1 want=40        (handler reads)
+    7470  [uxmsg] pid=4 RECV -> 40  peer=-1
+    7521  [uxmsg] pid=4 RECV -> 0   peer=-1  -> "incorrect payload size 0"
+
+So slice 78's reading was right about the mechanism (peer link cleared) but
+WRONG about its significance: the browser itself severs the link at 7297 by
+closing its own end on the way out, 170 ms BEFORE the handler's first read.
+The handler's EOF and crashpad's payload complaint are downstream of a
+browser that has already aborted. Chasing the handler further would have
+been wasted effort -- exactly the kind of detour this project's control
+discipline exists to prevent.
+
+THE REAL GAP, now precisely stated: **the browser never issues the reply
+read.** There is no recv of ANY kind from pid 3 on that socket -- not
+recvmsg ([uxmsg] logs none), not read/recvfrom ([unix] recv logs none,
+and it logs both the pid-4 and pid-6 reads, so the probe works). On Linux
+the control's strace has recvmsg IMMEDIATELY after the sendmsg, on the same
+fd, with no syscall between them:
+    sendmsg(4, iov_len=40, controllen=0) = 40
+    recvmsg(4, iov_len=8, [SCM_CREDENTIALS {pid,uid,gid}]) = 8
+    prctl(PR_SET_PTRACER, <that pid>)
+and tobyOS's own ring shows the browser going sendmsg -> rt_sigprocmask ->
+rt_sigaction -> getpid -> gettid -> exit_group instead. So between "sendmsg
+returned 40" and "decide to abort", crashpad takes an error path WITHOUT
+reading -- meaning something about the send's OUTCOME (not the reply) is
+unacceptable to it.
+
+NEXT, in order:
+ 1. The send is a SOCK_SEQPACKET sendmsg whose msghdr carries msg_name=NULL,
+    msg_controllen=0, flags=MSG_NOSIGNAL. Check what lx_sendmsg returns in
+    the msghdr's OUT fields and whether MSG_NOSIGNAL (0x4000) is being
+    misread as something else -- we ignore `flags` entirely in lx_sendmsg
+    ((void)flags on the first line).
+ 2. Verify the socket is actually SOCK_SEQPACKET end-to-end: lx_socketpair
+    accepts the type but stores nothing, so getsockopt(SO_TYPE) reports
+    whatever the generic path says. crashpad checks socket properties
+    before use.
+ 3. Only then look further afield.
