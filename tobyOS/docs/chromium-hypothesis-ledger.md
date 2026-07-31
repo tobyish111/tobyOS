@@ -4514,3 +4514,39 @@ reads the reply):
      control. That isolates the ABI difference from the browser entirely,
      which is what should have been done for this whole class of question.
  (c) msghdr OUT fields on the send path (low probability).
+
+## Slice 82: the ABI itself is EXONERATED. A standalone test of crashpad's
+## exact handshake shape PASSES identically on tobyOS and on real Linux.
+
+Stopped burning 7-minute chrome boots and wrote the ~30-line reproduction
+instead (programs/linux-scmsg, freestanding static ELF, raw syscalls, same
+recipe as linux-futex): socketpair(AF_UNIX, SOCK_SEQPACKET) ->
+sendmsg(40 bytes, MSG_NOSIGNAL) -> recvmsg -> verify the bytes. Distinct
+exit codes name each step (3=PASS, 10 socketpair, 11 MSG_NOSIGNAL send,
+12 recv, 13 wrong size, 14 corrupt, 15 flagless send), and it retries
+without flags on failure so "MSG_NOSIGNAL broke it" is distinguishable from
+"sends are broken".
+
+Ran on the CONTROL FIRST, per the prime directive -- if it failed there the
+test would be wrong, not tobyOS:
+    WSL Ubuntu (real 6.6 kernel): [scmsg] PASS ... exit=3
+    tobyOS:                        [scmsg] PASS ... exit=3
+IDENTICAL. So candidate (b) is dead: lx_sendmsg ignoring its `flags`
+argument does NOT break this path, and the AF_UNIX socketpair transport --
+SEQPACKET creation, MSG_NOSIGNAL sends, message-boundary receives, payload
+integrity -- is CORRECT.
+
+WHAT THIS MEANS: every mechanical explanation for the browser's behaviour is
+now eliminated by direct test -- clone semantics (fixed, slice 76),
+credentials (implemented, 77), socket type (fixed, 80), peer credentials
+(implemented + never queried, 81), and now the send/receive path itself.
+The browser's refusal to read its reply is therefore NOT a broken syscall;
+it is chrome deciding, on some OTHER input, that crashpad setup already
+failed. Candidate class shifts accordingly: look at what crashpad checks
+BEFORE the read -- the handler process's liveness/status (it waitpid()s or
+checks the pid it forked), /proc entries for that pid, or PR_SET_PTRACER
+itself -- rather than at the socket.
+
+The test is wired into the build permanently (Makefile + kernel spawn
+alongside FUTEXTEST, [SCMSGTEST] VERDICT in every CHROMIUM_BOOT boot), so
+this transport can never silently regress again.

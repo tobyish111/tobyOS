@@ -1788,6 +1788,16 @@ programs/linux-futex/linux-futex.elf: programs/linux-futex/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# Slice 82: AF_UNIX socketpair sendmsg/recvmsg ABI test -- reproduces
+# crashpad's handshake shape (SEQPACKET + MSG_NOSIGNAL + 40 bytes) in ~30
+# lines so the ABI can be compared against a real kernel in seconds instead
+# of through a 7-minute full-chrome boot. Same freestanding/static recipe.
+programs/linux-scmsg/linux-scmsg.elf: programs/linux-scmsg/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 # Eventfd/epoll unit test: epoll_wait on an eventfd must wake when another thread
 # writes it (the renderer's efd-14 case). Static Linux ELF, branded via dd.
 programs/linux-eventfd/linux-eventfd.elf: programs/linux-eventfd/main.c
@@ -2418,6 +2428,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-msgsock/linux-msgsock.elf \
                programs/linux-static-auto/linux-static-auto.elf \
                programs/linux-futex/linux-futex.elf \
+               programs/linux-scmsg/linux-scmsg.elf \
                programs/linux-eventfd/linux-eventfd.elf \
                programs/linux-mapshare/linux-mapshare.elf \
                programs/linux-demrace/linux-demrace.elf \
@@ -2554,6 +2565,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-static-auto/linux-static-auto.elf $(INITRD_STAGE)/bin/linux-static-auto
 	cp programs/linux-procfs/linux-procfs.elf         $(INITRD_STAGE)/bin/linux-procfs
 	cp programs/linux-futex/linux-futex.elf           $(INITRD_STAGE)/bin/linux-futex
+	cp programs/linux-scmsg/linux-scmsg.elf           $(INITRD_STAGE)/bin/linux-scmsg
 	cp programs/linux-eventfd/linux-eventfd.elf       $(INITRD_STAGE)/bin/linux-eventfd
 	cp programs/linux-mapshare/linux-mapshare.elf     $(INITRD_STAGE)/bin/linux-mapshare
 	cp programs/linux-demrace/linux-demrace.elf       $(INITRD_STAGE)/bin/linux-demrace
@@ -3014,7 +3026,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-fbwin bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
-	    bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
+	    bin/linux-scmsg bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
 	    bin/linux-xstub \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \

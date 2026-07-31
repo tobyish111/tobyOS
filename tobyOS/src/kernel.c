@@ -7234,6 +7234,35 @@ void _start(void) {
     }
 #endif
 
+#ifdef CHROMIUM_BOOT
+    /* Slice 82: AF_UNIX socketpair sendmsg/recvmsg ABI test. Full chrome's
+     * crashpad handshake sends 40 bytes with MSG_NOSIGNAL over a
+     * SOCK_SEQPACKET socketpair and then reads the reply; on tobyOS the send
+     * succeeds but the browser never reads (ledger 79-81). This runs that
+     * exact shape in isolation so the answer does not cost a chrome boot.
+     * PASS=3; 10..15 name the failing step (see programs/linux-scmsg). */
+    {
+        const char *path = "/bin/linux-scmsg";
+        char *argv[] = { (char *)"linux-scmsg", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-scmsg",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] SCMSGTEST: spawning %s\n", path);
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[SCMSGTEST] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[SCMSGTEST] VERDICT: %s exit=%d (3=PASS; 10=socketpair "
+                    "11=MSG_NOSIGNAL-send 12=recv 13=size 14=corrupt 15=send)\n",
+                    rc == 3 ? "PASS" : "FAIL", rc);
+        }
+    }
+
+#endif
+
 #if defined(CHROMIUM_BOOT) && !defined(TKAPP_BOOT)
     /* Slice 39: when TKAPP_BOOT is also defined we want ONLY the CHROMIUM
      * instruments ([chan], bt_dump_group, waitt labels, pgj...) -- the
