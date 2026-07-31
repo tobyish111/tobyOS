@@ -4635,3 +4635,54 @@ log file destination (it may be writing to a file under the profile dir we
 never read back), stderr buffering lost at exit_group, or logging being
 initialised late. Reading that message is now worth more than any further
 syscall archaeology -- it names the CHECK outright.
+
+## Slice 85: *** THE ABORT IS __stack_chk_fail *** -- a STACK CANARY
+## MISMATCH, not a chrome CHECK. Disassembly settles what 10 slices of
+## syscall archaeology could not.
+
+Used real tooling on the control instead of guessing: chrome is a PIE loaded
+at 0x500000, tobyOS reports rip=0x624a118, so the file address is 0x5d4a118
+and the trapping byte is at rip-1. objdump around it:
+
+    5d4a0ef:  mov  %fs:0x28,%rax        <- read the canary from TLS
+    5d4a0f8:  cmp  -0x30(%rbp),%rax     <- compare with the on-stack copy
+    5d4a0fc:  jne  5d4a112
+    5d4a112:  call __stack_chk_fail@plt
+    5d4a117:  int3                      <- THE TRAP WE HAVE BEEN CHASING
+    5d4a118:  ud2
+
+So the INT3 is glibc's stack-protector, and exit 191 is its aftermath.
+**Chrome is not rejecting anything. Its stack canary does not match.**
+Every "what is crashpad checking" theory is therefore moot -- including the
+missing recvmsg, which is a SYMPTOM: the function never returns normally.
+
+The enclosing function is also identified by its calls:
+    ... bind@plt with length 0x6e (110 == sizeof(struct sockaddr_un))
+    ... listen@plt
+    ... four calls to a common destructor, then the canary epilogue
+i.e. it creates, binds and listens on a UNIX-domain socket, and dies on the
+way out of that frame.
+
+TWO MECHANISMS, both ours, both testable:
+ 1. **We smash the caller's stack.** Something in bind/listen/getsockname
+    writes past the user's buffer. Note lx_sockaddr_out writes its
+    sockaddr WITHOUT consulting the caller's *addrlen (the netlink arm
+    copies sizeof(nl) unconditionally; the AF_INET arm likewise) -- if a
+    caller passes a buffer smaller than what we write, that is a textbook
+    canary kill. getsockname is called ~126,000 times per interval by
+    chrome, so this path is heavily exercised.
+ 2. **The canary READ is wrong**: %fs:0x28 resolves through the FS base, so
+    any discrepancy in TLS setup between where the canary was stored (
+    function entry) and where it is compared (exit) produces a spurious
+    mismatch. Relevant because this process just went through our
+    clone3 CLONE_VM|CLONE_VFORK path (slice 76), and real vfork SUSPENDS
+    the parent until the child execs -- we do not, so parent and child run
+    concurrently over memory glibc believes is exclusively the child's.
+
+NEXT (in order, both cheap):
+ a. Clamp every sockaddr writer to the caller's addrlen and re-run. This is
+    correct regardless of the outcome and directly tests mechanism 1.
+ b. If it survives, log fs_base plus the stored/expected canary at the
+    faulting frame and check CLONE_VFORK parent-suspension semantics.
+This is the closest the arc has been to a fix: the failure is now a
+two-line C bug class rather than an opaque browser decision.
