@@ -4355,3 +4355,44 @@ does chrome_crashpad_handler call sendmsg at all (no [uxmsg] SEND from pid 4
 appears in the captured window), and if so does our SEQPACKET path deliver
 its payload? The [uxmsg] probe already covers both sides; extend its cap and
 read the handler's half of the conversation.
+
+## Slice 78: the "incorrect payload size 0" is a PREMATURELY SEVERED PEER
+## LINK, not a missing reply. The handler's socket has peer=-1 before it
+## ever reads.
+
+Added peer/queue state to the [uxmsg] RECV probe, which settles it:
+
+    [uxmsg] pid=3 SEND fd=6 len=40 nscm=0 -> 40
+    [uxmsg] pid=4 RECV fd=7 want=40 flags=0x0 -> 40 nscm=0 **peer=-1** count=0
+    [uxmsg] pid=4 RECV fd=7 want=40 flags=0x0 ->  0 nscm=0 **peer=-1** count=0
+
+peer=-1 means self->peer_ip == 0, i.e. the endpoint's peer link is ALREADY
+cleared on the read that succeeds. The 40 bytes arrive only because they
+were queued before the severing; the next blocking read then finds "peer
+gone AND ring drained" and returns 0 -- which is CORRECT behaviour for a
+real EOF, and is exactly what crashpad reports as
+`util/linux/socket.cc:182 incorrect payload size 0` before exiting. So the
+handler is not failing to reply: it is being told the conversation is over.
+
+Mechanism to chase next (narrow): sock_unix_peer_close() clears
+`peer->peer_ip = 0` permanently when an endpoint hits its LAST reference.
+That is right for a genuine close, but this channel passes through
+crashpad's double-fork -- browser creates the pair, forks a middle child,
+the middle child forks the handler and _exit(0)s immediately, and the
+handler then execs and creates its OWN pair ([unix] pair pid=4 a=4 b=5).
+Somewhere in that sequence an endpoint reaches refs==0 and severs the link
+the handler still needs. The [uxref] trace shows every ref/close with its
+outcome and [uxclose] names the severing side, so the next step is simply
+to correlate them BY SLOT with the fd the handler reads (fd=7):
+
+    which slot is fd=7, and which [uxclose] cleared its peer, and at that
+    moment who still held the other end?
+
+Prime suspects, in order: (1) the middle child's exit closing inherited
+copies while the handler's exec is still in flight; (2) an endpoint being
+torn down and its slot RECYCLED by the handler's own socketpair (the a=4
+b=5 pair appears right after a teardown of slot 4 in the same run), which
+would alias a live channel onto a fresh one -- note sock_unix_pair reuses
+pool indices immediately, and peer_ip stores index+1 with no generation
+counter, so a recycled slot is indistinguishable from the original.
+Suspect (2) would also explain the run-to-run variability seen all along.

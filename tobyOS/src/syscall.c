@@ -6459,9 +6459,15 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
         /* Slice 75: the receive half of the crashpad-handshake probe. */
         { static int um = 0; if (um < 48) { um++;
             struct proc *up = current_proc();
+            /* Slice 78: report WHY a 0 came back. A blocking recv must only
+             * return 0 at real EOF (peer gone AND ring drained); returning
+             * it while the peer is alive but simply has not sent yet reads
+             * as EOF to the caller -- which is exactly what crashpad's
+             * handler reports as "incorrect payload size 0". */
             kprintf("[uxmsg] pid=%d RECV fd=%d want=%lu flags=0x%x -> %ld "
-                    "nscm=%d\n", up ? up->pid : -1, fd, (unsigned long)total,
-                    (unsigned)flags, n, scm_n);
+                    "nscm=%d peer=%d count=%d\n", up ? up->pid : -1, fd,
+                    (unsigned long)total, (unsigned)flags, n, scm_n,
+                    s->peer_ip ? (int)s->peer_ip - 1 : -1, (int)s->count);
         } }
 #endif
     } else {
