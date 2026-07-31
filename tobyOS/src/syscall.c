@@ -6922,7 +6922,18 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
          * churn (500 by ~17s, 1500 by ~21.5s) and misses the window that
          * matters -- the watch-page renderer's exit at ~25s and the ~35s
          * message-flow stop. Log only from 18s on. */
+        /* Slice 74: the 18s gate was tuned for the renderer-death hunt (the
+         * interesting window was late). FULL chrome dies at ~5s inside
+         * crashpad's handler handshake -- a sendmsg/recvmsg pair with
+         * SCM_RIGHTS over a SOCK_SEQPACKET socketpair, which on Linux is
+         * immediately followed by recvmsg + PR_SET_PTRACER + sigaltstack,
+         * and on tobyOS is followed by nothing but exit. Ungate for
+         * CHROME_FULL so those calls and their RETURN VALUES are visible. */
+#ifdef CHROME_FULL
+        if (chan_c < 1200) {
+#else
         if (perf_now_ns() >= 18000000000ull && chan_c < 1200) {
+#endif
             chan_c++;
             struct proc *me = current_proc();
             /* For a RECEIVE that returned data, decode the FRONT of the received

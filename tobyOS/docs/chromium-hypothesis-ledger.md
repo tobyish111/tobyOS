@@ -4163,3 +4163,44 @@ STILL OPEN: D-Bus absence (chrome talks to a real bus seconds after our
 death point; tobyOS has none), /proc completeness beyond exe, and the
 fork-without-exec child. The control makes each of these a one-command test
 now -- degrade Ubuntu toward tobyOS rather than guessing across guest boots.
+
+## Slice 74: STRACE ON THE CONTROL NAMES THE FAILING SUBSYSTEM -- crashpad's
+## handler handshake (SCM_RIGHTS over a SOCK_SEQPACKET socketpair). tobyOS
+## sends and never receives.
+
+Strace of the healthy browser's MAIN THREAD on Linux, at exactly the point
+tobyOS's [lx-recent] tail ends, decodes the sequence tobyOS could only show
+as bare syscall names:
+
+  socketpair(AF_UNIX, SOCK_SEQPACKET, 0, [4,5])       <- crashpad channel
+  sendmsg(4, ..., msg_control=[{cmsg_len=28, ...}])   <- SCM_RIGHTS fd pass
+  recvmsg(4, ..., msg_control=[{cmsg_len=28, ...}])   <- HANDLER REPLIES
+  prctl(PR_SET_PTRACER, 541)
+  mmap(16K PROT_NONE) + mprotect(8K RW) + sigaltstack({ss_sp=..,8192})
+  rt_sigaction(SIGABRT/BUS/FPE/ILL/QUIT/SEGV/SYS/TRAP, SA_ONSTACK|SA_SIGINFO)
+
+tobyOS's tail for the same thread:
+  ... prctl, rt_sigprocmask, sendmsg, rt_sigprocmask, rt_sigaction,
+      getpid, gettid, exit_group(191)
+The sendmsg happens -- and then there is **no recvmsg at all**. Chrome goes
+straight to signal setup and aborts. So the crashpad handler handshake is
+where full chrome dies, which also explains the shape we already had: the
+browser FORKS A CHILD WITHOUT EXEC (that child IS the crashpad handler --
+crashpad forks it rather than exec'ing), the child exits 0 having failed its
+side, and the browser CHECKs. It also explains why sigaltstack mattered
+enough to implement in slice 70 (crashpad installs one immediately after
+this handshake) and why --disable-crash-reporter does not help (chrome still
+performs the handshake).
+
+Confirmed present, so NOT the gap: SOCK_SEQPACKET (socketpair accepts it;
+socket.c preserves message boundaries) and AF_UNIX pair creation (the run
+logs `[unix] pair pid=3 a=1 b=2`).
+
+Instrument note for the next pass: the [chan] ring only records fds whose
+file kind is FILE_KIND_SOCKET, so AF_UNIX socketpairs never appear in it --
+which is why ungating its 18s timer (done here for CHROME_FULL) still showed
+nothing. The next probe must hook the AF_UNIX path itself: log sendmsg/
+recvmsg on unix sockets with their RETURN VALUE and whether a cmsg was
+attached/delivered. That single line will say whether our sendmsg rejected
+the SCM_RIGHTS message, whether the handler child ever read it, or whether
+the reply was sent but never delivered.
