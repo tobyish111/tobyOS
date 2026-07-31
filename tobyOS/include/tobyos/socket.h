@@ -169,6 +169,12 @@ struct sock {
     /* Slice 77: SO_PASSCRED -- receiver asked for SCM_CREDENTIALS on every
      * message (chrome's crashpad client sets it on its handshake socket). */
     bool             passcred;
+    /* Slice 80: the socket's REAL type (SOCK_STREAM/DGRAM/SEQPACKET) as the
+     * caller asked for it. getsockopt(SO_TYPE) used to answer from `kind`
+     * alone -- TCP=STREAM, everything else=DGRAM -- so every AF_UNIX socket
+     * reported SOCK_DGRAM, including the SOCK_SEQPACKET socketpairs Mojo and
+     * crashpad use and then inspect. */
+    uint8_t          sotype;
 
     /* ---- Non-blocking connect state ----------------------------------
      * connecting=1 between a connect() that returned EINPROGRESS and the

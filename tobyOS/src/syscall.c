@@ -5441,6 +5441,7 @@ static long lx_socket(int domain, int type, int proto) {
         struct sock *us = sock_alloc(SOCK_KIND_UNIX);
         if (!us) return -ABI_EMFILE;
         us->nonblock = (type & SOCK_NONBLOCK) != 0;
+        us->sotype   = (uint8_t)ut;                 /* slice 80 */
         int ufd = lx_sock_install(us);
         if (ufd < 0) { sock_close(us); return -ABI_EMFILE; }
         return ufd;
@@ -5498,6 +5499,7 @@ static long lx_socketpair(int domain, int type, int proto, uint64_t usv) {
 
     struct sock *a = 0, *b = 0;
     if (sock_unix_pair(&a, &b) != 0) return -ABI_EMFILE;   /* pool exhausted */
+    a->sotype = b->sotype = (uint8_t)t;         /* slice 80: SEQPACKET stays SEQPACKET */
 
     int fd0 = lx_sock_install(a);
     if (fd0 < 0) { sock_close(a); sock_close(b); return -ABI_EMFILE; }
@@ -6082,7 +6084,8 @@ static long lx_getsockopt(int fd, int level, int optname,
         v = s->so_error;
         s->so_error = 0;
         break;
-    case SO_TYPE:       v = (s->kind == SOCK_KIND_TCP) ? SOCK_STREAM
+    case SO_TYPE:       v = s->sotype ? s->sotype                     /* slice 80 */
+                          : (s->kind == SOCK_KIND_TCP) ? SOCK_STREAM
                                                        : SOCK_DGRAM; break;
     case SO_ACCEPTCONN: v = s->tcp_listening ? 1 : 0;                break;
     case SO_SNDBUF:

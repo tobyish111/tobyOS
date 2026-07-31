@@ -4445,3 +4445,42 @@ NEXT, in order:
     whatever the generic path says. crashpad checks socket properties
     before use.
  3. Only then look further afield.
+
+## Slice 80: SO_TYPE now reports the real socket type (a genuine bug), but
+## it is NOT the crashpad blocker -- same failure, unchanged.
+
+getsockopt(SO_TYPE) answered from `kind` alone: TCP -> SOCK_STREAM,
+everything else -> SOCK_DGRAM. So every AF_UNIX socket reported SOCK_DGRAM,
+including the SOCK_SEQPACKET socketpairs Mojo and crashpad create and then
+inspect. struct sock now records the type the caller actually asked for
+(lx_socket and lx_socketpair both set it) and SO_TYPE reports it. Correct on
+its own merits and worth keeping -- any program that validates its socket
+type was being lied to.
+
+TESTED: no change. Chrome still exits 191 with the same crashpad message.
+Kept anyway (it is a real ABI correction, not a speculative change), and
+recorded here so nobody re-tests it.
+
+STATE OF THE HUNT, unchanged by this slice: the browser's handshake sendmsg
+SUCCEEDS (returns 40, message queued on the peer), and then the browser
+NEVER READS the reply -- no recvmsg, no read, no recvfrom -- it installs a
+signal handler and exit_group(191)s, while on Linux recvmsg follows sendmsg
+immediately on the same fd. Everything downstream (the handler's EOF, the
+"incorrect payload size 0") is a consequence of the browser already being
+gone (slice 79's timestamps).
+
+REMAINING CANDIDATES for why crashpad bails right after a successful send,
+now that socket type and credentials are both correct:
+ a. lx_sendmsg IGNORES its `flags` argument entirely ((void)flags on the
+    first line). crashpad sends with MSG_NOSIGNAL; other call sites use
+    MSG_DONTWAIT/MSG_MORE. Nothing currently distinguishes them, and a
+    blocking-vs-nonblocking mismatch on THIS send is the most plausible
+    remaining trigger.
+ b. The msghdr OUT fields: we write msg_controllen/msg_flags on the recv
+    path but never touch them on send. Linux leaves them alone too, so this
+    is lower probability -- verify rather than assume.
+ c. crashpad may check the socket's peer credentials via getsockopt
+    SO_PEERCRED (level SOL_SOCKET, option 17) BEFORE reading; we return 0
+    with no data for unknown options, which would hand it zeroed creds.
+    SO_PEERCRED is the natural companion to the SO_PASSCRED work already
+    landed, and is cheap to implement -- try it first.
