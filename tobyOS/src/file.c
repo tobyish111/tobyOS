@@ -209,6 +209,7 @@ struct file *file_clone(struct file *src) {
          * up.) The refcount keeps the pool slot alive, and the AF_UNIX peer
          * only sees EOF once the last holder closes. */
         f->sock = src->sock;
+        f->sock_gen = sock_generation(f->sock);   /* slice 89 */
         sock_ref(f->sock);
         break;
     case FILE_KIND_WINDOW:
@@ -289,7 +290,16 @@ void file_close(struct file *f) {
     case FILE_KIND_SOCKET:
         /* Drops one reference. The AF_UNIX peer-EOF wake now happens INSIDE
          * sock_close at the last reference -- doing it here would signal EOF
-         * as soon as any one inheritor closed its copy. */
+         * as soon as any one inheritor closed its copy.
+         * Slice 89: only if the slot still holds the SAME socket. A stale or
+         * double-closed descriptor would otherwise decrement a stranger's
+         * refcount and tear down a live channel. */
+        if (f->sock && sock_generation(f->sock) != f->sock_gen) {
+            kprintf("[uxgen] file_close on RECYCLED sock slot "
+                    "(had gen=%u now gen=%u) -- refusing the close\n",
+                    f->sock_gen, sock_generation(f->sock));
+            break;
+        }
         sock_close(f->sock);
         break;
     case FILE_KIND_WINDOW:

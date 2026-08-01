@@ -4885,3 +4885,91 @@ New instruments that should outlive this slice: [uxstuck] (blocking UNIX
 recv >5s names its socket + x_server flag), [xdbg] (x_conn gates dump),
 [xpoll] (poll timeout with a readable-but-unreported X fd), poke MUTED
 (wake flood guard visibility), control_x11trace/x11deny/x11nodbus/x11vmod.
+
+## Slice 89: the wall is NOT scheduling and NOT X coverage -- it is AF_UNIX
+## SLOT RECYCLING (the hazard slice 78 named and nobody fixed). -smp 4 did
+## NOT reproduce the slice-88 freeze. MapWindow has now been OBSERVED.
+
+RETRACTION FIRST: slice 88's `-smp 4 PARKED -- APs did ZERO syscall work`
+is WRONG, or at least not reproducible. Four -smp 4 runs this slice: APs
+took real work every time (`[bkl] cpu1 acq=1.2M cpu2 acq=407k cpu3 acq=313k`),
+no clone3 pile-up, no freeze at 7.6s. Whatever the single 88-era trial saw,
+"the AP/quiesce arc" is NOT the thing standing between us and tier 2.5. Do
+not spend another session on it.
+
+THINGS THAT WERE ACTUALLY BROKEN AND ARE NOW FIXED:
+
+1. **`--vmodule` was silently disabled.** chromewin passed TWO `--vmodule=`
+   flags; chrome keeps only the LAST, so the X11/ozone/views narration added
+   for exactly this investigation never emitted a single line. Merged into
+   one flag. (Check for duplicate flags before trusting missing output.)
+
+2. **`[xsum]`, the diagnostic written to explain the stall, printed NOTHING
+   for a whole 360s run** -- it hung off `xserver_tick`, which is called from
+   pid 0's idle_loop, and under chrome load pid 0 NEVER RUNS. Any diagnostic
+   on the idle path is invisible in precisely the situation it exists for.
+   Moved onto the sched_tick heartbeat. The 100ms "wake (poll-idle)" lines
+   that kept appearing come from file_poll_ready's separate xserver_on_poll
+   caller -- which is what made the gap easy to miss.
+
+3. **The wait-graph is BLIND to blocking recvmsg** (only epoll_wait/futex
+   call waitt_enter). The browser UI thread showed up in NEITHER the blocked
+   list NOR the running list -- it was parked in recvmsg on the X socket the
+   whole time. [uxstuck] cannot catch it either, because our own 100ms
+   idle-poke means no single wait ever reaches its 5s threshold: slice 88's
+   fix blinded slice 88's instrument. `[xsum] lastreq=<ms>` is the
+   replacement -- it answers "is chrome still talking to us at all".
+
+4. **Two genuine SMP lost-wakeups** (release/acquire where StoreLoad
+   ordering was needed -- on x86 BOTH sides can read stale and NEITHER acts):
+   `sched_finish_switch` vs `tg_vm_resume` (thread parked BLOCKED forever,
+   the shape slice 88 blamed on AP queues), and `sys_fork_share` vs
+   `vfork_child_done` (launcher parked forever). SEQ_CST fences both sides.
+
+5. **Group teardown ran `close_all_fds` with the BKL DROPPED** while
+   file_close refcounts (vfs_refs/sock refs/pipe counts) are plain ints
+   guarded ONLY by the BKL. Also `proc_wait_off_cpu` could hang the whole
+   teardown forever on a quiesce-parked spinner. Both fixed (bounded wait +
+   leak the slot rather than free a live thread's stack).
+
+THE CURRENT WALL (repeatable signature; the EPIPE is a CONSEQUENCE):
+
+    [31] 46(sendmsg) a1=7 = -32   <-- EPIPE
+    ... rt_sigaction(11), getpid, gettid, exit_group(191)
+    stderr: "Crashing due to FD ownership violation:"
+
+Same divergence slice 83 recorded. What is NEW is why the peer is gone:
+
+    [6952 ms] [execve] pid=1 now running 'chrome_crashpad_handler'
+    [6954 ms] [proc]   pid=1 ... exit code=0 cpu=0 ms syscalls=4
+
+**chrome_crashpad_handler execs and exits 2 ms later after FOUR syscalls.**
+Slice 76 made the exec happen and nobody checked the handler SURVIVES. It
+does not; its endpoint dies with it, so every later client sendmsg EPIPEs
+and that client aborts 191. NEXT: dump those four syscalls. [xexit] will
+not help -- it only fires on NON-ZERO exits and this one exits 0.
+
+HYPOTHESIS TESTED AND **NOT CONFIRMED** -- AF_UNIX slot recycling.
+Slice 78 named it ("sock_alloc recycles pool indices IMMEDIATELY ... NO
+GENERATION COUNTER") and it fit the symptom exactly: a stale `peer_ip`
+aliases whatever socket now owns the slot, and `sock_unix_peer_close`'s
+`peer->peer_ip = 0` would then sever a LIVE stranger's channel. A full
+generation counter was implemented to test it -- `struct sock.gen`/
+`peer_gen`, all resolution via `sock_peer_checked()`, `struct file.sock_gen`
+for descriptors, `[uxgen]` logging every stale link caught.
+**`[uxgen]` fired ZERO times and the signature is byte-identical.** The
+aliasing is real in principle but is NOT what breaks this run. The code is
+KEPT (genuine hazard, no cost) but must NOT be credited with any behaviour
+change, and must not be re-chased as the cause. Recording this the way the
+arc's method demands: a fix that changes nothing is a disproof, not a win.
+
+X EXTENSIONS -- the mixed state was wrong: we advertised MIT-SHM + RANDR +
+XFIXES + BIG-REQUESTS. Slice 88's control proved chrome maps with ZERO
+extensions; the ledger's "do not ADD extensions on a hunch" said nothing
+about the half-way configuration we were actually in, where chrome takes
+the extension path for what we advertise and then waits on companions our
+hand-rolled replies never satisfy. Now MIT-SHM ONLY (tier 2.5 needs it),
+`-DXSRV_EXT_ALL` restores the old set for A/B.
+
+MapWindow (op=8) HAS now been observed on our server (`req c=4 op=8 seq=253`,
+window resized to 799x599) -- the first time in this arc.

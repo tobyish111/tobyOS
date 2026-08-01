@@ -94,8 +94,24 @@ struct x_conn {
     uint16_t pend_r, pend_w, pend_n;
     /* Set after first device-init PropertyNotify; gates poll-time idle wakes. */
     uint8_t  idle_wake_armed;
+    /* Slice 89: ms stamp of the last request DECODED from this client. At a
+     * stall, "chrome has sent nothing for 170s" (it is parked waiting on us)
+     * and "chrome is still talking" are entirely different bugs, and nothing
+     * in the tree could tell them apart -- the wait-graph is blind here
+     * because blocking recvmsg never registers with waitt_enter. */
+    uint64_t last_req_ms;
     uint8_t  display_wake_sent; /* one-shot wake after RANDR display probe */
 };
+
+/* Slice 89: extension surface. Default = MINIMAL (MIT-SHM only), which is
+ * the configuration slice 88's control rig proved chrome MapWindows under.
+ * -DXSRV_EXT_ALL restores the old RANDR/XFIXES/BIG-REQUESTS advertisement
+ * for A/B testing. */
+#ifdef XSRV_EXT_ALL
+#undef XSRV_EXT_MINIMAL
+#else
+#define XSRV_EXT_MINIMAL 1
+#endif
 
 /* Global frame chrome paints into; chromewin polls this. */
 static uint32_t g_xf_w = 800, g_xf_h = 600, g_xf_stride = 800 * 4;
@@ -1213,7 +1229,9 @@ static void handle_request(struct sock *s, struct x_conn *c,
         if (nlen == 7 && !memcmp(name, "MIT-SHM", 7)) {
             present = 1; major = XSRV_MIT_SHM_MAJOR;
             first_ev = XSRV_EV_MIT_SHM; first_err = XSRV_ERR_MIT_SHM;
-        } else if (nlen == 5 && !memcmp(name, "RANDR", 5)) {
+        }
+#ifndef XSRV_EXT_MINIMAL
+        else if (nlen == 5 && !memcmp(name, "RANDR", 5)) {
             present = 1; major = XSRV_RANDR_MAJOR;
             first_ev = XSRV_EV_RANDR; first_err = XSRV_ERR_RANDR;
         } else if (nlen == 6 && !memcmp(name, "XFIXES", 6)) {
@@ -1222,8 +1240,20 @@ static void handle_request(struct sock *s, struct x_conn *c,
         } else if (nlen == 12 && !memcmp(name, "BIG-REQUESTS", 12)) {
             present = 1; major = XSRV_BIGREQ_MAJOR;
         }
+#endif
         /* SYNC left absent: advertising it + QueryVersion desynced xcb and
-         * ImmediateCrash'd (vec=3) right after GetModifierMapping. */
+         * ImmediateCrash'd (vec=3) right after GetModifierMapping.
+         *
+         * SLICE 89 -- XSRV_EXT_MINIMAL (default ON): advertise ONLY MIT-SHM.
+         * Slice 88's control run (xtrace --denyextensions) proved this exact
+         * chrome + flags MapWindows with ZERO extensions, while our runs --
+         * which advertised RANDR + XFIXES + BIG-REQUESTS -- park before
+         * MapWindow. The ledger's "do not ADD extensions on a hunch" said
+         * nothing about the mixed state we were actually in: chrome takes the
+         * extension-using path for what we advertise, then waits on companion
+         * requests our hand-rolled replies never satisfy. Minimal is the
+         * CONTROL-PROVEN configuration; MIT-SHM is kept because tier 2.5's
+         * zero-copy frames require it. Build with -DXSRV_EXT_ALL to A/B. */
         kprintf("[xsrv] QueryExtension '%s' present=%d maj=%u ev=%u\n",
                 nbuf, present, major, first_ev);
         rep[0] = 1;
@@ -1387,12 +1417,17 @@ static void pump_requests(struct sock *self, struct x_conn *c) {
             g_x_backpressure = 1;
             break;
         }
+        c->last_req_ms = perf_now_ns() / 1000000ull;
         if (c->rbuf[0] != 16) {
             static int nreq;
-            if (nreq < 160) {
+            if (nreq < 400) {
                 nreq++;
-                kprintf("[xsrv] req op=%u words=%u\n",
-                        c->rbuf[0], need / 4);
+                /* Slice 89: conn + seq on every request line. The stall
+                 * diagnosis needs "which conn, which seq" to line up against
+                 * chrome's ui/gfx/x narration of the reply it waits for. */
+                kprintf("[xsrv] req c=%d op=%u words=%u seq=%u\n",
+                        sock_idx(self), c->rbuf[0], need / 4,
+                        (unsigned)(uint16_t)(c->seq + 1));
             }
         }
         handle_request(self, c, c->rbuf, need);
@@ -1445,6 +1480,29 @@ void xserver_on_poll(struct sock *self) {
     }
     last_poke_ms[idx] = now;
     x_wake_event(self, c, c->seq, "poll-idle");
+}
+
+static void xconn_summary(struct sock *s) {
+    int idx = sock_idx(s);
+    if (idx < 0) return;
+    struct x_conn *c = &g_xconn[idx];
+    if (!c->active) return;
+    uint64_t now = perf_now_ns() / 1000000ull;
+    kprintf("[xsum] c=%d seq=%u lastreq=%lums rlen=%u pend=%u rx=%u armed=%u\n",
+            idx, c->seq,
+            (unsigned long)(c->last_req_ms ? now - c->last_req_ms : 0),
+            c->rlen, c->pend_n, (unsigned)s->count, c->idle_wake_armed);
+}
+
+/* Slice 89: called from the sched_tick heartbeat, NOT from pid 0's idle
+ * loop. The original placement inside xserver_tick never printed a single
+ * line all run: under chrome load pid 0 is the idle task and never gets the
+ * CPU, so ANY diagnostic hung off idle_loop is invisible in exactly the
+ * situation it exists to explain. (The 100ms "wake (poll-idle)" lines that
+ * kept appearing come from file_poll_ready's xserver_on_poll, a different
+ * caller -- which is what made the gap easy to miss.) */
+void xserver_debug_tick(void) {
+    sock_foreach_xserver(xconn_summary);
 }
 
 void xserver_tick(void) {

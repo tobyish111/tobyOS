@@ -493,6 +493,7 @@ static long sys_socket(int domain, int type) {
     memset(f, 0, sizeof(*f));
     f->kind = FILE_KIND_SOCKET;
     f->sock = s;
+    f->sock_gen = sock_generation(s);        /* slice 89 */
 
     struct proc *p = current_proc();
     int fd = fd_alloc_into(p, f);
@@ -5425,6 +5426,7 @@ static int lx_sock_install(struct sock *s) {
     memset(f, 0, sizeof(*f));
     f->kind = FILE_KIND_SOCKET;
     f->sock = s;
+    f->sock_gen = sock_generation(s);        /* slice 89 */
     int fd = fd_alloc_into(current_proc(), f);
     if (fd < 0) { kfree(f); return -1; }
     return fd;
@@ -6853,6 +6855,10 @@ static const char *lx_scname(long n) {
 static long     g_lx_recent_n[LX_RECENT];
 static int      g_lx_recent_tid[LX_RECENT];
 static long     g_lx_recent_r[LX_RECENT];    /* slice 86: the RETURN value */
+static long     g_lx_recent_a1[LX_RECENT];   /* slice 89: first arg (the fd
+                                              * for read/recv/write/poll) --
+                                              * names WHICH socket the final
+                                              * pre-abort reads were on */
 static uint32_t g_lx_recent_i;
 #define LX_MAXCPU 16
 static uint32_t g_lx_slot_cpu[LX_MAXCPU];    /* slot this cpu is filling */
@@ -6868,8 +6874,8 @@ void lx_dump_recent_syscalls(void) {
          * syscall whose result register reads 0x00000000fffff001 -- a -4095
          * that is zero-extended rather than sign-extended -- and the number
          * alone could never say which call produced it. */
-        kprintf("  [%d] %ld(%s) = %ld (0x%lx)\n", g_lx_recent_tid[idx], nn,
-                lx_scname(nn), g_lx_recent_r[idx],
+        kprintf("  [%d] %ld(%s) a1=%ld = %ld (0x%lx)\n", g_lx_recent_tid[idx], nn,
+                lx_scname(nn), g_lx_recent_a1[idx], g_lx_recent_r[idx],
                 (unsigned long)g_lx_recent_r[idx]);
     }
 }
@@ -7325,6 +7331,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         uint32_t i = g_lx_recent_i++ % LX_RECENT;
         g_lx_recent_n[i]   = n;
         g_lx_recent_tid[i] = (int)current_proc()->pid;
+        g_lx_recent_a1[i]  = a1;
         g_lx_recent_r[i]   = 0x5eed;         /* "did not return" sentinel */
         /* Remember which slot this CPU is filling so the wrapper can stamp
          * the result once the body returns. Per-CPU rather than a single
@@ -7347,9 +7354,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         /* Slice 56 wall R1 / Slice 83: dump prelude on non-zero exit_group. */
         {
             struct proc *xp = current_proc();
-            if (xp && a1 != 0) {
-                kprintf("[xexit] pid=%d '%s' exit_group(%ld) -- syscall tail:\n",
-                        xp->pid, xp->name, (long)a1);
+            /* Slice 89: ALSO dump a SUCCESSFUL exit that did almost nothing.
+             * chrome_crashpad_handler execs and exit_group(0)s 2ms later
+             * after FOUR syscalls; every "sendmsg -> EPIPE -> abort 191"
+             * downstream is a consequence of that. The old non-zero gate
+             * made the one exit that matters the one exit we never saw --
+             * a process that dies successfully without doing its job is
+             * exactly as interesting as one that crashes. */
+            bool quiet_death = xp && a1 == 0 && xp->syscall_count < 32 &&
+                               xp->personality == 1;
+            if (xp && (a1 != 0 || quiet_death)) {
+                kprintf("[xexit] pid=%d '%s' exit_group(%ld) syscalls=%lu%s"
+                        " -- syscall tail:\n",
+                        xp->pid, xp->name, (long)a1,
+                        (unsigned long)xp->syscall_count,
+                        quiet_death ? " [QUIET DEATH: exited 0 having done"
+                                      " essentially nothing]" : "");
                 extern void lx_dump_recent_syscalls(void);
                 lx_dump_recent_syscalls();
             }

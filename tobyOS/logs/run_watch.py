@@ -82,9 +82,11 @@ def main():
            # froze at 7.6s: a dozen threads READY in clone/clone3 for 232s
            # with ZERO BKL acquisitions on cpu1-3 -- the APs never ran the
            # work; likely the slice-87 quiesce/deferred-requeue interacting
-           # with AP queues. Separate arc. 1 vCPU + wake handoff + idle-path
-           # sweeps is the supported tier-2.5 config.
-           "-smp", "1", "-m", "8192", "-cpu", "qemu64,+smep,+smap",
+           # with AP queues. Slice 89 chases that arc: SMP=4 env knob to
+           # flip this run to 4 vCPUs (default stays the supported 1-vCPU
+           # tier-2.5 config: wake handoff + idle-path sweeps).
+           "-smp", os.environ.get("SMP", "1"),
+           "-m", "8192", "-cpu", "qemu64,+smep,+smap",
            "-serial", "file:" + SERIAL,
            "-qmp", "tcp:127.0.0.1:%d,server,nowait" % PORT,
            "-no-reboot", "-display", "none"]

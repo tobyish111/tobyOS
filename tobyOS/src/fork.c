@@ -345,6 +345,12 @@ void tg_vm_resume(struct proc *actor) {
         if (q->cr3 != cr3) continue;
         __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
         if (!q->vm_quiesced) continue;
+        /* Slice 89: SEQ_CST fence between the vm_quiesce store and the
+         * on_cpu load -- pairs with sched_finish_switch's {on_cpu:=0;
+         * fence; load vm_quiesce}. Without it both sides can read stale
+         * values on x86 (StoreLoad) and the parked thread is never
+         * requeued by EITHER path. See the matching comment in sched.c. */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
         /* Re-enqueue only when off-CPU. If still on_cpu (mid-yield / #PF
          * spin), leave vm_quiesced=1: sched_finish_switch requeues when
          * on_cpu drops. Clearing vm_quiesced here without enqueue LOST
@@ -583,8 +589,11 @@ void vfork_child_done(struct proc *child) {
     if (!par) return;
     /* Signal completion on the PARENT so a late waiter cannot observe a
      * reaped child's PCB, and so a child that finishes before the parent
-     * blocks does not lose the wakeup. */
+     * blocks does not lose the wakeup. Fence between the flag store and the
+     * state load -- pairs with the BLOCKED-store -> fence -> flag-load order
+     * in sys_fork_share's wait loop (slice 89 SMP lost-wakeup fix). */
     __atomic_store_n(&par->vfork_child, 0, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (par->state == PROC_BLOCKED) {
         par->state = PROC_READY;
         sched_enqueue(par);
@@ -713,14 +722,28 @@ long sys_fork_share(void) {
             (unsigned long)child->vfork_stack_va);
 
     /* Block the launcher until child execve/_exit. Drop BKL so the child
-     * (and siblings) can enter the kernel. */
+     * (and siblings) can enter the kernel.
+     *
+     * Slice 89 SMP lost-wakeup fix: the old loop read vfork_child FIRST and
+     * set BLOCKED after. On another CPU vfork_child_done could clear the
+     * flag and test `state == PROC_BLOCKED` inside that window -- seeing
+     * RUNNING, it skipped the wake; we then parked BLOCKED forever (chrome
+     * launcher thread gone => whatever it owed the UI thread never happens).
+     * Order it store-BLOCKED -> fence -> load-flag, with the matching
+     * store-flag -> fence -> load-state in vfork_child_done: one side is
+     * now guaranteed to see the other (plain release/acquire is NOT enough
+     * -- x86 StoreLoad reordering lets both loads see stale values). */
     {
         bool held = bkl_held();
         if (held) bkl_exit();
-        while (__atomic_load_n(&parent->vfork_child, __ATOMIC_ACQUIRE) != 0) {
+        for (;;) {
             parent->state = PROC_BLOCKED;
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            if (__atomic_load_n(&parent->vfork_child, __ATOMIC_ACQUIRE) == 0)
+                break;
             sched_yield();
         }
+        parent->state = PROC_RUNNING;
         if (held) bkl_enter();
     }
 

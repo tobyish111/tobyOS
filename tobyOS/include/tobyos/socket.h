@@ -162,6 +162,23 @@ struct sock {
     uint32_t         peer_ip;
     uint16_t         peer_port;
 
+    /* ---- Slice 89: SLOT GENERATION (fixes the hazard slice 78 named) ----
+     * Pool slots are recycled IMMEDIATELY by sock_alloc, and an AF_UNIX
+     * endpoint identifies its peer purely by `peer_ip` == pool index + 1.
+     * A stale index therefore ALIASES whatever socket now owns that slot:
+     * sends land on the wrong channel, and -- the fatal one -- a close
+     * runs `peer->peer_ip = 0` on an unrelated LIVE socket, severing a
+     * channel nobody closed. Downstream that is `sendmsg -> -EPIPE` on a
+     * healthy fd and chrome's own "Crashing due to FD ownership violation"
+     * + exit_group(191).
+     *
+     * `gen` is bumped every time a slot is handed out, so an index alone is
+     * no longer an identity: holders remember the generation they linked to
+     * and every resolution checks it. A recycled slot fails the check and
+     * reads as "peer gone", which is both TRUE and safe. */
+    uint32_t         gen;        /* bumped on each sock_alloc of this slot */
+    uint32_t         peer_gen;   /* generation of the peer we linked to */
+
     /* ---- Non-blocking mode (O_NONBLOCK) ------------------------------
      * Set by SOCK_NONBLOCK at socket()/accept4() time or fcntl(F_SETFL).
      * Until this existed the flag was parsed and THROWN AWAY, so every
@@ -226,6 +243,8 @@ struct sock *sock_alloc(int kind);
 
 /* Pool index for side tables (fake X conn state). -1 if not from the pool. */
 int sock_pool_index(const struct sock *s);
+/* Slice 89: current generation of this socket's pool slot (0 if gone). */
+uint32_t sock_generation(const struct sock *s);
 
 /* Invoke cb(s) for every in-use AF_UNIX socket with x_server set. */
 void sock_foreach_xserver(void (*cb)(struct sock *s));

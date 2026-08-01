@@ -1139,6 +1139,19 @@ void proc_wait_off_cpu(struct proc *p) {
         __asm__ volatile("pause");
 }
 
+/* Slice 89: bounded variant for group teardown. A member wedged ON-CPU
+ * (in-kernel spin that never parks) must not hang the whole exit_group
+ * forever -- report failure so the caller can leak that slot instead.
+ * ~2e8 pauses is seconds of real time: far beyond any legitimate park. */
+bool proc_wait_off_cpu_bounded(struct proc *p) {
+    if (!p) return true;
+    for (uint64_t spins = 0; spins < 200000000ull; spins++) {
+        if (!__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) return true;
+        __asm__ volatile("pause");
+    }
+    return false;
+}
+
 /* Linux exit_group(2): terminate every task in the caller's thread group.
  * A non-leader chrome thread used to call exit_group(191) and only kill
  * itself, leaving the browser zombie'd on X11 recvmsg with no GPU. */
@@ -1168,15 +1181,38 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
             sched_dequeue(q);
             { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
             { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
-            proc_wait_off_cpu(q);
+            /* Slice 89: a member parked in cow_fork_lock_acquire's quiesce
+             * loop spins ON-CPU until vm_quiesce clears -- and the forker
+             * that set it may be exactly who we just terminated, so nobody
+             * would ever clear it. Release the member (its state is already
+             * TERMINATED; it parks at the next tick/park point) or the
+             * off-cpu wait below never returns and the WHOLE group teardown
+             * hangs mid-way -- observed as exit_group(191) closing 9 sock
+             * slots then never printing a single member [proc] exit line,
+             * with half-dead threads running in the wreckage for minutes. */
+            __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
+            if (!proc_wait_off_cpu_bounded(q)) {
+                kprintf("[exitg] pid=%d never left cpu -- slot leaked, "
+                        "kstack NOT freed\n", q->pid);
+                continue;      /* leak beats freeing a live thread's stack */
+            }
             if (q->is_thread) {
                 if (q->kstack_base) kfree(q->kstack_base);
                 q->kstack_base = 0;
                 q->kstack_top  = 0;
                 q->state = PROC_UNUSED;
             } else {
-                /* Leader: close shared fds; leave TERMINATED for wait/reap. */
+                /* Leader: close shared fds; leave TERMINATED for wait/reap.
+                 * Slice 89: close under the BKL. This loop runs with the BKL
+                 * DROPPED (necessary for the off-cpu waits), but file_close
+                 * refcounts (vfs_refs/sock refs/pipe writer counts) are plain
+                 * non-atomic ints whose only guard IS the BKL -- closing here
+                 * unlocked races every other CPU's open/close/dup on shared
+                 * file objects (fd-table over-release: sockets torn down at
+                 * refs=1 while the group still used them). */
+                bkl_enter();
                 close_all_fds(q);
+                bkl_exit();
                 wakeup_waiters(q->pid);
             }
         }
@@ -1269,8 +1305,15 @@ __attribute__((noreturn)) void proc_exit(int code) {
                 { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
                 /* Slice 88: wait until the sibling is off-CPU before freeing
                  * its kstack -- sched_dequeue does not stop a thread still
-                 * running on another core. */
-                proc_wait_off_cpu(q);
+                 * running on another core.
+                 * Slice 89: release a quiesce-parked spinner first, and bound
+                 * the wait (see proc_exit_group -- same hang, same fix). */
+                __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
+                if (!proc_wait_off_cpu_bounded(q)) {
+                    kprintf("[exitg] pid=%d never left cpu -- slot leaked, "
+                            "kstack NOT freed\n", q->pid);
+                    continue;
+                }
                 /* Free the thread's kernel stack */
                 if (q->kstack_base) kfree(q->kstack_base);
                 q->kstack_base = 0;
@@ -1278,7 +1321,18 @@ __attribute__((noreturn)) void proc_exit(int code) {
                 q->state = PROC_UNUSED;
             }
         }
+        /* Slice 89: close under the BKL -- file_close refcounts are plain
+         * ints guarded ONLY by the BKL, and this path runs with it dropped;
+         * unlocked closes raced other CPUs' open/close/dup on the shared
+         * objects (sockets torn down while still in use -> EPIPE storms,
+         * fd-number reuse under live owners). IRQs must be ON while waiting
+         * for the BKL: a remote holder mid-TLB-shootdown waits for THIS
+         * cpu's ACK, which needs interrupts. */
+        sti();
+        bkl_enter();
         close_all_fds(p);
+        bkl_exit();
+        cli();
     } else {
         /* Non-leader thread: don't close shared fds, just wake joiners */
         struct proc *w = p->join_waiters;

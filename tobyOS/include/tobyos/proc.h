@@ -562,6 +562,8 @@ __attribute__((noreturn)) void proc_exit(int code);
  * sched_dequeue / force-TERMINATED and BEFORE freeing kstack or zeroing
  * kstack_top -- otherwise another CPU can switch into a freed stack. */
 void proc_wait_off_cpu(struct proc *p);
+/* Slice 89: bounded variant for group teardown; false = never left CPU. */
+bool proc_wait_off_cpu_bounded(struct proc *p);
 
 /* Soft stop-the-world for the shared-CR3 thread group around vmm_cow_fork.
  * Defined in fork.c. Actor must be the forking thread; may briefly drop BKL. */

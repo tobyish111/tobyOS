@@ -126,6 +126,13 @@ struct file {
     int            *vfs_refs;
     /* For SOCKET. */
     struct sock    *sock;
+    /* Slice 89: the slot generation this descriptor was created against.
+     * Pool slots recycle, so a stale/double-closed struct file could
+     * otherwise decrement the refcount of whatever socket now occupies the
+     * slot and tear down a live channel underneath its real owner --
+     * surfacing as sendmsg EPIPE on a healthy fd and chrome's "Crashing due
+     * to FD ownership violation". Validated in file_close/file_clone. */
+    uint32_t        sock_gen;
     /* For WINDOW. */
     struct window  *win;
     /* For TERM (milestone 13). */

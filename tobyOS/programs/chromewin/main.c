@@ -117,6 +117,13 @@ static uint32_t *g_xf_pixels;
 static int g_xf_w, g_xf_h, g_xf_stride;
 static uint32_t g_xf_gen, g_xf_seen;
 static int g_xf_cap;
+/* Tier 2.5 close-out: how many real SHM frames have arrived, when the last
+ * one did, and whether we have committed to the zero-copy path (screencast
+ * stopped). Committing takes a few frames rather than one so a single
+ * spurious gen bump cannot blank the window. */
+static int  g_xf_frames, g_xf_live;
+static long g_xf_last_ms;
+#define XF_LIVE_FRAMES 5
 #endif
 static int  g_cmd_fd  = -1;          /* we write CDP commands here (chrome fd 3) */
 static int  g_resp_fd = -1;          /* we read CDP messages here (chrome fd 4) */
@@ -780,9 +787,17 @@ static int spawn_chrome(void) {
              * (ui/gfx/x/connection.cc) logs sequence-tracking and parse
              * errors at vlevel 2-3 -- if our fake server's reply framing
              * desyncs it, THIS names the request. ui/views + aura say how
-             * far BrowserFrame init got. */
+             * far BrowserFrame init got.
+             * SLICE 89 GOTCHA: chrome keeps only the LAST --vmodule= on the
+             * command line. This flag used to be silently overridden by the
+             * render/navigation --vmodule further down, so ~all the X11
+             * narration never emitted. ONE merged flag now carries both
+             * sets; never add a second --vmodule. */
             (char *)"--vmodule=*/ui/gfx/x/*=3,*/ui/base/x/*=2,*/ui/ozone/*=2,"
-                    "*/ui/views/widget/*=2,*/ui/aura/*=1,*/chrome/browser/ui/views/frame/*=2",
+                    "*/ui/views/widget/*=2,*/ui/aura/*=1,"
+                    "*/chrome/browser/ui/views/frame/*=2,"
+                    "render_process_host*=2,render_frame_host*=2,"
+                    "navigation_request=2,navigator=2,*/chrome/browser/ui/*=1",
 #endif
 #ifdef CHROME_FULL
             /* Slice 70: the full binary exits 191 after its Mojo handshake
@@ -848,15 +863,15 @@ static int spawn_chrome(void) {
                     "Chrome/151.0.0.0 Safari/537.36",
             (char *)"--lang=en-US",
             (char *)"--accept-lang=en-US,en;q=0.9",
-            /* Slice 56d (wall R1): the watch-page renderer cleanly
-             * exit_group(0)s at ~22-28s in most runs with no successor -- the
-             * shape of a browser-INSTRUCTED shutdown. Before building kernel
-             * forensics, ask the browser directly: VLOG the RenderProcessHost
-             * and navigation machinery so the shutdown decision (and the
-             * navigation that triggered it) is named on stderr. */
+            /* Slice 56d (wall R1): the render/navigation vmodule set. For
+             * CHROME_FULL it is MERGED into the single --vmodule above
+             * (chrome keeps only the last occurrence -- slice 89); the
+             * headless flavour still wants it standalone. */
+#ifndef CHROME_FULL
             (char *)"--vmodule=render_process_host*=2,render_frame_host*=2,"
                     "navigation_request=2,navigator=2,"
                     "*/ui/ozone/*=1,*/ui/aura/*=1,*/chrome/browser/ui/*=1",
+#endif
             /* Startup URL (not --app: app mode never CreateWindow'd here). */
             (char *)"about:blank",
             0,
@@ -1331,7 +1346,22 @@ static void xframe_poll_once(void) {
         g_xf_h = (int)xf.h;
         g_xf_stride = (int)(xf.stride / 4); /* tk_draw_blit wants px pitch */
         g_frames++;
-        g_last_frame_ms = sys_clock_ms();
+        g_xf_frames++;
+        g_xf_last_ms = sys_clock_ms();
+        g_last_frame_ms = g_xf_last_ms;
+        /* TIER 2.5 CLOSE-OUT: once chrome is really painting through MIT-SHM,
+         * the JPEG screencast is pure waste -- chrome encodes and we decode
+         * every frame, which slice 68 sized at ~2.3x. Switch over on
+         * EVIDENCE (a few real SHM frames), not on a build flag, so a run
+         * where Ozone never maps still falls back to CDP frames and the
+         * window is never blank. One-way: SHM is strictly better once live. */
+        if (!g_xf_live && g_xf_frames >= XF_LIVE_FRAMES) {
+            g_xf_live = 1;
+            cdp_send("Page.stopScreencast", "{}", 1);
+            if (g_frame) { free(g_frame); g_frame = 0; }
+            printf("[chromewin] SHM frames live (%d) -- screencast STOPPED, "
+                   "zero-copy path is now the paint source\n", g_xf_frames);
+        }
         if (g_frames == 1 || (g_frames % 30) == 0)
             printf("[chromewin] xframe %d: %dx%d gen=%u (MIT-SHM path)\n",
                    g_frames, g_xf_w, g_xf_h, xf.gen);
@@ -1351,8 +1381,21 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
     /* URL/status bar */
     tk_draw_fill(w, 0, 0, pw, BAR_H, 0x00202028u);
     tk_draw_text(w, 8, 6, g_status, 0x00d0d0d8u, 14, 0);
-    /* page area */
-    /* Prefer live CDP frames; xframe only when SHM gen actually advanced. */
+    /* page area.
+     * TIER 2.5: once the SHM path is live it OWNS the page -- chrome
+     * composites straight into our segment, so there is nothing to decode.
+     * Until then (or if SHM frames stop arriving) the CDP screencast still
+     * drives, which keeps a non-mapping Ozone run visually identical to the
+     * slice-68 baseline instead of blank. */
+#ifdef CHROME_FULL
+    if (g_xf_live && g_xf_pixels && g_xf_w > 0) {
+        int fw = g_xf_w < pw ? g_xf_w : pw;
+        int fh = g_xf_h < ph ? g_xf_h : ph;
+        tk_draw_blit(w, 0, BAR_H, fw, fh, g_xf_pixels, g_xf_stride);
+        if (fw < pw) tk_draw_fill(w, fw, BAR_H, pw - fw, ph, 0x00303038u);
+        if (fh < ph) tk_draw_fill(w, 0, BAR_H + fh, fw, ph - fh, 0x00303038u);
+    } else
+#endif
     if (g_frame) {
         int fw = g_frame->width  < pw ? g_frame->width  : pw;
         int fh = g_frame->height < ph ? g_frame->height : ph;

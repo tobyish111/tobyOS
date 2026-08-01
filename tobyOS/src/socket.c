@@ -71,6 +71,42 @@ static struct sock *sock_by_fd(int fd) {
     return s->in_use ? s : NULL;
 }
 
+/* Slice 89: monotonic slot-generation source. See `gen`/`peer_gen` in
+ * struct sock -- an index is not an identity once slots recycle. */
+static uint32_t g_sock_gen;
+
+/* Cross-link two AF_UNIX endpoints, recording each other's GENERATION so a
+ * later recycle of either slot cannot be mistaken for the original. */
+static void sock_link_peers(struct sock *a, struct sock *b) {
+    if (!a || !b) return;
+    a->peer_ip  = (uint32_t)(sock_index(b) + 1);
+    a->peer_gen = b->gen;
+    b->peer_ip  = (uint32_t)(sock_index(a) + 1);
+    b->peer_gen = a->gen;
+}
+
+/* Resolve `self`'s AF_UNIX peer, or NULL if it is gone OR its slot has been
+ * recycled under us. This is THE chokepoint: every peer lookup must come
+ * through here, so a stale index can never alias a live stranger. */
+static struct sock *sock_peer_checked(struct sock *self) {
+    if (!self || !self->peer_ip) return 0;
+    struct sock *p = sock_by_fd((int)self->peer_ip - 1);
+    if (!p) return 0;
+    if (p->gen != self->peer_gen) {
+#ifdef CHROMIUM_BOOT
+        static int sg; if (sg < 20) { sg++;
+            kprintf("[uxgen] STALE peer link: sock=%d -> slot=%d "
+                    "want_gen=%u got_gen=%u (recycled; treating as gone)\n",
+                    sock_index(self), (int)self->peer_ip - 1,
+                    self->peer_gen, p->gen); }
+#endif
+        self->peer_ip = 0;          /* forget the alias for good */
+        self->peer_gen = 0;
+        return 0;
+    }
+    return p;
+}
+
 struct sock *sock_alloc(int kind) {
     if (kind != SOCK_KIND_UDP && kind != SOCK_KIND_TCP &&
         kind != SOCK_KIND_UNIX && kind != SOCK_KIND_NETLINK) return 0;
@@ -80,6 +116,10 @@ struct sock *sock_alloc(int kind) {
             g_socks[i].in_use = true;
             g_socks[i].refs   = 1;
             g_socks[i].kind   = kind;
+            /* Slice 89: stamp a fresh generation so this slot is not
+             * mistakable for the socket that previously lived here. Starts
+             * at 1 -- gen 0 means "never linked" in peer_gen. */
+            g_socks[i].gen    = ++g_sock_gen;
             {   /* slice 81: latch creator creds for SO_PEERCRED */
                 struct proc *cp = current_proc();
                 g_socks[i].cr_pid = cp ? cp->pid : 0;
@@ -326,6 +366,12 @@ void sock_foreach_xserver(void (*cb)(struct sock *s)) {
     }
 }
 
+/* Slice 89: this slot's current generation (0 if the socket is gone). Used
+ * by struct file to notice that the slot it points at has been recycled. */
+uint32_t sock_generation(const struct sock *s) {
+    return (s && s->in_use) ? s->gen : 0;
+}
+
 int sock_pool_index(const struct sock *s) {
     if (!s) return -1;
     int i = (int)(s - g_socks);
@@ -343,8 +389,7 @@ long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
         for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
         return xserver_handle(self, kbuf, n);
     }
-    struct sock *peer = (self->peer_ip == 0) ? 0
-                      : sock_by_fd((int)self->peer_ip - 1);
+    struct sock *peer = sock_peer_checked(self);
     if (!peer || !peer->in_use || peer->kind != SOCK_KIND_UNIX) {
         self->peer_ip = 0;
         for (int i = 0; i < nfiles; i++) if (files[i]) file_close(files[i]);
@@ -386,8 +431,7 @@ bool sock_unix_send_would_block(struct sock *self) {
      * headroom so a write mid-InternAtom-storm can still enqueue replies. */
     if (self->x_server)
         return self->count + 8 >= SOCK_RX_DGRAMS;
-    if (!self->peer_ip) return false;
-    struct sock *peer = sock_by_fd((int)self->peer_ip - 1);
+    struct sock *peer = sock_peer_checked(self);
     return peer && peer->in_use && peer->count >= SOCK_RX_DGRAMS;
 }
 
@@ -552,16 +596,18 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
 /* Slice 81: the AF_UNIX peer endpoint, or NULL. peer_ip stores the peer's
  * pool index + 1 (0 = no peer). Used by SO_PEERCRED. */
 struct sock *sock_peer_of(struct sock *self) {
-    if (!self || self->kind != SOCK_KIND_UNIX || !self->peer_ip) return 0;
-    struct sock *p = sock_by_fd((int)self->peer_ip - 1);
-    return (p && p->in_use) ? p : 0;
+    if (!self || self->kind != SOCK_KIND_UNIX) return 0;
+    return sock_peer_checked(self);      /* slice 89: generation-validated */
 }
 
 void sock_unix_peer_close(struct sock *self) {
     if (!self || self->kind != SOCK_KIND_UNIX) return;
     if (self->x_server) return;                  /* no peer proc -- kernel side */
     if (self->peer_ip) {
-        struct sock *peer = sock_by_fd((int)self->peer_ip - 1);
+        /* Slice 89: generation-checked. This is the call that USED to sever
+         * an innocent socket -- `peer->peer_ip = 0` below, applied to
+         * whoever now occupies a recycled slot. */
+        struct sock *peer = sock_peer_checked(self);
         if (peer && peer->in_use) {
 #ifdef CHROMIUM_BOOT
             /* Slice 56 wall R1: every AF_UNIX peer-EOF, with who caused it.
@@ -578,9 +624,11 @@ void sock_unix_peer_close(struct sock *self) {
             }
 #endif
             peer->peer_ip = 0;                   /* our slot is going away */
+            peer->peer_gen = 0;
             wq_wake_all(&peer->wq_recv);         /* wake its blocked recv -> EOF */
         }
         self->peer_ip = 0;
+        self->peer_gen = 0;
     }
 }
 
@@ -727,8 +775,7 @@ int sock_unix_connect_named(struct sock *s, const char *name, bool abstract) {
         if (!srv) return -111;
         srv->sotype = s->sotype;
         /* Cross-link client and server ends, as socketpair(2) does. */
-        srv->peer_ip = (uint32_t)(sock_index(s)   + 1);
-        s->peer_ip   = (uint32_t)(sock_index(srv) + 1);
+        sock_link_peers(srv, s);            /* slice 89: records generations */
         b->backlog[b->nq++] = sock_index(srv);
 #ifdef CHROMIUM_BOOT
         kprintf("[unixbind] connect pid=%d -> '%s' cli=%d srv=%d q=%d\n",
@@ -752,8 +799,7 @@ int sock_unix_pair(struct sock **out_a, struct sock **out_b) {
     if (!a) return -1;
     struct sock *b = sock_alloc(SOCK_KIND_UNIX);
     if (!b) { sock_close(a); return -1; }
-    a->peer_ip = (uint32_t)(sock_index(b) + 1);
-    b->peer_ip = (uint32_t)(sock_index(a) + 1);
+    sock_link_peers(a, b);                  /* slice 89: records generations */
 #ifdef CHROMIUM_BOOT
     {   /* Slice 22 instrument: map pool indices to channels, so the send/recv
          * traces above can be read as a conversation. */

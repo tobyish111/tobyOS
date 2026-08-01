@@ -445,6 +445,18 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
     perf_count_ctx_switch();
     perf_zone_end(PERF_Z_SCHED_SWITCH, t);
 
+#ifdef CHROMIUM_BOOT
+    /* Slice 89 tripwire: switching into a proc that is STILL live on another
+     * CPU means two CPUs will run the same kernel stack/register image --
+     * the exact mechanism that produces "kernel pointers in user registers"
+     * and wandering heap corruption. Every picker is supposed to skip
+     * on_cpu procs; if this ever fires, one of them does not. */
+    if (__atomic_load_n(&to->on_cpu, __ATOMIC_ACQUIRE)) {
+        kprintf("[dsched] DUAL-SCHEDULE pid=%d state=%d on cpu%u (from=%d)\n",
+                to->pid, (int)to->state, me->cpu_idx,
+                from ? from->pid : -1);
+    }
+#endif
     to->state       = PROC_RUNNING;
     to->quantum_left = sched_quantum_for(to->prio);  /* fresh timeslice */
     /* Slice 39: mark `to` live-on-CPU before it can possibly be re-enqueued,
@@ -495,6 +507,16 @@ void sched_finish_switch(void) {
     if (prev) {
         cpu->prev_proc = 0;
         __atomic_store_n(&prev->on_cpu, 0, __ATOMIC_RELEASE);
+        /* Slice 89: SEQ_CST fence between the on_cpu store and the
+         * vm_quiesce load. This handoff races tg_vm_resume's mirror-image
+         * {vm_quiesce:=0; load on_cpu}: with only release/acquire, x86
+         * StoreLoad reordering lets BOTH sides read the stale value (we see
+         * vm_quiesce still 1, resume sees on_cpu still 1) and NEITHER
+         * requeues -- the thread is parked BLOCKED forever. The slice-88
+         * "-smp 4 froze, threads READY in clone3 232s, APs idle" family
+         * lives here. Both requeueing is fine (sched_enqueue no-ops on a
+         * queued proc; the state==BLOCKED test closes the double-READY). */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
         /* Deferred CoW-STW resume: tg_vm_resume left vm_quiesced set because
          * we were still on_cpu. Now safe to put a BLOCKED parked sibling
          * back on a run queue (vm_quiesce already cleared). */
@@ -558,7 +580,17 @@ void sched_enqueue(struct proc *p) {
     if (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE)) {
         p->state = PROC_BLOCKED;
         p->vm_quiesced = 1;
-        return;
+        /* Slice 89: re-check after a fence. tg_vm_resume iterates the proc
+         * table ONCE; if it already passed this proc while we were parking
+         * it here, nobody would ever requeue it (BLOCKED, off-queue, off-
+         * cpu). If the flag cleared under us, undo the park and enqueue --
+         * a concurrent requeue by tg_vm_resume is benign (queue_push
+         * no-ops on an already-queued proc). */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE))
+            return;
+        p->vm_quiesced = 0;
+        p->state = PROC_READY;
     }
     uint32_t target = enq_target_for(p);
     struct percpu *cpu = smp_cpu_mut(target);
@@ -979,6 +1011,11 @@ void sched_tick(struct regs *r) {
              * classes); run the deep dump every 60s. */
             kprintf("[hb %lu ms] alive logdrop=%lu\n",
                     now / 1000000ull, (unsigned long)serial_dropped());
+            /* Slice 89: per-X-conn state at the 3s cadence. Must ride the
+             * sched_tick heartbeat -- pid 0's idle loop never runs under
+             * chrome load, so the same call inside xserver_tick printed
+             * nothing for an entire 360s run. */
+            { extern void xserver_debug_tick(void); xserver_debug_tick(); }
             if (now - last_deep > 60000000000ull) {
             last_deep = now;
             extern struct proc g_proc[];

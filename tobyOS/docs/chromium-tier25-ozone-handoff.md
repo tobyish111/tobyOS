@@ -109,9 +109,104 @@ scheduling timing, **not** a missing feature: the control proves this exact
 chrome+flags maps on a core-only X server, and every fixed bug moved the
 average stall later.
 
-## 4. YOUR TARGET — two candidate paths, pick by evidence
+## 3b. SLICE 89 SUPERSEDES §4 BELOW — read this before acting on it
 
-### Path A (recommended): fix the `-smp 4` AP arc, dissolve the whole class
+**Path A is dead: `-smp 4` does NOT reproduce the slice-88 freeze.** Four
+runs at `-smp 4`: APs took real work every time (cpu1 1.2M BKL acquisitions,
+cpu2 407k, cpu3 313k), no clone3 pile-up, no 7.6s freeze. `run_watch.py`
+now has an `SMP=` env knob (default still 1). The quiesce/AP-queue arc is
+NOT what stands between us and tier 2.5 — don't spend a session on it.
+
+**THE CURRENT WALL — repeatable signature, and the cause is UPSTREAM of the
+socket.** Every failing run ends the same way:
+
+```
+[31] 46(sendmsg) a1=7 = -32     <-- EPIPE
+     rt_sigaction(11) getpid gettid exit_group(191)
+stderr: "Crashing due to FD ownership violation:"
+```
+
+**The EPIPE is a CONSEQUENCE, not the bug** — this is the same divergence
+slice 83 recorded (Linux does sendmsg → recvmsg → PR_SET_PTRACER →
+sigaltstack → 8× rt_sigaction; we do sendmsg → EPIPE → abort). What is new
+is WHY the peer is gone:
+
+```
+[6952 ms] [execve] pid=1 now running 'chrome_crashpad_handler'
+[6954 ms] [proc]   pid=1 'chrome_crashpad_handler' exit code=0
+                   cpu=0 ms syscalls=4
+```
+
+**chrome_crashpad_handler execs and exits TWO MILLISECONDS later having
+issued FOUR syscalls.** Slice 76 fixed the double-fork so the exec happens
+at all, and nobody then checked that the handler SURVIVES. It does not. Its
+socket endpoint dies with it, so every later client sendmsg EPIPEs and that
+client aborts 191.
+
+[xexit] now also fires on a QUIET DEATH (exit 0 with <32 syscalls) -- the
+old non-zero gate made the one exit that matters the one exit we never saw.
+It caught the four immediately:
+
+```
+[1] 14(rt_sigprocmask) a1=0 = 0
+[1] 14(rt_sigprocmask) a1=2 = 0
+[1] 59(execve)             = <no-return sentinel>   <-- exec SUCCEEDS
+[1] 231(exit_group) a1=0                            <-- FIRST call of the
+                                                        NEW image
+```
+
+`[execve] pid=1 now running 'chrome_crashpad_handler' entry=0x201120`
+confirms the exec took (entry 0x201120 = a STATIC binary, not the ld.so
+range). **So the handler image starts and its VERY FIRST syscall is
+exit_group(0)** -- no ld.so work, no mmap, no openat, nothing. A real
+static binary reaching main cannot do that. The suspicion is therefore the
+process image we hand it: initial stack / auxv / argv-envp layout built by
+execve ON TOP OF a `sys_fork_share` (vfork-style) child that borrows the
+parent's CR3 and a synthetic 512 KiB stack. **START THERE** -- compare the
+auxv/stack the handler receives against what a normally-spawned static
+Linux binary gets (programs/linux-* are ready-made controls, and the
+30-line-binary method from slice 82 applies: vfork+exec a tiny static ELF
+that just writes and exits, run it on both kernels).
+
+HYPOTHESIS TESTED AND **NOT CONFIRMED** — AF_UNIX slot recycling. Slice 78
+named it ("sock_alloc recycles pool indices IMMEDIATELY, peer_ip stores
+index+1 with NO GENERATION COUNTER") and it fit the symptom exactly, so a
+generation counter was implemented: `struct sock.gen`/`peer_gen`, every
+lookup via `sock_peer_checked()`, `struct file.sock_gen` for descriptors,
+`[uxgen]` logging each stale link caught. **Result: `[uxgen]` fired ZERO
+times and the failure signature is byte-identical.** The aliasing was real
+in theory but is not what breaks this run. **The code is KEPT** (it closes a
+genuine hazard and costs nothing) but do NOT re-chase it as the cause, and
+do not credit it with any behaviour change.
+
+**MapWindow (op=8) HAS now been observed** (`req c=4 op=8 seq=253`, frame
+resized to 799×599) — the first time in this arc.
+
+Also fixed, each a real bug: two SMP lost-wakeups needing SEQ_CST (not
+release/acquire) — `sched_finish_switch` vs `tg_vm_resume`, and
+`sys_fork_share` vs `vfork_child_done`; group teardown calling
+`close_all_fds` with the BKL dropped over non-atomic refcounts; an
+unbounded `proc_wait_off_cpu` that could hang teardown forever.
+
+**Extension surface is now MIT-SHM ONLY** (`-DXSRV_EXT_ALL` restores the
+old set). We had been in a MIXED state — advertising RANDR/XFIXES/BIG-
+REQUESTS — which the control never validated; the control proved chrome
+maps with ZERO extensions.
+
+**Two instrument lessons worth more than the fixes:**
+- chromewin passed **two** `--vmodule=` flags; chrome keeps the last, so
+  all the X11 narration added for this investigation was silently disabled.
+- `[xsum]` printed **nothing for a whole 360s run** because it hung off
+  `xserver_tick` → pid 0's idle_loop, and **pid 0 never runs under chrome
+  load**. Never put a stall diagnostic on the idle path.
+- The wait-graph is **blind to blocking recvmsg** (only epoll_wait/futex
+  register), and `[uxstuck]`'s 5s threshold can no longer fire because our
+  own 100ms idle-poke keeps every wait short — slice 88's fix blinded slice
+  88's instrument. Use `[xsum] lastreq=<ms>`.
+
+## 4. (SUPERSEDED — see §3b) original two candidate paths
+
+### Path A (NOT VIABLE, see §3b): fix the `-smp 4` AP arc
 
 One `-smp 4` trial froze at 7.6 s: **a dozen threads READY in clone/clone3 for
 232 s with ZERO BKL acquisitions on cpu1-3** — the APs got SIPIs and did no
