@@ -204,6 +204,16 @@ and what we let it skip: something reported success (or degraded silently)
 and left the member null. `r14` is a heap object; `rbx+2` is compared
 against `0x41` just above, so there is a type tag to identify it by.
 
+**CONFIRMED ACROSS RUNS (slice 90 final):** the crash rip is
+**deterministic** -- `0x59be96f`, `addr=0x18`, every time. And the dying
+thread now exits **139 (128+SIGSEGV)** instead of the blind
+`exit_group(191)`: with rt_sigtimedwait/rt_tgsigqueueinfo present, chrome
+RAISES the signal properly instead of aborting. MapWindow fired **twice**
+in that same run (`op=8 seq=239`, `seq=283`). So the sequence is now:
+handshake OK -> window mapped -> this one thread NULL-derefs -> no
+ShmPutImage ever happens. **One deterministic bug stands between here and
+the first zero-copy frame.**
+
 **IMPLEMENTATION GOTCHA worth keeping:** the first cut of `rt_sigtimedwait`
 spun on `sched_yield()` **while holding the BKL**. Crashpad parks a thread
 there with NO timeout, forever, so one thread hammering the global lock in
