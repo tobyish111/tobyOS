@@ -1011,6 +1011,41 @@ void sched_tick(struct regs *r) {
              * classes); run the deep dump every 60s. */
             kprintf("[hb %lu ms] alive logdrop=%lu\n",
                     now / 1000000ull, (unsigned long)serial_dropped());
+            /* Slice 91: DEFERRED-REQUEUE BACKSTOP / INSTRUMENT.
+             *
+             * The -smp 4 freeze is real (slice 89 wrongly exonerated it):
+             * six threads READY in clone3 for 293s with BKL acq=0 on ALL
+             * four CPUs -- the whole kernel wedged. Prime suspect is the
+             * slice-87 quiesce handoff: tg_vm_resume declines to requeue a
+             * sibling that is still on_cpu and leaves vm_quiesced=1 for
+             * sched_finish_switch to finish -- and if that never runs for
+             * that proc, NOTHING ever puts it back on a run queue. Every
+             * other lock in this machinery already has a timeout backstop
+             * (cow_fork_lock steals after 20M spins, tg_vm_quiesce gives up
+             * after 500k); the deferred requeue has none.
+             *
+             * This is an INSTRUMENT first and a mitigation second: if it
+             * ever fires, the deferred-requeue path IS the freeze mechanism
+             * and the real fix belongs at the handoff, not here. Runs from
+             * the tick because the tick is the last thing still alive when
+             * everything else is stuck. */
+            {
+                extern struct proc g_proc[];
+                for (int i = 0; i < PROC_MAX; i++) {
+                    struct proc *q = &g_proc[i];
+                    if (q->state != PROC_BLOCKED || !q->vm_quiesced) continue;
+                    if (__atomic_load_n(&q->vm_quiesce, __ATOMIC_ACQUIRE))
+                        continue;                   /* still legitimately parked */
+                    if (__atomic_load_n(&q->on_cpu, __ATOMIC_ACQUIRE))
+                        continue;                   /* finish_switch still owes it */
+                    kprintf("[qstuck] pid=%d parked with vm_quiesce CLEAR and "
+                            "off-cpu -- deferred requeue never fired; "
+                            "REQUEUEING\n", q->pid);
+                    q->vm_quiesced = 0;
+                    q->state = PROC_READY;
+                    sched_enqueue(q);
+                }
+            }
             /* Slice 89: per-X-conn state at the 3s cadence. Must ride the
              * sched_tick heartbeat -- pid 0's idle loop never runs under
              * chrome load, so the same call inside xserver_tick printed
