@@ -5055,3 +5055,67 @@ ORDER OF WORK, revised: the freeze is upstream of everything. Fix it (or at
 least make `[qstuck]` fire and prove the mechanism) BEFORE spending another
 cycle on X protocol behaviour. Every X hypothesis tested against a frozen
 run is wasted, and several already were.
+
+## Slice 91 FINDING (the important one): TIER 2.5's PREMISE DOES NOT HOLD.
+## Chromium never presents pixels through X — not on our server, and NOT ON
+## A REAL ONE. Stop hardening xserver.c for frames.
+
+Tier 2.5 is defined as: "chrome MapWindows on our fake X server, paints via
+**ShmPutImage** into the shared segment, chromewin presents those pixels."
+The whole zero-copy design, and the ~2.3x estimate from slice 68, rest on
+chrome issuing ShmPutImage (or at minimum PutImage) on its X connection.
+
+**It does not. Measured on the CONTROL — a full, real X server.**
+
+Three configurations, Xvfb + xtrace, real page (https://example.com),
+90–120 s each, chrome 151, the same binary the guest runs:
+
+| flags | PutImage | ShmPutImage | MIT-SHM traffic |
+|---|---|---|---|
+| `--use-gl=disabled --disable-gpu --single-process` (our guest set) | 0 | 0 | QueryVersion x3, Attach x1, Detach x1 |
+| `--disable-gpu-compositing --enable-unsafe-swiftshader --single-process` | 0 | 0 | QueryVersion x3, Attach x2, Detach x2 |
+| same, **multi-process** (no `--single-process`) | 0 | 0 | QueryVersion x3, Attach x2, Detach x2 |
+
+The third run had **66 extensions present=true** — MIT-SHM, DAMAGE, RENDER,
+GLX, Composite, SYNC, XFIXES, RANDR, SHAPE, XKEYBOARD, XTEST — i.e. every
+capability chrome could ask for, on a real server, with the page loaded
+(4 navigation hits in stderr). Chrome attaches an SHM segment, DETACHES it,
+issues GLX config queries (`glXGetFBConfigs`, `glXQueryServerString`,
+`glXCreatePbuffer` / `glXDestroyPbuffer`) and renders **offscreen**. It
+never pushes the result to the X window.
+
+**CONSEQUENCES, stated plainly:**
+
+1. **No amount of work on `src/xserver.c` can produce a tier-2.5 frame.**
+   We spent slices 88–91 making our fake server more correct — MapWindow,
+   VisibilityNotify/ConfigureNotify/FocusIn, EWMH SendEvent, the reply-vs-
+   silence fix. All of it was real and worth keeping (chrome now reaches
+   **bootstrap OK**, a live CDP session, which never happened before). None
+   of it was ever going to yield a frame, because chrome does not send one.
+
+2. **The slice-68 "~2.3x" figure was never validated against a working SHM
+   path** — it was an estimate of what zero-copy *would* save, not a
+   measurement of it working. Treat it as void.
+
+3. **The CDP screencast is not a stopgap we are trying to escape; on this
+   deployment it may be the only pixel source chrome offers.** The existing
+   path (933 frames/example.com, ~1050/react.dev) is the product, not the
+   fallback.
+
+**WHAT TIER 2.5 SHOULD BECOME.** Do not reopen it as "make ShmPutImage
+work". Either:
+ * **Retire it**, and re-aim the perf work at frame PRODUCTION inside
+   chrome, which is what tier 1 measured as the actual bottleneck (our
+   display path is ~1 ms/frame, essentially free); or
+ * **Re-scope it** to a mechanism chrome actually uses. That means finding
+   out where the offscreen render goes and whether it can be intercepted —
+   the GLX pbuffer path, or `viz`'s shared-memory buffers over Mojo (which
+   we already carry), NOT the X core protocol.
+Either way the next step is a measurement, not more X protocol.
+
+**METHOD NOTE, and it is on me.** I used `logs/control/x11wire.txt` as
+"ground truth for reaching MapWindow + ShmPutImage" for several slices. That
+trace **never reached the paint stage either** — it ends at MapWindow and
+teardown. I was treating a trace that stops before the goal as evidence
+about the goal. When a control is your spec, check that the control actually
+DOES the thing you are trying to reproduce before you trust it for that.
