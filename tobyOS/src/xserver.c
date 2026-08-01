@@ -164,10 +164,23 @@ static void xframe_ensure(uint32_t w, uint32_t h) {
     g_xf_stride = w * 4;
     if (g_xf_pixels)
         memset(g_xf_pixels, 0x20, need);
-    __atomic_fetch_add(&g_xf_gen, 1, __ATOMIC_RELEASE);
-    kprintf("[xsrv] xframe %ux%u shmid=%d\n", w, h, g_xf_shmid);
+    /* SLICE 91: do NOT bump the generation here.
+     *
+     * `gen` is the signal chromewin uses for "new pixels have been painted",
+     * and this function is a RESIZE (it hands back a freshly blanked
+     * buffer). Bumping it made every resize look like a frame: a run where
+     * chrome never painted at all still printed
+     *     [chromewin] xframe 1: 799x599 (MIT-SHM path)
+     * purely from the 800x600 -> 400x118 -> 799x599 ensure sequence, i.e.
+     * the tier-2.5 close-out would have reported success on an empty grey
+     * buffer. A frame counter that counts non-frames cannot be used to
+     * decide whether tier 2.5 is done. Only real pixel writes bump it now
+     * (xframe_bump, from PutImage / ShmPutImage). */
+    kprintf("[xsrv] xframe %ux%u shmid=%d (resize; gen NOT bumped)\n",
+            w, h, g_xf_shmid);
 }
 
+/* Called ONLY when actual pixels have been written into the frame. */
 static void xframe_bump(void) {
     __atomic_fetch_add(&g_xf_gen, 1, __ATOMIC_RELEASE);
 }
@@ -270,6 +283,43 @@ static void x_send_configure_notify(struct sock *s, uint16_t seq, uint32_t wid,
     xput16(ev + 24, 0);         /* border-width */
     ev[26] = 0;                 /* override-redirect */
     x_reply(s, seq, ev, 32);
+}
+
+/* Slice 91: does core X opcode `op` carry a reply?
+ *
+ * This is the difference between "client continues" and "client blocks in
+ * recvmsg forever" when we do not implement a request, so it is worth
+ * having exactly right. List is the reply-bearing set from the core X11
+ * protocol spec; everything else (ChangeProperty, MapWindow, SendEvent,
+ * ConfigureWindow, ...) is void and must stay silent. Extension opcodes
+ * (>=128) are NOT here: their major is dynamic and their reply-ness is
+ * per-minor, so they keep the old silent-ignore treatment. */
+static bool x_op_has_reply(uint8_t op) {
+    switch (op) {
+    case 3:   /* GetWindowAttributes */   case 14:  /* GetGeometry */
+    case 15:  /* QueryTree */             case 16:  /* InternAtom */
+    case 17:  /* GetAtomName */           case 20:  /* GetProperty */
+    case 21:  /* ListProperties */        case 23:  /* GetSelectionOwner */
+    case 26:  /* GrabPointer */           case 31:  /* GrabKeyboard */
+    case 38:  /* QueryPointer */          case 39:  /* GetMotionEvents */
+    case 40:  /* TranslateCoordinates */  case 43:  /* GetInputFocus */
+    case 44:  /* QueryKeymap */           case 47:  /* QueryFont */
+    case 48:  /* QueryTextExtents */      case 49:  /* ListFonts */
+    case 50:  /* ListFontsWithInfo */     case 52:  /* GetFontPath */
+    case 73:  /* GetImage */              case 83:  /* ListInstalledColormaps */
+    case 84:  /* AllocColor */            case 85:  /* AllocNamedColor */
+    case 86:  /* AllocColorCells */       case 87:  /* AllocColorPlanes */
+    case 91:  /* QueryColors */           case 92:  /* LookupColor */
+    case 97:  /* QueryBestSize */         case 98:  /* QueryExtension */
+    case 99:  /* ListExtensions */        case 101: /* GetKeyboardMapping */
+    case 103: /* GetKeyboardControl */    case 106: /* GetPointerControl */
+    case 108: /* GetScreenSaver */        case 110: /* ListHosts */
+    case 116: /* SetPointerMapping */     case 117: /* GetPointerMapping */
+    case 118: /* SetModifierMapping */    case 119: /* GetModifierMapping */
+        return true;
+    default:
+        return false;
+    }
 }
 
 static int x_error(struct sock *s, uint16_t seq, uint8_t code, uint8_t minor,
@@ -1514,18 +1564,39 @@ static void handle_request(struct sock *s, struct x_conn *c,
             return;
         }
     default:
-        /* Prefer silent ignore over BadImplementation: an error reply for a
-         * void probe can put xcb into a sticky error state and stall Ozone.
-         * Checked requests that need replies will show up as recv hangs —
-         * log them and implement the next opcode. */
+        /* SLICE 91 -- the old policy was "silent ignore, because an error
+         * reply for a void probe can put xcb into a sticky error state".
+         * The silence half of that is a HANG GENERATOR: in X11 a request
+         * that carries a reply and never gets one blocks the client in
+         * recvmsg FOREVER. That is precisely the "wandering stall" this arc
+         * has chased for four slices -- chrome stops at a different request
+         * every run because it stops at whichever reply-bearing opcode it
+         * reaches first that we have not implemented, and the order depends
+         * on timing.
+         *
+         * The control settles the safety question the old comment worried
+         * about: real servers send chrome errors as a matter of course and
+         * chrome handles them fine. In logs/control/x11wire.txt chrome
+         * deliberately probes the None window and gets
+         *     Error 3=Window:   major=3  (GetWindowAttributes)
+         *     Error 9=Drawable: major=14 (GetGeometry)
+         * back-to-back, then carries straight on. Errors are normal traffic.
+         *
+         * So: answer reply-bearing opcodes with an X error (the client
+         * unblocks and takes its failure path), and keep silence ONLY for
+         * void requests, where the old worry does apply. */
         {
             static int logged;
             if (logged < 80) {
                 logged++;
-                kprintf("[xsrv] unhandled opcode=%u seq=%u len=%u (ignored)\n",
-                        op, seq, req_bytes);
+                kprintf("[xsrv] unhandled opcode=%u seq=%u len=%u (%s)\n",
+                        op, seq, req_bytes,
+                        x_op_has_reply(op) ? "REPLY EXPECTED -> sending error"
+                                           : "void -> ignored");
             }
         }
+        if (x_op_has_reply(op))
+            x_error(s, seq, 17 /* BadImplementation */, 0, 0, op);
         return;
     }
 }
