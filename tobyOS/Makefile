@@ -1668,6 +1668,19 @@ programs/linux-xdg-settings/linux-xdg-settings.elf: programs/linux-xdg-settings/
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# Slice 90: a crashpad handler that ANSWERS. /opt/chrome/chrome_crashpad_handler
+# used to be staged as a COPY of the xdg-settings stub above, whose whole body
+# is exit_group(0) -- so the handler died in the same millisecond it exec'd,
+# its AF_UNIX endpoint went with it, and every later client sendmsg on that
+# socket got -EPIPE -> INT3 -> exit_group(191). chrome runs the crashpad
+# handshake even under --disable-crash-reporter (slice 75), so the handler has
+# to stay alive and reply, not merely exist.
+programs/linux-crashpad/linux-crashpad.elf: programs/linux-crashpad/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 # Track B/B4: a genuine Linux x86-64 static ELF proving the Linux signal
 # path (rt_sigaction + restorer + rt_sigreturn). Same build shape as
 # linux-hello (raw syscalls, no libc, brandelf'd EI_OSABI=Linux).
@@ -2426,6 +2439,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_edit,user_gui_edit))
 
 $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-xdg-settings/linux-xdg-settings.elf \
+               programs/linux-crashpad/linux-crashpad.elf \
                programs/linux-sigtest/linux-sigtest.elf \
                programs/linux-mmaptest/linux-mmaptest.elf \
                programs/linux-thread/linux-thread.elf \
@@ -3006,7 +3020,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	        cp -r programs/chromium/sysroot $(INITRD_STAGE)/opt/chrome/sysroot; \
 	    fi; \
 	    printf '\003' | dd of=$(INITRD_STAGE)/opt/chrome/chrome bs=1 seek=7 count=1 conv=notrunc 2>/dev/null; \
-	    cp programs/linux-xdg-settings/linux-xdg-settings.elf \
+	    cp programs/linux-crashpad/linux-crashpad.elf \
 	        $(INITRD_STAGE)/opt/chrome/chrome_crashpad_handler; \
 	    printf '\003' | dd of=$(INITRD_STAGE)/opt/chrome/chrome_crashpad_handler bs=1 seek=7 count=1 conv=notrunc 2>/dev/null; \
 	    rm -f $(INITRD_STAGE)/opt/chrome/vk_swiftshader_icd.json; \

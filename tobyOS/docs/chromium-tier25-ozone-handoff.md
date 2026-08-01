@@ -155,18 +155,72 @@ It caught the four immediately:
                                                         NEW image
 ```
 
-`[execve] pid=1 now running 'chrome_crashpad_handler' entry=0x201120`
-confirms the exec took (entry 0x201120 = a STATIC binary, not the ld.so
-range). **So the handler image starts and its VERY FIRST syscall is
-exit_group(0)** -- no ld.so work, no mmap, no openat, nothing. A real
-static binary reaching main cannot do that. The suspicion is therefore the
-process image we hand it: initial stack / auxv / argv-envp layout built by
-execve ON TOP OF a `sys_fork_share` (vfork-style) child that borrows the
-parent's CR3 and a synthetic 512 KiB stack. **START THERE** -- compare the
-auxv/stack the handler receives against what a normally-spawned static
-Linux binary gets (programs/linux-* are ready-made controls, and the
-30-line-binary method from slice 82 applies: vfork+exec a tiny static ELF
-that just writes and exits, run it on both kernels).
+**SLICE 90 RESOLVED THIS, AND THE SLICE-89 DIAGNOSIS ABOVE WAS WRONG.**
+There was no execve/auxv bug. `entry=0x201120` was the tell: it is the
+SAME entry as the `xdg-settings` stub in the same log, because the Makefile
+**deliberately staged a copy of that stub as
+`/opt/chrome/chrome_crashpad_handler`** — and that stub's entire body is
+`exit_group(0)`. The handler "quiet-died" because we told it to. (The real
+handler is DYNAMIC — `PT_INTERP=/lib64/ld-linux-x86-64.so.2`, e_type=DYN,
+entry 0x3fc00 — so "no ld.so syscalls at all" should have been read as
+"this is not the binary you think it is", not as a broken process image.
+Checking the ELF header costs one command and would have skipped the whole
+detour.)
+
+### WHAT THE FIXED HANDSHAKE REVEALED — the real remaining crash
+
+With the handler answering, the failure signature CHANGED, which is the
+point of the fix:
+
+```
+before: sendmsg a1=7 = -32 (EPIPE)  -> abort 191
+after:  sendmsg a1=7 = 40 (SUCCESS) -> 128(?) = -38 ENOSYS -> abort 191
+```
+
+Syscalls 128 (`rt_sigtimedwait`) and 297 (`rt_tgsigqueueinfo`) were both
+`-ENOSYS`; both are now implemented. But they were only the crash-REPORTING
+path failing. The actual crash is upstream and now visible:
+
+```
+[sigfault] pid=30 chrome+T vec=14 sig=11 code=1
+           rip=0x59be96f addr=0x18  rax=0x0  r14=0x1024000f3e80
+```
+
+Disassembled at `rip - 0x500000` (main PIE base):
+
+```
+mov 0xb8(%r14),%rax    ; rax = *(r14 + 0xb8)   -> NULL
+mov 0x18(%rax),%rdi    ; FAULT reading 0x18
+test %rsi,%rsi ; sete %al
+test %rdi,%rdi ; sete %cl ; or %al,%cl ; je ...
+```
+
+Chrome loads a member at `+0xb8` and dereferences it **with no null check**,
+then null-checks the *result* two instructions later — i.e. it treats
+`[r14+0xb8]` as an invariant some earlier init was supposed to establish.
+**This is the "wrong VALUE in something that SUCCEEDED" class from the
+method lessons, not a wrong errno.** Find which subsystem owns that object
+and what we let it skip: something reported success (or degraded silently)
+and left the member null. `r14` is a heap object; `rbx+2` is compared
+against `0x41` just above, so there is a type tag to identify it by.
+
+**IMPLEMENTATION GOTCHA worth keeping:** the first cut of `rt_sigtimedwait`
+spun on `sched_yield()` **while holding the BKL**. Crashpad parks a thread
+there with NO timeout, forever, so one thread hammering the global lock in
+an infinite loop wedged the entire guest at ~8.7s (the serial log simply
+stopped). Blocking syscalls must drop the BKL and hlt/yield cooperatively —
+the same shape `sock_unix_recv` already uses. Never add a wait loop without
+checking who holds the BKL across it.
+
+FIX (slice 90): `programs/linux-crashpad` — a stub that actually performs
+the handshake slice 76b decoded: parse `--initial-client-fd=N` off the raw
+SysV stack, `recvmsg` the 40-byte request, reply 8 bytes (the kernel
+attaches SCM_CREDENTIALS because the browser set SO_PASSCRED), and **loop
+forever** so the endpoint never dies. `_start` is naked — reading `rsp`
+from inside a normal C function is a lie the moment the compiler emits a
+prologue. Verified on the WSL control BEFORE booting it (slice-82 method):
+40-byte request received, 8-byte reply, `SCM_CREDENTIALS pid=16066`, and
+the handler still alive afterwards.
 
 HYPOTHESIS TESTED AND **NOT CONFIRMED** — AF_UNIX slot recycling. Slice 78
 named it ("sock_alloc recycles pool indices IMMEDIATELY, peer_ip stores

@@ -4424,6 +4424,8 @@ enum {
     LX_arch_prctl = 158, LX_gettid = 186, LX_tkill = 200, LX_futex = 202,
     LX_getdents64 = 217, LX_set_tid_address = 218, LX_clock_gettime = 228,
     LX_exit_group = 231, LX_tgkill = 234, LX_openat = 257,
+    /* Slice 90: chrome's crash path calls both; both used to be -ENOSYS. */
+    LX_rt_sigtimedwait = 128, LX_rt_tgsigqueueinfo = 297,
     LX_newfstatat = 262, LX_set_robust_list = 273, LX_getrandom = 318,
     LX_readlink = 89, LX_readlinkat = 267,  /* B20: /proc/self/exe etc. */
     /* Slice 69: symlink(2)/symlinkat(2). vfs_symlink() has existed since the
@@ -8780,6 +8782,87 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_tkill:                     /* (tid, sig) */
         return sys_kill((int)a1, (int)a2);
     case LX_tgkill:                    /* (tgid, tid, sig) -> signal the tid */
+        return sys_kill((int)a2, (int)a3);
+
+    /* Slice 90: the two signal syscalls chrome's crash path needs. Both were
+     * -ENOSYS, which is why a faulting thread could never finish reporting:
+     * it sent its crashpad message fine, then died on the very next call and
+     * aborted with exit_group(191) instead of raising properly. Filling them
+     * does not stop a thread from crashing -- it lets the crash be REPORTED
+     * the way Linux reports it, which is how we learn why. */
+    case LX_rt_sigtimedwait: {  /* (set, info, timeout, sigsetsize) */
+        uint64_t uset = 0;
+        if (a1 && copy_from_user(&uset, (const void *)(uintptr_t)a1,
+                                 sizeof uset) != 0)
+            return -ABI_EFAULT;
+        /* CONVENTION MISMATCH -- get this wrong and the wait either never
+         * fires or fires on the wrong signal. Linux sigset_t sets bit
+         * (signo-1); tobyOS's SIGMASK(s) is (1u << s), i.e. bit == signo
+         * (see signal.h and oom.c's `1u << 9` for SIGKILL). Shift the
+         * caller's set into OUR numbering once, here. */
+        uint64_t kset = uset << 1;
+        /* Deadline: NULL timeout means wait forever. */
+        bool have_to = (a3 != 0);
+        uint64_t deadline = 0;
+        if (have_to) {
+            int64_t ts[2];
+            if (copy_from_user(ts, (const void *)(uintptr_t)a3, sizeof ts) != 0)
+                return -ABI_EFAULT;
+            deadline = perf_now_ns() + (uint64_t)ts[0] * 1000000000ull
+                     + (uint64_t)ts[1];
+        }
+        struct proc *p = current_proc();
+        if (!p) return -ABI_EINVAL;
+        /* Crashpad parks a thread here with NO timeout, forever, waiting for
+         * a crash signal -- so this wait MUST be cooperative. The first cut
+         * spun on sched_yield() while holding the BKL and wedged the whole
+         * guest at ~8.7s (log simply stopped): one thread hammering the
+         * global lock in an infinite loop starves every other core. Same
+         * shape, same fix as sock_unix_recv's blocking path: drop the BKL,
+         * yield when this CPU has other runnable work, hlt when it does
+         * not, and only re-take the lock on the way out. */
+        bool had_bkl = bkl_held();
+        if (had_bkl) bkl_exit();
+#define RTSTW_RET(v) do { if (had_bkl) bkl_enter(); return (v); } while (0)
+        for (;;) {
+            /* Accept any pending signal that the caller asked to wait for.
+             * Linux DEQUEUES it (it is consumed here, not delivered to a
+             * handler), so clear the bit before returning the number. */
+            uint64_t hit = p->pending_signals & kset;
+            if (hit) {
+                int signo = 0;      /* bit index IS the signal number here */
+                for (int i = 0; i < 64; i++)
+                    if (hit & (1ull << i)) { signo = i; break; }
+                p->pending_signals &= ~(1ull << signo);
+                if (a2) {   /* siginfo_t: kernel-origin, minimal but valid */
+                    uint8_t si[128];
+                    memset(si, 0, sizeof si);
+                    *(int32_t *)&si[0] = signo;       /* si_signo */
+                    *(int32_t *)&si[8] = 0;           /* si_code = SI_USER */
+                    (void)copy_to_user((void *)(uintptr_t)a2, si, sizeof si);
+                }
+                RTSTW_RET(signo);
+            }
+            if (have_to && perf_now_ns() >= deadline)
+                RTSTW_RET(-ABI_EAGAIN);     /* Linux: EAGAIN on timeout */
+            if (p->pending_signals)         /* a signal we are NOT waiting for */
+                RTSTW_RET(EINTR_RET);
+            sti();
+            {
+                struct percpu *me_cpu = smp_this_cpu();
+                if (me_cpu &&
+                    __atomic_load_n(&me_cpu->ready_head, __ATOMIC_ACQUIRE))
+                    sched_yield();
+                else
+                    hlt();
+            }
+        }
+#undef RTSTW_RET
+    }
+    case LX_rt_tgsigqueueinfo:  /* (tgid, tid, sig, uinfo) -- re-raise to self */
+        /* The siginfo payload is advisory for our delivery path; what matters
+         * is that the signal actually reaches the thread, which is what the
+         * crash path is trying to do when it re-raises after reporting. */
         return sys_kill((int)a2, (int)a3);
 
     /* Futex: forward only the FUTEX_WAIT/WAKE low ops; private flag and
