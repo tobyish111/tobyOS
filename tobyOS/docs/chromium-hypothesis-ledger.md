@@ -4973,3 +4973,56 @@ hand-rolled replies never satisfy. Now MIT-SHM ONLY (tier 2.5 needs it),
 
 MapWindow (op=8) HAS now been observed on our server (`req c=4 op=8 seq=253`,
 window resized to 799x599) -- the first time in this arc.
+
+## Slice 91 CORRECTION: the -smp 4 freeze IS REAL. Slice 89's exoneration of
+## Path A was WRONG, and this is what blocks tier 2.5.
+
+**RETRACT slice 89's "Path A is dead: -smp 4 does NOT reproduce."** It
+reproduces. Slice 89 ran four -smp 4 sessions, saw APs doing real work in
+each, and concluded the arc was a dead end. That was sampling error: the
+freeze is INTERMITTENT, and none of those four runs hit it inside the window
+I inspected. The signature is unmistakable when it does:
+
+    [cur] pid=19 READY in clone3 for 293492 ms
+    [cur] pid=20 READY in clone3 for 293489 ms
+    ... six threads, all in clone/clone3, all ~293 s
+    [bkl] cpu0 acq=0 waits=0 wait=0Mcyc held=0Mcyc
+    [bkl] cpu1 acq=0   [bkl] cpu2 acq=0   [bkl] cpu3 acq=0
+
+**BKL acquisitions are ZERO on all four CPUs.** That is not chrome stalling;
+that is the WHOLE KERNEL wedged -- no CPU is entering a syscall body at all.
+This is slice 88's original report, verbatim, and the original handoff's
+Path A recommendation was correct.
+
+WHY IT LOOKED LIKE SOMETHING ELSE: the wedge presents downstream as the
+"wandering stall" -- chrome stops at a different X request every run
+(dri3 warning / WM detection / post-property-burst / after MapWindow),
+because whichever thread happens to be mid-clone3 when the system freezes
+determines which subsystem never finishes. Chasing the X protocol was
+chasing shadows. Two supporting facts from this run, both of which say the
+X server is INNOCENT:
+  * `[xsrv] unhandled opcode` never fired -- every request chrome sent, we
+    answered. It is not waiting on a reply we failed to send.
+  * `[xsum] c=5 seq=195 lastreq=64810ms rlen=0 pend=0 rx=0 armed=1` -- our
+    ring is EMPTY and chrome consumed every byte. It is not waiting on us.
+
+WHERE TO LOOK (the slice-87 quiesce machinery, as originally flagged):
+`cow_fork_lock_acquire` parks a forker that observes `vm_quiesce` by setting
+`state=PROC_BLOCKED` and spinning `while (vm_quiesce) pause;`. If the STW
+actor never reaches `tg_vm_resume` -- or reaches it while the sibling is
+still `on_cpu`, deferring the requeue to `sched_finish_switch` -- nothing
+ever puts that thread back on a run queue. Slice 89 added SEQ_CST fences to
+BOTH sides of that handoff (the release/acquire pair could let each side
+read the other's stale value on x86); those fences are correct and should
+stay, but they are clearly NOT SUFFICIENT.
+
+NEXT (concrete): the codebase already defends itself with timeouts in this
+exact area -- `cow_fork_lock_acquire` steals the lock after 20M spins,
+`tg_vm_quiesce` gives up waiting after 500k. **The deferred requeue has no
+such backstop.** Add one: a periodic sweep (the sched_tick heartbeat is
+already the right home -- it is the one thing still running when everything
+else is wedged) that finds any proc with `vm_quiesced && !vm_quiesce &&
+state==PROC_BLOCKED && !on_cpu` and requeues it, logging loudly. If that
+alone unfreezes the guest, the deferred-requeue path is confirmed as the
+bug and the real fix follows. Do NOT ship the sweep as the fix -- ship it as
+the instrument that proves the mechanism.
