@@ -132,15 +132,36 @@ kernel work. **Do not start Phase 1 without that measurement.** This arc has
 twice been rescued by measuring instead of assuming; the same discipline
 applies to deciding whether a tier is worth doing at all.
 
-## 6. Gate — why implementation has NOT started
+## 6. Gate — REVISED after slice 91
 
-Tier 3 changes what fills the frame buffer. Tier 2.5 is what makes a frame
-buffer exist at all, and it is **not finished**: as of slice 90 chrome
-reaches `MapWindow` but a thread still NULL-derefs (`addr=0x18`,
-`rip=0x59be96f`) before any `ShmPutImage`, so **zero SHM frames have ever
-flowed**. Building a GPU path for a pipeline that does not yet deliver a
-single frame would be building on nothing, and there would be no baseline to
-measure the result against.
+**The old gate here was "tier 2.5 must deliver a frame first". That gate is
+void: tier 2.5's premise was DISPROVEN (see
+`docs/chromium-handoff-post-slice-91.md` §3). Chromium does not present
+pixels through X — verified on a REAL X server across three flag
+configurations. So tier 3 is no longer waiting on tier 2.5.**
 
-**Order: fix the NULL deref → SHM frames flow → close tier 2.5 and re-measure
-→ take the §5 measurement → only then decide whether Phase 1 is worth it.**
+Two revisions to everything above:
+
+1. **Tier 3 may be a PRESENTATION fix, not just a rasterization one.** The
+   control showed chrome doing GLX work — `glXGetFBConfigs`,
+   `glXQueryServerString`, pbuffer create/destroy — and rendering
+   OFFSCREEN. That hints its real presentation path is GL-shaped
+   (`glXSwapBuffers`, or DRI3/Present), not MIT-SHM. If so, tier 3 could be
+   the thing that makes presentation happen AT ALL — more valuable than
+   this document originally assumed, and more work, because you need the
+   GL *presentation* path and not merely a rasterizer.
+
+2. **Phase 0 must be stricter than "does QEMU advertise VirGL".** Tier 2.5
+   died of a mechanism that was assumed available and never verified
+   end-to-end. Do not repeat that shape. Before building the DRM ioctl
+   surface, run a **control** that proves chrome, on a real system with a
+   real GPU stack, actually **PRESENTS FRAMES** through the mechanism you
+   intend to implement. That is a WSL/host experiment measured in minutes,
+   against a guest arc measured in slices.
+
+**Order now: fix the SMP freeze (tier A) → measure where frame time
+actually goes (tier B) → only then decide whether tier 3 is the answer.**
+§5's argument stands and is stronger than when written: tier 1 measured our
+display path at ~1 ms/frame and concluded frame PRODUCTION inside chrome is
+the bottleneck. Nothing has yet measured whether CPU rasterization is what
+dominates that production. Get that number before spending slices here.

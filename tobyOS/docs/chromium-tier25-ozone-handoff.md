@@ -1,10 +1,28 @@
 # Handoff: full Chromium on tobyOS — tier 2.5 headed Ozone close-out (post-slice-88)
 
-**Read this whole file before touching the arc.** It supersedes
-`docs/chromium-child-crash-handoff.md` (post-slice-87, now stale). Baseline
-commit: **`7ae1bac`** (slice 88). Long-form evidence:
-`docs/chromium-hypothesis-ledger.md` (slices 85–88) and the memory topic
-`chromium-bringup.md`.
+> # ⚠️ SUPERSEDED AND PARTLY WRONG — DO NOT WORK FROM THIS FILE
+>
+> **Read `docs/chromium-handoff-post-slice-91.md` instead.**
+>
+> This document's entire target — tier 2.5, zero-copy frames via Ozone X11
+> + MIT-SHM — was **DISPROVEN in slice 91**. Chromium does not present
+> pixels through X: measured on a REAL X server (Xvfb + xtrace, real page,
+> 90–120 s, 66 extensions `present=true`), across three flag
+> configurations including multi-process, `PutImage` and `ShmPutImage` are
+> **zero every time**. Chrome attaches an SHM segment, detaches it, and
+> renders into an offscreen GLX pbuffer. **No work in `src/xserver.c` can
+> produce the frame this document is chasing.**
+>
+> Also wrong here: §4's "Path A — fix the `-smp 4` AP arc" was retracted in
+> slice 89 and then **re-instated in slice 91** — the freeze is real and
+> intermittent, and slice 89's exoneration was sampling error.
+>
+> Kept for its evidence trail (the slice-88 root cause, the control-rig
+> method, the instrument list), which remains accurate and useful.
+
+**Historical.** Baseline commit: **`7ae1bac`** (slice 88). Long-form
+evidence: `docs/chromium-hypothesis-ledger.md` (slices 85–91) and the
+memory topic `chromium-bringup.md`.
 
 ---
 
@@ -34,7 +52,7 @@ real Chrome**. The perf arc was split into tiers; know where we are:
 |---|---|---|---|
 | **1** | Make our display path cheap | **DONE** | Frame-stage timers + in-place vectorized RGBA→ARGB swizzle adopting stbi's buffer. Decode ≈1 ms — the display path is ~free; frame *production* inside chrome is the bottleneck. |
 | **2** | Remove kernel-side serialization | **DONE** | `sched_yield`/futex BKL fast paths; `/data` moved from ATA PIO to **virtio-blk** (BKL held **94% → 1.3%** of wall clock); event-driven poll wakeups (`epoll_wait` ~13× cheaper/call). react.dev **630 → 1050 frames**. |
-| **2.5** | **Zero-copy frames** | **IN PROGRESS — you are here** | Sized at **~2.3×** (slice 68). Needs chrome to composite into memory we own = **Ozone X11 + MIT-SHM**. All infrastructure landed (slice 87); the headed bring-up wall was root-caused and mostly fixed (slice 88); **MapWindow reliability is the last gap** before wiring SHM as the default paint path. Cheap interims (device-scale-factor, screencast quality) were tested and **rejected** — no shortcut exists. |
+| **2.5** | **Zero-copy frames** | **CLOSED — PREMISE DISPROVEN (slice 91); this row is historical** | Sized at **~2.3×** (slice 68). Needs chrome to composite into memory we own = **Ozone X11 + MIT-SHM**. All infrastructure landed (slice 87); the headed bring-up wall was root-caused and mostly fixed (slice 88); **MapWindow reliability is the last gap** before wiring SHM as the default paint path. Cheap interims (device-scale-factor, screencast quality) were tested and **rejected** — no shortcut exists. |
 | **3** | Real GPU (not SwiftShader) | Not started | Comes after 2.5. Likely path: virtio-gpu / Venus or passthrough experiments; nothing designed yet. |
 | **4** | Audio | Not started | chrome currently runs with no audio backend (control shows it probing pulse and giving up cleanly). |
 
