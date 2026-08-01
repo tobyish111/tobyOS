@@ -250,6 +250,28 @@ static void x_wake_event(struct sock *s, struct x_conn *c, uint16_t seq,
     kprintf("[xsrv] wake (%s)\n", why);
 }
 
+/* Slice 90: ConfigureNotify(22). The control emits one after MapWindow and
+ * again after ConfigureWindow; Ozone will not treat its geometry as real
+ * (and so will not lay out or paint) until it sees one. */
+static void x_send_configure_notify(struct sock *s, uint16_t seq, uint32_t wid,
+                                    int16_t x, int16_t y, uint16_t w,
+                                    uint16_t h) {
+    uint8_t ev[32];
+    memset(ev, 0, 32);
+    ev[0] = 22;                 /* ConfigureNotify */
+    xput16(ev + 2, seq);
+    xput32(ev + 4, wid);        /* event window */
+    xput32(ev + 8, wid);        /* window */
+    xput32(ev + 12, 0);         /* above-sibling = None */
+    xput16(ev + 16, (uint16_t)x);
+    xput16(ev + 18, (uint16_t)y);
+    xput16(ev + 20, w);
+    xput16(ev + 22, h);
+    xput16(ev + 24, 0);         /* border-width */
+    ev[26] = 0;                 /* override-redirect */
+    x_reply(s, seq, ev, 32);
+}
+
 static int x_error(struct sock *s, uint16_t seq, uint8_t code, uint8_t minor,
                    uint32_t resid, uint8_t major) {
     uint8_t e[32];
@@ -902,6 +924,22 @@ static void handle_request(struct sock *s, struct x_conn *c,
             xput32(ev + 8, wid);
             x_reply(s, seq, ev, 32);
         }
+        /* Slice 90: VisibilityNotify BEFORE Expose, matching the control's
+         * ground-truth order (logs/control/x11wire.txt after MapWindow:
+         * MapNotify -> VisibilityNotify -> Expose -> ...). Chromium's Ozone
+         * treats an unmapped-or-obscured window as "do not paint": without
+         * this it mapped the window and then looped ChangeProperty /
+         * GetInputFocus / SendEvent forever, never issuing a single
+         * ShmPutImage. */
+        {
+            uint8_t ev[32];
+            memset(ev, 0, 32);
+            ev[0] = 15; /* VisibilityNotify */
+            xput16(ev + 2, seq);
+            xput32(ev + 4, wid);
+            ev[8] = 0;  /* VisibilityUnobscured */
+            x_reply(s, seq, ev, 32);
+        }
         /* Also expose so a client waiting on Expose starts painting. */
         {
             uint8_t ev[32];
@@ -916,6 +954,13 @@ static void handle_request(struct sock *s, struct x_conn *c,
             xput16(ev + 16, 0); /* count */
             x_reply(s, seq, ev, 32);
         }
+        /* ConfigureNotify: the control emits one for the mapped frame (the
+         * WM's final geometry). Ozone needs it to accept the window's size
+         * as real before it will lay out and paint. */
+        x_send_configure_notify(s, seq, wid,
+                                win ? win->x : 0, win ? win->y : 0,
+                                win ? win->w : (uint16_t)g_xf_w,
+                                win ? win->h : (uint16_t)g_xf_h);
         return;
     }
     case 10: { /* UnmapWindow */
@@ -1162,9 +1207,81 @@ static void handle_request(struct sock *s, struct x_conn *c,
         x_reply32(s, seq, rep);
         return;
     }
-    case 42: /* SetInputFocus */
-        c->focus = xget32(req + 4);
+    case 25: { /* SendEvent -- EWMH client->WM requests (slice 90) */
+        /* There was NO handler for this at all: it fell through to
+         * "unhandled opcode (ignored)". Chromium does not call SetInputFocus
+         * to activate its frame -- it asks the WINDOW MANAGER to, by
+         * SendEvent'ing a _NET_ACTIVE_WINDOW ClientMessage at the root. With
+         * nobody playing WM, the request vanished and chrome sat in a
+         * ChangeProperty / GetInputFocus / SendEvent retry loop forever,
+         * never painting. We are the server AND the WM here, so honour it.
+         *
+         * Wire: [0]=25 [1]=propagate [2..3]=len [4..7]=destination
+         *       [8..11]=event-mask [12..43]=the 32-byte event.
+         * Embedded ClientMessage: [0]=33 [4..7]=window [8..11]=type atom. */
+        if (req_bytes < 44) return;
+        const uint8_t *iev = req + 12;
+        if (iev[0] != 33 /* ClientMessage */) return;
+        uint32_t target = xget32(iev + 4);
+        uint32_t mtype  = xget32(iev + 8);
+        const char *mname = atom_name(mtype);
+        kprintf("[xsrv] SendEvent ClientMessage type=%u(%s) target=0x%x\n",
+                mtype, mname ? mname : "?", target);
+        if (mname && !strcmp(mname, "_NET_ACTIVE_WINDOW") && target) {
+            struct x_win *tw = win_find(c, target);
+            c->focus = target;
+            /* Act as the WM would: raise, confirm geometry, hand it focus. */
+            x_send_configure_notify(s, seq, target,
+                                    tw ? tw->x : 0, tw ? tw->y : 0,
+                                    tw ? tw->w : (uint16_t)g_xf_w,
+                                    tw ? tw->h : (uint16_t)g_xf_h);
+            uint8_t ev[32];
+            memset(ev, 0, 32);
+            ev[0] = 9;              /* FocusIn */
+            ev[1] = 3;              /* detail = Nonlinear */
+            xput16(ev + 2, seq);
+            xput32(ev + 4, target);
+            ev[8] = 0;              /* mode = Normal */
+            x_reply(s, seq, ev, 32);
+            /* Publish the EWMH state chrome polls for confirmation. */
+            prop_set(XSRV_ROOT_ID, atom_ensure("_NET_ACTIVE_WINDOW"),
+                     XA_WINDOW, 32, &target, 4);
+            memset(ev, 0, 32);
+            ev[0] = 28;             /* PropertyNotify on root */
+            xput16(ev + 2, seq);
+            xput32(ev + 4, XSRV_ROOT_ID);
+            xput32(ev + 8, atom_ensure("_NET_ACTIVE_WINDOW"));
+            x_reply(s, seq, ev, 32);
+        }
         return;
+    }
+    case 42: { /* SetInputFocus */
+        c->focus = xget32(req + 4);
+        /* Slice 90: the control answers SetInputFocus with FocusOut then
+         * FocusIn. Ozone gates "this window is active" on FocusIn, and an
+         * inactive window is one it will not paint -- which is why the
+         * post-MapWindow loop kept re-asking (GetInputFocus / SendEvent)
+         * instead of ever reaching ShmPutImage. */
+        if (c->focus && c->focus != XSRV_ROOT_ID) {
+            uint8_t ev[32];
+            memset(ev, 0, 32);
+            ev[0] = 10;             /* FocusOut */
+            ev[1] = 5;              /* detail = Pointer */
+            xput16(ev + 2, seq);
+            xput32(ev + 4, c->focus);
+            ev[8] = 0;              /* mode = Normal */
+            x_reply(s, seq, ev, 32);
+
+            memset(ev, 0, 32);
+            ev[0] = 9;              /* FocusIn */
+            ev[1] = 3;              /* detail = Nonlinear */
+            xput16(ev + 2, seq);
+            xput32(ev + 4, c->focus);
+            ev[8] = 0;              /* mode = Normal */
+            x_reply(s, seq, ev, 32);
+        }
+        return;
+    }
     case 43: { /* GetInputFocus */
         rep[0] = 1; rep[1] = 1; /* revert-to Parent */
         xput16(rep + 2, seq);
