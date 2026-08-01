@@ -1429,8 +1429,20 @@ void xserver_on_poll(struct sock *self) {
     uint64_t gap = self->count ? 500u : 100u;
     if (last_poke_ms[idx] && now - last_poke_ms[idx] < gap)
         return;
-    if (self->count >= 8)
+    if (self->count >= 8) {
+        /* Tier 2.5: if the client really is blocked in recvmsg on THIS
+         * conn, suppressing the poke here would wedge it forever -- a
+         * blocked reader cannot drain the ring that gates its own wake.
+         * Log once so a silent stall can be attributed. */
+        static uint8_t muted[SOCK_MAX];
+        int mi = sock_idx(self);
+        if (mi >= 0 && !muted[mi]) {
+            muted[mi] = 1;
+            kprintf("[xsrv] poke MUTED sock=%d count=%u (unread ring)\n",
+                    mi, (unsigned)self->count);
+        }
         return; /* don't flood a stuck non-reader */
+    }
     last_poke_ms[idx] = now;
     x_wake_event(self, c, c->seq, "poll-idle");
 }
@@ -1438,6 +1450,23 @@ void xserver_on_poll(struct sock *self) {
 void xserver_tick(void) {
     /* recvmsg waiters never enter poll — poke from the idle heartbeat. */
     sock_foreach_xserver(xserver_on_poll);
+}
+
+/* Tier 2.5 headed wall: called from the [uxstuck] probe (socket.c) when a
+ * blocking recvmsg on a fake-X socket has waited >5s with an empty ring.
+ * Prints exactly why the idle-wake machinery is not poking this conn --
+ * every gate in xserver_on_poll is reproduced here as data. */
+void xserver_debug_conn(struct sock *self) {
+    int idx = sock_idx(self);
+    if (idx < 0) { kprintf("[xdbg] no idx\n"); return; }
+    struct x_conn *c = &g_xconn[idx];
+    kprintf("[xdbg] sock=%d active=%u seq=%u rlen=%u pend_n=%u armed=%u "
+            "count=%u setup=%u\n",
+            idx, c->active, c->seq, c->rlen, c->pend_n, c->idle_wake_armed,
+            (unsigned)self->count, (unsigned)self->x_setup_done);
+    if (c->rlen >= 4)
+        kprintf("[xdbg]   rbuf[0..3]=%u,%u,%u,%u (op,pad,len16lo,len16hi)\n",
+                c->rbuf[0], c->rbuf[1], c->rbuf[2], c->rbuf[3]);
 }
 
 long xserver_handle(struct sock *self, const void *buf, size_t n) {

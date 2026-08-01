@@ -432,7 +432,38 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
         uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
         deadline = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
     }
+#ifdef CHROMIUM_BOOT
+    /* Tier 2.5 headed wall: pid 3 sits "READY in recvmsg" for minutes and
+     * the [cur] stamp cannot say ON WHICH SOCKET. Name it: log once per
+     * caller after ~5s of fruitless blocking wait -- socket slot, whether
+     * it is the fake-X endpoint, ring depth, peer. This one line decides
+     * between "chromium waits for an X reply we never produced" and
+     * "chromium waits on a Mojo channel", which are entirely different
+     * bugs. */
+    uint64_t stuck_at = 0;
+    {
+        uint32_t hz2 = pit_hz(); if (hz2 == 0) hz2 = 100;
+        stuck_at = pit_ticks() + (uint64_t)hz2 * 5u;
+    }
+    bool stuck_logged = false;
+#endif
     while (self->count == 0) {
+#ifdef CHROMIUM_BOOT
+        if (!stuck_logged && pit_ticks() >= stuck_at) {
+            stuck_logged = true;
+            struct proc *sp = current_proc();
+            kprintf("[uxstuck] pid=%d sock=%d xsrv=%d count=%u peer=%d "
+                    "want=%u to=%u\n",
+                    sp ? sp->pid : -1, sock_index(self),
+                    (int)self->x_server, (unsigned)self->count,
+                    self->peer_ip ? (int)self->peer_ip - 1 : -1,
+                    (unsigned)n, (unsigned)timeout_ms);
+            if (self->x_server) {
+                extern void xserver_debug_conn(struct sock *s);
+                xserver_debug_conn(self);
+            }
+        }
+#endif
         struct proc *me = current_proc();
         if (me->pending_signals) return EINTR_RET;
         if (!self->in_use)       return -1;

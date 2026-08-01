@@ -5162,6 +5162,32 @@ static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
         if (nready > 0 || timeout_ms == 0 ||
             (!infinite && perf_now_ns() >= deadline)) {
 #ifdef CHROMIUM_BOOT
+            /* Slice 88: the headed UI thread poll(2)-times-out every 500ms
+             * while its X socket sits at count=8 unread events ([xsrv] poke
+             * MUTED). Decide between "the X fd is not in the caller's poll
+             * set" and "it is, but the readiness predicate lies": on a
+             * ZERO-ready timeout, if ANY fd in the set is an x_server sock
+             * with data queued, that is the predicate lying -- log it. If
+             * this never fires while the mute persists, the fd is absent
+             * from the set and the bug is in chrome's watcher registration
+             * (or an fd we handed out wrong). */
+            if (nready == 0 && timeout_ms != 0) {
+                static int xp = 0;
+                for (unsigned long i = 0; xp < 24 && i < nfds; i++) {
+                    if (fds[i].fd < 0) continue;
+                    struct file *xf = fd_lookup(fds[i].fd);
+                    if (xf && xf->kind == FILE_KIND_SOCKET && xf->sock &&
+                        xf->sock->x_server && xf->sock->count > 0) {
+                        xp++;
+                        kprintf("[xpoll] pid=%d fd=%d XSRV count=%u events=0x%x "
+                                "cond=0x%x -> NOT READY?!\n",
+                                self ? self->pid : -1, fds[i].fd,
+                                (unsigned)xf->sock->count,
+                                (unsigned)fds[i].events,
+                                (unsigned)file_poll_ready(xf));
+                    }
+                }
+            }
             /* Slice 56: finite-timeout poll(2) overshoot (see [eplate]). */
             if (!infinite && timeout_ms > 0) {
                 uint64_t act = perf_now_ns() - po_start;
@@ -6626,8 +6652,20 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
         /* AF_UNIX stream: libxcb reads the X setup + events via recvmsg (this was
          * the wall -- ENOTSOCK here made xcb_connect() report XCB_CONN_ERROR even
          * though the writev'd request + our fake-X reply were fine). MSG_DONTWAIT
-         * (0x40) -> non-blocking poll; otherwise block like read(). */
-        uint32_t to = (flags & 0x40) ? 1u : 0u;
+         * (0x40) -> non-blocking poll; otherwise block like read().
+         *
+         * Slice 88 -- THE HEADED OZONE WALL. This branch honoured ONLY
+         * MSG_DONTWAIT and ignored s->nonblock (the fd's O_NONBLOCK), unlike
+         * lx_recv and the UDP branch above. Chromium's X socket is O_NONBLOCK
+         * and its UI-thread pump reads until EAGAIN with flags=0 -- so the
+         * first read on an empty ring parked the UI thread in a FOREVER
+         * blocking wait ([uxstuck] pid=3 sock=4 xsrv=1 count=0 to=0, "READY
+         * in recvmsg" for 173s). Every downstream symptom -- no MapWindow, no
+         * browser window, Target.createTarget never answering -- was this
+         * one missing flag check. Mojo never tripped it because its channel
+         * reads pass MSG_DONTWAIT explicitly. */
+        bool nowait = s->nonblock || (flags & 0x40) != 0;
+        uint32_t to = nowait ? 1u : 0u;
         n = sock_unix_recv_fds(s, k, total, to, scm_files, SOCK_SCM_MAX_FDS,
                                &scm_n);
         if (n == EINTR_RET)            { kfree(k); return -LXE_EINTR; }
@@ -6640,7 +6678,7 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
          * endlessly instead of pumping messages (the renderer then never
          * completed a document load). Linux returns 0 at EOF even for
          * MSG_DONTWAIT; match the poll predicate exactly. */
-        if (n == 0 && (flags & 0x40)) {
+        if (n == 0 && nowait) {   /* slice 88: O_NONBLOCK too, not just DONTWAIT */
             bool at_eof = (s->peer_ip == 0 && s->count == 0 && !s->x_server);
             if (!at_eof) { kfree(k); return -LXE_EAGAIN; }
         }

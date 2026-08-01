@@ -626,6 +626,7 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
 
         /* Wake up to `val` waiters */
         int woken = 0;
+        bool handoff = false;
         while (e->waiters && (uint32_t)woken < val) {
             struct proc *w = e->waiters;
             e->waiters = w->next_wait;
@@ -633,6 +634,28 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
             w->futex_deadline_ns = 0;     /* woken by wake, not timeout */
 #ifdef CHROMIUM_BOOT
             w->fx_wake_ns = perf_now_ns();
+#endif
+            /* Slice 88: STARVED-WAITER HANDOFF. A glibc mutex unlock is
+             * FUTEX_WAKE val=1; on Linux the woken thread soon preempts the
+             * waker and takes the free lock. Here the waker kept the CPU,
+             * re-acquired the mutex within microseconds, and the waiter
+             * found it locked EVERY time it ran -- chrome's UI thread lost
+             * this race against a busy worker for 3+ MINUTES straight
+             * (130 wake/wait ping-pongs on one address, browser window
+             * never created). If the waiter has already been parked >20ms,
+             * yield to it while the lock is still free -- i.e. right now,
+             * before the waker can return to userspace and retake it.
+             * Gated on val==1 (mutex unlock shape, not cv broadcast) and
+             * on real starvation, so hot uncontended wake paths keep their
+             * tier-2 cost. */
+#ifdef CHROMIUM_BOOT
+            /* Threshold history: 20ms let chrome's UI thread keep losing --
+             * the observed ping-pong re-waits every ~15ms, so no cycle ever
+             * qualified and progress came only from scheduling luck (window
+             * creation lurched 12s -> 17s -> stall). 5ms catches it. */
+            if (val == 1 && w->fx_park_ns &&
+                w->fx_wake_ns - w->fx_park_ns > 5000000ull)
+                handoff = true;
 #endif
             w->state = PROC_READY;
             sched_enqueue(w);
@@ -643,6 +666,12 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
         if (!e->waiters) futex_free_entry(e);
 
         spin_unlock_irqrestore(&g_futex_lock, flags);
+        if (handoff) {
+            bool had_bkl = bkl_held();
+            if (had_bkl) bkl_exit();      /* never yield holding the BKL */
+            sched_yield();
+            if (had_bkl) bkl_enter();
+        }
         return woken;
     }
 

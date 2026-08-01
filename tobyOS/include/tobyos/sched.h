@@ -54,7 +54,18 @@ struct regs;
  * IDLE proc to eventually out-rank a running RT proc, which bounds worst-case
  * wait. (Validated: 3 HIGH vs 3 LOW CPU-bound workers on 4 cores -> HIGH ~18x
  * the CPU of LOW, yet every LOW proc still made progress: no starvation.) */
+#ifdef CHROMIUM_BOOT
+/* Slice 88: 50ms slices starved chrome's UI thread on 1 CPU -- a busy
+ * worker legally kept the core 50ms at a stretch, and every contended
+ * mutex became a lottery the UI thread kept losing (browser window
+ * creation lurched 12s -> 17s -> never). Linux desktop schedulers
+ * preempt at 1-6ms; 1 LAPIC tick (10ms) is our floor at 100Hz and
+ * makes chrome's ~40-thread pipeline interleave like it expects.
+ * ~100 switches/s of overhead is noise. */
+#define SCHED_QUANTUM_BASE     1    /* LAPIC ticks for NORMAL (~10 ms @100Hz)   */
+#else
 #define SCHED_QUANTUM_BASE     5    /* LAPIC ticks for NORMAL (~50 ms @100Hz)   */
+#endif
 #define SCHED_AGE_STEP_TICKS  60    /* +1 effective level per ~60 ms waiting     */
 #define SCHED_AGE_MAX_BOOST    5    /* PRIO_MAX-PRIO_MIN+1: can lift IDLE>RT     */
 #define SCHED_IO_BOOST         2    /* interactivity bonus: one priority class   */

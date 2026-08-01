@@ -688,6 +688,35 @@ void sched_yield(void) {
      * tick, which is fine. */
     if (cur && cur->state == PROC_RUNNING &&
         __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE) == 0) {
+        /* Slice 88: this early return used to skip the futex-timeout sweep
+         * and poll_tick ENTIRELY -- they were only driven from the slow
+         * path below and from sched_yield_fast's decline window. That held
+         * as long as something kept the ready queue busy; the moment the
+         * system settles into "everyone parked in futex WAIT, each waiter
+         * looping sched_yield on an empty queue", every yield takes THIS
+         * path and the wake machinery starves. Observed the moment the
+         * slice-88 wake handoff resolved chrome's mutex ping-pong: [tick]
+         * fxsweep froze at 2681 for 2+ minutes and six worker threads sat
+         * 110s past their 60s futex deadlines. Drive the same rate-limited
+         * sweeps here; both are cheap and correctly locked for this
+         * context (sweep: g_futex_lock only; poll_tick: BKL, gated). */
+        static uint64_t last_idle_sweep;
+        uint64_t idlens = perf_now_ns();
+        if (idlens - last_idle_sweep >= 10000000ull) {   /* 10 ms */
+            last_idle_sweep = idlens;
+            extern void futex_expire_timeouts(void);
+            futex_expire_timeouts();
+            /* poll_tick needs the BKL. Under load every yield can be
+             * BKL-less (futex park loops drop it first) and pid 0 -- the
+             * other driver -- never runs while chrome threads are READY,
+             * so gating on holds_bkl starved poll_tick outright ([tick]
+             * polltick frozen at 322 for 2 minutes while fxsweep ran).
+             * Take the lock briefly at this 10ms cadence instead: the
+             * yield path holds no other locks, so this is a safe spot. */
+            extern void poll_tick(void);
+            if (me->holds_bkl) { poll_tick(); }
+            else { bkl_enter(); poll_tick(); bkl_exit(); }
+        }
         /* Slice 39: do NOT keep the BKL across the fast path. An infinite
          * in-syscall wait loop -- lx_do_poll(timeout=-1) spinning `check
          * fds; sched_yield()` on an AP whose local queue is always empty

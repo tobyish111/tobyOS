@@ -78,8 +78,12 @@ def main():
            "-netdev", "user,id=net0",
            "-device", "e1000,netdev=net0,mac=52:54:00:12:34:56",
            "-accel", "whpx,kernel-irqchip=off",
-           # Tier 2.5 bring-up: 1 vCPU avoids stale-TLB CoW races across APs
-           # while headed Ozone is validated; restore 4 once STW is airtight.
+           # Slice 88: -smp 4 was tried once the wake-handoff landed and
+           # froze at 7.6s: a dozen threads READY in clone/clone3 for 232s
+           # with ZERO BKL acquisitions on cpu1-3 -- the APs never ran the
+           # work; likely the slice-87 quiesce/deferred-requeue interacting
+           # with AP queues. Separate arc. 1 vCPU + wake handoff + idle-path
+           # sweeps is the supported tier-2.5 config.
            "-smp", "1", "-m", "8192", "-cpu", "qemu64,+smep,+smap",
            "-serial", "file:" + SERIAL,
            "-qmp", "tcp:127.0.0.1:%d,server,nowait" % PORT,

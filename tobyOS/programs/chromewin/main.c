@@ -739,11 +739,13 @@ static int spawn_chrome(void) {
         char *argv[] = {
 #ifdef CHROME_FULL
             (char *)"/opt/chrome/chrome",
-            /* Full-chrome stability/measure: headless ozone answers CDP.
-             * Headed --ozone-platform=x11 still parks UI on futex after
-             * Displays updated (no browser MapWindow); X11+MIT-SHM code
-             * remains in xserver.c for the next unblock. */
-            (char *)"--ozone-platform=headless",
+            /* Tier 2.5 close-out: HEADED ozone. The control trace
+             * (logs/control_x11trace.sh) proves this exact flag set reaches
+             * CreateWindow(780x580 InputOutput)+MapWindow on a real X
+             * server, so whatever stops it here is a gap in xserver.c --
+             * the [xsrv] log of the last answered/unhandled request is the
+             * divergence point. */
+            (char *)"--ozone-platform=x11",
             (char *)"--enable-features=UseOzonePlatform,NetworkServiceInProcess",
 #else
             (char *)"/opt/chrome/chrome-headless-shell",
@@ -773,6 +775,15 @@ static int spawn_chrome(void) {
             (char *)"--no-default-browser-check",
             (char *)"--disable-component-update",
             (char *)"--enable-logging=stderr",
+#ifdef CHROME_FULL
+            /* Tier 2.5 headed diagnosis: chromium's own X binding layer
+             * (ui/gfx/x/connection.cc) logs sequence-tracking and parse
+             * errors at vlevel 2-3 -- if our fake server's reply framing
+             * desyncs it, THIS names the request. ui/views + aura say how
+             * far BrowserFrame init got. */
+            (char *)"--vmodule=*/ui/gfx/x/*=3,*/ui/base/x/*=2,*/ui/ozone/*=2,"
+                    "*/ui/views/widget/*=2,*/ui/aura/*=1,*/chrome/browser/ui/views/frame/*=2",
+#endif
 #ifdef CHROME_FULL
             /* Slice 70: the full binary exits 191 after its Mojo handshake
              * with nothing on stderr at the default level. Chrome names its

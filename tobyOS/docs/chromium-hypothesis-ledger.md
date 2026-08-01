@@ -4826,3 +4826,62 @@ Tier 2.5 (Ozone X11 + MIT-SHM) infra landed; **not DONE** — see handoff §4.
   alongside the CoW window. tlb ERROR counts also returned on that run
   (post-panic / dying tree); treat as contaminated, re-measure after the
   kstack guard.
+
+## Slice 88: headed Ozone X11 -- the recvmsg O_NONBLOCK bug (UI thread parked
+## forever) + three scheduler-fairness fixes. Browser window + full WM
+## property suite + navigation now happen; MapWindow still not reliable.
+
+Method: WSL control rig upgraded with Xvfb + xtrace over TCP displays
+(/tmp/.X11-unix is read-only under WSLg). control_x11trace.sh captures the
+full X wire protocol of the SAME chrome + flag set on a real server --
+the ground-truth request sequence for xserver.c. Two control experiments
+eliminated whole theory families in minutes: --denyextensions (chrome maps
+its window with ZERO extensions => our sparse extension surface is fine)
+and dbus-dead env (chrome maps without any bus => dbus exonerated).
+
+THE HEADED WALL (found via [uxstuck] + [xdbg] probes):
+  lx_recvmsg's AF_UNIX branch honoured only MSG_DONTWAIT and IGNORED
+  s->nonblock -- unlike lx_recv and the UDP branch right above it.
+  Chromium's X socket is O_NONBLOCK and its UI pump reads until EAGAIN
+  with flags=0: the first read on an empty ring became a FOREVER blocking
+  wait ([uxstuck] pid=3 sock=4 xsrv=1 count=0 to=0; "READY in recvmsg" for
+  173s). Mojo never tripped it because its channel reads pass MSG_DONTWAIT
+  explicitly. Two-line fix.
+
+FAIRNESS FIXES the unblock then exposed (all 1-vCPU):
+  1. Futex wake handoff: FUTEX_WAKE enqueued the waiter and let the waker
+     keep the CPU; the waker re-acquired the mutex within microseconds and
+     the woken thread lost EVERY retry -- chrome's UI thread lost one mutex
+     to a busy worker for 3+ minutes (130 wake/wait ping-pongs). Now a
+     val==1 wake whose waiter already waited >5ms yields to it while the
+     lock is still free (20ms first -- too high, the ping-pong re-waits
+     every ~15ms and never qualified).
+  2. sched_yield's early-return path (RUNNING + empty queue) skipped the
+     futex-timeout sweep + poll_tick entirely; once the handoff calmed the
+     system into that path, [tick] fxsweep froze for 2+ minutes and six
+     workers sat 110s past their 60s futex deadlines. The early path now
+     drives both at the same 10ms cadence (taking the BKL briefly for
+     poll_tick when the yielder does not hold it).
+  3. SCHED_QUANTUM_BASE 5 -> 1 under CHROMIUM_BOOT (50ms -> 10ms NORMAL
+     slice): 50ms legal monopolies made every contended interaction a
+     lottery. (polltick=<n> in [tick] counts WAKES PERFORMED, not runs --
+     do not re-diagnose a frozen counter as a dead driver without checking
+     which it counts. That mistake cost one build cycle here.)
+
+RESULT: browser frame window created (799x599), FULL WM property suite set
+(WM_PROTOCOLS/WM_CLASS/_NET_WM_PID/64KB _NET_WM_ICON burst), WM_NORMAL_HINTS
+readback, AddKeepAlive(kBrowserWindow), navigation started ("URL to scan",
+omnibox lines) -- none of which EVER happened before this slice. STILL OPEN:
+MapWindow (op=8) not yet observed; the stall now WANDERS run to run
+(dri3 warning / WM detection / post-props) -- the remaining shape is 1-vCPU
+scheduling timing, not a single missing feature.
+
+-smp 4 TRIED AND PARKED: froze at 7.6s with a dozen threads READY in
+clone/clone3 for 232s and ZERO BKL acquisitions on cpu1-3 -- the slice-87
+quiesce/deferred-requeue vs AP queues family. Separate arc; run_watch.py
+documents it and stays at -smp 1.
+
+New instruments that should outlive this slice: [uxstuck] (blocking UNIX
+recv >5s names its socket + x_server flag), [xdbg] (x_conn gates dump),
+[xpoll] (poll timeout with a readable-but-unreported X fd), poke MUTED
+(wake flood guard visibility), control_x11trace/x11deny/x11nodbus/x11vmod.
