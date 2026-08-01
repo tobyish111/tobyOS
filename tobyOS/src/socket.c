@@ -23,6 +23,7 @@
 #include <tobyos/pit.h>
 #include <tobyos/percpu.h>   /* slice 56: yield-if-ready in the recv wait loop */
 #include <tobyos/smp.h>
+#include <tobyos/xserver.h>  /* tier 2.5 fake X protocol */
 
 static struct sock g_socks[SOCK_MAX];
 static uint16_t    g_next_ephemeral = 33000;
@@ -217,7 +218,7 @@ void sock_deliver(struct sock *s,
     if (s->count == SOCK_RX_DGRAMS) {
         struct sock_dgram *old = &s->dgrams[s->tail];
         if (old->payload) { kfree(old->payload); old->payload = 0; }
-        s->tail = (uint8_t)((s->tail + 1) % SOCK_RX_DGRAMS);
+        s->tail = (uint16_t)((s->tail + 1) % SOCK_RX_DGRAMS);
         s->count--;
         s->dropped++;
     }
@@ -231,7 +232,7 @@ void sock_deliver(struct sock *s,
     d->src_port = src_port_be;
     d->len      = (uint32_t)len;
     d->payload  = copy;
-    s->head = (uint8_t)((s->head + 1) % SOCK_RX_DGRAMS);
+    s->head = (uint16_t)((s->head + 1) % SOCK_RX_DGRAMS);
     s->count++;
 
     wq_wake_all(&s->wq_recv);
@@ -303,7 +304,7 @@ static int unix_enqueue_fds(struct sock *s, const void *payload, size_t len,
         d->chksum = h; }
 #endif
     for (int i = 0; i < nfiles; i++) d->fds[d->nfds++] = files[i];
-    s->head = (uint8_t)((s->head + 1) % SOCK_RX_DGRAMS);
+    s->head = (uint16_t)((s->head + 1) % SOCK_RX_DGRAMS);
     s->count++;
     wq_wake_all(&s->wq_recv);
     return 0;
@@ -313,7 +314,24 @@ static void unix_enqueue(struct sock *s, const void *payload, size_t len) {
     unix_enqueue_fds(s, payload, len, 0, 0);
 }
 
-static long xserver_handle(struct sock *self, const void *buf, size_t n);
+int sock_unix_enqueue(struct sock *s, const void *payload, size_t len) {
+    return unix_enqueue_fds(s, payload, len, 0, 0);
+}
+
+void sock_foreach_xserver(void (*cb)(struct sock *s)) {
+    if (!cb) return;
+    for (int i = 0; i < SOCK_MAX; i++) {
+        if (g_socks[i].in_use && g_socks[i].x_server)
+            cb(&g_socks[i]);
+    }
+}
+
+int sock_pool_index(const struct sock *s) {
+    if (!s) return -1;
+    int i = (int)(s - g_socks);
+    if (i < 0 || i >= SOCK_MAX) return -1;
+    return i;
+}
 
 long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
                         struct file **files, int nfiles) {
@@ -363,7 +381,12 @@ long sock_unix_send(struct sock *self, const void *kbuf, size_t n) {
  * file_poll_ready uses this so POLLOUT reflects real writability -- returning
  * POLLOUT while the peer ring is full is what let chrome overrun it. */
 bool sock_unix_send_would_block(struct sock *self) {
-    if (!self || self->kind != SOCK_KIND_UNIX || !self->peer_ip) return false;
+    if (!self || self->kind != SOCK_KIND_UNIX) return false;
+    /* Fake X: replies land on the same sock the client writes to. Leave
+     * headroom so a write mid-InternAtom-storm can still enqueue replies. */
+    if (self->x_server)
+        return self->count + 8 >= SOCK_RX_DGRAMS;
+    if (!self->peer_ip) return false;
     struct sock *peer = sock_by_fd((int)self->peer_ip - 1);
     return peer && peer->in_use && peer->count >= SOCK_RX_DGRAMS;
 }
@@ -416,12 +439,21 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
         if (self->peer_ip == 0 && !self->x_server)
             return 0;                            /* peer closed + drained -> EOF */
         if (deadline && pit_ticks() >= deadline) return 0;   /* timed out */
-        /* Cooperative wait: drop the BKL so the peer thread can run + deliver
-         * (unix_enqueue wakes wq_recv), idle, then re-check. */
+        /* Cooperative wait: drop the BKL so peers/siblings can run. On UP,
+         * a bare hlt returns to THIS context after the IRQ — READY clone3
+         * threads never ran (chrome stuck: pid=3 RUNNING in recvmsg 50s+
+         * while dozens of threads sat READY in clone3). Cede the core when
+         * the ready queue is non-empty; hlt only when truly idle. */
         bool had_bkl = bkl_held();
         if (had_bkl) bkl_exit();
         sti();
-        hlt();
+        {
+            struct percpu *me_cpu = smp_this_cpu();
+            if (me_cpu && __atomic_load_n(&me_cpu->ready_head, __ATOMIC_ACQUIRE))
+                sched_yield();
+            else
+                hlt();
+        }
         if (had_bkl) bkl_enter();
     }
 
@@ -476,9 +508,12 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
     self->tail_off = (uint32_t)(self->tail_off + copy);
     if (self->tail_off >= d->len) {              /* fully consumed -> advance */
         if (d->payload) { kfree(d->payload); d->payload = 0; }
-        self->tail = (uint8_t)((self->tail + 1) % SOCK_RX_DGRAMS);
+        self->tail = (uint16_t)((self->tail + 1) % SOCK_RX_DGRAMS);
         self->count--;
         self->tail_off = 0;
+        /* Tier 2.5: after chrome drains an X reply, finish requests that were
+         * parked because the RX ring was full (InternAtom storms). */
+        if (self->x_server) xserver_pump(self);
     }
     return (long)copy;
 }
@@ -518,112 +553,7 @@ void sock_unix_peer_close(struct sock *self) {
     }
 }
 
-/* ---- in-kernel fake X server (headless xcb_connect) ---------------- *
- * ANGLE's Vulkan backend picks DisplayVkXcb on Linux and, after passing the WSI
- * extension check, calls xcb_connect(). Headless tobyOS has no X server, so
- * xcb_connect() fails (XCB_CONN_ERROR) -> ANGLE Display::initialize fails ->
- * eglInitialize fails -> chrome calls a NULL GL dispatch and crashes. We do NOT
- * need a real X server: chrome is --dump-dom / headless and never opens a
- * window -- we only need the xcb_connect() HANDSHAKE to succeed. So a socket
- * that connects to the X server address becomes an `x_server` loopback: when
- * the client writes its xConnClientPrefix we reply with an xConnSetupSuccess
- * advertising one 24-bit TrueColor screen/visual, which is all xcb_connect +
- * DisplayVkXcb::initialize need (they then read the cached setup, no further
- * round-trips). Anything the client writes afterwards is absorbed. */
-
-static inline void xput16(uint8_t *p, uint16_t v){ p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); }
-static inline void xput32(uint8_t *p, uint32_t v){
-    p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24);
-}
-
-#define XSRV_ROOT_ID    0x0000002bu
-#define XSRV_CMAP_ID    0x00000020u
-#define XSRV_VISUAL_ID  0x00000021u
-
-/* Build an X11 connection-setup "Success" reply (little-endian; chrome is x86,
- * byteOrder 'l'). Returns the total byte length written, or 0 if it won't fit. */
-static size_t xserver_build_setup(uint8_t *o, size_t cap) {
-    const uint8_t nformats = 1, nscreens = 1, ndepths = 1, nvisuals = 1;
-    size_t body  = 32 + 8u*nformats + 40u*nscreens + 8u*ndepths + 24u*nvisuals;
-    size_t total = 8 + body;
-    if (total > cap) return 0;
-    memset(o, 0, total);
-    size_t i = 0;
-    /* xConnSetupPrefix (8) */
-    o[i++] = 1;                              /* success */
-    o[i++] = 0;                              /* lengthReason */
-    xput16(o+i, 11); i += 2;                 /* protocol-major-version */
-    xput16(o+i, 0);  i += 2;                 /* protocol-minor-version */
-    xput16(o+i, (uint16_t)(body/4)); i += 2; /* length of the data below, in 4-byte units */
-    /* xConnSetup (32) */
-    xput32(o+i, 0);            i += 4;        /* release-number */
-    xput32(o+i, XSRV_ROOT_ID+1); i += 4;     /* resource-id-base */
-    xput32(o+i, 0x001fffff);  i += 4;        /* resource-id-mask */
-    xput32(o+i, 0);           i += 4;        /* motion-buffer-size */
-    xput16(o+i, 0);           i += 2;        /* length of vendor (none) */
-    xput16(o+i, 0xffff);      i += 2;        /* maximum-request-length */
-    o[i++] = nscreens;                       /* number of SCREENs in roots */
-    o[i++] = nformats;                       /* number of pixmap FORMATs */
-    o[i++] = 0;                              /* image-byte-order = LSBFirst */
-    o[i++] = 0;                              /* bitmap-format-bit-order = LeastSignificant */
-    o[i++] = 32;                             /* bitmap-format-scanline-unit */
-    o[i++] = 32;                             /* bitmap-format-scanline-pad */
-    o[i++] = 8;                              /* min-keycode (must be >= 8) */
-    o[i++] = 255;                            /* max-keycode */
-    xput32(o+i, 0); i += 4;                  /* pad */
-    /* pixmap FORMAT (8): 24-bit depth, 32 bpp */
-    o[i++] = 24; o[i++] = 32; o[i++] = 32;   /* depth, bits-per-pixel, scanline-pad */
-    i += 5;                                  /* pad[5] */
-    /* SCREEN (40) */
-    xput32(o+i, XSRV_ROOT_ID);  i += 4;      /* root window */
-    xput32(o+i, XSRV_CMAP_ID);  i += 4;      /* default-colormap */
-    xput32(o+i, 0x00ffffff);    i += 4;      /* white-pixel */
-    xput32(o+i, 0x00000000);    i += 4;      /* black-pixel */
-    xput32(o+i, 0);             i += 4;      /* current-input-masks */
-    xput16(o+i, 1024); i += 2;               /* width-in-pixels */
-    xput16(o+i, 768);  i += 2;               /* height-in-pixels */
-    xput16(o+i, 270);  i += 2;               /* width-in-millimeters */
-    xput16(o+i, 203);  i += 2;               /* height-in-millimeters */
-    xput16(o+i, 1);    i += 2;               /* min-installed-maps */
-    xput16(o+i, 1);    i += 2;               /* max-installed-maps */
-    xput32(o+i, XSRV_VISUAL_ID); i += 4;     /* root-visual */
-    o[i++] = 0;                              /* backing-stores = Never */
-    o[i++] = 0;                              /* save-unders = False */
-    o[i++] = 24;                             /* root-depth */
-    o[i++] = ndepths;                        /* number of DEPTHs in allowed-depths */
-    /* DEPTH (8) */
-    o[i++] = 24;                             /* depth */
-    o[i++] = 0;                              /* pad */
-    xput16(o+i, nvisuals); i += 2;           /* number of VISUALTYPEs */
-    i += 4;                                  /* pad */
-    /* VISUALTYPE (24): TrueColor, 24-bit */
-    xput32(o+i, XSRV_VISUAL_ID); i += 4;     /* visual-id */
-    o[i++] = 4;                              /* class = TrueColor */
-    o[i++] = 8;                              /* bits-per-rgb-value */
-    xput16(o+i, 256); i += 2;                /* colormap-entries */
-    xput32(o+i, 0x00ff0000); i += 4;         /* red-mask */
-    xput32(o+i, 0x0000ff00); i += 4;         /* green-mask */
-    xput32(o+i, 0x000000ff); i += 4;         /* blue-mask */
-    i += 4;                                  /* pad */
-    return i;                                /* == total */
-}
-
-/* Client -> X server bytes. The only exchange we service is the initial
- * connection setup; reply once, then absorb everything (headless ANGLE issues
- * no further X requests before --dump-dom fires). */
-static long xserver_handle(struct sock *self, const void *buf, size_t n) {
-    (void)buf;
-    if (!self->x_setup_done) {
-        if (n < 12) return (long)n;          /* await the full xConnClientPrefix */
-        uint8_t reply[160];
-        size_t rlen = xserver_build_setup(reply, sizeof reply);
-        if (rlen) unix_enqueue(self, reply, rlen);   /* into our own rx ring */
-        self->x_setup_done = 1;
-        kprintf("[xsrv] setup: client sent %d bytes, replied %d bytes\n",
-                (int)n, (int)rlen);
-    }
-    return (long)n;                          /* absorb all client bytes */
-}
+/* Fake X protocol: xserver.c (tier 2.5 Ozone / MIT-SHM). */
 
 /* Is `name` the X display :0 socket (filesystem or abstract)? */
 static bool is_x0_socket(const char *name) {
@@ -891,7 +821,7 @@ long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
     if (src_port_be) *src_port_be = d->src_port;
 
     if (d->payload) { kfree(d->payload); d->payload = 0; }
-    s->tail = (uint8_t)((s->tail + 1) % SOCK_RX_DGRAMS);
+    s->tail = (uint16_t)((s->tail + 1) % SOCK_RX_DGRAMS);
     s->count--;
 
     return (long)copy;
@@ -1149,7 +1079,7 @@ long sock_netlink_recv_peek(struct sock *s, void *kbuf, size_t n, bool peek) {
     if (copy && d->payload) memcpy(kbuf, d->payload, copy);
     if (peek) return (long)copy;              /* MSG_PEEK: leave it queued */
     if (d->payload) { kfree(d->payload); d->payload = 0; }
-    s->tail = (uint8_t)((s->tail + 1) % SOCK_RX_DGRAMS);
+    s->tail = (uint16_t)((s->tail + 1) % SOCK_RX_DGRAMS);
     s->count--;
     return (long)copy;
 }

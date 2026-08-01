@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <tobyos/abi/abi.h>
 #include <toby/tk.h>
 #include <toby/image.h>
@@ -103,11 +104,20 @@ static int g_page_w = PAGE_W, g_page_h = PAGE_H;
 #else
 /* (Slice 62 used https://example.com to validate RESIZE in isolation from
  * YouTube's evening-service flakiness -- flip to it for mechanism tests.) */
-#define START_URL "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+/* react.dev still ImmediateCrash/PA-poison under --single-process right
+ * after bootstrap; measure on a light page until that is fixed. */
+#define START_URL "https://example.com"
 #endif
 
 static struct tk_window win;
-static toby_image_t *g_frame;        /* latest decoded screenshot */
+static toby_image_t *g_frame;        /* latest decoded screenshot (CDP path) */
+#ifdef CHROME_FULL
+/* Tier 2.5: ARGB pixels from fake-X MIT-SHM (primary paint path). */
+static uint32_t *g_xf_pixels;
+static int g_xf_w, g_xf_h, g_xf_stride;
+static uint32_t g_xf_gen, g_xf_seen;
+static int g_xf_cap;
+#endif
 static int  g_cmd_fd  = -1;          /* we write CDP commands here (chrome fd 3) */
 static int  g_resp_fd = -1;          /* we read CDP messages here (chrome fd 4) */
 static int  g_next_id = 1;
@@ -655,11 +665,45 @@ static int cdp_wait(int id) {
     return 0;
 }
 
+/* Timed wait used for DevTools readiness probes (headed Ozone can take
+ * several seconds before the pipe agent answers). Dispatches events, pumps
+ * TobyTK, and returns 0 on timeout without killing the session. */
+static int cdp_wait_ms(int id, long timeout_ms) {
+    long t0 = sys_clock_ms();
+    while (!g_quit) {
+        while (cdp_take_msg()) {
+            if (json_has_id(g_msg, id)) return 1;
+            cdp_dispatch();
+        }
+        int fr = cdp_fill_nb();
+        if (fr < 0) { g_quit = 1; return 0; }
+        if (fr > 0) continue;
+        if (sys_clock_ms() - t0 >= timeout_ms) return 0;
+        tk_pump(&win);
+        sc0(ABI_SYS_YIELD);
+    }
+    return 0;
+}
+
 /* ---- chrome spawn ---------------------------------------------------- */
 
 static int spawn_chrome(void) {
     int p2c[2], c2p[2];                       /* parent->chrome, chrome->parent */
     if (pipe(p2c) != 0 || pipe(c2p) != 0) { logln("pipe() failed"); return -1; }
+
+    /* Full chrome refuses to start if user-data-dir is missing/unwritable
+     * ("Failed To Create Data Directory") and then never answers CDP. */
+#ifdef CHROME_FULL
+    {
+        const char *udd = "/data/cr_ozone";
+        if (mkdir(udd, 0755) != 0) {
+            /* EEXIST is fine; anything else is loud. */
+            printf("[chromewin] mkdir %s -> errno (may already exist)\n", udd);
+        } else {
+            printf("[chromewin] created %s\n", udd);
+        }
+    }
+#endif
 
     long pid = fork();
     if (pid < 0) { logln("fork() failed"); return -1; }
@@ -695,7 +739,12 @@ static int spawn_chrome(void) {
         char *argv[] = {
 #ifdef CHROME_FULL
             (char *)"/opt/chrome/chrome",
-            (char *)"--headless=new",
+            /* Full-chrome stability/measure: headless ozone answers CDP.
+             * Headed --ozone-platform=x11 still parks UI on futex after
+             * Displays updated (no browser MapWindow); X11+MIT-SHM code
+             * remains in xserver.c for the next unblock. */
+            (char *)"--ozone-platform=headless",
+            (char *)"--enable-features=UseOzonePlatform,NetworkServiceInProcess",
 #else
             (char *)"/opt/chrome/chrome-headless-shell",
 #endif
@@ -705,16 +754,24 @@ static int spawn_chrome(void) {
              * omission cost a full 440s run that looked like a hang. */
             (char *)"--no-sandbox",
             (char *)"--no-zygote",
+            (char *)"--single-process",
             (char *)"--remote-debugging-pipe",
-            (char *)"--use-gl=angle",
-            (char *)"--use-angle=swiftshader",
-            (char *)"--enable-unsafe-swiftshader",
+            /* Disable GPU/ANGLE (INT3 under CoW); leave software compositing
+             * and rasterizer ON so Ozone can MapWindow + X11 paint. */
             (char *)"--in-process-gpu",
+            (char *)"--disable-gpu",
+            (char *)"--disable-vulkan",
+            (char *)"--use-gl=disabled",
             (char *)"--disable-kill-after-bad-ipc",
             (char *)"--disable-dev-shm-usage",
             (char *)"--disable-crash-reporter",
             (char *)"--disable-in-process-stack-traces",
             (char *)"--no-first-run",
+            /* Avoid fork+exec of /bin/xdg-settings (default-browser check).
+             * That child exit was driving multi-second TLB shootdown storms
+             * under WHPX and wedging the headed UI/CDP path. */
+            (char *)"--no-default-browser-check",
+            (char *)"--disable-component-update",
             (char *)"--enable-logging=stderr",
 #ifdef CHROME_FULL
             /* Slice 70: the full binary exits 191 after its Mojo handshake
@@ -728,7 +785,15 @@ static int spawn_chrome(void) {
              * consent redirects, cache) reproduces "identical failure on both
              * kernels" exactly like IP throttling would -- the A/B revert-test
              * could not distinguish them. A fresh dir isolates the theory. */
+#ifdef CHROME_FULL
+            (char *)"--user-data-dir=/data/cr_oz44",
+            (char *)"--disable-extensions",
+            (char *)"--disable-background-networking",
+            (char *)"--disable-component-extensions-with-background-pages",
+            (char *)"--disable-features=OptimizationHints,MediaRouter",
+#else
             (char *)"--user-data-dir=/data/cr2",
+#endif
             /* Slice 61c: bound the HTTP cache. On the old 4 MiB /data the
              * cache (buffering the very video segments being played) filled
              * the volume ~33s in; every vfs_create then failed and the
@@ -779,7 +844,10 @@ static int spawn_chrome(void) {
              * and navigation machinery so the shutdown decision (and the
              * navigation that triggered it) is named on stderr. */
             (char *)"--vmodule=render_process_host*=2,render_frame_host*=2,"
-                    "navigation_request=2,navigator=2",
+                    "navigation_request=2,navigator=2,"
+                    "*/ui/ozone/*=1,*/ui/aura/*=1,*/chrome/browser/ui/*=1",
+            /* Startup URL (not --app: app mode never CreateWindow'd here). */
+            (char *)"about:blank",
             0,
         };
         char *envp[] = {
@@ -790,7 +858,8 @@ static int spawn_chrome(void) {
             (char *)"LANG=C",
             (char *)"VK_ICD_FILENAMES=/opt/chrome/vk_swiftshader_icd.json",
             (char *)"DISPLAY=:0",
-            (char *)"LD_PRELOAD=/opt/chrome/libvulkan.so.1:/opt/chrome/libvk_swiftshader.so",
+            /* No LD_PRELOAD vulkan: X11+SwANGLE needs VK_KHR_xcb_surface we
+             * don't provide; software/Skia path is enough for MIT-SHM blit. */
             (char *)"FONTCONFIG_FILE=/etc/fonts/fonts.conf",
             0,
         };
@@ -1038,7 +1107,10 @@ static int cdp_bootstrap(void) {
     if (du) navurl = du;
 #endif
     /* createTarget with a possibly-huge (data:) URL: build in g_bigcmd, since
-     * cdp_send's 2KB static buffer can't hold an ~80KB base64 page. */
+     * cdp_send's 2KB static buffer can't hold an ~80KB base64 page.
+     * Headed Ozone can take tens of seconds before the DevTools pipe agent
+     * answers — wait with a long timeout (and TK pump) rather than blocking
+     * forever on a dead browser. */
     int id = g_next_id++;
     snprintf(g_bigcmd, sizeof g_bigcmd,
              "{\"id\":%d,\"method\":\"Target.createTarget\",\"params\":{\"url\":\"%s\"}}",
@@ -1046,7 +1118,11 @@ static int cdp_bootstrap(void) {
     cdp_write(g_bigcmd);
     printf("[chromewin] sent Target.createTarget id=%d urllen=%lu; waiting for reply\n",
            id, (unsigned long)strlen(navurl));
-    if (!cdp_wait(id)) { logln("createTarget: pipe closed / no reply"); return -1; }
+    if (!cdp_wait_ms(id, 180000)) {
+        if (g_quit) logln("createTarget: pipe closed / no reply");
+        else logln("createTarget: timed out waiting for DevTools");
+        return -1;
+    }
     logln("createTarget reply received");
     if (json_str(g_msg, "targetId", tid, sizeof tid) < 0) {
         logln("no targetId in createTarget reply"); return -1;
@@ -1114,18 +1190,8 @@ static int cdp_bootstrap(void) {
     id = cdp_send("Emulation.setFocusEmulationEnabled", "{\"enabled\":true}", 1);
     cdp_wait(id);
 
-    /* Slice 45: push frames instead of polling captureScreenshot. Slice 50: a
-     * PLAYING video pushes ~30fps of 800x600 damage, which stb_image can't decode
-     * fast enough on tobyOS -> g_rxbuf backs up -> the overflow drop truncates
-     * frames -> all later frames corrupt (the "display freezes at ~frame 150 while
-     * chrome keeps streaming" symptom). Throttle the SOURCE so decode keeps up:
-     * everyNthFrame=3 (~10fps). quality 60 balances size vs legibility.
-     * Slice 62: capture at the PAGE size (1:1), not a fixed 640x480. The old
-     * cap made PUSHED frames 0.8x-scaled while the POLLED captureScreenshot
-     * fallback was 1:1 -- the display alternated between two scales and any
-     * click while a pushed frame was showing was off by 25% (window coords
-     * are sent as CSS coords, which is only correct at 1:1). Decode cost
-     * rises with window size; everyNthFrame absorbs it. */
+    /* Screencast while headed X11 MapWindow remains wedged. Prefer xframe
+     * when gen advances (real PutImage/ShmPutImage). */
     {
         char scp[128];
         snprintf(scp, sizeof scp,
@@ -1233,6 +1299,36 @@ static void send_key(uint8_t key) {
  * frame installer, so it keeps its own accumulator/counter pair). */
 long g_t_paint, g_n_paint;
 
+#ifdef CHROME_FULL
+static void xframe_poll_once(void) {
+    struct abi_xframe xf;
+    size_t need = (size_t)PAGE_W * PAGE_H * 4u;
+    if (!g_xf_pixels || g_xf_cap < (int)need) {
+        free(g_xf_pixels);
+        g_xf_pixels = (uint32_t *)malloc(need);
+        g_xf_cap = (int)need;
+        if (!g_xf_pixels) return;
+    }
+    long rc = sc3(ABI_SYS_XFRAME_POLL, (long)(uintptr_t)&xf,
+                  (long)(uintptr_t)g_xf_pixels, (long)g_xf_cap);
+    if (rc < 0) return;
+    /* Only count when gen advances past the empty ensure(gen=1) baseline. */
+    if (xf.gen > 1 && xf.gen != g_xf_seen && xf.w && xf.h) {
+        g_xf_seen = xf.gen;
+        g_xf_gen = xf.gen;
+        g_xf_w = (int)xf.w;
+        g_xf_h = (int)xf.h;
+        g_xf_stride = (int)(xf.stride / 4); /* tk_draw_blit wants px pitch */
+        g_frames++;
+        g_last_frame_ms = sys_clock_ms();
+        if (g_frames == 1 || (g_frames % 30) == 0)
+            printf("[chromewin] xframe %d: %dx%d gen=%u (MIT-SHM path)\n",
+                   g_frames, g_xf_w, g_xf_h, xf.gen);
+        tk_redraw(&win);
+    }
+}
+#endif
+
 static void paint(struct tk_window *w, struct tk_widget *cv) {
     (void)cv;
     long tp0 = sys_clock_ms();
@@ -1245,15 +1341,22 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
     tk_draw_fill(w, 0, 0, pw, BAR_H, 0x00202028u);
     tk_draw_text(w, 8, 6, g_status, 0x00d0d0d8u, 14, 0);
     /* page area */
+    /* Prefer live CDP frames; xframe only when SHM gen actually advanced. */
     if (g_frame) {
         int fw = g_frame->width  < pw ? g_frame->width  : pw;
         int fh = g_frame->height < ph ? g_frame->height : ph;
         tk_draw_blit(w, 0, BAR_H, fw, fh, g_frame->pixels, g_frame->width);
-        /* A just-resized window shows the old (smaller/larger) frame until
-         * chrome delivers one at the new size; clear the right/bottom
-         * margins so stale pixels never linger next to the live frame. */
         if (fw < pw) tk_draw_fill(w, fw, BAR_H, pw - fw, ph, 0x00303038u);
         if (fh < ph) tk_draw_fill(w, 0, BAR_H + fh, fw, ph - fh, 0x00303038u);
+#ifdef CHROME_FULL
+    } else if (g_xf_pixels && g_xf_w > 0 && g_xf_gen > 0 &&
+               g_xf_seen == g_xf_gen) {
+        int fw = g_xf_w < pw ? g_xf_w : pw;
+        int fh = g_xf_h < ph ? g_xf_h : ph;
+        tk_draw_blit(w, 0, BAR_H, fw, fh, g_xf_pixels, g_xf_stride);
+        if (fw < pw) tk_draw_fill(w, fw, BAR_H, pw - fw, ph, 0x00303038u);
+        if (fh < ph) tk_draw_fill(w, 0, BAR_H + fh, fw, ph - fh, 0x00303038u);
+#endif
     } else {
         tk_draw_fill(w, 0, BAR_H, pw, ph, 0x00303038u);
         tk_draw_text(w, pw / 2 - 100, BAR_H + ph / 2 - 20,
@@ -1299,6 +1402,12 @@ int main(void) {
     tk_on_event(cv, on_event);
     tk_redraw(&win); tk_pump(&win);
 
+    /* Give headed Ozone time to finish X11/RANDR before DevTools traffic. */
+    for (int i = 0; i < 100 && !g_quit; i++) {
+        tk_pump(&win);
+        usleep(50000);
+    }
+
     if (cdp_bootstrap() != 0) {
         snprintf(g_status, sizeof g_status, "DevTools bootstrap FAILED");
         logln("bootstrap failed");
@@ -1307,21 +1416,22 @@ int main(void) {
         for (int i = 0; i < 400 && !tk_pump(&win); i++) usleep(50000);
         return 1;
     }
-    logln("bootstrap OK; screencast started");
+    logln("bootstrap OK; screencast (+ xframe if SHM advances)");
 
     /* Event-driven main loop (slice 45): chrome PUSHES screencast frames; we
      * drain the pipe non-blocking so TK input is never stalled behind a frame.
      *   tk_pump -> forwards mouse/keys as Input.* (fire-and-forget)
      *   drain   -> reads every buffered CDP message; screencastFrame -> blit+ack
-     * No nav-retry: under WHPX the first navigation's TLS handshake is fast
-     * and heavy pages (youtube / a watch page) take >45s to first paint, so
-     * re-navigating only RESTARTS the load. Target.createTarget already
-     * navigated; startScreencast delivers a frame when the page paints. */
+     * CHROME_FULL: also poll ABI_SYS_XFRAME_POLL for Ozone/MIT-SHM pixels. */
     g_last_frame_ms = sys_clock_ms();
     long t0 = sys_clock_ms();
     int replays = 0;
     while (!g_quit) {
         if (tk_pump(&win)) break;              /* input -> Input.* */
+
+#ifdef CHROME_FULL
+        xframe_poll_once();
+#endif
 
         for (;;) {                             /* drain all buffered CDP msgs */
             int f = cdp_fill_nb();

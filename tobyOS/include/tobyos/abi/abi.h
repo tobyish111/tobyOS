@@ -944,8 +944,21 @@ struct abi_ttf_raster {
  * input loop. a1=fd, a2=buf, a3=len. Non-pipe fds fall back to blocking read. */
 #define ABI_SYS_READ_NB         185
 
+/* Tier 2.5: poll the fake-X / MIT-SHM frame for chromewin zero-copy paint.
+ * a1 = struct abi_xframe *info (w/h/stride/gen filled on return)
+ * a2 = pixels buffer or NULL
+ * a3 = pixels_cap (bytes); ignored if a2 == NULL */
+#define ABI_SYS_XFRAME_POLL     186
+
+struct abi_xframe {
+    uint32_t w;
+    uint32_t h;
+    uint32_t stride;   /* bytes per row */
+    uint32_t gen;      /* bumps on every PutImage / ShmPutImage */
+};
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          186
+#define ABI_SYS_NR_MAX          187
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
@@ -1588,7 +1601,18 @@ struct abi_dirent {
 #define ABI_AT_BASE     7       /* base address the interpreter was loaded at */
 #define ABI_AT_FLAGS    8       /* flags */
 #define ABI_AT_ENTRY    9       /* entry point of the *program* (not interp) */
+#define ABI_AT_UID      11
+#define ABI_AT_EUID     12
+#define ABI_AT_GID      13
+#define ABI_AT_EGID     14
+#define ABI_AT_HWCAP    16      /* CPU capability bit mask (arch-specific) */
+#define ABI_AT_CLKTCK   17      /* frequency of times() ticks */
+#define ABI_AT_SECURE   23      /* nonzero if this is a secure exec */
 #define ABI_AT_RANDOM   25      /* ptr to 16 random bytes (libc stack canary) */
+/* Minimal x86-64 HWCAP: FPU|VME|DE|PSE|TSC|MSR|PAE|MCE|CX8|APIC|SEP|MTRR|
+ * PGE|MCA|CMOV|PAT|PSE36|CLFLUSH|MMX|FXSR|SSE|SSE2 — enough for glibc/GLib
+ * feature probes that abort when getauxval(AT_HWCAP) is missing entirely. */
+#define ABI_AT_HWCAP_X86_64_BASE  0x00000000bfebfbffULL
 
 struct abi_auxv {
     uint64_t a_type;

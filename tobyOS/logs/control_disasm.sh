@@ -15,7 +15,7 @@ mkdir -p "$OUT"
 command -v objdump >/dev/null || { export DEBIAN_FRONTEND=noninteractive
     apt-get install -y -qq binutils >/dev/null 2>&1; }
 
-TRAP=0x5d4a117          # the int3 itself (rip-1)
+TRAP=0x31c3fc3
 FROM=$((TRAP - 0x120))
 TO=$((TRAP + 0x10))
 

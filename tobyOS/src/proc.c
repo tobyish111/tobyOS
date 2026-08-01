@@ -63,9 +63,11 @@
 #include <tobyos/klibc.h>
 #include <tobyos/uaccess.h>
 #include <tobyos/smp.h>
+#include <tobyos/percpu.h>
 #include <tobyos/file.h>
 #include <tobyos/cap.h>
 #include <tobyos/perf.h>
+#include <tobyos/rng.h>
 
 /* Asm helpers from proc_switch.S. */
 extern __attribute__((noreturn)) void proc_enter_user_asm(uint64_t rip,
@@ -892,7 +894,7 @@ static int spawn_internal(const char *path, const char *name,
      * static programs -- the trailing AT_NULL is harmless to libtoby
      * crt0 (which doesn't read auxv at all today) and makes the stack
      * shape uniform across static and dynamic launches. */
-    struct abi_auxv aux[10];
+    struct abi_auxv aux[20];
     int             auxc = 0;
     if (ok) {
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PHDR,   prog_info.phdr_va  };
@@ -904,10 +906,17 @@ static int spawn_internal(const char *path, const char *name,
         aux[auxc++] = (struct abi_auxv){ ABI_AT_ENTRY,  prog_info.entry    };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PAGESZ, PAGE_SIZE          };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_FLAGS,  0                  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,    0                  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,   0                  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,    0                  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,   0                  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP,  ABI_AT_HWCAP_X86_64_BASE };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_CLKTCK, 100                };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE, 0                  };
         /* AT_RANDOM: 16 bytes a Linux libc reads for its stack canary.
          * Point at the 16-byte scratch pad pack_user_stack always leaves
          * at the very top of the (zeroed) user stack -- valid + readable.
-         * glibc requires this; musl falls back gracefully without it. */
+         * Slice 87: seed with CSPRNG after packing (was left zero). */
         aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
     }
 
@@ -922,6 +931,13 @@ static int spawn_internal(const char *path, const char *name,
             .auxv = aux,  .auxc = auxc,
         };
         ok = pack_user_stack(&pack, &user_rsp);
+        if (ok) {
+            uint8_t rnd[16];
+            rng_fill(rnd, sizeof rnd);
+            unsigned long uf = uaccess_begin();
+            memcpy((void *)(uintptr_t)(USER_STACK_TOP_VA - 16), rnd, 16);
+            uaccess_end(uf);
+        }
     }
   } /* end ELF arm */
 
@@ -1117,6 +1133,61 @@ static void wakeup_waiters(int pid) {
  * down (real fbdev programs draw into the mmap and exit without panning). */
 extern void fbdev_proc_exit(int pid);
 
+void proc_wait_off_cpu(struct proc *p) {
+    if (!p) return;
+    while (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause");
+}
+
+/* Linux exit_group(2): terminate every task in the caller's thread group.
+ * A non-leader chrome thread used to call exit_group(191) and only kill
+ * itself, leaving the browser zombie'd on X11 recvmsg with no GPU. */
+__attribute__((noreturn)) void proc_exit_group(int code) {
+    struct proc *p = current_proc();
+    if (!p) proc_exit(code);
+
+    if (p->is_thread) {
+        int tgid = p->tgid;
+        struct proc *leader = proc_lookup(tgid);
+        if (bkl_held()) bkl_exit();
+        for (int i = 0; i < PROC_MAX; i++) {
+            struct proc *q = &g_proc[i];
+            if (q == p || q->state == PROC_UNUSED) continue;
+            if (!(q->tgid == tgid || q->pid == tgid)) continue;
+            q->exit_code = code;
+            q->state = PROC_TERMINATED;
+            struct proc *w = q->join_waiters;
+            while (w) {
+                struct proc *nxt = w->next_wait;
+                w->state = PROC_READY;
+                w->next_wait = 0;
+                sched_enqueue(w);
+                w = nxt;
+            }
+            q->join_waiters = 0;
+            sched_dequeue(q);
+            { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
+            { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
+            proc_wait_off_cpu(q);
+            if (q->is_thread) {
+                if (q->kstack_base) kfree(q->kstack_base);
+                q->kstack_base = 0;
+                q->kstack_top  = 0;
+                q->state = PROC_UNUSED;
+            } else {
+                /* Leader: close shared fds; leave TERMINATED for wait/reap. */
+                close_all_fds(q);
+                wakeup_waiters(q->pid);
+            }
+        }
+        (void)leader;
+        /* Fall through: terminate the calling thread without closing fds
+         * again (leader already closed the shared table). */
+        p->is_thread = true; /* keep non-leader fd path in proc_exit */
+    }
+    proc_exit(code);
+}
+
 __attribute__((noreturn)) void proc_exit(int code) {
     struct proc *p = current_proc();
 
@@ -1131,6 +1202,10 @@ __attribute__((noreturn)) void proc_exit(int code) {
     }
 #endif
 
+    /* Share-until-exec: child _exit without exec must unblock the launcher. */
+    if (p && p->vfork_parent > 0)
+        vfork_child_done(p);
+
     /* Track B graphics: flush a Linux /dev/fb0 mmap to the display while this
      * process's pages are still mapped (before cli()/teardown below). */
     if (p) fbdev_proc_exit(p->is_thread ? p->tgid : p->pid);
@@ -1144,7 +1219,8 @@ __attribute__((noreturn)) void proc_exit(int code) {
         uint32_t zero = 0;
         (void)copy_to_user((void *)(uintptr_t)p->clear_child_tid,
                            &zero, sizeof(zero));
-        (void)futex((uint32_t *)(uintptr_t)p->clear_child_tid, FUTEX_WAKE, 1, 0);
+        (void)futex((uint32_t *)(uintptr_t)p->clear_child_tid, FUTEX_WAKE, 1,
+                    0, 0);
         p->clear_child_tid = 0;
     }
 
@@ -1160,6 +1236,9 @@ __attribute__((noreturn)) void proc_exit(int code) {
      * If we are the leader, terminate all threads in our group first.
      * If we are a non-leader thread, don't close shared fds. */
     if (!p->is_thread) {
+        /* Drop BKL before waiting on remote on_cpu: a sibling spinning in
+         * bkl_enter would never leave the CPU while we hold the lock. */
+        if (bkl_held()) bkl_exit();
         /* Leader exiting -- kill all threads in this group */
         for (int i = 0; i < PROC_MAX; i++) {
             struct proc *q = &g_proc[i];
@@ -1188,6 +1267,10 @@ __attribute__((noreturn)) void proc_exit(int code) {
                 sched_dequeue(q);
                 { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
                 { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
+                /* Slice 88: wait until the sibling is off-CPU before freeing
+                 * its kstack -- sched_dequeue does not stop a thread still
+                 * running on another core. */
+                proc_wait_off_cpu(q);
                 /* Free the thread's kernel stack */
                 if (q->kstack_base) kfree(q->kstack_base);
                 q->kstack_base = 0;
@@ -1240,6 +1323,7 @@ static void proc_reap(struct proc *p) {
     sched_dequeue(p);
     { extern void futex_forget_proc(struct proc *); futex_forget_proc(p); }
     { extern void poll_forget_proc(struct proc *);  poll_forget_proc(p);  }
+    proc_wait_off_cpu(p);
 
     /* Tear down the address space only when NOBODY else is still in it.
      *
@@ -1273,7 +1357,19 @@ static void proc_reap(struct proc *p) {
             heir->owns_pml4 = true;
             p->owns_pml4    = false;
         } else {
-            vmm_destroy_user_pml4(p->cr3);
+            /* Clear before free so a concurrent do_switch sees owns_pml4=0 /
+             * cr3=0 rather than a dangling live-looking pointer. */
+            uint64_t doomed = p->cr3;
+            p->cr3 = 0;
+            p->owns_pml4 = false;
+            /* One more barrier: no CPU may still be `current` in this space. */
+            for (uint32_t c = 0; c < smp_cpu_count(); c++) {
+                struct percpu *cpu = smp_cpu_mut(c);
+                if (!cpu || !cpu->current) continue;
+                while (cpu->current->cr3 == doomed)
+                    __asm__ volatile("pause");
+            }
+            vmm_destroy_user_pml4(doomed);
         }
     }
     if (p->kstack_base) {
@@ -1457,23 +1553,36 @@ uint64_t proc_brk(struct proc *p, uint64_t new_brk) {
     } else if (new_aligned < old_aligned) {
         /* Shrinking past at least one page boundary: free those pages.
          * CoW-aware: a fork sibling may still map the frame (refs > 1);
-         * drop only our reference and let the last owner free it. */
+         * drop only our reference and let the last owner free it.
+         *
+         * Slice 87: was free-THEN-shootdown (the classic stale-TLB reuse
+         * window). Unmap + batch, shoot down, THEN free; on an un-acked
+         * shootdown LEAK the batch (same trade as mmap.c quarantine). */
+        enum { BRK_FREE_MAX = 256 };
+        uint64_t doomed[BRK_FREE_MAX];
+        int n_doom = 0;
         for (uint64_t va = new_aligned; va < old_aligned; va += PAGE_SIZE) {
             uint64_t phys = vmm_translate(va) & ~((uint64_t)PAGE_SIZE - 1);
             vmm_unmap(va, PAGE_SIZE);
-            if (phys) {
-                int refs = page_ref_get(phys);
-                if (refs > 1) {
-                    page_ref_dec(phys);
-                } else {
-                    if (refs == 1) page_ref_dec(phys);
-                    pmm_free_page(phys);
-                }
+            if (!phys) continue;
+            int refs = page_ref_get(phys);
+            if (refs > 1) {
+                page_ref_dec(phys);
+                continue;
             }
+            if (refs == 1) page_ref_dec(phys);
+            if (n_doom == BRK_FREE_MAX) {
+                if (tlb_shootdown_remote_sync())
+                    for (int i = 0; i < n_doom; i++) pmm_free_page(doomed[i]);
+                /* !acked: leak this batch */
+                n_doom = 0;
+            }
+            doomed[n_doom++] = phys;
         }
-        /* Dropped translations must leave other CPUs' TLBs before the
-         * freed frames are reissued (see tlb_shootdown_remote). */
-        tlb_shootdown_remote();
+        if (n_doom) {
+            if (tlb_shootdown_remote_sync())
+                for (int i = 0; i < n_doom; i++) pmm_free_page(doomed[i]);
+        }
     }
 
     p->brk_cur = new_brk;

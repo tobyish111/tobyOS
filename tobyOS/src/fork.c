@@ -28,6 +28,7 @@
 #include <tobyos/page_fault.h>
 #include <tobyos/uaccess.h>
 #include <tobyos/mmap.h>
+#include <tobyos/rng.h>
 
 extern struct proc g_proc[];
 
@@ -187,6 +188,177 @@ static bool build_fork_kstack(struct proc *child) {
     return true;
 }
 
+/* Slice 88: soft stop-the-world for multithreaded CoW fork.
+ * Sibling threads sharing actor->cr3 keep WRITABLE TLBs while vmm_cow_fork
+ * walks PTEs; park them off-CPU first, shootdown after WP, then resume.
+ *
+ * Concurrent forks in the same (or any) process must not interleave STWs:
+ * each would wait for the other to leave PROC_RUNNING forever. Serialize
+ * with g_cow_fork_lock; a forker that is itself the target of another's
+ * vm_quiesce parks cooperatively instead of spinning on the lock. */
+static volatile int g_cow_fork_lock;
+
+static void cow_fork_lock_acquire(struct proc *actor) {
+    bool had_bkl = bkl_held();
+    if (had_bkl) bkl_exit();
+    for (uint32_t spins = 0; ; spins++) {
+        if (__atomic_load_n(&actor->vm_quiesce, __ATOMIC_ACQUIRE)) {
+            /* Another STW wants us off RUNNING -- stay BLOCKED until it
+             * resumes us. Do NOT bounce back to RUNNING while still
+             * contending for the lock (that deadlocks the waiter's
+             * !PROC_RUNNING loop). */
+            actor->state = PROC_BLOCKED;
+            actor->vm_quiesced = 1;
+            while (__atomic_load_n(&actor->vm_quiesce, __ATOMIC_ACQUIRE))
+                __asm__ volatile("pause");
+        }
+        int expected = 0;
+        if (__atomic_compare_exchange_n(&g_cow_fork_lock, &expected, 1,
+                                        false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_RELAXED))
+            break;
+        /* A forker killed mid-STW can leave the lock stuck at 1 forever.
+         * After a long spin, steal it so chrome can make progress. */
+        if (spins > 20000000u) {
+#ifdef CHROMIUM_BOOT
+            kprintf("[fork] cow_fork_lock steal pid=%d (was stuck)\n",
+                    actor ? actor->pid : -1);
+#endif
+            __atomic_store_n(&g_cow_fork_lock, 1, __ATOMIC_RELEASE);
+            break;
+        }
+        __asm__ volatile("pause");
+    }
+    if (actor->state == PROC_BLOCKED && actor->vm_quiesced &&
+        !__atomic_load_n(&actor->vm_quiesce, __ATOMIC_ACQUIRE)) {
+        /* We parked for a peer STW that has since resumed; we hold the
+         * fork lock now so we are the STW actor — run as RUNNING. */
+        actor->vm_quiesced = 0;
+    }
+    actor->state = PROC_RUNNING;
+    if (had_bkl) bkl_enter();
+}
+
+static void cow_fork_lock_release(void) {
+    __atomic_store_n(&g_cow_fork_lock, 0, __ATOMIC_RELEASE);
+}
+
+void tg_vm_quiesce(struct proc *actor) {
+    if (!actor) return;
+#ifdef CHROMIUM_BOOT
+    kprintf("[fork] quiesce enter pid=%d\n", actor->pid);
+#endif
+    cow_fork_lock_acquire(actor);
+#ifdef CHROMIUM_BOOT
+    kprintf("[fork] quiesce locked pid=%d\n", actor->pid);
+#endif
+
+    uint64_t cr3 = actor->cr3;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q == actor || q->state == PROC_UNUSED ||
+            q->state == PROC_TERMINATED) continue;
+        if (q->cr3 != cr3) continue;
+        __atomic_store_n(&q->vm_quiesce, 1, __ATOMIC_RELEASE);
+        q->quantum_left = 0;
+        if (q->state == PROC_READY) {
+            sched_dequeue(q);
+            q->state = PROC_BLOCKED;
+            q->vm_quiesced = 1;
+        } else if (q->state == PROC_RUNNING) {
+            q->vm_quiesced = 1;   /* tick / syscall-return will park */
+        }
+    }
+
+    /* Siblings stuck in bkl_enter need the lock to reach a park point. */
+    bool had_bkl = bkl_held();
+    if (had_bkl) bkl_exit();
+
+    /* Wait until siblings have left USER mode. Do NOT wait on on_cpu: a
+     * sibling mid-#PF / shootdown spins in-kernel with IRQs off, state
+     * often still PROC_RUNNING, and MUST stay on_cpu to ACK IPIs.
+     * Waiting for !RUNNING deadlocks those paths (observed: clone stuck
+     * 100s+ with a peer in shootdown wait). Bound the wait so LAPIC ticks
+     * can park user-mode siblings, then proceed — kernel siblings cannot
+     * retire user stores until they iret, and syscall/#PF return parks. */
+    for (uint32_t spins = 0; ; spins++) {
+        bool user_busy = false;
+        int running_on_cpu = 0;
+        for (int i = 0; i < PROC_MAX; i++) {
+            struct proc *q = &g_proc[i];
+            if (q == actor || q->state == PROC_UNUSED ||
+                q->state == PROC_TERMINATED) continue;
+            if (q->cr3 != cr3) continue;
+            if (q->state == PROC_READY) {
+                sched_dequeue(q);
+                q->state = PROC_BLOCKED;
+                q->vm_quiesced = 1;
+            }
+            if (q->state == PROC_RUNNING) {
+                if (!__atomic_load_n(&q->on_cpu, __ATOMIC_ACQUIRE)) {
+                    q->state = PROC_BLOCKED;
+                    q->vm_quiesced = 1;
+                } else {
+                    running_on_cpu++;
+                    user_busy = true;
+                }
+            }
+        }
+        if (!user_busy) break;
+        /* ~5e5 pauses: park user threads via LAPIC tick, then proceed.
+         * Leftover on_cpu RUNNING are assumed in-kernel (IRQ-off). */
+        if (spins > 500000u) {
+#ifdef CHROMIUM_BOOT
+            static int qw;
+            if (qw < 16) {
+                qw++;
+                kprintf("[fork] quiesce timeout: %d on_cpu RUNNING "
+                        "(assuming in-kernel; proceeding)\n", running_on_cpu);
+            }
+#endif
+            break;
+        }
+        /* UP: pause alone never lets READY siblings reach a park point —
+         * periodically yield so they can observe vm_quiesce and BLOCK. */
+        if ((spins & 0xfffu) == 0)
+            sched_yield();
+        else
+            __asm__ volatile("pause");
+    }
+
+#ifdef CHROMIUM_BOOT
+    kprintf("[fork] quiesce ready pid=%d\n", actor->pid);
+#endif
+    /* Do NOT re-take the BKL here. A sibling we timed out as "in-kernel"
+     * may still hold it; re-entering deadlocks (clone stuck 50s+ after
+     * "quiesce ready"). vmm_cow_fork runs without the BKL under STW;
+     * sys_fork re-takes only around mmap_cow_clone. */
+    (void)had_bkl;
+}
+
+void tg_vm_resume(struct proc *actor) {
+    if (!actor) return;
+    uint64_t cr3 = actor->cr3;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q == actor || q->state == PROC_UNUSED) continue;
+        if (q->cr3 != cr3) continue;
+        __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
+        if (!q->vm_quiesced) continue;
+        /* Re-enqueue only when off-CPU. If still on_cpu (mid-yield / #PF
+         * spin), leave vm_quiesced=1: sched_finish_switch requeues when
+         * on_cpu drops. Clearing vm_quiesced here without enqueue LOST
+         * threads; enqueue while on_cpu dual-scheduled them (tlb wedge). */
+        if (q->state == PROC_BLOCKED &&
+            !__atomic_load_n(&q->on_cpu, __ATOMIC_ACQUIRE)) {
+            q->vm_quiesced = 0;
+            q->state = PROC_READY;
+            sched_enqueue(q);
+        }
+    }
+    cow_fork_lock_release();
+}
+
 /* ===================================================================
  * sys_fork -- Create a child process that is a copy of the parent.
  *
@@ -237,6 +409,11 @@ long sys_fork(void) {
      * Observed: fork returned but the child never executed one instruction. */
     child->on_rq  = false;
     child->on_cpu = 0;
+    child->vm_quiesce  = 0;
+    child->vm_quiesced = 0;
+    child->mm_owner    = 0;
+    child->vfork_parent = 0;
+    child->vfork_child  = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;
@@ -266,14 +443,36 @@ long sys_fork(void) {
     child->cr3       = new_pml4;
     child->owns_pml4 = true;
 
-    /* COW fork: share parent pages as copy-on-write instead of deep copy. */
-    if (vmm_cow_fork(parent->cr3, new_pml4) != 0) {
-        vmm_destroy_user_pml4(new_pml4);
-        memset(child, 0, sizeof(*child));
-        child->state = PROC_UNUSED;
-        return -ABI_ENOMEM;
+    /* Slice 88: park same-CR3 siblings before write-protecting their pages. */
+    tg_vm_quiesce(parent);
+
+    /* Walk+WP under STW without the BKL: chrome's address space is huge and
+     * holding the global lock across vmm_cow_fork freezes every other syscall
+     * (including DevTools pipe I/O) for tens of seconds. Siblings are parked;
+     * page_ref atomics serialize with #PF CoW. Re-take BKL for VMA clone. */
+    {
+        bool held = bkl_held();
+        if (held) bkl_exit();
+#ifdef CHROMIUM_BOOT
+        kprintf("[fork] cow_fork begin pid=%d\n", parent->pid);
+#endif
+        int cow_rc = vmm_cow_fork(parent->cr3, new_pml4);
+#ifdef CHROMIUM_BOOT
+        kprintf("[fork] cow_fork done pid=%d rc=%d\n", parent->pid, cow_rc);
+#endif
+        if (held) bkl_enter();
+        /* VMA tables are tgid-keyed; chrome forks from a launcher THREAD. */
+        int vma_pid = parent->is_thread ? parent->tgid : parent->pid;
+        if (cow_rc == 0)
+            mmap_cow_clone(vma_pid, child_pid);
+        tg_vm_resume(parent);   /* always: releases g_cow_fork_lock */
+        if (cow_rc != 0) {
+            vmm_destroy_user_pml4(new_pml4);
+            memset(child, 0, sizeof(*child));
+            child->state = PROC_UNUSED;
+            return -ABI_ENOMEM;
+        }
     }
-    mmap_cow_clone(parent->pid, child_pid);
 
     /* Clone file descriptors from the table the parent actually USES.
      *
@@ -350,6 +549,185 @@ long sys_fork(void) {
 }
 
 /* ===================================================================
+ * sys_fork_share -- vfork / chrome LaunchProcess semantics.
+ *
+ * Child shares the parent's CR3 and VMA table until it execve()s or _exits.
+ * The launching thread blocks until then. No vmm_cow_fork write-protect, so
+ * sibling threads keep writing PartitionAlloc without a stale-TLB window.
+ * =================================================================== */
+void vfork_child_done(struct proc *child) {
+    if (!child || child->vfork_parent <= 0) return;
+    int ppid = child->vfork_parent;
+    child->vfork_parent = 0;
+    struct proc *par = proc_lookup(ppid);
+
+    /* Tear down the private stack we mapped into the shared CR3 so it does
+     * not leak into the parent's address space after exec. */
+    if (child->vfork_stack_va && child->vfork_stack_pages && par) {
+        uint64_t pages = child->vfork_stack_pages;
+        uint64_t va = child->vfork_stack_va;
+        uint64_t saved = vmm_set_editor_root(par->cr3);
+        for (uint64_t i = 0; i < pages; i++) {
+            uint64_t pva = va + i * PAGE_SIZE;
+            uint64_t phys = vmm_translate(pva);
+            vmm_unmap(pva, PAGE_SIZE);
+            if (phys) pmm_free_page(phys);
+        }
+        vmm_set_editor_root(saved);
+        child->vfork_stack_va = 0;
+        child->vfork_stack_pages = 0;
+    }
+
+    /* After exec the child owns a private mm; clear the borrow marker. */
+    child->mm_owner = 0;
+    if (!par) return;
+    /* Signal completion on the PARENT so a late waiter cannot observe a
+     * reaped child's PCB, and so a child that finishes before the parent
+     * blocks does not lose the wakeup. */
+    __atomic_store_n(&par->vfork_child, 0, __ATOMIC_RELEASE);
+    if (par->state == PROC_BLOCKED) {
+        par->state = PROC_READY;
+        sched_enqueue(par);
+    }
+}
+
+long sys_fork_share(void) {
+    struct proc *parent = current_proc();
+    if (!parent || parent->pid == 0) return -ABI_EINVAL;
+
+    struct proc *tg = (parent->is_thread && parent->tgid != parent->pid)
+                          ? proc_lookup(parent->tgid) : parent;
+    if (!tg) tg = parent;
+
+    struct proc *child = NULL;
+    for (int i = 1; i < PROC_MAX; i++) {
+        if (g_proc[i].state == PROC_UNUSED) { child = &g_proc[i]; break; }
+    }
+    if (!child) return -ABI_ENOMEM;
+
+    int child_pid = (int)(child - g_proc);
+    memcpy(child, parent, sizeof(*child));
+
+    child->pid       = child_pid;
+    child->ppid      = parent->pid;
+    child->state     = PROC_UNUSED;
+    child->wait_pid  = -1;
+    child->exit_code = -1;
+    child->next_ready = NULL;
+    child->on_rq  = false;
+    child->on_cpu = 0;
+    child->vm_quiesce  = 0;
+    child->vm_quiesced = 0;
+    child->next_wait  = NULL;
+    child->wait_head  = NULL;
+    child->join_waiters = NULL;
+    child->tgid      = child_pid;
+    child->is_thread = false;
+    child->detached  = false;
+    child->created_ns      = perf_now_ns();
+    child->cpu_ns          = 0;
+    child->syscall_count   = 0;
+    child->last_switch_tsc = 0;
+    child->sysprot_priv    = 0;
+    child->pending_signals  = 0;
+    child->sigstate.pending = 0;
+
+    /* Borrow parent's address space — do NOT CoW-WP. */
+    child->cr3       = tg->cr3;
+    child->owns_pml4 = false;
+    child->mm_owner  = proc_mm_pid(parent);
+    child->vfork_parent = parent->pid;
+    child->vfork_child  = 0;
+    child->vfork_stack_va = 0;
+    child->vfork_stack_pages = 0;
+
+    struct file **ptab = proc_fds(parent);
+    for (int i = 0; i < PROC_NFDS; i++) {
+        child->fds[i] = (ptab && ptab[i]) ? file_clone(ptab[i]) : NULL;
+    }
+
+    if (!build_fork_kstack(child)) {
+        for (int i = 0; i < PROC_NFDS; i++) {
+            if (child->fds[i]) file_close(child->fds[i]);
+            child->fds[i] = NULL;
+        }
+        memset(child, 0, sizeof(*child));
+        child->state = PROC_UNUSED;
+        return -ABI_ENOMEM;
+    }
+
+    memcpy((uint8_t *)child->kstack_top  - sizeof(struct syscall_regs),
+           (uint8_t *)parent->kstack_top - sizeof(struct syscall_regs),
+           sizeof(struct syscall_regs));
+
+    /* Private user stack in the shared CR3. Sharing the parent's RSP lets
+     * the child (crashpad double-fork, glibc) smash the launcher's frame;
+     * parent then resumes at rip=0. Map a fresh 512 KiB stack at a high VA
+     * keyed by child pid (visible to the parent too until vfork_child_done). */
+    {
+        const uint32_t np = 128; /* 512 KiB — glibc/crashpad probes past 32K */
+        uint64_t slot = 0x00007f0000000000ULL +
+                        ((uint64_t)child_pid * 0x200000ULL); /* 2 MiB slots */
+        uint64_t stack_va = slot;
+        uint64_t saved = vmm_set_editor_root(tg->cr3);
+        bool ok = true;
+        for (uint32_t i = 0; i < np; i++) {
+            uint64_t phys = pmm_alloc_page();
+            if (!phys) { ok = false; break; }
+            if (!vmm_map(stack_va + (uint64_t)i * PAGE_SIZE, phys, PAGE_SIZE,
+                         VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
+                pmm_free_page(phys);
+                ok = false;
+                break;
+            }
+            memset(pmm_phys_to_virt(phys), 0, PAGE_SIZE);
+        }
+        vmm_set_editor_root(saved);
+        if (!ok) {
+            for (int i = 0; i < PROC_NFDS; i++) {
+                if (child->fds[i]) file_close(child->fds[i]);
+                child->fds[i] = NULL;
+            }
+            if (child->kstack_base) kfree(child->kstack_base);
+            memset(child, 0, sizeof(*child));
+            child->state = PROC_UNUSED;
+            return -ABI_ENOMEM;
+        }
+        child->vfork_stack_va = stack_va;
+        child->vfork_stack_pages = np;
+        struct syscall_regs *cr =
+            (struct syscall_regs *)((uint8_t *)child->kstack_top
+                                    - sizeof(struct syscall_regs));
+        /* SysV ABI red zone is 128 bytes below RSP; leave headroom. */
+        cr->user_rsp = stack_va + (uint64_t)np * PAGE_SIZE - 256;
+    }
+
+    child->user_pages = parent->user_pages;
+    __atomic_store_n(&parent->vfork_child, child_pid, __ATOMIC_RELEASE);
+    child->state = PROC_READY;
+    sched_enqueue(child);
+    perf_count_proc_spawn();
+
+    kprintf("[fork] share pid=%d -> child pid=%d cr3=0x%lx mm=%d stack=0x%lx\n",
+            parent->pid, child_pid, (unsigned long)child->cr3, child->mm_owner,
+            (unsigned long)child->vfork_stack_va);
+
+    /* Block the launcher until child execve/_exit. Drop BKL so the child
+     * (and siblings) can enter the kernel. */
+    {
+        bool held = bkl_held();
+        if (held) bkl_exit();
+        while (__atomic_load_n(&parent->vfork_child, __ATOMIC_ACQUIRE) != 0) {
+            parent->state = PROC_BLOCKED;
+            sched_yield();
+        }
+        if (held) bkl_enter();
+    }
+
+    return child_pid;
+}
+
+/* ===================================================================
  * sys_clone_thread -- Linux clone(CLONE_VM,...) : create a thread that
  * SHARES the caller's address space and, like fork, resumes after the
  * clone `syscall` (rax = 0) -- but on the caller-provided `stack`, with
@@ -385,6 +763,9 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->is_thread  = true;
     child->cr3        = tg->cr3;                /* SHARE the address space */
     child->owns_pml4  = false;                  /* never free the shared PML4 */
+    child->mm_owner   = 0;
+    child->vfork_parent = 0;
+    child->vfork_child  = 0;
     child->detached   = true;
     child->state      = PROC_UNUSED;
     child->wait_pid   = -1;
@@ -547,6 +928,8 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
     /* Success -- point of no return. Commit the new address space. */
     write_cr3(new_pml4);
     vmm_set_editor_root(old_editor);
+    if (p->vfork_parent > 0)
+        vfork_child_done(p);
     if (old_pml4 != new_pml4 && p->owns_pml4) {
         vmm_destroy_user_pml4(old_pml4);
     }
@@ -799,7 +1182,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     }
 
     /* Build auxv + pack argv/envp onto user stack. */
-    struct abi_auxv aux[10];
+    struct abi_auxv aux[20];
     int auxc = 0;
     uint64_t user_rsp = USER_STACK_RSP_INIT;
 
@@ -812,6 +1195,13 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         aux[auxc++] = (struct abi_auxv){ ABI_AT_ENTRY,  prog_info.entry   };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PAGESZ, PAGE_SIZE         };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_FLAGS,  0                 };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,    0                 };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,   0                 };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,    0                 };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,   0                 };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP,  ABI_AT_HWCAP_X86_64_BASE };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_CLKTCK, 100               };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE, 0                 };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
 
         /* Pack using inline logic (we can't call proc.c's static pack_user_stack).
@@ -873,6 +1263,13 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
             auxv_ptr[auxc].a_type = ABI_AT_NULL;
             auxv_ptr[auxc].a_val  = 0;
 
+            /* Slice 87: seed AT_RANDOM (was left zero with the stack). */
+            {
+                uint8_t rnd[16];
+                rng_fill(rnd, sizeof rnd);
+                memcpy((void *)(uintptr_t)(USER_STACK_TOP_VA - 16), rnd, 16);
+            }
+
             *(uint64_t *)argc_va = (uint64_t)(uint32_t)kargc;
             uaccess_end(uflags);
             user_rsp = argc_va;
@@ -890,6 +1287,11 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     /* Success -- point of no return. Destroy the old address space. */
     write_cr3(new_pml4);
     vmm_set_editor_root(old_editor);
+
+    /* Share-until-exec: drop the borrowed mm and unblock the launcher
+     * now that we have a private address space. */
+    if (p->vfork_parent > 0)
+        vfork_child_done(p);
 
     /* Destroy the old PML4 now that we're on the new one. */
     if (old_pml4 != new_pml4 && p->owns_pml4) {

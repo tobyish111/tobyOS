@@ -394,6 +394,23 @@ static void default_exception(struct regs *r) {
                 extern void mmap_debug_fault_vma(uint64_t a);
                 if (addr) mmap_debug_fault_vma(addr);
                 if (true_rip) mmap_debug_fault_vma(true_rip);
+                /* Slice 87: #GP with a non-canonical pointer in a register is
+                 * almost always a corrupted freelist/heap slot (PartitionAlloc
+                 * ThreadCache). Dump the VMA + page journal for the pointer
+                 * SOURCE (rbx/r14/r15) -- the fatal path used to skip this for
+                 * signal-delivered faults, leaving only the useless rip VMA. */
+                if (r->vector == 13) {
+                    extern void pgj_dump(uint64_t);
+                    uint64_t srcs[3] = { pre.r15, pre.rbx, pre.r14 };
+                    for (int si = 0; si < 3; si++) {
+                        uint64_t s = srcs[si];
+                        if (s < 0x10000ull || s >= 0x0000800000000000ull)
+                            continue;
+                        kprintf("[sigfault] ptr-src[%d]=%p:\n", si, (void *)s);
+                        mmap_debug_fault_vma(s);
+                        pgj_dump(s);
+                    }
+                }
             }
 #endif
             return;   /* iretq lands in the user handler */

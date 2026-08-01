@@ -4751,3 +4751,78 @@ NEXT WALL (new, much later): a CHILD process, pid=10 'chrome+T', takes a
 vec=13 GP fault and exits 191 at ~74s after 39.5s of real CPU. Registers
 carry ASCII-looking bytes (r10=0x74736f01, r15=0x0605010702020301), which by
 the standing rule means memory corruption rather than a bad return value.
+
+## Slice 87: identified the ~74s fault as PartitionAlloc ThreadCache;
+## shootdown IRQ-off deadlock FIXED; AT_RANDOM seeded; CoW-window still OPEN
+
+### Identity of the ~74s crash (was mislabeled "child process")
+pid=10 is a THREAD of the browser (`clone` tid=10 in tgid=3), not a forked
+child. `--in-process-gpu` / `--no-zygote`. pid=29 exit 127 is benign:
+`execve(xdg-settings ...)` missing helper.
+
+Disassembly of rip file-addr `0x31c3fc4`: `#GP` on `mov (%r15),%rdx` with
+non-canonical `r15=0x0605010702020301`. The surrounding code is Chromium
+**PartitionAlloc ThreadCache** freelist lookup (`pthread_getspecific` +
+`imul $0x5e0`, freelist `bswap` / `second == ~first` check, 2 MiB super-page
+math). Same class as the YouTube ASCII-in-pointer crashes.
+
+### Shootdown IRQ-off deadlock — CONFIRMED and fixed
+Baseline run had `[tlb] ERROR: shootdown STILL un-acked after 16 rounds` in
+a cluster at 8–12 s (crashpad forks). Two CPUs taking CoW faults with IRQs
+masked deadlock on each other's shootdown IPIs, both time out, both proceed
+with stale WRITABLE TLBs.
+
+Fix (`apic.c`): while waiting for peer acks, periodically **self-flush CR3
+and bump our own tlb gen** (exactly what the ISR would do). Peers waiting
+on us observe progress; no `sti`, no BKL drop.
+- Attempt that **sti'd** across the wait → kstack_top=0 SMEP panic on
+  thread-group teardown. Retracted.
+- Attempt that **dropped BKL** across the wait → chrome INT3/CHECK at ~12 s
+  (VMA races). Retracted.
+- Self-ack: `[tlb] WARN/ERROR` count **8+/run → 0** on validation runs.
+
+### AT_RANDOM was all zeros — fixed
+`AT_RANDOM` pointed at the 16-byte stack pad that `build_user_stack` zeroes
+and never filled. Every process ran with `fs:0x28 == 0`. Now `rng_fill`s
+those 16 bytes on exec (proc.c + fork.c). Confirmed live:
+`fs:0x28=0x37b81f2d35988700` matching the stack slot when intact.
+
+Also: brk shrink was free-THEN-shootdown; now batch + shootdown-before-free
+(leak on un-acked). Quarantine ring got its own spinlock.
+
+### Residual wall (OPEN) — CoW-after-fork stale-writable window
+With shootdown timeouts gone, threads still #GP in PA with poison/ASCII,
+and the page journal on the faulting pointer source shows:
+
+    map4k → cow-fork-wp → cow-copy
+
+i.e. the page was write-protected for fork, then CoW-copied, and the
+pointer slot is already garbage. `vmm_cow_fork` write-protects the entire
+user half, then shoots down once at the end — sibling threads keep running
+with cached WRITABLE translations for that whole walk. Periodic
+shootdowns mid-walk were tried and **made it worse** (mass simultaneous
+#GP, browser exit 191 at 13 s); retracted. Next lever: stop-the-world the
+thread group around the WP walk, or make the walk+shootdown atomic per
+subtree under a hold that actually keeps siblings out of user mode.
+
+Tier 2.5 (Ozone X11 + MIT-SHM) infra landed; **not DONE** — see handoff §4.
+
+### Tier 2.5 close-out note (2026-07-31)
+- STW `tg_vm_quiesce`, teardown `on_cpu` wait, kstack guard, fake X + SysV
+  MIT-SHM + `xframe_poll`, PI futex `uaddr2` / UNLOCK handoff: in tree.
+- Full-chrome **stability gate PASSED** on headless ozone + screencast
+  (example.com, ~930 frames / session, tlb ERROR 0, no exit 191).
+- Headed X11 still: Displays updated → only 10×10 CreateWindows → UI futex
+  park → createTarget silence. SHM paint not default. Measure vs Slice 68
+  recorded on JPEG path only (~930 vs ~1050 baseline; no 2.3× claim).
+
+### Follow-ups observed late in the slice
+- Richer auxv (AT_HWCAP/CLKTCK/UID/SECURE) appears to clear the flaky
+  `GLib: getauxval () failed` path (0 hits on the clean rebuild run).
+- A clean full-`.o` rebuild then showed browser `exit 191` at ~9 s via
+  `#UD` (vec=6, likely `ud2` after CHECK) and a **sched panic**: switching
+  to tid with `kstack_top=0` during thread-group teardown. That is the
+  reaped-slot-still-runnable class resurfacing on the crash path — fix
+  alongside the CoW window. tlb ERROR counts also returned on that run
+  (post-panic / dying tree); treat as contaminated, re-measure after the
+  kstack guard.

@@ -631,6 +631,13 @@ static void serial_heartbeat(void) {
                    (unsigned long)up_s,
                    free_mib, total_mib,
                    gui_active() ? "on" : "off");
+#ifdef CHROMIUM_BOOT
+    /* Wake Ozone X clients blocked in recvmsg (poll path never runs). */
+    {
+        extern void xserver_tick(void);
+        xserver_tick();
+    }
+#endif
 }
 #endif
 
@@ -682,7 +689,6 @@ static __attribute__((noreturn)) void idle_loop(void) {
          * reads its own locked counters and kprintf_serial self-serialises. */
         serial_heartbeat();
 #endif
-
         /* SMP: pid 0's per-tick work (gui_tick, service ticks, net/USB/shell)
          * touches shared kernel state that user procs on other cores reach via
          * their syscalls, so each phase runs under the BKL.
@@ -710,6 +716,13 @@ static __attribute__((noreturn)) void idle_loop(void) {
          * blocked (the sched_yield-slow-path driver only fires while threads
          * are yielding), so a parked poller always makes progress. */
         poll_tick();
+#ifdef CHROMIUM_BOOT
+        /* Wake Ozone X clients blocked in recvmsg (needs BKL: sock enqueue). */
+        {
+            extern void xserver_tick(void);
+            xserver_tick();
+        }
+#endif
         bkl_exit();
 
         /* Periodic filesystem writeback so /data survives an unclean

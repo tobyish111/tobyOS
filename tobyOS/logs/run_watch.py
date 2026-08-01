@@ -78,7 +78,9 @@ def main():
            "-netdev", "user,id=net0",
            "-device", "e1000,netdev=net0,mac=52:54:00:12:34:56",
            "-accel", "whpx,kernel-irqchip=off",
-           "-smp", "4", "-m", "6144", "-cpu", "qemu64,+smep,+smap",
+           # Tier 2.5 bring-up: 1 vCPU avoids stale-TLB CoW races across APs
+           # while headed Ozone is validated; restore 4 once STW is airtight.
+           "-smp", "1", "-m", "8192", "-cpu", "qemu64,+smep,+smap",
            "-serial", "file:" + SERIAL,
            "-qmp", "tcp:127.0.0.1:%d,server,nowait" % PORT,
            "-no-reboot", "-display", "none"]

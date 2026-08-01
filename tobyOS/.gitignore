@@ -98,3 +98,5 @@ logs/
 
 # Frame-grab scratch from real-HW video debugging
 logs/frames*/
+programs/chromium/chrome-linux64/
+programs/chromium/chrome-linux64.zip

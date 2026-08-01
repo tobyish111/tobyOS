@@ -91,6 +91,7 @@ extern void syscall_entry(void);
 
 /* Phase 3 M3.2: fork/exec forward declarations */
 extern long sys_fork(void);
+extern long sys_fork_share(void);
 extern long sys_execve(const char *path, char *const argv[], char *const envp[]);
 /* Track B/B9: Linux clone(CLONE_VM) thread (shared address space). */
 extern long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
@@ -121,6 +122,10 @@ extern long sys_module(uint64_t op, uint64_t arg1, uint64_t arg2);
 extern long sys_shm_open(const char *name, int flags, size_t size);
 extern long sys_shm_map(int shm_id, uint64_t hint_addr);
 extern long sys_shm_unlink(const char *name);
+extern long sys_shmget(int key, size_t size, int shmflg);
+extern long sys_shmat(int shmid, uint64_t shmaddr, int shmflg);
+extern long sys_shmdt(uint64_t shmaddr);
+extern long sys_shmctl(int shmid, int cmd, void *buf);
 extern long sys_unix_socket(void);
 extern long sys_unix_bind(int sockfd, const char *path);
 extern long sys_unix_listen(int sockfd, int backlog);
@@ -4022,7 +4027,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
 
     case ABI_SYS_FUTEX:
         return futex((uint32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3,
-                     (const void *)(uintptr_t)a4);
+                     (const void *)(uintptr_t)a4,
+                     (uint32_t *)(uintptr_t)a5);
 
     case ABI_SYS_SET_TLS:
         thread_set_tls((uint64_t)a1);
@@ -4080,6 +4086,35 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         if (!user_str_in(kname, sizeof(kname),
                          (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
         return sys_shm_unlink(kname);
+    }
+
+    case ABI_SYS_XFRAME_POLL: {
+        /* Tier 2.5: chromewin blits Ozone/MIT-SHM pixels without CDP JPEG.
+         * a1=struct abi_xframe*, a2=pixels|NULL, a3=cap */
+        extern long xframe_poll(uint32_t *, uint32_t *, uint32_t *,
+                                uint32_t *, void *, size_t);
+        if (!a1) return -ABI_EINVAL;
+        uint32_t w = 0, h = 0, stride = 0, gen = 0;
+        void *upix = (void *)(uintptr_t)a2;
+        size_t cap = (size_t)a3;
+        uint8_t *tmp = 0;
+        if (upix && cap) {
+            tmp = kmalloc(cap);
+            if (!tmp) return -ABI_ENOMEM;
+        }
+        long rc = xframe_poll(&w, &h, &stride, &gen, tmp, cap);
+        if (rc < 0) { if (tmp) kfree(tmp); return rc; }
+        struct abi_xframe xf = { w, h, stride, gen };
+        if (copy_to_user((void *)(uintptr_t)a1, &xf, sizeof xf) != 0)
+            { if (tmp) kfree(tmp); return -ABI_EFAULT; }
+        if (tmp) {
+            size_t nbytes = (size_t)stride * h;
+            if (nbytes > cap) nbytes = cap;
+            if (copy_to_user(upix, tmp, nbytes) != 0)
+                { kfree(tmp); return -ABI_EFAULT; }
+            kfree(tmp);
+        }
+        return 0;
     }
 
     case ABI_SYS_UNIX_SOCKET:
@@ -4433,6 +4468,8 @@ enum {
      * the LAST blocker between a captured frame and /data/shot.png. */
     LX_creat = 85, LX_fchown = 93,
     LX_sched_getparam = 143, LX_sched_getscheduler = 145,
+    /* Tier 2.5: SysV shm for MIT-SHM / Ozone */
+    LX_shmget = 29, LX_shmat = 30, LX_shmctl = 31, LX_shmdt = 67,
 };
 
 /* arch_prctl codes. */
@@ -4913,6 +4950,11 @@ static short file_poll_ready(struct file *f) {
              * -- real backpressure, no loss. */
             if (!(f->sock && sock_unix_send_would_block(f->sock)))
                 r |= LXP_POLLOUT;                    /* UDP (no peer) or room */
+            /* Tier 2.5: keep fake-X clients from wedging in wait_for_event. */
+            if (f->sock && f->sock->x_server) {
+                extern void xserver_on_poll(struct sock *);
+                xserver_on_poll(f->sock);
+            }
             if (f->sock && f->sock->count > 0) r |= LXP_POLLIN;  /* rx queued */
             /* AF_UNIX socketpair: a closed peer makes us readable (EOF) + HUP,
              * so Mojo's epoll loop detects disconnect. The fake-X-server loopback
@@ -7260,22 +7302,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     switch (n) {
     /* ---- exits ---- */
     case LX_exit:
+        sys_exit((int)a1);          /* noreturn */
+        return 0;
     case LX_exit_group:
 #ifdef CHROMIUM_BOOT
-        /* Slice 56 wall R1: the watch-page RENDERER sometimes exits CLEANLY
-         * seconds after page handoff, killing the page (runs 2 + 5, with and
-         * without audio). Only fatal faults dumped the syscall ring before;
-         * dump it here too so the exit's prelude (channel EOF? shutdown
-         * message?) is on the record. Once, exit_group only (not per-thread). */
-        if (n == LX_exit_group) {
+        /* Slice 56 wall R1 / Slice 83: dump prelude on non-zero exit_group. */
+        {
             struct proc *xp = current_proc();
-            /* Slice 83: ANY non-zero exit_group from a Linux process dumps
-             * the syscall ring. The browser aborts with 191 at ~7s -- long
-             * before the 60s deep dump that normally prints the ring -- so
-             * its final syscalls have never been on the record. We know the
-             * sequence ENDS sendmsg -> ... -> exit_group and that the reply
-             * read is missing; this shows every call in between, with the
-             * arguments and returns the name-only ring cannot give. */
             if (xp && a1 != 0) {
                 kprintf("[xexit] pid=%d '%s' exit_group(%ld) -- syscall tail:\n",
                         xp->pid, xp->name, (long)a1);
@@ -7286,15 +7319,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 kprintf("[rexit] RENDERER pid=%d tgid=%d exit_group(%ld) -- "
                         "last channel ops of this thread group:\n",
                         xp->pid, xp->tgid, (long)a1);
-                /* Slice 56d: dump the dying thread-group's LAST <=48 channel
-                 * ops from the always-on ring (see g_chring above). This is
-                 * the R1 discriminator; the global syscall ring proved useless
-                 * (flooded by a sched_yield spinner). */
                 {
                     int keep[48]; uint32_t ki = 0;
                     for (uint32_t k = 0; k < CHRING_MAX; k++) {
                         uint32_t idx = (g_chring_i + k) % CHRING_MAX;
-                        if (g_chring[idx].ms == 0) continue;      /* unused */
+                        if (g_chring[idx].ms == 0) continue;
                         if (g_chring[idx].tgid != xp->tgid) continue;
                         keep[ki % 48] = (int)idx; ki++;
                     }
@@ -7312,7 +7341,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
         }
 #endif
-        sys_exit((int)a1);          /* noreturn */
+        /* Whole thread-group death (Linux exit_group), not per-thread exit. */
+        proc_exit_group((int)a1);   /* noreturn */
         return 0;
 
     /* ---- plain byte I/O (tobyOS handlers already take user buffers) ---- */
@@ -7423,6 +7453,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             struct vfs_stat vs;
             if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR)
                 return linux_open_dir(kpath);
+#ifdef CHROMIUM_BOOT
+            /* SQLite WAL -shm: memfd pre-size still busy-loops (mmap/lock).
+             * ENOENT forces rollback-journal fallback (ServerCertificate path). */
+            {
+                size_t kp_n = 0;
+                while (kpath[kp_n]) kp_n++;
+                if (kp_n >= 4 && kpath[kp_n - 4] == '-' &&
+                    kpath[kp_n - 3] == 's' && kpath[kp_n - 2] == 'h' &&
+                    kpath[kp_n - 1] == 'm') {
+                    static int shmd;
+                    if (shmd < 4) { shmd++;
+                        kprintf("[lopen] deny WAL -shm %s -> ENOENT\n", kpath); }
+                    return -ABI_ENOENT;
+                }
+            }
+#endif
         }
         long ofd = do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
 #ifdef CHROMIUM_BOOT
@@ -7611,18 +7657,16 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     /* ---- process control (B8): the shell forks, execs, and waits ---- */
     case LX_fork:
     case LX_vfork: {
-        long fr = do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+        /* LX_vfork / CLONE_VFORK → share-until-exec. Plain fork → CoW copy. */
+        long fr = (n == LX_vfork) ? sys_fork_share()
+                                  : do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
 #ifdef CHROMIUM_BOOT
-        /* The [fork] line inside sys_fork proves fork COMPLETED; this proves
-         * the PARENT got the value back and is on its way out of the syscall.
-         * If [fork] appears and this does not, we die between the two; if both
-         * appear and the world still stops, the parent reached here and
-         * something else halts the machine. */
         {   static int pf = 0;
             if (pf < 200) { pf++;
                 struct proc *me = current_proc();
-                kprintf("[fork] parent pid=%d returning %ld\n",
-                        me ? me->pid : -1, fr); } }
+                kprintf("[fork] parent pid=%d returning %ld%s\n",
+                        me ? me->pid : -1, fr,
+                        (n == LX_vfork) ? " (share)" : ""); } }
 #endif
         return fr;
     }
@@ -7641,23 +7685,49 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * its socketpair endpoint was torn down, and the browser's handshake
          * sendmsg came back EPIPE -> CHECK -> INT3 -> exit 191. A real
          * pthread always sets CLONE_THREAD (measured alongside it:
-         * 0x3d0f00 = VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|PARENT_SETTID).
-         * The vfork case becomes a plain fork here: semantically safe,
-         * because such a child only execs or _exits. */
+         * 0x3d0f00 = VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|PARENT_SETTID). */
         if ((uint64_t)a1 & 0x10000u /* CLONE_THREAD */)
             return sys_clone_thread((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
                                     (uint64_t)a4, (uint64_t)a5);
         {
-            long cr = do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+            uint64_t cfl = (uint64_t)a1;
+            /* Share only for CLONE_VFORK/VM. Plain fork stays CoW (glibc
+             * resumes on the parent's stack frame — a private RSP breaks it). */
+            int share = (cfl & 0x4000u /* CLONE_VFORK */) ||
+                        (cfl & 0x100u  /* CLONE_VM */);
 #ifdef CHROMIUM_BOOT
-            /* THIS is the path chrome forks through (glibc fork() routes via
-             * clone), not LX_fork -- instrumenting LX_fork alone showed 4 forks
-             * completed and 0 returns purely because nothing came through it. */
-            {   static int cf = 0;
-                if (cf < 200) { cf++;
-                    struct proc *me = current_proc();
-                    kprintf("[fork] parent pid=%d clone-returning %ld\n",
-                            me ? me->pid : -1, cr); } }
+            { static int cf = 0; if (cf < 200) { cf++;
+                struct proc *me = current_proc();
+                kprintf("[fork] clone flags=0x%lx pid=%d -> %s\n",
+                        (unsigned long)cfl, me ? me->pid : -1,
+                        share ? "share" : "cow"); } }
+            /* Tier 2.5: STW tg_vm_quiesce + eager CoW make limited chrome
+             * CoW forks viable. Cap still blocks fork storms (xdg-settings
+             * loops); raised from 1 — denying #2 left UI stuck before any
+             * browser CreateWindow/MapWindow (DevTools never answered). */
+            if (!share) {
+                struct proc *me = current_proc();
+                if (me && me->tgid == 3) {
+                    static int chrome_cow_forks;
+                    /* Multi-process Ozone (no --single-process): allow a
+                     * handful of utility/renderer CoW forks; still cap storms. */
+                    if (chrome_cow_forks++ >= 16) {
+                        kprintf("[fork] deny chrome CoW fork #%d pid=%d\n",
+                                chrome_cow_forks, me->pid);
+                        return -ABI_EAGAIN;
+                    }
+                    kprintf("[fork] allow chrome CoW fork #%d pid=%d\n",
+                            chrome_cow_forks, me->pid);
+                }
+            }
+#endif
+            long cr = share ? sys_fork_share()
+                            : do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+#ifdef CHROMIUM_BOOT
+            { static int crl = 0; if (crl < 200) { crl++;
+                struct proc *me = current_proc();
+                kprintf("[fork] parent pid=%d clone-returning %ld\n",
+                        me ? me->pid : -1, cr); } }
 #endif
             return cr;
         }
@@ -7747,8 +7817,19 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * and bound the length by what we actually have. */
         memset(ktmp, 0, sizeof ktmp);
         int rc = vfs_readlink(kpath, ktmp, cap);
-        if (rc == VFS_ERR_NOENT) return -ABI_ENOENT;
-        if (rc != VFS_OK)        return -ABI_EINVAL;
+        if (rc != VFS_OK) {
+            /* Linux: EINVAL if the path exists but is not a symlink, ENOENT
+             * if missing. glibc realpath() requires exactly this split --
+             * returning ENOENT for a plain dir/file makes MakeAbsoluteFilePath
+             * fail, and chrome then marks --user-data-dir invalid. */
+            if (rc == VFS_ERR_NOENT) {
+                struct vfs_stat vs;
+                if (vfs_stat(kpath, &vs) == VFS_OK)
+                    return -ABI_EINVAL;
+                return -ABI_ENOENT;
+            }
+            return -ABI_EINVAL;
+        }
         size_t n = 0;
         while (n < cap && ktmp[n]) n++;    /* bounded: never scans past cap */
         if (n == 0) return -ABI_EINVAL;    /* nothing resolved -> not a link */
@@ -8060,6 +8141,15 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return sys_madvise_dontneed((uint64_t)a1, (uint64_t)a2);
         return 0;
 
+    case LX_shmget:
+        return sys_shmget((int)a1, (size_t)a2, (int)a3);
+    case LX_shmat:
+        return sys_shmat((int)a1, (uint64_t)a2, (int)a3);
+    case LX_shmdt:
+        return sys_shmdt((uint64_t)a1);
+    case LX_shmctl:
+        return sys_shmctl((int)a1, (int)a2, (void *)(uintptr_t)a3);
+
     /* prlimit64(pid, resource, *new, *old) and the legacy getrlimit/setrlimit.
      * glibc reads RLIMIT_STACK at startup (to size the main+default thread
      * stacks) and RLIMIT_NOFILE elsewhere. We don't enforce limits, so report
@@ -8138,6 +8228,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return sys_clone_thread(ca.flags, stack_top, ca.parent_tid,
                                     ca.child_tid, ca.tls);
         }
+        if ((ca.flags & 0x4000u /* CLONE_VFORK */) ||
+            (ca.flags & 0x100u  /* CLONE_VM */))
+            return sys_fork_share();
+#ifdef CHROMIUM_BOOT
+        {
+            struct proc *me = current_proc();
+            if (me && me->tgid == 3) {
+                static int chrome_c3_cow;
+                if (chrome_c3_cow++ >= 32) {
+                    kprintf("[fork] deny chrome clone3 CoW #%d pid=%d\n",
+                            chrome_c3_cow, me->pid);
+                    return -ABI_EAGAIN;
+                }
+                kprintf("[fork] allow chrome clone3 CoW #%d pid=%d\n",
+                        chrome_c3_cow, me->pid);
+            }
+        }
+#endif
         return do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
     }
 
@@ -8484,7 +8592,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return -ABI_EFAULT;
         return secs;
     }
-    case LX_fallocate:  return 0;      /* best-effort; tobyfs grows on write */
+    case LX_fallocate: {
+        /* SQLite WAL -shm sizing: posix_fallocate(fd, 0, 32KiB) then fstat.
+         * A silent success that left vfs.size=0 made History-shm reopen in a
+         * tight loop forever (Tier 2.5 headed ozone stall after CreateWindow).
+         * Mirror ftruncate: record the end offset as the file size. */
+        struct file *af = fd_lookup((int)a1);
+        if (!af) return -ABI_EBADF;
+        uint64_t off = (uint64_t)a3;
+        uint64_t len = (uint64_t)a4;
+        uint64_t end = off + len;
+        if (af->kind == FILE_KIND_MEMFD)
+            return memfd_ftruncate(af->memfd, end);
+        if (af->kind == FILE_KIND_VFS && end > (uint64_t)af->vfs.size)
+            af->vfs.size = (size_t)end;
+        return 0;
+    }
     case LX_inotify_add_watch: {
         /* No real file-change events, but hand back a monotonic watch descriptor
          * so callers (fontconfig, dir watching) proceed rather than erroring. */
@@ -8631,7 +8754,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         }
 #endif
         long fr = futex((uint32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3,
-                        (const void *)(uintptr_t)a4);
+                        (const void *)(uintptr_t)a4,
+                        (uint32_t *)(uintptr_t)a5);
 #ifdef CHROMIUM_BOOT
         waitt_exit();
         /* [futex] WAIT/WAKE with ADDRESS and RESULT, so waits can be matched to
@@ -15979,6 +16103,20 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * `rv` is preserved as the to-be-restored RAX for the handler case
      * (or swapped for a syscall restart when the action has SA_RESTART). */
     signal_deliver_syscall(rv, num);
+
+    /* Slice 88: CoW-fork STW -- a sibling must not return to user while
+     * vmm_cow_fork is stripping PTE_WRITABLE. Park until tg_vm_resume. */
+    {
+        struct proc *qp = current_proc();
+        while (qp && __atomic_load_n(&qp->vm_quiesce, __ATOMIC_ACQUIRE)) {
+            qp->state = PROC_BLOCKED;
+            qp->vm_quiesced = 1;
+            bkl_exit();
+            sched_yield();
+            bkl_enter();
+            qp = current_proc();
+        }
+    }
 
     /* Leaving the kernel: drop the BKL so another core can enter. (If the
      * body proc_exit'd or a signal killed us, the scheduler already released

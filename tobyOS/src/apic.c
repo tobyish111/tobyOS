@@ -144,6 +144,30 @@ static bool cpu_may_hold_cr3(const struct percpu *c, uint64_t cr3) {
     return p->cr3 == cr3;
 }
 
+/* Slice 87: break the IRQ-off shootdown deadlock WITHOUT sti/BKL games.
+ *
+ * Two CPUs can take CoW faults concurrently with IRQs masked. Each then
+ * calls tlb_shootdown_remote() and waits for the other to ack -- but with
+ * IRQs off neither runs the shootdown ISR. Both time out, both proceed with
+ * stale WRITABLE TLB entries, and PartitionAlloc freelist heads get
+ * scribbled (full-chrome #GP at ThreadCache, rip in PA).
+ *
+ * An earlier attempt sti'd across the wait: that let peers ack, but also
+ * let timer/scheduling run mid-fault and produced a kstack_top=0 SMEP
+ * panic on thread-group teardown. Dropping the BKL raced VMA mutations
+ * and aborted chrome at ~12s on an INT3/CHECK.
+ *
+ * Fix: while WE wait (possibly with IRQs off), periodically self-flush and
+ * bump our own generation. That is exactly what the ISR would do, so any
+ * peer waiting on us observes progress and completes -- deadlock broken,
+ * no sti, no BKL drop. */
+static void tlb_shootdown_self_ack(uint32_t me) {
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+    __atomic_fetch_add(&g_tlb_gen[me], 1, __ATOMIC_SEQ_CST);
+}
+
 static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
     if (!g_ready) return true;
     uint32_t n = smp_cpu_count();
@@ -172,13 +196,28 @@ static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
      * them back to the PMM while any CPU could still hold the stale entry
      * (slice 50: it quarantines them until a later fully-acked shootdown).
      * Under WHPX a vCPU can be host-descheduled for >2M pauses, so timeouts
-     * here are routine, not exceptional. */
+     * here are routine, not exceptional.
+     *
+     * Slice 87: self-ack periodically so an IRQ-off peer that is itself in
+     * this wait loop can make OUR gen move (and we make theirs move). */
     bool all_acked = true;
     for (uint32_t i = 0; i < n && i < MAX_CPUS; i++) {
         if (!sent[i]) continue;
         uint32_t spins = 0;
         while (g_tlb_gen[i] == snap[i]) {
             __asm__ volatile("pause" ::: "memory");
+            if ((spins & 0xffu) == 0)
+                tlb_shootdown_self_ack(me);
+            /* Help CoW-fork STW: we are in-kernel with IRQs off, so demote
+             * to BLOCKED while still on_cpu (ACK path). Otherwise the forker
+             * waits forever for !PROC_RUNNING. */
+            {
+                struct proc *cp = current_proc();
+                if (cp && __atomic_load_n(&cp->vm_quiesce, __ATOMIC_ACQUIRE)) {
+                    cp->state = PROC_BLOCKED;
+                    cp->vm_quiesced = 1;
+                }
+            }
             if (++spins > 2000000u) {
                 static uint32_t warns;
                 if (warns < 8) {
@@ -194,7 +233,11 @@ static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
 }
 
 bool tlb_shootdown_remote_sync(void) {
-    return tlb_shootdown_sync_filtered(0);      /* broadcast, one round */
+    /* Broadcast (cr3=0). Retry a handful of times so a single WHPX
+     * deschedule does not force every free into quarantine. */
+    for (int round = 0; round < 8; round++)
+        if (tlb_shootdown_sync_filtered(0)) return true;
+    return false;
 }
 
 void tlb_shootdown_remote(void) {
@@ -212,15 +255,17 @@ void tlb_shootdown_remote(void) {
      * WHPX (bootstrap 267s: every round waits out host-descheduled vCPUs
      * running OTHER processes). Hence the cr3 filter: only CPUs currently
      * IN this address space can hold its stale user translations -- those
-     * are awake-and-working CPUs that ack in microseconds. */
+     * are awake-and-working CPUs that ack in microseconds.
+     *
+     * Slice 87: self-ack in the wait loop (see above) + higher round cap. */
     struct proc *me = current_proc();
     uint64_t cr3 = me ? me->cr3 : 0;
-    for (int round = 0; round < 16; round++)
+    for (int round = 0; round < 64; round++)
         if (tlb_shootdown_sync_filtered(cr3)) return;
     static uint32_t hard_warns;
     if (hard_warns < 8) {
         hard_warns++;
-        kprintf("[tlb] ERROR: shootdown STILL un-acked after 16 rounds\n");
+        kprintf("[tlb] ERROR: shootdown STILL un-acked after 64 rounds\n");
     }
 }
 

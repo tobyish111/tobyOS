@@ -414,6 +414,31 @@ static struct proc *steal_one(struct percpu *me) {
  * Shared by sched_yield and the AP idle loop. */
 static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
                       bool reacquire_bkl) {
+#ifdef CHROMIUM_BOOT
+    /* Validate BEFORE latching on_cpu / current. Slice 88: a reaper may have
+     * freed this PML4 after we popped the proc; skip to idle instead of panic. */
+    if (to && to->pid != 0 && !vmm_pml4_is_live(to->cr3)) {
+        kprintf("[sched] SKIP dead cr3 pid=%d cr3=0x%lx "
+                "(is_thread=%d tgid=%d) from pid=%d\n",
+                to->pid, (unsigned long)to->cr3, (int)to->is_thread,
+                to->tgid, from ? from->pid : -1);
+        to->state = PROC_UNUSED;
+        to->kstack_top = 0;
+        if (me->idle && from != me->idle)
+            to = me->idle;
+        else
+            return;
+    }
+    if (to && to->pid != 0 &&
+        (!to->kstack_top || !to->saved_rsp || to->state == PROC_UNUSED)) {
+        kprintf("[sched] SKIP bad kstack pid=%d top=%p state=%d\n",
+                to->pid, to->kstack_top, (int)to->state);
+        if (me->idle && from != me->idle)
+            to = me->idle;
+        else
+            return;
+    }
+#endif
     uint64_t t = perf_rdtsc();
     if (from) perf_proc_account_out(from, t);
     perf_proc_account_in(to, t);
@@ -442,37 +467,6 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
           to->gs_base ? to->gs_base : (uint64_t)me);
 
     fpu_save(from->fpu_state);
-#ifdef CHROMIUM_BOOT
-    /* Validate the address space BEFORE entering it. Loading a CR3 whose kernel
-     * half is gone unmaps the kernel underneath us, so the instruction fetch
-     * immediately after `mov %rdx,%cr3` faults, the handler cannot run either,
-     * and the box triple-faults with no panic and no log line. Panicking here
-     * instead turns that silent death into a diagnosable message naming both
-     * procs. vmm_pml4_is_live() checks the frame is still allocated and its
-     * kernel-half entry is present. */
-    if (!vmm_pml4_is_live(to->cr3)) {
-        kpanic("sched: switching to pid=%d with DEAD cr3=0x%lx "
-               "(is_thread=%d tgid=%d owns_pml4=%d) from pid=%d",
-               to->pid, (unsigned long)to->cr3, (int)to->is_thread,
-               to->tgid, (int)to->owns_pml4, from->pid);
-    }
-    /* The kernel stack must be real BEFORE we publish it as this CPU's syscall
-     * stack. percpu->syscall_rsp is loaded straight into RSP by syscall_entry
-     * (`mov %gs:0x0,%rsp`), so a NULL here means the next syscall from ring 3
-     * pushes at address -8 with no stack to fault on: #PF -> #DF -> triple
-     * fault, again with no panic possible. Observed as
-     * `v=0e e=0002 IP=syscall_entry+0x15 SP=0 CR2=fffffffffffffff8`. */
-    /* pid 0 is exempt BY DESIGN: the boot/idle context runs on the
-     * bootloader-provided stack and legitimately has kstack_base/top == NULL
-     * (see proc.h). It never enters ring 3, so it never uses syscall_rsp. */
-    if (to->pid != 0 &&
-        (!to->kstack_top || !to->saved_rsp || to->state == PROC_UNUSED)) {
-        kpanic("sched: switching to pid=%d with BAD kstack: top=%p rsp=0x%lx "
-               "state=%d is_thread=%d tgid=%d from pid=%d",
-               to->pid, to->kstack_top, (unsigned long)to->saved_rsp,
-               (int)to->state, (int)to->is_thread, to->tgid, from->pid);
-    }
-#endif
     proc_context_switch(&from->saved_rsp, to->saved_rsp, to->cr3);
     /* --- `from` resumes here when some later switch picks it again --- */
     /* Release the proc THIS cpu just switched away from (its saved_rsp is
@@ -501,6 +495,16 @@ void sched_finish_switch(void) {
     if (prev) {
         cpu->prev_proc = 0;
         __atomic_store_n(&prev->on_cpu, 0, __ATOMIC_RELEASE);
+        /* Deferred CoW-STW resume: tg_vm_resume left vm_quiesced set because
+         * we were still on_cpu. Now safe to put a BLOCKED parked sibling
+         * back on a run queue (vm_quiesce already cleared). */
+        if (prev->vm_quiesced &&
+            !__atomic_load_n(&prev->vm_quiesce, __ATOMIC_ACQUIRE) &&
+            prev->state == PROC_BLOCKED) {
+            prev->vm_quiesced = 0;
+            prev->state = PROC_READY;
+            sched_enqueue(prev);
+        }
     }
 }
 
@@ -546,6 +550,16 @@ int sched_debug_find_queued(struct proc *p, int *cpu_out, bool *cycle_out) {
 
 void sched_enqueue(struct proc *p) {
     if (!p) return;
+    /* Slice 88: never re-arm a slot whose kstack was torn down, and never
+     * put a VM-quiesced sibling back on a ready queue (tg_vm_resume owns
+     * that). pid 0 is exempt: boot/idle legitimately has kstack_top == 0. */
+    if (p->pid != 0 && (!p->kstack_top || p->state == PROC_UNUSED))
+        return;
+    if (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE)) {
+        p->state = PROC_BLOCKED;
+        p->vm_quiesced = 1;
+        return;
+    }
     uint32_t target = enq_target_for(p);
     struct percpu *cpu = smp_cpu_mut(target);
     if (!cpu) cpu = smp_cpu_mut(0);             /* should never happen */
@@ -1035,6 +1049,17 @@ void sched_tick(struct regs *r) {
     /* We interrupted ring 3, so r->rip is this Linux proc's user pc: sample it. */
     if (cur->personality == 1) prof_sample(cur->pid, r->rip);
 #endif
+
+    /* Slice 88: CoW-fork stop-the-world. A sibling marked vm_quiesce must
+     * leave user mode immediately so vmm_cow_fork can strip PTE_WRITABLE
+     * without stale WRITABLE TLBs. Park as BLOCKED (not READY) so we are
+     * not re-enqueued until tg_vm_resume. */
+    if (__atomic_load_n(&cur->vm_quiesce, __ATOMIC_ACQUIRE)) {
+        cur->state = PROC_BLOCKED;
+        cur->vm_quiesced = 1;
+        sched_yield();
+        return;
+    }
 
     /* Asynchronous-signal point for CPU-bound user code on THIS cpu. The
      * PIT only fires on the BSP, so before this a spinning proc running on

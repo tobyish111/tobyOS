@@ -15,7 +15,9 @@
 #include <tobyos/net.h>
 
 #define SOCK_MAX               128     /* pool depth (chrome/Mojo makes many pairs) */
-#define SOCK_RX_DGRAMS         64      /* per-socket UDP/UNIX ring depth. Was 8,
+#define SOCK_RX_DGRAMS         128     /* per-socket UDP/UNIX ring depth. Was 64
+                                        * (tier 2.5: X InternAtom + pump needs
+                                        * more headroom; 256 blew BSS); was 8,
                                         * which chrome's Mojo bursts overflowed --
                                         * and a full ring DROPPED the oldest
                                         * message, breaking the reliable stream
@@ -132,9 +134,9 @@ struct sock {
 
     /* UDP: RX datagram ring. */
     struct sock_dgram dgrams[SOCK_RX_DGRAMS];
-    uint8_t         head;
-    uint8_t         tail;
-    uint8_t         count;
+    uint16_t        head;              /* u16: SOCK_RX_DGRAMS may exceed 255 */
+    uint16_t        tail;
+    uint16_t        count;
     uint16_t        dropped;
     uint32_t        tail_off;          /* AF_UNIX stream: bytes already consumed
                                         * from the head dgram (partial reads leave
@@ -221,6 +223,16 @@ void sock_init(void);
 
 /* Allocate one socket. kind = SOCK_KIND_UDP or SOCK_KIND_TCP. */
 struct sock *sock_alloc(int kind);
+
+/* Pool index for side tables (fake X conn state). -1 if not from the pool. */
+int sock_pool_index(const struct sock *s);
+
+/* Invoke cb(s) for every in-use AF_UNIX socket with x_server set. */
+void sock_foreach_xserver(void (*cb)(struct sock *s));
+
+/* Enqueue bytes into an AF_UNIX peer/self RX ring (used by fake X replies).
+ * Returns 0 on success, -1 on hard fail, SOCK_ERR_AGAIN if the ring is full. */
+int sock_unix_enqueue(struct sock *s, const void *payload, size_t len);
 
 /* Free a socket. */
 void sock_close(struct sock *s);

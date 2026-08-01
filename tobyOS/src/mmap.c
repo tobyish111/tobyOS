@@ -139,7 +139,7 @@ static struct mmap_vma *vma_find_internal(struct vma_table *vt, uint64_t addr) {
 void mmap_debug_fault_vma(uint64_t addr) {
     struct proc *p = current_proc();
     if (!p) return;
-    int pid = p->is_thread ? p->tgid : p->pid;
+    int pid = proc_mm_pid(p);
     struct vma_table *vt = &g_vma_tables[pid];
     /* Print EVERY covering entry, not just the first hit: overlapping VMAs
      * (two entries claiming one address, fault handler resolving against
@@ -291,7 +291,7 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
     struct proc *p = current_proc();
     if (!p) return -1;
 
-    int pid = p->is_thread ? p->tgid : p->pid;
+    int pid = proc_mm_pid(p);
     struct vma_table *vt = &g_vma_tables[pid];
     vma_compact_table(vt, pid);
 
@@ -370,7 +370,7 @@ long sys_mmap2(uint64_t addr, size_t length, int prot, int flags,
     struct proc *p = current_proc();
     if (!p) return -1;
 
-    int pid = p->is_thread ? p->tgid : p->pid;
+    int pid = proc_mm_pid(p);
     struct vma_table *vt = &g_vma_tables[pid];
 
     if (length == 0) return -22;
@@ -455,30 +455,42 @@ struct mmap_free_batch { uint64_t phys[MMAP_FREE_BATCH]; int n; };
  * CPU may still hold the stale translation (the exact corruption the batch
  * exists to prevent, sneaking through the timeout path). Unacked frames park
  * here and only drain after a LATER fully-acked shootdown proves every TLB
- * has turned over. All users run under the BKL (munmap/madvise/brk/fault-
- * retry are BKL-held syscall paths), so a bare static ring is safe. Ring
+ * has turned over.
+ *
+ * Slice 87: shootdown waits drop the BKL (so peer CPUs can ack), so this
+ * ring is no longer BKL-covered -- guard it with its own spinlock. Ring
  * full => deliberately LEAK (a page lost beats a page corrupted). */
 #define TLBQ_MAX 8192
-static uint64_t g_tlbq[TLBQ_MAX];
-static int      g_tlbq_n;
-static uint64_t g_tlbq_leaked;
+static uint64_t   g_tlbq[TLBQ_MAX];
+static int        g_tlbq_n;
+static uint64_t   g_tlbq_leaked;
+static spinlock_t g_tlbq_lock = SPINLOCK_INIT;
 
 static void tlbq_drain_after_acked(void) {      /* call ONLY after acked==true */
+    spin_lock(&g_tlbq_lock);
     for (int i = 0; i < g_tlbq_n; i++) pmm_free_page(g_tlbq[i]);
     g_tlbq_n = 0;
+    spin_unlock(&g_tlbq_lock);
 }
 static void tlbq_free_or_park(uint64_t phys, bool acked) {
     if (acked) { pmm_free_page(phys); return; }
-    if (g_tlbq_n < TLBQ_MAX) { g_tlbq[g_tlbq_n++] = phys; return; }
+    spin_lock(&g_tlbq_lock);
+    if (g_tlbq_n < TLBQ_MAX) {
+        g_tlbq[g_tlbq_n++] = phys;
+        spin_unlock(&g_tlbq_lock);
+        return;
+    }
     g_tlbq_leaked++;
-    if (g_tlbq_leaked <= 8)
+    uint64_t leaked = g_tlbq_leaked;
+    spin_unlock(&g_tlbq_lock);
+    if (leaked <= 8)
         kprintf("[tlbq] WARN: quarantine full, leaking frame %p (total %lu)\n",
-                (void *)phys, (unsigned long)g_tlbq_leaked);
+                (void *)phys, (unsigned long)leaked);
 }
 
 static void mmap_free_batch_flush(struct mmap_free_batch *b) {
     bool acked = tlb_shootdown_remote_sync();   /* stale TLBs gone BEFORE reuse */
-    if (acked && g_tlbq_n) tlbq_drain_after_acked();
+    if (acked) tlbq_drain_after_acked();
     for (int i = 0; i < b->n; i++) tlbq_free_or_park(b->phys[i], acked);
     b->n = 0;
 }
@@ -493,7 +505,7 @@ long sys_munmap(uint64_t addr, uint64_t len) {
     struct proc *p = current_proc();
     if (!p) return -1;
 
-    int pid = p->is_thread ? p->tgid : p->pid;
+    int pid = proc_mm_pid(p);
     struct vma_table *vt = &g_vma_tables[pid];
     vma_compact_table(vt, pid);   /* slice 57: safe here -- no entry ptrs yet
                                    * (incl. the sys_mmap MAP_FIXED caller) */
@@ -665,7 +677,7 @@ void mprotect_ring_dump(uint64_t fault_addr) {
 long sys_madvise_dontneed(uint64_t addr, uint64_t len) {
     struct proc *p = current_proc();
     if (!p) return -1;
-    int pid = p->is_thread ? p->tgid : p->pid;
+    int pid = proc_mm_pid(p);
     struct vma_table *vt = &g_vma_tables[pid];
     if (len == 0) return 0;
     addr = page_align_down(addr);
@@ -712,7 +724,7 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
     struct proc *p = current_proc();
     if (!p) return -1;
 
-    int pid = p->is_thread ? p->tgid : p->pid;
+    int pid = proc_mm_pid(p);
     struct vma_table *vt = &g_vma_tables[pid];
     vma_compact_table(vt, pid);   /* slice 57: before any entry lookup */
 
@@ -803,7 +815,7 @@ long sys_brk2(uint64_t new_brk) {
     struct proc *p = current_proc();
     if (!p) return -1;
 
-    int pid = p->is_thread ? p->tgid : p->pid;
+    int pid = proc_mm_pid(p);
     struct vma_table *vt = &g_vma_tables[pid];
 
     /* Query current brk */
@@ -866,7 +878,7 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
     struct proc *p = current_proc();
     if (!p) return false;
 
-    int pid = p->is_thread ? p->tgid : p->pid;
+    int pid = proc_mm_pid(p);
     struct vma_table *vt = &g_vma_tables[pid];
     struct mmap_vma *v = vma_find_internal(vt, fault_addr);
 #ifdef CHROMIUM_BOOT
@@ -1060,6 +1072,22 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
  * skips the retry. The refused first attempt is side-effect-free (every
  * return-false path bails before mutating), so re-running is safe. */
 bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
+    /* Slice 88: while a sibling forks with CoW STW, do not CoW-copy under
+     * the WP walk. Demote to BLOCKED so quiesce wait completes; IRQs on
+     * so shootdown IPIs still ACK. */
+    {
+        struct proc *qp = current_proc();
+        if (qp && __atomic_load_n(&qp->vm_quiesce, __ATOMIC_ACQUIRE)) {
+            uint64_t rf = read_rflags();
+            sti();
+            qp->state = PROC_BLOCKED;
+            qp->vm_quiesced = 1;
+            while (__atomic_load_n(&qp->vm_quiesce, __ATOMIC_ACQUIRE))
+                __asm__ volatile("pause");
+            qp->state = PROC_RUNNING;
+            if (!(rf & (1u << 9))) cli();
+        }
+    }
     if (mmap_try_fault(fault_addr, error_code)) return true;
     if (bkl_held()) return false;          /* syscall-context fault: already serialized */
     uint64_t rf = read_rflags();
@@ -1087,9 +1115,16 @@ int mmap_cow_clone(int parent_pid, int child_pid) {
         if (v->flags & (VMA_FLAG_SHARED | VMA_FLAG_NOFREE)) continue;
         if (v->prot & VMA_PROT_WRITE) {
             v->flags |= VMA_FLAG_COW;
+#ifdef CHROMIUM_BOOT
+            /* Eager-copy fork leaves parent PTEs writable and exclusive.
+             * Marking the parent VMA CoW here made later mprotect/fault
+             * paths treat still-writable exclusive pages as shared. */
+            (void)parent_vt;
+#else
             if (i < parent_vt->count) {
                 parent_vt->entries[i].flags |= VMA_FLAG_COW;
             }
+#endif
         }
     }
 
@@ -1276,7 +1311,7 @@ long memfd_map(uint64_t addr, uint64_t len, uint32_t prot, uint32_t flags,
                struct memfd *mf, uint64_t offset) {
     struct proc *p = current_proc();
     if (!p || !mf) return -1;
-    int pid = p->is_thread ? p->tgid : p->pid;
+    int pid = proc_mm_pid(p);
     struct vma_table *vt = &g_vma_tables[pid];
     if (len == 0) return -22;
     len = page_align_up(len);
@@ -1490,7 +1525,7 @@ long shm_cache_mmap(struct shm_cache *sc, uint64_t addr, uint64_t len,
                     uint32_t prot, uint32_t flags, uint64_t offset) {
     struct proc *p = current_proc();
     if (!p || !sc) return -1;
-    int pid = p->is_thread ? p->tgid : p->pid;
+    int pid = proc_mm_pid(p);
     struct vma_table *vt = &g_vma_tables[pid];
     if (len == 0) return -22;
     len = page_align_up(len);

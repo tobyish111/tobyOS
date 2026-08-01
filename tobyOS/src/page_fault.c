@@ -166,6 +166,22 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
                         struct proc *p) {
     if (!p) return false;
 
+    /* Slice 88: serialize with CoW-fork STW -- do not promote/copy pages
+     * while a sibling is mid vmm_cow_fork WP walk. Demote to BLOCKED so
+     * tg_vm_quiesce's wait (no PROC_RUNNING siblings) can complete; stay
+     * on this CPU with IRQs on so TLB shootdown IPIs still ACK. */
+    if (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE)) {
+        uint64_t rf;
+        __asm__ volatile("pushfq; pop %0" : "=r"(rf));
+        __asm__ volatile("sti");
+        p->state = PROC_BLOCKED;
+        p->vm_quiesced = 1;
+        while (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE))
+            __asm__ volatile("pause");
+        p->state = PROC_RUNNING;
+        if (!(rf & (1ull << 9))) __asm__ volatile("cli");
+    }
+
     uint64_t page_va = fault_addr & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t *pte = get_pte(p->cr3, fault_addr);
 
@@ -566,49 +582,58 @@ int vmm_cow_fork(uint64_t parent_cr3, uint64_t child_cr3) {
                          * slice-33/34 DOM blocker). Keep it writable in
                          * BOTH parent and child. */
                         child_pt[i1] = pte_val;
-                    } else if (pte_val & PTE_WRITABLE) {
-                        /* Clear writable, set COW in parent */
-                        parent_pt[i1] = (pte_val & ~PTE_WRITABLE) | PTE_COW;
-                        /* Child gets same: not writable, COW set */
-                        child_pt[i1] = (pte_val & ~PTE_WRITABLE) | PTE_COW;
+                        if (page_ref_get(phys) == 0)
+                            page_ref_inc(phys);
+                        page_ref_inc(phys);
                     } else {
-                        /* Read-only page: it is now SHARED (refs go up
-                         * below), so it too must be COW-marked. Without
-                         * the marker, a later mprotect(RW) on either side
-                         * write-enabled the shared frame in place (the
-                         * refcounted copy-out never ran) and the two
-                         * processes scribbled over each other. For pages
-                         * that stay read-only forever (text/RELRO) the
-                         * bit is inert. */
-                        parent_pt[i1] = pte_val | PTE_COW;
-                        child_pt[i1]  = pte_val | PTE_COW;
-                    }
-
-                    /* Account BOTH owners of the now-shared page. Pages
-                     * allocated at spawn/exec time predate the refcount
-                     * system and sit untracked at 0, so the original
-                     * single inc here produced refs == 1 -- the COW fault
-                     * handler's sole-owner shortcut then made the SHARED
-                     * page writable in place for parent and child alike
-                     * (shared writable stacks: the post-fork procs
-                     * scribbled over each other and jumped through
-                     * corrupted return addresses). Bring an untracked
-                     * page to 1 (the parent's own reference) before
-                     * adding the child's. */
-                    if (page_ref_get(phys) == 0)
-                        page_ref_inc(phys);     /* parent's untracked ref */
-                    page_ref_inc(phys);         /* child's new ref        */
 #ifdef CHROMIUM_BOOT
-                    { extern void pgj_note(uint8_t, uint64_t, uint64_t,
-                                           uint64_t);
-                      pgj_note(13, fork_va, phys,
-                               (uint64_t)page_ref_get(phys)); }
+                        /* Tier 2.5: EAGER private copy for EVERY non-SHARED
+                         * present page (writable AND read-only). Sharing RO
+                         * text/RELRO still couples parent refs to the
+                         * crashpad child's teardown; a refcount slip there
+                         * frees frames still mapped in chrome and shows up
+                         * as GPU-thread jumps into .text padding. Parent
+                         * PTEs stay as-is (no WP / no PTE_COW) — no stale
+                         * WRITABLE-TLB window. RAM cost is brief: crashpad
+                         * child execs/exits within milliseconds. */
+                        uint64_t new_phys = pmm_alloc_page();
+                        if (!new_phys) return -1;
+                        memcpy((void *)(new_phys + hhdm),
+                               (void *)(phys + hhdm), PAGE_SIZE);
+                        child_pt[i1] = (pte_val & ~PTE_ADDR_MASK) | new_phys;
+                        if (page_ref_get(new_phys) == 0)
+                            page_ref_inc(new_phys);
+                        { extern void pgj_note(uint8_t, uint64_t, uint64_t,
+                                               uint64_t);
+                          pgj_note(13, fork_va, new_phys, 1); }
+#else
+                        if (pte_val & PTE_WRITABLE) {
+                            /* Clear writable, set COW in parent */
+                            parent_pt[i1] = (pte_val & ~PTE_WRITABLE) | PTE_COW;
+                            /* Child gets same: not writable, COW set */
+                            child_pt[i1] = (pte_val & ~PTE_WRITABLE) | PTE_COW;
+                            if (page_ref_get(phys) == 0)
+                                page_ref_inc(phys);
+                            page_ref_inc(phys);
+                        } else {
+                            /* Read-only page: shared + COW-marked. */
+                            parent_pt[i1] = pte_val | PTE_COW;
+                            child_pt[i1]  = pte_val | PTE_COW;
+                            if (page_ref_get(phys) == 0)
+                                page_ref_inc(phys);
+                            page_ref_inc(phys);
+                        }
 #endif
+                    }
                 }
             }
         }
     }
 
+#ifdef CHROMIUM_BOOT
+    /* Eager full-copy leaves every parent PTE untouched — no TLB invalidate
+     * required for the parent. Child installs a fresh CR3 on first run. */
+#else
     /* CRITICAL: flush the TLB. We just stripped PTE_WRITABLE from every
      * writable user PTE of the RUNNING parent, whose translations -- its
      * own stack above all -- are hot in this CPU's TLB with the old write
@@ -637,8 +662,15 @@ int vmm_cow_fork(uint64_t parent_cr3, uint64_t child_cr3) {
      * -- and worse, after a later CoW copy-out moves the PTE to a new frame,
      * a still-stale CPU keeps hitting the GHOST frame: chrome's SwiftShader
      * JIT thread lost 4 stack spills that way (slice 38 iter 24 page-journal
-     * autopsy) and read back pre-fork bytes. Flush everyone. */
-    tlb_shootdown_remote();
+     * autopsy) and read back pre-fork bytes. Flush everyone.
+     *
+     * Tier 2.5: use BROADCAST sync (not cr3-filtered fire-and-forget).
+     * Filtered shootdown skips CPUs whose current is idle/other even when
+     * they still hold stale WRITABLE chrome translations from a just-parked
+     * sibling — exactly the STW window. Broadcast + sync closes that hole. */
+    if (!tlb_shootdown_remote_sync())
+        tlb_shootdown_remote(); /* retry filtered as fallback */
+#endif
 
     return 0;
 }

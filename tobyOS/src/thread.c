@@ -275,6 +275,8 @@ int thread_join(int tid, int *out_code) {
     /* If already terminated, reap immediately */
     if (target->state == PROC_TERMINATED) {
         if (out_code) *out_code = target->exit_code;
+        sched_dequeue(target);
+        proc_wait_off_cpu(target);
         /* Free kernel stack */
         if (target->kstack_base) kfree(target->kstack_base);
         target->kstack_base = 0;
@@ -296,6 +298,8 @@ int thread_join(int tid, int *out_code) {
 
     /* Reap */
     if (target->state == PROC_TERMINATED) {
+        sched_dequeue(target);
+        proc_wait_off_cpu(target);
         if (target->kstack_base) kfree(target->kstack_base);
         target->kstack_base = 0;
         target->kstack_top  = 0;
@@ -318,6 +322,8 @@ int thread_detach(int tid) {
 
     /* If already terminated, reap now */
     if (target->state == PROC_TERMINATED) {
+        sched_dequeue(target);
+        proc_wait_off_cpu(target);
         if (target->kstack_base) kfree(target->kstack_base);
         target->kstack_base = 0;
         target->kstack_top  = 0;
@@ -448,7 +454,8 @@ int futex_fast(uint32_t *uaddr, int op, uint32_t val, long *out) {
     return 0;
 }
 
-long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
+long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
+           uint32_t *uaddr2) {
     struct proc *caller = current_proc();
     if (!caller) return -1;
 
@@ -457,6 +464,7 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
     if (!user_range_ok(addr, sizeof(uint32_t))) return -14; /* EFAULT */
 
     int cmd = op & 0x7f;   /* strip FUTEX_PRIVATE_FLAG(128)/CLOCK_REALTIME(256) */
+    int priv = op & ~0x7f; /* preserve PRIVATE / CLOCK_REALTIME for recursion */
 
     /* Pre-touch the futex word OUTSIDE the spinlock so any CoW/demand #PF
      * resolves with IRQs on; the locked re-read below then can't fault
@@ -638,21 +646,212 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout) {
         return woken;
     }
 
-    /* FUTEX_REQUEUE(3) / FUTEX_CMP_REQUEUE(4): glibc's pthread_cond_broadcast
-     * requeues waiters from the condvar word onto the mutex word. Returning
-     * -EINVAL (as this did until slice 59e) means a broadcast wakes NOBODY --
-     * every waiter parks forever on an INFINITE futex. Measured exactly that:
-     * the renderer's MAIN thread sat in futex(0xc130ac0, to=-1) for 8s and
-     * climbing while userspace was ~0.06% busy, so the page stopped building
-     * without any CPU cost. The bring-up-era note claiming chrome never uses
-     * these ops was taken from a trace of a much simpler page.
+    /* Tier 2.5: PI futexes used by glibc PTHREAD_PRIO_INHERIT mutexes.
+     * Chrome Ozone/X11 hit FUTEX_LOCK_PI_PRIVATE right after CreateWindow;
+     * returning -EINVAL made it ud2 (vec=6) and exit_group(191). We honour
+     * the Linux word protocol (TID | WAITERS) but skip real RT inheritance. */
+    if (cmd == FUTEX_LOCK_PI || cmd == FUTEX_TRYLOCK_PI) {
+        uint32_t tid = (uint32_t)caller->pid & FUTEX_TID_MASK;
+        if (tid == 0) tid = 1;
+        for (;;) {
+            uint32_t cur, old;
+            unsigned long uw = uaccess_begin();
+            cur = *(volatile uint32_t *)uaddr;
+            uaccess_end(uw);
+            uint32_t owner = cur & FUTEX_TID_MASK;
+            if (owner == 0) {
+                uint32_t neu = tid | (cur & FUTEX_WAITERS);
+                uw = uaccess_begin();
+                __asm__ volatile("lock cmpxchgl %2, %1"
+                    : "=a"(old), "+m"(*(volatile uint32_t *)uaddr)
+                    : "r"(neu), "a"(cur) : "memory");
+                uaccess_end(uw);
+                if (old == cur) return 0;
+                continue;
+            }
+            /* Already owner: UNLOCK_PI ownership handoff wakes us with our
+             * TID in the word. Treat as success (glibc PI mutexes are not
+             * recursive, so true self-deadlock is not expected here). */
+            if (owner == tid) return 0;
+            if (cmd == FUTEX_TRYLOCK_PI) return -11; /* -EAGAIN */
+
+            if (!(cur & FUTEX_WAITERS)) {
+                uint32_t neu = cur | FUTEX_WAITERS;
+                uw = uaccess_begin();
+                __asm__ volatile("lock cmpxchgl %2, %1"
+                    : "=a"(old), "+m"(*(volatile uint32_t *)uaddr)
+                    : "r"(neu), "a"(cur) : "memory");
+                uaccess_end(uw);
+                if (old != cur) continue;
+                cur = neu;
+            }
+
+            /* Timed LOCK_PI: honour absolute/relative timeout like WAIT. */
+            uint64_t deadline_ns = 0;
+            if (utimeout) {
+                struct { int64_t sec; int64_t nsec; } ts;
+                if (copy_from_user(&ts, utimeout, sizeof ts) == 0) {
+                    uint64_t t = (uint64_t)ts.sec * 1000000000ull
+                               + (uint64_t)ts.nsec;
+                    deadline_ns = perf_now_ns() + t; /* relative for LOCK_PI */
+                    if (deadline_ns == 0) deadline_ns = 1;
+                }
+            }
+            if (deadline_ns && perf_now_ns() >= deadline_ns)
+                return -110; /* -ETIMEDOUT */
+
+            uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+            uw = uaccess_begin();
+            uint32_t now = *(volatile uint32_t *)uaddr;
+            uaccess_end(uw);
+            if (now != cur) {
+                spin_unlock_irqrestore(&g_futex_lock, flags);
+                continue; /* owner changed — retry acquire */
+            }
+            struct futex_entry *e = futex_find_or_create(cr3, addr);
+            if (!e) {
+                spin_unlock_irqrestore(&g_futex_lock, flags);
+                return -12;
+            }
+            caller->state = PROC_BLOCKED;
+            caller->futex_deadline_ns = deadline_ns;
+            caller->futex_timed_out = false;
+            caller->next_wait = e->waiters;
+            e->waiters = caller;
+            spin_unlock_irqrestore(&g_futex_lock, flags);
+            sched_yield();
+            if (caller->futex_timed_out) {
+                caller->futex_timed_out = false;
+                return -110;
+            }
+            /* woken by UNLOCK_PI — loop and try to take ownership */
+        }
+    }
+
+    if (cmd == FUTEX_UNLOCK_PI) {
+        uint32_t tid = (uint32_t)caller->pid & FUTEX_TID_MASK;
+        if (tid == 0) tid = 1;
+        unsigned long uw = uaccess_begin();
+        uint32_t cur = *(volatile uint32_t *)uaddr;
+        uaccess_end(uw);
+        if ((cur & FUTEX_TID_MASK) != tid) return -1; /* -EPERM */
+
+        uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+        uint32_t idx = futex_hash(cr3, addr);
+        struct futex_entry *e = g_futex_hash[idx];
+        while (e) {
+            if (e->key_cr3 == cr3 && e->key_addr == addr) break;
+            e = e->next;
+        }
+        int woken = 0;
+        if (e && e->waiters) {
+            /* Hand ownership to the first waiter (Linux PI protocol). */
+            struct proc *w = e->waiters;
+            e->waiters = w->next_wait;
+            w->next_wait = 0;
+            uint32_t ntid = (uint32_t)w->pid & FUTEX_TID_MASK;
+            if (ntid == 0) ntid = 1;
+            uint32_t neu = ntid | (e->waiters ? FUTEX_WAITERS : 0);
+            uw = uaccess_begin();
+            *(volatile uint32_t *)uaddr = neu;
+            uaccess_end(uw);
+            w->futex_deadline_ns = 0;
+#ifdef CHROMIUM_BOOT
+            w->fx_wake_ns = perf_now_ns();
+#endif
+            w->state = PROC_READY;
+            sched_enqueue(w);
+            woken = 1;
+            if (!e->waiters) futex_free_entry(e);
+        } else {
+            uw = uaccess_begin();
+            *(volatile uint32_t *)uaddr = 0;
+            uaccess_end(uw);
+            if (e) futex_free_entry(e);
+        }
+        spin_unlock_irqrestore(&g_futex_lock, flags);
+#ifdef CHROMIUM_BOOT
+        { static int up; if (up < 16) { up++;
+            kprintf("[fxpi] pid=%d UNLOCK_PI addr=0x%lx woke %d\n",
+                    caller->pid, (unsigned long)addr, woken); } }
+#endif
+        return 0;
+    }
+
+    /* PI condvar wait: block on uaddr, then return holding PI mutex uaddr2. */
+    if (cmd == FUTEX_WAIT_REQUEUE_PI) {
+        if (!uaddr2 || !user_range_ok((uint64_t)(uintptr_t)uaddr2,
+                                      sizeof(uint32_t)))
+            return -14;
+        uint64_t deadline_ns = 0;
+        if (utimeout) {
+            struct { int64_t sec; int64_t nsec; } ts;
+            if (copy_from_user(&ts, utimeout, sizeof ts) == 0) {
+                uint64_t t = (uint64_t)ts.sec * 1000000000ull
+                           + (uint64_t)ts.nsec;
+                deadline_ns = t;
+                if (op & 0x100) {
+                    extern uint64_t lx_realtime_offset_ns(void);
+                    uint64_t off = lx_realtime_offset_ns();
+                    deadline_ns = (t > off) ? t - off : 1;
+                }
+                if (deadline_ns == 0) deadline_ns = 1;
+            }
+        }
+        uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+        unsigned long uw = uaccess_begin();
+        cur_val = *(volatile uint32_t *)uaddr;
+        uaccess_end(uw);
+        if (cur_val != val) {
+            spin_unlock_irqrestore(&g_futex_lock, flags);
+            return -11;
+        }
+        if (deadline_ns && perf_now_ns() >= deadline_ns) {
+            spin_unlock_irqrestore(&g_futex_lock, flags);
+            return -110;
+        }
+        struct futex_entry *e = futex_find_or_create(cr3, addr);
+        if (!e) {
+            spin_unlock_irqrestore(&g_futex_lock, flags);
+            return -12;
+        }
+        caller->state = PROC_BLOCKED;
+        caller->futex_deadline_ns = deadline_ns;
+        caller->futex_timed_out = false;
+        caller->next_wait = e->waiters;
+        e->waiters = caller;
+        spin_unlock_irqrestore(&g_futex_lock, flags);
+        sched_yield();
+        if (caller->futex_timed_out) {
+            caller->futex_timed_out = false;
+            return -110;
+        }
+#ifdef CHROMIUM_BOOT
+        { static int wr; if (wr < 16) { wr++;
+            kprintf("[fxpi] pid=%d WAIT_REQUEUE_PI woken; LOCK_PI uaddr2=0x%lx\n",
+                    caller->pid, (unsigned long)(uintptr_t)uaddr2); } }
+#endif
+        /* Linux ABI: success => caller owns the PI futex at uaddr2. */
+        return futex(uaddr2, FUTEX_LOCK_PI | priv, 0, 0, 0);
+    }
+
+    /* FUTEX_REQUEUE(3) / FUTEX_CMP_REQUEUE(4) / FUTEX_CMP_REQUEUE_PI(12):
+     * glibc's pthread_cond_broadcast requeues waiters from the condvar word
+     * onto the mutex word. Returning -EINVAL (as this did until slice 59e)
+     * means a broadcast wakes NOBODY -- every waiter parks forever on an
+     * INFINITE futex. Measured exactly that: the renderer's MAIN thread sat
+     * in futex(0xc130ac0, to=-1) for 8s and climbing while userspace was
+     * ~0.06% busy, so the page stopped building without any CPU cost. The
+     * bring-up-era note claiming chrome never uses these ops was taken from
+     * a trace of a much simpler page.
      *
      * Implementation: WAKE EVERY waiter on uaddr rather than moving them to
      * uaddr2. Spurious wakeups are explicitly legal for futexes -- glibc
      * re-checks its predicate and re-blocks on the mutex itself -- so this is
      * correct, just less efficient than a true requeue (a thundering herd on
      * broadcast). Correctness first; optimise only if it ever shows up. */
-    if (cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE) {
+    if (cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE ||
+        cmd == FUTEX_CMP_REQUEUE_PI) {
         uint64_t flags = spin_lock_irqsave(&g_futex_lock);
         uint32_t idx = futex_hash(cr3, addr);
         struct futex_entry *e = g_futex_hash[idx];

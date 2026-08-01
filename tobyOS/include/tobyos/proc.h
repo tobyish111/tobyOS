@@ -195,6 +195,26 @@ struct proc {
      * store by sched_finish_switch(); tested with ACQUIRE in the pickers. */
     volatile uint8_t on_cpu;
 
+    /* Slice 88: stop-the-world for CoW fork. Sibling threads sharing this
+     * proc's CR3 must leave user mode (and stay off-CPU) while vmm_cow_fork
+     * strips PTE_WRITABLE; otherwise stale WRITABLE TLBs corrupt PartitionAlloc
+     * freelists. vm_quiesce is set on siblings for the duration; vm_quiesced
+     * marks ones we parked (READY/RUNNING) so tg_vm_resume can re-enqueue
+     * them without stealing futex/pipe waiters. */
+    volatile uint8_t vm_quiesce;
+    uint8_t          vm_quiesced;
+
+    /* Share-until-exec (vfork / chrome LaunchProcess): child borrows the
+     * parent's CR3 + VMA table (mm_owner) with owns_pml4=false. vfork_parent
+     * is the launcher pid; vfork_child on the parent is the child pid while
+     * waiting (cleared when the child execve/_exits — avoids a lost-wake
+     * if the child finishes before the parent blocks). */
+    int              mm_owner;
+    int              vfork_parent;
+    int              vfork_child;
+    uint64_t         vfork_stack_va;   /* private stack in shared CR3; 0=none */
+    uint32_t         vfork_stack_pages;
+
     /* Generic per-proc wait-queue link. A blocked proc lives on at most
      * ONE such queue (e.g. a pipe's wq_read). The queue owner walks the
      * chain via this field on wakeup. */
@@ -538,6 +558,32 @@ uint64_t proc_brk(struct proc *p, uint64_t new_brk);
  * their reader/writer count immediately (rather than at reap time). */
 __attribute__((noreturn)) void proc_exit(int code);
 
+/* Spin until `p` is no longer live-on-CPU (on_cpu cleared). Call after
+ * sched_dequeue / force-TERMINATED and BEFORE freeing kstack or zeroing
+ * kstack_top -- otherwise another CPU can switch into a freed stack. */
+void proc_wait_off_cpu(struct proc *p);
+
+/* Soft stop-the-world for the shared-CR3 thread group around vmm_cow_fork.
+ * Defined in fork.c. Actor must be the forking thread; may briefly drop BKL. */
+void tg_vm_quiesce(struct proc *actor);
+void tg_vm_resume(struct proc *actor);
+
+/* VMA-table key for `p` (tgid for threads; mm_owner for share-until-exec). */
+static inline int proc_mm_pid(const struct proc *p) {
+    if (!p) return 0;
+    if (p->mm_owner > 0) return p->mm_owner;
+    return p->is_thread ? p->tgid : p->pid;
+}
+
+/* Wake a parent blocked in sys_fork_share once the child execve/_exits. */
+void vfork_child_done(struct proc *child);
+
+/* Share address space until exec/exit — no CoW write-protect of the parent. */
+long sys_fork_share(void);
+
+/* Linux exit_group: tear down the entire thread group (not just this thread). */
+__attribute__((noreturn)) void proc_exit_group(int code);
+
 /* Block the caller until the process with PID `pid` reaches
  * PROC_TERMINATED, then reap it (free PML4 + kstack + slot) and
  * return its exit code. Returns -1 if `pid` isn't found or the caller
@@ -612,11 +658,22 @@ int thread_detach(int tid);
  * (measured: the chrome renderer's main thread). See futex() in thread.c. */
 #define FUTEX_REQUEUE      3
 #define FUTEX_CMP_REQUEUE  4
+#define FUTEX_LOCK_PI      6   /* pthread PI mutex; stub without true inheritance */
+#define FUTEX_UNLOCK_PI    7
+#define FUTEX_TRYLOCK_PI   8
 #define FUTEX_WAIT_BITSET  9   /* like WAIT but ABSOLUTE timeout (glibc timedwait) */
 #define FUTEX_WAKE_BITSET  10
+#define FUTEX_WAIT_REQUEUE_PI 11
+#define FUTEX_CMP_REQUEUE_PI  12
+/* PI-futex word bits (Linux ABI). */
+#define FUTEX_WAITERS      0x80000000u
+#define FUTEX_OWNER_DIED   0x40000000u
+#define FUTEX_TID_MASK     0x3fffffffu
 /* utimeout: user pointer to a struct timespec, or NULL for an infinite wait.
- * For FUTEX_WAIT it is a RELATIVE timeout; for FUTEX_WAIT_BITSET, ABSOLUTE. */
-long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout);
+ * For FUTEX_WAIT it is a RELATIVE timeout; for FUTEX_WAIT_BITSET, ABSOLUTE.
+ * uaddr2: required for WAIT_REQUEUE_PI / CMP_REQUEUE*_PI (PI mutex word). */
+long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
+           uint32_t *uaddr2);
 
 /* Initialize the futex hash table. Call once during boot. */
 void futex_init(void);

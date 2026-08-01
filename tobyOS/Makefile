@@ -115,6 +115,7 @@ C_SRCS := src/kernel.c \
           src/mmap.c \
           src/fork.c \
           src/shm.c \
+          src/xserver.c \
           src/unix_socket.c \
           src/sysfs.c \
           src/aslr.c \
@@ -1658,6 +1659,15 @@ programs/linux-hello/linux-hello.elf: programs/linux-hello/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# Tier 2.5: chrome forks+execs xdg-settings for default-browser checks.
+# A Linux-personality no-op avoids ENOENT PATH storms and shortens the
+# CoW-fork child lifetime versus a failed exec.
+programs/linux-xdg-settings/linux-xdg-settings.elf: programs/linux-xdg-settings/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 # Track B/B4: a genuine Linux x86-64 static ELF proving the Linux signal
 # path (rt_sigaction + restorer + rt_sigreturn). Same build shape as
 # linux-hello (raw syscalls, no libc, brandelf'd EI_OSABI=Linux).
@@ -2415,6 +2425,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_edit,user_gui_edit))
 # the bin/ directory survives in source control.
 
 $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
+               programs/linux-xdg-settings/linux-xdg-settings.elf \
                programs/linux-sigtest/linux-sigtest.elf \
                programs/linux-mmaptest/linux-mmaptest.elf \
                programs/linux-thread/linux-thread.elf \
@@ -2687,6 +2698,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/lockscreen/lockscreen.elf           $(INITRD_STAGE)/bin/lockscreen
 	cp programs/mediaplayer/mediaplayer.elf         $(INITRD_STAGE)/bin/mediaplayer
 	cp programs/chromewin/chromewin.elf             $(INITRD_STAGE)/bin/chromewin
+	# Headed chrome may still fork xdg-settings despite --no-default-browser-check.
+	cp programs/linux-xdg-settings/linux-xdg-settings.elf $(INITRD_STAGE)/bin/xdg-settings
 	cp programs/diskmgr/diskmgr.elf                 $(INITRD_STAGE)/bin/diskmgr
 	cp programs/eventview/eventview.elf             $(INITRD_STAGE)/bin/eventview
 	cp programs/lua/lua.elf                         $(INITRD_STAGE)/bin/lua
@@ -2993,7 +3006,11 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	        cp -r programs/chromium/sysroot $(INITRD_STAGE)/opt/chrome/sysroot; \
 	    fi; \
 	    printf '\003' | dd of=$(INITRD_STAGE)/opt/chrome/chrome bs=1 seek=7 count=1 conv=notrunc 2>/dev/null; \
+	    cp programs/linux-xdg-settings/linux-xdg-settings.elf \
+	        $(INITRD_STAGE)/opt/chrome/chrome_crashpad_handler; \
 	    printf '\003' | dd of=$(INITRD_STAGE)/opt/chrome/chrome_crashpad_handler bs=1 seek=7 count=1 conv=notrunc 2>/dev/null; \
+	    rm -f $(INITRD_STAGE)/opt/chrome/vk_swiftshader_icd.json; \
+	    rm -f $(INITRD_STAGE)/opt/chrome/libvk_swiftshader.so; \
 	    echo "[initrd] chromium: staging FULL chrome (+sysroot) under /opt/chrome -- CHROME_FULL=1 (Route B: headed/Ozone arc)"; \
 	    EXTRA_FILES="$$EXTRA_FILES opt/chrome"; \
 	elif [ -f programs/chromium/chrome-headless-shell-linux64/chrome-headless-shell ]; then \
@@ -3021,6 +3038,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/login bin/gui_settings bin/abi_test                           \
 	    bin/volctrl bin/wifipicker bin/appinstall bin/updater bin/lockscreen \
 	    bin/devmgr bin/diskmgr bin/eventview bin/mediaplayer bin/chromewin \
+	    bin/xdg-settings \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-fbwin bin/linux-join bin/linux-poll \
