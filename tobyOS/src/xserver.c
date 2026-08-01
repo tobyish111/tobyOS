@@ -1171,11 +1171,26 @@ static void handle_request(struct sock *s, struct x_conn *c,
                 return;
             }
             if (!strcmp(pname, "_NET_SUPPORTING_WM_CHECK")) {
-                /* Point at root: chrome only needs a non-None window id that
-                 * echoes the same property. Avoid a second fake WM window. */
-                uint32_t w = XSRV_ROOT_ID;
-                prop_reply(s, seq, XA_WINDOW, 32, &w, 4);
-                return;
+                /* SLICE 91: answer NONE -- we are NOT a window manager.
+                 *
+                 * This used to point at root so chrome would see "a WM
+                 * exists". That was backwards. Declaring a WM makes Chromium
+                 * take the DELEGATING path: it stops activating its own
+                 * frame and instead asks the WM to, by SendEvent'ing
+                 * _NET_ACTIVE_WINDOW at the root and then re-checking. We
+                 * grant it (ConfigureNotify + FocusIn + _NET_ACTIVE_WINDOW),
+                 * chrome does not believe it, and it retries forever --
+                 * measured as an endless ChangeProperty / GetInputFocus /
+                 * SendEvent loop after MapWindow, with ShmAttach never sent
+                 * and therefore not one zero-copy frame in the entire arc.
+                 *
+                 * The control settles it: it is Xvfb with NO window manager
+                 * running, so _NET_SUPPORTING_WM_CHECK is absent, and chrome
+                 * takes the SELF-MANAGING path -- ConfigureWindow(Above),
+                 * SetInputFocus, QueryPointer, then paint. That is the path
+                 * we can actually satisfy: no WM to impersonate, just a
+                 * server answering focus and geometry (which we now do).
+                 * Falls through to the empty-property reply below. */
             }
             if (!strcmp(pname, "_NET_WM_NAME") && wid == XSRV_ROOT_ID) {
                 static const char nm[] = "tobyWM";
