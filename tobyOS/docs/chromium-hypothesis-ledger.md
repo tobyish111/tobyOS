@@ -5026,3 +5026,32 @@ state==PROC_BLOCKED && !on_cpu` and requeues it, logging loudly. If that
 alone unfreezes the guest, the deferred-requeue path is confirmed as the
 bug and the real fix follows. Do NOT ship the sweep as the fix -- ship it as
 the instrument that proves the mechanism.
+
+### Slice 91 addendum: the no-WM change (07f297a) is UNVERIFIED — do not
+### trust it until it is A/B'd against a run that does not freeze.
+
+`_NET_SUPPORTING_WM_CHECK` now answers None (we are not a WM). The
+reasoning is solid and control-backed: the control is Xvfb with NO window
+manager, and there chrome SELF-MANAGES (ConfigureWindow(Above) ->
+SetInputFocus -> QueryPointer -> paint) instead of delegating. Declaring a
+WM demonstrably put chrome in an endless ChangeProperty / GetInputFocus /
+SendEvent retry loop even after we started answering _NET_ACTIVE_WINDOW
+properly.
+
+BUT THE RUN THAT TESTED IT PROVES NOTHING. It stalled at seq=193 -- the
+_NET_SUPPORTING_WM_CHECK GetProperty itself -- with **zero `[bkl]` lines in
+the whole log**, i.e. it never reached the 60 s deep dump: the guest froze
+at ~7.6 s. That is the intermittent `-smp 4` kernel freeze, not a verdict on
+the X change. `[qstuck]` did NOT fire in that run either, so the backstop
+has still never been exercised.
+
+**This is the trap this arc keeps falling into: reading a frozen run as a
+result.** Before judging any X-server change from here on, first confirm the
+run got past the freeze -- `grep '\[bkl\] cpu' logs/run_watch.log` must be
+NON-EMPTY (the 60 s deep dump ran). A log without it is a frozen guest and
+says nothing about chrome.
+
+ORDER OF WORK, revised: the freeze is upstream of everything. Fix it (or at
+least make `[qstuck]` fire and prove the mechanism) BEFORE spending another
+cycle on X protocol behaviour. Every X hypothesis tested against a frozen
+run is wasted, and several already were.
