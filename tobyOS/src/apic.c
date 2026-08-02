@@ -201,6 +201,7 @@ static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
      * Slice 87: self-ack periodically so an IRQ-off peer that is itself in
      * this wait loop can make OUR gen move (and we make theirs move). */
     bool all_acked = true;
+    bool self_demoted = false;
     for (uint32_t i = 0; i < n && i < MAX_CPUS; i++) {
         if (!sent[i]) continue;
         uint32_t spins = 0;
@@ -216,6 +217,7 @@ static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
                 if (cp && __atomic_load_n(&cp->vm_quiesce, __ATOMIC_ACQUIRE)) {
                     cp->state = PROC_BLOCKED;
                     cp->vm_quiesced = 1;
+                    self_demoted = true;
                 }
             }
             if (++spins > 2000000u) {
@@ -227,6 +229,24 @@ static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
                 all_acked = false;
                 break;
             }
+        }
+    }
+    /* Slice 92: UNDO the demotion before returning. The demote is a lie
+     * told to the forker's quiesce wait ("I am parked") by a proc that in
+     * fact KEEPS EXECUTING -- leaving state=BLOCKED + vm_quiesced=1 on a
+     * running proc is the STALE FLAG that armed the -smp 4 freeze: the
+     * proc's next futex park hit sched_finish_switch's deferred requeue
+     * (BLOCKED + stale flag -> spurious READY while still on the futex
+     * waiter list -> re-park -> CYCLIC list -> the expire sweep spins
+     * forever holding g_futex_lock with IRQs off). If vm_quiesce is still
+     * up, the tick / syscall-return / #PF park points will park us
+     * properly; the quiesce wait re-times-out on us as in-kernel, which is
+     * the truth. */
+    if (self_demoted) {
+        struct proc *cp = current_proc();
+        if (cp && cp->state == PROC_BLOCKED) {
+            cp->state = PROC_RUNNING;
+            cp->vm_quiesced = 0;
         }
     }
     return all_acked;

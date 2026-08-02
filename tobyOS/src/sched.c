@@ -1131,9 +1131,11 @@ void sched_tick(struct regs *r) {
              * serialized the whole kernel behind the ticket lock for the
              * sweep duration. */
             { extern uint64_t g_qpark_engaged, g_qpark_bkl;
-              kprintf("  [qpark] engaged=%lu bkl=%lu\n",
+              extern uint64_t g_fx_spurious;
+              kprintf("  [qpark] engaged=%lu bkl=%lu fxspur=%lu\n",
                       (unsigned long)g_qpark_engaged,
-                      (unsigned long)g_qpark_bkl); }
+                      (unsigned long)g_qpark_bkl,
+                      (unsigned long)g_fx_spurious); }
             /* (deadlocked-stack dump now fires from signal_send at the renderer's
              * SIGKILL -- the only reliable moment; see bt_dump_group.) */
             }                        /* end 60s deep dump (slice 63c) */

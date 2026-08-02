@@ -428,6 +428,71 @@ static void futex_free_entry(struct futex_entry *e) {
  * Ordering: g_futex_lock -> per-CPU queue locks exists (wake/sweep); these
  * fast paths take g_futex_lock alone, and nothing under it takes the BKL.
  * Return 1 = fully served (*out set); 0 = fall through to the BKL path. */
+/* Slice 92: SPURIOUS-WAKE HARDENING -- the -smp 4 freeze, root-caused.
+ *
+ * QMP capture (freeze run 5, first specimen ever caught): one CPU looping
+ * FOREVER inside futex_expire_timeouts' waiter-list walk while HOLDING
+ * g_futex_lock with IRQs off; every other CPU spinning to acquire the same
+ * lock. The waiter list was CYCLIC. A cycle forms when a parked waiter is
+ * made READY by anything OTHER than the futex code (which is what unlinks
+ * it): the deferred CoW-STW requeue in sched_finish_switch fires on a proc
+ * whose vm_quiesced flag went STALE (set mid TLB-ack-wait by apic.c during
+ * a concurrent fork sweep, never consumed), sees BLOCKED+flag and requeues
+ * a proc that is BLOCKED *on a futex list*. The waiter returns "woken",
+ * glibc re-checks and re-parks, and the head-insert while its old link is
+ * still live closes the loop: pred -> T -> old head -> ... -> pred.
+ * That is why the freeze always landed within ms of "[fork] cow_fork done"
+ * and needed -smp 4.
+ *
+ * Defense: after EVERY park's sched_yield returns, unlink self from the
+ * waiter list if still linked (a legitimate waker always unlinked us
+ * first). Any spurious READY from any machinery, present or future, then
+ * degrades to a POSIX-legal spurious wakeup instead of list corruption. */
+uint64_t g_fx_spurious;      /* self-unlinks = spurious wakes detected */
+
+static bool futex_unlink_self(uint64_t cr3, uint64_t addr,
+                              struct proc *caller) {
+    bool was_linked = false;
+    uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+    uint32_t idx = futex_hash(cr3, addr);
+    struct futex_entry *e = g_futex_hash[idx];
+    while (e && !(e->key_cr3 == cr3 && e->key_addr == addr)) e = e->next;
+    if (e) {
+        struct proc **pp = &e->waiters;
+        int hops = 0;
+        while (*pp) {
+            if (*pp == caller) {
+                *pp = caller->next_wait;
+                caller->next_wait = 0;
+                was_linked = true;
+                break;
+            }
+            /* Bounded: an already-cyclic list must not wedge the unlink. */
+            if (++hops > PROC_MAX) {
+                kprintf("[fxcycle] unlink walk >%d hops addr=0x%lx -- "
+                        "cyclic waiter list, TRUNCATING\n", PROC_MAX,
+                        (unsigned long)addr);
+                *pp = 0;
+                break;
+            }
+            pp = &(*pp)->next_wait;
+        }
+        if (!e->waiters) futex_free_entry(e);
+    }
+    spin_unlock_irqrestore(&g_futex_lock, flags);
+    if (was_linked) {
+        __atomic_fetch_add(&g_fx_spurious, 1, __ATOMIC_RELAXED);
+        static int sp;
+        if (sp < 16) {
+            sp++;
+            kprintf("[fxspur] pid=%d SPURIOUS futex wake (still linked on "
+                    "0x%lx) -- unlinked self #%lu\n", caller->pid,
+                    (unsigned long)addr, (unsigned long)g_fx_spurious);
+        }
+    }
+    return was_linked;
+}
+
 int futex_fast(uint32_t *uaddr, int op, uint32_t val, long *out) {
     struct proc *caller = current_proc();
     if (!caller) return 0;
@@ -567,6 +632,10 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
         e->waiters = caller;
         spin_unlock_irqrestore(&g_futex_lock, flags);
         sched_yield();     /* woken by FUTEX_WAKE or the timeout sweep */
+        /* Slice 92: if we are still on the waiter list, the wake was
+         * SPURIOUS (deferred-requeue machinery, not a waker) -- unlink or
+         * the next re-park makes the list cyclic (the -smp 4 freeze). */
+        futex_unlink_self(cr3, addr, caller);
 #ifdef CHROMIUM_BOOT
         /* Slice 56 wake-latency instrument, wake side: requested vs actual.
          * rdy = time between the wake being DELIVERED (state->READY) and this
@@ -749,6 +818,7 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
             e->waiters = caller;
             spin_unlock_irqrestore(&g_futex_lock, flags);
             sched_yield();
+            futex_unlink_self(cr3, addr, caller);   /* slice 92: see WAIT */
             if (caller->futex_timed_out) {
                 caller->futex_timed_out = false;
                 return -110;
@@ -851,6 +921,7 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
         e->waiters = caller;
         spin_unlock_irqrestore(&g_futex_lock, flags);
         sched_yield();
+        futex_unlink_self(cr3, addr, caller);       /* slice 92: see WAIT */
         if (caller->futex_timed_out) {
             caller->futex_timed_out = false;
             return -110;
@@ -973,8 +1044,21 @@ void futex_expire_timeouts(void) {
         while (e) {
             struct futex_entry *enext = e->next;
             struct proc **pp = &e->waiters;
+            int hops = 0;
             while (*pp) {
                 struct proc *w = *pp;
+                /* Slice 92: BOUND THE WALK. The freeze-run-5 QMP capture
+                 * showed this exact loop spinning forever on a CYCLIC
+                 * waiter list while holding g_futex_lock with IRQs off --
+                 * the whole -smp 4 freeze. futex_unlink_self now prevents
+                 * the cycle from forming; this bound converts any residual
+                 * corruption into a loud line instead of a dead kernel. */
+                if (++hops > PROC_MAX) {
+                    kprintf("[fxcycle] expire walk >%d hops (bucket %d) -- "
+                            "cyclic waiter list, TRUNCATING\n", PROC_MAX, b);
+                    *pp = 0;
+                    break;
+                }
                 if (w->futex_deadline_ns && now >= w->futex_deadline_ns) {
                     *pp = w->next_wait;          /* unlink */
                     w->next_wait = 0;

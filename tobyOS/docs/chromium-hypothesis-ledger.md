@@ -5179,3 +5179,61 @@ remains UNPROVEN.**
    violation + measured stall shape, not on the retracted deadlock story.
  * A guard that passes with its hammers at 0 iterations is the frame
    counter that counts non-frames, again. Gate liveness INSIDE the test.
+
+## SLICE 92b — THE FREEZE IS CAUGHT, SYMBOLIZED, AND ROOT-CAUSED: a CYCLIC futex waiter list walked forever under g_futex_lock with IRQs off
+
+**The specimen.** Freeze-hunt run 5 (headed full chrome, WHPX `-smp 4`):
+total serial silence at guest ~10.7 s, `run_freeze.py` captured
+`info registers -a` twice, 3 s apart — the first successful capture since
+the tool was built. The last serial line before silence:
+`[fork] parent pid=13 clone-returning 25` — microseconds after a CoW fork
+completed (chrome fork #2).
+
+| CPU | RIP (both captures) | symbol | meaning |
+|---|---|---|---|
+| 0 | 0x...7501b → 0x...75021 | `futex_fast` | `spin_lock_irqsave(&g_futex_lock)` xchg loop, IRQs off |
+| 1 | 0x...75021 (same) | `futex_fast` | same spin |
+| 2 | 0x...dfb52, HLT=1, IF=1 | `sock_unix_recv_fds` | healthy cooperative hlt-wait |
+| 3 | 0x...76353 (same both) | `futex_expire_timeouts` | **INSIDE the locked waiter-list walk** — `mov (%r14),%rdi; ... add $0x4d0,%rdi; jmp` |
+
+CPU3 is the lock HOLDER, looping a linked-list traversal that never ends:
+**the waiter list is cyclic.** IRQs off on the holder + both spinners =
+no tick, no heartbeat, no serial, `[qstuck]` structurally blind. Every
+signature fact of slices 88–91 falls out of this one state.
+
+**How the cycle forms.** A parked futex waiter is made READY by machinery
+that does NOT unlink it from the waiter list (only the futex code unlinks).
+The waiter returns "woken", glibc re-checks its predicate, re-parks — and
+the head-insert while its old link is still live closes a loop:
+`pred -> T -> old_head -> ... -> pred`. The next `futex_expire_timeouts`
+or wake walk then never terminates, holding the lock. Spurious-READY
+sources found:
+ 1. **Stale `vm_quiesced` + `sched_finish_switch`'s deferred requeue** —
+    apic.c's TLB-ack wait demotes a proc to BLOCKED+vm_quiesced=1 mid-wait
+    (to satisfy a concurrent fork quiesce) and then KEEPS RUNNING; nothing
+    consumed the flag. The proc's next futex park + yield hits the
+    deferred requeue (BLOCKED + stale flag) and is spuriously requeued
+    while still linked. This is why the freeze lands right after
+    `cow_fork done` and needs `-smp 4`.
+ 2. **Any signal-path wake** (`signal.c` wakes BLOCKED procs without
+    futex-unlink; crashpad's `rt_tgsigqueueinfo` to a futex-parked thread
+    is a live example since slice 90).
+ (The pre-92 pf-park stale flag was a third source, already removed.)
+
+**FIXES (slice 92b):**
+ * `futex_unlink_self()` after EVERY futex park's `sched_yield` returns
+   (WAIT, LOCK_PI, WAIT_REQUEUE_PI): if still linked, the wake was
+   spurious — unlink self under `g_futex_lock`, count it (`[fxspur]`,
+   totals in the deep dump as `fxspur=`). Turns ANY spurious waker, present
+   or future, into a POSIX-legal spurious wakeup instead of list
+   corruption. This is the structural fix.
+ * `futex_expire_timeouts`: the walk is now BOUNDED (PROC_MAX hops) and
+   TRUNCATES a cyclic list with a loud `[fxcycle]` line — a residual
+   cycle becomes a log line, not a dead kernel.
+ * apic.c ack-wait: the BLOCKED+vm_quiesced demotion is UNDONE when the
+   wait exits (it was a lie told to the quiesce wait by a proc that keeps
+   executing) — removes stale-flag source #1 at its origin.
+
+**VERIFICATION SIGNAL for future runs:** `[fxspur]` firing with NO freeze
+is the mechanism confirming itself; `[fxcycle]` firing means a cycle
+former still exists and must be hunted.
