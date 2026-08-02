@@ -397,3 +397,19 @@ perf slices on it.
    the frame interval, and consider timestamping `Page.screencastFrame`
    arrivals vs acks in chromewin to split encode vs transport.
 3. Pick tier C from that data (§6 candidates), not from the ranking.
+
+## Post-fix headless re-baseline (slice 92, measured 2026-08-02)
+
+`build_vid` + `run_watch.py`, example.com, 360 s, both gate-clean,
+`fxspur=0`, zero freezes (`logs/rebase_smp1.log` / `rebase_smp4.log`):
+
+| config | frames/360 s | our per-frame cost |
+|---|---|---|
+| SMP=1 | ~270–299 (last window: frame 270) | b64=0 ms dec=1 ms paint=0 ms |
+| **SMP=4** | **~930–959 (last window: frame 930)** | b64=0 ms dec=1 ms paint=0 ms |
+
+-smp 4 is now both SAFE (tier A fixed) and ~3.3x SMP=1 in frame delivery —
+**make -smp 4 the default operating point for all tier-B measurement.**
+The SMP=4 number matches the historical 933; treat ~930/360 s @ SMP=4 as
+the post-slice-92 baseline. Tier-1's conclusion re-verified: our display
+path is ~1 ms/frame; the interframe time lives inside chrome.
