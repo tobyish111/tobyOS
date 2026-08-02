@@ -30,6 +30,14 @@
  * and CoW frame changes must invalidate every CPU's TLB, not just the
  * caller's -- see tlb_shootdown_remote). */
 #define TLB_SHOOTDOWN_VECTOR  0xFDu
+/* Slice 94: wake-kick IPI. A halted CPU (sti;hlt in sched_idle / the BSP
+ * in-place halt) used to sleep until its NEXT LAPIC tick before it could
+ * steal freshly-enqueued work -- [wlat] measured that at avg 2-3 ms per
+ * wake, which multiplied across every futex/pipe hop of a CDP round-trip.
+ * sched_enqueue now kicks one halted CPU with this no-op IPI so pickup is
+ * immediate. The ISR just EOIs; breaking hlt is the entire job. */
+#define SCHED_WAKE_VECTOR     0xFCu
+void apic_sched_wake(uint8_t target_apic_id);
 
 /* Map LAPIC MMIO + enable BSP's local APIC. Returns false on error
  * (e.g. ACPI didn't give us a sane lapic_phys). */

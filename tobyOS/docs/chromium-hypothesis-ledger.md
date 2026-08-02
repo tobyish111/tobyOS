@@ -5305,3 +5305,49 @@ gate-clean):** ~2820 frames (~7.8 fps at a ~100 ms cadence) vs 930 at
 nth=3 — the static-refresh duty cycle follows consumer demand too, so the
 arc's headline metric TRIPLED on the same page. Post-slice-93 baselines:
 **example.com ~2820 / anim.html ~9840 frames per 360 s at SMP=4.**
+
+---
+
+## SLICE 94 — the ack-loop ceiling attacked from three sides: encode EXONERATED, wake->run latency MEASURED at 2-5 ms and CUT 2-4x by a wake-kick IPI; the TAIL is the next target
+
+**New instrument, kernel:** `[wlat]` — perf_now_ns stamp on every enqueue
+(`proc.enq_ns`), consumed at switch-in; the deep dump prints avg/max/n per
+60 s. This is THE number under every IPC hop (futex wake, pipe write,
+eventfd) on tobyOS.
+
+**MEASURED (anim.html, nth=1, SMP=4, 360 s each, all gate-clean):**
+
+| config | frames | typical gap | [wlat] avg |
+|---|---|---|---|
+| pre-94 (ack-after-decode, Q60) | 9840 | 23-25 ms | — |
+| ack-early, Q60 | 7320 | 26-43 ms (noisy) | 1.6-14.6 ms |
+| ack-early, Q30 | 8520 | 21-25 ms | 1.4-4.7 ms |
+| ack-early, Q60, **wake-kick** | 9570 | **20-22 ms** | **0.8-1.4 ms** |
+
+**Verdicts:**
+ 1. **Encode is not a lever.** Q30 (5.9 KB jpegs) vs Q60 (7.3 KB) moved the
+    typical gap ~1-2 ms, inside run noise — slice 68's rejection
+    re-validated in the nth=1 regime. Q60 stays (CW_Q knob kept).
+ 2. **Wake->run pickup latency was the real IPC cost: avg 2-5 ms per wake.**
+    Mechanism: wakes enqueue on the BSP queue; a halted AP sleeps until its
+    NEXT LAPIC tick before stealing (percpu.h even documented the design).
+    **Fix: SCHED_WAKE_VECTOR (0xFC) wake-kick IPI** — sched_enqueue kicks
+    ONE cpu advertising `idle_halted` (claimed before the IPI; the sti;hlt
+    pair makes the pre-hlt race benign). ~15k kicks/60 s under chrome;
+    avg wlat 2-4x better; best-ever steady-state gap. defboot clean.
+ 3. **Ack-before-decode: kept, verdict neutral.** Its theoretical 2-5 ms
+    is invisible under hiccup noise; the best clean windows (20-22 ms) are
+    with ack-early + kick.
+ 4. **The TAIL survives:** hiccup windows persist (one 2.5 s stall; 400 ms
+    common), `[fxlate]` caught a futex wake sitting READY 363 ms, wlat max
+    runs 1-17 s. NOTE the max is partly contaminated: a proc enqueued while
+    still on_cpu (quiesce spinners) is unpickable by design and its stamp
+    ages. Next slice: percentile histogram + straggler attribution (log
+    pid/comm when a >100 ms-stamp proc is finally picked), then fix the
+    mechanism it names.
+
+**Session gotcha, now confirmed as law:** any Bash invocation that ran
+`make CC=TMP='C:\t' ...` poisons a LATER `python run_watch.py` in the SAME
+shell — QEMU's snapshot temp file lands on `C:\/vl.*` and it exits before
+boot (silent no-log run). Builds and runs get SEPARATE shells; runs get
+TMPDIR/TMP/TEMP prefixed to a real temp dir.

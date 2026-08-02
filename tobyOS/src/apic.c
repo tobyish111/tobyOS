@@ -115,6 +115,19 @@ void apic_eoi(void) {
  * parked with IRQs off can't ack; we warn instead of deadlocking). */
 static volatile uint32_t g_tlb_gen[MAX_CPUS];
 
+/* Slice 94: wake-kick receiver -- nothing to do; the interrupt itself
+ * broke the target's hlt, and its idle loop re-scans the queues next. */
+static void sched_wake_isr(struct regs *r) {
+    (void)r;
+    apic_eoi();
+}
+
+void apic_sched_wake(uint8_t target_apic_id) {
+    apic_send_ipi(target_apic_id,
+                  ICR_LEVEL_ASSERT | ICR_TRIGGER_EDGE |
+                  ICR_DEST_PHYSICAL | SCHED_WAKE_VECTOR);
+}
+
 static void tlb_shootdown_isr(struct regs *r) {
     (void)r;
     uint64_t cr3;
@@ -456,5 +469,6 @@ bool apic_init_bsp(void) {
     isr_register(APIC_TIMER_VECTOR, apic_timer_isr);
     /* TLB shootdown IPI handler -- shared IDT, so once covers all CPUs. */
     isr_register(TLB_SHOOTDOWN_VECTOR, tlb_shootdown_isr);
+    isr_register(SCHED_WAKE_VECTOR, sched_wake_isr);     /* slice 94 */
     return true;
 }

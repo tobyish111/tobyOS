@@ -48,6 +48,7 @@
 #include <tobyos/spinlock.h>
 #include <tobyos/watchdog.h>
 #include <tobyos/pit.h>
+#include <tobyos/apic.h>     /* slice 94: apic_sched_wake (wake-kick IPI) */
 #include <tobyos/isr.h>
 #include <tobyos/signal.h>
 
@@ -95,6 +96,12 @@ static bkl_ticket_t g_bkl = { 0, 0 };
 uint64_t g_bkl_wait_tsc[MAX_CPUS];
 uint64_t g_bkl_waits[MAX_CPUS];
 uint64_t g_bkl_acqs[MAX_CPUS];
+#ifdef CHROMIUM_BOOT
+/* Slice 94: [wlat] wake->run latency accumulators (see do_switch) +
+ * wake-kick IPI count (see sched_enqueue). */
+uint64_t g_wlat_sum, g_wlat_max, g_wlat_n;
+uint64_t g_wkick;
+#endif
 static uint64_t g_bkl_t0[MAX_CPUS];    /* slice 64b: acquire stamp per CPU */
 uint64_t g_bkl_held_tsc[MAX_CPUS];     /* total cycles HELD this interval */
 
@@ -266,6 +273,9 @@ static void queue_push_locked(struct percpu *cpu, struct proc *p) {
     if (p->on_rq) return;
     p->next_ready = 0;
     p->enq_tick   = pit_ticks();       /* start the aging clock for this wait */
+#ifdef CHROMIUM_BOOT
+    p->enq_ns     = perf_now_ns();     /* slice 94: [wlat] wake->run stamp */
+#endif
     if (cpu->ready_tail) {
         cpu->ready_tail->next_ready = p;
         cpu->ready_tail = p;
@@ -278,6 +288,9 @@ static void queue_push_locked(struct percpu *cpu, struct proc *p) {
 static void queue_push_front_locked(struct percpu *cpu, struct proc *p) {
     if (!p) return;
     p->enq_tick   = pit_ticks();
+#ifdef CHROMIUM_BOOT
+    p->enq_ns     = perf_now_ns();     /* slice 94: [wlat] wake->run stamp */
+#endif
     p->next_ready = cpu->ready_head;
     cpu->ready_head = p;
     if (!cpu->ready_tail) cpu->ready_tail = p;
@@ -463,6 +476,22 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
                 from ? from->pid : -1);
     }
 #endif
+#ifdef CHROMIUM_BOOT
+    /* Slice 94: [wlat] -- wall time between a proc being made READY and it
+     * actually starting to run. This is THE number behind every IPC hop on
+     * tobyOS (futex wake, pipe write, eventfd): if it is ~ms, scheduler
+     * pickup latency dominates chrome's CDP/Mojo round-trips; if ~us, the
+     * latency lives inside chrome and kernel work won't help. Idle procs
+     * excluded (their enq stamp is not a wake). */
+    if (!to->is_idle && to->enq_ns) {
+        uint64_t wl = perf_now_ns() - to->enq_ns;
+        to->enq_ns = 0;
+        extern uint64_t g_wlat_sum, g_wlat_max, g_wlat_n;
+        __atomic_fetch_add(&g_wlat_sum, wl, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_wlat_n, 1, __ATOMIC_RELAXED);
+        if (wl > g_wlat_max) g_wlat_max = wl;   /* racy max: fine for a dump */
+    }
+#endif
     to->state       = PROC_RUNNING;
     to->quantum_left = sched_quantum_for(to->prio);  /* fresh timeslice */
     /* Slice 39: mark `to` live-on-CPU before it can possibly be re-enqueued,
@@ -610,6 +639,32 @@ void sched_enqueue(struct proc *p) {
     uint64_t flags = spin_lock_irqsave(&cpu->ready_lock);
     queue_push_locked(cpu, p);                  /* no-ops if already on_rq */
     spin_unlock_irqrestore(&cpu->ready_lock, flags);
+
+    /* Slice 94: WAKE KICK. Work lands on the BSP queue; a halted AP would
+     * otherwise sleep until its next LAPIC tick before stealing it --
+     * [wlat] measured that pickup at avg 2-3 ms per wake, and every
+     * futex/pipe hop of a chrome CDP round-trip paid it. Kick ONE halted
+     * CPU so pickup is immediate. Claiming idle_halted before the IPI
+     * bounds it to one kick per sleeper; the sti;hlt pair on the receiver
+     * makes the race benign (a kick sent pre-hlt stays pending and breaks
+     * the hlt as it lands). Scan cost with nobody halted: <= MAX_CPUS
+     * relaxed loads. */
+    if (g_ap_run_enabled) {
+        uint32_t n = smp_cpu_count();
+        for (uint32_t i = 0; i < n && i < MAX_CPUS; i++) {
+            struct percpu *c = smp_cpu_mut(i);
+            if (!c || !c->online) continue;
+            if (__atomic_load_n(&c->idle_halted, __ATOMIC_ACQUIRE)) {
+                __atomic_store_n(&c->idle_halted, 0, __ATOMIC_RELAXED);
+                apic_sched_wake((uint8_t)c->apic_id);
+#ifdef CHROMIUM_BOOT
+                { extern uint64_t g_wkick;
+                  __atomic_fetch_add(&g_wkick, 1, __ATOMIC_RELAXED); }
+#endif
+                break;
+            }
+        }
+    }
 }
 
 /* Remove `p` from whatever ready queue it is on, if any. Safe to call on a proc
@@ -874,8 +929,11 @@ void sched_yield(void) {
             next = me->idle;
         } else {
             for (;;) {
+                /* Slice 94: kickable while halted in place (see sched_idle). */
+                __atomic_store_n(&me->idle_halted, 1, __ATOMIC_SEQ_CST);
                 sti();
                 hlt();
+                __atomic_store_n(&me->idle_halted, 0, __ATOMIC_RELAXED);
                 uint64_t f = spin_lock_irqsave(&me->ready_lock);
                 next = queue_pop_locked(me);
                 spin_unlock_irqrestore(&me->ready_lock, f);
@@ -916,8 +974,13 @@ void sched_idle(void) {
             do_switch(me, idle, p, false);
             me->current = idle;            /* p yielded/exited back to us */
         } else {
+            /* Slice 94: advertise "kickable" before parking. A wake kick
+             * sent between the store and the hlt stays pending across the
+             * sti and breaks the hlt immediately (sti;hlt atomicity). */
+            __atomic_store_n(&me->idle_halted, 1, __ATOMIC_SEQ_CST);
             sti();
             hlt();
+            __atomic_store_n(&me->idle_halted, 0, __ATOMIC_RELAXED);
         }
     }
 }
@@ -1136,6 +1199,15 @@ void sched_tick(struct regs *r) {
                       (unsigned long)g_qpark_engaged,
                       (unsigned long)g_qpark_bkl,
                       (unsigned long)g_fx_spurious); }
+            /* Slice 94: wake->run scheduler latency this interval + kicks. */
+            { extern uint64_t g_wlat_sum, g_wlat_max, g_wlat_n, g_wkick;
+              kprintf("  [wlat] avg=%luus max=%luus n=%lu wkick=%lu\n",
+                      (unsigned long)(g_wlat_n ? g_wlat_sum / g_wlat_n / 1000
+                                               : 0),
+                      (unsigned long)(g_wlat_max / 1000),
+                      (unsigned long)g_wlat_n,
+                      (unsigned long)g_wkick);
+              g_wlat_sum = g_wlat_max = g_wlat_n = 0; g_wkick = 0; }
             /* (deadlocked-stack dump now fires from signal_send at the renderer's
              * SIGKILL -- the only reliable moment; see bt_dump_group.) */
             }                        /* end 60s deep dump (slice 63c) */

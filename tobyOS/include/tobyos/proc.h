@@ -404,6 +404,10 @@ struct proc {
     int             prio;
     int32_t         quantum_left;
     uint64_t        enq_tick;
+    /* Slice 94: perf_now_ns() stamp of the last enqueue, consumed by
+     * do_switch to measure wake->run scheduler latency ([wlat] in the deep
+     * dump). 0 = no pending stamp. Struct grew: CLEAN BUILD required. */
+    uint64_t        enq_ns;
 
     /* `io_boost` is a transient interactivity bonus added to the effective
      * priority (MLFQ-style). A proc that gives up the CPU by BLOCKING before

@@ -125,6 +125,13 @@ static int g_page_w = PAGE_W, g_page_h = PAGE_H;
 #ifndef CW_NTH
 #define CW_NTH 1
 #endif
+/* Slice 94: JPEG quality knob for the encode-cost A/B at nth=1. The
+ * slice-68 "quality changed nothing" result predates tier 2 and the nth=1
+ * regime, so it gets a re-test before being believed here. Default 60 (the
+ * long-standing setting). */
+#ifndef CW_Q
+#define CW_Q 60
+#endif
 #define CW_STR2(x) #x
 #define CW_STR(x) CW_STR2(x)
 
@@ -546,14 +553,19 @@ static void handle_screencast_frame(void) {
             g_n_turn++;
         }
     }
-    g_arr_kind = 1;
-    install_b64_frame();
+    /* Slice 94: ACK BEFORE DECODE. The screencast is single-in-flight: chrome
+     * captures the next frame only after our ack, so acking after
+     * b64+decode+paint serialized our ~2-5ms into every cycle. Acking first
+     * overlaps chrome's next capture/encode with our decode of this frame.
+     * (g_msg is not touched by cdp_send, so the payload survives the send.) */
     if (sid >= 0) {                                /* ack -> chrome sends the next */
         char params[48];
         snprintf(params, sizeof params, "{\"sessionId\":%d}", sid);
         cdp_send("Page.screencastFrameAck", params, 1);
         g_last_ack_ms = sys_clock_ms();
     }
+    g_arr_kind = 1;
+    install_b64_frame();
 }
 
 /* Slice 52: POLLED-SCREENSHOT FALLBACK. Page.startScreencast only pushes when
@@ -602,7 +614,7 @@ static void send_ladder_probe(void) {
 static void request_screenshot(void) {
     if (g_shot_id) return;
     g_shot_id = cdp_send("Page.captureScreenshot",
-                         "{\"format\":\"jpeg\",\"quality\":60}", 1);
+                         "{\"format\":\"jpeg\",\"quality\":" CW_STR(CW_Q) "}", 1);
     g_shot_sent_ms = sys_clock_ms();               /* slice 93: round-trip t0 */
 }
 
@@ -1339,7 +1351,7 @@ static int cdp_bootstrap(void) {
     {
         char scp[128];
         snprintf(scp, sizeof scp,
-                 "{\"format\":\"jpeg\",\"quality\":60,"
+                 "{\"format\":\"jpeg\",\"quality\":" CW_STR(CW_Q) ","
                  "\"maxWidth\":%d,\"maxHeight\":%d,\"everyNthFrame\":" CW_STR(CW_NTH) "}",
                  g_page_w, g_page_h);
         id = cdp_send("Page.startScreencast", scp, 1);
@@ -1646,7 +1658,7 @@ int main(void) {
                          g_page_w, g_page_h);
                 cdp_send("Emulation.setDeviceMetricsOverride", rp, 1);
                 snprintf(rp, sizeof rp,
-                         "{\"format\":\"jpeg\",\"quality\":60,"
+                         "{\"format\":\"jpeg\",\"quality\":" CW_STR(CW_Q) ","
                          "\"maxWidth\":%d,\"maxHeight\":%d,"
                          "\"everyNthFrame\":" CW_STR(CW_NTH) "}",
                          g_page_w, g_page_h);

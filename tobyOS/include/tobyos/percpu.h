@@ -107,6 +107,14 @@ struct percpu {
      * cost collapsed throughput into a multi-core busy-spin livelock
      * (both cores pinned in apic_read_id, gui_tick never completing). */
     struct percpu  *self;
+
+    /* Slice 94: 1 while this CPU is parked on sti;hlt with nothing to run
+     * (sched_idle, or the BSP's in-place halt). sched_enqueue kicks ONE
+     * such CPU with SCHED_WAKE_VECTOR so a fresh wake is picked up
+     * immediately instead of waiting out the next LAPIC tick ([wlat]
+     * measured that wait at avg 2-3 ms under chrome). Appended LAST:
+     * offsets 0/8 are asm-visible and must not move. */
+    volatile uint8_t idle_halted;
 };
 
 #endif /* TOBYOS_PERCPU_H */
