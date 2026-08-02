@@ -126,6 +126,12 @@ static inline void bkl_unlock(void) {
  * would race it. The BSP flips this on right before idle_loop(). */
 static volatile bool g_ap_run_enabled = false;
 void sched_enable_ap_run(void) { g_ap_run_enabled = true; }
+/* Slice 92: the QFREEZETEST boot guard needs true SMP (its deadlock window
+ * requires a sibling mid-syscall on another CPU during a CoW-fork sweep),
+ * so it enables AP run early and restores the boot-harness invariant after.
+ * Only gates NEW steals; the caller must ensure no user proc is still live
+ * when disabling (the guard disables after proc_wait reaps everything). */
+void sched_disable_ap_run(void) { g_ap_run_enabled = false; }
 
 #ifdef SMP_DIAG
 /* ---- BKL accounting instrumentation (-DSMP_DIAG) -------------------------
@@ -1119,6 +1125,15 @@ void sched_tick(struct regs *r) {
                 g_bkl_held_tsc[ci] = 0;
             }
             { extern void lx_dump_syscall_top(void); lx_dump_syscall_top(); }
+            /* Slice 92: on-CPU quiesce-park totals (kernel-#PF during a CoW
+             * sweep). bkl= counts parks that ARRIVED holding the BKL -- they
+             * now drop it for the wait; before slice 92 they kept it, which
+             * serialized the whole kernel behind the ticket lock for the
+             * sweep duration. */
+            { extern uint64_t g_qpark_engaged, g_qpark_bkl;
+              kprintf("  [qpark] engaged=%lu bkl=%lu\n",
+                      (unsigned long)g_qpark_engaged,
+                      (unsigned long)g_qpark_bkl); }
             /* (deadlocked-stack dump now fires from signal_send at the renderer's
              * SIGKILL -- the only reliable moment; see bt_dump_group.) */
             }                        /* end 60s deep dump (slice 63c) */

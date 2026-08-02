@@ -5119,3 +5119,63 @@ trace **never reached the paint stage either** — it ends at MapWindow and
 teardown. I was treating a trace that stops before the goal as evidence
 about the goal. When a control is your spec, check that the control actually
 DOES the thing you are trying to reproduce before you trust it for that.
+
+---
+
+## SLICE 92 — tier A: the BKL-holding quiesce park is REAL and REMOVED; the "actor bkl_enter deadlock" theory is RETRACTED by its own A/B
+
+**Context.** Post-slice-91 handoff, tier A: fix the intermittent `-smp 4`
+freeze (six threads READY in clone3 ~293 s, `[bkl] acq=0` on all four CPUs,
+`[qstuck]` silent, worst shape total serial silence).
+
+**HYPOTHESIS (initially confirmed-looking, then half-refuted).** Audit found
+the one park point in the CoW-fork STW machinery that waits while HOLDING
+the BKL: a kernel-mode #PF on a WP'd user page — which `copy_to_user`
+triggers **synchronously** via `uaccess_prepare_write -> page_fault_handler`
+mid-syscall, BKL held — spun on `vm_quiesce` without dropping the lock
+(`page_fault.c` + the twin copy in `mmap.c mmap_handle_page_fault`). Theory:
+forker re-takes the BKL for `mmap_cow_clone` before `tg_vm_resume` -> hard
+cycle on the FIFO ticket lock -> whole-kernel wedge matching every observed
+fact.
+
+**A/B RESULT — the theory's actor edge DOES NOT EXIST.** A new permanent
+guard (`programs/linux-qfreeze`, QFREEZETEST in the console flavour: 3
+hammer threads driving `clock_gettime` out-params into a 256 MB touched
+region while main forks 12x) PASSES on BOTH kernels (3x fixed, 2x baseline,
+WHPX `-smp 4`). Re-tracing showed why: `tg_vm_quiesce` returns with the BKL
+already dropped, so `sys_fork`'s `held` flag is FALSE and the forker NEVER
+re-takes the BKL between quiesce and resume — `mmap_cow_clone` runs
+BKL-free. The old BKL-holding park therefore produces **sweep-length
+whole-kernel BKL stalls** (every syscall queues behind the ticket lock until
+`tg_vm_resume`), not a permanent deadlock. **The 293 s freeze mechanism
+remains UNPROVEN.**
+
+**KEPT (all real, all committed):**
+ * `vm_quiesce_park_oncpu()` (fork.c): the shared park now drops/re-takes
+   the BKL around the wait, clears the stale `vm_quiesced` on self-resume
+   (it previously leaked =1 with no `sched_finish_switch` ever owed, arming
+   `[qstuck]`/finish_switch to spuriously requeue a later unrelated BLOCKED
+   state), reports `[qpark]` engagements (+`bkl=` count) and warns loudly on
+   a >30 s park. Kernel rule enforced: no unbounded wait holds the BKL.
+ * QFREEZETEST guard: runs with AP-run enabled (new
+   `sched_disable_ap_run()` restores the boot invariant after) because the
+   boot harness is otherwise BSP-only — **a first cut "passed" with the
+   hammers at 0 iterations; the guard now hard-fails (exit 2 VACUOUS) unless
+   every hammer proves live before the forks and advances during them.**
+   Corollary worth knowing: every console-flavour boot guard (FUTEXTEST,
+   DEMRACETEST...) has been running effectively single-CPU — DEMRACETEST's
+   parallel verdicts were weaker than believed.
+ * `run_freeze.py` upgrades: detects the WEDGED-ALIVE shape (heartbeats
+   flowing, all-CPU `acq=0` in a deep dump) that the growth-only detector
+   sailed past; archives every run's serial log (`freeze_run<N>.log`);
+   `RUNS=` env knob.
+ * `[fork] bkl re-take` timing instrument at the (normally skipped)
+   `mmap_cow_clone` bkl_enter — if it ever prints, some park is holding the
+   BKL again.
+
+**METHOD NOTES.**
+ * The A/B that was built to CONFIRM the mechanism REFUTED half of it
+   instead — that is the test doing its job; the fix stands on the rule
+   violation + measured stall shape, not on the retracted deadlock story.
+ * A guard that passes with its hammers at 0 iterations is the frame
+   counter that counts non-frames, again. Gate liveness INSIDE the test.

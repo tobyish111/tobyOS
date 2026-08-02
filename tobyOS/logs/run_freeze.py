@@ -18,7 +18,7 @@ ISO = "tobyOS.iso"
 DISK = "disk.img"
 SERIAL = "logs/run_watch.log"
 PORT = 4465
-RUNS = 4            # freeze is intermittent; try a few
+RUNS = int(os.environ.get("RUNS", "4"))   # freeze is intermittent; try a few
 RUN_SECS = 360
 STALL_SECS = 25     # heartbeats come every 3s; deep dump bursts ~5s
 
@@ -90,14 +90,38 @@ def one_run(run_idx):
             if q.poll() is not None:
                 print("QEMU exited early", flush=True)
                 return False
+            blob = b""
             try:
-                size = os.path.getsize(SERIAL)
-                if not armed and b"[hb " in open(SERIAL, "rb").read():
+                blob = open(SERIAL, "rb").read()
+                size = len(blob)
+                if not armed and b"[hb " in blob:
                     armed = True
                     print("run %d: armed (kernel heartbeat seen)" % run_idx,
                           flush=True)
             except OSError:
                 size = -1
+            # Slice 92: the MILDER freeze shape -- serial still flowing
+            # (heartbeats alive) but a deep dump shows ZERO BKL acquisitions
+            # on EVERY cpu = the kernel is wedged while the tick narrates it.
+            # The old growth-only detector sailed straight past this shape.
+            if armed and size > 0:
+                tail = blob[-8000:]
+                zeros = sum(1 for c in (b"cpu0", b"cpu1", b"cpu2", b"cpu3")
+                            if (b"[bkl] " + c + b" acq=0 ") in tail)
+                if zeros >= int(os.environ.get("SMP", "4")):
+                    print("run %d: WEDGED-ALIVE (all-CPU acq=0 in deep dump)"
+                          " -- capturing" % run_idx, flush=True)
+                    with open("logs/freeze_regs.txt", "w") as out:
+                        out.write("=== wedged-alive capture run %d ===\n"
+                                  % run_idx)
+                        out.write("=== capture 1 ===\n")
+                        out.write(qmp.hmp("info registers -a"))
+                        time.sleep(3)
+                        out.write("\n=== capture 2 (3s later) ===\n")
+                        out.write(qmp.hmp("info registers -a"))
+                    import shutil
+                    shutil.copyfile(SERIAL, "logs/freeze_run%d.log" % run_idx)
+                    return True
             if size != last_size:
                 last_size = size
                 last_growth = time.time()
@@ -127,9 +151,18 @@ def one_run(run_idx):
                     out.write(qmp.hmp("info cpus"))
                 print("run %d: captured -> logs/freeze_regs.txt" % run_idx,
                       flush=True)
+                import shutil
+                shutil.copyfile(SERIAL, "logs/freeze_run%d.log" % run_idx)
                 return True
         print("run %d: completed %ds without freezing" % (run_idx, RUN_SECS),
               flush=True)
+        # Slice 92: keep every run's serial log -- the next run deletes
+        # SERIAL, and more than one "clean" run turned out to carry evidence.
+        try:
+            import shutil
+            shutil.copyfile(SERIAL, "logs/freeze_run%d.log" % run_idx)
+        except OSError:
+            pass
         return False
     finally:
         try:

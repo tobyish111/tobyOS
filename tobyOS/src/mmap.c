@@ -1073,21 +1073,9 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
  * return-false path bails before mutating), so re-running is safe. */
 bool mmap_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     /* Slice 88: while a sibling forks with CoW STW, do not CoW-copy under
-     * the WP walk. Demote to BLOCKED so quiesce wait completes; IRQs on
-     * so shootdown IPIs still ACK. */
-    {
-        struct proc *qp = current_proc();
-        if (qp && __atomic_load_n(&qp->vm_quiesce, __ATOMIC_ACQUIRE)) {
-            uint64_t rf = read_rflags();
-            sti();
-            qp->state = PROC_BLOCKED;
-            qp->vm_quiesced = 1;
-            while (__atomic_load_n(&qp->vm_quiesce, __ATOMIC_ACQUIRE))
-                __asm__ volatile("pause");
-            qp->state = PROC_RUNNING;
-            if (!(rf & (1u << 9))) cli();
-        }
-    }
+     * the WP walk. Slice 92: the wait must NOT hold the BKL (see
+     * vm_quiesce_park_oncpu -- holding it here was the -smp 4 freeze). */
+    vm_quiesce_park_oncpu(current_proc());
     if (mmap_try_fault(fault_addr, error_code)) return true;
     if (bkl_held()) return false;          /* syscall-context fault: already serialized */
     uint64_t rf = read_rflags();

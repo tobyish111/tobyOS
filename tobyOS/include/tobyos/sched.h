@@ -129,6 +129,7 @@ bool bkl_held(void);
  * the BSP after its boot sequence, right before entering the GUI idle loop --
  * before this, APs idle so they can't race kernel_main's unlocked boot work. */
 void sched_enable_ap_run(void);
+void sched_disable_ap_run(void);   /* slice 92: QFREEZETEST guard only */
 
 /* AP idle entry. Never returns. Sits on `sti; hlt` and wakes on
  * timer/IRQ; if anything ever lands on this CPU's ready queue, it

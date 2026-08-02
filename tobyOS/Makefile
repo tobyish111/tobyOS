@@ -1838,6 +1838,16 @@ programs/linux-demrace/linux-demrace.elf: programs/linux-demrace/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# CoW-fork STW deadlock guard (slice 92): hammer threads keep the kernel
+# writing user pages (clock_gettime out-params) while main fork()s over a
+# 256MB region; the old BKL-holding vm_quiesce park wedged the whole kernel
+# on the first sweep collision (-smp 4 WHPX only). Static Linux ELF.
+programs/linux-qfreeze/linux-qfreeze.elf: programs/linux-qfreeze/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 # MAP_SHARED cross-process coherence test: two processes independently mmap the
 # same (unlinked) file MAP_SHARED and must be coherent both directions -- the
 # ipcz NodeLinkMemory-fragment case behind the DOM blocker. Static Linux ELF.
@@ -2457,6 +2467,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-eventfd/linux-eventfd.elf \
                programs/linux-mapshare/linux-mapshare.elf \
                programs/linux-demrace/linux-demrace.elf \
+               programs/linux-qfreeze/linux-qfreeze.elf \
                programs/linux-mlkem/linux-mlkem.elf \
                programs/linux-xstub/linux-xstub.elf \
                programs/linux-procfs/linux-procfs.elf \
@@ -2594,6 +2605,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-eventfd/linux-eventfd.elf       $(INITRD_STAGE)/bin/linux-eventfd
 	cp programs/linux-mapshare/linux-mapshare.elf     $(INITRD_STAGE)/bin/linux-mapshare
 	cp programs/linux-demrace/linux-demrace.elf       $(INITRD_STAGE)/bin/linux-demrace
+	cp programs/linux-qfreeze/linux-qfreeze.elf       $(INITRD_STAGE)/bin/linux-qfreeze
 	cp programs/linux-mlkem/linux-mlkem.elf           $(INITRD_STAGE)/bin/linux-mlkem
 	cp programs/linux-xstub/linux-xstub.elf           $(INITRD_STAGE)/bin/linux-xstub
 	cp programs/linux-tty/linux-tty.elf               $(INITRD_STAGE)/bin/linux-tty
@@ -3059,6 +3071,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
 	    bin/linux-scmsg bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
+	    bin/linux-qfreeze \
 	    bin/linux-xstub \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \

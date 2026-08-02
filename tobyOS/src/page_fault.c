@@ -167,20 +167,11 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
     if (!p) return false;
 
     /* Slice 88: serialize with CoW-fork STW -- do not promote/copy pages
-     * while a sibling is mid vmm_cow_fork WP walk. Demote to BLOCKED so
-     * tg_vm_quiesce's wait (no PROC_RUNNING siblings) can complete; stay
-     * on this CPU with IRQs on so TLB shootdown IPIs still ACK. */
-    if (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE)) {
-        uint64_t rf;
-        __asm__ volatile("pushfq; pop %0" : "=r"(rf));
-        __asm__ volatile("sti");
-        p->state = PROC_BLOCKED;
-        p->vm_quiesced = 1;
-        while (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE))
-            __asm__ volatile("pause");
-        p->state = PROC_RUNNING;
-        if (!(rf & (1ull << 9))) __asm__ volatile("cli");
-    }
+     * while a sibling is mid vmm_cow_fork WP walk. Slice 92: the wait MUST
+     * NOT hold the BKL (a kernel #PF from a syscall's user copy arrives
+     * with it held; keeping it deadlocked the forker's mmap_cow_clone
+     * bkl_enter = the -smp 4 freeze). vm_quiesce_park_oncpu drops it. */
+    vm_quiesce_park_oncpu(p);
 
     uint64_t page_va = fault_addr & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t *pte = get_pte(p->cr3, fault_addr);

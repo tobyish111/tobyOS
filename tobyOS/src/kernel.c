@@ -7384,6 +7384,46 @@ void _start(void) {
         }
     }
 
+    /* CoW-fork STW deadlock guard (slice 92): hammer threads keep the kernel
+     * writing user pages (clock_gettime out-params = copy_to_user) while main
+     * fork()s over a 256MB region. The old vm_quiesce park in the kernel-#PF
+     * path spun HOLDING the BKL; the forker re-takes the BKL for
+     * mmap_cow_clone before tg_vm_resume -> whole-kernel deadlock on the
+     * ticket lock (the -smp 4 freeze: [bkl] acq=0 on every CPU). On a broken
+     * kernel this VERDICT line never prints -- silence IS the failure.
+     * Needs WHPX + -smp >= 2 to bite; TCG / -smp 1 passes trivially.
+     * PASS=3, FAIL=1 (lost write), ERROR=2. */
+    {
+        const char *path = "/bin/linux-qfreeze";
+        char *argv[] = { (char *)"linux-qfreeze", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-qfreeze",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        kprintf("[boot] QFREEZETEST: spawning %s (AP run ENABLED for the "
+                "guard -- the window needs true SMP)\n", path);
+        /* The boot harness normally runs BSP-only (sched_enable_ap_run fires
+         * just before idle_loop), which made a first cut of this guard pass
+         * VACUOUSLY: the hammer threads never got a CPU, iters=0. Enable AP
+         * stealing for the guard (the MCTEST_BOOT precedent: kernel_main
+         * waiting under the BKL while user procs run on APs) and restore the
+         * invariant after proc_wait has reaped every test proc. */
+        sched_enable_ap_run();
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[QFREEZETEST] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[QFREEZETEST] VERDICT: %s exit=%d (3=PASS all forks "
+                    "completed under a live syscall hammer, no lost writes; "
+                    "1=FAIL lost write; 2=ERROR/VACUOUS (hammers starved -- "
+                    "not a real verdict); NO VERDICT AT ALL = the STW/BKL "
+                    "deadlock is back)\n", rc == 3 ? "PASS" : "FAIL", rc);
+        }
+        sched_disable_ap_run();
+    }
+
     /* ML-KEM computational-correctness test (slice 38): chrome's https is
      * blocked by BoringSSL's X25519MLKEM768 computing a WRONG result on
      * tobyOS (ledger slice 36 -- the FO decapsulation amplifies any single-bit

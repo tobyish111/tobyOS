@@ -243,6 +243,72 @@ static void cow_fork_lock_release(void) {
     __atomic_store_n(&g_cow_fork_lock, 0, __ATOMIC_RELEASE);
 }
 
+/* Slice 92: park an ON-CPU proc that observed vm_quiesce from a kernel-mode
+ * #PF (the CoW-fork WP sweep is mid-flight). This is the ONE park point that
+ * used to spin while HOLDING the BKL: a sibling mid-syscall touches user
+ * memory (copy_to_user out-params under the SMAP stac window), the sweep has
+ * just write-protected that page, and the resulting kernel #PF parked here
+ * with the BKL still held. The forker meanwhile re-takes the BKL for
+ * mmap_cow_clone BEFORE tg_vm_resume -- a hard cycle on a FIFO ticket lock,
+ * and every other CPU's syscall entry queues behind it. That is the whole
+ * -smp 4 freeze: READY threads never picked, [bkl] acq=0 on all CPUs,
+ * [qstuck] blind because the spinner is on_cpu with vm_quiesce legitimately
+ * set. Drop the BKL for the wait like every other park point does.
+ *
+ * IRQs are forced on so TLB-shootdown IPIs still ACK. The wait is not
+ * broken on a timeout: proceeding mid-sweep is the PA-freelist corruption
+ * documented in apic.c, and with the BKL dropped the blast radius of an
+ * orphaned flag is one thread, not the kernel. We do REPORT a long park --
+ * if [qpark] ever prints, the resume side has a new hole. */
+uint64_t g_qpark_engaged;      /* total on-CPU quiesce parks (kernel #PF) */
+uint64_t g_qpark_bkl;          /* ... of which arrived HOLDING the BKL */
+
+void vm_quiesce_park_oncpu(struct proc *p) {
+    if (!p || !__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE)) return;
+    uint64_t rf;
+    __asm__ volatile("pushfq; pop %0" : "=r"(rf));
+    __asm__ volatile("sti");
+    bool had_bkl = bkl_held();
+    __atomic_fetch_add(&g_qpark_engaged, 1, __ATOMIC_RELAXED);
+    if (had_bkl) __atomic_fetch_add(&g_qpark_bkl, 1, __ATOMIC_RELAXED);
+#ifdef CHROMIUM_BOOT
+    /* First few engagements name themselves; the 60s deep dump prints the
+     * running totals ([qpark] engaged=/bkl=). If bkl>0 ever coincides with
+     * a freeze again, this park is back in the story. */
+    { static int qp; if (qp < 8) { qp++;
+        kprintf("[qpark] pid=%d parks on vm_quiesce (bkl=%d) #%lu\n",
+                p->pid, (int)had_bkl, (unsigned long)g_qpark_engaged); } }
+#endif
+    if (had_bkl) bkl_exit();
+    p->state = PROC_BLOCKED;
+    p->vm_quiesced = 1;
+    uint64_t warn_at = 0;
+    uint32_t spins = 0;
+    while (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("pause");
+        if ((++spins & 0xffffu) == 0) {
+            uint64_t now = perf_now_ns();
+            if (!warn_at) {
+                warn_at = now + 30000000000ull;      /* 30 s: sweep is long over */
+            } else if (now > warn_at) {
+                warn_at = now + 30000000000ull;
+                kprintf("[qpark] pid=%d STILL parked on vm_quiesce "
+                        "(had_bkl=%d) -- resume never came\n",
+                        p->pid, (int)had_bkl);
+            }
+        }
+    }
+    /* Self-resumed on-CPU: clear vm_quiesced ourselves. tg_vm_resume saw us
+     * on_cpu and deferred to sched_finish_switch, which will never run for
+     * us (we never switched out) -- a stale flag here would later make
+     * sched_finish_switch / [qstuck] requeue us out of an unrelated BLOCKED
+     * state (e.g. a futex wait). */
+    p->state = PROC_RUNNING;
+    p->vm_quiesced = 0;
+    if (had_bkl) bkl_enter();
+    if (!(rf & (1ull << 9))) __asm__ volatile("cli");
+}
+
 void tg_vm_quiesce(struct proc *actor) {
     if (!actor) return;
 #ifdef CHROMIUM_BOOT
@@ -466,7 +532,17 @@ long sys_fork(void) {
 #ifdef CHROMIUM_BOOT
         kprintf("[fork] cow_fork done pid=%d rc=%d\n", parent->pid, cow_rc);
 #endif
+        /* Slice 92: this bkl_enter is the actor edge of the freeze cycle --
+         * a sibling parked on vm_quiesce while holding the BKL wedged us
+         * here forever (before vm_quiesce_park_oncpu dropped it). Time it:
+         * if [fork] bkl re-take ever prints, some park point still holds
+         * the BKL and the cycle is back. */
+        uint64_t bkl_t0 = perf_now_ns();
         if (held) bkl_enter();
+        uint64_t bkl_dt = perf_now_ns() - bkl_t0;
+        if (bkl_dt > 2000000000ull)
+            kprintf("[fork] bkl re-take after sweep took %lu ms pid=%d\n",
+                    (unsigned long)(bkl_dt / 1000000ull), parent->pid);
         /* VMA tables are tgid-keyed; chrome forks from a launcher THREAD. */
         int vma_pid = parent->is_thread ? parent->tgid : parent->pid;
         if (cow_rc == 0)

@@ -569,6 +569,10 @@ bool proc_wait_off_cpu_bounded(struct proc *p);
  * Defined in fork.c. Actor must be the forking thread; may briefly drop BKL. */
 void tg_vm_quiesce(struct proc *actor);
 void tg_vm_resume(struct proc *actor);
+/* Slice 92: park an on-CPU proc that observed vm_quiesce from a kernel #PF.
+ * Drops the BKL while spinning (holding it deadlocked the whole kernel
+ * against the forker's mmap_cow_clone bkl_enter -- the -smp 4 freeze). */
+void vm_quiesce_park_oncpu(struct proc *p);
 
 /* VMA-table key for `p` (tgid for threads; mm_owner for share-until-exec). */
 static inline int proc_mm_pid(const struct proc *p) {
