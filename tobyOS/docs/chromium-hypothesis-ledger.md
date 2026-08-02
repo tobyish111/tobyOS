@@ -5463,3 +5463,40 @@ different dev host. Until one of those exists, tier-3 kernel work
 (/dev/dri + DRM ioctls + Mesa staging) would build toward a mechanism
 this environment cannot run — exactly the mistake Phase 0 exists to
 prevent.
+
+## SLICE 96b — RETRACTION OF THE PARK, same session: TIER 3 PHASE 0 is PASSED. The host blocker was QEMU's missing ANGLE, and this machine already carries the cure
+
+Slice 96 parked tier 3 on "host virglrenderer cannot initialize". That
+conclusion was PREMATURE by one probe. The full chain, now measured:
+
+ * The GDI-GL-1.1 fallback happens even on this RTX 5090 + Radeon iGPU
+   box in a Console (non-RDP) session — because QEMU 10.2's Windows build
+   ships NO EGL/GLES libraries at all (its dir has SDL2.dll and nothing
+   ANGLE-shaped). egl-headless' instant segfault is the missing-library
+   error path.
+ * **Staging Chromium-flavour ANGLE DLLs (libEGL/libGLESv2/
+   d3dcompiler_47, taken from the local Edge install) on PATH fixes it:**
+   `-display egl-headless -device virtio-gpu-gl-pci` initializes
+   virglrenderer (ANGLE -> D3D11 -> real GPU), and the guest completes
+   bring-up: virgl=yes negotiated, GET_DISPLAY_INFO answered (scanout
+   1280x800), RESOURCE_CREATE_2D ok, RESOURCE_ATTACH_BACKING ok.
+   Reproduced twice, deterministic. `logs/setup_angle.sh` stages the DLLs
+   into logs/angle/ (gitignored); prefix PATH with it for virgl runs.
+ * Remaining deterministic quirk = **Phase 1 work item #1**: under
+   virgl, SET_SCANOUT of a RESOURCE_CREATE_2D resource is rejected
+   (resp 0x1203, invalid resource) and our driver declines the device
+   (probe rc=-13). The 2D-compat scanout path differs in virgl mode;
+   either mask the VIRGL ack until 3D is actually wanted (2D keeps
+   working on a -gl device) or move scanout to the virgl/blob resource
+   flow.
+
+**Phase 0 status: PASSED, prerequisite documented.** Tier 3 is UNBLOCKED.
+Phase 1 scope (unchanged from the design doc, now with a concrete first
+step): (1) virgl-aware scanout in virtio_gpu.c (item above); (2)
+/dev/dri/card0 + the DRM/virtio-gpu ioctl surface; (3) stage Mesa's
+virgl driver DSOs into the chrome sysroot; (4) measure chrome GPU-raster
+value against the CPU-raster ~40 fps baseline BEFORE committing to the
+full surface. The perf-value caveat from slice 96 still stands: CPU
+raster is at ~40 fps vs a ~52 Hz ceiling, so tier 3's near-term value is
+fidelity/WebGL/headroom — hold Phase 1 to the same measure-first
+discipline.
