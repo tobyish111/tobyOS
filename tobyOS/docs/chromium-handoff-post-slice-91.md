@@ -413,3 +413,18 @@ perf slices on it.
 The SMP=4 number matches the historical 933; treat ~930/360 s @ SMP=4 as
 the post-slice-92 baseline. Tier-1's conclusion re-verified: our display
 path is ~1 ms/frame; the interframe time lives inside chrome.
+
+## ADDENDUM (slice 93): TIER B DONE — see ledger slice 93 for the tables
+
+One line each: the interframe time was **capture policy**, not
+encode/transport/display (those are ~1-10 ms). `everyNthFrame` 3->1 in
+chromewin (now the default, `CW_NTH` knob) took animated delivery
+**13 -> 27 fps** (ack loop sustains ~21 ms) and the example.com metric
+**930 -> ~2820 frames/360 s**. The renderer composits at ~52 Hz. New
+instruments: `[cwif]` interframe decomposition, `[cwping]` CDP RTT +
+JS-liveness, `/etc/anim.html` damage generator (`-DCW_URL` to use).
+Next ceiling: the single-in-flight ack loop (~21 ms = capture+encode+2
+pipe hops). Candidates: ack-before-decode in chromewin; re-test the
+JPEG quality knob AT nth=1; kernel IPC wake latency (pings cost
+32-86 ms under load). Baselines before slice 93 were nth=3 — annotate
+any cross-slice comparison.

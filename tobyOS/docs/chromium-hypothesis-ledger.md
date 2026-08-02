@@ -5237,3 +5237,71 @@ sources found:
 **VERIFICATION SIGNAL for future runs:** `[fxspur]` firing with NO freeze
 is the mechanism confirming itself; `[fxcycle]` firing means a cycle
 former still exists and must be hunted.
+
+---
+
+## SLICE 93 — TIER B DONE: the interframe time is MEASURED and decomposed; first tier-C win shipped (everyNthFrame 3->1 = 13->27 fps)
+
+**Instrument** (`programs/chromewin`, all committed): per-30-frame `[cwif]`
+line — arrival gap avg/max, chrome's own capture cadence (delta of
+consecutive `screencastFrame metadata.timestamp`s), ack->arrival
+turnaround, `captureScreenshot` round-trip, pushed/polled split — plus a
+5 s `[cwping]` CDP `Runtime.evaluate` round-trip that doubles as a
+JS-liveness probe (reports `location.href` + the anim counters), and a
+deterministic damage generator (`/etc/anim.html`, 16 ms setInterval
+full-viewport canvas repaint + an on-screen rAF counter; navigate to it
+with `-DCW_URL=\"file:///etc/anim.html\"`).
+
+**MEASURED, SMP=4, 360 s runs, all gate-clean:**
+
+| regime | delivered | gap | chrome capture cadence | ack->arrival | ours |
+|---|---|---|---|---|---|
+| example.com (static) | 3.3 fps | ~310 ms | ~300 ms | ~296 ms | ~1 ms |
+| anim page, nth=3 | 13 fps | 55 ms | 54 ms | 51 ms | ~1 ms |
+| anim page, **nth=1** | **27 fps** | **24 ms** | **23 ms** | **21 ms** | ~1 ms |
+
+Encode+transport is the small residual (gap minus capture cadence,
+~2-10 ms); CDP pings round-trip in 32-86 ms under load. The renderer
+composits at ~52 Hz (on-screen counter: `tick 52.5/s raf=13713`).
+
+**FINDINGS, in order of consequence:**
+ 1. **The interframe time was never encode, transport, or our display
+    path.** It was capture POLICY: `everyNthFrame:3` skipped 2 of every 3
+    compositor commits (54 ms = 3 x ~18 ms commits), and on a static page
+    the ~300 ms is viz's refresh duty-cycle re-serving an unchanged
+    surface (irrelevant: nothing new to show).
+ 2. **nth=1 is a measured 2x and is now chromewin's default** (`CW_NTH`
+    knob kept). Frame baselines recorded before slice 93 used nth=3 —
+    do not compare across without noting this.
+ 3. The next ceiling is the single-in-flight ack loop at ~21 ms
+    (capture+encode+2 pipe hops). Candidates, in order: ack-before-decode
+    in chromewin (overlaps our ~2-5 ms with chrome's next capture);
+    re-test the quality knob AT nth=1 (its slice-68 rejection predates
+    tier 2 and this regime); kernel wake-latency work (the 32-86 ms ping
+    RTT under load says IPC hops still cost real time on tobyOS).
+ 4. At SMP=1 chrome-side latency explodes (screenshot RTT ~3.5 s, pings
+    up to 1.6 s) — all measurement stays at SMP=4.
+
+**RETRACTION (mine, same-slice):** after the first blank-page run I
+attributed the missing animation to "headless issues no BeginFrames so
+rAF never ticks". WRONG — the page had simply failed to load
+(`chrome-error://chromewebdata/`, the URL's file was missing from the
+initrd tar list). With the file actually present, rAF ticks at ~50/s,
+on-screen. The on-page counters (put there as the discriminator) are what
+caught it. Verify the page LOADED before theorizing about the renderer.
+
+**Gotchas that burned this slice** (both now on the record):
+ * `initrd/etc` staging has BOTH a cp block AND an explicit tar file
+   list; a file only in the former builds fine and silently does not
+   exist in the guest (the linux-* /bin memory note, etc/ edition).
+ * Exporting `TMP='C:\t'` (the clang integrated-as workaround) into the
+   shell that later launches QEMU breaks `-snapshot` temp-file creation
+   (`C:\/vl.XXX: Permission denied`) — QEMU exits before boot and the run
+   silently produces no serial log. Scope the TMP override to the build
+   (build_vid.sh already does) or prefix runs with a valid TMP.
+
+**Post-change stock baseline (example.com, nth=1 default, SMP=4, 360 s,
+gate-clean):** ~2820 frames (~7.8 fps at a ~100 ms cadence) vs 930 at
+nth=3 — the static-refresh duty cycle follows consumer demand too, so the
+arc's headline metric TRIPLED on the same page. Post-slice-93 baselines:
+**example.com ~2820 / anim.html ~9840 frames per 360 s at SMP=4.**

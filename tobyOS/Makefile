@@ -2519,7 +2519,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                 initrd/etc/c19b.lua \
                 initrd/etc/c20.lua \
                 initrd/etc/c21.lua \
-               initrd/etc/motd initrd/readme.txt initrd/etc/Lato-Regular.ttf \
+               initrd/etc/motd initrd/etc/anim.html \
+               initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
                initrd/etc/Lato-BoldItalic.ttf initrd/etc/fallback.otf \
                initrd/etc/emoji.ttf \
@@ -2539,6 +2540,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	mkdir -p $(INITRD_STAGE)/bin $(INITRD_STAGE)/etc $(INITRD_STAGE)/repo $(INITRD_STAGE)/lib \
 	         $(INITRD_STAGE)/system/keys $(INITRD_STAGE)/m36
 	cp initrd/etc/motd                       $(INITRD_STAGE)/etc/motd
+	cp initrd/etc/anim.html                  $(INITRD_STAGE)/etc/anim.html
 	cp initrd/etc/Lato-Regular.ttf           $(INITRD_STAGE)/etc/Lato-Regular.ttf
 	cp initrd/etc/Lato-Bold.ttf              $(INITRD_STAGE)/etc/Lato-Bold.ttf
 	cp initrd/etc/Lato-Italic.ttf            $(INITRD_STAGE)/etc/Lato-Italic.ttf
@@ -3113,7 +3115,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    repo/helloapp_caps_ro.tpkg                                        \
 	    system/keys/trust.db                                              \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
-	    etc/motd etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
+	    etc/motd etc/anim.html etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    readme.txt $$EXTRA_FILES

@@ -101,6 +101,12 @@ static int g_page_w = PAGE_W, g_page_h = PAGE_H;
  * (Proven paths to flip back to: youtube.com/embed/<id> ; file:///opt/chrome/vid.webm ; example.com) */
 #ifdef MSE_TEST_JS
 #define START_URL "about:blank"        /* the MSE test needs no page at all */
+#elif defined(CW_URL)
+/* Slice 93: measurement override -- build with
+ *   PROG_EXTRA_CFLAGS='-DCW_URL=\"file:///etc/anim.html\"'
+ * (anim.html = rAF full-viewport repaint: drives the pushed screencast
+ * path at its natural max, zero network dependence). */
+#define START_URL CW_URL
 #else
 /* (Slice 62 used https://example.com to validate RESIZE in isolation from
  * YouTube's evening-service flakiness -- flip to it for mechanism tests.) */
@@ -108,6 +114,19 @@ static int g_page_w = PAGE_W, g_page_h = PAGE_H;
  * after bootstrap; measure on a light page until that is fixed. */
 #define START_URL "https://example.com"
 #endif
+
+/* Slice 93: screencast frame-skip knob. MEASURED (anim.html, SMP=4, 360s
+ * runs): the compositor commits at ~52Hz; everyNthFrame=3 (the historic
+ * setting) delivered 13 fps at a 54 ms cadence -- pure capture POLICY,
+ * every 3rd commit -- while the ack round-trip sustains ~21 ms. nth=1
+ * delivered 27 fps (gap 24 ms, turn 21 ms), our decode still ~1 ms.
+ * Default is now 1: a measured 2x on animated/video content; the knob
+ * stays for A/Bs. NOTE: frame baselines before slice 93 were nth=3. */
+#ifndef CW_NTH
+#define CW_NTH 1
+#endif
+#define CW_STR2(x) #x
+#define CW_STR(x) CW_STR2(x)
 
 static struct tk_window win;
 static toby_image_t *g_frame;        /* latest decoded screenshot (CDP path) */
@@ -393,6 +412,48 @@ static long g_last_frame_ms;
  * tk_redraw (blit syscall + kernel window copy). */
 static long g_t_b64, g_t_dec, g_t_blt, g_t_n;
 
+/* Slice 93 (tier B): INTERFRAME DECOMPOSITION. The question tier 2.5 died
+ * without answering: of the wall-clock between frames, how much is chrome
+ * producing/encoding, how much is transport/ack turnaround, how much is us
+ * (b64+dec+paint, known ~1ms), and how much is nobody-even-asked? Per
+ * 30-frame window:
+ *   gap    = arrival-to-arrival wall time (all frames)
+ *   cap    = delta between consecutive screencastFrame metadata.timestamps
+ *            (chrome's OWN capture clock -- its production cadence)
+ *   turn   = our screencastFrameAck -> next screencastFrame arrival
+ *            (chrome's produce+encode+pipe turnaround while ack-gated)
+ *   shotrt = Page.captureScreenshot request -> reply round-trip (polled path)
+ *   push/poll = how many frames each path contributed. */
+static long g_t_gap, g_gap_max, g_last_arr_ms;
+static long g_t_cap, g_n_cap;
+static long long g_last_cap_ms;          /* epoch ms from chrome, 0 = none */
+static long g_t_turn, g_n_turn, g_last_ack_ms;
+static long g_t_shot, g_n_shot, g_shot_sent_ms;
+static int  g_n_push, g_n_poll;
+static int  g_arr_kind;                  /* 0 = polled reply, 1 = pushed */
+static int  g_ping_id;                   /* slice 93: CDP ping in flight */
+static long g_ping_sent_ms;
+
+/* Parse "timestamp":<sec>.<frac> (CDP TimeSinceEpoch, seconds) -> epoch ms.
+ * Integer math; returns 0 if absent. */
+static long long json_ts_ms(const char *msg) {
+    const char *p = strstr(msg, "\"timestamp\":");
+    if (!p) return 0;
+    p += 12;
+    long long sec = 0;
+    while (*p >= '0' && *p <= '9') sec = sec * 10 + (*p++ - '0');
+    long long ms = sec * 1000;
+    if (*p == '.') {
+        p++;
+        int scale = 100;
+        while (*p >= '0' && *p <= '9' && scale) {
+            ms += (*p++ - '0') * scale;
+            scale /= 10;
+        }
+    }
+    return ms;
+}
+
 static int install_b64_frame(void) {
     const char *p = strstr(g_msg, "\"data\":\"");
     if (!p) return 0;
@@ -430,6 +491,17 @@ static int install_b64_frame(void) {
     g_t_b64 += t1ms - t0ms;
     g_t_dec += t2ms - t1ms;
     g_t_n++;
+    /* Slice 93: arrival-gap + path accounting (see decl block above). */
+    {
+        long now = g_last_frame_ms;
+        if (g_last_arr_ms) {
+            long gap = now - g_last_arr_ms;
+            g_t_gap += gap;
+            if (gap > g_gap_max) g_gap_max = gap;
+        }
+        g_last_arr_ms = now;
+        if (g_arr_kind) g_n_push++; else g_n_poll++;
+    }
     if (g_frames == 1 || (g_frames % 30) == 0) {
         extern long g_t_paint, g_n_paint;         /* accumulated in paint() */
         printf("[chromewin] frame %d: %dx%d jpeg=%ld bytes | avg/%ld "
@@ -437,19 +509,50 @@ static int install_b64_frame(void) {
                g_frames, img->width, img->height, n, g_t_n,
                g_t_b64 / g_t_n, g_t_dec / g_t_n,
                g_n_paint ? g_t_paint / g_n_paint : 0, g_n_paint);
+        printf("[cwif] frame %d | gap avg=%ldms max=%ldms | cap avg=%ldms "
+               "(x%ld) | turn avg=%ldms (x%ld) | shotrt avg=%ldms (x%ld) | "
+               "push=%d poll=%d\n",
+               g_frames,
+               (g_t_n > 1) ? g_t_gap / (g_t_n - 1) : 0, g_gap_max,
+               g_n_cap  ? g_t_cap  / g_n_cap  : 0, g_n_cap,
+               g_n_turn ? g_t_turn / g_n_turn : 0, g_n_turn,
+               g_n_shot ? g_t_shot / g_n_shot : 0, g_n_shot,
+               g_n_push, g_n_poll);
         g_t_b64 = g_t_dec = 0; g_t_n = 0;
         g_t_paint = g_n_paint = 0;
+        g_t_gap = g_gap_max = 0;
+        g_t_cap = g_n_cap = 0;
+        g_t_turn = g_n_turn = 0;
+        g_t_shot = g_n_shot = 0;
+        g_n_push = g_n_poll = 0;
     }
     return 1;
 }
 
 static void handle_screencast_frame(void) {
     int sid = json_int(g_msg, "sessionId");        /* numeric screencast session */
+    /* Slice 93: chrome's own capture cadence + ack->arrival turnaround. */
+    {
+        long now = sys_clock_ms();
+        long long cap = json_ts_ms(g_msg);
+        if (cap && g_last_cap_ms && cap > g_last_cap_ms &&
+            cap - g_last_cap_ms < 60000) {
+            g_t_cap += (long)(cap - g_last_cap_ms);
+            g_n_cap++;
+        }
+        if (cap) g_last_cap_ms = cap;
+        if (g_last_ack_ms && now >= g_last_ack_ms) {
+            g_t_turn += now - g_last_ack_ms;
+            g_n_turn++;
+        }
+    }
+    g_arr_kind = 1;
     install_b64_frame();
     if (sid >= 0) {                                /* ack -> chrome sends the next */
         char params[48];
         snprintf(params, sizeof params, "{\"sessionId\":%d}", sid);
         cdp_send("Page.screencastFrameAck", params, 1);
+        g_last_ack_ms = sys_clock_ms();
     }
 }
 
@@ -500,6 +603,7 @@ static void request_screenshot(void) {
     if (g_shot_id) return;
     g_shot_id = cdp_send("Page.captureScreenshot",
                          "{\"format\":\"jpeg\",\"quality\":60}", 1);
+    g_shot_sent_ms = sys_clock_ms();               /* slice 93: round-trip t0 */
 }
 
 /* Dispatch one event message currently in g_msg. Only screencastFrame needs
@@ -632,8 +736,22 @@ static void cdp_dispatch(void) {
         return;
     }
     if (strstr(g_msg, "\"method\":\"Network.")) { note_network_event(); return; }
+    if (g_ping_id && json_has_id(g_msg, g_ping_id)) {   /* slice 93: CDP ping */
+        static char pv[160];
+        if (json_str(g_msg, "value", pv, sizeof pv) < 0) pv[0] = 0;
+        printf("[cwping] rt=%ldms %s\n", sys_clock_ms() - g_ping_sent_ms, pv);
+        g_ping_id = 0;
+        return;
+    }
     if (g_shot_id && json_has_id(g_msg, g_shot_id)) {   /* polled screenshot reply */
         g_shot_id = 0;
+        /* Slice 93: screenshot round-trip (request -> reply arrival). */
+        if (g_shot_sent_ms) {
+            g_t_shot += sys_clock_ms() - g_shot_sent_ms;
+            g_n_shot++;
+            g_shot_sent_ms = 0;
+        }
+        g_arr_kind = 0;
         install_b64_frame();
         return;
     }
@@ -1222,7 +1340,7 @@ static int cdp_bootstrap(void) {
         char scp[128];
         snprintf(scp, sizeof scp,
                  "{\"format\":\"jpeg\",\"quality\":60,"
-                 "\"maxWidth\":%d,\"maxHeight\":%d,\"everyNthFrame\":3}",
+                 "\"maxWidth\":%d,\"maxHeight\":%d,\"everyNthFrame\":" CW_STR(CW_NTH) "}",
                  g_page_w, g_page_h);
         id = cdp_send("Page.startScreencast", scp, 1);
     }
@@ -1530,7 +1648,8 @@ int main(void) {
                 snprintf(rp, sizeof rp,
                          "{\"format\":\"jpeg\",\"quality\":60,"
                          "\"maxWidth\":%d,\"maxHeight\":%d,"
-                         "\"everyNthFrame\":3}", g_page_w, g_page_h);
+                         "\"everyNthFrame\":" CW_STR(CW_NTH) "}",
+                         g_page_w, g_page_h);
                 cdp_send("Page.startScreencast", rp, 1);
                 request_screenshot();            /* fresh frame right away */
                 printf("[chromewin] RESIZE applied: win %dx%d -> page %dx%d\n",
@@ -1564,6 +1683,29 @@ int main(void) {
          * finished painting before the screencast started) -> pull one. */
         if (sys_clock_ms() - g_last_frame_ms > 2000)
             request_screenshot();
+
+        /* Slice 93: CDP PING. Splits the ~300ms interframe residency: if a
+         * trivial Runtime.evaluate round-trips in ~10ms, the CDP pipe + the
+         * browser main thread are fast and the screencast cadence is capture
+         * POLICY; if pings also take ~300ms, the pipe/scheduling latency is
+         * the bottleneck and the ack just arrives late. */
+        {
+            static long next_ping;
+            long nowp = sys_clock_ms();
+            if (!g_ping_id && nowp >= next_ping && g_session[0]) {
+                next_ping = nowp + 5000;
+                /* Slice 93b: the ping doubles as a JS-liveness probe -- it
+                 * reports the page URL and the anim counters (n/raf), which
+                 * splits "JS never ran" from "JS runs but never composites"
+                 * (both look like a blank white screencast from outside). */
+                g_ping_id = cdp_send("Runtime.evaluate",
+                                     "{\"expression\":\"'u='+location.href+"
+                                     "' n='+(window.n===undefined?-1:window.n)+"
+                                     "' raf='+(window.raf===undefined?-1:window.raf)\","
+                                     "\"returnByValue\":true}", 1);
+                g_ping_sent_ms = nowp;
+            }
+        }
 
 #ifdef IPC_SIZE_LADDER
         /* One rung every 3s, starting 5s in (after the MSE test settles). */

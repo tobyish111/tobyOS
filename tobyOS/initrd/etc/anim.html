@@ -1,0 +1,36 @@
+<!doctype html>
+<!-- Slice 93 (tier B): deterministic damage generator. A requestAnimationFrame
+     canvas loop repaints the full viewport every vsync, so Page.startScreencast
+     pushes at its natural maximum rate -- measuring chrome's frame PRODUCTION
+     pipeline (raster + encode + CDP transport) with zero network dependence.
+     The frame counter text proves delivered frames are distinct, and the
+     hue sweep makes dropped/duplicated frames visible in screenshots. -->
+<html>
+<head><title>tobyOS anim probe</title>
+<style>html,body{margin:0;height:100%;overflow:hidden}</style></head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const cv = document.getElementById('c');
+const cx = cv.getContext('2d');
+function fit() { cv.width = innerWidth; cv.height = innerHeight; }
+addEventListener('resize', fit); fit();
+/* First cut used requestAnimationFrame alone: the page stayed BLANK WHITE
+ * -- headless-shell under screencast issues no BeginFrames, so rAF never
+ * ticks even once. Timers DO fire, so the damage generator is a 16 ms
+ * setInterval; the rAF counter is kept on screen as the discriminator
+ * (raf=0 on-screen = BeginFrames absent, measured not assumed). */
+let n = 0, raf = 0, t0 = Date.now();
+requestAnimationFrame(function rtick() { raf++; requestAnimationFrame(rtick); });
+setInterval(function () {
+  n++;
+  cx.fillStyle = 'hsl(' + (n * 7 % 360) + ',85%,55%)';
+  cx.fillRect(0, 0, cv.width, cv.height);
+  cx.fillStyle = '#000';
+  cx.font = '28px monospace';
+  const fps = (n * 1000 / (Date.now() - t0 + 1)).toFixed(1);
+  cx.fillText('tick ' + n + ' (' + fps + '/s)  raf=' + raf, 20, 44);
+}, 16);
+</script>
+</body>
+</html>
