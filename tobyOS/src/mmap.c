@@ -343,21 +343,35 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
      * while still PROT_NONE correctly can't be satisfied -> SIGSEGV). */
     if ((flags & VMA_FLAG_ANON) && prot != VMA_PROT_NONE) {
         uint32_t vmm_f = prot_to_vmm_flags(prot);
-        uint64_t saved_root = vmm_set_editor_root(p->cr3);
-        for (uint64_t a = base; a < base + len; a += PAGE_SIZE) {
-            uint64_t phys = pmm_alloc_page();
-            if (!phys) {
-                kprintf("[mmap] WARN: pmm_alloc_page FAILED at a=0x%lx "
-                        "(base=0x%lx len=0x%lx) -- OOM\n",
-                        (unsigned long)a, (unsigned long)base,
-                        (unsigned long)len);
-                vmm_set_editor_root(saved_root);
-                return -12;
+        /* Slice 95: chunk the commit. This loop (alloc + 4K memset + map,
+         * per page, whole range) was the #1 residual BKL customer after the
+         * mprotect fixes -- [lx-hold] mmap=28-48k Mcyc/min with single holds
+         * ~1 s (a multi-hundred-MB commit zeroes it all under the BKL).
+         * Same discipline as sys_mprotect: bounce the BKL between chunks so
+         * the ticket queue drains; the VMA is fully recorded above, so
+         * concurrent mappers already see this range as taken. */
+        const uint64_t COMMIT_CHUNK = 16ull << 20;       /* 16 MiB */
+        uint64_t a = base, cend = base + len;
+        while (a < cend) {
+            uint64_t seg = a + COMMIT_CHUNK;
+            if (seg > cend) seg = cend;
+            uint64_t saved_root = vmm_set_editor_root(p->cr3);
+            for (; a < seg; a += PAGE_SIZE) {
+                uint64_t phys = pmm_alloc_page();
+                if (!phys) {
+                    kprintf("[mmap] WARN: pmm_alloc_page FAILED at a=0x%lx "
+                            "(base=0x%lx len=0x%lx) -- OOM\n",
+                            (unsigned long)a, (unsigned long)base,
+                            (unsigned long)len);
+                    vmm_set_editor_root(saved_root);
+                    return -12;
+                }
+                memset((void *)(phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
+                vmm_map(a, phys, PAGE_SIZE, vmm_f);
             }
-            memset((void *)(phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
-            vmm_map(a, phys, PAGE_SIZE, vmm_f);
+            vmm_set_editor_root(saved_root);
+            if (a < cend && bkl_held()) { bkl_exit(); bkl_enter(); }
         }
-        vmm_set_editor_root(saved_root);
     }
 
     return (long)base;
@@ -790,9 +804,29 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
     }
 
     uint32_t vmm_f = prot_to_vmm_flags(prot);
-    uint64_t saved_root = vmm_set_editor_root(p->cr3);
-    vmm_protect(addr, len, vmm_f);
-    vmm_set_editor_root(saved_root);
+    /* Slice 95: chunk the PTE walk so one giant mprotect cannot convoy the
+     * whole kernel. The VMA tables above are already updated, so a fault
+     * taken mid-walk resolves against the NEW protection (the "VMA present
+     * but PROT_NONE / not writable" path); interleaving with the app's own
+     * threads is the POSIX-undefined mprotect race it always was. Between
+     * chunks: restore the editor root (it is GLOBAL state -- another
+     * thread's vmm op must not edit our cr3), then bounce the BKL so the
+     * fair ticket queue hands the kernel to whoever piled up behind us.
+     * One shootdown at the end, exactly as before (the stale-TLB window
+     * across chunks is the same window the single walk always had). */
+    {
+        const uint64_t MPROT_CHUNK = 32ull << 20;      /* 32 MiB */
+        uint64_t off = 0;
+        while (off < len) {
+            uint64_t n = len - off;
+            if (n > MPROT_CHUNK) n = MPROT_CHUNK;
+            uint64_t saved_root = vmm_set_editor_root(p->cr3);
+            vmm_protect(addr + off, n, vmm_f);
+            vmm_set_editor_root(saved_root);
+            off += n;
+            if (off < len && bkl_held()) { bkl_exit(); bkl_enter(); }
+        }
+    }
     /* Permission downgrade must reach every CPU's TLB, not just ours --
      * another thread of this process may be running on another core with
      * the old (more permissive) translation cached. */

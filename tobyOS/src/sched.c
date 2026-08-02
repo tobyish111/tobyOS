@@ -101,6 +101,16 @@ uint64_t g_bkl_acqs[MAX_CPUS];
  * wake-kick IPI count (see sched_enqueue). */
 uint64_t g_wlat_sum, g_wlat_max, g_wlat_n;
 uint64_t g_wkick;
+/* Slice 95: the TAIL hunt. Buckets: <100us, <1ms, <10ms, <100ms, <1s, >=1s.
+ * g_wtail_logged throttles the [wtail] attribution lines per interval. */
+uint64_t g_wlat_hist[6];
+int      g_wtail_logged;
+/* Longest single BKL hold this interval + who held it ([bklmax]): the
+ * direct test of the convoy theory (a READY straggler can be starved by
+ * every CPU queueing behind one long hold). */
+uint64_t g_bkl_maxhold_tsc;
+int      g_bkl_maxhold_pid;
+char     g_bkl_maxhold_comm[16];
 #endif
 static uint64_t g_bkl_t0[MAX_CPUS];    /* slice 64b: acquire stamp per CPU */
 uint64_t g_bkl_held_tsc[MAX_CPUS];     /* total cycles HELD this interval */
@@ -223,6 +233,26 @@ void bkl_exit(void) {
         g_bkl_held_tsc[me->cpu_idx] += d;
         extern void bkl_hold_account(uint64_t);
         bkl_hold_account(d);
+#ifdef CHROMIUM_BOOT
+        /* Slice 95: remember the longest SINGLE hold this interval and who
+         * held it -- the convoy test. Racy read/update is fine for a dump. */
+        {
+            extern uint64_t g_bkl_maxhold_tsc;
+            extern int g_bkl_maxhold_pid;
+            extern char g_bkl_maxhold_comm[16];
+            if (d > g_bkl_maxhold_tsc) {
+                g_bkl_maxhold_tsc = d;
+                struct proc *hp = current_proc();
+                g_bkl_maxhold_pid = hp ? hp->pid : -1;
+                if (hp) {
+                    int ci = 0;
+                    for (; ci < 15 && hp->name[ci]; ci++)
+                        g_bkl_maxhold_comm[ci] = hp->name[ci];
+                    g_bkl_maxhold_comm[ci] = 0;
+                }
+            }
+        }
+#endif
     }
     me->holds_bkl = false;
     bkl_unlock();
@@ -486,10 +516,29 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
     if (!to->is_idle && to->enq_ns) {
         uint64_t wl = perf_now_ns() - to->enq_ns;
         to->enq_ns = 0;
-        extern uint64_t g_wlat_sum, g_wlat_max, g_wlat_n;
+        extern uint64_t g_wlat_sum, g_wlat_max, g_wlat_n, g_wlat_hist[6];
+        extern int g_wtail_logged;
         __atomic_fetch_add(&g_wlat_sum, wl, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_wlat_n, 1, __ATOMIC_RELAXED);
         if (wl > g_wlat_max) g_wlat_max = wl;   /* racy max: fine for a dump */
+        /* Slice 95: percentile buckets + straggler attribution. */
+        int b = (wl < 100000ull)       ? 0
+              : (wl < 1000000ull)      ? 1
+              : (wl < 10000000ull)     ? 2
+              : (wl < 100000000ull)    ? 3
+              : (wl < 1000000000ull)   ? 4 : 5;
+        __atomic_fetch_add(&g_wlat_hist[b], 1, __ATOMIC_RELAXED);
+        if (b >= 4 && g_wtail_logged < 6) {
+            g_wtail_logged++;
+            uint64_t nt = pit_ticks();
+            kprintf("[wtail] pid=%d '%s' pickable %lums (prio=%d io=%d "
+                    "aged=%lums onrq=%d)\n",
+                    to->pid, to->name, (unsigned long)(wl / 1000000ull),
+                    to->prio, to->io_boost,
+                    (unsigned long)((nt > to->enq_tick)
+                                    ? nt - to->enq_tick : 0),
+                    to->on_rq ? 1 : 0);
+        }
     }
 #endif
     to->state       = PROC_RUNNING;
@@ -542,6 +591,16 @@ void sched_finish_switch(void) {
     if (prev) {
         cpu->prev_proc = 0;
         __atomic_store_n(&prev->on_cpu, 0, __ATOMIC_RELEASE);
+#ifdef CHROMIUM_BOOT
+        /* Slice 95: [wlat] measures PICKABLE time. A proc that sat queued
+         * while still on_cpu (yield rotation; a spurious enqueue during an
+         * on-CPU quiesce spin) was unpickable by design -- every picker
+         * skips on_cpu procs -- so its stamp would report scheduler
+         * latency that never existed. Re-stamp at the moment it truly
+         * becomes stealable. (enq_tick, the AGING clock, is deliberately
+         * left alone.) */
+        if (prev->on_rq) prev->enq_ns = perf_now_ns();
+#endif
         /* Slice 89: SEQ_CST fence between the on_cpu store and the
          * vm_quiesce load. This handoff races tg_vm_resume's mirror-image
          * {vm_quiesce:=0; load on_cpu}: with only release/acquire, x86
@@ -1199,15 +1258,39 @@ void sched_tick(struct regs *r) {
                       (unsigned long)g_qpark_engaged,
                       (unsigned long)g_qpark_bkl,
                       (unsigned long)g_fx_spurious); }
-            /* Slice 94: wake->run scheduler latency this interval + kicks. */
+            /* Slice 94: wake->run scheduler latency this interval + kicks.
+             * Slice 95: percentile buckets + longest single BKL hold. */
             { extern uint64_t g_wlat_sum, g_wlat_max, g_wlat_n, g_wkick;
-              kprintf("  [wlat] avg=%luus max=%luus n=%lu wkick=%lu\n",
+              extern uint64_t g_wlat_hist[6];
+              extern int g_wtail_logged;
+              extern uint64_t g_bkl_maxhold_tsc;
+              extern int g_bkl_maxhold_pid;
+              extern char g_bkl_maxhold_comm[16];
+              kprintf("  [wlat] avg=%luus max=%luus n=%lu wkick=%lu | "
+                      "<100u=%lu <1m=%lu <10m=%lu <100m=%lu <1s=%lu >=1s=%lu\n",
                       (unsigned long)(g_wlat_n ? g_wlat_sum / g_wlat_n / 1000
                                                : 0),
                       (unsigned long)(g_wlat_max / 1000),
                       (unsigned long)g_wlat_n,
-                      (unsigned long)g_wkick);
-              g_wlat_sum = g_wlat_max = g_wlat_n = 0; g_wkick = 0; }
+                      (unsigned long)g_wkick,
+                      (unsigned long)g_wlat_hist[0],
+                      (unsigned long)g_wlat_hist[1],
+                      (unsigned long)g_wlat_hist[2],
+                      (unsigned long)g_wlat_hist[3],
+                      (unsigned long)g_wlat_hist[4],
+                      (unsigned long)g_wlat_hist[5]);
+              kprintf("  [bklmax] hold=%luMcyc pid=%d '%s'\n",
+                      (unsigned long)(g_bkl_maxhold_tsc >> 20),
+                      g_bkl_maxhold_pid, g_bkl_maxhold_comm);
+              { extern uint64_t g_tlb_ack_timeouts, g_tlb_giveups;
+                kprintf("  [tlbto] ack_timeouts=%lu giveups=%lu\n",
+                        (unsigned long)g_tlb_ack_timeouts,
+                        (unsigned long)g_tlb_giveups);
+                g_tlb_ack_timeouts = 0; g_tlb_giveups = 0; }
+              g_wlat_sum = g_wlat_max = g_wlat_n = 0; g_wkick = 0;
+              for (int wb = 0; wb < 6; wb++) g_wlat_hist[wb] = 0;
+              g_wtail_logged = 0;
+              g_bkl_maxhold_tsc = 0; g_bkl_maxhold_pid = -1; }
             /* (deadlocked-stack dump now fires from signal_send at the renderer's
              * SIGKILL -- the only reliable moment; see bt_dump_group.) */
             }                        /* end 60s deep dump (slice 63c) */

@@ -5351,3 +5351,67 @@ eventfd) on tobyOS.
 shell — QEMU's snapshot temp file lands on `C:\/vl.*` and it exits before
 boot (silent no-log run). Builds and runs get SEPARATE shells; runs get
 TMPDIR/TMP/TEMP prefixed to a real temp dir.
+
+---
+
+## SLICE 95 — THE TAIL HUNT, CLOSED: three convoy mechanisms named by attribution and fixed; worst stall 5.9 s -> 0.7 s, wlat >=1s events -> ZERO, frames +33%
+
+**Instruments added** (all in the 60 s deep dump): `[wlat]` percentile
+buckets (<100u/<1m/<10m/<100m/<1s/>=1s) + `[wtail]` straggler lines
+(pid/comm/prio/io_boost/pickable-ms at pickup, 6/interval); a PICKABLE-time
+re-stamp in sched_finish_switch (a proc queued while still on_cpu is
+unpickable by design -- its stamp previously reported scheduler latency
+that never existed); `[bklmax]` = longest single BKL hold + holder;
+`[tlbto]` = shootdown ack-timeouts + giveups per interval.
+
+**What attribution named, in the order the data peeled it:**
+ 1. **The 64-round shootdown storm (2.9 s class).** Every interval carried
+    one ~12,000 Mcyc BKL hold; `[wtail]` showed clusters of threads
+    pickable 5.9 s together; worst frame gaps 2.9-5.9 s. One
+    `tlb_shootdown_remote` against a host-descheduled vCPU burned
+    64 x ~45 ms retry rounds UNDER THE BKL (mprotect is the #1 caller:
+    [lx-hold] mprotect=99.5k Mcyc/min). FIX: round cap 64 -> 2 + return on
+    the pending-IPI argument (an awake CPU acks in us -- the cr3 filter's
+    whole premise; a non-executing vCPU cannot consume a stale translation
+    and takes its pending IPI at VM-entry before any user instruction).
+ 2. **Naive 4-level page walks (1 s class).** vmm_protect/vmm_unmap did a
+    FULL descent per 4 KiB page -- including holes -- under g_vmm_lock
+    with IRQS OFF (which also stopped that CPU acking OTHERS' shootdowns:
+    the cascade fed itself). FIX: segmented walks (absent PML4/PDPT/PD
+    subtrees skip 512G/1G/2M per iteration; leaf PT fetched once per 2 MiB)
+    + sys_mprotect chunks the BKL every 32 MiB. mprotect 99.5k -> ~10k
+    Mcyc/min. sys_mmap's eager-commit (alloc+memset+map, whole range) got
+    the same 16 MiB chunking.
+ 3. **The iteration-bound ack round itself (the stubborn ~1.05 s
+    constant).** One timed-out round = 2M pauses with a self-ack CR3
+    reload every 256 iterations = ~7.8k VM EXITS under WHPX ~= 4.5k Mcyc.
+    FIX: rounds are now TIME-bounded (10 ms deadline, self-ack every 4096)
+    -- an awake CPU acks in microseconds, so 10 ms is two orders of margin.
+
+**MEASURED, anim.html nth=1 SMP=4 360 s, all gate-clean:**
+
+| metric | pre-95 | post-95 |
+|---|---|---|
+| worst frame gap | 5,920 ms | **715 ms** |
+| [wtail] worst pickable | 8,737 ms | **576 ms** |
+| [wlat] >=1s events/interval | 27-58 | **0 (all five intervals)** |
+| [bklmax] single hold | ~2.9 s | **~230 ms** |
+| frames/360 s | 9,840 | **13,050 (~36 fps, +33%)** |
+
+**Safety verification:** the corruption-class guards all PASS on the new
+kernel (QFREEZETEST x2 real, DEMRACETEST, MAPTEST incl. post-fork CoW
+divergence -- exactly the classes an early shootdown give-up would break);
+defboot clean; fxspur=0; [fxcycle] never fired.
+
+**What remains, honestly:** occasional 200-700 ms events whose scale
+matches HOST-imposed vCPU descheduling ([clkchk] records 1.5-1.9 s
+mono-clock gaps; WHPX steals those slices regardless of what the guest
+does). Not fixable in-guest; [tlbto]/[bklmax]/[wtail] keep it visible if
+the profile shifts. A ~230 ms [bklmax] residue is still unattributed by
+syscall -- next candidate if the tail ever matters again.
+
+**Pre-existing failure surfaced (NOT this slice's): EFDTEST FAILs (lost
+cross-thread eventfd wakeup) on committed HEAD too** -- A/B'd by stashing
+slice 95 and rebuilding; verdict identical. Filed here as an open item:
+chrome's message_pump_epoll rides eventfd, so this may matter for latency
+or worse. Hunt it as its own slice.

@@ -463,7 +463,10 @@ bool vmm_map(uint64_t virt, uint64_t phys, size_t bytes, uint32_t flags) {
 
 /* Unmap the leaf covering `virt`. Returns the number of bytes unmapped
  * (PAGE_SIZE or PAGE_2M), or 0 if nothing was mapped / the request would
- * shatter a 2 MiB leaf (sub-leaf unmap of a huge page is refused). */
+ * shatter a 2 MiB leaf (sub-leaf unmap of a huge page is refused).
+ * (Slice 95: vmm_unmap now walks segments inline; kept for future
+ * single-leaf callers.) */
+__attribute__((unused))
 static size_t unmap_one(uint64_t virt) {
     pte_t *pdpt = next_table(g_pml4, pml4_idx(virt), 0, false);
     if (!pdpt) return 0;
@@ -505,13 +508,65 @@ bool vmm_unmap(uint64_t virt, size_t bytes) {
                 (void *)virt, (unsigned long)bytes);
         return false;
     }
+    uint64_t end   = virt + bytes;
     uint64_t saved = spin_lock_irqsave(&g_vmm_lock);
     bool ok = true;
-    size_t off = 0;
-    while (off < bytes) {
-        size_t step = unmap_one(virt + off);    /* whole leaf: 4K or 2M */
-        if (step == 0) { ok = false; step = PAGE_SIZE; }  /* skip + keep going */
-        off += step;
+    /* Slice 95: same segmented walk as vmm_protect (see there). The old
+     * loop did a full 4-level descent per 4 KiB -- including for HOLES, one
+     * page at a time -- which put mmap/munmap right behind mprotect on the
+     * [lx-hold] BKL ranking (chrome MAP_FIXEDs over large regions
+     * constantly). Absent subtrees now skip 512G/1G/2M per iteration and
+     * the leaf PT is fetched once per 2 MiB segment.
+     * 2 MiB leaves: unmap only when the request covers the WHOLE aligned
+     * leaf. (The old per-leaf helper cleared an aligned leaf even when the
+     * request was shorter -- an over-unmap; user-half mappings are 4 KiB so
+     * this corner is theoretical either way.) */
+    uint64_t v = virt;
+    while (v < end) {
+        pte_t *pdpt = next_table(g_pml4, pml4_idx(v), 0, false);
+        if (!pdpt) {
+            ok = false;
+            v = (v + (1ull << 39)) & ~((1ull << 39) - 1);
+            continue;
+        }
+        pte_t *pd = next_table(pdpt, pdpt_idx(v), 0, false);
+        if (!pd) {
+            ok = false;
+            v = (v + (1ull << 30)) & ~((1ull << 30) - 1);
+            continue;
+        }
+        pte_t pde = pd[pd_idx(v)];
+        if (!(pde & PTE_P)) {
+            ok = false;
+            v = (v + PAGE_2M) & ~(uint64_t)(PAGE_2M - 1);
+            continue;
+        }
+        if (pde & PTE_PS) {
+            if ((v & PAGE_2M_MASK) || end - v < PAGE_2M) {
+                kprintf("[vmm] WARN: partial unmap of 2M leaf at %p -- "
+                        "skipped\n", (void *)v);
+                ok = false;
+                v = (v + PAGE_2M) & ~(uint64_t)(PAGE_2M - 1);
+                continue;
+            }
+            pd[pd_idx(v)] = 0;
+            invlpg(v);
+            v += PAGE_2M;
+            continue;
+        }
+        pte_t *pt = phys_to_table(pde & PTE_ADDR_MASK);
+        uint64_t seg_end = (v + PAGE_2M) & ~(uint64_t)(PAGE_2M - 1);
+        if (seg_end > end) seg_end = end;
+        for (; v < seg_end; v += PAGE_SIZE) {
+            size_t i = pt_idx(v);
+            if (!(pt[i] & PTE_P)) { ok = false; continue; }
+#ifdef CHROMIUM_BOOT
+            if (v < 0x0000800000000000ULL)
+                pgj_note(3, v, pt[i] & PTE_ADDR_MASK, pt[i]);
+#endif
+            pt[i] = 0;
+            invlpg(v);
+        }
     }
     spin_unlock_irqrestore(&g_vmm_lock, saved);
     return ok;
@@ -542,17 +597,38 @@ bool vmm_protect(uint64_t virt, size_t bytes, uint32_t flags) {
     }
 
     uint64_t leaf_flags = flags_to_leaf(flags);
+    uint64_t end   = virt + bytes;
     uint64_t saved = spin_lock_irqsave(&g_vmm_lock);
     bool ok = true;
-    for (size_t off = 0; off < bytes; off += PAGE_SIZE) {
-        uint64_t v = virt + off;
+    /* Slice 95: this walk used to do a FULL 4-level descent (three
+     * next_table calls) per 4 KiB page, for the whole range, under
+     * g_vmm_lock with IRQs OFF. Chrome mprotects multi-GB cage slices
+     * constantly: [lx-hold] measured mprotect as the #1 BKL customer
+     * (~99k Mcyc/min) with single holds >1 s -- and the IRQ-off CPU also
+     * could not ack OTHER CPUs' TLB shootdowns, feeding the ack-timeout
+     * cascade. Now: absent PML4/PDPT/PD subtrees skip 512 GiB / 1 GiB /
+     * 2 MiB at a stride (a 32 GiB PROT_NONE reservation is ~32 iterations
+     * instead of 8M), and the leaf PT is fetched once per 2 MiB segment. */
+    uint64_t v = virt;
+    while (v < end) {
         pte_t *pdpt = next_table(g_pml4, pml4_idx(v), 0, false);
-        if (!pdpt) { ok = false; continue; }
-        pte_t *pd   = next_table(pdpt,  pdpt_idx(v), 0, false);
-        if (!pd)   { ok = false; continue; }
-
+        if (!pdpt) {
+            ok = false;
+            v = (v + (1ull << 39)) & ~((1ull << 39) - 1);   /* next 512G */
+            continue;
+        }
+        pte_t *pd = next_table(pdpt, pdpt_idx(v), 0, false);
+        if (!pd) {
+            ok = false;
+            v = (v + (1ull << 30)) & ~((1ull << 30) - 1);   /* next 1G */
+            continue;
+        }
         pte_t pde = pd[pd_idx(v)];
-        if (!(pde & PTE_P)) { ok = false; continue; }
+        if (!(pde & PTE_P)) {
+            ok = false;
+            v = (v + PAGE_2M) & ~(uint64_t)(PAGE_2M - 1);   /* next 2M */
+            continue;
+        }
         if (pde & PTE_PS) {
             spin_unlock_irqrestore(&g_vmm_lock, saved);
             kpanic("vmm_protect: 2 MiB leaf at %p inside requested range "
@@ -560,26 +636,31 @@ bool vmm_protect(uint64_t virt, size_t bytes, uint32_t flags) {
         }
 
         pte_t *pt = phys_to_table(pde & PTE_ADDR_MASK);
-        size_t i  = pt_idx(v);
-        if (!(pt[i] & PTE_P)) { ok = false; continue; }
-        /* Preserve the MAP_SHARED software marker: mprotect callers rebuild
-         * flags from prot bits alone and know nothing about sharing, but the
-         * no-CoW-at-fork guarantee must survive any mprotect (chrome
-         * mprotects inside live shared regions). Same for the CoW/demand/
-         * swap software bits -- and if the page is still CoW-shared, do NOT
-         * grant write here: the frame has other owners. Leave it read-only
-         * with PTE_COW intact; the first write faults into the CoW handler,
-         * which does the refcounted copy-out and THEN grants write. */
-        uint64_t prev = pt[i];
-        uint64_t nf = leaf_flags;
-        if (prev & PTE_COW_SW) nf &= ~PTE_RW;
-        pt[i] = (prev & (PTE_ADDR_MASK | PTE_SHARED_SW | PTE_COW_SW |
-                         PTE_DEMAND_SW | PTE_SWAP_SW)) | nf;
-        invlpg(v);
+        uint64_t seg_end = (v + PAGE_2M) & ~(uint64_t)(PAGE_2M - 1);
+        if (seg_end > end) seg_end = end;
+        for (; v < seg_end; v += PAGE_SIZE) {
+            size_t i = pt_idx(v);
+            if (!(pt[i] & PTE_P)) { ok = false; continue; }
+            /* Preserve the MAP_SHARED software marker: mprotect callers
+             * rebuild flags from prot bits alone and know nothing about
+             * sharing, but the no-CoW-at-fork guarantee must survive any
+             * mprotect (chrome mprotects inside live shared regions). Same
+             * for the CoW/demand/swap software bits -- and if the page is
+             * still CoW-shared, do NOT grant write here: the frame has
+             * other owners. Leave it read-only with PTE_COW intact; the
+             * first write faults into the CoW handler, which does the
+             * refcounted copy-out and THEN grants write. */
+            uint64_t prev = pt[i];
+            uint64_t nf = leaf_flags;
+            if (prev & PTE_COW_SW) nf &= ~PTE_RW;
+            pt[i] = (prev & (PTE_ADDR_MASK | PTE_SHARED_SW | PTE_COW_SW |
+                             PTE_DEMAND_SW | PTE_SWAP_SW)) | nf;
+            invlpg(v);
 #ifdef CHROMIUM_BOOT
-        if (v < 0x0000800000000000ULL)
-            pgj_note(4, v, pt[i] & PTE_ADDR_MASK, prev);
+            if (v < 0x0000800000000000ULL)
+                pgj_note(4, v, pt[i] & PTE_ADDR_MASK, prev);
 #endif
+        }
     }
     spin_unlock_irqrestore(&g_vmm_lock, saved);
     return ok;

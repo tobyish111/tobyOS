@@ -40,6 +40,7 @@
 #include <tobyos/isr.h>
 #include <tobyos/proc.h>     /* slice 57: cr3-targeted shootdowns */
 #include <tobyos/percpu.h>
+#include <tobyos/perf.h>     /* slice 95: time-bounded shootdown ack waits */
 #include <tobyos/sched.h>
 #include <tobyos/smp.h>      /* tlb_shootdown_remote: percpu walk */
 
@@ -174,6 +175,11 @@ static bool cpu_may_hold_cr3(const struct percpu *c, uint64_t cr3) {
  * bump our own generation. That is exactly what the ISR would do, so any
  * peer waiting on us observes progress and completes -- deadlock broken,
  * no sti, no BKL drop. */
+/* Slice 95: shootdown-latency visibility (printed by the deep dump as
+ * [tlbto]). ack_timeouts = per-CPU 2M-spin round timeouts; giveups =
+ * tlb_shootdown_remote returning after 2 un-acked rounds (see below). */
+uint64_t g_tlb_ack_timeouts, g_tlb_giveups;
+
 static void tlb_shootdown_self_ack(uint32_t me) {
     uint64_t cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
@@ -217,10 +223,20 @@ static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
     bool self_demoted = false;
     for (uint32_t i = 0; i < n && i < MAX_CPUS; i++) {
         if (!sent[i]) continue;
+        /* Slice 95: TIME-bound the wait, don't iteration-bound it. The old
+         * 2M-pause spin self-acked every 256 iterations, and each self-ack
+         * is a CR3 reload = a VM EXIT under WHPX: ~7.8k exits made one
+         * timed-out round cost ~4.5k Mcyc (~1 s) -- measured as the
+         * constant [bklmax] hold behind every residual frame stall. An
+         * AWAKE CPU acks in microseconds; 10 ms is two orders of margin.
+         * A CPU that misses 10 ms is not executing, and its pending IPI
+         * flushes at VM-entry before any user instruction (same argument
+         * as the round-cap above). */
+        uint64_t deadline = perf_now_ns() + 10000000ull;   /* 10 ms */
         uint32_t spins = 0;
         while (g_tlb_gen[i] == snap[i]) {
             __asm__ volatile("pause" ::: "memory");
-            if ((spins & 0xffu) == 0)
+            if ((spins & 0xfffu) == 0)
                 tlb_shootdown_self_ack(me);
             /* Help CoW-fork STW: we are in-kernel with IRQs off, so demote
              * to BLOCKED while still on_cpu (ACK path). Otherwise the forker
@@ -233,8 +249,10 @@ static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
                     self_demoted = true;
                 }
             }
-            if (++spins > 2000000u) {
+            if (((++spins & 0x3ffu) == 0) && perf_now_ns() > deadline) {
                 static uint32_t warns;
+                extern uint64_t g_tlb_ack_timeouts;
+                __atomic_fetch_add(&g_tlb_ack_timeouts, 1, __ATOMIC_RELAXED);
                 if (warns < 8) {
                     warns++;
                     kprintf("[tlb] WARN: cpu%u shootdown ack timeout\n", i);
@@ -290,15 +308,35 @@ void tlb_shootdown_remote(void) {
      * IN this address space can hold its stale user translations -- those
      * are awake-and-working CPUs that ack in microseconds.
      *
-     * Slice 87: self-ack in the wait loop (see above) + higher round cap. */
+     * Slice 87: self-ack in the wait loop (see above) + higher round cap.
+     *
+     * Slice 95: round cap 64 -> 2. THE 64-ROUND STORM WAS THE LATENCY TAIL:
+     * one round against a non-acking vCPU costs a 2M-pause spin (~45 ms
+     * measured), so 64 rounds = ~2.9 s -- and mprotect holds the BKL across
+     * this wait, so one host-descheduled vCPU turned into whole-kernel
+     * 3-6 s convoys ([bklmax] hold=~12000Mcyc pid=chrome, [wtail] clusters
+     * of threads pickable 5.9 s, the [cwif] multi-second frame stalls).
+     * Correctness argument for giving up after 2 full rounds: an AWAKE CPU
+     * in this address space acks in MICROSECONDS (round 1, always -- the
+     * whole point of the cr3 filter). A CPU that has not acked after two
+     * 2M-spin rounds is NOT EXECUTING (host-descheduled or IRQ-off in
+     * kernel code that touches no user memory). A non-executing vCPU
+     * cannot consume a stale translation, and its pending IPI is injected
+     * at VM-entry before any further user instruction retires -- so the
+     * flush still happens before the stale entry could be used. Spinning
+     * longer under the BKL protected nothing. [tlbto]'s giveup counter in
+     * the deep dump keeps the frequency visible. */
     struct proc *me = current_proc();
     uint64_t cr3 = me ? me->cr3 : 0;
-    for (int round = 0; round < 64; round++)
+    for (int round = 0; round < 2; round++)
         if (tlb_shootdown_sync_filtered(cr3)) return;
+    extern uint64_t g_tlb_giveups;
+    __atomic_fetch_add(&g_tlb_giveups, 1, __ATOMIC_RELAXED);
     static uint32_t hard_warns;
     if (hard_warns < 8) {
         hard_warns++;
-        kprintf("[tlb] ERROR: shootdown STILL un-acked after 64 rounds\n");
+        kprintf("[tlb] shootdown un-acked after 2 rounds -- returning on the "
+                "pending-IPI argument (see slice 95)\n");
     }
 }
 
