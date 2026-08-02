@@ -5415,3 +5415,51 @@ cross-thread eventfd wakeup) on committed HEAD too** -- A/B'd by stashing
 slice 95 and rebuilding; verdict identical. Filed here as an open item:
 chrome's message_pump_epoll rides eventfd, so this may matter for latency
 or worse. Hunt it as its own slice.
+
+---
+
+## SLICE 96 — the eventfd lost-wakeup fixed (chrome jumps to ~40 fps); TIER 3 PHASE 0 RUN AND CLOSED: VirGL is blocked at the HOST layer — park tier 3 with evidence
+
+**EFDTEST root cause.** `eventfd_write` never called `poll_event_notify()`
+— eventfd was exactly the "readiness source with no event hook" the
+slice-67 design warned about, silently relying on the `poll_tick` sweep.
+Two consequences: in the console boot harness (pid 0 parked in proc_wait,
+never in idle_loop) the sweep never runs and a cross-thread eventfd wake
+was LOST FOREVER (the EFDTEST FAIL); under chrome it meant every
+message-pump signal could ride sweep latency instead of waking the pump
+immediately. FIX: `poll_event_notify()` from `eventfd_write` (and from
+`eventfd_read`'s drain, for EPOLLOUT watchers/blocked writers).
+
+**Verified:** EFDTEST FAIL -> PASS; all 7 console guards green (suite
+itself runs ~2 s faster). On the real workload (anim, nth=1, SMP=4,
+360 s, gate-clean): **13,050 -> ~14,610 frames (~40 fps, +12%)**;
+`[wlat]` avg 680-850 us -> **~310 us** with wake volume DOUBLED
+(~355k/interval, ~28k wake-kicks) — the message pump now flows
+event-driven; >=1s events still ZERO; 10 windows >200 ms (worst 435 ms).
+Cumulative since the tail hunt opened: 9,840 -> 14,610 = **+48%**.
+
+**TIER 3 PHASE 0 (control-first, per the tier-2.5 law) — VERDICT: PARK.**
+ * E1a: this host's QEMU 10.2.0 lists `virtio-gpu-gl-pci` and
+   `egl-headless` — but `-display egl-headless` SEGFAULTS instantly, with
+   or without the GPU device; `gtk,gl=on` also segfaults.
+ * E1b: `-display sdl,gl=on -device virtio-gpu-gl-pci` boots tobyOS far
+   enough to prove BOTH sides: our virtio_gpu.c negotiated **virgl=yes**
+   (guest ready), then host virglrenderer died — "Unable to create OpenGL
+   context >= 3.0 ... virgl could not be initialized: 22" (the QEMU
+   process only reaches Windows' GDI OpenGL 1.1 fallback, no vendor ICD)
+   — the device went inoperative and our driver correctly declined it.
+ * E2: the WSL2 control rig has /usr/lib/wsl/lib (libd3d12/CUDA) but NO
+   /dev/dri render node — no cheap place to measure GPU-raster value on
+   real Linux either.
+ * Perf case is weak regardless: CPU raster now delivers ~40 fps against
+   a ~52 Hz compositor ceiling; the binding constraint is the ack cycle,
+   not rasterization.
+
+**Unblock conditions, recorded:** (a) a host GL path for QEMU (vendor ICD
+visible to the qemu process, or a build whose ANGLE/EGL works — today's
+segfaults suggest the shipped ANGLE is broken); (b) a demonstrated
+raster-bound workload (heavy pages / WebGL / headed fidelity); (c) or a
+different dev host. Until one of those exists, tier-3 kernel work
+(/dev/dri + DRM ioctls + Mesa staging) would build toward a mechanism
+this environment cannot run — exactly the mistake Phase 0 exists to
+prevent.

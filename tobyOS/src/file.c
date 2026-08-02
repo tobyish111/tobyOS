@@ -117,6 +117,9 @@ static long eventfd_read(struct file *f, void *buf, size_t n) {
     if (e->flags & EFD_SEMAPHORE) { out = 1; e->count -= 1; }
     else                         { out = e->count; e->count = 0; }
     memcpy(buf, &out, 8);
+    /* Slice 96: the drain makes the eventfd WRITABLE again -- wake any
+     * EPOLLOUT poller / blocked writer (see the write-side note below). */
+    poll_event_notify();
     return 8;
 }
 
@@ -147,6 +150,15 @@ static long eventfd_write(struct file *f, const void *buf, size_t n) {
                     me ? me->pid : -1, e->id, (unsigned long)add,
                     (unsigned long)e->count); } }
 #endif
+    /* Slice 96: eventfd was a READINESS SOURCE WITH NO EVENT HOOK -- the
+     * slice-67 design's "missed hook costs latency, bounded by the sweep"
+     * held only where poll_tick actually runs. In the console boot harness
+     * (pid 0 parked in proc_wait, never in idle_loop) the sweep never ran
+     * and a cross-thread eventfd wake was LOST FOREVER (EFDTEST FAIL,
+     * pre-existing, A/B'd vs HEAD). Under chrome it silently meant every
+     * message-pump signal could ride the sweep's latency instead of waking
+     * the pump now. Write syscalls hold the BKL, per the API's convention. */
+    poll_event_notify();
     return 8;
 }
 
