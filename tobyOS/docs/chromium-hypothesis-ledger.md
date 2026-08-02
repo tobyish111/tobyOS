@@ -5500,3 +5500,41 @@ full surface. The perf-value caveat from slice 96 still stands: CPU
 raster is at ~40 fps vs a ~52 Hz ceiling, so tier 3's near-term value is
 fidelity/WebGL/headroom — hold Phase 1 to the same measure-first
 discipline.
+
+## SLICE 96c — the "un-ack VIRGL to keep 2D scanout" fix is DISPROVEN (same-slice retraction); the real Phase-1 shape is now measured
+
+**Predicted in 96b:** SET_SCANOUT's 0x1203 rejection came from the guest
+ACKING `VIRTIO_GPU_F_VIRGL`, which flips the device into virgl mode; not
+acking it would keep the plain 2D contract on a `-gl` device.
+
+**MEASURED: WRONG.** With the ack removed (`driver=0x00000001_00000000`,
+log now prints `virgl=avail-not-acked`), the `-gl` device STILL rejects
+SET_SCANOUT with 0x1203 and the driver still declines (rc=-13). QEMU's
+stderr shows `virtio_gpu_virgl_process_cmd: ctrl 0x103, error 0x1203`
+**in both runs** — i.e. **QEMU's `virtio-gpu-gl` routes every command
+through virglrenderer regardless of what the guest negotiates.** There
+is no 2D-compat path on a GL device to fall back to; the resource must
+exist in virglrenderer's world for scanout to accept it.
+
+**Kept anyway, relabelled honestly:** the guest no longer ACKS a feature
+whose command flow it cannot speak (the slice-89 "unvalidated mixed
+state" lesson). It is ack-honesty, NOT a fix — the decline is unchanged
+and is Phase 1's job. Plain `virtio-gpu-pci` is unaffected (probe: binds,
+SET_SCANOUT ok, cursor ready, device live) and defboot is clean.
+
+**Phase 1, restated with evidence:**
+ 1. Scanout on a GL device needs the **virgl resource flow** (3D resource
+    create / blob resources), not RESOURCE_CREATE_2D. This is the first
+    real code item and it is bigger than a feature flag.
+ 2. **Cheap alternative worth evaluating first:** attach BOTH devices —
+    plain `virtio-gpu-pci` keeps driving the display through the proven
+    2D path, while the `-gl` device exists solely to back 3D contexts via
+    `/dev/dri`. That sidesteps item 1 entirely for the bring-up.
+ 3. Then /dev/dri/card0 + DRM ioctls, Mesa virgl DSOs in the sysroot,
+    and the measure-first gate: prove GPU raster beats the CPU-raster
+    ~40 fps baseline before building the full surface.
+
+**METHOD NOTE (third time this arc):** a mechanism guess about someone
+else's implementation is a hypothesis, not a fix. This one cost a build
+and two probes because it was cheap to test — which is exactly why it
+was tested before being written down as done.

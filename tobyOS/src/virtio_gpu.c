@@ -1431,9 +1431,18 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
 
     d->virgl_supported = !!(devf_lo & (1u << VIRTIO_GPU_F_VIRGL));
 
+    /* Slice 96b (tier 3 Phase 1, item #1): do NOT ack VIRGL until we
+     * actually run 3D. Acking it flips the device into virgl mode, where
+     * SET_SCANOUT of a RESOURCE_CREATE_2D resource is REJECTED (resp
+     * 0x1203: virgl wants its own/blob resource flow) -- measured on the
+     * ANGLE-enabled rig: bring-up died at SET_SCANOUT and the driver
+     * declined the whole device (rc=-13). Left un-acked, a
+     * virtio-gpu-gl device serves the plain 2D contract and the proven
+     * framebuffer path works unchanged, so ONE kernel handles both
+     * device types. When the 3D arc starts (Mesa/virgl through
+     * /dev/dri), ack the bit and move scanout to the virgl flow --
+     * virgl_supported already records that the device could do it. */
     uint32_t drv_lo = 0;
-    if (d->virgl_supported)
-        drv_lo |= (1u << VIRTIO_GPU_F_VIRGL);
 
     cfg_w32(d, VIRTIO_PCI_DRIVER_FEATURE_SELECT, 0);
     cfg_w32(d, VIRTIO_PCI_DRIVER_FEATURE,        drv_lo);
@@ -1449,13 +1458,13 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
         return -6;
     }
 
-    d->virgl_enabled = d->virgl_supported;
+    d->virgl_enabled = false;              /* 2D contract until the 3D arc */
 
     kprintf("[virtio-gpu] features: device=0x%08x_%08x driver=0x%08x_%08x "
             "virgl=%s\n",
             devf_hi, devf_lo,
             1u << (VIRTIO_F_VERSION_1 - 32), drv_lo,
-            d->virgl_enabled ? "yes" : "no");
+            d->virgl_supported ? "avail-not-acked" : "no");
 
     /* Try MSI-X for the controlq. Fall back to no IRQ if the device
      * has no MSI-X cap (rare on modern virtio, but the legacy path
