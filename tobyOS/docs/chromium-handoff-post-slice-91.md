@@ -332,3 +332,68 @@ Serial lands in **`logs/run_watch.log`** (not `serial.log`). Screenshots:
   pointer registers ⇒ heap corruption.
 - **When a fix regresses something, retract it in the ledger immediately.**
   This arc has been derailed more than once by stale confident claims.
+
+---
+
+# ADDENDUM (slice 92, 2026-08-01/02): TIER A IS CLOSED — the freeze was caught, symbolized, root-caused, fixed, and re-verified
+
+**Read `docs/chromium-hypothesis-ledger.md` slices 92/92b for the full
+evidence chain.** Summary:
+
+* **The freeze specimen was captured** (freeze-hunt run 5, QMP registers
+  x2): one CPU looping FOREVER inside `futex_expire_timeouts`' waiter-list
+  walk while HOLDING `g_futex_lock` with IRQs off — **the waiter list was
+  CYCLIC** — with the other CPUs spinning on the same lock. Total serial
+  silence, `acq=0`, `[qstuck]` blind: every §4 signature fact falls out of
+  this one state. It landed microseconds after `[fork] clone-returning`.
+* **Cycle mechanism:** any spurious READY of a futex-parked thread (it
+  returns "woken" still linked; glibc re-parks; head-insert closes the
+  loop). Spurious sources found: `sched_finish_switch`'s deferred CoW-STW
+  requeue firing on a STALE `vm_quiesced` flag planted by apic.c's TLB-ack
+  demotion (hence post-fork, hence -smp 4), and the signal path (wakes
+  BLOCKED procs without futex-unlink).
+* **Fixes (4ee50f9 + 0dd4228):** `futex_unlink_self()` after every futex
+  park (structural: any spurious waker degrades to a legal spurious
+  wakeup); bounded+self-healing expire walk (`[fxcycle]`); apic.c undoes
+  its demotion; `vm_quiesce_park_oncpu()` drops the BKL in the kernel-#PF
+  quiesce park (rule violation removed; the deadlock theory built on it
+  was RETRACTED by its own A/B — see ledger 92).
+* **Verification:** `[fxspur]` fired ONCE in 6 fresh 360s -smp 4 headed
+  runs — at guest 10.5s, the freeze's exact signature window — and the run
+  sailed on; 6/6 runs passed the `[bkl]` gate; `[fxcycle]` never fired.
+  Causal, not statistical: the fix targets the captured state and the
+  trigger was observed firing and being defused.
+* **Watch items:** `[fxspur]` firing occasionally is the mechanism being
+  absorbed (fine). `[fxcycle]` firing means a cycle STILL formed — hunt
+  the new spurious source immediately.
+* **New permanent guard:** QFREEZETEST (`programs/linux-qfreeze`, console
+  flavour) — fork-STW + syscall-hammer under true SMP (it enables AP run;
+  the boot harness is otherwise BSP-only, which had been silently
+  weakening every console guard's SMP claims). Exit 2 = VACUOUS (hammers
+  starved), never trust a PASS without it having been live.
+
+## §3's OPEN QUESTION is ANSWERED — with data, not inertia
+
+Across **six 360 s headed full-chrome runs** (-smp 4, all gate-clean):
+`bootstrap OK` was reached ONCE (at 107 s; the arc's second time ever) and
+**ZERO screencast frames were produced in 2160 s of headed runtime**.
+Headless-shell's baseline on the same page is **933 frames / 360 s**.
+
+**Decision: the perf vehicle is chrome-headless-shell.** Tier B (frame-time
+breakdown: chrome's JPEG encode vs CDP transport vs our ~1 ms decode vs
+raster/layout) proceeds on the headless flavour. The headed path remains a
+fidelity/UX bring-up (its own blocker: chrome goes silent pre-bootstrap on
+the X conns — timing, not missing protocol), NOT a perf path. Do not spend
+perf slices on it.
+
+## Where tier B starts (next session)
+
+1. `bash logs/build_vid.sh`, `SMP=4 timeout 420 python logs/run_watch.py`
+   — re-baseline headless frames post-slice-92 (the futex fix may itself
+   move the number; measure before instrumenting).
+2. Our side is already timed per 30-frame window (`[chromewin] frame N:
+   ... b64= dec= paint=`). The missing numbers are inside chrome:
+   correlate `prof_dump_and_reset`'s hot user RIPs (+`[libmap]`) across
+   the frame interval, and consider timestamping `Page.screencastFrame`
+   arrivals vs acks in chromewin to split encode vs transport.
+3. Pick tier C from that data (§6 candidates), not from the ranking.
