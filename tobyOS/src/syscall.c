@@ -2194,6 +2194,27 @@ static long sys_open(const char *path, int flags, int mode) {
          * virgl-capable device is bound we return ENOENT, which is exactly
          * what a Linux box with no GPU does -- Mesa then falls back to
          * software, rather than failing in some deeper, stranger way. */
+        /* Slice 102: /dev/dri as a LISTABLE DIRECTORY. libdrm's
+         * drmGetDevice2(fd) -- which Mesa reaches through
+         * loader_get_pci_id_for_fd, and which reported "failed to
+         * retrieve device information" -- does not stop at the sysfs
+         * tree: it opendir()s /dev/dri and iterates it to fill in the
+         * device's node names. /dev/dri existed only as a special case
+         * in this open path, so there was nothing to enumerate.
+         * FILE_KIND_DIR + the dirpath marker; getdents64 synthesises the
+         * entries (there is no VFS directory behind /dev). */
+        if (strcmp(dev, "dri") == 0 || strcmp(dev, "dri/") == 0) {
+            if (!lxdrm_available()) return -ABI_ENOENT;
+            struct file *f = (struct file *)kmalloc(sizeof(*f));
+            if (!f) return -ABI_ENOMEM;
+            memset(f, 0, sizeof(*f));
+            f->kind    = FILE_KIND_DIR;
+            f->dirpath = "/dev/dri";       /* literal: getdents64 keys on it */
+            f->dir_off = 0;
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            return fd;
+        }
         if (strncmp(dev, "dri/", 4) == 0) {
             struct file *f = lxdrm_open(dev);
             if (!f) return -ABI_ENOENT;
@@ -4891,6 +4912,7 @@ struct lx_dirent64 {
 } __attribute__((packed));
 #define LX_DT_DIR  4
 #define LX_DT_REG  8
+#define LX_DT_CHR  2      /* slice 102: /dev/dri nodes are char devices */
 
 /* Open a directory as a Linux getdents64-capable fd (FILE_KIND_DIR). tobyOS
  * has no native directory fd, so we just remember the path; getdents64
@@ -8086,6 +8108,33 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (f->kind != FILE_KIND_DIR || !f->dirpath) return -ABI_ENOTDIR;
         uint8_t *ubuf = (uint8_t *)a2;
         size_t   cap  = (size_t)a3;
+        /* Slice 102: /dev/dri is synthetic (no VFS directory behind it),
+         * so emit its nodes here. libdrm iterates this to name the
+         * device's card/render nodes -- see the open path. */
+        if (strcmp(f->dirpath, "/dev/dri") == 0) {
+            static const char *const dri_names[] = { "card0", "renderD128" };
+            size_t written = 0;
+            uint32_t emitted = 0;
+            while (f->dir_off + emitted < 2) {
+                const char *nm = dri_names[f->dir_off + emitted];
+                size_t namelen = strlen(nm);
+                size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;
+                if (written + reclen > cap) break;
+                struct lx_dirent64 de;
+                memset(&de, 0, reclen);
+                de.d_ino    = 100 + f->dir_off + emitted;
+                de.d_off    = (int64_t)(f->dir_off + emitted + 1);
+                de.d_reclen = (uint16_t)reclen;
+                de.d_type   = LX_DT_CHR;
+                memcpy(de.d_name, nm, namelen);
+                if (copy_to_user(ubuf + written, &de, reclen) != 0)
+                    return -ABI_EFAULT;
+                written += reclen;
+                emitted++;
+            }
+            f->dir_off += emitted;
+            return (long)written;
+        }
         struct vfs_dir d;
         if (vfs_opendir(f->dirpath, &d) != VFS_OK) return -ABI_ENOENT;
         struct vfs_dirent ent;

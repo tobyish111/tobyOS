@@ -5909,3 +5909,50 @@ is already proven working.
 Phase 1d (the GPU-vs-CPU-raster measurement) remains gated on the above,
 with the slice-96 caveat unchanged: CPU raster is ~40 fps against a
 ~52 Hz ceiling, so tier 3's near-term value is fidelity/WebGL/headroom.
+
+---
+
+## SLICE 102 — `/dev/dri` is now a real listable directory (kept); it did NOT close `drmGetDevice2`, so that guess is retracted too. STOP GUESSING: instrument the accesses.
+
+**Built and kept:** `/dev/dri` is a `FILE_KIND_DIR` whose `getdents64`
+yields `card0` and `renderD128` as `DT_CHR` entries. It existed only as a
+special case in the open path before, which is wrong on its own terms —
+a Linux `/dev/dri` is listable, and `drmGetDevices2()` (the enumerating
+sibling libdrm uses on other paths) needs it. Correct regardless.
+
+**It did not fix the failure.** Mesa still prints
+`MESA-LOADER: failed to retrieve device information`, with a new
+follow-on (`libEGL warning: did not find extension DRI_DRI2 version 2`).
+
+**Scoreboard of guesses about libdrm's internals, this arc:**
+
+| slice | guess | outcome |
+|---|---|---|
+| 96b | un-ack VIRGL restores 2D scanout | disproven by measurement |
+| 99 | sysfs `/sys/dev/char/...` tree unblocks it | built; changed nothing |
+| 100 | plus symlink + binary PCI `config` | built; changed nothing |
+| 102 | plus a listable `/dev/dri` | built; changed nothing |
+
+Four in a row. The common failure is that each was inferred from reading
+third-party source and then *built* rather than *tested first*. Every one
+produced a correct, keepable improvement — and none of them was the
+cause, because none was measured before it was implemented.
+
+**THE NEXT STEP IS AN INSTRUMENT, NOT A FIX.** `drmGetDevice2` fails
+inside a small, finite set of filesystem accesses. We already log opens
+(`[lopen]`); we do not log the `stat`/`readlink`/`openat` results that
+this path depends on. Add a narrow trace — every `stat`, `readlink`,
+`openat` and `getdents64` whose path starts with `/sys/dev/char`,
+`/sys/class/drm`, `/sys/bus/pci` or `/dev/dri`, printing path and
+return value — run the guard once, and the failing access will name
+itself, exactly as `[fd2]` named the missing DSO in slice 101 after
+three slices of theorising.
+
+**What is genuinely working (unchanged, re-verified):** the whole lower
+stack. `gbm_create_device -> ok`; Mesa loads `virtio_gpu_dri.so` off our
+node's own VERSION answer; the DRM surface serves the full Mesa-shaped
+walk (DRMTEST PASS, 11 ioctls, all rc=0); the Mesa dependency closure is
+complete and self-checking. The remaining gap is one library function's
+view of one device's metadata.
+
+defboot clean.
