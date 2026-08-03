@@ -2209,7 +2209,12 @@ static long sys_open(const char *path, int flags, int mode) {
             if (!f) return -ABI_ENOMEM;
             memset(f, 0, sizeof(*f));
             f->kind    = FILE_KIND_DIR;
-            f->dirpath = "/dev/dri";       /* literal: getdents64 keys on it */
+            /* dirpath MUST be heap-owned: file_close/file_clone kfree it.
+             * A string literal here panicked the kernel on close with
+             * "bad block magic" once Mesa actually opened the directory. */
+            f->dirpath = (char *)kmalloc(9);
+            if (!f->dirpath) { kfree(f); return -ABI_ENOMEM; }
+            memcpy(f->dirpath, "/dev/dri", 9);
             f->dir_off = 0;
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { kfree(f); return -ABI_EMFILE; }
@@ -9174,6 +9179,44 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             { static int c=0; if(c<24){c++; kprintf("[memfd] GET_SEALS fd=%d -> 0x%lx\n",(int)a1,(unsigned long)memfd_get_seals(ff->memfd));} }
 #endif
             return memfd_get_seals(ff->memfd);
+        }
+        /* Slice 105: F_DUPFD / F_DUPFD_CLOEXEC actually duplicate.
+         *
+         * These fell into the blanket `return 0` below, so every caller
+         * was told "your new descriptor is fd 0". Mesa dups a DRM fd
+         * through os_dupfd_cloexec() -- which asks for the lowest fd
+         * >= 3 -- and then probed fd 0, i.e. stdin, for a GPU:
+         *     "failed to get driver name for fd 0"
+         *     "MESA-LOADER: failed to retrieve device information"
+         * That is the whole reason the GL stack never reached our device,
+         * and it is why libdrm appeared to make no DRM ioctls at all --
+         * it was talking to the wrong descriptor entirely.
+         *
+         * Semantics: allocate the lowest free fd >= arg, sharing the same
+         * open file (file_clone, exactly like dup2/dup3). */
+        if ((int)a2 == 0 /* F_DUPFD */ || (int)a2 == 1030 /* F_DUPFD_CLOEXEC */) {
+            struct file *ff = fd_lookup((int)a1);
+            if (!ff) return -ABI_EBADF;
+            int minfd = (int)a3;
+            if (minfd < 0 || minfd >= PROC_NFDS) return -ABI_EINVAL;
+            struct proc *p = current_proc();
+            if (!p) return -ABI_EPERM;
+            struct file **tab = proc_fds(p);
+            if (!tab) return -ABI_EPERM;
+            int nfd = -1;
+            for (int i = minfd; i < PROC_NFDS; i++)
+                if (!tab[i]) { nfd = i; break; }
+            if (nfd < 0) return -ABI_EMFILE;
+            struct file *cl = file_clone(ff);
+            if (!cl) return -ABI_ENOMEM;
+            tab[nfd] = cl;
+#ifdef CHROMIUM_BOOT
+            { static int c = 0; if (c < 24) { c++;
+                kprintf("[fcntl] F_DUPFD%s fd=%d min=%d -> %d (kind=%d)\n",
+                        ((int)a2 == 1030) ? "_CLOEXEC" : "", (int)a1, minfd,
+                        nfd, (int)ff->kind); } }
+#endif
+            return nfd;
         }
         return 0;               /* F_GETFD/F_SETFD/F_SETFL/CLOEXEC: best-effort no-op */
     }

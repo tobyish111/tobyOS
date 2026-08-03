@@ -217,8 +217,11 @@ int main(void) {
 
     p_eglBindAPI(EGL_OPENGL_ES_API);
 
+    /* NO EGL_SURFACE_TYPE constraint. Asking for EGL_PBUFFER_BIT
+     * returned zero configs with EGL_SUCCESS: a GBM display advertises
+     * WINDOW configs (gbm_surface), not pbuffers. We render to no
+     * surface at all (surfaceless context), so any config will do. */
     EGLint cfg_attr[] = {
-        EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
         EGL_NONE

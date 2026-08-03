@@ -7442,7 +7442,14 @@ void _start(void) {
              * the virgl one: without this it probes by PCI id and can
              * silently pick swrast, which would read as "GPU absent". */
             (char *)"LIBGL_DRIVERS_PATH=/opt/chrome/sysroot/dri",
-            (char *)"MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu",
+            /* Slice 105 A/B: MESA_LOADER_DRIVER_OVERRIDE removed. It was
+             * set to force the virgl driver, but the consumer whose
+             * libdrm enumeration DOES succeed in the same boot sets no
+             * such override -- and an override can send Mesa down a
+             * different loader path than the one it validates devices
+             * on. Let it probe normally; LIBGL_DRIVERS_PATH still points
+             * at the staged drivers, which is the part it genuinely
+             * cannot guess. */
             (char *)"EGL_PLATFORM=surfaceless",
             (char *)"LIBGL_DEBUG=verbose",
             /* Debian's libEGL.so.1 is libglvnd, which finds Mesa only via
@@ -7455,7 +7462,7 @@ void _start(void) {
         };
         struct proc_spec spec = {
             .path = path, .name = "linux-egltest",
-            .argc = 1, .argv = argv, .envc = 7, .envp = envp,
+            .argc = 1, .argv = argv, .envc = 6, .envp = envp,
         };
         kprintf("[boot] EGLTEST: spawning %s (Mesa -> /dev/dri gap list)\n",
                 path);

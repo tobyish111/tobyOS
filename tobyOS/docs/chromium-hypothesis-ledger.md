@@ -6074,3 +6074,76 @@ inside one boot is a strong, cheap lead:
 
 **Regressions:** DRMTEST PASS; defboot clean; `gbm_create_device -> ok`
 still holds.
+
+---
+
+## SLICE 105 — **`GL_RENDERER: virgl`. TIER 3 PHASE 1c IS DONE.** Real Mesa renders OpenGL on the host GPU from inside tobyOS — and the wall was our own `fcntl`
+
+```
+[egltest] EGL 1.4 initialized
+[egltest] EGL_VENDOR:   Mesa Project
+[egltest] config ok
+[egltest] context current
+[egltest] GL_VENDOR:    Mesa/X.org
+[egltest] GL_RENDERER:  virgl
+[egltest] GL_VERSION:   OpenGL ES 2.0 Mesa 22.3.6
+[EGLTEST] VERDICT: PASS exit=3
+```
+
+A GLES2 context, current, on **virgl** — guest Mesa -> our `/dev/dri`
+-> virtio-gpu -> virglrenderer -> ANGLE -> D3D11 -> RTX 5090.
+
+### The root cause, and it was never Mesa's
+
+`fcntl()` ended in a blanket `return 0` for every command it did not
+implement — **including `F_DUPFD` and `F_DUPFD_CLOEXEC`**. Mesa dups a
+DRM fd through `os_dupfd_cloexec()`, which asks for the lowest fd >= 3;
+our kernel answered "0". Mesa then probed **fd 0 — stdin — for a GPU**:
+
+```
+failed to get driver name for fd 0
+MESA-LOADER: failed to retrieve device information
+```
+
+That single wrong return value produced every symptom of slices 99-104
+and sent four slices chasing libdrm's sysfs behaviour. It also explains
+the observation that finally cracked it: libdrm made *no* DRM ioctls and
+*no* sysfs accesses, because it was never holding our device at all.
+`F_DUPFD`/`F_DUPFD_CLOEXEC` now allocate the lowest free fd >= arg and
+share the open file, like `dup2`/`dup3`.
+
+**A second, self-inflicted bug found the same run:** the `/dev/dri`
+directory file set `dirpath` to a **string literal**, and
+`file_close()` `kfree()`s that field — the kernel panicked with
+`bad block magic 0x656c6552` ("Rele", i.e. rodata) the moment Mesa
+actually opened the directory. Heap-owned now.
+
+**And one test bug:** `eglChooseConfig` asked for `EGL_PBUFFER_BIT`,
+which a GBM display does not advertise (zero configs, `EGL_SUCCESS`).
+Dropped the surface-type constraint — we render surfaceless.
+
+### What this closes
+
+Phase 1a (3D-only bind), 1b (DRM render node), 1c (Mesa on our node) are
+**done**. The stack is proven end to end by a guard that says `virgl`,
+not by inference.
+
+### Method, since this arc paid a lot for it
+
+Four slices guessed at libdrm's internals and built things; all four
+were premature (though each shipped a correct improvement, and all are
+load-bearing now). The thing that actually worked, twice, was making the
+other program talk: `[fd2]` named the missing DSO, and the Mesa error
+string naming **fd 0** named the fcntl bug in one line. **When a
+third-party library refuses, read its output and trace its syscalls
+before implementing anything.**
+
+### Next: Phase 1d, the measurement
+
+Everything now hinges on the question tier 3 was always gated on — is
+GPU raster actually faster here? Point chrome at the GL stack
+(`--use-gl=egl` with the staged Mesa) and compare against the
+CPU-raster baseline of ~40 fps / ~20 ms ack cycle. The slice-96 caveat
+stands: the binding constraint may still be the CDP loop, in which case
+tier 3's value is fidelity/WebGL rather than frame rate — but now it can
+be measured instead of argued.
