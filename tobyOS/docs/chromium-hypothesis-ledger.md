@@ -5693,3 +5693,79 @@ The layer is named `lxdrm_*` in `src/linux_drm.c` because `src/gpu_drm.c`
 is an unrelated NATIVE display abstraction that also uses "drm"; two
 things called drm in one kernel is exactly the confusion this arc has
 paid for before.
+
+---
+
+## SLICE 99 — Phase 1c: Mesa now LOADS THE VIRGL DRIVER off our node; the remaining block is libdrm's sysfs validation, named exactly
+
+Two measured gap-list entries closed, and the next one is no longer a
+guess — it is a specific libdrm function with a specific file list.
+
+**Entry #6 CLOSED — a DRM fd must stat as a CHARACTER DEVICE.**
+`gbm_create_device()` opened `/dev/dri/renderD128` and returned NULL
+having issued **zero ioctls**: it fstats the fd first and refuses
+anything that is not `S_ISCHR`. Our generic stat emitter only knew
+FILE/DIR (there is no `VFS_TYPE_CHR`), so every DRM fd looked like a
+regular file. Added `linux_emit_chrdev_stat` — `S_IFCHR | 0666` with a
+real `st_rdev` built from the Linux split encoding, DRM major 226, minor
+128 for `renderD*` / 0 for `card*` (recorded on the file at open).
+
+**Entry #7 CLOSED (understanding) — the platform choice mattered.**
+EGL *surfaceless* makes Mesa enumerate devices via `drmGetDevices2()`
+(list `/dev/dri`, walk `/sys/dev/char/...`), so it never opened our node
+at all and silently loaded `swrast_dri.so`. **GBM takes an fd we open
+ourselves**, needs no enumeration, and is the platform chrome's Ozone
+path uses — so the test now tries GBM first and keeps surfaceless as a
+fallback.
+
+**RESULT: Mesa selects and loads OUR driver.** With those two fixed:
+
+```
+[drm] open dri/renderD128 (virgl capset=1 max=308)
+[drm] ioctl #1 VERSION (nr=0x0 sz=64) -> 0
+[drm] ioctl #2 VERSION (nr=0x0 sz=64) -> 0
+[lopen] /opt/chrome/sysroot/dri/virtio_gpu_dri.so     <-- THE VIRGL DRIVER
+```
+
+Two VERSION calls is exactly right (libdrm's `drmGetVersion` is a
+two-pass length-then-strings query), both answered 0, and Mesa used the
+name we reported to dlopen **`virtio_gpu_dri.so`**. The guest's DRM
+identity now drives Mesa's driver selection.
+
+**Entry #8, OPEN — and precisely located.** After loading the driver,
+Mesa fell back to `swrast_dri.so` **without issuing a single further
+ioctl**. That rules out our ioctl implementations entirely: the failure
+is upstream of the device, inside gallium's `pipe_loader_drm_probe_fd`,
+which calls libdrm's **`drmGetDevice2(fd)`** — and that function
+validates a DRM fd through **sysfs**, not ioctls:
+
+| libdrm needs | what it does |
+|---|---|
+| `/sys/dev/char/226:128/device/drm` | `stat()` — `drmNodeIsDRM()`; absent = "not a DRM node" |
+| `/sys/dev/char/226:128/device/subsystem` | `readlink()` — basename must be `pci` |
+| `.../device/{vendor,device,revision,subsystem_vendor,subsystem_device}` or `config` | PCI identity |
+| `.../device/uevent` | `PCI_SLOT_NAME=` for the bus address |
+
+None of that exists in our `/sys`, so libdrm returns -EINVAL and gallium
+gives up before ever touching the device. **This is the whole remaining
+distance to "Mesa renders on the host GPU."**
+
+Next slice, mechanically: extend `src/sysfs.c` (it already has
+`sysfs_add_dir` / `sysfs_add_file(path, generator)`) with that tree,
+teach it one symlink (`subsystem` -> `.../bus/pci`) since sysfs currently
+serves only files and dirs, and re-run the same guard. The PCI values
+are already known to the kernel — `virtio_gpu.c` logs `1af4:1050` at
+probe.
+
+**Also this slice: a per-ioctl trace** (`[drm] ioctl #N NAME (nr sz) ->
+rc`, first 40 calls). The `UNHANDLED` list answers "what don't we
+implement"; it could never answer "which implemented call did Mesa
+dislike, and how far did it get" — which is exactly the question that
+mattered here, and it settled it in one run.
+
+**Unchanged and re-verified:** DRMTEST still PASS (the full
+VERSION->GETPARAM->GET_CAPS->CONTEXT_INIT->RESOURCE_CREATE->MAP->
+TRANSFER->EXECBUFFER->GEM_CLOSE walk, ioctls #3-11 above, all rc=0);
+defboot clean.
+
+**Phase 1d remains gated** on entry #8, for the same reason as before.

@@ -246,6 +246,15 @@ struct file *lxdrm_open(const char *node) {
     if (!f) return 0;
     memset(f, 0, sizeof(*f));
     f->kind = FILE_KIND_DRM;
+    /* Slice 99: remember which node this is, so fstat can report the
+     * right character-device minor (Linux: card* = 0.., renderD* = 128..).
+     * Mesa/GBM reads the minor to classify the node as render vs primary,
+     * and refuses an fd that is not a char device at all. */
+    {
+        const char *base = node;
+        for (const char *p = node; *p; p++) if (*p == '/') base = p + 1;
+        f->dir_off = (base[0] == 'r') ? 128u : 0u;   /* renderD128 : card0 */
+    }
 
     if (!g_drm.open) {
         struct proc *p = current_proc();
@@ -271,15 +280,13 @@ void lxdrm_close(struct file *f) {
 
 /* ---- the gap-list instrument ---- */
 
-static void drm_unhandled(unsigned long req) {
+static void drm_unhandled(unsigned nr) {
     static unsigned seen[64];
     static int nseen;
-    unsigned nr = IOC_NR(req);
     for (int i = 0; i < nseen; i++) if (seen[i] == nr) return;
     if (nseen < 64) seen[nseen++] = nr;
-    kprintf("[drm] UNHANDLED ioctl nr=0x%x (type='%c' size=%u dir=%u) "
-            "-- gap list\n", nr, (char)IOC_TYPE(req), IOC_SIZE(req),
-            (unsigned)((req >> 30) & 3u));
+    kprintf("[drm] UNHANDLED ioctl nr=0x%x%s -- gap list\n", nr,
+            nr >= DRM_COMMAND_BASE ? " (virtgpu-specific)" : " (core DRM)");
 }
 
 /* ---- ioctl handlers ---- */
@@ -560,11 +567,53 @@ static long drm_ioc_gem_close(unsigned long arg) {
     return 0;
 }
 
+static long lxdrm_ioctl_inner(unsigned nr, unsigned long arg);
+
+/* Slice 99: name every ioctl and its result for the first N calls. The
+ * gap list tells us which ioctls we DON'T implement; this tells us
+ * which implemented one Mesa disliked -- measured need: the virgl
+ * driver loaded, issued 2 ioctls, and fell back to swrast without ever
+ * reaching GET_CAPS, which "UNHANDLED" alone could never explain. */
+static const char *drm_nr_name(unsigned nr) {
+    switch (nr) {
+    case DRM_NR_VERSION:                return "VERSION";
+    case DRM_NR_GET_CAP:                return "GET_CAP";
+    case DRM_NR_SET_CLIENT_CAP:         return "SET_CLIENT_CAP";
+    case DRM_NR_SET_VERSION:            return "SET_VERSION";
+    case DRM_NR_GEM_CLOSE:              return "GEM_CLOSE";
+    case DRM_NR_GET_UNIQUE:             return "GET_UNIQUE";
+    case DRM_NR_GET_MAGIC:              return "GET_MAGIC";
+    case DRM_NR_PRIME_H2FD:             return "PRIME_HANDLE_TO_FD";
+    case DRM_NR_PRIME_FD2H:             return "PRIME_FD_TO_HANDLE";
+    case VIRTGPU_NR_MAP:                return "VIRTGPU_MAP";
+    case VIRTGPU_NR_EXECBUFFER:         return "VIRTGPU_EXECBUFFER";
+    case VIRTGPU_NR_GETPARAM:           return "VIRTGPU_GETPARAM";
+    case VIRTGPU_NR_RESOURCE_CREATE:    return "VIRTGPU_RESOURCE_CREATE";
+    case VIRTGPU_NR_RESOURCE_INFO:      return "VIRTGPU_RESOURCE_INFO";
+    case VIRTGPU_NR_TRANSFER_FROM_HOST: return "VIRTGPU_TRANSFER_FROM_HOST";
+    case VIRTGPU_NR_TRANSFER_TO_HOST:   return "VIRTGPU_TRANSFER_TO_HOST";
+    case VIRTGPU_NR_WAIT:               return "VIRTGPU_WAIT";
+    case VIRTGPU_NR_GET_CAPS:           return "VIRTGPU_GET_CAPS";
+    case VIRTGPU_NR_RESOURCE_CREATE_BLOB: return "VIRTGPU_RES_CREATE_BLOB";
+    case VIRTGPU_NR_CONTEXT_INIT:       return "VIRTGPU_CONTEXT_INIT";
+    default:                            return "?";
+    }
+}
+
 long lxdrm_ioctl(struct file *f, unsigned long req, unsigned long arg) {
     (void)f;
     if (IOC_TYPE(req) != DRM_IOCTL_TYPE) return -ABI_ENOTTY;
     g_drm.ioctls++;
     unsigned nr = IOC_NR(req);
+    long trc = lxdrm_ioctl_inner(nr, arg);
+    if (g_drm.ioctls <= 40)
+        kprintf("[drm] ioctl #%lu %s (nr=0x%x sz=%u) -> %ld\n",
+                (unsigned long)g_drm.ioctls, drm_nr_name(nr), nr,
+                IOC_SIZE(req), trc);
+    return trc;
+}
+
+static long lxdrm_ioctl_inner(unsigned nr, unsigned long arg) {
     switch (nr) {
     case DRM_NR_VERSION:               return drm_ioc_version(arg);
     case DRM_NR_GET_CAP:               return drm_ioc_get_cap(arg);
@@ -581,7 +630,7 @@ long lxdrm_ioctl(struct file *f, unsigned long req, unsigned long arg) {
     case VIRTGPU_NR_TRANSFER_FROM_HOST:return drm_ioc_transfer(arg, false);
     case VIRTGPU_NR_WAIT:              return drm_ioc_wait(arg);
     default:
-        drm_unhandled(req);
+        drm_unhandled(nr);
         return -ABI_ENOTTY;
     }
 }

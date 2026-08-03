@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 
 typedef void *EGLDisplay;
 typedef void *EGLConfig;
@@ -119,8 +120,48 @@ int main(void) {
     if (!p_eglGetPlatformDisplay || !p_eglInitialize || !p_glGetString)
         return 10;
 
-    EGLDisplay dpy = p_eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
-                                             NULL, NULL);
+    /* PLATFORM CHOICE, and it matters (gap-list entry #5).
+     *
+     * SURFACELESS made Mesa call libdrm's drmGetDevices2(), which
+     * ENUMERATES devices by listing /dev/dri and walking
+     * /sys/dev/char/<maj>:<min>/... -- neither of which we serve -- so
+     * Mesa concluded there was no GPU and loaded swrast_dri.so without
+     * ever opening our node.
+     *
+     * GBM takes an fd we open OURSELVES: no enumeration, Mesa asks the
+     * fd what it is (DRM_IOCTL_VERSION -> "virtio_gpu") and loads that
+     * driver. It is also the platform chrome's Ozone/GBM path uses, so
+     * it is the more relevant one to prove. Surfaceless is kept as a
+     * fallback so this client still reports something useful once
+     * enumeration exists. */
+    EGLDisplay dpy = EGL_NO_DISPLAY;
+    void *hgbm = dlopen("libgbm.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (hgbm) {
+        void *(*p_gbm_create_device)(int) = bind_sym(hgbm, "gbm_create_device");
+        int fd = open("/dev/dri/renderD128", O_RDWR);
+        if (fd < 0) fd = open("/dev/dri/card0", O_RDWR);
+        printf("[egltest] /dev/dri fd=%d\n", fd);
+        fflush(stdout);
+        if (p_gbm_create_device && fd >= 0) {
+            void *gbm = p_gbm_create_device(fd);
+            printf("[egltest] gbm_create_device -> %s\n", gbm ? "ok" : "NULL");
+            fflush(stdout);
+            if (gbm) {
+                dpy = p_eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA, gbm, NULL);
+                printf("[egltest] GBM display %s\n",
+                       dpy == EGL_NO_DISPLAY ? "FAILED" : "ok");
+                fflush(stdout);
+            }
+        }
+    } else {
+        printf("[egltest] libgbm.so.1 not loadable: %s\n", dlerror());
+    }
+    if (dpy == EGL_NO_DISPLAY) {
+        printf("[egltest] falling back to surfaceless\n");
+        fflush(stdout);
+        dpy = p_eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
+                                      NULL, NULL);
+    }
     if (dpy == EGL_NO_DISPLAY) {
         printf("[egltest] eglGetPlatformDisplay FAILED (err=0x%x)\n",
                p_eglGetError());

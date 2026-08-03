@@ -4553,6 +4553,38 @@ static uint64_t lx_ino_hash(const char *s) {
 /* Build a Linux struct stat from a tobyOS vfs_stat and copy it out. `ino` is a
  * synthetic-but-stable inode number (see lx_ino_hash) so distinct files get
  * distinct inodes -- required for glibc ld.so's shared-library dedup. */
+/* Slice 99 (tier 3 Phase 1c): a DRM fd must stat as a CHARACTER DEVICE.
+ *
+ * Measured gap-list entry: Mesa's gbm_create_device() opened
+ * /dev/dri/renderD128 and then returned NULL having issued ZERO ioctls
+ * -- it fstats the fd first and bails unless S_ISCHR. Our generic
+ * emitter only knows FILE/DIR, so every DRM fd looked like a regular
+ * file and GBM refused it before asking the device anything.
+ *
+ * Linux's DRM major is 226 (render nodes start at minor 128). dev_t is
+ * the split encoding: minor bits 0-7 and 20+, major bits 8-19. */
+#define DRM_CHR_MAJOR 226u
+static inline uint64_t lx_makedev(uint32_t maj, uint32_t min) {
+    return ((uint64_t)(min & 0xffu))
+         | ((uint64_t)(maj & 0xfffu) << 8)
+         | ((uint64_t)(min & ~0xffu) << 12)
+         | ((uint64_t)(maj & ~0xfffu) << 32);
+}
+
+static long linux_emit_chrdev_stat(uint32_t maj, uint32_t min, uint64_t ino,
+                                   void *ubuf) {
+    struct lx_stat st;
+    memset(&st, 0, sizeof st);
+    st.st_mode    = 0x2000u | 0666u;          /* S_IFCHR | rw-rw-rw- */
+    st.st_dev     = 6;                        /* devtmpfs-ish, non-zero */
+    st.st_ino     = ino ? ino : 1;
+    st.st_nlink   = 1;
+    st.st_rdev    = lx_makedev(maj, min);
+    st.st_blksize = 4096;
+    if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
 static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf) {
     struct lx_stat st;
     memset(&st, 0, sizeof st);
@@ -8026,6 +8058,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         struct file *f = fd_lookup((int)a1);
         if (!f) return -ABI_EBADF;
         struct vfs_stat vs;
+        if (f->kind == FILE_KIND_DRM)         /* slice 99: S_IFCHR 226:128 */
+            return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
+                                          lx_fd_ino(f, (int)a1), (void *)a2);
         if (f->kind == FILE_KIND_DIR && f->dirpath) {
             if (vfs_stat(f->dirpath, &vs) != VFS_OK)
                 vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
