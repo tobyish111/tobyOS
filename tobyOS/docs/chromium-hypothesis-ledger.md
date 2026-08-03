@@ -5956,3 +5956,64 @@ complete and self-checking. The remaining gap is one library function's
 view of one device's metadata.
 
 defboot clean.
+
+---
+
+## SLICE 103 — the instrument finally arrives: `[gpupath]` proves libdrm touches NOTHING, killing four slices of theory at once, and names a real gap by measurement
+
+**The instrument.** `[gpupath]` logs every `stat` / `newfstatat` /
+`readlink` whose path lies under `/sys/dev/char`, `/sys/class/drm`,
+`/sys/bus/pci`, `/sys/devices/pci` or `/dev/dri`, with its return value.
+Six lines of filter; it should have existed four slices ago.
+
+**What it proved immediately.** During Mesa's device probe, libdrm makes
+**ZERO accesses to any of those paths.** The only entries in the trace
+are my own `probe_sysfs()` calls. So:
+
+* `drmGetDevice2`'s sysfs walk never runs — it returns before touching
+  the filesystem;
+* therefore the sysfs tree (99), the symlink + binary PCI `config`
+  (100), and the listable `/dev/dri` (102) could never have been the
+  cause. **All three are now disproven by direct measurement rather than
+  by "it didn't help".** They stay, because each is correct Linux
+  behaviour we were missing, but none of them was the bug.
+
+**A real gap, found by the same trace, not by reading source:**
+
+```
+[gpupath] stat /dev/dri/card0       -> -1
+[gpupath] stat /dev/dri/renderD128  -> -1
+```
+
+**Path-based `stat()` of the DRM nodes FAILS.** `/dev/dri/*` exists only
+as a special case in the `open()` handler; `vfs_stat` knows nothing about
+it. Anything that stats a node by name before opening it — which is
+exactly what libdrm's enumeration does for each directory entry — sees
+ENOENT. Fix `vfs_stat` for those paths next; the trace will say whether
+it moves libdrm.
+
+**Also fixed this slice (measured, not guessed).** The slice-99
+char-device stat only covered `LX_fstat`, but glibc's `fstat()` reaches
+the kernel as `newfstatat(fd, "", AT_EMPTY_PATH)` or `statx` — both of
+which flattened a DRM fd to `mode 0666`, i.e. a regular file. libdrm
+checks `S_ISCHR` before anything else, so it would have bailed there
+regardless. Both paths now emit `S_IFCHR` + `st_rdev` 226:minor.
+(Consistent with the zero-access observation, though the trace shows
+libdrm still not proceeding, so this was necessary and not sufficient.)
+
+**Score so far, honestly.** `gbm_create_device -> ok`; Mesa loads
+`virtio_gpu_dri.so` from our node's own VERSION answer; the DRM surface
+serves the full Mesa-shaped walk (DRMTEST PASS, 11 ioctls, rc=0); the
+Mesa dependency closure is complete and self-checking. Still no GL
+context: `MESA-LOADER: failed to retrieve device information` persists,
+and we now know it happens without any filesystem access at all.
+
+**Next, in order:** (1) make `vfs_stat` answer for `/dev/dri/*`;
+(2) re-run and read `[gpupath]` — if libdrm still touches nothing, the
+remaining possibilities are narrow and mechanical (it is failing inside
+`drmGetVersion`-derived bus detection on the fd itself, which the
+existing `[drm] ioctl #N` trace will show). Both steps are now
+instrument-first, which is the only thing that has actually worked on
+this front.
+
+defboot clean.

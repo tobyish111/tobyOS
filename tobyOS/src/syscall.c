@@ -4585,6 +4585,26 @@ static uint64_t lx_ino_hash(const char *s) {
  * Linux's DRM major is 226 (render nodes start at minor 128). dev_t is
  * the split encoding: minor bits 0-7 and 20+, major bits 8-19. */
 #define DRM_CHR_MAJOR 226u
+
+/* Slice 103: GPU-path access trace. Four slices in a row guessed which
+ * file libdrm wanted, built it, and changed nothing (see the ledger).
+ * The library never says which access failed -- so log the accesses
+ * ourselves, filtered to the paths this machinery touches, with their
+ * results. Cheap, and it ends the guessing. */
+static bool gpupath(const char *p) {
+    if (!p) return false;
+    return strncmp(p, "/sys/dev/char", 13) == 0 ||
+           strncmp(p, "/sys/class/drm", 14) == 0 ||
+           strncmp(p, "/sys/bus/pci", 12) == 0 ||
+           strncmp(p, "/sys/devices/pci", 16) == 0 ||
+           strncmp(p, "/dev/dri", 8) == 0;
+}
+static void gputrace(const char *op, const char *path, long rc) {
+    static int n;
+    if (!gpupath(path) || n >= 120) return;
+    n++;
+    kprintf("[gpupath] %-10s %-52s -> %ld\n", op, path, rc);
+}
 static inline uint64_t lx_makedev(uint32_t maj, uint32_t min) {
     return ((uint64_t)(min & 0xffu))
          | ((uint64_t)(maj & 0xfffu) << 8)
@@ -7944,6 +7964,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * and bound the length by what we actually have. */
         memset(ktmp, 0, sizeof ktmp);
         int rc = vfs_readlink(kpath, ktmp, cap);
+        gputrace("readlink", kpath, rc);
         if (rc != VFS_OK) {
             /* Linux: EINVAL if the path exists but is not a symlink, ENOENT
              * if missing. glibc realpath() requires exactly this split --
@@ -8045,6 +8066,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (rr) return rr;
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
+        gputrace("stat", kpath, sr);
         if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
         if (sr != VFS_OK)        return -ABI_EACCES;
         return linux_emit_stat(&vs, lx_ino_hash(kpath), (void *)a2);
@@ -8062,6 +8084,17 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             struct vfs_stat vs = { .type = VFS_TYPE_FILE, .size = f->vfs.size,
                                    .uid = f->vfs.uid, .gid = f->vfs.gid,
                                    .mode = f->vfs.mode };
+            /* Slice 103: a DRM fd must report S_IFCHR here too. glibc's
+             * fstat() goes through newfstatat(fd,"",AT_EMPTY_PATH), not
+             * LX_fstat -- so the slice-99 char-device fix never applied
+             * to libdrm, whose drmGetDevice2 checks S_ISCHR FIRST and
+             * returns -EINVAL before touching sysfs. MEASURED: the
+             * [gpupath] trace showed libdrm making ZERO sysfs accesses,
+             * which is only possible if it bailed at this stat. */
+            if (f->kind == FILE_KIND_DRM)
+                return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
+                                              lx_fd_ino(f, (int)a1),
+                                              (void *)a3);
             if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
             return linux_emit_stat(&vs, lx_fd_ino(f, (int)a1), (void *)a3);
         }
@@ -8072,6 +8105,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (rr) return rr;
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
+        gputrace("newfstatat", kpath, sr);
         if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
         if (sr != VFS_OK)        return -ABI_EACCES;
         return linux_emit_stat(&vs, lx_ino_hash(kpath), (void *)a3);
@@ -8734,6 +8768,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             struct vfs_stat vs = { .type = VFS_TYPE_FILE, .size = f->vfs.size,
                                    .uid = f->vfs.uid, .gid = f->vfs.gid,
                                    .mode = f->vfs.mode };
+            /* Slice 103: same char-device answer for statx -- glibc may
+             * use either. See the newfstatat note above. */
+            if (f->kind == FILE_KIND_DRM) {
+                struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
+                                        .mode = 0666 };
+                long src = linux_emit_statx(&cvs, lx_fd_ino(f, (int)a1),
+                                            (void *)a5);
+                if (src == 0) {
+                    /* Patch mode to S_IFCHR and fill rdev in place: the
+                     * generic emitter only knows FILE/DIR. */
+                    uint16_t m = (uint16_t)(0x2000u | 0666u);
+                    uint32_t rmaj = DRM_CHR_MAJOR, rmin = f->dir_off;
+                    (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);
+                    (void)copy_to_user((uint8_t *)a5 + 0x80, &rmaj, sizeof rmaj);
+                    (void)copy_to_user((uint8_t *)a5 + 0x84, &rmin, sizeof rmin);
+                }
+                return src;
+            }
             if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
             return linux_emit_statx(&vs, lx_fd_ino(f, (int)a1), (void *)a5);
         }
