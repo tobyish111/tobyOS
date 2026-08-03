@@ -5538,3 +5538,52 @@ SET_SCANOUT ok, cursor ready, device live) and defboot is clean.
 else's implementation is a hypothesis, not a fix. This one cost a build
 and two probes because it was cheap to test — which is exactly why it
 was tested before being written down as done.
+
+---
+
+## SLICE 97 — TIER 3 PHASE 1a DONE: the GL device is no longer declined, it is BOUND in a 3D-only role with a VERIFIED virgl pipe
+
+**The change.** A `-gl` device rejects 2D SET_SCANOUT by design (96c:
+everything routes through virglrenderer), and the driver used to throw
+the whole device away for it (rc=-13) — taking a live control queue with
+it. Now, when SET_SCANOUT fails on a virgl-capable device, the probe
+runs the **3D capability handshake** instead of declining:
+
+```
+[virtio-gpu] features: ... virgl=acked (3D role)
+[virtio-gpu] SET_SCANOUT bad response type=0x1203
+[virtio-gpu] 3D-ONLY mode: scanout is virgl-owned (2D SET_SCANOUT refused, expected).
+             capset id=1 (VIRGL) maxver=1 maxsize=308 | CTX_CREATE ok
+[virtio-gpu] 3D pipe VERIFIED -- device bound for tier 3
+[pci] driver virtio-gpu bound to 00:04.0 (1af4:1050) strat=exact
+```
+
+**A real virglrenderer answered**: GET_CAPSET_INFO returned capset id 1
+(VIRGL), max version 1, a 308-byte capability blob; CTX_CREATE opened a
+rendering context and CTX_DESTROY closed it. That is the whole 3D
+control path — host GL stack, virtqueue, command encoding, response
+parsing — proven end to end from inside tobyOS.
+
+**VIRGL is acked again** (96c removed the ack as honesty when we could
+not speak the flow). The 3D role *wants* virgl mode; a 3D-only device
+never claims a scanout, so display duty is unaffected.
+
+**Regression-checked:** plain `virtio-gpu-pci` unchanged — binds,
+SET_SCANOUT ok, backend installed, HW cursor active, `fb0 1280x800
+backend=virtio-gpu` registered; defboot clean.
+
+**What Phase 1a deliberately did NOT do:** no `/dev/dri`, no DRM ioctls,
+no Mesa. The context is opened as proof and immediately destroyed. The
+next slices are (b) a `/dev/dri/card0` node + the DRM ioctl surface
+(DRM_IOCTL_VERSION / GEM / VIRTGPU_EXECBUFFER / GETPARAM) backed by this
+device, (c) staging Mesa's virgl driver into the chrome sysroot, and
+(d) the measure-first gate: GPU raster must beat the CPU-raster ~40 fps
+baseline before the full surface is worth finishing.
+
+**Two structural notes for whoever writes (b):** the file already
+carried `virtio_gpu_ctx_create()` / `virtio_gpu_ctx_destroy()` /
+`virtio_gpu_virgl_available()` from an old "Phase 3 foundation" — they
+gate on `g_vgpu_active && virgl_enabled`, neither true during probe,
+hence this slice's probe-time twins. And a 3D-only device sets
+`three_d_only` and does NOT set `g_vgpu_bound`, so nothing in the
+display path can mistake it for a scanout provider.

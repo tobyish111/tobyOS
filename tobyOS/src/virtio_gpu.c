@@ -182,6 +182,10 @@ enum {
     VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING = 0x0106,
     VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING = 0x0107,
 
+    /* Slice 97 (tier 3 Phase 1a): the 3D capability handshake. */
+    VIRTIO_GPU_CMD_GET_CAPSET_INFO         = 0x0108,
+    VIRTIO_GPU_CMD_GET_CAPSET              = 0x0109,
+
     VIRTIO_GPU_CMD_CTX_CREATE              = 0x0200,
     VIRTIO_GPU_CMD_CTX_DESTROY             = 0x0201,
     VIRTIO_GPU_CMD_SUBMIT_3D               = 0x0207,
@@ -191,12 +195,23 @@ enum {
 
     VIRTIO_GPU_RESP_OK_NODATA              = 0x1100,
     VIRTIO_GPU_RESP_OK_DISPLAY_INFO        = 0x1101,
+    VIRTIO_GPU_RESP_OK_CAPSET_INFO         = 0x1102,
+    VIRTIO_GPU_RESP_OK_CAPSET              = 0x1103,
 };
+
+/* Capset ids (virtio-gpu spec): what flavour of 3D the host speaks.
+ * (The request/response structs live after virtio_gpu_ctrl_hdr below.) */
+#define VIRTIO_GPU_CAPSET_VIRGL   1
+#define VIRTIO_GPU_CAPSET_VIRGL2  2
 
 /* virtio_gpu_formats -- pixel formats. We use B8G8R8X8_UNORM which on
  * little-endian x86 is the same byte order Limine hands us (BGRX), so
  * the back buffer can be memcpy'd verbatim with no swizzle. */
 #define VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM   2
+
+/* Slice 97: the context id the Phase-1a 3D handshake opens (and closes).
+ * Real per-client contexts get allocated by the /dev/dri layer later. */
+#define VG_3D_CTX_ID  1u
 #define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM   1
 
 struct __attribute__((packed)) virtio_gpu_ctrl_hdr {
@@ -284,6 +299,23 @@ struct __attribute__((packed)) virtio_gpu_resource_detach_backing {
 };
 
 /* VirGL 3D command structures (Phase 3 foundation) */
+
+/* Slice 97 (tier 3 Phase 1a): the capability handshake. GET_CAPSET_INFO
+ * asks the host which 3D flavour it speaks -- a live virglrenderer
+ * answers VIRGL/VIRGL2 with a max version and capability-blob size. */
+struct __attribute__((packed)) virtio_gpu_get_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t capset_index;
+    uint32_t padding;
+};
+
+struct __attribute__((packed)) virtio_gpu_resp_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t capset_id;
+    uint32_t capset_max_version;
+    uint32_t capset_max_size;
+    uint32_t padding;
+};
 
 struct __attribute__((packed)) virtio_gpu_ctx_create {
     struct virtio_gpu_ctrl_hdr hdr;
@@ -381,6 +413,9 @@ struct vgpu_dev {
     /* VirGL 3D state (Phase 3 foundation). */
     bool            virgl_supported;
     bool            virgl_enabled;
+    /* Slice 97: bound for 3D only -- the device's scanout belongs to
+     * virglrenderer, so it does NO display duty here (see the probe). */
+    bool            three_d_only;
     uint64_t        cmd3d_phys;     /* 2-page DMA buffer for SUBMIT_3D */
     uint8_t        *cmd3d_virt;
 
@@ -844,6 +879,92 @@ static bool cmd_set_scanout(struct vgpu_dev *d,
         return false;
     }
     return true;
+}
+
+/* ---- Slice 97 (tier 3 Phase 1a): the 3D capability handshake -------
+ *
+ * Phase 0 proved the HOST side (ANGLE -> virglrenderer -> D3D11), and
+ * 96c proved a `-gl` device routes EVERY command through virglrenderer,
+ * so its 2D scanout is unusable (0x1203) and the device used to be
+ * DECLINED outright -- taking its live control queue with it.
+ *
+ * These two commands are the smallest end-to-end proof that the 3D pipe
+ * actually works: GET_CAPSET_INFO asks the host what flavour of 3D it
+ * speaks (a real virglrenderer answers VIRGL/VIRGL2 with a version and
+ * a capability-blob size), and CTX_CREATE opens a rendering context --
+ * the object every future DRM ioctl hangs off. If both answer, the
+ * remaining tier-3 work is Mesa + /dev/dri plumbing, not "does any of
+ * this exist". */
+static bool cmd_get_capset_info(struct vgpu_dev *d, uint32_t index,
+                                uint32_t *id_out, uint32_t *ver_out,
+                                uint32_t *size_out) {
+    struct virtio_gpu_get_capset_info *req
+        = (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_resp_capset_info *resp
+        = (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req,  0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type     = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+    req->capset_index = index;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return false;
+    if (resp->hdr.type != VIRTIO_GPU_RESP_OK_CAPSET_INFO) {
+        kprintf("[virtio-gpu] GET_CAPSET_INFO(%u) bad response type=0x%x\n",
+                index, resp->hdr.type);
+        return false;
+    }
+    if (id_out)   *id_out   = resp->capset_id;
+    if (ver_out)  *ver_out  = resp->capset_max_version;
+    if (size_out) *size_out = resp->capset_max_size;
+    return true;
+}
+
+/* CTX_CREATE/CTX_DESTROY already exist as the public
+ * virtio_gpu_ctx_create()/virtio_gpu_ctx_destroy() ("VirGL 3D
+ * foundation", further down) -- but those gate on g_vgpu_active &&
+ * virgl_enabled, neither of which is true DURING probe. This probe-time
+ * variant issues the same command straight at the device under test. */
+static bool cmd_ctx_create_probe(struct vgpu_dev *d, uint32_t ctx_id,
+                                 const char *name) {
+    struct virtio_gpu_ctx_create *req
+        = (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp
+        = (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req,  0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type   = VIRTIO_GPU_CMD_CTX_CREATE;
+    req->hdr.ctx_id = ctx_id;
+    uint32_t n = 0;
+    while (name[n] && n < sizeof(req->debug_name) - 1) {
+        req->debug_name[n] = name[n];
+        n++;
+    }
+    req->nlen = n;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return false;
+    if (resp->type != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("[virtio-gpu] CTX_CREATE(%u) bad response type=0x%x\n",
+                ctx_id, resp->type);
+        return false;
+    }
+    return true;
+}
+
+static bool cmd_ctx_destroy_probe(struct vgpu_dev *d, uint32_t ctx_id) {
+    struct virtio_gpu_ctx_destroy *req
+        = (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp
+        = (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req,  0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type   = VIRTIO_GPU_CMD_CTX_DESTROY;
+    req->hdr.ctx_id = ctx_id;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return false;
+    return resp->type == VIRTIO_GPU_RESP_OK_NODATA;
 }
 
 /* M27F: TRANSFER_TO_HOST_2D over an arbitrary sub-rect of the resource.
@@ -1431,18 +1552,19 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
 
     d->virgl_supported = !!(devf_lo & (1u << VIRTIO_GPU_F_VIRGL));
 
-    /* Slice 96b (tier 3 Phase 1, item #1): do NOT ack VIRGL until we
-     * actually run 3D. Acking it flips the device into virgl mode, where
-     * SET_SCANOUT of a RESOURCE_CREATE_2D resource is REJECTED (resp
-     * 0x1203: virgl wants its own/blob resource flow) -- measured on the
-     * ANGLE-enabled rig: bring-up died at SET_SCANOUT and the driver
-     * declined the whole device (rc=-13). Left un-acked, a
-     * virtio-gpu-gl device serves the plain 2D contract and the proven
-     * framebuffer path works unchanged, so ONE kernel handles both
-     * device types. When the 3D arc starts (Mesa/virgl through
-     * /dev/dri), ack the bit and move scanout to the virgl flow --
-     * virgl_supported already records that the device could do it. */
+    /* Slice 96b predicted that NOT acking VIRGL would keep the plain 2D
+     * contract on a `-gl` device. 96c MEASURED that wrong: QEMU's
+     * virtio-gpu-gl routes every command through virglrenderer whatever
+     * the guest negotiates, so 2D scanout is refused either way.
+     *
+     * Slice 97 therefore acks it again -- deliberately, because the 3D
+     * role WANTS virgl mode: the probe now binds such a device in
+     * 3D-ONLY mode after verifying the pipe (GET_CAPSET_INFO +
+     * CTX_CREATE), instead of declining it. Display duty is unaffected;
+     * a 3D-only device never claims a scanout. */
     uint32_t drv_lo = 0;
+    if (d->virgl_supported)
+        drv_lo |= (1u << VIRTIO_GPU_F_VIRGL);
 
     cfg_w32(d, VIRTIO_PCI_DRIVER_FEATURE_SELECT, 0);
     cfg_w32(d, VIRTIO_PCI_DRIVER_FEATURE,        drv_lo);
@@ -1458,13 +1580,15 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
         return -6;
     }
 
-    d->virgl_enabled = false;              /* 2D contract until the 3D arc */
+    /* Set only once the 3D handshake actually answers (see the probe). */
+    d->virgl_enabled = false;
+    d->three_d_only  = false;
 
     kprintf("[virtio-gpu] features: device=0x%08x_%08x driver=0x%08x_%08x "
             "virgl=%s\n",
             devf_hi, devf_lo,
             1u << (VIRTIO_F_VERSION_1 - 32), drv_lo,
-            d->virgl_supported ? "avail-not-acked" : "no");
+            d->virgl_supported ? "acked (3D role)" : "no");
 
     /* Try MSI-X for the controlq. Fall back to no IRQ if the device
      * has no MSI-X cap (rare on modern virtio, but the legacy path
@@ -1542,8 +1666,41 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
         return -12;
     kprintf("[virtio-gpu] RESOURCE_ATTACH_BACKING ok\n");
 
-    if (!cmd_set_scanout(d, 0, VG_RESOURCE_ID, d->width, d->height))
+    if (!cmd_set_scanout(d, 0, VG_RESOURCE_ID, d->width, d->height)) {
+        /* Slice 97 (tier 3 Phase 1a): a GL device rejects 2D scanout by
+         * design (96c: virtio-gpu-gl routes everything through
+         * virglrenderer, so the resource must live in ITS world). That
+         * is NOT a reason to throw the device away -- its control queue
+         * is live and is exactly what tier 3 needs. Bind it in a 3D-ONLY
+         * role: no display duty (the framebuffer path is untouched, and
+         * a plain virtio-gpu-pci or the Limine framebuffer keeps driving
+         * the screen), but the 3D pipe stays open for /dev/dri. */
+        if (d->virgl_supported) {
+            uint32_t cid = 0, ver = 0, csz = 0;
+            bool caps = cmd_get_capset_info(d, 0, &cid, &ver, &csz);
+            bool ctx  = cmd_ctx_create_probe(d, VG_3D_CTX_ID, "tobyos-t3");
+            kprintf("[virtio-gpu] 3D-ONLY mode: scanout is virgl-owned "
+                    "(2D SET_SCANOUT refused, expected). capset%s",
+                    caps ? "" : ": FAILED\n");
+            if (caps)
+                kprintf(" id=%u (%s) maxver=%u maxsize=%u | CTX_CREATE %s\n",
+                        cid,
+                        cid == VIRTIO_GPU_CAPSET_VIRGL2 ? "VIRGL2" :
+                        cid == VIRTIO_GPU_CAPSET_VIRGL  ? "VIRGL"  : "?",
+                        ver, csz, ctx ? "ok" : "FAILED");
+            if (caps && ctx) {
+                cmd_ctx_destroy_probe(d, VG_3D_CTX_ID);  /* proof, for now */
+                d->virgl_enabled = true;            /* 3D pipe is REAL */
+                d->three_d_only  = true;
+                dev->driver_data = d;
+                kprintf("[virtio-gpu] 3D pipe VERIFIED -- device bound for "
+                        "tier 3 (display stays on the existing path)\n");
+                return 0;
+            }
+            kprintf("[virtio-gpu] 3D handshake incomplete -- declining\n");
+        }
         return -13;
+    }
     kprintf("[virtio-gpu] SET_SCANOUT 0 -> resource %u ok\n", VG_RESOURCE_ID);
 
     /* Set up the hardware cursor resource on VQ 1. Non-fatal if it
