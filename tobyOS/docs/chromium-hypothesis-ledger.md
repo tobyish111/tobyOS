@@ -5845,3 +5845,67 @@ walk). The pattern is clear enough to write down: *a mechanism inferred
 from third-party source is a hypothesis with a test attached, never a
 diagnosis* — and the cheap test here was always "make the other program
 tell you", which is what the next step finally does.
+
+---
+
+## SLICE 101 — Mesa's GBM device now CREATES on our DRM node; the last blocker is `/dev/dri` not being a listable directory, and Mesa says so itself
+
+**The instrument I recommended in slice 100 already existed, and had been
+answering all along.** Slice 100's handoff said "capture the client's
+stderr, Mesa is probably explaining itself unread". The harness *already*
+surfaces stderr as `[fd2]` — and it had been printing the reason since
+the first Mesa run:
+
+```
+MESA-LOADER: failed to open virtio_gpu: libLLVM-15.so.1: cannot open shared object file
+failed to load driver: virtio_gpu
+```
+
+Not sysfs at all — a missing DSO. Slices 99 and 100 built a sysfs device
+tree on a theory while the actual cause sat in the log. **Correction to
+the slice-100 method note: the failure was not "inferring from
+third-party source" so much as not READING THE OUTPUT WE ALREADY HAD.
+Grep the child's stderr before theorising about its behaviour.**
+
+**Closing the DSO chain, then automating it.** libLLVM-15 -> libsensors5
+-> libstdc++6 -> libz3-4/libpciaccess0, each costing a full ISO build +
+boot to discover one name. So `mesa.sh` now parses the driver's own
+`DT_NEEDED` **transitively** and prints the entire remaining gap at once:
+
+```
+[mesa] MISSING DEPENDENCIES -- add their packages to SEED:
+    libpciaccess.so.0 (needed by libdrm_intel.so.1)
+    libz3.so.4 (needed by libLLVM-15.so.1)
+...
+[mesa] dependency closure COMPLETE for the virgl driver
+```
+
+**RESULT: `gbm_create_device -> ok`.** Mesa loads `virtio_gpu_dri.so`,
+initialises its GBM device against our render node, and no longer falls
+back on load failure. The sysroot is 454 MB with the GL stack staged
+(opt-in; `mesa.sh` is never run by the Makefile).
+
+**The one remaining blocker, in Mesa's own words:**
+
+```
+MESA-LOADER: failed to retrieve device information
+```
+
+That is `loader_get_pci_id_for_fd()` -> libdrm `drmGetDevice2(fd)`.
+Slices 99-100 gave it the sysfs tree it wants (verified in-guest: every
+path stats, `readlink subsystem -> ../../../bus/pci`, binary `config`
+present) — but `drmGetDevice2` **also `opendir("/dev/dri")` and iterates
+the directory** to fill in the device's node names, and our `/dev/dri`
+is not a directory at all: `open("/dev/dri/renderD128")` is special-cased
+in the syscall layer (syscall.c, `strncmp(dev, "dri/", 4)`), with no
+entry that `getdents64` can enumerate.
+
+**NEXT, and it is now a single well-defined task:** make `/dev/dri`
+listable — a FILE_KIND_DIR whose `getdents64` yields `card0` and
+`renderD128` — then re-run the same guard. Everything else in the chain
+is already proven working.
+
+**Regressions:** DRMTEST still PASS (11 ioctls, all rc=0); defboot clean.
+Phase 1d (the GPU-vs-CPU-raster measurement) remains gated on the above,
+with the slice-96 caveat unchanged: CPU raster is ~40 fps against a
+~52 Hz ceiling, so tier 3's near-term value is fidelity/WebGL/headroom.

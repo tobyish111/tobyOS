@@ -40,6 +40,9 @@ SUITE="${SUITE:-bookworm}"
 SEED="libgl1-mesa-dri libegl-mesa0 libegl1 libgles2 libglapi-mesa \
 libglvnd0 libglx0 libgl1 libopengl0 libxcb-glx0 libx11-xcb1 \
 libxcb-randr0 libxcb-shm0 libxcb-xkb1 libxcb-render0 libxcb-util1 \
+libllvm15 libedit2 libbsd0 libmd0 libtinfo6 libxml2 libicu72 liblzma5 \
+libsensors5 libffi8 libunwind8 libdrm-common zlib1g libstdc++6 \
+libz3-4 libpciaccess0 libgomp1 \
 libdrm2 libgbm1 libdrm-amdgpu1 libdrm-intel1 libdrm-nouveau2 libdrm-radeon1 \
 libzstd1 libelf1 libwayland-client0 libwayland-server0 libxcb-dri2-0 \
 libxcb-dri3-0 libxcb-present0 libxcb-sync1 libxcb-xfixes0 libxshmfence1"
@@ -159,6 +162,66 @@ print('[mesa] pruned unused DRI drivers (%d MB freed); kept %s'
 for want in ('dri/virtio_gpu_dri.so', 'libEGL_mesa.so.0', 'libgbm.so.1'):
     print('[mesa] %-28s %s' % (want,
           'OK' if os.path.exists(os.path.join(out, want)) else 'MISSING'))
+
+# CLOSURE CHECK. Mesa reports a missing dependency one per run, and each
+# round trip here is a full ISO build + boot -- three of them were spent
+# discovering libLLVM, then libsensors, then libstdc++ one at a time.
+# Read the driver's own DT_NEEDED instead and report the whole gap at
+# once. (glibc's own libs come from the in-tree toolchain, not here.)
+import struct
+GLIBC = ('libc.so.6', 'libm.so.6', 'libdl.so.2', 'libpthread.so.0',
+         'librt.so.1', 'libgcc_s.so.1')
+def dt_needed(path):
+    d = open(path, 'rb').read()
+    if d[:4] != b'\x7fELF':
+        return []
+    e_shoff = struct.unpack_from('<Q', d, 0x28)[0]
+    e_shentsize = struct.unpack_from('<H', d, 0x3a)[0]
+    e_shnum = struct.unpack_from('<H', d, 0x3c)[0]
+    secs = []
+    for i in range(e_shnum):
+        secs.append(struct.unpack_from('<IIQQQQIIQQ', d, e_shoff + i*e_shentsize))
+    dyn = next((s for s in secs if s[1] == 6), None)
+    if not dyn:
+        return []
+    strtab = secs[dyn[6]]
+    out_ = []
+    for i in range(dyn[5] // 16):
+        tag, val = struct.unpack_from('<Qq', d, dyn[4] + i*16)
+        if tag == 0:
+            break
+        if tag == 1:
+            so = strtab[4] + val
+            out_.append(d[so:d.index(b'\x00', so)].decode())
+    return out_
+
+# TRANSITIVE closure: libLLVM pulls libz3, which pulls more. Walking
+# only the driver's direct DT_NEEDED cost a whole build+boot cycle per
+# hop (libLLVM -> libsensors -> libstdc++ -> libz3 ...). Walk the graph.
+missing = []
+seen = set()
+queue = ['dri/virtio_gpu_dri.so', 'libEGL_mesa.so.0', 'libgbm.so.1']
+while queue:
+    rel = queue.pop()
+    if rel in seen:
+        continue
+    seen.add(rel)
+    p = os.path.join(out, rel)
+    if not os.path.exists(p):
+        continue
+    for dep in dt_needed(p):
+        if dep in GLIBC or dep in seen:
+            continue
+        if os.path.exists(os.path.join(out, dep)):
+            queue.append(dep)
+        else:
+            missing.append('%s (needed by %s)' % (dep, os.path.basename(rel)))
+if missing:
+    print('[mesa] MISSING DEPENDENCIES -- add their packages to SEED:')
+    for m in sorted(set(missing)):
+        print('   ', m)
+else:
+    print('[mesa] dependency closure COMPLETE for the virgl driver')
 PY
 
 echo "[mesa] sysroot now:"
