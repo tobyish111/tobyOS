@@ -1414,6 +1414,42 @@ long memfd_map(uint64_t addr, uint64_t len, uint32_t prot, uint32_t flags,
     return (long)base;
 }
 
+/* Slice 98 (tier 3 Phase 1b): map a CONTIGUOUS PHYSICAL range into the
+ * calling process. /dev/dri BOs are DMA buffers the GPU reads directly,
+ * so the guest must write the very same frames -- an anonymous shadow
+ * plus a copy (the fbdev model) would be both slower and wrong for
+ * Mesa, which expects its mapping to BE the buffer.
+ *
+ * Marked SHARED+NOFREE for the same reasons the memfd path is: fork must
+ * never CoW these pages (every mapper writes the one frame the device
+ * sees), and teardown must not hand device memory back to the PMM --
+ * the DRM layer owns that lifetime. */
+long mmap_map_phys_user(uint64_t phys, uint64_t len) {
+    struct proc *p = current_proc();
+    if (!p || !phys || len == 0) return -22;
+    int pid = proc_mm_pid(p);
+    struct vma_table *vt = &g_vma_tables[pid];
+    len = page_align_up(len);
+    size_t np = (size_t)(len / PAGE_SIZE);
+
+    uint64_t base = find_free_region(vt, len);
+    if (!base) return -12;
+    struct mmap_vma *v = vma_alloc(vt);
+    if (!v) return -12;
+    v->start = base; v->end = base + len;
+    v->prot  = VMA_PROT_READ | VMA_PROT_WRITE;
+    v->flags = VMA_FLAG_SHARED | VMA_FLAG_NOFREE;
+    v->fd = -1; v->offset = 0;
+
+    uint32_t vmm_f = prot_to_vmm_flags(v->prot) | VMM_SHARED;
+    uint64_t saved = vmm_set_editor_root(p->cr3);
+    for (size_t i = 0; i < np; i++)
+        vmm_map(base + i * PAGE_SIZE, phys + (uint64_t)i * PAGE_SIZE,
+                PAGE_SIZE, vmm_f);
+    vmm_set_editor_root(saved);
+    return (long)base;
+}
+
 /* ==================================================================
  * MAP_SHARED file-backed page cache (slice 22).
  *

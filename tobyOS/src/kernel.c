@@ -73,6 +73,7 @@
 #include <tobyos/usb_hub.h>
 #include <tobyos/usb_hid.h>
 #include <tobyos/virtio_gpu.h>
+#include <tobyos/linux_drm.h>
 #include <tobyos/gpu_intel.h>
 #include <tobyos/gfx.h>
 #include <tobyos/mouse.h>
@@ -7422,6 +7423,100 @@ void _start(void) {
                     "deadlock is back)\n", rc == 3 ? "PASS" : "FAIL", rc);
         }
         sched_disable_ap_run();
+    }
+
+#ifdef EGLTEST_BOOT
+    /* Tier 3 Phase 1c (slice 98): drive REAL Mesa against /dev/dri and
+     * collect the gap list. Opt-in (-DEGLTEST_BOOT) because it needs the
+     * Mesa sysroot staged by programs/chromium/mesa.sh, which is a large
+     * payload nobody wants in an ordinary boot. The DELIVERABLE is the
+     * "[drm] UNHANDLED ioctl" set this produces, not the pass/fail.
+     * 3=virgl on the host GPU, 4=software fallback, 10..15=EGL step. */
+    {
+        const char *path = "/bin/linux-egltest";
+        char *argv[] = { (char *)"linux-egltest", 0 };
+        char *envp[] = {
+            (char *)"PATH=/bin",
+            (char *)"LD_LIBRARY_PATH=/opt/chrome/sysroot",
+            /* Point Mesa's loader at the staged gallium drivers and force
+             * the virgl one: without this it probes by PCI id and can
+             * silently pick swrast, which would read as "GPU absent". */
+            (char *)"LIBGL_DRIVERS_PATH=/opt/chrome/sysroot/dri",
+            (char *)"MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu",
+            (char *)"EGL_PLATFORM=surfaceless",
+            (char *)"LIBGL_DEBUG=verbose",
+            /* Debian's libEGL.so.1 is libglvnd, which finds Mesa only via
+             * a vendor ICD json. Without it every EGL call returns
+             * EGL_BAD_PARAMETER, and dlopening libEGL_mesa directly does
+             * not help either (a vendor library exports __egl_Main, not
+             * the public entry points). Point glvnd at the one we stage. */
+            (char *)"__EGL_VENDOR_LIBRARY_FILENAMES=/etc/egl_vendor.json",
+            0,
+        };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-egltest",
+            .argc = 1, .argv = argv, .envc = 7, .envp = envp,
+        };
+        kprintf("[boot] EGLTEST: spawning %s (Mesa -> /dev/dri gap list)\n",
+                path);
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[EGLTEST] VERDICT: SKIP reason=no-binary (run "
+                    "programs/chromium/mesa.sh + rebuild)\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[EGLTEST] VERDICT: %s exit=%d (3=virgl on host GPU; "
+                    "4=software fallback; 10=loader; 11..15=EGL step) -- "
+                    "the [drm] UNHANDLED lines above are the gap list\n",
+                    rc == 3 ? "PASS" : (rc == 4 ? "SOFTWARE" : "FAIL"), rc);
+            lxdrm_dump_stats();
+        }
+    }
+#endif
+
+    /* Tier 3 Phase 1b guard (slice 98): does the DRM render node actually
+     * drive real 3D? linux-drmtest walks /dev/dri/renderD128 the way Mesa's
+     * virgl driver does -- VERSION, GETPARAM(3D_FEATURES), GET_CAPS,
+     * CONTEXT_INIT, RESOURCE_CREATE, MAP+mmap, TRANSFER_TO_HOST,
+     * EXECBUFFER. It only means anything when QEMU is run with
+     * `-device virtio-gpu-gl-pci` AND the host has a working GL stack
+     * (logs/setup_angle.sh); without a 3D device /dev/dri does not exist
+     * and the guard reports SKIP, which is the correct answer, not a
+     * failure. PASS=3, 11..20 = the numbered step that failed. */
+    {
+        const char *path = "/bin/linux-drmtest";
+        char *argv[] = { (char *)"linux-drmtest", 0 };
+        char *envp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec spec = {
+            .path = path, .name = "linux-drmtest",
+            .argc = 1, .argv = argv, .envc = 1, .envp = envp,
+        };
+        /* No 3D device attached is the COMMON case (every run that does
+         * not pass -device virtio-gpu-gl-pci with a working host GL
+         * stack). Report that as SKIP, not FAIL: a guard whose verdict
+         * says "FAIL" for the expected configuration trains everyone to
+         * ignore it, which is how a real regression would slip past. */
+        bool have3d = lxdrm_available();
+        kprintf("[boot] DRMTEST: spawning %s (3D device %s)\n", path,
+                have3d ? "PRESENT" : "absent -- expect SKIP");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[DRMTEST] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            if (!have3d && rc == 11) {
+                kprintf("[DRMTEST] VERDICT: SKIP reason=no-3D-device "
+                        "(run QEMU with -device virtio-gpu-gl-pci and "
+                        "logs/setup_angle.sh on PATH to exercise it)\n");
+            } else {
+                kprintf("[DRMTEST] VERDICT: %s exit=%d (3=PASS real virgl 3D "
+                        "through /dev/dri; 11=open 12=VERSION 13=GETPARAM "
+                        "14=GET_CAPS 15=CONTEXT_INIT 16=RESOURCE_CREATE "
+                        "17=MAP/mmap 18=TRANSFER 19=EXECBUFFER "
+                        "20=GEM_CLOSE)\n", rc == 3 ? "PASS" : "FAIL", rc);
+                lxdrm_dump_stats();
+            }
+        }
     }
 
     /* ML-KEM computational-correctness test (slice 38): chrome's https is

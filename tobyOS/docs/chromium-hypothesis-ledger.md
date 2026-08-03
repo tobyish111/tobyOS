@@ -5587,3 +5587,109 @@ gate on `g_vgpu_active && virgl_enabled`, neither true during probe,
 hence this slice's probe-time twins. And a 3D-only device sets
 `three_d_only` and does NOT set `g_vgpu_bound`, so nothing in the
 display path can mistake it for a scanout provider.
+
+---
+
+## SLICE 98 — TIER 3 PHASE 1b DONE (real 3D through /dev/dri, proven), PHASE 1c OPENED with a live gap list; 1d still gated
+
+### Phase 1b: the DRM render node — DONE and PROVEN
+
+`grep -r DRM_IOCTL src/` returned nothing for this entire arc. It now
+returns a driver. New `src/linux_drm.c` (+ `include/tobyos/linux_drm.h`)
+implements the Linux **render-node** contract over virtio-gpu:
+
+| ioctl | behaviour |
+|---|---|
+| `DRM_IOCTL_VERSION` | reports driver name `virtio_gpu` (what Mesa matches on), with the two-pass length query Linux callers expect |
+| `DRM_IOCTL_GET_CAP` / `SET_CLIENT_CAP` | answered / accepted |
+| `VIRTGPU_GETPARAM` | 3D_FEATURES=1, CAPSET_QUERY_FIX, CONTEXT_INIT; BLOB/HOST_VISIBLE deliberately 0 (keeps Mesa on the classic path this layer serves); unknown ids log themselves |
+| `VIRTGPU_GET_CAPS` | fetches the REAL virglrenderer capability blob |
+| `VIRTGPU_CONTEXT_INIT` | lazily creates the 3D context |
+| `VIRTGPU_RESOURCE_CREATE` | RESOURCE_CREATE_3D + contiguous backing + ATTACH_BACKING + CTX_ATTACH, returns GEM + resource handles |
+| `VIRTGPU_MAP` + `mmap` | maps the BO's real DMA pages into the client (new `mmap_map_phys_user`, SHARED+NOFREE) — the mapping IS the buffer, not a shadow |
+| `VIRTGPU_TRANSFER_TO/FROM_HOST` | TRANSFER_*_3D |
+| `VIRTGPU_EXECBUFFER` | submits virgl command streams |
+| `VIRTGPU_WAIT`, `GEM_CLOSE` | synchronous-complete / release |
+| anything else | `[drm] UNHANDLED ioctl nr=0x..` — **the gap list**, once per number |
+
+Supporting virtio-gpu work: RESOURCE_CREATE_3D / CTX_ATTACH+DETACH /
+TRANSFER_*_3D / GET_CAPSET commands, a 3-descriptor `issue_cmd_payload`
+for buffers too large for the scratch page, SUBMIT_3D ceiling 4 KiB ->
+64 KiB (Mesa's streams are tens of KiB), and the 3D gate fixed:
+`g_vgpu_active && virgl_enabled` required the DISPLAY backend, which a
+slice-97 3D-only device never installs — now `vgpu_3d_ready()`.
+
+**PROOF — the DRMTEST guard (`programs/linux-drmtest`), PASS:**
+
+```
+[drm] open dri/renderD128 (virgl capset=1 max=308)
+[drmtest] driver name: virtio_gpu        [drmtest] 3D_FEATURES=1
+[drm] GET_CAPS id=0 ver=0 -> 308 bytes   [drmtest] caps non-zero bytes=70
+[drm] 3D context 2 created               [drmtest] bo_handle=1 res_handle=64
+[drmtest] BO mapped + coherent           [drmtest] TRANSFER_TO_HOST ok
+[drm] EXECBUFFER #1 size=8               [drmtest] EXECBUFFER ok
+[DRMTEST] VERDICT: PASS exit=3
+```
+
+Every step Mesa's virgl driver performs at start-up, answered by a real
+virglrenderer (70 non-zero bytes of genuine capability data). Zero
+`UNHANDLED` entries on that path.
+
+**Regression-checked:** plain `virtio-gpu-pci` unchanged (binds, scanout,
+cursor, `fb0` registered); a boot with NO GPU device reports **SKIP**,
+not FAIL (the verdict was fixed after the first run labelled the
+expected configuration as a failure — a guard that cries wolf in the
+common case trains everyone to ignore it); defboot clean.
+
+### Phase 1c: Mesa staged, and the gap list is LIVE
+
+`programs/chromium/mesa.sh` stages Debian bookworm's Mesa into the chrome
+sysroot (own script, never run by the Makefile — a GPU experiment must
+not destabilise the browser payload). Two traps worth recording: Debian
+hardlinks all 13 gallium drivers to ONE 25 MB blob, so a naive extractor
+staged exactly one driver and silently lost virgl (tarfile reports them
+as LNKTYPE, not files); and materialising them all costs ~330 MB, so the
+script prunes to virgl + swrast.
+
+`programs/linux-egltest` then drives REAL Mesa and reports what breaks.
+The list so far, in the order the runs produced it:
+
+1. **`libGLdispatch.so.0` missing** -> staged libglvnd. CLOSED.
+2. **glvnd returns EGL_BAD_PARAMETER for every call** -> it finds Mesa
+   only through a vendor ICD json; staged `/etc/egl_vendor.json` +
+   `__EGL_VENDOR_LIBRARY_FILENAMES`. CLOSED.
+3. **`libxcb-randr.so.0` missing** -> staged the xcb closure. CLOSED.
+4. **dlopening `libEGL_mesa.so.0` directly gives no `egl*` symbols** — a
+   glvnd VENDOR library exports `__egl_Main`, not the public API. Not a
+   bug: go through `libEGL.so.1`. CLOSED (understanding).
+5. **OPEN — the real one.** With glvnd wired up, `eglGetPlatformDisplay`
+   now succeeds (`display ok`) and `eglInitialize` fails 0x3001, and the
+   log shows why: Mesa loaded **`dri/swrast_dri.so`, never
+   `virtio_gpu_dri.so`, and never opened `/dev/dri` at all**.
+   `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` did not change that, because
+   the surfaceless platform first ENUMERATES devices
+   (libdrm `drmGetDevices2`) — which walks `/sys/class/drm/renderD*/…`
+   and lists `/dev/dri/`. We serve `open("/dev/dri/renderD128")` but
+   provide neither the directory listing nor the sysfs tree, so Mesa
+   concludes there is no GPU and falls back to software.
+
+**Next step is therefore well-localized:** make the DRM device
+DISCOVERABLE — `/dev/dri` as a listable directory plus the
+`/sys/class/drm/renderD128/device/{vendor,device,…}` nodes libdrm reads
+(the `/proc` + `/sys` machinery from Track B already exists) — then
+re-run the same guard and read the next entry.
+
+### Phase 1d: still gated, honestly
+
+No frame measurement is possible until Mesa actually binds the virgl
+driver. The slice-96 caveat stands: CPU raster already delivers ~40 fps
+against a ~52 Hz compositor ceiling and the binding constraint is the
+~20 ms ack cycle, so tier 3's near-term value is fidelity/WebGL/headroom
+rather than fps — measure before finishing the surface.
+
+### Method note
+
+The layer is named `lxdrm_*` in `src/linux_drm.c` because `src/gpu_drm.c`
+is an unrelated NATIVE display abstraction that also uses "drm"; two
+things called drm in one kernel is exactly the confusion this arc has
+paid for before.

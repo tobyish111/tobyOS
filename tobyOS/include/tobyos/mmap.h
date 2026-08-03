@@ -99,4 +99,9 @@ void *shm_cache_page_ptr(struct shm_cache *sc, size_t idx);
 long  shm_cache_mmap(struct shm_cache *sc, uint64_t addr, uint64_t len,
                      uint32_t prot, uint32_t flags, uint64_t offset);
 
+/* Slice 98: map a contiguous physical range into the calling process
+ * (SHARED+NOFREE). Used by /dev/dri to hand a GPU buffer object straight
+ * to userspace -- the mapping IS the DMA buffer, not a shadow. */
+long mmap_map_phys_user(uint64_t phys, uint64_t len);
+
 #endif /* TOBYOS_MMAP_H */

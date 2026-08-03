@@ -159,6 +159,7 @@ C_SRCS := src/kernel.c \
           src/usb_hid.c \
           src/usb_hub.c \
           src/virtio_gpu.c \
+          src/linux_drm.c \
           src/net.c \
           src/eth.c \
           src/arp.c \
@@ -1838,6 +1839,16 @@ programs/linux-demrace/linux-demrace.elf: programs/linux-demrace/main.c
 	      -Wl,-e,_start -o $@ $<
 	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
 
+# DRM render-node guard (tier 3 Phase 1b): walks /dev/dri/renderD128 the way
+# Mesa's virgl driver does -- VERSION, GETPARAM, GET_CAPS, CONTEXT_INIT,
+# RESOURCE_CREATE, MAP+mmap, TRANSFER_TO_HOST, EXECBUFFER -- so a real
+# virglrenderer answering is a PASS. Static Linux ELF.
+programs/linux-drmtest/linux-drmtest.elf: programs/linux-drmtest/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
 # CoW-fork STW deadlock guard (slice 92): hammer threads keep the kernel
 # writing user pages (clock_gettime out-params) while main fork()s over a
 # 256MB region; the old BKL-holding vm_quiesce park wedged the whole kernel
@@ -2468,6 +2479,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-mapshare/linux-mapshare.elf \
                programs/linux-demrace/linux-demrace.elf \
                programs/linux-qfreeze/linux-qfreeze.elf \
+               programs/linux-drmtest/linux-drmtest.elf \
                programs/linux-mlkem/linux-mlkem.elf \
                programs/linux-xstub/linux-xstub.elf \
                programs/linux-procfs/linux-procfs.elf \
@@ -2519,7 +2531,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                 initrd/etc/c19b.lua \
                 initrd/etc/c20.lua \
                 initrd/etc/c21.lua \
-               initrd/etc/motd initrd/etc/anim.html \
+               initrd/etc/motd initrd/etc/anim.html initrd/etc/egl_vendor.json \
                initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
                initrd/etc/Lato-BoldItalic.ttf initrd/etc/fallback.otf \
@@ -2541,6 +2553,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         $(INITRD_STAGE)/system/keys $(INITRD_STAGE)/m36
 	cp initrd/etc/motd                       $(INITRD_STAGE)/etc/motd
 	cp initrd/etc/anim.html                  $(INITRD_STAGE)/etc/anim.html
+	cp initrd/etc/egl_vendor.json            $(INITRD_STAGE)/etc/egl_vendor.json
 	cp initrd/etc/Lato-Regular.ttf           $(INITRD_STAGE)/etc/Lato-Regular.ttf
 	cp initrd/etc/Lato-Bold.ttf              $(INITRD_STAGE)/etc/Lato-Bold.ttf
 	cp initrd/etc/Lato-Italic.ttf            $(INITRD_STAGE)/etc/Lato-Italic.ttf
@@ -2608,6 +2621,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-mapshare/linux-mapshare.elf     $(INITRD_STAGE)/bin/linux-mapshare
 	cp programs/linux-demrace/linux-demrace.elf       $(INITRD_STAGE)/bin/linux-demrace
 	cp programs/linux-qfreeze/linux-qfreeze.elf       $(INITRD_STAGE)/bin/linux-qfreeze
+	cp programs/linux-drmtest/linux-drmtest.elf       $(INITRD_STAGE)/bin/linux-drmtest
 	cp programs/linux-mlkem/linux-mlkem.elf           $(INITRD_STAGE)/bin/linux-mlkem
 	cp programs/linux-xstub/linux-xstub.elf           $(INITRD_STAGE)/bin/linux-xstub
 	cp programs/linux-tty/linux-tty.elf               $(INITRD_STAGE)/bin/linux-tty
@@ -2832,6 +2846,13 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] Track B/B26: bundling DYNAMIC glibc proof +"      \
 	         "ld-linux-x86-64.so.2 + libc.so.6/libm.so.6 -- OPT-IN";     \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-glibc-dyn lib/ld-linux-x86-64.so.2 lib/libc.so.6 lib/libm.so.6"; \
+	fi;                                                                   \
+	if [ -f programs/linux-egltest/linux-egltest.elf ]; then              \
+	    cp programs/linux-egltest/linux-egltest.elf                       \
+	         $(INITRD_STAGE)/bin/linux-egltest;                           \
+	    echo "[initrd] tier 3 Phase 1c: bundling linux-egltest (drives"   \
+	         "staged Mesa against /dev/dri) -- OPT-IN";                   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-egltest";                    \
 	fi;                                                                   \
 	if [ -f programs/linux-fbgui/linux-fbgui.elf ] &&                    \
 	   [ -f programs/busybox/ld-musl-x86_64.so.1 ]; then                 \
@@ -3073,7 +3094,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
 	    bin/linux-scmsg bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
-	    bin/linux-qfreeze \
+	    bin/linux-qfreeze bin/linux-drmtest \
 	    bin/linux-xstub \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \
@@ -3115,7 +3136,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    repo/helloapp_caps_ro.tpkg                                        \
 	    system/keys/trust.db                                              \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
-	    etc/motd etc/anim.html etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
+	    etc/motd etc/anim.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    readme.txt $$EXTRA_FILES

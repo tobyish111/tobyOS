@@ -34,6 +34,7 @@
 #include <tobyos/gui.h>
 #include <tobyos/gfx.h>
 #include <tobyos/virtio_gpu.h>
+#include <tobyos/linux_drm.h>
 #include <tobyos/term.h>
 #include <tobyos/vfs.h>
 #include <tobyos/heap.h>
@@ -2186,6 +2187,18 @@ static long sys_open(const char *path, int flags, int mode) {
             if (!f) return -ABI_ENOENT;
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { file_close(f); return -ABI_EMFILE; }
+            return fd;
+        }
+        /* Slice 98 (tier 3 Phase 1b): the DRM render node. Mesa opens
+         * /dev/dri/renderD128 (and probes card0); both land here. When no
+         * virgl-capable device is bound we return ENOENT, which is exactly
+         * what a Linux box with no GPU does -- Mesa then falls back to
+         * software, rather than failing in some deeper, stranger way. */
+        if (strncmp(dev, "dri/", 4) == 0) {
+            struct file *f = lxdrm_open(dev);
+            if (!f) return -ABI_ENOENT;
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { kfree(f); return -ABI_EMFILE; }
             return fd;
         }
         /* Track B graphics: the Linux framebuffer device. */
@@ -8372,6 +8385,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (f->kind == FILE_KIND_EVDEV)
             return evdev_ioctl((unsigned)f->dir_off, (unsigned long)a2,
                                (unsigned long)a3);
+        if (f->kind == FILE_KIND_DRM)                 /* slice 98: /dev/dri */
+            return lxdrm_ioctl(f, (unsigned long)a2, (unsigned long)a3);
         return -ABI_ENOTTY;
     }
 
@@ -8390,6 +8405,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         struct file *mf = (fd >= 0) ? fd_lookup(fd) : NULL;
         if (mf && mf->kind == FILE_KIND_FB)          /* /dev/fb0 shadow scanout */
             ret = fbdev_mmap((uint64_t)a2);
+        else if (mf && mf->kind == FILE_KIND_DRM)    /* slice 98: a GPU BO */
+            ret = lxdrm_mmap(lx_mmap_offset(), (uint64_t)a2);
         else if (mf && mf->kind == FILE_KIND_MEMFD) { /* coherent shared memory */
             ret = memfd_map((uint64_t)a1, (uint64_t)a2, (uint32_t)a3,
                             lx_mmap_flags(lf), mf->memfd, lx_mmap_offset());

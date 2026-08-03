@@ -71,6 +71,28 @@ int  virtio_gpu_ctx_create(uint32_t ctx_id, const char *debug_name);
 void virtio_gpu_ctx_destroy(uint32_t ctx_id);
 int  virtio_gpu_submit_3d(uint32_t ctx_id, const void *cmd_buf, uint32_t cmd_size);
 
+/* Slice 98 (tier 3 Phase 1b): the 3D surface /dev/dri (drm.c) drives.
+ * All synchronous; the DRM layer owns handles and user copies. */
+int  virtio_gpu_get_capset(uint32_t capset_id, uint32_t version,
+                           void *out, uint32_t out_size);
+int  virtio_gpu_res_create_3d(uint32_t res_id, uint32_t target,
+                              uint32_t format, uint32_t bind,
+                              uint32_t width, uint32_t height, uint32_t depth,
+                              uint32_t array_size, uint32_t last_level,
+                              uint32_t nr_samples, uint32_t flags);
+int  virtio_gpu_ctx_resource(uint32_t ctx_id, uint32_t res_id, bool attach);
+int  virtio_gpu_res_attach_backing(uint32_t res_id, uint64_t entries_phys,
+                                   uint32_t nr_entries);
+int  virtio_gpu_transfer_3d(uint32_t ctx_id, uint32_t res_id, bool to_host,
+                            uint32_t x, uint32_t y, uint32_t z,
+                            uint32_t w, uint32_t h, uint32_t dpt,
+                            uint64_t offset, uint32_t level,
+                            uint32_t stride, uint32_t layer_stride);
+/* Capset advertised by the bound device (0 if none) -- the DRM layer
+ * reports it through VIRTGPU_GETPARAM/GET_CAPS. */
+uint32_t virtio_gpu_capset_id(void);
+uint32_t virtio_gpu_capset_max_size(void);
+
 /* ---- Per-window GPU resource API --------------------------------
  *
  * Each GUI window can own a VirtIO-GPU 2D resource backed by physically

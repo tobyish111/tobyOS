@@ -188,6 +188,13 @@ enum {
 
     VIRTIO_GPU_CMD_CTX_CREATE              = 0x0200,
     VIRTIO_GPU_CMD_CTX_DESTROY             = 0x0201,
+    /* Slice 98 (Phase 1b): the rest of the 3D command set, driven by
+     * /dev/dri (drm.c) on behalf of Mesa's virgl driver. */
+    VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE     = 0x0202,
+    VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE     = 0x0203,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_3D      = 0x0204,
+    VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D     = 0x0205,
+    VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D   = 0x0206,
     VIRTIO_GPU_CMD_SUBMIT_3D               = 0x0207,
 
     VIRTIO_GPU_CMD_UPDATE_CURSOR           = 0x0300,
@@ -212,6 +219,11 @@ enum {
 /* Slice 97: the context id the Phase-1a 3D handshake opens (and closes).
  * Real per-client contexts get allocated by the /dev/dri layer later. */
 #define VG_3D_CTX_ID  1u
+
+/* Slice 98: SUBMIT_3D bounce buffer. 64 KiB of physically contiguous
+ * pages; the usable stream is that minus the submit header. */
+#define VG_CMD3D_PAGES 16u
+#define VG_CMD3D_MAX   ((VG_CMD3D_PAGES * 4096u) - 64u)
 #define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM   1
 
 struct __attribute__((packed)) virtio_gpu_ctrl_hdr {
@@ -324,6 +336,50 @@ struct __attribute__((packed)) virtio_gpu_ctx_create {
     char     debug_name[64];
 };
 
+/* Slice 98 (Phase 1b): 3D resource + transfer + capset-fetch structs. */
+struct __attribute__((packed)) virtio_gpu_resource_create_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t target;
+    uint32_t format;
+    uint32_t bind;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t array_size;
+    uint32_t last_level;
+    uint32_t nr_samples;
+    uint32_t flags;
+    uint32_t padding;
+};
+
+struct __attribute__((packed)) virtio_gpu_ctx_resource {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+};
+
+struct __attribute__((packed)) virtio_gpu_box {
+    uint32_t x, y, z;
+    uint32_t w, h, d;
+};
+
+struct __attribute__((packed)) virtio_gpu_transfer_host_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_box box;
+    uint64_t offset;
+    uint32_t resource_id;
+    uint32_t level;
+    uint32_t stride;
+    uint32_t layer_stride;
+};
+
+struct __attribute__((packed)) virtio_gpu_get_capset {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t capset_id;
+    uint32_t capset_version;
+};
+
 struct __attribute__((packed)) virtio_gpu_ctx_destroy {
     struct virtio_gpu_ctrl_hdr hdr;
 };
@@ -416,7 +472,10 @@ struct vgpu_dev {
     /* Slice 97: bound for 3D only -- the device's scanout belongs to
      * virglrenderer, so it does NO display duty here (see the probe). */
     bool            three_d_only;
-    uint64_t        cmd3d_phys;     /* 2-page DMA buffer for SUBMIT_3D */
+    uint32_t        capset_id;        /* slice 98: reported via DRM GETPARAM */
+    uint32_t        capset_max_ver;
+    uint32_t        capset_max_size;
+    uint64_t        cmd3d_phys;     /* DMA bounce buffer for SUBMIT_3D */
     uint8_t        *cmd3d_virt;
 
     /* M27F: per-region transfer counters. Surfaced via describe() so
@@ -685,6 +744,64 @@ static bool issue_cmd(struct vgpu_dev *d,
         __asm__ volatile ("pause" ::: "memory");
     }
     kprintf("[virtio-gpu] issue_cmd timed out (req_type=0x%x)\n",
+            ((const struct virtio_gpu_ctrl_hdr *)req_buf)->type);
+    return false;
+}
+
+/* Slice 98 (Phase 1b): issue a command whose PAYLOAD does not fit in the
+ * scratch page. Mesa hands us virgl command streams of many KiB, and
+ * TRANSFER_*_3D needs the guest data pages themselves; both are passed as
+ * a second device-readable descriptor rather than copied into scratch.
+ * Chain: [hdr (scratch, R)] -> [payload (caller phys, R)] -> [resp
+ * (scratch, W)]. payload_write=true flips the payload descriptor to
+ * device-writable (TRANSFER_FROM_HOST_3D reads back into guest memory). */
+static bool issue_cmd_payload(struct vgpu_dev *d,
+                              const void *req_buf, size_t req_len,
+                              uint64_t payload_phys, size_t payload_len,
+                              bool payload_write,
+                              void *resp_buf, size_t resp_len) {
+    if (!req_buf || !resp_buf || req_len == 0 || resp_len == 0) return false;
+    if (!payload_phys || payload_len == 0)
+        return issue_cmd(d, req_buf, req_len, resp_buf, resp_len);
+
+    uint8_t *r_req  = (uint8_t *)req_buf;
+    uint8_t *r_resp = (uint8_t *)resp_buf;
+    if (r_req  < d->scratch_virt || r_req  >= d->scratch_virt + PAGE_SIZE ||
+        r_resp < d->scratch_virt || r_resp >= d->scratch_virt + PAGE_SIZE) {
+        kprintf("[virtio-gpu] issue_cmd_payload: hdr/resp outside scratch\n");
+        return false;
+    }
+    uint64_t req_phys  = d->scratch_phys + (uint64_t)(r_req  - d->scratch_virt);
+    uint64_t resp_phys = d->scratch_phys + (uint64_t)(r_resp - d->scratch_virt);
+
+    d->desc[0].addr  = req_phys;
+    d->desc[0].len   = (uint32_t)req_len;
+    d->desc[0].flags = VQ_DESC_F_NEXT;
+    d->desc[0].next  = 1;
+
+    d->desc[1].addr  = payload_phys;
+    d->desc[1].len   = (uint32_t)payload_len;
+    d->desc[1].flags = VQ_DESC_F_NEXT | (payload_write ? VQ_DESC_F_WRITE : 0);
+    d->desc[1].next  = 2;
+
+    d->desc[2].addr  = resp_phys;
+    d->desc[2].len   = (uint32_t)resp_len;
+    d->desc[2].flags = VQ_DESC_F_WRITE;
+    d->desc[2].next  = 0;
+
+    d->avail_ring[d->avail_idx % d->qsize] = 0;
+    d->avail_idx++;
+    *d->avail_idx_ptr = d->avail_idx;
+    *d->notify = 0;
+
+    for (uint32_t spins = 0; spins < 50000000u; spins++) {
+        if (*d->used_idx_ptr != d->used_idx) {
+            d->used_idx++;
+            return true;
+        }
+        __asm__ volatile ("pause" ::: "memory");
+    }
+    kprintf("[virtio-gpu] issue_cmd_payload timed out (req_type=0x%x)\n",
             ((const struct virtio_gpu_ctrl_hdr *)req_buf)->type);
     return false;
 }
@@ -1678,6 +1795,11 @@ static int virtio_gpu_probe(struct pci_dev *dev) {
         if (d->virgl_supported) {
             uint32_t cid = 0, ver = 0, csz = 0;
             bool caps = cmd_get_capset_info(d, 0, &cid, &ver, &csz);
+            if (caps) {
+                d->capset_id       = cid;   /* slice 98: for DRM GET_CAPS */
+                d->capset_max_ver  = ver;
+                d->capset_max_size = csz;
+            }
             bool ctx  = cmd_ctx_create_probe(d, VG_3D_CTX_ID, "tobyos-t3");
             kprintf("[virtio-gpu] 3D-ONLY mode: scanout is virgl-owned "
                     "(2D SET_SCANOUT refused, expected). capset%s",
@@ -1821,12 +1943,28 @@ void virtio_gpu_install_backend(void) {
 
 /* ---- VirGL 3D foundation (Phase 3) ----------------------------- */
 
+/* Slice 98 (Phase 1b): the 3D gate. The original block required
+ * g_vgpu_active -- "the DISPLAY backend is installed" -- which is false
+ * for the 3D-ONLY device slice 97 introduced (its scanout belongs to
+ * virglrenderer, so it never becomes the gfx backend). 3D readiness is
+ * about the virgl pipe, not display duty. */
+static inline bool vgpu_3d_ready(void) {
+    return g_vgpu.virgl_enabled && (g_vgpu_active || g_vgpu.three_d_only);
+}
+
+uint32_t virtio_gpu_capset_id(void) {
+    return vgpu_3d_ready() ? g_vgpu.capset_id : 0;
+}
+uint32_t virtio_gpu_capset_max_size(void) {
+    return vgpu_3d_ready() ? g_vgpu.capset_max_size : 0;
+}
+
 bool virtio_gpu_virgl_available(void) {
-    return g_vgpu_active && g_vgpu.virgl_enabled;
+    return vgpu_3d_ready();
 }
 
 int virtio_gpu_ctx_create(uint32_t ctx_id, const char *debug_name) {
-    if (!g_vgpu_active || !g_vgpu.virgl_enabled) return -1;
+    if (!vgpu_3d_ready()) return -1;
 
     struct vgpu_dev *d = &g_vgpu;
     struct virtio_gpu_ctx_create *req =
@@ -1856,7 +1994,7 @@ int virtio_gpu_ctx_create(uint32_t ctx_id, const char *debug_name) {
 }
 
 void virtio_gpu_ctx_destroy(uint32_t ctx_id) {
-    if (!g_vgpu_active || !g_vgpu.virgl_enabled) return;
+    if (!vgpu_3d_ready()) return;
 
     struct vgpu_dev *d = &g_vgpu;
     struct virtio_gpu_ctx_destroy *req =
@@ -1876,10 +2014,183 @@ void virtio_gpu_ctx_destroy(uint32_t ctx_id) {
     }
 }
 
+/* ---- Slice 98 (Phase 1b): the rest of the 3D surface, for drm.c ----
+ *
+ * These are the virtio-gpu commands Mesa's virgl driver reaches through
+ * /dev/dri: fetch the host capability blob, create/attach 3D resources,
+ * and move pixel data in both directions. Each is a thin, synchronous
+ * wrapper -- the DRM layer owns handle allocation and user copies. */
+
+int virtio_gpu_get_capset(uint32_t capset_id, uint32_t version,
+                          void *out, uint32_t out_size) {
+    if (!vgpu_3d_ready() || !out || out_size == 0) return -1;
+    /* The response is hdr + blob and must fit the scratch response area. */
+    if (out_size > (PAGE_SIZE - SCRATCH_RESP_OFF) - sizeof(struct virtio_gpu_ctrl_hdr))
+        return -1;
+
+    struct vgpu_dev *d = &g_vgpu;
+    struct virtio_gpu_get_capset *req =
+        (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp =
+        (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req, 0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp) + out_size);
+    req->hdr.type       = VIRTIO_GPU_CMD_GET_CAPSET;
+    req->capset_id      = capset_id;
+    req->capset_version = version;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp) + out_size))
+        return -1;
+    if (resp->type != VIRTIO_GPU_RESP_OK_CAPSET) {
+        kprintf("[virtio-gpu] GET_CAPSET(%u,%u) bad response type=0x%x\n",
+                capset_id, version, resp->type);
+        return -1;
+    }
+    memcpy(out, (const uint8_t *)resp + sizeof(*resp), out_size);
+    return 0;
+}
+
+int virtio_gpu_res_create_3d(uint32_t res_id, uint32_t target,
+                             uint32_t format, uint32_t bind,
+                             uint32_t width, uint32_t height, uint32_t depth,
+                             uint32_t array_size, uint32_t last_level,
+                             uint32_t nr_samples, uint32_t flags) {
+    if (!vgpu_3d_ready()) return -1;
+    struct vgpu_dev *d = &g_vgpu;
+    struct virtio_gpu_resource_create_3d *req =
+        (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp =
+        (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req, 0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    req->resource_id = res_id;
+    req->target      = target;
+    req->format      = format;
+    req->bind        = bind;
+    req->width       = width;
+    req->height      = height;
+    req->depth       = depth;
+    req->array_size  = array_size;
+    req->last_level  = last_level;
+    req->nr_samples  = nr_samples;
+    req->flags       = flags;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return -1;
+    if (resp->type != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("[virtio-gpu] RESOURCE_CREATE_3D(%u) bad response 0x%x\n",
+                res_id, resp->type);
+        return -1;
+    }
+    return 0;
+}
+
+int virtio_gpu_ctx_resource(uint32_t ctx_id, uint32_t res_id, bool attach) {
+    if (!vgpu_3d_ready()) return -1;
+    struct vgpu_dev *d = &g_vgpu;
+    struct virtio_gpu_ctx_resource *req =
+        (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp =
+        (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req, 0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type    = attach ? VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE
+                              : VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
+    req->hdr.ctx_id  = ctx_id;
+    req->resource_id = res_id;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return -1;
+    return (resp->type == VIRTIO_GPU_RESP_OK_NODATA) ? 0 : -1;
+}
+
+/* Attach guest pages as the backing store of a 3D resource. `entries`
+ * points at an array of {phys,len,pad} triples already laid out by the
+ * caller in a DMA-visible buffer (drm.c builds it from the GEM object's
+ * page list). */
+int virtio_gpu_res_attach_backing(uint32_t res_id, uint64_t entries_phys,
+                                  uint32_t nr_entries) {
+    if (!vgpu_3d_ready() || !entries_phys || nr_entries == 0) return -1;
+    struct vgpu_dev *d = &g_vgpu;
+    struct virtio_gpu_resource_attach_backing *req =
+        (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp =
+        (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req, 0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type     = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    req->resource_id  = res_id;
+    req->nr_entries   = nr_entries;
+
+    /* The struct carries entries[1] inline for the 2D single-entry path;
+     * here the entry ARRAY rides its own descriptor, so the header part
+     * we send stops right before it. */
+    const size_t hdr_len = sizeof(*req) - sizeof(struct virtio_gpu_mem_entry);
+    if (!issue_cmd_payload(d, req, hdr_len,
+                           entries_phys,
+                           (size_t)nr_entries * sizeof(struct virtio_gpu_mem_entry),
+                           false, resp, sizeof(*resp)))
+        return -1;
+    if (resp->type != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("[virtio-gpu] 3D ATTACH_BACKING(%u) bad response 0x%x\n",
+                res_id, resp->type);
+        return -1;
+    }
+    return 0;
+}
+
+int virtio_gpu_transfer_3d(uint32_t ctx_id, uint32_t res_id, bool to_host,
+                           uint32_t x, uint32_t y, uint32_t z,
+                           uint32_t w, uint32_t h, uint32_t dpt,
+                           uint64_t offset, uint32_t level,
+                           uint32_t stride, uint32_t layer_stride) {
+    if (!vgpu_3d_ready()) return -1;
+    struct vgpu_dev *d = &g_vgpu;
+    struct virtio_gpu_transfer_host_3d *req =
+        (void *)(d->scratch_virt + SCRATCH_REQ_OFF);
+    struct virtio_gpu_ctrl_hdr *resp =
+        (void *)(d->scratch_virt + SCRATCH_RESP_OFF);
+
+    memset(req, 0, sizeof(*req));
+    memset(resp, 0, sizeof(*resp));
+    req->hdr.type     = to_host ? VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D
+                                : VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    req->hdr.ctx_id   = ctx_id;
+    req->box.x = x; req->box.y = y; req->box.z = z;
+    req->box.w = w; req->box.h = h; req->box.d = dpt;
+    req->offset       = offset;
+    req->resource_id  = res_id;
+    req->level        = level;
+    req->stride       = stride;
+    req->layer_stride = layer_stride;
+
+    if (!issue_cmd(d, req, sizeof(*req), resp, sizeof(*resp))) return -1;
+    if (resp->type != VIRTIO_GPU_RESP_OK_NODATA) {
+        kprintf("[virtio-gpu] TRANSFER_%s_3D(%u) bad response 0x%x\n",
+                to_host ? "TO" : "FROM", res_id, resp->type);
+        return -1;
+    }
+    return 0;
+}
+
 int virtio_gpu_submit_3d(uint32_t ctx_id,
                          const void *cmd_buf, uint32_t cmd_size) {
-    if (!g_vgpu_active || !g_vgpu.virgl_enabled) return -1;
-    if (!cmd_buf || cmd_size == 0 || cmd_size > 4096) return -1;
+    if (!vgpu_3d_ready()) return -1;
+    /* Slice 98: Mesa's virgl driver emits command streams far larger
+     * than the original 4 KiB ceiling (state emission for a single draw
+     * routinely runs tens of KiB). VG_CMD3D_PAGES sizes the bounce
+     * buffer; a stream past that is rejected loudly rather than
+     * truncated -- a silently clipped command stream would corrupt the
+     * host's virgl state in ways that are very hard to trace back. */
+    if (!cmd_buf || cmd_size == 0 || cmd_size > VG_CMD3D_MAX) {
+        if (cmd_buf && cmd_size > VG_CMD3D_MAX)
+            kprintf("[virtio-gpu] SUBMIT_3D too large: %u > %u max\n",
+                    cmd_size, (unsigned)VG_CMD3D_MAX);
+        return -1;
+    }
 
     struct vgpu_dev *d = &g_vgpu;
 
@@ -1888,7 +2199,7 @@ int virtio_gpu_submit_3d(uint32_t ctx_id,
      * buffer -- up to sizeof(virtio_gpu_cmd_submit) + 4096 bytes,
      * which exceeds a single page; two contiguous pages are plenty. */
     if (!d->cmd3d_virt) {
-        d->cmd3d_phys = pmm_alloc_pages(2);
+        d->cmd3d_phys = pmm_alloc_pages(VG_CMD3D_PAGES);
         if (!d->cmd3d_phys) {
             kprintf("[virtio-gpu] OOM allocating SUBMIT_3D DMA buffer\n");
             return -1;
