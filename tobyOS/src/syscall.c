@@ -4599,6 +4599,20 @@ static bool gpupath(const char *p) {
            strncmp(p, "/sys/devices/pci", 16) == 0 ||
            strncmp(p, "/dev/dri", 8) == 0;
 }
+/* Slice 104: is `path` one of our DRM nodes? Returns the char-device
+ * minor (renderD128 -> 128, card0 -> 0) or -1. MEASURED need: the
+ * [gpupath] trace showed `stat /dev/dri/card0 -> -1`, because the nodes
+ * live only in the open() handler and vfs_stat has never heard of them.
+ * Anything that stats a node BY NAME before opening it -- which is what
+ * device enumeration does for every directory entry -- saw ENOENT. */
+static int lx_dev_dri_minor(const char *path) {
+    if (!path || strncmp(path, "/dev/dri/", 9) != 0) return -1;
+    const char *leaf = path + 9;
+    if (strcmp(leaf, "renderD128") == 0) return 128;
+    if (strcmp(leaf, "card0") == 0)      return 0;
+    return -1;
+}
+
 static void gputrace(const char *op, const char *path, long rc) {
     static int n;
     if (!gpupath(path) || n >= 120) return;
@@ -4614,6 +4628,8 @@ static inline uint64_t lx_makedev(uint32_t maj, uint32_t min) {
 
 static long linux_emit_chrdev_stat(uint32_t maj, uint32_t min, uint64_t ino,
                                    void *ubuf) {
+    { static int n; if (n < 24) { n++;
+        kprintf("[drmstat] chrdev emit %u:%u mode=S_IFCHR|0666\n", maj, min); } }
     struct lx_stat st;
     memset(&st, 0, sizeof st);
     st.st_mode    = 0x2000u | 0666u;          /* S_IFCHR | rw-rw-rw- */
@@ -8064,6 +8080,14 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
         if (rr) return rr;
+        {   /* slice 104: DRM nodes stat as char devices, by path too. */
+            int dmin = lx_dev_dri_minor(kpath);
+            if (dmin >= 0 && lxdrm_available()) {
+                gputrace("stat", kpath, 0);
+                return linux_emit_chrdev_stat(DRM_CHR_MAJOR, (uint32_t)dmin,
+                                              lx_ino_hash(kpath), (void *)a2);
+            }
+        }
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
         gputrace("stat", kpath, sr);
@@ -8103,6 +8127,14 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path_at((int)a1, upath, kpath, sizeof kpath);
         if (rr) return rr;
+        {   /* slice 104: see the LX_stat note. */
+            int dmin = lx_dev_dri_minor(kpath);
+            if (dmin >= 0 && lxdrm_available()) {
+                gputrace("newfstatat", kpath, 0);
+                return linux_emit_chrdev_stat(DRM_CHR_MAJOR, (uint32_t)dmin,
+                                              lx_ino_hash(kpath), (void *)a3);
+            }
+        }
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
         gputrace("newfstatat", kpath, sr);
@@ -8113,6 +8145,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_fstat: {                   /* (fd, struct stat*) */
         struct file *f = fd_lookup((int)a1);
         if (!f) return -ABI_EBADF;
+        { static int n; if (f->kind == FILE_KIND_DRM && n < 12) { n++;
+            kprintf("[drmstat] LX_fstat on DRM fd=%d\n", (int)a1); } }
         struct vfs_stat vs;
         if (f->kind == FILE_KIND_DRM)         /* slice 99: S_IFCHR 226:128 */
             return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
@@ -8759,6 +8793,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     }
 
     case LX_statx: {                   /* (dirfd, path, flags, mask, statxbuf) */
+        { static int n; struct file *sf = ((int)a1 >= 0) ? fd_lookup((int)a1) : 0;
+          if (sf && sf->kind == FILE_KIND_DRM && n < 12) { n++;
+            kprintf("[drmstat] LX_statx on DRM fd=%d\n", (int)a1); } }
         const char *upath = (const char *)a2;
         char probe[2] = {0, 0};
         if (upath) (void)strncpy_from_user(probe, upath, sizeof probe);
@@ -8792,8 +8829,20 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path(upath, kpath, sizeof kpath);
         if (rr) return rr;
+        {   /* Slice 104: DRM nodes stat as char devices here too -- and
+             * TRACE it. glibc's stat() compiles to statx on modern
+             * builds, so this branch was the blind spot that hid
+             * libdrm's sysfs probes from [gpupath] entirely. */
+            int dmin = lx_dev_dri_minor(kpath);
+            if (dmin >= 0 && lxdrm_available()) {
+                gputrace("statx", kpath, 0);
+                return linux_emit_chrdev_stat(DRM_CHR_MAJOR, (uint32_t)dmin,
+                                              lx_ino_hash(kpath), (void *)a5);
+            }
+        }
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
+        gputrace("statx", kpath, sr);
         if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
         if (sr != VFS_OK)        return -ABI_EACCES;
         return linux_emit_statx(&vs, lx_ino_hash(kpath), (void *)a5);

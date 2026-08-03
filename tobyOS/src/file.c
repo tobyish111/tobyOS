@@ -270,6 +270,16 @@ struct file *file_clone(struct file *src) {
          * so a clone just remembers which device it reads. */
         f->dir_off = src->dir_off;
         break;
+    case FILE_KIND_DRM:
+        /* Slice 104: dir_off holds the DRM char-device MINOR (renderD128
+         * -> 128, card0 -> 0), and the whole device is global state, so a
+         * clone only has to remember which node it is. Without this case
+         * the switch fell through and left dir_off = 0, so every DUP of a
+         * render node stat'd as minor 0 -- and Mesa dups the fd
+         * (os_dupfd_cloexec) before probing it, which sent libdrm looking
+         * for /sys/dev/char/226:0 instead of 226:128. */
+        f->dir_off = src->dir_off;
+        break;
     }
     return f;
 }

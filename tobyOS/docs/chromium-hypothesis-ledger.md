@@ -6017,3 +6017,60 @@ instrument-first, which is the only thing that has actually worked on
 this front.
 
 defboot clean.
+
+---
+
+## SLICE 104 — a real dup() bug found, path-stat for `/dev/dri/*`, and the statx blind spot closed: libdrm's enumeration now RUNS AND SUCCEEDS end-to-end
+
+Three fixes, every one derived from the `[gpupath]`/`[drmstat]` traces
+rather than from reading Mesa's source.
+
+**1. `file_clone()` had no case for `FILE_KIND_DRM` — a genuine bug.**
+The switch fell through, leaving `dir_off = 0`, so **every `dup()` of a
+render node stat'd as minor 0 (card0) instead of 128**. Mesa dups the fd
+(`os_dupfd_cloexec`) before probing it, which sent libdrm looking for
+`/sys/dev/char/226:0/...`. The trace had been showing a stray
+`chrdev emit 226:0` all along.
+
+**2. Path-based `stat()` of `/dev/dri/*` now answers.** The nodes lived
+only in the `open()` handler, so `stat("/dev/dri/renderD128")` returned
+ENOENT — and enumeration stats every entry by name before opening it.
+Added to `LX_stat`/`lstat`, `newfstatat` and `statx`.
+
+**3. The instrument had a blind spot, which is why slices 99-103 kept
+guessing.** glibc's `stat()` compiles to **statx** on modern builds, and
+`[gpupath]` did not trace the statx path at all. Every sysfs probe
+libdrm made was invisible. With statx traced, the picture appeared
+immediately.
+
+**MEASURED RESULT — libdrm's enumeration now works end to end:**
+
+```
+[gpupath] stat     /dev/dri/card0                      -> 0
+[gpupath] stat     /sys/dev/char/226:0/device/drm      -> -1   (card0: no node, correct)
+[gpupath] stat     /dev/dri/renderD128                 -> 0
+[gpupath] stat     /sys/dev/char/226:128/device/drm    -> 0    (node validated)
+[gpupath] readlink /sys/dev/char/226:128/device/subsystem -> 0 (bus type resolved)
+[gpupath] readlink /sys/dev/char/226:128              -> -5   (VFS_ERR_INVAL -> EINVAL: correct, it is not a link)
+```
+
+Every step of `drmGetDevice2`'s validation — node identity, DRM-ness,
+bus type — now succeeds against our kernel. **This is the machinery
+slices 99/100/102 built, finally being exercised**; it was never
+reachable before because the fd/path stats underneath it were wrong.
+Those slices were premature, not wrong.
+
+**Still open, and honestly narrower than before:** the EGLTEST client's
+own Mesa still reports `failed to retrieve device information` *without*
+performing any of the above accesses, while the later probe in the same
+boot performs all of them successfully. Two runs differing in behaviour
+inside one boot is a strong, cheap lead:
+
+* the client sets `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` and
+  `LIBGL_DRIVERS_PATH`; the other consumer does not. **A/B those two
+  env vars first** — one run, no code change.
+* if that is not it, trace `dup`/`fcntl(F_DUPFD)` on DRM fds; the
+  client's fd goes through gbm, which dups.
+
+**Regressions:** DRMTEST PASS; defboot clean; `gbm_create_device -> ok`
+still holds.
