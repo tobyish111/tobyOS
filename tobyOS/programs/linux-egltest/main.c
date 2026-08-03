@@ -34,6 +34,8 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 typedef void *EGLDisplay;
 typedef void *EGLConfig;
@@ -84,9 +86,40 @@ static void *bind_sym(void *h, const char *name) {
     return s;
 }
 
+/* Slice 100: ground-truth check of the sysfs tree libdrm validates a DRM
+ * fd against. Theorising about which file libdrm wants is exactly the
+ * mistake this arc keeps paying for -- ask the kernel directly and print
+ * the answers, so the next step is chosen from data. */
+static void probe_sysfs(void) {
+    static const char *paths[] = {
+        "/sys/dev/char/226:128",
+        "/sys/dev/char/226:128/device",
+        "/sys/dev/char/226:128/device/drm",
+        "/sys/dev/char/226:128/device/vendor",
+        "/sys/dev/char/226:128/device/uevent",
+    };
+    struct stat st;
+    for (unsigned i = 0; i < sizeof(paths)/sizeof(paths[0]); i++)
+        printf("[egltest] stat %-42s %s\n", paths[i],
+               stat(paths[i], &st) == 0 ? "OK" : "MISSING");
+    char lnk[128];
+    long n = readlink("/sys/dev/char/226:128/device/subsystem", lnk,
+                      sizeof(lnk) - 1);
+    if (n > 0) { lnk[n] = 0; printf("[egltest] readlink subsystem -> %s\n", lnk); }
+    else       { printf("[egltest] readlink subsystem FAILED\n"); }
+    int fd = open("/sys/dev/char/226:128/device/vendor", O_RDONLY);
+    if (fd >= 0) {
+        char b[32]; long r = read(fd, b, sizeof(b) - 1);
+        if (r > 0) { b[r] = 0; printf("[egltest] vendor file: %s", b); }
+        close(fd);
+    }
+    fflush(stdout);
+}
+
 int main(void) {
     printf("[egltest] start\n");
     fflush(stdout);
+    probe_sysfs();
 
     /* Debian's libEGL.so.1 is libglvnd, which finds its vendor driver
      * through /usr/share/glvnd/egl_vendor.d/*.json. Without that config

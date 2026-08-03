@@ -5769,3 +5769,79 @@ TRANSFER->EXECBUFFER->GEM_CLOSE walk, ioctls #3-11 above, all rc=0);
 defboot clean.
 
 **Phase 1d remains gated** on entry #8, for the same reason as before.
+
+---
+
+## SLICE 100 — sysfs grew a DRM device tree + symlink support (kept, correct); the "libdrm sysfs validation is the blocker" theory is RETRACTED — it was not
+
+Slice 99 ended by naming libdrm's `drmGetDevice2(fd)` sysfs walk as the
+remaining block. This slice built exactly that and **it did not change
+the outcome**, so the theory is retracted rather than patched around.
+
+**Built and kept (all correct, all needed eventually):**
+ * `sysfs_add_link()` + a `readlink` op in sysfs — the tree served only
+   files and directories before, and libdrm keys bus type on
+   `readlink(".../device/subsystem")`.
+ * `/sys/dev/char/226:128/device/` with `drm/`, `subsystem ->
+   ../../../bus/pci`, `vendor`, `device`, `revision`,
+   `subsystem_vendor`, `subsystem_device`, `uevent` (with
+   `PCI_SLOT_NAME=0000:00:04.0`), and `config` — the 64-byte BINARY PCI
+   header, which is what Linux libdrm actually reads
+   (`drmParsePciDeviceInfo` opens `config`, not the text files).
+ * Node cap 64 -> 96.
+
+**A real bug found on the way, worth the slice by itself:** the first
+`sysfs_readlink` returned the LENGTH, but `vfs_readlink`'s callers test
+`rc != VFS_OK` and measure the buffer themselves. Every *successful*
+readlink therefore reported failure. The in-guest probe caught it
+immediately.
+
+**VERIFIED BY IN-GUEST PROBE (not by inference):** the client now stats
+and reads the tree itself and prints the results —
+
+```
+stat /sys/dev/char/226:128                      OK
+stat /sys/dev/char/226:128/device               OK
+stat /sys/dev/char/226:128/device/drm           OK
+stat /sys/dev/char/226:128/device/vendor        OK
+stat /sys/dev/char/226:128/device/uevent        OK
+readlink subsystem -> ../../../bus/pci
+vendor file: 0x1af4
+```
+
+Everything libdrm asks for is present and correct. **And Mesa still
+falls back to swrast.**
+
+**WHAT IS ACTUALLY KNOWN, stated without theory:**
+ 1. Mesa opens our node and issues exactly two `VERSION` ioctls, both
+    rc=0 (libdrm's normal two-pass `drmGetVersion`).
+ 2. Mesa uses the name we return to dlopen **`virtio_gpu_dri.so`** — the
+    real virgl driver.
+ 3. ~40 ms later it dlopens `swrast_dri.so`, having issued **zero**
+    further ioctls on our fd.
+ 4. The sysfs tree is complete and readable (above).
+
+So the rejection happens inside the virgl driver's screen/winsys
+creation, before it touches the device, and it is NOT (or not only) the
+sysfs validation this slice implemented.
+
+**NEXT INSTRUMENT, and it is the obvious one: capture the child's
+STDERR.** `LIBGL_DEBUG=verbose` is already set and Mesa explains these
+refusals in detail on stderr (`EGL_LOG_LEVEL=debug` adds more), but the
+boot harness only surfaces the client's stdout — Mesa has very probably
+been telling us the answer for three runs and we have not been reading
+it. Wire the spawned process's stderr into the serial log, re-run, and
+let Mesa name its own reason instead of inferring it from ioctl
+absence. (Every previous wall in this arc fell to an instrument, not to
+a guess; this is the same shape.)
+
+**Regressions:** DRMTEST still PASS (ioctls #3-11, all rc=0); defboot
+clean; the new sysfs nodes are inert for everything else.
+
+**METHOD NOTE.** Two slices in a row I named a mechanism from reading
+someone else's source rather than from a measurement, and both times the
+fix built on it did not move the result (96b's VIRGL un-ack, 99's sysfs
+walk). The pattern is clear enough to write down: *a mechanism inferred
+from third-party source is a hypothesis with a test attached, never a
+diagnosis* — and the cheap test here was always "make the other program
+tell you", which is what the next step finally does.
