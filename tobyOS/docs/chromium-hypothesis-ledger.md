@@ -6147,3 +6147,106 @@ CPU-raster baseline of ~40 fps / ~20 ms ack cycle. The slice-96 caveat
 stands: the binding constraint may still be the CDP loop, in which case
 tier 3's value is fidelity/WebGL rather than frame rate — but now it can
 be measured instead of argued.
+
+---
+
+## SLICE 106 — **TIER 3 PHASE 1d: THE MEASURE-FIRST GATE RETURNS AN ANSWER, AND IT IS "NO".** Chrome cannot consume our render node — not because the node is wrong (real Mesa renders on it), but because *this chrome has no road to a bare render node at all*
+
+The gate tier 3 was conditioned on from the day it was designed: **prove GPU
+raster beats CPU raster before building the rest of the surface.** Slice 105
+finished the plumbing (`GL_RENDERER: virgl`). This slice tried to point chrome
+at it and measure. The measurement could not be taken, and the reason is a
+harder fact than any number would have been.
+
+### Four runs, and chrome named the wall every time
+
+| # | configuration | chrome's own words | outcome |
+|---|---|---|---|
+| 1 | GPU on, `DISPLAY=:0`, ozone default | (INT3 after our X setup reply) | takes **X11/GLX**, CHECK-crashes on our stub server; 2 threads killed, bootstrap timeout 190s, **0 frames** |
+| 2 | `--ozone-platform=headless`, no `DISPLAY` | `ANGLE Display::initialize error 12289: Could not open the default X display` | **ANGLE-GL requires X11** |
+| 3 | `--use-gl=egl` (skip ANGLE) | `Requested GL implementation (gl=egl-gles2,angle=none) not found in allowed implementations: [(gl=egl-angle,angle=default)]` | **ANGLE is mandatory**; the native EGL path is not in this build |
+| 4 | `--ozone-platform=drm` (the ChromeOS road) | same 12289 X error; **zero KMS ioctls** | the DRM platform **is not in the binary** |
+
+Run 4's conclusion is confirmed statically, not inferred: scanning both
+shipped binaries for registered Ozone platform names yields exactly
+**`headless` and `x11`** — no `drm`, no `wayland`, in *either*
+chrome-headless-shell or full chrome.
+
+### The finding
+
+Chrome's GL stack here requires **ANGLE**; ANGLE's GL backend requires an **X
+display**; and the only non-X platform in the binary (`headless`) supplies no
+native display for ANGLE to initialize on. **A bare DRM render node is not a
+road this chrome offers.**
+
+The block is upstream of everything slices 97–105 built, and it is **not a
+defect in our stack**: the same `/dev/dri/renderD128`, in the same boot, is
+driven successfully by real Mesa 22.3.6 to `GL_RENDERER: virgl` on the host
+GPU (EGLTEST, slice 105). Chrome even *finds* our node — `[drm] open
+dri/renderD128 (virgl capset=1 max=308)` plus libdrm's two-pass VERSION — it
+just does so while collecting GPU info, after its own EGL init has already
+failed.
+
+### What that means for tier 3
+
+**The perf case for chrome is closed, and not by the comparison the gate
+intended.** GPU-vs-CPU raster could not be measured because chrome will not
+use the GPU here at all. The three ways to unblock it are each a project, not
+a slice:
+
+1. **GLX on our X server** — ANGLE-GL over GLX. This is the X road tier 2.5
+   closed, and it needs the GLX protocol plus a GL transport.
+2. **A chrome build carrying Ozone-DRM** — i.e. a ChromeOS-style build. Not
+   available prebuilt, and building chromium from source is outside Track B's
+   premise of running *unmodified shipped binaries*.
+3. **ANGLE-Vulkan + Venus** — needs a guest Vulkan ICD and host-side Venus in
+   QEMU-for-Windows. Phase 0 already showed how thin the host GL support is.
+
+**So: do not build Phase 2 (KMS/scanout) for chrome's sake.** The DRM + Mesa +
+virgl stack keeps its value — it is a real, proven GL capability for *Linux
+programs* on tobyOS, which is a Track-B capability win — but it is a fidelity
+result, not a chrome frame-rate result, and the roadmap should say so.
+
+### The baseline, re-measured on today's kernel
+
+Slice 96's ~40 fps predates slices 97–105, so it was not a fair comparator any
+more. Re-measured, same page, same harness, GPU off:
+
+```
+FRAMES(cpu_anim) = 9372 frames @ guest 220s  =  ~42.6 fps
+gate1 liveness: guest clock reached 239974ms of 360000ms wall; bkl reports: 12
+renderer: tobygl ctx=NONE (no WebGL: GPU process down or compositing is software)
+```
+
+**~42.6 fps vs slice 96's ~40.6 fps — no regression.** Everything slices
+97–105 added (the DRM node, sysfs device tree, char-device stat, F_DUPFD,
+`/dev/dri`) costs the chrome workload nothing.
+
+That same line also settles the WebGL question without a separate run:
+`ctx=NONE`. **Chrome on tobyOS has no WebGL today** — measured, not inferred.
+The planned `webgl.html` A/B is therefore moot in both arms: the baseline
+cannot create a context, and the GPU arm cannot initialize GL at all. The page
+stays in tree; it becomes meaningful the day an unblock condition above holds.
+
+### Two other things this slice measured
+
+**Chrome's GL-init failure is expensive to us.** After GL init fails, a chrome
+thread storms ~4 GiB `PROT_NONE` `mmap`/`munmap` probes (shrinking 0x1000 per
+pass) and the guest CRAWLS — 7–12 s of guest clock per 100 s of wall clock.
+Ruled out as a logging artifact: those runs carried only ~25 stderr lines.
+
+**The liveness gate was measuring the wrong thing.** The standing rule is
+"`[bkl] cpu` must be non-empty or the run is evidence about nothing" — but
+that report fires on a **60-second interval**, so it cried freeze at a 90 s
+diagnostic run that had merely not reached the first emission, and it is blind
+to a crawl, which is what actually happened. It now gates on **guest clock
+progress vs wall clock**, which catches freeze, panic and crawl alike at any
+run length; `[bkl] cpu` is retained as an extra check on full-length runs.
+
+### Method
+
+Every one of the four walls was named by **chrome's own stderr**, in one line,
+within seconds of the run starting — the same lesson slices 99–105 paid for
+twice over. Nothing here was inferred from reading chromium's source. The
+static binary scan came *after* run 4 pointed at it, to confirm a stated
+hypothesis rather than to generate one.

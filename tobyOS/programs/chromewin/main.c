@@ -773,7 +773,7 @@ static void cdp_dispatch(void) {
      * (Slice 61: cap raised 300 -> 800 -- the grown probe truncated at 300,
      * which silently cut the ytd/sh/th tail out of the serial record.) */
     if (strstr(g_msg, "tobyprobe") || strstr(g_msg, "ladder") ||
-        strstr(g_msg, "\"error\"")) {
+        strstr(g_msg, "tobygl") || strstr(g_msg, "\"error\"")) {
         if (strstr(g_msg, "tobyprobe")) {
             g_p_sy    = probe_num(" sy=");
             g_p_ytd   = probe_num(" ytd=");
@@ -898,9 +898,81 @@ static int spawn_chrome(void) {
             /* Disable GPU/ANGLE (INT3 under CoW); leave software compositing
              * and rasterizer ON so Ozone can MapWindow + X11 paint. */
             (char *)"--in-process-gpu",
+#ifdef CW_GL
+            /* TIER 3 PHASE 1d (slice 106): the measure-first gate. Slice 105
+             * proved real Mesa reaches the host GPU through our /dev/dri
+             * (GL_RENDERER: virgl), so now ask whether GPU raster is
+             * actually FASTER than the ~40fps CPU-raster baseline -- the
+             * question tier 3 has been conditioned on since it was designed.
+             *
+             * ANGLE-on-GL is chrome's normal Linux path: chrome talks ANGLE,
+             * ANGLE talks GLES to Mesa, Mesa talks virgl to the host. Do NOT
+             * assume it takes: chrome may quietly fall back to SwiftShader or
+             * to software compositing, which would make this A/B VACUOUS --
+             * that is exactly what gl_renderer_probe() below exists to catch,
+             * and no fps number from this build means anything until it says
+             * "virgl". */
+#ifdef CW_GL_NATIVE
+            /* MEASURED (slice 106 run 3, chrome's own words): ANGLE's GL
+             * backend REQUIRES X11 --
+             *   "ANGLE Display::initialize error 12289: Could not open the
+             *    default X display"
+             * With DISPLAY set it CHECK-crashes against our stub server; with
+             * DISPLAY unset it cannot initialize at all. Both ends of that
+             * road are closed, and tier 2.5 says do not pave it.
+             *
+             * So skip ANGLE: --use-gl=egl is chromium's NATIVE EGL/GLES2
+             * path, the one embedded/ChromeOS builds use to talk to Mesa
+             * directly. That is the road to libEGL.so.1 -> glvnd -> Mesa ->
+             * virgl, which slice 105 already proved end to end. If this build
+             * dropped the native path, chrome says so and this A/B is over. */
+            (char *)"--use-gl=egl",
+#else
+            (char *)"--use-gl=angle",
+            (char *)"--use-angle=gl",
+#endif
+            (char *)"--enable-gpu-rasterization",
+            (char *)"--ignore-gpu-blocklist",
+            (char *)"--disable-vulkan",
+            /* MEASURED (slice 106 run 1): with the GPU on and DISPLAY set,
+             * chrome took the X11/GLX path instead of the EGL one -- it
+             * dlopened libX11, completed a setup handshake with our stub X
+             * server ("setup: client sent 12 bytes, replied 120 bytes"), and
+             * then fired its own INT3/CHECK, killing two threads and the
+             * whole browser (bootstrap timed out at 190s, zero frames). It
+             * never opened /dev/dri and never made one DRM ioctl.
+             *
+             * Tier 2.5 is CLOSED, so there is nothing to gain by making that
+             * path work -- the point is to keep chrome OFF it. Ozone headless
+             * plus no DISPLAY in the environment leaves ANGLE only the EGL
+             * road, which is the one that leads to Mesa -> virgl. */
+#ifdef CW_GL_DRM
+            /* MEASURED (slice 106 runs 3-4): ANGLE-on-GL demands an X display,
+             * and this chromium build REFUSES the non-ANGLE path outright --
+             *   "Requested GL implementation (gl=egl-gles2,angle=none) not
+             *    found in allowed implementations: [(gl=egl-angle,default)]"
+             * So ANGLE is mandatory, and ANGLE needs a native display that is
+             * not a bare render node.
+             *
+             * Ozone DRM is the remaining candidate and the one ChromeOS
+             * itself uses for GPU-without-X: it opens /dev/dri/card0, drives
+             * KMS, and hands ANGLE a GBM display. Whether our card0 can carry
+             * that is unknown -- but the [drm] UNHANDLED gap list turns the
+             * question into a NAMED LIST of missing ioctls rather than an
+             * estimate, which is the point of running it. */
+            (char *)"--ozone-platform=drm",
+#else
+            (char *)"--ozone-platform=headless",
+#endif
+            /* NOTE: the GPU vmodule set is merged into the SINGLE --vmodule
+             * further down, not added here. Chrome keeps only the LAST
+             * --vmodule on the command line (slice 89 cost a whole run to
+             * that), so a second one here would silently disable itself. */
+#else
             (char *)"--disable-gpu",
             (char *)"--disable-vulkan",
             (char *)"--use-gl=disabled",
+#endif
             (char *)"--disable-kill-after-bad-ipc",
             (char *)"--disable-dev-shm-usage",
             (char *)"--disable-crash-reporter",
@@ -997,10 +1069,29 @@ static int spawn_chrome(void) {
              * CHROME_FULL it is MERGED into the single --vmodule above
              * (chrome keeps only the last occurrence -- slice 89); the
              * headless flavour still wants it standalone. */
-#ifndef CHROME_FULL
+#if !defined(CHROME_FULL) && !defined(CW_GL)
             (char *)"--vmodule=render_process_host*=2,render_frame_host*=2,"
                     "navigation_request=2,navigator=2,"
                     "*/ui/ozone/*=1,*/ui/aura/*=1,*/chrome/browser/ui/*=1",
+#elif defined(CW_GL)
+            /* Same set PLUS chrome's GPU-init narration, in ONE flag (see the
+             * last-wins note above). gpu_init/gl_* say which backend actually
+             * bound and, on a fallback, why. */
+            (char *)"--vmodule=render_process_host*=2,render_frame_host*=2,"
+                    "navigation_request=2,navigator=2,"
+                    "*/ui/ozone/*=1,*/ui/aura/*=1,*/chrome/browser/ui/*=1,"
+                    "gpu_init=2,gpu_channel_manager=1,viz_main_impl=1,"
+                    /* Run 2 measured: "eglInitialize OpenGL failed with
+                     * EGL_NOT_INITIALIZED / Initialization of all (1) EGL
+                     * display types failed" -- chrome offered ANGLE exactly
+                     * ONE display type and never dlopened a native EGL at
+                     * all. gl_display at 3 names WHICH type it tried and why
+                     * it was rejected; ozone at 2 says what the headless
+                     * platform handed it. Turn these back down before the
+                     * measurement runs. */
+                    "gl_display*=3,gl_surface*=2,gl_context*=2,"
+                    "gl_factory=2,gl_initializer*=2,gl_utils=2,"
+                    "*/ui/ozone/*=2,gpu_data_manager*=1,gpu_info_collector=2",
 #endif
             /* Startup URL (not --app: app mode never CreateWindow'd here). */
             (char *)"about:blank",
@@ -1012,8 +1103,32 @@ static int spawn_chrome(void) {
             (char *)"PATH=/bin",
             (char *)"LD_LIBRARY_PATH=/opt/chrome:/opt/chrome/sysroot",
             (char *)"LANG=C",
+#ifndef CW_GL
             (char *)"VK_ICD_FILENAMES=/opt/chrome/vk_swiftshader_icd.json",
+            /* DISPLAY is deliberately ABSENT in CW_GL builds: run 1 proved
+             * that giving GPU-enabled chrome an X display sends it into
+             * libX11/GLX, where it CHECK-crashes against our stub server.
+             * Software mode still wants it (the tier-2.5 era paths). */
             (char *)"DISPLAY=:0",
+#endif
+#ifdef CW_GL
+            /* Phase 1d: the EXACT env slice 105 measured "GL_RENDERER: virgl"
+             * with -- copied, not re-derived. Mesa cannot guess where the
+             * staged gallium drivers live, and Debian's libEGL is libglvnd,
+             * which finds Mesa only through a vendor ICD json (without it
+             * every EGL call returns EGL_BAD_PARAMETER). No
+             * MESA_LOADER_DRIVER_OVERRIDE: slice 105 removed it and the
+             * probe still lands on virgl, and an override can send Mesa down
+             * a different loader path than the one it validates devices on. */
+            (char *)"LIBGL_DRIVERS_PATH=/opt/chrome/sysroot/dri",
+            (char *)"__EGL_VENDOR_LIBRARY_FILENAMES=/etc/egl_vendor.json",
+            (char *)"LIBGL_DEBUG=verbose",
+            /* Mesa's EGL loader narration. If ANGLE ever reaches Mesa these
+             * lines appear; if they never do, that silence is itself the
+             * measurement -- it means the failure is upstream of Mesa. */
+            (char *)"EGL_LOG_LEVEL=debug",
+            (char *)"MESA_DEBUG=1",
+#endif
             /* No LD_PRELOAD vulkan: X11+SwANGLE needs VK_KHR_xcb_surface we
              * don't provide; software/Skia path is enough for MIT-SHM blit. */
             (char *)"FONTCONFIG_FILE=/etc/fonts/fonts.conf",
@@ -1042,6 +1157,33 @@ static void kick_play(void) {
              "{\"expression\":\"var v=document.querySelector('video');"
              "if(v){v.muted=true;v.loop=true;v.play&&v.play();}\","
              "\"userGesture\":true}", 1);
+}
+
+/* TIER 3 PHASE 1d (slice 106): THE VACUITY GUARD for the GPU-raster A/B.
+ *
+ * A GPU-enabled chrome that quietly falls back to SwiftShader or to software
+ * compositing produces a perfectly plausible fps number that measures NOTHING
+ * -- and this arc has already been burned twice by treating an unvalidated
+ * control as ground truth (slice 91: the X control never reached the paint
+ * stage either). So ask chrome itself what it is rendering with, in its own
+ * words, and print it next to the frame count.
+ *
+ * WEBGL_debug_renderer_info's UNMASKED_RENDERER_WEBGL (0x9246) is the string
+ * that discriminates: "ANGLE (Mesa, virgl, ...)" means the frames really came
+ * off the host GPU; anything naming SwiftShader/llvmpipe/swrast means the
+ * measurement is VOID no matter how good the number looks. */
+static void gl_renderer_probe(void) {
+    cdp_send("Runtime.evaluate",
+             "{\"expression\":\"(function(){"
+             "try{var c=document.createElement('canvas');"
+             "var g=c.getContext('webgl')||c.getContext('experimental-webgl');"
+             "if(!g)return 'tobygl ctx=NONE (no WebGL: GPU process down or "
+             "compositing is software)';"
+             "var d=g.getExtension('WEBGL_debug_renderer_info');"
+             "return 'tobygl vendor='+g.getParameter(d?d.UNMASKED_VENDOR_WEBGL:"
+             "g.VENDOR)+' renderer='+g.getParameter(d?d.UNMASKED_RENDERER_WEBGL:"
+             "g.RENDERER)+' version='+g.getParameter(g.VERSION);"
+             "}catch(e){return 'tobygl EXC '+e;}})()\"}", 1);
 }
 
 /* Slice 52: PAGE-STATE PROBE. Frames stopped arriving for every NETWORK page
@@ -1949,6 +2091,10 @@ int main(void) {
                        g_req_thumb, g_req_api, g_resp_api_ok, g_resp_api_bad,
                        g_drop_events, g_drop_midmsg);
                 probe_page();
+                /* Ask once, after the page has had time to bring the GPU
+                 * process up. Cheap, and it decides whether the fps number
+                 * this run produces means anything at all. */
+                if (probes == 2) gl_renderer_probe();
             }
         }
 

@@ -30,10 +30,26 @@
 set -e
 cd "$(dirname "$0")/.."
 EDGE_APP="/c/Program Files (x86)/Microsoft/Edge/Application"
-VER=$(ls "$EDGE_APP" | grep -E '^[0-9]+\.' | sort -V | tail -1)
-[ -n "$VER" ] || { echo "no Edge install found under $EDGE_APP"; exit 1; }
+NEED="libEGL.dll libGLESv2.dll d3dcompiler_47.dll"
+# Slice 106: pick the newest version that ACTUALLY CARRIES the DLLs, not just
+# the newest version. Edge updated to 151.0.4129.59 on this box and that
+# directory ships no ANGLE at all (150.0.4078.99 still does), so the old
+# `sort -V | tail -1` picked a version where every cp failed -- and with
+# `set -e` the whole GPU run then died at staging time.
+VER=""
+for v in $(ls "$EDGE_APP" | grep -E '^[0-9]+\.' | sort -V -r); do
+    ok=1
+    for f in $NEED; do [ -f "$EDGE_APP/$v/$f" ] || ok=0; done
+    [ "$ok" = 1 ] && { VER="$v"; break; }
+done
+if [ -z "$VER" ]; then
+    echo "no Edge version under $EDGE_APP carries ANGLE ($NEED)."
+    echo "installed versions:"; ls "$EDGE_APP" | grep -E '^[0-9]+\.'
+    echo "Any Chromium-flavour ANGLE will do -- point this at one."
+    exit 1
+fi
 mkdir -p logs/angle
-for f in libEGL.dll libGLESv2.dll d3dcompiler_47.dll; do
+for f in $NEED; do
     cp "$EDGE_APP/$VER/$f" logs/angle/
 done
 echo "staged ANGLE from Edge $VER -> logs/angle/"

@@ -1,0 +1,104 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>webgl boot</title>
+<!--
+  TIER 3 PHASE 1d (slice 106): the RASTER-BOUND workload.
+
+  anim.html answers "is the screencast pipeline faster with GPU raster", and
+  slice 93 already measured that pipeline as CAPTURE-bound (ack ~21ms), so the
+  honest expectation there is "barely". This page answers the other half, which
+  is the half slice 96 actually named as tier 3's unblock condition: work that
+  CANNOT run on the CPU raster path at all.
+
+  Under --use-gl=disabled getContext('webgl') returns null and the page reports
+  ctx=NONE. If this page draws, that alone is a capability tobyOS did not have
+  before, independent of any fps delta.
+
+  Deliberately fragment-heavy (a full-viewport quad per pass, several passes,
+  with a non-trivial per-pixel loop) so the GPU is the thing being measured
+  rather than JS or the compositor.
+-->
+<style>
+  html,body{margin:0;background:#000;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  #hud{position:fixed;left:8px;top:8px;font:14px monospace;color:#0f0;
+       text-shadow:0 0 3px #000;white-space:pre}
+</style>
+<canvas id="c"></canvas>
+<div id="hud">starting…</div>
+<script>
+var cv = document.getElementById('c'), hud = document.getElementById('hud');
+cv.width = 800; cv.height = 600;
+
+var gl = cv.getContext('webgl') || cv.getContext('experimental-webgl');
+if (!gl) {
+  document.title = 'WEBGL-NONE';
+  hud.textContent = 'getContext(webgl) = null\n' +
+                    'GPU process down, or --use-gl=disabled';
+} else {
+  var VS =
+    'attribute vec2 p;varying vec2 uv;' +
+    'void main(){uv=p*0.5+0.5;gl_Position=vec4(p,0.0,1.0);}';
+  // Enough per-pixel work that the fragment stage dominates: an inner loop
+  // the driver cannot fold away (it feeds forward through `a`).
+  var FS =
+    'precision mediump float;varying vec2 uv;uniform float t;' +
+    'void main(){' +
+    '  vec2 z=(uv-0.5)*3.0;float a=0.0;' +
+    '  for(int i=0;i<48;i++){' +
+    '    a+=sin(z.x*6.0+t+a*0.3)*cos(z.y*6.0-t*0.7+a*0.2);' +
+    '    z=vec2(z.x*0.99-z.y*0.03,z.y*0.99+z.x*0.03);' +
+    '  }' +
+    '  gl_FragColor=vec4(0.5+0.5*sin(a),0.5+0.5*cos(a*1.3),' +
+    '                    0.5+0.5*sin(a*0.7+t),1.0);' +
+    '}';
+
+  function sh(type, src) {
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  var prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  var buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER,
+                new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  var loc = gl.getAttribLocation(prog, 'p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  var uT = gl.getUniformLocation(prog, 't');
+
+  // Renderer identity straight from the page, so the serial log carries it
+  // even if the CDP probe never fires.
+  var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  var rend = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+                 : gl.getParameter(gl.RENDERER);
+  window.__glrenderer = rend;
+
+  var frames = 0, t0 = 0, fps = 0, PASSES = 4;
+  function draw(ts) {
+    if (!t0) t0 = ts;
+    for (var i = 0; i < PASSES; i++) {
+      gl.uniform1f(uT, ts * 0.001 + i * 0.25);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    frames++;
+    var dt = ts - t0;
+    if (dt >= 1000) { fps = (frames * 1000 / dt).toFixed(1); frames = 0; t0 = ts; }
+    // The page-state probe reads document.title, so publish there too.
+    document.title = 'WEBGL ' + fps + 'fps';
+    hud.textContent = 'webgl ' + fps + ' fps  x' + PASSES + ' passes\n' + rend;
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+}
+</script>

@@ -23,6 +23,11 @@ SHOTS = [(72, "logs/wat_a.png"), (80, "logs/wat_b.png"),
          (240, "logs/wat_e.png"), (270, "logs/wat_g.png"),
          (305, "logs/wat_h.png"), (330, "logs/wat_f.png")]
 TOTAL = 360
+# Slice 106: RUNSECS shortens the run for DIAGNOSTIC cycles. Chrome's GPU init
+# either works or fails in the first ~10s, so an 8-minute run to read one error
+# line is 7 minutes of nothing. Perf MEASUREMENT runs must stay at the default
+# 360 -- every frame baseline in this arc is frames/360s.
+TOTAL = int(os.environ.get("RUNSECS", TOTAL))
 
 
 def qmp(sock, obj):
@@ -89,9 +94,32 @@ def main():
            "-m", "8192", "-cpu", "qemu64,+smep,+smap",
            "-serial", "file:" + SERIAL,
            "-qmp", "tcp:127.0.0.1:%d,server,nowait" % PORT,
-           "-no-reboot", "-display", "none"]
+           "-no-reboot"]
+    # TIER 3 PHASE 1d (slice 106): GLDEV=1 attaches the 3D device so chrome can
+    # raster on the host GPU, for the measure-first A/B against CPU raster.
+    # Three things are load-bearing here and all three were paid for earlier:
+    #   * virtio-gpu-gl-pci is ADDITIVE -- the std VGA stays and keeps doing
+    #     scanout. Slice 96c proved SET_SCANOUT is REJECTED on the -gl device
+    #     (QEMU routes everything there through virglrenderer), and slice 97
+    #     bound it in a 3D-ONLY role for exactly that reason.
+    #   * -display egl-headless, not none: virglrenderer needs a host GL
+    #     context, and with -display none QEMU has none to give.
+    #   * logs/angle on PATH: QEMU-for-Windows ships no EGL/GLES, which is what
+    #     made egl-headless segfault until slice 96b staged Edge's ANGLE DLLs.
+    env = None
+    if os.environ.get("GLDEV") == "1":
+        angle = os.path.join(os.getcwd(), "logs", "angle")
+        if not os.path.isdir(angle):
+            raise SystemExit("GLDEV=1 but logs/angle is missing -- "
+                             "run `bash logs/setup_angle.sh` first")
+        cmd += ["-device", "virtio-gpu-gl-pci", "-display", "egl-headless"]
+        env = dict(os.environ, PATH=angle + os.pathsep + os.environ.get("PATH", ""))
+        print("GLDEV=1: virtio-gpu-gl-pci + egl-headless, ANGLE from " + angle,
+              flush=True)
+    else:
+        cmd += ["-display", "none"]
     print("launching qemu (WHPX)", flush=True)
-    q = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    q = subprocess.Popen(cmd, stderr=subprocess.PIPE, env=env)
     sock = None
     try:
         for _ in range(60):

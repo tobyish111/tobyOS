@@ -165,3 +165,80 @@ actually goes (tier B) → only then decide whether tier 3 is the answer.**
 display path at ~1 ms/frame and concluded frame PRODUCTION inside chrome is
 the bottleneck. Nothing has yet measured whether CPU rasterization is what
 dominates that production. Get that number before spending slices here.
+
+---
+
+# VERDICT (slice 106, 2026-08-03): PHASE 1d RAN. **THE GATE SAYS STOP.**
+
+This document's gate — "GPU raster must prove value before the surface is
+finished" — has now been exercised, and it returns a harder answer than the
+fps comparison it anticipated: **the comparison cannot be run, because this
+chrome will not use a GPU here at all.**
+
+## What was measured
+
+Four configurations, each wall named by chrome's own stderr within seconds:
+
+1. GPU on with `DISPLAY` set → chrome takes **X11/GLX**, CHECK-crashes (INT3)
+   right after our stub X server's setup reply. Two threads killed, DevTools
+   bootstrap timed out at 190 s, **zero frames**.
+2. `--ozone-platform=headless`, no `DISPLAY` →
+   `ANGLE Display::initialize error 12289: Could not open the default X display`.
+   **ANGLE's GL backend requires X11.**
+3. `--use-gl=egl` (skip ANGLE) →
+   `Requested GL implementation (gl=egl-gles2,angle=none) not found in allowed
+   implementations: [(gl=egl-angle,angle=default)]`.
+   **ANGLE is mandatory; the native EGL path is not in this build.**
+4. `--ozone-platform=drm` (the ChromeOS road) → the same X error and **zero KMS
+   ioctls**. Confirmed statically: both shipped binaries register exactly two
+   Ozone platforms, **`headless` and `x11`**. No `drm`. No `wayland`.
+
+## The conclusion, and what it is NOT
+
+Chrome's GL requires ANGLE → ANGLE requires an X display → the only non-X
+platform present supplies none. **A bare DRM render node is not a road this
+chrome offers.**
+
+This is **not** a defect in the stack slices 97–105 built. In the same boot,
+on the same `/dev/dri/renderD128`, real Mesa 22.3.6 reaches
+`GL_RENDERER: virgl` on the host GPU (EGLTEST). Chrome even finds our node —
+`[drm] open dri/renderD128 (virgl capset=1 max=308)` and libdrm's two-pass
+VERSION — but only while collecting GPU info, *after* its own EGL init failed.
+
+## Consequences for this document
+
+- **§4 Phase 2 (stage Mesa) and Phase 3 (point chrome at it) are CLOSED for
+  chrome.** Do not build KMS/scanout surface on chrome's behalf. Phase 3's
+  proposed order (`--use-gl=egl --use-angle=gl`, then Venus) was tried at
+  item 1 and REFUSED BY THE BINARY.
+- **§5's "honest alternative" is now the recommendation, on stronger grounds
+  than when it was written.** It argued tier 3 might be a large investment for
+  a small win. The measurement says worse: for chrome the win is currently
+  unreachable at any investment short of a project.
+- **Tier 3 is re-scoped from a chrome PERF tier to a Track-B CAPABILITY
+  result.** What exists is real and proven: tobyOS runs unmodified Linux GL
+  programs on the host GPU through Mesa → our DRM node → virgl. That belongs
+  in the Linux-personality story, not the chrome frame-rate story.
+
+## Unblock conditions (each a project, not a slice)
+
+1. **GLX on our X server** — ANGLE-GL over GLX. This is the X road tier 2.5
+   closed; it needs GLX protocol plus a GL transport.
+2. **A chrome build carrying Ozone-DRM** (ChromeOS-style). Not available
+   prebuilt, and building chromium from source contradicts Track B's premise
+   of running unmodified shipped binaries.
+3. **ANGLE-Vulkan + Venus** — needs a guest Vulkan ICD and host-side Venus in
+   QEMU-for-Windows. Phase 0 already documented how thin host GL support is
+   there.
+
+If one of these ever holds, `initrd/etc/webgl.html` and
+`logs/gpuperf.sh {cpu|gl|gle|gld} {anim|webgl}` are in tree and ready to take
+the measurement immediately.
+
+## Baseline for the record
+
+Re-measured on today's kernel (slice 96's number predates slices 97–105):
+**9372 frames @ guest 220 s ≈ 42.6 fps**, versus slice 96's ~40.6 fps — **no
+regression**. The whole DRM/sysfs/F_DUPFD chain costs the chrome workload
+nothing. The same run reports `tobygl ctx=NONE`: **chrome on tobyOS has no
+WebGL today.**
