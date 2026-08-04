@@ -2,12 +2,12 @@
 
 Read this file, then `docs/chromium-hypothesis-ledger.md` (slices 105–108 at
 the tail) **before touching anything**. The memory topic `chromium-bringup.md`
-carries the same history in compressed form. Baseline commit: `76f7096`.
+carries the same history in compressed form. Baseline commit: `f14fd2a`.
 
 Your job, in order:
 
 1. **Root-cause the multi-process bootstrap flake.** It is reproduced,
-   archived and localized — but NOT explained, and four hypotheses are already
+   archived and localized — but NOT explained, and FIVE hypotheses are already
    dead. Details in §3.
 2. **Then continue the perf roadmap** from §5, which has been re-aimed twice
    by measurement and now points somewhere specific.
@@ -30,10 +30,7 @@ stack is real and proven (`GL_RENDERER: virgl`) and remains valuable for
 frame-rate result. See `docs/chromium-tier3-gpu-design.md` (tail) and slice
 106 in the ledger.
 
-## 2. UNCOMMITTED WORK — deal with this first
-
-`git status` at handoff time shows five modified files carrying slice-108 work
-that is **built and partly measured but not committed**:
+## 2. What slice 108 added (all committed in `f14fd2a`)
 
 | file | what is in there |
 |---|---|
@@ -118,13 +115,16 @@ repeatedly in this arc (slices 99–105, 106), and I broke it twice inside slice
 | viz shm, 4 ms poll instead of 15 ms | 38.3 | **worse** — polling harder steals the CPU that produces frames |
 
 …but multi-process drives the **guest clock at ~46 % of wall**, which the fps
-column does not show. The page's own rAF runs at **61/s**, so the remaining
-headroom to the workload's own ceiling is ~20 %.
+column does not show. The page's own rAF runs at **61/s**, so at 52.4 we are
+capturing 86 % of what the workload itself produces — the remaining headroom
+is ~14 %, not the ~2.3x that slice 68 once projected.
 
 **What these numbers mean together:** slice 68's ~2.3× estimate assumed the
-JPEG encode was the bottleneck. It was not. Neither is the copy. Neither is
-poll latency. The cost is the **work done per poll**, which is why item 3
-(coarse sampling + early exit) is the live experiment.
+JPEG encode was the bottleneck. It was not. Neither was the copy, and neither
+was poll latency. The cost was the **work done per poll** — which is why
+sampling less per poll is the change that finally moved it. Every intuition
+about where the time went in this pipeline has been wrong at least once;
+measure before you optimise, and measure again after.
 
 ## 5. The roadmap from here
 
@@ -136,7 +136,7 @@ poll latency. The cost is the **work done per poll**, which is why item 3
    actual commit cadence before optimising further; do not assume the
    remaining ~14% is sitting there for the taking. If it is real, the poll
    loop is still the place it would come from (a signal instead of a poll).
-4. **Then re-rank.** §6 of `docs/chromium-handoff-post-slice-91.md` still
+3. **Then re-rank.** §6 of `docs/chromium-handoff-post-slice-91.md` still
    lists the other candidates. With tier 3 closed and viz shm delivered, the
    honest question is whether frame rate is still the right target at all, or
    whether responsiveness (input latency, navigation time) matters more.
