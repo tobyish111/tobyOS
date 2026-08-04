@@ -428,3 +428,68 @@ pipe hops). Candidates: ack-before-decode in chromewin; re-test the
 JPEG quality knob AT nth=1; kernel IPC wake latency (pings cost
 32-86 ms under load). Baselines before slice 93 were nth=3 — annotate
 any cross-slice comparison.
+
+---
+
+# ADDENDUM (slice 106, 2026-08-03): TIER 3 IS RE-SCOPED — the measure-first gate ran and chrome cannot use the GPU here at all
+
+Read this before planning any further GPU work. It changes §7's premise.
+
+**What §6/§7 assumed:** that tier 3, once the DRM node existed, would be
+decided by comparing GPU raster against CPU raster. Slice 105 finished that
+node (real Mesa 22.3.6 → `GL_RENDERER: virgl` on the host GPU). Slice 106
+pointed chrome at it.
+
+**What happened:** the comparison cannot be run. Chrome's GL stack requires
+**ANGLE**; ANGLE's GL backend requires an **X display**; and the only non-X
+Ozone platform in the shipped binaries supplies none. Four runs, each wall
+named by chrome's own stderr in one line:
+
+1. GPU on with `DISPLAY` → takes X11/GLX, CHECK-crashes (INT3) right after our
+   stub X server's setup reply. 0 frames, bootstrap timeout at 190 s.
+2. no `DISPLAY` → `ANGLE Display::initialize error 12289: Could not open the
+   default X display`.
+3. `--use-gl=egl` → `Requested GL implementation (gl=egl-gles2,angle=none) not
+   found in allowed implementations: [(gl=egl-angle,angle=default)]`.
+4. `--ozone-platform=drm` → same X error, zero KMS ioctls. Static scan: both
+   binaries register exactly `headless` and `x11`. No `drm`, no `wayland`.
+
+**This is not a defect in the stack slices 97–105 built.** Same boot, same
+`/dev/dri/renderD128`, real Mesa gets to the host GPU. Chrome even finds our
+node — it just does so during GPU-info collection, after its EGL init failed.
+
+**Consequences:**
+
+- **Do not build Phase 2 (KMS/scanout) for chrome's sake.** §7's ranking of
+  tier 3 as a perf candidate is void; there is no reachable perf win to rank.
+- **Tier 3 becomes a Track-B capability result**, not a chrome frame-rate
+  result: tobyOS runs unmodified Linux GL programs on the host GPU. That is
+  worth keeping and worth stating — in the Linux-personality story.
+- **§6's candidate list still stands for perf.** With tier 3 removed from
+  contention, candidate 1 (viz shared-memory frames over Mojo) is again the
+  strongest structural idea and remains the least explored. The measured
+  ceiling is unchanged: the ~21 ms single-in-flight ack loop.
+- Unblock conditions for tier 3, each a project rather than a slice, are
+  listed at the end of `docs/chromium-tier3-gpu-design.md`.
+
+**Baseline re-measured on today's kernel** (slice 96's number predates
+97–105): **9372 frames @ guest 220 s ≈ 42.6 fps** vs ~40.6 — no regression.
+The same run reports `tobygl ctx=NONE`: **chrome on tobyOS has no WebGL
+today.**
+
+**One standing rule in §9 was wrong and is now fixed.** "`grep -a '[bkl] cpu'`
+must be non-empty or the run is evidence about nothing" relies on a report
+that only fires every **60 seconds** — it cried freeze at a 90 s diagnostic
+run that had simply not reached the first emission, and it cannot see a
+**crawl**, which is the failure that actually occurred (7–12 s of guest clock
+per 100 s of wall clock, chrome storming ~4 GiB `PROT_NONE` mmap/munmap probes
+after GL init fails). `logs/gpuperf.sh` now gates on **guest-clock vs
+wall-clock progress**, which catches freeze, panic and crawl at any run
+length. Keep the `[bkl] cpu` check for full-length runs; do not rely on it
+alone for short ones.
+
+**New tooling:** `logs/gpuperf.sh {cpu|gl|gle|gld} {anim|webgl}` carries both
+gates (liveness, and a renderer-identity check that refuses to report an fps
+number unless chrome names `virgl`). `RUNSECS=<n>` shortens a run for
+diagnosis — measurements stay at 360 s, since every frame baseline in this arc
+is frames/360 s.
