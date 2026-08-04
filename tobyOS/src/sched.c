@@ -1179,6 +1179,13 @@ void sched_tick(struct regs *r) {
              * chrome load, so the same call inside xserver_tick printed
              * nothing for an entire 360s run. */
             { extern void xserver_debug_tick(void); xserver_debug_tick(); }
+            /* Slice 107: shared-region census at the same 3s cadence. It is
+             * the ONE measurement that decides handoff §6 candidate 1 (viz
+             * shared-memory frames): does a framebuffer-sized shared region
+             * exist inside chrome and change per frame, or not? Rides this
+             * heartbeat for the same reason xserver_debug_tick does -- pid
+             * 0's idle loop never runs under chrome load. */
+            { extern void shm_census_dump(void); shm_census_dump(); }
             if (now - last_deep > 60000000000ull) {
             last_deep = now;
             extern struct proc g_proc[];

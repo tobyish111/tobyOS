@@ -957,8 +957,28 @@ struct abi_xframe {
     uint32_t gen;      /* bumps on every PutImage / ShmPutImage */
 };
 
+/* Slice 107 (handoff §6 candidate 1): poll chrome's VIZ SHARED-MEMORY frame.
+ *
+ * Tier 2.5 built the consumer above (xframe) for pixels chrome would push
+ * through MIT-SHM, and chrome never pushed any -- the premise was disproven.
+ * This is the same contract with a producer that DEMONSTRABLY EXISTS:
+ * MEASURED (slice 107 census, multi-process chrome, 113 rounds while 13,347
+ * frames were produced) -- chrome keeps a POOL of shared regions of exactly
+ * viewport size (800x600x4 = 1,920,000 B = 469 pages) and rewrites them
+ * continuously (60-96 changes per region). Those are software compositing's
+ * shared bitmaps. Reading them skips the JPEG encode + base64 + pipe round
+ * trip that slice 68 measured as the binding cost.
+ *
+ * a1 = struct abi_xframe *info  (w/h/stride/gen filled on return; SAME shape
+ *      as XFRAME_POLL, so chromewin's blit path is reused verbatim)
+ * a2 = pixels buffer or NULL
+ * a3 = pixels_cap (bytes); ignored if a2 == NULL
+ * The caller's CURRENT window size is passed in info->w / info->h on ENTRY --
+ * the kernel matches regions by w*h*4 and cannot guess the viewport itself. */
+#define ABI_SYS_VIZFRAME_POLL   187
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          187
+#define ABI_SYS_NR_MAX          188
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

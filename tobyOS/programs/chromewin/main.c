@@ -137,7 +137,17 @@ static int g_page_w = PAGE_W, g_page_h = PAGE_H;
 
 static struct tk_window win;
 static toby_image_t *g_frame;        /* latest decoded screenshot (CDP path) */
-#ifdef CHROME_FULL
+
+/* Slice 107: the direct-pixel paint path is shared by TWO producers now.
+ * Tier 2.5 built it for fake-X MIT-SHM (CHROME_FULL) and chrome never fed it.
+ * CW_VIZ feeds the same buffers from chrome's VIZ SHARED BITMAPS, which the
+ * census proved chrome really does rewrite every frame. Same state, same
+ * blit, same one-way switch off CDP -- only the producer differs. */
+#if defined(CHROME_FULL) || defined(CW_VIZ)
+#define CW_HAVE_XF 1
+#endif
+
+#ifdef CW_HAVE_XF
 /* Tier 2.5: ARGB pixels from fake-X MIT-SHM (primary paint path). */
 static uint32_t *g_xf_pixels;
 static int g_xf_w, g_xf_h, g_xf_stride;
@@ -893,11 +903,21 @@ static int spawn_chrome(void) {
              * omission cost a full 440s run that looked like a hang. */
             (char *)"--no-sandbox",
             (char *)"--no-zygote",
+#ifndef CW_MP
+            /* Slice 107: handoff §6 candidate 1 assumes chrome's renderer ->
+             * viz frame transport uses SHARED MEMORY over Mojo. Under
+             * --single-process that transport CANNOT EXIST: renderer and viz
+             * share one address space, so a frame is a plain heap pointer and
+             * nothing is ever shared. CW_MP drops single-process so the
+             * census can look for the real thing. */
             (char *)"--single-process",
+#endif
             (char *)"--remote-debugging-pipe",
             /* Disable GPU/ANGLE (INT3 under CoW); leave software compositing
              * and rasterizer ON so Ozone can MapWindow + X11 paint. */
+#ifndef CW_MP
             (char *)"--in-process-gpu",
+#endif
 #ifdef CW_GL
             /* TIER 3 PHASE 1d (slice 106): the measure-first gate. Slice 105
              * proved real Mesa reaches the host GPU through our /dev/dri
@@ -1597,6 +1617,7 @@ static void send_key(uint8_t key) {
  * frame installer, so it keeps its own accumulator/counter pair). */
 long g_t_paint, g_n_paint;
 
+#ifdef CW_HAVE_XF
 #ifdef CHROME_FULL
 static void xframe_poll_once(void) {
     struct abi_xframe xf;
@@ -1640,7 +1661,72 @@ static void xframe_poll_once(void) {
         tk_redraw(&win);
     }
 }
-#endif
+#endif /* CHROME_FULL */
+
+#ifdef CW_VIZ
+/* Slice 107: the SAME consumer, fed from chrome's viz shared bitmaps.
+ *
+ * The kernel cannot guess the viewport, so the window size goes IN through
+ * info->w/h and the kernel matches shared regions of exactly w*h*4 bytes.
+ * gen only advances when a region actually changed since the last poll, so
+ * "no new frame" costs one syscall and no copy accounting.
+ *
+ * Honest about what this is: the newest-changed region is a HEURISTIC for
+ * "the frame chrome just finished", and nothing synchronises us against the
+ * compositor, so a frame can tear. Whether that is visible is a question for
+ * the screendump, not for argument. */
+static void vizframe_poll_once(void) {
+    struct abi_xframe xf;
+    int vw = g_page_w > 0 ? g_page_w : PAGE_W;
+    int vh = g_page_h > 0 ? g_page_h : PAGE_H;
+    size_t need = (size_t)vw * vh * 4u;
+    if (!g_xf_pixels || g_xf_cap < (int)need) {
+        free(g_xf_pixels);
+        g_xf_pixels = (uint32_t *)malloc(need);
+        g_xf_cap = g_xf_pixels ? (int)need : 0;
+        if (!g_xf_pixels) return;
+    }
+    xf.w = (uint32_t)vw; xf.h = (uint32_t)vh; xf.stride = 0; xf.gen = 0;
+    long rc = sc3(ABI_SYS_VIZFRAME_POLL, (long)(uintptr_t)&xf,
+                  (long)(uintptr_t)g_xf_pixels, (long)g_xf_cap);
+    if (rc < 0) {
+        static int moaned;
+        if (!moaned && rc != -61 /* ENODATA: none yet, normal at startup */) {
+            moaned = 1;
+            printf("[cwviz] VIZFRAME_POLL rc=%ld (%dx%d) -- no viewport-sized "
+                   "shared region; is this a MULTI-PROCESS build?\n",
+                   rc, vw, vh);
+        }
+        return;
+    }
+    if (xf.gen == g_xf_seen || !xf.w || !xf.h) return;   /* no new frame */
+    g_xf_seen = xf.gen;
+    g_xf_gen  = xf.gen;
+    g_xf_w    = (int)xf.w;
+    g_xf_h    = (int)xf.h;
+    g_xf_stride = (int)(xf.stride / 4);      /* tk_draw_blit wants px pitch */
+    g_frames++;
+    g_xf_frames++;
+    g_xf_last_ms = sys_clock_ms();
+    g_last_frame_ms = g_xf_last_ms;
+    /* Switch off CDP on EVIDENCE, exactly as tier 2.5 intended: once real viz
+     * frames are arriving, the JPEG encode + base64 + pipe round trip is pure
+     * waste (slice 68 sized it at ~2.3x). If viz frames never come, the
+     * screencast keeps driving and the window is never blank. */
+    if (!g_xf_live && g_xf_frames >= XF_LIVE_FRAMES) {
+        g_xf_live = 1;
+        cdp_send("Page.stopScreencast", "{}", 1);
+        if (g_frame) { free(g_frame); g_frame = 0; }
+        printf("[cwviz] VIZ frames live (%d) -- screencast STOPPED, reading "
+               "chrome's shared bitmaps directly\n", g_xf_frames);
+    }
+    if (g_frames == 1 || (g_frames % 30) == 0)
+        printf("[cwviz] frame %d: %dx%d gen=%u (viz shm path)\n",
+               g_frames, g_xf_w, g_xf_h, xf.gen);
+    tk_redraw(&win);
+}
+#endif /* CW_VIZ */
+#endif /* CW_HAVE_XF */
 
 static void paint(struct tk_window *w, struct tk_widget *cv) {
     (void)cv;
@@ -1659,7 +1745,7 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
      * Until then (or if SHM frames stop arriving) the CDP screencast still
      * drives, which keeps a non-mapping Ozone run visually identical to the
      * slice-68 baseline instead of blank. */
-#ifdef CHROME_FULL
+#ifdef CW_HAVE_XF
     if (g_xf_live && g_xf_pixels && g_xf_w > 0) {
         int fw = g_xf_w < pw ? g_xf_w : pw;
         int fh = g_xf_h < ph ? g_xf_h : ph;
@@ -1674,7 +1760,7 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
         tk_draw_blit(w, 0, BAR_H, fw, fh, g_frame->pixels, g_frame->width);
         if (fw < pw) tk_draw_fill(w, fw, BAR_H, pw - fw, ph, 0x00303038u);
         if (fh < ph) tk_draw_fill(w, 0, BAR_H + fh, fw, ph - fh, 0x00303038u);
-#ifdef CHROME_FULL
+#ifdef CW_HAVE_XF
     } else if (g_xf_pixels && g_xf_w > 0 && g_xf_gen > 0 &&
                g_xf_seen == g_xf_gen) {
         int fw = g_xf_w < pw ? g_xf_w : pw;
@@ -1757,6 +1843,9 @@ int main(void) {
 
 #ifdef CHROME_FULL
         xframe_poll_once();
+#endif
+#ifdef CW_VIZ
+        vizframe_poll_once();      /* slice 107: chrome's viz shared bitmaps */
 #endif
 
         for (;;) {                             /* drain all buffered CDP msgs */
@@ -2098,6 +2187,21 @@ int main(void) {
             }
         }
 
+        /* Slice 107, TESTED AND REJECTED: sampling the viz path faster.
+         *
+         * The reasoning looked sound -- the CDP path is PUSH (we wake on the
+         * pipe) while the viz path is POLL, 15ms caps sampling at 66/s, and
+         * we were capturing 48.8fps while anim.html's own rAF ran at 61/s.
+         * So poll granularity looked like the thing leaving frames on the
+         * floor. MEASURED at 4ms: 38.3 fps -- WORSE, by a fifth.
+         *
+         * Polling harder does not catch more frames, it steals the CPU that
+         * produces them: every poll hashes ~7 candidate regions before it can
+         * decide whether anything changed. The capture ceiling is that work
+         * plus the 1.9 MiB copy, not the nap. Left at 15ms, which is the
+         * configuration the verified +16.5% was measured in. (n=1 per arm and
+         * multi-process runs vary, so treat 38.3 as indicative -- but there is
+         * no evidence FOR the change, so it does not ship.) */
         usleep(15000);
     }
     printf("[chromewin] exiting; frames=%d\n", g_frames);

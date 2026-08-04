@@ -1201,11 +1201,53 @@ struct memfd {
     unsigned  seals;    /* F_ADD_SEALS bits (accepted, informational) */
 };
 
+/* ---- slice 107: SHARED-REGION CENSUS ----------------------------------
+ * Handoff §6 candidate 1 ("viz shared-memory frames over Mojo") rests on a
+ * single testable claim: that somewhere inside chrome there is a
+ * FRAMEBUFFER-SIZED shared region whose contents change once per frame. If
+ * there is, we can read pixels straight out of it and skip the JPEG+base64+
+ * pipe round trip that slice 68 measured as the binding cost (~21ms/frame,
+ * and frame rate tracks PAYLOAD SIZE). If there is not, the candidate is
+ * disproven and no amount of plumbing will save it.
+ *
+ * Two tiers of this arc (2.5, then 3) died from building on a mechanism
+ * nobody had verified end to end. So verify this one BEFORE implementing:
+ * the census walks every shared region the kernel owns -- shm_cache entries
+ * (file-backed MAP_SHARED) and memfds -- samples a hash of each, and reports
+ * size alongside how many census rounds saw the contents CHANGE.
+ *
+ * Reading the verdict: a region of width*height*4 bytes (800x600x4 = 1875
+ * KiB) that changes every round IS the composited frame. Small regions that
+ * change constantly are metrics/discardable/font caches, not pixels. */
+#define MEMFD_REG_MAX 192
+static struct memfd *g_memfd_reg[MEMFD_REG_MAX];
+static uint32_t      g_memfd_reg_id[MEMFD_REG_MAX];
+static int           g_memfd_reg_pid[MEMFD_REG_MAX];
+static uint32_t      g_memfd_next_id = 1;
+
+static void memfd_reg_add(struct memfd *mf) {
+    for (int i = 0; i < MEMFD_REG_MAX; i++) {
+        if (!g_memfd_reg[i]) {
+            g_memfd_reg[i]     = mf;
+            g_memfd_reg_id[i]  = g_memfd_next_id++;
+            struct proc *p     = current_proc();
+            g_memfd_reg_pid[i] = p ? p->pid : -1;
+            return;
+        }
+    }
+}
+
+static void memfd_reg_del(struct memfd *mf) {
+    for (int i = 0; i < MEMFD_REG_MAX; i++)
+        if (g_memfd_reg[i] == mf) { g_memfd_reg[i] = 0; return; }
+}
+
 struct memfd *memfd_new(void) {
     struct memfd *mf = (struct memfd *)kmalloc(sizeof *mf);
     if (!mf) return 0;
     mf->pages = 0; mf->npages = 0; mf->cap = 0;
     mf->size = 0; mf->refs = 1; mf->seals = 0;
+    memfd_reg_add(mf);
     return mf;
 }
 
@@ -1214,6 +1256,7 @@ void memfd_ref(struct memfd *mf) { if (mf) mf->refs++; }
 void memfd_unref(struct memfd *mf) {
     if (!mf) return;
     if (--mf->refs > 0) return;
+    memfd_reg_del(mf);
     for (size_t i = 0; i < mf->npages; i++)
         if (mf->pages[i]) {
             /* Drop the memfd's OWN reference (memfd_ensure_pages). If a
@@ -1623,4 +1666,142 @@ long shm_cache_mmap(struct shm_cache *sc, uint64_t addr, uint64_t len,
     }
     vmm_set_editor_root(saved);
     return (long)base;
+}
+
+/* ---- slice 107: the census walk (see the header comment on memfd_reg) ----
+ *
+ * Called from the 3s scheduler heartbeat under CHROMIUM_BOOT. Hashes a
+ * SAMPLE of each region (32 bytes from every 8th page) rather than the whole
+ * thing: enough to detect "these bytes changed", cheap enough to run while
+ * chrome is producing frames. A full hash of every 1.9MB region every 3s
+ * would perturb the very workload being measured.
+ *
+ * Only regions >= CENSUS_MIN_PAGES are printed. Below that they are metrics,
+ * font caches and discardable-memory scraps -- never a frame -- and printing
+ * them buries the signal. */
+#define CENSUS_MIN_PAGES 16          /* 64 KiB */
+
+static uint64_t census_hash_pages(uint64_t *pages, size_t npages) {
+    uint64_t h = 1469598103934665603ull;             /* FNV-1a offset basis */
+    for (size_t i = 0; i < npages; i += 8) {
+        uint64_t ph = pages[i];
+        if (!ph) { h ^= 0x9e3779b9ull; h *= 1099511628211ull; continue; }
+        const unsigned char *p = (const unsigned char *)(ph + vmm_hhdm_offset());
+        for (int b = 0; b < 32; b++) { h ^= p[b]; h *= 1099511628211ull; }
+    }
+    return h;
+}
+
+/* Per-slot previous hash + change tally, kept parallel to the registries so
+ * neither struct grows for an instrument. */
+static uint64_t g_cs_shm_hash[SHMCACHE_MAX];
+static uint32_t g_cs_shm_chg[SHMCACHE_MAX];
+static uint64_t g_cs_mfd_hash[MEMFD_REG_MAX];
+static uint32_t g_cs_mfd_chg[MEMFD_REG_MAX];
+
+void shm_census_dump(void) {
+    static uint32_t round;
+    round++;
+    int shown = 0;
+    for (int i = 0; i < SHMCACHE_MAX; i++) {
+        struct shm_cache *sc = &g_shm[i];
+        if (!sc->used || sc->npages < CENSUS_MIN_PAGES || !sc->pages) continue;
+        uint64_t h = census_hash_pages(sc->pages, sc->npages);
+        int changed = (round > 1 && h != g_cs_shm_hash[i]);
+        if (changed) g_cs_shm_chg[i]++;
+        g_cs_shm_hash[i] = h;
+        kprintf("[census] r%u shm#%d ino=%lu pages=%lu (%luKiB) chg=%u %s\n",
+                round, i, (unsigned long)sc->ino, (unsigned long)sc->npages,
+                (unsigned long)(sc->npages * 4), g_cs_shm_chg[i],
+                changed ? "CHANGED" : "same");
+        shown++;
+    }
+    for (int i = 0; i < MEMFD_REG_MAX; i++) {
+        struct memfd *mf = g_memfd_reg[i];
+        if (!mf || mf->npages < CENSUS_MIN_PAGES || !mf->pages) continue;
+        uint64_t h = census_hash_pages(mf->pages, mf->npages);
+        int changed = (round > 1 && h != g_cs_mfd_hash[i]);
+        if (changed) g_cs_mfd_chg[i]++;
+        g_cs_mfd_hash[i] = h;
+        kprintf("[census] r%u memfd#%u pid=%d pages=%lu (%luKiB) chg=%u %s\n",
+                round, g_memfd_reg_id[i], g_memfd_reg_pid[i],
+                (unsigned long)mf->npages, (unsigned long)(mf->npages * 4),
+                g_cs_mfd_chg[i], changed ? "CHANGED" : "same");
+        shown++;
+    }
+    if (!shown)
+        kprintf("[census] r%u NO shared region >= %d pages exists at all\n",
+                round, CENSUS_MIN_PAGES);
+}
+
+/* ---- slice 107: VIZ SHARED-MEMORY FRAME (handoff §6 candidate 1) --------
+ *
+ * The census proved the premise: under MULTI-PROCESS chrome a pool of shared
+ * regions of exactly viewport size is rewritten continuously while frames are
+ * produced. Those are software compositing's shared bitmaps -- the pixels
+ * chrome would otherwise JPEG-encode and base64 down the CDP pipe for us to
+ * decode, which slice 68 measured as the thing frame rate is bound by.
+ *
+ * This picks the viewport-sized region that changed MOST RECENTLY and copies
+ * it out. "Most recently changed" is a heuristic, and an honest one: with a
+ * rotating pool the buffer just written is the newest frame. It can tear --
+ * nothing here synchronises against chrome's compositor, so a region may be
+ * sampled mid-write. That is a known, measurable cost of this approach, not
+ * an oversight; see the ledger.
+ *
+ * Returns 0 and leaves gen unchanged when nothing changed since the last
+ * poll, so the caller can cheaply detect "no new frame".
+ */
+static uint64_t g_viz_hash[SHMCACHE_MAX];
+static int      g_viz_have[SHMCACHE_MAX];
+static uint32_t g_viz_gen;
+static int      g_viz_last = -1;
+
+long vizframe_poll(uint32_t *w, uint32_t *h, uint32_t *stride, uint32_t *gen,
+                   void *dst, size_t cap) {
+    uint32_t vw = w ? *w : 0, vh = h ? *h : 0;
+    if (!vw || !vh) return -22;                       /* -EINVAL: caller must say */
+    uint64_t want_bytes = (uint64_t)vw * vh * 4ull;
+    size_t   want_pages = (size_t)((want_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+
+    int newest = -1;
+    for (int i = 0; i < SHMCACHE_MAX; i++) {
+        struct shm_cache *sc = &g_shm[i];
+        if (!sc->used || !sc->pages || sc->npages != want_pages) continue;
+        uint64_t hv = census_hash_pages(sc->pages, sc->npages);
+        if (g_viz_have[i] && hv != g_viz_hash[i]) newest = i;   /* changed NOW */
+        g_viz_hash[i] = hv;
+        g_viz_have[i] = 1;
+    }
+    /* Nothing changed this poll: keep showing the last good buffer, and do
+     * NOT bump gen, so the caller knows there is no new frame. */
+    if (newest < 0) newest = g_viz_last;
+    else { g_viz_last = newest; g_viz_gen++; }
+    if (newest < 0) return -61;                        /* -ENODATA: none yet */
+
+    struct shm_cache *sc = &g_shm[newest];
+    if (!sc->used || !sc->pages) { g_viz_last = -1; return -61; }
+
+    if (w)      *w      = vw;
+    if (h)      *h      = vh;
+    if (stride) *stride = vw * 4u;
+    if (gen)    *gen    = g_viz_gen;
+
+    if (dst && cap) {
+        uint64_t n = want_bytes < cap ? want_bytes : cap;
+        uint64_t done = 0;
+        char *out = (char *)dst;
+        while (done < n) {
+            size_t pi = (size_t)(done / PAGE_SIZE);
+            size_t po = (size_t)(done % PAGE_SIZE);
+            uint64_t chunk = PAGE_SIZE - po;
+            if (chunk > n - done) chunk = n - done;
+            uint64_t ph = (pi < sc->npages) ? sc->pages[pi] : 0;
+            if (ph) memcpy(out + done,
+                           (char *)(ph + vmm_hhdm_offset()) + po, (size_t)chunk);
+            else    memset(out + done, 0, (size_t)chunk);
+            done += chunk;
+        }
+    }
+    return 0;
 }

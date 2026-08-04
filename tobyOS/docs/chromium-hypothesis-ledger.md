@@ -6250,3 +6250,124 @@ within seconds of the run starting — the same lesson slices 99–105 paid for
 twice over. Nothing here was inferred from reading chromium's source. The
 static binary scan came *after* run 4 pointed at it, to confirm a stated
 hypothesis rather than to generate one.
+
+---
+
+## SLICE 107 — **§6 CANDIDATE 1 IMPLEMENTED, VERIFIED ON SCREEN, AND MEASURED: +16.5%.** Chrome's viz shared bitmaps read directly; the JPEG+base64+pipe round trip is gone
+
+The handoff's strongest remaining perf candidate — "viz shared-memory frames
+over Mojo" — rested on one claim nobody had tested: that a framebuffer-sized
+shared region exists inside chrome and changes once per frame. Two tiers of
+this arc died from building on an unverified mechanism, so this slice tested
+it first, then built on the answer.
+
+### The premise check (a new instrument, and it was needed)
+
+`[census]`, on the 3s heartbeat: walk every shared region the kernel owns
+(`shm_cache` entries and memfds, the latter needing a new registry), hash a
+sample of each, report size and how many rounds saw the contents CHANGE.
+
+**Run 1 (single-process) found nothing, and that was the first real finding.**
+Chrome created exactly ONE memfd all run — Mojo's probe, the one that expects
+`EINVAL` — and every shared region was 1-65 pages. Nothing near viewport size.
+Structural, not incidental: under `--single-process` the renderer and viz
+share an address space, so a frame is a plain heap pointer and there is
+nothing to share. **Candidate 1 cannot exist in the configuration the perf
+vehicle has always used.**
+
+**Run 2 (multi-process, `CW_MP`) confirmed the premise outright:**
+
+```
+[census] r113 shm#40 ino=84 pages=469 (1876KiB) chg=88 CHANGED
+[census] r113 shm#42 ino=84 pages=469 (1876KiB) chg=88 CHANGED
+[census] r113 shm#43 ino=84 pages=469 (1876KiB) chg=81 CHANGED
+[census] r113 shm#45 ino=84 pages=469 (1876KiB) chg=80 CHANGED
+```
+
+469 pages is exactly 800x600x4. A POOL of them, each rewritten 60-96 times
+across 113 rounds, while chrome produced 13,347 frames. Those are software
+compositing's shared bitmaps.
+
+### The implementation reuses tier 2.5's corpse
+
+Tier 2.5 built a complete consumer for pixels chrome would push through
+MIT-SHM — poll, count, switch off CDP on evidence, blit — and chrome never
+pushed any. **That consumer is now fed by a producer that demonstrably
+exists.** `ABI_SYS_VIZFRAME_POLL` (187) deliberately reuses `struct
+abi_xframe`, so chromewin's blit path, frame accounting and one-way
+screencast shutdown are reused verbatim; only the producer differs.
+
+- kernel (`vizframe_poll`, mmap.c): match shared regions by exactly `w*h*4`,
+  hash each, copy out the one that changed MOST RECENTLY, bump `gen` only on
+  a real change so "no new frame" costs one syscall and no copy.
+- the VIEWPORT comes IN through `info->w/h` — the kernel cannot know the
+  window size, and guessing it would have been one more unverified assumption.
+
+### MEASURED (same config, same page, steady state)
+
+```
+   CDP screencast     (mp)   41.9 fps
+   viz shared bitmaps (viz)  48.8 fps     +16.5%
+```
+
+**Verified, not inferred:** the screendump shows anim.html rendering
+correctly — "tick 8457 (61.0/s) raf=8101" — with `[cwviz] VIZ frames live (5)
+-- screencast STOPPED` at 20s. Real content, correct text, no visible tearing.
+
+### What this is NOT
+
+- **NOT the ~2.3x slice 68 predicted.** That estimate assumed removing the
+  encode removed the bottleneck. It did not: the page's own rAF runs at 61/s
+  and we capture 48.8, so the ceiling is now OUR CAPTURE, not chrome's encode.
+- **NOT zero-copy.** The kernel still copies 1.9 MiB per frame through
+  `copy_to_user` and hashes the candidate regions every poll. "Encode-free"
+  is the honest description.
+- **NOT free.** The mechanism only exists multi-process, and multi-process
+  drives the guest at ~46% of wall clock. The fps number does not show that.
+- **NOT reliable yet.** See below.
+
+### The multi-process bootstrap flake — REAL, and mechanism UNIDENTIFIED
+
+Multi-process chrome reached steady-state frames in **2 of 4** runs. The other
+two reached `sessionId` and never bootstrapped, with the guest clock running
+fine (331s of 420s), so it is not a timeout.
+
+**Three hypotheses tested and REJECTED with data, none of them the cause:**
+
+1. *The CoW-fork cap (16) fired.* No — only 4 forks in both runs.
+2. *A chrome child crashed in glibc's fork.* There IS such a crash, precisely
+   fingerprinted — `libc.so.6 +0xb1a66`, `cr2=0x0`, `err=0x6` (write to NULL),
+   `rdi=0x01200011` = `CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD`, i.e.
+   glibc `fork()` — but it happens in the SUCCESSFUL run too, so it is
+   survivable and not the discriminator.
+3. *The ~4 GiB `PROT_NONE` probe storm* (slice 106's finding). Present in
+   both, 36 vs 37 probes.
+
+Recorded as open rather than guessed at a fourth time. The failing runs are
+missing the `network`/`utility`/`none` child processes the successful ones
+spawn — that is where to look next.
+
+### One follow-up TESTED AND REJECTED — sampling faster makes it slower
+
+The obvious next lever looked sound: the CDP path is PUSH (wake on the pipe)
+while the viz path is POLL, a 15 ms nap caps sampling at 66/s, and we captured
+48.8 fps against a page producing 61/s. So poll granularity looked like the
+constraint. **Measured at 4 ms: 38.3 fps — worse by a fifth.**
+
+Polling harder does not catch more frames, it steals the CPU that produces
+them: every poll hashes ~7 candidate regions before it can decide whether
+anything changed. **The capture ceiling is that hashing plus the 1.9 MiB copy,
+not the nap.** Reverted to 15 ms — the configuration the verified +16.5% was
+measured in. (n=1 per arm and multi-process runs vary, so 38.3 is indicative;
+but there is no evidence FOR the change, so it does not ship.)
+
+That also names where the remaining headroom actually is: stop hashing every
+candidate every poll (have the kernel remember which region chrome wrote), and
+stop copying (map the region read-only instead). Both are real slices.
+
+### Also fixed here
+
+The census's own vacuity guard matched only `[cwif] frame` and therefore
+announced "chrome produced NO frames" for a run containing 15,390 `[cwviz]`
+ones. Both markers now count. (The same guard caught a genuinely frameless run
+correctly, which is why it exists.)

@@ -4157,6 +4157,42 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return 0;
     }
 
+    case ABI_SYS_VIZFRAME_POLL: {
+        /* Slice 107: chrome's viz shared bitmap, straight to the caller --
+         * no JPEG, no base64, no pipe. Same struct as XFRAME_POLL so
+         * chromewin reuses its blit path; the difference is that this
+         * producer exists (census-proven) and tier 2.5's did not.
+         * The VIEWPORT comes IN through info->w/h: the kernel matches
+         * regions by w*h*4 and has no way to know the window size. */
+        extern long vizframe_poll(uint32_t *, uint32_t *, uint32_t *,
+                                  uint32_t *, void *, size_t);
+        if (!a1) return -ABI_EINVAL;
+        struct abi_xframe req;
+        if (copy_from_user(&req, (const void *)(uintptr_t)a1, sizeof req) != 0)
+            return -ABI_EFAULT;
+        uint32_t w = req.w, h = req.h, stride = 0, gen = 0;
+        void  *upix = (void *)(uintptr_t)a2;
+        size_t cap  = (size_t)a3;
+        uint8_t *tmp = 0;
+        if (upix && cap) {
+            tmp = kmalloc(cap);
+            if (!tmp) return -ABI_ENOMEM;
+        }
+        long rc = vizframe_poll(&w, &h, &stride, &gen, tmp, cap);
+        if (rc < 0) { if (tmp) kfree(tmp); return rc; }
+        struct abi_xframe xf = { w, h, stride, gen };
+        if (copy_to_user((void *)(uintptr_t)a1, &xf, sizeof xf) != 0)
+            { if (tmp) kfree(tmp); return -ABI_EFAULT; }
+        if (tmp) {
+            size_t nbytes = (size_t)stride * h;
+            if (nbytes > cap) nbytes = cap;
+            if (copy_to_user(upix, tmp, nbytes) != 0)
+                { kfree(tmp); return -ABI_EFAULT; }
+            kfree(tmp);
+        }
+        return 0;
+    }
+
     case ABI_SYS_UNIX_SOCKET:
         return sys_unix_socket();
 
