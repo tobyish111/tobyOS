@@ -1,0 +1,29 @@
+<!doctype html>
+<!-- Slice 117: font-coverage acceptance page. One screendump answers all
+     three questions: does serif render as a REAL serif (DejaVu Serif, not
+     Lato), does monospace ALIGN (DejaVu Sans Mono -- the ruler rows line up
+     only in a real mono face), and do emoji still come from Twemoji. -->
+<html>
+<head><title>tobyOS font test</title>
+<style>
+  html,body{margin:0;background:#ffffff;color:#111;overflow:hidden}
+  section{padding:10px 16px;border-bottom:2px solid #ccc}
+  h2{margin:0 0 6px 0;font:16px sans-serif;color:#666}
+  .sans {font:26px sans-serif}
+  .serif{font:26px serif}
+  .mono {font:20px monospace;white-space:pre}
+</style></head>
+<body>
+<section><h2>sans-serif (Lato)</h2>
+  <div class="sans">Grumpy wizards make toxic brew. 0123456789 Illegal 1lI 0O</div></section>
+<section><h2>serif (should be DejaVu Serif: real serifs on I, l, T)</h2>
+  <div class="serif">Grumpy wizards make toxic brew. 0123456789 Illegal 1lI 0O</div></section>
+<section><h2>monospace (columns MUST align)</h2>
+  <div class="mono">iiiiiiiiii|
+MMMMMMMMMM|
+0123456789|
+llllllllll|</div></section>
+<section><h2>emoji (Twemoji)</h2>
+  <div class="sans">&#x1F600; &#x1F680; &#x2764;&#xFE0F; &#x1F44D;</div></section>
+</body>
+</html>

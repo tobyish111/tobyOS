@@ -810,6 +810,10 @@ static void cdp_dispatch(void) {
                  "\"everyNthFrame\":" CW_STR(CW_NTH) "}",
                  g_page_w, g_page_h);
         cdp_send("Page.startScreencast", scp, 1);
+        /* Slice 118: the bar shows where we ARE -- lift the frame's url out
+         * of the event (json_str finds the first "url" key, which is the
+         * navigated frame's). */
+        json_str(g_msg, "url", g_status, sizeof g_status);
         printf("[chromewin] main-frame navigation -- screencast restarted\n");
         return;
     }
@@ -1969,6 +1973,31 @@ static void vizframe_poll_once(void) {
 #endif /* CW_VIZ */
 #endif /* CW_HAVE_XF */
 
+/* ---- Slice 118: the omnibox -------------------------------------------- *
+ * The bar becomes a real browser control: [<] [>] [ URL... ]. Clicking the
+ * URL area focuses the omnibox (keys edit it instead of going to the page);
+ * Enter navigates (slice 116's frameNavigated restart keeps the display
+ * alive across it), Esc cancels. Back/forward ride history.back/forward()
+ * via Runtime.evaluate -- CDP has no direct history commands. */
+static int  g_omni_active;
+static char g_omni[240];
+static int  g_omni_len;
+
+static void omni_navigate(void) {
+    if (!g_omni_len) { g_omni_active = 0; tk_redraw(&win); return; }
+    char url[300];
+    if (strstr(g_omni, "://"))  snprintf(url, sizeof url, "%s", g_omni);
+    else if (g_omni[0] == '/')  snprintf(url, sizeof url, "file://%s", g_omni);
+    else                        snprintf(url, sizeof url, "https://%s", g_omni);
+    char p[360];
+    snprintf(p, sizeof p, "{\"url\":\"%s\"}", url);
+    cdp_send("Page.navigate", p, 1);
+    snprintf(g_status, sizeof g_status, "%s", url);
+    g_omni_active = 0;
+    g_omni_len = 0; g_omni[0] = 0;
+    tk_redraw(&win);
+}
+
 static void paint(struct tk_window *w, struct tk_widget *cv) {
     (void)cv;
     long tp0 = sys_clock_ms();
@@ -1977,9 +2006,18 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
     int pw = w->w, ph = w->h - BAR_H;
     if (pw < 64) pw = 64;
     if (ph < 64) ph = 64;
-    /* URL/status bar */
+    /* URL/status bar -- slice 118: [<] [>] [ URL/omnibox ] */
     tk_draw_fill(w, 0, 0, pw, BAR_H, 0x00202028u);
-    tk_draw_text(w, 8, 6, g_status, 0x00d0d0d8u, 14, 0);
+    tk_draw_text(w, 8, 6, "<", 0x00a0c0e0u, 14, 0);
+    tk_draw_text(w, 34, 6, ">", 0x00a0c0e0u, 14, 0);
+    if (g_omni_active) {
+        tk_draw_fill(w, 54, 2, pw - 58, BAR_H - 4, 0x00303a48u);
+        char ob[256];
+        snprintf(ob, sizeof ob, "%s_", g_omni);        /* trailing cursor */
+        tk_draw_text(w, 60, 6, ob, 0x00f0f4f8u, 14, 0);
+    } else {
+        tk_draw_text(w, 60, 6, g_status, 0x00d0d0d8u, 14, 0);
+    }
     /* page area.
      * TIER 2.5: once the SHM path is live it OWNS the page -- chrome
      * composites straight into our segment, so there is nothing to decode.
@@ -2034,10 +2072,28 @@ static void on_event(struct tk_window *w, struct tk_widget *cv,
     if (!g_session[0]) return;
     int py = ev->y - BAR_H;                    /* canvas is window-wide; the
                                                 * page starts below the bar */
-    if (py < 0) return;
+    if (py < 0) {
+        /* Slice 118: bar clicks. [<]=back  [>]=forward  rest=omnibox. */
+        if (ev->type == TK_EV_MOUSE_DOWN) {
+            if (ev->x < 28)
+                cdp_send("Runtime.evaluate",
+                         "{\"expression\":\"history.back()\"}", 1);
+            else if (ev->x < 54)
+                cdp_send("Runtime.evaluate",
+                         "{\"expression\":\"history.forward()\"}", 1);
+            else {
+                g_omni_active = 1;
+                g_omni_len = 0; g_omni[0] = 0;
+            }
+            tk_redraw(&win);
+        }
+        return;                                /* bar events never reach the page */
+    }
     switch (ev->type) {
     case TK_EV_MOUSE_MOVE: send_mouse("mouseMoved",    ev->x, py, ev->button, 0); break;
-    case TK_EV_MOUSE_DOWN: send_mouse("mousePressed",  ev->x, py, ev->button, 1); break;
+    case TK_EV_MOUSE_DOWN:
+        if (g_omni_active) { g_omni_active = 0; tk_redraw(&win); }
+        send_mouse("mousePressed",  ev->x, py, ev->button, 1); break;
     case TK_EV_MOUSE_UP:   send_mouse("mouseReleased", ev->x, py, ev->button, 1); break;
     default: break;
     }
@@ -2045,6 +2101,22 @@ static void on_event(struct tk_window *w, struct tk_widget *cv,
 
 static void on_key(struct tk_window *w, struct tk_event *ev) {
     (void)w;
+    if (g_omni_active) {                       /* slice 118: omnibox owns keys */
+        uint8_t k = ev->key;
+        if (k == 27) { g_omni_active = 0; tk_redraw(&win); return; }
+        if (k == TK_KEY_ENTER) { omni_navigate(); return; }
+        if (k == TK_KEY_BACKSPACE) {
+            if (g_omni_len) g_omni[--g_omni_len] = 0;
+            tk_redraw(&win);
+            return;
+        }
+        if (k >= 0x20 && k < 0x80 && g_omni_len < (int)sizeof(g_omni) - 1) {
+            g_omni[g_omni_len++] = (char)k;
+            g_omni[g_omni_len] = 0;
+            tk_redraw(&win);
+        }
+        return;
+    }
     if (ev->key == 27) { g_quit = 1; return; } /* ESC quits the host */
     if (g_session[0]) send_key(ev->key);
 }

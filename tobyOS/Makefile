@@ -2531,11 +2531,13 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                 initrd/etc/c19b.lua \
                 initrd/etc/c20.lua \
                 initrd/etc/c21.lua \
-               initrd/etc/motd initrd/etc/anim.html initrd/etc/webgl.html initrd/etc/input.html initrd/etc/input2.html initrd/etc/egl_vendor.json \
+               initrd/etc/motd initrd/etc/anim.html initrd/etc/webgl.html initrd/etc/input.html initrd/etc/input2.html initrd/etc/fonttest.html initrd/etc/egl_vendor.json \
                initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
                initrd/etc/Lato-BoldItalic.ttf initrd/etc/fallback.otf \
                initrd/etc/emoji.ttf \
+               initrd/etc/DejaVuSerif.ttf initrd/etc/DejaVuSerif-Bold.ttf \
+               initrd/etc/DejaVuSansMono.ttf initrd/etc/DejaVuSansMono-Bold.ttf \
                initrd/etc/drvmatch.conf initrd/etc/drvmatch.conf.test \
                initrd/etc/lua_selftest.lua initrd/etc/resolv.conf \
                initrd/etc/fonts.conf \
@@ -2556,6 +2558,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/webgl.html                 $(INITRD_STAGE)/etc/webgl.html
 	cp initrd/etc/input.html                 $(INITRD_STAGE)/etc/input.html
 	cp initrd/etc/input2.html                $(INITRD_STAGE)/etc/input2.html
+	cp initrd/etc/fonttest.html             $(INITRD_STAGE)/etc/fonttest.html
 	cp initrd/etc/egl_vendor.json            $(INITRD_STAGE)/etc/egl_vendor.json
 	cp initrd/etc/Lato-Regular.ttf           $(INITRD_STAGE)/etc/Lato-Regular.ttf
 	cp initrd/etc/Lato-Bold.ttf              $(INITRD_STAGE)/etc/Lato-Bold.ttf
@@ -2563,6 +2566,10 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/Lato-BoldItalic.ttf        $(INITRD_STAGE)/etc/Lato-BoldItalic.ttf
 	cp initrd/etc/fallback.otf               $(INITRD_STAGE)/etc/fallback.otf
 	cp initrd/etc/emoji.ttf                  $(INITRD_STAGE)/etc/emoji.ttf
+	cp initrd/etc/DejaVuSerif.ttf            $(INITRD_STAGE)/etc/DejaVuSerif.ttf
+	cp initrd/etc/DejaVuSerif-Bold.ttf       $(INITRD_STAGE)/etc/DejaVuSerif-Bold.ttf
+	cp initrd/etc/DejaVuSansMono.ttf         $(INITRD_STAGE)/etc/DejaVuSansMono.ttf
+	cp initrd/etc/DejaVuSansMono-Bold.ttf    $(INITRD_STAGE)/etc/DejaVuSansMono-Bold.ttf
 	cp initrd/etc/drvmatch.conf              $(INITRD_STAGE)/etc/drvmatch.conf
 	cp initrd/etc/drvmatch.conf.test         $(INITRD_STAGE)/etc/drvmatch.conf.test
 	cp initrd/etc/lua_selftest.lua           $(INITRD_STAGE)/etc/lua_selftest.lua
@@ -3121,6 +3128,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
 	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
 	    etc/Lato-BoldItalic.ttf etc/fallback.otf etc/emoji.ttf        \
+	    etc/DejaVuSerif.ttf etc/DejaVuSerif-Bold.ttf                  \
+	    etc/DejaVuSansMono.ttf etc/DejaVuSansMono-Bold.ttf            \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
@@ -3139,7 +3148,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    repo/helloapp_caps_ro.tpkg                                        \
 	    system/keys/trust.db                                              \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
-	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
+	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    readme.txt $$EXTRA_FILES

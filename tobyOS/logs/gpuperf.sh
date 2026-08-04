@@ -33,7 +33,8 @@ case "$PAGE" in
   anim)  URL='file:///etc/anim.html' ;;
   webgl) URL='file:///etc/webgl.html' ;;
   input) URL='file:///etc/input.html' ;;   # slice 114: static latency-probe page
-  *)     echo "usage: $0 {cpu|gl} {anim|webgl|input}"; exit 2 ;;
+  font)  URL='file:///etc/fonttest.html' ;; # slice 117: font-coverage acceptance
+  *)     echo "usage: $0 {cpu|gl} {anim|webgl|input|font}"; exit 2 ;;
 esac
 
 # The quotes around the URL must reach the COMPILER, which means surviving two
