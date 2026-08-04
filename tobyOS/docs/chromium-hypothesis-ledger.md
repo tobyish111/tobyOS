@@ -6506,3 +6506,139 @@ Next instrument named in the handoff: `tls_base` vs the live `IA32_FS_BASE`
 MSR at fatal time, plus a disassembly of `libc.so.6 + 0xb1a66`.
 
 Handoff written to `docs/chromium-handoff-post-slice-108.md`.
+
+---
+
+## SLICE 109 — **THE FLAKE IS ROOT-CAUSED AND FIXED: a proc-slot allocation race.** sys_fork and sys_clone_thread built in the SAME slot; the "glibc fork NULL deref" was a fork child executing a demand-zeroed text page under a stolen identity
+
+The handoff's decisive instrument (tls_base vs `IA32_FS_BASE`) was never
+needed. The chain broke open from a static contradiction, and every link
+after it came from the already-archived failing log — no new runs were
+spent on diagnosis.
+
+### Step 1: the crash address was attributed against the wrong base
+
+`libc.so.6 + 0xb1a66` (slices 107/108) was computed as `rip - vma_start`
+of the **r-x segment VMA** (`[libmap] base=0x100000aeb000 off=0x28000`),
+not the ELF load base (`0x100000ac3000`). At vaddr `0xb1a66` libc's bytes
+are mid-instruction inside `__strcpy_sse2_unaligned` — that attribution
+could not be right. The true file vaddr is `0xb1a66 + 0x28000 = 0xd9a66`:
+
+```
+00000000000d9a30 <_Fork>:
+   ...
+   d9a64:  0f 05                syscall
+   d9a66:  48 3d 00 f0 ff ff    cmp $0xfffffffffffff000,%rax   <- fatal rip
+```
+
+`_Fork+0x36` — the instruction **immediately after the clone syscall**.
+So "glibc's fork" was right. But `cmp reg,imm` **cannot write memory**,
+and the fault is `err=0x6` — a user-mode WRITE to address 0. The
+instruction at the fatal rip is architecturally incapable of the fault
+recorded at it. Therefore the CPU was not executing libc's bytes.
+
+### Step 2: the register dump is a fork CHILD's first instruction
+
+`rax=0` (child side of the clone return), `rcx=rip` (syscall convention),
+`rdi=0x1200011` (the clone flags), `rsp/rbp/rbx/r12` byte-identical
+across BOTH deaths (the same forking parent thread's stack) — and the
+dump's `cr3` **equals the brand-new child's cr3 from the matching
+`[fork]` line** (death 1: `0x2af1b000` = child pid 32; death 2:
+`0x43f7f000` = child pid 38). The dying context is the fresh CoW-fork
+child at its very first user instruction.
+
+### Step 3: what actually executed — a zero page
+
+The `[pfres]` ring shows the child's first-touch instruction-FETCH fault
+at that rip (`err=0x14`, resolved `how=2` = mmap demand path) ~2 ms
+before the fatal write. The two deaths mapped two **different** phys
+frames (`0x54383000`, `0x6ed7b000`) for the same libc text page — not a
+shared page-cache frame, i.e. freshly zero-filled pages. Executing
+zeros: `00 00` decodes to `add %al,(%rax)`, and with `rax=0` that is
+precisely a user-mode WRITE to NULL from a PRESENT rip page. Every
+"impossible" detail of the fingerprint reproduces.
+
+### Step 4: WHY the child was that broken — the slot collision
+
+`sys_fork` claims its proc-table slot by scanning for
+`state == PROC_UNUSED` — and then **leaves the slot marked UNUSED for
+the entire build**, which spans `tg_vm_quiesce` + `vmm_cow_fork` +
+VMA/fd/kstack cloning: 200–700 ms of wall clock under `-smp 4`.
+`sys_clone_thread` allocates slots the same way. Chrome's fresh children
+create threads constantly. When a thread-create lands inside a fork's
+build window it claims the SAME slot and builds a live thread in it;
+fork's later writes (fd table, kstack pointers, staged `_Fork` return
+frame, `state=READY`, enqueue) then land on the live thread's struct.
+
+The archived failing log (`gpuperf_viz_anim.001.log`) shows it directly,
+twice:
+
+| fork window (pid 13) | child | colliding clone | victim |
+|---|---|---|---|
+| 13925 -> 14125 ms | pid 32 | `[clone] thread tid=32 in tgid=18` @ 13938 ms | gpu-process loses a live thread |
+| 15653 -> 16356 ms | pid 38 | `[clone] thread tid=38 in tgid=23` @ 15910 ms | network service loses a live thread |
+
+The dying proc at death 2 is a **mongrel**: `[isr] TLS: pid=38 tgid=23
+is_thread=1` — fork-child pid with the thread's identity. That is also
+why `[pfrej]` printed `pid=18` / `pid=23`: it prints `proc_mm_pid()`,
+which followed the stolen `tgid` to the victim's VMA table — and
+resolving the fork child's first-touch fetch against the WRONG process's
+VMA table is what turned it into a zero-fill instead of the libc file
+page.
+
+**Two prior confusions dissolve:**
+
+- *"The same crash occurs in successful runs — survivable"* (slice 107's
+  rejected hypothesis 2): it was ALWAYS this bug. Pre-fix archived runs
+  002 and 003 ("successful") each contain ONE exception at the identical
+  rip `0x100000b9ca66`, and each has a clone-inside-fork-window
+  collision on exactly the dead child's slot (tid 33 @ 10145 ms inside
+  fork window 9996->10246 for child 33; tid 27 @ 8670 ms inside
+  8633->8763 for child 27). **3 of 3 archived pre-fix viz runs
+  collided.** The "flake rate" was just the probability that the victim
+  was load-bearing for bootstrap.
+- *The gpu-process re-exec at 29 s*: chrome restarting a process that
+  had silently lost a live thread to the collision.
+
+### The fix
+
+`PROC_EMBRYO`, claimed atomically (proc.h/proc.c/fork.c/thread.c +
+reader sweep):
+
+- `proc_slot_claim()` — now the ONLY slot allocator: CAS
+  `state UNUSED -> EMBRYO`. All five allocation sites route through it
+  (`sys_fork`, `sys_fork_share`, `sys_clone_thread`, `thread_create`,
+  `proc_create[_kernel]` via `alloc_slot`).
+- `proc_slot_wipe()` — zeroes a claimed slot WITHOUT ever exposing
+  `state==0` (a bare memset re-opens the race for a few ns).
+- EMBRYO is "not a process" everywhere a mid-build slot must stay
+  invisible: `proc_lookup`, the quiesce/resume loops, `signal_send` and
+  the kill(0)/kill(-1) broadcasts, oom, the sched dispatch guards,
+  procfs, thread-group scans. This is exactly the invisibility
+  `PROC_UNUSED` accidentally provided mid-build — minus the
+  claimability.
+- Failure paths release by resetting `state = PROC_UNUSED` (audited:
+  every between-claim-and-commit exit already did).
+
+### VERIFIED — post-fix, four full-length viz runs
+
+| run | bootstrap | frames @270s probe | steady fps (last 20 s) | EXCEPTION dumps | collisions |
+|---|---|---|---|---|---|
+| 004 | OK (renderers @ 8.5 s, 12.3 s) | 14,129 | 53.5 | **0** | **0** |
+| 005 | OK | 14,091 | 53.5 | **0** | **0** |
+| 006 | OK | 14,103 | 52.5 | **0** | **0** |
+| 007 | OK | 14,182 | 53.7 | **0** | **0** |
+
+Pre-fix: 3 of 3 archived runs collided (one fatal to bootstrap, two
+"survivable"). Post-fix: **4 of 4 clean**, and the frame totals now sit
+within ±0.3% of each other where pre-fix successful runs ranged
+10,410–15,390 — the collision was killing throughput in the "successful"
+runs too (dead renderers respawned mid-run, gpu re-execs).
+
+Two side observations, recorded not claimed: guest clock reached
+79–80% of wall in all four runs (the slice 107 figure was ~46%), and
+steady-state fps ~53 vs the 52.4 shipped in slice 108. Both plausibly
+the same mechanism (no more thread-loss churn), neither A/B'd.
+
+defboot stock regression: PASS (markers present, fault list clean).
+

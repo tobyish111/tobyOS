@@ -60,7 +60,8 @@ bool oom_is_protected(int pid) {
 
 int oom_score(struct proc *p) {
     if (!p) return 0;
-    if (p->state == PROC_UNUSED || p->state == PROC_TERMINATED) return 0;
+    if (p->state == PROC_UNUSED || p->state == PROC_EMBRYO ||
+        p->state == PROC_TERMINATED) return 0;
 
     size_t total = pmm_total_pages();
     if (total == 0) return 0;
@@ -116,7 +117,8 @@ void oom_check(void) {
 
     for (int i = 0; i < PROC_MAX; i++) {
         struct proc *p = &g_proc[i];
-        if (p->state == PROC_UNUSED || p->state == PROC_TERMINATED)
+        if (p->state == PROC_UNUSED || p->state == PROC_EMBRYO ||
+            p->state == PROC_TERMINATED)
             continue;
         if (oom_is_protected(p->pid))
             continue;

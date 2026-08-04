@@ -479,7 +479,8 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
             return;
     }
     if (to && to->pid != 0 &&
-        (!to->kstack_top || !to->saved_rsp || to->state == PROC_UNUSED)) {
+        (!to->kstack_top || !to->saved_rsp || to->state == PROC_UNUSED ||
+         to->state == PROC_EMBRYO)) {
         kprintf("[sched] SKIP bad kstack pid=%d top=%p state=%d\n",
                 to->pid, to->kstack_top, (int)to->state);
         if (me->idle && from != me->idle)
@@ -669,7 +670,8 @@ void sched_enqueue(struct proc *p) {
     /* Slice 88: never re-arm a slot whose kstack was torn down, and never
      * put a VM-quiesced sibling back on a ready queue (tg_vm_resume owns
      * that). pid 0 is exempt: boot/idle legitimately has kstack_top == 0. */
-    if (p->pid != 0 && (!p->kstack_top || p->state == PROC_UNUSED))
+    if (p->pid != 0 && (!p->kstack_top || p->state == PROC_UNUSED ||
+                        p->state == PROC_EMBRYO))
         return;
     if (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE)) {
         p->state = PROC_BLOCKED;
@@ -1194,7 +1196,8 @@ void sched_tick(struct regs *r) {
                     now / 1000000ull, nt, (unsigned long)serial_dropped());
             for (int i = 0; i < PROC_MAX; i++) {
                 struct proc *p = &g_proc[i];
-                if (p->state == PROC_UNUSED || p->personality != 1) continue;
+                if (p->state == PROC_UNUSED || p->state == PROC_EMBRYO ||
+                    p->personality != 1) continue;
                 uint64_t waited = (nt > p->enq_tick) ? (nt - p->enq_tick) : 0;
                 kprintf("  pid=%d %-8s prio=%d io=%d enq=%lu wait=%lu eff=%d "
                         "onq=%d oncpu=%d rsp=%p\n",

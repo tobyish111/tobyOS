@@ -127,7 +127,8 @@ void signal_send(struct proc *p, int sig) {
     if (!p) return;
     if (sig <= 0 || sig >= SIG_MAX) return;
     if (p->pid == 0) return;
-    if (p->state == PROC_UNUSED || p->state == PROC_TERMINATED) return;
+    if (p->state == PROC_UNUSED || p->state == PROC_EMBRYO ||
+        p->state == PROC_TERMINATED) return;
 
 #ifdef CHROMIUM_BOOT
     /* [sig] Who kills whom. signal_send is the ONLY way a signal becomes
@@ -780,6 +781,7 @@ int sys_kill(int pid, int sig) {
         extern struct proc g_proc[];
         for (int i = 1; i < PROC_MAX; i++) {
             if (g_proc[i].state != PROC_UNUSED &&
+                g_proc[i].state != PROC_EMBRYO &&
                 g_proc[i].session_id == p->session_id) {
                 signal_send(&g_proc[i], sig);
                 if (sig > 0) {
@@ -792,7 +794,8 @@ int sys_kill(int pid, int sig) {
         /* Send to all processes (except pid 0) */
         extern struct proc g_proc[];
         for (int i = 1; i < PROC_MAX; i++) {
-            if (g_proc[i].state != PROC_UNUSED) {
+            if (g_proc[i].state != PROC_UNUSED &&
+                g_proc[i].state != PROC_EMBRYO) {
                 signal_send(&g_proc[i], sig);
                 if (sig > 0) {
                     g_proc[i].sigstate.si_pid[sig] = p->pid;

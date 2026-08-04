@@ -154,6 +154,7 @@ const char *proc_state_name(enum proc_state s) {
     case PROC_BLOCKED:    return "BLOCKED";
     case PROC_TERMINATED: return "TERMINATED";
     case PROC_STOPPED:    return "STOPPED";
+    case PROC_EMBRYO:     return "EMBRYO";
     }
     return "?";
 }
@@ -161,7 +162,7 @@ const char *proc_state_name(enum proc_state s) {
 struct proc *proc_lookup(int pid) {
     if (pid < 0 || pid >= PROC_MAX) return 0;
     struct proc *p = &g_proc[pid];
-    return p->state == PROC_UNUSED ? 0 : p;
+    return (p->state == PROC_UNUSED || p->state == PROC_EMBRYO) ? 0 : p;
 }
 
 void proc_dump_table(void) {
@@ -185,12 +186,41 @@ void proc_dump_table(void) {
     }
 }
 
-static struct proc *alloc_slot(void) {
+/* Slice 109: the ONLY slot allocator. Claim by CAS so two concurrent
+ * allocators (sys_fork mid-cow_fork vs sys_clone_thread, two forks, spawn
+ * vs clone, ...) can never both build in the same slot. The old pattern --
+ * scan for UNUSED, leave state UNUSED until the final READY -- held the
+ * slot "free" for the whole build (hundreds of ms across cow_fork), and a
+ * chrome thread-create landing in that window built a live thread inside
+ * the fork child's slot: the child then ran with the thread's identity
+ * (mongrel pid/tgid/is_thread), executed a demand-zeroed text page and
+ * died at NULL, while the victim process lost the thread (the mp
+ * bootstrap flake, gpuperf_viz_anim.001.log). */
+struct proc *proc_slot_claim(void) {
     /* Slot 0 is reserved for kernel_main. Search 1..PROC_MAX-1. */
     for (int i = 1; i < PROC_MAX; i++) {
-        if (g_proc[i].state == PROC_UNUSED) return &g_proc[i];
+        enum proc_state expected = PROC_UNUSED;
+        if (__atomic_compare_exchange_n(&g_proc[i].state, &expected,
+                                        PROC_EMBRYO, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return &g_proc[i];
     }
     return 0;
+}
+
+void proc_slot_wipe(struct proc *p) {
+    /* Zero everything below and above `state` separately: a plain memset
+     * writes state=0 (PROC_UNUSED), and that instant is enough for a
+     * concurrent proc_slot_claim to steal the slot being built. */
+    size_t off = __builtin_offsetof(struct proc, state);
+    memset(p, 0, off);
+    memset((uint8_t *)p + off + sizeof(p->state), 0,
+           sizeof(*p) - off - sizeof(p->state));
+    p->state = PROC_EMBRYO;
+}
+
+static struct proc *alloc_slot(void) {
+    return proc_slot_claim();
 }
 
 void proc_init(void) {
@@ -589,9 +619,8 @@ static int spawn_internal(const char *path, const char *name,
         return -1;
     }
 
-    memset(p, 0, sizeof(*p));
+    proc_slot_wipe(p);                /* stays EMBRYO; READY at the very end */
     p->pid       = (int)(p - g_proc);
-    p->state     = PROC_UNUSED;       /* upgraded to READY at the very end */
     p->wait_pid  = -1;
     /* Slice 64c: "not inside a syscall" is -1, but memset leaves 0, which
      * is a VALID syscall number -- BKL hold time would be misattributed to
@@ -1009,9 +1038,8 @@ int proc_create_kernel(void (*entry)(void), const char *name) {
                 name ? name : "?");
         return -1;
     }
-    memset(p, 0, sizeof(*p));
+    proc_slot_wipe(p);                /* stays EMBRYO; READY at the end */
     p->pid        = (int)(p - g_proc);
-    p->state      = PROC_UNUSED;
     p->wait_pid   = -1;
     p->exit_code  = -1;
     p->ppid       = 0;
@@ -1165,7 +1193,8 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
         if (bkl_held()) bkl_exit();
         for (int i = 0; i < PROC_MAX; i++) {
             struct proc *q = &g_proc[i];
-            if (q == p || q->state == PROC_UNUSED) continue;
+            if (q == p || q->state == PROC_UNUSED ||
+                q->state == PROC_EMBRYO) continue;
             if (!(q->tgid == tgid || q->pid == tgid)) continue;
             q->exit_code = code;
             q->state = PROC_TERMINATED;
@@ -1278,7 +1307,8 @@ __attribute__((noreturn)) void proc_exit(int code) {
         /* Leader exiting -- kill all threads in this group */
         for (int i = 0; i < PROC_MAX; i++) {
             struct proc *q = &g_proc[i];
-            if (q == p || q->state == PROC_UNUSED) continue;
+            if (q == p || q->state == PROC_UNUSED ||
+                q->state == PROC_EMBRYO) continue;
             if (q->tgid == p->pid && q->is_thread) {
                 /* Force-terminate the thread */
                 q->exit_code = code;
@@ -1400,7 +1430,8 @@ static void proc_reap(struct proc *p) {
         struct proc *heir = 0;
         for (int i = 0; i < PROC_MAX; i++) {
             struct proc *q = &g_proc[i];
-            if (q == p || q->state == PROC_UNUSED) continue;
+            if (q == p || q->state == PROC_UNUSED ||
+                q->state == PROC_EMBRYO) continue;
             if (q->cr3 != p->cr3) continue;
             /* Prefer a still-runnable member; a TERMINATED-but-unreaped one is
              * an acceptable heir too, since it will run this same check. */
@@ -1461,7 +1492,8 @@ int proc_any_child(int ppid) {
     int live = -1;
     for (int i = 0; i < PROC_MAX; i++) {
         struct proc *q = &g_proc[i];
-        if (q->state == PROC_UNUSED || q->ppid != ppid) continue;
+        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+            q->ppid != ppid) continue;
         if (q->state == PROC_TERMINATED) return q->pid;   /* reap-ready */
         if (live < 0) live = q->pid;
     }

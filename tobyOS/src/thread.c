@@ -38,10 +38,9 @@
 extern struct proc g_proc[];
 
 static struct proc *thread_alloc_slot(void) {
-    for (int i = 1; i < PROC_MAX; i++) {
-        if (g_proc[i].state == PROC_UNUSED) return &g_proc[i];
-    }
-    return 0;
+    /* Slice 109: atomic claim -- a bare scan for UNUSED raced sys_fork's
+     * long build window (both claimed the same slot; the mp flake). */
+    return proc_slot_claim();
 }
 
 int thread_create(uint64_t entry, uint64_t arg,
@@ -67,10 +66,9 @@ int thread_create(uint64_t entry, uint64_t arg,
     struct proc *t = thread_alloc_slot();
     if (!t) return -1;
 
-    memset(t, 0, sizeof(*t));
+    proc_slot_wipe(t);       /* stays EMBRYO; upgraded to READY at end */
     t->pid   = (int)(t - g_proc);
     t->ppid  = tg_leader->ppid;
-    t->state = PROC_UNUSED;  /* upgraded at end */
 
     /* Copy name with "+T" suffix */
     size_t nlen = strlen(tg_leader->name);

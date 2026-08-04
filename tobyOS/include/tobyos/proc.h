@@ -87,6 +87,16 @@ enum proc_state {
      * treats it like BLOCKED (won't requeue on yield). Appended after
      * TERMINATED so existing state ordinals are unchanged. */
     PROC_STOPPED,
+    /* Slice 109: slot claimed by an allocator (fork/clone/spawn) but still
+     * being built. Every slot allocator used to leave state at PROC_UNUSED
+     * for the whole build -- sys_fork's window is hundreds of ms under
+     * cow_fork, and sys_clone_thread's scan would claim the SAME slot and
+     * interleave writes with it (the multi-process chrome bootstrap flake:
+     * fork child and live thread sharing one proc struct). Claimed by CAS
+     * in proc_slot_claim(); to every reader an EMBRYO slot must look
+     * exactly like PROC_UNUSED did mid-build: not a process. Appended so
+     * existing state ordinals are unchanged. */
+    PROC_EMBRYO,
 };
 
 struct proc {
@@ -610,8 +620,18 @@ int proc_wait(int pid);
 #define USER_STACK_MAX_BYTES     (8ULL * 1024ULL * 1024ULL)
 #define USER_STACK_FLOOR_VA      (USER_STACK_TOP_LIMIT_VA - USER_STACK_MAX_BYTES)
 
-/* Look up a PCB by PID. Returns NULL if not found or slot is UNUSED. */
+/* Look up a PCB by PID. Returns NULL if not found or slot is UNUSED/EMBRYO. */
 struct proc *proc_lookup(int pid);
+
+/* Atomically claim a free proc slot (state CAS UNUSED -> EMBRYO). The ONLY
+ * way to allocate a slot -- a plain "scan for UNUSED" race is exactly the
+ * chrome bootstrap flake. Release on failure by resetting state to
+ * PROC_UNUSED after clearing the fields the builder touched. */
+struct proc *proc_slot_claim(void);
+
+/* Zero a claimed slot WITHOUT ever exposing state==PROC_UNUSED (a bare
+ * memset would, letting a concurrent claimer steal the slot mid-build). */
+void proc_slot_wipe(struct proc *p);
 
 /* The fd table that `p` actually USES. For a CLONE_FILES thread this is the
  * thread-group leader's table, because a thread's own fds[] is deliberately left

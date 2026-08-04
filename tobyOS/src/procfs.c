@@ -199,7 +199,8 @@ static int gen_meminfo(char *buf, size_t cap) {
 static int live_proc_count(void) {
     int n = 0;
     for (int i = 0; i < PROC_MAX; i++)
-        if (g_proc[i].state != PROC_UNUSED) n++;
+        if (g_proc[i].state != PROC_UNUSED &&
+            g_proc[i].state != PROC_EMBRYO) n++;
     return n;
 }
 
@@ -209,7 +210,8 @@ static int gen_loadavg(char *buf, size_t cap) {
     int total = live_proc_count();
     int lastpid = 0;
     for (int i = 0; i < PROC_MAX; i++)
-        if (g_proc[i].state != PROC_UNUSED && g_proc[i].pid > lastpid)
+        if (g_proc[i].state != PROC_UNUSED &&
+            g_proc[i].state != PROC_EMBRYO && g_proc[i].pid > lastpid)
             lastpid = g_proc[i].pid;
     int off = 0;
     char tmp[24];
@@ -602,6 +604,7 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
                 uint32_t nthreads = 0;
                 for (int i = 0; i < PROC_MAX; i++) {
                     if (g_proc[i].state == PROC_UNUSED ||
+                        g_proc[i].state == PROC_EMBRYO ||
                         g_proc[i].state == PROC_TERMINATED) continue;
                     int qtg = g_proc[i].is_thread ? g_proc[i].tgid
                                                   : g_proc[i].pid;
@@ -746,7 +749,8 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
         }
         int pidx = dh->index - nglobals;
         for (int i = pidx; i < PROC_MAX; i++) {
-            if (g_proc[i].state != PROC_UNUSED) {
+            if (g_proc[i].state != PROC_UNUSED &&
+                g_proc[i].state != PROC_EMBRYO) {
                 memset(out->name, 0, VFS_NAME_MAX);
                 char tmp[16];
                 int_to_str(tmp, sizeof(tmp), g_proc[i].pid);

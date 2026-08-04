@@ -323,6 +323,7 @@ void tg_vm_quiesce(struct proc *actor) {
     for (int i = 0; i < PROC_MAX; i++) {
         struct proc *q = &g_proc[i];
         if (q == actor || q->state == PROC_UNUSED ||
+            q->state == PROC_EMBRYO ||
             q->state == PROC_TERMINATED) continue;
         if (q->cr3 != cr3) continue;
         __atomic_store_n(&q->vm_quiesce, 1, __ATOMIC_RELEASE);
@@ -353,6 +354,7 @@ void tg_vm_quiesce(struct proc *actor) {
         for (int i = 0; i < PROC_MAX; i++) {
             struct proc *q = &g_proc[i];
             if (q == actor || q->state == PROC_UNUSED ||
+                q->state == PROC_EMBRYO ||
                 q->state == PROC_TERMINATED) continue;
             if (q->cr3 != cr3) continue;
             if (q->state == PROC_READY) {
@@ -407,7 +409,8 @@ void tg_vm_resume(struct proc *actor) {
     uint64_t cr3 = actor->cr3;
     for (int i = 0; i < PROC_MAX; i++) {
         struct proc *q = &g_proc[i];
-        if (q == actor || q->state == PROC_UNUSED) continue;
+        if (q == actor || q->state == PROC_UNUSED ||
+            q->state == PROC_EMBRYO) continue;
         if (q->cr3 != cr3) continue;
         __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
         if (!q->vm_quiesced) continue;
@@ -440,14 +443,11 @@ long sys_fork(void) {
     struct proc *parent = current_proc();
     if (!parent || parent->pid == 0) return -ABI_EINVAL;
 
-    /* Find a free slot. */
-    struct proc *child = NULL;
-    for (int i = 1; i < PROC_MAX; i++) {
-        if (g_proc[i].state == PROC_UNUSED) {
-            child = &g_proc[i];
-            break;
-        }
-    }
+    /* Claim a free slot ATOMICALLY (state CAS UNUSED -> EMBRYO). This build
+     * runs for hundreds of ms across cow_fork; with the slot left UNUSED a
+     * concurrent sys_clone_thread claimed the SAME slot and both built in it
+     * (the mp bootstrap flake -- see the slice 109 ledger entry). */
+    struct proc *child = proc_slot_claim();
     if (!child) {
 #ifdef CHROMIUM_BOOT
         /* Slice 76: fork FAILURES were never logged, only successes -- and
@@ -469,7 +469,7 @@ long sys_fork(void) {
 
     child->pid       = child_pid;
     child->ppid      = parent->pid;
-    child->state     = PROC_UNUSED;
+    child->state     = PROC_EMBRYO;   /* memcpy copied parent's state */
     child->wait_pid  = -1;
     child->exit_code = -1;
     child->next_ready = NULL;
@@ -684,10 +684,7 @@ long sys_fork_share(void) {
                           ? proc_lookup(parent->tgid) : parent;
     if (!tg) tg = parent;
 
-    struct proc *child = NULL;
-    for (int i = 1; i < PROC_MAX; i++) {
-        if (g_proc[i].state == PROC_UNUSED) { child = &g_proc[i]; break; }
-    }
+    struct proc *child = proc_slot_claim();
     if (!child) return -ABI_ENOMEM;
 
     int child_pid = (int)(child - g_proc);
@@ -695,7 +692,7 @@ long sys_fork_share(void) {
 
     child->pid       = child_pid;
     child->ppid      = parent->pid;
-    child->state     = PROC_UNUSED;
+    child->state     = PROC_EMBRYO;   /* memcpy copied parent's state */
     child->wait_pid  = -1;
     child->exit_code = -1;
     child->next_ready = NULL;
@@ -848,10 +845,7 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
                           ? proc_lookup(parent->tgid) : parent;
     if (!tg) return -ABI_EINVAL;
 
-    struct proc *child = NULL;
-    for (int i = 1; i < PROC_MAX; i++) {
-        if (g_proc[i].state == PROC_UNUSED) { child = &g_proc[i]; break; }
-    }
+    struct proc *child = proc_slot_claim();
     if (!child) return -ABI_ENOMEM;
     int child_pid = (int)(child - g_proc);
 
@@ -866,7 +860,7 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->vfork_parent = 0;
     child->vfork_child  = 0;
     child->detached   = true;
-    child->state      = PROC_UNUSED;
+    child->state      = PROC_EMBRYO;  /* memcpy copied parent's state */
     child->wait_pid   = -1;
     child->exit_code  = -1;
     child->next_ready = NULL;

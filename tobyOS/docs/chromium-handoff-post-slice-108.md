@@ -1,14 +1,25 @@
 # Handoff: Chromium on tobyOS — post-slice-108
 
-Read this file, then `docs/chromium-hypothesis-ledger.md` (slices 105–108 at
+> **SLICE 109 UPDATE: §3's flake is ROOT-CAUSED, FIXED and VERIFIED** — a
+> proc-table slot allocation race (sys_fork left its slot PROC_UNUSED for the
+> whole 200–700 ms build; sys_clone_thread claimed the SAME slot and both
+> built in it). The "glibc fork NULL deref" was the fork child executing a
+> demand-zeroed text page under a stolen identity. Fixed with an atomic
+> EMBRYO slot claim; 4 of 4 post-fix full-length viz runs bootstrap clean
+> (pre-fix: 3 of 3 archived runs carried the collision). Full chain +
+> verification table: slice 109 in `docs/chromium-hypothesis-ledger.md`.
+> §3 below is kept as written for the record; job 1 is DONE. Job 2 (§5) is
+> now the open front, starting at item 2 (measure the producer).
+
+Read this file, then `docs/chromium-hypothesis-ledger.md` (slices 105–109 at
 the tail) **before touching anything**. The memory topic `chromium-bringup.md`
 carries the same history in compressed form. Baseline commit: `f14fd2a`.
 
 Your job, in order:
 
-1. **Root-cause the multi-process bootstrap flake.** It is reproduced,
+1. **Root-cause the multi-process bootstrap flake.** ~~It is reproduced,
    archived and localized — but NOT explained, and FIVE hypotheses are already
-   dead. Details in §3.
+   dead. Details in §3.~~ **DONE in slice 109 — see the banner above.**
 2. **Then continue the perf roadmap** from §5, which has been re-aimed twice
    by measurement and now points somewhere specific.
 

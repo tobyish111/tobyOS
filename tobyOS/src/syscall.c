@@ -7222,7 +7222,7 @@ void bt_dump_group(int tgid) {
     kprintf("[bt] ===== SIGKILL victim group tgid=%d call chains =====\n", tgid);
     for (int i = 1; i < PROC_MAX; i++) {
         struct proc *p = &g_proc[i];
-        if (p->state == PROC_UNUSED) continue;
+        if (p->state == PROC_UNUSED || p->state == PROC_EMBRYO) continue;
         if (p->pid != tgid && p->tgid != tgid) continue;
         /* Find its blocking-syscall label from the waitt table, if any. */
         const char *lbl = "(running)"; uint64_t arg = 0;
