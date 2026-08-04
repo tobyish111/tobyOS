@@ -6925,3 +6925,77 @@ ones: a fine-grained (or dirty-rect-aware) change detector for the viz
 path, and screencast-survival across navigation for chromewin as a real
 browser shell.
 
+---
+
+## SLICE 115 — **the interactive channel: viz-live now KEEPS the screencast, throttled by deferred acks — and the "producer ceiling" moves: 53 → 59.7 fps.** Slice 110's 52.7/s was partly an artifact of killing chrome's only frame consumer
+
+Slice 114 proved the shm pool is ANIMATION-ONLY (reclaimed on idle) and
+the coarse hash blind to small rects — so no kernel-side detector can
+ever see a keypress echo. Chrome's real dirty-rect channel IS the
+screencast, and viz-live used to stop it forever: in viz mode, typing
+into a loaded page updated NOTHING on screen. This slice fixes that
+class:
+
+- **Viz-live keeps the screencast.** Throttling uses the protocol's own
+  flow control: the screencast is single-in-flight (chrome encodes the
+  next frame only after our ack), so chromewin DEFERS the ack ~450 ms
+  while viz frames flow — encode drops to ~1.8/s (~free) — and acks
+  instantly when viz is silent, keeping the fast interactive path.
+- **Freshest source paints.** A screencast frame newer than the last viz
+  frame wins the blit (the keypress echo arrives only there).
+
+### MEASURED (full-length viz anim)
+
+```
+   viz gens: 15,201 over 267.6s guest  =  ~59.7/s steady  (was ~53)
+   screencast installs: ~489           =  ~1.8/s  (the throttle, as designed)
+   guest clock: 74.3% of wall          (was 79-80% -- chrome doing ~13% more
+                                        real frame work)
+   wall-clock fps: 42.2                (was 39.2 -- a win in BOTH clocks)
+```
+
+**The producer measurement (slice 110) gets a correction, not a
+retraction**: 52.7/s was chrome's commit rate WITH ITS ONLY FRAME
+CONSUMER KILLED (viz mode stopped the screencast at ~20 s; the census'
+readback was not a consumer chrome's scheduler counts). With a live
+consumer chrome commits ~59.7/s — 98% of the page's 61/s rAF. The
+measure-first gate's VERDICT stands (capture tracks the producer;
+optimize capture no further) but the ceiling itself was consumer-
+dependent. Recorded so nobody "re-discovers" ~6 fps by accident.
+
+---
+
+## SLICE 116 — **screencast survives navigation: the generic `Page.frameNavigated` restart.** And input latency lands at **36 ms median** — the restart also rebinds the session to the live document
+
+Slice 114 found the screencast dies across any cross-document
+navigation — as a browser shell, chromewin froze on the first link
+click. Now `cdp_dispatch` restarts the screencast on every MAIN-frame
+`Page.frameNavigated` (subframes carry `parentId`; a deferred ack for
+the dead session is dropped). The lat-mode probes' probe-local restart
+is REMOVED — the nav probes now verify the shipped mechanism.
+
+### MEASURED (full-length lat input run, zero timeouts both phases)
+
+```
+   [inlat]  n=60 median=36ms  p90=41ms  p99=84ms    (was 97/114/144)
+   [navlat] n=31 median=138ms p90=161ms p99=205ms   (was 122 via the
+                                probe-local restart; +16ms = waiting for
+                                the frameNavigated event -- the honest
+                                shipped-path number, and the p99 tail
+                                TIGHTENED from 798 to 205)
+```
+
+The 2.7x input-latency improvement was not designed for and needs an
+honest hypothesis: the bootstrap screencast attaches during early load
+(about:blank/first paint), and the frameNavigated restart REBINDS it to
+the live document's surface. Recorded as hypothesis, not fact — the
+numbers themselves are probe-verified with content gates and reproduce
+the infrastructure of slice 114.
+
+### Where the arc rests now
+
+**~59.7 fps at 98% of the page's own rate; input 36 ms median;
+navigation 138 ms median; interactive updates paint correctly in viz
+mode; navigation no longer kills the display.** chromewin is now
+plausible as a browser shell, not only a benchmark harness.
+

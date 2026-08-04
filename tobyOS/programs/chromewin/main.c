@@ -449,6 +449,17 @@ static long g_t_gap, g_gap_max, g_last_arr_ms;
 static long g_t_cap, g_n_cap;
 static long long g_last_cap_ms;          /* epoch ms from chrome, 0 = none */
 static long g_t_turn, g_n_turn, g_last_ack_ms;
+/* Slice 115: the screencast is chrome's DIRTY-RECT channel -- the shm pool
+ * is an ANIMATION-ONLY phenomenon (reclaimed on idle, slice 114), so
+ * stopping the screencast at viz-live froze every interactive update (a
+ * keypress echo, a link hover) forever. Keep it, throttled by the
+ * protocol's own flow control: chrome only encodes the next frame after
+ * our ack, so DEFERRING the ack while viz frames flow drops the encode
+ * rate to ~2/s during animation (~free) and instant acks while viz is
+ * silent keep the 97 ms interactive path. Single-in-flight => one slot. */
+static int  g_ack_pend_sid = -1;          /* deferred ack; -1 = none */
+static long g_ack_due_ms;
+static long g_cdp_last_ms;                /* last screencast frame install */
 static long g_t_shot, g_n_shot, g_shot_sent_ms;
 static int  g_n_push, g_n_poll;
 static int  g_arr_kind;                  /* 0 = polled reply, 1 = pushed */
@@ -511,6 +522,7 @@ static int install_b64_frame(void) {
     if (old) toby_image_free(old);
     g_frames++;
     g_last_frame_ms = sys_clock_ms();
+    g_cdp_last_ms = g_last_frame_ms;  /* slice 115: freshest-source paint */
     tk_redraw(&win);                  /* marks dirty; paint() runs in tk_pump */
 #ifdef CW_LAT
     /* Slice 114 v5: on a STATIC page chrome RECLAIMS the viewport-sized shm
@@ -584,10 +596,21 @@ static void handle_screencast_frame(void) {
      * overlaps chrome's next capture/encode with our decode of this frame.
      * (g_msg is not touched by cdp_send, so the payload survives the send.) */
     if (sid >= 0) {                                /* ack -> chrome sends the next */
-        char params[48];
-        snprintf(params, sizeof params, "{\"sessionId\":%d}", sid);
-        cdp_send("Page.screencastFrameAck", params, 1);
-        g_last_ack_ms = sys_clock_ms();
+#if defined(CW_VIZ) && !defined(CW_LAT)
+        /* Slice 115: defer the ack while viz frames flow (see decl block).
+         * Lat mode keeps instant acks -- its measurements are of the
+         * screencast path itself. */
+        if (g_xf_live && sys_clock_ms() - g_xf_last_ms < 300) {
+            g_ack_pend_sid = sid;
+            g_ack_due_ms = sys_clock_ms() + 450;
+        } else
+#endif
+        {
+            char params[48];
+            snprintf(params, sizeof params, "{\"sessionId\":%d}", sid);
+            cdp_send("Page.screencastFrameAck", params, 1);
+            g_last_ack_ms = sys_clock_ms();
+        }
     }
     g_arr_kind = 1;
     install_b64_frame();
@@ -770,6 +793,24 @@ static int probe_num(const char *key) {  /* " sy=" -> value, -1 if absent */
 static void cdp_dispatch(void) {
     if (strstr(g_msg, "\"method\":\"Page.screencastFrame\"")) {
         handle_screencast_frame();
+        return;
+    }
+    /* Slice 116: THE SCREENCAST DIES ACROSS A CROSS-DOCUMENT NAVIGATION
+     * (slice 114: page titles alternate, zero frames follow -- the first
+     * link click would freeze the window forever). Restart it whenever the
+     * MAIN frame navigates; a subframe's event carries "parentId". Any
+     * deferred ack belongs to the dead session -- drop it. */
+    if (strstr(g_msg, "\"method\":\"Page.frameNavigated\"") &&
+        !strstr(g_msg, "\"parentId\"")) {
+        char scp[128];
+        g_ack_pend_sid = -1;
+        snprintf(scp, sizeof scp,
+                 "{\"format\":\"jpeg\",\"quality\":" CW_STR(CW_Q) ","
+                 "\"maxWidth\":%d,\"maxHeight\":%d,"
+                 "\"everyNthFrame\":" CW_STR(CW_NTH) "}",
+                 g_page_w, g_page_h);
+        cdp_send("Page.startScreencast", scp, 1);
+        printf("[chromewin] main-frame navigation -- screencast restarted\n");
         return;
     }
     if (strstr(g_msg, "\"method\":\"Network.")) { note_network_event(); return; }
@@ -1761,18 +1802,10 @@ static void lat_probe_tick(void) {
         snprintf(p, sizeof p, "{\"url\":\"file:///etc/input%s.html\"}",
                  g_lat_navflip ? "2" : "");
         cdp_send("Page.navigate", p, 1);
-        /* v7: the screencast DIES across a cross-document navigation (v6:
-         * navigation verified via page titles, yet zero frames followed --
-         * 10 of 10 navs timed out at 10 s). Re-issue it immediately; chrome
-         * starts it on the new document and pushes its first frame, so
-         * [navlat] = navigate -> the new page's pixels reach the window,
-         * which is exactly what a user experiences. */
-        snprintf(p, sizeof p,
-                 "{\"format\":\"jpeg\",\"quality\":" CW_STR(CW_Q) ","
-                 "\"maxWidth\":%d,\"maxHeight\":%d,"
-                 "\"everyNthFrame\":" CW_STR(CW_NTH) "}",
-                 g_page_w, g_page_h);
-        cdp_send("Page.startScreencast", p, 1);
+        /* v7 restarted the screencast HERE; slice 116 moved the restart to
+         * the generic Page.frameNavigated handler (cdp_dispatch) so real
+         * link-click navigations get it too -- these probes now VERIFY the
+         * shipped mechanism instead of a probe-only workaround. */
     }
 }
 #endif /* CW_LAT */
@@ -1916,10 +1949,14 @@ static void vizframe_poll_once(void) {
      * screencast keeps driving and the window is never blank. */
     if (!g_xf_live && g_xf_frames >= XF_LIVE_FRAMES) {
         g_xf_live = 1;
-        cdp_send("Page.stopScreencast", "{}", 1);
-        if (g_frame) { free(g_frame); g_frame = 0; }
-        printf("[cwviz] VIZ frames live (%d) -- screencast STOPPED, reading "
-               "chrome's shared bitmaps directly\n", g_xf_frames);
+        /* Slice 115: do NOT stop the screencast -- it is the only channel
+         * chrome has for interactive/small-rect updates (the shm pool is
+         * reclaimed on idle, slice 114). The deferred-ack flow control in
+         * handle_screencast_frame throttles its encode cost to ~2/s while
+         * viz frames flow, so the slice-107/108 win survives. */
+        printf("[cwviz] VIZ frames live (%d) -- screencast KEPT as the "
+               "interactive channel (acks deferred while viz flows)\n",
+               g_xf_frames);
     }
     if (g_frames == 1 || (g_frames % 30) == 0)
         printf("[cwviz] frame %d: %dx%d gen=%u (viz shm path)\n",
@@ -1950,7 +1987,12 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
      * drives, which keeps a non-mapping Ozone run visually identical to the
      * slice-68 baseline instead of blank. */
 #ifdef CW_HAVE_XF
-    if (g_xf_live && (g_xf_pixels_ro || g_xf_pixels) && g_xf_w > 0) {
+    /* Slice 115: freshest source wins. With the screencast kept alive under
+     * viz-live, an interactive update (keypress echo on a static page)
+     * arrives ONLY as a screencast frame -- painting the stale viz buffer
+     * over it would hide exactly the updates the hybrid exists to show. */
+    if (g_xf_live && (g_xf_pixels_ro || g_xf_pixels) && g_xf_w > 0 &&
+        !(g_frame && g_cdp_last_ms > g_xf_last_ms)) {
         int fw = g_xf_w < pw ? g_xf_w : pw;
         int fh = g_xf_h < ph ? g_xf_h : ph;
         /* Slice 108: prefer the READ-ONLY mapping -- that is chrome's own
@@ -2054,6 +2096,17 @@ int main(void) {
 #endif
 #ifdef CW_VIZ
         vizframe_poll_once();      /* slice 107: chrome's viz shared bitmaps */
+        /* Slice 115: flush a deferred screencast ack once due (or at once
+         * when viz has gone quiet -- an interactive frame may be waiting). */
+        if (g_ack_pend_sid >= 0 &&
+            (sys_clock_ms() >= g_ack_due_ms ||
+             sys_clock_ms() - g_xf_last_ms >= 300)) {
+            char ackp[48];
+            snprintf(ackp, sizeof ackp, "{\"sessionId\":%d}", g_ack_pend_sid);
+            cdp_send("Page.screencastFrameAck", ackp, 1);
+            g_last_ack_ms = sys_clock_ms();
+            g_ack_pend_sid = -1;
+        }
 #ifdef CW_LAT
         lat_probe_tick();          /* slice 114: responsiveness probes */
 #endif
