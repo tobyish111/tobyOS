@@ -6694,3 +6694,48 @@ guest-wide (the ~230 ms `[bklmax]` residue, the ~20 ms ack-cycle) or a
 change of metric (input latency, navigation time). Frame-rate work on
 the capture path ends here.
 
+---
+
+## SLICE 111 — **the `[bklmax]` residue ATTRIBUTED: it is execve, and only at bootstrap. The steady-state residue no longer exists** — slice 109 took it with the slot race
+
+`[bklmax]` recorded pid+comm but not the SITE, which is why the residue
+stayed unattributed for four slices. It now also records the holder's
+`cursys`/`cursys_nat` at max-record time (sched.c, one field pair).
+
+### MEASURED (full-length viz run, post-109 kernel)
+
+```
+[60616]   [bklmax] hold=2782Mcyc pid=26 'chrome-headless' sys=59 nat=142
+[120529]  [bklmax] hold=92Mcyc   pid=0  'kernel_main'     sys=0  nat=0
+[180634]  [bklmax] hold=28Mcyc   pid=2  'chromewin'       sys=-1 nat=-1
+[240631]  [bklmax] hold=29Mcyc   pid=2  'chromewin'       sys=-1 nat=-1
+```
+
+- **The big hold is `sys=59` = execve: ~730 ms under the BKL**, once per
+  exec'd chrome process, all inside the bootstrap window. Chrome spawns
+  ~5 processes, so startup serializes seconds of whole-kernel convoy —
+  and the ENTIRE `[wlat]` tail of the run lives in that first interval
+  (max 1.1 s, 118 sub-second + 2 over-1s wake events; intervals 2-4:
+  max 13-23 ms, ZERO events ≥100 ms beyond single digits).
+- **Steady state is CLEAN. The documented "~230 ms residue" does not
+  reproduce on the post-109 kernel**: worst steady single hold is
+  ~7 ms (chromewin, native path), worst including kernel housekeeping
+  ~24 ms (pid 0 — consistent with the census/heartbeat diagnostics,
+  which are CHROMIUM_BOOT-only instrumentation, not production cost).
+  The residue was the pre-109 fork-window chaos.
+- **The "~20 ms ack-cycle" item also does not reproduce**: `[tlbto]`
+  reads `ack_timeouts=0 giveups=0` across the whole run.
+
+### VERDICT
+
+Steady-state guest throughput has no attributable single-hold kernel
+defect left at 53 fps. The one real, attributed, actionable hold is
+**execve's ~730 ms** — a bootstrap/navigation latency cost, not a
+steady-state fps cost. Fixing it means dropping the BKL around execve's
+image-build phase, which is DELICATE (the vmm editor root
+`g_pml4_phys` is a shared global also touched by BKL-free fault paths)
+and deserves its own slice: FIRST add phase timers inside sys_execve
+(vfs_read_all vs segment mapping vs BSS zero — the 730 ms is not yet
+split), THEN design the lock drop against what the split says. Named
+follow-up, not attempted here — the measure-first law.
+

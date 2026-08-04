@@ -149,12 +149,20 @@ measure before you optimise, and measure again after.
    signal-instead-of-poll rewrite at ≤8%; not worth chrome-mojo surgery.
    **The viz capture path is CLOSED. Do not reopen poll cadence (4 ms
    measured worse) or build event delivery for ≤8%.**
-3. **Re-rank — this is now the live item.** The remaining gap to 61/s is
-   chrome's pipeline under guest speed, so the honest candidates are
-   guest-wide throughput (the ~230 ms `[bklmax]` residue, the ~20 ms
-   ack-cycle) or a change of metric: responsiveness (input latency,
-   navigation time). §6 of `docs/chromium-handoff-post-slice-91.md` still
-   lists older candidates for reference.
+3. **Re-rank — this is now the live item.** ~~guest-wide throughput (the
+   ~230 ms `[bklmax]` residue, the ~20 ms ack-cycle)~~ **BOTH RESOLVED BY
+   MEASUREMENT (slice 111)**: the steady-state residue no longer exists on
+   the post-109 kernel (worst steady hold ~7 ms; the residue was the
+   fork-window chaos), and `[tlbto]` reads 0/0 all run. The one real
+   attributed hold is **execve: ~730 ms under the BKL per exec'd chrome
+   process, bootstrap/navigation only** — the entire `[wlat]` tail of a
+   run lives in the bootstrap interval. Named follow-up: phase-time
+   sys_execve (vfs_read_all vs mapping vs BSS zero), then design the BKL
+   drop (careful: `g_pml4_phys` editor root is a shared global). Beyond
+   that, the honest next metric is responsiveness (input latency,
+   navigation time — where the execve fix also lands). §6 of
+   `docs/chromium-handoff-post-slice-91.md` still lists older candidates
+   for reference.
 
 Also open, unrelated and unclaimed: the ~230 ms `[bklmax]` residue is still
 unattributed, and chrome's GL-init failure path storms ~4 GiB `PROT_NONE`
