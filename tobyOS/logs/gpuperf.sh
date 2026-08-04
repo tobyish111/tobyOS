@@ -77,7 +77,18 @@ if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ]; then
 else
     SMP=4 $PY logs/run_watch.py 2>&1 | tail -6
 fi
+# Slice 108: keep EVERY run, not just the last. These logs were overwritten
+# per mode, and that destroyed the only failing multi-process run before it
+# could be diagnosed -- worse, it led to a SUCCESSFUL run's log being analysed
+# as if it were the failure. A flake you cannot re-read is a flake you cannot
+# fix. The numbered copy is the archive; the plain name stays as "latest".
+RUNIDX=1
+while [ -e "logs/gpuperf_${TAG}.$(printf %03d $RUNIDX).log" ]; do
+    RUNIDX=$((RUNIDX+1))
+done
+cp logs/run_watch.log "logs/gpuperf_${TAG}.$(printf %03d $RUNIDX).log"
 cp logs/run_watch.log "logs/gpuperf_${TAG}.log"
+echo "run archived as logs/gpuperf_${TAG}.$(printf %03d $RUNIDX).log"
 L="logs/gpuperf_${TAG}.log"
 
 echo "=== [3/3] verdict ==="

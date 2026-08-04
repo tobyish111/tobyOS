@@ -6371,3 +6371,63 @@ The census's own vacuity guard matched only `[cwif] frame` and therefore
 announced "chrome produced NO frames" for a run containing 15,390 `[cwviz]`
 ones. Both markers now count. (The same guard caught a genuinely frameless run
 correctly, which is why it exists.)
+
+---
+
+## SLICE 108 (correction) — **SLICE 107's FLAKE FIGURE AND ITS "LEAD" WERE BOTH WRONG.** Retracted here, with the cause: the harness overwrote the evidence
+
+Slice 107 reported "multi-process bootstrap succeeded in 2 of 4 runs" and
+offered a lead ("failing runs never spawn the `network`/`utility`/`none`
+children"). **Both are retracted.**
+
+### The corrected tally
+
+Recovered from the preserved per-run task outputs:
+
+| run | length | outcome |
+|---|---|---|
+| mp #1 | 150 s | guest reached only 69 s — **cut off before bootstrap, not a bootstrap failure** |
+| mp #2 | 420 s | SUCCESS, 13,347 frames |
+| viz #1 | 420 s | SUCCESS, 15,390 frames |
+| viz #2 | 420 s | **FAILED** — no frames, no viewport-sized regions |
+| viz #3 | 420 s | SUCCESS, 10,410 frames |
+
+**Of full-length runs: 3 of 4 bootstrapped, 1 did not.** The 150 s run was
+counted as a failure when it was simply too short — it is not evidence of a
+flake at all.
+
+### Why the "lead" was wrong, and it is the more important error
+
+`logs/gpuperf_<mode>.log` was **overwritten by every run of that mode**. The
+one genuine failure (viz #2) was destroyed by viz #3 before it was analysed —
+and the log examined "as the failure" was in fact viz #3, a run that produced
+10,410 frames. The differences dutifully catalogued from it (one renderer
+instead of two, every spawn ~2x later) are differences between two SUCCESSFUL
+runs, and say nothing about the failure.
+
+The `network`/`utility`/`none` claim compounded that: it came from grepping
+`type=` across the whole log, which matches strings in `--vmodule` arguments
+and elsewhere, not from the `[execve-argv]` events that actually record child
+spawns. Counting the events instead shows both runs spawning browser +
+gpu-process + utility.
+
+**Two lessons, both cheap and both paid for:**
+1. **A flake you cannot re-read is a flake you cannot fix.** `gpuperf.sh` now
+   archives every run as `gpuperf_<mode>.NNN.log` and keeps the plain name as
+   "latest". Overwriting the only failing run was the whole cause of this
+   correction.
+2. **Grep the EVENT, not the string.** `type=renderer` appears in argv dumps,
+   vmodule flags and log text; `[execve-argv] ... --type=renderer` is the
+   event. The sloppy form invented a difference that was not there.
+
+### What still stands from slice 107
+
+Everything measured: the census result (469-page regions rewritten per frame,
+multi-process only), the implementation, **CDP 41.9 → viz 48.8 fps (+16.5%)**
+verified on screen, and the rejected 4 ms-poll experiment (38.3 fps). None of
+those depended on the failure analysis.
+
+**The flake itself remains real but rarer than reported (1 in 4 full-length
+runs) and its mechanism is UNKNOWN — with no surviving evidence.** The next
+failure will be archived; diagnose it then, from the failing log, rather than
+from a successful one.

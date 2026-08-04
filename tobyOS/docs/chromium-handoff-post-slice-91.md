@@ -554,3 +554,20 @@ Concretely, and confirmed by a rejected experiment:
 stands the viz path is the faster option when multi-process comes up, and the
 CDP path remains the reliable one — chromewin still falls back to it
 automatically, since the switch-over only happens after 5 real viz frames.
+
+---
+
+# CORRECTION (slice 108): the flake figure above is wrong
+
+The slice-107 addendum says multi-process bootstrap "succeeded in 2 of 4
+runs" and names a lead about missing `network`/`utility` children. **Both are
+retracted.** Of full-length (420 s) runs, **3 of 4 bootstrapped**; the 4th
+"failure" was a 150 s run cut off at 69 s of guest clock. The lead came from
+grepping `type=` across a whole log rather than the `[execve-argv]` event —
+and from a log that was actually a *successful* run, because `gpuperf.sh`
+overwrote the failing one before it could be read.
+
+`gpuperf.sh` now archives every run as `gpuperf_<mode>.NNN.log`. The flake is
+real but rarer than reported, with no surviving evidence; diagnose the next
+failure from the failing log. Everything measured in slice 107 stands — the
+census, the implementation, +16.5%, and the rejected 4 ms poll.
