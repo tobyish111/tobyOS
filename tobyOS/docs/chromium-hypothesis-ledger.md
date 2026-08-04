@@ -6642,3 +6642,55 @@ the same mechanism (no more thread-loss churn), neither A/B'd.
 
 defboot stock regression: PASS (markers present, fault list clean).
 
+---
+
+## SLICE 110 — **THE PRODUCER IS THE CEILING: chrome commits ~52.7/s, and capture already takes essentially all of it.** The ~13% "headroom" to the page's 61/s rAF does not exist at the capture layer
+
+Handoff §5 item 2 asked the measure-first question: before optimising
+capture further, measure what chrome actually PRODUCES. The shipped poll
+cannot answer it — it stops at the first changed region, so it observes
+at most one change per poll and measures DELIVERY.
+
+### The instrument
+
+`-DVIZPROD_DIAG` (mmap.c) + `gpuperf.sh vizp` mode: hash EVERY candidate
+region each poll (the 49.2fps-era cost, fine for a diagnostic; delivery
+semantics unchanged — first changed region still wins, so frame
+accounting stays comparable), count all changes, self-report every 200
+polls. `gpuperf.sh` now always `rm -f src/mmap.o` (the flag would
+otherwise go stale across modes, the EXTRA_CFLAGS trap again).
+
+### MEASURED (full-length vizp run, steady state over 257 s guest)
+
+```
+   polls/s = 63.7    hit/s = 48.5    CHG/S = 52.68    multi/s = 4.22
+```
+
+- **CHG/S 52.68 = chrome's observed commit rate.** The shipped viz path
+  delivers ~53 fps. Capture parity with the producer, already.
+- The page's rAF runs 61/s; chrome's compositor commits ~53/s in this
+  guest. The missing ~13% never reaches shared memory at all — it is
+  chrome's own frame scheduling skipping under guest speed, not our
+  sampling.
+- `multi/s = 4.22`: the producer is BURSTY (occasional sub-15 ms commit
+  pairs after stalls). An event-driven wake ("signal instead of poll")
+  could therefore recover AT MOST ~4/s (≤8%) — and would cost hooking
+  chrome's mojo frame-ready semantics. Under the shipped (lighter) poll
+  the recoverable margin is smaller still.
+- Consistency checks: chg ≈ hit + multi (52.68 ≈ 48.5 + 4.22); whole-run
+  totals (17,200 polls, 14,247 chg) reproduce the same rate; run clean
+  (0 exceptions — a FIFTH consecutive clean full-length mp-family run
+  post-slice-109).
+
+### VERDICT, per the measure-first gate
+
+**The viz capture path is DONE.** Its ceiling is chrome's production
+rate, and it sits on it. Do not build the signal-instead-of-poll slice
+for ≤8%; do not touch poll cadence again (4 ms already measured worse).
+The §5.3 question is now live: the remaining fps gap belongs to chrome's
+pipeline under guest speed (guest clock 79-80% of wall — general guest
+throughput, not the capture path), so the honest next targets are either
+guest-wide (the ~230 ms `[bklmax]` residue, the ~20 ms ack-cycle) or a
+change of metric (input latency, navigation time). Frame-rate work on
+the capture path ends here.
+

@@ -42,14 +42,17 @@ esac
 #   #define CW_URL file:///etc/anim.html
 # which fails as an undeclared identifier `file`. (Cost one build.)
 PROGF='-DCW_URL=\"'"$URL"'\"'
+KCF="-DFAST_BOOT -DQUICK_BOOT -DCHROMIUM_BOOT -DTKAPP_BOOT -DTKAPP_CHROMEWIN"
 case "$MODE" in
   gl)  PROGF="$PROGF -DCW_GL" ;;                    # ANGLE-on-GL (needs X11)
   gle) PROGF="$PROGF -DCW_GL -DCW_GL_NATIVE" ;;     # chromium native EGL (REFUSED by this build)
   gld) PROGF="$PROGF -DCW_GL -DCW_GL_DRM" ;;        # ANGLE + Ozone DRM/GBM
   mp)  PROGF="$PROGF -DCW_MP" ;;                     # multi-process (shm census)
   viz) PROGF="$PROGF -DCW_MP -DCW_VIZ" ;;            # multi-process + read viz shm bitmaps
+  vizp) PROGF="$PROGF -DCW_MP -DCW_VIZ"             # slice 110: PRODUCER diagnostic --
+        KCF="$KCF -DVIZPROD_DIAG" ;;                # full-pool hash + [vizprod] counters
   cpu) ;;
-  *)   echo "usage: $0 {cpu|gl|gle|gld|mp|viz} {anim|webgl}"; exit 2 ;;
+  *)   echo "usage: $0 {cpu|gl|gle|gld|mp|viz|vizp} {anim|webgl}"; exit 2 ;;
 esac
 
 echo "=== [1/3] build: mode=$MODE page=$PAGE ==="
@@ -60,9 +63,13 @@ rm -f build/initrd.tar build/base.iso tobyOS.iso
 # stale object built for the OTHER arm of the A/B (slice 73's lesson, and it
 # would silently invert the experiment here).
 rm -f programs/chromewin/chromewin.o programs/chromewin/chromewin.elf
+# mmap.o depends on VIZPROD_DIAG (vizp vs viz), and make does NOT rebuild on
+# an EXTRA_CFLAGS change -- a stale object silently inverts THIS experiment
+# too. One file, so always rebuild it.
+rm -f src/mmap.o
 if ! make "CC=TMP='C:\\t' TEMP='C:\\t' clang" \
           "HOST_CC=TMP='C:\\t' TEMP='C:\\t' gcc" iso \
-     EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DCHROMIUM_BOOT -DTKAPP_BOOT -DTKAPP_CHROMEWIN" \
+     EXTRA_CFLAGS="$KCF" \
      PROG_EXTRA_CFLAGS="$PROGF" > "logs/gpuperf_${TAG}.build.log" 2>&1; then
     echo "BUILD FAILED -- tail:"; tail -25 "logs/gpuperf_${TAG}.build.log"; exit 1
 fi
@@ -71,7 +78,7 @@ grep -a "CW_GL\|chromewin.elf" "logs/gpuperf_${TAG}.build.log" | tail -2
 ls -l --time-style=full-iso tobyOS.iso
 
 echo "=== [2/3] run: SMP=4 $( [ "$MODE" != cpu ] && echo 'GLDEV=1 (virtio-gpu-gl-pci + ANGLE)' ) ==="
-if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ]; then
+if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ] && [ "$MODE" != "vizp" ]; then
     [ -d logs/angle ] || bash logs/setup_angle.sh > "logs/gpuperf_${TAG}.angle.log" 2>&1
     SMP=4 GLDEV=1 $PY logs/run_watch.py 2>&1 | tail -6
 else
@@ -121,7 +128,7 @@ PY
 # a slowdown, not a wedge. Holding mp to the same bar would report "frozen"
 # for a guest that is working correctly, which is the exact failure this gate
 # was rewritten to stop making. Lower bar for mp; unchanged everywhere else.
-case "$MODE" in mp|viz) MINTS=$(( RUNMS / 4 ));; *) MINTS=$(( RUNMS / 2 ));; esac
+case "$MODE" in mp|viz|vizp) MINTS=$(( RUNMS / 4 ));; *) MINTS=$(( RUNMS / 2 ));; esac
 echo "gate1 liveness: guest clock reached ${MAXTS}ms of ${RUNMS}ms wall"
 if [ "${MAXTS:-0}" -lt "$MINTS" ]; then
     echo "GATE FAIL: the guest did not keep up with the wall clock (< ${MINTS}ms)."
@@ -140,7 +147,7 @@ echo "gate1 liveness: OK (bkl reports: $BKL)"
 # GATE 2 -- is it really the GPU? (gl mode only)
 GLLINE=$(grep -ao 'tobygl [^"\\]*' "$L" | tail -1)
 echo "renderer: ${GLLINE:-<no tobygl reply -- probe never answered>}"
-if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ]; then
+if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ] && [ "$MODE" != "vizp" ]; then
     if echo "$GLLINE" | grep -qi 'virgl'; then
         echo "gate2 GPU: OK (chrome names virgl)"
     else
@@ -158,6 +165,31 @@ echo "FRAMES($TAG) = ${FRAMES:-none}   (360s run => fps = frames/360)"
 grep -ao 'probe #[0-9]* at [0-9]*s: frames=[0-9]*' "$L" | tail -3
 echo "--- [cwviz] viz shm frame path ---"
 grep -a '\[cwviz\]' "$L" | tail -6
+if [ "$MODE" = "vizp" ]; then
+    echo "--- [vizprod] PRODUCER rate (slice 110: chg/interval vs polls) ---"
+    grep -a '\[vizprod\]' "$L" | tail -5
+    # Steady-state producer rate: sum the per-interval chg over the report
+    # lines from 25s of guest clock onward, divided by the guest time they
+    # span (the [N ms] stamps are guest clock).
+    python - "$L" <<'PY3'
+import io,re,sys
+rows=[]
+for ln in io.open(sys.argv[1],encoding="utf-8",errors="replace"):
+    m=re.match(r"\[(\d+) ms\].*\[vizprod\].*interval polls=(\d+) hit=(\d+) chg=(\d+) multi=(\d+)",ln)
+    if m: rows.append(tuple(int(x) for x in m.groups()))
+rows=[r for r in rows if r[0]>=25000]
+if len(rows)<2:
+    print("VIZPROD VACUOUS: <2 report lines after 25s of guest clock")
+else:
+    dt=(rows[-1][0]-rows[0][0])/1000.0
+    polls=sum(r[1] for r in rows[1:]); hit=sum(r[2] for r in rows[1:])
+    chg=sum(r[3] for r in rows[1:]);   multi=sum(r[4] for r in rows[1:])
+    print("steady state over %.1fs guest: polls/s=%.1f  hit/s=%.1f  CHG/S=%.2f  multi/s=%.2f"
+          %(dt,polls/dt,hit/dt,chg/dt,multi/dt))
+    print("(CHG/S = observed producer commit rate; compare to the page's 61/s rAF")
+    print(" and the ~53/s delivered. multi/s = polls seeing >=2 fresh regions.)")
+PY3
+fi
 echo "--- [cwif] decomposition (last) ---"
 grep -a '\[cwif\]' "$L" | tail -2
 echo "--- faults (empty=clean) ---"

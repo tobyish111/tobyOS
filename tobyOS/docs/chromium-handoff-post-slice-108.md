@@ -139,18 +139,22 @@ measure before you optimise, and measure again after.
 
 ## 5. The roadmap from here
 
-1. **Fix the flake** (§3). Until then the viz path cannot be the default:
-   chromewin only switches over after 5 real viz frames, so a failing run
-   silently stays on CDP, which is correct but means the win is unreliable.
-2. **The next suspect is the PRODUCER, not the consumer.** We now capture
-   52.4 against a page producing 61/s — 86% of its own rate. Measure chrome's
-   actual commit cadence before optimising further; do not assume the
-   remaining ~14% is sitting there for the taking. If it is real, the poll
-   loop is still the place it would come from (a signal instead of a poll).
-3. **Then re-rank.** §6 of `docs/chromium-handoff-post-slice-91.md` still
-   lists the other candidates. With tier 3 closed and viz shm delivered, the
-   honest question is whether frame rate is still the right target at all, or
-   whether responsiveness (input latency, navigation time) matters more.
+1. ~~**Fix the flake** (§3).~~ **DONE (slice 109)** — proc-slot allocation
+   race; PROC_EMBRYO atomic claim; 5 consecutive clean full-length runs.
+2. ~~**The next suspect is the PRODUCER, not the consumer.**~~ **MEASURED
+   (slice 110): the producer IS the ceiling.** `gpuperf.sh vizp` +
+   `-DVIZPROD_DIAG` counted every region change per poll: chrome commits
+   **~52.7/s** while the page's rAF runs 61/s — capture (~53 fps) already
+   sits AT producer parity. The bursty tail (`multi/s=4.22`) bounds a
+   signal-instead-of-poll rewrite at ≤8%; not worth chrome-mojo surgery.
+   **The viz capture path is CLOSED. Do not reopen poll cadence (4 ms
+   measured worse) or build event delivery for ≤8%.**
+3. **Re-rank — this is now the live item.** The remaining gap to 61/s is
+   chrome's pipeline under guest speed, so the honest candidates are
+   guest-wide throughput (the ~230 ms `[bklmax]` residue, the ~20 ms
+   ack-cycle) or a change of metric: responsiveness (input latency,
+   navigation time). §6 of `docs/chromium-handoff-post-slice-91.md` still
+   lists older candidates for reference.
 
 Also open, unrelated and unclaimed: the ~230 ms `[bklmax]` residue is still
 unattributed, and chrome's GL-init failure path storms ~4 GiB `PROT_NONE`

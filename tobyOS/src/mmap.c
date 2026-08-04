@@ -1817,6 +1817,20 @@ static int      g_viz_have[SHMCACHE_MAX];
 static uint32_t g_viz_gen;
 static int      g_viz_last = -1;
 
+#ifdef VIZPROD_DIAG
+/* Slice 110: PRODUCER-rate diagnostic (handoff §5 item 2). The shipped poll
+ * stops at the first changed region, so it can only ever observe <=1 change
+ * per poll -- it measures DELIVERY, not production. This mode hashes EVERY
+ * candidate region each poll (the 49.2fps-era cost, acceptable for a
+ * diagnostic) and counts all changes, which at 66 polls/s over a rotating
+ * pool of 4-7 regions is an unaliased count of chrome's commits: a given
+ * region is rewritten every ~100ms+, far above the 15ms sampling period.
+ * Delivery semantics stay IDENTICAL (first changed region in scan order
+ * wins), so [cwviz] frame accounting remains comparable to viz mode. */
+static uint64_t g_vp_polls, g_vp_hit, g_vp_changes, g_vp_multi;
+static uint64_t g_vp_polls_l, g_vp_hit_l, g_vp_changes_l, g_vp_multi_l;
+#endif
+
 long vizframe_poll(uint32_t *w, uint32_t *h, uint32_t *stride, uint32_t *gen,
                    void *dst, size_t cap) {
     uint32_t vw = w ? *w : 0, vh = h ? *h : 0;
@@ -1832,6 +1846,39 @@ long vizframe_poll(uint32_t *w, uint32_t *h, uint32_t *stride, uint32_t *gen,
      * they will register as changed on a later poll, when they are the fresh
      * one. */
     int newest = -1;
+#ifdef VIZPROD_DIAG
+    int vp_chg = 0;
+    for (int i = 0; i < SHMCACHE_MAX; i++) {
+        struct shm_cache *sc = &g_shm[i];
+        if (!sc->used || !sc->pages || sc->npages != want_pages) continue;
+        uint64_t hv = census_hash_pages_stride(sc->pages, sc->npages,
+                                               VIZ_HASH_STRIDE);
+        int had = g_viz_have[i];
+        uint64_t prev = g_viz_hash[i];
+        g_viz_hash[i] = hv;
+        g_viz_have[i] = 1;
+        if (had && hv != prev) {
+            vp_chg++;
+            if (newest < 0) newest = i;   /* same winner as the shipped path */
+        }
+    }
+    g_vp_polls++;
+    if (vp_chg >= 1) g_vp_hit++;
+    if (vp_chg >= 2) g_vp_multi++;
+    g_vp_changes += (uint64_t)vp_chg;
+    if ((g_vp_polls % 200u) == 0) {      /* ~every 3s at 66 polls/s */
+        kprintf("[vizprod] polls=%lu hit=%lu chg=%lu multi=%lu | "
+                "interval polls=%lu hit=%lu chg=%lu multi=%lu\n",
+                (unsigned long)g_vp_polls, (unsigned long)g_vp_hit,
+                (unsigned long)g_vp_changes, (unsigned long)g_vp_multi,
+                (unsigned long)(g_vp_polls - g_vp_polls_l),
+                (unsigned long)(g_vp_hit - g_vp_hit_l),
+                (unsigned long)(g_vp_changes - g_vp_changes_l),
+                (unsigned long)(g_vp_multi - g_vp_multi_l));
+        g_vp_polls_l = g_vp_polls; g_vp_hit_l = g_vp_hit;
+        g_vp_changes_l = g_vp_changes; g_vp_multi_l = g_vp_multi;
+    }
+#else
     for (int i = 0; i < SHMCACHE_MAX; i++) {
         struct shm_cache *sc = &g_shm[i];
         if (!sc->used || !sc->pages || sc->npages != want_pages) continue;
@@ -1843,6 +1890,7 @@ long vizframe_poll(uint32_t *w, uint32_t *h, uint32_t *stride, uint32_t *gen,
         g_viz_have[i] = 1;
         if (had && hv != prev) { newest = i; break; }        /* fresh frame */
     }
+#endif
     /* Nothing changed this poll: keep showing the last good buffer, and do
      * NOT bump gen, so the caller knows there is no new frame. */
     if (newest < 0) newest = g_viz_last;
