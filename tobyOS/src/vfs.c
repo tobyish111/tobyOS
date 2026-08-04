@@ -11,6 +11,7 @@
  */
 
 #include <tobyos/vfs.h>
+#include <tobyos/ramfs.h>   /* slice 112: ramfs_ops identity + payload borrow */
 #include <tobyos/heap.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
@@ -627,6 +628,40 @@ int vfs_read_all(const char *path, void **out_buf, size_t *out_size) {
     *out_buf  = buf;
     *out_size = st.size;
     return VFS_OK;
+}
+
+/* Slice 112: like vfs_read_all, but for a ramfs-backed file hand out a
+ * BORROWED pointer into the resident initrd tar instead of a full copy
+ * (*out_borrowed = 1; the caller must NOT kfree it). Falls back to the
+ * copying vfs_read_all everywhere else (*out_borrowed = 0). All the
+ * open-path gates (cap, sandbox, perm) run either way -- the borrow is
+ * taken from an OPEN handle. Motivation: execve of chrome's 188 MiB
+ * image paid a ~320 ms memcpy under the BKL, five times per bootstrap,
+ * for bytes that already sit in RAM. */
+int vfs_read_all_ref(const char *path, void **out_buf, size_t *out_size,
+                     int *out_borrowed) {
+    if (out_borrowed) *out_borrowed = 0;
+    if (!path || !out_buf || !out_size) return VFS_ERR_INVAL;
+
+    char realpath_buf[VFS_PATH_MAX];
+    int rc = vfs_follow_link(path, realpath_buf, sizeof(realpath_buf));
+    if (rc != VFS_OK) return rc;
+
+    struct vfs_file f;
+    if (vfs_open(realpath_buf, &f) == VFS_OK) {
+        if (f.ops == &ramfs_ops) {
+            const void *d = 0; size_t n = 0;
+            if (ramfs_file_data(&f, &d, &n) == VFS_OK) {
+                vfs_close(&f);
+                *out_buf = (void *)d;
+                *out_size = n;
+                if (out_borrowed) *out_borrowed = 1;
+                return VFS_OK;
+            }
+        }
+        vfs_close(&f);
+    }
+    return vfs_read_all(realpath_buf, out_buf, out_size);
 }
 
 int vfs_write_all(const char *path, const void *buf, size_t n) {

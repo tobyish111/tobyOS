@@ -982,12 +982,13 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
  * down -- identical to the ELF path's point-of-no-return semantics.
  * =================================================================== */
 static long execve_pe(struct proc *p, void *image, size_t image_size,
+                      int image_borrowed,
                       const char *kpath, int kargc, char **kargv_buf,
                       uint64_t old_pml4, uint64_t new_pml4,
                       uint64_t saved_cr3, uint64_t old_editor) {
     struct pe_load_info pe_info = {0};
     int prc = pe_load_user(image, image_size, kargc, kargv_buf, &pe_info);
-    kfree(image);
+    if (!image_borrowed) kfree(image);   /* slice 112: initrd borrow */
 
     bool ok = (prc == 0);
 
@@ -1093,6 +1094,13 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
 long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     struct proc *p = current_proc();
     if (!p || p->pid == 0) return -ABI_EINVAL;
+#ifdef CHROMIUM_BOOT
+    /* Slice 112 prep: [bklmax] attributed a ~730ms BKL hold to execve
+     * (sys=59) for chrome-sized images, but not to a PHASE. Time the
+     * candidate phases; one [exectime] line prints at commit. */
+    uint64_t xt_entry = perf_now_ns();
+    uint64_t xt_read = 0, xt_load = 0, xt_interp = 0, xt_stack = 0;
+#endif
 
     /* Copy path into a kernel buffer (per-copy uaccess). */
     char kpath[ABI_PATH_MAX];
@@ -1183,10 +1191,20 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         }
     }
 
-    /* Read the ELF image from VFS. */
+    /* Read the ELF image from VFS. Slice 112: for an initrd (ramfs) file
+     * this BORROWS a pointer into the resident tar instead of copying --
+     * the copy was ~320 ms of chrome's ~700 ms execve BKL hold, paid five
+     * times per bootstrap for the same immutable 188 MiB binary. */
     void  *image      = NULL;
     size_t image_size = 0;
-    int rc = vfs_read_all(kpath, &image, &image_size);
+    int    img_borrowed = 0;
+#ifdef CHROMIUM_BOOT
+    xt_read = perf_now_ns();
+#endif
+    int rc = vfs_read_all_ref(kpath, &image, &image_size, &img_borrowed);
+#ifdef CHROMIUM_BOOT
+    xt_read = perf_now_ns() - xt_read;
+#endif
     if (rc != 0) {
         kprintf("[execve] cannot read '%s': %d\n", kpath, rc);
         return -ABI_ENOENT;
@@ -1197,7 +1215,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     uint64_t old_pml4 = p->cr3;
     uint64_t new_pml4 = vmm_create_user_pml4();
     if (!new_pml4) {
-        kfree(image);
+        if (!img_borrowed) kfree(image);
         return -ABI_ENOMEM;
     }
 
@@ -1212,7 +1230,8 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
      * process (e.g. a busybox `sh` pipeline stage) execve() a .exe, so a
      * single pipeline can mix Windows and Linux binaries. */
     if (pe_is_image(image, image_size)) {
-        return execve_pe(p, image, image_size, kpath, kargc, kargv_buf,
+        return execve_pe(p, image, image_size, img_borrowed,
+                         kpath, kargc, kargv_buf,
                          old_pml4, new_pml4, saved_cr3, old_editor);
     }
 
@@ -1230,8 +1249,14 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     uint64_t interp_load_base = has_interp ? 0x0000000040000000ULL : 0;
 
     struct elf_load_info prog_info = {0};
+#ifdef CHROMIUM_BOOT
+    xt_load = perf_now_ns();
+#endif
     bool ok = elf_load_user_at(image, image_size, prog_load_base, &prog_info);
-    kfree(image);
+#ifdef CHROMIUM_BOOT
+    xt_load = perf_now_ns() - xt_load;
+#endif
+    if (!img_borrowed) kfree(image);
 
     /* Track B: re-latch the ABI personality from the new image (brand OR a
      * Linux-loader PT_INTERP, per B10), so `exec`ing a Linux binary from a
@@ -1245,6 +1270,9 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
 
     struct elf_load_info interp_info = {0};
     if (ok && has_interp) {
+#ifdef CHROMIUM_BOOT
+        xt_interp = perf_now_ns();
+#endif
         void *interp_image = NULL;
         size_t interp_size = 0;
         int irc = vfs_read_all(interp_path, &interp_image, &interp_size);
@@ -1255,10 +1283,16 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
                                   interp_load_base, &interp_info);
             kfree(interp_image);
         }
+#ifdef CHROMIUM_BOOT
+        xt_interp = perf_now_ns() - xt_interp;
+#endif
     }
 
     /* Build user stack. */
     if (ok) {
+#ifdef CHROMIUM_BOOT
+        xt_stack = perf_now_ns();
+#endif
         p->user_stack_base  = USER_STACK_TOP_PAGE;
         p->user_stack_pages = USER_STACK_PAGES;
         for (size_t i = 0; i < USER_STACK_PAGES; i++) {
@@ -1369,6 +1403,9 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         }
     }
 
+#ifdef CHROMIUM_BOOT
+    if (xt_stack) xt_stack = perf_now_ns() - xt_stack;   /* incl. auxv pack */
+#endif
     if (!ok) {
         /* Restore previous address space on failure. */
         write_cr3(saved_cr3);
@@ -1387,9 +1424,24 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         vfork_child_done(p);
 
     /* Destroy the old PML4 now that we're on the new one. */
+#ifdef CHROMIUM_BOOT
+    uint64_t xt_old = perf_now_ns();
+#endif
     if (old_pml4 != new_pml4 && p->owns_pml4) {
         vmm_destroy_user_pml4(old_pml4);
     }
+#ifdef CHROMIUM_BOOT
+    xt_old = perf_now_ns() - xt_old;
+    kprintf("[exectime] pid=%d img=%luKiB total=%lums read=%lums load=%lums "
+            "interp=%lums stack=%lums olddestroy=%lums\n",
+            p->pid, (unsigned long)(image_size / 1024),
+            (unsigned long)((perf_now_ns() - xt_entry) / 1000000ull),
+            (unsigned long)(xt_read / 1000000ull),
+            (unsigned long)(xt_load / 1000000ull),
+            (unsigned long)(xt_interp / 1000000ull),
+            (unsigned long)(xt_stack / 1000000ull),
+            (unsigned long)(xt_old / 1000000ull));
+#endif
 
     p->cr3       = new_pml4;
     p->owns_pml4 = true;

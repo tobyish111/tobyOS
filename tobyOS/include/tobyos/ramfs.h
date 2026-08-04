@@ -31,4 +31,20 @@ int ramfs_mount(const void *image, size_t size);
 /* Number of entries the ramfs is currently serving (for diagnostics). */
 size_t ramfs_node_count(void);
 
+/* Slice 112: zero-copy image borrow for execve.
+ *
+ * The tar bytes are resident and permanently mapped (see the header
+ * comment), and every file's payload is CONTIGUOUS inside them -- so a
+ * reader that only needs the bytes for the duration of a syscall can
+ * borrow a pointer instead of paying a full-copy vfs_read_all (~320 ms
+ * for chrome's 188 MiB image, under the BKL, per exec'd child).
+ *
+ * `ramfs_file_data` returns the payload pointer/size for an OPEN ramfs
+ * file handle (i.e. after vfs_open ran every cap/sandbox/perm gate).
+ * Callers identify a ramfs handle by `f->ops == &ramfs_ops`. The
+ * returned pointer is read-only and valid for the mount's lifetime;
+ * it must NEVER be kfree'd. */
+extern const struct vfs_ops ramfs_ops;
+int ramfs_file_data(struct vfs_file *f, const void **data, size_t *size);
+
 #endif /* TOBYOS_RAMFS_H */

@@ -305,6 +305,16 @@ static int ramfs_close(struct vfs_file *f) {
     return VFS_OK;
 }
 
+/* Slice 112: hand out the open file's payload pointer (see ramfs.h).
+ * The node was validated by ramfs_open; the tar bytes never move. */
+int ramfs_file_data(struct vfs_file *f, const void **data, size_t *size) {
+    struct ramfs_node *nd = f ? (struct ramfs_node *)f->priv : 0;
+    if (!nd || nd->type != VFS_TYPE_FILE) return VFS_ERR_INVAL;
+    if (data) *data = nd->data;
+    if (size) *size = nd->size;
+    return VFS_OK;
+}
+
 static long ramfs_read(struct vfs_file *f, void *buf, size_t n) {
     struct ramfs_node *nd = (struct ramfs_node *)f->priv;
     if (!nd) return VFS_ERR_INVAL;

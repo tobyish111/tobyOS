@@ -268,6 +268,13 @@ int  vfs_perm_check(const char *path, int want);
  * on any error returns the error code AND leaves *out_buf == NULL. */
 int  vfs_read_all(const char *path, void **out_buf, size_t *out_size);
 
+/* Slice 112: zero-copy variant. For a ramfs (initrd) file, *out_buf is a
+ * BORROWED read-only pointer into the resident tar (*out_borrowed = 1;
+ * do NOT kfree). Otherwise identical to vfs_read_all (*out_borrowed = 0,
+ * caller owns and kfrees). */
+int  vfs_read_all_ref(const char *path, void **out_buf, size_t *out_size,
+                      int *out_borrowed);
+
 /* Convenience: open(create-if-missing), write `n` bytes, close. */
 int  vfs_write_all(const char *path, const void *buf, size_t n);
 

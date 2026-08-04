@@ -6739,3 +6739,68 @@ and deserves its own slice: FIRST add phase timers inside sys_execve
 split), THEN design the lock drop against what the split says. Named
 follow-up, not attempted here — the measure-first law.
 
+---
+
+## SLICE 112 — **execve HALVED (700→355 ms) without touching a lock: the read half was a 188 MiB memcpy of bytes already resident in RAM.** `[exectime]` split the hold; the initrd borrow deleted half of it
+
+### Step 1: the split (`[exectime]`, fork.c phase timers)
+
+```
+[exectime] pid=3  img=192359KiB total=681ms read=322ms load=336ms interp=2 stack=0 olddestroy=0
+[exectime] pid=21 img=192359KiB total=636ms read=296ms load=312ms ...
+[exectime] pid=22 img=192359KiB total=349ms read=9ms   load=312ms ...   <- read CAN be ~free
+[exectime] pid=26 img=192359KiB total=721ms read=338ms load=355ms ...
+[exectime] pid=51 img=192359KiB total=707ms read=321ms load=336ms ...
+```
+
+~50/50: `vfs_read_all` (a full 188 MiB copy OUT of the resident initrd
+tar, per exec) vs `elf_load_user_at` (map+copy+BSS). The old-pml4
+destroy — the plausible-sounding suspect — measured **0 ms**. Measure
+before you design.
+
+### Step 2: the fix — borrow, don't copy
+
+ramfs stores every file's payload CONTIGUOUS inside the permanently
+mapped tar image (ramfs.c has always documented this). So:
+
+- `ramfs_file_data()` — payload pointer/size from an OPEN handle;
+- `vfs_read_all_ref()` — vfs_open (every cap/sandbox/perm gate runs),
+  then for a ramfs handle return the borrowed pointer (`borrowed=1`),
+  else fall back to the copying `vfs_read_all`;
+- `sys_execve` uses it and skips `kfree` when borrowed (both ELF and PE
+  arms). Both loaders take `const void *image` and only ever use it as
+  a memcpy SOURCE (verified) — the tar bytes cannot be corrupted.
+
+### VERIFIED (full-length viz run + defboot)
+
+```
+[exectime] pid=3  total=354ms read=0ms load=335ms   (was 681/322)
+[exectime] pid=20 total=351ms read=0ms load=327ms
+[exectime] pid=31 total=356ms read=0ms load=328ms
+[exectime] pid=1  total=46ms  read=0ms load=22ms
+[exectime] pid=55 total=362ms read=0ms load=333ms
+```
+
+- **read=0 ms on every exec; execve totals halved (636-721 → 351-362).**
+- Bootstrap `[bklmax]`: 2970 → **1495 Mcyc (~390 ms)** — now purely the
+  load phase (still `sys=59`).
+- Bootstrap wake-latency tail: max 1.1 s → **621 ms**, `>=1s` events
+  2 → **0**.
+- Steady state untouched: 14,178 frames, 2 renderers, 0 exceptions.
+  defboot stock regression PASS.
+
+### Remaining, recorded not chased
+
+1. The other half, `elf_load_user_at` ~330 ms, is a genuine 188 MiB
+   copy into fresh user pages under the BKL. Next lever if navigation
+   latency ever matters: demand-map exec segments from the borrowed
+   image (the mmap machinery already does file-backed demand paging),
+   or share text pages between execs of the same binary. Both are
+   real slices; neither affects steady-state fps.
+2. A single ~460 ms `[bklmax]` hold (`pid=61 sys=-1 nat=142`) appeared
+   in ONE steady interval of ONE run — outside any Linux syscall, and
+   `cursys_nat` can be STALE across fork (inherited by memcpy), so the
+   attribution field is not trustworthy for it yet. If it recurs, first
+   make `[bklmax]` also record the holder's last-fault info; do not
+   guess from the stale nat.
+
