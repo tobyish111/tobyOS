@@ -497,6 +497,12 @@ long sys_fork(void) {
     child->syscall_count  = 0;
     child->last_switch_tsc = 0;
     child->sysprot_priv   = 0;
+    /* Slice 113: the child returns to user via fork_child_entry, skipping
+     * the dispatcher epilogue that clears cursys -- the memcpy'd values
+     * would read as the PARENT's syscall in every instrument until the
+     * child's own first syscall ([bklmax]'s stale nat=142). */
+    child->cursys     = -1;
+    child->cursys_nat = -1;
     /* POSIX fork: the child inherits the parent's signal dispositions, mask,
      * and sigreturn trampoline (already copied by the memcpy above), but
      * starts with NO pending signals. (Previously this reset all handlers,
@@ -711,6 +717,8 @@ long sys_fork_share(void) {
     child->syscall_count   = 0;
     child->last_switch_tsc = 0;
     child->sysprot_priv    = 0;
+    child->cursys          = -1;   /* slice 113: see sys_fork */
+    child->cursys_nat      = -1;
     child->pending_signals  = 0;
     child->sigstate.pending = 0;
 
@@ -878,6 +886,8 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->syscall_count   = 0;
     child->last_switch_tsc = 0;
     child->sysprot_priv    = 0;
+    child->cursys          = -1;   /* slice 113: see sys_fork */
+    child->cursys_nat      = -1;
 
     size_t nlen = strlen(tg->name);
     if (nlen > PROC_NAME_MAX - 3) nlen = PROC_NAME_MAX - 3;

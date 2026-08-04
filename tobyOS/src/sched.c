@@ -115,6 +115,9 @@ int      g_bkl_maxhold_pid;
 char     g_bkl_maxhold_comm[16];
 int      g_bkl_maxhold_sys  = -1;   /* holder's cursys  (Linux syscall #) */
 int      g_bkl_maxhold_nat  = -1;   /* holder's cursys_nat (native #) */
+/* Slice 113: a sys=-1 hold is fault-path or IRQ work -- record the
+ * holder's last resolved fault so the site is attributable anyway. */
+uint64_t g_bkl_maxhold_frip, g_bkl_maxhold_fcr2;
 #endif
 static uint64_t g_bkl_t0[MAX_CPUS];    /* slice 64b: acquire stamp per CPU */
 uint64_t g_bkl_held_tsc[MAX_CPUS];     /* total cycles HELD this interval */
@@ -246,11 +249,14 @@ void bkl_exit(void) {
             extern char g_bkl_maxhold_comm[16];
             if (d > g_bkl_maxhold_tsc) {
                 extern int g_bkl_maxhold_sys, g_bkl_maxhold_nat;
+                extern uint64_t g_bkl_maxhold_frip, g_bkl_maxhold_fcr2;
                 g_bkl_maxhold_tsc = d;
                 struct proc *hp = current_proc();
                 g_bkl_maxhold_pid = hp ? hp->pid : -1;
                 g_bkl_maxhold_sys = hp ? hp->cursys : -1;
                 g_bkl_maxhold_nat = hp ? hp->cursys_nat : -1;
+                g_bkl_maxhold_frip = hp ? hp->last_fault_rip : 0;
+                g_bkl_maxhold_fcr2 = hp ? hp->last_fault_cr2 : 0;
                 if (hp) {
                     int ci = 0;
                     for (; ci < 15 && hp->name[ci]; ci++)
@@ -1297,11 +1303,16 @@ void sched_tick(struct regs *r) {
                       (unsigned long)g_wlat_hist[4],
                       (unsigned long)g_wlat_hist[5]);
               { extern int g_bkl_maxhold_sys, g_bkl_maxhold_nat;
-                kprintf("  [bklmax] hold=%luMcyc pid=%d '%s' sys=%d nat=%d\n",
+                extern uint64_t g_bkl_maxhold_frip, g_bkl_maxhold_fcr2;
+                kprintf("  [bklmax] hold=%luMcyc pid=%d '%s' sys=%d nat=%d "
+                        "lastfault rip=%p cr2=%p\n",
                         (unsigned long)(g_bkl_maxhold_tsc >> 20),
                         g_bkl_maxhold_pid, g_bkl_maxhold_comm,
-                        g_bkl_maxhold_sys, g_bkl_maxhold_nat);
-                g_bkl_maxhold_sys = -1; g_bkl_maxhold_nat = -1; }
+                        g_bkl_maxhold_sys, g_bkl_maxhold_nat,
+                        (void *)g_bkl_maxhold_frip,
+                        (void *)g_bkl_maxhold_fcr2);
+                g_bkl_maxhold_sys = -1; g_bkl_maxhold_nat = -1;
+                g_bkl_maxhold_frip = 0; g_bkl_maxhold_fcr2 = 0; }
               { extern uint64_t g_tlb_ack_timeouts, g_tlb_giveups;
                 kprintf("  [tlbto] ack_timeouts=%lu giveups=%lu\n",
                         (unsigned long)g_tlb_ack_timeouts,

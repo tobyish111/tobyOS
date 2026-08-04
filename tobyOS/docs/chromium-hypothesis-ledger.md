@@ -6804,3 +6804,50 @@ mapped tar image (ramfs.c has always documented this). So:
    make `[bklmax]` also record the holder's last-fault info; do not
    guess from the stale nat.
 
+---
+
+## SLICE 113 — **the load half is NOT guest-fixable: `[elfsplit]` shows the 330 ms is ~95% pure copy, and the copy is bounded by HOST EPT lazy backing of virgin frames.** Two designs (2 MiB pages, lazy demand-fill) killed by one instrument line each
+
+### The measurement (`[elfsplit]`, do_elf_load phase accumulators)
+
+```
+[elfsplit] img=192359KiB map=5ms copy=318ms zero=4ms prot=3ms   (x5 execs, all alike)
+```
+
+- `map=4-5ms`: 48k per-page pmm_alloc + vmm_map walks are NEARLY FREE.
+  **The eager-2MiB-pages idea would save ~4 ms. Dead.**
+- `copy≈310ms` = 188 MiB at ~600 MB/s — with a `rep movsq` memcpy
+  (checked) that streams >5 GB/s on warm memory. The missing 10x is the
+  HOST: WHPX backs guest RAM lazily, so the FIRST write to each virgin
+  4 KiB frame takes an EPT-violation VM exit, ~48k of them per exec.
+  Three independent confirmations: (1) map is trivial so it is not the
+  guest's paging; (2) run 010's pid 1 exec loaded the SAME image in
+  **22 ms** on recycled (already-host-backed) frames; (3) run 009's
+  pid 22 read the image in **9 ms** through a recycled buffer.
+- **Lazy demand-fill is therefore ALSO dead as a throughput fix**: it
+  would move the same per-first-touch EPT cost to fault time, not
+  delete it. (It would spread the convoy — but the bootstrap tail is
+  already down to 621 ms max after slice 112, and the machinery is a
+  fault-path rewrite. Not worth it; do not build without NEW evidence.)
+- The ~395 ms interval-1 hold with lastfault in the mmap region is the
+  SAME phenomenon downstream: ld.so's lib mmaps + chrome's resource
+  files (icu, .paks) eagerly copy tens of MB into virgin frames right
+  after exec. It shrinks naturally once RAM recycles.
+
+### Instrument hardening that landed here (and already paid off)
+
+- fork/clone/fork_share children now reset `cursys/cursys_nat` (they
+  return via fork_child_entry, skipping the epilogue that clears them —
+  slice 112's "nat=142" watch item was exactly this staleness).
+- `[bklmax]` records the holder's LAST-FAULT rip/cr2, so `sys=-1`
+  (fault-path/IRQ) holds are attributable. First use immediately
+  explained the post-exec hold above.
+
+### VERDICT
+
+Bootstrap exec cost is now: ~355 ms/exec, of which ~310 ms is host
+EPT first-touch — **a virtualization-hosting artifact, same class as
+the WHPX descheduling residual**, movable but not deletable from the
+guest. Slice 112's borrow removed the deletable half. This closes the
+execve thread; the watch item's instrument stays armed.
+

@@ -191,6 +191,13 @@ static bool ensure_writable_pages(uint64_t virt_lo, uint64_t virt_hi,
 static bool do_elf_load(const void *image, size_t size, bool user_mode,
                         uint64_t load_base, struct elf_load_info *info) {
     if (!image || !info) return false;
+#ifdef CHROMIUM_BOOT
+    /* Slice 113 measure-first: split the ~330ms chrome image load into its
+     * candidate costs BEFORE choosing between lazy demand-fill and eager
+     * 2MiB-page mapping. Only prints for large (chrome-sized) images. */
+    extern uint64_t perf_now_ns(void);
+    uint64_t es_map = 0, es_copy = 0, es_zero = 0, es_prot = 0, es_t;
+#endif
     info->entry      = 0;
     info->load_base  = load_base;
     info->phdr_va    = 0;
@@ -315,7 +322,13 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
                 (void *)virt_lo, (void *)virt_hi);
 #endif
 
+#ifdef CHROMIUM_BOOT
+        es_t = perf_now_ns();
+#endif
         if (!ensure_writable_pages(virt_lo, virt_hi, user_mode)) return false;
+#ifdef CHROMIUM_BOOT
+        es_map += perf_now_ns() - es_t;
+#endif
 
         /* These writes target the (just-mapped) destination address space.
          * For a user ELF that is user memory, so under SMAP they need a
@@ -324,9 +337,16 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
          * save+restore AC so either nests correctly. Harmless for kernel
          * ELFs (AC doesn't affect kernel-page access). */
         unsigned long uflags = uaccess_begin();
+#ifdef CHROMIUM_BOOT
+        es_t = perf_now_ns();
+#endif
         if (ph->p_filesz) {
             memcpy((void *)seg_vaddr, bytes + ph->p_offset, ph->p_filesz);
         }
+#ifdef CHROMIUM_BOOT
+        es_copy += perf_now_ns() - es_t;
+        es_t = perf_now_ns();
+#endif
         /* Zero from the end of the file-backed data all the way to the
          * page-rounded end of the segment (virt_hi). This clears the BSS
          * [filesz, memsz) AND the tail of the final mapped page
@@ -345,6 +365,9 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
                 memset((void *)zero_from, 0, virt_hi - zero_from);
             }
         }
+#ifdef CHROMIUM_BOOT
+        es_zero += perf_now_ns() - es_t;
+#endif
         uaccess_end(uflags);
         loaded++;
     }
@@ -354,6 +377,9 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
         return false;
     }
 
+#ifdef CHROMIUM_BOOT
+    es_t = perf_now_ns();
+#endif
     /* ---- pass 2: tighten permissions to what the segments asked for ---- */
     for (Elf64_Half i = 0; i < eh->e_phnum; i++) {
         const Elf64_Phdr *ph = &phdrs[i];
@@ -369,6 +395,16 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
                     (void *)virt_lo, (void *)virt_hi);
         }
     }
+#ifdef CHROMIUM_BOOT
+    es_prot = perf_now_ns() - es_t;
+    if (size > (64u << 20))
+        kprintf("[elfsplit] img=%luKiB map=%lums copy=%lums zero=%lums "
+                "prot=%lums\n", (unsigned long)(size / 1024),
+                (unsigned long)(es_map / 1000000ull),
+                (unsigned long)(es_copy / 1000000ull),
+                (unsigned long)(es_zero / 1000000ull),
+                (unsigned long)(es_prot / 1000000ull));
+#endif
 
     /* ---- compute output info ---- */
     info->entry = eh->e_entry + bias;
