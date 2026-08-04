@@ -493,3 +493,64 @@ gates (liveness, and a renderer-identity check that refuses to report an fps
 number unless chrome names `virgl`). `RUNSECS=<n>` shortens a run for
 diagnosis — measurements stay at 360 s, since every frame baseline in this arc
 is frames/360 s.
+
+---
+
+# ADDENDUM (slice 107, 2026-08-04): §6 CANDIDATE 1 IS DONE — +16.5%, and the ceiling MOVED
+
+§6 ranked "viz shared-memory frames over Mojo" the strongest structural
+candidate and the least explored. It is now built, verified on screen, and
+measured. **CDP screencast 41.9 fps → viz shared bitmaps 48.8 fps (+16.5%)**,
+same configuration, same page, steady state, with the screendump showing real
+page content and the screencast stopped.
+
+## What §6 got right, and what it got wrong
+
+**Right:** chrome really does keep frame-sized shared memory, and we really
+could read it. A pool of 469-page regions — 1876 KiB, exactly 800×600×4 —
+rewritten 60–96 times across 113 census rounds.
+
+**Wrong, and it matters:** §6 said "chrome's renderer→viz transport already
+uses shared-memory buffers over Mojo." True — but **only multi-process**.
+Under `--single-process`, which every perf run in this arc has used, renderer
+and viz share an address space and there is nothing shared at all: chrome
+created exactly one memfd in a whole run, Mojo's probe that expects `EINVAL`.
+The candidate was structurally impossible in the configuration it was ranked
+for, and no amount of plumbing would have found that out. The census did, in
+one run.
+
+## The ceiling moved — re-aim from here
+
+Slice 68's ~2.3× estimate assumed removing the JPEG encode removed the
+bottleneck. It did not. The page's own rAF runs at **61/s** and we now capture
+48.8, so **the binding constraint is our own capture**, not chrome's encode.
+Concretely, and confirmed by a rejected experiment:
+
+- Polling at 4 ms instead of 15 ms measured **38.3 fps — worse by a fifth**.
+  Polling harder steals the CPU that produces frames, because every poll
+  hashes ~7 candidate regions before it can tell whether anything changed.
+- So the two real levers, each its own slice:
+  1. **Stop hashing every candidate every poll.** The kernel should know which
+     region chrome just wrote (a write-fault or mapping hook), not rediscover
+     it by sampling.
+  2. **Stop copying.** 1.9 MiB per frame still goes through `copy_to_user`.
+     Mapping the region read-only into chromewin makes this genuinely
+     zero-copy. This is the one that earns the "zero-copy" name.
+
+## Two costs the fps number hides
+
+- **Multi-process drives the guest at ~46% of wall clock.** The mechanism does
+  not exist without it, so that cost is part of the deal.
+- **Multi-process bootstrap succeeded in 2 of 4 runs.** Failures reach
+  `sessionId` and never bootstrap with a healthy guest clock, so it is not a
+  timeout. Three hypotheses were tested and rejected: the CoW-fork cap (never
+  fired), a chrome child crashing in glibc's `fork()` (real and fingerprinted
+  — `libc.so.6 +0xb1a66`, write to NULL — but it happens in the *successful*
+  run too), and the ~4 GiB `PROT_NONE` probe storm (present in both).
+  **Mechanism unidentified; do not guess a fourth time.** The lead is that
+  failing runs never spawn the `network`/`utility`/`none` children.
+
+**Before this path can be the default, the flake has to be understood.** As it
+stands the viz path is the faster option when multi-process comes up, and the
+CDP path remains the reliable one — chromewin still falls back to it
+automatically, since the switch-over only happens after 5 real viz frames.
