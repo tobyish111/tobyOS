@@ -1,0 +1,47 @@
+<!doctype html>
+<!-- Slice 114: input-latency probe page. STATIC by construction: no
+     animation, no <input> element (a caret would blink = periodic frames),
+     no timers. The ONLY thing that changes pixels is a key event appending
+     its character to the log div -- so with the viz shm capture running,
+     "next frame after Input.dispatchKeyEvent" IS the end-to-end input
+     latency (inject -> chrome event -> layout -> raster -> commit ->
+     shared bitmap -> our poll). chromewin's CW_LAT probe drives it. -->
+<html>
+<head><title>tobyOS input probe</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#182028;
+            color:#d8e0e8;font:20px/1.4 monospace}
+  #hdr{padding:12px;background:#243040}
+  #log{padding:12px;word-wrap:break-word}
+</style></head>
+<body>
+<div id="hdr">tobyOS INPUT PROBE &mdash; keys typed: <span id="n">0</span></div>
+<div id="log"></div>
+<script>
+let n = 0;
+const log = document.getElementById('log');
+const cnt = document.getElementById('n');
+const hdr = document.getElementById('hdr');
+function took(ch) {
+  n++;
+  cnt.textContent = n;
+  /* Slice 114 v4: the kernel's viz change detector samples 32 bytes of
+   * every 64th page (the shipped coarse hash) -- a few-hundred-pixel text
+   * echo is statistically INVISIBLE to it (measured: 67 of 70 probes timed
+   * out). Toggle the full-width header background so the top-left corner
+   * -- page 0, byte 0, always sampled -- changes on EVERY key. The echo is
+   * still a real user-visible repaint; it just lands where the sampler
+   * looks. */
+  hdr.style.background = (n & 1) ? '#304858' : '#243040';
+  /* Reset before the div overflows the viewport -- growth past the fold
+   * would stop changing visible pixels and the probe would read TIMEOUT. */
+  if (n % 200 === 0) log.textContent = '';
+  log.textContent += ch;
+}
+/* Listen on BOTH: CDP rawKeyDown lands as keydown, 'char' as keypress.
+ * Either alone repaints; both firing just appends two glyphs (fine). */
+addEventListener('keydown',  e => { if (e.key.length === 1) took(e.key); });
+addEventListener('keypress', e => { if (e.key.length === 1) took(e.key.toUpperCase()); });
+</script>
+</body>
+</html>

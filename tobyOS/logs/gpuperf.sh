@@ -32,7 +32,8 @@ PY=/c/Users/tdude/AppData/Local/Programs/Python/Python311/python
 case "$PAGE" in
   anim)  URL='file:///etc/anim.html' ;;
   webgl) URL='file:///etc/webgl.html' ;;
-  *)     echo "usage: $0 {cpu|gl} {anim|webgl}"; exit 2 ;;
+  input) URL='file:///etc/input.html' ;;   # slice 114: static latency-probe page
+  *)     echo "usage: $0 {cpu|gl} {anim|webgl|input}"; exit 2 ;;
 esac
 
 # The quotes around the URL must reach the COMPILER, which means surviving two
@@ -51,8 +52,9 @@ case "$MODE" in
   viz) PROGF="$PROGF -DCW_MP -DCW_VIZ" ;;            # multi-process + read viz shm bitmaps
   vizp) PROGF="$PROGF -DCW_MP -DCW_VIZ"             # slice 110: PRODUCER diagnostic --
         KCF="$KCF -DVIZPROD_DIAG" ;;                # full-pool hash + [vizprod] counters
+  lat) PROGF="$PROGF -DCW_MP -DCW_VIZ -DCW_LAT" ;;  # slice 114: input/nav latency probes
   cpu) ;;
-  *)   echo "usage: $0 {cpu|gl|gle|gld|mp|viz|vizp} {anim|webgl}"; exit 2 ;;
+  *)   echo "usage: $0 {cpu|gl|gle|gld|mp|viz|vizp|lat} {anim|webgl|input}"; exit 2 ;;
 esac
 
 echo "=== [1/3] build: mode=$MODE page=$PAGE ==="
@@ -78,7 +80,7 @@ grep -a "CW_GL\|chromewin.elf" "logs/gpuperf_${TAG}.build.log" | tail -2
 ls -l --time-style=full-iso tobyOS.iso
 
 echo "=== [2/3] run: SMP=4 $( [ "$MODE" != cpu ] && echo 'GLDEV=1 (virtio-gpu-gl-pci + ANGLE)' ) ==="
-if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ] && [ "$MODE" != "vizp" ]; then
+if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ] && [ "$MODE" != "vizp" ] && [ "$MODE" != "lat" ]; then
     [ -d logs/angle ] || bash logs/setup_angle.sh > "logs/gpuperf_${TAG}.angle.log" 2>&1
     SMP=4 GLDEV=1 $PY logs/run_watch.py 2>&1 | tail -6
 else
@@ -128,7 +130,7 @@ PY
 # a slowdown, not a wedge. Holding mp to the same bar would report "frozen"
 # for a guest that is working correctly, which is the exact failure this gate
 # was rewritten to stop making. Lower bar for mp; unchanged everywhere else.
-case "$MODE" in mp|viz|vizp) MINTS=$(( RUNMS / 4 ));; *) MINTS=$(( RUNMS / 2 ));; esac
+case "$MODE" in mp|viz|vizp|lat) MINTS=$(( RUNMS / 4 ));; *) MINTS=$(( RUNMS / 2 ));; esac
 echo "gate1 liveness: guest clock reached ${MAXTS}ms of ${RUNMS}ms wall"
 if [ "${MAXTS:-0}" -lt "$MINTS" ]; then
     echo "GATE FAIL: the guest did not keep up with the wall clock (< ${MINTS}ms)."
@@ -147,7 +149,7 @@ echo "gate1 liveness: OK (bkl reports: $BKL)"
 # GATE 2 -- is it really the GPU? (gl mode only)
 GLLINE=$(grep -ao 'tobygl [^"\\]*' "$L" | tail -1)
 echo "renderer: ${GLLINE:-<no tobygl reply -- probe never answered>}"
-if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ] && [ "$MODE" != "vizp" ]; then
+if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ] && [ "$MODE" != "vizp" ] && [ "$MODE" != "lat" ]; then
     if echo "$GLLINE" | grep -qi 'virgl'; then
         echo "gate2 GPU: OK (chrome names virgl)"
     else
@@ -165,6 +167,22 @@ echo "FRAMES($TAG) = ${FRAMES:-none}   (360s run => fps = frames/360)"
 grep -ao 'probe #[0-9]* at [0-9]*s: frames=[0-9]*' "$L" | tail -3
 echo "--- [cwviz] viz shm frame path ---"
 grep -a '\[cwviz\]' "$L" | tail -6
+if [ "$MODE" = "lat" ]; then
+    echo "--- [inlat]/[navlat] responsiveness (slice 114) ---"
+    grep -a "\[inlat\] DONE\|\[navlat\] STAT" "$L" | tail -4
+    python - "$L" <<'PY4'
+import io,re,sys
+d=io.open(sys.argv[1],encoding="utf-8",errors="replace").read()
+def stats(tag):
+    v=sorted(int(m) for m in re.findall(r"\["+tag+r"\] n=\d+ t=(\d+)ms",d))
+    if not v: print("%s: NO SAMPLES"%tag); return
+    p=lambda q: v[min(len(v)-1,int(len(v)*q))]
+    print("%s: n=%d median=%dms p90=%dms p99=%dms max=%dms"
+          %(tag,len(v),p(0.5),p(0.9),p(0.99),v[-1]))
+stats("inlat"); stats("navlat")
+t=len(re.findall(r"\[inlat\] TIMEOUT",d)); print("probe timeouts: %d"%t)
+PY4
+fi
 if [ "$MODE" = "vizp" ]; then
     echo "--- [vizprod] PRODUCER rate (slice 110: chg/interval vs polls) ---"
     grep -a '\[vizprod\]' "$L" | tail -5

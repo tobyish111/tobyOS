@@ -454,6 +454,9 @@ static int  g_n_push, g_n_poll;
 static int  g_arr_kind;                  /* 0 = polled reply, 1 = pushed */
 static int  g_ping_id;                   /* slice 93: CDP ping in flight */
 static long g_ping_sent_ms;
+#ifdef CW_LAT
+static void lat_note_frame(void);        /* slice 114: defined below */
+#endif
 
 /* Parse "timestamp":<sec>.<frac> (CDP TimeSinceEpoch, seconds) -> epoch ms.
  * Integer math; returns 0 if absent. */
@@ -509,6 +512,14 @@ static int install_b64_frame(void) {
     g_frames++;
     g_last_frame_ms = sys_clock_ms();
     tk_redraw(&win);                  /* marks dirty; paint() runs in tk_pump */
+#ifdef CW_LAT
+    /* Slice 114 v5: on a STATIC page chrome RECLAIMS the viewport-sized shm
+     * pool when idle (census: no 469-page regions exist), so the viz gen
+     * edge is structurally absent -- v3/v4 timed out on 66 of 70 probes.
+     * In lat mode the window's pixels arrive HERE, through the screencast;
+     * this install IS the honest end of the latency path. */
+    lat_note_frame();
+#endif
     g_t_b64 += t1ms - t0ms;
     g_t_dec += t2ms - t1ms;
     g_t_n++;
@@ -1621,6 +1632,151 @@ static void send_key(uint8_t key) {
  * frame installer, so it keeps its own accumulator/counter pair). */
 long g_t_paint, g_n_paint;
 
+#ifdef CW_LAT
+/* ---- Slice 114: responsiveness probes ---------------------------------- *
+ * The fps arc closed at producer parity (slice 110); the honest next metric
+ * is whether the system FEELS fast. Two numbers, both end-to-end through
+ * the real display path (inject -> chrome -> raster -> commit -> viz shm ->
+ * our poll):
+ *   [inlat]  Input.dispatchKeyEvent -> next frame, on the STATIC
+ *            input.html (the only pixel change is the key's echo).
+ *   [navlat] Page.navigate -> first frame of the new page (input.html <->
+ *            input2.html, different colors so the repaint is unambiguous).
+ * The 15 ms viz poll quantizes both (+~7.5 ms avg); that is honest -- it is
+ * the latency a user of THIS display path experiences.
+ * Phase 0: input probes every 2 s until N samples; then phase 1: navs. */
+static long g_lat_t0;                     /* injection stamp; 0 = disarmed */
+static long g_lat_next_ms;                /* next probe due (0 = settling) */
+static int  g_lat_phase;                  /* 0 = input, 1 = navigation */
+static int  g_lat_n, g_lat_navs, g_lat_timeouts, g_lat_navflip;
+static long g_lat_sum, g_lat_max, g_nav_sum, g_nav_max;
+static int  g_lat_nav_fseq;               /* g_frames count at navigate send */
+#define LAT_INPUT_SAMPLES 60          /* leaves the nav phase ~2 min */
+#define LAT_TIMEOUT_MS    1500
+/* v6: 1500 ms clipped EVERY nav (34 of 34 timed out) -- navigation under
+ * guest speed is plausibly seconds, and a timeout that short measures
+ * nothing. Give navs room to report their real number. */
+#define LAT_NAV_TIMEOUT_MS 10000
+
+/* Called from vizframe_poll_once when gen ADVANCES (a real new frame). */
+static void lat_note_frame(void) {
+    if (!g_lat_t0) return;
+    long dt = sys_clock_ms() - g_lat_t0;
+    g_lat_t0 = 0;
+    if (g_lat_phase == 0) {
+        g_lat_n++; g_lat_sum += dt; if (dt > g_lat_max) g_lat_max = dt;
+        printf("[inlat] n=%d t=%ldms\n", g_lat_n, dt);
+        if (g_lat_n >= LAT_INPUT_SAMPLES) {
+            printf("[inlat] DONE n=%d avg=%ldms max=%ldms timeouts=%d\n",
+                   g_lat_n, g_lat_sum / g_lat_n, g_lat_max, g_lat_timeouts);
+            g_lat_phase = 1;
+        }
+        g_lat_next_ms = sys_clock_ms() + 2000;
+    } else {
+        /* v8/v9: only a FRESH frame WHOSE PIXELS ARE the new page answers
+         * the probe. v7 counted the restarted screencast's push of the OLD
+         * page (18 ms "navs"); v8's red-channel threshold could never match
+         * input2 (0x50 > its 0x40) and false-hit stale input.html frames
+         * when navigating back. Blue channel separates the pages with >=20
+         * of margin either side (input2 body #403018 b=0x18; input.html
+         * header b=0x40/0x58), and the frame-counter check rejects any
+         * frame installed before the navigate was sent. */
+        if (g_frames <= g_lat_nav_fseq) {
+            g_lat_t0 = sys_clock_ms() - dt;      /* pre-nav frame: wait on */
+            return;
+        }
+        uint32_t px = (g_frame && g_frame->pixels && g_frame->width > 8)
+                          ? g_frame->pixels[8 * g_frame->width + 8] : 0;
+        int is2 = (px & 0xff) < 0x30;
+        if (is2 != g_lat_navflip) {
+            g_lat_t0 = sys_clock_ms() - dt;      /* wrong page: wait on */
+            return;
+        }
+        g_lat_navs++; g_nav_sum += dt; if (dt > g_nav_max) g_nav_max = dt;
+        printf("[navlat] n=%d t=%ldms\n", g_lat_navs, dt);
+        if (g_lat_navs && (g_lat_navs % 10) == 0)
+            printf("[navlat] STAT n=%d avg=%ldms max=%ldms\n",
+                   g_lat_navs, g_nav_sum / g_lat_navs, g_nav_max);
+        g_lat_next_ms = sys_clock_ms() + 3000;
+    }
+}
+
+static void lat_probe_tick(void) {
+    /* Slice 114 v2: do NOT wait for g_xf_live -- on a STATIC page viz gen
+     * never advances 5 times on its own (the whole point of the page), so
+     * the live-switch never fires. Arm on a timer instead; the FIRST
+     * probe's echo produces the first gen change. Stop the screencast at
+     * arm time so its JPEG encode load cannot pollute the measurement. */
+    long now = sys_clock_ms();
+    static long t_start;
+    if (!t_start) { t_start = now; return; }
+    if (now - t_start < 30000) return;
+    if (!g_lat_next_ms) {
+        /* v3: the screencast STAYS ON. Stopping it (v2) starved the page of
+         * BeginFrames -- the key echo changed the DOM but chrome never
+         * rastered/committed it, so 64 of 70 probes timed out and the few
+         * "hits" were riding periodic devtools traffic. The screencast is
+         * the BeginFrame driver on headless-shell; its encode cost at one
+         * frame per 2 s probe is nil, and the measured edge is still the
+         * kernel's viz-shm hash, not the JPEG. */
+        printf("[cwlat] probes ARMED (screencast kept: BeginFrame driver; "
+               "viz gen is the frame edge)\n");
+        g_lat_next_ms = now + 2000;
+        return;
+    }
+    if (g_lat_t0) {                       /* armed: frame hook or timeout */
+        long lim = g_lat_phase ? LAT_NAV_TIMEOUT_MS : LAT_TIMEOUT_MS;
+        if (now - g_lat_t0 > lim) {
+            g_lat_timeouts++;
+            printf("[inlat] TIMEOUT phase=%d (>%ldms)\n",
+                   g_lat_phase, lim);
+            g_lat_t0 = 0;
+            g_lat_next_ms = now + 2000;
+        }
+        return;
+    }
+    if (now < g_lat_next_ms) return;
+    if (g_lat_phase == 0) {
+        /* Real-typing triple: rawKeyDown lands as keydown, char as
+         * keypress -- input.html listens on both. t0 BEFORE the first
+         * send so transport is inside the measurement. */
+        char p[128];
+        char ch = (char)('a' + (g_lat_n % 26));
+        g_lat_t0 = now;
+        snprintf(p, sizeof p, "{\"type\":\"rawKeyDown\","
+                 "\"windowsVirtualKeyCode\":%d,\"key\":\"%c\"}",
+                 'A' + (g_lat_n % 26), ch);
+        cdp_send("Input.dispatchKeyEvent", p, 1);
+        snprintf(p, sizeof p, "{\"type\":\"char\",\"text\":\"%c\"}", ch);
+        cdp_send("Input.dispatchKeyEvent", p, 1);
+        snprintf(p, sizeof p, "{\"type\":\"keyUp\","
+                 "\"windowsVirtualKeyCode\":%d,\"key\":\"%c\"}",
+                 'A' + (g_lat_n % 26), ch);
+        cdp_send("Input.dispatchKeyEvent", p, 1);
+    } else {
+        char p[160];
+        g_lat_navflip ^= 1;
+        g_lat_t0 = now;
+        g_lat_nav_fseq = g_frames;    /* v9: only newer frames can answer */
+        snprintf(p, sizeof p, "{\"url\":\"file:///etc/input%s.html\"}",
+                 g_lat_navflip ? "2" : "");
+        cdp_send("Page.navigate", p, 1);
+        /* v7: the screencast DIES across a cross-document navigation (v6:
+         * navigation verified via page titles, yet zero frames followed --
+         * 10 of 10 navs timed out at 10 s). Re-issue it immediately; chrome
+         * starts it on the new document and pushes its first frame, so
+         * [navlat] = navigate -> the new page's pixels reach the window,
+         * which is exactly what a user experiences. */
+        snprintf(p, sizeof p,
+                 "{\"format\":\"jpeg\",\"quality\":" CW_STR(CW_Q) ","
+                 "\"maxWidth\":%d,\"maxHeight\":%d,"
+                 "\"everyNthFrame\":" CW_STR(CW_NTH) "}",
+                 g_page_w, g_page_h);
+        cdp_send("Page.startScreencast", p, 1);
+    }
+}
+#endif /* CW_LAT */
+
 #ifdef CW_HAVE_XF
 #ifdef CHROME_FULL
 static void xframe_poll_once(void) {
@@ -1700,6 +1856,14 @@ static void vizframe_poll_once(void) {
     /* Take the mappings once the regions exist. Before chrome has allocated
      * them there is nothing to map, so this retries until it succeeds and
      * then never again. Failure is not fatal: the copy path still works. */
+#ifdef CW_LAT
+    /* Slice 114: latency probes NAVIGATE, and a navigation allocates fresh
+     * shared bitmaps that a startup-time mapping does not cover -- a stale
+     * map index would silently drop exactly the frames being measured.
+     * The copy path's kernel-side hashing covers ANY size-matching region,
+     * so lat mode never maps. (Copy cost is irrelevant at ~1 frame/2s.) */
+    g_vizmap_tried = 400;
+#endif
     if (!g_vizmap.count && g_vizmap_tried < 400) {
         g_vizmap_tried++;
         g_vizmap.w = (uint32_t)vw; g_vizmap.h = (uint32_t)vh;
@@ -1760,6 +1924,9 @@ static void vizframe_poll_once(void) {
     if (g_frames == 1 || (g_frames % 30) == 0)
         printf("[cwviz] frame %d: %dx%d gen=%u (viz shm path)\n",
                g_frames, g_xf_w, g_xf_h, xf.gen);
+#ifdef CW_LAT
+    lat_note_frame();          /* slice 114: this frame answers the probe */
+#endif
     tk_redraw(&win);
 }
 #endif /* CW_VIZ */
@@ -1887,6 +2054,9 @@ int main(void) {
 #endif
 #ifdef CW_VIZ
         vizframe_poll_once();      /* slice 107: chrome's viz shared bitmaps */
+#ifdef CW_LAT
+        lat_probe_tick();          /* slice 114: responsiveness probes */
+#endif
 #endif
 
         for (;;) {                             /* drain all buffered CDP msgs */

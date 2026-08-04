@@ -6851,3 +6851,77 @@ the WHPX descheduling residual**, movable but not deletable from the
 guest. Slice 112's borrow removed the deletable half. This closes the
 execve thread; the watch item's instrument stays armed.
 
+---
+
+## SLICE 114 — **RESPONSIVENESS BASELINED: keypress→window median 97 ms (p90 114), navigation→new-page-pixels median 122 ms (p90 149).** Getting probes that don't lie took nine versions, and the failures mapped the capture stack's static-page behavior
+
+The fps arc closed at producer parity (110); this is the metric switch
+(§5.3). New: `initrd/etc/input.html` + `input2.html` (static probe
+pages), `CW_LAT` in chromewin, `gpuperf.sh lat input` mode.
+
+### The numbers (full-length run, all probes content-verified)
+
+```
+[inlat]  n=60 median=97ms  p90=114ms p99=144ms  timeouts=0
+[navlat] n=36 median=122ms p90=149ms p99=798ms  timeouts=0
+```
+
+- **inlat** = Input.dispatchKeyEvent → the echo's frame installed in
+  chromewin, through the REAL pipeline (CDP inject → renderer event →
+  raster → JPEG encode → base64 → pipe → decode). Median 97 ms,
+  reproduced across FIVE runs (97/84/97/97/97). ~2 BeginFrame periods
+  + encode/transport — chrome on tobyOS types like a usable browser.
+- **navlat** = Page.navigate → a frame that PROVABLY shows the new page
+  (see below). 122 ms median; the p99=798 ms is a real slow-beat tail,
+  not probe noise. Correctly ABOVE inlat, as a navigation must be.
+
+### What it took — each probe failure was a structural finding
+
+1. v1: probes never armed. **An evidence-based live-switch (5 viz
+   frames) and a static page are mutually exclusive** — the probe is
+   the only frame source. Arm on a timer.
+2. v2 (screencast stopped for purity): 64/70 timeouts. **The screencast
+   is the BeginFrame driver on headless-shell** — without it the echo
+   changes the DOM but never rasters. Keep it; its cost at 1 frame/2 s
+   is nil.
+3. v3/v4: still 66/70 timeouts, keys PROVEN landing (probe `blen` grew
+   per key). Census: **chrome RECLAIMS the viewport-sized shm pool when
+   a page idles — the viz path's 469-page premise is an
+   ANIMATION-ONLY phenomenon.** The viz gen edge is structurally absent
+   on static pages; and separately, the shipped stride-64/32-byte
+   coarse hash is BLIND to small dirty rects (slice 108's "could miss a
+   small rect" caveat is, measured, near-total for text-sized updates).
+   **Both are load-bearing facts for any future interactive use of the
+   viz path.** The honest lat-mode edge is the screencast frame install
+   — which IS the pixels' real path in this mode.
+4. v7: navs "measured" 18 ms — faster than a keypress, i.e. impossible.
+   **The screencast dies across a cross-document navigation** (verified:
+   page titles alternate, zero frames follow); re-issuing it after
+   Page.navigate makes chrome push the new document. But its first push
+   can still be the OLD page:
+5. v8/v9: a nav sample is only scored by a frame that is (a) NEWER than
+   the navigate command (frame-counter gate) and (b) PROVABLY the
+   destination page (blue-channel corner check, ≥20 units of margin
+   each side — the red-channel version had a wrong threshold AND
+   false-hit stale frames when navigating back). With both gates:
+   navlat 122 ms, zero timeouts, sanity restored.
+
+### Watch item (slice 112's ~460 ms hold): CLOSED benign
+
+Did not recur in 6+ runs since. With the hardened `[bklmax]`
+(`lastfault rip/cr2`), the mid-run `sys=-1` holds attribute to chrome
+fault-path work (CoW/demand under the BKL retry, ≤72 ms typical, cr2 in
+heap/mmap regions) plus the known interval-1 execve hold. Nothing
+defect-shaped.
+
+### Where the arc stands
+
+Steady state ~53 fps at chrome's own production rate; input 97 ms
+median; navigation 122 ms median; bootstrap tail ≤621 ms with zero
+≥1 s wake events; no attributable steady-state kernel defect. The
+remaining costs are host-virtualization artifacts (EPT first-touch,
+WHPX descheduling). Next levers, if ever needed, are INTERACTIVE-use
+ones: a fine-grained (or dirty-rect-aware) change detector for the viz
+path, and screencast-survival across navigation for chromewin as a real
+browser shell.
+
