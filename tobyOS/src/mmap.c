@@ -136,6 +136,36 @@ static struct mmap_vma *vma_find_internal(struct vma_table *vt, uint64_t addr) {
  * Distinguishes "no VMA at all" (wild pointer / cage reservation gap) from
  * "VMA present but PROT_NONE / not writable" (an mprotect/commit not reflected
  * here). Uses the tgid table so a worker thread sees the process's mappings. */
+/* Slice 108: what the HARDWARE sees at a fatal fault, next to what the VMA
+ * table claims. The multi-process bootstrap flake kills a freshly forked
+ * chrome child on an INSTRUCTION FETCH inside libc (err=0x14: not-present +
+ * exec) at an address the VMA table reports as present and executable
+ * (prot=0x5). Those two statements cannot both be true, and until now the
+ * fatal path printed only the second. This prints the PTE, which
+ * discriminates the remaining possibilities in one line:
+ *   no mapping        -> the resolver never installed a page
+ *   present, NX       -> installed without exec permission
+ *   present, !user    -> installed without the user bit
+ *   present and fine  -> a stale TLB / wrong address space
+ * Read-only; it maps nothing and changes no state. */
+void mmap_debug_fault_pte(uint64_t addr) {
+    struct proc *p = current_proc();
+    if (!p) return;
+    uint64_t va = addr & ~0xfffULL;
+    uint64_t saved = vmm_set_editor_root(p->cr3);
+    uint64_t phys = vmm_translate(va);
+    vmm_set_editor_root(saved);
+    if (!phys) {
+        kprintf("[pfpte] va=0x%lx cr3=0x%lx -> NO MAPPING (resolver never "
+                "installed a page, or installed it elsewhere)\n",
+                (unsigned long)va, (unsigned long)p->cr3);
+        return;
+    }
+    kprintf("[pfpte] va=0x%lx cr3=0x%lx -> phys=0x%lx PRESENT (so the fault is "
+            "a PERMISSION/TLB problem, not a missing page)\n",
+            (unsigned long)va, (unsigned long)p->cr3, (unsigned long)phys);
+}
+
 void mmap_debug_fault_vma(uint64_t addr) {
     struct proc *p = current_proc();
     if (!p) return;
@@ -1681,6 +1711,36 @@ long shm_cache_mmap(struct shm_cache *sc, uint64_t addr, uint64_t len,
  * them buries the signal. */
 #define CENSUS_MIN_PAGES 16          /* 64 KiB */
 
+/* Slice 108 item 3: how many pages the change-detector samples.
+ *
+ * MEASURED so far: the per-frame COPY is not the cost (removing it entirely
+ * moved 48.8 -> 49.2 fps, i.e. nothing), and polling HARDER made things worse
+ * (4ms: 38.3 fps). Both point at the work done per poll, and the only work
+ * per poll is this hash. At stride 8 a 469-page region costs 59 samples
+ * scattered across 1.9 MiB -- 59 cache misses per region per poll, times ~7
+ * regions, times ~66 polls/s.
+ *
+ * VIZ_HASH_STRIDE trades detection certainty for cache traffic. A page whose
+ * frame changed anywhere is overwhelmingly likely to differ in ANY sampled
+ * page for a full-viewport repaint; a small dirty rect could be missed, which
+ * costs a dropped frame, not a wrong one. The census keeps the fine stride --
+ * it is diagnostic and runs once every 3s, where cost does not matter. */
+#ifndef VIZ_HASH_STRIDE
+#define VIZ_HASH_STRIDE 64
+#endif
+
+static uint64_t census_hash_pages_stride(uint64_t *pages, size_t npages,
+                                         size_t stride) {
+    uint64_t h = 1469598103934665603ull;             /* FNV-1a offset basis */
+    for (size_t i = 0; i < npages; i += stride) {
+        uint64_t ph = pages[i];
+        if (!ph) { h ^= 0x9e3779b9ull; h *= 1099511628211ull; continue; }
+        const unsigned char *p = (const unsigned char *)(ph + vmm_hhdm_offset());
+        for (int b = 0; b < 32; b++) { h ^= p[b]; h *= 1099511628211ull; }
+    }
+    return h;
+}
+
 static uint64_t census_hash_pages(uint64_t *pages, size_t npages) {
     uint64_t h = 1469598103934665603ull;             /* FNV-1a offset basis */
     for (size_t i = 0; i < npages; i += 8) {
@@ -1764,20 +1824,41 @@ long vizframe_poll(uint32_t *w, uint32_t *h, uint32_t *stride, uint32_t *gen,
     uint64_t want_bytes = (uint64_t)vw * vh * 4ull;
     size_t   want_pages = (size_t)((want_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
 
+    /* Slice 108 item 3: sample coarsely, and STOP at the first region that
+     * changed. The old loop hashed every candidate at stride 8 on every poll
+     * even after it had found a fresh frame. With a rotating buffer pool any
+     * changed region IS a fresh frame, so scanning the rest only burns cache.
+     * Regions after the winner keep their stale stored hash, which is correct:
+     * they will register as changed on a later poll, when they are the fresh
+     * one. */
     int newest = -1;
     for (int i = 0; i < SHMCACHE_MAX; i++) {
         struct shm_cache *sc = &g_shm[i];
         if (!sc->used || !sc->pages || sc->npages != want_pages) continue;
-        uint64_t hv = census_hash_pages(sc->pages, sc->npages);
-        if (g_viz_have[i] && hv != g_viz_hash[i]) newest = i;   /* changed NOW */
+        uint64_t hv = census_hash_pages_stride(sc->pages, sc->npages,
+                                               VIZ_HASH_STRIDE);
+        int had = g_viz_have[i];
+        uint64_t prev = g_viz_hash[i];
         g_viz_hash[i] = hv;
         g_viz_have[i] = 1;
+        if (had && hv != prev) { newest = i; break; }        /* fresh frame */
     }
     /* Nothing changed this poll: keep showing the last good buffer, and do
      * NOT bump gen, so the caller knows there is no new frame. */
     if (newest < 0) newest = g_viz_last;
     else { g_viz_last = newest; g_viz_gen++; }
     if (newest < 0) return -61;                        /* -ENODATA: none yet */
+
+    /* Slice 108: the caller needs to know WHICH region is current, so it can
+     * blit from a read-only mapping instead of taking a copy. The index is
+     * returned rather than added to struct abi_xframe, which tier 2.5's
+     * xframe path shares -- widening that struct would change an ABI two
+     * producers depend on, to carry a field only one of them uses. */
+    int viz_idx = 0;
+    for (int i = 0; i < SHMCACHE_MAX && i < newest; i++) {
+        struct shm_cache *c = &g_shm[i];
+        if (c->used && c->pages && c->npages == want_pages) viz_idx++;
+    }
 
     struct shm_cache *sc = &g_shm[newest];
     if (!sc->used || !sc->pages) { g_viz_last = -1; return -61; }
@@ -1803,5 +1884,32 @@ long vizframe_poll(uint32_t *w, uint32_t *h, uint32_t *stride, uint32_t *gen,
             done += chunk;
         }
     }
-    return 0;
+    return viz_idx;          /* index into the MAP list, not the slot number */
+}
+
+/* Slice 108: install the viewport-sized regions read-only in the caller.
+ *
+ * These are the same physical pages chrome composites into -- shm_cache_mmap
+ * maps them, it does not copy them, which is the whole point. READ-ONLY: a
+ * stray write from us would land in a live compositor buffer.
+ *
+ * Enumerated in the SAME ORDER vizframe_poll counts, so the index it returns
+ * selects addr[] here. Both walk g_shm ascending and skip non-matching slots;
+ * keep them in step if either changes. */
+long vizframe_map(uint32_t w, uint32_t h, uint32_t *stride,
+                  uint64_t *addrs, uint32_t max_addrs) {
+    if (!w || !h || !addrs || !max_addrs) return -22;
+    uint64_t want_bytes = (uint64_t)w * h * 4ull;
+    size_t   want_pages = (size_t)((want_bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+    uint32_t n = 0;
+    for (int i = 0; i < SHMCACHE_MAX && n < max_addrs; i++) {
+        struct shm_cache *sc = &g_shm[i];
+        if (!sc->used || !sc->pages || sc->npages != want_pages) continue;
+        long base = shm_cache_mmap(sc, 0, want_bytes, 0x1u /* PROT_READ */,
+                                   0, 0);
+        if (base < 0) continue;              /* skip; a partial map is usable */
+        addrs[n++] = (uint64_t)base;
+    }
+    if (stride) *stride = w * 4u;
+    return (long)n;
 }

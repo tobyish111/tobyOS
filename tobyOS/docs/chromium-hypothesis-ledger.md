@@ -6431,3 +6431,78 @@ those depended on the failure analysis.
 runs) and its mechanism is UNKNOWN — with no surviving evidence.** The next
 failure will be archived; diagnose it then, from the failing log, rather than
 from a successful one.
+
+---
+
+## SLICE 108 — **the viz path finishes at 52.4 fps (+25% over CDP)**, and the two levers that *looked* obvious both measured as nothing
+
+Slice 107 left three named levers. All three are now measured, and the results
+invert the intuition that produced them.
+
+### The measurements, in the order they were taken
+
+```
+   multi-process CDP screencast                    41.9 fps
+   viz shm, copy path            (slice 107)       48.8 fps   +16.5%
+   viz shm, ZERO-COPY mapping                      49.2 fps   +0.8%   <- nothing
+   viz shm, zero-copy + coarse hash + early exit   52.4 fps   +6.5%
+```
+
+**+25% end to end**, against a page whose own rAF runs at **61/s** — so the
+capture now runs at 86% of the workload's own production rate.
+
+### Lever 1: zero-copy — built, verified, and worth NOTHING
+
+`ABI_SYS_VIZFRAME_MAP` installs chrome's viz bitmaps READ-ONLY in chromewin
+(the same physical pages, via `shm_cache_mmap`), and the poll returns which
+region is current, so paint blits straight out of chrome's compositor buffer.
+`[cwviz] mapped 4` regions; the 1.9 MiB-per-frame `copy_to_user` is gone.
+
+**48.8 → 49.2 fps.** The copy was never the bottleneck. This is kept anyway —
+it is strictly less work, it is correct, and it removes a whole class of
+future confusion — but as a PERFORMANCE change it measured as noise, and
+saying otherwise would be dishonest.
+
+### Lever 2: the per-poll hash — this was the real cost
+
+The 4 ms-poll experiment (slice 107: 38.3 fps, worse) had already implicated
+per-poll work rather than poll latency. With the copy eliminated, the only
+work left per poll was change detection: at stride 8, a 469-page region costs
+59 samples scattered across 1.9 MiB — 59 cache misses per region, times ~7
+regions, times ~66 polls/s.
+
+Two changes: sample at **stride 64**, and **stop at the first region that
+changed** instead of hashing all seven every time (with a rotating pool, any
+changed region IS a fresh frame; the ones after it keep their stale stored
+hash and register as changed on a later poll, when they are the fresh one).
+
+**49.2 → 52.4 fps.** Verified on screen: "tick 8752 (61.0/s)", animating, no
+tearing and no staleness — coarser sampling did not cost frames on a
+full-viewport repaint. A small dirty rect could in principle be missed; that
+costs a dropped frame, never a wrong one.
+
+### The flake instrument, and a correction it forced
+
+`[pfpte]` now prints the actual PTE at a fatal user fault, next to what the
+VMA table claims. It immediately corrected my own reading of the flake: I had
+taken an `err=0x14` (instruction-fetch) entry out of the `[pfres]` ring and
+called it the fatal fault. It was an earlier RESOLVED one. The instrument
+shows the rip's page **PRESENT** and the faulting address **0** — a genuine
+NULL dereference inside glibc's `fork()`, which is what the very first
+register dump said.
+
+**A register ring contains more than one fault. Print the PTE and believe
+that, not the ring's last entry.**
+
+### Flake status: reproduced, archived, localized, NOT explained
+
+3 of 4 full-length multi-process runs bootstrap. In the archived failure
+(`gpuperf_viz_anim.001.log`) no renderer is ever spawned, two forked children
+die pre-exec at the identical address, and the gpu-process re-execs at 29s.
+**Five hypotheses are dead** (fork cap, "the glibc crash is the discriminator",
+the PROT_NONE storm, "missing network/utility children", "the child loses its
+FS base" — `sys_fork` memcpy's the whole proc, so `tls_base` IS inherited).
+Next instrument named in the handoff: `tls_base` vs the live `IA32_FS_BASE`
+MSR at fatal time, plus a disassembly of `libc.so.6 + 0xb1a66`.
+
+Handoff written to `docs/chromium-handoff-post-slice-108.md`.

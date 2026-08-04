@@ -150,6 +150,10 @@ static toby_image_t *g_frame;        /* latest decoded screenshot (CDP path) */
 #ifdef CW_HAVE_XF
 /* Tier 2.5: ARGB pixels from fake-X MIT-SHM (primary paint path). */
 static uint32_t *g_xf_pixels;
+/* Slice 108: when chrome's bitmaps are mapped read-only this points straight
+ * INTO one of them, so paint reads chrome's page and nothing is copied. NULL
+ * on the copy path, where g_xf_pixels holds our own buffer. */
+static uint32_t *g_xf_pixels_ro;
 static int g_xf_w, g_xf_h, g_xf_stride;
 static uint32_t g_xf_gen, g_xf_seen;
 static int g_xf_cap;
@@ -1675,6 +1679,13 @@ static void xframe_poll_once(void) {
  * "the frame chrome just finished", and nothing synchronises us against the
  * compositor, so a frame can tear. Whether that is visible is a question for
  * the screendump, not for argument. */
+/* Slice 108: the read-only mappings of chrome's bitmaps, taken once. While
+ * these are live we blit STRAIGHT out of chrome's compositor buffers and the
+ * per-frame 1.9 MiB copy disappears entirely -- the step that stopped slice
+ * 107 from honestly being called zero-copy. */
+static struct abi_vizmap g_vizmap;
+static int g_vizmap_tried;
+
 static void vizframe_poll_once(void) {
     struct abi_xframe xf;
     int vw = g_page_w > 0 ? g_page_w : PAGE_W;
@@ -1686,9 +1697,28 @@ static void vizframe_poll_once(void) {
         g_xf_cap = g_xf_pixels ? (int)need : 0;
         if (!g_xf_pixels) return;
     }
+    /* Take the mappings once the regions exist. Before chrome has allocated
+     * them there is nothing to map, so this retries until it succeeds and
+     * then never again. Failure is not fatal: the copy path still works. */
+    if (!g_vizmap.count && g_vizmap_tried < 400) {
+        g_vizmap_tried++;
+        g_vizmap.w = (uint32_t)vw; g_vizmap.h = (uint32_t)vh;
+        long mrc = sc3(ABI_SYS_VIZFRAME_MAP, (long)(uintptr_t)&g_vizmap, 0, 0);
+        if (mrc > 0)
+            printf("[cwviz] mapped %u region(s) READ-ONLY at %dx%d stride=%u "
+                   "-- zero-copy blit from chrome's own buffers\n",
+                   g_vizmap.count, vw, vh, g_vizmap.stride);
+        else if (g_vizmap_tried == 400)
+            printf("[cwviz] VIZFRAME_MAP never succeeded (rc=%ld); staying on "
+                   "the copy path\n", mrc);
+    }
     xf.w = (uint32_t)vw; xf.h = (uint32_t)vh; xf.stride = 0; xf.gen = 0;
+    /* With mappings live, ask for NO pixel copy -- just which region is
+     * current. That is the entire saving. */
+    int mapped = (g_vizmap.count > 0);
     long rc = sc3(ABI_SYS_VIZFRAME_POLL, (long)(uintptr_t)&xf,
-                  (long)(uintptr_t)g_xf_pixels, (long)g_xf_cap);
+                  mapped ? 0 : (long)(uintptr_t)g_xf_pixels,
+                  mapped ? 0 : (long)g_xf_cap);
     if (rc < 0) {
         static int moaned;
         if (!moaned && rc != -61 /* ENODATA: none yet, normal at startup */) {
@@ -1705,6 +1735,13 @@ static void vizframe_poll_once(void) {
     g_xf_w    = (int)xf.w;
     g_xf_h    = (int)xf.h;
     g_xf_stride = (int)(xf.stride / 4);      /* tk_draw_blit wants px pitch */
+    /* rc is the index of the region that changed most recently. Point the
+     * paint path at chrome's page directly; no copy has happened anywhere. */
+    if (mapped) {
+        if (rc < 0 || (uint32_t)rc >= g_vizmap.count || !g_vizmap.addr[rc])
+            return;                          /* stale index: skip this frame */
+        g_xf_pixels_ro = (uint32_t *)(uintptr_t)g_vizmap.addr[rc];
+    }
     g_frames++;
     g_xf_frames++;
     g_xf_last_ms = sys_clock_ms();
@@ -1746,10 +1783,14 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
      * drives, which keeps a non-mapping Ozone run visually identical to the
      * slice-68 baseline instead of blank. */
 #ifdef CW_HAVE_XF
-    if (g_xf_live && g_xf_pixels && g_xf_w > 0) {
+    if (g_xf_live && (g_xf_pixels_ro || g_xf_pixels) && g_xf_w > 0) {
         int fw = g_xf_w < pw ? g_xf_w : pw;
         int fh = g_xf_h < ph ? g_xf_h : ph;
-        tk_draw_blit(w, 0, BAR_H, fw, fh, g_xf_pixels, g_xf_stride);
+        /* Slice 108: prefer the READ-ONLY mapping -- that is chrome's own
+         * compositor buffer, blitted with no intermediate copy. */
+        tk_draw_blit(w, 0, BAR_H, fw, fh,
+                     g_xf_pixels_ro ? g_xf_pixels_ro : g_xf_pixels,
+                     g_xf_stride);
         if (fw < pw) tk_draw_fill(w, fw, BAR_H, pw - fw, ph, 0x00303038u);
         if (fh < ph) tk_draw_fill(w, 0, BAR_H + fh, fw, ph - fh, 0x00303038u);
     } else

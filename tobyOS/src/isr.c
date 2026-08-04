@@ -609,6 +609,20 @@ static void default_exception(struct regs *r) {
                 }
                 kprintf("[isr] VMA at rip=%p:\n", (void *)r->rip);
                 mmap_debug_fault_vma(r->rip);
+                /* Slice 108: the VMA table's claim is not evidence about what
+                 * the CPU saw. Print the actual PTE for both the faulting
+                 * address and the rip -- the multi-process flake kills a
+                 * forked chrome child on an instruction fetch at an address
+                 * the VMA reports as present+exec, and only the PTE can say
+                 * whether the page is missing, mis-permissioned, or fine
+                 * (i.e. a stale TLB / wrong address space). */
+                {
+                    extern void mmap_debug_fault_pte(uint64_t);
+                    mmap_debug_fault_pte(r->rip);
+                    uint64_t fa = read_cr2();
+                    if ((fa & ~0xfffULL) != (r->rip & ~0xfffULL))
+                        mmap_debug_fault_pte(fa);
+                }
             }
         }
     }

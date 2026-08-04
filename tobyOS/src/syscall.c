@@ -4193,6 +4193,29 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return 0;
     }
 
+    case ABI_SYS_VIZFRAME_MAP: {
+        /* Slice 108: hand the caller READ-ONLY mappings of chrome's viz
+         * bitmaps so frames need no copy at all. Called once; the per-frame
+         * poll then just names which one is current. */
+        extern long vizframe_map(uint32_t, uint32_t, uint32_t *,
+                                 uint64_t *, uint32_t);
+        if (!a1) return -ABI_EINVAL;
+        struct abi_vizmap vm;
+        if (copy_from_user(&vm, (const void *)(uintptr_t)a1, sizeof vm) != 0)
+            return -ABI_EFAULT;
+        uint32_t stride = 0;
+        uint64_t addrs[ABI_VIZMAP_MAX];
+        memset(addrs, 0, sizeof addrs);
+        long n = vizframe_map(vm.w, vm.h, &stride, addrs, ABI_VIZMAP_MAX);
+        if (n < 0) return n;
+        vm.stride = stride;
+        vm.count  = (uint32_t)n;
+        memcpy(vm.addr, addrs, sizeof addrs);
+        if (copy_to_user((void *)(uintptr_t)a1, &vm, sizeof vm) != 0)
+            return -ABI_EFAULT;
+        return n;
+    }
+
     case ABI_SYS_UNIX_SOCKET:
         return sys_unix_socket();
 

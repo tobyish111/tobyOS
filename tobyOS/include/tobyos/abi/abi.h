@@ -977,8 +977,32 @@ struct abi_xframe {
  * the kernel matches regions by w*h*4 and cannot guess the viewport itself. */
 #define ABI_SYS_VIZFRAME_POLL   187
 
+/* Slice 108: map chrome's viz shared bitmaps READ-ONLY -- the zero-copy half.
+ *
+ * VIZFRAME_POLL still copies w*h*4 bytes per frame (1.9 MiB at 800x600),
+ * which is what stopped slice 107 from honestly calling itself zero-copy.
+ * These are the SAME PHYSICAL PAGES chrome composites into, so they can be
+ * installed in our address space instead of copied out of it.
+ *
+ * Call once after viz frames start; then poll with a NULL pixel buffer and
+ * blit straight from addr[newest]. VIZFRAME_POLL's return value is the index
+ * of the region that changed most recently, which is what selects the buffer.
+ *
+ * a1 = struct abi_vizmap * (w/h IN, everything else OUT)
+ * The mapping is READ-ONLY on purpose: chrome owns these pages, and a stray
+ * write from us would corrupt a live compositor buffer. */
+#define ABI_SYS_VIZFRAME_MAP    188
+
+#define ABI_VIZMAP_MAX 8
+struct abi_vizmap {
+    uint32_t w, h;                  /* IN: viewport; regions match w*h*4    */
+    uint32_t stride;                /* OUT: bytes per row                   */
+    uint32_t count;                 /* OUT: regions mapped (<= MAX)         */
+    uint64_t addr[ABI_VIZMAP_MAX];  /* OUT: read-only user addresses        */
+};
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          188
+#define ABI_SYS_NR_MAX          189
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
