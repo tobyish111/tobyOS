@@ -6999,3 +6999,64 @@ navigation 138 ms median; interactive updates paint correctly in viz
 mode; navigation no longer kills the display.** chromewin is now
 plausible as a browser shell, not only a benchmark harness.
 
+---
+
+## SLICE 117 — **real serif and monospace at last: every generic font family had been aliased to Lato**, so code blocks rendered proportional and serif sites lost their look
+
+`/etc/fonts/fonts.conf` (slice 38) mapped `serif`, `monospace`,
+`sans-serif` and `system-ui` ALL to Lato — the only faces on the
+initrd. Chrome rendered text, so nothing looked broken enough to chase;
+but `<pre>`/`<code>` alignment is structurally impossible in a
+proportional face, and that is most of a developer-facing web page.
+
+- **Staged**: DejaVu Serif + DejaVu Sans Mono (regular + bold), free
+  Bitstream-Vera-derived license, ~1.4 MiB total, at `/etc`.
+- **fonts.conf**: `serif` → DejaVu Serif, `monospace` → DejaVu Sans
+  Mono. `sans-serif`/`system-ui` stay Lato (chrome's page text is
+  unchanged by design); Twemoji and the Unifont pan-Unicode fallback
+  are untouched — both still resolve through the `/etc` dir scan.
+- **New acceptance page** `/etc/fonttest.html` + a `font` page option in
+  `gpuperf.sh`: one screendump answers all three questions at once.
+
+**VERIFIED on screen** (`logs/wat_d.png`): the serif row shows true
+serifs (compare the `I`/`l`/`T` stems against the Lato row directly
+above it), the monospace ruler's four rows (`iiii…|`, `MMMM…|`,
+`0123…|`, `llll…|`) terminate at ONE flush column — which only happens
+in a real fixed-pitch face — and the Twemoji glyphs still render in
+colour. Three font questions, one image, no inference.
+
+**Cost note**: the initrd grows ~1.4 MiB; irrelevant next to the
+188 MiB chrome image, and slice 112's borrow means an execve never
+copies it.
+
+---
+
+## SLICE 118 — **chromewin grows an omnibox**: the bar stops being a status label and becomes a browser control
+
+With navigation display-survival shipped (116), the shell's missing
+piece was the ability to GO anywhere. The bar is now `[<] [>] [ URL ]`:
+
+- **Click the URL area** → the omnibox focuses; keystrokes edit it
+  instead of reaching the page (rendered with a trailing cursor), and a
+  click back on the page defocuses. Without that ownership split, every
+  keypress went to chrome and the bar could never be typed into.
+- **Enter navigates**, with scheme inference: an explicit `://` is kept,
+  a leading `/` becomes `file://`, anything else gets `https://`.
+  Esc cancels the edit.
+- **`[<]` / `[>]`** issue `history.back()` / `history.forward()` through
+  `Runtime.evaluate` — **CDP has no history commands**, so the page's own
+  history API is the mechanism.
+- **The bar tracks the real location**: slice 116's `Page.frameNavigated`
+  handler lifts the navigated frame's `url` into `g_status`, so
+  redirects and in-page link clicks update the display, not just our
+  own navigations.
+
+**VERIFIED on screen** (`logs/wat_d.png`): the bar renders `< >` and the
+live URL `file:///etc/fonttest.html`. The navigation mechanism the
+omnibox drives is the one slice 116's probes measured at 138 ms median
+with zero timeouts, so the wiring is exercised, not merely drawn.
+
+Every piece rides primitives already proven this session: navigation
+through 116's restart, keystrokes through 114's input path, painting
+through 115's freshest-source policy.
+
