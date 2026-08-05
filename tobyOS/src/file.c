@@ -15,6 +15,7 @@
  */
 
 #include <tobyos/file.h>
+#include <tobyos/snd_pcm.h>
 #include <tobyos/pipe.h>
 #include <tobyos/socket.h>
 #include <tobyos/tcp.h>
@@ -287,6 +288,11 @@ struct file *file_clone(struct file *src) {
 void file_close(struct file *f) {
     if (!f) return;
     switch (f->kind) {
+    case FILE_KIND_SND:
+        /* Audio slice 3: release the substream and stop the DAC, or the
+         * next open sees in_use and returns ENOENT forever. */
+        lxsnd_close(f);
+        break;
     case FILE_KIND_PIPE_R:
         pipe_close_reader(f->pipe);
         break;

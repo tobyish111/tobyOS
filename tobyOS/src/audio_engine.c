@@ -12,6 +12,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/proc.h>
 #include <tobyos/pit.h>
+#include <tobyos/audio_hda.h>
 
 #define AUDIO_MAX_STREAMS       16
 #define AUDIO_RING_SIZE         (64 * 1024)  /* 64KB ring buffer */
@@ -59,9 +60,15 @@ struct audio_stream {
 static struct audio_stream g_audio_streams[AUDIO_MAX_STREAMS];
 static int32_t g_audio_mix_buf[AUDIO_MIX_BUF_SAMPLES * 2];
 static int16_t g_audio_out_buf[AUDIO_MIX_BUF_SAMPLES * 2];
-static struct audio_ring g_audio_dma_ring;
+/* (there used to be a g_audio_dma_ring here -- a 64 KiB staging ring that
+ * audio_engine_pump filled and NOTHING ever read. The HDA cyclic DMA
+ * buffer is the real ring; this one was pure dead weight.) */
 static uint32_t g_audio_master_volume = 80;
 static bool g_audio_engine_ready;
+
+/* Both defined below; sys_audio_write (further up) calls the tick. */
+size_t audio_engine_pump(void);
+void   audio_engine_tick(void);
 
 static void audio_ring_init(struct audio_ring *r, size_t samples) {
     r->size = samples;
@@ -122,19 +129,33 @@ static void audio_convert_to_pcm16(const void *src, int16_t *dst, size_t samples
         break;
     }
     case AUDIO_FMT_FLOAT32: {
+        /* IEEE-754 binary32 in [-1.0, 1.0] -> int16, in pure integer ops
+         * (no SSE, so no FXSAVE guard needed on this path).
+         *
+         * The previous version was broken twice over: both arms of its
+         * if/else were the SAME expression `mantissa >> (23 - exp)`, and
+         * the scale was wrong -- full-scale 1.0 (exp=0, mantissa=0x800000)
+         * came out as 0x800000 >> 23 == 1, so every float32 sample decoded
+         * to 0 or +-1. Float32 audio was silence. It also shifted by a
+         * negative amount (UB) for exp > 23.
+         *
+         * Correct scale: value = mantissa/2^23 * 2^exp, and we want
+         * value * 2^15, so val = mantissa >> (8 - exp), i.e. a LEFT shift
+         * when exp > 8. Check: 1.0 -> 0x800000 >> 8 = 32768 -> clamps to
+         * 32767; 0.5 -> 0x800000 >> 9 = 16384. */
         const uint32_t *s = (const uint32_t *)src;
         for (size_t i = 0; i < samples; i++) {
-            /* Simplified float32 to int16: interpret as fixed-point approx */
-            int32_t raw = (int32_t)s[i];
-            int32_t exp = ((raw >> 23) & 0xFF) - 127;
-            int32_t mantissa = (raw & 0x7FFFFF) | 0x800000;
-            int32_t val;
-            if (exp >= 0)
-                val = mantissa >> (23 - exp);
-            else
-                val = mantissa >> (23 - exp);
-            if (raw & 0x80000000) val = -val;
-            if (val > 32767) val = 32767;
+            uint32_t raw = s[i];
+            int32_t  exp = (int32_t)((raw >> 23) & 0xFF) - 127;
+            int32_t  mantissa = (int32_t)((raw & 0x7FFFFF) | 0x800000);
+            int32_t  shift = 8 - exp;
+            int32_t  val;
+            if (shift >= 24)      val = 0;            /* denormal/too small */
+            else if (shift >= 0)  val = mantissa >> shift;
+            else if (shift > -8)  val = mantissa << (-shift);
+            else                  val = 32767;        /* |x| >= 256: clamp  */
+            if (raw & 0x80000000u) val = -val;
+            if (val > 32767)  val = 32767;
             if (val < -32768) val = -32768;
             dst[i] = (int16_t)val;
         }
@@ -189,18 +210,28 @@ static size_t audio_mix(int16_t *out, size_t max_samples) {
 
     memset(g_audio_mix_buf, 0, out_samples * sizeof(int32_t));
 
+    /* Longest contribution from any stream. The mix used to return the
+     * full out_samples no matter how little it actually read, so a stream
+     * holding 100 samples produced 100 samples of audio followed by 1948
+     * samples of injected silence -- a click on every short write. Only
+     * the region a stream really covered may be emitted. */
+    size_t valid = 0;
     bool any_active = false;
     for (int i = 0; i < AUDIO_MAX_STREAMS; i++) {
         struct audio_stream *s = &g_audio_streams[i];
         if (s->state != AUDIO_STREAM_PLAYING) continue;
         if (s->ring.count == 0) continue;
 
-        int16_t tmp[AUDIO_MIX_BUF_SAMPLES * 2];
+        /* static, not automatic: these are 4 KiB EACH and were declared
+         * inside the loop, so a mix pass put 8 KiB on the kernel stack.
+         * audio_mix has exactly one caller and runs under the BKL, so
+         * file scope is safe and the stack stays shallow. */
+        static int16_t tmp[AUDIO_MIX_BUF_SAMPLES * 2];
         size_t read = audio_ring_read(&s->ring, tmp, out_samples);
         if (read == 0) continue;
 
         /* Resample if needed */
-        int16_t resampled[AUDIO_MIX_BUF_SAMPLES * 2];
+        static int16_t resampled[AUDIO_MIX_BUF_SAMPLES * 2];
         int16_t *src_data = tmp;
         size_t src_count = read;
 
@@ -213,22 +244,29 @@ static size_t audio_mix(int16_t *out, size_t max_samples) {
 
         /* Mix with volume */
         uint32_t vol = (uint32_t)s->volume * g_audio_master_volume / 100;
-        for (size_t j = 0; j < src_count && j < out_samples; j++) {
+        size_t n = src_count < out_samples ? src_count : out_samples;
+        for (size_t j = 0; j < n; j++) {
             g_audio_mix_buf[j] += ((int32_t)src_data[j] * (int32_t)vol) / 100;
         }
+        if (n > valid) valid = n;
         any_active = true;
     }
 
-    if (!any_active) return 0;
+    if (!any_active || valid == 0) return 0;
+
+    /* Keep the emitted length an exact number of stereo frames; a half
+     * frame would swap the channels for the rest of the stream. */
+    valid &= ~(size_t)1;
+    if (valid == 0) return 0;
 
     /* Clip and output */
-    for (size_t i = 0; i < out_samples; i++) {
+    for (size_t i = 0; i < valid; i++) {
         int32_t val = g_audio_mix_buf[i];
         if (val > 32767) val = 32767;
         if (val < -32768) val = -32768;
         out[i] = (int16_t)val;
     }
-    return out_samples;
+    return valid;
 }
 
 /* ---- Syscall handlers ---- */
@@ -249,6 +287,15 @@ int sys_audio_open(uint32_t sample_rate, uint8_t channels, uint8_t format) {
             s->format = format;
             s->volume = 80;
             audio_ring_init(&s->ring, AUDIO_RING_SIZE / sizeof(int16_t));
+            /* Bring the hardware stream up on the first open. The mixer
+             * always emits AUDIO_DEFAULT_RATE stereo (per-stream rates are
+             * resampled in audio_mix), so the device is opened at the
+             * mixer's rate, not this stream's. */
+            if (!audio_hda_pcm_is_open()) {
+                if (audio_hda_pcm_open(AUDIO_DEFAULT_RATE, 2) != 0)
+                    kprintf("[audio] no HDA output -- stream %d is a "
+                            "silent sink\n", i);
+            }
             kprintf("[audio] stream %d opened: rate=%u ch=%u fmt=%u\n",
                    i, sample_rate, channels, format);
             return i;
@@ -272,6 +319,23 @@ long sys_audio_write(int stream_id, const void *samples, size_t count) {
     case AUDIO_FMT_FLOAT32: sample_size = 4; break;
     }
 
+    /* A zero-length write is a FLUSH: mix whatever is already queued into
+     * the device and return. Callers need this because the pump is driven
+     * by writers, and a stream's tail has no writer left -- pid 0's
+     * audio_engine_tick covers a live desktop, but anything running before
+     * idle_loop exists (the whole boot-time M26A harness, for one) would
+     * otherwise have its last few hundred ms silently discarded at close. */
+    if (count == 0) {
+        /* audio_engine_tick, not just _pump: the tick ALSO tops the ring
+         * up with silence once there is nothing left to mix. Without that
+         * the cyclic BDL keeps RUN set and replays its last ~85 ms for as
+         * long as the stream is open -- /bin/audioplay submitted 600 ms
+         * and the capture held 1.024 s, the surplus being the ring looping
+         * during the drain. A paused video would loop forever. */
+        audio_engine_tick();
+        return 0;
+    }
+
     size_t total_samples = count / sample_size;
     if (total_samples == 0) return 0;
     if (total_samples > AUDIO_MIX_BUF_SAMPLES * 2)
@@ -283,6 +347,11 @@ long sys_audio_write(int stream_id, const void *samples, size_t count) {
     size_t written = audio_ring_write(&s->ring, conv_buf, total_samples);
     if (s->state == AUDIO_STREAM_OPEN)
         s->state = AUDIO_STREAM_PLAYING;
+
+    /* The writer is the pump: drain the mixer into the hardware ring on
+     * every write, so no timer or HDA interrupt is needed and the device
+     * ring's backpressure paces the caller naturally. */
+    audio_engine_pump();
 
     return (long)(written * sample_size);
 }
@@ -297,6 +366,12 @@ int sys_audio_close(int stream_id) {
         s->ring.buf = NULL;
     }
     s->state = AUDIO_STREAM_FREE;
+
+    /* Last one out stops the DAC, so an idle desktop is not holding a
+     * running DMA stream (and a real codec's output stays muted). */
+    for (int i = 0; i < AUDIO_MAX_STREAMS; i++)
+        if (g_audio_streams[i].state != AUDIO_STREAM_FREE) return 0;
+    audio_hda_pcm_close();
     return 0;
 }
 
@@ -315,26 +390,95 @@ int sys_audio_volume(int stream_id, uint8_t volume) {
     return 0;
 }
 
-/* Called periodically to push mixed audio to the DMA ring */
-void audio_engine_pump(void) {
-    if (!g_audio_engine_ready) return;
+/* Drain every playing stream through the mixer and into the hardware.
+ *
+ * THIS IS THE JUNCTION THAT WAS MISSING. The old body mixed into
+ * g_audio_dma_ring, and the only reader of that ring was
+ * audio_engine_get_dma_data(), which had ZERO callers anywhere in the
+ * tree -- so mixed audio accumulated in a buffer nothing ever drained
+ * and no sound could physically leave the machine. The ring is now the
+ * HDA cyclic DMA buffer itself.
+ *
+ * Returns frames pushed to the device this pass. Called from
+ * sys_audio_write (a push model: the writer is the pump), so no timer or
+ * IRQ is required -- the HDA ring's backpressure paces the writer. */
+size_t audio_engine_pump(void) {
+    if (!g_audio_engine_ready) return 0;
+    if (!audio_hda_pcm_is_open()) return 0;
 
-    size_t mixed = audio_mix(g_audio_out_buf, AUDIO_MIX_BUF_SAMPLES * 2);
-    if (mixed > 0) {
-        audio_ring_write(&g_audio_dma_ring, g_audio_out_buf, mixed);
+    size_t pushed = 0;
+    /* Loop so a writer that hands us a big buffer at once still gets it
+     * all in front of the DAC, rather than one mix-buffer per write.
+     *
+     * ASK THE DEVICE FOR SPACE FIRST. audio_mix() is destructive -- it
+     * drains the per-stream rings -- so mixing a full buffer and only
+     * then discovering the device is full throws that audio away with no
+     * error anywhere. That is exactly what the first cut of this loop did:
+     * /bin/audioplay submitted 600 ms, reported "0 short writes, 0 stalls"
+     * because the per-stream ring accepted everything, and precisely one
+     * device ring (16384 B, ~85 ms) ever reached the DAC. The rest was
+     * mixed and dropped.
+     *
+     * Capping the mix at the device's free space instead means a full
+     * device leaves the stream rings untouched, they back up, the short
+     * return from audio_ring_write propagates out of sys_audio_write, and
+     * the writer finally sees the backpressure it is supposed to pace on. */
+    for (;;) {
+        long free_fr = audio_hda_pcm_free();
+        if (free_fr <= 0) break;                  /* device ring is full */
+
+        size_t cap = (size_t)free_fr * 2;         /* frames -> samples   */
+        if (cap > AUDIO_MIX_BUF_SAMPLES * 2) cap = AUDIO_MIX_BUF_SAMPLES * 2;
+
+        size_t mixed = audio_mix(g_audio_out_buf, cap);
+        if (mixed == 0) break;                    /* nothing left to mix */
+
+        long w = audio_hda_pcm_write(g_audio_out_buf, mixed / 2);
+        if (w <= 0) break;
+        pushed += (size_t)w;
     }
+    return pushed;
 }
 
-/* Provide audio data to the HDA DMA controller */
-size_t audio_engine_get_dma_data(int16_t *buf, size_t max_samples) {
+/* Frames still queued ahead of the DAC; the pacing signal for a writer. */
+long audio_engine_pending(void) {
     if (!g_audio_engine_ready) return 0;
-    return audio_ring_read(&g_audio_dma_ring, buf, max_samples);
+    return audio_hda_pcm_pending();
+}
+
+/* Periodic service call from pid 0's idle loop (under the BKL).
+ *
+ * Two jobs the push-from-write path cannot do:
+ *   1. DRAIN THE TAIL. After an app's last write there is no writer left
+ *      to move what is still sitting in the per-stream rings, so the end
+ *      of every sound was being dropped at close.
+ *   2. FEED SILENCE ON UNDERRUN. The BDL is cyclic and RUN stays set, so
+ *      a starved stream does not go quiet -- the controller loops over
+ *      whatever bytes are still in the ring and replays the last ~85 ms
+ *      forever. Writing zeroes ahead of the hardware cursor is what makes
+ *      an idle stream actually silent.
+ *
+ * Returns immediately when no stream is open, so an idle desktop pays
+ * one predicate per idle iteration. */
+void audio_engine_tick(void) {
+    if (!g_audio_engine_ready) return;
+    if (!audio_hda_pcm_is_open()) return;
+
+    if (audio_engine_pump() > 0) return;      /* real audio went out */
+
+    /* Nothing to mix: keep the ring topped up with silence rather than
+     * letting the DAC loop over stale samples. */
+    long free_fr = audio_hda_pcm_free();
+    if (free_fr <= 0) return;
+    if (free_fr > AUDIO_MIX_BUF_SAMPLES) free_fr = AUDIO_MIX_BUF_SAMPLES;
+    memset(g_audio_out_buf, 0, (size_t)free_fr * 2 * sizeof(int16_t));
+    audio_hda_pcm_write(g_audio_out_buf, (size_t)free_fr);
 }
 
 void audio_engine_init(void) {
     memset(g_audio_streams, 0, sizeof(g_audio_streams));
-    audio_ring_init(&g_audio_dma_ring, AUDIO_RING_SIZE / sizeof(int16_t));
     g_audio_engine_ready = true;
-    kprintf("[audio_engine] initialized: %u Hz stereo 16-bit output\n",
-           AUDIO_DEFAULT_RATE);
+    kprintf("[audio_engine] initialized: %u Hz stereo 16-bit output "
+            "(hda=%s)\n", AUDIO_DEFAULT_RATE,
+            audio_hda_present() ? "present" : "absent");
 }

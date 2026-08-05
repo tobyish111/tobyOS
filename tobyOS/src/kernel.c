@@ -95,6 +95,7 @@
 #include <tobyos/fw_cfg.h>
 #include <tobyos/acpi_bat.h>
 #include <tobyos/devtest.h>
+#include <tobyos/snd_pcm.h>
 #include <tobyos/display.h>
 #include <tobyos/slog.h>
 #include <tobyos/watchdog.h>
@@ -181,6 +182,7 @@ extern void hidpi_init(void);
 
 /* Phase B: Audio engine */
 extern void audio_engine_init(void);
+extern void audio_engine_tick(void);
 
 /* ---- Limine framebuffer request (kept inline -- only used here) ---- */
 
@@ -724,6 +726,18 @@ static __attribute__((noreturn)) void idle_loop(void) {
             xserver_tick();
         }
 #endif
+        bkl_exit();
+
+        /* Audio slice 2: keep the DAC fed even when nobody is calling
+         * write(). sys_audio_write pumps too (that keeps latency low),
+         * but a push-only model cannot drain the TAIL of a stream: after
+         * an app's last write, whatever is still in the per-stream ring
+         * has no one left to move it, and close() throws it away. That
+         * cost /bin/audioplay 335 ms of a 600 ms tone. audio_engine_pump
+         * was always commented "called periodically" -- this is that call.
+         * Cheap when idle: it returns immediately unless a stream is open. */
+        bkl_enter();
+        audio_engine_tick();
         bkl_exit();
 
         /* Periodic filesystem writeback so /data survives an unclean
@@ -1718,6 +1732,25 @@ static void m26a_run_userland_tools(void) {
          * so booting on a machine without an audio chip stays clean. */
         { "/bin/audiotest",    "audiotest-boot",    1,
           { "audiotest",    0, 0, 0, 0, 0 } },
+        /* Audio slice 2: audiotest only probes the controller/codec.
+         * audioplay exercises the PLAYBACK path -- sys_audio_write ->
+         * mixer -> HDA cyclic DMA -> DAC -- which had no caller chain at
+         * all until the engine was connected to the driver. Capture it
+         * with logs/audio2.sh + logs/wavcheck.py. */
+        { "/bin/audioplay",    "audioplay-boot",    1,
+          { "audioplay",    0, 0, 0, 0, 0 } },
+        /* Audio slice 3: the ALSA ABI guard. A static LINUX ELF (raw
+         * syscalls, no libc) that walks /dev/snd/{controlC0,pcmC0D0p}
+         * exactly as alsa-lib does, so the kernel half of the ABI is
+         * proven independently -- when slice 4 drops the real
+         * libasound.so.2 on top, a failure is attributable to the library
+         * rather than to us. Lives HERE rather than beside the DRMTEST
+         * guard: that whole neighbourhood sits behind a boot flag and has
+         * never executed in any config we build (verified across
+         * audio1/audio2/defboot logs -- zero DRMTEST lines). This table
+         * demonstrably runs. */
+        { "/bin/linux-sndtest", "linux-sndtest-boot", 1,
+          { "linux-sndtest", 0, 0, 0, 0, 0 } },
         { "/bin/batterytest",  "batterytest-boot",  1,
           { "batterytest",  0, 0, 0, 0, 0 } },
     };

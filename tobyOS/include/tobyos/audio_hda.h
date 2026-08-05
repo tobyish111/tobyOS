@@ -89,15 +89,37 @@ int  audio_hda_introspect(struct abi_dev_info *out, int cap);
 int  audio_hda_selftest(char *msg, size_t cap);
 
 /* Tone-playback self-test via devtest_run("audio_tone", ...).
- * Programs output stream 0 with a 1-period square-wave at 440 Hz,
- * 48 kHz / 16-bit / stereo, runs the stream for ~250 ms, then stops
- * it. Returns:
+ * Programs output stream 0 with a square wave at 880 Hz (the header used
+ * to say 440; the code has always written 880), 48 kHz / 16-bit / stereo,
+ * runs the stream for ~250 ms, then stops it. Returns:
  *   ABI_DEVT_SKIP  no controller / no codec / no DAC+PIN pair / no OSS
- *   0              registers + codec verbs accepted (audibility is
- *                  QEMU-audiodev-dependent and NOT validated here)
+ *   0              registers + codec verbs accepted, and LPIB is reported
+ *                  so the caller can see the DMA cursor actually moved
  *   negative       register read-back mismatch or stream-descriptor
  *                  reset wedged
- * `msg` is filled with what was actually programmed. */
+ * `msg` is filled with what was actually programmed.
+ *
+ * Audibility IS now verifiable end-to-end: run QEMU with
+ *   -audiodev wav,id=snd0,path=out.wav -device intel-hda \
+ *   -device hda-output,audiodev=snd0
+ * and check the capture with logs/wavcheck.py (see logs/audio1.sh). */
 int  audio_hda_tone_selftest(char *msg, size_t cap);
+
+/* ---- Continuous PCM playback -------------------------------------------
+ * The real output path, as opposed to the one-shot tone diagnostic above.
+ * A cyclic DMA ring (one BDL entry per page) that the controller loops
+ * over forever while a writer refills it behind the hardware cursor.
+ *
+ * Usage: open() once, then write() repeatedly, pacing off pending().
+ * write() returns a SHORT count (possibly 0) when the ring is full rather
+ * than blocking, so the caller controls its own waiting -- the same
+ * contract as ALSA's snd_pcm_writei against avail_update. */
+int      audio_hda_pcm_open(uint32_t rate, uint8_t channels);
+long     audio_hda_pcm_write(const int16_t *src, size_t frames);
+long     audio_hda_pcm_free(void);      /* frames of space available NOW  */
+long     audio_hda_pcm_pending(void);   /* frames queued ahead of the DAC */
+void     audio_hda_pcm_close(void);
+bool     audio_hda_pcm_is_open(void);
+uint64_t audio_hda_pcm_underruns(void);
 
 #endif /* TOBYOS_AUDIO_HDA_H */

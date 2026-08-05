@@ -35,6 +35,7 @@
 #include <tobyos/gfx.h>
 #include <tobyos/virtio_gpu.h>
 #include <tobyos/linux_drm.h>
+#include <tobyos/snd_pcm.h>
 #include <tobyos/term.h>
 #include <tobyos/vfs.h>
 #include <tobyos/heap.h>
@@ -2227,6 +2228,34 @@ static long sys_open(const char *path, int flags, int mode) {
             if (fd < 0) { kfree(f); return -ABI_EMFILE; }
             return fd;
         }
+        /* Audio slice 3: the ALSA character devices. alsa-lib opens
+         * /dev/snd/controlC0 to enumerate the card and /dev/snd/pcmC0D0p
+         * for the playback substream; Chromium reaches both by dlopening
+         * libasound.so.2. ENOENT when no codec is bound, which is what a
+         * Linux box with no sound card does. */
+        if (strcmp(dev, "snd") == 0 || strcmp(dev, "snd/") == 0) {
+            if (!lxsnd_available()) return -ABI_ENOENT;
+            struct file *f = (struct file *)kmalloc(sizeof(*f));
+            if (!f) return -ABI_ENOMEM;
+            memset(f, 0, sizeof(*f));
+            f->kind    = FILE_KIND_DIR;
+            /* Heap-owned: file_close/file_clone kfree it (the slice-102
+             * string-literal panic). */
+            f->dirpath = (char *)kmalloc(9);
+            if (!f->dirpath) { kfree(f); return -ABI_ENOMEM; }
+            memcpy(f->dirpath, "/dev/snd", 9);
+            f->dir_off = 0;
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            return fd;
+        }
+        if (strncmp(dev, "snd/", 4) == 0) {
+            struct file *f = lxsnd_open(dev);
+            if (!f) return -ABI_ENOENT;
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            return fd;
+        }
         /* Track B graphics: the Linux framebuffer device. */
         if (strcmp(dev, "fb0") == 0) {
             struct file *f = (struct file *)kmalloc(sizeof(*f));
@@ -4360,11 +4389,23 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     case ABI_SYS_AUDIO_OPEN:
         return sys_audio_open((uint32_t)a1, (uint8_t)a2, (uint8_t)a3);
     case ABI_SYS_AUDIO_WRITE: {
-        /* count is in SAMPLES; bound the byte size conservatively (max
-         * 4 bytes/sample) and bounce. */
+        /* count is in BYTES.
+         *
+         * This used to read "count is in SAMPLES" and bounce count * 4,
+         * but NOTHING else in the tree agreed: sys_audio_write's body
+         * does `total_samples = count / sample_size`, and every caller --
+         * the native browser (user_gui_browser/main.c) and /bin/audioplay
+         * -- passes a byte count. So every audio write over-read FOUR
+         * TIMES past the end of the user's buffer. It only ever appeared
+         * to work when the caller's buffer happened to be followed by
+         * 3x its length of mapped readable memory; a 1920-byte write
+         * from /bin/audioplay bounced 7680 bytes and took an EFAULT. */
         size_t count = (size_t)a3;
-        if (count > SYS_MAX_RW / 4) count = SYS_MAX_RW / 4;
-        void *k = bounce_in((const void *)a2, count * 4);
+        /* count == 0 is the flush kick -- no buffer to bounce, and
+         * bounce_in(ptr, 0) would fail and look like EFAULT. */
+        if (count == 0) return sys_audio_write((int)a1, 0, 0);
+        if (count > SYS_MAX_RW) count = SYS_MAX_RW;
+        void *k = bounce_in((const void *)a2, count);
         if (!k) return -ABI_EFAULT;
         long rv = sys_audio_write((int)a1, k, count);
         kfree(k);
@@ -8603,6 +8644,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                (unsigned long)a3);
         if (f->kind == FILE_KIND_DRM)                 /* slice 98: /dev/dri */
             return lxdrm_ioctl(f, (unsigned long)a2, (unsigned long)a3);
+        if (f->kind == FILE_KIND_SND)                 /* audio slice 3 */
+            return lxsnd_ioctl(f, (unsigned long)a2, (unsigned long)a3);
         return -ABI_ENOTTY;
     }
 

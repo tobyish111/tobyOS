@@ -198,6 +198,7 @@ C_SRCS := src/kernel.c \
           src/sysmon.c \
           src/installer.c \
           src/audio_hda.c \
+          src/snd_pcm.c \
           src/fw_cfg.c \
           src/acpi_bat.c \
           src/devtest.c \
@@ -419,6 +420,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/drvtest/drvtest.elf \
             programs/usbtest/usbtest.elf \
             programs/audiotest/audiotest.elf \
+            programs/audioplay/audioplay.elf \
             programs/batterytest/batterytest.elf \
             programs/displayinfo/displayinfo.elf \
             programs/drawtest/drawtest.elf \
@@ -1428,6 +1430,7 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devlist,devlist))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,drvtest,drvtest))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,usbtest,usbtest))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,audiotest,audiotest))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,audioplay,audioplay))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,batterytest,batterytest))
 
 # ---------- M27A: display test harness userland tools ----------
@@ -1834,6 +1837,16 @@ programs/linux-eventfd/linux-eventfd.elf: programs/linux-eventfd/main.c
 # the same madvise-dropped pages in lock-step rounds; a map_4k PTE replace
 # (the 0x208c13a YouTube corruption) loses the winner's writes. Static Linux ELF.
 programs/linux-demrace/linux-demrace.elf: programs/linux-demrace/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
+# ALSA PCM guard (audio slice 3): drives /dev/snd/{controlC0,pcmC0D0p} the
+# way alsa-lib does -- CARD_INFO, PCM_INFO, HW_REFINE, HW_PARAMS, SW_PARAMS,
+# PREPARE, WRITEI_FRAMES, SYNC_PTR -- and requires hw_ptr to ADVANCE, which
+# only happens if the DAC really consumed the samples. Static Linux ELF.
+programs/linux-sndtest/linux-sndtest.elf: programs/linux-sndtest/main.c
 	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
 	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
 	      -Wl,-e,_start -o $@ $<
@@ -2480,6 +2493,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-demrace/linux-demrace.elf \
                programs/linux-qfreeze/linux-qfreeze.elf \
                programs/linux-drmtest/linux-drmtest.elf \
+               programs/linux-sndtest/linux-sndtest.elf \
                programs/linux-mlkem/linux-mlkem.elf \
                programs/linux-xstub/linux-xstub.elf \
                programs/linux-procfs/linux-procfs.elf \
@@ -2633,6 +2647,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-demrace/linux-demrace.elf       $(INITRD_STAGE)/bin/linux-demrace
 	cp programs/linux-qfreeze/linux-qfreeze.elf       $(INITRD_STAGE)/bin/linux-qfreeze
 	cp programs/linux-drmtest/linux-drmtest.elf       $(INITRD_STAGE)/bin/linux-drmtest
+	cp programs/linux-sndtest/linux-sndtest.elf       $(INITRD_STAGE)/bin/linux-sndtest
 	cp programs/linux-mlkem/linux-mlkem.elf           $(INITRD_STAGE)/bin/linux-mlkem
 	cp programs/linux-xstub/linux-xstub.elf           $(INITRD_STAGE)/bin/linux-xstub
 	cp programs/linux-tty/linux-tty.elf               $(INITRD_STAGE)/bin/linux-tty
@@ -2694,6 +2709,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
 	cp programs/audiotest/audiotest.elf               $(INITRD_STAGE)/bin/audiotest
+	cp programs/audioplay/audioplay.elf               $(INITRD_STAGE)/bin/audioplay
 	cp programs/batterytest/batterytest.elf           $(INITRD_STAGE)/bin/batterytest
 	cp programs/displayinfo/displayinfo.elf           $(INITRD_STAGE)/bin/displayinfo
 	cp programs/drawtest/drawtest.elf                 $(INITRD_STAGE)/bin/drawtest
@@ -3105,7 +3121,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
 	    bin/linux-scmsg bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
-	    bin/linux-qfreeze bin/linux-drmtest \
+	    bin/linux-qfreeze bin/linux-drmtest bin/linux-sndtest \
 	    bin/linux-xstub \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \
@@ -3131,7 +3147,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    etc/Lato-BoldItalic.ttf etc/fallback.otf etc/emoji.ttf        \
 	    etc/DejaVuSerif.ttf etc/DejaVuSerif-Bold.ttf                  \
 	    etc/DejaVuSansMono.ttf etc/DejaVuSansMono-Bold.ttf            \
-	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
+	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
 	    bin/services bin/svc_crasher bin/stabilitytest                    \
@@ -4741,6 +4757,7 @@ clean:
 	       programs/drvtest/drvtest.o programs/drvtest/drvtest.elf \
 	       programs/usbtest/usbtest.o programs/usbtest/usbtest.elf \
 	       programs/audiotest/audiotest.o programs/audiotest/audiotest.elf \
+	       programs/audioplay/audioplay.o programs/audioplay/audioplay.elf \
 	       programs/batterytest/batterytest.o programs/batterytest/batterytest.elf \
 	       programs/displayinfo/displayinfo.o programs/displayinfo/displayinfo.elf \
 	       programs/drawtest/drawtest.o programs/drawtest/drawtest.elf \
