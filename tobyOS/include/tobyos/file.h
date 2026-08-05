@@ -108,8 +108,27 @@ enum file_kind {
      * src/drm.c; read/write are meaningless on a DRM fd. */
     FILE_KIND_DRM        = 18,
     /* /dev/urandom + /dev/random: reads draw from the kernel CSPRNG (rng.h),
-     * writes are mixed back into the pool (as on Linux). Always poll-ready. */
-    FILE_KIND_DEVRANDOM  = 18,
+     * writes are mixed back into the pool (as on Linux). Always poll-ready.
+     *
+     * WAS 18 -- the same value as FILE_KIND_DRM, for real, in shipped code.
+     * The two kinds never appeared in one switch so nothing failed to
+     * compile, and the collision quietly cross-wired four paths:
+     *   - file_read on a DRM fd returned CSPRNG bytes instead of an error
+     *     (file.c, `case FILE_KIND_DEVRANDOM`), despite the DRM comment
+     *     directly above saying read/write are meaningless on a DRM fd;
+     *   - file_write to a DRM fd stirred the RNG pool and reported success;
+     *   - fstat("/dev/urandom") reported char device 226:128, i.e. claimed
+     *     to be a DRM render node (syscall.c);
+     *   - mmap of a /dev/urandom fd routed into the GPU buffer-object path.
+     * Same family as the GUI event-type ABI collision in docs/win10-gap.md.
+     * NOTE: enum file_kind is kernel-internal (no ABI/serialized use --
+     * verified), but the Makefile has no header dep tracking, so changing
+     * these values REQUIRES a full rebuild or objects disagree silently. */
+    FILE_KIND_DEVRANDOM  = 19,
+    /* Audio arc: /dev/snd/{controlC0,pcmC0D0p} -- the Linux ALSA PCM ABI
+     * over the HDA driver. ioctl routes to snd_pcm.c; write() is accepted
+     * as the non-mmap playback path (snd_pcm_writei's kernel side). */
+    FILE_KIND_SND        = 20,
 };
 
 struct eventfd;
