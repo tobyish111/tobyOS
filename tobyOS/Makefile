@@ -2531,7 +2531,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                 initrd/etc/c19b.lua \
                 initrd/etc/c20.lua \
                 initrd/etc/c21.lua \
-               initrd/etc/motd initrd/etc/anim.html initrd/etc/webgl.html initrd/etc/input.html initrd/etc/input2.html initrd/etc/fonttest.html initrd/etc/egl_vendor.json \
+               initrd/etc/motd initrd/etc/anim.html initrd/etc/webgl.html initrd/etc/input.html initrd/etc/input2.html initrd/etc/fonttest.html initrd/etc/start.html initrd/etc/egl_vendor.json \
                initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
                initrd/etc/Lato-BoldItalic.ttf initrd/etc/fallback.otf \
@@ -2559,6 +2559,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/input.html                 $(INITRD_STAGE)/etc/input.html
 	cp initrd/etc/input2.html                $(INITRD_STAGE)/etc/input2.html
 	cp initrd/etc/fonttest.html             $(INITRD_STAGE)/etc/fonttest.html
+	cp initrd/etc/start.html                $(INITRD_STAGE)/etc/start.html
 	cp initrd/etc/egl_vendor.json            $(INITRD_STAGE)/etc/egl_vendor.json
 	cp initrd/etc/Lato-Regular.ttf           $(INITRD_STAGE)/etc/Lato-Regular.ttf
 	cp initrd/etc/Lato-Bold.ttf              $(INITRD_STAGE)/etc/Lato-Bold.ttf
@@ -3148,7 +3149,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    repo/helloapp_caps_ro.tpkg                                        \
 	    system/keys/trust.db                                              \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
-	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
+	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    readme.txt $$EXTRA_FILES

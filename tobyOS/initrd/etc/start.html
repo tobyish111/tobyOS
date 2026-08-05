@@ -1,0 +1,55 @@
+<!doctype html>
+<!-- Slice 121: chromewin's default home page.
+     The old default was https://example.com, so on any machine without a
+     working network the browser opened straight onto chrome's error page --
+     a blank white rectangle that looks exactly like a broken browser (real-HW
+     report: "now it's just white"). A LOCAL home page always renders, proves
+     the whole pipeline end to end, and gives the omnibox somewhere to return
+     to. Entirely self-contained: no network, no external fonts, no images. -->
+<html>
+<head><title>tobyOS</title>
+<style>
+  html,body{margin:0;height:100%;background:#141a22;color:#e6edf3;
+            font:16px/1.55 sans-serif}
+  .wrap{max-width:660px;margin:0 auto;padding:44px 28px}
+  h1{font:600 40px/1.1 sans-serif;margin:0 0 4px 0;letter-spacing:-0.5px}
+  h1 span{color:#4fb3ff}
+  .sub{color:#8b98a6;margin:0 0 30px 0}
+  .card{background:#1c242e;border:1px solid #2b3644;border-radius:10px;
+        padding:16px 18px;margin:0 0 14px 0}
+  .card h2{font:600 15px/1.3 sans-serif;margin:0 0 8px 0;color:#b8c4d0;
+           text-transform:uppercase;letter-spacing:0.6px}
+  a{color:#4fb3ff;text-decoration:none}
+  a:hover{text-decoration:underline}
+  ul{margin:0;padding-left:20px}
+  li{margin:3px 0}
+  code{font-family:monospace;background:#0f1319;padding:1px 5px;
+       border-radius:4px;color:#9fd2ff}
+  .tip{color:#8b98a6;font-size:14px;margin-top:26px}
+</style></head>
+<body>
+<div class="wrap">
+  <h1>toby<span>OS</span></h1>
+  <p class="sub">Chromium, running on a kernel written from scratch.</p>
+
+  <div class="card">
+    <h2>Browse</h2>
+    Type an address in the bar above and press Enter.
+    Use <code>&lt;</code> and <code>&gt;</code> to go back and forward.
+  </div>
+
+  <div class="card">
+    <h2>Local pages (no network needed)</h2>
+    <ul>
+      <li><a href="file:///etc/fonttest.html">Font rendering test</a>
+          &mdash; serif, monospace and emoji coverage</li>
+      <li><a href="file:///etc/anim.html">Animation benchmark</a>
+          &mdash; a full-viewport repaint loop</li>
+    </ul>
+  </div>
+
+  <p class="tip">If web pages fail to load, check the network indicator in
+  the taskbar &mdash; the browser is fine, it just has nowhere to go.</p>
+</div>
+</body>
+</html>

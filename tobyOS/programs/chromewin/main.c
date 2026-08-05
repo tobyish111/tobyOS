@@ -108,11 +108,20 @@ static int g_page_w = PAGE_W, g_page_h = PAGE_H;
  * path at its natural max, zero network dependence). */
 #define START_URL CW_URL
 #else
-/* (Slice 62 used https://example.com to validate RESIZE in isolation from
- * YouTube's evening-service flakiness -- flip to it for mechanism tests.) */
-/* react.dev still ImmediateCrash/PA-poison under --single-process right
- * after bootstrap; measure on a light page until that is fixed. */
-#define START_URL "https://example.com"
+/* Slice 121: the default home page is LOCAL.
+ *
+ * It used to be https://example.com, so on a machine whose network is not
+ * up the browser opened directly onto chrome's error page -- a blank white
+ * rectangle indistinguishable from a broken browser. That is exactly what
+ * real hardware reported ("now it's just white"): the EliteDesk's NIC has
+ * no working TX, so DHCP never completes and the very first navigation
+ * failed with ERR_INTERNET_DISCONNECTED. A local start page always
+ * renders, proves the pipeline end to end, and gives the omnibox a home.
+ *
+ * (Slice 62 used https://example.com to validate RESIZE in isolation from
+ * YouTube's evening-service flakiness -- flip to it for mechanism tests;
+ * every perf harness passes its own -DCW_URL and is unaffected by this.) */
+#define START_URL "file:///etc/start.html"
 #endif
 
 /* Slice 93: screencast frame-skip knob. MEASURED (anim.html, SMP=4, 360s
