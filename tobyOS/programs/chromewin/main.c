@@ -172,6 +172,11 @@ static char g_session[64];
 static char g_status[128] = "starting chrome...";
 static int  g_frames;
 static long g_quit;
+/* Slice 119: chrome's pid, so closing the window can take chrome with it.
+ * Irrelevant while chromewin was a one-shot harness (the VM died with it);
+ * load-bearing now that it launches from the taskbar and can be opened and
+ * closed repeatedly -- otherwise every close leaks a ~390 MB chrome tree. */
+static long g_chrome_pid;
 
 /* ---- CDP message buffers ------------------------------------------- *
  * A captureScreenshot response for 800x600 is ~20-40 KB of base64 inside
@@ -1222,9 +1227,26 @@ static int spawn_chrome(void) {
     close(p2c[0]); close(c2p[1]);
     g_cmd_fd  = p2c[1];
     g_resp_fd = c2p[0];
+    g_chrome_pid = pid;                        /* slice 119: for teardown */
     printf("[chromewin] chrome pid=%ld cmd_fd=%d resp_fd=%d\n",
            pid, g_cmd_fd, g_resp_fd);
     return 0;
+}
+
+/* Slice 119: tear chrome down when the window closes. Closing the command
+ * pipe first is the polite exit (chrome treats EOF on the DevTools pipe as
+ * "shut down"), which lets it end its own children; the SIGKILL is the
+ * backstop for a chrome that is wedged or ignoring it. Children whose Mojo
+ * pipes die exit on their own. */
+static void chrome_teardown(void) {
+    if (g_cmd_fd >= 0) { close(g_cmd_fd); g_cmd_fd = -1; }
+    if (g_resp_fd >= 0) { close(g_resp_fd); g_resp_fd = -1; }
+    if (g_chrome_pid > 0) {
+        usleep(200000);                        /* a moment to exit politely */
+        sc3(ABI_SYS_KILL, g_chrome_pid, 9 /* SIGKILL */, 0);
+        printf("[chromewin] chrome pid=%ld torn down\n", g_chrome_pid);
+        g_chrome_pid = 0;
+    }
 }
 
 /* Force the first <video> to play + loop (muted). A MediaDocument (direct
@@ -2541,5 +2563,6 @@ int main(void) {
         usleep(15000);
     }
     printf("[chromewin] exiting; frames=%d\n", g_frames);
+    chrome_teardown();                          /* slice 119 */
     return 0;
 }

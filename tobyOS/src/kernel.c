@@ -8822,6 +8822,18 @@ void _start(void) {
         kprintf("[TKAPP] %s %s; holding ~%ds for screenshot\n", TKAPP_NAME,
                 (sp && sp->state != PROC_TERMINATED) ? "ALIVE" : "EXITED",
                 (int)(TKAPP_HOLD_MS / 1000));
+#ifdef TKAPP_CLICK_X
+        /* Slice 119: click a point on the SHELL (a taskbar pin) after the
+         * desktop has settled. Host input never reaches this guest's PS/2
+         * mouse in a headless run -- QEMU accepts input-send-event and the
+         * cursor still never moves -- so a pin can only be exercised from
+         * inside. Build:
+         *   -DTKAPP_BOOT -DTKAPP_CLICK_X=605 -DTKAPP_CLICK_Y=778 */
+        TKA_PUMP(20000);                       /* let the desktop settle */
+        kprintf("[TKAPP] synthetic shell click at (%d,%d)\n",
+                TKAPP_CLICK_X, TKAPP_CLICK_Y);
+        gui_post_shell_click(TKAPP_CLICK_X, TKAPP_CLICK_Y);
+#endif
 #if defined(TKAPP_CHROMEWIN) && defined(CHROMIUM_BOOT)
         /* Slice 39: chrome under the FULL desktop is ~5x slower than the
          * headless one-shot (the compositor + gui_tick steal most cores under

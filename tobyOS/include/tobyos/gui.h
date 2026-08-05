@@ -401,6 +401,13 @@ void gui_alt_tab_cycle(void);
  * few letters, Enter. No-op unless the desktop is up. */
 void gui_toggle_search(void);
 
+#ifdef TKAPP_BOOT
+/* Slice 119 (harness only): synthesise a left click on the SHELL at an
+ * absolute screen point -- the only way to test a taskbar pin headlessly,
+ * since host input never reaches the guest's PS/2 mouse. See gui.c. */
+void gui_post_shell_click(int x, int y);
+#endif
+
 /* Clipboard */
 int gui_clip_copy(const char *data, uint32_t len);
 int gui_clip_paste(char *buf, uint32_t max);

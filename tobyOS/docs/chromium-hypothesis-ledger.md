@@ -7060,3 +7060,70 @@ Every piece rides primitives already proven this session: navigation
 through 116's restart, keystrokes through 114's input path, painting
 through 115's freshest-source policy.
 
+---
+
+## SLICE 119 — **Chromium is on the taskbar**: click the pin, get a browser. Verified by making the guest click its own taskbar, because host input cannot reach this VM
+
+Chromium existed only as a build-flag harness app (`TKAPP_CHROMEWIN`).
+Now it is a pinned launcher like any other app.
+
+### What shipped
+
+- **Taskbar pin #9** — icon (tri-spoke wheel), "Chromium" tooltip,
+  `shell_launch_path("/bin/chromewin")` on click; plus a **Chromium**
+  entry in the start menu next to Web Browser.
+- **The pin is PAYLOAD-GATED.** `taskbar_pin_count()` returns 9 only when
+  `/opt/chrome` exists (the initrd carries the ~390 MB payload only when
+  the tree has it), else 8. A button that launches nothing is worse than
+  no button; the count drives geometry, hit-testing and paint alike, so
+  the taskbar simply has one fewer pin on a build without chrome.
+- **Chrome is torn down when the window closes** (`chrome_teardown`).
+  Irrelevant while chromewin was a one-shot harness — the VM died with
+  it — and load-bearing the moment it can be opened and closed
+  repeatedly: every close previously orphaned a ~390 MB chrome tree.
+  Close the pipes first (chrome treats DevTools-pipe EOF as shutdown),
+  SIGKILL as the backstop.
+
+### Verification, and why it needed a new instrument
+
+The pin's geometry is visible in a screendump and its dispatch is three
+lines, but "a user clicks it and Chromium comes up" has to be clicked.
+**Host-side injection is a dead end on this VM**: QEMU ACCEPTS relative
+`input-send-event` (returns `{"return": {}}`) and `abs` fails with "Input
+handler not found" (no tablet) — yet the guest cursor never moves. The
+PS/2 driver is up (IRQ12, and it does send 0xF4), the events are
+accepted, and nothing arrives. Measured over two runs once the QMP
+replies were PRINTED rather than discarded — the first run's silence was
+my own harness swallowing the answer. Corroborating detail: the cursor
+sits at the identical pixel in *every* screendump of this entire
+session, so headless host input has never worked here.
+
+So the click is synthesised INSIDE the guest: `gui_post_shell_click()`
+places the cursor and calls the real `on_mouse_event()` with zero
+deltas — identical to the PS/2 callback minus the transport, so
+hit-testing and pin dispatch are genuinely exercised. Same precedent as
+`gui_post_mouse()` for the C8 Win32 harness. Harness-only
+(`TKAPP_BOOT`), driven by `-DTKAPP_CLICK_X/Y`; `logs/pintest.sh`.
+
+**RESULT** (`docs/proof-taskbar-chromium-launch.png`):
+
+```
+[TKAPP] synthetic shell click at (605,778)
+[proc] created pid=1 'chromewin'
+[gui] launched /bin/chromewin as pid 1 (session=1)
+[chromewin] chrome pid=3 cmd_fd=4 resp_fd=5
+[chromewin] sessionId=68C3966746961B5C8E01124E92222CB5
+```
+
+…and the screendump shows a Chromium window with example.com fetched
+over real HTTPS and rendered, the slice-118 omnibox showing the URL,
+and no faults. **Crucially this ran on a kernel WITHOUT
+`CHROMIUM_BOOT`** — only `TKAPP_BOOT` for auto-login — which settles a
+question code-reading could not: the ordinary desktop runs chromewin.
+(The chrome CoW-fork cap in syscall.c keys on a hardcoded `tgid == 3`
+from the harness era; it only ever ADDS a restriction, so a
+taskbar-launched chrome is uncapped rather than blocked. Worth
+revisiting if fork storms ever reappear.)
+
+defboot stock regression: PASS.
+

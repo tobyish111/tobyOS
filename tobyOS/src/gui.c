@@ -61,6 +61,7 @@
 #include <tobyos/sysmon.h>
 #include <tobyos/virtio_gpu.h>
 #include <tobyos/net.h>
+#include <tobyos/vfs.h>     /* slice 119: probe for the staged chrome payload */
 #include <tobyos/audio_hda.h>
 #include <tobyos/bootlog.h>
 #include <tobyos/virtio_gpu.h>
@@ -165,7 +166,7 @@ struct ctx_menu_item {
 #define START_BTN_W       62
 #define START_BTN_LABEL   "TO"
 #define TASKBAR_SEARCH_W  160
-#define TASKBAR_PIN_COUNT 8
+#define TASKBAR_PIN_COUNT 9
 #define TASKBAR_PIN_W      44
 #define TAB_W             152
 #define TAB_PAD           6
@@ -232,7 +233,7 @@ struct ctx_menu_item {
  * by the package manager, plus one pinned "Logout" entry at the
  * bottom. LAUNCHER_MAX sizes the internal cursor math; keep it big
  * enough to hold all three plus headroom. */
-#define LAUNCHER_SYS_MAX  12
+#define LAUNCHER_SYS_MAX  14
 #define LAUNCHER_MAX      (LAUNCHER_SYS_MAX + GUI_LAUNCHER_USER_MAX + 1)
 #define LAUNCHER_W        420
 #define LAUNCHER_HEAD_H    84
@@ -259,6 +260,11 @@ struct launcher_item {
 static const struct launcher_item g_launcher_sys[LAUNCHER_SYS_MAX] = {
     { "File Explorer", "/bin/gui_files"    },
     { "Web Browser",   "/bin/gui_browser"  },
+    /* Slice 119: real unmodified Chromium, driven over a CDP pipe in a
+     * TobyTK window. Listed unconditionally -- unlike the taskbar pin,
+     * a menu entry that reports a missing payload is acceptable, and
+     * the menu is not the primary launch surface. */
+    { "Chromium",      "/bin/chromewin"    },
     { "Settings",      "/bin/gui_settings" },
     { "Nex Terminal",  "/bin/gui_term"     },
     { "Notes",         "/bin/gui_widgets"  },
@@ -745,10 +751,26 @@ static bool point_in_min(const struct window *w, int px, int py) {
 
 static int taskbar_top(void) { return (int)gfx_height() - GUI_TASKBAR_H; }
 
+/* Slice 119: the Chromium pin (the LAST one) exists only when the chrome
+ * payload is actually staged under /opt/chrome -- the initrd carries it
+ * only when the ~390 MB binary is present in the source tree. A pin that
+ * launches nothing is worse than no pin, so the count is resolved once at
+ * first use (an initrd cannot change under a running kernel). Defined
+ * here because the taskbar geometry below it needs the count. */
+static int taskbar_pin_count(void) {
+    static int n;                       /* 0 = not resolved yet */
+    if (!n) {
+        struct vfs_stat st;
+        n = (vfs_stat("/opt/chrome", &st) == VFS_OK) ? TASKBAR_PIN_COUNT
+                                                     : TASKBAR_PIN_COUNT - 1;
+    }
+    return n;
+}
+
 static int taskbar_tabs_x0(void) {
     int W = (int)gfx_width();
     int x = START_BTN_W + TASKBAR_SEARCH_W + 12 +
-            TASKBAR_PIN_COUNT * TASKBAR_PIN_W + 10;
+            taskbar_pin_count() * TASKBAR_PIN_W + 10;
     if (x > W / 2) {
         x = START_BTN_W + TASKBAR_SEARCH_W + 12;
     }
@@ -794,7 +816,7 @@ static int taskbar_pin_at(int px, int py) {
     if (py < yt || py >= yt + GUI_TASKBAR_H) return -1;
     int sx = START_BTN_W + 4;
     int x0 = sx + TASKBAR_SEARCH_W + 8;
-    for (int i = 0; i < TASKBAR_PIN_COUNT; i++) {
+    for (int i = 0; i < taskbar_pin_count(); i++) {
         int ix = x0 + i * TASKBAR_PIN_W;
         if (px >= ix && px < ix + TASKBAR_PIN_W - 6) return i;
     }
@@ -1450,6 +1472,10 @@ static void shell_launch_pin(int pin) {
     case 5: shell_launch_path("/bin/gui_calc");     break;
     case 6: shell_launch_path("/bin/gui_about");    break;
     case 7: shell_launch_path("/bin/gui_taskmgr");  break;
+    /* Slice 119: real Chromium in a TobyTK window. chromewin spawns
+     * /opt/chrome and drives it over a CDP pipe; the pin is only shown
+     * when that payload exists (taskbar_pin_count). */
+    case 8: shell_launch_path("/bin/chromewin");    break;
     default: break;
     }
 }
@@ -3716,6 +3742,15 @@ static void paint_taskbar_pin_icon(int cx, int cy, int pin,
         gfx_fill_rect(x + 9, y + 9,  2, 6, fg2);   /* medium bar */
         gfx_fill_rect(x + 13, y + 7, 2, 8, fg);    /* tall bar   */
         break;
+    case 8: /* Chromium -- tri-spoke wheel with a hub (the Chrome mark) */
+        gfx_draw_rect(x + 2, y + 2, 16, 16, fg);       /* rim          */
+        gfx_fill_rect(x + 3, y + 3, 14, 4, fg2);       /* upper band   */
+        draw_line(x + 10, y + 7,  x + 10, y + 3,  fg); /* spoke: up    */
+        draw_line(x + 13, y + 13, x + 17, y + 17, fg); /* spoke: SE    */
+        draw_line(x + 7,  y + 13, x + 3,  y + 17, fg); /* spoke: SW    */
+        gfx_draw_rect(x + 7, y + 7, 7, 7, fg2);        /* hub ring     */
+        gfx_fill_rect(x + 9, y + 9, 3, 3, fg);         /* hub          */
+        break;
     default:
         gfx_fill_rect(x + 5, y + 5, 10, 10, fg);
         break;
@@ -3834,7 +3869,7 @@ static void paint_taskbar(void) {
 
     int px = sx + TASKBAR_SEARCH_W + 8;
     int hovered_pin = -1;
-    for (int i = 0; i < TASKBAR_PIN_COUNT; i++) {
+    for (int i = 0; i < taskbar_pin_count(); i++) {
         int ix = px + i * TASKBAR_PIN_W;
         bool hot = (g.cur_x >= ix && g.cur_x < ix + TASKBAR_PIN_W - 4 &&
                     g.cur_y >= yt && g.cur_y < yt + GUI_TASKBAR_H);
@@ -3855,7 +3890,8 @@ static void paint_taskbar(void) {
     if (hovered_pin >= 0) {
         static const char *pin_names[TASKBAR_PIN_COUNT] = {
             "Files", "Browser", "Terminal", "Notes",
-            "Settings", "Calculator", "About", "Task Manager"
+            "Settings", "Calculator", "About", "Task Manager",
+            "Chromium"
         };
         const char *tip = pin_names[hovered_pin];
         int tip_len = 0;
@@ -5881,6 +5917,27 @@ void gui_close_focused(void) {
     w->close_request_tick = pit_ticks();
     g.dirty = true;
 }
+
+#ifdef TKAPP_BOOT
+/* Slice 119: click the SHELL at an absolute point, through the real handler
+ * -- cursor placement, hit-testing, pin dispatch and all.
+ *
+ * Why this exists: a taskbar pin can only be verified by clicking it, and in
+ * a headless run the host cannot drive the pointer. QEMU ACCEPTS relative
+ * input-send-event (it returns success) but nothing ever reaches IRQ12, so
+ * the guest cursor never moves -- measured, not assumed, over two runs with
+ * the QMP replies printed. Rather than trust a hit-test by reading it, drive
+ * on_mouse_event() with a placed cursor and zero deltas: identical to what
+ * the PS/2 callback does, minus the transport. Same precedent as
+ * gui_post_mouse() for the C8 Win32 harness. Harness-only surface. */
+void gui_post_shell_click(int x, int y) {
+    if (!g.ready) return;
+    g.cur_x = x;
+    g.cur_y = y;
+    on_mouse_event(0, 0, 1);     /* left button DOWN at (x, y) */
+    on_mouse_event(0, 0, 0);     /* release */
+}
+#endif
 
 void gui_toggle_search(void) {
     if (!g.ready || !g.active || !g.desktop_mode) return;
