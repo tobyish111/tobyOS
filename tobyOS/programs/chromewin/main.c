@@ -897,25 +897,72 @@ static int cdp_wait_ms(int id, long timeout_ms) {
     return 0;
 }
 
-/* ---- chrome spawn ---------------------------------------------------- */
+/* ---- chrome spawn ---------------------------------------------------- *
+ *
+ * Slice 120: chrome will not start without a WRITABLE --user-data-dir, and
+ * the failure is silent from the outside: it prints one line to its stderr,
+ * exits 1, the DevTools pipe closes, and the window sits on "connecting to
+ * chrome" before disappearing. Real hardware found it -- a non-root desktop
+ * session cannot write /data (root inode is uid 0 mode 0755), so:
+ *   "Could not create directory /data/cr2: Permission denied (13)"
+ * The kernel now relaxes /data to 0777 at mount, but a launcher must not
+ * DEPEND on that: probe the candidates and use the first that really takes
+ * a file. g_profile_err carries the reason to the window when none does. */
+static char g_profile_dir[96];
+static char g_profile_err[160];
+
+/* True if `dir` exists (or can be made) AND a file can be created in it. */
+static int dir_writable(const char *dir) {
+    char probe[128];
+    mkdir(dir, 0700);                       /* EEXIST is fine */
+    snprintf(probe, sizeof probe, "%s/.wtest", dir);
+    int fd = open(probe, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return 0;
+    close(fd);
+    unlink(probe);
+    return 1;
+}
+
+/* Choose the profile directory. Ordered most- to least-preferred; the last
+ * candidate is deliberately under the always-RAM-backed scratch so a broken
+ * or read-only /data still yields a working browser. */
+static const char *pick_profile_dir(void) {
+    static const char *cands[] = {
+        "/data/cr2",            /* the historical location            */
+        "/data/chromium",       /* if cr2 exists but is not ours       */
+        "/tmp/chromium",        /* scratch, if /tmp is writable        */
+        0
+    };
+    if (g_profile_dir[0]) return g_profile_dir;
+    for (int i = 0; cands[i]; i++) {
+        if (dir_writable(cands[i])) {
+            snprintf(g_profile_dir, sizeof g_profile_dir, "%s", cands[i]);
+            printf("[chromewin] profile dir: %s\n", g_profile_dir);
+            return g_profile_dir;
+        }
+        printf("[chromewin] profile dir %s NOT writable -- trying next\n",
+               cands[i]);
+    }
+    snprintf(g_profile_err, sizeof g_profile_err,
+             "no writable profile dir (tried /data/cr2, /data/chromium, "
+             "/tmp/chromium) -- chrome cannot start");
+    printf("[chromewin] %s\n", g_profile_err);
+    return 0;
+}
 
 static int spawn_chrome(void) {
     int p2c[2], c2p[2];                       /* parent->chrome, chrome->parent */
-    if (pipe(p2c) != 0 || pipe(c2p) != 0) { logln("pipe() failed"); return -1; }
 
-    /* Full chrome refuses to start if user-data-dir is missing/unwritable
-     * ("Failed To Create Data Directory") and then never answers CDP. */
-#ifdef CHROME_FULL
-    {
-        const char *udd = "/data/cr_ozone";
-        if (mkdir(udd, 0755) != 0) {
-            /* EEXIST is fine; anything else is loud. */
-            printf("[chromewin] mkdir %s -> errno (may already exist)\n", udd);
-        } else {
-            printf("[chromewin] created %s\n", udd);
-        }
-    }
-#endif
+    /* Slice 120: settle the profile directory BEFORE forking. Chrome exits 1
+     * on an unwritable one and says so only on its stderr, so failing here
+     * -- with a reason the window can show -- beats a mute bootstrap stall. */
+    const char *udd = pick_profile_dir();
+    if (!udd) return -2;                       /* -2: g_profile_err is set */
+    static char udd_arg_buf[128];
+    snprintf(udd_arg_buf, sizeof udd_arg_buf, "--user-data-dir=%s", udd);
+    char *udd_arg = udd_arg_buf;
+
+    if (pipe(p2c) != 0 || pipe(c2p) != 0) { logln("pipe() failed"); return -1; }
 
     long pid = fork();
     if (pid < 0) { logln("fork() failed"); return -1; }
@@ -1098,14 +1145,14 @@ static int spawn_chrome(void) {
              * consent redirects, cache) reproduces "identical failure on both
              * kernels" exactly like IP throttling would -- the A/B revert-test
              * could not distinguish them. A fresh dir isolates the theory. */
+            /* Slice 120: the PROBED profile dir, not a hardcoded path (see
+             * pick_profile_dir). udd_arg is built in spawn_chrome below. */
+            udd_arg,
 #ifdef CHROME_FULL
-            (char *)"--user-data-dir=/data/cr_oz44",
             (char *)"--disable-extensions",
             (char *)"--disable-background-networking",
             (char *)"--disable-component-extensions-with-background-pages",
             (char *)"--disable-features=OptimizationHints,MediaRouter",
-#else
-            (char *)"--user-data-dir=/data/cr2",
 #endif
             /* Slice 61c: bound the HTTP cache. On the old 4 MiB /data the
              * cache (buffering the very video segments being played) filled
@@ -2080,9 +2127,25 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
         if (fh < ph) tk_draw_fill(w, 0, BAR_H + fh, fw, ph - fh, 0x00303038u);
 #endif
     } else {
+        /* Slice 120: when chrome cannot start, say WHY here instead of
+         * showing "connecting to chrome..." forever and then vanishing --
+         * the real-HW failure mode. g_profile_err is the actionable case
+         * (nothing writable); anything else still beats a mute window. */
         tk_draw_fill(w, 0, BAR_H, pw, ph, 0x00303038u);
-        tk_draw_text(w, pw / 2 - 100, BAR_H + ph / 2 - 20,
-                     "connecting to chrome...", 0x00a0a0b0u, 16, 1);
+        if (g_profile_err[0]) {
+            tk_draw_text(w, 24, BAR_H + 40, "Chromium could not start",
+                         0x00ff8080u, 18, 1);
+            tk_draw_text(w, 24, BAR_H + 78, g_profile_err, 0x00d0d0d8u, 14, 0);
+            tk_draw_text(w, 24, BAR_H + 108,
+                         "The profile directory is not writable by this user.",
+                         0x00a0a0b0u, 14, 0);
+            tk_draw_text(w, 24, BAR_H + 132,
+                         "Log in as root, or make /data writable.",
+                         0x00a0a0b0u, 14, 0);
+        } else {
+            tk_draw_text(w, pw / 2 - 100, BAR_H + ph / 2 - 20,
+                         "connecting to chrome...", 0x00a0a0b0u, 16, 1);
+        }
     }
     g_t_paint += sys_clock_ms() - tp0;
     g_n_paint++;
@@ -2145,7 +2208,11 @@ static void on_key(struct tk_window *w, struct tk_event *ev) {
 
 int main(void) {
     logln("chromium window host starting");
-    if (spawn_chrome() != 0) return 1;
+    /* Slice 120: spawn BEFORE the window exists so the forked child cannot
+     * inherit the TobyTK connection, but do NOT exit on failure -- open the
+     * window anyway and put the reason on screen. Launched from the taskbar,
+     * a silent exit is indistinguishable from "the click did nothing". */
+    int spawn_rc = spawn_chrome();
 
     if (tk_window_open(&win, WIN_W, WIN_H, "Chromium") != 0) {
         logln("tk_window_open failed"); return 1;
@@ -2158,6 +2225,17 @@ int main(void) {
     tk_on_event(cv, on_event);
     tk_redraw(&win); tk_pump(&win);
 
+    if (spawn_rc != 0) {                       /* slice 120: report, don't vanish */
+        if (!g_profile_err[0])
+            snprintf(g_profile_err, sizeof g_profile_err,
+                     "could not start /opt/chrome (fork/exec failed)");
+        snprintf(g_status, sizeof g_status, "Chromium could not start");
+        tk_redraw(&win);
+        while (!tk_pump(&win)) usleep(50000);  /* until the user closes it */
+        chrome_teardown();
+        return 1;
+    }
+
     /* Give headed Ozone time to finish X11/RANDR before DevTools traffic. */
     for (int i = 0; i < 100 && !g_quit; i++) {
         tk_pump(&win);
@@ -2165,11 +2243,18 @@ int main(void) {
     }
 
     if (cdp_bootstrap() != 0) {
+        /* Chrome was spawned but never answered. By far the most common
+         * cause is chrome exiting during startup (it reports the reason on
+         * its own stderr, which the [fd2] logger carries to the serial log). */
+        if (!g_profile_err[0])
+            snprintf(g_profile_err, sizeof g_profile_err,
+                     "chrome exited during startup -- see the serial log for "
+                     "its own error line");
         snprintf(g_status, sizeof g_status, "DevTools bootstrap FAILED");
         logln("bootstrap failed");
         tk_redraw(&win);
-        /* keep the window up so the failure is visible */
-        for (int i = 0; i < 400 && !tk_pump(&win); i++) usleep(50000);
+        while (!tk_pump(&win)) usleep(50000);  /* until the user closes it */
+        chrome_teardown();
         return 1;
     }
     logln("bootstrap OK; screencast (+ xframe if SHM advances)");

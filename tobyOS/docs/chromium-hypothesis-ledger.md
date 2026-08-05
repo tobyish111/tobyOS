@@ -7127,3 +7127,71 @@ revisiting if fork storms ever reappear.)
 
 defboot stock regression: PASS.
 
+---
+
+## SLICE 120 — **REAL HARDWARE FOUND THE BUG SLICE 119 COULD NOT: `/data` is root-only, so a non-root desktop session can save NOTHING.** Chrome was merely the first thing to complain out loud
+
+The EliteDesk booted the slice-119 ISO, the user clicked the Chromium pin,
+and the window sat on "connecting to chrome" and then vanished. The
+serial log had the whole answer in one line:
+
+```
+ERROR:command_line_handler.cc:154] Could not create directory /data/cr2:
+                                   Permission denied (13)
+[proc] pid=4 'chrome-headless-shell' exit code=1
+```
+
+### The diagnosis, and why the errno mattered
+
+`EACCES(13)` is not `EROFS(30)`. In this VFS, `VFS_ERR_ROFS → EROFS` and
+`VFS_ERR_PERM → EACCES`, so `/data` was mounted and writable-capable and a
+PERMISSION CHECK refused the mkdir. Walking `vfs_mkdir_mode`'s gates:
+`ops->mkdir` exists (so a real tobyfs mount, not the read-only ramfs);
+`cap_check_path` passed (it logs a deny line on failure and the log has
+none); `sysprot` passed (`/data/cr2` matches no protected prefix — only
+`/data/packages` and `/data/users` are). That leaves
+`vfs_perm_check("/data", WRITE|EXEC)`, which is uid-based and which **uid 0
+always passes**.
+
+Root cause: `tobyfs_format` writes the root inode as **uid 0, gid 0, mode
+0755** (`TFS_DEFAULT_DIR_MODE`). Every QEMU run in this arc auto-logged-in
+as root (`LOGIN user='root' uid=0`), so this was invisible for ~80 slices.
+**On any non-root session, nothing can write to /data at all** — not
+chrome, not Notes, not settings, not downloads. This is a desktop-wide
+defect that a browser happened to surface.
+
+### The fix, in two independent layers
+
+1. **kernel**: after the /data mount sweep, if the volume's root denies
+   world-write, `chmod 0777` it — `/tmp` semantics for the desktop's shared
+   data volume. Applied at **MOUNT**, not just at format, because volumes
+   provisioned by earlier builds are already 0755 on disk and would stay
+   broken forever. Idempotent and logged.
+2. **chromewin**: stop hardcoding `--user-data-dir=/data/cr2`. Probe
+   `/data/cr2` → `/data/chromium` → `/tmp/chromium`, selecting the first
+   that genuinely accepts a created file, so the launcher does not DEPEND
+   on layer 1.
+
+### And it must never fail silently again
+
+The old failure path `return 1`'d **before the window even opened**, so a
+profile-dir failure produced no window at all; the bootstrap-failed path
+closed itself on a 20 s timer. Now the window always opens (the fork still
+happens first, so chrome cannot inherit the TobyTK socket) and on failure
+STAYS UP until dismissed, naming the cause on screen — for this bug: the
+profile directory is not writable, log in as root or make /data writable.
+The true cause reaching only the serial console is precisely why this
+needed a hardware report to find.
+
+### VERIFIED
+
+`[boot] /data was mode 0755 (root-only) -- relaxed to 0777`,
+`[chromewin] profile dir: /data/cr2`, the pin click still launches chrome
+to a live `sessionId`, no faults, defboot PASS. (A `%o` in the new log line
+printed literally — kprintf has no `%o`; split into `%d%d%d`.)
+
+**METHOD NOTE: every QEMU run in this arc auto-logs-in as root, so the
+whole arc is blind to uid-dependent bugs by construction.** Real-hardware
+validation is not a formality here; it is the only configuration that
+exercises a normal login.
+

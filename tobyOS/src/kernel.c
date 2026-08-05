@@ -2989,6 +2989,37 @@ void _start(void) {
                         "fallback failed (out of memory?).\n");
         }
 
+        /* Slice 120: /data must be writable by the LOGGED-IN USER, not just
+         * root. A tobyfs root inode is formatted uid 0 / mode 0755
+         * (TFS_DEFAULT_DIR_MODE), so on any non-root session every write to
+         * the data volume fails the vfs_perm_check with VFS_ERR_PERM -- no
+         * saved notes, no settings, no downloads. Found on real hardware
+         * (EliteDesk) as chrome refusing to start: "Could not create
+         * directory /data/cr2: Permission denied (13)", which exits chrome 1
+         * and leaves the browser window stuck on "connecting to chrome".
+         *
+         * /data is the desktop's shared scratch+data volume, so it gets /tmp
+         * semantics: world-writable. Applied at MOUNT, not just at format,
+         * because volumes provisioned by earlier builds are already 0755 on
+         * disk and would stay broken forever. Idempotent and logged. */
+        if (data_mounted) {
+            struct vfs_stat dst;
+            if (vfs_stat("/data", &dst) == VFS_OK &&
+                (dst.mode & 00002u) == 0) {
+                /* kprintf has no %o -- split the octal digits by hand. */
+                unsigned mo = (unsigned)(dst.mode & 0777u);
+                unsigned m2 = (mo >> 6) & 7, m1 = (mo >> 3) & 7, m0 = mo & 7;
+                if (vfs_chmod("/data", 00777u) == VFS_OK)
+                    kprintf("[boot] /data was mode 0%d%d%d (root-only) -- "
+                            "relaxed to 0777 so non-root sessions can use the "
+                            "desktop\n", m2, m1, m0);
+                else
+                    kprintf("[boot] WARN: /data is mode 0%d%d%d (root-only) "
+                            "and could not be relaxed -- non-root logins will "
+                            "not be able to save anything\n", m2, m1, m0);
+            }
+        }
+
 #ifdef PROVISION_SELFTEST
         /* Opt-in guard + end-to-end provisioning proof on RAM-backed
          * fake disks (marker "[PROV]"). Run it in a boot WITHOUT real
