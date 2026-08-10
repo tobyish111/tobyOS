@@ -1369,3 +1369,125 @@ validated here — that is a structural blindness, not an oversight. Before
 If any step fails, the fix belongs in the launcher or `/data` permissions, not in the
 kernel: the namespace + seccomp prerequisites are verified independently
 (`linux-netns` bit7, `linux-seccomp` bit5).
+
+### THE SANDBOX RUN WAS MADE AFTER ALL, AND IT FOUND THE NEXT BLOCKER
+
+I had written that this environment "structurally cannot" validate the sandboxed
+path because QEMU auto-logs-in as root. **That reasoning was wrong for this slice:**
+the privilege drop is performed by `chromewin` itself, so it happens whatever the
+session's uid is. The run was made.
+
+**Take 1 was wasted on the wrong launcher.** `-DCHROMIUM_BOOT` has its own in-kernel
+launcher that execs `/opt/chrome` directly and never goes through `chromewin`, so
+none of slice 14's code was on the path. The tell was an absent `[chromewin]` line
+and a bare `chrome` pid. The chromewin path is **`-DTKAPP_BOOT -DTKAPP_CHROMEWIN`**
+(Slice 39 FRONT C, 420 s hold). The gate now asserts the KERNEL references
+`/bin/chromewin` as well as that the staged binary is a sandbox build — which would
+have caught take 1 before spending a boot on it.
+
+**Take 2, the result that matters:**
+
+```
+[chromewin] dropped to uid=1000 gid=1000 before exec (sandbox build)
+"Running as root without --no-sandbox is not supported"   -> 0 occurrences
+[ns] clone: pid=4 new namespaces user
+[fork] parent pid=3 -> child pid=4
+[isr] VMA at cr2=0xffffffffffffffd8:  rip=0x0000000003716f29
+[isr] user-mode fault -- terminating user process pid=4
+[proc] pid=4 'chrome-headless-shell' exit code=-1  cpu=0 ms  syscalls=0
+[3] 56(clone)  a1=268435473 = 4        <- CLONE_NEWUSER|SIGCHLD, child pid 4
+[3] 61(wait4)  a1=4        = -10       <- ECHILD
+FATAL:sandbox/linux/services/credentials.cc:309] Check failed: . : No child processes (10)
+```
+
+**So slice 14's deliverable works.** The privilege drop takes effect, Chromium
+accepts a non-root launch (the root refusal never fires), and its sandbox proceeds
+far enough to start building namespaces. That is the whole point of the slice.
+
+**And the next blocker is now precisely located, in the kernel, not the launcher:**
+
+`clone(CLONE_NEWUSER|SIGCHLD)` (flags `0x10000011`; the low byte is the exit signal,
+SIGCHLD 17) creates the child — `[ns] clone: pid=4 new namespaces user` confirms the
+namespace is applied — and the child then **faults before executing a single
+syscall** (`cpu=0 ms syscalls=0`). `cr2 = 0xffffffffffffffd8` is `-0x28`: a
+dereference at a small negative offset from a base register holding **zero**, which
+is the same shape as the already-fixed `proc_enter_user_asm` GP-register bug
+([[linux-exit-path-fault]]) — a register the child should have inherited is zero on
+its first return to user mode. Chromium's `wait4` then finds no child (`ECHILD`) and
+its sandbox `CHECK`s out.
+
+**A COVERAGE GAP IN MY OWN TESTS EXPLAINS WHY THE ARC'S 8/8 MISSED THIS.**
+`linux-userns` and `linux-netns` exercise `unshare(CLONE_NEWUSER)` — changing the
+CALLER's namespace. Nothing tested `clone(CLONE_NEWUSER)` — creating a CHILD directly
+in a new namespace. Those are different code paths, and only the second is what
+Chromium's sandbox uses. The lesson generalises: for every namespace flag, both
+entry points need a test, and the arc only ever tested one.
+
+Next step for slice 14 is therefore a kernel fix, not launcher work: make a
+clone-with-namespace-flags child survive its first return to user mode, then add a
+`clone(CLONE_NEWUSER)` case to `linux-userns` so it stays fixed.
+
+### CORRECTION: the clone-child diagnosis above is WRONG, and here is the disproof
+
+The section above concluded that `clone(CLONE_NEWUSER)` produces a child that faults
+before its first syscall. **That is not true, and a new test proves it.**
+
+`programs/linux-clonens/` was written to pin the bug before touching the fork path.
+It issues the clone exactly as Chromium does -- `syscall(SYS_clone, flags, 0,0,0,0)`
+with a NULL child stack -- and covers the matrix:
+
+| case | result |
+|---|---|
+| root + plain clone (control) | ok |
+| root + NEWUSER / NEWUTS / NEWIPC / NEWNS / NEWPID / NEWNET | ok |
+| NEWUSER child really unmapped (`getuid()==65534`) | ok -- flag honoured, not ignored |
+| root + NEWUSER with a live sibling thread | ok |
+| **uid 1000** + plain clone | ok |
+| **uid 1000** + NEWUSER | ok |
+| **uid 1000** + NEWUSER + live sibling thread (closest to Chromium) | ok |
+
+`BITS=0xff`, zero faults. Non-root does not break it. A live sibling thread does not
+break it. Both together do not break it.
+
+**The first version of this test was too weak, and saying how it was weak matters
+more than the result.** Its child called `_exit()` immediately -- which reads almost
+no state, so a child whose callee-saved registers, frame pointer or TLS base had been
+mangled would have passed. Chromium's child ran real code and faulted at
+`cr2=-0x28`, a dereference through a base register holding zero, which is exactly the
+damage `_exit()` cannot see. The child now walks a deep recursive call chain, formats
+through libc, and reads `errno` (a TLS access). Still 8/8.
+
+**So the Linux-arc namespace surface is eliminated as the cause.** What remains is
+what is specific to Chromium at that moment: **forking chrome's own address space**
+-- 327 VMAs, shared libraries packed from `0x100000000000`, V8 cages -- through
+`vmm_cow_fork`. The tree already treats that as fragile: the `CHROMIUM_BOOT` path
+carries a hard cap of 16 chrome CoW forks and a comment noting that only
+"STW tg_vm_quiesce + eager CoW make limited chrome CoW forks viable".
+
+**That makes the sandbox blocker a Chromium-arc problem, not a Linux-arc one.** The
+next probe belongs to that arc's tooling, not to namespaces:
+
+1. Map the faulting `rip=0x0000000003716f29` to a function in
+   `chrome-headless-shell` (compute the offset from the ELF LOAD base, per that
+   arc's law) -- it identifies what the child was doing when its base register was
+   zero.
+2. Determine whether a *plain* CoW fork of chrome faults the same way, which would
+   confirm the namespace flag is incidental. The `[fork] clone flags=` and
+   `allow chrome CoW fork` instruments already exist but are `CHROMIUM_BOOT`-gated,
+   so they were compiled out of the `TKAPP_CHROMEWIN` build that produced this
+   failure -- enabling them for a chromewin build is the cheapest next step.
+
+**What slice 14 delivered stands unchanged:** the privilege drop works, Chromium
+accepts a non-root launch, and its sandbox engages. What it uncovered is a
+pre-existing weakness in CoW-forking a very large address space, which was always
+going to surface the first time anything asked chrome to fork.
+
+### Also corrected: `sys_fork` does NOT full-copy
+
+Two slice-16 comments (in `cgroup.h` and `fork.c`) justified bulk-charging a forked
+child by citing `copy_user_pages`'s "intentionally a FULL copy (no COW)" note.
+**`copy_user_pages` is dead code** -- the compiler says so (`unused function`), and
+`sys_fork` actually calls `vmm_cow_fork`. No behaviour changes (the over-count note
+already covered CoW paths, and the child still gets its own `cr3`, so it is its own
+mm owner and the bulk charge still lands correctly), but the stated reason was wrong
+and is now fixed.

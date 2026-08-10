@@ -85,8 +85,11 @@ int  cgroup_nr_procs(int cg);
  *     under-reports every threaded program: a thread faults 100 pages, exits, and
  *     proc_reap releases them while all 100 are still mapped for the leader.
  *     Chromium runs ~30 threads per process, so this is not a corner case.
- *   - `sys_fork` FULL-copies the user half, so the child owns its pages and is
- *     bulk-charged its parent's count -- exact, not an approximation.
+ *   - `sys_fork` CoW-clones the user half (vmm_cow_fork; the copy_user_pages
+ *     "FULL copy" note next to it is DEAD CODE -- the compiler flags it unused).
+ *     The child gets its own cr3, so it is its own mm owner and is bulk-charged
+ *     its parent's count. Shared-until-written pages are therefore counted in
+ *     both cgroups, same as the vfork case below.
  *   - `sys_fork_share`/vfork SHARES the space, so the child is charged nothing;
  *     the parent already holds it. Charging both would double-count the whole
  *     address space on every vfork, and busybox vforks constantly.

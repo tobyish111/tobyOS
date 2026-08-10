@@ -2906,6 +2906,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-cgroup (slice 15 cgroup v2 proof)";    \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cgroup";                      \
 	fi;                                                                   \
+	if [ -f programs/linux-clonens/linux-clonens.elf ]; then               \
+	    cp programs/linux-clonens/linux-clonens.elf                        \
+	         $(INITRD_STAGE)/bin/linux-clonens;                            \
+	    echo "[initrd] staged linux-clonens (clone+CLONE_NEW* proof)";     \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-clonens";                     \
+	fi;                                                                   \
 	if [ -f programs/linux-cgroup2/linux-cgroup2.elf ]; then               \
 	    cp programs/linux-cgroup2/linux-cgroup2.elf                        \
 	         $(INITRD_STAGE)/bin/linux-cgroup2;                            \

@@ -7424,6 +7424,19 @@ void _start(void) {
              * root), which is why CW_SANDBOX defaults OFF. */
             { "/bin/nsetuid", "nsetuid", 0, 63,
               "slice 14: native privilege drop (C)" },
+            /* clone(2) with CLONE_NEW* -- creating a CHILD in a new namespace,
+             * as opposed to unshare(2) moving the CALLER into one. The entire
+             * arc tested only the second form; nothing tested the first, and
+             * the first is what Chromium's sandbox and every container runtime
+             * use. That gap hid a real bug: Chromium's
+             * clone(CLONE_NEWUSER|SIGCHLD) child faulted before its first
+             * syscall, so wait4 found nothing and its sandbox CHECKed out at
+             * credentials.cc:309 "No child processes".
+             *
+             * bit0 is the CONTROL (plain clone, no flags): if it fails too, the
+             * bug is in clone/fork generally and not about namespaces at all. */
+            { "/bin/linux-clonens", "linux-clonens", 0, 255,
+              "clone(CLONE_NEW*) creates a child (C)" },
 
             /* Independent witness #1: two SEPARATE processes in the initial
              * namespace must report the SAME uts inum (each $( ) is its own

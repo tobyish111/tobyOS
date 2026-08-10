@@ -666,10 +666,14 @@ long sys_fork(void) {
     child->state = PROC_READY;
     sched_enqueue(child);
 
-    /* SLICE 16: this path FULL-COPIES the user half (see copy_user_pages), so the
-     * child genuinely owns every one of these pages and the charge is exact.
-     * cgroup_mem_charge bumps child->user_pages itself, so assigning it as well
-     * would double it. */
+    /* SLICE 16: the child gets its OWN cr3 (vmm_cow_fork below), so it is its own
+     * mm owner and is bulk-charged its parent's page count; cgroup_mem_charge bumps
+     * child->user_pages itself, so assigning it as well would double it.
+     *
+     * NOTE this is a CoW clone, not a full copy -- copy_user_pages above, with its
+     * "intentionally a FULL copy (no COW)" comment, is DEAD CODE (the compiler flags
+     * it unused). An earlier version of this comment cited it as justification. So
+     * pages shared until first write are counted in both cgroups; see cgroup.h. */
     child->user_pages = 0;
     cgroup_mem_charge(child, parent->user_pages);
     perf_count_proc_spawn();
