@@ -30,6 +30,7 @@
 #include <tobyos/pit.h>
 #include <tobyos/pmm.h>
 #include <tobyos/smp.h>
+#include <tobyos/nsproxy.h>   /* the /proc/PID/ns tree (slice 8) */
 
 /* Describe an open file for /proc/<pid>/fd/<n> readlink: a real path where we
  * have one, else the Linux-style synthetic target (pipe:[..], socket:[..],
@@ -114,7 +115,13 @@ static void subst_self(const char *rel, char *out, size_t cap) {
         rel[1] == 's' && rel[2] == 'e' && rel[3] == 'l' && rel[4] == 'f' &&
         (rel[5] == '\0' || rel[5] == '/')) {
         struct proc *p = current_proc();
-        int pid = p ? p->pid : 0;
+        /* Slice 10: substitute the pid AS THE CALLER NUMBERS IT. Every numeric
+         * component below is now translated from the caller's namespace, so
+         * writing the raw kpid here would send it through that translation a
+         * second time and resolve to the wrong process (or to nothing). The two
+         * have to agree; identity in the initial namespace. */
+        int pid = p ? pid_vnr(p) : 0;
+        if (p && !pid) pid = p->pid;
         char pidstr[16];
         int pl = int_to_str(pidstr, sizeof(pidstr), pid);
         const char *tail = rel + 5;
@@ -132,6 +139,27 @@ static void subst_self(const char *rel, char *out, size_t cap) {
     if (rl >= cap) rl = cap - 1;
     if (rel) memcpy(out, rel, rl);
     out[rl] = '\0';
+}
+
+/* Slice 10: every numeric component of a /proc path is a pid IN THE READER'S
+ * PID NAMESPACE. Translate it here, once, and treat "not visible from the
+ * reader's namespace" as ENOENT -- which is not an approximation: from inside
+ * that namespace the process genuinely does not exist. Identity in the initial
+ * namespace, so this is a no-op for a system that never used CLONE_NEWPID.
+ *
+ * Returns a kpid suitable for proc_lookup(), or 0. */
+static int procfs_kpid(const char *s) {
+    int v = parse_int(s);
+    struct proc *me = current_proc();
+    /* A reader in the INITIAL namespace gets the identity mapping verbatim,
+     * including /proc/0 -- which this kernel has always exposed even though
+     * Linux has no pid 0. Routing it through pid_knr() would have quietly
+     * dropped it (pid_vnr treats 0 as "not visible"), and removing /proc/0 is
+     * an unrelated behaviour change that a pid-namespace slice has no business
+     * making. Inside a namespace, translate and let 0 mean ENOENT. */
+    if (!me || !me->pid_ns) return v;
+    if (v <= 0) return 0;
+    return pid_knr(v);
 }
 
 /* ---- content generators ---- */
@@ -285,6 +313,63 @@ static int gen_version(char *buf, size_t cap) {
     return (int)vl;
 }
 
+
+/* Linux slice 6: /proc/filesystems.
+ *
+ * mount(8), busybox's mount applet and most distro init scripts read this to
+ * decide what they may mount; an absent file makes them assume NOTHING is
+ * supported. The "nodev" column means "needs no block device". */
+static int gen_filesystems(char *buf, size_t cap) {
+    static const char *txt =
+        "nodev\tramfs\n"
+        "nodev\tproc\n"
+        "nodev\tsysfs\n"
+        "\ttobyfs\n"
+        "\text2\n"
+        "\text4\n"
+        "\tvfat\n";
+    size_t n = strlen(txt);
+    if (n >= cap) n = cap - 1;
+    memcpy(buf, txt, n); buf[n] = 0;
+    return (int)n;
+}
+
+/* Linux slice 6: /proc/devices. Reported so tools that enumerate device
+ * majors get a plausible, non-empty answer rather than concluding the system
+ * has no devices at all. */
+static int gen_devices(char *buf, size_t cap) {
+    static const char *txt =
+        "Character devices:\n"
+        "  1 mem\n"
+        "  4 tty\n"
+        "  5 /dev/tty\n"
+        " 13 input\n"
+        " 29 fb\n"
+        "116 alsa\n"
+        "226 drm\n"
+        "\nBlock devices:\n"
+        "  8 sd\n"
+        "259 blkext\n";
+    size_t n = strlen(txt);
+    if (n >= cap) n = cap - 1;
+    memcpy(buf, txt, n); buf[n] = 0;
+    return (int)n;
+}
+
+/* Linux slice 6 NOTE: /proc/<pid>/environ is deliberately absent.
+ *
+ * The environment is not kernel state here. `envc`/`envp` live on struct
+ * proc_spec (the spawn request) and are deep-copied onto the new process's
+ * USER STACK by pack_argv_envp_on_user_stack(); the PCB keeps no pointer to
+ * them afterwards. Generating this file would mean recording that stack
+ * address at exec and then reading another address space (a CR3 switch) to
+ * serve a read.
+ *
+ * Not built because nothing needs it: `ps e` and a few sandbox probes read it,
+ * none of which are on the path to the Alpine milestone. An absent file is an
+ * honest ENOENT; a present but empty one would read as "this process has no
+ * environment", which is false. */
+
 static int gen_pid_status(int pid, char *buf, size_t cap) {
     struct proc *p = proc_lookup(pid);
     if (!p) return -1;
@@ -304,9 +389,42 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
 
     APPEND_STR("Name:   "); APPEND_STR(p->name);     APPEND_STR("\n");
     APPEND_STR("State:  "); APPEND_STR(proc_state_name(p->state)); APPEND_STR("\n");
-    APPEND_STR("Pid:    "); APPEND_INT(p->pid);       APPEND_STR("\n");
-    APPEND_STR("PPid:   "); APPEND_INT(p->ppid);      APPEND_STR("\n");
-    APPEND_STR("Uid:    "); APPEND_INT(p->uid);        APPEND_STR("\n");
+    /* Slice 10: report pids as the READER numbers them, not as the kernel
+     * stores them. A process inside a pid namespace reading /proc must see its
+     * own numbering, or `ps` shows pids that kill(2) then rejects. Identity in
+     * the initial namespace. PPid falls to 0 when the parent is outside the
+     * reader's namespace, which is what Linux reports and is also the right
+     * answer -- the alternative leaks a host pid across the boundary. */
+    APPEND_STR("Pid:    "); APPEND_INT(pid_vnr(p));            APPEND_STR("\n");
+    APPEND_STR("PPid:   "); APPEND_INT(pid_vnr_of_kpid(p->ppid)); APPEND_STR("\n");
+    /* Linux slice 2: report the full credential set. Linux's format is four
+     * TAB-separated columns -- real, effective, saved-set, filesystem -- and
+     * `ps`, `id` and every sandbox probe parse exactly that shape. We had a
+     * single value, which is the same class of bug as the truncated stat line
+     * (see gen_pid_stat): a short line does not read as an error, it reads as
+     * a wrong answer. fsuid has no separate storage here, so it mirrors
+     * effective, which is true for every process we can create. */
+    /* Slice 11: report ids as the READER's user namespace numbers them -- the
+     * same rule as the pid fields above. `id`, `ps` and every sandbox probe read
+     * these, so a host id here would contradict what getuid(2) told the same
+     * process. */
+    #define APPEND_UID(v) APPEND_INT(userns_cur_uid((uint32_t)(v)))
+    #define APPEND_GID(v) APPEND_INT(userns_cur_gid((uint32_t)(v)))
+    APPEND_STR("Uid:\t"); APPEND_UID(p->ruid); APPEND_STR("\t");
+    APPEND_UID(p->uid);  APPEND_STR("\t");
+    APPEND_UID(p->suid); APPEND_STR("\t");
+    APPEND_UID(p->uid);  APPEND_STR("\n");
+    APPEND_STR("Gid:\t"); APPEND_GID(p->rgid); APPEND_STR("\t");
+    APPEND_GID(p->gid);  APPEND_STR("\t");
+    APPEND_GID(p->sgid); APPEND_STR("\t");
+    APPEND_GID(p->gid);  APPEND_STR("\n");
+    APPEND_STR("Groups:\t");
+    for (int gi = 0; gi < p->ngroups; gi++) {
+        APPEND_GID(p->groups[gi]); APPEND_STR(" ");
+    }
+    #undef APPEND_UID
+    #undef APPEND_GID
+    APPEND_STR("\n");
     buf[off] = '\0';
     return off;
 
@@ -423,14 +541,67 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
     } while (0)
     #define APPEND_INT(v) do { int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); } while (0)
 
-    APPEND_INT(p->pid); APPEND_STR(" (");
+    /* Slice 10: fields 1 and 4 are pid and ppid -- namespace-translated for the
+     * same reason as /proc/<pid>/status. busybox `ps` reads field 1 and then
+     * offers it to kill(1). */
+    APPEND_INT(pid_vnr(p)); APPEND_STR(" (");
     APPEND_STR(p->name); APPEND_STR(") ");
     { char ss[2] = { st, 0 }; APPEND_STR(ss); }
-    APPEND_STR(" "); APPEND_INT(p->ppid);
-    /* pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt
-     * utime stime cutime cstime priority nice num_threads itrealvalue
-     * starttime -- 18 fields, all zero. */
-    for (int i = 0; i < 18; i++) APPEND_STR(" 0");
+    APPEND_STR(" "); APPEND_INT(pid_vnr_of_kpid(p->ppid));
+
+    /* Linux /proc/<pid>/stat has FIFTY-TWO fields. We used to stop at 22,
+     * which crashed real programs -- not by returning an error, but by
+     * running them off the end of the buffer.
+     *
+     * busybox `ps` reads vsize and rss, fields 23 and 24. It reaches them with
+     * a hand-rolled skip_fields():
+     *
+     *     do { while (*str++ != ' ') continue;
+     *          while (*str == ' ') str++;    } while (--count);
+     *
+     * which has NO NUL check and no bounds check. That is safe on Linux
+     * precisely because the fields are always there; against our truncated
+     * line it scanned past the end of ps's stack buffer until the pointer went
+     * non-canonical, taking a #GP at rax=0x0000800000000001 (the first address
+     * above the user half). Any /proc consumer that indexes a late field --
+     * ps, top, procps, and anything Alpine ships -- hits the same wall.
+     *
+     * So: emit all 52, with honest values where we have them and 0 elsewhere.
+     * Field numbers below are 1-based and match proc(5). */
+    {
+        uint64_t hz100 = p->cpu_ns / 10000000ull;   /* ns -> USER_HZ (100/s) */
+        uint64_t rss_pages = p->user_pages;
+        uint64_t vsize = rss_pages * 4096ull;
+
+        APPEND_STR(" 0");                    /*  5 pgrp        */
+        APPEND_STR(" 0");                    /*  6 session     */
+        APPEND_STR(" 0");                    /*  7 tty_nr      */
+        APPEND_STR(" -1");                   /*  8 tpgid       */
+        APPEND_STR(" 0");                    /*  9 flags       */
+        APPEND_STR(" 0");                    /* 10 minflt      */
+        APPEND_STR(" 0");                    /* 11 cminflt     */
+        APPEND_STR(" 0");                    /* 12 majflt      */
+        APPEND_STR(" 0");                    /* 13 cmajflt     */
+        APPEND_STR(" "); APPEND_INT(hz100);  /* 14 utime       */
+        APPEND_STR(" 0");                    /* 15 stime       */
+        APPEND_STR(" 0");                    /* 16 cutime      */
+        APPEND_STR(" 0");                    /* 17 cstime      */
+        APPEND_STR(" 20");                   /* 18 priority    */
+        APPEND_STR(" 0");                    /* 19 nice        */
+        APPEND_STR(" 1");                    /* 20 num_threads */
+        APPEND_STR(" 0");                    /* 21 itrealvalue */
+        APPEND_STR(" 0");                    /* 22 starttime   */
+        APPEND_STR(" "); APPEND_INT(vsize);      /* 23 vsize   */
+        APPEND_STR(" "); APPEND_INT(rss_pages);  /* 24 rss (in PAGES) */
+        /* 25 rsslim: Linux reports RLIM_INFINITY here. */
+        APPEND_STR(" 18446744073709551615");
+        /* 26..52 -- startcode endcode startstack kstkesp kstkeip signal
+         * blocked sigignore sigcatch wchan nswap cnswap exit_signal
+         * processor rt_priority policy delayacct_blkio_ticks guest_time
+         * cguest_time start_data end_data start_brk arg_start arg_end
+         * env_start env_end exit_code = 27 fields. */
+        for (int i = 0; i < 27; i++) APPEND_STR(" 0");
+    }
     APPEND_STR("\n");
     buf[off] = '\0';
     return off;
@@ -440,10 +611,17 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
 
 /* ---- VFS driver ---- */
 
+/* Slice 11: which writable procfs file a handle refers to (PW_NONE for the
+ * read-only majority). Recorded at open because procfs_write() only receives
+ * the handle, not the path. */
+enum procfs_wkind { PW_NONE = 0, PW_UID_MAP, PW_GID_MAP, PW_SETGROUPS };
+
 struct procfs_handle {
     char *data;
     size_t len;
     size_t pos;
+    int    wpid;                 /* target pid for a writable file */
+    enum procfs_wkind wkind;
 };
 
 static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
@@ -456,6 +634,8 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
 
     char buf[2048];
     int len = -1;
+    int wpid = 0;                          /* slice 11: writable-file target */
+    enum procfs_wkind wkind = PW_NONE;
 
     if (strcmp(rel, "uptime") == 0)  { len = gen_uptime(buf, sizeof(buf));  }
     else if (strcmp(rel, "meminfo") == 0) { len = gen_meminfo(buf, sizeof(buf)); }
@@ -464,6 +644,8 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
     else if (strcmp(rel, "loadavg") == 0) { len = gen_loadavg(buf, sizeof(buf)); }
     else if (strcmp(rel, "stat") == 0)    { len = gen_stat(buf, sizeof(buf)); }
     else if (strcmp(rel, "mounts") == 0)  { len = gen_mounts(buf, sizeof(buf)); }
+    else if (strcmp(rel, "filesystems") == 0) { len = gen_filesystems(buf, sizeof(buf)); }
+    else if (strcmp(rel, "devices") == 0) { len = gen_devices(buf, sizeof(buf)); }
     else {
         /* Try /proc/<pid>/<file> */
         if (rel[0] >= '0' && rel[0] <= '9') {
@@ -475,7 +657,8 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                 if (pidlen >= sizeof(pid_str)) return VFS_ERR_NOENT;
                 memcpy(pid_str, rel, pidlen);
                 pid_str[pidlen] = '\0';
-                int pid = parse_int(pid_str);
+                int pid = procfs_kpid(pid_str);      /* slice 10 */
+                if (!pid) return VFS_ERR_NOENT;
                 const char *sub = slash + 1;
                 if (strcmp(sub, "status") == 0)
                     len = gen_pid_status(pid, buf, sizeof(buf));
@@ -485,6 +668,27 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                     len = gen_pid_maps(pid, buf, sizeof(buf));
                 else if (strcmp(sub, "stat") == 0)
                     len = gen_pid_stat(pid, buf, sizeof(buf));
+                /* Slice 11: the user-namespace id maps. These are the first
+                 * WRITABLE files in /proc -- see procfs_write(). The pid is
+                 * stashed on the handle because a write has to know which
+                 * process's namespace it is configuring. */
+                else if (strcmp(sub, "uid_map") == 0 ||
+                         strcmp(sub, "gid_map") == 0 ||
+                         strcmp(sub, "setgroups") == 0) {
+                    struct proc *up = proc_lookup(pid);
+                    if (!up) return VFS_ERR_NOENT;
+                    if (sub[0] == 's')
+                        len = userns_render_setgroups(up, buf, sizeof(buf));
+                    else
+                        len = userns_render_map(up, sub[0] == 'u', buf,
+                                                sizeof(buf));
+                    if (len < 0) len = 0;      /* empty map: a real, readable
+                                                * state, not an error */
+                    wpid = pid;
+                    wkind = (sub[0] == 's') ? PW_SETGROUPS
+                                            : (sub[0] == 'u' ? PW_UID_MAP
+                                                             : PW_GID_MAP);
+                }
                 else if (strcmp(sub, "exe") == 0) {
                     /* Opening /proc/<pid>/exe FOLLOWS the symlink, as Linux does:
                      * hand back a handle to the real executable. stat/readlink
@@ -512,6 +716,8 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
     memcpy(h->data, buf, (size_t)len + 1);
     h->len = (size_t)len;
     h->pos = 0;
+    h->wpid  = wpid;
+    h->wkind = wkind;
 
     out->priv = h;
     out->size = h->len;
@@ -537,6 +743,41 @@ static long procfs_read(struct vfs_file *f, void *buf, size_t n) {
     return (long)n;
 }
 
+/* Slice 11: the FIRST write path in procfs. Everything in /proc was read-only
+ * until user namespaces needed /proc/PID/{uid_map,gid_map,setgroups}, which are
+ * configured by WRITING them -- there is no syscall for it, the file IS the
+ * interface.
+ *
+ * Only those three files accept writes; every other handle has wkind == PW_NONE
+ * and gets VFS_ERR_ROFS, which is what the whole filesystem returned before. */
+static long procfs_write(struct vfs_file *f, const void *buf, size_t n) {
+    struct procfs_handle *h = f->priv;
+    if (!h || h->wkind == PW_NONE) return VFS_ERR_ROFS;
+    struct proc *target = proc_lookup(h->wpid);
+    if (!target) return VFS_ERR_NOENT;
+
+    long rc;
+    if (h->wkind == PW_SETGROUPS)
+        rc = userns_write_setgroups(target, (const char *)buf, n);
+    else
+        rc = userns_write_map(target, h->wkind == PW_UID_MAP,
+                              (const char *)buf, n);
+    /* userns_* speak ABI errnos; the VFS speaks VFS_ERR_*. Map the two cases
+     * that can occur rather than letting an ABI code escape as a VFS code --
+     * the bug slice 6 recorded (raw VFS_ERR_* leaking to userspace as Linux
+     * errnos) in the other direction. */
+    if (rc < 0) {
+        /* EPERM must map to VFS_ERR_NOTPERM, not VFS_ERR_PERM: the latter comes
+         * out of vfs_err_to_abi() as EACCES, so the caller would see the wrong
+         * refusal. Linux reports EPERM for every uid_map refusal and container
+         * runtimes test for it specifically. */
+        if (rc == -ABI_EPERM)  return VFS_ERR_NOTPERM;
+        if (rc == -ABI_ENOENT) return VFS_ERR_NOENT;
+        return VFS_ERR_INVAL;
+    }
+    return rc;
+}
+
 static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     (void)mnt;
     if (!path || path[0] != '/') return VFS_ERR_NOENT;
@@ -558,7 +799,7 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
         const char *s = rel;
         while (*s >= '0' && *s <= '9') s++;
         if (*s == '\0') {
-            int pid = parse_int(rel);
+            int pid = procfs_kpid(rel);   /* slice 10 */
             if (proc_lookup(pid)) {
                 out->type = VFS_TYPE_DIR;
                 out->size = 0;
@@ -568,7 +809,7 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
             return VFS_ERR_NOENT;
         }
         if (*s == '/' && strcmp(s + 1, "exe") == 0) {
-            int pid = parse_int(rel);
+            int pid = procfs_kpid(rel);   /* slice 10 */
             if (proc_lookup(pid)) {
                 out->type = VFS_TYPE_SYMLINK;
                 out->size = 0;
@@ -587,7 +828,7 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
          * and died. Note the trailing slash chrome passes -- accept it. */
         if (*s == '/' && (strncmp(s + 1, "task", 4) == 0) &&
             (s[5] == '\0' || s[5] == '/')) {
-            int pid = parse_int(rel);
+            int pid = procfs_kpid(rel);   /* slice 10 */
             struct proc *p = proc_lookup(pid);
             if (!p) return VFS_ERR_NOENT;
             int tgid = p->is_thread ? p->tgid : p->pid;
@@ -616,7 +857,7 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
                 return VFS_OK;
             }
             /* /proc/<pid>/task/<tid> -- a per-thread directory. */
-            int tid = parse_int(after);
+            int tid = procfs_kpid(after); /* slice 10 */
             struct proc *t = proc_lookup(tid);
             if (!t) return VFS_ERR_NOENT;
             /* A stopped/exited thread must READ AS GONE, not merely idle --
@@ -634,7 +875,7 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
         /* /proc/<pid>/fd (dir) and /proc/<pid>/fd/<n> (symlink) */
         if (*s == '/' && (strcmp(s + 1, "fd") == 0 ||
                           (s[1]=='f' && s[2]=='d' && s[3]=='/'))) {
-            int pid = parse_int(rel);
+            int pid = procfs_kpid(rel);   /* slice 10 */
             struct proc *p = proc_lookup(pid);
             if (!p) return VFS_ERR_NOENT;
             if (strcmp(s + 1, "fd") == 0) {        /* the fd directory */
@@ -649,6 +890,28 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
                 return VFS_OK;
             }
             return VFS_ERR_NOENT;
+        }
+
+        /* Slice 8: /proc/<pid>/ns (dir) and /proc/<pid>/ns/<kind> (symlink).
+         * Every kind Linux defines is listed, including the ones this kernel
+         * has not implemented yet -- a process really IS in the single global
+         * namespace of those kinds, so reporting the link (with the initial
+         * namespace's inum) is accurate, and it is what `lsns` expects to
+         * find. ns_kind_implemented() is what gates unshare/setns. */
+        if (*s == '/' && strncmp(s + 1, "ns", 2) == 0 &&
+            (s[3] == '\0' || s[3] == '/')) {
+            int pid = procfs_kpid(rel);   /* slice 10 */
+            if (!proc_lookup(pid)) return VFS_ERR_NOENT;
+            if (s[3] == '\0') {                    /* the ns directory */
+                out->type = VFS_TYPE_DIR;
+                out->nlink = 2;
+                out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+                return VFS_OK;
+            }
+            if (ns_kind_from_name(s + 4) < 0) return VFS_ERR_NOENT;
+            out->type = VFS_TYPE_SYMLINK;
+            out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+            return VFS_OK;
         }
     }
 
@@ -670,6 +933,7 @@ struct procfs_dir_handle {
     int index;
     int pid;    /* -1 for /proc root, else the pid we're listing */
     int isfd;   /* 1 if listing /proc/<pid>/fd */
+    int isns;   /* 1 if listing /proc/<pid>/ns (slice 8) */
 };
 
 static int procfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
@@ -679,6 +943,7 @@ static int procfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
     if (!dh) return VFS_ERR_NOMEM;
     dh->index = 0;
     dh->isfd  = 0;
+    dh->isns  = 0;
 
     if (strcmp(path, "/") == 0) {
         dh->pid = -1;
@@ -686,12 +951,13 @@ static int procfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
         char normbuf[ABI_PATH_MAX];
         subst_self(path, normbuf, sizeof(normbuf));
         const char *rel = normbuf + 1;
-        dh->pid = parse_int(rel);
+        dh->pid = procfs_kpid(rel);  /* slice 10: caller-namespace pid */
         if (!proc_lookup(dh->pid)) { kfree(dh); return VFS_ERR_NOENT; }
         /* /proc/<pid>/fd is itself a directory of open-fd symlinks. */
         const char *s = rel;
         while (*s >= '0' && *s <= '9') s++;
         if (*s == '/' && strcmp(s + 1, "fd") == 0) dh->isfd = 1;
+        else if (*s == '/' && strcmp(s + 1, "ns") == 0) dh->isns = 1;  /* slice 8 */
         else if (*s != '\0') { kfree(dh); return VFS_ERR_NOENT; }
     }
     out->priv = dh;
@@ -707,6 +973,21 @@ static int procfs_closedir(struct vfs_dir *d) {
 static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     struct procfs_dir_handle *dh = d->priv;
     if (!dh) return VFS_ERR_INVAL;
+
+    if (dh->isns) {
+        /* Slice 8: /proc/<pid>/ns -- one symlink per namespace kind. */
+        if (dh->index >= NS_KIND_COUNT) return VFS_ERR_NOENT;
+        const char *kn = ns_kind_name(dh->index);
+        memset(out->name, 0, VFS_NAME_MAX);
+        size_t kl = strlen(kn);
+        if (kl >= VFS_NAME_MAX) kl = VFS_NAME_MAX - 1;
+        memcpy(out->name, kn, kl);
+        out->type = VFS_TYPE_SYMLINK;
+        out->size = 0;
+        out->uid = 0; out->gid = 0; out->mode = 0;
+        dh->index++;
+        return VFS_OK;
+    }
 
     if (dh->isfd) {
         /* /proc/<pid>/fd: one symlink-named-N per open descriptor. */
@@ -733,8 +1014,10 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
         /* Root /proc listing: global files first, then pid dirs */
         static const char *globals[] = { "uptime", "meminfo", "version",
                                          "cpuinfo", "loadavg", "stat",
-                                         "mounts", "self" };
-        const int nglobals = 8;
+                                         "mounts", "self",
+                                         /* slice 6 */
+                                         "filesystems", "devices" };
+        const int nglobals = 10;
         if (dh->index < nglobals) {
             memset(out->name, 0, VFS_NAME_MAX);
             size_t nl = strlen(globals[dh->index]);
@@ -748,12 +1031,30 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
             return VFS_OK;
         }
         int pidx = dh->index - nglobals;
+        struct proc *me = current_proc();
         for (int i = pidx; i < PROC_MAX; i++) {
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO) {
+                /* Slice 10: list only what the READER's pid namespace can see,
+                 * under the number it sees. It has to be the LISTING that
+                 * filters, not just the per-pid lookup, or a container's `ps`
+                 * enumerates host processes and then fails to stat them.
+                 *
+                 * A reader in the initial namespace is left EXACTLY as before,
+                 * pid 0 included -- pid_vnr_in reports 0 as "not visible", so
+                 * routing the initial namespace through it would have silently
+                 * dropped /proc/0 from the listing. Same reasoning as
+                 * procfs_kpid(). */
+                int vp;
+                if (!me || !me->pid_ns) {
+                    vp = g_proc[i].pid;
+                } else {
+                    vp = pid_vnr_in(me->pid_ns, g_proc[i].pid);
+                    if (!vp) continue;
+                }
                 memset(out->name, 0, VFS_NAME_MAX);
                 char tmp[16];
-                int_to_str(tmp, sizeof(tmp), g_proc[i].pid);
+                int_to_str(tmp, sizeof(tmp), vp);
                 size_t tl = strlen(tmp);
                 memcpy(out->name, tmp, tl);
                 out->type = VFS_TYPE_DIR;
@@ -766,16 +1067,20 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
         return VFS_ERR_NOENT;
     }
 
-    /* Per-pid directory listing. "exe" is a symlink, "fd" is a directory,
-     * the rest are files. */
-    static const char *entries[] = { "status", "cmdline", "maps", "stat", "exe", "fd" };
-    const int nentries = 6;
+    /* Per-pid directory listing. "exe" is a symlink, "fd" and "ns" are
+     * directories, the rest are files. */
+    static const char *entries[] = { "status", "cmdline", "maps", "stat",
+                                     "exe", "fd", "ns",
+                                     /* slice 11 */
+                                     "uid_map", "gid_map", "setgroups" };
+    const int nentries = 10;
     if (dh->index >= nentries) return VFS_ERR_NOENT;
     memset(out->name, 0, VFS_NAME_MAX);
     size_t nl = strlen(entries[dh->index]);
     memcpy(out->name, entries[dh->index], nl);
     if (dh->index == 4)      out->type = VFS_TYPE_SYMLINK;   /* exe */
     else if (dh->index == 5) out->type = VFS_TYPE_DIR;       /* fd  */
+    else if (dh->index == 6) out->type = VFS_TYPE_DIR;       /* ns (slice 8) */
     else                     out->type = VFS_TYPE_FILE;
     out->size = 0;
     out->uid = 0; out->gid = 0; out->mode = 0;
@@ -815,7 +1120,7 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
         const char *s = rel;
         while (*s >= '0' && *s <= '9') s++;
         if (*s == '/' && strcmp(s + 1, "exe") == 0) {
-            int pid = parse_int(rel);
+            int pid = procfs_kpid(rel);   /* slice 10 */
             struct proc *p = proc_lookup(pid);
             if (!p) return VFS_ERR_NOENT;
             const char *tgt = p->exe_path[0] ? p->exe_path : p->name;
@@ -841,12 +1146,39 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
         }
         /* /proc/<pid>/fd/<n> -> a description of the open file */
         if (*s == '/' && s[1]=='f' && s[2]=='d' && s[3]=='/') {
-            int pid = parse_int(rel);
+            int pid = procfs_kpid(rel);   /* slice 10 */
             struct proc *p = proc_lookup(pid);
             if (!p) return VFS_ERR_NOENT;
             int fd = parse_int(s + 4);
             if (fd < 0 || fd >= PROC_NFDS || !p->fds[fd]) return VFS_ERR_NOENT;
             describe_fd_target(p->fds[fd], buf, bufsz);
+            return VFS_OK;
+        }
+        /* Slice 8: /proc/<pid>/ns/<kind> -> "<kind>:[<inum>]".
+         *
+         * The inum is the ONLY thing that identifies a namespace to userspace:
+         * two processes are in the same namespace exactly when these strings
+         * match, which is how lsns, `ip netns identify` and every container
+         * runtime compare them. So this is not a cosmetic string -- it is the
+         * comparison the whole feature is observed through. */
+        if (*s == '/' && s[1]=='n' && s[2]=='s' && s[3]=='/') {
+            int pid = procfs_kpid(rel);   /* slice 10 */
+            struct proc *p = proc_lookup(pid);
+            if (!p) return VFS_ERR_NOENT;
+            int kind = ns_kind_from_name(s + 4);
+            if (kind < 0) return VFS_ERR_NOENT;
+            const char *kn = ns_kind_name(kind);
+            char num[24];
+            int nl = uint_to_str(num, sizeof num, ns_inum_of(p, kind));
+            if (nl < 0) return VFS_ERR_INVAL;
+            size_t kl = strlen(kn);
+            if (kl + 2 + (size_t)nl + 1 + 1 > bufsz) return VFS_ERR_INVAL;
+            size_t o = 0;
+            memcpy(buf + o, kn, kl); o += kl;
+            buf[o++] = ':'; buf[o++] = '[';
+            memcpy(buf + o, num, (size_t)nl); o += (size_t)nl;
+            buf[o++] = ']';
+            buf[o] = '\0';
             return VFS_OK;
         }
     }
@@ -857,7 +1189,7 @@ static const struct vfs_ops procfs_ops = {
     .open     = procfs_open,
     .close    = procfs_close,
     .read     = procfs_read,
-    .write    = 0,
+    .write    = procfs_write,   /* slice 11: uid_map/gid_map/setgroups only */
     .create   = 0,
     .unlink   = 0,
     .mkdir    = 0,

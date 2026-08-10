@@ -47,6 +47,11 @@ static void pit_irq(struct regs *r) {
      * no-op when nothing is pending (just reads the event ring dequeue). */
     xhci_poll();
 
+    /* NOTE (Linux slice 3): alarm(2) deadlines are deliberately NOT scanned
+     * here. signal_send() touches the run queue, and doing that from this IRQ
+     * deadlocked the machine. The scan lives in sched_yield()'s slow path
+     * next to poll_tick -- see signal_tick_alarms(). */
+
     /* Asynchronous-signal preemption point.
      *
      * If the timer interrupted ring 3 (CPL=3) and the current process

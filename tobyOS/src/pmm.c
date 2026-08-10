@@ -202,7 +202,18 @@ void pmm_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
             (unsigned long)g_used_pages);
 }
 
+#ifdef CGMEM_TRACE
+/* Slice-16 bring-up instrument (temporary, flag-gated): name the call sites that
+ * hand a page to a process inside a LIMITED cgroup without going through
+ * mm_user_page_alloc. Printing the return address is what turns "the charge never
+ * happened" into "this exact line is the path". */
+void cgmem_trace_alloc(void *ra);
+#endif
+
 uint64_t pmm_alloc_page(void) {
+#ifdef CGMEM_TRACE
+    cgmem_trace_alloc(__builtin_return_address(0));
+#endif
     uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
     uint64_t phys = 0;
     for (size_t i = g_first_free_hint; i < g_total_pages; i++) {

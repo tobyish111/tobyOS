@@ -303,42 +303,124 @@ static bool mask_empty(const struct snd_mask *m) {
 }
 /* Intersect `m` with the single-bit set we support; returns false if the
  * result is empty (the caller's request cannot be satisfied). */
+
+/* Set by the ioctl entry points so a rejection can name itself. The refine
+ * runs from both HW_REFINE -- where narrowing to empty is a normal
+ * negotiation outcome and must stay quiet -- and HW_PARAMS, where it is a
+ * failure the client reports as a bare EINVAL with no further detail. */
+static bool g_trace_refine;
+
+/* cmask accumulation.
+ *
+ * ALSA's cmask is a PER-PARAMETER bitmask of what the kernel changed (bit
+ * N == parameter N), and alsa-lib uses it to decide which parameters to
+ * re-propagate through its own constraint graph. Reporting the blanket
+ * `changed ? rmask : 0` says "all twenty parameters moved" on every call,
+ * which is never true and gives the library no usable information.
+ *
+ * The bases are recorded at the top of hw_refine so the refine helpers can
+ * recover a parameter's index from its address, rather than threading an
+ * index through every call site. */
+static const struct snd_interval *g_ival_base;
+static const struct snd_mask     *g_mask_base;
+static unsigned                   g_cmask_acc;
+
+static void cmask_note_ival(const struct snd_interval *v) {
+    if (!g_ival_base) return;
+    g_cmask_acc |= 1u << (unsigned)((v - g_ival_base) + HWP_FIRST_INTERVAL);
+}
+static void cmask_note_mask(const struct snd_mask *m) {
+    if (!g_mask_base) return;
+    g_cmask_acc |= 1u << (unsigned)((m - g_mask_base) + HWP_FIRST_MASK);
+}
+
 static bool mask_refine_to(struct snd_mask *m, const unsigned *allowed,
                            int n, bool *changed) {
     struct snd_mask out;
     mask_zero(&out);
     for (int i = 0; i < n; i++)
         if (mask_test(m, allowed[i])) mask_set(&out, allowed[i]);
-    if (mask_empty(&out)) return false;
-    if (memcmp(&out, m, sizeof(out)) != 0) { *m = out; *changed = true; }
+    if (mask_empty(&out)) {
+        if (g_trace_refine)
+            kprintf("[snd] refine REJECT mask: client offered none of our "
+                    "%d supported value(s)\n", n);
+        return false;
+    }
+    if (memcmp(&out, m, sizeof(out)) != 0) {
+        *m = out; *changed = true; cmask_note_mask(m);
+    }
     return true;
 }
 
-static bool ival_refine(struct snd_interval *v, unsigned lo, unsigned hi,
-                        bool *changed) {
+/* Narrow `v` to [lo,hi]. `what` names the parameter so a rejection under
+ * g_trace_refine identifies itself instead of surfacing as a bare EINVAL. */
+static bool ival_refine_n(const char *what, struct snd_interval *v,
+                          unsigned lo, unsigned hi, bool *changed) {
     unsigned omin = v->min, omax = v->max;
     if (v->min < lo) { v->min = lo; v->openmin = 0; }
     if (v->max > hi) { v->max = hi; v->openmax = 0; }
-    /* An open bound excludes its endpoint; close it by stepping inward so
-     * the rest of the refine only has to reason about closed intervals. */
-    if (v->openmin) { v->min++; v->openmin = 0; }
-    if (v->openmax) { if (v->max == 0) return false; v->max--; v->openmax = 0; }
-    if (v->min > v->max) { v->empty = 1; return false; }
-    if (v->min != omin || v->max != omax) *changed = true;
+
+    /* Close open bounds by stepping inward -- but NEVER let that alone
+     * empty the interval.
+     *
+     * Stepping both ends of [3..4] gives min=4, max=3, which the old code
+     * reported as unsatisfiable. That is a bound-flag convention, not a
+     * real conflict: chrome's `plug` layer asked for periods [3..4]
+     * against our [2..2048] and was refused an obviously satisfiable
+     * request, so it abandoned the configuration and never issued
+     * HW_PARAMS at all -- the whole of slice 5's silence. Real ALSA
+     * normalizes open bounds only for `integer` intervals and does not
+     * synthesize emptiness this way. When stepping would empty it, keep
+     * the closed reading instead; being permissive costs nothing, since
+     * the exact values that finally arrive at HW_PARAMS are what we
+     * actually honour. */
+    {
+        unsigned smin = v->min, smax = v->max;
+        if (v->openmin) smin++;
+        if (v->openmax) { if (smax == 0) return false; smax--; }
+        if (smin <= smax) { v->min = smin; v->max = smax; }
+        v->openmin = v->openmax = 0;
+    }
+    if (v->min > v->max) {
+        v->empty = 1;
+        if (g_trace_refine)
+            kprintf("[snd] refine REJECT %s: asked [%u..%u], hw [%u..%u]\n",
+                    what, omin, omax, lo, hi);
+        return false;
+    }
+    if (v->min != omin || v->max != omax) { *changed = true; cmask_note_ival(v); }
     return true;
 }
+#define ival_refine(v, lo, hi, ch) ival_refine_n(#v, (v), (lo), (hi), (ch))
 
-static void ival_set_exact(struct snd_interval *v, unsigned val,
-                           bool *changed) {
-    if (v->min != val || v->max != val) *changed = true;
-    v->min = v->max = val;
-    v->openmin = v->openmax = 0;
-    v->integer = 1;
-    v->empty = 0;
-}
 
 static bool ival_is_exact(const struct snd_interval *v) {
     return v->min == v->max;
+}
+
+/* Saturating 32-bit helpers for the constraint arithmetic below. Every
+ * product here can overflow a u32 for wide-open intervals (period_size up
+ * to UINT_MAX times a rate), and an overflow that wraps would silently
+ * narrow an interval to nonsense rather than to "unbounded". */
+#define IVAL_MAX 0xFFFFFFFFu
+
+static unsigned sat_mul(unsigned a, unsigned b) {
+    uint64_t r = (uint64_t)a * b;
+    return r > IVAL_MAX ? IVAL_MAX : (unsigned)r;
+}
+/* floor(a*b/c) for a lower bound, saturating. */
+static unsigned mul_div_lo(unsigned a, unsigned b, unsigned c) {
+    if (c == 0) return 0;
+    uint64_t r = (uint64_t)a * b / c;
+    return r > IVAL_MAX ? IVAL_MAX : (unsigned)r;
+}
+/* ceil(a*b/c) for an upper bound, saturating. Rounding UP matters: a
+ * truncated upper bound can exclude the very value the client is about to
+ * request and turn a satisfiable configuration into EINVAL. */
+static unsigned mul_div_hi(unsigned a, unsigned b, unsigned c) {
+    if (c == 0) return IVAL_MAX;
+    uint64_t r = ((uint64_t)a * b + (c - 1)) / c;
+    return r > IVAL_MAX ? IVAL_MAX : (unsigned)r;
 }
 
 /* ============================================================
@@ -353,6 +435,9 @@ static bool ival_is_exact(const struct snd_interval *v) {
  * classic way a PCM device "opens" and then produces nothing.
  * ============================================================ */
 static int hw_refine(struct snd_pcm_hw_params *p) {
+    g_ival_base = p->intervals;
+    g_mask_base = p->masks;
+    g_cmask_acc = 0;
     static const unsigned ok_access[] = { ACCESS_RW_INTERLEAVED };
     static const unsigned ok_format[] = { FORMAT_S16_LE };
     static const unsigned ok_subfmt[] = { 0 /* STD */ };
@@ -376,6 +461,7 @@ static int hw_refine(struct snd_pcm_hw_params *p) {
     struct snd_interval *bbytes = &p->intervals[IVAL_IDX(HWP_BUFFER_BYTES)];
     struct snd_interval *ptime  = &p->intervals[IVAL_IDX(HWP_PERIOD_TIME)];
     struct snd_interval *btime  = &p->intervals[IVAL_IDX(HWP_BUFFER_TIME)];
+    struct snd_interval *tick   = &p->intervals[IVAL_IDX(HWP_TICK_TIME)];
 
     /* S16_LE only, so sample_bits is pinned. */
     if (!ival_refine(sbits, 16, 16, &changed))  return -ABI_EINVAL;
@@ -383,54 +469,175 @@ static int hw_refine(struct snd_pcm_hw_params *p) {
     /* Rates the HDA format word can express (hda_fmt_word in audio_hda.c). */
     if (!ival_refine(rate, 8000, 96000, &changed)) return -ABI_EINVAL;
 
-    /* Geometry. The HDA ring is 4 pages of 4096 B; keep clients inside it
-     * so a period never exceeds what audio_hda_pcm_write can hold. */
-    if (!ival_refine(periods, 2, 32, &changed))         return -ABI_EINVAL;
-    if (!ival_refine(psize, 32, 8192, &changed))        return -ABI_EINVAL;
-    if (!ival_refine(bsize, 64, 65536, &changed))       return -ABI_EINVAL;
+    /* Geometry, and it MUST be self-consistent with the real ring.
+     *
+     * The HDA cyclic buffer is HDA_PCM_PERIODS * HDA_PCM_PERIOD_BYTES =
+     * 16384 B, i.e. 4096 frames at stereo S16. Advertising buffer_size up
+     * to 65536 frames -- 16x more than the hardware holds -- was a lie
+     * that our own constraints then contradicted: alsa-lib pinned
+     * period_size to 240, asked for the 65536 we had promised, and that
+     * needs 273 periods against a periods cap of 32. The refine rejected
+     * buffer_size against [1920..7680] and the library reported a bare
+     * EINVAL from snd_pcm_hw_params, having never issued HW_PARAMS.
+     *
+     * So: bound buffer_size by what the device really has, and keep the
+     * three bounds mutually satisfiable --
+     *   psize.min * periods.min <= bsize.min, and
+     *   psize.max * periods.max >= bsize.max. */
+    /* NOTE the buffer_size cap is NOT the DMA ring size.
+     *
+     * ALSA's buffer_size is the CLIENT's logical ring, not our hardware
+     * one: audio_hda_pcm_write already short-returns when the DMA buffer
+     * is full, so a client may reason about a larger buffer perfectly
+     * safely. Tying the advertised maximum to the physical 4096 frames
+     * looked honest but was actively harmful -- alsa-lib pinned
+     * period_size=240 from period_time, then asked for the 4096 we had
+     * just offered, and 4096/240 is not an integer, so the product rule
+     * refused it against 240*17=4080. Divisibility cannot be expressed in
+     * interval arithmetic, so the cap must be loose enough that some
+     * (period_size, periods) pair always exists. */
+    unsigned max_frames = 65536;
+    (void)HDA_PCM_RING_BYTES;
+    /* periods must reach buffer_size / smallest period_size, or the
+     * product bound contradicts the buffer_size we advertise. With a cap
+     * of 32, a client that pinned period_size=240 and then asked for the
+     * 4096-frame buffer we had just offered was refused against
+     * 240*17=4080 -- the request was only unsatisfiable because the cap
+     * was, and alsa-lib had no way to know that when it chose 240. */
+    unsigned min_psize = 32;
+    if (!ival_refine(psize, min_psize, max_frames / 2, &changed))
+        return -ABI_EINVAL;
+    if (!ival_refine(periods, 2, max_frames / min_psize, &changed))
+        return -ABI_EINVAL;
+    if (!ival_refine(bsize, 64, max_frames, &changed))
+        return -ABI_EINVAL;
 
-    /* Derived: frame_bits = sample_bits * channels. Only resolvable once
-     * channels is pinned; alsa-lib always gets there before HW_PARAMS. */
-    if (ival_is_exact(chan)) {
-        unsigned fb = 16u * chan->min;
-        if (!ival_refine(fbits, fb, fb, &changed)) return -ABI_EINVAL;
+    /* ---- constraint propagation ------------------------------------
+     * The derived parameters must be narrowed as RANGES, not merely
+     * pinned once everything else happens to be exact.
+     *
+     * This is what alsa-lib's convergence loop actually depends on: it
+     * repeatedly asks "given what I have fixed so far, what is still
+     * possible for X?" and closes in. Leaving period_time / buffer_time /
+     * period_bytes / buffer_bytes at [0 .. UINT_MAX] -- which the
+     * exact-only version did, since rate and the sizes are ranges for most
+     * of the negotiation -- means the answer is always "anything", the
+     * space never closes, and the library gives up with EINVAL WITHOUT
+     * ever issuing HW_PARAMS. That is precisely what was observed: 30+
+     * HW_REFINE calls all returning 0, then a bare EINVAL from
+     * snd_pcm_hw_params with no ioctl behind it.
+     *
+     * Rules (Linux sound/core/pcm_native.c):
+     *   frame_bits   = sample_bits * channels
+     *   period_bytes = period_size * frame_bits / 8
+     *   buffer_bytes = buffer_size * frame_bits / 8
+     *   buffer_size  = period_size * periods
+     *   period_time  = period_size * 1e6 / rate
+     *   buffer_time  = buffer_size * 1e6 / rate
+     * applied in both directions and iterated to a fixed point. */
+    for (int pass = 0; pass < 6; pass++) {
+        bool before = changed;
 
-        if (ival_is_exact(psize)) {
-            unsigned pb = (unsigned)(psize->min * fb / 8u);
-            if (!ival_refine(pbytes, pb, pb, &changed)) return -ABI_EINVAL;
+        if (!ival_refine(fbits, 16u * chan->min, 16u * chan->max, &changed))
+            return -ABI_EINVAL;
+
+        /* sizes <-> bytes */
+        if (!ival_refine(pbytes, mul_div_lo(psize->min, fbits->min, 8),
+                                 mul_div_hi(psize->max, fbits->max, 8),
+                                 &changed)) return -ABI_EINVAL;
+        if (!ival_refine(bbytes, mul_div_lo(bsize->min, fbits->min, 8),
+                                 mul_div_hi(bsize->max, fbits->max, 8),
+                                 &changed)) return -ABI_EINVAL;
+        if (fbits->max)
+            if (!ival_refine(psize, mul_div_lo(pbytes->min, 8, fbits->max),
+                                    mul_div_hi(pbytes->max, 8, fbits->min),
+                                    &changed)) return -ABI_EINVAL;
+
+        /* buffer_size <-> period_size * periods */
+        if (!ival_refine(bsize, sat_mul(psize->min, periods->min),
+                                sat_mul(psize->max, periods->max),
+                                &changed)) return -ABI_EINVAL;
+        /* CEIL for the upper bound. Plain division truncates, and the
+         * truncation propagates straight back into buffer_size on the
+         * next pass: with period_size pinned at 240 and buffer_size
+         * 65536, floor gave periods<=273, hence buffer_size<=240*273=
+         * 65520 -- sixteen frames short of the very value the client had
+         * just been offered, so a satisfiable request was refused. */
+        if (psize->max)
+            if (!ival_refine(periods, bsize->min / psize->max,
+                                      mul_div_hi(bsize->max, 1, psize->min),
+                                      &changed)) return -ABI_EINVAL;
+
+        /* frames <-> microseconds, with ONE MICROSECOND of slack on each
+         * side.
+         *
+         * The conversion is lossy in both directions and alsa-lib does its
+         * own rounding, so an exact answer here can contradict the library
+         * over a single unit and collapse the interval. Observed: with
+         * period_size pinned at 240 and rate 48000, the true period_time
+         * is exactly 5000 us; the library asked for >= 5001 and our
+         * [5000..5000] left an empty intersection -- EINVAL for a
+         * configuration that is perfectly achievable. Widening by a unit
+         * costs nothing (we honour period_size, not period_time) and
+         * absorbs the disagreement. */
+        if (rate->max) {
+            unsigned lo = mul_div_lo(psize->min, 1000000u, rate->max);
+            unsigned hi = rate->min ? mul_div_hi(psize->max, 1000000u,
+                                                 rate->min) : IVAL_MAX;
+            if (!ival_refine(ptime, lo ? lo - 1 : 0,
+                             hi < IVAL_MAX ? hi + 1 : hi, &changed))
+                return -ABI_EINVAL;
         }
-        if (ival_is_exact(bsize)) {
-            unsigned bb = (unsigned)(bsize->min * fb / 8u);
-            if (!ival_refine(bbytes, bb, bb, &changed)) return -ABI_EINVAL;
+        if (rate->max) {
+            unsigned lo = mul_div_lo(bsize->min, 1000000u, rate->max);
+            unsigned hi = rate->min ? mul_div_hi(bsize->max, 1000000u,
+                                                 rate->min) : IVAL_MAX;
+            if (!ival_refine(btime, lo ? lo - 1 : 0,
+                             hi < IVAL_MAX ? hi + 1 : hi, &changed))
+                return -ABI_EINVAL;
         }
-    } else {
-        if (!ival_refine(fbits, 16, 32, &changed)) return -ABI_EINVAL;
+        /* and back: period_size implied by the time the client asked for */
+        if (!ival_refine(psize, mul_div_lo(ptime->min, rate->min, 1000000u),
+                                mul_div_hi(ptime->max, rate->max, 1000000u),
+                                &changed)) return -ABI_EINVAL;
+        if (!ival_refine(bsize, mul_div_lo(btime->min, rate->min, 1000000u),
+                                mul_div_hi(btime->max, rate->max, 1000000u),
+                                &changed)) return -ABI_EINVAL;
+
+        if (changed == before) break;          /* fixed point reached */
     }
 
-    /* Derived: buffer_size = period_size * periods. */
-    if (ival_is_exact(psize) && ival_is_exact(periods)) {
-        unsigned bs = (unsigned)(psize->min * periods->min);
-        if (!ival_refine(bsize, bs, bs, &changed)) return -ABI_EINVAL;
-    }
-
-    /* Derived: *_time in microseconds = frames * 1e6 / rate. */
-    if (ival_is_exact(rate) && rate->min) {
-        if (ival_is_exact(psize)) {
-            unsigned t = (unsigned)((psize->min * 1000000ull) / rate->min);
-            ival_set_exact(ptime, t, &changed);
-        }
-        if (ival_is_exact(bsize)) {
-            unsigned t = (unsigned)((bsize->min * 1000000ull) / rate->min);
-            ival_set_exact(btime, t, &changed);
-        }
-    }
+    /* tick_time is a legacy parameter; pin it so it is never left open. */
+    if (!ival_refine(tick, 0, 0, &changed)) return -ABI_EINVAL;
 
     p->info     = INFO_INTERLEAVED | INFO_BLOCK_TRANSFER | INFO_PAUSE;
     p->msbits   = 16;
     p->rate_num = ival_is_exact(rate) ? rate->min : 48000;
     p->rate_den = 1;
     p->fifo_size = 0;
-    p->cmask    = changed ? p->rmask : 0;
+    p->cmask    = g_cmask_acc & p->rmask;
+    (void)changed;
+
+#ifdef SND_TRACE
+    {   /* What is alsa-lib actually asking for, and what did we hand back?
+         * The library runs its own convergence loop over HW_REFINE and can
+         * conclude the space is empty WITHOUT ever issuing HW_PARAMS -- so
+         * "every refine returned 0" is not evidence the negotiation is
+         * healthy. Dump the parameters that matter. */
+        static int n;
+        if (n < 40) { n++;
+            kprintf("[refine] rmask=0x%x cmask=0x%x rate[%u..%u] ch[%u..%u] "
+                    "psz[%u..%u] per[%u..%u] bsz[%u..%u] pt[%u..%u] "
+                    "bt[%u..%u] pb[%u..%u] bb[%u..%u]\n",
+                    p->rmask, p->cmask,
+                    rate->min, rate->max, chan->min, chan->max,
+                    psize->min, psize->max, periods->min, periods->max,
+                    bsize->min, bsize->max, ptime->min, ptime->max,
+                    btime->min, btime->max, pbytes->min, pbytes->max,
+                    bbytes->min, bbytes->max);
+        }
+    }
+#endif
     return 0;
 }
 
@@ -533,7 +740,32 @@ static void fill_pcm_info(struct snd_pcm_info *pi) {
     pi->subdevices_avail = 1;
 }
 
+/* Compact ioctl trace. Bounded so a busy stream cannot flood the serial
+ * log; enough to see the whole open/negotiate/prepare handshake, which is
+ * the part that goes wrong. */
+static long lxsnd_ioctl_inner(struct file *f, unsigned long req,
+                              unsigned long arg);
+
+/* Reset per client session (see lxsnd_open) so each program gets its own
+ * trace window -- otherwise the first client to run burns the whole budget
+ * and the one you are actually debugging shows nothing. */
+static int g_trace_n;
+
 long lxsnd_ioctl(struct file *f, unsigned long req, unsigned long arg) {
+    long rc = lxsnd_ioctl_inner(f, req, arg);
+#ifdef SND_TRACE
+    if (g_trace_n < 120) {
+        g_trace_n++;
+        kprintf("[sndio] %s nr=0x%02x size=%u -> %ld\n",
+                f->dir_off == 0 ? "ctl" : "pcm",
+                IOC_NR(req), IOC_SIZE(req), rc);
+    }
+#endif
+    return rc;
+}
+
+static long lxsnd_ioctl_inner(struct file *f, unsigned long req,
+                              unsigned long arg) {
     unsigned type = IOC_TYPE(req), nr = IOC_NR(req);
 
     /* ---- control device ---- */
@@ -604,7 +836,15 @@ long lxsnd_ioctl(struct file *f, unsigned long req, unsigned long arg) {
         if (copy_from_user(p, (const void *)arg, sizeof(*p)) != 0) {
             kfree(p); return -ABI_EFAULT;
         }
+        /* Trace rejections here too, not only on the HW_PARAMS path.
+         * A plugin (chrome reaches us through `plug`) resolves its slave's
+         * parameters with HW_REFINE and simply gives up if one comes back
+         * EINVAL -- it never issues HW_PARAMS at all. With tracing off for
+         * refine that failure was completely silent from the kernel side:
+         * no ioctl, no reject, no clue. */
+        g_trace_refine = true;
         int rc = hw_refine(p);
+        g_trace_refine = false;
         if (rc == 0 && copy_to_user((void *)arg, p, sizeof(*p)) != 0)
             rc = -ABI_EFAULT;
         kfree(p);
@@ -617,7 +857,9 @@ long lxsnd_ioctl(struct file *f, unsigned long req, unsigned long arg) {
         if (copy_from_user(p, (const void *)arg, sizeof(*p)) != 0) {
             kfree(p); return -ABI_EFAULT;
         }
+        g_trace_refine = true;
         int rc = hw_refine(p);
+        g_trace_refine = false;
         if (rc != 0) { kfree(p); return rc; }
 
         struct snd_interval *chan = &p->intervals[IVAL_IDX(HWP_CHANNELS)];
@@ -625,6 +867,10 @@ long lxsnd_ioctl(struct file *f, unsigned long req, unsigned long arg) {
         struct snd_interval *psz  = &p->intervals[IVAL_IDX(HWP_PERIOD_SIZE)];
         struct snd_interval *bsz  = &p->intervals[IVAL_IDX(HWP_BUFFER_SIZE)];
         if (!ival_is_exact(chan) || !ival_is_exact(rate)) {
+            kprintf("[snd] hw_params REJECT: not exact -- channels [%u..%u] "
+                    "rate [%u..%u] period_size [%u..%u] buffer_size [%u..%u]\n",
+                    chan->min, chan->max, rate->min, rate->max,
+                    psz->min, psz->max, bsz->min, bsz->max);
             kfree(p); return -ABI_EINVAL;
         }
         g_sub.channels    = chan->min;
@@ -760,7 +1006,15 @@ struct file *lxsnd_open(const char *node) {
     int which;
     if (strcmp(n, "controlC0") == 0)      which = 0;
     else if (strcmp(n, "pcmC0D0p") == 0)  which = 1;
-    else return 0;
+    else {
+        kprintf("[snd] open REJECT unknown node '%s'\n", node);
+        return 0;
+    }
+    kprintf("[snd] open %s\n", node);
+    /* Reset on the PCM open, not the control open: chrome reopens
+     * controlC0 constantly, which kept resetting the window and hid
+     * the playback ioctls that actually matter. */
+    if (which == 1) g_trace_n = 0;
 
     if (which == 1) {
         if (g_sub.in_use) return 0;            /* single substream */

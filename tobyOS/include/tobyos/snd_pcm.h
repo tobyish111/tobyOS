@@ -8,8 +8,9 @@
 struct file;
 
 /* True once an HDA controller with a codec is bound. When false, opening
- * /dev/snd/* returns ENOENT -- exactly what a Linux box with no sound card
- * does, so alsa-lib reports "no such device" instead of failing deeper. */
+ * any node under /dev/snd returns ENOENT -- exactly what a Linux box with
+ * no sound card does, so alsa-lib reports "no such device" rather than
+ * failing somewhere deeper and stranger. */
 bool lxsnd_available(void);
 
 /* open("/dev/snd/controlC0" | "/dev/snd/pcmC0D0p") -> FILE_KIND_SND.

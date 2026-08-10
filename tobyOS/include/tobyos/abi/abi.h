@@ -116,6 +116,11 @@ extern "C" {
 #define ABI_ENAMETOOLONG    36   /* file name too long */
 #define ABI_ENOSYS          38   /* function not implemented */
 #define ABI_ENOTTY          25   /* not a typewriter (ioctl on non-tty) */
+/* Linux slice 1. Values are the Linux/x86-64 errno numbers, like every code
+ * above -- adding new ones is explicitly safe per the stability promise. */
+#define ABI_EINTR            4   /* interrupted system call */
+#define ABI_ENOTEMPTY       39   /* directory not empty (rmdir) */
+#define ABI_ENODEV          19   /* no such device / unknown filesystem type */
 
 /* ============================================================
  *  Process ABI personality (Track B: foreign-binary compat)
@@ -1001,8 +1006,26 @@ struct abi_vizmap {
     uint64_t addr[ABI_VIZMAP_MAX];  /* OUT: read-only user addresses        */
 };
 
+/* ---- Phase 3 slice 14: privilege drop for NATIVE processes ---------------
+ *
+ * The native ABI could read identity (ABI_SYS_GETUID/GETGID, 26/27) but had no way
+ * to CHANGE it -- the setuid family existed only in the Linux personality. That gap
+ * is what blocked slice 14: `chromewin` is a native app, Chromium refuses to enable
+ * its sandbox while running as root, and a native process had no way to stop being
+ * root before exec'ing the browser.
+ *
+ * Semantics deliberately match Linux setuid(2)/setgid(2) as implemented for the
+ * Linux personality in this same file, including the part that matters most:
+ * dropping from root to a non-root uid ALSO clears the capability set, so the drop
+ * is real rather than cosmetic. Sharing the semantics keeps one story for both
+ * personalities -- the thesis is one environment, not two credential models.
+ *
+ * a1 = target id. Returns 0, or -EPERM / -EINVAL. */
+#define ABI_SYS_SETUID          189
+#define ABI_SYS_SETGID          190
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          189
+#define ABI_SYS_NR_MAX          191
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

@@ -39,8 +39,23 @@
  *   /fat       FAT32  (GPT slot 3)
  *   /ext       ext4   (GPT slot 4, RO)
  *   /usb       FAT32  (USB MSC)
- * plus headroom for `mountfs /mnt ...` calls from the live shell. */
-#define VFS_MAX_MOUNTS 8
+ * plus headroom for `mountfs /mnt ...` calls from the live shell.
+ *
+ * Slice 9: 8 -> 16. The table is now PER MOUNT NAMESPACE, and a container that
+ * pivot_roots then mounts its own /proc, /sys, /dev, /dev/pts and /tmp needs
+ * five slots of its own on top of the three the boot namespace already uses
+ * (/, /proc, /data). At 8 that wall would have been hit by slice 16's container
+ * runtime rather than by anything diagnosable. Costs ~288 bytes per extra slot
+ * per namespace. */
+#define VFS_MAX_MOUNTS 16
+
+/* Slice 9: mount PROPAGATION type, per mount (Linux MS_PRIVATE/SHARED/SLAVE/
+ * UNBINDABLE). PRIVATE is 0 so it stays the default for every mount that
+ * existed before this slice, which is also Linux's default for a fresh mount. */
+#define VFS_PROP_PRIVATE     0u
+#define VFS_PROP_SHARED      1u
+#define VFS_PROP_SLAVE       2u
+#define VFS_PROP_UNBINDABLE  3u
 
 /* Result codes -- negative on error, 0 on success unless noted. */
 #define VFS_OK             0
@@ -55,7 +70,17 @@
 #define VFS_ERR_ROFS      -9   /* mount is read-only */
 #define VFS_ERR_NOSPC     -10  /* filesystem is full */
 #define VFS_ERR_NAMETOOLONG -11
-#define VFS_ERR_PERM      -12   /* permission denied (milestone 15) */
+#define VFS_ERR_PERM      -12   /* permission denied     -> EACCES */
+/* Slice 11: "operation not permitted" (EPERM), which is NOT the same answer as
+ * EACCES and cannot be folded into VFS_ERR_PERM.
+ *
+ * Found because /proc/PID/uid_map write refusals -- which Linux reports as
+ * EPERM, and which container runtimes test for -- came out of the VFS as EACCES:
+ * there was simply no code in this vocabulary that mapped to EPERM. That is the
+ * same class of bug slice 6 recorded in the other direction (a raw VFS_ERR_*
+ * escaping as an unrelated Linux errno); an error vocabulary that cannot express
+ * the answer will silently substitute a plausible one. */
+#define VFS_ERR_NOTPERM   -14   /* operation not permitted -> EPERM  */
 
 /* Permission "want" bits, passed to vfs_perm_check(). They are the
  * same shape as the low 3 bits of a Unix mode: 4=read, 2=write,
@@ -67,7 +92,16 @@
 /* Mode bits stored in struct vfs_stat / struct vfs_dirent. We mirror
  * the on-disk tobyfs values so callers can use one set of constants
  * across both filesystems. */
-#define VFS_MODE_PERMS   00777u
+/* Linux slice 2: widened 00777 -> 07777 so the setuid/setgid/sticky bits
+ * survive the VFS. They were previously masked off at every filesystem
+ * boundary, which meant execve could not see S_ISUID and a setuid binary was
+ * indistinguishable from an ordinary one. ext2/ext4 already stored the full
+ * i_mode -- only this mask was truncating it. Backward compatible: inodes
+ * written before this simply read the new bits as 0. */
+#define VFS_MODE_PERMS   07777u
+#define VFS_MODE_SETUID  04000u
+#define VFS_MODE_SETGID  02000u
+#define VFS_MODE_STICKY  01000u
 #define VFS_MODE_VALID   0x10000u
 
 enum vfs_type {
@@ -96,6 +130,20 @@ struct vfs_stat {
     uint32_t      uid;
     uint32_t      gid;
     uint32_t      mode;
+    /* Linux slice 6: timestamps, in UNIX EPOCH SECONDS.
+     *
+     * Slice 1 shipped utimensat as accept-and-do-nothing because there was
+     * nowhere to put a time: struct vfs_stat had no time fields at all, so
+     * every file reported 1970 and `ls -l`, tar, cp -p and apk all saw the
+     * same fixed date.
+     *
+     * EPOCH SECONDS, not tick counts: tobyfs stored `pit_ticks()` in its
+     * on-disk mtime, which is time since BOOT and resets every reboot -- a
+     * value that looks like a timestamp and is not one. Filesystems that have
+     * no times leave these 0, which stat emitters report as the epoch. */
+    uint64_t      mtime;       /* last data modification */
+    uint64_t      atime;       /* last access (best effort) */
+    uint64_t      ctime;       /* last inode change */
 };
 
 struct vfs_dirent {
@@ -139,6 +187,21 @@ struct vfs_ops {
     int  (*chmod)   (void *mnt, const char *path, uint32_t mode);
     int  (*chown)   (void *mnt, const char *path,
                      uint32_t uid, uint32_t gid);
+    /* Linux slice 6: set timestamps (epoch seconds). OPTIONAL -- a NULL entry
+     * means the filesystem cannot store them, and vfs_utimes() reports
+     * VFS_ERR_ROFS so utimensat can answer honestly instead of claiming a
+     * success it did not achieve. */
+    int  (*utimes)  (void *mnt, const char *path,
+                     uint64_t mtime, uint64_t atime);
+    /* Linux slice 6: set a file's length. OPTIONAL; NULL => VFS_ERR_ROFS.
+     * Slice 1's truncate(2) could only validate its arguments because there
+     * was no way to reach the on-disk size from a path. */
+    int  (*truncate)(void *mnt, const char *path, uint64_t length);
+    /* Linux slice 6: truncate an OPEN file. Needed separately from ->truncate
+     * because busybox's `truncate` (and CPython's os.ftruncate) act on an fd,
+     * not a path -- and the open handle is the only thing that knows which
+     * inode it refers to after the name may have changed. */
+    int  (*ftruncate)(struct vfs_file *f, uint64_t length);
     /* B20 (optional). Resolve a symlink that the driver synthesises
      * dynamically (e.g. procfs /proc/self, /proc/<pid>/exe), which the
      * static in-kernel symlink table can't represent. Gets the path
@@ -146,6 +209,11 @@ struct vfs_ops {
      * and returns VFS_OK, or VFS_ERR_NOENT/INVAL. NULL => the driver has
      * no synthetic symlinks. */
     int  (*readlink)(void *mnt, const char *path, char *buf, size_t bufsz);
+    /* Linux slice 7: create a PERSISTENT symlink on this filesystem. OPTIONAL;
+     * when NULL, vfs_symlink() falls back to the legacy in-RAM table (which is
+     * global, capped, and lost on reboot -- fine for the read-only initrd,
+     * useless for a real rootfs). */
+    int  (*symlink) (void *mnt, const char *path, const char *target);
     /* M26E (optional). Called by vfs_unmount AFTER the slot is removed
      * from the mount table. Drivers free their per-mount state here
      * (cluster buffers, FS scratch, etc). NULL => the VFS just drops
@@ -208,6 +276,49 @@ struct vfs_dir {
  * root mount; anything else (e.g. "/data") creates a sub-mount. Path
  * resolution always picks the longest matching mount-point prefix. */
 int  vfs_mount(const char *mount_point, const struct vfs_ops *ops, void *mount_data);
+
+/* ---- Per-mount security flags (Linux slice 2) -----------------------------
+ *
+ * Added BEFORE mount(2) exists (that is slice 5) and deliberately so. Slice 2
+ * made execve honour the set-user-ID bit, which is safe only while root is the
+ * only thing that can mount a filesystem. The moment userspace can mount, an
+ * attacker mounts an image containing a root-owned setuid shell and is done.
+ *
+ * Landing the flag plumbing now means slice 5's mount(2) only has to pass the
+ * user's flags through, rather than having to remember to invent this -- the
+ * enforcement point in sys_execve already reads them. */
+#define VFS_MNT_NOSUID   0x1u   /* ignore setuid/setgid bits on this mount */
+#define VFS_MNT_NODEV    0x2u   /* ignore device nodes                     */
+#define VFS_MNT_NOEXEC   0x4u   /* refuse to execute anything here         */
+#define VFS_MNT_RDONLY   0x8u   /* refuse writes                           */
+
+/* As vfs_mount(), but records mount flags. vfs_mount() is exactly this with
+ * flags == 0, so all 13 existing callers keep their current behaviour. */
+int  vfs_mount_flags(const char *mount_point, const struct vfs_ops *ops,
+                     void *mount_data, uint32_t flags);
+
+/* Look up the mount registered at EXACTLY `mount_point` (not the mount a path
+ * resolves through -- that is vfs_path_mount_flags). Used by mount(2) to
+ * re-register a mount with the caller's flags, and by MS_BIND to copy an
+ * existing mount's ops/data to a second point. VFS_OK, else VFS_ERR_NOMOUNT. */
+/* Linux slice 6: set a path's timestamps (epoch seconds). VFS_ERR_ROFS if the
+ * filesystem has no ->utimes, so callers can tell "stored" from "ignored". */
+int  vfs_utimes(const char *path, uint64_t mtime, uint64_t atime);
+
+/* Linux slice 6: set a path's length. VFS_ERR_ROFS if unsupported. */
+int  vfs_truncate(const char *path, uint64_t length);
+
+/* Linux slice 6: truncate via an OPEN file handle. Updates f->size on success
+ * so a subsequent fstat sees the new length. */
+int  vfs_file_truncate(struct vfs_file *f, uint64_t length);
+
+int  vfs_mount_lookup(const char *mount_point,
+                      const struct vfs_ops **ops_out, void **data_out);
+
+/* Flags of the mount that `path` resolves through (0 if unmounted/unknown).
+ * The enforcement points -- execve's setuid transition today, open/write and
+ * mknod later -- ask this rather than tracking mounts themselves. */
+uint32_t vfs_path_mount_flags(const char *path);
 bool vfs_is_mounted(void);
 void vfs_dump_mounts(void);
 
@@ -222,6 +333,26 @@ void vfs_dump_mounts(void);
  * `mount_point`, VFS_ERR_INVAL on a malformed path. The driver's
  * umount callback's return value is forwarded if non-zero. */
 int  vfs_unmount(const char *mount_point);
+
+/* ---- Slice 9: mount namespaces -------------------------------------------
+ * `struct mount_ns` stays private to vfs.c (the payload's owner keeps its own
+ * namespace struct -- same split as slice 8's uts/ipc). nsproxy.c drives the
+ * lifecycle through these; NULL always means the initial namespace.
+ *
+ * mount_ns_create() CLONES the caller's mount table, and preserves peer groups
+ * for SHARED mounts so propagation survives the unshare -- which is what makes
+ * MS_SHARED mean anything at all. */
+void    *mount_ns_create(void);
+void     mount_ns_get(void *ns);
+void     mount_ns_put(void *ns);
+uint64_t mount_ns_inum(void *ns);
+
+/* mount --make-{shared,private,slave,unbindable} [-R]; `prop` is VFS_PROP_*. */
+int  vfs_set_propagation(const char *mount_point, uint32_t prop, bool recursive);
+bool vfs_mount_is_unbindable(const char *mount_point);
+
+/* pivot_root(2). Requires a non-initial mount namespace -- see vfs.c. */
+int  vfs_pivot_root(const char *new_root, const char *put_old);
 
 /* M26E: walk every entry in the mount table. Stops early if `cb`
  * returns false. The callback gets a NUL-terminated normalised mount

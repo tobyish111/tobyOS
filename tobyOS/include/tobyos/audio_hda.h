@@ -114,6 +114,12 @@ int  audio_hda_tone_selftest(char *msg, size_t cap);
  * write() returns a SHORT count (possibly 0) when the ring is full rather
  * than blocking, so the caller controls its own waiting -- the same
  * contract as ALSA's snd_pcm_writei against avail_update. */
+/* Total bytes in the cyclic DMA buffer. Exported so the ALSA layer can
+ * advertise a buffer_size the hardware can actually hold -- promising more
+ * than this makes hw_params self-contradictory and clients fail with a
+ * bare EINVAL. Must track HDA_PCM_PERIODS * HDA_PCM_PERIOD_BYTES. */
+#define HDA_PCM_RING_BYTES  (4u * 4096u)
+
 int      audio_hda_pcm_open(uint32_t rate, uint8_t channels);
 long     audio_hda_pcm_write(const int16_t *src, size_t frames);
 long     audio_hda_pcm_free(void);      /* frames of space available NOW  */

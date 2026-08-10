@@ -13,6 +13,7 @@
 
 #include <tobyos/oom.h>
 #include <tobyos/proc.h>
+#include <tobyos/cgroup.h>
 #include <tobyos/pmm.h>
 #include <tobyos/vmm.h>
 #include <tobyos/printk.h>
@@ -88,6 +89,11 @@ void oom_kill(struct proc *p) {
             (unsigned long)p->user_pages);
 
     g_last_killed_pid = p->pid;
+    /* Slice 16: memory.events oom_kill. Now meaningful because oom.c's victim
+     * score reads p->user_pages, which this slice turned from a spawn-time
+     * estimate into a maintained count -- the killer was previously ranking
+     * every process by the same fabricated number. */
+    cgroup_mem_note_oom_kill(p);
 
     /* Send SIGKILL to the process */
     p->pending_signals |= (1u << 9); /* SIGKILL = signal 9 */

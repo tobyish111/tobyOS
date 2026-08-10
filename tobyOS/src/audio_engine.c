@@ -464,6 +464,25 @@ void audio_engine_tick(void) {
     if (!g_audio_engine_ready) return;
     if (!audio_hda_pcm_is_open()) return;
 
+    /* ONLY service a stream this engine actually owns.
+     *
+     * The HDA ring can also be opened straight from the ALSA layer
+     * (snd_pcm.c calls audio_hda_pcm_open on HW_PARAMS), and then these
+     * samples are not ours to write. Filling silence regardless kept the
+     * ring permanently full of zeros: chrome's snd_pcm_writei got EAGAIN
+     * forever, its audio clock froze (AudioContext currentTime stuck at
+     * 0.47 while state stayed "running"), SyncReader timed out, and the
+     * capture was 30 seconds of digital silence from a stream that was
+     * genuinely running. Nothing looked broken anywhere -- which is what
+     * made it expensive.
+     *
+     * /bin/linux-alsatest never hit this only because the boot harness
+     * runs before idle_loop exists, so the tick was not yet alive. */
+    bool mine = false;
+    for (int i = 0; i < AUDIO_MAX_STREAMS; i++)
+        if (g_audio_streams[i].state != AUDIO_STREAM_FREE) { mine = true; break; }
+    if (!mine) return;
+
     if (audio_engine_pump() > 0) return;      /* real audio went out */
 
     /* Nothing to mix: keep the ring topped up with silence rather than

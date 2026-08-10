@@ -20,6 +20,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/swap.h>
 #include <tobyos/apic.h>     /* tlb_shootdown_remote */
+#include <tobyos/cgroup.h>   /* slice 16: the user-page charge funnel */
 
 /* One refcount slot per MANAGED physical frame, sized from the PMM at
  * init. This used to be a fixed 256K-slot static array (1 GiB of
@@ -104,6 +105,17 @@ uint64_t *get_pte(uint64_t cr3, uint64_t virt_addr) {
 /* ---- COW page copy ---- */
 
 bool cow_copy_page(uint64_t old_phys, uint64_t *pte) {
+    /* Slice 16: NOT charged, and that is the correct answer, not an omission.
+     *
+     * Breaking CoW is charge-NEUTRAL for this process: it already paid for this
+     * page (the fork paths bulk-charge the child for every inherited page), and
+     * here it exchanges its share of `old_phys` for a private `new_phys`. Charging
+     * again counts the same page twice.
+     *
+     * Charging it here was tried, and bit7 of linux-cgroup2 caught it as a steady
+     * 2-pages-per-fork-cycle drift in memory.current -- because the old page is
+     * released below via page_ref_dec/pmm_free_page, a path with no uncharge. The
+     * leak was invisible in every other bit. */
     uint64_t new_phys = pmm_alloc_page();
     if (!new_phys) return false;
 
@@ -211,7 +223,9 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
 
     /* Case 2: Demand-zero fault -- PTE marked DEMAND but not present */
     if (pte && !(*pte & PTE_PRESENT) && (*pte & PTE_DEMAND)) {
-        uint64_t new_phys = pmm_alloc_page();
+        /* Slice 16: charged -- this is THE demand-fault path for a PTE_DEMAND
+         * mapping, and it is where a growing process actually gets its memory. */
+        uint64_t new_phys = mm_user_page_alloc(p);
         if (!new_phys) return false;
 
         uint64_t hhdm = vmm_hhdm_offset();
@@ -274,7 +288,7 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
 
         /* File-backed mmap: read page from disk */
         if (v->flags & VMA_FILE) {
-            uint64_t new_phys = pmm_alloc_page();
+            uint64_t new_phys = mm_user_page_alloc(p);   /* slice 16: charged */
             if (!new_phys) return false;
 
             uint64_t hhdm = vmm_hhdm_offset();
@@ -296,7 +310,7 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
         }
 
         /* Anonymous mapping: allocate zero page */
-        uint64_t new_phys = pmm_alloc_page();
+        uint64_t new_phys = mm_user_page_alloc(p);       /* slice 16: charged */
         if (!new_phys) return false;
 
         uint64_t hhdm = vmm_hhdm_offset();
@@ -350,12 +364,12 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
             uint64_t *epte = get_pte(p->cr3, va);
             if (epte && (*epte & PTE_PRESENT)) continue;
 
-            uint64_t new_phys = pmm_alloc_page();
+            uint64_t new_phys = mm_user_page_alloc(p);   /* slice 16: charged */
             if (!new_phys) { ok = false; break; }
             memset((void *)(new_phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
             if (!vmm_map(va, new_phys, PAGE_SIZE,
                          VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
-                pmm_free_page(new_phys);
+                mm_user_page_free(p, new_phys);          /* slice 16 */
                 ok = false;
                 break;
             }

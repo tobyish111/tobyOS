@@ -12,6 +12,7 @@
 #include <tobyos/tcp.h>
 #include <tobyos/net.h>
 #include <tobyos/proc.h>
+#include <tobyos/nsproxy.h>   /* net_ns_has_network (slice 12) */
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/heap.h>
@@ -120,11 +121,15 @@ struct sock *sock_alloc(int kind) {
              * mistakable for the socket that previously lived here. Starts
              * at 1 -- gen 0 means "never linked" in peer_gen. */
             g_socks[i].gen    = ++g_sock_gen;
-            {   /* slice 81: latch creator creds for SO_PEERCRED */
+            {   /* slice 81: latch creator creds for SO_PEERCRED
+                 * slice 12: and the creator's NETWORK namespace, which is what
+                 * every network operation on this socket is then checked
+                 * against (see net_ns_has_network). */
                 struct proc *cp = current_proc();
                 g_socks[i].cr_pid = cp ? cp->pid : 0;
                 g_socks[i].cr_uid = cp ? (uint32_t)cp->uid : 0;
-                g_socks[i].cr_gid = cp ? (uint32_t)cp->gid : 0; }
+                g_socks[i].cr_gid = cp ? (uint32_t)cp->gid : 0;
+                g_socks[i].net_ns = cp ? cp->net_ns : 0; }
             g_socks[i].recv_timeout_ms = 30000;
             g_socks[i].send_timeout_ms = 30000;
             return &g_socks[i];
@@ -253,6 +258,17 @@ void sock_deliver(struct sock *s,
                   uint32_t src_ip_be, uint16_t src_port_be,
                   const void *payload, size_t len) {
     if (!s || !s->in_use) return;
+    /* Slice 12: packets arriving from a real NIC belong to the INITIAL network
+     * namespace. Delivering them to a socket created in an empty namespace would
+     * make the isolation one-directional -- the sandbox could not send, but could
+     * still receive, which is the half that leaks data IN. Sockets in a
+     * non-initial namespace are therefore never a delivery target.
+     *
+     * Note this is the inbound mirror of the connect/sendto gates, and it has to
+     * be here rather than at the port-matching scan: sock_deliver is the single
+     * funnel every inbound datagram passes through (udp_recv calls it), so one
+     * check covers every source. */
+    if (!net_ns_has_network(s->net_ns)) return;
     if (len > ETH_MTU) len = ETH_MTU;
 
     if (s->count == SOCK_RX_DGRAMS) {

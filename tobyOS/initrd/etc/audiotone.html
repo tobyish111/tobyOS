@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>tobyOS audio slice 5</title>
+<style>
+  body { background:#101418; color:#e6edf3; font:16px/1.5 sans-serif;
+         margin:0; padding:32px; }
+  h1   { font-size:22px; margin:0 0 16px; }
+  #s   { font:28px/1.4 monospace; color:#7ee787; margin-top:24px; }
+  .n   { color:#8b949e; font-size:14px; }
+</style></head>
+<body>
+<h1>tobyOS &mdash; Chromium audio</h1>
+<p class="n">Web Audio oscillator at 1000&nbsp;Hz, the same tone
+   /bin/audioplay and /bin/linux-alsatest emit, so all four paths land as
+   comparable bursts in one QEMU wav capture.</p>
+<div id="s">starting&hellip;</div>
+
+<script>
+// A plain oscillator rather than a media file: it exercises the audio
+// output path only -- no demuxer, no codec, no network -- so a failure
+// here is unambiguously about reaching the device. Chrome is launched
+// with --autoplay-policy=no-user-gesture-required, so the context is
+// allowed to start without a click.
+var s = document.getElementById('s');
+function log(t) { s.textContent = t; console.log('[TONE] ' + t); }
+
+try {
+  var AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) { log('FAIL: no AudioContext'); }
+  else {
+    var ctx = new AC({ sampleRate: 48000 });
+    var osc = ctx.createOscillator();
+    var g   = ctx.createGain();
+    osc.type = 'square';            // matches the square waves elsewhere
+    osc.frequency.value = 1000;
+    g.gain.value = 0.30;            // well under clipping
+    osc.connect(g); g.connect(ctx.destination);
+    osc.start();
+
+    // The context can be created "suspended"; resume() is what actually
+    // opens the output stream, and its promise is the honest signal that
+    // the device accepted us.
+    var r = ctx.resume ? ctx.resume() : null;
+    if (r && r.then) {
+      r.then(function () {
+        log('PLAYING 1000 Hz  state=' + ctx.state +
+            ' rate=' + ctx.sampleRate);
+      }, function (e) {
+        log('FAIL: resume rejected: ' + e);
+      });
+    } else {
+      log('PLAYING 1000 Hz  state=' + ctx.state);
+    }
+    setInterval(function () {
+      console.log('[TONE] state=' + ctx.state +
+                  ' t=' + ctx.currentTime.toFixed(2));
+    }, 1000);
+  }
+} catch (e) {
+  log('FAIL: ' + e);
+}
+</script>
+</body>
+</html>

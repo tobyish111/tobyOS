@@ -268,8 +268,22 @@ void _start(void) {
     if (hw.intervals[IV_PERIOD_BYTES].min != PERIOD * CHANS * 2) {
         put("[LXSND] period_bytes not derived\n"); goto fail;
     }
-    if (hw.intervals[IV_PERIOD_TIME].min != (PERIOD * 1000000u) / RATE) {
-        put("[LXSND] period_time not derived\n"); goto fail;
+    /* period_time is derived, but NOT to the microsecond: the frames<->us
+     * conversion is lossy both ways and the kernel deliberately reports a
+     * unit of slack, because alsa-lib's own rounding can disagree by one
+     * and an exact answer then leaves an empty interval (that cost slice 4
+     * a real EINVAL on a perfectly achievable configuration). So assert
+     * the value is CLOSE, not equal -- demanding equality here would be
+     * asserting a bug back into existence. */
+    {
+        u32 want = (PERIOD * 1000000u) / RATE;
+        u32 got  = hw.intervals[IV_PERIOD_TIME].min;
+        u32 diff = got > want ? got - want : want - got;
+        if (diff > 2) {
+            put("[LXSND] period_time not derived (want ~"); putn(want);
+            put(", got "); putn(got); put(")\n");
+            goto fail;
+        }
     }
 
     /* ---- 10. SW_PARAMS ---- */

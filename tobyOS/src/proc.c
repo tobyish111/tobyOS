@@ -50,6 +50,7 @@
 #include <tobyos/signal.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
+#include <tobyos/cgroup.h>   /* slice 16: the user-page charge funnel */
 #include <tobyos/page_fault.h>   /* page_ref_* for CoW-aware brk shrink */
 #include <tobyos/apic.h>         /* tlb_shootdown_remote */
 #include <tobyos/heap.h>
@@ -68,6 +69,7 @@
 #include <tobyos/cap.h>
 #include <tobyos/perf.h>
 #include <tobyos/rng.h>
+#include <tobyos/nsproxy.h>   /* nsproxy_release (slice 8) */
 
 /* Asm helpers from proc_switch.S. */
 extern __attribute__((noreturn)) void proc_enter_user_asm(uint64_t rip,
@@ -525,7 +527,7 @@ static bool build_user_stack(struct proc *p) {
     p->user_stack_pages = USER_STACK_PAGES;
 
     for (size_t i = 0; i < USER_STACK_PAGES; i++) {
-        uint64_t phys = pmm_alloc_page();
+        uint64_t phys = mm_user_page_alloc(p);      /* slice 16: charged */
         if (phys == 0) {
             kprintf("[proc] OOM allocating user stack page %lu/%d\n",
                     (unsigned long)i, USER_STACK_PAGES);
@@ -666,6 +668,40 @@ static int spawn_internal(const char *path, const char *name,
         p->session_id = parent ? parent->session_id : 0;
         p->uid        = parent ? parent->uid        : 0;
         p->gid        = parent ? parent->gid        : 0;
+        /* Linux slice 1: umask is inherited, like uid/gid. 0022 for a
+         * parentless (kernel-spawned) proc -- the conventional default. */
+        p->umask      = parent ? parent->umask      : 0022u;
+        /* Linux slice 2: the rest of the credential set is inherited too.
+         * A plain spawn is not a privilege transition, so real/effective/saved
+         * all agree on entry -- exactly what fork(2) gives you. execve may
+         * then raise them if the image is setuid (see execve_apply_setid).
+         *
+         * All three are seeded from the INHERITED EFFECTIVE ids, never from
+         * the parent's real ids. That distinction is load-bearing, not
+         * stylistic: the desktop launcher (gui.c) and session code (kernel.c)
+         * both temporarily flip pid 0's EFFECTIVE uid to the logged-in user
+         * around a spawn and restore it afterwards. Copying parent->ruid there
+         * would hand the child real=root with effective=user -- and setuid(2)
+         * lets any process return to its real uid, so the user's app could
+         * simply setuid(0) and be root. Seeding from effective closes that.
+         *
+         * fork(2) is unaffected and correct already: it memcpy's the whole PCB,
+         * so a forked child inherits the parent's genuine triple. */
+        p->ruid       = p->uid;
+        p->rgid       = p->gid;
+        p->suid       = p->uid;
+        p->sgid       = p->gid;
+        p->ngroups    = parent ? parent->ngroups : 0;
+        for (int gi = 0; gi < p->ngroups && gi < PROC_NGROUPS_MAX; gi++)
+            p->groups[gi] = parent->groups[gi];
+        /* Linux capabilities: root gets the full set, everyone else none.
+         * This mirrors the "uid 0 bypasses every check" rule the VFS already
+         * follows, expressed in the ABI's own terms. */
+        if (p->uid == 0) {
+            p->lcap_eff = p->lcap_perm = p->lcap_inh = ~0ull;
+        } else {
+            p->lcap_eff = p->lcap_perm = p->lcap_inh = 0;
+        }
         /* Milestone 18: inherit capability mask + sandbox root from
          * parent. A NULL parent shouldn't be reachable in practice
          * (spawn_internal runs in the context of a live proc) but we
@@ -1003,11 +1039,16 @@ static int spawn_internal(const char *path, const char *name,
     p->state = PROC_READY;
     sched_enqueue(p);
 
-    /* Milestone 19: approximate RSS -- we only count the pages we
-     * explicitly mapped for this proc (user stack + vmm-style page
-     * walk over the user half is expensive). This is "user_pages",
-     * i.e. a lower bound on resident set size. Enough for ps/top. */
-    p->user_pages = p->user_stack_pages + 1 /* rough elf overhead */;
+    /* SLICE 16: user_pages is now MAINTAINED, not estimated.
+     *
+     * It used to be assigned here, once, as user_stack_pages plus one page of
+     * "rough elf overhead", and never updated again -- so `ps` reported a constant
+     * RSS for every process no matter what it mapped, and anything built on it
+     * (oom.c's
+     * victim score) was scoring a fabricated number. The counter is now bumped by
+     * mm_user_page_alloc / mm_user_page_free at every user-page event, so this
+     * assignment MUST NOT clobber what the stack build already charged. */
+    (void)0;   /* user_pages accumulated by the funnel; nothing to assign */
 
     /* Milestone 19 metric: another proc spawned. */
     perf_count_proc_spawn();
@@ -1229,6 +1270,10 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
                 if (q->kstack_base) kfree(q->kstack_base);
                 q->kstack_base = 0;
                 q->kstack_top  = 0;
+                /* Slice 8: this path frees the slot WITHOUT going through
+                 * proc_reap, so it owes the namespace release itself -- a
+                 * thread holds its own reference (sys_clone_thread takes one). */
+                nsproxy_release(q);
                 q->state = PROC_UNUSED;
             } else {
                 /* Leader: close shared fds; leave TERMINATED for wait/reap.
@@ -1287,6 +1332,40 @@ __attribute__((noreturn)) void proc_exit(int code) {
         (void)futex((uint32_t *)(uintptr_t)p->clear_child_tid, FUTEX_WAKE, 1,
                     0, 0);
         p->clear_child_tid = 0;
+    }
+
+    /* ---- Slice 10: PID-namespace exit semantics --------------------------
+     * Deliberately BEFORE cli(): both branches call signal_send(), which does
+     * wait_queue_unlink() + sched_enqueue() on the run queue. Doing that from a
+     * cli()/IRQ context deadlocked the whole machine once (see the alarm-scan
+     * placement note in signal.c) -- so this runs in ordinary process context
+     * with interrupts on, exactly like sys_kill does.
+     *
+     * Both branches are no-ops in the initial namespace. */
+    if (p && !p->is_thread) {
+        if (pid_ns_is_init(p)) {
+            /* Linux ties a pid namespace's lifetime to its init: when init
+             * exits, every other member is SIGKILLed. Without this a container
+             * whose init died would leave its processes running, still
+             * invisible to the host's pid view -- unkillable by name. */
+            pid_ns_kill_members(p);
+        } else {
+            /* Orphans inside a namespace reparent to that namespace's init,
+             * not to the host's. Scoped to non-initial namespaces on purpose:
+             * the initial namespace has never reparented orphans in this
+             * kernel, and changing that as a side effect of a namespace slice
+             * is a behaviour change nobody asked for (recorded as an open
+             * item instead). */
+            int reaper = pid_ns_reaper_kpid(p);
+            if (reaper) {
+                for (int i = 1; i < PROC_MAX; i++) {
+                    struct proc *q = &g_proc[i];
+                    if (q == p || q->state == PROC_UNUSED ||
+                        q->state == PROC_EMBRYO) continue;
+                    if (q->ppid == p->pid) q->ppid = reaper;
+                }
+            }
+        }
     }
 
     cli();
@@ -1348,6 +1427,7 @@ __attribute__((noreturn)) void proc_exit(int code) {
                 if (q->kstack_base) kfree(q->kstack_base);
                 q->kstack_base = 0;
                 q->kstack_top  = 0;
+                nsproxy_release(q);       /* slice 8 -- bypasses proc_reap */
                 q->state = PROC_UNUSED;
             }
         }
@@ -1409,6 +1489,15 @@ static void proc_reap(struct proc *p) {
     { extern void poll_forget_proc(struct proc *);  poll_forget_proc(p);  }
     proc_wait_off_cpu(p);
 
+    /* SLICE 16: return this process's whole memory charge to its cgroup.
+     *
+     * Done from the process's OWN counter rather than by counting frames during
+     * the page-table walk, so it is correct no matter which path released the
+     * pages -- including vmm_destroy_user_pml4's bulk walk below, which frees the
+     * user half without visiting the accounting at all. A per-frame uncharge there
+     * would also double-count the pages a thread shares with its leader. */
+    mm_user_pages_release_all(p);
+
     /* Tear down the address space only when NOBODY else is still in it.
      *
      * Threads share their leader's cr3 with owns_pml4 == false, and a thread
@@ -1460,6 +1549,12 @@ static void proc_reap(struct proc *p) {
     if (p->kstack_base) {
         kfree(p->kstack_base);
     }
+
+    /* Slice 8: drop this process's namespace references. Must happen before
+     * the memset below, which would otherwise lose the pointers and leak the
+     * objects. nsproxy_release NULLs as it goes, so the two thread-teardown
+     * paths that also call it cannot double-free. */
+    nsproxy_release(p);
 
     int pid = p->pid;
 #ifdef CHROMIUM_BOOT
@@ -1608,7 +1703,7 @@ uint64_t proc_brk(struct proc *p, uint64_t new_brk) {
     if (growing) {
         /* Map [old_aligned, new_aligned). */
         for (uint64_t va = old_aligned; va < new_aligned; va += PAGE_SIZE) {
-            uint64_t phys = pmm_alloc_page();
+            uint64_t phys = mm_user_page_alloc(p);  /* slice 16: charged */
             if (phys == 0) {
                 /* OOM partway through: roll back the pages we just
                  * mapped so the proc's address space stays consistent

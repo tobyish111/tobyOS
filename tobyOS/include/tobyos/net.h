@@ -92,6 +92,23 @@ uint16_t net_udp_checksum(uint32_t src_ip_be, uint32_t dst_ip_be,
 
 /* Pretty-print: writes "a.b.c.d" (max 16 bytes incl. NUL) to dst. */
 void net_format_ip (char dst[16], uint32_t ip_be);
+
+/* ---- Slice 12 cut 2: the namespace-relative address ---------------------
+ * g_my_ip stays the INITIAL namespace's address (DHCP writes it, ifconfig reads
+ * it). These return the CALLER's / RECEIVER's namespace address instead, falling
+ * back to g_my_ip -- so the wire path is unchanged and a namespace with a veth
+ * end answers for its own address only. */
+uint32_t net_my_ip(void);
+uint32_t net_my_netmask(void);
+const uint8_t *net_my_mac(void);   /* the transmitting interface's MAC */
+
+/* veth (src/veth.c). Pairs are created by kernel call: there is no netlink
+ * RTM_NEWLINK handling, so `ip link add ... type veth` is NOT available -- see
+ * the header comment in veth.c for why that is a separate slice. A NULL ns means
+ * the initial namespace, and that end is registered as an ordinary interface. */
+long netns_veth_pair(void *ns_a, uint32_t ip_a, void *ns_b, uint32_t ip_b,
+                     uint32_t mask);
+void netns_veth_stats(void *ns, uint32_t *tx, uint32_t *rx);
 /* Pretty-print: writes "aa:bb:cc:dd:ee:ff" (max 18 bytes incl. NUL). */
 void net_format_mac(char dst[18], const uint8_t mac[ETH_ADDR_LEN]);
 

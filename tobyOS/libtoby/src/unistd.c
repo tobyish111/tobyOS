@@ -361,6 +361,21 @@ uid_t geteuid(void) { return (uid_t)toby_sc0(ABI_SYS_GETUID); }
 gid_t getgid(void)  { return (gid_t)toby_sc0(ABI_SYS_GETGID); }
 gid_t getegid(void) { return (gid_t)toby_sc0(ABI_SYS_GETGID); }
 
+/* Slice 14: the native ABI could READ identity but never change it, which is why
+ * chromewin (a native app) could not stop being root before exec'ing Chromium --
+ * and Chromium refuses to enable its sandbox as root. Errors come back as a
+ * negative return; mapped to -1/errno the way the rest of this file does it. */
+int setuid(uid_t uid) {
+    long r = toby_sc1(ABI_SYS_SETUID, (long)(unsigned)uid);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 0;
+}
+int setgid(gid_t gid) {
+    long r = toby_sc1(ABI_SYS_SETGID, (long)(unsigned)gid);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 0;
+}
+
 /* ---- socket API ------------------------------------------------- */
 
 int socket(int domain, int type, int protocol) {

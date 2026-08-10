@@ -115,6 +115,13 @@ C_SRCS := src/kernel.c \
           src/mmap.c \
           src/fork.c \
           src/shm.c \
+          src/nsproxy.c \
+          src/pid_ns.c \
+          src/user_ns.c \
+          src/net_ns.c \
+          src/veth.c \
+          src/seccomp.c \
+          src/cgroup.c \
           src/xserver.c \
           src/unix_socket.c \
           src/sysfs.c \
@@ -411,6 +418,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_gui_edit/user_gui_edit.elf \
             programs/user_abi_test/user_abi_test.elf \
             programs/c_hello/c_hello.elf \
+            programs/nsetuid/nsetuid.elf \
             programs/c_args/c_args.elf \
             programs/c_filedemo/c_filedemo.elf \
             programs/c_alloctest/c_alloctest.elf \
@@ -1419,6 +1427,8 @@ programs/user_oh264test/user_oh264test.elf: programs/user_oh264test/user_oh264te
 	      $(LIBTOBY_CRT0) programs/user_oh264test/user_oh264test.o $(LIBTOBY_AR)
 
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_hello,c_hello))
+# Slice 14: native privilege-drop proof (ABI_SYS_SETUID).
+$(eval $(call LIBTOBY_PROGRAM_RULES,nsetuid,nsetuid))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_args,c_args))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_filedemo,c_filedemo))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_alloctest,c_alloctest))
@@ -2545,7 +2555,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                 initrd/etc/c19b.lua \
                 initrd/etc/c20.lua \
                 initrd/etc/c21.lua \
-               initrd/etc/motd initrd/etc/anim.html initrd/etc/webgl.html initrd/etc/input.html initrd/etc/input2.html initrd/etc/fonttest.html initrd/etc/start.html initrd/etc/egl_vendor.json \
+               initrd/etc/motd initrd/etc/anim.html initrd/etc/webgl.html initrd/etc/input.html initrd/etc/input2.html initrd/etc/fonttest.html initrd/etc/audiotone.html initrd/etc/start.html initrd/etc/egl_vendor.json \
                initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
                initrd/etc/Lato-BoldItalic.ttf initrd/etc/fallback.otf \
@@ -2573,6 +2583,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/input.html                 $(INITRD_STAGE)/etc/input.html
 	cp initrd/etc/input2.html                $(INITRD_STAGE)/etc/input2.html
 	cp initrd/etc/fonttest.html             $(INITRD_STAGE)/etc/fonttest.html
+	cp initrd/etc/audiotone.html            $(INITRD_STAGE)/etc/audiotone.html
 	cp initrd/etc/start.html                $(INITRD_STAGE)/etc/start.html
 	cp initrd/etc/egl_vendor.json            $(INITRD_STAGE)/etc/egl_vendor.json
 	cp initrd/etc/Lato-Regular.ttf           $(INITRD_STAGE)/etc/Lato-Regular.ttf
@@ -2621,6 +2632,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_gui_edit/user_gui_edit.elf       $(INITRD_STAGE)/bin/gui_edit
 	cp programs/user_abi_test/user_abi_test.elf       $(INITRD_STAGE)/bin/abi_test
 	cp programs/c_hello/c_hello.elf                   $(INITRD_STAGE)/bin/c_hello
+	cp programs/nsetuid/nsetuid.elf                   $(INITRD_STAGE)/bin/nsetuid
 	cp programs/c_args/c_args.elf                     $(INITRD_STAGE)/bin/c_args
 	cp programs/c_filedemo/c_filedemo.elf             $(INITRD_STAGE)/bin/c_filedemo
 	cp programs/c_alloctest/c_alloctest.elf           $(INITRD_STAGE)/bin/c_alloctest
@@ -2858,6 +2870,90 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "/etc/drvtest_now baked into initrd";                        \
 	    EXTRA_FILES="$$EXTRA_FILES etc/drvtest_now";                      \
 	fi;                                                                   \
+	if [ -f programs/linux-cred/linux-cred.elf ]; then                    \
+	    cp programs/linux-cred/linux-cred.elf                             \
+	         $(INITRD_STAGE)/bin/linux-cred;                              \
+	    echo "[initrd] staged linux-cred (slice 2 POSIX credentials proof)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cred";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-suid/linux-suid.elf ]; then                    \
+	    cp programs/linux-suid/linux-suid.elf                             \
+	         $(INITRD_STAGE)/bin/linux-suid;                              \
+	    echo "[initrd] staged linux-suid (slice 2 setuid-on-exec proof)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-suid";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-timers/linux-timers.elf ]; then                \
+	    cp programs/linux-timers/linux-timers.elf                         \
+	         $(INITRD_STAGE)/bin/linux-timers;                            \
+	    echo "[initrd] staged linux-timers (slice 3 timerfd/signalfd proof)";\
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-timers";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-mount/linux-mount.elf ]; then                  \
+	    cp programs/linux-mount/linux-mount.elf                           \
+	         $(INITRD_STAGE)/bin/linux-mount;                             \
+	    echo "[initrd] staged linux-mount (slice 5 mount/chroot proof)";  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-mount";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-ns/linux-ns.elf ]; then                        \
+	    cp programs/linux-ns/linux-ns.elf                                 \
+	         $(INITRD_STAGE)/bin/linux-ns;                                \
+	    echo "[initrd] staged linux-ns (slice 8 UTS+IPC namespace proof)";\
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ns";                         \
+	fi;                                                                   \
+	if [ -f programs/linux-cgroup/linux-cgroup.elf ]; then                 \
+	    cp programs/linux-cgroup/linux-cgroup.elf                          \
+	         $(INITRD_STAGE)/bin/linux-cgroup;                             \
+	    echo "[initrd] staged linux-cgroup (slice 15 cgroup v2 proof)";    \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cgroup";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-cgroup2/linux-cgroup2.elf ]; then               \
+	    cp programs/linux-cgroup2/linux-cgroup2.elf                        \
+	         $(INITRD_STAGE)/bin/linux-cgroup2;                            \
+	    echo "[initrd] staged linux-cgroup2 (slice 16 memory+io proof)";   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cgroup2";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-seccomp/linux-seccomp.elf ]; then               \
+	    cp programs/linux-seccomp/linux-seccomp.elf                        \
+	         $(INITRD_STAGE)/bin/linux-seccomp;                            \
+	    echo "[initrd] staged linux-seccomp (slice 13 seccomp-bpf proof)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-seccomp";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-netns/linux-netns.elf ]; then                   \
+	    cp programs/linux-netns/linux-netns.elf                            \
+	         $(INITRD_STAGE)/bin/linux-netns;                              \
+	    echo "[initrd] staged linux-netns (slice 12 net ns proof)";        \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-netns";                       \
+	fi;                                                                    \
+	if [ -f programs/linux-userns/linux-userns.elf ]; then                 \
+	    cp programs/linux-userns/linux-userns.elf                          \
+	         $(INITRD_STAGE)/bin/linux-userns;                             \
+	    echo "[initrd] staged linux-userns (slice 11 user ns proof)";      \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-userns";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-mntns/linux-mntns.elf ]; then                  \
+	    cp programs/linux-mntns/linux-mntns.elf                           \
+	         $(INITRD_STAGE)/bin/linux-mntns;                             \
+	    echo "[initrd] staged linux-mntns (slice 9 mount namespace proof)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-mntns";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-pidns/linux-pidns.elf ]; then                  \
+	    cp programs/linux-pidns/linux-pidns.elf                           \
+	         $(INITRD_STAGE)/bin/linux-pidns;                             \
+	    echo "[initrd] staged linux-pidns (slice 10 PID namespace proof)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-pidns";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-alpinerun/linux-alpinerun.elf ]; then          \
+	    cp programs/linux-alpinerun/linux-alpinerun.elf                   \
+	         $(INITRD_STAGE)/bin/linux-alpinerun;                         \
+	    echo "[initrd] staged linux-alpinerun (slice 7 non-root proof)";  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-alpinerun";                  \
+	fi;                                                                   \
+	if [ -f programs/alpine/alpine-minirootfs-3.19.0-x86_64.tar.gz ]; then\
+	    cp programs/alpine/alpine-minirootfs-3.19.0-x86_64.tar.gz         \
+	         $(INITRD_STAGE)/alpine.tar.gz;                               \
+	    echo "[initrd] staged alpine minirootfs (slice 7 distro milestone)";\
+	    EXTRA_FILES="$$EXTRA_FILES alpine.tar.gz";                        \
+	fi;                                                                   \
 	if [ -f programs/linux-glibc-dyn/linux-glibc-dyn.elf ] &&            \
 	   [ -f programs/linux-glibc-dyn/lib/libc.so.6 ] &&                  \
 	   [ -f programs/linux-glibc-dyn/lib/ld-linux-x86-64.so.2 ]; then    \
@@ -2873,6 +2969,19 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] Track B/B26: bundling DYNAMIC glibc proof +"      \
 	         "ld-linux-x86-64.so.2 + libc.so.6/libm.so.6 -- OPT-IN";     \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-glibc-dyn lib/ld-linux-x86-64.so.2 lib/libc.so.6 lib/libm.so.6"; \
+	fi;                                                                   \
+	if [ -f programs/alsa/libasound.so.2 ] &&                            \
+	   [ -d programs/alsa/alsa-share ] &&                                \
+	   [ -f programs/linux-alsatest/linux-alsatest.elf ]; then           \
+	    mkdir -p $(INITRD_STAGE)/lib $(INITRD_STAGE)/usr/share;          \
+	    cp programs/alsa/libasound.so.2 $(INITRD_STAGE)/lib/;            \
+	    cp -r programs/alsa/alsa-share $(INITRD_STAGE)/usr/share/alsa;   \
+	    cp programs/alsa/asound.conf $(INITRD_STAGE)/etc/asound.conf;    \
+	    cp programs/linux-alsatest/linux-alsatest.elf                    \
+	         $(INITRD_STAGE)/bin/linux-alsatest;                         \
+	    echo "[initrd] audio slice 4: bundling UNMODIFIED alsa-lib +"  \
+	         "/usr/share/alsa + linux-alsatest -- OPT-IN";             \
+	    EXTRA_FILES="$$EXTRA_FILES lib/libasound.so.2 usr/share/alsa etc/asound.conf bin/linux-alsatest"; \
 	fi;                                                                   \
 	if [ -f programs/linux-egltest/linux-egltest.elf ]; then              \
 	    cp programs/linux-egltest/linux-egltest.elf                       \
@@ -3116,6 +3225,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/devmgr bin/diskmgr bin/eventview bin/mediaplayer bin/chromewin \
 	    bin/xdg-settings \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
+	    bin/nsetuid \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-fbwin bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
@@ -3165,7 +3275,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    repo/helloapp_caps_ro.tpkg                                        \
 	    system/keys/trust.db                                              \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
-	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
+	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/audiotone.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    readme.txt $$EXTRA_FILES

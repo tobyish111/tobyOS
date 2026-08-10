@@ -842,6 +842,31 @@ void sched_yield(void) {
      * even on the fast path below. */
     wdog_kick_sched();
 
+    /* Linux slice 3: fire due alarm(2) deadlines.
+     *
+     * Placed at the TOP of sched_yield, before the fast-path early return,
+     * because the sweeps further down only run when
+     * `cur->state == PROC_RUNNING && ready_head == 0`. A process parked in
+     * proc_wait() marks itself BLOCKED before yielding, so in a boot-harness
+     * shape (pid 0 waiting on the test proc) that block never executes and
+     * the alarm never fired -- pause() hung forever. Same class of trap as
+     * slice 96's "the sweep does not run when pid 0 is parked in proc_wait".
+     *
+     * Rate-limited to ~10 ms so this costs a clock read on the hot path.
+     * Runs with the BKL held (taken briefly if not) because signal_send()
+     * touches the run queue -- and it must be signal_send() rather than a
+     * bare pending-bit set, since only that WAKES a blocked waiter. */
+    {
+        extern void signal_tick_alarms(void);
+        static uint64_t last_alarm_sweep;
+        uint64_t anow = perf_now_ns();
+        if (anow - last_alarm_sweep >= 10000000ull) {   /* 10 ms */
+            last_alarm_sweep = anow;
+            if (me && me->holds_bkl) { signal_tick_alarms(); }
+            else { bkl_enter(); signal_tick_alarms(); bkl_exit(); }
+        }
+    }
+
     /* ---- Milestone 19 fast path ----------------------------------
      *
      * If we're still RUNNING and our queue is empty, nobody is
@@ -1270,6 +1295,10 @@ void sched_tick(struct regs *r) {
                 g_bkl_held_tsc[ci] = 0;
             }
             { extern void lx_dump_syscall_top(void); lx_dump_syscall_top(); }
+            /* Linux slice 1: the ENOSYS census, ranked. Cumulative over the
+             * boot, so each interval reads as a growing picture of which
+             * gaps the running workload actually cares about. */
+            { extern void lx_dump_gaps(void); lx_dump_gaps(); }
             /* Slice 92: on-CPU quiesce-park totals (kernel-#PF during a CoW
              * sweep). bkl= counts parks that ARRIVED holding the BKL -- they
              * now drop it for the wait; before slice 92 they kept it, which

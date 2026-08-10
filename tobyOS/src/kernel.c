@@ -51,6 +51,10 @@
 #include <tobyos/smp.h>
 #include <tobyos/initrd.h>
 #include <tobyos/vfs.h>
+#include <tobyos/cgroup.h>   /* cgroup v2 init + mount (slice 15) */
+#include <tobyos/nsproxy.h>  /* net_ns_* for the veth harness (slice 12 cut 2) */
+#include <tobyos/net.h>
+#include <tobyos/arp.h>
 #include <tobyos/blk.h>
 #include <tobyos/partition.h>
 #include <tobyos/provision.h>
@@ -1751,10 +1755,28 @@ static void m26a_run_userland_tools(void) {
          * demonstrably runs. */
         { "/bin/linux-sndtest", "linux-sndtest-boot", 1,
           { "linux-sndtest", 0, 0, 0, 0, 0 } },
+        /* Audio slice 4: the same job done by the REAL, UNMODIFIED
+         * alsa-lib 1.2.8 instead of our own hand-rolled ioctls -- a test
+         * and a kernel written by the same author agree with each other
+         * by construction, so this is the one that actually validates the
+         * ABI. A glibc-dynamic PIE that dlopen()s libasound.so.2 exactly
+         * as Chromium does. OPT-IN: absent unless programs/alsa/fetch.sh
+         * and programs/linux-alsatest/build.sh have been run, in which
+         * case M26A reports it missing rather than failing. */
+        { "/bin/linux-alsatest", "linux-alsatest-boot", 1,
+          { "linux-alsatest", 0, 0, 0, 0, 0 } },
         { "/bin/batterytest",  "batterytest-boot",  1,
           { "batterytest",  0, 0, 0, 0, 0 } },
     };
-    char *envp[] = { (char *)"PATH=/bin", 0 };
+    /* LD_LIBRARY_PATH is for the glibc-dynamic entries (linux-alsatest):
+     * glibc's ld.so searches DT_RUNPATH, then LD_LIBRARY_PATH, then
+     * ld.so.cache, then a set of default directories baked in at glibc
+     * build time -- and this Bootlin glibc's baked-in list does not
+     * usefully cover our flat /lib, so libm.so.6 came back "cannot open
+     * shared object file" even though it sits in the initrd right next to
+     * a libc.so.6 that resolved. Native and musl binaries ignore it. */
+    char *envp[] = { (char *)"PATH=/bin",
+                     (char *)"LD_LIBRARY_PATH=/lib", 0 };
     int passed = 0, failed = 0, missing = 0;
     for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++) {
         const struct utool *u = &tools[i];
@@ -1766,7 +1788,7 @@ static void m26a_run_userland_tools(void) {
             .name = u->name,
             .argc = u->argc,
             .argv = argv,
-            .envc = 1,
+            .envc = 2,
             .envp = envp,
         };
         int pid = proc_spawn(&spec);
@@ -3635,6 +3657,8 @@ void _start(void) {
     shm_init();              /* Phase 1 M1.4: shared memory */
     unix_socket_init();      /* Phase 1 M1.4: Unix domain sockets */
     sysfs_init();            /* Phase 1 M1.5: sysfs virtual filesystem */
+    cgroup_init();           /* Slice 15: cgroup v2 hierarchy */
+    cgroup_mount();          /* ...and cgroupfs at /sys/fs/cgroup (nests in /sys) */
     aslr_init();             /* Phase 7 M7.1: address space layout randomization */
     hardening_init();        /* Phase 7 M7.2: SMEP/SMAP/NX enforcement */
     page_fault_init();       /* Phase 1: COW + demand paging refcounts + vm_spaces */
@@ -6851,6 +6875,832 @@ void _start(void) {
                     "TTY + cmd-substitution; expect 42)\n",
                     rc == 42 ? "PASS" : "FAIL", rc);
         }
+    }
+#endif
+
+#ifdef LXCRED_BOOT
+    /* Linux slice 2: POSIX credentials. Walks the real/effective/saved triple,
+     * supplementary groups and the Linux capability ABI -- and, critically,
+     * asserts that a PERMANENT privilege drop cannot be undone. Six checks,
+     * all-pass => exit 63. */
+    {
+        char *argv[] = { (char *)"linux-cred", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-cred", .name = "linux-cred",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] LXCRED: spawning /bin/linux-cred (POSIX credentials)\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[boot] LXCRED: not present -- SKIPPED\n");
+            kprintf("[LXCRED] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[LXCRED] VERDICT: %s exit=%d (uid triple + setuid family "
+                    "+ groups + capget/capset + IRREVERSIBLE drop; expect 63)\n",
+                    rc == 63 ? "PASS" : "FAIL", rc);
+        }
+
+        /* Separate check: do the setuid/setgid/sticky MODE BITS survive the
+         * VFS now that VFS_MODE_PERMS is 07777? That widening is what makes
+         * setuid-on-exec representable at all -- before it, every filesystem
+         * masked S_ISUID off and execve could never see it. Proven by asking
+         * busybox to chmod 4755 and stat the result back. */
+        {
+            char *argv[] = { (char *)"sh", (char *)"-c",
+                             (char *)"cd /data && /bin/busybox touch suidprobe && "
+                                     "/bin/busybox chmod 4755 suidprobe && "
+                                     "/bin/busybox stat -c '[SUIDBIT] mode=%a' "
+                                     "suidprobe; /bin/busybox rm -f suidprobe", 0 };
+            char *envp2[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+            struct proc_spec sp2 = {
+                .path = "/bin/busybox", .name = "sh",
+                .argc = 3, .argv = argv, .envc = 2, .envp = envp2,
+            };
+            int p2 = proc_spawn(&sp2);
+            if (p2 >= 0) proc_wait(p2);
+            kprintf("[LXCRED] (expect [SUIDBIT] mode=4755 above; 755 means the "
+                    "mode widening did not take)\n");
+        }
+    }
+#endif
+
+#ifdef LXSUID_BOOT
+    /* Linux slice 2 (debt): set-user-ID-on-exec, end to end. Distinct from
+     * LXCRED, which proves the setuid SYSCALLS -- this proves the EXEC-TIME
+     * transition: an unprivileged process execs a setuid image owned by a
+     * third uid and comes out running as that uid, with its REAL uid intact. */
+    {
+        char *argv[] = { (char *)"linux-suid", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-suid", .name = "linux-suid",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] LXSUID: spawning /bin/linux-suid (setuid-on-exec)\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[LXSUID] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[LXSUID] VERDICT: %s exit=%d (unprivileged exec of a "
+                    "setuid image -> euid becomes the file owner, ruid "
+                    "stays dropped; expect 63)\n",
+                    rc == 63 ? "PASS" : "FAIL", rc);
+        }
+
+        /* This test doubles as the regression gate for the >=64 KiB I/O bug it
+         * originally surfaced (tobyfs journal transactions capped at
+         * TFS_TXN_MAX_BLOCKS=16, so a 64 KiB write overflowed and transferred
+         * ZERO bytes; fixed 2026-08-07 by committing and reopening the
+         * transaction mid-write). The self-copy above deliberately uses a
+         * 64 KiB buffer and then EXECUTES the copy -- a truncated or corrupted
+         * image would not run, so a pass covers integrity as well as size. */
+    }
+#endif
+
+
+#ifdef LXTIMERS_BOOT
+    /* Linux slice 3: timerfd + signalfd + rt_sigpending + alarm/pause.
+     * Every check goes through poll(2) rather than a bare read, because the
+     * poll-readiness arms are the part most likely to be missing and a
+     * read-only test would pass without them. Six checks -> exit 63. */
+    {
+        char *argv[] = { (char *)"linux-timers", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/linux-timers", .name = "linux-timers",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] LXTIMERS: spawning /bin/linux-timers\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[LXTIMERS] VERDICT: SKIP reason=no-binary\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[LXTIMERS] VERDICT: %s exit=%d (timerfd one-shot+periodic "
+                    "via poll, signalfd, sigpending, alarm+pause; expect 63)\n",
+                    rc == 63 ? "PASS" : "FAIL", rc);
+        }
+    }
+#endif
+
+#ifdef LXALPINE_BOOT
+    /* ==================================================================
+     * Linux slice 7 -- THE DISTRO MILESTONE.
+     *
+     * Extract a real, unmodified Alpine Linux minirootfs onto /data, chroot
+     * into it, and run ITS binaries -- Alpine's own busybox and apk, linked
+     * against Alpine's own musl loader, not ours.
+     *
+     * This is the first configuration in this project's history that runs a
+     * NON-ROOT session, which matters beyond the milestone: every QEMU run
+     * here auto-logs-in as root, so the whole arc has been structurally blind
+     * to uid-dependent bugs (the class real hardware found in slice 120).
+     *
+     * Staged as a .tar.gz and extracted IN THE GUEST on purpose: that path
+     * exercises tar, gzip, symlink creation, and timestamp setting on tobyfs
+     * -- i.e. most of slices 1, 5 and 6 at once, on 528 real entries.
+     * ================================================================== */
+    {
+        char *envp[] = { (char *)"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+                         (char *)"HOME=/", (char *)"TERM=linux", 0 };
+        struct { const char *what; const char *script; } steps[] = {
+          { "extract rootfs",
+            "/bin/busybox rm -rf /data/alp; /bin/busybox mkdir -p /data/alp && "
+            "/bin/busybox tar -xzf /alpine.tar.gz -C /data/alp && "
+            "/bin/busybox ls /data/alp/bin/busybox /data/alp/lib/ld-musl-x86_64.so.1 "
+            ">/dev/null && echo '[ALP] extracted ok'" },
+          /* PROVE it is ALPINE's binary, not the host's.
+           *
+           * The first version just ran `chroot /data/alp /bin/busybox echo` and
+           * called it proof. It was not: execve ignored the chroot root, so
+           * that exec'd the HOST's /bin/busybox (which exists at the same
+           * path) and printed the message from entirely the wrong binary.
+           * Compare the version banners instead -- ours and Alpine's differ,
+           * so this cannot pass unless the jail's binary really ran. */
+          { "alpine busybox runs (chroot) -- version-checked",
+            "H=$(/bin/busybox | /bin/busybox head -1); "
+            "A=$(/bin/busybox chroot /data/alp /bin/busybox | /bin/busybox head -1); "
+            "echo \"[ALP] host=$H\"; echo \"[ALP] jail=$A\"; "
+            "/bin/busybox test \"$A\" != \"$H\" && "
+            "echo \"$A\" | /bin/busybox grep -q 'v1\\.36' && "
+            "echo '[ALP] confirmed: ALPINE busybox ran, not the host'" },
+          /* NOTE: no `| sed` prettifying here. The first version of this
+           * harness piped each step through sed, so the PIPELINE's exit code
+           * was sed's -- step 4 printed "can't execute /sbin/apk" and was
+           * still counted as a pass. Report the real command's status. */
+          { "alpine identity",
+            "/bin/busybox chroot /data/alp /bin/busybox cat /etc/alpine-release" },
+          /* Diagnostics BEFORE the hardest step: apk needs libz.so.1 and
+           * libc.musl-x86_64.so.1, both SYMLINKS, so prove links resolve
+           * through open() (not just readlink) first. Ordering matters
+           * because a failing step stops the chain. */
+          { "symlinks resolve on tobyfs",
+            "/bin/busybox readlink /data/alp/lib/libz.so.1 && "
+            "/bin/busybox readlink /data/alp/bin/sh && "
+            "/bin/busybox head -c 4 /data/alp/lib/libz.so.1 >/dev/null && "
+            "echo '[ALP] symlink open() resolves'" },
+          /* THE NON-ROOT STEP. This is the part of the milestone that matters
+           * beyond "a distro ran": every QEMU run in this project auto-logs-in
+           * as root, so nothing here has ever exercised a normal session. */
+          /* NO `|| fallback` here. The first version had one, and when the su
+           * path failed the fallback ran AS ROOT and the step still reported
+           * exit=0 -- a "non-root" milestone that was actually root. Same
+           * class of self-deception as the earlier `| sed` masking. The step
+           * must fail if it cannot genuinely drop privilege. */
+          /* busybox `su` produced no output and no error here, so the
+           * transition is done explicitly by /bin/linux-alpinerun instead:
+           * chroot -> chdir -> setgid/setuid(65534) -> exec ALPINE's busybox.
+           * Stating each step ourselves means the proof cannot be satisfied
+           * by a fallback, and names which step failed when one does. */
+          { "alpine userland as NON-ROOT",
+            "/bin/linux-alpinerun" },
+          { "alpine apk runs",
+            "/bin/busybox chroot /data/alp /sbin/apk --version" },
+        };
+        int n = (int)(sizeof(steps)/sizeof(steps[0]));
+        int ok = 0;
+        for (int i = 0; i < n; i++) {
+            char *argv[] = { (char *)"sh", (char *)"-c",
+                             (char *)steps[i].script, 0 };
+            struct proc_spec spec = {
+                .path = "/bin/busybox", .name = "sh",
+                .argc = 3, .argv = argv, .envc = 3, .envp = envp,
+            };
+            kprintf("[LXALPINE] step %d: %s\n", i + 1, steps[i].what);
+            int pid = proc_spawn(&spec);
+            if (pid < 0) { kprintf("[LXALPINE] no busybox -- SKIP\n"); break; }
+            int rc = proc_wait(pid);
+            kprintf("[LXALPINE] step %d (%s) exit=%d\n", i + 1, steps[i].what, rc);
+            if (rc == 0) ok++; else break;   /* later steps depend on earlier */
+        }
+        kprintf("[LXALPINE] VERDICT: %s steps=%d/%d\n",
+                (ok == n) ? "PASS" : "FAIL", ok, n);
+    }
+#endif
+
+#ifdef LXPOSIX_BOOT
+    /* ==================================================================
+     * Linux slice 4: THE STANDING POSIX ACCEPTANCE GATE.
+     *
+     * Slices 1-3 each grew their own harness (LXCENSUS, LXCRED, LXSUID,
+     * LXTIMERS), which meant a regression run was ~18 -D flags and eyeballing
+     * two dozen verdict lines. This runs the whole POSIX-completeness suite in
+     * ONE flavour and reduces it to ONE greppable line, so every later slice
+     * has a cheap gate rather than an excuse to skip regression testing.
+     *
+     * Two independent things are asserted:
+     *   1. every sub-test still passes, and
+     *   2. the ENOSYS census is EMPTY -- i.e. no workload in the suite asked
+     *      for a syscall the kernel has never heard of.
+     *
+     * (2) is the part that catches coverage regressions rather than logic
+     * regressions, and it is why the census is RESET first: a gate whose
+     * result depends on what else the boot flavour probed is not a gate.
+     * ================================================================== */
+    {
+        extern void lx_reset_gaps(void);
+        extern int  lx_gap_count(void);
+        extern void lx_dump_gaps(void);
+
+        struct lxp_case {
+            const char *path;
+            const char *name;
+            const char *arg;      /* NULL => run with no extra argument */
+            int         want;     /* expected exit code */
+            const char *what;
+        };
+        /* busybox groups run through `sh -c`; the standalone proofs are
+         * spawned directly. `want` is the contract each one already prints. */
+        static const struct lxp_case cases[] = {
+            { "/bin/busybox", "sh", "/bin/busybox mkdir -p /data/px/a && "
+                                    "cd /data/px && /bin/busybox touch f && "
+                                    "/bin/busybox chmod 644 f && "
+                                    "/bin/busybox chown 0:0 f && "
+                                    "/bin/busybox ln -s f s && "
+                                    "/bin/busybox readlink s >/dev/null && "
+                                    "/bin/busybox rmdir a && "
+                                    "/bin/busybox sync && "
+                                    "/bin/busybox ls -la >/dev/null && "
+                                    "cd / && /bin/busybox rm -rf /data/px",
+              0,  "busybox file-management sweep" },
+            { "/bin/busybox", "sh", "/bin/busybox dd if=/dev/zero of=/data/pw "
+                                    "bs=64k count=8 2>/dev/null && "
+                                    "/bin/busybox rm -f /data/pw",
+              0,  "large (64 KiB) write path" },
+            { "/bin/linux-cred",   "linux-cred",   0, 63, "POSIX credentials" },
+            { "/bin/linux-suid",   "linux-suid",   0, 63, "setuid-on-exec" },
+            { "/bin/linux-timers", "linux-timers", 0, 63, "timerfd/signalfd/alarm" },
+            { "/bin/linux-mount",  "linux-mount",  0, 63, "mount/umount2/chroot" },
+            /* A REAL mount round-trip, not just the failure paths the C test
+             * covers: unmount the live /data volume, remount it read-only via
+             * mount(2), confirm a write is refused, then restore it read-write
+             * and confirm writes work again. Uses busybox so the flags travel
+             * the same path a real caller would use. */
+            { "/bin/busybox", "sh",
+              "/bin/busybox umount /data && "
+              "/bin/busybox mount -t tobyfs -o ro ide0:master.p1 /data && "
+              "! /bin/busybox touch /data/rotest 2>/dev/null && "
+              "/bin/busybox umount /data && "
+              "/bin/busybox mount -t tobyfs ide0:master.p1 /data && "
+              "/bin/busybox touch /data/rwtest && "
+              "/bin/busybox rm -f /data/rwtest",
+              0, "mount round-trip (ro then rw)" },
+            /* Slice 6: timestamps must be REAL and must PERSIST. Checks the
+             * three things that were each independently broken: stat reports
+             * a non-1970 date, touch -d stores a specific time that survives a
+             * re-stat, and the clock the file gets agrees with date(1). */
+            { "/bin/busybox", "sh",
+              "cd /data && /bin/busybox touch tsprobe && "
+              "Y=$(/bin/busybox date -r tsprobe +%Y) && "
+              "echo \"[TS] file year=$Y now=$(/bin/busybox date +%Y)\" && "
+              "[ \"$Y\" != \"1970\" ] && "
+              "/bin/busybox touch -d '2001-02-03 04:05:06' tsprobe && "
+              "S=$(/bin/busybox date -r tsprobe +%Y-%m-%d) && "
+              "echo \"[TS] after touch -d: $S\" && "
+              "[ \"$S\" = \"2001-02-03\" ] && "
+              "/bin/busybox rm -f tsprobe",
+              0, "timestamps (real + persisted)" },
+            /* Slice 6: truncate must actually RESIZE. Slice 1 shipped it as a
+             * validating no-op, so this asserts the size really changes -- in
+             * both directions, and back to zero. */
+            { "/bin/busybox", "sh",
+              "cd /data && /bin/busybox printf 'abc' > tr && "
+              "/bin/busybox truncate -s 10 tr && "
+              "A=$(/bin/busybox stat -c %s tr) && "
+              "/bin/busybox truncate -s 2 tr && "
+              "B=$(/bin/busybox stat -c %s tr) && "
+              "/bin/busybox truncate -s 0 tr && "
+              "C=$(/bin/busybox stat -c %s tr) && "
+              "echo \"[TRUNC] grow=$A shrink=$B zero=$C\" && "
+              "[ \"$A\" = 10 ] && [ \"$B\" = 2 ] && [ \"$C\" = 0 ] && "
+              "/bin/busybox rm -f tr",
+              0, "truncate resizes for real" },
+            /* Slice 6: the new /proc and /dev nodes. mount(8) and init scripts
+             * read /proc/filesystems to decide what they may mount; shells and
+             * anything that prompts open /dev/tty by NAME because fd 0 is not
+             * the terminal inside a pipeline. */
+            { "/bin/busybox", "sh",
+              "/bin/busybox grep -q tobyfs /proc/filesystems && "
+              "/bin/busybox grep -q 'Block devices' /proc/devices && "
+              "echo hello > /dev/tty && "
+              "/bin/busybox head -c 4 /dev/zero >/dev/null && "
+              "! echo x > /dev/full 2>/dev/null && "
+              "echo '[NODES] filesystems+devices+tty+full ok'",
+              0, "/proc + /dev nodes" },
+        };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/",
+                         (char *)"PYTHONHOME=/", (char *)"LANG=C", 0 };
+
+        kprintf("[LXPOSIX] ==== POSIX acceptance gate ====\n");
+        lx_reset_gaps();          /* measure only this window */
+
+        int ncase = (int)(sizeof(cases) / sizeof(cases[0]));
+        int passed = 0, ran = 0, skipped = 0;
+        for (int i = 0; i < ncase; i++) {
+            char *a0 = (char *)cases[i].name;
+            char *argv_sh[]  = { a0, (char *)"-c", (char *)cases[i].arg, 0 };
+            char *argv_bin[] = { a0, 0 };
+            struct proc_spec spec = {
+                .path = cases[i].path, .name = cases[i].name,
+                .argc = cases[i].arg ? 3 : 1,
+                .argv = cases[i].arg ? argv_sh : argv_bin,
+                .envc = 4, .envp = envp,
+            };
+            int pid = proc_spawn(&spec);
+            if (pid < 0) {
+                kprintf("[LXPOSIX]   SKIP %-28s (no %s)\n",
+                        cases[i].what, cases[i].path);
+                skipped++;
+                continue;
+            }
+            int rc = proc_wait(pid);
+            ran++;
+            int ok = (rc == cases[i].want);
+            if (ok) passed++;
+            kprintf("[LXPOSIX]   %s %-28s exit=%d (want %d)\n",
+                    ok ? "ok  " : "FAIL", cases[i].what, rc, cases[i].want);
+        }
+
+        int gaps = lx_gap_count();
+        if (gaps) lx_dump_gaps();     /* only noisy when it matters */
+
+        /* A SKIP is not a pass. Opt-in binaries may legitimately be absent, so
+         * the count is reported rather than failed on -- but it is on the
+         * verdict line, because "PASS 2/2" with three silent skips is exactly
+         * the kind of result that reads as green and means nothing. */
+        kprintf("[LXPOSIX] VERDICT: %s subtests=%d/%d skipped=%d enosys_gaps=%d\n",
+                (passed == ran && gaps == 0 && ran > 0) ? "PASS" : "FAIL",
+                passed, ran, skipped, gaps);
+    }
+#endif
+
+#ifdef LXVETH_BOOT
+    /* ==================================================================
+     * Slice 12 cut 2: DO REAL FRAMES CROSS A NAMESPACE BOUNDARY?
+     *
+     * A kernel harness rather than a userspace test, and deliberately so: there
+     * is no netlink RTM_NEWLINK handling, so nothing in userspace can create a
+     * veth pair. Adding that is a slice of its own (see veth.c) -- so the
+     * capability is proven here, at the only layer that can currently express it.
+     *
+     * BOTH ends live in NON-INITIAL namespaces. That is the point: it removes
+     * net_default() from the picture entirely, so a pass cannot be an artifact of
+     * the host's e1000 happening to carry the frame.
+     *
+     * The assertion is deliberately TWO-LAYERED:
+     *   - veth frame counters prove bytes crossed in BOTH directions;
+     *   - the ARP cache proves the payload was really parsed and ANSWERED by the
+     *     peer namespace's stack, not merely copied. Counters alone would pass
+     *     for a veth that forwarded garbage.
+     * ================================================================== */
+    {
+        extern void *net_ns_create(void);
+        void *ns_a = net_ns_create();
+        void *ns_b = net_ns_create();
+        int pass = 0, total = 4;
+
+        /* 10.99.0.1 <-> 10.99.0.2/24, in network byte order. */
+        uint32_t ip_a = (uint32_t)(10u | (99u << 8) | (0u << 16) | (1u << 24));
+        uint32_t ip_b = (uint32_t)(10u | (99u << 8) | (0u << 16) | (2u << 24));
+        uint32_t mask = (uint32_t)(255u | (255u << 8) | (255u << 16) | (0u << 24));
+
+        kprintf("[LXVETH] ==== veth across a network namespace boundary ====\n");
+
+        if (ns_a && ns_b && netns_veth_pair(ns_a, ip_a, ns_b, ip_b, mask) == 0) {
+            pass++;
+            kprintf("[LXVETH]   ok   pair created, both ends in namespaces\n");
+        } else {
+            kprintf("[LXVETH]   FAIL could not create the pair\n");
+        }
+
+        /* Each namespace must report its OWN address, not the host's. */
+        if (net_ns_ip(ns_a) == ip_a && net_ns_ip(ns_b) == ip_b &&
+            net_my_ip() != ip_a) {
+            pass++;
+            kprintf("[LXVETH]   ok   per-namespace addressing (host unchanged)\n");
+        } else {
+            kprintf("[LXVETH]   FAIL addressing wrong (host ip leaked in?)\n");
+        }
+
+        /* Originate an ARP request AS ns_a. The reply has to come back from
+         * ns_b's stack, over the pair, and land in ns_a. */
+        { void *prev = net_ns_rx_enter(ns_a);
+          arp_request(ip_b);
+          net_ns_rx_leave(prev); }
+
+        uint32_t atx = 0, arx = 0, btx = 0, brx = 0;
+        netns_veth_stats(ns_a, &atx, &arx);
+        netns_veth_stats(ns_b, &btx, &brx);
+        kprintf("[LXVETH]   frames: a tx=%u rx=%u | b tx=%u rx=%u\n",
+                atx, arx, btx, brx);
+        if (atx >= 1 && brx >= 1 && btx >= 1 && arx >= 1) {
+            pass++;
+            kprintf("[LXVETH]   ok   frames crossed BOTH ways\n");
+        } else {
+            kprintf("[LXVETH]   FAIL no bidirectional frame flow\n");
+        }
+
+        /* And the payload was really understood: ns_b answered the ARP, so the
+         * peer's MAC is now resolvable.
+         *
+         * THE MAC MUST BE THE PEER'S VETH MAC, NOT MERELY RESOLVABLE. The first
+         * version of this check only asserted arp_resolve() succeeded -- and it
+         * PASSED while returning the host e1000's 52:54:00:12:34:56, because the
+         * ARP payload's sender hardware address was still coming from g_my_mac.
+         * The peer had cached "10.99.0.2 is at <host NIC>", which resolves
+         * perfectly and is entirely wrong. Asserting the VALUE is what caught it.
+         *
+         * veth.c assigns 02:00:00:00:<pair>:<end>, so end b of pair 0 is
+         * 02:00:00:00:00:01. */
+        uint8_t mac[6];
+        static const uint8_t want_b[6] = { 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+        if (arp_resolve(ip_b, mac) && memcmp(mac, want_b, 6) == 0) {
+            pass++;
+            kprintf("[LXVETH]   ok   ARP answered BY THE PEER'S OWN MAC "
+                    "(%02x:%02x:%02x:%02x:%02x:%02x)\n",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        } else {
+            kprintf("[LXVETH]   FAIL ARP gave %02x:%02x:%02x:%02x:%02x:%02x, "
+                    "want 02:00:00:00:00:01 (a host MAC here means the reply "
+                    "used g_my_mac)\n",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+
+        kprintf("[LXVETH] VERDICT: %s subtests=%d/%d\n",
+                (pass == total) ? "PASS" : "FAIL", pass, total);
+    }
+#endif
+
+#ifdef LXNS_BOOT
+    /* ==================================================================
+     * Phase 3 slice 8: THE NAMESPACE GATE (UTS + IPC).
+     *
+     * Two independent observation paths, on purpose:
+     *
+     *   1. /bin/linux-ns -- a purpose-built C test that drives unshare(2),
+     *      clone(CLONE_NEWUTS), setns(2) and shmget through syscall(2) and
+     *      asserts BOTH halves of every isolation claim plus a control.
+     *      Its contract is exit 255.
+     *
+     *   2. real busybox -- `unshare -u`, `hostname` and `readlink` from an
+     *      implementation we did not write. This matters more than it looks:
+     *      a test that only ever exercises its own author's idea of the ABI
+     *      can agree with a kernel that has the ABI wrong. busybox agreeing
+     *      is evidence about the ABI, not just about our code.
+     *
+     * The busybox steps are written so the ASSERTION is a `[ ... ]`
+     * comparison, never a pipeline's exit status -- the slice-7 lesson
+     * (`cmd | sed` reports sed's status, so a failing cmd counted as PASS).
+     * ================================================================== */
+    {
+        struct lxns_case {
+            const char *path;
+            const char *name;
+            const char *arg;
+            int         want;
+            const char *what;
+        };
+        static const struct lxns_case cases[] = {
+            { "/bin/linux-ns", "linux-ns", 0, 255,
+              "unshare/clone/setns/ipc (C)" },
+            /* Slice 10: pid namespaces get their own binary rather than more
+             * bits in linux-ns -- that test is a passing gate and a pid
+             * namespace needs a full byte of its own. */
+            { "/bin/linux-pidns", "linux-pidns", 0, 255,
+              "pid ns: vpid/init/isolation (C)" },
+            /* Slice 9: mount namespaces -- isolation, real propagation, and
+             * pivot_root. Every mount check in it is FUNCTIONAL (does a marker
+             * file appear through the other path?) rather than a /proc/mounts
+             * line, because mount(2) here is a table insertion and a bind that
+             * resolves to nothing would still produce the line. */
+            { "/bin/linux-mntns", "linux-mntns", 0, 255,
+              "mount ns: isolation/prop/pivot (C)" },
+            /* Slice 11: user namespaces. Its most important check is a NEGATIVE
+             * one -- that CLONE_NEWUSER alone grants no mounting authority --
+             * because this is the slice that hands an unprivileged process a
+             * full capability set. */
+            { "/bin/linux-userns", "linux-userns", 0, 255,
+              "user ns: uid_map/caps/guard (C)" },
+            /* Slice 12 cut 1: network namespaces. Its central assertion is an
+             * ERRNO -- ENETUNREACH inside vs anything-else outside -- because
+             * "connect failed" is worthless evidence on a VM where almost
+             * nothing is listening. */
+            { "/bin/linux-netns", "linux-netns", 0, 255,
+              "net ns: ENETUNREACH/IPC/sandbox (C)" },
+            /* Slice 13: seccomp-bpf. Its most important assertion is bit5 --
+             * that a filter survives BOTH fork and execve. A sandbox a child
+             * could shed by exec'ing would not be a sandbox, and this test
+             * re-execs itself to observe it from the inside. */
+            { "/bin/linux-seccomp", "linux-seccomp", 0, 255,
+              "seccomp: bpf/verifier/inescapable (C)" },
+            /* Slice 15: cgroup v2. Neither controller is tested through its
+             * control file -- pids.max by whether fork ACTUALLY fails with
+             * EAGAIN, cpu.weight by MEASURING /proc CPU time under contention.
+             * A cgroup interface is the easiest thing in this arc to fake. */
+            { "/bin/linux-cgroup", "linux-cgroup", 0, 255,
+              "cgroup v2: pids.max/cpu.weight (C)" },
+            /* Slice 16: the memory + io controllers. The check that carries this
+             * one is bit6 -- memory.current must agree EXACTLY with the RSS that
+             * /proc/PID/stat reports for the same single-member cgroup. Two
+             * independent code paths over one counter: if the cgroup number were
+             * invented or had drifted from a missed uncharge, they would differ.
+             * bit7 then requires no drift across four fork/allocate/exit cycles,
+             * because a leaked charge is invisible until it breaks a limit. */
+            { "/bin/linux-cgroup2", "linux-cgroup2", 0, 255,
+              "cgroup v2: memory.max/io.stat (C)" },
+            /* Slice 14: the NATIVE privilege drop. A native program on purpose --
+             * chromewin is native, and the gap that blocked slice 14 was that the
+             * native ABI had no setuid at all, so a Linux-personality test would
+             * have proved nothing about it. Its bit3 carries the test: it asserts a
+             * ROOT-ONLY SYSCALL NOW FAILS, because a "drop" that moved p->uid while
+             * leaving root authority intact would pass a naive check and be worse
+             * than no drop at all -- it would look safe.
+             *
+             * This verifies the half of slice 14 that QEMU can verify. The sandboxed
+             * Chromium path cannot be checked here (every boot auto-logs-in as
+             * root), which is why CW_SANDBOX defaults OFF. */
+            { "/bin/nsetuid", "nsetuid", 0, 63,
+              "slice 14: native privilege drop (C)" },
+
+            /* Independent witness #1: two SEPARATE processes in the initial
+             * namespace must report the SAME uts inum (each $( ) is its own
+             * fork+exec, so this really is a cross-process comparison), the ns
+             * directory must list all six kinds, and the link must have the
+             * Linux "uts:[N]" shape. */
+            { "/bin/busybox", "sh",
+              "A=$(/bin/busybox readlink /proc/self/ns/uts) && "
+              "B=$(/bin/busybox readlink /proc/self/ns/uts) && "
+              "N=$(/bin/busybox ls /proc/self/ns | /bin/busybox wc -l) && "
+              "echo \"[NSPROC] a=$A b=$B kinds=$N\" && "
+              "[ \"$A\" = \"$B\" ] && [ \"$N\" = 6 ] && "
+              "case \"$A\" in uts:\\[*\\]) true ;; *) false ;; esac",
+              0, "/proc/PID/ns shape + sharing" },
+
+            /* Independent witness #2: busybox's OWN unshare(1) + hostname(1).
+             * Two-sided -- the hostname changes inside and must not change
+             * outside -- and the inum must differ, which is a second witness
+             * that does not go through the hostname payload at all. */
+            { "/bin/busybox", "sh",
+              "H0=$(/bin/busybox hostname) && "
+              "IN=$(/bin/busybox unshare -u /bin/busybox sh -c "
+              "'/bin/busybox hostname bb-inside; /bin/busybox hostname') && "
+              "H1=$(/bin/busybox hostname) && "
+              "U0=$(/bin/busybox readlink /proc/self/ns/uts) && "
+              "U1=$(/bin/busybox unshare -u /bin/busybox readlink /proc/self/ns/uts) && "
+              "echo \"[NSBB] before=$H0 inside=$IN after=$H1\" && "
+              "echo \"[NSBB] outer=$U0 inner=$U1\" && "
+              "[ \"$IN\" = bb-inside ] && [ \"$H1\" = \"$H0\" ] && "
+              "[ \"$U0\" != \"$U1\" ]",
+              0, "busybox unshare -u isolates" },
+
+            /* Slice 10, independent witness: busybox's OWN unshare(1) -p.
+             *
+             * DELIBERATELY WITHOUT -f. busybox's -f exists precisely because
+             * unshare(CLONE_NEWPID) cannot renumber the caller, so it forks to
+             * get a process that CAN be pid 1 -- but it forks with xvfork(),
+             * and this kernel's vfork hands the child a PRIVATE STACK, so the
+             * child returns from vfork onto a stack holding none of the
+             * caller's frame and jumps through a NULL argv. That is a
+             * pre-existing vfork limitation (the LX_clone arm documents the
+             * same "a private RSP breaks it" hazard for plain fork), entirely
+             * independent of pid namespaces -- see the probe case below, which
+             * reproduces it with -u, a namespace that has worked since slice 8.
+             *
+             * So this case asserts the half that needs no fork, and it is the
+             * half most likely to be implemented wrongly: `unshare -p` execs
+             * the command IN THE CALLER, so the command must come out with the
+             * caller's ORIGINAL pid namespace, unrenumbered. A kernel that
+             * moved the caller would fail here. The "children do move" half is
+             * proven by /bin/linux-pidns above. */
+            { "/bin/busybox", "sh",
+              "O=$(/bin/busybox readlink /proc/self/ns/pid) && "
+              "I=$(/bin/busybox unshare -p /bin/busybox readlink /proc/self/ns/pid) && "
+              "Q=$(/bin/busybox unshare -p /bin/busybox sh -c '/bin/busybox echo $$') && "
+              "echo \"[NSPID] outer=$O after-unshare-p=$I pid=$Q\" && "
+              "[ \"$O\" = \"$I\" ] && [ \"$Q\" != 1 ]",
+              0, "busybox unshare -p leaves caller" },
+
+            /* Slice 9, independent witness: busybox's OWN unshare -m + mount.
+             * `-m` needs no fork (CLONE_NEWNS does move the caller), so unlike
+             * `-p -f` this is not blocked by the vfork gap. Two-sided and
+             * FUNCTIONAL: the marker must be reachable through the bind INSIDE
+             * the namespace and unreachable through it outside. */
+            { "/bin/busybox", "sh",
+              "/bin/busybox touch /data/bbm && "
+              "M=$(/bin/busybox readlink /proc/self/ns/mnt) && "
+              "I=$(/bin/busybox unshare -m /bin/busybox sh -c "
+              "'/bin/busybox mount -o bind /data /bbmnt >/dev/null 2>&1; "
+              "/bin/busybox test -f /bbmnt/bbm && /bin/busybox readlink /proc/self/ns/mnt') && "
+              "echo \"[NSMNT] outer=$M inner=$I\" && "
+              "[ -n \"$I\" ] && [ \"$M\" != \"$I\" ] && "
+              "! /bin/busybox test -f /bbmnt/bbm && "
+              "/bin/busybox rm -f /data/bbm",
+              0, "busybox unshare -m isolates mounts" },
+
+            /* NO `unshare -f` CASE HERE, ON PURPOSE.
+             *
+             * busybox's -f is how it gets a process that can BE pid 1, since
+             * unshare(CLONE_NEWPID) cannot renumber the caller. It forks with
+             * xvfork(), and this kernel's vfork is broken for that use: measured
+             * 2026-08-08 with an attribution probe that ran `unshare -f -u`
+             * (a namespace working since slice 8, so no pid namespace involved)
+             * and reproduced the fault exactly --
+             *
+             *   [fork] share pid=3 -> child pid=4 stack=0x7f0000800000
+             *   EXCEPTION 14 rip=0x0 err=0x14   (user instruction fetch at NULL)
+             *
+             * sys_fork_share() hands the vfork child a PRIVATE stack, so the
+             * child returns from vfork onto a stack holding none of the
+             * caller's frame and jumps through a NULL argv. The LX_clone arm
+             * documents the same hazard for plain fork ("a private RSP breaks
+             * it"). Adding a case for it would put a known pre-existing fault
+             * inside a gate whose fault count is a hard failure -- so it is an
+             * OPEN ITEM in docs/linux-arc-handoff-phase3.md instead, with the
+             * diagnosis, and the `-p` case above covers the half that does not
+             * need a fork. */
+        };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/",
+                         (char *)"LANG=C", 0 };
+
+        kprintf("[LXNS] ==== namespace gate (UTS + IPC) ====\n");
+        int ncase = (int)(sizeof(cases) / sizeof(cases[0]));
+        int passed = 0, ran = 0, skipped = 0;
+        for (int i = 0; i < ncase; i++) {
+            char *a0 = (char *)cases[i].name;
+            char *argv_sh[]  = { a0, (char *)"-c", (char *)cases[i].arg, 0 };
+            char *argv_bin[] = { a0, 0 };
+            struct proc_spec spec = {
+                .path = cases[i].path, .name = cases[i].name,
+                .argc = cases[i].arg ? 3 : 1,
+                .argv = cases[i].arg ? argv_sh : argv_bin,
+                .envc = 3, .envp = envp,
+            };
+            int pid = proc_spawn(&spec);
+            if (pid < 0) {
+                kprintf("[LXNS]   SKIP %-30s (no %s)\n",
+                        cases[i].what, cases[i].path);
+                skipped++;
+                continue;
+            }
+            int rc = proc_wait(pid);
+            ran++;
+            int ok = (rc == cases[i].want);
+            if (ok) passed++;
+            kprintf("[LXNS]   %s %-30s exit=%d (want %d)\n",
+                    ok ? "ok  " : "FAIL", cases[i].what, rc, cases[i].want);
+        }
+        /* A skip is reported on the verdict line, never silently dropped --
+         * "PASS 1/1" with two absent binaries reads as green and means almost
+         * nothing (slice 4's rule). */
+        kprintf("[LXNS] VERDICT: %s subtests=%d/%d skipped=%d\n",
+                (passed == ran && ran > 0) ? "PASS" : "FAIL",
+                passed, ran, skipped);
+    }
+#endif
+
+#ifdef LXCENSUS_BOOT
+    /* Linux slice 1: THE ENOSYS CENSUS.
+     *
+     * The measure-first gate for the POSIX-completeness arc. Rather than
+     * guessing which of the ~200 unimplemented Linux syscalls matter, drive a
+     * broad sweep of real workloads and let the kernel's own gap logger rank
+     * them by hit count and first caller (`lx_dump_gaps`).
+     *
+     * The busybox applet sweep is the widest net available: coreutils-shaped
+     * applets are exactly the programs that exercise the boring file-management
+     * syscalls a browser never touches (rmdir/link/chown/utimensat/truncate/
+     * sync), and running them under `sh -c` exercises fork/exec/wait/pipes on
+     * top. bash and python3 then add a big-shell and a big-stdlib startup.
+     *
+     * NOTHING here asserts an exit code. A census does not care whether an
+     * applet succeeded -- it cares that the gap was RECORDED. Verdicts would
+     * only add noise, and a failing applet is often the most informative case.
+     * The single output that matters is the [lx-gaps] table at the end. */
+    {
+        /* Each entry is a `sh -c` script. Split into several short scripts
+         * rather than one long one so a hang is attributable to a group. */
+        /* Two constraints the first census run taught us, the hard way:
+         *   1. There are no applet symlinks in /bin, so every applet MUST be
+         *      invoked as `busybox <applet>` -- otherwise the shell answers
+         *      127 and the census measures nothing but PATH lookups.
+         *   2. The ramfs root is READ-ONLY. /data is the writable volume (and
+         *      is chmod 0777 at mount since slice 120), so all scratch work
+         *      has to live there, not in /tmp. */
+        #define BB "/bin/busybox "
+        static const char *scripts[] = {
+            /* dirs + links: rmdir, link, symlink, readlink */
+            BB "mkdir -p /data/cx/a/b; cd /data/cx; echo hi > f; "
+            BB "ln f hardlink; " BB "ln -s f symlink; " BB "readlink symlink; "
+            BB "rmdir a/b; " BB "rmdir a; " BB "ls -la /data/cx",
+            /* metadata: utimensat (touch/cp -p), chown, chmod, truncate, stat */
+            "cd /data/cx; " BB "touch newfile; " BB "cp -p f copy; "
+            BB "chmod 644 f; " BB "chown 0:0 f; " BB "truncate -s 10 f; "
+            BB "stat f; " BB "ls -l",
+            /* bulk + fs: dd, sync, df, du, find, tar through a pipe */
+            "cd /data/cx; " BB "dd if=/dev/zero of=big bs=1k count=8; "
+            BB "sync; " BB "df; " BB "du -s /data/cx; "
+            BB "find /data/cx -type f; "
+            BB "tar cf - /data/cx 2>/dev/null | " BB "wc -c",
+            /* text pipeline + process/identity + the `times` builtin */
+            "cd /data/cx; " BB "printf 'c\\nb\\na\\n' | " BB "sort | "
+            BB "uniq | " BB "wc -l; " BB "sed 's/a/A/' f; " BB "date; "
+            BB "id; " BB "whoami; " BB "ps; times",
+            /* cleanup, so a re-run starts clean */
+            BB "rm -rf /data/cx",
+        };
+        char *envp[] = {
+            (char *)"PATH=/bin", (char *)"HOME=/", (char *)"TMPDIR=/data", 0,
+        };
+        int ns = (int)(sizeof(scripts) / sizeof(scripts[0]));
+        int ran = 0;
+        for (int s = 0; s < ns; s++) {
+            char *argv[] = { (char *)"sh", (char *)"-c",
+                             (char *)scripts[s], 0 };
+            struct proc_spec spec = {
+                .path = "/bin/busybox", .name = "sh",
+                .argc = 3, .argv = argv, .envc = 3, .envp = envp,
+            };
+            kprintf("[boot] LXCENSUS: busybox group %d/%d\n", s + 1, ns);
+            int pid = proc_spawn(&spec);
+            if (pid < 0) {
+                kprintf("[boot] LXCENSUS: /bin/busybox not present -- SKIPPED\n");
+                break;
+            }
+            int rc = proc_wait(pid);
+            ran++;
+            kprintf("[boot] LXCENSUS: group %d exit=%d (exit code is NOT a "
+                    "verdict -- the census is the output)\n", s + 1, rc);
+        }
+
+        /* bash: a big shell, different libc path (glibc) from busybox (musl). */
+        {
+            char *argv[] = { (char *)"bash", (char *)"--norc",
+                             (char *)"--noprofile", (char *)"-c",
+                             (char *)"cd /data; echo $((2+2)); "
+                                     "for i in 1 2 3; do echo $i; done; "
+                                     "times; ulimit -a; "
+                                     "echo x > bt; test -f bt; "
+                                     "/bin/busybox rm -f bt", 0 };
+            struct proc_spec spec = {
+                .path = "/bin/bash", .name = "bash",
+                .argc = 5, .argv = argv, .envc = 3, .envp = envp,
+            };
+            kprintf("[boot] LXCENSUS: real bash\n");
+            int pid = proc_spawn(&spec);
+            if (pid < 0) kprintf("[boot] LXCENSUS: /bin/bash absent -- skipped\n");
+            else { int rc = proc_wait(pid); ran++;
+                   kprintf("[boot] LXCENSUS: bash exit=%d\n", rc); }
+        }
+
+        /* python3: the largest stdlib startup available -- imports, stat
+         * storms, and the interpreter's own signal/thread setup. */
+        {
+            /* CPython needs PYTHONHOME/PYTHONPATH pointing at the staged
+             * stdlib zip, exactly as REALPYTHON_BOOT sets them -- without
+             * them the interpreter dies in prefix discovery before running
+             * a single line, and the census sees only the loader's syscalls.
+             * Each os.* call is guarded so one ENOSYS does not abort the
+             * rest: a census wants EVERY gap, not just the first. */
+            char *pyenv[] = {
+                (char *)"PATH=/bin", (char *)"HOME=/",
+                (char *)"PYTHONHOME=/", (char *)"PYTHONPATH=/lib/python310.zip",
+                (char *)"PYTHONDONTWRITEBYTECODE=1", (char *)"LANG=C", 0,
+            };
+            char *argv[] = { (char *)"python3", (char *)"-c",
+                             (char *)"import os,sys\n"
+                                     "d='/data/pycx'\n"
+                                     "for op in [lambda:os.makedirs(d,exist_ok=True),\n"
+                                     "  lambda:open(d+'/f','w').write('x'),\n"
+                                     "  lambda:os.utime(d+'/f'),\n"
+                                     "  lambda:os.truncate(d+'/f',0),\n"
+                                     "  lambda:os.link(d+'/f',d+'/l'),\n"
+                                     "  lambda:os.chmod(d+'/f',0o644),\n"
+                                     "  lambda:os.chown(d+'/f',0,0),\n"
+                                     "  lambda:os.sync(),\n"
+                                     "  lambda:os.times(),\n"
+                                     "  lambda:os.unlink(d+'/l'),\n"
+                                     "  lambda:os.unlink(d+'/f'),\n"
+                                     "  lambda:os.rmdir(d)]:\n"
+                                     "    try: op()\n"
+                                     "    except Exception as e: print('py:',type(e).__name__,e)\n"
+                                     "print('pycensus ok',sys.version_info[:2])", 0 };
+            struct proc_spec spec = {
+                .path = "/bin/python3", .name = "python3",
+                .argc = 3, .argv = argv, .envc = 6, .envp = pyenv,
+            };
+            kprintf("[boot] LXCENSUS: real CPython\n");
+            int pid = proc_spawn(&spec);
+            if (pid < 0) kprintf("[boot] LXCENSUS: /bin/python3 absent -- skipped\n");
+            else { int rc = proc_wait(pid); ran++;
+                   kprintf("[boot] LXCENSUS: python3 exit=%d\n", rc); }
+        }
+
+        kprintf("[LXCENSUS] workloads run: %d\n", ran);
+        { extern void lx_dump_gaps(void); lx_dump_gaps(); }
+        kprintf("[LXCENSUS] VERDICT: DONE (census above is the deliverable)\n");
     }
 #endif
 

@@ -129,11 +129,31 @@ enum file_kind {
      * over the HDA driver. ioctl routes to snd_pcm.c; write() is accepted
      * as the non-mmap playback path (snd_pcm_writei's kernel side). */
     FILE_KIND_SND        = 20,
+    /* Linux slice 3: the two "wait for X as a file descriptor" objects. Both
+     * exist so an event loop can wait on timers and signals with the SAME
+     * epoll/poll call it uses for sockets -- which is how essentially every
+     * modern Linux daemon and runtime is written. Modelled on
+     * FILE_KIND_EVENTFD, including its hard-won lesson: a readiness source
+     * MUST call poll_event_notify() when it becomes ready, or a poller that
+     * is already blocked never wakes (slice 96). */
+    /* Linux slice 6: /dev/full -- reads as zeroes, every write ENOSPC. */
+    FILE_KIND_DEVFULL    = 23,
+    FILE_KIND_TIMERFD    = 21,
+    FILE_KIND_SIGNALFD   = 22,
+    /* Phase 3 slice 8: an open /proc/PID/ns/<kind>. Carries no data at all --
+     * read/write are meaningless on it. Its whole purpose is to be a HANDLE ON
+     * A NAMESPACE that setns(2) can be given, and to hold a reference so the
+     * namespace outlives its last member while an fd still names it (the
+     * mechanism `ip netns add` pins one with). See nsproxy.c. */
+    FILE_KIND_NSFD       = 24,
 };
 
 struct eventfd;
 struct memfd;
 struct shm_cache;
+struct timerfd;
+struct signalfd;
+struct nsfd;
 
 struct file {
     enum file_kind  kind;
@@ -171,6 +191,13 @@ struct file {
     struct pty *pty;
     /* For FILE_KIND_EVENTFD (Track C): the shared counter object. */
     struct eventfd *efd;
+    /* Linux slice 3: timerfd / signalfd backing objects. Refcounted like
+     * eventfd so dup() and fork() share one object. */
+    struct timerfd  *tfd;
+    struct signalfd *sfd;
+    /* Phase 3 slice 8: FILE_KIND_NSFD's namespace handle. Refcounted the same
+     * way, so dup()/fork() share one reference-holding object. */
+    struct nsfd     *nsfd;
     /* For FILE_KIND_MEMFD (slice 20): the shared page-backed memory object.
      * The per-fd read/write cursor lives in vfs.pos (unused for memfd otherwise). */
     struct memfd *memfd;
@@ -204,6 +231,33 @@ int eventfd_id(struct file *f);
 
 /* Poll readiness helper: nonzero if the eventfd counter is > 0 (POLLIN). */
 int eventfd_pollin(struct file *f);
+
+/* ---- Linux slice 3: timerfd / signalfd ------------------------------------
+ *
+ * Both follow the eventfd shape exactly: a refcounted backing object, a read()
+ * that yields a fixed-size record, and a *_pollin() the poll dispatcher calls.
+ *
+ * timerfd is EXPIRY-DRIVEN with no timer interrupt behind it: expiries are
+ * computed on demand from the monotonic clock whenever the fd is read or
+ * polled. That is enough for the two things callers actually do (block in
+ * poll until it fires; read the expiry count) and avoids adding a per-fd timer
+ * to the scheduler. The cost, stated: an fd nobody looks at accumulates
+ * nothing until someone looks -- which is indistinguishable from Linux unless
+ * you measure wakeups. */
+struct file *timerfd_file_make(int clockid, unsigned int flags);
+int  timerfd_pollin(struct file *f);
+/* Arm/disarm. `value_ns` == 0 disarms; `interval_ns` != 0 makes it periodic.
+ * Returns the previously-programmed setting through *old_value/*old_interval
+ * when those are non-NULL. */
+int  timerfd_set(struct file *f, uint64_t value_ns, uint64_t interval_ns,
+                 int absolute, uint64_t *old_value, uint64_t *old_interval);
+int  timerfd_get(struct file *f, uint64_t *value_ns, uint64_t *interval_ns);
+
+struct file *signalfd_file_make(uint64_t mask, unsigned int flags);
+int  signalfd_pollin(struct file *f);
+/* Replace the watched signal mask on an existing signalfd (signalfd(2) with
+ * an existing fd). Mask is in TOBYOS numbering (bit == signo). */
+void signalfd_setmask(struct file *f, uint64_t mask);
 
 /* Allocate + initialise the well-known console-backed file. Each call
  * returns a fresh kmalloc'd struct -- never share, so close() can

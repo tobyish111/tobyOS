@@ -23,6 +23,8 @@
  */
 
 #include <tobyos/net.h>
+#include <tobyos/nsproxy.h>
+#include <tobyos/proc.h>
 #include <tobyos/arp.h>
 #include <tobyos/socket.h>
 #include <tobyos/dhcp.h>
@@ -62,6 +64,50 @@ static uint64_t        g_net_boot_next_tick;
 /* Set once in net_init(): true iff the running IPv4 config came from DHCP
  * (not static fallback). Used by bootlog UDP upload targeting. */
 static bool g_net_boot_via_dhcp;
+
+/* ---- Slice 12 cut 2: "my address", per network namespace ----------------
+ *
+ * g_my_ip is the INITIAL namespace's address and stays exactly that -- DHCP
+ * writes it, ifconfig reads it, nothing about that path changes. These
+ * accessors add the namespaced answer on top:
+ *
+ *   1. an active receive context wins (we are processing a frame that arrived on
+ *      a veth end, so "us" means that namespace);
+ *   2. otherwise the calling process's namespace;
+ *   3. otherwise g_my_ip.
+ *
+ * Every consumer that used to read g_my_ip directly to answer "is this mine?"
+ * now calls these, which is what stops a container's stack claiming the host's
+ * address (and vice versa). */
+uint32_t net_my_ip(void) {
+    void *ns = net_ns_rx_current();
+    if (!ns) { struct proc *cp = current_proc(); ns = cp ? cp->net_ns : 0; }
+    if (ns) return net_ns_ip(ns);
+    return g_my_ip;
+}
+/* The MAC of the interface "we" would transmit from, namespace-relative.
+ *
+ * Needed because the ARP PAYLOAD carries a sender hardware address, and that has
+ * to be the replying device's MAC. Fixing only the ethernet header (eth_send)
+ * left ARP replies from inside a namespace advertising the HOST NIC's MAC -- so
+ * the peer cached "container-ip is at host-mac", which resolves fine and is
+ * completely wrong. Two layers, both needed. */
+const uint8_t *net_my_mac(void) {
+    void *ns = net_ns_rx_current();
+    if (!ns) { struct proc *cp = current_proc(); ns = cp ? cp->net_ns : 0; }
+    if (ns) {
+        struct net_dev *d = net_ns_dev(ns);
+        if (d) return d->mac;
+    }
+    return g_my_mac;
+}
+
+uint32_t net_my_netmask(void) {
+    void *ns = net_ns_rx_current();
+    if (!ns) { struct proc *cp = current_proc(); ns = cp ? cp->net_ns : 0; }
+    if (ns) return net_ns_netmask(ns);
+    return g_my_netmask;
+}
 
 bool net_is_up(void) { return g_net_up; }
 

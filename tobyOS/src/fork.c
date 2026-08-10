@@ -29,6 +29,9 @@
 #include <tobyos/uaccess.h>
 #include <tobyos/mmap.h>
 #include <tobyos/rng.h>
+#include <tobyos/nsproxy.h>   /* nsproxy_fork_inherit (slice 8) */
+#include <tobyos/seccomp.h>   /* seccomp_fork_inherit (slice 13) */
+#include <tobyos/cgroup.h>    /* cgroup_can_fork (slice 15) */
 
 extern struct proc g_proc[];
 
@@ -447,6 +450,11 @@ long sys_fork(void) {
      * runs for hundreds of ms across cow_fork; with the slot left UNUSED a
      * concurrent sys_clone_thread claimed the SAME slot and both built in it
      * (the mp bootstrap flake -- see the slice 109 ledger entry). */
+    /* Slice 15: the pids controller. Checked BEFORE claiming a slot so a denied
+     * fork costs nothing and cannot leave a PROC_EMBRYO behind -- which, per the
+     * slice-109 note directly above, is the state that must never leak. */
+    { long cgrc = cgroup_can_fork(parent);
+      if (cgrc != 0) return cgrc; }
     struct proc *child = proc_slot_claim();
     if (!child) {
 #ifdef CHROMIUM_BOOT
@@ -497,6 +505,34 @@ long sys_fork(void) {
     child->syscall_count  = 0;
     child->last_switch_tsc = 0;
     child->sysprot_priv   = 0;
+    /* Slice 8: the memcpy copied the parent's namespace POINTERS, which is the
+     * correct inheritance -- but each one now has a second user, so take the
+     * references. Omitting this makes the parent's exit free a namespace the
+     * child is still in. */
+    nsproxy_fork_inherit(child);
+    seccomp_fork_inherit(child);   /* slice 13: a child cannot escape the filter */
+    /* ...then apply any CLONE_NEW* the caller staged. This happens HERE, while
+     * the child is still PROC_EMBRYO and not yet enqueued, because the child
+     * becomes runnable on another core before this function returns -- see the
+     * clone_ns_flags comment in proc.h. */
+    {
+        uint32_t nsf = parent->clone_ns_flags;
+        parent->clone_ns_flags = 0;
+        long nsrc = nsf ? nsproxy_apply_clone_flags(child, nsf) : 0;
+        /* Slice 10: pid placement runs UNCONDITIONALLY, not only when clone
+         * flags were staged -- a plain fork(2) still has to land the child in
+         * parent->pid_ns_for_children, which differs from the parent's own
+         * namespace after unshare(CLONE_NEWPID), and still needs a vpid
+         * allocated in that namespace and every ancestor. */
+        if (nsrc == 0)
+            nsrc = pid_ns_place_child(child, parent, nsf, false);
+        if (nsrc != 0) {
+            nsproxy_release(child);
+            memset(child, 0, sizeof(*child));
+            child->state = PROC_UNUSED;
+            return nsrc;
+        }
+    }
     /* Slice 113: the child returns to user via fork_child_entry, skipping
      * the dispatcher epilogue that clears cursys -- the memcpy'd values
      * would read as the PARENT's syscall in every instrument until the
@@ -514,6 +550,7 @@ long sys_fork(void) {
     /* Allocate a new PML4 with the kernel half mirrored. */
     uint64_t new_pml4 = vmm_create_user_pml4();
     if (!new_pml4) {
+        nsproxy_release(child);        /* slice 8: undo fork_inherit */
         memset(child, 0, sizeof(*child));
         child->state = PROC_UNUSED;
         return -ABI_ENOMEM;
@@ -556,6 +593,7 @@ long sys_fork(void) {
         tg_vm_resume(parent);   /* always: releases g_cow_fork_lock */
         if (cow_rc != 0) {
             vmm_destroy_user_pml4(new_pml4);
+            nsproxy_release(child);    /* slice 8 */
             memset(child, 0, sizeof(*child));
             child->state = PROC_UNUSED;
             return -ABI_ENOMEM;
@@ -608,6 +646,7 @@ long sys_fork(void) {
             child->fds[i] = NULL;
         }
         vmm_destroy_user_pml4(new_pml4);
+        nsproxy_release(child);        /* slice 8 */
         memset(child, 0, sizeof(*child));
         child->state = PROC_UNUSED;
         return -ABI_ENOMEM;
@@ -627,7 +666,12 @@ long sys_fork(void) {
     child->state = PROC_READY;
     sched_enqueue(child);
 
-    child->user_pages = parent->user_pages;
+    /* SLICE 16: this path FULL-COPIES the user half (see copy_user_pages), so the
+     * child genuinely owns every one of these pages and the charge is exact.
+     * cgroup_mem_charge bumps child->user_pages itself, so assigning it as well
+     * would double it. */
+    child->user_pages = 0;
+    cgroup_mem_charge(child, parent->user_pages);
     perf_count_proc_spawn();
 
     kprintf("[fork] parent pid=%d -> child pid=%d cr3=0x%lx\n",
@@ -690,6 +734,7 @@ long sys_fork_share(void) {
                           ? proc_lookup(parent->tgid) : parent;
     if (!tg) tg = parent;
 
+    { long cgrc = cgroup_can_fork(parent); if (cgrc != 0) return cgrc; }  /* slice 15 */
     struct proc *child = proc_slot_claim();
     if (!child) return -ABI_ENOMEM;
 
@@ -721,6 +766,21 @@ long sys_fork_share(void) {
     child->cursys_nat      = -1;
     child->pending_signals  = 0;
     child->sigstate.pending = 0;
+    nsproxy_fork_inherit(child);
+    seccomp_fork_inherit(child);   /* slice 13 -- see sys_fork */
+    {
+        uint32_t nsf = parent->clone_ns_flags;
+        parent->clone_ns_flags = 0;
+        long nsrc = nsf ? nsproxy_apply_clone_flags(child, nsf) : 0;
+        if (nsrc == 0)
+            nsrc = pid_ns_place_child(child, parent, nsf, false);  /* slice 10 */
+        if (nsrc != 0) {
+            nsproxy_release(child);
+            memset(child, 0, sizeof(*child));
+            child->state = PROC_UNUSED;
+            return nsrc;
+        }
+    }
 
     /* Borrow parent's address space — do NOT CoW-WP. */
     child->cr3       = tg->cr3;
@@ -741,6 +801,7 @@ long sys_fork_share(void) {
             if (child->fds[i]) file_close(child->fds[i]);
             child->fds[i] = NULL;
         }
+        nsproxy_release(child);        /* slice 8 */
         memset(child, 0, sizeof(*child));
         child->state = PROC_UNUSED;
         return -ABI_ENOMEM;
@@ -779,6 +840,7 @@ long sys_fork_share(void) {
                 child->fds[i] = NULL;
             }
             if (child->kstack_base) kfree(child->kstack_base);
+            nsproxy_release(child);    /* slice 8 */
             memset(child, 0, sizeof(*child));
             child->state = PROC_UNUSED;
             return -ABI_ENOMEM;
@@ -792,7 +854,17 @@ long sys_fork_share(void) {
         cr->user_rsp = stack_va + (uint64_t)np * PAGE_SIZE - 256;
     }
 
-    child->user_pages = parent->user_pages;
+    /* SLICE 16: NO charge here, and that is deliberate.
+     *
+     * sys_fork_share SHARES the parent's address space (child->mm_owner = parent),
+     * so every page the child can touch is already charged to the parent. Charging
+     * the child too would double-count the whole space on every vfork -- and busybox
+     * uses vfork constantly. The child's own counter stays 0, which is also what
+     * makes its teardown a no-op while the parent still holds the mapping.
+     *
+     * The pages the child faults in later resolve to the mm owner via
+     * mm_charge_target(), so they land on the parent exactly once. */
+    child->user_pages = 0;
     __atomic_store_n(&parent->vfork_child, child_pid, __ATOMIC_RELEASE);
     child->state = PROC_READY;
     sched_enqueue(child);
@@ -853,6 +925,12 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
                           ? proc_lookup(parent->tgid) : parent;
     if (!tg) return -ABI_EINVAL;
 
+    /* Slice 15: threads count too. Linux's pids controller limits TASKS, not
+     * processes, so a cgroup at its limit must not be able to keep growing by
+     * spawning threads instead of forking -- that would make pids.max trivially
+     * evadable by any threaded program. cgroup_nr_procs counts g_proc entries,
+     * which is threads included, so the two agree. */
+    { long cgrc = cgroup_can_fork(parent); if (cgrc != 0) return cgrc; }
     struct proc *child = proc_slot_claim();
     if (!child) return -ABI_ENOMEM;
     int child_pid = (int)(child - g_proc);
@@ -888,6 +966,22 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->sysprot_priv    = 0;
     child->cursys          = -1;   /* slice 113: see sys_fork */
     child->cursys_nat      = -1;
+    /* Slice 8: a thread shares its leader's namespaces (Linux shares the whole
+     * nsproxy across CLONE_THREAD) but holds its OWN reference, because a
+     * thread can outlive its leader in this kernel -- see proc_reap's PML4
+     * heir logic for the same hazard. Both thread-teardown paths in proc.c call
+     * nsproxy_release to balance this. */
+    nsproxy_fork_inherit(child);
+    seccomp_fork_inherit(child);   /* slice 13: a child cannot escape the filter */
+    /* Slice 10: a tid is namespace-local exactly like a pid, so a thread needs
+     * its own vpid in the thread group's namespace. CLONE_NEW* on a thread is
+     * refused at the syscall boundary, so this never creates a namespace. */
+    if (pid_ns_place_child(child, tg, 0, true) != 0) {
+        nsproxy_release(child);
+        memset(child, 0, sizeof(*child));
+        child->state = PROC_UNUSED;
+        return -ABI_EAGAIN;
+    }
 
     size_t nlen = strlen(tg->name);
     if (nlen > PROC_NAME_MAX - 3) nlen = PROC_NAME_MAX - 3;
@@ -906,6 +1000,7 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
         child->fds[i] = NULL;
 
     if (!build_fork_kstack(child)) {
+        nsproxy_release(child);        /* slice 8 */
         memset(child, 0, sizeof(*child));
         child->state = PROC_UNUSED;
         return -ABI_ENOMEM;
@@ -923,11 +1018,18 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
                                                               : parent->tls_base;
 
     /* CLONE_PARENT_SETTID / CLONE_CHILD_SETTID: publish the new tid into the
-     * shared address space (we're already on the shared CR3). */
-    if ((flags & 0x00100000u /* CLONE_PARENT_SETTID */) && ptid)
-        (void)put_user_u32((void *)ptid, (uint32_t)child_pid);
-    if ((flags & 0x01000000u /* CLONE_CHILD_SETTID */) && ctid)
-        (void)put_user_u32((void *)ctid, (uint32_t)child_pid);
+     * shared address space (we're already on the shared CR3).
+     *
+     * Slice 10: this MUST be the namespace-local tid, because user code
+     * compares it against gettid() and passes it to tgkill(). Publishing a kpid
+     * here while gettid() reported a vpid would break pthread_join in a pid
+     * namespace -- and silently, since both numbers look equally plausible. */
+    { uint32_t vtid = (uint32_t)(pid_vnr(child) ? pid_vnr(child) : child_pid);
+      if ((flags & 0x00100000u /* CLONE_PARENT_SETTID */) && ptid)
+          (void)put_user_u32((void *)ptid, vtid);
+      if ((flags & 0x01000000u /* CLONE_CHILD_SETTID */) && ctid)
+          (void)put_user_u32((void *)ctid, vtid);
+    }
 
     /* B11: CLONE_CHILD_CLEARTID -- record the futex address the kernel must
      * zero + wake when THIS thread exits (the pthread_join rendezvous). The
@@ -1112,10 +1214,29 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     uint64_t xt_read = 0, xt_load = 0, xt_interp = 0, xt_stack = 0;
 #endif
 
-    /* Copy path into a kernel buffer (per-copy uaccess). */
+    /* Copy path into a kernel buffer AND resolve it the way every other
+     * path-taking syscall does.
+     *
+     * Linux slice 7: this used a bare strncpy_from_user(), i.e. the RAW user
+     * string, so execve was the ONE path syscall that ignored both the cwd
+     * and -- once slice 5 added it -- the process's chroot root. Inside a
+     * chroot that is not a cosmetic gap: `chroot /jail /bin/busybox` silently
+     * exec'd the HOST's /bin/busybox (the path exists there too), so the jail
+     * appeared to work while running the wrong binary entirely; and anything
+     * whose executable exists ONLY inside the jail -- Alpine's /bin/sh,
+     * /sbin/apk -- failed with "No such file or directory" while plainly
+     * being present. One root cause, three symptoms.
+     *
+     * resolve_user_path() does the user copy itself and applies cwd + fs_root,
+     * with the chroot prefix added AFTER lexical cleaning so ".." cannot climb
+     * out (see its comment). */
     char kpath[ABI_PATH_MAX];
-    long plen = strncpy_from_user(kpath, path, sizeof(kpath));
-    if (plen < 0) return -ABI_EFAULT;
+    {
+        extern int resolve_user_path(const char *user_path, char *out, size_t cap);
+        int prc = resolve_user_path(path, kpath, sizeof(kpath));
+        if (prc != 0) return prc;
+    }
+    long plen = (long)strlen(kpath);
     if (plen == 0) return -ABI_EINVAL;
 
     /* Resolve symlinks NOW, so everything downstream -- the ELF read, p->name
@@ -1218,6 +1339,53 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     if (rc != 0) {
         kprintf("[execve] cannot read '%s': %d\n", kpath, rc);
         return -ABI_ENOENT;
+    }
+
+    /* ---- Linux slice 2: the set-user-ID-on-exec transition ----
+     *
+     * Applied here: the image has been read (so we know the exec will not fail
+     * for a missing/unreadable file) but the address space has not been torn
+     * down yet. POSIX says the transition happens as part of a SUCCESSFUL exec.
+     *
+     * Semantics: S_ISUID sets the EFFECTIVE uid to the file's owner and copies
+     * it to the SAVED uid -- the saved copy is the whole point, since it is
+     * what lets the program drop privilege with seteuid() and pick it back up
+     * later. The REAL uid never changes, which is how a setuid program can
+     * still tell who invoked it.
+     *
+     * Only possible at all because VFS_MODE_PERMS widened from 00777 to 07777
+     * in this slice; before that every filesystem masked S_ISUID off and a
+     * setuid binary was indistinguishable from an ordinary one.
+     *
+     * MNT_NOSUID IS enforced (VFS_MNT_NOSUID, added in slice 2 alongside this).
+     * Linux ignores setuid bits on filesystems mounted nosuid, and that check
+     * is what stands between "userspace can mount" and "userspace is root":
+     * without it, an attacker mounts any image containing a root-owned setuid
+     * shell and wins. Every kernel-internal mount passes flags 0, so this is a
+     * no-op today; mount(2) in slice 5 only has to pass the user's flags to
+     * vfs_mount_flags() and this site already does the right thing. */
+    {
+        struct vfs_stat xst;
+        uint32_t mflags = vfs_path_mount_flags(kpath);
+        if (!(mflags & VFS_MNT_NOSUID) &&
+            vfs_stat(kpath, &xst) == VFS_OK && (xst.mode & VFS_MODE_VALID)) {
+            if (xst.mode & VFS_MODE_SETUID) {
+                p->uid  = (int)xst.uid;
+                p->suid = p->uid;
+                if (p->uid == 0)
+                    p->lcap_eff = p->lcap_perm = p->lcap_inh = ~0ull;
+            }
+            if (xst.mode & VFS_MODE_SETGID) {
+                p->gid  = (int)xst.gid;
+                p->sgid = p->gid;
+            }
+        } else if (mflags & VFS_MNT_NOSUID) {
+            struct vfs_stat nst;
+            if (vfs_stat(kpath, &nst) == VFS_OK &&
+                (nst.mode & (VFS_MODE_SETUID | VFS_MODE_SETGID)))
+                kprintf("[execve] nosuid mount: ignoring set-id bits on '%s'\n",
+                        kpath);
+        }
     }
 
     /* Destroy the old user-half mappings and rebuild the address space.

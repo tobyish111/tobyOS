@@ -19,6 +19,17 @@
  * --screenshot flags, plus --remote-debugging-pipe.
  */
 
+/* Phase 3 slice 14: the unprivileged identity the sandboxed browser runs as.
+ * 1000 matches the uid linux-netns bit7 proved the sandbox recipe with (it does
+ * unshare(CLONE_NEWUSER|CLONE_NEWNET) as uid 1000 and keeps working local IPC),
+ * so this is the identity already known to work for the namespace half. */
+#ifndef CW_SANDBOX_UID
+#define CW_SANDBOX_UID 1000
+#endif
+#ifndef CW_SANDBOX_GID
+#define CW_SANDBOX_GID 1000
+#endif
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1018,12 +1029,27 @@ static int spawn_chrome(void) {
 #else
             (char *)"/opt/chrome/chrome-headless-shell",
 #endif
-            /* MANDATORY: we run as root; chrome exit(1)s at ~4s with
+#ifndef CW_SANDBOX
+            /* MANDATORY WHILE ROOT: chrome exit(1)s at ~4s with
              * "Running as root without --no-sandbox is not supported"
              * otherwise (zygote_host_impl_linux.cc:101).  This exact
-             * omission cost a full 440s run that looked like a hang. */
+             * omission cost a full 440s run that looked like a hang.
+             *
+             * Phase 3 slice 14: this is a CHROMIUM POLICY CHECK, not a kernel
+             * capability gap. The kernel has user/pid/net namespaces and
+             * seccomp, all verified -- what was missing was a way for this
+             * NATIVE process to stop being root, which ABI_SYS_SETUID now
+             * provides. Build with -DCW_SANDBOX to drop these flags and run
+             * the browser under its real sandbox as an unprivileged uid.
+             *
+             * DEFAULT IS OFF DELIBERATELY. Every QEMU boot in this tree
+             * auto-logs-in as root, so the sandboxed path cannot be validated
+             * here; the plan requires an EliteDesk run for slice 14. Flipping
+             * the default is a one-line change once that passes -- see the
+             * checklist in docs/linux-arc-handoff-phase3.md. */
             (char *)"--no-sandbox",
             (char *)"--no-zygote",
+#endif
 #ifndef CW_MP
             /* Slice 107: handoff §6 candidate 1 assumes chrome's renderer ->
              * viz frame transport uses SHARED MEMORY over Mojo. Under
@@ -1184,15 +1210,38 @@ static int spawn_chrome(void) {
             (char *)"--ignore-certificate-errors",
             (char *)"--allow-file-access-from-files",
             (char *)"--autoplay-policy=no-user-gesture-required",
-            /* Slice 56: tobyOS has no ALSA device. With audio enabled, the
-             * watch-page renderer initialised playback at ~42s (AudioService
-             * spawned, PcmOpen failed, SyncReader timed out, broken pipe) and
-             * the RENDERER exit(0)'d ~1s later -- taking the whole page (and
-             * all MSE fetches) with it, with no crash and no respawn. Disable
-             * audio output entirely (and mute as belt-and-braces) so playback
-             * runs video-only until an audio device exists. */
-            (char *)"--mute-audio",
-            (char *)"--disable-audio-output",
+            /* Slice 56 disabled audio output here, for a good reason at the
+             * time: tobyOS had no ALSA device, so the watch-page renderer
+             * initialised playback at ~42s (AudioService spawned, PcmOpen
+             * failed, SyncReader timed out, broken pipe) and the RENDERER
+             * exit(0)'d a second later, taking the whole page and all its
+             * MSE fetches with it -- no crash, no respawn. The flags said
+             * "until an audio device exists".
+             *
+             * AUDIO SLICE 5: it exists. /dev/snd/{controlC0,pcmC0D0p} is a
+             * real ALSA node over the HDA driver (src/snd_pcm.c), and the
+             * unmodified libasound.so.2 chrome dlopens has been verified
+             * driving it end to end (/bin/linux-alsatest, [LXALSA] PASS).
+             * So both flags come off and chrome gets to open the device
+             * the same way any Linux build would.
+             *
+             * Requires QEMU to actually have a codec attached:
+             *   -device intel-hda -device hda-output,audiodev=<id>
+             * Without one, hda_probe never binds, /dev/snd returns ENOENT,
+             * and chrome degrades exactly as a Linux box with no sound
+             * card does -- which is the correct behaviour, not the
+             * renderer-killing failure slice 56 was working around.
+             *
+             * Name the output device explicitly. Chrome's AudioManagerAlsa
+             * otherwise ENUMERATES devices before opening one, and that
+             * walk (snd_device_name_hint and friends) probes far more of
+             * the control surface than a playback path needs -- observed:
+             * it opened /dev/snd/controlC0 eight times, never opened
+             * pcmC0D0p at all, and produced silence. Naming the device is
+             * the documented way to bypass the hint machinery, and
+             * plughw:0,0 keeps alsa-lib's format/rate conversion in front
+             * of us so chrome may ask for whatever it likes. */
+            (char *)"--alsa-output-device=plughw:0,0",
             /* Slice 59: present as ordinary desktop Chrome. chrome-headless-
              * shell otherwise advertises "HeadlessChrome/151...", which
              * YouTube treats as a bot: it serves a proof-of-origin/signature
@@ -1275,6 +1324,36 @@ static int spawn_chrome(void) {
             (char *)"FONTCONFIG_FILE=/etc/fonts/fonts.conf",
             0,
         };
+#ifdef CW_SANDBOX
+        /* Phase 3 slice 14: STOP BEING ROOT before handing control to Chromium.
+         *
+         * Order matters and this is the only correct place for it: after every
+         * privileged setup step this launcher performs, and before execve, because
+         * the credentials a process execs with are the ones Chromium sees when it
+         * decides whether it may enable its sandbox.
+         *
+         * A failure here must be FATAL rather than "carry on as root": continuing
+         * would exec a root Chromium with the --no-sandbox flags now removed, which
+         * is exactly the exit(1)-at-4s trap that once cost a 440-second run, and it
+         * would look like a hang rather than a refusal.
+         *
+         * setgid BEFORE setuid -- after dropping uid we no longer have the authority
+         * to change gid, so the reverse order silently leaves the process in group 0. */
+        if (sc3(ABI_SYS_SETGID, (long)CW_SANDBOX_GID, 0, 0) != 0) {
+            printf("[chromewin] FATAL: setgid(%d) failed; refusing to exec a "
+                   "privileged chrome with the sandbox flags removed\n",
+                   CW_SANDBOX_GID);
+            return 1;
+        }
+        if (sc3(ABI_SYS_SETUID, (long)CW_SANDBOX_UID, 0, 0) != 0) {
+            printf("[chromewin] FATAL: setuid(%d) failed; refusing to exec a "
+                   "privileged chrome with the sandbox flags removed\n",
+                   CW_SANDBOX_UID);
+            return 1;
+        }
+        printf("[chromewin] dropped to uid=%ld gid=%ld before exec (sandbox build)\n",
+               sc0(ABI_SYS_GETUID), sc0(ABI_SYS_GETGID));
+#endif
         sc3(ABI_SYS_EXECVE, (long)argv[0], (long)argv, (long)envp);
         _exit(127);                            /* execve failed */
     }

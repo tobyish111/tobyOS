@@ -300,11 +300,17 @@ bool ip_send(uint32_t dst_ip_be, uint8_t proto,
  * directed broadcast (e.g. 192.168.1.255) — some DHCP implementations use
  * the latter for OFFER/ACK instead of global broadcast. */
 static bool ip_dst_is_for_us(uint32_t dst_ip_be) {
-    if (dst_ip_be == g_my_ip) return true;
+    /* Slice 12 cut 2: "us" is namespace-relative. net_my_ip() is g_my_ip in the
+     * initial namespace, so the wire path is unchanged; inside a namespace with
+     * a veth end it is that namespace's address, which is what stops a container
+     * accepting packets addressed to the host. */
+    uint32_t me   = net_my_ip();
+    uint32_t mask = net_my_netmask();
+    if (dst_ip_be == me) return true;
     if (dst_ip_be == IP_BROADCAST_BE) return true;
-    if (g_my_ip == 0) return true;
-    if (g_my_netmask) {
-        uint32_t bcast = (g_my_ip & g_my_netmask) | ~g_my_netmask;
+    if (me == 0) return true;
+    if (mask) {
+        uint32_t bcast = (me & mask) | ~mask;
         if (dst_ip_be == bcast) return true;
     }
     return false;

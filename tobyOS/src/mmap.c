@@ -18,6 +18,7 @@
 #include <tobyos/proc.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
+#include <tobyos/cgroup.h>   /* slice 16: the user-page charge funnel */
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
@@ -387,9 +388,9 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
             if (seg > cend) seg = cend;
             uint64_t saved_root = vmm_set_editor_root(p->cr3);
             for (; a < seg; a += PAGE_SIZE) {
-                uint64_t phys = pmm_alloc_page();
+                uint64_t phys = mm_user_page_alloc(p);   /* slice 16: charged */
                 if (!phys) {
-                    kprintf("[mmap] WARN: pmm_alloc_page FAILED at a=0x%lx "
+                    kprintf("[mmap] WARN: user page alloc FAILED at a=0x%lx "
                             "(base=0x%lx len=0x%lx) -- OOM\n",
                             (unsigned long)a, (unsigned long)base,
                             (unsigned long)len);
@@ -491,7 +492,15 @@ long sys_mmap2(uint64_t addr, size_t length, int prot, int flags,
  * the old "always shoot down after unmapping" guarantee for refs>1 / no-free
  * pages too. */
 #define MMAP_FREE_BATCH 256
-struct mmap_free_batch { uint64_t phys[MMAP_FREE_BATCH]; int n; };
+/* Slice 16: the batch carries its OWNER so the memory-controller uncharge happens
+ * in exactly one place (mmap_free_batch_push) rather than at each of the three
+ * call sites. Same reasoning as the alloc funnel: one place is auditable.
+ *
+ * Uncharge happens at PUSH, not at the deferred physical free, because the page
+ * leaves the address space at push time -- that is the moment it stops counting
+ * against the process, and a limit that only relaxed after a TLB shootdown would
+ * make munmap-then-mmap fail for no visible reason. */
+struct mmap_free_batch { uint64_t phys[MMAP_FREE_BATCH]; int n; struct proc *owner; };
 
 /* Quarantine for frames whose shootdown TIMED OUT (slice 50): under WHPX a
  * vCPU can be host-descheduled past the bounded ack wait, so ~8 shootdowns
@@ -541,6 +550,7 @@ static void mmap_free_batch_flush(struct mmap_free_batch *b) {
 static void mmap_free_batch_push(struct mmap_free_batch *b, uint64_t phys) {
     if (b->n == MMAP_FREE_BATCH) mmap_free_batch_flush(b);
     b->phys[b->n++] = phys;
+    cgroup_mem_uncharge(b->owner, 1);           /* slice 16 */
 }
 
 /* ---- munmap ---- */
@@ -558,7 +568,7 @@ long sys_munmap(uint64_t addr, uint64_t len) {
     addr = page_align_down(addr);
     len  = page_align_up(len);
 
-    struct mmap_free_batch fb = { .n = 0 };
+    struct mmap_free_batch fb = { .n = 0, .owner = p };
     for (int i = 0; i < vt->count; i++) {
         struct mmap_vma *v = &vt->entries[i];
         if (addr >= v->end || (addr + len) <= v->start) continue;
@@ -730,7 +740,7 @@ long sys_madvise_dontneed(uint64_t addr, uint64_t len) {
     mprot_ring_note(addr, len, pid, MPROT_MADV);
 #endif
 
-    struct mmap_free_batch fb = { .n = 0 };
+    struct mmap_free_batch fb = { .n = 0, .owner = p };
     for (int i = 0; i < vt->count; i++) {
         struct mmap_vma *v = &vt->entries[i];
         if (addr >= v->end || (addr + len) <= v->start) continue;
@@ -895,7 +905,10 @@ long sys_brk2(uint64_t new_brk) {
     if (new_brk > vt->brk_cur) {
         uint64_t saved_root = vmm_set_editor_root(p->cr3);
         for (uint64_t a = vt->brk_cur; a < new_brk; a += PAGE_SIZE) {
-            uint64_t phys = pmm_alloc_page();
+            /* Slice 16: charged to the cgroup. A 0 here now means EITHER real OOM
+             * OR memory.max -- and ENOMEM is the right answer to both, which is
+             * exactly what Linux returns when brk hits a memory cgroup limit. */
+            uint64_t phys = mm_user_page_alloc(p);
             if (!phys) {
                 vmm_set_editor_root(saved_root);
                 return -12;
@@ -908,7 +921,7 @@ long sys_brk2(uint64_t new_brk) {
 
     /* Shrink: unmap pages between new brk and old brk */
     if (new_brk < vt->brk_cur) {
-        struct mmap_free_batch fb = { .n = 0 };
+        struct mmap_free_batch fb = { .n = 0, .owner = p };
         uint64_t saved_root = vmm_set_editor_root(p->cr3);
         for (uint64_t a = new_brk; a < vt->brk_cur; a += PAGE_SIZE) {
             uint64_t phys = vmm_translate(a);
@@ -978,9 +991,9 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
                           (void *)v->start, (void *)v->end, v->prot);
                 return false; }
 
-            uint64_t new_phys = pmm_alloc_page();
+            uint64_t new_phys = mm_user_page_alloc(p);   /* slice 16: charged */
             if (!new_phys) { vmm_set_editor_root(saved_root);
-                PF_REJECT("COW copy OOM"); return false; }
+                PF_REJECT("COW copy refused (OOM or memory.max)"); return false; }
 
             memcpy((void *)(new_phys + vmm_hhdm_offset()),
                    (void *)(old_phys + vmm_hhdm_offset()),
@@ -996,7 +1009,10 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
             int ins = vmm_remap_page_if(page_va, old_phys, new_phys, vmm_f);
             vmm_set_editor_root(saved_root);
             if (ins != 1) {
-                pmm_free_page(new_phys);        /* our copy was never visible */
+                /* Slice 16: uncharge too -- the copy was charged when allocated,
+                 * and a lost race must not leak a charge or the limit tightens
+                 * every time two CPUs fault the same page. */
+                mm_user_page_free(p, new_phys); /* our copy was never visible */
                 if (ins < 0) { PF_REJECT("COW remap walk failed"); return false; }
 #ifdef CHROMIUM_BOOT
                 { static int _r; if (_r < 24) { _r++;
@@ -1066,8 +1082,11 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
         return false;
     }
 
-    /* Demand paging: allocate a zero-filled physical page */
-    uint64_t phys = pmm_alloc_page();
+    /* Demand paging: allocate a zero-filled physical page.
+     * Slice 16: THE memory-controller hot path -- one charge per fault, next to a
+     * 4 KiB memset, so the accounting is far below the noise floor of the work it
+     * accompanies. (Measured; see the slice-16 notes in the handoff.) */
+    uint64_t phys = mm_user_page_alloc(p);
     if (!phys) {
         /* This failure path is a SILENT fatal SIGSEGV for the process --
          * from the outside indistinguishable from a wild pointer. Name it. */
@@ -1100,7 +1119,10 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
     int ins = vmm_map_page_if_absent(page_va, phys, vmm_f);
     vmm_set_editor_root(saved_root);
     if (ins != 1) {
-        pmm_free_page(phys);
+        /* Slice 16: release the charge with the frame. Losing this race is common
+         * under SMP, so a leaked charge here would ratchet memory.current upward
+         * on a purely successful workload. */
+        mm_user_page_free(p, phys);
         if (ins < 0) {
             kprintf("[mmap] demand-page table OOM at %p\n", (void *)fault_addr);
             return false;

@@ -34,6 +34,8 @@
 #include <tobyos/cpu.h>
 #include <tobyos/sched.h>
 #include <tobyos/proc.h>   /* current_proc -- [efd] Mojo-notification trace */
+#include <tobyos/perf.h>   /* perf_now_ns -- timerfd deadlines (slice 3) */
+#include <tobyos/nsproxy.h>  /* ns_file_clone_ref / ns_file_close (slice 8) */
 #include <tobyos/abi/abi.h>
 
 static long console_read(void *buf, size_t n) {
@@ -163,6 +165,174 @@ static long eventfd_write(struct file *f, const void *buf, size_t n) {
     return 8;
 }
 
+/* ==========================================================================
+ * Linux slice 3: timerfd + signalfd
+ *
+ * Both are "wait for X through the poll loop" objects, built on the eventfd
+ * shape. The single most important thing here is the poll_event_notify()
+ * discipline slice 96 established: a source that becomes ready without
+ * announcing it leaves an already-blocked poller asleep forever.
+ * ========================================================================== */
+
+struct timerfd {
+    uint64_t deadline_ns;   /* absolute monotonic; 0 == disarmed */
+    uint64_t interval_ns;   /* 0 == one-shot */
+    uint64_t last_seen_ns;  /* expiries already accounted to the reader */
+    uint32_t flags;
+    int      clockid;
+    int      refs;
+};
+
+struct signalfd {
+    uint64_t mask;          /* TOBYOS numbering: bit == signo */
+    uint32_t flags;
+    int      refs;
+};
+
+/* Expiries that have elapsed but not yet been reported. Computed on demand --
+ * there is no timer interrupt driving this, which is why every entry point
+ * (read AND poll) has to call it rather than trusting a counter. */
+static uint64_t timerfd_pending_count(struct timerfd *t) {
+    if (!t || t->deadline_ns == 0) return 0;
+    uint64_t now = perf_now_ns();
+    if (now < t->deadline_ns) return 0;
+    if (t->interval_ns == 0) return 1;                 /* one-shot */
+    uint64_t elapsed = now - t->deadline_ns;
+    return 1 + elapsed / t->interval_ns;
+}
+
+struct file *timerfd_file_make(int clockid, unsigned int flags) {
+    struct file *f = (struct file *)kmalloc(sizeof(*f));
+    if (!f) return 0;
+    memset(f, 0, sizeof(*f));
+    struct timerfd *t = (struct timerfd *)kmalloc(sizeof(*t));
+    if (!t) { kfree(f); return 0; }
+    memset(t, 0, sizeof(*t));
+    t->refs = 1; t->clockid = clockid; t->flags = flags;
+    f->kind = FILE_KIND_TIMERFD;
+    f->tfd  = t;
+    return f;
+}
+
+int timerfd_pollin(struct file *f) {
+    return (f && f->tfd && timerfd_pending_count(f->tfd) > 0) ? 1 : 0;
+}
+
+int timerfd_set(struct file *f, uint64_t value_ns, uint64_t interval_ns,
+                int absolute, uint64_t *old_value, uint64_t *old_interval) {
+    if (!f || !f->tfd) return -1;
+    struct timerfd *t = f->tfd;
+    uint64_t now = perf_now_ns();
+    if (old_interval) *old_interval = t->interval_ns;
+    if (old_value) {
+        *old_value = (t->deadline_ns && t->deadline_ns > now)
+                   ? t->deadline_ns - now : 0;
+    }
+    if (value_ns == 0) {                 /* disarm */
+        t->deadline_ns = 0; t->interval_ns = 0;
+    } else {
+        t->deadline_ns = absolute ? value_ns : now + value_ns;
+        t->interval_ns = interval_ns;
+    }
+    t->last_seen_ns = 0;
+    /* Arming can make the fd ready immediately (a deadline already in the
+     * past, which callers do use as "fire now"), so announce it. */
+    poll_event_notify();
+    return 0;
+}
+
+int timerfd_get(struct file *f, uint64_t *value_ns, uint64_t *interval_ns) {
+    if (!f || !f->tfd) return -1;
+    struct timerfd *t = f->tfd;
+    uint64_t now = perf_now_ns();
+    if (interval_ns) *interval_ns = t->interval_ns;
+    if (value_ns) {
+        *value_ns = (t->deadline_ns && t->deadline_ns > now)
+                  ? t->deadline_ns - now : 0;
+    }
+    return 0;
+}
+
+/* read(2) on a timerfd yields a u64 expiry count and RESETS it. Blocks until
+ * at least one expiry unless O_NONBLOCK. */
+static long timerfd_read(struct file *f, void *buf, size_t n) {
+    if (n < 8) return -ABI_EINVAL;
+    struct timerfd *t = f->tfd;
+    for (;;) {
+        uint64_t cnt = timerfd_pending_count(t);
+        if (cnt > 0) {
+            /* Re-base so the same expiries are not reported twice. */
+            if (t->interval_ns == 0) t->deadline_ns = 0;         /* one-shot done */
+            else t->deadline_ns += cnt * t->interval_ns;
+            memcpy(buf, &cnt, 8);
+            return 8;
+        }
+        if (t->flags & EFD_NONBLOCK) return -EFD_EAGAIN;
+        if (t->deadline_ns == 0) {
+            /* Disarmed and non-blocking-less: a read would hang forever.
+             * Linux blocks here too, but a disarmed timer that nobody will
+             * arm is a caller bug, so make it visibly EAGAIN instead of a
+             * silent hang -- easier to debug and strictly more useful. */
+            return -EFD_EAGAIN;
+        }
+        struct proc *p = current_proc();
+        if (p && p->pending_signals) return EINTR_RET;
+        sched_yield();
+    }
+}
+
+struct file *signalfd_file_make(uint64_t mask, unsigned int flags) {
+    struct file *f = (struct file *)kmalloc(sizeof(*f));
+    if (!f) return 0;
+    memset(f, 0, sizeof(*f));
+    struct signalfd *s = (struct signalfd *)kmalloc(sizeof(*s));
+    if (!s) { kfree(f); return 0; }
+    memset(s, 0, sizeof(*s));
+    s->refs = 1; s->mask = mask; s->flags = flags;
+    f->kind = FILE_KIND_SIGNALFD;
+    f->sfd  = s;
+    return f;
+}
+
+void signalfd_setmask(struct file *f, uint64_t mask) {
+    if (f && f->sfd) f->sfd->mask = mask;
+}
+
+int signalfd_pollin(struct file *f) {
+    struct proc *p = current_proc();
+    if (!f || !f->sfd || !p) return 0;
+    return (p->pending_signals & f->sfd->mask) ? 1 : 0;
+}
+
+/* read(2) on a signalfd yields struct signalfd_siginfo (128 bytes) and
+ * CONSUMES the signal -- it is delivered here instead of to a handler. */
+static long signalfd_read(struct file *f, void *buf, size_t n) {
+    if (n < 128) return -ABI_EINVAL;
+    struct signalfd *s = f->sfd;
+    struct proc *p = current_proc();
+    if (!p) return -ABI_EINVAL;
+    for (;;) {
+        uint64_t hit = p->pending_signals & s->mask;
+        if (hit) {
+            int signo = 0;
+            for (int i = 0; i < 32; i++)
+                if (hit & (1ull << i)) { signo = i; break; }
+            p->pending_signals   &= ~(1u << signo);
+            p->sigstate.pending  &= ~SIGMASK(signo);
+            uint8_t si[128];
+            memset(si, 0, sizeof si);
+            *(uint32_t *)&si[0]  = (uint32_t)signo;              /* ssi_signo */
+            *(uint32_t *)&si[8]  = 0;                            /* ssi_code  */
+            *(uint32_t *)&si[12] = (uint32_t)p->sigstate.si_pid[signo]; /* ssi_pid */
+            *(uint32_t *)&si[16] = p->sigstate.si_uid[signo];    /* ssi_uid   */
+            memcpy(buf, si, sizeof si);
+            return 128;
+        }
+        if (s->flags & EFD_NONBLOCK) return -EFD_EAGAIN;
+        sched_yield();
+    }
+}
+
 struct file *file_clone(struct file *src) {
     if (!src) return 0;
     struct file *f = (struct file *)kmalloc(sizeof(*f));
@@ -248,6 +418,21 @@ struct file *file_clone(struct file *src) {
         /* dup/fork share the same counter object; bump its refcount. */
         f->efd = src->efd;
         if (f->efd) f->efd->refs++;
+        break;
+    /* Linux slice 3: same sharing rule -- dup()/fork() must observe ONE timer
+     * and ONE signal mask, not private copies. */
+    case FILE_KIND_TIMERFD:
+        f->tfd = src->tfd;
+        if (f->tfd) f->tfd->refs++;
+        break;
+    case FILE_KIND_SIGNALFD:
+        f->sfd = src->sfd;
+        if (f->sfd) f->sfd->refs++;
+        break;
+    /* Slice 8: an nsfd must survive fork/dup with the namespace still pinned --
+     * that is the whole point of holding a reference through the descriptor. */
+    case FILE_KIND_NSFD:
+        ns_file_clone_ref(f, src);
         break;
     case FILE_KIND_MEMFD:
         /* dup/dup2/fork share the SAME page-backed object; bump its refcount.
@@ -349,6 +534,15 @@ void file_close(struct file *f) {
     case FILE_KIND_EVENTFD:
         if (f->efd && --f->efd->refs == 0) kfree(f->efd);
         break;
+    case FILE_KIND_TIMERFD:
+        if (f->tfd && --f->tfd->refs == 0) kfree(f->tfd);
+        break;
+    case FILE_KIND_SIGNALFD:
+        if (f->sfd && --f->sfd->refs == 0) kfree(f->sfd);
+        break;
+    case FILE_KIND_NSFD:
+        ns_file_close(f);      /* drops the fd's reference on the namespace */
+        break;
     case FILE_KIND_MEMFD:
         memfd_unref(f->memfd);   /* frees pages+object at the last ref */
         break;
@@ -371,6 +565,10 @@ long file_read(struct file *f, void *buf, size_t n) {
         return pty_slave_read(f, buf, n);
     case FILE_KIND_EVENTFD:
         return eventfd_read(f, buf, n);
+    case FILE_KIND_TIMERFD:
+        return timerfd_read(f, buf, n);
+    case FILE_KIND_SIGNALFD:
+        return signalfd_read(f, buf, n);
     case FILE_KIND_MEMFD: {
         long r = memfd_read(f->memfd, f->vfs.pos, buf, n);
         if (r > 0) f->vfs.pos += (size_t)r;
@@ -379,6 +577,7 @@ long file_read(struct file *f, void *buf, size_t n) {
     case FILE_KIND_DEVNULL:
         return 0;                                  /* always EOF */
     case FILE_KIND_DEVZERO:
+    case FILE_KIND_DEVFULL:                        /* slice 6: reads as zeroes */
         memset(buf, 0, n);
         return (long)n;                            /* endless zeroes */
     case FILE_KIND_DEVRANDOM:
@@ -455,6 +654,8 @@ long file_write(struct file *f, const void *buf, size_t n) {
     case FILE_KIND_DEVNULL:
     case FILE_KIND_DEVZERO:
         return (long)n;                            /* swallow everything */
+    case FILE_KIND_DEVFULL:
+        return -ABI_ENOSPC;                        /* slice 6: always full */
     case FILE_KIND_DEVRANDOM:
         rng_mix(buf, n);                           /* writes seed the pool */
         return (long)n;

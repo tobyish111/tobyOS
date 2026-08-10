@@ -235,14 +235,36 @@ void blk_mark_gone(struct blk_dev *disk);
  * a stale FAT32 mount that survives an unplug returns clean EIO codes
  * instead of dereferencing a freed driver state. The check is two
  * loads + one branch; harmless on the steady-state path. */
+/* Slice 16 (cgroup io): declared locally rather than by including cgroup.h/proc.h.
+ * blk.h is included by nearly every driver, and pulling proc.h in here would create
+ * an include cycle for no gain -- two prototypes are the whole dependency. */
+struct proc;
+struct proc *current_proc(void);
+void cgroup_io_charge(struct proc *p, bool write, uint64_t bytes);
+
+/* Slice 16 (cgroup io): these two inlines are the ONE place every block operation
+ * in the kernel passes through, so io.stat is charged here. A driver cannot bypass
+ * the accounting without bypassing the API itself -- which is the property that
+ * makes the numbers trustworthy rather than merely plausible.
+ *
+ * Cost: one call per block request, against an operation that already costs
+ * thousands of cycles and a DMA round trip. There is no measurable hot path here,
+ * which is why io accounting needed none of the care the memory charge did.
+ *
+ * Charged only on SUCCESS -- a failed read moved no bytes, and counting it would
+ * make io.stat disagree with the device's own counters after an unplug. */
 static inline int blk_read(struct blk_dev *d, uint64_t lba, uint32_t n, void *b) {
     if (!d || d->gone) return -1;
-    return d->ops->read(d, lba, n, b);
+    int r = d->ops->read(d, lba, n, b);
+    if (r >= 0) cgroup_io_charge(current_proc(), false, (uint64_t)n * BLK_SECTOR_SIZE);
+    return r;
 }
 static inline int blk_write(struct blk_dev *d, uint64_t lba, uint32_t n, const void *b) {
     if (!d || d->gone) return -1;
     if (!d->ops->write) return -1;
-    return d->ops->write(d, lba, n, b);
+    int r = d->ops->write(d, lba, n, b);
+    if (r >= 0) cgroup_io_charge(current_proc(), true, (uint64_t)n * BLK_SECTOR_SIZE);
+    return r;
 }
 static inline int blk_flush(struct blk_dev *d) {
     if (!d || d->gone) return -1;

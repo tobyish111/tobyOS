@@ -70,15 +70,15 @@ void arp_request(uint32_t ip_be) {
     p.hw_len     = ETH_ADDR_LEN;
     p.proto_len  = 4;
     p.opcode     = htons(ARP_OP_REQUEST);
-    memcpy(p.sender_mac, g_my_mac, ETH_ADDR_LEN);
-    p.sender_ip  = g_my_ip;
+    memcpy(p.sender_mac, net_my_mac(), ETH_ADDR_LEN);   /* slice 12 cut 2 */
+    p.sender_ip  = net_my_ip();
     memset(p.target_mac, 0, ETH_ADDR_LEN);
     p.target_ip  = ip_be;
     eth_send(g_eth_broadcast, ETH_TYPE_ARP, &p, sizeof(p));
 }
 
 void arp_gratuitous(void) {
-    if (g_my_ip == 0) return;
+    if (net_my_ip() == 0) return;
     /* ARP REQUEST with spa = tpa = our IP — standard gratuitous probe;
      * peers cache (sender_mac, sender_ip) from the frame. */
     struct arp_pkt p;
@@ -87,10 +87,10 @@ void arp_gratuitous(void) {
     p.hw_len     = ETH_ADDR_LEN;
     p.proto_len  = 4;
     p.opcode     = htons(ARP_OP_REQUEST);
-    memcpy(p.sender_mac, g_my_mac, ETH_ADDR_LEN);
-    p.sender_ip  = g_my_ip;
+    memcpy(p.sender_mac, net_my_mac(), ETH_ADDR_LEN);   /* slice 12 cut 2 */
+    p.sender_ip  = net_my_ip();
     memset(p.target_mac, 0, ETH_ADDR_LEN);
-    p.target_ip  = g_my_ip;
+    p.target_ip  = net_my_ip();
     eth_send(g_eth_broadcast, ETH_TYPE_ARP, &p, sizeof(p));
 }
 
@@ -102,8 +102,8 @@ static void arp_send_reply(const uint8_t dst_mac[ETH_ADDR_LEN],
     p.hw_len     = ETH_ADDR_LEN;
     p.proto_len  = 4;
     p.opcode     = htons(ARP_OP_REPLY);
-    memcpy(p.sender_mac, g_my_mac, ETH_ADDR_LEN);
-    p.sender_ip  = g_my_ip;
+    memcpy(p.sender_mac, net_my_mac(), ETH_ADDR_LEN);   /* slice 12 cut 2 */
+    p.sender_ip  = net_my_ip();
     memcpy(p.target_mac, dst_mac, ETH_ADDR_LEN);
     p.target_ip  = dst_ip_be;
     eth_send(dst_mac, ETH_TYPE_ARP, &p, sizeof(p));
@@ -122,7 +122,7 @@ void arp_recv(const void *payload, size_t len) {
     arp_cache_set(p->sender_ip, p->sender_mac);
 
     uint16_t op = ntohs(p->opcode);
-    if (op == ARP_OP_REQUEST && p->target_ip == g_my_ip) {
+    if (op == ARP_OP_REQUEST && p->target_ip == net_my_ip()) {
         arp_send_reply(p->sender_mac, p->sender_ip);
     }
     /* For ARP_OP_REPLY the cache_set above already did the work. */

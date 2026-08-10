@@ -85,6 +85,18 @@ static int read_block(struct tobyfs *fs, uint32_t blk, void *buf) {
     return 0;
 }
 
+/* Linux slice 6: wall-clock seconds for inode timestamps.
+ *
+ * These fields used to be filled with pit_ticks() -- time since BOOT, which
+ * resets every reboot and is not a timestamp at all despite looking like one.
+ * lx_realtime_ns() is the same anchored realtime clock CLOCK_REALTIME uses,
+ * so on-disk times now agree with what userspace sees. */
+static uint32_t tfs_now_secs(void) {
+    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+    extern uint64_t perf_now_ns(void);
+    return (uint32_t)(lx_realtime_ns(perf_now_ns()) / 1000000000ull);
+}
+
 static int write_block_raw(struct tobyfs *fs, uint32_t blk, const void *buf) {
     uint64_t lba = (uint64_t)blk * TFS_SECTORS_PER_BLOCK;
     void *cached = bcache_get(fs->dev, lba);
@@ -651,11 +663,19 @@ static int tobyfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     struct tfs_inode_disk node;
     int rc = path_walk(fs, path, &ino, &node);
     if (rc != VFS_OK) return rc;
-    out->type = (node.type == TFS_TYPE_DIR) ? VFS_TYPE_DIR : VFS_TYPE_FILE;
+    /* Slice 7: report symlinks as such -- vfs_follow_link only engages when
+     * stat says VFS_TYPE_SYMLINK, so getting this wrong makes every link
+     * behave like a regular file containing its own target string. */
+    out->type = (node.type == TFS_TYPE_DIR)     ? VFS_TYPE_DIR
+              : (node.type == TFS_TYPE_SYMLINK) ? VFS_TYPE_SYMLINK
+                                                : VFS_TYPE_FILE;
     out->size = node.size;
     out->uid  = node.uid;
     out->gid  = node.gid;
     out->mode = node.mode;
+    out->mtime = node.mtime;      /* slice 6 */
+    out->atime = node.mtime;      /* no separate atime on disk */
+    out->ctime = node.mtime;
     return VFS_OK;
 }
 
@@ -835,6 +855,38 @@ static long tobyfs_write(struct vfs_file *f, const void *buf, size_t n) {
     uint8_t blkbuf[TFS_BLOCK_SIZE];
 
     while (written < n) {
+        /* ---- Bound the journal transaction --------------------------------
+         *
+         * A single write() can touch far more blocks than one transaction can
+         * hold. TFS_TXN_MAX_BLOCKS is 16, and a 64 KiB write is 16 DATA blocks
+         * before you count the bitmap, indirect and inode blocks that go with
+         * them -- so journal_write() hit VFS_ERR_NOSPC and the whole write
+         * failed. Symptom: `dd bs=64k` transferred ZERO bytes, while 16 KiB
+         * and 32 KiB worked. 4 KiB writes were fine, which is why this hid --
+         * every in-kernel writer used small buffers.
+         *
+         * Fix: commit the current transaction and open a fresh one whenever
+         * the next iteration might not fit. Each chunk stays crash-atomic
+         * (that is what the journal is for); the write as a whole is not one
+         * atomic unit, which POSIX does not require of write(2) on a regular
+         * file anyway.
+         *
+         * RESERVE is the worst-case slot count for one iteration: the data
+         * block, its bitmap block, an indirect block, a double-indirect block,
+         * and the inode -- five, rounded up to six. */
+        #define TFS_TXN_RESERVE 6
+        if (fs->in_transaction &&
+            fs->txn_count + TFS_TXN_RESERVE > (int)TFS_TXN_MAX_BLOCKS) {
+            size_t cur_end = f->pos + written;
+            if (cur_end > h->node.size) h->node.size = (uint32_t)cur_end;
+            h->node.mtime = tfs_now_secs();
+            int crc = write_inode(fs, h->ino, &h->node);
+            if (crc != VFS_OK) { journal_abort(fs); return crc; }
+            crc = journal_commit(fs);
+            if (crc != VFS_OK) return crc;
+            journal_begin(fs);          /* continue in a new transaction */
+        }
+
         size_t off    = f->pos + written;
         uint32_t didx = (uint32_t)(off / TFS_BLOCK_SIZE);
         uint32_t bofs = (uint32_t)(off % TFS_BLOCK_SIZE);
@@ -871,10 +923,19 @@ static long tobyfs_write(struct vfs_file *f, const void *buf, size_t n) {
             }
             memcpy(blkbuf + bofs, in + written, chunk);
         }
-        if (write_block(fs, blk, blkbuf) != 0) {
-            if (written > 0) goto flush;
-            journal_abort(fs);
-            return VFS_ERR_IO;
+        {
+            /* Report the REAL failure. This used to flatten everything to
+             * VFS_ERR_IO, which turned a full-journal VFS_ERR_NOSPC into "I/O
+             * error" -- and since VFS codes leak out as Linux errnos, -7
+             * surfaced to userspace as E2BIG, "Argument list too long", on a
+             * plain disk write. Losing the code cost more debugging time than
+             * the bug it hid. */
+            int wrc = write_block(fs, blk, blkbuf);
+            if (wrc != 0) {
+                if (written > 0) goto flush;
+                journal_abort(fs);
+                return wrc < 0 ? wrc : VFS_ERR_IO;
+            }
         }
         written += chunk;
     }
@@ -883,7 +944,7 @@ flush:
     {
         size_t newend = f->pos + written;
         if (newend > h->node.size) h->node.size = (uint32_t)newend;
-        h->node.mtime = (uint32_t)pit_ticks();
+        h->node.mtime = tfs_now_secs();
         int rc = write_inode(fs, h->ino, &h->node);
         if (rc != VFS_OK) { journal_abort(fs); return rc; }
         rc = journal_commit(fs);
@@ -977,7 +1038,7 @@ static int tobyfs_create(void *mnt, const char *path,
     node.type  = TFS_TYPE_FILE;
     node.nlink = 1;
     node.size  = 0;
-    node.mtime = (uint32_t)pit_ticks();
+    node.mtime = tfs_now_secs();
     node.mode  = mode ? mode : TFS_DEFAULT_FILE_MODE;
     node.uid   = uid;
     node.gid   = gid;
@@ -991,6 +1052,88 @@ static int tobyfs_create(void *mnt, const char *path,
         return rc;
     }
     return journal_commit(fs);
+}
+
+/* Linux slice 7: create an on-disk symbolic link.
+ *
+ * Modelled on tobyfs_create, with the target string written into the inode's
+ * first data block and node.size set to its length -- so readlink is just a
+ * short read and no new on-disk structure exists to version. */
+static int tobyfs_symlink(void *mnt, const char *path, const char *target) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    char parent[VFS_PATH_MAX], leaf[TFS_NAME_MAX + 1];
+    size_t tlen = strlen(target);
+    if (tlen == 0 || tlen >= TFS_BLOCK_SIZE) return VFS_ERR_NAMETOOLONG;
+
+    int rc = split_parent_leaf(path, parent, leaf);
+    if (rc != VFS_OK) return rc;
+    uint32_t pino;
+    struct tfs_inode_disk pnode;
+    rc = path_walk(fs, parent, &pino, &pnode);
+    if (rc != VFS_OK) return rc;
+    if (pnode.type != TFS_TYPE_DIR) return VFS_ERR_NOTDIR;
+
+    uint32_t existing;
+    if (dir_lookup(fs, &pnode, leaf, &existing) == VFS_OK) return VFS_ERR_EXIST;
+
+    journal_begin(fs);
+    uint32_t ino;
+    rc = alloc_inode(fs, &ino);
+    if (rc != VFS_OK) { journal_abort(fs); return rc; }
+
+    struct tfs_inode_disk node = {0};
+    node.type  = TFS_TYPE_SYMLINK;
+    node.nlink = 1;
+    node.size  = (uint32_t)tlen;
+    node.mtime = tfs_now_secs();
+    node.mode  = 00777u | TFS_MODE_VALID;     /* links are always lrwxrwxrwx */
+
+    uint32_t blk;
+    rc = alloc_data_block(fs, &blk);
+    if (rc != VFS_OK) { (void)free_inode(fs, ino); journal_abort(fs); return rc; }
+    rc = set_block_for_index(fs, &node, 0, blk);
+    if (rc != VFS_OK) { (void)free_data_block(fs, blk); (void)free_inode(fs, ino);
+                        journal_abort(fs); return VFS_ERR_IO; }
+    {
+        uint8_t blkbuf[TFS_BLOCK_SIZE];
+        memset(blkbuf, 0, sizeof blkbuf);
+        memcpy(blkbuf, target, tlen);
+        if (write_block(fs, blk, blkbuf) != 0) {
+            (void)free_data_block(fs, blk); (void)free_inode(fs, ino);
+            journal_abort(fs); return VFS_ERR_IO;
+        }
+    }
+    rc = write_inode(fs, ino, &node);
+    if (rc != VFS_OK) { (void)free_inode(fs, ino); journal_abort(fs); return rc; }
+    rc = dir_insert(fs, pino, &pnode, ino, leaf);
+    if (rc != VFS_OK) { (void)free_inode(fs, ino); journal_abort(fs); return rc; }
+    return journal_commit(fs);
+}
+
+/* Linux slice 7: read an on-disk symbolic link's target. */
+static int tobyfs_readlink(void *mnt, const char *path,
+                           char *buf, size_t bufsz) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    uint32_t ino;
+    struct tfs_inode_disk node;
+    int rc = path_walk(fs, path, &ino, &node);
+    if (rc != VFS_OK) return rc;
+    if (node.type != TFS_TYPE_SYMLINK) return VFS_ERR_INVAL;
+    uint32_t blk = get_block_for_index(fs, &node, 0);
+    if (blk == 0) return VFS_ERR_IO;
+    uint8_t blkbuf[TFS_BLOCK_SIZE];
+    if (read_block(fs, blk, blkbuf) != 0) return VFS_ERR_IO;
+    size_t n = node.size;
+    if (n >= bufsz) n = bufsz - 1;
+    memcpy(buf, blkbuf, n);
+    buf[n] = '\0';
+    /* VFS_OK, NOT the length. vfs_readlink()'s caller tests `rc != VFS_OK`
+     * and takes the string's length itself, so returning a byte count here
+     * (the obvious readlink(2)-shaped answer) reads as an error code and
+     * makes every link look broken -- which is exactly what happened to the
+     * 335 links in the extracted Alpine rootfs. procfs_readlink returns
+     * VFS_OK for the same reason. */
+    return VFS_OK;
 }
 
 static int tobyfs_mkdir(void *mnt, const char *path,
@@ -1021,7 +1164,7 @@ static int tobyfs_mkdir(void *mnt, const char *path,
     node.type  = TFS_TYPE_DIR;
     node.nlink = 1;
     node.size  = 0;
-    node.mtime = (uint32_t)pit_ticks();
+    node.mtime = tfs_now_secs();
     node.mode  = mode ? mode : TFS_DEFAULT_DIR_MODE;
     node.uid   = uid;
     node.gid   = gid;
@@ -1038,6 +1181,8 @@ static int tobyfs_mkdir(void *mnt, const char *path,
     return journal_commit(fs);
 }
 
+
+
 static int tobyfs_chmod(void *mnt, const char *path, uint32_t mode) {
     struct tobyfs *fs = (struct tobyfs *)mnt;
     uint32_t ino;
@@ -1048,6 +1193,73 @@ static int tobyfs_chmod(void *mnt, const char *path, uint32_t mode) {
      * but mask everything else to perms only. */
     node.mode = (mode & TFS_MODE_PERMS) | TFS_MODE_VALID;
     return write_inode(fs, ino, &node);
+}
+
+/* Linux slice 6: persist timestamps. The on-disk inode has ONE time field, so
+ * atime is accepted and folded into mtime rather than stored separately --
+ * stated plainly because a caller that sets only atime will see mtime move.
+ * The alternative (silently ignoring atime) would be worse: `tar -x` and
+ * `cp -p` set both, and mtime is the one anything actually compares. */
+static int tobyfs_utimes(void *mnt, const char *path,
+                         uint64_t mtime, uint64_t atime) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    uint32_t ino;
+    struct tfs_inode_disk node;
+    int rc = path_walk(fs, path, &ino, &node);
+    if (rc != VFS_OK) return rc;
+    node.mtime = (uint32_t)(mtime ? mtime : atime);
+    return write_inode(fs, ino, &node);
+}
+
+/* Linux slice 6: set a file's length.
+ *
+ * SCOPE, stated plainly:
+ *   - truncate to 0 frees every data block (the `> file` case, and the one
+ *     where leaking blocks would actually hurt).
+ *   - a partial SHRINK updates the size but leaves the now-unreachable tail
+ *     blocks allocated until the file is unlinked. Reclaiming them needs a
+ *     block-range free that the inode layout does not have a helper for; the
+ *     space is recovered on unlink, so this wastes blocks rather than losing
+ *     data.
+ *   - a GROW is sparse: the size moves and reads past the old end return
+ *     zeroes, because get_block_for_index() reports "no block" as zero-fill.
+ * All three match what callers observe on Linux; only the middle one differs
+ * in on-disk economy. */
+static int tobyfs_truncate(void *mnt, const char *path, uint64_t length) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    uint32_t ino;
+    struct tfs_inode_disk node;
+    int rc = path_walk(fs, path, &ino, &node);
+    if (rc != VFS_OK) return rc;
+    if (node.type == TFS_TYPE_DIR) return VFS_ERR_ISDIR;
+    if (length > 0xFFFFFFFFull) return VFS_ERR_INVAL;
+
+    journal_begin(fs);
+    if (length == 0) inode_free_blocks(fs, &node);
+    node.size  = (uint32_t)length;
+    node.mtime = tfs_now_secs();
+    rc = write_inode(fs, ino, &node);
+    if (rc != VFS_OK) { journal_abort(fs); return rc; }
+    return journal_commit(fs);
+}
+
+/* Linux slice 6: truncate through an OPEN handle. The handle already carries
+ * the inode number and a cached copy of the inode, so this needs no path walk
+ * -- which is the point: busybox's `truncate` and CPython's os.ftruncate act
+ * on an fd, and the slice-1 ftruncate only ever touched in-memory open-file
+ * state that never reached the disk. Same scope notes as tobyfs_truncate. */
+static int tobyfs_ftruncate(struct vfs_file *f, uint64_t length) {
+    struct tobyfs *fs = (struct tobyfs *)f->mnt;
+    struct tobyfs_handle *h = (struct tobyfs_handle *)f->priv;
+    if (!fs || !h) return VFS_ERR_INVAL;
+    if (length > 0xFFFFFFFFull) return VFS_ERR_INVAL;
+    journal_begin(fs);
+    if (length == 0) inode_free_blocks(fs, &h->node);
+    h->node.size  = (uint32_t)length;
+    h->node.mtime = tfs_now_secs();
+    int rc = write_inode(fs, h->ino, &h->node);
+    if (rc != VFS_OK) { journal_abort(fs); return rc; }
+    return journal_commit(fs);
 }
 
 static int tobyfs_chown(void *mnt, const char *path,
@@ -1280,6 +1492,11 @@ static const struct vfs_ops tobyfs_ops = {
     .stat     = tobyfs_stat,
     .chmod    = tobyfs_chmod,
     .chown    = tobyfs_chown,
+    .symlink  = tobyfs_symlink,  /* slice 7 */
+    .readlink = tobyfs_readlink, /* slice 7 */
+    .utimes   = tobyfs_utimes,   /* slice 6 */
+    .truncate = tobyfs_truncate, /* slice 6 */
+    .ftruncate= tobyfs_ftruncate,/* slice 6 */
 };
 
 /* M28E: identification helper used by sys_fs_check() to recognise
@@ -2242,7 +2459,21 @@ int tobyfs_self_test(struct tobyfs_check *clean_out,
  *  cope with. [TFST] markers.
  * ============================================================ */
 
-#define TFST_CHUNK (16u * 1024u)    /* 4 blocks/write: under the 16-block txn cap */
+/* 4 blocks/write. This used to be a REQUIREMENT -- tobyfs_write ran the whole
+ * call in one journal transaction, so anything over TFS_TXN_MAX_BLOCKS (16)
+ * failed outright, and this test chunked to stay under it. That constraint is
+ * gone as of 2026-08-07: tobyfs_write now commits and reopens the transaction
+ * mid-write, so a write of any size succeeds.
+ *
+ * The value is kept because it is now a useful property of THIS test rather
+ * than a workaround: small writes mean many transactions per file, which is
+ * what makes the crash-injection cases (t1/t2) land at interesting points.
+ * Note the consequence of the fix, deliberately accepted: a single large
+ * write() is no longer atomic across a power loss -- it spans several
+ * transactions, exactly as ext4/xfs behave. Each transaction is still
+ * complete-or-absent, so metadata stays consistent, which is the guarantee
+ * that actually matters. */
+#define TFST_CHUNK (16u * 1024u)
 
 /* Write `size` bytes of a seed+offset-derived pattern to `path`. */
 static int tfst_write(const char *path, uint32_t seed, size_t size,

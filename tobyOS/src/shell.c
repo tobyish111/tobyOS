@@ -2258,6 +2258,16 @@ static void cmd_time(int argc, char **argv) {
             (unsigned long)info.syscall_count);
 }
 
+/* Linux slice 1: dump the ENOSYS census on demand.
+ *
+ * The 60 s deep dump prints this too, but a census run wants the answer at a
+ * chosen moment -- run a workload, then ask -- rather than on a timer. */
+static void cmd_lxgaps(int argc, char **argv) {
+    (void)argc; (void)argv;
+    extern void lx_dump_gaps(void);
+    lx_dump_gaps();
+}
+
 static void cmd_perf(int argc, char **argv) {
     /* Syntax:
      *   perf              -- dump zones + syscalls + sys metrics
@@ -5061,6 +5071,7 @@ static const struct cmd cmds[] = {
     { "top",    "top [-n iters] [-d ms]: live process stats",  cmd_top  },
     { "time",   "time <cmd> [args]: measure wall + cpu + syscalls", cmd_time },
     { "perf",   "perf [reset|on|off]: dump profiling counters", cmd_perf },
+    { "lxgaps", "dump the Linux ENOSYS census (ranked gap list)", cmd_lxgaps },
     { "log",    "log [enable|disable <cat>]: toggle structured log categories", cmd_log },
     { "cpus",   "list CPUs (SMP) + online state",cmd_cpus  },
     { "ifconfig","show NIC config (IP/MAC/gateway/DNS)", cmd_ifconfig },

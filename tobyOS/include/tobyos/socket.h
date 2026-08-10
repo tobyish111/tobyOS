@@ -201,6 +201,13 @@ struct sock {
      * these endpoints are inherited across fork and exec. */
     int32_t          cr_pid;
     uint32_t         cr_uid, cr_gid;
+    /* Slice 12: the NETWORK namespace this socket was created in (NULL ==
+     * initial). Latched in sock_alloc next to the creds above, and enforcement
+     * asks the SOCKET rather than the current process -- so unshare(CLONE_NEWNET)
+     * does not retroactively unplug sockets that already exist. Linux behaves the
+     * same way, and it is what lets a sandboxed child keep an inherited
+     * socketpair to its parent while having no network of its own. */
+    void            *net_ns;
 
     /* ---- Non-blocking connect state ----------------------------------
      * connecting=1 between a connect() that returned EINPROGRESS and the

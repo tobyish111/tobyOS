@@ -184,6 +184,10 @@
 #define HDA_PCM_PERIODS       4
 #define HDA_PCM_PERIOD_BYTES  4096
 #define HDA_PCM_BYTES         (HDA_PCM_PERIODS * HDA_PCM_PERIOD_BYTES)
+/* snd_pcm.c advertises buffer_size from this; keep the two in step or the
+ * ALSA layer promises a buffer the ring cannot hold. */
+_Static_assert(HDA_PCM_BYTES == HDA_PCM_RING_BYTES,
+               "HDA_PCM_RING_BYTES (audio_hda.h) must match the ring here");
 
 static struct {
     bool                bound;
