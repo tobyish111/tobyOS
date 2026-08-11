@@ -7444,7 +7444,13 @@ static const char *lx_scname(long n) {
     case 288: return "accept4"; case 289: return "signalfd4"; case 290: return "eventfd2";
     case 291: return "epoll_create1"; case 292: return "dup3"; case 293: return "pipe2";
     case 294: return "inotify_init1"; case 302: return "prlimit64";
-    case 305: return "syncfs"; case 309: return "getcpu"; case 316: return "renameat2";
+    /* 305 is clock_adjtime, NOT syncfs -- syncfs is 306 and is already named
+     * above. This table is what the ENOSYS census and the [lx-recent] ring
+     * print, so a wrong name here sends the next reader to implement the wrong
+     * syscall. Found by cross-checking the census against the LX_ enum, which
+     * has always had syncfs = 306. */
+    case 305: return "clock_adjtime"; case 309: return "getcpu";
+    case 316: return "renameat2";
     case 318: return "getrandom"; case 319: return "memfd_create"; case 321: return "bpf";
     case 322: return "execveat"; case 324: return "membarrier"; case 325: return "mlock2";
     case 332: return "statx"; case 334: return "rseq"; case 424: return "pidfd_send_signal";
