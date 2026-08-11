@@ -94,6 +94,7 @@ extern "C" {
 #define ABI_OK               0
 #define ABI_EPERM            1   /* operation not permitted */
 #define ABI_ENOENT           2   /* no such file or directory */
+#define ABI_ESRCH            3   /* no such process */
 #define ABI_EIO              5   /* I/O error from underlying device */
 #define ABI_E2BIG            7   /* arg/env list too long */
 #define ABI_EBADF            9   /* bad file descriptor */
@@ -1538,6 +1539,7 @@ _Static_assert(sizeof(struct abi_display_info) ==
 #define ABI_S_IFREG     0x8000
 #define ABI_S_IFDIR     0x4000
 #define ABI_S_IFLNK     0xA000
+#define ABI_S_IFCHR     0x2000   /* character device (the /dev nodes) */
 
 #define ABI_S_ISLNK(m)  (((m) & ABI_S_IFMT) == ABI_S_IFLNK)
 
@@ -1554,6 +1556,7 @@ _Static_assert(sizeof(struct abi_display_info) ==
 
 #define ABI_S_ISDIR(m)  (((m) & ABI_S_IFMT) == ABI_S_IFDIR)
 #define ABI_S_ISREG(m)  (((m) & ABI_S_IFMT) == ABI_S_IFREG)
+#define ABI_S_ISCHR(m)  (((m) & ABI_S_IFMT) == ABI_S_IFCHR)
 
 struct abi_stat {
     uint64_t size;

@@ -1049,6 +1049,40 @@ static int spawn_chrome(void) {
              * checklist in docs/linux-arc-handoff-phase3.md. */
             (char *)"--no-sandbox",
             (char *)"--no-zygote",
+#else
+            /* SANDBOX BUILD: select the NAMESPACE sandbox by ruling out the
+             * setuid one.
+             *
+             * Chromium has two layer-1 sandboxes. The modern one uses
+             * unprivileged user namespaces -- which is exactly what this whole
+             * arc built and what linux-clonestk proves works. The legacy one
+             * needs a setuid-root helper binary, `chrome-sandbox`, which it
+             * looks for beside the executable and PCHECKs the existence of:
+             *
+             *   FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc:221]
+             *   Check failed: . : No such file or directory (2)
+             *
+             * chrome-headless-shell DOES NOT SHIP THAT HELPER -- there is no
+             * chrome-sandbox anywhere in the distribution -- so this flag is
+             * the right one for this payload regardless.
+             *
+             * IT DID NOT FIX THE CHECK, and saying so here matters more than
+             * the flag does. Measured: with the flag present in the staged
+             * binary (verified by grep, not by the build succeeding), chrome
+             * still stats /opt/chrome/chrome-sandbox and still dies at
+             * zygote_host_impl_linux.cc:221. So either the lookup is
+             * unconditional and only some OTHER path is the ENOENT, or this
+             * build ignores the flag. The next experiment is to STAGE a file
+             * at that path and see whether the CHECK moves -- one boot, and it
+             * settles which.
+             *
+             * Kept because it is correct for a payload with no SUID helper,
+             * and because removing it would leave the setuid sandbox nominally
+             * selected with nothing behind it. It does NOT weaken the sandbox:
+             * it rules out the deprecated alternative and leaves the namespace
+             * sandbox, which is the stronger one and the one this kernel work
+             * supports. It is emphatically not --no-sandbox. */
+            (char *)"--disable-setuid-sandbox",
 #endif
 #ifndef CW_MP
             /* Slice 107: handoff §6 candidate 1 assumes chrome's renderer ->

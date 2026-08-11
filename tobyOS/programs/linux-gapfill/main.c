@@ -72,6 +72,7 @@
 struct lx_open_how { unsigned long long flags, mode, resolve; };
 
 static int g_bits;
+static int g_fdinfo_dir_ok;
 __attribute__((format(printf, 2, 3)))
 static void ok(int bit, const char *fmt, ...)
 {
@@ -104,6 +105,65 @@ static int fdinfo_has(const char *name, int *count)
     closedir(d);
     if (count) *count = n;
     return found;
+}
+
+
+/* ---- bit0 (shared): the /dev nodes must OPEN and STAT alike --------------
+ *
+ * They were synthesised in the open path only, so this held:
+ *
+ *     open("/dev/null")  -> a working descriptor
+ *     stat("/dev/null")  -> ENOENT
+ *
+ * which quietly broke `test -e /dev/null`, access(), `ls -l`, and Chromium's
+ * base::PathExists -- the last of which PCHECKs in its zygote host and killed
+ * the browser AFTER the entire sandbox had come up. The asymmetry is the bug,
+ * so the assertion is the SYMMETRY: every node must do both, and must report
+ * itself as a character device. Checking only stat() would pass on a kernel
+ * that had lost open(). */
+static const char *g_devnodes[] = {
+    "/dev/null", "/dev/zero", "/dev/full", "/dev/tty",
+    "/dev/random", "/dev/urandom",
+};
+
+static void check_devnodes(void)
+{
+    int n = (int)(sizeof g_devnodes / sizeof g_devnodes[0]);
+    for (int i = 0; i < n; i++) {
+        const char *d = g_devnodes[i];
+        struct stat st;
+        if (stat(d, &st) != 0) {
+            no("dev: stat(%s) errno=%d -- openable but not stat-able is the "
+               "asymmetry this check exists for", d, errno);
+            return;
+        }
+        if (!S_ISCHR(st.st_mode)) {
+            no("dev: %s stats as mode 0%o, not a character device", d,
+               (unsigned)st.st_mode);
+            return;
+        }
+        if (access(d, F_OK) != 0) {
+            no("dev: access(%s, F_OK) errno=%d while stat() succeeded", d,
+               errno);
+            return;
+        }
+        /* /dev/tty needs a controlling terminal, so its open is allowed to
+         * fail -- but only that one, and only that way. */
+        int fd = open(d, O_RDONLY);
+        if (fd < 0 && strcmp(d, "/dev/tty") != 0) {
+            no("dev: %s stats fine but open() errno=%d -- the two paths "
+               "disagree in the other direction now", d, errno);
+            return;
+        }
+        if (fd >= 0) close(fd);
+    }
+    if (!g_fdinfo_dir_ok) {
+        no("dev: the nodes are fine but the fdinfo directory check did not "
+           "pass -- bit0 covers both");
+        return;
+    }
+    ok(1, "dev: all %d synthesised nodes stat AND open and report S_ISCHR "
+          "(+ fdinfo dir tracks the fd table)", n);
 }
 
 /* ---- bit0: the listing tracks the fd table, both ways ------------------- */
@@ -156,8 +216,10 @@ static void check_fdinfo_dir(void)
            "the live fd table", fd);
         return;
     }
-    ok(1, "fdinfo: a directory that TRACKS the fd table (fd %d appeared among "
-          "%d entries, gone among %d after close)", fd, before, after);
+    g_fdinfo_dir_ok = 1;
+    printf("gapfill:   ok   fdinfo: a directory that TRACKS the fd table "
+           "(fd %d appeared among %d entries, gone among %d after close)\n",
+           fd, before, after);
 }
 
 /* ---- bit1: pos is real ------------------------------------------------- */
@@ -347,6 +409,7 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("gapfill: start pid=%d uid=%u\n", (int)getpid(), (unsigned)getuid());
     check_fdinfo_dir();
+    check_devnodes();      /* shares bit0: both are "the two paths agree" */
     check_fdinfo_pos();
     check_chroot_fdinfo();
     check_mkdirat();

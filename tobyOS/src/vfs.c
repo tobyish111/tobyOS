@@ -744,6 +744,27 @@ int vfs_perm_check(const char *path, int want) {
 
 /* -------- read-side -------- */
 
+
+#ifdef PATHFAIL_TRACE
+/* Name the path behind an ENOENT.
+ *
+ * The syscall ring records ARGUMENTS, and a path argument is a user pointer --
+ * so a log full of `openat a1=29407312 = -2` says a file is missing without
+ * saying which. That is the exact wall Chromium's zygote hit
+ * (zygote_host_impl_linux.cc:221, "No such file or directory"), and guessing
+ * the filename from Chromium's source would be a hypothesis, not a diagnosis.
+ *
+ * Capped, because a normal boot probes for dozens of absent paths (every
+ * ld.so search directory) and an uncapped trace buries the interesting one. */
+void pathfail_trace(const char *what, const char *path, int rc) {
+    static int n;
+    if (rc != VFS_ERR_NOENT) return;
+    if (n >= 400) return;
+    n++;
+    kprintf("[enoent] %s '%s'\n", what, path ? path : "(null)");
+}
+#endif
+
 int vfs_open(const char *path, struct vfs_file *out) {
     /* Milestone 19: wrap the whole open path in a perf zone. The
      * PERM/sandbox check below short-circuits before the driver call
@@ -811,6 +832,9 @@ int vfs_open(const char *path, struct vfs_file *out) {
     if (!m->ops->open) { perf_zone_end(PERF_Z_VFS_OPEN, t_v); return VFS_ERR_INVAL; }
     int rc = m->ops->open(m->data, rel, out);
     perf_zone_end(PERF_Z_VFS_OPEN, t_v);
+#ifdef PATHFAIL_TRACE
+    pathfail_trace("open", path, rc);
+#endif
     return rc;
 }
 
@@ -919,6 +943,9 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
     if (!m->ops->stat) { perf_zone_end(PERF_Z_VFS_STAT, t_v); return VFS_ERR_INVAL; }
     int rc = m->ops->stat(m->data, rel, out);
     perf_zone_end(PERF_Z_VFS_STAT, t_v);
+#ifdef PATHFAIL_TRACE
+    pathfail_trace("stat", path, rc);
+#endif
     return rc;
 }
 

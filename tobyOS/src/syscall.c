@@ -38,6 +38,7 @@
 #include <tobyos/snd_pcm.h>
 #include <tobyos/term.h>
 #include <tobyos/vfs.h>
+#include <tobyos/apic.h>
 #include <tobyos/procfs.h>
 #include <tobyos/cgroup.h>
 int sysfs_mount_at(const char *path);   /* src/sysfs.c has no public header */
@@ -2651,10 +2652,80 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
     dst->gid = userns_cur_gid(src->gid);
 }
 
+
+/* ---- the synthetic /dev nodes, in ONE place ------------------------------
+ *
+ * /dev/null, /dev/zero, /dev/tty and friends are SYNTHESISED by sys_open: it
+ * matches the name and builds a struct file with no VFS backing at all. That
+ * works for open() and fails for everything else, because every other path
+ * syscall asks the VFS -- which has never heard of them.
+ *
+ *     open("/dev/null")  -> a working descriptor
+ *     stat("/dev/null")  -> ENOENT
+ *
+ * So `test -e /dev/null` said no, `ls -l /dev/null` said no, access() said no,
+ * and Chromium's base::PathExists() said no -- which is what its zygote host
+ * PCHECKs at zygote_host_impl_linux.cc:221, killing the browser with
+ * "No such file or directory" AFTER the whole sandbox had come up correctly.
+ * Found by tracing the path behind an ENOENT (-DPATHFAIL_TRACE) rather than by
+ * guessing at Chromium's source.
+ *
+ * This table is the single answer to "what exists in /dev", so the open path
+ * and the stat path cannot drift apart. programs/linux-gapfill asserts they
+ * agree NODE BY NODE: anything listed here must both open AND stat, and a node
+ * that opens without appearing here fails the test. That symmetry is the whole
+ * point -- the bug above was exactly the two disagreeing. */
+struct dev_synth { const char *name; uint32_t mode; };
+static const struct dev_synth g_dev_synth[] = {
+    { "null",     ABI_S_IFCHR | 0666 },
+    { "zero",     ABI_S_IFCHR | 0666 },
+    { "full",     ABI_S_IFCHR | 0666 },
+    { "tty",      ABI_S_IFCHR | 0620 },
+    { "ptmx",     ABI_S_IFCHR | 0666 },
+    { "random",   ABI_S_IFCHR | 0666 },
+    { "urandom",  ABI_S_IFCHR | 0666 },
+};
+
+/* Non-zero (the mode) if `kpath` names a synthesised device node. */
+static uint32_t dev_synth_mode(const char *kpath)
+{
+    if (!kpath || kpath[0] != '/' || kpath[1] != 'd' || kpath[2] != 'e' ||
+        kpath[3] != 'v' || kpath[4] != '/')
+        return 0;
+    const char *dev = kpath + 5;
+    for (unsigned i = 0; i < sizeof g_dev_synth / sizeof g_dev_synth[0]; i++)
+        if (strcmp(g_dev_synth[i].name, dev) == 0)
+            return g_dev_synth[i].mode;
+    /* /dev/pts/<n> is synthesised per pair rather than named up front. */
+    if (strncmp(dev, "pts/", 4) == 0 && dev[4]) return ABI_S_IFCHR | 0620;
+    return 0;
+}
+
+/* Fill an abi_stat for a synthesised node. Character devices, because that is
+ * what they are -- reporting S_IFREG would make `test -c /dev/null` false and
+ * confuse anything that special-cases a tty. */
+static void dev_synth_stat(uint32_t mode, struct abi_stat *out)
+{
+    memset(out, 0, sizeof *out);
+    out->mode  = mode;
+    out->size  = 0;
+}
+
 static long sys_stat(const char *path, struct abi_stat *out) {
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
+    /* A synthesised /dev node has no VFS entry -- see dev_synth_mode. Checked
+     * BEFORE the VFS so a real file of the same name could never shadow the
+     * device, and so the answer matches what open() would actually give. */
+    {   uint32_t dm = dev_synth_mode(kpath);
+        if (dm) {
+            struct abi_stat dtmp;
+            dev_synth_stat(dm, &dtmp);
+            if (copy_to_user(out, &dtmp, sizeof dtmp) != 0) return -ABI_EFAULT;
+            return 0;
+        }
+    }
     struct vfs_stat vs;
     int sr = vfs_stat(kpath, &vs);
     if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
@@ -7346,10 +7417,14 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
  * AT_FDCWD and absolute paths are honoured (resolve_user_path also handles
  * cwd-relative); a non-AT_FDCWD dirfd-relative path is resolved against the cwd
  * (best-effort -- bash/coreutils use AT_FDCWD). */
+/* Defined next to sys_stat: the single table of synthesised /dev nodes. */
+static uint32_t dev_synth_mode(const char *kpath);
+
 static long lx_faccess(const char *upath) {
     char kpath[ABI_PATH_MAX];
     if (resolve_user_path(upath, kpath, sizeof kpath) != 0)
         return -ABI_EFAULT;
+    if (dev_synth_mode(kpath)) return 0;   /* synthesised /dev node */
     struct vfs_stat vs;
     return (vfs_stat(kpath, &vs) == VFS_OK) ? 0 : -ABI_ENOENT;
 }
@@ -8150,6 +8225,137 @@ static long lx_do_setid(bool is_uid, long id) {
     return 0;
 }
 
+
+/* ---- process_vm_readv / process_vm_writev (310 / 311) --------------------
+ *
+ * Copy between the CALLER's address space and ANOTHER process's, without
+ * ptrace's stop/resume dance. gdb, strace -p and CRIU all reach for it.
+ *
+ * The mechanism here does NOT switch CR3. vmm_set_editor_root() points the
+ * page-table walker at the target's PML4 while the kernel keeps running on its
+ * own, so vmm_translate() yields the target's physical frame and the copy goes
+ * through the HHDM. That is the same borrow fork.c uses to map a vfork child's
+ * stack into the parent's space, and it avoids a CR3 round trip per iovec.
+ *
+ * Copying is PER PAGE because a remote range is contiguous in virtual address
+ * space and arbitrary in physical: one memcpy across a page boundary would read
+ * whatever frame happens to follow. A remote page with no mapping ends the
+ * transfer and returns the bytes moved so far, which is what Linux does -- a
+ * partial transfer is a legal result, not an error.
+ *
+ * PERMISSION is the same rule Linux applies (ptrace_may_access): the caller
+ * must own the target or hold CAP_SYS_ADMIN in a user namespace over it. Both
+ * ids are compared as HOST uids, which is what struct proc stores -- see the
+ * namespace note in proc.h. Without this check any process could read every
+ * other process's memory, which is a considerably worse hole than the syscall
+ * is worth. */
+static long lx_process_vm_rw(int pid, uint64_t liov_u, unsigned long liovcnt,
+                             uint64_t riov_u, unsigned long riovcnt,
+                             bool write)
+{
+    struct proc *me = current_proc();
+    if (!me) return -ABI_EINVAL;
+    if (liovcnt > 1024 || riovcnt > 1024) return -ABI_EINVAL;
+
+    int kpid = pid_knr(pid);          /* the caller's namespace numbers it */
+    if (!kpid) return -ABI_ESRCH;
+    struct proc *tgt = proc_lookup(kpid);
+    if (!tgt || tgt->state == PROC_UNUSED || tgt->state == PROC_EMBRYO)
+        return -ABI_ESRCH;
+
+    if (me->uid != 0 && me->uid != tgt->uid &&
+        !userns_capable(LCAP_SYS_ADMIN))
+        return -ABI_EPERM;
+
+    /* A thread shares its leader's address space; the mm owner is where the
+     * page tables actually live. */
+    uint64_t tcr3 = tgt->cr3;
+    if (!tcr3) return -ABI_ESRCH;
+
+    struct lx_iovec liov[8], riov[8];
+    if (liovcnt > 8 || riovcnt > 8) return -ABI_EINVAL;   /* see note below */
+    if (liovcnt && copy_from_user(liov, (const void *)(uintptr_t)liov_u,
+                                  liovcnt * sizeof liov[0]) != 0)
+        return -ABI_EFAULT;
+    if (riovcnt && copy_from_user(riov, (const void *)(uintptr_t)riov_u,
+                                  riovcnt * sizeof riov[0]) != 0)
+        return -ABI_EFAULT;
+
+    unsigned long li = 0, ri = 0;
+    uint64_t loff = 0, roff = 0;
+    long moved = 0;
+
+    while (li < liovcnt && ri < riovcnt) {
+        uint64_t lrem = liov[li].iov_len - loff;
+        uint64_t rrem = riov[ri].iov_len - roff;
+        if (!lrem) { li++; loff = 0; continue; }
+        if (!rrem) { ri++; roff = 0; continue; }
+        uint64_t rva = riov[ri].iov_base + roff;
+        uint64_t lva = liov[li].iov_base + loff;
+        uint64_t page_left = PAGE_SIZE - (rva & (PAGE_SIZE - 1));
+        uint64_t n = lrem < rrem ? lrem : rrem;
+        if (n > page_left) n = page_left;
+
+        uint64_t saved = vmm_set_editor_root(tcr3);
+        uint64_t rphys = vmm_translate(rva & ~(uint64_t)(PAGE_SIZE - 1));
+        vmm_set_editor_root(saved);
+        if (!rphys) break;            /* unmapped: a partial transfer is legal */
+        uint8_t *rk = (uint8_t *)pmm_phys_to_virt(rphys) +
+                      (rva & (PAGE_SIZE - 1));
+
+        int rc = write ? copy_from_user(rk, (const void *)(uintptr_t)lva,
+                                        (size_t)n)
+                       : copy_to_user((void *)(uintptr_t)lva, rk, (size_t)n);
+        if (rc != 0) { if (moved) break; return -ABI_EFAULT; }
+
+        moved += (long)n;
+        loff  += n;
+        roff  += n;
+    }
+    return moved;
+}
+
+/* ---- membarrier (324) ---------------------------------------------------
+ *
+ * "Make every other CPU observe a memory barrier." An IPI does that by
+ * construction: taking an interrupt serializes the receiving core, so the
+ * existing TLB-shootdown broadcast is a real membarrier and not an
+ * approximation of one.
+ *
+ * QUERY therefore advertises ONLY the commands backed by that broadcast. The
+ * temptation is to report the full set and return 0 for all of them -- which
+ * would be a barrier that never happened, in a syscall whose entire purpose is
+ * ordering, i.e. a bug that shows up as impossible data races in someone
+ * else's library. Unsupported commands return EINVAL, which is what Linux
+ * returns when a kernel is built without them. */
+#define MEMBARRIER_CMD_QUERY                    0
+#define MEMBARRIER_CMD_GLOBAL                   (1 << 0)
+#define MEMBARRIER_CMD_PRIVATE_EXPEDITED        (1 << 3)
+#define MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED (1 << 4)
+
+static long lx_membarrier(int cmd, unsigned int flags)
+{
+    if (flags) return -ABI_EINVAL;
+    switch (cmd) {
+    case MEMBARRIER_CMD_QUERY:
+        return MEMBARRIER_CMD_GLOBAL |
+               MEMBARRIER_CMD_PRIVATE_EXPEDITED |
+               MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
+    case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED:
+        /* Registration is bookkeeping Linux needs to know which mms to signal.
+         * We signal every CPU regardless, so there is nothing to record and
+         * success is accurate rather than a shrug. */
+        return 0;
+    case MEMBARRIER_CMD_GLOBAL:
+    case MEMBARRIER_CMD_PRIVATE_EXPEDITED:
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* this CPU */
+        (void)tlb_shootdown_remote_sync();         /* every other CPU */
+        return 0;
+    default:
+        return -ABI_EINVAL;
+    }
+}
+
 static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long a5) {
     {
         uint32_t i = g_lx_recent_i++ % LX_RECENT;
@@ -8533,6 +8739,15 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return -ABI_EFAULT;
         return 0;                       /* a3 (tcache) is unused since 2.6.24 */
     }
+
+    case 310:                          /* process_vm_readv  */
+    case 311:                          /* process_vm_writev */
+        return lx_process_vm_rw((int)a1, (uint64_t)a2, (unsigned long)a3,
+                                (uint64_t)a4, (unsigned long)a5,
+                                n == 311);
+
+    case 324:                          /* membarrier(cmd, flags, cpu_id) */
+        return lx_membarrier((int)a1, (unsigned int)a2);
 
     case 325:                          /* mlock2(addr, len, flags) */
         /* Same answer as mlock/munlock above, and for the same reason: nothing
@@ -9757,6 +9972,21 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                               lx_ino_hash(kpath), (void *)a3);
             }
         }
+        /* Synthesised /dev nodes, same as LX_stat. This arm matters MORE than
+         * that one: glibc's stat() compiles to newfstatat, so a fix applied
+         * only to LX_stat would never run for a C program -- exactly the trap
+         * slice 103 hit with DRM fds. */
+        {   uint32_t dm = dev_synth_mode(kpath);
+            if (dm) {
+                (void)dm;
+                /* major 1 minor 3 is /dev/null's real Linux identity; the
+                 * other synthesised nodes share the shape, and nothing in
+                 * tree keys off the exact minor. What matters to callers is
+                 * S_ISCHR, which linux_emit_chrdev_stat sets. */
+                return linux_emit_chrdev_stat(1, 3, lx_ino_hash(kpath),
+                                              (void *)a3);
+            }
+        }
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
         gputrace("newfstatat", kpath, sr);
@@ -10707,6 +10937,38 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 gputrace("statx", kpath, 0);
                 return linux_emit_chrdev_stat(DRM_CHR_MAJOR, (uint32_t)dmin,
                                               lx_ino_hash(kpath), (void *)a5);
+            }
+        }
+        /* Synthesised /dev nodes -- and THIS is the arm that matters, for the
+         * reason the DRM note directly above already gives: glibc's stat()
+         * compiles to statx on modern builds. Fixing LX_stat and newfstatat
+         * and stopping there would leave every C program still seeing ENOENT
+         * for /dev/null, which is precisely how slice 104's blind spot worked.
+         * Three arms, one table (dev_synth_mode), so they cannot disagree. */
+        {   uint32_t dm = dev_synth_mode(kpath);
+            if (dm) {
+                /* Emit the STATX layout and then stamp the char-device bits,
+                 * the same way the AT_EMPTY_PATH arm above does. NOT
+                 * linux_emit_chrdev_stat: that writes a struct lx_stat, which
+                 * is a different shape from statx -- using it here would fill
+                 * a 256-byte statx buffer with a stat-sized record and every
+                 * field past st_mode would be garbage. (The DRM arm a few
+                 * lines up does exactly that; left alone because that path is
+                 * verified working end-to-end and this is not its slice, but
+                 * it is noted in the handoff.) */
+                struct vfs_stat dvs = { .type = VFS_TYPE_FILE, .size = 0,
+                                        .uid = 0, .gid = 0,
+                                        .mode = dm & 0xFFFu };
+                long src = linux_emit_statx(&dvs, lx_ino_hash(kpath),
+                                            (void *)a5);
+                if (src == 0 && a5) {
+                    uint16_t m = (uint16_t)(0x2000u | (dm & 0xFFFu));
+                    uint32_t rmaj = 1, rmin = 3;      /* /dev/null's identity */
+                    (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);
+                    (void)copy_to_user((uint8_t *)a5 + 0x80, &rmaj, sizeof rmaj);
+                    (void)copy_to_user((uint8_t *)a5 + 0x84, &rmin, sizeof rmin);
+                }
+                return src;
             }
         }
         struct vfs_stat vs;

@@ -55,7 +55,11 @@ if [ "${LEFTOVER:-0}" != "0" ]; then
     exit 1
 fi
 
-KFLAGS="-DFAST_BOOT -DQUICK_BOOT -DTKAPP_BOOT -DTKAPP_CHROMEWIN"
+# EXTRA_KFLAGS lets a diagnostic flag ride along without editing this file
+# (e.g. EXTRA_KFLAGS=-DPATHFAIL_TRACE to name the paths behind an ENOENT --
+# the syscall ring only records the POINTER, which is why a missing file
+# shows up as `openat a1=29407312 = -2` and says nothing about which one).
+KFLAGS="-DFAST_BOOT -DQUICK_BOOT -DTKAPP_BOOT -DTKAPP_CHROMEWIN ${EXTRA_KFLAGS:-}"
 
 echo "== forcing the flavour-sensitive objects to rebuild"
 rm -f programs/chromewin/chromewin.o programs/chromewin/chromewin.elf
