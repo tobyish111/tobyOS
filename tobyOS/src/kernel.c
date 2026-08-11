@@ -7651,6 +7651,17 @@ void _start(void) {
              * the weaker version and still be wrong. */
             { "/bin/linux-clonestk", "linux-clonestk", 0, 255,
               "clone(fn, child_stack, ...) via glibc (C)" },
+            /* The surface added after Phase 3 closed: /proc/PID/fdinfo -- the
+             * live Chromium sandbox blocker, since ChrootToSafeEmptyDir chroots
+             * into it -- plus mkdirat/getcpu/mlock2/fadvise64/openat2.
+             *
+             * bit7 carries this one. openat2's RESOLVE_* bits are path
+             * resolution RESTRICTIONS, so an implementation that performs the
+             * open while dropping them hands the caller a sandbox that does not
+             * exist. It asserts the refusal is EINVAL -- not merely that the
+             * call failed. */
+            { "/bin/linux-gapfill", "linux-gapfill", 0, 255,
+              "fdinfo + mkdirat/getcpu/openat2 (C)" },
 
             /* Independent witness #1: two SEPARATE processes in the initial
              * namespace must report the SAME uts inum (each $( ) is its own

@@ -8492,6 +8492,88 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
 
+    /* ---- the *at / hint batch, all forwards onto machinery already here ----
+     *
+     * Each of these was measured absent by a census over the dispatcher (the
+     * one in the scratchpad; the naive greps got it wrong twice -- once low by
+     * missing raw-number cases followed by `{`, once high by matching
+     * lx_scname's own table). Nothing here is a stub: every arm either does
+     * the real work or refuses. */
+
+    case 258: {                        /* mkdirat(dirfd, path, mode) */
+        /* resolve_user_path_at gives a KERNEL path, but sys_mkdir wants a USER
+         * one (it resolves internally, applies the umask and gets the EEXIST
+         * ordering right -- all of which we want). So the AT_FDCWD case, which
+         * is what glibc's mkdir() compiles to, forwards straight to it; a real
+         * dirfd is resolved here and refused rather than silently resolved
+         * against the cwd, because a wrong-directory mkdir is worse than an
+         * error. */
+        int dfd = (int)a1;
+        if (dfd == -100 /* AT_FDCWD */)
+            return do_syscall(SYS_MKDIR, a2, a3, 0, 0, 0);
+        char kpath[ABI_PATH_MAX];
+        if (resolve_user_path_at(dfd, (const char *)a2, kpath,
+                                 sizeof kpath) != 0)
+            return -ABI_EFAULT;
+        /* An absolute path ignores the dirfd, so that case is exact. */
+        {   char raw[ABI_PATH_MAX];
+            if (strncpy_from_user(raw, (const char *)a2, sizeof raw) > 0 &&
+                raw[0] == '/')
+                return do_syscall(SYS_MKDIR, a2, a3, 0, 0, 0); }
+        return -ABI_ENOSYS;            /* dirfd-relative: not yet expressible */
+    }
+
+    case 309: {                        /* getcpu(*cpu, *node, *tcache) */
+        struct percpu *pc = smp_this_cpu();
+        unsigned cpu = pc ? (unsigned)pc->cpu_idx : 0u;
+        unsigned node = 0;              /* single NUMA node, and truthfully so */
+        if (a1 && copy_to_user((void *)a1, &cpu, sizeof cpu) != 0)
+            return -ABI_EFAULT;
+        if (a2 && copy_to_user((void *)a2, &node, sizeof node) != 0)
+            return -ABI_EFAULT;
+        return 0;                       /* a3 (tcache) is unused since 2.6.24 */
+    }
+
+    case 325:                          /* mlock2(addr, len, flags) */
+        /* Same answer as mlock/munlock above, and for the same reason: nothing
+         * here pages anything out, so every mapping is already "locked" and
+         * reporting success is accurate rather than convenient. MLOCK_ONFAULT
+         * changes only WHEN pages are populated, which is likewise moot. */
+        return 0;
+
+    case 221:                          /* fadvise64(fd, off, len, advice) */
+        /* posix_fadvise is a HINT: the specification allows an implementation
+         * to ignore it, and returning 0 is the correct answer, not a stub. The
+         * distinction from an accept-and-ignore lie is that no caller can
+         * observe a difference -- unlike, say, a mount flag or a seccomp
+         * action, where ignoring the argument removes a guarantee. */
+        return 0;
+
+    case 437: {                        /* openat2(dirfd, path, *how, size) */
+        /* how = { __u64 flags; __u64 mode; __u64 resolve; }
+         *
+         * The RESOLVE_* bits are the entire point of openat2 -- they are path
+         * resolution RESTRICTIONS (no symlinks, no ../ escape, stay in this
+         * mount). Honouring the open while ignoring them would hand the caller
+         * a sandbox it does not have, which is the failure mode this arc keeps
+         * finding. So any resolve bit at all is refused, and openat2 is
+         * otherwise exactly openat. */
+        struct lx_open_how { uint64_t flags, mode, resolve; } how;
+        uint64_t sz = (uint64_t)a4;
+        if (sz < sizeof how) return -ABI_EINVAL;
+        if (!a3 || copy_from_user(&how, (const void *)a3, sizeof how) != 0)
+            return -ABI_EFAULT;
+        if (how.resolve != 0) {
+            kprintf("[linux] openat2 RESOLVE_0x%lx cannot be enforced here -> "
+                    "EINVAL (refusing rather than opening unrestricted)\n",
+                    (unsigned long)how.resolve);
+            return -ABI_EINVAL;
+        }
+        return linux_syscall_impl(LX_openat, a1, a2, (long)how.flags,
+                                  (long)how.mode, 0);
+    }
+
+
     /* chmod/fchmodat. Slice 86: these used to validate the path and then
      * throw the mode away, on the belief that the VFS did not model
      * permission bits -- but vfs_chmod() has stored them all along. The

@@ -444,6 +444,59 @@ static int gen_pid_cmdline(int pid, char *buf, size_t cap) {
     return (int)nl;
 }
 
+/* /proc/<pid>/fdinfo/<n>.
+ *
+ * Chromium's sandbox is what made this load-bearing: ChrootToSafeEmptyDir()
+ * chroots into /proc/self/fdinfo/ precisely because it is a directory whose
+ * contents are exactly the caller's own open descriptors -- so after closing
+ * them it is guaranteed EMPTY, and no path in it can be reopened. Without the
+ * directory the sandbox dies at credentials.cc:118.
+ *
+ * FIELDS ARE REPORTED ONLY WHERE THEY ARE REAL. Linux prints pos/flags/mnt_id
+ * for every fd and then adds kind-specific lines (epoll, inotify, signalfd...),
+ * so the field SET already varies by descriptor and a key-based reader copes
+ * with an absent key. `mnt_id` is therefore omitted rather than reported as 0:
+ * this kernel tracks no per-descriptor mount id, and a plausible-looking
+ * constant is exactly the kind of fabrication this arc keeps having to undo.
+ * `pos` is only meaningful for a VFS-backed handle; a pipe or socket has no
+ * file position, and Linux reports 0 for those too. */
+static int gen_pid_fdinfo(int pid, int fd, char *buf, size_t cap) {
+    struct proc *p = proc_lookup(pid);
+    if (!p) return -1;
+    struct file **tab = proc_fds(p);
+    if (!tab || fd < 0 || fd >= PROC_NFDS || !tab[fd]) return -1;
+    struct file *f = tab[fd];
+
+    uint64_t pos = (f->kind == FILE_KIND_VFS) ? (uint64_t)f->vfs.pos : 0;
+    /* Linux prints the open flags in OCTAL with a leading 0. We keep only the
+     * access mode on the descriptor, so that is what goes out -- the value is
+     * right as far as it goes, and no bit is invented to pad it. */
+    unsigned flags = (unsigned)f->o_accmode;
+
+    int off = 0;
+    char tmp[24];
+    #define FD_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+
+    FD_STR("pos:\t");
+    int_to_str(tmp, sizeof(tmp), (int64_t)pos);
+    FD_STR(tmp);
+    FD_STR("\nflags:\t0");
+    {   /* octal, by hand: kprintf/int_to_str are decimal only */
+        char oct[16]; int oi = 0;
+        unsigned v = flags;
+        if (v == 0) oct[oi++] = '0';
+        while (v) { oct[oi++] = (char)('0' + (v & 7)); v >>= 3; }
+        while (oi) { if ((size_t)off + 1 >= cap) return off;
+                     buf[off++] = oct[--oi]; }
+    }
+    FD_STR("\n");
+    buf[off] = '\0';
+    return off;
+    #undef FD_STR
+}
+
 static int gen_cpuinfo(char *buf, size_t cap) {
     int off = 0;
     char tmp[24];
@@ -667,6 +720,11 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                     len = gen_pid_cmdline(pid, buf, sizeof(buf));
                 else if (strcmp(sub, "maps") == 0)
                     len = gen_pid_maps(pid, buf, sizeof(buf));
+                else if (strncmp(sub, "fdinfo/", 7) == 0) {
+                    int fdn = parse_int(sub + 7);
+                    len = gen_pid_fdinfo(pid, fdn, buf, sizeof(buf));
+                    if (len < 0) return VFS_ERR_NOENT;
+                }
                 else if (strcmp(sub, "stat") == 0)
                     len = gen_pid_stat(pid, buf, sizeof(buf));
                 /* Slice 11: the user-namespace id maps. These are the first
@@ -873,6 +931,30 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
             return VFS_OK;
         }
 
+        /* /proc/<pid>/fdinfo (dir) and /proc/<pid>/fdinfo/<n> (regular file).
+         * MUST be tested before the "fd" arm below, whose prefix match would
+         * otherwise swallow "fdinfo" and report it as an fd symlink. */
+        if (*s == '/' && strncmp(s + 1, "fdinfo", 6) == 0 &&
+            (s[7] == '\0' || s[7] == '/')) {
+            int pid = procfs_kpid(rel);
+            struct proc *p = proc_lookup(pid);
+            if (!p) return VFS_ERR_NOENT;
+            if (s[7] == '\0') {                    /* the fdinfo directory */
+                out->type = VFS_TYPE_DIR;
+                out->nlink = 2;
+                out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+                return VFS_OK;
+            }
+            int fd = parse_int(s + 8);
+            struct file **tab = proc_fds(p);
+            if (fd >= 0 && fd < PROC_NFDS && tab && tab[fd]) {
+                out->type = VFS_TYPE_FILE;
+                out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+                return VFS_OK;
+            }
+            return VFS_ERR_NOENT;
+        }
+
         /* /proc/<pid>/fd (dir) and /proc/<pid>/fd/<n> (symlink) */
         if (*s == '/' && (strcmp(s + 1, "fd") == 0 ||
                           (s[1]=='f' && s[2]=='d' && s[3]=='/'))) {
@@ -935,6 +1017,7 @@ struct procfs_dir_handle {
     int pid;    /* -1 for /proc root, else the pid we're listing */
     int isfd;   /* 1 if listing /proc/<pid>/fd */
     int isns;   /* 1 if listing /proc/<pid>/ns (slice 8) */
+    int isfdi;  /* 1 if listing /proc/<pid>/fdinfo */
 };
 
 static int procfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
@@ -945,6 +1028,7 @@ static int procfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
     dh->index = 0;
     dh->isfd  = 0;
     dh->isns  = 0;
+    dh->isfdi = 0;
 
     if (strcmp(path, "/") == 0) {
         dh->pid = -1;
@@ -957,7 +1041,8 @@ static int procfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
         /* /proc/<pid>/fd is itself a directory of open-fd symlinks. */
         const char *s = rel;
         while (*s >= '0' && *s <= '9') s++;
-        if (*s == '/' && strcmp(s + 1, "fd") == 0) dh->isfd = 1;
+        if (*s == '/' && strcmp(s + 1, "fdinfo") == 0) dh->isfdi = 1;
+        else if (*s == '/' && strcmp(s + 1, "fd") == 0) dh->isfd = 1;
         else if (*s == '/' && strcmp(s + 1, "ns") == 0) dh->isns = 1;  /* slice 8 */
         else if (*s != '\0') { kfree(dh); return VFS_ERR_NOENT; }
     }
@@ -988,6 +1073,32 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
         out->uid = 0; out->gid = 0; out->mode = 0;
         dh->index++;
         return VFS_OK;
+    }
+
+    if (dh->isfdi) {
+        /* /proc/<pid>/fdinfo: one FILE named N per open descriptor -- the same
+         * walk as fd below, with the type Linux reports. Chromium chroots here
+         * and then requires the directory to be empty once it has closed its
+         * descriptors, so the listing has to track the fd table live rather
+         * than report a fixed set. */
+        struct proc *p = proc_lookup(dh->pid);
+        if (!p) return VFS_ERR_NOENT;
+        struct file **tab = proc_fds(p);
+        if (!tab) return VFS_ERR_NOENT;
+        for (int i = dh->index; i < PROC_NFDS; i++) {
+            if (tab[i]) {
+                memset(out->name, 0, VFS_NAME_MAX);
+                char tmp[16];
+                int_to_str(tmp, sizeof(tmp), i);
+                memcpy(out->name, tmp, strlen(tmp));
+                out->type = VFS_TYPE_FILE;
+                out->size = 0;
+                out->uid = 0; out->gid = 0; out->mode = 0;
+                dh->index = i + 1;
+                return VFS_OK;
+            }
+        }
+        return VFS_ERR_NOENT;
     }
 
     if (dh->isfd) {
@@ -1073,8 +1184,9 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     static const char *entries[] = { "status", "cmdline", "maps", "stat",
                                      "exe", "fd", "ns",
                                      /* slice 11 */
-                                     "uid_map", "gid_map", "setgroups" };
-    const int nentries = 10;
+                                     "uid_map", "gid_map", "setgroups",
+                                     "fdinfo" };
+    const int nentries = 11;
     if (dh->index >= nentries) return VFS_ERR_NOENT;
     memset(out->name, 0, VFS_NAME_MAX);
     size_t nl = strlen(entries[dh->index]);
@@ -1082,6 +1194,7 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     if (dh->index == 4)      out->type = VFS_TYPE_SYMLINK;   /* exe */
     else if (dh->index == 5) out->type = VFS_TYPE_DIR;       /* fd  */
     else if (dh->index == 6) out->type = VFS_TYPE_DIR;       /* ns (slice 8) */
+    else if (dh->index == 10) out->type = VFS_TYPE_DIR;      /* fdinfo */
     else                     out->type = VFS_TYPE_FILE;
     out->size = 0;
     out->uid = 0; out->gid = 0; out->mode = 0;

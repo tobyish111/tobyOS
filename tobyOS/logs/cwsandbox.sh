@@ -4,7 +4,17 @@
 #
 #   bash logs/cwsandbox.sh <tag>      # tag names the log; NEVER reuse one
 #
-# Exit status is the result: 0 = chrome survived the sandbox bring-up, 1 = not.
+# Exit status is the result: 0 = chrome survived the sandbox bring-up AND
+# actually bootstrapped, 1 = not.
+#
+# THAT SECOND CLAUSE WAS MISSING AND THE GATE LIED BECAUSE OF IT. The checks
+# below started as "the drop happened, chromium did not refuse root, no
+# credentials.cc CHECK, no clone was refused" -- all four of which can be true
+# on a run where the browser never comes up at all. It reported GREEN on
+# exactly such a run: every sandbox milestone passed, and then
+# `[chromewin] bootstrap failed`. A gate whose success path does not include
+# the thing it is gating is not a gate. The bootstrap check is now the LAST
+# word, and it is the one that decides.
 #
 # --- the traps this script exists to avoid, all of them already paid for ---
 #
@@ -106,6 +116,15 @@ grep -aq 'credentials.cc' "$LOG" && \
 if grep -aqE '56\(clone\).*= -1 '  "$LOG"; then
     echo "   !! a clone() was REFUSED:"
     grep -aE '56\(clone\).*= -1 ' "$LOG" | sed 's/^\[[0-9 ]*ms\] //' | head -4
+    RC=1
+fi
+
+# THE DECIDING CHECK: the browser has to actually come up. Everything above is
+# a milestone on the way there, and milestones are not the destination.
+if grep -aq 'bootstrap failed\|pipe closed / no reply' "$LOG"; then
+    echo "   !! chromewin never bootstrapped -- the sandbox milestones above"
+    echo "      passed and the browser still did not come up:"
+    grep -aE 'FATAL:|Check failed' "$LOG" | sed 's/^\[[0-9 ]*ms\] //' | head -3
     RC=1
 fi
 

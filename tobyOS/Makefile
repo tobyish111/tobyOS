@@ -2933,6 +2933,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-ctrprobe (in-container probe)";        \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ctrprobe";                    \
 	fi;                                                                   \
+	if [ -f programs/linux-gapfill/linux-gapfill.elf ]; then               \
+	    cp programs/linux-gapfill/linux-gapfill.elf                        \
+	         $(INITRD_STAGE)/bin/linux-gapfill;                            \
+	    echo "[initrd] staged linux-gapfill (fdinfo + new syscalls)";      \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-gapfill";                     \
+	fi;                                                                   \
 	if [ -f programs/linux-cgroup2/linux-cgroup2.elf ]; then               \
 	    cp programs/linux-cgroup2/linux-cgroup2.elf                        \
 	         $(INITRD_STAGE)/bin/linux-cgroup2;                            \
