@@ -325,6 +325,7 @@ static int gen_filesystems(char *buf, size_t cap) {
         "nodev\tproc\n"
         "nodev\tsysfs\n"
         "nodev\tcgroup2\n"
+        "nodev\ttmpfs\n"
         "\ttobyfs\n"
         "\text2\n"
         "\text4\n"

@@ -48,10 +48,11 @@ file's header.
 - No cgroup namespace exists in this kernel, so a container that mounts
   `cgroup2` sees the whole hierarchy rather than a subtree rooted at its own
   cgroup. The bundle deliberately does not mount it.
-- No `tmpfs`. This kernel has no mountable in-memory filesystem (ramfs is the
-  initrd singleton), so the bundle's `/dev` mount is **expected** to be refused
-  — it is in the config on purpose, to prove the runtime reports what it did not
-  apply instead of quietly skipping it.
+- `tmpfs` EXISTS now (`src/tmpfs.c`), so the bundle's `/dev` is applied rather
+  than reported. It is size-capped per mount and honours `size=`; an
+  in-memory filesystem without an enforced cap is a way to take the machine
+  down. The runtime's NOT-APPLIED reporting is still exercised by anything else
+  a config asks for that this kernel cannot do — see the list above.
 - One uid/gid mapping line only; `/proc/PID/uid_map` here takes a single entry.
 - Namespace `path` (join an existing namespace), seccomp argument filters, and
   the seccomp TRACE/NOTIFY actions are refused rather than approximated.

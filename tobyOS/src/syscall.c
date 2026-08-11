@@ -42,6 +42,7 @@
 #include <tobyos/procfs.h>
 #include <tobyos/cgroup.h>
 int sysfs_mount_at(const char *path);   /* src/sysfs.c has no public header */
+int tmpfs_mount_at(const char *path, const char *opts);  /* src/tmpfs.c */
 #include <tobyos/nsproxy.h>   /* namespaces: unshare/setns/uts (slice 8) */
 #include <tobyos/seccomp.h>   /* seccomp-bpf (slice 13) */
 #include <tobyos/heap.h>
@@ -9219,10 +9220,28 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * is rendered per-caller, so an extra mount point is an extra view of
          * the same generator rather than a second instance. That is what makes
          * this honest rather than a stub; see procfs_mount_at/cgroup_mount_at.
-         * tmpfs/devtmpfs are deliberately NOT here -- this kernel has no
-         * mountable in-memory filesystem (ramfs is the initrd singleton), and
-         * accepting `-t tmpfs` to mount something else would be the exact class
-         * of lie this arc keeps finding. They fall through to ENODEV. */
+         * tmpfs IS here now, handled just above by a real driver. devtmpfs is
+         * still absent: it would have to synthesise device NODES, and this
+         * kernel synthesises those in the open path rather than as files. */
+        if (strcmp(kfs, "tmpfs") == 0) {
+            /* A REAL in-memory filesystem now (src/tmpfs.c), so this is no
+             * longer the ENODEV the comment above used to describe. The mount
+             * DATA argument carries the options string, and tmpfs parses
+             * `size=` from it rather than accepting and ignoring it. */
+            char kopts[128];
+            kopts[0] = 0;
+            if (a5) (void)strncpy_from_user(kopts, (const char *)a5,
+                                            sizeof kopts);
+            int rc = tmpfs_mount_at(ktgt, kopts[0] ? kopts : 0);
+            if (rc != VFS_OK) return vfs_err_to_abi(rc);
+            if (vflags) {
+                const struct vfs_ops *vops = 0; void *vdata = 0;
+                if (vfs_mount_lookup(ktgt, &vops, &vdata) == VFS_OK)
+                    (void)vfs_mount_flags(ktgt, vops, vdata, vflags);
+            }
+            kprintf("[mount] tmpfs on %s flags=0x%x\n", ktgt, vflags);
+            return 0;
+        }
         if (strcmp(kfs, "proc")    == 0 || strcmp(kfs, "cgroup2") == 0 ||
             strcmp(kfs, "sysfs")   == 0) {
             int rc = (kfs[0] == 'p') ? procfs_mount_at(ktgt)

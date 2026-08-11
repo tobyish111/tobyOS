@@ -109,6 +109,7 @@ C_SRCS := src/kernel.c \
           src/smp.c \
           src/vfs.c \
           src/ramfs.c \
+          src/tmpfs.c \
           src/initrd.c \
           src/proc.c \
           src/thread.c \
@@ -2938,6 +2939,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         $(INITRD_STAGE)/bin/linux-gapfill;                            \
 	    echo "[initrd] staged linux-gapfill (fdinfo + new syscalls)";      \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-gapfill";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
+	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
+	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \
+	    echo "[initrd] staged linux-tmpfs (in-memory filesystem proof)";   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-tmpfs";                       \
 	fi;                                                                   \
 	if [ -f programs/linux-cgroup2/linux-cgroup2.elf ]; then               \
 	    cp programs/linux-cgroup2/linux-cgroup2.elf                        \

@@ -61,6 +61,27 @@ fi
 # shows up as `openat a1=29407312 = -2` and says nothing about which one).
 KFLAGS="-DFAST_BOOT -DQUICK_BOOT -DTKAPP_BOOT -DTKAPP_CHROMEWIN ${EXTRA_KFLAGS:-}"
 
+# PROBE_SANDBOX=1 stages a DUMMY file at /opt/chrome/chrome-sandbox.
+#
+# Chromium's zygote host PCHECKs that its setuid-sandbox helper exists, and
+# chrome-headless-shell does not ship one. This answers, in a single boot,
+# whether that missing file is what kills the browser at
+# zygote_host_impl_linux.cc:221 -- if the CHECK moves, it was; if it does not,
+# the last candidate is eliminated and the next step is symbolising the CHECK
+# rather than guessing again.
+#
+# It is a PROBE, not a fix: the file is not a working setuid helper and cannot
+# be. It is created before the build and deleted after, so it can never ship in
+# an ordinary chrome build, and it carries a marker saying so.
+SANDBOX_STUB=programs/chromium/chrome-headless-shell-linux64/chrome-sandbox
+if [ "${PROBE_SANDBOX:-0}" = "1" ]; then
+    printf 'NOT-A-SANDBOX-HELPER probe file, see logs/cwsandbox.sh
+' > "$SANDBOX_STUB"
+    chmod 755 "$SANDBOX_STUB"
+    echo "== PROBE: staged a dummy $SANDBOX_STUB (existence test only)"
+    trap 'rm -f "$SANDBOX_STUB"' EXIT
+fi
+
 echo "== forcing the flavour-sensitive objects to rebuild"
 rm -f programs/chromewin/chromewin.o programs/chromewin/chromewin.elf
 rm -f build/initrd.tar build/base.iso tobyOS.iso

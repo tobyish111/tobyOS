@@ -12,10 +12,13 @@
 #     runs while quietly skipping half its config would otherwise look
 #     identical to one that honoured all of it.
 #
-# The bundle deliberately asks for a tmpfs /dev this kernel cannot provide, so
-# EXACTLY ONE "NOT APPLIED" for /dev is expected -- and asserted. If that line
-# disappears, either tmpfs appeared (good, update this) or the runtime stopped
-# reporting what it skipped (bad, and invisible without this check).
+# The bundle's tmpfs /dev used to be UNSUPPORTED, and this gate asserted
+# exactly one "NOT APPLIED: /dev" so the runtime's reporting stayed honest.
+# tmpfs now exists (src/tmpfs.c), so that expectation INVERTED: /dev must be
+# applied, and a "NOT APPLIED: /dev" is now a regression. The old comment said
+# "if that line disappears, either tmpfs appeared (good, update this) or the
+# runtime stopped reporting what it skipped (bad)" -- this is the first case,
+# updated.
 set -o pipefail
 cd /c/CustomOS/tobyOS || exit 1
 export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
@@ -102,7 +105,8 @@ grep -aq 'CTR. BITS=0xff' "$LOG"             || { echo "   !! probe mask is not 
 grep -aq 'ocirun.   root: pivot_root into' "$LOG" || \
     { echo "   !! no pivot_root line -- the root move did not happen"; RC=1; }
 NA=$(grep -ac 'NOT APPLIED: /dev' "$LOG")
-[ "$NA" = "1" ] || { echo "   !! expected exactly one 'NOT APPLIED: /dev', got $NA"; RC=1; }
+[ "$NA" = "0" ] || { echo "   !! /dev was NOT APPLIED ($NA) -- tmpfs exists now, so this is a regression"; RC=1; }
+grep -aq 'ocirun.   mount: /dev type tmpfs' "$LOG" ||     { echo "   !! no tmpfs /dev mount line -- the container has no /dev"; RC=1; }
 
 HB=$(grep -ac '\[hb\]' "$LOG")
 FAULTS=$(grep -ac 'EXCEPTION\|user-mode fault\|PANIC' "$LOG")

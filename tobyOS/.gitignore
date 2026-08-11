@@ -121,6 +121,7 @@ programs/linux-clonestk/*.elf
 programs/linux-ocirun/*.elf
 programs/linux-ctrprobe/*.elf
 programs/linux-gapfill/*.elf
+programs/linux-tmpfs/*.elf
 
 # Build scratch left by ad-hoc debugging sessions
 .tmp_*/

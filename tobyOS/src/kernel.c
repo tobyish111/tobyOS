@@ -7662,6 +7662,15 @@ void _start(void) {
              * call failed. */
             { "/bin/linux-gapfill", "linux-gapfill", 0, 255,
               "fdinfo + mkdirat/getcpu/openat2 (C)" },
+            /* tmpfs. bit5 is the check that carries it: an in-memory
+             * filesystem whose size cap is not ENFORCED lets any process
+             * consume all of RAM, so "the mount succeeded" is not the claim --
+             * "the write eventually returns ENOSPC, at the size that was
+             * asked for" is. bit2 is the other half: after umount the data
+             * must be GONE and what was underneath must be back, which is
+             * what distinguishes a mount from a directory someone wrote to. */
+            { "/bin/linux-tmpfs", "linux-tmpfs", 0, 255,
+              "tmpfs: round-trip + enforced size cap (C)" },
 
             /* Independent witness #1: two SEPARATE processes in the initial
              * namespace must report the SAME uts inum (each $( ) is its own
