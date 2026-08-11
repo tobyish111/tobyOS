@@ -38,6 +38,9 @@
 #include <tobyos/snd_pcm.h>
 #include <tobyos/term.h>
 #include <tobyos/vfs.h>
+#include <tobyos/procfs.h>
+#include <tobyos/cgroup.h>
+int sysfs_mount_at(const char *path);   /* src/sysfs.c has no public header */
 #include <tobyos/nsproxy.h>   /* namespaces: unshare/setns/uts (slice 8) */
 #include <tobyos/seccomp.h>   /* seccomp-bpf (slice 13) */
 #include <tobyos/heap.h>
@@ -7683,6 +7686,32 @@ void bt_dump_self(const char *why) {
 }
 #endif
 
+/* Translate a newly created child's pid into the CALLER's pid namespace.
+ *
+ * Slice 10 translated getpid, getppid, procfs and wait4's ARGUMENT -- but
+ * not the number fork/clone HANDS BACK, which is the one every caller then
+ * feeds straight into waitpid(). Inside a pid namespace a process therefore
+ * got a HOST pid from fork() and could not reap its own child: pid_knr()
+ * finds no mapping for a number that was never allocated in that namespace,
+ * so waitpid returned ECHILD.
+ *
+ * Found by linux-clonestk, and only because the test asserted waitpid's
+ * RETURN VALUE. Two checks in the container probe had forked, ignored what
+ * waitpid said, and passed over this same bug -- which is the arc's oldest
+ * lesson arriving again: a call that is allowed to fail silently is not
+ * evidence of anything.
+ *
+ * Errors (< 0) and the child's own 0 pass through untouched, and a caller
+ * in the initial namespace gets the identity mapping, so this is a no-op
+ * everywhere a pid namespace is not involved. */
+static inline long lx_child_pid_ret(long rc) {
+    if (rc > 0) {
+        int v = pid_vnr_of_kpid((int)rc);
+        if (v) return (long)v;
+    }
+    return rc;
+}
+
 static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long a5);
 
 /* [chan] -- every socket-fd I/O call with its ARGS *and its RESULT*.
@@ -8877,6 +8906,36 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return (rc == VFS_OK) ? 0 : vfs_err_to_abi(rc);
         }
 
+        /* VIRTUAL filesystems, which take no block device.
+         *
+         * Every OCI config.json mounts /proc, and a container runtime that
+         * silently skipped that would be relying on the pre-pivot /proc
+         * surviving pivot_root -- true here, but true by accident.
+         *
+         * Each of these is a stateless SINGLETON (ops + data==0) whose content
+         * is rendered per-caller, so an extra mount point is an extra view of
+         * the same generator rather than a second instance. That is what makes
+         * this honest rather than a stub; see procfs_mount_at/cgroup_mount_at.
+         * tmpfs/devtmpfs are deliberately NOT here -- this kernel has no
+         * mountable in-memory filesystem (ramfs is the initrd singleton), and
+         * accepting `-t tmpfs` to mount something else would be the exact class
+         * of lie this arc keeps finding. They fall through to ENODEV. */
+        if (strcmp(kfs, "proc")    == 0 || strcmp(kfs, "cgroup2") == 0 ||
+            strcmp(kfs, "sysfs")   == 0) {
+            int rc = (kfs[0] == 'p') ? procfs_mount_at(ktgt)
+                   : (kfs[0] == 's') ? sysfs_mount_at(ktgt)
+                                     : cgroup_mount_at(ktgt);
+            if (rc != VFS_OK) return vfs_err_to_abi(rc);
+            if (vflags) {
+                const struct vfs_ops *vops = 0; void *vdata = 0;
+                if (vfs_mount_lookup(ktgt, &vops, &vdata) == VFS_OK)
+                    (void)vfs_mount_flags(ktgt, vops, vdata, vflags);
+            }
+            kprintf("[mount] %s on %s type %s flags=0x%x\n",
+                    ksrc[0] ? ksrc : kfs, ktgt, kfs, vflags);
+            return 0;
+        }
+
         /* Validate the FSTYPE before looking up the device.
          *
          * Order matters for the error the caller sees: Linux reports ENODEV
@@ -9235,6 +9294,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         /* LX_vfork / CLONE_VFORK → share-until-exec. Plain fork → CoW copy. */
         long fr = (n == LX_vfork) ? sys_fork_share()
                                   : do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+        fr = lx_child_pid_ret(fr);
 #ifdef CHROMIUM_BOOT
         {   static int pf = 0;
             if (pf < 200) { pf++;
@@ -9274,8 +9334,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                         (unsigned)((uint32_t)a1 & CLONE_NEW_ANY));
                 return -ABI_EINVAL;
             }
-            return sys_clone_thread((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
-                                    (uint64_t)a4, (uint64_t)a5);
+            /* A tid is namespace-local exactly like a pid (pid_ns_place_child
+             * registers one for threads too), so the tid handed back needs the
+             * same translation. */
+            return lx_child_pid_ret(
+                sys_clone_thread((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
+                                 (uint64_t)a4, (uint64_t)a5));
         }
         {
             uint64_t cfl = (uint64_t)a1;
@@ -9316,9 +9380,30 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * afterwards in case the fork bailed before consuming them. */
             struct proc *nsme = current_proc();
             if (nsme) nsme->clone_ns_flags = (uint32_t)(cfl & CLONE_NEW_ANY);
+            /* ...and the child_stack, which this arm used to DROP on the floor.
+             * See proc.h clone_child_stack: glibc's clone() library wrapper
+             * puts the child's entry function on that stack and the child-side
+             * of the wrapper pops it, so a child that resumes on the parent's
+             * stack pops garbage and jumps into it. Chromium's sandbox is the
+             * caller that found this; linux-clonens missed it because the raw
+             * syscall form it tests passes a NULL stack, for which "resume where
+             * the parent was" is the CORRECT behaviour.
+             *
+             * BOTH arms, and sys_fork_share is careful about why: it keeps its
+             * private-stack behaviour for the caller that supplies NO stack
+             * (plain vfork, which is the load-bearing Chromium launcher path)
+             * and uses the caller's when one IS supplied. glibc's clone()
+             * wrapper reaches the share arm too -- Chromium's
+             * ChrootToSafeEmptyDir issues clone(fn, stack, CLONE_VM|
+             * CLONE_VFORK|SIGCHLD, 0) -- so fixing only the CoW arm moved the
+             * same failure one call site along. */
+            uint64_t cstk = (uint64_t)a2;
+            if (nsme && cstk && cstk < UACCESS_USER_END)
+                nsme->clone_child_stack = cstk;
             long cr = share ? sys_fork_share()
                             : do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
-            if (nsme) nsme->clone_ns_flags = 0;
+            if (nsme) { nsme->clone_ns_flags = 0; nsme->clone_child_stack = 0; }
+            cr = lx_child_pid_ret(cr);       /* see lx_child_pid_ret */
 #ifdef CHROMIUM_BOOT
             { static int crl = 0; if (crl < 200) { crl++;
                 struct proc *me = current_proc();
@@ -9928,8 +10013,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 return -ABI_EINVAL;
             }
             uint64_t stack_top = ca.stack + ca.stack_size;
-            return sys_clone_thread(ca.flags, stack_top, ca.parent_tid,
-                                    ca.child_tid, ca.tls);
+            return lx_child_pid_ret(
+                sys_clone_thread(ca.flags, stack_top, ca.parent_tid,
+                                 ca.child_tid, ca.tls));
         }
         /* Slice 8: same staging as LX_clone, covering both fork shapes below. */
         {
@@ -9940,10 +10026,17 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * would leave it armed for whatever forked next. */
             struct proc *nsme = current_proc();
             uint32_t nsf = (uint32_t)(ca.flags & CLONE_NEW_ANY);
+            /* clone3 hands the LOWEST address plus a size, so the resume RSP is
+             * the top -- the identical computation the CLONE_THREAD arm above
+             * already does. Staged for BOTH arms; see LX_clone and proc.h
+             * clone_child_stack for why ignoring it is a hole. */
+            uint64_t c3stk = ca.stack ? ca.stack + ca.stack_size : 0;
             long fr3;
             if ((ca.flags & 0x4000u /* CLONE_VFORK */) ||
                 (ca.flags & 0x100u  /* CLONE_VM */)) {
                 if (nsme) nsme->clone_ns_flags = nsf;
+                if (nsme && c3stk && c3stk < UACCESS_USER_END)
+                    nsme->clone_child_stack = c3stk;
                 fr3 = sys_fork_share();
             } else {
 #ifdef CHROMIUM_BOOT
@@ -9959,10 +10052,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 }
 #endif
                 if (nsme) nsme->clone_ns_flags = nsf;
+                if (nsme && c3stk && c3stk < UACCESS_USER_END)
+                    nsme->clone_child_stack = c3stk;
                 fr3 = do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
             }
-            if (nsme) nsme->clone_ns_flags = 0;   /* fork may have bailed early */
-            return fr3;
+            if (nsme) { nsme->clone_ns_flags = 0;   /* fork may have bailed early */
+                        nsme->clone_child_stack = 0; }
+            return lx_child_pid_ret(fr3);    /* see lx_child_pid_ret */
         }
     }
 

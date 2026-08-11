@@ -2912,6 +2912,27 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-clonens (clone+CLONE_NEW* proof)";     \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-clonens";                     \
 	fi;                                                                   \
+	if [ -f programs/linux-clonestk/linux-clonestk.elf ]; then             \
+	    cp programs/linux-clonestk/linux-clonestk.elf                      \
+	         $(INITRD_STAGE)/bin/linux-clonestk;                           \
+	    echo "[initrd] staged linux-clonestk (clone child-stack proof)";   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-clonestk";                    \
+	fi;                                                                   \
+	if [ -f programs/linux-ocirun/linux-ocirun.elf ]; then                 \
+	    cp programs/linux-ocirun/linux-ocirun.elf                          \
+	         $(INITRD_STAGE)/bin/linux-ocirun;                             \
+	    mkdir -p $(INITRD_STAGE)/oci-bundle;                               \
+	    cp programs/linux-ocirun/config.json                               \
+	         $(INITRD_STAGE)/oci-bundle/config.json;                       \
+	    echo "[initrd] staged linux-ocirun + /oci-bundle (slice 16 OCI)";  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ocirun oci-bundle/config.json"; \
+	fi;                                                                   \
+	if [ -f programs/linux-ctrprobe/linux-ctrprobe.elf ]; then             \
+	    cp programs/linux-ctrprobe/linux-ctrprobe.elf                      \
+	         $(INITRD_STAGE)/bin/linux-ctrprobe;                           \
+	    echo "[initrd] staged linux-ctrprobe (in-container probe)";        \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ctrprobe";                    \
+	fi;                                                                   \
 	if [ -f programs/linux-cgroup2/linux-cgroup2.elf ]; then               \
 	    cp programs/linux-cgroup2/linux-cgroup2.elf                        \
 	         $(INITRD_STAGE)/bin/linux-cgroup2;                            \

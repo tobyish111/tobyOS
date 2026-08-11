@@ -45,6 +45,9 @@ void cgroup_init(void);
  * /sys, which the longest-prefix mount table handles natively). */
 void cgroup_mount(void);
 
+/* Mount cgroup2 at an extra point (mount(2) -t cgroup2). Returns VFS_*. */
+int  cgroup_mount_at(const char *path);
+
 /* ---- membership -------------------------------------------------------- */
 /* A process's cgroup index; 0 (root) for anything never assigned. */
 int  cgroup_of(struct proc *p);

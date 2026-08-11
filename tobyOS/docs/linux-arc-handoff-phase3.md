@@ -1491,3 +1491,224 @@ child by citing `copy_user_pages`'s "intentionally a FULL copy (no COW)" note.
 already covered CoW paths, and the child still gets its own `cr3`, so it is its own
 mm owner and the bulk charge still lands correctly), but the stated reason was wrong
 and is now fixed.
+
+---
+
+## 21. Slice 14 CLOSED OUT + slice 16 CAPSTONE (2026-08-10)
+
+**Read this section before acting on §20's middle.** §20 concludes that the
+sandbox blocker was "CoW-forking chrome's own address space -- 327 VMAs, V8
+cages -- through `vmm_cow_fork`", and hands the next step to the Chromium arc's
+tooling. **That conclusion is wrong.** Nothing about chrome's size, its VMAs or
+CoW was involved. The cause was four ordinary `clone(2)` bugs, all fixed here,
+and the first was visible in the very log §20 quotes.
+
+### THE ROOT CAUSE, and the one step that found it
+
+§20's own first probe -- "map `rip=0x0000000003716f29` to a function in
+`chrome-headless-shell`" -- answers the whole question in about a minute.
+`base=0x500000` is in the same log, so the ELF vaddr is `0x3216f29`:
+
+```
+3216f1b:  e8 60 a5 31 08    call   b531480 <clone@plt>
+3216f20:  64 48 8b 0c 25... mov    %fs:0x28,%rcx        <- reload the stack canary
+3216f29:  48 3b 4d d8       cmp    -0x28(%rbp),%rcx     <- FAULTS. cr2 = -0x28 => rbp == 0
+```
+
+`cr2 = 0xffffffffffffffd8` is not "a base register holding zero" in general --
+it is **`%rbp` exactly**, in a stack-canary check. And the call above it is
+`clone@plt`: **Chromium goes through glibc's clone() LIBRARY function, not
+`syscall(SYS_clone, ...)`.**
+
+That distinction is the bug. glibc's `__clone` stores `fn`/`arg` at the top of
+the caller-supplied child stack, and its child side is
+
+```
+xor %ebp,%ebp ; pop %rax ; pop %rdi ; call *%rax
+```
+
+**`LX_clone` dropped `a2` (child_stack) on the floor.** The child therefore ran
+those pops against the PARENT's stack: `%rax` got the return address of the
+caller's own `call clone@plt`, the child "called" back into the middle of its
+parent's caller with `%rbp == 0`, and died on the first frame-relative access --
+zero syscalls, so `wait4` found nothing and the sandbox `CHECK`ed out.
+
+**Why the previous session's 8/8 disproof was itself wrong.**
+`programs/linux-clonens` issues `syscall(SYS_clone, flags, NULL, ...)`, and for
+a NULL child stack "resume where the parent was" is the CORRECT behaviour -- so
+that test passes on a kernel with this bug and always would have. Its header
+claimed the raw form "is precisely what Chromium's ForkWithFlags does"; that
+sentence is corrected in the file. The lesson is not "test both entry points"
+(§20 said that, and the test written from it still missed) -- it is **test the
+entry point the real caller uses, and read the disassembly to find out which
+one that is.**
+
+### FOUR KERNEL BUGS, in the order they surfaced
+
+Each was uncovered by fixing the one before it, so they are a chain, not a list.
+
+1. **`clone(2)` ignored `child_stack` on the CoW arm** (`LX_clone`, `LX_clone3`).
+   Fixed with `proc->clone_child_stack`, staged by the clone arm and consumed
+   inside the fork -- the same pattern and the same reason as slice 8's
+   `clone_ns_flags`: the child is enqueued before the syscall returns, so a
+   post-fork fixup is an SMP race, not a simplification.
+
+2. **`nsproxy_apply_clone_flags` contradicted its own comment.** It read
+
+   ```c
+   if ((want & ~CLONE_NEWUSER) && !userns_capable(LCAP_SYS_ADMIN)) return -EPERM;
+   ```
+
+   under a comment saying "asking for NEWUSER together with others is authorised
+   by the NEWUSER itself". Masking a bit out of the set being CHECKED grants
+   nothing. So unprivileged `clone(CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET)` --
+   flags `0x70000011`, the only combination unprivileged containers ever use,
+   and Chromium's second clone -- was measured against the PARENT's user
+   namespace and refused with EPERM. `ns_unshare()` had always been right,
+   because it INSTALLS the user namespace first and only then tests the
+   capability. Two entry points to one feature, one of them wrong -- again.
+
+3. **`sys_fork_share` ignored `child_stack` too.** With bug 1 fixed, the sandbox
+   advanced from `credentials.cc:309` to `credentials.cc:118` --
+   `ChrootToSafeEmptyDir`, which clones with
+   `CLONE_VM|CLONE_VFORK|CLONE_FS|SIGCHLD|CLONE_UNTRACED` (`0x84311`) **and a
+   stack**. That reaches the share arm, which maps the child a fresh zeroed
+   private stack, so `pop %rax` gave 0 and `call *0` produced `rip=0, err=0x14`
+   -- the signature already recorded against busybox `unshare -f` in §6.
+
+   **The private stack is UNCHANGED for the caller that supplies none** (plain
+   `vfork`, the load-bearing Chromium launcher path §6 warns against touching).
+   An explicitly supplied stack simply takes precedence. The two callers are
+   distinguishable, so this is not the fix §6 forbids.
+
+4. **`fork`/`clone` returned the HOST pid to a caller inside a pid namespace.**
+   Slice 10 translated `getpid`, `getppid`, procfs and `wait4`'s ARGUMENT -- but
+   not the number fork HANDS BACK, which is precisely the number every caller
+   then feeds to `waitpid`. Inside a namespace `pid_knr()` finds no mapping for
+   it, so a process could not reap its own children (ECHILD). Fixed by
+   `lx_child_pid_ret()` on all four fork/clone/clone3 return paths, threads
+   included (a tid is namespace-local too).
+
+Plus one bug introduced by fix 1 and caught by the capstone: **the staging
+fields are copied into the child by the whole-PCB `memcpy`.** A child that keeps
+`clone_child_stack` applies it to ITS next fork, pointing a grandchild's RSP at
+an address belonging to a program that had already been replaced by execve.
+`clone_ns_flags` had the same latent hole. Both are now explicitly zeroed in all
+three fork paths.
+
+### Where Chromium's sandbox stands now -- NOT "done"
+
+```
+[chromewin] dropped to uid=1000 ...
+[ns] clone: pid=4 new namespaces user            <- CanCreateProcessInNewUserNS
+[proc] pid=4 ... exit code=0  syscalls=19        <- that probe child RUNS and exits 0
+[ns] clone: pid=5 new namespaces pid user net    <- 0x70000011 now ACCEPTED
+[fork] share pid=5 -> child pid=6 ... stack=0x0  <- the caller's stack is honoured
+Check failed: sys_chroot("/proc/self/fdinfo/") == 0
+```
+
+**The next blocker is a named, ordinary feature gap: `/proc/PID/fdinfo` does not
+exist.** `ChrootToSafeEmptyDir` chroots into it as a guaranteed-empty directory.
+It is a bounded procfs addition -- a directory plus one file per open fd,
+mirroring the existing `fd/` handling in `procfs_stat` / `procfs_opendir` /
+`procfs_readdir` -- and a genuine Linux-completeness item regardless of
+Chromium. **Expect more blockers after it**; the sandbox does a great deal past
+this point. What changed is the KIND of failure: from "the child dies before
+executing one instruction, cause unknown" to "the child runs and prints what it
+is missing".
+
+Reproduce with `bash logs/cwsandbox.sh <fresh-tag>`, which carries the build
+laws (right launcher, `PROG_EXTRA_CFLAGS`, forced object deletion) and gates on
+the BINARIES before spending a boot.
+
+### Slice 16's capstone: a real OCI container, `LXCONTAINER_BOOT`
+
+```
+TAG=<fresh> bash logs/lxcontainer.sh      # never reuse a log name
+```
+
+`programs/linux-ocirun/` is a minimal OCI runtime: it parses a real
+`config.json` and applies namespaces, id mappings, cgroup v2 limits, mounts, a
+seccomp profile compiled from that profile's syscall NAMES, `pivot_root`, and a
+privilege drop -- then execs the configured process and reports its status.
+
+**The rule it is built around:** a container runtime's failure mode is not
+crashing, it is STARTING ANYWAY. Anything affecting isolation that cannot be
+honoured is FATAL (unknown namespace type, `namespaces[].path`, an unknown
+seccomp action or syscall name, seccomp argument filters, a failed
+map/pivot/drop). Anything else not applied is REPORTED BY NAME and counted. The
+bundle asks for a `tmpfs /dev` on purpose so every run exercises that reporting
+-- and `logs/lxcontainer.sh` asserts **exactly one** `NOT APPLIED: /dev`.
+
+The verdict is carried by `programs/linux-ctrprobe/`, which runs INSIDE and
+returns an 8-bit mask in which every bit asserts a value:
+
+```
+[CTR] ok pid ns: getpid=1, /proc Pid:1        [CTR] ok uts ns: hostname 'toby-container'
+[CTR] ok root: host root GONE and / is Alpine 3.19.0 (both halves)
+[CTR] ok creds: uid=gid=1000, root-only chown refused (errno=1)
+[CTR] ok net ns: connect(10.0.2.2:80) -> ENETUNREACH exactly
+[CTR] ok alpine: the container's OWN busybox -- 'BusyBox v1.36.1 ...'
+[CTR] ok seccomp: chmod -> errno=1 as configured, others unaffected
+[CTR] ok cgroup pids.max: fork returned EAGAIN after 7 children (limit 8)
+[CTR] BITS=0xff      [LXCONTAINER] VERDICT: PASS setup=3/3 probe=0xff
+```
+
+**The rootfs needs its own MOUNT.** `pivot_root` requires the new root to BE a
+mount point, and this VFS cannot bind a subtree to make one (`MS_BIND`
+re-registers an existing *mount's* ops at a second path, so binding
+`/data/alp` onto itself is not expressible). `LXCONTAINER_BOOT` therefore
+creates a RAM-backed tobyfs volume at `/oci`. The runtime **refuses to fall back
+to chroot** when the pivot is impossible: a silent downgrade from "the old root
+is gone" to "the old root is merely hard to name" is exactly the quiet weakening
+this program exists not to do.
+
+**Two things the capstone taught, both worth more than the pass:**
+
+- **SIZE A tobyfs VOLUME BY INODES, NOT BY CONTENT.** The rootfs unpacks to
+  ~9 MiB, so the volume was made 32 MiB. `tobyfs_format` derives
+  `inodes = total_blocks / 64` (floor 256), and the Alpine rootfs is **528
+  entries, 335 of them symlinks**. The extraction died halfway with
+  `tar: can't create symlink './usr/bin/readlink'` -- a message that points at
+  symlinks, and not at the volume. 192 MiB = 768 inodes; a `_Static_assert`
+  guards it now and the harness prints the budget before extracting.
+- **THE PROBE COMMITTED THIS ARC'S OLDEST MISTAKE.** Two of its checks forked
+  and then wrote `waitpid(p, &st, 0);`, discarding the result. Both reported
+  `ok` while bug 4 above was live and every one of those waitpids was returning
+  ECHILD. `linux-clonestk` caught what the container missed, and only because it
+  asserted waitpid's RETURN VALUE. The probe now checks the reap and the kill.
+
+### New tests, and what each is for
+
+- `programs/linux-clonestk/` -- the LIBRARY `clone()` shape. bit1 is the check
+  that carries it: not "the child ran" but "the child's own frame address is
+  INSIDE the buffer we supplied", because a child pointed at some other valid
+  stack would pass the weaker version and still be wrong. Its child also does a
+  plain `fork()` of its own, which is what catches staging leaking through the
+  PCB copy. **Negative control run:** with the fix disabled the mask is `0x00`
+  and every case fails with `errno=10` -- ECHILD, the literal
+  `credentials.cc:309` signature.
+- `programs/linux-ctrprobe/` -- the in-container payload described above.
+- `logs/cwsandbox.sh`, `logs/lxcontainer.sh` -- one-command gates, each
+  refusing to reuse a log filename and each gating on binaries rather than on
+  the build's exit status.
+
+### Also added, because an OCI config asks for them
+
+`mount(2)` now accepts `-t proc`, `-t sysfs` and `-t cgroup2`. Each mounts an
+existing stateless singleton at a second point (content is rendered per-caller,
+so a second mount point is a second VIEW, not a second instance). This also
+closes a pre-existing mismatch: `/proc/filesystems` had always advertised
+`nodev sysfs` while `mount(2)` answered ENODEV for it; `cgroup2` is now listed
+as well. **No `tmpfs`** -- this kernel has no mountable in-memory filesystem
+(ramfs is the initrd singleton), and accepting `-t tmpfs` to mount something
+else would be precisely the lie this arc keeps catching.
+
+Stated limit: there is no cgroup namespace, so a container that mounts
+`cgroup2` sees the whole hierarchy rather than a subtree rooted at its own
+cgroup. The capstone bundle deliberately does not mount it.
+
+### Gate state after all of the above
+
+`lxposix --full` **GREEN 23/23** with `enosys_gaps=0`, `LXNS` **15/15**,
+`LXCONTAINER` **PASS probe=0xff**, zero faults in every run.

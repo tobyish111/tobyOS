@@ -397,6 +397,31 @@ struct proc {
      * needed. */
     uint32_t        clone_ns_flags;
 
+    /* clone(2)'s `child_stack` argument (a2), staged by the same arm and for
+     * the same reason as clone_ns_flags above: it has to be installed into the
+     * child's saved user register block while the child is still PROC_EMBRYO.
+     * 0 == "not supplied" (fork semantics: the child resumes on the parent's
+     * stack), which is also the zero-init default.
+     *
+     * This existed as a hole until the Chromium sandbox found it. `clone` has
+     * TWO callers with different shapes and only one of them was tested:
+     *
+     *   syscall(SYS_clone, flags, NULL, ...)  -- the raw syscall, NULL stack.
+     *      The child resumes on the parent's stack, exactly like fork(2).
+     *      This is what programs/linux-clonens exercises, and it always worked.
+     *
+     *   clone(fn, child_stack, flags, arg)    -- the glibc LIBRARY function.
+     *      __clone stores fn/arg at the TOP of child_stack, passes the adjusted
+     *      pointer as the syscall's a2, and the child-side of the wrapper does
+     *      `xor %ebp,%ebp; pop %rax; pop %rdi; call *%rax`. If a2 is ignored,
+     *      that pop reads the PARENT's stack: %rax gets the return address of
+     *      the `call clone@plt`, so the child "calls" back into the middle of
+     *      its parent's caller with rbp == 0 and dies on the first frame-
+     *      relative access. Chromium's sandbox does exactly this at
+     *      credentials.cc, which is why its child died at cr2 = -0x28 (the
+     *      stack-canary reload `cmp -0x28(%rbp),%rcx`) with syscalls=0. */
+    uint64_t        clone_child_stack;
+
     /* Linux slice 3: alarm(2) deadline, absolute monotonic ns; 0 == no alarm.
      * Checked by signal_check_alarms() on the timer tick, which raises SIGALRM
      * and clears it. Deliberately NOT a general timer subsystem -- one

@@ -148,6 +148,79 @@ static int ramdata_write(struct blk_dev *d, uint64_t lba, uint32_t n,
 static const struct blk_ops g_ramdata_ops = {
     .read = ramdata_read, .write = ramdata_write,
 };
+#ifdef LXCONTAINER_BOOT
+/* ---- a SECOND RAM-backed volume, for slice 16's container rootfs ---------
+ *
+ * The container needs its root filesystem to be a MOUNT POINT, because
+ * pivot_root(2) requires that (vfs_pivot_root -> ns_find_exact) and this VFS
+ * cannot bind a subtree to manufacture one: MS_BIND re-registers an existing
+ * MOUNT's ops at a second path, so binding /data/alp onto itself is not
+ * expressible. Extracting the rootfs into a directory on /data would therefore
+ * leave the runtime with nothing but chroot -- which is a weaker thing wearing
+ * the same name, and the whole point of the capstone is that the old root is
+ * really gone.
+ *
+ * So the container gets its own volume. In RAM rather than on a disk image so
+ * the harness needs no extra -drive and no host-side provisioning. Gated, so no
+ * other flavour pays for it.
+ *
+ * SIZE IT BY INODES, NOT BY BYTES. The first attempt was 32 MiB, on the
+ * reasoning that the Alpine 3.19 minirootfs unpacks to ~9 MiB. It failed
+ * partway through the extraction with
+ *
+ *     tar: can't create symlink './usr/bin/readlink' to '/bin/busybox'
+ *
+ * because tobyfs derives its inode count from the VOLUME size --
+ * `inodes = total_blocks / 64`, floored at TFS_INODE_COUNT (256) -- and the
+ * rootfs is 528 entries, of which 335 are symlinks. 32 MiB bought 256 inodes
+ * and it ran out at roughly half. The content fits; the metadata does not.
+ *
+ * 192 MiB = 49152 blocks = 768 inodes, ~230 spare over the 535 the rootfs plus
+ * the probe need. The volume is ~95% empty and that is the point. */
+#define RAMOCI_BYTES  (192u * 1024u * 1024u)
+#define RAMOCI_MIN_INODES 600u        /* 528 rootfs entries + probe + slack */
+/* tobyfs_format: inodes = max(total_blocks / 64, TFS_INODE_COUNT=256). */
+#define RAMOCI_BLOCKS ((RAMOCI_BYTES) / 4096u)
+#define RAMOCI_INODES ((RAMOCI_BLOCKS / 64u) < 256u ? 256u \
+                                                    : (RAMOCI_BLOCKS / 64u))
+_Static_assert(RAMOCI_INODES >= RAMOCI_MIN_INODES,
+               "container volume too small: tobyfs sizes its INODE table from "
+               "the volume, and the Alpine rootfs is 528 entries -- a volume "
+               "that fits the bytes can still run out of inodes mid-extract");
+static uint8_t       *g_ramoci;
+static struct blk_dev g_ramoci_dev;
+
+static int ramoci_read(struct blk_dev *d, uint64_t lba, uint32_t n, void *buf) {
+    (void)d;
+    uint64_t off = lba * 512ull, len = (uint64_t)n * 512ull;
+    if (!g_ramoci || off + len > RAMOCI_BYTES) return -1;
+    memcpy(buf, g_ramoci + off, (size_t)len);
+    return 0;
+}
+static int ramoci_write(struct blk_dev *d, uint64_t lba, uint32_t n,
+                        const void *buf) {
+    (void)d;
+    uint64_t off = lba * 512ull, len = (uint64_t)n * 512ull;
+    if (!g_ramoci || off + len > RAMOCI_BYTES) return -1;
+    memcpy(g_ramoci + off, buf, (size_t)len);
+    return 0;
+}
+static const struct blk_ops g_ramoci_ops = {
+    .read = ramoci_read, .write = ramoci_write,
+};
+static struct blk_dev *ramoci_device(void) {
+    if (g_ramoci) return &g_ramoci_dev;
+    g_ramoci = (uint8_t *)kmalloc(RAMOCI_BYTES);
+    if (!g_ramoci) return 0;
+    memset(g_ramoci, 0, RAMOCI_BYTES);
+    g_ramoci_dev.name         = "ramoci";
+    g_ramoci_dev.ops          = &g_ramoci_ops;
+    g_ramoci_dev.sector_count = RAMOCI_BYTES / 512u;
+    g_ramoci_dev.class        = BLK_CLASS_DISK;
+    return &g_ramoci_dev;
+}
+#endif /* LXCONTAINER_BOOT */
+
 /* Build (once) the in-RAM block device backing the /data fallback. */
 static struct blk_dev *ramdata_device(void) {
     if (g_ramdata) return &g_ramdata_dev;
@@ -7081,6 +7154,127 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXCONTAINER_BOOT
+    /* ==================================================================
+     * Linux slice 16 -- THE CAPSTONE: a real OCI container.
+     *
+     * Everything Phase 3 built, driven at once by a config.json rather than by
+     * a test that calls each piece in turn: user + mount + pid + uts + ipc +
+     * net namespaces, an id mapping, pivot_root onto its own volume with the
+     * old root detached, cgroup v2 pids/memory/cpu limits, a seccomp-bpf
+     * profile compiled from the profile's syscall NAMES, and a privilege drop
+     * -- then Alpine's own userland on the far side of all of it.
+     *
+     * WHAT MAKES THE VERDICT MEAN SOMETHING is not this harness, it is
+     * linux-ctrprobe: it runs INSIDE and returns an 8-bit mask where every bit
+     * asserts a VALUE, not a success. The host-only file must be GONE while an
+     * Alpine-only file is readable; connect() must fail with ENETUNREACH
+     * exactly; fork() must ACTUALLY start returning EAGAIN below pids.max; the
+     * busybox that runs must print ALPINE's banner. See that file's header for
+     * why each check is shaped the way it is.
+     *
+     * Note the bundle deliberately asks for a `tmpfs` /dev, which this kernel
+     * cannot provide. That is not an oversight in the config: it is there so
+     * the run demonstrates the runtime REPORTING what it did not apply rather
+     * than skipping it quietly. Expect one "NOT APPLIED: /dev (tmpfs)".
+     * ================================================================== */
+    {
+        char *envp[] = { (char *)"PATH=/bin:/sbin:/usr/bin",
+                         (char *)"HOME=/", (char *)"TERM=linux", 0 };
+        int ok = 0, n = 0;
+        bool mounted = false;
+
+        kprintf("[LXCONTAINER] ==== OCI container over the Alpine rootfs ====\n");
+        struct blk_dev *cd = ramoci_device();
+        if (cd && tobyfs_format(cd) == VFS_OK) {
+            bcache_invalidate(cd);
+            if (tobyfs_mount("/oci", cd) == VFS_OK) mounted = true;
+        }
+        if (!mounted) {
+            kprintf("[LXCONTAINER] could not create the container volume "
+                    "(32 MiB RAM-backed tobyfs at /oci)\n");
+        } else {
+            /* The rootfs is unpacked and then pivoted into by a process that
+             * ends up uid 1000, so the volume root cannot stay 0755/root. */
+            (void)vfs_chmod("/oci", 00777u);
+            kprintf("[LXCONTAINER] /oci: %u MiB tobyfs, a MOUNT POINT so "
+                    "pivot_root has something real to move\n",
+                    RAMOCI_BYTES / (1024u * 1024u));
+            /* Say the inode budget out loud. Running out of them mid-extraction
+             * reads as "tar can't create symlink", which points at symlinks and
+             * not at the volume -- see the sizing comment above. Computed from
+             * tobyfs_format's own rule rather than read back, so the number is
+             * checkable before the extraction rather than after it. */
+            kprintf("[LXCONTAINER] /oci inodes: %u (tobyfs gives blocks/64, "
+                    "floor 256) -- the rootfs needs >= %u\n",
+                    RAMOCI_INODES, RAMOCI_MIN_INODES);
+
+            struct { const char *what; const char *script; } steps[] = {
+              /* Alpine's own rootfs, extracted in the guest -- same tarball
+               * slice 7 uses, so this is not a special-purpose image. */
+              { "unpack the Alpine rootfs into the container volume",
+                "/bin/busybox tar -xzf /alpine.tar.gz -C /oci && "
+                "/bin/busybox ls /oci/bin/busybox /oci/etc/alpine-release "
+                ">/dev/null && echo '[CTRSETUP] rootfs unpacked'" },
+              /* The probe is a STATIC binary: after pivot_root there is no
+               * host filesystem left to resolve a loader from. */
+              { "stage the probe inside the rootfs",
+                "/bin/busybox cp /bin/linux-ctrprobe /oci/bin/ctrprobe && "
+                "/bin/busybox chmod 755 /oci/bin/ctrprobe && "
+                "/bin/busybox mkdir -p /oci/proc && "
+                "echo '[CTRSETUP] probe staged as /bin/ctrprobe'" },
+              /* Two-sidedness for the probe's bit3: it requires
+               * /alpine.tar.gz to be UNREACHABLE from inside. Prove it is
+               * reachable OUT here, or "not found" would prove nothing. */
+              { "the host-only marker is present OUTSIDE the container",
+                "/bin/busybox test -f /alpine.tar.gz && "
+                "/bin/busybox test ! -f /oci/alpine.tar.gz && "
+                "echo '[CTRSETUP] /alpine.tar.gz visible on the host, absent "
+                "from the rootfs'" },
+            };
+            n = (int)(sizeof(steps)/sizeof(steps[0]));
+            for (int i = 0; i < n; i++) {
+                char *argv[] = { (char *)"sh", (char *)"-c",
+                                 (char *)steps[i].script, 0 };
+                struct proc_spec spec = {
+                    .path = "/bin/busybox", .name = "sh",
+                    .argc = 3, .argv = argv, .envc = 3, .envp = envp,
+                };
+                kprintf("[LXCONTAINER] setup %d: %s\n", i + 1, steps[i].what);
+                int pid = proc_spawn(&spec);
+                if (pid < 0) { kprintf("[LXCONTAINER] no busybox -- SKIP\n");
+                               break; }
+                int rc = proc_wait(pid);
+                kprintf("[LXCONTAINER] setup %d exit=%d\n", i + 1, rc);
+                if (rc == 0) ok++; else break;   /* later steps depend on it */
+            }
+        }
+
+        int probe = -1;
+        if (ok == n && n > 0) {
+            /* linux-ocirun returns the CONTAINER's exit status verbatim, so
+             * this number is the probe's bitmask and nothing else. */
+            char *argv[] = { (char *)"linux-ocirun", (char *)"/oci-bundle",
+                             (char *)"toby-demo", 0 };
+            struct proc_spec spec = {
+                .path = "/bin/linux-ocirun", .name = "ocirun",
+                .argc = 3, .argv = argv, .envc = 3, .envp = envp,
+            };
+            kprintf("[LXCONTAINER] running the bundle\n");
+            int pid = proc_spawn(&spec);
+            if (pid < 0) kprintf("[LXCONTAINER] /bin/linux-ocirun missing "
+                                 "(opt-in: run programs/linux-ocirun/build.sh)\n");
+            else probe = proc_wait(pid);
+        }
+
+        kprintf("[LXCONTAINER] container probe BITS=0x%x (want 0xff)\n",
+                probe < 0 ? 0 : probe);
+        kprintf("[LXCONTAINER] VERDICT: %s setup=%d/%d probe=0x%x\n",
+                (ok == n && n > 0 && probe == 255) ? "PASS" : "FAIL",
+                ok, n, probe < 0 ? 0 : probe);
+    }
+#endif
+
 #ifdef LXPOSIX_BOOT
     /* ==================================================================
      * Linux slice 4: THE STANDING POSIX ACCEPTANCE GATE.
@@ -7437,6 +7631,26 @@ void _start(void) {
              * bug is in clone/fork generally and not about namespaces at all. */
             { "/bin/linux-clonens", "linux-clonens", 0, 255,
               "clone(CLONE_NEW*) creates a child (C)" },
+            /* ...and the OTHER clone shape, which is the one that was broken.
+             * linux-clonens above issues the RAW syscall with a NULL child
+             * stack, for which "the child resumes where the parent was" is
+             * correct -- so it passed 8/8 over a real bug and was read as
+             * exonerating the whole namespace path.
+             *
+             * glibc's clone() LIBRARY function passes a real child stack and
+             * its child-side wrapper pops the entry function off it. This arm
+             * ignored the argument entirely, so the child popped the parent's
+             * stack, "called" the return address of the caller's own
+             * `call clone@plt` with rbp == 0, and died on the first
+             * frame-relative access -- Chromium's sandbox, cr2 = -0x28, zero
+             * syscalls, then ECHILD at credentials.cc:309.
+             *
+             * bit1 is the check that carries this test: not "the child ran"
+             * but "the child's own frame address is INSIDE the buffer we
+             * supplied". A child pointed at some other valid stack would pass
+             * the weaker version and still be wrong. */
+            { "/bin/linux-clonestk", "linux-clonestk", 0, 255,
+              "clone(fn, child_stack, ...) via glibc (C)" },
 
             /* Independent witness #1: two SEPARATE processes in the initial
              * namespace must report the SAME uts inum (each $( ) is its own

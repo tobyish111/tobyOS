@@ -77,10 +77,19 @@ programs/realcurl/curl
 programs/realcurl/*.tar.xz
 
 # Bootable images / filesystems produced by the build
+#
+# NOTE: gitignore has NO trailing-comment syntax -- everything after the pattern
+# is part of the pattern. `nvme*.img  # scratch...` therefore matched nothing,
+# which is why nvme4k.img / nvme512.img / sata.img showed up as untracked for
+# months while disk.img (no comment) was correctly ignored. Comments go on their
+# own line.
 *.iso
 disk.img
-nvme*.img       # scratch NVMe backing images for QEMU storage tests
-sata*.img       # scratch AHCI/SATA backing images for QEMU storage tests
+disk.img.*
+# scratch NVMe backing images for QEMU storage tests
+nvme*.img
+# scratch AHCI/SATA backing images for QEMU storage tests
+sata*.img
 *.tar
 build/
 iso/
@@ -100,3 +109,18 @@ logs/
 logs/frames*/
 programs/chromium/chrome-linux64/
 programs/chromium/chrome-linux64.zip
+
+# Third-party payloads that are FETCHED, not committed (programs/*/fetch.sh).
+# The Alpine minirootfs backs slice 7 (LXALPINE_BOOT) and slice 16's container
+# capstone (LXCONTAINER_BOOT); get it with: bash programs/alpine/fetch.sh
+programs/alpine/*.tar.gz
+
+# Opt-in acceptance binaries built by their own build.sh, like the sibling
+# linux-* tests above them.
+programs/linux-clonestk/*.elf
+programs/linux-ocirun/*.elf
+programs/linux-ctrprobe/*.elf
+
+# Build scratch left by ad-hoc debugging sessions
+.tmp_*/
+.tmp_*.sh

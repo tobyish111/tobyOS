@@ -290,12 +290,35 @@ long nsproxy_apply_clone_flags(struct proc *child, uint32_t flags) {
         return -ABI_EINVAL;
     }
     /* Same privilege rule as unshare(2) below: CLONE_NEWUSER is free, anything
-     * else needs CAP_SYS_ADMIN in the caller's user namespace. Asking for
-     * NEWUSER together with others is authorised by the NEWUSER itself, which
-     * is why the check ignores that bit. */
+     * else needs CAP_SYS_ADMIN in the caller's user namespace -- UNLESS
+     * CLONE_NEWUSER is part of the SAME request, in which case the user
+     * namespace being created here is what authorises the rest.
+     *
+     * THAT LAST CLAUSE WAS THE COMMENT AND NOT THE CODE. The old test was
+     *
+     *     if ((want & ~CLONE_NEWUSER) && !userns_capable(LCAP_SYS_ADMIN))
+     *
+     * which masks NEWUSER out of the set being CHECKED -- it does not grant
+     * anything. So an unprivileged `clone(CLONE_NEWUSER|CLONE_NEWPID|
+     * CLONE_NEWNET)` was still measured against the PARENT's user namespace
+     * and refused with EPERM. That is the only combination unprivileged
+     * containers ever use, and it is exactly what Chromium's sandbox issues
+     * (flags 0x70000011) once it gets past its credentials probe.
+     *
+     * ns_unshare() below has always been right, because it INSTALLS the user
+     * namespace first and only then tests the capability. Two entry points to
+     * one feature, and only one of them correct -- the same shape as the
+     * clone/child_stack bug this same boot uncovered.
+     *
+     * Not an escalation: the child's capabilities are scoped to the namespace
+     * it just created (userns_owns_mnt_ns and the gates in syscall.c), and
+     * every namespace reachable this way is strictly a REMOVAL of reach -- an
+     * empty net namespace, a private pid/uts/ipc table, a mount namespace
+     * owned by the new user namespace. */
     struct proc *me = current_proc();
     if (!me) return -ABI_EPERM;
-    if ((want & ~(uint32_t)CLONE_NEWUSER) && !userns_capable(LCAP_SYS_ADMIN))
+    if (!(want & CLONE_NEWUSER) && (want & ~(uint32_t)CLONE_NEWUSER) &&
+        !userns_capable(LCAP_SYS_ADMIN))
         return -ABI_EPERM;
 
     if (want & CLONE_NEWUTS) {

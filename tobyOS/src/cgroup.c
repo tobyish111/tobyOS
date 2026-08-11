@@ -835,3 +835,15 @@ void cgroup_mount(void) {
     int rc = vfs_mount("/sys/fs/cgroup", &cgroupfs_ops, 0);
     kprintf("[cgroup] cgroup2 mounted at /sys/fs/cgroup (rc=%d)\n", rc);
 }
+
+/* Mount cgroup2 at an arbitrary point, for mount(2) -t cgroup2. Same singleton
+ * argument as procfs_mount_at: cgroupfs has no per-mount state (data==0) and
+ * renders the ONE cgroup hierarchy, which is what cgroup v2 is -- so a second
+ * mount point is a second view, not a second hierarchy.
+ *
+ * That also names the limit honestly: this is NOT a per-namespace cgroup view.
+ * A container mounting cgroup2 sees the whole hierarchy, not a root rebased at
+ * its own cgroup, because there is no cgroup namespace in this kernel. */
+int cgroup_mount_at(const char *path) {
+    return vfs_mount(path, &cgroupfs_ops, 0);
+}

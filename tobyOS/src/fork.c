@@ -494,6 +494,19 @@ long sys_fork(void) {
     child->mm_owner    = 0;
     child->vfork_parent = 0;
     child->vfork_child  = 0;
+    /* The clone(2) STAGING fields are per-call scratch, and the memcpy above
+     * copied them. A child that keeps them applies them to ITS next fork:
+     * clone_child_stack would point the grandchild's RSP at an address that
+     * means nothing after an execve, and clone_ns_flags would silently build
+     * namespaces nobody asked for.
+     *
+     * Found by the slice-16 capstone, not by reasoning: the container's first
+     * ordinary fork() faulted at cr2 = rsp-8 with rsp = 0x39c130, which is the
+     * top-minus-16 of the OCI runtime's OWN clone stack -- a BSS address from a
+     * program that had already been replaced by execve. The staging worked; it
+     * just did not stop working. */
+    child->clone_ns_flags   = 0;
+    child->clone_child_stack = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;
@@ -662,6 +675,27 @@ long sys_fork(void) {
            (uint8_t *)parent->kstack_top - sizeof(struct syscall_regs),
            sizeof(struct syscall_regs));
 
+    /* clone(2): if the caller supplied a child_stack, the child must resume ON
+     * IT, not on the parent's. Staged by the clone arm (see proc.h
+     * clone_child_stack) and applied HERE, for the same reason the namespace
+     * flags are: the child is enqueued below and can be running on another core
+     * before this function returns, so a post-fork fixup is a race.
+     *
+     * a2 == 0 means fork semantics (resume on the parent's stack), which is what
+     * every raw syscall(SYS_clone, flags, NULL, ...) caller wants -- and is why
+     * ignoring a2 outright went unnoticed until glibc's clone() wrapper, whose
+     * child-side pops its function pointer off this exact stack. */
+    {
+        uint64_t cstk = parent->clone_child_stack;
+        parent->clone_child_stack = 0;
+        if (cstk) {
+            struct syscall_regs *cr =
+                (struct syscall_regs *)((uint8_t *)child->kstack_top
+                                        - sizeof(struct syscall_regs));
+            cr->user_rsp = cstk;
+        }
+    }
+
     /* Ready to run. */
     child->state = PROC_READY;
     sched_enqueue(child);
@@ -755,6 +789,9 @@ long sys_fork_share(void) {
     child->on_cpu = 0;
     child->vm_quiesce  = 0;
     child->vm_quiesced = 0;
+    /* Per-call clone staging must not be inherited -- see sys_fork. */
+    child->clone_ns_flags    = 0;
+    child->clone_child_stack = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;
@@ -815,6 +852,40 @@ long sys_fork_share(void) {
            (uint8_t *)parent->kstack_top - sizeof(struct syscall_regs),
            sizeof(struct syscall_regs));
 
+    /* clone(2) with an EXPLICIT child_stack takes precedence over the private
+     * stack below, and the distinction is the whole reason this is safe.
+     *
+     * Two different callers arrive here:
+     *
+     *   vfork() / clone(CLONE_VM|CLONE_VFORK) with child_stack == NULL. The
+     *     caller expects the child to run on the PARENT's stack. We give it a
+     *     private one instead -- a documented, pre-existing deviation that the
+     *     comment below explains and that the Chromium launcher path depends
+     *     on. UNCHANGED here.
+     *
+     *   clone(fn, child_stack, CLONE_VM|CLONE_VFORK|SIGCHLD, arg) -- glibc's
+     *     library wrapper. The caller supplied a stack PRECISELY so the child
+     *     would not touch the parent's, and __clone's child side pops its entry
+     *     function off it (`xor %ebp,%ebp; pop %rax; pop %rdi; call *%rax`).
+     *     Handing that child a fresh ZEROED stack makes it pop 0 and `call *0`
+     *     -- an instruction fetch at NULL, which is the rip=0/err=0x14 fault
+     *     already recorded against busybox `unshare -f`. Chromium's
+     *     ChrootToSafeEmptyDir (credentials.cc) is the same call, and it died
+     *     the same way.
+     *
+     * Honouring an explicitly supplied stack cannot disturb the first caller,
+     * because that caller supplies none. CLONE_VM means the address space is
+     * shared, so the pointer is valid in the child by construction. */
+    uint64_t user_cstk = parent->clone_child_stack;
+    parent->clone_child_stack = 0;
+    if (user_cstk) {
+        struct syscall_regs *cr =
+            (struct syscall_regs *)((uint8_t *)child->kstack_top
+                                    - sizeof(struct syscall_regs));
+        cr->user_rsp = user_cstk;
+        child->vfork_stack_va = 0;      /* nothing for vfork_child_done to free */
+        child->vfork_stack_pages = 0;
+    } else
     /* Private user stack in the shared CR3. Sharing the parent's RSP lets
      * the child (crashpad double-fork, glibc) smash the launcher's frame;
      * parent then resumes at rip=0. Map a fresh 512 KiB stack at a high VA
@@ -958,6 +1029,9 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
      * live on_cpu/on_rq, which would make this thread unschedulable. */
     child->on_rq  = false;
     child->on_cpu = 0;
+    /* Per-call clone staging must not be inherited -- see sys_fork. */
+    child->clone_ns_flags    = 0;
+    child->clone_child_stack = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;

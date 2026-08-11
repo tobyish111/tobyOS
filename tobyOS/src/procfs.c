@@ -324,6 +324,7 @@ static int gen_filesystems(char *buf, size_t cap) {
         "nodev\tramfs\n"
         "nodev\tproc\n"
         "nodev\tsysfs\n"
+        "nodev\tcgroup2\n"
         "\ttobyfs\n"
         "\text2\n"
         "\text4\n"
@@ -1202,6 +1203,18 @@ static const struct vfs_ops procfs_ops = {
     .readlink = procfs_readlink,
     .umount   = 0,
 };
+
+/* Mount procfs at an arbitrary point, for mount(2) -t proc.
+ *
+ * procfs here is a SINGLETON with no per-mount state (ops + data==0), and every
+ * file it serves is rendered from the CALLING process at read time -- which is
+ * what already makes /proc pid-namespace-aware. So a second mount point is a
+ * second view of the same generator, which is exactly what a container runtime
+ * asks for and is not a pretence: nothing about the first mount is copied,
+ * because there is nothing to copy. */
+int procfs_mount_at(const char *path) {
+    return vfs_mount(path, &procfs_ops, 0);
+}
 
 void procfs_init(void) {
     int rc = vfs_mount("/proc", &procfs_ops, 0);

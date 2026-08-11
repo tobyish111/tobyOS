@@ -29,7 +29,23 @@
  *     that makes that interesting.
  *
  * The clone is issued RAW -- syscall(SYS_clone, flags, 0, 0, 0, 0), NULL child
- * stack -- because that is precisely what Chromium's ForkWithFlags does.
+ * stack.
+ *
+ * CORRECTION (added after this test's 8/8 was read as exonerating the whole
+ * namespace path): the sentence that used to end the line above -- "because
+ * that is precisely what Chromium's ForkWithFlags does" -- WAS WRONG, and it is
+ * the reason this test passed over a real bug. Disassembling the faulting rip in
+ * chrome-headless-shell shows `call clone@plt`: Chromium goes through glibc's
+ * clone() LIBRARY function, which always supplies a child stack and whose
+ * child-side wrapper pops its entry function off it. This kernel's clone arm
+ * dropped that argument, so the child popped the PARENT's stack. The raw form
+ * tested here is the one case where ignoring child_stack is CORRECT, which is
+ * exactly why 8/8 here meant nothing about Chromium.
+ *
+ * That shape now has its own test: programs/linux-clonestk. What this file
+ * proves stands -- CLONE_NEW* on the raw entry point works, as root and as uid
+ * 1000, single- and multi-threaded -- it is just not the entry point Chromium
+ * uses.
  *
  * bit0 root  + plain clone (THE CONTROL: if this fails nothing else means anything)
  * bit1 root  + CLONE_NEWUSER

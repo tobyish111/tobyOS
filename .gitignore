@@ -1,3 +1,7 @@
 ﻿# Root repo: keep large generated logs out of git
 tobyOS/qemu*.log
 tobyOS/**/qemu*.log
+
+# Prebuilt Bootlin glibc cross-toolchain used by the linux-* acceptance tests
+# (~670 MB, downloaded by programs/linux-glibc/build.sh -- not a source artefact)
+.glibc-tc/
