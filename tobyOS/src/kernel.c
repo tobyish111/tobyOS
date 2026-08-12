@@ -7454,7 +7454,7 @@ void _start(void) {
         extern void *net_ns_create(void);
         void *ns_a = net_ns_create();
         void *ns_b = net_ns_create();
-        int pass = 0, total = 4;
+        int pass = 0, total = 5;
 
         /* 10.99.0.1 <-> 10.99.0.2/24, in network byte order. */
         uint32_t ip_a = (uint32_t)(10u | (99u << 8) | (0u << 16) | (1u << 24));
@@ -7521,6 +7521,43 @@ void _start(void) {
                     "want 02:00:00:00:00:01 (a host MAC here means the reply "
                     "used g_my_mac)\n",
                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+
+        /* ---- cut 3: MORE THAN ONE DEVICE IN A NAMESPACE -------------------
+         * A namespace used to hold exactly one interface, which is why the
+         * control plane could not exist: `ip link add` names interfaces, and a
+         * bridge is only interesting with several attached. This asserts the
+         * list is REAL rather than declared -- two named pairs land in one
+         * namespace, both are enumerable, and they are DISTINCT devices with
+         * distinct names. Counting to 2 is the whole point; a list that
+         * silently kept only the last would still report "created ok". */
+        {
+            void *ns_m = net_ns_create();
+            size_t before = ns_m ? net_ns_dev_count(ns_m) : 99;
+            long r1 = ns_m ? netns_veth_pair_named(ns_m, "vtA", ip_a,
+                                                   0, "vtA-peer", 0, mask) : -1;
+            long r2 = ns_m ? netns_veth_pair_named(ns_m, "vtB", 0,
+                                                   0, "vtB-peer", 0, mask) : -1;
+            size_t after = ns_m ? net_ns_dev_count(ns_m) : 0;
+            struct net_dev *da = ns_m ? net_ns_find_dev(ns_m, "vtA") : 0;
+            struct net_dev *db = ns_m ? net_ns_find_dev(ns_m, "vtB") : 0;
+            /* A duplicate name must be REFUSED -- two interfaces with one name
+             * make every later lookup ambiguous. */
+            long dup = ns_m ? netns_veth_pair_named(ns_m, "vtA", 0,
+                                                    0, "vtA-again", 0, mask) : 0;
+            if (r1 == 0 && r2 == 0 && before == 0 && after == 2 &&
+                da && db && da != db && dup != 0) {
+                pass++;
+                kprintf("[LXVETH]   ok   a namespace holds %lu devices "
+                        "(vtA + vtB, distinct), and a duplicate name is "
+                        "refused\n", (unsigned long)after);
+            } else {
+                kprintf("[LXVETH]   FAIL device list: r1=%ld r2=%ld count %lu"
+                        "->%lu vtA=%p vtB=%p dup=%ld (want 0,0, 0->2, two "
+                        "distinct devices, dup refused)\n",
+                        r1, r2, (unsigned long)before, (unsigned long)after,
+                        (void *)da, (void *)db, dup);
+            }
         }
 
         kprintf("[LXVETH] VERDICT: %s subtests=%d/%d\n",

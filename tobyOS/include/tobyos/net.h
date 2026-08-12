@@ -106,6 +106,9 @@ const uint8_t *net_my_mac(void);   /* the transmitting interface's MAC */
  * RTM_NEWLINK handling, so `ip link add ... type veth` is NOT available -- see
  * the header comment in veth.c for why that is a separate slice. A NULL ns means
  * the initial namespace, and that end is registered as an ordinary interface. */
+long netns_veth_pair_named(void *ns_a, const char *name_a, uint32_t ip_a,
+                           void *ns_b, const char *name_b, uint32_t ip_b,
+                           uint32_t mask);
 long netns_veth_pair(void *ns_a, uint32_t ip_a, void *ns_b, uint32_t ip_b,
                      uint32_t mask);
 void netns_veth_stats(void *ns, uint32_t *tx, uint32_t *rx);

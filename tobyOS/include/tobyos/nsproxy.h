@@ -290,6 +290,13 @@ uint32_t net_ns_ip(void *ns);
 uint32_t net_ns_netmask(void *ns);
 uint32_t net_ns_gateway(void *ns);
 void     net_ns_set_dev(void *ns, struct net_dev *dev);
+/* Cut 3: a namespace holds a LIST of devices. net_ns_dev() is devs[0], the
+ * primary, so every pre-cut-3 caller is unchanged. */
+size_t   net_ns_dev_count(void *ns);
+struct net_dev *net_ns_dev_at(void *ns, size_t i);
+struct net_dev *net_ns_find_dev(void *ns, const char *name);
+bool     net_ns_add_dev(void *ns, struct net_dev *dev);
+bool     net_ns_del_dev(void *ns, struct net_dev *dev);
 void     net_ns_set_addr(void *ns, uint32_t ip, uint32_t mask, uint32_t gw);
 /* Bracket a frame delivery so it is processed AS `ns` (see veth.c). */
 void    *net_ns_rx_enter(void *ns);

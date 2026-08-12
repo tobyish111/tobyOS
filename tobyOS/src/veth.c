@@ -105,6 +105,64 @@ static struct veth_end *veth_alloc(void) {
  * stack can use it, while the container end lives only in its own namespace.
  * That asymmetry is the whole point of the additive design: the host side of the
  * pair is a normal interface; the container side is invisible outside its ns. */
+/* Named variant: choose both interface names and APPEND each end to its
+ * namespace's device list rather than installing it as the one interface.
+ *
+ * This is what a control plane needs and the original could not express. `ip
+ * link add veth0 type veth peer name veth1` names both ends, and a bridge is
+ * only interesting when several pairs land in the same namespace -- neither is
+ * sayable when a namespace has a single device slot and the names are
+ * generated from a global counter.
+ *
+ * Both ends may go in the SAME namespace, which is what `ip link add` does
+ * before either end is moved anywhere: Linux creates the pair in the caller's
+ * namespace and `ip link set NAME netns N` moves one end afterwards.
+ */
+long netns_veth_pair_named(void *ns_a, const char *name_a, uint32_t ip_a,
+                           void *ns_b, const char *name_b, uint32_t ip_b,
+                           uint32_t mask) {
+    if (!name_a || !name_b || !*name_a || !*name_b) return -1;
+    /* A duplicate name is refused, not silently accepted: two interfaces with
+     * one name make every subsequent lookup ambiguous, and the caller would
+     * have no way to tell which it got. */
+    if (ns_a && net_ns_find_dev(ns_a, name_a)) return -1;
+    if (ns_b && net_ns_find_dev(ns_b, name_b)) return -1;
+
+    struct veth_end *a = veth_alloc();
+    struct veth_end *b = veth_alloc();
+    if (!a || !b) { if (a) a->in_use = false; if (b) b->in_use = false;
+                    return -1; }
+
+    static int named_no;
+    int n = named_no++;
+    a->peer = b; b->peer = a;
+    a->ns = ns_a; b->ns = ns_b;
+
+    for (int i = 0; i < 2; i++) {
+        struct veth_end *e = i ? b : a;
+        const char *nm = i ? name_b : name_a;
+        ksnprintf(e->name, sizeof e->name, "%s", nm);
+        e->dev.name     = e->name;
+        e->dev.priv     = e;
+        e->dev.tx       = veth_tx;
+        e->dev.rx_drain = veth_rx_drain;
+        e->dev.link_up  = veth_link_up;
+        e->dev.mac[0] = 0x02; e->dev.mac[1] = 0x00; e->dev.mac[2] = 0x01;
+        e->dev.mac[3] = 0x00; e->dev.mac[4] = (uint8_t)n;
+        e->dev.mac[5] = (uint8_t)i;
+    }
+
+    if (ns_a) { net_ns_add_dev(ns_a, &a->dev);
+                if (ip_a) net_ns_set_addr(ns_a, ip_a, mask, 0); }
+    else        net_register(&a->dev);
+    if (ns_b) { net_ns_add_dev(ns_b, &b->dev);
+                if (ip_b) net_ns_set_addr(ns_b, ip_b, mask, 0); }
+    else        net_register(&b->dev);
+
+    kprintf("[veth] pair %s <-> %s (named)\n", a->name, b->name);
+    return 0;
+}
+
 long netns_veth_pair(void *ns_a, uint32_t ip_a, void *ns_b, uint32_t ip_b,
                      uint32_t mask) {
     struct veth_end *a = veth_alloc();
