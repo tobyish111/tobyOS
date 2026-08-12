@@ -1712,3 +1712,249 @@ cgroup. The capstone bundle deliberately does not mount it.
 
 `lxposix --full` **GREEN 23/23** with `enosys_gaps=0`, `LXNS` **15/15**,
 `LXCONTAINER` **PASS probe=0xff**, zero faults in every run.
+
+---
+
+## 22. Post-capstone completeness push (2026-08-11)
+
+Six commits after §21, all gated: `4109c03` (syscall name table), `5988d75`
+(fdinfo + syscall batch), `3f721b6` (/dev stat), `f18a146` (tmpfs), `5566908`
+(ptrace), `6219344` (net_ns device list). Plus `57f4335`, which is a GATE fix
+and is the first thing below because it changes how much the others' greens are
+worth.
+
+### THE GATE COULD NOT SEE A TEST THAT NEVER RAN
+
+`logs/lxns.sh` asserted `VERDICT: PASS` and nothing else. A subtest whose binary
+failed to stage simply did not run, the count dropped, and the verdict stayed
+PASS. Not hypothetical: `linux-ptrace` was added, its Makefile and harness-table
+edits silently did not apply, and the gate reported **GREEN 17/17 — exactly
+what it reported before the test existed.**
+
+A missing test reads as a pass, which is the same failure shape as a green test
+over a real bug and arguably worse, because there is nothing to notice. The
+gate now asserts the subtest COUNT (`WANT_SUBTESTS`, currently 18); raise it
+when you add one.
+
+Its first version did not work either — the `sed` backref was written through a
+heredoc and arrived as a raw `\x01` byte, so the extracted count was always
+empty and the guard fired on every run. Replaced with `grep -o | cut`, which
+has no escapes to lose, and **verified against a real log before committing**.
+
+### MEASURING THE SYSCALL SURFACE: two wrong numbers before a right one
+
+The count is now **212** reachable syscall numbers (208 of the 0..334 core
+range). Getting there took three attempts and the wrong ones were reported
+before they were caught:
+
+- `case\s+(\d+)\s*:\s*(/\*|\n)` missed every raw-number case followed by `{`,
+  so `clock_nanosleep`, `memfd_create` and `sigaltstack` read as ABSENT. **204,
+  too low** — and that list was stated to the user before it was checked.
+- Dropping the suffix then matched `lx_scname`'s ~90-entry NAME TABLE as though
+  those labels were handlers. **218, too high.**
+- Scoping the scan to the dispatcher's own body by brace matching: correct.
+
+The census lives in a script now, not a grep. **Anything claiming a syscall is
+absent must be checked against the dispatcher body**, and a spot-check that
+disagrees with a memory of what was implemented is probably the spot-check.
+
+A real defect fell out of it: `lx_scname` named **305 "syncfs"**. syncfs is 306
+and was already named correctly a few lines above. That table is what the ENOSYS
+census and the `[lx-recent]` ring print, so an unhandled `clock_adjtime` would
+have been reported under the wrong name and sent the next reader to implement
+the wrong thing.
+
+### `/proc/PID/fdinfo`, and the batch
+
+fdinfo is a directory plus one file per open fd, mirroring `fd/`. Chromium's
+`ChrootToSafeEmptyDir()` chroots into it precisely because it holds exactly the
+caller's own descriptors and empties when they close — so the listing walks the
+LIVE fd table. `mnt_id` is OMITTED rather than reported as a plausible constant:
+Linux already varies fdinfo's field set by descriptor kind, so key-based readers
+cope, and inventing a value is the fabrication this arc keeps undoing.
+
+Also `mkdirat`, `getcpu`, `mlock2`, `fadvise64`, `openat2`,
+`process_vm_readv/writev`, `membarrier`. Two are honest no-ops and the
+distinction matters: `fadvise64` is a HINT the spec permits ignoring and
+`mlock2` cannot page out what never pages out, so no caller can observe a
+difference — unlike a mount flag or a seccomp action, where ignoring the
+argument removes a guarantee. `openat2` REFUSES any `RESOLVE_*` bit with EINVAL,
+because those are path-resolution RESTRICTIONS and honouring the open while
+dropping them hands back a sandbox that does not exist.
+
+`membarrier` is backed by the existing TLB-shootdown IPI, which IS a real
+barrier (taking an interrupt serializes the receiving core); QUERY advertises
+only what that covers.
+
+`process_vm_readv/writev` copy through the editor-root borrow — point the
+page-table walker at the target while the kernel stays on its own PML4 — PER
+PAGE, because a remote range is contiguous virtually and arbitrary physically.
+
+### YOU COULD `open("/dev/null")` BUT NOT `stat` IT
+
+The synthetic device nodes were built in the OPEN path only, so every other
+path syscall asked the VFS, which had never heard of them:
+
+```
+open("/dev/null")  -> a working descriptor
+stat("/dev/null")  -> ENOENT
+```
+
+That silently broke `test -e /dev/null`, `access()`, `ls -l`, and
+`base::PathExists`. One table (`g_dev_synth`) now answers "what exists in /dev"
+for stat, newfstatat, statx and access.
+
+**THE `statx` ARM IS THE ONE THAT MATTERS**: glibc's `stat()` compiles to statx
+on modern builds, so fixing `LX_stat` alone would have left every C program
+still seeing ENOENT. That is exactly how slice 104's DRM blind spot worked —
+**and its warning comment is three lines above the code that repeated the
+mistake.**
+
+statx gets the STATX layout with char-device bits stamped on, NOT
+`linux_emit_chrdev_stat`, which writes a `struct lx_stat` — a different shape.
+**NOTE: the existing DRM statx arm does exactly that** (fills a 256-byte statx
+buffer with a stat-sized record). Left alone because that path is verified
+working end-to-end and it was not this slice, but it is a real latent defect.
+
+### tmpfs
+
+`src/tmpfs.c`: writable, mountable anywhere, flat path-keyed table like ramfs
+(the VFS resolves by longest-prefix match and has no dentry graph, so a tree of
+inodes is a structure nothing else here speaks).
+
+**SIZE-CAPPED, and that is the load-bearing decision.** An unbounded in-memory
+filesystem lets any process consume all of RAM — `cat /dev/zero > /tmp/x` is
+enough. Per mount, 16 MiB default, `size=` PARSED rather than accepted and
+ignored, an unparseable value REFUSED rather than falling back to the default.
+
+`linux-tmpfs` 0xff. bit5/bit6 carry it: ENOSPC at 16711680 bytes on the default
+mount and at 65536 on a `size=64k` one — the requested cap, not the default.
+Reading a number back from a config file only proves the file remembers it.
+
+Follow-through: the OCI bundle's `/dev` is now APPLIED, and
+`logs/lxcontainer.sh`'s assertion was INVERTED (it required exactly one
+`NOT APPLIED: /dev`; it now requires zero plus a real mount line). Leaving the
+old assertion would have turned a fix into a red gate.
+
+### ptrace WORKS -- and the cause was a RACE, not a mechanism
+
+`programs/linux-ptrace` 0xff. TRACEME, ATTACH/SEIZE, DETACH, PEEK/POKE,
+GETREGS/SETREGS, SETOPTIONS, CONT, SYSCALL, KILL, syscall entry/exit stops.
+SINGLESTEP, the `PTRACE_EVENT_*` stops, GETSIGINFO and GETREGSET are REFUSED
+with EINVAL — a tracer promised a stop that never fires waits forever.
+
+**The bug, which took four attempts:**
+
+```
+[fork] parent pid=2 -> child pid=3
+[ptrace] pid=3 TRACEME (tracer=2)
+[signal] pid=3 stopped by signal 19
+<nothing, ever>
+```
+
+A tracer forks and calls waitpid IMMEDIATELY, before the child has run
+PTRACE_TRACEME. At that instant the child is not traced, so a "is this child
+traced?" test is false and the caller commits to a wait that only wakes on
+TERMINATION — while the child traces itself and parks. **The condition has to be
+re-evaluated AFTER blocking, not before.** `proc_wait_or_ptrace()` does that.
+
+Three dead ends, each a real disproof:
+
+1. wait4 looked only for a ptrace-stop, but strace's opening handshake is
+   TRACEME + `raise(SIGSTOP)` — a JOB-CONTROL stop. signal.c's stop site now
+   marks a traced process, which is also why ptrace-stops reuse PROC_STOPPED.
+2. That fix woke the tracer with a hand-rolled `sched_enqueue()` from the signal
+   path and the guest wedged to a dead stop (**heartbeats=0**) — exactly §7's
+   warning. The wake now goes through proc.c's own `wakeup_waiters`, the one
+   `proc_exit` already uses.
+3. Polling instead left the guest live but the tracer still never saw the stop,
+   because polling cannot fix a waiter that has already committed to a block.
+
+**A hypothesis CHECKED AND DISPROVED rather than "fixed":** that parking with
+`sched_yield()` while holding the BKL was the cause. `sched_yield` captures
+`had_bkl` and hands it to `do_switch`, which reacquires on resume — parking
+with the BKL held is supported. It had been written into the parked handoff note
+as the prime suspect, and it was wrong.
+
+The test is a MINIATURE STRACE, not a list of ptrace() calls: "every request
+returned 0" would pass on a kernel where each stop is fabricated and each
+register read is zeroes. Measured: `write(fd=4, .., 19)` by number and argument,
+`rax=19` at the exit stop, PEEKDATA finding the child's pattern, POKEDATA
+landing a value the CHILD reads back.
+
+The test also probed the refusals AFTER `PTRACE_CONT` ran the tracee to exit and
+got ESRCH instead of EINVAL — the kernel being right and the test asking at the
+wrong time. **A refusal check must run while the thing being refused is
+otherwise possible.**
+
+### CHROMIUM'S SANDBOX: SETTLED, and it is NOT a kernel gap
+
+Staging a dummy file at `/opt/chrome/chrome-sandbox` changed the zygote host's
+CHECK from `No such file or directory (2)` to `Invalid argument (22)` — which
+identifies the missing file exactly. Chromium wants the **setuid sandbox helper
+binary**; `chrome-headless-shell` ships none. The full `chrome-linux64`
+distribution carries one as `chrome_sandbox` (UNDERSCORE); Chromium looks for
+`chrome-sandbox` (HYPHEN) beside the executable, conventionally setuid root.
+
+Three hypotheses were tested and failed first, all recorded so nobody repeats
+them: `/dev/null` (fixed, not it), `--disable-setuid-sandbox` (verified present
+in the staged binary by grep, not it), `statx` (fixed, not it).
+
+**BLOCKER FOR THE FIX: `ramfs` reports a FIXED 0444 mode for every file**
+(`ramfs_open` hardcodes it), so no initrd file can carry a setuid bit or its
+real permissions. The helper must live on a tobyfs volume, or be named via
+`CHROME_DEVEL_SANDBOX`. That mode limitation is a latent surprise elsewhere too.
+
+`PROBE_SANDBOX=1` in `logs/cwsandbox.sh` stages and removes the dummy. It is a
+probe, not a fix.
+
+`logs/cwsandbox.sh` also LIED and is fixed: its checks were "drop happened, no
+root refusal, no credentials.cc, no clone refused" — all four true on a run
+where the browser never came up, which it duly reported as GREEN. The bootstrap
+check is now the deciding one.
+
+`-DPATHFAIL_TRACE` (src/vfs.c) is what made any of this diagnosable: the syscall
+ring records path ARGUMENTS, which are user pointers, so a missing file shows up
+as `openat a1=29407312 = -2` and names nothing.
+
+### Networking: the device list is in, the control plane is NOT
+
+A namespace held EXACTLY ONE device, which is what makes `ip link add`
+unexpressible. Now a list; `net_ns_dev()` still returns `devs[0]` so all six
+pre-existing call sites are untouched. `netns_veth_pair_named()` names both ends
+and appends them; duplicate names refused. LXVETH 5/5.
+
+**Blast radius measured before refactoring: SIX call sites**, not the sweeping
+change "the one slice that can blow up" implies — the same lesson cut 1 already
+paid for.
+
+**NEXT, IN THIS ORDER, and the order matters:**
+
+1. **Per-device addressing.** A namespace carries one ip/netmask/gateway, so
+   `RTM_NEWADDR` on a second interface has nowhere to put the address. Doing
+   handlers first means writing one that lies.
+2. **Make the dumps report the REAL device list**, per namespace. `RTM_GETLINK`
+   is hardcoded `lo` + `eth0` today. **The initial namespace's reply must stay
+   byte-identical** — Chromium's AddressTrackerLinux depends on it, and a link
+   that is online must report IFF_UP|IFF_LOWER_UP|IFF_RUNNING and not
+   IFF_LOOPBACK or chrome concludes the machine is offline.
+3. **Command handlers**: RTM_NEWLINK/NEWADDR/SETLINK/DELLINK + `NLMSG_ERROR`
+   ACKs, which `ip` requires. busybox's real `ip` applet IS present in the tree,
+   so the test can be a third-party tool rather than hand-rolled netlink.
+4. Bridge, then forwarding/NAT.
+
+A dump that still says "lo and eth0" after `ip link add` succeeded would be
+worse than no control plane — the trap the cut-2 note already named.
+
+### Method note, recorded because it cost real time
+
+**Bash heredocs ate backslashes SIX times this session**, twice producing NUL
+bytes inside C char literals and once a raw CR inside one. Every occurrence was
+caught by the compiler, and every one was avoidable: the law is Write/Edit for
+anything containing escapes, and it was already written down.
+
+### Gate state
+
+`lxposix --full` **23/23** with `enosys_gaps=0`, `LXNS` **18/18**, `LXVETH`
+**5/5**, `LXCONTAINER` **PASS probe=0xff**, defboot 3/3, cross-personality all
+PASS, zero faults everywhere.
