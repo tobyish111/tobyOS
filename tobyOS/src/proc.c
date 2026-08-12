@@ -1197,6 +1197,45 @@ static void wakeup_waiters(int pid) {
     }
 }
 
+/* Public wrapper: a tracee entering a ptrace-stop has to wake a parent that is
+ * already parked in proc_wait, and this is the mechanism proc_exit already
+ * uses for the same job (BLOCKED + wait_pid match -> READY + enqueue). Reusing
+ * it rather than inventing a second wake is deliberate -- an earlier attempt
+ * hand-rolled one inside the signal path and wedged the guest. */
+void proc_wake_waiters(int pid) { wakeup_waiters(pid); }
+
+/* Wait for `pid` to either TERMINATE or enter a ptrace-stop belonging to the
+ * caller. Returns 1 for the stop, 0 for termination (the caller then uses the
+ * ordinary proc_wait to collect and reap), -1 if there is no such child.
+ *
+ * This exists because of a race that is easy to miss and fatal when hit: a
+ * tracer typically forks and calls waitpid IMMEDIATELY, before the child has
+ * run PTRACE_TRACEME. At that instant the child is not traced, so a test for
+ * "is this child traced?" is false, and the caller commits to a wait that only
+ * ever wakes on termination -- while the child goes on to trace itself and
+ * park forever. Both sides then wait for the other. Observed exactly:
+ *
+ *   [fork] parent pid=2 -> child pid=3
+ *   [ptrace] pid=3 TRACEME (tracer=2)
+ *   [signal] pid=3 stopped by signal 19
+ *   <nothing, ever>
+ *
+ * So the condition has to be re-evaluated after the block, not before it. */
+int proc_wait_or_ptrace(int pid) {
+    struct proc *self = current_proc();
+    struct proc *child = proc_lookup(pid);
+    if (!self || !child || pid == self->pid) return -1;
+    for (;;) {
+        if (child->ptrace_stopped && child->tracer_pid == self->pid) return 1;
+        if (child->state == PROC_TERMINATED) return 0;
+        self->wait_pid = pid;
+        self->state    = PROC_BLOCKED;
+        sched_yield();
+        /* Woken by proc_exit's wakeup_waiters, or by proc_wake_waiters from a
+         * ptrace-stop. Re-check both conditions -- which is the whole point. */
+    }
+}
+
 /* Defined in syscall.c: if this process owns an active Linux fbdev mmap,
  * present its final frame to the scanout before the address space is torn
  * down (real fbdev programs draw into the mmap and exit without panning). */

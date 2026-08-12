@@ -80,6 +80,7 @@ struct proc *current_proc(void);
 void         sched_enqueue(struct proc *p);
 void         sched_yield(void);
 int          pid_knr(int vpid);
+void         proc_wake_waiters(int pid);
 
 /* x86-64 user_regs_struct, in the order Linux defines it. strace reads
  * orig_rax for the syscall number, rdi/rsi/rdx/r10/r8/r9 for the arguments,
@@ -127,7 +128,14 @@ static void ptrace_stop(struct proc *p, int sig)
     p->ptrace_stopsig = sig;
     p->ptrace_stopped = 1;
     p->state = PROC_STOPPED;
+    /* Wake a tracer already parked in proc_wait. Uses proc.c's own wake --
+     * the one proc_exit uses for a terminating child -- rather than a
+     * hand-rolled enqueue, because a hand-rolled one in the signal path wedged
+     * the guest outright once already. */
+    proc_wake_waiters(p->pid);
     sched_yield();          /* resumes here when the tracer flips us READY */
+    { static int n; if (n < 24) { n++;
+        kprintf("[ptdbg] pid=%d RESUMED\n", p->pid); } }
     p->ptrace_stopped = 0;
 }
 

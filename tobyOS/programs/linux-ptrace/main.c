@@ -142,6 +142,32 @@ int main(void)
     int bad_opt = ptrace(PTRACE_SETOPTIONS, kid, 0, 0x00100000 /* EXITKILL */);
     int bad_errno = errno;
 
+    /* bit7: the refusals -- probed HERE, while the tracee is still alive and
+     * stopped. The first version asked after PTRACE_CONT had run the child to
+     * exit, and got ESRCH ("no such process") instead of EINVAL -- which is
+     * the kernel being right and the test asking at the wrong time. A refusal
+     * check has to run when the thing being refused is otherwise possible,
+     * or it is not testing the refusal at all. */
+    int refusals_ok = 0;
+    {
+        errno = 0;
+        long ss = ptrace(PTRACE_SINGLESTEP, kid, 0, 0);
+        int ss_errno = errno;
+        if (!opt_ok)
+            no("SETOPTIONS(TRACESYSGOOD) was refused, and it is implemented");
+        else if (bad_opt == 0)
+            no("SETOPTIONS accepted an unimplemented option -- a tracer would "
+               "wait forever for an event stop that never comes");
+        else if (bad_errno != EINVAL)
+            no("the unimplemented option was refused with errno=%d, want "
+               "EINVAL", bad_errno);
+        else if (ss == 0 || ss_errno != EINVAL)
+            no("SINGLESTEP returned %ld errno=%d -- an unimplemented request "
+               "must refuse with EINVAL, not pretend", ss, ss_errno);
+        else
+            refusals_ok = 1;
+    }
+
     /* Arm syscall-stops and run to the child's write(2). */
     long entry_nr = -1, exit_ret = -1, r_rdi = -1, r_rdx = -1;
     int stops = 0, pairs = 0;
@@ -262,26 +288,9 @@ int main(void)
                "the other address space", got, (long)0x5A5A5A5A);
     }
 
-    /* bit7: the refusals. */
-    {
-        errno = 0;
-        long ss = ptrace(PTRACE_SINGLESTEP, kid, 0, 0);
-        int ss_errno = errno;
-        if (!opt_ok)
-            no("SETOPTIONS(TRACESYSGOOD) was refused, and it is implemented");
-        else if (bad_opt == 0)
-            no("SETOPTIONS accepted an unimplemented option -- a tracer would "
-               "wait forever for an event stop that never comes");
-        else if (bad_errno != EINVAL)
-            no("the unimplemented option was refused with errno=%d, want "
-               "EINVAL", bad_errno);
-        else if (ss == 0 || ss_errno != EINVAL)
-            no("SINGLESTEP returned %ld errno=%d -- an unimplemented request "
-               "must refuse with EINVAL, not pretend", ss, ss_errno);
-        else
-            ok(128, "unimplemented requests refuse with EINVAL (SINGLESTEP, "
-                    "and an unsupported SETOPTIONS bit)");
-    }
+    if (refusals_ok)
+        ok(128, "unimplemented requests refuse with EINVAL (SINGLESTEP, and "
+                "an unsupported SETOPTIONS bit)");
 
     printf("ptrace: BITS=0x%x (want 0xff)\n", g_bits);
     return g_bits;

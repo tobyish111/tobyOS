@@ -7671,6 +7671,12 @@ void _start(void) {
              * what distinguishes a mount from a directory someone wrote to. */
             { "/bin/linux-tmpfs", "linux-tmpfs", 0, 255,
               "tmpfs: round-trip + enforced size cap (C)" },
+            /* ptrace, as a miniature strace: the child performs a syscall
+             * sequence it chooses and the tracer must report it back by
+             * number, by argument and by return value. bit4/bit5 read and
+             * write memory that exists only in the other address space. */
+            { "/bin/linux-ptrace", "linux-ptrace", 0, 255,
+              "ptrace: syscall stops + PEEK/POKE (C)" },
 
             /* Independent witness #1: two SEPARATE processes in the initial
              * namespace must report the SAME uts inum (each $( ) is its own

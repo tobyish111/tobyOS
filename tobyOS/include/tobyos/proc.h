@@ -422,6 +422,22 @@ struct proc {
      *      stack-canary reload `cmp -0x28(%rbp),%rcx`) with syscalls=0. */
     uint64_t        clone_child_stack;
 
+    /* ---- ptrace(2) ------------------------------------------------------
+     * tracer_pid == 0 means untraced, the zero-init default.
+     *
+     * The stop reuses PROC_STOPPED, the job-control state SIGSTOP already
+     * uses: to the scheduler a ptrace-stop and a job-control stop are the
+     * same thing (off every run queue, not requeued on yield), and
+     * ptrace_stopped is what distinguishes them for wait4. */
+    int             tracer_pid;
+    uint32_t        ptrace_opts;
+    uint8_t         ptrace_stopped;
+    uint8_t         ptrace_syscall;
+    uint8_t         ptrace_atexit;
+    int             ptrace_stopsig;
+    long            ptrace_orig_rax;
+    long            ptrace_retval;
+
     /* Linux slice 3: alarm(2) deadline, absolute monotonic ns; 0 == no alarm.
      * Checked by signal_check_alarms() on the timer tick, which raises SIGALRM
      * and clears it. Deliberately NOT a general timer subsystem -- one

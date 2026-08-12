@@ -268,9 +268,27 @@ static void signal_apply_default(struct proc *p, int sig) {
      * later flips us READY + enqueues, and execution resumes right here. */
     kprintf("[signal] pid=%d '%s' stopped by signal %d\n",
             p->pid, p->name, sig);
+    /* A TRACED process entering a stop must be visible to its tracer, and it
+     * is the TRACER that resumes it, not SIGCONT. Without this the two
+     * deadlock on the very first thing any tracing session does: strace's
+     * handshake is TRACEME followed by raise(SIGSTOP), so the tracer waits for
+     * a ptrace-stop while the tracee sits in a job-control one.
+     *
+     * NO run-queue work here. An earlier version woke the tracer with
+     * sched_enqueue() from this path and wedged the guest to a dead stop
+     * (heartbeats=0) -- handoff §7: "signal_send touches the run queue".
+     * wait4's traced-child arm polls, so setting the flag IS the
+     * notification. */
+    if (p->tracer_pid) {
+        extern void proc_wake_waiters(int pid);
+        p->ptrace_stopsig = sig;
+        p->ptrace_stopped = 1;
+        proc_wake_waiters(p->pid);
+    }
     p->state = PROC_STOPPED;
     sched_yield();
-    /* SIGCONT arrived: we're RUNNING again; resume the interrupted flow. */
+    /* Resumed: by SIGCONT, or by the tracer's PTRACE_CONT/PTRACE_SYSCALL. */
+    p->ptrace_stopped = 0;
 }
 
 /* Build a signal frame on the user stack and redirect the saved syscall

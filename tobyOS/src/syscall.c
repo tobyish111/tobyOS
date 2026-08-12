@@ -43,6 +43,12 @@
 #include <tobyos/cgroup.h>
 int sysfs_mount_at(const char *path);   /* src/sysfs.c has no public header */
 int tmpfs_mount_at(const char *path, const char *opts);  /* src/tmpfs.c */
+/* src/ptrace.c */
+long ptrace_do(long req, int vpid, uint64_t addr, uint64_t data);
+void ptrace_syscall_stop(struct proc *p, bool entering, long nr, long ret);
+bool ptrace_stopped_for(struct proc *me, struct proc *t);
+int  ptrace_stop_signal(struct proc *t);
+int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/nsproxy.h>   /* namespaces: unshare/setns/uts (slice 8) */
 #include <tobyos/seccomp.h>   /* seccomp-bpf (slice 13) */
 #include <tobyos/heap.h>
@@ -8030,6 +8036,13 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
             if (sc != 0) return sc;
         }
     }
+    /* THE PTRACE SYSCALL-ENTRY STOP -- same site and same argument as the
+     * seccomp hook above: a syscall number is a Linux number only here. */
+    {
+        struct proc *tp = current_proc();
+        if (tp && tp->tracer_pid && tp->ptrace_syscall)
+            ptrace_syscall_stop(tp, true, n, 0);
+    }
     if (n >= 0 && n < 512) g_lx_nrcount[n]++;   /* slice 64: BKL-held count */
     /* Slice 64b: measure how long this syscall keeps the BKL. Note the
      * body may DROP the lock while blocking (the scheduler does that around
@@ -8154,6 +8167,13 @@ static long linux_syscall(long n, long a1, long a2, long a3, long a4, long a5) {
         }
     }
 #endif
+    /* ...and the EXIT half. strace prints the call from the entry stop and its
+     * result from here. */
+    {
+        struct proc *tp = current_proc();
+        if (tp && tp->tracer_pid && tp->ptrace_syscall)
+            ptrace_syscall_stop(tp, false, n, r);
+    }
     return r;
 }
 
@@ -8729,6 +8749,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 return do_syscall(SYS_MKDIR, a2, a3, 0, 0, 0); }
         return -ABI_ENOSYS;            /* dirfd-relative: not yet expressible */
     }
+
+    case 101:                          /* ptrace(request, pid, addr, data) */
+        return ptrace_do((long)a1, (int)a2, (uint64_t)a3, (uint64_t)a4);
 
     case 309: {                        /* getcpu(*cpu, *node, *tcache) */
         struct percpu *pc = smp_this_cpu();
@@ -9760,6 +9783,29 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * would read a mapping that no longer exists. */
         int rvpid = pid_vnr_of_kpid(pid);
         if (!rvpid) rvpid = pid;
+        /* A TRACEE IN A PTRACE-STOP IS REPORTED, NOT REAPED.
+         *
+         * proc_wait_or_ptrace re-evaluates the condition AFTER blocking, which
+         * is what makes this race-free. Testing "is this child traced?" once,
+         * up front, is the obvious version and it deadlocks: a tracer forks and
+         * calls waitpid immediately, before the child has run PTRACE_TRACEME,
+         * so the test is false and the caller commits to a wait that only ever
+         * wakes on termination -- while the child traces itself and parks. Seen
+         * exactly that way, with the tracer silent forever after
+         * "[ptrace] pid=3 TRACEME". */
+        if (!(options & 0x1 /* WNOHANG */)) {
+            int pr = proc_wait_or_ptrace(pid);
+            if (pr == 1) {
+                struct proc *c = proc_lookup(pid);
+                if (ustatus) {
+                    uint32_t st = ((uint32_t)ptrace_stop_signal(c) << 8) | 0x7fu;
+                    if (put_user_u32(ustatus, st) != 0) return -ABI_EFAULT;
+                }
+                return rvpid;         /* stopped: report, do NOT reap */
+            }
+            if (pr < 0) return -ABI_ECHILD;
+            /* pr == 0: terminated. proc_wait below returns at once and reaps. */
+        }
         if (options & 0x1 /* WNOHANG */) {
             struct proc *c = proc_lookup(pid);
             if (!c) return -ABI_ECHILD;

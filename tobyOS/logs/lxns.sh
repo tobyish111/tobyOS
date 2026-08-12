@@ -62,8 +62,8 @@ grep -aq 'LXNS. VERDICT: PASS' "$LOG" || RC=1
 #
 # Raise this number when you add a subtest; a mismatch in EITHER direction is
 # worth stopping for.
-WANT_SUBTESTS=${WANT_SUBTESTS:-17}
-GOT=$(grep -a 'LXNS. VERDICT' "$LOG" | sed -n 's/.*subtests=\([0-9]*\).*//p' | head -1)
+WANT_SUBTESTS=${WANT_SUBTESTS:-18}
+GOT=$(grep -a 'LXNS. VERDICT' "$LOG" | grep -o 'subtests=[0-9]*' | head -1 | cut -d= -f2)
 if [ -n "$GOT" ] && [ "$GOT" != "$WANT_SUBTESTS" ]; then
     echo "   !! LXNS ran $GOT subtests, expected $WANT_SUBTESTS -- a test that"
     echo "      does not run cannot fail, so the verdict alone cannot see this"

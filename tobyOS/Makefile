@@ -110,6 +110,7 @@ C_SRCS := src/kernel.c \
           src/vfs.c \
           src/ramfs.c \
           src/tmpfs.c \
+          src/ptrace.c \
           src/initrd.c \
           src/proc.c \
           src/thread.c \
@@ -2945,6 +2946,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \
 	    echo "[initrd] staged linux-tmpfs (in-memory filesystem proof)";   \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-tmpfs";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-ptrace/linux-ptrace.elf ]; then                 \
+	    cp programs/linux-ptrace/linux-ptrace.elf                          \
+	         $(INITRD_STAGE)/bin/linux-ptrace;                             \
+	    echo "[initrd] staged linux-ptrace (mini-strace proof)";           \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ptrace";                      \
 	fi;                                                                   \
 	if [ -f programs/linux-cgroup2/linux-cgroup2.elf ]; then               \
 	    cp programs/linux-cgroup2/linux-cgroup2.elf                        \
