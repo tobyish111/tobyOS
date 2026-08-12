@@ -100,6 +100,7 @@ void net_format_ip (char dst[16], uint32_t ip_be);
  * end answers for its own address only. */
 uint32_t net_my_ip(void);
 uint32_t net_my_netmask(void);
+uint32_t net_my_gateway(void);     /* cut 5: the next hop for off-subnet */
 const uint8_t *net_my_mac(void);   /* the transmitting interface's MAC */
 
 /* veth (src/veth.c). These two are the KERNEL-ONLY constructors: a NULL ns means

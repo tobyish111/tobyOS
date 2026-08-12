@@ -42,7 +42,11 @@ bool udp_send(uint16_t src_port_be, uint32_t dst_ip_be, uint16_t dst_port_be,
 
     if (payload_len) memcpy(buf + UDP_HDR_LEN, payload, payload_len);
 
-    h->checksum = net_udp_checksum(g_my_ip, dst_ip_be, buf, udp_len);
+    /* Cut 5: the pseudo-header carries the SOURCE ADDRESS, so it has to be
+     * the one ip_send will actually stamp. Computing it over g_my_ip while
+     * the header said the container's address would put a packet on the
+     * wire that every correct receiver drops. */
+    h->checksum = net_udp_checksum(net_my_ip(), dst_ip_be, buf, udp_len);
     if (h->checksum == 0) h->checksum = htons(0xFFFF);
 
     bool ok = ip_send(dst_ip_be, IP_PROTO_UDP, buf, udp_len);
@@ -85,9 +89,10 @@ void udp_recv(uint32_t src_ip_be, const void *udp_packet, size_t len) {
      *
      * Skip when we clamped DHCP length: checksum covers declared udp_len,
      * not the truncated buffer. */
+    uint32_t me_ip = net_my_ip();      /* cut 5: whose address this frame is for */
     if (h->checksum != 0 && udp_n == (size_t)udp_len &&
-        h->dst_port != htons(68) && g_my_ip != 0) {
-        if (net_udp_checksum(src_ip_be, g_my_ip, udp_packet, udp_len) != 0)
+        h->dst_port != htons(68) && me_ip != 0) {
+        if (net_udp_checksum(src_ip_be, me_ip, udp_packet, udp_len) != 0)
             return;
     }
 

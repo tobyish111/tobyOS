@@ -857,9 +857,20 @@ long sock_sendto(struct sock *s, const void *buf, size_t len,
 
     if (!net_is_up()) return -4;
 
-    if (!udp_send(s->local_port, dst_ip_be, dst_port_be, buf, len)) {
-        return -3;
-    }
+    /* CUT 5: send in the SOCKET's namespace, not the caller's.
+     *
+     * Same rule cut 1 chose for the ENETUNREACH gate and for the same reason: a
+     * socket created before an unshare(CLONE_NEWNET) keeps the network it was
+     * made in, which is what lets a sandboxed child keep an inherited one. The
+     * bracket covers the source address, the pseudo-header checksum and the
+     * route decision together, because all three read net_my_ip(). UDP has no
+     * connection object to latch this on, so the socket layer is the only place
+     * that knows -- udp.c's other callers (DHCP, DNS, mDNS, NTP, QUIC) are host
+     * services and correctly get the initial namespace by default. */
+    struct net_ctx nprev = net_ctx_enter(s->net_ns, 0);
+    bool sent = udp_send(s->local_port, dst_ip_be, dst_port_be, buf, len);
+    net_ctx_leave(nprev);
+    if (!sent) return -3;
     return (long)len;
 }
 

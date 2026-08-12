@@ -11,7 +11,7 @@
  * The part that genuinely needed work is not the device, it is the CONTEXT: an
  * incoming frame has to be processed as the namespace that owns the receiving
  * end, because ip_dst_is_for_us() and arp compare against "my IP" and that
- * address is now per-namespace. See net_ns_rx_enter() and net_my_ip().
+ * address is now per-namespace. See net_ctx_enter() and net_my_ip().
  * ---------------------------------------------------------------------------
  *
  * CUT 4 ADDED THE CONTROL PLANE -- this comment used to say there was none.
@@ -79,10 +79,13 @@ static void veth_deliver(struct veth_end *dst, const uint8_t *frame, size_t len)
      *
      * Bracketed so it is processed AS the receiving namespace: everything below
      * compares against "my IP", which is per-namespace now. Without this the
-     * container's stack would answer for the host's address. */
-    void *prev = net_ns_rx_enter(dst->ns);
-    eth_recv(frame, len);
-    net_ns_rx_leave(prev);
+     * container's stack would answer for the host's address.
+     *
+     * Cut 5 passes the DEVICE too, not just the namespace: a namespace holding
+     * two interfaces used to answer for its PRIMARY's address no matter which
+     * end the frame came in on, so the second interface could never complete an
+     * ARP round trip for its own address. */
+    eth_recv_dev(frame, len, dst->ns, &dst->dev);
 }
 
 static bool veth_tx(struct net_dev *dev, const void *frame, size_t len) {

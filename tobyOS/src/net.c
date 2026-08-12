@@ -79,9 +79,35 @@ static bool g_net_boot_via_dhcp;
  * Every consumer that used to read g_my_ip directly to answer "is this mine?"
  * now calls these, which is what stops a container's stack claiming the host's
  * address (and vice versa). */
+/* ---- cut 5: one resolver, three accessors ------------------------------
+ *
+ * The order is the whole design:
+ *   1. an ACTIVE network context wins outright -- it means some code that
+ *      genuinely knows (a driver, a veth end) said so. Within it, the DEVICE's
+ *      own address beats the namespace's primary, which is what makes a
+ *      namespace with two interfaces answer for the right one.
+ *   2. otherwise the CALLING PROCESS's namespace, which is correct for a
+ *      send driven by a syscall.
+ *   3. otherwise the host's globals.
+ *
+ * (1) existing at all is the cut-5 fix: it used to be impossible to say "this
+ * frame is the host's", so the host receive path fell into (2) and answered
+ * with the namespace of whatever process happened to be in the syscall that
+ * pumped net_poll(). */
+static void *net_ctx_resolve_ns(struct net_dev **dev_out) {
+    if (net_ctx_active()) {
+        if (dev_out) *dev_out = net_ctx_dev();
+        return net_ctx_ns();
+    }
+    if (dev_out) *dev_out = 0;
+    struct proc *cp = current_proc();
+    return cp ? cp->net_ns : 0;
+}
+
 uint32_t net_my_ip(void) {
-    void *ns = net_ns_rx_current();
-    if (!ns) { struct proc *cp = current_proc(); ns = cp ? cp->net_ns : 0; }
+    struct net_dev *d = 0;
+    void *ns = net_ctx_resolve_ns(&d);
+    if (d) { uint32_t ip = net_ns_dev_ip(ns, d); if (ip) return ip; }
     if (ns) return net_ns_ip(ns);
     return g_my_ip;
 }
@@ -93,20 +119,34 @@ uint32_t net_my_ip(void) {
  * the peer cached "container-ip is at host-mac", which resolves fine and is
  * completely wrong. Two layers, both needed. */
 const uint8_t *net_my_mac(void) {
-    void *ns = net_ns_rx_current();
-    if (!ns) { struct proc *cp = current_proc(); ns = cp ? cp->net_ns : 0; }
+    struct net_dev *d = 0;
+    void *ns = net_ctx_resolve_ns(&d);
+    if (d) return d->mac;                  /* the interface that received it */
     if (ns) {
-        struct net_dev *d = net_ns_dev(ns);
-        if (d) return d->mac;
+        struct net_dev *p = net_ns_dev(ns);
+        if (p) return p->mac;
     }
     return g_my_mac;
 }
 
 uint32_t net_my_netmask(void) {
-    void *ns = net_ns_rx_current();
-    if (!ns) { struct proc *cp = current_proc(); ns = cp ? cp->net_ns : 0; }
+    struct net_dev *d = 0;
+    void *ns = net_ctx_resolve_ns(&d);
+    if (d) { uint32_t m = net_ns_dev_netmask(ns, d); if (m) return m; }
     if (ns) return net_ns_netmask(ns);
     return g_my_netmask;
+}
+
+/* The next hop for anything off-subnet. ip_send used g_gateway_ip
+ * unconditionally, so a container sending off its own subnet resolved the
+ * HOST's gateway -- the same "one more layer still carries the global" shape
+ * cut 2 found in the ARP payload, one layer further up. */
+uint32_t net_my_gateway(void) {
+    struct net_dev *d = 0;
+    void *ns = net_ctx_resolve_ns(&d);
+    if (d) { uint32_t g = net_ns_dev_gateway(ns, d); if (g) return g; }
+    if (ns) return net_ns_gateway(ns);
+    return g_gateway_ip;
 }
 
 bool net_is_up(void) { return g_net_up; }

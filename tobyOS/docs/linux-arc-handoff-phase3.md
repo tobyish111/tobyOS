@@ -2137,3 +2137,147 @@ a netlink-created pair really carries a frame), **LXVETH 6/6** (regression: the
 enforced admin state sits in every frame path now), **LXNS 20/20 skipped=0**
 (userspace: `/bin/linux-netlink` BITS=0xff over a real socket, and a busybox
 `ip` witness measuring `n=2 a=1 e=0 z=1 d=1 u=2`).
+
+---
+
+## 24. Slice 12 cut 5 — the IP LAYER becomes namespace-aware (2026-08-12)
+
+Cut 5 is what had to happen before forwarding or NAT could mean anything, and
+it turned out to be mostly BUG FIXES rather than new machinery. Extended:
+`net_ns.c`, `net.c`, `eth.c`, `ip.c`, `udp.c`, `tcp.c`, `socket.c`, `veth.c`,
+`nsproxy.h`, `net.h`, `eth.h`, plus one new subtest in `rtnl_selftest`.
+
+### THE HEADLINE: a container's IP packets carried the HOST's source address
+
+```c
+h->src_ip = g_my_ip;            /* ip_send_frame, unconditionally */
+```
+
+Cut 2 made the ethernet header's source MAC namespace-relative, then had to fix
+the ARP payload's sender MAC after the first fix "looked complete and was not"
+(§18's own words). **This is the same finding one layer further up**, and it
+went unnoticed for the same reason the ARP one nearly did: nothing had ever
+sent IP — as opposed to ARP — from inside a namespace, so no test could see it.
+LXVETH does an ARP round trip; linux-netns asserts ENETUNREACH; neither puts a
+datagram on the wire.
+
+The rule cut 2 wrote down was *"when making a stack namespace-aware, grep for
+the global at EVERY layer."* The census that starts this cut found five more:
+`ip_send_frame`'s source address, `ip_send`'s next-hop decision, the UDP
+pseudo-header (send AND verify), and the TCP pseudo-header (send AND verify).
+All five are now `net_my_ip()`.
+
+### THE SECOND BUG: NULL WAS AMBIGUOUS, SO THE HOST GUESSED
+
+Cut 2 stored the receive context as a bare `void *ns` where NULL meant "no
+context" — and NULL is ALSO the initial namespace. So there was no way to say
+"this frame is the host's", and the accessors fell through to
+`current_proc()->net_ns`.
+
+That fallback is a GUESS, and on the host receive path it is a wrong one:
+**e1000's rx drain runs from its IRQ handler and from `net_poll()`, which
+`poll`/`select`/`recvmsg` call.** A process inside a container calling `poll()`
+therefore drained the HOST's NIC while `net_my_ip()` answered with the
+CONTAINER's address — and `ip_dst_is_for_us()` dropped the host's own packets.
+Latent since cut 2; nothing had a namespaced process polling under host traffic
+until containers arrived.
+
+The context now carries an explicit `active` flag and the receiving DEVICE.
+`eth_recv()` — which all five hardware drivers call — brackets it as "the
+initial namespace, said out loud", so **the fix is one function and no driver
+was touched.**
+
+### THE THIRD BUG: RETRANSMITS BELONG TO THE CONNECTION, NOT THE POLLER
+
+`tcp_tick_all()` runs from `tcp_poll_until()`, so a container process sitting in
+`poll()` drives retransmits for EVERY connection including the host's. Reading
+`current_proc()` at send time would have stamped the container's address on the
+host's segments and computed the checksum over it — i.e. moving the send path
+onto `net_my_ip()` would have INTRODUCED a bug where none existed.
+
+`struct tcp_conn` (local to tcp.c, so the field costs nothing) now latches
+`net_ns` at `conn_alloc`, and `tcp_emit` — the ONE place a connection puts a
+segment on the wire — brackets with it. One bracket covers the source address,
+the pseudo-header and the route decision together. UDP has no connection object,
+so `sock_sendto` brackets with the SOCKET's namespace instead: the same rule cut
+1 chose for the ENETUNREACH gate, and for the same reason.
+
+### THE COMPILER CAUGHT AN UNFILLED FIELD, AND IT WOULD HAVE FAILED SILENTLY
+
+`tcp_conn.net_ns` was added and `tcp_ctx_ns()` was written to fill it, and the
+assignment in `conn_alloc` was never made. **0 is the initial namespace**, so
+the missing assignment would have read as "every connection belongs to the
+host" — no crash, no error, exactly the previous behaviour, and the container
+half silently doing nothing. What surfaced it was
+`-Wunused-function: 'tcp_ctx_ns'`. A field whose "unset" value is a legitimate
+value cannot be caught by testing the common path.
+
+### The resolver, and why the order is the design
+
+```
+1. an ACTIVE context wins        -- something that KNOWS said so
+   (within it, the DEVICE's address beats the namespace's primary)
+2. else the calling process's namespace   -- right for a syscall-driven send
+3. else the host's globals
+```
+
+(1) existing at all is the cut-5 fix. It also removed the limitation §23
+recorded as "the next thing to fix": a namespace with two interfaces answers
+ARP for its PRIMARY's address only. The context carries the device now, so each
+interface answers for its own — and `eth_send` replies out the interface the
+frame arrived on rather than the namespace's primary.
+
+### Limits — stated, not implied
+
+- **There is still NO ROUTE TABLE.** Routing is "my subnet, else my gateway",
+  now asked per-namespace. Forwarding and NAT need more than this and the next
+  reader should not mistake it for a route lookup. An off-subnet send with no
+  gateway configured now returns false instead of ARPing for 0.0.0.0.
+- **The UDP/TCP port lookup is GLOBAL** (`sock_lookup_by_port`), so two
+  namespaces cannot both bind the same port. Not fixed, and it is the next
+  thing a real container workload will hit.
+- **The ARP cache is still global** (cut 2's note, unchanged).
+- **No bridge, no forwarding, no NAT.** A container reaches its peer end with
+  real IP now. It still cannot reach the internet.
+- A container that makes the kernel resolve a name (the in-kernel DNS/HTTP path,
+  not sockets) now does so from its OWN namespace and therefore fails, where
+  before it silently used the host's network. That is correct-but-failing
+  replacing incorrect-but-working, and it is a deliberate consequence.
+
+### Method note: a gate that reported RED, and the RED was mine
+
+`validate.sh 3 120` came back **RED — run 2 DEAD, heartbeats=0**, with runs 1
+and 3 both alive at 31 heartbeats on the same ISO. Run 2's log stopped at 12 ms
+mid-boot, at a clean line boundary, with no fault and no panic — the shape of a
+process that was KILLED, not one that hung.
+
+Cause: `logs/realcurl.sh` ends with `taskkill //IM qemu-system-x86_64.exe //F`,
+and I had started the defboot run while realcurl was still finishing. Its
+cleanup killed my run 2.
+
+**A gate script that kills QEMU BY IMAGE NAME cannot be overlapped with any
+other QEMU run.** The existing law ("check `tasklist | grep qemu` and
+`taskkill` before believing a run") is about stale processes *before* a run;
+this is its mirror image — another script's cleanup arriving *during* one.
+
+It was re-run with nothing else in flight and came back **GREEN 3/3, 32/32/33
+heartbeats**. The hypothesis was checked rather than assumed, which is the only
+reason it is recorded as measurement error instead of shipped as a known-flaky
+boot.
+
+### Gate state
+
+`bash logs/lxnet.sh` GREEN: **LXNETLINK 8/8**, LXVETH 6/6, LXNS 20/20
+skipped=0. `lxposix --full` **23/23** `enosys_gaps=0`. defboot **3/3 alive, 0
+faults**. **REALCURL PASS** —
+unmodified static curl 8.20.0 fetching `http://example.com/` over e1000+SLIRP,
+`http_code=200 size=559`, which is the regression check that matters most here:
+it exercises DNS (UDP checksums both ways), the TCP handshake, `tcp_emit`'s new
+bracket, and the off-subnet gateway path through `net_my_gateway()` — all of
+them for the HOST, on code that every packet now passes through.
+
+The new subtest is the one that carries this cut —
+`UDP crossed the boundary and carries the SENDER's address (10.55.0.1), not the
+host's`. It fails in two independent ways on a partial fix: with only the
+source address fixed the checksum still mismatches and the datagram is dropped,
+so "nothing arrived" and "arrived with the wrong source" are distinguishable.

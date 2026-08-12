@@ -221,7 +221,18 @@ static bool ip_send_frame(uint32_t dst_ip_be, uint8_t proto,
     h->ttl        = IP_DEFAULT_TTL;
     h->proto      = proto;
     h->checksum   = 0;
-    h->src_ip     = g_my_ip;
+    /* CUT 5: the SOURCE ADDRESS is namespace-relative.
+     *
+     * This was `g_my_ip` -- the host's -- unconditionally, which meant every IP
+     * packet a container sent left with the HOST's source address on it. Cut 2
+     * fixed the ethernet header's source MAC and then the ARP payload's sender
+     * MAC after the first one turned out not to be enough; this is the same
+     * finding one layer further up, and the same reason it went unnoticed:
+     * nothing had ever sent IP (as opposed to ARP) from inside a namespace, so
+     * no test could see it. net_my_ip() is g_my_ip in the initial namespace, so
+     * the host path is unchanged -- including while DHCP is still SELECTING and
+     * it is legitimately 0. */
+    h->src_ip     = net_my_ip();
     h->dst_ip     = dst_ip_be;
     h->checksum   = net_checksum(h, IP_HDR_LEN);
 
@@ -234,10 +245,25 @@ bool ip_send(uint32_t dst_ip_be, uint8_t proto,
              const void *payload, size_t payload_len) {
     if (payload_len > IP_MAX_PAYLOAD_SEND) return false;
 
+    /* CUT 5: THE ROUTE DECISION IS NAMESPACE-RELATIVE.
+     *
+     * "Is this destination on my subnet, and if not who is my gateway" was
+     * answered from the HOST's address, mask and gateway no matter who was
+     * asking -- so a container sending off its own subnet resolved the host's
+     * gateway, on a network it is not attached to. This is the whole of routing
+     * in this kernel: there is no route table, only "my subnet or my gateway".
+     * Saying so plainly matters, because forwarding and NAT will need more than
+     * this and the next reader should not mistake it for a route lookup. */
+    uint32_t me       = net_my_ip();
+    uint32_t mask     = net_my_netmask();
     uint32_t next_hop = dst_ip_be;
-    if ((dst_ip_be & g_my_netmask) != (g_my_ip & g_my_netmask) &&
+    if ((dst_ip_be & mask) != (me & mask) &&
         dst_ip_be != IP_BROADCAST_BE) {
-        next_hop = g_gateway_ip;
+        next_hop = net_my_gateway();
+        /* No gateway configured: with no route table there is nowhere to send
+         * an off-subnet packet, and ARPing for the destination itself would
+         * put a frame on the wire addressed to a host that cannot answer. */
+        if (next_hop == 0) return false;
     }
 
     uint8_t mac[ETH_ADDR_LEN];

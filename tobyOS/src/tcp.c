@@ -9,6 +9,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/sched.h>   /* bkl_held/bkl_exit/bkl_enter for the wait loop */
 #include <tobyos/proc.h>    /* current_proc()->tcp_yield_wait (stage 12D) */
+#include <tobyos/nsproxy.h> /* net_ctx_* -- a connection sends in its own ns (cut 5) */
 #include <tobyos/percpu.h>  /* slice 56: yield-if-ready in tcp_poll_until */
 #include <tobyos/smp.h>
 
@@ -53,6 +54,11 @@ struct tx_pend {
 
 struct tcp_conn {
     bool         in_use;
+    /* Cut 5: the NETWORK NAMESPACE this connection lives in, latched at
+     * allocation. NULL == the initial namespace. Read by tcp_emit, which is why
+     * it is on the connection and not taken from the caller -- retransmits are
+     * driven by whoever is polling, not by this connection's owner. */
+    void        *net_ns;
     tcp_state_t  state;
     uint32_t     remote_ip_be;
     uint16_t     remote_port_be;
@@ -178,6 +184,17 @@ bool tcp_init(void) {
 
 static void conn_free(struct tcp_conn *c);   /* fwd (recycle-on-full below) */
 
+/* Which namespace is "now"? An active network context (a frame being received,
+ * a socket sending) wins; otherwise the calling process's. Same order as
+ * net_my_ip(), and it must stay that way -- an inbound connection is allocated
+ * while eth_recv's context is active, so this is what makes a server socket in
+ * a namespace answer from that namespace. */
+static void *tcp_ctx_ns(void) {
+    if (net_ctx_active()) return net_ctx_ns();
+    struct proc *cp = current_proc();
+    return cp ? cp->net_ns : 0;
+}
+
 static struct tcp_conn *conn_alloc(void) {
     struct tcp_conn *c = NULL;
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
@@ -228,6 +245,13 @@ static struct tcp_conn *conn_alloc(void) {
     c->snd_wnd_shift = 0;
     c->rcv_wnd_shift = 4;  /* advertise shift=4 => up to 1 MiB */
     c->wscale_ok     = false;
+    /* Cut 5: latch the namespace HERE, at the one place a connection comes into
+     * existence, so every later send reads it instead of guessing from whoever
+     * is running. The memset above zeroes it first, and 0 is the initial
+     * namespace -- so a missed assignment would fail SILENTLY as "the host",
+     * which is exactly why the compiler noticing tcp_ctx_ns() was unused
+     * mattered: the field had been added and never filled in. */
+    c->net_ns        = tcp_ctx_ns();
     return c;
 }
 
@@ -493,7 +517,32 @@ static void pend_ack(struct tcp_conn *c, uint32_t ack) {
         tcp_congestion_on_ack(c, bytes_acked);
 }
 
+/* CUT 5: A CONNECTION SENDS IN THE NAMESPACE IT WAS CREATED IN, ALWAYS.
+ *
+ * tcp_emit is the ONE place this connection puts a segment on the wire, so one
+ * bracket here covers the source address, the pseudo-header checksum and the
+ * route decision at once.
+ *
+ * It has to be latched on the CONNECTION rather than read from the caller,
+ * because a retransmit is not driven by the connection's owner: tcp_tick_all()
+ * runs from tcp_poll_until() and from the idle loop, so a container process
+ * sitting in poll() drives retransmits for EVERY connection including the
+ * host's. Reading current_proc() there would stamp the container's address on
+ * the host's segments and compute the checksum over it. Same rule cut 1 chose
+ * for sockets -- the namespace belongs to the endpoint, not to whoever happens
+ * to be running. */
+static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
+                            const void *payload, size_t plen);
+
 static bool tcp_emit(struct tcp_conn *c, uint8_t flags,
+                      const void *payload, size_t plen) {
+    struct net_ctx nprev = net_ctx_enter(c->net_ns, 0);
+    bool r = tcp_emit_locked(c, flags, payload, plen);
+    net_ctx_leave(nprev);
+    return r;
+}
+
+static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
                       const void *payload, size_t plen) {
     uint8_t buf[TCP_HDR_LEN + 4 + TCP_DEFAULT_MSS]; /* +4 for options */
     if (plen > TCP_DEFAULT_MSS) return false;
@@ -536,7 +585,7 @@ static bool tcp_emit(struct tcp_conn *c, uint8_t flags,
     }
 
     if (plen) memcpy(buf + hdr_len, payload, plen);
-    h->checksum = net_l4_checksum(IP_PROTO_TCP, g_my_ip, c->remote_ip_be,
+    h->checksum = net_l4_checksum(IP_PROTO_TCP, net_my_ip(), c->remote_ip_be,
                                    buf, hdr_len + plen);
     bool sent = ip_send(c->remote_ip_be, IP_PROTO_TCP, buf, hdr_len + plen);
     /* Slice 56: remember what the peer now believes our window is, so
@@ -765,8 +814,9 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
     unsigned hlen = tcp_hdr_bytes(h->data_off);
     if (hlen < TCP_HDR_LEN || hlen > len) return;
 
-    if (g_my_ip != 0) {
-        if (net_l4_checksum(IP_PROTO_TCP, src_ip_be, g_my_ip, tcp_packet,
+    uint32_t me_ip = net_my_ip();
+    if (me_ip != 0) {
+        if (net_l4_checksum(IP_PROTO_TCP, src_ip_be, me_ip, tcp_packet,
                              len) != 0)
             return;
     }
@@ -1120,7 +1170,11 @@ static int pred_est(const struct tcp_conn *c) {
  * Shared by the blocking and non-blocking active opens -- the ONLY difference
  * between them is whether we then wait for the handshake. */
 static struct tcp_conn *tcp_syn_out(uint32_t dst_ip_be, uint16_t dst_port_be) {
-    if (dst_ip_be == 0 || g_my_ip == 0) return NULL;
+    /* Cut 5: OUR address, namespace-relative. Asking g_my_ip meant a
+     * container with no address of its own still passed this gate on the
+     * HOST's -- an outbound connect that could never work, refused here
+     * instead of failing later with a wrong source address. */
+    if (dst_ip_be == 0 || net_my_ip() == 0) return NULL;
     struct tcp_conn *c = conn_alloc();
     if (!c) return NULL;
     uint16_t lp = alloc_ephemeral_port();
@@ -1184,7 +1238,7 @@ uint16_t tcp_remote_port_be(const struct tcp_conn *c) {
 }
 
 struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog) {
-    if (g_my_ip == 0) return NULL;
+    if (net_my_ip() == 0) return NULL;          /* cut 5: ours, not the host's */
     if (port_in_use(local_port_be)) return NULL;
     struct tcp_conn *c = conn_alloc();
     if (!c) return NULL;

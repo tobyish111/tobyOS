@@ -58,6 +58,8 @@
 #include <tobyos/net.h>
 #include <tobyos/eth.h>
 #include <tobyos/arp.h>
+#include <tobyos/socket.h>   /* the cross-namespace UDP subtest (cut 5) */
+#include <tobyos/udp.h>
 #include <tobyos/nsproxy.h>
 #include <tobyos/proc.h>
 #include <tobyos/rtnetlink.h>
@@ -912,7 +914,7 @@ void rtnl_selftest(void) {
     static uint8_t out[CAP];
     struct hnl r;
     struct hmsg m[8];
-    int pass = 0, total = 7;
+    int pass = 0, total = 8;
 
     kprintf("[LXNETLINK] ==== the rtnetlink control plane ====\n");
 
@@ -1109,9 +1111,9 @@ void rtnl_selftest(void) {
         uint8_t mac[ETH_ADDR_LEN];
         bool resolved = false;
         if (da && db) {
-            void *prev = net_ns_rx_enter(ns);
+            struct net_ctx prev = net_ctx_enter(ns, da);
             arp_request(ip_b);
-            net_ns_rx_leave(prev);
+            net_ctx_leave(prev);
             resolved = arp_resolve(ip_b, mac) &&
                        memcmp(mac, db->mac, ETH_ADDR_LEN) == 0;
         }
@@ -1147,15 +1149,15 @@ void rtnl_selftest(void) {
         int down = hnl_ack(out, hnl_go(&r, ns, out, CAP));
 
         netns_veth_dev_stats(db, &dummy, &rx0);
-        { void *prev = net_ns_rx_enter(ns); arp_request(ip_b);
-          net_ns_rx_leave(prev); }
+        { struct net_ctx prev = net_ctx_enter(ns, da); arp_request(ip_b);
+          net_ctx_leave(prev); }
         netns_veth_dev_stats(db, &dummy, &rx1);
 
         ii.flags = NL_IFF_UP;                                    /* UP again */
         hnl_init(&r, NL_RTM_SETLINK, NL_NLM_F_ACK, &ii, sizeof ii);
         int up = hnl_ack(out, hnl_go(&r, ns, out, CAP));
-        { void *prev = net_ns_rx_enter(ns); arp_request(ip_b);
-          net_ns_rx_leave(prev); }
+        { struct net_ctx prev = net_ctx_enter(ns, da); arp_request(ip_b);
+          net_ctx_leave(prev); }
         netns_veth_dev_stats(db, &dummy, &rx2);
 
         /* The counter is the evidence, not the flag. A stored-and-ignored
@@ -1193,6 +1195,60 @@ void rtnl_selftest(void) {
         }
     } else {
         kprintf("[LXNETLINK]   FAIL set down/up: no pair to test\n");
+    }
+
+    /* ---- 5b. REAL IP TRAFFIC, AND WHOSE ADDRESS IT CARRIES ---------------
+     *
+     * THE SUBTEST THAT WOULD HAVE CAUGHT CUT 5's BUG. Every check before this
+     * one is satisfied by a stack that builds interfaces correctly and then
+     * stamps the HOST's address on every packet they carry -- which is exactly
+     * what ip_send_frame did (`h->src_ip = g_my_ip`, unconditionally). Cut 2
+     * proved ARP crosses the boundary; nothing had ever sent IP across it, so
+     * nothing could see this.
+     *
+     * The assertion is the SOURCE ADDRESS THE RECEIVER RECORDS, not that a
+     * datagram arrived. It fails in two independent ways on a partial fix:
+     *   - old code: delivered, but src reads as the host's 10.0.2.15;
+     *   - src_ip fixed but the UDP pseudo-header still computed over g_my_ip:
+     *     the checksum mismatches and udp_recv drops it, so nothing arrives.
+     * Only fixing both layers passes -- the same two-layer shape as cut 2's
+     * ethernet-header-vs-ARP-payload MAC. */
+    if (da && db && idx_a && idx_b) {
+        uint32_t ip_a = 10u | (55u << 8) | (0u << 16) | (1u << 24);
+        uint32_t ip_b = 10u | (55u << 8) | (0u << 16) | (2u << 24);
+        struct sock *rx = sock_alloc(SOCK_KIND_UDP);
+        bool ok = false;
+        uint32_t got_src = 0, got_cnt = 0;
+        if (rx) {
+            /* Receive AS the peer namespace. sock_alloc latches the CREATOR's
+             * namespace and the creator here is a boot task in the initial
+             * one, so this is the harness standing in for a process that lives
+             * in ns2. */
+            rx->net_ns = ns2;
+            if (sock_bind(rx, htons(7777)) == 0) {
+                static const char msg[] = "cut5";
+                struct net_ctx prev = net_ctx_enter(ns, da);
+                (void)udp_send(htons(7778), ip_b, htons(7777),
+                               msg, sizeof msg - 1);
+                net_ctx_leave(prev);
+                got_cnt = rx->count;
+                if (got_cnt) got_src = rx->dgrams[rx->tail].src_ip;
+                ok = (got_cnt == 1 && got_src == ip_a);
+            }
+            sock_close(rx);
+        }
+        if (ok) {
+            pass++;
+            kprintf("[LXNETLINK]   ok   UDP crossed the boundary and carries "
+                    "the SENDER's address (10.55.0.1), not the host's\n");
+        } else {
+            kprintf("[LXNETLINK]   FAIL cross-ns UDP: %u datagram(s), src="
+                    "0x%08x (want 1 and 0x%08x; host g_my_ip=0x%08x -- if src "
+                    "equals THAT, ip_send is still stamping the host)\n",
+                    got_cnt, got_src, ip_a, g_my_ip);
+        }
+    } else {
+        kprintf("[LXNETLINK]   FAIL cross-ns UDP: no addressed pair to use\n");
     }
 
     /* ---- 6. RTM_DELLINK removes BOTH ends ------------------------------- */

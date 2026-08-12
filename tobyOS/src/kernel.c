@@ -7485,9 +7485,9 @@ void _start(void) {
 
         /* Originate an ARP request AS ns_a. The reply has to come back from
          * ns_b's stack, over the pair, and land in ns_a. */
-        { void *prev = net_ns_rx_enter(ns_a);
+        { struct net_ctx prev = net_ctx_enter(ns_a, net_ns_dev(ns_a));
           arp_request(ip_b);
-          net_ns_rx_leave(prev); }
+          net_ctx_leave(prev); }
 
         uint32_t atx = 0, arx = 0, btx = 0, brx = 0;
         netns_veth_stats(ns_a, &atx, &arx);

@@ -357,21 +357,50 @@ void net_ns_set_addr(void *nsp, uint32_t ip, uint32_t mask, uint32_t gw) {
     ns->ifs[0].ip = ip; ns->ifs[0].netmask = mask; ns->ifs[0].gateway = gw;
 }
 
-/* ---- the RECEIVE-SIDE namespace context -------------------------------
- * A frame handed to a veth end has to be processed AS the namespace that owns
- * that end: ip_dst_is_for_us() and arp must compare against THAT namespace's
- * address, not the host's. The packet path is a synchronous call chain with no
- * namespace parameter, so the delivering code brackets it with this.
+/* ---- THE NETWORK CONTEXT ----------------------------------------------
+ * "Which namespace, and which interface, is the stack acting as right now?"
+ * ip_dst_is_for_us() and arp compare against "my IP", and that address is
+ * per-namespace (cut 2) and per-device (cut 3b) -- but the packet path is a
+ * synchronous call chain with no parameter for either, so the code that
+ * delivers a frame brackets it with this.
  *
- * Not a lock and not per-CPU on purpose: veth delivery happens inline on the
+ * CUT 5 CHANGED TWO THINGS ABOUT IT, AND THE FIRST WAS A REAL BUG.
+ *
+ * 1. `active` EXISTS BECAUSE NULL IS AMBIGUOUS. Cut 2 stored a bare `void *ns`
+ *    where NULL meant "no context", and NULL is ALSO the initial namespace --
+ *    so there was no way to say "this frame belongs to the host" and the
+ *    accessors fell through to `current_proc()->net_ns` instead. That fallback
+ *    is a GUESS, and on the host receive path it is a wrong one: e1000's rx
+ *    drain runs from its IRQ handler and from net_poll(), which is called out
+ *    of poll/select/recvmsg -- i.e. in the context of whatever process happened
+ *    to make the syscall. A process inside a container that called poll() would
+ *    drain the HOST's NIC while net_my_ip() answered with the CONTAINER's
+ *    address, and ip_dst_is_for_us() would drop the host's own packets.
+ *    Latent since cut 2; nothing had a namespaced process polling under host
+ *    traffic until containers arrived.
+ *
+ * 2. It carries the DEVICE, not just the namespace. A namespace with two
+ *    interfaces used to answer for its PRIMARY's address on receive no matter
+ *    which interface the frame came in on -- the receive-side counterpart of
+ *    the per-device addressing cut 3b added on the send side.
+ *
+ * Not a lock and not per-CPU on purpose: delivery happens inline on the
  * sender's stack under the BKL, exactly like every other packet path here, so a
- * single depth-1 save/restore is sufficient and honest. If veth delivery ever
+ * single depth-1 save/restore is sufficient and honest. If delivery ever
  * becomes concurrent this must become per-CPU -- noted rather than pretended. */
-static void *g_rx_ns;
+static struct net_ctx g_ctx;
 
-void *net_ns_rx_enter(void *ns) { void *prev = g_rx_ns; g_rx_ns = ns; return prev; }
-void  net_ns_rx_leave(void *prev) { g_rx_ns = prev; }
-void *net_ns_rx_current(void) { return g_rx_ns; }
+struct net_ctx net_ctx_enter(void *ns, struct net_dev *dev) {
+    struct net_ctx prev = g_ctx;
+    g_ctx.active = true;
+    g_ctx.ns     = ns;
+    g_ctx.dev    = dev;
+    return prev;
+}
+void net_ctx_leave(struct net_ctx prev) { g_ctx = prev; }
+bool net_ctx_active(void) { return g_ctx.active; }
+void *net_ctx_ns(void) { return g_ctx.ns; }
+struct net_dev *net_ctx_dev(void) { return g_ctx.dev; }
 
 bool net_ns_is_initial(struct proc *p) {
     return !p || !p->net_ns;

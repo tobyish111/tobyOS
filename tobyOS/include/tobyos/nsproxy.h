@@ -313,10 +313,23 @@ struct net_dev *net_ns_dev_by_index(void *ns, int idx);
 bool     net_ns_dev_is_up(void *ns, struct net_dev *dev);
 bool     net_ns_set_dev_up(void *ns, struct net_dev *dev, bool up);
 uint32_t net_ns_dev_gateway(void *ns, struct net_dev *dev);
-/* Bracket a frame delivery so it is processed AS `ns` (see veth.c). */
-void    *net_ns_rx_enter(void *ns);
-void     net_ns_rx_leave(void *prev);
-void    *net_ns_rx_current(void);
+/* ---- cut 5: THE NETWORK CONTEXT ----------------------------------------
+ * Bracket a frame delivery so the stack processes it AS a given namespace and
+ * interface. `active` is load-bearing: NULL is a valid namespace (the initial
+ * one), so without a separate flag "the host owns this frame" is
+ * indistinguishable from "nobody said", and the accessors fall back to
+ * current_proc()->net_ns -- which on the host receive path is whatever process
+ * happened to call poll(). See the long comment in net_ns.c. */
+struct net_ctx {
+    bool            active;
+    void           *ns;      /* NULL == the initial namespace */
+    struct net_dev *dev;     /* the interface, or NULL if not known */
+};
+struct net_ctx  net_ctx_enter(void *ns, struct net_dev *dev);
+void            net_ctx_leave(struct net_ctx prev);
+bool            net_ctx_active(void);
+void           *net_ctx_ns(void);
+struct net_dev *net_ctx_dev(void);
 
 /* Linux capability numbers this kernel checks by name. */
 #define LCAP_SETGID     6
