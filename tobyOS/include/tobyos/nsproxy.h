@@ -298,6 +298,12 @@ struct net_dev *net_ns_find_dev(void *ns, const char *name);
 bool     net_ns_add_dev(void *ns, struct net_dev *dev);
 bool     net_ns_del_dev(void *ns, struct net_dev *dev);
 void     net_ns_set_addr(void *ns, uint32_t ip, uint32_t mask, uint32_t gw);
+/* Cut 3b: per-DEVICE addressing. The per-namespace calls above answer for the
+ * PRIMARY interface; RTM_NEWADDR names an interface and needs these. */
+bool     net_ns_set_dev_addr(void *ns, struct net_dev *dev, uint32_t ip,
+                             uint32_t mask, uint32_t gw);
+uint32_t net_ns_dev_ip(void *ns, struct net_dev *dev);
+uint32_t net_ns_dev_netmask(void *ns, struct net_dev *dev);
 /* Bracket a frame delivery so it is processed AS `ns` (see veth.c). */
 void    *net_ns_rx_enter(void *ns);
 void     net_ns_rx_leave(void *prev);

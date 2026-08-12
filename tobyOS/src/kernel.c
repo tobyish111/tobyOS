@@ -7454,7 +7454,7 @@ void _start(void) {
         extern void *net_ns_create(void);
         void *ns_a = net_ns_create();
         void *ns_b = net_ns_create();
-        int pass = 0, total = 5;
+        int pass = 0, total = 6;
 
         /* 10.99.0.1 <-> 10.99.0.2/24, in network byte order. */
         uint32_t ip_a = (uint32_t)(10u | (99u << 8) | (0u << 16) | (1u << 24));
@@ -7557,6 +7557,41 @@ void _start(void) {
                         "distinct devices, dup refused)\n",
                         r1, r2, (unsigned long)before, (unsigned long)after,
                         (void *)da, (void *)db, dup);
+            }
+        }
+
+        /* ---- cut 3b: TWO INTERFACES, TWO ADDRESSES ------------------------
+         * The address used to be per-NAMESPACE, which is indistinguishable
+         * from per-device while a namespace has one interface -- and wrong the
+         * moment it has two. This is the assertion that tells them apart: give
+         * two interfaces in ONE namespace different addresses and require each
+         * to report its OWN. A per-namespace address makes both answer the
+         * same, and "ip addr add" would have reported success while the second
+         * interface silently carried the first's address. */
+        {
+            void *ns_p = net_ns_create();
+            uint32_t ip1 = (uint32_t)(10u | (77u << 8) | (0u << 16) | (1u << 24));
+            uint32_t ip2 = (uint32_t)(10u | (88u << 8) | (0u << 16) | (1u << 24));
+            long q1 = ns_p ? netns_veth_pair_named(ns_p, "pdA", ip1,
+                                                   0, "pdA-peer", 0, mask) : -1;
+            long q2 = ns_p ? netns_veth_pair_named(ns_p, "pdB", ip2,
+                                                   0, "pdB-peer", 0, mask) : -1;
+            struct net_dev *d1 = ns_p ? net_ns_find_dev(ns_p, "pdA") : 0;
+            struct net_dev *d2 = ns_p ? net_ns_find_dev(ns_p, "pdB") : 0;
+            uint32_t g1 = (ns_p && d1) ? net_ns_dev_ip(ns_p, d1) : 0;
+            uint32_t g2 = (ns_p && d2) ? net_ns_dev_ip(ns_p, d2) : 0;
+            /* And the PRIMARY accessor must still answer for devs[0], or every
+             * pre-cut-3b caller (net.c, eth.c, the ARP path) changed meaning. */
+            uint32_t prim = ns_p ? net_ns_ip(ns_p) : 0;
+            if (q1 == 0 && q2 == 0 && g1 == ip1 && g2 == ip2 && g1 != g2 &&
+                prim == ip1) {
+                pass++;
+                kprintf("[LXVETH]   ok   per-device addresses: pdA=10.77.0.1 "
+                        "pdB=10.88.0.1 (distinct), primary still pdA\n");
+            } else {
+                kprintf("[LXVETH]   FAIL per-device addr: q=%ld/%ld got "
+                        "0x%x/0x%x want 0x%x/0x%x primary=0x%x\n",
+                        q1, q2, g1, g2, ip1, ip2, prim);
             }
         }
 

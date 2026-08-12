@@ -152,11 +152,13 @@ long netns_veth_pair_named(void *ns_a, const char *name_a, uint32_t ip_a,
         e->dev.mac[5] = (uint8_t)i;
     }
 
+    /* Address the DEVICE, not the namespace: two ends in one namespace need
+     * two addresses, and net_ns_set_addr would give the second the first's. */
     if (ns_a) { net_ns_add_dev(ns_a, &a->dev);
-                if (ip_a) net_ns_set_addr(ns_a, ip_a, mask, 0); }
+                if (ip_a) net_ns_set_dev_addr(ns_a, &a->dev, ip_a, mask, 0); }
     else        net_register(&a->dev);
     if (ns_b) { net_ns_add_dev(ns_b, &b->dev);
-                if (ip_b) net_ns_set_addr(ns_b, ip_b, mask, 0); }
+                if (ip_b) net_ns_set_dev_addr(ns_b, &b->dev, ip_b, mask, 0); }
     else        net_register(&b->dev);
 
     kprintf("[veth] pair %s <-> %s (named)\n", a->name, b->name);

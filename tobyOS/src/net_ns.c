@@ -68,7 +68,24 @@ struct net_ns {
      * making it truthful means one address block per device. Named here so the
      * next cut starts from the gap rather than discovering it. */
 #define NET_NS_MAX_DEVS 8
-    struct net_dev *devs[NET_NS_MAX_DEVS];
+    /* CUT 3b: the ADDRESS travels with the device.
+     *
+     * ip/netmask/gateway used to be per-NAMESPACE, which is fine while a
+     * namespace has one interface and wrong the moment it has two: RTM_NEWADDR
+     * names an interface, so a per-namespace address gives `ip addr add` two
+     * interfaces and one place to put an answer. Writing the netlink handler
+     * against that would have meant writing one that lies -- it would report
+     * success and the second interface would silently carry the first's
+     * address.
+     *
+     * The per-namespace accessors below still answer for devs[0], so net.c,
+     * eth.c and the ARP path are unchanged. */
+    struct net_ns_if {
+        struct net_dev *dev;
+        uint32_t        ip;        /* network byte order */
+        uint32_t        netmask;
+        uint32_t        gateway;
+    }               ifs[NET_NS_MAX_DEVS];
     size_t          ndev;
     uint32_t        ip;           /* network byte order */
     uint32_t        netmask;
@@ -144,20 +161,45 @@ bool net_ns_has_network(void *sock_ns) {
  * keeping the name pointing at it is what made the list additive. */
 struct net_dev *net_ns_dev(void *nsp) {
     struct net_ns *ns = as_nns(nsp);
-    return ns->ndev ? ns->devs[0] : 0;
+    return ns->ndev ? ns->ifs[0].dev : 0;
 }
 size_t net_ns_dev_count(void *nsp) { return as_nns(nsp)->ndev; }
 struct net_dev *net_ns_dev_at(void *nsp, size_t i) {
     struct net_ns *ns = as_nns(nsp);
-    return (i < ns->ndev) ? ns->devs[i] : 0;
+    return (i < ns->ndev) ? ns->ifs[i].dev : 0;
 }
 struct net_dev *net_ns_find_dev(void *nsp, const char *name) {
     struct net_ns *ns = as_nns(nsp);
     if (!name) return 0;
     for (size_t i = 0; i < ns->ndev; i++)
-        if (ns->devs[i] && ns->devs[i]->name &&
-            strcmp(ns->devs[i]->name, name) == 0) return ns->devs[i];
+        if (ns->ifs[i].dev && ns->ifs[i].dev->name &&
+            strcmp(ns->ifs[i].dev->name, name) == 0) return ns->ifs[i].dev;
     return 0;
+}
+
+/* ---- per-DEVICE addressing ---- */
+static struct net_ns_if *nsif(struct net_ns *ns, struct net_dev *dev) {
+    for (size_t i = 0; i < ns->ndev; i++)
+        if (ns->ifs[i].dev == dev) return &ns->ifs[i];
+    return 0;
+}
+bool net_ns_set_dev_addr(void *nsp, struct net_dev *dev, uint32_t ip,
+                         uint32_t mask, uint32_t gw) {
+    struct net_ns *ns = as_nns(nsp);
+    if (ns == &g_init_net_ns) return false;   /* net.c owns the initial config */
+    struct net_ns_if *e = nsif(ns, dev);
+    if (!e) return false;      /* addressing an interface this ns does not have
+                                * is a refusal, not a silent no-op */
+    e->ip = ip; e->netmask = mask; e->gateway = gw;
+    return true;
+}
+uint32_t net_ns_dev_ip(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->ip : 0;
+}
+uint32_t net_ns_dev_netmask(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->netmask : 0;
 }
 /* Append. Returns false when the namespace is full -- a refusal, because a
  * device that is "added" and silently absent is the kind of half-answer this
@@ -166,23 +208,39 @@ bool net_ns_add_dev(void *nsp, struct net_dev *dev) {
     struct net_ns *ns = as_nns(nsp);
     if (ns == &g_init_net_ns || !dev) return false;
     if (ns->ndev >= NET_NS_MAX_DEVS) return false;
-    for (size_t i = 0; i < ns->ndev; i++) if (ns->devs[i] == dev) return true;
-    ns->devs[ns->ndev++] = dev;
+    for (size_t i = 0; i < ns->ndev; i++) if (ns->ifs[i].dev == dev) return true;
+    ns->ifs[ns->ndev].dev = dev;
+    ns->ifs[ns->ndev].ip = 0;
+    ns->ifs[ns->ndev].netmask = 0;
+    ns->ifs[ns->ndev].gateway = 0;
+    ns->ndev++;
     return true;
 }
 bool net_ns_del_dev(void *nsp, struct net_dev *dev) {
     struct net_ns *ns = as_nns(nsp);
     for (size_t i = 0; i < ns->ndev; i++) {
-        if (ns->devs[i] != dev) continue;
-        for (size_t j = i + 1; j < ns->ndev; j++) ns->devs[j - 1] = ns->devs[j];
-        ns->devs[--ns->ndev] = 0;
+        if (ns->ifs[i].dev != dev) continue;
+        for (size_t j = i + 1; j < ns->ndev; j++) ns->ifs[j - 1] = ns->ifs[j];
+        ns->ndev--;
+        ns->ifs[ns->ndev].dev = 0;
         return true;
     }
     return false;
 }
-uint32_t        net_ns_ip(void *nsp)       { return as_nns(nsp)->ip; }
-uint32_t        net_ns_netmask(void *nsp)  { return as_nns(nsp)->netmask; }
-uint32_t        net_ns_gateway(void *nsp)  { return as_nns(nsp)->gateway; }
+/* The per-NAMESPACE accessors answer for the PRIMARY interface, which is
+ * what every pre-cut-3b caller means by "this namespace's address". */
+uint32_t net_ns_ip(void *nsp) {
+    struct net_ns *ns = as_nns(nsp);
+    return ns->ndev ? ns->ifs[0].ip : 0;
+}
+uint32_t net_ns_netmask(void *nsp) {
+    struct net_ns *ns = as_nns(nsp);
+    return ns->ndev ? ns->ifs[0].netmask : 0;
+}
+uint32_t net_ns_gateway(void *nsp) {
+    struct net_ns *ns = as_nns(nsp);
+    return ns->ndev ? ns->ifs[0].gateway : 0;
+}
 
 void net_ns_set_dev(void *nsp, struct net_dev *dev) {
     struct net_ns *ns = as_nns(nsp);
@@ -190,13 +248,16 @@ void net_ns_set_dev(void *nsp, struct net_dev *dev) {
     /* Install as the PRIMARY. Existing callers (veth.c) mean "this namespace's
      * interface", and that is devs[0]; additional ones go through
      * net_ns_add_dev. */
-    if (ns->ndev == 0) { ns->devs[0] = dev; ns->ndev = 1; }
-    else                 ns->devs[0] = dev;
+    if (ns->ndev == 0) { ns->ifs[0].dev = dev; ns->ifs[0].ip = 0;
+                         ns->ifs[0].netmask = 0; ns->ifs[0].gateway = 0;
+                         ns->ndev = 1; }
+    else                 ns->ifs[0].dev = dev;
 }
 void net_ns_set_addr(void *nsp, uint32_t ip, uint32_t mask, uint32_t gw) {
     struct net_ns *ns = as_nns(nsp);
     if (ns == &g_init_net_ns) return;      /* net.c owns the initial config */
-    ns->ip = ip; ns->netmask = mask; ns->gateway = gw;
+    if (!ns->ndev) return;                 /* no interface to address */
+    ns->ifs[0].ip = ip; ns->ifs[0].netmask = mask; ns->ifs[0].gateway = gw;
 }
 
 /* ---- the RECEIVE-SIDE namespace context -------------------------------
