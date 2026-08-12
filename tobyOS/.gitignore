@@ -122,6 +122,7 @@ programs/linux-ocirun/*.elf
 programs/linux-ctrprobe/*.elf
 programs/linux-gapfill/*.elf
 programs/linux-tmpfs/*.elf
+programs/linux-ptrace/*.elf
 
 # Build scratch left by ad-hoc debugging sessions
 .tmp_*/
