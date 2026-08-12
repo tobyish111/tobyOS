@@ -102,16 +102,35 @@ uint32_t net_my_ip(void);
 uint32_t net_my_netmask(void);
 const uint8_t *net_my_mac(void);   /* the transmitting interface's MAC */
 
-/* veth (src/veth.c). Pairs are created by kernel call: there is no netlink
- * RTM_NEWLINK handling, so `ip link add ... type veth` is NOT available -- see
- * the header comment in veth.c for why that is a separate slice. A NULL ns means
- * the initial namespace, and that end is registered as an ordinary interface. */
+/* veth (src/veth.c). These two are the KERNEL-ONLY constructors: a NULL ns means
+ * the initial namespace, and that end is registered with net.c as an ordinary
+ * interface rather than placed in a namespace list. For the userspace-drivable
+ * path (`ip link add ... type veth` -> RTM_NEWLINK -> netns_veth_create) see
+ * the cut-4 block below. */
 long netns_veth_pair_named(void *ns_a, const char *name_a, uint32_t ip_a,
                            void *ns_b, const char *name_b, uint32_t ip_b,
                            uint32_t mask);
 long netns_veth_pair(void *ns_a, uint32_t ip_a, void *ns_b, uint32_t ip_b,
                      uint32_t mask);
 void netns_veth_stats(void *ns, uint32_t *tx, uint32_t *rx);
+
+/* Forward declaration: struct net_dev is defined further down, and a `struct
+ * net_dev *` first mentioned inside a prototype would be a DIFFERENT,
+ * function-scoped type -- clang says so (-Wvisibility) and then rejects every
+ * call. */
+struct net_dev;
+/* Cut 4: the entry points rtnetlink drives. Unlike the two above, these put
+ * BOTH ends in a namespace list (which is what RTM_GETLINK enumerates) and
+ * never call net_register. `peer_name` may be NULL/empty for Linux's automatic
+ * vethN naming -- busybox's `ip` cannot express a peer name at all. */
+long netns_veth_create(void *ns, const char *name, const char *peer_name,
+                       struct net_dev **out_a, struct net_dev **out_b);
+bool netns_veth_is_veth(struct net_dev *dev);
+bool netns_veth_delete(struct net_dev *dev);       /* removes BOTH ends */
+void netns_veth_release(struct net_dev *dev);      /* namespace teardown: this
+                                                    * end only, peer unpaired */
+bool netns_veth_move_ns(struct net_dev *dev, void *ns);
+void netns_veth_dev_stats(struct net_dev *dev, uint32_t *tx, uint32_t *rx);
 /* Pretty-print: writes "aa:bb:cc:dd:ee:ff" (max 18 bytes incl. NUL). */
 void net_format_mac(char dst[18], const uint8_t mac[ETH_ADDR_LEN]);
 

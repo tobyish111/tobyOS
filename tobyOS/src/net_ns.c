@@ -80,20 +80,57 @@ struct net_ns {
      *
      * The per-namespace accessors below still answer for devs[0], so net.c,
      * eth.c and the ARP path are unchanged. */
+    /* CUT 4 (the control plane) adds the two fields rtnetlink cannot work
+     * without:
+     *
+     *   ifindex -- netlink names an interface by NUMBER, not by name. RTM_NEWADDR
+     *     carries ifa_index and nothing else, so without a stable per-namespace
+     *     index there is no way to say which interface an address belongs to.
+     *     It must survive deletion of an earlier device, hence a counter rather
+     *     than the array position.
+     *
+     *   up -- the ADMIN state, and it is ENFORCED (veth.c consults it before it
+     *     will move a frame in either direction). A stored-and-ignored IFF_UP
+     *     would report a guarantee that does not exist, which is the exact shape
+     *     of lie this arc keeps deleting.
+     *
+     * DELIBERATE DEVIATION FROM LINUX, stated rather than hidden: a device here
+     * is created UP. Linux creates one DOWN and requires `ip link set X up`,
+     * but this kernel has no admin-state concept for its real NIC either, and
+     * every pre-control-plane veth (netns_veth_pair, LXVETH) passes frames the
+     * instant it exists. Defaulting to DOWN would have made that gate fail for
+     * a semantic nothing else here honours. Taking a device DOWN is real. */
     struct net_ns_if {
         struct net_dev *dev;
         uint32_t        ip;        /* network byte order */
         uint32_t        netmask;
         uint32_t        gateway;
+        int             ifindex;
+        bool            up;
     }               ifs[NET_NS_MAX_DEVS];
     size_t          ndev;
+    int             next_ifindex;
     uint32_t        ip;           /* network byte order */
     uint32_t        netmask;
     uint32_t        gateway;
 };
 
+/* THE INITIAL NAMESPACE CAN HOLD CONTROL-PLANE DEVICES TOO, and next_ifindex
+ * starts at 3 because rtnetlink reports its lo as 1 and eth0 as 2 -- those two
+ * are net.c's, not this list's, and a collision would make `ip addr add` name
+ * the wrong interface.
+ *
+ * That the initial namespace may hold a list at all is a change from cut 3, and
+ * it was MEASURED before it was made: every packet-path caller of net_ns_dev()
+ * / net_ns_ip() / net_ns_netmask() (eth.c:51, net.c:99, net_my_ip, net_my_mac,
+ * net_my_netmask) guards on the RAW namespace pointer being non-NULL, and the
+ * initial namespace IS the NULL pointer. So none of them ever consults this
+ * list for the initial namespace, and e1000/DHCP/ARP are unaffected by
+ * construction. Without this, `ip link add` would have been refusable only in
+ * the initial namespace -- and the standard container recipe is to create the
+ * pair on the host and move one end in. */
 static struct net_ns g_init_net_ns = {
-    .refs = 1, .inum = NS_INUM_INIT_NET,
+    .refs = 1, .inum = NS_INUM_INIT_NET, .next_ifindex = 3,
 };
 
 static spinlock_t g_netns_lock = SPINLOCK_INIT;
@@ -108,6 +145,11 @@ void *net_ns_create(void) {
     memset(ns, 0, sizeof(*ns));
     ns->refs = 1;
     ns->inum = ns_inum_alloc();
+    /* 1, not 3: a fresh namespace has no lo and no eth0 to leave room for.
+     * REPORTING A LOOPBACK IT DOES NOT HAVE WOULD BE THE FABRICATION -- this
+     * stack has no loopback anywhere (cut 1's founding measurement), so a new
+     * namespace's first interface really is interface 1. */
+    ns->next_ifindex = 1;
     kprintf("[netns] created net:[%lu] -- EMPTY (no interfaces, no routes)\n",
             (unsigned long)ns->inum);
     return ns;
@@ -127,7 +169,19 @@ void net_ns_put(void *p) {
     uint64_t f = spin_lock_irqsave(&g_netns_lock);
     int left = --ns->refs;
     spin_unlock_irqrestore(&g_netns_lock, f);
-    if (left <= 0) kfree(ns);
+    if (left > 0) return;
+    /* A namespace that dies takes its interfaces with it. Before the control
+     * plane nothing could create one at runtime, so leaking the veth slots was
+     * invisible; now every `ip link add` inside a container that exits would
+     * burn two of them permanently and the pool would run dry mid-gate.
+     *
+     * The PEER is deliberately NOT deleted, only unpaired: it may live in
+     * another namespace that is still running, and that namespace still owns
+     * it. It goes carrier-down (veth_link_up is "my peer exists"), which is
+     * exactly what Linux reports for the surviving half of a torn-down pair. */
+    for (size_t i = 0; i < ns->ndev; i++)
+        if (ns->ifs[i].dev) netns_veth_release(ns->ifs[i].dev);
+    kfree(ns);
 }
 
 uint64_t net_ns_inum(void *p) { return as_nns(p)->inum; }
@@ -183,10 +237,14 @@ static struct net_ns_if *nsif(struct net_ns *ns, struct net_dev *dev) {
         if (ns->ifs[i].dev == dev) return &ns->ifs[i];
     return 0;
 }
+/* Addressing a device the namespace HOLDS is allowed even in the initial
+ * namespace -- that device came from the control plane, not from net.c. What
+ * stays refused is addressing anything net.c owns: e1000 is not in this list,
+ * so nsif() misses and `ip addr add ... dev eth0` gets ENODEV rather than
+ * silently overwriting the DHCP lease. */
 bool net_ns_set_dev_addr(void *nsp, struct net_dev *dev, uint32_t ip,
                          uint32_t mask, uint32_t gw) {
     struct net_ns *ns = as_nns(nsp);
-    if (ns == &g_init_net_ns) return false;   /* net.c owns the initial config */
     struct net_ns_if *e = nsif(ns, dev);
     if (!e) return false;      /* addressing an interface this ns does not have
                                 * is a refusal, not a silent no-op */
@@ -206,13 +264,15 @@ uint32_t net_ns_dev_netmask(void *nsp, struct net_dev *dev) {
  * arc keeps deleting. */
 bool net_ns_add_dev(void *nsp, struct net_dev *dev) {
     struct net_ns *ns = as_nns(nsp);
-    if (ns == &g_init_net_ns || !dev) return false;
+    if (!dev) return false;
     if (ns->ndev >= NET_NS_MAX_DEVS) return false;
     for (size_t i = 0; i < ns->ndev; i++) if (ns->ifs[i].dev == dev) return true;
     ns->ifs[ns->ndev].dev = dev;
     ns->ifs[ns->ndev].ip = 0;
     ns->ifs[ns->ndev].netmask = 0;
     ns->ifs[ns->ndev].gateway = 0;
+    ns->ifs[ns->ndev].ifindex = ns->next_ifindex++;
+    ns->ifs[ns->ndev].up = true;              /* see the struct comment */
     ns->ndev++;
     return true;
 }
@@ -250,8 +310,45 @@ void net_ns_set_dev(void *nsp, struct net_dev *dev) {
      * net_ns_add_dev. */
     if (ns->ndev == 0) { ns->ifs[0].dev = dev; ns->ifs[0].ip = 0;
                          ns->ifs[0].netmask = 0; ns->ifs[0].gateway = 0;
+                         ns->ifs[0].ifindex = ns->next_ifindex++;
+                         ns->ifs[0].up = true;
                          ns->ndev = 1; }
     else                 ns->ifs[0].dev = dev;
+}
+
+/* ---- cut 4: what a control plane needs on top of the list ---- */
+
+/* The netlink interface INDEX of `dev` in `ns`, or 0 for "this namespace does
+ * not have it" -- 0 is never a valid ifindex on Linux either, so the caller
+ * cannot mistake absence for interface zero. */
+int net_ns_dev_index(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->ifindex : 0;
+}
+struct net_dev *net_ns_dev_by_index(void *nsp, int idx) {
+    struct net_ns *ns = as_nns(nsp);
+    if (idx <= 0) return 0;
+    for (size_t i = 0; i < ns->ndev; i++)
+        if (ns->ifs[i].ifindex == idx) return ns->ifs[i].dev;
+    return 0;
+}
+/* A device this namespace does not hold answers UP. That is the honest answer
+ * for e1000 in the initial namespace: net.c owns it, there is no admin state
+ * for it anywhere in this kernel, and returning "down" would stop the host's
+ * traffic on a question this list has no business answering. */
+bool net_ns_dev_is_up(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->up : true;
+}
+bool net_ns_set_dev_up(void *nsp, struct net_dev *dev, bool up) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    if (!e) return false;
+    e->up = up;
+    return true;
+}
+uint32_t net_ns_dev_gateway(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->gateway : 0;
 }
 void net_ns_set_addr(void *nsp, uint32_t ip, uint32_t mask, uint32_t gw) {
     struct net_ns *ns = as_nns(nsp);

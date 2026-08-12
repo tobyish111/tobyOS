@@ -50,6 +50,7 @@ bool ptrace_stopped_for(struct proc *me, struct proc *t);
 int  ptrace_stop_signal(struct proc *t);
 int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/nsproxy.h>   /* namespaces: unshare/setns/uts (slice 8) */
+#include <tobyos/rtnetlink.h> /* SIOC* interface ioctls (slice 12 cut 4) */
 #include <tobyos/seccomp.h>   /* seccomp-bpf (slice 13) */
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
@@ -10557,6 +10558,14 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return lxdrm_ioctl(f, (unsigned long)a2, (unsigned long)a3);
         if (f->kind == FILE_KIND_SND)                 /* audio slice 3 */
             return lxsnd_ioctl(f, (unsigned long)a2, (unsigned long)a3);
+        /* Slice 12 cut 4: the SIOC* interface ioctls. Answered for the
+         * SOCKET's network namespace, matching every other network operation
+         * here -- and note libc's if_nametoindex() opens an AF_UNIX socket for
+         * this, so it must NOT be restricted to AF_INET fds. */
+        if (f->kind == FILE_KIND_SOCKET && f->sock)
+            return rtnl_sock_ioctl(f->sock->net_ns,
+                                   userns_capable(LCAP_NET_ADMIN),
+                                   (unsigned long)a2, (unsigned long)a3);
         return -ABI_ENOTTY;
     }
 

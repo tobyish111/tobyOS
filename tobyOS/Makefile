@@ -122,6 +122,7 @@ C_SRCS := src/kernel.c \
           src/user_ns.c \
           src/net_ns.c \
           src/veth.c \
+          src/rtnetlink.c \
           src/seccomp.c \
           src/cgroup.c \
           src/xserver.c \
@@ -2970,6 +2971,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         $(INITRD_STAGE)/bin/linux-netns;                              \
 	    echo "[initrd] staged linux-netns (slice 12 net ns proof)";        \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-netns";                       \
+	fi;                                                                    \
+	if [ -f programs/linux-netlink/linux-netlink.elf ]; then               \
+	    cp programs/linux-netlink/linux-netlink.elf                        \
+	         $(INITRD_STAGE)/bin/linux-netlink;                            \
+	    echo "[initrd] staged linux-netlink (cut 4 control-plane proof)";  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-netlink";                     \
 	fi;                                                                    \
 	if [ -f programs/linux-userns/linux-userns.elf ]; then                 \
 	    cp programs/linux-userns/linux-userns.elf                          \

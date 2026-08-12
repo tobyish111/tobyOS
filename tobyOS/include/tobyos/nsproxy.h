@@ -304,6 +304,15 @@ bool     net_ns_set_dev_addr(void *ns, struct net_dev *dev, uint32_t ip,
                              uint32_t mask, uint32_t gw);
 uint32_t net_ns_dev_ip(void *ns, struct net_dev *dev);
 uint32_t net_ns_dev_netmask(void *ns, struct net_dev *dev);
+/* Cut 4: what rtnetlink needs. An interface INDEX (netlink names interfaces by
+ * number -- RTM_NEWADDR carries nothing else), and an ADMIN state that veth.c
+ * actually enforces. net_ns_dev_is_up() answers true for a device the namespace
+ * does not hold, which is the honest answer for net.c-owned hardware. */
+int      net_ns_dev_index(void *ns, struct net_dev *dev);      /* 0 == absent */
+struct net_dev *net_ns_dev_by_index(void *ns, int idx);
+bool     net_ns_dev_is_up(void *ns, struct net_dev *dev);
+bool     net_ns_set_dev_up(void *ns, struct net_dev *dev, bool up);
+uint32_t net_ns_dev_gateway(void *ns, struct net_dev *dev);
 /* Bracket a frame delivery so it is processed AS `ns` (see veth.c). */
 void    *net_ns_rx_enter(void *ns);
 void     net_ns_rx_leave(void *prev);
@@ -312,6 +321,7 @@ void    *net_ns_rx_current(void);
 /* Linux capability numbers this kernel checks by name. */
 #define LCAP_SETGID     6
 #define LCAP_SETUID     7
+#define LCAP_NET_ADMIN  12
 #define LCAP_SYS_CHROOT 18
 #define LCAP_SYS_ADMIN  21
 

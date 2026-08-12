@@ -53,6 +53,7 @@
 #include <tobyos/vfs.h>
 #include <tobyos/cgroup.h>   /* cgroup v2 init + mount (slice 15) */
 #include <tobyos/nsproxy.h>  /* net_ns_* for the veth harness (slice 12 cut 2) */
+#include <tobyos/rtnetlink.h> /* rtnl_selftest (slice 12 cut 4) */
 #include <tobyos/net.h>
 #include <tobyos/arp.h>
 #include <tobyos/blk.h>
@@ -7435,10 +7436,13 @@ void _start(void) {
     /* ==================================================================
      * Slice 12 cut 2: DO REAL FRAMES CROSS A NAMESPACE BOUNDARY?
      *
-     * A kernel harness rather than a userspace test, and deliberately so: there
-     * is no netlink RTM_NEWLINK handling, so nothing in userspace can create a
-     * veth pair. Adding that is a slice of its own (see veth.c) -- so the
-     * capability is proven here, at the only layer that can currently express it.
+     * A kernel harness rather than a userspace test. When this was written that
+     * was forced -- there was no netlink RTM_NEWLINK handling, so nothing in
+     * userspace could create a veth pair. Cut 4 removed that limit (see
+     * LXNETLINK / /bin/linux-netlink), and this harness stays because it
+     * exercises the KERNEL constructors, which the control plane does not use:
+     * netns_veth_pair()'s NULL-namespace end goes to net_register, a path
+     * nothing else covers.
      *
      * BOTH ends live in NON-INITIAL namespaces. That is the point: it removes
      * net_default() from the picture entirely, so a pass cannot be an artifact of
@@ -7749,6 +7753,16 @@ void _start(void) {
              * write memory that exists only in the other address space. */
             { "/bin/linux-ptrace", "linux-ptrace", 0, 255,
               "ptrace: syscall stops + PEEK/POKE (C)" },
+            /* Slice 12 cut 4: THE NETWORKING CONTROL PLANE. Every check does
+             * something and then RE-READS IT THROUGH THE DUMP, because the
+             * named danger in making rtnetlink accept commands was a dump that
+             * still said "lo and eth0" after `ip link add` succeeded -- an ACK
+             * and the interface list were exactly the two things allowed to
+             * disagree. bit1 is the one that proves the dump became
+             * namespace-aware: a fresh netns must report ZERO links, where the
+             * old code reported the host's two. */
+            { "/bin/linux-netlink", "linux-netlink", 0, 255,
+              "rtnetlink: link/addr commands (C)" },
 
             /* Independent witness #1: two SEPARATE processes in the initial
              * namespace must report the SAME uts inum (each $( ) is its own
@@ -7808,6 +7822,67 @@ void _start(void) {
               "[ \"$O\" = \"$I\" ] && [ \"$Q\" != 1 ]",
               0, "busybox unshare -p leaves caller" },
 
+            /* Slice 12 cut 4, independent witness: busybox's OWN `ip` applet
+             * drives the control plane. This matters more than another C test
+             * would: `ip` was written against Linux's rtnetlink, not against
+             * ours, so it agreeing is evidence about the ABI rather than about
+             * our idea of it. Its `iplink` builds IFLA_LINKINFO/IFLA_INFO_KIND
+             * itself and its `ipaddr` resolves "bb0" to an ifindex by running
+             * a GETLINK dump first -- so a wrong dump breaks `ip addr add`
+             * before the address handler is ever reached.
+             *
+             * THE ASSERTION IS A `[ ]` COMPARISON OF SIX MEASURED VALUES, not
+             * the exit status of `ip` (slice 7's lesson: a pipeline reports the
+             * LAST command's status, and `ip link add` reporting success is
+             * precisely the claim under test).
+             *
+             * The expected tuple is chosen so the OLD behaviour cannot produce
+             * it. Before cut 4, a dump inside `unshare -n` answered with the
+             * HOST's lo + eth0: that gives links=2 as well, but eth0=1 and
+             * bb0=0, and `ip addr add` would have failed for want of an
+             * interface. So the tuple separates "the control plane works" from
+             * "the dump is hardcoded", which a bare link count would not.
+             *
+             * `: eth0:` and `: bb0:` are matched WITH THEIR SURROUNDING COLONS
+             * on purpose. The first version grepped for a bare `eth0` and
+             * counted 1 in a namespace that has no eth0 at all -- the
+             * auto-generated peer is named `veth0`, and `eth0` is a substring
+             * of it. It read as "the host's interface leaked into the
+             * namespace" and was purely a defect in the test.
+             *
+             * down/up goes through SIOCSIFFLAGS, not netlink: busybox's
+             * `ip link set` is ioctl-based, so this checks that the ioctl WRITE
+             * and the netlink READ agree about the same interface.
+             *
+             * It counts links whose flag block contains ",UP," and expects
+             * 1 then 2 -- which asserts BOTH halves at once: the named
+             * interface went down, and its PEER did not. A single "is bb0
+             * down" check would pass on an implementation that took the whole
+             * namespace offline.
+             *
+             * WRITTEN TIGHT ON PURPOSE: `$B` for the interpreter, newlines
+             * instead of `; `, bare `ip link` instead of `ip link show`. One
+             * argv entry may not exceed ABI_ARG_MAX (512 bytes, enforced in
+             * proc.c) and a spawn that trips it is reported by this harness as
+             * "SKIP ... (no /bin/busybox)" -- a binary that plainly exists.
+             * That cost a whole gate run, and the SKIP message below now says
+             * what actually happened. */
+            { "/bin/busybox", "sh",
+              "B=/bin/busybox;$B unshare -n $B sh -c 'B=/bin/busybox\n"
+              "$B ip link add name bb0 type veth\n"
+              "$B ip addr add 10.9.0.1/24 dev bb0\n"
+              "N=$($B ip link|$B grep -c \"^[0-9]\")\n"
+              "A=$($B ip addr|$B grep -c 10.9.0.1)\n"
+              "E=$($B ip link|$B grep -c \": eth0:\")\n"
+              "Z=$($B ip link|$B grep -c \": bb0:\")\n"
+              "$B ip link set bb0 down\n"
+              "D=$($B ip link|$B grep -c \",UP,\")\n"
+              "$B ip link set bb0 up\n"
+              "U=$($B ip link|$B grep -c \",UP,\")\n"
+              "$B echo \"[NSIP] n=$N a=$A e=$E z=$Z d=$D u=$U\"\n"
+              "[ \"$N $A $E $Z $D $U\" = \"2 1 0 1 1 2\" ]'",
+              0, "busybox ip link add / addr add / set" },
+
             /* Slice 9, independent witness: busybox's OWN unshare -m + mount.
              * `-m` needs no fork (CLONE_NEWNS does move the caller), so unlike
              * `-p -f` this is not blocked by the vfork gap. Two-sided and
@@ -7865,8 +7940,15 @@ void _start(void) {
             };
             int pid = proc_spawn(&spec);
             if (pid < 0) {
-                kprintf("[LXNS]   SKIP %-30s (no %s)\n",
-                        cases[i].what, cases[i].path);
+                /* Do NOT say "no <path>": proc_spawn also refuses an argv entry
+                 * longer than ABI_ARG_MAX, and reading "no /bin/busybox" for a
+                 * busybox that is plainly present sends the reader hunting the
+                 * initrd instead of the argument. Print the length too. */
+                kprintf("[LXNS]   SKIP %-30s (spawn %s failed, rc=%d, "
+                        "arglen=%d, cap=%d)\n",
+                        cases[i].what, cases[i].path, pid,
+                        cases[i].arg ? (int)strlen(cases[i].arg) : 0,
+                        ABI_ARG_MAX);
                 skipped++;
                 continue;
             }
@@ -7884,6 +7966,22 @@ void _start(void) {
                 (passed == ran && ran > 0) ? "PASS" : "FAIL",
                 passed, ran, skipped);
     }
+#endif
+
+#ifdef LXNETLINK_BOOT
+    /* Slice 12 cut 4. The body is rtnl_selftest() in src/rtnetlink.c, beside
+     * the message builders it needs -- see the comment there for what this half
+     * checks and why userspace cannot.
+     *
+     * IT RUNS LATE, AFTER THE OTHER HARNESSES, AND THAT IS DELIBERATE. Two of
+     * its subtests assert the INITIAL namespace's reply, which reports eth0's
+     * carrier from net_is_up() and its address from g_my_ip -- and DHCP has not
+     * finished by the time the earlier harness blocks run (the veth gate's own
+     * log has the `[dhcp] ACK bound` line AFTER its verdict). Asserting there
+     * would have measured "the link is not up yet" and read as a control-plane
+     * bug. The subtests report net_is_up() either way, so a boot where the
+     * network genuinely failed says so rather than silently weakening. */
+    rtnl_selftest();
 #endif
 
 #ifdef LXCENSUS_BOOT

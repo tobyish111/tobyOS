@@ -1958,3 +1958,182 @@ anything containing escapes, and it was already written down.
 `lxposix --full` **23/23** with `enosys_gaps=0`, `LXNS` **18/18**, `LXVETH`
 **5/5**, `LXCONTAINER` **PASS probe=0xff**, defboot 3/3, cross-personality all
 PASS, zero faults everywhere.
+
+---
+
+## 23. Slice 12 cut 4 — THE NETWORKING CONTROL PLANE (2026-08-12)
+
+`ip link add` works. rtnetlink parses and executes commands, and the dumps
+report what is actually there, per namespace. New: `src/rtnetlink.c`,
+`include/tobyos/rtnetlink.h`, `programs/linux-netlink/`, `logs/lxnet.sh`.
+Extended: `net_ns.c`, `veth.c`, `socket.c`, `syscall.c`, `net.h`, `nsproxy.h`,
+the LXNS harness table.
+
+Steps 1 and 2 of the handoff order are done. **Step 3 (bridge) and step 4
+(forwarding/NAT) are NOT**, deliberately — the handoff said a good slice stops
+there rather than half-building a bridge on an unproven control plane.
+
+### What it does
+
+- **RTM_GETLINK / RTM_GETADDR report REALITY, per namespace.** A fresh
+  `unshare -n` now dumps nothing; it used to answer with the host's hardcoded
+  `lo` + `eth0`, which reads perfectly and is a complete fabrication for a
+  namespace that has no interface and cannot send a byte.
+- **RTM_NEWLINK** (`type veth`, with or without a nested `VETH_INFO_PEER`),
+  **RTM_DELLINK** (removes BOTH ends, across namespaces), **RTM_NEWADDR /
+  RTM_DELADDR**, **RTM_SETLINK** (admin up/down, and `IFLA_NET_NS_PID` to move
+  an interface into another namespace), all with `NLMSG_ERROR` ACKs.
+- **An attribute WALKER** (`nla_find`), nested-aware. Only a builder existed.
+- **IFF_UP is an ENFORCED admin state**, not a stored flag: `veth_tx` and
+  `veth_deliver` both consult it, so a down interface stops carrying frames in
+  either direction. **Deviation from Linux, stated rather than hidden: a device
+  here is created UP.** Linux creates one DOWN. This kernel has no admin state
+  for its own NIC and every pre-existing veth passes frames the instant it
+  exists; defaulting to DOWN would have failed LXVETH for a semantic nothing
+  else here honours.
+- **The SIOC* ioctls** — see below, they are not optional.
+
+### THE INITIAL NAMESPACE'S REPLY, and how "byte-identical" is actually checked
+
+Chromium's `AddressTrackerLinux` and glibc's `check_pf` both read this reply and
+both fail silently and catastrophically if it changes. The initial namespace
+emits exactly the messages it always did and only then appends anything the
+control plane created in it — which is nothing until someone runs `ip link add`.
+
+There was no way to capture a golden dump from the previous build once the
+edit was made, so **byte-identity is asserted as exact BYTE LENGTH plus every
+field parsed and compared**: 116 bytes / 3 messages for GETLINK (lo index 1 with
+`IFF_LOOPBACK`, eth0 index 2 without it, then DONE), 72 bytes / 2 messages for
+GETADDR. Those numbers are arithmetic, not observation — 16-byte header, aligned
+body, 4-byte attribute headers. The eth0 carrier bits are compared against
+`net_is_up()` rather than hardcoded, so a boot where DHCP has not finished
+reports honestly instead of failing.
+
+**The initial namespace can now hold control-plane devices at all**, which cut 3
+refused. MEASURED BEFORE CHANGING IT: every packet-path caller of
+`net_ns_dev()` / `net_ns_ip()` / `net_ns_netmask()` (eth.c:51, net.c:99,
+`net_my_ip`, `net_my_mac`, `net_my_netmask`) guards on the RAW namespace pointer
+being non-NULL, and the initial namespace IS the NULL pointer — so none of them
+ever consults the list for it, and e1000/DHCP/ARP are unaffected by
+construction. Without this, the standard container recipe (create the pair on
+the host, move one end in) would have been unexpressible.
+
+### THE FINDING: A PERFECT NETLINK SURFACE IS STILL NOT DRIVABLE
+
+busybox's `ip link add name bb0 type veth` worked over netlink on the first
+try — real device, real pair, `[veth] created bb0 <-> veth0`. The very next
+command died:
+
+```
+ip: can't find device 'bb0'
+```
+
+`ip addr add ... dev NAME` resolves the name to an INDEX through
+`ll_name_to_index()`, which consults a cache only the LISTING commands populate
+and otherwise falls straight through to libc's `if_nametoindex()` — **and that
+is an ioctl (SIOCGIFINDEX), not netlink at all.**
+
+So a control plane can have a complete, correct netlink surface and still be
+unusable by the standard tools. `rtnl_sock_ioctl` now answers SIOCGIFINDEX,
+SIOCGIFFLAGS/SIOCSIFFLAGS, SIOCGIFNAME, SIOCGIFADDR, SIOCGIFNETMASK,
+SIOCGIFMTU, SIOCGIFHWADDR, SIOCGIFTXQLEN — every value read from the same state
+the dumps read, so the two surfaces cannot drift. Unknown requests still get
+ENOTTY, so the change is purely additive (an `isatty()` on a socket answers
+exactly as before).
+
+**A hand-rolled test would never have found this** — it resolves indices from
+its own dump. This is precisely what the busybox-witness pattern is for, and it
+is the strongest single argument in this arc for keeping it.
+
+Note `if_nametoindex` opens an **AF_UNIX** socket for that ioctl, so the handler
+must not be restricted to AF_INET fds.
+
+### TWO MORE BUGS THE SAME WORK EXPOSED
+
+1. **`sock_deliver` dropped every netlink reply in an empty namespace.** Cut 1's
+   inbound gate (`if (!net_ns_has_network(s->net_ns)) return;`) exists to stop a
+   frame that arrived on the HOST's NIC reaching a socket in an empty namespace.
+   A netlink reply is not an arriving frame — it is the kernel's synchronous
+   answer to a request that very socket just made, built strictly from
+   `s->net_ns`. Dropping it made an empty namespace unable to observe that it is
+   empty, which is how the emptiness is *supposed* to be seen. Netlink is now
+   exempt; every real-traffic path is still refused and linux-netns still proves
+   it.
+2. **The capability check was in the wrong place.** `userns_capable()` reads
+   `current_proc()`, and the kernel-side harness calls `rtnl_process` from a
+   boot task with an empty capability set — so every command came back EPERM for
+   a caller that has no credentials to check. The decision now belongs to the
+   syscall boundary (`privileged` argument), which is where the caller's
+   credentials exist. The selftest exercises BOTH values, so the refusal is
+   tested on a request that would otherwise succeed.
+
+### LIMITS — stated, not implied
+
+- **No bridge, no forwarding, no NAT.** A container reaches its peer end. It
+  still cannot reach the internet.
+- **A namespace holding TWO interfaces answers ARP for the PRIMARY's address
+  only.** `arp_recv` replies when the target IP equals `net_my_ip()`, and that
+  is the receiving namespace's `devs[0]` address. Cut 3b made the STORED address
+  per-device; the RECEIVE path still has no per-device context because
+  `eth_recv` does not carry the device. This is the receive-side counterpart of
+  cut 3b and it is the next thing to fix if a bridge lands. It is why the
+  kernel selftest moves the peer end into its own namespace before the frame
+  test — one end per namespace is also the real container topology.
+- **`ip link add ... type X` for any X other than `veth` is EOPNOTSUPP**, by
+  name. An empty shell that forwards nothing would be the half-answer this file
+  exists to avoid.
+- **AF_INET only** for addresses; AF_INET6 is refused by family rather than
+  accepted and dropped.
+- **A NON-initial namespace reports no `lo`.** Linux always creates one. This
+  stack has no loopback anywhere (cut 1's founding measurement), so reporting
+  one would be an interface that cannot carry a packet.
+- **One reply DATAGRAM per request.** Linux splits large dumps; with at most 8
+  devices per namespace the whole answer is under 1 KiB against a 3 KiB buffer,
+  and the builder refuses to emit a partial message.
+- **`ip addr add ... dev eth0` on the host is EOPNOTSUPP**, not ENODEV: lo and
+  eth0 are net.c's, they exist and cannot be commanded from here, and "no such
+  device" about an interface `ip link show` just listed sends the reader hunting
+  the wrong bug.
+- **No `ip link set ... mtu` / `address` / rename**: refused with EOPNOTSUPP
+  rather than accepted and ignored.
+- **The ARP cache is still global**, as cut 2 said.
+- Veth ends ARE now reclaimed when a namespace dies (`netns_veth_release`,
+  called from `net_ns_put`); the peer is unpaired rather than deleted, because
+  it may live in a namespace that is still running — which is what Linux
+  reports for the surviving half. Pool raised 8 -> 16 pairs.
+
+### Method notes this slice paid for
+
+- **A SKIP MESSAGE THAT NAMED THE WRONG CAUSE COST A FULL GATE RUN.** The LXNS
+  harness printed `SKIP busybox ip link add (no /bin/busybox)` for a busybox
+  that was plainly present and had just run five other cases. `proc_spawn` also
+  refuses any argv entry over **ABI_ARG_MAX (512 bytes, proc.c:436)**, and the
+  witness script had grown past it. The message now reports the rc, the actual
+  length and the cap. **A diagnostic that can only say one thing will say it
+  when it is wrong.**
+- **The DHCP health check matched nothing on a boot where DHCP had plainly
+  succeeded.** The log line is column-aligned — `[dhcp] ACK    bound:` — and the
+  pattern assumed one space. It reported a network regression that had not
+  happened. Gate patterns must be checked against a real log, not written from
+  memory of the format.
+- **The build-marker gate fired correctly and for a reason I did not expect**:
+  not a stale build, but a marker string I had edited in the source without
+  updating the gate. It now prints WHICH marker is missing and says both causes
+  out loud. The check earned its place either way — it stopped a run that would
+  have tested the previous binary.
+- **Heredocs ate backslashes again**, this time in a throwaway python one-liner
+  whose regex character class arrived broken. The law is Write/Edit for anything
+  containing escapes, and it applies to scratch scripts too.
+- **Editing sources while a gate build is running invalidates the run.** One run
+  was killed for this rather than trusted. `make` also rebuilds essentially
+  everything when the Makefile itself is touched, which is easy to forget when
+  adding a source file.
+
+### Gate state
+
+`bash logs/lxnet.sh` — one command, three independent layers in one boot:
+**LXNETLINK 7/7** (kernel-side: the initial namespace's exact reply, and whether
+a netlink-created pair really carries a frame), **LXVETH 6/6** (regression: the
+enforced admin state sits in every frame path now), **LXNS 20/20 skipped=0**
+(userspace: `/bin/linux-netlink` BITS=0xff over a real socket, and a busybox
+`ip` witness measuring `n=2 a=1 e=0 z=1 d=1 u=2`).

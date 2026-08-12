@@ -14,13 +14,13 @@
  * address is now per-namespace. See net_ns_rx_enter() and net_my_ip().
  * ---------------------------------------------------------------------------
  *
- * WHAT IS DELIBERATELY NOT HERE
+ * CUT 4 ADDED THE CONTROL PLANE -- this comment used to say there was none.
+ * `ip link add ... type veth` now works: src/rtnetlink.c parses RTM_NEWLINK and
+ * calls netns_veth_create() below. The pre-cut-4 entry points (netns_veth_pair,
+ * netns_veth_pair_named) are unchanged and still kernel-only.
  *
- *   - No control plane. Pairs are created by kernel call (netns_veth_pair), not
- *     by `ip link add ... type veth`, because netlink RTM_NEWLINK handling does
- *     not exist -- netlink here only ever BUILDS reply messages for interface
- *     dumps, it does not accept commands. Adding it is a slice of its own and
- *     pretending otherwise would mean a half-netlink nobody could drive.
+ * WHAT IS STILL DELIBERATELY NOT HERE
+ *
  *   - No bridge. A bridge is what lets MANY namespaces share one uplink; a pair
  *     is what proves frames cross a namespace boundary at all. The pair is the
  *     foundation, so it comes first.
@@ -28,9 +28,10 @@
  *     (the host side of the pair); it cannot reach the internet, because that
  *     needs forwarding + address translation on top of a bridge.
  *
- * So cut 2 as implemented here means: REAL FRAMES CROSS A NAMESPACE BOUNDARY,
- * with per-namespace addressing and a working ARP+IP round trip. It does not yet
- * mean "a container can reach the network".
+ * So this file means: REAL FRAMES CROSS A NAMESPACE BOUNDARY, with per-namespace
+ * addressing, a working ARP+IP round trip, and interfaces userspace can create,
+ * address, move and take down. It does not yet mean "a container can reach the
+ * network".
  */
 
 #include <tobyos/net.h>
@@ -40,7 +41,12 @@
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 
-#define VETH_MAX_PAIRS 8
+/* 8 -> 16 with the control plane: userspace can now create pairs at will, and a
+ * combined gate run (LXVETH + the rtnetlink selftest + /bin/linux-netlink + a
+ * busybox `ip` witness) reaches 14 live ends at its peak. Ends ARE reclaimed
+ * when a namespace dies (netns_veth_release), so this is headroom rather than a
+ * substitute for that. */
+#define VETH_MAX_PAIRS 16
 
 struct veth_end {
     struct net_dev   dev;
@@ -58,6 +64,12 @@ static struct veth_end g_veth[VETH_MAX_PAIRS * 2];
  * same thing inline), so this does too. */
 static void veth_deliver(struct veth_end *dst, const uint8_t *frame, size_t len) {
     if (!dst || !dst->in_use || len < ETH_HDR_LEN) return;
+    /* ADMIN-DOWN IS ENFORCED ON BOTH SIDES. Checking only tx would let a frame
+     * INTO an interface that `ip link set X down` had just taken out of
+     * service, which is the half of "down" that matters for isolation. The
+     * counter is bumped only for a frame that is actually accepted, so a test
+     * can tell "dropped" from "delivered" rather than having to trust a flag. */
+    if (!net_ns_dev_is_up(dst->ns, &dst->dev)) return;
     dst->rx_frames++;
 
     /* eth_recv() is the stack's own ethertype demux -- reuse it rather than
@@ -76,6 +88,7 @@ static void veth_deliver(struct veth_end *dst, const uint8_t *frame, size_t len)
 static bool veth_tx(struct net_dev *dev, const void *frame, size_t len) {
     struct veth_end *e = (struct veth_end *)dev->priv;
     if (!e || !e->peer) return false;
+    if (!net_ns_dev_is_up(e->ns, &e->dev)) return false;
     e->tx_frames++;
     /* Delivered INLINE on the sender's stack, which is what makes the depth-1
      * rx-namespace save/restore in net_ns.c sufficient. */
@@ -204,6 +217,146 @@ long netns_veth_pair(void *ns_a, uint32_t ip_a, void *ns_b, uint32_t ip_b,
             a->name, sa, (unsigned long)net_ns_inum(ns_a),
             b->name, sb, (unsigned long)net_ns_inum(ns_b));
     return 0;
+}
+
+/* ---- cut 4: what the netlink control plane drives -----------------------
+ *
+ * `ip link add name v0 type veth` creates BOTH ends in the CALLER's namespace
+ * and moves one afterwards -- that is Linux's order, and it is why this exists
+ * separately from netns_veth_pair_named(), which registers a NULL-namespace end
+ * with net.c instead of putting it in a namespace list. A control-plane device
+ * must always be in a list: that list is what the RTM_GETLINK dump enumerates,
+ * and a device the dump cannot see is exactly the "ip link add succeeded but
+ * the dump still says lo and eth0" trap. */
+static bool veth_name_taken(void *ns, const char *n) {
+    return net_ns_find_dev(ns, n) != 0;
+}
+
+long netns_veth_create(void *ns, const char *name, const char *peer_name,
+                       struct net_dev **out_a, struct net_dev **out_b) {
+    char peer[24];
+    if (!name || !*name) return -1;
+    if (veth_name_taken(ns, name)) return -1;
+
+    if (peer_name && *peer_name) {
+        if (veth_name_taken(ns, peer_name)) return -1;
+        ksnprintf(peer, sizeof peer, "%s", peer_name);
+    } else {
+        /* No VETH_INFO_PEER: Linux's veth driver auto-names the peer vethN,
+         * and busybox's `ip` cannot send a peer name at all (its iplink keyword
+         * set is link/name/type/dev/address -- no `peer`), so this is the path
+         * the third-party witness actually takes. */
+        int i;
+        for (i = 0; i < 64; i++) {
+            ksnprintf(peer, sizeof peer, "veth%d", i);
+            if (!veth_name_taken(ns, peer) && strcmp(peer, name) != 0) break;
+        }
+        if (i == 64) return -1;
+    }
+
+    struct veth_end *a = veth_alloc();
+    struct veth_end *b = veth_alloc();
+    if (!a || !b) { if (a) a->in_use = false; if (b) b->in_use = false;
+                    return -1; }
+
+    static int create_no;
+    int n = create_no++;
+    a->peer = b; b->peer = a;
+    a->ns = ns; b->ns = ns;
+
+    for (int i = 0; i < 2; i++) {
+        struct veth_end *e = i ? b : a;
+        ksnprintf(e->name, sizeof e->name, "%s", i ? peer : name);
+        e->dev.name     = e->name;
+        e->dev.priv     = e;
+        e->dev.tx       = veth_tx;
+        e->dev.rx_drain = veth_rx_drain;
+        e->dev.link_up  = veth_link_up;
+        e->dev.mac[0] = 0x02; e->dev.mac[1] = 0x00; e->dev.mac[2] = 0x02;
+        e->dev.mac[3] = 0x00; e->dev.mac[4] = (uint8_t)n;
+        e->dev.mac[5] = (uint8_t)i;
+    }
+
+    if (!net_ns_add_dev(ns, &a->dev) || !net_ns_add_dev(ns, &b->dev)) {
+        /* Partial success is worse than failure: a namespace holding one half
+         * of a pair looks like a working interface and can never carry a
+         * frame. Undo both. */
+        net_ns_del_dev(ns, &a->dev);
+        net_ns_del_dev(ns, &b->dev);
+        a->in_use = b->in_use = false;
+        return -1;
+    }
+    if (out_a) *out_a = &a->dev;
+    if (out_b) *out_b = &b->dev;
+    kprintf("[veth] created %s <-> %s in net:[%lu]\n",
+            a->name, b->name, (unsigned long)net_ns_inum(ns));
+    return 0;
+}
+
+bool netns_veth_is_veth(struct net_dev *dev) {
+    return dev && dev->tx == veth_tx;
+}
+
+/* `ip link del` removes BOTH ends, as on Linux -- half a pair is not a device.
+ *
+ * REFUSED unless both ends are held by a namespace list. The pre-control-plane
+ * netns_veth_pair() path hands a NULL-namespace end to net_register(), and
+ * net.c has no unregister; freeing such an end would leave a dangling pointer
+ * in g_net_devs. Refusing is the honest answer and the control plane never
+ * creates one of those. */
+bool netns_veth_delete(struct net_dev *dev) {
+    if (!netns_veth_is_veth(dev)) return false;
+    struct veth_end *e = (struct veth_end *)dev->priv;
+    if (!e || !e->in_use) return false;
+    struct veth_end *p = e->peer;
+    if (!net_ns_dev_index(e->ns, &e->dev)) return false;
+    if (p && !net_ns_dev_index(p->ns, &p->dev)) return false;
+
+    net_ns_del_dev(e->ns, &e->dev);
+    if (p) { net_ns_del_dev(p->ns, &p->dev); p->peer = 0; p->in_use = false; }
+    e->peer = 0;
+    e->in_use = false;
+    return true;
+}
+
+/* Namespace teardown, NOT `ip link del`: free THIS end and leave the peer
+ * alive but unpaired. See the comment in net_ns_put() for why the asymmetry is
+ * the honest behaviour rather than a shortcut. */
+void netns_veth_release(struct net_dev *dev) {
+    if (!netns_veth_is_veth(dev)) return;
+    struct veth_end *e = (struct veth_end *)dev->priv;
+    if (!e || !e->in_use) return;
+    if (e->peer) { e->peer->peer = 0; e->peer = 0; }
+    e->in_use = false;
+}
+
+/* `ip link set DEV netns PID`. The device's ADDRESS is dropped, which is what
+ * Linux does and is not a shortcut: an address is meaningful only in the
+ * namespace whose routing it belongs to, and carrying 10.0.2.15 into a
+ * container would make the container answer for the host. */
+bool netns_veth_move_ns(struct net_dev *dev, void *ns) {
+    if (!netns_veth_is_veth(dev)) return false;
+    struct veth_end *e = (struct veth_end *)dev->priv;
+    if (!e || !e->in_use) return false;
+    if (e->ns == ns) return true;
+    if (net_ns_find_dev(ns, e->name)) return false;   /* name clash over there */
+    if (!net_ns_dev_index(e->ns, &e->dev)) return false;  /* not ours to move */
+    void *old = e->ns;
+    if (!net_ns_add_dev(ns, &e->dev)) return false;
+    net_ns_del_dev(old, &e->dev);
+    e->ns = ns;
+    return true;
+}
+
+/* Per-DEVICE counters. netns_veth_stats() below reports the namespace's PRIMARY
+ * device, which stops meaning anything once a namespace holds several -- and
+ * "did THIS interface stop passing frames when I took it down" is a question
+ * only a per-device counter can answer. */
+void netns_veth_dev_stats(struct net_dev *dev, uint32_t *tx, uint32_t *rx) {
+    struct veth_end *e = netns_veth_is_veth(dev) ?
+                         (struct veth_end *)dev->priv : 0;
+    if (tx) *tx = e ? e->tx_frames : 0;
+    if (rx) *rx = e ? e->rx_frames : 0;
 }
 
 void netns_veth_stats(void *ns, uint32_t *tx, uint32_t *rx) {

@@ -47,8 +47,8 @@ timeout "$TIMEOUT" "/c/Program Files/qemu/qemu-system-x86_64.exe" \
 
 echo
 echo "== gate"
-grep -a 'LXNS\|\[ns\]\|\[NSPROC\]\|\[NSBB\]\|^ns:\|ns: ' "$LOG" \
-    | sed 's/^\[[0-9 ]*ms\] //' | head -60
+grep -a 'LXNS\|\[ns\]\|\[NSPROC\]\|\[NSBB\]\|\[NSIP\]\|\[nl\]\|^ns:\|ns: ' "$LOG" \
+    | sed 's/^\[[0-9 ]*ms\] //' | head -80
 
 RC=0
 grep -aq 'LXNS. VERDICT: PASS' "$LOG" || RC=1
@@ -62,7 +62,9 @@ grep -aq 'LXNS. VERDICT: PASS' "$LOG" || RC=1
 #
 # Raise this number when you add a subtest; a mismatch in EITHER direction is
 # worth stopping for.
-WANT_SUBTESTS=${WANT_SUBTESTS:-18}
+# 18 -> 20 with slice 12 cut 4: /bin/linux-netlink (the control plane, in C)
+# and a busybox `ip link add` witness.
+WANT_SUBTESTS=${WANT_SUBTESTS:-20}
 GOT=$(grep -a 'LXNS. VERDICT' "$LOG" | grep -o 'subtests=[0-9]*' | head -1 | cut -d= -f2)
 if [ -n "$GOT" ] && [ "$GOT" != "$WANT_SUBTESTS" ]; then
     echo "   !! LXNS ran $GOT subtests, expected $WANT_SUBTESTS -- a test that"
