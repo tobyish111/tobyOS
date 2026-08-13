@@ -101,6 +101,10 @@ void net_format_ip (char dst[16], uint32_t ip_be);
 uint32_t net_my_ip(void);
 uint32_t net_my_netmask(void);
 uint32_t net_my_gateway(void);     /* cut 5: the next hop for off-subnet */
+/* The namespace the stack is currently acting for: an active network context
+ * if there is one, else the calling process's. NULL == the initial namespace.
+ * The port space is scoped by this -- see sock_lookup_by_port. */
+void    *net_current_ns(void);
 const uint8_t *net_my_mac(void);   /* the transmitting interface's MAC */
 
 /* veth (src/veth.c). These two are the KERNEL-ONLY constructors: a NULL ns means
@@ -132,6 +136,35 @@ void netns_veth_release(struct net_dev *dev);      /* namespace teardown: this
                                                     * end only, peer unpaired */
 bool netns_veth_move_ns(struct net_dev *dev, void *ns);
 void netns_veth_dev_stats(struct net_dev *dev, uint32_t *tx, uint32_t *rx);
+
+/* Cut 6: the BRIDGE (src/bridge.c). A device whose tx goes to its PORTS rather
+ * than to a wire, so many namespaces can share one attachment point -- the
+ * shape `docker0` has, and what forwarding/NAT is built on. It LEARNS source
+ * MACs, so a unicast goes to one port instead of being flooded to every
+ * container. */
+long netns_bridge_create(void *ns, const char *name, struct net_dev **out);
+bool netns_bridge_is_bridge(struct net_dev *dev);
+bool netns_bridge_delete(struct net_dev *dev);
+/* A frame arriving on an ENSLAVED port, handed to the bridge instead of to that
+ * port's own stack. */
+void netns_bridge_input(struct net_dev *brdev, struct net_dev *in_port,
+                        const void *frame, size_t len);
+void netns_bridge_port_gone(struct net_dev *port);   /* purge it from every FDB */
+void netns_bridge_stats(struct net_dev *dev, uint32_t *tx, uint32_t *rx,
+                        uint32_t *flooded, uint32_t *unicast);
+
+/* Cut 6: forwarding + MASQUERADE (src/nat.c) -- the last piece between a
+ * container and the internet. Enabling NAT also enables forwarding for the
+ * namespace; there is no /proc/sys here to separate them. Masquerade only:
+ * no DNAT, no inbound port forwarding, no filtering. */
+bool netns_nat_enable(void *ns, struct net_dev *uplink);
+bool netns_nat_enabled(void *ns);
+/* Called from ip_recv. `pkt` is a WRITABLE copy of the IPv4 packet; each
+ * returns true when it consumed (translated and forwarded) it. */
+bool netns_nat_outbound(void *ns, void *pkt, size_t total);
+bool netns_nat_inbound(void *ns, void *pkt, size_t total);
+void netns_nat_stats(uint32_t *out, uint32_t *in, uint32_t *dropped,
+                     uint32_t *maps);
 /* Pretty-print: writes "aa:bb:cc:dd:ee:ff" (max 18 bytes incl. NUL). */
 void net_format_mac(char dst[18], const uint8_t mac[ETH_ADDR_LEN]);
 

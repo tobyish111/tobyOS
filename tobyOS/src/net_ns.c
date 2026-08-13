@@ -107,9 +107,40 @@ struct net_ns {
         uint32_t        gateway;
         int             ifindex;
         bool            up;
+        /* CUT 6: the BRIDGE this interface is enslaved to, or NULL. An enslaved
+         * interface has no stack of its own -- its frames go to the bridge --
+         * which is exactly Linux's rule and the reason this lives beside the
+         * address rather than inside the device: a device can be moved between
+         * namespaces, and its master cannot follow it. */
+        struct net_dev *master;
     }               ifs[NET_NS_MAX_DEVS];
     size_t          ndev;
     int             next_ifindex;
+    /* CUT 6: A ROUTE TABLE, and it is ADDITIVE ON PURPOSE.
+     *
+     * ip_send's whole routing policy was "my subnet, else my gateway" -- one
+     * address, one gateway, no way to say "10.99.0.0/24 is reachable through
+     * THIS interface". That is unexpressible for a host that has to send
+     * replies back down to a container, which is exactly what forwarding needs.
+     *
+     * The table is consulted FIRST and the old logic is the FALLBACK, so a
+     * namespace with an empty table behaves byte-identically to before -- which
+     * is what keeps eth0/DHCP/the whole host path out of this change. Routes
+     * appear either from `ip route add` or automatically as a CONNECTED route
+     * when an address is put on an interface, the way Linux does it. */
+#define NET_NS_MAX_ROUTES 8
+    struct net_ns_route {
+        uint32_t        dst;        /* network order, already masked */
+        uint32_t        mask;
+        uint32_t        gateway;    /* 0 == on-link (no next hop) */
+        struct net_dev *dev;
+        bool            in_use;
+    }               routes[NET_NS_MAX_ROUTES];
+    /* CUT 6: the interface this namespace MASQUERADES out of, or NULL for "this
+     * namespace does not forward". One field carries both facts on purpose --
+     * see the header comment in nat.c for why forwarding and NAT are not
+     * separable here the way they are on Linux. */
+    struct net_dev *nat_uplink;
     uint32_t        ip;           /* network byte order */
     uint32_t        netmask;
     uint32_t        gateway;
@@ -134,6 +165,8 @@ static struct net_ns g_init_net_ns = {
 };
 
 static spinlock_t g_netns_lock = SPINLOCK_INIT;
+
+static void routes_purge_dev(struct net_ns *ns, struct net_dev *dev);
 
 static inline struct net_ns *as_nns(void *p) {
     return p ? (struct net_ns *)p : &g_init_net_ns;
@@ -248,7 +281,18 @@ bool net_ns_set_dev_addr(void *nsp, struct net_dev *dev, uint32_t ip,
     struct net_ns_if *e = nsif(ns, dev);
     if (!e) return false;      /* addressing an interface this ns does not have
                                 * is a refusal, not a silent no-op */
+    /* Drop the old connected route before overwriting the address, or
+     * re-addressing an interface leaves a route to the previous subnet
+     * pointing at it -- which silently swallows traffic for that subnet. */
+    if (e->ip && e->netmask) net_ns_route_del(nsp, e->ip & e->netmask,
+                                              e->netmask);
     e->ip = ip; e->netmask = mask; e->gateway = gw;
+    /* CONNECTED ROUTE, exactly as Linux derives one from `ip addr add`: the
+     * interface's own subnet is reachable through it with no next hop. Without
+     * this every `ip addr add` would need a matching `ip route add` that no
+     * real tooling issues. */
+    if (ip && mask) net_ns_route_add(nsp, ip & mask, mask, 0, dev);
+    if (gw)         net_ns_route_add(nsp, 0, 0, gw, dev);   /* default via gw */
     return true;
 }
 uint32_t net_ns_dev_ip(void *nsp, struct net_dev *dev) {
@@ -280,6 +324,11 @@ bool net_ns_del_dev(void *nsp, struct net_dev *dev) {
     struct net_ns *ns = as_nns(nsp);
     for (size_t i = 0; i < ns->ndev; i++) {
         if (ns->ifs[i].dev != dev) continue;
+        routes_purge_dev(ns, dev);      /* no route may outlive its interface */
+        netns_bridge_port_gone(dev);    /* nor may a bridge remember it */
+        if (ns->nat_uplink == dev) ns->nat_uplink = 0;   /* nor may NAT */
+        for (size_t k = 0; k < ns->ndev; k++)
+            if (ns->ifs[k].master == dev) ns->ifs[k].master = 0;
         for (size_t j = i + 1; j < ns->ndev; j++) ns->ifs[j - 1] = ns->ifs[j];
         ns->ndev--;
         ns->ifs[ns->ndev].dev = 0;
@@ -349,6 +398,135 @@ bool net_ns_set_dev_up(void *nsp, struct net_dev *dev, bool up) {
 uint32_t net_ns_dev_gateway(void *nsp, struct net_dev *dev) {
     struct net_ns_if *e = nsif(as_nns(nsp), dev);
     return e ? e->gateway : 0;
+}
+
+/* ---- cut 6: bridge enslavement ---- */
+
+bool net_ns_set_dev_master(void *nsp, struct net_dev *dev,
+                           struct net_dev *master) {
+    struct net_ns *ns = as_nns(nsp);
+    struct net_ns_if *e = nsif(ns, dev);
+    if (!e) return false;
+    if (master == dev) return false;      /* a bridge cannot enslave itself */
+    e->master = master;
+    return true;
+}
+struct net_dev *net_ns_dev_master(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->master : 0;
+}
+
+bool net_ns_set_nat(void *nsp, struct net_dev *uplink) {
+    struct net_ns *ns = as_nns(nsp);
+    /* The uplink must be an interface this namespace actually holds, or the
+     * masquerade would rewrite to an address that is not ours. */
+    if (uplink && !nsif(ns, uplink)) return false;
+    ns->nat_uplink = uplink;
+    return true;
+}
+struct net_dev *net_ns_nat_uplink(void *nsp) { return as_nns(nsp)->nat_uplink; }
+
+/* ---- cut 6: the route table ---- */
+
+/* Number of leading 1-bits, so the LONGEST prefix wins a lookup. A default
+ * route (mask 0) therefore loses to every specific one, which is the whole
+ * point of ordering by prefix length rather than by insertion. */
+static int mask_bits(uint32_t mask_be) {
+    uint32_t m = ntohl(mask_be);
+    int n = 0;
+    while (m & 0x80000000u) { n++; m <<= 1; }
+    return n;
+}
+
+bool net_ns_route_add(void *nsp, uint32_t dst, uint32_t mask, uint32_t gw,
+                      struct net_dev *dev) {
+    struct net_ns *ns = as_nns(nsp);
+    if (!dev) return false;            /* a route with no way out is not one */
+    dst &= mask;
+    /* Replacing an identical prefix rather than appending: two entries for one
+     * prefix make which-one-wins an accident of iteration order. */
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) {
+        struct net_ns_route *r = &ns->routes[i];
+        if (r->in_use && r->dst == dst && r->mask == mask) {
+            r->gateway = gw; r->dev = dev;
+            return true;
+        }
+    }
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) {
+        struct net_ns_route *r = &ns->routes[i];
+        if (r->in_use) continue;
+        r->dst = dst; r->mask = mask; r->gateway = gw; r->dev = dev;
+        r->in_use = true;
+        return true;
+    }
+    return false;                                  /* table full -- a refusal */
+}
+
+bool net_ns_route_del(void *nsp, uint32_t dst, uint32_t mask) {
+    struct net_ns *ns = as_nns(nsp);
+    dst &= mask;
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) {
+        struct net_ns_route *r = &ns->routes[i];
+        if (r->in_use && r->dst == dst && r->mask == mask) {
+            memset(r, 0, sizeof *r);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Drop every route that leaves by `dev`. Called when a device leaves the
+ * namespace: a route whose output interface is gone would otherwise hand
+ * ip_send a dangling pointer. */
+static void routes_purge_dev(struct net_ns *ns, struct net_dev *dev) {
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++)
+        if (ns->routes[i].in_use && ns->routes[i].dev == dev)
+            memset(&ns->routes[i], 0, sizeof ns->routes[i]);
+}
+
+bool net_ns_route_lookup(void *nsp, uint32_t dst, uint32_t *next_hop,
+                         struct net_dev **dev_out) {
+    struct net_ns *ns = as_nns(nsp);
+    struct net_ns_route *best = 0;
+    int best_bits = -1;
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) {
+        struct net_ns_route *r = &ns->routes[i];
+        if (!r->in_use || !r->dev) continue;
+        if ((dst & r->mask) != r->dst) continue;
+        int b = mask_bits(r->mask);
+        if (b > best_bits) { best_bits = b; best = r; }
+    }
+    if (!best) return false;
+    /* An ON-LINK route resolves ARP for the DESTINATION; a gatewayed one
+     * resolves it for the gateway. Getting this backwards means ARPing for a
+     * host that is not on this wire and silently never sending. */
+    if (next_hop) *next_hop = best->gateway ? best->gateway : dst;
+    if (dev_out)  *dev_out  = best->dev;
+    return true;
+}
+
+size_t net_ns_route_count(void *nsp) {
+    struct net_ns *ns = as_nns(nsp);
+    size_t n = 0;
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) if (ns->routes[i].in_use) n++;
+    return n;
+}
+
+bool net_ns_route_at(void *nsp, size_t idx, uint32_t *dst, uint32_t *mask,
+                     uint32_t *gw, struct net_dev **dev_out) {
+    struct net_ns *ns = as_nns(nsp);
+    size_t n = 0;
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) {
+        struct net_ns_route *r = &ns->routes[i];
+        if (!r->in_use) continue;
+        if (n++ != idx) continue;
+        if (dst)     *dst     = r->dst;
+        if (mask)    *mask    = r->mask;
+        if (gw)      *gw      = r->gateway;
+        if (dev_out) *dev_out = r->dev;
+        return true;
+    }
+    return false;
 }
 void net_ns_set_addr(void *nsp, uint32_t ip, uint32_t mask, uint32_t gw) {
     struct net_ns *ns = as_nns(nsp);

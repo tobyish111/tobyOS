@@ -7883,6 +7883,31 @@ void _start(void) {
               "[ \"$N $A $E $Z $D $U\" = \"2 1 0 1 1 2\" ]'",
               0, "busybox ip link add / addr add / set" },
 
+            /* Cut 6, independent witness: busybox's OWN `ip route`.
+             *
+             * A SEPARATE case rather than more lines in the one above, because
+             * a single argv entry may not exceed ABI_ARG_MAX (512) and that one
+             * is already at 469 bytes. Splitting also means a route failure
+             * does not mask a link/addr failure.
+             *
+             * `default` and `10.7.0.0/24` are the two shapes busybox's
+             * print_route emits, and they exercise different halves: the
+             * connected route is one this kernel DERIVED from `ip addr add`,
+             * and the default is one busybox asked for with `via` and NO `dev`
+             * -- so the kernel had to resolve the output interface from the
+             * gateway itself, which is the path `ip route add default via X`
+             * always takes. */
+            { "/bin/busybox", "sh",
+              "B=/bin/busybox;$B unshare -n $B sh -c 'B=/bin/busybox\n"
+              "$B ip link add name r0 type veth\n"
+              "$B ip addr add 10.7.0.1/24 dev r0\n"
+              "C=$($B ip route|$B grep -c \"10.7.0.0/24\")\n"
+              "$B ip route add default via 10.7.0.2\n"
+              "D=$($B ip route|$B grep -c default)\n"
+              "$B echo \"[NSRT] conn=$C def=$D\"\n"
+              "[ \"$C $D\" = \"1 1\" ]'",
+              0, "busybox ip route add / show" },
+
             /* Slice 9, independent witness: busybox's OWN unshare -m + mount.
              * `-m` needs no fork (CLONE_NEWNS does move the caller), so unlike
              * `-p -f` this is not blocked by the vfork gap. Two-sided and

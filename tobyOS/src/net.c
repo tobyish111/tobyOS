@@ -104,6 +104,15 @@ static void *net_ctx_resolve_ns(struct net_dev **dev_out) {
     return cp ? cp->net_ns : 0;
 }
 
+/* "Which namespace is this code acting for?" -- the same question net_my_ip()
+ * answers, without the address. Exported because the PORT SPACE has to ask it
+ * too: a port is only in use, and a datagram only deliverable, within one
+ * namespace. */
+void *net_current_ns(void) {
+    struct net_dev *d = 0;
+    return net_ctx_resolve_ns(&d);
+}
+
 uint32_t net_my_ip(void) {
     struct net_dev *d = 0;
     void *ns = net_ctx_resolve_ns(&d);

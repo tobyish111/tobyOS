@@ -220,13 +220,32 @@ void sock_close(struct sock *s) {
     memset(s, 0, sizeof(*s));
 }
 
-struct sock *sock_lookup_by_port(uint16_t dst_port_be) {
+/* CUT 6: THE PORT SPACE IS PER-NAMESPACE.
+ *
+ * This scanned every socket in the pool by port alone, which had two
+ * consequences and both are the kind of thing a container hits on day one:
+ *   - two namespaces could not both bind the same port, so a container running
+ *     anything on :80 collided with the host;
+ *   - a datagram arriving in ONE namespace was delivered to a socket bound in
+ *     ANOTHER, because the first port match won. That is a cross-namespace
+ *     data leak, not merely an inconvenience.
+ *
+ * The namespace comes from net_current_ns(): the receive context when a frame
+ * is being delivered (so the answer is the namespace the frame arrived in), and
+ * the caller's namespace when a bind is being checked. */
+static struct sock *sock_lookup_port_in_ns(uint16_t dst_port_be, void *ns) {
     if (dst_port_be == 0) return 0;
     for (int i = 0; i < SOCK_MAX; i++) {
-        if (g_socks[i].in_use && g_socks[i].local_port == dst_port_be)
+        if (g_socks[i].in_use && g_socks[i].local_port == dst_port_be &&
+            g_socks[i].net_ns == ns)
             return &g_socks[i];
     }
     return 0;
+}
+
+/* DELIVERY asks about the namespace the frame arrived in. */
+struct sock *sock_lookup_by_port(uint16_t dst_port_be) {
+    return sock_lookup_port_in_ns(dst_port_be, net_current_ns());
 }
 
 int sock_bind(struct sock *s, uint16_t port_be) {
@@ -235,7 +254,13 @@ int sock_bind(struct sock *s, uint16_t port_be) {
      * what musl/busybox resolvers do (bind a UDP socket to 0 before sending a
      * DNS query). Treating it as an error broke `nslookup` (bind EADDRINUSE). */
     if (port_be == 0) return sock_bind_ephemeral(s);
-    if (sock_lookup_by_port(port_be)) return -1;
+    /* A BIND asks about the SOCKET's namespace, not the ambient one. In normal
+     * use they are the same process and therefore the same namespace, but
+     * saying which one is meant is what lets two namespaces hold the same port
+     * -- and it is the socket's namespace that the later delivery will match
+     * against, so checking anything else could admit a bind that then never
+     * receives. */
+    if (sock_lookup_port_in_ns(port_be, s->net_ns)) return -1;
     s->local_port = port_be;
     return 0;
 }
@@ -245,7 +270,7 @@ static int sock_bind_ephemeral(struct sock *s) {
         uint16_t p = g_next_ephemeral++;
         if (g_next_ephemeral >= 34000) g_next_ephemeral = 33000;
         uint16_t pbe = htons(p);
-        if (!sock_lookup_by_port(pbe)) {
+        if (!sock_lookup_port_in_ns(pbe, s->net_ns)) {
             s->local_port = pbe;
             return 0;
         }

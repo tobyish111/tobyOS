@@ -60,6 +60,7 @@
 #include <tobyos/arp.h>
 #include <tobyos/socket.h>   /* the cross-namespace UDP subtest (cut 5) */
 #include <tobyos/udp.h>
+#include <tobyos/tcp.h>
 #include <tobyos/nsproxy.h>
 #include <tobyos/proc.h>
 #include <tobyos/rtnetlink.h>
@@ -80,6 +81,19 @@
 #define NL_RTM_NEWADDR    20
 #define NL_RTM_DELADDR    21
 #define NL_RTM_GETADDR    22
+#define NL_RTM_NEWROUTE   24
+#define NL_RTM_DELROUTE   25
+#define NL_RTM_GETROUTE   26
+
+#define NL_RTA_DST         1
+#define NL_RTA_OIF         4
+#define NL_RTA_GATEWAY     5
+#define NL_RTA_PREFSRC     7
+
+#define NL_RT_TABLE_MAIN 254
+#define NL_RTN_UNICAST     1
+#define NL_RT_SCOPE_LINK 253
+#define NL_RTPROT_BOOT     3
 
 #define NL_NLM_F_REQUEST 0x001
 #define NL_NLM_F_MULTI   0x002
@@ -96,6 +110,7 @@
 #define NL_IFLA_MTU          4
 #define NL_IFLA_TXQLEN      13
 #define NL_IFLA_OPERSTATE   16
+#define NL_IFLA_MASTER      10
 #define NL_IFLA_LINKINFO    18
 #define NL_IFLA_NET_NS_PID  19
 #define NL_IFLA_NET_NS_FD   28
@@ -143,6 +158,12 @@ struct nl_ifinfomsg {
     uint16_t type;
     int32_t  index;
     uint32_t flags, change;
+};
+/* struct rtmsg (12 bytes) */
+struct nl_rtmsg {
+    uint8_t  family, dst_len, src_len, tos;
+    uint8_t  table, protocol, scope, type;
+    uint32_t flags;
 };
 
 /* ---- the message BUILDER (moved verbatim from socket.c) ---------------- */
@@ -282,6 +303,9 @@ static void rtnl_link_msg(struct nl_build *b, void *ns, struct net_dev *d,
     { uint32_t qlen = 1000;     nlb_attr(b, NL_IFLA_TXQLEN, &qlen, 4); }
     { uint8_t st = (up && carrier) ? NL_IF_OPER_UP : NL_IF_OPER_DOWN;
       nlb_attr(b, NL_IFLA_OPERSTATE, &st, 1); }
+    { struct net_dev *m = net_ns_dev_master(ns, d);
+      if (m) { uint32_t mi = (uint32_t)net_ns_dev_index(ns, m);
+               nlb_attr(b, NL_IFLA_MASTER, &mi, 4); } }
     nlb_msg_end(b);
 }
 
@@ -369,7 +393,98 @@ static void rtnl_dump_addrs(struct nl_build *b, void *ns,
     }
 }
 
+static bool rtnl_is_synth(void *ns, int index);
+
+/* The ROUTE dump. The initial namespace's two synthetic entries come from
+ * net.c's config so `ip route` on the host says something true; every other
+ * namespace reports its real table. Nothing in the Chromium/glibc path reads
+ * RTM_GETROUTE (they read GETLINK and GETADDR), which is why this may report
+ * more than it used to without breaking the byte-identical contract. */
+static void rtnl_route_msg(struct nl_build *b, uint32_t dst, uint32_t mask,
+                           uint32_t gw, int oif, uint32_t seq, uint32_t pid) {
+    struct nl_rtmsg rm = { 0 };
+    rm.family   = 2;                                  /* AF_INET */
+    rm.dst_len  = nl_prefix_len(mask);
+    rm.table    = NL_RT_TABLE_MAIN;
+    rm.protocol = NL_RTPROT_BOOT;
+    rm.scope    = gw ? 0 : NL_RT_SCOPE_LINK;   /* on-link vs via a gateway */
+    rm.type     = NL_RTN_UNICAST;
+    nlb_msg_begin(b, NL_RTM_NEWROUTE, NL_NLM_F_MULTI, seq, pid, &rm, sizeof rm);
+    /* A DEFAULT route carries NO RTA_DST -- that, plus dst_len 0, is how
+     * every reader recognises it. Emitting a zero destination attribute
+     * instead would make `ip route` print "0.0.0.0/0 via ..." rather than
+     * "default via ...", and some parsers reject it outright. */
+    if (mask) nlb_attr(b, NL_RTA_DST, &dst, 4);
+    if (gw)   nlb_attr(b, NL_RTA_GATEWAY, &gw, 4);
+    if (oif)  nlb_attr(b, NL_RTA_OIF, &oif, 4);
+    nlb_msg_end(b);
+}
+
+static void rtnl_dump_routes(struct nl_build *b, void *ns,
+                             uint32_t seq, uint32_t pid) {
+    if (!ns) {
+        if (g_my_ip && g_my_netmask)
+            rtnl_route_msg(b, g_my_ip & g_my_netmask, g_my_netmask, 0, 2,
+                           seq, pid);
+        if (g_gateway_ip)
+            rtnl_route_msg(b, 0, 0, g_gateway_ip, 2, seq, pid);
+    }
+    size_t n = net_ns_route_count(ns);
+    for (size_t i = 0; i < n; i++) {
+        uint32_t dst = 0, mask = 0, gw = 0;
+        struct net_dev *d = 0;
+        if (!net_ns_route_at(ns, i, &dst, &mask, &gw, &d)) continue;
+        rtnl_route_msg(b, dst, mask, gw, net_ns_dev_index(ns, d), seq, pid);
+    }
+}
+
 /* ---- COMMANDS ---------------------------------------------------------- */
+
+static int rtnl_newroute(void *ns, const void *body, size_t len, bool del) {
+    if (len < sizeof(struct nl_rtmsg)) return -ABI_EINVAL;
+    struct nl_rtmsg rm;
+    memcpy(&rm, body, sizeof rm);
+    const void *attrs = (const uint8_t *)body + sizeof rm;
+    size_t      alen  = len - sizeof rm;
+    /* AF_UNSPEC is accepted as AF_INET. iproute2 and busybox both leave
+     * rtm_family at the `preferred_family` default for a plain
+     * `ip route add default via X`, and refusing that would make the most
+     * ordinary route command in existence fail with an address-family error
+     * that names nothing the user typed. This kernel has no IPv6 routing, so
+     * there is nothing else it could have meant. */
+    if (rm.family != 2 && rm.family != 0) return -NL_EAFNOSUPPORT;
+
+    const void *v; size_t vl;
+    uint32_t dst = 0, gw = 0;
+    int oif = 0;
+    if (nla_find(attrs, alen, NL_RTA_DST, &v, &vl) && vl >= 4)
+        memcpy(&dst, v, 4);
+    if (nla_find(attrs, alen, NL_RTA_GATEWAY, &v, &vl) && vl >= 4)
+        memcpy(&gw, v, 4);
+    if (nla_find(attrs, alen, NL_RTA_OIF, &v, &vl) && vl >= 4)
+        memcpy(&oif, v, 4);
+    uint32_t mask = nl_mask_from_prefix(rm.dst_len);
+
+    if (del) return net_ns_route_del(ns, dst & mask, mask) ? 0 : -ABI_ENOENT;
+
+    struct net_dev *dev = 0;
+    if (oif) {
+        dev = net_ns_dev_by_index(ns, oif);
+        if (!dev) return rtnl_is_synth(ns, oif) ? -NL_EOPNOTSUPP : -ABI_ENODEV;
+    } else if (gw) {
+        /* `ip route add default via X` with no `dev`: resolve the interface
+         * from the route to the GATEWAY, which is what Linux does. A gateway
+         * that is not itself reachable has no interface to name, and a route
+         * installed against a guess would silently send down the wrong wire. */
+        struct net_dev *g = 0;
+        uint32_t nh = 0;
+        if (net_ns_route_lookup(ns, gw, &nh, &g)) dev = g;
+        if (!dev) return -ABI_ENODEV;
+    } else {
+        return -ABI_EINVAL;               /* neither a device nor a next hop */
+    }
+    return net_ns_route_add(ns, dst & mask, mask, gw, dev) ? 0 : -ABI_ENOSPC;
+}
 
 /* Resolve the interface a command names: by index if it carries one, else by
  * IFLA_IFNAME. Both, because `ip link add`-style creates carry a name and no
@@ -409,6 +524,27 @@ static int rtnl_setlink(void *ns, const struct nl_ifinfomsg *ii,
     if (ii->change & NL_IFF_UP) {
         if (!net_ns_set_dev_up(ns, d, (ii->flags & NL_IFF_UP) != 0))
             return -ABI_ENODEV;
+    }
+
+    if (nla_find(attrs, alen, NL_IFLA_MASTER, &v, &vl) && vl >= 4) {
+        int midx = 0;
+        memcpy(&midx, v, 4);
+        /* index 0 is `nomaster`: detach. Linux spells both with the same
+         * attribute, so treating 0 as "no such device" would make releasing a
+         * port impossible. */
+        struct net_dev *mdev = 0;
+        if (midx) {
+            mdev = net_ns_dev_by_index(ns, midx);
+            if (!mdev) return -ABI_ENODEV;
+            /* Enslaving to something that is not a bridge would accept the
+             * command and then never switch a frame. */
+            if (!netns_bridge_is_bridge(mdev)) return -ABI_EINVAL;
+            if (mdev == d) return -ABI_EINVAL;
+        } else {
+            netns_bridge_port_gone(d);
+        }
+        if (!net_ns_set_dev_master(ns, d, mdev)) return -ABI_ENODEV;
+        return 0;
     }
 
     if (nla_find(attrs, alen, NL_IFLA_NET_NS_PID, &v, &vl) && vl >= 4) {
@@ -463,6 +599,10 @@ static int rtnl_newlink(void *ns, const void *body, size_t len) {
      * name rather than created as an empty shell -- `ip link add ... type
      * bridge` returning success and producing a device that forwards nothing
      * is precisely the half-answer that makes a control plane worse than none. */
+    if (strcmp(kind, "bridge") == 0) {
+        if (net_ns_find_dev(ns, name)) return -ABI_EEXIST;
+        return netns_bridge_create(ns, name, 0) == 0 ? 0 : -ABI_ENOSPC;
+    }
     if (strcmp(kind, "veth") != 0) return -NL_EOPNOTSUPP;
 
     /* IFLA_INFO_DATA -> VETH_INFO_PEER -> { ifinfomsg, IFLA_IFNAME }. Optional:
@@ -499,6 +639,10 @@ static int rtnl_dellink(void *ns, const void *body, size_t len) {
     if (!d) return rtnl_is_synth(ns, ii.index) ? -NL_EOPNOTSUPP : -ABI_ENODEV;
     /* Deleting the host's real NIC is not a thing this kernel can undo, and
      * net.c has no unregister -- refused rather than half-done. */
+    if (netns_bridge_is_bridge(d)) {
+        if (!netns_bridge_delete(d)) return -NL_EOPNOTSUPP;
+        return 0;
+    }
     if (!netns_veth_delete(d)) return -NL_EOPNOTSUPP;
     return 0;
 }
@@ -570,12 +714,17 @@ size_t rtnl_process(void *ns, uint32_t nl_pid, bool privileged,
         case NL_RTM_GETADDR:
             rtnl_dump_addrs(&b, ns, rq.seq, nl_pid);
             goto done_msg;
+        case NL_RTM_GETROUTE:
+            rtnl_dump_routes(&b, ns, rq.seq, nl_pid);
+            goto done_msg;
 
         case NL_RTM_NEWLINK:
         case NL_RTM_SETLINK:
         case NL_RTM_DELLINK:
         case NL_RTM_NEWADDR:
-        case NL_RTM_DELADDR: {
+        case NL_RTM_DELADDR:
+        case NL_RTM_NEWROUTE:
+        case NL_RTM_DELROUTE: {
             int err;
             /* CAP_NET_ADMIN. The DECISION is the caller's, made at the syscall
              * boundary where the caller's credentials exist -- this file is
@@ -600,6 +749,10 @@ size_t rtnl_process(void *ns, uint32_t nl_pid, bool privileged,
                 }
             } else if (rq.type == NL_RTM_DELLINK) {
                 err = rtnl_dellink(ns, body, body_len);
+            } else if (rq.type == NL_RTM_NEWROUTE ||
+                       rq.type == NL_RTM_DELROUTE) {
+                err = rtnl_newroute(ns, body, body_len,
+                                    rq.type == NL_RTM_DELROUTE);
             } else {
                 err = rtnl_newaddr(ns, body, body_len,
                                    rq.type == NL_RTM_DELADDR);
@@ -914,7 +1067,7 @@ void rtnl_selftest(void) {
     static uint8_t out[CAP];
     struct hnl r;
     struct hmsg m[8];
-    int pass = 0, total = 8;
+    int pass = 0, total = 12;
 
     kprintf("[LXNETLINK] ==== the rtnetlink control plane ====\n");
 
@@ -1251,6 +1404,128 @@ void rtnl_selftest(void) {
         kprintf("[LXNETLINK]   FAIL cross-ns UDP: no addressed pair to use\n");
     }
 
+    /* ---- 5c. THE PORT SPACE IS PER-NAMESPACE -----------------------------
+     *
+     * Two claims, and the second is the one that matters:
+     *   1. two namespaces can BOTH hold the same port (they could not before --
+     *      a container running anything on a port the host used simply failed);
+     *   2. a datagram arriving in one is delivered to THAT namespace's socket
+     *      and NOT to the other's. The old global scan returned the first port
+     *      match in the pool, which is a cross-namespace delivery -- a data
+     *      leak, not an inconvenience.
+     *
+     * Asserting only (1) would pass on an implementation that stopped checking
+     * for collisions altogether and then delivered to whichever socket it found
+     * first. The count on the WRONG socket has to be zero. */
+    if (da && db && idx_a && idx_b) {
+        uint32_t ip_b = 10u | (55u << 8) | (0u << 16) | (2u << 24);
+        struct sock *ra = sock_alloc(SOCK_KIND_UDP);
+        struct sock *rb = sock_alloc(SOCK_KIND_UDP);
+        int ba = -1, bb = -1;
+        uint32_t a_cnt = 99, b_cnt = 99;
+        int lsn_a = 0, lsn_b = 0;
+        struct tcp_conn *la = 0, *lb = 0;
+
+        if (ra && rb) {
+            ra->net_ns = ns;                 /* one socket in each namespace */
+            rb->net_ns = ns2;
+            ba = sock_bind(ra, htons(7000));
+            bb = sock_bind(rb, htons(7000)); /* THE SAME PORT */
+            if (ba == 0 && bb == 0) {
+                static const char p[] = "p";
+                struct net_ctx prev = net_ctx_enter(ns, da);
+                (void)udp_send(htons(7001), ip_b, htons(7000), p, 1);
+                net_ctx_leave(prev);
+                a_cnt = ra->count;
+                b_cnt = rb->count;
+            }
+        }
+        /* The TCP half goes through a DIFFERENT predicate (tcp.c's port_in_use,
+         * not socket.c's), so it is checked separately rather than assumed to
+         * follow. Both listeners must come up on one port. */
+        { struct net_ctx p1 = net_ctx_enter(ns, da);
+          la = tcp_listen(htons(7002), 1); lsn_a = la ? 1 : 0;
+          net_ctx_leave(p1); }
+        { struct net_ctx p2 = net_ctx_enter(ns2, db);
+          lb = tcp_listen(htons(7002), 1); lsn_b = lb ? 1 : 0;
+          net_ctx_leave(p2); }
+        if (la) tcp_close_nowait(la);
+        if (lb) tcp_close_nowait(lb);
+        if (ra) sock_close(ra);
+        if (rb) sock_close(rb);
+
+        if (ba == 0 && bb == 0 && b_cnt == 1 && a_cnt == 0 && lsn_a && lsn_b) {
+            pass++;
+            kprintf("[LXNETLINK]   ok   port 7000 bound in BOTH namespaces; the "
+                    "datagram reached only its own (b=%u a=%u), and two TCP "
+                    "listeners share port 7002\n", b_cnt, a_cnt);
+        } else {
+            kprintf("[LXNETLINK]   FAIL per-ns ports: bind=%d/%d dgrams b=%u "
+                    "a=%u tcp_listen=%d/%d (want 0/0, 1, 0, 1/1)\n",
+                    ba, bb, b_cnt, a_cnt, lsn_a, lsn_b);
+        }
+    } else {
+        kprintf("[LXNETLINK]   FAIL per-ns ports: no addressed pair to use\n");
+    }
+
+    /* ---- 5d. THE ROUTE TABLE ---------------------------------------------
+     *
+     * Three claims, and the third is the one a bare "did the route appear"
+     * check would miss:
+     *   1. addressing an interface creates a CONNECTED route for its subnet;
+     *   2. RTM_NEWROUTE installs a default route and resolves its interface
+     *      from the GATEWAY when the request names no device (which is what
+     *      `ip route add default via X` sends);
+     *   3. LONGEST PREFIX WINS. A table that simply returned the first match
+     *      would answer the default route for an on-subnet destination, and
+     *      every packet to the local wire would be sent to the gateway --
+     *      which still "works" on a real network and is completely wrong.
+     */
+    if (da && idx_a) {
+        uint32_t gw    = 10u | (55u << 8) | (0u << 16) | (2u << 24);
+        uint32_t onsub = 10u | (55u << 8) | (0u << 16) | (9u << 24);
+        uint32_t far   = 8u  | (8u  << 8) | (8u  << 16) | (8u  << 24);
+
+        uint32_t nh_on = 0, nh_far = 0;
+        struct net_dev *d_on = 0, *d_far = 0;
+        bool got_on = net_ns_route_lookup(ns, onsub, &nh_on, &d_on);
+
+        struct nl_rtmsg rm = { 0 };
+        rm.family = 0;              /* AF_UNSPEC, as busybox actually sends */
+        rm.dst_len = 0;             /* default route */
+        hnl_init(&r, NL_RTM_NEWROUTE,
+                 NL_NLM_F_CREATE | NL_NLM_F_EXCL | NL_NLM_F_ACK, &rm, sizeof rm);
+        hnl_attr(&r, NL_RTA_GATEWAY, &gw, 4);     /* no RTA_OIF, on purpose */
+        int ack = hnl_ack(out, hnl_go(&r, ns, out, CAP));
+        bool got_far = net_ns_route_lookup(ns, far, &nh_far, &d_far);
+
+        struct nl_ifinfomsg gi = { 0 };
+        hnl_init(&r, NL_RTM_GETROUTE, 0x300, &gi, sizeof gi);
+        size_t n = hnl_go(&r, ns, out, CAP);
+        int nroutes = 0;
+        { int c = hnl_msgs(out, n, m, 8);
+          for (int i = 0; i < c; i++)
+            if (m[i].type == NL_RTM_NEWROUTE) nroutes++; }
+
+        if (got_on && nh_on == onsub && d_on == da &&      /* on-link, not gw */
+            ack == 0 && got_far && nh_far == gw && d_far == da &&
+            nroutes == 2 && net_ns_route_count(ns) == 2) {
+            pass++;
+            kprintf("[LXNETLINK]   ok   routes: connected 10.55.0.0/24 on-link "
+                    "via k0, default via 10.55.0.2 (device resolved from the "
+                    "gateway), longest prefix wins, dump shows 2\n");
+        } else {
+            kprintf("[LXNETLINK]   FAIL routes: on=%d nh=0x%08x dev=%p | "
+                    "ack=%d far=%d nh=0x%08x dev=%p | dump=%d tbl=%lu "
+                    "(want on-link 0x%08x/k0, gw 0x%08x/k0, 2, 2)\n",
+                    (int)got_on, nh_on, (void *)d_on, ack, (int)got_far,
+                    nh_far, (void *)d_far, nroutes,
+                    (unsigned long)net_ns_route_count(ns), onsub, gw);
+        }
+    } else {
+        kprintf("[LXNETLINK]   FAIL routes: no addressed interface to use\n");
+    }
+
     /* ---- 6. RTM_DELLINK removes BOTH ends ------------------------------- */
     if (da && idx_a) {
         struct nl_ifinfomsg ii = { 0 };
@@ -1280,6 +1555,181 @@ void rtnl_selftest(void) {
         }
     } else {
         kprintf("[LXNETLINK]   FAIL RTM_DELLINK: no pair to delete\n");
+    }
+
+    /* ---- 7. TWO CONTAINERS THROUGH A BRIDGE ------------------------------
+     *
+     * The topology every container runtime actually uses: a bridge in the host
+     * namespace, one veth pair per container, each host-side end enslaved to
+     * the bridge. A pair alone connects exactly two namespaces; this is the
+     * thing that lets many share one attachment point.
+     *
+     * The assertion is an ARP round trip between TWO CONTAINERS that have no
+     * direct link at all -- every frame has to be switched by the bridge -- and
+     * it checks the resolved MAC is the far container's OWN. That is the same
+     * check that caught cut 2's g_my_mac bug, and here it also rules out the
+     * bridge answering on their behalf.
+     *
+     * The unicast counter is the second layer: it separates a BRIDGE from a
+     * HUB. Flooding every frame to every port would satisfy the ARP check
+     * completely while leaking each container's traffic to all the others. */
+    {
+        void *nsH = net_ns_create();
+        void *nsA = net_ns_create();
+        void *nsB = net_ns_create();
+        struct net_dev *br = 0, *pa0 = 0, *pa1 = 0, *pb0 = 0, *pb1 = 0;
+        uint32_t mask24 = 255u | (255u << 8) | (255u << 16) | (0u << 24);
+        uint32_t ip_br  = 10u | (66u << 8) | (0u << 16) | (1u << 24);
+        uint32_t ip_ca  = 10u | (66u << 8) | (0u << 16) | (2u << 24);
+        uint32_t ip_cb  = 10u | (66u << 8) | (0u << 16) | (3u << 24);
+        bool built = false;
+
+        if (nsH && nsA && nsB &&
+            netns_bridge_create(nsH, "br0", &br) == 0 &&
+            netns_veth_create(nsH, "pa0", "pa1", &pa0, &pa1) == 0 &&
+            netns_veth_create(nsH, "pb0", "pb1", &pb0, &pb1) == 0 &&
+            netns_veth_move_ns(pa1, nsA) && netns_veth_move_ns(pb1, nsB) &&
+            net_ns_set_dev_master(nsH, pa0, br) &&
+            net_ns_set_dev_master(nsH, pb0, br) &&
+            net_ns_set_dev_addr(nsH, br,  ip_br, mask24, 0) &&
+            net_ns_set_dev_addr(nsA, pa1, ip_ca, mask24, 0) &&
+            net_ns_set_dev_addr(nsB, pb1, ip_cb, mask24, 0))
+            built = true;
+
+        uint8_t mac[ETH_ADDR_LEN];
+        bool resolved = false;
+        uint32_t brx = 0, btx = 0, flood = 0, uni = 0;
+        if (built) {
+            /* Container A resolves container B. A and B share no link. */
+            struct net_ctx p = net_ctx_enter(nsA, pa1);
+            arp_request(ip_cb);
+            net_ctx_leave(p);
+            resolved = arp_resolve(ip_cb, mac) &&
+                       memcmp(mac, pb1->mac, ETH_ADDR_LEN) == 0;
+            netns_bridge_stats(br, &btx, &brx, &flood, &uni);
+        }
+
+        if (built && resolved && brx >= 2 && uni >= 1) {
+            pass++;
+            kprintf("[LXNETLINK]   ok   two containers talk THROUGH a bridge: "
+                    "ARP answered by B's own MAC, br rx=%u flooded=%u "
+                    "unicast=%u (it learned, so it is a bridge not a hub)\n",
+                    brx, flood, uni);
+        } else {
+            kprintf("[LXNETLINK]   FAIL bridge: built=%d resolved=%d br rx=%u "
+                    "tx=%u flooded=%u unicast=%u (want built, resolved, rx>=2, "
+                    "unicast>=1)\n", (int)built, (int)resolved, brx, btx,
+                    flood, uni);
+        }
+        net_ns_put(nsA); net_ns_put(nsB); net_ns_put(nsH);
+    }
+
+    /* ---- 8. A CONTAINER REACHES "THE INTERNET" THROUGH NAT ---------------
+     *
+     * The whole arc's destination, and it is checked from BOTH ends because
+     * either half alone can be satisfied by something wrong:
+     *
+     *   - the far side must see the packet arrive wearing the HOST's uplink
+     *     address, not the container's 10.77.0.2. Asserting only "it arrived"
+     *     would pass on a stack that forwarded the container's unroutable
+     *     source address straight onto the wire -- which works perfectly on
+     *     this fake wire and would vanish on a real one.
+     *   - the REPLY must find its way back. That is the half a one-way test
+     *     cannot see, and it is the half the mapping table exists for: the
+     *     reply is addressed to the host's own address and would otherwise be
+     *     delivered to the host's own socket layer.
+     *
+     * "The internet" is a third namespace on the far side of an uplink veth,
+     * so the test is deterministic and needs no real network.
+     */
+    {
+        void *nsW = net_ns_create();       /* the "world" */
+        void *nsH = net_ns_create();       /* the host doing the forwarding */
+        void *nsC = net_ns_create();       /* the container */
+        struct net_dev *w0 = 0, *w1 = 0, *h0 = 0, *c1 = 0;
+        uint32_t m24    = 255u | (255u << 8) | (255u << 16) | (0u << 24);
+        uint32_t ip_up  = 192u | (168u << 8) | (50u << 16) | (1u << 24);  /* host uplink */
+        uint32_t ip_wld = 192u | (168u << 8) | (50u << 16) | (2u << 24);  /* the world */
+        uint32_t ip_gw  = 10u  | (77u  << 8) | (0u  << 16) | (1u << 24);  /* host, inner */
+        uint32_t ip_ct  = 10u  | (77u  << 8) | (0u  << 16) | (2u << 24);  /* container */
+        bool built = false;
+
+        if (nsW && nsH && nsC &&
+            netns_veth_create(nsH, "w0", "w1", &w0, &w1) == 0 &&
+            netns_veth_create(nsH, "h0", "c1", &h0, &c1) == 0 &&
+            netns_veth_move_ns(w1, nsW) && netns_veth_move_ns(c1, nsC) &&
+            net_ns_set_dev_addr(nsH, w0, ip_up,  m24, 0) &&
+            net_ns_set_dev_addr(nsH, h0, ip_gw,  m24, 0) &&
+            net_ns_set_dev_addr(nsW, w1, ip_wld, m24, 0) &&
+            /* the container's DEFAULT ROUTE is the host's inner address */
+            net_ns_set_dev_addr(nsC, c1, ip_ct,  m24, ip_gw) &&
+            netns_nat_enable(nsH, w0))
+            built = true;
+
+        /* Warm the ARP caches. A forwarded packet has no sender to retry on
+         * its behalf, so the FIRST datagram to a cold next hop is legitimately
+         * dropped -- testing that as a failure would be testing ARP, not NAT. */
+        if (built) {
+            struct net_ctx p;
+            p = net_ctx_enter(nsC, c1); arp_request(ip_gw);  net_ctx_leave(p);
+            p = net_ctx_enter(nsH, w0); arp_request(ip_wld); net_ctx_leave(p);
+            p = net_ctx_enter(nsH, h0); arp_request(ip_ct);  net_ctx_leave(p);
+            p = net_ctx_enter(nsW, w1); arp_request(ip_up);  net_ctx_leave(p);
+        }
+
+        struct sock *ws = built ? sock_alloc(SOCK_KIND_UDP) : 0;
+        struct sock *cs = built ? sock_alloc(SOCK_KIND_UDP) : 0;
+        uint32_t seen_src = 0, back_src = 0;
+        uint16_t seen_port = 0;
+        uint32_t wcnt = 0, ccnt = 0;
+
+        if (ws && cs) {
+            ws->net_ns = nsW; cs->net_ns = nsC;
+            if (sock_bind(ws, htons(9999)) == 0 &&
+                sock_bind(cs, htons(6000)) == 0) {
+                static const char msg[] = "out";
+                struct net_ctx p = net_ctx_enter(nsC, c1);
+                (void)udp_send(htons(6000), ip_wld, htons(9999),
+                               msg, sizeof msg - 1);
+                net_ctx_leave(p);
+
+                wcnt = ws->count;
+                if (wcnt) {
+                    seen_src  = ws->dgrams[ws->tail].src_ip;
+                    seen_port = ws->dgrams[ws->tail].src_port;
+                    /* Reply to exactly what we saw -- the translated port. */
+                    static const char rep[] = "back";
+                    struct net_ctx q = net_ctx_enter(nsW, w1);
+                    (void)udp_send(htons(9999), ip_up, seen_port,
+                                   rep, sizeof rep - 1);
+                    net_ctx_leave(q);
+                    ccnt = cs->count;
+                    if (ccnt) back_src = cs->dgrams[cs->tail].src_ip;
+                }
+            }
+        }
+        uint32_t nout = 0, nin = 0, ndrop = 0, nmaps = 0;
+        netns_nat_stats(&nout, &nin, &ndrop, &nmaps);
+        if (ws) sock_close(ws);
+        if (cs) sock_close(cs);
+
+        if (built && wcnt == 1 && seen_src == ip_up &&
+            ntohs(seen_port) >= 50000u && ccnt == 1 && back_src == ip_wld &&
+            nout >= 1 && nin >= 1) {
+            pass++;
+            kprintf("[LXNETLINK]   ok   NAT round trip: the world saw "
+                    "192.168.50.1:%u (NOT the container's 10.77.0.2), and the "
+                    "reply came back to the container from 192.168.50.2 "
+                    "[out=%u in=%u maps=%u]\n",
+                    (unsigned)ntohs(seen_port), nout, nin, nmaps);
+        } else {
+            kprintf("[LXNETLINK]   FAIL NAT: built=%d world got %u src=0x%08x "
+                    "port=%u | container got %u src=0x%08x | out=%u in=%u "
+                    "drop=%u maps=%u (want src 0x%08x, NOT 0x%08x)\n",
+                    (int)built, wcnt, seen_src, (unsigned)ntohs(seen_port),
+                    ccnt, back_src, nout, nin, ndrop, nmaps, ip_up, ip_ct);
+        }
+        net_ns_put(nsC); net_ns_put(nsH); net_ns_put(nsW);
     }
 
     net_ns_put(ns2);

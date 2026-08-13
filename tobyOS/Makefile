@@ -122,6 +122,8 @@ C_SRCS := src/kernel.c \
           src/user_ns.c \
           src/net_ns.c \
           src/veth.c \
+          src/bridge.c \
+          src/nat.c \
           src/rtnetlink.c \
           src/seccomp.c \
           src/cgroup.c \

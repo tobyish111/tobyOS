@@ -313,6 +313,32 @@ struct net_dev *net_ns_dev_by_index(void *ns, int idx);
 bool     net_ns_dev_is_up(void *ns, struct net_dev *dev);
 bool     net_ns_set_dev_up(void *ns, struct net_dev *dev, bool up);
 uint32_t net_ns_dev_gateway(void *ns, struct net_dev *dev);
+
+/* Cut 6: bridge enslavement. An enslaved interface has no stack of its own --
+ * its frames go to the bridge (netns_bridge_input), as on Linux. */
+bool     net_ns_set_dev_master(void *ns, struct net_dev *dev,
+                               struct net_dev *master);
+struct net_dev *net_ns_dev_master(void *ns, struct net_dev *dev);
+
+/* Cut 6: the interface this namespace masquerades out of. NULL means it does
+ * not forward at all -- one field for both facts; see src/nat.c. */
+bool     net_ns_set_nat(void *ns, struct net_dev *uplink);
+struct net_dev *net_ns_nat_uplink(void *ns);
+
+/* ---- cut 6: the per-namespace ROUTE TABLE ------------------------------
+ * Consulted FIRST by ip_send; its old "my subnet, else my gateway" logic is
+ * the fallback, so a namespace with an empty table behaves exactly as before.
+ * A connected route appears automatically when an address is put on an
+ * interface, as on Linux. `gw == 0` means on-link (ARP for the destination
+ * itself); otherwise ARP resolves the gateway. Longest prefix wins. */
+bool     net_ns_route_add(void *ns, uint32_t dst, uint32_t mask, uint32_t gw,
+                          struct net_dev *dev);
+bool     net_ns_route_del(void *ns, uint32_t dst, uint32_t mask);
+bool     net_ns_route_lookup(void *ns, uint32_t dst, uint32_t *next_hop,
+                             struct net_dev **dev_out);
+size_t   net_ns_route_count(void *ns);
+bool     net_ns_route_at(void *ns, size_t idx, uint32_t *dst, uint32_t *mask,
+                         uint32_t *gw, struct net_dev **dev_out);
 /* ---- cut 5: THE NETWORK CONTEXT ----------------------------------------
  * Bracket a frame delivery so the stack processes it AS a given namespace and
  * interface. `active` is load-bearing: NULL is a valid namespace (the initial

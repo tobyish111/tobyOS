@@ -499,14 +499,33 @@ int main(void) {
 
     /* ---- bit5: refusals, by EXACT errno --------------------------------- */
     {
-        int e_kind = add_kind(fd, "br0", "bridge");   /* want EOPNOTSUPP 95 */
+        /* `bridge` USED TO BE THE UNSUPPORTED KIND HERE and this assertion
+         * caught its own obsolescence the moment bridges landed: the gate went
+         * red with type-bridge=0 against a wanted 95. That is the assertion
+         * working. It now checks the opposite -- bridge SUCCEEDS -- and picks
+         * `vlan` as the kind this kernel genuinely does not have.
+         *
+         * Keeping both in one bit is deliberate: a supported kind and an
+         * unsupported one are the two halves of "the kind is actually looked
+         * at", and a kernel that ignored IFLA_INFO_KIND entirely would fail
+         * one of them whichever way it guessed. */
+        int e_kind = add_kind(fd, "vl0", "vlan");     /* want EOPNOTSUPP 95 */
+        int e_br   = add_kind(fd, "brx", "bridge");   /* want 0 -- created */
+        int n_br   = dump_links(fd, lv, 16);
+        struct link_ent *bx = find_link(lv, n_br, "brx");
+        /* Remove it again so the counts the later bits assert are unaffected.
+         * A test that leaves state behind makes the next one's numbers depend
+         * on the order they happen to run in. */
+        if (bx) del_link(fd, bx->index);
         int e_dup  = add_veth(fd, "c0", NULL);        /* want EEXIST 17 */
         int e_addr = add_addr(fd, 99, ip4(10, 9, 0, 9), 24);  /* ENODEV 19 */
-        printf("[nl] refusals: type-bridge=%d dup-name=%d addr-if99=%d "
-               "(want 95/17/19)\n", e_kind, e_dup, e_addr);
+        printf("[nl] kinds: vlan=%d bridge=%d(listed=%d) dup-name=%d "
+               "addr-if99=%d (want 95/0/1/17/19)\n",
+               e_kind, e_br, bx ? 1 : 0, e_dup, e_addr);
         /* "It failed" would be satisfied by a kernel that refuses everything,
          * including the things it is supposed to do. */
-        if (e_kind == 95 && e_dup == 17 && e_addr == 19) bits |= 1 << 5;
+        if (e_kind == 95 && e_br == 0 && bx && e_dup == 17 && e_addr == 19)
+            bits |= 1 << 5;
     }
 
     /* ---- bit6: RTM_DELLINK removes BOTH ends ---------------------------- */

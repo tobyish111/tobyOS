@@ -2281,3 +2281,159 @@ The new subtest is the one that carries this cut —
 host's`. It fails in two independent ways on a partial fix: with only the
 source address fixed the checksum still mismatches and the datagram is dropped,
 so "nothing arrived" and "arrived with the wrong source" are distinguishable.
+
+---
+
+## 25. Slice 12 cut 6 — ports, ROUTES, BRIDGE, and NAT (2026-08-12)
+
+**A container can reach the internet.** New: `src/bridge.c`, `src/nat.c`.
+Extended: `net_ns.c`, `net.c`, `ip.c`, `socket.c`, `tcp.c`, `veth.c`,
+`rtnetlink.c`, `nsproxy.h`, `net.h`, `ip.h`, the LXNS table. Four pieces, each
+gated before the next was started.
+
+### 1. THE PORT SPACE WAS GLOBAL — a cross-namespace data leak
+
+`sock_lookup_by_port` scanned the whole pool by port alone, so **a datagram
+arriving in one namespace was delivered to a socket bound in another** (first
+port match wins), and two namespaces could not both bind a port. The same was
+true of tcp.c's `conn_lookup`, `listen_lookup` and `port_in_use`.
+
+Delivery asks `net_current_ns()` (the receive context); a BIND asks the
+SOCKET's own namespace, which is what lets two namespaces hold one port and is
+also the namespace the later delivery will match against.
+
+The subtest asserts BOTH halves: both binds succeed AND the count on the wrong
+socket is zero. Asserting only the first would pass on a kernel that stopped
+checking collisions and then delivered to whichever socket it found first.
+
+### 2. A ROUTE TABLE, consulted first, old logic as the fallback
+
+Routing was "my subnet, else my gateway" — no way to say "10.99.0.0/24 is
+through THIS interface", which is exactly what a reply travelling back down to a
+container needs. Per-namespace table, longest prefix wins, and **a matching
+route names the OUTPUT INTERFACE** — the thing this stack could not previously
+say at all.
+
+Additive by construction: an empty table takes the identical old path, so eth0
+and DHCP are untouched. A connected route appears automatically from
+`ip addr add`, as on Linux. `RTM_NEWROUTE/DELROUTE/GETROUTE` are wired, and
+`ip route add default via X` (no `dev`) resolves its interface from the route to
+the GATEWAY, which is the form every real tool sends.
+
+Two details that would each have produced a silently wrong table: a DEFAULT
+route must carry **no RTA_DST** (or `ip` prints `0.0.0.0/0` and some parsers
+reject it), and `rtm_family` arrives as **AF_UNSPEC** from busybox, so refusing
+anything but AF_INET would fail the most ordinary route command there is.
+
+### 3. A BRIDGE that LEARNS
+
+`struct net_dev`'s vtable fit unchanged for the third time in this slice — a
+bridge is a device whose `tx` goes to its ports. Enslavement lives in the
+namespace's interface record (`master`), not in the device, because a device can
+move between namespaces and its master cannot follow it.
+
+**It learns source MACs.** Flooding everything is functionally correct — the
+wrong container discards it — and is also a way to leak every container's
+traffic to every other container. The subtest checks the unicast counter for
+exactly that reason: it is what separates a bridge from a hub, and the ARP
+assertion alone would pass on a hub.
+
+**The loop guard is not optional.** A port's `tx` is a veth end that may deliver
+to another port. Attaching both ends of one pair to one bridge — two ordinary
+`ip link set` commands — would recurse until the stack is gone. There is no
+spanning tree here, so a depth counter is the honest defence.
+
+### 4. FORWARDING + MASQUERADE
+
+The mapping table is the whole mechanism: on the way out rewrite the source
+address to the uplink's and substitute a port; on the way back look the port up
+and put the original address and port back.
+
+**The ORDER in ip_recv is the load-bearing part.** A reply to a masqueraded
+connection is addressed to the HOST'S OWN address — that is what masquerading
+means — so `ip_dst_is_for_us` is true for it, and a local-delivery-first stack
+hands a container's segment to the host's socket layer. The NAT table is
+therefore consulted BEFORE local delivery, and only a packet matching a live
+mapping is taken.
+
+The reverse lookup matches on the peer address as well as the translated port,
+so a host on the internet cannot inject into a container by guessing a port.
+
+Limits, stated: **masquerade only** (no DNAT, no inbound port forwarding, no
+filtering — there is no iptables here); **enabling it is a kernel call**,
+because this kernel has no `/proc/sys` at all, so a userspace runtime cannot
+turn forwarding on; **fragments are dropped rather than forwarded untranslated**
+(only the first carries the ports a mapping is keyed on, and forwarding the rest
+with the container's source address would leak an unroutable address onto the
+wire); TCP state is not tracked, so a mapping expires on a timer.
+
+### The test that carries this cut, and why it checks both ends
+
+"The internet" is a third namespace behind an uplink veth, so the round trip is
+deterministic and needs no real network:
+
+```
+world saw 192.168.50.1:50000 (NOT the container's 10.77.0.2),
+and the reply came back to the container from 192.168.50.2  [out=1 in=1 maps=1]
+```
+
+Asserting only "it arrived" would pass on a stack that forwarded the
+container's unroutable source address straight onto the wire — which works
+perfectly on this fake wire and vanishes on a real one. Asserting only the
+outbound half would miss the mapping table entirely, which is the half that
+exists so the reply is not eaten by the host's own socket layer.
+
+The ARP caches are warmed first, deliberately: a forwarded packet has no sender
+to retry on its behalf, so the first datagram to a cold next hop is legitimately
+dropped. Testing that as a failure would be testing ARP, not NAT.
+
+### A TEST CAUGHT ITS OWN OBSOLESCENCE, which is the system working
+
+`/bin/linux-netlink` bit5 asserted `ip link add type bridge` -> EOPNOTSUPP. The
+moment bridges landed the gate went RED with `type-bridge=0` against a wanted
+95. That is not a false alarm — it is an assertion noticing that a documented
+refusal had become a supported feature. It now checks the opposite (bridge
+SUCCEEDS and is listed) and uses `vlan` for the kind this kernel genuinely does
+not have. **Keeping both in one bit is deliberate:** a kernel that ignored
+IFLA_INFO_KIND entirely fails one of them whichever way it guessed.
+
+### Method note
+
+The `until grep ... logs/lxnet.log` loop I used to wait for a verdict read the
+PREVIOUS run's log — the gate deletes it only just before starting QEMU, so for
+the first minute the old one is still there and still says PASS. The handoff's
+"never reuse a log filename across runs" law is about exactly this, and the
+reuse is inside the gate script itself. Wait on the RUNNER, not on the log.
+
+### A GATE THAT FAILED SILENTLY BY PRODUCING NO OUTPUT AT ALL
+
+`logs/realcurl.sh` came back with its REALCURL section EMPTY -- no verdict line,
+no error, nothing between the header and the fault check. The log showed why:
+
+```
+limine: Loading module `boot():/boot/initrd.tar`...
+PANIC: High memory allocator: Out of memory
+```
+
+A **BOOTLOADER** panic loading an ~826 MB initrd into a guest the script starts
+with `-m 512`. The kernel never ran, so nothing it could have printed appeared,
+and the script's "grep for the verdict" check reported that as an absence rather
+than a failure.
+
+`validate.sh` already carries this exact fix and a comment explaining it (`-m
+512` "was too small to boot the current ISO at all... which is how a bootloader
+panic came to be reported as a healthy boot"). realcurl.sh never got it. Raised
+to 5120 to match every other gate; it then passed with
+`http_code=200 size=559`.
+
+**Note honestly: this same script passed at `-m 512` earlier the same day, and
+that is unexplained.** 826 MB cannot fit in 512 MB, so the earlier pass is the
+anomaly, not this failure. It is recorded as unexplained rather than given a
+tidy story.
+
+### Gate state
+
+`bash logs/lxnet.sh` GREEN: **LXNETLINK 12/12**, LXVETH 6/6, **LXNS 21/21
+skipped=0** (`/bin/linux-netlink` 0xff, `[NSIP] n=2 a=1 e=0 z=1 d=1 u=2`,
+`[NSRT] conn=1 def=1`). `lxposix --full` **23/23** `enosys_gaps=0`. **REALCURL
+PASS**. defboot **3/3**.

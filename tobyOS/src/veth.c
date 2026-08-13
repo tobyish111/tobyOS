@@ -84,7 +84,16 @@ static void veth_deliver(struct veth_end *dst, const uint8_t *frame, size_t len)
      * Cut 5 passes the DEVICE too, not just the namespace: a namespace holding
      * two interfaces used to answer for its PRIMARY's address no matter which
      * end the frame came in on, so the second interface could never complete an
-     * ARP round trip for its own address. */
+     * ARP round trip for its own address.
+     *
+     * Cut 6: an ENSLAVED end has no stack of its own. Its frames go to the
+     * bridge, which decides whether to forward them to another port, deliver
+     * them up as the bridge's own, or both. Handing them to eth_recv_dev here
+     * instead would make the container's own stack answer for traffic that was
+     * meant to be switched. */
+    struct net_dev *master = net_ns_dev_master(dst->ns, &dst->dev);
+    if (master) { netns_bridge_input(master, &dst->dev, frame, len); return; }
+
     eth_recv_dev(frame, len, dst->ns, &dst->dev);
 }
 

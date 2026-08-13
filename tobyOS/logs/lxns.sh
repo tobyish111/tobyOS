@@ -64,7 +64,7 @@ grep -aq 'LXNS. VERDICT: PASS' "$LOG" || RC=1
 # worth stopping for.
 # 18 -> 20 with slice 12 cut 4: /bin/linux-netlink (the control plane, in C)
 # and a busybox `ip link add` witness.
-WANT_SUBTESTS=${WANT_SUBTESTS:-20}
+WANT_SUBTESTS=${WANT_SUBTESTS:-21}
 GOT=$(grep -a 'LXNS. VERDICT' "$LOG" | grep -o 'subtests=[0-9]*' | head -1 | cut -d= -f2)
 if [ -n "$GOT" ] && [ "$GOT" != "$WANT_SUBTESTS" ]; then
     echo "   !! LXNS ran $GOT subtests, expected $WANT_SUBTESTS -- a test that"

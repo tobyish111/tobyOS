@@ -260,11 +260,21 @@ static void conn_free(struct tcp_conn *c) {
     memset(c, 0, sizeof(*c));
 }
 
+/* CUT 6: every one of these matchers is scoped to a NAMESPACE.
+ *
+ * The four-tuple is only unique within one network namespace. Without this a
+ * segment arriving in one namespace could match -- and be delivered into -- a
+ * connection belonging to another, and two namespaces could not both listen on
+ * the same port. net_current_ns() is the receive context while a frame is being
+ * processed and the caller's namespace otherwise, which is exactly right for
+ * both the delivery and the bind cases. */
 static struct tcp_conn *conn_lookup(uint32_t rip, uint16_t rport,
                                      uint16_t lport) {
+    void *ns = net_current_ns();
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn *c = &g_conns[i];
         if (!c->in_use) continue;
+        if (c->net_ns != ns) continue;
         if (c->remote_ip_be != rip || c->remote_port_be != rport ||
             c->local_port_be != lport)
             continue;
@@ -274,9 +284,10 @@ static struct tcp_conn *conn_lookup(uint32_t rip, uint16_t rport,
 }
 
 static struct tcp_conn *listen_lookup(uint16_t local_port_be) {
+    void *ns = net_current_ns();
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn *c = &g_conns[i];
-        if (c->in_use && c->state == TCP_LISTEN &&
+        if (c->in_use && c->net_ns == ns && c->state == TCP_LISTEN &&
             c->local_port_be == local_port_be)
             return c;
     }
@@ -284,8 +295,10 @@ static struct tcp_conn *listen_lookup(uint16_t local_port_be) {
 }
 
 static bool port_in_use(uint16_t port_be) {
+    void *ns = net_current_ns();
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
-        if (g_conns[i].in_use && g_conns[i].local_port_be == port_be)
+        if (g_conns[i].in_use && g_conns[i].net_ns == ns &&
+            g_conns[i].local_port_be == port_be)
             return true;
     }
     return false;

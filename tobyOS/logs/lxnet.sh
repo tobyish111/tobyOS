@@ -33,9 +33,9 @@ FLAGS="-DFAST_BOOT -DQUICK_BOOT -DLXNETLINK_BOOT -DLXVETH_BOOT -DLXNS_BOOT"
 LOG=logs/lxnet.log
 TIMEOUT=300
 
-WANT_NETLINK=${WANT_NETLINK:-8}
+WANT_NETLINK=${WANT_NETLINK:-12}
 WANT_VETH=${WANT_VETH:-6}
-WANT_NS=${WANT_NS:-20}
+WANT_NS=${WANT_NS:-21}
 
 MK=(make "CC=TMP='C:\\t' TEMP='C:\\t' clang" "HOST_CC=TMP='C:\\t' TEMP='C:\\t' gcc")
 
@@ -61,7 +61,8 @@ fi
 python -c "
 d = open('tobyos.bin','rb').read()
 need = [b'[LXNETLINK] ==== the rtnetlink control plane',
-        b'[NSIP] n=']
+        b'[NSIP] n=',
+        b'[NSRT] conn=']
 missing = [m for m in need if m not in d]
 for m in missing:
     print('missing marker:', m.decode())
@@ -81,7 +82,7 @@ timeout "$TIMEOUT" "/c/Program Files/qemu/qemu-system-x86_64.exe" \
 
 echo
 echo "== gate"
-grep -a 'LXNETLINK\|LXVETH\|LXNS\|\[nl\]\|\[NSIP\]\|\[veth\]\|\[netns\]' "$LOG" \
+grep -a 'LXNETLINK\|LXVETH\|LXNS\|\[nl\]\|\[NSIP\]\|\[NSRT\]\|\[veth\]\|\[netns\]' "$LOG" \
     | sed 's/^\[[0-9 ]*ms\] //' | head -80
 
 RC=0
