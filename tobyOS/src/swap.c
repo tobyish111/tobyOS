@@ -6,6 +6,34 @@
  * partition on disk. Each swap slot holds one 4KB page (8 sectors).
  * The slot table is a simple flat array; slot allocation is O(N) scan
  * which is acceptable for the 4096-slot budget.
+ *
+ * ---- STATUS: THERE IS NO PAGE RECLAIM. READ THIS BEFORE TRUSTING SWAP ----
+ *
+ * The swap-IN half is real and wired: page_fault.c case 2.5 decodes a
+ * PTE_SWAPPED entry and calls swap_in(), and that path works.
+ *
+ * The swap-OUT half has NO PRODUCTION CALLER. swap_out()'s only callers are
+ * zram.c's self-test. Nothing in this kernel ever selects a victim page,
+ * writes it here, and rewrites the PTE -- so no page is ever evicted, and
+ * case 2.5 in the fault handler is unreachable outside that self-test.
+ * Physical memory pressure is therefore handled by the OOM killer (oom.c,
+ * called from pid 0's idle loop) and by nothing else.
+ *
+ * Why reclaim was NOT bolted on when the OOM killer was wired: evicting a
+ * page means clearing a live PTE and returning the frame to the PMM, and
+ * mmap.c documents at length what that path actually requires --
+ *   - the frame must NOT reach the PMM until a TLB shootdown has been ACKED
+ *     (see mmap_free_batch / g_tlbq; getting this wrong is the measured
+ *     corruption where chrome's renderer read JSON bytes through a stale
+ *     translation where a pointer belonged),
+ *   - unacked shootdowns must quarantine rather than free,
+ *   - a CoW-shared frame (page_ref_get > 1) must never be evicted via one
+ *     mapping, or the other address space is left pointing at a free frame,
+ *   - the owner's cgroup charge must be reversed exactly once.
+ * A reclaim engine that gets any of those wrong fails as silent memory
+ * corruption, not as a red gate. It needs its own slice and its own stress
+ * harness, reusing mmap.c's batch/quarantine machinery rather than inventing
+ * a second teardown sequence.
  */
 
 #include <tobyos/swap.h>

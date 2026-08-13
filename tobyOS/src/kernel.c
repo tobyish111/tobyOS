@@ -117,6 +117,7 @@
 #include <tobyos/clipboard.h>
 #include <tobyos/abi/abi.h>
 #include <tobyos/swap.h>
+#include <tobyos/oom.h>
 #include <tobyos/page_fault.h>
 #include <tobyos/bcache.h>
 
@@ -860,6 +861,39 @@ static __attribute__((noreturn)) void idle_loop(void) {
         if (!gui_active())
             console_tick(pit_ticks(), hz);
         acpi_m22_selftest_tick();
+
+        /* Global OOM check.
+         *
+         * oom.c was written with a working killer and NEVER CALLED: oom_init()
+         * had no caller, so g_oom_initialized stayed false, and oom_check()
+         * -- which returns early on exactly that flag -- had no caller either.
+         * Physical exhaustion therefore had no recovery path at all: every
+         * allocator just returned 0 and each caller failed in its own way.
+         *
+         * HERE, and not at the allocation failure itself, even though that is
+         * where oom.h says it belongs and where Linux does it: the demand-fault
+         * path runs pmm_alloc_page() BKL-FREE (see the deferred-free comment in
+         * mmap.c), and oom_kill() enqueues onto the run queue. Calling the
+         * scheduler from a BKL-free fault is the shape of race this kernel has
+         * repeatedly had to hunt down. pid 0's idle loop is BKL-held process
+         * context that always runs, which makes this the safe site.
+         *
+         * The cost of that choice, stated: recovery is reactive rather than
+         * immediate. A burst that exhausts memory between two checks still
+         * fails the allocation -- what this fixes is SUSTAINED pressure (the
+         * leaking or greedy process), which is the case that previously wedged
+         * the machine with no way out.
+         *
+         * Rate-limited to ~1 Hz: oom_check() is two counter reads and bails
+         * unless free memory is under 1%, but this loop spins hot. */
+        {
+            static uint64_t last_oom_tick;
+            uint64_t oom_now = pit_ticks();
+            if (oom_now - last_oom_tick >= (uint64_t)hz) {
+                last_oom_tick = oom_now;
+                oom_check();
+            }
+        }
         bkl_exit();
 
         /* Drain any queued serial bytes without spinning. The THRE IRQ
@@ -3734,6 +3768,7 @@ void _start(void) {
     cgroup_init();           /* Slice 15: cgroup v2 hierarchy */
     cgroup_mount();          /* ...and cgroupfs at /sys/fs/cgroup (nests in /sys) */
     aslr_init();             /* Phase 7 M7.1: address space layout randomization */
+    oom_init();              /* Phase 1: OOM killer -- see the idle-loop check */
     hardening_init();        /* Phase 7 M7.2: SMEP/SMAP/NX enforcement */
     page_fault_init();       /* Phase 1: COW + demand paging refcounts + vm_spaces */
     aml_interp_init();       /* Phase 4: AML namespace + interpreter */
