@@ -118,6 +118,7 @@
 #include <tobyos/abi/abi.h>
 #include <tobyos/swap.h>
 #include <tobyos/oom.h>
+#include <tobyos/mmap.h>   /* mem_reclaim_pages + reclaim_stat_* */
 #include <tobyos/page_fault.h>
 #include <tobyos/bcache.h>
 
@@ -891,6 +892,23 @@ static __attribute__((noreturn)) void idle_loop(void) {
             uint64_t oom_now = pit_ticks();
             if (oom_now - last_oom_tick >= (uint64_t)hz) {
                 last_oom_tick = oom_now;
+                /* RECLAIM BEFORE KILLING. oom_check() only fires under 1%
+                 * free; reclaim starts at 5%, so the cheap response (evict
+                 * cold anonymous pages to swap) gets a chance before the
+                 * expensive one (destroy a process). If reclaim frees
+                 * nothing -- no swap configured, or no eligible victim --
+                 * oom_check still runs and the behaviour is exactly what it
+                 * was before reclaim existed. */
+                size_t total = pmm_total_pages();
+                size_t freep = pmm_free_pages();
+#ifdef RECLAIM_BOOT
+                /* Harness build: evict unconditionally so the reclaim proof
+                 * does not depend on the machine actually running out of RAM.
+                 * Never on in a normal build. */
+                mem_reclaim_pages(256);
+#endif
+                if (total && (freep * 100 / total) < 5)
+                    mem_reclaim_pages(256);
                 oom_check();
             }
         }
@@ -9945,6 +9963,72 @@ void _start(void) {
                     (unsigned long long)((one * 4) / four),
                     (unsigned long long)(((one * 4 * 100) / four) % 100));
 #undef MC_NOW_MS
+    }
+#endif
+
+#ifdef RECLAIM_BOOT
+    /* Opt-in page-reclaim proof (EXTRA_CFLAGS+=-DRECLAIM_BOOT).
+     *
+     * /bin/reclaimtest maps 256 anonymous pages, fills them with a pattern
+     * derived from BOTH page index and byte offset, sleeps (which parks it in
+     * PROC_BLOCKED -- the only state reclaim evicts from), then verifies every
+     * byte. Three rounds, re-dirtying between each, so pages are evicted,
+     * faulted back, rewritten and evicted again.
+     *
+     * Under this flag the idle loop calls mem_reclaim_pages() UNCONDITIONALLY
+     * rather than waiting for real memory pressure (see g_reclaim_force), so
+     * the eviction actually happens during those sleep windows instead of
+     * depending on the machine running out of RAM.
+     *
+     * The verdict is the child's EXIT CODE, not the fact that it ran: 0 only
+     * if every byte of every round matched. A reclaim bug here is silent data
+     * corruption, so "it survived" would be exactly the wrong thing to assert.
+     * Checking proc_wait's return is deliberate -- an earlier harness in this
+     * tree ignored it and passed over a live bug. */
+    {
+        struct proc_spec spec = {
+            .path = "/bin/reclaimtest", .name = "reclaimtest",
+            .argc = 0, .argv = 0, .envc = 0, .envp = 0,
+        };
+        kprintf("[boot] RECLAIM: forcing eviction while /bin/reclaimtest sleeps\n");
+        bkl_enter();
+        int rp = proc_spawn(&spec);
+        /* Drive reclaim from HERE rather than from the idle loop. pid 0 is
+         * this harness; if it blocked in proc_wait it would never reach the
+         * idle loop's reclaim call, and the child would sleep through the
+         * whole test with nothing evicting anything -- a green run that
+         * proved nothing. Spin instead: yield (which drops and retakes the
+         * BKL, letting the child run) and evict on each pass until the child
+         * terminates. The bound is a safety net, not the exit condition. */
+        if (rp > 0) {
+            for (int i = 0; i < 200000; i++) {
+                struct proc *c = proc_lookup(rp);
+                if (!c || c->state == PROC_TERMINATED) break;
+                mem_reclaim_pages(256);
+                sched_yield();
+            }
+        }
+        int rc = (rp > 0) ? proc_wait(rp) : -1;
+        bkl_exit();
+        if (rp <= 0) {
+            kprintf("[RECLAIM] VERDICT: FAIL (spawn failed rp=%d)\n", rp);
+        } else if (rc != 0) {
+            kprintf("[RECLAIM] VERDICT: FAIL (child exit=%d)\n", rc);
+        } else {
+            kprintf("[RECLAIM] child exit=0; evicted=%lu faulted_back=%lu\n",
+                    (unsigned long)reclaim_stat_evicted(),
+                    (unsigned long)reclaim_stat_faulted_back());
+            /* A clean exit proves nothing if nothing was ever evicted -- that
+             * is the "green test that never ran" trap. Require real work. */
+            if (reclaim_stat_evicted() == 0)
+                kprintf("[RECLAIM] VERDICT: FAIL (no page was ever evicted -- "
+                        "the test proved nothing)\n");
+            else if (reclaim_stat_faulted_back() == 0)
+                kprintf("[RECLAIM] VERDICT: FAIL (nothing faulted back in -- "
+                        "the data was never re-read through swap)\n");
+            else
+                kprintf("[RECLAIM] VERDICT: PASS\n");
+        }
     }
 #endif
 

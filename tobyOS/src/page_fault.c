@@ -19,6 +19,8 @@
 #include <tobyos/panic.h>
 #include <tobyos/klibc.h>
 #include <tobyos/swap.h>
+#include <tobyos/cgroup.h>   /* swap-in must re-charge residency */
+#include <tobyos/mmap.h>     /* reclaim_stat_* live alongside mem_reclaim_pages */
 #include <tobyos/apic.h>     /* tlb_shootdown_remote */
 #include <tobyos/cgroup.h>   /* slice 16: the user-page charge funnel */
 
@@ -36,6 +38,12 @@
  * multi-GiB fork-churn footprint ever triggered (slice 38: ICU locale
  * strings appearing inside the browser's vulkan-loader heap). */
 static uint16_t *g_page_refcounts;
+
+/* Pages brought back from swap. Paired with reclaim_stat_evicted(): the
+ * reclaim harness requires BOTH to be non-zero, so a run that evicted nothing
+ * (or evicted but never faulted anything back) cannot report a pass. */
+static uint64_t g_swapin_count;
+uint64_t reclaim_stat_faulted_back(void) { return g_swapin_count; }
 static size_t    g_page_ref_slots;
 
 /* Per-process vm_space table, indexed by pid */
@@ -245,13 +253,24 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
     if (pte && !(*pte & PTE_PRESENT) && (*pte & PTE_SWAPPED)) {
         int slot = swap_decode_pte(*pte);
         if (slot >= 0) {
+            /* Charge BEFORE bringing the page back. Reclaim uncharged this
+             * page when it evicted it (mmap.c's free batch), so residency has
+             * to be paid for again here -- otherwise every evict/fault-back
+             * cycle ratchets the process's counter down and memory.max stops
+             * meaning anything. Refusal is a fault failure, which is the same
+             * way memory.max is enforced on every other allocating fault. */
+            if (!mm_user_page_charge_existing(p))
+                return false;
             uint64_t new_phys;
             if (swap_in(slot, &new_phys) == 0) {
                 *pte = new_phys | PTE_PRESENT | PTE_USER | PTE_WRITABLE;
                 page_ref_inc(new_phys);
                 invlpg(page_va);
+                g_swapin_count++;
                 return true;
             }
+            /* Page did not come back -- do not keep the charge. */
+            mm_user_page_uncharge_existing(p);
         }
         return false;
     }

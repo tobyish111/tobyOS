@@ -27,7 +27,11 @@
 #include <tobyos/sched.h>
 #include <tobyos/mmap.h>
 #include <tobyos/page_fault.h>
+#include <tobyos/swap.h>
+#include <tobyos/oom.h>
 #include <tobyos/apic.h>     /* tlb_shootdown_remote */
+
+extern struct proc g_proc[];   /* reclaim scans for eviction candidates */
 
 /* ---- VMA definitions ---- */
 
@@ -579,6 +583,196 @@ static void mmap_free_batch_push(struct mmap_free_batch *b, uint64_t phys) {
     if (b->n == MMAP_FREE_BATCH) mmap_free_batch_flush(b);
     b->phys[b->n++] = phys;
     cgroup_mem_uncharge(b->owner, 1);           /* slice 16 */
+}
+
+/* ---- page reclaim: evict private-anonymous pages to swap ----------------
+ *
+ * This lives in mmap.c ON PURPOSE. Eviction ends in "clear a live PTE and
+ * return the frame to the PMM", which is the single most invariant-laden
+ * operation in this kernel:
+ *   - the frame must not reach the PMM until a TLB shootdown has been ACKED
+ *     (mmap_free_batch / g_tlbq above -- the measured corruption where a
+ *     chrome renderer read JSON bytes through a stale translation),
+ *   - unacked shootdowns must quarantine rather than free,
+ *   - a CoW-shared frame must never be dropped through one mapping,
+ *   - the owner's cgroup charge must be reversed exactly once.
+ * Writing a second teardown sequence elsewhere would mean re-deriving all
+ * four. Instead this reuses mmap_free_batch_push/flush verbatim, so eviction
+ * and munmap free frames through the same audited path.
+ *
+ * ORDERING is what makes a concurrent fault safe. Per page:
+ *   1. swap_out() copies the bytes out FIRST,
+ *   2. then one aligned 64-bit store turns the PTE from present into a
+ *      PTE_SWAPPED entry -- a racing reader sees either the old present PTE
+ *      or the new swap entry, never a torn value, and both are handled
+ *      (page_fault.c case 2.5 brings it back),
+ *   3. the frame goes to the batch, so it is not reusable until after a
+ *      shootdown -- which is what makes a stale-TLB read harmless.
+ *
+ * ELIGIBILITY is deliberately narrow. Anything not obviously safe is skipped
+ * rather than handled, because the failure mode here is silent corruption
+ * rather than a red gate:
+ *   - PROC_BLOCKED only: the victim is parked in the kernel, not executing.
+ *   - never the caller, never an OOM-protected pid (0/1/login).
+ *   - sole owner of its mm (no threads, no share-until-exec peer), so the
+ *     batch's `owner` is unambiguously the charge target.
+ *   - private + anonymous VMAs only: file-backed and MAP_SHARED pages have a
+ *     second source of truth, and NOFREE (memfd/shm) frames are owned
+ *     elsewhere.
+ *   - page_ref_get(phys) > 1 is skipped: a CoW-shared frame is still mapped
+ *     by another address space whose PTE this loop cannot see.
+ *
+ * Returns the number of pages evicted. */
+static bool reclaim_candidate(struct proc *p, struct proc *self, int *key_out) {
+    if (!p || p == self) return false;
+    /* THE VICTIM MUST NOT BE EXECUTING. This is a CORRECTNESS requirement of
+     * the eviction order above, not conservatism, and it is the single biggest
+     * limitation of this reclaim implementation.
+     *
+     * swap_out() COPIES the page and only then is the PTE flipped. If the
+     * victim is running on another CPU it can write to the page after the copy
+     * has read it: the write lands in a frame that is about to be freed, the
+     * swapped copy is stale, and the process silently loses data when the page
+     * faults back. No amount of TLB discipline fixes that -- the write never
+     * faults, because the page is still present and writable while we copy.
+     *
+     * Linux's order is unmap -> shootdown -> copy, so no write can occur once
+     * the copy begins. Doing that here needs a "swap in progress" PTE state
+     * that the fault path blocks on (Linux uses the page lock); this kernel
+     * has no such primitive, and inventing one is a bigger change than
+     * reclaim itself. Until then: only evict from a process that is provably
+     * not running, where copy-then-unmap is safe.
+     *
+     * Consequence worth knowing: on a busy SMP box this finds fewer victims
+     * than Linux would. It fires for idle/blocked processes -- which is the
+     * common shape under memory pressure -- and skips hot ones. */
+    if (p->state != PROC_READY && p->state != PROC_BLOCKED) return false;
+    if (oom_is_protected(p->pid)) return false;
+    if (p->on_cpu) return false;
+    if (!p->cr3) return false;
+
+    int key = proc_mm_pid(p);
+    if (key != p->pid) return false;      /* a thread -- leave the group alone */
+
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q == p) continue;
+        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+            q->state == PROC_TERMINATED) continue;
+        if (proc_mm_pid(q) == key) return false;   /* shares this mm */
+    }
+    *key_out = key;
+    return true;
+}
+
+/* Lifetime counters. The harness asserts BOTH are non-zero: a reclaim test
+ * whose child exits 0 having never evicted a page proves nothing, and one that
+ * evicted pages but never faulted any back never exercised swap-in. */
+static uint64_t g_reclaim_evicted;
+uint64_t reclaim_stat_evicted(void) { return g_reclaim_evicted; }
+
+int mem_reclaim_pages(int want) {
+    if (want <= 0) return 0;
+    struct proc *self = current_proc();
+    int reclaimed = 0;
+
+    for (int i = 0; i < PROC_MAX && reclaimed < want; i++) {
+        struct proc *p = &g_proc[i];
+        int key = 0;
+        if (!reclaim_candidate(p, self, &key)) {
+#ifdef RECLAIM_BOOT
+            /* Bring-up only: name why each live proc was rejected. "Nothing
+             * was evicted" is otherwise indistinguishable from "the filter
+             * silently excluded everything". */
+            static int rej_logs;
+            if (p && p != self && p->state != PROC_UNUSED &&
+                p->state != PROC_EMBRYO && p->state != PROC_TERMINATED &&
+                rej_logs < 24) {
+                rej_logs++;
+                kprintf("[reclaim?] pid=%d name=%s state=%d on_cpu=%d cr3=%lx "
+                        "mmkey=%d prot=%d\n",
+                        p->pid, p->name, (int)p->state, (int)p->on_cpu,
+                        (unsigned long)p->cr3, proc_mm_pid(p),
+                        (int)oom_is_protected(p->pid));
+            }
+#endif
+            continue;
+        }
+
+        struct vma_table *vt = &g_vma_tables[key];
+        struct mmap_free_batch fb = { .n = 0, .owner = p };
+        bool swap_exhausted = false;
+
+        for (int vi = 0; vi < vt->count && reclaimed < want && !swap_exhausted;
+             vi++) {
+            struct mmap_vma *v = &vt->entries[vi];
+            /* Anonymous, no backing object, not owned elsewhere.
+             *
+             * v->fd < 0 is the load-bearing test, NOT the SHARED flag:
+             * sys_mmap stores `flags | VMA_FLAG_ANON` -- the caller's RAW
+             * bits -- and libtoby's user-facing MAP_PRIVATE (0x02) collides
+             * with the kernel's VMA_FLAG_SHARED (0x02), while its
+             * MAP_ANONYMOUS (0x04) collides with VMA_FLAG_PRIVATE. So on the
+             * native path those two flag bits mean nothing reliable. (Only
+             * sys_mmap2 translates properly; the mismatch is harmless today
+             * because sys_mmap force-ORs ANON and nothing consumes
+             * SHARED/PRIVATE there, but it must not be leaned on here.)
+             *
+             * Sharing safety comes from the refcount below instead, which is
+             * the property that actually matters. */
+            if (!(v->flags & VMA_FLAG_ANON)) continue;
+            if (v->flags & VMA_FLAG_NOFREE) continue;   /* memfd/shm-owned */
+            if (v->fd >= 0) continue;                   /* file-backed */
+
+            for (uint64_t a = v->start; a < v->end && reclaimed < want;
+                 a += PAGE_SIZE) {
+                uint64_t *pte = get_pte(p->cr3, a);
+                if (!pte || !(*pte & PTE_PRESENT)) continue;
+                /* A CoW-marked PTE is the one present-page case where the
+                 * BKL-free fault path WRITES the entry (cow_copy_page installs
+                 * a fresh frame). Evicting it concurrently would race that
+                 * store and lose whichever write landed second. Skip; it
+                 * becomes eligible once the CoW is broken. */
+                if (*pte & PTE_COW) continue;
+                /* PTE_ADDR_MASK (bits 12..51), NOT this file's PAGE_MASK.
+                 * PAGE_MASK is ~0xFFF, so it keeps bit 63 (NX) and the
+                 * software bits 52..62 that every non-executable user PTE
+                 * carries. Using it here produced "physical addresses" like
+                 * 0x8000000001803000, and pmm_phys_to_virt() of that is a
+                 * NON-CANONICAL pointer -- swap_out's memcpy took a #GP and
+                 * panicked the kernel. munmap avoids this by starting from
+                 * vmm_translate() rather than a raw PTE; reading the PTE
+                 * directly means masking it properly. */
+                uint64_t phys = *pte & PTE_ADDR_MASK;
+                if (!phys) continue;
+
+                /* refs > 1 => another address space maps this frame and its
+                 * PTE is not visible from here. refs == 0 is a freshly
+                 * mapped page that was never page_ref_inc'd -- the same case
+                 * munmap handles by freeing without a dec. Mirror munmap's
+                 * handling exactly rather than inventing a variant. */
+                int refs = page_ref_get(phys);
+                if (refs > 1) continue;
+
+                int slot = swap_out(phys, p->pid, a);
+                if (slot < 0) { swap_exhausted = true; break; }
+
+                *pte = swap_encode_pte(slot);           /* step 2 */
+                if (refs == 1) page_ref_dec(phys);
+                mmap_free_batch_push(&fb, phys);        /* uncharges */
+                reclaimed++;
+            }
+        }
+        mmap_free_batch_flush(&fb);      /* shootdown, THEN free */
+        if (swap_exhausted) break;       /* no slots left; stop entirely */
+    }
+
+    if (reclaimed) {
+        g_reclaim_evicted += (uint64_t)reclaimed;
+        kprintf("[reclaim] evicted %d page(s) to swap (total %lu)\n",
+                reclaimed, (unsigned long)g_reclaim_evicted);
+    }
+    return reclaimed;
 }
 
 /* ---- munmap ---- */

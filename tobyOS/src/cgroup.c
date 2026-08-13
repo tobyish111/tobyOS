@@ -387,6 +387,28 @@ void mm_user_page_free(struct proc *p, uint64_t phys) {
     cgroup_mem_uncharge(mm_charge_target(p), 1);
 }
 
+/* ---- accounting-only halves of the funnel, for pages that change RESIDENCY
+ * without being allocated or freed here: swap.
+ *
+ * Reclaim evicts a resident page to swap and hands the frame to mmap.c's
+ * deferred-free batch, which uncharges. The swap-IN that brings it back
+ * allocates through swap_in() -> pmm_alloc_page() directly, which is NOT the
+ * funnel -- so without a matching charge, every evict/fault-back cycle would
+ * ratchet the process's counter permanently DOWN. memory.current would
+ * under-report, the invariant `mem_pages == sum of member p->user_pages` would
+ * break, and a process could sit above memory.max forever by cycling pages
+ * through swap.
+ *
+ * These resolve the same mm-owner target as the rest of the funnel, so a
+ * threaded process still charges its leader. */
+bool mm_user_page_charge_existing(struct proc *p) {
+    return cgroup_mem_charge(mm_charge_target(p), 1);
+}
+
+void mm_user_page_uncharge_existing(struct proc *p) {
+    cgroup_mem_uncharge(mm_charge_target(p), 1);
+}
+
 /* Bulk uncharge at process teardown. The process's OWN counter is the source of
  * truth, so this cannot leave the cgroup counter behind however the pages were
  * freed -- including paths that free the whole user half in one walk. */

@@ -42,6 +42,20 @@ long sys_brk2(uint64_t new_brk);
 void mmap2_init_proc(int pid);
 void mmap2_cleanup_proc(int pid);
 
+/* Page reclaim: evict up to `want` private-anonymous pages to swap, returning
+ * how many were actually evicted. Implemented in mmap.c so it reuses the same
+ * shootdown-before-free batch as munmap; see the comment there for the
+ * eligibility rules (BLOCKED, sole mm owner, private+anon, refcount 1).
+ * Safe to call with no swap configured -- it simply reclaims 0. */
+int mem_reclaim_pages(int want);
+
+/* Lifetime reclaim counters, for harnesses that must prove work actually
+ * happened rather than trusting a green exit code. evicted: pages written to
+ * swap by mem_reclaim_pages. faulted_back: pages brought back by the swap-in
+ * arm of the fault handler. */
+uint64_t reclaim_stat_evicted(void);
+uint64_t reclaim_stat_faulted_back(void);
+
 /* COW clone for fork: duplicate parent's VMA table into child,
  * marking writable regions as COW. Returns 0 on success. */
 int mmap2_cow_clone(int parent_pid, int child_pid);

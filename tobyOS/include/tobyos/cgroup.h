@@ -107,6 +107,13 @@ uint64_t mm_user_page_alloc(struct proc *p);
 void     mm_user_page_free(struct proc *p, uint64_t phys);
 /* Bulk release at teardown, using the process's own counter as source of truth. */
 void     mm_user_pages_release_all(struct proc *p);
+/* Accounting-only halves, for pages whose RESIDENCY changes without an
+ * allocation or free happening here -- i.e. swap. Reclaim's eviction uncharges
+ * via mmap.c's free batch; the swap-in fault must charge back through
+ * mm_user_page_charge_existing or the counter ratchets down forever. Returns
+ * false when the charge would exceed memory.max, exactly like a normal fault. */
+bool     mm_user_page_charge_existing(struct proc *p);
+void     mm_user_page_uncharge_existing(struct proc *p);
 
 bool     cgroup_mem_charge(struct proc *p, uint64_t pages);
 void     cgroup_mem_uncharge(struct proc *p, uint64_t pages);
