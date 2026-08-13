@@ -718,6 +718,52 @@ long sys_fork(void) {
     return child->pid;  /* parent gets child PID */
 }
 
+/* Drop the VMA bookkeeping describing the image execve just replaced.
+ *
+ * execve builds a brand-new PML4 and destroys the old one, but nothing ever
+ * cleared g_vma_tables[]. The entries describing the PREVIOUS image survived
+ * into the new one, where mmap_handle_page_fault would happily service a
+ * demand fault against one -- faulting a zero page into an address the new
+ * image never mapped. (The reap-side half of this same leak is fixed in
+ * proc_reap; this is the exec-side half.)
+ *
+ * CALL THIS ONLY AFTER vfork_child_done(). A share-until-exec child has
+ * mm_owner pointing at its PARENT, so proc_mm_pid() would return the parent's
+ * key and this would wipe the PARENT's live table. vfork_child_done clears
+ * mm_owner precisely because "after exec the child owns a private mm", so
+ * ordering this after it is what makes the key correct.
+ *
+ * TWO GUARDS, because execve here does not implement Linux's "exec kills the
+ * other threads in the group":
+ *   1. mmkey != p->pid  =>  p is a THREAD exec'ing (key is its tgid). Its
+ *      siblings still run in that address space; leave their table alone.
+ *   2. another live proc shares the key  =>  p is a group LEADER exec'ing
+ *      with threads still alive. Same reasoning.
+ * Both are skipped-and-logged rather than silently ignored. (In case 2 those
+ * siblings are already in serious trouble -- the caller destroys old_pml4 out
+ * from under them -- but that is a separate pre-existing bug, and making this
+ * function the place it finally bites would be the wrong trade.) */
+static void exec_release_vma_table(struct proc *p) {
+    int mmkey = proc_mm_pid(p);
+    if (mmkey != p->pid) {
+        kprintf("[execve] pid=%d is a thread (mm key=%d); leaving the group's "
+                "VMA table intact\n", p->pid, mmkey);
+        return;
+    }
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q == p) continue;
+        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+            q->state == PROC_TERMINATED) continue;
+        if (proc_mm_pid(q) == mmkey) {
+            kprintf("[execve] pid=%d still shares its mm key with pid=%d; "
+                    "leaving the VMA table intact\n", p->pid, q->pid);
+            return;
+        }
+    }
+    mmap_cleanup_proc(mmkey);
+}
+
 /* ===================================================================
  * sys_fork_share -- vfork / chrome LaunchProcess semantics.
  *
@@ -1214,6 +1260,8 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
     vmm_set_editor_root(old_editor);
     if (p->vfork_parent > 0)
         vfork_child_done(p);
+    /* After vfork_child_done, so the mm key is this process's own. */
+    exec_release_vma_table(p);
     if (old_pml4 != new_pml4 && p->owns_pml4) {
         vmm_destroy_user_pml4(old_pml4);
     }
@@ -1678,6 +1726,9 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
      * now that we have a private address space. */
     if (p->vfork_parent > 0)
         vfork_child_done(p);
+
+    /* After vfork_child_done, so the mm key is this process's own. */
+    exec_release_vma_table(p);
 
     /* Destroy the old PML4 now that we're on the new one. */
 #ifdef CHROMIUM_BOOT
