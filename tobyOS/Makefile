@@ -31,6 +31,25 @@ OVMF_CODE     := build/ovmf-code.fd
 OVMF_VARS     := build/ovmf-vars.fd
 OVMF_VARS_SZ  := 540672
 
+# Header dependency tracking. -MMD writes a `.d` beside every object listing
+# the headers that object actually included; -MP adds a phony target for each
+# of those headers so DELETING one does not wedge the build with "No rule to
+# make target". The generated files are pulled in by the `-include` near the
+# bottom of this file.
+#
+# Why this exists: before it, `src/%.o` depended on $(HEADERS), which is
+# `include/tobyos/*.h` -- ONE directory level. `include/tobyos/abi/abi.h` (the
+# entire Linux ABI) was not in that glob, and libtoby/ and programs/ had no
+# header prerequisites AT ALL. That is the mechanical cause of the two rules
+# this tree carried by hand: "struct proc grows => make clean" and "struct
+# tk_window grew => touch all program sources". Both are now the build's job.
+#
+# The $(HEADERS) prerequisite is deliberately KEPT below: on the first build
+# after this change no .d files exist yet, and stale objects from before it
+# would otherwise never notice a header edit. It costs a full kernel rebuild
+# when a top-level header is touched -- exactly the old behaviour, no worse.
+DEPFLAGS := -MMD -MP
+
 CFLAGS := --target=x86_64-elf \
           -Iinclude \
           -Ithird_party/monocypher-4.0.2/src \
@@ -39,7 +58,7 @@ CFLAGS := --target=x86_64-elf \
           -fno-unwind-tables -fno-asynchronous-unwind-tables \
           -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
           -mcmodel=kernel \
-          -nostdlib -O2 -Wall -Wextra -std=c11
+          -nostdlib -O2 -Wall -Wextra -std=c11 $(DEPFLAGS)
 
 # Faster default boot: shorter DHCP budget, quicker ARP pre-warm, and
 # no inline example.com DNS+TCP+HTTP smoke in kmain (that alone can add
@@ -785,7 +804,7 @@ USER_CFLAGS := --target=x86_64-elf \
                -ffreestanding -fno-stack-protector -fno-pie -fno-pic \
                -fno-unwind-tables -fno-asynchronous-unwind-tables \
                -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
-               -nostdlib -O2 -Wall -Wextra -std=c11
+               -nostdlib -O2 -Wall -Wextra -std=c11 $(DEPFLAGS)
 
 programs/hello/hello.o: programs/hello/main.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -2485,6 +2504,34 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_edit,user_gui_edit))
 #
 # The .gitkeep file in initrd/bin/ is excluded -- it only exists so
 # the bin/ directory survives in source control.
+#
+# MODES ARE FORCED AT TAR TIME, in two passes, because the host filesystem
+# cannot carry them: this tree is built under MSYS on Windows, where
+# `chmod 755` on a staged file is silently a no-op (verified -- `ls -l`
+# still reports 0644 afterwards). Every binary was therefore tar'd as 0644
+# owned by the BUILD USER, and src/ramfs.c papered over that by reporting a
+# fabricated 00444 for every file and 00555 for every directory, ignoring
+# the header entirely. ramfs now reads the real header, so the header has to
+# be true:
+#   pass 1 (-c)  bin/ + lib/ + $$EXTRA_FILES -> 0755 root:root -- executables,
+#                shared objects, and the staged chrome/alpine trees
+#   pass 2 (-r)  etc/ + repo/ + system/ + m36/ + readme.txt -> 0644 root:root
+# --numeric-owner keeps this working on a host with no `root` account.
+#
+# The two passes MUST NOT OVERLAP: ramfs's find_node() returns the FIRST
+# matching entry, so a path present in both passes would silently resolve to
+# whichever mode was archived first. If you add a file here, put it in
+# exactly one list. `tar -tf` before and after should differ only in modes.
+#
+# KNOWN OVER-APPROXIMATION, stated rather than hidden: $$EXTRA_FILES is whole
+# staged TREES (opt/chrome, the alpine rootfs, the OCI bundle, usr/, lib64/),
+# and the host cannot tell their binaries from their data -- everything in
+# them lands on disk 0644, chrome-headless-shell included. So pass 1 marks
+# that entire subtree 0755. Erring the other way would leave the actual
+# executables non-executable, which is the worse failure; the cost is that
+# e.g. opt/chrome/*.pak is reported executable. Files tobyOS itself builds
+# (bin/, lib/, etc/, repo/, ...) are exact -- this caveat is only the
+# opt-in third-party trees.
 
 $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-xdg-settings/linux-xdg-settings.elf \
@@ -3270,7 +3317,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    done; \
 	    echo "[initrd] chromium: staged managed policy PostQuantumKeyAgreementEnabled=false (disable X25519MLKEM768 PQ KEX -- tobyOS ML-KEM wall)"; \
 	fi; \
-	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
+	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
+	    --owner=0 --group=0 --numeric-owner -cf ../initrd.tar             \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
 	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest bin/av1test bin/aactest bin/wasmtest \
@@ -3308,11 +3356,6 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
-	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
-	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
-	    etc/Lato-BoldItalic.ttf etc/fallback.otf etc/emoji.ttf        \
-	    etc/DejaVuSerif.ttf etc/DejaVuSerif-Bold.ttf                  \
-	    etc/DejaVuSansMono.ttf etc/DejaVuSansMono-Bold.ttf            \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
@@ -3322,6 +3365,14 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
     bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
 	    lib/ld-toby.so lib/libtoby.so                                     \
+	    $$EXTRA_FILES                                                     \
+	  && tar --format=ustar --mode=0644 \
+	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
+	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
+	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
+	    etc/Lato-BoldItalic.ttf etc/fallback.otf etc/emoji.ttf        \
+	    etc/DejaVuSerif.ttf etc/DejaVuSerif-Bold.ttf                  \
+	    etc/DejaVuSansMono.ttf etc/DejaVuSansMono-Bold.ttf            \
 	    repo/helloapp.tpkg repo/helloapp_v2.tpkg                          \
 	    repo/helloapp_corrupt.tpkg repo/helloapp_badhash.tpkg             \
 	    repo/helloapp_nohash.tpkg  repo/helloapp_badfhash.tpkg            \
@@ -3334,7 +3385,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/audiotone.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
-	    readme.txt $$EXTRA_FILES
+	    readme.txt
 
 # ---------- Build ISO ----------
 #
@@ -4976,4 +5027,26 @@ clean:
 	       libtoby/libtoby.a libtoby/crt0.o $(LIBTOBY_OBJS) \
 	       libtoby/libtoby.so libtoby/Scrt0.o $(LDTOBY_OBJS) $(LDTOBY_SO) \
 	       programs/common/start.o $(LOGDIR)/net.pcap
+	@rm -f $(ALL_DEPS)
 	@echo "(disk.img preserved -- 'make wipe-disk' to reformat the persistent FS)"
+
+# ---------- Header dependency tracking ----------
+#
+# Every object is compiled with $(DEPFLAGS) (-MMD -MP, see the top of this
+# file), which drops a `.d` next to it naming the headers it really included.
+# Pull them all in so editing a header rebuilds exactly the objects that read
+# it -- including `include/tobyos/abi/abi.h` and everything under libtoby/ and
+# programs/, none of which had header prerequisites before.
+#
+# $(wildcard) is deliberate: it expands to only the .d files that EXIST, so a
+# clean tree (or a brand-new object with no .d yet) is not an error. The
+# per-header phony targets from -MP cover the delete-a-header case.
+ALL_DEPS := $(wildcard \
+    src/*.d \
+    $(LIBTOBY_SRC)/*.d \
+    programs/*/*.d \
+    third_party/*/*.d \
+    third_party/*/src/*.d \
+    third_party/*/src/*/*.d)
+
+-include $(ALL_DEPS)
