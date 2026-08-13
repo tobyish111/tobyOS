@@ -166,9 +166,11 @@ static size_t count_entries(const uint8_t *img, size_t size) {
         if (memcmp(h->magic, USTAR_MAGIC, 5) != 0) break;
         size_t fsize = parse_octal(h->size, sizeof(h->size));
         char tf = h->typeflag;
-        /* '0' / NUL = regular file, '5' = directory. Skip everything
-         * else (links, char/block dev, fifo, GNU extensions...). */
-        if (tf == '0' || tf == 0 || tf == '5') count++;
+        /* '0' / NUL = regular file, '5' = directory, '1' = hard link (see
+         * the resolver in the fill pass). Still skipped: '2' symlinks (the
+         * VFS has no readlink hook for a driver to implement), char/block
+         * devices, fifos, GNU extensions. */
+        if (tf == '0' || tf == 0 || tf == '5' || tf == '1') count++;
         off += USTAR_BLOCK + round_up_block(fsize);
     }
     return count;
@@ -210,12 +212,61 @@ int ramfs_mount(const void *image, size_t size) {
         char tf = h->typeflag;
         size_t data_off = off + USTAR_BLOCK;
 
-        if (tf == '0' || tf == 0 || tf == '5') {
+        if (tf == '0' || tf == 0 || tf == '5' || tf == '1') {
             struct ramfs_node *nd = &nodes[idx];
             if (!copy_name(h->name, nd->name, sizeof(nd->name))) {
                 kprintf("[ramfs] WARN: skipping entry with overlong name\n");
             } else if (nd->name[0] == 0) {
                 /* root entry "./" or similar -- skip silently */
+            } else if (tf == '1') {
+                /* Hard link ('1'): no data of its own -- `linkname` names an
+                 * entry that appeared EARLIER in the archive, so a single
+                 * forward pass can resolve it against what we have already
+                 * parsed. Share the target's bytes; sharing a pointer into
+                 * the tar image is exactly right, since a hard link IS the
+                 * same data under a second name and the image is read-only.
+                 *
+                 * The self-referential case (name == linkname) is not a real
+                 * link: GNU tar emits it when the SAME staged file is passed
+                 * more than once in one archive's member list, which this
+                 * build does via overlapping $EXTRA_FILES trees. The regular
+                 * entry is already in the table, so these are pure
+                 * duplicates -- drop them rather than add a shadowing node.
+                 * All 14 hard links in the current initrd are this case. */
+                char target[VFS_PATH_MAX];
+                if (!copy_name(h->linkname, target, sizeof(target))) {
+                    kprintf("[ramfs] WARN: hard link '%s' has an overlong "
+                            "target\n", nd->name);
+                } else if (strcmp(target, nd->name) == 0) {
+                    /* tar's duplicate-member dedup -- silently ignore. */
+                } else {
+                    struct ramfs_node *tgt = 0;
+                    for (size_t j = 0; j < idx; j++) {
+                        if (strcmp(nodes[j].name, target) == 0) {
+                            tgt = &nodes[j];
+                            break;
+                        }
+                    }
+                    if (!tgt) {
+                        /* Forward reference or a target we skipped. Warn --
+                         * silently dropping it is how a file goes missing
+                         * with no evidence. */
+                        kprintf("[ramfs] WARN: hard link '%s' -> '%s': target "
+                                "not found, entry dropped\n",
+                                nd->name, target);
+                    } else {
+                        nd->type = tgt->type;
+                        nd->data = tgt->data;
+                        nd->size = tgt->size;
+                        /* A hard link shares the inode, so it shares the
+                         * inode's mode and ownership too -- the link's own
+                         * header fields are not authoritative. */
+                        nd->mode = tgt->mode;
+                        nd->uid  = tgt->uid;
+                        nd->gid  = tgt->gid;
+                        idx++;
+                    }
+                }
             } else {
                 /* USTAR mode/uid/gid are ASCII octal. parse_octal returns 0
                  * for an unparseable field, and a 0 mode is indistinguishable
