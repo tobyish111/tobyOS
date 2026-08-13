@@ -58,7 +58,26 @@ struct ramfs_node {
     enum vfs_type type;
     const void   *data;                 /* file bytes (NULL for DIR) */
     size_t        size;                 /* 0 for DIR */
+    /* Ownership + permission bits, read from the USTAR header rather than
+     * fabricated. Before this, ramfs reported a FIXED 00444 for every file
+     * and 00555 for every directory at all three reporting sites (open,
+     * stat, readdir) -- so nothing in the initrd could be marked executable,
+     * setuid, or group-private, and `ls -l /bin` described a filesystem that
+     * did not exist. mode carries VFS_MODE_PERMS (07777), so setuid/setgid/
+     * sticky survive; execve reads S_ISUID from exactly this value. */
+    uint32_t      mode;
+    uint32_t      uid;
+    uint32_t      gid;
 };
+
+/* Fallbacks for a tar whose mode field is missing or unparseable. These are
+ * the OLD hardcoded values -- a malformed header degrades to the previous
+ * behaviour rather than producing a 00000-mode file nobody can open. */
+#define RAMFS_FALLBACK_FILE_MODE  00444u
+#define RAMFS_FALLBACK_DIR_MODE   00555u
+/* Synthesised parent directories (tar has "bin/hello" but no "bin/" entry)
+ * have no header to read a mode from, so they get the conventional 0755. */
+#define RAMFS_IMPLICIT_DIR_MODE   00755u
 
 struct ramfs_mount {
     const void          *image;
@@ -198,11 +217,25 @@ int ramfs_mount(const void *image, size_t size) {
             } else if (nd->name[0] == 0) {
                 /* root entry "./" or similar -- skip silently */
             } else {
+                /* USTAR mode/uid/gid are ASCII octal. parse_octal returns 0
+                 * for an unparseable field, and a 0 mode is indistinguishable
+                 * from that -- so treat 0 as "no usable mode" and fall back.
+                 * uid/gid legitimately ARE 0 (root), so they need no such
+                 * guard: an absent field simply reads as root, which is the
+                 * right answer for an initrd. */
+                uint32_t tmode = (uint32_t)parse_octal(h->mode, sizeof(h->mode));
+                nd->uid = (uint32_t)parse_octal(h->uid, sizeof(h->uid));
+                nd->gid = (uint32_t)parse_octal(h->gid, sizeof(h->gid));
+
                 if (tf == '5') {
                     nd->type = VFS_TYPE_DIR;
                     nd->data = 0;
                     nd->size = 0;
+                    nd->mode = tmode ? (tmode & VFS_MODE_PERMS)
+                                     : RAMFS_FALLBACK_DIR_MODE;
                 } else {
+                    nd->mode = tmode ? (tmode & VFS_MODE_PERMS)
+                                     : RAMFS_FALLBACK_FILE_MODE;
                     if (data_off + fsize > size) {
                         kprintf("[ramfs] reject: '%s' file data runs off "
                                 "image (%lu+%lu > %lu)\n",
@@ -292,11 +325,15 @@ static int ramfs_open(void *mnt, const char *path, struct vfs_file *out) {
     out->priv = nd;
     out->pos  = 0;
     out->size = nd->size;
-    /* ramfs is owned by root and world-readable but never writable;
+    /* The node's real identity, as recorded in the tar. Writability is NOT
+     * expressed here: ramfs leaves every write-side op NULL, so the VFS
+     * returns VFS_ERR_ROFS regardless of the mode bits. That is the Linux
+     * split -- the mode describes the FILE, read-only-ness is a property of
+     * the MOUNT -- and it is why a 0755 binary here still cannot be written.
      * MODE_VALID forces the VFS to enforce these bits explicitly. */
-    out->uid  = 0;
-    out->gid  = 0;
-    out->mode = 00444u | VFS_MODE_VALID;
+    out->uid  = nd->uid;
+    out->gid  = nd->gid;
+    out->mode = nd->mode | VFS_MODE_VALID;
     return VFS_OK;
 }
 
@@ -339,7 +376,8 @@ struct ramfs_diriter {
 static bool dirent_push_unique(struct vfs_dirent *list, size_t *n,
                                size_t cap,
                                const char *name, enum vfs_type type,
-                               size_t size) {
+                               size_t size,
+                               uint32_t mode, uint32_t uid, uint32_t gid) {
     for (size_t i = 0; i < *n; i++) {
         if (strcmp(list[i].name, name) == 0) return true;   /* dedup */
     }
@@ -351,10 +389,12 @@ static bool dirent_push_unique(struct vfs_dirent *list, size_t *n,
     e->name[nl] = 0;
     e->type = type;
     e->size = size;
-    /* Everything in the initrd is owned by root and read-only. */
-    e->uid  = 0;
-    e->gid  = 0;
-    e->mode = ((type == VFS_TYPE_DIR) ? 00555u : 00444u) | VFS_MODE_VALID;
+    /* Carried from the node (or the caller's synthesised values for an
+     * implicit directory) -- readdir must agree with stat, or `ls -l` and
+     * stat() describe the same file differently. */
+    e->uid  = uid;
+    e->gid  = gid;
+    e->mode = mode | VFS_MODE_VALID;
     (*n)++;
     return true;
 }
@@ -404,20 +444,27 @@ static int ramfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
         while (*slash && *slash != '/') slash++;
 
         if (*slash == 0) {
-            /* Direct child entry. */
+            /* Direct child entry -- report the node's own recorded mode. */
             if (!dirent_push_unique(it->ents, &it->count, cap, rest,
-                                    m->nodes[i].type, m->nodes[i].size)) {
+                                    m->nodes[i].type, m->nodes[i].size,
+                                    m->nodes[i].mode, m->nodes[i].uid,
+                                    m->nodes[i].gid)) {
                 break;
             }
         } else {
-            /* Implicit directory: emit the leading component. */
+            /* Implicit directory: emit the leading component. There is no
+             * tar header for it, so it gets the conventional root-owned
+             * 0755 -- matching what ramfs_stat() synthesises for the same
+             * path, which is the pairing that keeps readdir and stat
+             * consistent. */
             size_t leaf_len = (size_t)(slash - rest);
             char leaf[VFS_NAME_MAX];
             if (leaf_len >= sizeof(leaf)) leaf_len = sizeof(leaf) - 1;
             memcpy(leaf, rest, leaf_len);
             leaf[leaf_len] = 0;
             if (!dirent_push_unique(it->ents, &it->count, cap, leaf,
-                                    VFS_TYPE_DIR, 0)) {
+                                    VFS_TYPE_DIR, 0,
+                                    RAMFS_IMPLICIT_DIR_MODE, 0, 0)) {
                 break;
             }
         }
@@ -451,12 +498,23 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     char norm[VFS_PATH_MAX];
     if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
 
+    /* nlink was never assigned on ANY of the three paths below, so `ls -l`
+     * printed whatever junk the caller happened to have on its stack -- a
+     * visible "-r--r--r-- 1919954296 ..." (those digits are ASCII bytes read
+     * as an integer). Per struct vfs_stat, 0 means "this fs has no answer"
+     * and the stat emitters substitute the conventional 1-for-files /
+     * 2-for-directories, so setting 0 routes through that shared default
+     * rather than duplicating the policy here. */
+    out->nlink = 0;
+
+    /* The mount root has no tar header of its own -- same synthesised 0755
+     * as any other implicit directory. */
     if (norm[0] == 0) {
         out->type = VFS_TYPE_DIR;
         out->size = 0;
         out->uid  = 0;
         out->gid  = 0;
-        out->mode = 00555u | VFS_MODE_VALID;
+        out->mode = RAMFS_IMPLICIT_DIR_MODE | VFS_MODE_VALID;
         return VFS_OK;
     }
 
@@ -464,10 +522,9 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     if (nd) {
         out->type = nd->type;
         out->size = nd->size;
-        out->uid  = 0;
-        out->gid  = 0;
-        out->mode = ((nd->type == VFS_TYPE_DIR) ? 00555u : 00444u)
-                    | VFS_MODE_VALID;
+        out->uid  = nd->uid;
+        out->gid  = nd->gid;
+        out->mode = nd->mode | VFS_MODE_VALID;
         return VFS_OK;
     }
     /* Implicit directory? */
@@ -476,7 +533,7 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
         out->size = 0;
         out->uid  = 0;
         out->gid  = 0;
-        out->mode = 00555u | VFS_MODE_VALID;
+        out->mode = RAMFS_IMPLICIT_DIR_MODE | VFS_MODE_VALID;
         return VFS_OK;
     }
     return VFS_ERR_NOENT;
