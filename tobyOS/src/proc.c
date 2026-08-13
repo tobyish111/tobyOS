@@ -1583,6 +1583,19 @@ static void proc_reap(struct proc *p) {
                     __asm__ volatile("pause");
             }
             vmm_destroy_user_pml4(doomed);
+            /* The page tables are gone; drop the VMA bookkeeping that
+             * described them. This is the ONLY place it is unambiguously
+             * safe: we are in the no-heir branch, so this was the last proc
+             * in the address space, and the barrier above proved no CPU is
+             * still running in it.
+             *
+             * Without this, g_vma_tables[] was never cleared at all -- and it
+             * is keyed by proc_mm_pid(), which for an ordinary process is its
+             * pid, which is a RECYCLED g_proc[] slot index. The next process
+             * to land in this slot inherited these mappings and could fault a
+             * fresh zero page into an address it never asked for. Read
+             * proc_mm_pid BEFORE the memset at the end of this function. */
+            mmap_cleanup_proc(proc_mm_pid(p));
         }
     }
     if (p->kstack_base) {

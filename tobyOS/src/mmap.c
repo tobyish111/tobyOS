@@ -114,10 +114,30 @@ static inline uint64_t page_align_down(uint64_t v) {
 #define MMAP_REGION_BASE  0x0000100000000000ULL
 #define MMAP_REGION_END   0x0000700000000000ULL
 
+/* ASLR: pick this address space's mmap base.
+ *
+ * MMAP_REGION_BASE..MMAP_REGION_END is a 96 TiB window and aslr_mmap_offset()
+ * is at most 2^20 pages = 4 GiB, so randomising the start costs nothing in
+ * usable space. find_free_region() re-applies align_for_len() on top of the
+ * hint, so V8's 4 GiB cage alignment survives the offset.
+ *
+ * aslr_offset() returns 0 when ASLR is disabled, which collapses this to the
+ * old fixed base -- the disabled path is exactly the previous behaviour.
+ *
+ * SCOPE, stated plainly: this randomises the MMAP region only, once per
+ * address-space lifetime. Stack and executable bases are NOT randomised (see
+ * aslr.c), and an execve that reuses a live proc slot keeps the hint it
+ * already had rather than drawing a fresh one -- Linux re-randomises at every
+ * execve, this does not. */
+static uint64_t aslr_mmap_start(void) {
+    extern uint64_t aslr_mmap_offset(void);
+    return MMAP_REGION_BASE + aslr_mmap_offset();
+}
+
 void mmap_init_proc(int pid) {
     struct vma_table *vt = &g_vma_tables[pid];
     memset(vt, 0, sizeof(*vt));
-    vt->mmap_hint = MMAP_REGION_BASE;
+    vt->mmap_hint = aslr_mmap_start();
 }
 
 void mmap2_init_proc(int pid) {
@@ -235,6 +255,14 @@ static uint64_t align_for_len(uint64_t len) {
 
 static uint64_t find_free_region(struct vma_table *vt, uint64_t len) {
     uint64_t align = align_for_len(len);
+    /* hint == 0 means "this address space has never allocated" -- either a
+     * never-used pid (g_vma_tables is zero-initialised) or one whose table
+     * mmap_cleanup_proc has just released. Draw the ASLR base here, lazily,
+     * so randomisation happens without any hook in the execve path: execve's
+     * address-space rebuild is entangled with mm_owner / share-until-exec,
+     * which the Chromium arc depends on and which is not safe to disturb
+     * from here. */
+    if (vt->mmap_hint == 0) vt->mmap_hint = aslr_mmap_start();
     uint64_t addr = vt->mmap_hint;
     if (addr < MMAP_REGION_BASE) addr = MMAP_REGION_BASE;
     addr = (addr + align - 1) & ~(align - 1);
@@ -1211,12 +1239,27 @@ int mmap2_cow_clone(int parent_pid, int child_pid) {
 
 /* ---- Cleanup ---- */
 
+/* Release an address space's VMA bookkeeping.
+ *
+ * Called from proc_reap the moment vmm_destroy_user_pml4 runs -- i.e. when the
+ * LAST user of this address space is gone, so no thread can still consult the
+ * table. Before this was wired, nothing ever cleared g_vma_tables: the array is
+ * keyed by proc_mm_pid(), pids ARE recycled g_proc[] slot indices, and reap
+ * memset the struct proc while leaving the VMA table untouched. A recycled pid
+ * therefore inherited the dead process's mappings, and mmap_handle_page_fault
+ * would service a demand fault against one -- handing the new process a
+ * zero-filled page at an address it never mapped, instead of a fault. That is
+ * the same class of bug as the second registry removed in sys_mmap (see the
+ * NOTE there), which is why the entries are dropped and not merely counted out.
+ *
+ * mmap_hint goes to 0, not MMAP_REGION_BASE: 0 is find_free_region's "fresh
+ * address space" sentinel, so the next user of this slot draws a NEW ASLR base
+ * rather than inheriting the dead process's layout. */
 void mmap_cleanup_proc(int pid) {
+    if (pid < 0 || pid >= PROC_MAX) return;
     struct vma_table *vt = &g_vma_tables[pid];
-    vt->count = 0;
-    vt->mmap_hint = MMAP_REGION_BASE;
-    vt->brk_base = 0;
-    vt->brk_cur = 0;
+    memset(vt, 0, sizeof(*vt));
+    vt->mmap_hint = 0;
 }
 
 void mmap2_cleanup_proc(int pid) {
