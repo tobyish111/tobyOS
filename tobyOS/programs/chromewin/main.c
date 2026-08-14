@@ -1289,6 +1289,19 @@ static int spawn_chrome(void) {
                     "Chrome/151.0.0.0 Safari/537.36",
             (char *)"--lang=en-US",
             (char *)"--accept-lang=en-US,en;q=0.9",
+            /* Google's "unusual traffic" interstitial (/sorry/index) was
+             * gating SEARCH -- the homepage loaded fine, the query bounced.
+             * The slice-59 UA above is necessary but NOT sufficient, because
+             * two other automation tells survive it:
+             *
+             *   navigator.webdriver === true. --remote-debugging-pipe sets it,
+             *   and it is the single cheapest bot check on the web. This flag
+             *   is Chromium's own documented way to not set it.
+             *
+             * (the second tell, Sec-CH-UA client hints, cannot be fixed by a
+             * command line at all -- see Emulation.setUserAgentOverride in
+             * cdp_bootstrap, which is where the two are made to AGREE.) */
+            (char *)"--disable-blink-features=AutomationControlled",
             /* Slice 56d (wall R1): the render/navigation vmodule set. For
              * CHROME_FULL it is MERGED into the single --vmodule above
              * (chrome keeps only the last occurrence -- slice 89); the
@@ -1712,6 +1725,38 @@ static int cdp_bootstrap(void) {
     id = cdp_send("Network.enable",
                   "{\"maxTotalBufferSize\":1000000,\"maxResourceBufferSize\":100000}", 1);
     if (!cdp_wait(id)) return -1;
+
+    /* MAKE THE UA STRING AND THE CLIENT HINTS AGREE.
+     *
+     * --user-agent (slice 59) rewrites only the User-Agent HEADER. It does not
+     * touch User-Agent Client Hints, which chrome derives from its own build
+     * identity -- so chrome-headless-shell kept sending
+     *     Sec-CH-UA: "HeadlessChrome";v="151", ...
+     * underneath a UA string claiming "Chrome/151.0.0.0". A server reading
+     * both sees a browser lying about itself, which is a STRONGER bot signal
+     * than an honest HeadlessChrome would have been: Google's /sorry/index
+     * gate let the homepage through and bounced the search.
+     *
+     * Emulation.setUserAgentOverride is the only interface that sets both, via
+     * userAgentMetadata. brands[] carries the deliberate "Not_A Brand" entry
+     * real Chrome ships (GREASE, to stop servers hard-coding the list).
+     * Versions here must track the payload in programs/chromium/ -- if that is
+     * ever upgraded and this is not, the mismatch comes straight back. */
+    id = cdp_send("Emulation.setUserAgentOverride",
+        "{\"userAgent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36\","
+        "\"acceptLanguage\":\"en-US,en;q=0.9\",\"platform\":\"Linux\","
+        "\"userAgentMetadata\":{"
+          "\"brands\":[{\"brand\":\"Not_A Brand\",\"version\":\"24\"},"
+                      "{\"brand\":\"Chromium\",\"version\":\"151\"},"
+                      "{\"brand\":\"Google Chrome\",\"version\":\"151\"}],"
+          "\"fullVersionList\":[{\"brand\":\"Not_A Brand\",\"version\":\"24.0.0.0\"},"
+                      "{\"brand\":\"Chromium\",\"version\":\"151.0.7922.34\"},"
+                      "{\"brand\":\"Google Chrome\",\"version\":\"151.0.7922.34\"}],"
+          "\"fullVersion\":\"151.0.7922.34\",\"platform\":\"Linux\","
+          "\"platformVersion\":\"6.1.0\",\"architecture\":\"x86\",\"model\":\"\","
+          "\"mobile\":false,\"bitness\":\"64\",\"wow64\":false}}", 1);
+    cdp_wait(id);
 
     /* Slice 59c: give chrome a DESKTOP-SIZED viewport. The TobyTK window is
      * 800x600, and YouTube's responsive layout below ~1000px collapses the

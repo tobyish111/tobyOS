@@ -32,6 +32,25 @@
   <h1>toby<span>OS</span></h1>
   <p class="sub">Chromium, running on a kernel written from scratch.</p>
 
+  <!-- Search box added 2026-08-14. A browser start page should have one.
+       DO NOT read this as "the search that works": it was added believing
+       DuckDuckGo would not gate us, and a direct test DISPROVED that --
+       duckduckgo.com/?q=... served static-pages/418.html (their anomalous-
+       traffic block) exactly as google.com/search served /sorry/index. Two
+       independent engines refusing the same client points at something shared
+       -- address reputation, and a profile that is wiped on every boot so
+       every session is a fresh cookie-less client -- not at either engine.
+       Still a self-contained page: the form only goes anywhere when submitted. -->
+  <div class="card">
+    <h2>Search the web</h2>
+    <form method="GET" action="https://duckduckgo.com/">
+      <input type="text" name="q" autofocus placeholder="Search DuckDuckGo&hellip;"
+             style="width:100%;box-sizing:border-box;padding:9px 11px;
+                    background:#0f1319;color:#e6edf3;border:1px solid #2b3644;
+                    border-radius:6px;font:15px sans-serif">
+    </form>
+  </div>
+
   <div class="card">
     <h2>Browse</h2>
     Type an address in the bar above and press Enter.
