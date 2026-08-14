@@ -1489,6 +1489,20 @@ static void probe_page(void) {
     cdp_send("Runtime.evaluate",
              "{\"expression\":\"(function(){var v=document.querySelector('video');"
              "return 'tobyprobe rs='+document.readyState"
+             /* BOT-TELL SELF-CHECK. The two anti-automation fixes (the
+              * --disable-blink-features flag and Emulation.setUserAgentOverride)
+              * were verified only as "present in the binary, accepted by CDP" --
+              * which is not the same as "the PAGE now sees a normal browser".
+              * Report what a detector actually reads:
+              *   wd=  navigator.webdriver, MUST be false/undefined
+              *   ch=  the Sec-CH-UA brand list, must NOT say HeadlessChrome
+              *   ua=  tail of the UA string
+              * If wd=true the flag never took effect and no amount of further
+              * fingerprint work matters until it does. */
+             "+' wd='+(navigator.webdriver===undefined?'undef':navigator.webdriver)"
+             "+' ch='+((navigator.userAgentData&&navigator.userAgentData.brands)?"
+             "navigator.userAgentData.brands.map(function(b){return b.brand}).join(',').slice(0,40)"
+             ":'none')"
              "+' title='+document.title.slice(0,20)"
              "+' blen='+(document.body?document.body.innerHTML.length:-1)"
              "+' vid='+(v?('r'+v.readyState+' n'+v.networkState"
@@ -1791,6 +1805,25 @@ static int cdp_bootstrap(void) {
     id = cdp_send("Network.setCookie",
                   "{\"name\":\"SOCS\",\"value\":\"CAI\","
                   "\"domain\":\".youtube.com\",\"path\":\"/\"}", 1);
+    cdp_wait(id);
+    /* Same two cookies for .google.com. Slice 59f set them only on
+     * .youtube.com because YouTube was the subject then, but the consent gate
+     * is a GOOGLE-account-wide thing and search serves a reduced/interstitial
+     * page to a client that has never recorded consent. Setting them is
+     * exactly what clicking "Accept all" does.
+     *
+     * HONEST SCOPE: this is the CONSENT interstitial, which is NOT the
+     * /sorry/index "unusual traffic" bot gate -- do not expect it to clear
+     * that. It removes one reason to be treated as a brand-new client; the bot
+     * gate is driven by address reputation and by a profile that starts empty
+     * every boot, neither of which a cookie set here can fix. */
+    id = cdp_send("Network.setCookie",
+                  "{\"name\":\"CONSENT\",\"value\":\"YES+cb\","
+                  "\"domain\":\".google.com\",\"path\":\"/\"}", 1);
+    cdp_wait(id);
+    id = cdp_send("Network.setCookie",
+                  "{\"name\":\"SOCS\",\"value\":\"CAI\","
+                  "\"domain\":\".google.com\",\"path\":\"/\"}", 1);
     cdp_wait(id);
 
     id = cdp_send("Page.enable", "{}", 1);
