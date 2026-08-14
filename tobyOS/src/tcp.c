@@ -1421,7 +1421,38 @@ long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
         if (c->rx_count > 0) return (long)rx_pop(c, buf, cap);
         return -1;
     }
-    if (r == 0) return 0;
+    if (r == 0) {
+        /* RARE-EVENT diagnostic for the ~30 s stalls seen on real hardware
+         * (1 of 8 large HTTPS fetches, 2026-08-14). Deliberately NOT the
+         * per-segment trace above: that one saturates a 38400-baud console and
+         * delays ACKs until senders back off -- it would CAUSE this bug rather
+         * than find it. A recv timeout is rare, so one line here is free.
+         *
+         * The numbers are chosen to test ONE hypothesis, stated in the slice-56
+         * comment below: "the one update ACK was lost -- pure ACKs are not
+         * retransmitted", leaving the peer to sit silent until its own
+         * zero-window probe tens of seconds later. If that is what happens,
+         * this prints free >> adv_free_last: WE have room, the peer was never
+         * successfully told, and neither side speaks. If instead free is small
+         * the ring genuinely never drained and the stall is elsewhere. */
+        kprintf("[tcp] RECV-TIMEOUT tcp[%d] port=%u %ums state=%s "
+                "free=%u adv_free_last=%u rx_count=%u\n",
+                conn_index(c), (unsigned)ntohs(c->remote_port_be),
+                (unsigned)timeout_ms, tcp_state_name(c->state),
+                (unsigned)(TCP_RX_BUF_BYTES - c->rx_count),
+                (unsigned)c->adv_free_last, (unsigned)c->rx_count);
+        /* The wire counters are the CHROMIUM_BOOT diagnostic set, so they are
+         * a bonus when that flavour is built -- the free/adv_free_last pair
+         * above is what actually decides the hypothesis, and it is always
+         * compiled in. */
+#ifdef CHROMIUM_BOOT
+        kprintf("[tcp]   wire tx=%lu rx=%lu popped=%lu ooo=%u retx=%u\n",
+                (unsigned long)c->dbg_tx_total, (unsigned long)c->dbg_rx_total,
+                (unsigned long)c->dbg_rx_popped,
+                (unsigned)c->dbg_ooo, (unsigned)c->dbg_retx);
+#endif
+        return 0;
+    }
     size_t before = c->rx_count;
     long got = (long)rx_pop(c, buf, cap);
     /* Slice 56 receiver flow control, done right. The old rule (ACK only when

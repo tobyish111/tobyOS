@@ -522,7 +522,22 @@ static int h2_run(struct h2 *h, struct tls_conn *tls, const struct http_url *u,
     int guard = 0;
     while (!done && guard++ < 100000) {
         uint8_t fh[9];
-        if (h2_read(h, fh, 9) < 0) { rc = body_len ? 0 : HTTP_ERR_TIMEOUT; break; }
+        /* WAS: rc = body_len ? 0 : HTTP_ERR_TIMEOUT -- i.e. a read failure
+         * partway through a body MANUFACTURED SUCCESS. The caller got 200 OK
+         * and a SHORT body with no way to tell it was short, because the h2
+         * path also reports content_len as "however much I ended up with".
+         *
+         * Caught on real hardware: 1 of 8 fetches of an 823576-byte file
+         * stalled ~30 s and returned 819200 bytes (exactly 50 x 16 KiB DATA
+         * frames, END_STREAM never seen) as a clean 200. That is precisely
+         * how a JS file arrives truncated and Chromium reports "Uncaught
+         * SyntaxError: Invalid or unexpected token" -- a parse error standing
+         * in for a transport failure.
+         *
+         * Report the failure. `done` (END_STREAM) is the completeness flag and
+         * it is still clear here, so the truncation is knowable; throwing that
+         * away was the whole defect. */
+        if (h2_read(h, fh, 9) < 0) { rc = HTTP_ERR_TIMEOUT; break; }
         uint32_t flen = ((uint32_t)fh[0] << 16) | ((uint32_t)fh[1] << 8) | fh[2];
         uint8_t ftype = fh[3], fflags = fh[4];
         uint32_t sid; memcpy(&sid, fh + 5, 4); sid = ntohl(sid) & 0x7FFFFFFF;
@@ -612,6 +627,24 @@ static int h2_run(struct h2 *h, struct tls_conn *tls, const struct http_url *u,
         h2_send_frame(h, H2_WINDOW_UPDATE, 0, 0, &inc, 4);
     }
 
+    /* AN INCOMPLETE STREAM IS A FAILURE, however many bytes it produced.
+     * This used to be `rc != 0 && body_len == 0`, so any error that arrived
+     * after the first byte was swallowed and the partial body returned as a
+     * success -- the silent-truncation half of the bug fixed at the read above.
+     *
+     * `done` is set only by END_STREAM on our stream id, so !done means the
+     * response never finished, even when rc happens to be 0 (e.g. the frame
+     * loop hit its guard). Both conditions are failures.
+     *
+     * HTTP_F_TRUNCATE is the caller explicitly ASKING for as much as fits, so
+     * it keeps the old behaviour -- opting in is different from being lied to. */
+    if ((rc != 0 || !done) && !(flags & HTTP_F_TRUNCATE)) {
+        kprintf("[h2] INCOMPLETE: %lu bytes, END_STREAM=%d rc=%d -- reporting "
+                "failure rather than a short body\n",
+                (unsigned long)body_len, done, rc);
+        kfree(body);
+        return rc ? rc : HTTP_ERR_PROTOCOL;
+    }
     if (rc != 0 && body_len == 0) { kfree(body); return rc; }
 
     /* A 204/304/empty 200 never hit body_reserve. The h1 path always
