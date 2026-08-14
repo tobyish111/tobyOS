@@ -1737,11 +1737,35 @@ static int lx_path_has(const char *h, const char *n) {
  * path exactly like every other path syscall, including the chroot root.
  * It was the one caller doing its own raw copy, and inside a chroot that
  * silently exec'd the HOST binary of the same name. */
+/* Opt-in path-failure tracing, the same switch src/vfs.c uses. OFF by default:
+ * the syscall ring records path ARGUMENTS as user POINTERS, so a failure reads
+ * as `openat a1=29407312 = -36` and names nothing. Build with
+ * -DPATHFAIL_TRACE when a path is the suspect. */
+#ifdef PATHFAIL_TRACE
+#define PATHFAIL_LOG(...) kprintf("[pathfail] " __VA_ARGS__)
+#else
+#define PATHFAIL_LOG(...) ((void)0)
+#endif
+
 int resolve_user_path(const char *user_path, char *out, size_t cap) {
     char up[ABI_PATH_MAX];
     long plen = strncpy_from_user(up, user_path, sizeof(up));
     if (plen < 0) return -ABI_EFAULT;
-    if ((size_t)plen >= sizeof(up) - 1) return -ABI_ENAMETOOLONG;
+    if ((size_t)plen >= sizeof(up) - 1) {
+        /* NAME THE PATH. ABI_PATH_MAX is 256 here and Linux's PATH_MAX is
+         * 4096, so a program that is perfectly well-behaved on Linux can be
+         * refused by this branch -- and the refusal surfaces a long way from
+         * its cause. Chromium maps errno ENAMETOOLONG through MapSystemError()
+         * to net::ERR_FILE_PATH_TOO_LONG and reports it as a NETWORK failure,
+         * so a page fails to load with an error naming neither a file nor a
+         * path. Without the string there is nothing to connect the two.
+         *
+         * The truncated path IS the diagnosis: it says which subsystem (cache,
+         * profile, socket dir) is generating the over-long name. */
+        PATHFAIL_LOG("resolve_user_path: ENAMETOOLONG len>=%d first=%.*s\n",
+                     (int)sizeof(up) - 1, 64, up);
+        return -ABI_ENAMETOOLONG;
+    }
     if (plen == 0 || cap == 0) return -ABI_EINVAL;
 #ifdef CHROMIUM_BOOT
     /* slice 20: chrome's --dump-dom loads headless_command_resources.pak from
