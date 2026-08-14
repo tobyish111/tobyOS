@@ -68,6 +68,12 @@ struct ramfs_node {
     uint32_t      mode;
     uint32_t      uid;
     uint32_t      gid;
+    /* Copy-on-write state. `data` normally points INTO the initrd module
+     * (zero-copy). After the first write it points at a kmalloc'd buffer of
+     * `cap` bytes instead, and `owned` says so -- which is what makes it safe
+     * to free/grow, and what keeps the shared initrd image itself immutable. */
+    bool          owned;
+    size_t        cap;
 };
 
 /* Fallbacks for a tar whose mode field is missing or unparseable. These are
@@ -590,14 +596,95 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     return VFS_ERR_NOENT;
 }
 
-/* Write-side ops are all NULL -- the VFS layer translates a NULL hook
- * into VFS_ERR_ROFS, so callers see "read-only filesystem" cleanly. */
+/* ---- writes: COPY-ON-WRITE onto the heap ------------------------------
+ *
+ * WHY THIS EXISTS. A file's bytes normally point straight INTO the Limine
+ * initrd module (zero-copy: nd->data = img + off), which is why ramfs was
+ * read-only. But a read-only root is a DEVIATION, not a design: Linux's
+ * initramfs is a writable tmpfs, and the deviation had a real cost. DHCP
+ * learns the nameserver and net_write_resolv_conf() rewrites
+ * /etc/resolv.conf -- except the write silently failed here, so the resolver
+ * kept using the address baked into the initrd. In QEMU that address is
+ * accidentally correct (SLIRP hands out exactly the 10.0.2.3 the file names);
+ * on real hardware every name lookup went to a host that does not exist and
+ * Chromium reported ERR_NAME_NOT_RESOLVED with nothing in the log to explain
+ * it.
+ *
+ * SCOPE, DELIBERATELY NARROW: an EXISTING file can be overwritten; a NEW file
+ * still cannot be created and nothing can be unlinked or mkdir'd. That keeps
+ * "you cannot add to /" true -- which existing behaviour and tests rely on --
+ * while fixing the case that actually bit. Widening it later is additive.
+ *
+ * The first write to a tar-backed node kmallocs a private buffer and repoints
+ * `data` at it; `owned` then says the buffer is ours to free and grow. The
+ * initrd image itself is NEVER modified -- it is shared, and on a real boot it
+ * is the module Limine loaded. */
+static int ramfs_cow(struct ramfs_node *nd, size_t need) {
+    if (nd->owned && need <= nd->cap) return VFS_OK;
+    size_t cap = nd->owned ? nd->cap : 0;
+    if (cap < need) cap = need < 64 ? 64 : need;
+    uint8_t *buf = (uint8_t *)kmalloc(cap);
+    if (!buf) return VFS_ERR_NOMEM;
+    memset(buf, 0, cap);
+    if (nd->data && nd->size) {
+        size_t keep = nd->size < cap ? nd->size : cap;
+        memcpy(buf, nd->data, keep);
+    }
+    if (nd->owned && nd->data) kfree((void *)nd->data);
+    nd->data  = buf;
+    nd->cap   = cap;
+    nd->owned = true;
+    return VFS_OK;
+}
+
+static long ramfs_write(struct vfs_file *f, const void *buf, size_t n) {
+    struct ramfs_node *nd = (struct ramfs_node *)f->priv;
+    if (!nd) return VFS_ERR_INVAL;
+    if (nd->type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
+    if (n == 0) return 0;
+    size_t need = f->pos + n;
+    if (need < f->pos) return VFS_ERR_INVAL;          /* offset overflow */
+    int rc = ramfs_cow(nd, need);
+    if (rc != VFS_OK) return rc;
+    memcpy((uint8_t *)nd->data + f->pos, buf, n);
+    f->pos += n;
+    if (need > nd->size) nd->size = need;
+    f->size = nd->size;
+    return (long)n;
+}
+
+/* vfs_write_all() calls create() before open(), and treats VFS_ERR_EXIST as
+ * "fine, carry on" -- so this hook is what makes that helper usable here. It
+ * TRUNCATES, matching the contract vfs_write_all documents ("create() on a
+ * file that already exists is OK -- we then truncate"). Without the truncate a
+ * shorter replacement would leave the tail of the old contents behind, which
+ * for resolv.conf would mean two nameserver lines. */
+static int ramfs_create(void *mnt, const char *path, uint32_t mode,
+                        uint32_t uid, uint32_t gid) {
+    /* mode/uid/gid are ignored on purpose: this hook never creates anything,
+     * so there is no new file whose ownership they could describe. The
+     * existing node keeps the identity the USTAR header gave it. */
+    (void)mode; (void)uid; (void)gid;
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    char norm[VFS_PATH_MAX];
+    if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
+    struct ramfs_node *nd = find_node(m, norm);
+    if (!nd) return VFS_ERR_ROFS;      /* creating NEW files stays unsupported */
+    if (nd->type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
+    int rc = ramfs_cow(nd, 1);
+    if (rc != VFS_OK) return rc;
+    nd->size = 0;                                            /* truncate */
+    return VFS_ERR_EXIST;
+}
+
+/* unlink/mkdir stay NULL -- the VFS turns a NULL hook into VFS_ERR_ROFS, so
+ * the root is still not something you can add to or remove from. */
 const struct vfs_ops ramfs_ops = {
     .open     = ramfs_open,
     .close    = ramfs_close,
     .read     = ramfs_read,
-    .write    = 0,
-    .create   = 0,
+    .write    = ramfs_write,
+    .create   = ramfs_create,
     .unlink   = 0,
     .mkdir    = 0,
     .opendir  = ramfs_opendir,
