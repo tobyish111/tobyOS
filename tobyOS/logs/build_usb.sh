@@ -25,19 +25,36 @@ rm -f src/*.o
 rm -f programs/chromewin/chromewin.o programs/chromewin/chromewin.elf
 
 mkdir -p /c/t
-# PROG_EXTRA_CFLAGS IS NOT OPTIONAL HERE. CHROME_FULL=1 only changes what the
-# INITRD STAGES (/opt/chrome = the full browser, whose binary is `chrome`).
-# chromewin picks its exec path at COMPILE time via #ifdef CHROME_FULL, and
-# EXTRA_CFLAGS never reaches user programs -- so without it the staged browser
-# is the full one while chromewin still execs the headless shell that is no
-# longer there. It fails as `execve ... -1` / exit 127, which reads like a
-# loader bug. The Makefile documents this exact trap at the
-# LIBTOBY_KABI_PROGRAM_RULES definition; this script did not honour it, and a
-# REAL-HARDWARE run is what surfaced it.
-echo "=== building (plain desktop + CHROME_FULL) ==="
+# ---------------------------------------------------------------------------
+# NO CHROME_FULL. THIS IS THE POINT OF THE FIX, so read before changing it.
+#
+# There are two chrome configurations and only ONE of them renders:
+#
+#   headless-shell + CDP -> TobyTK window   (chromewin's default path)
+#       PROVEN END TO END: multi-process, https, VP9 on a real YouTube watch
+#       page, live resize, ~52fps via the viz shared-bitmap path.
+#
+#   full chrome + Ozone/X11                 (#ifdef CHROME_FULL)
+#       "Route B", and it is REFUTED. Chrome takes the X11/GLX path and
+#       CHECK-crashes (INT3) just after our stub X server's setup reply;
+#       the arc notes record it as "bootstrap OK reached, 0 FRAMES".
+#
+# This script used to pass CHROME_FULL=1 -- a leftover from that arc -- which
+# staged the full browser at /opt/chrome/chrome while chromewin, compiled
+# WITHOUT -DCHROME_FULL (EXTRA_CFLAGS never reaches user programs), still
+# exec'd /opt/chrome/chrome-headless-shell. That file is not staged in the
+# CHROME_FULL branch, so it died `execve ... -1` / exit 127 on real hardware.
+#
+# Adding PROG_EXTRA_CFLAGS=-DCHROME_FULL would have made the two halves agree
+# -- on the path that produces NO PIXELS. Dropping CHROME_FULL instead makes
+# them agree on the path that works. The taskbar pin is gated on /opt/chrome
+# EXISTING, and the headless-shell branch stages to exactly that path, so the
+# pin is unaffected.
+# ---------------------------------------------------------------------------
+echo "=== building (plain desktop, headless-shell + CDP) ==="
 if ! make "CC=TMP='C:\\t' TEMP='C:\\t' clang" \
           "HOST_CC=TMP='C:\\t' TEMP='C:\\t' gcc" \
-          CHROME_FULL=1 PROG_EXTRA_CFLAGS=-DCHROME_FULL iso \
+          iso \
      >logs/build_usb.log 2>&1; then
     echo "BUILD FAIL -- tail:"; tail -30 logs/build_usb.log; exit 1
 fi
@@ -56,26 +73,40 @@ if grep -qa "TKAPP. launching" tobyos.bin; then
 else
     echo "  ok: no TKAPP auto-launch (you get the normal desktop)"
 fi
-# Must carry the FULL browser, not headless-shell.
-if grep -a "initrd\] chromium" logs/build_usb.log | grep -q "FULL chrome"; then
-    echo "  ok: FULL chrome staged under /opt/chrome (taskbar pin live)"
+# The taskbar pin is gated on the DIRECTORY /opt/chrome existing -- gui.c's
+# taskbar_pin_count() does vfs_stat("/opt/chrome"), not a check for any
+# particular binary. Both staging branches create that directory, so the pin is
+# live either way. The old check here asked "is it the FULL browser?" and
+# warned that the pin would be absent when it was not, which was wrong in
+# exactly the configuration that actually renders.
+if tar tf build/initrd.tar 2>/dev/null | grep -q "^opt/chrome/"; then
+    echo "  ok: /opt/chrome staged -> taskbar pin live (gui.c gates on the dir)"
 else
-    echo "  WARNING: full chrome NOT staged -- taskbar pin will be absent:"
-    grep -a "initrd\] chromium" logs/build_usb.log | head -2
-fi
-# THE BINARY IS THE GATE, not the make invocation: assert chromewin actually
-# execs the browser that got staged. This check costs nothing and is the
-# difference between finding the mismatch here and finding it on a USB stick.
-if grep -qa '/opt/chrome/chrome-headless-shell' programs/chromewin/chromewin.elf; then
-    echo "  FAIL: chromewin still execs chrome-headless-shell, which CHROME_FULL"
-    echo "        does NOT stage -- it will exit 127. PROG_EXTRA_CFLAGS did not"
-    echo "        reach it."
+    echo "  FAIL: nothing staged under /opt/chrome -- the pin will be absent"
     exit 1
 fi
-if grep -qa '\-\-ozone-platform=x11' programs/chromewin/chromewin.elf; then
-    echo "  ok: chromewin built with -DCHROME_FULL (execs /opt/chrome/chrome)"
+# THE TWO HALVES MUST AGREE, and nobody was checking that -- which is the whole
+# reason a USB stick shipped with a browser that exited 127. One half is what
+# chromewin EXECS (baked in at compile time); the other is what the initrd
+# STAGES. Assert them against each other, not each against an assumption.
+CW_EXEC=""
+grep -qa '/opt/chrome/chrome-headless-shell' programs/chromewin/chromewin.elf \
+    && CW_EXEC="/opt/chrome/chrome-headless-shell"
+grep -qa -- '--ozone-platform=x11' programs/chromewin/chromewin.elf \
+    && CW_EXEC="/opt/chrome/chrome"
+case "$CW_EXEC" in
+  /opt/chrome/chrome-headless-shell) ;;
+  "") echo "  FAIL: cannot tell which browser chromewin execs"; exit 1 ;;
+  *)  echo "  FAIL: chromewin is a CHROME_FULL build (execs $CW_EXEC)."
+      echo "        That is the Ozone/X11 route, which reaches bootstrap and"
+      echo "        renders ZERO frames. Build without CHROME_FULL."
+      exit 1 ;;
+esac
+if tar tf build/initrd.tar 2>/dev/null | grep -qx "opt/chrome/chrome-headless-shell"; then
+    echo "  ok: chromewin execs $CW_EXEC, and the initrd stages it"
 else
-    echo "  FAIL: chromewin lacks the CHROME_FULL argv -- wrong flavour"
+    echo "  FAIL: chromewin execs $CW_EXEC but the initrd does NOT contain it"
+    echo "        -- this is the exit-127 that shipped on a USB stick."
     exit 1
 fi
 
