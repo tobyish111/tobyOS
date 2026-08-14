@@ -6823,6 +6823,102 @@ void _start(void) {
     }
 #endif
 
+#ifdef NETINTEG_BOOT
+    /* DO THE BYTES ARRIVE INTACT? (2026-08-14)
+     *
+     * Two real-hardware symptoms say maybe not, and both are the kind that
+     * look like something else:
+     *   - chrome logged "Uncaught SyntaxError: Invalid or unexpected token"
+     *     parsing gstatic's recaptcha__en.js. V8 cannot fail on Google's own
+     *     minified JS unless the BYTES it received were wrong.
+     *   - a different real-HW run took 3x ERR_SSL_PROTOCOL_ERROR in the first
+     *     navigation burst, then none for 70s.
+     * Both intermittent, neither reproduced in QEMU, and a 667 KB Wikipedia
+     * article rendered clean -- so this is occasional, not systematic, which
+     * is exactly the shape that hides.
+     *
+     * This fetches ONE large (823 KiB) file repeatedly over tobyOS's OWN
+     * HTTPS stack and hashes every copy. It deliberately does NOT use chrome:
+     * chrome's failure is the symptom, the question is whether the kernel's
+     * TCP/TLS path can deliver a big body byte-exact, repeatedly.
+     *
+     * THE PRIMARY SIGNAL IS SELF-CONSISTENCY -- all fetches identical to each
+     * other. The host-computed hash is a secondary check that can go stale on
+     * its own (Google may rotate the file), and a harness whose verdict
+     * depends on a remote file staying frozen is a harness that will one day
+     * cry wolf. So a self-consistent set that simply does not match the
+     * recorded hash is reported as CHANGED, not FAILED.
+     *
+     * Build EXTRA_CFLAGS+=-DNETINTEG_BOOT. Meant for REAL HARDWARE; QEMU is
+     * the control (it has never shown the corruption, so a QEMU pass proves
+     * the harness works, not that the bug is gone). */
+    {
+        static const char *nu =
+            "https://www.gstatic.com/recaptcha/releases/"
+            "XOqlk8PL_yVx6IdpLbpXdiLy/recaptcha__en.js";
+        /* Host: 823576 bytes, sha256 761bc958ae8cee93362bf575f61daa03
+         *                            7f570fffc5fbb724f3758fb9a5d6566a */
+        static const uint8_t want[32] = {
+            0x76,0x1b,0xc9,0x58,0xae,0x8c,0xee,0x93,
+            0x36,0x2b,0xf5,0x75,0xf6,0x1d,0xaa,0x03,
+            0x7f,0x57,0x0f,0xff,0xc5,0xfb,0xb7,0x24,
+            0xf3,0x75,0x8f,0xb9,0xa5,0xd6,0x56,0x6a };
+        const size_t want_len = 823576u;
+        enum { NI_ROUNDS = 8 };
+
+        uint8_t  first[32]; size_t first_len = 0; bool have_first = false;
+        int fetched = 0, differ = 0, failed = 0, match_host = 0;
+
+        kprintf("[NETINTEG] >>> %d x HTTPS GET of an 823576-byte file, "
+                "sha256 each\n", NI_ROUNDS);
+        for (int i = 0; i < NI_ROUNDS; i++) {
+            struct http_response hr;
+            int rc = http_get(nu, 2u * 1024u * 1024u, 30000, &hr);
+            if (rc != 0 || !hr.body) {
+                kprintf("[NETINTEG] #%d FETCH-FAIL rc=%d\n", i, rc);
+                failed++;
+                if (rc == 0) http_free(&hr);
+                continue;
+            }
+            uint8_t d[32];
+            sha256_buf(hr.body, hr.body_len, d);
+            fetched++;
+            if (!have_first) {
+                memcpy(first, d, 32); first_len = hr.body_len; have_first = true;
+            }
+            bool same = (hr.body_len == first_len) && (memcmp(d, first, 32) == 0);
+            if (!same) differ++;
+            if (hr.body_len == want_len && memcmp(d, want, 32) == 0) match_host++;
+            kprintf("[NETINTEG] #%d status=%d len=%lu sha=%02x%02x%02x%02x%02x%02x%02x%02x %s\n",
+                    i, hr.status, (unsigned long)hr.body_len,
+                    d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
+                    same ? "same" : "*** DIFFERS FROM #0 ***");
+            http_free(&hr);
+        }
+
+        if (fetched == 0) {
+            kprintf("[NETINTEG] VERDICT: ERROR no fetch completed (%d failed) "
+                    "-- no evidence either way\n", failed);
+        } else if (differ > 0) {
+            kprintf("[NETINTEG] VERDICT: **CORRUPTION** %d of %d fetches "
+                    "differ from each other -- the same URL returned "
+                    "different bytes in one boot\n", differ, fetched);
+        } else if (match_host == fetched && failed == 0) {
+            kprintf("[NETINTEG] VERDICT: PASS %d/%d byte-exact vs the host "
+                    "hash\n", match_host, NI_ROUNDS);
+        } else if (match_host == 0) {
+            kprintf("[NETINTEG] VERDICT: CHANGED all %d fetches agree with "
+                    "each other but not the recorded hash -- the upstream "
+                    "file was rotated; re-record, this is not corruption\n",
+                    fetched);
+        } else {
+            kprintf("[NETINTEG] VERDICT: PARTIAL fetched=%d failed=%d "
+                    "host-match=%d (self-consistent)\n",
+                    fetched, failed, match_host);
+        }
+    }
+#endif
+
 #ifdef REALCURL_BOOT
     /* Track C (networking) -- run a REAL, off-the-shelf third-party HTTP client:
      * UNMODIFIED upstream curl 8.20.0 (libcurl), statically linked against musl
