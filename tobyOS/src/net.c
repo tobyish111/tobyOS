@@ -349,8 +349,34 @@ static void net_write_resolv_conf(uint32_t dns_be) {
     if (n < (int)sizeof line - 1) line[n++] = '\n';
     line[n] = 0;
     int rc = vfs_write_all("/etc/resolv.conf", line, (size_t)n);
-    if (rc == VFS_OK)
+    if (rc == VFS_OK) {
         kprintf("[net] /etc/resolv.conf -> %s\n", dnsbuf);
+        return;
+    }
+    /* SAY SO. This used to log only on success, so on a read-only root it
+     * failed in complete silence -- and the consequence is invisible until a
+     * browser reports ERR_NAME_NOT_RESOLVED with nothing in the kernel log to
+     * connect it to.
+     *
+     * It matters ONLY on real hardware, which is why it survived this long:
+     * the initrd ships `nameserver 10.0.2.3`, QEMU's SLIRP hands out exactly
+     * 10.0.2.3, and the static file is therefore accidentally correct in every
+     * QEMU boot. On a real LAN the DHCP nameserver is something else entirely
+     * and every name lookup goes to an address that does not exist there.
+     *
+     * The fix is a writable root (ramfs has .write = 0 today; Linux's
+     * initramfs is a writable tmpfs, so the read-only root is the deviation).
+     * Until then this is a WARNING with the actual numbers in it, because a
+     * one-line diagnosis beats a silent wrong answer. */
+    static bool warned;
+    if (!warned) {
+        warned = true;
+        kprintf("[net] WARN: cannot update /etc/resolv.conf (rc=%d, read-only "
+                "root). DHCP says the nameserver is %s, but resolvers will "
+                "keep using whatever the initrd shipped -- if those differ, "
+                "name resolution FAILS (ERR_NAME_NOT_RESOLVED) while ping and "
+                "raw IP still work.\n", rc, dnsbuf);
+    }
 }
 
 /* Apply a successful DHCP lease into the kernel globals. Logged with
