@@ -67,6 +67,30 @@ fi
 
 echo
 echo "=== flavour checks (these are the traps, so verify them) ==="
+# DESTRUCTIVE-HARNESS GATE. A near-miss on 2026-08-14: logs/provcheck.sh had
+# just built a -DPROVISION_BLANK_BOOT kernel, and the copy step that names the
+# shippable ISO ran against it. That flavour PROVISIONS THE FIRST BLANK DISK AT
+# BOOT WITH NO PROMPT -- boot it with a spare USB stick attached and the stick
+# is wiped. Nothing here would have caught it: the TKAPP check below passes,
+# and the ISO is byte-plausible.
+#
+# So refuse outright on any marker that means "this build does something on its
+# own". These are ERRORS, not warnings -- a warning in a 60-line build log is
+# how the browser shipped exiting 127.
+# NOTE "[PROV] PASS" is deliberately NOT in this list, though it looks like the
+# obvious one: provision_selftest()'s strings are compiled UNCONDITIONALLY (the
+# function is merely not CALLED without -DPROVISION_SELFTEST), so it is present
+# in every clean desktop build and would block all of them. Verified against a
+# known-good build before trusting this gate -- which is the only way to find
+# out that a marker does not discriminate.
+for bad in PROVBOOT REALCURL LXPOSIX LXCONTAINER; do
+    if grep -qa -- "$bad" tobyos.bin; then
+        echo "  FAIL: kernel carries harness marker [$bad] -- NOT SHIPPABLE."
+        echo "        A harness flavour was built last; drop src/*.o and rebuild."
+        exit 1
+    fi
+done
+echo "  ok: no self-acting harness (no auto-provision / boot-test flavour)"
 # Must NOT carry the auto-launch harness.
 if grep -qa "TKAPP. launching" tobyos.bin; then
     echo "  WARNING: kernel still carries the TKAPP auto-launch harness"
