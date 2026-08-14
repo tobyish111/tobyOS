@@ -745,6 +745,36 @@ static void serial_heartbeat(void) {
                    (unsigned long)up_s,
                    free_mib, total_mib,
                    gui_active() ? "on" : "off");
+
+    /* TLB-shootdown health, but ONLY when there is something to say.
+     *
+     * The "[tlb] WARN: cpu%u shootdown ack timeout" line stops after 8
+     * occurrences (a deliberate cap -- it would otherwise flood a 38400-baud
+     * console). That makes 8 timeouts and 8000 look identical from a serial
+     * log, which is exactly the situation on the EliteDesk: one boot showed
+     * the 8-line cap and six later boots showed none, and nothing in between
+     * could have been distinguished.
+     *
+     * A timeout is NOT corruption -- mmap_free_batch_flush quarantines the
+     * frames instead of freeing them, so a stale TLB can never be reused. The
+     * number that would matter is `leaked`: the quarantine is bounded at 8192
+     * and deliberately leaks past that ("a page lost beats a page corrupted"),
+     * and until now nothing reported it. Silent, bounded, unbounded-in-time
+     * leakage is the failure this makes visible.
+     *
+     * Prints nothing on a healthy system, so it costs a comparison per beat. */
+    {
+        extern uint64_t g_tlb_ack_timeouts, g_tlb_giveups;
+        uint64_t to = __atomic_load_n(&g_tlb_ack_timeouts, __ATOMIC_RELAXED);
+        uint64_t gu = __atomic_load_n(&g_tlb_giveups, __ATOMIC_RELAXED);
+        uint64_t qn = 0, ql = 0;
+        mmap_tlbq_stats(&qn, &ql);
+        if (to || gu || qn || ql)
+            kprintf_serial("[tlb] health: ack_timeouts=%lu giveups=%lu "
+                           "quarantined=%lu leaked=%lu\n",
+                           (unsigned long)to, (unsigned long)gu,
+                           (unsigned long)qn, (unsigned long)ql);
+    }
 #ifdef CHROMIUM_BOOT
     /* Wake Ozone X clients blocked in recvmsg (poll path never runs). */
     {

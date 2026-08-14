@@ -118,4 +118,11 @@ long  shm_cache_mmap(struct shm_cache *sc, uint64_t addr, uint64_t len,
  * to userspace -- the mapping IS the DMA buffer, not a shadow. */
 long mmap_map_phys_user(uint64_t phys, uint64_t len);
 
+/* TLB-shootdown quarantine depth + cumulative deliberate leaks. Frames whose
+ * shootdown was not fully acked park in a bounded ring rather than returning
+ * to the PMM; past the bound they are leaked on purpose ("a page lost beats a
+ * page corrupted"). Both numbers were tracked and never surfaced -- the
+ * heartbeat now reports them when non-zero. */
+void mmap_tlbq_stats(uint64_t *depth, uint64_t *leaked);
+
 #endif /* TOBYOS_MMAP_H */

@@ -551,6 +551,17 @@ static int        g_tlbq_n;
 static uint64_t   g_tlbq_leaked;
 static spinlock_t g_tlbq_lock = SPINLOCK_INIT;
 
+/* Read-only view of the quarantine, for the heartbeat's health line. The ring
+ * depth and the leak count were tracked but never reported anywhere, so a
+ * quarantine filling up -- the one genuinely bad outcome here -- was invisible
+ * apart from 8 capped warning lines. */
+void mmap_tlbq_stats(uint64_t *depth, uint64_t *leaked) {
+    spin_lock(&g_tlbq_lock);
+    if (depth)  *depth  = (uint64_t)g_tlbq_n;
+    if (leaked) *leaked = g_tlbq_leaked;
+    spin_unlock(&g_tlbq_lock);
+}
+
 static void tlbq_drain_after_acked(void) {      /* call ONLY after acked==true */
     spin_lock(&g_tlbq_lock);
     for (int i = 0; i < g_tlbq_n; i++) pmm_free_page(g_tlbq[i]);
