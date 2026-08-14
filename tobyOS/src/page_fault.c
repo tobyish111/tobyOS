@@ -512,10 +512,23 @@ int uaccess_prepare_write(uint64_t addr, uint64_t len) {
                         (praw & PTE_PRESENT)  ? "P" : "-",
                         (praw & PTE_WRITABLE) ? "W" : "r",
                         (praw & PTE_USER)     ? "U" : "k");
+                /* The 384-entry ring dump is OPT-IN, and the reason is the
+                 * note above: this hit is EXPECTED on every chrome run. On a
+                 * 38400-baud serial console 384 lines is ~15 s of output and
+                 * roughly 30 KB -- on a real-hardware capture it pushed the
+                 * [chromewin] frame counters past the end of the log, so the
+                 * one question the run existed to answer became unanswerable.
+                 * A diagnostic that fires on a benign condition and buries the
+                 * evidence is worse than no diagnostic. Build with
+                 * -DUACCESS_EFAULT_TRACE when the EFAULT is the thing under
+                 * investigation; the one-line PTE above (which distinguishes
+                 * present-read-only from unmapped) is kept unconditionally. */
+#ifdef UACCESS_EFAULT_TRACE
                 if (logged == 1) {
                     extern void lx_dump_recent_syscalls(void);
                     lx_dump_recent_syscalls();
                 }
+#endif
             }
         }
         return -1;                                      /* read-only / unmapped */
