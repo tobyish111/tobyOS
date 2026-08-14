@@ -252,6 +252,32 @@ static long vfs_err_to_abi(long rv) {
     }
 }
 
+/* Convert a file_read()/file_write() result, WHICH ERROR SPACE IT IS IN
+ * DEPENDING ON THE FILE KIND.
+ *
+ * Only FILE_KIND_VFS dispatches into f->vfs.ops, so only that kind can hand
+ * back a VFS_ERR_* code. Every other kind (socket, pipe, pty, eventfd, ...)
+ * already returns an ABI errno. THE TWO SPACES OVERLAP NUMERICALLY, so running
+ * the second through vfs_err_to_abi() does not pass it through -- it REWRITES
+ * it into an unrelated errno:
+ *
+ *   -ABI_EAGAIN  == -11 == VFS_ERR_NAMETOOLONG  ->  -ABI_ENAMETOOLONG (36)
+ *   -ABI_EBADF   ==  -9 == VFS_ERR_ROFS         ->  -ABI_EROFS
+ *
+ * The first of those broke every remote page load in Chromium. A non-blocking
+ * socket with nothing to read yet is the COMMON case in an epoll-driven client,
+ * and file.c returns SOCK_ERR_AGAIN for it; the conversion turned "retry" into
+ * "file name too long". chrome's SocketPosix maps errno 36 to
+ * ERR_FILE_PATH_TOO_LONG, SocketBIOAdapter::BIORead pushes that into
+ * BoringSSL's error queue, and the TLS handshake dies -- reported as
+ * net::ERR_FILE_PATH_TOO_LONG, an error naming neither a file nor a path.
+ * (Same class as slice 6's raw-VFS_ERR_-to-userspace leak, one level up: the
+ * bug is not a missing conversion but an INAPPLICABLE one.) */
+static long file_err_to_abi(const struct file *f, long rv) {
+    if (rv >= 0) return rv;
+    return (f && f->kind == FILE_KIND_VFS) ? vfs_err_to_abi(rv) : rv;
+}
+
 static void *bounce_in(const void *ubuf, size_t len) {
     void *k = kmalloc(len ? len : 1);
     if (!k) return 0;
@@ -326,7 +352,7 @@ static long sys_write(int fd, const void *buf, size_t len) {
 #endif
     long rv = file_write(f, k, len);
     kfree(k);
-    return vfs_err_to_abi(rv);
+    return file_err_to_abi(f, rv);
 }
 
 static long evdev_read(unsigned dev, uint64_t ubuf, size_t len); /* evdev dev, below */
@@ -423,7 +449,7 @@ static long sys_read(int fd, void *buf, size_t len) {
         rdchk_verify(f->sock->tcp, fd, k, (uint64_t)(uintptr_t)buf, rv, len);
 #endif
     kfree(k);
-    return vfs_err_to_abi(rv);
+    return file_err_to_abi(f, rv);
 }
 
 /* Non-blocking read (slice 45, ABI_SYS_READ_NB): on a pipe, drains what is

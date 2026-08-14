@@ -129,14 +129,26 @@
  * fails. It is NON-persistent (contents reset on reboot) and is always
  * superseded by a real volume (the disk sweep runs first). See the /data
  * mount block in the boot path. */
-#define RAMDATA_BYTES  (8u * 1024u * 1024u)      /* 8 MiB in-RAM /data */
+/* SIZE IS CHOSEN AT RUNTIME FROM FREE RAM (2026-08-14). A hard 8 MiB was fine
+ * for settings + users, but it is the ONLY writable filesystem on a machine
+ * with no tobyfs volume -- and that is where a browser puts its entire
+ * profile, its cache and its logs. The EliteDesk has 6.8 GiB free and was
+ * giving Chromium 8 MiB; QEMU runs never noticed because disk.img backs /data
+ * there. It also silently truncated the one diagnostic that matters here,
+ * chrome's --log-net-log dump.
+ * Take a SIXTEENTH of free RAM, clamped to [8 MiB, 256 MiB]: generous on a
+ * real desktop, and on a small machine it lands on the old 8 MiB, so the
+ * previous behaviour is the floor rather than a regression. */
+#define RAMDATA_MIN_BYTES  (8u  * 1024u * 1024u)
+#define RAMDATA_MAX_BYTES  (256u * 1024u * 1024u)
+static size_t         g_ramdata_bytes;   /* 0 until ramdata_device() runs */
 static uint8_t       *g_ramdata;
 static struct blk_dev g_ramdata_dev;
 
 static int ramdata_read(struct blk_dev *d, uint64_t lba, uint32_t n, void *buf) {
     (void)d;
     uint64_t off = lba * 512ull, len = (uint64_t)n * 512ull;
-    if (!g_ramdata || off + len > RAMDATA_BYTES) return -1;
+    if (!g_ramdata || off + len > g_ramdata_bytes) return -1;
     memcpy(buf, g_ramdata + off, (size_t)len);
     return 0;
 }
@@ -144,7 +156,7 @@ static int ramdata_write(struct blk_dev *d, uint64_t lba, uint32_t n,
                          const void *buf) {
     (void)d;
     uint64_t off = lba * 512ull, len = (uint64_t)n * 512ull;
-    if (!g_ramdata || off + len > RAMDATA_BYTES) return -1;
+    if (!g_ramdata || off + len > g_ramdata_bytes) return -1;
     memcpy(g_ramdata + off, buf, (size_t)len);
     return 0;
 }
@@ -227,12 +239,31 @@ static struct blk_dev *ramoci_device(void) {
 /* Build (once) the in-RAM block device backing the /data fallback. */
 static struct blk_dev *ramdata_device(void) {
     if (g_ramdata) return &g_ramdata_dev;
-    g_ramdata = (uint8_t *)kmalloc(RAMDATA_BYTES);
+
+    /* Size from free RAM, then clamp. pmm is long up by here (the disk sweep
+     * that precedes this ran off it), so pmm_free_pages() is meaningful. */
+    uint64_t want = ((uint64_t)pmm_free_pages() * PAGE_SIZE) / 16u;
+    if (want < RAMDATA_MIN_BYTES) want = RAMDATA_MIN_BYTES;
+    if (want > RAMDATA_MAX_BYTES) want = RAMDATA_MAX_BYTES;
+    want &= ~(uint64_t)511u;                       /* whole 512-byte sectors */
+
+    /* Fall back down rather than leaving /data read-only: a machine that
+     * cannot spare the generous size is still fully usable at the old one. */
+    while (want >= RAMDATA_MIN_BYTES) {
+        g_ramdata = (uint8_t *)kmalloc((size_t)want);
+        if (g_ramdata) break;
+        want /= 2u;
+        want &= ~(uint64_t)511u;
+    }
     if (!g_ramdata) return 0;
-    memset(g_ramdata, 0, RAMDATA_BYTES);
+    g_ramdata_bytes = (size_t)want;
+    memset(g_ramdata, 0, g_ramdata_bytes);
+    kprintf("[ramdata] in-RAM /data sized %lu MiB (free RAM %lu MiB)\n",
+            (unsigned long)(g_ramdata_bytes / (1024u * 1024u)),
+            (unsigned long)((pmm_free_pages() * PAGE_SIZE) / (1024u * 1024u)));
     g_ramdata_dev.name         = "ramdata";
     g_ramdata_dev.ops          = &g_ramdata_ops;
-    g_ramdata_dev.sector_count = RAMDATA_BYTES / 512u;
+    g_ramdata_dev.sector_count = (uint64_t)g_ramdata_bytes / 512u;
     g_ramdata_dev.class        = BLK_CLASS_DISK;
     return &g_ramdata_dev;
 }
@@ -3158,10 +3189,16 @@ void _start(void) {
             if (rd && tobyfs_format(rd) == VFS_OK) {
                 bcache_invalidate(rd);
                 if (tobyfs_mount("/data", rd) == VFS_OK) {
-                    kprintf("[boot] /data is RAM-backed (8 MiB, NOT persistent "
+                    /* Report the size ACTUALLY allocated. It was hardcoded
+                     * "8 MiB" here, which stopped being true the moment the
+                     * fallback started sizing itself from free RAM -- and a
+                     * boot line that states a capacity it did not measure is
+                     * the kind of thing that gets believed later. */
+                    kprintf("[boot] /data is RAM-backed (%lu MiB, NOT persistent "
                             "-- no disk/USB tobyfs volume found; contents reset "
                             "on reboot). Format a stick/disk with mkfs_tobyfs, "
-                            "or make a tobyOS-data GPT partition, to persist.\n");
+                            "or make a tobyOS-data GPT partition, to persist.\n",
+                            (unsigned long)(g_ramdata_bytes / (1024u * 1024u)));
                     data_mounted = true;
                 }
             }
@@ -9358,6 +9395,17 @@ void _start(void) {
                 kprintf("[netlog] /data/netlog.json not present (chrome may not "
                         "have flushed it)\n");
             }
+            /* Real-hardware divergence probe (2026-08-14). On the EliteDesk
+             * every remote page load fails in the TLS handshake while QEMU is
+             * green, so the question is whether the SILICON delivered the
+             * server's flight intact: a TLS record is the least forgiving
+             * consumer of a corrupted or dropped frame, where a small HTTP
+             * fetch would survive one. These counters are CLEAR-ON-READ and
+             * were last read at post-net_init, so this reports exactly the
+             * traffic of the chrome run above -- crc>0 or miss>0 indicts the
+             * I217 RX path rather than anything in TLS. No-op off e1000e. */
+            { extern void e1000e_dump_stats(const char *when);
+              e1000e_dump_stats("post-chrome"); }
         }
     }
 #endif
