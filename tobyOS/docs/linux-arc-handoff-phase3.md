@@ -2437,3 +2437,69 @@ tidy story.
 skipped=0** (`/bin/linux-netlink` 0xff, `[NSIP] n=2 a=1 e=0 z=1 d=1 u=2`,
 `[NSRT] conn=1 def=1`). `lxposix --full` **23/23** `enosys_gaps=0`. **REALCURL
 PASS**. defboot **3/3**.
+
+---
+
+## 26. THE GATES ABOVE WERE ALL GREEN OVER A DEAD NETWORK STACK (2026-08-14)
+
+Read §25's verdict line again: `lxposix --full 23/23`, `REALCURL PASS`,
+`LXNS 21/21`, `defboot 3/3`. Every one of those was true, and **every
+non-blocking socket read in the system had been returning `ENAMETOOLONG` since
+2026-08-09.** No Linux program that reads a socket before data arrives worked.
+Chromium could not load a single remote page — http or https.
+
+### The bug
+
+`sys_read`/`sys_write` ran **every** file kind's result through
+`vfs_err_to_abi()`. Only `FILE_KIND_VFS` dispatches into `f->vfs.ops`, so only
+it speaks `VFS_ERR_*`; sockets, pipes and ptys already return ABI errnos. The
+two spaces **overlap numerically**, so the conversion did not pass them
+through, it REWROTE them:
+
+```text
+-ABI_EAGAIN == -11 == VFS_ERR_NAMETOOLONG  ->  -ABI_ENAMETOOLONG (36)
+-ABI_EBADF  ==  -9 == VFS_ERR_ROFS         ->  -ABI_EROFS
+```
+
+Fix (`5d2ef41`): `file_err_to_abi()` applies the conversion **only** for
+`FILE_KIND_VFS`. **The fix is the ABSENCE of a conversion.** This is slice 6's
+raw-`VFS_ERR_`-leak one level up — there a conversion was MISSING, here an
+INAPPLICABLE one was added, and *the fix for the first caused the second*.
+
+`git log -L 424,427:src/syscall.c` names the commit in one command: `3f8e670`
+("Linux-completeness phase 3"). Use `git log -L` before theorising about
+whether you broke something.
+
+### WHY EVERY GATE MISSED IT — the part that matters for Phase 4
+
+- **`lxposix.sh` has NO socket coverage.** File management, credentials, suid,
+  timers, mount. That is the standing regression gate for this arc and it
+  cannot see the network at all.
+- **`REALCURL PASS` IS NOT SOCKET COVERAGE.** It is real curl over real
+  sockets and it passed *three days into* the regression. curl polls until
+  readable and THEN reads, so the data is already there and the `EAGAIN` branch
+  never executes. Chromium fails because it reads **optimistically, before the
+  data arrives** — which `file.c`'s own comment calls "the COMMON case in an
+  epoll-driven client, not an edge case".
+
+**So the owed test has a specific SHAPE, not just a subject: it must read a
+non-blocking socket BEFORE data is available and assert `errno == EAGAIN`.** A
+socket test that polls first re-passes over this exact bug. (Not added here:
+the `linux-*` tests are prebuilt `.elf`s and this box has no Linux toolchain.)
+
+Interim gate added, `logs/cwnet.sh`: builds the ORDINARY desktop with
+`-DCW_URL` pointed at a remote url and fails on a `[net] FAILED` line.
+Verified after the fix: `tobyprobe rs=complete title=Example Domain blen=207`,
+300 frames, **0** `[net] FAILED`, 0 faults.
+
+### Two method traps paid for in the same session
+
+- **`/data` on `disk.img` PERSISTS across QEMU runs.** A run whose chrome died
+  early re-read the PREVIOUS run's `netlog.json`, and the harness printed
+  byte-identical output that looked exactly like a fresh reproduction. Boot
+  without `-drive` (RAM-backed `/data`, fresh per boot, and the same shape real
+  hardware has); `run_watch.py` already uses `snapshot=on`.
+- **Verify in the configuration that SHIPS.** `CHROMIUM_BOOT` passes
+  `--screenshot`, which forces the X/SwiftShader render tier; it crashes there
+  for its own reasons before a netlog is ever written, so it cannot report on a
+  networking fix. It is a diagnostic, not a gate.
