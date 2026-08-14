@@ -1733,9 +1733,20 @@ static int tfs_compute_geom(uint32_t total_blocks, struct tfs_geom *g) {
     if (total_blocks < TFS_TOTAL_BLOCKS) return -1;
     if (total_blocks > TFS_MAX_TOTAL_BLOCKS) total_blocks = TFS_MAX_TOTAL_BLOCKS;
 
-    /* Scale inodes with the volume: ~1 inode per 64 blocks, floor 256, and
-     * round UP to a whole inode-table block (TFS_INODES_PER_BLOCK each). */
-    uint32_t inodes = total_blocks / 64u;
+    /* Scale inodes with the volume: ~1 inode per 4 blocks, floor 256, and
+     * round UP to a whole inode-table block (TFS_INODES_PER_BLOCK each).
+     *
+     * WAS 1-per-64 (one inode per 256 KiB), which assumed big files. A browser
+     * profile is the opposite workload -- thousands of small cache entries --
+     * and it exhausted the inode table long before the space: a 256 MiB /data
+     * carried only 1023 inodes, so Chromium's SECOND launch could not create a
+     * file and its leveldb reported "OS or hardware error". Inodes are 128 B,
+     * i.e. 32 per block, so this density costs 0.8% of the volume (2 MiB on
+     * 256 MiB) -- the stingy version was not buying anything worth having.
+     * 1-per-4-blocks == one inode per 16 KiB, which is ext4's default
+     * bytes-per-inode. Geometry is per-volume and comes from the superblock at
+     * mount, so existing images keep their own count and still mount. */
+    uint32_t inodes = total_blocks / 4u;
     if (inodes < TFS_INODE_COUNT) inodes = TFS_INODE_COUNT;
     inodes = ((inodes + TFS_INODES_PER_BLOCK - 1) / TFS_INODES_PER_BLOCK)
              * TFS_INODES_PER_BLOCK;

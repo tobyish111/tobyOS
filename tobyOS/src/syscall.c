@@ -2643,13 +2643,17 @@ static long sys_open(const char *path, int flags, int mode) {
     if (rc != VFS_OK) {
         kfree(f->vfs_refs);
         kfree(f);
-        switch (rc) {
-        case VFS_ERR_NOENT: return -ABI_ENOENT;
-        case VFS_ERR_ISDIR: return -ABI_EISDIR;
-        case VFS_ERR_PERM:  return -ABI_EACCES;
-        case VFS_ERR_NOMOUNT: return -ABI_ENOENT;
-        default:            return -ABI_EIO;
-        }
+        /* Was a four-case switch with `default: -ABI_EIO`, which is the SAME
+         * mistake slice 61c fixed twenty lines above on the create path and
+         * recorded as costing a day: a blanket default destroys the one piece
+         * of information the caller needs. Here it flattened VFS_ERR_NOSPC --
+         * a FULL /data -- into EIO, so Chromium's second launch reported
+         * "IO error: .../LOCK: OS or hardware error" and looked like failing
+         * storage rather than a filesystem with no room left.
+         * vfs_err_to_abi() is exactly the right converter here (this rc really
+         * IS a VFS code) and it is a strict superset of the four cases: NOENT,
+         * ISDIR, PERM and NOMOUNT all map identically. */
+        return vfs_err_to_abi(rc);
     }
     /* Reject write attempts on a read-only access mode early -- we
      * still let the file_write path enforce mount-level RO. */
