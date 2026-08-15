@@ -82,6 +82,34 @@ static void populate(void) {
         g_ndisk++;
     }
     if (g_sel >= g_ndisk) g_sel = g_ndisk ? g_ndisk - 1 : 0;
+
+    /* Say on the SERIAL CONSOLE what this window is showing.
+     *
+     * Every string in this program goes into a GUI buffer via snprintf, so a
+     * remote log records that diskmgr started and nothing else -- the screen
+     * is the only place the answer exists, and "what did Disk Manager list?"
+     * then costs a photograph or a reboot. The verdict per device is exactly
+     * what decides whether provisioning is possible, so print it.
+     *
+     * Once per populate(), so it follows a refresh rather than spamming. */
+    static const char *vname[] = {
+        "UNKNOWN(unprobed)", "BLANK(provisionable)", "TOBYOS(needs FORCE)",
+        "FOREIGN(refused, unforceable)", "MOUNTED(refused)", "NOT_DISK"
+    };
+    printf("[diskmgr] %d block device(s), %d disk(s):\n", g_nblk, g_ndisk);
+    for (int i = 0; i < g_nblk; i++) {
+        char sz[16];
+        unsigned v = g_blk[i].verdict;
+        fmt_size(g_blk[i].sector_count, sz, sizeof(sz));
+        printf("[diskmgr]   %-16s %-9s %s fs=%-7s %s%s\n",
+               g_blk[i].name, sz,
+               g_blk[i].class == 1 ? "disk" : "part",
+               g_blk[i].fs[0] ? g_blk[i].fs : "-",
+               (g_blk[i].flags & ABI_BLK_F_RAM) ? "RAM " : "",
+               g_blk[i].class == 1
+                   ? (v < 6 ? vname[v] : "?")
+                   : (g_blk[i].label[0] ? g_blk[i].label : ""));
+    }
 }
 
 static int part_count_of(int bi) {
