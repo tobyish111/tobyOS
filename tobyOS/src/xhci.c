@@ -2316,6 +2316,54 @@ static int xhci_probe(struct pci_dev *dev) {
 
     xhci_bios_handoff();
 
+    /* CLAIM THE PORTS THE FIRMWARE IS HOLDING FOR US (Intel PCH).
+     *
+     * On 7/8-series PCH the USB2 differential pairs are shared between EHCI
+     * and xHCI, and with the BIOS set to Auto / Smart Auto they come up on
+     * EHCI *deliberately* -- so a legacy OS with no xHCI driver can still use
+     * a keyboard. The firmware then WAITS for the OS to claim them by writing
+     * XUSB2PR. This is a documented handoff, not a fight with the firmware:
+     * Linux performs exactly these four accesses in
+     * usb_enable_intel_xhci_ports() (xhci-pci.c), and Windows does the same.
+     * tobyOS simply never implemented its half, which is why the EliteDesk
+     * reported "xhci port census: 0 of 21" with a stick plugged in while both
+     * EHCI controllers showed a device.
+     *
+     *   USB3PRM  (0xDC) -> which SuperSpeed ports CAN be enabled
+     *   USB3PSSEN(0xD8) -> enable them
+     *   XUSB2PRM (0xD4) -> which USB2 ports CAN be routed to xHCI
+     *   XUSB2PR  (0xD0) -> route them
+     *
+     * Only the ports the MASK says are routable are touched, so a port the
+     * board wired EHCI-only stays put.
+     *
+     * KEYBOARD NOTE, because this is the risk: routing takes the ports away
+     * from the BIOS's legacy emulation, so input then depends on tobyOS's own
+     * HID path -- which exists and is wired (usb_hid_probe below). A REAL PS/2
+     * keyboard is unaffected either way. If HID-over-xHCI misbehaves on some
+     * board, reverting is a reflash of the previous image, and the routing is
+     * re-done from scratch on every boot (no persistent state is written). */
+    if (dev->vendor == 0x8086) {
+        uint32_t ss_mask = pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xDC);
+        uint32_t hs_mask = pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xD4);
+        uint32_t ss_before = pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xD8);
+        uint32_t hs_before = pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xD0);
+        if (ss_mask || hs_mask) {
+            if (ss_mask) pci_cfg_write32(dev->bus, dev->slot, dev->fn, 0xD8, ss_mask);
+            if (hs_mask) pci_cfg_write32(dev->bus, dev->slot, dev->fn, 0xD0, hs_mask);
+            kprintf("[xhci] Intel port routing: SS 0x%08x->0x%08x (mask 0x%08x) "
+                    "HS 0x%08x->0x%08x (mask 0x%08x)\n",
+                    (unsigned)ss_before,
+                    (unsigned)pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xD8),
+                    (unsigned)ss_mask, (unsigned)hs_before,
+                    (unsigned)pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xD0),
+                    (unsigned)hs_mask);
+        } else {
+            kprintf("[xhci] Intel port routing: nothing routable "
+                    "(XUSB2PRM=0 USB3PRM=0) -- ports are wired to EHCI\n");
+        }
+    }
+
     if (!xhci_controller_init()) return -5;
 
     g_xhci.bound = true;
