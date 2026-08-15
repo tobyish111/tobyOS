@@ -1666,6 +1666,46 @@ static void ehci_probe_legacy_ownership(struct pci_dev *dev,
                 "emulation; preserving it for keyboard/mouse input\n",
                 dev->bus, dev->slot, dev->fn);
     }
+
+    /* READ-ONLY port census, to answer the one question the xHCI census
+     * cannot: "is my stick actually plugged in, just on the wrong
+     * controller?"
+     *
+     * The xHCI census reports "0 of 21 connected" identically whether nothing
+     * is plugged in at all or a USB-2 device is sitting on a port the firmware
+     * routed to EHCI -- and those two call for completely different actions
+     * (plug something in, versus move it to a blue port). EHCI's PORTSC tells
+     * us directly.
+     *
+     * PURE READS. No writes, no ownership handover, no reset: this must not
+     * disturb the BIOS's legacy emulation, which is what keeps the keyboard
+     * and mouse alive on a machine whose only other console is a serial
+     * cable. PORTSC lives at operational offset 0x44 + 4*n, and both `bar`
+     * and `caplen` are already in hand here even on the BIOS-owned path. */
+    {
+        volatile uint8_t *op = bar + caplen;
+        unsigned conn = 0;
+        char list[48]; size_t lo = 0; list[0] = 0;
+        for (uint8_t p = 0; p < c->ports && p < 15u; p++) {
+            uint32_t ps = mmio_r32(op, 0x44u + 4u * (uint32_t)p);
+            if (ps & 1u) {                          /* CCS: device present */
+                conn++;
+                if (lo < sizeof(list) - 6)
+                    lo += (size_t)ksnprintf(list + lo, sizeof(list) - lo,
+                                            "%s%u", lo ? "," : "", p + 1u);
+            }
+        }
+        kprintf("[usb-legacy] EHCI %02x:%02x.%x port census: %u of %u "
+                "connected%s%s\n", dev->bus, dev->slot, dev->fn,
+                conn, (unsigned)c->ports,
+                conn ? " -- port(s) " : " (nothing on this controller)",
+                conn ? list : "");
+        if (conn)
+            kprintf("[usb-legacy]   NOTE: a device here is on the BIOS-owned "
+                    "EHCI controller and is INVISIBLE to tobyOS storage. For a "
+                    "data volume, move it to a blue USB-3 port so xHCI owns "
+                    "it.\n");
+    }
 }
 
 static bool legacy_companions_online(void) {
