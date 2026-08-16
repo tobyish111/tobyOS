@@ -710,6 +710,42 @@ static int g_req_total, g_req_media, g_resp_media, g_fail_total, g_fin_media;
  * completes, tiles=2/cmt=0 is a DATA problem, not a rendering one). */
 static int g_req_thumb, g_req_api, g_resp_api_ok, g_resp_api_bad, g_req_cont;
 
+/* ---- Slice 130: THE LOADING INDICATOR ---------------------------------- *
+ * Until now the bar showed one plain string, and on navigation it was set to
+ * the DESTINATION URL immediately while the page area kept showing the
+ * PREVIOUS page's last frame. First paint on this hardware is tens of
+ * seconds out, so for that whole window the browser looked exactly like a
+ * hung one -- no feedback that the click had even registered. That is a real
+ * part of "sluggish" that has nothing to do with frame rate.
+ *
+ * chrome already tells us everything needed: Network.enable is unconditional
+ * (see chrome_bootstrap) and requestWillBeSent / loadingFinished /
+ * loadingFailed bracket every request. So this is a HONEST indicator -- an
+ * animated glyph plus the real number of outstanding requests -- not a
+ * decorative spinner that spins whether or not anything is happening.
+ *
+ * The failure mode to design against is a spinner that never stops, which is
+ * worse than none: it would report "still loading" forever and train the user
+ * to ignore it. Two guards:
+ *   - the in-flight count is CLAMPED at zero (a loadingFailed we never saw a
+ *     request for must not drive it negative, or it can never return to 0);
+ *   - it is ARMED BY RECENT ACTIVITY. chrome can drop a request without a
+ *     terminal event (aborted speculative loads do exactly this -- see the
+ *     ERR_ABORTED note in the cwwebgl gate), leaking the count. If no network
+ *     event has arrived for LOAD_QUIET_MS the page is done as far as the user
+ *     is concerned, whatever the counter says. */
+#define LOAD_QUIET_MS 5000
+#define SPIN_STEP_MS  120            /* glyph advance; ~8 steps/s reads as alive */
+static int  g_net_inflight;          /* requests started but not yet ended */
+static long g_net_last_ms;           /* last network event, 0 = none yet */
+static int  g_spin_phase;            /* advanced by the main loop, not by paint */
+
+/* Is the page loading RIGHT NOW? Both conditions, for the reasons above. */
+static int load_active(void) {
+    return g_net_inflight > 0 && g_net_last_ms &&
+           (sys_clock_ms() - g_net_last_ms) < LOAD_QUIET_MS;
+}
+
 /* Slice 122: .br.js decode diagnostic state (see the responseReceived and
  * loadingFinished branches below, and the reply handler in cdp_dispatch). */
 static char g_brjs_rid[48];
@@ -720,6 +756,28 @@ static int  g_brjs_printed;
 
 static void note_network_event(void) {
     static char url[160], err[96];
+
+    /* Slice 130: keep the in-flight count HERE, at the top, before any of the
+     * per-URL branches below -- every one of them ends in an early `return`,
+     * so a decrement placed inside the loadingFinished branch would be
+     * skipped for exactly the requests that took the media/api/thumb paths
+     * and the count would never come back down. */
+    {
+        int started = strstr(g_msg, "\"Network.requestWillBeSent\"") != 0;
+        int ended   = strstr(g_msg, "\"Network.loadingFinished\"") != 0 ||
+                      strstr(g_msg, "\"Network.loadingFailed\"")   != 0;
+        if (started || ended) {
+            g_net_last_ms = sys_clock_ms();
+            if (started) g_net_inflight++;
+            else if (g_net_inflight > 0) g_net_inflight--;   /* clamped */
+            /* Deliberately NO tk_redraw here. A busy page fires hundreds of
+             * these, and tk_redraw only marks dirty -- so they would coalesce
+             * into a paint on every one of the ~66 main-loop passes per
+             * second, adding compositor work during precisely the load window
+             * this indicator exists to make feel faster. The 120 ms spinner
+             * tick already repaints; the count rides along with it. */
+        }
+    }
 
     if (strstr(g_msg, "\"Network.requestWillBeSent\"")) {
         g_req_total++;
@@ -2743,6 +2801,19 @@ static void paint(struct tk_window *w, struct tk_widget *cv) {
         char ob[256];
         snprintf(ob, sizeof ob, "%s_", g_omni);        /* trailing cursor */
         tk_draw_text(w, 60, 6, ob, 0x00f0f4f8u, 14, 0);
+    } else if (load_active()) {
+        /* Slice 130: glyph + the REAL number of outstanding requests.
+         * ASCII |/-\ deliberately: the bar is drawn with the Lato TTF and a
+         * prettier braille/box spinner would silently fall back to a missing
+         * glyph. g_spin_phase is advanced by the main loop on a wall clock,
+         * not per paint -- painting is driven by frame arrival, which is the
+         * very thing that stops during a load, so a per-paint animation would
+         * freeze exactly when it is supposed to be reassuring. */
+        static const char glyph[4] = { '|', '/', '-', '\\' };
+        char lb[192];
+        snprintf(lb, sizeof lb, "%c  %s  (%d)",
+                 glyph[g_spin_phase & 3], g_status, g_net_inflight);
+        tk_draw_text(w, 60, 6, lb, 0x00e0e4f0u, 14, 0);
     } else {
         tk_draw_text(w, 60, 6, g_status, 0x00d0d0d8u, 14, 0);
     }
@@ -3364,6 +3435,50 @@ int main(void) {
          * configuration the verified +16.5% was measured in. (n=1 per arm and
          * multi-process runs vary, so treat 38.3 as indicative -- but there is
          * no evidence FOR the change, so it does not ship.) */
+        /* Slice 130: drive the loading glyph off the WALL CLOCK.
+         * Everything else in this window repaints when a frame arrives -- and
+         * during a page load frames are exactly what is not arriving, which is
+         * why the browser looked hung in the first place. So tick here, in the
+         * loop that always runs, and only while a load is actually active:
+         * an idle browser must not wake the compositor 8 times a second.
+         * One redraw per 120 ms costs ~1 ms of paint (measured: paint=0ms). */
+        {
+            static long next_spin, load_t0;
+            static int  was_loading, load_reqs;
+            long now = sys_clock_ms();
+            /* Two lines per page load, on the STATE TRANSITIONS only -- enough
+             * to gate the indicator from a log ("did it arm, and did it ever
+             * disarm?") without becoming per-request chatter. The stuck-
+             * spinner failure mode is invisible from a screenshot and obvious
+             * from these. */
+            if (load_active() != was_loading) {
+                was_loading = !was_loading;
+                if (was_loading) {
+                    load_t0 = now; load_reqs = g_req_total;
+                    printf("[cwload] loading: %d in flight\n", g_net_inflight);
+                } else {
+                    printf("[cwload] settled after %ldms, %d requests, "
+                           "%d still counted in flight\n",
+                           now - load_t0, g_req_total - load_reqs,
+                           g_net_inflight);
+                }
+            }
+            if (load_active()) {
+                if (now >= next_spin) {
+                    next_spin = now + SPIN_STEP_MS;
+                    g_spin_phase++;
+                    tk_redraw(&win);
+                }
+            } else if (g_spin_phase) {
+                /* Load just ended: one final repaint to clear the glyph and
+                 * the count, otherwise the last spinner frame stays on screen
+                 * until something else happens to trigger a paint. */
+                g_spin_phase = 0;
+                next_spin = 0;
+                tk_redraw(&win);
+            }
+        }
+
         usleep(15000);
     }
     printf("[chromewin] exiting; frames=%d\n", g_frames);
