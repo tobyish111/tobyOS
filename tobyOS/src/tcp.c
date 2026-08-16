@@ -580,6 +580,26 @@ static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
      * at 65535: with a 64 KiB buffer the raw value is 65536, which a
      * bare uint16_t cast would truncate to a ZERO window. */
     uint32_t free_wnd = (uint32_t)(TCP_RX_BUF_BYTES - c->rx_count);
+    /* Slice 124: RFC 1122 4.2.3.3 receiver-side silly-window avoidance.
+     * Never announce a NON-ZERO window smaller than one MSS -- announce
+     * zero and reopen only when a worthwhile amount is free. Without this
+     * the window trickles open in whatever scraps the app happened to
+     * drain, the peer answers with segments that small, and a bulk
+     * transfer degenerates into hundreds of round trips carrying a few
+     * hundred bytes each. (The 2026-08-15 capture showed exactly that
+     * shape -- 0, 128, 256, 384 ... -- though its immediate cause was a
+     * log line on the send path, fixed separately in tcp_recv. This is
+     * the structural guard that makes the shape impossible rather than
+     * merely unobserved.)
+     *
+     * Zero here is SAFE to announce only because something re-opens it:
+     * tcp_recv sends a window update once >= 2 MSS is free. That update
+     * is a pure ACK and pure ACKs are never retransmitted, so if it is
+     * lost the peer waits for its own zero-window probe -- a real
+     * remaining hole, deliberately left for its own slice rather than
+     * bundled into a window-advertisement change. */
+    if (free_wnd < TCP_DEFAULT_MSS && free_wnd < TCP_RX_BUF_BYTES / 2u)
+        free_wnd = 0;
     uint16_t adv_wnd;
     if (c->wscale_ok && !(flags & TCP_FLAG_SYN))
         adv_wnd = (uint16_t)(free_wnd >> c->rcv_wnd_shift);
@@ -1468,14 +1488,40 @@ long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
         uint32_t free_now = (uint32_t)(TCP_RX_BUF_BYTES - c->rx_count);
         if (free_now > c->adv_free_last &&
             free_now - c->adv_free_last >= 2u * TCP_DEFAULT_MSS) {
+            /* Slice 124: SEND FIRST, LOG AFTER. This kprintf used to sit
+             * between the decision and the send, and on a 38400-baud console
+             * one ~50-char line costs ~13 ms with interrupts enabled -- so
+             * in-flight data refilled the ring before tcp_emit sampled
+             * rx_count, and we advertised the collapsed window instead of the
+             * one we had just decided to announce. The 2026-08-15 capture
+             * shows the signature: twelve consecutive updates whose
+             * free-minus-announced gap is EXACTLY 17280 bytes, a constant
+             * because the log line is a constant duration. A varying delay
+             * would have given a varying gap; that constant is what says
+             * "instrument", not "network".
+             *
+             * This is the same trap tcp_set_trace(1) is documented for --
+             * per-segment logging on this console delays ACKs until senders
+             * back off, CAUSING the stall it was meant to observe. Logging
+             * after the send also reports strictly more: what the peer knew
+             * AND what we actually told it (adv_free_last is stamped by
+             * tcp_emit), which is the pair needed to judge the window. */
+#ifdef CHROMIUM_BOOT
+            uint32_t knew = c->adv_free_last;   /* before the send stamps it */
+#endif
+            tcp_send_ack(c);
 #ifdef CHROMIUM_BOOT
             {   static int wu = 0;
                 if (wu < 24) { wu++;
-                    kprintf("[tcp] WIN-UPDATE tcp[%d] free=%u peer-knew=%u\n",
-                            conn_index(c), free_now, c->adv_free_last);
+                    kprintf("[tcp] WIN-UPDATE tcp[%d] free=%u peer-knew=%u "
+                            "announced=%u\n",
+                            conn_index(c), free_now, knew,
+                            (unsigned)c->adv_free_last);
+                    if (wu == 24)
+                        kprintf("[tcp] WIN-UPDATE log CAP HIT (24) -- later "
+                                "updates are NOT logged\n");
                 } }
 #endif
-            tcp_send_ack(c);
         }
 #ifdef CHROMIUM_BOOT
         if (c->rx_full_episode && free_now >= TCP_RX_BUF_BYTES / 2u)
