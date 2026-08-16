@@ -1253,7 +1253,26 @@ void sched_tick(struct regs *r) {
              * exist inside chrome and change per frame, or not? Rides this
              * heartbeat for the same reason xserver_debug_tick does -- pid
              * 0's idle loop never runs under chrome load. */
+            /* SLICE 129: OFF BY DEFAULT NOW -- the question it was built to
+             * answer is closed, and the instrument outlived it.
+             *
+             * MEASURED on a 260 s Bing run: 86 rounds x ~641 regions = 55,164
+             * lines = 3.9 MB, which is 84% of ALL serial output. The guest
+             * emits 18.1 KB/s against a 38400-baud UART that carries 3.84
+             * KB/s, so on the user's real hardware this instrument alone
+             * oversubscribes the wire 4.7x -- and in QEMU every one of those
+             * bytes is a VM exit (slice 63c's lesson, applied to the biggest
+             * offender rather than the smallest).
+             *
+             * What it was for: "does a framebuffer-sized shared region exist
+             * inside chrome and change per frame?" Slice 110 answered yes and
+             * measured the resulting path; slice 129 then measured that path
+             * LOSING to plain CDP on a real page (6.16 vs 7.32 fps) because a
+             * static page commits ~6x/s, not 60. The premise is settled in
+             * both directions. Build with -DSHM_CENSUS to bring it back. */
+#ifdef SHM_CENSUS
             { extern void shm_census_dump(void); shm_census_dump(); }
+#endif
             if (now - last_deep > 60000000000ull) {
             last_deep = now;
             extern struct proc g_proc[];

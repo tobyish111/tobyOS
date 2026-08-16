@@ -1,10 +1,8 @@
 # Handoff: make Chromium on tobyOS feel responsive
 
-Read this file first, then `docs/chromium-handoff-post-slice-108.md` §5 (the
-prior perf roadmap — it is still substantially correct and this file builds on
-it rather than replacing it). Memory topics: `chromium-bringup.md`,
-`browser-webgl-swiftshader.md`. Baseline commit: `88efd21` on
-`feat/chromium-browser`.
+Read this file first, then `docs/chromium-handoff-post-slice-108.md` §5.
+Memory topics: `chromium-bringup.md`, `browser-webgl-swiftshader.md`.
+Baseline commit for slice 129: `eb82bb2` on `feat/chromium-browser`.
 
 **The user's ask, verbatim: "make it much more responsive like real chrome or
 edge is."** They browse on a real HP EliteDesk 800 G1 (Haswell i5-4590, 4
@@ -13,204 +11,227 @@ generally sluggish browser.
 
 ---
 
-## 1. The one number that matters, and where it comes from
+## 1. WHAT SLICE 129 SETTLED — read this before re-planning anything
 
-Steady-state frame cadence on a real page (Bing SERP), QEMU, current default
-build:
+Three things, two of them retractions of what the previous version of this
+file told you to go do.
 
-```
-[cwif] frame 780 | gap avg=122ms max=714ms | cap avg=140ms | turn avg=...
-```
+**A. The "~6.5× sitting on the table" was not real.** This file's §3 said
+slice 110 measured ~52.7 fps through the viz shared-bitmap path while we ship
+~8 fps of CDP JPEG, and told you to go make multi-process the default. Those
+two numbers were measured **on different pages**. `anim.html` is a 60 fps rAF
+animation benchmark; the ~8 fps figure came from a Bing SERP. Measured on the
+SAME page, both arms rebuilt from the same tree on the same day:
 
-**~8 fps.** On the user's real hardware, a static page measured `cap
-avg=366ms` (~2.7 fps).
-
-What the fields mean (`handle_screencast_frame`, programs/chromewin/main.c):
-
-* `cap` — delta between **chrome's own** capture timestamps. Chrome's
-  production rate.
-* `turn` — our ack → next frame arriving.
-* `gap` — wall time between frames landing in chromewin.
-
-**The screencast is SINGLE-IN-FLIGHT: chrome captures frame N+1 only after we
-ack frame N.** So `cap` ≈ our ack latency + chrome's capture+JPEG-encode+
-transfer. Every frame pays a full JPEG encode, base64, pipe round trip,
-base64 decode, JPEG decode, blit. That is the architectural ceiling, and it
-is why this will not reach Chrome-like smoothness by tuning.
-
----
-
-## 2. What was just fixed (do NOT re-chase these)
-
-**Sleeping processes were busy-waiting (slice 128, commit `88efd21`).**
-`sys_nanosleep` pause-spun to its deadline with a `sched_yield()` per
-iteration — the process stayed READY and paid a BKL round trip per yield.
-chromewin's main loop is one `usleep(15000)` per pass, so this was the
-browser's steady state. Measured on the EliteDesk over 17.5 s:
-
-| process | CPU | share |
+| arm | page | steady fps |
 | --- | --- | --- |
-| `chromewin` | 6027 ms | ~34% of a core, doing nothing |
-| `chrome-headless-shell` | 1492 ms | ~8.7%, the thing rendering |
+| `cpu` (single-process CDP, what ships) | Bing SERP | **7.32** |
+| `viz` (multi-process + viz shm) | Bing SERP | **6.16** |
+| `cpu` | anim.html | 46.31 |
+| `viz` | anim.html | **61.27** |
 
-Chrome was **starved, not render-bound**. Sleepers now park with
-`sleep_deadline_ns` and are woken by a sweep at the top of `sched_yield`
-beside the alarm/futex sweeps. **Measured: 570 → 780 frames (+37%) on the
-same page and run length. Per-frame cadence UNCHANGED (~116 ms)** — which is
-precisely what localises the remaining bottleneck to the screencast round
-trip rather than to CPU.
+**On a real page the viz path LOSES by 16%.** The mechanism is not subtle and
+`main.c` already documented it at slice 114: viz frames arrive when chrome
+*commits* a new frame, and a real page that has finished loading commits
+~6×/s, not 60. anim.html commits 61×/s because it is written to. So viz was
+never a 6.5× on browsing — it was a faithful measurement of an animation
+benchmark. Multi-process additionally costs: the same run's `cap` rose from
+123 ms to 166 ms.
 
-Also fixed today and load-bearing for perf work: the shm-cache exhaustion
-that silently un-shared MAP_SHARED regions past 256 (see
-`bing-brjs-blank-serp` memory) — **multi-process chrome depends on that
-path**, so measurements taken before it are suspect.
+**DO NOT ship multi-process/viz as the default. DO NOT re-plan around the
+6.5×.** viz remains the right path for animation-heavy content and the arm
+still works; it is simply not what browsing looks like.
 
----
+**B. Multi-process chrome is NOT broken.** The previous file called its own
+`-DCW_MP -DCW_VIZ` run "inconclusive" because the archived log "ends at 3733
+ms while the gate says the guest ran 250 s". The log was complete and correct.
+The guest really did run 250 s and really did print nothing after 3.7 s —
+because `gpuperf.sh` force-rebuilt `chromewin.o` and `mmap.o` but **not
+`src/kernel.o`**, which is where `TKAPP_CHROMEWIN` lives. The ISO booted a
+kernel that had never been told to launch a browser. Rebuilt properly, the
+same arm runs 61.27 fps and spawns a real `--type=renderer` and
+`--type=gpu-process`. See §4 for the gates that now make this impossible.
 
-## 3. THE LIVE ITEM: the fast path exists and is not being used
-
-`docs/chromium-handoff-post-slice-108.md` §5 item 2 records that slice 110
-**measured chrome committing ~52.7 frames/s** through the viz shared-bitmap
-path, at producer parity with the page's own rAF (61/s). That is ~6.5× what
-we ship.
-
-**We ship the slow path.** The default build is CDP JPEG screencast. The fast
-path is `-DCW_VIZ`, and per `logs/gpuperf.sh` it is ALWAYS paired:
-
-```
-viz)  PROGF="$PROGF -DCW_MP -DCW_VIZ"     # multi-process + read viz shm bitmaps
-```
-
-**`CW_VIZ` requires `CW_MP`, and that is structural, not incidental**: viz
-shared bitmaps only exist when the renderer and viz are separate processes.
-Under `--single-process` (our default) the transport cannot exist at all —
-`main.c` says so at the `--single-process` flag.
-
-So the chain is: **multi-process → viz shared bitmaps → ~53 fps.**
-
-### What I measured, and what I did NOT establish
-
-* `-DCW_MP` **alone**, via `logs/cwnet.sh`: **zero frames**, a child exits
-  with code 3. But this is a configuration the project never uses — CW_MP was
-  only ever an shm-census arm. Do not read it as "multi-process is broken".
-* `-DCW_MP -DCW_VIZ` via `bash logs/gpuperf.sh viz anim`: the gate failed
-  (`GATE FAIL: full-length run with no '[bkl] cpu' report`) and the archived
-  log `logs/gpuperf_viz_anim.013.log` **ends at 3733 ms while the gate reports
-  the guest reached 250588 ms** — so the archive is truncated or points at the
-  wrong file. **My analysis of that run is inconclusive, not a failure
-  verdict.** Start by fixing that log plumbing so the run can be read at all.
-
-### Job 1, concretely
-
-1. Make `gpuperf.sh viz` produce a readable full-length log. Check which file
-   it archives vs which one `run_watch.py` writes (`logs/run_watch.log`).
-2. Determine whether multi-process chrome still bootstraps at all on the
-   current kernel. Slice 109 root-caused an earlier multi-process flake (a
-   proc-slot allocation race, fixed with an atomic PROC_EMBRYO claim) — check
-   whether that regressed, and note that today's shm-cache fix changes the
-   MAP_SHARED behaviour multi-process depends on.
-3. If it bootstraps, measure `viz` against the `cpu` arm on the SAME page and
-   ship whichever wins **as the default**, with the number in the commit.
-
-That is the item with a measured ~6.5× on the table. Everything else on this
-list is single-digit percent.
+**C. The one real win was an instrument, not an architecture.** See §2.
 
 ---
 
-## 4. Ranked levers after that
+## 2. WHAT SHIPPED, AND THE NUMBER
 
-2. **Kill the JPEG round trip even on the CDP path.** `chromewin` already
-   switches to a zero-copy blit ON EVIDENCE (`XF_LIVE_FRAMES` real SHM
-   frames, then `Page.stopScreencast`) — but `xframe_poll_once` is gated on
-   `CHROME_FULL`, the headed/Ozone build. Its own comment sizes JPEG at ~2.3×
-   waste.
-3. **execve holds the BKL ~730 ms per exec'd chrome process** (slice 111,
-   §5 item 3 of the older handoff). Bootstrap/navigation only, but the user
-   explicitly complains about *load* time, so this lands where they feel it.
-   Named follow-up there: phase-time `sys_execve` (vfs_read_all vs mapping vs
-   BSS zero) before attempting the BKL drop — careful, `g_pml4_phys` editor
-   root is a shared global.
-4. **WebGL costs ~10–15%** (`cwwebgl` cap 136–150 ms vs `tcpfix` 119–140 ms).
-   It ships enabled via `-DCW_SWGL` because the user asked for it. If perf
-   wins over capability, drop it — but ASK, do not decide unilaterally.
+`shm_census_dump()` ran every 3 s from `sched_tick`, **unconditionally, in the
+default build**, hashing every shared region the kernel owned and printing one
+line per region. Measured on a 260 s Bing run: 86 rounds × ~641 regions =
+55,164 lines = 3.9 MB, which is **84% of all serial output**.
+
+That put the guest at 18.1 KB/s of log against a 38400-baud UART that carries
+3.84 KB/s — **4.7× oversubscribed on the user's real hardware**, where every
+byte past the ring costs an `inb` + spinlock with interrupts disabled, and in
+QEMU costs a VM exit. Gated behind `-DSHM_CENSUS`:
+
+| arm | steady fps | serial | `cap` med | 1st frame |
+| --- | --- | --- | --- | --- |
+| A baseline (census ON) | 7.32 | 18149 B/s | 129 ms | 52.4 s |
+| B + 64 KiB pipe (census ON) | 7.02 | 17789 B/s | 123 ms | 46.6 s |
+| C + census OFF | **9.79** | 3152 B/s | 100 ms | 35.1 s |
+| C′ rerun | **10.00** | 2982 B/s | 100 ms | 30.5 s |
+
+**+38% frame cadence, −22% capture latency, and first paint ~18 s earlier**,
+all on the same page with the same build otherwise. Serial output fell 5.8×,
+to **below** what the real UART carries — so on the EliteDesk the log no
+longer oversubscribes the wire at all, which is the part that should matter
+most there and which QEMU cannot show you.
+
+Why it was safe to delete: the census existed to answer "does a
+framebuffer-sized shared region exist inside chrome and change per frame?"
+Slice 110 answered yes; slice 129 (§1A) then measured that path losing on a
+real page. The question is settled in both directions.
+
+**The 64 KiB pipe (arm B) measured NEUTRAL — do not re-chase it as a win.**
+It is still in the tree, and here is exactly what it does and does not do.
+`PIPE_BUF_SZ` was 4096 while this pipe carries chrome's CDP frames: a Bing
+frame is a 22–40 KiB JPEG → 29–54 KiB of base64 in ONE `write()`. Direct
+sighting: `[devpipe] pid=33 write(fd=4, 27888)`. With a 4 KiB ring that one
+write blocked and handed off ~7–14 times internally. 64 KiB clears the
+largest measured frame in a single handoff, and the copy loops became memcpy
+runs instead of a byte-at-a-time loop with a `%` per byte. **All of that is
+real and none of it moved the number** (7.02 vs 7.32, inside run-to-run
+spread) — which localises the remaining ~100 ms/frame to chrome's own
+capture+encode, not to our transport. Committed separately so the negative
+result stays legible in history.
+
+---
+
+## 3. THE HONEST CEILING, AND WHERE TO LOOK NEXT
+
+Say this plainly to the user: **this is a capture-and-blit architecture and it
+will not become Edge.** Native Chrome draws to the display with GPU
+compositing and never pays a per-frame copy. What we have is chrome rendering
+offscreen, encoding a JPEG, shipping it through a pipe, and us decoding and
+blitting it.
+
+What the numbers say about where the time actually goes, on a real page,
+post-fix (`cap` med 100 ms ≈ 10 fps):
+
+* **Our side is ~1 ms of it.** `b64=0ms dec=1ms paint=0ms` per frame, every
+  run. We ack before decode already (slice 94). There is no meaningful win
+  left on the consumer side.
+* **`cap` ≈ `turn`**, i.e. essentially the whole cycle is chrome producing the
+  frame after our ack. That is chrome's capture + JPEG encode + pipe write.
+* On a **static** page chrome re-encodes and re-ships a **byte-identical**
+  JPEG forever (`jpeg=22044 bytes` on every frame from 630 to 780). Those
+  frames carry no information. A change-detection skip would save the decode
+  and blit — but that is the 1 ms, not the 100 ms.
+
+So the ranked list from here:
+
+1. **Measure input latency, not frame cadence.** On a static page fps is close
+   to meaningless — nothing is moving. `-DCW_LAT` (slice 114) already
+   instruments inject→pixel and navigate→pixel and it works on the CDP path
+   (`lat_note_frame` is called from `install_b64_frame`). `gpuperf.sh`'s `lat`
+   arm forces `-DCW_MP -DCW_VIZ`; add a single-process `latcpu` arm and get
+   the number the user's word "sluggish" actually refers to. **This is the
+   next job.**
+2. **Page load.** Chrome reaches its CDP session ~11 s in and first paint
+   ~30 s in. `execve` of the 192 MB chrome image is 388 ms (`[exectime]
+   total=388ms load=364ms`), better than the 730 ms slice 111 recorded, so the
+   remaining bootstrap time is chrome's own. Phase-time it before assuming.
+3. **Audit for the next census.** The method that found it: dump the log,
+   bucket every line by its `[tag]`, and rank by BYTES. `[shm]` (2000-line
+   cap) and `[chan]` are bounded one-offs; the census was unbounded and
+   recurring, which is what made it the outlier. Nothing else currently
+   exceeds a few percent.
 
 ### Closed — do not reopen
 
 * **Tier 3 (host GPU) for chrome.** Measured no. `browser-webgl-swiftshader`
-  explains why SwiftShader is NOT a reopening of it.
-* **viz poll cadence.** 4 ms measured *worse* than 15 ms (slice 107).
-* **Event-instead-of-poll viz delivery.** Bounded at ≤8% by slice 110.
+  explains why SwiftShader is not a reopening of it.
+* **viz/multi-process as the browsing default.** §1A. Measured, on a real
+  page, twice the wrong way round before it was measured right.
+* **viz poll cadence** (4 ms worse than 15 ms, slice 107) and
+  **event-instead-of-poll viz delivery** (≤8%, slice 110).
+* **The 64 KiB pipe as a perf lever.** §2. Neutral, measured.
 
 ---
 
-## 5. How to measure (and how these harnesses lie)
+## 4. THE HARNESS — what was broken and what now catches it
+
+`gpuperf.sh` gained three gates this slice, all because of §1B.
+
+* **Kernel-flag stamp.** `build/.gpuperf_kcflags` records `EXTRA_CFLAGS`; when
+  it changes, `rm -f src/*.o`. `make` does not rebuild on a `-D` change, and
+  the script previously force-rebuilt only `chromewin.o` and `mmap.o`. The
+  stamp is written only after a *successful* build.
+* **GATE 0 — the flags are in the BINARIES, checked before the run.** The
+  stamp cannot see `make`, `defboot.sh` or a hand build leaving objects with
+  other defines, which is how §1B happened. So ask the binaries: `tobyos.bin`
+  must contain `TKAPP] launching` and `/bin/chromewin`; `chromewin.elf` must
+  contain `CW_URL`'s value, must NOT contain `--single-process` in `mp`/`viz`
+  arms and MUST contain it otherwise, and must contain `cwviz` for viz arms.
+  Fails in seconds instead of six minutes.
+* **GATE 1b — did the browser even start?** `TKAPP] launching` must appear in
+  the run log. The old gate said "full-length run with no `[bkl] cpu`", which
+  reads as "the kernel wedged"; it had not.
+
+**The `FRAMES(...)` line is not an fps figure and never was** — it is the last
+counter value. The new `STEADY-STATE CADENCE` block is the A/B number. Getting
+it right needed three separate corrections, each of which had already produced
+a wrong reading in this tree:
+
+* counter/RUNSECS divides a **guest** counter by **wall** seconds, and
+  multi-process runs the guest at ~46% of wall clock;
+* counting `[cwviz] frame` **markers** undercounts 30×, because chromewin
+  prints one line per 30 frames;
+* the frame lines **lose their `[N ms]` prefix** once the `[fd1]` chunk logger
+  stops wrapping them, so a per-line timestamp regex silently drops the whole
+  steady state and reports on the first 25 s.
+
+The block carries the last guest timestamp forward and reads the counter.
+**Validated against a known-good run before being trusted**: it reproduces
+slice 110's 52.68 fps from `gpuperf_viz_anim.011.log` to the digit.
+
+`gpuperf.sh` also gained a `url` arm (`URL=... bash logs/gpuperf.sh cpu url`,
+default a Bing SERP). Every other arm is a local file, and that is the single
+biggest reason this harness's numbers did not describe the user's experience.
+
+### The standing traps (all still real)
 
 ```bash
-# one page, real network, frame cadence + net failures
-URL="https://www.bing.com/search?q=perf+test" TAG=myrun RUNSECS=220 \
-  bash logs/cwnet.sh
-
-# the perf A/B harness (arms: cpu gl gle gld mp viz vizp lat)
-bash logs/gpuperf.sh viz anim
+tr -d '\000' < logs/X.log | tr '\r' '\n'      # the capture carries NULs
 ```
 
-Read the log as: `tr -d '\000' < logs/X.log | tr '\r' '\n'` — **the serial
-capture carries NUL bytes**, and a pipeline that forgets flips grep into
-binary mode on some hosts.
-
-**Traps that have each cost a wrong conclusion in this tree. Every one is
-real and recent:**
-
-* **The serial log splits every `printf` at its format conversions.** A line
-  like `[chromewin] profile /data/cr2: REUSED (1 entries)` lands as
-  `[chromewin] profile ` / `/data/cr2` / `: REUSED (` / `1` / …, interleaved
-  with `[fd1] len=N:` markers. **Whole-line greps match verdict-less
-  fragments.** Match tokens; do not try to reassemble (each fragment appears
-  twice, so `grep -o` output concatenates to garbage).
-* **Capped loggers hide the evidence they were added to collect.** Four
-  separate instances in two days (`wu<24` window updates, `c<200` shm maps,
-  `warns<8` TLB, `rx_full_episode`). **Every cap must announce itself when
-  hit.** "The line stopped appearing" is not "the event stopped happening".
-* **An instrument in the critical path becomes the bug.** The "tiny TCP
-  window" pathology was a `kprintf` sitting between deciding to send a window
-  update and sending it — ~13 ms of 38400-baud serial time, during which
-  in-flight data refilled the ring. The tell was a **constant** 17280-byte
-  gap across twelve samples: races vary, instruments do not. See
-  `tcp-tiny-window-lead` memory.
-* **Verify a gate against a KNOWN-GOOD run, not only a failing one.**
-  `logs/cwwebgl.sh` v1 reported INCONCLUSIVE on a run that had passed, because
-  it counted `net::ERR_ABORTED` as failure — that is chrome cancelling its own
-  speculative loads and it appears on healthy runs.
-* **"Never fires in my test" is not "never fires."** An RFC 1122 zero-window
-  rule shipped on that reasoning and broke the browser on real hardware.
-  Reverted in `d107f81`; read that commit before adding TCP behaviour.
+* **The serial log splits every `printf` at its format conversions.** Match
+  tokens; do not reassemble (each fragment appears twice).
+* **Capped loggers hide the evidence they were added to collect.** Every cap
+  must announce itself when hit.
+* **An instrument in the critical path becomes the bug.** This slice is the
+  fourth instance and the largest: 84% of the log. Before that, a `kprintf`
+  between deciding to send a TCP window update and sending it. Races vary,
+  instruments do not — a *constant* anomaly means an instrument.
+* **Verify a gate against a KNOWN-GOOD run, not only a failing one.** Applied
+  twice this slice: gate 1b was checked against `.011`/`.012` (passes) as well
+  as `.013` (fails), and the cadence metric against slice 110's number.
+* **"Never fires in my test" is not "never fires."** See `d107f81`.
 * **`EXTRA_CFLAGS` does not reach user programs** — use `PROG_EXTRA_CFLAGS`,
   and gate on the marker being in the BINARY.
-* **`PROG_EXTRA_CFLAGS` expands UNQUOTED in make's recipe shell.** A `;` in a
-  value terminates the clang command mid-flag and surfaces as `clang: error:
-  no input files`, which reads like a broken makefile.
-* **make does not rebuild on a `-D` change.** `rm -f programs/chromewin/
-  chromewin.o` (and `src/*.o` for kernel flags) or the A/B silently inverts.
+* **`PROG_EXTRA_CFLAGS` expands UNQUOTED in make's recipe shell**; a `;`
+  surfaces as `clang: error: no input files`.
 * **QEMU under Chromium load runs ~2.4× slower than wall clock.** A slow
   capture is not a hang.
+* Header dependency tracking (`-MMD -MP` + `ALL_DEPS`) **does** now exist, so
+  a `pipe.h` change really does rebuild its includers. The `-D` problem is
+  separate and unfixed by it — hence the stamp.
 
 ---
 
-## 6. Ground truth to compare against
+## 5. How to run things
 
-| config | cadence | note |
-| --- | --- | --- |
-| default (single-process, CDP JPEG) | `cap ~116–140 ms` (~8 fps) | what ships |
-| same, real HW, static page | `cap ~366 ms` | user's report |
-| viz path, slice 110 | **~52.7 commits/s** | the prize |
-| WebGL on (`-DCW_SWGL`) | `cap 136–150 ms` | ~10–15% cost |
+```bash
+bash logs/gpuperf.sh cpu url          # the A/B that matters: a REAL page
+URL=https://example.com/ bash logs/gpuperf.sh cpu url
+bash logs/gpuperf.sh viz anim         # the animation benchmark
+bash logs/defboot.sh                  # stock-path regression, after ANY kernel change
+```
 
-Total frames is the cleaner throughput metric (`grep -o "frame [0-9]*: "`);
-`cap` is the latency metric. Report both.
-
-**Finally: be honest with the user about the ceiling.** Even a working viz
-path is a capture-and-blit architecture. Native Chrome draws straight to the
-display with GPU compositing and never pays a per-frame copy. ~53 fps would
-be a genuine transformation of how it feels, and it is worth doing — but
-"identical to Edge" is not what is on the table, and saying so plainly is
-better than implying otherwise.
+Report **both** total frames and `cap`; they are different questions
+(throughput vs latency).
+</content>
