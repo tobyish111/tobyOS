@@ -1,12 +1,30 @@
 /* aslr.c -- Address Space Layout Randomization (Phase 7 M7.1).
  *
- * Randomizes the base addresses of:
- *   - User stack (within a range near the top of user space)
- *   - Heap (mmap base address)
- *   - Program load address (for PIE binaries, future)
+ * WHAT IS ACTUALLY WIRED, as of the mmap-ASLR change:
  *
- * Uses the kernel's RNG subsystem for entropy. Applied during
- * process creation in spawn_internal.
+ *   mmap region  RANDOMISED. src/mmap.c draws its per-address-space base from
+ *                aslr_mmap_offset() (find_free_region, on the hint == 0
+ *                "fresh address space" path). This is the one that matters
+ *                most: every shared library, every anonymous mapping and
+ *                every JIT region a dynamic binary allocates lands through
+ *                that allocator.
+ *   user stack   NOT randomised. The stack tops out at the fixed
+ *                USER_STACK_TOP_LIMIT_VA, and page_fault.c decides whether a
+ *                fault is stack growth by comparing against the equally fixed
+ *                USER_STACK_FLOOR_VA. Moving the top per-process means making
+ *                that floor per-process too -- a change to the fault path,
+ *                which is not something to do without its own gate.
+ *   exe base     NOT randomised. tobyOS's own programs are -fno-pie, and the
+ *                PIE/ET_DYN load bases in fork.c are fixed constants that the
+ *                Chromium arc's V8 cage layout is sensitive to.
+ *
+ * This header used to claim all three, while NOTHING consumed any of the
+ * three offset functions -- aslr_init() printed an "ASLR enabled" banner at
+ * every boot and that was the entire feature. Two of the three are still
+ * unwired; they are described as unwired rather than advertised.
+ *
+ * Uses the kernel's RNG subsystem for entropy (rng_fill self-seeds on first
+ * use, so these are safe to call at any point after boot).
  */
 
 #include <tobyos/proc.h>
@@ -23,8 +41,11 @@
 static int g_aslr_enabled = 1;
 
 void aslr_init(void) {
-    kprintf("[aslr] ASLR enabled (stack=%d bits, mmap=%d bits, exe=%d bits)\n",
-            ASLR_STACK_BITS, ASLR_MMAP_BITS, ASLR_EXE_BITS);
+    /* Report only what is wired. The old banner named all three regions and
+     * randomised none of them -- a boot line that read as a security feature
+     * and was a print statement. */
+    kprintf("[aslr] mmap base randomised (%d bits); stack/exe base fixed "
+            "(not wired)\n", ASLR_MMAP_BITS);
 }
 
 void aslr_set_enabled(int enabled) {

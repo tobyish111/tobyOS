@@ -22,6 +22,7 @@
 #include <tobyos/icmp.h>
 #include <tobyos/udp.h>
 #include <tobyos/tcp.h>
+#include <tobyos/nsproxy.h>  /* the route table + net_ctx_* (cut 6) */
 #include <tobyos/pit.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
@@ -221,7 +222,18 @@ static bool ip_send_frame(uint32_t dst_ip_be, uint8_t proto,
     h->ttl        = IP_DEFAULT_TTL;
     h->proto      = proto;
     h->checksum   = 0;
-    h->src_ip     = g_my_ip;
+    /* CUT 5: the SOURCE ADDRESS is namespace-relative.
+     *
+     * This was `g_my_ip` -- the host's -- unconditionally, which meant every IP
+     * packet a container sent left with the HOST's source address on it. Cut 2
+     * fixed the ethernet header's source MAC and then the ARP payload's sender
+     * MAC after the first one turned out not to be enough; this is the same
+     * finding one layer further up, and the same reason it went unnoticed:
+     * nothing had ever sent IP (as opposed to ARP) from inside a namespace, so
+     * no test could see it. net_my_ip() is g_my_ip in the initial namespace, so
+     * the host path is unchanged -- including while DHCP is still SELECTING and
+     * it is legitimately 0. */
+    h->src_ip     = net_my_ip();
     h->dst_ip     = dst_ip_be;
     h->checksum   = net_checksum(h, IP_HDR_LEN);
 
@@ -230,15 +242,55 @@ static bool ip_send_frame(uint32_t dst_ip_be, uint8_t proto,
     return eth_send(mac, ETH_TYPE_IPV4, buf, IP_HDR_LEN + payload_len);
 }
 
+static bool ip_send_routed(uint32_t dst_ip_be, uint32_t next_hop, uint8_t proto,
+                           const void *payload, size_t payload_len);
+
 bool ip_send(uint32_t dst_ip_be, uint8_t proto,
              const void *payload, size_t payload_len) {
     if (payload_len > IP_MAX_PAYLOAD_SEND) return false;
 
+    /* CUT 5 made this decision NAMESPACE-RELATIVE: "is this on my subnet, and
+     * if not who is my gateway" was answered from the HOST's address, mask and
+     * gateway no matter who asked, so a container sending off its own subnet
+     * resolved the host's gateway on a network it is not attached to.
+     *
+     * CUT 6: THE ROUTE TABLE IS CONSULTED FIRST, that logic is the
+     * fallback. A namespace with an empty table -- which is every namespace
+     * that has not had an address or an `ip route add` -- takes the identical
+     * path it took before, so eth0/DHCP/the host are untouched by construction.
+     *
+     * A matching route also names the OUTPUT INTERFACE, which is the thing this
+     * stack could not previously say: eth_send picked the namespace's primary
+     * or net_default(), so a host with two attached networks had no way to
+     * reach the second. That is precisely what a reply travelling back down to
+     * a container needs. */
     uint32_t next_hop = dst_ip_be;
-    if ((dst_ip_be & g_my_netmask) != (g_my_ip & g_my_netmask) &&
-        dst_ip_be != IP_BROADCAST_BE) {
-        next_hop = g_gateway_ip;
+    struct net_dev *odev = 0;
+    void *ns = net_current_ns();
+    if (!net_ns_route_lookup(ns, dst_ip_be, &next_hop, &odev)) {
+        uint32_t me   = net_my_ip();
+        uint32_t mask = net_my_netmask();
+        if ((dst_ip_be & mask) != (me & mask) &&
+            dst_ip_be != IP_BROADCAST_BE) {
+            next_hop = net_my_gateway();
+            /* Nowhere to send it: ARPing for the destination itself would put a
+             * frame on the wire addressed to a host that cannot answer. */
+            if (next_hop == 0) return false;
+        }
     }
+    /* Everything below -- the ARP resolve, the ARP request it may fire, and
+     * every fragment -- has to happen AS THE OUTPUT INTERFACE, or the ARP goes
+     * out one wire and the packet down another. */
+    struct net_ctx rprev;
+    bool routed = (odev != 0);
+    if (routed) rprev = net_ctx_enter(ns, odev);
+    bool ok = ip_send_routed(dst_ip_be, next_hop, proto, payload, payload_len);
+    if (routed) net_ctx_leave(rprev);
+    return ok;
+}
+
+static bool ip_send_routed(uint32_t dst_ip_be, uint32_t next_hop, uint8_t proto,
+                           const void *payload, size_t payload_len) {
 
     uint8_t mac[ETH_ADDR_LEN];
     if (dst_ip_be == IP_BROADCAST_BE) {
@@ -300,11 +352,17 @@ bool ip_send(uint32_t dst_ip_be, uint8_t proto,
  * directed broadcast (e.g. 192.168.1.255) — some DHCP implementations use
  * the latter for OFFER/ACK instead of global broadcast. */
 static bool ip_dst_is_for_us(uint32_t dst_ip_be) {
-    if (dst_ip_be == g_my_ip) return true;
+    /* Slice 12 cut 2: "us" is namespace-relative. net_my_ip() is g_my_ip in the
+     * initial namespace, so the wire path is unchanged; inside a namespace with
+     * a veth end it is that namespace's address, which is what stops a container
+     * accepting packets addressed to the host. */
+    uint32_t me   = net_my_ip();
+    uint32_t mask = net_my_netmask();
+    if (dst_ip_be == me) return true;
     if (dst_ip_be == IP_BROADCAST_BE) return true;
-    if (g_my_ip == 0) return true;
-    if (g_my_netmask) {
-        uint32_t bcast = (g_my_ip & g_my_netmask) | ~g_my_netmask;
+    if (me == 0) return true;
+    if (mask) {
+        uint32_t bcast = (me & mask) | ~mask;
         if (dst_ip_be == bcast) return true;
     }
     return false;
@@ -325,6 +383,56 @@ static bool ip_rx_allow_bad_ipv4_csum(const struct ip_hdr *h,
     const uint8_t *udp = (const uint8_t *)payload + IP_HDR_LEN;
     /* UDP destination port 68 (BOOTP/DHCP client), wire byte order. */
     return udp[2] == 0 && udp[3] == 68;
+}
+
+/* CUT 6: put an ALREADY-FORMED IPv4 packet back on the wire.
+ *
+ * Forwarding is not sending: the header already exists, its addresses have
+ * already been decided (possibly rewritten by NAT), and re-running ip_send
+ * would build a fresh header with OUR source address -- which is the whole
+ * thing forwarding must not do. So this routes, ARPs and transmits the buffer
+ * as given, touching only TTL and the header checksum.
+ *
+ * The TTL decrement is what stops a routing loop from becoming a livelock, and
+ * it is why this is the only place a forwarded packet may go. */
+bool ip_forward_packet(void *ns, void *ip_packet, size_t total) {
+    if (total < IP_HDR_LEN) return false;
+    struct ip_hdr *h = (struct ip_hdr *)ip_packet;
+    if (h->ttl <= 1) return false;         /* expired: drop (no ICMP here) */
+    h->ttl--;
+    h->checksum = 0;
+    h->checksum = net_checksum(h, IP_HDR_LEN);
+
+    uint32_t next_hop = h->dst_ip;
+    struct net_dev *odev = 0;
+    if (!net_ns_route_lookup(ns, h->dst_ip, &next_hop, &odev)) {
+        /* Fall back to the host's own notion of a gateway, which is what
+         * carries a container's traffic out to the real world: the initial
+         * namespace reaches the internet through g_gateway_ip and has no route
+         * table entry for it. */
+        struct net_ctx p = net_ctx_enter(ns, 0);
+        uint32_t me = net_my_ip(), mask = net_my_netmask();
+        if ((h->dst_ip & mask) != (me & mask)) {
+            next_hop = net_my_gateway();
+            if (!next_hop) { net_ctx_leave(p); return false; }
+        }
+        net_ctx_leave(p);
+    }
+
+    struct net_ctx prev = net_ctx_enter(ns, odev);
+    uint8_t mac[ETH_ADDR_LEN];
+    bool ok = false;
+    if (arp_resolve(next_hop, mac)) {
+        ok = eth_send(mac, ETH_TYPE_IPV4, ip_packet, total);
+    } else {
+        /* No ARP entry yet: fire the request and DROP this packet. A forwarded
+         * datagram has no sender to retry on its behalf, so the first one to a
+         * cold next hop is lost -- the same behaviour ip_send has, and TCP or
+         * the application retransmits. */
+        arp_request(next_hop);
+    }
+    net_ctx_leave(prev);
+    return ok;
 }
 
 void ip_recv(const void *payload, size_t len) {
@@ -354,6 +462,30 @@ void ip_recv(const void *payload, size_t len) {
 
     if (net_checksum(h, IP_HDR_LEN) != 0) {
         if (!ip_rx_allow_bad_ipv4_csum(h, payload, len, total)) return;
+    }
+
+    /* CUT 6: FORWARDING. Two cases, and the ORDER matters.
+     *
+     * A reply to a masqueraded connection is addressed to OUR OWN address --
+     * that is what masquerading means -- so "is this for us" is true for it and
+     * a local-delivery-first stack would hand a container's TCP segment to the
+     * host's own socket layer. The NAT table is therefore consulted BEFORE
+     * local delivery, and only a packet that matches a live mapping is taken.
+     *
+     * Both paths are no-ops unless this namespace has NAT enabled, so the host
+     * with no containers takes exactly the path it always did. */
+    void *fns = net_current_ns();
+    if (netns_nat_enabled(fns)) {
+        uint8_t fbuf[ETH_MTU];
+        if (total <= sizeof fbuf) {
+            memcpy(fbuf, payload, total);
+            if (ip_dst_is_for_us(h->dst_ip)) {
+                if (netns_nat_inbound(fns, fbuf, total)) return;
+            } else {
+                if (netns_nat_outbound(fns, fbuf, total)) return;
+                return;    /* forwardable in principle, refused -> drop */
+            }
+        }
     }
 
     if (!ip_dst_is_for_us(h->dst_ip)) return;

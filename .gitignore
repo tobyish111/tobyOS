@@ -1,3 +1,18 @@
 ﻿# Root repo: keep large generated logs out of git
 tobyOS/qemu*.log
 tobyOS/**/qemu*.log
+
+# Prebuilt Bootlin glibc cross-toolchain used by the linux-* acceptance tests
+# (~670 MB, downloaded by programs/linux-glibc/build.sh -- not a source artefact)
+.glibc-tc/
+
+# Stray nested build tree: tobyOS/tobyOS/ (~2.1 GB) is a SECOND copy of the
+# build outputs -- disk.img (1.0 GB), tobyOS.iso (810 MB), the sata/nvme test
+# images, tobyos.bin -- created by running a build from the wrong working
+# directory (a relative path resolved one level too deep). It is not a source
+# tree: it holds no .c/.h of its own, only generated artefacts and a few
+# stale summary docs that already exist one level up.
+#
+# Ignored rather than deleted -- that is the user's call, not the build's.
+# To reclaim the space: rm -rf tobyOS/tobyOS
+tobyOS/tobyOS/

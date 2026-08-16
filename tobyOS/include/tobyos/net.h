@@ -92,6 +92,79 @@ uint16_t net_udp_checksum(uint32_t src_ip_be, uint32_t dst_ip_be,
 
 /* Pretty-print: writes "a.b.c.d" (max 16 bytes incl. NUL) to dst. */
 void net_format_ip (char dst[16], uint32_t ip_be);
+
+/* ---- Slice 12 cut 2: the namespace-relative address ---------------------
+ * g_my_ip stays the INITIAL namespace's address (DHCP writes it, ifconfig reads
+ * it). These return the CALLER's / RECEIVER's namespace address instead, falling
+ * back to g_my_ip -- so the wire path is unchanged and a namespace with a veth
+ * end answers for its own address only. */
+uint32_t net_my_ip(void);
+uint32_t net_my_netmask(void);
+uint32_t net_my_gateway(void);     /* cut 5: the next hop for off-subnet */
+/* The namespace the stack is currently acting for: an active network context
+ * if there is one, else the calling process's. NULL == the initial namespace.
+ * The port space is scoped by this -- see sock_lookup_by_port. */
+void    *net_current_ns(void);
+const uint8_t *net_my_mac(void);   /* the transmitting interface's MAC */
+
+/* veth (src/veth.c). These two are the KERNEL-ONLY constructors: a NULL ns means
+ * the initial namespace, and that end is registered with net.c as an ordinary
+ * interface rather than placed in a namespace list. For the userspace-drivable
+ * path (`ip link add ... type veth` -> RTM_NEWLINK -> netns_veth_create) see
+ * the cut-4 block below. */
+long netns_veth_pair_named(void *ns_a, const char *name_a, uint32_t ip_a,
+                           void *ns_b, const char *name_b, uint32_t ip_b,
+                           uint32_t mask);
+long netns_veth_pair(void *ns_a, uint32_t ip_a, void *ns_b, uint32_t ip_b,
+                     uint32_t mask);
+void netns_veth_stats(void *ns, uint32_t *tx, uint32_t *rx);
+
+/* Forward declaration: struct net_dev is defined further down, and a `struct
+ * net_dev *` first mentioned inside a prototype would be a DIFFERENT,
+ * function-scoped type -- clang says so (-Wvisibility) and then rejects every
+ * call. */
+struct net_dev;
+/* Cut 4: the entry points rtnetlink drives. Unlike the two above, these put
+ * BOTH ends in a namespace list (which is what RTM_GETLINK enumerates) and
+ * never call net_register. `peer_name` may be NULL/empty for Linux's automatic
+ * vethN naming -- busybox's `ip` cannot express a peer name at all. */
+long netns_veth_create(void *ns, const char *name, const char *peer_name,
+                       struct net_dev **out_a, struct net_dev **out_b);
+bool netns_veth_is_veth(struct net_dev *dev);
+bool netns_veth_delete(struct net_dev *dev);       /* removes BOTH ends */
+void netns_veth_release(struct net_dev *dev);      /* namespace teardown: this
+                                                    * end only, peer unpaired */
+bool netns_veth_move_ns(struct net_dev *dev, void *ns);
+void netns_veth_dev_stats(struct net_dev *dev, uint32_t *tx, uint32_t *rx);
+
+/* Cut 6: the BRIDGE (src/bridge.c). A device whose tx goes to its PORTS rather
+ * than to a wire, so many namespaces can share one attachment point -- the
+ * shape `docker0` has, and what forwarding/NAT is built on. It LEARNS source
+ * MACs, so a unicast goes to one port instead of being flooded to every
+ * container. */
+long netns_bridge_create(void *ns, const char *name, struct net_dev **out);
+bool netns_bridge_is_bridge(struct net_dev *dev);
+bool netns_bridge_delete(struct net_dev *dev);
+/* A frame arriving on an ENSLAVED port, handed to the bridge instead of to that
+ * port's own stack. */
+void netns_bridge_input(struct net_dev *brdev, struct net_dev *in_port,
+                        const void *frame, size_t len);
+void netns_bridge_port_gone(struct net_dev *port);   /* purge it from every FDB */
+void netns_bridge_stats(struct net_dev *dev, uint32_t *tx, uint32_t *rx,
+                        uint32_t *flooded, uint32_t *unicast);
+
+/* Cut 6: forwarding + MASQUERADE (src/nat.c) -- the last piece between a
+ * container and the internet. Enabling NAT also enables forwarding for the
+ * namespace; there is no /proc/sys here to separate them. Masquerade only:
+ * no DNAT, no inbound port forwarding, no filtering. */
+bool netns_nat_enable(void *ns, struct net_dev *uplink);
+bool netns_nat_enabled(void *ns);
+/* Called from ip_recv. `pkt` is a WRITABLE copy of the IPv4 packet; each
+ * returns true when it consumed (translated and forwarded) it. */
+bool netns_nat_outbound(void *ns, void *pkt, size_t total);
+bool netns_nat_inbound(void *ns, void *pkt, size_t total);
+void netns_nat_stats(uint32_t *out, uint32_t *in, uint32_t *dropped,
+                     uint32_t *maps);
 /* Pretty-print: writes "aa:bb:cc:dd:ee:ff" (max 18 bytes incl. NUL). */
 void net_format_mac(char dst[18], const uint8_t mac[ETH_ADDR_LEN]);
 

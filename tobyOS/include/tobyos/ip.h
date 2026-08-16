@@ -33,6 +33,12 @@ struct __attribute__((packed)) ip_hdr {
  *   - len > 65535 - IP_HDR_LEN
  *   - ARP cache miss for next-hop (an ARP request is fired in that
  *     case so a retry shortly after will likely succeed). */
+/* Cut 6: put an ALREADY-FORMED IPv4 packet back on the wire (forwarding).
+ * Decrements TTL, redoes the header checksum, routes, ARPs and transmits the
+ * buffer as given -- it must NOT rebuild the header, because a forwarded packet
+ * keeps the original sender's source address. `pkt` is written in place. */
+bool ip_forward_packet(void *ns, void *ip_packet, size_t total);
+
 bool ip_send(uint32_t dst_ip_be, uint8_t proto,
              const void *payload, size_t payload_len);
 

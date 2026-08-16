@@ -282,6 +282,169 @@ struct proc {
     /* Phase 1 M1.3: full POSIX signal state (handlers, mask, restorer) */
     struct signal_state sigstate;
 
+    /* Linux slice 5: chroot(2) filesystem root. Empty == "/".
+     *
+     * DELIBERATELY SEPARATE from `sandbox_root` below, though the slice plan
+     * suggested reusing it. They are different mechanisms that happen to look
+     * alike:
+     *   sandbox_root -- a CHECK:       "you may not name paths outside this"
+     *   fs_root      -- a TRANSLATION: "the names you use are relative to this"
+     * Folding chroot into sandbox_root would silently convert the existing cap
+     * sandbox from a denial into a redirect (a `restricted`-profile app that
+     * currently gets EACCES for /etc would start reading <root>/etc instead),
+     * changing a live security boundary to save 64 bytes per proc. They also
+     * compose: a process can be chrooted AND sandboxed.
+     *
+     * Applied in resolve_user_path() AFTER lexical cleaning, so a path full of
+     * ".." can never climb out of the new root. */
+    char            fs_root[PROC_SANDBOX_MAX];
+
+    /* Linux slice 5: this process's MOUNT NAMESPACE (struct mount_ns, private
+     * to vfs.c -- void* to avoid dragging the VFS internals into every file
+     * that includes proc.h). NULL means "the initial namespace", which is what
+     * every process uses today; slice 9's CLONE_NEWNS allocates a copy and
+     * points here instead. Inherited across fork via the whole-PCB memcpy. */
+    void           *mnt_ns;
+
+    /* Phase 3 slice 8: the UTS and IPC namespaces, same shape as mnt_ns above
+     * -- void* to a refcounted object owned by the subsystem that owns the
+     * payload (`struct uts_ns` in nsproxy.c, `struct ipc_ns` in shm.c), with
+     * NULL meaning "the initial namespace".
+     *
+     * NULL-means-initial is load-bearing, not laziness: it is why adding a
+     * namespace type cannot change the behaviour of a system where nobody has
+     * called unshare(2), and why boot allocates nothing.
+     *
+     * The whole-PCB memcpy in fork copies these pointers, so every copying
+     * path MUST call nsproxy_fork_inherit() to take the matching references --
+     * see nsproxy.h. Teardown goes through nsproxy_release(). */
+    void           *uts_ns;
+    void           *ipc_ns;
+
+    /* Slice 10: the PID namespace this process is IN, and the one its next
+     * CHILD will be placed in. Both `struct pid_ns *` (pid_ns.c).
+     *
+     * THESE TWO ARE NOT REDUNDANT. unshare(CLONE_NEWPID) is the one namespace
+     * operation that does not move the caller -- a process cannot change its
+     * own pid namespace, because its number there would have to appear from
+     * nowhere while every existing holder of the old number kept using it. So
+     * unshare sets only `pid_ns_for_children`, and the next fork's child lands
+     * in the new namespace as its init while the parent stays put. Linux has
+     * exactly this split; collapsing them is the easiest way to get
+     * CLONE_NEWPID quietly wrong.
+     *
+     * `p->pid` REMAINS the host / initial-namespace number, always. Namespace
+     * -local pids are a translation at the syscall boundary (see nsproxy.h) --
+     * the same decision slice 2 made for uids, for the same reason. */
+    void           *pid_ns;
+    void           *pid_ns_for_children;
+
+    /* Slice 11: the USER namespace (`struct user_ns *`, user_ns.c). NULL means
+     * the initial one, as everywhere else.
+     *
+     * `uid`/`gid`/`ruid`/`suid`/... above REMAIN host ids (Linux's kuid_t) --
+     * slice 2 committed to that in advance so this field could be added without
+     * touching vfs_perm_check, cap_check_path, oom scoring, SO_PEERCRED and the
+     * other ~30 consumers that compare them. Translation happens only at the
+     * syscall boundary; see nsproxy.h. */
+    void           *user_ns;
+
+    /* Slice 12 (cut 1): the NETWORK namespace. NULL == initial.
+     *
+     * Sockets latch this at creation (sock_alloc) and enforcement asks the
+     * SOCKET's namespace, not the process's -- so an unshare does not
+     * retroactively unplug already-open sockets, which is Linux's behaviour and
+     * is what lets a sandboxed child keep an inherited socketpair. */
+    void           *net_ns;
+
+    /* Slice 13: seccomp-bpf. `seccomp_filter` is a `struct seccomp_filter *`
+     * (seccomp.c) and is a CHAIN -- installing a filter pushes onto it rather
+     * than replacing, because every filter must keep running (the lowest return
+     * wins, so a policy can only ever tighten).
+     *
+     * `no_new_privs` is prctl(PR_SET_NO_NEW_PRIVS): an unprivileged process must
+     * set it before it may install a filter, because a filter can make a setuid
+     * binary misbehave by failing syscalls it does not expect to fail. Both are
+     * inherited across fork and SURVIVE execve -- a sandbox a child could shed
+     * by exec'ing would not be a sandbox. */
+    void           *seccomp_filter;
+    uint8_t         seccomp_mode;
+    uint8_t         no_new_privs;
+
+    /* Slice 15: cgroup v2 membership -- an index into cgroup.c's table, 0 ==
+     * the root cgroup (which is also the zero-init default, so every existing
+     * process is in the root without any initialisation).
+     *
+     * An int rather than a pointer because cgroup v2 is ONE hierarchy with
+     * exactly one membership per process, and an index makes the whole-PCB
+     * memcpy in fork inherit it correctly for free. */
+    int             cgroup;
+
+    /* Slice 8: CLONE_NEW* bits STAGED by the clone(2)/clone3(2) arm for the
+     * fork about to happen, consumed inside sys_fork/sys_fork_share and
+     * cleared there.
+     *
+     * This looks like an odd way to pass an argument, and the obvious
+     * alternative -- fork first, then fix up the child by pid -- is a RACE:
+     * sys_fork sets the child PROC_READY and sched_enqueue()s it before
+     * returning, so on an SMP boot another core can run the child before the
+     * parent's syscall returns. The child would then observe the parent's
+     * namespaces, which is precisely the isolation failure the whole feature
+     * exists to prevent. Staging here lets the flags be applied while the child
+     * is still PROC_EMBRYO and unreachable.
+     *
+     * Only ever written by the calling process to itself, so no lock is
+     * needed. */
+    uint32_t        clone_ns_flags;
+
+    /* clone(2)'s `child_stack` argument (a2), staged by the same arm and for
+     * the same reason as clone_ns_flags above: it has to be installed into the
+     * child's saved user register block while the child is still PROC_EMBRYO.
+     * 0 == "not supplied" (fork semantics: the child resumes on the parent's
+     * stack), which is also the zero-init default.
+     *
+     * This existed as a hole until the Chromium sandbox found it. `clone` has
+     * TWO callers with different shapes and only one of them was tested:
+     *
+     *   syscall(SYS_clone, flags, NULL, ...)  -- the raw syscall, NULL stack.
+     *      The child resumes on the parent's stack, exactly like fork(2).
+     *      This is what programs/linux-clonens exercises, and it always worked.
+     *
+     *   clone(fn, child_stack, flags, arg)    -- the glibc LIBRARY function.
+     *      __clone stores fn/arg at the TOP of child_stack, passes the adjusted
+     *      pointer as the syscall's a2, and the child-side of the wrapper does
+     *      `xor %ebp,%ebp; pop %rax; pop %rdi; call *%rax`. If a2 is ignored,
+     *      that pop reads the PARENT's stack: %rax gets the return address of
+     *      the `call clone@plt`, so the child "calls" back into the middle of
+     *      its parent's caller with rbp == 0 and dies on the first frame-
+     *      relative access. Chromium's sandbox does exactly this at
+     *      credentials.cc, which is why its child died at cr2 = -0x28 (the
+     *      stack-canary reload `cmp -0x28(%rbp),%rcx`) with syscalls=0. */
+    uint64_t        clone_child_stack;
+
+    /* ---- ptrace(2) ------------------------------------------------------
+     * tracer_pid == 0 means untraced, the zero-init default.
+     *
+     * The stop reuses PROC_STOPPED, the job-control state SIGSTOP already
+     * uses: to the scheduler a ptrace-stop and a job-control stop are the
+     * same thing (off every run queue, not requeued on yield), and
+     * ptrace_stopped is what distinguishes them for wait4. */
+    int             tracer_pid;
+    uint32_t        ptrace_opts;
+    uint8_t         ptrace_stopped;
+    uint8_t         ptrace_syscall;
+    uint8_t         ptrace_atexit;
+    int             ptrace_stopsig;
+    long            ptrace_orig_rax;
+    long            ptrace_retval;
+
+    /* Linux slice 3: alarm(2) deadline, absolute monotonic ns; 0 == no alarm.
+     * Checked by signal_check_alarms() on the timer tick, which raises SIGALRM
+     * and clears it. Deliberately NOT a general timer subsystem -- one
+     * deadline per process is exactly what alarm(2) offers, and setitimer's
+     * richer shape can grow from here if something needs it. */
+    uint64_t        alarm_deadline_ns;
+
     /* Per-process file descriptor table. Slot indices that fit in a
      * struct file pointer are owning -- close-on-exit drops them. */
     struct file    *fds[PROC_NFDS];
@@ -304,6 +467,53 @@ struct proc {
      * uid 0 (root) bypasses every check. */
     int             uid;
     int             gid;
+
+    /* ---- Linux slice 2: the full POSIX credential set ------------------
+     *
+     * `uid`/`gid` above remain the EFFECTIVE ids. That is deliberate: every
+     * existing consumer (vfs_perm_check, cap_check_path, sysprot, uac, oom
+     * scoring, SO_PEERCRED, siginfo si_uid) already means "effective" when it
+     * says p->uid, so widening in place would have silently changed ~30 call
+     * sites in a tree with no header-dependency tracking. Effective stays put;
+     * the rest of the triple lives here.
+     *
+     * ruid/rgid  -- real: who launched us. Restored-to by setuid(real).
+     * suid/sgid  -- saved-set: lets a setuid program drop privilege
+     *               temporarily and regain it (POSIX saved-set-user-ID).
+     *
+     * NAMESPACE NOTE (slice 11): these are HOST/initial-namespace ids, the
+     * equivalent of Linux's kuid_t. A user namespace does NOT rewrite them --
+     * it interposes a uid_map at the REPORTING boundary (getuid, stat, the
+     * per-pid procfs status file) and at ns entry. Keeping the stored ids
+     * global is what makes that possible without touching every check. */
+    int             ruid, rgid;
+    int             suid, sgid;
+
+    /* Supplementary groups. Linux allows 65536; 32 covers every real use and
+     * keeps struct proc (256 slots) from growing by 64 KiB for nothing.
+     * ngroups == 0 is the correct answer for a process in no extra groups,
+     * which is what getgroups(2) reported before this slice. */
+#define PROC_NGROUPS_MAX 32
+    int             ngroups;
+    int             groups[PROC_NGROUPS_MAX];
+
+    /* Linux capability bits (CAP_SYS_ADMIN, CAP_NET_RAW, ...), a 64-bit mask
+     * per set. DELIBERATELY SEPARATE from `caps` below, which is tobyOS's own
+     * sandbox-profile mask (CAP_FILE_READ/NET/GUI/...). The two share a prefix
+     * and nothing else: tobyOS caps are local policy, these are the Linux ABI
+     * that capget/capset and (slice 11) user namespaces are defined in terms
+     * of. Conflating them would make both wrong. */
+    uint64_t        lcap_eff, lcap_perm, lcap_inh;
+
+    /* File-creation mask (Linux slice 1). POSIX: bits SET here are CLEARED
+     * from the mode of any file/directory this process creates. Inherited
+     * across fork AND preserved across execve (unlike most process state),
+     * which is why it lives in the PCB rather than being derived.
+     *
+     * 0022 is the conventional default. Note the shell has long had its own
+     * `umask` builtin, but it was shell-local bookkeeping with nothing behind
+     * it -- this is the field that actually reaches file creation. */
+    uint32_t        umask;
 
     /* Capability mask + path-sandbox root (milestone 18). `caps` is a
      * bitwise-OR of CAP_* (see <tobyos/cap.h>). pid 0 is initialised

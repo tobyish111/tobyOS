@@ -1376,8 +1376,33 @@ static bool xhci_finalize_device(struct xhci_dev_state *st) {
         kprintf("[xhci] GET_DESCRIPTOR(DEV, 8B) failed on slot %u\n", slot_id);
         return false;
     }
-    if (dev_desc->bMaxPacketSize0 != 0 && dev_desc->bMaxPacketSize0 != st->usb.mps0) {
-        st->usb.mps0 = dev_desc->bMaxPacketSize0;
+    /* bMaxPacketSize0 is a BYTE COUNT for LS/FS/HS but an EXPONENT for
+     * SuperSpeed (9 means 2^9 = 512, USB 3.x 9.6.1). Taking the SS value
+     * literally patched EP0 from the correct 512 down to NINE bytes, after
+     * which the very next control transfer times out -- on real hardware.
+     * QEMU does not enforce the EP-context MPS, so every QEMU stick
+     * (usbprov.sh 4/4) sailed through the same wrong patch, and the bug
+     * only surfaced on the EliteDesk: 8B fetch OK, then "GET_DESCRIPTOR
+     * (DEV, 18B) failed" -- the one transfer that runs after the patch.
+     * (This same fix was applied once in the HP 260 G2 arc and reverted
+     * with the timing changes it shipped alongside; the note said to
+     * revisit "if a SuperSpeed device misbehaves". One did.) */
+    uint16_t desc_mps0 = dev_desc->bMaxPacketSize0;
+    if (st->usb.speed >= USB_SPEED_SUPER && desc_mps0 != 0) {
+        if (desc_mps0 <= 12) {
+            desc_mps0 = (uint16_t)(1u << desc_mps0);
+        } else {
+            /* An SS device reporting a literal byte count here is out of
+             * spec; log it and keep the 512 default rather than wedging
+             * EP0 on garbage. */
+            kprintf("[xhci] slot %u: SS bMaxPacketSize0=%u not an exponent "
+                    "-- keeping mps0=%u\n",
+                    slot_id, desc_mps0, st->usb.mps0);
+            desc_mps0 = st->usb.mps0;
+        }
+    }
+    if (desc_mps0 != 0 && desc_mps0 != st->usb.mps0) {
+        st->usb.mps0 = desc_mps0;
         struct xhci_ep_ctx *ep0 =
             (struct xhci_ep_ctx *)((uint8_t *)st->input_ctx + 64);
         ep0->dw1 = (ep0->dw1 & ~0xFFFF0000u) |
@@ -2316,6 +2341,54 @@ static int xhci_probe(struct pci_dev *dev) {
 
     xhci_bios_handoff();
 
+    /* CLAIM THE PORTS THE FIRMWARE IS HOLDING FOR US (Intel PCH).
+     *
+     * On 7/8-series PCH the USB2 differential pairs are shared between EHCI
+     * and xHCI, and with the BIOS set to Auto / Smart Auto they come up on
+     * EHCI *deliberately* -- so a legacy OS with no xHCI driver can still use
+     * a keyboard. The firmware then WAITS for the OS to claim them by writing
+     * XUSB2PR. This is a documented handoff, not a fight with the firmware:
+     * Linux performs exactly these four accesses in
+     * usb_enable_intel_xhci_ports() (xhci-pci.c), and Windows does the same.
+     * tobyOS simply never implemented its half, which is why the EliteDesk
+     * reported "xhci port census: 0 of 21" with a stick plugged in while both
+     * EHCI controllers showed a device.
+     *
+     *   USB3PRM  (0xDC) -> which SuperSpeed ports CAN be enabled
+     *   USB3PSSEN(0xD8) -> enable them
+     *   XUSB2PRM (0xD4) -> which USB2 ports CAN be routed to xHCI
+     *   XUSB2PR  (0xD0) -> route them
+     *
+     * Only the ports the MASK says are routable are touched, so a port the
+     * board wired EHCI-only stays put.
+     *
+     * KEYBOARD NOTE, because this is the risk: routing takes the ports away
+     * from the BIOS's legacy emulation, so input then depends on tobyOS's own
+     * HID path -- which exists and is wired (usb_hid_probe below). A REAL PS/2
+     * keyboard is unaffected either way. If HID-over-xHCI misbehaves on some
+     * board, reverting is a reflash of the previous image, and the routing is
+     * re-done from scratch on every boot (no persistent state is written). */
+    if (dev->vendor == 0x8086) {
+        uint32_t ss_mask = pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xDC);
+        uint32_t hs_mask = pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xD4);
+        uint32_t ss_before = pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xD8);
+        uint32_t hs_before = pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xD0);
+        if (ss_mask || hs_mask) {
+            if (ss_mask) pci_cfg_write32(dev->bus, dev->slot, dev->fn, 0xD8, ss_mask);
+            if (hs_mask) pci_cfg_write32(dev->bus, dev->slot, dev->fn, 0xD0, hs_mask);
+            kprintf("[xhci] Intel port routing: SS 0x%08x->0x%08x (mask 0x%08x) "
+                    "HS 0x%08x->0x%08x (mask 0x%08x)\n",
+                    (unsigned)ss_before,
+                    (unsigned)pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xD8),
+                    (unsigned)ss_mask, (unsigned)hs_before,
+                    (unsigned)pci_cfg_read32(dev->bus, dev->slot, dev->fn, 0xD0),
+                    (unsigned)hs_mask);
+        } else {
+            kprintf("[xhci] Intel port routing: nothing routable "
+                    "(XUSB2PRM=0 USB3PRM=0) -- ports are wired to EHCI\n");
+        }
+    }
+
     if (!xhci_controller_init()) return -5;
 
     g_xhci.bound = true;
@@ -2330,8 +2403,45 @@ static int xhci_probe(struct pci_dev *dev) {
      * only flip the IR0 IE bit AFTER everything is enumerated, so
      * the interrupt-IN reports for HID devices are the very first
      * events we receive via MSI. */
-    for (uint8_t p = 0; p < g_xhci.max_ports; p++) {
-        enumerate_port(p);
+    /* PORT CENSUS. enumerate_port() returns SILENTLY when a port has no
+     * device (CCS=0), so a controller with nothing attached logs exactly
+     * nothing -- which is what the EliteDesk produced: "enumerating 21
+     * root-hub port(s)" and then not one further line. That is
+     * indistinguishable from "the stick was plugged in and we failed to see
+     * it", and telling those two apart is the whole question when persistent
+     * storage depends on a USB device appearing.
+     *
+     * ONE line, after the walk, listing which ports have a device and at what
+     * speed. Silence now means "the hardware reported no connection", not
+     * "the driver said nothing".
+     *
+     * WHY A USB-2 STICK MAY NEVER APPEAR HERE, on Intel PCH: the USB2
+     * differential pairs are routed between EHCI and xHCI by XUSB2PR (PCI cfg
+     * 0xD0 on the xHCI function), which this driver deliberately does not
+     * touch -- usb_legacy.c leaves EHCI with the BIOS so legacy-emulated
+     * keyboard/mouse keep working. SuperSpeed lanes are NOT shared, so a real
+     * USB-3 device in a blue port trains on xHCI regardless. speed 4 = SS. */
+    {
+        unsigned connected = 0;
+        char list[128]; size_t lo = 0; list[0] = 0;
+        for (uint8_t p = 0; p < g_xhci.max_ports; p++) {
+            uint32_t sc = portsc_read(p);
+            if (sc & PORTSC_CCS) {
+                connected++;
+                if (lo < sizeof(list) - 24)
+                    lo += (size_t)ksnprintf(list + lo, sizeof(list) - lo,
+                                            "%s%u(spd%u%s)", lo ? "," : "",
+                                            p + 1u, (unsigned)PORTSC_SPEED(sc),
+                                            (sc & PORTSC_PED) ? "" : ",!en");
+            }
+            enumerate_port(p);
+        }
+        kprintf("[xhci] port census: %u of %u connected%s%s\n",
+                connected, g_xhci.max_ports,
+                connected ? " -- " : " (nothing attached to xHCI; a USB-2 "
+                "device is routed to EHCI by the firmware and is invisible "
+                "here -- use a USB-3 stick in a blue port)",
+                connected ? list : "");
     }
 
     /* Try MSI-X first (xHCI 1.1 mandates it on the primary

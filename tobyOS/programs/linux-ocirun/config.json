@@ -1,0 +1,39 @@
+{
+  "ociVersion": "1.0.2-dev",
+  "process": {
+    "terminal": false,
+    "user": { "uid": 1000, "gid": 1000 },
+    "args": [ "/bin/ctrprobe" ],
+    "env": [ "PATH=/bin:/sbin:/usr/bin", "HOME=/", "TERM=linux" ],
+    "cwd": "/"
+  },
+  "root": { "path": "/oci", "readonly": false },
+  "hostname": "toby-container",
+  "mounts": [
+    { "destination": "/proc", "type": "proc", "source": "proc" },
+    { "destination": "/dev", "type": "tmpfs", "source": "tmpfs" }
+  ],
+  "linux": {
+    "namespaces": [
+      { "type": "user" },
+      { "type": "mount" },
+      { "type": "pid" },
+      { "type": "uts" },
+      { "type": "ipc" },
+      { "type": "network" }
+    ],
+    "uidMappings": [ { "containerID": 0, "hostID": 0, "size": 65536 } ],
+    "gidMappings": [ { "containerID": 0, "hostID": 0, "size": 65536 } ],
+    "resources": {
+      "pids":   { "limit": 8 },
+      "memory": { "limit": 67108864 },
+      "cpu":    { "shares": 512 }
+    },
+    "seccomp": {
+      "defaultAction": "SCMP_ACT_ALLOW",
+      "syscalls": [
+        { "names": [ "chmod" ], "action": "SCMP_ACT_ERRNO", "errnoRet": 1 }
+      ]
+    }
+  }
+}

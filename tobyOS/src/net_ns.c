@@ -1,0 +1,585 @@
+/* net_ns.c -- NETWORK namespaces, cut 1 (Phase 3 slice 12).
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT CUT 1 IS, AND WHAT IT IS NOT
+ *
+ * The plan called this "the one that can blow up" and estimated ~93 static
+ * globals across net.c/tcp.c/socket.c needing to gather into a `struct net_ns`.
+ * Two measurements changed the shape of the work:
+ *
+ *   1. There are ~38 static variables across those files, not ~93.
+ *   2. THIS STACK HAS NO LOOPBACK. There is no 127.0.0.1 path anywhere in
+ *      socket.c / tcp.c / ip.c -- grep finds not one reference.
+ *
+ * (2) is the important one. The plan's cut 1 was "CLONE_NEWNET yields an EMPTY
+ * namespace (loopback only)". With no loopback to speak of, an empty namespace
+ * means simply NO NETWORK -- which is precisely the property a sandbox wants,
+ * and is reached WITHOUT replicating any of that state.
+ *
+ * So cut 1 deliberately does NOT namespace the network stack. The ARP table,
+ * routes, interface list and TCP connection table all remain the initial
+ * namespace's, and a new namespace is empty because it has no interfaces --
+ * so there is nothing to replicate, and every network operation from inside it
+ * is refused at the socket boundary.
+ *
+ * BE PRECISE ABOUT THIS WHEN READING RESULTS: cut 1 achieves isolation by
+ * DENIAL, not by replication. It is honest (an interface-less namespace really
+ * can't reach anything) and it permanently unblocks slice 14, but it is not a
+ * network namespace in the full sense. Cut 2 -- veth pairs and a bridge, so a
+ * container can actually reach the network -- is the refactor the plan
+ * described, and it still has to gather those globals.
+ * ---------------------------------------------------------------------------
+ */
+
+#include <tobyos/nsproxy.h>
+#include <tobyos/net.h>
+#include <tobyos/proc.h>
+#include <tobyos/heap.h>
+#include <tobyos/klibc.h>
+#include <tobyos/printk.h>
+#include <tobyos/spinlock.h>
+#include <tobyos/abi/abi.h>
+
+struct net_ns {
+    int      refs;
+    uint64_t inum;
+    /* ---- cut 2 ----
+     * The namespace's interface. ONE device is enough for a container: a veth
+     * end. Deliberately NOT a refactor of net.c's `g_net_devs` -- the INITIAL
+     * namespace keeps that array untouched, so e1000, DHCP and everything built
+     * on them are byte-for-byte unaffected, and a non-initial namespace simply
+     * has its own device here. Same "NULL == initial, zero behaviour change"
+     * shape as slices 8-12, and it turns a risky rewrite of the stack every
+     * other gate depends on into an additive change. */
+    /* CUT 3: a LIST, because one device per namespace cannot express what a
+     * control plane is for. `ip link add` creates interfaces by name, and a
+     * bridge exists precisely to have several attached to it -- neither is
+     * sayable when the namespace has a single `dev` slot.
+     *
+     * MEASURED BEFORE REFACTORING, exactly as cut 1's note says to: the whole
+     * blast radius was SIX call sites (eth.c, net.c, veth.c x2, and the two
+     * accessors here), not the sweeping change "the one that can blow up"
+     * implies. devs[0] stays THE primary device, so net_ns_dev() answers what
+     * it always did and every existing caller is untouched.
+     *
+     * Addressing is still per-NAMESPACE rather than per-device (ip/netmask/
+     * gateway below). That is a stated limit, not an oversight: `ip addr add`
+     * on a second interface therefore has nowhere to put the address, and
+     * making it truthful means one address block per device. Named here so the
+     * next cut starts from the gap rather than discovering it. */
+#define NET_NS_MAX_DEVS 8
+    /* CUT 3b: the ADDRESS travels with the device.
+     *
+     * ip/netmask/gateway used to be per-NAMESPACE, which is fine while a
+     * namespace has one interface and wrong the moment it has two: RTM_NEWADDR
+     * names an interface, so a per-namespace address gives `ip addr add` two
+     * interfaces and one place to put an answer. Writing the netlink handler
+     * against that would have meant writing one that lies -- it would report
+     * success and the second interface would silently carry the first's
+     * address.
+     *
+     * The per-namespace accessors below still answer for devs[0], so net.c,
+     * eth.c and the ARP path are unchanged. */
+    /* CUT 4 (the control plane) adds the two fields rtnetlink cannot work
+     * without:
+     *
+     *   ifindex -- netlink names an interface by NUMBER, not by name. RTM_NEWADDR
+     *     carries ifa_index and nothing else, so without a stable per-namespace
+     *     index there is no way to say which interface an address belongs to.
+     *     It must survive deletion of an earlier device, hence a counter rather
+     *     than the array position.
+     *
+     *   up -- the ADMIN state, and it is ENFORCED (veth.c consults it before it
+     *     will move a frame in either direction). A stored-and-ignored IFF_UP
+     *     would report a guarantee that does not exist, which is the exact shape
+     *     of lie this arc keeps deleting.
+     *
+     * DELIBERATE DEVIATION FROM LINUX, stated rather than hidden: a device here
+     * is created UP. Linux creates one DOWN and requires `ip link set X up`,
+     * but this kernel has no admin-state concept for its real NIC either, and
+     * every pre-control-plane veth (netns_veth_pair, LXVETH) passes frames the
+     * instant it exists. Defaulting to DOWN would have made that gate fail for
+     * a semantic nothing else here honours. Taking a device DOWN is real. */
+    struct net_ns_if {
+        struct net_dev *dev;
+        uint32_t        ip;        /* network byte order */
+        uint32_t        netmask;
+        uint32_t        gateway;
+        int             ifindex;
+        bool            up;
+        /* CUT 6: the BRIDGE this interface is enslaved to, or NULL. An enslaved
+         * interface has no stack of its own -- its frames go to the bridge --
+         * which is exactly Linux's rule and the reason this lives beside the
+         * address rather than inside the device: a device can be moved between
+         * namespaces, and its master cannot follow it. */
+        struct net_dev *master;
+    }               ifs[NET_NS_MAX_DEVS];
+    size_t          ndev;
+    int             next_ifindex;
+    /* CUT 6: A ROUTE TABLE, and it is ADDITIVE ON PURPOSE.
+     *
+     * ip_send's whole routing policy was "my subnet, else my gateway" -- one
+     * address, one gateway, no way to say "10.99.0.0/24 is reachable through
+     * THIS interface". That is unexpressible for a host that has to send
+     * replies back down to a container, which is exactly what forwarding needs.
+     *
+     * The table is consulted FIRST and the old logic is the FALLBACK, so a
+     * namespace with an empty table behaves byte-identically to before -- which
+     * is what keeps eth0/DHCP/the whole host path out of this change. Routes
+     * appear either from `ip route add` or automatically as a CONNECTED route
+     * when an address is put on an interface, the way Linux does it. */
+#define NET_NS_MAX_ROUTES 8
+    struct net_ns_route {
+        uint32_t        dst;        /* network order, already masked */
+        uint32_t        mask;
+        uint32_t        gateway;    /* 0 == on-link (no next hop) */
+        struct net_dev *dev;
+        bool            in_use;
+    }               routes[NET_NS_MAX_ROUTES];
+    /* CUT 6: the interface this namespace MASQUERADES out of, or NULL for "this
+     * namespace does not forward". One field carries both facts on purpose --
+     * see the header comment in nat.c for why forwarding and NAT are not
+     * separable here the way they are on Linux. */
+    struct net_dev *nat_uplink;
+    uint32_t        ip;           /* network byte order */
+    uint32_t        netmask;
+    uint32_t        gateway;
+};
+
+/* THE INITIAL NAMESPACE CAN HOLD CONTROL-PLANE DEVICES TOO, and next_ifindex
+ * starts at 3 because rtnetlink reports its lo as 1 and eth0 as 2 -- those two
+ * are net.c's, not this list's, and a collision would make `ip addr add` name
+ * the wrong interface.
+ *
+ * That the initial namespace may hold a list at all is a change from cut 3, and
+ * it was MEASURED before it was made: every packet-path caller of net_ns_dev()
+ * / net_ns_ip() / net_ns_netmask() (eth.c:51, net.c:99, net_my_ip, net_my_mac,
+ * net_my_netmask) guards on the RAW namespace pointer being non-NULL, and the
+ * initial namespace IS the NULL pointer. So none of them ever consults this
+ * list for the initial namespace, and e1000/DHCP/ARP are unaffected by
+ * construction. Without this, `ip link add` would have been refusable only in
+ * the initial namespace -- and the standard container recipe is to create the
+ * pair on the host and move one end in. */
+static struct net_ns g_init_net_ns = {
+    .refs = 1, .inum = NS_INUM_INIT_NET, .next_ifindex = 3,
+};
+
+static spinlock_t g_netns_lock = SPINLOCK_INIT;
+
+static void routes_purge_dev(struct net_ns *ns, struct net_dev *dev);
+
+static inline struct net_ns *as_nns(void *p) {
+    return p ? (struct net_ns *)p : &g_init_net_ns;
+}
+
+void *net_ns_create(void) {
+    struct net_ns *ns = kmalloc(sizeof(*ns));
+    if (!ns) return 0;
+    memset(ns, 0, sizeof(*ns));
+    ns->refs = 1;
+    ns->inum = ns_inum_alloc();
+    /* 1, not 3: a fresh namespace has no lo and no eth0 to leave room for.
+     * REPORTING A LOOPBACK IT DOES NOT HAVE WOULD BE THE FABRICATION -- this
+     * stack has no loopback anywhere (cut 1's founding measurement), so a new
+     * namespace's first interface really is interface 1. */
+    ns->next_ifindex = 1;
+    kprintf("[netns] created net:[%lu] -- EMPTY (no interfaces, no routes)\n",
+            (unsigned long)ns->inum);
+    return ns;
+}
+
+void net_ns_get(void *p) {
+    struct net_ns *ns = (struct net_ns *)p;
+    if (!ns || ns == &g_init_net_ns) return;
+    uint64_t f = spin_lock_irqsave(&g_netns_lock);
+    ns->refs++;
+    spin_unlock_irqrestore(&g_netns_lock, f);
+}
+
+void net_ns_put(void *p) {
+    struct net_ns *ns = (struct net_ns *)p;
+    if (!ns || ns == &g_init_net_ns) return;
+    uint64_t f = spin_lock_irqsave(&g_netns_lock);
+    int left = --ns->refs;
+    spin_unlock_irqrestore(&g_netns_lock, f);
+    if (left > 0) return;
+    /* A namespace that dies takes its interfaces with it. Before the control
+     * plane nothing could create one at runtime, so leaking the veth slots was
+     * invisible; now every `ip link add` inside a container that exits would
+     * burn two of them permanently and the pool would run dry mid-gate.
+     *
+     * The PEER is deliberately NOT deleted, only unpaired: it may live in
+     * another namespace that is still running, and that namespace still owns
+     * it. It goes carrier-down (veth_link_up is "my peer exists"), which is
+     * exactly what Linux reports for the surviving half of a torn-down pair. */
+    for (size_t i = 0; i < ns->ndev; i++)
+        if (ns->ifs[i].dev) netns_veth_release(ns->ifs[i].dev);
+    kfree(ns);
+}
+
+uint64_t net_ns_inum(void *p) { return as_nns(p)->inum; }
+
+/* THE enforcement predicate, and the only one.
+ *
+ * A socket carries the network namespace it was created in (latched in
+ * sock_alloc alongside the SO_PEERCRED creds). Every operation that would touch
+ * a real interface asks this, and a non-initial namespace answers "no" --
+ * because it has no interfaces, which is the literal truth rather than a policy
+ * decision.
+ *
+ * Deliberately a property of the SOCKET, not of the calling process: a socket
+ * created before unshare(CLONE_NEWNET) keeps its network, exactly as on Linux,
+ * where a namespace change does not retroactively unplug open sockets. That is
+ * also what lets a sandboxed child keep an inherited socketpair. */
+bool net_ns_has_network(void *sock_ns) {
+    struct net_ns *ns = as_nns(sock_ns);
+    if (ns == &g_init_net_ns) return true;
+    /* CUT 2 CHANGES THIS ANSWER. In cut 1 a non-initial namespace was always
+     * "no network" because it could not possibly have an interface. Now it can:
+     * a namespace with a veth end has a route, so it is networked. A namespace
+     * without one is still empty -- which is exactly the sandbox case, and the
+     * cut-1 acceptance test still passes because it never creates a veth. */
+    return ns->ndev != 0;
+}
+
+/* ---- cut 2 accessors, used by veth.c and the IP/ARP path ---- */
+
+/* The PRIMARY device: devs[0]. Every pre-cut-3 caller means this one, and
+ * keeping the name pointing at it is what made the list additive. */
+struct net_dev *net_ns_dev(void *nsp) {
+    struct net_ns *ns = as_nns(nsp);
+    return ns->ndev ? ns->ifs[0].dev : 0;
+}
+size_t net_ns_dev_count(void *nsp) { return as_nns(nsp)->ndev; }
+struct net_dev *net_ns_dev_at(void *nsp, size_t i) {
+    struct net_ns *ns = as_nns(nsp);
+    return (i < ns->ndev) ? ns->ifs[i].dev : 0;
+}
+struct net_dev *net_ns_find_dev(void *nsp, const char *name) {
+    struct net_ns *ns = as_nns(nsp);
+    if (!name) return 0;
+    for (size_t i = 0; i < ns->ndev; i++)
+        if (ns->ifs[i].dev && ns->ifs[i].dev->name &&
+            strcmp(ns->ifs[i].dev->name, name) == 0) return ns->ifs[i].dev;
+    return 0;
+}
+
+/* ---- per-DEVICE addressing ---- */
+static struct net_ns_if *nsif(struct net_ns *ns, struct net_dev *dev) {
+    for (size_t i = 0; i < ns->ndev; i++)
+        if (ns->ifs[i].dev == dev) return &ns->ifs[i];
+    return 0;
+}
+/* Addressing a device the namespace HOLDS is allowed even in the initial
+ * namespace -- that device came from the control plane, not from net.c. What
+ * stays refused is addressing anything net.c owns: e1000 is not in this list,
+ * so nsif() misses and `ip addr add ... dev eth0` gets ENODEV rather than
+ * silently overwriting the DHCP lease. */
+bool net_ns_set_dev_addr(void *nsp, struct net_dev *dev, uint32_t ip,
+                         uint32_t mask, uint32_t gw) {
+    struct net_ns *ns = as_nns(nsp);
+    struct net_ns_if *e = nsif(ns, dev);
+    if (!e) return false;      /* addressing an interface this ns does not have
+                                * is a refusal, not a silent no-op */
+    /* Drop the old connected route before overwriting the address, or
+     * re-addressing an interface leaves a route to the previous subnet
+     * pointing at it -- which silently swallows traffic for that subnet. */
+    if (e->ip && e->netmask) net_ns_route_del(nsp, e->ip & e->netmask,
+                                              e->netmask);
+    e->ip = ip; e->netmask = mask; e->gateway = gw;
+    /* CONNECTED ROUTE, exactly as Linux derives one from `ip addr add`: the
+     * interface's own subnet is reachable through it with no next hop. Without
+     * this every `ip addr add` would need a matching `ip route add` that no
+     * real tooling issues. */
+    if (ip && mask) net_ns_route_add(nsp, ip & mask, mask, 0, dev);
+    if (gw)         net_ns_route_add(nsp, 0, 0, gw, dev);   /* default via gw */
+    return true;
+}
+uint32_t net_ns_dev_ip(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->ip : 0;
+}
+uint32_t net_ns_dev_netmask(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->netmask : 0;
+}
+/* Append. Returns false when the namespace is full -- a refusal, because a
+ * device that is "added" and silently absent is the kind of half-answer this
+ * arc keeps deleting. */
+bool net_ns_add_dev(void *nsp, struct net_dev *dev) {
+    struct net_ns *ns = as_nns(nsp);
+    if (!dev) return false;
+    if (ns->ndev >= NET_NS_MAX_DEVS) return false;
+    for (size_t i = 0; i < ns->ndev; i++) if (ns->ifs[i].dev == dev) return true;
+    ns->ifs[ns->ndev].dev = dev;
+    ns->ifs[ns->ndev].ip = 0;
+    ns->ifs[ns->ndev].netmask = 0;
+    ns->ifs[ns->ndev].gateway = 0;
+    ns->ifs[ns->ndev].ifindex = ns->next_ifindex++;
+    ns->ifs[ns->ndev].up = true;              /* see the struct comment */
+    ns->ndev++;
+    return true;
+}
+bool net_ns_del_dev(void *nsp, struct net_dev *dev) {
+    struct net_ns *ns = as_nns(nsp);
+    for (size_t i = 0; i < ns->ndev; i++) {
+        if (ns->ifs[i].dev != dev) continue;
+        routes_purge_dev(ns, dev);      /* no route may outlive its interface */
+        netns_bridge_port_gone(dev);    /* nor may a bridge remember it */
+        if (ns->nat_uplink == dev) ns->nat_uplink = 0;   /* nor may NAT */
+        for (size_t k = 0; k < ns->ndev; k++)
+            if (ns->ifs[k].master == dev) ns->ifs[k].master = 0;
+        for (size_t j = i + 1; j < ns->ndev; j++) ns->ifs[j - 1] = ns->ifs[j];
+        ns->ndev--;
+        ns->ifs[ns->ndev].dev = 0;
+        return true;
+    }
+    return false;
+}
+/* The per-NAMESPACE accessors answer for the PRIMARY interface, which is
+ * what every pre-cut-3b caller means by "this namespace's address". */
+uint32_t net_ns_ip(void *nsp) {
+    struct net_ns *ns = as_nns(nsp);
+    return ns->ndev ? ns->ifs[0].ip : 0;
+}
+uint32_t net_ns_netmask(void *nsp) {
+    struct net_ns *ns = as_nns(nsp);
+    return ns->ndev ? ns->ifs[0].netmask : 0;
+}
+uint32_t net_ns_gateway(void *nsp) {
+    struct net_ns *ns = as_nns(nsp);
+    return ns->ndev ? ns->ifs[0].gateway : 0;
+}
+
+void net_ns_set_dev(void *nsp, struct net_dev *dev) {
+    struct net_ns *ns = as_nns(nsp);
+    if (ns == &g_init_net_ns) return;      /* the initial ns keeps g_net_devs */
+    /* Install as the PRIMARY. Existing callers (veth.c) mean "this namespace's
+     * interface", and that is devs[0]; additional ones go through
+     * net_ns_add_dev. */
+    if (ns->ndev == 0) { ns->ifs[0].dev = dev; ns->ifs[0].ip = 0;
+                         ns->ifs[0].netmask = 0; ns->ifs[0].gateway = 0;
+                         ns->ifs[0].ifindex = ns->next_ifindex++;
+                         ns->ifs[0].up = true;
+                         ns->ndev = 1; }
+    else                 ns->ifs[0].dev = dev;
+}
+
+/* ---- cut 4: what a control plane needs on top of the list ---- */
+
+/* The netlink interface INDEX of `dev` in `ns`, or 0 for "this namespace does
+ * not have it" -- 0 is never a valid ifindex on Linux either, so the caller
+ * cannot mistake absence for interface zero. */
+int net_ns_dev_index(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->ifindex : 0;
+}
+struct net_dev *net_ns_dev_by_index(void *nsp, int idx) {
+    struct net_ns *ns = as_nns(nsp);
+    if (idx <= 0) return 0;
+    for (size_t i = 0; i < ns->ndev; i++)
+        if (ns->ifs[i].ifindex == idx) return ns->ifs[i].dev;
+    return 0;
+}
+/* A device this namespace does not hold answers UP. That is the honest answer
+ * for e1000 in the initial namespace: net.c owns it, there is no admin state
+ * for it anywhere in this kernel, and returning "down" would stop the host's
+ * traffic on a question this list has no business answering. */
+bool net_ns_dev_is_up(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->up : true;
+}
+bool net_ns_set_dev_up(void *nsp, struct net_dev *dev, bool up) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    if (!e) return false;
+    e->up = up;
+    return true;
+}
+uint32_t net_ns_dev_gateway(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->gateway : 0;
+}
+
+/* ---- cut 6: bridge enslavement ---- */
+
+bool net_ns_set_dev_master(void *nsp, struct net_dev *dev,
+                           struct net_dev *master) {
+    struct net_ns *ns = as_nns(nsp);
+    struct net_ns_if *e = nsif(ns, dev);
+    if (!e) return false;
+    if (master == dev) return false;      /* a bridge cannot enslave itself */
+    e->master = master;
+    return true;
+}
+struct net_dev *net_ns_dev_master(void *nsp, struct net_dev *dev) {
+    struct net_ns_if *e = nsif(as_nns(nsp), dev);
+    return e ? e->master : 0;
+}
+
+bool net_ns_set_nat(void *nsp, struct net_dev *uplink) {
+    struct net_ns *ns = as_nns(nsp);
+    /* The uplink must be an interface this namespace actually holds, or the
+     * masquerade would rewrite to an address that is not ours. */
+    if (uplink && !nsif(ns, uplink)) return false;
+    ns->nat_uplink = uplink;
+    return true;
+}
+struct net_dev *net_ns_nat_uplink(void *nsp) { return as_nns(nsp)->nat_uplink; }
+
+/* ---- cut 6: the route table ---- */
+
+/* Number of leading 1-bits, so the LONGEST prefix wins a lookup. A default
+ * route (mask 0) therefore loses to every specific one, which is the whole
+ * point of ordering by prefix length rather than by insertion. */
+static int mask_bits(uint32_t mask_be) {
+    uint32_t m = ntohl(mask_be);
+    int n = 0;
+    while (m & 0x80000000u) { n++; m <<= 1; }
+    return n;
+}
+
+bool net_ns_route_add(void *nsp, uint32_t dst, uint32_t mask, uint32_t gw,
+                      struct net_dev *dev) {
+    struct net_ns *ns = as_nns(nsp);
+    if (!dev) return false;            /* a route with no way out is not one */
+    dst &= mask;
+    /* Replacing an identical prefix rather than appending: two entries for one
+     * prefix make which-one-wins an accident of iteration order. */
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) {
+        struct net_ns_route *r = &ns->routes[i];
+        if (r->in_use && r->dst == dst && r->mask == mask) {
+            r->gateway = gw; r->dev = dev;
+            return true;
+        }
+    }
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) {
+        struct net_ns_route *r = &ns->routes[i];
+        if (r->in_use) continue;
+        r->dst = dst; r->mask = mask; r->gateway = gw; r->dev = dev;
+        r->in_use = true;
+        return true;
+    }
+    return false;                                  /* table full -- a refusal */
+}
+
+bool net_ns_route_del(void *nsp, uint32_t dst, uint32_t mask) {
+    struct net_ns *ns = as_nns(nsp);
+    dst &= mask;
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) {
+        struct net_ns_route *r = &ns->routes[i];
+        if (r->in_use && r->dst == dst && r->mask == mask) {
+            memset(r, 0, sizeof *r);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Drop every route that leaves by `dev`. Called when a device leaves the
+ * namespace: a route whose output interface is gone would otherwise hand
+ * ip_send a dangling pointer. */
+static void routes_purge_dev(struct net_ns *ns, struct net_dev *dev) {
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++)
+        if (ns->routes[i].in_use && ns->routes[i].dev == dev)
+            memset(&ns->routes[i], 0, sizeof ns->routes[i]);
+}
+
+bool net_ns_route_lookup(void *nsp, uint32_t dst, uint32_t *next_hop,
+                         struct net_dev **dev_out) {
+    struct net_ns *ns = as_nns(nsp);
+    struct net_ns_route *best = 0;
+    int best_bits = -1;
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) {
+        struct net_ns_route *r = &ns->routes[i];
+        if (!r->in_use || !r->dev) continue;
+        if ((dst & r->mask) != r->dst) continue;
+        int b = mask_bits(r->mask);
+        if (b > best_bits) { best_bits = b; best = r; }
+    }
+    if (!best) return false;
+    /* An ON-LINK route resolves ARP for the DESTINATION; a gatewayed one
+     * resolves it for the gateway. Getting this backwards means ARPing for a
+     * host that is not on this wire and silently never sending. */
+    if (next_hop) *next_hop = best->gateway ? best->gateway : dst;
+    if (dev_out)  *dev_out  = best->dev;
+    return true;
+}
+
+size_t net_ns_route_count(void *nsp) {
+    struct net_ns *ns = as_nns(nsp);
+    size_t n = 0;
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) if (ns->routes[i].in_use) n++;
+    return n;
+}
+
+bool net_ns_route_at(void *nsp, size_t idx, uint32_t *dst, uint32_t *mask,
+                     uint32_t *gw, struct net_dev **dev_out) {
+    struct net_ns *ns = as_nns(nsp);
+    size_t n = 0;
+    for (size_t i = 0; i < NET_NS_MAX_ROUTES; i++) {
+        struct net_ns_route *r = &ns->routes[i];
+        if (!r->in_use) continue;
+        if (n++ != idx) continue;
+        if (dst)     *dst     = r->dst;
+        if (mask)    *mask    = r->mask;
+        if (gw)      *gw      = r->gateway;
+        if (dev_out) *dev_out = r->dev;
+        return true;
+    }
+    return false;
+}
+void net_ns_set_addr(void *nsp, uint32_t ip, uint32_t mask, uint32_t gw) {
+    struct net_ns *ns = as_nns(nsp);
+    if (ns == &g_init_net_ns) return;      /* net.c owns the initial config */
+    if (!ns->ndev) return;                 /* no interface to address */
+    ns->ifs[0].ip = ip; ns->ifs[0].netmask = mask; ns->ifs[0].gateway = gw;
+}
+
+/* ---- THE NETWORK CONTEXT ----------------------------------------------
+ * "Which namespace, and which interface, is the stack acting as right now?"
+ * ip_dst_is_for_us() and arp compare against "my IP", and that address is
+ * per-namespace (cut 2) and per-device (cut 3b) -- but the packet path is a
+ * synchronous call chain with no parameter for either, so the code that
+ * delivers a frame brackets it with this.
+ *
+ * CUT 5 CHANGED TWO THINGS ABOUT IT, AND THE FIRST WAS A REAL BUG.
+ *
+ * 1. `active` EXISTS BECAUSE NULL IS AMBIGUOUS. Cut 2 stored a bare `void *ns`
+ *    where NULL meant "no context", and NULL is ALSO the initial namespace --
+ *    so there was no way to say "this frame belongs to the host" and the
+ *    accessors fell through to `current_proc()->net_ns` instead. That fallback
+ *    is a GUESS, and on the host receive path it is a wrong one: e1000's rx
+ *    drain runs from its IRQ handler and from net_poll(), which is called out
+ *    of poll/select/recvmsg -- i.e. in the context of whatever process happened
+ *    to make the syscall. A process inside a container that called poll() would
+ *    drain the HOST's NIC while net_my_ip() answered with the CONTAINER's
+ *    address, and ip_dst_is_for_us() would drop the host's own packets.
+ *    Latent since cut 2; nothing had a namespaced process polling under host
+ *    traffic until containers arrived.
+ *
+ * 2. It carries the DEVICE, not just the namespace. A namespace with two
+ *    interfaces used to answer for its PRIMARY's address on receive no matter
+ *    which interface the frame came in on -- the receive-side counterpart of
+ *    the per-device addressing cut 3b added on the send side.
+ *
+ * Not a lock and not per-CPU on purpose: delivery happens inline on the
+ * sender's stack under the BKL, exactly like every other packet path here, so a
+ * single depth-1 save/restore is sufficient and honest. If delivery ever
+ * becomes concurrent this must become per-CPU -- noted rather than pretended. */
+static struct net_ctx g_ctx;
+
+struct net_ctx net_ctx_enter(void *ns, struct net_dev *dev) {
+    struct net_ctx prev = g_ctx;
+    g_ctx.active = true;
+    g_ctx.ns     = ns;
+    g_ctx.dev    = dev;
+    return prev;
+}
+void net_ctx_leave(struct net_ctx prev) { g_ctx = prev; }
+bool net_ctx_active(void) { return g_ctx.active; }
+void *net_ctx_ns(void) { return g_ctx.ns; }
+struct net_dev *net_ctx_dev(void) { return g_ctx.dev; }
+
+bool net_ns_is_initial(struct proc *p) {
+    return !p || !p->net_ns;
+}

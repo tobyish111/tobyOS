@@ -1,0 +1,5 @@
+# Third-party payloads staged by fetch.sh -- not committed (same opt-in
+# pattern as programs/chromium/sysroot). asound.conf and fetch.sh ARE
+# tracked: they are ours.
+libasound.so.2
+alsa-share/

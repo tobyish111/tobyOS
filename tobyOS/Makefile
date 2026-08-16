@@ -31,6 +31,25 @@ OVMF_CODE     := build/ovmf-code.fd
 OVMF_VARS     := build/ovmf-vars.fd
 OVMF_VARS_SZ  := 540672
 
+# Header dependency tracking. -MMD writes a `.d` beside every object listing
+# the headers that object actually included; -MP adds a phony target for each
+# of those headers so DELETING one does not wedge the build with "No rule to
+# make target". The generated files are pulled in by the `-include` near the
+# bottom of this file.
+#
+# Why this exists: before it, `src/%.o` depended on $(HEADERS), which is
+# `include/tobyos/*.h` -- ONE directory level. `include/tobyos/abi/abi.h` (the
+# entire Linux ABI) was not in that glob, and libtoby/ and programs/ had no
+# header prerequisites AT ALL. That is the mechanical cause of the two rules
+# this tree carried by hand: "struct proc grows => make clean" and "struct
+# tk_window grew => touch all program sources". Both are now the build's job.
+#
+# The $(HEADERS) prerequisite is deliberately KEPT below: on the first build
+# after this change no .d files exist yet, and stale objects from before it
+# would otherwise never notice a header edit. It costs a full kernel rebuild
+# when a top-level header is touched -- exactly the old behaviour, no worse.
+DEPFLAGS := -MMD -MP
+
 CFLAGS := --target=x86_64-elf \
           -Iinclude \
           -Ithird_party/monocypher-4.0.2/src \
@@ -39,7 +58,7 @@ CFLAGS := --target=x86_64-elf \
           -fno-unwind-tables -fno-asynchronous-unwind-tables \
           -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
           -mcmodel=kernel \
-          -nostdlib -O2 -Wall -Wextra -std=c11
+          -nostdlib -O2 -Wall -Wextra -std=c11 $(DEPFLAGS)
 
 # Faster default boot: shorter DHCP budget, quicker ARP pre-warm, and
 # no inline example.com DNS+TCP+HTTP smoke in kmain (that alone can add
@@ -109,12 +128,24 @@ C_SRCS := src/kernel.c \
           src/smp.c \
           src/vfs.c \
           src/ramfs.c \
+          src/tmpfs.c \
+          src/ptrace.c \
           src/initrd.c \
           src/proc.c \
           src/thread.c \
           src/mmap.c \
           src/fork.c \
           src/shm.c \
+          src/nsproxy.c \
+          src/pid_ns.c \
+          src/user_ns.c \
+          src/net_ns.c \
+          src/veth.c \
+          src/bridge.c \
+          src/nat.c \
+          src/rtnetlink.c \
+          src/seccomp.c \
+          src/cgroup.c \
           src/xserver.c \
           src/unix_socket.c \
           src/sysfs.c \
@@ -198,6 +229,7 @@ C_SRCS := src/kernel.c \
           src/sysmon.c \
           src/installer.c \
           src/audio_hda.c \
+          src/snd_pcm.c \
           src/fw_cfg.c \
           src/acpi_bat.c \
           src/devtest.c \
@@ -410,6 +442,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_gui_edit/user_gui_edit.elf \
             programs/user_abi_test/user_abi_test.elf \
             programs/c_hello/c_hello.elf \
+            programs/nsetuid/nsetuid.elf \
             programs/c_args/c_args.elf \
             programs/c_filedemo/c_filedemo.elf \
             programs/c_alloctest/c_alloctest.elf \
@@ -419,6 +452,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/drvtest/drvtest.elf \
             programs/usbtest/usbtest.elf \
             programs/audiotest/audiotest.elf \
+            programs/audioplay/audioplay.elf \
             programs/batterytest/batterytest.elf \
             programs/displayinfo/displayinfo.elf \
             programs/drawtest/drawtest.elf \
@@ -439,6 +473,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/compattest/compattest.elf \
             programs/sigtest/sigtest.elf \
             programs/mctest/mctest.elf \
+            programs/reclaimtest/reclaimtest.elf \
             programs/tobycc/tobycc.elf \
             programs/tobybuild/tobybuild.elf \
             programs/selfhosttest/selfhosttest.elf \
@@ -770,7 +805,7 @@ USER_CFLAGS := --target=x86_64-elf \
                -ffreestanding -fno-stack-protector -fno-pie -fno-pic \
                -fno-unwind-tables -fno-asynchronous-unwind-tables \
                -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
-               -nostdlib -O2 -Wall -Wextra -std=c11
+               -nostdlib -O2 -Wall -Wextra -std=c11 $(DEPFLAGS)
 
 programs/hello/hello.o: programs/hello/main.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -1417,6 +1452,8 @@ programs/user_oh264test/user_oh264test.elf: programs/user_oh264test/user_oh264te
 	      $(LIBTOBY_CRT0) programs/user_oh264test/user_oh264test.o $(LIBTOBY_AR)
 
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_hello,c_hello))
+# Slice 14: native privilege-drop proof (ABI_SYS_SETUID).
+$(eval $(call LIBTOBY_PROGRAM_RULES,nsetuid,nsetuid))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_args,c_args))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_filedemo,c_filedemo))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_alloctest,c_alloctest))
@@ -1428,6 +1465,7 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devlist,devlist))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,drvtest,drvtest))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,usbtest,usbtest))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,audiotest,audiotest))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,audioplay,audioplay))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,batterytest,batterytest))
 
 # ---------- M27A: display test harness userland tools ----------
@@ -1526,6 +1564,7 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,hwreport,hwreport))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,compattest,compattest))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,sigtest,sigtest))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,mctest,mctest))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,reclaimtest,reclaimtest))
 
 # ---------- Developer tools ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,strace,strace))
@@ -1834,6 +1873,16 @@ programs/linux-eventfd/linux-eventfd.elf: programs/linux-eventfd/main.c
 # the same madvise-dropped pages in lock-step rounds; a map_4k PTE replace
 # (the 0x208c13a YouTube corruption) loses the winner's writes. Static Linux ELF.
 programs/linux-demrace/linux-demrace.elf: programs/linux-demrace/main.c
+	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
+	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
+	      -Wl,-e,_start -o $@ $<
+	printf '\003' | dd of=$@ bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+
+# ALSA PCM guard (audio slice 3): drives /dev/snd/{controlC0,pcmC0D0p} the
+# way alsa-lib does -- CARD_INFO, PCM_INFO, HW_REFINE, HW_PARAMS, SW_PARAMS,
+# PREPARE, WRITEI_FRAMES, SYNC_PTR -- and requires hw_ptr to ADVANCE, which
+# only happens if the DAC really consumed the samples. Static Linux ELF.
+programs/linux-sndtest/linux-sndtest.elf: programs/linux-sndtest/main.c
 	$(CC) --target=x86_64-unknown-linux-gnu -static -nostdlib -ffreestanding \
 	      -fno-builtin -fno-stack-protector -fno-pic -fno-pie -O2 -fuse-ld=lld \
 	      -Wl,-e,_start -o $@ $<
@@ -2457,6 +2506,34 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_edit,user_gui_edit))
 #
 # The .gitkeep file in initrd/bin/ is excluded -- it only exists so
 # the bin/ directory survives in source control.
+#
+# MODES ARE FORCED AT TAR TIME, in two passes, because the host filesystem
+# cannot carry them: this tree is built under MSYS on Windows, where
+# `chmod 755` on a staged file is silently a no-op (verified -- `ls -l`
+# still reports 0644 afterwards). Every binary was therefore tar'd as 0644
+# owned by the BUILD USER, and src/ramfs.c papered over that by reporting a
+# fabricated 00444 for every file and 00555 for every directory, ignoring
+# the header entirely. ramfs now reads the real header, so the header has to
+# be true:
+#   pass 1 (-c)  bin/ + lib/ + $$EXTRA_FILES -> 0755 root:root -- executables,
+#                shared objects, and the staged chrome/alpine trees
+#   pass 2 (-r)  etc/ + repo/ + system/ + m36/ + readme.txt -> 0644 root:root
+# --numeric-owner keeps this working on a host with no `root` account.
+#
+# The two passes MUST NOT OVERLAP: ramfs's find_node() returns the FIRST
+# matching entry, so a path present in both passes would silently resolve to
+# whichever mode was archived first. If you add a file here, put it in
+# exactly one list. `tar -tf` before and after should differ only in modes.
+#
+# KNOWN OVER-APPROXIMATION, stated rather than hidden: $$EXTRA_FILES is whole
+# staged TREES (opt/chrome, the alpine rootfs, the OCI bundle, usr/, lib64/),
+# and the host cannot tell their binaries from their data -- everything in
+# them lands on disk 0644, chrome-headless-shell included. So pass 1 marks
+# that entire subtree 0755. Erring the other way would leave the actual
+# executables non-executable, which is the worse failure; the cost is that
+# e.g. opt/chrome/*.pak is reported executable. Files tobyOS itself builds
+# (bin/, lib/, etc/, repo/, ...) are exact -- this caveat is only the
+# opt-in third-party trees.
 
 $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-xdg-settings/linux-xdg-settings.elf \
@@ -2480,6 +2557,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                programs/linux-demrace/linux-demrace.elf \
                programs/linux-qfreeze/linux-qfreeze.elf \
                programs/linux-drmtest/linux-drmtest.elf \
+               programs/linux-sndtest/linux-sndtest.elf \
                programs/linux-mlkem/linux-mlkem.elf \
                programs/linux-xstub/linux-xstub.elf \
                programs/linux-procfs/linux-procfs.elf \
@@ -2531,7 +2609,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                 initrd/etc/c19b.lua \
                 initrd/etc/c20.lua \
                 initrd/etc/c21.lua \
-               initrd/etc/motd initrd/etc/anim.html initrd/etc/webgl.html initrd/etc/input.html initrd/etc/input2.html initrd/etc/fonttest.html initrd/etc/start.html initrd/etc/egl_vendor.json \
+               initrd/etc/motd initrd/etc/anim.html initrd/etc/webgl.html initrd/etc/input.html initrd/etc/input2.html initrd/etc/fonttest.html initrd/etc/audiotone.html initrd/etc/start.html initrd/etc/egl_vendor.json \
                initrd/readme.txt initrd/etc/Lato-Regular.ttf \
                initrd/etc/Lato-Bold.ttf initrd/etc/Lato-Italic.ttf \
                initrd/etc/Lato-BoldItalic.ttf initrd/etc/fallback.otf \
@@ -2559,6 +2637,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/input.html                 $(INITRD_STAGE)/etc/input.html
 	cp initrd/etc/input2.html                $(INITRD_STAGE)/etc/input2.html
 	cp initrd/etc/fonttest.html             $(INITRD_STAGE)/etc/fonttest.html
+	cp initrd/etc/audiotone.html            $(INITRD_STAGE)/etc/audiotone.html
 	cp initrd/etc/start.html                $(INITRD_STAGE)/etc/start.html
 	cp initrd/etc/egl_vendor.json            $(INITRD_STAGE)/etc/egl_vendor.json
 	cp initrd/etc/Lato-Regular.ttf           $(INITRD_STAGE)/etc/Lato-Regular.ttf
@@ -2607,6 +2686,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_gui_edit/user_gui_edit.elf       $(INITRD_STAGE)/bin/gui_edit
 	cp programs/user_abi_test/user_abi_test.elf       $(INITRD_STAGE)/bin/abi_test
 	cp programs/c_hello/c_hello.elf                   $(INITRD_STAGE)/bin/c_hello
+	cp programs/nsetuid/nsetuid.elf                   $(INITRD_STAGE)/bin/nsetuid
 	cp programs/c_args/c_args.elf                     $(INITRD_STAGE)/bin/c_args
 	cp programs/c_filedemo/c_filedemo.elf             $(INITRD_STAGE)/bin/c_filedemo
 	cp programs/c_alloctest/c_alloctest.elf           $(INITRD_STAGE)/bin/c_alloctest
@@ -2633,6 +2713,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/linux-demrace/linux-demrace.elf       $(INITRD_STAGE)/bin/linux-demrace
 	cp programs/linux-qfreeze/linux-qfreeze.elf       $(INITRD_STAGE)/bin/linux-qfreeze
 	cp programs/linux-drmtest/linux-drmtest.elf       $(INITRD_STAGE)/bin/linux-drmtest
+	cp programs/linux-sndtest/linux-sndtest.elf       $(INITRD_STAGE)/bin/linux-sndtest
 	cp programs/linux-mlkem/linux-mlkem.elf           $(INITRD_STAGE)/bin/linux-mlkem
 	cp programs/linux-xstub/linux-xstub.elf           $(INITRD_STAGE)/bin/linux-xstub
 	cp programs/linux-tty/linux-tty.elf               $(INITRD_STAGE)/bin/linux-tty
@@ -2694,6 +2775,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
 	cp programs/audiotest/audiotest.elf               $(INITRD_STAGE)/bin/audiotest
+	cp programs/audioplay/audioplay.elf               $(INITRD_STAGE)/bin/audioplay
 	cp programs/batterytest/batterytest.elf           $(INITRD_STAGE)/bin/batterytest
 	cp programs/displayinfo/displayinfo.elf           $(INITRD_STAGE)/bin/displayinfo
 	cp programs/drawtest/drawtest.elf                 $(INITRD_STAGE)/bin/drawtest
@@ -2714,6 +2796,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/compattest/compattest.elf             $(INITRD_STAGE)/bin/compattest
 	cp programs/sigtest/sigtest.elf                   $(INITRD_STAGE)/bin/sigtest
 	cp programs/mctest/mctest.elf                     $(INITRD_STAGE)/bin/mctest
+	cp programs/reclaimtest/reclaimtest.elf           $(INITRD_STAGE)/bin/reclaimtest
 	cp programs/strace/strace.elf                     $(INITRD_STAGE)/bin/strace
 	cp programs/debugger/debugger.elf                 $(INITRD_STAGE)/bin/debugger
 	cp programs/pkgmgr/pkgmgr.elf                    $(INITRD_STAGE)/bin/pkgmgr
@@ -2842,6 +2925,141 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         "/etc/drvtest_now baked into initrd";                        \
 	    EXTRA_FILES="$$EXTRA_FILES etc/drvtest_now";                      \
 	fi;                                                                   \
+	if [ -f programs/linux-cred/linux-cred.elf ]; then                    \
+	    cp programs/linux-cred/linux-cred.elf                             \
+	         $(INITRD_STAGE)/bin/linux-cred;                              \
+	    echo "[initrd] staged linux-cred (slice 2 POSIX credentials proof)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cred";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-suid/linux-suid.elf ]; then                    \
+	    cp programs/linux-suid/linux-suid.elf                             \
+	         $(INITRD_STAGE)/bin/linux-suid;                              \
+	    echo "[initrd] staged linux-suid (slice 2 setuid-on-exec proof)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-suid";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-timers/linux-timers.elf ]; then                \
+	    cp programs/linux-timers/linux-timers.elf                         \
+	         $(INITRD_STAGE)/bin/linux-timers;                            \
+	    echo "[initrd] staged linux-timers (slice 3 timerfd/signalfd proof)";\
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-timers";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-mount/linux-mount.elf ]; then                  \
+	    cp programs/linux-mount/linux-mount.elf                           \
+	         $(INITRD_STAGE)/bin/linux-mount;                             \
+	    echo "[initrd] staged linux-mount (slice 5 mount/chroot proof)";  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-mount";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-ns/linux-ns.elf ]; then                        \
+	    cp programs/linux-ns/linux-ns.elf                                 \
+	         $(INITRD_STAGE)/bin/linux-ns;                                \
+	    echo "[initrd] staged linux-ns (slice 8 UTS+IPC namespace proof)";\
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ns";                         \
+	fi;                                                                   \
+	if [ -f programs/linux-cgroup/linux-cgroup.elf ]; then                 \
+	    cp programs/linux-cgroup/linux-cgroup.elf                          \
+	         $(INITRD_STAGE)/bin/linux-cgroup;                             \
+	    echo "[initrd] staged linux-cgroup (slice 15 cgroup v2 proof)";    \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cgroup";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-clonens/linux-clonens.elf ]; then               \
+	    cp programs/linux-clonens/linux-clonens.elf                        \
+	         $(INITRD_STAGE)/bin/linux-clonens;                            \
+	    echo "[initrd] staged linux-clonens (clone+CLONE_NEW* proof)";     \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-clonens";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-clonestk/linux-clonestk.elf ]; then             \
+	    cp programs/linux-clonestk/linux-clonestk.elf                      \
+	         $(INITRD_STAGE)/bin/linux-clonestk;                           \
+	    echo "[initrd] staged linux-clonestk (clone child-stack proof)";   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-clonestk";                    \
+	fi;                                                                   \
+	if [ -f programs/linux-ocirun/linux-ocirun.elf ]; then                 \
+	    cp programs/linux-ocirun/linux-ocirun.elf                          \
+	         $(INITRD_STAGE)/bin/linux-ocirun;                             \
+	    mkdir -p $(INITRD_STAGE)/oci-bundle;                               \
+	    cp programs/linux-ocirun/config.json                               \
+	         $(INITRD_STAGE)/oci-bundle/config.json;                       \
+	    echo "[initrd] staged linux-ocirun + /oci-bundle (slice 16 OCI)";  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ocirun oci-bundle/config.json"; \
+	fi;                                                                   \
+	if [ -f programs/linux-ctrprobe/linux-ctrprobe.elf ]; then             \
+	    cp programs/linux-ctrprobe/linux-ctrprobe.elf                      \
+	         $(INITRD_STAGE)/bin/linux-ctrprobe;                           \
+	    echo "[initrd] staged linux-ctrprobe (in-container probe)";        \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ctrprobe";                    \
+	fi;                                                                   \
+	if [ -f programs/linux-gapfill/linux-gapfill.elf ]; then               \
+	    cp programs/linux-gapfill/linux-gapfill.elf                        \
+	         $(INITRD_STAGE)/bin/linux-gapfill;                            \
+	    echo "[initrd] staged linux-gapfill (fdinfo + new syscalls)";      \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-gapfill";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
+	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
+	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \
+	    echo "[initrd] staged linux-tmpfs (in-memory filesystem proof)";   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-tmpfs";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-ptrace/linux-ptrace.elf ]; then                 \
+	    cp programs/linux-ptrace/linux-ptrace.elf                          \
+	         $(INITRD_STAGE)/bin/linux-ptrace;                             \
+	    echo "[initrd] staged linux-ptrace (mini-strace proof)";           \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ptrace";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-cgroup2/linux-cgroup2.elf ]; then               \
+	    cp programs/linux-cgroup2/linux-cgroup2.elf                        \
+	         $(INITRD_STAGE)/bin/linux-cgroup2;                            \
+	    echo "[initrd] staged linux-cgroup2 (slice 16 memory+io proof)";   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cgroup2";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-seccomp/linux-seccomp.elf ]; then               \
+	    cp programs/linux-seccomp/linux-seccomp.elf                        \
+	         $(INITRD_STAGE)/bin/linux-seccomp;                            \
+	    echo "[initrd] staged linux-seccomp (slice 13 seccomp-bpf proof)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-seccomp";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-netns/linux-netns.elf ]; then                   \
+	    cp programs/linux-netns/linux-netns.elf                            \
+	         $(INITRD_STAGE)/bin/linux-netns;                              \
+	    echo "[initrd] staged linux-netns (slice 12 net ns proof)";        \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-netns";                       \
+	fi;                                                                    \
+	if [ -f programs/linux-netlink/linux-netlink.elf ]; then               \
+	    cp programs/linux-netlink/linux-netlink.elf                        \
+	         $(INITRD_STAGE)/bin/linux-netlink;                            \
+	    echo "[initrd] staged linux-netlink (cut 4 control-plane proof)";  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-netlink";                     \
+	fi;                                                                    \
+	if [ -f programs/linux-userns/linux-userns.elf ]; then                 \
+	    cp programs/linux-userns/linux-userns.elf                          \
+	         $(INITRD_STAGE)/bin/linux-userns;                             \
+	    echo "[initrd] staged linux-userns (slice 11 user ns proof)";      \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-userns";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-mntns/linux-mntns.elf ]; then                  \
+	    cp programs/linux-mntns/linux-mntns.elf                           \
+	         $(INITRD_STAGE)/bin/linux-mntns;                             \
+	    echo "[initrd] staged linux-mntns (slice 9 mount namespace proof)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-mntns";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-pidns/linux-pidns.elf ]; then                  \
+	    cp programs/linux-pidns/linux-pidns.elf                           \
+	         $(INITRD_STAGE)/bin/linux-pidns;                             \
+	    echo "[initrd] staged linux-pidns (slice 10 PID namespace proof)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-pidns";                      \
+	fi;                                                                   \
+	if [ -f programs/linux-alpinerun/linux-alpinerun.elf ]; then          \
+	    cp programs/linux-alpinerun/linux-alpinerun.elf                   \
+	         $(INITRD_STAGE)/bin/linux-alpinerun;                         \
+	    echo "[initrd] staged linux-alpinerun (slice 7 non-root proof)";  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-alpinerun";                  \
+	fi;                                                                   \
+	if [ -f programs/alpine/alpine-minirootfs-3.19.0-x86_64.tar.gz ]; then\
+	    cp programs/alpine/alpine-minirootfs-3.19.0-x86_64.tar.gz         \
+	         $(INITRD_STAGE)/alpine.tar.gz;                               \
+	    echo "[initrd] staged alpine minirootfs (slice 7 distro milestone)";\
+	    EXTRA_FILES="$$EXTRA_FILES alpine.tar.gz";                        \
+	fi;                                                                   \
 	if [ -f programs/linux-glibc-dyn/linux-glibc-dyn.elf ] &&            \
 	   [ -f programs/linux-glibc-dyn/lib/libc.so.6 ] &&                  \
 	   [ -f programs/linux-glibc-dyn/lib/ld-linux-x86-64.so.2 ]; then    \
@@ -2857,6 +3075,19 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] Track B/B26: bundling DYNAMIC glibc proof +"      \
 	         "ld-linux-x86-64.so.2 + libc.so.6/libm.so.6 -- OPT-IN";     \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-glibc-dyn lib/ld-linux-x86-64.so.2 lib/libc.so.6 lib/libm.so.6"; \
+	fi;                                                                   \
+	if [ -f programs/alsa/libasound.so.2 ] &&                            \
+	   [ -d programs/alsa/alsa-share ] &&                                \
+	   [ -f programs/linux-alsatest/linux-alsatest.elf ]; then           \
+	    mkdir -p $(INITRD_STAGE)/lib $(INITRD_STAGE)/usr/share;          \
+	    cp programs/alsa/libasound.so.2 $(INITRD_STAGE)/lib/;            \
+	    cp -r programs/alsa/alsa-share $(INITRD_STAGE)/usr/share/alsa;   \
+	    cp programs/alsa/asound.conf $(INITRD_STAGE)/etc/asound.conf;    \
+	    cp programs/linux-alsatest/linux-alsatest.elf                    \
+	         $(INITRD_STAGE)/bin/linux-alsatest;                         \
+	    echo "[initrd] audio slice 4: bundling UNMODIFIED alsa-lib +"  \
+	         "/usr/share/alsa + linux-alsatest -- OPT-IN";             \
+	    EXTRA_FILES="$$EXTRA_FILES lib/libasound.so.2 usr/share/alsa etc/asound.conf bin/linux-alsatest"; \
 	fi;                                                                   \
 	if [ -f programs/linux-egltest/linux-egltest.elf ]; then              \
 	    cp programs/linux-egltest/linux-egltest.elf                       \
@@ -3089,7 +3320,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    done; \
 	    echo "[initrd] chromium: staged managed policy PostQuantumKeyAgreementEnabled=false (disable X25519MLKEM768 PQ KEX -- tobyOS ML-KEM wall)"; \
 	fi; \
-	cd $(INITRD_STAGE) && tar --format=ustar -cf ../initrd.tar            \
+	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
+	    --owner=0 --group=0 --numeric-owner -cf ../initrd.tar             \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
 	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest bin/av1test bin/aactest bin/wasmtest \
@@ -3100,12 +3332,13 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/devmgr bin/diskmgr bin/eventview bin/mediaplayer bin/chromewin \
 	    bin/xdg-settings \
 	    bin/c_hello bin/c_args bin/c_filedemo bin/c_alloctest bin/c_envtest \
+	    bin/nsetuid \
 	    bin/c_dynhello bin/linux-hello bin/linux-sigtest                  \
 	    bin/linux-mmaptest bin/linux-thread bin/linux-fb bin/linux-fbwin bin/linux-join bin/linux-poll \
 	    bin/linux-netserver bin/linux-siginfo bin/linux-httpget bin/linux-msgsock \
 	    bin/linux-static-auto bin/linux-procfs bin/linux-tty bin/linux-pty bin/linux-procfs2 \
 	    bin/linux-scmsg bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
-	    bin/linux-qfreeze bin/linux-drmtest \
+	    bin/linux-qfreeze bin/linux-drmtest bin/linux-sndtest \
 	    bin/linux-xstub \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \
@@ -3126,20 +3359,23 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
+	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
+	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
+	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
+	    bin/services bin/svc_crasher bin/stabilitytest                    \
+	    bin/hwinfo bin/drvmatch bin/hwcompat bin/hwreport bin/compattest  \
+	    bin/sigtest bin/mctest bin/reclaimtest bin/tobycc bin/tobybuild bin/selfhosttest \
+    bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
+	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
+	    lib/ld-toby.so lib/libtoby.so                                     \
+	    $$EXTRA_FILES                                                     \
+	  && tar --format=ustar --mode=0644 \
+	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
 	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
 	    etc/Lato-Regular.ttf etc/Lato-Bold.ttf etc/Lato-Italic.ttf   \
 	    etc/Lato-BoldItalic.ttf etc/fallback.otf etc/emoji.ttf        \
 	    etc/DejaVuSerif.ttf etc/DejaVuSerif-Bold.ttf                  \
 	    etc/DejaVuSansMono.ttf etc/DejaVuSansMono-Bold.ttf            \
-	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/batterytest \
-	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
-	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
-	    bin/services bin/svc_crasher bin/stabilitytest                    \
-	    bin/hwinfo bin/drvmatch bin/hwcompat bin/hwreport bin/compattest  \
-	    bin/sigtest bin/mctest bin/tobycc bin/tobybuild bin/selfhosttest \
-    bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
-	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
-	    lib/ld-toby.so lib/libtoby.so                                     \
 	    repo/helloapp.tpkg repo/helloapp_v2.tpkg                          \
 	    repo/helloapp_corrupt.tpkg repo/helloapp_badhash.tpkg             \
 	    repo/helloapp_nohash.tpkg  repo/helloapp_badfhash.tpkg            \
@@ -3149,10 +3385,10 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    repo/helloapp_caps_ro.tpkg                                        \
 	    system/keys/trust.db                                              \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
-	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
+	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/audiotone.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
-	    readme.txt $$EXTRA_FILES
+	    readme.txt
 
 # ---------- Build ISO ----------
 #
@@ -4741,6 +4977,7 @@ clean:
 	       programs/drvtest/drvtest.o programs/drvtest/drvtest.elf \
 	       programs/usbtest/usbtest.o programs/usbtest/usbtest.elf \
 	       programs/audiotest/audiotest.o programs/audiotest/audiotest.elf \
+	       programs/audioplay/audioplay.o programs/audioplay/audioplay.elf \
 	       programs/batterytest/batterytest.o programs/batterytest/batterytest.elf \
 	       programs/displayinfo/displayinfo.o programs/displayinfo/displayinfo.elf \
 	       programs/drawtest/drawtest.o programs/drawtest/drawtest.elf \
@@ -4793,4 +5030,26 @@ clean:
 	       libtoby/libtoby.a libtoby/crt0.o $(LIBTOBY_OBJS) \
 	       libtoby/libtoby.so libtoby/Scrt0.o $(LDTOBY_OBJS) $(LDTOBY_SO) \
 	       programs/common/start.o $(LOGDIR)/net.pcap
+	@rm -f $(ALL_DEPS)
 	@echo "(disk.img preserved -- 'make wipe-disk' to reformat the persistent FS)"
+
+# ---------- Header dependency tracking ----------
+#
+# Every object is compiled with $(DEPFLAGS) (-MMD -MP, see the top of this
+# file), which drops a `.d` next to it naming the headers it really included.
+# Pull them all in so editing a header rebuilds exactly the objects that read
+# it -- including `include/tobyos/abi/abi.h` and everything under libtoby/ and
+# programs/, none of which had header prerequisites before.
+#
+# $(wildcard) is deliberate: it expands to only the .d files that EXIST, so a
+# clean tree (or a brand-new object with no .d yet) is not an error. The
+# per-header phony targets from -MP cover the delete-a-header case.
+ALL_DEPS := $(wildcard \
+    src/*.d \
+    $(LIBTOBY_SRC)/*.d \
+    programs/*/*.d \
+    third_party/*/*.d \
+    third_party/*/src/*.d \
+    third_party/*/src/*/*.d)
+
+-include $(ALL_DEPS)

@@ -18,6 +18,7 @@
 #include <tobyos/proc.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
+#include <tobyos/cgroup.h>   /* slice 16: the user-page charge funnel */
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
@@ -26,7 +27,11 @@
 #include <tobyos/sched.h>
 #include <tobyos/mmap.h>
 #include <tobyos/page_fault.h>
+#include <tobyos/swap.h>
+#include <tobyos/oom.h>
 #include <tobyos/apic.h>     /* tlb_shootdown_remote */
+
+extern struct proc g_proc[];   /* reclaim scans for eviction candidates */
 
 /* ---- VMA definitions ---- */
 
@@ -113,10 +118,30 @@ static inline uint64_t page_align_down(uint64_t v) {
 #define MMAP_REGION_BASE  0x0000100000000000ULL
 #define MMAP_REGION_END   0x0000700000000000ULL
 
+/* ASLR: pick this address space's mmap base.
+ *
+ * MMAP_REGION_BASE..MMAP_REGION_END is a 96 TiB window and aslr_mmap_offset()
+ * is at most 2^20 pages = 4 GiB, so randomising the start costs nothing in
+ * usable space. find_free_region() re-applies align_for_len() on top of the
+ * hint, so V8's 4 GiB cage alignment survives the offset.
+ *
+ * aslr_offset() returns 0 when ASLR is disabled, which collapses this to the
+ * old fixed base -- the disabled path is exactly the previous behaviour.
+ *
+ * SCOPE, stated plainly: this randomises the MMAP region only, once per
+ * address-space lifetime. Stack and executable bases are NOT randomised (see
+ * aslr.c), and an execve that reuses a live proc slot keeps the hint it
+ * already had rather than drawing a fresh one -- Linux re-randomises at every
+ * execve, this does not. */
+static uint64_t aslr_mmap_start(void) {
+    extern uint64_t aslr_mmap_offset(void);
+    return MMAP_REGION_BASE + aslr_mmap_offset();
+}
+
 void mmap_init_proc(int pid) {
     struct vma_table *vt = &g_vma_tables[pid];
     memset(vt, 0, sizeof(*vt));
-    vt->mmap_hint = MMAP_REGION_BASE;
+    vt->mmap_hint = aslr_mmap_start();
 }
 
 void mmap2_init_proc(int pid) {
@@ -234,6 +259,14 @@ static uint64_t align_for_len(uint64_t len) {
 
 static uint64_t find_free_region(struct vma_table *vt, uint64_t len) {
     uint64_t align = align_for_len(len);
+    /* hint == 0 means "this address space has never allocated" -- either a
+     * never-used pid (g_vma_tables is zero-initialised) or one whose table
+     * mmap_cleanup_proc has just released. Draw the ASLR base here, lazily,
+     * so randomisation happens without any hook in the execve path: execve's
+     * address-space rebuild is entangled with mm_owner / share-until-exec,
+     * which the Chromium arc depends on and which is not safe to disturb
+     * from here. */
+    if (vt->mmap_hint == 0) vt->mmap_hint = aslr_mmap_start();
     uint64_t addr = vt->mmap_hint;
     if (addr < MMAP_REGION_BASE) addr = MMAP_REGION_BASE;
     addr = (addr + align - 1) & ~(align - 1);
@@ -387,9 +420,9 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
             if (seg > cend) seg = cend;
             uint64_t saved_root = vmm_set_editor_root(p->cr3);
             for (; a < seg; a += PAGE_SIZE) {
-                uint64_t phys = pmm_alloc_page();
+                uint64_t phys = mm_user_page_alloc(p);   /* slice 16: charged */
                 if (!phys) {
-                    kprintf("[mmap] WARN: pmm_alloc_page FAILED at a=0x%lx "
+                    kprintf("[mmap] WARN: user page alloc FAILED at a=0x%lx "
                             "(base=0x%lx len=0x%lx) -- OOM\n",
                             (unsigned long)a, (unsigned long)base,
                             (unsigned long)len);
@@ -491,7 +524,15 @@ long sys_mmap2(uint64_t addr, size_t length, int prot, int flags,
  * the old "always shoot down after unmapping" guarantee for refs>1 / no-free
  * pages too. */
 #define MMAP_FREE_BATCH 256
-struct mmap_free_batch { uint64_t phys[MMAP_FREE_BATCH]; int n; };
+/* Slice 16: the batch carries its OWNER so the memory-controller uncharge happens
+ * in exactly one place (mmap_free_batch_push) rather than at each of the three
+ * call sites. Same reasoning as the alloc funnel: one place is auditable.
+ *
+ * Uncharge happens at PUSH, not at the deferred physical free, because the page
+ * leaves the address space at push time -- that is the moment it stops counting
+ * against the process, and a limit that only relaxed after a TLB shootdown would
+ * make munmap-then-mmap fail for no visible reason. */
+struct mmap_free_batch { uint64_t phys[MMAP_FREE_BATCH]; int n; struct proc *owner; };
 
 /* Quarantine for frames whose shootdown TIMED OUT (slice 50): under WHPX a
  * vCPU can be host-descheduled past the bounded ack wait, so ~8 shootdowns
@@ -509,6 +550,17 @@ static uint64_t   g_tlbq[TLBQ_MAX];
 static int        g_tlbq_n;
 static uint64_t   g_tlbq_leaked;
 static spinlock_t g_tlbq_lock = SPINLOCK_INIT;
+
+/* Read-only view of the quarantine, for the heartbeat's health line. The ring
+ * depth and the leak count were tracked but never reported anywhere, so a
+ * quarantine filling up -- the one genuinely bad outcome here -- was invisible
+ * apart from 8 capped warning lines. */
+void mmap_tlbq_stats(uint64_t *depth, uint64_t *leaked) {
+    spin_lock(&g_tlbq_lock);
+    if (depth)  *depth  = (uint64_t)g_tlbq_n;
+    if (leaked) *leaked = g_tlbq_leaked;
+    spin_unlock(&g_tlbq_lock);
+}
 
 static void tlbq_drain_after_acked(void) {      /* call ONLY after acked==true */
     spin_lock(&g_tlbq_lock);
@@ -541,6 +593,197 @@ static void mmap_free_batch_flush(struct mmap_free_batch *b) {
 static void mmap_free_batch_push(struct mmap_free_batch *b, uint64_t phys) {
     if (b->n == MMAP_FREE_BATCH) mmap_free_batch_flush(b);
     b->phys[b->n++] = phys;
+    cgroup_mem_uncharge(b->owner, 1);           /* slice 16 */
+}
+
+/* ---- page reclaim: evict private-anonymous pages to swap ----------------
+ *
+ * This lives in mmap.c ON PURPOSE. Eviction ends in "clear a live PTE and
+ * return the frame to the PMM", which is the single most invariant-laden
+ * operation in this kernel:
+ *   - the frame must not reach the PMM until a TLB shootdown has been ACKED
+ *     (mmap_free_batch / g_tlbq above -- the measured corruption where a
+ *     chrome renderer read JSON bytes through a stale translation),
+ *   - unacked shootdowns must quarantine rather than free,
+ *   - a CoW-shared frame must never be dropped through one mapping,
+ *   - the owner's cgroup charge must be reversed exactly once.
+ * Writing a second teardown sequence elsewhere would mean re-deriving all
+ * four. Instead this reuses mmap_free_batch_push/flush verbatim, so eviction
+ * and munmap free frames through the same audited path.
+ *
+ * ORDERING is what makes a concurrent fault safe. Per page:
+ *   1. swap_out() copies the bytes out FIRST,
+ *   2. then one aligned 64-bit store turns the PTE from present into a
+ *      PTE_SWAPPED entry -- a racing reader sees either the old present PTE
+ *      or the new swap entry, never a torn value, and both are handled
+ *      (page_fault.c case 2.5 brings it back),
+ *   3. the frame goes to the batch, so it is not reusable until after a
+ *      shootdown -- which is what makes a stale-TLB read harmless.
+ *
+ * ELIGIBILITY is deliberately narrow. Anything not obviously safe is skipped
+ * rather than handled, because the failure mode here is silent corruption
+ * rather than a red gate:
+ *   - PROC_BLOCKED only: the victim is parked in the kernel, not executing.
+ *   - never the caller, never an OOM-protected pid (0/1/login).
+ *   - sole owner of its mm (no threads, no share-until-exec peer), so the
+ *     batch's `owner` is unambiguously the charge target.
+ *   - private + anonymous VMAs only: file-backed and MAP_SHARED pages have a
+ *     second source of truth, and NOFREE (memfd/shm) frames are owned
+ *     elsewhere.
+ *   - page_ref_get(phys) > 1 is skipped: a CoW-shared frame is still mapped
+ *     by another address space whose PTE this loop cannot see.
+ *
+ * Returns the number of pages evicted. */
+static bool reclaim_candidate(struct proc *p, struct proc *self, int *key_out) {
+    if (!p || p == self) return false;
+    /* THE VICTIM MUST NOT BE EXECUTING. This is a CORRECTNESS requirement of
+     * the eviction order above, not conservatism, and it is the single biggest
+     * limitation of this reclaim implementation.
+     *
+     * swap_out() COPIES the page and only then is the PTE flipped. If the
+     * victim is running on another CPU it can write to the page after the copy
+     * has read it: the write lands in a frame that is about to be freed, the
+     * swapped copy is stale, and the process silently loses data when the page
+     * faults back. No amount of TLB discipline fixes that -- the write never
+     * faults, because the page is still present and writable while we copy.
+     *
+     * Linux's order is unmap -> shootdown -> copy, so no write can occur once
+     * the copy begins. Doing that here needs a "swap in progress" PTE state
+     * that the fault path blocks on (Linux uses the page lock); this kernel
+     * has no such primitive, and inventing one is a bigger change than
+     * reclaim itself. Until then: only evict from a process that is provably
+     * not running, where copy-then-unmap is safe.
+     *
+     * Consequence worth knowing: on a busy SMP box this finds fewer victims
+     * than Linux would. It fires for idle/blocked processes -- which is the
+     * common shape under memory pressure -- and skips hot ones. */
+    if (p->state != PROC_READY && p->state != PROC_BLOCKED) return false;
+    if (oom_is_protected(p->pid)) return false;
+    if (p->on_cpu) return false;
+    if (!p->cr3) return false;
+
+    int key = proc_mm_pid(p);
+    if (key != p->pid) return false;      /* a thread -- leave the group alone */
+
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q == p) continue;
+        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+            q->state == PROC_TERMINATED) continue;
+        if (proc_mm_pid(q) == key) return false;   /* shares this mm */
+    }
+    *key_out = key;
+    return true;
+}
+
+/* Lifetime counters. The harness asserts BOTH are non-zero: a reclaim test
+ * whose child exits 0 having never evicted a page proves nothing, and one that
+ * evicted pages but never faulted any back never exercised swap-in. */
+static uint64_t g_reclaim_evicted;
+uint64_t reclaim_stat_evicted(void) { return g_reclaim_evicted; }
+
+int mem_reclaim_pages(int want) {
+    if (want <= 0) return 0;
+    struct proc *self = current_proc();
+    int reclaimed = 0;
+
+    for (int i = 0; i < PROC_MAX && reclaimed < want; i++) {
+        struct proc *p = &g_proc[i];
+        int key = 0;
+        if (!reclaim_candidate(p, self, &key)) {
+#ifdef RECLAIM_BOOT
+            /* Bring-up only: name why each live proc was rejected. "Nothing
+             * was evicted" is otherwise indistinguishable from "the filter
+             * silently excluded everything". */
+            static int rej_logs;
+            if (p && p != self && p->state != PROC_UNUSED &&
+                p->state != PROC_EMBRYO && p->state != PROC_TERMINATED &&
+                rej_logs < 24) {
+                rej_logs++;
+                kprintf("[reclaim?] pid=%d name=%s state=%d on_cpu=%d cr3=%lx "
+                        "mmkey=%d prot=%d\n",
+                        p->pid, p->name, (int)p->state, (int)p->on_cpu,
+                        (unsigned long)p->cr3, proc_mm_pid(p),
+                        (int)oom_is_protected(p->pid));
+            }
+#endif
+            continue;
+        }
+
+        struct vma_table *vt = &g_vma_tables[key];
+        struct mmap_free_batch fb = { .n = 0, .owner = p };
+        bool swap_exhausted = false;
+
+        for (int vi = 0; vi < vt->count && reclaimed < want && !swap_exhausted;
+             vi++) {
+            struct mmap_vma *v = &vt->entries[vi];
+            /* Anonymous, no backing object, not owned elsewhere.
+             *
+             * v->fd < 0 is the load-bearing test, NOT the SHARED flag:
+             * sys_mmap stores `flags | VMA_FLAG_ANON` -- the caller's RAW
+             * bits -- and libtoby's user-facing MAP_PRIVATE (0x02) collides
+             * with the kernel's VMA_FLAG_SHARED (0x02), while its
+             * MAP_ANONYMOUS (0x04) collides with VMA_FLAG_PRIVATE. So on the
+             * native path those two flag bits mean nothing reliable. (Only
+             * sys_mmap2 translates properly; the mismatch is harmless today
+             * because sys_mmap force-ORs ANON and nothing consumes
+             * SHARED/PRIVATE there, but it must not be leaned on here.)
+             *
+             * Sharing safety comes from the refcount below instead, which is
+             * the property that actually matters. */
+            if (!(v->flags & VMA_FLAG_ANON)) continue;
+            if (v->flags & VMA_FLAG_NOFREE) continue;   /* memfd/shm-owned */
+            if (v->fd >= 0) continue;                   /* file-backed */
+
+            for (uint64_t a = v->start; a < v->end && reclaimed < want;
+                 a += PAGE_SIZE) {
+                uint64_t *pte = get_pte(p->cr3, a);
+                if (!pte || !(*pte & PTE_PRESENT)) continue;
+                /* A CoW-marked PTE is the one present-page case where the
+                 * BKL-free fault path WRITES the entry (cow_copy_page installs
+                 * a fresh frame). Evicting it concurrently would race that
+                 * store and lose whichever write landed second. Skip; it
+                 * becomes eligible once the CoW is broken. */
+                if (*pte & PTE_COW) continue;
+                /* PTE_ADDR_MASK (bits 12..51), NOT this file's PAGE_MASK.
+                 * PAGE_MASK is ~0xFFF, so it keeps bit 63 (NX) and the
+                 * software bits 52..62 that every non-executable user PTE
+                 * carries. Using it here produced "physical addresses" like
+                 * 0x8000000001803000, and pmm_phys_to_virt() of that is a
+                 * NON-CANONICAL pointer -- swap_out's memcpy took a #GP and
+                 * panicked the kernel. munmap avoids this by starting from
+                 * vmm_translate() rather than a raw PTE; reading the PTE
+                 * directly means masking it properly. */
+                uint64_t phys = *pte & PTE_ADDR_MASK;
+                if (!phys) continue;
+
+                /* refs > 1 => another address space maps this frame and its
+                 * PTE is not visible from here. refs == 0 is a freshly
+                 * mapped page that was never page_ref_inc'd -- the same case
+                 * munmap handles by freeing without a dec. Mirror munmap's
+                 * handling exactly rather than inventing a variant. */
+                int refs = page_ref_get(phys);
+                if (refs > 1) continue;
+
+                int slot = swap_out(phys, p->pid, a);
+                if (slot < 0) { swap_exhausted = true; break; }
+
+                *pte = swap_encode_pte(slot);           /* step 2 */
+                if (refs == 1) page_ref_dec(phys);
+                mmap_free_batch_push(&fb, phys);        /* uncharges */
+                reclaimed++;
+            }
+        }
+        mmap_free_batch_flush(&fb);      /* shootdown, THEN free */
+        if (swap_exhausted) break;       /* no slots left; stop entirely */
+    }
+
+    if (reclaimed) {
+        g_reclaim_evicted += (uint64_t)reclaimed;
+        kprintf("[reclaim] evicted %d page(s) to swap (total %lu)\n",
+                reclaimed, (unsigned long)g_reclaim_evicted);
+    }
+    return reclaimed;
 }
 
 /* ---- munmap ---- */
@@ -558,7 +801,7 @@ long sys_munmap(uint64_t addr, uint64_t len) {
     addr = page_align_down(addr);
     len  = page_align_up(len);
 
-    struct mmap_free_batch fb = { .n = 0 };
+    struct mmap_free_batch fb = { .n = 0, .owner = p };
     for (int i = 0; i < vt->count; i++) {
         struct mmap_vma *v = &vt->entries[i];
         if (addr >= v->end || (addr + len) <= v->start) continue;
@@ -730,7 +973,7 @@ long sys_madvise_dontneed(uint64_t addr, uint64_t len) {
     mprot_ring_note(addr, len, pid, MPROT_MADV);
 #endif
 
-    struct mmap_free_batch fb = { .n = 0 };
+    struct mmap_free_batch fb = { .n = 0, .owner = p };
     for (int i = 0; i < vt->count; i++) {
         struct mmap_vma *v = &vt->entries[i];
         if (addr >= v->end || (addr + len) <= v->start) continue;
@@ -895,7 +1138,10 @@ long sys_brk2(uint64_t new_brk) {
     if (new_brk > vt->brk_cur) {
         uint64_t saved_root = vmm_set_editor_root(p->cr3);
         for (uint64_t a = vt->brk_cur; a < new_brk; a += PAGE_SIZE) {
-            uint64_t phys = pmm_alloc_page();
+            /* Slice 16: charged to the cgroup. A 0 here now means EITHER real OOM
+             * OR memory.max -- and ENOMEM is the right answer to both, which is
+             * exactly what Linux returns when brk hits a memory cgroup limit. */
+            uint64_t phys = mm_user_page_alloc(p);
             if (!phys) {
                 vmm_set_editor_root(saved_root);
                 return -12;
@@ -908,7 +1154,7 @@ long sys_brk2(uint64_t new_brk) {
 
     /* Shrink: unmap pages between new brk and old brk */
     if (new_brk < vt->brk_cur) {
-        struct mmap_free_batch fb = { .n = 0 };
+        struct mmap_free_batch fb = { .n = 0, .owner = p };
         uint64_t saved_root = vmm_set_editor_root(p->cr3);
         for (uint64_t a = new_brk; a < vt->brk_cur; a += PAGE_SIZE) {
             uint64_t phys = vmm_translate(a);
@@ -978,9 +1224,9 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
                           (void *)v->start, (void *)v->end, v->prot);
                 return false; }
 
-            uint64_t new_phys = pmm_alloc_page();
+            uint64_t new_phys = mm_user_page_alloc(p);   /* slice 16: charged */
             if (!new_phys) { vmm_set_editor_root(saved_root);
-                PF_REJECT("COW copy OOM"); return false; }
+                PF_REJECT("COW copy refused (OOM or memory.max)"); return false; }
 
             memcpy((void *)(new_phys + vmm_hhdm_offset()),
                    (void *)(old_phys + vmm_hhdm_offset()),
@@ -996,7 +1242,10 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
             int ins = vmm_remap_page_if(page_va, old_phys, new_phys, vmm_f);
             vmm_set_editor_root(saved_root);
             if (ins != 1) {
-                pmm_free_page(new_phys);        /* our copy was never visible */
+                /* Slice 16: uncharge too -- the copy was charged when allocated,
+                 * and a lost race must not leak a charge or the limit tightens
+                 * every time two CPUs fault the same page. */
+                mm_user_page_free(p, new_phys); /* our copy was never visible */
                 if (ins < 0) { PF_REJECT("COW remap walk failed"); return false; }
 #ifdef CHROMIUM_BOOT
                 { static int _r; if (_r < 24) { _r++;
@@ -1066,8 +1315,11 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
         return false;
     }
 
-    /* Demand paging: allocate a zero-filled physical page */
-    uint64_t phys = pmm_alloc_page();
+    /* Demand paging: allocate a zero-filled physical page.
+     * Slice 16: THE memory-controller hot path -- one charge per fault, next to a
+     * 4 KiB memset, so the accounting is far below the noise floor of the work it
+     * accompanies. (Measured; see the slice-16 notes in the handoff.) */
+    uint64_t phys = mm_user_page_alloc(p);
     if (!phys) {
         /* This failure path is a SILENT fatal SIGSEGV for the process --
          * from the outside indistinguishable from a wild pointer. Name it. */
@@ -1100,7 +1352,10 @@ static bool mmap_try_fault(uint64_t fault_addr, uint64_t error_code) {
     int ins = vmm_map_page_if_absent(page_va, phys, vmm_f);
     vmm_set_editor_root(saved_root);
     if (ins != 1) {
-        pmm_free_page(phys);
+        /* Slice 16: release the charge with the frame. Losing this race is common
+         * under SMP, so a leaked charge here would ratchet memory.current upward
+         * on a purely successful workload. */
+        mm_user_page_free(p, phys);
         if (ins < 0) {
             kprintf("[mmap] demand-page table OOM at %p\n", (void *)fault_addr);
             return false;
@@ -1189,12 +1444,27 @@ int mmap2_cow_clone(int parent_pid, int child_pid) {
 
 /* ---- Cleanup ---- */
 
+/* Release an address space's VMA bookkeeping.
+ *
+ * Called from proc_reap the moment vmm_destroy_user_pml4 runs -- i.e. when the
+ * LAST user of this address space is gone, so no thread can still consult the
+ * table. Before this was wired, nothing ever cleared g_vma_tables: the array is
+ * keyed by proc_mm_pid(), pids ARE recycled g_proc[] slot indices, and reap
+ * memset the struct proc while leaving the VMA table untouched. A recycled pid
+ * therefore inherited the dead process's mappings, and mmap_handle_page_fault
+ * would service a demand fault against one -- handing the new process a
+ * zero-filled page at an address it never mapped, instead of a fault. That is
+ * the same class of bug as the second registry removed in sys_mmap (see the
+ * NOTE there), which is why the entries are dropped and not merely counted out.
+ *
+ * mmap_hint goes to 0, not MMAP_REGION_BASE: 0 is find_free_region's "fresh
+ * address space" sentinel, so the next user of this slot draws a NEW ASLR base
+ * rather than inheriting the dead process's layout. */
 void mmap_cleanup_proc(int pid) {
+    if (pid < 0 || pid >= PROC_MAX) return;
     struct vma_table *vt = &g_vma_tables[pid];
-    vt->count = 0;
-    vt->mmap_hint = MMAP_REGION_BASE;
-    vt->brk_base = 0;
-    vt->brk_cur = 0;
+    memset(vt, 0, sizeof(*vt));
+    vt->mmap_hint = 0;
 }
 
 void mmap2_cleanup_proc(int pid) {
@@ -1550,10 +1820,23 @@ long mmap_map_phys_user(uint64_t phys, uint64_t len) {
  * implementation needs msync/close writeback and eviction.
  * ================================================================== */
 
-/* One entry per SHARED-MAPPED FILE, not per inode NUMBER. Chrome creates ~40
- * regions in a run and each needs its own entry now that they no longer
- * (wrongly) collapse onto a recycled inode number -- see shm_cache_detach_ino. */
-#define SHMCACHE_MAX 256
+/* One entry per SHARED-MAPPED FILE, not per inode NUMBER.
+ *
+ * SIZE + RECLAIM (slice 122): this was 256 permanent entries, sized when
+ * "chrome creates ~40 regions in a run" -- and one Bing search page consumed
+ * EXACTLY 256 (measured: the 256th CREATED is the last line the [shm] trace
+ * ever printed). Every region after that fell through to the silent copying
+ * path, where each mapper gets a private snapshot of a freshly-zeroed file:
+ * the producer's bytes land where no consumer can see them, so V8 parsed
+ * 34498 NUL bytes with a straight face and the whole SERP rendered white.
+ * No syscall fails anywhere on that path -- the only symptom is data that
+ * quietly stops being shared. Hence two changes:
+ *   1. entries are refcounted (pins = struct files carrying the f->shm pin)
+ *      and DEAD entries -- no pins, no live mappings -- are reaped when the
+ *      table fills, so long sessions stop leaking toward the cliff;
+ *   2. the cliff itself is LOUD now (see the fall-through log in
+ *      shm_slot_alloc), because a silent one cost a day of forensics. */
+#define SHMCACHE_MAX 1024
 
 struct shm_cache {
     bool      used;
@@ -1562,9 +1845,38 @@ struct shm_cache {
     uint64_t *pages;        /* physical page addrs; index i == file page i */
     size_t    npages;
     size_t    cap;
+    int       pins;         /* struct files whose f->shm points here */
 };
 
 static struct shm_cache g_shm[SHMCACHE_MAX];
+
+void shm_cache_pin(struct shm_cache *sc)   { if (sc) sc->pins++; }
+void shm_cache_unpin(struct shm_cache *sc) { if (sc && sc->pins > 0) sc->pins--; }
+
+/* True if nothing can ever reach this entry again: no fd carries the pin
+ * (so no future mmap can attach through a descriptor), and no address space
+ * still maps its pages (each mapping holds a page reference on top of the
+ * cache's own one, so ref==1 everywhere means the cache is the last holder).
+ * A future by-(ino,gen) attach is impossible for chrome's regions -- the
+ * file is unlinked at birth, so once the descriptors are gone the identity
+ * is unreachable. */
+static bool shm_slot_dead(const struct shm_cache *sc) {
+    if (sc->pins > 0) return false;
+    for (size_t i = 0; i < sc->npages; i++)
+        if (sc->pages[i] && page_ref_get(sc->pages[i]) != 1) return false;
+    return true;
+}
+
+static void shm_slot_free(struct shm_cache *sc) {
+    for (size_t i = 0; i < sc->npages; i++) {
+        if (sc->pages[i]) {
+            page_ref_dec(sc->pages[i]);         /* drop the cache's own ref */
+            pmm_free_page(sc->pages[i]);
+        }
+    }
+    if (sc->pages) kfree(sc->pages);
+    memset(sc, 0, sizeof(*sc));
+}
 
 static struct shm_cache *shm_slot_alloc(uint64_t ino, uint64_t gen) {
     for (int i = 0; i < SHMCACHE_MAX; i++) {
@@ -1573,9 +1885,40 @@ static struct shm_cache *shm_slot_alloc(uint64_t ino, uint64_t gen) {
             g_shm[i].ino  = ino;
             g_shm[i].gen  = gen;
             g_shm[i].pages = 0; g_shm[i].npages = 0; g_shm[i].cap = 0;
+            g_shm[i].pins  = 0;
             return &g_shm[i];
         }
     }
+    /* Table full: reap ONE dead entry and take its slot. Lazy on purpose --
+     * below the cap this function behaves exactly as before. */
+    for (int i = 0; i < SHMCACHE_MAX; i++) {
+        if (g_shm[i].used && shm_slot_dead(&g_shm[i])) {
+            {   static int rl = 0;
+                if (rl < 8) { rl++;
+                    kprintf("[shm] cache full: reaped dead region ino=%lu/%lu "
+                            "(%lu pages) for %lu/%lu\n",
+                            (unsigned long)g_shm[i].ino,
+                            (unsigned long)g_shm[i].gen,
+                            (unsigned long)g_shm[i].npages,
+                            (unsigned long)ino, (unsigned long)gen);
+                } }
+            shm_slot_free(&g_shm[i]);
+            g_shm[i].used = true;
+            g_shm[i].ino  = ino;
+            g_shm[i].gen  = gen;
+            return &g_shm[i];
+        }
+    }
+    /* Still full: the caller falls back to COPYING, which un-shares this
+     * region -- readers of the copy will see zeros, not the writer's bytes.
+     * That outcome must NEVER be silent again. */
+    {   static int fl = 0;
+        if (fl < 16) { fl++;
+            kprintf("[shm] WARNING: cache FULL (%d live regions) -- region "
+                    "ino=%lu/%lu gets a PRIVATE COPY; cross-process readers "
+                    "of it will see stale/zero bytes\n",
+                    SHMCACHE_MAX, (unsigned long)ino, (unsigned long)gen);
+        } }
     return 0;                                    /* table full -> caller copies */
 }
 

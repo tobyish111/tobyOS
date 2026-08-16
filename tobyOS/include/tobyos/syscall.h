@@ -199,6 +199,9 @@
  */
 #define SYS_GETUID        ABI_SYS_GETUID
 #define SYS_GETGID        ABI_SYS_GETGID
+/* Slice 14: the native side could read identity but never change it. */
+#define SYS_SETUID        ABI_SYS_SETUID
+#define SYS_SETGID        ABI_SYS_SETGID
 #define SYS_USERNAME      ABI_SYS_USERNAME
 #define SYS_CHMOD         ABI_SYS_CHMOD
 #define SYS_CHOWN         ABI_SYS_CHOWN

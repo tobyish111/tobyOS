@@ -13,6 +13,7 @@
  */
 
 #include <tobyos/perf.h>
+#include <tobyos/cgroup.h>   /* cgroup_account_cpu (slice 15) */
 #include <tobyos/pit.h>
 #include <tobyos/printk.h>
 #include <tobyos/proc.h>
@@ -251,7 +252,12 @@ void perf_proc_account_out(struct proc *p, uint64_t tsc_now) {
     if (!p) return;
     if (p->last_switch_tsc) {
         uint64_t dtsc = tsc_now - p->last_switch_tsc;
-        p->cpu_ns += perf_tsc_to_ns(dtsc);
+        uint64_t dns  = perf_tsc_to_ns(dtsc);
+        p->cpu_ns += dns;
+        /* Slice 15: the same figure feeds cpu.stat. Accounted HERE, at the one
+         * place per-proc CPU time is already computed, so cpu.stat can never
+         * disagree with /proc/<pid>/stat. */
+        cgroup_account_cpu(p, dns);
     }
     p->last_switch_tsc = 0;
 }

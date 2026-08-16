@@ -20,16 +20,78 @@
 #include <tobyos/sysprot.h>
 #include <tobyos/slog.h>
 #include <tobyos/perf.h>
+#include <tobyos/nsproxy.h>   /* ns_inum_alloc, NS_INUM_INIT_MNT (slice 9) */
 
 struct vfs_mount {
     char                  point[VFS_PATH_MAX];   /* "/", "/data", ... no trailing '/' (except root) */
     size_t                point_len;             /* strlen(point) */
     const struct vfs_ops *ops;
     void                 *data;
+    uint32_t              flags;   /* VFS_MNT_* -- Linux slice 2 */
+    /* Slice 9: propagation. `prop` is VFS_PROP_*; `peer_id` names the peer
+     * group a SHARED mount belongs to (0 = none), and `master_id` the group a
+     * SLAVE receives events from. Propagation is between NAMESPACES, so these
+     * ids are global and are what makes a mount in one namespace findable from
+     * another. */
+    uint32_t              prop;
+    uint32_t              peer_id;
+    uint32_t              master_id;
 };
 
-static struct vfs_mount g_mounts[VFS_MAX_MOUNTS];
-static size_t           g_mount_count;
+/* ---- Linux slice 5: the mount NAMESPACE seam ------------------------------
+ *
+ * The mount table now lives inside a `struct mount_ns` rather than being a
+ * bare global. Today there is exactly one namespace and every process shares
+ * it, so behaviour is identical -- this is deliberately a SEAM, not a feature.
+ *
+ * It is built now because slice 9 (CLONE_NEWNS) only has to allocate a second
+ * mount_ns and point a proc at it; doing the flat version first and
+ * namespacing later would mean rewriting every resolution site twice.
+ *
+ * Namespacing is cheap here precisely because tobyOS resolves paths by
+ * longest-matching-prefix over a small array rather than by walking a
+ * dentry/vfsmount graph: cloning a namespace is a struct copy.
+ *
+ * The two accessor macros keep the ~29 existing `g_mounts`/`g_mount_count`
+ * uses in this file untouched, so the seam adds no churn and no opportunity
+ * to miss a site. */
+struct mount_ns {
+    struct vfs_mount m[VFS_MAX_MOUNTS];
+    size_t           count;
+    int              refs;      /* namespaces are shared until unshared */
+    /* ---- slice 9 ---- */
+    uint64_t         inum;      /* nsfs inode number, i.e. the N in mnt:[N] */
+    struct mount_ns *next;      /* global registry; see g_mnt_ns_list */
+    /* ---- slice 11 ----
+     * The USER namespace that created this mount namespace. NULL == the initial
+     * user namespace. This is what makes unprivileged mounting safe: holding
+     * CAP_SYS_ADMIN in a user namespace only authorises mounting in namespaces
+     * that user namespace OWNS, so unshare(CLONE_NEWUSER) alone grants nothing
+     * over the real mount table. See userns_owns_mnt_ns(). */
+    void            *owner_user_ns;
+};
+
+static struct mount_ns g_init_mnt_ns;
+
+/* Slice 9: every namespace, threaded on ->next, initial namespace first.
+ *
+ * Propagation is the reason this exists. A mount event under a SHARED mount has
+ * to reach that mount's peers, and peers live in OTHER namespaces -- so there
+ * must be a way to enumerate namespaces from inside a mount call. Linux walks
+ * its vfsmount tree instead; we have a flat table per namespace, so a list of
+ * namespaces is the equivalent structure. */
+static struct mount_ns *g_mnt_ns_list = &g_init_mnt_ns;
+
+/* Peer-group id allocator. 0 means "not in a peer group". */
+static uint32_t g_peer_next = 1;
+
+static inline struct mount_ns *cur_mnt_ns(void) {
+    struct proc *p = current_proc();
+    return (p && p->mnt_ns) ? (struct mount_ns *)p->mnt_ns : &g_init_mnt_ns;
+}
+
+#define g_mounts      (cur_mnt_ns()->m)
+#define g_mount_count (cur_mnt_ns()->count)
 
 /* Normalise a mount point: ensure leading '/', strip trailing '/'
  * unless it's exactly the root. Writes into out (size VFS_PATH_MAX). */
@@ -46,7 +108,270 @@ static bool normalise_mount(const char *in, char *out) {
     return true;
 }
 
-int vfs_mount(const char *mount_point, const struct vfs_ops *ops, void *mount_data) {
+/* ===================================================================
+ * Slice 9: mount namespaces and propagation
+ *
+ * Propagation is the only part of this slice with real semantic content, and
+ * the only part that could be faked by accepting MS_SHARED and doing nothing.
+ * So it is implemented for real: a mount under a SHARED mount appears in that
+ * mount's peers, which live in OTHER namespaces, and the acceptance test checks
+ * both that it does and that a PRIVATE mount does not.
+ *
+ * The model maps onto tobyOS's flat longest-prefix table like this:
+ *   - a mount's "parent" is the longest-prefix mount strictly above it;
+ *   - "peers" are mounts (in any namespace) sharing a peer_id;
+ *   - propagating means adding/removing the same table entry in each peer's
+ *     namespace.
+ * Linux walks a vfsmount tree to do the same thing.
+ * =================================================================== */
+
+static struct vfs_mount *ns_find_exact(struct mount_ns *ns, const char *norm) {
+    for (size_t i = 0; i < ns->count; i++)
+        if (strcmp(ns->m[i].point, norm) == 0) return &ns->m[i];
+    return 0;
+}
+
+/* The mount `norm` sits under: longest prefix STRICTLY shorter than norm. */
+static struct vfs_mount *ns_find_parent(struct mount_ns *ns, const char *norm) {
+    struct vfs_mount *best = 0;
+    size_t nl = strlen(norm);
+    for (size_t i = 0; i < ns->count; i++) {
+        struct vfs_mount *m = &ns->m[i];
+        if (m->point_len >= nl) continue;
+        if (strncmp(norm, m->point, m->point_len) != 0) continue;
+        /* "/" is a prefix of everything; otherwise the next char must be '/'
+         * so that /datax is not treated as living under /data. */
+        if (m->point_len > 1 && norm[m->point_len] != '/') continue;
+        if (!best || m->point_len > best->point_len) best = m;
+    }
+    return best;
+}
+
+/* Insert without any propagation or driver call. Returns VFS_OK or an error. */
+static int ns_add_raw(struct mount_ns *ns, const char *norm,
+                      const struct vfs_ops *ops, void *data, uint32_t flags,
+                      uint32_t prop, uint32_t peer_id, uint32_t master_id) {
+    struct vfs_mount *ex = ns_find_exact(ns, norm);
+    if (!ex) {
+        if (ns->count >= VFS_MAX_MOUNTS) return VFS_ERR_NOMEM;
+        ex = &ns->m[ns->count++];
+        size_t nlen = strlen(norm);
+        memcpy(ex->point, norm, nlen + 1);
+        ex->point_len = nlen;
+    }
+    ex->ops       = ops;
+    ex->data      = data;
+    ex->flags     = flags;
+    ex->prop      = prop;
+    ex->peer_id   = peer_id;
+    ex->master_id = master_id;
+    return VFS_OK;
+}
+
+/* Remove without calling the driver's umount hook. Propagated copies SHARE the
+ * (ops, data) of the original, so the driver must be torn down exactly once --
+ * see the shared-data guard in vfs_unmount. */
+static void ns_remove_raw(struct mount_ns *ns, const char *norm) {
+    for (size_t i = 0; i < ns->count; i++) {
+        if (strcmp(ns->m[i].point, norm) != 0) continue;
+        for (size_t j = i + 1; j < ns->count; j++) ns->m[j - 1] = ns->m[j];
+        ns->count--;
+        memset(&ns->m[ns->count], 0, sizeof(ns->m[ns->count]));
+        return;
+    }
+}
+
+/* Is (ops,data) still referenced by any mount in any namespace? Used to decide
+ * whether vfs_unmount may call the driver's umount hook.
+ *
+ * This also closes a PRE-EXISTING hazard: slice 5's MS_BIND already registers a
+ * second table entry sharing one (ops,data), so unmounting either end called
+ * ops->umount(data) and left the other pointing at torn-down state. */
+static bool data_still_referenced(const struct vfs_ops *ops, void *data) {
+    for (struct mount_ns *ns = g_mnt_ns_list; ns; ns = ns->next)
+        for (size_t i = 0; i < ns->count; i++)
+            if (ns->m[i].ops == ops && ns->m[i].data == data) return true;
+    return false;
+}
+
+/* Propagate a new mount at `norm` outward from `origin`. Returns the peer group
+ * the new mount should join (0 when nothing propagated). */
+static uint32_t propagate_mount(struct mount_ns *origin, const char *norm,
+                                const struct vfs_ops *ops, void *data,
+                                uint32_t flags) {
+    struct vfs_mount *parent = ns_find_parent(origin, norm);
+    if (!parent || parent->prop != VFS_PROP_SHARED || !parent->peer_id) return 0;
+
+    uint32_t group = g_peer_next++;
+    int n = 0;
+    for (struct mount_ns *ns = g_mnt_ns_list; ns; ns = ns->next) {
+        if (ns == origin) continue;
+        /* Does this namespace hold a peer (or a slave) of the parent? */
+        for (size_t i = 0; i < ns->count; i++) {
+            struct vfs_mount *m = &ns->m[i];
+            bool is_peer  = (m->peer_id   == parent->peer_id);
+            bool is_slave = (m->master_id == parent->peer_id);
+            if (!is_peer && !is_slave) continue;
+            /* A peer receives a SHARED copy (so it propagates onward); a slave
+             * receives a SLAVE copy (receives, never sends). */
+            (void)ns_add_raw(ns, norm, ops, data, flags,
+                             is_peer ? VFS_PROP_SHARED : VFS_PROP_SLAVE,
+                             is_peer ? group : 0,
+                             is_peer ? 0 : group);
+            n++;
+            break;                       /* one copy per namespace */
+        }
+    }
+    if (n) kprintf("[mntns] propagated mount '%s' to %d peer namespace(s) "
+                   "(group %u)\n", norm, n, group);
+    return group;
+}
+
+static void propagate_umount(struct mount_ns *origin, const struct vfs_mount *gone) {
+    if (!gone->peer_id && !gone->master_id) return;
+    uint32_t g = gone->peer_id ? gone->peer_id : gone->master_id;
+    for (struct mount_ns *ns = g_mnt_ns_list; ns; ns = ns->next) {
+        if (ns == origin) continue;
+        struct vfs_mount *m = ns_find_exact(ns, gone->point);
+        if (!m) continue;
+        if (m->peer_id != g && m->master_id != g) continue;
+        ns_remove_raw(ns, gone->point);
+    }
+}
+
+/* ---- the namespace object, driven by nsproxy.c ---- */
+
+void *mount_ns_create(void) {
+    struct mount_ns *src = cur_mnt_ns();
+    struct mount_ns *ns = kmalloc(sizeof(*ns));
+    if (!ns) return 0;
+    memcpy(ns, src, sizeof(*ns));           /* a namespace CLONES the mounts */
+    ns->refs = 1;
+    ns->inum = ns_inum_alloc();
+    /* Peer relationships across the clone, per Linux:
+     *   SHARED  -> the copy is a PEER of the original (same peer_id), which is
+     *              exactly what makes propagation survive an unshare;
+     *   SLAVE   -> the copy is still a slave of the same master;
+     *   PRIVATE -> the copy is independent.
+     * Getting the SHARED case wrong (clearing peer_id) would silently turn
+     * every propagation test into a no-op that still looked isolated. */
+    for (size_t i = 0; i < ns->count; i++) {
+        if (ns->m[i].prop == VFS_PROP_PRIVATE ||
+            ns->m[i].prop == VFS_PROP_UNBINDABLE) {
+            ns->m[i].peer_id = 0;
+            ns->m[i].master_id = 0;
+        }
+    }
+    /* Slice 11: record the creator's user namespace as the owner. */
+    { struct proc *cp = current_proc();
+      ns->owner_user_ns = cp ? cp->user_ns : 0; }
+    ns->next = g_mnt_ns_list;
+    g_mnt_ns_list = ns;
+    kprintf("[mntns] created mnt:[%lu] with %lu mount(s) cloned (owner user ns "
+            "%p)\n", (unsigned long)ns->inum, (unsigned long)ns->count,
+            ns->owner_user_ns);
+    return ns;
+}
+
+void *mount_ns_owner(void *p) {
+    struct mount_ns *ns = p ? (struct mount_ns *)p : &g_init_mnt_ns;
+    return ns->owner_user_ns;
+}
+
+void mount_ns_get(void *p) {
+    struct mount_ns *ns = (struct mount_ns *)p;
+    if (!ns || ns == &g_init_mnt_ns) return;
+    ns->refs++;
+}
+
+void mount_ns_put(void *p) {
+    struct mount_ns *ns = (struct mount_ns *)p;
+    if (!ns || ns == &g_init_mnt_ns) return;
+    if (--ns->refs > 0) return;
+    /* Unlink from the registry before tearing down, so no propagation walk can
+     * still reach it. */
+    struct mount_ns **pp = &g_mnt_ns_list;
+    while (*pp && *pp != ns) pp = &(*pp)->next;
+    if (*pp) *pp = ns->next;
+    /* Release any filesystem whose last reference was in this namespace. Its
+     * mounts are going away with it, so the driver hook is owed exactly here --
+     * and only for (ops,data) nothing else still names. */
+    for (size_t i = 0; i < ns->count; i++) {
+        const struct vfs_ops *ops = ns->m[i].ops;
+        void *data = ns->m[i].data;
+        ns->m[i].ops = 0;                   /* so the guard below ignores us */
+        ns->m[i].data = 0;
+        if (ops && ops->umount && !data_still_referenced(ops, data))
+            (void)ops->umount(data);
+    }
+    kprintf("[mntns] destroyed mnt:[%lu]\n", (unsigned long)ns->inum);
+    kfree(ns);
+}
+
+uint64_t mount_ns_inum(void *p) {
+    struct mount_ns *ns = p ? (struct mount_ns *)p : &g_init_mnt_ns;
+    if (!ns->inum) ns->inum = NS_INUM_INIT_MNT;   /* lazily stamp the initial ns */
+    return ns->inum;
+}
+
+/* mount --make-{shared,private,slave,unbindable} [-R]. Linux spells these as a
+ * mount(2) call carrying only a propagation flag, so this is not a new syscall. */
+int vfs_set_propagation(const char *mount_point, uint32_t prop, bool recursive) {
+    char norm[VFS_PATH_MAX];
+    if (!normalise_mount(mount_point, norm)) return VFS_ERR_INVAL;
+    struct mount_ns *ns = cur_mnt_ns();
+    struct vfs_mount *m = ns_find_exact(ns, norm);
+    if (!m) return VFS_ERR_NOMOUNT;
+
+    size_t nl = strlen(norm);
+    for (size_t i = 0; i < ns->count; i++) {
+        struct vfs_mount *t = &ns->m[i];
+        if (t != m) {
+            if (!recursive) continue;
+            /* Under norm? Same prefix rule as ns_find_parent. */
+            if (t->point_len <= nl) continue;
+            if (strncmp(t->point, norm, nl) != 0) continue;
+            if (nl > 1 && t->point[nl] != '/') continue;
+        }
+        switch (prop) {
+        case VFS_PROP_SHARED:
+            if (!t->peer_id) t->peer_id = g_peer_next++;
+            t->master_id = 0;
+            t->prop = VFS_PROP_SHARED;
+            break;
+        case VFS_PROP_SLAVE:
+            /* A shared mount becoming a slave keeps receiving from the group it
+             * used to be a peer of -- that is what "slave" means. */
+            t->master_id = t->peer_id ? t->peer_id : t->master_id;
+            t->peer_id = 0;
+            t->prop = VFS_PROP_SLAVE;
+            break;
+        case VFS_PROP_UNBINDABLE:
+            t->peer_id = 0; t->master_id = 0;
+            t->prop = VFS_PROP_UNBINDABLE;
+            break;
+        default:
+            t->peer_id = 0; t->master_id = 0;
+            t->prop = VFS_PROP_PRIVATE;
+            break;
+        }
+    }
+    kprintf("[mntns] '%s' propagation -> %u%s\n", norm, prop,
+            recursive ? " (recursive)" : "");
+    return VFS_OK;
+}
+
+/* True when `mount_point` is an existing mount whose propagation forbids
+ * bind-mounting it (MS_UNBINDABLE). */
+bool vfs_mount_is_unbindable(const char *mount_point) {
+    char norm[VFS_PATH_MAX];
+    if (!normalise_mount(mount_point, norm)) return false;
+    struct vfs_mount *m = ns_find_exact(cur_mnt_ns(), norm);
+    return m && m->prop == VFS_PROP_UNBINDABLE;
+}
+
+int vfs_mount_flags(const char *mount_point, const struct vfs_ops *ops,
+                    void *mount_data, uint32_t flags) {
     if (!ops || !mount_point) return VFS_ERR_INVAL;
     if (g_mount_count >= VFS_MAX_MOUNTS) return VFS_ERR_NOMEM;
 
@@ -57,8 +382,9 @@ int vfs_mount(const char *mount_point, const struct vfs_ops *ops, void *mount_da
      * re-mounts during testing -- not used at runtime). */
     for (size_t i = 0; i < g_mount_count; i++) {
         if (strcmp(g_mounts[i].point, norm) == 0) {
-            g_mounts[i].ops  = ops;
-            g_mounts[i].data = mount_data;
+            g_mounts[i].ops   = ops;
+            g_mounts[i].data  = mount_data;
+            g_mounts[i].flags = flags;
             return VFS_OK;
         }
     }
@@ -69,8 +395,31 @@ int vfs_mount(const char *mount_point, const struct vfs_ops *ops, void *mount_da
     m->point_len = nlen;
     m->ops       = ops;
     m->data      = mount_data;
+    m->flags     = flags;
+    /* Slice 9: a fresh mount is PRIVATE unless it inherits a peer group by
+     * propagating to the peers of the mount it sits under. Note the ordering --
+     * propagate_mount() reads the table to find the parent, so the entry above
+     * must already exist, and it must not yet claim a peer group. */
+    m->prop      = VFS_PROP_PRIVATE;
+    m->peer_id   = 0;
+    m->master_id = 0;
+    uint32_t group = propagate_mount(cur_mnt_ns(), norm, ops, mount_data, flags);
+    if (group) {
+        /* The new mount and every copy it just produced are peers. */
+        m = ns_find_exact(cur_mnt_ns(), norm);   /* re-find: table may have moved */
+        if (m) { m->prop = VFS_PROP_SHARED; m->peer_id = group; }
+    }
     return VFS_OK;
 }
+
+int vfs_mount(const char *mount_point, const struct vfs_ops *ops, void *mount_data) {
+    /* Kernel-internal mounts are trusted: flags 0. Only mount(2) (slice 5)
+     * will pass anything else, and that is exactly the untrusted path. */
+    return vfs_mount_flags(mount_point, ops, mount_data, 0);
+}
+
+/* vfs_path_mount_flags() lives just after resolve()'s definition below --
+ * it needs the resolver, which is static and defined later in this file. */
 
 bool vfs_is_mounted(void) { return g_mount_count > 0; }
 
@@ -105,12 +454,108 @@ int vfs_unmount(const char *mount_point) {
     /* Zero the trailing slot so a stale ops pointer doesn't survive. */
     memset(&g_mounts[g_mount_count], 0, sizeof(g_mounts[g_mount_count]));
 
-    if (snap.ops && snap.ops->umount) {
+    /* Slice 9: remove the peer copies in other namespaces BEFORE deciding
+     * whether the driver may be torn down -- they hold references to the same
+     * (ops,data). */
+    propagate_umount(cur_mnt_ns(), &snap);
+
+    /* Slice 9: only the LAST reference to a filesystem may call its umount
+     * hook. Propagated mounts and MS_BIND mounts share one (ops,data) across
+     * several table entries -- and bind already did before this slice, so
+     * unmounting either end tore the filesystem down under the other. */
+    if (snap.ops && snap.ops->umount &&
+        !data_still_referenced(snap.ops, snap.data)) {
         drv_rc = snap.ops->umount(snap.data);
     }
     kprintf("[vfs] unmounted '%s' (driver rc=%d, %lu mount(s) remaining)\n",
             snap.point, drv_rc, (unsigned long)g_mount_count);
     return drv_rc;
+}
+
+/* ===================================================================
+ * pivot_root(new_root, put_old) -- the item slice 5 deliberately left ENOSYS
+ *
+ * Slice 5 refused to alias this to chroot, correctly: chroot only changes name
+ * resolution and leaves the old tree reachable through any fd or any path that
+ * escapes, whereas pivot_root MOVES the root mount so the old root is genuinely
+ * gone from the namespace. Aliasing them would hand callers a false guarantee.
+ *
+ * In tobyOS's flat longest-prefix table, "moving the root" is exactly a rewrite
+ * of mount POINTS, which is why this needed the mount namespace underneath it
+ * and nothing more: the old "/" becomes `put_old`, `new_root` becomes "/", and
+ * every path then resolves through the new root's filesystem. That is a real
+ * implementation of the semantic, not a redirect.
+ *
+ * Requires a NON-INITIAL mount namespace. Linux permits it in the initial one
+ * (initramfs switch_root relies on that), but here it would rewrite the mount
+ * table of the running system with no way back, and every caller that wants it
+ * -- a container runtime -- is in its own namespace anyway.
+ * =================================================================== */
+int vfs_pivot_root(const char *new_root, const char *put_old) {
+    struct proc *p = current_proc();
+    if (!p || !p->mnt_ns) return VFS_ERR_PERM;    /* initial ns: refused */
+    if (!new_root || !put_old) return VFS_ERR_INVAL;
+
+    char nr[VFS_PATH_MAX], po[VFS_PATH_MAX];
+    if (!normalise_mount(new_root, nr)) return VFS_ERR_INVAL;
+    if (!normalise_mount(put_old, po))  return VFS_ERR_INVAL;
+    if (strcmp(nr, "/") == 0) return VFS_ERR_INVAL;  /* must not be the root */
+
+    struct mount_ns *ns = cur_mnt_ns();
+    struct vfs_mount *nrm = ns_find_exact(ns, nr);
+    if (!nrm) return VFS_ERR_NOMOUNT;             /* new_root must be a mount */
+    struct vfs_mount *root = ns_find_exact(ns, "/");
+    if (!root) return VFS_ERR_NOMOUNT;
+
+    /* put_old must lie underneath new_root, as Linux requires -- otherwise the
+     * old root would land somewhere still reachable from the new one by a
+     * shorter path, which defeats the point. */
+    size_t nrl = strlen(nr);
+    if (strncmp(po, nr, nrl) != 0 || po[nrl] != '/') return VFS_ERR_INVAL;
+
+    /* Rewrite in place. Order matters: stash the two descriptors first, because
+     * renaming shifts nothing but re-pointing both entries at once through the
+     * live table is easy to get wrong. */
+    struct vfs_mount newroot_snap = *nrm;
+    struct vfs_mount oldroot_snap = *root;
+
+    /* old "/" -> put_old, WITH THE new_root PREFIX STRIPPED.
+     *
+     * `put_old` is supplied as a path in the PRE-pivot tree (Linux requires it
+     * to be under new_root), but after the pivot new_root IS "/" -- so the old
+     * root lands at put_old minus that prefix. Storing `po` verbatim would park
+     * it at "/newroot/oldroot", a path that no longer resolves because
+     * "/newroot" is not a mount point any more: the old root would be silently
+     * unreachable, which looks exactly like a working pivot_root until someone
+     * tries to unmount the old root. */
+    { const char *rel = po + nrl;            /* nrl = strlen(new_root) */
+      size_t l = strlen(rel);
+      memcpy(root->point, rel, l + 1); root->point_len = l;
+      root->ops = oldroot_snap.ops; root->data = oldroot_snap.data;
+      root->flags = oldroot_snap.flags; }
+    /* new_root -> "/" */
+    { nrm->point[0] = '/'; nrm->point[1] = '\0'; nrm->point_len = 1;
+      nrm->ops = newroot_snap.ops; nrm->data = newroot_snap.data;
+      nrm->flags = newroot_snap.flags; }
+
+    /* Everything that lived under the old new_root prefix has to follow it up to
+     * the new root, or those mounts would dangle at paths that no longer exist. */
+    for (size_t i = 0; i < ns->count; i++) {
+        struct vfs_mount *t = &ns->m[i];
+        if (t == nrm || t == root) continue;
+        if (t->point_len <= nrl) continue;
+        if (strncmp(t->point, nr, nrl) != 0 || t->point[nrl] != '/') continue;
+        char moved[VFS_PATH_MAX];
+        size_t tl = strlen(t->point + nrl);
+        if (tl >= VFS_PATH_MAX) continue;
+        memcpy(moved, t->point + nrl, tl + 1);
+        memcpy(t->point, moved, tl + 1);
+        t->point_len = tl;
+    }
+
+    kprintf("[mntns] pivot_root: '%s' is now / (old / -> '%s') in mnt:[%lu]\n",
+            nr, po, (unsigned long)ns->inum);
+    return VFS_OK;
 }
 
 void vfs_iter_mounts(vfs_mount_walk_cb cb, void *cookie) {
@@ -172,6 +617,59 @@ static struct vfs_mount *resolve(const char *path, const char **relative) {
     if (rel[0] == 0) rel = "/";
     *relative = rel;
     return best;
+}
+
+/* Linux slice 2: the mount flags a path resolves through. Defined here rather
+ * than beside vfs_mount_flags() because it needs the static resolver above. */
+int vfs_utimes(const char *path, uint64_t mtime, uint64_t atime) {
+    if (!path) return VFS_ERR_INVAL;
+    const char *rel; struct vfs_mount *m = resolve(path, &rel);
+    if (!m) return VFS_ERR_NOMOUNT;
+    if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
+    if (!m->ops->utimes) return VFS_ERR_ROFS;   /* fs cannot store times */
+    if (!cap_check_path(current_proc(), path, CAP_FILE_WRITE, "vfs_utimes"))
+        return VFS_ERR_PERM;
+    return m->ops->utimes(m->data, rel, mtime, atime);
+}
+
+int vfs_truncate(const char *path, uint64_t length) {
+    if (!path) return VFS_ERR_INVAL;
+    const char *rel; struct vfs_mount *m = resolve(path, &rel);
+    if (!m) return VFS_ERR_NOMOUNT;
+    if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
+    if (!m->ops->truncate) return VFS_ERR_ROFS;
+    if (!cap_check_path(current_proc(), path, CAP_FILE_WRITE, "vfs_truncate"))
+        return VFS_ERR_PERM;
+    return m->ops->truncate(m->data, rel, length);
+}
+
+int vfs_file_truncate(struct vfs_file *f, uint64_t length) {
+    if (!f || !f->ops) return VFS_ERR_INVAL;
+    if (!f->ops->ftruncate) return VFS_ERR_ROFS;
+    int rc = f->ops->ftruncate(f, length);
+    if (rc == VFS_OK) f->size = (size_t)length;
+    return rc;
+}
+
+int vfs_mount_lookup(const char *mount_point,
+                     const struct vfs_ops **ops_out, void **data_out) {
+    if (!mount_point) return VFS_ERR_INVAL;
+    char norm[VFS_PATH_MAX];
+    if (!normalise_mount(mount_point, norm)) return VFS_ERR_INVAL;
+    for (size_t i = 0; i < g_mount_count; i++) {
+        if (strcmp(g_mounts[i].point, norm) == 0) {
+            if (ops_out)  *ops_out  = g_mounts[i].ops;
+            if (data_out) *data_out = g_mounts[i].data;
+            return VFS_OK;
+        }
+    }
+    return VFS_ERR_NOMOUNT;
+}
+
+uint32_t vfs_path_mount_flags(const char *path) {
+    const char *rel;
+    struct vfs_mount *m = resolve(path, &rel);
+    return m ? m->flags : 0;
 }
 
 /* -------- permission helpers (milestone 15) --------
@@ -246,6 +744,27 @@ int vfs_perm_check(const char *path, int want) {
 
 /* -------- read-side -------- */
 
+
+#ifdef PATHFAIL_TRACE
+/* Name the path behind an ENOENT.
+ *
+ * The syscall ring records ARGUMENTS, and a path argument is a user pointer --
+ * so a log full of `openat a1=29407312 = -2` says a file is missing without
+ * saying which. That is the exact wall Chromium's zygote hit
+ * (zygote_host_impl_linux.cc:221, "No such file or directory"), and guessing
+ * the filename from Chromium's source would be a hypothesis, not a diagnosis.
+ *
+ * Capped, because a normal boot probes for dozens of absent paths (every
+ * ld.so search directory) and an uncapped trace buries the interesting one. */
+void pathfail_trace(const char *what, const char *path, int rc) {
+    static int n;
+    if (rc != VFS_ERR_NOENT) return;
+    if (n >= 400) return;
+    n++;
+    kprintf("[enoent] %s '%s'\n", what, path ? path : "(null)");
+}
+#endif
+
 int vfs_open(const char *path, struct vfs_file *out) {
     /* Milestone 19: wrap the whole open path in a perf zone. The
      * PERM/sandbox check below short-circuits before the driver call
@@ -253,6 +772,28 @@ int vfs_open(const char *path, struct vfs_file *out) {
      * sandbox escape attempts in profiling. */
     uint64_t t_v = perf_rdtsc();
     if (!path || !out) { perf_zone_end(PERF_Z_VFS_OPEN, t_v); return VFS_ERR_INVAL; }
+
+    /* Linux slice 7: FOLLOW SYMLINKS on open.
+     *
+     * Nothing did before, because until on-disk symlinks existed the only
+     * links were procfs's synthetic ones (resolved by their own mount) and a
+     * RAM table that path resolution consulted separately. With a real rootfs
+     * this is load-bearing: Alpine's ld.so opens /lib/libz.so.1 and
+     * /lib/libc.musl-x86_64.so.1, both symlinks, so every dynamically-linked
+     * binary needing more than the loader itself fails to start without it.
+     *
+     * Deliberately NOT done in resolve_user_path(): readlink(2) and
+     * symlink(2) must act on the LINK, not its target, and they share that
+     * resolver. Following belongs to the operations that mean "the thing the
+     * name refers to" -- open being the main one. */
+    char followed[VFS_PATH_MAX];
+    {
+        struct vfs_stat lst;
+        if (vfs_stat(path, &lst) == VFS_OK && lst.type == VFS_TYPE_SYMLINK) {
+            if (vfs_follow_link(path, followed, sizeof followed) == VFS_OK)
+                path = followed;
+        }
+    }
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) { perf_zone_end(PERF_Z_VFS_OPEN, t_v); return VFS_ERR_NOMOUNT; }
     /* Milestone 18: capability + path-sandbox gate FIRST. Must come
@@ -291,6 +832,9 @@ int vfs_open(const char *path, struct vfs_file *out) {
     if (!m->ops->open) { perf_zone_end(PERF_Z_VFS_OPEN, t_v); return VFS_ERR_INVAL; }
     int rc = m->ops->open(m->data, rel, out);
     perf_zone_end(PERF_Z_VFS_OPEN, t_v);
+#ifdef PATHFAIL_TRACE
+    pathfail_trace("open", path, rc);
+#endif
     return rc;
 }
 
@@ -399,6 +943,9 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
     if (!m->ops->stat) { perf_zone_end(PERF_Z_VFS_STAT, t_v); return VFS_ERR_INVAL; }
     int rc = m->ops->stat(m->data, rel, out);
     perf_zone_end(PERF_Z_VFS_STAT, t_v);
+#ifdef PATHFAIL_TRACE
+    pathfail_trace("stat", path, rc);
+#endif
     return rc;
 }
 
@@ -408,6 +955,11 @@ int vfs_create(const char *path) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
+    /* Linux slice 5: a read-only mount refuses mutation. VFS_MNT_RDONLY was
+     * defined in slice 2 and passed through by mount(2), but nothing enforced
+     * it -- a flag that is accepted and ignored is the same class of lie as a
+     * no-op syscall that reports success. */
+    if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
     if (!m->ops->create) return VFS_ERR_ROFS;
     if (!cap_check_path(current_proc(), path, CAP_FILE_WRITE, "vfs_create")) {
         return VFS_ERR_PERM;
@@ -437,6 +989,11 @@ int vfs_unlink(const char *path) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
+    /* Linux slice 5: a read-only mount refuses mutation. VFS_MNT_RDONLY was
+     * defined in slice 2 and passed through by mount(2), but nothing enforced
+     * it -- a flag that is accepted and ignored is the same class of lie as a
+     * no-op syscall that reports success. */
+    if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
     if (!m->ops->unlink) return VFS_ERR_ROFS;
     if (!cap_check_path(current_proc(), path, CAP_FILE_WRITE, "vfs_unlink")) {
         return VFS_ERR_PERM;
@@ -461,6 +1018,11 @@ int vfs_rename(const char *oldpath, const char *newpath) {
     const char *orel; struct vfs_mount *om = resolve(oldpath, &orel);
     const char *nrel; struct vfs_mount *nm = resolve(newpath, &nrel);
     if (!om || !nm) return VFS_ERR_NOMOUNT;
+    /* Linux slice 5: a read-only mount refuses mutation. VFS_MNT_RDONLY was
+     * defined in slice 2 and passed through by mount(2), but nothing enforced
+     * it -- a flag that is accepted and ignored is the same class of lie as a
+     * no-op syscall that reports success. */
+    if ((om->flags | nm->flags) & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
     if (om != nm)   return VFS_ERR_INVAL;    /* cross-mount rename (EXDEV) -- n/s */
     if (!om->ops->rename) return VFS_ERR_ROFS;
     /* Need write on both old and new (source is unlinked, dest is created). */
@@ -488,6 +1050,11 @@ int vfs_mkdir_mode(const char *path, uint32_t mode) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
+    /* Linux slice 5: a read-only mount refuses mutation. VFS_MNT_RDONLY was
+     * defined in slice 2 and passed through by mount(2), but nothing enforced
+     * it -- a flag that is accepted and ignored is the same class of lie as a
+     * no-op syscall that reports success. */
+    if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
     if (!m->ops->mkdir) return VFS_ERR_ROFS;
     if (!cap_check_path(current_proc(), path, CAP_FILE_WRITE, "vfs_mkdir")) {
         return VFS_ERR_PERM;
@@ -515,6 +1082,11 @@ int vfs_chmod(const char *path, uint32_t mode) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
+    /* Linux slice 5: a read-only mount refuses mutation. VFS_MNT_RDONLY was
+     * defined in slice 2 and passed through by mount(2), but nothing enforced
+     * it -- a flag that is accepted and ignored is the same class of lie as a
+     * no-op syscall that reports success. */
+    if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
     if (!m->ops->chmod) return VFS_ERR_ROFS;
     if (!cap_check_path(current_proc(), path, CAP_FILE_WRITE, "vfs_chmod")) {
         return VFS_ERR_PERM;
@@ -542,6 +1114,11 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
+    /* Linux slice 5: a read-only mount refuses mutation. VFS_MNT_RDONLY was
+     * defined in slice 2 and passed through by mount(2), but nothing enforced
+     * it -- a flag that is accepted and ignored is the same class of lie as a
+     * no-op syscall that reports success. */
+    if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
     if (!m->ops->chown) return VFS_ERR_ROFS;
     if (!cap_check_path(current_proc(), path, CAP_FILE_WRITE, "vfs_chown")) {
         return VFS_ERR_PERM;
@@ -572,6 +1149,49 @@ int vfs_follow_link(const char *path, char *out, size_t outsz) {
         char *next = scratch[depth & 1];            /* never readlink into `cur` */
         rc = vfs_readlink(cur, next, VFS_PATH_MAX);
         if (rc != VFS_OK) return rc;
+
+        /* A RELATIVE target resolves against the LINK'S OWN DIRECTORY, not
+         * against the root. This was missing, so `lib/libc.musl-x86_64.so.1
+         * -> ld-musl-x86_64.so.1` resolved to "/ld-musl-x86_64.so.1" and
+         * landed on whatever (if anything) sat there -- during the Alpine
+         * extraction it hit a directory and tar reported "write: Is a
+         * directory".
+         *
+         * It went unnoticed until now because the only previous symlinks were
+         * procfs's synthetic ones and a RAM table, both of which store
+         * ABSOLUTE targets. Real distributions use relative targets heavily
+         * (Alpine's rootfs is full of them), so this is the first workload
+         * that could expose it. */
+        /* An ABSOLUTE target is absolute in the CALLER'S root, not the
+         * kernel's. Inside a chroot, Alpine's `/bin/sh -> /bin/busybox`
+         * otherwise resolves to the HOST's /bin/busybox -- so `su -s /bin/sh`
+         * reported "can't execute '/bin/sh': No such file or directory" while
+         * the link and its target both plainly existed inside the jail.
+         * Re-apply the process root that resolve_user_path() already applied
+         * to the link's own path. */
+        if (next[0] == '/') {
+            struct proc *cp = current_proc();
+            if (cp && cp->fs_root[0]) {
+                char joined[VFS_PATH_MAX];
+                size_t rl = strlen(cp->fs_root), tl = strlen(next);
+                if (rl + tl + 1 <= sizeof(joined)) {
+                    memcpy(joined, cp->fs_root, rl);
+                    memcpy(joined + rl, next, tl + 1);
+                    memcpy(next, joined, strlen(joined) + 1);
+                }
+            }
+        }
+        if (next[0] != '/') {
+            char joined[VFS_PATH_MAX];
+            size_t cl = strlen(cur);
+            while (cl > 0 && cur[cl - 1] != '/') cl--;   /* keep trailing '/' */
+            size_t tl = strlen(next);
+            if (cl + tl + 1 > sizeof(joined)) return VFS_ERR_NAMETOOLONG;
+            memcpy(joined, cur, cl);
+            memcpy(joined + cl, next, tl + 1);
+            /* Copy back into the scratch slot so `cur` stays valid next loop. */
+            memcpy(next, joined, strlen(joined) + 1);
+        }
         cur = next;
     }
 
@@ -731,6 +1351,23 @@ int vfs_symlink(const char *path, const char *target) {
     if (strlen(path) >= VFS_PATH_MAX || strlen(target) >= VFS_PATH_MAX)
         return VFS_ERR_NAMETOOLONG;
     if (symlink_find(path)) return VFS_ERR_EXIST;
+
+    /* Linux slice 7: prefer a PERSISTENT, per-filesystem symlink.
+     *
+     * The table below is global to the machine, capped at VFS_MAX_SYMLINKS,
+     * and lives only in RAM. Extracting Alpine's minirootfs (335 symlinks,
+     * nearly all busybox applet links) both overflowed it -- `tar: can't
+     * create symlink` partway through -- and would have left every link
+     * dangling after a reboot. Filesystems that can store a link do; the
+     * table remains for those that cannot (the read-only initrd ramfs). */
+    {
+        const char *rel = 0;
+        struct vfs_mount *m = resolve(path, &rel);
+        if (m && m->ops && m->ops->symlink) {
+            if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
+            return m->ops->symlink(m->data, rel, target);
+        }
+    }
 
     for (size_t i = 0; i < VFS_MAX_SYMLINKS; i++) {
         if (!g_symlinks[i].used) {

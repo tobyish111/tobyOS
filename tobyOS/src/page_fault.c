@@ -19,7 +19,10 @@
 #include <tobyos/panic.h>
 #include <tobyos/klibc.h>
 #include <tobyos/swap.h>
+#include <tobyos/cgroup.h>   /* swap-in must re-charge residency */
+#include <tobyos/mmap.h>     /* reclaim_stat_* live alongside mem_reclaim_pages */
 #include <tobyos/apic.h>     /* tlb_shootdown_remote */
+#include <tobyos/cgroup.h>   /* slice 16: the user-page charge funnel */
 
 /* One refcount slot per MANAGED physical frame, sized from the PMM at
  * init. This used to be a fixed 256K-slot static array (1 GiB of
@@ -35,6 +38,12 @@
  * multi-GiB fork-churn footprint ever triggered (slice 38: ICU locale
  * strings appearing inside the browser's vulkan-loader heap). */
 static uint16_t *g_page_refcounts;
+
+/* Pages brought back from swap. Paired with reclaim_stat_evicted(): the
+ * reclaim harness requires BOTH to be non-zero, so a run that evicted nothing
+ * (or evicted but never faulted anything back) cannot report a pass. */
+static uint64_t g_swapin_count;
+uint64_t reclaim_stat_faulted_back(void) { return g_swapin_count; }
 static size_t    g_page_ref_slots;
 
 /* Per-process vm_space table, indexed by pid */
@@ -104,6 +113,17 @@ uint64_t *get_pte(uint64_t cr3, uint64_t virt_addr) {
 /* ---- COW page copy ---- */
 
 bool cow_copy_page(uint64_t old_phys, uint64_t *pte) {
+    /* Slice 16: NOT charged, and that is the correct answer, not an omission.
+     *
+     * Breaking CoW is charge-NEUTRAL for this process: it already paid for this
+     * page (the fork paths bulk-charge the child for every inherited page), and
+     * here it exchanges its share of `old_phys` for a private `new_phys`. Charging
+     * again counts the same page twice.
+     *
+     * Charging it here was tried, and bit7 of linux-cgroup2 caught it as a steady
+     * 2-pages-per-fork-cycle drift in memory.current -- because the old page is
+     * released below via page_ref_dec/pmm_free_page, a path with no uncharge. The
+     * leak was invisible in every other bit. */
     uint64_t new_phys = pmm_alloc_page();
     if (!new_phys) return false;
 
@@ -211,7 +231,9 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
 
     /* Case 2: Demand-zero fault -- PTE marked DEMAND but not present */
     if (pte && !(*pte & PTE_PRESENT) && (*pte & PTE_DEMAND)) {
-        uint64_t new_phys = pmm_alloc_page();
+        /* Slice 16: charged -- this is THE demand-fault path for a PTE_DEMAND
+         * mapping, and it is where a growing process actually gets its memory. */
+        uint64_t new_phys = mm_user_page_alloc(p);
         if (!new_phys) return false;
 
         uint64_t hhdm = vmm_hhdm_offset();
@@ -231,13 +253,24 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
     if (pte && !(*pte & PTE_PRESENT) && (*pte & PTE_SWAPPED)) {
         int slot = swap_decode_pte(*pte);
         if (slot >= 0) {
+            /* Charge BEFORE bringing the page back. Reclaim uncharged this
+             * page when it evicted it (mmap.c's free batch), so residency has
+             * to be paid for again here -- otherwise every evict/fault-back
+             * cycle ratchets the process's counter down and memory.max stops
+             * meaning anything. Refusal is a fault failure, which is the same
+             * way memory.max is enforced on every other allocating fault. */
+            if (!mm_user_page_charge_existing(p))
+                return false;
             uint64_t new_phys;
             if (swap_in(slot, &new_phys) == 0) {
                 *pte = new_phys | PTE_PRESENT | PTE_USER | PTE_WRITABLE;
                 page_ref_inc(new_phys);
                 invlpg(page_va);
+                g_swapin_count++;
                 return true;
             }
+            /* Page did not come back -- do not keep the charge. */
+            mm_user_page_uncharge_existing(p);
         }
         return false;
     }
@@ -274,7 +307,7 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
 
         /* File-backed mmap: read page from disk */
         if (v->flags & VMA_FILE) {
-            uint64_t new_phys = pmm_alloc_page();
+            uint64_t new_phys = mm_user_page_alloc(p);   /* slice 16: charged */
             if (!new_phys) return false;
 
             uint64_t hhdm = vmm_hhdm_offset();
@@ -296,7 +329,7 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
         }
 
         /* Anonymous mapping: allocate zero page */
-        uint64_t new_phys = pmm_alloc_page();
+        uint64_t new_phys = mm_user_page_alloc(p);       /* slice 16: charged */
         if (!new_phys) return false;
 
         uint64_t hhdm = vmm_hhdm_offset();
@@ -350,12 +383,12 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
             uint64_t *epte = get_pte(p->cr3, va);
             if (epte && (*epte & PTE_PRESENT)) continue;
 
-            uint64_t new_phys = pmm_alloc_page();
+            uint64_t new_phys = mm_user_page_alloc(p);   /* slice 16: charged */
             if (!new_phys) { ok = false; break; }
             memset((void *)(new_phys + vmm_hhdm_offset()), 0, PAGE_SIZE);
             if (!vmm_map(va, new_phys, PAGE_SIZE,
                          VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
-                pmm_free_page(new_phys);
+                mm_user_page_free(p, new_phys);          /* slice 16 */
                 ok = false;
                 break;
             }
@@ -479,10 +512,23 @@ int uaccess_prepare_write(uint64_t addr, uint64_t len) {
                         (praw & PTE_PRESENT)  ? "P" : "-",
                         (praw & PTE_WRITABLE) ? "W" : "r",
                         (praw & PTE_USER)     ? "U" : "k");
+                /* The 384-entry ring dump is OPT-IN, and the reason is the
+                 * note above: this hit is EXPECTED on every chrome run. On a
+                 * 38400-baud serial console 384 lines is ~15 s of output and
+                 * roughly 30 KB -- on a real-hardware capture it pushed the
+                 * [chromewin] frame counters past the end of the log, so the
+                 * one question the run existed to answer became unanswerable.
+                 * A diagnostic that fires on a benign condition and buries the
+                 * evidence is worse than no diagnostic. Build with
+                 * -DUACCESS_EFAULT_TRACE when the EFAULT is the thing under
+                 * investigation; the one-line PTE above (which distinguishes
+                 * present-read-only from unmapped) is kept unconditionally. */
+#ifdef UACCESS_EFAULT_TRACE
                 if (logged == 1) {
                     extern void lx_dump_recent_syscalls(void);
                     lx_dump_recent_syscalls();
                 }
+#endif
             }
         }
         return -1;                                      /* read-only / unmapped */

@@ -272,6 +272,17 @@ static const struct launcher_item g_launcher_sys[LAUNCHER_SYS_MAX] = {
     { "Clock",         "/bin/gui_clock"    },
     { "Calculator",    "/bin/gui_calc"     },
     { "Task Manager",  "/bin/gui_taskmgr"  },
+    /* Disk Manager was BUILT, STAGED to /bin/diskmgr, and listed in the
+     * initrd tar -- and had no launcher entry, so nothing in the GUI could
+     * start it. The taskbar search does not help either: it matches these
+     * LABELS, not /bin, so an app absent from this table is unreachable by
+     * every surface the desktop offers.
+     *
+     * It is the only way to create a persistent /data volume, which makes it
+     * the one app whose absence strands a whole feature. Shipping a program
+     * with no way to run it is the same class of miss as the browser that
+     * shipped exiting 127: built, staged, and unreachable. */
+    { "Disk Manager",  "/bin/diskmgr"      },
     { "About TobyOS",  "/bin/gui_about"    },
     { 0, 0 },
 };

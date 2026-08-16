@@ -119,6 +119,50 @@ proc_enter_user_asm:
     mov es, ax
     mov fs, ax
 
+    /* Zero EVERY general-purpose register before the descent to CPL3.
+     * RSP is excluded -- it comes from the IRETQ frame pushed above.
+     *
+     * This is required by the x86-64 SysV program-entry contract, not just
+     * hygiene. The ABI specifies that at process entry %rdx holds "a function
+     * pointer that the application should register with atexit", and Linux
+     * zeroes all GP registers so that pointer reads as NULL. glibc's _start
+     * takes %rdx as `rtld_fini` and __libc_start_main does:
+     *
+     *     if (rtld_fini != NULL) __cxa_atexit (rtld_fini, NULL, NULL);
+     *
+     * We were leaving whatever the kernel last had in %rdx, so every STATIC
+     * glibc binary registered a garbage kernel value as an atexit handler and
+     * jumped to it from __run_exit_handlers -- doing all of its real work
+     * correctly and then dying on the way out. That is the LXGLIBC gate's
+     * "exit=-1": the observed value was 0x...61000, this process's PML4
+     * physical address, deterministic per boot, which is also why the crash
+     * looked like a mysterious constant rather than random garbage.
+     *
+     * Dynamically-linked binaries were immune, which is exactly why this hid
+     * for so long: ld.so sets %rdx to a real _dl_fini before jumping to the
+     * program entry, overwriting the leak. Only the static path was exposed.
+     *
+     * It is also a kernel->user INFORMATION LEAK in its own right: ring 3 saw
+     * raw kernel register contents (here, a physical page-table address).
+     *
+     * proc_enter_user_thread_asm already did this; the clearing was simply
+     * never applied to the process-entry path. Both are now consistent. */
+    xor eax, eax                /* 32-bit xor zero-extends: clears all 64 */
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx                /* <-- the ABI-mandated one (rtld_fini) */
+    xor esi, esi
+    xor edi, edi
+    xor ebp, ebp
+    xor r8d,  r8d
+    xor r9d,  r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
+
     /* SWAPGS: first descent to CPL3. do_switch put this proc's user GS base
      * (TEB for a Win32 PE, else &percpu) in the IA32_KERNEL_GS_BASE shadow;
      * swap it into the active GS base for ring 3. Mirror swaps live in the
@@ -157,15 +201,26 @@ proc_enter_user_thread_asm:
     mov es, ax
     mov fs, ax
 
-    /* Set RDI = arg for the thread function */
+    /* Set RDI = arg for the thread function, and zero everything else.
+     * rbx/rbp/r12-r15 were previously left un-cleared here -- the same
+     * kernel->user register leak fixed in proc_enter_user_asm above, just
+     * narrower (a thread entry has no rtld_fini contract, so it did not
+     * crash anything; it was still a leak). */
     mov rdi, rcx
-    xor rsi, rsi
-    xor rdx, rdx
-    xor rcx, rcx
-    xor r8, r8
-    xor r9, r9
-    xor r10, r10
-    xor r11, r11
+    xor esi, esi
+    xor edx, edx
+    xor ecx, ecx
+    xor eax, eax
+    xor ebx, ebx
+    xor ebp, ebp
+    xor r8d,  r8d
+    xor r9d,  r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
 
     /* SWAPGS: first descent to CPL3 (see proc_enter_user_asm). */
     swapgs

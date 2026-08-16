@@ -32,5 +32,11 @@ bool eth_send(const uint8_t dst_mac[ETH_ADDR_LEN],
  * VLAN tags when present, then inspects the final EtherType and dispatches
  * to the matching protocol handler. */
 void eth_recv(const void *frame, size_t len);
+/* Same demux, but stating which namespace and interface the frame arrived on.
+ * eth_recv() is this with "the initial namespace, interface unknown" -- see the
+ * comment above its definition for why saying so explicitly is a bug fix. */
+struct net_dev;
+void eth_recv_dev(const void *frame, size_t len, void *ns,
+                  struct net_dev *dev);
 
 #endif /* TOBYOS_ETH_H */

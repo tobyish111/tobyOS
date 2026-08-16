@@ -12,6 +12,8 @@
 #include <tobyos/tcp.h>
 #include <tobyos/net.h>
 #include <tobyos/proc.h>
+#include <tobyos/nsproxy.h>   /* net_ns_has_network (slice 12) */
+#include <tobyos/rtnetlink.h> /* rtnl_process (slice 12 cut 4) */
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/heap.h>
@@ -120,11 +122,15 @@ struct sock *sock_alloc(int kind) {
              * mistakable for the socket that previously lived here. Starts
              * at 1 -- gen 0 means "never linked" in peer_gen. */
             g_socks[i].gen    = ++g_sock_gen;
-            {   /* slice 81: latch creator creds for SO_PEERCRED */
+            {   /* slice 81: latch creator creds for SO_PEERCRED
+                 * slice 12: and the creator's NETWORK namespace, which is what
+                 * every network operation on this socket is then checked
+                 * against (see net_ns_has_network). */
                 struct proc *cp = current_proc();
                 g_socks[i].cr_pid = cp ? cp->pid : 0;
                 g_socks[i].cr_uid = cp ? (uint32_t)cp->uid : 0;
-                g_socks[i].cr_gid = cp ? (uint32_t)cp->gid : 0; }
+                g_socks[i].cr_gid = cp ? (uint32_t)cp->gid : 0;
+                g_socks[i].net_ns = cp ? cp->net_ns : 0; }
             g_socks[i].recv_timeout_ms = 30000;
             g_socks[i].send_timeout_ms = 30000;
             return &g_socks[i];
@@ -214,13 +220,32 @@ void sock_close(struct sock *s) {
     memset(s, 0, sizeof(*s));
 }
 
-struct sock *sock_lookup_by_port(uint16_t dst_port_be) {
+/* CUT 6: THE PORT SPACE IS PER-NAMESPACE.
+ *
+ * This scanned every socket in the pool by port alone, which had two
+ * consequences and both are the kind of thing a container hits on day one:
+ *   - two namespaces could not both bind the same port, so a container running
+ *     anything on :80 collided with the host;
+ *   - a datagram arriving in ONE namespace was delivered to a socket bound in
+ *     ANOTHER, because the first port match won. That is a cross-namespace
+ *     data leak, not merely an inconvenience.
+ *
+ * The namespace comes from net_current_ns(): the receive context when a frame
+ * is being delivered (so the answer is the namespace the frame arrived in), and
+ * the caller's namespace when a bind is being checked. */
+static struct sock *sock_lookup_port_in_ns(uint16_t dst_port_be, void *ns) {
     if (dst_port_be == 0) return 0;
     for (int i = 0; i < SOCK_MAX; i++) {
-        if (g_socks[i].in_use && g_socks[i].local_port == dst_port_be)
+        if (g_socks[i].in_use && g_socks[i].local_port == dst_port_be &&
+            g_socks[i].net_ns == ns)
             return &g_socks[i];
     }
     return 0;
+}
+
+/* DELIVERY asks about the namespace the frame arrived in. */
+struct sock *sock_lookup_by_port(uint16_t dst_port_be) {
+    return sock_lookup_port_in_ns(dst_port_be, net_current_ns());
 }
 
 int sock_bind(struct sock *s, uint16_t port_be) {
@@ -229,7 +254,13 @@ int sock_bind(struct sock *s, uint16_t port_be) {
      * what musl/busybox resolvers do (bind a UDP socket to 0 before sending a
      * DNS query). Treating it as an error broke `nslookup` (bind EADDRINUSE). */
     if (port_be == 0) return sock_bind_ephemeral(s);
-    if (sock_lookup_by_port(port_be)) return -1;
+    /* A BIND asks about the SOCKET's namespace, not the ambient one. In normal
+     * use they are the same process and therefore the same namespace, but
+     * saying which one is meant is what lets two namespaces hold the same port
+     * -- and it is the socket's namespace that the later delivery will match
+     * against, so checking anything else could admit a bind that then never
+     * receives. */
+    if (sock_lookup_port_in_ns(port_be, s->net_ns)) return -1;
     s->local_port = port_be;
     return 0;
 }
@@ -239,7 +270,7 @@ static int sock_bind_ephemeral(struct sock *s) {
         uint16_t p = g_next_ephemeral++;
         if (g_next_ephemeral >= 34000) g_next_ephemeral = 33000;
         uint16_t pbe = htons(p);
-        if (!sock_lookup_by_port(pbe)) {
+        if (!sock_lookup_port_in_ns(pbe, s->net_ns)) {
             s->local_port = pbe;
             return 0;
         }
@@ -253,6 +284,28 @@ void sock_deliver(struct sock *s,
                   uint32_t src_ip_be, uint16_t src_port_be,
                   const void *payload, size_t len) {
     if (!s || !s->in_use) return;
+    /* Slice 12: packets arriving from a real NIC belong to the INITIAL network
+     * namespace. Delivering them to a socket created in an empty namespace would
+     * make the isolation one-directional -- the sandbox could not send, but could
+     * still receive, which is the half that leaks data IN. Sockets in a
+     * non-initial namespace are therefore never a delivery target.
+     *
+     * Note this is the inbound mirror of the connect/sendto gates, and it has to
+     * be here rather than at the port-matching scan: sock_deliver is the single
+     * funnel every inbound datagram passes through (udp_recv calls it), so one
+     * check covers every source.
+     *
+     * CUT 4 EXEMPTS NETLINK, and it is not a loosening of the sandbox. This
+     * guard exists to stop a frame that arrived on the HOST's NIC from reaching
+     * a socket in an empty namespace. A netlink reply is not an arriving frame:
+     * it is the kernel's synchronous answer to a request this very socket just
+     * made, built by rtnl_process strictly from s->net_ns, so it can never
+     * carry anything from another namespace. Dropping it made an empty
+     * namespace unable to observe that it is empty -- `ip link show` inside a
+     * fresh `unshare -n` got no reply at all, which is how the emptiness is
+     * SUPPOSED to be seen. The cut-1 acceptance test (linux-netns) still
+     * asserts every real-traffic path is refused. */
+    if (s->kind != SOCK_KIND_NETLINK && !net_ns_has_network(s->net_ns)) return;
     if (len > ETH_MTU) len = ETH_MTU;
 
     if (s->count == SOCK_RX_DGRAMS) {
@@ -829,9 +882,20 @@ long sock_sendto(struct sock *s, const void *buf, size_t len,
 
     if (!net_is_up()) return -4;
 
-    if (!udp_send(s->local_port, dst_ip_be, dst_port_be, buf, len)) {
-        return -3;
-    }
+    /* CUT 5: send in the SOCKET's namespace, not the caller's.
+     *
+     * Same rule cut 1 chose for the ENETUNREACH gate and for the same reason: a
+     * socket created before an unshare(CLONE_NEWNET) keeps the network it was
+     * made in, which is what lets a sandboxed child keep an inherited one. The
+     * bracket covers the source address, the pseudo-header checksum and the
+     * route decision together, because all three read net_my_ip(). UDP has no
+     * connection object to latch this on, so the socket layer is the only place
+     * that knows -- udp.c's other callers (DHCP, DNS, mDNS, NTP, QUIC) are host
+     * services and correctly get the initial namespace by default. */
+    struct net_ctx nprev = net_ctx_enter(s->net_ns, 0);
+    bool sent = udp_send(s->local_port, dst_ip_be, dst_port_be, buf, len);
+    net_ctx_leave(nprev);
+    if (!sent) return -3;
     return (long)len;
 }
 
@@ -944,119 +1008,20 @@ bool sock_recv_ready(struct sock *s) {
  *
  * We never send unsolicited notifications: tobyOS's link comes up before chrome
  * starts and never changes, which is exactly the steady state the tracker
- * expects after its initial dump. */
+ * expects after its initial dump.
+ *
+ * CUT 4 MOVED THE MESSAGE WORK OUT to src/rtnetlink.c, which now also PARSES
+ * requests (RTM_NEWLINK/NEWADDR/SETLINK/DELLINK) rather than only answering two
+ * dumps with a hardcoded lo + eth0. What stays here is the socket: its rx ring,
+ * its nl_pid, and the namespace it was created in. The initial namespace's
+ * reply is unchanged, deliberately and byte for byte. */
 
-#define NL_NLMSG_DONE      3
-#define NL_RTM_NEWLINK    16
-#define NL_RTM_GETLINK    18
-#define NL_RTM_NEWADDR    20
-#define NL_RTM_GETADDR    22
-#define NL_NLM_F_MULTI  0x002
-
-#define NL_IFA_ADDRESS     1
-#define NL_IFA_LOCAL       2
-#define NL_IFA_LABEL       3
-#define NL_IFLA_ADDRESS    1
-#define NL_IFLA_IFNAME     3
-
-#define NL_IFF_UP        0x0001
-#define NL_IFF_BROADCAST 0x0002
-#define NL_IFF_LOOPBACK  0x0008
-#define NL_IFF_RUNNING   0x0040
-#define NL_IFF_MULTICAST 0x1000
-#define NL_IFF_LOWER_UP  0x10000
-
-#define NL_ARPHRD_ETHER      1
-#define NL_ARPHRD_LOOPBACK 772
-
-#define NL_ALIGN(n)  (((n) + 3u) & ~3u)
-
-struct nl_msghdr {                 /* struct nlmsghdr */
-    uint32_t len;
-    uint16_t type;
-    uint16_t flags;
-    uint32_t seq;
-    uint32_t pid;
-};
-
-/* Append one netlink message header + payload + attributes into buf. */
-struct nl_build {
-    uint8_t *buf;
-    size_t   cap;
-    size_t   off;
-    /* Offset of the message header currently being built, so its length can be
-     * patched once every attribute has been appended. */
-    size_t   msg_start;
-    /* Set once anything did not fit. Every later append is then a no-op --
-     * without this a truncated begin() would leave msg_start pointing at the
-     * PREVIOUS message and end() would overwrite its length, corrupting a
-     * message that was already complete. Netlink has no partial messages. */
-    bool     full;
-};
-
-static void nlb_msg_begin(struct nl_build *b, uint16_t type, uint16_t flags,
-                          uint32_t seq, uint32_t pid,
-                          const void *body, size_t body_len) {
-    if (b->full) return;
-    if (b->off + sizeof(struct nl_msghdr) + NL_ALIGN(body_len) > b->cap) {
-        b->full = true;
-        return;
-    }
-    b->msg_start = b->off;
-    struct nl_msghdr h = { 0 };
-    h.type = type; h.flags = flags; h.seq = seq; h.pid = pid;
-    memcpy(b->buf + b->off, &h, sizeof h);
-    b->off += sizeof h;
-    if (body_len) memcpy(b->buf + b->off, body, body_len);
-    /* Pad the fixed body out to a 4-byte boundary; attributes start aligned. */
-    memset(b->buf + b->off + body_len, 0, NL_ALIGN(body_len) - body_len);
-    b->off += NL_ALIGN(body_len);
-}
-
-static void nlb_attr(struct nl_build *b, uint16_t type,
-                     const void *val, size_t len) {
-    if (b->full) return;
-    size_t need = 4u + NL_ALIGN(len);
-    if (b->off + need > b->cap) { b->full = true; return; }
-    uint16_t rta_len = (uint16_t)(4u + len);          /* excludes the padding */
-    memcpy(b->buf + b->off,     &rta_len, 2);
-    memcpy(b->buf + b->off + 2, &type,    2);
-    if (len) memcpy(b->buf + b->off + 4, val, len);
-    memset(b->buf + b->off + 4 + len, 0, NL_ALIGN(len) - len);
-    b->off += need;
-}
-
-static void nlb_msg_end(struct nl_build *b) {
-    if (b->full) return;
-    if (b->msg_start + sizeof(struct nl_msghdr) > b->cap) return;
-    uint32_t total = (uint32_t)(b->off - b->msg_start);
-    memcpy(b->buf + b->msg_start, &total, 4);         /* patch nlmsg_len */
-}
-
-/* struct ifaddrmsg (8 bytes) */
-struct nl_ifaddrmsg {
-    uint8_t  family, prefixlen, flags, scope;
-    uint32_t index;
-};
-/* struct ifinfomsg (16 bytes) */
-struct nl_ifinfomsg {
-    uint8_t  family, pad;
-    uint16_t type;
-    int32_t  index;
-    uint32_t flags, change;
-};
-
-/* Number of leading 1-bits in a network-order netmask (e.g. 255.255.255.0 -> 24). */
-static uint8_t nl_prefix_len(uint32_t mask_be) {
-    uint32_t m = ntohl(mask_be);
-    uint8_t n = 0;
-    while (m & 0x80000000u) { n++; m <<= 1; }
-    return n;
-}
+/* 16 bytes: struct nlmsghdr, the minimum a request can be. */
+#define NL_MSGHDR_LEN 16
 
 long sock_netlink_send(struct sock *s, const void *kbuf, size_t n) {
     if (!s || !s->in_use) return -1;
-    if (n < sizeof(struct nl_msghdr)) return -1;
+    if (n < NL_MSGHDR_LEN) return -1;
 
     /* Auto-bind an unbound socket to the caller's pid, exactly as Linux does on
      * the first send. This is NOT cosmetic: glibc's check_pf (which getaddrinfo
@@ -1074,72 +1039,24 @@ long sock_netlink_send(struct sock *s, const void *kbuf, size_t n) {
         if (cp) s->nl_pid = (uint32_t)cp->pid;
     }
 
-    /* One 1 KiB reply datagram is ample: two links + one address with their
-     * attributes come to a few hundred bytes, and chrome reads into 4 KiB. */
-    uint8_t *out = (uint8_t *)kmalloc(1024);
+    /* 3 KiB. Two links + one address with their attributes come to a few
+     * hundred bytes (the initial namespace's whole reply), and a namespace at
+     * the NET_NS_MAX_DEVS ceiling of 8 interfaces comes to under 1 KiB. The
+     * headroom is deliberate: rtnl_process refuses to emit a message that does
+     * not fit, so an undersized buffer would silently shorten a dump. */
+    enum { NL_REPLY_CAP = 3072 };
+    uint8_t *out = (uint8_t *)kmalloc(NL_REPLY_CAP);
     if (!out) return -1;
-    struct nl_build b = { out, 1024, 0, 0, false };
 
-    /* Walk every request in the caller's buffer (chrome sends one at a time). */
-    size_t off = 0;
-    while (off + sizeof(struct nl_msghdr) <= n) {
-        struct nl_msghdr rq;
-        memcpy(&rq, (const uint8_t *)kbuf + off, sizeof rq);
-        if (rq.len < sizeof(struct nl_msghdr) || off + rq.len > n) break;
+    /* The SOCKET's namespace, not the caller's -- s->net_ns is latched in
+     * sock_alloc, so a socket that predates an unshare(CLONE_NEWNET) keeps
+     * answering for the namespace it was created in. Same rule as every other
+     * network operation here (net_ns_has_network). */
+    size_t used = rtnl_process(s->net_ns, s->nl_pid,
+                               userns_capable(LCAP_NET_ADMIN),
+                               kbuf, n, out, NL_REPLY_CAP);
 
-        if (rq.type == NL_RTM_GETADDR) {
-            /* One IPv4 address on eth0 (index 2). Loopback is deliberately
-             * omitted: the tracker discards loopback/unspecified addresses. */
-            if (g_my_ip) {
-                struct nl_ifaddrmsg ia = { 0 };
-                ia.family    = 2;                     /* AF_INET */
-                ia.prefixlen = nl_prefix_len(g_my_netmask);
-                ia.scope     = 0;                     /* RT_SCOPE_UNIVERSE */
-                ia.index     = 2;
-                nlb_msg_begin(&b, NL_RTM_NEWADDR, NL_NLM_F_MULTI,
-                              rq.seq, s->nl_pid, &ia, sizeof ia);
-                nlb_attr(&b, NL_IFA_ADDRESS, &g_my_ip, 4);
-                nlb_attr(&b, NL_IFA_LOCAL,   &g_my_ip, 4);
-                nlb_attr(&b, NL_IFA_LABEL,   "eth0", 5);
-                nlb_msg_end(&b);
-            }
-        } else if (rq.type == NL_RTM_GETLINK) {
-            struct nl_ifinfomsg lo = { 0 };
-            lo.type  = NL_ARPHRD_LOOPBACK;
-            lo.index = 1;
-            lo.flags = NL_IFF_UP | NL_IFF_LOOPBACK | NL_IFF_RUNNING |
-                       NL_IFF_LOWER_UP;
-            nlb_msg_begin(&b, NL_RTM_NEWLINK, NL_NLM_F_MULTI,
-                          rq.seq, s->nl_pid, &lo, sizeof lo);
-            nlb_attr(&b, NL_IFLA_IFNAME, "lo", 3);
-            nlb_msg_end(&b);
-
-            /* eth0 -- the one that must read as ONLINE. */
-            struct nl_ifinfomsg eth = { 0 };
-            eth.type  = NL_ARPHRD_ETHER;
-            eth.index = 2;
-            eth.flags = NL_IFF_UP | NL_IFF_BROADCAST | NL_IFF_MULTICAST |
-                        (net_is_up() ? (NL_IFF_RUNNING | NL_IFF_LOWER_UP) : 0);
-            nlb_msg_begin(&b, NL_RTM_NEWLINK, NL_NLM_F_MULTI,
-                          rq.seq, s->nl_pid, &eth, sizeof eth);
-            nlb_attr(&b, NL_IFLA_IFNAME,  "eth0", 5);
-            nlb_attr(&b, NL_IFLA_ADDRESS, g_my_mac, ETH_ADDR_LEN);
-            nlb_msg_end(&b);
-        }
-        /* Anything else (RTM_GETROUTE, RTM_GETNEIGH, ...): no entries, just
-         * the DONE below. A dump that returns nothing is a valid answer. */
-
-        /* Every dump terminates with NLMSG_DONE; its body is an int error
-         * code, which for a successful dump is 0. */
-        int32_t done = 0;
-        nlb_msg_begin(&b, NL_NLMSG_DONE, NL_NLM_F_MULTI,
-                      rq.seq, s->nl_pid, &done, sizeof done);
-        nlb_msg_end(&b);
-
-        off += NL_ALIGN(rq.len);
-    }
-
-    if (b.off) sock_deliver(s, 0, 0, out, b.off);
+    if (used) sock_deliver(s, 0, 0, out, used);
     kfree(out);
     return (long)n;                    /* the request itself was fully consumed */
 }

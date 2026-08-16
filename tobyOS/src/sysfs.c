@@ -405,6 +405,16 @@ static const struct vfs_ops sysfs_ops = {
     .umount  = 0,
 };
 
+/* Mount sysfs at an extra point (mount(2) -t sysfs). Same singleton
+ * argument as procfs_mount_at -- and it also closes a gap that predates
+ * this slice: /proc/filesystems has always advertised "nodev sysfs",
+ * while mount(2) answered ENODEV for it. A filesystem list that names
+ * something the kernel then refuses is the same class of lie as a knob
+ * that accepts a limit and enforces nothing. */
+int sysfs_mount_at(const char *path) {
+    return vfs_mount(path, &sysfs_ops, 0);
+}
+
 void sysfs_init(void) {
     sysfs_add_dir("/");
     sysfs_add_dir("/cpu");

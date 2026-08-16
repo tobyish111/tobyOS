@@ -23,6 +23,8 @@
  */
 
 #include <tobyos/net.h>
+#include <tobyos/nsproxy.h>
+#include <tobyos/proc.h>
 #include <tobyos/arp.h>
 #include <tobyos/socket.h>
 #include <tobyos/dhcp.h>
@@ -62,6 +64,99 @@ static uint64_t        g_net_boot_next_tick;
 /* Set once in net_init(): true iff the running IPv4 config came from DHCP
  * (not static fallback). Used by bootlog UDP upload targeting. */
 static bool g_net_boot_via_dhcp;
+
+/* ---- Slice 12 cut 2: "my address", per network namespace ----------------
+ *
+ * g_my_ip is the INITIAL namespace's address and stays exactly that -- DHCP
+ * writes it, ifconfig reads it, nothing about that path changes. These
+ * accessors add the namespaced answer on top:
+ *
+ *   1. an active receive context wins (we are processing a frame that arrived on
+ *      a veth end, so "us" means that namespace);
+ *   2. otherwise the calling process's namespace;
+ *   3. otherwise g_my_ip.
+ *
+ * Every consumer that used to read g_my_ip directly to answer "is this mine?"
+ * now calls these, which is what stops a container's stack claiming the host's
+ * address (and vice versa). */
+/* ---- cut 5: one resolver, three accessors ------------------------------
+ *
+ * The order is the whole design:
+ *   1. an ACTIVE network context wins outright -- it means some code that
+ *      genuinely knows (a driver, a veth end) said so. Within it, the DEVICE's
+ *      own address beats the namespace's primary, which is what makes a
+ *      namespace with two interfaces answer for the right one.
+ *   2. otherwise the CALLING PROCESS's namespace, which is correct for a
+ *      send driven by a syscall.
+ *   3. otherwise the host's globals.
+ *
+ * (1) existing at all is the cut-5 fix: it used to be impossible to say "this
+ * frame is the host's", so the host receive path fell into (2) and answered
+ * with the namespace of whatever process happened to be in the syscall that
+ * pumped net_poll(). */
+static void *net_ctx_resolve_ns(struct net_dev **dev_out) {
+    if (net_ctx_active()) {
+        if (dev_out) *dev_out = net_ctx_dev();
+        return net_ctx_ns();
+    }
+    if (dev_out) *dev_out = 0;
+    struct proc *cp = current_proc();
+    return cp ? cp->net_ns : 0;
+}
+
+/* "Which namespace is this code acting for?" -- the same question net_my_ip()
+ * answers, without the address. Exported because the PORT SPACE has to ask it
+ * too: a port is only in use, and a datagram only deliverable, within one
+ * namespace. */
+void *net_current_ns(void) {
+    struct net_dev *d = 0;
+    return net_ctx_resolve_ns(&d);
+}
+
+uint32_t net_my_ip(void) {
+    struct net_dev *d = 0;
+    void *ns = net_ctx_resolve_ns(&d);
+    if (d) { uint32_t ip = net_ns_dev_ip(ns, d); if (ip) return ip; }
+    if (ns) return net_ns_ip(ns);
+    return g_my_ip;
+}
+/* The MAC of the interface "we" would transmit from, namespace-relative.
+ *
+ * Needed because the ARP PAYLOAD carries a sender hardware address, and that has
+ * to be the replying device's MAC. Fixing only the ethernet header (eth_send)
+ * left ARP replies from inside a namespace advertising the HOST NIC's MAC -- so
+ * the peer cached "container-ip is at host-mac", which resolves fine and is
+ * completely wrong. Two layers, both needed. */
+const uint8_t *net_my_mac(void) {
+    struct net_dev *d = 0;
+    void *ns = net_ctx_resolve_ns(&d);
+    if (d) return d->mac;                  /* the interface that received it */
+    if (ns) {
+        struct net_dev *p = net_ns_dev(ns);
+        if (p) return p->mac;
+    }
+    return g_my_mac;
+}
+
+uint32_t net_my_netmask(void) {
+    struct net_dev *d = 0;
+    void *ns = net_ctx_resolve_ns(&d);
+    if (d) { uint32_t m = net_ns_dev_netmask(ns, d); if (m) return m; }
+    if (ns) return net_ns_netmask(ns);
+    return g_my_netmask;
+}
+
+/* The next hop for anything off-subnet. ip_send used g_gateway_ip
+ * unconditionally, so a container sending off its own subnet resolved the
+ * HOST's gateway -- the same "one more layer still carries the global" shape
+ * cut 2 found in the ARP payload, one layer further up. */
+uint32_t net_my_gateway(void) {
+    struct net_dev *d = 0;
+    void *ns = net_ctx_resolve_ns(&d);
+    if (d) { uint32_t g = net_ns_dev_gateway(ns, d); if (g) return g; }
+    if (ns) return net_ns_gateway(ns);
+    return g_gateway_ip;
+}
 
 bool net_is_up(void) { return g_net_up; }
 
@@ -254,8 +349,34 @@ static void net_write_resolv_conf(uint32_t dns_be) {
     if (n < (int)sizeof line - 1) line[n++] = '\n';
     line[n] = 0;
     int rc = vfs_write_all("/etc/resolv.conf", line, (size_t)n);
-    if (rc == VFS_OK)
+    if (rc == VFS_OK) {
         kprintf("[net] /etc/resolv.conf -> %s\n", dnsbuf);
+        return;
+    }
+    /* SAY SO. This used to log only on success, so on a read-only root it
+     * failed in complete silence -- and the consequence is invisible until a
+     * browser reports ERR_NAME_NOT_RESOLVED with nothing in the kernel log to
+     * connect it to.
+     *
+     * It matters ONLY on real hardware, which is why it survived this long:
+     * the initrd ships `nameserver 10.0.2.3`, QEMU's SLIRP hands out exactly
+     * 10.0.2.3, and the static file is therefore accidentally correct in every
+     * QEMU boot. On a real LAN the DHCP nameserver is something else entirely
+     * and every name lookup goes to an address that does not exist there.
+     *
+     * The fix is a writable root (ramfs has .write = 0 today; Linux's
+     * initramfs is a writable tmpfs, so the read-only root is the deviation).
+     * Until then this is a WARNING with the actual numbers in it, because a
+     * one-line diagnosis beats a silent wrong answer. */
+    static bool warned;
+    if (!warned) {
+        warned = true;
+        kprintf("[net] WARN: cannot update /etc/resolv.conf (rc=%d, read-only "
+                "root). DHCP says the nameserver is %s, but resolvers will "
+                "keep using whatever the initrd shipped -- if those differ, "
+                "name resolution FAILS (ERR_NAME_NOT_RESOLVED) while ping and "
+                "raw IP still work.\n", rc, dnsbuf);
+    }
 }
 
 /* Apply a successful DHCP lease into the kernel globals. Logged with

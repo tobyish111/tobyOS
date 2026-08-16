@@ -42,6 +42,20 @@ long sys_brk2(uint64_t new_brk);
 void mmap2_init_proc(int pid);
 void mmap2_cleanup_proc(int pid);
 
+/* Page reclaim: evict up to `want` private-anonymous pages to swap, returning
+ * how many were actually evicted. Implemented in mmap.c so it reuses the same
+ * shootdown-before-free batch as munmap; see the comment there for the
+ * eligibility rules (BLOCKED, sole mm owner, private+anon, refcount 1).
+ * Safe to call with no swap configured -- it simply reclaims 0. */
+int mem_reclaim_pages(int want);
+
+/* Lifetime reclaim counters, for harnesses that must prove work actually
+ * happened rather than trusting a green exit code. evicted: pages written to
+ * swap by mem_reclaim_pages. faulted_back: pages brought back by the swap-in
+ * arm of the fault handler. */
+uint64_t reclaim_stat_evicted(void);
+uint64_t reclaim_stat_faulted_back(void);
+
 /* COW clone for fork: duplicate parent's VMA table into child,
  * marking writable regions as COW. Returns 0 on success. */
 int mmap2_cow_clone(int parent_pid, int child_pid);
@@ -90,6 +104,12 @@ struct shm_cache;
 /* Keyed on (inode, incarnation) -- a bare inode number is reissued the moment
  * a file is unlinked and would alias unrelated regions together. */
 struct shm_cache *shm_cache_for_ino(uint64_t ino, uint64_t gen, bool *created);
+/* Slice 122: pin = one struct file whose f->shm points at the entry. Entries
+ * with zero pins and no live mappings are reaped when the table fills; before
+ * this, entries were permanent and one heavy page exhausted all 256, after
+ * which every new region silently fell back to unshared private copies. */
+void shm_cache_pin(struct shm_cache *sc);
+void shm_cache_unpin(struct shm_cache *sc);
 int   shm_cache_ensure(struct shm_cache *sc, size_t want_pages);
 /* High-water page count. Sample BEFORE shm_cache_ensure() to learn which pages
  * that call newly allocated, so exactly those get populated from the file. */
@@ -103,5 +123,12 @@ long  shm_cache_mmap(struct shm_cache *sc, uint64_t addr, uint64_t len,
  * (SHARED+NOFREE). Used by /dev/dri to hand a GPU buffer object straight
  * to userspace -- the mapping IS the DMA buffer, not a shadow. */
 long mmap_map_phys_user(uint64_t phys, uint64_t len);
+
+/* TLB-shootdown quarantine depth + cumulative deliberate leaks. Frames whose
+ * shootdown was not fully acked park in a bounded ring rather than returning
+ * to the PMM; past the bound they are leaked on purpose ("a page lost beats a
+ * page corrupted"). Both numbers were tracked and never surfaced -- the
+ * heartbeat now reports them when non-zero. */
+void mmap_tlbq_stats(uint64_t *depth, uint64_t *leaked);
 
 #endif /* TOBYOS_MMAP_H */

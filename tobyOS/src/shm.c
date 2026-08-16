@@ -11,6 +11,7 @@
 #include <tobyos/mmap.h>
 #include <tobyos/page_fault.h>
 #include <tobyos/uaccess.h>
+#include <tobyos/nsproxy.h>
 
 #define SHM_MAX        64
 #define SHM_NAME_MAX   64
@@ -42,14 +43,97 @@ struct sysv_seg {
     int      marked_rmid;
 };
 
+/* ---- the IPC namespace ------------------------------------------------
+ * Slice 8: the SysV tables moved out of file scope and into a refcounted
+ * `struct ipc_ns`. Done with the same ZERO-CHURN accessor-macro trick slice 5
+ * used for the mount table: `g_sysv` becomes a macro resolving to the calling
+ * process's table, so all ~20 existing uses below are untouched and there was
+ * no opportunity to miss one.
+ *
+ * NOTE WHAT DID *NOT* MOVE: `g_shm`, the POSIX shm_open() table, stays global.
+ * That is not an oversight -- on Linux POSIX shared memory is a tmpfs mounted
+ * at /dev/shm, so its isolation belongs to the MOUNT namespace (slice 9), not
+ * the IPC namespace. Only System V IPC lives in the IPC namespace. Moving
+ * g_shm here would have produced isolation that looks right and is attributed
+ * to the wrong namespace, which then contradicts slice 9. */
+struct ipc_ns {
+    int             refs;
+    uint64_t        inum;
+    struct sysv_seg seg[SHM_MAX];
+};
+
 static struct shm_object g_shm[SHM_MAX];
-static struct sysv_seg   g_sysv[SHM_MAX];
+static struct ipc_ns     g_init_ipc_ns;
 static spinlock_t g_shm_lock = SPINLOCK_INIT;
+
+static inline struct ipc_ns *cur_ipc_ns(void) {
+    struct proc *p = current_proc();
+    return (p && p->ipc_ns) ? (struct ipc_ns *)p->ipc_ns : &g_init_ipc_ns;
+}
+#define g_sysv (cur_ipc_ns()->seg)
 
 void shm_init(void) {
     memset(g_shm, 0, sizeof(g_shm));
-    memset(g_sysv, 0, sizeof(g_sysv));
-    kprintf("[shm] shared memory ready (POSIX + SysV, %d slots)\n", SHM_MAX);
+    memset(&g_init_ipc_ns, 0, sizeof(g_init_ipc_ns));
+    g_init_ipc_ns.refs = 1;                 /* never freed */
+    g_init_ipc_ns.inum = NS_INUM_INIT_IPC;
+    kprintf("[shm] shared memory ready (POSIX + SysV, %d slots, ipc ns %lu)\n",
+            SHM_MAX, (unsigned long)g_init_ipc_ns.inum);
+}
+
+/* Release every segment in `ns`. Called only when the last reference goes, so
+ * nothing can be attached. Without this, unsharing an IPC namespace that then
+ * exits would leak every page its segments allocated -- and a namespace whose
+ * whole point is "these segments go away with me" that instead retains them
+ * forever is a resource leak with a security flavour. */
+static void ipc_ns_destroy(struct ipc_ns *ns) {
+    for (int i = 0; i < SHM_MAX; i++) {
+        struct sysv_seg *s = &ns->seg[i];
+        if (!s->active) continue;
+        for (size_t j = 0; j < s->n_pages; j++)
+            if (s->pages[j]) pmm_free_page(s->pages[j]);
+        if (s->pages) kfree(s->pages);
+        memset(s, 0, sizeof(*s));
+    }
+    kfree(ns);
+}
+
+void *ipc_ns_create(void) {
+    struct ipc_ns *ns = kmalloc(sizeof(*ns));
+    if (!ns) return 0;
+    memset(ns, 0, sizeof(*ns));
+    ns->refs = 1;
+    ns->inum = ns_inum_alloc();
+    return ns;
+}
+
+void ipc_ns_get(void *p) {
+    struct ipc_ns *ns = (struct ipc_ns *)p;
+    if (!ns || ns == &g_init_ipc_ns) return;   /* NULL / initial: nothing to count */
+    uint64_t f = spin_lock_irqsave(&g_shm_lock);
+    ns->refs++;
+    spin_unlock_irqrestore(&g_shm_lock, f);
+}
+
+void ipc_ns_put(void *p) {
+    struct ipc_ns *ns = (struct ipc_ns *)p;
+    if (!ns || ns == &g_init_ipc_ns) return;
+    uint64_t f = spin_lock_irqsave(&g_shm_lock);
+    int left = --ns->refs;
+    spin_unlock_irqrestore(&g_shm_lock, f);
+    if (left <= 0) ipc_ns_destroy(ns);
+}
+
+uint64_t ipc_ns_inum(void *p) {
+    struct ipc_ns *ns = (struct ipc_ns *)p;
+    return ns ? ns->inum : g_init_ipc_ns.inum;
+}
+
+int ipc_ns_nsegs(void *p) {
+    struct ipc_ns *ns = p ? (struct ipc_ns *)p : &g_init_ipc_ns;
+    int n = 0;
+    for (int i = 0; i < SHM_MAX; i++) if (ns->seg[i].active) n++;
+    return n;
 }
 
 static struct shm_object *shm_find(const char *name) {

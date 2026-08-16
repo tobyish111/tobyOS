@@ -177,6 +177,18 @@
 #define HDA_CORB_ENTRIES   256   /* 4 B each = 1 KiB              */
 #define HDA_RIRB_ENTRIES   256   /* 8 B each = 2 KiB              */
 
+/* Continuous-playback ring geometry. 4 pages of stereo 16-bit @48 kHz is
+ * 16384 B / 4 B-per-frame = 4096 frames = ~85 ms of buffer, which is deep
+ * enough to ride out a scheduling gap and shallow enough that a stream
+ * stops promptly on close. One BDL entry per page. */
+#define HDA_PCM_PERIODS       4
+#define HDA_PCM_PERIOD_BYTES  4096
+#define HDA_PCM_BYTES         (HDA_PCM_PERIODS * HDA_PCM_PERIOD_BYTES)
+/* snd_pcm.c advertises buffer_size from this; keep the two in step or the
+ * ALSA layer promises a buffer the ring cannot hold. */
+_Static_assert(HDA_PCM_BYTES == HDA_PCM_RING_BYTES,
+               "HDA_PCM_RING_BYTES (audio_hda.h) must match the ring here");
+
 static struct {
     bool                bound;
     struct pci_dev     *dev;
@@ -213,6 +225,28 @@ static struct {
     uint64_t            pcm_phys;
     bool                tone_attempted;
     bool                tone_started;
+
+    /* ---- Continuous PCM playback (the real output path) --------------
+     * A cyclic ring of HDA_PCM_PERIODS pages, one BDL entry each, so the
+     * controller loops forever and we refill behind it. The hardware read
+     * cursor is LPIB (a byte offset inside CBL); the app write cursor is
+     * pcm_appl_bytes, monotonic. Free space = CBL - (appl - consumed).
+     *
+     * Pages need NOT be contiguous -- that is exactly what a scatter BDL
+     * is for -- so this allocates page-at-a-time and never needs a
+     * contiguous multi-page allocator. */
+    bool                pcm_open;
+    uint32_t            pcm_sdi;          /* stream descriptor index      */
+    uint32_t            pcm_rate;
+    uint8_t             pcm_channels;
+    bool                pcm_running;      /* RUN bit is set               */
+    int16_t            *pcm_page[HDA_PCM_PERIODS];
+    uint64_t            pcm_page_phys[HDA_PCM_PERIODS];
+    uint64_t            pcm_appl_bytes;   /* total bytes handed to us     */
+    uint64_t            pcm_wraps;        /* LPIB wrap count              */
+    uint32_t            pcm_last_lpib;
+    uint64_t            pcm_underruns;
+    int                 pcm_cad, pcm_dac, pcm_pin;   /* codec path in use */
 
     /* Telemetry exposed via introspect/selftest for the test harness. */
     uint64_t            verbs_sent;
@@ -938,6 +972,233 @@ int audio_hda_tone_selftest(char *msg, size_t cap) {
               (unsigned long)g_hda.verb_timeouts);
     return 0;
 }
+
+/* ============================================================
+ * Continuous PCM playback
+ *
+ * This is the path that was missing: audio_engine.c mixed into a ring
+ * that nothing drained, and audio_hda.c could only play one hardcoded
+ * square wave from a diagnostic. The two halves were written to meet in
+ * the middle and never did. Everything below is that junction.
+ * ============================================================ */
+
+/* Encode SDxFMT. Base bit 14: 0 = 48 kHz family, 1 = 44.1 kHz family;
+ * bits[13:11] multiplier, bits[10:8] divisor, bits[6:4] bits-per-sample,
+ * bits[3:0] channels-1. Returns 0 for a rate we cannot express. */
+static uint16_t hda_fmt_word(uint32_t rate, uint8_t channels) {
+    uint16_t base, mult = 0, div = 0;
+    switch (rate) {
+    case 48000: base = 0; break;
+    case 44100: base = 1; break;
+    case 24000: base = 0; div = 1; break;   /* 48000 / 2 */
+    case 22050: base = 1; div = 1; break;   /* 44100 / 2 */
+    case 16000: base = 0; div = 2; break;   /* 48000 / 3 */
+    case 96000: base = 0; mult = 1; break;  /* 48000 * 2 */
+    case 8000:  base = 0; div = 5; break;   /* 48000 / 6 */
+    default:    return 0;
+    }
+    if (channels < 1 || channels > 2) return 0;
+    return (uint16_t)((base << 14) | (mult << 11) | (div << 8) |
+                      (0x1 << 4) | (channels - 1));   /* 0x1 = 16-bit */
+}
+
+static bool hda_pcm_alloc(void) {
+    if (!g_hda.bdl) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) return false;
+        g_hda.bdl      = (volatile uint32_t *)pmm_phys_to_virt(phys);
+        g_hda.bdl_phys = phys;
+        memset((void *)g_hda.bdl, 0, 4096);
+    }
+    for (int i = 0; i < HDA_PCM_PERIODS; i++) {
+        if (g_hda.pcm_page[i]) continue;
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) return false;
+        g_hda.pcm_page[i]      = (int16_t *)pmm_phys_to_virt(phys);
+        g_hda.pcm_page_phys[i] = phys;
+        memset(g_hda.pcm_page[i], 0, HDA_PCM_PERIOD_BYTES);
+    }
+    return true;
+}
+
+/* Bytes the controller has consumed since the stream started. LPIB only
+ * gives a position INSIDE the buffer, so wraps have to be counted; call
+ * this often enough that the buffer cannot lap us between calls (85 ms
+ * at 48 kHz stereo -- the write path calls it on every write). */
+static uint64_t hda_pcm_consumed(void) {
+    if (!g_hda.pcm_running) return 0;
+    uint32_t off  = HDA_SD_BASE + g_hda.pcm_sdi * HDA_SD_STRIDE;
+    uint32_t lpib = hda_r32(off + HDA_SD_LPIB) % HDA_PCM_BYTES;
+    if (lpib < g_hda.pcm_last_lpib) g_hda.pcm_wraps++;
+    g_hda.pcm_last_lpib = lpib;
+    return g_hda.pcm_wraps * (uint64_t)HDA_PCM_BYTES + lpib;
+}
+
+int audio_hda_pcm_open(uint32_t rate, uint8_t channels) {
+    if (!g_hda.bound)        return -1;
+    if (g_hda.codec_count == 0 || g_hda.oss == 0) return -1;
+    if (g_hda.pcm_open)      return 0;         /* already open: share it */
+
+    uint16_t fmt = hda_fmt_word(rate, channels);
+    if (!fmt) return -1;
+
+    struct audio_hda_codec_info *c = NULL;
+    for (int i = 0; i < g_hda.codec_count; i++) {
+        if (g_hda.codecs[i].first_dac_nid && g_hda.codecs[i].first_pin_nid) {
+            c = &g_hda.codecs[i];
+            break;
+        }
+    }
+    if (!c) return -1;
+    if (!hda_pcm_alloc()) return -1;
+
+    /* Output stream descriptors start after the input ones. */
+    g_hda.pcm_sdi = g_hda.iss;
+    uint32_t off  = HDA_SD_BASE + g_hda.pcm_sdi * HDA_SD_STRIDE;
+    if (!hda_sd_reset(g_hda.pcm_sdi)) return -1;
+
+    /* One BDL entry per page; IOC left off since we poll LPIB rather
+     * than take an interrupt (the driver has no HDA ISR). */
+    for (int i = 0; i < HDA_PCM_PERIODS; i++) {
+        g_hda.bdl[i * 4 + 0] = (uint32_t)(g_hda.pcm_page_phys[i] & 0xFFFFFFFFu);
+        g_hda.bdl[i * 4 + 1] = (uint32_t)(g_hda.pcm_page_phys[i] >> 32);
+        g_hda.bdl[i * 4 + 2] = HDA_PCM_PERIOD_BYTES;
+        g_hda.bdl[i * 4 + 3] = 0;
+        memset(g_hda.pcm_page[i], 0, HDA_PCM_PERIOD_BYTES);
+    }
+
+    hda_w16(off + HDA_SD_FMT,  fmt);
+    hda_w32(off + HDA_SD_CBL,  HDA_PCM_BYTES);
+    hda_w16(off + HDA_SD_LVI,  HDA_PCM_PERIODS - 1);
+    hda_w32(off + HDA_SD_BDPL, (uint32_t)(g_hda.bdl_phys & 0xFFFFFFFFu));
+    hda_w32(off + HDA_SD_BDPU, (uint32_t)(g_hda.bdl_phys >> 32));
+
+    if (hda_r32(off + HDA_SD_CBL) != HDA_PCM_BYTES) return -1;
+
+    hda_w8(off + HDA_SD_CTL_HI, (uint8_t)(1u << 4));      /* stream tag 1 */
+
+    hda_send_verb(hda_verb12(c->cad, c->first_dac_nid,
+                             HDA_VERB_SET_STREAM_CHAN, 0x10));
+    hda_send_verb(hda_verb4 (c->cad, c->first_dac_nid,
+                             HDA_VERB_SHORT_SET_FORMAT, fmt));
+    hda_send_verb(hda_verb4 (c->cad, c->first_dac_nid,
+                             HDA_VERB_SHORT_SET_AMP_GAIN, 0xB07Fu));
+    hda_send_verb(hda_verb12(c->cad, c->first_pin_nid,
+                             HDA_VERB_SET_PIN_CTL,
+                             HDA_PIN_CTL_OUT_EN | HDA_PIN_CTL_HP_EN));
+    hda_send_verb(hda_verb12(c->cad, c->first_pin_nid,
+                             HDA_VERB_SET_EAPD_BTL, 0x02));
+
+    g_hda.pcm_cad = c->cad;
+    g_hda.pcm_dac = c->first_dac_nid;
+    g_hda.pcm_pin = c->first_pin_nid;
+    g_hda.pcm_rate       = rate;
+    g_hda.pcm_channels   = channels;
+    g_hda.pcm_appl_bytes = 0;
+    g_hda.pcm_wraps      = 0;
+    g_hda.pcm_last_lpib  = 0;
+    g_hda.pcm_underruns  = 0;
+    g_hda.pcm_running    = false;
+    g_hda.pcm_open       = true;
+    kprintf("[hda] pcm open: SD%u %u Hz %u ch fmt=0x%04x cbl=%u (%u periods)\n",
+            g_hda.pcm_sdi, rate, channels, fmt,
+            (unsigned)HDA_PCM_BYTES, (unsigned)HDA_PCM_PERIODS);
+    return 0;
+}
+
+/* Copy `frames` stereo-16 frames into the cyclic buffer ahead of the
+ * hardware cursor. Returns frames accepted, which may be 0 (buffer full)
+ * or partial -- the caller paces itself off that, exactly like ALSA's
+ * snd_pcm_writei against avail_update. */
+long audio_hda_pcm_write(const int16_t *src, size_t frames) {
+    if (!g_hda.pcm_open || !src) return -1;
+
+    const uint32_t fb = 2u * g_hda.pcm_channels;     /* frame bytes */
+    uint64_t consumed = hda_pcm_consumed();
+
+    /* The app cursor must never fall behind the hardware cursor, or we
+     * would be writing into bytes the controller already played. */
+    if (g_hda.pcm_appl_bytes < consumed) {
+        g_hda.pcm_underruns++;
+        g_hda.pcm_appl_bytes = consumed;
+    }
+    uint64_t inflight = g_hda.pcm_appl_bytes - consumed;
+    if (inflight >= HDA_PCM_BYTES) return 0;         /* full: try later */
+
+    size_t space_frames = (size_t)((HDA_PCM_BYTES - inflight) / fb);
+    if (frames > space_frames) frames = space_frames;
+    if (frames == 0) return 0;
+
+    size_t remaining = frames * fb;
+    size_t soff = 0;
+    while (remaining) {
+        uint32_t pos    = (uint32_t)(g_hda.pcm_appl_bytes % HDA_PCM_BYTES);
+        uint32_t page   = pos / HDA_PCM_PERIOD_BYTES;
+        uint32_t inpage = pos % HDA_PCM_PERIOD_BYTES;
+        size_t   chunk  = HDA_PCM_PERIOD_BYTES - inpage;
+        if (chunk > remaining) chunk = remaining;
+        memcpy((uint8_t *)g_hda.pcm_page[page] + inpage,
+               (const uint8_t *)src + soff, chunk);
+        g_hda.pcm_appl_bytes += chunk;
+        soff      += chunk;
+        remaining -= chunk;
+    }
+
+    /* Start only once there is a period of audio queued, so the very
+     * first thing the DAC sees is real samples and not the zeroed ring. */
+    if (!g_hda.pcm_running && g_hda.pcm_appl_bytes >= HDA_PCM_PERIOD_BYTES) {
+        uint32_t off = HDA_SD_BASE + g_hda.pcm_sdi * HDA_SD_STRIDE;
+        hda_w8(off + HDA_SD_CTL_LO,
+               hda_r8(off + HDA_SD_CTL_LO) | (uint8_t)HDA_SDCTL_RUN);
+        g_hda.pcm_running = true;
+        g_hda.streams_started++;
+    }
+    return (long)frames;
+}
+
+/* Frames of free space in the cyclic buffer right now.
+ *
+ * A caller MUST consult this before consuming from its own source, not
+ * after: the mixer destroys what it reads, so mixing first and finding
+ * the device full afterwards silently drops that audio. */
+long audio_hda_pcm_free(void) {
+    if (!g_hda.pcm_open) return -1;
+    uint64_t consumed = hda_pcm_consumed();
+    uint64_t inflight = (g_hda.pcm_appl_bytes > consumed)
+                        ? g_hda.pcm_appl_bytes - consumed : 0;
+    if (inflight >= HDA_PCM_BYTES) return 0;
+    return (long)((HDA_PCM_BYTES - inflight) / (2u * g_hda.pcm_channels));
+}
+
+/* Frames of already-written audio still queued ahead of the DAC. The
+ * pacing signal for a writer: sleep when this is deep, write when shallow. */
+long audio_hda_pcm_pending(void) {
+    if (!g_hda.pcm_open) return -1;
+    uint64_t consumed = hda_pcm_consumed();
+    if (g_hda.pcm_appl_bytes <= consumed) return 0;
+    return (long)((g_hda.pcm_appl_bytes - consumed) / (2u * g_hda.pcm_channels));
+}
+
+void audio_hda_pcm_close(void) {
+    if (!g_hda.pcm_open) return;
+    uint32_t off = HDA_SD_BASE + g_hda.pcm_sdi * HDA_SD_STRIDE;
+    if (g_hda.pcm_running) {
+        hda_w8(off + HDA_SD_CTL_LO,
+               hda_r8(off + HDA_SD_CTL_LO) & (uint8_t)~HDA_SDCTL_RUN);
+        g_hda.pcm_running = false;
+    }
+    /* Mute the pin so an idle stream cannot leave the output hot. */
+    hda_send_verb(hda_verb12(g_hda.pcm_cad, g_hda.pcm_pin,
+                             HDA_VERB_SET_PIN_CTL, 0));
+    g_hda.pcm_open = false;
+    kprintf("[hda] pcm close: %lu bytes played, %lu underrun(s)\n",
+            (unsigned long)g_hda.pcm_appl_bytes,
+            (unsigned long)g_hda.pcm_underruns);
+}
+
+bool audio_hda_pcm_is_open(void) { return g_hda.pcm_open; }
+
+uint64_t audio_hda_pcm_underruns(void) { return g_hda.pcm_underruns; }
 
 /* ============================================================
  * Public API

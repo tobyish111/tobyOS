@@ -79,6 +79,16 @@
 #define TFS_TYPE_FREE 0
 #define TFS_TYPE_FILE 1
 #define TFS_TYPE_DIR  2
+/* Linux slice 7: on-disk symbolic link. The target string is stored as the
+ * inode's DATA (size = strlen), so no new on-disk structure is needed and
+ * legacy volumes are unaffected -- they simply contain no type-3 inodes.
+ *
+ * Before this, symlinks lived only in a fixed 128-entry RAM table in vfs.c:
+ * global to the machine, not per-filesystem, and gone on reboot. A real
+ * distro rootfs is mostly symlinks (Alpine's minirootfs has 335, nearly all
+ * busybox applet links), so that table both overflowed AND would have left
+ * every link dangling after a restart. */
+#define TFS_TYPE_SYMLINK 3
 
 #define TFS_ROOT_INO  1u
 
@@ -97,7 +107,9 @@
 #define TFS_MODE_R_GROUP  00040u
 #define TFS_MODE_W_GROUP  00020u
 #define TFS_MODE_X_GROUP  00010u
-#define TFS_MODE_PERMS    00777u
+/* Slice 2: 00777 -> 07777, matching VFS_MODE_PERMS, so setuid/setgid/sticky
+ * round-trip through the on-disk inode (mode is a uint32; nothing else to do). */
+#define TFS_MODE_PERMS    07777u
 #define TFS_MODE_VALID    0x10000u   /* "this inode has explicit perms" */
 
 /* Defaults for newly-created inodes. Files are owner-rw + world-r,
@@ -186,6 +198,10 @@ int tobyfs_format(struct blk_dev *dev);
  * opaque mount-data back to its backing block device. */
 const void *tobyfs_ops_addr(void);
 struct blk_dev *tobyfs_blkdev_of(void *mnt);
+/* Slice 122c: the mounted volume's true on-disk extent in 512-byte sectors
+ * (superblock total_blocks, NOT the compile-time minimum). For placing swap
+ * strictly past the filesystem. */
+uint64_t tobyfs_total_sectors(void *mnt);
 
 /* ============================================================
  *  Milestone 28E: filesystem integrity checker.

@@ -15,6 +15,7 @@
 #include <tobyos/uaccess.h>
 #include <tobyos/klibc.h>
 #include <tobyos/isr.h>
+#include <tobyos/nsproxy.h>   /* pid_knr / pid_vnr_in / pid_ns_can_see (slice 10) */
 #include <tobyos/abi/abi.h>
 
 static int g_foreground_pid = 0;
@@ -267,9 +268,27 @@ static void signal_apply_default(struct proc *p, int sig) {
      * later flips us READY + enqueues, and execution resumes right here. */
     kprintf("[signal] pid=%d '%s' stopped by signal %d\n",
             p->pid, p->name, sig);
+    /* A TRACED process entering a stop must be visible to its tracer, and it
+     * is the TRACER that resumes it, not SIGCONT. Without this the two
+     * deadlock on the very first thing any tracing session does: strace's
+     * handshake is TRACEME followed by raise(SIGSTOP), so the tracer waits for
+     * a ptrace-stop while the tracee sits in a job-control one.
+     *
+     * NO run-queue work here. An earlier version woke the tracer with
+     * sched_enqueue() from this path and wedged the guest to a dead stop
+     * (heartbeats=0) -- handoff §7: "signal_send touches the run queue".
+     * wait4's traced-child arm polls, so setting the flag IS the
+     * notification. */
+    if (p->tracer_pid) {
+        extern void proc_wake_waiters(int pid);
+        p->ptrace_stopsig = sig;
+        p->ptrace_stopped = 1;
+        proc_wake_waiters(p->pid);
+    }
     p->state = PROC_STOPPED;
     sched_yield();
-    /* SIGCONT arrived: we're RUNNING again; resume the interrupted flow. */
+    /* Resumed: by SIGCONT, or by the tracer's PTRACE_CONT/PTRACE_SYSCALL. */
+    p->ptrace_stopped = 0;
 }
 
 /* Build a signal frame on the user stack and redirect the saved syscall
@@ -404,7 +423,34 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
      * originals from the entry trapframe, so after the handler returns via
      * sigreturn the kernel re-executes the interrupted call transparently.
      * Otherwise the handler returns into code that sees rax == -EINTR. */
-    if (rv == EINTR_RET && num >= 0 && (sa->sa_flags & SA_RESTART)) {
+    /* Linux slice 3: SA_RESTART does NOT apply to every syscall.
+     *
+     * Linux keeps a set that is never restarted no matter what the handler
+     * asked for, because restarting them would be wrong rather than merely
+     * surprising: pause() has no success case at all, and the poll/select
+     * family would silently restart with their ORIGINAL timeout, turning a
+     * bounded wait into an unbounded one.
+     *
+     * We restarted everything, which is how alarm(1)+pause() hung forever:
+     * glibc's signal() sets SA_RESTART, so the SIGALRM handler ran, pause was
+     * restarted, and the alarm that would have ended it had already been
+     * consumed. Caught by the slice-3 test; the same bug would have hit any
+     * poll loop using a SA_RESTART handler as its wakeup. */
+    bool never_restart = false;
+    if (p->personality == ABI_PERS_LINUX) {
+        switch (num) {
+        case 7:    /* poll            */  case 23:  /* select          */
+        case 34:   /* pause           */  case 35:  /* nanosleep       */
+        case 128:  /* rt_sigtimedwait */  case 130: /* rt_sigsuspend   */
+        case 230:  /* clock_nanosleep */  case 232: /* epoll_wait      */
+        case 270:  /* pselect6        */  case 271: /* ppoll           */
+        case 281:  /* epoll_pwait     */
+            never_restart = true; break;
+        default: break;
+        }
+    }
+    if (rv == EINTR_RET && num >= 0 && (sa->sa_flags & SA_RESTART) &&
+        !never_restart) {
         ctx->rax = (uint64_t)num;
         ctx->rip = regs->rcx - 2;
     } else {
@@ -539,6 +585,49 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
 
 /* IRQ-context entry (PIT). Handles fatal/default dispositions; caught
  * handlers are deferred to the next syscall return. */
+/* Linux slice 3: fire any alarm(2) deadlines that have come due.
+ *
+ * Driven from the same timer tick that delivers signals, so an alarm lands
+ * even on a process that is asleep in pause()/sigsuspend() -- which is the
+ * only reason alarm() is useful. One deadline per process (see proc.h);
+ * clearing it BEFORE raising the signal keeps a one-shot from re-firing if
+ * the handler takes longer than a tick. */
+/* Fire due alarm(2) deadlines.
+ *
+ * CALLED FROM sched_yield()'s slow path (next to poll_tick), NOT from the
+ * timer IRQ. Two failed attempts got us here and both are worth recording:
+ *
+ *  1. Hanging it off signal_deliver_if_pending() -- which the PIT calls only
+ *     when it interrupted RING 3 -- meant the alarm fired for every process
+ *     EXCEPT the ones asleep in pause()/sigsuspend(), which hlt() in ring 0.
+ *     Those are precisely the callers alarm() exists to wake.
+ *
+ *  2. Calling it unconditionally from the PIT IRQ instead DEADLOCKED THE
+ *     MACHINE: signal_send() does wait_queue_unlink() + sched_enqueue(), and
+ *     an IRQ that preempts a context holding the run-queue lock and then
+ *     grabs it wedges everything. (That is *why* the handler's signal work is
+ *     gated on ring 3 -- the gate is a safety condition, not a style choice.)
+ *
+ * The yield slow path is the right home: it runs at a ~10 ms cadence, holds
+ * the BKL and no other locks, and can therefore call the full signal_send()
+ * -- which is what actually WAKES a blocked process rather than just marking
+ * it pending. A bare pending-bit set is not enough: a process parked in
+ * poll_wait_block() only re-scans when something wakes it, and poll_tick's
+ * sweep does not run when pid 0 is parked in proc_wait (the boot-harness
+ * shape slice 96 documented). */
+void signal_tick_alarms(void) {
+    extern struct proc g_proc[];          /* mirrors the idiom used below */
+    extern uint64_t perf_now_ns(void);
+    uint64_t now = perf_now_ns();
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *p = &g_proc[i];
+        if (p->state == PROC_UNUSED || p->alarm_deadline_ns == 0) continue;
+        if (now < p->alarm_deadline_ns) continue;
+        p->alarm_deadline_ns = 0;         /* clear BEFORE raising: one-shot */
+        signal_send(p, SIGALRM);          /* full send: also WAKES a blocked proc */
+    }
+}
+
 void signal_deliver_if_pending(void) {
     signal_deliver(0, 0, -1);
 }
@@ -767,12 +856,18 @@ int sys_kill(int pid, int sig) {
      * case kill(getpid(), sig), which Linux reports as si_pid == getpid().
      * signal_send's generic stamp can't tell a kill() syscall from a tty/kernel
      * source, so stamp the true sender here, after delivery. */
+    /* Slice 10: `pid` arrives as a vpid in the CALLER's pid namespace, and
+     * si_pid must be reported as the sender's number in the TARGET's namespace.
+     * Both are identity in the initial namespace, so nothing changes for a
+     * system that never used CLONE_NEWPID. */
     if (pid > 0) {
-        struct proc *target = proc_lookup(pid);
+        int kpid = pid_knr(pid);
+        if (!kpid) return -3;                        /* not visible => ESRCH */
+        struct proc *target = proc_lookup(kpid);
         if (!target) return -3; /* ESRCH */
         signal_send(target, sig);
         if (sig > 0) {
-            target->sigstate.si_pid[sig] = p->pid;
+            target->sigstate.si_pid[sig] = pid_vnr_in(target->pid_ns, p->pid);
             target->sigstate.si_uid[sig] = p->uid;
         }
     } else if (pid == 0) {
@@ -783,9 +878,14 @@ int sys_kill(int pid, int sig) {
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO &&
                 g_proc[i].session_id == p->session_id) {
+                /* A broadcast must not escape the caller's pid namespace: a
+                 * container that can signal the host is not a container. The
+                 * visibility map is the whole check. */
+                if (!pid_ns_can_see(p, &g_proc[i])) continue;
                 signal_send(&g_proc[i], sig);
                 if (sig > 0) {
-                    g_proc[i].sigstate.si_pid[sig] = p->pid;
+                    g_proc[i].sigstate.si_pid[sig] =
+                        pid_vnr_in(g_proc[i].pid_ns, p->pid);
                     g_proc[i].sigstate.si_uid[sig] = p->uid;
                 }
             }
@@ -796,9 +896,11 @@ int sys_kill(int pid, int sig) {
         for (int i = 1; i < PROC_MAX; i++) {
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO) {
+                if (!pid_ns_can_see(p, &g_proc[i])) continue;   /* slice 10 */
                 signal_send(&g_proc[i], sig);
                 if (sig > 0) {
-                    g_proc[i].sigstate.si_pid[sig] = p->pid;
+                    g_proc[i].sigstate.si_pid[sig] =
+                        pid_vnr_in(g_proc[i].pid_ns, p->pid);
                     g_proc[i].sigstate.si_uid[sig] = p->uid;
                 }
             }

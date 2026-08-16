@@ -58,6 +58,8 @@ int     symlink(const char *target, const char *linkpath);
 ssize_t readlink(const char *path, char *buf, size_t bufsiz);
 
 uid_t   getuid (void);
+int     setuid (uid_t uid);      /* slice 14: real privilege drop */
+int     setgid (gid_t gid);
 uid_t   geteuid(void);
 gid_t   getgid (void);
 gid_t   getegid(void);

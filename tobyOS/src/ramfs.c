@@ -58,7 +58,32 @@ struct ramfs_node {
     enum vfs_type type;
     const void   *data;                 /* file bytes (NULL for DIR) */
     size_t        size;                 /* 0 for DIR */
+    /* Ownership + permission bits, read from the USTAR header rather than
+     * fabricated. Before this, ramfs reported a FIXED 00444 for every file
+     * and 00555 for every directory at all three reporting sites (open,
+     * stat, readdir) -- so nothing in the initrd could be marked executable,
+     * setuid, or group-private, and `ls -l /bin` described a filesystem that
+     * did not exist. mode carries VFS_MODE_PERMS (07777), so setuid/setgid/
+     * sticky survive; execve reads S_ISUID from exactly this value. */
+    uint32_t      mode;
+    uint32_t      uid;
+    uint32_t      gid;
+    /* Copy-on-write state. `data` normally points INTO the initrd module
+     * (zero-copy). After the first write it points at a kmalloc'd buffer of
+     * `cap` bytes instead, and `owned` says so -- which is what makes it safe
+     * to free/grow, and what keeps the shared initrd image itself immutable. */
+    bool          owned;
+    size_t        cap;
 };
+
+/* Fallbacks for a tar whose mode field is missing or unparseable. These are
+ * the OLD hardcoded values -- a malformed header degrades to the previous
+ * behaviour rather than producing a 00000-mode file nobody can open. */
+#define RAMFS_FALLBACK_FILE_MODE  00444u
+#define RAMFS_FALLBACK_DIR_MODE   00555u
+/* Synthesised parent directories (tar has "bin/hello" but no "bin/" entry)
+ * have no header to read a mode from, so they get the conventional 0755. */
+#define RAMFS_IMPLICIT_DIR_MODE   00755u
 
 struct ramfs_mount {
     const void          *image;
@@ -147,9 +172,11 @@ static size_t count_entries(const uint8_t *img, size_t size) {
         if (memcmp(h->magic, USTAR_MAGIC, 5) != 0) break;
         size_t fsize = parse_octal(h->size, sizeof(h->size));
         char tf = h->typeflag;
-        /* '0' / NUL = regular file, '5' = directory. Skip everything
-         * else (links, char/block dev, fifo, GNU extensions...). */
-        if (tf == '0' || tf == 0 || tf == '5') count++;
+        /* '0' / NUL = regular file, '5' = directory, '1' = hard link (see
+         * the resolver in the fill pass). Still skipped: '2' symlinks (the
+         * VFS has no readlink hook for a driver to implement), char/block
+         * devices, fifos, GNU extensions. */
+        if (tf == '0' || tf == 0 || tf == '5' || tf == '1') count++;
         off += USTAR_BLOCK + round_up_block(fsize);
     }
     return count;
@@ -191,18 +218,81 @@ int ramfs_mount(const void *image, size_t size) {
         char tf = h->typeflag;
         size_t data_off = off + USTAR_BLOCK;
 
-        if (tf == '0' || tf == 0 || tf == '5') {
+        if (tf == '0' || tf == 0 || tf == '5' || tf == '1') {
             struct ramfs_node *nd = &nodes[idx];
             if (!copy_name(h->name, nd->name, sizeof(nd->name))) {
                 kprintf("[ramfs] WARN: skipping entry with overlong name\n");
             } else if (nd->name[0] == 0) {
                 /* root entry "./" or similar -- skip silently */
+            } else if (tf == '1') {
+                /* Hard link ('1'): no data of its own -- `linkname` names an
+                 * entry that appeared EARLIER in the archive, so a single
+                 * forward pass can resolve it against what we have already
+                 * parsed. Share the target's bytes; sharing a pointer into
+                 * the tar image is exactly right, since a hard link IS the
+                 * same data under a second name and the image is read-only.
+                 *
+                 * The self-referential case (name == linkname) is not a real
+                 * link: GNU tar emits it when the SAME staged file is passed
+                 * more than once in one archive's member list, which this
+                 * build does via overlapping $EXTRA_FILES trees. The regular
+                 * entry is already in the table, so these are pure
+                 * duplicates -- drop them rather than add a shadowing node.
+                 * All 14 hard links in the current initrd are this case. */
+                char target[VFS_PATH_MAX];
+                if (!copy_name(h->linkname, target, sizeof(target))) {
+                    kprintf("[ramfs] WARN: hard link '%s' has an overlong "
+                            "target\n", nd->name);
+                } else if (strcmp(target, nd->name) == 0) {
+                    /* tar's duplicate-member dedup -- silently ignore. */
+                } else {
+                    struct ramfs_node *tgt = 0;
+                    for (size_t j = 0; j < idx; j++) {
+                        if (strcmp(nodes[j].name, target) == 0) {
+                            tgt = &nodes[j];
+                            break;
+                        }
+                    }
+                    if (!tgt) {
+                        /* Forward reference or a target we skipped. Warn --
+                         * silently dropping it is how a file goes missing
+                         * with no evidence. */
+                        kprintf("[ramfs] WARN: hard link '%s' -> '%s': target "
+                                "not found, entry dropped\n",
+                                nd->name, target);
+                    } else {
+                        nd->type = tgt->type;
+                        nd->data = tgt->data;
+                        nd->size = tgt->size;
+                        /* A hard link shares the inode, so it shares the
+                         * inode's mode and ownership too -- the link's own
+                         * header fields are not authoritative. */
+                        nd->mode = tgt->mode;
+                        nd->uid  = tgt->uid;
+                        nd->gid  = tgt->gid;
+                        idx++;
+                    }
+                }
             } else {
+                /* USTAR mode/uid/gid are ASCII octal. parse_octal returns 0
+                 * for an unparseable field, and a 0 mode is indistinguishable
+                 * from that -- so treat 0 as "no usable mode" and fall back.
+                 * uid/gid legitimately ARE 0 (root), so they need no such
+                 * guard: an absent field simply reads as root, which is the
+                 * right answer for an initrd. */
+                uint32_t tmode = (uint32_t)parse_octal(h->mode, sizeof(h->mode));
+                nd->uid = (uint32_t)parse_octal(h->uid, sizeof(h->uid));
+                nd->gid = (uint32_t)parse_octal(h->gid, sizeof(h->gid));
+
                 if (tf == '5') {
                     nd->type = VFS_TYPE_DIR;
                     nd->data = 0;
                     nd->size = 0;
+                    nd->mode = tmode ? (tmode & VFS_MODE_PERMS)
+                                     : RAMFS_FALLBACK_DIR_MODE;
                 } else {
+                    nd->mode = tmode ? (tmode & VFS_MODE_PERMS)
+                                     : RAMFS_FALLBACK_FILE_MODE;
                     if (data_off + fsize > size) {
                         kprintf("[ramfs] reject: '%s' file data runs off "
                                 "image (%lu+%lu > %lu)\n",
@@ -292,11 +382,15 @@ static int ramfs_open(void *mnt, const char *path, struct vfs_file *out) {
     out->priv = nd;
     out->pos  = 0;
     out->size = nd->size;
-    /* ramfs is owned by root and world-readable but never writable;
+    /* The node's real identity, as recorded in the tar. Writability is NOT
+     * expressed here: ramfs leaves every write-side op NULL, so the VFS
+     * returns VFS_ERR_ROFS regardless of the mode bits. That is the Linux
+     * split -- the mode describes the FILE, read-only-ness is a property of
+     * the MOUNT -- and it is why a 0755 binary here still cannot be written.
      * MODE_VALID forces the VFS to enforce these bits explicitly. */
-    out->uid  = 0;
-    out->gid  = 0;
-    out->mode = 00444u | VFS_MODE_VALID;
+    out->uid  = nd->uid;
+    out->gid  = nd->gid;
+    out->mode = nd->mode | VFS_MODE_VALID;
     return VFS_OK;
 }
 
@@ -339,7 +433,8 @@ struct ramfs_diriter {
 static bool dirent_push_unique(struct vfs_dirent *list, size_t *n,
                                size_t cap,
                                const char *name, enum vfs_type type,
-                               size_t size) {
+                               size_t size,
+                               uint32_t mode, uint32_t uid, uint32_t gid) {
     for (size_t i = 0; i < *n; i++) {
         if (strcmp(list[i].name, name) == 0) return true;   /* dedup */
     }
@@ -351,10 +446,12 @@ static bool dirent_push_unique(struct vfs_dirent *list, size_t *n,
     e->name[nl] = 0;
     e->type = type;
     e->size = size;
-    /* Everything in the initrd is owned by root and read-only. */
-    e->uid  = 0;
-    e->gid  = 0;
-    e->mode = ((type == VFS_TYPE_DIR) ? 00555u : 00444u) | VFS_MODE_VALID;
+    /* Carried from the node (or the caller's synthesised values for an
+     * implicit directory) -- readdir must agree with stat, or `ls -l` and
+     * stat() describe the same file differently. */
+    e->uid  = uid;
+    e->gid  = gid;
+    e->mode = mode | VFS_MODE_VALID;
     (*n)++;
     return true;
 }
@@ -404,20 +501,27 @@ static int ramfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
         while (*slash && *slash != '/') slash++;
 
         if (*slash == 0) {
-            /* Direct child entry. */
+            /* Direct child entry -- report the node's own recorded mode. */
             if (!dirent_push_unique(it->ents, &it->count, cap, rest,
-                                    m->nodes[i].type, m->nodes[i].size)) {
+                                    m->nodes[i].type, m->nodes[i].size,
+                                    m->nodes[i].mode, m->nodes[i].uid,
+                                    m->nodes[i].gid)) {
                 break;
             }
         } else {
-            /* Implicit directory: emit the leading component. */
+            /* Implicit directory: emit the leading component. There is no
+             * tar header for it, so it gets the conventional root-owned
+             * 0755 -- matching what ramfs_stat() synthesises for the same
+             * path, which is the pairing that keeps readdir and stat
+             * consistent. */
             size_t leaf_len = (size_t)(slash - rest);
             char leaf[VFS_NAME_MAX];
             if (leaf_len >= sizeof(leaf)) leaf_len = sizeof(leaf) - 1;
             memcpy(leaf, rest, leaf_len);
             leaf[leaf_len] = 0;
             if (!dirent_push_unique(it->ents, &it->count, cap, leaf,
-                                    VFS_TYPE_DIR, 0)) {
+                                    VFS_TYPE_DIR, 0,
+                                    RAMFS_IMPLICIT_DIR_MODE, 0, 0)) {
                 break;
             }
         }
@@ -451,12 +555,23 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     char norm[VFS_PATH_MAX];
     if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
 
+    /* nlink was never assigned on ANY of the three paths below, so `ls -l`
+     * printed whatever junk the caller happened to have on its stack -- a
+     * visible "-r--r--r-- 1919954296 ..." (those digits are ASCII bytes read
+     * as an integer). Per struct vfs_stat, 0 means "this fs has no answer"
+     * and the stat emitters substitute the conventional 1-for-files /
+     * 2-for-directories, so setting 0 routes through that shared default
+     * rather than duplicating the policy here. */
+    out->nlink = 0;
+
+    /* The mount root has no tar header of its own -- same synthesised 0755
+     * as any other implicit directory. */
     if (norm[0] == 0) {
         out->type = VFS_TYPE_DIR;
         out->size = 0;
         out->uid  = 0;
         out->gid  = 0;
-        out->mode = 00555u | VFS_MODE_VALID;
+        out->mode = RAMFS_IMPLICIT_DIR_MODE | VFS_MODE_VALID;
         return VFS_OK;
     }
 
@@ -464,10 +579,9 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     if (nd) {
         out->type = nd->type;
         out->size = nd->size;
-        out->uid  = 0;
-        out->gid  = 0;
-        out->mode = ((nd->type == VFS_TYPE_DIR) ? 00555u : 00444u)
-                    | VFS_MODE_VALID;
+        out->uid  = nd->uid;
+        out->gid  = nd->gid;
+        out->mode = nd->mode | VFS_MODE_VALID;
         return VFS_OK;
     }
     /* Implicit directory? */
@@ -476,20 +590,101 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
         out->size = 0;
         out->uid  = 0;
         out->gid  = 0;
-        out->mode = 00555u | VFS_MODE_VALID;
+        out->mode = RAMFS_IMPLICIT_DIR_MODE | VFS_MODE_VALID;
         return VFS_OK;
     }
     return VFS_ERR_NOENT;
 }
 
-/* Write-side ops are all NULL -- the VFS layer translates a NULL hook
- * into VFS_ERR_ROFS, so callers see "read-only filesystem" cleanly. */
+/* ---- writes: COPY-ON-WRITE onto the heap ------------------------------
+ *
+ * WHY THIS EXISTS. A file's bytes normally point straight INTO the Limine
+ * initrd module (zero-copy: nd->data = img + off), which is why ramfs was
+ * read-only. But a read-only root is a DEVIATION, not a design: Linux's
+ * initramfs is a writable tmpfs, and the deviation had a real cost. DHCP
+ * learns the nameserver and net_write_resolv_conf() rewrites
+ * /etc/resolv.conf -- except the write silently failed here, so the resolver
+ * kept using the address baked into the initrd. In QEMU that address is
+ * accidentally correct (SLIRP hands out exactly the 10.0.2.3 the file names);
+ * on real hardware every name lookup went to a host that does not exist and
+ * Chromium reported ERR_NAME_NOT_RESOLVED with nothing in the log to explain
+ * it.
+ *
+ * SCOPE, DELIBERATELY NARROW: an EXISTING file can be overwritten; a NEW file
+ * still cannot be created and nothing can be unlinked or mkdir'd. That keeps
+ * "you cannot add to /" true -- which existing behaviour and tests rely on --
+ * while fixing the case that actually bit. Widening it later is additive.
+ *
+ * The first write to a tar-backed node kmallocs a private buffer and repoints
+ * `data` at it; `owned` then says the buffer is ours to free and grow. The
+ * initrd image itself is NEVER modified -- it is shared, and on a real boot it
+ * is the module Limine loaded. */
+static int ramfs_cow(struct ramfs_node *nd, size_t need) {
+    if (nd->owned && need <= nd->cap) return VFS_OK;
+    size_t cap = nd->owned ? nd->cap : 0;
+    if (cap < need) cap = need < 64 ? 64 : need;
+    uint8_t *buf = (uint8_t *)kmalloc(cap);
+    if (!buf) return VFS_ERR_NOMEM;
+    memset(buf, 0, cap);
+    if (nd->data && nd->size) {
+        size_t keep = nd->size < cap ? nd->size : cap;
+        memcpy(buf, nd->data, keep);
+    }
+    if (nd->owned && nd->data) kfree((void *)nd->data);
+    nd->data  = buf;
+    nd->cap   = cap;
+    nd->owned = true;
+    return VFS_OK;
+}
+
+static long ramfs_write(struct vfs_file *f, const void *buf, size_t n) {
+    struct ramfs_node *nd = (struct ramfs_node *)f->priv;
+    if (!nd) return VFS_ERR_INVAL;
+    if (nd->type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
+    if (n == 0) return 0;
+    size_t need = f->pos + n;
+    if (need < f->pos) return VFS_ERR_INVAL;          /* offset overflow */
+    int rc = ramfs_cow(nd, need);
+    if (rc != VFS_OK) return rc;
+    memcpy((uint8_t *)nd->data + f->pos, buf, n);
+    f->pos += n;
+    if (need > nd->size) nd->size = need;
+    f->size = nd->size;
+    return (long)n;
+}
+
+/* vfs_write_all() calls create() before open(), and treats VFS_ERR_EXIST as
+ * "fine, carry on" -- so this hook is what makes that helper usable here. It
+ * TRUNCATES, matching the contract vfs_write_all documents ("create() on a
+ * file that already exists is OK -- we then truncate"). Without the truncate a
+ * shorter replacement would leave the tail of the old contents behind, which
+ * for resolv.conf would mean two nameserver lines. */
+static int ramfs_create(void *mnt, const char *path, uint32_t mode,
+                        uint32_t uid, uint32_t gid) {
+    /* mode/uid/gid are ignored on purpose: this hook never creates anything,
+     * so there is no new file whose ownership they could describe. The
+     * existing node keeps the identity the USTAR header gave it. */
+    (void)mode; (void)uid; (void)gid;
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    char norm[VFS_PATH_MAX];
+    if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
+    struct ramfs_node *nd = find_node(m, norm);
+    if (!nd) return VFS_ERR_ROFS;      /* creating NEW files stays unsupported */
+    if (nd->type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
+    int rc = ramfs_cow(nd, 1);
+    if (rc != VFS_OK) return rc;
+    nd->size = 0;                                            /* truncate */
+    return VFS_ERR_EXIST;
+}
+
+/* unlink/mkdir stay NULL -- the VFS turns a NULL hook into VFS_ERR_ROFS, so
+ * the root is still not something you can add to or remove from. */
 const struct vfs_ops ramfs_ops = {
     .open     = ramfs_open,
     .close    = ramfs_close,
     .read     = ramfs_read,
-    .write    = 0,
-    .create   = 0,
+    .write    = ramfs_write,
+    .create   = ramfs_create,
     .unlink   = 0,
     .mkdir    = 0,
     .opendir  = ramfs_opendir,

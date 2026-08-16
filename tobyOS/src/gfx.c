@@ -756,7 +756,22 @@ void gfx_blit(int dst_x, int dst_y, int w, int h,
 
 /* Source-over blend using the SIMD-friendly "parallel channel" trick:
  * Process R+B in one 32-bit word, G in another, avoiding per-channel
- * extract/insert. Uses (x * a + 128) >> 8 ≈ x * a / 255. */
+ * extract/insert.
+ *
+ * DIVIDES BY 255, NOT 256. The old form was `(x*a + 128) >> 8`, described in
+ * this very comment as "~= x*a/255" -- and that approximation is what made
+ * display_alpha FAIL on real hardware: 50% red over mid-grey gave 9f2020 where
+ * the exact answer is a02020. Every blended pixel in the UI was ~0.4% dark, and
+ * the boot self-test had been reporting it as a [FAIL] the whole time.
+ *
+ * The exact rounded form of x/255 is (t + (t>>8)) >> 8 with t = x + 128. It
+ * costs one add and one shift more, which is nothing next to the multiply.
+ *
+ * THE PACKED LANE IS THE TRAP: t holds R in bits 16..31 and B in bits 0..15,
+ * so a bare `t >> 8` drags R's low bits down into B's lane. Masking the shifted
+ * value with 0x00FF00FF keeps each lane's carry inside itself. Lane overflow is
+ * impossible: t peaks at 255*255 + 128 = 65153, and t + (t>>8) at 65407, both
+ * under 65536. */
 static inline uint32_t blend_src_over(uint32_t dst_xrgb, uint32_t src_argb) {
     uint32_t a = src_argb >> 24;
     if (__builtin_expect(a == 0, 0))   return dst_xrgb;
@@ -765,12 +780,13 @@ static inline uint32_t blend_src_over(uint32_t dst_xrgb, uint32_t src_argb) {
     /* RB channels packed: mask out G, multiply both R and B in parallel */
     uint32_t src_rb = src_argb & 0x00FF00FFu;
     uint32_t dst_rb = dst_xrgb & 0x00FF00FFu;
-    uint32_t out_rb = (src_rb * a + dst_rb * inv + 0x00800080u) >> 8;
-    out_rb &= 0x00FF00FFu;
-    /* G channel */
+    uint32_t t_rb   = src_rb * a + dst_rb * inv + 0x00800080u;
+    uint32_t out_rb = ((t_rb + ((t_rb >> 8) & 0x00FF00FFu)) >> 8) & 0x00FF00FFu;
+    /* G channel (scalar, so the plain exact form is fine) */
     uint32_t src_g = (src_argb >> 8) & 0xFFu;
     uint32_t dst_g = (dst_xrgb >> 8) & 0xFFu;
-    uint32_t out_g = ((src_g * a + dst_g * inv + 128u) >> 8) & 0xFFu;
+    uint32_t t_g   = src_g * a + dst_g * inv + 128u;
+    uint32_t out_g = ((t_g + (t_g >> 8)) >> 8) & 0xFFu;
     return out_rb | (out_g << 8);
 }
 
