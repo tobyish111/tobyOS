@@ -2636,21 +2636,144 @@ static void cmd_mkdir(int argc, char **argv) {
     }
 }
 
+/* Slice 127: recursive delete.
+ *
+ * `rm` could only ever remove a file or an EMPTY directory, which means an
+ * ordinary directory TREE could not be deleted from this OS at all -- a
+ * chrome profile is thousands of files deep and hand-unlinking it is not a
+ * thing a person can do. Found the practical way: a corrupt
+ * /data/cr2 needed clearing and there was no command that could.
+ *
+ * Depth is bounded and the recursion carries ONE path buffer that it
+ * appends to and truncates on the way back out, rather than a buffer per
+ * level: this runs on the kernel stack, where VFS_PATH_MAX per frame would
+ * be the thing that overflows first on a deep tree.
+ *
+ * Returns 0 on success, -1 if anything could not be removed (the caller
+ * reports; each individual failure is printed as it happens so a partial
+ * delete says exactly what survived). */
+#define RM_MAX_DEPTH 32
+
+static int rm_tree(char *path, size_t len, size_t cap, int depth, bool force) {
+    struct vfs_stat st;
+    int rc = vfs_stat(path, &st);
+    if (rc != VFS_OK) {
+        if (!force) kprintf("rm: '%s': %s\n", path, vfs_strerror(rc));
+        return force ? 0 : -1;
+    }
+
+    if (st.type == VFS_TYPE_DIR) {
+        if (depth >= RM_MAX_DEPTH) {
+            kprintf("rm: '%s': directory nested deeper than %d -- stopping\n",
+                    path, RM_MAX_DEPTH);
+            return -1;
+        }
+        /* Re-open the directory after every removal. The readdir cursor is
+         * an index into a directory whose entries we are actively deleting,
+         * so holding it across an unlink would skip entries -- delete one,
+         * rewind, repeat until a full pass finds nothing left to take. */
+        for (;;) {
+            struct vfs_dir d;
+            if (vfs_opendir(path, &d) != VFS_OK) break;
+            struct vfs_dirent ent;
+            bool removed_one = false;
+            while (vfs_readdir(&d, &ent) == VFS_OK) {
+                if (ent.name[0] == '.' &&
+                    (ent.name[1] == 0 || (ent.name[1] == '.' && ent.name[2] == 0)))
+                    continue;
+                size_t nlen = strlen(ent.name);
+                /* +1 for the separator we may add, +1 for the NUL. */
+                if (len + 1 + nlen + 1 > cap) {
+                    kprintf("rm: path too long under '%s' -- skipping '%s'\n",
+                            path, ent.name);
+                    continue;
+                }
+                size_t save = len;
+                if (len == 0 || path[len - 1] != '/') path[len++] = '/';
+                memcpy(path + len, ent.name, nlen);
+                len += nlen;
+                path[len] = 0;
+
+                int sub = rm_tree(path, len, cap, depth + 1, force);
+
+                len = save; path[len] = 0;          /* truncate back */
+                if (sub != 0) { vfs_closedir(&d); return -1; }
+                removed_one = true;
+                break;                              /* rewind: reopen */
+            }
+            vfs_closedir(&d);
+            if (!removed_one) break;                /* a clean pass: empty */
+        }
+    }
+
+    rc = vfs_unlink(path);
+    if (rc != VFS_OK) {
+        if (!force || rc != VFS_ERR_NOENT) {
+            kprintf("rm: '%s': %s\n", path, vfs_strerror(rc));
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static void cmd_rm(int argc, char **argv) {
-    if (argc < 2) {
-        kprintf("usage: rm <path>      (file or empty directory)\n");
+    bool recursive = false, force = false;
+    int  argi = 1;
+    for (; argi < argc && argv[argi][0] == '-' && argv[argi][1]; argi++) {
+        for (const char *f = argv[argi] + 1; *f; f++) {
+            if      (*f == 'r' || *f == 'R') recursive = true;
+            else if (*f == 'f')              force     = true;
+            else {
+                kprintf("rm: unknown option -%c\n", *f);
+                shell_set_status(1);
+                return;
+            }
+        }
+    }
+    if (argi >= argc) {
+        kprintf("usage: rm [-r] [-f] <path>...   (-r: recurse into directories)\n");
         shell_set_status(1);
         return;
     }
-    char path[VFS_PATH_MAX];
-    if (shell_resolve_path_arg(argv[1], path, sizeof(path), "rm") < 0) return;
-    int rc = vfs_unlink(path);
-    if (rc != VFS_OK) {
-        kprintf("rm: '%s': %s\n", argv[1], vfs_strerror(rc));
-        shell_set_status(1);
-    } else {
-        shell_set_status(0);
+
+    int failed = 0;
+    for (; argi < argc; argi++) {
+        char path[VFS_PATH_MAX];
+        if (shell_resolve_path_arg(argv[argi], path, sizeof(path), "rm") < 0) {
+            failed = 1;
+            continue;
+        }
+        /* Refuse to recurse from the root. Not paranoia about the user --
+         * `rm -r /` here would walk into /proc and /sys and try to unlink
+         * synthesised nodes, and the first confusing failure would come
+         * from a filesystem the user never meant to touch. */
+        if (recursive && path[0] == '/' && path[1] == 0) {
+            kprintf("rm: refusing to recurse from '/'\n");
+            failed = 1;
+            continue;
+        }
+        if (recursive) {
+            if (rm_tree(path, strlen(path), sizeof(path), 0, force) != 0)
+                failed = 1;
+        } else {
+            int rc = vfs_unlink(path);
+            if (rc != VFS_OK) {
+                if (force && rc == VFS_ERR_NOENT) continue;
+                /* This VFS has no distinct "directory not empty" code, so a
+                 * failed unlink on a directory is ambiguous. Stat it and say
+                 * the useful thing rather than echoing a generic errno at
+                 * someone who just wants the tree gone. */
+                struct vfs_stat st;
+                if (vfs_stat(path, &st) == VFS_OK && st.type == VFS_TYPE_DIR)
+                    kprintf("rm: '%s' is a directory -- use -r to remove it "
+                            "and its contents\n", argv[argi]);
+                else
+                    kprintf("rm: '%s': %s\n", argv[argi], vfs_strerror(rc));
+                failed = 1;
+            }
+        }
     }
+    shell_set_status(failed);
 }
 
 /* `write <path> <text...>` -- joins all remaining args with single
@@ -5055,7 +5178,7 @@ static const struct cmd cmds[] = {
     { "cat",    "cat <path>: print a file",     cmd_cat    },
     { "touch",  "touch <path>: create empty file (RW mounts)", cmd_touch },
     { "mkdir",  "mkdir <path>: create directory (RW mounts)",  cmd_mkdir },
-    { "rm",     "rm <path>: delete file/empty dir (RW mounts)",cmd_rm    },
+    { "rm",     "rm [-r] [-f] <path>...: delete file or tree (RW mounts)", cmd_rm },
     { "write",  "write <path> <text>: write/overwrite file",   cmd_write },
     { "mounts", "list mounted filesystems",     cmd_mounts },
     { "run",    "run <path> [args]: spawn ring-3 process (fg)", cmd_run},

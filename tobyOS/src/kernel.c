@@ -3285,6 +3285,43 @@ void _start(void) {
          * semantics: world-writable. Applied at MOUNT, not just at format,
          * because volumes provisioned by earlier builds are already 0755 on
          * disk and would stay broken forever. Idempotent and logged. */
+#ifdef RMTREE_SELFTEST
+        /* Slice 127: prove `rm -r` on a real tree, on the real filesystem.
+         * Runs before the desktop so the assertions are early in the log.
+         * Opt-in only -- it creates and deletes /data/.rmtest. */
+        if (data_mounted) {
+            struct vfs_stat st;
+            int fails = 0;
+            kprintf("[RMTREE] building /data/.rmtest ...\n");
+            shell_run_test_line("mkdir /data/.rmtest");
+            shell_run_test_line("mkdir /data/.rmtest/a");
+            shell_run_test_line("mkdir /data/.rmtest/a/b");
+            shell_run_test_line("write /data/.rmtest/top.txt hello");
+            shell_run_test_line("write /data/.rmtest/a/mid.txt hello");
+            shell_run_test_line("write /data/.rmtest/a/b/leaf.txt hello");
+            if (vfs_stat("/data/.rmtest/a/b/leaf.txt", &st) != VFS_OK) {
+                kprintf("[RMTREE] FAIL: could not build the tree\n"); fails++;
+            }
+            /* Plain rm must REFUSE a non-empty directory (and say why). */
+            shell_run_test_line("rm /data/.rmtest");
+            if (vfs_stat("/data/.rmtest", &st) != VFS_OK) {
+                kprintf("[RMTREE] FAIL: plain rm deleted a non-empty tree\n");
+                fails++;
+            } else {
+                kprintf("[RMTREE] ok: plain rm refused the directory\n");
+            }
+            /* -r must remove it entirely. */
+            shell_run_test_line("rm -r /data/.rmtest");
+            if (vfs_stat("/data/.rmtest", &st) == VFS_OK) {
+                kprintf("[RMTREE] FAIL: tree survived rm -r\n"); fails++;
+            } else {
+                kprintf("[RMTREE] ok: rm -r removed the whole tree\n");
+            }
+            /* -f on a missing path must be silent and succeed. */
+            shell_run_test_line("rm -f /data/.rmtest/nope");
+            kprintf("[RMTREE] VERDICT: %s\n", fails ? "FAIL" : "PASS");
+        }
+#endif
         if (data_mounted) {
             struct vfs_stat dst;
             if (vfs_stat("/data", &dst) == VFS_OK &&
