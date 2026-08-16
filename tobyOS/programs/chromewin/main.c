@@ -1304,6 +1304,41 @@ static int spawn_chrome(void) {
              * further down, not added here. Chrome keeps only the LAST
              * --vmodule on the command line (slice 89 cost a whole run to
              * that), so a second one here would silently disable itself. */
+#elif defined(CW_SWGL)
+            /* Slice 123: WebGL that EXISTS, via ANGLE-on-SwiftShader.
+             *
+             * This is NOT a reopening of tier 3. Tier 3 asked "can chrome
+             * raster on the HOST GPU faster than CPU raster" and was closed
+             * with a measured no. This asks a different question with a
+             * different answer at stake: chrome here reports
+             * `tobygl ctx=NONE` -- not slow WebGL, NO WebGL -- and a
+             * Chrome 151 with no WebGL context at all is a genuine anomaly
+             * that every fingerprinting gate can see for free. SwiftShader
+             * is pure CPU rasterisation, so it needs no host GPU, behaves
+             * identically in QEMU and on the EliteDesk, and cannot drag the
+             * virgl/Mesa road back open.
+             *
+             * The pieces were staged all along and simply switched off: the
+             * headless-shell distribution ships libEGL/libGLESv2 (ANGLE),
+             * libvulkan.so.1, libvk_swiftshader.so and its ICD json, and
+             * VK_ICD_FILENAMES already points at that json in software
+             * builds. What blocked WebGL was this very flag set --
+             * --disable-gpu kills the GPU host entirely, and --disable-vulkan
+             * removes the one API ANGLE's SwiftShader backend speaks.
+             *
+             * --enable-unsafe-swiftshader is REQUIRED, not optional garnish:
+             * modern Chromium refuses to satisfy a WebGL context from
+             * SwiftShader without it (the fallback was gated for security
+             * after GPU-process sandbox concerns), and a build missing it
+             * fails exactly like a build with no SwiftShader at all --
+             * ctx=NONE, no error. gl_renderer_probe() below is the arbiter:
+             * a renderer string naming SwiftShader means this worked, and
+             * ctx=NONE means it did not, whatever the flags claim. */
+            (char *)"--use-gl=angle",
+            (char *)"--use-angle=swiftshader",
+            (char *)"--enable-unsafe-swiftshader",
+            (char *)"--ignore-gpu-blocklist",
+            (char *)"--ozone-platform=headless",
 #else
             (char *)"--disable-gpu",
             (char *)"--disable-vulkan",
@@ -1480,8 +1515,17 @@ static int spawn_chrome(void) {
             /* DISPLAY is deliberately ABSENT in CW_GL builds: run 1 proved
              * that giving GPU-enabled chrome an X display sends it into
              * libX11/GLX, where it CHECK-crashes against our stub server.
-             * Software mode still wants it (the tier-2.5 era paths). */
+             * Software mode still wants it (the tier-2.5 era paths).
+             *
+             * Slice 123: CW_SWGL is withheld it for the SAME reason as
+             * CW_GL. That crash was about a GPU-ENABLED chrome finding a
+             * display, not about which GL backend it settles on -- and
+             * CW_SWGL is GPU-enabled by construction (that is the whole
+             * point). Ozone headless + no DISPLAY leaves ANGLE the road we
+             * want it on. */
+#ifndef CW_SWGL
             (char *)"DISPLAY=:0",
+#endif
 #endif
 #ifdef CW_GL
             /* Phase 1d: the EXACT env slice 105 measured "GL_RENDERER: virgl"
@@ -3007,6 +3051,66 @@ int main(void) {
                 g_ping_sent_ms = nowp;
             }
         }
+
+#ifdef CW_CLICK_AT
+        /* Slice 126: SCRIPTED CLICKS, so an INTERACTIVE failure can be
+         * reproduced without a human at the keyboard.
+         *
+         * The reCAPTCHA report ("renders for the first few, then not
+         * properly, so I can't finish it") is invisible to every harness we
+         * have: cwnet.sh loads a URL and never clicks, so it can reach the
+         * challenge page but never the tile phase where the failure lives.
+         *
+         * CW_CLICK_AT is "t,x,y:t,x,y:..." with t in ms after the CDP
+         * session comes up. THE RECORD SEPARATOR IS ':' AND THAT IS A BUILD
+         * CONSTRAINT, not a taste: PROG_EXTRA_CFLAGS is expanded UNQUOTED
+         * inside make's recipe shell, so a ';' in the value terminates the
+         * clang command mid-flag ("clang: error: no input files", which
+         * looks like a broken makefile rather than a bad -D). ';' is still
+         * accepted by the parser for anyone editing the string in C.
+         *
+         * Clicks are dispatched through the SAME
+         * Input.dispatchMouseEvent path a real TobyTK click takes -- browser
+         * level, so they land in cross-origin iframes (the reCAPTCHA anchor
+         * and challenge frames) exactly as a user's would, which a
+         * page-context script could never do. Combined with run_watch.py's
+         * timed screendumps, that turns "it looks wrong on my screen" into a
+         * reproducible before/after image pair. */
+        {
+            static long t_base;
+            static int  click_idx;
+            long nowc = sys_clock_ms();
+            if (!t_base && g_session[0]) t_base = nowc;
+            if (t_base) {
+                /* Re-walk the string each time rather than caching a cursor:
+                 * the list is a handful of entries and this keeps the parser
+                 * stateless (no pointer to invalidate, nothing to get out of
+                 * step with click_idx). */
+                const char *p = CW_CLICK_AT;
+                for (int i = 0; i < click_idx && *p; i++) {
+                    while (*p && *p != ':' && *p != ';') p++;
+                    if (*p == ':' || *p == ';') p++;
+                }
+                if (*p) {
+                    long t = atol(p);
+                    const char *c1 = strchr(p, ',');
+                    const char *c2 = c1 ? strchr(c1 + 1, ',') : 0;
+                    if (c1 && c2 && (nowc - t_base) >= t) {
+                        int cx = atoi(c1 + 1), cy = atoi(c2 + 1);
+                        printf("[cwclick] #%d t=%ldms -> (%d,%d)\n",
+                               click_idx, t, cx, cy);
+                        /* Move first: a press with no prior move lands on a
+                         * page that never saw hover, and some widgets (the
+                         * reCAPTCHA checkbox among them) gate on it. */
+                        send_mouse("mouseMoved",    cx, cy, 0, 0);
+                        send_mouse("mousePressed",  cx, cy, 0, 1);
+                        send_mouse("mouseReleased", cx, cy, 0, 1);
+                        click_idx++;
+                    }
+                }
+            }
+        }
+#endif
 
 #ifdef IPC_SIZE_LADDER
         /* One rung every 3s, starting 5s in (after the MSE test settles). */
