@@ -198,6 +198,10 @@ int tobyfs_format(struct blk_dev *dev);
  * opaque mount-data back to its backing block device. */
 const void *tobyfs_ops_addr(void);
 struct blk_dev *tobyfs_blkdev_of(void *mnt);
+/* Slice 122c: the mounted volume's true on-disk extent in 512-byte sectors
+ * (superblock total_blocks, NOT the compile-time minimum). For placing swap
+ * strictly past the filesystem. */
+uint64_t tobyfs_total_sectors(void *mnt);
 
 /* ============================================================
  *  Milestone 28E: filesystem integrity checker.

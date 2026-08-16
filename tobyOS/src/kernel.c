@@ -268,6 +268,22 @@ static struct blk_dev *ramdata_device(void) {
     return &g_ramdata_dev;
 }
 
+/* Slice 122c: resolve the block device backing the /data mount AND the
+ * filesystem's true extent, for swap placement. Only a tobyfs /data counts
+ * -- that is the only mount swap may ever share a device with. */
+struct swap_data_walk { struct blk_dev *dev; uint64_t fs_sectors; };
+
+static bool swap_data_mount_cb(const char *mount_point,
+                               const struct vfs_ops *ops,
+                               void *mount_data, void *cookie) {
+    struct swap_data_walk *w = (struct swap_data_walk *)cookie;
+    if (!mount_point || strcmp(mount_point, "/data") != 0) return true;
+    if (ops != tobyfs_ops_addr()) return true;
+    w->dev        = tobyfs_blkdev_of(mount_data);
+    w->fs_sectors = tobyfs_total_sectors(mount_data);
+    return false;                                   /* found; stop walking */
+}
+
 /* New subsystem headers */
 extern void devmgr_init(void);
 extern void devmgr_enumerate(void);
@@ -3820,8 +3836,29 @@ void _start(void) {
         vfs_dump_mounts();
 
         if (data_mounted) {
-            swap_init(TFS_TOTAL_BLOCKS * TFS_SECTORS_PER_BLOCK,
-                      SWAP_SLOT_COUNT * SWAP_SECTORS_PER_PAGE);
+            /* Slice 122c: disk swap goes on THE DEVICE /data LIVES ON, in
+             * the area past the tobyfs blocks -- or nowhere. The old
+             * swap_init() picked blk_first_partition() blindly, which on
+             * the EliteDesk was ahci0:p0.p1: the WINDOWS EFI SYSTEM
+             * PARTITION, armed for writes at LBA 8192 (and reclaim -- the
+             * thing that calls swap_out -- has been wired since 08-13).
+             * "ramdata" is excluded by name: the RAM-backed fallback also
+             * mounts /data, and swapping RAM out to a RAM disk is motion
+             * without progress; zram already covers that case. */
+            /* The base is the mounted volume's TRUE extent, not the stale
+             * TFS_TOTAL_BLOCKS compile-time minimum -- that constant is
+             * 4 MiB, which lands INSIDE the filesystem of every dynamically
+             * sized volume, so disk swap-outs would have corrupted /data's
+             * own files even on the correct device. */
+            struct swap_data_walk sdw = { 0, 0 };
+            vfs_iter_mounts(swap_data_mount_cb, &sdw);
+            if (sdw.dev && sdw.dev->name &&
+                strcmp(sdw.dev->name, "ramdata") != 0 && sdw.fs_sectors) {
+                swap_init_dev(sdw.dev, sdw.fs_sectors,
+                              SWAP_SLOT_COUNT * SWAP_SECTORS_PER_PAGE);
+            } else {
+                swap_init_dev(NULL, 0, 0);   /* zram-only eviction */
+            }
         }
     }
 

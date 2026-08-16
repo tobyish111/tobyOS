@@ -65,7 +65,22 @@ void swap_init_dev(struct blk_dev *dev, uint64_t swap_partition_lba,
     zram_init();
 
     g_swap_dev = dev;
-    if (g_swap_dev && swap_size_sectors >= SWAP_SLOT_COUNT * SWAP_SECTORS_PER_PAGE) {
+    /* Slice 122c: BOUNDS-CHECK AGAINST THE DEVICE, not just the size the
+     * caller claims. The swap area must fit entirely inside the device
+     * beyond lba_base, or a swap_out would write past the volume -- and
+     * before this slice the device was picked BLINDLY (see the note below),
+     * so "past the volume" once meant "into the Windows EFI partition". */
+    uint64_t need = (uint64_t)SWAP_SLOT_COUNT * SWAP_SECTORS_PER_PAGE;
+    if (g_swap_dev && g_swap_lba_base + need > g_swap_dev->sector_count) {
+        kprintf("swap: '%s' too small for swap area (need LBA %lu..%lu, "
+                "device has %lu) -- zram-only eviction\n",
+                g_swap_dev->name ? g_swap_dev->name : "?",
+                (unsigned long)g_swap_lba_base,
+                (unsigned long)(g_swap_lba_base + need),
+                (unsigned long)g_swap_dev->sector_count);
+        g_swap_dev = NULL;
+    }
+    if (g_swap_dev && swap_size_sectors >= need) {
         g_swap_ready = true;
         kprintf("swap: initialized %d slots (%d MB) on %s at LBA %lu (+zram)\n",
                 SWAP_SLOT_COUNT,
@@ -77,11 +92,14 @@ void swap_init_dev(struct blk_dev *dev, uint64_t swap_partition_lba,
     }
 }
 
-void swap_init(uint64_t swap_partition_lba, uint64_t swap_size_sectors) {
-    struct blk_dev *dev = blk_first_partition();
-    if (!dev) dev = blk_first_disk();
-    swap_init_dev(dev, swap_partition_lba, swap_size_sectors);
-}
+/* Slice 122c: the old swap_init() is GONE, deliberately. It picked
+ * blk_first_partition() -- whatever partition happened to register first --
+ * and armed disk swap on it with no identity check at all. On the EliteDesk
+ * that was ahci0:p0.p1, THE WINDOWS EFI SYSTEM PARTITION: one incompressible
+ * page evicted under memory pressure (reclaim is wired since 2026-08-13)
+ * would have overwritten the user's bootloader 4 MiB in. Swap now only ever
+ * targets the device /data actually lives on -- the caller resolves it and
+ * calls swap_init_dev directly; there is no blind fallback to fall back to. */
 
 static int find_free_slot(void) {
     for (int i = 0; i < SWAP_SLOT_COUNT; i++) {

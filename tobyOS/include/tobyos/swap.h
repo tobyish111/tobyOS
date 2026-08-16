@@ -32,14 +32,16 @@ struct swap_entry {
     int      zram_slot;     /* zram slot id when compressed */
 };
 
-/* Initialize swap with a backing block device partition.
- * swap_partition_lba: starting LBA on the block device
- * swap_size_sectors: size of swap area in 512-byte sectors */
-void swap_init(uint64_t swap_partition_lba, uint64_t swap_size_sectors);
-
-/* Like swap_init but with an explicit backing device (used by the
- * memory-compression self-test so it can target a ramdev instead of a
- * real disk). swap_init() picks the device automatically and calls this. */
+/* Initialize swap with an EXPLICIT backing device (NULL = zram-only).
+ * swap_partition_lba: starting LBA on that device
+ * swap_size_sectors:  size of the swap area in 512-byte sectors
+ *
+ * Slice 122c: the old swap_init(), which picked blk_first_partition()
+ * automatically, is deleted -- on a machine with a foreign disk that
+ * "first partition" was the Windows EFI system partition, and disk swap
+ * would have written into it. The caller must resolve the device /data
+ * actually lives on and refuse the RAM fallback; see the kernel.c call
+ * site. Bounds are re-checked here against dev->sector_count. */
 void swap_init_dev(struct blk_dev *dev, uint64_t swap_partition_lba,
                    uint64_t swap_size_sectors);
 

@@ -1513,6 +1513,17 @@ struct blk_dev *tobyfs_blkdev_of(void *mnt) {
     return fs ? fs->dev : 0;
 }
 
+/* Slice 122c: the filesystem's TRUE on-disk extent in 512-byte sectors, so
+ * the swap placer can start past it. TFS_TOTAL_BLOCKS (the compile-time
+ * 4 MiB minimum) is NOT the answer for dynamically-sized volumes -- placing
+ * swap at that stale constant put it INSIDE the live filesystem of every
+ * volume larger than the minimum. */
+uint64_t tobyfs_total_sectors(void *mnt) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    if (!fs) return 0;
+    return (uint64_t)fs->sb.total_blocks * TFS_SECTORS_PER_BLOCK;
+}
+
 /* -------- mount -------- */
 
 int tobyfs_mount(const char *mount_point, struct blk_dev *dev) {
