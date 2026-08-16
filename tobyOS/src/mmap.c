@@ -1820,10 +1820,23 @@ long mmap_map_phys_user(uint64_t phys, uint64_t len) {
  * implementation needs msync/close writeback and eviction.
  * ================================================================== */
 
-/* One entry per SHARED-MAPPED FILE, not per inode NUMBER. Chrome creates ~40
- * regions in a run and each needs its own entry now that they no longer
- * (wrongly) collapse onto a recycled inode number -- see shm_cache_detach_ino. */
-#define SHMCACHE_MAX 256
+/* One entry per SHARED-MAPPED FILE, not per inode NUMBER.
+ *
+ * SIZE + RECLAIM (slice 122): this was 256 permanent entries, sized when
+ * "chrome creates ~40 regions in a run" -- and one Bing search page consumed
+ * EXACTLY 256 (measured: the 256th CREATED is the last line the [shm] trace
+ * ever printed). Every region after that fell through to the silent copying
+ * path, where each mapper gets a private snapshot of a freshly-zeroed file:
+ * the producer's bytes land where no consumer can see them, so V8 parsed
+ * 34498 NUL bytes with a straight face and the whole SERP rendered white.
+ * No syscall fails anywhere on that path -- the only symptom is data that
+ * quietly stops being shared. Hence two changes:
+ *   1. entries are refcounted (pins = struct files carrying the f->shm pin)
+ *      and DEAD entries -- no pins, no live mappings -- are reaped when the
+ *      table fills, so long sessions stop leaking toward the cliff;
+ *   2. the cliff itself is LOUD now (see the fall-through log in
+ *      shm_slot_alloc), because a silent one cost a day of forensics. */
+#define SHMCACHE_MAX 1024
 
 struct shm_cache {
     bool      used;
@@ -1832,9 +1845,38 @@ struct shm_cache {
     uint64_t *pages;        /* physical page addrs; index i == file page i */
     size_t    npages;
     size_t    cap;
+    int       pins;         /* struct files whose f->shm points here */
 };
 
 static struct shm_cache g_shm[SHMCACHE_MAX];
+
+void shm_cache_pin(struct shm_cache *sc)   { if (sc) sc->pins++; }
+void shm_cache_unpin(struct shm_cache *sc) { if (sc && sc->pins > 0) sc->pins--; }
+
+/* True if nothing can ever reach this entry again: no fd carries the pin
+ * (so no future mmap can attach through a descriptor), and no address space
+ * still maps its pages (each mapping holds a page reference on top of the
+ * cache's own one, so ref==1 everywhere means the cache is the last holder).
+ * A future by-(ino,gen) attach is impossible for chrome's regions -- the
+ * file is unlinked at birth, so once the descriptors are gone the identity
+ * is unreachable. */
+static bool shm_slot_dead(const struct shm_cache *sc) {
+    if (sc->pins > 0) return false;
+    for (size_t i = 0; i < sc->npages; i++)
+        if (sc->pages[i] && page_ref_get(sc->pages[i]) != 1) return false;
+    return true;
+}
+
+static void shm_slot_free(struct shm_cache *sc) {
+    for (size_t i = 0; i < sc->npages; i++) {
+        if (sc->pages[i]) {
+            page_ref_dec(sc->pages[i]);         /* drop the cache's own ref */
+            pmm_free_page(sc->pages[i]);
+        }
+    }
+    if (sc->pages) kfree(sc->pages);
+    memset(sc, 0, sizeof(*sc));
+}
 
 static struct shm_cache *shm_slot_alloc(uint64_t ino, uint64_t gen) {
     for (int i = 0; i < SHMCACHE_MAX; i++) {
@@ -1843,9 +1885,40 @@ static struct shm_cache *shm_slot_alloc(uint64_t ino, uint64_t gen) {
             g_shm[i].ino  = ino;
             g_shm[i].gen  = gen;
             g_shm[i].pages = 0; g_shm[i].npages = 0; g_shm[i].cap = 0;
+            g_shm[i].pins  = 0;
             return &g_shm[i];
         }
     }
+    /* Table full: reap ONE dead entry and take its slot. Lazy on purpose --
+     * below the cap this function behaves exactly as before. */
+    for (int i = 0; i < SHMCACHE_MAX; i++) {
+        if (g_shm[i].used && shm_slot_dead(&g_shm[i])) {
+            {   static int rl = 0;
+                if (rl < 8) { rl++;
+                    kprintf("[shm] cache full: reaped dead region ino=%lu/%lu "
+                            "(%lu pages) for %lu/%lu\n",
+                            (unsigned long)g_shm[i].ino,
+                            (unsigned long)g_shm[i].gen,
+                            (unsigned long)g_shm[i].npages,
+                            (unsigned long)ino, (unsigned long)gen);
+                } }
+            shm_slot_free(&g_shm[i]);
+            g_shm[i].used = true;
+            g_shm[i].ino  = ino;
+            g_shm[i].gen  = gen;
+            return &g_shm[i];
+        }
+    }
+    /* Still full: the caller falls back to COPYING, which un-shares this
+     * region -- readers of the copy will see zeros, not the writer's bytes.
+     * That outcome must NEVER be silent again. */
+    {   static int fl = 0;
+        if (fl < 16) { fl++;
+            kprintf("[shm] WARNING: cache FULL (%d live regions) -- region "
+                    "ino=%lu/%lu gets a PRIVATE COPY; cross-process readers "
+                    "of it will see stale/zero bytes\n",
+                    SHMCACHE_MAX, (unsigned long)ino, (unsigned long)gen);
+        } }
     return 0;                                    /* table full -> caller copies */
 }
 

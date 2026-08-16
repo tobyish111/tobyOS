@@ -376,9 +376,10 @@ struct file *file_clone(struct file *src) {
         /* Carry the shared-mapping region across dup/fork/SCM_RIGHTS. This is
          * what actually makes cross-process shared memory work once the file is
          * unlinked: the inode number is gone (and reused), so the descriptor is
-         * the only thing tying the sharers together. Entries are permanent for
-         * now, so there is no refcount to bump here. */
+         * the only thing tying the sharers together. Slice 122: entries are no
+         * longer permanent -- the pin count is what keeps this one alive. */
         f->shm      = src->shm;
+        if (f->shm) shm_cache_pin(f->shm);
         (*f->vfs_refs)++;
         break;
     case FILE_KIND_SOCKET:
@@ -485,6 +486,11 @@ void file_close(struct file *f) {
         pipe_close_writer(f->pipe);
         break;
     case FILE_KIND_VFS:
+        /* Slice 122: this struct file's shm pin dies with it. Pin count, not
+         * vfs_refs, is what keeps the shared-page region alive: mappings can
+         * outlive every fd (chrome closes the fd right after mmap), so the
+         * region is only reaped once pins==0 AND no address space maps it. */
+        if (f->shm) { shm_cache_unpin(f->shm); f->shm = 0; }
         /* Drop our share of the open-file description. ops->close runs
          * exactly once, when the last fd referencing this handle is
          * closed. If vfs_refs is NULL the file was minted before the

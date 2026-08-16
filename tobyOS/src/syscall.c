@@ -5349,7 +5349,11 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
          * entries are permanent (no reclaim yet), so that traded a per-process
          * copy that is freed at teardown for one that is never freed. */
         if (sc) {
-            f->shm = sc;                 /* pin for this fd and its clones */
+            if (f->shm != sc) {          /* pin for this fd and its clones */
+                if (f->shm) shm_cache_unpin(f->shm);   /* re-key (shouldn't happen) */
+                f->shm = sc;
+                shm_cache_pin(sc);
+            }
             uint64_t alen = (len + 0xfffULL) & ~0xfffULL;
             uint64_t aoff = offset & ~0xfffULL;
             size_t page_off = (size_t)(aoff / PAGE_SIZE);
@@ -5380,16 +5384,28 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
                 long b = shm_cache_mmap(sc, addr, alen, prot,
                                         lx_mmap_flags(lflags), aoff);
 #ifdef CHROMIUM_BOOT
-                {   static int c = 0;
-                    if (c < 200) { c++;
+                {   /* Slice 122: cap raised 200 -> 2000 with a loud tail.
+                     * The 200 cap was HIT during the bing-blank forensics and
+                     * silently swallowed every late mapping -- "the ring was
+                     * never attached by a second pid" was an artifact of the
+                     * cap, not a finding. Same trap as WIN-UPDATE's wu<24 and
+                     * rx_full_episode: a capped log that says nothing at the
+                     * cap reads as "the event stopped happening". Also log W
+                     * so a read-only vs writable mapping is visible. */
+                    static int c = 0;
+                    if (c < 2000) { c++;
                         struct proc *me = current_proc();
                         kprintf("[shm] MAP_SHARED pid=%d ino=%lu/%lu off=%lu np=%lu "
-                                "%s -> 0x%lx\n",
+                                "%s%s -> 0x%lx\n",
                                 me ? me->pid : -1, (unsigned long)f->vfs.ino,
                                 (unsigned long)f->vfs.ino_gen,
                                 (unsigned long)page_off, (unsigned long)np,
                                 created ? "CREATED" : "attached",
+                                (prot & 0x2) ? "+W" : "+r",
                                 (unsigned long)b);
+                        if (c == 2000)
+                            kprintf("[shm] MAP_SHARED log CAP HIT (2000) -- "
+                                    "later mappings are NOT logged\n");
                     } }
 #endif
                 if (b >= 0) return b;

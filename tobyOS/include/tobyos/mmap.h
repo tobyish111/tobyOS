@@ -104,6 +104,12 @@ struct shm_cache;
 /* Keyed on (inode, incarnation) -- a bare inode number is reissued the moment
  * a file is unlinked and would alias unrelated regions together. */
 struct shm_cache *shm_cache_for_ino(uint64_t ino, uint64_t gen, bool *created);
+/* Slice 122: pin = one struct file whose f->shm points at the entry. Entries
+ * with zero pins and no live mappings are reaped when the table fills; before
+ * this, entries were permanent and one heavy page exhausted all 256, after
+ * which every new region silently fell back to unshared private copies. */
+void shm_cache_pin(struct shm_cache *sc);
+void shm_cache_unpin(struct shm_cache *sc);
 int   shm_cache_ensure(struct shm_cache *sc, size_t want_pages);
 /* High-water page count. Sample BEFORE shm_cache_ensure() to learn which pages
  * that call newly allocated, so exactly those get populated from the file. */
