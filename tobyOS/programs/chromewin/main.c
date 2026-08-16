@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <tobyos/abi/abi.h>
 #include <toby/tk.h>
@@ -709,6 +710,14 @@ static int g_req_total, g_req_media, g_resp_media, g_fail_total, g_fin_media;
  * completes, tiles=2/cmt=0 is a DATA problem, not a rendering one). */
 static int g_req_thumb, g_req_api, g_resp_api_ok, g_resp_api_bad, g_req_cont;
 
+/* Slice 122: .br.js decode diagnostic state (see the responseReceived and
+ * loadingFinished branches below, and the reply handler in cdp_dispatch). */
+static char g_brjs_rid[48];
+static char g_brjs_url[160];
+static int  g_brjs_body_id;
+static int  g_brjs_fetch_id;
+static int  g_brjs_printed;
+
 static void note_network_event(void) {
     static char url[160], err[96];
 
@@ -771,6 +780,24 @@ static void note_network_event(void) {
     }
     if (strstr(g_msg, "\"Network.responseReceived\"")) {
         if (json_str(g_msg, "url", url, sizeof url) <= 0) return;
+        /* Slice 122 diagnostic: every r.bing.com *.br.js asset fails V8 at
+         * line 1 ("Invalid or unexpected token") while the same URL fetched
+         * from a host curl is VALID JS over both gzip and br -- so the wire
+         * is fine and the question is what chrome DECODED. Capture the first
+         * such response: print the content-encoding it was served with, then
+         * pull the decoded body via Network.getResponseBody (what V8 parsed)
+         * once its load finishes. Silent unless a .br.js response appears. */
+        if (!g_brjs_rid[0] && !g_brjs_printed && strstr(url, ".br.js") &&
+            strstr(url, "://www.bing.com/")) {
+            /* Same-origin assets only: run 3 adds a page-context fetch() of
+             * this URL, and only a same-origin response is readable there. */
+            json_str(g_msg, "requestId", g_brjs_rid, sizeof g_brjs_rid);
+            snprintf(g_brjs_url, sizeof g_brjs_url, "%s", url);
+            const char *ce = strstr(g_msg, "content-encoding");
+            printf("[brjs] RESP rid=%s enc=%.48s url=%.80s\n",
+                   g_brjs_rid[0] ? g_brjs_rid : "?",
+                   ce ? ce : "(no content-encoding key)", url);
+        }
         if (strstr(url, "/youtubei/")) {
             int ast = json_int(g_msg, "status");
             if (ast >= 200 && ast < 300) g_resp_api_ok++;
@@ -796,6 +823,15 @@ static void note_network_event(void) {
     }
     if (strstr(g_msg, "\"Network.loadingFinished\"")) {
         g_fin_media++;      /* not URL-tagged; a count is enough to see progress */
+        /* Slice 122: our captured .br.js just finished -- its body is now
+         * fully buffered, safe to ask for. Match the rid: this event fires
+         * for every request and an early ask returns a partial body. */
+        if (g_brjs_rid[0] && !g_brjs_body_id && !g_brjs_printed &&
+            strstr(g_msg, g_brjs_rid)) {
+            char p[96];
+            snprintf(p, sizeof p, "{\"requestId\":\"%s\"}", g_brjs_rid);
+            g_brjs_body_id = cdp_send("Network.getResponseBody", p, 1);
+        }
         return;
     }
 }
@@ -848,6 +884,66 @@ static void cdp_dispatch(void) {
         if (json_str(g_msg, "value", pv, sizeof pv) < 0) pv[0] = 0;
         printf("[cwping] rt=%ldms %s\n", sys_clock_ms() - g_ping_sent_ms, pv);
         g_ping_id = 0;
+        return;
+    }
+    if (g_brjs_body_id && json_has_id(g_msg, g_brjs_body_id)) {
+        /* Slice 122: the DECODED body of the captured .br.js -- these bytes
+         * are exactly what V8 was handed. base64Encoded=true means chrome
+         * classified the body as binary, which for a text/javascript
+         * response is itself the finding. Print the head either way. */
+        static char body[200];
+        int b64 = strstr(g_msg, "\"base64Encoded\":true") != 0;
+        if (json_str(g_msg, "body", body, sizeof body) < 0)
+            snprintf(body, sizeof body, "(no body key: %.120s)", g_msg);
+        printf("[brjs] BODY b64=%d head=%.160s\n", b64, body);
+        /* The head alone answered "garbage or JS?" (JS) -- so the failure is
+         * mid-file, and LENGTH is the question: the host fetch of the same
+         * asset decodes to a known size, and a short count here = the
+         * truncation class. Measure the raw escaped span of the body value
+         * (escaping inflates it slightly; fine for a truncation verdict)
+         * and show the tail, where a cut would land. */
+        {
+            const char *b = strstr(g_msg, "\"body\":\"");
+            if (b) {
+                b += 8;
+                const char *p = b;
+                while (*p && !(*p == '"' && p[-1] != '\\')) p++;
+                long blen = (long)(p - b);
+                const char *tail = (blen > 120) ? p - 120 : b;
+                printf("[brjs] BLEN esc=%ld msg=%lu tail=%.120s\n",
+                       blen, (unsigned long)strlen(g_msg), tail);
+            }
+        }
+        /* Run 3: the network service's copy measured PERFECT (right head,
+         * tail, and length), so ask the RENDERER for its own view of the
+         * same bytes -- a same-origin fetch() re-crosses the network-service
+         * -> renderer mojo data pipe, the only remaining suspect. The JS
+         * reports length plus the first NUL/replacement char with context,
+         * which is where SHM-style corruption would show. */
+        if (g_brjs_url[0] && !g_brjs_fetch_id) {
+            static char ex[900];
+            snprintf(ex, sizeof ex,
+                "{\"expression\":\"fetch('%s').then(r=>r.text()).then(t=>{"
+                "let b=-1;for(let i=0;i<t.length;i++){let c=t.charCodeAt(i);"
+                "if(c==0||c==65533){b=i;break}}"
+                "return 'flen='+t.length+' bad@'+b+"
+                "(b<0?'':' ctx='+encodeURIComponent(t.slice(b>40?b-40:0,b+40)))"
+                "}).catch(e=>'ferr='+e)\","
+                "\"returnByValue\":true,\"awaitPromise\":true}",
+                g_brjs_url);
+            g_brjs_fetch_id = cdp_send("Runtime.evaluate", ex, 1);
+        }
+        g_brjs_body_id = 0;
+        g_brjs_printed = 1;      /* one asset is enough; stay quiet after */
+        g_brjs_rid[0] = 0;
+        return;
+    }
+    if (g_brjs_fetch_id && json_has_id(g_msg, g_brjs_fetch_id)) {
+        static char fv[240];
+        if (json_str(g_msg, "value", fv, sizeof fv) < 0)
+            snprintf(fv, sizeof fv, "(no value: %.160s)", g_msg);
+        printf("[brjs] FETCH renderer-view %s\n", fv);
+        g_brjs_fetch_id = 0;
         return;
     }
     if (g_shot_id && json_has_id(g_msg, g_shot_id)) {   /* polled screenshot reply */
@@ -970,6 +1066,44 @@ static const char *pick_profile_dir(void) {
     return 0;
 }
 
+/* Slice 121: say whether this boot INHERITED a profile or starts blank.
+ *
+ * /data is RAM-backed whenever the boot sweep found no tobyfs volume, and a
+ * RAM-backed /data means chrome starts every single boot as a brand-new
+ * cookie-less client: consent screens come back, logins are gone, and every
+ * site sees a first-time visitor. From inside the window that is invisible
+ * -- it just looks like the web being tedious -- so state it at startup,
+ * where the serial log keeps it and a test can assert on it.
+ *
+ * "Local State" and "Default/Cookies" are chrome's own files. Their presence
+ * is what separates a genuinely REUSED profile from a directory that merely
+ * exists, which is why the count alone is not the verdict. */
+static void report_profile_state(const char *dir) {
+    int entries = 0;
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != 0) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                continue;
+            entries++;
+        }
+        closedir(d);
+    }
+    char path[192];
+    snprintf(path, sizeof path, "%s/Default/Cookies", dir);
+    int fd = open(path, O_RDONLY);
+    int cookies = (fd >= 0);
+    if (fd >= 0) close(fd);
+
+    if (entries == 0)
+        printf("[chromewin] profile %s: FRESH (empty) -- no cookies carried "
+               "over; if /data is RAM-backed this repeats every boot\n", dir);
+    else
+        printf("[chromewin] profile %s: REUSED (%d entries, cookie db %s)\n",
+               dir, entries, cookies ? "present" : "absent");
+}
+
 static int spawn_chrome(void) {
     int p2c[2], c2p[2];                       /* parent->chrome, chrome->parent */
 
@@ -978,6 +1112,7 @@ static int spawn_chrome(void) {
      * -- with a reason the window can show -- beats a mute bootstrap stall. */
     const char *udd = pick_profile_dir();
     if (!udd) return -2;                       /* -2: g_profile_err is set */
+    report_profile_state(udd);
     static char udd_arg_buf[128];
     snprintf(udd_arg_buf, sizeof udd_arg_buf, "--user-data-dir=%s", udd);
     char *udd_arg = udd_arg_buf;
@@ -2252,14 +2387,294 @@ static int  g_omni_active;
 static char g_omni[240];
 static int  g_omni_len;
 
+/* ---- Slice 121: the omnibox searches ----------------------------------- *
+ *
+ * Slice 118 treated EVERY entry as a hostname, so typing "cats" navigated to
+ * https://cats -- a DNS failure and an error page. That is the one thing a
+ * user does most in a browser, and it did not work; searching meant loading
+ * an engine's homepage first and typing into the page.
+ *
+ * The URL-vs-query rule below is deliberately biased toward SEARCH: a query
+ * misread as a host shows an error page, while a host misread as a query
+ * shows search results that link to the site. Wrong-toward-search is the
+ * recoverable direction, so anything not clearly a host becomes a search.
+ *
+ * NOTE (see docs + the bot-gate history): the engine choice is a
+ * convenience, NOT a way around an "unusual traffic" block. When an address
+ * is flagged, Google and DuckDuckGo gate it independently -- switching
+ * engines does not dodge that, and nothing on this side can. */
+
+#define OMNI_SETTINGS_PATH "/data/settings.conf"
+#define OMNI_SEARCH_KEY    "browser.search"
+#define SEARCH_CFG_MAX     160    /* a settings.conf value: key or template */
+/* Worst case is a full-width omnibox that is entirely percent-encoded
+ * (3 bytes out per byte in) dropped into the longest template. */
+#define OMNI_URL_MAX       (3 * (int)sizeof(g_omni) + SEARCH_CFG_MAX)
+
+struct search_engine { const char *key, *tmpl; };
+
+/* Ordered: [0] is the default.
+ *
+ * That default is BING, not Google, and the reason is measured rather than
+ * aesthetic: Google serves this deployment its "unusual traffic" interstitial
+ * for real browser searches (photographed on the EliteDesk 2026-08-15), and
+ * the reCAPTCHA on that page cannot currently be completed here -- so a
+ * Google default means the single most common browser action dead-ends. Bing
+ * answers normally from the same address. Google remains one setting or one
+ * `google.com` away.
+ *
+ * Do NOT read this as a fix for the bot gate. It is a route around one
+ * engine's challenge, nothing more; see the bot-gate history before treating
+ * engine choice as a captcha remedy. */
+static const struct search_engine k_engines[] = {
+    { "bing",      "https://www.bing.com/search?q=%s"               },
+    { "google",    "https://www.google.com/search?q=%s"             },
+    { "ddg",       "https://duckduckgo.com/?q=%s"                   },
+    { "brave",     "https://search.brave.com/search?q=%s"           },
+    { "mojeek",    "https://www.mojeek.com/search?q=%s"             },
+    { "wikipedia", "https://en.wikipedia.org/w/index.php?search=%s" },
+    { 0, 0 }
+};
+
+/* Read `key` from /data/settings.conf, the desktop's persistent key=value
+ * store. chromewin cannot call settings_get_str() -- that lives in the
+ * kernel with no syscall behind it -- but the backing file is plain
+ * "key=value" text, so parsing it directly uses the SAME store instead of
+ * inventing a second config file that the Control Panel would not know
+ * about. Missing file / missing key are both "not set", never an error:
+ * /data may not even be mounted. */
+static int omni_settings_lookup(const char *key, char *out, size_t cap) {
+    int fd = open(OMNI_SETTINGS_PATH, O_RDONLY);
+    if (fd < 0) return 0;
+    static char buf[4096];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    size_t klen = strlen(key);
+    for (char *line = buf; line && *line; ) {
+        char *eol = strchr(line, '\n');
+        if (eol) *eol = 0;
+        if (*line != '#' && strncmp(line, key, klen) == 0 && line[klen] == '=') {
+            snprintf(out, cap, "%s", line + klen + 1);
+            /* settings.conf is written by the kernel, but a hand-edited file
+             * can carry CRLF -- a trailing \r inside the URL would be sent
+             * to chrome verbatim. */
+            for (char *p = out; *p; p++)
+                if (*p == '\r' || *p == '\n') { *p = 0; break; }
+            return out[0] != 0;
+        }
+        line = eol ? eol + 1 : 0;
+    }
+    return 0;
+}
+
+/* A user-supplied template becomes the FORMAT STRING of the snprintf that
+ * builds the search URL, so it has to be checked as one -- "contains %s" is
+ * not enough. A second %s reads an argument that was never passed, and a %n
+ * writes through one; both are undefined behaviour reachable from a line in
+ * a config file. Require exactly one conversion, and require it to be %s.
+ * ("%%" is a literal percent and is allowed to appear any number of times.) */
+static int template_ok(const char *t) {
+    int subs = 0;
+    for (const char *p = strchr(t, '%'); p; p = strchr(p, '%')) {
+        if (p[1] == '%') { p += 2; continue; }
+        if (p[1] != 's') return 0;
+        subs++;
+        p += 2;
+    }
+    return subs == 1;
+}
+
+/* Resolve the search-URL template once. TOBY_SEARCH wins (it is how a shell
+ * launch overrides for one run), then the persistent setting, then Google.
+ * Either source accepts an engine key from the table or a full template. */
+static const char *search_template(void) {
+    static const char *cached;
+    static char cfg[SEARCH_CFG_MAX];
+    if (cached) return cached;
+
+    const char *sel = getenv("TOBY_SEARCH");
+    const char *src = "TOBY_SEARCH";
+    if (!sel || !*sel) {
+        if (omni_settings_lookup(OMNI_SEARCH_KEY, cfg, sizeof cfg)) {
+            sel = cfg;
+            src = OMNI_SETTINGS_PATH;
+        }
+    }
+
+    if (sel && *sel) {
+        for (int i = 0; k_engines[i].key; i++)
+            if (strcmp(sel, k_engines[i].key) == 0) {
+                cached = k_engines[i].tmpl;
+                printf("[chromewin] search engine '%s' (from %s)\n", sel, src);
+                return cached;
+            }
+        /* A full template is allowed, but ONLY if it carries exactly the one
+         * %s we substitute. Without that check a typo'd template would send
+         * every search to the same static page -- which looks like a broken
+         * network rather than a bad setting -- and a malformed one would be
+         * undefined behaviour (see template_ok). */
+        if (template_ok(sel)) {
+            cached = sel;     /* environ and `cfg` both outlive this call */
+            printf("[chromewin] search engine: custom template (from %s)\n",
+                   src);
+            return cached;
+        }
+        /* Name the fallback from the TABLE, never as a literal -- this line
+         * read "falling back to google" for exactly as long as it took to
+         * change the default, and a diagnostic that names the wrong engine
+         * is worse than none. */
+        printf("[chromewin] %s='%s' is neither a known engine nor a template "
+               "with exactly one %%s -- falling back to %s\n",
+               src, sel, k_engines[0].key);
+    }
+    cached = k_engines[0].tmpl;
+    return cached;
+}
+
+/* Percent-encode `in` for use as a query-string VALUE. Everything outside
+ * the RFC 3986 unreserved set is escaped, so the result can never carry a
+ * quote or backslash into the CDP JSON below. */
+static void url_encode_query(const char *in, char *out, size_t cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+            (*p >= '0' && *p <= '9') ||
+            *p == '-' || *p == '_' || *p == '.' || *p == '~') {
+            if (o + 2 > cap) break;
+            out[o++] = (char)*p;
+        } else if (*p == ' ') {
+            if (o + 2 > cap) break;
+            out[o++] = '+';
+        } else {
+            if (o + 4 > cap) break;
+            out[o++] = '%';
+            out[o++] = hex[*p >> 4];
+            out[o++] = hex[*p & 15];
+        }
+    }
+    out[o] = 0;
+}
+
+/* Exactly four decimal labels of 0..255. This has to be the WHOLE test for
+ * a numeric host: the looser "last label is digits" rule accepts "3.5", and
+ * a bare decimal number is far more often a calculation or a version than a
+ * machine someone wants to visit. */
+static int is_dotted_quad(const char *s) {
+    int labels = 0;
+    for (;;) {
+        int v = 0, digits = 0;
+        while (*s >= '0' && *s <= '9') {
+            v = v * 10 + (*s++ - '0');
+            if (++digits > 3) return 0;
+        }
+        if (!digits || v > 255) return 0;
+        labels++;
+        if (*s == '.') { s++; continue; }
+        if (*s) return 0;                        /* trailing junk */
+        break;
+    }
+    return labels == 4;
+}
+
+/* Does `s` name a host the browser could actually resolve? Only the
+ * authority is considered -- "example.com/a b" is still a URL, because the
+ * space is in the path where it is legal-ish and chrome will encode it. */
+static int looks_like_host(const char *s) {
+    char host[256];
+    size_t n = 0;
+    for (const char *p = s; *p && n < sizeof host - 1; p++) {
+        if (*p == '/' || *p == '?' || *p == '#') break;
+        host[n++] = *p;
+    }
+    host[n] = 0;
+    if (!n || strchr(host, ' ')) return 0;      /* no authority has a space */
+
+    /* Strip a :port, so "localhost:8080" and "example.com:8443" both pass.
+     * A colon followed by non-digits is not a port, so it is not a host
+     * either -- that shape is almost always prose ("note: buy milk"). */
+    char *colon = strchr(host, ':');
+    if (colon) {
+        if (!colon[1]) return 0;
+        for (char *p = colon + 1; *p; p++)
+            if (*p < '0' || *p > '9') return 0;
+        *colon = 0;
+        if (!host[0]) return 0;
+    }
+    if (strcmp(host, "localhost") == 0) return 1;   /* the one dotless host */
+
+    /* Otherwise require a final label that looks like a TLD -- two or more
+     * letters -- or a complete dotted quad. So "a.co" and "10.0.0.1"
+     * navigate, while "3.5" and "hello." search. */
+    const char *dot = 0;
+    for (const char *p = host; *p; p++) if (*p == '.') dot = p;
+    if (!dot || dot == host || !dot[1]) return 0;
+    int alpha = 1;
+    size_t tld = 0;
+    for (const char *p = dot + 1; *p; p++, tld++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))) alpha = 0;
+    if (alpha && tld >= 2) return 1;
+    return is_dotted_quad(host);
+}
+
+/* Escape a URL for embedding in a JSON string. The search path is already
+ * percent-encoded, but the "://" branch passes whatever was typed straight
+ * through, and an unescaped quote there produces malformed CDP that chrome
+ * answers with a parse error and no navigation. */
+static void json_escape(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+        const char *esc = 0;
+        switch (*p) {
+        case '"':  esc = "\\\""; break;
+        case '\\': esc = "\\\\"; break;
+        case '\n': esc = "\\n";  break;
+        case '\r': esc = "\\r";  break;
+        case '\t': esc = "\\t";  break;
+        default: break;
+        }
+        if (esc) {
+            if (o + 3 > cap) break;
+            out[o++] = esc[0]; out[o++] = esc[1];
+        } else if (*p < 0x20) {
+            continue;                            /* drop other control bytes */
+        } else {
+            if (o + 2 > cap) break;
+            out[o++] = (char)*p;
+        }
+    }
+    out[o] = 0;
+}
+
 static void omni_navigate(void) {
     if (!g_omni_len) { g_omni_active = 0; tk_redraw(&win); return; }
-    char url[300];
-    if (strstr(g_omni, "://"))  snprintf(url, sizeof url, "%s", g_omni);
-    else if (g_omni[0] == '/')  snprintf(url, sizeof url, "file://%s", g_omni);
-    else                        snprintf(url, sizeof url, "https://%s", g_omni);
-    char p[360];
-    snprintf(p, sizeof p, "{\"url\":\"%s\"}", url);
+
+    /* Trim surrounding blanks first: " cats " must be a search, and
+     * " example.com " must still be the host. */
+    char in[sizeof g_omni];
+    const char *b = g_omni;
+    while (*b == ' ' || *b == '\t') b++;
+    snprintf(in, sizeof in, "%s", b);
+    for (size_t i = strlen(in); i > 0 && (in[i - 1] == ' ' || in[i - 1] == '\t');)
+        in[--i] = 0;
+    if (!in[0]) { g_omni_active = 0; tk_redraw(&win); return; }
+
+    char url[OMNI_URL_MAX];
+    if (strstr(in, "://"))        snprintf(url, sizeof url, "%s", in);
+    else if (in[0] == '/')        snprintf(url, sizeof url, "file://%s", in);
+    else if (looks_like_host(in)) snprintf(url, sizeof url, "https://%s", in);
+    else {
+        char q[3 * sizeof g_omni + 4];
+        url_encode_query(in, q, sizeof q);
+        snprintf(url, sizeof url, search_template(), q);
+    }
+
+    char esc[2 * OMNI_URL_MAX];
+    json_escape(url, esc, sizeof esc);
+    char p[2 * OMNI_URL_MAX + 32];
+    snprintf(p, sizeof p, "{\"url\":\"%s\"}", esc);
     cdp_send("Page.navigate", p, 1);
     snprintf(g_status, sizeof g_status, "%s", url);
     g_omni_active = 0;
