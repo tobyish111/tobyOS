@@ -26,7 +26,7 @@ cd /c/CustomOS/tobyOS || exit 1
 
 MODE="${1:-cpu}"          # cpu | gl (ANGLE-on-GL) | gle (native EGL, no ANGLE)
 PAGE="${2:-anim}"         # anim | webgl
-TAG="${MODE}_${PAGE}"
+TAG="${MODE}_${PAGE}${SMPTAG:-}"
 PY=/c/Users/tdude/AppData/Local/Programs/Python/Python311/python
 
 case "$PAGE" in
@@ -96,6 +96,7 @@ if [ "$(cat "$KSTAMP" 2>/dev/null)" != "$KCF" ]; then
     rm -f src/*.o
 fi
 rm -f "$KSTAMP"             # only a SUCCESSFUL build earns the stamp
+do_build () {
 if ! make "CC=TMP='C:\\t' TEMP='C:\\t' clang" \
           "HOST_CC=TMP='C:\\t' TEMP='C:\\t' gcc" iso \
      EXTRA_CFLAGS="$KCF" \
@@ -103,6 +104,8 @@ if ! make "CC=TMP='C:\\t' TEMP='C:\\t' clang" \
     echo "BUILD FAILED -- tail:"; tail -25 "logs/gpuperf_${TAG}.build.log"; exit 1
 fi
 [ -f tobyOS.iso ] || { echo "BUILD FAILED (no ISO)"; exit 1; }
+}
+do_build
 printf '%s' "$KCF" > "$KSTAMP"
 grep -a "CW_GL\|chromewin.elf" "logs/gpuperf_${TAG}.build.log" | tail -2
 ls -l --time-style=full-iso tobyOS.iso
@@ -114,35 +117,63 @@ ls -l --time-style=full-iso tobyOS.iso
 # different defines -- which is exactly how .013 happened. A string only
 # reaches a binary if its #ifdef compiled, so ask the binaries directly. This
 # is cheap and it fails in seconds instead of six minutes.
-gate0_fail() { echo "GATE 0 FAIL: $1"; echo "            stale objects -- rm -f src/*.o programs/chromewin/chromewin.o and re-run."; exit 1; }
-grep -aq 'TKAPP\] launching' tobyos.bin \
-  || gate0_fail "kernel has no TKAPP launcher (-DTKAPP_BOOT did not compile in), so the guest will boot to the desktop and never start the browser."
-grep -aq '/bin/chromewin' tobyos.bin \
-  || gate0_fail "kernel's TKAPP target is not chromewin (-DTKAPP_CHROMEWIN missing)."
+# Slice 131: gate 0 SELF-HEALS once. The stamp cannot see a hand `make` or
+# defboot.sh leaving objects with other defines behind, and that happened
+# three times in a single day of ISO builds. Rebuilding from clean is the
+# known and only fix, so do it rather than making a human retype it -- but
+# say so loudly, and if the SECOND check still fails the problem is real.
+GATE0_HEALED=0
+gate0_fail() {
+    if [ "$GATE0_HEALED" = "0" ]; then
+        echo "GATE 0: $1"
+        echo "GATE 0: stale kernel objects -- clearing src/*.o and rebuilding ONCE."
+        GATE0_HEALED=1
+        rm -f src/*.o programs/chromewin/chromewin.o programs/chromewin/chromewin.elf
+        rm -f build/initrd.tar build/base.iso tobyOS.iso
+        do_build
+        printf '%s' "$KCF" > "$KSTAMP"
+        gate0_check
+        echo "gate0 flags-in-binary: OK after rebuild ($MODE)"
+        return 0
+    fi
+    echo "GATE 0 FAIL (after a clean rebuild -- this one is real): $1"
+    exit 1
+}
 CWELF=programs/chromewin/chromewin.elf
-grep -aq -- "$URL" "$CWELF" \
-  || gate0_fail "chromewin.elf does not carry $URL -- it would navigate to the PREVIOUS arm's page."
-case "$MODE" in
-  mp|viz|vizp|lat)
-    grep -aq -- '--single-process' "$CWELF" \
-      && gate0_fail "chromewin still carries --single-process, so CW_MP did not compile in and this is NOT a multi-process run." ;;
-  *)
-    grep -aq -- '--single-process' "$CWELF" \
-      || gate0_fail "chromewin has no --single-process, so this 'cpu' arm is secretly multi-process." ;;
-esac
-case "$MODE" in
-  viz|vizp|lat)
-    grep -aq 'cwviz' "$CWELF" \
-      || gate0_fail "chromewin has no [cwviz] strings, so CW_VIZ did not compile in." ;;
-esac
+gate0_check() {
+    grep -aq 'TKAPP\] launching' tobyos.bin \
+      || gate0_fail "kernel has no TKAPP launcher (-DTKAPP_BOOT did not compile in), so the guest will boot to the desktop and never start the browser."
+    grep -aq '/bin/chromewin' tobyos.bin \
+      || gate0_fail "kernel's TKAPP target is not chromewin (-DTKAPP_CHROMEWIN missing)."
+    grep -aq -- "$URL" "$CWELF" \
+      || gate0_fail "chromewin.elf does not carry $URL -- it would navigate to the PREVIOUS arm's page."
+    case "$MODE" in
+      mp|viz|vizp|lat)
+        grep -aq -- '--single-process' "$CWELF" \
+          && gate0_fail "chromewin still carries --single-process, so CW_MP did not compile in and this is NOT a multi-process run." ;;
+      *)
+        grep -aq -- '--single-process' "$CWELF" \
+          || gate0_fail "chromewin has no --single-process, so this 'cpu' arm is secretly multi-process." ;;
+    esac
+    case "$MODE" in
+      viz|vizp|lat)
+        grep -aq 'cwviz' "$CWELF" \
+          || gate0_fail "chromewin has no [cwviz] strings, so CW_VIZ did not compile in." ;;
+    esac
+    return 0
+}
+gate0_check
 echo "gate0 flags-in-binary: OK ($MODE)"
 
-echo "=== [2/3] run: SMP=4 $( [ "$MODE" != cpu ] && echo 'GLDEV=1 (virtio-gpu-gl-pci + ANGLE)' ) ==="
+# Slice 131: SMP is an A/B variable now, not a constant. Whether extra
+# cores help this workload at all is a question, not an assumption.
+SMP="${SMP:-4}"
+echo "=== [2/3] run: SMP=$SMP $( [ "$MODE" != cpu ] && echo 'GLDEV=1 (virtio-gpu-gl-pci + ANGLE)' ) ==="
 if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ] && [ "$MODE" != "vizp" ] && [ "$MODE" != "lat" ]; then
     [ -d logs/angle ] || bash logs/setup_angle.sh > "logs/gpuperf_${TAG}.angle.log" 2>&1
-    SMP=4 GLDEV=1 $PY logs/run_watch.py 2>&1 | tail -6
+    SMP=$SMP GLDEV=1 $PY logs/run_watch.py 2>&1 | tail -6
 else
-    SMP=4 $PY logs/run_watch.py 2>&1 | tail -6
+    SMP=$SMP $PY logs/run_watch.py 2>&1 | tail -6
 fi
 # Slice 108: keep EVERY run, not just the last. These logs were overwritten
 # per mode, and that destroyed the only failing multi-process run before it

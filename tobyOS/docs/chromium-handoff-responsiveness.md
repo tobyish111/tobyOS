@@ -101,6 +101,65 @@ result stays legible in history.
 
 ---
 
+## 2b. MULTICORE: WIRED, RUNNING, AND WORTH EXACTLY NOTHING (slice 131)
+
+Asked to "wire up multicore/multiprocess support so chrome isn't so slow to
+respond". It is already wired — APs run user code, 4 vCPUs come up, the BKL is
+a fair ticket lock. So the question is not whether it is connected but whether
+it BUYS anything. Measured, same page, same build, core count verified from
+the log (`[smp] 3/3 APs online` vs a single `[bkl] cpu0`):
+
+| arm | steady fps | load: chromewin→1st frame | BKL held, load window | BKL held, steady |
+| --- | --- | --- | --- | --- |
+| **SMP=1** | **10.16** | **14.2 s** | 30.5% of wall | 7.6% |
+| **SMP=4** | **10.02** | **14.2 s** | **51.8%** | 15.9% |
+
+**Four cores deliver ZERO on both metrics, and double the lock contention
+doing it.** Single-core is fractionally ahead, inside noise.
+
+Two independent reasons, and the second is the one that matters:
+
+1. **The kernel serializes.** The BKL is held across every syscall body. Going
+   1→4 cores takes BKL occupancy from 30.5% to 51.8% during load — the extra
+   cores mostly generate contention.
+2. **The workload has no parallelism to exploit at the points we measured.**
+   The `[hb] chrome thread states` dump shows **35 of 38 chrome threads
+   BLOCKED** in steady state. Chrome is not CPU-starved, it is idle waiting.
+   The ~100 ms/frame is chrome's own single-threaded capture+encode, and load
+   time is chrome's parsing/JIT plus real network latency. Neither is a thing
+   more cores can divide.
+
+Reason 2 is why fixing reason 1 would not have helped: **if the BKL were the
+limiter, SMP=4 would have been WORSE than SMP=1** (it has 21 points more lock
+occupancy). They are equal. The lock is not the binding constraint at these
+operating points.
+
+**Tested and reverted:** `sys_madvise_dontneed` is the top `[lx-hold]` BKL
+holder (6615 Mcyc/60 s, ~214 µs/call) and it called `vmm_translate` +
+`vmm_unmap(a, PAGE_SIZE)` **per 4 KiB** — two full 4-level descents and a
+`spin_lock_irqsave` round trip per page, never benefiting from the segmented
+walk slice 95 added for exactly this. Batching it (one lock + one segmented
+walk per 64 frames, refcount logic untouched) measured **9.83 fps / 14.6 s
+load** — inside the 9.79–10.16 spread, i.e. nothing. Reverted: page-table plus
+refcount plus TLB-shootdown code is the most invariant-laden in the kernel and
+a zero-benefit change there is a bad trade. **Do not redo this without a
+metric that first proves it is sensitive to kernel CPU cost.**
+
+Also corrected: the older handoff warns "careful, `g_pml4_phys` editor root is
+a shared global" before any BKL work. **It is per-CPU already**
+(`g_pml4_phys_cpu[MAX_CPUS]`, vmm.c), and page-table edits have their own
+`g_vmm_lock`. That warning is stale.
+
+**Where multicore WOULD pay** (unmeasured, stated as hypothesis): a workload
+with real concurrent CPU work — several tabs rendering, a heavy JS benchmark,
+video decode alongside layout. Chrome idling on a loaded SERP is the worst
+possible case for it. If the user's complaint is ever reproduced on a
+multi-tab or animation-heavy workload, re-run this A/B before concluding
+anything; `SMP=1 SMPTAG=_smp1 bash logs/gpuperf.sh cpu url` is now a
+one-liner.
+
+---
+
 ## 3. THE HONEST CEILING, AND WHERE TO LOOK NEXT
 
 Say this plainly to the user: **this is a capture-and-blit architecture and it
