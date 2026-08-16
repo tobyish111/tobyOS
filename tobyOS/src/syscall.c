@@ -3017,6 +3017,47 @@ static long sys_nanosleep(uint64_t ns) {
      * tcp_poll_until. sched_yield still runs other ready work on this CPU;
      * with nothing ready we genuinely idle in hlt until the next IRQ. */
     uint64_t end = perf_now_ns() + ns;
+
+    /* Slice 128: PARK, don't spin.
+     *
+     * This function used to pause-spin to the deadline with a sched_yield()
+     * every iteration. It was polite (BKL dropped, peers ran) but it was not
+     * a sleep: the process stayed READY, took a scheduling slot on every
+     * pass, and paid a BKL round-trip per yield for the entire duration.
+     *
+     * MEASURED on the EliteDesk: chromewin's main loop is one usleep(15000)
+     * per pass, and it burned 6027 ms of CPU in a 17.5 s session -- 34% of a
+     * core to do nothing -- while chrome-headless-shell, the thing actually
+     * rendering the page, got 1492 ms (8.7%) and the browser managed ~3 fps.
+     * Chrome was never render-bound; it was starved by a busy-wait.
+     *
+     * Now the proc blocks with a deadline and the sweep in sched_yield wakes
+     * it. The old comment's fear -- that a parked sleeper could wedge the box
+     * if a timer IRQ went missing -- is answered by WHERE the wake lives: the
+     * sweep runs from sched_yield's slow path (and pid 0's idle loop, which
+     * pause-spins rather than halting), so waking depends on the scheduler
+     * running at all, not on IRQ delivery. Same structure the futex and
+     * alarm deadlines already use.
+     *
+     * Very short sleeps still spin: below one tick, parking costs more in
+     * switch overhead than it saves, and callers that usleep(100) in a
+     * tight retry loop would otherwise take a full tick each time. */
+    struct proc *sp = current_proc();
+    if (sp && ns >= 2000000ull) {                 /* >= 2 ms: worth parking */
+        bool had = bkl_held();
+        sp->sleep_deadline_ns = end;
+        sp->state = PROC_BLOCKED;
+        if (had) bkl_exit();
+        while (__atomic_load_n(&sp->sleep_deadline_ns, __ATOMIC_ACQUIRE) &&
+               perf_now_ns() < end) {
+            sched_yield();
+        }
+        sp->sleep_deadline_ns = 0;
+        if (sp->state == PROC_BLOCKED) sp->state = PROC_RUNNING;
+        if (had) bkl_enter();
+        return 0;
+    }
+
     bool had_bkl = bkl_held();
     if (had_bkl) bkl_exit();
     while (perf_now_ns() < end) {

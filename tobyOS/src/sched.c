@@ -867,6 +867,34 @@ void sched_yield(void) {
         }
     }
 
+    /* Slice 128: wake procs whose nanosleep deadline has passed.
+     *
+     * Sits beside the alarm sweep, at the TOP of sched_yield, for the reason
+     * that comment gives: the sweeps further down only run in the
+     * still-RUNNING-and-queue-empty shape, and a sleeper is BLOCKED by
+     * definition, so a wake placed there would never fire for the very
+     * processes it exists to serve.
+     *
+     * Deliberately NOT rate-limited: the cost is a clock read plus a walk of
+     * the proc table only when some proc is actually sleeping, and a 10 ms
+     * rate limit would quantise every sleep to the sweep period -- which is
+     * exactly the latency this slice exists to remove. Waking depends on the
+     * scheduler running, never on IRQ delivery. */
+    {
+        extern struct proc g_proc[];
+        uint64_t snow = perf_now_ns();
+        for (int i = 0; i < PROC_MAX; i++) {
+            struct proc *p = &g_proc[i];
+            if (p->state != PROC_BLOCKED) continue;
+            uint64_t dl = __atomic_load_n(&p->sleep_deadline_ns,
+                                          __ATOMIC_ACQUIRE);
+            if (!dl || snow < dl) continue;
+            __atomic_store_n(&p->sleep_deadline_ns, 0, __ATOMIC_RELEASE);
+            p->state = PROC_READY;
+            sched_enqueue(p);
+        }
+    }
+
     /* ---- Milestone 19 fast path ----------------------------------
      *
      * If we're still RUNNING and our queue is empty, nobody is

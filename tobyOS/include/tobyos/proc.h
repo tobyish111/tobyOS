@@ -444,6 +444,15 @@ struct proc {
      * deadline per process is exactly what alarm(2) offers, and setitimer's
      * richer shape can grow from here if something needs it. */
     uint64_t        alarm_deadline_ns;
+    /* Slice 128: a REAL timed sleep. sys_nanosleep used to pause-spin with a
+     * sched_yield() per iteration until the deadline, so a sleeping process
+     * never actually slept -- it burned a core's worth of scheduling slots
+     * and BKL round-trips for the whole duration. Measured on the EliteDesk:
+     * chromewin, whose main loop is one usleep(15000) per pass, took 34% CPU
+     * doing nothing while chrome itself got 8.7% and the browser rendered at
+     * ~3 fps. Non-zero means "PROC_BLOCKED until perf_now_ns() reaches this";
+     * the sweep in sched_yield wakes it. */
+    uint64_t        sleep_deadline_ns;
 
     /* Per-process file descriptor table. Slot indices that fit in a
      * struct file pointer are owning -- close-on-exit drops them. */
