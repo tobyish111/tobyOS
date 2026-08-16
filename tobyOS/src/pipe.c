@@ -112,6 +112,46 @@ void pipe_close_writer(struct pipe *p) {
 
 /* ---- read / write ----------------------------------------------- */
 
+/* SLICE 129: copy the ring in at most TWO memcpy runs instead of a byte at a
+ * time. The old loops did `idx = (idx + 1) % PIPE_BUF_SZ` PER BYTE -- a real
+ * div, since the compiler cannot fold a modulo by a non-constant-folded
+ * expression into a mask here -- plus a one-byte load/store. That was merely
+ * wasteful at 4 KiB; at the 64 KiB ring this pipe now carries (see pipe.h) it
+ * would be the dominant cost of moving a frame, so the conversion is part of
+ * the same change, not a separate cleanup.
+ *
+ * Both helpers assume the caller has already established there is work to do
+ * and space/data for it; they clamp to `count`/room regardless. PIPE_BUF_SZ is
+ * a power of two so the wrap is a mask. */
+static size_t pipe_drain(struct pipe *p, uint8_t *out, size_t n) {
+    size_t got = 0;
+    while (got < n && p->count > 0) {
+        size_t run = PIPE_BUF_SZ - p->tail;        /* to the end of the ring */
+        if (run > p->count) run = p->count;        /* to the end of the data */
+        if (run > n - got)  run = n - got;         /* to the end of the caller */
+        memcpy(out + got, p->buf + p->tail, run);
+        p->tail = (uint32_t)((p->tail + run) & PIPE_BUF_MASK);
+        p->count -= (uint32_t)run;
+        got += run;
+    }
+    return got;                                    /* loops at most twice */
+}
+
+static size_t pipe_fill(struct pipe *p, const uint8_t *in, size_t n) {
+    size_t put = 0;
+    while (put < n && p->count < PIPE_BUF_SZ) {
+        size_t run  = PIPE_BUF_SZ - p->head;       /* to the end of the ring */
+        size_t room = PIPE_BUF_SZ - p->count;      /* to the end of the space */
+        if (run > room)    run = room;
+        if (run > n - put) run = n - put;          /* to the end of the caller */
+        memcpy(p->buf + p->head, in + put, run);
+        p->head = (uint32_t)((p->head + run) & PIPE_BUF_MASK);
+        p->count += (uint32_t)run;
+        put += run;
+    }
+    return put;                                    /* loops at most twice */
+}
+
 long pipe_read(struct pipe *p, void *buf, size_t n) {
     if (!p || !buf) return -1;
     if (n == 0) return 0;
@@ -139,12 +179,7 @@ long pipe_read(struct pipe *p, void *buf, size_t n) {
         return 0;
     }
 
-    size_t got = 0;
-    while (got < n && p->count > 0) {
-        out[got++] = p->buf[p->tail];
-        p->tail = (p->tail + 1) % PIPE_BUF_SZ;
-        p->count--;
-    }
+    size_t got = pipe_drain(p, out, n);
 
     /* We freed buffer space -- wake any blocked writer. */
     if (p->wq_write) wq_wake_all(&p->wq_write);
@@ -163,13 +198,7 @@ long pipe_tryread(struct pipe *p, void *buf, size_t n) {
     if (p->count == 0)
         return (p->writers > 0) ? -11 /* -ABI_EAGAIN */ : 0 /* EOF */;
 
-    uint8_t *out = (uint8_t *)buf;
-    size_t got = 0;
-    while (got < n && p->count > 0) {
-        out[got++] = p->buf[p->tail];
-        p->tail = (p->tail + 1) % PIPE_BUF_SZ;
-        p->count--;
-    }
+    size_t got = pipe_drain(p, (uint8_t *)buf, n);
     if (p->wq_write) wq_wake_all(&p->wq_write);
     return (long)got;
 }
@@ -202,11 +231,7 @@ long pipe_write(struct pipe *p, const void *buf, size_t n) {
         if (p->readers == 0) {
             return put > 0 ? (long)put : -3;
         }
-        while (put < n && p->count < PIPE_BUF_SZ) {
-            p->buf[p->head] = in[put++];
-            p->head = (p->head + 1) % PIPE_BUF_SZ;
-            p->count++;
-        }
+        put += pipe_fill(p, in + put, n - put);
         /* We added bytes -- wake any blocked reader. */
         if (p->wq_read) wq_wake_all(&p->wq_read);
     }
