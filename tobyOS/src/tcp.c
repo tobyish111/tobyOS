@@ -580,26 +580,28 @@ static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
      * at 65535: with a 64 KiB buffer the raw value is 65536, which a
      * bare uint16_t cast would truncate to a ZERO window. */
     uint32_t free_wnd = (uint32_t)(TCP_RX_BUF_BYTES - c->rx_count);
-    /* Slice 124: RFC 1122 4.2.3.3 receiver-side silly-window avoidance.
-     * Never announce a NON-ZERO window smaller than one MSS -- announce
-     * zero and reopen only when a worthwhile amount is free. Without this
-     * the window trickles open in whatever scraps the app happened to
-     * drain, the peer answers with segments that small, and a bulk
-     * transfer degenerates into hundreds of round trips carrying a few
-     * hundred bytes each. (The 2026-08-15 capture showed exactly that
-     * shape -- 0, 128, 256, 384 ... -- though its immediate cause was a
-     * log line on the send path, fixed separately in tcp_recv. This is
-     * the structural guard that makes the shape impossible rather than
-     * merely unobserved.)
+    /* Slice 124 REVERTED 2026-08-15, same day, on real-hardware evidence.
      *
-     * Zero here is SAFE to announce only because something re-opens it:
-     * tcp_recv sends a window update once >= 2 MSS is free. That update
-     * is a pure ACK and pure ACKs are never retransmitted, so if it is
-     * lost the peer waits for its own zero-window probe -- a real
-     * remaining hole, deliberately left for its own slice rather than
-     * bundled into a window-advertisement change. */
-    if (free_wnd < TCP_DEFAULT_MSS && free_wnd < TCP_RX_BUF_BYTES / 2u)
-        free_wnd = 0;
+     * This briefly applied RFC 1122 4.2.3.3 receiver-side silly-window
+     * avoidance: announce ZERO rather than any non-zero window below one
+     * MSS. The rule is correct in the abstract and I shipped it anyway on
+     * a bad justification -- I had MEASURED that it never fired in QEMU
+     * and reasoned it was therefore harmless. "Never fires in my test" is
+     * not "never fires"; it means the path went to the user UNTESTED IN
+     * EFFECT, and on the EliteDesk (different timing, real NIC pacing) it
+     * could fire and slam the window shut.
+     *
+     * Announcing zero is only safe if something reliably re-opens it, and
+     * this stack's re-opener is a single pure ACK from tcp_recv -- never
+     * retransmitted, so one loss strands the connection until the peer's
+     * zero-window probe. Shipping the shut half without the persist half
+     * was the mistake; the two belong in one slice, with a gate that can
+     * actually make the rule fire (a deliberately throttled reader).
+     *
+     * Restores the exact wire behaviour that demonstrably worked on that
+     * machine earlier the same day (search -> results -> click-through).
+     * The tcp_recv logging fix that came with it is KEPT: it changes no
+     * bytes on the wire and removed a real observer effect. */
     uint16_t adv_wnd;
     if (c->wscale_ok && !(flags & TCP_FLAG_SYN))
         adv_wnd = (uint16_t)(free_wnd >> c->rcv_wnd_shift);
