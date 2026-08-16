@@ -781,15 +781,34 @@ static void serial_heartbeat(void) {
      * Prints nothing on a healthy system, so it costs a comparison per beat. */
     {
         extern uint64_t g_tlb_ack_timeouts, g_tlb_giveups;
+        extern uint64_t g_tlb_to_percpu[MAX_CPUS];
+        extern uint64_t g_tlb_wait_max_ns;
         uint64_t to = __atomic_load_n(&g_tlb_ack_timeouts, __ATOMIC_RELAXED);
         uint64_t gu = __atomic_load_n(&g_tlb_giveups, __ATOMIC_RELAXED);
         uint64_t qn = 0, ql = 0;
         mmap_tlbq_stats(&qn, &ql);
-        if (to || gu || qn || ql)
+        if (to || gu || qn || ql) {
+            /* Slice 125: report the DISTRIBUTION, not just the total. A tally
+             * spread across every CPU is scheduling noise (WHPX deschedules,
+             * or a console-heavy burst); one CPU carrying nearly all of them
+             * is a core to go look at. worst= says by how much the 10 ms
+             * deadline was actually missed. */
+            uint64_t mx = __atomic_load_n(&g_tlb_wait_max_ns, __ATOMIC_RELAXED);
+            char per[96]; size_t pn = 0; per[0] = 0;
+            for (uint32_t i = 0; i < MAX_CPUS && pn + 12 < sizeof per; i++) {
+                uint64_t v = __atomic_load_n(&g_tlb_to_percpu[i],
+                                             __ATOMIC_RELAXED);
+                if (!v) continue;
+                pn += (size_t)ksnprintf(per + pn, sizeof per - pn,
+                                        "%scpu%u=%lu", pn ? "," : "",
+                                        i, (unsigned long)v);
+            }
             kprintf_serial("[tlb] health: ack_timeouts=%lu giveups=%lu "
-                           "quarantined=%lu leaked=%lu\n",
+                           "quarantined=%lu leaked=%lu worst=%luus [%s]\n",
                            (unsigned long)to, (unsigned long)gu,
-                           (unsigned long)qn, (unsigned long)ql);
+                           (unsigned long)qn, (unsigned long)ql,
+                           (unsigned long)(mx / 1000u), per[0] ? per : "-");
+        }
     }
 #ifdef CHROMIUM_BOOT
     /* Wake Ozone X clients blocked in recvmsg (poll path never runs). */
