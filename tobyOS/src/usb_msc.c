@@ -117,7 +117,12 @@ _Static_assert(sizeof(struct csw) == 13, "BBB CSW must be 13 B");
 /* Per-device state                                                 */
 /* ============================================================== */
 
-#define USB_MSC_MAX_DEVICES 2          /* one root-hub stick + one spare */
+/* Slice 122b: was 2 ("one root-hub stick + one spare") -- which the EliteDesk
+ * disproved the day two real sticks were attached: the table was full from
+ * boot and the first reseat of either stick was refused. 8 covers boot stick
+ * + data stick + hubs/spares; slots are one struct + two lazily-allocated
+ * DMA pages each, and dead slots are REVIVED on re-attach (see probe). */
+#define USB_MSC_MAX_DEVICES 8
 
 struct usb_msc {
     struct usb_device *udev;
@@ -445,14 +450,40 @@ bool usb_msc_probe(struct usb_device *dev,
                    const struct usb_iface_desc *iface,
                    const struct usb_endpoint_desc *ep_in,
                    const struct usb_endpoint_desc *ep_out) {
-    if (g_msc_count >= USB_MSC_MAX_DEVICES) {
-        kprintf("[usb-msc] too many devices, ignoring slot %u\n",
-                dev->slot_id);
-        return false;
+    /* Slice 122b: prefer REVIVING a dead slot (its device was unbound by a
+     * yank/reseat) over consuming a fresh one. The blk registry stores a
+     * POINTER to this slot's embedded blk_dev, and blk_register() no-ops on
+     * a repeat pointer -- so the old 'usbN' registry entry simply comes back
+     * to life with refreshed geometry, one entry, no duplicate.
+     *
+     * Before this, usb_msc_unbind left the slot occupied forever, and with
+     * USB_MSC_MAX_DEVICES=2 and two sticks attached the table was full from
+     * boot: ONE reseat of either stick was refused with "too many devices"
+     * and the stick stayed UNKNOWN(unprobed) until reboot (EliteDesk,
+     * 2026-08-15 -- the user unplugged and replugged the PNY stick while
+     * Disk Manager was open, a completely ordinary thing to do). */
+    struct usb_msc *m = 0;
+    size_t midx = g_msc_count;
+    for (size_t i = 0; i < g_msc_count; i++) {
+        if (g_msc[i].in_use && !g_msc[i].udev) { m = &g_msc[i]; midx = i; break; }
     }
-
-    struct usb_msc *m = &g_msc[g_msc_count];
-    memset(m, 0, sizeof(*m));
+    if (m) {
+        /* Revive: the blk entry is still registered and marked gone; leave
+         * it gone while fields are in flux (walkers check ->gone before
+         * touching anything). Keep the slot's DMA scratch -- it was
+         * allocated on first use and re-allocating would leak a page per
+         * reseat. Everything else is refreshed by the code below. */
+        kprintf("[usb-msc] reviving dead slot %u ('%s') for new device\n",
+                (unsigned)midx, m->name[0] ? m->name : "?");
+    } else {
+        if (g_msc_count >= USB_MSC_MAX_DEVICES) {
+            kprintf("[usb-msc] too many devices, ignoring slot %u\n",
+                    dev->slot_id);
+            return false;
+        }
+        m = &g_msc[midx];                       /* midx == g_msc_count */
+        memset(m, 0, sizeof(*m));
+    }
     m->udev          = dev;
     m->iface_num     = iface->bInterfaceNumber;
     m->slot_id_cached = dev->slot_id;
@@ -475,18 +506,22 @@ bool usb_msc_probe(struct usb_device *dev,
     /* Allocate DMA scratch (one CBW + one CSW + one cluster data). All
      * three need to be HHDM-mapped so xhci_bulk_xfer_sync can
      * vmm_translate them straight to phys. A single 4K page is plenty
-     * for CBW + CSW; the data buffer gets its own page. */
-    struct dma_buf cbw_csw;
-    if (!alloc_dma_page(&cbw_csw)) {
-        kprintf("[usb-msc] OOM for CBW/CSW page\n");
-        return false;
+     * for CBW + CSW; the data buffer gets its own page. A REVIVED slot
+     * already owns both pages -- reuse them (see the revive note above). */
+    if (!m->cbw) {
+        struct dma_buf cbw_csw;
+        if (!alloc_dma_page(&cbw_csw)) {
+            kprintf("[usb-msc] OOM for CBW/CSW page\n");
+            return false;
+        }
+        m->cbw      = (struct cbw *)cbw_csw.virt;
+        m->cbw_phys = cbw_csw.phys;
+        m->csw      = (struct csw *)((uint8_t *)cbw_csw.virt + 64);
+        m->csw_phys = cbw_csw.phys + 64;
     }
-    m->cbw      = (struct cbw *)cbw_csw.virt;
-    m->cbw_phys = cbw_csw.phys;
-    m->csw      = (struct csw *)((uint8_t *)cbw_csw.virt + 64);
-    m->csw_phys = cbw_csw.phys + 64;
 
-    if (!alloc_dma_page((struct dma_buf *)&g_data_buf[g_msc_count])) {
+    if (!g_data_buf[midx].virt &&
+        !alloc_dma_page((struct dma_buf *)&g_data_buf[midx])) {
         kprintf("[usb-msc] OOM for data buffer\n");
         return false;
     }
@@ -555,8 +590,10 @@ bool usb_msc_probe(struct usb_device *dev,
     m->block_count = (uint64_t)last_lba + 1ull;
 
     /* Build a "usbN" name. Lower-case + decimal index, stable for
-     * blk_find lookups from the shell. */
-    int idx = (int)g_msc_count;
+     * blk_find lookups from the shell. A revived slot regains its OLD
+     * index, so the registry entry keeps its name ('usb1' stays 'usb1'
+     * across a reseat). */
+    int idx = (int)midx;
     char *p = m->name;
     *p++ = 'u'; *p++ = 's'; *p++ = 'b';
     if (idx >= 10) { *p++ = (char)('0' + idx / 10); }
@@ -583,6 +620,10 @@ bool usb_msc_probe(struct usb_device *dev,
         while (w > 0 && mm[w - 1] == ' ') w--;
         mm[w] = '\0';
     }
+    /* For a revived slot this is a no-op (same pointer already on the
+     * list) and the entry is live again the moment `gone` clears below.
+     * For a fresh slot it appends normally. */
+    m->blk.gone = false;
     blk_register(&m->blk);
     dev->msc_state = m;
 
@@ -603,7 +644,7 @@ bool usb_msc_probe(struct usb_device *dev,
                 m->name);
     }
 
-    g_msc_count++;
+    if (midx == g_msc_count) g_msc_count++;    /* fresh slot consumed */
     return true;
 }
 
