@@ -1452,3 +1452,106 @@ int vfs_resolve_path(const char *path, char *resolved, size_t resolved_sz) {
     }
     return VFS_ERR_LOOP;
 }
+
+/* ================================================================== *
+ * Slice 127: recursive delete, shared by every caller that needs it.
+ *
+ * `rm` in the kernel shell could remove a file or an EMPTY directory and
+ * nothing else, and the GUI terminal (src/term.c, its own much smaller
+ * builtin set) had no delete at all -- so a directory TREE could not be
+ * removed from this OS by any route. Found the practical way: a corrupt
+ * chrome profile at /data/cr2, thousands of files deep, needed clearing.
+ *
+ * It lives HERE rather than in either shell because both need it and the
+ * file manager will too; duplicating a recursive unlink into three command
+ * tables is how they drift.
+ *
+ * Two things this gets right that a naive version does not:
+ *
+ *  - The readdir cursor is an index into a directory whose entries are
+ *    being deleted underneath it, so HOLDING it across an unlink skips
+ *    entries. Remove one child, close, reopen, repeat until a full pass
+ *    finds nothing left. Slower, correct, obvious.
+ *  - Recursion carries ONE path buffer, appended to and truncated on the
+ *    way back out. A VFS_PATH_MAX buffer per frame is what would overflow
+ *    the kernel stack on a deep tree; depth is capped at VFS_RMTREE_MAX
+ *    besides, with a real error rather than a fault.
+ *
+ * `failed` (optional) receives the path of the first thing that could not
+ * be removed, so a caller can report something better than an errno.
+ * ================================================================== */
+#define VFS_RMTREE_MAX_DEPTH 32
+
+static int vfs_rmtree_walk(char *path, size_t len, size_t cap, int depth,
+                           bool force, char *failed, size_t failed_cap) {
+    struct vfs_stat st;
+    int rc = vfs_stat(path, &st);
+    if (rc != VFS_OK)
+        return (force && rc == VFS_ERR_NOENT) ? VFS_OK : rc;
+
+    if (st.type == VFS_TYPE_DIR) {
+        if (depth >= VFS_RMTREE_MAX_DEPTH) {
+            if (failed && failed_cap) {
+                size_t n = 0;
+                while (path[n] && n + 1 < failed_cap) { failed[n] = path[n]; n++; }
+                failed[n] = 0;
+            }
+            return VFS_ERR_NAMETOOLONG;
+        }
+        for (;;) {
+            struct vfs_dir d;
+            if (vfs_opendir(path, &d) != VFS_OK) break;
+            struct vfs_dirent ent;
+            bool removed_one = false;
+            while (vfs_readdir(&d, &ent) == VFS_OK) {
+                if (ent.name[0] == '.' &&
+                    (ent.name[1] == 0 ||
+                     (ent.name[1] == '.' && ent.name[2] == 0)))
+                    continue;
+                size_t nlen = 0;
+                while (ent.name[nlen]) nlen++;
+                if (len + 1 + nlen + 1 > cap) continue;      /* skip: too long */
+                size_t save = len;
+                if (len == 0 || path[len - 1] != '/') path[len++] = '/';
+                for (size_t i = 0; i < nlen; i++) path[len + i] = ent.name[i];
+                len += nlen;
+                path[len] = 0;
+
+                int sub = vfs_rmtree_walk(path, len, cap, depth + 1, force,
+                                          failed, failed_cap);
+                len = save; path[len] = 0;
+                if (sub != VFS_OK) { vfs_closedir(&d); return sub; }
+                removed_one = true;
+                break;                                       /* rewind */
+            }
+            vfs_closedir(&d);
+            if (!removed_one) break;
+        }
+    }
+
+    rc = vfs_unlink(path);
+    if (rc != VFS_OK) {
+        if (force && rc == VFS_ERR_NOENT) return VFS_OK;
+        if (failed && failed_cap) {
+            size_t n = 0;
+            while (path[n] && n + 1 < failed_cap) { failed[n] = path[n]; n++; }
+            failed[n] = 0;
+        }
+        return rc;
+    }
+    return VFS_OK;
+}
+
+int vfs_rmtree(const char *path, bool force, char *failed, size_t failed_cap) {
+    if (!path || !path[0]) return VFS_ERR_INVAL;
+    /* Refuse to recurse from the root: it would walk into /proc and /sys and
+     * fail confusingly on synthesised nodes the caller never meant to touch. */
+    if (path[0] == '/' && path[1] == 0) return VFS_ERR_INVAL;
+    char buf[VFS_PATH_MAX];
+    size_t len = 0;
+    while (path[len] && len + 1 < sizeof buf) { buf[len] = path[len]; len++; }
+    if (path[len]) return VFS_ERR_NAMETOOLONG;
+    buf[len] = 0;
+    if (failed && failed_cap) failed[0] = 0;
+    return vfs_rmtree_walk(buf, len, sizeof buf, 0, force, failed, failed_cap);
+}

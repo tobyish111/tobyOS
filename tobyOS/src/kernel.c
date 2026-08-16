@@ -3319,6 +3319,34 @@ void _start(void) {
             }
             /* -f on a missing path must be silent and succeed. */
             shell_run_test_line("rm -f /data/.rmtest/nope");
+            /* THE GUI TERMINAL IS A DIFFERENT COMMAND TABLE, and that is the
+             * whole reason this gate grew: `rm` answered "unknown" there even
+             * after the kernel shell had rm -r, because src/term.c keeps its
+             * own much smaller builtin set. A shell-only test cannot see that
+             * gap, so drive a real term session the way the GUI app does --
+             * bytes in, newline to execute. */
+            {
+                struct term_session *ts = term_session_create();
+                if (!ts) {
+                    kprintf("[RMTREE] FAIL: no term session available\n");
+                    fails++;
+                } else {
+                    shell_run_test_line("mkdir /data/.rmtest2");
+                    shell_run_test_line("mkdir /data/.rmtest2/x");
+                    shell_run_test_line("write /data/.rmtest2/x/f.txt hi");
+                    const char *line = "rm -r /data/.rmtest2\n";
+                    term_session_write_input(ts, line, strlen(line));
+                    if (vfs_stat("/data/.rmtest2", &st) == VFS_OK) {
+                        kprintf("[RMTREE] FAIL: GUI-terminal rm -r left the "
+                                "tree behind\n");
+                        fails++;
+                    } else {
+                        kprintf("[RMTREE] ok: GUI-terminal rm -r removed the "
+                                "tree\n");
+                    }
+                    term_session_close(ts);
+                }
+            }
             kprintf("[RMTREE] VERDICT: %s\n", fails ? "FAIL" : "PASS");
         }
 #endif

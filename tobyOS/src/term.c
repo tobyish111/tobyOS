@@ -212,7 +212,8 @@ static bool streq(const char *a, const char *b) {
 static void builtin_help(struct term_session *s) {
     term_printf(s,
         "builtins: help, clear, about, echo, pwd, cd <p>, ls [p],\r\n"
-        "          cat <p>, run <p> [arg], whoami, su <user>,\r\n"
+        "          cat <p>, mkdir <p>, rm [-r] [-f] <p>,\r\n"
+        "          run <p> [arg], whoami, su <user>,\r\n"
         "          pkg <subcmd> ...\r\n"
         "apps are launched in the background -- their stdout goes to\r\n"
         "the kernel console/serial, not this window.\r\n"
@@ -296,6 +297,75 @@ static void builtin_ls(struct term_session *s, int argc, char **argv) {
     }
     vfs_closedir(&d);
     if (shown == 0) term_printf(s, "  (empty)\r\n");
+}
+
+/* Slice 127: the GUI terminal had NO delete and NO mkdir at all -- its
+ * builtin set is separate from the kernel shell's, which is why `rm` here
+ * answered "unknown" even after the shell grew rm -r. Both now exist and
+ * both go through vfs_rmtree/vfs_mkdir, so there is one implementation of
+ * recursive delete in the tree rather than one per command table. */
+static void builtin_rm(struct term_session *s, int argc, char **argv) {
+    bool recursive = false, force = false;
+    int  argi = 1;
+    for (; argi < argc && argv[argi][0] == '-' && argv[argi][1]; argi++) {
+        for (const char *f = argv[argi] + 1; *f; f++) {
+            if      (*f == 'r' || *f == 'R') recursive = true;
+            else if (*f == 'f')              force     = true;
+            else { term_printf(s, "rm: unknown option -%c\r\n", *f); return; }
+        }
+    }
+    if (argi >= argc) {
+        term_printf(s, "usage: rm [-r] [-f] <path>...\r\n");
+        return;
+    }
+    for (; argi < argc; argi++) {
+        char abs[TERM_CWD_MAX];
+        const char *path = argv[argi];
+        if (path[0] != '/') {
+            if (!resolve_path(s, path, abs, sizeof(abs))) {
+                term_printf(s, "rm: path too long\r\n");
+                continue;
+            }
+            path = abs;
+        }
+        if (recursive) {
+            char failed[TERM_CWD_MAX];
+            int rc = vfs_rmtree(path, force, failed, sizeof(failed));
+            if (rc != VFS_OK)
+                term_printf(s, "rm: '%s': %s\r\n",
+                            failed[0] ? failed : path, vfs_strerror(rc));
+        } else {
+            int rc = vfs_unlink(path);
+            if (rc != VFS_OK) {
+                if (force && rc == VFS_ERR_NOENT) continue;
+                struct vfs_stat st;
+                if (vfs_stat(path, &st) == VFS_OK && st.type == VFS_TYPE_DIR)
+                    term_printf(s, "rm: '%s' is a directory -- use -r\r\n",
+                                argv[argi]);
+                else
+                    term_printf(s, "rm: '%s': %s\r\n", argv[argi],
+                                vfs_strerror(rc));
+            }
+        }
+    }
+}
+
+static void builtin_mkdir(struct term_session *s, int argc, char **argv) {
+    if (argc < 2) { term_printf(s, "usage: mkdir <path>\r\n"); return; }
+    for (int i = 1; i < argc; i++) {
+        char abs[TERM_CWD_MAX];
+        const char *path = argv[i];
+        if (path[0] != '/') {
+            if (!resolve_path(s, path, abs, sizeof(abs))) {
+                term_printf(s, "mkdir: path too long\r\n");
+                continue;
+            }
+            path = abs;
+        }
+        int rc = vfs_mkdir(path);
+        if (rc != VFS_OK)
+            term_printf(s, "mkdir: '%s': %s\r\n", argv[i], vfs_strerror(rc));
+    }
 }
 
 static void builtin_cat(struct term_session *s, int argc, char **argv) {
@@ -513,6 +583,8 @@ static void execute_line(struct term_session *s) {
     else if (streq(cmd, "cd"))     builtin_cd(s, argc, argv);
     else if (streq(cmd, "ls"))     builtin_ls(s, argc, argv);
     else if (streq(cmd, "cat"))    builtin_cat(s, argc, argv);
+    else if (streq(cmd, "rm"))     builtin_rm(s, argc, argv);
+    else if (streq(cmd, "mkdir"))  builtin_mkdir(s, argc, argv);
     else if (streq(cmd, "run"))    builtin_run(s, argc, argv);
     else if (streq(cmd, "whoami")) builtin_whoami(s);
     else if (streq(cmd, "su"))     builtin_su(s, argc, argv);

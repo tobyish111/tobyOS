@@ -2652,70 +2652,6 @@ static void cmd_mkdir(int argc, char **argv) {
  * Returns 0 on success, -1 if anything could not be removed (the caller
  * reports; each individual failure is printed as it happens so a partial
  * delete says exactly what survived). */
-#define RM_MAX_DEPTH 32
-
-static int rm_tree(char *path, size_t len, size_t cap, int depth, bool force) {
-    struct vfs_stat st;
-    int rc = vfs_stat(path, &st);
-    if (rc != VFS_OK) {
-        if (!force) kprintf("rm: '%s': %s\n", path, vfs_strerror(rc));
-        return force ? 0 : -1;
-    }
-
-    if (st.type == VFS_TYPE_DIR) {
-        if (depth >= RM_MAX_DEPTH) {
-            kprintf("rm: '%s': directory nested deeper than %d -- stopping\n",
-                    path, RM_MAX_DEPTH);
-            return -1;
-        }
-        /* Re-open the directory after every removal. The readdir cursor is
-         * an index into a directory whose entries we are actively deleting,
-         * so holding it across an unlink would skip entries -- delete one,
-         * rewind, repeat until a full pass finds nothing left to take. */
-        for (;;) {
-            struct vfs_dir d;
-            if (vfs_opendir(path, &d) != VFS_OK) break;
-            struct vfs_dirent ent;
-            bool removed_one = false;
-            while (vfs_readdir(&d, &ent) == VFS_OK) {
-                if (ent.name[0] == '.' &&
-                    (ent.name[1] == 0 || (ent.name[1] == '.' && ent.name[2] == 0)))
-                    continue;
-                size_t nlen = strlen(ent.name);
-                /* +1 for the separator we may add, +1 for the NUL. */
-                if (len + 1 + nlen + 1 > cap) {
-                    kprintf("rm: path too long under '%s' -- skipping '%s'\n",
-                            path, ent.name);
-                    continue;
-                }
-                size_t save = len;
-                if (len == 0 || path[len - 1] != '/') path[len++] = '/';
-                memcpy(path + len, ent.name, nlen);
-                len += nlen;
-                path[len] = 0;
-
-                int sub = rm_tree(path, len, cap, depth + 1, force);
-
-                len = save; path[len] = 0;          /* truncate back */
-                if (sub != 0) { vfs_closedir(&d); return -1; }
-                removed_one = true;
-                break;                              /* rewind: reopen */
-            }
-            vfs_closedir(&d);
-            if (!removed_one) break;                /* a clean pass: empty */
-        }
-    }
-
-    rc = vfs_unlink(path);
-    if (rc != VFS_OK) {
-        if (!force || rc != VFS_ERR_NOENT) {
-            kprintf("rm: '%s': %s\n", path, vfs_strerror(rc));
-            return -1;
-        }
-    }
-    return 0;
-}
-
 static void cmd_rm(int argc, char **argv) {
     bool recursive = false, force = false;
     int  argi = 1;
@@ -2753,8 +2689,15 @@ static void cmd_rm(int argc, char **argv) {
             continue;
         }
         if (recursive) {
-            if (rm_tree(path, strlen(path), sizeof(path), 0, force) != 0)
+            /* Slice 127: one implementation, in the VFS -- the GUI terminal
+             * needs the same thing and the file manager will too. */
+            char bad[VFS_PATH_MAX];
+            int rc = vfs_rmtree(path, force, bad, sizeof(bad));
+            if (rc != VFS_OK) {
+                kprintf("rm: '%s': %s\n", bad[0] ? bad : path,
+                        vfs_strerror(rc));
                 failed = 1;
+            }
         } else {
             int rc = vfs_unlink(path);
             if (rc != VFS_OK) {
