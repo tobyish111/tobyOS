@@ -1376,8 +1376,33 @@ static bool xhci_finalize_device(struct xhci_dev_state *st) {
         kprintf("[xhci] GET_DESCRIPTOR(DEV, 8B) failed on slot %u\n", slot_id);
         return false;
     }
-    if (dev_desc->bMaxPacketSize0 != 0 && dev_desc->bMaxPacketSize0 != st->usb.mps0) {
-        st->usb.mps0 = dev_desc->bMaxPacketSize0;
+    /* bMaxPacketSize0 is a BYTE COUNT for LS/FS/HS but an EXPONENT for
+     * SuperSpeed (9 means 2^9 = 512, USB 3.x 9.6.1). Taking the SS value
+     * literally patched EP0 from the correct 512 down to NINE bytes, after
+     * which the very next control transfer times out -- on real hardware.
+     * QEMU does not enforce the EP-context MPS, so every QEMU stick
+     * (usbprov.sh 4/4) sailed through the same wrong patch, and the bug
+     * only surfaced on the EliteDesk: 8B fetch OK, then "GET_DESCRIPTOR
+     * (DEV, 18B) failed" -- the one transfer that runs after the patch.
+     * (This same fix was applied once in the HP 260 G2 arc and reverted
+     * with the timing changes it shipped alongside; the note said to
+     * revisit "if a SuperSpeed device misbehaves". One did.) */
+    uint16_t desc_mps0 = dev_desc->bMaxPacketSize0;
+    if (st->usb.speed >= USB_SPEED_SUPER && desc_mps0 != 0) {
+        if (desc_mps0 <= 12) {
+            desc_mps0 = (uint16_t)(1u << desc_mps0);
+        } else {
+            /* An SS device reporting a literal byte count here is out of
+             * spec; log it and keep the 512 default rather than wedging
+             * EP0 on garbage. */
+            kprintf("[xhci] slot %u: SS bMaxPacketSize0=%u not an exponent "
+                    "-- keeping mps0=%u\n",
+                    slot_id, desc_mps0, st->usb.mps0);
+            desc_mps0 = st->usb.mps0;
+        }
+    }
+    if (desc_mps0 != 0 && desc_mps0 != st->usb.mps0) {
+        st->usb.mps0 = desc_mps0;
         struct xhci_ep_ctx *ep0 =
             (struct xhci_ep_ctx *)((uint8_t *)st->input_ctx + 64);
         ep0->dw1 = (ep0->dw1 & ~0xFFFF0000u) |

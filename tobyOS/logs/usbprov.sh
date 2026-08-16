@@ -10,11 +10,16 @@
 # is whole-disk anyway.
 #
 # QEMU attaches the stick to qemu-xhci exactly as real SuperSpeed hardware
-# does, so this exercises the same driver path. What it CANNOT prove is that
-# the EliteDesk's firmware routes a given port to xHCI at all -- on Intel PCH
-# the USB2 pairs are routed by XUSB2PR, which tobyOS deliberately leaves alone
-# so the BIOS keeps the legacy-emulated keyboard. Hence the port census: it
+# does, so this exercises the same driver path. Hence the port census: it
 # separates "no device was connected" from "we failed to enumerate one".
+#
+# UPDATED 2026-08-15 (8b85f82): this file used to say tobyOS "deliberately
+# leaves XUSB2PR alone", and that was the wrong conclusion -- on 7/8-series
+# PCH the USB2 pairs come up on EHCI and the firmware WAITS for the OS to
+# claim them, exactly as Linux's usb_enable_intel_xhci_ports() does. tobyOS
+# now performs that handoff (src/xhci.c), so a stick in a blue USB-3 port
+# should enumerate on the EliteDesk. QEMU cannot check that half -- its ports
+# need no routing -- so the real-hardware run is still owed.
 cd /c/CustomOS/tobyOS || exit 1
 export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
 mkdir -p /c/t; export TMP='C:\t' TEMP='C:\t' TMPDIR='C:\t'
