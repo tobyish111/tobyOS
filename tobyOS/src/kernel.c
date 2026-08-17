@@ -2032,6 +2032,22 @@ static void posix_shell_selftest(void) {
         "echo POSIXSH: noexec-good=$?",
         "sh /data/px_badquote.sh",
         "echo POSIXSH: noexec-quote=$?",
+        /* --- traps fire on delivery; job control --- */
+        "trap 'echo POSIXSH: trap-usr1-fired' USR1",
+        "kill -USR1 $$",
+        "echo POSIXSH: after-kill=$?",
+        "trap - USR1",
+        "trap 'echo POSIXSH: trap-ignored-bad' USR2",
+        "trap '' USR2",
+        "kill -USR2 $$",
+        "echo POSIXSH: ignored-ok=$?",
+        "trap - USR2",
+        "/bin/echo POSIXSH: bgjob &",
+        "jobs",
+        "echo POSIXSH: jobs-status=$?",
+        "wait",
+        "sh -c 'trap \"echo POSIXSH: sub-trap\" EXIT; exit 3'",
+        "echo POSIXSH: sub-trap-status=$?",
         "echo POSIXSH: done",
         0
     };

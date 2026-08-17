@@ -337,7 +337,16 @@ $required = @(
     'POSIXSH: noexec-good=0',
     'POSIXSH: noexec-quote=2',
     "sh: syntax error: 'if' without matching 'fi'",
-    'sh: syntax error: unterminated single quote'
+    'sh: syntax error: unterminated single quote',
+
+    # a trap fires when the shell is actually signalled; job control
+    'POSIXSH: trap-usr1-fired',
+    'POSIXSH: after-kill=0',
+    'POSIXSH: ignored-ok=0',
+    'POSIXSH: jobs-status=0',
+    'POSIXSH: bgjob',
+    'POSIXSH: sub-trap',
+    'POSIXSH: sub-trap-status=3'
 )
 
 # The harness echoes every command line it drives ("[shell-test] $ ..."), and
@@ -362,6 +371,7 @@ if ($out -match '(?m)^POSIXSH: ml-case-bad') { $missing += 'unexpected POSIXSH: 
 if ($out -match '(?m)^POSIXSH: case-quoted-bad') { $missing += 'unexpected POSIXSH: case-quoted-bad' }
 if ($out -match '(?m)^POSIXSH: errexit-fn-bad') { $missing += 'unexpected POSIXSH: errexit-fn-bad' }
 if ($out -match '(?m)^POSIXSH: never') { $missing += 'unexpected POSIXSH: never' }
+if ($out -match '(?m)^POSIXSH: trap-ignored-bad') { $missing += 'unexpected POSIXSH: trap-ignored-bad' }
 if ($txt -match '(?m)^POSIXSH: loop-later') { $missing += 'unexpected POSIXSH: loop-later' }
 if ($txt -match '(?m)^POSIXSH: return-bad') { $missing += 'unexpected POSIXSH: return-bad' }
 if ($txt -match '(?m)^POSIXSH: subshell-alias-bad') { $missing += 'unexpected POSIXSH: subshell-alias-bad' }

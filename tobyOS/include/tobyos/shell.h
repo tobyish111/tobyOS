@@ -38,4 +38,8 @@ void shell_run_test_line(const char *line);
  * or the signal subsystem). The trap handler will run at the next safe point. */
 void shell_deliver_signal(int sig);
 
+/* True when `pid` is the process the shell itself runs as. Used by signal
+ * delivery to route a signal aimed at the shell to its trap dispatcher. */
+bool shell_owns_pid(int pid);
+
 #endif /* TOBYOS_SHELL_H */
