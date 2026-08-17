@@ -504,6 +504,15 @@ static void env_init_defaults(void) {
     if (env_set("PWD",   "/")       < 0) kprintf("env: default PWD set failed\n");
     if (env_set("SHELL", "tobysh")  < 0) kprintf("env: default SHELL set failed\n");
     if (env_set("OPTIND", "1")      < 0) kprintf("env: default OPTIND set failed\n");
+    /* POSIX 2.5.3: IFS shall be SET by default to <space><tab><newline>.
+     *
+     * Every splitting site here already falls back to those three when IFS is
+     * absent, so behaviour was right -- but the VARIABLE did not exist, so
+     * `echo "[$IFS]"` printed empty where bash prints the three characters,
+     * and a script that saves and restores IFS around a loop restored it to
+     * nothing. Setting it makes the value observable and the fallback
+     * redundant rather than load-bearing. */
+    if (env_set("IFS", " \t\n")     < 0) kprintf("env: default IFS set failed\n");
 }
 
 /* ---- POSIX positional parameters ---------------------------------- */
