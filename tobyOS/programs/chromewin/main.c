@@ -443,6 +443,8 @@ static int cdp_take_msg(void) {
 }
 
 /* Send a browser-level or session command; return its id. */
+static void cdp_wake(void);      /* slice 133: defined with the idle state */
+
 static int cdp_send(const char *method, const char *params_json, int with_session) {
     static char buf[16384];   /* slice 59h: 2048 truncated the grown probe JS into invalid JSON (-32700) */
     int id = g_next_id++;
@@ -454,6 +456,14 @@ static int cdp_send(const char *method, const char *params_json, int with_sessio
         snprintf(buf, sizeof buf,
                  "{\"id\":%d,\"method\":\"%s\",\"params\":%s}",
                  id, method, params_json ? params_json : "{}");
+    /* Slice 133: THE snap-back hook, placed here on purpose. Every input path
+     * -- mouse, key down/up/char, every variant and any added later -- funnels
+     * through cdp_send, so hooking the method name cannot miss one, which a
+     * hook at each call site eventually would. An Input.* command means the
+     * user just did something and is waiting to see the result, so drop out of
+     * idle and make any deferred ack due immediately. */
+    if (method && method[0] == 'I' && method[1] == 'n' && method[2] == 'p')
+        cdp_wake();
     cdp_write(buf);
     return id;
 }
@@ -503,6 +513,79 @@ static long g_t_turn, g_n_turn, g_last_ack_ms;
  * silent keep the 97 ms interactive path. Single-in-flight => one slot. */
 static int  g_ack_pend_sid = -1;          /* deferred ack; -1 = none */
 static long g_ack_due_ms;
+
+/* ---- SLICE 133: DON'T PAY FOR PHOTOGRAPHS OF A PAGE THAT DID NOT CHANGE --
+ *
+ * MEASURED, and this is the whole justification: a 39% smaller JPEG (Q=60 ->
+ * Q=20, 21602 -> 13152 bytes) moved the frame cycle by ONE millisecond
+ * (100 -> 99 ms). Encode, base64 and transport together are ~1% of the cycle;
+ * essentially all ~100 ms is chrome's CAPTURE -- the compositor readback. The
+ * cost is therefore PER CAPTURE, and per capture is exactly what is wasted:
+ * 84% of sampled frames on a Bing SERP are identical to the one before (6
+ * distinct JPEG sizes across a whole run; the EliteDesk bootlog agrees --
+ * jpeg=30710/30713/30660/30687).
+ *
+ * The screencast is SINGLE-IN-FLIGHT: chrome captures frame N+1 only after we
+ * ack frame N. So OUR ACK RATE IS CHROME'S CAPTURE RATE, and holding an ack
+ * back is the only lever the measurement supports. Slice 115 already built
+ * the deferred-ack machinery for the viz path; this engages it when CDP is
+ * the only source.
+ *
+ * Policy: after IDLE_ENTER consecutive unchanged frames, ack on a ~IDLE_ACK_MS
+ * timer (~2 captures/s) instead of immediately. ANY change, ANY input, ANY
+ * network event snaps back to full rate at once. The point is not to save
+ * power -- it is that the CPU chrome burns re-photographing a static page is
+ * exactly the CPU that is missing when the user finally clicks something.
+ *
+ * THE FAILURE MODE TO DESIGN AGAINST is a deferred ack that never gets sent:
+ * chrome would stop sending frames FOREVER and the window would freeze, which
+ * is far worse than a wasted capture. Three guards:
+ *   1. the flush in the main loop is UNCONDITIONAL (not under any #ifdef) and
+ *      runs every pass, so a pending ack always goes out once due;
+ *   2. g_ack_due_ms is an absolute deadline -- it cannot be pushed back;
+ *   3. anything that could mean "the user is waiting" calls cdp_wake(), which
+ *      clears the idle state and makes the pending ack due immediately.
+ * Slice 116's lesson also applies: a navigation drops the old session's
+ * deferred ack (see the frameNavigated handler), so a stale sid is never
+ * flushed against a dead session. */
+#define IDLE_ENTER   8            /* unchanged frames before backing off */
+#define IDLE_ACK_MS  500          /* ~2 captures/s while nothing is moving */
+static unsigned g_same_run;               /* consecutive unchanged frames */
+static unsigned long g_frame_sig;         /* signature of the last frame */
+static int  g_idle_mode;                  /* 1 = currently backed off */
+static long g_idle_since_ms, g_idle_saved;/* [cwidle] accounting */
+
+/* Signature of the base64 payload still sitting in g_msg. Strided so it costs
+ * nothing on a 54 KiB payload, and length-seeded so a same-length-different-
+ * content frame cannot collide by stride alone. Runs BEFORE the ack, so the
+ * verdict is about THIS frame rather than the previous one. */
+static unsigned long frame_signature(void) {
+    const char *p = strstr(g_msg, "\"data\":\"");
+    if (!p) return 0;
+    p += 8;
+    const char *e = strchr(p, '"');
+    if (!e || e <= p) return 0;
+    size_t len = (size_t)(e - p);
+    unsigned long h = 1469598103934665603UL ^ (unsigned long)len;
+    size_t stride = len / 256; if (stride < 1) stride = 1;
+    for (size_t i = 0; i < len; i += stride) {
+        h ^= (unsigned char)p[i];
+        h *= 1099511628211UL;
+    }
+    return h ? h : 1;                     /* 0 is reserved for "no signature" */
+}
+
+/* "Something happened -- stop idling." Safe to call from anywhere, including
+ * before the first frame. */
+static void cdp_wake(void) {
+    g_same_run = 0;
+    if (g_idle_mode) {
+        g_idle_mode = 0;
+        printf("[cwidle] active (idled %lds, ~%ld captures skipped)\n",
+               (sys_clock_ms() - g_idle_since_ms) / 1000, g_idle_saved);
+    }
+    if (g_ack_pend_sid >= 0) g_ack_due_ms = 0;   /* flush on the next pass */
+}
 static long g_cdp_last_ms;                /* last screencast frame install */
 static long g_t_shot, g_n_shot, g_shot_sent_ms;
 static int  g_n_push, g_n_poll;
@@ -639,6 +722,19 @@ static void handle_screencast_frame(void) {
      * b64+decode+paint serialized our ~2-5ms into every cycle. Acking first
      * overlaps chrome's next capture/encode with our decode of this frame.
      * (g_msg is not touched by cdp_send, so the payload survives the send.) */
+    /* Slice 133: classify THIS frame before the ack decision below. */
+#ifndef CW_LAT
+    {
+        unsigned long sig = frame_signature();
+        if (sig && sig == g_frame_sig) {
+            if (g_same_run < 1000000u) g_same_run++;
+        } else {
+            if (g_idle_mode) cdp_wake();           /* real change -- full rate */
+            g_same_run = 0;
+        }
+        if (sig) g_frame_sig = sig;
+    }
+#endif
     if (sid >= 0) {                                /* ack -> chrome sends the next */
 #if defined(CW_VIZ) && !defined(CW_LAT)
         /* Slice 115: defer the ack while viz frames flow (see decl block).
@@ -647,6 +743,25 @@ static void handle_screencast_frame(void) {
         if (g_xf_live && sys_clock_ms() - g_xf_last_ms < 300) {
             g_ack_pend_sid = sid;
             g_ack_due_ms = sys_clock_ms() + 450;
+        } else
+#endif
+#ifndef CW_LAT
+        /* Slice 133: nothing has changed for IDLE_ENTER frames -- stop asking
+         * chrome to re-photograph it at full rate. Lat mode is excluded: it
+         * measures this very path, and throttling it would measure the
+         * throttle. */
+        if (g_same_run >= IDLE_ENTER) {
+            if (!g_idle_mode) {
+                g_idle_mode = 1;
+                g_idle_since_ms = sys_clock_ms();
+                g_idle_saved = 0;
+                printf("[cwidle] idle: %u unchanged frames -- backing off to "
+                       "~%d captures/s until something moves\n",
+                       g_same_run, 1000 / IDLE_ACK_MS);
+            }
+            g_idle_saved++;
+            g_ack_pend_sid = sid;
+            g_ack_due_ms = sys_clock_ms() + IDLE_ACK_MS;
         } else
 #endif
         {
@@ -788,6 +903,9 @@ static void note_network_event(void) {
             g_net_last_ms = sys_clock_ms();
             if (started) g_net_inflight++;
             else if (g_net_inflight > 0) g_net_inflight--;   /* clamped */
+            /* Slice 133: the page is fetching something, so it is about to
+             * change -- do not sit in the idle throttle through a load. */
+            cdp_wake();
             /* Deliberately NO tk_redraw here. A busy page fires hundreds of
              * these, and tk_redraw only marks dirty -- so they would coalesce
              * into a paint on every one of the ~66 main-loop passes per
@@ -941,6 +1059,11 @@ static void cdp_dispatch(void) {
         !strstr(g_msg, "\"parentId\"")) {
         char scp[128];
         g_ack_pend_sid = -1;
+        /* Slice 133: a new document is the least idle thing that can happen --
+         * drop the throttle AND the old page's frame signature, or the first
+         * frames of the new page could be compared against the old one's. */
+        g_frame_sig = 0;
+        cdp_wake();
         snprintf(scp, sizeof scp,
                  "{\"format\":\"jpeg\",\"quality\":" CW_STR(CW_Q) ","
                  "\"maxWidth\":%d,\"maxHeight\":%d,"
@@ -3023,20 +3146,38 @@ int main(void) {
 #endif
 #ifdef CW_VIZ
         vizframe_poll_once();      /* slice 107: chrome's viz shared bitmaps */
-        /* Slice 115: flush a deferred screencast ack once due (or at once
-         * when viz has gone quiet -- an interactive frame may be waiting). */
-        if (g_ack_pend_sid >= 0 &&
-            (sys_clock_ms() >= g_ack_due_ms ||
-             sys_clock_ms() - g_xf_last_ms >= 300)) {
-            char ackp[48];
-            snprintf(ackp, sizeof ackp, "{\"sessionId\":%d}", g_ack_pend_sid);
-            cdp_send("Page.screencastFrameAck", ackp, 1);
-            g_last_ack_ms = sys_clock_ms();
-            g_ack_pend_sid = -1;
-        }
-#ifdef CW_LAT
-        lat_probe_tick();          /* slice 114: responsiveness probes */
 #endif
+        /* SLICE 133: THIS FLUSH IS UNCONDITIONAL AND MUST STAY THAT WAY.
+         *
+         * It was inside #ifdef CW_VIZ, which was correct while viz was the
+         * only thing deferring acks. The idle throttle now defers them on the
+         * plain CDP path too -- the one every user actually runs -- and a
+         * deferred ack that is never sent stops chrome sending frames FOREVER
+         * (the window freezes, which is far worse than a wasted capture). So
+         * the flush runs on every pass of the loop that always runs, gated
+         * only by a deadline that can never be pushed back.
+         *
+         * The viz-quiet condition is kept (an interactive frame may be waiting
+         * behind a viz lull) but is now an EXTRA reason to flush early, never
+         * a requirement for flushing at all. */
+        if (g_ack_pend_sid >= 0) {
+            long now = sys_clock_ms();
+            int due = (now >= g_ack_due_ms);
+#ifdef CW_VIZ
+            if (!due && now - g_xf_last_ms >= 300) due = 1;
+#endif
+            if (due) {
+                char ackp[48];
+                snprintf(ackp, sizeof ackp, "{\"sessionId\":%d}", g_ack_pend_sid);
+                g_ack_pend_sid = -1;       /* clear BEFORE the send: cdp_send */
+                                           /* can set g_quit, and a half-sent  */
+                                           /* ack must not look still-pending  */
+                cdp_send("Page.screencastFrameAck", ackp, 1);
+                g_last_ack_ms = sys_clock_ms();
+            }
+        }
+#if defined(CW_VIZ) && defined(CW_LAT)
+        lat_probe_tick();          /* slice 114: responsiveness probes */
 #endif
 
         for (;;) {                             /* drain all buffered CDP msgs */
