@@ -105,6 +105,10 @@ static int g_positional_count;
  * `$@` behaves differently from `$*`. */
 static bool g_expand_dquote;
 
+/* $LINENO: line number of the command currently executing, counted within the
+ * script (or from shell start for interactive input). */
+static unsigned long g_shell_lineno;
+
 enum shell_flow {
     SHELL_FLOW_NONE = 0,
     SHELL_FLOW_BREAK,
@@ -158,6 +162,9 @@ static void execute_line_text(const char *src);
 static bool shell_name_is_valid(const char *s, size_t n);
 static bool shell_special_builtin_name(const char *name);
 static int shell_expand_param_word(const char *word, char *out, size_t cap);
+static bool shell_starts_with_word(const char *s, const char *word);
+static bool is_space(char c);
+static bool shell_is_word_end(char c);
 static const char *shell_skip_blanks(const char *s);
 static int parse_int(const char *s, int *out);
 static int shell_run_exit_trap(int status);
@@ -733,11 +740,45 @@ static void shell_function_unset(const char *name) {
     g_functions[idx].body = 0;
 }
 
+/* Signal names for `kill -l`, `kill -NAME` and `trap NAME`. Indexed by
+ * number, gaps included so the numbering stays true. */
+struct shell_signal_name { int num; const char *name; };
+
+static const struct shell_signal_name g_shell_signals[] = {
+    { SIGHUP, "HUP" },   { SIGINT, "INT" },   { SIGQUIT, "QUIT" },
+    { SIGILL, "ILL" },   { SIGTRAP, "TRAP" }, { SIGABRT, "ABRT" },
+    { SIGBUS, "BUS" },   { SIGFPE, "FPE" },   { SIGKILL, "KILL" },
+    { SIGUSR1, "USR1" }, { SIGSEGV, "SEGV" }, { SIGUSR2, "USR2" },
+    { SIGPIPE, "PIPE" }, { SIGALRM, "ALRM" }, { SIGTERM, "TERM" },
+    { SIGCHLD, "CHLD" }, { SIGCONT, "CONT" }, { SIGSTOP, "STOP" },
+    { SIGTSTP, "TSTP" }, { SIGTTIN, "TTIN" }, { SIGTTOU, "TTOU" },
+    { SIGURG, "URG" },   { SIGXCPU, "XCPU" }, { SIGXFSZ, "XFSZ" },
+    { SIGVTALRM, "VTALRM" }, { SIGPROF, "PROF" }, { SIGWINCH, "WINCH" },
+    { SIGIO, "IO" },     { SIGSYS, "SYS" },
+};
+
+static int shell_signal_by_name(const char *name) {
+    if (!name || !*name) return -1;
+    if (strncmp(name, "SIG", 3) == 0) name += 3;
+    for (size_t i = 0; i < sizeof(g_shell_signals) / sizeof(g_shell_signals[0]);
+         i++) {
+        if (strcmp(g_shell_signals[i].name, name) == 0)
+            return g_shell_signals[i].num;
+    }
+    return -1;
+}
+
+static const char *shell_signal_name(int num) {
+    for (size_t i = 0; i < sizeof(g_shell_signals) / sizeof(g_shell_signals[0]);
+         i++) {
+        if (g_shell_signals[i].num == num) return g_shell_signals[i].name;
+    }
+    return 0;
+}
+
 static const char *shell_trap_name(int sig) {
     if (sig == 0) return "EXIT";
-    if (sig == SIGINT) return "INT";
-    if (sig == SIGTERM) return "TERM";
-    return 0;
+    return shell_signal_name(sig);
 }
 
 static void shell_trap_unset(int sig) {
@@ -1220,16 +1261,41 @@ static bool shell_set_opt(char c, bool on) {
     }
 }
 
+struct shell_opt_desc {
+    const char *name;
+    bool *flag;
+};
+
+static const struct shell_opt_desc *shell_option_table(int *count) {
+    static const struct shell_opt_desc opts[] = {
+        { "allexport", &g_opt_allexport },
+        { "errexit",   &g_opt_errexit   },
+        { "noclobber", &g_opt_noclobber },
+        { "noexec",    &g_opt_noexec    },
+        { "noglob",    &g_opt_noglob    },
+        { "notify",    &g_opt_notify    },
+        { "nounset",   &g_opt_nounset   },
+        { "verbose",   &g_opt_verbose   },
+        { "xtrace",    &g_opt_xtrace    },
+    };
+    *count = (int)(sizeof(opts) / sizeof(opts[0]));
+    return opts;
+}
+
 static void shell_print_options(void) {
-    kprintf("allexport %s\n", g_opt_allexport ? "on" : "off");
-    kprintf("errexit   %s\n", g_opt_errexit ? "on" : "off");
-    kprintf("noclobber %s\n", g_opt_noclobber ? "on" : "off");
-    kprintf("noexec    %s\n", g_opt_noexec ? "on" : "off");
-    kprintf("noglob    %s\n", g_opt_noglob ? "on" : "off");
-    kprintf("notify    %s\n", g_opt_notify ? "on" : "off");
-    kprintf("nounset   %s\n", g_opt_nounset ? "on" : "off");
-    kprintf("verbose   %s\n", g_opt_verbose ? "on" : "off");
-    kprintf("xtrace    %s\n", g_opt_xtrace  ? "on" : "off");
+    int n = 0;
+    const struct shell_opt_desc *opts = shell_option_table(&n);
+    for (int i = 0; i < n; i++)
+        kprintf("%-9s %s\n", opts[i].name, *opts[i].flag ? "on" : "off");
+}
+
+/* `set +o` has to write the settings in a form that can be read back in --
+ * that is what makes save/restore of shell options possible. */
+static void shell_print_options_reinput(void) {
+    int n = 0;
+    const struct shell_opt_desc *opts = shell_option_table(&n);
+    for (int i = 0; i < n; i++)
+        kprintf("set %co %s\n", *opts[i].flag ? '-' : '+', opts[i].name);
 }
 
 static bool shell_set_opt_by_name(const char *name, bool on) {
@@ -1273,6 +1339,8 @@ static void cmd_set(int argc, char **argv) {
                 if (!shell_set_opt_by_name(argv[i], false)) {
                     kprintf("set: unknown option '%s'\n", argv[i]); shell_set_status(1); return;
                 }
+            } else {
+                shell_print_options_reinput();
             }
             first = i + 1;
             continue;
@@ -3795,9 +3863,37 @@ static const char *shell_skip_expansion(const char *p) {
     if (open != '(' && open != '{') return 0;
     char close = (open == '(') ? ')' : '}';
     int depth = 0;
+    int case_depth = 0;
     for (const char *q = p + 1; *q; q++) {
+        if (*q == '\'') {
+            q++;
+            while (*q && *q != '\'') q++;
+            if (!*q) return 0;
+            continue;
+        }
+        if (*q == '"') {
+            q++;
+            while (*q && *q != '"') {
+                if (*q == '\\' && q[1]) q++;
+                q++;
+            }
+            if (!*q) return 0;
+            continue;
+        }
+        /* Inside `$(...)`, a case item's pattern ends in an unbalanced `)`
+         * that must not be counted as closing the substitution. */
+        if (open == '(') {
+            if (shell_starts_with_word(q, "case") &&
+                (is_space(q[-1]) || q[-1] == ';' || q[-1] == '(')) {
+                case_depth++;
+            } else if (strncmp(q, "esac", 4) == 0 &&
+                       shell_is_word_end(q[4]) && case_depth > 0 &&
+                       (is_space(q[-1]) || q[-1] == ';')) {
+                case_depth--;
+            }
+        }
         if (*q == open) depth++;
-        else if (*q == close && --depth == 0) return q;
+        else if (*q == close && case_depth == 0 && --depth == 0) return q;
     }
     return 0;
 }
@@ -3950,10 +4046,13 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     }
 
     g_script_depth++;
+    unsigned long saved_lineno = g_shell_lineno;
+    g_shell_lineno = 0;
     int last = 0;
     char *p = text;
     bool first_line = true;
     while (*p) {
+        g_shell_lineno++;
         char *line_start = p;
         while (*p && *p != '\n' && *p != '\r') p++;
         char saved = *p;
@@ -3998,6 +4097,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     }
     if (run_exit_trap) last = shell_run_exit_trap(last);
     g_script_depth--;
+    g_shell_lineno = saved_lineno;
     return last;
 }
 
@@ -4395,12 +4495,9 @@ static int shell_trap_parse_condition(const char *s, int *out_sig) {
         *out_sig = 0;
         return 0;
     }
-    if (strcmp(s, "INT") == 0 || strcmp(s, "SIGINT") == 0) {
-        *out_sig = SIGINT;
-        return 0;
-    }
-    if (strcmp(s, "TERM") == 0 || strcmp(s, "SIGTERM") == 0) {
-        *out_sig = SIGTERM;
+    int named = shell_signal_by_name(s);
+    if (named > 0) {
+        *out_sig = named;
         return 0;
     }
     int v = 0;
@@ -5304,7 +5401,50 @@ static void cmd_kill(int argc, char **argv) {
     }
     int sig = SIGTERM;
     int first = 1;
-    if (argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
+    if (strcmp(argv[1], "-l") == 0) {
+        if (argc == 2) {
+            size_t n = sizeof(g_shell_signals) / sizeof(g_shell_signals[0]);
+            for (size_t i = 0; i < n; i++) {
+                kprintf("%2d) SIG%-7s%s", g_shell_signals[i].num,
+                        g_shell_signals[i].name, (i % 4 == 3) ? "\n" : " ");
+            }
+            if (n % 4 != 0) kprintf("\n");
+            return;
+        }
+        for (int i = 2; i < argc; i++) {
+            const char *a = argv[i];
+            bool numeric = true;
+            int v = 0;
+            for (const char *q = a; *q; q++) {
+                if (*q < '0' || *q > '9') { numeric = false; break; }
+                v = v * 10 + (*q - '0');
+            }
+            if (numeric) {
+                /* A status from `wait` encodes the signal in the low bits. */
+                if (v > 128) v -= 128;
+                const char *nm = shell_signal_name(v);
+                if (nm) kprintf("%s\n", nm);
+                else { kprintf("kill: %s: invalid signal number\n", a);
+                       shell_set_status(1); }
+            } else {
+                int num = shell_signal_by_name(a);
+                if (num > 0) kprintf("%d\n", num);
+                else { kprintf("kill: %s: invalid signal name\n", a);
+                       shell_set_status(1); }
+            }
+        }
+        return;
+    }
+    if (strcmp(argv[1], "-s") == 0 && argc > 2) {
+        int num = shell_signal_by_name(argv[2]);
+        if (num < 0) {
+            kprintf("kill: unknown signal '%s'\n", argv[2]);
+            shell_set_status(1);
+            return;
+        }
+        sig = num;
+        first = 3;
+    } else if (argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
         int v = 0;
         for (const char *p = argv[1] + 1; *p; p++) {
             if (*p < '0' || *p > '9') {
@@ -5316,17 +5456,14 @@ static void cmd_kill(int argc, char **argv) {
         }
         sig = v;
         first = 2;
-    } else if (argv[1][0] == '-') {
-        const char *name = argv[1] + 1;
-        if (strcmp(name, "INT") == 0 || strcmp(name, "SIGINT") == 0)
-            sig = SIGINT;
-        else if (strcmp(name, "TERM") == 0 || strcmp(name, "SIGTERM") == 0)
-            sig = SIGTERM;
-        else {
-            kprintf("kill: unknown signal '%s'\n", name);
+    } else if (argv[1][0] == '-' && argv[1][1] != '\0') {
+        int num = shell_signal_by_name(argv[1] + 1);
+        if (num < 0) {
+            kprintf("kill: unknown signal '%s'\n", argv[1] + 1);
             shell_set_status(1);
             return;
         }
+        sig = num;
         first = 2;
     }
     for (int i = first; i < argc; i++) {
@@ -5346,6 +5483,52 @@ static void cmd_kill(int argc, char **argv) {
         if (neg) pid = -pid;
         signal_send_to_pid(pid, sig);
     }
+}
+
+/* POSIX `ulimit [-f] [-H|-S] [blocks]`. tobyOS enforces no per-process
+ * resource limits, so every limit reads as unlimited and setting one is
+ * rejected rather than silently ignored -- a script that lowers a limit for
+ * safety deserves to hear that it did not take. */
+static void cmd_ulimit(int argc, char **argv) {
+    shell_set_status(0);
+    bool show_all = false;
+    const char *what = "f";
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
+        for (const char *f = argv[i] + 1; *f; f++) {
+            switch (*f) {
+            case 'a': show_all = true; break;
+            case 'H': case 'S': break;          /* hard/soft: identical here */
+            case 'c': case 'd': case 'f': case 'n':
+            case 's': case 't': case 'v':
+                what = f;
+                break;
+            default:
+                kprintf("ulimit: bad option '-%c'\n", *f);
+                shell_set_status(2);
+                return;
+            }
+        }
+    }
+
+    if (show_all) {
+        kprintf("core file size          (blocks) unlimited\n");
+        kprintf("data seg size           (kbytes) unlimited\n");
+        kprintf("file size               (blocks) unlimited\n");
+        kprintf("open files                       unlimited\n");
+        kprintf("stack size              (kbytes) unlimited\n");
+        kprintf("cpu time               (seconds) unlimited\n");
+        kprintf("virtual memory          (kbytes) unlimited\n");
+        return;
+    }
+
+    if (i < argc) {
+        kprintf("ulimit: cannot modify limit: not supported\n");
+        shell_set_status(1);
+        return;
+    }
+    (void)what;
+    kprintf("unlimited\n");
 }
 
 static const struct cmd cmds[] = {
@@ -5405,6 +5588,7 @@ static const struct cmd cmds[] = {
     { "wait",   "wait [pid|%job...]: wait for background jobs", cmd_wait },
     { "kill",   "kill [-SIGNAL] PID...: send signal to process", cmd_kill },
     { "umask",  "umask [MODE]: display or set file creation mask", cmd_umask },
+    { "ulimit", "ulimit [-acdfnstv] [-H|-S]: show resource limits", cmd_ulimit },
     { "hash",   "hash [-r]: display or reset command hash table", cmd_hash },
     { "source", "source script: run script in current shell",     cmd_dot  },
     { "ps",     "list processes with cpu/syscalls/pages", cmd_ps },
@@ -5792,6 +5976,7 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
 
     size_t pos = 0;
     int depth = 1;
+    int case_depth = 0;
     while (*p) {
         if (*p == '\'') {
             if (pos + 1 >= cmd_cap) return -1;
@@ -5828,7 +6013,18 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
             cmd[pos++] = *p++;
             continue;
         }
-        if (*p == ')') {
+        /* A case item's pattern ends in an unbalanced `)`. Counting it would
+         * close the substitution early, so `$(case $x in a) echo hi ;; esac)`
+         * has to know when it is inside a case. */
+        if (shell_starts_with_word(p, "case") &&
+            (p == *pp || is_space(p[-1]) || p[-1] == ';' || p[-1] == '(')) {
+            case_depth++;
+        } else if (strncmp(p, "esac", 4) == 0 && shell_is_word_end(p[4]) &&
+                   (p == *pp || is_space(p[-1]) || p[-1] == ';') &&
+                   case_depth > 0) {
+            case_depth--;
+        }
+        if (*p == ')' && case_depth == 0) {
             depth--;
             if (depth == 0) {
                 p++;
@@ -5966,6 +6162,8 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
             *is_set = false;
             return 0;
         }
+    } else if (strcmp(name, "LINENO") == 0 && !env_get("LINENO")) {
+        rc = shell_append_uint(out, &pos, cap, g_shell_lineno);
     } else {
         const char *v = env_get(name);
         if (!v) {
@@ -6032,6 +6230,12 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         length_mode = true;
         expr++;
     }
+
+    /* ${#*} and ${#@} are the parameter COUNT, not the length of the joined
+     * string -- the one place ${#...} does not mean "length of the value". */
+    if (length_mode && (expr[0] == '*' || expr[0] == '@') && expr[1] == '\0')
+        return shell_append_uint(buf, pos, cap,
+                                 (unsigned long)g_positional_count);
 
     size_t name_len = 0;
     if (shell_parse_braced_name(expr, &name_len) < 0) {
@@ -6586,7 +6790,23 @@ static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
                 p += 2;
                 expr[epos] = '\0';
                 *pp = p;
-                struct shell_arith a = { .p = expr, .ok = true };
+                /* POSIX performs the other expansions on the expression text
+                 * before evaluating it, so `$(( $(date +%s) + 60 ))` and
+                 * `$(( ${n} * 2 ))` have to work. The evaluator understands
+                 * bare variable names on its own, so only run this when there
+                 * is something to expand. */
+                char expanded[256];
+                const char *src_expr = expr;
+                for (const char *q = expr; *q; q++) {
+                    if (*q == '$' || *q == '`') {
+                        if (shell_expand_param_word(expr, expanded,
+                                                    sizeof(expanded)) >= 0) {
+                            src_expr = expanded;
+                        }
+                        break;
+                    }
+                }
+                struct shell_arith a = { .p = src_expr, .ok = true };
                 long v = shell_arith_expr(&a);
                 shell_arith_skip(&a);
                 if (!a.ok || *a.p != '\0') {
@@ -6714,6 +6934,8 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
     name[n] = '\0';
     *pp = p;
     const char *val = env_get(name);
+    if (!val && strcmp(name, "LINENO") == 0)
+        return shell_append_uint(buf, pos, cap, g_shell_lineno);
     if (!val && g_opt_nounset) {
         kprintf("%s: unbound variable\n", name);
         return -1;
