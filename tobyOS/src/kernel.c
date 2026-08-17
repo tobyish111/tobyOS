@@ -1787,6 +1787,12 @@ static void posix_shell_selftest(void) {
         "echo POSIXSH: noglob2=*",
         "set +f",
 
+        /* multi-line scripts: the terminators live on their own lines,
+         * separated by newlines rather than semicolons */
+        "sh /data/px_multi.sh",
+        "echo POSIXSH: multi-status=$?",
+        "sh /data/px_deep.sh",
+
         /* --- POSIX conformance, second pass --- */
 
         /* while loop */
@@ -2015,6 +2021,49 @@ static void posix_shell_selftest(void) {
         "echo POSIXSH: lineno1=$LINENO\n"
         "echo POSIXSH: lineno2=$LINENO\n";
     hrc = vfs_write_all("/data/px_lineno.sh", px_lineno, strlen(px_lineno));
+
+    static const char px_multi[] =
+        "#!/bin/sh\n"
+        "x=3\n"
+        "if [ $x -eq 3 ]\n"
+        "then\n"
+        "    echo POSIXSH: ml-if\n"
+        "else\n"
+        "    echo POSIXSH: ml-if-bad\n"
+        "fi\n"
+        "for w in a b\n"
+        "do\n"
+        "    echo POSIXSH: ml-for-$w\n"
+        "done\n"
+        "n=0\n"
+        "while [ $n -lt 2 ]\n"
+        "do\n"
+        "    n=$((n+1))\n"
+        "done\n"
+        "echo POSIXSH: ml-while=$n\n"
+        "greet() {\n"
+        "    echo POSIXSH: ml-fn-$1\n"
+        "}\n"
+        "greet hello\n"
+        "case $x in\n"
+        "    3) echo POSIXSH: ml-case ;;\n"
+        "    *) echo POSIXSH: ml-case-bad ;;\n"
+        "esac\n"
+        "echo POSIXSH: ml-cont=$( \\\n"
+        "echo joined )\n"
+        "y=`echo backtick`\n"
+        "echo POSIXSH: ml-bt=$y\n"
+        "z=$(false)\n"
+        "echo POSIXSH: ml-substatus=$?\n"
+        "echo POSIXSH: ml-arg0=$0\n"
+        "echo POSIXSH: ml-done\n";
+    hrc = vfs_write_all("/data/px_multi.sh", px_multi, strlen(px_multi));
+
+    static const char px_deep[] =
+        "i=0\n"
+        "while [ $i -lt 2000 ]; do i=$((i+1)); done\n"
+        "echo POSIXSH: deep=$i\n";
+    hrc = vfs_write_all("/data/px_deep.sh", px_deep, strlen(px_deep));
 
     kprintf("[boot] POSIXSH: starting shell compatibility smoke\n");
     for (int i = 0; lines[i]; i++) {

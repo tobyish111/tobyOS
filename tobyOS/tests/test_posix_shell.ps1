@@ -266,7 +266,22 @@ $required = @(
     'POSIXSH: lineno2=2',
     "trap -- 'echo POSIXSH: trap-hup' HUP",
     'POSIXSH: pipe-status=1',
-    'POSIXSH: pipe-status2=0'
+    'POSIXSH: pipe-status2=0',
+
+    # multi-line scripts (newline as command separator)
+    'POSIXSH: ml-if',
+    'POSIXSH: ml-for-a',
+    'POSIXSH: ml-for-b',
+    'POSIXSH: ml-while=2',
+    'POSIXSH: ml-fn-hello',
+    'POSIXSH: ml-case',
+    'POSIXSH: ml-cont=joined',
+    'POSIXSH: ml-bt=backtick',
+    'POSIXSH: ml-substatus=1',
+    'POSIXSH: ml-arg0=/data/px_multi.sh',
+    'POSIXSH: ml-done',
+    'POSIXSH: multi-status=0',
+    'POSIXSH: deep=2000'
 )
 
 # The harness echoes every command line it drives ("[shell-test] $ ..."), and
@@ -286,6 +301,8 @@ if ($txt -match '(?m)^POSIXSH: case-bad') { $missing += 'unexpected POSIXSH: cas
 if ($txt -match '(?m)^POSIXSH: exit-bad') { $missing += 'unexpected POSIXSH: exit-bad' }
 if ($txt -match '(?m)^POSIXSH: trap-reset-bad') { $missing += 'unexpected POSIXSH: trap-reset-bad' }
 if ($txt -match '(?m)^POSIXSH: case-wild') { $missing += 'unexpected POSIXSH: case-wild' }
+if ($out -match '(?m)^POSIXSH: ml-if-bad') { $missing += 'unexpected POSIXSH: ml-if-bad' }
+if ($out -match '(?m)^POSIXSH: ml-case-bad') { $missing += 'unexpected POSIXSH: ml-case-bad' }
 if ($txt -match '(?m)^POSIXSH: loop-later') { $missing += 'unexpected POSIXSH: loop-later' }
 if ($txt -match '(?m)^POSIXSH: return-bad') { $missing += 'unexpected POSIXSH: return-bad' }
 if ($txt -match '(?m)^POSIXSH: subshell-alias-bad') { $missing += 'unexpected POSIXSH: subshell-alias-bad' }

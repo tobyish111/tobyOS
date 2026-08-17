@@ -60,6 +60,12 @@
 extern volatile struct limine_module_request module_req;
 
 #define LINE_MAX 512
+
+/* Runaway guard for `while`/`until`. POSIX has no iteration limit, but this
+ * loop runs in the kernel, so an unbounded one wedges the machine with no way
+ * back. 1024 was low enough that ordinary scripts hit it; this is high enough
+ * that only a genuine runaway does. */
+#define SHELL_LOOP_MAX 4000000L
 #define ARG_MAX  32
 #define SHELL_ALIAS_MAX 32
 #define SHELL_FUNC_MAX 32
@@ -108,6 +114,11 @@ static bool g_expand_dquote;
 /* $LINENO: line number of the command currently executing, counted within the
  * script (or from shell start for interactive input). */
 static unsigned long g_shell_lineno;
+
+/* A command that is nothing but assignments takes its exit status from the
+ * last command substitution it performed: `x=$(false)` must leave $? at 1. */
+static bool g_subst_ran;
+static int  g_subst_status;
 
 enum shell_flow {
     SHELL_FLOW_NONE = 0,
@@ -165,6 +176,7 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap);
 static bool shell_starts_with_word(const char *s, const char *word);
 static bool is_space(char c);
 static bool shell_is_word_end(char c);
+static bool shell_line_needs_continuation(const char *s);
 static const char *shell_skip_blanks(const char *s);
 static int parse_int(const char *s, int *out);
 static int shell_run_exit_trap(int status);
@@ -4041,6 +4053,63 @@ static int shell_collect_heredoc(char **pp, const char *delim,
     return -1;
 }
 
+/* Joining a multi-line construct back into one logical command.
+ *
+ * The compound-command parsers key off `; do` / `; then` / `; fi`, but a
+ * script writes those terminators on their own lines, where the NEWLINE is
+ * the separator. Scripts were executed strictly line by line, so
+ *
+ *     if [ $x = 3 ]
+ *     then echo yes
+ *     fi
+ *
+ * was three unrelated commands: the `if` ran with no body, `then echo yes`
+ * ran unconditionally, and `fi` was a command not found. Both branches of an
+ * if/else therefore executed.
+ *
+ * Newlines become `;` -- except after a word that is still expecting its
+ * command (`do`, `then`, `else`, `in`, an operator, an open brace), where a
+ * `;` would introduce an empty command instead. A line ending in `\` splices
+ * directly onto the next one. */
+static bool shell_join_wants_semi(const char *s, size_t n) {
+    if (n == 0) return false;
+    char c = s[n - 1];
+    if (c == ';' || c == '&' || c == '|' || c == '{' || c == '(') return false;
+    static const char *open_words[] = { "do", "then", "else", "in", 0 };
+    for (int i = 0; open_words[i]; i++) {
+        size_t wl = strlen(open_words[i]);
+        if (n >= wl && memcmp(s + n - wl, open_words[i], wl) == 0 &&
+            (n == wl || is_space(s[n - wl - 1]) || s[n - wl - 1] == ';')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int shell_join_line(char *dst, size_t *dlen, size_t cap,
+                           const char *line) {
+    while (*line == ' ' || *line == '\t') line++;
+    while (*dlen > 0 && (dst[*dlen - 1] == ' ' || dst[*dlen - 1] == '\t'))
+        (*dlen)--;
+    dst[*dlen] = '\0';
+
+    const char *sep = "";
+    if (*dlen > 0) {
+        if (dst[*dlen - 1] == '\\') {
+            dst[--(*dlen)] = '\0';          /* explicit line splice */
+        } else {
+            sep = shell_join_wants_semi(dst, *dlen) ? "; " : " ";
+        }
+    }
+    size_t sl = strlen(sep), ll = strlen(line);
+    if (*dlen + sl + ll + 1 > cap) return -1;
+    memcpy(dst + *dlen, sep, sl);
+    *dlen += sl;
+    memcpy(dst + *dlen, line, ll + 1);
+    *dlen += ll;
+    return 0;
+}
+
 static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (!text) return 1;
     if (g_script_depth >= 8) {
@@ -4054,6 +4123,9 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     int last = 0;
     char *p = text;
     bool first_line = true;
+    char pending[LINE_MAX * 2];
+    size_t pending_len = 0;
+    pending[0] = '\0';
     while (*p) {
         g_shell_lineno++;
         char *line_start = p;
@@ -4083,7 +4155,23 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 break;
             }
         }
+
+        /* Keep collecting while the text so far is an unfinished compound
+         * command (or ends in a splice), then run the joined result. */
+        if (pending_len > 0 || shell_line_needs_continuation(line)) {
+            if (shell_join_line(pending, &pending_len, sizeof(pending),
+                                line) < 0) {
+                kprintf("sh: command too long\n");
+                last = 2;
+                shell_set_status(2);
+                break;
+            }
+            if (shell_line_needs_continuation(pending)) continue;
+            line = pending;
+        }
         execute_line_text(line);
+        pending_len = 0;
+        pending[0] = '\0';
         last = g_last_status;
         shell_heredoc_reset();
         if (g_shell_flow == SHELL_FLOW_EXIT) {
@@ -5959,6 +6047,8 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     printk_set_sink_mode(old_sink, old_sink_ctx, old_sink_suppress);
     shell_set_output(old_out, old_out_ctx);
     g_expand_dquote = saved_dq;
+    g_subst_ran = true;
+    g_subst_status = g_last_status;
 
     while (cap.pos > 0 &&
            (cap.buf[cap.pos - 1] == '\n' || cap.buf[cap.pos - 1] == '\r')) {
@@ -8356,6 +8446,7 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
         }
         shell_fd_state_close_owned(&fds);
         int rc = shell_apply_assignments(cmd->argv, assignc, "shell");
+        if (rc == 0 && g_subst_ran) rc = g_subst_status;
         return rc;
     }
 
@@ -9122,7 +9213,7 @@ static bool shell_try_while_command(const char *src) {
 
     int last = 0;
     g_shell_loop_depth++;
-    for (int iter = 0; iter < 1024; iter++) {
+    for (long iter = 0; iter < SHELL_LOOP_MAX; iter++) {
         execute_line_text(cond);
         if (g_last_status != 0) {
             g_shell_loop_depth--;
@@ -9195,7 +9286,7 @@ static bool shell_try_until_command(const char *src) {
 
     int last = 0;
     g_shell_loop_depth++;
-    for (int iter = 0; iter < 1024; iter++) {
+    for (long iter = 0; iter < SHELL_LOOP_MAX; iter++) {
         execute_line_text(cond);
         if (g_last_status == 0) {
             g_shell_loop_depth--;
@@ -9980,6 +10071,7 @@ static void shell_run_segment(const char *src, bool background) {
     char words[SHELL_PARSE_BUF_MAX];
     int ntok = 0;
 
+    g_subst_ran = false;
     if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) {
         shell_set_status(2);
         return;
@@ -10205,6 +10297,7 @@ static size_t g_continuation_len;
 
 static bool shell_line_needs_continuation(const char *s) {
     int if_depth = 0, do_depth = 0, case_depth = 0;
+    int loop_open = 0;                  /* `for`/`while`/`until` awaiting `do` */
     int brace_depth = 0, paren_depth = 0;
     bool in_sq = false, in_dq = false;
     bool last_was_pipe = false, last_was_and = false, last_was_or = false;
@@ -10233,20 +10326,22 @@ static bool shell_line_needs_continuation(const char *s) {
         last_was_and = false;
         last_was_or = false;
 
-        if (shell_starts_with_word(p, "if") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            if_depth++;
-        if (shell_starts_with_word(p, "then") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            {} /* then is part of if, no depth change */
-        if (shell_starts_with_word(p, "fi") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            if_depth--;
-        if ((shell_starts_with_word(p, "do") && (p == s || is_space(p[-1]) || p[-1] == ';')))
+        if (!(p == s || is_space(p[-1]) || p[-1] == ';')) continue;
+        if (shell_starts_with_word(p, "if")) if_depth++;
+        else if (shell_starts_with_word(p, "fi")) if_depth--;
+        /* A loop header is incomplete until its `do` arrives, which in a
+         * script is usually on the NEXT line. Without this, `for x in a b`
+         * looked like a finished command all by itself. */
+        else if (shell_starts_with_word(p, "for") ||
+                 shell_starts_with_word(p, "while") ||
+                 shell_starts_with_word(p, "until")) loop_open++;
+        else if (shell_starts_with_word(p, "do")) {
             do_depth++;
-        if (shell_starts_with_word(p, "done") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            do_depth--;
-        if (shell_starts_with_word(p, "case") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            case_depth++;
-        if (shell_starts_with_word(p, "esac") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            case_depth--;
+            if (loop_open > 0) loop_open--;
+        }
+        else if (shell_starts_with_word(p, "done")) do_depth--;
+        else if (shell_starts_with_word(p, "case")) case_depth++;
+        else if (shell_starts_with_word(p, "esac")) case_depth--;
     }
 
     /* Trailing pipe or logical operator means continuation */
@@ -10261,9 +10356,12 @@ static bool shell_line_needs_continuation(const char *s) {
 
     if (in_sq || in_dq) return true;
     if (last_was_backslash) return true;
-    if (if_depth > 0 || do_depth > 0 || case_depth > 0) return true;
+    if (if_depth > 0 || do_depth > 0 || case_depth > 0 || loop_open > 0)
+        return true;
     if (brace_depth > 0 || paren_depth > 0) return true;
     if (last_was_pipe || last_was_and || last_was_or) return true;
+    /* A line that ends on a word still expecting its command. */
+    if (!shell_join_wants_semi(s, (size_t)(end - s))) return true;
     return false;
 }
 

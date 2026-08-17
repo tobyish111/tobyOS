@@ -32,7 +32,7 @@ FORBIDDEN = [
     "case-wild", "loop-later", "return-bad", "subshell-alias-bad",
     "subshell-function-bad", "subshell-exit-bad", "errexit-bad",
     "empty-at-bad", "case-q-bad", "case-cls-bad", "case-neg-bad",
-    "plain-bad", "clobber-bad",
+    "plain-bad", "clobber-bad", "ml-if-bad", "ml-case-bad",
 ]
 
 
