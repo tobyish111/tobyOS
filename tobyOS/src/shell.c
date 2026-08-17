@@ -8938,7 +8938,29 @@ static const char *shell_find_elif_else(const char *start, const char *fi_at,
  * Parses the text after a compound's terminator as redirections only, into
  * `out`. Returns 0 on success (including an empty tail), -1 on a parse error
  * or if the tail contains anything that is not a redirection. */
+/* Re-point a parsed redirection list's strings at caller-owned storage. */
+static int shell_redirs_intern(struct shell_simple *out, char *buf, size_t cap) {
+    size_t pos = 0;
+    for (int i = 0; i < out->redir_count; i++) {
+        struct shell_redir *r = &out->redir[i];
+        const char **fields[2] = { &r->path, &r->text };
+        for (int f = 0; f < 2; f++) {
+            const char *src = *fields[f];
+            if (!src) continue;
+            size_t n = strlen(src) + 1;
+            if (pos + n > cap) return -1;
+            memcpy(buf + pos, src, n);
+            *fields[f] = buf + pos;
+            pos += n;
+        }
+    }
+    /* These alias into `words` too and nothing on this path reads them. */
+    out->stdin_path = out->stdin_text = out->stdout_path = 0;
+    return 0;
+}
+
 static int shell_parse_compound_redirs(const char *tail, struct shell_simple *out,
+                                       char *pathbuf, size_t pathcap,
                                        const char *label) {
     shell_simple_init(out);
     tail = shell_skip_blanks(tail);
@@ -8968,6 +8990,16 @@ static int shell_parse_compound_redirs(const char *tail, struct shell_simple *ou
             goto out;
         }
         *out = pl->stage[0];
+        /* The struct's path/text pointers point INTO `words`, which is freed
+         * at `out:` below. Copying the struct alone handed the caller
+         * dangling pointers, so by the time it entered the io frame the
+         * filename was freed memory -- `for ... done > file` reported success
+         * and wrote to the terminal. Intern the strings into caller-owned
+         * storage so they outlive this frame. */
+        if (shell_redirs_intern(out, pathbuf, pathcap) < 0) {
+            kprintf("%s: redirection target too long\n", label);
+            goto out;
+        }
         rc = 0;
     }
 out:
@@ -9142,8 +9174,10 @@ static bool shell_try_for_command(const char *src) {
             done_marker ? done_marker : "(null)",
             done_at + strlen(done_marker));
 #endif
+    char tail_paths[512];
     if (shell_parse_compound_redirs(done_at + strlen(done_marker),
-                                    &tail_redirs, "for") < 0) {
+                                    &tail_redirs, tail_paths,
+                                    sizeof(tail_paths), "for") < 0) {
         shell_set_status(2);
         return true;
     }
@@ -9289,8 +9323,10 @@ static bool shell_try_while_command(const char *src) {
     }
 
     struct shell_simple tail_redirs;
+    char tail_paths[512];
     if (shell_parse_compound_redirs(done_at + strlen(done_marker),
-                                    &tail_redirs, "while") < 0) {
+                                    &tail_redirs, tail_paths,
+                                    sizeof(tail_paths), "while") < 0) {
         shell_set_status(2);
         return true;
     }
@@ -9388,8 +9424,10 @@ static bool shell_try_until_command(const char *src) {
     }
 
     struct shell_simple tail_redirs;
+    char tail_paths[512];
     if (shell_parse_compound_redirs(done_at + strlen(done_marker),
-                                    &tail_redirs, "until") < 0) {
+                                    &tail_redirs, tail_paths,
+                                    sizeof(tail_paths), "until") < 0) {
         shell_set_status(2);
         return true;
     }
