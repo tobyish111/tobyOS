@@ -125,6 +125,11 @@ static int  g_subst_status;
  * bare `return` -- both defined to reuse $? -- always report success. */
 static int g_builtin_entry_status;
 
+/* errexit is defined not to fire on a command whose failure is being TESTED:
+ * the condition of an if/while/until, an operand of && or ||, or anything
+ * under `!`. Held up while such a condition runs. */
+static int g_errexit_suppress;
+
 enum shell_flow {
     SHELL_FLOW_NONE = 0,
     SHELL_FLOW_BREAK,
@@ -6382,7 +6387,14 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             char strip_op = *op++;
             bool greedy = (*op == strip_op);
             if (greedy) op++;
+            /* The pattern is a word: `${f%$suffix}` and `${f#$(prefix)}` have
+             * to expand it before matching. */
+            char pattern_buf[SHELL_PARSE_BUF_MAX];
             const char *pattern = op;
+            if (shell_expand_param_word(op, pattern_buf,
+                                        sizeof(pattern_buf)) >= 0) {
+                pattern = pattern_buf;
+            }
 
             char value[SHELL_PARSE_BUF_MAX];
             bool is_set = false;
@@ -7518,6 +7530,15 @@ static bool shell_glob_bracket(const char **pp, char c) {
 
 static bool shell_glob_match(const char *pat, const char *name) {
     while (*pat) {
+        /* A backslash quotes the next character, so `\*` matches a literal
+         * star rather than anything at all. */
+        if (*pat == '\\' && pat[1]) {
+            pat++;
+            if (!*name || *pat != *name) return false;
+            pat++;
+            name++;
+            continue;
+        }
         if (*pat == '*') {
             while (*pat == '*') pat++;
             if (!*pat) return true;
@@ -9032,7 +9053,9 @@ static bool shell_try_if_command(const char *src) {
             return true;
         }
 
+        g_errexit_suppress++;
         execute_line_text(cond);
+        g_errexit_suppress--;
         if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
         if (g_last_status == 0) {
@@ -9264,7 +9287,9 @@ static bool shell_try_while_command(const char *src) {
     int last = 0;
     g_shell_loop_depth++;
     for (long iter = 0; iter < SHELL_LOOP_MAX; iter++) {
+        g_errexit_suppress++;
         execute_line_text(cond);
+        g_errexit_suppress--;
         if (g_last_status != 0) {
             g_shell_loop_depth--;
             shell_set_status(last);
@@ -9337,7 +9362,9 @@ static bool shell_try_until_command(const char *src) {
     int last = 0;
     g_shell_loop_depth++;
     for (long iter = 0; iter < SHELL_LOOP_MAX; iter++) {
+        g_errexit_suppress++;
         execute_line_text(cond);
+        g_errexit_suppress--;
         if (g_last_status == 0) {
             g_shell_loop_depth--;
             shell_set_status(last);
@@ -9413,6 +9440,37 @@ static int shell_expand_case_word(const char *src, char *out, size_t cap) {
     return 0;
 }
 
+/* Strip shell quoting from a pattern, leaving the glob metacharacters that
+ * were not quoted intact. A quoted metacharacter is escaped so the matcher
+ * treats it literally. */
+static void shell_pattern_unquote(const char *src, char *out, size_t cap) {
+    size_t n = 0;
+    bool in_sq = false, in_dq = false;
+    for (const char *p = src; *p && n + 2 < cap; p++) {
+        if (in_sq) {
+            if (*p == '\'') { in_sq = false; continue; }
+        } else if (in_dq) {
+            if (*p == '"') { in_dq = false; continue; }
+            if (*p == '\\' && p[1]) p++;
+        } else {
+            if (*p == '\'') { in_sq = true; continue; }
+            if (*p == '"')  { in_dq = true; continue; }
+            if (*p == '\\' && p[1]) {
+                p++;
+                out[n++] = '\\';
+                out[n++] = *p;
+                continue;
+            }
+            out[n++] = *p;
+            continue;
+        }
+        if (*p == '*' || *p == '?' || *p == '[' || *p == ']' || *p == '\\')
+            out[n++] = '\\';
+        out[n++] = *p;
+    }
+    out[n] = '\0';
+}
+
 static bool shell_case_pattern_match(const char *patterns, const char *word) {
     const char *p = patterns;
     while (*p) {
@@ -9423,9 +9481,13 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
         while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
 
         char pat[128];
-        if (shell_copy_segment(pat, sizeof(pat), start, end) == 0 &&
-            pat[0] && shell_glob_match(pat, word)) {
-            return true;
+        if (shell_copy_segment(pat, sizeof(pat), start, end) == 0 && pat[0]) {
+            /* A case pattern is a word, so quoting in it makes those
+             * characters literal: `case $x in 'a b')` must match the string
+             * `a b`, not the pattern `'a b'`. */
+            char unq[128];
+            shell_pattern_unquote(pat, unq, sizeof(unq));
+            if (shell_glob_match(unq, word)) return true;
         }
         if (*p == '|') p++;
     }
@@ -10117,6 +10179,11 @@ static const char *shell_find_list_sep(const char *s, int *oplen,
 /* Run one and-or-list element: a single pipeline, already isolated from the
  * rest of the line so its expansions happen at the moment it runs. */
 static void shell_run_segment(const char *src, bool background) {
+    /* `set -n`: read the commands, run none of them. */
+    if (g_opt_noexec) {
+        shell_set_status(0);
+        return;
+    }
     struct shell_token tok[SHELL_TOKEN_MAX];
     char words[SHELL_PARSE_BUF_MAX];
     int ntok = 0;
@@ -10348,7 +10415,9 @@ static void execute_line_text(const char *src) {
                           (prev_link == SH_TOK_AND_IF && last == 0) ||
                           (prev_link == SH_TOK_OR_IF && last != 0);
         if (should_run) {
-            if (shell_line_is_compound(body)) {
+            if (shell_try_function_definition(seg)) {
+                /* `f() { ... }` can appear mid-list too. */
+            } else if (shell_line_is_compound(body)) {
                 /* Re-enter so the compound dispatch at the top of this
                  * function claims it; one of those handlers always does, so
                  * this cannot loop. */
@@ -10358,7 +10427,7 @@ static void execute_line_text(const char *src) {
             }
             last = g_last_status;
             if (g_shell_flow != SHELL_FLOW_NONE) return;
-            if (g_opt_errexit && last != 0 &&
+            if (g_opt_errexit && last != 0 && g_errexit_suppress == 0 &&
                 prev_link != SH_TOK_AND_IF && prev_link != SH_TOK_OR_IF &&
                 op != SH_TOK_AND_IF && op != SH_TOK_OR_IF &&
                 g_shell_loop_depth == 0) {

@@ -1816,6 +1816,32 @@ static void posix_shell_selftest(void) {
          * suppresses expansion in it */
         "sh /data/px_heredoc2.sh",
 
+        /* pattern words expand; case patterns are words, so quoting in
+         * them is literal */
+        "unset PXU",
+        "echo POSIXSH: defsub=${PXU:-$(echo made)}",
+        "PXP=abc.txt",
+        "PXS=.txt",
+        "echo POSIXSH: patvar=${PXP%$PXS}",
+        "echo POSIXSH: mixq=\"a'b'c\" esc=\"a\\\"b\"",
+        "case 'a b' in 'a b') echo POSIXSH: case-quoted-ok ;; *) echo POSIXSH: case-quoted-bad ;; esac",
+        "echo POSIXSH: cs-split=$(echo 'x  y')",
+        "echo POSIXSH: cs-noq=\"$(echo 'x  y')\"",
+
+        /* errexit fires on a failing command but not on a tested one;
+         * a function definition can sit mid-list */
+        "sh -c 'set -e; f() { false; }; f; echo POSIXSH: errexit-fn-bad'",
+        "echo POSIXSH: errexit-fn=$?",
+        "sh -c 'set -e; if false; then :; fi; echo POSIXSH: errexit-if-ok'",
+
+        /* set -n reads without executing */
+        "sh -c 'set -n; echo POSIXSH: noexec-bad'",
+        "echo POSIXSH: noexec-status=$?",
+
+        /* a function on the receiving end of a pipe */
+        "pxpipe() { while read L; do echo POSIXSH: pl-$L; done; }",
+        "printf 'p1\\np2\\n' | pxpipe",
+
         /* --- POSIX conformance, second pass --- */
 
         /* while loop */

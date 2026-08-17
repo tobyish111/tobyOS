@@ -294,7 +294,20 @@ $required = @(
     'POSIXSH: ifs-empty=3-[a]-[]-[b]',
     'POSIXSH: catpipe=hello',
     'POSIXSH: dash-heredoc',
-    'POSIXSH: quoted-heredoc $HOME'
+    'POSIXSH: quoted-heredoc $HOME',
+
+    # pattern words, case quoting, errexit scope, set -n, pipe into a function
+    'POSIXSH: defsub=made',
+    'POSIXSH: patvar=abc',
+    'POSIXSH: mixq=a''b''c esc=a"b',
+    'POSIXSH: case-quoted-ok',
+    'POSIXSH: cs-split=x y',
+    'POSIXSH: cs-noq=x  y',
+    'POSIXSH: errexit-fn=1',
+    'POSIXSH: errexit-if-ok',
+    'POSIXSH: noexec-status=0',
+    'POSIXSH: pl-p1',
+    'POSIXSH: pl-p2'
 )
 
 # The harness echoes every command line it drives ("[shell-test] $ ..."), and
@@ -316,6 +329,9 @@ if ($txt -match '(?m)^POSIXSH: trap-reset-bad') { $missing += 'unexpected POSIXS
 if ($txt -match '(?m)^POSIXSH: case-wild') { $missing += 'unexpected POSIXSH: case-wild' }
 if ($out -match '(?m)^POSIXSH: ml-if-bad') { $missing += 'unexpected POSIXSH: ml-if-bad' }
 if ($out -match '(?m)^POSIXSH: ml-case-bad') { $missing += 'unexpected POSIXSH: ml-case-bad' }
+if ($out -match '(?m)^POSIXSH: case-quoted-bad') { $missing += 'unexpected POSIXSH: case-quoted-bad' }
+if ($out -match '(?m)^POSIXSH: errexit-fn-bad') { $missing += 'unexpected POSIXSH: errexit-fn-bad' }
+if ($out -match '(?m)^POSIXSH: noexec-bad') { $missing += 'unexpected POSIXSH: noexec-bad' }
 if ($txt -match '(?m)^POSIXSH: loop-later') { $missing += 'unexpected POSIXSH: loop-later' }
 if ($txt -match '(?m)^POSIXSH: return-bad') { $missing += 'unexpected POSIXSH: return-bad' }
 if ($txt -match '(?m)^POSIXSH: subshell-alias-bad') { $missing += 'unexpected POSIXSH: subshell-alias-bad' }
