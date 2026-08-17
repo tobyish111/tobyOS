@@ -1793,6 +1793,29 @@ static void posix_shell_selftest(void) {
         "echo POSIXSH: multi-status=$?",
         "sh /data/px_deep.sh",
 
+        /* a compound command can sit anywhere in a list, including inside
+         * a function body, and functions recurse */
+        "rec() { echo POSIXSH: enter-$1; if [ $1 -gt 0 ]; then n=$(($1-1)); rec $n; fi; echo POSIXSH: rec-$1; }",
+        "rec 2",
+
+        /* bare `exit` / `return` reuse $? */
+        "sh -c 'false; exit'",
+        "echo POSIXSH: bare-exit=$?",
+
+        /* IFS: a non-whitespace delimiter keeps empty fields */
+        "export IFS=:",
+        "PXW=a::b",
+        "set -- $PXW",
+        "unset IFS",
+        "echo POSIXSH: ifs-empty=$#-[$1]-[$2]-[$3]",
+
+        /* `cat` with no operand copies standard input */
+        "echo POSIXSH: catpipe=$(echo hello | cat)",
+
+        /* <<- strips leading tabs from the body; a quoted delimiter
+         * suppresses expansion in it */
+        "sh /data/px_heredoc2.sh",
+
         /* --- POSIX conformance, second pass --- */
 
         /* while loop */
@@ -2064,6 +2087,49 @@ static void posix_shell_selftest(void) {
         "while [ $i -lt 2000 ]; do i=$((i+1)); done\n"
         "echo POSIXSH: deep=$i\n";
     hrc = vfs_write_all("/data/px_deep.sh", px_deep, strlen(px_deep));
+
+    static const char px_probe4[] =
+        "cat <<-TAB\n"
+        "\tPOSIXSH: dash-heredoc\n"
+        "\tTAB\n"
+        "cat <<'Q'\n"
+        "POSIXSH: quoted-heredoc $HOME\n"
+        "Q\n"
+        "f=/a/b/c.tar.gz\n"
+        "echo POSIXSH: pat1=${f##*/} pat2=${f%%.*} pat3=${f%.*}\n"
+        "echo POSIXSH: pat4=${f#*/?/}\n"
+        "IFS=:\n"
+        "v=a::b\n"
+        "set -- $v\n"
+        "unset IFS\n"
+        "echo POSIXSH: ifs-empty=$#-[$1]-[$2]-[$3]\n"
+        "rec() { if [ $1 -gt 0 ]; then n=$(($1-1)); rec $n; fi; echo POSIXSH: rec-$1; }\n"
+        "rec 2\n"
+        "g() { return 3; }\n"
+        "g\n"
+        "echo POSIXSH: fnret=$?\n"
+        "h() { echo POSIXSH: hin-$(cat); }\n"
+        "echo piped | h\n"
+        "printf 'POSIXSH: nonl\\\\c'\n"
+        "echo ''\n"
+        "echo POSIXSH: hash=$#  # trailing comment\n"
+        "cd\n"
+        "echo POSIXSH: cd-home=$PWD\n"
+        "false\n"
+        "( exit )\n"
+        "echo POSIXSH: bare-exit=$?\n"
+        "echo POSIXSH: probe4-done\n";
+    hrc = vfs_write_all("/data/px_probe4.sh", px_probe4, strlen(px_probe4));
+
+    static const char px_heredoc2[] =
+        "cat <<-TAB\n"
+        "\tPOSIXSH: dash-heredoc\n"
+        "\tTAB\n"
+        "cat <<'Q'\n"
+        "POSIXSH: quoted-heredoc $HOME\n"
+        "Q\n";
+    hrc = vfs_write_all("/data/px_heredoc2.sh", px_heredoc2,
+                        strlen(px_heredoc2));
 
     kprintf("[boot] POSIXSH: starting shell compatibility smoke\n");
     for (int i = 0; lines[i]; i++) {

@@ -120,6 +120,11 @@ static unsigned long g_shell_lineno;
 static bool g_subst_ran;
 static int  g_subst_status;
 
+/* $? as it stood when the current builtin was entered. The dispatcher zeroes
+ * the status before calling one, which would otherwise make bare `exit` and
+ * bare `return` -- both defined to reuse $? -- always report success. */
+static int g_builtin_entry_status;
+
 enum shell_flow {
     SHELL_FLOW_NONE = 0,
     SHELL_FLOW_BREAK,
@@ -2658,8 +2663,26 @@ static void cmd_su(int argc, char **argv) {
 
 static void cmd_cat(int argc, char **argv) {
     if (argc < 2) {
-        kprintf("usage: cat <path>\n");
-        shell_set_status(1);
+        /* No operand: copy standard input, which is what makes `cmd | cat`
+         * and `cat <<EOF` work. */
+        struct file *in = g_shell_in ? g_shell_in : g_shell_fd[0];
+        if (!in) {
+            kprintf("cat: no standard input\n");
+            shell_set_status(1);
+            return;
+        }
+        char sbuf[256];
+        for (;;) {
+            long n = file_read(in, sbuf, sizeof(sbuf));
+            if (n < 0) {
+                kprintf("cat: read error\n");
+                shell_set_status(1);
+                return;
+            }
+            if (n == 0) break;
+            for (long i = 0; i < n; i++) shell_putc(sbuf[i]);
+        }
+        shell_set_status(0);
         return;
     }
     char path[VFS_PATH_MAX];
@@ -4032,6 +4055,12 @@ static int shell_collect_heredoc(char **pp, const char *delim,
             return shell_heredoc_push(body, bpos);
         }
 
+        /* `<<-` strips leading tabs from the BODY too, not just from the
+         * delimiter line -- that is the whole point of the form: it lets the
+         * here-document be indented with the code around it. */
+        if (strip_tabs) {
+            while (*line_start == '\t') line_start++;
+        }
         const char *emit = line_start;
         char expanded[LINE_MAX * 2];
         if (!quoted) {
@@ -4533,7 +4562,7 @@ static void cmd_return(int argc, char **argv) {
         return;
     }
     bool ok = true;
-    int st = shell_status_arg(argc, argv, g_last_status, "return", &ok);
+    int st = shell_status_arg(argc, argv, g_builtin_entry_status, "return", &ok);
     if (!ok) {
         shell_set_status(st);
         return;
@@ -4550,7 +4579,7 @@ static void cmd_exit(int argc, char **argv) {
         return;
     }
     bool ok = true;
-    int st = shell_status_arg(argc, argv, g_last_status, "exit", &ok);
+    int st = shell_status_arg(argc, argv, g_builtin_entry_status, "exit", &ok);
     if (!ok) {
         shell_set_status(st);
         return;
@@ -7685,6 +7714,7 @@ struct shell_field_iter {
     const char *p;
     bool quoted;
     bool done;
+    bool at_start;
 };
 
 static void shell_field_iter_init(struct shell_field_iter *it,
@@ -7692,6 +7722,15 @@ static void shell_field_iter_init(struct shell_field_iter *it,
     it->p = word;
     it->quoted = quoted;
     it->done = false;
+    it->at_start = true;
+}
+
+/* IFS splits on two kinds of character with different rules: runs of IFS
+ * WHITESPACE collapse and never produce an empty field, while each IFS
+ * non-whitespace character delimits exactly one field -- so `a::b` with
+ * IFS=':' is three fields, the middle one empty. */
+static bool shell_is_ifs_white(char c) {
+    return (c == ' ' || c == '\t' || c == '\n') && shell_is_ifs_char(c);
 }
 
 static bool shell_field_iter_next(struct shell_field_iter *it,
@@ -7701,12 +7740,13 @@ static bool shell_field_iter_next(struct shell_field_iter *it,
     /* SHELL_FIELD_NULL stands in for an empty "$@": it carries no text and
      * never ends a field, so skip it wherever it turns up. */
     while (*p == SHELL_FIELD_NULL) p++;
-    if (!it->quoted) {
-        while (*p && *p != SHELL_FIELD_SEP && shell_is_ifs_char(*p)) p++;
-        if (!*p) {
-            it->done = true;
-            return false;
-        }
+    if (!it->quoted && it->at_start) {
+        while (*p && *p != SHELL_FIELD_SEP && shell_is_ifs_white(*p)) p++;
+        it->at_start = false;
+    }
+    if (!it->quoted && !*p) {
+        it->done = true;
+        return false;
     }
     size_t n = 0;
     while (*p && *p != SHELL_FIELD_SEP &&
@@ -7722,10 +7762,19 @@ static bool shell_field_iter_next(struct shell_field_iter *it,
     out[n] = '\0';
     if (*p == SHELL_FIELD_SEP) {
         it->p = p + 1;
-    } else {
-        it->p = p;
-        if (!*p) it->done = true;
+        return true;
     }
+    if (!it->quoted && *p) {
+        /* One delimiter: an optional run of IFS whitespace, at most one IFS
+         * non-whitespace character, then another optional run. */
+        while (*p && shell_is_ifs_white(*p)) p++;
+        if (*p && *p != SHELL_FIELD_SEP && shell_is_ifs_char(*p)) {
+            p++;
+            while (*p && shell_is_ifs_white(*p)) p++;
+        }
+    }
+    it->p = p;
+    if (!*p) it->done = true;
     return true;
 }
 
@@ -8374,6 +8423,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
         sink_active = true;
     }
     g_shell_in = fds.fd[0];
+    g_builtin_entry_status = g_last_status;
     shell_set_status(0);
     c->fn(cmd->argc, cmd->argv);
     int rc = g_last_status;
@@ -10188,6 +10238,17 @@ static bool shell_compound_enter_redirs(const char *src, char *body,
     return true;
 }
 
+/* Does this text start a compound command? */
+static bool shell_line_is_compound(const char *s) {
+    s = shell_skip_blanks(s);
+    if (*s == '{' || *s == '(') return true;
+    return shell_starts_with_word(s, "if") ||
+           shell_starts_with_word(s, "for") ||
+           shell_starts_with_word(s, "while") ||
+           shell_starts_with_word(s, "until") ||
+           shell_starts_with_word(s, "case");
+}
+
 static void execute_line_text(const char *src) {
     char alias_buf[SHELL_PARSE_BUF_MAX];
     char seg[LINE_MAX];
@@ -10203,11 +10264,7 @@ static void execute_line_text(const char *src) {
         shell_set_status(2);
         return;
     }
-    if (shell_starts_with_word(shell_skip_blanks(src), "if") ||
-        shell_starts_with_word(shell_skip_blanks(src), "for") ||
-        shell_starts_with_word(shell_skip_blanks(src), "while") ||
-        shell_starts_with_word(shell_skip_blanks(src), "until") ||
-        shell_starts_with_word(shell_skip_blanks(src), "case")) {
+    if (shell_line_is_compound(src)) {
         struct shell_io_frame cframe;
         bool centered = false;
         if (shell_compound_enter_redirs(src, seg, sizeof(seg),
@@ -10241,21 +10298,45 @@ static void execute_line_text(const char *src) {
     const char *p = src;
     enum shell_tok_type prev_link = SH_TOK_SEMI;
     int last = g_last_status;
-    bool ran_any = false;
 
     while (*p) {
-        int oplen = 0;
+        /* Collect one and-or element. A compound command can sit anywhere in
+         * a list -- `echo hi; if test $x; then ...; fi` -- and its own `;`s
+         * are not list separators, so keep absorbing separators while the
+         * text so far is an unfinished construct. */
+        size_t n = 0;
         enum shell_tok_type op = SH_TOK_SEMI;
-        const char *sep = shell_find_list_sep(p, &oplen, &op);
-        size_t n = sep ? (size_t)(sep - p) : strlen(p);
-        if (n + 1 > sizeof(seg)) {
-            kprintf("shell: command too long\n");
-            shell_set_status(2);
-            return;
+        seg[0] = '\0';
+        for (;;) {
+            int oplen = 0;
+            enum shell_tok_type thisop = SH_TOK_SEMI;
+            const char *sep = shell_find_list_sep(p, &oplen, &thisop);
+            size_t chunk = sep ? (size_t)(sep - p) : strlen(p);
+            if (n + chunk + 3 > sizeof(seg)) {
+                kprintf("shell: command too long\n");
+                shell_set_status(2);
+                return;
+            }
+            memcpy(seg + n, p, chunk);
+            n += chunk;
+            seg[n] = '\0';
+            p = sep ? sep + oplen : p + chunk;
+            op = thisop;
+            if (!sep) break;
+            if (!shell_line_needs_continuation(seg)) break;
+            const char *optext = (thisop == SH_TOK_AND_IF) ? "&&" :
+                                 (thisop == SH_TOK_OR_IF)  ? "||" :
+                                 (thisop == SH_TOK_BG)     ? "&"  : ";";
+            size_t ol = strlen(optext);
+            if (n + ol + 1 > sizeof(seg)) {
+                kprintf("shell: command too long\n");
+                shell_set_status(2);
+                return;
+            }
+            memcpy(seg + n, optext, ol + 1);
+            n += ol;
+            op = SH_TOK_SEMI;
         }
-        memcpy(seg, p, n);
-        seg[n] = '\0';
-        p = sep ? sep + oplen : p + n;
 
         const char *body = shell_skip_blanks(seg);
         if (*body == '\0' || *body == '#') {
@@ -10267,9 +10348,15 @@ static void execute_line_text(const char *src) {
                           (prev_link == SH_TOK_AND_IF && last == 0) ||
                           (prev_link == SH_TOK_OR_IF && last != 0);
         if (should_run) {
-            shell_run_segment(seg, op == SH_TOK_BG);
+            if (shell_line_is_compound(body)) {
+                /* Re-enter so the compound dispatch at the top of this
+                 * function claims it; one of those handlers always does, so
+                 * this cannot loop. */
+                execute_line_text(seg);
+            } else {
+                shell_run_segment(seg, op == SH_TOK_BG);
+            }
             last = g_last_status;
-            ran_any = true;
             if (g_shell_flow != SHELL_FLOW_NONE) return;
             if (g_opt_errexit && last != 0 &&
                 prev_link != SH_TOK_AND_IF && prev_link != SH_TOK_OR_IF &&
@@ -10282,7 +10369,6 @@ static void execute_line_text(const char *src) {
         }
         prev_link = op;
     }
-    (void)ran_any;
 }
 
 static char g_heredoc_cmd[LINE_MAX];
@@ -10378,9 +10464,12 @@ static void execute_line(void) {
             shell_heredoc_reset();
         } else {
             const char *emit = line;
+            if (g_heredoc_strip_tabs) {
+                while (*emit == '\t') emit++;
+            }
             char expanded[LINE_MAX * 2];
             if (!g_heredoc_quoted) {
-                if (shell_expand_param_word(line, expanded,
+                if (shell_expand_param_word(emit, expanded,
                                             sizeof(expanded)) >= 0)
                     emit = expanded;
             }

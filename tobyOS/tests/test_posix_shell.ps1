@@ -281,7 +281,20 @@ $required = @(
     'POSIXSH: ml-arg0=/data/px_multi.sh',
     'POSIXSH: ml-done',
     'POSIXSH: multi-status=0',
-    'POSIXSH: deep=2000'
+    'POSIXSH: deep=2000',
+
+    # compound commands inside a list, recursion, and the remaining semantics
+    'POSIXSH: enter-2',
+    'POSIXSH: enter-1',
+    'POSIXSH: enter-0',
+    'POSIXSH: rec-0',
+    'POSIXSH: rec-1',
+    'POSIXSH: rec-2',
+    'POSIXSH: bare-exit=1',
+    'POSIXSH: ifs-empty=3-[a]-[]-[b]',
+    'POSIXSH: catpipe=hello',
+    'POSIXSH: dash-heredoc',
+    'POSIXSH: quoted-heredoc $HOME'
 )
 
 # The harness echoes every command line it drives ("[shell-test] $ ..."), and
