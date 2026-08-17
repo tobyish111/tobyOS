@@ -550,29 +550,81 @@ static long g_ack_due_ms;
  * flushed against a dead session. */
 #define IDLE_ENTER   8            /* unchanged frames before backing off */
 #define IDLE_ACK_MS  500          /* ~2 captures/s while nothing is moving */
-static unsigned g_same_run;               /* consecutive unchanged frames */
-static unsigned long g_frame_sig;         /* signature of the last frame */
+/* SLICE 133b: match against the last SIG_RING frames, not just the previous
+ * one. MEASURED, on the very page the EliteDesk boots to (file:///etc/
+ * start.html -- no animation, no timers, no CSS transitions): the JPEG sizes
+ * run 30702, 30665, 30702, 30665, 30702, ... A CLEAN A/B ALTERNATION, ~37
+ * bytes apart in 30 KiB, i.e. visually nothing. Chrome re-encodes a static
+ * page to slightly different bytes from frame to frame, so "identical to the
+ * PREVIOUS frame" was never once true and the throttle never engaged --
+ * confirmed on real hardware (cap stayed 82-84ms through frames 30..120) and
+ * then reproduced in QEMU on the same URL.
+ *
+ * A ring fixes the whole family: A/B, A/B/C, A/B/C/D oscillation all match
+ * something recent and count as "not making progress". A genuine animation
+ * cycles through far more than SIG_RING distinct frames, so it never matches
+ * and keeps full rate -- which is the behaviour that matters. The deliberate
+ * trade is that a page whose ONLY motion is a 2-state blink (a text caret)
+ * gets throttled to ~2/s; a blinking caret is not worth 12 captures/s. */
+static unsigned g_same_run;               /* consecutive visually-unchanged frames */
 static int  g_idle_mode;                  /* 1 = currently backed off */
 static long g_idle_since_ms, g_idle_saved;/* [cwidle] accounting */
 
-/* Signature of the base64 payload still sitting in g_msg. Strided so it costs
- * nothing on a 54 KiB payload, and length-seeded so a same-length-different-
- * content frame cannot collide by stride alone. Runs BEFORE the ack, so the
- * verdict is about THIS frame rather than the previous one. */
-static unsigned long frame_signature(void) {
-    const char *p = strstr(g_msg, "\"data\":\"");
-    if (!p) return 0;
-    p += 8;
-    const char *e = strchr(p, '"');
-    if (!e || e <= p) return 0;
-    size_t len = (size_t)(e - p);
-    unsigned long h = 1469598103934665603UL ^ (unsigned long)len;
-    size_t stride = len / 256; if (stride < 1) stride = 1;
-    for (size_t i = 0; i < len; i += stride) {
-        h ^= (unsigned char)p[i];
-        h *= 1099511628211UL;
+/* SLICE 133c: COMPARE PIXELS, NOT BYTES.
+ *
+ * Two byte-level detectors were tried and both failed on the very page the
+ * machine boots to (file:///etc/start.html -- no animation, no timers). The
+ * JPEG size sequence there is 30702, 30665, 30702, 30665, ... 30652, 30639,
+ * 30652, ...: it ALTERNATES, and the alternating pair also DRIFTS every few
+ * frames. So "identical to the previous frame" was never true (throttle never
+ * engaged, cap stayed 82-84ms on real hardware), and "matches one of the last
+ * 4" only caught the alternation until the pair moved (4 [cwidle] lines in a
+ * 200s run; 11.99 -> 10.88 fps, i.e. nothing).
+ *
+ * The lesson: chrome re-encodes a visually static page to different bytes, so
+ * the JPEG stream is simply not a reliable identity for the PICTURE. The
+ * picture is, and we already decode every frame (dec=3ms) -- so sample the
+ * decoded pixels and allow a tolerance. ~37 bytes of JPEG difference in 30 KiB
+ * is sub-pixel noise; a real change moves many samples at once.
+ *
+ * SAMPLES points scattered by a large odd stride (co-prime with any plausible
+ * row width, so the samples never line up into one column and miss a change
+ * confined to a stripe). A frame counts as unchanged when at most DIFF_TOL
+ * samples moved by more than LUMA_EPS per channel. Cost is SAMPLES compares,
+ * i.e. microseconds -- and it runs where the frame is already in cache. */
+#define SIG_SAMPLES 512
+#define SIG_STRIDE  1021          /* prime; decorrelates from row width */
+#define LUMA_EPS    6             /* per-channel noise floor */
+#define DIFF_TOL    3             /* samples allowed to move and still "same" */
+static uint32_t g_prev_samp[SIG_SAMPLES];
+static int      g_prev_samp_ok;
+
+/* Returns 1 if this frame looks the SAME as the previous one. Updates the
+ * stored samples either way. */
+static int frame_unchanged(const toby_image_t *img) {
+    if (!img || !img->pixels || img->width <= 0 || img->height <= 0) return 0;
+    size_t npx = (size_t)img->width * (size_t)img->height;
+    if (npx == 0) return 0;
+    int diff = 0;
+    int was_ok = g_prev_samp_ok;
+    for (int i = 0; i < SIG_SAMPLES; i++) {
+        size_t idx = ((size_t)i * SIG_STRIDE) % npx;
+        uint32_t px = img->pixels[idx];
+        if (was_ok) {
+            uint32_t q = g_prev_samp[i];
+            int dr = (int)((px >> 16) & 0xff) - (int)((q >> 16) & 0xff);
+            int dg = (int)((px >>  8) & 0xff) - (int)((q >>  8) & 0xff);
+            int db = (int)( px        & 0xff) - (int)( q        & 0xff);
+            if (dr < 0) dr = -dr;
+            if (dg < 0) dg = -dg;
+            if (db < 0) db = -db;
+            if (dr > LUMA_EPS || dg > LUMA_EPS || db > LUMA_EPS) diff++;
+        }
+        g_prev_samp[i] = px;
     }
-    return h ? h : 1;                     /* 0 is reserved for "no signature" */
+    g_prev_samp_ok = 1;
+    if (!was_ok) return 0;                 /* first frame: no verdict */
+    return diff <= DIFF_TOL;
 }
 
 /* "Something happened -- stop idling." Safe to call from anywhere, including
@@ -647,6 +699,15 @@ static int install_b64_frame(void) {
     toby_image_t *old = g_frame;
     g_frame = img;
     if (old) toby_image_free(old);
+#ifndef CW_LAT
+    /* Slice 133c: classify the PICTURE, now that we have pixels. */
+    if (frame_unchanged(img)) {
+        if (g_same_run < 1000000u) g_same_run++;
+    } else {
+        if (g_idle_mode) cdp_wake();          /* really moved -- full rate */
+        g_same_run = 0;
+    }
+#endif
     g_frames++;
     g_last_frame_ms = sys_clock_ms();
     g_cdp_last_ms = g_last_frame_ms;  /* slice 115: freshest-source paint */
@@ -722,19 +783,10 @@ static void handle_screencast_frame(void) {
      * b64+decode+paint serialized our ~2-5ms into every cycle. Acking first
      * overlaps chrome's next capture/encode with our decode of this frame.
      * (g_msg is not touched by cdp_send, so the payload survives the send.) */
-    /* Slice 133: classify THIS frame before the ack decision below. */
-#ifndef CW_LAT
-    {
-        unsigned long sig = frame_signature();
-        if (sig && sig == g_frame_sig) {
-            if (g_same_run < 1000000u) g_same_run++;
-        } else {
-            if (g_idle_mode) cdp_wake();           /* real change -- full rate */
-            g_same_run = 0;
-        }
-        if (sig) g_frame_sig = sig;
-    }
-#endif
+    /* Slice 133c: the changed/unchanged verdict is produced in
+     * install_b64_frame, from the DECODED pixels (see frame_unchanged). It is
+     * therefore one frame behind at this point, which is harmless -- the
+     * throttle needs IDLE_ENTER of them in a row before it does anything. */
     if (sid >= 0) {                                /* ack -> chrome sends the next */
 #if defined(CW_VIZ) && !defined(CW_LAT)
         /* Slice 115: defer the ack while viz frames flow (see decl block).
@@ -1062,7 +1114,7 @@ static void cdp_dispatch(void) {
         /* Slice 133: a new document is the least idle thing that can happen --
          * drop the throttle AND the old page's frame signature, or the first
          * frames of the new page could be compared against the old one's. */
-        g_frame_sig = 0;
+        g_prev_samp_ok = 0;        /* new document: no verdict from the old one */
         cdp_wake();
         snprintf(scp, sizeof scp,
                  "{\"format\":\"jpeg\",\"quality\":" CW_STR(CW_Q) ","
