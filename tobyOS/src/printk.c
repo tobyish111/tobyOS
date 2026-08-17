@@ -223,6 +223,12 @@ static void kvprintf_unlocked(const char *fmt, va_list ap) {
             emit_uint(v, 10, false, width, zero_pad, left_align);
             break;
         }
+        case 'o': {
+            uint64_t v = is_long ? va_arg(ap, unsigned long)
+                                 : va_arg(ap, unsigned int);
+            emit_uint(v, 8, false, width, zero_pad, left_align);
+            break;
+        }
         case 'x': {
             uint64_t v = is_long ? va_arg(ap, unsigned long)
                                  : va_arg(ap, unsigned int);
