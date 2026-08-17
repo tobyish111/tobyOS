@@ -65,7 +65,11 @@ case "$MODE" in
   *)   echo "usage: $0 {cpu|gl|gle|gld|mp|viz|vizp|lat} {anim|webgl|input}"; exit 2 ;;
 esac
 
-echo "=== [1/3] build: mode=$MODE page=$PAGE ==="
+# Slice 133: extra chromewin defines for one-off A/Bs without editing this
+# script (e.g. CW_EXTRA=-DCW_Q=20 to split encode cost from capture cost).
+PROGF="$PROGF ${CW_EXTRA:-}"
+
+echo "=== [1/3] build: mode=$MODE page=$PAGE ${CW_EXTRA:+extra=$CW_EXTRA} ==="
 taskkill //F //IM qemu-system-x86_64.exe >/dev/null 2>&1
 sleep 1                     # let Windows release the ISO lock (slice 61f)
 rm -f build/initrd.tar build/base.iso tobyOS.iso
