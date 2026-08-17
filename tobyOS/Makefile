@@ -1604,8 +1604,14 @@ TSH_OBJS := programs/tsh/shell_hosted.o \
 # -DSHELL_HOSTED: userspace exposes only the POSIX/bash builtin set, so the
 # kernel shell's convenience builtins (cat, ls, mkdir, ...) stop shadowing the
 # real utilities in /bin. See shell_hosted_builtin() in src/shell.c.
+# EXTRA_CFLAGS must reach THIS copy too. src/shell.c is compiled twice, and a
+# -D passed on the make line used to land only in the kernel's copy -- so
+# instrumentation added to diagnose a /bin/tsh failure silently was not in
+# /bin/tsh, and its absent output read as "this code path is never reached".
+# Same shape as the PROG_EXTRA_CFLAGS trap: a define reaching one half of a
+# twice-compiled file.
 programs/tsh/shell_hosted.o: src/shell.c $(LIBTOBY_AR)
-	$(CC) $(LIBTOBY_CFLAGS) -I include -DSHELL_HOSTED -c $< -o $@
+	$(CC) $(LIBTOBY_CFLAGS) $(EXTRA_CFLAGS) -I include -DSHELL_HOSTED -c $< -o $@
 
 programs/tsh/%.o: programs/tsh/%.c $(LIBTOBY_AR)
 	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@

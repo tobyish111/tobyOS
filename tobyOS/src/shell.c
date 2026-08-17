@@ -1722,6 +1722,11 @@ static void cmd_read(int argc, char **argv) {
         return;
     }
 
+#ifdef SHELL_TRACE_READ
+    kprintf("[readtrace] argc=%d first=%d in=%p g_shell_in=%p fd0=%p IFS='%s'\n",
+            argc, first, (void *)in, (void *)g_shell_in, (void *)g_shell_fd[0],
+            env_get("IFS") ? env_get("IFS") : "(unset)");
+#endif
     char linebuf[LINE_MAX];
     bool got_any = false;
     int rr = shell_read_line_from_file(in, raw, linebuf, sizeof(linebuf),
