@@ -1585,10 +1585,17 @@ static bool shell_ifs_has(const char *ifs, char c) {
     return false;
 }
 
+/* Returns 0 when the line ended at a NEWLINE, 1 when it ended at EOF with
+ * data still unterminated, negative on error. POSIX requires `read` to
+ * report a non-zero status in the second case even though it assigns what
+ * it got -- that is how `while read line` terminates on a file whose last
+ * line has no trailing newline instead of processing it twice or not at
+ * all. The reader used to return 0 for both and the distinction was lost. */
 static int shell_read_line_from_file(struct file *in, bool raw,
                                      char *out, size_t cap,
                                      bool *got_any) {
     if (!in || !out || cap == 0 || !got_any) return -1;
+    bool hit_eof = false;
     size_t pos = 0;
     bool escaped = false;
     *got_any = false;
@@ -1597,7 +1604,7 @@ static int shell_read_line_from_file(struct file *in, bool raw,
         char c = 0;
         long n = file_read(in, &c, 1);
         if (n < 0) return -1;
-        if (n == 0) break;
+        if (n == 0) { hit_eof = true; break; }
         *got_any = true;
 
         if (!raw && escaped) {
@@ -1621,7 +1628,7 @@ static int shell_read_line_from_file(struct file *in, bool raw,
         out[pos++] = '\\';
     }
     out[pos] = '\0';
-    return 0;
+    return hit_eof ? 1 : 0;
 }
 
 static int shell_read_assign_empty(int argc, char **argv, int first) {
@@ -1733,7 +1740,9 @@ static void cmd_read(int argc, char **argv) {
     }
 
     int rc = shell_read_assign_fields(argc, argv, first, linebuf);
-    shell_set_status(rc);
+    /* Fields are assigned either way; the status reports that input ran
+     * out mid-line, which is what stops a `while read` loop. */
+    shell_set_status(rc ? rc : (rr == 1 ? 1 : 0));
 }
 
 static void cmd_pwd(int argc, char **argv) {
@@ -9123,11 +9132,19 @@ static bool shell_try_for_command(const char *src) {
     }
 
     struct shell_simple tail_redirs;
+#ifdef SHELL_TRACE_FOR
+    kprintf("[fortrace] marker='%s' tail='%s'\n",
+            done_marker ? done_marker : "(null)",
+            done_at + strlen(done_marker));
+#endif
     if (shell_parse_compound_redirs(done_at + strlen(done_marker),
                                     &tail_redirs, "for") < 0) {
         shell_set_status(2);
         return true;
     }
+#ifdef SHELL_TRACE_FOR
+    kprintf("[fortrace] redir_count=%d\n", tail_redirs.redir_count);
+#endif
 
     struct shell_token tok[SHELL_TOKEN_MAX];
     char words[SHELL_PARSE_BUF_MAX];
