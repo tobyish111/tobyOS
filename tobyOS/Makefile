@@ -405,13 +405,15 @@ HEADERS := $(wildcard include/tobyos/*.h)
 # Full rules live further below. We declare the per-tool ELF list up
 # here so PROGRAMS (built with := immediate-expansion) can reference it.
 PORTS_SBASE_DIR    := ports/sbase
-PORTS_SBASE_TOOLS  := echo cat wc head ls grep
+PORTS_SBASE_TOOLS  := echo cat wc head ls grep \
+                      basename dirname sleep tee expr tr cut uniq sort
 PORTS_SBASE_ELFS   := $(addprefix $(PORTS_SBASE_DIR)/,$(addsuffix .elf,$(PORTS_SBASE_TOOLS)))
 
 # Programs built and bundled into the boot initrd. Each is a tiny
 # static ELF; programs/user_hello/user_hello.elf becomes /bin/hello
 # inside the initramfs (see initrd-stage rules below).
-PROGRAMS := programs/hello/hello.elf \
+PROGRAMS := programs/awk/awk.elf \
+            programs/hello/hello.elf \
             programs/user_hello/user_hello.elf \
             programs/user_bad/user_bad.elf \
             programs/user_echo/user_echo.elf \
@@ -2018,6 +2020,16 @@ programs/linux-static-auto/linux-static-auto.elf: programs/linux-static-auto/mai
 # GetStdHandle / WriteFile / ExitProcess. PE is self-identifying by its
 # 'MZ' magic, so -- unlike the brandelf'd Linux ELFs -- it needs NO brand;
 # tobyOS's exec path sniffs the magic and routes it to the PE loader.
+# awk keeps numeric values as doubles, so this one program needs SSE
+# re-enabled -- the default userland flags disable it kernel-style.
+programs/awk/awk.o: programs/awk/main.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -msse -msse2 -c $< -o $@
+
+programs/awk/awk.elf: programs/awk/awk.o $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                      $(PORTS_SBASE_LD)
+	$(LD) $(PROG_LDFLAGS) -T $(PORTS_SBASE_LD) -o $@ \
+	      $(LIBTOBY_CRT0) programs/awk/awk.o $(LIBTOBY_AR)
+
 programs/win-hello/win-hello.exe: programs/win-hello/hello.c
 	$(CC) --target=x86_64-w64-mingw32 -nostdlib -ffreestanding -fno-builtin \
 	      -fno-stack-protector -O1 -Wl,-e,hello_entry -Wl,--subsystem,console \
@@ -2913,6 +2925,16 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp $(PORTS_SBASE_DIR)/head.elf                    $(INITRD_STAGE)/bin/p_head
 	cp $(PORTS_SBASE_DIR)/ls.elf                      $(INITRD_STAGE)/bin/p_ls
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/p_grep
+	cp $(PORTS_SBASE_DIR)/basename.elf                  $(INITRD_STAGE)/bin/basename
+	cp $(PORTS_SBASE_DIR)/dirname.elf                   $(INITRD_STAGE)/bin/dirname
+	cp $(PORTS_SBASE_DIR)/sleep.elf                     $(INITRD_STAGE)/bin/sleep
+	cp $(PORTS_SBASE_DIR)/tee.elf                       $(INITRD_STAGE)/bin/tee
+	cp $(PORTS_SBASE_DIR)/expr.elf                      $(INITRD_STAGE)/bin/expr
+	cp $(PORTS_SBASE_DIR)/tr.elf                        $(INITRD_STAGE)/bin/tr
+	cp $(PORTS_SBASE_DIR)/cut.elf                       $(INITRD_STAGE)/bin/cut
+	cp $(PORTS_SBASE_DIR)/uniq.elf                      $(INITRD_STAGE)/bin/uniq
+	cp programs/awk/awk.elf                           $(INITRD_STAGE)/bin/awk
+	cp $(PORTS_SBASE_DIR)/sort.elf                      $(INITRD_STAGE)/bin/sort
 	cp $(LDTOBY_SO)                                   $(INITRD_STAGE)/lib/ld-toby.so
 	cp $(LIBTOBY_SO)                                  $(INITRD_STAGE)/lib/libtoby.so
 	cp $(HELLOAPP_TPKG)                               $(INITRD_STAGE)/repo/helloapp.tpkg
@@ -3396,6 +3418,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-scmsg bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
 	    bin/linux-qfreeze bin/linux-drmtest bin/linux-sndtest \
 	    bin/linux-xstub \
+	    bin/basename bin/dirname bin/sleep bin/tee bin/expr \
+	    bin/tr bin/cut bin/uniq bin/sort bin/awk \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
