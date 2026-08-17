@@ -106,6 +106,31 @@ def main():
     out = "\n".join(l for l in raw.splitlines() if "[shell-test] $ " not in l)
 
     missing = [p for p in required_patterns() if p not in out]
+
+    # Utility output is plain text, so it is checked against the command that
+    # produced it rather than by a unique sentinel.
+    util_checks = [
+        ("basename /a/b/c.txt", "c.txt"),
+        ("basename /a/b/c.txt .txt", "c"),
+        ("dirname /a/b/c.txt", "/a/b"),
+        ("dirname plain", "."),
+        ("expr 3 + 4", "7"),
+        ("expr 10 / 3", "3"),
+        ("expr abc : 'a.*'", "3"),
+        ("expr 5 '>' 3", "1"),
+        ("cut -d: -f2 /data/px_c.txt", "b"),
+        ("cut -c1-3 /data/px_c.txt", "a:b"),
+        ("tr a-z A-Z </data/px_t.txt", "HELLO"),
+    ]
+    lines = raw.splitlines()
+    for cmd, want in util_checks:
+        idx = next((i for i, l in enumerate(lines)
+                    if l.endswith("[shell-test] $ " + cmd)), -1)
+        if idx < 0:
+            missing.append(f"no output for: {cmd}")
+            continue
+        if not any(l.strip() == want for l in lines[idx + 1:idx + 8]):
+            missing.append(f"{cmd} did not print {want}")
     for name in FORBIDDEN:
         if re.search(r"(?m)^POSIXSH: " + re.escape(name), out):
             missing.append(f"unexpected POSIXSH: {name}")

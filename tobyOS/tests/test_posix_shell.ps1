@@ -350,7 +350,12 @@ $required = @(
 
     # a compound block well past the old 512-byte limit, comments and all
     'POSIXSH: long-block=40',
-    'POSIXSH: long-status=0'
+    'POSIXSH: long-status=0',
+
+    # POSIX utilities that were entirely absent
+    'POSIXSH: util-start',
+    'POSIXSH: expr-false=1',
+    'POSIXSH: sleep-status=0'
 )
 
 # The harness echoes every command line it drives ("[shell-test] $ ..."), and
@@ -382,6 +387,34 @@ if ($txt -match '(?m)^POSIXSH: subshell-alias-bad') { $missing += 'unexpected PO
 if ($txt -match '(?m)^POSIXSH: subshell-function-bad') { $missing += 'unexpected POSIXSH: subshell-function-bad' }
 if ($txt -match '(?m)^POSIXSH: subshell-exit-bad') { $missing += 'unexpected POSIXSH: subshell-exit-bad' }
 if ($txt -match '(?m)^POSIXSH: errexit-bad') { $missing += 'unexpected POSIXSH: errexit-bad' }
+# Utility output: plain lines, checked against the commands that produced them.
+$utilChecks = @(
+    @('basename /a/b/c.txt',        'c.txt'),
+    @('basename /a/b/c.txt .txt',   'c'),
+    @('dirname /a/b/c.txt',         '/a/b'),
+    @('dirname plain',              '.'),
+    @('expr 3 + 4',                 '7'),
+    @('expr 10 / 3',                '3'),
+    @("expr abc : 'a.*'",           '3'),
+    @('expr 5 ''>'' 3',             '1'),
+    @('cut -d: -f2 /data/px_c.txt', 'b'),
+    @('cut -c1-3 /data/px_c.txt',   'a:b'),
+    @('tr a-z A-Z </data/px_t.txt', 'HELLO')
+)
+$lines = $txt -split "`n"
+foreach ($chk in $utilChecks) {
+    $idx = -1
+    for ($k = 0; $k -lt $lines.Count; $k++) {
+        if ($lines[$k] -like ('*[shell-test] $ ' + $chk[0])) { $idx = $k; break }
+    }
+    if ($idx -lt 0) { $missing += ('no output for: ' + $chk[0]); continue }
+    $found = $false
+    for ($k = $idx + 1; $k -lt [Math]::Min($idx + 8, $lines.Count); $k++) {
+        if ($lines[$k].Trim() -eq $chk[1]) { $found = $true; break }
+    }
+    if (-not $found) { $missing += ($chk[0] + ' did not print ' + $chk[1]) }
+}
+
 if ($out -notmatch 'posixsh_a\.txt' -or $out -notmatch 'posixsh_b\.txt') {
     $missing += 'glob expansion did not show both posixsh files'
 }

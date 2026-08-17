@@ -2052,6 +2052,39 @@ static void posix_shell_selftest(void) {
          * with a trailing comment on every line */
         "sh /data/px_long.sh",
         "echo POSIXSH: long-status=$?",
+        /* --- POSIX utilities: basename dirname expr sort uniq cut tr
+         *     tee sleep awk. Their output is checked from the boot log
+         *     directly rather than through $(...), which does not yet
+         *     capture an external program's stdout. --- */
+        "echo POSIXSH: util-start",
+        "basename /a/b/c.txt",
+        "basename /a/b/c.txt .txt",
+        "dirname /a/b/c.txt",
+        "dirname plain",
+        "expr 3 + 4",
+        "expr 10 / 3",
+        "expr abc : 'a.*'",
+        "expr abcdef : 'abc\\(.*\\)'",
+        "expr 5 '>' 3",
+        "expr 0",
+        "echo POSIXSH: expr-false=$?",
+        "printf 'b\\na\\nb\\nb\\n' >/data/px_u.txt",
+        "sort /data/px_u.txt >/data/px_s.txt",
+        "sort -u /data/px_u.txt",
+        "uniq -c </data/px_s.txt",
+        "uniq -d </data/px_s.txt",
+        "printf '2 x\\n10 y\\n' >/data/px_n.txt",
+        "sort -n /data/px_n.txt",
+        "printf 'a:b:c\\n' >/data/px_c.txt",
+        "cut -d: -f2 /data/px_c.txt",
+        "cut -c1-3 /data/px_c.txt",
+        "printf 'hello\\n' >/data/px_t.txt",
+        "tr a-z A-Z </data/px_t.txt",
+        "tee /data/px_tee.txt </data/px_t.txt",
+        "awk '{ print $1 }' /data/px_n.txt",
+        "sleep 0",
+        "echo POSIXSH: sleep-status=$?",
+
         "echo POSIXSH: done",
         0
     };
