@@ -200,35 +200,72 @@ static int run_shell(const char *shell, char *const argv[],
  * is the whole diagnostic value of the gate: "outputs differ" tells you
  * nothing, "line 3: bash said `a b` and tsh said `a  b`" tells you it is word
  * splitting. */
-static void show_diff(const char *a, long na, const char *b, long nb) {
+/* Print every differing LINE, not just the first differing byte.
+ *
+ * The old version reported one line per side, taken at the first byte that
+ * differed. That is enough to know a case failed and almost never enough to
+ * know why: if one shell emits an extra line early, every later line is
+ * "different" and the reported pair points at whatever happened to be
+ * adjacent rather than at the cause. Three root causes in a row were read
+ * wrong that way -- a per-handle lseek looked like a flushing problem, a
+ * multi-line function body looked like a getopts bug, and a builtin shadowing
+ * /bin/cat looked like a pipeline bug.
+ *
+ * Comparing line by line and showing each mismatch makes the SHAPE of the
+ * difference visible: a missing line, an extra line, or a changed one. Bounded,
+ * so a wholly divergent case cannot flood the serial log. */
+
+#define DIFF_MAX_LINES 14
+
+/* Copy line `want` (0-based) of `buf` into `out`, escaping control characters.
+ * Returns -1 if that line does not exist -- itself information, since it says
+ * one side simply stopped producing output. */
+static int line_at(const char *buf, long len, int want, char *out, size_t cap) {
+    int line = 0;
     long i = 0;
-    while (i < na && i < nb && a[i] == b[i]) i++;
-
-    /* Which line, and where does it start? */
-    int lineno = 1;
-    long ls = 0;
-    for (long k = 0; k < i; k++)
-        if (a[k] == '\n') { lineno++; ls = k + 1; }
-
-    char ea[128], eb[128];
-    for (int side = 0; side < 2; side++) {
-        const char *s = side ? b : a;
-        long   n = side ? nb : na;
-        char  *e = side ? eb : ea;
-        size_t o = 0;
-        for (long k = ls; k < n && s[k] != '\n' && o < sizeof ea - 5; k++) {
-            unsigned char c = (unsigned char)s[k];
-            if (c == '\t')      { e[o++] = '\\'; e[o++] = 't'; }
-            else if (c < 0x20 || c == 0x7f) {
-                o += (size_t)snprintf(e + o, sizeof ea - o, "\\x%02x", c);
-            } else e[o++] = (char)c;
-        }
-        e[o] = '\0';
+    while (i < len && line < want) {
+        if (buf[i] == '\n') line++;
+        i++;
     }
+    if (i >= len && line < want) return -1;
+    size_t o = 0;
+    for (; i < len && buf[i] != '\n' && o + 5 < cap; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c == '\t') { out[o++] = '\\'; out[o++] = 't'; }
+        else if (c < 0x20 || c == 0x7f)
+            o += (size_t)snprintf(out + o, cap - o, "\\x%02x", c);
+        else out[o++] = (char)c;
+    }
+    out[o] = '\0';
+    return 0;
+}
 
-    emitf("[shparity]     first diff at byte %ld (line %d)\n", i, lineno);
-    emitf("[shparity]     bash: |%s|\n", ea);
-    emitf("[shparity]     tsh : |%s|\n", eb);
+static int count_lines(const char *buf, long len) {
+    int n = 0;
+    for (long i = 0; i < len; i++) if (buf[i] == '\n') n++;
+    if (len > 0 && buf[len - 1] != '\n') n++;
+    return n;
+}
+
+static void show_diff(const char *a, long na, const char *b, long nb) {
+    int la = count_lines(a, na), lb = count_lines(b, nb);
+    emitf("[shparity]     lines bash=%d tsh=%d\n", la, lb);
+
+    int shown = 0;
+    int most = (la > lb) ? la : lb;
+    for (int n = 0; n < most && shown < DIFF_MAX_LINES; n++) {
+        char ta[160], tb[160];
+        int ra = line_at(a, na, n, ta, sizeof ta);
+        int rb = line_at(b, nb, n, tb, sizeof tb);
+        if (ra < 0) ta[0] = '\0';
+        if (rb < 0) tb[0] = '\0';
+        if (ra == rb && strcmp(ta, tb) == 0) continue;
+        emitf("[shparity]     L%-3d bash: %s\n", n + 1, ra < 0 ? "<none>" : ta);
+        emitf("[shparity]     L%-3d tsh : %s\n", n + 1, rb < 0 ? "<none>" : tb);
+        shown++;
+    }
+    if (shown >= DIFF_MAX_LINES)
+        emitf("[shparity]     ... further differences suppressed\n");
 }
 
 /* ---- main --------------------------------------------------------------- */
