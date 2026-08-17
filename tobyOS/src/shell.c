@@ -821,6 +821,22 @@ static void shell_run_trap(int sig) {
     kfree(action);
 }
 
+/* The pid the shell itself runs as, so a signal aimed at the shell can be
+ * routed to its trap dispatcher. Recorded from the shell thread -- latching
+ * it inside shell_owns_pid would record whichever thread happened to send the
+ * first signal, and the shell's own pid is 0 here, so there is no sentinel
+ * value to fall back on. */
+static int g_shell_pid = -1;
+
+static void shell_latch_pid(void) {
+    struct proc *cur = current_proc();
+    if (cur) g_shell_pid = cur->pid;
+}
+
+bool shell_owns_pid(int pid) {
+    return g_shell_pid >= 0 && pid == g_shell_pid;
+}
+
 void shell_deliver_signal(int sig) {
     if (sig > 0 && sig < SIG_MAX) g_pending_signals[sig] = 1;
 }
@@ -10780,6 +10796,7 @@ static bool shell_line_needs_continuation(const char *s) {
 }
 
 static void execute_line(void) {
+    shell_latch_pid();
     if (g_heredoc_collecting) {
         const char *check = line;
         if (g_heredoc_strip_tabs)

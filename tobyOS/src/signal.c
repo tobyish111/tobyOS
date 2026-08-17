@@ -9,6 +9,7 @@
  */
 
 #include <tobyos/signal.h>
+#include <tobyos/shell.h>
 #include <tobyos/proc.h>
 #include <tobyos/sched.h>
 #include <tobyos/printk.h>
@@ -211,6 +212,13 @@ void signal_send(struct proc *p, int sig) {
 }
 
 void signal_send_to_pid(int pid, int sig) {
+    /* The shell runs as a kernel thread and never returns to user mode, so
+     * the normal delivery point -- the return-to-user path -- never runs for
+     * it and a `trap ... USR1` handler would never fire. shell_deliver_signal
+     * existed for exactly this and had no callers at all. Hand it the signal;
+     * the shell dispatches pending traps at the next command boundary, which
+     * is where POSIX says a trap action runs. */
+    if (shell_owns_pid(pid)) shell_deliver_signal(sig);
     signal_send(proc_lookup(pid), sig);
 }
 
