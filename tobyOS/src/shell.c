@@ -1404,6 +1404,13 @@ static void cmd_shift(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    /* `shift 0` is a no-op, and must be one: the compaction below copies slot
+     * i to slot i-n and then clears slot i, so with n == 0 every parameter is
+     * assigned to itself and then NULLed. $# stayed correct while every $n
+     * became empty -- which is what `shift $((OPTIND-1))` does after getopts
+     * consumed no options, i.e. the common case. */
+    if (n == 0) return;
+
     for (int i = 0; i < n; i++) {
         if (g_positional[i]) kfree(g_positional[i]);
     }
