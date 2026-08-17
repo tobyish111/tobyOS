@@ -2023,6 +2023,15 @@ static void posix_shell_selftest(void) {
         "fc -l -n -1",
         "fc -s target=replaced echo",
 
+        /* --- set -n reads and checks without executing --- */
+        "sh -c 'set -n; echo POSIXSH: never; if true; then echo POSIXSH: never2; fi'",
+        "echo POSIXSH: noexec-clean=$?",
+        "sh /data/px_badsyn.sh",
+        "echo POSIXSH: noexec-bad=$?",
+        "sh /data/px_goodsyn.sh",
+        "echo POSIXSH: noexec-good=$?",
+        "sh /data/px_badquote.sh",
+        "echo POSIXSH: noexec-quote=$?",
         "echo POSIXSH: done",
         0
     };
@@ -2186,6 +2195,26 @@ static void posix_shell_selftest(void) {
         "Q\n";
     hrc = vfs_write_all("/data/px_heredoc2.sh", px_heredoc2,
                         strlen(px_heredoc2));
+
+    static const char px_badsyn[] =
+        "set -n\n"
+        "if true\n"
+        "then echo hi\n";
+    hrc = vfs_write_all("/data/px_badsyn.sh", px_badsyn, strlen(px_badsyn));
+
+    static const char px_goodsyn[] =
+        "set -n\n"
+        "if true\n"
+        "then echo hi\n"
+        "fi\n"
+        "for i in a b; do echo $i; done\n";
+    hrc = vfs_write_all("/data/px_goodsyn.sh", px_goodsyn, strlen(px_goodsyn));
+
+    static const char px_badquote[] =
+        "set -n\n"
+        "echo 'unterminated\n";
+    hrc = vfs_write_all("/data/px_badquote.sh", px_badquote,
+                        strlen(px_badquote));
 
     kprintf("[boot] POSIXSH: starting shell compatibility smoke\n");
     for (int i = 0; lines[i]; i++) {

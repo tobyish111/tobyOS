@@ -33,7 +33,7 @@ FORBIDDEN = [
     "subshell-function-bad", "subshell-exit-bad", "errexit-bad",
     "empty-at-bad", "case-q-bad", "case-cls-bad", "case-neg-bad",
     "plain-bad", "clobber-bad", "ml-if-bad", "ml-case-bad",
-    "case-quoted-bad", "errexit-fn-bad", "noexec-bad",
+    "case-quoted-bad", "errexit-fn-bad", "never",
 ]
 
 

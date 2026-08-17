@@ -329,7 +329,15 @@ $required = @(
     'POSIXSH: pathchk-p=1',
     'POSIXSH: newgrp=1',
     'POSIXSH: fc-target',
-    'POSIXSH: fc-replaced'
+    'POSIXSH: fc-replaced',
+
+    # set -n reads and syntax-checks without executing
+    'POSIXSH: noexec-clean=0',
+    'POSIXSH: noexec-bad=2',
+    'POSIXSH: noexec-good=0',
+    'POSIXSH: noexec-quote=2',
+    "sh: syntax error: 'if' without matching 'fi'",
+    'sh: syntax error: unterminated single quote'
 )
 
 # The harness echoes every command line it drives ("[shell-test] $ ..."), and
@@ -353,7 +361,7 @@ if ($out -match '(?m)^POSIXSH: ml-if-bad') { $missing += 'unexpected POSIXSH: ml
 if ($out -match '(?m)^POSIXSH: ml-case-bad') { $missing += 'unexpected POSIXSH: ml-case-bad' }
 if ($out -match '(?m)^POSIXSH: case-quoted-bad') { $missing += 'unexpected POSIXSH: case-quoted-bad' }
 if ($out -match '(?m)^POSIXSH: errexit-fn-bad') { $missing += 'unexpected POSIXSH: errexit-fn-bad' }
-if ($out -match '(?m)^POSIXSH: noexec-bad') { $missing += 'unexpected POSIXSH: noexec-bad' }
+if ($out -match '(?m)^POSIXSH: never') { $missing += 'unexpected POSIXSH: never' }
 if ($txt -match '(?m)^POSIXSH: loop-later') { $missing += 'unexpected POSIXSH: loop-later' }
 if ($txt -match '(?m)^POSIXSH: return-bad') { $missing += 'unexpected POSIXSH: return-bad' }
 if ($txt -match '(?m)^POSIXSH: subshell-alias-bad') { $missing += 'unexpected POSIXSH: subshell-alias-bad' }

@@ -130,6 +130,10 @@ static int g_builtin_entry_status;
  * under `!`. Held up while such a condition runs. */
 static int g_errexit_suppress;
 
+/* Sticky non-zero once `set -n` has seen a malformed command, so the script
+ * as a whole reports the failure it found. */
+static int g_noexec_error;
+
 /* Command history, kept so `fc` has something to list and re-run. A ring:
  * g_hist_base is the history number of slot 0, so numbers keep climbing as
  * entries are overwritten. */
@@ -198,6 +202,7 @@ static bool shell_line_needs_continuation(const char *s);
 static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
 static int shell_append_str(char *buf, size_t *pos, size_t cap, const char *s);
 static bool shell_word_has(const char *word, char c);
+static int shell_syntax_check(const char *s);
 static const char *shell_skip_blanks(const char *s);
 static int parse_int(const char *s, int *out);
 static int shell_run_exit_trap(int status);
@@ -4164,6 +4169,8 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
 
     g_script_depth++;
     unsigned long saved_lineno = g_shell_lineno;
+    int saved_noexec_error = g_noexec_error;
+    g_noexec_error = 0;
     g_shell_lineno = 0;
     int last = 0;
     char *p = text;
@@ -4231,7 +4238,17 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         }
         if (g_shell_flow != SHELL_FLOW_NONE) break;
     }
+    /* Text left in `pending` at end of file is a construct that never
+     * closed -- an unterminated quote, or an `if` with no `fi`. Silently
+     * dropping it made a truncated script look like it ran clean. */
+    if (pending_len > 0) {
+        int rc = shell_syntax_check(pending);
+        last = rc ? rc : 2;
+        if (!rc) kprintf("sh: syntax error: unexpected end of file\n");
+    }
     if (run_exit_trap) last = shell_run_exit_trap(last);
+    if (g_noexec_error) last = g_noexec_error;
+    g_noexec_error = saved_noexec_error;
     g_script_depth--;
     g_shell_lineno = saved_lineno;
     return last;
@@ -10571,9 +10588,96 @@ static const char *shell_find_list_sep(const char *s, int *oplen,
 
 /* Run one and-or-list element: a single pipeline, already isolated from the
  * rest of the line so its expansions happen at the moment it runs. */
+/* Syntax check for `set -n`.
+ *
+ * POSIX: "read commands but do not execute them", which exists so a script
+ * can be checked without side effects. Merely skipping execution -- what this
+ * used to do -- reports success on a file full of unbalanced `if`s, which
+ * makes the option useless for the one job it has. Returns 0 if the text is
+ * well formed, or writes a diagnostic and returns non-zero.
+ *
+ * This is a structural check over the same features the parser recognises:
+ * quoting, compound-command balance, and the operators that must be followed
+ * by a command. It is not a full grammar -- the parser is not one either. */
+static int shell_syntax_check(const char *s) {
+    int if_depth = 0, do_depth = 0, case_depth = 0;
+    int brace = 0, paren = 0, loop_open = 0;
+    bool in_sq = false, in_dq = false;
+
+    for (const char *p = s; *p; p++) {
+        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_dq = false;
+            continue;
+        }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'') { in_sq = true; continue; }
+        if (*p == '"')  { in_dq = true; continue; }
+        if (*p == '#' && (p == s || is_space(p[-1]))) {
+            while (*p && *p != '\n') p++;
+            if (!*p) break;
+            continue;
+        }
+        if (*p == '{') brace++;
+        else if (*p == '}') brace--;
+        else if (*p == '(') paren++;
+        else if (*p == ')') paren--;
+
+        if (!(p == s || is_space(p[-1]) || p[-1] == ';' || p[-1] == '\n'))
+            continue;
+        if (shell_starts_with_word(p, "if")) if_depth++;
+        else if (shell_starts_with_word(p, "fi")) if_depth--;
+        else if (shell_starts_with_word(p, "for") ||
+                 shell_starts_with_word(p, "while") ||
+                 shell_starts_with_word(p, "until")) loop_open++;
+        else if (shell_starts_with_word(p, "do")) {
+            do_depth++;
+            if (loop_open > 0) loop_open--;
+        }
+        else if (shell_starts_with_word(p, "done")) do_depth--;
+        else if (shell_starts_with_word(p, "case")) case_depth++;
+        else if (shell_starts_with_word(p, "esac")) case_depth--;
+    }
+
+    const char *what = 0;
+    if (in_sq)            what = "unterminated single quote";
+    else if (in_dq)       what = "unterminated double quote";
+    else if (if_depth > 0)   what = "'if' without matching 'fi'";
+    else if (if_depth < 0)   what = "'fi' without matching 'if'";
+    else if (do_depth > 0)   what = "'do' without matching 'done'";
+    else if (do_depth < 0)   what = "'done' without matching 'do'";
+    else if (loop_open > 0)  what = "loop without 'do'";
+    else if (case_depth > 0) what = "'case' without matching 'esac'";
+    else if (case_depth < 0) what = "'esac' without matching 'case'";
+    else if (brace > 0)      what = "'{' without matching '}'";
+    else if (brace < 0)      what = "'}' without matching '{'";
+    else if (paren > 0)      what = "'(' without matching ')'";
+    else if (paren < 0)      what = "')' without matching '('";
+
+    if (!what) {
+        /* A trailing operator has nothing to operate on. */
+        const char *end = s + strlen(s);
+        while (end > s && (is_space(end[-1]) || end[-1] == '\n')) end--;
+        if (end > s && (end[-1] == '|' || end[-1] == '&')) {
+            bool doubled = (end - s >= 2 && end[-2] == end[-1]);
+            if (end[-1] == '|' || doubled) what = "unexpected end after operator";
+        }
+    }
+    if (what) {
+        kprintf("sh: syntax error: %s\n", what);
+        return 2;
+    }
+    return 0;
+}
+
 static void shell_run_segment(const char *src, bool background) {
-    /* `set -n`: read the commands, run none of them. */
+    /* Also checked here, not just per line: `set -n; echo hi` turns the
+     * option on partway through a list, and everything after it must be
+     * checked rather than run. */
     if (g_opt_noexec) {
+        int rc = shell_syntax_check(src);
+        if (rc) g_noexec_error = rc;
         shell_set_status(0);
         return;
     }
@@ -10722,6 +10826,15 @@ static void execute_line_text(const char *src) {
     src = shell_expand_aliases(src, alias_buf, sizeof(alias_buf));
     if (!src) {
         shell_set_status(2);
+        return;
+    }
+
+    /* `set -n`: read the command and check it, but do not run it. Checked
+     * here rather than deeper down so compound commands are covered too. */
+    if (g_opt_noexec) {
+        int rc = shell_syntax_check(src);
+        if (rc) g_noexec_error = rc;
+        shell_set_status(0);
         return;
     }
     if (shell_line_is_compound(src)) {
