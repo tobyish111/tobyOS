@@ -8262,6 +8262,48 @@ static void shell_printk_bridge_char(void *ctx, char c) {
     b->fn(s, b->ctx);
 }
 
+/* Roll back ONLY the variables a command prefix assigned.
+ *
+ * A prefix on a non-special builtin applies to that command alone, so it has
+ * to be undone afterwards -- but snapshotting the whole environment and
+ * restoring it also undoes what the command itself did. `IFS=: read a b`
+ * therefore read the line, assigned a and b, and then had both assignments
+ * rolled back with IFS: the variables kept their previous values and the
+ * builtin looked like it had never run. Save just the prefixed names. */
+#define SHELL_PREFIX_MAX 16
+
+struct shell_prefix_save {
+    char  name[SHELL_PREFIX_MAX][64];
+    char *prev[SHELL_PREFIX_MAX];   /* strdup of the old value, or NULL */
+    bool  had[SHELL_PREFIX_MAX];
+    int   count;
+};
+
+static void shell_prefix_capture(struct shell_prefix_save *sv,
+                                 char **assignv, int assignc) {
+    sv->count = 0;
+    for (int i = 0; i < assignc && sv->count < SHELL_PREFIX_MAX; i++) {
+        size_t klen = env_key_len(assignv[i]);
+        if (klen == 0 || klen + 1 > sizeof(sv->name[0])) continue;
+        int k = sv->count++;
+        memcpy(sv->name[k], assignv[i], klen);
+        sv->name[k][klen] = '\0';
+        const char *old = env_get(sv->name[k]);
+        sv->had[k]  = (old != 0);
+        sv->prev[k] = old ? shell_strdup(old) : 0;
+    }
+}
+
+static void shell_prefix_restore(struct shell_prefix_save *sv) {
+    for (int i = 0; i < sv->count; i++) {
+        if (sv->had[i] && sv->prev[i]) env_set(sv->name[i], sv->prev[i]);
+        else if (!sv->had[i])          env_unset(sv->name[i]);
+        if (sv->prev[i]) kfree(sv->prev[i]);
+        sv->prev[i] = 0;
+    }
+    sv->count = 0;
+}
+
 static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
                              char **assignv, int assignc,
                              bool persist_assignments) {
@@ -8278,7 +8320,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     bool old_sink_suppress = false;
     bool sink_active = false;
     struct shell_printk_bridge bridge;
-    struct shell_env_frame env_frame;
+    struct shell_prefix_save prefix_save;
     bool restore_env = false;
 
     shell_fd_state_init_from_defaults(&fds);
@@ -8287,16 +8329,12 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
         return 1;
     }
     if (assignc > 0 && !persist_assignments) {
-        if (shell_env_frame_capture(&env_frame) < 0) {
-            kprintf("%s: failed to save shell environment\n", cmd->argv[0]);
-            shell_fd_state_close_owned(&fds);
-            return 1;
-        }
+        shell_prefix_capture(&prefix_save, assignv, assignc);
         restore_env = true;
     }
     if (assignc > 0 &&
         shell_apply_assignments(assignv, assignc, cmd->argv[0]) != 0) {
-        if (restore_env) shell_env_frame_restore(&env_frame);
+        if (restore_env) shell_prefix_restore(&prefix_save);
         shell_fd_state_close_owned(&fds);
         return 1;
     }
@@ -8319,7 +8357,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     int rc = g_last_status;
     g_shell_in = old_in;
     if (restore_env) {
-        shell_env_frame_restore(&env_frame);
+        shell_prefix_restore(&prefix_save);
         shell_set_status(rc);
     }
     if (sink_active) {
