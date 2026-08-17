@@ -4845,6 +4845,213 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
     return neg ? -v : v;
 }
 
+/* printf's %f/%e/%g without floating point.
+ *
+ * The kernel is built -mno-sse, so there is no `double` to convert to. There
+ * does not need to be: printf's argument arrives as decimal TEXT, so the
+ * significant digits can be carried straight through as digits and rounded in
+ * base 10. That is both simpler than a soft-float path and exact for the
+ * values a shell script actually prints.
+ *
+ * Representation: value = 0.d[0]d[1]... * 10^exp, sign held separately. */
+#define PF_DIG_MAX 40
+
+struct printf_dec {
+    bool neg;
+    bool zero;
+    char dig[PF_DIG_MAX];
+    int  ndig;
+    int  exp;
+};
+
+static void printf_dec_parse(const char *s, struct printf_dec *d) {
+    memset(d, 0, sizeof(*d));
+    d->zero = true;
+    if (!s) return;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-') { d->neg = true; s++; }
+    else if (*s == '+') s++;
+
+    int pointexp = 0;      /* digits seen before the '.' */
+    bool seen_point = false;
+    bool leading = true;
+    for (; *s; s++) {
+        if (*s == '.' && !seen_point) { seen_point = true; continue; }
+        if (*s < '0' || *s > '9') break;
+        if (!seen_point) pointexp++;
+        if (leading && *s == '0') {
+            /* A leading zero is not a significant digit: undo the increment
+             * above for one before the point, and push the exponent down for
+             * one after it. Both cases are the same decrement. */
+            pointexp--;
+            continue;
+        }
+        leading = false;
+        d->zero = false;
+        if (d->ndig < PF_DIG_MAX) d->dig[d->ndig++] = *s;
+    }
+    d->exp = pointexp;
+
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        bool eneg = false;
+        if (*s == '-') { eneg = true; s++; }
+        else if (*s == '+') s++;
+        int ev = 0;
+        while (*s >= '0' && *s <= '9' && ev < 100000) {
+            ev = ev * 10 + (*s - '0');
+            s++;
+        }
+        d->exp += eneg ? -ev : ev;
+    }
+    if (d->zero) { d->ndig = 0; d->exp = 0; }
+}
+
+/* Round to `keep` significant digits, half away from zero. `keep` may be <= 0,
+ * meaning the value rounds down to nothing or up to a single 1 a decade
+ * higher. */
+static void printf_dec_round(struct printf_dec *d, int keep) {
+    if (d->zero) return;
+    if (keep >= d->ndig) return;
+    if (keep < 0) {
+        d->zero = true;
+        d->ndig = 0;
+        d->exp = 0;
+        return;
+    }
+    bool round_up = d->dig[keep] >= '5';
+    d->ndig = keep;
+    if (!round_up) {
+        while (d->ndig > 0 && d->dig[d->ndig - 1] == '0') d->ndig--;
+        if (d->ndig == 0) { d->zero = true; d->exp = 0; }
+        return;
+    }
+    int i = keep - 1;
+    while (i >= 0) {
+        if (d->dig[i] != '9') { d->dig[i]++; break; }
+        d->dig[i] = '0';
+        i--;
+    }
+    if (i < 0) {
+        /* Carried out of the top: 999 -> 1000, one decade higher. */
+        d->dig[0] = '1';
+        d->ndig = 1;
+        d->exp++;
+        d->zero = false;
+        return;
+    }
+    while (d->ndig > 0 && d->dig[d->ndig - 1] == '0') d->ndig--;
+}
+
+static char printf_dec_at(const struct printf_dec *d, int i) {
+    if (i < 0 || i >= d->ndig) return '0';
+    return d->dig[i];
+}
+
+static void printf_buf_put(char *buf, size_t cap, size_t *n, char c) {
+    if (*n + 1 < cap) buf[(*n)++] = c;
+}
+
+/* Render `d` in %f style with `prec` fraction digits (already rounded). */
+static void printf_dec_fixed(const struct printf_dec *d, int prec,
+                             char *buf, size_t cap, size_t *n) {
+    if (d->exp <= 0) {
+        printf_buf_put(buf, cap, n, '0');
+    } else {
+        for (int i = 0; i < d->exp; i++)
+            printf_buf_put(buf, cap, n, printf_dec_at(d, i));
+    }
+    if (prec > 0) {
+        printf_buf_put(buf, cap, n, '.');
+        for (int j = 1; j <= prec; j++)
+            printf_buf_put(buf, cap, n, printf_dec_at(d, d->exp + j - 1));
+    }
+}
+
+/* Render `d` in %e style with `prec` fraction digits (already rounded). */
+static void printf_dec_sci(const struct printf_dec *d, int prec, char espec,
+                           char *buf, size_t cap, size_t *n) {
+    printf_buf_put(buf, cap, n, d->zero ? '0' : printf_dec_at(d, 0));
+    if (prec > 0) {
+        printf_buf_put(buf, cap, n, '.');
+        for (int j = 1; j <= prec; j++)
+            printf_buf_put(buf, cap, n, printf_dec_at(d, j));
+    }
+    printf_buf_put(buf, cap, n, espec);
+    int e = d->zero ? 0 : d->exp - 1;
+    printf_buf_put(buf, cap, n, e < 0 ? '-' : '+');
+    if (e < 0) e = -e;
+    if (e >= 100) {
+        printf_buf_put(buf, cap, n, (char)('0' + e / 100));
+        printf_buf_put(buf, cap, n, (char)('0' + (e / 100) % 10));
+    }
+    printf_buf_put(buf, cap, n, (char)('0' + (e / 10) % 10));
+    printf_buf_put(buf, cap, n, (char)('0' + e % 10));
+}
+
+static void printf_strip_trailing_zeros(char *buf, size_t *n) {
+    size_t dot = 0;
+    bool has_dot = false;
+    for (size_t i = 0; i < *n; i++) {
+        if (buf[i] == '.') { dot = i; has_dot = true; }
+        if (buf[i] == 'e' || buf[i] == 'E') return;   /* handled by caller */
+    }
+    if (!has_dot) return;
+    while (*n > dot + 1 && buf[*n - 1] == '0') (*n)--;
+    if (*n == dot + 1) (*n)--;
+}
+
+/* Format one floating conversion into `buf`; returns its length. */
+static size_t printf_format_float(const char *arg, char spec, int prec,
+                                  bool alt, char *buf, size_t cap) {
+    struct printf_dec d;
+    printf_dec_parse(arg, &d);
+    size_t n = 0;
+
+    if (spec == 'f' || spec == 'F') {
+        if (prec < 0) prec = 6;
+        printf_dec_round(&d, d.exp + prec);
+        printf_dec_fixed(&d, prec, buf, cap, &n);
+        if (prec == 0 && alt) printf_buf_put(buf, cap, &n, '.');
+    } else if (spec == 'e' || spec == 'E') {
+        if (prec < 0) prec = 6;
+        printf_dec_round(&d, prec + 1);
+        printf_dec_sci(&d, prec, spec == 'E' ? 'E' : 'e', buf, cap, &n);
+        if (prec == 0 && alt) printf_buf_put(buf, cap, &n, '.');
+    } else {                                            /* g / G */
+        int P = (prec < 0) ? 6 : (prec == 0 ? 1 : prec);
+        printf_dec_round(&d, P);
+        int X = d.zero ? 0 : d.exp - 1;
+        if (X < -4 || X >= P) {
+            printf_dec_sci(&d, P - 1, spec == 'G' ? 'E' : 'e', buf, cap, &n);
+            if (!alt) {
+                /* Strip trailing zeros in the mantissa only. */
+                size_t epos = n;
+                for (size_t i = 0; i < n; i++)
+                    if (buf[i] == 'e' || buf[i] == 'E') { epos = i; break; }
+                size_t mant = epos;
+                bool has_dot = false;
+                size_t dot = 0;
+                for (size_t i = 0; i < mant; i++)
+                    if (buf[i] == '.') { dot = i; has_dot = true; }
+                if (has_dot) {
+                    size_t end = mant;
+                    while (end > dot + 1 && buf[end - 1] == '0') end--;
+                    if (end == dot + 1) end--;
+                    size_t tail = n - epos;
+                    for (size_t i = 0; i < tail; i++) buf[end + i] = buf[epos + i];
+                    n = end + tail;
+                }
+            }
+        } else {
+            printf_dec_fixed(&d, P - 1 - X, buf, cap, &n);
+            if (!alt) printf_strip_trailing_zeros(buf, &n);
+        }
+    }
+    buf[n < cap ? n : cap - 1] = '\0';
+    return n;
+}
+
 static const char *printf_arg_str(int argc, char **argv, int *argi) {
     if (*argi >= argc) return "";
     return argv[(*argi)++];
@@ -4881,23 +5088,51 @@ static void cmd_printf(int argc, char **argv) {
 
             bool left = false;
             bool zero_pad = false;
-            if (*p == '-') { left = true; p++; }
-            if (*p == '0') { zero_pad = true; p++; }
+            bool plus = false;
+            bool space = false;
+            bool alt = false;
+            for (;;) {
+                if (*p == '-')      { left = true; p++; }
+                else if (*p == '0') { zero_pad = true; p++; }
+                else if (*p == '+') { plus = true; p++; }
+                else if (*p == ' ') { space = true; p++; }
+                else if (*p == '#') { alt = true; p++; }
+                else break;
+            }
 
             int width = 0;
-            while (*p >= '0' && *p <= '9') {
-                width = width * 10 + (*p - '0');
+            if (*p == '*') {
+                width = (int)printf_arg_int(argc, argv, &argi);
+                if (width < 0) { left = true; width = -width; }
                 p++;
+            } else {
+                while (*p >= '0' && *p <= '9') {
+                    width = width * 10 + (*p - '0');
+                    p++;
+                }
             }
 
             int prec = -1;
             if (*p == '.') {
                 p++;
-                prec = 0;
-                while (*p >= '0' && *p <= '9') {
-                    prec = prec * 10 + (*p - '0');
+                if (*p == '*') {
+                    prec = (int)printf_arg_int(argc, argv, &argi);
+                    if (prec < 0) prec = -1;
                     p++;
+                } else {
+                    prec = 0;
+                    while (*p >= '0' && *p <= '9') {
+                        prec = prec * 10 + (*p - '0');
+                        p++;
+                    }
                 }
+            }
+
+            /* Length modifiers are accepted and ignored: every integer here is
+             * parsed out of a string into a long already. */
+            while (*p == 'l' || *p == 'h' || *p == 'j' || *p == 'z' ||
+                   *p == 't' || *p == 'L') {
+                p++;
             }
 
             char spec = *p;
@@ -4911,23 +5146,52 @@ static void cmd_printf(int argc, char **argv) {
                 if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
                 for (int i = 0; i < slen; i++) shell_putc(s[i]);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
-            } else if (spec == 'd' || spec == 'i') {
+            } else if (spec == 'd' || spec == 'i' || spec == 'u') {
                 long v = printf_arg_int(argc, argv, &argi);
                 char buf[32];
                 int blen = 0;
-                bool neg = v < 0;
-                unsigned long uv = neg ? (unsigned long)(-v) : (unsigned long)v;
+                bool neg = (spec != 'u') && v < 0;
+                unsigned long uv = (v < 0) ? (unsigned long)(-v)
+                                           : (unsigned long)v;
                 if (uv == 0) buf[blen++] = '0';
                 while (uv > 0 && blen < (int)sizeof(buf) - 1) {
                     buf[blen++] = (char)('0' + (uv % 10));
                     uv /= 10;
                 }
-                int numlen = blen + (neg ? 1 : 0);
+                char sign = neg ? '-' : (plus ? '+' : (space ? ' ' : '\0'));
+                if (spec == 'u') sign = '\0';
+                int numlen = blen + (sign ? 1 : 0);
+                /* An explicit precision is a minimum digit count and it
+                 * cancels zero padding. */
+                int zeros = (prec > blen) ? prec - blen : 0;
+                if (prec >= 0) zero_pad = false;
+                numlen += zeros;
                 int pad = width > numlen ? width - numlen : 0;
                 if (!left && !zero_pad) for (int i = 0; i < pad; i++) shell_putc(' ');
-                if (neg) shell_putc('-');
+                if (sign) shell_putc(sign);
                 if (!left && zero_pad) for (int i = 0; i < pad; i++) shell_putc('0');
+                for (int i = 0; i < zeros; i++) shell_putc('0');
                 while (blen > 0) shell_putc(buf[--blen]);
+                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+            } else if (spec == 'f' || spec == 'F' || spec == 'e' ||
+                       spec == 'E' || spec == 'g' || spec == 'G') {
+                const char *s = printf_arg_str(argc, argv, &argi);
+                char buf[PF_DIG_MAX * 2 + 32];
+                size_t blen = printf_format_float(s, spec, prec, alt,
+                                                  buf, sizeof(buf));
+                bool neg = false;
+                for (const char *q = s; *q; q++) {
+                    if (*q == ' ' || *q == '\t') continue;
+                    neg = (*q == '-');
+                    break;
+                }
+                char sign = neg ? '-' : (plus ? '+' : (space ? ' ' : '\0'));
+                int numlen = (int)blen + (sign ? 1 : 0);
+                int pad = width > numlen ? width - numlen : 0;
+                if (!left && !zero_pad) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (sign) shell_putc(sign);
+                if (!left && zero_pad) for (int i = 0; i < pad; i++) shell_putc('0');
+                for (size_t i = 0; i < blen; i++) shell_putc(buf[i]);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
             } else if (spec == 'b') {
                 const char *s = printf_arg_str(argc, argv, &argi);
@@ -4942,35 +5206,41 @@ static void cmd_printf(int argc, char **argv) {
                 }
             } else if (spec == 'c') {
                 const char *s = printf_arg_str(argc, argv, &argi);
-                shell_putc(s[0] ? s[0] : '\0');
-            } else if (spec == 'o') {
-                long v = printf_arg_int(argc, argv, &argi);
-                unsigned long uv = (unsigned long)v;
-                char buf[32];
-                int blen = 0;
-                if (uv == 0) buf[blen++] = '0';
-                while (uv > 0 && blen < (int)sizeof(buf) - 1) {
-                    buf[blen++] = (char)('0' + (uv & 7));
-                    uv >>= 3;
-                }
-                int pad = width > blen ? width - blen : 0;
-                if (!left) for (int i = 0; i < pad; i++) shell_putc(zero_pad ? '0' : ' ');
-                while (blen > 0) shell_putc(buf[--blen]);
+                int pad = width > 1 ? width - 1 : 0;
+                if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (s[0]) shell_putc(s[0]);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
-            } else if (spec == 'x' || spec == 'X') {
+            } else if (spec == 'o' || spec == 'x' || spec == 'X') {
                 long v = printf_arg_int(argc, argv, &argi);
                 unsigned long uv = (unsigned long)v;
                 const char *hex = (spec == 'X') ? "0123456789ABCDEF"
                                                 : "0123456789abcdef";
+                int base = (spec == 'o') ? 8 : 16;
                 char buf[32];
                 int blen = 0;
                 if (uv == 0) buf[blen++] = '0';
                 while (uv > 0 && blen < (int)sizeof(buf) - 1) {
-                    buf[blen++] = hex[uv & 0xF];
-                    uv >>= 4;
+                    buf[blen++] = hex[uv % (unsigned)base];
+                    uv /= (unsigned)base;
                 }
-                int pad = width > blen ? width - blen : 0;
-                if (!left) for (int i = 0; i < pad; i++) shell_putc(zero_pad ? '0' : ' ');
+                char pre[3];
+                int prelen = 0;
+                if (alt && v != 0) {
+                    if (spec == 'o') {
+                        pre[prelen++] = '0';
+                    } else {
+                        pre[prelen++] = '0';
+                        pre[prelen++] = (spec == 'X') ? 'X' : 'x';
+                    }
+                }
+                int zeros = (prec > blen) ? prec - blen : 0;
+                if (prec >= 0) zero_pad = false;
+                int numlen = blen + zeros + prelen;
+                int pad = width > numlen ? width - numlen : 0;
+                if (!left && !zero_pad) for (int i = 0; i < pad; i++) shell_putc(' ');
+                for (int i = 0; i < prelen; i++) shell_putc(pre[i]);
+                if (!left && zero_pad) for (int i = 0; i < pad; i++) shell_putc('0');
+                for (int i = 0; i < zeros; i++) shell_putc('0');
                 while (blen > 0) shell_putc(buf[--blen]);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
             } else {
@@ -8286,8 +8556,11 @@ static const char *shell_find_if_fi(const char *start) {
         if (*p == '"')  { in_dq = true; continue; }
         if (shell_starts_with_word(p, "if") &&
             shell_word_boundary_before(start, p)) depth++;
-        if ((strncmp(p, "; fi", 4) == 0 || strncmp(p, ";fi", 3) == 0) &&
-            shell_word_boundary_before(start, p)) {
+        /* A `;` always ends the preceding word, so `echo x; fi` terminates the
+         * if just as `echo x ; fi` does -- requiring a blank before the `;`
+         * made the far more common spelling unparseable. */
+        if ((strncmp(p, "; fi", 4) == 0 && shell_is_word_end(p[4])) ||
+            (strncmp(p, ";fi", 3) == 0 && shell_is_word_end(p[3]))) {
             depth--;
             if (depth == 0) return p;
         }
@@ -8312,24 +8585,25 @@ static const char *shell_find_elif_else(const char *start, const char *fi_at,
         if (shell_starts_with_word(p, "if") &&
             shell_word_boundary_before(start, p)) { depth++; continue; }
         if (depth > 0 &&
-            (strncmp(p, "; fi", 4) == 0 || strncmp(p, ";fi", 3) == 0)) {
+            ((strncmp(p, "; fi", 4) == 0 && shell_is_word_end(p[4])) ||
+             (strncmp(p, ";fi", 3) == 0 && shell_is_word_end(p[3])))) {
             depth--;
             continue;
         }
         if (depth > 0) continue;
-        if (strncmp(p, "; elif", 6) == 0) {
+        if (strncmp(p, "; elif", 6) == 0 && shell_is_word_end(p[6])) {
             *found_marker = "; elif";
             return p;
         }
-        if (strncmp(p, ";elif", 5) == 0) {
+        if (strncmp(p, ";elif", 5) == 0 && shell_is_word_end(p[5])) {
             *found_marker = ";elif";
             return p;
         }
-        if (strncmp(p, "; else", 6) == 0) {
+        if (strncmp(p, "; else", 6) == 0 && shell_is_word_end(p[6])) {
             *found_marker = "; else";
             return p;
         }
-        if (strncmp(p, ";else", 5) == 0) {
+        if (strncmp(p, ";else", 5) == 0 && shell_is_word_end(p[5])) {
             *found_marker = ";else";
             return p;
         }
@@ -9513,6 +9787,74 @@ static void shell_run_segment(const char *src, bool background) {
     shell_set_status(last);
 }
 
+/* Compound commands take redirections after their terminator:
+ *     while read L; do echo $L; done </etc/hosts
+ * The loop and conditional builders stop at `done`/`fi`/`esac` and used to
+ * drop whatever followed, so `read` fell back to the console and the loop
+ * hung waiting for a keypress that was never coming.
+ *
+ * Split the tail off, copy the body into `body`, and enter an io frame that
+ * lasts for the whole construct. The tokens the redirections were parsed from
+ * die with this function's frame, which is why the files are opened here and
+ * not left for the caller. */
+static bool shell_compound_enter_redirs(const char *src, char *body,
+                                        size_t body_cap,
+                                        struct shell_io_frame *frame,
+                                        bool *entered) {
+    static const char *terms[] = { "done", "fi", "esac", 0 };
+    *entered = false;
+
+    const char *best_end = 0;
+    bool in_single = false, in_double = false;
+    for (const char *p = src; *p; p++) {
+        if (in_single) { if (*p == '\'') in_single = false; continue; }
+        if (in_double) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_double = false;
+            continue;
+        }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'') { in_single = true; continue; }
+        if (*p == '"') { in_double = true; continue; }
+        if (p != src && !is_space(p[-1]) && p[-1] != ';') continue;
+        for (int t = 0; terms[t]; t++) {
+            size_t n = strlen(terms[t]);
+            if (memcmp(p, terms[t], n) != 0) continue;
+            char after = p[n];
+            if (after && !is_space(after) && after != ';') continue;
+            if (!best_end || p + n > best_end) best_end = p + n;
+        }
+    }
+    if (!best_end) return false;
+
+    const char *tail = shell_skip_blanks(best_end);
+    while (*tail == ';') tail = shell_skip_blanks(tail + 1);
+    if (!*tail) return false;
+
+    struct shell_token tok[SHELL_TOKEN_MAX];
+    char words[SHELL_PARSE_BUF_MAX];
+    int ntok = 0;
+    if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) return false;
+    int i = 0;
+    struct shell_pipeline pl;
+    int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
+    if (parsed <= 0 || pl.count != 1 || pl.stage[0].argc != 0 ||
+        pl.stage[0].redir_count == 0) {
+        return false;
+    }
+    enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
+    if (sep != SH_TOK_SEMI || i < ntok) return false;
+
+    size_t blen = (size_t)(best_end - src);
+    if (blen + 1 > body_cap) return false;
+    memcpy(body, src, blen);
+    body[blen] = '\0';
+
+    if (shell_enter_io_frame(&pl.stage[0], "compound", frame) < 0) return false;
+    *entered = true;
+    return true;
+}
+
 static void execute_line_text(const char *src) {
     char alias_buf[SHELL_PARSE_BUF_MAX];
     char seg[LINE_MAX];
@@ -9528,6 +9870,27 @@ static void execute_line_text(const char *src) {
         shell_set_status(2);
         return;
     }
+    if (shell_starts_with_word(shell_skip_blanks(src), "if") ||
+        shell_starts_with_word(shell_skip_blanks(src), "for") ||
+        shell_starts_with_word(shell_skip_blanks(src), "while") ||
+        shell_starts_with_word(shell_skip_blanks(src), "until") ||
+        shell_starts_with_word(shell_skip_blanks(src), "case")) {
+        struct shell_io_frame cframe;
+        bool centered = false;
+        if (shell_compound_enter_redirs(src, seg, sizeof(seg),
+                                        &cframe, &centered) && centered) {
+            (void)(shell_try_if_command(seg) ||
+                   shell_try_for_command(seg) ||
+                   shell_try_while_command(seg) ||
+                   shell_try_until_command(seg) ||
+                   shell_try_case_command(seg));
+            int rc = g_last_status;
+            shell_restore_io_frame(&cframe);
+            shell_set_status(rc);
+            return;
+        }
+    }
+
     if (shell_try_if_command(src) ||
         shell_try_for_command(src) ||
         shell_try_while_command(src) ||
