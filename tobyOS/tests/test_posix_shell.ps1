@@ -307,7 +307,29 @@ $required = @(
     'POSIXSH: errexit-if-ok',
     'POSIXSH: noexec-status=0',
     'POSIXSH: pl-p1',
-    'POSIXSH: pl-p2'
+    'POSIXSH: pl-p2',
+
+    # any run of blanks between `;` and the reserved word after it
+    'POSIXSH: sp-for-a',
+    'POSIXSH: sp-for-b',
+    'POSIXSH: sp-if',
+    'POSIXSH: sp-while=2',
+    'POSIXSH: sp-elif',
+    'POSIXSH: sp-else',
+    'POSIXSH: sp-until',
+
+    # ulimit stores real soft/hard values; getconf/pathchk/logname/newgrp/fc
+    'POSIXSH: ul-soft=512 hard=512',
+    'POSIXSH: ul-hard2=256',
+    'POSIXSH: ul-raise=1',
+    'POSIXSH: ul-over=1',
+    'POSIXSH: getconf=200809',
+    'POSIXSH: getconf-bad=1',
+    'POSIXSH: pathchk-ok=0',
+    'POSIXSH: pathchk-p=1',
+    'POSIXSH: newgrp=1',
+    'POSIXSH: fc-target',
+    'POSIXSH: fc-replaced'
 )
 
 # The harness echoes every command line it drives ("[shell-test] $ ..."), and

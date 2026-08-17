@@ -1842,6 +1842,13 @@ static void posix_shell_selftest(void) {
         "pxpipe() { while read L; do echo POSIXSH: pl-$L; done; }",
         "printf 'p1\\np2\\n' | pxpipe",
 
+        /* reserved words after `;` take any run of blanks */
+        "for w in a b ;   do echo POSIXSH: sp-for-$w ;   done",
+        "if true ;\tthen echo POSIXSH: sp-if ;\tfi",
+        "n=0; while [ $n -lt 2 ] ;  do n=$((n+1)) ;  done; echo POSIXSH: sp-while=$n",
+        "if false ;  then echo POSIXSH: bad ;  elif true ;  then echo POSIXSH: sp-elif ;  else echo POSIXSH: bad2 ;  fi",
+        "if false ;  then echo POSIXSH: bad3 ;  else echo POSIXSH: sp-else ;  fi",
+        "until false ;  do echo POSIXSH: sp-until ; break ;  done",
         /* --- POSIX conformance, second pass --- */
 
         /* while loop */
@@ -1992,6 +1999,29 @@ static void posix_shell_selftest(void) {
         "echo POSIXSH: pipe-status=$?",
         "false | true",
         "echo POSIXSH: pipe-status2=$?",
+
+        /* --- ulimit / getconf / pathchk / logname / newgrp / fc --- */
+        "ulimit -f 512",
+        "echo POSIXSH: ul-soft=$(ulimit -f) hard=$(ulimit -H -f)",
+        "ulimit -H -f 256",
+        "echo POSIXSH: ul-hard2=$(ulimit -H -f)",
+        "ulimit -H -f 1024",
+        "echo POSIXSH: ul-raise=$?",
+        "ulimit -S -f 9999",
+        "echo POSIXSH: ul-over=$?",
+        "echo POSIXSH: logname=$(logname)",
+        "echo POSIXSH: getconf=$(getconf _POSIX_VERSION)",
+        "getconf NOPE_VAR",
+        "echo POSIXSH: getconf-bad=$?",
+        "pathchk /data/ok.txt",
+        "echo POSIXSH: pathchk-ok=$?",
+        "pathchk -p '/data/bad name.txt'",
+        "echo POSIXSH: pathchk-p=$?",
+        "newgrp staff",
+        "echo POSIXSH: newgrp=$?",
+        "echo POSIXSH: fc-target",
+        "fc -l -n -1",
+        "fc -s target=replaced echo",
 
         "echo POSIXSH: done",
         0

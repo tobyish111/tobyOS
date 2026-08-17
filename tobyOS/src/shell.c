@@ -130,6 +130,14 @@ static int g_builtin_entry_status;
  * under `!`. Held up while such a condition runs. */
 static int g_errexit_suppress;
 
+/* Command history, kept so `fc` has something to list and re-run. A ring:
+ * g_hist_base is the history number of slot 0, so numbers keep climbing as
+ * entries are overwritten. */
+#define SHELL_HIST_MAX 128
+static char *g_hist[SHELL_HIST_MAX];
+static int g_hist_count;          /* entries currently held (<= MAX) */
+static unsigned long g_hist_base; /* history number of the oldest entry */
+
 enum shell_flow {
     SHELL_FLOW_NONE = 0,
     SHELL_FLOW_BREAK,
@@ -187,6 +195,9 @@ static bool shell_starts_with_word(const char *s, const char *word);
 static bool is_space(char c);
 static bool shell_is_word_end(char c);
 static bool shell_line_needs_continuation(const char *s);
+static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
+static int shell_append_str(char *buf, size_t *pos, size_t cap, const char *s);
+static bool shell_word_has(const char *word, char c);
 static const char *shell_skip_blanks(const char *s);
 static int parse_int(const char *s, int *out);
 static int shell_run_exit_trap(int status);
@@ -5610,50 +5621,418 @@ static void cmd_kill(int argc, char **argv) {
     }
 }
 
-/* POSIX `ulimit [-f] [-H|-S] [blocks]`. tobyOS enforces no per-process
- * resource limits, so every limit reads as unlimited and setting one is
- * rejected rather than silently ignored -- a script that lowers a limit for
- * safety deserves to hear that it did not take. */
+/* POSIX `ulimit [-HS] [-acdfnstv] [value]`.
+ *
+ * The kernel does not police these yet, so nothing here constrains a running
+ * process. What the shell CAN do correctly is be a faithful store: report a
+ * value that was set, keep the soft/hard pair distinct, and enforce the two
+ * rules that make the interface meaningful -- a soft limit may not exceed its
+ * hard limit, and a hard limit may only ever be lowered. A script that reads
+ * back what it set gets the right answer; one that tries to raise a hard
+ * limit is refused, exactly as it would be on a system that did enforce them.
+ */
+#define ULIMIT_INF (-1L)
+
+struct shell_rlimit {
+    char  opt;
+    const char *label;
+    const char *units;
+    long  soft;
+    long  hard;
+};
+
+static struct shell_rlimit g_shell_rlimits[] = {
+    { 'c', "core file size",  "(blocks)", ULIMIT_INF, ULIMIT_INF },
+    { 'd', "data seg size",   "(kbytes)", ULIMIT_INF, ULIMIT_INF },
+    { 'f', "file size",       "(blocks)", ULIMIT_INF, ULIMIT_INF },
+    { 'n', "open files",      "",         ULIMIT_INF, ULIMIT_INF },
+    { 's', "stack size",      "(kbytes)", ULIMIT_INF, ULIMIT_INF },
+    { 't', "cpu time",        "(seconds)",ULIMIT_INF, ULIMIT_INF },
+    { 'v', "virtual memory",  "(kbytes)", ULIMIT_INF, ULIMIT_INF },
+};
+
+static struct shell_rlimit *shell_rlimit_find(char opt) {
+    for (size_t i = 0; i < sizeof(g_shell_rlimits) / sizeof(g_shell_rlimits[0]);
+         i++) {
+        if (g_shell_rlimits[i].opt == opt) return &g_shell_rlimits[i];
+    }
+    return 0;
+}
+
+static void shell_rlimit_print(const struct shell_rlimit *r, bool hard,
+                               bool with_label) {
+    long v = hard ? r->hard : r->soft;
+    if (with_label) kprintf("%-24s%-10s", r->label, r->units);
+    if (v == ULIMIT_INF) kprintf("unlimited\n");
+    else kprintf("%ld\n", v);
+}
+
 static void cmd_ulimit(int argc, char **argv) {
     shell_set_status(0);
     bool show_all = false;
-    const char *what = "f";
+    bool want_hard = false, want_soft = false;
+    char which = 'f';                       /* POSIX default resource */
+    int i = 1;
+
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
+        for (const char *f = argv[i] + 1; *f; f++) {
+            if (*f == 'a') { show_all = true; continue; }
+            if (*f == 'H') { want_hard = true; continue; }
+            if (*f == 'S') { want_soft = true; continue; }
+            if (shell_rlimit_find(*f)) { which = *f; continue; }
+            kprintf("ulimit: bad option '-%c'\n", *f);
+            shell_set_status(2);
+            return;
+        }
+    }
+    /* Neither -H nor -S: report the soft limit, set both. */
+    bool report_hard = want_hard && !want_soft;
+
+    if (show_all) {
+        for (size_t k = 0;
+             k < sizeof(g_shell_rlimits) / sizeof(g_shell_rlimits[0]); k++) {
+            shell_rlimit_print(&g_shell_rlimits[k], report_hard, true);
+        }
+        return;
+    }
+
+    struct shell_rlimit *r = shell_rlimit_find(which);
+    if (!r) {
+        kprintf("ulimit: no such resource\n");
+        shell_set_status(2);
+        return;
+    }
+
+    if (i >= argc) {
+        shell_rlimit_print(r, report_hard, false);
+        return;
+    }
+
+    long val;
+    if (strcmp(argv[i], "unlimited") == 0) {
+        val = ULIMIT_INF;
+    } else {
+        int v = 0;
+        if (parse_int(argv[i], &v) < 0 || v < 0) {
+            kprintf("ulimit: %s: invalid number\n", argv[i]);
+            shell_set_status(2);
+            return;
+        }
+        val = v;
+    }
+
+    bool set_hard = want_hard || !want_soft;
+    bool set_soft = want_soft || !want_hard;
+
+    /* A hard limit is a ceiling that only ever comes down. */
+    if (set_hard && r->hard != ULIMIT_INF &&
+        (val == ULIMIT_INF || val > r->hard)) {
+        kprintf("ulimit: cannot raise a hard limit\n");
+        shell_set_status(1);
+        return;
+    }
+    long ceiling = set_hard ? val : r->hard;
+    if (set_soft && ceiling != ULIMIT_INF &&
+        (val == ULIMIT_INF || val > ceiling)) {
+        kprintf("ulimit: soft limit exceeds hard limit\n");
+        shell_set_status(1);
+        return;
+    }
+    if (set_hard) r->hard = val;
+    if (set_soft) r->soft = val;
+}
+
+/* POSIX `logname`: the login name, which for this shell is the identity the
+ * session is running under. */
+static void cmd_logname(int argc, char **argv) {
+    (void)argc; (void)argv;
+    const char *u = env_get("LOGNAME");
+    if (!u) u = env_get("USER");
+    kprintf("%s\n", u ? u : "root");
+    shell_set_status(0);
+}
+
+/* POSIX `getconf NAME`: system configuration values. Only the variables this
+ * kernel can answer for are listed; anything else is an error rather than a
+ * fabricated number. */
+static void cmd_getconf(int argc, char **argv) {
+    static const struct { const char *name; long value; } vars[] = {
+        { "ARG_MAX",         ARG_MAX     },
+        { "LINE_MAX",        LINE_MAX    },
+        { "NAME_MAX",        255         },
+        { "PATH_MAX",        VFS_PATH_MAX},
+        { "OPEN_MAX",        SHELL_FD_MAX},
+        { "_POSIX_VERSION",  200809L     },
+        { "_POSIX_ARG_MAX",  ARG_MAX     },
+        { "_POSIX_OPEN_MAX", SHELL_FD_MAX},
+        { "CHAR_BIT",        8           },
+        { "INT_MAX",         2147483647L },
+    };
+    if (argc < 2) {
+        for (size_t i = 0; i < sizeof(vars) / sizeof(vars[0]); i++)
+            kprintf("%s=%ld\n", vars[i].name, vars[i].value);
+        shell_set_status(0);
+        return;
+    }
+    for (size_t i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+        if (strcmp(vars[i].name, argv[1]) == 0) {
+            kprintf("%ld\n", vars[i].value);
+            shell_set_status(0);
+            return;
+        }
+    }
+    if (strcmp(argv[1], "PATH") == 0) {
+        const char *pv = env_get("PATH");
+        kprintf("%s\n", pv ? pv : "/bin");
+        shell_set_status(0);
+        return;
+    }
+    kprintf("getconf: %s: unknown configuration variable\n", argv[1]);
+    shell_set_status(1);
+}
+
+/* POSIX `pathchk [-p] pathname...`: report pathnames that are not usable.
+ * Without -p the check is against this system's actual limits; with -p it is
+ * against the POSIX minimums, which is the portability check. */
+static void cmd_pathchk(int argc, char **argv) {
+    bool portable = false;
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
         for (const char *f = argv[i] + 1; *f; f++) {
-            switch (*f) {
-            case 'a': show_all = true; break;
-            case 'H': case 'S': break;          /* hard/soft: identical here */
-            case 'c': case 'd': case 'f': case 'n':
-            case 's': case 't': case 'v':
-                what = f;
+            if (*f == 'p') { portable = true; continue; }
+            kprintf("pathchk: bad option '-%c'\n", *f);
+            shell_set_status(2);
+            return;
+        }
+    }
+    if (i >= argc) {
+        kprintf("usage: pathchk [-p] pathname...\n");
+        shell_set_status(2);
+        return;
+    }
+
+    size_t path_max = portable ? 256 : VFS_PATH_MAX;
+    size_t name_max = portable ? 14 : 255;
+    static const char portable_set[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+
+    int rc = 0;
+    for (; i < argc; i++) {
+        const char *path = argv[i];
+        if (strlen(path) >= path_max) {
+            kprintf("pathchk: %s: pathname too long\n", path);
+            rc = 1;
+            continue;
+        }
+        bool bad = false;
+        const char *comp = path;
+        while (*comp == '/') comp++;
+        while (*comp && !bad) {
+            const char *end = comp;
+            while (*end && *end != '/') end++;
+            if ((size_t)(end - comp) > name_max) {
+                kprintf("pathchk: %s: component too long\n", path);
+                bad = true;
                 break;
+            }
+            if (portable) {
+                for (const char *c = comp; c < end; c++) {
+                    if (!shell_word_has(portable_set, *c)) {
+                        kprintf("pathchk: %s: non-portable character '%c'\n",
+                                path, *c);
+                        bad = true;
+                        break;
+                    }
+                }
+                if (!bad && comp < end && *comp == '-') {
+                    kprintf("pathchk: %s: component starts with '-'\n", path);
+                    bad = true;
+                }
+            }
+            comp = end;
+            while (*comp == '/') comp++;
+        }
+        if (bad) rc = 1;
+    }
+    shell_set_status(rc);
+}
+
+/* POSIX `newgrp [group]`: change the real group ID. tobyOS has users but no
+ * supplementary-group database to switch between, so this reports that rather
+ * than pretending to succeed -- a script that relies on the change would
+ * otherwise carry on with the wrong privileges. */
+static void cmd_newgrp(int argc, char **argv) {
+    (void)argv;
+    kprintf("newgrp: no group database on this system%s\n",
+            argc > 1 ? "" : "");
+    shell_set_status(1);
+}
+
+/* Record one command line in the history ring. Called for lines the user (or
+ * the test harness) submitted, not for the pieces they decompose into. */
+static void shell_history_add(const char *cmdline) {
+    if (!cmdline) return;
+    const char *t = shell_skip_blanks(cmdline);
+    if (!*t) return;
+    size_t n = strlen(cmdline);
+    char *copy = (char *)kmalloc(n + 1);
+    if (!copy) return;
+    memcpy(copy, cmdline, n + 1);
+
+    if (g_hist_count == SHELL_HIST_MAX) {
+        kfree(g_hist[0]);
+        for (int i = 1; i < SHELL_HIST_MAX; i++) g_hist[i - 1] = g_hist[i];
+        g_hist[SHELL_HIST_MAX - 1] = copy;
+        g_hist_base++;
+    } else {
+        g_hist[g_hist_count++] = copy;
+    }
+}
+
+/* Drop the newest entry. `fc` uses this to take its own invocation back out
+ * of the history before it looks at it, which is what POSIX means by the
+ * re-executed command replacing the fc command. */
+static void shell_history_pop(void) {
+    if (g_hist_count <= 0) return;
+    kfree(g_hist[--g_hist_count]);
+    g_hist[g_hist_count] = 0;
+}
+
+/* Map a history number (or a negative offset, or a prefix string) to a ring
+ * index; -1 if it names nothing. */
+static int shell_history_resolve(const char *spec, int def_index) {
+    if (!spec || !*spec) return def_index;
+    /* parse_int rejects a leading '-', but a negative offset is exactly how
+     * `fc -l -1` names the previous command, so handle the sign here. */
+    bool neg = (spec[0] == '-');
+    int v = 0;
+    if (parse_int(neg ? spec + 1 : spec, &v) == 0) {
+        long idx = neg ? (long)g_hist_count - v
+                       : (long)v - (long)g_hist_base - 1;
+        if (idx < 0 || idx >= g_hist_count) return -1;
+        return (int)idx;
+    }
+    size_t n = strlen(spec);
+    for (int i = g_hist_count - 1; i >= 0; i--) {
+        if (strncmp(g_hist[i], spec, n) == 0) return i;
+    }
+    return -1;
+}
+
+/* POSIX `fc`:
+ *     fc -l [-nr] [first [last]]   list
+ *     fc -s [old=new] [first]      re-execute, with one substitution
+ *     fc [-e editor] [first [last]]
+ * There is no editor to hand off to, so the editing form is refused rather
+ * than silently behaving like -s, which would run the wrong thing. */
+static void cmd_fc(int argc, char **argv) {
+    /* The fc command itself is not part of the range it operates on. */
+    shell_history_pop();
+
+    bool list = false, no_numbers = false, reverse = false, subst = false;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
+        /* `fc -l -1` -- a leading `-` followed by digits is a negative
+         * history offset, an operand, not a bundle of option letters. */
+        if (argv[i][1] >= '0' && argv[i][1] <= '9') break;
+        for (const char *f = argv[i] + 1; *f; f++) {
+            switch (*f) {
+            case 'l': list = true; break;
+            case 'n': no_numbers = true; break;
+            case 'r': reverse = true; break;
+            case 's': subst = true; break;
+            case 'e':
+                kprintf("fc: no editor available; use -l or -s\n");
+                shell_set_status(1);
+                return;
             default:
-                kprintf("ulimit: bad option '-%c'\n", *f);
+                kprintf("fc: bad option '-%c'\n", *f);
                 shell_set_status(2);
                 return;
             }
         }
     }
 
-    if (show_all) {
-        kprintf("core file size          (blocks) unlimited\n");
-        kprintf("data seg size           (kbytes) unlimited\n");
-        kprintf("file size               (blocks) unlimited\n");
-        kprintf("open files                       unlimited\n");
-        kprintf("stack size              (kbytes) unlimited\n");
-        kprintf("cpu time               (seconds) unlimited\n");
-        kprintf("virtual memory          (kbytes) unlimited\n");
-        return;
-    }
-
-    if (i < argc) {
-        kprintf("ulimit: cannot modify limit: not supported\n");
+    if (g_hist_count == 0) {
+        if (list) { shell_set_status(0); return; }
+        kprintf("fc: history is empty\n");
         shell_set_status(1);
         return;
     }
-    (void)what;
-    kprintf("unlimited\n");
+
+    int newest = g_hist_count - 1;
+
+    if (subst) {
+        const char *old_new = 0;
+        const char *first = 0;
+        for (int a = i; a < argc; a++) {
+            if (!old_new && shell_word_has(argv[a], '=')) old_new = argv[a];
+            else if (!first) first = argv[a];
+        }
+        int idx = shell_history_resolve(first, newest);
+        if (idx < 0) {
+            kprintf("fc: no such history entry\n");
+            shell_set_status(1);
+            return;
+        }
+        char buf[LINE_MAX];
+        const char *src = g_hist[idx];
+        if (old_new) {
+            size_t klen = 0;
+            while (old_new[klen] && old_new[klen] != '=') klen++;
+            const char *rep = old_new + klen + 1;
+            size_t pos = 0;
+            bool done = false;
+            for (const char *q = src; *q; ) {
+                if (!done && klen && strncmp(q, old_new, klen) == 0) {
+                    if (shell_append_str(buf, &pos, sizeof(buf), rep) < 0) break;
+                    q += klen;
+                    done = true;
+                    continue;
+                }
+                if (shell_append_char(buf, &pos, sizeof(buf), *q++) < 0) break;
+            }
+            buf[pos] = '\0';
+        } else {
+            size_t n = strlen(src);
+            if (n + 1 > sizeof(buf)) n = sizeof(buf) - 1;
+            memcpy(buf, src, n);
+            buf[n] = '\0';
+        }
+        kprintf("%s\n", buf);
+        shell_history_add(buf);
+        execute_line_text(buf);
+        return;
+    }
+
+    const char *first_s = (i < argc) ? argv[i++] : 0;
+    const char *last_s  = (i < argc) ? argv[i++] : 0;
+    int first = shell_history_resolve(first_s, list ? (newest >= 15 ? newest - 15 : 0)
+                                                    : newest);
+    int last  = shell_history_resolve(last_s, list ? newest : first);
+    if (first < 0 || last < 0) {
+        kprintf("fc: no such history entry\n");
+        shell_set_status(1);
+        return;
+    }
+    if (!list) {
+        kprintf("fc: no editor available; use -l or -s\n");
+        shell_set_status(1);
+        return;
+    }
+    if (first > last) { int t = first; first = last; last = t; }
+    if (reverse) {
+        for (int k = last; k >= first; k--) {
+            if (no_numbers) kprintf("\t%s\n", g_hist[k]);
+            else kprintf("%lu\t%s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
+        }
+    } else {
+        for (int k = first; k <= last; k++) {
+            if (no_numbers) kprintf("\t%s\n", g_hist[k]);
+            else kprintf("%lu\t%s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
+        }
+    }
+    shell_set_status(0);
 }
 
 static const struct cmd cmds[] = {
@@ -5713,7 +6092,12 @@ static const struct cmd cmds[] = {
     { "wait",   "wait [pid|%job...]: wait for background jobs", cmd_wait },
     { "kill",   "kill [-SIGNAL] PID...: send signal to process", cmd_kill },
     { "umask",  "umask [MODE]: display or set file creation mask", cmd_umask },
-    { "ulimit", "ulimit [-acdfnstv] [-H|-S]: show resource limits", cmd_ulimit },
+    { "ulimit", "ulimit [-HS] [-acdfnstv] [value]: resource limits", cmd_ulimit },
+    { "fc",     "fc [-l|-s] [first [last]]: list or re-run history", cmd_fc },
+    { "logname","logname: print the login name",                  cmd_logname },
+    { "getconf","getconf [NAME]: print system configuration values", cmd_getconf },
+    { "pathchk","pathchk [-p] path...: check pathnames are usable", cmd_pathchk },
+    { "newgrp", "newgrp [group]: change the real group ID",        cmd_newgrp },
     { "hash",   "hash [-r]: display or reset command hash table", cmd_hash },
     { "source", "source script: run script in current shell",     cmd_dot  },
     { "ps",     "list processes with cpu/syscalls/pages", cmd_ps },
@@ -8870,6 +9254,38 @@ static int shell_copy_segment(char *dst, size_t cap,
     return 0;
 }
 
+/* Match `; <blanks> word` at `p`.
+ *
+ * POSIX puts no constraint on the blanks between a `;` and the reserved word
+ * after it, but these scans used to be fixed strings ("; do" / ";do"), so
+ * `for x in a b;  do` -- two spaces, or a tab -- did not parse at all. Returns
+ * the distance from `p` through the end of the keyword, or 0 if `p` does not
+ * start that construct. */
+static size_t shell_semi_word_len(const char *p, const char *word) {
+    if (*p != ';') return 0;
+    const char *q = p + 1;
+    while (*q == ' ' || *q == '\t') q++;
+    size_t n = strlen(word);
+    if (strncmp(q, word, n) != 0) return 0;
+    if (!shell_is_word_end(q[n])) return 0;
+    return (size_t)(q - p) + n;
+}
+
+/* First `; word` at or after `s`. *skip receives the distance from the
+ * returned pointer to just past the keyword, which is where the caller
+ * resumes. */
+static const char *shell_find_semi_word(const char *s, const char *word,
+                                        size_t *skip) {
+    for (const char *p = s; *p; p++) {
+        size_t n = shell_semi_word_len(p, word);
+        if (n) {
+            if (skip) *skip = n;
+            return p;
+        }
+    }
+    return 0;
+}
+
 static const char *shell_find_marker2(const char *s, const char *a,
                                       const char *b, const char **found) {
     const char *pa = shell_find_text(s, a);
@@ -8893,7 +9309,7 @@ static bool shell_is_word_end(char c) {
 }
 
 static const char *shell_find_matching_done(const char *start,
-                                            const char **found_marker) {
+                                            size_t *skip) {
     int depth = 1;
     bool in_sq = false, in_dq = false;
     for (const char *p = start; *p; p++) {
@@ -8910,35 +9326,21 @@ static const char *shell_find_matching_done(const char *start,
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"') { in_dq = true; continue; }
 
-        /* Check for "; done" / ";done" FIRST (before "; do") to avoid
-         * false positive where "; done" starts with "; do". */
-        if (strncmp(p, "; done", 6) == 0 && shell_is_word_end(p[6])) {
+        /* "done" before "do": the former starts with the latter. */
+        size_t n = shell_semi_word_len(p, "done");
+        if (n) {
             depth--;
             if (depth <= 0) {
-                if (found_marker) *found_marker = "; done";
+                if (skip) *skip = n;
                 return p;
             }
-            p += 5;
+            p += n - 1;
             continue;
         }
-        if (strncmp(p, ";done", 5) == 0 && shell_is_word_end(p[5])) {
-            depth--;
-            if (depth <= 0) {
-                if (found_marker) *found_marker = ";done";
-                return p;
-            }
-            p += 4;
-            continue;
-        }
-        /* Now check "; do" / ";do" */
-        if (strncmp(p, "; do", 4) == 0 && shell_is_word_end(p[4])) {
+        n = shell_semi_word_len(p, "do");
+        if (n) {
             depth++;
-            p += 3;
-            continue;
-        }
-        if (strncmp(p, ";do", 3) == 0 && shell_is_word_end(p[3])) {
-            depth++;
-            p += 2;
+            p += n - 1;
             continue;
         }
     }
@@ -8962,8 +9364,7 @@ static const char *shell_find_if_fi(const char *start) {
         /* A `;` always ends the preceding word, so `echo x; fi` terminates the
          * if just as `echo x ; fi` does -- requiring a blank before the `;`
          * made the far more common spelling unparseable. */
-        if ((strncmp(p, "; fi", 4) == 0 && shell_is_word_end(p[4])) ||
-            (strncmp(p, ";fi", 3) == 0 && shell_is_word_end(p[3]))) {
+        if (shell_semi_word_len(p, "fi")) {
             depth--;
             if (depth == 0) return p;
         }
@@ -8972,10 +9373,10 @@ static const char *shell_find_if_fi(const char *start) {
 }
 
 static const char *shell_find_elif_else(const char *start, const char *fi_at,
-                                        const char **found_marker) {
+                                        bool *is_elif, size_t *skip) {
     int depth = 0;
     bool in_sq = false, in_dq = false;
-    *found_marker = 0;
+    *is_elif = false;
     for (const char *p = start; p < fi_at && *p; p++) {
         if (in_sq) { if (*p == '\'') in_sq = false; continue; }
         if (in_dq) {
@@ -8987,27 +9388,22 @@ static const char *shell_find_elif_else(const char *start, const char *fi_at,
         if (*p == '"')  { in_dq = true; continue; }
         if (shell_starts_with_word(p, "if") &&
             shell_word_boundary_before(start, p)) { depth++; continue; }
-        if (depth > 0 &&
-            ((strncmp(p, "; fi", 4) == 0 && shell_is_word_end(p[4])) ||
-             (strncmp(p, ";fi", 3) == 0 && shell_is_word_end(p[3])))) {
+        size_t n = shell_semi_word_len(p, "fi");
+        if (depth > 0 && n) {
             depth--;
             continue;
         }
         if (depth > 0) continue;
-        if (strncmp(p, "; elif", 6) == 0 && shell_is_word_end(p[6])) {
-            *found_marker = "; elif";
+        n = shell_semi_word_len(p, "elif");
+        if (n) {
+            *is_elif = true;
+            *skip = n;
             return p;
         }
-        if (strncmp(p, ";elif", 5) == 0 && shell_is_word_end(p[5])) {
-            *found_marker = ";elif";
-            return p;
-        }
-        if (strncmp(p, "; else", 6) == 0 && shell_is_word_end(p[6])) {
-            *found_marker = "; else";
-            return p;
-        }
-        if (strncmp(p, ";else", 5) == 0 && shell_is_word_end(p[5])) {
-            *found_marker = ";else";
+        n = shell_semi_word_len(p, "else");
+        if (n) {
+            *is_elif = false;
+            *skip = n;
             return p;
         }
     }
@@ -9032,19 +9428,20 @@ static bool shell_try_if_command(const char *src) {
     const char *cond_start = s;
     bool done = false;
     while (!done) {
-        const char *then_marker = 0;
-        const char *then_at = shell_find_marker2(cond_start, "; then",
-                                                 ";then", &then_marker);
+        size_t then_skip = 0;
+        const char *then_at = shell_find_semi_word(cond_start, "then",
+                                                   &then_skip);
         if (!then_at || then_at > fi_at) {
             kprintf("if: expected '; then'\n");
             shell_set_status(2);
             return true;
         }
-        const char *after_then = then_at + strlen(then_marker);
+        const char *after_then = then_at + then_skip;
 
-        const char *branch_marker = 0;
+        bool is_elif = false;
+        size_t branch_skip = 0;
         const char *branch_at = shell_find_elif_else(after_then, fi_at,
-                                                     &branch_marker);
+                                                     &is_elif, &branch_skip);
 
         char cond[LINE_MAX];
         if (shell_copy_segment(cond, sizeof(cond), cond_start, then_at) < 0) {
@@ -9075,13 +9472,9 @@ static bool shell_try_if_command(const char *src) {
             return true;
         }
 
-        bool is_elif = (strncmp(branch_marker, "; elif", 6) == 0 ||
-                        strncmp(branch_marker, ";elif", 5) == 0);
-        bool is_else = !is_elif;
-
-        if (is_else) {
+        if (!is_elif) {
             char no[LINE_MAX];
-            const char *else_body = branch_at + strlen(branch_marker);
+            const char *else_body = branch_at + branch_skip;
             if (shell_copy_segment(no, sizeof(no), else_body, fi_at) < 0) {
                 kprintf("if: else body too long\n");
                 shell_set_status(2);
@@ -9091,7 +9484,7 @@ static bool shell_try_if_command(const char *src) {
             return true;
         }
 
-        cond_start = shell_skip_blanks(branch_at + strlen(branch_marker));
+        cond_start = shell_skip_blanks(branch_at + branch_skip);
     }
 
     shell_set_status(0);
@@ -9132,16 +9525,16 @@ static bool shell_try_for_command(const char *src) {
         return true;
     }
 
-    const char *do_marker = 0;
-    const char *do_at = shell_find_marker2(s, "; do", ";do", &do_marker);
+    size_t do_skip = 0;
+    const char *do_at = shell_find_semi_word(s, "do", &do_skip);
     if (!do_at) {
         kprintf("for: expected '; do'\n");
         shell_set_status(2);
         return true;
     }
-    const char *done_marker = 0;
-    const char *done_at = shell_find_matching_done(do_at + strlen(do_marker),
-                                                    &done_marker);
+    size_t done_skip = 0;
+    const char *done_at = shell_find_matching_done(do_at + do_skip,
+                                                   &done_skip);
     if (!done_at) {
         kprintf("for: expected '; done'\n");
         shell_set_status(2);
@@ -9161,7 +9554,7 @@ static bool shell_try_for_command(const char *src) {
             return true;
         }
     }
-    if (shell_copy_segment(body, sizeof(body), do_at + strlen(do_marker),
+    if (shell_copy_segment(body, sizeof(body), do_at + do_skip,
                            done_at) < 0) {
         kprintf("for: command too long\n");
         shell_set_status(2);
@@ -9258,16 +9651,16 @@ static bool shell_try_while_command(const char *src) {
     if (!shell_starts_with_word(s, "while")) return false;
     s = shell_skip_blanks(s + 5);
 
-    const char *do_marker = 0;
-    const char *do_at = shell_find_marker2(s, "; do", ";do", &do_marker);
+    size_t do_skip = 0;
+    const char *do_at = shell_find_semi_word(s, "do", &do_skip);
     if (!do_at) {
         kprintf("while: expected '; do'\n");
         shell_set_status(2);
         return true;
     }
-    const char *done_marker = 0;
-    const char *done_at = shell_find_matching_done(do_at + strlen(do_marker),
-                                                    &done_marker);
+    size_t done_skip = 0;
+    const char *done_at = shell_find_matching_done(do_at + do_skip,
+                                                   &done_skip);
     if (!done_at) {
         kprintf("while: expected '; done'\n");
         shell_set_status(2);
@@ -9277,7 +9670,7 @@ static bool shell_try_while_command(const char *src) {
     char cond[LINE_MAX];
     char body[LINE_MAX];
     if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
-        shell_copy_segment(body, sizeof(body), do_at + strlen(do_marker),
+        shell_copy_segment(body, sizeof(body), do_at + do_skip,
                            done_at) < 0) {
         kprintf("while: command too long\n");
         shell_set_status(2);
@@ -9333,16 +9726,16 @@ static bool shell_try_until_command(const char *src) {
     if (!shell_starts_with_word(s, "until")) return false;
     s = shell_skip_blanks(s + 5);
 
-    const char *do_marker = 0;
-    const char *do_at = shell_find_marker2(s, "; do", ";do", &do_marker);
+    size_t do_skip = 0;
+    const char *do_at = shell_find_semi_word(s, "do", &do_skip);
     if (!do_at) {
         kprintf("until: expected '; do'\n");
         shell_set_status(2);
         return true;
     }
-    const char *done_marker = 0;
-    const char *done_at = shell_find_matching_done(do_at + strlen(do_marker),
-                                                    &done_marker);
+    size_t done_skip = 0;
+    const char *done_at = shell_find_matching_done(do_at + do_skip,
+                                                   &done_skip);
     if (!done_at) {
         kprintf("until: expected '; done'\n");
         shell_set_status(2);
@@ -9352,7 +9745,7 @@ static bool shell_try_until_command(const char *src) {
     char cond[LINE_MAX];
     char body[LINE_MAX];
     if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
-        shell_copy_segment(body, sizeof(body), do_at + strlen(do_marker),
+        shell_copy_segment(body, sizeof(body), do_at + do_skip,
                            done_at) < 0) {
         kprintf("until: command too long\n");
         shell_set_status(2);
@@ -10638,6 +11031,7 @@ void shell_run_test_line(const char *in) {
     console_set_color(0x00FFCC66);
     kprintf("[shell-test] $ %s\n", line);
     console_set_color(0x00CCCCCC);
+    shell_history_add(line);
     execute_line();
     line_len = 0;
     line[0]  = '\0';
