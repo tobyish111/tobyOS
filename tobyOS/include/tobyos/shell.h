@@ -38,4 +38,26 @@ void shell_run_test_line(const char *line);
  * or the signal subsystem). The trap handler will run at the next safe point. */
 void shell_deliver_signal(int sig);
 
+/* ---- hosted entry points ------------------------------------------------
+ *
+ * shell.c is compiled twice: into the kernel (driven by shell_poll above) and
+ * into userspace /bin/tsh (driven by programs/tsh/host.c). One language, two
+ * hosts -- so the shell's expansion, arithmetic, globbing and control flow
+ * exist exactly once and cannot drift between the two.
+ *
+ * The host provides the other half of the seam: kmalloc, vfs_*, proc_spawn,
+ * file_*, kprintf. Real subsystems in the kernel; libtoby syscall wrappers in
+ * userspace. See programs/tsh/host.c. */
+
+/* Initialise state without printing a banner or prompt (scripts must emit
+ * nothing the oracle would not). `argv0` becomes $0. */
+void shell_init_hosted(const char *argv0);
+
+/* Run a script file / a single -c line. Both return the exit status. */
+int  shell_run_script_hosted(const char *path);
+int  shell_run_line_hosted(const char *text);
+
+/* Set $1..$n before running. */
+int  shell_set_args_hosted(int argc, char **argv);
+
 #endif /* TOBYOS_SHELL_H */

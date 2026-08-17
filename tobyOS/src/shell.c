@@ -60,6 +60,13 @@
 extern volatile struct limine_module_request module_req;
 
 #define LINE_MAX 512
+/* Parse scratch: also the cap on a multi-line compound command joined
+ * into one line by shell_run_script_text. Defined here rather than beside
+ * SHELL_TOKEN_MAX because that reader runs long before that point. */
+#define SHELL_PARSE_BUF_MAX (LINE_MAX * 2)
+/* Word-boundary marker planted by "$@" expansion; see
+ * shell_append_positional_join(). Never appears in real shell text. */
+#define SHELL_ARG_MARK '\x01'
 #define ARG_MAX  32
 #define SHELL_ALIAS_MAX 32
 #define SHELL_FUNC_MAX 32
@@ -143,6 +150,13 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap);
 static const char *shell_skip_blanks(const char *s);
 static int parse_int(const char *s, int *out);
 static int shell_run_exit_trap(int status);
+static bool shell_starts_with_word(const char *s, const char *word);
+static inline bool is_space(char c);
+static bool shell_group_open_at(const char *p);
+static bool shell_group_close_at(const char *p);
+static int shell_copy_segment(char *dst, size_t cap,
+                              const char *start, const char *end);
+static bool shell_word_boundary_before(const char *start, const char *p);
 struct shell_simple;
 struct shell_io_frame;
 static int shell_enter_io_frame(struct shell_simple *cmd, const char *label,
@@ -993,8 +1007,44 @@ struct cmd {
 
 static const struct cmd cmds[];   /* forward */
 
+#ifdef SHELL_HOSTED
+/* In userspace the builtin set is exactly the POSIX/bash one -- no more.
+ *
+ * The kernel shell carries convenience builtins (`cat`, `ls`, `mkdir`, `rm`,
+ * `touch`, `ps`, `ifconfig`...) because when it runs there may be no /bin to
+ * exec from. In /bin/tsh those same names SHADOW the real utilities and
+ * behave differently: the builtin `cat` demands a path argument, so
+ * `echo x | cat` printed a usage message where bash piped the text through
+ * /bin/cat. A builtin that shares a utility's name and not its behaviour is
+ * the one thing a superset shell must not do.
+ *
+ * So the hosted build answers "is this a builtin?" from an allow-list of the
+ * names bash implements as builtins, and everything else falls through to a
+ * PATH lookup. The kernel build is untouched -- this whole function body is
+ * compiled only into /bin/tsh. */
+static bool shell_hosted_builtin(const char *name) {
+    static const char *const allow[] = {
+        /* POSIX special builtins */
+        ":", ".", "source", "break", "continue", "eval", "exec", "exit",
+        "export", "readonly", "return", "set", "shift", "times", "trap",
+        "unset",
+        /* regular builtins bash also implements internally */
+        "alias", "unalias", "bg", "cd", "command", "echo", "false", "fg",
+        "getopts", "hash", "jobs", "kill", "printf", "pwd", "read", "test",
+        "[", "true", "type", "umask", "wait", "sh",
+        0
+    };
+    for (int i = 0; allow[i]; i++)
+        if (strcmp(name, allow[i]) == 0) return true;
+    return false;
+}
+#endif
+
 static const struct cmd *shell_cmd_lookup(const char *name) {
     if (!name) return 0;
+#ifdef SHELL_HOSTED
+    if (!shell_hosted_builtin(name)) return 0;
+#endif
     for (const struct cmd *c = cmds; c->name; c++) {
         if (strcmp(c->name, name) == 0) return c;
     }
@@ -3860,6 +3910,28 @@ static bool shell_line_find_heredoc(const char *line, char *delim, size_t cap,
             in_double = true;
             continue;
         }
+        /* Skip over $(( )) and $( ). Arithmetic contains the LEFT SHIFT
+         * operator, and `$((1<<4))` was being read as a here-document
+         * introduced by `<<` -- which swallowed the rest of the script
+         * looking for a delimiter and took the whole shift family with
+         * it. Quotes were already skipped here; substitutions were not. */
+        if (*p == '$' && p[1] == '(') {
+            int depth = 0;
+            p++;                       /* at the first '(' */
+            while (*p) {
+                if (*p == '(') depth++;
+                else if (*p == ')') { depth--; if (depth == 0) break; }
+                p++;
+            }
+            if (!*p) break;            /* unterminated: nothing to find */
+            continue;
+        }
+        if (*p == '`') {              /* legacy command substitution */
+            p++;
+            while (*p && *p != '`') p++;
+            if (!*p) break;
+            continue;
+        }
         if (p[0] != '<' || p[1] != '<') continue;
 
         p += 2;
@@ -3938,6 +4010,170 @@ static int shell_collect_heredoc(char **pp, const char *delim,
     return -1;
 }
 
+/* ---- multi-line compound commands ---------------------------------------
+ *
+ * The compound parsers below (shell_try_if_command and friends) work on ONE
+ * line: they search for the literal markers "; then", "; do", "; fi",
+ * "; done". That is exactly right for an interactive shell, where the user
+ * types `if [ -f x ]; then echo yes; fi` on a single line.
+ *
+ * Scripts do not look like that. They look like this:
+ *
+ *     if [ 1 -eq 1 ]
+ *     then
+ *         echo one
+ *     fi
+ *
+ * ...which the line-at-a-time reader below used to hand to the parser one
+ * fragment at a time, producing "if: expected '; fi'" and then trying to run
+ * `then`, `echo one` and `fi` as three separate commands. Against real bash
+ * that failed five of the fourteen parity cases -- more than any other single
+ * gap -- because essentially every real script writes compounds across lines.
+ *
+ * So: count unterminated compounds, and keep pulling lines until the count
+ * returns to zero, joining them into the single line the parser expects.
+ *
+ * KNOWN LIMITS, stated rather than hidden:
+ *   - `{ }` groups and `( )` subshells are not counted, because `{` is also
+ *     brace expansion and `${`, and miscounting those would break lines that
+ *     work today. Multi-line groups still need a trailing `;` per line.
+ *   - A here-document opened INSIDE a compound has its body swallowed by the
+ *     accumulator; heredocs at the top level (the common case) are collected
+ *     by the caller as before.
+ */
+
+/* Collapse `;` + run-of-blanks to exactly `; `, in place, outside quotes.
+ *
+ * The compound parsers match their separators LITERALLY -- "; then", "; do",
+ * "; done" -- so `for w in $v;   do ... done`, which bash accepts without
+ * comment, produced "for: expected '; do'". Rather than teach five separate
+ * matchers about arbitrary whitespace, normalise once here: the transform
+ * only ever shortens the string, so it is safe to do in place, and it leaves
+ * quoted text untouched. */
+static void shell_normalise_separators(char *s) {
+    bool in_sq = false, in_dq = false;
+    char *w = s;
+    for (char *r = s; *r; r++) {
+        if (in_sq) { *w++ = *r; if (*r == '\'') in_sq = false; continue; }
+        if (in_dq) {
+            if (*r == '\\' && r[1]) { *w++ = *r++; *w++ = *r; continue; }
+            *w++ = *r;
+            if (*r == '"') in_dq = false;
+            continue;
+        }
+        if (*r == '\'') { in_sq = true; *w++ = *r; continue; }
+        if (*r == '"')  { in_dq = true; *w++ = *r; continue; }
+        *w++ = *r;
+        if (*r == ';') {
+            char *q = r + 1;
+            while (*q == ' ' || *q == '\t') q++;
+            if (q > r + 1) { *w++ = ' '; r = q - 1; }
+        }
+    }
+    *w = '\0';
+}
+
+/* Does `s` leave a logical line INCOMPLETE?
+ *
+ * Two ways it can: a quote opened and never closed, or a trailing backslash
+ * (POSIX 2.2.1 line continuation -- backslash and newline are both removed and
+ * the next line continues the same command). The script reader already
+ * stitches lines together for compound commands and here-documents; these are
+ * the two remaining cases where a "line" is not a whole line.
+ *
+ * Returns 1 for an open quote, 2 for a continuation (whose backslash the
+ * caller must also drop), 0 when the line stands on its own. */
+static int shell_line_incomplete(const char *s) {
+    bool in_sq = false, in_dq = false, esc = false;
+    for (const char *p = s; *p; p++) {
+        esc = false;
+        if (in_sq) {
+            if (*p == '\'') in_sq = false;
+            continue;
+        }
+        if (in_dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_dq = false;
+            continue;
+        }
+        if (*p == '\\') {
+            if (!p[1]) { esc = true; break; }   /* trailing backslash */
+            p++;                                /* escapes the next character */
+            continue;
+        }
+        if (*p == '\'') { in_sq = true; continue; }
+        if (*p == '"')  { in_dq = true; continue; }
+        if (*p == '#' && (p == s || is_space(p[-1]))) break;   /* comment */
+    }
+    if (in_sq || in_dq) return 1;
+    return esc ? 2 : 0;
+}
+
+/* Unterminated-compound depth of `s`, starting from `depth`. Quote-aware, so
+ * the `fi` in `echo "fi"` does not close anything. */
+static int shell_compound_depth(const char *s, int depth) {
+    bool in_sq = false, in_dq = false;
+    const char *start = s;
+    for (const char *q = s; *q; q++) {
+        if (in_sq) { if (*q == '\'') in_sq = false; continue; }
+        if (in_dq) {
+            if (*q == '\\' && q[1]) { q++; continue; }
+            if (*q == '"') in_dq = false;
+            continue;
+        }
+        if (*q == '\'') { in_sq = true; continue; }
+        if (*q == '"')  { in_dq = true;  continue; }
+        /* A comment runs to end of line; keywords inside it are text. */
+        if (*q == '#' && (q == start || is_space(q[-1]))) break;
+        if (!shell_word_boundary_before(start, q)) continue;
+        if (shell_starts_with_word(q, "if")    ||
+            shell_starts_with_word(q, "for")   ||
+            shell_starts_with_word(q, "while") ||
+            shell_starts_with_word(q, "until") ||
+            shell_starts_with_word(q, "case")) {
+            depth++;
+        } else if (shell_starts_with_word(q, "fi")   ||
+                   shell_starts_with_word(q, "done") ||
+                   shell_starts_with_word(q, "esac")) {
+            depth--;
+        } else if (shell_group_open_at(q)) {
+            /* A `{ }` group spanning lines -- which is what a
+             * multi-line FUNCTION BODY is. Without this, `f() {` was
+             * executed on its own as a command and the body lines
+             * ran as top-level commands, so the function was never
+             * defined and calls to it saw no arguments. */
+            depth++;
+        } else if (shell_group_close_at(q)) {
+            depth--;
+        }
+    }
+    return depth < 0 ? 0 : depth;
+}
+
+/* Separator to place between an accumulated compound and its next line.
+ *
+ * The parsers want a literal ';' before `then`/`do`/`fi`/`done`, but must NOT
+ * see one straight after them -- `; then; echo x` would run an empty command
+ * where the body belongs. So a line ending in a keyword that expects a
+ * following command joins with a space; everything else joins with "; ". */
+static const char *shell_compound_join_sep(const char *buf, size_t len) {
+    while (len > 0 && (buf[len - 1] == ' ' || buf[len - 1] == '\t')) len--;
+    if (len == 0) return "";
+    char c = buf[len - 1];
+    if (c == ';' || c == '&' || c == '|') return " ";   /* covers `;;` too */
+    if (c == '{') return " ";   /* `{` opens a group; `{;` is a syntax error */
+    static const char *const kw[] = { "then", "do", "else", "in", 0 };
+    for (int i = 0; kw[i]; i++) {
+        size_t kl = strlen(kw[i]);
+        if (len < kl || strncmp(buf + len - kl, kw[i], kl) != 0) continue;
+        char before = (len == kl) ? ' ' : buf[len - kl - 1];
+        if (!((before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z') ||
+              (before >= '0' && before <= '9') || before == '_'))
+            return " ";
+    }
+    return "; ";
+}
+
 static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (!text) return 1;
     if (g_script_depth >= 8) {
@@ -3965,6 +4201,117 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         first_line = false;
         if (*line == '\0' || *line == '#') continue;
 
+        /* If this line opens a compound, pull following lines until it closes
+         * and hand the parser the single line it expects. See the comment
+         * above shell_compound_depth. The buffer is heap-allocated, not a
+         * local: scripts nest up to 8 deep and each level already puts two
+         * SHELL_PARSE_BUF_MAX buffers on the stack inside execute_line_text. */
+        char *accum = 0;
+
+        /* First, join physical lines into one LOGICAL line: a trailing
+         * backslash continues, and so does an unclosed quote. Done before the
+         * compound scan so that a `fi` inside an unterminated string cannot
+         * be mistaken for the end of a construct. */
+        {
+            int inc = shell_line_incomplete(line);
+            if (inc) {
+                accum = kmalloc(SHELL_PARSE_BUF_MAX);
+                if (!accum) {
+                    kprintf("sh: out of memory reading continued line\n");
+                    shell_set_status(2);
+                    break;
+                }
+                size_t alen = (size_t)ksnprintf(accum, SHELL_PARSE_BUF_MAX, "%s", line);
+                bool bad = false;
+                while (inc && *p) {
+                    /* A continuation drops the backslash and joins directly;
+                     * an open quote keeps the newline, because it is part of
+                     * the string being built. */
+                    if (inc == 2 && alen > 0 && accum[alen - 1] == '\\') alen--;
+                    else if (inc == 1 && alen + 1 < SHELL_PARSE_BUF_MAX) accum[alen++] = '\n';
+
+                    char *nstart = p;
+                    while (*p && *p != '\n' && *p != '\r') p++;
+                    char nsaved = *p;
+                    if (*p) *p++ = '\0';
+                    if (nsaved == '\r' && *p == '\n') p++;
+
+                    size_t nlen = strlen(nstart);
+                    if (alen + nlen + 1 > SHELL_PARSE_BUF_MAX) {
+                        kprintf("sh: line too long after continuation\n");
+                        bad = true;
+                        break;
+                    }
+                    memcpy(accum + alen, nstart, nlen);
+                    alen += nlen;
+                    accum[alen] = '\0';
+                    inc = shell_line_incomplete(accum);
+                }
+                if (bad) {
+                    kfree(accum);
+                    shell_set_status(2);
+                    last = 2;
+                    break;
+                }
+                line = accum;
+            }
+        }
+
+        int depth = shell_compound_depth(line, 0);
+        if (depth > 0) {
+            /* The continuation pass above may already own this buffer, with
+             * `line` pointing into it; reuse it rather than allocating a
+             * second one and leaking the first. */
+            if (!accum) {
+                accum = kmalloc(SHELL_PARSE_BUF_MAX);
+                if (!accum) {
+                    kprintf("sh: out of memory reading compound command\n");
+                    shell_set_status(2);
+                    break;
+                }
+            }
+            size_t alen = (line == accum) ? strlen(accum)
+                        : (size_t)ksnprintf(accum, SHELL_PARSE_BUF_MAX, "%s", line);
+            bool overflow = false;
+            while (depth > 0 && *p) {
+                char *nstart = p;
+                while (*p && *p != '\n' && *p != '\r') p++;
+                char nsaved = *p;
+                if (*p) *p++ = '\0';
+                if (nsaved == '\r' && *p == '\n') p++;
+
+                char *nl = nstart;
+                while (*nl == ' ' || *nl == '\t') nl++;
+                if (*nl == '\0' || *nl == '#') continue;
+
+                const char *sep = shell_compound_join_sep(accum, alen);
+                size_t seplen = strlen(sep), nllen = strlen(nl);
+                if (alen + seplen + nllen + 1 > SHELL_PARSE_BUF_MAX) {
+                    kprintf("sh: compound command too long (max %d bytes)\n",
+                            SHELL_PARSE_BUF_MAX);
+                    overflow = true;
+                    break;
+                }
+                memcpy(accum + alen, sep, seplen); alen += seplen;
+                memcpy(accum + alen, nl, nllen);   alen += nllen;
+                accum[alen] = '\0';
+                depth = shell_compound_depth(nl, depth);
+            }
+            if (overflow || depth > 0) {
+                if (!overflow)
+                    kprintf("sh: unexpected end of file (unterminated compound)\n");
+                kfree(accum);
+                shell_set_status(2);
+                last = 2;
+                break;
+            }
+            line = accum;
+        }
+
+        /* In place: `line` points either into the script text or into accum,
+         * both writable, and the result is never longer than the input. */
+        shell_normalise_separators(line);
+
         char delim[64];
         bool strip_tabs = false;
         bool quoted = false;
@@ -3974,10 +4321,12 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             if (shell_collect_heredoc(&p, delim, strip_tabs, quoted) < 0) {
                 last = 2;
                 shell_set_status(2);
+                if (accum) kfree(accum);
                 break;
             }
         }
         execute_line_text(line);
+        if (accum) { kfree(accum); accum = 0; line = 0; }
         last = g_last_status;
         shell_heredoc_reset();
         if (g_shell_flow == SHELL_FLOW_EXIT) {
@@ -5202,7 +5551,6 @@ static void prompt(void) {
 #define PIPE_BIN_PREFIX "/bin/"
 #define SHELL_TOKEN_MAX 96
 #define SHELL_STAGE_MAX 8
-#define SHELL_PARSE_BUF_MAX (LINE_MAX * 2)
 #define SHELL_REDIR_MAX 8
 
 enum shell_tok_type {
@@ -5548,6 +5896,15 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
             cmd[pos++] = *p++;
             continue;
         }
+        /* A BARE `(` -- a subshell inside the substitution -- nests too. Only
+         * `$(` was counted, while every `)` decremented, so `$( (echo x) )`
+         * ended at the subshell's own paren and left a stray `)` in the word. */
+        if (*p == '(') {
+            depth++;
+            if (pos + 1 >= cmd_cap) return -1;
+            cmd[pos++] = *p++;
+            continue;
+        }
         if (*p == ')') {
             depth--;
             if (depth == 0) {
@@ -5615,15 +5972,51 @@ static bool shell_var_char(char c) {
     return shell_var_start(c) || (c >= '0' && c <= '9');
 }
 
+/* "$@" has to survive quoting as SEPARATE words -- that is the entire reason
+ * it exists, and why `wrapper "$@"` is how every script forwards arguments
+ * containing spaces. Expansion produces flat text, though, so there is
+ * nowhere to record a word boundary... except in the text itself.
+ *
+ * So `$@` emits SHELL_ARG_MARK before each parameter, and shell_add_arg()
+ * splits on that byte even for quoted words. 0x01 is not producible by any
+ * expansion the shell performs and cannot appear in a shell word, so it
+ * cannot collide with real data.
+ *
+ * The marker is a PREFIX rather than a separator so that zero parameters
+ * yields zero words (bash: `set --; f "$@"` passes nothing) rather than one
+ * empty one -- with a separator those two cases are indistinguishable.
+ *
+ * Known divergence, stated rather than hidden: bash glues an adjacent prefix
+ * onto the first word, so `"pre$@"` with args a b gives `prea b`; here it
+ * gives `pre a b`. `"$@"` alone -- essentially all real usage -- is exact.
+ *
+ * `star` selects "$*", which is the opposite case: a SINGLE word joined by
+ * the first character of IFS. */
 static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
-                                        bool use_ifs) {
-    char sep = ' ';
-    if (use_ifs) {
-        const char *ifs = env_get("IFS");
-        if (ifs && *ifs) sep = ifs[0];
-        else if (!ifs) sep = ' ';
-        else sep = '\0';
+                                        bool star) {
+    if (!star) {                                /* "$@" -- one word each */
+        /* Emit a marker FIRST, then one before each subsequent parameter:
+         *
+         *     "$@"      with a b c   ->   MARK a MARK b MARK c
+         *     "pre$@"   with a b     ->   pre MARK a MARK b
+         *     "$@"      with none    ->   MARK
+         *
+         * The leading marker is what makes the zero-parameter case
+         * distinguishable from a literal empty word, and it makes the text
+         * before it unambiguously a PREFIX that shell_add_marked_words glues
+         * onto the first parameter -- which is how bash treats `"pre$@"`. */
+        if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0) return -1;
+        for (int i = 0; i < g_positional_count; i++) {
+            if (i > 0 && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+                return -1;
+            if (shell_append_str(buf, pos, cap, g_positional[i]) < 0) return -1;
+        }
+        return 0;
     }
+    char sep = ' ';
+    const char *ifs = env_get("IFS");
+    if (ifs && *ifs) sep = ifs[0];
+    else if (ifs) sep = '\0';
     for (int i = 0; i < g_positional_count; i++) {
         if (i > 0 && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
         if (shell_append_str(buf, pos, cap, g_positional[i]) < 0) return -1;
@@ -6075,14 +6468,38 @@ static long shell_arith_factor(struct shell_arith *a) {
     return 0;
 }
 
+/* Exponentiation. Binds tighter than * / %, and is RIGHT-associative, so
+ * 2 ** 3 ** 2 is 2 ** 9, not 8 ** 2 -- hence the recursion into itself for
+ * the exponent rather than a loop. Sits between factor and mul so that
+ * `2 ** 3 * 4` groups as `(2 ** 3) * 4`, which is what bash computes.
+ *
+ * Without this `$((2 ** 8))` reached the `*` case, consumed one star, and
+ * then failed on the second with "bad arithmetic expansion". */
+static long shell_arith_pow(struct shell_arith *a) {
+    long base = shell_arith_factor(a);
+    if (!a->ok) return 0;
+    shell_arith_skip(a);
+    if (a->p[0] != '*' || a->p[1] != '*') return base;
+    a->p += 2;
+    long exp = shell_arith_pow(a);
+    if (!a->ok) return 0;
+    if (exp < 0) {                 /* bash: "exponent less than 0" */
+        a->ok = false;
+        return 0;
+    }
+    long r = 1;
+    while (exp-- > 0) r *= base;
+    return r;
+}
+
 static long shell_arith_mul(struct shell_arith *a) {
-    long v = shell_arith_factor(a);
+    long v = shell_arith_pow(a);
     while (a->ok) {
         shell_arith_skip(a);
         char op = *a->p;
         if (op != '*' && op != '/' && op != '%') break;
         a->p++;
-        long rhs = shell_arith_factor(a);
+        long rhs = shell_arith_pow(a);
         if (!a->ok) return 0;
         if ((op == '/' || op == '%') && rhs == 0) {
             a->ok = false;
@@ -6290,7 +6707,7 @@ static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
     if (p[0] != '$' || p[1] != '(' || p[2] != '(') return -1;
     p += 3;
 
-    char expr[128];
+    char expr[256];
     size_t epos = 0;
     int paren_depth = 0;
     while (*p) {
@@ -6301,6 +6718,21 @@ static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
                 p += 2;
                 expr[epos] = '\0';
                 *pp = p;
+                /* Expand the expression text before evaluating it. The
+                 * evaluator resolves bare names itself, but knows nothing
+                 * about `$( )` or `${ }`, so `$(( $(echo 4) + 1 ))` reached
+                 * it as literal text and died as "bad arithmetic expansion".
+                 * Expanding first also makes `$(($x + 1))` and `${#a}` work
+                 * inside arithmetic for free. */
+                char *xexpr = kmalloc(SHELL_PARSE_BUF_MAX);
+                if (xexpr) {
+                    if (shell_expand_param_word(expr, xexpr,
+                                                SHELL_PARSE_BUF_MAX) == 0 &&
+                        strlen(xexpr) < sizeof(expr)) {
+                        memcpy(expr, xexpr, strlen(xexpr) + 1);
+                    }
+                    kfree(xexpr);
+                }
                 struct shell_arith a = { .p = expr, .ok = true };
                 long v = shell_arith_expr(&a);
                 shell_arith_skip(&a);
@@ -6611,6 +7043,22 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                 p++;
                 while (*p && *p != '"') {
                     if (*p == '\\' && p[1]) {
+                        /* POSIX 2.2.3: inside double quotes a backslash is
+                         * special ONLY before $ ` " \ or newline. Anywhere
+                         * else it is an ordinary character and BOTH it and
+                         * what follows are literal -- so "a\bc" is a\bc, not
+                         * abc. Swallowing it unconditionally quietly ate a
+                         * character out of every Windows path and regex a
+                         * script ever put in double quotes. */
+                        char nxt = p[1];
+                        if (nxt != '$' && nxt != '`' && nxt != '"' &&
+                            nxt != '\\' && nxt != '\n') {
+                            if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                                kprintf("shell: word too long\n");
+                                return -1;
+                            }
+                            continue;
+                        }
                         p++;
                         if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
                             kprintf("shell: word too long\n");
@@ -6862,6 +7310,17 @@ static bool shell_glob_bracket(const char **pp, char c) {
 
 static bool shell_glob_match(const char *pat, const char *name) {
     while (*pat) {
+        /* A backslash makes the next character literal. This is how a QUOTED
+         * metacharacter survives: `case $v in "*")` must match the one-character
+         * string `*`, not everything. shell_case_unquote() strips the quotes
+         * and escapes what was inside them, so the distinction between `*` and
+         * `"*"` reaches here instead of being lost with the quotes. */
+        if (*pat == '\\' && pat[1]) {
+            if (*name != pat[1]) return false;
+            pat += 2;
+            name++;
+            continue;
+        }
         if (*pat == '*') {
             while (*pat == '*') pat++;
             if (!*pat) return true;
@@ -6983,6 +7442,7 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,
     if (rc != VFS_OK) return 0;
 
     int matches = 0;
+    int first_arg = cur->argc;
     struct vfs_dirent ent;
     while ((rc = vfs_readdir(&d, &ent)) == VFS_OK) {
         if (ent.name[0] == '.' && pattern[0] != '.') continue;
@@ -7009,6 +7469,20 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,
         matches++;
     }
     vfs_closedir(&d);
+
+    /* Glob results are SORTED. bash guarantees it, so scripts rely on it --
+     * `for f in *.txt` processing files in directory order looks fine until
+     * the directory is rehashed and the output silently reorders. readdir
+     * gives us whatever order the filesystem stores, so sort here. */
+    for (int a = first_arg + 1; a < cur->argc; a++) {
+        char *key = cur->argv[a];
+        int b = a - 1;
+        while (b >= first_arg && strcmp(cur->argv[b], key) > 0) {
+            cur->argv[b + 1] = cur->argv[b];
+            b--;
+        }
+        cur->argv[b + 1] = key;
+    }
     return matches;
 }
 
@@ -7036,6 +7510,54 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
             cur->argv[cur->argc++] = expanded;
             return 0;
         }
+
+        /* POSIX 2.6.1: in an ASSIGNMENT, a tilde is also expanded right after
+         * the `=` and after each `:`. That second rule is what makes
+         * `PATH=~/bin:~/tools` work, and without the first `x=~` stored a
+         * literal tilde that every later use of $x carried around. */
+        size_t klen = env_key_len(word);
+        if (word[klen] == '=' && shell_name_is_valid(word, klen)) {
+            char asg[SHELL_PARSE_BUF_MAX];
+            size_t apos = 0;
+            bool changed = false;
+            const char *q = word;
+            /* copy `name=` verbatim */
+            for (size_t i = 0; i <= klen; i++)
+                if (shell_append_char(asg, &apos, sizeof(asg), *q++) < 0) return -1;
+            while (*q) {
+                if (*q == '~') {
+                    const char *seg_end = q;
+                    while (*seg_end && *seg_end != ':') seg_end++;
+                    char seg[VFS_PATH_MAX];
+                    size_t sl = (size_t)(seg_end - q);
+                    if (sl + 1 <= sizeof(seg)) {
+                        memcpy(seg, q, sl);
+                        seg[sl] = '\0';
+                        char *sub = 0;
+                        int r = shell_expand_tilde_word(pl, seg, &sub);
+                        if (r < 0) return -1;
+                        if (r > 0) {
+                            if (shell_append_str(asg, &apos, sizeof(asg), sub) < 0) return -1;
+                            q = seg_end;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+                /* Only a tilde that STARTS a segment expands. */
+                while (*q && *q != ':')
+                    if (shell_append_char(asg, &apos, sizeof(asg), *q++) < 0) return -1;
+                if (*q == ':')
+                    if (shell_append_char(asg, &apos, sizeof(asg), *q++) < 0) return -1;
+            }
+            if (changed) {
+                asg[apos] = '\0';
+                char *saved = 0;
+                if (shell_pipeline_save_word(pl, asg, &saved) < 0) return -1;
+                cur->argv[cur->argc++] = saved;
+                return 0;
+            }
+        }
     }
 
     cur->argv[cur->argc++] = (char *)word;
@@ -7051,8 +7573,81 @@ static bool shell_is_ifs_char(char c) {
     return false;
 }
 
+/* IFS whitespace, as POSIX means it: space/tab/newline, and only when they
+ * are actually in IFS. With IFS=':' a space is an ordinary character. */
+static bool shell_is_ifs_white(char c) {
+    return (c == ' ' || c == '\t' || c == '\n') && shell_is_ifs_char(c);
+}
+
+static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
+                         const char *word, bool quoted);
+
+/* Split a word on the "$@" word-boundary marker and add each piece. Runs for
+ * quoted words too -- that is the whole point, since `"$@"` must yield one
+ * argument per parameter despite being quoted. Empty pieces are dropped, so
+ * zero parameters contributes zero arguments.
+ *
+ * Returns 1 if the word carried markers (and has been fully handled), 0 if it
+ * carried none and should take the normal path, -1 on error. */
+static int shell_add_marked_words(struct shell_pipeline *pl,
+                                  struct shell_simple *cur,
+                                  const char *word, bool quoted) {
+    const char *first = word;
+    while (*first && *first != SHELL_ARG_MARK) first++;
+    if (!*first) return 0;                       /* no marker: normal path */
+
+    size_t prefix_len = (size_t)(first - word);
+    char tmp[SHELL_PARSE_BUF_MAX];
+    int emitted = 0;
+
+    for (const char *p = first; *p == SHELL_ARG_MARK; ) {
+        p++;
+        const char *start = p;
+        while (*p && *p != SHELL_ARG_MARK) p++;
+        size_t n = (size_t)(p - start);
+
+        /* Exactly one marker with nothing after it is the zero-parameter
+         * encoding, not a parameter that happens to be empty. */
+        if (n == 0 && emitted == 0 && *p == '\0') break;
+
+        size_t glue = (emitted == 0) ? prefix_len : 0;
+        if (glue + n + 1 > sizeof(tmp)) {
+            kprintf("shell: field too long\n");
+            return -1;
+        }
+        if (glue) memcpy(tmp, word, glue);
+        memcpy(tmp + glue, start, n);
+        tmp[glue + n] = '\0';
+
+        char *saved = 0;
+        if (shell_pipeline_save_word(pl, tmp, &saved) < 0) return -1;
+        /* An unquoted "$@" still field-splits each parameter; a quoted one
+         * keeps each parameter whole, spaces and all. */
+        if (quoted) {
+            if (shell_add_one_arg(pl, cur, saved, true) < 0) return -1;
+        } else {
+            if (shell_add_arg(pl, cur, saved, false) < 0) return -1;
+        }
+        emitted++;
+    }
+
+    /* `"pre$@"` with no parameters is still the word `pre`. */
+    if (emitted == 0 && prefix_len > 0) {
+        if (prefix_len + 1 > sizeof(tmp)) return -1;
+        memcpy(tmp, word, prefix_len);
+        tmp[prefix_len] = '\0';
+        char *saved = 0;
+        if (shell_pipeline_save_word(pl, tmp, &saved) < 0) return -1;
+        if (shell_add_one_arg(pl, cur, saved, quoted) < 0) return -1;
+    }
+    return 1;
+}
+
 static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
                          const char *word, bool quoted) {
+    int mrc = shell_add_marked_words(pl, cur, word, quoted);
+    if (mrc != 0) return mrc < 0 ? -1 : 0;
+
     if (quoted) return shell_add_one_arg(pl, cur, word, true);
 
     size_t klen = env_key_len(word);
@@ -7060,11 +7655,19 @@ static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
         return shell_add_one_arg(pl, cur, word, false);
     }
 
+    /* IFS splitting, POSIX rules -- and the two rules are different.
+     *
+     * A run of IFS WHITESPACE is a single delimiter, and leading/trailing
+     * runs produce no fields, so "  x   y  " is two fields. But each IFS
+     * NON-whitespace character delimits on its own, so with IFS=':' the
+     * string "a::b" is THREE fields, the middle one empty. Collapsing both
+     * kinds (which is what the loop here used to do) silently drops empty
+     * fields, and `IFS=: read a b c` is exactly how scripts parse
+     * /etc/passwd-shaped data. */
     const char *p = word;
-    bool added = false;
+    while (shell_is_ifs_char(*p) && shell_is_ifs_white(*p)) p++;
+
     while (*p) {
-        while (shell_is_ifs_char(*p)) p++;
-        if (!*p) break;
         const char *start = p;
         while (*p && !shell_is_ifs_char(*p)) p++;
         size_t n = (size_t)(p - start);
@@ -7078,12 +7681,22 @@ static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
         char *saved = 0;
         if (shell_pipeline_save_word(pl, tmp, &saved) < 0) return -1;
         if (shell_add_one_arg(pl, cur, saved, false) < 0) return -1;
-        added = true;
+
+        if (!*p) break;
+        /* One delimiter: optional whitespace, at most one non-whitespace
+         * IFS character, optional whitespace. */
+        while (shell_is_ifs_char(*p) && shell_is_ifs_white(*p)) p++;
+        if (shell_is_ifs_char(*p) && !shell_is_ifs_white(*p)) {
+            p++;
+            while (shell_is_ifs_char(*p) && shell_is_ifs_white(*p)) p++;
+        }
+        /* A trailing delimiter does not introduce an empty final field. */
+        if (!*p) break;
     }
 
-    if (!added && word[0] == '\0') {
-        return shell_add_one_arg(pl, cur, word, false);
-    }
+    /* An unquoted expansion that came out empty contributes NO word. bash:
+     * `x=""; f $x` passes nothing, while `f ""` passes one empty argument --
+     * and the quoted form never reaches here. */
     return 0;
 }
 
@@ -7372,12 +7985,16 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
     if (!f) return 0;
     memset(f, 0, sizeof(*f));
     f->kind = FILE_KIND_VFS;
-    f->vfs_refs = (int *)kmalloc(sizeof(int));
-    if (!f->vfs_refs) {
-        kfree(f);
-        return 0;
+    {
+        struct vfs_ofd *ofd = (struct vfs_ofd *)kmalloc(sizeof *ofd);
+        if (!ofd) {
+            kfree(f);
+            return 0;
+        }
+        ofd->refs = 1;
+        ofd->pos  = 0;
+        f->vfs_refs = &ofd->refs;   /* refs is first; see struct vfs_ofd */
     }
-    *f->vfs_refs = 1;
 
     int rc = vfs_open(path, &f->vfs);
     if (rc != VFS_OK) {
@@ -7386,7 +8003,7 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
         kfree(f);
         return 0;
     }
-    if (write && append) f->vfs.pos = f->vfs.size;
+    if (write && append) file_pos_set(f, f->vfs.size);
     return f;
 }
 
@@ -7525,8 +8142,19 @@ static int shell_apply_redirs(struct shell_simple *cmd,
             }
             struct file *clone = 0;
             bool owned = false;
-            if (st->fd[r->target_fd]) {
-                clone = file_clone(st->fd[r->target_fd]);
+            /* A NULL slot means "the shell's own descriptor", not "no
+             * file". Cloning NULL used to produce NULL, which reads as
+             * the default again -- so `1>&2` quietly did nothing. Ask
+             * the host for a real handle on that standard descriptor. */
+            struct file *target = st->fd[r->target_fd];
+            struct file *synth = 0;
+            if (!target) {
+                synth = file_std_handle(r->target_fd);
+                target = synth;
+            }
+            if (target) {
+                clone = file_clone(target);
+                if (synth) file_close(synth);
                 if (!clone) {
                     kprintf("%s: failed to duplicate fd %d\n",
                             label, r->target_fd);
@@ -7731,13 +8359,56 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
     }
 
     if (!background) {
+        /* `exec` with redirections and NO command applies them to the SHELL
+         * and returns -- that is how a script sends everything that follows to
+         * a log file. cmd_exec() only knew how to replace the shell with a
+         * program, so a bare `exec > file` did nothing at all and the output
+         * kept going to the terminal.
+         *
+         * The handles are installed permanently and deliberately not owned by
+         * an io frame: there is nothing to restore them to. */
+        if (exec_cmd.argc == 1 && strcmp(exec_cmd.argv[0], "exec") == 0 &&
+            cmd->redir_count > 0) {
+            struct shell_fd_state fds;
+            shell_fd_state_init_from_defaults(&fds);
+            if (shell_apply_redirs(cmd, &fds, "exec") < 0) {
+                shell_fd_state_close_owned(&fds);
+                return 1;
+            }
+            for (int i = 0; i < 3; i++) {
+                g_shell_fd[i] = fds.fd[i];
+                fds.owned[i] = false;   /* the shell keeps them now */
+            }
+            return 0;
+        }
+
         const struct cmd *special = shell_cmd_lookup(exec_cmd.argv[0]);
         if (special && shell_special_builtin_name(special->name)) {
             return shell_run_builtin(&exec_cmd, special, cmd->argv, assignc,
                                      true);
         }
-        int frc = shell_run_function(&exec_cmd);
-        if (frc >= 0) return frc;
+        /* A variable assignment PREFIXED to a command applies to that command
+         * only -- `PREF=x show` must be visible inside `show` and gone after.
+         * The builtin path below already threaded assignv/assignc through;
+         * the function path did not, so the assignment was silently dropped
+         * and the function saw the outer (or unset) value. */
+        {
+            struct shell_env_frame env_frame;
+            bool restore = false;
+            /* Only when there IS a prefix. A function shares the caller's
+             * environment, so `f() { g=1; }; f` must leave g set -- snapshotting
+             * around every call would roll that back. */
+            if (assignc > 0 && shell_function_lookup(exec_cmd.argv[0])) {
+                if (shell_env_frame_capture(&env_frame) == 0) restore = true;
+                if (shell_apply_assignments(cmd->argv, assignc, "shell") != 0) {
+                    if (restore) shell_env_frame_restore(&env_frame);
+                    return 1;
+                }
+            }
+            int frc = shell_run_function(&exec_cmd);
+            if (restore) shell_env_frame_restore(&env_frame);
+            if (frc >= 0) return frc;
+        }
         const struct cmd *builtin = shell_cmd_lookup(exec_cmd.argv[0]);
         int brc = shell_run_builtin(&exec_cmd, builtin, cmd->argv, assignc,
                                     false);
@@ -8162,8 +8833,15 @@ static const char *shell_find_if_fi(const char *start) {
         if (*p == '"')  { in_dq = true; continue; }
         if (shell_starts_with_word(p, "if") &&
             shell_word_boundary_before(start, p)) depth++;
-        if ((strncmp(p, "; fi", 4) == 0 || strncmp(p, ";fi", 3) == 0) &&
-            shell_word_boundary_before(start, p)) {
+        /* The character BEFORE the ';' is deliberately not examined. It used
+         * to be required to be a space or ';' (shell_word_boundary_before),
+         * which meant `if c; then echo eq; fi` did not parse -- the 'q' of
+         * "eq" sat in front of the ';' -- while `... echo eq ; fi` did. bash
+         * makes no such distinction, and a ';' cannot occur inside a bare
+         * word anyway; quoted ones are already skipped above. What DOES
+         * matter is that "fi" ends a word, so `; fifo` is not a terminator. */
+        if ((strncmp(p, "; fi", 4) == 0 && shell_is_word_end(p[4])) ||
+            (strncmp(p, ";fi",  3) == 0 && shell_is_word_end(p[3]))) {
             depth--;
             if (depth == 0) return p;
         }
@@ -8211,6 +8889,55 @@ static const char *shell_find_elif_else(const char *start, const char *fi_at,
         }
     }
     return 0;
+}
+
+/* ---- redirections attached to a compound command ------------------------
+ *
+ * `while read l; do ...; done < file` redirects the WHOLE loop, and it is how
+ * every script feeds a file into a read loop. The loop parsers used to stop
+ * at `done` and ignore what followed, so the body read from the terminal and
+ * the loop never ran.
+ *
+ * Parses the text after a compound's terminator as redirections only, into
+ * `out`. Returns 0 on success (including an empty tail), -1 on a parse error
+ * or if the tail contains anything that is not a redirection. */
+static int shell_parse_compound_redirs(const char *tail, struct shell_simple *out,
+                                       const char *label) {
+    shell_simple_init(out);
+    tail = shell_skip_blanks(tail);
+    if (!*tail) return 0;
+
+    /* Heap for the same reason as everywhere else on this path: the loop
+     * parsers that call this already hold list[], body[], tok[] and words[],
+     * and struct shell_pipeline alone is ~5.5 KB. */
+    struct shell_token *tok = kmalloc(sizeof(*tok) * SHELL_TOKEN_MAX);
+    char *words = kmalloc(SHELL_PARSE_BUF_MAX);
+    struct shell_pipeline *pl = kmalloc(sizeof(*pl));
+    int rc = -1;
+    if (!tok || !words || !pl) {
+        kprintf("%s: out of memory parsing redirections\n", label);
+        goto out;
+    }
+    {
+        int ntok = 0;
+        if (shell_tokenize(tail, tok, &ntok, words, SHELL_PARSE_BUF_MAX) < 0)
+            goto out;
+        if (ntok == 0) { rc = 0; goto out; }
+
+        int i = 0;
+        int parsed = shell_parse_pipeline(tok, ntok, &i, pl);
+        if (parsed <= 0 || pl->count != 1 || pl->stage[0].argc != 0) {
+            kprintf("%s: expected only redirections after the loop\n", label);
+            goto out;
+        }
+        *out = pl->stage[0];
+        rc = 0;
+    }
+out:
+    if (tok)   kfree(tok);
+    if (words) kfree(words);
+    if (pl)    kfree(pl);
+    return rc;
 }
 
 static bool shell_try_if_command(const char *src) {
@@ -8372,6 +9099,13 @@ static bool shell_try_for_command(const char *src) {
         return true;
     }
 
+    struct shell_simple tail_redirs;
+    if (shell_parse_compound_redirs(done_at + strlen(done_marker),
+                                    &tail_redirs, "for") < 0) {
+        shell_set_status(2);
+        return true;
+    }
+
     struct shell_token tok[SHELL_TOKEN_MAX];
     char words[SHELL_PARSE_BUF_MAX];
     int ntok = 0;
@@ -8380,45 +9114,111 @@ static bool shell_try_for_command(const char *src) {
         return true;
     }
 
+    /* The list is a WORD LIST, and gets the same treatment a command's
+     * arguments get: IFS splitting of unquoted expansions, "$@" to one word
+     * per parameter, and globbing. Iterating the raw tokens instead meant
+     * `for w in $v` ran once with "a b c" and `for f in *.txt` iterated over
+     * the literal pattern -- the two most obvious things a for loop is for. */
+    /* HEAP, not stack. struct shell_pipeline is ~5.5 KB (eight stages plus a
+     * 1 KB expansion buffer), and this function already carries list[],
+     * body[], tok[] and words[] -- about 5 KB more. A nested `for` recurses
+     * through execute_line_text into another copy of this frame, so putting
+     * the pipeline on the stack overflowed it and corrupted memory a byte at
+     * a time: output came back with single characters missing at random
+     * positions, in cases that had nothing to do with loops. */
+    struct shell_pipeline *wl = kmalloc(sizeof(*wl));
+    struct shell_simple *items = kmalloc(sizeof(*items));
+    if (!wl || !items) {
+        if (wl) kfree(wl);
+        if (items) kfree(items);
+        kprintf("for: out of memory expanding list\n");
+        shell_set_status(2);
+        return true;
+    }
+    wl->count = 0;
+    wl->expand_pos = 0;
+    shell_simple_init(items);
+    if (implicit_at) {
+        /* `for a` with no `in` iterates the positional parameters with
+         * "$@" semantics: ONE iteration per parameter, each kept whole.
+         * Flattening them into a string and re-splitting (which is what
+         * building `list` above does) turns `set -- "one two"` into two
+         * iterations, losing exactly the quoting the caller preserved. */
+        for (int i = 0; i < g_positional_count; i++) {
+            char *saved = 0;
+            if (shell_pipeline_save_word(wl, g_positional[i], &saved) < 0 ||
+                shell_add_one_arg(wl, items, saved, true) < 0) {
+                kfree(wl); kfree(items);
+                shell_set_status(2);
+                return true;
+            }
+        }
+    } else {
+        for (int i = 0; i < ntok; i++) {
+            if (tok[i].type != SH_TOK_WORD) continue;
+            if (shell_add_arg(wl, items, tok[i].text, tok[i].quoted) < 0) {
+                kfree(wl); kfree(items);
+                shell_set_status(2);
+                return true;
+            }
+        }
+    }
+
     int last = 0;
     g_shell_loop_depth++;
-    for (int i = 0; i < ntok; i++) {
-        if (tok[i].type != SH_TOK_WORD) continue;
-        if (env_set(name, tok[i].text) < 0) {
-            kprintf("for: failed to set '%s'\n", name);
+
+    struct shell_io_frame io_frame;
+    bool io_active = false;
+    if (tail_redirs.redir_count > 0) {
+        if (shell_enter_io_frame(&tail_redirs, "for", &io_frame) < 0) {
             g_shell_loop_depth--;
+            kfree(wl); kfree(items);
             shell_set_status(1);
             return true;
+        }
+        io_active = true;
+    }
+
+    /* One exit path, so the redirection frame is always unwound. Every
+     * `return true` inside the loop became a `goto done` for that reason. */
+    bool set_last = true;
+    for (int i = 0; i < items->argc; i++) {
+        if (env_set(name, items->argv[i]) < 0) {
+            kprintf("for: failed to set '%s'\n", name);
+            last = 1;
+            goto done;
         }
         execute_line_text(body);
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_EXIT) {
-            g_shell_loop_depth--;
-            return true;
+            set_last = false;
+            goto done;
         }
         if (g_shell_flow == SHELL_FLOW_BREAK) {
             if (--g_shell_break_depth <= 0) {
                 g_shell_flow = SHELL_FLOW_NONE;
                 g_shell_flow_status = 0;
             }
-            g_shell_loop_depth--;
-            shell_set_status(last);
-            return true;
+            goto done;
         }
         if (g_shell_flow == SHELL_FLOW_CONTINUE) {
             if (--g_shell_break_depth <= 0) {
                 g_shell_flow = SHELL_FLOW_NONE;
                 g_shell_flow_status = 0;
             } else {
-                g_shell_loop_depth--;
-                return true;
+                set_last = false;
+                goto done;
             }
             continue;
         }
     }
+done:
     g_shell_loop_depth--;
-    shell_set_status(last);
+    if (io_active) shell_restore_io_frame(&io_frame);
+    kfree(wl);
+    kfree(items);
+    if (set_last) shell_set_status(last);
     return true;
 }
 
@@ -8443,6 +9243,13 @@ static bool shell_try_while_command(const char *src) {
         return true;
     }
 
+    struct shell_simple tail_redirs;
+    if (shell_parse_compound_redirs(done_at + strlen(done_marker),
+                                    &tail_redirs, "while") < 0) {
+        shell_set_status(2);
+        return true;
+    }
+
     char cond[LINE_MAX];
     char body[LINE_MAX];
     if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
@@ -8455,43 +9262,62 @@ static bool shell_try_while_command(const char *src) {
 
     int last = 0;
     g_shell_loop_depth++;
+
+    /* The redirection wraps the WHOLE loop, so it is entered once here and
+     * unwound once at `done` -- hence the single exit path below. */
+    struct shell_io_frame io_frame;
+    bool io_active = false;
+    if (tail_redirs.redir_count > 0) {
+        if (shell_enter_io_frame(&tail_redirs, "while", &io_frame) < 0) {
+            g_shell_loop_depth--;
+            shell_set_status(1);
+            return true;
+        }
+        io_active = true;
+    }
+
+    bool set_last = true;
+    bool overrun = false;
     for (int iter = 0; iter < 1024; iter++) {
         execute_line_text(cond);
         if (g_last_status != 0) {
-            g_shell_loop_depth--;
-            shell_set_status(last);
-            return true;
+            goto done;
         }
         execute_line_text(body);
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_EXIT) {
-            g_shell_loop_depth--;
-            return true;
+            set_last = false;
+            goto done;
         }
         if (g_shell_flow == SHELL_FLOW_BREAK) {
             if (--g_shell_break_depth <= 0) {
                 g_shell_flow = SHELL_FLOW_NONE;
                 g_shell_flow_status = 0;
             }
-            g_shell_loop_depth--;
-            shell_set_status(last);
-            return true;
+            goto done;
         }
         if (g_shell_flow == SHELL_FLOW_CONTINUE) {
             if (--g_shell_break_depth <= 0) {
                 g_shell_flow = SHELL_FLOW_NONE;
                 g_shell_flow_status = 0;
             } else {
-                g_shell_loop_depth--;
-                return true;
+                set_last = false;
+                goto done;
             }
             continue;
         }
+        if (iter == 1023) overrun = true;
     }
+done:
     g_shell_loop_depth--;
-    kprintf("while: iteration limit reached\n");
-    shell_set_status(2);
+    if (io_active) shell_restore_io_frame(&io_frame);
+    if (overrun) {
+        kprintf("while: iteration limit reached\n");
+        shell_set_status(2);
+    } else if (set_last) {
+        shell_set_status(last);
+    }
     return true;
 }
 
@@ -8516,6 +9342,13 @@ static bool shell_try_until_command(const char *src) {
         return true;
     }
 
+    struct shell_simple tail_redirs;
+    if (shell_parse_compound_redirs(done_at + strlen(done_marker),
+                                    &tail_redirs, "until") < 0) {
+        shell_set_status(2);
+        return true;
+    }
+
     char cond[LINE_MAX];
     char body[LINE_MAX];
     if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
@@ -8528,43 +9361,62 @@ static bool shell_try_until_command(const char *src) {
 
     int last = 0;
     g_shell_loop_depth++;
+
+    /* The redirection wraps the WHOLE loop, so it is entered once here and
+     * unwound once at `done` -- hence the single exit path below. */
+    struct shell_io_frame io_frame;
+    bool io_active = false;
+    if (tail_redirs.redir_count > 0) {
+        if (shell_enter_io_frame(&tail_redirs, "until", &io_frame) < 0) {
+            g_shell_loop_depth--;
+            shell_set_status(1);
+            return true;
+        }
+        io_active = true;
+    }
+
+    bool set_last = true;
+    bool overrun = false;
     for (int iter = 0; iter < 1024; iter++) {
         execute_line_text(cond);
         if (g_last_status == 0) {
-            g_shell_loop_depth--;
-            shell_set_status(last);
-            return true;
+            goto done;
         }
         execute_line_text(body);
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_EXIT) {
-            g_shell_loop_depth--;
-            return true;
+            set_last = false;
+            goto done;
         }
         if (g_shell_flow == SHELL_FLOW_BREAK) {
             if (--g_shell_break_depth <= 0) {
                 g_shell_flow = SHELL_FLOW_NONE;
                 g_shell_flow_status = 0;
             }
-            g_shell_loop_depth--;
-            shell_set_status(last);
-            return true;
+            goto done;
         }
         if (g_shell_flow == SHELL_FLOW_CONTINUE) {
             if (--g_shell_break_depth <= 0) {
                 g_shell_flow = SHELL_FLOW_NONE;
                 g_shell_flow_status = 0;
             } else {
-                g_shell_loop_depth--;
-                return true;
+                set_last = false;
+                goto done;
             }
             continue;
         }
+        if (iter == 1023) overrun = true;
     }
+done:
     g_shell_loop_depth--;
-    kprintf("until: iteration limit reached\n");
-    shell_set_status(2);
+    if (io_active) shell_restore_io_frame(&io_frame);
+    if (overrun) {
+        kprintf("until: iteration limit reached\n");
+        shell_set_status(2);
+    } else if (set_last) {
+        shell_set_status(last);
+    }
     return true;
 }
 
@@ -8605,19 +9457,70 @@ static int shell_expand_case_word(const char *src, char *out, size_t cap) {
     return 0;
 }
 
+/* Strip one level of shell quoting from a case pattern, in place.
+ *
+ * `case "$v" in "") ...` is the idiomatic empty-string arm, and it never
+ * matched: the pattern text is the two characters `""`, which were compared
+ * LITERALLY against the (empty) word. Quotes in a pattern suppress globbing
+ * of what they enclose rather than being part of the pattern, so remove them
+ * -- and once `""` unquotes to the empty pattern, an empty pattern has to be
+ * allowed to match the empty word instead of being rejected as blank. */
+/* Glob metacharacters that must be neutralised when they came from inside
+ * quotes -- `"*"` is the literal asterisk, not the match-anything pattern. */
+static bool shell_glob_meta(char c) {
+    return c == '*' || c == '?' || c == '[' || c == ']' || c == '\\';
+}
+
+static void shell_case_unquote(char *pat) {
+    bool in_sq = false, in_dq = false;
+    char *w = pat;
+    for (char *r = pat; *r; r++) {
+        if (in_sq) {
+            if (*r == '\'') { in_sq = false; continue; }
+            if (shell_glob_meta(*r)) *w++ = '\\';
+            *w++ = *r;
+            continue;
+        }
+        if (in_dq) {
+            if (*r == '\\' && r[1]) { r++; if (shell_glob_meta(*r)) *w++ = '\\'; *w++ = *r; continue; }
+            if (*r == '"') { in_dq = false; continue; }
+            if (shell_glob_meta(*r)) *w++ = '\\';
+            *w++ = *r;
+            continue;
+        }
+        if (*r == '\'') { in_sq = true;  continue; }
+        if (*r == '"')  { in_dq = true;  continue; }
+        if (*r == '\\' && r[1]) { *w++ = *++r; continue; }
+        *w++ = *r;
+    }
+    *w = '\0';
+}
+
 static bool shell_case_pattern_match(const char *patterns, const char *word) {
     const char *p = patterns;
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '(') p++;
         const char *start = p;
-        while (*p && *p != '|') p++;
+        bool in_sq = false, in_dq = false;
+        /* A `|` inside quotes is a literal, not an alternation separator. */
+        while (*p) {
+            if (in_sq) { if (*p == '\'') in_sq = false; p++; continue; }
+            if (in_dq) { if (*p == '"')  in_dq = false; p++; continue; }
+            if (*p == '\'') { in_sq = true; p++; continue; }
+            if (*p == '"')  { in_dq = true; p++; continue; }
+            if (*p == '|') break;
+            p++;
+        }
         const char *end = p;
         while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
 
         char pat[128];
-        if (shell_copy_segment(pat, sizeof(pat), start, end) == 0 &&
-            pat[0] && shell_glob_match(pat, word)) {
-            return true;
+        if (shell_copy_segment(pat, sizeof(pat), start, end) == 0) {
+            bool was_quoted = (end > start);
+            shell_case_unquote(pat);
+            /* An empty pattern is only meaningful if it came from quotes;
+             * a genuinely blank clause is still skipped. */
+            if ((pat[0] || was_quoted) && shell_glob_match(pat, word)) return true;
         }
         if (*p == '|') p++;
     }
@@ -8635,7 +9538,21 @@ static bool shell_try_case_command(const char *src) {
         shell_set_status(2);
         return true;
     }
-    const char *esac_at = shell_find_word_marker(in_at + 2, "esac");
+    /* Find the esac that closes THIS case, not the first one in the text: a
+     * `case` nested inside a clause body has its own, and matching that one
+     * truncated the outer construct so every clause after the nested one was
+     * silently dropped. */
+    const char *esac_at = 0;
+    {
+        int depth = 1;
+        for (const char *q = in_at + 2; *q; q++) {
+            if (!shell_word_boundary_before(in_at + 2, q)) continue;
+            if (shell_starts_with_word(q, "case")) { depth++; continue; }
+            if (shell_starts_with_word(q, "esac")) {
+                if (--depth == 0) { esac_at = q; break; }
+            }
+        }
+    }
     if (!esac_at) {
         kprintf("case: expected 'esac'\n");
         shell_set_status(2);
@@ -8669,7 +9586,23 @@ static bool shell_try_case_command(const char *src) {
         }
 
         const char *body = close + 1;
-        const char *sep = shell_find_text(body, ";;");
+        /* The `;;` that ends THIS clause, skipping any nested case construct:
+         * a `case` inside a clause body has clause terminators of its own, and
+         * matching the first one truncated the outer body right after it. */
+        const char *sep = 0;
+        {
+            int cdepth = 0;
+            for (const char *q = body; *q && q < esac_at; q++) {
+                if (shell_word_boundary_before(body, q)) {
+                    if (shell_starts_with_word(q, "case")) { cdepth++; continue; }
+                    if (shell_starts_with_word(q, "esac")) {
+                        if (cdepth > 0) cdepth--;
+                        continue;
+                    }
+                }
+                if (cdepth == 0 && q[0] == ';' && q[1] == ';') { sep = q; break; }
+            }
+        }
         if (!sep || sep > esac_at) sep = esac_at;
 
         char pats[128];
@@ -8953,6 +9886,11 @@ struct shell_subshell_frame {
     enum shell_flow flow;
     int flow_status;
     int loop_depth;
+    /* A subshell gets its own copy of the shell EXECUTION ENVIRONMENT,
+     * and POSIX 2.12 counts open files as part of it. Without these,
+     * `( exec > f; echo x )` left the shell redirected after the
+     * subshell ended and every later command wrote into f. */
+    struct file *fd[3];
 };
 
 static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
@@ -8977,6 +9915,7 @@ static int shell_subshell_frame_capture(struct shell_subshell_frame *frame) {
     frame->flow = g_shell_flow;
     frame->flow_status = g_shell_flow_status;
     frame->loop_depth = g_shell_loop_depth;
+    for (int i = 0; i < 3; i++) frame->fd[i] = g_shell_fd[i];
 
     shell_save_opts(&frame->opts);
     if (shell_env_frame_capture(&frame->env) < 0 ||
@@ -9004,6 +9943,10 @@ static void shell_subshell_frame_restore(struct shell_subshell_frame *frame) {
     g_shell_flow = frame->flow;
     g_shell_flow_status = frame->flow_status;
     g_shell_loop_depth = frame->loop_depth;
+    /* Anything the subshell installed with `exec` dies with it. The
+     * handles it opened are deliberately not closed here: a clone may
+     * still be referenced by a spawned child. */
+    for (int i = 0; i < 3; i++) g_shell_fd[i] = frame->fd[i];
 }
 
 static bool shell_subshell_tail_can_follow(const char *tail) {
@@ -9250,6 +10193,287 @@ static bool shell_try_group_command(const char *src) {
     return true;
 }
 
+/* ---- top-level command lists --------------------------------------------
+ *
+ * A line is split into its `;` / `&&` / `||` segments HERE, before anything
+ * is tokenized, and each segment is executed on its own. Two bugs die with
+ * this, and they were the two most consequential ones the parity gate found:
+ *
+ *  1. `$?` was a line ahead of itself. shell_tokenize() EXPANDS as it
+ *     tokenizes, and it was handed the whole line, so `false; echo $?`
+ *     expanded `$?` before `false` ever ran and printed the status of
+ *     whatever came before. The same ordering bug applied to `$( )` -- a
+ *     command substitution in the second half of a line ran before the first
+ *     half, side effects and all.
+ *
+ *  2. Anything after a compound command was silently dropped. The compound
+ *     parsers each located their terminator and then ignored the rest of the
+ *     line -- shell_try_if_command literally computed `fi_skip` and threw it
+ *     away -- so `if a; then b; fi; echo c` never echoed. Harmless while
+ *     compounds had to be one-liners; fatal once multi-line compounds got
+ *     joined into one line. Splitting first means a compound parser only
+ *     ever receives its own text.
+ *
+ * The scan must not split inside quotes, `$( )`, backticks, a compound
+ * (if/for/while/until/case ... fi/done/esac), a `{ }` group, or a `( )`
+ * subshell -- and `;;` is a case-clause terminator, not two separators.
+ */
+
+enum shell_list_link { SH_LINK_SEMI, SH_LINK_AND, SH_LINK_OR };
+
+/* A `{` or `}` only opens/closes a group when it stands as its own word;
+ * otherwise it is brace expansion, `${...}`, or part of a filename. */
+static bool shell_group_open_at(const char *p) {
+    return *p == '{' && (p[1] == ' ' || p[1] == '\t' || p[1] == '\0');
+}
+static bool shell_group_close_at(const char *p) {
+    return *p == '}' && (p[1] == '\0' || p[1] == ' ' || p[1] == '\t' ||
+                         p[1] == ';' || p[1] == '&' || p[1] == '|');
+}
+
+static const char *shell_find_list_sep(const char *s, enum shell_list_link *link,
+                                       int *oplen) {
+    bool in_sq = false, in_dq = false, in_bt = false;
+    int paren = 0, compound = 0, brace = 0;
+    const char *start = s;
+
+    for (const char *p = s; *p; p++) {
+        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_dq = false;
+            continue;
+        }
+        if (in_bt) { if (*p == '`') in_bt = false; continue; }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'') { in_sq = true; continue; }
+        if (*p == '"')  { in_dq = true; continue; }
+        if (*p == '`')  { in_bt = true; continue; }
+
+        /* `$(`, `$((` and a bare `(` subshell all nest the same way here: we
+         * only care that their contents are off limits to the splitter. */
+        if (*p == '$' && p[1] == '(') { paren++; p++; continue; }
+        if (*p == '(') { paren++; continue; }
+        if (*p == ')') { if (paren > 0) paren--; continue; }
+        if (paren > 0) continue;
+
+        if (shell_word_boundary_before(start, p)) {
+            if (shell_starts_with_word(p, "if")    ||
+                shell_starts_with_word(p, "for")   ||
+                shell_starts_with_word(p, "while") ||
+                shell_starts_with_word(p, "until") ||
+                shell_starts_with_word(p, "case")) { compound++; continue; }
+            if (shell_starts_with_word(p, "fi")   ||
+                shell_starts_with_word(p, "done") ||
+                shell_starts_with_word(p, "esac")) {
+                if (compound > 0) compound--;
+                continue;
+            }
+            if (shell_group_open_at(p))  { brace++; continue; }
+            if (shell_group_close_at(p)) { if (brace > 0) brace--; continue; }
+        }
+        if (compound > 0 || brace > 0) continue;
+
+        if (*p == ';') {
+            if (p[1] == ';') { p++; continue; }      /* case clause end */
+            *link = SH_LINK_SEMI; *oplen = 1;
+            return p;
+        }
+        if (*p == '&' && p[1] == '&') { *link = SH_LINK_AND; *oplen = 2; return p; }
+        if (*p == '|' && p[1] == '|') { *link = SH_LINK_OR;  *oplen = 2; return p; }
+    }
+    return 0;
+}
+
+/* Returns false if `src` has no top-level separator, so the caller runs it
+ * exactly as it did before -- single-command lines take an identical path. */
+static bool shell_run_list_line(const char *src) {
+    enum shell_list_link link = SH_LINK_SEMI;
+    int oplen = 0;
+    if (!shell_find_list_sep(src, &link, &oplen)) return false;
+
+    const char *cur = src;
+    enum shell_list_link prev = SH_LINK_SEMI;
+    for (;;) {
+        link = SH_LINK_SEMI;
+        oplen = 0;
+        const char *sep = shell_find_list_sep(cur, &link, &oplen);
+        const char *end = sep ? sep : cur + strlen(cur);
+
+        /* Heap: execute_line_text recurses (a compound body re-enters it),
+         * and a kilobyte per level adds up fast on a kernel stack. */
+        char *seg = kmalloc(SHELL_PARSE_BUF_MAX);
+        if (!seg) {
+            kprintf("shell: out of memory\n");
+            shell_set_status(2);
+            return true;
+        }
+        if (shell_copy_segment(seg, SHELL_PARSE_BUF_MAX, cur, end) < 0) {
+            kfree(seg);
+            kprintf("shell: command too long\n");
+            shell_set_status(2);
+            return true;
+        }
+        if (*shell_skip_blanks(seg)) {
+            /* A skipped segment leaves the status alone, which is what makes
+             * `false && a && b` skip BOTH a and b rather than reconsidering. */
+            bool should_run = (prev == SH_LINK_SEMI) ||
+                              (prev == SH_LINK_AND && g_last_status == 0) ||
+                              (prev == SH_LINK_OR  && g_last_status != 0);
+            if (should_run) {
+                execute_line_text(seg);
+                if (g_shell_flow != SHELL_FLOW_NONE) { kfree(seg); return true; }
+            }
+        }
+        kfree(seg);
+        if (!sep) break;
+        prev = link;
+        cur = sep + oplen;
+    }
+    return true;
+}
+
+/* ---- pipelines whose stages are compound commands -----------------------
+ *
+ * POSIX 2.9.2 lets any pipeline stage be a compound command, and
+ * `cmd | while read l; do ...; done` is one of the most common shapes in real
+ * scripts. The token-level pipeline parser cannot express it: by the time it
+ * runs, `while` is just a word, so the stage was dispatched as a program and
+ * the shell reported `failed to spawn '/bin/while'`.
+ *
+ * So this catches such pipelines BEFORE tokenizing, where the stage is still
+ * text, and runs each stage through execute_line_text() with the pipe wired
+ * into the shell's own descriptors.
+ *
+ * Stages run SEQUENTIALLY -- stage N runs to completion, its write end is
+ * closed, then stage N+1 reads. That is the same shape the existing builtin
+ * pipeline stages already use, and it is bounded by the 64 KiB pipe buffer:
+ * a stage producing more than that before the next one starts would block.
+ * Real bash runs stages concurrently; this does not, and a genuinely
+ * streaming pipeline is the one case where the difference is observable.
+ */
+static const char *shell_find_pipe_at(const char *s) {
+    bool in_sq = false, in_dq = false, in_bt = false;
+    int paren = 0, compound = 0, brace = 0;
+    const char *start = s;
+
+    for (const char *p = s; *p; p++) {
+        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_dq = false;
+            continue;
+        }
+        if (in_bt) { if (*p == '`') in_bt = false; continue; }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'') { in_sq = true; continue; }
+        if (*p == '"')  { in_dq = true; continue; }
+        if (*p == '`')  { in_bt = true; continue; }
+        if (*p == '$' && p[1] == '(') { paren++; p++; continue; }
+        if (*p == '(') { paren++; continue; }
+        if (*p == ')') { if (paren > 0) paren--; continue; }
+        if (paren > 0) continue;
+
+        if (shell_word_boundary_before(start, p)) {
+            if (shell_starts_with_word(p, "if")    ||
+                shell_starts_with_word(p, "for")   ||
+                shell_starts_with_word(p, "while") ||
+                shell_starts_with_word(p, "until") ||
+                shell_starts_with_word(p, "case")) { compound++; continue; }
+            if (shell_starts_with_word(p, "fi")   ||
+                shell_starts_with_word(p, "done") ||
+                shell_starts_with_word(p, "esac")) {
+                if (compound > 0) compound--;
+                continue;
+            }
+            if (shell_group_open_at(p))  { brace++; continue; }
+            if (shell_group_close_at(p)) { if (brace > 0) brace--; continue; }
+        }
+        if (compound > 0 || brace > 0) continue;
+
+        if (*p == '|') {
+            if (p[1] == '|') { p++; continue; }   /* an OR, not a pipe */
+            return p;
+        }
+    }
+    return 0;
+}
+
+static bool shell_stage_is_compound(const char *s) {
+    s = shell_skip_blanks(s);
+    return shell_starts_with_word(s, "while") ||
+           shell_starts_with_word(s, "until") ||
+           shell_starts_with_word(s, "for")   ||
+           shell_starts_with_word(s, "if")    ||
+           shell_starts_with_word(s, "case")  ||
+           shell_group_open_at(s) || *s == '(';
+}
+
+/* Returns false when this is not a pipeline, or when no stage is compound --
+ * in which case the existing token-level path handles it exactly as before. */
+static bool shell_try_compound_pipeline(const char *src) {
+    if (!shell_find_pipe_at(src)) return false;
+
+    char (*stages)[SHELL_PARSE_BUF_MAX] =
+        kmalloc(sizeof(*stages) * SHELL_STAGE_MAX);
+    if (!stages) return false;
+
+    int n = 0;
+    bool any_compound = false, overflow = false;
+    const char *cur = src;
+    for (;;) {
+        const char *sep = shell_find_pipe_at(cur);
+        const char *end = sep ? sep : cur + strlen(cur);
+        if (n >= SHELL_STAGE_MAX) { overflow = true; break; }
+        if (shell_copy_segment(stages[n], SHELL_PARSE_BUF_MAX, cur, end) < 0) {
+            overflow = true;
+            break;
+        }
+        if (shell_stage_is_compound(stages[n])) any_compound = true;
+        n++;
+        if (!sep) break;
+        cur = sep + 1;
+    }
+    if (overflow || n < 2 || !any_compound) {
+        kfree(stages);
+        return false;
+    }
+
+    struct file *saved0 = g_shell_fd[0], *saved1 = g_shell_fd[1];
+    struct file *prev_in = 0;
+    int last = 0;
+
+    for (int i = 0; i < n; i++) {
+        struct file *r = 0, *w = 0;
+        if (i + 1 < n && pipe_create(&r, &w) != 0) {
+            kprintf("pipeline: pipe_create failed\n");
+            break;
+        }
+        if (prev_in) g_shell_fd[0] = prev_in;
+        if (w)       g_shell_fd[1] = w;
+
+        execute_line_text(stages[i]);
+        last = g_last_status;
+
+        g_shell_fd[0] = saved0;
+        g_shell_fd[1] = saved1;
+
+        /* Close the write end before the reader runs, or it never sees EOF. */
+        if (w) file_close(w);
+        if (prev_in) file_close(prev_in);
+        prev_in = r;
+
+        if (g_shell_flow != SHELL_FLOW_NONE) break;
+    }
+    if (prev_in) file_close(prev_in);
+
+    g_shell_fd[0] = saved0;
+    g_shell_fd[1] = saved1;
+    kfree(stages);
+    shell_set_status(last);
+    return true;
+}
+
 static void execute_line_text(const char *src) {
     struct shell_token tok[SHELL_TOKEN_MAX];
     char words[SHELL_PARSE_BUF_MAX];
@@ -9261,7 +10485,15 @@ static void execute_line_text(const char *src) {
     if (g_opt_verbose) kprintf("%s\n", src);
     shell_check_pending_signals();
     if (g_shell_flow != SHELL_FLOW_NONE) return;
+    /* Before tokenizing (which expands): split `;` / `&&` / `||` and run each
+     * piece on its own, so expansion happens per command. See above. This
+     * precedes the function-definition check so that `f() { ...; }; f` gives
+     * that check a clean definition rather than one with a call glued on. */
+    if (shell_run_list_line(src)) return;
     if (shell_try_function_definition(src)) return;
+    /* A pipeline with a compound stage must be split while the stages are
+     * still TEXT; the tokenizer would reduce `while` to an ordinary word. */
+    if (shell_try_compound_pipeline(src)) return;
     src = shell_expand_aliases(src, alias_buf, sizeof(alias_buf));
     if (!src) {
         shell_set_status(2);
@@ -9584,4 +10816,61 @@ void shell_poll(void) {
         line[line_len++] = ch;
         kputc(ch);
     }
+}
+
+/* ---- hosted entry points (userspace /bin/tsh) ---------------------------
+ *
+ * This file is compiled TWICE: once into the kernel, where the shell is
+ * driven by the keyboard poll loop above, and once into /bin/tsh, where it is
+ * driven by main() in programs/tsh/host.c. Same language, two hosts.
+ *
+ * That is the whole point. The language core here -- the tokenizer, the
+ * ${...} expansion family, the recursive-descent arithmetic evaluator,
+ * command substitution, globbing, functions, traps, here-documents -- took a
+ * long time to get right, and a second implementation in userspace would have
+ * been a second set of the same bugs. The userspace shell that existed before
+ * this proved the point: its parser had if/for/while/case, but the expansion
+ * layer underneath was mostly missing, and it scored 0/14 against real bash.
+ *
+ * Everything below is ADDITIVE. No existing function is modified and nothing
+ * is compiled out, so the kernel shell's behaviour is unchanged by
+ * construction -- these are simply three doors into machinery that was
+ * already here but only reachable from the keyboard loop.
+ *
+ * The host supplies the other side of the seam (kmalloc, vfs_*, proc_spawn,
+ * file_*, kprintf...). In the kernel those are the real subsystems; in
+ * userspace they are thin wrappers over libtoby syscalls. */
+
+/* Initialise shell state WITHOUT printing a banner or a prompt: a script run
+ * must not emit anything the oracle would not. */
+void shell_init_hosted(const char *argv0) {
+    line_len = 0;
+    line[0]  = '\0';
+    for (int i = 0; i < 3; i++) g_shell_fd[i] = 0;
+    env_init_defaults();
+    g_getopts_last_optind = 1;
+    g_getopts_char_index  = 1;
+    shell_trap_clear_all();
+    (void)shell_set_param0(argv0 ? argv0 : "tsh");
+    (void)shell_set_positional_params(0, 0);
+}
+
+/* Run a script file to completion; returns its exit status. */
+int shell_run_script_hosted(const char *path) {
+    return shell_run_script_path(path, true);
+}
+
+/* Run one command line (the `-c` form); returns its exit status. */
+int shell_run_line_hosted(const char *text) {
+    if (!text) return 0;
+    char *copy = shell_strdup(text);
+    if (!copy) return 2;
+    int rc = shell_run_script_text(copy, true);
+    kfree(copy);
+    return rc;
+}
+
+/* Set the positional parameters ($1..$n) from a hosted caller. */
+int shell_set_args_hosted(int argc, char **argv) {
+    return shell_set_positional_params(argc, argv);
 }

@@ -489,10 +489,10 @@ static long sys_pread64(int fd, void *buf, size_t len, int64_t offset) {
     if (f->kind != FILE_KIND_VFS) return -ABI_ESPIPE;
     void *k = kmalloc(len);
     if (!k) return -ABI_ENOMEM;
-    size_t saved = f->vfs.pos;
-    f->vfs.pos = (size_t)offset;
+    size_t saved = file_pos_get(f);
+    file_pos_set(f, (size_t)offset);
     long rv = file_read(f, k, len);
-    f->vfs.pos = saved;          /* positioned read must not move the offset */
+    file_pos_set(f, saved);      /* positioned read must not move the offset */
     if (rv > 0 && copy_to_user(buf, k, (size_t)rv) != 0) rv = -ABI_EFAULT;
     kfree(k);
     return rv;
@@ -507,10 +507,10 @@ static long sys_pwrite64(int fd, const void *buf, size_t len, int64_t offset) {
     if (f->kind != FILE_KIND_VFS) return -ABI_ESPIPE;
     void *k = bounce_in(buf, len);
     if (!k) return -ABI_EFAULT;
-    size_t saved = f->vfs.pos;
-    f->vfs.pos = (size_t)offset;
+    size_t saved = file_pos_get(f);
+    file_pos_set(f, (size_t)offset);
     long rv = file_write(f, k, len);
-    f->vfs.pos = saved;
+    file_pos_set(f, saved);
     kfree(k);
     return rv;
 }
@@ -2593,7 +2593,6 @@ static long sys_open(const char *path, int flags, int mode) {
     bool want_excl   = (flags & ABI_O_EXCL)  != 0;
     bool want_trunc  = (flags & ABI_O_TRUNC) != 0;
     bool want_append = (flags & ABI_O_APPEND)!= 0;
-    (void)want_append; /* honoured at write-time once we plumb seek */
 
     /* Optionally create. Returns EEXIST if O_EXCL set and present. */
     if (want_create) {
@@ -2635,9 +2634,13 @@ static long sys_open(const char *path, int flags, int mode) {
      * triggers the underlying vfs ops->close when it hits zero. We
      * allocate before vfs_open so the failure path doesn't have to
      * unwind a successfully-opened handle on a refcount OOM. */
-    f->vfs_refs = (int *)kmalloc(sizeof(int));
-    if (!f->vfs_refs) { kfree(f); return -ABI_ENOMEM; }
-    *f->vfs_refs = 1;
+    {
+        struct vfs_ofd *ofd = (struct vfs_ofd *)kmalloc(sizeof *ofd);
+        if (!ofd) { kfree(f); return -ABI_ENOMEM; }
+        ofd->refs = 1;
+        ofd->pos  = 0;
+        f->vfs_refs = &ofd->refs;   /* refs is first; see struct vfs_ofd */
+    }
 
     int rc = vfs_open(kpath, &f->vfs);
     if (rc != VFS_OK) {
@@ -2660,6 +2663,23 @@ static long sys_open(const char *path, int flags, int mode) {
     (void)access;
     f->o_accmode = flags & 3;    /* O_ACCMODE: O_RDONLY/O_WRONLY/O_RDWR for F_GETFL */
 
+    /* O_APPEND: start at end of file.
+     *
+     * This used to be parsed and then explicitly discarded ("honoured at
+     * write-time once we plumb seek"), so every `>>` wrote at offset 0 and
+     * OVERWROTE what it was supposed to append to. It is invisible in the
+     * usual test because `echo two >> f` replacing `one` leaves a file of the
+     * same length containing plausible content -- it surfaced only when the
+     * bash-parity gate ran `echo one > f1; echo two >> f1` under real GNU
+     * bash and the file came back holding just "two".
+     *
+     * Positioning at open is correct for the sequential single-writer case,
+     * which is what shells and log writers do. It is NOT the full atomic
+     * seek-to-end-per-write that two processes appending to one file need;
+     * that wants a flag in struct file, and changing that struct's layout
+     * requires a full rebuild of every object that includes it. */
+    if (want_append) file_pos_set(f, f->vfs.size);
+
     struct proc *p = current_proc();
     int fd = fd_alloc_into(p, f);
     if (fd < 0) {
@@ -2677,7 +2697,7 @@ static long sys_lseek(int fd, int64_t off, int whence) {
     struct file *f = fd_lookup(fd);
     if (!f) return -ABI_EBADF;
     if (f->kind != FILE_KIND_VFS) return -ABI_EINVAL;
-    int64_t cur  = (int64_t)f->vfs.pos;
+    int64_t cur  = (int64_t)file_pos_get(f);
     int64_t size = (int64_t)f->vfs.size;
     int64_t newp;
     switch (whence) {
@@ -2687,7 +2707,7 @@ static long sys_lseek(int fd, int64_t off, int whence) {
     default: return -ABI_EINVAL;
     }
     if (newp < 0) return -ABI_EINVAL;
-    f->vfs.pos = (size_t)newp;
+    file_pos_set(f, (size_t)newp);
     /* POSIX: seeking past EOF does NOT change the file size -- the file only
      * grows when bytes are actually written. (Was: bumped vfs.size to the seek
      * offset, a latent bug. It surfaced via SQLite's positioned reads: seeking
@@ -5413,14 +5433,14 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
                 size_t fill_from = before > page_off ? before : page_off;
                 size_t fill_to   = page_off + np;
                 if (fill_from < fill_to) {
-                    size_t save_pos = f->vfs.pos;
-                    f->vfs.pos = fill_from * PAGE_SIZE;
+                    size_t save_pos = file_pos_get(f);
+                    file_pos_set(f, fill_from * PAGE_SIZE);
                     for (size_t i = fill_from; i < fill_to; i++) {
                         void *dst = shm_cache_page_ptr(sc, i);
                         if (!dst) break;
                         if (file_read(f, dst, PAGE_SIZE) <= 0) break; /* EOF: stays zero */
                     }
-                    f->vfs.pos = save_pos;
+                    file_pos_set(f, save_pos);
                 }
                 long b = shm_cache_mmap(sc, addr, alen, prot,
                                         lx_mmap_flags(lflags), aoff);
@@ -5480,8 +5500,8 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
     uint8_t *kbuf = (uint8_t *)kmalloc(4096);
     if (!kbuf) { sys_munmap((uint64_t)base, len); return -ABI_ENOMEM; }
 
-    size_t save_pos = f->vfs.pos;
-    f->vfs.pos = offset;
+    size_t save_pos = file_pos_get(f);
+    file_pos_set(f, offset);
     uint64_t done = 0;
     while (done < len) {
         size_t want = (len - done) > 4096 ? 4096 : (size_t)(len - done);
@@ -5489,7 +5509,7 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
         if (got <= 0) break;                  /* EOF -> leave tail zeroed */
         if (copy_to_user((void *)((uint64_t)base + done), kbuf,
                          (size_t)got) != 0) {
-            kfree(kbuf); f->vfs.pos = save_pos;
+            kfree(kbuf); file_pos_set(f, save_pos);
             sys_munmap((uint64_t)base, len);
             return -ABI_EFAULT;
         }
@@ -5497,7 +5517,7 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
         if ((size_t)got < want) break;        /* short read == EOF */
     }
     kfree(kbuf);
-    f->vfs.pos = save_pos;
+    file_pos_set(f, save_pos);
 
     /* Tighten to the loader's requested protection (R-X for .text, etc.). */
     sys_mprotect((uint64_t)base, len, prot);

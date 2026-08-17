@@ -95,6 +95,13 @@ struct tmpfs_node {
     size_t        size, cap;
     uint32_t      uid, gid, mode;
     uint64_t      mtime, atime;
+    /* POSIX: unlink() removes the NAME; the file itself survives until
+     * the last open handle closes. Without this, `fd = open(t); unlink(t);
+     * read(fd)` -- which is how every mkstemp()/tmpfile() user, GNU bash
+     * here-documents included, makes a private temp file -- read back
+     * nothing, because unlink freed the data out from under the fd. */
+    int           open_count;
+    bool          unlinked;
 };
 
 struct tmpfs_mount {
@@ -125,7 +132,8 @@ static bool tnorm(const char *path, char *out, size_t cap)
 static struct tmpfs_node *tfind(struct tmpfs_mount *m, const char *norm)
 {
     for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
-        if (m->nodes[i].used && strcmp(m->nodes[i].path, norm) == 0)
+        if (m->nodes[i].used && !m->nodes[i].unlinked &&
+            strcmp(m->nodes[i].path, norm) == 0)
             return &m->nodes[i];
     return NULL;
 }
@@ -142,6 +150,22 @@ static const char *tchild_of(const char *dir, const char *norm)
     const char *rest = norm + dl + 1;
     if (!*rest) return NULL;
     return tchr(rest, '/') ? NULL : rest;
+}
+
+/* Free a node and its data, returning the slot to talloc(). The mount is
+ * found by pointer range so callers that only hold the node can reap. */
+static void treap(struct tmpfs_node *nd)
+{
+    if (!nd || !nd->used) return;
+    for (size_t i = 0; i < TMPFS_MAX_MOUNTS; i++) {
+        if (!g_tmpfs[i].used) continue;
+        if (nd >= g_tmpfs[i].nodes && nd < g_tmpfs[i].nodes + TMPFS_MAX_NODES) {
+            if (nd->data) g_tmpfs[i].bytes -= nd->cap;
+            break;
+        }
+    }
+    if (nd->data) kfree(nd->data);
+    memset(nd, 0, sizeof *nd);
 }
 
 static struct tmpfs_node *talloc(struct tmpfs_mount *m)
@@ -177,6 +201,7 @@ static int tmpfs_open(void *mnt, const char *path, struct vfs_file *out)
     struct tmpfs_node *nd = tfind(m, norm);
     if (!nd) return VFS_ERR_NOENT;
     if (nd->type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
+    nd->open_count++;
     out->priv = nd;
     out->pos  = 0;
     out->size = nd->size;
@@ -186,7 +211,15 @@ static int tmpfs_open(void *mnt, const char *path, struct vfs_file *out)
     return VFS_OK;
 }
 
-static int tmpfs_close(struct vfs_file *f) { (void)f; return VFS_OK; }
+/* Releasing the last handle on an unlinked node is what finally frees it. */
+static int tmpfs_close(struct vfs_file *f)
+{
+    struct tmpfs_node *nd = f ? f->priv : 0;
+    if (!nd || !nd->used) return VFS_OK;
+    if (nd->open_count > 0) nd->open_count--;
+    if (nd->unlinked && nd->open_count == 0) treap(nd);
+    return VFS_OK;
+}
 
 static long tmpfs_read(struct vfs_file *f, void *buf, size_t n)
 {
@@ -307,8 +340,14 @@ static int tmpfs_unlink(void *mnt, const char *path)
         for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
             if (m->nodes[i].used && tchild_of(norm, m->nodes[i].path))
                 return VFS_ERR_EXIST;   /* ENOTEMPTY has no VFS code here */
-    if (nd->data) { m->bytes -= nd->cap; kfree(nd->data); }
-    memset(nd, 0, sizeof *nd);
+    /* Still open: drop the name now, keep the bytes until the last close.
+     * The slot stays `used` so talloc() cannot hand it out underneath the
+     * handles that still point at it. */
+    if (nd->open_count > 0) {
+        nd->unlinked = true;
+        return VFS_OK;
+    }
+    treap(nd);
     return VFS_OK;
 }
 

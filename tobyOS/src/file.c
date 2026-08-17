@@ -559,6 +559,46 @@ void file_close(struct file *f) {
     kfree(f);
 }
 
+/* ---- shared offset (see struct vfs_ofd in file.h) ------------------------ */
+
+static struct vfs_ofd *file_ofd(struct file *f) {
+    /* Only VFS handles carry a description; refs is the first member, so the
+     * pointer the rest of the kernel knows as `int *vfs_refs` IS the struct. */
+    if (!f || f->kind != FILE_KIND_VFS || !f->vfs_refs) return 0;
+    return (struct vfs_ofd *)(void *)f->vfs_refs;
+}
+
+/* In the kernel all three standard descriptors are the same console, so the
+ * fd number does not select anything -- but the CALLER still needs a real
+ * object to clone. See file_std_handle() in file.h. */
+struct file *file_std_handle(int fd) {
+    (void)fd;
+    return console_file_make();
+}
+
+size_t file_pos_get(struct file *f) {
+    struct vfs_ofd *o = file_ofd(f);
+    return o ? o->pos : (f ? f->vfs.pos : 0);
+}
+
+void file_pos_set(struct file *f, size_t pos) {
+    if (!f) return;
+    struct vfs_ofd *o = file_ofd(f);
+    if (o) o->pos = pos;
+    f->vfs.pos = pos;          /* keep the embedded copy consistent */
+}
+
+/* The driver advances the cursor it is handed, so load the shared offset
+ * before the call and store the advanced value back after it. */
+static void file_pos_load(struct file *f) {
+    struct vfs_ofd *o = file_ofd(f);
+    if (o) f->vfs.pos = o->pos;
+}
+static void file_pos_store(struct file *f) {
+    struct vfs_ofd *o = file_ofd(f);
+    if (o) o->pos = f->vfs.pos;
+}
+
 long file_read(struct file *f, void *buf, size_t n) {
     if (!f || !buf) return -1;
     if (n == 0) return 0;
@@ -591,9 +631,13 @@ long file_read(struct file *f, void *buf, size_t n) {
         return (long)n;                            /* never short, never blocks */
     case FILE_KIND_PIPE_R:
         return pipe_read(f->pipe, buf, n);
-    case FILE_KIND_VFS:
+    case FILE_KIND_VFS: {
         if (!f->vfs.ops || !f->vfs.ops->read) return -1;
-        return f->vfs.ops->read(&f->vfs, buf, n);
+        file_pos_load(f);
+        long r = f->vfs.ops->read(&f->vfs, buf, n);
+        file_pos_store(f);
+        return r;
+    }
     case FILE_KIND_SOCKET:
         /* Non-blocking socket with nothing to read: EAGAIN, never park. Chrome
          * reads its TCP sockets with plain read() (not recv), so the check has
@@ -667,9 +711,13 @@ long file_write(struct file *f, const void *buf, size_t n) {
         return (long)n;
     case FILE_KIND_PIPE_W:
         return pipe_write(f->pipe, buf, n);
-    case FILE_KIND_VFS:
+    case FILE_KIND_VFS: {
         if (!f->vfs.ops || !f->vfs.ops->write) return -1;
-        return f->vfs.ops->write(&f->vfs, buf, n);
+        file_pos_load(f);
+        long w = f->vfs.ops->write(&f->vfs, buf, n);
+        file_pos_store(f);
+        return w;
+    }
     case FILE_KIND_SOCKET:
         /* Connected TCP byte stream: write() == send(). A connect()-ed UDP
          * socket sends a datagram to its peer. */

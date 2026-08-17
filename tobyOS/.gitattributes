@@ -1,0 +1,8 @@
+# Shell scripts must reach the guest with LF endings.
+#
+# core.autocrlf is on for this checkout, and a corpus case checked out with
+# CRLF fails INSIDE tobyOS in a way that looks like a shell bug: the guest's
+# bash sees the stray CR and exits 2 with a syntax error, while MSYS bash on
+# the host tolerates it and reports the same file as fine. That cost a full
+# build-and-boot cycle to track down once already.
+*.sh text eol=lf

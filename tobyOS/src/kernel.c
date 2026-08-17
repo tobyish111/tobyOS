@@ -3972,6 +3972,27 @@ void _start(void) {
     unix_socket_init();      /* Phase 1 M1.4: Unix domain sockets */
     sysfs_init();            /* Phase 1 M1.5: sysfs virtual filesystem */
     cgroup_init();           /* Slice 15: cgroup v2 hierarchy */
+
+    /* A writable /tmp. POSIX programs assume one exists, and until now none
+     * did: the root filesystem is the read-only initrd ramfs, whose create
+     * hook returns ROFS for any path that is not already in the tar, so
+     * nothing anywhere could make a temp file.
+     *
+     * The bash-parity gate is what surfaced it. GNU bash implements a
+     * here-document by writing the body to a temp file and reading it back;
+     * with no writable /tmp that silently produced truncated garbage, so the
+     * ORACLE was wrong and a correct tsh looked like the failure. Every
+     * ported program that calls tmpfile()/mkstemp() had the same problem.
+     *
+     * tmpfs has been in the tree since slice 5 and was reachable only through
+     * mount(2) -- a working filesystem nothing had mounted. */
+    {
+        extern int tmpfs_mount_at(const char *path, const char *opts);
+        int rc = tmpfs_mount_at("/tmp", 0);
+        kprintf("[boot] /tmp: %s\n",
+                rc == VFS_OK ? "tmpfs mounted (writable)"
+                             : "MOUNT FAILED -- temp files will not work");
+    }
     cgroup_mount();          /* ...and cgroupfs at /sys/fs/cgroup (nests in /sys) */
     aslr_init();             /* Phase 7 M7.1: address space layout randomization */
     oom_init();              /* Phase 1: OOM killer -- see the idle-loop check */
@@ -8670,6 +8691,40 @@ void _start(void) {
             kprintf("[REALTOOL] VERDICT: %s pass=%d/%d (UNMODIFIED GNU binutils "
                     "readelf: glibc ld.so + getopt + file mmap + ELF parse)\n",
                     (tpass == trun && trun > 0) ? "PASS" : "FAIL", tpass, trun);
+    }
+#endif
+
+#ifdef SHPARITY_BOOT
+    /* The bash-parity gate. tobyOS's shell is meant to be a SUPERSET of bash
+     * -- every bash script runs unchanged and produces the same bytes -- and
+     * this is what turns that from a claim into a measured property.
+     *
+     * The oracle is not a spec we interpret: it is the UNMODIFIED GNU bash 5.2
+     * already in the initrd (see REALBASH_BOOT below). /bin/shparity runs each
+     * /etc/shparity/*.sh case under both bash and /bin/tsh and diffs stdout +
+     * exit status. All the interesting logic is in userspace where it can be
+     * extended without a kernel rebuild; the kernel's whole job is to spawn it
+     * and let its verdict reach the serial log.
+     *
+     * Needs a writable /data (tobyfs) for scratch -- the root ramfs cannot
+     * create files. shparity reports SKIP with the reason if it is missing,
+     * so a QEMU run without a disk is loud rather than falsely green. */
+    {
+        char *argv[] = { (char *)"shparity", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/shparity", .name = "shparity",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] SHPARITY: differential bash-parity gate\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[SHPARITY] VERDICT: SKIP reason=no-binary "
+                    "(/bin/shparity not staged)\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] SHPARITY: gate (pid=%d) exit=%d\n", pid, rc);
+        }
     }
 #endif
 

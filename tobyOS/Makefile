@@ -507,6 +507,8 @@ PROGRAMS := programs/hello/hello.elf \
             programs/pkgmgr/pkgmgr.elf \
             programs/init/init.elf \
             programs/sh/sh.elf \
+            programs/shparity/shparity.elf \
+            programs/tsh/tsh.elf \
             programs/devmgr/devmgr.elf \
             programs/indexer/indexer.elf \
             programs/updater/updater.elf \
@@ -534,6 +536,12 @@ PROGRAMS := programs/hello/hello.elf \
 # is what Limine ships as a module.
 INITRD_STAGE := build/initrd
 INITRD_TAR   := build/initrd.tar
+
+# Bash-parity corpus. Wildcarded on purpose -- this is the ONE place the
+# initrd's otherwise-explicit file list uses a glob, because the corpus is
+# meant to grow a case at a time and a case that silently failed to ship
+# would show up as a PASS. The tar list globs the staged copies to match.
+SHPARITY_CASES := $(wildcard initrd/etc/shparity/*.sh)
 
 # ---------- Disk image (tobyfs, milestone 6) ----------
 #
@@ -1573,6 +1581,39 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,pkgmgr,pkgmgr))
 
 # ---------- Advanced userland: shell, utilities, networking, GUI ----------
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_sh,user_sh))
+# /bin/shparity -- the bash-parity gate. Runs every /etc/shparity/*.sh case
+# under BOTH the real GNU bash 5.2 we already ship and /bin/tsh, and requires
+# byte-identical stdout plus an identical exit status. See programs/shparity.
+$(eval $(call LIBTOBY_PROGRAM_RULES,shparity,shparity))
+
+# ---------- /bin/tsh: the shell language, hosted in userspace ----------
+#
+# src/shell.c is compiled TWICE -- once into the kernel (where the keyboard
+# poll loop drives it) and once here, where programs/tsh/host.c does. One
+# language implementation, two hosts, so the expansion/arithmetic/glob core
+# cannot drift between the kernel shell and /bin/tsh.
+#
+# The kernel object and this one are built from the same file with different
+# flags into DIFFERENT output paths, so neither can clobber the other. Note
+# -I include: shell.c speaks the kernel's headers (vfs.h, proc.h, file.h) and
+# the host implements that interface rather than the other way round.
+TSH_OBJS := programs/tsh/shell_hosted.o \
+            programs/tsh/host.o \
+            programs/tsh/kstubs.o
+
+# -DSHELL_HOSTED: userspace exposes only the POSIX/bash builtin set, so the
+# kernel shell's convenience builtins (cat, ls, mkdir, ...) stop shadowing the
+# real utilities in /bin. See shell_hosted_builtin() in src/shell.c.
+programs/tsh/shell_hosted.o: src/shell.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -DSHELL_HOSTED -c $< -o $@
+
+programs/tsh/%.o: programs/tsh/%.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/tsh/tsh.elf: $(TSH_OBJS) $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                      programs/tsh/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/tsh/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) $(TSH_OBJS) $(LIBTOBY_AR)
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_pkg,user_pkg))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_svcctl,user_svcctl))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ps,user_ps))
@@ -2627,7 +2668,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                $(HELLOAPP_TPKG_SIGNED) $(HELLOAPP_TPKG_SIG_UNKNOWN) \
                $(HELLOAPP_TPKG_SIG_TAMPER) \
                $(HELLOAPP_TPKG_CAPS_RO) \
-               initrd/m36/m36_part2.c initrd/m36/m36_sample.c initrd/m36/Tobyfile
+               initrd/m36/m36_part2.c initrd/m36/m36_sample.c initrd/m36/Tobyfile \
+               $(SHPARITY_CASES)
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)/bin $(INITRD_STAGE)/etc $(INITRD_STAGE)/repo $(INITRD_STAGE)/lib \
 	         $(INITRD_STAGE)/system/keys $(INITRD_STAGE)/m36
@@ -2804,6 +2846,14 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/tobybuild/tobybuild.elf             $(INITRD_STAGE)/bin/tobybuild
 	cp programs/selfhosttest/selfhosttest.elf       $(INITRD_STAGE)/bin/selfhosttest
 	cp programs/user_sh/user_sh.elf                 $(INITRD_STAGE)/bin/sh
+# /bin/tsh -- the tobyOS shell language hosted in userspace: src/shell.c
+# compiled a second time against programs/tsh/host.c. It replaced
+# programs/sh/sh.elf here, which had a parser but almost no expansion layer
+# and scored 0/14 against real bash. /bin/sh (programs/user_sh) is untouched.
+	cp programs/tsh/tsh.elf                         $(INITRD_STAGE)/bin/tsh
+	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
+	mkdir -p $(INITRD_STAGE)/etc/shparity
+	cp initrd/etc/shparity/*.sh                     $(INITRD_STAGE)/etc/shparity/
 	cp programs/user_pkg/user_pkg.elf               $(INITRD_STAGE)/bin/pkg
 	cp programs/user_svcctl/user_svcctl.elf         $(INITRD_STAGE)/bin/svcctl
 	cp programs/user_ps/user_ps.elf                 $(INITRD_STAGE)/bin/ps
@@ -3367,6 +3417,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/sigtest bin/mctest bin/reclaimtest bin/tobycc bin/tobybuild bin/selfhosttest \
     bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
+	    bin/tsh bin/shparity                                              \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    $$EXTRA_FILES                                                     \
 	  && tar --format=ustar --mode=0644 \
@@ -3388,6 +3439,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/audiotone.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
+	    etc/shparity/*.sh \
 	    readme.txt
 
 # ---------- Build ISO ----------
@@ -4987,6 +5039,7 @@ clean:
 	       programs/crashinfo/crashinfo.o programs/crashinfo/crashinfo.elf \
 	       programs/wdogtest/wdogtest.o programs/wdogtest/wdogtest.elf \
 	       programs/safesh/safesh.o programs/safesh/safesh.elf \
+	       programs/shparity/shparity.o programs/shparity/shparity.elf \
 	       programs/fscheck/fscheck.o programs/fscheck/fscheck.elf \
 	       programs/services/services.o programs/services/services.elf \
 	       programs/svc_crasher/svc_crasher.o programs/svc_crasher/svc_crasher.elf \
