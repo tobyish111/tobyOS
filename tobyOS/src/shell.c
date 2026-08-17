@@ -327,7 +327,10 @@ static void jobs_reap_finished(void) {
  *   SHELL=tobysh
  */
 
-#define ENV_MAX 32
+/* Shell variables plus exported environment share this table. 32 was small
+ * enough that an ordinary script -- let alone the conformance suite -- ran it
+ * out and started failing assignments. */
+#define ENV_MAX 128
 #define SHELL_READONLY_MAX 16
 
 static char *g_env[ENV_MAX + 1];     /* +1 reserved for NULL terminator */
@@ -7299,10 +7302,26 @@ static const char *shell_expand_aliases(const char *src, char *buf,
             return 0;
         }
         cur = dst;
-        if (!changed) return cur;
+        if (!changed) break;
+        if (pass == 7) {
+            kprintf("alias: recursive expansion limit reached\n");
+            return 0;
+        }
     }
-    kprintf("alias: recursive expansion limit reached\n");
-    return 0;
+
+    /* The ping-pong above can leave the result in `tmp`, which dies with this
+     * frame -- returning it handed the caller freed stack. Every alias use
+     * settles on an odd pass (one to substitute, one to confirm nothing else
+     * changed), so that was the common case, not the rare one. */
+    if (cur != buf) {
+        size_t n = strlen(cur);
+        if (n + 1 > cap) {
+            kprintf("alias: expansion too long\n");
+            return 0;
+        }
+        memcpy(buf, cur, n + 1);
+    }
+    return buf;
 }
 
 static bool shell_is_list_sep(enum shell_tok_type t) {

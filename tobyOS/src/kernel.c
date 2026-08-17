@@ -1787,6 +1787,157 @@ static void posix_shell_selftest(void) {
         "echo POSIXSH: noglob2=*",
         "set +f",
 
+        /* --- POSIX conformance, second pass --- */
+
+        /* while loop */
+        "PXI=0",
+        "while test $PXI -lt 3; do PXI=$((PXI+1)); done",
+        "echo POSIXSH: while=$PXI",
+
+        /* each command in a `;` list is expanded when it runs, not up front */
+        "PXORD=1; echo POSIXSH: order=$PXORD",
+
+        /* aliases actually expand at the point of use */
+        "alias pxa='echo POSIXSH: alias2-ok'",
+        "pxa",
+        "unalias pxa",
+
+        /* ${var?word} / ${var-word} / the colon distinction */
+        "unset PXNO",
+        "sh -c 'echo ${PXNO?boom}'",
+        "echo POSIXSH: qmark-status=$?",
+        "echo POSIXSH: nocolon-dash=${PXNO-alt}",
+        "PXE=",
+        "echo POSIXSH: empty-dash=[${PXE-alt}] empty-colon=[${PXE:-alt}]",
+
+        /* nested command substitution */
+        "echo POSIXSH: nest=$(echo $(echo deep))",
+
+        /* arithmetic: bit ops, shifts (the `<<` here must NOT start a
+         * here-document), division, modulo, unary minus */
+        "echo POSIXSH: bits=$((6&3))-$((6|3))-$((6^3))-$((1<<4))-$((256>>4))",
+        "echo POSIXSH: bitnot=$((~0))",
+        "echo POSIXSH: math=$((-5+2))-$((7/2))-$((7%3))",
+        "echo POSIXSH: arith-cs=$(( $(echo 5) + 1 ))",
+        "PXN=7",
+        "echo POSIXSH: arith-brace=$(( ${PXN} * 2 ))",
+
+        /* test / [ */
+        "test -n abc && test -z '' && echo POSIXSH: test-nz-ok",
+        "test 3 -eq 3 && test 3 -ne 4 && test 3 -lt 4 && test 4 -le 4 && test 5 -gt 4 && test 5 -ge 5 && echo POSIXSH: test-int-ok",
+        "[ 1 = 1 -a 2 = 2 ] && [ 1 = 2 -o 2 = 2 ] && [ ! 1 = 2 ] && echo POSIXSH: test-logic-ok",
+        "[ \\( 1 = 2 \\) -o \\( 3 = 3 \\) ] && echo POSIXSH: test-paren-ok",
+        "test -f /data/posixsh_a.txt && test -d /data && test -e /data && test -r /data/posixsh_a.txt && echo POSIXSH: test-file-ok",
+
+        /* cd - and OLDPWD */
+        "cd /data",
+        "cd -",
+        "echo POSIXSH: cd-dash=$PWD oldpwd=$OLDPWD",
+
+        /* "$@" is one field per parameter; $V splits, "$V" does not */
+        "sh -c 'for a in \"$@\"; do echo POSIXSH: qat-[$a]; done' x 'a b' c",
+        "sh -c 'for a; do echo POSIXSH: impl-[$a]; done' x 'd e' f",
+        "sh -c 'set --; for a in \"$@\"; do echo POSIXSH: empty-at-bad; done; echo POSIXSH: empty-at-ok'",
+        "sh -c 'set -- p1 \"p 2\"; c_args \"$@\"'",
+        "PXV='x y z'",
+        "for a in $PXV; do echo POSIXSH: split-[$a]; done",
+        "for a in \"$PXV\"; do echo POSIXSH: nosplit-[$a]; done",
+        "set -- outer1 outer2",
+        "echo POSIXSH: star-count=${#*} at-count=${#@}",
+
+        /* printf: integer flags, string precision, format reuse */
+        "printf 'POSIXSH: pf1=%d|%s|%c|%x|%o|%5s|%-5s|%.2s|%%\\n' 42 str Z 255 8 ab ab abcdef",
+        "printf 'POSIXSH: pf2=%u|%+d|% d|%#x|%#o|%.5d|%*d|%-*d|\\n' 42 7 7 255 8 42 5 42 5 42",
+        "printf 'POSIXSH: pf-reuse=%s.' a b c; echo",
+
+        /* printf floating point (no FPU in the kernel: decimal digits) */
+        "printf 'POSIXSH: pff=[%f][%.2f][%8.2f][%-8.2f][%.3f][%.1f]\\n' 3.14159 3.14159 3.14159 3.14159 0.0005 99.95",
+        "printf 'POSIXSH: pfe=[%e][%.2e][%E]\\n' 1234.5 1234.5 0.00012",
+        "printf 'POSIXSH: pfg=[%g][%g][%g][%.3g]\\n' 0.0001 100000 1234567 1234.5",
+
+        /* pathname expansion: bracket class and negation */
+        "echo POSIXSH: glob-cls /data/posixsh_[ab].txt",
+        "echo POSIXSH: glob-neg /data/posixsh_[!b].txt",
+
+        /* case patterns */
+        "case abc in a?c) echo POSIXSH: case-q-ok ;; *) echo POSIXSH: case-q-bad ;; esac",
+        "case b in [abc]) echo POSIXSH: case-cls-ok ;; *) echo POSIXSH: case-cls-bad ;; esac",
+        "case d in [!abc]) echo POSIXSH: case-neg-ok ;; *) echo POSIXSH: case-neg-bad ;; esac",
+        "echo POSIXSH: case-sub=$(case abc in a*) echo yes ;; *) echo no ;; esac)",
+
+        /* `if ...; fi` with no blank before the semicolon, and nesting */
+        "if true; then echo POSIXSH: plain-if; fi",
+        "if false; then echo POSIXSH: plain-bad; else echo POSIXSH: plain-else; fi",
+        "if false; then echo POSIXSH: plain-bad2; elif true; then echo POSIXSH: plain-elif; else echo POSIXSH: plain-bad3; fi",
+        "if true; then if true; then echo POSIXSH: nested-if; fi; fi",
+
+        /* descriptors above 2 */
+        "rm /data/px_fd3.txt",
+        "exec 3>/data/px_fd3.txt",
+        "echo POSIXSH: fd3-line >&3",
+        "exec 3>&-",
+        "cat /data/px_fd3.txt",
+        "exec 4</data/px_fd3.txt",
+        "read PXL <&4",
+        "echo POSIXSH: fd4-read=$PXL",
+        "exec 4<&-",
+        "sh -c 'exec 5>/data/px_fd5.txt; echo POSIXSH: fd5-ok >&5; exec 5>&-'",
+        "cat /data/px_fd5.txt",
+
+        /* noclobber */
+        "rm /data/px_clob.txt",
+        "set -C",
+        "echo POSIXSH: clobber1 >/data/px_clob.txt",
+        "echo POSIXSH: clobber-bad >/data/px_clob.txt",
+        "echo POSIXSH: noclobber-status=$?",
+        "echo POSIXSH: clobber-force >|/data/px_clob.txt",
+        "cat /data/px_clob.txt",
+        "set +C",
+
+        /* redirections on compound commands */
+        "rm /data/px_lines.txt",
+        "printf 'one\\ntwo\\nthree\\n' >/data/px_lines.txt",
+        "sh /data/px_while_read.sh",
+        "echo POSIXSH: while-read-status=$?",
+        "for i in 1 2; do echo POSIXSH: forredir-$i; done >/data/px_forredir.txt",
+        "cat /data/px_forredir.txt",
+        "if true; then echo POSIXSH: ifredir; fi >/data/px_ifredir.txt",
+        "cat /data/px_ifredir.txt",
+        "case x in x) echo POSIXSH: caseredir ;; esac >/data/px_caseredir.txt",
+        "cat /data/px_caseredir.txt",
+
+        /* read -r vs read */
+        "sh /data/px_read_r.sh",
+
+        /* `.` passes positional parameters */
+        "write /data/px_dot.sh 'echo POSIXSH: dot-$#-$1'",
+        ". /data/px_dot.sh alpha beta",
+
+        /* functions get their own positional parameters */
+        "pxfn() { echo POSIXSH: fn-$#-$1-$2; }",
+        "set -- outer1 outer2",
+        "pxfn inner1 inner2",
+        "echo POSIXSH: fn-restore=$#-$1",
+
+        /* umask, ulimit, set +o, kill -l, $LINENO */
+        "umask 022",
+        "echo POSIXSH: umask=$(umask)",
+        "echo POSIXSH: ulimit=$(ulimit)",
+        "set +o",
+        "echo POSIXSH: killl-name=$(kill -l 9) num=$(kill -l TERM)",
+        "sh /data/px_lineno.sh",
+
+        /* traps by signal name */
+        "trap 'echo POSIXSH: trap-hup' HUP",
+        "trap",
+        "trap - HUP",
+
+        /* pipeline status is the last stage's */
+        "true | false",
+        "echo POSIXSH: pipe-status=$?",
+        "false | true",
+        "echo POSIXSH: pipe-status2=$?",
+
         "echo POSIXSH: done",
         0
     };
@@ -1844,6 +1995,26 @@ static void posix_shell_selftest(void) {
         "echo POSIXSH: cont2=$R\n";
     hrc = vfs_write_all("/data/posixsh_cont_n.sh",
                         cont_n_script, strlen(cont_n_script));
+
+    static const char px_while_read[] =
+        "while read L; do echo POSIXSH: wr-$L; done </data/px_lines.txt\n";
+    hrc = vfs_write_all("/data/px_while_read.sh", px_while_read,
+                        strlen(px_while_read));
+
+    static const char px_read_r[] =
+        "read R </data/px_rr.txt\n"
+        "echo POSIXSH: read-noopt=$R\n"
+        "read -r R </data/px_rr.txt\n"
+        "echo POSIXSH: read-r=$R\n";
+    hrc = vfs_write_all("/data/px_read_r.sh", px_read_r, strlen(px_read_r));
+
+    static const char px_rr_data[] = "a\\tb\n";
+    hrc = vfs_write_all("/data/px_rr.txt", px_rr_data, strlen(px_rr_data));
+
+    static const char px_lineno[] =
+        "echo POSIXSH: lineno1=$LINENO\n"
+        "echo POSIXSH: lineno2=$LINENO\n";
+    hrc = vfs_write_all("/data/px_lineno.sh", px_lineno, strlen(px_lineno));
 
     kprintf("[boot] POSIXSH: starting shell compatibility smoke\n");
     for (int i = 0; lines[i]; i++) {

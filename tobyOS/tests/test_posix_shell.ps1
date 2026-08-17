@@ -192,12 +192,93 @@ $required = @(
     'POSIXSH: printf-b=tab',
     'POSIXSH: noglob2=*',
     'POSIXSH: done',
-    'POSIXSH: PASS'
+    'POSIXSH: PASS',
+
+    # --- POSIX conformance, second pass ---
+    'POSIXSH: while=3',
+    'POSIXSH: order=1',
+    'POSIXSH: alias2-ok',
+    'POSIXSH: qmark-status=2',
+    'POSIXSH: nocolon-dash=alt',
+    'POSIXSH: empty-dash=[] empty-colon=[alt]',
+    'POSIXSH: nest=deep',
+    'POSIXSH: bits=2-7-5-16-16',
+    'POSIXSH: bitnot=-1',
+    'POSIXSH: math=-3-3-1',
+    'POSIXSH: arith-cs=6',
+    'POSIXSH: arith-brace=14',
+    'POSIXSH: test-nz-ok',
+    'POSIXSH: test-int-ok',
+    'POSIXSH: test-logic-ok',
+    'POSIXSH: test-paren-ok',
+    'POSIXSH: test-file-ok',
+    'POSIXSH: cd-dash=/ oldpwd=/data',
+    'POSIXSH: qat-[a b]',
+    'POSIXSH: qat-[c]',
+    'POSIXSH: impl-[d e]',
+    'POSIXSH: impl-[f]',
+    'POSIXSH: empty-at-ok',
+    'POSIXSH: split-[x]',
+    'POSIXSH: split-[y]',
+    'POSIXSH: split-[z]',
+    'POSIXSH: nosplit-[x y z]',
+    'POSIXSH: star-count=2 at-count=2',
+    'POSIXSH: pf1=42|str|Z|ff|10|   ab|ab   |ab|%',
+    'POSIXSH: pf2=42|+7| 7|0xff|010|00042|   42|42   |',
+    'POSIXSH: pf-reuse=a.POSIXSH: pf-reuse=b.POSIXSH: pf-reuse=c.',
+    'POSIXSH: pff=[3.141590][3.14][    3.14][3.14    ][0.001][100.0]',
+    'POSIXSH: pfe=[1.234500e+03][1.23e+03][1.200000E-04]',
+    'POSIXSH: pfg=[0.0001][100000][1.23457e+06][1.23e+03]',
+    'POSIXSH: glob-cls /data/posixsh_a.txt /data/posixsh_b.txt',
+    'POSIXSH: glob-neg /data/posixsh_a.txt',
+    'POSIXSH: case-q-ok',
+    'POSIXSH: case-cls-ok',
+    'POSIXSH: case-neg-ok',
+    'POSIXSH: case-sub=yes',
+    'POSIXSH: plain-if',
+    'POSIXSH: plain-else',
+    'POSIXSH: plain-elif',
+    'POSIXSH: nested-if',
+    'POSIXSH: fd3-line',
+    'POSIXSH: fd4-read=POSIXSH: fd3-line',
+    'POSIXSH: fd5-ok',
+    'POSIXSH: noclobber-status=1',
+    'POSIXSH: clobber-force',
+    'POSIXSH: wr-one',
+    'POSIXSH: wr-two',
+    'POSIXSH: wr-three',
+    'POSIXSH: while-read-status=0',
+    'POSIXSH: forredir-1',
+    'POSIXSH: forredir-2',
+    'POSIXSH: ifredir',
+    'POSIXSH: caseredir',
+    'POSIXSH: read-noopt=atb',
+    'POSIXSH: read-r=a\tb',
+    'POSIXSH: dot-2-alpha',
+    'POSIXSH: fn-2-inner1-inner2',
+    'POSIXSH: fn-restore=2-outer1',
+    'POSIXSH: umask=0022',
+    'POSIXSH: ulimit=unlimited',
+    'set +o allexport',
+    'set +o xtrace',
+    'POSIXSH: killl-name=KILL num=15',
+    'POSIXSH: lineno1=1',
+    'POSIXSH: lineno2=2',
+    "trap -- 'echo POSIXSH: trap-hup' HUP",
+    'POSIXSH: pipe-status=1',
+    'POSIXSH: pipe-status2=0'
 )
+
+# The harness echoes every command line it drives ("[shell-test] $ ..."), and
+# those echoes contain the very sentinels the commands are supposed to PRINT.
+# Matching against them turns a broken feature into a green check -- that is
+# how `POSIXSH: if-ok` and `POSIXSH: alias-ok` passed while `if ...; fi` and
+# alias expansion were both broken. Assert against real output only.
+$out = ($txt -split "`n" | Where-Object { $_ -notmatch '\[shell-test\] \$ ' }) -join "`n"
 
 $missing = @()
 foreach ($pat in $required) {
-    if ($txt -notmatch [regex]::Escape($pat)) { $missing += $pat }
+    if ($out -notmatch [regex]::Escape($pat)) { $missing += $pat }
 }
 if ($txt -match '(?m)^POSIXSH: if-bad') { $missing += 'unexpected POSIXSH: if-bad' }
 if ($txt -match '(?m)^POSIXSH: elif-bad') { $missing += 'unexpected POSIXSH: elif-bad' }
@@ -211,7 +292,7 @@ if ($txt -match '(?m)^POSIXSH: subshell-alias-bad') { $missing += 'unexpected PO
 if ($txt -match '(?m)^POSIXSH: subshell-function-bad') { $missing += 'unexpected POSIXSH: subshell-function-bad' }
 if ($txt -match '(?m)^POSIXSH: subshell-exit-bad') { $missing += 'unexpected POSIXSH: subshell-exit-bad' }
 if ($txt -match '(?m)^POSIXSH: errexit-bad') { $missing += 'unexpected POSIXSH: errexit-bad' }
-if ($txt -notmatch 'posixsh_a\.txt' -or $txt -notmatch 'posixsh_b\.txt') {
+if ($out -notmatch 'posixsh_a\.txt' -or $out -notmatch 'posixsh_b\.txt') {
     $missing += 'glob expansion did not show both posixsh files'
 }
 
