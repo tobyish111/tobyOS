@@ -312,7 +312,28 @@ static void net_warm_gateway_arp(struct net_dev *nd) {
     net_warm_arp(nd, g_gateway_ip, "gateway");
     /* Skip when DNS is the same host as the gateway (typical home router). */
     if (g_my_dns_be && g_my_dns_be != g_gateway_ip) {
-        net_warm_arp(nd, g_my_dns_be, "dns    ");
+        /* SLICE 132: ...and skip when DNS is OFF-SUBNET, because ARPing it is
+         * asking a question no one on this link can answer. The EliteDesk's
+         * DHCP lease hands out a PUBLIC resolver (ip=192.168.68.77/22, dns=
+         * 209.18.47.61), so this burned the full NET_ARP_WARM_MS and then
+         * printed "WARN: dns ... did not respond to ARP", which reads like
+         * broken DNS. It is not: ip_send already routes off-subnet traffic via
+         * the gateway (see the netmask test in ip.c), and the gateway's ARP is
+         * warmed just above -- so the useful cache entry was already there.
+         *
+         * QEMU CANNOT SHOW THIS. SLIRP hands out 10.0.2.3, which is inside the
+         * guest's own /24, so the direct ARP always succeeded and the branch
+         * looked correct for the entire life of this code. Same blind spot
+         * class as the xHCI packet-size bug. */
+        uint32_t mask = net_my_netmask();
+        if (mask && ((g_my_dns_be & mask) == (net_my_ip() & mask))) {
+            net_warm_arp(nd, g_my_dns_be, "dns    ");
+        } else {
+            char dbuf[16];
+            net_format_ip(dbuf, g_my_dns_be);
+            kprintf("[net] dns     %s is off-subnet -- reached via the "
+                    "gateway (no direct ARP)\n", dbuf);
+        }
     }
 }
 

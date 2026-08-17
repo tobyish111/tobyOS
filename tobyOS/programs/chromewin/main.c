@@ -339,7 +339,25 @@ static void cdp_write(const char *json) {
         if (w <= 0) { g_quit = 1; return; }
         off += (size_t)w;
     }
-    printf("[chromewin] wrote %lu bytes to cmd pipe\n", (unsigned long)n);
+    /* SLICE 132: this fired on EVERY CDP command, and every screencast ack is
+     * one -- so at the ~12 fps the EliteDesk actually runs it emitted ~11
+     * lines/s forever. MEASURED off the 2026-08-16 real-hardware bootlog:
+     * ~420 B/s of a 38400-baud wire that carries 3840 B/s, i.e. ~11% of the
+     * link, permanently, to say "a frame was acked" 12 times a second.
+     *
+     * The bootstrap handshake IS worth seeing (it is how a chrome that never
+     * reaches DevTools gets diagnosed), so keep the first CDPW_LOG_MAX and
+     * then stop -- ANNOUNCING the cap when it is hit, because a logger that
+     * silently stops reads as an event that stopped happening, which has cost
+     * this tree four separate wrong conclusions. */
+#define CDPW_LOG_MAX 24
+    static unsigned long cdpw;
+    if (cdpw < CDPW_LOG_MAX)
+        printf("[chromewin] wrote %lu bytes to cmd pipe\n", (unsigned long)n);
+    else if (cdpw == CDPW_LOG_MAX)
+        printf("[chromewin] (cmd-pipe write log capped at %d -- further writes "
+               "are silent; the screencast acks one per frame)\n", CDPW_LOG_MAX);
+    cdpw++;
 }
 
 /* Pull one NUL-delimited message into g_msg (blocking). 0 on EOF/err. */

@@ -160,6 +160,68 @@ one-liner.
 
 ---
 
+## 2c. REAL HARDWARE, MEASURED (EliteDesk bootlog, 2026-08-16)
+
+Chromium runs end-to-end on the EliteDesk: CDP bootstrap, `start.html` loaded,
+frames streaming, `intel-gt-flip` backend, 4 CPUs, WebGL build.
+
+```
+[cwif] frame 30 | gap avg=377ms | cap avg=364ms (x29)   <- BOOTSTRAP, not steady
+[cwif] frame 60 | gap avg= 85ms | cap avg= 82ms (x30)   <- steady
+[cwif] frame 90 | gap avg= 88ms | cap avg= 85ms (x30)   <- steady
+```
+
+**Steady state on real hardware is `cap` 82–85 ms, ~11.8 fps** — *faster* than
+QEMU's 100 ms, which is what you would expect once the emulator is out of the
+way.
+
+**RETRACTION, and it matters for how this arc is scored.** Earlier handoffs
+recorded "real HW, static page: `cap ~366 ms` (~2.7 fps)" as the user's
+baseline. This run reproduces **364 ms at frame 30** and then settles to 82 ms
+by frame 60. That old number was almost certainly the **first `[cwif]` report,
+which covers the bootstrap window**, read as though it were steady state. So:
+
+* Do NOT claim a 4× real-hardware win from the slice-129 census fix. There is
+  no clean real-HW *steady-state* before-number to compare against.
+* The first `[cwif]` line of any run is bootstrap. Start at frame 60.
+* This is the same class of error as the anim-vs-SERP mixup in §1A: a number
+  lifted from one regime and compared against another.
+
+What the census fix demonstrably did do on this machine: the chrome-phase log
+now runs a few hundred B/s against a 3840 B/s wire, where the census alone was
+~15,000 B/s. The wire is no longer saturated. That is real and it is visible
+in the bootlog; the fps delta it bought on real HW is simply not measured.
+
+**Two things the bootlog exposed that QEMU cannot** (both fixed, slice 132):
+
+* `[net] WARN: dns 209.18.47.61 did not respond to ARP within 120ms`. The
+  lease hands out a **public** resolver (`ip=192.168.68.77/22`), so the
+  boot-time ARP warm was asking the local link about a host that is not on it
+  — 120 ms wasted and a warning that reads like broken DNS. It never was:
+  `ip_send` routes off-subnet via the gateway, whose ARP is warmed one line
+  earlier. **SLIRP hands out 10.0.2.3, inside the guest's own /24, so this
+  branch looked correct in QEMU forever.**
+* `[chromewin] wrote N bytes to cmd pipe` fired on every CDP command, and
+  every screencast ack is one — ~11 lines/s at real-HW cadence, ~420 B/s,
+  **~11% of the 38400-baud wire, permanently**. Capped at 24 (the bootstrap
+  handshake is the part worth seeing), and the cap announces itself.
+
+**Still open from that log, not chased:** eight `[uaccess] copy_to_user ->
+EFAULT` at 58.8 s, `pte=0x...025`/`0x...005` — present + user but **not
+writable**, i.e. a kernel write into a CoW page that the fault path did not
+resolve. Chrome carried on, so it is not fatal, but `isr.c` explicitly routes
+kernel-mode faults on user addresses through the CoW path and these got
+`EFAULT` anyway. Worth a look before trusting fork-heavy workloads.
+
+**The biggest real-world load-time item is not code at all:** `/data` is
+RAM-backed on this machine (`no disk/USB tobyfs volume found; contents reset
+on reboot`), so the browser profile is `FRESH (empty)` on **every** boot — no
+HTTP cache, no cookies, no compiled-JS cache. Every page load is a cold one.
+Formatting a spare USB stick with `mkfs_tobyfs` would give warm-cache repeat
+visits, which is worth far more to a browsing user than anything in §3.
+
+---
+
 ## 3. THE HONEST CEILING, AND WHERE TO LOOK NEXT
 
 Say this plainly to the user: **this is a capture-and-blit architecture and it
