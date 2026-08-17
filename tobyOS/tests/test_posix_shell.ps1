@@ -346,7 +346,11 @@ $required = @(
     'POSIXSH: jobs-status=0',
     'POSIXSH: bgjob',
     'POSIXSH: sub-trap',
-    'POSIXSH: sub-trap-status=3'
+    'POSIXSH: sub-trap-status=3',
+
+    # a compound block well past the old 512-byte limit, comments and all
+    'POSIXSH: long-block=40',
+    'POSIXSH: long-status=0'
 )
 
 # The harness echoes every command line it drives ("[shell-test] $ ..."), and

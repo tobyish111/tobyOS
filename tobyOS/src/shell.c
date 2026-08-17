@@ -59,13 +59,30 @@
 
 extern volatile struct limine_module_request module_req;
 
+/* Two different budgets, deliberately decoupled.
+ *
+ * LINE_MAX sizes the per-word expansion buffers, which sit on the stack in
+ * functions called once per `$` in a word. Raising it multiplies the deepest
+ * recursive chain and overruns the kernel stack, so it stays small.
+ *
+ * SHELL_CMD_MAX is the length of one logical command -- for a compound
+ * construct, the whole `if`/`for`/`case` joined back together. That is what
+ * real scripts need room for, and every buffer of this size is heap
+ * allocated, so it costs heap rather than kernel stack. At 512 (the old
+ * shared limit) an ordinary multi-line block failed with "command too
+ * long". */
 #define LINE_MAX 512
+#define SHELL_CMD_MAX 4096
 
 /* Runaway guard for `while`/`until`. POSIX has no iteration limit, but this
  * loop runs in the kernel, so an unbounded one wedges the machine with no way
  * back. 1024 was low enough that ordinary scripts hit it; this is high enough
  * that only a genuine runaway does. */
 #define SHELL_LOOP_MAX 4000000L
+
+/* Buffer for a multi-line construct being joined back into one command.
+ * Heap-allocated: it is per script-nesting level and scripts nest. */
+#define SHELL_PENDING_MAX SHELL_CMD_MAX
 #define ARG_MAX  32
 #define SHELL_ALIAS_MAX 32
 #define SHELL_FUNC_MAX 32
@@ -4152,6 +4169,29 @@ static bool shell_join_wants_semi(const char *s, size_t n) {
     return true;
 }
 
+/* Length of `line` up to a comment. A `#` that begins a word and is outside
+ * quotes comments out the rest of the LINE -- so when lines are joined with
+ * `;` the comment has to be dropped first, or one trailing `# note` would
+ * comment out every remaining line of the construct. */
+static size_t shell_line_code_len(const char *line) {
+    bool in_sq = false, in_dq = false;
+    const char *p = line;
+    for (; *p; p++) {
+        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_dq = false;
+            continue;
+        }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'') { in_sq = true; continue; }
+        if (*p == '"') { in_dq = true; continue; }
+        if (*p == '#' && (p == line || is_space(p[-1]))) break;
+    }
+    while (p > line && is_space(p[-1])) p--;
+    return (size_t)(p - line);
+}
+
 static int shell_join_line(char *dst, size_t *dlen, size_t cap,
                            const char *line) {
     while (*line == ' ' || *line == '\t') line++;
@@ -4167,12 +4207,14 @@ static int shell_join_line(char *dst, size_t *dlen, size_t cap,
             sep = shell_join_wants_semi(dst, *dlen) ? "; " : " ";
         }
     }
-    size_t sl = strlen(sep), ll = strlen(line);
+    size_t sl = strlen(sep), ll = shell_line_code_len(line);
+    if (ll == 0) return 0;                     /* comment-only line */
     if (*dlen + sl + ll + 1 > cap) return -1;
     memcpy(dst + *dlen, sep, sl);
     *dlen += sl;
-    memcpy(dst + *dlen, line, ll + 1);
+    memcpy(dst + *dlen, line, ll);
     *dlen += ll;
+    dst[*dlen] = '\0';
     return 0;
 }
 
@@ -4191,7 +4233,14 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     int last = 0;
     char *p = text;
     bool first_line = true;
-    char pending[LINE_MAX * 2];
+    char *pending = (char *)kmalloc(SHELL_PENDING_MAX);
+    if (!pending) {
+        kprintf("sh: out of memory\n");
+        g_script_depth--;
+        g_shell_lineno = saved_lineno;
+        g_noexec_error = saved_noexec_error;
+        return 2;
+    }
     size_t pending_len = 0;
     pending[0] = '\0';
     while (*p) {
@@ -4227,7 +4276,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         /* Keep collecting while the text so far is an unfinished compound
          * command (or ends in a splice), then run the joined result. */
         if (pending_len > 0 || shell_line_needs_continuation(line)) {
-            if (shell_join_line(pending, &pending_len, sizeof(pending),
+            if (shell_join_line(pending, &pending_len, SHELL_PENDING_MAX,
                                 line) < 0) {
                 kprintf("sh: command too long\n");
                 last = 2;
@@ -4265,6 +4314,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (run_exit_trap) last = shell_run_exit_trap(last);
     if (g_noexec_error) last = g_noexec_error;
     g_noexec_error = saved_noexec_error;
+    kfree(pending);
     g_script_depth--;
     g_shell_lineno = saved_lineno;
     return last;
@@ -6266,6 +6316,41 @@ struct shell_pipeline {
     size_t expand_pos;
 };
 
+/* Parsing scratch space.
+ *
+ * A token array, its backing word buffer and a pipeline together come to
+ * around 9 KiB. On the stack, in functions that recurse once per nesting
+ * level, that overran the kernel stack at very modest depth -- a `for`
+ * containing an `if` was already past 32 KiB. They live on the heap instead,
+ * so nesting costs a few hundred bytes a level rather than ten kilobytes. */
+struct shell_parse_scratch {
+    struct shell_token tok[SHELL_TOKEN_MAX];
+    char words[SHELL_PARSE_BUF_MAX];
+    struct shell_pipeline pl;
+};
+
+/* Text of one compound construct. Heap allocated because SHELL_CMD_MAX is
+ * large and these functions recurse once per nesting level. */
+struct shell_cmd_text {
+    char a[SHELL_CMD_MAX];
+    char b[SHELL_CMD_MAX];
+};
+
+static struct shell_cmd_text *shell_cmd_text_alloc(void) {
+    struct shell_cmd_text *t =
+        (struct shell_cmd_text *)kmalloc(sizeof(*t));
+    if (!t) kprintf("shell: out of memory for command text\n");
+    return t;
+}
+
+static struct shell_parse_scratch *shell_scratch_alloc(void) {
+    struct shell_parse_scratch *sc =
+        (struct shell_parse_scratch *)kmalloc(sizeof(*sc));
+    if (!sc) kprintf("shell: out of memory for parse buffers\n");
+    return sc;
+}
+
+
 /* Build "<prefix>/<name>" into out_buf and return a pointer to it,
  * skipping a redundant slash if `prefix` already ends in one. Returns
  * NULL on overflow. */
@@ -7837,22 +7922,30 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
 
 static const char *shell_expand_aliases(const char *src, char *buf,
                                         size_t cap) {
-    char tmp[SHELL_PARSE_BUF_MAX];
+    /* Heap: this scratch is the size of a whole command, and alias expansion
+     * happens once per line at every nesting level. */
+    char *tmp = (char *)kmalloc(SHELL_CMD_MAX);
+    if (!tmp) {
+        kprintf("alias: out of memory\n");
+        return 0;
+    }
     const char *cur = src ? src : "";
     bool changed = false;
 
     for (int pass = 0; pass < 8; pass++) {
         char *dst = (pass & 1) ? tmp : buf;
         if (shell_expand_aliases_once(cur, dst,
-                                      (pass & 1) ? sizeof(tmp) : cap,
+                                      (pass & 1) ? SHELL_CMD_MAX : cap,
                                       &changed) < 0) {
             kprintf("alias: expansion too long\n");
+            kfree(tmp);
             return 0;
         }
         cur = dst;
         if (!changed) break;
         if (pass == 7) {
             kprintf("alias: recursive expansion limit reached\n");
+            kfree(tmp);
             return 0;
         }
     }
@@ -7865,10 +7958,12 @@ static const char *shell_expand_aliases(const char *src, char *buf,
         size_t n = strlen(cur);
         if (n + 1 > cap) {
             kprintf("alias: expansion too long\n");
+            kfree(tmp);
             return 0;
         }
         memcpy(buf, cur, n + 1);
     }
+    kfree(tmp);
     return buf;
 }
 
@@ -9476,47 +9571,60 @@ static bool shell_try_if_command(const char *src) {
         const char *branch_at = shell_find_elif_else(after_then, fi_at,
                                                      &is_elif, &branch_skip);
 
-        char cond[LINE_MAX];
-        if (shell_copy_segment(cond, sizeof(cond), cond_start, then_at) < 0) {
+        struct shell_cmd_text *ct = shell_cmd_text_alloc();
+        if (!ct) {
+            shell_set_status(2);
+            return true;
+        }
+        char *cond = ct->a;
+        if (shell_copy_segment(cond, SHELL_CMD_MAX, cond_start, then_at) < 0) {
             kprintf("if: condition too long\n");
             shell_set_status(2);
+            kfree(ct);
             return true;
         }
 
         g_errexit_suppress++;
         execute_line_text(cond);
         g_errexit_suppress--;
-        if (g_shell_flow != SHELL_FLOW_NONE) return true;
+        if (g_shell_flow != SHELL_FLOW_NONE) { kfree(ct); return true; }
 
         if (g_last_status == 0) {
-            char yes[LINE_MAX];
+            char *yes = ct->b;
             const char *body_end = branch_at ? branch_at : fi_at;
-            if (shell_copy_segment(yes, sizeof(yes), after_then, body_end) < 0) {
+            if (shell_copy_segment(yes, SHELL_CMD_MAX, after_then,
+                                   body_end) < 0) {
                 kprintf("if: body too long\n");
                 shell_set_status(2);
+                kfree(ct);
                 return true;
             }
             execute_line_text(yes);
+            kfree(ct);
             return true;
         }
 
         if (!branch_at) {
             shell_set_status(0);
+            kfree(ct);
             return true;
         }
 
         if (!is_elif) {
-            char no[LINE_MAX];
+            char *no = ct->b;
             const char *else_body = branch_at + branch_skip;
-            if (shell_copy_segment(no, sizeof(no), else_body, fi_at) < 0) {
+            if (shell_copy_segment(no, SHELL_CMD_MAX, else_body, fi_at) < 0) {
                 kprintf("if: else body too long\n");
                 shell_set_status(2);
+                kfree(ct);
                 return true;
             }
             execute_line_text(no);
+            kfree(ct);
             return true;
         }
 
+        kfree(ct);
         cond_start = shell_skip_blanks(branch_at + branch_skip);
     }
 
@@ -9574,31 +9682,49 @@ static bool shell_try_for_command(const char *src) {
         return true;
     }
 
-    char list[LINE_MAX];
-    char body[LINE_MAX];
+    struct shell_for_scratch {
+        char list[SHELL_CMD_MAX];
+        char body[SHELL_CMD_MAX];
+        char items[SHELL_PARSE_BUF_MAX];
+        char field[LINE_MAX];
+        const char *item[ARG_MAX];
+        struct shell_token tok[SHELL_TOKEN_MAX];
+        char words[SHELL_PARSE_BUF_MAX];
+    };
+    struct shell_for_scratch *fs =
+        (struct shell_for_scratch *)kmalloc(sizeof(*fs));
+    if (!fs) {
+        kprintf("for: out of memory\n");
+        shell_set_status(2);
+        return true;
+    }
+    char *list = fs->list;
+    char *body = fs->body;
     /* `for x; do` iterates "$@" -- one field per parameter, so a parameter
      * containing blanks stays one iteration. */
     if (implicit_at) {
         memcpy(list, "\"$@\"", 5);
     } else {
-        if (shell_copy_segment(list, sizeof(list), s, do_at) < 0) {
+        if (shell_copy_segment(list, sizeof(fs->list), s, do_at) < 0) {
             kprintf("for: command too long\n");
             shell_set_status(2);
+            kfree(fs);
             return true;
         }
     }
-    if (shell_copy_segment(body, sizeof(body), do_at + do_skip,
+    if (shell_copy_segment(body, sizeof(fs->body), do_at + do_skip,
                            done_at) < 0) {
         kprintf("for: command too long\n");
         shell_set_status(2);
+        kfree(fs);
         return true;
     }
 
-    struct shell_token tok[SHELL_TOKEN_MAX];
-    char words[SHELL_PARSE_BUF_MAX];
+    struct shell_token *tok = fs->tok;
     int ntok = 0;
-    if (shell_tokenize(list, tok, &ntok, words, sizeof(words)) < 0) {
+    if (shell_tokenize(list, tok, &ntok, fs->words, sizeof(fs->words)) < 0) {
         shell_set_status(2);
+        kfree(fs);
         return true;
     }
 
@@ -9606,8 +9732,8 @@ static bool shell_try_for_command(const char *src) {
      * IFS splitting for unquoted words, one field per parameter for "$@".
      * `words` is already consumed by the tokenizer, so the split fields go in
      * their own buffer. */
-    char items[SHELL_PARSE_BUF_MAX];
-    const char *item[ARG_MAX];
+    char *items = fs->items;
+    const char **item = fs->item;
     int nitems = 0;
     size_t ipos = 0;
     for (int i = 0; i < ntok && nitems < ARG_MAX; i++) {
@@ -9615,14 +9741,15 @@ static bool shell_try_for_command(const char *src) {
         if (shell_word_is_null_field(tok[i].text)) continue;
         struct shell_field_iter it;
         shell_field_iter_init(&it, tok[i].text, tok[i].quoted);
-        char field[LINE_MAX];
+        char *field = fs->field;
         bool any = false;
         while (nitems < ARG_MAX &&
-               shell_field_iter_next(&it, field, sizeof(field))) {
+               shell_field_iter_next(&it, field, sizeof(fs->field))) {
             size_t n = strlen(field);
-            if (ipos + n + 1 > sizeof(items)) {
+            if (ipos + n + 1 > sizeof(fs->items)) {
                 kprintf("for: list too long\n");
                 shell_set_status(2);
+                kfree(fs);
                 return true;
             }
             memcpy(items + ipos, field, n + 1);
@@ -9631,7 +9758,7 @@ static bool shell_try_for_command(const char *src) {
             any = true;
         }
         if (!any && tok[i].quoted && tok[i].text[0] == '\0' &&
-            nitems < ARG_MAX && ipos < sizeof(items)) {
+            nitems < ARG_MAX && ipos < sizeof(fs->items)) {
             items[ipos] = '\0';
             item[nitems++] = items + ipos;
             ipos++;
@@ -9645,6 +9772,7 @@ static bool shell_try_for_command(const char *src) {
             kprintf("for: failed to set '%s'\n", name);
             g_shell_loop_depth--;
             shell_set_status(1);
+            kfree(fs);
             return true;
         }
         execute_line_text(body);
@@ -9652,6 +9780,7 @@ static bool shell_try_for_command(const char *src) {
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_EXIT) {
             g_shell_loop_depth--;
+            kfree(fs);
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_BREAK) {
@@ -9661,6 +9790,7 @@ static bool shell_try_for_command(const char *src) {
             }
             g_shell_loop_depth--;
             shell_set_status(last);
+            kfree(fs);
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_CONTINUE) {
@@ -9669,6 +9799,7 @@ static bool shell_try_for_command(const char *src) {
                 g_shell_flow_status = 0;
             } else {
                 g_shell_loop_depth--;
+                kfree(fs);
                 return true;
             }
             continue;
@@ -9676,6 +9807,7 @@ static bool shell_try_for_command(const char *src) {
     }
     g_shell_loop_depth--;
     shell_set_status(last);
+    kfree(fs);
     return true;
 }
 
@@ -9700,13 +9832,19 @@ static bool shell_try_while_command(const char *src) {
         return true;
     }
 
-    char cond[LINE_MAX];
-    char body[LINE_MAX];
-    if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
-        shell_copy_segment(body, sizeof(body), do_at + do_skip,
+    struct shell_cmd_text *ct = shell_cmd_text_alloc();
+    if (!ct) {
+        shell_set_status(2);
+        return true;
+    }
+    char *cond = ct->a;
+    char *body = ct->b;
+    if (shell_copy_segment(cond, SHELL_CMD_MAX, s, do_at) < 0 ||
+        shell_copy_segment(body, SHELL_CMD_MAX, do_at + do_skip,
                            done_at) < 0) {
         kprintf("while: command too long\n");
         shell_set_status(2);
+        kfree(ct);
         return true;
     }
 
@@ -9719,6 +9857,7 @@ static bool shell_try_while_command(const char *src) {
         if (g_last_status != 0) {
             g_shell_loop_depth--;
             shell_set_status(last);
+            kfree(ct);
             return true;
         }
         execute_line_text(body);
@@ -9726,6 +9865,7 @@ static bool shell_try_while_command(const char *src) {
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_EXIT) {
             g_shell_loop_depth--;
+            kfree(ct);
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_BREAK) {
@@ -9735,6 +9875,7 @@ static bool shell_try_while_command(const char *src) {
             }
             g_shell_loop_depth--;
             shell_set_status(last);
+            kfree(ct);
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_CONTINUE) {
@@ -9751,6 +9892,7 @@ static bool shell_try_while_command(const char *src) {
     g_shell_loop_depth--;
     kprintf("while: iteration limit reached\n");
     shell_set_status(2);
+    kfree(ct);
     return true;
 }
 
@@ -9775,13 +9917,19 @@ static bool shell_try_until_command(const char *src) {
         return true;
     }
 
-    char cond[LINE_MAX];
-    char body[LINE_MAX];
-    if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
-        shell_copy_segment(body, sizeof(body), do_at + do_skip,
+    struct shell_cmd_text *ct = shell_cmd_text_alloc();
+    if (!ct) {
+        shell_set_status(2);
+        return true;
+    }
+    char *cond = ct->a;
+    char *body = ct->b;
+    if (shell_copy_segment(cond, SHELL_CMD_MAX, s, do_at) < 0 ||
+        shell_copy_segment(body, SHELL_CMD_MAX, do_at + do_skip,
                            done_at) < 0) {
         kprintf("until: command too long\n");
         shell_set_status(2);
+        kfree(ct);
         return true;
     }
 
@@ -9794,6 +9942,7 @@ static bool shell_try_until_command(const char *src) {
         if (g_last_status == 0) {
             g_shell_loop_depth--;
             shell_set_status(last);
+            kfree(ct);
             return true;
         }
         execute_line_text(body);
@@ -9801,6 +9950,7 @@ static bool shell_try_until_command(const char *src) {
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_EXIT) {
             g_shell_loop_depth--;
+            kfree(ct);
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_BREAK) {
@@ -9810,6 +9960,7 @@ static bool shell_try_until_command(const char *src) {
             }
             g_shell_loop_depth--;
             shell_set_status(last);
+            kfree(ct);
             return true;
         }
         if (g_shell_flow == SHELL_FLOW_CONTINUE) {
@@ -9826,6 +9977,7 @@ static bool shell_try_until_command(const char *src) {
     g_shell_loop_depth--;
     kprintf("until: iteration limit reached\n");
     shell_set_status(2);
+    kfree(ct);
     return true;
 }
 
@@ -9938,12 +10090,25 @@ static bool shell_try_case_command(const char *src) {
         return true;
     }
 
-    char word_src[LINE_MAX];
-    char word[SHELL_PARSE_BUF_MAX];
-    if (shell_copy_segment(word_src, sizeof(word_src), s, in_at) < 0 ||
-        shell_expand_case_word(word_src, word, sizeof(word)) < 0) {
+    struct shell_case_scratch {
+        char word_src[SHELL_CMD_MAX];
+        char word[SHELL_PARSE_BUF_MAX];
+        char pats[SHELL_PARSE_BUF_MAX];
+        char body_text[SHELL_CMD_MAX];
+    };
+    struct shell_case_scratch *cs =
+        (struct shell_case_scratch *)kmalloc(sizeof(*cs));
+    if (!cs) {
+        kprintf("case: out of memory\n");
+        shell_set_status(2);
+        return true;
+    }
+    char *word = cs->word;
+    if (shell_copy_segment(cs->word_src, sizeof(cs->word_src), s, in_at) < 0 ||
+        shell_expand_case_word(cs->word_src, word, sizeof(cs->word)) < 0) {
         kprintf("case: word too long\n");
         shell_set_status(2);
+        kfree(cs);
         return true;
     }
 
@@ -9961,6 +10126,7 @@ static bool shell_try_case_command(const char *src) {
         if (close >= esac_at) {
             kprintf("case: expected ')'\n");
             shell_set_status(2);
+            kfree(cs);
             return true;
         }
 
@@ -9968,12 +10134,14 @@ static bool shell_try_case_command(const char *src) {
         const char *sep = shell_find_text(body, ";;");
         if (!sep || sep > esac_at) sep = esac_at;
 
-        char pats[128];
-        char body_text[LINE_MAX];
-        if (shell_copy_segment(pats, sizeof(pats), p, close) < 0 ||
-            shell_copy_segment(body_text, sizeof(body_text), body, sep) < 0) {
+        char *pats = cs->pats;
+        char *body_text = cs->body_text;
+        if (shell_copy_segment(pats, sizeof(cs->pats), p, close) < 0 ||
+            shell_copy_segment(body_text, sizeof(cs->body_text), body,
+                               sep) < 0) {
             kprintf("case: clause too long\n");
             shell_set_status(2);
+            kfree(cs);
             return true;
         }
 
@@ -9982,6 +10150,7 @@ static bool shell_try_case_command(const char *src) {
             execute_line_text(body_text);
             last = g_last_status;
             shell_set_status(last);
+            kfree(cs);
             return true;
         }
 
@@ -9989,6 +10158,7 @@ static bool shell_try_case_command(const char *src) {
     }
 
     shell_set_status(0);
+    kfree(cs);
     return true;
 }
 
@@ -10050,11 +10220,17 @@ static bool shell_try_function_definition(const char *src) {
     }
 
     char name[64];
-    char body[LINE_MAX];
+    struct shell_cmd_text *ct = shell_cmd_text_alloc();
+    if (!ct) {
+        shell_set_status(2);
+        return true;
+    }
+    char *body = ct->a;
     if (name_len == 0 || name_len + 1 > sizeof(name) ||
-        shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
+        shell_copy_segment(body, SHELL_CMD_MAX, body_start, body_end) < 0) {
         kprintf("function: definition too long\n");
         shell_set_status(2);
+        kfree(ct);
         return true;
     }
     memcpy(name, name_start, name_len);
@@ -10062,9 +10238,11 @@ static bool shell_try_function_definition(const char *src) {
     if (shell_function_set(name, body) < 0) {
         kprintf("function: failed to define '%s'\n", name);
         shell_set_status(1);
+        kfree(ct);
         return true;
     }
     shell_set_status(0);
+    kfree(ct);
     return true;
 }
 
@@ -10372,58 +10550,67 @@ static bool shell_try_subshell_command(const char *src) {
         return true;
     }
 
-    char body[LINE_MAX];
-    if (shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
-        kprintf("subshell: body too long\n");
+    struct shell_cmd_text *ct = shell_cmd_text_alloc();
+    if (!ct) {
         shell_set_status(2);
         return true;
     }
+    char *body = ct->a;
+    if (shell_copy_segment(body, SHELL_CMD_MAX, body_start, body_end) < 0) {
+        kprintf("subshell: body too long\n");
+        shell_set_status(2);
+        kfree(ct);
+        return true;
+    }
 
-    struct shell_simple redirs;
-    shell_simple_init(&redirs);
+    /* Redirection paths point into the scratch block's word buffer, so the
+     * files are opened while it is still alive rather than after it is
+     * freed. */
+    struct shell_io_frame io_frame;
+    bool io_active = false;
     const char *tail = shell_skip_blanks(body_end + 1);
     if (*tail) {
-        struct shell_token tok[SHELL_TOKEN_MAX];
-        char words[SHELL_PARSE_BUF_MAX];
+        struct shell_parse_scratch *sc = shell_scratch_alloc();
+        if (!sc) {
+            shell_set_status(2);
+            return true;
+        }
         int ntok = 0;
-        if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
+        const char *err = 0;
+        if (shell_tokenize(tail, sc->tok, &ntok, sc->words,
+                           sizeof(sc->words)) < 0) {
+            err = "";
+        } else {
+            int i = 0;
+            int parsed = shell_parse_pipeline(sc->tok, ntok, &i, &sc->pl);
+            if (parsed <= 0 || sc->pl.count != 1 || sc->pl.stage[0].argc != 0)
+                err = "subshell: expected only redirections after ')'\n";
+            else if (shell_consume_separator(sc->tok, ntok, &i) != SH_TOK_SEMI ||
+                     i < ntok)
+                err = "subshell: unexpected text after redirection\n";
+            else if (sc->pl.stage[0].redir_count > 0) {
+                if (shell_enter_io_frame(&sc->pl.stage[0], "subshell",
+                                         &io_frame) < 0) err = "";
+                else io_active = true;
+            }
+        }
+        kfree(sc);
+        if (err) {
+            if (*err) kprintf("%s", err);
+            if (io_active) shell_restore_io_frame(&io_frame);
             shell_set_status(2);
+            kfree(ct);
             return true;
         }
-        int i = 0;
-        struct shell_pipeline pl;
-        int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
-        if (parsed < 0 || parsed == 0 || pl.count != 1 ||
-            pl.stage[0].argc != 0) {
-            kprintf("subshell: expected only redirections after ')'\n");
-            shell_set_status(2);
-            return true;
-        }
-        enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
-        if (sep != SH_TOK_SEMI || i < ntok) {
-            kprintf("subshell: unexpected text after redirection\n");
-            shell_set_status(2);
-            return true;
-        }
-        redirs = pl.stage[0];
     }
 
     struct shell_subshell_frame state;
     if (shell_subshell_frame_capture(&state) < 0) {
         kprintf("subshell: failed to save shell state\n");
+        if (io_active) shell_restore_io_frame(&io_frame);
         shell_set_status(1);
+        kfree(ct);
         return true;
-    }
-
-    struct shell_io_frame io_frame;
-    bool io_active = false;
-    if (redirs.redir_count > 0) {
-        if (shell_enter_io_frame(&redirs, "subshell", &io_frame) < 0) {
-            shell_subshell_frame_restore(&state);
-            shell_set_status(1);
-            return true;
-        }
-        io_active = true;
     }
 
     g_subshell_depth++;
@@ -10442,6 +10629,7 @@ static bool shell_try_subshell_command(const char *src) {
     if (io_active) shell_restore_io_frame(&io_frame);
     shell_subshell_frame_restore(&state);
     shell_set_status(rc);
+    kfree(ct);
     return true;
 }
 
@@ -10493,56 +10681,64 @@ static bool shell_try_group_command(const char *src) {
         return true;
     }
 
-    char body[LINE_MAX];
-    if (shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
+    struct shell_cmd_text *ct = shell_cmd_text_alloc();
+    if (!ct) {
+        shell_set_status(2);
+        return true;
+    }
+    char *body = ct->a;
+    if (shell_copy_segment(body, SHELL_CMD_MAX, body_start, body_end) < 0) {
         kprintf("group: body too long\n");
         shell_set_status(2);
+        kfree(ct);
         return true;
     }
 
     struct shell_simple redirs;
     shell_simple_init(&redirs);
+    struct shell_io_frame io_frame_early;
+    bool io_early = false;
     const char *tail = shell_skip_blanks(body_end + 1);
     if (*tail) {
-        struct shell_token tok[SHELL_TOKEN_MAX];
-        char words[SHELL_PARSE_BUF_MAX];
+        /* The tokens the redirection paths point into die with the scratch
+         * block, so the files are opened here, while it is still alive. */
+        struct shell_parse_scratch *sc = shell_scratch_alloc();
+        if (!sc) {
+            shell_set_status(2);
+            return true;
+        }
         int ntok = 0;
-        if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
+        const char *err = 0;
+        if (shell_tokenize(tail, sc->tok, &ntok, sc->words,
+                           sizeof(sc->words)) < 0) {
+            err = "";
+        } else {
+            int i = 0;
+            int parsed = shell_parse_pipeline(sc->tok, ntok, &i, &sc->pl);
+            if (parsed <= 0 || sc->pl.count != 1 || sc->pl.stage[0].argc != 0)
+                err = "group: expected only redirections after '}'\n";
+            else if (shell_consume_separator(sc->tok, ntok, &i) != SH_TOK_SEMI ||
+                     i < ntok)
+                err = "group: unexpected text after redirection\n";
+            else if (sc->pl.stage[0].redir_count > 0) {
+                if (shell_enter_io_frame(&sc->pl.stage[0], "group",
+                                         &io_frame_early) < 0) err = "";
+                else io_early = true;
+            }
+        }
+        kfree(sc);
+        if (err) {
+            if (*err) kprintf("%s", err);
             shell_set_status(2);
             return true;
         }
-        int i = 0;
-        struct shell_pipeline pl;
-        int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
-        if (parsed < 0 || parsed == 0 || pl.count != 1 ||
-            pl.stage[0].argc != 0) {
-            kprintf("group: expected only redirections after '}'\n");
-            shell_set_status(2);
-            return true;
-        }
-        enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
-        if (sep != SH_TOK_SEMI || i < ntok) {
-            kprintf("group: unexpected text after redirection\n");
-            shell_set_status(2);
-            return true;
-        }
-        redirs = pl.stage[0];
-    }
-
-    struct shell_io_frame io_frame;
-    bool io_active = false;
-    if (redirs.redir_count > 0) {
-        if (shell_enter_io_frame(&redirs, "group", &io_frame) < 0) {
-            shell_set_status(1);
-            return true;
-        }
-        io_active = true;
     }
 
     execute_line_text(body);
     int rc = g_last_status;
-    if (io_active) shell_restore_io_frame(&io_frame);
+    if (io_early) shell_restore_io_frame(&io_frame_early);
     shell_set_status(rc);
+    kfree(ct);
     return true;
 }
 
@@ -10697,16 +10893,21 @@ static void shell_run_segment(const char *src, bool background) {
         shell_set_status(0);
         return;
     }
-    struct shell_token tok[SHELL_TOKEN_MAX];
-    char words[SHELL_PARSE_BUF_MAX];
-    int ntok = 0;
-
-    g_subst_ran = false;
-    if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) {
+    struct shell_parse_scratch *sc = shell_scratch_alloc();
+    if (!sc) {
         shell_set_status(2);
         return;
     }
-    if (ntok == 0) return;
+    struct shell_token *tok = sc->tok;
+    int ntok = 0;
+    int status = 0;
+
+    g_subst_ran = false;
+    if (shell_tokenize(src, tok, &ntok, sc->words, sizeof(sc->words)) < 0) {
+        status = 2;
+        goto out;
+    }
+    if (ntok == 0) goto out_keep;
 
     int i = 0;
     bool negate = false;
@@ -10716,38 +10917,40 @@ static void shell_run_segment(const char *src, bool background) {
         i++;
     }
     if (i >= ntok) {
-        int last = g_last_status;
-        if (negate) last = last == 0 ? 1 : 0;
-        shell_set_status(last);
-        return;
+        status = g_last_status;
+        if (negate) status = status == 0 ? 1 : 0;
+        goto out;
     }
 
-    struct shell_pipeline pl;
-    int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
+    int parsed = shell_parse_pipeline(tok, ntok, &i, &sc->pl);
     if (parsed < 0) {
-        shell_set_status(2);
-        return;
+        status = 2;
+        goto out;
     }
     if (parsed == 0) {
         kprintf("shell: expected command\n");
-        shell_set_status(2);
-        return;
+        status = 2;
+        goto out;
     }
 
     if (g_opt_xtrace) {
         const char *ps4 = env_get("PS4");
         kprintf("%s", ps4 ? ps4 : "+ ");
-        for (int st = 0; st < pl.count; st++) {
+        for (int st = 0; st < sc->pl.count; st++) {
             if (st > 0) kprintf("| ");
-            for (int a = 0; a < pl.stage[st].argc; a++)
-                kprintf("%s%s", pl.stage[st].argv[a],
-                        a + 1 < pl.stage[st].argc ? " " : "");
+            for (int a = 0; a < sc->pl.stage[st].argc; a++)
+                kprintf("%s%s", sc->pl.stage[st].argv[a],
+                        a + 1 < sc->pl.stage[st].argc ? " " : "");
         }
         kprintf("\n");
     }
-    int last = shell_run_pipeline(&pl, background);
-    if (negate) last = last == 0 ? 1 : 0;
-    shell_set_status(last);
+    status = shell_run_pipeline(&sc->pl, background);
+    if (negate) status = status == 0 ? 1 : 0;
+
+out:
+    shell_set_status(status);
+out_keep:
+    kfree(sc);
 }
 
 /* Compound commands take redirections after their terminator:
@@ -10794,28 +10997,32 @@ static bool shell_compound_enter_redirs(const char *src, char *body,
     while (*tail == ';') tail = shell_skip_blanks(tail + 1);
     if (!*tail) return false;
 
-    struct shell_token tok[SHELL_TOKEN_MAX];
-    char words[SHELL_PARSE_BUF_MAX];
+    struct shell_parse_scratch *sc = shell_scratch_alloc();
+    if (!sc) return false;
     int ntok = 0;
-    if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) return false;
+    bool ok = false;
+    if (shell_tokenize(tail, sc->tok, &ntok, sc->words, sizeof(sc->words)) < 0)
+        goto out;
     int i = 0;
-    struct shell_pipeline pl;
-    int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
-    if (parsed <= 0 || pl.count != 1 || pl.stage[0].argc != 0 ||
-        pl.stage[0].redir_count == 0) {
-        return false;
+    int parsed = shell_parse_pipeline(sc->tok, ntok, &i, &sc->pl);
+    if (parsed <= 0 || sc->pl.count != 1 || sc->pl.stage[0].argc != 0 ||
+        sc->pl.stage[0].redir_count == 0) {
+        goto out;
     }
-    enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
-    if (sep != SH_TOK_SEMI || i < ntok) return false;
+    if (shell_consume_separator(sc->tok, ntok, &i) != SH_TOK_SEMI || i < ntok)
+        goto out;
 
     size_t blen = (size_t)(best_end - src);
-    if (blen + 1 > body_cap) return false;
+    if (blen + 1 > body_cap) goto out;
     memcpy(body, src, blen);
     body[blen] = '\0';
 
-    if (shell_enter_io_frame(&pl.stage[0], "compound", frame) < 0) return false;
+    if (shell_enter_io_frame(&sc->pl.stage[0], "compound", frame) < 0) goto out;
     *entered = true;
-    return true;
+    ok = true;
+out:
+    kfree(sc);
+    return ok;
 }
 
 /* Does this text start a compound command? */
@@ -10829,9 +11036,17 @@ static bool shell_line_is_compound(const char *s) {
            shell_starts_with_word(s, "case");
 }
 
-static void execute_line_text(const char *src) {
-    char alias_buf[SHELL_PARSE_BUF_MAX];
-    char seg[LINE_MAX];
+/* Split in two so the SHELL_CMD_MAX segment buffer can live on the heap
+ * without threading a free through every early return below. */
+struct shell_line_bufs {
+    char seg[SHELL_CMD_MAX];
+    char alias[SHELL_CMD_MAX];
+};
+
+static void execute_line_text_inner(const char *src,
+                                    struct shell_line_bufs *lb) {
+    char *seg = lb->seg;
+    char *alias_buf = lb->alias;
 
     src = src ? src : "";
     if (g_shell_flow != SHELL_FLOW_NONE) return;
@@ -10839,7 +11054,7 @@ static void execute_line_text(const char *src) {
     shell_check_pending_signals();
     if (g_shell_flow != SHELL_FLOW_NONE) return;
     if (shell_try_function_definition(src)) return;
-    src = shell_expand_aliases(src, alias_buf, sizeof(alias_buf));
+    src = shell_expand_aliases(src, alias_buf, SHELL_CMD_MAX);
     if (!src) {
         shell_set_status(2);
         return;
@@ -10856,7 +11071,7 @@ static void execute_line_text(const char *src) {
     if (shell_line_is_compound(src)) {
         struct shell_io_frame cframe;
         bool centered = false;
-        if (shell_compound_enter_redirs(src, seg, sizeof(seg),
+        if (shell_compound_enter_redirs(src, seg, SHELL_CMD_MAX,
                                         &cframe, &centered) && centered) {
             (void)(shell_try_if_command(seg) ||
                    shell_try_for_command(seg) ||
@@ -10901,7 +11116,7 @@ static void execute_line_text(const char *src) {
             enum shell_tok_type thisop = SH_TOK_SEMI;
             const char *sep = shell_find_list_sep(p, &oplen, &thisop);
             size_t chunk = sep ? (size_t)(sep - p) : strlen(p);
-            if (n + chunk + 3 > sizeof(seg)) {
+            if (n + chunk + 3 > SHELL_CMD_MAX) {
                 kprintf("shell: command too long\n");
                 shell_set_status(2);
                 return;
@@ -10917,7 +11132,7 @@ static void execute_line_text(const char *src) {
                                  (thisop == SH_TOK_OR_IF)  ? "||" :
                                  (thisop == SH_TOK_BG)     ? "&"  : ";";
             size_t ol = strlen(optext);
-            if (n + ol + 1 > sizeof(seg)) {
+            if (n + ol + 1 > SHELL_CMD_MAX) {
                 kprintf("shell: command too long\n");
                 shell_set_status(2);
                 return;
@@ -10960,6 +11175,18 @@ static void execute_line_text(const char *src) {
         }
         prev_link = op;
     }
+}
+
+static void execute_line_text(const char *src) {
+    struct shell_line_bufs *lb =
+        (struct shell_line_bufs *)kmalloc(sizeof(*lb));
+    if (!lb) {
+        kprintf("shell: out of memory\n");
+        shell_set_status(2);
+        return;
+    }
+    execute_line_text_inner(src, lb);
+    kfree(lb);
 }
 
 static char g_heredoc_cmd[LINE_MAX];

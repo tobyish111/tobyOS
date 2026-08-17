@@ -2048,6 +2048,10 @@ static void posix_shell_selftest(void) {
         "wait",
         "sh -c 'trap \"echo POSIXSH: sub-trap\" EXIT; exit 3'",
         "echo POSIXSH: sub-trap-status=$?",
+        /* a compound block far larger than the old 512-byte cap,
+         * with a trailing comment on every line */
+        "sh /data/px_long.sh",
+        "echo POSIXSH: long-status=$?",
         "echo POSIXSH: done",
         0
     };
@@ -2231,6 +2235,56 @@ static void posix_shell_selftest(void) {
         "echo 'unterminated\n";
     hrc = vfs_write_all("/data/px_badquote.sh", px_badquote,
                         strlen(px_badquote));
+
+    static const char px_long[] =
+        "c=0\n"
+        "if true\n"
+        "then\n"
+        "    c=$((c+1))          # padding line 00 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 01 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 02 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 03 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 04 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 05 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 06 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 07 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 08 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 09 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 10 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 11 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 12 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 13 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 14 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 15 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 16 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 17 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 18 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 19 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 20 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 21 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 22 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 23 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 24 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 25 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 26 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 27 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 28 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 29 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 30 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 31 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 32 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 33 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 34 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 35 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 36 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 37 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 38 to push this block past 512 bytes\n"
+        "    c=$((c+1))          # padding line 39 to push this block past 512 bytes\n"
+        "else\n"
+        "    c=-1\n"
+        "fi\n"
+        "echo POSIXSH: long-block=$c\n";
+    hrc = vfs_write_all("/data/px_long.sh", px_long, strlen(px_long));
 
     kprintf("[boot] POSIXSH: starting shell compatibility smoke\n");
     for (int i = 0; lines[i]; i++) {
