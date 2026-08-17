@@ -87,6 +87,20 @@ static char *g_param0;
 static char *g_positional[ARG_MAX];
 static int g_positional_count;
 
+/* A token is a single flat string by the time argument building sees it, so
+ * `"$@"` -- which must yield one field per positional parameter, with no IFS
+ * splitting inside a field -- needs its field boundaries carried in-band.
+ * SHELL_FIELD_SEP marks a boundary; SHELL_FIELD_NULL marks a `"$@"` that
+ * expanded to nothing, so `cmd "$@"` with no parameters passes no argument at
+ * all (as opposed to `cmd ""`, which passes one empty one). Both are control
+ * characters no ordinary word can contain. */
+#define SHELL_FIELD_SEP  '\x01'
+#define SHELL_FIELD_NULL '\x02'
+
+/* True while the expander is running inside double quotes -- the only place
+ * `$@` behaves differently from `$*`. */
+static bool g_expand_dquote;
+
 enum shell_flow {
     SHELL_FLOW_NONE = 0,
     SHELL_FLOW_BREAK,
@@ -3765,6 +3779,36 @@ static bool shell_heredoc_delim_char(char c) {
            c != '|' && c != '<' && c != '>';
 }
 
+/* Skip a `$(...)`, `$((...))` or `${...}` expansion starting at `p` (which
+ * must point at the '$'). Returns a pointer to the closing delimiter, or 0 if
+ * `p` is not the start of one of those forms. Nesting is counted so
+ * `$((1<<4))` is skipped as a unit -- without this the raw-line scanners
+ * below see the `<<` and start collecting a here-document that never ends,
+ * which swallows every following line of input. */
+static const char *shell_skip_expansion(const char *p) {
+    if (p[0] != '$') return 0;
+    char open = p[1];
+    if (open != '(' && open != '{') return 0;
+    char close = (open == '(') ? ')' : '}';
+    int depth = 0;
+    for (const char *q = p + 1; *q; q++) {
+        if (*q == open) depth++;
+        else if (*q == close && --depth == 0) return q;
+    }
+    return 0;
+}
+
+/* Skip a `...` command substitution starting at the opening backtick.
+ * Returns the closing backtick, or 0 if unterminated. */
+static const char *shell_skip_backticks(const char *p) {
+    if (*p != '`') return 0;
+    for (const char *q = p + 1; *q; q++) {
+        if (*q == '\\' && q[1]) { q++; continue; }
+        if (*q == '`') return q;
+    }
+    return 0;
+}
+
 static bool shell_line_find_heredoc(const char *line, char *delim, size_t cap,
                                     bool *strip_tabs, bool *quoted) {
     bool in_single = false;
@@ -3783,7 +3827,21 @@ static bool shell_line_find_heredoc(const char *line, char *delim, size_t cap,
                 p++;
                 continue;
             }
+            /* Expansions are live inside double quotes, so their operators
+             * must be skipped there too. */
+            if (*p == '$') {
+                const char *end = shell_skip_expansion(p);
+                if (end) { p = end; continue; }
+            }
+            if (*p == '`') {
+                const char *end = shell_skip_backticks(p);
+                if (end) { p = end; continue; }
+            }
             if (*p == '"') in_double = false;
+            continue;
+        }
+        if (*p == '\\' && p[1]) {
+            p++;
             continue;
         }
         if (*p == '\'') {
@@ -3793,6 +3851,14 @@ static bool shell_line_find_heredoc(const char *line, char *delim, size_t cap,
         if (*p == '"') {
             in_double = true;
             continue;
+        }
+        if (*p == '$') {
+            const char *end = shell_skip_expansion(p);
+            if (end) { p = end; continue; }
+        }
+        if (*p == '`') {
+            const char *end = shell_skip_backticks(p);
+            if (end) { p = end; continue; }
         }
         if (p[0] != '<' || p[1] != '<') continue;
 
@@ -5409,6 +5475,11 @@ static void shell_capture_kputc(void *ctx, char c) {
 static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     if (!cmd || !out || out_cap == 0) return -1;
 
+    /* The substituted command is its own parse; it must not inherit the
+     * enclosing word's double-quote context. */
+    bool saved_dq = g_expand_dquote;
+    g_expand_dquote = false;
+
     struct shell_capture cap = { .buf = out, .cap = out_cap, .pos = 0 };
     out[0] = '\0';
 
@@ -5426,6 +5497,7 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
 
     printk_set_sink_mode(old_sink, old_sink_ctx, old_sink_suppress);
     shell_set_output(old_out, old_out_ctx);
+    g_expand_dquote = saved_dq;
 
     while (cap.pos > 0 &&
            (cap.buf[cap.pos - 1] == '\n' || cap.buf[cap.pos - 1] == '\r')) {
@@ -5557,6 +5629,11 @@ static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
         if (ifs && *ifs) sep = ifs[0];
         else if (!ifs) sep = ' ';
         else sep = '\0';
+    } else if (g_expand_dquote) {
+        /* "$@": emit one field per parameter rather than one joined word. */
+        if (g_positional_count == 0)
+            return shell_append_char(buf, pos, cap, SHELL_FIELD_NULL);
+        sep = SHELL_FIELD_SEP;
     }
     for (int i = 0; i < g_positional_count; i++) {
         if (i > 0 && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
@@ -6543,24 +6620,35 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
             if (*p == '"') {
                 word_quoted = true;
                 p++;
+                bool saved_dq = g_expand_dquote;
+                g_expand_dquote = true;
                 while (*p && *p != '"') {
                     if (*p == '\\' && p[1]) {
                         p++;
                         if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
                             kprintf("shell: word too long\n");
+                            g_expand_dquote = saved_dq;
                             return -1;
                         }
                     } else if (*p == '$') {
-                        if (shell_expand_var(&p, words, &wpos, word_cap) < 0) return -1;
+                        if (shell_expand_var(&p, words, &wpos, word_cap) < 0) {
+                            g_expand_dquote = saved_dq;
+                            return -1;
+                        }
                     } else if (*p == '`') {
-                        if (shell_expand_backtick(&p, words, &wpos, word_cap) < 0) return -1;
+                        if (shell_expand_backtick(&p, words, &wpos, word_cap) < 0) {
+                            g_expand_dquote = saved_dq;
+                            return -1;
+                        }
                     } else {
                         if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
                             kprintf("shell: word too long\n");
+                            g_expand_dquote = saved_dq;
                             return -1;
                         }
                     }
                 }
+                g_expand_dquote = saved_dq;
                 if (*p != '"') {
                     kprintf("shell: unmatched double quote\n");
                     return -1;
@@ -6985,38 +7073,105 @@ static bool shell_is_ifs_char(char c) {
     return false;
 }
 
+/* Walks the final fields of one expanded token. SHELL_FIELD_SEP boundaries
+ * (planted by `"$@"`) always split, even inside quotes; IFS splitting applies
+ * only to the unquoted parts. */
+struct shell_field_iter {
+    const char *p;
+    bool quoted;
+    bool done;
+};
+
+static void shell_field_iter_init(struct shell_field_iter *it,
+                                  const char *word, bool quoted) {
+    it->p = word;
+    it->quoted = quoted;
+    it->done = false;
+}
+
+static bool shell_field_iter_next(struct shell_field_iter *it,
+                                  char *out, size_t cap) {
+    if (it->done) return false;
+    const char *p = it->p;
+    /* SHELL_FIELD_NULL stands in for an empty "$@": it carries no text and
+     * never ends a field, so skip it wherever it turns up. */
+    while (*p == SHELL_FIELD_NULL) p++;
+    if (!it->quoted) {
+        while (*p && *p != SHELL_FIELD_SEP && shell_is_ifs_char(*p)) p++;
+        if (!*p) {
+            it->done = true;
+            return false;
+        }
+    }
+    size_t n = 0;
+    while (*p && *p != SHELL_FIELD_SEP &&
+           (it->quoted || !shell_is_ifs_char(*p))) {
+        if (*p == SHELL_FIELD_NULL) { p++; continue; }
+        if (n + 1 >= cap) {
+            kprintf("shell: field too long\n");
+            it->done = true;
+            return false;
+        }
+        out[n++] = *p++;
+    }
+    out[n] = '\0';
+    if (*p == SHELL_FIELD_SEP) {
+        it->p = p + 1;
+    } else {
+        it->p = p;
+        if (!*p) it->done = true;
+    }
+    return true;
+}
+
+static bool shell_word_has(const char *word, char c) {
+    for (; *word; word++) {
+        if (*word == c) return true;
+    }
+    return false;
+}
+
+/* True when the token is nothing but the marker an empty `"$@"` left behind,
+ * so it contributes no field at all -- `cmd "$@"` with no parameters passes no
+ * argument, unlike `cmd ""`, which passes one empty one. */
+static bool shell_word_is_null_field(const char *word) {
+    bool had_marker = false;
+    for (; *word; word++) {
+        if (*word != SHELL_FIELD_NULL) return false;
+        had_marker = true;
+    }
+    return had_marker;
+}
+
 static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
                          const char *word, bool quoted) {
-    if (quoted) return shell_add_one_arg(pl, cur, word, true);
+    if (shell_word_is_null_field(word)) return 0;
 
-    size_t klen = env_key_len(word);
-    if (cur->argc == 0 && word[klen] == '=' && shell_name_is_valid(word, klen)) {
-        return shell_add_one_arg(pl, cur, word, false);
+    if (quoted && !shell_word_has(word, SHELL_FIELD_SEP) &&
+        !shell_word_has(word, SHELL_FIELD_NULL))
+        return shell_add_one_arg(pl, cur, word, true);
+
+    if (!quoted) {
+        size_t klen = env_key_len(word);
+        if (cur->argc == 0 && word[klen] == '=' &&
+            shell_name_is_valid(word, klen)) {
+            return shell_add_one_arg(pl, cur, word, false);
+        }
     }
 
-    const char *p = word;
+    struct shell_field_iter it;
+    shell_field_iter_init(&it, word, quoted);
+    char tmp[SHELL_PARSE_BUF_MAX];
     bool added = false;
-    while (*p) {
-        while (shell_is_ifs_char(*p)) p++;
-        if (!*p) break;
-        const char *start = p;
-        while (*p && !shell_is_ifs_char(*p)) p++;
-        size_t n = (size_t)(p - start);
-        char tmp[SHELL_PARSE_BUF_MAX];
-        if (n + 1 > sizeof(tmp)) {
-            kprintf("shell: field too long\n");
-            return -1;
-        }
-        memcpy(tmp, start, n);
-        tmp[n] = '\0';
+    while (shell_field_iter_next(&it, tmp, sizeof(tmp))) {
         char *saved = 0;
         if (shell_pipeline_save_word(pl, tmp, &saved) < 0) return -1;
-        if (shell_add_one_arg(pl, cur, saved, false) < 0) return -1;
+        if (shell_add_one_arg(pl, cur, saved, quoted) < 0) return -1;
         added = true;
     }
 
     if (!added && word[0] == '\0') {
-        return shell_add_one_arg(pl, cur, word, false);
+        return shell_add_one_arg(pl, cur, word, quoted);
     }
     return 0;
 }
@@ -8281,17 +8436,10 @@ static bool shell_try_for_command(const char *src) {
 
     char list[LINE_MAX];
     char body[LINE_MAX];
+    /* `for x; do` iterates "$@" -- one field per parameter, so a parameter
+     * containing blanks stays one iteration. */
     if (implicit_at) {
-        size_t lpos = 0;
-        for (int i = 0; i < g_positional_count; i++) {
-            if (i > 0 && shell_append_char(list, &lpos, sizeof(list), ' ') < 0) {
-                kprintf("for: list too long\n"); shell_set_status(2); return true;
-            }
-            if (shell_append_str(list, &lpos, sizeof(list), g_positional[i]) < 0) {
-                kprintf("for: list too long\n"); shell_set_status(2); return true;
-            }
-        }
-        list[lpos] = '\0';
+        memcpy(list, "\"$@\"", 5);
     } else {
         if (shell_copy_segment(list, sizeof(list), s, do_at) < 0) {
             kprintf("for: command too long\n");
@@ -8314,11 +8462,46 @@ static bool shell_try_for_command(const char *src) {
         return true;
     }
 
+    /* The word list gets the same field splitting an argument list would:
+     * IFS splitting for unquoted words, one field per parameter for "$@".
+     * `words` is already consumed by the tokenizer, so the split fields go in
+     * their own buffer. */
+    char items[SHELL_PARSE_BUF_MAX];
+    const char *item[ARG_MAX];
+    int nitems = 0;
+    size_t ipos = 0;
+    for (int i = 0; i < ntok && nitems < ARG_MAX; i++) {
+        if (tok[i].type != SH_TOK_WORD) continue;
+        if (shell_word_is_null_field(tok[i].text)) continue;
+        struct shell_field_iter it;
+        shell_field_iter_init(&it, tok[i].text, tok[i].quoted);
+        char field[LINE_MAX];
+        bool any = false;
+        while (nitems < ARG_MAX &&
+               shell_field_iter_next(&it, field, sizeof(field))) {
+            size_t n = strlen(field);
+            if (ipos + n + 1 > sizeof(items)) {
+                kprintf("for: list too long\n");
+                shell_set_status(2);
+                return true;
+            }
+            memcpy(items + ipos, field, n + 1);
+            item[nitems++] = items + ipos;
+            ipos += n + 1;
+            any = true;
+        }
+        if (!any && tok[i].quoted && tok[i].text[0] == '\0' &&
+            nitems < ARG_MAX && ipos < sizeof(items)) {
+            items[ipos] = '\0';
+            item[nitems++] = items + ipos;
+            ipos++;
+        }
+    }
+
     int last = 0;
     g_shell_loop_depth++;
-    for (int i = 0; i < ntok; i++) {
-        if (tok[i].type != SH_TOK_WORD) continue;
-        if (env_set(name, tok[i].text) < 0) {
+    for (int i = 0; i < nitems; i++) {
+        if (env_set(name, item[i]) < 0) {
             kprintf("for: failed to set '%s'\n", name);
             g_shell_loop_depth--;
             shell_set_status(1);
@@ -9184,11 +9367,120 @@ static bool shell_try_group_command(const char *src) {
     return true;
 }
 
-static void execute_line_text(const char *src) {
+/* Find the next top-level list separator (`;`, `&`, `&&`, `||`) in `s`,
+ * skipping quotes, expansions and comments. A lone `|` is a pipe, not a list
+ * separator, and the `&` of `2>&1` is part of a redirection. */
+static const char *shell_find_list_sep(const char *s, int *oplen,
+                                       enum shell_tok_type *op) {
+    for (const char *p = s; *p; p++) {
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'') {
+            p++;
+            while (*p && *p != '\'') p++;
+            if (!*p) return 0;
+            continue;
+        }
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"') {
+                if (*p == '\\' && p[1]) p++;
+                p++;
+            }
+            if (!*p) return 0;
+            continue;
+        }
+        if (*p == '$') {
+            const char *e = shell_skip_expansion(p);
+            if (e) { p = e; continue; }
+        }
+        if (*p == '`') {
+            const char *e = shell_skip_backticks(p);
+            if (e) { p = e; continue; }
+        }
+        if (*p == '#' && (p == s || is_space(p[-1]))) return 0;
+        if (*p == ';') {
+            *oplen = 1;
+            *op = SH_TOK_SEMI;
+            return p;
+        }
+        if (*p == '&') {
+            if (p[1] == '&') {
+                *oplen = 2;
+                *op = SH_TOK_AND_IF;
+                return p;
+            }
+            if (p > s && (p[-1] == '>' || p[-1] == '<')) continue;
+            *oplen = 1;
+            *op = SH_TOK_BG;
+            return p;
+        }
+        if (*p == '|' && p[1] == '|') {
+            *oplen = 2;
+            *op = SH_TOK_OR_IF;
+            return p;
+        }
+    }
+    return 0;
+}
+
+/* Run one and-or-list element: a single pipeline, already isolated from the
+ * rest of the line so its expansions happen at the moment it runs. */
+static void shell_run_segment(const char *src, bool background) {
     struct shell_token tok[SHELL_TOKEN_MAX];
     char words[SHELL_PARSE_BUF_MAX];
-    char alias_buf[SHELL_PARSE_BUF_MAX];
     int ntok = 0;
+
+    if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) {
+        shell_set_status(2);
+        return;
+    }
+    if (ntok == 0) return;
+
+    int i = 0;
+    bool negate = false;
+    while (i < ntok && tok[i].type == SH_TOK_WORD &&
+           strcmp(tok[i].text, "!") == 0) {
+        negate = !negate;
+        i++;
+    }
+    if (i >= ntok) {
+        int last = g_last_status;
+        if (negate) last = last == 0 ? 1 : 0;
+        shell_set_status(last);
+        return;
+    }
+
+    struct shell_pipeline pl;
+    int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
+    if (parsed < 0) {
+        shell_set_status(2);
+        return;
+    }
+    if (parsed == 0) {
+        kprintf("shell: expected command\n");
+        shell_set_status(2);
+        return;
+    }
+
+    if (g_opt_xtrace) {
+        const char *ps4 = env_get("PS4");
+        kprintf("%s", ps4 ? ps4 : "+ ");
+        for (int st = 0; st < pl.count; st++) {
+            if (st > 0) kprintf("| ");
+            for (int a = 0; a < pl.stage[st].argc; a++)
+                kprintf("%s%s", pl.stage[st].argv[a],
+                        a + 1 < pl.stage[st].argc ? " " : "");
+        }
+        kprintf("\n");
+    }
+    int last = shell_run_pipeline(&pl, background);
+    if (negate) last = last == 0 ? 1 : 0;
+    shell_set_status(last);
+}
+
+static void execute_line_text(const char *src) {
+    char alias_buf[SHELL_PARSE_BUF_MAX];
+    char seg[LINE_MAX];
 
     src = src ? src : "";
     if (g_shell_flow != SHELL_FLOW_NONE) return;
@@ -9211,79 +9503,55 @@ static void execute_line_text(const char *src) {
         return;
     }
 
-    if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) {
-        shell_set_status(2);
-        return;
-    }
-    if (ntok == 0) return;
-
-    int i = 0;
+    /* Split the and-or list on raw text BEFORE expanding anything: POSIX
+     * expands each command as it is about to run, so `X=1; echo $X` has to
+     * see the assignment the first command made. Tokenizing the whole line
+     * up front expanded `$X` while X was still unset. */
+    const char *p = src;
     enum shell_tok_type prev_link = SH_TOK_SEMI;
     int last = g_last_status;
+    bool ran_any = false;
 
-    while (i < ntok) {
-        while (i < ntok && tok[i].type == SH_TOK_SEMI) i++;
-        if (i >= ntok) break;
+    while (*p) {
+        int oplen = 0;
+        enum shell_tok_type op = SH_TOK_SEMI;
+        const char *sep = shell_find_list_sep(p, &oplen, &op);
+        size_t n = sep ? (size_t)(sep - p) : strlen(p);
+        if (n + 1 > sizeof(seg)) {
+            kprintf("shell: command too long\n");
+            shell_set_status(2);
+            return;
+        }
+        memcpy(seg, p, n);
+        seg[n] = '\0';
+        p = sep ? sep + oplen : p + n;
+
+        const char *body = shell_skip_blanks(seg);
+        if (*body == '\0' || *body == '#') {
+            prev_link = op;
+            continue;
+        }
 
         bool should_run = (prev_link == SH_TOK_SEMI || prev_link == SH_TOK_BG) ||
                           (prev_link == SH_TOK_AND_IF && last == 0) ||
                           (prev_link == SH_TOK_OR_IF && last != 0);
-
-        bool negate = false;
-        while (i < ntok && tok[i].type == SH_TOK_WORD &&
-               strcmp(tok[i].text, "!") == 0) {
-            negate = !negate;
-            i++;
-        }
-        if (i >= ntok || shell_is_list_sep(tok[i].type)) {
-            if (negate) {
-                last = g_last_status == 0 ? 1 : 0;
-                shell_set_status(last);
-            }
-            enum shell_tok_type sep2 = shell_consume_separator(tok, ntok, &i);
-            prev_link = sep2;
-            continue;
-        }
-
-        struct shell_pipeline pl;
-        int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
-        if (parsed < 0) {
-            shell_set_status(2);
-            return;
-        }
-        if (parsed == 0) {
-            kprintf("shell: expected command\n");
-            shell_set_status(2);
-            return;
-        }
-
-        enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
-        bool background = (sep == SH_TOK_BG);
         if (should_run) {
-            if (g_opt_xtrace) {
-                kprintf("+ ");
-                for (int s = 0; s < pl.count; s++) {
-                    if (s > 0) kprintf("| ");
-                    for (int a = 0; a < pl.stage[s].argc; a++)
-                        kprintf("%s%s", pl.stage[s].argv[a],
-                                a + 1 < pl.stage[s].argc ? " " : "");
-                }
-                kprintf("\n");
-            }
-            last = shell_run_pipeline(&pl, background);
-            if (negate) last = last == 0 ? 1 : 0;
-            shell_set_status(last);
+            shell_run_segment(seg, op == SH_TOK_BG);
+            last = g_last_status;
+            ran_any = true;
             if (g_shell_flow != SHELL_FLOW_NONE) return;
-            if (g_opt_errexit && last != 0 && !negate &&
+            if (g_opt_errexit && last != 0 &&
                 prev_link != SH_TOK_AND_IF && prev_link != SH_TOK_OR_IF &&
+                op != SH_TOK_AND_IF && op != SH_TOK_OR_IF &&
                 g_shell_loop_depth == 0) {
                 g_shell_flow = SHELL_FLOW_EXIT;
                 g_shell_flow_status = last;
                 return;
             }
         }
-        prev_link = sep;
+        prev_link = op;
     }
+    (void)ran_any;
 }
 
 static char g_heredoc_cmd[LINE_MAX];
