@@ -1136,8 +1136,21 @@ static int shell_canonicalize_path(const char *in, char *out, size_t cap) {
     return 0;
 }
 
+#ifdef SHELL_HOSTED
+/* The hosted shell must move the PROCESS, not just its own idea of where
+ * it is. host.c's current_proc() re-reads the real getcwd() every call --
+ * it is a view of a process the shell does not own -- so writing p->cwd
+ * was overwritten microseconds later and every `cd` silently did nothing
+ * while reporting success. Declared here rather than via <unistd.h>:
+ * this file speaks the kernel's headers. */
+extern int chdir(const char *path);
+#endif
+
 static int shell_set_cwd(const char *path) {
     if (!path || !*path) return -1;
+#ifdef SHELL_HOSTED
+    if (chdir(path) != 0) return -1;
+#endif
     struct proc *p = current_proc();
     if (p) {
         size_t n = strlen(path);
@@ -1149,6 +1162,11 @@ static int shell_set_cwd(const char *path) {
 
 static void shell_restore_cwd_only(const char *path) {
     if (!path || !*path) return;
+#ifdef SHELL_HOSTED
+    /* Unwinding a builtin/subshell frame has to move the process back too,
+     * or the restore is as fictional as the cd was. */
+    (void)chdir(path);
+#endif
     struct proc *p = current_proc();
     if (!p) return;
     size_t n = strlen(path);
@@ -7334,7 +7352,24 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     shell_set_output(shell_capture_write, &cap);
     printk_set_sink_mode(shell_capture_kputc, &cap, true);
 
+    /* A failure INSIDE the substitution is not the parent's error.
+     *
+     *     set -e; echo $(echo one; false); echo status=$?
+     *
+     * prints `one` then `status=0` in bash, dash and ash: turning that
+     * failure into the parent's is what `shopt -s inherit_errexit` is
+     * for, and it is off by default. The substitution runs through
+     * execute_line_text, which is where the errexit trigger lives, so
+     * without this the script simply stopped.
+     *
+     * g_last_status is restored for the same reason: $? belongs to the
+     * ENCLOSING command, and letting the inner status leak out made
+     * `echo $?` report the substitution's failure. */
+    int saved_status = g_last_status;
+    g_errexit_suspend++;
     execute_line_text(cmd);
+    g_errexit_suspend--;
+    g_last_status = saved_status;
 
     printk_set_sink_mode(old_sink, old_sink_ctx, old_sink_suppress);
     shell_set_output(old_out, old_out_ctx);
