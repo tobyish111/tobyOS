@@ -196,6 +196,7 @@ static int g_exec_line_depth;
 static bool shell_name_is_valid(const char *s, size_t n);
 static bool shell_special_builtin_name(const char *name);
 static int shell_expand_param_word(const char *word, char *out, size_t cap);
+static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
 static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
 static int shell_append_str(char *buf, size_t *pos, size_t cap, const char *s);
 static bool shell_word_has(const char *word, char c);
@@ -4378,15 +4379,26 @@ static bool shell_heredoc_delim_char(char c) {
            c != '|' && c != '<' && c != '>';
 }
 
-static bool shell_line_find_heredoc(const char *line, char *delim, size_t cap,
-                                    bool *strip_tabs, bool *quoted) {
+/* One `<<WORD` operator: its delimiter and how it was written. */
+struct shell_heredoc_spec {
+    char delim[64];
+    bool strip_tabs;      /* <<- : leading tabs stripped from the body */
+    bool quoted;          /* delimiter was quoted: body does not expand */
+};
+
+/* Find EVERY here-document operator on `line`, left to right, which is the
+ * order their bodies follow the line in. Returns how many were found.
+ *
+ * This used to stop at the first one, so `cat <<A | cat <<B` collected one
+ * body and then ran a command still waiting for a second. The consumer side
+ * (g_heredocs) was always a queue -- only the producer was singular. */
+static int shell_line_find_heredocs(const char *line,
+                                    struct shell_heredoc_spec *out, int max) {
     bool in_single = false;
     bool in_double = false;
-    *strip_tabs = false;
-    *quoted = false;
-    delim[0] = '\0';
+    int found = 0;
 
-    for (const char *p = line; *p; p++) {
+    for (const char *p = line; *p && found < max; p++) {
         if (in_single) {
             if (*p == '\'') in_single = false;
             continue;
@@ -4429,11 +4441,19 @@ static bool shell_line_find_heredoc(const char *line, char *delim, size_t cap,
             if (!*p) break;
             continue;
         }
-        if (p[0] != '<' || p[1] != '<') continue;
+        /* `<<<` is a here-STRING, not a here-document: it takes its text
+         * from the same line and has no body to collect. Reading it as `<<`
+         * would send the reader hunting for a delimiter that never comes. */
+        if (p[0] != '<' || p[1] != '<' || p[2] == '<') continue;
+
+        struct shell_heredoc_spec *sp = &out[found];
+        sp->strip_tabs = false;
+        sp->quoted = false;
+        sp->delim[0] = '\0';
 
         p += 2;
         if (*p == '-') {
-            *strip_tabs = true;
+            sp->strip_tabs = true;
             p++;
         }
         while (*p == ' ' || *p == '\t') p++;
@@ -4442,21 +4462,45 @@ static bool shell_line_find_heredoc(const char *line, char *delim, size_t cap,
         while (shell_heredoc_delim_char(*p)) {
             if (*p == '\'' || *p == '"') {
                 char q = *p++;
-                *quoted = true;
+                sp->quoted = true;
                 while (*p && *p != q) {
-                    if (pos + 1 >= cap) return false;
-                    delim[pos++] = *p++;
+                    if (pos + 1 >= sizeof sp->delim) return found;
+                    sp->delim[pos++] = *p++;
                 }
                 if (*p == q) p++;
                 continue;
             }
-            if (pos + 1 >= cap) return false;
-            delim[pos++] = *p++;
+            if (pos + 1 >= sizeof sp->delim) return found;
+            sp->delim[pos++] = *p++;
         }
-        delim[pos] = '\0';
-        return delim[0] != '\0';
+        sp->delim[pos] = '\0';
+        if (!sp->delim[0]) return found;       /* `<<` with no word */
+        found++;
+        /* Keep scanning from here. The for-header's p++ would skip the
+         * character the delimiter scan stopped on, so step back one. */
+        p--;
     }
-    return false;
+    return found;
+}
+
+/* Single-result wrapper. The interactive reader is a state machine spread
+ * across calls and still handles one here-document at a time; scripts (the
+ * path that matters for conformance) use the plural form below. */
+static bool shell_line_find_heredoc(const char *line, char *delim, size_t cap,
+                                    bool *strip_tabs, bool *quoted) {
+    struct shell_heredoc_spec sp[1];
+    if (shell_line_find_heredocs(line, sp, 1) < 1) {
+        delim[0] = '\0';
+        *strip_tabs = false;
+        *quoted = false;
+        return false;
+    }
+    size_t n = strlen(sp[0].delim);
+    if (n + 1 > cap) return false;
+    memcpy(delim, sp[0].delim, n + 1);
+    *strip_tabs = sp[0].strip_tabs;
+    *quoted = sp[0].quoted;
+    return true;
 }
 
 static bool shell_heredoc_line_matches(const char *line, const char *delim,
@@ -4499,8 +4543,8 @@ static int shell_collect_heredoc(char **pp, const char *delim,
         const char *emit = line_start;
         char expanded[LINE_MAX * 2];
         if (!quoted) {
-            if (shell_expand_param_word(line_start, expanded,
-                                        sizeof(expanded)) < 0) {
+            if (shell_expand_literal_quotes(line_start, expanded,
+                                            sizeof(expanded)) < 0) {
                 kfree(body);
                 return -1;
             }
@@ -4826,18 +4870,25 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
          * both writable, and the result is never longer than the input. */
         shell_normalise_separators(line);
 
-        char delim[64];
-        bool strip_tabs = false;
-        bool quoted = false;
+        /* Every here-document the line opens, collected in the order the
+         * operators appear -- which is the order their bodies follow, and
+         * the order the redirection code pops them off the queue. */
+        struct shell_heredoc_spec hd[SHELL_HEREDOC_MAX];
+        int nhd = shell_line_find_heredocs(line, hd, SHELL_HEREDOC_MAX);
         shell_heredoc_reset();
-        if (shell_line_find_heredoc(line, delim, sizeof(delim),
-                                    &strip_tabs, &quoted)) {
-            if (shell_collect_heredoc(&p, delim, strip_tabs, quoted) < 0) {
-                last = 2;
-                shell_set_status(2);
-                if (accum) kfree(accum);
+        bool hd_failed = false;
+        for (int hi = 0; hi < nhd; hi++) {
+            if (shell_collect_heredoc(&p, hd[hi].delim, hd[hi].strip_tabs,
+                                      hd[hi].quoted) < 0) {
+                hd_failed = true;
                 break;
             }
+        }
+        if (hd_failed) {
+            last = 2;
+            shell_set_status(2);
+            if (accum) kfree(accum);
+            break;
         }
         execute_line_text(line);
         if (accum) { kfree(accum); accum = 0; line = 0; }
@@ -7549,14 +7600,15 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
  * needs a "do not split this span" marker through the splitter, the way
  * SHELL_ARG_MARK carries "$@" word boundaries; quote REMOVAL is correct on its
  * own and is what most of these expansions actually need. */
-static int shell_expand_param_word(const char *word, char *out, size_t cap) {
+static int shell_expand_word_ex(const char *word, char *out, size_t cap,
+                               bool quotes_are_syntax) {
     const char *p = word ? word : "";
     size_t pos = 0;
     if (!out || cap == 0) return -1;
     out[0] = '\0';
 
     while (*p) {
-        if (*p == '\'') {                    /* literal until the next quote */
+        if (quotes_are_syntax && *p == '\'') {   /* literal to next quote */
             p++;
             if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             while (*p && *p != '\'') {
@@ -7566,7 +7618,7 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap) {
             if (*p == '\'') p++;
             continue;
         }
-        if (*p == '"') {                     /* expanding, but quotes removed */
+        if (quotes_are_syntax && *p == '"') {    /* expands, quotes removed */
             p++;
             if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             while (*p && *p != '"') {
@@ -7600,6 +7652,20 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap) {
     }
     out[pos] = '\0';
     return 0;
+}
+
+/* The WORD of ${name-WORD}: quotes are shell syntax and are removed. */
+static int shell_expand_param_word(const char *word, char *out, size_t cap) {
+    return shell_expand_word_ex(word, out, cap, true);
+}
+
+/* A here-document body line, or the inside of $(( )): $ and ` still expand,
+ * but a quote is an ORDINARY CHARACTER. `cat <<EOF` containing `it's fine`
+ * must print the apostrophe, and the arithmetic evaluator has always been
+ * handed its text with quotes intact. Sharing one expander with the ${...}
+ * word above is what briefly made both of those wrong. */
+static int shell_expand_literal_quotes(const char *word, char *out, size_t cap) {
+    return shell_expand_word_ex(word, out, cap, false);
 }
 
 /* Copy `src` to `dst`, dropping split-protection markers. Called wherever a
@@ -8236,8 +8302,8 @@ static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
                  * inside arithmetic for free. */
                 char *xexpr = kmalloc(SHELL_PARSE_BUF_MAX);
                 if (xexpr) {
-                    if (shell_expand_param_word(expr, xexpr,
-                                                SHELL_PARSE_BUF_MAX) == 0 &&
+                    if (shell_expand_literal_quotes(expr, xexpr,
+                                                    SHELL_PARSE_BUF_MAX) == 0 &&
                         strlen(xexpr) < sizeof(expr)) {
                         memcpy(expr, xexpr, strlen(xexpr) + 1);
                     }
@@ -12442,8 +12508,8 @@ static void execute_line(void) {
             const char *emit = line;
             char expanded[LINE_MAX * 2];
             if (!g_heredoc_quoted) {
-                if (shell_expand_param_word(line, expanded,
-                                            sizeof(expanded)) >= 0)
+                if (shell_expand_literal_quotes(line, expanded,
+                                                sizeof(expanded)) >= 0)
                     emit = expanded;
             }
             size_t n = strlen(emit);
