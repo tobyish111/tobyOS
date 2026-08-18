@@ -554,7 +554,11 @@ static void usage(void) {
 int main(int argc, char **argv) {
     shell_init_hosted(argv[0]);
 
+    /* `-c` and a script file are NOT terminal sessions. Only the loop at the
+     * bottom of this function is, and it leaves the default alone. Getting
+     * this backwards makes a script expand aliases where bash does not. */
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
+        shell_set_interactive_hosted(false);
         if (argc > 3) (void)shell_set_args_hosted(argc - 3, argv + 3);
         return shell_run_line_hosted(argv[2]);
     }
@@ -563,6 +567,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (argc >= 2) {
+        shell_set_interactive_hosted(false);
         if (argc > 2) (void)shell_set_args_hosted(argc - 2, argv + 2);
         return shell_run_script_hosted(argv[1]);
     }

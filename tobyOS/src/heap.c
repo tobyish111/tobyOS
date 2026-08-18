@@ -44,6 +44,16 @@
 #define KHEAP_ALIGN       16u
 #define KHEAP_MIN_SPLIT   32u            /* don't split if remainder < this */
 #define KHEAP_GROW_PAGES  16u            /* grow in 64 KiB chunks at minimum */
+
+/* At or above this, an allocation gets a private arena that is released the
+ * moment it is freed. Chosen well above anything the kernel allocates
+ * routinely and well below a process image, so the general pool keeps
+ * servicing everyday traffic and only the big transients are segregated. */
+#define KHEAP_LARGE       (128u * 1024u)
+
+/* arena_t::flags */
+#define ARENA_HUGE        0x1u   /* 2 MiB-page backed (was the old _pad==1) */
+#define ARENA_DEDICATED   0x2u   /* holds exactly one allocation; freed with it */
 #define KHEAP_MAGIC       0xC0DEFEEDu
 
 #define INUSE_BIT         1u
@@ -63,7 +73,9 @@ typedef struct arena {
     size_t        pages;        /* page count for pmm_free_pages_range */
     size_t        total_size;   /* bytes after the arena header */
     uint32_t      magic;
-    uint32_t      _pad;
+    uint32_t      flags;        /* ARENA_* -- was _pad; keeps the header 32
+                                 * bytes, which is what makes payloads
+                                 * 16-aligned. Do not grow this struct. */
 } arena_t;
 
 typedef struct block_hdr {
@@ -156,7 +168,7 @@ static arena_t *grow_huge(size_t bytes) {
     a->pages      = n2m * (KHEAP_2M / PAGE_SIZE);
     a->total_size = (size_t)n2m * KHEAP_2M - sizeof(arena_t);
     a->magic      = KHEAP_MAGIC;
-    a->_pad       = 1;                      /* huge marker */
+    a->flags      = ARENA_HUGE;
     g_arenas      = a;
 
     block_hdr_t *b = first_block(a);
@@ -225,7 +237,7 @@ static arena_t *grow(size_t need_bytes) {
     a->pages     = pages;
     a->total_size = pages * PAGE_SIZE - sizeof(arena_t);
     a->magic     = KHEAP_MAGIC;
-    a->_pad      = 0;                       /* 4 KiB-backed arena */
+    a->flags     = 0;                       /* 4 KiB-backed arena */
     g_arenas     = a;
 
     block_hdr_t *b = first_block(a);
@@ -286,7 +298,26 @@ void *kmalloc(size_t n) {
     size_t need = align_up(n + sizeof(block_hdr_t), KHEAP_ALIGN);
 
     uint64_t flags = spin_lock_irqsave(&g_heap_lock);
+
+    /* Big transients never share an arena with anything else -- see the note
+     * at the top of this file. Skipping the search is not just an
+     * optimisation: allocating a 1 MiB image inside a general arena is what
+     * lets a later 64-byte object pin a megabyte for the life of the system. */
+    if (need >= KHEAP_LARGE) {
+        arena_t *ded = grow(need);
+        if (!ded) {
+            spin_unlock_irqrestore(&g_heap_lock, flags);
+            return 0;
+        }
+        ded->flags |= ARENA_DEDICATED;
+        void *p = try_alloc_in(ded, need);
+        if (p) g_alloc_count++;
+        spin_unlock_irqrestore(&g_heap_lock, flags);
+        return p;
+    }
+
     for (arena_t *a = g_arenas; a; a = a->next) {
+        if (a->flags & ARENA_DEDICATED) continue;   /* not a shared pool */
         void *p = try_alloc_in(a, need);
         if (p) {
             g_alloc_count++;
@@ -366,14 +397,42 @@ void kfree(void *p) {
     g_used_bytes -= bsz;
     g_free_count++;
 
-    /* Find which arena owns this block, then coalesce that arena. */
-    for (arena_t *a = g_arenas; a; a = a->next) {
-        if ((uint8_t *)b >= (uint8_t *)first_block(a) &&
-            (uint8_t *)b <  (uint8_t *)arena_end(a)) {
-            coalesce_arena(a);
-            spin_unlock_irqrestore(&g_heap_lock, flags);
-            return;
+    /* Find which arena owns this block, then coalesce that arena. `prev` is
+     * tracked so a dedicated arena can be unlinked below. */
+    arena_t *prev = 0;
+    for (arena_t *a = g_arenas; a; prev = a, a = a->next) {
+        if ((uint8_t *)b < (uint8_t *)first_block(a) ||
+            (uint8_t *)b >= (uint8_t *)arena_end(a)) continue;
+
+        coalesce_arena(a);
+
+        /* A dedicated arena holds exactly one allocation, so freeing it makes
+         * the arena wholly free and it can go back to the PMM. Verified
+         * rather than assumed: the single block must be free and span the
+         * whole arena. */
+        if (a->flags & ARENA_DEDICATED) {
+            block_hdr_t *only = first_block(a);
+            if (!(only->size & INUSE_BIT) &&
+                (only->size & SIZE_MASK) == a->total_size) {
+                if (prev) prev->next = a->next;
+                else      g_arenas   = a->next;
+                g_total_bytes -= a->total_size;
+
+                uint64_t base  = (uint64_t)a;
+                size_t   pages = a->pages;
+                bool     huge  = (a->flags & ARENA_HUGE) != 0;
+                /* Unmap AFTER unlinking: nothing can reach the arena now. The
+                 * virtual range is not recycled (g_kheap_brk is a bump cursor
+                 * over a 1 TiB window); the physical frames are, and those are
+                 * what ran out. */
+                spin_unlock_irqrestore(&g_heap_lock, flags);
+                if (huge) rollback_huge(base, pages / (KHEAP_2M / PAGE_SIZE));
+                else      rollback_pages(base, pages);
+                return;
+            }
         }
+        spin_unlock_irqrestore(&g_heap_lock, flags);
+        return;
     }
     spin_unlock_irqrestore(&g_heap_lock, flags);
     kpanic("kfree(%p): block does not belong to any known arena", p);

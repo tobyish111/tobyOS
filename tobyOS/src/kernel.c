@@ -8728,6 +8728,47 @@ void _start(void) {
     }
 #endif
 
+#ifdef OILSPEC_BOOT
+    /* The THIRD-PARTY shell conformance gate.
+     *
+     * SHPARITY_BOOT above runs 54 cases we wrote. This runs ~2,776 written by
+     * the Oils project, for their own shell, to document where bash/dash/mksh/
+     * ash/zsh disagree -- a corpus nobody here chose, over corners nobody here
+     * thought of. It is the difference between "passes our tests" and "passes
+     * someone else's".
+     *
+     * Same oracle as shparity: the unmodified GNU bash 5.2 in the initrd, not
+     * a specification we interpret. /bin/oilspec runs each /etc/oilspec/*.sh
+     * case under bash and /bin/tsh and diffs stdout + exit status.
+     *
+     * To restrict the run to one band of case ids WITH full per-case diffs,
+     * put "LO-HI" in /etc/oilspec/FILTER (logs/oilspec.sh writes it). That
+     * used to be a -DOILSPEC_FILTER string macro, but the quotes did not
+     * survive make -> sh -> clang: the macro expanded to the integer
+     * expression 0001-0200, argv[1] became (char *)1 - 200, and the gate
+     * faulted before printing anything. A file has no quoting layers.
+     *
+     * Needs a writable /tmp or /data for scratch; /bin/oilspec reports SKIP
+     * with the reason if neither is there, rather than inventing a pass. */
+    {
+        char *argv[] = { (char *)"oilspec", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/oilspec", .name = "oilspec",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] OILSPEC: third-party shell conformance gate\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[OILSPEC] VERDICT: SKIP reason=no-binary "
+                    "(/bin/oilspec not staged)\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] OILSPEC: gate (pid=%d) exit=%d\n", pid, rc);
+        }
+    }
+#endif
+
 #ifdef REALBASH_BOOT
     /* Track B: run a REAL, UNMODIFIED, off-the-shelf GNU bash 5.2 as an
      * INTERACTIVE shell over the console TTY. Where B22 ran busybox's small

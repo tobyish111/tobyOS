@@ -1,0 +1,5 @@
+empty=""
+space=" "
+AB="A B"
+X="X"
+Yspaces=" Y "

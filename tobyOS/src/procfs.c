@@ -216,6 +216,24 @@ static int gen_meminfo(char *buf, size_t cap) {
     APPEND_STR("Cached:       "); APPEND_KB(0);     APPEND_STR("\n");
     APPEND_STR("SwapTotal:    "); APPEND_KB(0);     APPEND_STR("\n");
     APPEND_STR("SwapFree:     "); APPEND_KB(0);     APPEND_STR("\n");
+
+    /* Kernel heap, which Linux does not report here and we do.
+     *
+     * MemFree alone cannot tell a LEAK from FRAGMENTATION, and those need
+     * opposite fixes. HeapUsed climbing means unbalanced kmalloc/kfree;
+     * HeapUsed flat while HeapTotal climbs means the allocator is holding
+     * arenas it cannot reuse. The shell conformance gate loses ~620 KiB per
+     * process spawn and reading MemFree for an hour could not distinguish
+     * the two. Allocs/Frees make an imbalance countable directly. */
+    {
+        struct heap_stats hs;
+        heap_stats(&hs);
+        APPEND_STR("HeapTotal:    "); APPEND_KB(hs.total_bytes / 1024); APPEND_STR("\n");
+        APPEND_STR("HeapUsed:     "); APPEND_KB(hs.used_bytes  / 1024); APPEND_STR("\n");
+        APPEND_STR("HeapArenas:   "); APPEND_KB(hs.arenas);             APPEND_STR("\n");
+        APPEND_STR("HeapAllocs:   "); APPEND_KB(hs.alloc_count);        APPEND_STR("\n");
+        APPEND_STR("HeapFrees:    "); APPEND_KB(hs.free_count);         APPEND_STR("\n");
+    }
     buf[off] = '\0';
     return off;
 

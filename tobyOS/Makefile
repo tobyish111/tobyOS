@@ -510,6 +510,8 @@ PROGRAMS := programs/awk/awk.elf \
             programs/init/init.elf \
             programs/sh/sh.elf \
             programs/shparity/shparity.elf \
+            programs/oilspec/oilspec.elf \
+            programs/spechelp/spechelp.elf \
             programs/tsh/tsh.elf \
             programs/devmgr/devmgr.elf \
             programs/indexer/indexer.elf \
@@ -1587,6 +1589,13 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_sh,user_sh))
 # under BOTH the real GNU bash 5.2 we already ship and /bin/tsh, and requires
 # byte-identical stdout plus an identical exit status. See programs/shparity.
 $(eval $(call LIBTOBY_PROGRAM_RULES,shparity,shparity))
+# /bin/oilspec -- the THIRD-PARTY conformance gate. Same differential engine
+# as shparity, but over the ~2.8k-case Oils spec suite in third_party/oils-spec
+# rather than the 54 cases we wrote ourselves. See programs/oilspec.
+$(eval $(call LIBTOBY_PROGRAM_RULES,oilspec,oilspec))
+# The corpus's Python helpers (argv.py and friends) reimplemented in C, so the
+# gate does not depend on CPython and the host oracle runs the SAME code.
+$(eval $(call LIBTOBY_PROGRAM_RULES,spechelp,spechelp))
 
 # ---------- /bin/tsh: the shell language, hosted in userspace ----------
 #
@@ -2872,6 +2881,17 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
 	mkdir -p $(INITRD_STAGE)/etc/shparity
 	cp initrd/etc/shparity/*.sh                     $(INITRD_STAGE)/etc/shparity/
+	cp programs/oilspec/oilspec.elf                 $(INITRD_STAGE)/bin/oilspec
+	mkdir -p $(INITRD_STAGE)/etc/oilspec/bin
+# 2,776 case files: `cp a/*.sh b/` blows past the command-line limit here, so
+# copy the directory rather than the glob.
+	cp -r initrd/etc/oilspec/.                      $(INITRD_STAGE)/etc/oilspec/
+# One binary, four names. tobyOS has no hard links, so these are copies -- and
+# spechelp dispatches on argv[0], so the name IS the interface.
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/argv.py
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/printenv.py
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/stdout_stderr.py
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/read_from_fd.py
 	cp programs/user_pkg/user_pkg.elf               $(INITRD_STAGE)/bin/pkg
 	cp programs/user_svcctl/user_svcctl.elf         $(INITRD_STAGE)/bin/svcctl
 	cp programs/user_ps/user_ps.elf                 $(INITRD_STAGE)/bin/ps
@@ -2925,6 +2945,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp $(PORTS_SBASE_DIR)/head.elf                    $(INITRD_STAGE)/bin/p_head
 	cp $(PORTS_SBASE_DIR)/ls.elf                      $(INITRD_STAGE)/bin/p_ls
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/p_grep
+# ...and under the names scripts actually use. sbase's grep/wc/head had a
+# p_ prefix and no plain entry, so `grep` was simply not a command that
+# existed. echo/cat/ls keep the prefix because other programs own those.
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/grep
+	cp $(PORTS_SBASE_DIR)/wc.elf                      $(INITRD_STAGE)/bin/wc
+	cp $(PORTS_SBASE_DIR)/head.elf                    $(INITRD_STAGE)/bin/head
 	cp $(PORTS_SBASE_DIR)/basename.elf                  $(INITRD_STAGE)/bin/basename
 	cp $(PORTS_SBASE_DIR)/dirname.elf                   $(INITRD_STAGE)/bin/dirname
 	cp $(PORTS_SBASE_DIR)/sleep.elf                     $(INITRD_STAGE)/bin/sleep
@@ -3447,7 +3473,13 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/sigtest bin/mctest bin/reclaimtest bin/tobycc bin/tobybuild bin/selfhosttest \
     bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
-	    bin/tsh bin/shparity                                              \
+	    bin/grep bin/wc bin/head                                          \
+	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
+	    bin/env bin/find bin/tail bin/df bin/ps bin/top bin/sh            \
+	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \
+	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
+	    bin/bluescreen                                                    \
+	    bin/tsh bin/shparity bin/oilspec                                  \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    $$EXTRA_FILES                                                     \
 	  && tar --format=ustar --mode=0644 \
@@ -3471,6 +3503,20 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    etc/shparity/*.sh \
 	    readme.txt
+# The 2,776 corpus scripts are DATA (run as `bash FILE`), so 0644 is right.
+# Tarred as a TREE, not a glob: 2,776 names is 75 KB of command line. The
+# helper binaries are excluded here and added below with the executable bit,
+# because staging them 0644 made every case that calls argv.py fail to run
+# it -- 327 cases reporting a shell divergence that was a permission bit.
+# No './' prefix: gate 0 matches exact tar paths and './etc/...' is not
+# the same name as 'etc/...'.
+	cd $(INITRD_STAGE) && tar --format=ustar --mode=0644 \
+	    --owner=0 --group=0 --numeric-owner \
+	    --exclude='etc/oilspec/bin' --exclude='etc/oilspec/bin/*' \
+	    -rf ../initrd.tar etc/oilspec
+	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
+	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar \
+	    etc/oilspec/bin
 
 # ---------- Build ISO ----------
 #

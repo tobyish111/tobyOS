@@ -128,6 +128,15 @@ static int g_script_depth;
 static int g_subshell_depth;
 
 static bool g_opt_errexit;   /* set -e */
+
+/* Depth of "failure here is a DECISION, not an error".
+ *
+ * POSIX exempts a command from `set -e` when its exit status is being tested
+ * rather than acted on: the condition of if/elif/while/until, any command in
+ * an AND-OR list except the last, and the operand of `!`. A counter rather
+ * than a flag because these nest -- a while condition may contain a pipeline
+ * containing an if -- and the innermost scope must not clear the outer one. */
+static int g_errexit_suspend;
 static bool g_opt_nounset;   /* set -u */
 static bool g_opt_xtrace;    /* set -x */
 static bool g_opt_noglob;    /* set -f */
@@ -139,6 +148,15 @@ static bool g_opt_noexec;    /* set -n */
  * as a whole reports the failure it found. */
 static int g_noexec_error;
 static bool g_opt_allexport; /* set -a */
+
+/* Alias expansion is an INTERACTIVE-shell behaviour. A script gets it only
+ * when `shopt -s expand_aliases` asks for it. tsh expanded unconditionally,
+ * so every alias defined in a script took effect where bash ignored it. */
+static bool g_opt_expand_aliases;
+/* True for a terminal session, false while running a script or `-c`. The
+ * kernel shell is always a terminal session, so this defaults true and only
+ * the hosted entry points clear it. */
+static bool g_interactive = true;
 
 struct shell_alias {
     char *name;
@@ -166,6 +184,11 @@ static bool g_heredoc_collecting;
 static bool g_continuation_active;
 static void prompt(void);
 static void execute_line_text(const char *src);
+static void execute_line_text_inner(const char *src);
+
+/* 0 while no line is executing; 1 inside an input line; >1 inside a segment,
+ * body or condition re-entering the executor. Only depth 0 is a NEW line. */
+static int g_exec_line_depth;
 static bool shell_name_is_valid(const char *s, size_t n);
 static bool shell_special_builtin_name(const char *name);
 static int shell_expand_param_word(const char *word, char *out, size_t cap);
@@ -341,12 +364,31 @@ static void jobs_reap_finished(void) {
  *   SHELL=tobysh
  */
 
-#define ENV_MAX 32
+/* ENV_MAX was 32, which is not a limit POSIX allows a shell to have: the
+ * 33rd assignment in a script failed with "env: table full". The third-party
+ * conformance corpus has cases that define more than that in a loop. */
+#define ENV_MAX 512
 #define SHELL_READONLY_MAX 16
 
 static char *g_env[ENV_MAX + 1];     /* +1 reserved for NULL terminator */
 static int   g_envc = 0;
 static char *g_readonly[SHELL_READONLY_MAX];
+
+/* Per-variable flags, parallel to g_env.
+ *
+ * g_env stays an array of bare "KEY=VALUE" blobs because it is handed to
+ * proc_spawn as envp directly -- putting the flags in the blob would mean
+ * rebuilding the array on every spawn. The two arrays are kept in step by the
+ * four functions that mutate g_env (env_set_kv, env_remove_at, the frame
+ * save/restore pair); nothing else may touch g_envc.
+ *
+ * SHVAR_EXPORTED is the one that changes observable behaviour: before this
+ * existed, every shell variable reached every child process, so
+ *     x=1; env | grep x
+ * printed x=1 where POSIX (and bash, and dash) print nothing. */
+#define SHVAR_EXPORTED  0x01u
+#define SHVAR_READONLY  0x02u
+static unsigned char g_env_flags[ENV_MAX];
 
 /* Length of "KEY" up to (but not including) the '='. Returns the
  * byte count, 0 if `kv` doesn't start with at least one non-'=' char. */
@@ -438,9 +480,13 @@ static const char *env_get(const char *key) {
 static void env_remove_at(int idx) {
     if (idx < 0 || idx >= g_envc) return;
     kfree(g_env[idx]);
-    for (int i = idx; i < g_envc - 1; i++) g_env[i] = g_env[i + 1];
+    for (int i = idx; i < g_envc - 1; i++) {
+        g_env[i] = g_env[i + 1];
+        g_env_flags[i] = g_env_flags[i + 1];
+    }
     g_envc--;
     g_env[g_envc] = 0;
+    g_env_flags[g_envc] = 0;
 }
 
 /* Install a fully-formed "KEY=VALUE" string. `kv_in` is COPIED -- the
@@ -462,8 +508,12 @@ static int env_set_kv(const char *kv_in) {
 
     int idx = env_find(kv_in, klen);
     if (idx >= 0) {
+        /* Assigning to an existing variable does not change its export state:
+         * once exported, `x=2` keeps x in the child environment. That is what
+         * POSIX means by the export ATTRIBUTE being on the name. */
         kfree(g_env[idx]);
         g_env[idx] = blob;
+        if (g_opt_allexport) g_env_flags[idx] |= SHVAR_EXPORTED;
         shell_getopts_note_external_optind_write(kv_in, klen);
         return 0;
     }
@@ -472,6 +522,8 @@ static int env_set_kv(const char *kv_in) {
         kprintf("env: table full (max %d)\n", ENV_MAX);
         return -1;
     }
+    /* A brand-new variable is NOT exported unless `set -a` is in force. */
+    g_env_flags[g_envc] = g_opt_allexport ? SHVAR_EXPORTED : 0u;
     g_env[g_envc++] = blob;
     g_env[g_envc]   = 0;
     shell_getopts_note_external_optind_write(kv_in, klen);
@@ -512,6 +564,7 @@ static int env_unset(const char *key) {
 static void env_init_defaults(void) {
     g_envc = 0;
     g_env[0] = 0;
+    for (int i = 0; i < ENV_MAX; i++) g_env_flags[i] = 0;
     for (int i = 0; i < SHELL_READONLY_MAX; i++) {
         if (g_readonly[i]) kfree(g_readonly[i]);
         g_readonly[i] = 0;
@@ -531,6 +584,19 @@ static void env_init_defaults(void) {
      * nothing. Setting it makes the value observable and the fallback
      * redundant rather than load-bearing. */
     if (env_set("IFS", " \t\n")     < 0) kprintf("env: default IFS set failed\n");
+
+    /* PATH, HOME, PWD, SHELL and USER are exported: a child process is
+     * expected to inherit them, and every real shell does. IFS and OPTIND are
+     * deliberately NOT -- POSIX describes both as shell variables, and bash
+     * keeps them out of the child environment unless asked. Before the export
+     * flag existed the distinction could not be expressed and all seven were
+     * shipped to every child. */
+    static const char *const exported[] = { "PATH", "HOME", "USER", "PWD",
+                                            "SHELL", 0 };
+    for (int e = 0; exported[e]; e++) {
+        int idx = env_find(exported[e], strlen(exported[e]));
+        if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
+    }
 }
 
 /* ---- POSIX positional parameters ---------------------------------- */
@@ -655,8 +721,24 @@ static const char *shell_alias_value(const char *name) {
     return idx >= 0 ? g_aliases[idx].value : 0;
 }
 
+/* An alias NAME is not a variable name. bash accepts anything that is not
+ * whitespace, an operator, a quote or a paren -- `echo-x` and `ll.` are legal
+ * aliases and illegal variables. shell_alias_set used the VARIABLE rule, so
+ * `alias echo-x=...` failed with "failed to set" while the expander, which
+ * uses shell_alias_name_char, would happily have expanded it. The definition
+ * side and the expansion side must agree on what a name is, so they now share
+ * one predicate. */
+static bool shell_alias_name_char(char c);
+
+static bool shell_alias_name_ok(const char *name) {
+    if (!name || !*name) return false;
+    for (const char *p = name; *p; p++)
+        if (*p == '=' || *p == '/' || !shell_alias_name_char(*p)) return false;
+    return true;
+}
+
 static int shell_alias_set(const char *name, const char *value) {
-    if (!name || !value || !shell_name_is_valid(name, strlen(name))) return -1;
+    if (!name || !value || !shell_alias_name_ok(name)) return -1;
 
     char *ncopy = shell_strdup(name);
     char *vcopy = shell_strdup(value);
@@ -1114,8 +1196,13 @@ static bool shell_hosted_builtin(const char *name) {
         "unset",
         /* regular builtins bash also implements internally */
         "alias", "unalias", "bg", "cd", "command", "echo", "false", "fg",
-        "getopts", "hash", "jobs", "kill", "printf", "pwd", "read", "test",
-        "[", "true", "type", "umask", "wait", "sh",
+        "getopts", "hash", "jobs", "kill", "local", "printf", "pwd", "read",
+        "shopt", "test", "[", "true", "type", "umask", "wait", "sh",
+        /* Implemented in the table above but absent from this list, so
+         * /bin/tsh sent them to a PATH lookup and reported
+         * "failed to launch '/bin/ulimit'". They are builtins in bash and in
+         * the kernel shell; the hosted build simply never admitted it. */
+        "ulimit", "fc", "getconf", "logname", "pathchk", "newgrp",
         0
     };
     for (int i = 0; allow[i]; i++)
@@ -1155,7 +1242,11 @@ static bool shell_special_builtin_name(const char *name) {
 static void cmd_env(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1) {
-        for (int i = 0; i < g_envc; i++) kprintf("%s\n", g_env[i]);
+        /* The ENVIRONMENT, not the variable table -- `env` is defined as what
+         * a child would receive, so it must apply the same export filter
+         * shell_build_env_overlay does. */
+        for (int i = 0; i < g_envc; i++)
+            if (g_env_flags[i] & SHVAR_EXPORTED) shell_printf("%s\n", g_env[i]);
         return;
     }
     /* "env K=V [K=V ...]" -- treat each arg as a literal "KEY=VALUE"
@@ -1227,10 +1318,297 @@ static void shell_print_export_entry(const char *entry) {
     }
 }
 
+/* ---- `local`: function-scoped variables ---------------------------------
+ *
+ * See the note above shell_locals_push. The stack is global and bounded; a
+ * function that localises more than SHELL_LOCAL_MAX variables across the whole
+ * call chain gets a diagnostic rather than silent breakage, because silently
+ * dropping a save means the variable never gets restored and the caller's
+ * value is gone. */
+#define SHELL_LOCAL_MAX 256
+
+struct shell_local_save {
+    int   depth;          /* g_script_depth at which this was localised */
+    char *name;           /* variable name, NUL-terminated */
+    char *kv;             /* prior "KEY=VALUE" blob, or 0 if it did not exist */
+    unsigned char flags;  /* prior flags */
+    bool  existed;
+};
+
+static struct shell_local_save g_locals[SHELL_LOCAL_MAX];
+static int g_localc;
+
+/* Record `name`'s current state so the current function's return can put it
+ * back. Called before the variable is overwritten. */
+static int shell_locals_push(const char *name, int depth) {
+    if (g_localc >= SHELL_LOCAL_MAX) {
+        kprintf("local: too many local variables (max %d)\n", SHELL_LOCAL_MAX);
+        return -1;
+    }
+    struct shell_local_save *sv = &g_locals[g_localc];
+    sv->name = shell_strdup(name);
+    if (!sv->name) return -1;
+
+    size_t klen = strlen(name);
+    int idx = env_find(name, klen);
+    if (idx >= 0) {
+        sv->kv = shell_strdup(g_env[idx]);
+        if (!sv->kv) { kfree(sv->name); sv->name = 0; return -1; }
+        sv->flags = g_env_flags[idx];
+        sv->existed = true;
+    } else {
+        sv->kv = 0;
+        sv->flags = 0;
+        sv->existed = false;
+    }
+    sv->depth = depth;
+    g_localc++;
+    return 0;
+}
+
+/* Undo every localisation made at `depth`, newest first. */
+static void shell_locals_pop(int depth) {
+    while (g_localc > 0 && g_locals[g_localc - 1].depth >= depth) {
+        struct shell_local_save *sv = &g_locals[--g_localc];
+        size_t klen = strlen(sv->name);
+        int idx = env_find(sv->name, klen);
+        if (sv->existed) {
+            char *blob = shell_strdup(sv->kv);
+            if (blob) {
+                if (idx >= 0) {
+                    kfree(g_env[idx]);
+                    g_env[idx] = blob;
+                    g_env_flags[idx] = sv->flags;
+                } else if (g_envc < ENV_MAX) {
+                    g_env_flags[g_envc] = sv->flags;
+                    g_env[g_envc++] = blob;
+                    g_env[g_envc] = 0;
+                } else {
+                    kfree(blob);
+                }
+            }
+        } else if (idx >= 0) {
+            /* It did not exist before the function ran, so it must not exist
+             * after. This is what makes `local x` (no value) mean "unset and
+             * mine" rather than "empty and mine". */
+            env_remove_at(idx);
+        }
+        kfree(sv->name);
+        kfree(sv->kv);
+        sv->name = 0;
+        sv->kv = 0;
+    }
+}
+
+/* `local NAME[=VALUE] ...`
+ *
+ * Bare `local x` leaves x UNSET but local, which is what bash and dash both
+ * do: `f() { local x; echo "${x-unset}"; }` prints `unset`. Setting it empty
+ * instead would make an unset local indistinguishable from an empty one. */
+static void cmd_local(int argc, char **argv) {
+    shell_set_status(0);
+    if (g_script_depth <= 0) {
+        kprintf("local: can only be used in a function\n");
+        shell_set_status(1);
+        return;
+    }
+    for (int i = 1; i < argc; i++) {
+        size_t klen = env_key_len(argv[i]);
+        bool has_value = (klen > 0 && argv[i][klen] == '=');
+        if (!has_value) klen = strlen(argv[i]);
+        if (!shell_name_is_valid(argv[i], klen)) {
+            kprintf("local: bad name '%s'\n", argv[i]);
+            shell_set_status(1);
+            continue;
+        }
+        char name[128];
+        if (klen >= sizeof name) {
+            kprintf("local: name too long\n");
+            shell_set_status(1);
+            continue;
+        }
+        memcpy(name, argv[i], klen);
+        name[klen] = '\0';
+
+        if (shell_locals_push(name, g_script_depth) < 0) {
+            shell_set_status(1);
+            continue;
+        }
+        if (has_value) {
+            if (env_set_kv(argv[i]) < 0) shell_set_status(1);
+        } else {
+            int idx = env_find(name, klen);
+            if (idx >= 0) env_remove_at(idx);
+        }
+    }
+}
+
+/* ---- shopt ---------------------------------------------------------------
+ *
+ * See the note at the top of this change. `wired` records whether the option
+ * actually does anything here; an unwired option is still accepted, because
+ * refusing a name bash accepts would be a worse divergence than a no-op, but
+ * it announces itself on stderr the first time it is turned on. */
+struct shell_shopt {
+    const char *name;
+    bool       *slot;
+    bool        wired;
+    bool        warned;
+};
+
+static bool g_shopt_nullglob, g_shopt_failglob, g_shopt_dotglob;
+static bool g_shopt_extglob, g_shopt_globstar, g_shopt_nocaseglob;
+static bool g_shopt_xpg_echo, g_shopt_lastpipe, g_shopt_huponexit;
+static bool g_shopt_checkwinsize, g_shopt_shift_verbose, g_shopt_execfail;
+static bool g_shopt_histappend, g_shopt_cmdhist, g_shopt_progcomp;
+/* bash has these ON by default. */
+/* Backing store for the accepted-but-unwired option names above. */
+static bool g_shopt_misc[40];
+static bool g_shopt_interactive_comments = true;
+static bool g_shopt_sourcepath = true;
+static bool g_shopt_promptvars = true;
+
+static struct shell_shopt g_shopts[] = {
+    { "expand_aliases",       &g_opt_expand_aliases,         true,  false },
+    { "nullglob",             &g_shopt_nullglob,             false, false },
+    { "failglob",             &g_shopt_failglob,             false, false },
+    { "dotglob",              &g_shopt_dotglob,              false, false },
+    { "extglob",              &g_shopt_extglob,              false, false },
+    { "globstar",             &g_shopt_globstar,             false, false },
+    { "nocaseglob",           &g_shopt_nocaseglob,           false, false },
+    { "xpg_echo",             &g_shopt_xpg_echo,             false, false },
+    { "lastpipe",             &g_shopt_lastpipe,             false, false },
+    { "huponexit",            &g_shopt_huponexit,            false, false },
+    { "checkwinsize",         &g_shopt_checkwinsize,         false, false },
+    { "shift_verbose",        &g_shopt_shift_verbose,        false, false },
+    { "execfail",             &g_shopt_execfail,             false, false },
+    { "histappend",           &g_shopt_histappend,           false, false },
+    { "cmdhist",              &g_shopt_cmdhist,              false, false },
+    { "progcomp",             &g_shopt_progcomp,             false, false },
+    { "interactive_comments", &g_shopt_interactive_comments, false, false },
+    { "sourcepath",           &g_shopt_sourcepath,           false, false },
+    { "promptvars",           &g_shopt_promptvars,           false, false },
+    /* The remainder of bash's set. None are wired; they are here because
+     * REFUSING a name bash accepts changes the exit status a script sees, and
+     * `shopt -s inherit_errexit` at the top of a file should not be an error.
+     * Each still announces itself once on stderr when switched on. */
+    { "inherit_errexit",      &g_shopt_misc[0],              false, false },
+    { "strict_errexit",       &g_shopt_misc[1],              false, false },
+    { "command_sub_errexit",  &g_shopt_misc[2],              false, false },
+    { "nocasematch",          &g_shopt_misc[3],              false, false },
+    { "autocd",               &g_shopt_misc[4],              false, false },
+    { "cdable_vars",          &g_shopt_misc[5],              false, false },
+    { "cdspell",              &g_shopt_misc[6],              false, false },
+    { "checkhash",            &g_shopt_misc[7],              false, false },
+    { "checkjobs",            &g_shopt_misc[8],              false, false },
+    { "dirspell",             &g_shopt_misc[9],              false, false },
+    { "extdebug",             &g_shopt_misc[10],             false, false },
+    { "extquote",             &g_shopt_misc[11],             false, false },
+    { "force_fignore",        &g_shopt_misc[12],             false, false },
+    { "globasciiranges",      &g_shopt_misc[13],             false, false },
+    { "gnu_errfmt",           &g_shopt_misc[14],             false, false },
+    { "histreedit",           &g_shopt_misc[15],             false, false },
+    { "histverify",           &g_shopt_misc[16],             false, false },
+    { "hostcomplete",         &g_shopt_misc[17],             false, false },
+    { "lithist",              &g_shopt_misc[18],             false, false },
+    { "localvar_inherit",     &g_shopt_misc[19],             false, false },
+    { "localvar_unset",       &g_shopt_misc[20],             false, false },
+    { "login_shell",          &g_shopt_misc[21],             false, false },
+    { "mailwarn",             &g_shopt_misc[22],             false, false },
+    { "no_empty_cmd_completion", &g_shopt_misc[23],          false, false },
+    { "nullglob",             &g_shopt_nullglob,             false, false },
+    { "restricted_shell",     &g_shopt_misc[24],             false, false },
+    { "shift_verbose",        &g_shopt_shift_verbose,        false, false },
+    { "xpg_echo",             &g_shopt_xpg_echo,             false, false },
+    { "assoc_expand_once",    &g_shopt_misc[25],             false, false },
+    { "compat31",             &g_shopt_misc[26],             false, false },
+    { "compat32",             &g_shopt_misc[27],             false, false },
+    { "compat40",             &g_shopt_misc[28],             false, false },
+    { "compat41",             &g_shopt_misc[29],             false, false },
+    { "compat42",             &g_shopt_misc[30],             false, false },
+    { "compat43",             &g_shopt_misc[31],             false, false },
+    { "compat44",             &g_shopt_misc[32],             false, false },
+    { "patsub_replacement",   &g_shopt_misc[33],             false, false },
+    { "varredir_close",       &g_shopt_misc[34],             false, false },
+    { 0, 0, false, false },
+};
+
+static struct shell_shopt *shell_shopt_find(const char *name) {
+    for (int i = 0; g_shopts[i].name; i++)
+        if (strcmp(g_shopts[i].name, name) == 0) return &g_shopts[i];
+    return 0;
+}
+
+static void shell_shopt_print(const struct shell_shopt *o) {
+    shell_printf("%s\t%s\n", o->name, *o->slot ? "on" : "off");
+}
+
+/* `shopt [-suqp] [NAME...]`
+ *
+ * Exit status follows bash: with -q, 0 if every named option is set; without
+ * it, 0 unless a name is unknown. An unknown name is status 1 plus a
+ * diagnostic, which is what bash does and what several corpus cases check. */
+static void cmd_shopt(int argc, char **argv) {
+    bool set = false, unset = false, quiet = false, print = false;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        for (const char *c = argv[i] + 1; *c; c++) {
+            switch (*c) {
+            case 's': set = true; break;
+            case 'u': unset = true; break;
+            case 'q': quiet = true; break;
+            case 'p': print = true; break;
+            case 'o': break;   /* `shopt -o` addresses `set -o` names */
+            default:
+                kprintf("shopt: -%c: invalid option\n", *c);
+                shell_set_status(2);
+                return;
+            }
+        }
+    }
+    (void)print;
+
+    if (i >= argc) {                       /* no names: list everything */
+        for (int k = 0; g_shopts[k].name; k++) {
+            if (set   && !*g_shopts[k].slot) continue;
+            if (unset &&  *g_shopts[k].slot) continue;
+            if (!quiet) shell_shopt_print(&g_shopts[k]);
+        }
+        shell_set_status(0);
+        return;
+    }
+
+    int status = 0;
+    for (; i < argc; i++) {
+        struct shell_shopt *o = shell_shopt_find(argv[i]);
+        if (!o) {
+            if (!quiet) kprintf("shopt: %s: invalid shell option name\n", argv[i]);
+            status = 1;
+            continue;
+        }
+        if (set || unset) {
+            *o->slot = set;
+            if (!o->wired && set && !o->warned) {
+                o->warned = true;
+                kprintf("shopt: %s: accepted but not implemented -- "
+                        "behaviour is unchanged\n", o->name);
+            }
+        } else {
+            if (!quiet) shell_shopt_print(o);
+            if (!*o->slot) status = 1;
+        }
+    }
+    shell_set_status(status);
+}
+
 static void cmd_export(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1 || (argc == 2 && strcmp(argv[1], "-p") == 0)) {
-        for (int i = 0; i < g_envc; i++) shell_print_export_entry(g_env[i]);
+        /* Only exported names. `export` with no arguments is defined to list
+         * the exported ones; it used to list the whole variable table. */
+        for (int i = 0; i < g_envc; i++)
+            if (g_env_flags[i] & SHVAR_EXPORTED)
+                shell_print_export_entry(g_env[i]);
         return;
     }
     int start = 1;
@@ -1246,13 +1624,23 @@ static void cmd_export(int argc, char **argv) {
             if (env_set_kv(argv[i]) < 0) {
                 kprintf("export: failed to set '%s'\n", argv[i]);
                 shell_set_status(1);
+                continue;
             }
         } else if (!env_get(argv[i])) {
+            /* `export X` on a name that does not exist marks it exported
+             * WITHOUT creating a value: POSIX says the attribute is set, and
+             * bash keeps `${X-unset}` reporting unset until X is assigned.
+             * Creating it empty here would make the two indistinguishable, so
+             * the name is registered with an empty value and the export bit,
+             * which is the closest this table can represent. */
             if (env_set(argv[i], "") < 0) {
                 kprintf("export: failed to create '%s'\n", argv[i]);
                 shell_set_status(1);
+                continue;
             }
         }
+        int idx = env_find(argv[i], klen);
+        if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
     }
 }
 
@@ -1337,15 +1725,15 @@ static bool shell_set_opt(char c, bool on) {
 }
 
 static void shell_print_options(void) {
-    kprintf("allexport %s\n", g_opt_allexport ? "on" : "off");
-    kprintf("errexit   %s\n", g_opt_errexit ? "on" : "off");
-    kprintf("noclobber %s\n", g_opt_noclobber ? "on" : "off");
-    kprintf("noexec    %s\n", g_opt_noexec ? "on" : "off");
-    kprintf("noglob    %s\n", g_opt_noglob ? "on" : "off");
-    kprintf("notify    %s\n", g_opt_notify ? "on" : "off");
-    kprintf("nounset   %s\n", g_opt_nounset ? "on" : "off");
-    kprintf("verbose   %s\n", g_opt_verbose ? "on" : "off");
-    kprintf("xtrace    %s\n", g_opt_xtrace  ? "on" : "off");
+    shell_printf("allexport %s\n", g_opt_allexport ? "on" : "off");
+    shell_printf("errexit   %s\n", g_opt_errexit ? "on" : "off");
+    shell_printf("noclobber %s\n", g_opt_noclobber ? "on" : "off");
+    shell_printf("noexec    %s\n", g_opt_noexec ? "on" : "off");
+    shell_printf("noglob    %s\n", g_opt_noglob ? "on" : "off");
+    shell_printf("notify    %s\n", g_opt_notify ? "on" : "off");
+    shell_printf("nounset   %s\n", g_opt_nounset ? "on" : "off");
+    shell_printf("verbose   %s\n", g_opt_verbose ? "on" : "off");
+    shell_printf("xtrace    %s\n", g_opt_xtrace  ? "on" : "off");
 }
 
 static bool shell_set_opt_by_name(const char *name, bool on) {
@@ -1364,7 +1752,7 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
 static void cmd_set(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1) {
-        for (int i = 0; i < g_envc; i++) kprintf("%s\n", g_env[i]);
+        for (int i = 0; i < g_envc; i++) shell_printf("%s\n", g_env[i]);
         return;
     }
 
@@ -1820,7 +2208,7 @@ static void cmd_read(int argc, char **argv) {
 
 static void cmd_pwd(int argc, char **argv) {
     (void)argc; (void)argv;
-    kprintf("%s\n", shell_cwd());
+    shell_printf("%s\n", shell_cwd());   /* a RESULT: stdout */
     shell_set_status(0);
 }
 
@@ -2112,11 +2500,11 @@ static void cmd_jobs(int argc, char **argv) {
         if (g_jobs[i].id == 0) continue;
         struct proc *p = proc_lookup(g_jobs[i].pid);
         const char *st = p ? proc_state_name(p->state) : "GONE";
-        kprintf("  [%d]  pid=%-3d  %-10s  %s\n",
+        shell_printf("  [%d]  pid=%-3d  %-10s  %s\n",
                 g_jobs[i].id, g_jobs[i].pid, st, g_jobs[i].name);
         shown++;
     }
-    if (shown == 0) kprintf("  (no background jobs)\n");
+    if (shown == 0) shell_printf("  (no background jobs)\n");
 }
 
 static int parse_int(const char *s, int *out) {
@@ -5247,6 +5635,53 @@ static int test_eval(int argc, char **argv) {
     return r;
 }
 
+/* The operators POSIX lists, split by arity. Used only by the count-based
+ * dispatch below; the expression parser keeps its own inline tests. */
+static bool test_is_unary_op(const char *s) {
+    static const char *const u[] = {
+        "-n", "-z", "-e", "-f", "-d", "-r", "-w", "-x", "-s", "-L", "-h",
+        "-p", "-c", "-b", "-g", "-u", "-k", "-S", "-G", "-O", "-t", 0
+    };
+    for (int i = 0; u[i]; i++) if (strcmp(s, u[i]) == 0) return true;
+    return false;
+}
+
+static bool test_is_binary_op(const char *s) {
+    static const char *const b[] = {
+        "=", "==", "!=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
+        "-nt", "-ot", "-ef", 0
+    };
+    for (int i = 0; b[i]; i++) if (strcmp(s, b[i]) == 0) return true;
+    return false;
+}
+
+/* One operand: true iff the string is non-empty. This is the rule that makes
+ * `[ = ]` and `[ ! ]` true -- they are STRINGS here, not operators. */
+static int test_one(const char *a) { return a[0] != '\0' ? 0 : 1; }
+
+static int test_two(char **a) {
+    if (strcmp(a[0], "!") == 0) return test_one(a[1]) == 0 ? 1 : 0;
+    if (test_is_unary_op(a[0])) { int pos = 0; return test_primary(2, a, &pos); }
+    return -1;                       /* caller reports the syntax error */
+}
+
+static int test_three(char **a) {
+    if (test_is_binary_op(a[1])) { int pos = 0; return test_primary(3, a, &pos); }
+    /* bash accepts `x -a y` / `x -o y` here even though POSIX does not list
+     * them among the 3-operand binary operators. The superset contract owes
+     * bash's answer wherever POSIX leaves it unspecified. */
+    if (strcmp(a[1], "-a") == 0)
+        return (test_one(a[0]) == 0 && test_one(a[2]) == 0) ? 0 : 1;
+    if (strcmp(a[1], "-o") == 0)
+        return (test_one(a[0]) == 0 || test_one(a[2]) == 0) ? 0 : 1;
+    if (strcmp(a[0], "!") == 0) {
+        int r = test_two(a + 1);
+        return r < 0 ? -1 : (r == 0 ? 1 : 0);
+    }
+    if (strcmp(a[0], "(") == 0 && strcmp(a[2], ")") == 0) return test_one(a[1]);
+    return -1;
+}
+
 static void cmd_test(int argc, char **argv) {
     bool bracket = (argc > 0 && strcmp(argv[0], "[") == 0);
     int end = argc;
@@ -5258,18 +5693,59 @@ static void cmd_test(int argc, char **argv) {
         }
         end = argc - 1;
     }
-    if (end <= 1) {
+
+    int n = end - 1;              /* operand count, ']' already removed */
+    char **a = &argv[1];
+    int r = -1;
+
+    /* POSIX XCU defines test for 0..4 operands by COUNT, not by grammar. */
+    switch (n) {
+    case 0:
         shell_set_status(1);
         return;
+    case 1:
+        shell_set_status(test_one(a[0]));
+        return;
+    case 2:
+        r = test_two(a);
+        break;
+    case 3:
+        r = test_three(a);
+        break;
+    case 4:
+        if (strcmp(a[0], "!") == 0) {
+            int t = test_three(a + 1);
+            r = (t < 0) ? -1 : (t == 0 ? 1 : 0);
+        } else if (strcmp(a[0], "(") == 0 && strcmp(a[3], ")") == 0) {
+            r = test_two(a + 1);
+        }
+        break;
+    default:
+        /* 5 or more: POSIX says the result is unspecified and bash applies its
+         * own parser, which is what -a / -o chains rely on. Keep it. */
+        shell_set_status(test_eval(n, a));
+        return;
     }
-    int result = test_eval(end - 1, &argv[1]);
-    shell_set_status(result);
+
+    if (r < 0) {
+        kprintf("%s: syntax error near '%s'\n", bracket ? "[" : "test",
+                n > 0 ? a[n - 1] : "");
+        shell_set_status(2);
+        return;
+    }
+    shell_set_status(r);
 }
 
 /* ---- POSIX `printf` builtin ------------------------------------- */
 
+/* Set when the escape was not one printf knows. The caller emits the
+ * backslash before the character, so `\\Z` survives as the two characters
+ * bash prints rather than the one tsh used to print. */
+static bool g_printf_escape_raw;
+
 static int printf_parse_escape(const char **pp) {
     const char *p = *pp;
+    g_printf_escape_raw = false;
     if (*p != '\\') return -1;
     p++;
     char c = *p;
@@ -5288,27 +5764,50 @@ static int printf_parse_escape(const char **pp) {
     case '\'': return '\'';
     case '"':  return '"';
     case '0': {
+        /* THREE octal digits including this leading zero, so at most two
+         * more. `\\0377` is \\037 then a literal '7'; reading three digits
+         * after the zero gave 0xff and swallowed the '7'. */
         int v = 0;
-        for (int i = 0; i < 3 && *p >= '0' && *p <= '7'; i++, p++)
+        for (int i = 0; i < 2 && *p >= '0' && *p <= '7'; i++, p++)
             v = v * 8 + (*p - '0');
         *pp = p;
         return v & 0xFF;
     }
-    default: return c;
+    default:
+        g_printf_escape_raw = true;
+        return c;
     }
 }
+
+/* Set by printf_arg_int when an operand is not a valid number. printf must
+ * still PRINT what it managed to parse (bash prints 3 for "3abc") and then
+ * exit 1, so the failure cannot be signalled by the return value. */
+static bool g_printf_bad_num;
+
+static bool printf_is_blank(char c) { return c == ' ' || c == '\t'; }
 
 static long printf_arg_int(int argc, char **argv, int *argi) {
     if (*argi >= argc) return 0;
     const char *s = argv[(*argi)++];
+
+    /* POSIX XCU: a leading ' or " means "the numeric value of the next
+     * character". Extra characters after it are ignored, not an error. */
+    if (*s == '\'' || *s == '"') return (long)(unsigned char)s[1];
+
+    while (printf_is_blank(*s)) s++;
     long v = 0;
     bool neg = false;
+    bool any = false;
     if (*s == '-') { neg = true; s++; }
     else if (*s == '+') s++;
     while (*s >= '0' && *s <= '9') {
         v = v * 10 + (*s - '0');
         s++;
+        any = true;
     }
+    while (printf_is_blank(*s)) s++;
+    /* Trailing garbage, or no digits at all: print what we have, fail later. */
+    if (*s != '\0' || !any) g_printf_bad_num = true;
     return neg ? -v : v;
 }
 
@@ -5524,22 +6023,68 @@ static const char *printf_arg_str(int argc, char **argv, int *argi) {
     return argv[(*argi)++];
 }
 
+/* Sink for `printf -v`: collects what would have gone to stdout. */
+struct printf_capture { char buf[4096]; size_t len; };
+
+static void printf_capture_sink(const char *s, void *ctx) {
+    struct printf_capture *c = (struct printf_capture *)ctx;
+    if (!c || !s) return;
+    while (*s && c->len + 1 < sizeof c->buf) c->buf[c->len++] = *s++;
+    c->buf[c->len] = '\0';
+}
+
 static void cmd_printf(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 2) {
         kprintf("usage: printf FORMAT [ARG...]\n");
-        shell_set_status(1);
+        shell_set_status(2);      /* usage error, not a runtime failure */
         return;
     }
-    const char *fmt = argv[1];
-    int argi = 2;
+
+    /* `printf -v NAME FORMAT [ARG...]` assigns instead of printing. */
+    const char *vname = 0;
+    int base = 1;
+    if (argc >= 4 && strcmp(argv[1], "-v") == 0) {
+        vname = argv[2];
+        base = 3;
+    } else if (argc >= 2 && strcmp(argv[1], "--") == 0) {
+        base = 2;
+    }
+    if (base >= argc) {
+        kprintf("usage: printf [-v NAME] FORMAT [ARG...]\n");
+        shell_set_status(2);
+        return;
+    }
+
+    struct printf_capture cap;
+    shell_write_fn_t saved_out = g_shell_out;
+    void *saved_ctx = g_shell_out_ctx;
+    if (vname) {
+        cap.len = 0;
+        cap.buf[0] = '\0';
+        g_shell_out = printf_capture_sink;
+        g_shell_out_ctx = &cap;
+    }
+
+    g_printf_bad_num = false;
+
+    const char *fmt = argv[base];
+    int argi = base + 1;
 
     do {
+        /* Where this pass started. A pass that consumes NO argument cannot be
+         * followed by a useful one -- the format has no conversions to absorb
+         * what is left -- and repeating it is the infinite loop this used to
+         * be. See the note at the top of this change. */
+        int argi_at_pass_start = argi;
         const char *p = fmt;
         while (*p) {
             if (*p == '\\') {
                 int c = printf_parse_escape(&p);
-                if (c >= 0) shell_putc((char)c);
+                if (c >= 0) {
+                    if (g_printf_escape_raw) shell_putc('\\');
+                    shell_putc((char)c);
+                }
                 continue;
             }
             if (*p != '%') {
@@ -5613,7 +6158,24 @@ static void cmd_printf(int argc, char **argv) {
                 if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
                 for (int i = 0; i < slen; i++) shell_putc(s[i]);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
-            } else if (spec == 'd' || spec == 'i' || spec == 'u') {
+            } else if (spec == 'u') {
+                /* Two's complement, not "absolute value without a sign":
+                 * `printf '%u' -42` is 18446744073709551574 everywhere. */
+                long sv = printf_arg_int(argc, argv, &argi);
+                unsigned long uv = (unsigned long)sv;
+                char buf[32];
+                int blen = 0;
+                if (uv == 0) buf[blen++] = '0';
+                while (uv > 0 && blen < (int)sizeof(buf) - 1) {
+                    buf[blen++] = (char)('0' + (int)(uv % 10ul));
+                    uv /= 10ul;
+                }
+                int pad = width > blen ? width - blen : 0;
+                if (!left && !zero_pad) for (int k = 0; k < pad; k++) shell_putc(' ');
+                if (!left && zero_pad)  for (int k = 0; k < pad; k++) shell_putc('0');
+                while (blen > 0) shell_putc(buf[--blen]);
+                if (left) for (int k = 0; k < pad; k++) shell_putc(' ');
+            } else if (spec == 'd' || spec == 'i') {
                 long v = printf_arg_int(argc, argv, &argi);
                 char buf[32];
                 int blen = 0;
@@ -5666,7 +6228,10 @@ static void cmd_printf(int argc, char **argv) {
                 while (*bp) {
                     if (*bp == '\\') {
                         int c = printf_parse_escape(&bp);
-                        if (c >= 0) shell_putc((char)c);
+                        if (c >= 0) {
+                            if (g_printf_escape_raw) shell_putc('\\');
+                            shell_putc((char)c);
+                        }
                     } else {
                         shell_putc(*bp++);
                     }
@@ -5715,7 +6280,24 @@ static void cmd_printf(int argc, char **argv) {
                 if (spec) shell_putc(spec);
             }
         }
+        if (argi == argi_at_pass_start) break;   /* consumed nothing: stop */
     } while (argi < argc);
+
+    /* An unparsable numeric operand is a runtime error: the output already
+     * produced stands, and the status is 1. Reported AFTER the loop so one
+     * bad operand does not suppress the rest of the output. */
+    if (g_printf_bad_num) shell_set_status(1);
+
+    if (vname) {
+        g_shell_out = saved_out;
+        g_shell_out_ctx = saved_ctx;
+        if (!shell_name_is_valid(vname, strlen(vname))) {
+            kprintf("printf: `%s': not a valid identifier\n", vname);
+            shell_set_status(2);     /* bash: a bad -v name is a usage error */
+            return;
+        }
+        if (env_set(vname, cap.buf) < 0) shell_set_status(1);
+    }
 }
 
 static int g_shell_umask = 022;
@@ -5723,7 +6305,7 @@ static int g_shell_umask = 022;
 static void cmd_umask(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1) {
-        kprintf("%04o\n", (unsigned)g_shell_umask);
+        shell_printf("%04o\n", (unsigned)g_shell_umask);
         return;
     }
     int val = 0;
@@ -5743,18 +6325,18 @@ static void cmd_umask(int argc, char **argv) {
 static void cmd_hash(int argc, char **argv) {
     shell_set_status(0);
     if (argc >= 2 && strcmp(argv[1], "-r") == 0) {
-        kprintf("hash: table cleared\n");
+        shell_printf("hash: table cleared\n");
         return;
     }
     if (argc <= 1) {
-        kprintf("hash: table is empty\n");
+        shell_printf("hash: table is empty\n");
         return;
     }
     for (int i = 1; i < argc; i++) {
         char path_buf[64];
         const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
         if (path_is_file(path)) {
-            kprintf("%s=%s\n", argv[i], path);
+            shell_printf("%s=%s\n", argv[i], path);
         } else {
             kprintf("hash: %s: not found\n", argv[i]);
             shell_set_status(1);
@@ -5989,7 +6571,7 @@ static void cmd_logname(int argc, char **argv) {
     (void)argc; (void)argv;
     const char *u = env_get("LOGNAME");
     if (!u) u = env_get("USER");
-    kprintf("%s\n", u ? u : "root");
+    shell_printf("%s\n", u ? u : "root");
     shell_set_status(0);
 }
 
@@ -6011,13 +6593,13 @@ static void cmd_getconf(int argc, char **argv) {
     };
     if (argc < 2) {
         for (size_t i = 0; i < sizeof(vars) / sizeof(vars[0]); i++)
-            kprintf("%s=%ld\n", vars[i].name, vars[i].value);
+            shell_printf("%s=%ld\n", vars[i].name, vars[i].value);
         shell_set_status(0);
         return;
     }
     for (size_t i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
         if (strcmp(vars[i].name, argv[1]) == 0) {
-            kprintf("%ld\n", vars[i].value);
+            shell_printf("%ld\n", vars[i].value);
             shell_set_status(0);
             return;
         }
@@ -6298,6 +6880,8 @@ static const struct cmd cmds[] = {
     { "cd",     "cd [dir|-]: change current directory", cmd_cd },
     { "env",      "env [K=V ...]: print or set environment vars (M25C)", cmd_env      },
     { "export",   "export [NAME[=VALUE]...]: set shell environment",     cmd_export   },
+    { "local",    "local NAME[=VALUE]...: function-scoped variable",      cmd_local    },
+    { "shopt",    "shopt [-suqp] [NAME...]: shell option toggles",        cmd_shopt    },
     { "readonly", "readonly [NAME[=VALUE]...]: mark variables readonly", cmd_readonly },
     { "unset",    "unset NAME [NAME...]: remove shell variables",         cmd_unset    },
     { "set",      "set [NAME=VALUE...]: print or set shell variables",    cmd_set      },
@@ -6947,6 +7531,20 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
     return rc;
 }
 
+/* Expand the WORD half of ${name-WORD} / ${name=WORD} / ${name?WORD} /
+ * ${name+WORD}.
+ *
+ * QUOTES INSIDE THE BRACES ARE REAL QUOTES. This used to copy them through
+ * verbatim, so `${Unset:-'b'}` produced the three characters 'b' where bash
+ * produces one, and every corpus case in var-sub-quote failed on the quote
+ * marks alone. Single quotes suppress expansion; double quotes do not.
+ *
+ * KNOWN REMAINING GAP, stated rather than hidden: the quoted text is not yet
+ * protected from the field splitting that happens later, so
+ * `${Unset:-'a b c'}` yields three words where bash yields one. Fixing that
+ * needs a "do not split this span" marker through the splitter, the way
+ * SHELL_ARG_MARK carries "$@" word boundaries; quote REMOVAL is correct on its
+ * own and is what most of these expansions actually need. */
 static int shell_expand_param_word(const char *word, char *out, size_t cap) {
     const char *p = word ? word : "";
     size_t pos = 0;
@@ -6954,6 +7552,33 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap) {
     out[0] = '\0';
 
     while (*p) {
+        if (*p == '\'') {                    /* literal until the next quote */
+            p++;
+            while (*p && *p != '\'') {
+                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            }
+            if (*p == '\'') p++;
+            continue;
+        }
+        if (*p == '"') {                     /* expanding, but quotes removed */
+            p++;
+            while (*p && *p != '"') {
+                if (*p == '$') {
+                    if (shell_expand_var(&p, out, &pos, cap) < 0) return -1;
+                    continue;
+                }
+                if (*p == '`') {
+                    if (shell_expand_backtick(&p, out, &pos, cap) < 0) return -1;
+                    continue;
+                }
+                /* Inside double quotes a backslash only escapes these four. */
+                if (*p == '\\' && (p[1] == '"' || p[1] == '\\' ||
+                                   p[1] == '$'  || p[1] == '`')) p++;
+                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            }
+            if (*p == '"') p++;
+            continue;
+        }
         if (*p == '$') {
             if (shell_expand_var(&p, out, &pos, cap) < 0) return -1;
             continue;
@@ -8039,7 +8664,12 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
                 memcpy(name, start, n);
                 name[n] = '\0';
                 const char *q = shell_skip_blanks(p);
-                const char *av = (*q == '(') ? 0 : shell_alias_value(name);
+                /* Not in a script unless asked. This is the rule, not an
+                 * optimisation: `alias foo=bar; foo` runs bar interactively
+                 * and reports "foo: not found" in a script. */
+                bool may_expand = (g_interactive || g_opt_expand_aliases);
+                const char *av = (*q == '(' || !may_expand)
+                                     ? 0 : shell_alias_value(name);
                 if (av) {
                     if (shell_append_str(out, &pos, cap, av) < 0) return -1;
                     *changed = true;
@@ -8720,10 +9350,19 @@ static bool shell_assignment_overrides(const char *kv, char **assignv,
     return false;
 }
 
+/* Build the environment a child process receives.
+ *
+ * ONLY EXPORTED VARIABLES GO. This is the point of the export flag: before it
+ * existed this loop copied the entire shell variable table, so
+ *     x=1; printenv x
+ * printed 1 where POSIX, bash and dash all print nothing. `assignv` carries
+ * the one-shot `VAR=v cmd` prefix assignments, which ARE in the child's
+ * environment by definition regardless of the export attribute. */
 static int shell_build_env_overlay(char **assignv, int assignc,
                                    char **out_env, int *out_envc) {
     int n = 0;
     for (int i = 0; i < g_envc; i++) {
+        if (!(g_env_flags[i] & SHVAR_EXPORTED)) continue;
         if (!shell_assignment_overrides(g_env[i], assignv, assignc)) {
             if (n >= ENV_MAX + ARG_MAX) return -1;
             out_env[n++] = g_env[i];
@@ -8740,6 +9379,7 @@ static int shell_build_env_overlay(char **assignv, int assignc,
 
 struct shell_env_frame {
     char *env[ENV_MAX + 1];
+    unsigned char flags[ENV_MAX];
     int envc;
     int getopts_last_optind;
     int getopts_char_index;
@@ -8764,6 +9404,9 @@ static int shell_env_frame_capture(struct shell_env_frame *frame) {
             shell_env_frame_clear(frame);
             return -1;
         }
+        /* The export attribute is part of the variable, so a subshell that
+         * exports something must not leak that attribute back out. */
+        frame->flags[i] = g_env_flags[i];
     }
     frame->envc = g_envc;
     frame->env[g_envc] = 0;
@@ -8781,6 +9424,7 @@ static void shell_env_frame_restore(struct shell_env_frame *frame) {
     g_envc = frame->envc;
     for (int i = 0; i < frame->envc; i++) {
         g_env[i] = frame->env[i];
+        g_env_flags[i] = frame->flags[i];
         frame->env[i] = 0;
     }
     g_env[g_envc] = 0;
@@ -9222,6 +9866,7 @@ static int shell_run_function(struct shell_simple *cmd) {
     }
 
     g_script_depth++;
+    int local_depth = g_script_depth;
     execute_line_text(fn->body);
     int rc = g_last_status;
     if (g_shell_flow == SHELL_FLOW_RETURN) {
@@ -9229,6 +9874,10 @@ static int shell_run_function(struct shell_simple *cmd) {
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;
     }
+    /* Before the depth drops: undo anything this frame localised. `return`
+     * from the middle of a function reaches here too, which is the whole
+     * reason the unwind is here rather than at the end of the body. */
+    shell_locals_pop(local_depth);
     g_script_depth--;
     shell_restore_params_from_frame(&frame);
     if (io_active) shell_restore_io_frame(&io_frame);
@@ -9912,7 +10561,11 @@ static bool shell_try_if_command(const char *src) {
             return true;
         }
 
+        /* The condition's status is the decision, so `set -e` must not act
+         * on it: `if false; then` used to exit the shell outright. */
+        g_errexit_suspend++;
         execute_line_text(cond);
+        g_errexit_suspend--;
         if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
         if (g_last_status == 0) {
@@ -10224,11 +10877,13 @@ static bool shell_try_while_command(const char *src) {
     bool set_last = true;
     bool overrun = false;
     for (int iter = 0; iter < 1024; iter++) {
+        g_errexit_suspend++;              /* the condition is a decision */
         execute_line_text(cond);
+        g_errexit_suspend--;
         if (g_last_status != 0) {
             goto done;
         }
-        execute_line_text(body);
+        execute_line_text(body);          /* the BODY is not exempt */
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_EXIT) {
@@ -11504,10 +12159,9 @@ static int shell_syntax_check(const char *s) {
     return 0;
 }
 
-static void execute_line_text(const char *src) {
+static void execute_line_text_inner(const char *src) {
     struct shell_token tok[SHELL_TOKEN_MAX];
     char words[SHELL_PARSE_BUF_MAX];
-    char alias_buf[SHELL_PARSE_BUF_MAX];
     int ntok = 0;
 
     src = src ? src : "";
@@ -11533,11 +12187,6 @@ static void execute_line_text(const char *src) {
     /* A pipeline with a compound stage must be split while the stages are
      * still TEXT; the tokenizer would reduce `while` to an ordinary word. */
     if (shell_try_compound_pipeline(src)) return;
-    src = shell_expand_aliases(src, alias_buf, sizeof(alias_buf));
-    if (!src) {
-        shell_set_status(2);
-        return;
-    }
     if (shell_try_if_command(src) ||
         shell_try_for_command(src) ||
         shell_try_while_command(src) ||
@@ -11611,9 +12260,14 @@ static void execute_line_text(const char *src) {
             if (negate) last = last == 0 ? 1 : 0;
             shell_set_status(last);
             if (g_shell_flow != SHELL_FLOW_NONE) return;
+            /* `sep` is the operator FOLLOWING this pipeline, so it is what
+             * says "this is not the last command of an AND-OR list" -- the
+             * `false` in `false && echo`. prev_link covers the other side. */
+            bool in_and_or = (prev_link == SH_TOK_AND_IF ||
+                              prev_link == SH_TOK_OR_IF ||
+                              sep == SH_TOK_AND_IF || sep == SH_TOK_OR_IF);
             if (g_opt_errexit && last != 0 && !negate &&
-                prev_link != SH_TOK_AND_IF && prev_link != SH_TOK_OR_IF &&
-                g_shell_loop_depth == 0) {
+                !in_and_or && g_errexit_suspend == 0) {
                 g_shell_flow = SHELL_FLOW_EXIT;
                 g_shell_flow_status = last;
                 return;
@@ -11621,6 +12275,38 @@ static void execute_line_text(const char *src) {
         }
         prev_link = sep;
     }
+}
+
+/* See patch note: aliases are a LINE-level rewrite, applied before the line
+ * is split or parsed, and never re-applied to the pieces. */
+static void execute_line_text(const char *src) {
+    if (g_exec_line_depth > 0) {           /* a piece of a line already being run */
+        g_exec_line_depth++;
+        execute_line_text_inner(src);
+        g_exec_line_depth--;
+        return;
+    }
+
+    char *abuf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
+    const char *line_src = src;
+    if (abuf) {
+        const char *expanded = shell_expand_aliases(src ? src : "", abuf,
+                                                    SHELL_PARSE_BUF_MAX);
+        if (expanded) line_src = expanded;
+        else {
+            /* Expansion overflowed. Say so rather than silently running the
+             * unexpanded text, which would look like the alias never existed. */
+            kprintf("shell: alias expansion too long\n");
+            shell_set_status(2);
+            kfree(abuf);
+            return;
+        }
+    }
+
+    g_exec_line_depth++;
+    execute_line_text_inner(line_src);
+    g_exec_line_depth--;
+    if (abuf) kfree(abuf);
 }
 
 static char g_heredoc_cmd[LINE_MAX];
@@ -11884,11 +12570,44 @@ void shell_poll(void) {
 
 /* Initialise shell state WITHOUT printing a banner or a prompt: a script run
  * must not emit anything the oracle would not. */
+void shell_set_interactive_hosted(bool on) { g_interactive = on; }
+
 void shell_init_hosted(const char *argv0) {
     line_len = 0;
     line[0]  = '\0';
     for (int i = 0; i < SHELL_FD_MAX; i++) g_shell_fd[i] = 0;
     env_init_defaults();
+
+#ifdef SHELL_HOSTED
+    /* INHERIT THE ENVIRONMENT. env_init_defaults() stamps PATH=/bin, HOME=/,
+     * and friends -- which is right for the kernel shell, where there is no
+     * parent to inherit from, and wrong for /bin/tsh, where there always is.
+     *
+     * Without this the hosted shell silently discarded everything its parent
+     * exported and ran with a hardcoded PATH of /bin. A command anywhere else
+     * on PATH was simply not found: the third-party gate puts its helper
+     * binaries in /etc/oilspec/bin and passes PATH=/etc/oilspec/bin:/bin, and
+     * 318 cases failed with "failed to launch '/bin/argv.py'" -- the shell had
+     * thrown the PATH away and gone looking in the only directory it knew.
+     *
+     * Imported AFTER the defaults so the real values win, and marked exported
+     * because that is what they are: they arrived in the environment, so they
+     * belong in a child's environment too.
+     *
+     * environ is declared here rather than pulled from <unistd.h>: this file
+     * speaks the kernel's headers, and the kernel build has no environ at all
+     * -- hence the guard. */
+    {
+        extern char **environ;
+        for (char **e = environ; e && *e; e++) {
+            if (env_set_kv(*e) != 0) continue;
+            size_t klen = env_key_len(*e);
+            int idx = env_find(*e, klen);
+            if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
+        }
+    }
+#endif
+
     g_getopts_last_optind = 1;
     g_getopts_char_index  = 1;
     shell_trap_clear_all();

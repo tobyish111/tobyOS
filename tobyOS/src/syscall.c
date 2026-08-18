@@ -2614,13 +2614,33 @@ static long sys_open(const char *path, int flags, int mode) {
     }
 
     if (want_trunc) {
-        /* Trivial truncate: unlink + recreate. The VFS doesn't expose
-         * a real truncate primitive yet (M25A scope). Honoured only
-         * when the file already exists. */
+        /* O_TRUNC truncates the file IN PLACE. It used to unlink and
+         * recreate, with the note "the VFS doesn't expose a real truncate
+         * primitive yet (M25A scope)" -- that stopped being true when
+         * ->truncate/->ftruncate landed, and the workaround outlived its
+         * reason by long enough to become three bugs:
+         *
+         *   1. It changes the inode. POSIX requires O_TRUNC to keep the same
+         *      file; anyone else holding a descriptor is silently detached
+         *      from the file the truncating process goes on to write.
+         *   2. It LEAKS A NODE per truncate whenever any handle is open. The
+         *      unlink cannot free a node with open_count > 0 -- correctly, by
+         *      unlink-while-open semantics -- so it marks it and moves on,
+         *      and the recreate allocates a fresh one. The third-party shell
+         *      gate re-truncated four capture files per case and killed
+         *      /tmp after 127 cases: 506 of 512 nodes unlinked-but-held.
+         *   3. Between the unlink and the create the path does not exist, so
+         *      a concurrent opener sees ENOENT on a file that never went away.
+         *
+         * Fall back to the old dance only where the filesystem genuinely has
+         * no truncate op, so read-only-ish drivers behave as before. */
         struct vfs_stat st;
         if (vfs_stat(kpath, &st) == VFS_OK) {
-            vfs_unlink(kpath);
-            (void)vfs_create(kpath);
+            int tr = vfs_truncate(kpath, 0);
+            if (tr != VFS_OK) {
+                vfs_unlink(kpath);
+                (void)vfs_create(kpath);
+            }
         }
     }
 

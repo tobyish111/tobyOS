@@ -109,6 +109,7 @@ struct tmpfs_mount {
     struct tmpfs_node *nodes;
     size_t             bytes;      /* data bytes currently held */
     size_t             max_bytes;
+    bool               reported_full;  /* census printed once, not per create */
 };
 
 static struct tmpfs_mount g_tmpfs[TMPFS_MAX_MOUNTS];
@@ -168,10 +169,55 @@ static void treap(struct tmpfs_node *nd)
     memset(nd, 0, sizeof *nd);
 }
 
+/* Running out of nodes used to be a silent NULL: every create returned an
+ * error the caller reported as a generic failure, and a filesystem that has
+ * simply filled up looked identical to one that is broken. The third-party
+ * shell gate spent a whole run reporting "could not run" for 2,600 cases
+ * because of it. A full table now says so, once per mount, with the census
+ * that distinguishes the two ways it can happen:
+ *
+ *   used but reachable      -- genuinely full, the caller should clean up
+ *   used AND unlinked       -- LEAKED: the name is gone but the slot is held
+ *                              by an open_count that never came back to zero
+ */
+static void tmpfs_census(struct tmpfs_mount *m, const char *why)
+{
+    size_t used = 0, orphan = 0, open_held = 0;
+    for (size_t i = 0; i < TMPFS_MAX_NODES; i++) {
+        if (!m->nodes[i].used) continue;
+        used++;
+        if (m->nodes[i].unlinked) orphan++;
+        if (m->nodes[i].open_count > 0) open_held++;
+    }
+    kprintf("[tmpfs] %s: %lu/%d nodes used, %lu unlinked-but-held (leaked), "
+            "%lu with open handles, %lu/%lu KiB\n",
+            why, (unsigned long)used, TMPFS_MAX_NODES,
+            (unsigned long)orphan, (unsigned long)open_held,
+            (unsigned long)(m->bytes / 1024u),
+            (unsigned long)(m->max_bytes / 1024u));
+
+    /* Name a few of them. "506 nodes leaked" says a leak exists; the PATHS say
+     * which operation leaked them, and that is the difference between knowing
+     * there is a bug and knowing where it is. Bounded -- this runs from an
+     * allocation failure and must not become the next flood. */
+    int shown = 0;
+    for (size_t i = 0; i < TMPFS_MAX_NODES && shown < 8; i++) {
+        if (!m->nodes[i].used || !m->nodes[i].unlinked) continue;
+        kprintf("[tmpfs]   leaked: '%s' open_count=%d type=%d size=%lu\n",
+                m->nodes[i].path, m->nodes[i].open_count,
+                (int)m->nodes[i].type, (unsigned long)m->nodes[i].size);
+        shown++;
+    }
+}
+
 static struct tmpfs_node *talloc(struct tmpfs_mount *m)
 {
     for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
         if (!m->nodes[i].used) return &m->nodes[i];
+    if (!m->reported_full) {
+        m->reported_full = true;
+        tmpfs_census(m, "node table FULL");
+    }
     return NULL;
 }
 
@@ -247,7 +293,17 @@ static int tgrow(struct tmpfs_mount *m, struct tmpfs_node *nd, size_t want)
          * may be what crossed the limit. */
         ncap = want;
         delta = ncap - nd->cap;
-        if (m->bytes + delta > m->max_bytes) return VFS_ERR_NOSPC;
+        if (m->bytes + delta > m->max_bytes) {
+            /* Say so. A tmpfs that has simply filled up returned a bare
+             * NOSPC that every caller reported as a generic write failure,
+             * which is indistinguishable from a broken filesystem -- the
+             * shell gate lost 2,600 cases to exactly that ambiguity. */
+            if (!m->reported_full) {
+                m->reported_full = true;
+                tmpfs_census(m, "byte budget EXHAUSTED");
+            }
+            return VFS_ERR_NOSPC;
+        }
     }
     uint8_t *nb = kmalloc(ncap);
     if (!nb) return VFS_ERR_NOMEM;

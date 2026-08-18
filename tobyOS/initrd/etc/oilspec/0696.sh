@@ -1,0 +1,2 @@
+[ -t invalid ]
+echo status=$?

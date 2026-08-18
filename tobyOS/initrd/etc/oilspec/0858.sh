@@ -1,0 +1,2 @@
+eval 'echo >'
+echo status=$?

@@ -1,0 +1,2 @@
+dbracket=[[
+$dbracket foo == foo ]]

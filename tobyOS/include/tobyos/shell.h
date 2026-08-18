@@ -57,6 +57,12 @@ bool shell_owns_pid(int pid);
  * nothing the oracle would not). `argv0` becomes $0. */
 void shell_init_hosted(const char *argv0);
 
+/* Declare whether this is a terminal session. Defaults to true, because the
+ * kernel shell always is; a script or `-c` must clear it. Alias expansion is
+ * keyed on this -- bash expands aliases interactively and ignores them in a
+ * script unless `shopt -s expand_aliases` says otherwise. */
+void shell_set_interactive_hosted(bool on);
+
 /* Run a script file / a single -c line. Both return the exit status. */
 int  shell_run_script_hosted(const char *path);
 int  shell_run_line_hosted(const char *text);
