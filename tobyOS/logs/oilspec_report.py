@@ -104,15 +104,38 @@ def main():
     # it case by case. Comparing aggregate scores told me a change cost 6 cases
     # and could not tell me WHICH -- so two attempts at the field-splitting
     # model were each judged on a number with no way to see what moved.
+    # Fingerprint the log this archive came from. Running the report TWICE on
+    # one log used to overwrite the archive with that same log, so the second
+    # invocation compared a run against itself and reported "0 gained, 0 lost"
+    # -- which is how the diff for the field-splitting attempt was lost the
+    # first time the tool was used.
     prev_path = os.path.join(HERE, 'oilspec_prev.json')
+    fingerprint = '%d:%d' % (os.path.getsize(LOG), int(os.path.getmtime(LOG)))
+    same_log = False
     if os.path.exists(prev_path):
-        prev = json.load(open(prev_path, encoding='utf-8'))
+        blob = json.load(open(prev_path, encoding='utf-8'))
+        prev = blob.get('results', blob)
+        same_log = blob.get('log') == fingerprint
         flipped = [(c, prev[c], results[c]) for c in sorted(results)
                    if c in prev and prev[c] != results[c]]
         gained = [f for f in flipped if f[2] == 'P']
         lost   = [f for f in flipped if f[1] == 'P']
+        # ALSO to a file. Twice now the diff has been lost to a shell pipeline
+        # -- once by re-running the report, once by a grep that did not match --
+        # and each loss cost an 18-minute run to recreate. A result that only
+        # exists in a pipe is a result you can lose.
+        dpath = os.path.join(HERE, 'oilspec_diff.txt')
+        with open(dpath, 'w', newline='\n', encoding='utf-8') as df:
+            df.write('gained %d, lost %d\n' % (len(gained), len(lost)))
+            for tag, rows in (('LOST', lost), ('GAINED', gained)):
+                for c, was, now in rows:
+                    m = man.get(c, {})
+                    df.write('%-6s %s  %-9s %-24s %s\n'
+                             % (tag, c, host.get(c, {}).get('class', '?'),
+                                m.get('file', '?'), m.get('name', '')))
         print()
-        print('--- vs previous run: %d gained, %d lost ---' % (len(gained), len(lost)))
+        print('--- vs previous run: %d gained, %d lost  (also in %s) ---'
+              % (len(gained), len(lost), os.path.basename(dpath)))
         for c, was, now in lost[:25]:
             m = man.get(c, {})
             print('  LOST   %s  %-9s %-22s %s'
@@ -123,8 +146,9 @@ def main():
             print('  gained %s  %-9s %-22s %s'
                   % (c, host.get(c, {}).get('class', '?'), m.get('file', '?'),
                      m.get('name', '')[:44]))
-    with open(prev_path, 'w', encoding='utf-8') as f:
-        json.dump(results, f)
+    if not same_log:
+        with open(prev_path, 'w', encoding='utf-8') as f:
+            json.dump({'log': fingerprint, 'results': results}, f)
 
     out = os.path.join(HERE, 'oilspec_failures.txt')
     with open(out, 'w', newline='\n', encoding='utf-8') as f:

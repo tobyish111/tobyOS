@@ -7101,6 +7101,11 @@ struct shell_token {
     enum shell_tok_type type;
     char *text;
     bool quoted;
+    /* True if building this word consumed a `$` or a backtick. Only such
+     * words are subject to field splitting (POSIX 2.6.5); a purely literal
+     * word must survive whatever IFS happens to be, which is why
+     * `IFS=o; echo hi` used to try to run /bin/ech. */
+    bool expanded;
     int fd;
 };
 
@@ -8481,6 +8486,8 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
     return shell_append_str(buf, pos, cap, val);
 }
 
+static bool g_tok_word_expanded;   /* set while the current word is built */
+
 static int shell_emit_token_fd(struct shell_token *tok, int *ntok,
                                enum shell_tok_type type, char *text,
                                bool quoted, int fd) {
@@ -8491,6 +8498,7 @@ static int shell_emit_token_fd(struct shell_token *tok, int *ntok,
     tok[*ntok].type = type;
     tok[*ntok].text = text;
     tok[*ntok].quoted = quoted;
+    tok[*ntok].expanded = g_tok_word_expanded;
     tok[*ntok].fd = fd;
     (*ntok)++;
     return 0;
@@ -8581,6 +8589,7 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
         char *start = words + wpos;
         bool got = false;
         bool word_quoted = false;
+        g_tok_word_expanded = false;
         while (*p && !is_space(*p) && !shell_operator_char(*p)) {
             got = true;
             if (*p == '$' && p[1] == '\'') {
@@ -8681,6 +8690,7 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                         if (shell_expand_var(&p, words, &wpos, word_cap) < 0) return -1;
                     } else if (*p == '`') {
                         if (shell_expand_backtick(&p, words, &wpos, word_cap) < 0) return -1;
+                        g_tok_word_expanded = true;
                     } else {
                         if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
                             kprintf("shell: word too long\n");
@@ -8708,12 +8718,18 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                 }
                 continue;
             }
+            /* Flag AFTER the expander returns. Command substitution and
+             * friends re-enter this tokenizer, and each nested word clears
+             * the flag -- so setting it first left the OUTER word marked
+             * with whatever the last inner word did. */
             if (*p == '`') {
                 if (shell_expand_backtick(&p, words, &wpos, word_cap) < 0) return -1;
+                g_tok_word_expanded = true;
                 continue;
             }
             if (*p == '$') {
                 if (shell_expand_var(&p, words, &wpos, word_cap) < 0) return -1;
+                g_tok_word_expanded = true;
                 continue;
             }
             if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
@@ -9241,6 +9257,8 @@ static bool shell_is_ifs_white(char c) {
 
 static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
                          const char *word, bool quoted);
+static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
+                            const char *word, bool quoted, bool expanded);
 
 /* Split a word on the "$@" word-boundary marker and add each piece. Runs for
  * quoted words too -- that is the whole point, since `"$@"` must yield one
@@ -9303,12 +9321,17 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
     return 1;
 }
 
-static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
-                         const char *word, bool quoted) {
+static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
+                            const char *word, bool quoted, bool expanded) {
     int mrc = shell_add_marked_words(pl, cur, word, quoted);
     if (mrc != 0) return mrc < 0 ? -1 : 0;
 
     if (quoted) return shell_add_one_arg(pl, cur, word, true);
+
+    /* Nothing expanded, so there is nothing to split. POSIX splits the
+     * RESULTS of expansion, never the literal text of a word -- without
+     * this, `IFS=o` turns `echo` into `ech`. */
+    if (!expanded) return shell_add_one_arg(pl, cur, word, false);
 
     size_t klen = env_key_len(word);
     if (cur->argc == 0 && word[klen] == '=' && shell_name_is_valid(word, klen)) {
@@ -9367,6 +9390,13 @@ static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
      * `x=""; f $x` passes nothing, while `f ""` passes one empty argument --
      * and the quoted form never reaches here. */
     return 0;
+}
+
+/* Compatibility entry for callers that have no token to ask. The "$@"
+ * re-entry below is one: its words ARE expansion results by construction. */
+static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
+                         const char *word, bool quoted) {
+    return shell_add_arg_ex(pl, cur, word, quoted, true);
 }
 
 static int shell_default_redir_fd(enum shell_tok_type t, int explicit_fd) {
@@ -9494,7 +9524,8 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             kprintf("shell: unexpected token\n");
             return -1;
         }
-        if (shell_add_arg(pl, cur, tok[*io].text, tok[*io].quoted) < 0) {
+        if (shell_add_arg_ex(pl, cur, tok[*io].text, tok[*io].quoted,
+                             tok[*io].expanded) < 0) {
             return -1;
         }
         (*io)++;
@@ -10928,7 +10959,8 @@ static bool shell_try_for_command(const char *src) {
     } else {
         for (int i = 0; i < ntok; i++) {
             if (tok[i].type != SH_TOK_WORD) continue;
-            if (shell_add_arg(wl, items, tok[i].text, tok[i].quoted) < 0) {
+            if (shell_add_arg_ex(wl, items, tok[i].text, tok[i].quoted,
+                                 tok[i].expanded) < 0) {
                 kfree(wl); kfree(items);
                 shell_set_status(2);
                 return true;
