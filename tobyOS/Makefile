@@ -2951,6 +2951,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/grep
 	cp $(PORTS_SBASE_DIR)/wc.elf                      $(INITRD_STAGE)/bin/wc
 	cp $(PORTS_SBASE_DIR)/head.elf                    $(INITRD_STAGE)/bin/head
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/egrep
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/fgrep
 	cp $(PORTS_SBASE_DIR)/basename.elf                  $(INITRD_STAGE)/bin/basename
 	cp $(PORTS_SBASE_DIR)/dirname.elf                   $(INITRD_STAGE)/bin/dirname
 	cp $(PORTS_SBASE_DIR)/sleep.elf                     $(INITRD_STAGE)/bin/sleep
@@ -3473,7 +3475,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/sigtest bin/mctest bin/reclaimtest bin/tobycc bin/tobybuild bin/selfhosttest \
     bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
-	    bin/grep bin/wc bin/head                                          \
+	    bin/grep bin/wc bin/head bin/egrep bin/fgrep                      \
 	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
 	    bin/env bin/find bin/tail bin/df bin/ps bin/top bin/sh            \
 	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \

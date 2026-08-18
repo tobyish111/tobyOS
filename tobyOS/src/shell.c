@@ -8740,6 +8740,26 @@ static bool shell_alias_name_char(char c) {
            c != '(' && c != ')' && c != '\'' && c != '"' && c != '\\';
 }
 
+/* Names already substituted while expanding the current line. POSIX: the
+ * replacement text is reprocessed for aliases, but a name already used is
+ * not substituted again -- otherwise `alias echo='echo foo'` never
+ * terminates. Reset per line by shell_expand_aliases. */
+#define SHELL_ALIAS_SEEN_MAX 32
+static char g_alias_seen[SHELL_ALIAS_SEEN_MAX][64];
+static int  g_alias_seen_n;
+
+static bool shell_alias_already_used(const char *name) {
+    for (int i = 0; i < g_alias_seen_n; i++)
+        if (strcmp(g_alias_seen[i], name) == 0) return true;
+    return false;
+}
+
+static void shell_alias_mark_used(const char *name) {
+    if (g_alias_seen_n >= SHELL_ALIAS_SEEN_MAX) return;
+    ksnprintf(g_alias_seen[g_alias_seen_n], 64, "%s", name);
+    g_alias_seen_n++;
+}
+
 static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
                                      bool *changed) {
     const char *p = src ? src : "";
@@ -8793,12 +8813,22 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
                  * optimisation: `alias foo=bar; foo` runs bar interactively
                  * and reports "foo: not found" in a script. */
                 bool may_expand = (g_interactive || g_opt_expand_aliases);
-                const char *av = (*q == '(' || !may_expand)
+                /* ...and never a name already substituted on this line, or
+                 * `alias echo='echo foo'` recurses until the pass counter
+                 * gives up and the command produces nothing at all. */
+                const char *av = (*q == '(' || !may_expand ||
+                                  shell_alias_already_used(name))
                                      ? 0 : shell_alias_value(name);
                 if (av) {
+                    shell_alias_mark_used(name);
+                    size_t avlen = strlen(av);
                     if (shell_append_str(out, &pos, cap, av) < 0) return -1;
                     *changed = true;
-                    at_cmd = false;
+                    /* POSIX: a replacement ending in a blank means the NEXT
+                     * word is checked for aliases too -- which is what makes
+                     * `alias sudo='sudo '` expand what follows it. */
+                    at_cmd = (avlen > 0 && (av[avlen - 1] == ' ' ||
+                                            av[avlen - 1] == '\t'));
                     continue;
                 }
             }
@@ -8837,6 +8867,8 @@ static const char *shell_expand_aliases(const char *src, char *buf,
     char tmp[SHELL_PARSE_BUF_MAX];
     const char *cur = src ? src : "";
     bool changed = false;
+
+    g_alias_seen_n = 0;      /* the no-reuse set is per LINE */
 
     for (int pass = 0; pass < 8; pass++) {
         char *dst = (pass & 1) ? tmp : buf;
