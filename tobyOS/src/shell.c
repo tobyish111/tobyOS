@@ -74,6 +74,10 @@ extern volatile struct limine_module_request module_req;
 #define SHELL_FD_MAX 10
 
 #define SHELL_ARG_MARK '\x01'
+/* Toggles "do not field-split" while expanding. See the note above
+ * shell_append_positional_join for why a marker in the text is the only
+ * place this information can live. Stripped before any word reaches argv. */
+#define SHELL_NOSPLIT_MARK '\x02'
 #define ARG_MAX  32
 #define SHELL_ALIAS_MAX 32
 #define SHELL_FUNC_MAX 32
@@ -7554,14 +7558,17 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap) {
     while (*p) {
         if (*p == '\'') {                    /* literal until the next quote */
             p++;
+            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             while (*p && *p != '\'') {
                 if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
             }
+            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '\'') p++;
             continue;
         }
         if (*p == '"') {                     /* expanding, but quotes removed */
             p++;
+            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             while (*p && *p != '"') {
                 if (*p == '$') {
                     if (shell_expand_var(&p, out, &pos, cap) < 0) return -1;
@@ -7576,6 +7583,7 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap) {
                                    p[1] == '$'  || p[1] == '`')) p++;
                 if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
             }
+            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '"') p++;
             continue;
         }
@@ -7592,6 +7600,22 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap) {
     }
     out[pos] = '\0';
     return 0;
+}
+
+/* Copy `src` to `dst`, dropping split-protection markers. Called wherever a
+ * word becomes an argument; a marker that escaped would be a stray 0x02 byte
+ * in a program's argv. */
+static void shell_strip_nosplit(char *dst, size_t cap, const char *src) {
+    size_t o = 0;
+    for (const char *p = src; *p && o + 1 < cap; p++)
+        if (*p != SHELL_NOSPLIT_MARK) dst[o++] = *p;
+    dst[o] = '\0';
+}
+
+static bool shell_has_nosplit(const char *s) {
+    for (const char *p = s; *p; p++)
+        if (*p == SHELL_NOSPLIT_MARK) return true;
+    return false;
 }
 
 static int shell_parse_braced_name(const char *expr, size_t *name_len) {
@@ -8986,6 +9010,16 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
         return -1;
     }
 
+    /* The funnel: every word becomes an argument through here, so this is the
+     * one place that has to guarantee no split-protection marker escapes. */
+    char unmarked[SHELL_PARSE_BUF_MAX];
+    if (shell_has_nosplit(word)) {
+        shell_strip_nosplit(unmarked, sizeof unmarked, word);
+        char *saved = 0;
+        if (shell_pipeline_save_word(pl, unmarked, &saved) < 0) return -1;
+        word = saved;
+    }
+
     if (!quoted) {
         if (!g_opt_noglob && shell_has_glob(word)) {
             int n = shell_expand_glob_word(pl, cur, word);
@@ -9157,20 +9191,29 @@ static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
      * kinds (which is what the loop here used to do) silently drops empty
      * fields, and `IFS=: read a b c` is exactly how scripts parse
      * /etc/passwd-shaped data. */
+    /* `prot` tracks the SHELL_NOSPLIT_MARK toggle: while it is on, no
+     * character is a delimiter, which is what keeps `${x:-'a b c'}` one word. */
+    bool prot = false;
     const char *p = word;
-    while (shell_is_ifs_char(*p) && shell_is_ifs_white(*p)) p++;
+    while (!prot && shell_is_ifs_char(*p) && shell_is_ifs_white(*p)) p++;
 
     while (*p) {
         const char *start = p;
-        while (*p && !shell_is_ifs_char(*p)) p++;
+        while (*p) {
+            if (*p == SHELL_NOSPLIT_MARK) { prot = !prot; p++; continue; }
+            if (!prot && shell_is_ifs_char(*p)) break;
+            p++;
+        }
         size_t n = (size_t)(p - start);
+        char raw[SHELL_PARSE_BUF_MAX];
         char tmp[SHELL_PARSE_BUF_MAX];
-        if (n + 1 > sizeof(tmp)) {
+        if (n + 1 > sizeof(raw)) {
             kprintf("shell: field too long\n");
             return -1;
         }
-        memcpy(tmp, start, n);
-        tmp[n] = '\0';
+        memcpy(raw, start, n);
+        raw[n] = '\0';
+        shell_strip_nosplit(tmp, sizeof tmp, raw);
         char *saved = 0;
         if (shell_pipeline_save_word(pl, tmp, &saved) < 0) return -1;
         if (shell_add_one_arg(pl, cur, saved, false) < 0) return -1;
