@@ -100,6 +100,32 @@ def main():
         print('  %-28s %3d failing / %3d  (%d POSIX)'
               % (stem, bad, sum(c.values()), posix_bad))
 
+    # Archive this run's per-case results so the NEXT run can be diffed against
+    # it case by case. Comparing aggregate scores told me a change cost 6 cases
+    # and could not tell me WHICH -- so two attempts at the field-splitting
+    # model were each judged on a number with no way to see what moved.
+    prev_path = os.path.join(HERE, 'oilspec_prev.json')
+    if os.path.exists(prev_path):
+        prev = json.load(open(prev_path, encoding='utf-8'))
+        flipped = [(c, prev[c], results[c]) for c in sorted(results)
+                   if c in prev and prev[c] != results[c]]
+        gained = [f for f in flipped if f[2] == 'P']
+        lost   = [f for f in flipped if f[1] == 'P']
+        print()
+        print('--- vs previous run: %d gained, %d lost ---' % (len(gained), len(lost)))
+        for c, was, now in lost[:25]:
+            m = man.get(c, {})
+            print('  LOST   %s  %-9s %-22s %s'
+                  % (c, host.get(c, {}).get('class', '?'), m.get('file', '?'),
+                     m.get('name', '')[:44]))
+        for c, was, now in gained[:10]:
+            m = man.get(c, {})
+            print('  gained %s  %-9s %-22s %s'
+                  % (c, host.get(c, {}).get('class', '?'), m.get('file', '?'),
+                     m.get('name', '')[:44]))
+    with open(prev_path, 'w', encoding='utf-8') as f:
+        json.dump(results, f)
+
     out = os.path.join(HERE, 'oilspec_failures.txt')
     with open(out, 'w', newline='\n', encoding='utf-8') as f:
         f.write('# id  code  class  file  case name\n')
